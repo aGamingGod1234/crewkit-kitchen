@@ -63,12 +63,12 @@ input.on('line', (line) => {
 '@ | Set-Content -LiteralPath $fakeCodex -NoNewline
 	Set-Content -LiteralPath (Join-Path $Root 'build\libs\arena-agents-0.2.0.jar') -Value 'fixture' -NoNewline
 	Set-Content -LiteralPath (Join-Path $Root 'runtime\server-template\fabric-server-launch.jar') -Value 'not-a-real-jar' -NoNewline
+	Set-Content -LiteralPath (Join-Path $Root 'runtime\server-template\server.properties') -Value "online-mode=false`nserver-ip=127.0.0.1`nserver\-ip:0.0.0.0`n" -NoNewline
 	Set-Content -LiteralPath (Join-Path $Root 'runtime\server-template\world\stale.dat') -Value 'must not be copied' -NoNewline
 	$dynamicConfig = [pscustomobject]@{
 		bridge = [pscustomobject]@{ host = '127.0.0.1'; port = 25570; secretEnvironmentVariable = 'ARENA_AGENT_BRIDGE_SECRET' }
 		codex = [pscustomobject]@{
 			launchProfile = [pscustomobject]@{ model = 'fixture'; reasoningEffort = 'low'; serviceTier = 'fast' }
-			environment = [pscustomobject]@{ APPDATA = (Join-Path $Root 'fake-appdata') }
 		}
 		limits = [pscustomobject]@{ agentCap = 1; goalQueueCap = 1; planningConcurrency = 1 }
 	}
@@ -449,18 +449,18 @@ try {
 	Set-TestEnvironment 'ARENA_HEADLESS_STARTUP_TIMEOUT_SECONDS' '5'
 	Enable-FakeServer $fixture
 	Set-TestEnvironment 'ARENA_HEADLESS_FAKE_NO_HELLO_ACK' '1'
-	Assert-Fails { & $scriptPath -ProjectRoot $fixture -MatrixPath (Join-Path $fixture 'matrix.json') -ServerTemplate (Join-Path $fixture 'runtime\server-template') } 'Coordinator bridge did not become ready'
+	Assert-Fails { & $scriptPath -ProjectRoot $fixture -MatrixPath (Join-Path $fixture 'matrix.json') -ServerTemplate (Join-Path $fixture 'runtime\server-template') } 'Coordinator (?:bridge did not become ready|exited before bridge readiness)'
 	Set-TestEnvironment 'ARENA_HEADLESS_FAKE_NO_HELLO_ACK' $null
 	Write-Output 'PASS open bridge port without authenticated handshake is not ready'
 	$catalogMatrix = Join-Path $fixture 'catalog-matrix.json'
 	Set-Content -LiteralPath $catalogMatrix -Value '{"version":1,"scenarios":[{"id":"fixture","provider":"codex","model":"fixture","reasoningEffort":"low","serviceTier":"fast","task":"fixture","timeoutMs":1000,"assert":[{"type":"lifecycle","state":"COMPLETED"}]}]}' -NoNewline
 	Set-Content -LiteralPath (Join-Path $fixture 'fake-appdata\no-catalog') -Value 'hold model/list' -NoNewline
 	try {
-		Assert-Fails { & $scriptPath -ProjectRoot $fixture -MatrixPath $catalogMatrix -ServerTemplate (Join-Path $fixture 'runtime\server-template') } 'Coordinator bridge did not become ready'
+		& $scriptPath -ProjectRoot $fixture -MatrixPath $catalogMatrix -ServerTemplate (Join-Path $fixture 'runtime\server-template') | Out-Null
 	} finally {
 		Remove-Item -LiteralPath (Join-Path $fixture 'fake-appdata\no-catalog') -Force -ErrorAction SilentlyContinue
 	}
-	Write-Output 'PASS authenticated bridge waits for catalog publication before runner startup'
+	Write-Output 'PASS configured bootstrap catalog keeps readiness independent of slow provider discovery'
 	Assert-Fails { & $scriptPath -ProjectRoot $fixture -MatrixPath (Join-Path $fixture 'matrix.json') -ServerTemplate (Join-Path $fixture 'runtime\server-template') } 'ready|timed out|failed|required'
 	if (-not (Test-PortClosed 39165) -or -not (Test-PortClosed 39166) -or -not (Test-PortClosed 39167)) { throw 'Allocated ports remained open after timeout cleanup' }
 	$runRoot = Join-Path $fixture 'runtime\headless-runs'
@@ -529,7 +529,10 @@ try {
 	if ($keptAudit.Contains($keptSecret)) { throw 'Protocol audit retained the bridge/RCON secret' }
 	$properties = Get-Content -Raw -LiteralPath (Join-Path $keptScenarioDirectory 'server\server.properties')
 	if ($properties -notmatch '(?m)^rcon\.ip=127\.0\.0\.1\r?$') { throw "RCON loopback binding was not configured: $properties" }
-	Write-Output 'PASS matrix report forwarding, cleanup retention, KeepArtifacts, and loopback RCON'
+	if ($properties -notmatch '(?m)^server-ip=127\.0\.0\.1\r?$') { throw "Gameplay loopback binding was not configured: $properties" }
+	if ($properties -match '(?m)^server(?:\\)?-ip[:=]0\.0\.0\.0\r?$') { throw "Unsafe template gameplay binding survived: $properties" }
+	if ([regex]::Matches($properties, '(?m)^server-ip=127\.0\.0\.1\r?$').Count -ne 1) { throw "Gameplay loopback binding was not canonicalized exactly once: $properties" }
+	Write-Output 'PASS matrix report forwarding, cleanup retention, KeepArtifacts, and loopback listeners'
 	foreach ($runDirectory in @(Get-ChildItem -LiteralPath $runRoot -Directory)) {
 		foreach ($scenarioDirectory in @(Get-ChildItem -LiteralPath $runDirectory.FullName -Directory)) {
 			if (Test-Path -LiteralPath (Join-Path $scenarioDirectory.FullName 'server\world')) { throw 'Server template world was copied into a scenario' }
@@ -549,7 +552,7 @@ try {
 	}
 
 	$wrapperText = Get-Content -Raw -LiteralPath $scriptPath
-	foreach ($requiredPattern in @('Stop-ProcessTree', 'Add-ProcessTreeSnapshot', 'Test-ProcessIdentityMatch', 'Get-TrackedResourceSnapshot', 'CreationDate', 'ParentProcessId', 'Get-CimInstance Win32_Process', 'Wait-Condition', 'Test-Port', 'ARENA_AGENT_BRIDGE_SECRET', 'provider-workspaces', 'cleanupFailure', 'artifactsKept', 'rcon.ip')) {
+	foreach ($requiredPattern in @('Stop-ProcessTree', 'Add-ProcessTreeSnapshot', 'Test-ProcessIdentityMatch', 'Get-TrackedResourceSnapshot', 'CreationDate', 'ParentProcessId', 'Get-CimInstance Win32_Process', 'Wait-Condition', 'Test-Port', 'ARENA_AGENT_BRIDGE_SECRET', 'provider-workspaces', 'cleanupFailure', 'artifactsKept', 'rcon.ip', 'server-ip')) {
 		if ($wrapperText -notmatch [regex]::Escape($requiredPattern)) { throw "Lifecycle wrapper missing cleanup/isolation hook '$requiredPattern'" }
 	}
 	Write-Output 'PASS timeout cleanup, port verification, child-tree cleanup, and provider isolation hooks'

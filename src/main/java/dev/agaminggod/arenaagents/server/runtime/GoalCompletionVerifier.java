@@ -52,16 +52,18 @@ public final class GoalCompletionVerifier {
 		if (serverTick < 0L) throw new IllegalArgumentException("serverTick must be nonnegative");
 		AgentGoal goal = record.currentGoal().orElseThrow();
 		AgentKillLedger kills = killLedger == null ? new AgentKillLedger() : killLedger;
+		Map<PredicateKey, Evaluation> evaluatedLeaves = new HashMap<>();
 		Evaluation evaluation = evaluate(
 				goal.goalId(), goal.spec().completion(), "root", facts,
 				kills,
-				record, serverTick, operatorConfirmed, new Counter(), new KillAllocation()
+				record, serverTick, operatorConfirmed, new Counter(), new KillAllocation(), evaluatedLeaves
 		);
 		if (!evaluation.satisfied()) {
 			Optional<List<GoalEvidence.Fact>> recovered = satisfyWithBacktracking(
 					goal.goalId(), goal.spec().completion(), "root", facts,
 					kills,
-					record, serverTick, operatorConfirmed, new KillAllocation(), ignored -> Optional.of(List.of())
+					record, serverTick, operatorConfirmed, new KillAllocation(),
+					evaluatedLeaves, ignored -> Optional.of(List.of())
 			);
 			if (recovered.isPresent()) evaluation = new Evaluation(true, recovered.orElseThrow());
 		}
@@ -139,14 +141,15 @@ public final class GoalCompletionVerifier {
 			long tick,
 			boolean operatorConfirmed,
 			Counter counter,
-			KillAllocation killAllocation
+			KillAllocation killAllocation,
+			Map<PredicateKey, Evaluation> evaluatedLeaves
 	) {
 		if (predicate instanceof GoalPredicate.AllOf all) {
 			boolean satisfied = true;
 			ArrayList<GoalEvidence.Fact> facts = new ArrayList<>();
 			for (int index = 0; index < all.predicates().size(); index++) {
 				Evaluation child = evaluate(goalId, all.predicates().get(index), path + "." + index, source, kills,
-						record, tick, operatorConfirmed, counter, killAllocation);
+						record, tick, operatorConfirmed, counter, killAllocation, evaluatedLeaves);
 				satisfied &= child.satisfied();
 				facts.addAll(child.facts());
 			}
@@ -160,7 +163,7 @@ public final class GoalCompletionVerifier {
 			for (int index = 0; index < any.predicates().size(); index++) {
 				KillAllocation branchAllocation = baseAllocation.copy();
 				Evaluation child = evaluate(goalId, any.predicates().get(index), path + "." + index, source, kills,
-						record, tick, operatorConfirmed, counter, branchAllocation);
+						record, tick, operatorConfirmed, counter, branchAllocation, evaluatedLeaves);
 				if (selected == null && child.satisfied()) {
 					selectedAllocation = branchAllocation;
 					selected = child;
@@ -173,16 +176,27 @@ public final class GoalCompletionVerifier {
 		}
 		if (counter.next() > 16) throw new IllegalStateException("Goal predicate leaf limit was not enforced");
 		PredicateKey key = new PredicateKey(goalId, path);
+		if (!(predicate instanceof GoalPredicate.EntityKilledByAgent)) {
+			Evaluation cached = evaluatedLeaves.get(key);
+			if (cached != null) return cached;
+		}
+		Evaluation evaluated;
 		if (predicate instanceof GoalPredicate.InventoryContains inventory) {
 			int observed = source.inventoryCount(inventory.itemId());
-			return leaf("inventory_contains", observed >= inventory.count(), inventory.itemId() + " x" + inventory.count(), inventory.itemId() + " x" + observed);
+			evaluated = leaf("inventory_contains", observed >= inventory.count(), inventory.itemId() + " x" + inventory.count(), inventory.itemId() + " x" + observed);
+			evaluatedLeaves.put(key, evaluated);
+			return evaluated;
 		}
 		if (predicate instanceof GoalPredicate.PositionWithin position) {
 			if (!position.dimensionId().equals(source.dimensionId())) {
-				return leaf("position_dimension", false, position.dimensionId(), source.dimensionId());
+				evaluated = leaf("position_dimension", false, position.dimensionId(), source.dimensionId());
+				evaluatedLeaves.put(key, evaluated);
+				return evaluated;
 			}
 			if (!source.isCoordinateReachable(position.x(), position.y(), position.z())) {
-				return leaf("position_reachable", false, formatPosition(position.x(), position.y(), position.z()), "unreachable");
+				evaluated = leaf("position_reachable", false, formatPosition(position.x(), position.y(), position.z()), "unreachable");
+				evaluatedLeaves.put(key, evaluated);
+				return evaluated;
 			}
 			Position observed = source.position();
 			double dx = observed.x() - position.x();
@@ -194,13 +208,17 @@ public final class GoalCompletionVerifier {
 					? (previous.lastTick() == tick ? previous.ticks() : previous.lastTick() == tick - 1L ? previous.ticks() + 1 : 1)
 					: 0;
 			stablePositionTicks.put(key, new PositionCounter(stable, tick));
-			return leaf("position_within", stable >= position.stableTicks(),
+			evaluated = leaf("position_within", stable >= position.stableTicks(),
 					formatPosition(position.x(), position.y(), position.z()) + " radius=" + position.radius() + " stableTicks=" + position.stableTicks(),
 					formatPosition(observed.x(), observed.y(), observed.z()) + " stableTicks=" + stable);
+			evaluatedLeaves.put(key, evaluated);
+			return evaluated;
 		}
 		if (predicate instanceof GoalPredicate.AdvancementGranted advancement) {
 			boolean granted = source.advancementGranted(advancement.advancementId());
-			return leaf("advancement_granted", granted, advancement.advancementId(), granted ? "granted" : "not granted");
+			evaluated = leaf("advancement_granted", granted, advancement.advancementId(), granted ? "granted" : "not granted");
+			evaluatedLeaves.put(key, evaluated);
+			return evaluated;
 		}
 		if (predicate instanceof GoalPredicate.EntityKilledByAgent killed) {
 			int required = killAllocation.claim(new KillRequirement(killed.entityType(), killed.afterGoalStart()));
@@ -210,23 +228,33 @@ public final class GoalCompletionVerifier {
 		}
 		if (predicate instanceof GoalPredicate.BlockMatches block) {
 			if (!block.dimensionId().equals(source.dimensionId())) {
-				return leaf("block_dimension", false, block.dimensionId(), source.dimensionId());
+				evaluated = leaf("block_dimension", false, block.dimensionId(), source.dimensionId());
+				evaluatedLeaves.put(key, evaluated);
+				return evaluated;
 			}
 			if (!source.isCoordinateReachable(block.x(), block.y(), block.z())) {
-				return leaf("block_reachable", false, block.x() + "," + block.y() + "," + block.z(), "unreachable");
+				evaluated = leaf("block_reachable", false, block.x() + "," + block.y() + "," + block.z(), "unreachable");
+				evaluatedLeaves.put(key, evaluated);
+				return evaluated;
 			}
 			BlockFact observed = source.blockAt(block.x(), block.y(), block.z());
 			boolean satisfied = observed.blockId().equals(block.blockId())
 					&& block.properties().entrySet().stream().allMatch(entry -> entry.getValue().equals(observed.properties().get(entry.getKey())));
-			return leaf("block_matches", satisfied, block.blockId() + sortedProperties(block.properties()), observed.blockId() + sortedProperties(observed.properties()));
+			evaluated = leaf("block_matches", satisfied, block.blockId() + sortedProperties(block.properties()), observed.blockId() + sortedProperties(observed.properties()));
+			evaluatedLeaves.put(key, evaluated);
+			return evaluated;
 		}
 		if (predicate instanceof GoalPredicate.SurviveDuration survive) {
 			long observed = survivalProgress.observe(new SurvivalProgressLedger.Requirement(
 					goalId, record.agentId(), path, survive.ticks()), source.alive(), tick);
-			return leaf("survive_duration", observed >= survive.ticks(), survive.ticks() + " ticks", observed + " ticks");
+			evaluated = leaf("survive_duration", observed >= survive.ticks(), survive.ticks() + " ticks", observed + " ticks");
+			evaluatedLeaves.put(key, evaluated);
+			return evaluated;
 		}
 		if (predicate instanceof GoalPredicate.OperatorConfirmed) {
-			return leaf("operator_confirmed", operatorConfirmed, "operator confirmation", operatorConfirmed ? "confirmed" : "not confirmed");
+			evaluated = leaf("operator_confirmed", operatorConfirmed, "operator confirmation", operatorConfirmed ? "confirmed" : "not confirmed");
+			evaluatedLeaves.put(key, evaluated);
+			return evaluated;
 		}
 		throw new IllegalStateException("Unsupported stored goal predicate: " + predicate.getClass().getName());
 	}
@@ -245,17 +273,18 @@ public final class GoalCompletionVerifier {
 			long tick,
 			boolean operatorConfirmed,
 			KillAllocation allocation,
+			Map<PredicateKey, Evaluation> evaluatedLeaves,
 			AllocationContinuation continuation
 	) {
 		if (predicate instanceof GoalPredicate.AllOf all) {
 			return satisfyAllWithBacktracking(goalId, all.predicates(), 0, path, source, kills,
-					record, tick, operatorConfirmed, allocation, continuation);
+					record, tick, operatorConfirmed, allocation, evaluatedLeaves, continuation);
 		}
 		if (predicate instanceof GoalPredicate.AnyOf any) {
 			for (int index = 0; index < any.predicates().size(); index++) {
 				Optional<List<GoalEvidence.Fact>> satisfied = satisfyWithBacktracking(
 						goalId, any.predicates().get(index), path + "." + index, source, kills,
-						record, tick, operatorConfirmed, allocation.copy(), continuation);
+						record, tick, operatorConfirmed, allocation.copy(), evaluatedLeaves, continuation);
 				if (satisfied.isPresent()) return satisfied;
 			}
 			return Optional.empty();
@@ -272,7 +301,7 @@ public final class GoalCompletionVerifier {
 		}
 		Evaluation leaf = evaluate(
 				goalId, predicate, path, source, kills, record, tick, operatorConfirmed,
-				new Counter(), allocation.copy());
+				new Counter(), allocation.copy(), evaluatedLeaves);
 		if (!leaf.satisfied()) return Optional.empty();
 		return prepend(leaf.facts().getFirst(), continuation.apply(allocation));
 	}
@@ -288,14 +317,15 @@ public final class GoalCompletionVerifier {
 			long tick,
 			boolean operatorConfirmed,
 			KillAllocation allocation,
+			Map<PredicateKey, Evaluation> evaluatedLeaves,
 			AllocationContinuation continuation
 	) {
 		if (index == predicates.size()) return continuation.apply(allocation);
 		return satisfyWithBacktracking(
 				goalId, predicates.get(index), path + "." + index, source, kills,
-				record, tick, operatorConfirmed, allocation,
+				record, tick, operatorConfirmed, allocation, evaluatedLeaves,
 				next -> satisfyAllWithBacktracking(goalId, predicates, index + 1, path, source, kills,
-						record, tick, operatorConfirmed, next, continuation));
+						record, tick, operatorConfirmed, next, evaluatedLeaves, continuation));
 	}
 
 	private static Optional<List<GoalEvidence.Fact>> prepend(

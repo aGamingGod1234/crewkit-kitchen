@@ -32,6 +32,7 @@ public final class GoalVerificationRuntimeVerification {
 	public static int verify() {
 		int assertions = 0;
 		assertions += verifyExactInventoryAndIdempotence();
+		assertions += verifyFailedNonKillLeafMemoization();
 		assertions += verifyStablePositionAndReset();
 		assertions += verifyDimensionBinding();
 		assertions += verifyBlockAdvancementAndCompoundPredicates();
@@ -75,6 +76,36 @@ public final class GoalVerificationRuntimeVerification {
 		assertEquals(0, fixture.runtime.tick().size(), "later ticks do not repeat terminal satisfaction");
 		assertEquals(1, fixture.transitions.size(), "duplicate evidence cannot emit a second transition");
 		return 8;
+	}
+
+	private static int verifyFailedNonKillLeafMemoization() {
+		GoalPredicate predicate = new GoalPredicate.AllOf(List.of(
+				new GoalPredicate.InventoryContains("minecraft:diamond", 1),
+				new GoalPredicate.BlockMatches(
+						GoalPredicate.DEFAULT_DIMENSION, 4, 64, 4, "minecraft:diamond_block", Map.of())
+		));
+		Fixture fixture = fixture(predicate, 150L);
+		long goalRevision = fixture.record().goalRevision();
+		GoalCompletionVerifier.VerificationResult failed = fixture.runtime.evaluate(fixture.agentId);
+		assertEquals(false, failed.verified(), "unchanged non-kill facts retain failed verification");
+		assertEquals("PREDICATE_FAILED", failed.reasonCode(), "memoized failure keeps its reason code");
+		assertEquals(goalRevision, failed.goalRevision(), "memoized failure keeps the exact goal revision");
+		assertEquals(1, fixture.facts.inventoryReads,
+				"failed inventory fact is read once instead of again during backtracking");
+		assertEquals(1, fixture.facts.blockReads,
+				"failed block fact is read once instead of again during backtracking");
+
+		fixture.facts.items.put("minecraft:diamond", 1);
+		fixture.facts.blocks.put("4,64,4",
+				new GoalCompletionVerifier.BlockFact("minecraft:diamond_block", Map.of()));
+		GoalCompletionVerifier.VerificationResult changed = fixture.runtime.evaluate(fixture.agentId);
+		assertEquals(true, changed.verified(),
+				"relevant fact changes complete immediately even within the same server tick");
+		assertEquals(2, fixture.facts.inventoryReads,
+				"a later verification reads the changed inventory revision");
+		assertEquals(2, fixture.facts.blockReads,
+				"a later verification reads the changed block revision");
+		return 9;
 	}
 
 	private static int verifyStablePositionAndReset() {
@@ -974,10 +1005,16 @@ public final class GoalVerificationRuntimeVerification {
 		private GoalCompletionVerifier.Position position = new GoalCompletionVerifier.Position(0.0, 64.0, 0.0);
 		private boolean alive = true;
 		private String dimension = GoalPredicate.DEFAULT_DIMENSION;
+		private int inventoryReads;
+		private int blockReads;
 
-		@Override public int inventoryCount(String itemId) { return items.getOrDefault(itemId, 0); }
+		@Override public int inventoryCount(String itemId) {
+			inventoryReads++;
+			return items.getOrDefault(itemId, 0);
+		}
 		@Override public GoalCompletionVerifier.Position position() { return position; }
 		@Override public GoalCompletionVerifier.BlockFact blockAt(int x, int y, int z) {
+			blockReads++;
 			return blocks.getOrDefault(x + "," + y + "," + z, new GoalCompletionVerifier.BlockFact("minecraft:air", Map.of()));
 		}
 		@Override public boolean advancementGranted(String advancementId) { return advancements.getOrDefault(advancementId, false); }

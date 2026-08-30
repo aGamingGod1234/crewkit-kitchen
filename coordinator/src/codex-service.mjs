@@ -1,4 +1,4 @@
-import { CodexStdioTransport, CodexProtocolError } from './codex-app-server.mjs';
+import { CodexStdioTransport, CodexProtocolError, listCodexModels } from './codex-app-server.mjs';
 import { DEFAULT_AGENT_CAP, DEFAULT_SERVICE_TIER } from './constants.mjs';
 import { parseDecision } from './decision-parser.mjs';
 import { ModelCatalogCache } from './model-catalog-cache.mjs';
@@ -67,7 +67,7 @@ export class CodexService {
 		this.#exactLaunchProfile = builtinModels.length === 1
 			? { provider: 'codex', ...this.#config.launchProfile }
 			: null;
-		this.#catalog = dependencies.catalog ?? new ModelCatalogCache(() => this.#listModels(), {
+		this.#catalog = dependencies.catalog ?? new ModelCatalogCache(({ signal } = {}) => this.#listModels({ signal }), {
 			ttlMs: this.#config.catalogTtlMs,
 			now: dependencies.now ?? Date.now,
 			builtinModels,
@@ -323,16 +323,8 @@ export class CodexService {
 			|| records.some((record) => !profilesMatch(this.#exactLaunchProfile, { provider: 'codex', ...record }));
 	}
 
-	async #listModels() {
-		const models = [];
-		let cursor = null;
-		do {
-			const response = await this.#transport.request('model/list', { cursor, limit: 100, includeHidden: false });
-			if (!Array.isArray(response?.data)) throw new CodexProtocolError('INVALID_CATALOG', 'model/list response must contain a data array');
-			models.push(...response.data);
-			cursor = response.nextCursor ?? null;
-		} while (cursor !== null);
-		return models;
+	async #listModels({ signal } = {}) {
+		return listCodexModels(this.#transport, { signal });
 	}
 }
 

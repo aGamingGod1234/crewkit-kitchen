@@ -124,7 +124,12 @@ public final class CoordinatorStartupSmokeVerification {
 					}
 					Thread.sleep(100L);
 				}
-				throw new AssertionError("staged coordinator did not reach the catalog-ready boundary: " + supervisor.failureCode());
+				Path errorLog = packageRoot.resolve("game/logs/arena-agents-coordinator-error.log");
+				String errorDetail = Files.isRegularFile(errorLog)
+						? Files.readString(errorLog, StandardCharsets.UTF_8)
+						: "<missing coordinator error log>";
+				throw new AssertionError("staged coordinator did not reach the catalog-ready boundary: "
+						+ supervisor.failureCode() + "\n" + errorDetail);
 			}
 		} finally {
 			AssertionError ownershipFailure = null;

@@ -87,6 +87,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyBlockingMaintenanceNeverBlocksTicks();
 		verifyBlockedMaintenanceWaitsForRetryDeadline();
 		verifyProductionDependencyMonitorWakesOnRelevantFileChange();
+		verifyProductionDependencyMonitorAvoidsManifestMemberPolling();
 		verifyManifestFingerprintCoversEveryListedModule();
 		verifyExternalFingerprintChangeStillReplacesHealthyChild();
 		verifyWorkerFingerprintObservationAdvancesMonitorBaseline();
@@ -112,7 +113,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyCloseWaitsForInflightOwnedLaunchCleanup();
 		verifyCloseTerminatesChildBehindBlockedMaintenance();
 		verifyCloseIsIdempotent();
-		return isWindows() ? 306 : 296;
+		return isWindows() ? 369 : 359;
 	}
 
 	private static void verifyPosixLaunchGateCommand() {
@@ -1322,6 +1323,53 @@ public final class CoordinatorProcessSupervisorVerification {
 		} catch (IOException exception) {
 			throw new AssertionError("manifest fingerprint verification failed", exception);
 		} finally {
+			if (root != null) deleteTree(root);
+		}
+	}
+
+	private static void verifyProductionDependencyMonitorAvoidsManifestMemberPolling() {
+		String oldPackageRoot = System.getProperty("arenaagents.packageRoot");
+		Path root = null;
+		try {
+			root = Files.createTempDirectory("arena-cheap-dependency-monitor-");
+			Path module = root.resolve("coordinator/src/codex-service.mjs");
+			Path manifest = root.resolve("coordinator/.arena-agents-bundle-manifest");
+			Path generation = root.resolve("runtime/coordinator-generation.properties");
+			Files.createDirectories(module.getParent());
+			Files.createDirectories(generation.getParent());
+			Files.writeString(module, "alpha", StandardCharsets.UTF_8);
+			Files.writeString(manifest, "0".repeat(64) + " src/codex-service.mjs\n", StandardCharsets.UTF_8);
+			Files.writeString(generation, "generation=alpha\n", StandardCharsets.UTF_8);
+			FileTime initialManifestTime = Files.getLastModifiedTime(manifest);
+			FileTime initialGenerationTime = Files.getLastModifiedTime(generation);
+			System.setProperty("arenaagents.packageRoot", root.toString());
+			CoordinatorProcessSupervisor.DefaultDependencyResolver resolver =
+					new CoordinatorProcessSupervisor.DefaultDependencyResolver(root.resolve("game"), Map.of());
+			String initial = resolver.monitorFingerprint();
+			for (int second = 0; second < 60; second++) {
+				assertEquals(initial, resolver.monitorFingerprint(),
+						"unchanged monitor token stays stable without reading manifest-listed modules");
+			}
+
+			FileTime originalModuleTime = Files.getLastModifiedTime(module);
+			Files.writeString(module, "omega", StandardCharsets.UTF_8);
+			Files.setLastModifiedTime(module, FileTime.fromMillis(originalModuleTime.toMillis() + 2_000L));
+			assertEquals(initial, resolver.monitorFingerprint(),
+					"fast monitor token does not stat every manifest-listed module");
+
+			Files.writeString(generation, "generation=beta\n", StandardCharsets.UTF_8);
+			Files.setLastModifiedTime(generation, FileTime.fromMillis(initialGenerationTime.toMillis() + 2_000L));
+			String generationChanged = resolver.monitorFingerprint();
+			assertFalse(initial.equals(generationChanged),
+					"generation journal changes are visible on the next one-second monitor poll");
+			Files.writeString(manifest, "1".repeat(64) + " src/codex-service.mjs\n", StandardCharsets.UTF_8);
+			Files.setLastModifiedTime(manifest, FileTime.fromMillis(initialManifestTime.toMillis() + 2_000L));
+			assertFalse(generationChanged.equals(resolver.monitorFingerprint()),
+					"manifest changes are visible on the next one-second monitor poll");
+		} catch (IOException exception) {
+			throw new AssertionError("cheap dependency monitor verification failed", exception);
+		} finally {
+			restoreProperty("arenaagents.packageRoot", oldPackageRoot);
 			if (root != null) deleteTree(root);
 		}
 	}

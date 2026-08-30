@@ -92,7 +92,22 @@ test('goal spec request is exact, bounded, and deduplicates no candidate IDs', (
 	assert.deepEqual(parseGoalSpecRequest(request), request);
 	assert.throws(() => parseGoalSpecRequest({ ...request, candidateIds: [...request.candidateIds, request.candidateIds[0]] }), /duplicate/i);
 	assert.throws(() => parseGoalSpecRequest({ ...request, candidateIds: Array.from({ length: 65 }, (_, i) => `test:item_${i}`) }), /candidateIds/i);
-	assert.throws(() => parseGoalSpecRequest({ ...request, originalRequest: 'x'.repeat(2_049) }), /originalRequest/i);
+	assert.equal(parseGoalSpecRequest({ ...request, originalRequest: 'x'.repeat(4_096) }).originalRequest.length, 4_096);
+	assert.throws(() => parseGoalSpecRequest({ ...request, originalRequest: 'x'.repeat(4_097) }), /originalRequest/i);
+	assert.equal(parseGoalSpecRequest({ ...request, originalRequest: '\u{1f642}'.repeat(2_048) }).originalRequest.length, 4_096);
+	assert.throws(() => parseGoalSpecRequest({ ...request, originalRequest: '\u{1f642}'.repeat(2_049) }), /originalRequest/i);
+});
+
+test('goal persistence and fingerprints use Java-compatible UTF-16 length boundaries', () => {
+	const originalRequest = '\u{1f642}'.repeat(2_048);
+	const fields = { originalRequest, predicate: { type: 'operator_confirmed' }, createdAtTick: 7 };
+	const fingerprint = goalSpecFingerprint(fields);
+	assert.equal(fingerprint, '59f44cbb5e6425ac14c77166d18bf2f541276e8baa59c281ee03eb3b5df48637');
+	assert.deepEqual(parseGoalSpec({ ...fields, fingerprint }), { ...fields, fingerprint });
+	assert.throws(
+		() => goalSpecFingerprint({ ...fields, originalRequest: `${originalRequest}\u{1f642}` }),
+		/originalRequest/i,
+	);
 });
 
 test('wire goal spec retains immutable predicate, creation tick, and fingerprint', () => {

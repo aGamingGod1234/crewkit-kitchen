@@ -14,6 +14,8 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'offline-server-policy.ps1')
+. (Join-Path $PSScriptRoot 'project-metadata.ps1')
 
 $MinecraftVersion = '26.1.2'
 $FabricLoaderVersion = '0.19.3'
@@ -121,8 +123,8 @@ if (-not $SkipBuild) {
 	}
 }
 
-$arenaJar = Join-Path $project 'build\libs\arena-agents-0.2.0.jar'
-$carpetJar = Join-Path $project 'libs\fabric-carpet-26.1+v260402.jar'
+$arenaJar = Resolve-ArenaModJar $project
+$carpetJar = Resolve-ArenaCarpetJar $project
 foreach ($required in @($arenaJar, $carpetJar)) {
 	if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "Missing required mod JAR: $required" }
 }
@@ -141,6 +143,7 @@ try {
 	foreach ($required in @('fabric-server-launch.jar', 'server.jar', 'libraries', 'server.properties')) {
 		if (-not (Test-Path -LiteralPath (Join-Path $staging $required))) { throw "Fabric installer did not create required template artifact: $required" }
 	}
+	Assert-ArenaOfflineServerLoopback (Join-Path $staging 'server.properties') -RequireOffline
 	$mods = Join-Path $staging 'mods'
 	New-Item -ItemType Directory -Path $mods -Force | Out-Null
 	Copy-Item -LiteralPath $arenaJar -Destination (Join-Path $mods ([IO.Path]::GetFileName($arenaJar))) -Force

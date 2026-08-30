@@ -9,8 +9,19 @@ public record ScenarioLaunchRequest(
 		String mapVersion,
 		boolean deterministicEvents,
 		ScenarioPlacementMode placementMode,
-		List<ScenarioAgentSpec> roster
+		List<ScenarioAgentSpec> roster,
+		String confirmationToken
 ) {
+	public ScenarioLaunchRequest(
+			String scenarioId,
+			String mapVersion,
+			boolean deterministicEvents,
+			ScenarioPlacementMode placementMode,
+			List<ScenarioAgentSpec> roster
+	) {
+		this(scenarioId, mapVersion, deterministicEvents, placementMode, roster, "");
+	}
+
 	public ScenarioLaunchRequest {
 		ScenarioPreset preset = ScenarioPresets.require(scenarioId);
 		scenarioId = preset.id();
@@ -19,6 +30,11 @@ public record ScenarioLaunchRequest(
 			throw new IllegalArgumentException("scenario map version does not match the installed preset");
 		}
 		placementMode = Objects.requireNonNull(placementMode, "placementMode must not be null");
+		confirmationToken = Objects.requireNonNull(confirmationToken, "confirmationToken must not be null").trim();
+		if (confirmationToken.length() > 80 || confirmationToken.indexOf('\n') >= 0
+				|| confirmationToken.indexOf('\r') >= 0) {
+			throw new IllegalArgumentException("confirmation token is invalid");
+		}
 		roster = List.copyOf(Objects.requireNonNull(roster, "roster must not be null"));
 		preset.validateAgentCount(roster.size());
 		HashSet<Integer> slots = new HashSet<>();

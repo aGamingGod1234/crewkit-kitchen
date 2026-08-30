@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { buildCodexArgs, checkCodexModelProfile, CodexAgent, CodexProtocolError, CodexStdioTransport, resolveCodexLaunch } from '../src/codex-app-server.mjs';
+import { buildCodexArgs, checkCodexModelProfile, CodexAgent, CodexProtocolError, CodexStdioTransport, listCodexModels, resolveCodexLaunch } from '../src/codex-app-server.mjs';
 import { finishDecisionJson } from './provider-decision-fixtures.mjs';
 
 const model = {
@@ -48,7 +48,8 @@ class FakeStdioChild extends EventEmitter {
 		this.stdout = new EventEmitter();
 		this.stderr = new EventEmitter();
 		this.writes = [];
-		this.stdin = { write: (line) => this.writes.push(JSON.parse(String(line).trim())) };
+		this.stdin = new EventEmitter();
+		this.stdin.write = (line) => this.writes.push(JSON.parse(String(line).trim()));
 		this.killed = false;
 		this.exitCode = null;
 		this.signalCode = null;
@@ -306,6 +307,56 @@ test('Codex child stderr crosses the shared bounded diagnostic sanitizer', async
 	} finally {
 		await transport.stop();
 	}
+});
+
+test('aborted Codex requests settle promptly and ignore their late response', async () => {
+	const child = new FakeStdioChild();
+	const transport = new CodexStdioTransport(config, { spawn: () => child, stopTimeoutMs: 1 });
+	const started = transport.start();
+	child.emit('spawn');
+	await started;
+	try {
+		const controller = new AbortController();
+		const request = transport.request('model/list', {}, { signal: controller.signal, timeoutMs: 10_000 });
+		const requestId = child.writes.at(-1).id;
+		controller.abort();
+		await assert.rejects(request, (error) => error?.code === 'REQUEST_ABORTED');
+		const protocolErrors = [];
+		transport.on('protocolError', (error) => protocolErrors.push(error));
+		child.stdout.emit('data', `${JSON.stringify({ id: requestId, result: { data: [], nextCursor: null } })}\n`);
+		assert.deepEqual(protocolErrors, []);
+	} finally {
+		await transport.stop();
+	}
+});
+
+test('Codex catalog pagination is bounded, progressive, and cancellable', async () => {
+	let calls = 0;
+	await assert.rejects(listCodexModels({
+		request: async () => ({ data: [], nextCursor: 'same-cursor' }),
+	}, { yieldControl: async () => { calls += 1; } }), (error) => error?.code === 'CATALOG_CURSOR_LOOP');
+	assert.equal(calls, 1);
+
+	await assert.rejects(listCodexModels({
+		request: async (_method, { cursor }) => ({ data: [], nextCursor: `${cursor ?? 'start'}-next` }),
+	}, { maxPages: 2, yieldControl: async () => {} }), (error) => error?.code === 'CATALOG_PAGE_LIMIT');
+
+	await assert.rejects(listCodexModels({
+		request: async () => ({ data: [{}, {}, {}], nextCursor: null }),
+	}, { maxModels: 2 }), (error) => error?.code === 'CATALOG_MODEL_LIMIT');
+
+	const controller = new AbortController();
+	let requests = 0;
+	await assert.rejects(listCodexModels({
+		request: async () => {
+			requests += 1;
+			return { data: [], nextCursor: 'page-2' };
+		},
+	}, {
+		signal: controller.signal,
+		yieldControl: async () => controller.abort(),
+	}), (error) => error?.code === 'REQUEST_ABORTED');
+	assert.equal(requests, 1, 'cancellation prevents page N+1');
 });
 
 test('Codex desktop discovery writes a shared-sanitized bounded failure', (t) => {

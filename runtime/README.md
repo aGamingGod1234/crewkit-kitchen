@@ -2,6 +2,9 @@
 
 Everything generated beneath `runtime/` is local evidence or executable state and is ignored by Git except this file.
 
+This layout belongs to a source checkout. The Windows release ZIP uses its own
+`install-distribution.ps1` flow and does not ship the preparation scripts below.
+
 ## Directories
 
 - `server-template/`: reproducible runnable Fabric server generated from the tracked `server-template/` skeleton by `scripts/prepare-headless-server-template.ps1`; binaries, EULA state, and generated libraries stay ignored.
@@ -23,7 +26,7 @@ Only Fabric API and the final Arena Agents JAR are copied into their `mods` dire
 
 ## Official launcher installations
 
-After `prepare-runtime.ps1` installs `fabric-loader-0.19.3-26.1.2`, create two installations through the official launcher UI:
+`prepare-runtime.ps1` accepts only `%APPDATA%\.minecraft\saves\New World (76)` as its source world. It requires the project-local Java 25 runtime and an existing Fabric API JAR, installs `fabric-loader-0.19.3-26.1.2`, and copies the world into `runtime/server`. After it completes, create two installations through the official launcher UI:
 
 ### Arena Agent 55 (GPT-5.5 xhigh Fast)
 
@@ -50,9 +53,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-test-server.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\start-dynamic-coordinator.ps1
 ```
 
-Both scripts use `runtime\bridge-secret.txt`. The server receives only its absolute file path; the coordinator receives the secret in its process environment. Keep that file local and never attach it to evidence.
+Both scripts use `runtime\bridge-secret.txt`. `start-test-server.ps1` starts only the prepared Fabric server. `start-dynamic-coordinator.ps1` starts the manual development coordinator and requires the Codex CLI to be authenticated. The packaged launcher profile uses the bundled coordinator supervisor and must not run this second coordinator. Keep the secret file local and never attach it to evidence.
 
-The Fabric mod must be present on both the server and joining client because the custom NPC entity and renderer are mod-defined. Unlike the legacy two-player arena, all summoned NPCs share one server bridge. Codex NPCs retain separate Codex threads on the shared app server. Gemini NPCs use cancellable sandboxed Antigravity CLI print processes with exact combined model/thinking IDs, while Kimi NPCs retain separate ACP processes and sessions. Every provider uses a stable per-agent directory under `runtime/agent-workspaces`, keeping cwd, cancellation, and per-agent thinking settings isolated without copying credentials.
+The Fabric mod must be present on both the server and joining client because the custom NPC entity and renderer are mod-defined. All summoned NPCs share one authenticated server bridge. Each provider uses a stable per-agent directory under `runtime/agent-workspaces`. Codex keeps separate threads, Kimi keeps separate ACP processes and sessions, and Cursor resumes its native agent session. Gemini identities remain readable for saved-profile compatibility, but production planning fails closed because Antigravity cannot enforce the required no-tool boundary. Provider credentials remain in their normal CLI locations.
 
 ## Evidence classes
 

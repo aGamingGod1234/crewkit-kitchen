@@ -11,14 +11,29 @@ public record ScenarioLaunchPlan(
 		String mapVersion,
 		boolean deterministicEvents,
 		ScenarioPlacementMode placementMode,
-		List<Agent> roster
+		List<Agent> roster,
+		String confirmationToken
 ) {
+	public ScenarioLaunchPlan(
+			String scenarioId, String scenarioTitle, String mapVersion,
+			boolean deterministicEvents, ScenarioPlacementMode placementMode, List<Agent> roster
+	) {
+		this(scenarioId, scenarioTitle, mapVersion, deterministicEvents, placementMode, roster, "");
+	}
+
 	public ScenarioLaunchPlan {
 		scenarioId = Objects.requireNonNull(scenarioId, "scenarioId must not be null");
 		scenarioTitle = Objects.requireNonNull(scenarioTitle, "scenarioTitle must not be null");
 		mapVersion = Objects.requireNonNull(mapVersion, "mapVersion must not be null");
 		placementMode = Objects.requireNonNull(placementMode, "placementMode must not be null");
 		roster = List.copyOf(roster);
+		confirmationToken = Objects.requireNonNull(confirmationToken, "confirmationToken must not be null");
+		if (confirmationToken.length() > 80) throw new IllegalArgumentException("confirmationToken is too long");
+	}
+
+	public ScenarioLaunchPlan withConfirmationToken(String token) {
+		return new ScenarioLaunchPlan(
+				scenarioId, scenarioTitle, mapVersion, deterministicEvents, placementMode, roster, token);
 	}
 
 	public record Agent(

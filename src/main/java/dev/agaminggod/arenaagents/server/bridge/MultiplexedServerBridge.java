@@ -23,6 +23,7 @@ import dev.agaminggod.arenaagents.protocol.ProtocolConstants;
 import dev.agaminggod.arenaagents.scenario.ScenarioAgentEvent;
 import dev.agaminggod.arenaagents.scenario.runtime.ScenarioRuntimeService;
 import dev.agaminggod.arenaagents.server.AgentRuntimeHooks;
+import dev.agaminggod.arenaagents.server.AgentSavedData;
 import dev.agaminggod.arenaagents.server.AgentRuntimeRouter;
 import dev.agaminggod.arenaagents.server.AgentActivityPresentation;
 import dev.agaminggod.arenaagents.server.AgentChatReporter;
@@ -81,7 +82,10 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
@@ -165,6 +169,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private final SecureRandom authenticationRandom = new SecureRandom();
 	private final ProgramActionLedger programActions = new ProgramActionLedger();
 	private final TerminalResultLedger terminalResults = new TerminalResultLedger();
+	private final DurableActionJournal actionJournal;
 	private final Object publicationLock = new Object();
 	private final Object verboseControlLock = new Object();
 	private final Set<AgentId> protocolKnownAgentIds = new HashSet<>();
@@ -182,6 +187,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private volatile ServerSocket serverSocket;
 	private volatile Set<String> catalogProfiles = Set.of();
 	private volatile List<AgentControlModelOption> catalogModels = AgentControlCatalog.fallbackOptions();
+	private boolean actionJournalHydrated;
 	private volatile boolean catalogLoaded;
 	private boolean catalogDiscoveryPending;
 	private int catalogDiscoveryAttempts;
@@ -260,6 +266,20 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		);
 	}
 
+	MultiplexedServerBridge(
+			CodexAgentManager manager,
+			int port,
+			Path secretPath,
+			ServerSocketFactory serverSockets,
+			LongSupplier nanoTime,
+			DurableActionJournal actionJournal
+	) {
+		this(
+				manager, port, readSecret(secretPath), new AgentVerboseState(), defaultGoalVerificationRuntime(manager),
+				serverSockets, nanoTime, actionJournal
+		);
+	}
+
 	private MultiplexedServerBridge(
 			CodexAgentManager manager,
 			int port,
@@ -295,7 +315,21 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			ServerSocketFactory serverSockets,
 			LongSupplier nanoTime
 	) {
+		this(manager, port, preparedSecret, verboseState, goalVerificationRuntime, serverSockets, nanoTime, defaultActionJournal(manager));
+	}
+
+	private MultiplexedServerBridge(
+			CodexAgentManager manager,
+			int port,
+			String preparedSecret,
+			AgentVerboseState verboseState,
+			GoalVerificationRuntime goalVerificationRuntime,
+			ServerSocketFactory serverSockets,
+			LongSupplier nanoTime,
+			DurableActionJournal actionJournal
+	) {
 		this.manager = Objects.requireNonNull(manager, "manager must not be null");
+		this.actionJournal = Objects.requireNonNull(actionJournal, "actionJournal must not be null");
 		this.router = new AgentRuntimeRouter(manager);
 		if (port < 0 || port > 65_535) throw new IllegalArgumentException("bridge port must be between 0 and 65535");
 		this.port = port;
@@ -346,6 +380,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	synchronized void start(ServerSocketFactory socketFactory) {
 		Objects.requireNonNull(socketFactory, "server socket factory must not be null");
+		hydrateActionJournal();
 		if (!running.compareAndSet(false, true)) {
 			return;
 		}
@@ -621,6 +656,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	@Override
 	public boolean onCreated(AgentRecord record) {
 		registryPublicationRevision.incrementAndGet();
+		actionJournal.retainGoal(record.agentId(), logicalGoalId(record));
 		programActions.beginGoal(record.agentId(), record.goalRevision());
 		terminalResults.beginGoal(record.agentId(), record.goalRevision(), logicalGoalId(record));
 		synchronized (publicationLock) {
@@ -674,6 +710,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			send("goal_control", transition.after().agentId().toString(), goalControlPayload(transition, operation));
 			return null;
 		});
+		actionJournal.retainGoal(transition.after().agentId(), logicalGoalId(transition.after()));
 	}
 
 	void setHandshakeSnapshotHookForVerification(Runnable hook) {
@@ -697,6 +734,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		dev.agaminggod.arenaagents.server.voice.VoiceSubsystemRuntime.removeAgent(manager.server(), agentId);
 		programActions.remove(agentId);
 		terminalResults.remove(agentId);
+		actionJournal.remove(agentId);
 		observationPublication.remove(agentId);
 		synchronized (publicationLock) {
 			coordinatorReadyAgentIds.remove(agentId);
@@ -889,9 +927,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			ensureHandshakeTimeRemaining(source);
 			awaitDisconnectPublication(source);
 			ensureHandshakeTimeRemaining(source);
-			long snapshotRevision = registryPublicationRevision.get();
-			List<AgentRecord> visibleRecords = manager.coordinatorVisibleRecords();
-			List<PendingConversationWake> pendingWakes = manager.pendingConversationWakes();
+			HandshakeSnapshot snapshot = awaitHandshakeSnapshot(source);
+			long snapshotRevision = snapshot.registryRevision();
+			List<AgentRecord> visibleRecords = snapshot.visibleRecords();
 			JsonObject payload = new JsonObject();
 			payload.addProperty("replyTo", envelope.messageId());
 			payload.addProperty("authenticated", true);
@@ -909,7 +947,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			));
 			VerboseControlSnapshot verboseControl = verboseControlSnapshot();
 			handshake.add(verboseControlEnvelope(verboseControl.enabled()));
-			for (PendingConversationWake wake : pendingWakes) {
+			for (PendingConversationWake wake : snapshot.pendingWakes()) {
 				handshake.add(conversationWakeEnvelope(wake));
 			}
 			handshakeSnapshotHook.run();
@@ -943,19 +981,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				protocolKnownAgentIds.clear();
 				protocolKnownAgentIds.addAll(handshakeKnownAgentIds);
 				coordinatorReadyAgentIds.clear();
-				Map<AgentId, AgentRecord> allRecordsById = new HashMap<>();
-				for (AgentRecord record : manager.records()) allRecordsById.put(record.agentId(), record);
-				for (PendingGoalDraft draft : manager.goalDrafts()) {
-					AgentRecord record = allRecordsById.get(draft.agentId());
-					if (record == null) {
-						manager.removeGoalDraft(draft.draftId());
-						continue;
-					}
-					if (!draft.matches(record)) {
-						manager.removeGoalDraft(draft.draftId());
-						continue;
-					}
-					if (draft.proposedPredicate().isEmpty() && handshakeKnownAgentIds.contains(draft.agentId())) {
+				for (PendingGoalDraft draft : snapshot.goalSpecRequests()) {
+					if (handshakeKnownAgentIds.contains(draft.agentId())) {
 						handshake.add(goalSpecRequestEnvelope(draft));
 					}
 				}
@@ -1027,7 +1054,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		AgentId agentId = AgentId.parse(envelope.agentId());
 		JsonObject payload = envelope.payload();
 		requireKeys(payload, Set.of("goalRevision", "actionId"), "action_result_ack");
-		terminalResults.acknowledge(agentId, requiredLong(payload, "goalRevision"), requiredString(payload, "actionId"));
+		long goalRevision = requiredLong(payload, "goalRevision");
+		String actionId = requiredString(payload, "actionId");
+		actionJournal.acknowledge(agentId, goalRevision, actionId);
+		terminalResults.acknowledge(agentId, goalRevision, actionId);
 	}
 
 	private void acceptGoalSpecProposal(BridgeEnvelope envelope) {
@@ -1403,6 +1433,118 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 	}
 
+	void hydrateActionJournalForVerification() {
+		hydrateActionJournal();
+	}
+
+	private synchronized void hydrateActionJournal() {
+		if (actionJournalHydrated) return;
+		actionJournal.terminalizeAccepted(MultiplexedServerBridge::recoveryUncertainResult);
+		List<AgentRecord> records = manager.registry().records();
+		Map<AgentId, AgentRecord> current = new HashMap<>();
+		for (AgentRecord record : records) {
+			current.put(record.agentId(), record);
+			actionJournal.retainGoal(record.agentId(), logicalGoalId(record));
+		}
+		for (DurableActionJournal.Entry entry : actionJournal.snapshot()) {
+			AgentRecord record = current.get(entry.request().agentId());
+			if (record == null) {
+				actionJournal.remove(entry.request().agentId());
+				continue;
+			}
+		}
+		for (AgentRecord record : records) {
+			programActions.beginGoal(record.agentId(), record.goalRevision());
+		}
+		for (DurableActionJournal.Entry entry : actionJournal.snapshot()) {
+			AgentRecord record = current.get(entry.request().agentId());
+			if (record == null) continue;
+			ServerActionResult result = entry.result();
+			if (entry.request().goalRevision() == record.goalRevision()) {
+				programActions.accept(entry.request());
+				programActions.terminal(result);
+			}
+			if (entry.phase() == DurableActionJournal.Phase.TERMINAL) {
+				terminalResults.beginGoal(entry.request().agentId(), entry.request().goalRevision(), entry.logicalGoalId());
+				terminalResults.retain(result);
+			}
+		}
+		for (AgentRecord record : records) {
+			terminalResults.beginGoal(record.agentId(), record.goalRevision(), logicalGoalId(record));
+		}
+		actionJournalHydrated = true;
+	}
+
+	static ServerActionResult recoveryUncertainResult(ServerActionRequest request) {
+		return new ServerActionResult(
+				request.agentId(), request.goalRevision(), request.actionId(), request.type(), request.traceId(),
+				dev.agaminggod.arenaagents.server.runtime.ServerActionState.FAILED,
+				"RECOVERY_UNCERTAIN",
+				"Server restarted after accepting the action; its physical outcome is uncertain and it will not be replayed",
+				0L, Math.max(1L, System.currentTimeMillis()), true, true
+		);
+	}
+
+	private HandshakeSnapshot awaitHandshakeSnapshot(Session source) {
+		if (manager.server() == null || !manager.server().isRunning()) {
+			return captureHandshakeSnapshot(false);
+		}
+		CompletableFuture<HandshakeSnapshot> snapshot = new CompletableFuture<>();
+		if (!serverTasks.offer(BoundedServerTaskQueue.Lane.CONTROL, () -> {
+			try {
+				snapshot.complete(captureHandshakeSnapshot(true));
+			} catch (RuntimeException exception) {
+				snapshot.completeExceptionally(exception);
+			}
+		})) {
+			throw new BridgeProtocolException(
+					"SERVER_TASK_QUEUE_FULL", "Could not capture the coordinator handshake on the server thread");
+		}
+		long remainingNanos = source.handshakeRemainingNanos();
+		if (remainingNanos <= 0L) throw handshakeTimeout();
+		try {
+			return snapshot.get(remainingNanos, TimeUnit.NANOSECONDS);
+		} catch (TimeoutException exception) {
+			throw handshakeTimeout();
+		} catch (InterruptedException exception) {
+			Thread.currentThread().interrupt();
+			throw new BridgeProtocolException(
+					"COORDINATOR_DISCONNECTED", "Bridge authentication was interrupted", exception);
+		} catch (ExecutionException exception) {
+			Throwable cause = exception.getCause();
+			if (cause instanceof RuntimeException runtime) throw runtime;
+			throw new BridgeProtocolException(
+					"HANDSHAKE_SNAPSHOT_FAILED", "Could not capture coordinator state", cause);
+		}
+	}
+
+	private HandshakeSnapshot captureHandshakeSnapshot(boolean mayPruneStaleDrafts) {
+		long revision = registryPublicationRevision.get();
+		List<AgentRecord> visibleRecords = manager.coordinatorVisibleRecords();
+		List<PendingConversationWake> pendingWakes = manager.pendingConversationWakes();
+		Map<AgentId, AgentRecord> recordsById = new HashMap<>();
+		for (AgentRecord record : manager.records()) recordsById.put(record.agentId(), record);
+		ArrayList<PendingGoalDraft> goalSpecRequests = new ArrayList<>();
+		ArrayList<UUID> staleDraftIds = new ArrayList<>();
+		for (PendingGoalDraft draft : manager.goalDrafts()) {
+			AgentRecord record = recordsById.get(draft.agentId());
+			if (record == null || !draft.matches(record)) {
+				staleDraftIds.add(draft.draftId());
+			} else if (draft.proposedPredicate().isEmpty()) {
+				goalSpecRequests.add(draft);
+			}
+		}
+		if (!staleDraftIds.isEmpty()) {
+			if (mayPruneStaleDrafts) {
+				staleDraftIds.forEach(manager::removeGoalDraft);
+			} else if (!serverTasks.offer(BoundedServerTaskQueue.Lane.CONTROL,
+					() -> staleDraftIds.forEach(manager::removeGoalDraft))) {
+				LOGGER.debug("Stale goal draft cleanup deferred because the server task queue is full");
+			}
+		}
+		return new HandshakeSnapshot(revision, visibleRecords, pendingWakes, goalSpecRequests);
+	}
+
 	private static void ensureHandshakeTimeRemaining(Session source) {
 		if (source.handshakeRemainingNanos() <= 0L) throw handshakeTimeout();
 	}
@@ -1411,6 +1553,19 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		return new BridgeProtocolException(
 				"AUTHENTICATION_TIMEOUT", "Coordinator handshake deadline expired while publishing the registry snapshot"
 		);
+	}
+
+	private record HandshakeSnapshot(
+			long registryRevision,
+			List<AgentRecord> visibleRecords,
+			List<PendingConversationWake> pendingWakes,
+			List<PendingGoalDraft> goalSpecRequests
+	) {
+		private HandshakeSnapshot {
+			visibleRecords = List.copyOf(visibleRecords);
+			pendingWakes = List.copyOf(pendingWakes);
+			goalSpecRequests = List.copyOf(goalSpecRequests);
+		}
 	}
 
 	private void bumpRegistryPublicationRevision() {
@@ -1606,11 +1761,24 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	private void acceptAction(BridgeEnvelope envelope) {
+		boolean durableAccepted = false;
 		try {
 			ServerActionRequest request = decodeActionRequest(envelope);
-			validateActionProvenance(request);
-			actionExecutor.submitProgramPrimitive(request);
+			AgentRecord record = validateActionProvenance(request);
+			actionJournal.accept(request, logicalGoalId(record));
+			durableAccepted = true;
+			try {
+				programActions.accept(request);
+				actionExecutor.submitProgramPrimitive(request);
+			} catch (RuntimeException exception) {
+				if (actionJournal.rollbackAccepted(request)) {
+					durableAccepted = false;
+					programActions.rollback(request);
+				}
+				throw exception;
+			}
 		} catch (BridgeProtocolException | AgentDomainException exception) {
+			if (durableAccepted) throw exception;
 			if (sendRejectedAction(envelope, exception)) return;
 			throw exception;
 		}
@@ -1706,7 +1874,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		return bounded.isBlank() ? fallback : bounded;
 	}
 
-	private void validateActionProvenance(ServerActionRequest request) {
+	private AgentRecord validateActionProvenance(ServerActionRequest request) {
 		AgentRecord record = manager.registry().require(request.agentId());
 		boolean respawn = request.type() == ActionType.RESPAWN;
 		if ((respawn && (record.state() != AgentLifecycleState.DEAD || request.goalRevision() != record.goalRevision()))
@@ -1735,7 +1903,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 					requiredString(request.arguments(), "recipientId")
 			);
 		}
-		programActions.accept(request);
+		return record;
 	}
 
 	private static ActionProvenance decodeActionProvenance(JsonObject payload) {
@@ -1769,6 +1937,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	private void sendActionResult(ServerActionResult result) {
+		actionJournal.terminal(result);
 		programActions.terminal(result);
 		observations.invalidate(result.agentId());
 		ScenarioRuntimeService.onAgentAction(
@@ -1817,8 +1986,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		conversationPublished(event);
 	}
 
-	private void publishGoalSpecRequest(PendingGoalDraft draft) {
+	void publishGoalSpecRequest(PendingGoalDraft draft) {
 		Objects.requireNonNull(draft, "draft must not be null");
+		// A draft staged after handshake capture must either invalidate that snapshot or use the live session.
+		bumpRegistryPublicationRevision();
 		synchronized (publicationLock) {
 			Session active = session;
 			if (active == null || !active.open.get() || !active.authenticated.get()
@@ -1927,7 +2098,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			try {
 				if (!terminalResults.claim(result, active)) throw new BridgeProtocolException("ACTION_RESULT_REPLAY_CONFLICT", "Respawn result is already queued");
 				publishRespawnScenarioEvents(
-						() -> active.enqueuePair(resultEnvelope, controlEnvelope, commit),
+						() -> active.enqueuePair(resultEnvelope, controlEnvelope,
+								() -> commitRespawnTerminal(commit, () -> actionJournal.terminal(result))),
 						() -> ScenarioRuntimeService.onAgentAction(manager.server(), result.agentId().toString(), result.actionType().wireName(), true),
 						() -> ScenarioRuntimeService.onAgentState(manager.server(), transition.after().agentId().toString(), publicState(transition.after().state()))
 				);
@@ -2309,6 +2481,19 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				System::currentTimeMillis,
 				manager::validateGoalForActivation
 		);
+	}
+
+	static void commitRespawnTerminal(Runnable commit, Runnable persistTerminal) {
+		Objects.requireNonNull(commit, "commit must not be null");
+		Objects.requireNonNull(persistTerminal, "persistTerminal must not be null");
+		commit.run();
+		persistTerminal.run();
+	}
+
+	private static DurableActionJournal defaultActionJournal(CodexAgentManager manager) {
+		Objects.requireNonNull(manager, "manager must not be null");
+		if (manager.server() == null || !manager.server().isRunning()) return DurableActionJournal.inMemory();
+		return DurableActionJournal.open(AgentSavedData.actionJournalPath(manager.server()));
 	}
 
 	private static Path configuredSecretPath() {
@@ -2749,11 +2934,14 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				if (!allowUnchanged && published.hasDelivered(agentId) && !delta.attention()) return Result.SUPPRESSED;
 				JsonObject delivery = observation.deepCopy();
 				attachDelta(delivery, delta);
-				delivery = fitter.apply(agentId, delivery).observation();
-				delta = published.delta(agentId, delivery, eventSequence, observedAtEpochMs);
-				attachDelta(delivery, delta);
-				delivery = fitter.apply(agentId, delivery).observation();
-				attachDelta(delivery, published.delta(agentId, delivery, eventSequence, observedAtEpochMs));
+				ServerObservationWireBudget.Fitted fitted = fitter.apply(agentId, delivery);
+				delivery = fitted.observation();
+				if (!fitted.reductions().isEmpty()) {
+					delta = published.delta(agentId, delivery, eventSequence, observedAtEpochMs);
+					attachDelta(delivery, delta);
+					delivery = fitter.apply(agentId, delivery).observation();
+					attachDelta(delivery, published.delta(agentId, delivery, eventSequence, observedAtEpochMs));
+				}
 				if (!writer.send(agentId, delivery)) return Result.DELIVERY_RETRY;
 				published.commit(agentId, delivery);
 				return Result.COMMITTED;
@@ -3063,13 +3251,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 					if (agentQueued > AGENT_QUEUE_CAP - 2) throw new BridgeProtocolException("AGENT_BACKPRESSURE", first.agentId());
 					if (outbound.remainingCapacity() < 2) throw new BridgeProtocolException("CONNECTION_BACKPRESSURE", "Outbound queue cannot atomically publish paired messages");
 					beforeEnqueue.run();
-					if (!open.get() || !authenticated.get()) {
-						throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Bridge session closed during paired publication");
-					}
 					if (!outbound.offer(first) || !outbound.offer(second)) {
 						outbound.remove(first);
 						outbound.remove(second);
-						throw new BridgeProtocolException("CONNECTION_BACKPRESSURE", "Atomic paired publication failed");
+						throw new IllegalStateException("preflighted paired publication queue rejected an envelope");
 					}
 					queuedByAgent.put(first.agentId(), agentQueued + 2);
 				}

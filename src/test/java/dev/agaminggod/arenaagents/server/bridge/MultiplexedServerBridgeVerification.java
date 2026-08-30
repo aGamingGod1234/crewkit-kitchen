@@ -13,7 +13,6 @@ import dev.agaminggod.arenaagents.agent.AgentTransition;
 import dev.agaminggod.arenaagents.agent.goal.GoalEvidence;
 import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
 import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
-import dev.agaminggod.arenaagents.agent.AgentTransition;
 import dev.agaminggod.arenaagents.server.AgentRuntimeHooks;
 import dev.agaminggod.arenaagents.server.AgentSavedData;
 import dev.agaminggod.arenaagents.server.AgentVerboseState;
@@ -28,6 +27,7 @@ import dev.agaminggod.arenaagents.server.goal.GoalDraftChoice;
 import dev.agaminggod.arenaagents.server.goal.GoalSpecWireCodec;
 import dev.agaminggod.arenaagents.server.goal.PendingGoalDraft;
 import dev.agaminggod.arenaagents.server.perception.ObservationDispatchQueue;
+import dev.agaminggod.arenaagents.server.perception.ServerObservationWireBudget;
 import dev.agaminggod.arenaagents.server.runtime.ActionProvenance;
 import dev.agaminggod.arenaagents.server.runtime.GoalCompletionVerifier;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionProgress;
@@ -44,7 +44,6 @@ import java.net.ServerSocket;
 import java.lang.reflect.Method;
 import java.net.InetAddress;
 import java.net.Proxy;
-import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
@@ -61,14 +60,10 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.Set;
-import java.util.UUID;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 import net.minecraft.nbt.NbtOps;
 import net.minecraft.nbt.Tag;
 import net.minecraft.SystemReport;
@@ -101,6 +96,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyReplacementHandshakeSupersedesPendingDisconnect();
 		verifyAuthenticatedReconnectRecovery();
 		verifyTerminalReplaySurvivesDisconnectRevision();
+		verifyAcceptedActionRecoversWithoutReplay();
 		verifyObsoletePlannerReadinessIsIgnored();
 		verifyAgentErrorRevisionGate();
 		verifyRespawnContinuationPayload();
@@ -154,6 +150,19 @@ public final class MultiplexedServerBridgeVerification {
 		);
 		assertEquals(List.of("paired-messages-and-commit", "action-attempted", "state-after-telemetry-failure"), committed,
 				"scenario callback failure cannot escape or roll back committed respawn publication");
+		List<String> durableRespawn = new ArrayList<>();
+		MultiplexedServerBridge.commitRespawnTerminal(
+				() -> durableRespawn.add("commit"),
+				() -> durableRespawn.add("terminal")
+		);
+		assertEquals(List.of("commit", "terminal"), durableRespawn,
+				"respawn success becomes durable only after the rollback-capable lifecycle commit");
+		AtomicBoolean terminalPersisted = new AtomicBoolean();
+		assertThrows(IllegalStateException.class, () -> MultiplexedServerBridge.commitRespawnTerminal(
+				() -> { throw new IllegalStateException("commit rejected"); },
+				() -> terminalPersisted.set(true)
+		), "failed respawn commit does not persist terminal success");
+		assertTrue(!terminalPersisted.get(), "failed respawn commit leaves the accepted journal phase intact");
 		verifyDeathFacts();
 		verifyTraceWireValidation();
 		verifyExactTargetObservationLedger(registered.getFirst().agentId());
@@ -166,18 +175,65 @@ public final class MultiplexedServerBridgeVerification {
 		verifyAtomicConversationWakePublication();
 		verifyGoalSpecProposalLifecycle();
 		verifyStaleGoalDraftIsPrunedBeforeHandshake();
+		verifyGoalDraftCreatedDuringHandshakeIsReplayed();
 		verifyCompletionResultFacts();
 		verifyReplacementOperation();
 		verifyFailedBindClosesEverySocket();
 		verifyShutdownRejectsAcceptedSocketBeforePublication();
 		verifyLaunchIdentityAndReconnectGeneration();
 		verifyReplacementHandshakeDrainsPreviousDisconnect();
+		verifyHandshakeSnapshotAvoidsRegistryLockInversion();
 		verifyHandshakeResnapshotsLifecycleRaces();
 		verifyHandshakeSnapshotDeadline();
 		verifyImmediateHandshakeClosePreservesDisconnect();
 		verifyPendingRegistrationMarkerIsFenced();
 		verifyAtomicPublicationRacesSessionClose();
-		return 260;
+		return 278;
+	}
+
+	private static void verifyAcceptedActionRecoversWithoutReplay() {
+		MultiplexedServerBridge bridge = null;
+		Path secretFile = null;
+		Path journalFile = null;
+		try {
+			secretFile = Files.createTempFile("arena-agents-action-recovery-secret-", ".txt");
+			Files.writeString(secretFile, "0123456789abcdef0123456789abcdef");
+			journalFile = Files.createTempFile("arena-agents-action-recovery-", ".json");
+			Files.delete(journalFile);
+			CodexAgentManager manager = uninitializedManager();
+			AgentRecord created = manager.registry().create("gpt-5.6-sol", "high", Optional.of("JournalRecovery"), 4_000L);
+			AgentRecord started = manager.registry().start(created.agentId(), "recover the accepted action", 4_001L).after();
+			JsonObject arguments = new JsonObject();
+			arguments.addProperty("durationMs", 25L);
+			String traceId = "trace-action-recovery";
+			ServerActionRequest request = new ServerActionRequest(
+					started.agentId(), started.goalRevision(), "accepted-before-crash", ActionType.WAIT, arguments,
+					new ActionProvenance(
+							"codex", "gpt-5.6-sol", "high", "priority", "recovery-program", 1L,
+							"recovery-step", 1L, traceId, null
+					), traceId
+			);
+			DurableActionJournal journal = DurableActionJournal.open(journalFile);
+			journal.accept(request, started.currentGoal().orElseThrow().goalId());
+			bridge = new MultiplexedServerBridge(manager, 0, secretFile, ServerSocket::new, System::nanoTime, journal);
+			bridge.hydrateActionJournalForVerification();
+
+			DurableActionJournal.Entry recovered = DurableActionJournal.open(journalFile).snapshot().getFirst();
+			assertEquals(DurableActionJournal.Phase.TERMINAL, recovered.phase(),
+					"accepted-only crash recovery is durably terminalized");
+			assertEquals("RECOVERY_UNCERTAIN", recovered.result().reasonCode(),
+					"accepted-only crash recovery reports an explicit uncertain outcome");
+			assertEquals(1, bridge.terminalResultsForVerification().pendingCount(),
+					"uncertain recovery result is hydrated for coordinator replay");
+			ProgramActionLedger actions = (ProgramActionLedger) readPrivateField(bridge, "programActions");
+			assertThrowsDomain(() -> actions.accept(request), "ACTION_REPLAY");
+		} catch (ReflectiveOperationException | IOException exception) {
+			throw new AssertionError("accepted action crash recovery verification failed", exception);
+		} finally {
+			if (bridge != null) bridge.close();
+			deleteIfExists(secretFile);
+			deleteIfExists(journalFile);
+		}
 	}
 
 	/**
@@ -721,7 +777,8 @@ public final class MultiplexedServerBridgeVerification {
 				Thread.sleep(50L);
 				assertTrue(!reader.ready(), "stale goal draft is not replayed during authentication");
 			}
-			assertTrue(manager.goalDraft(draftId).isEmpty(), "stale goal draft is removed before handshake publication");
+			bridge.tick();
+			assertTrue(manager.goalDraft(draftId).isEmpty(), "stale goal draft cleanup runs on the server tick");
 		} catch (Exception exception) {
 			throw new AssertionError("stale goal draft handshake verification failed", exception);
 		} finally {
@@ -729,6 +786,59 @@ public final class MultiplexedServerBridgeVerification {
 			if (secretFile != null) try { Files.deleteIfExists(secretFile); } catch (java.io.IOException exception) {
 				throw new AssertionError("could not remove stale goal draft secret", exception);
 			}
+		}
+	}
+
+	private static void verifyGoalDraftCreatedDuringHandshakeIsReplayed() {
+		MultiplexedServerBridge bridge = null;
+		Path secretFile = null;
+		CountDownLatch releaseSnapshot = new CountDownLatch(1);
+		try {
+			String secret = "0123456789abcdef0123456789abcdef";
+			secretFile = Files.createTempFile("arena-agents-goal-draft-handshake-", ".txt");
+			Files.writeString(secretFile, secret);
+			CodexAgentManager manager = uninitializedManager();
+			AgentRecord idle = manager.registry().create("gpt-5.6-sol", "high", Optional.of("DraftRace"), 1_100L);
+			bridge = new MultiplexedServerBridge(manager, 0, secretFile);
+			CountDownLatch snapshotCaptured = new CountDownLatch(1);
+			bridge.setHandshakeSnapshotHookForVerification(() -> {
+				snapshotCaptured.countDown();
+				awaitLatch(releaseSnapshot, "goal draft handshake snapshot released");
+			});
+			bridge.start();
+			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+				socket.setSoTimeout(2_000);
+				String messageId = "hello-goal-draft-handshake";
+				AuthenticationExchange exchange = beginAuthentication(socket, reader, codec, secret, messageId);
+				writeAuthenticatedHello(socket, codec, secret, null, messageId, exchange);
+				awaitLatch(snapshotCaptured, "handshake captures state before the goal draft is staged");
+				PendingGoalDraft draft = new PendingGoalDraft(
+						UUID.fromString("00000000-0000-0000-0000-000000000321"), idle.agentId(),
+						UUID.fromString("00000000-0000-0000-0000-000000000322"),
+						"Obtain an iron pickaxe", List.of("minecraft:iron_pickaxe"), Optional.empty(),
+						DraftIntent.CONFIRM_TRANSLATION, 1_101L, idle.goalRevision(), Optional.empty()
+				);
+				manager.stageGoalDraft(draft);
+				bridge.publishGoalSpecRequest(draft);
+				releaseSnapshot.countDown();
+				assertEquals("hello_ack", codec.decode(reader.readLine()).type(),
+						"handshake retries after the staged goal draft invalidates its snapshot");
+				assertEquals("verbose_control", codec.decode(reader.readLine()).type(),
+						"verbose control remains ordered before goal draft replay");
+				BridgeEnvelope replay = codec.decode(reader.readLine());
+				assertEquals("goal_spec_request", replay.type(),
+						"goal draft staged during authentication is included by the retried handshake");
+				assertEquals(draft.draftId().toString(), replay.payload().get("requestId").getAsString(),
+						"retried handshake preserves the staged draft identity");
+			}
+		} catch (Exception exception) {
+			throw new AssertionError("goal draft handshake race verification failed", exception);
+		} finally {
+			releaseSnapshot.countDown();
+			if (bridge != null) bridge.close();
+			deleteIfExists(secretFile);
 		}
 	}
 
@@ -1699,6 +1809,45 @@ public final class MultiplexedServerBridgeVerification {
 		}
 	}
 
+	private static void verifyHandshakeSnapshotAvoidsRegistryLockInversion() {
+		MultiplexedServerBridge bridge = null;
+		Path secretFile = null;
+		CountDownLatch releaseSnapshot = new CountDownLatch(1);
+		try {
+			String secret = "0123456789abcdef0123456789abcdef";
+			secretFile = Files.createTempFile("arena-agents-handshake-lock-order-", ".txt");
+			Files.writeString(secretFile, secret);
+			CodexAgentManager manager = uninitializedManager();
+			manager.registry().create("gpt-5.6-sol", "high", Optional.of("LockOrder"), 1_000L);
+			bridge = new MultiplexedServerBridge(manager, 0, secretFile);
+			CountDownLatch snapshotCaptured = new CountDownLatch(1);
+			bridge.setHandshakeSnapshotHookForVerification(() -> {
+				snapshotCaptured.countDown();
+				awaitLatch(releaseSnapshot, "lock-order handshake snapshot released");
+			});
+			bridge.start();
+			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+				socket.setSoTimeout(2_000);
+				writeHello(socket, reader, codec, secret, null, "hello-lock-order");
+				awaitLatch(snapshotCaptured, "handshake captures registry state before publication");
+				synchronized (manager.registry()) {
+					releaseSnapshot.countDown();
+					assertEquals("hello_ack", codec.decode(reader.readLine()).type(),
+							"handshake publishes without reacquiring the registry under publicationLock");
+				}
+				assertTrue(bridge.authenticated(), "lock-order handshake commits while the registry monitor is held");
+			}
+		} catch (Exception exception) {
+			throw new AssertionError("handshake registry lock-order verification failed", exception);
+		} finally {
+			releaseSnapshot.countDown();
+			if (bridge != null) bridge.close();
+			deleteIfExists(secretFile);
+		}
+	}
+
 	private static void verifyHandshakeResnapshotsLifecycleRaces() {
 		verifyRemovalDuringHandshakeResnapshots();
 		verifyTransitionDuringHandshakePublishesOnce();
@@ -2125,7 +2274,12 @@ public final class MultiplexedServerBridgeVerification {
 				}, "matching coordinator acknowledgement is persisted");
 				assertEquals(1, manager.pendingConversationWakes().size(),
 						"acknowledgement retains replay context until the wake goal is terminal");
-				manager.registry().coordinatorCompleted(idle.agentId(), 1L, System.currentTimeMillis());
+				manager.registry().satisfyGoal(
+						idle.agentId(),
+						1L,
+						new GoalEvidence(System.currentTimeMillis(), "operator_confirmed", List.of()),
+						System.currentTimeMillis()
+				);
 				assertTrue(manager.pendingConversationWakes().isEmpty(),
 						"terminal wake goal clears its durable replay context");
 			}
@@ -2160,6 +2314,26 @@ public final class MultiplexedServerBridgeVerification {
 				authenticate(socket, reader, codec, secret, null, "hello-publication-close-race");
 				Object session = readPrivateField(bridge, "session");
 				Object publicationLock = readPrivateField(bridge, "publicationLock");
+				Method enqueuePair = session.getClass().getDeclaredMethod(
+						"enqueuePair", BridgeEnvelope.class, BridgeEnvelope.class, Runnable.class);
+				enqueuePair.setAccessible(true);
+				BridgeEnvelope pairFirst = new BridgeEnvelope(
+						2, "server-instance", "server", "heartbeat", "paired-rollback-first", new JsonObject());
+				BridgeEnvelope pairSecond = new BridgeEnvelope(
+						2, "server-instance", "server", "heartbeat", "paired-rollback-second", new JsonObject());
+				try {
+					enqueuePair.invoke(session, pairFirst, pairSecond,
+							(Runnable) () -> { throw new IllegalStateException("paired callback failed"); });
+					throw new AssertionError("failed paired callback was accepted");
+				} catch (java.lang.reflect.InvocationTargetException exception) {
+					assertTrue(exception.getCause() instanceof IllegalStateException,
+							"paired callback failure is returned to the transaction owner");
+				}
+				@SuppressWarnings("unchecked")
+				java.util.concurrent.ArrayBlockingQueue<BridgeEnvelope> outbound =
+						(java.util.concurrent.ArrayBlockingQueue<BridgeEnvelope>) readPrivateField(session, "outbound");
+				assertTrue(outbound.stream().noneMatch(envelope -> envelope.messageId().startsWith("paired-rollback-")),
+						"failed paired callback publishes neither envelope");
 				Method enqueueAtomically = session.getClass().getDeclaredMethod("enqueueAtomically", BridgeEnvelope.class, Runnable.class);
 				enqueueAtomically.setAccessible(true);
 				BridgeEnvelope envelope = new BridgeEnvelope(2, "server-instance", "server", "heartbeat", "publication-close-race", new JsonObject());
@@ -2412,6 +2586,7 @@ public final class MultiplexedServerBridgeVerification {
 			putObject(unsafe, manager, "pendingAgentRegistrations", java.util.concurrent.ConcurrentHashMap.newKeySet());
 			putObject(unsafe, manager, "pendingEntityRecoveries", new java.util.LinkedHashSet<>());
 			putObject(unsafe, manager, "seenPlayers", new java.util.LinkedHashSet<>());
+			putObject(unsafe, manager, "lastLocationPersistenceEpochMs", new java.util.LinkedHashMap<>());
 			return manager;
 		} catch (ReflectiveOperationException exception) {
 			throw new AssertionError("could not allocate lifecycle-only manager", exception);
@@ -3025,6 +3200,20 @@ public final class MultiplexedServerBridgeVerification {
 		assertEquals(MultiplexedServerBridge.ObservationPublication.Result.COMMITTED,
 				publication.publish(agent, session, first, (ignoredAgent, ignoredPayload) -> true, false),
 				"the first urgent observation establishes a delivered baseline");
+		AtomicInteger fitCalls = new AtomicInteger();
+		MultiplexedServerBridge.ObservationPublication singleFitPublication =
+				new MultiplexedServerBridge.ObservationPublication(16, 16, (ignoredAgent, payload) -> {
+					fitCalls.incrementAndGet();
+					return new ServerObservationWireBudget.Fitted(payload, List.of());
+				});
+		singleFitPublication.activate(session);
+		JsonObject singleFitObservation = observation("00000000-0000-0000-0000-000000000002", 1_000L);
+		assertEquals(MultiplexedServerBridge.ObservationPublication.Result.COMMITTED,
+				singleFitPublication.publish(agent, session, singleFitObservation,
+						(ignoredAgent, ignoredPayload) -> true, false),
+				"an under-budget observation publishes through the single-fit path");
+		assertEquals(1, fitCalls.get(), "an under-budget observation is fitted once");
+		assertTrue(!singleFitObservation.has("eventSequence"), "single-fit publication does not mutate the collector snapshot");
 		JsonObject unchanged = first.deepCopy();
 		unchanged.addProperty("observedAtEpochMs", 1_001L);
 		assertEquals(MultiplexedServerBridge.ObservationPublication.Result.SUPPRESSED,

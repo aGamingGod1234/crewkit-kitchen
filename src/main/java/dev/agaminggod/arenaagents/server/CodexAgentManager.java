@@ -76,6 +76,7 @@ public final class CodexAgentManager {
 	private static final long VANILLA_DEATH_REMOVAL_GRACE_MS = 1_000L;
 	private static final long RECOVERY_RETRY_DELAY_MS = 30_000L;
 	private static final long CANCELLED_SPAWN_RETENTION_MS = 120_000L;
+	private static final long LOCATION_PERSIST_INTERVAL_MS = 1_000L;
 	private static final String HIDDEN_AGENT_TEAM = "arenaagents_hidden";
 	private static final TicketType AGENT_TICKET_TYPE = new TicketType(
 			TicketType.NO_TIMEOUT,
@@ -90,6 +91,7 @@ public final class CodexAgentManager {
 	private final Map<AgentChunkTicket, Integer> chunkTicketReferences = new LinkedHashMap<>();
 	private final Map<AgentId, Long> pendingPlayerSpawns = new LinkedHashMap<>();
 	private final Map<AgentId, VanillaRespawnAttempt> pendingVerifiedRespawns = new LinkedHashMap<>();
+	private final Map<AgentId, Long> lastLocationPersistenceEpochMs = new LinkedHashMap<>();
 	private final Set<AgentId> pendingAgentRegistrations = ConcurrentHashMap.newKeySet();
 	private final Set<AgentId> pendingEntityRecoveries = new LinkedHashSet<>();
 	private final PendingSpawnCancellationLedger cancelledPlayerSpawns =
@@ -103,6 +105,7 @@ public final class CodexAgentManager {
 		this.savedData = AgentSavedData.get(server);
 		this.groupSavedData = AgentGroupSavedData.get(server);
 		this.savedData.setRuntimeHooks(new ForwardingRuntimeHooks());
+		prunePersistentMembership();
 	}
 
 	public static synchronized CodexAgentManager get(MinecraftServer server) {
@@ -123,6 +126,7 @@ public final class CodexAgentManager {
 		releaseOnce(
 				releaseStarted,
 				runtimeHooks::onServerStopping,
+				this::persistLiveAgentLocations,
 				this::releasePendingVerifiedRespawns,
 				this::releaseChunkTickets,
 				() -> savedData.setRuntimeHooks(AgentRuntimeHooks.NO_OP),
@@ -729,22 +733,22 @@ public final class CodexAgentManager {
 			if (player.isPresent() && player.get().isAlive()) {
 				pendingPlayerSpawns.remove(record.agentId());
 				seenPlayers.add(record.agentId());
-				AgentEntityLocation location = entityLocation(player.get());
 				AgentRecord attached = record;
 				if (record.entityUuid().filter(player.get().getUUID()::equals).isEmpty()
-						|| record.entityLocation().filter(location::equals).isEmpty()) {
+						|| record.entityLocation().isEmpty()) {
 					attached = savedData.registry().attachEntity(
 							record.agentId(),
 							player.get().getUUID(),
-							location,
+							entityLocation(player.get()),
 							now
 					);
+					lastLocationPersistenceEpochMs.put(record.agentId(), now);
 				}
 				// Identity and status belong in the field console, not as noisy world-space labels.
 				player.get().setCustomName(null);
 				player.get().setCustomNameVisible(false);
 				hideWorldName(player.get());
-				trackChunkTicket(record.agentId(), player.get());
+				trackChunkTicket(record.agentId(), player.get(), now);
 				publishPendingRegistration(attached);
 				if (pendingEntityRecoveries.remove(record.agentId())
 						&& attached.state() == dev.agaminggod.arenaagents.agent.AgentLifecycleState.DISCONNECTED) {
@@ -782,6 +786,34 @@ public final class CodexAgentManager {
 			claimed = true;
 			return true;
 		}
+	}
+
+	private void prunePersistentMembership() {
+		Set<AgentId> currentIds = new LinkedHashSet<>();
+		Set<String> currentPlayerNames = new LinkedHashSet<>();
+		for (AgentRecord record : records()) {
+			currentIds.add(record.agentId());
+			currentPlayerNames.add(AgentIdentity.playerName(record.agentId(), record.profile()));
+		}
+		groupSavedData.registry().retainMembers(currentIds);
+		PlayerTeam team = server.getScoreboard().getPlayerTeam(HIDDEN_AGENT_TEAM);
+		if (team == null) return;
+		for (String trackedName : staleHiddenTeamMembers(team.getPlayers(), currentPlayerNames)) {
+			server.getScoreboard().removePlayerFromTeam(trackedName, team);
+		}
+		if (team.getPlayers().isEmpty()) server.getScoreboard().removePlayerTeam(team);
+	}
+
+	static List<String> staleHiddenTeamMembers(Iterable<String> trackedNames, Set<String> currentPlayerNames) {
+		Objects.requireNonNull(trackedNames, "trackedNames must not be null");
+		Set<String> checkedCurrentNames = Set.copyOf(Objects.requireNonNull(
+				currentPlayerNames, "currentPlayerNames must not be null"
+		));
+		List<String> stale = new java.util.ArrayList<>();
+		for (String trackedName : trackedNames) {
+			if (!checkedCurrentNames.contains(trackedName)) stale.add(trackedName);
+		}
+		return List.copyOf(stale);
 	}
 
 	public AgentGroup saveGroup(String name, List<AgentId> memberIds) {
@@ -932,26 +964,39 @@ public final class CodexAgentManager {
 		server.getScoreboard().addPlayerToTeam(player.getScoreboardName(), team);
 	}
 
+	private void removeHiddenWorldName(String playerName) {
+		PlayerTeam team = server.getScoreboard().getPlayerTeam(HIDDEN_AGENT_TEAM);
+		if (team != null && team.getPlayers().contains(playerName)) {
+			server.getScoreboard().removePlayerFromTeam(playerName, team);
+			if (team.getPlayers().isEmpty()) server.getScoreboard().removePlayerTeam(team);
+		}
+	}
+
 	private boolean recoverOfflinePlayer(AgentRecord record, long now) {
 		Optional<RecoverySpawn> recovery;
 		try {
 			Optional<CodexAgentEntity> legacy = findAgentEntity(record.agentId());
 			if (legacy.isPresent() && legacy.get().level() instanceof ServerLevel legacyLevel) {
-				Vec3 legacyPosition = legacy.get().position();
-				legacy.get().discard();
+				CodexAgentEntity legacyEntity = legacy.get();
+				Vec3 legacyPosition = legacyEntity.position();
 				AgentRecoverySpawnPolicy.ChunkPosition chunk =
 						AgentRecoverySpawnPolicy.chunkContaining(legacyPosition.x, legacyPosition.z);
-				recovery = findRecoverySpawn(
-						legacyLevel,
+				AgentEntityLocation legacyLocation = AgentEntityLocation.exact(
+						legacyLevel.dimension().identifier().toString(),
 						chunk.x(),
 						chunk.z(),
-						java.util.OptionalInt.of((int) Math.floor(legacyPosition.y))
+						legacyPosition.x,
+						legacyPosition.y,
+						legacyPosition.z,
+						legacyEntity.getYRot(),
+						legacyEntity.getXRot()
 				);
+				legacy.get().discard();
+				recovery = findRecoverySpawn(legacyLevel, legacyLocation);
 			} else if (record.entityLocation().isPresent()) {
 				AgentEntityLocation location = record.entityLocation().orElseThrow();
 				recovery = findLevel(location.dimension())
-						.flatMap(level -> findRecoverySpawn(
-								level, location.chunkX(), location.chunkZ(), location.blockY()));
+						.flatMap(level -> findRecoverySpawn(level, location));
 			} else {
 				recovery = Optional.empty();
 			}
@@ -974,8 +1019,8 @@ public final class CodexAgentManager {
 					record.agentId(),
 					record.profile(),
 					position,
-					0.0F,
-					0.0F,
+					recovery.orElseThrow().yaw(),
+					recovery.orElseThrow().pitch(),
 					level.dimension(),
 					record.profile().gameMode()
 			);
@@ -1009,9 +1054,87 @@ public final class CodexAgentManager {
 			int chunkZ,
 			java.util.OptionalInt preferredY
 	) {
-		level.getChunk(chunkX, chunkZ);
 		int centerX = (chunkX << 4) + 8;
 		int centerZ = (chunkZ << 4) + 8;
+		return findRecoverySpawn(level, chunkX, chunkZ, centerX, centerZ, preferredY, 0.0F, 0.0F);
+	}
+
+	private Optional<RecoverySpawn> findRecoverySpawn(ServerLevel level, AgentEntityLocation location) {
+		if (location.hasExactPosition()) level.getChunk(location.chunkX(), location.chunkZ());
+		Optional<ExactRecoveryCoordinates> exact = exactRecoveryCoordinates(
+				location,
+				(x, y, z) -> recoveryColumnAt(level, x, y, z).safe()
+		);
+		if (exact.isPresent()) {
+			ExactRecoveryCoordinates coordinates = exact.orElseThrow();
+			return Optional.of(new RecoverySpawn(
+					level,
+					new Vec3(coordinates.x(), coordinates.y(), coordinates.z()),
+					coordinates.yaw(),
+					coordinates.pitch()
+			));
+		}
+		float yaw = (float) location.yaw().orElse(0.0D);
+		float pitch = (float) location.pitch().orElse(0.0D);
+		if (location.hasExactPosition()) {
+			return findRecoverySpawn(
+					level,
+					location.chunkX(),
+					location.chunkZ(),
+					(int) Math.floor(location.exactX().orElseThrow()),
+					(int) Math.floor(location.exactZ().orElseThrow()),
+					location.blockY(),
+					yaw,
+					pitch
+			);
+		}
+		return findRecoverySpawn(
+				level,
+				location.chunkX(),
+				location.chunkZ(),
+				(location.chunkX() << 4) + 8,
+				(location.chunkZ() << 4) + 8,
+				location.blockY(),
+				yaw,
+				pitch
+		);
+	}
+
+	static Optional<ExactRecoveryCoordinates> exactRecoveryCoordinates(
+			AgentEntityLocation location,
+			RecoveryColumnSafety safety
+	) {
+		Objects.requireNonNull(location, "location must not be null");
+		Objects.requireNonNull(safety, "safety must not be null");
+		if (!location.hasExactPosition()) return Optional.empty();
+		double x = location.exactX().orElseThrow();
+		double y = location.exactY().orElseThrow();
+		double z = location.exactZ().orElseThrow();
+		if (!safety.safe((int) Math.floor(x), (int) Math.floor(y), (int) Math.floor(z))) {
+			return Optional.empty();
+		}
+		return Optional.of(new ExactRecoveryCoordinates(
+				x,
+				y,
+				z,
+				(float) location.yaw().orElse(0.0D),
+				(float) location.pitch().orElse(0.0D)
+		));
+	}
+
+	private Optional<RecoverySpawn> findRecoverySpawn(
+			ServerLevel level,
+			int chunkX,
+			int chunkZ,
+			int preferredX,
+			int preferredZ,
+			java.util.OptionalInt preferredY,
+			float yaw,
+			float pitch
+	) {
+		level.getChunk(chunkX, chunkZ);
+		int centerX = Math.max(chunkX << 4, Math.min(((chunkX + 1) << 4) - 1, preferredX));
+		int centerZ = Math.max(chunkZ << 4, Math.min(((chunkZ + 1) << 4) - 1, preferredZ));
 		Optional<RecoverySpawn> local = findRecoverySpawnInBounds(
 				level,
 				centerX,
@@ -1020,7 +1143,9 @@ public final class CodexAgentManager {
 				((chunkX + 1) << 4) - 1,
 				chunkZ << 4,
 				((chunkZ + 1) << 4) - 1,
-				preferredY
+				preferredY,
+				yaw,
+				pitch
 		);
 		if (local.isPresent()) return local;
 
@@ -1034,7 +1159,7 @@ public final class CodexAgentManager {
 		int maxX = ((chunkX + chunkRadius + 1) << 4) - 1;
 		int minZ = (chunkZ - chunkRadius) << 4;
 		int maxZ = ((chunkZ + chunkRadius + 1) << 4) - 1;
-		return findRecoverySpawnInBounds(level, centerX, centerZ, minX, maxX, minZ, maxZ, preferredY);
+		return findRecoverySpawnInBounds(level, centerX, centerZ, minX, maxX, minZ, maxZ, preferredY, yaw, pitch);
 	}
 
 	private Optional<RecoverySpawn> findRecoverySpawnInBounds(
@@ -1045,14 +1170,18 @@ public final class CodexAgentManager {
 			int maxX,
 			int minZ,
 			int maxZ,
-			java.util.OptionalInt preferredY
+			java.util.OptionalInt preferredY,
+			float yaw,
+			float pitch
 	) {
 		return AgentRecoverySpawnPolicy.selectNearestDryPosition(
 				centerX, centerZ, minX, maxX, minZ, maxZ,
 				(x, z) -> recoveryColumn(level, x, z, preferredY)
 		).map(selected -> new RecoverySpawn(
 				level,
-				Vec3.atBottomCenterOf(new BlockPos(selected.x(), selected.y(), selected.z()))
+				Vec3.atBottomCenterOf(new BlockPos(selected.x(), selected.y(), selected.z())),
+				yaw,
+				pitch
 		));
 	}
 
@@ -1105,10 +1234,19 @@ public final class CodexAgentManager {
 		);
 	}
 
-	private record RecoverySpawn(ServerLevel level, Vec3 position) {
+	private record RecoverySpawn(ServerLevel level, Vec3 position, float yaw, float pitch) {
+	}
+
+	record ExactRecoveryCoordinates(double x, double y, double z, float yaw, float pitch) {
+	}
+
+	@FunctionalInterface
+	interface RecoveryColumnSafety {
+		boolean safe(int x, int y, int z);
 	}
 
 	public void maintainChunkTickets() {
+		long now = System.currentTimeMillis();
 		for (AgentRecord record : records()) {
 			if (record.state() == dev.agaminggod.arenaagents.agent.AgentLifecycleState.DEAD) {
 				releaseChunkTicket(record.agentId());
@@ -1116,7 +1254,7 @@ public final class CodexAgentManager {
 			}
 			restoreChunkTicket(record);
 			if (record.entityUuid().isPresent()) {
-				findAgentPlayer(record.agentId()).ifPresent(entity -> trackChunkTicket(record.agentId(), entity));
+				findAgentPlayer(record.agentId()).ifPresent(entity -> trackChunkTicket(record.agentId(), entity, now));
 			}
 		}
 	}
@@ -1148,7 +1286,10 @@ public final class CodexAgentManager {
 									},
 									() -> pendingAgentRegistrations.remove(record.agentId()),
 									() -> pendingEntityRecoveries.remove(record.agentId()),
-									() -> seenPlayers.remove(record.agentId())
+									() -> seenPlayers.remove(record.agentId()),
+									() -> removeHiddenWorldName(AgentIdentity.playerName(
+											record.agentId(), record.profile())),
+									() -> groupSavedData.registry().removeMember(record.agentId())
 							);
 						},
 						() -> runtimeHooks.onRemoved(record.agentId(), terminalRevision),
@@ -1156,6 +1297,7 @@ public final class CodexAgentManager {
 				)
 		));
 		runCleanupSteps(
+				() -> lastLocationPersistenceEpochMs.remove(record.agentId()),
 				() -> savedData.clearConversationWake(record.agentId()),
 				() -> savedData.clearGoalDrafts(record.agentId())
 		);
@@ -1316,22 +1458,27 @@ public final class CodexAgentManager {
 			throw new AgentDomainException("AGENT_LEVEL_INVALID", "Codex agent is not in a server level");
 		}
 		ChunkPos position = entity.chunkPosition();
-		return new AgentEntityLocation(
+		return AgentEntityLocation.exact(
 				level.dimension().identifier().toString(),
 				position.x(),
 				position.z(),
-				java.util.OptionalInt.of((int) Math.floor(entity.getY()))
+				entity.getX(),
+				entity.getY(),
+				entity.getZ(),
+				entity.getYRot(),
+				entity.getXRot()
 		);
 	}
 
-	private void trackChunkTicket(AgentId agentId, Entity entity) {
+	private void trackChunkTicket(AgentId agentId, Entity entity, long nowEpochMs) {
 		if (!(entity.level() instanceof ServerLevel level)) {
 			throw new AgentDomainException("AGENT_LEVEL_INVALID", "Codex agent is not in a server level");
 		}
 		ChunkPos position = entity.chunkPosition();
 		AgentChunkTicket current = chunkTickets.get(agentId);
+		boolean chunkChanged = current == null || current.level() != level || !current.position().equals(position);
 		if (current != null && current.level() == level && current.position().equals(position)) {
-			savedData.registry().updateEntityLocation(agentId, entityLocation(entity), System.currentTimeMillis());
+			persistEntityLocation(agentId, entity, nowEpochMs, false);
 			return;
 		}
 		AgentChunkTicket next = new AgentChunkTicket(level, position);
@@ -1340,7 +1487,28 @@ public final class CodexAgentManager {
 			releaseChunkTicket(current);
 		}
 		chunkTickets.put(agentId, next);
-		savedData.registry().updateEntityLocation(agentId, entityLocation(entity), System.currentTimeMillis());
+		persistEntityLocation(agentId, entity, nowEpochMs, chunkChanged);
+	}
+
+	private void persistEntityLocation(AgentId agentId, Entity entity, long nowEpochMs, boolean force) {
+		long lastPersisted = lastLocationPersistenceEpochMs.getOrDefault(agentId, Long.MIN_VALUE);
+		if (!shouldPersistEntityLocation(lastPersisted, nowEpochMs, force)) return;
+		savedData.registry().updateEntityLocation(agentId, entityLocation(entity), nowEpochMs);
+		lastLocationPersistenceEpochMs.put(agentId, nowEpochMs);
+	}
+
+	static boolean shouldPersistEntityLocation(long lastPersistedEpochMs, long nowEpochMs, boolean force) {
+		return force || lastPersistedEpochMs == Long.MIN_VALUE
+				|| nowEpochMs < lastPersistedEpochMs
+				|| nowEpochMs - lastPersistedEpochMs >= LOCATION_PERSIST_INTERVAL_MS;
+	}
+
+	private void persistLiveAgentLocations() {
+		long now = System.currentTimeMillis();
+		for (AgentRecord record : records()) {
+			findAgentPlayer(record.agentId()).ifPresent(player ->
+					persistEntityLocation(record.agentId(), player, now, true));
+		}
 	}
 
 	private void releaseChunkTicket(AgentId agentId) {

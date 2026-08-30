@@ -61,6 +61,9 @@ export function createVoiceHttpServer({
 
 	let active = 0;
 	let activeTts = 0;
+	let activeProviderTts = 0;
+	const maxProviderTts = maxConcurrent * 2;
+	let providerTtsStalled = false;
 	let activeStt = 0;
 	let pendingAuthentication = 0;
 	const controllers = new Set();
@@ -286,6 +289,11 @@ export function createVoiceHttpServer({
 	function joinTtsSynthesis({ cacheKey, profile, profileNamespace, payload, signal }) {
 		let entry = inFlightTts.get(cacheKey);
 		if (entry === undefined) {
+			if (providerTtsStalled || activeProviderTts >= maxProviderTts) {
+				providerTtsStalled = true;
+				ttsLifecycle.recordCapacityStalled();
+				throw typedError('TTS_CAPACITY', 'Speech synthesis provider did not acknowledge cancellation; this worker is fail-closed');
+			}
 			const providerController = new AbortController();
 			entry = {
 				providerController,
@@ -296,6 +304,7 @@ export function createVoiceHttpServer({
 				failureRecorded: false,
 				operation: null,
 			};
+			activeProviderTts += 1;
 			const current = entry;
 			entry.operation = Promise.resolve().then(async () => {
 				try {
@@ -322,6 +331,7 @@ export function createVoiceHttpServer({
 					current.failure = error;
 					throw error;
 				} finally {
+					activeProviderTts -= 1;
 					current.settled = true;
 					if (inFlightTts.get(cacheKey) === current) inFlightTts.delete(cacheKey);
 					if (current.waiters === 0) recordTtsFlightFailure(current);
@@ -344,8 +354,7 @@ export function createVoiceHttpServer({
 					if (inFlightTts.get(cacheKey) === current) inFlightTts.delete(cacheKey);
 					current.providerController.abort(abortError('All synthesis waiters cancelled'));
 				}
-				if (current.waiters > 0 || current.settled) release();
-				else current.operation.then(release, release);
+				release();
 				if (current.waiters === 0 && current.settled) recordTtsFlightFailure(current);
 			},
 		};
@@ -382,6 +391,7 @@ export function createVoiceHttpServer({
 
 	return Object.freeze({
 		server,
+		removeAgent(agentId) { return profileStore.remove?.(agentId) ?? false; },
 		onFailure(listener) {
 			if (typeof listener !== 'function') throw new TypeError('voice failure listener must be a function');
 			if (terminalFailure !== null) {
@@ -546,6 +556,27 @@ class VoiceChannelLifecycle {
 		this.#failures = Math.min(1_000_000, this.#failures + 1);
 		this.#generation += 1;
 		if (this.#retryEnabled && this.#timer === null && this.#probeToken === null) this.#scheduleRetry();
+	}
+
+	recordCapacityStalled() {
+		if (this.#closed || this.#broken) return;
+		this.#broken = true;
+		this.#retryEnabled = false;
+		this.#epoch += 1;
+		if (this.#timer !== null) this.#cancelSchedule(this.#timer);
+		this.#timer = null;
+		if (this.#probeToken !== null) {
+			this.#probeToken.invalidated = true;
+			if (this.#probeToken.timeout !== null) this.#cancelSchedule(this.#probeToken.timeout);
+			this.#probeToken.timeout = null;
+			this.#probeToken.controller.abort();
+		}
+		this.#state = 'degraded';
+		this.#failureCode = 'TTS_PROVIDER_CAPACITY_STALLED';
+		this.#failures = Math.min(1_000_000, this.#failures + 1);
+		this.#nextProbeAt = null;
+		this.#generation += 1;
+		// An in-process promise cannot be forcibly reclaimed. Do not request a replacement generation.
 	}
 
 	recordReady() {

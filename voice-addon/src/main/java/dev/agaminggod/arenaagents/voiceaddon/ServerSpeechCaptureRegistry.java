@@ -1,6 +1,5 @@
 package dev.agaminggod.arenaagents.voiceaddon;
 
-import de.maxhenkel.voicechat.api.events.MicrophonePacketEvent;
 import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemConfiguration;
 import java.util.Map;
 import java.util.Objects;
@@ -49,9 +48,9 @@ final class ServerSpeechCaptureRegistry<S, O> {
 		if (previous != null) safeClose(previous);
 	}
 
-	void accept(S server, O owner, MicrophonePacketEvent event) {
+	void accept(S server, O owner, MicrophonePacketSnapshot packet) {
 		Entry entry = entries.get(server);
-		if (entry != null) entry.accept(owner, event);
+		if (entry != null) entry.accept(owner, packet);
 	}
 
 	void cancel(S server, java.util.UUID playerId) {
@@ -81,7 +80,7 @@ final class ServerSpeechCaptureRegistry<S, O> {
 	}
 
 	interface Capture {
-		void accept(MicrophonePacketEvent event);
+		void accept(MicrophonePacketSnapshot packet);
 
 		void cancel(java.util.UUID playerId);
 
@@ -107,7 +106,7 @@ final class ServerSpeechCaptureRegistry<S, O> {
 			this.configuration = Objects.requireNonNull(configuration, "voice configuration must not be null");
 		}
 
-		private synchronized void accept(O currentOwner, MicrophonePacketEvent event) {
+		private synchronized void accept(O currentOwner, MicrophonePacketSnapshot packet) {
 			if (closed) return;
 			if (owner == null) owner = currentOwner;
 			if (currentOwner != null && owner != currentOwner) return;
@@ -122,7 +121,7 @@ final class ServerSpeechCaptureRegistry<S, O> {
 				}
 			}
 			try {
-				capture.accept(event);
+				capture.accept(packet);
 			} catch (RuntimeException exception) {
 				Capture failed = capture;
 				capture = null;

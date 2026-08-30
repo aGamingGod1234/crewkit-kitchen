@@ -27,7 +27,6 @@ import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.CompletionStage;
 import net.minecraft.server.MinecraftServer;
-import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -39,6 +38,7 @@ public final class ArenaAgentsVoiceProvider implements VoiceSubsystemProvider, V
 	private static final int DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
 	private static final int MAX_REQUEST_TIMEOUT_MS = 600_000;
 	private static volatile VoicechatServerApi legacyServerApi;
+	private static volatile MinecraftServer legacyMinecraftServer;
 	private static volatile HumanSpeechCapture legacySpeechCapture;
 
 	@Override
@@ -66,6 +66,7 @@ public final class ArenaAgentsVoiceProvider implements VoiceSubsystemProvider, V
 	@Override
 	public VoiceSubsystem create(MinecraftServer server) {
 		LegacyConfiguration configuration = legacyConfiguration();
+		legacyMinecraftServer = Objects.requireNonNull(server, "server must not be null");
 		return new LegacyVoiceSubsystem(server, legacyWorker(configuration));
 	}
 
@@ -106,11 +107,19 @@ public final class ArenaAgentsVoiceProvider implements VoiceSubsystemProvider, V
 
 	private void onLegacyMicrophonePacket(MicrophonePacketEvent event) {
 		try {
-			if (event.getSenderConnection() == null) return;
-			Object rawPlayer = event.getSenderConnection().getPlayer().getPlayer();
-			if (!(rawPlayer instanceof ServerPlayer player)) return;
-			MinecraftServer server = player.level().getServer();
-			if (!CodexAgentServerRuntime.hasVoiceConsent(server, player.getUUID())) return;
+			MicrophonePacketSnapshot captured = MicrophonePacketSnapshot.capture(event);
+			if (captured == null) return;
+			MinecraftServer server = legacyMinecraftServer;
+			if (server == null) return;
+			MicrophonePacketSnapshot packet = captured.forServer(server);
+			server.execute(() -> acceptLegacyPacketOnServer(server, packet));
+		} catch (RuntimeException exception) {
+			LOGGER.error("Arena Agents proximity speech capture could not start", exception);
+		}
+	}
+
+	private void acceptLegacyPacketOnServer(MinecraftServer server, MicrophonePacketSnapshot packet) {
+		try {
 			HumanSpeechCapture capture = legacySpeechCapture;
 			if (capture == null) {
 				synchronized (ArenaAgentsVoiceProvider.class) {
@@ -126,7 +135,7 @@ public final class ArenaAgentsVoiceProvider implements VoiceSubsystemProvider, V
 					}
 				}
 			}
-			capture.accept(event);
+			capture.accept(packet);
 		} catch (RuntimeException exception) {
 			LOGGER.error("Arena Agents proximity speech capture could not start", exception);
 		}
@@ -268,6 +277,7 @@ public final class ArenaAgentsVoiceProvider implements VoiceSubsystemProvider, V
 		@Override
 		public void close() {
 			playback.close();
+			if (legacyMinecraftServer == server) legacyMinecraftServer = null;
 		}
 
 		private Entity findEntity(UUID entityId) {

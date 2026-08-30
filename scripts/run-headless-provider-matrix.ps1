@@ -10,6 +10,8 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'offline-server-policy.ps1')
+. (Join-Path $PSScriptRoot 'project-metadata.ps1')
 
 $PollMilliseconds = 250
 $StartupTimeoutSeconds = 120
@@ -427,13 +429,11 @@ function Set-ServerProperties([string] $Path, [hashtable] $Values) {
 	$seen = @{}
 	$result = @(
 	foreach ($line in $lines) {
-		if ($line -match '^\s*([^#=:\s]+)\s*=') {
-			$key = $Matches[1]
-			if ($Values.ContainsKey($key)) {
-				$seen[$key] = $true
-				"$key=$($Values[$key])"
-				continue
-			}
+		$entry = ConvertTo-ArenaServerPropertyEntry $line
+		if ($null -ne $entry -and $Values.ContainsKey($entry.Key)) {
+			if (-not $seen.ContainsKey($entry.Key)) { "$($entry.Key)=$($Values[$entry.Key])" }
+			$seen[$entry.Key] = $true
+			continue
 		}
 		$line
 	}
@@ -602,6 +602,7 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 	$propertiesPath = Join-Path $serverDirectory 'server.properties'
 	Set-ServerProperties $propertiesPath @{
 		'online-mode' = 'false'
+		'server-ip' = '127.0.0.1'
 		'enable-rcon' = 'true'
 		'rcon.password' = $secret
 		'rcon.port' = $rconPort
@@ -610,6 +611,7 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 		'level-name' = $worldName
 		'pause-when-empty-seconds' = '-1'
 	}
+	Assert-ArenaOfflineServerLoopback $propertiesPath -RequireOffline
 	Protect-LocalFile $propertiesPath
 	$logsDirectory = Join-Path $scenarioDirectory 'logs'
 	$traceDirectory = Join-Path $scenarioDirectory 'traces'
@@ -693,9 +695,10 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 				$rconPort = Reserve-FreePort (Get-ConfiguredPort 'ARENA_HEADLESS_RCON_PORT') @($bridgePort)
 				$serverPort = Reserve-FreePort (Get-ConfiguredPort 'ARENA_HEADLESS_MINECRAFT_PORT') @($bridgePort, $rconPort)
 				Set-ServerProperties $propertiesPath @{
-					'online-mode' = 'false'; 'enable-rcon' = 'true'; 'rcon.password' = $secret; 'rcon.port' = $rconPort; 'rcon.ip' = '127.0.0.1'
+					'online-mode' = 'false'; 'server-ip' = '127.0.0.1'; 'enable-rcon' = 'true'; 'rcon.password' = $secret; 'rcon.port' = $rconPort; 'rcon.ip' = '127.0.0.1'
 					'server-port' = $serverPort; 'level-name' = $worldName; 'pause-when-empty-seconds' = '-1'
 				}
+				Assert-ArenaOfflineServerLoopback $propertiesPath -RequireOffline
 				Protect-LocalFile $propertiesPath
 				New-ScenarioConfig $sourceConfig $coordinatorConfig $bridgePort $providerWorkspace
 			}
@@ -736,9 +739,10 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 				$rconPort = Reserve-FreePort (Get-ConfiguredPort 'ARENA_HEADLESS_RCON_PORT') @($bridgePort)
 				$serverPort = Reserve-FreePort (Get-ConfiguredPort 'ARENA_HEADLESS_MINECRAFT_PORT') @($bridgePort, $rconPort)
 				Set-ServerProperties $propertiesPath @{
-					'online-mode' = 'false'; 'enable-rcon' = 'true'; 'rcon.password' = $secret; 'rcon.port' = $rconPort; 'rcon.ip' = '127.0.0.1'
+					'online-mode' = 'false'; 'server-ip' = '127.0.0.1'; 'enable-rcon' = 'true'; 'rcon.password' = $secret; 'rcon.port' = $rconPort; 'rcon.ip' = '127.0.0.1'
 					'server-port' = $serverPort; 'level-name' = $worldName; 'pause-when-empty-seconds' = '-1'
 				}
+				Assert-ArenaOfflineServerLoopback $propertiesPath -RequireOffline
 				Protect-LocalFile $propertiesPath
 				New-ScenarioConfig $sourceConfig $coordinatorConfig $bridgePort $providerWorkspace
 				$serverArgs = "-Darenaagents.bridgePort=$bridgePort -Darenaagents.coordinatorAutoStart=false -Darenaagents.bridgeSecretFile=$(Quote-Argument $secretPath) -Xms1G -Xmx4G -jar $(Quote-Argument (Join-Path $serverDirectory 'fabric-server-launch.jar')) nogui"
@@ -852,7 +856,7 @@ $node = Resolve-Node
 $serverLauncher = Join-Path $ServerTemplate 'fabric-server-launch.jar'
 if (-not (Test-Path -LiteralPath $ServerTemplate -PathType Container)) { throw "Missing server template: $ServerTemplate" }
 if (-not (Test-Path -LiteralPath $serverLauncher -PathType Leaf)) { throw "Missing Fabric server launcher: $serverLauncher" }
-$builtJar = Join-Path $root 'build\libs\arena-agents-0.2.0.jar'
+$builtJar = Resolve-ArenaModJar $root
 if (-not (Test-Path -LiteralPath $builtJar -PathType Leaf)) { throw "Missing built mod JAR: $builtJar" }
 $matrix = Read-Matrix $MatrixPath
 $selected = @($matrix.scenarios | Where-Object { [string]::IsNullOrWhiteSpace($ScenarioId) -or [string] $_.id -eq $ScenarioId })

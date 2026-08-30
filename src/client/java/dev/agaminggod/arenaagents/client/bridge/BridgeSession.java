@@ -37,6 +37,7 @@ public final class BridgeSession implements AutoCloseable {
 
 	private static final long WRITER_POLL_MS = 100L;
 	private static final long THREAD_JOIN_MS = 2_000L;
+	private static final AtomicLong NEXT_SESSION_ID = new AtomicLong();
 	private static final String FIELD_PROTOCOL_VERSION = "protocolVersion";
 	private static final String FIELD_AGENT_ID = "agentId";
 	private static final String FIELD_TYPE = "type";
@@ -81,6 +82,7 @@ public final class BridgeSession implements AutoCloseable {
 	private final Object callbackLock = new Object();
 	private final Object lifecycleLock = new Object();
 	private final Object outputLock = new Object();
+	private final long sessionId = NEXT_SESSION_ID.incrementAndGet();
 
 	private volatile SessionState state = SessionState.AWAITING_RESPONSE;
 	private boolean started;
@@ -401,7 +403,7 @@ public final class BridgeSession implements AutoCloseable {
 				return;
 			}
 			try {
-				eventSink.onActionCommand(command);
+				eventSink.onActionCommand(sessionId, command);
 			} catch (RuntimeException ignored) {
 				callbackFailed = true;
 			}
@@ -418,7 +420,7 @@ public final class BridgeSession implements AutoCloseable {
 				return;
 			}
 			try {
-				eventSink.onObservationRequested();
+				eventSink.onObservationRequested(sessionId);
 			} catch (RuntimeException ignored) {
 				callbackFailed = true;
 			}
@@ -435,7 +437,7 @@ public final class BridgeSession implements AutoCloseable {
 				return;
 			}
 			try {
-				eventSink.onCancelAction(commandId);
+				eventSink.onCancelAction(sessionId, commandId);
 			} catch (RuntimeException ignored) {
 				callbackFailed = true;
 			}
@@ -676,12 +678,21 @@ public final class BridgeSession implements AutoCloseable {
 			// Wait for an in-flight callback after closing the socket so blocked I/O can unwind.
 		}
 		try {
+			callbackExecutor.execute(() -> eventSink.onSessionClosed(sessionId));
+		} catch (RuntimeException ignored) {
+			// The client executor is already stopping, so no later session can inherit this state.
+		}
+		try {
 			closedCallback.run();
 		} catch (RuntimeException ignored) {
 			// Session resources must still be joined even if an owner callback is faulty.
 		}
 		join(writerThread);
 		join(readerThread);
+	}
+
+	long sessionId() {
+		return sessionId;
 	}
 
 	private void awaitCloseCompletionWhenSafe() {

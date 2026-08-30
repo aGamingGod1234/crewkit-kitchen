@@ -125,11 +125,31 @@ function Copy-ExpectedCoordinator([string] $Source, [string] $Destination, [stri
 
 $project = [IO.Path]::GetFullPath($ProjectRoot)
 $game = [IO.Path]::GetFullPath($GameDirectory)
+$gradlePropertiesPath = Join-Path $project 'gradle.properties'
+if (-not (Test-Path -LiteralPath $gradlePropertiesPath -PathType Leaf)) { throw "Missing Gradle properties: $gradlePropertiesPath" }
+$gradleProperties = [ordered]@{}
+foreach ($line in Get-Content -LiteralPath $gradlePropertiesPath) {
+	$trimmed = $line.Trim()
+	if ($trimmed.Length -eq 0 -or $trimmed.StartsWith('#')) { continue }
+	$separator = $trimmed.IndexOf('=')
+	if ($separator -le 0) { throw "Invalid Gradle property: $trimmed" }
+	$gradleProperties[$trimmed.Substring(0, $separator).Trim()] = $trimmed.Substring($separator + 1).Trim()
+}
+
+function Test-CoreArenaModName([string] $Name) {
+	return $Name -match '^(?i:arena-agents)-(?!voice-).+\.jar$'
+}
+foreach ($requiredProperty in @('mod_version', 'fabric_api_version', 'carpet_version')) {
+	if (-not $gradleProperties.Contains($requiredProperty)) { throw "Missing Gradle property '$requiredProperty'." }
+}
+$modJarName = "arena-agents-$($gradleProperties.mod_version).jar"
+$fabricApiJarName = "fabric-api-$($gradleProperties.fabric_api_version).jar"
+$carpetJarName = "fabric-carpet-$($gradleProperties.carpet_version).jar"
 Assert-NoReparse $project 'project root'
 Assert-NoReparse $game 'game directory'
 $mods = Resolve-ContainedPath $game (Join-Path $game 'mods') 'mods target'
 $runtime = Resolve-ContainedPath $game (Join-Path $game 'arena-agents-runtime') 'runtime target'
-$jar = Join-Path $project 'build\libs\arena-agents-0.2.0.jar'
+$jar = Join-Path $project ("build\libs\" + $modJarName)
 $coordinator = Join-Path $project 'coordinator'
 Assert-NoReparse $mods 'mods target'
 Assert-NoReparse $runtime 'runtime target'
@@ -147,7 +167,7 @@ foreach ($process in $javaProcesses) {
     $commandLine = [string]$process.CommandLine
     if (Test-UnsafeJavaProcess ([string]$process.Name) $commandLine) { throw "A Minecraft/Fabric Java process is active (PID $($process.ProcessId)); refusing to update." }
 }
-foreach ($dependency in @('fabric-api-0.150.0+26.1.2.jar', 'fabric-carpet-26.1+v260402.jar')) {
+foreach ($dependency in @($fabricApiJarName, $carpetJarName)) {
     if (-not (Test-Path -LiteralPath (Join-Path $mods $dependency) -PathType Leaf)) { throw "Required dependency is missing from target mods: $dependency" }
 }
 
@@ -161,14 +181,14 @@ $backup = Join-Path $game ('.arena-agents-backup-' + [DateTime]::UtcNow.ToString
 $stageMods = Join-Path $stage 'mods'
 $stageCoordinator = Join-Path $stage 'coordinator'
 $installedCoordinator = Join-Path $runtime 'coordinator'
-$installedJar = Join-Path $mods 'arena-agents-0.2.0.jar'
+$installedJar = Join-Path $mods $modJarName
 $backupMade = $false
 $oldArena = @()
 try {
     Assert-NoReparse $stage 'staging path'
     Assert-NoReparse $backup 'backup path'
     New-Item -ItemType Directory -Force -Path $stageMods, $stageCoordinator | Out-Null
-    Copy-Item -LiteralPath $jar -Destination (Join-Path $stageMods 'arena-agents-0.2.0.jar') -Force
+    Copy-Item -LiteralPath $jar -Destination (Join-Path $stageMods $modJarName) -Force
     Copy-ExpectedCoordinator $coordinator $stageCoordinator $expected
     foreach ($relative in $expected) {
         $sourceHash = (Get-FileHash (Join-Path $coordinator ($relative.Replace('/', '\'))) -Algorithm SHA256).Hash
@@ -176,7 +196,7 @@ try {
         if ($sourceHash -ne $stageHash) { throw "Staged coordinator hash mismatch: $relative" }
     }
     New-Item -ItemType Directory -Force -Path $backup | Out-Null
-    $oldArena = @(Get-ChildItem -LiteralPath $mods -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^arena-agents-(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\.jar$' })
+    $oldArena = @(Get-ChildItem -LiteralPath $mods -File -ErrorAction SilentlyContinue | Where-Object { Test-CoreArenaModName $_.Name })
     foreach ($old in $oldArena) { Assert-NoReparseTree $old.FullName "Arena JAR $($old.Name)" }
     foreach ($old in $oldArena) { Copy-Item -LiteralPath $old.FullName -Destination (Join-Path $backup $old.Name) -Force }
     if ($FailurePoint -eq 'AfterJarsBackup') { throw 'Injected failure after JAR backup.' }
@@ -196,7 +216,7 @@ try {
     Assert-NoReparseTree $stage 'staging path before mutation'
     Assert-NoReparseTree $backup 'backup path before mutation'
     foreach ($old in $oldArena) { Remove-Item -LiteralPath $old.FullName -Force }
-    Copy-Item -LiteralPath (Join-Path $stageMods 'arena-agents-0.2.0.jar') -Destination $installedJar -Force
+    Copy-Item -LiteralPath (Join-Path $stageMods $modJarName) -Destination $installedJar -Force
     if ($FailurePoint -eq 'AfterJarSwap') { throw 'Injected failure after JAR swap.' }
     New-Item -ItemType Directory -Force -Path $runtime | Out-Null
     if (Test-Path -LiteralPath $installedCoordinator) { Remove-Item -LiteralPath $installedCoordinator -Recurse -Force }

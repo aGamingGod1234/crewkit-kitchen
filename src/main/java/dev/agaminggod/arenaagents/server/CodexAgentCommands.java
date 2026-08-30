@@ -26,6 +26,7 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.phys.Vec3;
 import dev.agaminggod.arenaagents.server.voice.VoiceConsentRegistry;
+import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemRuntime;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -476,6 +477,7 @@ public final class CodexAgentCommands {
 
 	private static int voiceConsent(CommandContext<CommandSourceStack> context, boolean enabled) throws CommandSyntaxException {
 		ServerPlayer player = requirePlayer(context);
+		requireVoiceAvailable(context.getSource());
 		if (enabled) VoiceConsentRegistry.grant(context.getSource().getServer(), player.getUUID());
 		else VoiceConsentRegistry.revoke(context.getSource().getServer(), player.getUUID());
 		context.getSource().sendSuccess(
@@ -491,12 +493,23 @@ public final class CodexAgentCommands {
 
 	private static int voiceConsentStatus(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
 		ServerPlayer player = requirePlayer(context);
+		requireVoiceAvailable(context.getSource());
 		boolean enabled = VoiceConsentRegistry.granted(context.getSource().getServer(), player.getUUID());
 		context.getSource().sendSuccess(
 				() -> Component.literal("Agent voice transcription is " + (enabled ? "enabled." : "disabled.")),
 				false
 		);
 		return enabled ? 1 : 0;
+	}
+
+	private static void requireVoiceAvailable(CommandSourceStack source) throws CommandSyntaxException {
+		if (!VoiceSubsystemRuntime.available(source.getServer())) {
+			throw COMMAND_FAILURE.create(voiceUnavailableMessage());
+		}
+	}
+
+	static String voiceUnavailableMessage() {
+		return "VOICE_UNAVAILABLE: Install and start the Arena Agents Voice add-on with Simple Voice Chat";
 	}
 
 	private static ServerPlayer requirePlayer(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {

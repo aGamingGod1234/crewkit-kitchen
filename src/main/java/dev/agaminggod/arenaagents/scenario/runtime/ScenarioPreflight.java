@@ -24,7 +24,9 @@ public final class ScenarioPreflight {
 		if (!input.resetVerified()) return Verdict.failed("RESET_NOT_VERIFIED");
 		if (!input.expectedResetHash().equals(input.verifiedResetHash())) return Verdict.failed("RESET_HASH_MISMATCH");
 		for (RequiredProfile profile : input.requiredProfiles()) {
-			if (!status.supports(profile.agentId(), profile.provider(), profile.model(), profile.reasoningEffort())) {
+			if (!status.supports(
+					profile.agentId(), profile.provider(), profile.model(),
+					profile.reasoningEffort(), profile.serviceTier())) {
 				return Verdict.waiting("REQUIRED_PROFILE_NOT_READY");
 			}
 		}
@@ -70,12 +72,23 @@ public final class ScenarioPreflight {
 		}
 	}
 
-	public record RequiredProfile(String agentId, String provider, String model, String reasoningEffort) {
+	public record RequiredProfile(
+			String agentId,
+			String provider,
+			String model,
+			String reasoningEffort,
+			String serviceTier
+	) {
+		public RequiredProfile(String agentId, String provider, String model, String reasoningEffort) {
+			this(agentId, provider, model, reasoningEffort, "priority");
+		}
+
 		public RequiredProfile {
 			agentId = nonblank(agentId, "agentId");
 			provider = nonblank(provider, "provider");
 			model = nonblank(model, "model");
 			reasoningEffort = nonblank(reasoningEffort, "reasoningEffort");
+			serviceTier = nonblank(serviceTier, "serviceTier");
 		}
 	}
 

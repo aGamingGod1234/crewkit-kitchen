@@ -28,6 +28,11 @@ public final class ScenarioLaunchRuntimeVerification {
 		);
 		assertEquals(request, ScenarioLaunchCodec.decode(ScenarioLaunchCodec.encode(request)),
 				"scenario launch codec round trip");
+		ScenarioLaunchRequest confirmed = new ScenarioLaunchRequest(
+				request.scenarioId(), request.mapVersion(), request.deterministicEvents(),
+				request.placementMode(), request.roster(), "confirm-123");
+		assertEquals("confirm-123", ScenarioLaunchCodec.decode(ScenarioLaunchCodec.encode(confirmed)).confirmationToken(),
+				"one-time site confirmation token survives the launch payload");
 		expectIllegalArgument(
 				() -> new ScenarioLaunchRequest(
 						"thinking-tower",
@@ -48,7 +53,7 @@ public final class ScenarioLaunchRuntimeVerification {
 				"locked parkour mode rejects survival"
 		);
 
-		return 2;
+		return 3;
 	}
 
 	private static void expectIllegalArgument(Runnable action, String message) {

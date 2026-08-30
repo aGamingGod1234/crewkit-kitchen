@@ -40,7 +40,7 @@ public final class ProgramActionLedgerVerification {
 		ledger.accept(request(agent, 8L, "action-1", provenance));
 		ledger.remove(agent);
 		ledger.accept(first);
-		return 4_107;
+		return 4_107 + DurableActionJournalVerification.verify();
 	}
 
 	private static ServerActionRequest request(AgentId agent, String actionId, ActionProvenance provenance) {

@@ -314,7 +314,7 @@ final class ArenaAgentsVoiceChatPluginVerification {
 		}
 
 		@Override
-		public synchronized void accept(MicrophonePacketEvent event) {
+		public synchronized void accept(MicrophonePacketSnapshot packet) {
 			accepts++;
 		}
 

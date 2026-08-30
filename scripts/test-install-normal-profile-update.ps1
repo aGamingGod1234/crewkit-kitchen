@@ -4,6 +4,16 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 if ([string]::IsNullOrWhiteSpace($ProjectRoot)) { $ProjectRoot = Split-Path -Parent $PSScriptRoot }
 $root = [IO.Path]::GetFullPath($ProjectRoot)
+$properties = [ordered]@{}
+foreach ($line in Get-Content -LiteralPath (Join-Path $root 'gradle.properties')) {
+	$trimmed = $line.Trim()
+	if ($trimmed.Length -eq 0 -or $trimmed.StartsWith('#')) { continue }
+	$separator = $trimmed.IndexOf('=')
+	if ($separator -gt 0) { $properties[$trimmed.Substring(0, $separator).Trim()] = $trimmed.Substring($separator + 1).Trim() }
+}
+$modJarName = "arena-agents-$($properties.mod_version).jar"
+$fabricApiJarName = "fabric-api-$($properties.fabric_api_version).jar"
+$carpetJarName = "fabric-carpet-$($properties.carpet_version).jar"
 & (Join-Path $root 'scripts\install-normal-profile-update.ps1') -ProjectRoot $root -GameDirectory $env:TEMP -TestProcessClassification
 $target = Join-Path $env:TEMP ('arena-normal-profile-test-' + [guid]::NewGuid().ToString('N'))
 $mods = Join-Path $target 'mods'
@@ -11,21 +21,28 @@ $runtimeCoordinator = Join-Path $target 'arena-agents-runtime\coordinator'
 $runtime = Join-Path $target 'arena-agents-runtime\runtime'
 New-Item -ItemType Directory -Force -Path $mods, $runtimeCoordinator, $runtime | Out-Null
 try {
-    Copy-Item -LiteralPath (Join-Path $root 'build\libs\arena-agents-0.2.0.jar') -Destination (Join-Path $mods 'arena-agents-0.0.1.jar')
+    Copy-Item -LiteralPath (Join-Path $root ("build\libs\" + $modJarName)) -Destination (Join-Path $mods 'arena-agents-old-unparseable.jar')
     Set-Content -LiteralPath (Join-Path $mods 'unrelated.jar') -Value 'keep'
-    Set-Content -LiteralPath (Join-Path $mods 'fabric-api-0.150.0+26.1.2.jar') -Value 'api'
-    Set-Content -LiteralPath (Join-Path $mods 'fabric-carpet-26.1+v260402.jar') -Value 'carpet'
+	$voiceAddon = Join-Path $mods 'arena-agents-voice-0.1.0.jar'
+	Set-Content -LiteralPath $voiceAddon -Value 'optional voice addon'
+	$voiceAddonHash = (Get-FileHash -LiteralPath $voiceAddon -Algorithm SHA256).Hash
+    Set-Content -LiteralPath (Join-Path $mods $fabricApiJarName) -Value 'api'
+    Set-Content -LiteralPath (Join-Path $mods $carpetJarName) -Value 'carpet'
     Set-Content -LiteralPath (Join-Path $runtimeCoordinator 'stale.log') -Value 'remove'
     Set-Content -LiteralPath (Join-Path $target 'arena-agents-runtime\runtime\bridge-secret.txt') -Value ('a' * 32)
 
     & (Join-Path $root 'scripts\install-normal-profile-update.ps1') -ProjectRoot $root -GameDirectory $target
-    if (-not (Test-Path -LiteralPath (Join-Path $mods 'arena-agents-0.2.0.jar'))) { throw 'Updated jar missing.' }
-    if (Test-Path -LiteralPath (Join-Path $mods 'arena-agents-0.0.1.jar')) { throw 'Stale Arena jar remains.' }
+    if (-not (Test-Path -LiteralPath (Join-Path $mods $modJarName))) { throw 'Updated jar missing.' }
+    if (Test-Path -LiteralPath (Join-Path $mods 'arena-agents-old-unparseable.jar')) { throw 'Stale Arena jar remains.' }
     if (-not (Test-Path -LiteralPath (Join-Path $mods 'unrelated.jar'))) { throw 'Unrelated mod was changed.' }
+	if (-not (Test-Path -LiteralPath $voiceAddon -PathType Leaf) -or
+		(Get-FileHash -LiteralPath $voiceAddon -Algorithm SHA256).Hash -ne $voiceAddonHash) {
+		throw 'Normal profile update removed or changed the optional Arena Agents Voice add-on.'
+	}
     if (Test-Path -LiteralPath (Join-Path $runtimeCoordinator 'stale.log')) { throw 'Stale coordinator state remains.' }
 
-    $installedHash = (Get-FileHash (Join-Path $mods 'arena-agents-0.2.0.jar') -Algorithm SHA256).Hash
-    $sourceHash = (Get-FileHash (Join-Path $root 'build\libs\arena-agents-0.2.0.jar') -Algorithm SHA256).Hash
+    $installedHash = (Get-FileHash (Join-Path $mods $modJarName) -Algorithm SHA256).Hash
+    $sourceHash = (Get-FileHash (Join-Path $root ("build\libs\" + $modJarName)) -Algorithm SHA256).Hash
     if ($installedHash -ne $sourceHash) { throw 'Installed jar hash differs from source jar.' }
 
     $secretPath = Join-Path $target 'arena-agents-runtime\runtime\bridge-secret.txt'
@@ -43,7 +60,7 @@ try {
         if ((Get-FileHash $secretPath -Algorithm SHA256).Hash -ne $secretBefore) { throw "Secret changed after failure: $failurePoint" }
         if (-not (Test-Path -LiteralPath (Join-Path $target 'arena-agents-runtime\coordinator\src\dynamic-main.mjs'))) { throw "Forced failure did not restore coordinator state: $failurePoint" }
     }
-    Write-Host 'Normal profile updater temp end-to-end test passed.'
+    Write-Host 'Normal profile updater preserved the optional voice add-on and passed rollback verification.'
 } finally {
     if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
 }

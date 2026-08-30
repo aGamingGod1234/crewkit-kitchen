@@ -1,4 +1,4 @@
-import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import net from 'node:net';
 
@@ -29,6 +29,8 @@ import { encodeJsonLine, JsonlDecoder } from './jsonl.mjs';
 import { MessageIdGenerator } from './message-id.mjs';
 import { ValidationError, validateAction, validateActionCommandPayload } from './schema.mjs';
 import { parseGoalSpec, parseGoalSpecProposal, parseGoalSpecRequest } from './goal-spec.mjs';
+import { assertProviderServiceTier, normalizeProviderId } from './provider-identity.mjs';
+import { validateRegisteredAgentContract } from './registered-agent-contract.mjs';
 
 const MAX_COORDINATOR_CIRCUITS = 32;
 
@@ -393,6 +395,8 @@ export class MultiplexedServerBridge extends EventEmitter {
 	#terminalActionsByGoal = new Map();
 	#terminalResultsByKey = new Map();
 	#acknowledgedTerminalActionIds = new Set();
+	#retiredTerminalActionIds = new Set();
+	#retiredTerminalResultsByKey = new Map();
 	#knownAgentIds = new Set();
 	#retiredAgentIds = new Set();
 	#observedRevisions = new Map();
@@ -830,6 +834,21 @@ export class MultiplexedServerBridge extends EventEmitter {
 		if (envelope.type !== 'action_result' || !TERMINAL_ACTION_STATES.has(envelope.payload.state)) return;
 		const actionId = requireIdentifier(envelope.payload.actionId ?? envelope.payload.commandId, 'actionId');
 		const key = `${envelope.agentId}:${envelope.payload.goalRevision}:${actionId}`;
+		const fingerprint = terminalResultFingerprint(envelope.payload);
+		const previous = this.#terminalResultsByKey.get(key);
+		if (previous !== undefined) {
+			if (previous !== fingerprint) throw new ProtocolV2Error('DUPLICATE_TERMINAL_RESULT', `Action '${actionId}' changed its terminal result`);
+			return this.#acknowledgedTerminalActionIds.has(key);
+		}
+		const retired = this.#retiredTerminalResultsByKey.get(key);
+		if (retired !== undefined) {
+			if (retired.fingerprint !== fingerprint) throw new ProtocolV2Error('DUPLICATE_TERMINAL_RESULT', `Action '${actionId}' changed its terminal result`);
+			if (retired.acknowledged) return true;
+			this.#retiredTerminalResultsByKey.delete(key);
+			this.#retiredTerminalActionIds.delete(key);
+			this.#rememberTerminalResult(key, fingerprint);
+			return false;
+		}
 		if (!this.#issuedActionIds.has(key)) {
 			const expectedProof = this.#clientNonce === null || this.#serverNonce === null
 				? null
@@ -847,25 +866,26 @@ export class MultiplexedServerBridge extends EventEmitter {
 			}
 			this.#rememberIssuedActionKey(key);
 		}
-		const fingerprint = terminalResultFingerprint(envelope.payload);
-		const previous = this.#terminalResultsByKey.get(key);
-		if (previous !== undefined) {
-			if (previous !== fingerprint) throw new ProtocolV2Error('DUPLICATE_TERMINAL_RESULT', `Action '${actionId}' changed its terminal result`);
-			return this.#acknowledgedTerminalActionIds.has(key);
-		}
-		const activeGoal = this.#terminalActionsByGoal.get(envelope.agentId);
-		const goal = activeGoal !== undefined && envelope.payload.goalRevision < activeGoal.goalRevision
-			? null
-			: this.#ensureTerminalGoal(envelope.agentId, envelope.payload.goalRevision);
-		if (goal?.actionIds.has(actionId)) throw new ProtocolV2Error('DUPLICATE_TERMINAL_RESULT', `Duplicate terminal result for action '${actionId}'`);
-		goal?.actionIds.add(actionId);
+		this.#ensureTerminalGoal(envelope.agentId, envelope.payload.goalRevision);
+		this.#rememberTerminalResult(key, fingerprint);
+		return false;
+	}
+
+	#rememberTerminalResult(key, fingerprint) {
 		this.#terminalResultsByKey.set(key, fingerprint);
 		const evicted = rememberBounded(this.#terminalActionIds, key, this.#trackedTerminalActionIdCap);
-		if (evicted !== undefined) {
-			this.#terminalResultsByKey.delete(evicted);
-			this.#acknowledgedTerminalActionIds.delete(evicted);
-		}
-		return false;
+		if (evicted !== undefined) this.#retireTerminalResult(evicted);
+	}
+
+	#retireTerminalResult(key) {
+		const fingerprint = this.#terminalResultsByKey.get(key);
+		if (fingerprint === undefined) return;
+		const proof = { fingerprint, acknowledged: this.#acknowledgedTerminalActionIds.has(key) };
+		this.#terminalResultsByKey.delete(key);
+		this.#acknowledgedTerminalActionIds.delete(key);
+		this.#retiredTerminalResultsByKey.set(key, proof);
+		const evicted = rememberBounded(this.#retiredTerminalActionIds, key, this.#trackedTerminalActionIdCap);
+		if (evicted !== undefined) this.#retiredTerminalResultsByKey.delete(evicted);
 	}
 
 	/** Acknowledges a result after the application has accepted or safely ignored it. */
@@ -873,13 +893,18 @@ export class MultiplexedServerBridge extends EventEmitter {
 		const goalRevision = revision(payload?.goalRevision, 'goalRevision');
 		const actionId = requireIdentifier(payload?.actionId ?? payload?.commandId, 'actionId');
 		const key = `${agentId}:${goalRevision}:${actionId}`;
+		const fingerprint = terminalResultFingerprint(payload);
 		const tracked = this.#terminalResultsByKey.get(key);
-		if (tracked === undefined || tracked !== terminalResultFingerprint(payload)) {
+		const retired = this.#retiredTerminalResultsByKey.get(key);
+		if ((tracked === undefined || tracked !== fingerprint)
+				&& (retired === undefined || retired.fingerprint !== fingerprint)) {
 			return Promise.reject(new ProtocolV2Error('UNTRACKED_ACTION_RESULT', `Action '${actionId}' has no matching delivered terminal result`));
 		}
 		return Promise.resolve(this.send('action_result_ack', agentId, { goalRevision, actionId }, { connectionEpoch }))
 			.then((value) => {
-				rememberBounded(this.#acknowledgedTerminalActionIds, key, this.#trackedTerminalActionIdCap);
+				if (this.#terminalResultsByKey.has(key)) this.#acknowledgedTerminalActionIds.add(key);
+				const retiredProof = this.#retiredTerminalResultsByKey.get(key);
+				if (retiredProof !== undefined) retiredProof.acknowledged = true;
 				return value;
 			});
 	}
@@ -889,7 +914,8 @@ export class MultiplexedServerBridge extends EventEmitter {
 		if (!Number.isSafeInteger(payload?.goalRevision) || payload.goalRevision < 0) return false;
 		const actionId = payload?.actionId ?? payload?.commandId;
 		return typeof actionId === 'string'
-			&& this.#terminalResultsByKey.has(`${agentId}:${payload.goalRevision}:${actionId}`);
+			&& (this.#terminalResultsByKey.has(`${agentId}:${payload.goalRevision}:${actionId}`)
+				|| this.#retiredTerminalResultsByKey.has(`${agentId}:${payload.goalRevision}:${actionId}`));
 	}
 
 	#synchronizeTerminalGoals(registry) {
@@ -910,7 +936,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 		let goal = this.#terminalActionsByGoal.get(agentId);
 		if (goal?.goalRevision !== goalRevision) {
 			if (goal !== undefined) this.#dropTerminalResultKeys(agentId, goal.goalRevision);
-			goal = { goalRevision, actionIds: new Set() };
+			goal = { goalRevision };
 			this.#terminalActionsByGoal.set(agentId, goal);
 		}
 		return goal;
@@ -920,12 +946,6 @@ export class MultiplexedServerBridge extends EventEmitter {
 		const prefix = goalRevision === null ? `${agentId}:` : `${agentId}:${goalRevision}:`;
 		for (const key of this.#issuedActionIds) {
 			if (key.startsWith(prefix)) this.#issuedActionIds.delete(key);
-		}
-		for (const key of this.#terminalResultsByKey.keys()) {
-			if (!key.startsWith(prefix)) continue;
-			this.#terminalResultsByKey.delete(key);
-			this.#acknowledgedTerminalActionIds.delete(key);
-			this.#terminalActionIds.delete(key);
 		}
 	}
 
@@ -949,11 +969,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 	}
 
 	#rememberIssuedActionKey(key) {
-		const evicted = rememberBounded(this.#issuedActionIds, key, this.#trackedTerminalActionIdCap);
-		if (evicted === undefined) return;
-		this.#terminalResultsByKey.delete(evicted);
-		this.#acknowledgedTerminalActionIds.delete(evicted);
-		this.#terminalActionIds.delete(evicted);
+		rememberBounded(this.#issuedActionIds, key, this.#trackedTerminalActionIdCap);
 	}
 
 	#sendLossy(envelope) {
@@ -1335,15 +1351,18 @@ function normalizeRegisteredAgent(value, field) {
 	const death = value.death === undefined ? null : normalizeDeath(value.death);
 	if (state === 'DEAD' && death === null) throw new ProtocolV2Error('MISSING_FIELD', `${field} DEAD state requires death facts`);
 	if (state !== 'DEAD' && death !== null) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} death facts require DEAD state`);
-	return {
+	const provider = normalizeProvider(value.provider ?? 'codex', `${field}.provider`);
+	const serviceTier = requireIdentifier(value.serviceTier ?? 'priority', `${field}.serviceTier`);
+	assertProviderServiceTier(provider, serviceTier, `${field}.serviceTier`, { ErrorType: ProtocolV2Error, code: 'INVALID_PAYLOAD' });
+	const record = {
 		schemaVersion: nonnegativeInteger(value.schemaVersion, `${field}.schemaVersion`),
 		agentId: requireIdentifier(value.agentId, `${field}.agentId`),
 		entityUuid: value.entityUuid === undefined ? null : requireIdentifier(value.entityUuid, `${field}.entityUuid`),
 		name: value.name === undefined ? null : boundedText(value.name, `${field}.name`, MAX_IDENTIFIER_LENGTH),
-		provider: normalizeProvider(value.provider ?? 'codex', `${field}.provider`),
+		provider,
 		model: requireIdentifier(value.model, `${field}.model`),
 		reasoningEffort: requireIdentifier(value.reasoningEffort, `${field}.reasoningEffort`),
-		serviceTier: requireIdentifier(value.serviceTier ?? 'priority', `${field}.serviceTier`),
+		serviceTier,
 		gameMode: requireIdentifier(value.gameMode ?? 'survival', `${field}.gameMode`),
 		skinVariant: requireIdentifier(value.skinVariant, `${field}.skinVariant`),
 		state,
@@ -1358,6 +1377,7 @@ function normalizeRegisteredAgent(value, field) {
 		updatedAtEpochMs: nonnegativeInteger(value.updatedAtEpochMs, `${field}.updatedAtEpochMs`),
 		lastError,
 	};
+	return validateRegisteredAgentContract(record, (message) => new ProtocolV2Error('INVALID_PAYLOAD', `${field} ${message}`));
 }
 
 function normalizeCatalogSnapshot(value) {
@@ -1382,9 +1402,7 @@ function normalizeCatalogSnapshot(value) {
 }
 
 function normalizeProvider(value, field) {
-	const provider = requireIdentifier(value, field);
-	if (!['codex', 'gemini', 'kimi', 'cursor'].includes(provider)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be codex, gemini, kimi, or cursor`);
-	return provider;
+	return normalizeProviderId(requireIdentifier(value, field), field, { ErrorType: ProtocolV2Error, code: 'INVALID_PAYLOAD' });
 }
 
 function normalizeGoalControl(value) {
@@ -1669,7 +1687,7 @@ function normalizeActionResult(value) {
 
 function terminalResultFingerprint(payload) {
 	const { replayProof: _replayProof, ...result } = payload;
-	return JSON.stringify(result);
+	return createHash('sha256').update(JSON.stringify(result)).digest('hex');
 }
 
 function normalizeGoalCompletionRequest(value) {

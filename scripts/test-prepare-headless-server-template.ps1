@@ -38,7 +38,7 @@ try {
 	$fakeJava = Join-Path $fixture 'fake-java.ps1'
 	$fakeJava21 = Join-Path $fixture 'fake-java-21.ps1'
 
-	Write-TestText (Join-Path $source 'server.properties') "online-mode=false`nserver-port=0`nenable-rcon=false`nlevel-name=headless-template-world`npause-when-empty-seconds=-1`n"
+	Write-TestText (Join-Path $source 'server.properties') "online-mode=false`nserver-ip=127.0.0.1`nserver-port=0`nenable-rcon=false`nlevel-name=headless-template-world`npause-when-empty-seconds=-1`n"
 	Write-TestText (Join-Path $source 'README.md') "Generated binaries are installed at setup time.`n"
 	Write-TestText $buildJar 'arena-mod-fixture'
 	Write-TestText $carpetJar 'fabric-carpet-fixture'
@@ -99,6 +99,8 @@ throw 'Java 21 candidate must not run the installer'
 	Assert-True (-not (Test-Path -LiteralPath (Join-Path $target 'world'))) 'materialized template contains no world'
 	Assert-True (-not (Test-Path -LiteralPath (Join-Path $target 'logs'))) 'materialized template contains no logs'
 	Assert-True ((Get-Content -LiteralPath (Join-Path $target 'eula.txt') -Raw) -eq "eula=true`n") 'EULA acceptance is explicit and deterministic'
+	$materializedProperties = Get-Content -LiteralPath (Join-Path $target 'server.properties') -Raw
+	Assert-True ($materializedProperties -match '(?m)^server-ip=127\.0\.0\.1\r?$') 'materialized template binds offline gameplay to loopback'
 	$installerArguments = Get-Content -LiteralPath (Join-Path $target 'installer-arguments.txt') -Raw
 	Assert-True ($installerArguments -match 'server.+-mcversion 26\.1\.2.+-loader 0\.19\.3.+-downloadMinecraft') 'installer receives exact pinned versions and Minecraft download flag'
 	$manifest = Get-Content -LiteralPath (Join-Path $target 'template-manifest.json') -Raw | ConvertFrom-Json

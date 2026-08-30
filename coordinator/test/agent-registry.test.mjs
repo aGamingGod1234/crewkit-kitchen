@@ -204,7 +204,7 @@ test('reconciliation disconnects in-flight persisted agents, preserves explicit 
 test('recovery reconciliation re-arms active goals without changing revisions or exact profiles', () => {
 	const registry = new AgentRegistry({ now: () => 99 });
 	const snapshot = [
-		record('agent-a', { state: DynamicAgentState.STARTING, currentGoal: 'Start.', goalRevision: 5, provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'max', serviceTier: 'fast' }),
+		record('agent-a', { state: DynamicAgentState.STARTING, currentGoal: 'Start.', goalRevision: 5, provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'max', serviceTier: 'priority' }),
 		record('agent-b', { state: DynamicAgentState.PLANNING, currentGoal: 'Plan.', goalRevision: 6 }),
 		record('agent-c', { state: DynamicAgentState.ACTING, currentGoal: 'Act.', goalRevision: 7 }),
 		record('agent-d', { state: DynamicAgentState.DISCONNECTED, currentGoal: 'Reconnect.', goalRevision: 8 }),
@@ -221,7 +221,7 @@ test('recovery reconciliation re-arms active goals without changing revisions or
 	]);
 	assert.deepEqual(
 		pickRecoveryIdentity(registry.get('agent-a')),
-		{ currentGoal: 'Start.', goalRevision: 5, provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'max', serviceTier: 'fast' },
+		{ currentGoal: 'Start.', goalRevision: 5, provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'max', serviceTier: 'priority' },
 	);
 	const first = registry.snapshot();
 	registry.reconcile(first, { recovery: true });
@@ -267,6 +267,11 @@ test('stop cleanup is idempotent while new commands still require newer revision
 test('runtime state changes reject illegal lifecycle transitions', () => {
 	const registry = new AgentRegistry({ now: () => 99 });
 	registry.register(record('agent-a'));
+	assert.throws(
+		() => registry.applyGoalControl('agent-a', { operation: 'stop', goalRevision: 1 }),
+		/PAUSED agents require a current goal/,
+	);
+	assert.equal(registry.get('agent-a').state, DynamicAgentState.IDLE);
 	assert.throws(() => registry.setState('agent-a', DynamicAgentState.ACTING, { goalRevision: 0 }), (error) => error.code === 'ILLEGAL_STATE_TRANSITION');
 	registry.applyGoalControl('agent-a', { operation: 'start', goalRevision: 1, goal: 'Explore.', updatedAtEpochMs: 1 });
 	const planning = registry.setState('agent-a', DynamicAgentState.PLANNING, { goalRevision: 1 });
@@ -361,4 +366,26 @@ test('legacy registry snapshots migrate to the Codex provider while explicit pro
 	const cursor = encodeAgentRegistrySnapshot([record('cursor', { provider: 'cursor', model: 'composer-2.5', reasoningEffort: 'high' })]);
 	assert.equal(decodeAgentRegistrySnapshot(cursor)[0].provider, 'cursor');
 	assert.throws(() => normalizeAgentRecord(record('bad', { provider: 'unknown' })), /provider/i);
+});
+
+test('registry goal text uses the shared 4096 UTF-16 code-unit contract', () => {
+	const boundary = '\u{1f642}'.repeat(2_048);
+	assert.equal(normalizeAgentRecord(record('agent-a', {
+		state: DynamicAgentState.PAUSED,
+		currentGoal: boundary,
+		goalRevision: 1,
+	})).currentGoal.length, 4_096);
+	assert.throws(() => normalizeAgentRecord(record('agent-a', {
+		state: DynamicAgentState.PAUSED,
+		currentGoal: `${boundary}\u{1f642}`,
+		goalRevision: 1,
+	})), /4096/);
+});
+
+test('registered agent normalization enforces the shared Java state and identity contract', () => {
+	assert.throws(() => normalizeAgentRecord(record('schema', { schemaVersion: 2 })), /schemaVersion must be 1/);
+	assert.throws(() => normalizeAgentRecord(record('active', { state: DynamicAgentState.ACTING })), /ACTING agents require a current goal/);
+	assert.throws(() => normalizeAgentRecord(record('idle', { currentGoal: 'Impossible.' })), /IDLE agents cannot have a current goal/);
+	assert.throws(() => normalizeAgentRecord(record('time', { createdAtEpochMs: 5, updatedAtEpochMs: 4 })), /timestamps are invalid/);
+	assert.equal(normalizeAgentRecord(record('legacy-defaults')).createdAtEpochMs, 1);
 });

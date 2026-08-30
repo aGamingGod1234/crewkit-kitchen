@@ -33,6 +33,20 @@ jobs:
       - name: Test coordinator
         working-directory: coordinator
         run: npm run ${{ matrix.test-script }}
+      - name: Test POSIX process groups
+        if: runner.os == 'Linux'
+        working-directory: coordinator
+        run: node --test --test-timeout=60000 test/posix-process-wrapper.test.mjs test/provider-process-cleanup.test.mjs test/recovery-real-process.test.mjs
+
+      - uses: actions/setup-java@v4
+        if: runner.os == 'Linux'
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: gradle
+      - name: Test Java POSIX coordinator ownership
+        if: runner.os == 'Linux'
+        run: ./gradlew verifyCore --no-daemon --console=plain
 
   java-and-package:
     name: Java and package (Windows)
@@ -49,6 +63,15 @@ jobs:
           node-version: '22'
           cache: npm
           cache-dependency-path: coordinator/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Read release version
+        shell: powershell
+        run: |
+          $properties = ConvertFrom-StringData (Get-Content -LiteralPath .\gradle.properties -Raw)
+          "MOD_VERSION=$($properties.mod_version)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "DISTRIBUTION_NAME=arena-agents-modpack-$($properties.mod_version)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Assemble pinned standalone Node runtime
         shell: powershell
         run: |
@@ -57,21 +80,38 @@ jobs:
       - name: Verify Java, Fabric, and embedded coordinator
         shell: powershell
         run: |
+          .\scripts\test-minecraft-server-loopback-policy.ps1
           .\gradlew.bat clean check build packageWindowsDistribution --no-daemon --console=plain
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          .\scripts\verify-coordinator-packaging.ps1 -JarPath .\build\libs\arena-agents-0.2.0.jar
+          python -m unittest scripts.maps.tests.test_map_tools
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python .\scripts\maps\verify_map_modules.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $builtMod = ".\build\libs\arena-agents-$env:MOD_VERSION.jar"
+          $archive = ".\build\distributions\$env:DISTRIBUTION_NAME.zip"
+          .\scripts\verify-coordinator-packaging.ps1 -JarPath $builtMod
           .\scripts\verify-distribution-runtime.ps1
           $unpacked = Join-Path $env:RUNNER_TEMP 'arena-agents-standalone'
-          Expand-Archive -LiteralPath .\build\distributions\arena-agents-modpack-0.2.0.zip -DestinationPath $unpacked
-          $packagedMod = Join-Path $unpacked 'mods\arena-agents-0.2.0.jar'
-          if ((Get-FileHash -LiteralPath $packagedMod).Hash -ne (Get-FileHash -LiteralPath .\build\libs\arena-agents-0.2.0.jar).Hash) {
+          Expand-Archive -LiteralPath $archive -DestinationPath $unpacked
+          $packagedMod = Join-Path $unpacked "mods\arena-agents-$env:MOD_VERSION.jar"
+          if ((Get-FileHash -LiteralPath $packagedMod).Hash -ne (Get-FileHash -LiteralPath $builtMod).Hash) {
             throw 'The standalone archive does not contain the built Arena Agents mod.'
           }
           .\scripts\verify-coordinator-packaging.ps1 -JarPath $packagedMod
           .\scripts\verify-startup-packaging.ps1 -PackageRoot $unpacked
+          .\scripts\verify-windows-distribution.ps1 -ArchivePath $archive -BuiltJarPath $builtMod
+          .\scripts\test-install-distribution.ps1 -PackageRoot $unpacked -JavaPath (Join-Path $env:JAVA_HOME 'bin\javaw.exe')
+      - name: Boot exact staged Fabric mod set
+        shell: powershell
+        run: |
+          .\scripts\prepare-headless-server-template.ps1 -ProjectRoot . -SkipBuild -AcceptMinecraftEula
+          .\scripts\verify-distribution-fabric-boot.ps1 `
+            -PackageRoot (Join-Path $env:RUNNER_TEMP 'arena-agents-standalone') `
+            -ServerTemplate .\runtime\server-template `
+            -JavaPath (Join-Path $env:JAVA_HOME 'bin\java.exe')
       - name: Upload verified standalone distribution
         uses: actions/upload-artifact@v4
         with:
-          name: arena-agents-modpack-0.2.0
-          path: build/distributions/arena-agents-modpack-0.2.0.zip
+          name: ${{ env.DISTRIBUTION_NAME }}
+          path: build/distributions/${{ env.DISTRIBUTION_NAME }}.zip
           if-no-files-found: error

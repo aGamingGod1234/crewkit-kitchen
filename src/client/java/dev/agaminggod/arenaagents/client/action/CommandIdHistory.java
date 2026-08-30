@@ -49,6 +49,10 @@ final class CommandIdHistory {
 		return commandIds.size();
 	}
 
+	void clear() {
+		commandIds.clear();
+	}
+
 	private boolean evictOldestExcept(String protectedCommandId) {
 		Iterator<String> oldest = commandIds.iterator();
 		while (oldest.hasNext()) {

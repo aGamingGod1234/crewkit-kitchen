@@ -8,6 +8,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 if ([string]::IsNullOrWhiteSpace($ProjectRoot)) { $ProjectRoot = Split-Path -Parent $PSScriptRoot }
+. (Join-Path $PSScriptRoot 'offline-server-policy.ps1')
+. (Join-Path $PSScriptRoot 'project-metadata.ps1')
 
 $MinecraftVersion = '26.1.2'
 $LoaderVersion = '0.19.3'
@@ -30,7 +32,8 @@ $Agent55 = [IO.Path]::GetFullPath((Join-Path $env:APPDATA '.minecraft-agent-55')
 $Agent56 = [IO.Path]::GetFullPath((Join-Path $env:APPDATA '.minecraft-agent-56'))
 $JavaHome = Join-Path $Runtime 'toolchains\temurin-25\jdk-25.0.3+9'
 $Java = Join-Path $JavaHome 'bin\java.exe'
-$AgentJar = Join-Path $Project 'build\libs\arena-agents-0.2.0.jar'
+$AgentJar = Resolve-ArenaModJar $Project
+$CarpetJar = Resolve-ArenaCarpetJar $Project
 $FabricApi = Join-Path $Minecraft "mods\fabric-api-$FabricApiVersion.jar"
 $Installer = Join-Path $Downloads "fabric-installer-$InstallerVersion.jar"
 $WorldEvidence = Join-Path $Evidence 'world-copy.json'
@@ -75,11 +78,11 @@ function Write-AgentConfig([string] $GameDirectory, [string] $AgentId, [int] $Po
     $configDirectory = Join-Path $GameDirectory 'config'
     New-Item -ItemType Directory -Force -Path (Join-Path $GameDirectory 'mods'),$configDirectory | Out-Null
     $path = Join-Path $configDirectory 'arenaagents.json'
-    $expected = [ordered]@{ agentId=$AgentId; bridgePort=$Port; observationRadius=12; enabled=$true }
+    $expected = [ordered]@{ agentId=$AgentId; bridgePort=$Port; observationRadius=12; enabled=$false }
     if (Test-Path -LiteralPath $path -PathType Leaf) {
         $existing = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
         if ($existing.agentId -ne $AgentId -or [int]$existing.bridgePort -ne $Port -or
-            [int]$existing.observationRadius -ne 12 -or -not [bool]$existing.enabled) {
+            [int]$existing.observationRadius -ne 12 -or [bool]$existing.enabled) {
             throw "Existing agent config differs from the required isolated profile: $path"
         }
         Write-Host "Verified existing config: $path"
@@ -95,7 +98,7 @@ Assert-UnderRoot $TargetWorld $Server 'Copied world'
 if (Get-Process -Name MinecraftLauncher,Minecraft,javaw -ErrorAction SilentlyContinue) {
     throw 'Close Minecraft Launcher and all Minecraft clients before preparing runtime files.'
 }
-foreach ($required in @($Java, $FabricApi)) {
+foreach ($required in @($Java, $FabricApi, $CarpetJar)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "Missing required file: $required" }
 }
 
@@ -129,7 +132,8 @@ Write-AgentConfig $Agent55 'agent-55' 25571
 Write-AgentConfig $Agent56 'agent-56' 25572
 foreach ($gameDirectory in @($Agent55, $Agent56)) {
     Copy-Item -LiteralPath $FabricApi -Destination (Join-Path $gameDirectory "mods\fabric-api-$FabricApiVersion.jar") -Force
-    Copy-Item -LiteralPath $AgentJar -Destination (Join-Path $gameDirectory 'mods\arena-agents-0.2.0.jar') -Force
+    Copy-Item -LiteralPath $CarpetJar -Destination (Join-Path $gameDirectory "mods\$([IO.Path]::GetFileName($CarpetJar))") -Force
+    Copy-Item -LiteralPath $AgentJar -Destination (Join-Path $gameDirectory "mods\$([IO.Path]::GetFileName($AgentJar))") -Force
 }
 
 New-Item -ItemType Directory -Force -Path $Server,(Join-Path $Server 'mods') | Out-Null
@@ -140,7 +144,8 @@ if (-not (Test-Path -LiteralPath $serverLauncher -PathType Leaf)) {
 }
 if (-not (Test-Path -LiteralPath $serverLauncher -PathType Leaf)) { throw "Fabric server launcher is missing: $serverLauncher" }
 Copy-Item -LiteralPath $FabricApi -Destination (Join-Path $Server "mods\fabric-api-$FabricApiVersion.jar") -Force
-Copy-Item -LiteralPath $AgentJar -Destination (Join-Path $Server 'mods\arena-agents-0.2.0.jar') -Force
+Copy-Item -LiteralPath $CarpetJar -Destination (Join-Path $Server "mods\$([IO.Path]::GetFileName($CarpetJar))") -Force
+Copy-Item -LiteralPath $AgentJar -Destination (Join-Path $Server "mods\$([IO.Path]::GetFileName($AgentJar))") -Force
 
 if (-not (Test-Path -LiteralPath $TargetWorld)) {
     New-Item -ItemType Directory -Path $TargetWorld | Out-Null
@@ -194,10 +199,10 @@ $eulaPath = Join-Path $Server 'eula.txt'
 if (-not (Test-Path -LiteralPath $eulaPath)) { [IO.File]::WriteAllText($eulaPath, "eula=true`n", $Utf8NoBom) }
 $propertiesPath = Join-Path $Server 'server.properties'
 if (-not (Test-Path -LiteralPath $propertiesPath)) {
-    [IO.File]::WriteAllText($propertiesPath, "online-mode=false`nserver-port=25565`nlevel-name=world`nenable-command-block=false`npause-when-empty-seconds=-1`n", $Utf8NoBom)
+    [IO.File]::WriteAllText($propertiesPath, "online-mode=false`nserver-ip=127.0.0.1`nserver-port=25565`nlevel-name=world`nenable-command-block=false`npause-when-empty-seconds=-1`n", $Utf8NoBom)
 } else {
     $properties = Get-Content -LiteralPath $propertiesPath -Raw
-    foreach ($requiredSetting in @('online-mode=false','server-port=25565','level-name=world')) {
+    foreach ($requiredSetting in @('online-mode=false','server-ip=127.0.0.1','server-port=25565','level-name=world')) {
         if ($properties -notmatch "(?m)^$([regex]::Escape($requiredSetting))\r?$") {
             throw "Existing server.properties must contain $requiredSetting"
         }
@@ -209,6 +214,7 @@ if (-not (Test-Path -LiteralPath $propertiesPath)) {
     }
     [IO.File]::WriteAllText($propertiesPath, $properties, $Utf8NoBom)
 }
+Assert-ArenaOfflineServerLoopback $propertiesPath -RequireOffline
 
 $buildEvidence = [ordered]@{
     commit = (& git -C $Project rev-parse HEAD).Trim()

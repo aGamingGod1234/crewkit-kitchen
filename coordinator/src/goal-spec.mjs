@@ -1,11 +1,10 @@
 import { createHash } from 'node:crypto';
 
-import { MIN_MOVEMENT_TOLERANCE } from './constants.mjs';
+import { MAX_GOAL_LENGTH, MIN_MOVEMENT_TOLERANCE } from './constants.mjs';
 
 const IDENTIFIER = /^[a-z0-9_.-]+:[a-z0-9_./-]+$/;
 const FINGERPRINT = /^[0-9a-f]{64}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const MAX_REQUEST_LENGTH = 2_048;
 const MAX_CANDIDATES = 64;
 const MAX_LEAVES = 16;
 const MAX_DEPTH = 4;
@@ -69,7 +68,7 @@ export function parseGoalSpecRequest(value) {
 	if (new Set(candidateIds).size !== candidateIds.length) fail('INVALID_GOAL_SPEC_REQUEST', 'candidateIds contains a duplicate identifier');
 	return deepFreeze({
 		requestId: requestId(value.requestId),
-		originalRequest: text(value.originalRequest, 'originalRequest', MAX_REQUEST_LENGTH),
+		originalRequest: text(value.originalRequest, 'originalRequest', MAX_GOAL_LENGTH),
 		candidateIds,
 	});
 }
@@ -93,7 +92,7 @@ export function parseGoalSpec(value) {
 	const fingerprint = text(value.fingerprint, 'fingerprint', 64);
 	if (!FINGERPRINT.test(fingerprint)) fail('INVALID_GOAL_FINGERPRINT', 'fingerprint must be 64 lowercase hexadecimal characters');
 	const spec = {
-		originalRequest: canonicalWireText(value.originalRequest, 'originalRequest', MAX_REQUEST_LENGTH),
+		originalRequest: canonicalWireText(value.originalRequest, 'originalRequest', MAX_GOAL_LENGTH),
 		predicate: parsePredicate(value.predicate, 0, { leaves: 0 }),
 		createdAtTick: nonnegativeInteger(value.createdAtTick, 'createdAtTick'),
 		fingerprint,
@@ -106,7 +105,7 @@ export function parseGoalSpec(value) {
 
 export function goalSpecFingerprint({ originalRequest, predicate, createdAtTick }) {
 	return createHash('sha256').update(canonicalGoalFields(
-		canonicalWireText(originalRequest, 'originalRequest', MAX_REQUEST_LENGTH),
+		canonicalWireText(originalRequest, 'originalRequest', MAX_GOAL_LENGTH),
 		parsePredicate(predicate, 0, { leaves: 0 }),
 		nonnegativeInteger(createdAtTick, 'createdAtTick'),
 	)).digest('hex');
@@ -275,7 +274,7 @@ function requireArray(value, field, maximum, minimum = 0) {
 function text(value, field, maximum) {
 	if (typeof value !== 'string') fail('INVALID_GOAL_SPEC', `${field} must be a string`);
 	const checked = value.trim().replace(/\s+/gu, ' ');
-	if (checked.length === 0 || [...checked].length > maximum) fail('INVALID_GOAL_SPEC', `${field} has an invalid length`);
+	if (checked.length === 0 || checked.length > maximum) fail('INVALID_GOAL_SPEC', `${field} has an invalid length`);
 	return checked;
 }
 

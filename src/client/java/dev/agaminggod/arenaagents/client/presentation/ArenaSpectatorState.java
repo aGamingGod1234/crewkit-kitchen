@@ -103,9 +103,13 @@ public final class ArenaSpectatorState {
 	}
 
 	public void clearOnDisconnect() {
+		clear();
+		dismissedResultRunId = "";
+	}
+
+	public void clear() {
 		snapshot = null;
 		cameraEnabled = false;
-		dismissedResultRunId = "";
 	}
 
 	public enum ManualOverride {

@@ -6,6 +6,7 @@ import path from 'node:path';
 import { BestEffortDiagnosticQueue } from './best-effort-diagnostic-queue.mjs';
 import { DIAGNOSTIC_REDACTED, isOperationalTokenMetric, isSensitiveDiagnosticKey, sanitizeDiagnosticText, truncateDiagnosticUtf8 } from './diagnostic-sanitizer.mjs';
 import { preparePrivateArtifact } from './private-artifact-permissions.mjs';
+import { RotatingJsonlSink } from './rotating-jsonl-sink.mjs';
 
 const REDACTED = DIAGNOSTIC_REDACTED;
 const UNSAFE = '[UNSAFE_OBJECT]';
@@ -23,7 +24,7 @@ const MAX_TRACE_ROW_BYTES = MAX_TRACE_BYTES - 1;
 export class TraceWriter {
 	#filePath;
 	#diagnosticFilePath;
-	#appendFile;
+	#sinks;
 	#mkdir;
 	#preparePrivateArtifact;
 	#ready;
@@ -37,11 +38,23 @@ export class TraceWriter {
 		const privatePath = dependencies.diagnosticFilePath ?? dependencies.privateFilePath ?? null;
 		if (privatePath !== null && (typeof privatePath !== 'string' || privatePath.trim().length === 0)) throw new TypeError('diagnostic trace file path must be nonblank');
 		this.#diagnosticFilePath = privatePath === null ? null : path.resolve(privatePath);
-		this.#appendFile = dependencies.appendFile ?? appendFile;
+		const append = dependencies.appendFile ?? appendFile;
 		this.#mkdir = dependencies.mkdir ?? mkdir;
 		this.#preparePrivateArtifact = dependencies.preparePrivateArtifact
 			?? (dependencies.appendFile === undefined && dependencies.mkdir === undefined
 				? preparePrivateArtifact : async () => {});
+		this.#sinks = new Map([this.#filePath, this.#diagnosticFilePath].filter(Boolean).map((filePath) => [filePath, new RotatingJsonlSink(filePath, {
+			appendFile: append,
+			stat: dependencies.stat,
+			rename: dependencies.rename,
+			unlink: dependencies.unlink,
+			maxFileBytes: dependencies.maxFileBytes,
+			maxFileAgeMs: dependencies.maxFileAgeMs,
+			retainedGenerations: dependencies.retainedGenerations,
+			now: dependencies.now,
+			inspect: dependencies.appendFile === undefined || dependencies.stat !== undefined
+				|| dependencies.maxFileBytes !== undefined || dependencies.maxFileAgeMs !== undefined,
+		})]));
 		this.#queue = new BestEffortDiagnosticQueue({
 			maxPending: dependencies.maxPending,
 			operationTimeoutMs: dependencies.operationTimeoutMs,
@@ -92,7 +105,7 @@ export class TraceWriter {
 		const encoded = `${JSON.stringify(row)}\n`;
 		this.#queue.submit(async () => {
 			if (!await this.#ready) throw new Error('trace sink directory is unavailable');
-			await this.#appendFile(filePath, encoded, { encoding: 'utf8', flag: 'a', mode: 0o600 });
+			await this.#sinks.get(filePath).append(encoded, { encoding: 'utf8', flag: 'a', mode: 0o600 });
 		});
 	}
 }

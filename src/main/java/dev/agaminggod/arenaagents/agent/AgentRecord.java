@@ -49,7 +49,7 @@ public record AgentRecord(
 
 	public static AgentRecord create(AgentId id, AgentProfile profile, long nowEpochMs) {
 		return new AgentRecord(AgentConstants.SCHEMA_VERSION, id, Optional.empty(), Optional.empty(), profile,
-				AgentLifecycleState.IDLE, false, Optional.empty(), 0L, List.of(), "", "", true, RespawnPolicy.RESPAWN_AUTOMATICALLY,
+				AgentLifecycleState.IDLE, false, Optional.empty(), 0L, List.of(), "", "", true, RespawnPolicy.PAUSE_UNTIL_RESPAWN,
 				Optional.empty(), nowEpochMs, nowEpochMs, "");
 	}
 
@@ -104,5 +104,9 @@ public record AgentRecord(
 	private static void validateStateGoalInvariant(AgentLifecycleState state, Optional<AgentGoal> currentGoal) {
 		if (state == AgentLifecycleState.IDLE && currentGoal.isPresent()) throw new AgentDomainException("INVALID_AGENT_STATE", "IDLE agents cannot have a current goal");
 		if ((state.isActive() || state == AgentLifecycleState.PAUSED || state == AgentLifecycleState.DISCONNECTED) && currentGoal.isEmpty()) throw new AgentDomainException("INVALID_AGENT_STATE", state + " agents require a current goal");
+		if (state == AgentLifecycleState.COMPLETED
+				&& currentGoal.filter(goal -> goal.status() == dev.agaminggod.arenaagents.agent.goal.GoalStatus.SATISFIED).isEmpty()) {
+			throw new AgentDomainException("GOAL_NOT_SATISFIED", "COMPLETED agents require a factually satisfied goal");
+		}
 	}
 }

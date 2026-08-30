@@ -37,6 +37,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private static final Logger LOGGER = LoggerFactory.getLogger(CoordinatorProcessSupervisor.class);
 	private static final String FISH_API_KEY_FILE = "runtime/fish-api-key.txt";
 	private static final long DEPENDENCY_RECHECK_MS = 5_000L;
+	private static final long DEPENDENCY_MONITOR_INTERVAL_MS = 1_000L;
 	private static final long AUTHENTICATION_TIMEOUT_MS = 15_000L;
 	private static final long RECONNECT_TIMEOUT_MS = 10_000L;
 	private static final long STABILITY_INTERVAL_MS = 30_000L;
@@ -228,7 +229,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		state = CoordinatorRecoveryState.STARTING;
 		nextRetryEpochMs = createdAtEpochMs + CoordinatorLaunchPolicy.STARTUP_GRACE_MS;
 		this.dependencyChangeMonitor = new DependencyChangeMonitor(
-				this::safeFingerprint, this::publishDependencyFingerprintChange, monitorScheduler
+				this::safeMonitorFingerprint, this::publishDependencyFingerprintChange, monitorScheduler
 		);
 		submitDependencyMaintenance(createdAtEpochMs, true, true);
 		drainMaintenanceResults(createdAtEpochMs);
@@ -254,6 +255,14 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 
 	interface DependencyResolver {
 		String fingerprint();
+
+		default String monitorFingerprint() {
+			return fingerprint();
+		}
+
+		default String monitorFingerprintFor(String resolvedFingerprint) {
+			return resolvedFingerprint;
+		}
 
 		DependencyResolution resolve();
 
@@ -896,7 +905,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		long submittedWakeGeneration = dependencyWakeGeneration.get();
 		submitMaintenance(() -> {
 			String currentFingerprint = safeFingerprint();
-			dependencyChangeMonitor.observeSubmittedFingerprint(currentFingerprint);
+			dependencyChangeMonitor.observeSubmittedFingerprint(safeMonitorFingerprint(currentFingerprint));
 			boolean changed = !Objects.equals(previousFingerprint, currentFingerprint);
 			long checkedAt = now();
 			if (!force && !reapRequired && !changed && checkedAt < scheduledCheck) {
@@ -1146,7 +1155,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		dependencyFingerprint = Objects.requireNonNull(
 				fingerprint, "owned dependency fingerprint must not be null"
 		);
-		dependencyChangeMonitor.acceptOwnedFingerprint(fingerprint);
+		dependencyChangeMonitor.acceptOwnedFingerprint(safeMonitorFingerprint(fingerprint));
 	}
 
 	private static PreparedRuntime withGeneration(PreparedRuntime runtime, GenerationStatus status) {
@@ -1201,6 +1210,22 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			return Objects.toString(dependencyResolver.fingerprint(), "");
 		} catch (RuntimeException exception) {
 			return "fingerprint-unavailable:" + exception.getClass().getName();
+		}
+	}
+
+	private String safeMonitorFingerprint() {
+		try {
+			return Objects.toString(dependencyResolver.monitorFingerprint(), "");
+		} catch (RuntimeException exception) {
+			return "monitor-fingerprint-unavailable:" + exception.getClass().getName();
+		}
+	}
+
+	private String safeMonitorFingerprint(String resolvedFingerprint) {
+		try {
+			return Objects.toString(dependencyResolver.monitorFingerprintFor(resolvedFingerprint), "");
+		} catch (RuntimeException exception) {
+			return "monitor-fingerprint-unavailable:" + exception.getClass().getName();
 		}
 	}
 
@@ -1615,7 +1640,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			executor.scheduleWithFixedDelay(
 					Objects.requireNonNull(task, "dependency monitor task must not be null"),
 					0L,
-					250L,
+					DEPENDENCY_MONITOR_INTERVAL_MS,
 					TimeUnit.MILLISECONDS
 			);
 		}
@@ -2012,8 +2037,10 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		private final Map<String, String> environmentOverrides;
 		private String cachedFingerprint;
 		private DependencyResolution cachedReadyResolution;
+		private String monitoredPackageRootProperty;
+		private Path monitoredRoot;
 
-		private DefaultDependencyResolver(Path gameDirectory, Map<String, String> environmentOverrides) {
+		DefaultDependencyResolver(Path gameDirectory, Map<String, String> environmentOverrides) {
 			this.gameDirectory = gameDirectory;
 			this.environmentOverrides = environmentOverrides;
 		}
@@ -2051,6 +2078,53 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		}
 
 		@Override
+		public synchronized String monitorFingerprint() {
+			String packageRootProperty = Objects.toString(System.getProperty("arenaagents.packageRoot"), "");
+			if (monitoredRoot == null || !Objects.equals(monitoredPackageRootProperty, packageRootProperty)) {
+				Path installedRoot = gameDirectory.resolve("arena-agents-runtime");
+				Path packageRoot = findPackageRoot(gameDirectory);
+				monitoredRoot = packageRoot == null ? installedRoot : packageRoot;
+				monitoredPackageRootProperty = packageRootProperty;
+			}
+			StringBuilder token = new StringBuilder(512);
+			appendFingerprintValue(token, packageRootProperty);
+			String explicitNode = Objects.toString(System.getProperty(NodeRuntimeLocator.PROPERTY), "");
+			appendFingerprintValue(token, explicitNode);
+			appendFingerprintValue(token, fileStamp(monitoredRoot.resolve("coordinator/.arena-agents-bundle-manifest")));
+			appendFingerprintValue(token, fileStamp(monitoredRoot.resolve("coordinator.last-known-good/.arena-agents-bundle-manifest")));
+			appendFingerprintValue(token, fileStamp(monitoredRoot.resolve("coordinator/src/dynamic-main.mjs")));
+			appendFingerprintValue(token, fileStamp(monitoredRoot.resolve("runtime/coordinator-generation.properties")));
+			appendFingerprintValue(token, fileStamp(monitoredRoot.resolve("runtime/dynamic-agents.json")));
+			appendFingerprintValue(token, fileStamp(monitoredRoot.resolve("runtime/bridge-secret.txt")));
+			appendFingerprintValue(token, fileStamp(monitoredRoot.resolve("runtime/voice-secret.txt")));
+			appendFingerprintValue(token, fileStamp(bundledNode(monitoredRoot)));
+			if (!explicitNode.isBlank()) {
+				try {
+					appendFingerprintValue(token, fileStamp(Path.of(explicitNode)));
+				} catch (RuntimeException invalid) {
+					appendFingerprintValue(token, "invalid-explicit-node");
+				}
+			}
+			for (Map.Entry<String, String> override : environmentOverrides.entrySet()) {
+				if (override.getKey().equalsIgnoreCase("PATH") || override.getKey().equalsIgnoreCase("APPDATA")) {
+					appendFingerprintValue(token,
+							override.getKey().toUpperCase(java.util.Locale.ROOT) + '=' + override.getValue());
+				}
+			}
+			return token.toString();
+		}
+
+		@Override
+		public String monitorFingerprintFor(String resolvedFingerprint) {
+			return monitorFingerprint();
+		}
+
+		private static void appendFingerprintValue(StringBuilder token, String value) {
+			if (!token.isEmpty()) token.append('|');
+			token.append(value);
+		}
+
+		@Override
 		public DependencyResolution resolve() {
 			return resolve(fingerprint());
 		}
@@ -2085,6 +2159,9 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			BundledCoordinatorInstaller.RuntimePackage prepared = null;
 			Path installedRoot = gameDirectory.resolve("arena-agents-runtime");
 			Path existingRoot = findPackageRoot(gameDirectory);
+			Path installationRoot = configuredProperty("arenaagents.packageRoot") == null
+					? installedRoot
+					: existingRoot;
 			Path nodeRoot = existingRoot == null ? installedRoot : existingRoot;
 			NodeRuntimeLocator.LocatedNode node;
 			try {
@@ -2095,7 +2172,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			try {
 				IOException installFailure = null;
 				try {
-					if (BundledCoordinatorInstaller.installBundled(installedRoot)) {
+					if (installationRoot != null && BundledCoordinatorInstaller.installBundled(installationRoot)) {
 						LOGGER.info("Installed the bundled Arena Agents coordinator runtime");
 					}
 				} catch (IOException failure) {

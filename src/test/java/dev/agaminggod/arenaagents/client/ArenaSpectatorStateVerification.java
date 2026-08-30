@@ -90,11 +90,27 @@ public final class ArenaSpectatorStateVerification {
 				"HUD line exposes rank and a non-color provider/status badge"
 		);
 		List<String> resultLines = ScenarioResultsScreen.resultLines(terminal);
-		assertEquals("Run: run-a", resultLines.get(3), "result lines include the run id");
-		assertEquals("Map: last-valley @ 1.0.0", resultLines.get(4), "result lines include map id and version");
-		assertEquals("Seeds: world=123 event=456", resultLines.get(5), "result lines include both seeds");
-		assertEquals("Result SHA-256: " + terminal.resultHash(), resultLines.get(6),
+		assertEquals("Winner: Agent A", resultLines.getFirst(), "results lead with the winner");
+		assertTrue(resultLines.indexOf("#1 Agent A [codex] 4 | HP 85% | completed")
+				< resultLines.indexOf("Run: run-a"), "standings appear before technical run metadata");
+		assertTrue(resultLines.contains("Map: last-valley @ 1.0.0"), "result lines include map id and version");
+		assertTrue(resultLines.contains("Seeds: world=123 event=456"), "result lines include both seeds");
+		assertTrue(resultLines.contains("Result SHA-256: " + terminal.resultHash()),
 				"result lines include the canonical hash");
+		assertEquals("Decisive event: " + terminal.feed().getLast().message(),
+				resultLines.stream().filter(line -> line.startsWith("Decisive event: ")).findFirst().orElseThrow(),
+				"results lead with the newest decisive event");
+		ArenaSpectatorSnapshot failed = snapshot(
+				9L, "run-failed", 220L, true,
+				"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", "Failed");
+		List<String> failedLines = ScenarioResultsScreen.resultLines(failed);
+		assertEquals("MATCH FAILED", ScenarioResultsScreen.headline(failed),
+				"failed results use an explicit failure headline");
+		assertEquals("Match failed", failedLines.getFirst(), "failed results do not announce a winner");
+		assertTrue(failedLines.stream().noneMatch(line -> line.startsWith("Winner:")),
+				"failed result hierarchy never crowns the top standing");
+		assertTrue(failedLines.indexOf("Outcome: Failed after 220 ticks") < failedLines.indexOf("Run: run-failed"),
+				"failed outcome appears before technical run metadata");
 		state.tickCamera(true, true, true, false, 10_000L);
 		assertTrue(state.resultsAvailable(), "time does not expire deterministic terminal results");
 		state.dismissResults();
@@ -105,10 +121,15 @@ public final class ArenaSpectatorStateVerification {
 				"a new run accepts its independently reset revision");
 		assertFalse(state.resultsAvailable(), "starting another run clears dismissed terminal state");
 		assertTrue(state.enableCamera(true, 0L), "new run recommendation can opt in");
+		state.clear();
+		assertTrue(state.snapshot().isEmpty(), "server tombstone clears an expired spectator snapshot");
+		assertTrue(state.cameraDisabled(), "server tombstone clears camera opt-in");
+		assertTrue(state.accept(ArenaSpectatorSnapshotPayload.full(newRun)),
+				"a full snapshot can start cleanly after a server tombstone");
 		state.clearOnDisconnect();
 		assertTrue(state.snapshot().isEmpty(), "disconnect clears spectator snapshots");
 		assertTrue(state.cameraDisabled(), "disconnect clears camera opt-in");
-		return 47;
+		return 56;
 	}
 
 	private static ArenaSpectatorSnapshot snapshot(
@@ -118,6 +139,17 @@ public final class ArenaSpectatorStateVerification {
 			boolean terminal,
 			String resultHash
 	) {
+		return snapshot(revision, runId, elapsedTick, terminal, resultHash, terminal ? "Finished" : "Dawn");
+	}
+
+	private static ArenaSpectatorSnapshot snapshot(
+			long revision,
+			String runId,
+			long elapsedTick,
+			boolean terminal,
+			String resultHash,
+			String phaseTitle
+	) {
 		DirectorRecommendation recommendation = new DirectorRecommendation(
 				"participant", "agent-a", "Follow Agent A", 10.0D, 80.0D, 10.0D, elapsedTick + 40L, 20);
 		return new ArenaSpectatorSnapshot(
@@ -125,7 +157,7 @@ public final class ArenaSpectatorStateVerification {
 				runId,
 				"last-valley",
 				"The Last Valley",
-				terminal ? "Finished" : "Dawn",
+				phaseTitle,
 				elapsedTick,
 				36_000L,
 				terminal,

@@ -11,7 +11,10 @@ import java.util.Objects;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.input.KeyEvent;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.MutableComponent;
+import org.lwjgl.glfw.GLFW;
 
 public final class ScenarioResultsScreen extends Screen {
 	private static final int PANEL = 0xF21A1D23;
@@ -19,6 +22,7 @@ public final class ScenarioResultsScreen extends Screen {
 	private static final int SURFACE = 0xFF222B36;
 	private static final int TRACK = 0xFF10161C;
 	private static final int ACCENT = 0xFFF2BD58;
+	private static final int FAILURE = 0xFFFF737A;
 	private static final int TEXT = 0xFFF2F3F5;
 	private static final int MUTED = 0xFFABB1BC;
 	private final ArenaSpectatorSnapshot snapshot;
@@ -38,16 +42,44 @@ public final class ScenarioResultsScreen extends Screen {
 		Objects.requireNonNull(snapshot, "snapshot must not be null");
 		if (!snapshot.terminal()) throw new IllegalArgumentException("results require a terminal snapshot");
 		ArrayList<String> lines = new ArrayList<>();
-		lines.add(snapshot.scenarioTitle() + " | " + snapshot.phaseTitle());
-		lines.add("Elapsed: " + snapshot.elapsedTick() + " / " + snapshot.durationTicks() + " ticks");
+		lines.add(failed(snapshot) ? "Match failed"
+				: snapshot.standings().isEmpty() ? "No winner recorded"
+				: "Winner: " + snapshot.standings().getFirst().displayName());
 		for (ArenaSpectatorSnapshot.Standing standing : snapshot.standings()) {
 			lines.add(ArenaSpectatorHud.standingLabel(standing));
 		}
+		lines.add("Outcome: " + snapshot.phaseTitle() + " after " + snapshot.elapsedTick() + " ticks");
+		for (var event : snapshot.feed().reversed().stream().limit(2).toList()) {
+			lines.add("Decisive event: " + event.message());
+		}
+		lines.add(snapshot.scenarioTitle());
 		lines.add("Run: " + snapshot.runId());
 		lines.add("Map: " + snapshot.scenarioId() + " @ " + snapshot.mapVersion());
 		lines.add("Seeds: world=" + snapshot.worldSeed() + " event=" + snapshot.eventSeed());
 		lines.add("Result SHA-256: " + snapshot.resultHash());
 		return List.copyOf(lines);
+	}
+
+	public static String headline(ArenaSpectatorSnapshot snapshot) {
+		Objects.requireNonNull(snapshot, "snapshot must not be null");
+		return failed(snapshot) ? "MATCH FAILED" : "MATCH COMPLETE";
+	}
+
+	private static boolean failed(ArenaSpectatorSnapshot snapshot) {
+		return snapshot.phaseTitle().equalsIgnoreCase("failed");
+	}
+
+	@Override
+	public Component getNarrationMessage() {
+		MutableComponent narration = getTitle().copy();
+		List<String> lines = resultLines(snapshot);
+		for (String line : lines.subList(0, Math.min(lines.size(), snapshot.standings().size() + 4))) {
+			narration.append(". ").append(Component.literal(line));
+		}
+		if (snapshot.standings().size() > layout().visibleStandings()) {
+			narration.append(". ").append(Component.literal(scrollPositionLabel()));
+		}
+		return narration;
 	}
 
 	@Override
@@ -71,6 +103,33 @@ public final class ScenarioResultsScreen extends Screen {
 	}
 
 	@Override
+	public boolean keyPressed(KeyEvent event) {
+		if (super.keyPressed(event)) return true;
+		ScenarioResultsLayout layout = layout();
+		int maximum = Math.max(0, snapshot.standings().size() - layout.visibleStandings());
+		int next = switch (event.key()) {
+			case GLFW.GLFW_KEY_UP -> standingScroll - layout.columns();
+			case GLFW.GLFW_KEY_DOWN -> standingScroll + layout.columns();
+			case GLFW.GLFW_KEY_PAGE_UP -> standingScroll - layout.visibleStandings();
+			case GLFW.GLFW_KEY_PAGE_DOWN -> standingScroll + layout.visibleStandings();
+			case GLFW.GLFW_KEY_HOME -> 0;
+			case GLFW.GLFW_KEY_END -> maximum;
+			default -> standingScroll;
+		};
+		next = Math.clamp(next, 0, maximum);
+		if (next == standingScroll) return false;
+		standingScroll = next;
+		return true;
+	}
+
+	private String scrollPositionLabel() {
+		ScenarioResultsLayout layout = layout();
+		int end = Math.min(snapshot.standings().size(), standingScroll + layout.visibleStandings());
+		return "Standings " + (standingScroll + 1) + " to " + end + " of " + snapshot.standings().size()
+				+ ". Use arrow or page keys to scroll.";
+	}
+
+	@Override
 	public void extractRenderState(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float partialTick) {
 		ScenarioResultsLayout layout = layout();
 		int panelWidth = layout.panelWidth();
@@ -80,12 +139,16 @@ public final class ScenarioResultsScreen extends Screen {
 		graphics.fill(0, 0, width, height, 0xC00B1016);
 		graphics.fill(left - 1, top - 1, layout.panelRight() + 1, bottom + 1, EDGE);
 		graphics.fill(left, top, layout.panelRight(), bottom, PANEL);
-		graphics.fill(left, top, left + panelWidth, top + 3, ACCENT);
-		graphics.text(font, "MATCH COMPLETE", left + 14, top + 12, ACCENT, false);
-		String winner = snapshot.standings().isEmpty()
+		int resultTone = failed(snapshot) ? FAILURE : ACCENT;
+		graphics.fill(left, top, left + panelWidth, top + 3, resultTone);
+		graphics.text(font, headline(snapshot), left + 14, top + 12, resultTone, false);
+		String winner = failed(snapshot)
+				? "NO WINNER  RUN FAILED"
+				: snapshot.standings().isEmpty()
 				? snapshot.scenarioTitle()
 				: "WINNER  " + snapshot.standings().getFirst().displayName();
-		graphics.text(font, fit(winner, panelWidth - 150), left + 14, top + 27, TEXT, false);
+		graphics.text(font, fit(winner, panelWidth - 150), left + 14, top + 27,
+				failed(snapshot) ? FAILURE : TEXT, false);
 		String duration = ArenaHudPresentation.timeLabel(snapshot.elapsedTick(), snapshot.durationTicks(), true);
 		graphics.text(font, duration, left + panelWidth - font.width(duration) - 14, top + 27, TEXT, false);
 
@@ -102,26 +165,18 @@ public final class ScenarioResultsScreen extends Screen {
 		int detailsTop = layout.detailsTop();
 		if (snapshot.standings().size() > layout.visibleStandings()) {
 			String range = "STANDINGS " + (standingScroll + 1) + "-" + end + " OF " + snapshot.standings().size()
-					+ " | SCROLL FOR MORE";
+					+ " | WHEEL, ARROWS, OR PAGE KEYS";
 			graphics.text(font, range, left + 14, detailsTop - 11, ACCENT, false);
 		}
-		graphics.text(font, "RUN RECORD", left + 14, detailsTop, MUTED, false);
-		if (panelWidth < 600) {
-			graphics.text(font, fit("Run " + snapshot.runId() + " | Map " + snapshot.scenarioId()
-					+ " @ " + snapshot.mapVersion(), panelWidth - 28), left + 14, detailsTop + 12, TEXT, false);
-			graphics.text(font, fit("Seeds  world " + snapshot.worldSeed() + " / event " + snapshot.eventSeed(),
-					panelWidth - 28), left + 14, detailsTop + 25, MUTED, false);
-			graphics.text(font, fit("Result  " + snapshot.resultHash(), panelWidth - 28),
-					left + 14, detailsTop + 38, MUTED, false);
-		} else {
-			graphics.text(font, fit("Run  " + snapshot.runId(), panelWidth - 28), left + 14, detailsTop + 12, TEXT, false);
-			graphics.text(font, fit("Map  " + snapshot.scenarioId() + " @ " + snapshot.mapVersion(), panelWidth - 28),
-					left + 14, detailsTop + 26, MUTED, false);
-			graphics.text(font, fit("Seeds  world " + snapshot.worldSeed() + " / event " + snapshot.eventSeed(), panelWidth - 28),
-					left + 14, detailsTop + 38, MUTED, false);
-			graphics.text(font, fit("Result  " + snapshot.resultHash(), panelWidth - 28),
-					left + 14, detailsTop + 50, MUTED, false);
-		}
+		graphics.text(font, "OUTCOME", left + 14, detailsTop, resultTone, false);
+		graphics.text(font, fit(snapshot.phaseTitle() + " after " + snapshot.elapsedTick() + " ticks", panelWidth - 28),
+				left + 14, detailsTop + 12, failed(snapshot) ? FAILURE : TEXT, false);
+		String decisiveEvent = snapshot.feed().isEmpty()
+				? "No decisive event recorded"
+				: "Decisive  " + snapshot.feed().getLast().message();
+		graphics.text(font, fit(decisiveEvent, panelWidth - 28), left + 14, detailsTop + 25, TEXT, false);
+		graphics.text(font, fit("Run " + snapshot.runId() + " | Map " + snapshot.scenarioId()
+				+ " @ " + snapshot.mapVersion(), panelWidth - 28), left + 14, detailsTop + 38, MUTED, false);
 		super.extractRenderState(graphics, mouseX, mouseY, partialTick);
 	}
 

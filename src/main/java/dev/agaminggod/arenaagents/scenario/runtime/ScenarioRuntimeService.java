@@ -29,6 +29,7 @@ import dev.agaminggod.arenaagents.server.GoalControl;
 import dev.agaminggod.arenaagents.server.OfflineAgentPlayers;
 import dev.agaminggod.arenaagents.server.bridge.CoordinatorStatusStore;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.Identifier;
 import net.minecraft.network.chat.Component;
@@ -37,16 +38,20 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.FallingBlock;
 import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.level.storage.LevelData;
 import net.minecraft.world.level.GameType;
 import net.minecraft.world.Container;
+import net.minecraft.world.entity.Entity;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -61,6 +66,10 @@ public final class ScenarioRuntimeService {
 	private static final Logger LOGGER = LoggerFactory.getLogger(ScenarioRuntimeService.class);
 	private static final long ROSTER_READY_TIMEOUT_TICKS = 240L;
 	private static final int PUBLIC_EVENT_LIMIT = 4_096;
+	private static final long CONFIRMATION_TTL_TICKS = 20L * 60L;
+	private static final long TERMINAL_BUILD_TTL_TICKS = 20L * 60L;
+	private static final int MAX_EVACUATION_OCCUPANTS = 512;
+	private static final int MAX_EVACUATION_COLUMNS = 4_096;
 	private static final Map<MinecraftServer, RuntimeState> STATES = new WeakHashMap<>();
 
 	private ScenarioRuntimeService() {
@@ -72,19 +81,13 @@ public final class ScenarioRuntimeService {
 		}
 		MinecraftServer server = operator.level().getServer();
 		RuntimeState state = STATES.computeIfAbsent(server, ignored -> new RuntimeState());
-		if (ScenarioActivationFailurePolicy.mayReplacePendingLaunch(
-				state.build != null, state.pendingActivation != null,
-				state.activation != null || state.activeRun != null || state.pendingResult != null)) {
-			state.pendingActivation = null;
-			state.buildProgress = null;
-		}
-		if (state.build != null || state.pendingActivation != null || state.activation != null) {
+		if (state.build != null || state.pendingActivation != null || state.activation != null
+				|| state.preparationSnapshot != null) {
 			throw new IllegalStateException("An arena is already being prepared");
 		}
 		if (state.activeRun != null || state.pendingResult != null) {
 			throw new IllegalStateException("A scenario is already running");
 		}
-		CodexAgentManager.get(server).registry().requireCapacity(request.roster().size());
 		ScenarioPreset preset = ScenarioPresets.require(request.scenarioId());
 		ServerLevel level = operator.level();
 		BlockPos origin = arenaOrigin(level, preset, operator, request.placementMode());
@@ -109,13 +112,54 @@ public final class ScenarioRuntimeService {
 				now
 		);
 		ScenarioArenaBlueprint blueprint = ScenarioArenaBlueprint.create(preset, origin, participants.size());
+		SiteInspection inspection = inspectSite(level, blueprint);
+		if (!inspection.verdict.allowedWithConfirmation()) {
+			throw new IllegalStateException(inspection.verdict.code());
+		}
+		String launchIntent = launchIntent(request);
+		if (request.confirmationToken().isEmpty()) {
+			String token = UUID.randomUUID().toString();
+			state.pendingConfirmation = new PendingSiteConfirmation(
+					token, operator.getUUID(), launchIntent, origin, inspection.occupantIds,
+					state.runtimeTick + CONFIRMATION_TTL_TICKS);
+			state.buildProgress = ScenarioBuildProgress.confirmationRequired(
+					config.sessionId().toString(), preset.title(), state.nextBuildRevision(),
+					origin.getX(), origin.getY(), origin.getZ(), confirmationDetail(blueprint, inspection), token);
+			return;
+		}
+		PendingSiteConfirmation confirmation = state.pendingConfirmation;
+		if (confirmation == null || state.runtimeTick > confirmation.expiresAtTick
+				|| !confirmation.token.equals(request.confirmationToken())
+				|| !confirmation.operatorId.equals(operator.getUUID())
+				|| !confirmation.launchIntent.equals(launchIntent)
+				|| !confirmation.origin.equals(origin)
+				|| !confirmation.occupantIds.equals(inspection.occupantIds)) {
+			throw new IllegalStateException("SITE_CONFIRMATION_EXPIRED");
+		}
+		state.pendingConfirmation = null;
+		CodexAgentManager.get(server).registry().requireCapacity(request.roster().size());
+		ScenarioPreparationJournal journal = new ScenarioPreparationJournal(server.getServerDirectory());
+		ScenarioPreparationJournal.Snapshot preparation = new ScenarioPreparationJournal.Snapshot(
+				config.sessionId(), operator.getUUID(), level.dimension().identifier().toString(), origin,
+				new ScenarioLaunchRequest(request.scenarioId(), request.mapVersion(), request.deterministicEvents(),
+						request.placementMode(), request.roster()),
+				config.worldSeed(), config.eventSeed(), config.createdAtEpochMs(), List.of(), false);
+		try {
+			journal.write(preparation);
+		} catch (java.io.IOException exception) {
+			throw new IllegalStateException("PREPARATION_JOURNAL_UNAVAILABLE", exception);
+		}
+		state.preparationJournal = journal;
+		state.preparationSnapshot = preparation;
+		ScenarioSavedData.get(server).clear();
+		ScenarioSavedData.saveNow(server);
+		evacuateSite(level, blueprint.siteBounds());
 		removeContestants(CodexAgentManager.get(server), state.agents);
 		state.agents = List.of();
 		state.participantByAgent.clear();
 		state.publicEvents.clear();
-		ScenarioSavedData.get(server).clear();
 		state.build = new BuildJob(
-				operator,
+				operator.getUUID(),
 				level,
 				request,
 				config,
@@ -123,7 +167,8 @@ public final class ScenarioRuntimeService {
 				blueprint,
 				new ScenarioArenaResetJob(blueprint),
 				null,
-				-1
+				-1,
+				false
 		);
 		state.buildProgress = new ScenarioBuildProgress(
 				config.sessionId().toString(), preset.title(), "canonicalizing", state.nextBuildRevision(),
@@ -142,6 +187,24 @@ public final class ScenarioRuntimeService {
 		RuntimeState state = STATES.get(server);
 		if (state == null) return;
 		state.runtimeTick++;
+		if (state.pendingConfirmation != null
+				&& state.runtimeTick > state.pendingConfirmation.expiresAtTick) {
+			state.pendingConfirmation = null;
+			state.buildProgress = null;
+		}
+		if (state.buildProgress != null && state.buildProgress.terminal()
+				&& state.buildProgressTerminalTick > 0L
+				&& state.runtimeTick - state.buildProgressTerminalTick >= TERMINAL_BUILD_TTL_TICKS) {
+			state.buildProgress = null;
+			state.buildProgressTerminalTick = 0L;
+		}
+		if (!state.cancelCleanupIds.isEmpty()) {
+			if (removeBoundAgentsStrict(CodexAgentManager.get(server), state.cancelCleanupIds)) {
+				state.cancelCleanupIds = List.of();
+				clearPreparationJournal(state);
+			}
+			return;
+		}
 		if (state.pendingResult != null) {
 			tickPendingResult(state, server);
 			return;
@@ -378,7 +441,73 @@ public final class ScenarioRuntimeService {
 		if (state.cleanup != null) return retryFailedRecoveryCleanup(state, server);
 		if (state.restoreAttempted) return true;
 		state.restoreAttempted = true;
+		ScenarioPreparationJournal preparationJournal = new ScenarioPreparationJournal(server.getServerDirectory());
+		Optional<ScenarioPreparationJournal.Snapshot> prepared;
+		try {
+			prepared = preparationJournal.load();
+		} catch (java.io.IOException exception) {
+			LOGGER.error("Scenario preparation journal cannot be read; recovery is blocked", exception);
+			state.restoreAttempted = false;
+			return false;
+		}
 		Optional<ScenarioRunSnapshot> saved = ScenarioSavedData.get(server).snapshot();
+		if (preparationOwnsRecovery(
+				prepared.map(ScenarioPreparationJournal.Snapshot::sessionId),
+				saved.map(ScenarioRunSnapshot::sessionId))) {
+			ScenarioPreparationJournal.Snapshot owner = prepared.orElseThrow();
+			if (saved.isPresent()) {
+				LOGGER.warn(
+						"Scenario preparation {} supersedes stale saved run {}",
+						owner.sessionId(), saved.orElseThrow().sessionId());
+				ScenarioSavedData.get(server).clear();
+				ScenarioSavedData.saveNow(server);
+			}
+			ServerLevel level = null;
+			for (ServerLevel candidate : server.getAllLevels()) {
+				if (candidate.dimension().identifier().toString().equals(owner.dimensionId())) level = candidate;
+			}
+			CodexAgentManager manager = CodexAgentManager.get(server);
+			List<String> preparationAgentIds = preparationOwnedAgentIds(manager, owner);
+			if (level == null || !removeBoundAgentsStrict(manager, preparationAgentIds)) {
+				state.restoreAttempted = false;
+				return false;
+			}
+			ScenarioLaunchRequest request = owner.request();
+			ScenarioPreset preset = ScenarioPresets.require(request.scenarioId());
+			List<ScenarioParticipant> participants = request.roster().stream()
+					.sorted(Comparator.comparingInt(ScenarioAgentSpec::slot))
+					.map(agent -> new ScenarioParticipant("slot-" + agent.slot(), agent.displayName(), agent.team()))
+					.toList();
+			ScenarioSessionConfig config = new ScenarioSessionConfig(
+					owner.sessionId(), preset, owner.worldSeed(), owner.eventSeed(), preset.defaultDurationTicks(),
+					request.deterministicEvents(), participants, owner.createdAtEpochMs());
+			ScenarioArenaBlueprint blueprint = ScenarioArenaBlueprint.create(preset, owner.origin(), participants.size());
+			state.preparationJournal = preparationJournal;
+			state.preparationSnapshot = owner.cancelling();
+			try {
+				preparationJournal.write(state.preparationSnapshot);
+			} catch (java.io.IOException exception) {
+				state.restoreAttempted = false;
+				return false;
+			}
+			state.build = new BuildJob(
+					owner.operatorId(), level, request, config, new ScenarioSession(config), blueprint,
+					new ScenarioArenaResetJob(blueprint), null, -1, true);
+			state.buildProgress = new ScenarioBuildProgress(
+					owner.sessionId().toString(), preset.title(), "canonicalizing", state.nextBuildRevision(),
+					0, state.build.reset.totalPlacements(), 0, owner.origin().getX(), owner.origin().getY(),
+					owner.origin().getZ(), ScenarioBuildProgress.Status.BUILDING,
+					"Recovering an interrupted preparation to a verified safe state", "", "");
+			return true;
+		}
+		if (prepared.isPresent() && saved.isPresent()
+				&& prepared.orElseThrow().sessionId().equals(saved.orElseThrow().sessionId())) {
+			try {
+				preparationJournal.clear();
+			} catch (java.io.IOException exception) {
+				LOGGER.warn("Could not clear superseded scenario preparation journal", exception);
+			}
+		}
 		if (saved.isEmpty()) return true;
 		ScenarioRunSnapshot snapshot = saved.orElseThrow();
 		if (snapshot.state().terminal()) {
@@ -423,6 +552,13 @@ public final class ScenarioRuntimeService {
 		}
 		state.recovery = new RecoveryJob(snapshot, session, clock, savedLevel, 0L);
 		return true;
+	}
+
+	static boolean preparationOwnsRecovery(Optional<UUID> preparedSession, Optional<UUID> savedSession) {
+		Objects.requireNonNull(preparedSession, "preparedSession must not be null");
+		Objects.requireNonNull(savedSession, "savedSession must not be null");
+		return preparedSession.isPresent()
+				&& (savedSession.isEmpty() || !preparedSession.orElseThrow().equals(savedSession.orElseThrow()));
 	}
 
 	private static void tickRecovery(RuntimeState state, boolean coordinatorReady) {
@@ -540,8 +676,10 @@ public final class ScenarioRuntimeService {
 	}
 
 	private static void tickBuild(RuntimeState state) {
+		if (state.buildFailed) return;
 		BuildJob build = state.build;
 		try {
+			evacuateSite(build.level, build.blueprint.siteBounds());
 			ScenarioArenaResetJob.Tick progress = build.reset.tick(build.level);
 			boolean phaseChanged = progress.phase() != build.reportedPhase;
 			int percent = progress.total() == 0
@@ -554,11 +692,11 @@ public final class ScenarioRuntimeService {
 						build.config.sessionId().toString(), build.config.preset().title(), progress,
 						build.blueprint.origin().getX(), build.blueprint.origin().getY(), build.blueprint.origin().getZ(),
 						state.nextBuildRevision(), buildProgressDetail(progress));
-				build.operator.connection.send(new ClientboundSetActionBarTextPacket(Component.literal(
+				sendActionBar(build.level, build.operatorId, Component.literal(
 						"Arena at " + coordinates(build.blueprint.origin()) + ": "
 								+ progress.phase().displayName() + " " + progress.completed() + " / "
 								+ progress.total() + " (" + Math.min(100, percent) + "%)"
-				)));
+				));
 				build = build.withReportedProgress(progress.phase(), progress.completed());
 			}
 			state.build = build;
@@ -574,10 +712,24 @@ public final class ScenarioRuntimeService {
 						build.reset.mismatchCount(), build.reset.mismatchSamples()
 				);
 				build.session.fail(0L, "Arena preparation failed: " + reason);
-				publishOperatorNotice(build.operator, ScenarioOperatorMessagePolicy.Event.FAILURE,
+				publishOperatorNotice(build.level, build.operatorId, ScenarioOperatorMessagePolicy.Event.FAILURE,
 						"Arena launch failed: " + resetFailureMessage(reason));
-				state.build = null;
+				state.build = build;
+				state.buildFailed = true;
 			} else if (progress.phase() == ScenarioArenaResetJob.Phase.COMPLETE) {
+				if (build.cancellationRequested) {
+					state.buildProgress = ScenarioBuildProgress.cancelled(
+							build.config.sessionId().toString(), build.config.preset().title(),
+							state.nextBuildRevision(), progress.total(), progress.changedBlocks(),
+							build.blueprint.origin().getX(), build.blueprint.origin().getY(),
+							build.blueprint.origin().getZ(),
+							"Arena launch cancelled after the site reached a verified safe state");
+					state.buildProgressTerminalTick = state.runtimeTick;
+					state.build = null;
+					state.buildFailed = false;
+					clearPreparationJournal(state);
+					return;
+				}
 				populateArenaContainers(build);
 				state.buildProgress = ScenarioBuildProgress.fromResetTick(
 						build.config.sessionId().toString(), build.config.preset().title(), progress,
@@ -603,9 +755,10 @@ public final class ScenarioRuntimeService {
 					build.blueprint.origin().getX(), build.blueprint.origin().getY(), build.blueprint.origin().getZ(),
 					state.nextBuildRevision(), safeMessage(exception));
 			build.session.fail(0L, "Arena preparation failed: " + safeMessage(exception));
-			publishOperatorNotice(build.operator, ScenarioOperatorMessagePolicy.Event.FAILURE,
+			publishOperatorNotice(build.level, build.operatorId, ScenarioOperatorMessagePolicy.Event.FAILURE,
 					"Arena launch failed: " + safeMessage(exception));
-			state.build = null;
+			state.build = build;
+			state.buildFailed = true;
 		}
 	}
 
@@ -613,9 +766,9 @@ public final class ScenarioRuntimeService {
 		BuildJob build = state.pendingActivation;
 		if (!CodexAgentServerRuntime.automationAvailable(build.level.getServer())) {
 			if (state.runtimeTick % 40L == 0L) {
-				build.operator.connection.send(new ClientboundSetActionBarTextPacket(Component.literal(
+				sendActionBar(build.level, build.operatorId, Component.literal(
 						"Arena ready | connecting agent coordinator..."
-				)));
+				));
 			}
 			return;
 		}
@@ -627,6 +780,15 @@ public final class ScenarioRuntimeService {
 		try {
 			beginActivation(state, build);
 		} catch (RuntimeException exception) {
+			if (!state.cancelCleanupIds.isEmpty()) {
+				build.session.fail(0L, "Contestant activation failed: " + safeMessage(exception));
+				state.buildProgress = activationFailureProgress(state, build.config, build.blueprint.origin(),
+						"Agents could not start; cleanup is retrying: " + safeMessage(exception));
+				state.buildProgressTerminalTick = state.runtimeTick;
+				publishOperatorNotice(build.level, build.operatorId, ScenarioOperatorMessagePolicy.Event.FAILURE,
+						"Arena is ready, but partial contestant cleanup must finish before another launch.");
+				return;
+			}
 			if (ScenarioActivationFailurePolicy.retryWhenCoordinatorReturns(exception)) {
 				waitForCoordinator(state, build);
 				return;
@@ -634,16 +796,18 @@ public final class ScenarioRuntimeService {
 			build.session.fail(0L, "Contestant activation failed: " + safeMessage(exception));
 			state.buildProgress = activationFailureProgress(state, build.config, build.blueprint.origin(),
 					"Agents could not start: " + safeMessage(exception));
-			publishOperatorNotice(build.operator, ScenarioOperatorMessagePolicy.Event.FAILURE,
+			publishOperatorNotice(build.level, build.operatorId, ScenarioOperatorMessagePolicy.Event.FAILURE,
 					"Arena is ready, but agents could not start: " + safeMessage(exception));
+			state.buildProgressTerminalTick = state.runtimeTick;
+			clearPreparationJournal(state);
 		}
 	}
 
 	private static void waitForCoordinator(RuntimeState state, BuildJob build) {
 		state.pendingActivation = build;
-		build.operator.connection.send(new ClientboundSetActionBarTextPacket(Component.literal(
+		sendActionBar(build.level, build.operatorId, Component.literal(
 				"Arena ready | waiting for agent coordinator"
-		)));
+		));
 	}
 
 	private static String buildProgressDetail(ScenarioArenaResetJob.Tick progress) {
@@ -696,7 +860,7 @@ public final class ScenarioRuntimeService {
 				CoordinatorStatusStore.latest(activation.level.getServer()),
 				activation.contestants.stream().map(contestant -> new ScenarioPreflight.RequiredProfile(
 						contestant.record.agentId().toString(), contestant.spec.provider(),
-						contestant.spec.model(), contestant.spec.reasoning()
+						contestant.spec.model(), contestant.spec.reasoning(), contestant.spec.serviceTier()
 				)).toList(),
 				activation.expectedDimension,
 				activation.level.dimension().identifier().toString(),
@@ -782,7 +946,7 @@ public final class ScenarioRuntimeService {
 			state.activeRun = new ActiveRun(
 					activation.session,
 					new ScenarioRuntimeClock(activation.session),
-					activation.operator.getUUID(),
+					activation.operatorId,
 					activation.level,
 					activation.origin,
 					activation.resetReceipt,
@@ -790,16 +954,26 @@ public final class ScenarioRuntimeService {
 			);
 			state.activation = null;
 			persistActiveRun(state);
-			BlockPos operatorSpawn = ScenarioArenaBlueprint.operatorSpawn(activation.origin);
-			activation.operator.teleportTo(
-					operatorSpawn.getX() + 0.5D,
-					operatorSpawn.getY(),
-					operatorSpawn.getZ() + 0.5D
-			);
-			publishOperatorNotice(activation.operator, ScenarioOperatorMessagePolicy.Event.STARTED,
-					"GO | " + activation.config.preset().title() + " launched with " + ready.size()
-							+ " independently controlled offline players."
-			);
+			ScenarioSavedData.saveNow(activation.level.getServer());
+			clearPreparationJournal(state);
+			try {
+				ServerPlayer operator = liveOperator(activation.level, activation.operatorId);
+				if (operator != null) {
+					BlockPos operatorSpawn = ScenarioArenaBlueprint.operatorSpawn(activation.origin);
+					operator.teleportTo(operatorSpawn.getX() + 0.5D, operatorSpawn.getY(), operatorSpawn.getZ() + 0.5D);
+				}
+			} catch (RuntimeException exception) {
+				LOGGER.warn("Scenario {} started but the operator could not be moved to the arena",
+						activation.config.sessionId(), exception);
+			}
+			try {
+				publishOperatorNotice(activation.level, activation.operatorId, ScenarioOperatorMessagePolicy.Event.STARTED,
+						"GO | " + activation.config.preset().title() + " launched with " + ready.size()
+								+ " independently controlled offline players.");
+			} catch (RuntimeException exception) {
+				LOGGER.warn("Scenario {} started but its operator notice could not be delivered",
+						activation.config.sessionId(), exception);
+			}
 		} catch (RuntimeException exception) {
 			failActivation(state, activation, manager, safeMessage(exception));
 		}
@@ -903,6 +1077,37 @@ public final class ScenarioRuntimeService {
 		if (operator == null || ScenarioOperatorMessagePolicy.surface(event)
 				!= ScenarioOperatorMessagePolicy.Surface.ACTION_BAR) return;
 		operator.connection.send(new ClientboundSetActionBarTextPacket(Component.literal(message)));
+	}
+
+	private static void publishOperatorNotice(
+			ServerLevel level,
+			UUID operatorId,
+			ScenarioOperatorMessagePolicy.Event event,
+			String message
+	) {
+		publishOperatorNotice(liveOperator(level, operatorId), event, message);
+	}
+
+	private static void sendActionBar(ServerLevel level, UUID operatorId, Component message) {
+		ServerPlayer operator = liveOperator(level, operatorId);
+		if (operator != null) operator.connection.send(new ClientboundSetActionBarTextPacket(message));
+	}
+
+	private static ServerPlayer liveOperator(ServerLevel level, UUID operatorId) {
+		return level.getServer().getPlayerList().getPlayer(operatorId);
+	}
+
+	private static void clearPreparationJournal(RuntimeState state) {
+		if (state.preparationJournal != null) {
+			try {
+				state.preparationJournal.clear();
+			} catch (java.io.IOException exception) {
+				LOGGER.error("Could not clear completed scenario preparation journal", exception);
+				return;
+			}
+		}
+		state.preparationJournal = null;
+		state.preparationSnapshot = null;
 	}
 
 	private static ScenarioRunSnapshot persistActiveRun(RuntimeState state) {
@@ -1106,9 +1311,31 @@ public final class ScenarioRuntimeService {
 						effectiveGameMode
 				);
 				contestants.add(new PendingContestant(record, spec, spawn.slotIndex()));
+				if (state.preparationJournal == null || state.preparationSnapshot == null) {
+					throw new IllegalStateException("PREPARATION_JOURNAL_MISSING");
+				}
+				state.preparationSnapshot = state.preparationSnapshot.withAgentId(record.agentId().toString());
+				try {
+					state.preparationJournal.write(state.preparationSnapshot);
+				} catch (java.io.IOException exception) {
+					throw new IllegalStateException("PREPARATION_JOURNAL_UNAVAILABLE", exception);
+				}
 			}
 		} catch (RuntimeException exception) {
-			removeContestants(manager, contestants.stream().map(PendingContestant::record).toList());
+			List<String> cleanupIds = state.preparationSnapshot == null
+					? contestants.stream().map(contestant -> contestant.record.agentId().toString()).toList()
+					: preparationOwnedAgentIds(manager, state.preparationSnapshot);
+			boolean cleanupSucceeded = removeBoundAgentsStrict(manager, cleanupIds);
+			state.cancelCleanupIds = activationCleanupIds(cleanupSucceeded, cleanupIds);
+			if (cleanupSucceeded && ScenarioActivationFailurePolicy.retryWhenCoordinatorReturns(exception)
+					&& state.preparationJournal != null && state.preparationSnapshot != null) {
+				state.preparationSnapshot = preparationWithoutAgents(state.preparationSnapshot);
+				try {
+					state.preparationJournal.write(state.preparationSnapshot);
+				} catch (java.io.IOException journalFailure) {
+					throw new IllegalStateException("PREPARATION_JOURNAL_UNAVAILABLE", journalFailure);
+				}
+			}
 			throw exception;
 		}
 		build.session.markReady(0L);
@@ -1116,7 +1343,7 @@ public final class ScenarioRuntimeService {
 		List<PendingContestant> pending = List.copyOf(contestants);
 		state.activation = new ActivationJob(
 				build.session,
-				build.operator,
+				build.operatorId,
 				build.level,
 				build.config,
 				build.blueprint.origin(),
@@ -1130,7 +1357,7 @@ public final class ScenarioRuntimeService {
 				System.currentTimeMillis(),
 				0L
 		);
-		publishOperatorNotice(build.operator, ScenarioOperatorMessagePolicy.Event.READY,
+		publishOperatorNotice(build.level, build.operatorId, ScenarioOperatorMessagePolicy.Event.READY,
 				"Arena ready | waiting for " + pending.size() + " offline contestants.");
 	}
 
@@ -1143,9 +1370,11 @@ public final class ScenarioRuntimeService {
 		activation.session.fail(0L, "Contestant activation failed: " + reason);
 		state.buildProgress = activationFailureProgress(
 				state, activation.config, activation.origin, "Agents could not start: " + reason);
-		publishOperatorNotice(activation.operator, ScenarioOperatorMessagePolicy.Event.FAILURE,
+		publishOperatorNotice(activation.level, activation.operatorId, ScenarioOperatorMessagePolicy.Event.FAILURE,
 				"Arena launch failed: " + reason);
 		removeContestants(manager, activation.contestants.stream().map(PendingContestant::record).toList());
+		state.cancelCleanupIds = activation.contestants.stream()
+				.map(contestant -> contestant.record.agentId().toString()).toList();
 		state.activation = null;
 		state.activeRun = null;
 		state.agents = List.of();
@@ -1204,6 +1433,21 @@ public final class ScenarioRuntimeService {
 
 	private static boolean agentRegistryContains(CodexAgentManager manager, String agentId) {
 		return manager.records().stream().anyMatch(record -> record.agentId().toString().equals(agentId));
+	}
+
+	static List<String> activationCleanupIds(boolean cleanupSucceeded, List<String> ownedAgentIds) {
+		Objects.requireNonNull(ownedAgentIds, "ownedAgentIds must not be null");
+		return cleanupSucceeded ? List.of() : List.copyOf(ownedAgentIds);
+	}
+
+	static ScenarioPreparationJournal.Snapshot preparationWithoutAgents(
+			ScenarioPreparationJournal.Snapshot snapshot
+	) {
+		Objects.requireNonNull(snapshot, "snapshot must not be null");
+		return new ScenarioPreparationJournal.Snapshot(
+				snapshot.sessionId(), snapshot.operatorId(), snapshot.dimensionId(), snapshot.origin(), snapshot.request(),
+				snapshot.worldSeed(), snapshot.eventSeed(), snapshot.createdAtEpochMs(), List.of(),
+				snapshot.cancellationRequested());
 	}
 
 	private static boolean retryFailedRecoveryCleanup(RuntimeState state, MinecraftServer server) {
@@ -1305,6 +1549,279 @@ public final class ScenarioRuntimeService {
 		return actual.getItem() == expected.getItem() && actual.getCount() == expected.getCount();
 	}
 
+	private static List<String> preparationOwnedAgentIds(
+			CodexAgentManager manager,
+			ScenarioPreparationJournal.Snapshot owner
+	) {
+		java.util.LinkedHashSet<String> ids = new java.util.LinkedHashSet<>(owner.agentIds());
+		for (AgentRecord record : manager.records()) {
+			if (record.createdAtEpochMs() < owner.createdAtEpochMs()) continue;
+			boolean matches = owner.request().roster().stream().anyMatch(spec ->
+					record.profile().userName().orElse("").equals(spec.displayName())
+							&& record.profile().provider().equals(spec.provider())
+							&& record.profile().model().equals(spec.model())
+							&& record.profile().reasoning().equals(spec.reasoning())
+							&& record.profile().serviceTier().equals(spec.serviceTier()));
+			if (matches) ids.add(record.agentId().toString());
+		}
+		return List.copyOf(ids);
+	}
+
+	public static synchronized void cancel(ServerPlayer operator, String buildId) {
+		Objects.requireNonNull(operator, "operator must not be null");
+		String expectedBuildId = Objects.requireNonNull(buildId, "buildId must not be null").trim();
+		if (!GoalControl.mayControl(operator.createCommandSourceStack())) {
+			throw new IllegalStateException("You do not have permission to cancel Arena Agents scenarios");
+		}
+		RuntimeState state = STATES.get(operator.level().getServer());
+		if (state == null || state.buildProgress == null
+				|| !state.buildProgress.buildId().equals(expectedBuildId)) {
+			throw new IllegalStateException("This arena preparation is no longer active");
+		}
+		if (state.activeRun != null || state.pendingResult != null || state.recovery != null) {
+			throw new IllegalStateException("A started scenario cannot be cancelled as preparation");
+		}
+		ScenarioBuildProgress current = state.buildProgress;
+		if (state.pendingConfirmation != null) {
+			state.pendingConfirmation = null;
+			state.buildProgress = ScenarioBuildProgress.cancelled(
+					current.buildId(), current.scenarioTitle(), state.nextBuildRevision(), 0, 0,
+					current.originX(), current.originY(), current.originZ(), "Arena launch cancelled before world changes");
+			state.buildProgressTerminalTick = state.runtimeTick;
+			clearPreparationJournal(state);
+			return;
+		}
+		if (state.build != null) {
+			ScenarioArenaResetJob.Phase phase = state.build.reset.phase();
+			if (!ScenarioCancellationPolicy.requiresSafeReset(phase, state.buildFailed)) {
+				state.build.reset.close(state.build.level);
+				state.buildProgress = ScenarioBuildProgress.cancelled(
+						current.buildId(), current.scenarioTitle(), state.nextBuildRevision(),
+						current.total(), current.changedBlocks(), current.originX(), current.originY(), current.originZ(),
+						"Arena launch cancelled before world changes");
+				state.build = null;
+				state.buildProgressTerminalTick = state.runtimeTick;
+				clearPreparationJournal(state);
+			} else if (state.buildFailed || phase == ScenarioArenaResetJob.Phase.FAILED) {
+				state.build = state.build.restartForCancellation();
+				state.buildFailed = false;
+				state.buildProgress = new ScenarioBuildProgress(
+						current.buildId(), current.scenarioTitle(), "canonicalizing", state.nextBuildRevision(),
+						0, state.build.reset.totalPlacements(), current.changedBlocks(), current.originX(), current.originY(),
+						current.originZ(), ScenarioBuildProgress.Status.BUILDING,
+						"Restoring the interrupted site to a verified arena before release", "", "");
+			} else {
+				state.build = state.build.cancelAfterSafeReset();
+				state.buildProgress = new ScenarioBuildProgress(
+						current.buildId(), current.scenarioTitle(), current.phase(), state.nextBuildRevision(),
+						current.completed(), current.total(), current.changedBlocks(), current.originX(), current.originY(),
+						current.originZ(), ScenarioBuildProgress.Status.BUILDING,
+						"Cancellation requested; finishing verification so the site is not left partial", "", "");
+			}
+			return;
+		}
+		if (state.pendingActivation != null) {
+			state.pendingActivation = null;
+			state.buildProgress = ScenarioBuildProgress.cancelled(
+					current.buildId(), current.scenarioTitle(), state.nextBuildRevision(), current.total(),
+					current.changedBlocks(), current.originX(), current.originY(), current.originZ(),
+					"Arena launch cancelled before contestants started");
+			state.buildProgressTerminalTick = state.runtimeTick;
+			clearPreparationJournal(state);
+			return;
+		}
+		if (state.activation != null) {
+			state.cancelCleanupIds = state.activation.contestants.stream()
+					.map(contestant -> contestant.record.agentId().toString()).toList();
+			state.activation = null;
+			state.buildProgress = ScenarioBuildProgress.cancelled(
+					current.buildId(), current.scenarioTitle(), state.nextBuildRevision(), current.total(),
+					current.changedBlocks(), current.originX(), current.originY(), current.originZ(),
+					"Arena launch cancelled; removing summoned contestants");
+			state.buildProgressTerminalTick = state.runtimeTick;
+			return;
+		}
+		throw new IllegalStateException("This arena preparation is no longer active");
+	}
+
+	private static SiteInspection inspectSite(ServerLevel level, ScenarioArenaBlueprint blueprint) {
+		ScenarioArenaBlueprint.SiteBounds bounds = blueprint.siteBounds();
+		AABB volume = siteVolume(level, bounds);
+		List<Entity> occupantEntities = level.getEntities((Entity) null, volume, Entity::isAlive).stream()
+				.sorted(Comparator.comparing(entity -> entity.getUUID().toString()))
+				.toList();
+		Set<UUID> occupants = occupantEntities.stream().map(Entity::getUUID)
+				.collect(java.util.stream.Collectors.toUnmodifiableSet());
+		boolean border = List.of(
+				new BlockPos(bounds.minimumX(), bounds.clearFloorY(), bounds.minimumZ()),
+				new BlockPos(bounds.minimumX(), bounds.clearFloorY(), bounds.maximumZ()),
+				new BlockPos(bounds.maximumX(), bounds.clearFloorY(), bounds.minimumZ()),
+				new BlockPos(bounds.maximumX(), bounds.clearFloorY(), bounds.maximumZ()))
+				.stream().allMatch(level.getWorldBorder()::isWithinBounds);
+		int maximumAuthoredY = blueprint.placements().stream()
+				.mapToInt(placement -> placement.position().getY()).max().orElse(bounds.clearFloorY());
+		ScenarioSitePreflight.Verdict verdict = ScenarioSitePreflight.assess(new ScenarioSitePreflight.Input(
+				bounds, level.getMinY(), level.getMaxY(), maximumAuthoredY, border, occupants.size()));
+		if (occupants.size() > MAX_EVACUATION_OCCUPANTS) {
+			verdict = new ScenarioSitePreflight.Verdict(false, "SITE_OCCUPANT_LIMIT", 0L, occupants.size());
+		} else if (verdict.allowedWithConfirmation() && !canEvacuate(level, bounds, occupantEntities)) {
+			verdict = new ScenarioSitePreflight.Verdict(false, "NO_SAFE_EVACUATION_SITE", 0L, occupants.size());
+		}
+		return new SiteInspection(verdict, occupants);
+	}
+
+	private static AABB siteVolume(ServerLevel level, ScenarioArenaBlueprint.SiteBounds bounds) {
+		return new AABB(
+				bounds.minimumX(), bounds.clearFloorY() + 1.0D, bounds.minimumZ(),
+				bounds.maximumX() + 1.0D, level.getMaxY(), bounds.maximumZ() + 1.0D);
+	}
+
+	private static void evacuateSite(ServerLevel level, ScenarioArenaBlueprint.SiteBounds bounds) {
+		List<Entity> occupants = level.getEntities((Entity) null, siteVolume(level, bounds), Entity::isAlive).stream()
+				.sorted(Comparator.comparing(entity -> entity.getUUID().toString()))
+				.toList();
+		if (occupants.size() > MAX_EVACUATION_OCCUPANTS) throw new IllegalStateException("SITE_OCCUPANT_LIMIT");
+		List<EvacuationAssignment> assignments = evacuationPlan(level, bounds, occupants);
+		for (Entity occupant : occupants) occupant.stopRiding();
+		for (EvacuationAssignment assignment : assignments) {
+			BlockPos target = assignment.target;
+			assignment.entity.teleportTo(target.getX() + 0.5D, target.getY(), target.getZ() + 0.5D);
+		}
+		if (!level.getEntities((Entity) null, siteVolume(level, bounds), Entity::isAlive).isEmpty()) {
+			throw new IllegalStateException("SITE_EVACUATION_INCOMPLETE");
+		}
+	}
+
+	private static boolean canEvacuate(
+			ServerLevel level,
+			ScenarioArenaBlueprint.SiteBounds bounds,
+			List<Entity> occupants
+	) {
+		try {
+			evacuationPlan(level, bounds, occupants);
+			return true;
+		} catch (IllegalStateException unavailable) {
+			return false;
+		}
+	}
+
+	private static List<EvacuationAssignment> evacuationPlan(
+			ServerLevel level,
+			ScenarioArenaBlueprint.SiteBounds bounds,
+			List<Entity> occupants
+	) {
+		if (occupants.isEmpty()) return List.of();
+		ArrayList<EvacuationAssignment> result = new ArrayList<>(occupants.size());
+		ArrayList<AABB> reserved = new ArrayList<>(occupants.size());
+		AABB destructiveVolume = siteVolume(level, bounds);
+		ArrayList<BlockPos> targets = new ArrayList<>();
+		for (BlockPos column : evacuationCandidateColumns(bounds, occupants.size())) {
+			int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, column.getX(), column.getZ());
+			BlockPos target = new BlockPos(
+					column.getX(), Math.clamp(y, level.getMinY() + 1, level.getMaxY() - 2), column.getZ());
+			if (safeEvacuationColumn(level, target)) targets.add(target);
+		}
+		if (targets.size() < occupants.size()) throw new IllegalStateException("NO_SAFE_EVACUATION_SITE");
+		for (Entity entity : occupants) {
+			EvacuationAssignment selected = null;
+			for (BlockPos target : targets) {
+				AABB targetBounds = entity.getBoundingBox().move(
+						target.getX() + 0.5D - entity.getX(),
+						target.getY() - entity.getY(),
+						target.getZ() + 0.5D - entity.getZ());
+				if (!evacuationFootprint(targetBounds, target.getY() - 1).stream()
+						.allMatch(floor -> safeEvacuationFloor(level, floor))
+						|| targetBounds.intersects(destructiveVolume)
+						|| !level.getWorldBorder().isWithinBounds(targetBounds)
+						|| !level.noCollision(entity, targetBounds)
+						|| !level.getEntities(entity, targetBounds.inflate(0.25D), Entity::isAlive).isEmpty()
+						|| reserved.stream().anyMatch(existing -> existing.intersects(targetBounds.inflate(0.25D)))) {
+					continue;
+				}
+				selected = new EvacuationAssignment(entity, target, targetBounds);
+				break;
+			}
+			if (selected == null) throw new IllegalStateException("NO_SAFE_EVACUATION_SITE");
+			result.add(selected);
+			reserved.add(selected.bounds);
+		}
+		return List.copyOf(result);
+	}
+
+	static List<BlockPos> evacuationCandidateColumns(ScenarioArenaBlueprint.SiteBounds bounds, int occupantCount) {
+		Objects.requireNonNull(bounds, "bounds must not be null");
+		if (occupantCount < 0 || occupantCount > MAX_EVACUATION_OCCUPANTS) {
+			throw new IllegalArgumentException("occupantCount is out of range");
+		}
+		int targetCount = Math.min(MAX_EVACUATION_COLUMNS, Math.max(64, occupantCount * 8));
+		LinkedHashSet<BlockPos> columns = new LinkedHashSet<>(targetCount);
+		for (int radius = 6; columns.size() < targetCount; radius += 3) {
+			int minimumX = bounds.minimumX() - radius;
+			int maximumX = bounds.maximumX() + radius;
+			int minimumZ = bounds.minimumZ() - radius;
+			int maximumZ = bounds.maximumZ() + radius;
+			for (int x = minimumX; x <= maximumX && columns.size() < targetCount; x += 3) {
+				columns.add(new BlockPos(x, 0, minimumZ));
+				if (columns.size() < targetCount) columns.add(new BlockPos(x, 0, maximumZ));
+			}
+			for (int z = minimumZ + 3; z < maximumZ && columns.size() < targetCount; z += 3) {
+				columns.add(new BlockPos(minimumX, 0, z));
+				if (columns.size() < targetCount) columns.add(new BlockPos(maximumX, 0, z));
+			}
+		}
+		return List.copyOf(columns);
+	}
+
+	static List<BlockPos> evacuationFootprint(AABB bounds, int floorY) {
+		Objects.requireNonNull(bounds, "bounds must not be null");
+		int minimumX = (int) Math.floor(bounds.minX + 1.0E-7D);
+		int maximumX = (int) Math.floor(bounds.maxX - 1.0E-7D);
+		int minimumZ = (int) Math.floor(bounds.minZ + 1.0E-7D);
+		int maximumZ = (int) Math.floor(bounds.maxZ - 1.0E-7D);
+		ArrayList<BlockPos> result = new ArrayList<>((maximumX - minimumX + 1) * (maximumZ - minimumZ + 1));
+		for (int x = minimumX; x <= maximumX; x++) {
+			for (int z = minimumZ; z <= maximumZ; z++) result.add(new BlockPos(x, floorY, z));
+		}
+		return List.copyOf(result);
+	}
+
+	private static boolean safeEvacuationColumn(ServerLevel level, BlockPos feet) {
+		BlockPos floor = feet.below();
+		BlockPos head = feet.above();
+		return safeEvacuationFloor(level, floor)
+				&& level.getBlockState(feet).getCollisionShape(level, feet).isEmpty()
+				&& level.getFluidState(feet).isEmpty()
+				&& level.getBlockState(head).getCollisionShape(level, head).isEmpty()
+				&& level.getFluidState(head).isEmpty();
+	}
+
+	private static boolean safeEvacuationFloor(ServerLevel level, BlockPos floor) {
+		var floorState = level.getBlockState(floor);
+		boolean safeFloor = floorState.isFaceSturdy(level, floor, Direction.UP)
+				&& !floorState.is(Blocks.CACTUS)
+				&& !floorState.is(Blocks.MAGMA_BLOCK)
+				&& !floorState.is(Blocks.CAMPFIRE)
+				&& !floorState.is(Blocks.SOUL_CAMPFIRE)
+				&& !floorState.is(Blocks.POWDER_SNOW);
+		boolean stableFloor = !(floorState.getBlock() instanceof FallingBlock)
+				|| level.getBlockState(floor.below()).isFaceSturdy(level, floor.below(), Direction.UP);
+		return safeFloor && stableFloor && level.getFluidState(floor).isEmpty();
+	}
+
+	private static String confirmationDetail(ScenarioArenaBlueprint blueprint, SiteInspection inspection) {
+		ScenarioArenaBlueprint.SiteBounds bounds = blueprint.siteBounds();
+		return "Confirm overwrite of X " + bounds.minimumX() + " to " + bounds.maximumX()
+				+ ", Z " + bounds.minimumZ() + " to " + bounds.maximumZ()
+				+ ". Up to " + inspection.verdict.destructiveCells() + " cells are managed; "
+				+ inspection.verdict.occupantCount() + " occupants will be moved to safety.";
+	}
+
+	private static String launchIntent(ScenarioLaunchRequest request) {
+		return dev.agaminggod.arenaagents.scenario.ScenarioLaunchCodec.encode(new ScenarioLaunchRequest(
+				request.scenarioId(), request.mapVersion(), request.deterministicEvents(),
+				request.placementMode(), request.roster(), ""));
+	}
+
 	static BlockPos arenaOrigin(
 			ServerLevel level,
 			ScenarioPreset preset,
@@ -1340,10 +1857,14 @@ public final class ScenarioRuntimeService {
 	}
 
 	private static final class RuntimeState {
+		private PendingSiteConfirmation pendingConfirmation;
+		private ScenarioPreparationJournal preparationJournal;
+		private ScenarioPreparationJournal.Snapshot preparationSnapshot;
 		private BuildJob build;
 		private BuildJob pendingActivation;
 		private ScenarioBuildProgress buildProgress;
 		private long buildProgressRevision;
+		private long buildProgressTerminalTick;
 		private ActivationJob activation;
 		private RecoveryJob recovery;
 		private CleanupJob cleanup;
@@ -1354,6 +1875,8 @@ public final class ScenarioRuntimeService {
 		private final LinkedHashMap<String, String> participantByAgent = new LinkedHashMap<>();
 		private long runtimeTick;
 		private boolean restoreAttempted;
+		private boolean buildFailed;
+		private List<String> cancelCleanupIds = List.of();
 
 		private long nextBuildRevision() {
 			return ++buildProgressRevision;
@@ -1407,7 +1930,7 @@ public final class ScenarioRuntimeService {
 
 	private record ActivationJob(
 			ScenarioSession session,
-			ServerPlayer operator,
+			UUID operatorId,
 			ServerLevel level,
 			ScenarioSessionConfig config,
 			BlockPos origin,
@@ -1421,7 +1944,7 @@ public final class ScenarioRuntimeService {
 		private ActivationJob nextTick() {
 			return new ActivationJob(
 					session,
-					operator,
+					operatorId,
 					level,
 					config,
 					origin,
@@ -1447,7 +1970,7 @@ public final class ScenarioRuntimeService {
 	}
 
 	private record BuildJob(
-			ServerPlayer operator,
+			UUID operatorId,
 			ServerLevel level,
 			ScenarioLaunchRequest request,
 			ScenarioSessionConfig config,
@@ -1455,10 +1978,55 @@ public final class ScenarioRuntimeService {
 			ScenarioArenaBlueprint blueprint,
 			ScenarioArenaResetJob reset,
 			ScenarioArenaResetJob.Phase reportedPhase,
-			int reportedCompleted
+			int reportedCompleted,
+			boolean cancellationRequested
 	) {
 		private BuildJob withReportedProgress(ScenarioArenaResetJob.Phase phase, int value) {
-			return new BuildJob(operator, level, request, config, session, blueprint, reset, phase, value);
+			return new BuildJob(operatorId, level, request, config, session, blueprint, reset, phase, value,
+					cancellationRequested);
+		}
+
+		private BuildJob cancelAfterSafeReset() {
+			return new BuildJob(operatorId, level, request, config, session, blueprint, reset,
+					reportedPhase, reportedCompleted, true);
+		}
+
+		private BuildJob restartForCancellation() {
+			return new BuildJob(operatorId, level, request, config, session, blueprint,
+					new ScenarioArenaResetJob(blueprint), null, -1, true);
+		}
+	}
+
+	private record PendingSiteConfirmation(
+			String token,
+			UUID operatorId,
+			String launchIntent,
+			BlockPos origin,
+			Set<UUID> occupantIds,
+			long expiresAtTick
+	) {
+		private PendingSiteConfirmation {
+			token = Objects.requireNonNull(token, "token must not be null");
+			operatorId = Objects.requireNonNull(operatorId, "operatorId must not be null");
+			launchIntent = Objects.requireNonNull(launchIntent, "launchIntent must not be null");
+			origin = Objects.requireNonNull(origin, "origin must not be null").immutable();
+			occupantIds = Set.copyOf(Objects.requireNonNull(occupantIds, "occupantIds must not be null"));
+			if (expiresAtTick < 1L) throw new IllegalArgumentException("confirmation expiry is invalid");
+		}
+	}
+
+	private record SiteInspection(ScenarioSitePreflight.Verdict verdict, Set<UUID> occupantIds) {
+		private SiteInspection {
+			verdict = Objects.requireNonNull(verdict, "verdict must not be null");
+			occupantIds = Set.copyOf(Objects.requireNonNull(occupantIds, "occupantIds must not be null"));
+		}
+	}
+
+	private record EvacuationAssignment(Entity entity, BlockPos target, AABB bounds) {
+		private EvacuationAssignment {
+			entity = Objects.requireNonNull(entity, "entity must not be null");
+			target = Objects.requireNonNull(target, "target must not be null").immutable();
+			bounds = Objects.requireNonNull(bounds, "bounds must not be null");
 		}
 	}
 }

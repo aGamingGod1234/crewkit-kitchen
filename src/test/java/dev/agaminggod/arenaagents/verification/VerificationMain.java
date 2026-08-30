@@ -934,6 +934,8 @@ public final class VerificationMain {
 				writeMessage(codec, client, actionEnvelope("before-hello"));
 				assertErrorCode(codec, client, "AUTHENTICATION_REQUIRED", "first message must authenticate");
 			}
+			awaitCondition(() -> executor.pendingCount() == 1, "closed session callback queued");
+			executor.runNext();
 			try (Socket client = connectAuthenticatedWithRetry(codec, port, "hello-authenticated")) {
 				writeMessage(codec, client, actionEnvelope("action-1"));
 				awaitCondition(() -> executor.pendingCount() == 1, "action callback queued");

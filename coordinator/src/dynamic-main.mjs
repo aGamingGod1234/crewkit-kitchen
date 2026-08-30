@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { createHash } from 'node:crypto';
-import { appendFile, mkdir, readFile } from 'node:fs/promises';
+import { mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -38,10 +38,12 @@ import { classifyNativeGoalError } from './native-goal-error-policy.mjs';
 import { MAX_GOAL_SPEC_CORRECTION_ATTEMPTS } from './goal-spec-translator.mjs';
 import { ProgramRuntimeManager } from './program-runtime-manager.mjs';
 import { createProviderChildEnvironment } from './provider-environment.mjs';
+import { PROVIDER_IDS } from './provider-identity.mjs';
 import { TraceWriter } from './trace-writer.mjs';
 import { wireRuntimeDiagnostics } from './runtime-diagnostics.mjs';
 import { RuntimeErrorReporter } from './runtime-error-reporter.mjs';
 import { BestEffortDiagnosticQueue } from './best-effort-diagnostic-queue.mjs';
+import { RotatingJsonlSink } from './rotating-jsonl-sink.mjs';
 import { sanitizeDiagnosticCode, sanitizeDiagnosticErrorCode, sanitizeDiagnosticErrorMessage, sanitizeDiagnosticText, sanitizeDiagnosticValue } from './diagnostic-sanitizer.mjs';
 import { FishTtsProvider } from './voice/fish-tts-provider.mjs';
 import { DeepgramSttProvider, NoSttProvider } from './voice/deepgram-stt-provider.mjs';
@@ -158,8 +160,9 @@ export class DynamicCoordinator extends EventEmitter {
 	#verboseTransitions = new ReportingTransitionDeduper();
 	#maxPendingAgentOperations;
 	#maxPendingAgentTransactions;
+	#runtimeHooks;
 
-	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, goalSupervisor, codexControlProtocol = 'native_tools', traceWriter = null, providerTurnRecorder = null, runtimeGeneration = null, benchmarkRecorder = null, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval, setGoalSpecTimeout = defaultGoalSpecTimeout, clearGoalSpecTimeout = clearTimeout, connectionOperationCap = DEFAULT_CONNECTION_OPERATION_CAP, agentOperationCap = DEFAULT_AGENT_OPERATION_CAP, goalSpecRequestCap = connectionOperationCap, maxPendingAgentOperations = DEFAULT_MAX_PENDING_AGENT_OPERATIONS, maxPendingAgentTransactions = DEFAULT_MAX_PENDING_AGENT_TRANSACTIONS }) {
+	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, goalSupervisor, codexControlProtocol = 'native_tools', traceWriter = null, providerTurnRecorder = null, runtimeGeneration = null, runtimeHooks = {}, benchmarkRecorder = null, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval, setGoalSpecTimeout = defaultGoalSpecTimeout, clearGoalSpecTimeout = clearTimeout, connectionOperationCap = DEFAULT_CONNECTION_OPERATION_CAP, agentOperationCap = DEFAULT_AGENT_OPERATION_CAP, goalSpecRequestCap = connectionOperationCap, maxPendingAgentOperations = DEFAULT_MAX_PENDING_AGENT_OPERATIONS, maxPendingAgentTransactions = DEFAULT_MAX_PENDING_AGENT_TRANSACTIONS }) {
 		super();
 		this.#registry = requireDependency(registry, 'registry');
 		this.#scheduler = requireDependency(scheduler, 'scheduler');
@@ -174,6 +177,9 @@ export class DynamicCoordinator extends EventEmitter {
 		if (providerTurnRecorder !== null && typeof providerTurnRecorder.close !== 'function') throw new TypeError('providerTurnRecorder.close must be a function');
 		this.#providerTurnRecorder = providerTurnRecorder;
 		this.#runtimeGeneration = runtimeGeneration;
+		if (runtimeHooks === null || typeof runtimeHooks !== 'object' || Array.isArray(runtimeHooks)) throw new TypeError('runtimeHooks must be an object');
+		if (runtimeHooks.onRemoved !== undefined && typeof runtimeHooks.onRemoved !== 'function') throw new TypeError('runtimeHooks.onRemoved must be a function');
+		this.#runtimeHooks = runtimeHooks;
 		this.#connectionOperationCap = positiveInteger(connectionOperationCap, 'connectionOperationCap');
 		this.#agentOperationCap = positiveInteger(agentOperationCap, 'agentOperationCap');
 		this.#goalSpecRequestCap = positiveInteger(goalSpecRequestCap, 'goalSpecRequestCap');
@@ -446,6 +452,9 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#forgetConversationWakes(message.agentId);
 			this.#cancelGoalSpecRequests(message.agentId);
 			this.#supportedAgentIds.delete(message.agentId);
+			try {
+				void Promise.resolve(this.#runtimeHooks.onRemoved?.(message.agentId)).catch((error) => this.#emitRuntimeError(error));
+			} catch (error) { this.#emitRuntimeError(error); }
 			await this.#publishStatus(connectionEpoch);
 		}, connectionEpoch));
 		this.#listen('goal_spec_request', (message, connectionEpoch) => {
@@ -2299,7 +2308,7 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 	const providerTurnRecorder = dependencies.providerTurnRecorder ?? null;
 	const coordinatorEnvironment = dependencies.env ?? process.env;
 	const config = normalizeDynamicConfig(configValue, coordinatorEnvironment);
-	const providerEnvironments = Object.fromEntries(['codex', 'gemini', 'kimi', 'cursor'].map((provider) => [
+	const providerEnvironments = Object.fromEntries(PROVIDER_IDS.map((provider) => [
 		provider,
 		createProviderChildEnvironment(provider, coordinatorEnvironment, config.bridge.secretEnvironmentVariable),
 	]));
@@ -2386,6 +2395,7 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		traceWriter: dependencies.traceWriter,
 		providerTurnRecorder,
 		runtimeGeneration: dependencies.runtimeGeneration,
+		runtimeHooks: dependencies.runtimeHooks,
 		controlNow: dependencies.controlNow,
 		epochNow: dependencies.epochNow,
 		setStatusInterval: dependencies.setStatusInterval,
@@ -2441,9 +2451,25 @@ export async function loadDynamicConfig(configPath = DEFAULT_DYNAMIC_CONFIG_PATH
 
 export function normalizeDynamicConfig(value, environment = process.env) {
 	if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('dynamic coordinator config must be an object');
+	value = migrateDynamicConfig(value);
+	assertKnownConfigKeys(value, ['schemaVersion', 'bridge', 'voice', 'codex', 'gemini', 'kimi', 'cursor', 'limits', 'workspaceRoot', 'minecraftAgentRoot', 'minecraftAgentTemplateRoot'], 'config');
 	if (value.bridge === null || typeof value.bridge !== 'object' || Array.isArray(value.bridge)) throw new TypeError('dynamic coordinator bridge config must be an object');
 	if (value.codex === null || typeof value.codex !== 'object' || Array.isArray(value.codex)) throw new TypeError('dynamic coordinator Codex config must be an object');
 	if (value.voice !== undefined && (value.voice === null || typeof value.voice !== 'object' || Array.isArray(value.voice))) throw new TypeError('dynamic coordinator voice config must be an object');
+	assertOptionalConfigObject(value.limits, 'limits');
+	assertOptionalConfigObject(value.gemini, 'gemini');
+	assertOptionalConfigObject(value.kimi, 'kimi');
+	assertOptionalConfigObject(value.cursor, 'cursor');
+	assertKnownConfigKeys(value.bridge, ['host', 'port', 'secret', 'secretEnvironmentVariable', 'reconnectDelayMs', 'maxReconnectDelayMs', 'connectionQueueCap', 'agentQueueCap', 'inboundConnectionQueueCap', 'inboundAgentQueueCap', 'inboundDispatchBatch', 'trackedTerminalActionIdCap', 'handshakeTimeoutMs', 'heartbeatIntervalMs', 'heartbeatTimeoutMs', 'serverInstanceId', 'launchId'], 'bridge');
+	assertKnownConfigKeys(value.voice ?? {}, ['port', 'maxConcurrent', 'profileAssignmentsPath', 'fishApiKeyEnvironmentVariable', 'deepgramApiKeyEnvironmentVariable', 'localSpeechTimeoutMs', 'localSpeechPythonPath', 'secret', 'secretFile'], 'voice');
+	assertKnownConfigKeys(value.codex, ['cwd', 'controlProtocol', 'planningTimeoutMs', 'maxDecisionBytes', 'catalogTtlMs', 'startupTimeoutMs', 'serviceTier', 'launchProfile'], 'codex');
+	if (value.codex.launchProfile !== undefined) {
+		assertOptionalConfigObject(value.codex.launchProfile, 'codex.launchProfile');
+		assertKnownConfigKeys(value.codex.launchProfile, ['agentId', 'model', 'reasoningEffort', 'serviceTier', 'planningTimeoutMs', 'maxDecisionBytes', 'cwd'], 'codex.launchProfile');
+	}
+	const providerKeys = ['provider', 'cwd', 'executable', 'models', 'reasoningEfforts', 'modelReasoningEfforts', 'catalogDiscovery', 'catalogDiscoveryTimeoutMs', 'planningTimeoutMs', 'maxDecisionBytes', 'stdoutLimitBytes', 'stderrLimitBytes', 'serviceTier'];
+	for (const provider of ['gemini', 'kimi', 'cursor']) assertKnownConfigKeys(value[provider] ?? {}, providerKeys, provider);
+	assertKnownConfigKeys(value.limits ?? {}, ['agentCap', 'goalQueueCap', 'planningConcurrency', 'planningMode', 'urgentReserve', 'invalidDecisionRetries'], 'limits');
 	const secret = value.bridge.secret ?? environment[value.bridge.secretEnvironmentVariable ?? 'ARENA_AGENT_BRIDGE_SECRET'];
 	const cwd = value.codex.cwd ?? PROJECT_DIRECTORY;
 	const workspaceRoot = value.workspaceRoot === undefined
@@ -2467,6 +2493,7 @@ export function normalizeDynamicConfig(value, environment = process.env) {
 	const codexControlProtocol = value.codex.controlProtocol ?? 'native_tools';
 	if (!['arena_script', 'native_tools'].includes(codexControlProtocol)) throw new TypeError('codex.controlProtocol must be arena_script or native_tools');
 	return {
+		schemaVersion: 1,
 		bridge: { ...value.bridge, secret },
 		workspaceRoot,
 		minecraftAgentRoot,
@@ -2525,6 +2552,29 @@ export function normalizeDynamicConfig(value, environment = process.env) {
 	};
 }
 
+function migrateDynamicConfig(value) {
+	const schemaVersion = value.schemaVersion ?? 0;
+	if (!Number.isSafeInteger(schemaVersion) || schemaVersion < 0) throw new TypeError('config.schemaVersion must be a nonnegative safe integer');
+	if (schemaVersion > 1) throw new TypeError(`Unsupported dynamic coordinator config schemaVersion ${schemaVersion}`);
+	if (schemaVersion === 1) return value;
+	const cursor = value.cursor === undefined || value.cursor === null || typeof value.cursor !== 'object' || Array.isArray(value.cursor)
+		? value.cursor
+		: Object.fromEntries(Object.entries(value.cursor).filter(([key]) => key !== 'serviceTiers'));
+	return { ...value, schemaVersion: 1, ...(cursor === undefined ? {} : { cursor }) };
+}
+
+function assertOptionalConfigObject(value, field) {
+	if (value !== undefined && (value === null || typeof value !== 'object' || Array.isArray(value))) {
+		throw new TypeError(`dynamic coordinator ${field} config must be an object`);
+	}
+}
+
+function assertKnownConfigKeys(value, allowed, field) {
+	for (const key of Object.keys(value)) {
+		if (!allowed.includes(key)) throw new TypeError(`Unknown dynamic coordinator config key '${field}.${key}'`);
+	}
+}
+
 async function runCli(reporter = new RuntimeErrorReporter()) {
 	const { configPath } = parseDynamicCliArguments(process.argv.slice(2));
 	const config = await loadDynamicConfig(configPath);
@@ -2537,11 +2587,12 @@ async function runCli(reporter = new RuntimeErrorReporter()) {
 		scenarioId: runtime.scenarioId,
 		privatePath: runtime.providerTurnsPath,
 	});
+	const voiceSupervisor = createVoiceSupervisor(config, process.env);
 	const coordinator = createDynamicCoordinator(config, {
 		traceWriter, protocolAudit, providerTurnRecorder, runtimeGeneration: runtime.runtimeGeneration,
+		runtimeHooks: { onRemoved: (agentId) => voiceSupervisor.removeAgent(agentId) },
 	});
 	const disposeDiagnostics = wireRuntimeDiagnostics(coordinator, reporter);
-	const voiceSupervisor = createVoiceSupervisor(config, process.env);
 	try {
 		await startCoordinatorControl(coordinator, voiceSupervisor);
 	} catch (error) {
@@ -2602,9 +2653,13 @@ export function createVoiceSupervisor(config, environment = process.env, depende
 
 export function createJsonlAudit(filePath, metadata, dependencies = {}) {
 	if (typeof filePath !== 'string' || filePath.trim() === '') throw new TypeError('protocol audit path must be nonblank');
-	const write = dependencies.appendFile ?? appendFile;
 	const makeDirectory = dependencies.mkdir ?? mkdir;
 	const queue = new BestEffortDiagnosticQueue(dependencies);
+	const sink = new RotatingJsonlSink(filePath, {
+		...dependencies,
+		inspect: dependencies.appendFile === undefined || dependencies.stat !== undefined
+			|| dependencies.maxFileBytes !== undefined || dependencies.maxFileAgeMs !== undefined,
+	});
 	let closed = false;
 	let closePromise = null;
 	const ready = Promise.resolve().then(() => makeDirectory(path.dirname(path.resolve(filePath)), { recursive: true }));
@@ -2616,7 +2671,7 @@ export function createJsonlAudit(filePath, metadata, dependencies = {}) {
 				safeMetadata !== null && typeof safeMetadata === 'object' && !Array.isArray(safeMetadata) ? safeMetadata : {},
 				{ direction: sanitizeDiagnosticValue(direction), envelope: sanitizeDiagnosticValue(envelope) });
 			const encoded = `${JSON.stringify(row)}\n`;
-			queue.submit(async () => { await ready; await write(filePath, encoded, { encoding: 'utf8', flag: 'a' }); });
+			queue.submit(async () => { await ready; await sink.append(encoded, { encoding: 'utf8', flag: 'a' }); });
 		} catch { /* invalid audit evidence is observational */ }
 		return Promise.resolve();
 	};
@@ -2776,6 +2831,7 @@ function voiceProfileStoreWithLifecycle(profiles) {
 	let closePromise = null;
 	return Object.freeze({
 		resolve(agentId) { return store.resolve(agentId); },
+		remove(agentId) { return store.remove?.(agentId) ?? false; },
 		flush(options) { return flushOperation === null ? Promise.resolve() : flushOperation(options); },
 		close() {
 			closePromise ??= Promise.resolve().then(() => closeOperation === null ? flushOperation?.() : closeOperation());

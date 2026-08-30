@@ -5,6 +5,7 @@ import dev.agaminggod.arenaagents.agent.goal.GoalStatus;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.OptionalDouble;
 import java.util.OptionalInt;
 import java.util.Set;
 import java.util.UUID;
@@ -127,8 +128,11 @@ public final class AgentRegistryVerification {
 		assertEquals(3, registry.availableCapacity(), "creating an agent consumes one capacity slot");
 		expectFailure(() -> registry.requireCapacity(4), "AGENT_LIMIT_REACHED");
 		assertEquals(AgentLifecycleState.IDLE, created.state(), "new agent is idle");
-		assertEquals(RespawnPolicy.RESPAWN_AUTOMATICALLY, created.respawnPolicy(),
-				"new agents automatically return after vanilla death");
+		assertEquals(RespawnPolicy.PAUSE_UNTIL_RESPAWN, created.respawnPolicy(),
+				"new agents wait for an explicit respawn decision");
+		assertEquals(RespawnPolicy.RESPAWN_AUTOMATICALLY,
+				registry.setRespawnPolicy(created.agentId(), RespawnPolicy.RESPAWN_AUTOMATICALLY, START_TIME + 1L).respawnPolicy(),
+				"automatic respawn requires an explicit policy change");
 
 		AgentTransition started = registry.start(created.agentId(), "Build a shelter", START_TIME + 1L);
 		assertEquals(AgentLifecycleState.STARTING, started.after().state(), "start state");
@@ -176,21 +180,15 @@ public final class AgentRegistryVerification {
 		AgentRecord created = registry.create("gpt-5.6-sol", "high", Optional.of("Coordinator"), START_TIME);
 		registry.start(created.agentId(), "Finish this task", START_TIME + 1L);
 		registry.beginPlanning(created.agentId(), START_TIME + 2L);
-		AgentRecord completed = registry.coordinatorCompleted(created.agentId(), 1L, START_TIME + 3L);
-		assertEquals(AgentLifecycleState.COMPLETED, completed.state(), "coordinator completion state");
-		assertEquals(1L, completed.goalRevision(), "coordinator completion preserves goal revision");
-		assertEquals("Finish this task", completed.currentGoal().orElseThrow().prompt(), "coordinator completion preserves current goal");
-		assertEquals(3, transitions.size(), "coordinator completion dispatches a state transition hook");
-		AgentTransition completion = transitions.getLast();
-		assertEquals(AgentLifecycleState.PLANNING, completion.before().state(), "completion transition records the prior lifecycle state");
-		assertEquals(AgentLifecycleState.COMPLETED, completion.after().state(), "completion transition records the terminal lifecycle state");
-		assertEquals(1L, completion.before().goalRevision(), "completion transition retains the prior revision");
-		assertEquals(1L, completion.after().goalRevision(), "completion transition does not echo a revised goal");
-		assertTrue(!completion.cancelAction(), "coordinator completion does not cancel an already finished action");
-		assertTrue(!completion.interruptPlanner(), "coordinator completion does not interrupt an already finished planner");
-		assertEquals(AgentLifecycleState.COMPLETED, registry.coordinatorCompleted(created.agentId(), 1L, START_TIME + 4L).state(), "repeated coordinator completion is idempotent");
+		expectFailure(() -> registry.coordinatorCompleted(created.agentId(), 1L, START_TIME + 3L), "GOAL_NOT_SATISFIED");
+		GoalEvidence evidence = new GoalEvidence(START_TIME + 3L, "operator_confirmed", List.of());
+		AgentRecord completed = registry.satisfyGoal(created.agentId(), 1L, evidence, START_TIME + 3L).after();
+		assertEquals(AgentLifecycleState.COMPLETED, completed.state(), "factual satisfaction completes the goal");
+		assertEquals(GoalStatus.SATISFIED, completed.currentGoal().orElseThrow().status(), "completed goal is satisfied");
+		assertEquals(completed, registry.coordinatorCompleted(created.agentId(), 2L, START_TIME + 4L),
+				"repeated coordinator completion is idempotent only after satisfaction");
 		expectFailure(() -> registry.coordinatorCompleted(created.agentId(), 0L, START_TIME + 5L), "STALE_REVISION");
-		return 12;
+		return 5;
 	}
 
 	private static int verifyCoordinatorCompletionPromotesQueue() {
@@ -199,15 +197,11 @@ public final class AgentRegistryVerification {
 		AgentRecord created = registry.create("gpt-5.6-sol", "high", Optional.of("QueuedCoordinator"), START_TIME);
 		registry.start(created.agentId(), "Finish this task", START_TIME + 1L);
 		registry.queue(created.agentId(), "Start the queued task", START_TIME + 2L);
-		AgentRecord completed = registry.coordinatorCompleted(created.agentId(), 1L, START_TIME + 3L);
-		assertEquals(AgentLifecycleState.STARTING, completed.state(), "coordinator completion promotes the queued goal");
-		assertEquals(2L, completed.goalRevision(), "queued promotion advances the goal revision");
-		assertEquals("Start the queued task", completed.currentGoal().orElseThrow().prompt(), "queued goal becomes current");
-		assertEquals(0, completed.queuedGoals().size(), "promoted queued goal is removed from the queue");
-		assertEquals(3, transitions.size(), "queued completion promotion dispatches one lifecycle transition");
-		AgentTransition promotion = transitions.getLast();
-		assertEquals(AgentLifecycleState.STARTING, promotion.after().state(), "promotion is restartable by the coordinator");
-		return 7;
+		expectFailure(() -> registry.coordinatorCompleted(created.agentId(), 1L, START_TIME + 3L), "GOAL_NOT_SATISFIED");
+		AgentRecord retained = registry.require(created.agentId());
+		assertEquals(AgentLifecycleState.STARTING, retained.state(), "unverified completion keeps the goal active");
+		assertEquals(1, retained.queuedGoals().size(), "unverified completion keeps queued work intact");
+		return 3;
 	}
 
 	private static int verifyTerminalGoalControls() {
@@ -293,7 +287,16 @@ public final class AgentRegistryVerification {
 		assertEquals(paused.goalRevision(), restoredPaused.goalRevision(), "explicit pause revision survives reload");
 		assertEquals(paused.currentGoal().orElseThrow().prompt(), restoredPaused.currentGoal().orElseThrow().prompt(),
 				"explicit pause goal survives reload");
-		return 7;
+
+		String legacyFalseCompletion = encoded.replace(
+				"\"state\":\"PLANNING\"", "\"state\":\"COMPLETED\""
+		);
+		AgentRecord migratedCompletion = codec.decode(legacyFalseCompletion).records().getFirst();
+		assertEquals(AgentLifecycleState.PAUSED, migratedCompletion.state(),
+				"legacy completed state with unfinished work migrates to a safe pause");
+		assertEquals(GoalStatus.ACTIVE, migratedCompletion.currentGoal().orElseThrow().status(),
+				"legacy false-completion migration preserves the unfinished goal");
+		return 9;
 	}
 
 	private static int verifyProviderPersistenceAndMigration() {
@@ -333,7 +336,8 @@ public final class AgentRegistryVerification {
 				START_TIME
 		).withEntity(
 				Optional.of(UUID.fromString("01234567-89ab-cdef-0123-456789abcdef")),
-				Optional.of(new AgentEntityLocation("minecraft:the_nether", 12, -8, OptionalInt.of(71))),
+				Optional.of(AgentEntityLocation.exact(
+						"minecraft:the_nether", 12, -8, 200.25D, 71.125D, -120.75D, 137.5F, -22.25F)),
 				START_TIME + 1L
 		);
 		AgentRegistry.Snapshot snapshot = new AgentRegistry.Snapshot(
@@ -347,8 +351,23 @@ public final class AgentRegistryVerification {
 		AgentRecord decoded = codec.decode(encoded).records().getFirst();
 		assertEquals(record.entityLocation(), decoded.entityLocation(), "entity location round-trip");
 		assertTrue(encoded.contains("\"block_y\":71"), "entity recovery height is persisted");
+		assertTrue(encoded.contains("\"exact_x\":200.25"), "exact recovery X is persisted");
+		assertTrue(encoded.contains("\"exact_y\":71.125"), "exact recovery Y is persisted");
+		assertTrue(encoded.contains("\"exact_z\":-120.75"), "exact recovery Z is persisted");
+		assertTrue(encoded.contains("\"yaw\":137.5"), "recovery yaw is persisted");
+		assertTrue(encoded.contains("\"pitch\":-22.25"), "recovery pitch is persisted");
 
-		String legacy = encoded.replace(
+		String coarse = encoded
+				.replace(",\"exact_x\":200.25", "")
+				.replace(",\"exact_y\":71.125", "")
+				.replace(",\"exact_z\":-120.75", "")
+				.replace(",\"yaw\":137.5", "")
+				.replace(",\"pitch\":-22.25", "");
+		AgentEntityLocation migratedCoarse = codec.decode(coarse).records().getFirst().entityLocation().orElseThrow();
+		assertEquals(new AgentEntityLocation("minecraft:the_nether", 12, -8, OptionalInt.of(71)), migratedCoarse,
+				"coarse entity location snapshots remain loadable");
+
+		String legacy = coarse.replace(
 				",\"entity_location\":{\"dimension\":\"minecraft:the_nether\",\"chunk_x\":12,\"chunk_z\":-8,\"block_y\":71}",
 				""
 		);
@@ -360,7 +379,11 @@ public final class AgentRegistryVerification {
 		AgentRecord detached = registry.detachEntity(record.agentId(), START_TIME + 3L);
 		assertEquals(Optional.empty(), detached.entityUuid(), "missing physical player clears stale entity UUID");
 		assertEquals(Optional.empty(), detached.entityLocation(), "missing physical player clears stale entity location");
-		return 6;
+		expectFailure(() -> new AgentEntityLocation(
+				"minecraft:overworld", 0, 0, OptionalInt.of(64),
+				OptionalDouble.of(Double.NaN), OptionalDouble.of(64.0D), OptionalDouble.of(0.0D),
+				OptionalDouble.empty(), OptionalDouble.empty()), "INVALID_ENTITY_LOCATION");
+		return 13;
 	}
 
 	private static int verifyAutomaticProgressPersistence() {

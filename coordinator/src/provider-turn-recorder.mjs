@@ -4,6 +4,7 @@ import { appendFile as defaultAppendFile } from 'node:fs/promises';
 import { BestEffortDiagnosticQueue } from './best-effort-diagnostic-queue.mjs';
 import { sanitizeDiagnosticText, truncateDiagnosticUtf8 } from './diagnostic-sanitizer.mjs';
 import { preparePrivateArtifact } from './private-artifact-permissions.mjs';
+import { RotatingJsonlSink } from './rotating-jsonl-sink.mjs';
 
 const MAX_PRIVATE_TEXT_BYTES = 65_536;
 const MAX_PUBLIC_EXCERPT_BYTES = 512;
@@ -15,7 +16,7 @@ export class ProviderTurnRecorder {
 	#scenarioId;
 	#privatePath;
 	#publicSink;
-	#appendFile;
+	#sink;
 	#preparePrivateArtifact;
 	#ready;
 	#now;
@@ -23,7 +24,7 @@ export class ProviderTurnRecorder {
 	#closed = false;
 	#closePromise = null;
 
-	constructor({ runId, scenarioId, privatePath, publicSink = null, appendFile = defaultAppendFile, preparePrivateArtifact: prepareArtifact = null, now = Date.now, ...queueOptions } = {}) {
+	constructor({ runId, scenarioId, privatePath, publicSink = null, appendFile = defaultAppendFile, preparePrivateArtifact: prepareArtifact = null, now = Date.now, rotation = {}, ...queueOptions } = {}) {
 		if (typeof runId !== 'string' || runId.trim() === '') throw new TypeError('runId must be nonblank');
 		if (typeof scenarioId !== 'string' || scenarioId.trim() === '') throw new TypeError('scenarioId must be nonblank');
 		if (privatePath !== null && privatePath !== undefined && (typeof privatePath !== 'string' || privatePath.trim() === '')) throw new TypeError('privatePath must be nonblank or null');
@@ -34,7 +35,9 @@ export class ProviderTurnRecorder {
 		this.#scenarioId = scenarioId;
 		this.#privatePath = privatePath ?? null;
 		this.#publicSink = publicSink;
-		this.#appendFile = appendFile;
+		this.#sink = this.#privatePath === null ? null : new RotatingJsonlSink(this.#privatePath, {
+			appendFile, now, inspect: appendFile === defaultAppendFile || Object.keys(rotation).length > 0, ...rotation,
+		});
 		this.#preparePrivateArtifact = prepareArtifact ?? (appendFile === defaultAppendFile ? preparePrivateArtifact : async () => {});
 		this.#ready = this.#privatePath === null ? Promise.resolve(true) : this.#preparePrivateArtifact(this.#privatePath).then(() => true, () => false);
 		this.#now = now;
@@ -56,7 +59,7 @@ export class ProviderTurnRecorder {
 				if (this.#privatePath !== null) {
 					try {
 						if (!await this.#ready) return Promise.allSettled(writes);
-						writes.push(this.#appendFile(this.#privatePath, encoded, { encoding: 'utf8', flag: 'a', mode: 0o600 }));
+						writes.push(this.#sink.append(encoded, { encoding: 'utf8', flag: 'a', mode: 0o600 }));
 					}
 					catch { /* observational */ }
 				}

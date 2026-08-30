@@ -34,6 +34,11 @@ export class FactLedger {
 		this.#purgeExpired(value.tick);
 		const key = typeof value.key === 'string' && value.key.length > 0 ? value.key : `fact:${++this.#sequence}`;
 		const next = Object.freeze({ key, fact, source: value.source, tick: value.tick, dimension, expiresAtTick: value.expiresAtTick, confidence: value.confidence });
+		const previous = this.#entries.find((entry) => entry.key === key);
+		if (previous !== undefined && sameFact(previous, next)) {
+			this.#entries = ordered(this.#entries.map((entry) => entry.key === key ? next : entry));
+			return;
+		}
 		const previousKeys = new Set(this.#entries.map((entry) => entry.key));
 		this.#entries = ordered([...this.#entries.filter((entry) => entry.key !== key), next]).slice(0, this.#maximumEntries);
 		const retainedKeys = new Set(this.#entries.map((entry) => entry.key));
@@ -199,6 +204,14 @@ export class FactLedger {
 		this.#history.push({ revision: this.#revision, ...change });
 		if (this.#history.length > this.#historyLimit) this.#history.splice(0, this.#history.length - this.#historyLimit);
 	}
+}
+
+function sameFact(left, right) {
+	return left.key === right.key
+		&& left.fact === right.fact
+		&& left.source === right.source
+		&& left.dimension === right.dimension
+		&& left.confidence === right.confidence;
 }
 
 function ordered(entries) {

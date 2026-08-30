@@ -1,15 +1,12 @@
 package dev.agaminggod.arenaagents.voiceaddon;
 
 import de.maxhenkel.voicechat.api.VoicechatServerApi;
-import de.maxhenkel.voicechat.api.events.MicrophonePacketEvent;
 import de.maxhenkel.voicechat.api.opus.OpusDecoder;
 import dev.agaminggod.arenaagents.server.CodexAgentServerRuntime;
 import dev.agaminggod.arenaagents.server.conversation.ServerAgentConversationRouter.ProximitySpeechAudience;
 import java.util.Optional;
 import java.util.UUID;
-import java.util.concurrent.atomic.AtomicReference;
 import net.minecraft.server.MinecraftServer;
-import net.minecraft.server.level.ServerPlayer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -41,33 +38,25 @@ final class HumanSpeechCapture implements ServerSpeechCaptureRegistry.Capture {
 	}
 
 	@Override
-	public void accept(MicrophonePacketEvent event) {
-		if (event.getSenderConnection() == null) return;
-		Object rawPlayer = event.getSenderConnection().getPlayer().getPlayer();
-		if (!(rawPlayer instanceof ServerPlayer player)) return;
-		var server = player.level().getServer();
+	public void accept(MicrophonePacketSnapshot packet) {
+		if (!(packet.minecraftServer() instanceof MinecraftServer server)) return;
 		captureWhileGranted(
-				server, player.getUUID(), () -> {
-					byte[] opus = event.getPacket().getOpusEncodedData().clone();
+				server, packet.playerId(), () -> {
+					byte[] opus = packet.opus();
 					if (opus.length == 0 || opus.length > 8_192) return;
-					VoicechatServerApi api = event.getVoicechat();
-					boolean whispering = event.getPacket().isWhispering();
+					VoicechatServerApi api = packet.voicechat();
+					boolean whispering = packet.whispering();
+					Optional<ProximitySpeechAudience> audience =
+							CodexAgentServerRuntime.captureHumanSpeechAudience(server, packet.playerId(), whispering);
 					engine.accept(
-							player.getUUID(),
+							packet.playerId(),
 							whispering,
 							opus,
 							() -> decoder(api.createDecoder()),
 							server::execute,
-							() -> {
-								AtomicReference<Optional<ProximitySpeechAudience>> audience =
-										new AtomicReference<>(Optional.empty());
-								server.execute(() -> audience.set(CodexAgentServerRuntime.captureHumanSpeechAudience(
-										server, player.getUUID(), whispering
-								)));
-								return (playerId, transcript, ignoredWhispering) -> audience.get().ifPresent(
+							() -> (playerId, transcript, ignoredWhispering) -> audience.ifPresent(
 										snapshot -> CodexAgentServerRuntime.deliverHumanSpeech(server, snapshot, transcript)
-								);
-							}
+							)
 					);
 				}
 		);

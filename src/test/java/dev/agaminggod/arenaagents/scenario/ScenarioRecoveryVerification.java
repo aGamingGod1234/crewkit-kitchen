@@ -12,7 +12,9 @@ import dev.agaminggod.arenaagents.scenario.runtime.ScenarioRecoveryDecision;
 import dev.agaminggod.arenaagents.scenario.runtime.ScenarioRecoveryGate;
 import dev.agaminggod.arenaagents.scenario.runtime.ScenarioRunSnapshot;
 import dev.agaminggod.arenaagents.scenario.runtime.ScenarioRuntimeClock;
+import dev.agaminggod.arenaagents.scenario.runtime.ScenarioRuntimeSafetyVerification;
 import dev.agaminggod.arenaagents.scenario.runtime.ScenarioOwnedAgentIds;
+import dev.agaminggod.arenaagents.scenario.runtime.ScenarioPreparationJournal;
 import dev.agaminggod.arenaagents.server.AgentRemovalCoordinator;
 import dev.agaminggod.arenaagents.server.bridge.CoordinatorStatusSnapshot;
 import java.util.List;
@@ -34,6 +36,7 @@ public final class ScenarioRecoveryVerification {
 	}
 
 	public static int verify() {
+		int assertions = ScenarioRuntimeSafetyVerification.verify();
 		net.minecraft.SharedConstants.tryDetectVersion();
 		net.minecraft.server.Bootstrap.bootStrap();
 		ScenarioSession session = runningSession();
@@ -316,7 +319,43 @@ public final class ScenarioRecoveryVerification {
 		);
 		assertEquals(List.of(), registry.records(), "registry deletion survives cleanup and hook failures");
 		assertEquals(2, removalFailures.get(), "post-delete failures are reported without restoring the agent");
-		return 57;
+
+		java.nio.file.Path journalRoot = null;
+		try {
+			journalRoot = java.nio.file.Files.createTempDirectory("scenario-preparation-");
+			ScenarioLaunchRequest request = new ScenarioLaunchRequest(
+					"last-valley", ScenarioPresets.require("last-valley").mapVersion(), true,
+					ScenarioPlacementMode.IN_FRONT_OF_PLAYER,
+					List.of(
+							new ScenarioAgentSpec(1, "One", "codex", "gpt-5.6-sol", "high", "priority",
+									Optional.empty(), dev.agaminggod.arenaagents.agent.AgentGameMode.SURVIVAL),
+							new ScenarioAgentSpec(2, "Two", "codex", "gpt-5.6-sol", "high", "priority",
+									Optional.empty(), dev.agaminggod.arenaagents.agent.AgentGameMode.SURVIVAL)));
+			ScenarioPreparationJournal journal = new ScenarioPreparationJournal(journalRoot);
+			ScenarioPreparationJournal.Snapshot owner = new ScenarioPreparationJournal.Snapshot(
+					SESSION_ID, OPERATOR_ID, "minecraft:overworld", new BlockPos(10, 70, 20), request,
+					101L, 202L, 1_000L, List.of(), false).withAgentId("agent-a").cancelling();
+			journal.write(owner);
+			assertEquals(Optional.of(owner), journal.load(),
+					"preparation journal survives restart with exact owner and cleanup IDs");
+			journal.write(owner);
+			assertEquals(Optional.of(owner), journal.load(), "preparation journal rewrite is idempotent");
+			journal.clear();
+			assertEquals(Optional.empty(), journal.load(), "completed preparation removes its durable owner record");
+		} catch (java.io.IOException exception) {
+			throw new AssertionError("preparation journal verification failed", exception);
+		} finally {
+			if (journalRoot != null) {
+				try (var paths = java.nio.file.Files.walk(journalRoot)) {
+					for (var path : paths.sorted(java.util.Comparator.reverseOrder()).toList()) {
+						java.nio.file.Files.deleteIfExists(path);
+					}
+				} catch (java.io.IOException exception) {
+					throw new AssertionError("could not remove preparation journal fixture", exception);
+				}
+			}
+		}
+		return 60 + assertions;
 	}
 
 	private static CoordinatorStatusSnapshot recoveryStatus(

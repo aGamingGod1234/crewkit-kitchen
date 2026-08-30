@@ -32,15 +32,18 @@ export class VoiceProfileStore {
 	#used = new Set();
 	#onChange;
 	#reserve;
+	#release;
 
-	constructor(assignments = {}, onChange = () => {}, reserve = null) {
+	constructor(assignments = {}, onChange = () => {}, reserve = null, release = null) {
 		if (assignments === null || typeof assignments !== 'object' || Array.isArray(assignments)) {
 			throw new TypeError('voice profile assignments must be an object');
 		}
 		if (typeof onChange !== 'function') throw new TypeError('onChange must be a function');
 		if (reserve !== null && typeof reserve !== 'function') throw new TypeError('reserve must be a function');
+		if (release !== null && typeof release !== 'function') throw new TypeError('release must be a function');
 		this.#onChange = onChange;
 		this.#reserve = reserve;
+		this.#release = release;
 		for (const [agentId, profileId] of Object.entries(assignments)) {
 			const profileIndex = VOICE_PROFILES.findIndex((entry) => entry.profileId === profileId);
 			if (!isUuid(agentId) || profileIndex < 0 || this.#used.has(profileIndex)) continue;
@@ -64,6 +67,17 @@ export class VoiceProfileStore {
 			this.#onChange(this.snapshotAssignments());
 		}
 		return VOICE_PROFILES[index];
+	}
+
+	remove(agentId) {
+		if (!isUuid(agentId)) throw new TypeError('agentId must be a UUID');
+		const index = this.#assignments.get(agentId);
+		if (index === undefined) return false;
+		this.#release?.(agentId);
+		this.#assignments.delete(agentId);
+		if (![...this.#assignments.values()].includes(index)) this.#used.delete(index);
+		this.#onChange(this.snapshotAssignments());
+		return true;
 	}
 
 	snapshotAssignments() {
@@ -127,7 +141,8 @@ export async function loadPersistentVoiceProfileStore(filePath, dependencies = {
 		desiredRevision += 1;
 		mergeOwnerSnapshot(coordinator, ownerGeneration, snapshot);
 		startDrain();
-	}, (agentId) => reserveCoordinatorProfile(coordinator, ownerGeneration, agentId));
+	}, (agentId) => reserveCoordinatorProfile(coordinator, ownerGeneration, agentId),
+	(agentId) => releaseCoordinatorProfile(coordinator, ownerGeneration, agentId));
 	const startDrain = (externalSignal) => {
 		if (pending !== null) return pending;
 		const combinedSignal = combineSignals(ownerController.signal, signal, externalSignal);
@@ -224,6 +239,14 @@ export async function loadPersistentVoiceProfileStore(filePath, dependencies = {
 				throw error;
 			}
 			return VoiceProfileStore.prototype.resolve.call(store, agentId);
+		}, writable: true },
+		remove: { value: (agentId) => {
+			if (closed) {
+				const error = new Error('Voice profile store is closed');
+				error.code = 'VOICE_PROFILE_STORE_CLOSED';
+				throw error;
+			}
+			return VoiceProfileStore.prototype.remove.call(store, agentId);
 		}, writable: true },
 		flush: { value: flush, writable: true },
 		close: { value: close, writable: true },
@@ -352,6 +375,15 @@ function reserveCoordinatorProfile(coordinator, ownerGeneration, agentId, prefer
 	coordinator.assignmentOwners.set(agentId, ownerGeneration);
 	coordinator.version += 1;
 	return index;
+}
+
+function releaseCoordinatorProfile(coordinator, ownerGeneration, agentId) {
+	const currentOwner = coordinator.assignmentOwners.get(agentId) ?? -1;
+	if (ownerGeneration < currentOwner || !coordinator.assignments.has(agentId)) return false;
+	coordinator.assignments.delete(agentId);
+	coordinator.assignmentOwners.delete(agentId);
+	coordinator.version += 1;
+	return true;
 }
 
 function snapshotPersistentAssignments(coordinator) {

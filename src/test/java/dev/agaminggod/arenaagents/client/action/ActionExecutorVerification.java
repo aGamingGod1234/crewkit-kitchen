@@ -693,7 +693,16 @@ public final class ActionExecutorVerification {
 		runtime.stop("client_stopping");
 		assertEquals(ActionState.CANCELLED, runtime.lastResult().state(), "client runtime stop cancels action");
 		assertEquals(false, runtime.currentStatus().present(), "client runtime stop clears current action");
-		return 5;
+
+		runtime.onActionCommand(41L, waitCommand("session-a"));
+		assertEquals(true, runtime.currentStatus(41L).present(), "owning bridge session sees its action");
+		assertEquals(false, runtime.currentStatus(42L).present(), "another bridge session cannot see the action");
+		runtime.onSessionClosed(41L);
+		assertEquals(false, runtime.currentStatus(41L).present(), "session close clears its action status");
+		assertEquals(null, runtime.lastResult(42L), "terminal state cannot cross bridge sessions");
+		runtime.onActionCommand(42L, waitCommand("session-a"));
+		assertEquals(true, runtime.currentStatus(42L).present(), "a new session may reuse an old command id");
+		return 10;
 	}
 
 	private static ActionExecutor executor(FakeActionContext context, ActionExecutor.EventSink sink) {
@@ -711,7 +720,7 @@ public final class ActionExecutorVerification {
 	}
 
 	private static void assertEquals(Object expected, Object actual, String label) {
-		if (!expected.equals(actual)) {
+		if (!java.util.Objects.equals(expected, actual)) {
 			throw new AssertionError(label + ": expected <" + expected + "> but was <" + actual + ">");
 		}
 	}
