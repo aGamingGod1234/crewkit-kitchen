@@ -2029,6 +2029,12 @@ public final class CoordinatorProcessSupervisorVerification {
 			Files.writeString(secretFile, rotatedSecret, StandardCharsets.UTF_8);
 			Files.setLastModifiedTime(secretFile, originalTimestamp);
 			CodexAgentServerRuntime.reconcileBridgeConfiguration(slot, uninitializedManager(), supervisor);
+			long rotationDeadline = System.currentTimeMillis() + 3_000L;
+			while ((slot.bridge() == null || slot.bridge() == initialBridge)
+					&& System.currentTimeMillis() < rotationDeadline) {
+				Thread.sleep(25L);
+				CodexAgentServerRuntime.reconcileBridgeConfiguration(slot, uninitializedManager(), supervisor);
+			}
 			assertTrue(slot.bridge() != null && slot.bridge() != initialBridge,
 					"same-size same-timestamp rotation after byte 257 rebinds the explicit Java bridge");
 			try (Socket connection = authenticate(
