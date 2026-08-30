@@ -29,6 +29,11 @@ public final class AgentGroupRegistryVerification {
 				changes::incrementAndGet
 		);
 		assertEquals(List.of(builders), restored.groups(), "saved group survives snapshot round trip");
+		expectDomain(
+				() -> AgentGroupSnapshotCodec.decode("🙂".repeat(9_000)),
+				"GROUP_SNAPSHOT_TOO_LARGE",
+				"saved-group storage limit counts UTF-8 bytes"
+		);
 
 		AgentGroup revised = restored.save("BUILDERS", List.of(MOSS));
 		assertEquals(List.of(MOSS), revised.memberIds(), "saving an existing name updates the same group");
@@ -62,7 +67,7 @@ public final class AgentGroupRegistryVerification {
 		savedData.registry().save("Party", List.of(FLINT, MOSS));
 		assertEquals("Party", savedData.registry().require("party").name(),
 				"world saved data owns the persistent group registry");
-		return 16;
+		return 17;
 	}
 
 	private static void expectDomain(Runnable action, String code, String label) {

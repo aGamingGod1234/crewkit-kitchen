@@ -1,12 +1,19 @@
 import { types as nodeTypes } from 'node:util';
 
+import { ALL_FACT_DOMAINS, FACT_DOMAIN } from './fact-domains.mjs';
+import { MAX_LINE_BYTES } from '../constants.mjs';
+
 const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 const OBSERVED_SETS = new WeakSet();
 const CANDIDATE_ORIGINS = new WeakMap();
+const INTERPRETER_FACTS = new WeakSet();
+const FACT_STATS = new WeakMap();
 const PLAYER_FIELDS = ['x', 'y', 'z', 'health', 'hunger', 'air', 'fire', 'fallDistance', 'dead', 'yaw', 'pitch'];
 const CANDIDATE_FIELDS = ['stableId', 'entityId', 'type', 'itemId', 'blockId', 'count', 'x', 'y', 'z', 'distance', 'tags'];
 const ADAPTED_CANDIDATE_FIELDS = new Set([...CANDIDATE_FIELDS, 'name', 'isPlayer', 'placeableFaces']);
 const ADAPTED_INVENTORY_FIELDS = new Set(['itemId', 'count', 'slot', 'tags', 'damage', 'maxDamage', 'hotbar']);
+const TRUST_LIMITS = Object.freeze({ depth: 256, nodes: 4_096, keys: 4_096, stringBytes: 16_384, factBytes: MAX_LINE_BYTES * 2, arrayLength: 256 });
+const EMPTY_FACT_STATS = Object.freeze({ nodes: 0, keys: 0, bytes: 0, depth: -1 });
 
 /** Builds an immutable, observation-only fact view. */
 export function createFactView(observation) {
@@ -33,22 +40,55 @@ export function createFactView(observation) {
 }
 
 /** Serializable frozen facts used by the interpreter. */
-export function createInterpreterFacts(observation = {}) {
+export function createInterpreterFacts(observation = {}, previousFacts = null) {
+	const previous = INTERPRETER_FACTS.has(previousFacts) ? previousFacts : null;
 	const source = ownDataRecord(observation, 'observation');
 	const playerSource = ownDataRecord(source.player ?? Object.create(null), 'observation.player');
 	const player = copyRecord(playerSource, PLAYER_FIELDS, 'observation.player');
 	if (Object.hasOwn(playerSource, 'lastAttacker')) player.lastAttacker = copyAttacker(playerSource.lastAttacker);
-	const frozenPlayer = freezeRecord(player);
+	const frozenPlayer = reuseEqual(previous?.player, freezeRecord(player));
 	const inventorySource = ownDataRecord(source.inventory ?? Object.create(null), 'observation.inventory');
 	const tagCounts = Object.create(null);
 	for (const [tag, count] of Object.entries(ownDataRecord(inventorySource.tagCounts ?? Object.create(null), 'observation.inventory.tagCounts'))) {
 		if (validKey(tag) && nonNegativeInteger(count)) tagCounts[tag] = count;
 	}
-	return freezeRecord({
+	const worldItems = reuseEqual(previous?.world.items, copyCandidates(source.items, 'item'));
+	const worldEntities = reuseEqual(previous?.world.entities, copyCandidates(source.entities, 'entity'));
+	const worldBlocks = reuseEqual(previous?.world.blocks, copyCandidates(source.blocks, 'block'));
+	const inventoryItems = reuseEqual(previous?.inventory.items, copyInventory(inventorySource.items));
+	const inventoryTagCounts = reuseEqual(previous?.inventory.tagCounts, freezeRecord(tagCounts));
+	if (previous !== null
+		&& frozenPlayer === previous.player
+		&& worldItems === previous.world.items
+		&& worldEntities === previous.world.entities
+		&& worldBlocks === previous.world.blocks
+		&& inventoryItems === previous.inventory.items
+		&& inventoryTagCounts === previous.inventory.tagCounts) return previous;
+	const facts = freezeRecord({
 		player: frozenPlayer,
-		world: freezeRecord({ items: copyCandidates(source.items, 'item'), entities: copyCandidates(source.entities, 'entity'), blocks: copyCandidates(source.blocks, 'block') }),
-		inventory: freezeRecord({ items: copyInventory(inventorySource.items), tagCounts: freezeRecord(tagCounts) }),
+		world: freezeRecord({ items: worldItems, entities: worldEntities, blocks: worldBlocks }),
+		inventory: freezeRecord({ items: inventoryItems, tagCounts: inventoryTagCounts }),
 	});
+	if (withinInterpreterFactLimits(facts)) INTERPRETER_FACTS.add(facts);
+	return facts;
+}
+
+/** Returns true only for fact trees fully validated and frozen by this module. */
+export function isTrustedInterpreterFacts(value) {
+	return INTERPRETER_FACTS.has(value);
+}
+
+/** Compares trusted fact domains by identity after createInterpreterFacts structural sharing. */
+export function changedInterpreterFactDomains(previous, next) {
+	if (!INTERPRETER_FACTS.has(previous) || !INTERPRETER_FACTS.has(next)) return ALL_FACT_DOMAINS;
+	let changed = 0;
+	if (previous.player !== next.player) changed |= FACT_DOMAIN.player;
+	if (previous.world.items !== next.world.items) changed |= FACT_DOMAIN.worldItems;
+	if (previous.world.entities !== next.world.entities) changed |= FACT_DOMAIN.worldEntities;
+	if (previous.world.blocks !== next.world.blocks) changed |= FACT_DOMAIN.worldBlocks;
+	if (previous.inventory.items !== next.inventory.items) changed |= FACT_DOMAIN.inventoryItems;
+	if (previous.inventory.tagCounts !== next.inventory.tagCounts) changed |= FACT_DOMAIN.inventoryTagCounts;
+	return changed;
 }
 
 export function filterObserved(candidates, criteria = {}) {
@@ -63,7 +103,18 @@ export function nearest(candidates, origin) {
 	if (!OBSERVED_SETS.has(candidates)) throw new TypeError('nearest requires an observed candidate set');
 	if (candidates.length === 0) return null;
 	const point = pointOf(origin, 'origin');
-	return [...candidates].sort((left, right) => distanceSquared(left, point) - distanceSquared(right, point) || codePointCompare(left.stableId, right.stableId))[0] ?? null;
+	let closest = candidates[0];
+	let closestDistance = distanceSquared(closest, point);
+	for (let index = 1; index < candidates.length; index += 1) {
+		const candidate = candidates[index];
+		const candidateDistance = distanceSquared(candidate, point);
+		if (candidateDistance < closestDistance
+			|| (candidateDistance === closestDistance && codePointCompare(candidate.stableId, closest.stableId) < 0)) {
+			closest = candidate;
+			closestDistance = candidateDistance;
+		}
+	}
+	return closest;
 }
 
 export function nearestFromCurrent(candidates, origin, currentSets) {
@@ -173,3 +224,58 @@ function nonNegativeInteger(value) { return Number.isSafeInteger(value) && value
 function validKey(key) { return !FORBIDDEN_KEYS.has(key); }
 function observedList(values, origin = null) { const frozen = Object.freeze(values.filter((value) => value !== null)); OBSERVED_SETS.add(frozen); if (origin !== null) CANDIDATE_ORIGINS.set(frozen, origin); return frozen; }
 function freezeRecord(values) { return Object.freeze(Object.assign(Object.create(null), values)); }
+
+function reuseEqual(previous, next) {
+	if (previous === undefined || !sameTrustedValue(previous, next)) return next;
+	return previous;
+}
+
+function sameTrustedValue(left, right) {
+	if (Object.is(left, right)) return true;
+	if (left === null || right === null || typeof left !== 'object' || typeof right !== 'object' || Array.isArray(left) !== Array.isArray(right)) return false;
+	const leftKeys = Object.keys(left);
+	const rightKeys = Object.keys(right);
+	if (leftKeys.length !== rightKeys.length) return false;
+	for (let index = 0; index < leftKeys.length; index += 1) {
+		const key = leftKeys[index];
+		if (key !== rightKeys[index] || !sameTrustedValue(left[key], right[key])) return false;
+	}
+	return true;
+}
+
+function withinInterpreterFactLimits(root) {
+	const stats = interpreterFactStats(root);
+	return stats !== null
+		&& stats.nodes <= TRUST_LIMITS.nodes
+		&& stats.keys <= TRUST_LIMITS.keys
+		&& stats.bytes <= TRUST_LIMITS.factBytes
+		&& stats.depth <= TRUST_LIMITS.depth;
+}
+
+function interpreterFactStats(value) {
+	if (typeof value === 'string') {
+		const bytes = Buffer.byteLength(value, 'utf8');
+		return bytes > TRUST_LIMITS.stringBytes ? null : { nodes: 0, keys: 0, bytes, depth: -1 };
+	}
+	if (value === null || typeof value !== 'object') return EMPTY_FACT_STATS;
+	const cached = FACT_STATS.get(value);
+	if (cached !== undefined) return cached;
+	if (Array.isArray(value) && value.length > TRUST_LIMITS.arrayLength) return null;
+	const keys = Object.keys(value);
+	const stats = { nodes: 1, keys: keys.length, bytes: 0, depth: 0 };
+	for (let index = 0; index < keys.length; index += 1) {
+		const key = keys[index];
+		const keyBytes = Array.isArray(value)
+			? index < 10 ? 1 : index < 100 ? 2 : index < 1_000 ? 3 : String(index).length
+			: Buffer.byteLength(key, 'utf8');
+		if (keyBytes > TRUST_LIMITS.stringBytes) return null;
+		const child = interpreterFactStats(value[key]);
+		if (child === null) return null;
+		stats.nodes += child.nodes;
+		stats.keys += child.keys;
+		stats.bytes += keyBytes + child.bytes;
+		stats.depth = Math.max(stats.depth, child.depth + 1);
+	}
+	FACT_STATS.set(value, stats);
+	return stats;
+}

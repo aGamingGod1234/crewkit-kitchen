@@ -26,6 +26,7 @@ test('local speech worker serializes concurrent TTS, STT, and warmup model work'
 		warmupRequests: 2,
 		maximumConcurrentInference: 1,
 		maximumConcurrentWarmupOrInference: 1,
+		weightedOrder: ['stt-1', 'stt-2', 'stt-3', 'tts-1', 'stt-4', 'tts-2'],
 	});
 });
 

@@ -19,26 +19,34 @@ public final class ServerObservationWireBudget {
 		Objects.requireNonNull(fitsCompleteEnvelope, "fitsCompleteEnvelope must not be null");
 		JsonObject candidate = source.deepCopy();
 		ArrayList<String> reductions = new ArrayList<>();
-		if (fitsCompleteEnvelope.test(candidate)) return new Fitted(candidate, reductions);
+		if (fitsCompleteEnvelope.test(candidate)) return fitted(candidate, reductions);
 
 		if (removeCandidateTags(candidate)) reductions.add("candidateTags");
-		if (fitsCompleteEnvelope.test(candidate)) return new Fitted(candidate, reductions);
+		if (fitsCompleteEnvelope.test(candidate)) return fitted(candidate, reductions);
 
-		trimTail(candidate, candidate.get("blocks"), fitsCompleteEnvelope, "blocks", reductions);
-		if (fitsCompleteEnvelope.test(candidate)) return new Fitted(candidate, reductions);
-		trimTail(candidate, candidate.get("nearbyContainers"), fitsCompleteEnvelope, "nearbyContainers", reductions);
-		if (fitsCompleteEnvelope.test(candidate)) return new Fitted(candidate, reductions);
-		trimTail(candidate, candidate.get("entities"), fitsCompleteEnvelope, "entities", reductions);
-		if (fitsCompleteEnvelope.test(candidate)) return new Fitted(candidate, reductions);
+		if (trimTail(candidate, candidate.get("blocks"), fitsCompleteEnvelope, "blocks", reductions)) {
+			return fitted(candidate, reductions);
+		}
+		if (trimTail(candidate, candidate.get("nearbyContainers"), fitsCompleteEnvelope,
+				"nearbyContainers", reductions)) {
+			return fitted(candidate, reductions);
+		}
+		if (trimTail(candidate, candidate.get("entities"), fitsCompleteEnvelope, "entities", reductions)) {
+			return fitted(candidate, reductions);
+		}
 
 		JsonObject player = object(candidate, "player");
-		trimTail(candidate, player == null ? null : player.get("effects"), fitsCompleteEnvelope,
-				"player.effects", reductions);
-		if (!fitsCompleteEnvelope.test(candidate)) {
+		if (!trimTail(candidate, player == null ? null : player.get("effects"), fitsCompleteEnvelope,
+				"player.effects", reductions)) {
 			throw new BridgeProtocolException("OBSERVATION_TOO_LARGE",
 					"Protected observation facts exceed the complete bridge envelope limit");
 		}
-		return new Fitted(candidate, reductions);
+		return fitted(candidate, reductions);
+	}
+
+	private static Fitted fitted(JsonObject candidate, List<String> reductions) {
+		// The predicate has observed candidate, so establish sole ownership before taking the trusted path.
+		return Fitted.trusted(candidate.deepCopy(), reductions);
 	}
 
 	private static boolean removeCandidateTags(JsonObject observation) {
@@ -60,21 +68,22 @@ public final class ServerObservationWireBudget {
 		return changed;
 	}
 
-	private static void trimTail(
+	private static boolean trimTail(
 			JsonObject root,
 			JsonElement value,
 			Predicate<JsonObject> fitsCompleteEnvelope,
 			String reduction,
 			List<String> reductions
 	) {
-		if (value == null || !value.isJsonArray()) return;
+		if (value == null || !value.isJsonArray()) return false;
 		JsonArray values = value.getAsJsonArray();
 		int originalSize = values.size();
-		if (originalSize <= 1) return;
-		List<JsonElement> original = values.asList().stream().map(JsonElement::deepCopy).toList();
+		if (originalSize <= 1) return false;
+		List<JsonElement> original = List.copyOf(values.asList());
 		setPrefix(values, original, 1);
 		int retained = 1;
-		if (fitsCompleteEnvelope.test(root)) {
+		boolean fits = fitsCompleteEnvelope.test(root);
+		if (fits) {
 			int low = 2;
 			int high = originalSize - 1;
 			while (low <= high) {
@@ -90,11 +99,12 @@ public final class ServerObservationWireBudget {
 		}
 		setPrefix(values, original, retained);
 		reductions.add(reduction);
+		return fits;
 	}
 
 	private static void setPrefix(JsonArray target, List<JsonElement> source, int size) {
 		while (!target.isEmpty()) target.remove(target.size() - 1);
-		for (int index = 0; index < size; index++) target.add(source.get(index).deepCopy());
+		for (int index = 0; index < size; index++) target.add(source.get(index));
 	}
 
 	private static JsonArray array(JsonObject object, String field) {
@@ -107,15 +117,47 @@ public final class ServerObservationWireBudget {
 				? object.getAsJsonObject(field) : null;
 	}
 
-	public record Fitted(JsonObject observation, List<String> reductions) {
-		public Fitted {
-			observation = Objects.requireNonNull(observation, "observation must not be null").deepCopy();
-			reductions = List.copyOf(Objects.requireNonNull(reductions, "reductions must not be null"));
+	public static final class Fitted {
+		private final JsonObject observation;
+		private final List<String> reductions;
+
+		public Fitted(JsonObject observation, List<String> reductions) {
+			this(observation, reductions, false);
+		}
+
+		public JsonObject observation() {
+			return observation.deepCopy();
+		}
+
+		public List<String> reductions() {
+			return reductions;
+		}
+
+		private Fitted(JsonObject observation, List<String> reductions, boolean trusted) {
+			JsonObject value = Objects.requireNonNull(observation, "observation must not be null");
+			this.observation = trusted ? value : value.deepCopy();
+			this.reductions = List.copyOf(Objects.requireNonNull(reductions, "reductions must not be null"));
+		}
+
+		private static Fitted trusted(JsonObject observation, List<String> reductions) {
+			return new Fitted(observation, reductions, true);
 		}
 
 		@Override
-		public JsonObject observation() {
-			return observation.deepCopy();
+		public boolean equals(Object other) {
+			return this == other || other instanceof Fitted fitted
+					&& observation.equals(fitted.observation)
+					&& reductions.equals(fitted.reductions);
+		}
+
+		@Override
+		public int hashCode() {
+			return Objects.hash(observation, reductions);
+		}
+
+		@Override
+		public String toString() {
+			return "Fitted[observation=" + observation + ", reductions=" + reductions + "]";
 		}
 	}
 }

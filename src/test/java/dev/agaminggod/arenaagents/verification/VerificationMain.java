@@ -33,6 +33,7 @@ import dev.agaminggod.arenaagents.client.bridge.BridgeServer;
 import dev.agaminggod.arenaagents.client.bridge.BridgeSession;
 import dev.agaminggod.arenaagents.client.config.AgentConfig;
 import dev.agaminggod.arenaagents.client.config.AgentConfigLoader;
+import dev.agaminggod.arenaagents.client.control.AgentClientPresentationVerification;
 import dev.agaminggod.arenaagents.client.perception.BlockSnapshot;
 import dev.agaminggod.arenaagents.client.perception.EntitySnapshot;
 import dev.agaminggod.arenaagents.client.perception.InventorySnapshot;
@@ -227,6 +228,7 @@ public final class VerificationMain {
 		passedAssertions += GoalSpecVerification.verify();
 		passedAssertions += AgentIdentityVerification.verify();
 		passedAssertions += AgentControlVerification.verify();
+		passedAssertions += AgentClientPresentationVerification.verify();
 		passedAssertions += AgentControlSelectionStateVerification.verify();
 		passedAssertions += AgentRosterViewStateVerification.verify();
 		passedAssertions += AgentControlLayoutVerification.verify();

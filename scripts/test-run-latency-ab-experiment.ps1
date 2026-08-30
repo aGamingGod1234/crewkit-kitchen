@@ -87,7 +87,7 @@ try {
         BaselineRunnerArguments = @('--shared-state-path', $statePath, '--retry-once', '--label', 'baseline')
         OptimizedRunnerArguments = @('--shared-state-path', $statePath, '--retry-once', '--label', 'optimized')
         BaselinePlanningConcurrency = 16
-        OptimizedPlanningConcurrency = 4
+        OptimizedPlanningConcurrency = 16
         BaselineReplayRecordingsPath = $baselineReplayPath
         OptimizedReplayRecordingsPath = $optimizedReplayPath
     }
@@ -96,8 +96,11 @@ try {
     $firstManifest = Get-ManifestFromOutput $firstOutput
     Assert-Fixture ([string]$firstManifest.Status -eq 'passed') 'A successful fixture run did not pass.'
     Assert-Fixture ([int]$firstManifest.results.Count -eq 8) 'Expected one result per pair and arm.'
+    Assert-Fixture ([int]$firstManifest.results[0].result.trials.Count -eq 2) 'Aggregate runner repetitions were not preserved.'
+    Assert-Fixture ([double]$firstManifest.results[0].latencyMs -eq 18) 'Aggregate runner latency was not summarized as repetition p95.'
+    Assert-Fixture ([bool]$firstManifest.results[0].cleanupOk) 'Validated cleanup status was not preserved in the manifest summary.'
     Assert-Fixture ([int]$firstManifest.armConfig.baseline.planningConcurrency -eq 16) 'Baseline planning concurrency was not recorded.'
-    Assert-Fixture ([int]$firstManifest.armConfig.optimized.planningConcurrency -eq 4) 'Optimized planning concurrency was not recorded.'
+    Assert-Fixture ([int]$firstManifest.armConfig.optimized.planningConcurrency -eq 16) 'Optimized planning concurrency was not recorded.'
     Assert-Fixture ([string]$firstManifest.armConfig.baseline.runnerArguments[-1] -eq 'baseline') 'Baseline runner arguments were not recorded.'
     Assert-Fixture ([string]$firstManifest.armConfig.optimized.runnerArguments[-1] -eq 'optimized') 'Optimized runner arguments were not recorded.'
     Assert-Fixture ([string]$firstManifest.armConfig.baseline.replayRecordingsPath -eq [IO.Path]::GetFullPath($baselineReplayPath)) 'Baseline replay path was not recorded.'
@@ -148,11 +151,12 @@ try {
     }
     $mixedArtifactRoot = Join-Path $fixtureRoot 'artifacts-mixed'
     New-Item -ItemType Directory -Force -Path $mixedArtifactRoot | Out-Null
-    $mixedOutput = @( & $orchestratorPath @{
+    $mixedParameters = @{
         BaselinePath = $baselineRoot; OptimizedPath = $optimizedRoot; MatrixPath = 'coordinator\config\mixed-matrix.json';
         BaselineRunnerPath = $baselineFixtureRunnerPath; OptimizedRunnerPath = $optimizedFixtureRunnerPath; OutputRoot = $mixedArtifactRoot; OuterTimeoutSeconds = 5; MaxRetries = 0;
-        Seed = 12345; Mode = @('instant', 'replay'); RunnerArguments = @('-SharedStatePath', $statePath)
-    } )
+        Seed = 12345; Mode = @('instant', 'replay'); RunnerArguments = @('--shared-state-path', $statePath)
+    }
+    $mixedOutput = @( & $orchestratorPath @mixedParameters )
     $mixedManifest = Get-ManifestFromOutput $mixedOutput
     Assert-Fixture ([string]$mixedManifest.Status -eq 'passed') 'Mixed-mode matrix run did not pass.'
     Assert-Fixture ([int]$mixedManifest.results.Count -eq 4) 'Mode selection cross-product created extra mixed-mode trials.'
@@ -164,11 +168,12 @@ try {
     New-Item -ItemType Directory -Force -Path $driftArtifactRoot | Out-Null
     $driftArgs = @('--shared-state-path', $statePath, '--drift-source')
     Invoke-ExpectedFailure -Action {
-        & $orchestratorPath @{
+        $parameters = @{
             BaselinePath = $baselineRoot; OptimizedPath = $optimizedRoot; MatrixPath = 'coordinator\config\latency-matrix.json';
             BaselineRunnerPath = $baselineFixtureRunnerPath; OptimizedRunnerPath = $optimizedFixtureRunnerPath; OutputRoot = $driftArtifactRoot; OuterTimeoutSeconds = 5; MaxRetries = 0;
             Seed = 12345; Mode = @('instant'); RunnerArguments = $driftArgs
         }
+        & $orchestratorPath @parameters
     } -Message 'Source hash drift was not rejected.'
     $driftFile = Join-Path $baselineRoot 'src\fixture-drift.txt'
     if (Test-Path -LiteralPath $driftFile -PathType Leaf) { Remove-Item -LiteralPath $driftFile -Force }
@@ -176,31 +181,34 @@ try {
     $malformedArtifactRoot = Join-Path $fixtureRoot 'artifacts-malformed'
     New-Item -ItemType Directory -Force -Path $malformedArtifactRoot | Out-Null
     Invoke-ExpectedFailure -Action {
-        & $orchestratorPath @{
+        $parameters = @{
             BaselinePath = $baselineRoot; OptimizedPath = $optimizedRoot; MatrixPath = 'coordinator\config\latency-matrix.json';
             BaselineRunnerPath = $baselineFixtureRunnerPath; OptimizedRunnerPath = $optimizedFixtureRunnerPath; OutputRoot = $malformedArtifactRoot; OuterTimeoutSeconds = 5; MaxRetries = 0;
             Seed = 12345; Mode = @('instant'); RunnerArguments = @('--shared-state-path', $statePath, '--fixture-mode', 'malformed')
         }
+        & $orchestratorPath @parameters
     } -Message 'Malformed runner JSON was not rejected.'
 
     $leakArtifactRoot = Join-Path $fixtureRoot 'artifacts-leak'
     New-Item -ItemType Directory -Force -Path $leakArtifactRoot | Out-Null
     Invoke-ExpectedFailure -Action {
-        & $orchestratorPath @{
+        $parameters = @{
             BaselinePath = $baselineRoot; OptimizedPath = $optimizedRoot; MatrixPath = 'coordinator\config\latency-matrix.json';
             BaselineRunnerPath = $baselineFixtureRunnerPath; OptimizedRunnerPath = $optimizedFixtureRunnerPath; OutputRoot = $leakArtifactRoot; OuterTimeoutSeconds = 5; MaxRetries = 0;
             Seed = 12345; Mode = @('instant'); RunnerArguments = @('--shared-state-path', $statePath, '--fixture-mode', 'cleanup-leak')
         }
+        & $orchestratorPath @parameters
     } -Message 'Cleanup residue was not rejected.'
 
     $timeoutArtifactRoot = Join-Path $fixtureRoot 'artifacts-timeout'
     New-Item -ItemType Directory -Force -Path $timeoutArtifactRoot | Out-Null
     Invoke-ExpectedFailure -Action {
-        & $orchestratorPath @{
+        $parameters = @{
             BaselinePath = $baselineRoot; OptimizedPath = $optimizedRoot; MatrixPath = 'coordinator\config\latency-matrix.json';
             BaselineRunnerPath = $baselineFixtureRunnerPath; OptimizedRunnerPath = $optimizedFixtureRunnerPath; OutputRoot = $timeoutArtifactRoot; OuterTimeoutSeconds = 1; MaxRetries = 0;
             Seed = 12345; Mode = @('instant'); RunnerArguments = @('--shared-state-path', $statePath, '--fixture-mode', 'timeout')
         }
+        & $orchestratorPath @parameters
     } -Message 'Outer timeout was not enforced.'
 
     $liveArtifactRoot = Join-Path $fixtureRoot 'artifacts-live'
@@ -208,6 +216,8 @@ try {
     $liveCommon = $common.Clone()
     $liveCommon.OutputRoot = $liveArtifactRoot
     $liveCommon.Mode = @('live')
+    $liveCommon.Remove('BaselineRunnerArguments')
+    $liveCommon.Remove('OptimizedRunnerArguments')
     $liveCommon.RunnerArguments = @('--shared-state-path', $statePath, '--fixture-mode', 'skip-live')
     $liveOutput = @( & $orchestratorPath @liveCommon )
     $liveManifest = Get-ManifestFromOutput $liveOutput
@@ -222,6 +232,12 @@ try {
 
     Write-Host 'Latency A/B orchestrator fixture tests passed.'
     $global:LASTEXITCODE = 0
+}
+catch {
+    Get-ChildItem -LiteralPath $artifactRoot -Filter result.json -File -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { (Get-Content -Raw -LiteralPath $_.FullName) -match '"status"\s*:\s*"FAILED"' } |
+        ForEach-Object { Write-Host "Failed fixture result $($_.FullName):`n$(Get-Content -Raw -LiteralPath $_.FullName)" }
+    throw
 }
 finally {
     foreach ($path in $pathsToRemove) {

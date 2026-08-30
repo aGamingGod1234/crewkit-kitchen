@@ -13,6 +13,7 @@ import java.io.IOException;
 import java.io.StringReader;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Set;
 
@@ -52,7 +53,7 @@ public final class BridgeEnvelopeCodec {
 		if (!object.get("payload").isJsonObject()) {
 			throw new BridgeProtocolException("INVALID_FIELD", "payload must be an object");
 		}
-		return new BridgeEnvelope(
+		return BridgeEnvelope.fromDecoded(
 				requiredInteger(object, "protocolVersion"),
 				requiredString(object, "serverInstanceId"),
 				requiredString(object, "agentId"),
@@ -126,16 +127,37 @@ public final class BridgeEnvelopeCodec {
 	}
 
 	public String encode(BridgeEnvelope envelope) {
-		String encoded = serialize(envelope);
-		if (encodedBytes(encoded) > MAX_LINE_BYTES) {
-			throw new BridgeProtocolException("LINE_TOO_LARGE", "Encoded protocol line exceeds wire limit");
-		}
-		return encoded + "\n";
+		return encodeFrame(envelope).utf8();
 	}
 
 	/** Returns the exact UTF-8 wire size, including the newline frame delimiter. */
 	public int encodedBytes(BridgeEnvelope envelope) {
-		return encodedBytes(serialize(envelope));
+		return encodedFrameUnchecked(envelope).byteLength();
+	}
+
+	/** Returns the exact UTF-8 JSON line size, excluding the newline frame delimiter. */
+	public int encodedLineBytes(BridgeEnvelope envelope) {
+		return encodedFrameUnchecked(envelope).byteLength() - 1;
+	}
+
+	public EncodedFrame encodeFrame(BridgeEnvelope envelope) {
+		EncodedFrame encoded = encodedFrameUnchecked(envelope);
+		if (encoded.byteLength() - 1 > MAX_LINE_BYTES) {
+			throw new BridgeProtocolException("LINE_TOO_LARGE", "Encoded protocol line exceeds " + MAX_LINE_BYTES + " UTF-8 bytes");
+		}
+		return encoded;
+	}
+
+	private EncodedFrame encodedFrameUnchecked(BridgeEnvelope envelope) {
+		BridgeEnvelope checked = java.util.Objects.requireNonNull(envelope, "envelope must not be null");
+		EncodedFrame cached = checked.encodedFrame();
+		if (cached != null) return cached;
+		byte[] jsonBytes = serialize(checked).getBytes(StandardCharsets.UTF_8);
+		byte[] wireBytes = Arrays.copyOf(jsonBytes, jsonBytes.length + 1);
+		wireBytes[jsonBytes.length] = (byte) '\n';
+		EncodedFrame encoded = new EncodedFrame(wireBytes);
+		checked.cacheEncodedFrame(encoded);
+		return checked.encodedFrame();
 	}
 
 	private static String serialize(BridgeEnvelope envelope) {
@@ -145,11 +167,27 @@ public final class BridgeEnvelopeCodec {
 		object.addProperty("agentId", envelope.agentId());
 		object.addProperty("type", envelope.type());
 		object.addProperty("messageId", envelope.messageId());
-		object.add("payload", envelope.payload());
+		object.add("payload", envelope.payloadView());
 		return GSON.toJson(object);
 	}
 
-	private static int encodedBytes(String serialized) {
-		return serialized.getBytes(StandardCharsets.UTF_8).length + 1;
+	public static final class EncodedFrame {
+		private final byte[] bytes;
+		private volatile String utf8;
+
+		private EncodedFrame(byte[] bytes) {
+			this.bytes = bytes;
+		}
+
+		public int byteLength() { return bytes.length; }
+		public byte[] bytes() { return bytes.clone(); }
+		byte[] bytesView() { return bytes; }
+		public String utf8() {
+			String value = utf8;
+			if (value != null) return value;
+			value = new String(bytes, StandardCharsets.UTF_8);
+			utf8 = value;
+			return value;
+		}
 	}
 }

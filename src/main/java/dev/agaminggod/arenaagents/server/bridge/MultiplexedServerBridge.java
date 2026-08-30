@@ -111,7 +111,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private static final int MIN_SECRET_LENGTH = 32;
 	private static final int MAX_SECRET_LENGTH = 512;
 	private static final int MAX_TRACKED_IDS = 4_096;
-	private static final int SERVER_TASK_CAP = 4_096;
+	private static final int SERVER_TASK_BULK_CAP = 4_096;
+	private static final int SERVER_TASK_URGENT_RESERVE = 512;
+	private static final int SERVER_TASK_CONTROL_RESERVE = 512;
 	private static final int SERVER_TASKS_PER_TICK = 256;
 	private static final int OBSERVATION_HISTORY_CAPACITY = 4_096;
 	private static final int MAX_TARGET_IDS_PER_OBSERVATION = 64;
@@ -139,7 +141,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			AgentConstants.DEFAULT_AGENT_LIMIT,
 			OBSERVATIONS_PER_TICK,
 			(agentId, payload) -> ServerObservationWireBudget.fit(payload, candidate ->
-					codec.encodedBytes(new BridgeEnvelope(
+					codec.encodedLineBytes(new BridgeEnvelope(
 							2, serverInstanceId, agentId.toString(), "observation",
 							MAX_OBSERVATION_MESSAGE_ID, candidate
 					)) <= BridgeEnvelopeCodec.MAX_LINE_BYTES)
@@ -149,7 +151,11 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private final ServerSocketFactory serverSockets;
 	private final LongSupplier nanoTime;
 	private final AgentVerboseState verboseState;
-	private final BoundedServerTaskQueue serverTasks = new BoundedServerTaskQueue(SERVER_TASK_CAP);
+	private final BoundedServerTaskQueue serverTasks = new BoundedServerTaskQueue(
+			SERVER_TASK_BULK_CAP + SERVER_TASK_URGENT_RESERVE + SERVER_TASK_CONTROL_RESERVE,
+			SERVER_TASK_URGENT_RESERVE,
+			SERVER_TASK_CONTROL_RESERVE
+	);
 	private final AtomicBoolean running = new AtomicBoolean();
 	private final AtomicBoolean coordinatorDisconnectPending = new AtomicBoolean();
 	private final AtomicBoolean activeDisconnectPending = new AtomicBoolean();
@@ -182,6 +188,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private long catalogDiscoveryRetryAtNanos;
 	private long catalogDiscoveryGeneration;
 	private String catalogDiscoveryFailureCode;
+	private volatile long admissionTicks;
+	private volatile long publicationTicks;
 
 	public MultiplexedServerBridge(CodexAgentManager manager) {
 		this(manager, configuredPort(), configuredSecretPath(), new AgentVerboseState());
@@ -366,19 +374,23 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		ServerSocket open() throws IOException;
 	}
 
-	public void tick() {
+	/**
+	 * Admits coordinator work and applies action input at the start of the Minecraft tick.
+	 * Every callback in this method must run on the server thread.
+	 */
+	public void startTick() {
+		admissionTicks++;
+		drainServerTasks();
+		actionExecutor.tick();
+	}
+
+	/** Publishes terminal results and post-physics observations at the end of the tick. */
+	public void endTick() {
+		publicationTicks++;
 		publishPendingDisconnects();
 		publishPendingVerboseControl();
 		publishCatalogDiscoveryRetry();
-		serverTasks.drain(SERVER_TASKS_PER_TICK, task -> {
-			try {
-				task.run();
-			} catch (RuntimeException exception) {
-				LOGGER.error("Codex bridge server task failed", exception);
-			}
-		});
 		replayPendingTerminalResults();
-		actionExecutor.tick();
 		List<AgentId> observationAgents = registeredObservationIds(manager.coordinatorVisibleRecords());
 		for (AgentId agentId : observations.changedActiveAgents()) {
 			if (!observationAgents.contains(agentId)) continue;
@@ -387,6 +399,22 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 		observationPublication.scheduleIdleHeartbeat(observationAgents);
 		observationPublication.drain(this::sendObservation);
+	}
+
+	/** Compatibility entry point for verification and embedders that do not expose tick phases. */
+	public void tick() {
+		startTick();
+		endTick();
+	}
+
+	private void drainServerTasks() {
+		serverTasks.drain(SERVER_TASKS_PER_TICK, task -> {
+			try {
+				task.run();
+			} catch (RuntimeException exception) {
+				LOGGER.error("Codex bridge server task failed", exception);
+			}
+		});
 	}
 
 	static List<AgentId> registeredObservationIds(List<AgentRecord> records) {
@@ -406,6 +434,30 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	TerminalResultLedger terminalResultsForVerification() {
 		return terminalResults;
 	}
+
+	/** Low-cost counters for confirming queue pressure and tick-phase admission in production. */
+	public BridgePerformanceSnapshot performanceSnapshot() {
+		BoundedServerTaskQueue.QueueMetrics queue = serverTasks.metrics();
+		return new BridgePerformanceSnapshot(
+				admissionTicks, publicationTicks,
+				queue.offeredUrgent(), queue.offeredControl(), queue.offeredBulk(),
+				queue.rejected(), queue.drained(),
+				queue.pendingUrgent(), queue.pendingControl(), queue.pendingBulk()
+		);
+	}
+
+	public record BridgePerformanceSnapshot(
+			long admissionTicks,
+			long publicationTicks,
+			long offeredUrgent,
+			long offeredControl,
+			long offeredBulk,
+			long rejectedInbound,
+			long drainedInbound,
+			int pendingUrgent,
+			int pendingControl,
+			int pendingBulk
+	) { }
 
 	public void setVerbose(boolean enabled) {
 		synchronized (verboseControlLock) {
@@ -753,7 +805,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		if (!serverInstanceId.equals(envelope.serverInstanceId())) {
 			throw new BridgeProtocolException("SERVER_INSTANCE_MISMATCH", "Authenticated session changed serverInstanceId");
 		}
-		if (!serverTasks.offer(() -> {
+		if (!serverTasks.offer(inboundLane(envelope.type()), () -> {
 			synchronized (publicationLock) {
 				if (session != source || !source.open.get() || !source.authenticated.get()) return;
 				routeAuthenticated(envelope);
@@ -761,6 +813,18 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		})) {
 			throw new BridgeProtocolException("SERVER_TASK_QUEUE_FULL", "Coordinator exceeded the bounded server task queue");
 		}
+	}
+
+	static BoundedServerTaskQueue.Lane inboundLane(String type) {
+		return switch (Objects.requireNonNull(type, "type must not be null")) {
+			// Lifecycle state, action admission, and cancellation share one FIFO. In particular,
+			// an action_cancel can never overtake its preceding action_command.
+			case "agent_ready", "planning_state", "goal_completed", "action_command", "action_cancel",
+					"action_result_ack" -> BoundedServerTaskQueue.Lane.URGENT;
+			case "coordinator_status", "conversation_wake_ack", "goal_spec_proposal",
+					"request_observation", "heartbeat" -> BoundedServerTaskQueue.Lane.CONTROL;
+			default -> BoundedServerTaskQueue.Lane.BULK;
+		};
 	}
 
 	private void acceptAuthChallenge(BridgeEnvelope envelope, Session source) {
@@ -1697,10 +1761,6 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		);
 		synchronized (publicationLock) {
 			terminalResults.retain(result);
-			Session active = session;
-			if (active != null && active.open.get() && active.authenticated.get()) {
-				enqueueTerminalResult(active, result);
-			}
 		}
 		reportVerbose(result.agentId(), AgentActivityPresentation.verboseResultStage(result), verboseResult(result));
 		verboseState.finishAction(result);
@@ -2124,7 +2184,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		if (session != source || !source.open.get() || !source.authenticated.get()) return false;
 		BridgeEnvelope envelope = new BridgeEnvelope(2, serverInstanceId, agentId.toString(), "observation",
 				"server-" + messageIds.incrementAndGet(), payload);
-		if (codec.encodedBytes(envelope) > BridgeEnvelopeCodec.MAX_LINE_BYTES) {
+		if (codec.encodedLineBytes(envelope) > BridgeEnvelopeCodec.MAX_LINE_BYTES) {
 			throw new BridgeProtocolException("LINE_TOO_LARGE", "Fitted observation exceeds the actual wire envelope");
 		}
 		source.enqueue(envelope);
@@ -2938,6 +2998,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			if (ordered.isEmpty() || !"hello_ack".equals(ordered.getFirst().type())) {
 				throw new IllegalArgumentException("handshake must begin with hello_ack");
 			}
+			ordered.forEach(codec::encodeFrame);
 			if (outbound.remainingCapacity() < ordered.size()) {
 				throw new BridgeProtocolException("CONNECTION_BACKPRESSURE", "Outbound queue cannot publish handshake replay batch");
 			}
@@ -2958,6 +3019,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 
 		void enqueue(BridgeEnvelope envelope) {
+			codec.encodeFrame(envelope);
 			synchronized (publicationLock) {
 				synchronized (this) {
 					if (!open.get() || !authenticated.get()) {
@@ -2972,6 +3034,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 
 		void enqueuePair(BridgeEnvelope first, BridgeEnvelope second, Runnable beforeEnqueue) {
+			codec.encodeFrame(first);
+			codec.encodeFrame(second);
 			synchronized (publicationLock) {
 				synchronized (this) {
 					if (!open.get() || !authenticated.get()) throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Bridge session closed before paired publication");
@@ -2994,6 +3058,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 
 		void enqueueAtomically(BridgeEnvelope envelope, Runnable beforeEnqueue) {
+			codec.encodeFrame(envelope);
 			synchronized (publicationLock) {
 				synchronized (this) {
 					if (!open.get() || !authenticated.get()) throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Bridge session closed before atomic publication");
@@ -3055,8 +3120,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			try (BufferedOutputStream output = new BufferedOutputStream(socket.getOutputStream())) {
 				while (open.get()) {
 					BridgeEnvelope envelope = outbound.take();
-					byte[] bytes = codec.encode(envelope).getBytes(StandardCharsets.UTF_8);
-					output.write(bytes);
+					BridgeEnvelopeCodec.EncodedFrame frame = codec.encodeFrame(envelope);
+					output.write(frame.bytesView());
 					output.flush();
 					synchronized (this) {
 						queuedByAgent.computeIfPresent(envelope.agentId(), (id, count) -> count <= 1 ? null : count - 1);

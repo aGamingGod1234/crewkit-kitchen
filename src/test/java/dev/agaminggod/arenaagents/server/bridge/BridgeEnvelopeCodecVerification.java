@@ -4,6 +4,7 @@ import com.google.gson.JsonObject;
 import dev.agaminggod.arenaagents.protocol.ActionType;
 import dev.agaminggod.arenaagents.protocol.ProtocolConstants;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionRequest;
+import java.nio.charset.StandardCharsets;
 
 public final class BridgeEnvelopeCodecVerification {
 	private BridgeEnvelopeCodecVerification() {
@@ -14,6 +15,17 @@ public final class BridgeEnvelopeCodecVerification {
 		JsonObject payload = new JsonObject();
 		payload.addProperty("goalRevision", 7L);
 		BridgeEnvelope source = new BridgeEnvelope(2, "server-instance", "agent-id", "observation", "message-1", payload);
+		payload.addProperty("goalRevision", 99L);
+		JsonObject publicPayload = source.payload();
+		publicPayload.addProperty("goalRevision", 100L);
+		assertEquals(7L, source.payload().get("goalRevision").getAsLong(), "public payload mutations cannot change an envelope");
+		BridgeEnvelopeCodec.EncodedFrame firstFrame = codec.encodeFrame(source);
+		BridgeEnvelopeCodec.EncodedFrame secondFrame = codec.encodeFrame(source);
+		assertEquals(true, firstFrame == secondFrame, "an immutable envelope caches one encoded frame");
+		assertEquals(codec.encode(source).getBytes(StandardCharsets.UTF_8).length, firstFrame.byteLength(), "encoded frame reports exact wire bytes");
+		byte[] detachedBytes = firstFrame.bytes();
+		detachedBytes[0] = (byte) 'x';
+		assertEquals((byte) '{', firstFrame.bytes()[0], "public frame bytes are detached");
 		BridgeEnvelope decoded = codec.decode(codec.encode(source).trim());
 		assertEquals(source.protocolVersion(), decoded.protocolVersion(), "protocol version");
 		assertEquals(source.serverInstanceId(), decoded.serverInstanceId(), "server instance");
@@ -25,6 +37,16 @@ public final class BridgeEnvelopeCodecVerification {
 		expectFailure(() -> codec.decode("{\"protocolVersion\":2,\"protocolVersion\":2}"), "DUPLICATE_FIELD");
 		expectFailure(() -> codec.decode("{\"protocolVersion\":2,\"serverInstanceId\":\"server-instance\",\"agentId\":\"agent\",\"type\":\"observation\",\"messageId\":\"m\",\"payload\":{\"goalRevision\":1,\"goalRevision\":2}}"), "DUPLICATE_FIELD");
 		expectFailure(() -> codec.decode("{\"protocolVersion\":\"2\",\"serverInstanceId\":\"server-instance\",\"agentId\":\"agent\",\"type\":\"observation\",\"messageId\":\"m\",\"payload\":{}}"), "INVALID_FIELD");
+		JsonObject boundedPayload = new JsonObject();
+		boundedPayload.addProperty("text", "");
+		BridgeEnvelope bounded = new BridgeEnvelope(2, "server-instance", "agent", "observation", "utf8-bound", boundedPayload);
+		int fixedJsonBytes = codec.encodeFrame(bounded).byteLength() - 1;
+		boundedPayload.addProperty("text", "a".repeat(BridgeEnvelopeCodec.MAX_LINE_BYTES - fixedJsonBytes));
+		BridgeEnvelope exactLimit = new BridgeEnvelope(2, "server-instance", "agent", "observation", "utf8-bound", boundedPayload);
+		assertEquals(BridgeEnvelopeCodec.MAX_LINE_BYTES + 1, codec.encodeFrame(exactLimit).byteLength(), "line limit excludes the newline delimiter");
+		assertEquals(BridgeEnvelopeCodec.MAX_LINE_BYTES, codec.encodedLineBytes(exactLimit), "line sizing excludes only the frame delimiter");
+		boundedPayload.addProperty("text", boundedPayload.get("text").getAsString() + "a");
+		expectFailure(() -> codec.encode(new BridgeEnvelope(2, "server-instance", "agent", "observation", "utf8-bound", boundedPayload)), "LINE_TOO_LARGE");
 		JsonObject waitArguments = new JsonObject();
 		waitArguments.addProperty("durationMs", 25L);
 		ServerActionRequest primitive = MultiplexedServerBridge.decodeActionRequest(new BridgeEnvelope(
@@ -68,7 +90,7 @@ public final class BridgeEnvelopeCodecVerification {
 		assertEquals(ProtocolConstants.MAX_RESULT_MESSAGE_LENGTH - 1, emojiBounded.length(), "emoji rejection clamp does not split a surrogate pair");
 		assertEquals(false, Character.isHighSurrogate(emojiBounded.charAt(emojiBounded.length() - 1)), "emoji rejection clamp leaves valid UTF-16");
 		assertEquals("Action rejected", MultiplexedServerBridge.boundedRejectionMessage(" \t"), "blank rejection has stable fallback");
-		return 21;
+		return 27;
 	}
 
 	private static JsonObject actionPayload(String actionId, String type, JsonObject arguments) {

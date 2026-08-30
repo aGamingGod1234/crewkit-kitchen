@@ -36,6 +36,7 @@ import org.slf4j.LoggerFactory;
 
 public final class AgentControlClient {
 	public static final int SNAPSHOT_REFRESH_TICKS = 20;
+	public static final int HIDDEN_SNAPSHOT_REFRESH_TICKS = 100;
 	private static final Logger LOGGER = LoggerFactory.getLogger(AgentControlClient.class);
 	private static final KeyMapping.Category KEY_CATEGORY = KeyMapping.Category.register(
 			Identifier.fromNamespaceAndPath("arenaagents", "controls")
@@ -62,6 +63,7 @@ public final class AgentControlClient {
 	private static final Set<String> AUTOMATIC_AGENT_IDS = new LinkedHashSet<>();
 	private static final Set<String> KNOWN_AGENT_IDS = new LinkedHashSet<>();
 	private static int refreshCountdown;
+	private static int snapshotContentHash;
 
 	private AgentControlClient() {
 	}
@@ -226,8 +228,11 @@ public final class AgentControlClient {
 			}
 		}
 		boolean connected = client.player != null && client.level != null && client.getConnection() != null;
+		boolean controlsVisible = client.screen instanceof AgentControlScreen
+				|| client.screen instanceof dev.agaminggod.arenaagents.client.gui.scenario.ScenarioSetupScreen;
 		SnapshotRefreshPolicy.Tick refresh = SnapshotRefreshPolicy.advance(
-				refreshCountdown, connected, SNAPSHOT_REFRESH_TICKS);
+				refreshCountdown, connected, controlsVisible,
+				SNAPSHOT_REFRESH_TICKS, HIDDEN_SNAPSHOT_REFRESH_TICKS);
 		refreshCountdown = refresh.nextCountdown();
 		if (refresh.requestSnapshot()) requestSnapshot();
 		CAMERA_ASSISTANT.tick(client, SPECTATOR_STATE);
@@ -236,12 +241,19 @@ public final class AgentControlClient {
 
 	private static void acceptSnapshot(AgentControlSnapshot nextSnapshot) {
 		Objects.requireNonNull(nextSnapshot, "nextSnapshot must not be null");
+		AgentControlSnapshot previous = SNAPSHOTS.current().orElse(null);
 		if (!SNAPSHOTS.accept(nextSnapshot)) {
 			return;
 		}
+		int nextContentHash = contentHash(nextSnapshot);
+		Minecraft client = Minecraft.getInstance();
+		if (previous != null && snapshotContentHash == nextContentHash && sameContent(previous, nextSnapshot)) {
+			if (client.screen instanceof AgentControlScreen screen) screen.acceptSnapshot(nextSnapshot);
+			return;
+		}
+		snapshotContentHash = nextContentHash;
 		AgentControlCatalog.installRuntimeCatalog(nextSnapshot.catalog());
 		normalizePreferences();
-		Minecraft client = Minecraft.getInstance();
 		if (client.screen instanceof AgentControlScreen screen) {
 			screen.acceptSnapshot(nextSnapshot);
 		}
@@ -271,6 +283,22 @@ public final class AgentControlClient {
 		BUILD_PROGRESS_STATE.clear();
 		CAMERA_ASSISTANT.resetTracking();
 		refreshCountdown = 0;
+		snapshotContentHash = 0;
+	}
+
+	private static int contentHash(AgentControlSnapshot snapshot) {
+		return Objects.hash(
+				snapshot.canControl(), snapshot.automationAvailable(), snapshot.automationStatus(),
+				snapshot.agents(), snapshot.groups(), snapshot.catalog());
+	}
+
+	private static boolean sameContent(AgentControlSnapshot left, AgentControlSnapshot right) {
+		return left.canControl() == right.canControl()
+				&& left.automationAvailable() == right.automationAvailable()
+				&& left.automationStatus().equals(right.automationStatus())
+				&& left.agents().equals(right.agents())
+				&& left.groups().equals(right.groups())
+				&& left.catalog().equals(right.catalog());
 	}
 
 	private static void normalizePreferences() {

@@ -71,3 +71,31 @@ test('refreshes one shared native Minecraft workspace from bundled templates', a
 	assert.deepEqual(second, first);
 	assert.equal(await readFile(path.join(second.cwd, 'AGENTS.md'), 'utf8'), '# refreshed verified completion\n');
 });
+
+test('does not rewrite unchanged shared Minecraft templates', async (t) => {
+	const root = await mkdtemp(path.join(os.tmpdir(), 'minecraft-agent-workspace-cache-'));
+	const templateRoot = path.join(root, 'templates');
+	t.after(() => rm(root, { recursive: true, force: true }));
+	await mkdir(path.join(templateRoot, '.codex', 'skills', 'minecraft-control'), { recursive: true });
+	await writeFile(path.join(templateRoot, 'AGENTS.md'), '# agents\n', 'utf8');
+	await writeFile(path.join(templateRoot, '.codex', 'skills', 'minecraft-control', 'SKILL.md'), '# skill\n', 'utf8');
+
+	let writes = 0;
+	const workspace = new MinecraftAgentWorkspace({ root: path.join(root, 'runtime'), templateRoot }, {
+		fs: {
+			async writeFile(...args) {
+				writes += 1;
+				return writeFile(...args);
+			},
+		},
+	});
+	await workspace.prepare();
+	assert.equal(writes, 2);
+	await workspace.prepare();
+	assert.equal(writes, 2);
+
+	await writeFile(path.join(workspace.root, 'AGENTS.md'), '# externally changed\n', 'utf8');
+	await workspace.prepare();
+	assert.equal(writes, 3);
+	assert.equal(await readFile(path.join(workspace.root, 'AGENTS.md'), 'utf8'), '# agents\n');
+});

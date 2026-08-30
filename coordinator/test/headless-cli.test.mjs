@@ -204,6 +204,43 @@ test('classifies skipped profiles as failures only with --require-all', async ()
 	assert.equal(required.exitCode, 1);
 });
 
+test('fails the matrix when a required roster has no per-agent factual evidence', async () => {
+	const names = [];
+	const result = await runHeadlessMatrix({
+		configPath: 'C:/matrix.json', runDirectory: 'C:/runs/required-facts', rconPort: 25575,
+		rconPasswordFile: 'C:/runs/password.txt',
+		readFile: async (file) => {
+			if (file.endsWith('matrix.json')) return JSON.stringify({ version: 1, scenarios: [{
+				id: 'required-facts', provider: 'codex', model: 'm', reasoningEffort: 'low', task: 't', timeoutMs: 1000,
+				rosterSize: 8, requireFactualSuccess: true, assert: [{ type: 'lifecycle', state: 'COMPLETED' }],
+			}] });
+			if (file.endsWith('protocol.jsonl')) return names.map((name, index) => JSON.stringify({
+				direction: 'server_to_coordinator', envelope: { type: 'agent_snapshot', agentId: `required-${index + 1}`, payload: {
+					agentId: `required-${index + 1}`, name, provider: 'codex', model: 'm', reasoningEffort: 'low', serviceTier: 'priority',
+				} },
+			})).join('\n');
+			return 'password';
+		},
+		writeFile: async () => {}, mkdir: async () => {}, rconFactory: () => ({
+			connect: async () => {},
+			command: async (command) => {
+				if (command.includes('summon-configured')) {
+					const name = command.split(' ').at(-1);
+					names.push(name);
+					return { text: `Created ${name}. It is ready for a task.` };
+				}
+				return { text: command.startsWith('codex status') ? 'state=COMPLETED' : 'ok' };
+			},
+			close: async () => {},
+		}),
+	});
+	assert.equal(result.exitCode, 1);
+	assert.equal(result.report.status, 'FAILED');
+	assert.equal(result.report.scenarios[0].status, 'FAILED');
+	assert.equal(result.report.scenarios[0].classification, 'FAILED_USER_OBJECTIVE');
+	assert.equal(result.report.scenarios[0].factualSuccess, false);
+});
+
 test('isolates append-only evidence between unselected direct-CLI scenarios', async () => {
 	const protocolPath = 'C:/runs/all/protocol.jsonl';
 	let protocolText = '';

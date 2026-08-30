@@ -1,10 +1,8 @@
 package dev.agaminggod.arenaagents.server;
 
-import java.time.Duration;
-
-/** Lets an already-running coordinator reconnect before starting another process. */
+/** Starts the owned coordinator immediately and keeps bounded retry delays after failures. */
 public final class CoordinatorLaunchPolicy {
-	public static final long STARTUP_GRACE_MS = Duration.ofSeconds(3).toMillis();
+	public static final long STARTUP_GRACE_MS = 0L;
 	private static final long[] RESTART_DELAYS_MS = {1_000L, 2_000L, 5_000L, 15_000L, 30_000L};
 
 	private CoordinatorLaunchPolicy() {

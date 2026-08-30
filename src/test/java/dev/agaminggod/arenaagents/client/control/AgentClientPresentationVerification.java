@@ -19,6 +19,12 @@ public final class AgentClientPresentationVerification {
 		SnapshotRefreshPolicy.Tick waiting = SnapshotRefreshPolicy.advance(7, true, 20);
 		assertFalse(waiting.requestSnapshot(), "background polling waits until the interval expires");
 		assertEquals(6, waiting.nextCountdown(), "background polling advances once per client tick");
+		SnapshotRefreshPolicy.Tick hidden = SnapshotRefreshPolicy.advance(0, true, false, 20, 100);
+		assertTrue(hidden.requestSnapshot(), "hidden controls retain a slow roster heartbeat");
+		assertEquals(99, hidden.nextCountdown(), "hidden controls avoid polling a full snapshot every second");
+		SnapshotRefreshPolicy.Tick shown = SnapshotRefreshPolicy.advance(99, true, true, 20, 100);
+		assertFalse(shown.requestSnapshot(), "showing controls advances the next request without a duplicate tick send");
+		assertEquals(0, shown.nextCountdown(), "showing controls makes the next tick immediately due");
 
 		AgentControlAgent agent = new AgentControlAgent(
 				"12345678-1234-1234-1234-123456789abc", "12345678", "Builder", "codex",
@@ -33,7 +39,7 @@ public final class AgentClientPresentationVerification {
 				"ordinary players never inherit agent presentation");
 		assertTrue(AgentPlayerIdentity.find(snapshot, "  ").isEmpty(),
 				"blank profile names never match an agent");
-		return 10;
+		return 14;
 	}
 
 	private static void assertTrue(boolean condition, String label) {

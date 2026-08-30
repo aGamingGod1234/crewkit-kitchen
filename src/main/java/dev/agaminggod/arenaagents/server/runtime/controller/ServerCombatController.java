@@ -18,7 +18,9 @@ import java.util.Objects;
  */
 public final class ServerCombatController implements ServerController {
 	private static final double ATTACK_REACH = 3.0D;
-	private static final double PURSUIT_REPLAN_DISTANCE_SQUARED = 0.25D;
+	private static final double PURSUIT_REPLAN_DISTANCE_SQUARED = 1.0D;
+	private static final double IMMEDIATE_PURSUIT_REPLAN_DISTANCE_SQUARED = 16.0D;
+	private static final long PURSUIT_REPLAN_INTERVAL_MS = 250L;
 
 	private final Entity target;
 	private final CombatIntent intent;
@@ -26,7 +28,9 @@ public final class ServerCombatController implements ServerController {
 	private final CombatPolicy policy = new CombatPolicy();
 	private ServerNavigationController navigation;
 	private Vec3 navigationTarget;
+	private long navigationPlannedAtEpochMs;
 	private InputLease combatLease;
+	private LeasedServerInputController inputController;
 	private AgentInputStates.MotorState motorState;
 
 	public ServerCombatController(Entity target, CombatIntent intent, long startedAt) {
@@ -115,10 +119,11 @@ public final class ServerCombatController implements ServerController {
 			double targetDistance
 	) {
 		releaseCombat(player);
-		if (navigation == null || navigationTarget == null
-				|| navigationTarget.distanceToSqr(destination) > PURSUIT_REPLAN_DISTANCE_SQUARED) {
+		if (shouldReplanPursuit(
+				navigation != null, navigationTarget, destination, navigationPlannedAtEpochMs, nowEpochMs)) {
 			stopNavigation(player);
 			navigationTarget = destination;
+			navigationPlannedAtEpochMs = nowEpochMs;
 			long remainingTimeout = Math.max(1_000L, intent.timeoutMs() - Math.max(0L, nowEpochMs - startedAt));
 			navigation = new ServerNavigationController(
 					destination,
@@ -136,6 +141,21 @@ public final class ServerCombatController implements ServerController {
 		return resolveNavigationTick(result, progress(targetDistance));
 	}
 
+	static boolean shouldReplanPursuit(
+			boolean navigationActive,
+			Vec3 plannedTarget,
+			Vec3 currentTarget,
+			long plannedAtEpochMs,
+			long nowEpochMs
+	) {
+		Objects.requireNonNull(currentTarget, "currentTarget must not be null");
+		if (!navigationActive || plannedTarget == null) return true;
+		double drift = plannedTarget.distanceToSqr(currentTarget);
+		if (drift >= IMMEDIATE_PURSUIT_REPLAN_DISTANCE_SQUARED) return true;
+		return drift >= PURSUIT_REPLAN_DISTANCE_SQUARED
+				&& Math.max(0L, nowEpochMs - plannedAtEpochMs) >= PURSUIT_REPLAN_INTERVAL_MS;
+	}
+
 	static TickResult resolveNavigationTick(TickResult navigationResult, double combatProgress) {
 		Objects.requireNonNull(navigationResult, "navigationResult must not be null");
 		return navigationResult.state() == State.FAILED
@@ -150,9 +170,9 @@ public final class ServerCombatController implements ServerController {
 	}
 
 	private void applyCombatInput(ServerPlayer player, boolean attack, long nowEpochMs) {
-		LeasedServerInputController controller = AgentInputRuntime.controller(player);
 		if (combatLease == null) {
-			combatLease = controller.acquire(AgentInputRuntime.requireAgentId(player), InputOwner.COMBAT, 200);
+			inputController = AgentInputRuntime.controller(player);
+			combatLease = inputController.acquire(AgentInputRuntime.requireAgentId(player), InputOwner.COMBAT, 200);
 		}
 		Vec3 lookTarget = target.getEyePosition();
 		Vec3 delta = lookTarget.subtract(player.getEyePosition());
@@ -168,7 +188,7 @@ public final class ServerCombatController implements ServerController {
 				nowEpochMs
 		);
 		motorState = step.state();
-		controller.apply(combatLease, new dev.agaminggod.arenaagents.server.runtime.input.AgentInputState(
+		inputController.apply(combatLease, new dev.agaminggod.arenaagents.server.runtime.input.AgentInputState(
 				0.0F, 0.0F, false, false, false, attack, false,
 				step.state().yaw(), step.state().pitch(),
 				player.getInventory().getSelectedSlot(), InteractionHand.MAIN_HAND
@@ -191,11 +211,12 @@ public final class ServerCombatController implements ServerController {
 	private void releaseCombat(ServerPlayer player) {
 		if (combatLease == null) return;
 		try {
-			AgentInputRuntime.controller(player).release(combatLease);
+			inputController.release(combatLease);
 		} catch (IllegalStateException ignored) {
 			// A lifecycle clear may already have invalidated every lease.
 		}
 		combatLease = null;
+		inputController = null;
 	}
 
 	private TickResult succeeded(ServerPlayer player, String reasonCode, String message) {

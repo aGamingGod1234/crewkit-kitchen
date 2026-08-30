@@ -26,6 +26,18 @@ const PROVIDERS = new Set(['codex', 'gemini', 'kimi', 'instant', 'replay']);
 const MAX_TRIALS = 4_096;
 const MAX_REPETITIONS = 1_024;
 const MAX_METRIC_SAMPLES = 4_096;
+const DISABLED_BENCHMARK_RECORDER = Object.freeze({ record: () => null, snapshot: () => [] });
+const DISABLED_LATENCY_REGISTRY = Object.freeze({
+	record: () => null,
+	recordTracePhase: () => null,
+	recordPhase: () => null,
+	invalidateTrace: () => null,
+	completeTrace: () => Object.freeze({ complete: false, totalMs: null, phases: [] }),
+	traceSnapshot: () => [],
+	traces: () => [],
+	snapshot: () => [],
+	performanceSnapshot: () => [],
+});
 
 /** Strictly validate and freeze a latency matrix before executing it. */
 export function normalizeLatencyMatrix(value) {
@@ -78,7 +90,7 @@ export async function runLatencyMatrix(options = {}) {
 	const wallClockBasis = options.wallClock !== undefined || options.wallNow !== undefined ? 'injected_monotonic_ms' : 'process_monotonic_ms';
 	const wallClock = createMonotonicClock(options.wallClock ?? options.wallNow ?? (() => performance.now()), 'wall clock');
 	const measurementsEnabled = options.measurements !== false && options.instrumentation !== false && options.collectMetrics !== false;
-	const recorder = options.recorder ?? new BenchmarkRecorder({ maxEvents: options.maxEvents ?? 10_000, baseContext: measurementContext, clock: options.recorderClock ?? wallClock });
+	const recorder = measurementsEnabled ? options.recorder ?? new BenchmarkRecorder({ maxEvents: options.maxEvents ?? 10_000, baseContext: measurementContext, clock: options.recorderClock ?? wallClock }) : DISABLED_BENCHMARK_RECORDER;
 	const results = [];
 	let requiredFailure = null;
 	const cleanups = [];
@@ -113,6 +125,8 @@ export async function runLatencyMatrix(options = {}) {
 async function runTrial({ matrix, trial, repetition, scenarioResolver, providerFactories, recorder, measurementContext = {}, wallClock, wallClockBasis = 'process_monotonic_ms', measurementsEnabled = true, ...options }) {
 	const startedAt = performance.now();
 	const deadline = startedAt + trial.trialBudgetMs;
+	let measurementStartedAt = null;
+	const setupSpansMs = { providerStart: null, coordinatorStart: null };
 	let provider = null;
 	let coordinator = null;
 	let bridge = null;
@@ -129,9 +143,9 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 	let trialRecorder = null;
 	let scheduler = null;
 	let records = [];
-	const latencyRegistry = new ControlLatencyRegistry({ traceCap: Math.max(64, trial.agentLoad * 2) });
+	const latencyRegistry = measurementsEnabled ? new ControlLatencyRegistry({ traceCap: Math.max(64, trial.agentLoad * 2) }) : DISABLED_LATENCY_REGISTRY;
 	let systemSummary = null;
-	const metrics = new LatencyMetricsTracker({ wallClock, wallClockBasis, enabled: measurementsEnabled, maxSamples: options.maxMetricSamples, context: measurementContext });
+	const metrics = measurementsEnabled ? new LatencyMetricsTracker({ wallClock, wallClockBasis, maxSamples: options.maxMetricSamples, context: measurementContext }) : null;
 	const cleanupTimeoutMs = 1_000;
 	try {
 		const rawScenario = await runWithDeadline(() => scenarioResolver(trial.scenarioId, trial), deadline);
@@ -164,15 +178,17 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 		registerProviderCleanup();
 		if (provider === null || provider === undefined || provider.available === false) {
 			const error = coded('PROVIDER_UNAVAILABLE', boundedError(provider?.reason ?? 'provider is unavailable'));
-			result = trialResult(trial, repetition, trial.providerAvailabilityRequired ? 'FAILED' : 'SKIPPED', error, startedAt, null, null, measurementContext);
+			result = trialResult(trial, repetition, trial.providerAvailabilityRequired ? 'FAILED' : 'SKIPPED', error, startedAt, null, null, measurementContext, { measurementStartedAt, setupSpansMs });
 			return result;
 		}
 		if (trial.mode === 'replay' && !provider.createAgent) provider = createReplayProvider({ ...options, ...trial.replay, recordings: options.replayRecordings, trialId: trial.id, providerProfile: trial.providerProfile, scenario: rawScenario, prompt: trial.prompt ?? options.replayPrompt ?? 'latency-replay-prompt', protocolVersion: matrix.protocolVersion });
 		registerProviderCleanup();
 		validateProviderIdentity(provider, trial);
 		if (typeof provider.start === 'function') {
+			const providerStartedAt = performance.now();
 			try { await runWithDeadline(() => provider.start(), deadline); }
 			catch (error) { await stopProviderAfterTimeout(); throw error; }
+			finally { setupSpansMs.providerStart = Math.max(0, performance.now() - providerStartedAt); }
 		}
 
 		const goal = scenario.goal ?? `Complete ${trial.scenarioId}`;
@@ -180,7 +196,7 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 		records = scenario.agentIds.map((agentId) => ({ agentId, provider: internalProvider(trial.providerProfile.provider), model: trial.providerProfile.model, reasoningEffort: trial.providerProfile.reasoningEffort, serviceTier: trial.providerProfile.serviceTier, state: DynamicAgentState.IDLE, currentGoal: null, currentGoalSpec: null, goalRevision: 0, queue: [] }));
 		const virtualRecords = records.map((record) => ({ ...record, state: DynamicAgentState.STARTING, currentGoal: goal, currentGoalSpec: goalSpec, goalRevision: 1 }));
 		world = new VirtualWorld(scenario.world, { scheduler: manualScheduler() });
-		metrics.attachWorld(world, scenario, scenario.agentIds);
+		metrics?.attachWorld(world, scenario, scenario.agentIds);
 		initialSnapshots = new Map(scenario.agentIds.map((agentId) => [agentId, captureScenarioInitialSnapshot({ manifest: scenario.agentManifests?.[agentId] ?? rawScenario, world, agentId })]));
 		const virtual = new VirtualMinecraftBridge({ world, agentRecords: virtualRecords, serverInstanceId: `latency-${trial.id}-${repetition}` });
 		bridge = new VirtualMinecraftBridgeAdapter(virtual, records, {
@@ -188,11 +204,11 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 			initialSnapshots,
 			recordPhase: (stage, context, fields) => trialRecorder?.record(stage, context, fields),
 		});
-		metrics.attachVirtualBridge(virtual);
-		metrics.attachBridgeAdapter(bridge);
-		cleanup.push(() => metrics.close());
+		metrics?.attachVirtualBridge(virtual);
+		metrics?.attachBridgeAdapter(bridge);
+		if (metrics) cleanup.push(() => metrics.close());
 		cleanup.push(() => bridge?.stop());
-		trialRecorder = createTrialRecorder(recorder, { trial, repetition, measurementContext, metrics });
+		trialRecorder = createTrialRecorder(recorder, { trial, repetition, measurementContext, metrics, enabled: measurementsEnabled });
 		scheduler = createTrialScheduler(trial, trialRecorder, options);
 		cleanup.push(() => scheduler?.close?.('latency trial cleanup'));
 		const providerService = factory !== null ? createInjectedProviderService(provider, trial, turnBudget(trial), deadline, () => ++turnCount, stopProvider, stopProviderAfterTimeout) : null;
@@ -213,16 +229,24 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 		coordinator.on('runtimeError', runtimeListener);
 		cleanup.push(() => coordinator?.off?.('runtimeError', runtimeListener));
 		cleanup.push(() => coordinator?.stop());
-		const samplerOptions = options.systemSamplerOptions ?? {};
-		sampler = options.systemSampler
-			?? options.systemSamplerFactory?.({ ...samplerOptions, schedulerReader: options.schedulerReader ?? samplerOptions.schedulerReader ?? (() => schedulerSnapshot(scheduler)), processReader: options.processReader ?? samplerOptions.processReader, childProcessReader: options.childProcessReader ?? samplerOptions.childProcessReader ?? (() => null) })
-			?? new SystemSampler({ ...samplerOptions, schedulerReader: options.schedulerReader ?? samplerOptions.schedulerReader ?? (() => schedulerSnapshot(scheduler)), processReader: options.processReader ?? samplerOptions.processReader, childProcessReader: options.childProcessReader ?? samplerOptions.childProcessReader ?? (() => null) });
-		sampler.start();
-		sampler.sample?.();
-		cleanup.push(() => sampler?.stop());
 		const reconciled = new Promise((resolve) => coordinator.once('reconciled', resolve));
-		await runWithDeadline(() => coordinator.start(), deadline);
-		await runWithDeadline(() => reconciled, deadline);
+		const coordinatorStartedAt = performance.now();
+		try {
+			await runWithDeadline(() => coordinator.start(), deadline);
+			await runWithDeadline(() => reconciled, deadline);
+		} finally {
+			setupSpansMs.coordinatorStart = Math.max(0, performance.now() - coordinatorStartedAt);
+		}
+		if (measurementsEnabled) {
+			const samplerOptions = options.systemSamplerOptions ?? {};
+			sampler = options.systemSampler
+				?? options.systemSamplerFactory?.({ ...samplerOptions, schedulerReader: options.schedulerReader ?? samplerOptions.schedulerReader ?? (() => schedulerSnapshot(scheduler)), processReader: options.processReader ?? samplerOptions.processReader, childProcessReader: options.childProcessReader ?? samplerOptions.childProcessReader ?? (() => null) })
+				?? new SystemSampler({ ...samplerOptions, schedulerReader: options.schedulerReader ?? samplerOptions.schedulerReader ?? (() => schedulerSnapshot(scheduler)), processReader: options.processReader ?? samplerOptions.processReader, childProcessReader: options.childProcessReader ?? samplerOptions.childProcessReader ?? (() => null) });
+			sampler.start();
+			sampler.sample?.();
+			cleanup.push(() => sampler?.stop());
+		}
+		measurementStartedAt = performance.now();
 		for (const agentId of scenario.agentIds) {
 			trialRecorder.record('goal_received', { agentId, goalRevision: 1 });
 			bridge.startAgent(agentId, goal, goalSpec);
@@ -240,9 +264,9 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 		const scenarioDigest = scenarioOutcomes.length > 0 ? hash(scenarioOutcomes.map(normalizeScenarioOutcome)) : null;
 		const status = runtimeError ? (runtimeTimedOut ? 'TIMED_OUT' : 'FAILED') : registryStatus === 'PASSED' && scenarioPassed ? 'PASSED' : registryStatus === 'TIMED_OUT' ? 'TIMED_OUT' : 'FAILED';
 		const error = runtimeError ? coded(runtimeError.code, runtimeError.message) : status === 'TIMED_OUT' ? coded('TURN_CAP', `trial exceeded the ${trial.turnCap}-turn cap`) : !scenarioPassed ? coded('SCENARIO_ASSERTION_FAILED', 'authoritative scenario outcome did not satisfy its success predicate') : null;
-		metrics.markTaskCompletion({ status, agentIds: scenario.agentIds });
+		metrics?.markTaskCompletion({ status, agentIds: scenario.agentIds });
 		const outcomeHash = hash({ trialId: trial.id, repetition, status, scenarioId: trial.scenarioId, seed: trial.seed, agentLoad: trial.agentLoad, providerProfile: trial.providerProfile, statuses, turnCount, scenarioDigest });
-		result = trialResult(trial, repetition, status, error, startedAt, outcomeHash, cleanupSnapshot(bridge, sampler), measurementContext);
+		result = trialResult(trial, repetition, status, error, startedAt, outcomeHash, cleanupSnapshot(bridge, sampler), measurementContext, { measurementStartedAt, setupSpansMs });
 		result.benchmark = { eventCount: trialRecorder?.count ?? 0, traces: latencyRegistry.traceSnapshot() };
 		result.debug = { statuses, turnCount, runtimeErrors, scenarioPassed, scenarioDigest, scenarioEvidence: scenarioEvidence(virtual, scenario.agentIds), actionCommandHash: hash(authoritativeCommands(virtual)) };
 	} catch (error) {
@@ -253,7 +277,7 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 			const runtimeError = providerError ?? runtimeErrors.find((entry) => entry.code && !['TRIAL_TIMEOUT'].includes(entry.code));
 			if (runtimeError) typed = coded(runtimeError.code, runtimeError.message);
 		}
-		result = trialResult(trial, repetition, isTimeoutErrorCode(typed.code) ? 'TIMED_OUT' : 'FAILED', typed, startedAt, null, cleanupSnapshot(bridge, sampler), measurementContext);
+		result = trialResult(trial, repetition, isTimeoutErrorCode(typed.code) ? 'TIMED_OUT' : 'FAILED', typed, startedAt, null, cleanupSnapshot(bridge, sampler), measurementContext, { measurementStartedAt, setupSpansMs });
 		result.benchmark = { eventCount: trialRecorder?.count ?? 0, traces: latencyRegistry.traceSnapshot() };
 		result.debug = {
 			runtimeErrors,
@@ -271,7 +295,7 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 			try { systemSummary = summarizeTrialSystem(sampler); } catch { systemSummary = null; }
 			result.cleanup = cleanupSnapshot(bridge, sampler, cleanupErrors);
 			result.systemSummary = systemSummary;
-			result.metrics = metrics.finalize({ world, agentIds: world?.agentIds ?? [] });
+			result.metrics = metrics?.finalize({ world, agentIds: world?.agentIds ?? [] }) ?? null;
 			if (!result.cleanup.ok) {
 				result.status = 'FAILED';
 				result.error = { code: 'CLEANUP_FAILED', message: 'trial cleanup left resources or reported an error' };
@@ -481,6 +505,8 @@ class LatencyMetricsTracker {
 	#planning = new Map();
 	#baseline = new Map();
 	#seenConversationEvents = new Set();
+	#conversationCursor = 0;
+	#conversationPollPending = false;
 	#tickDurations = [];
 	#taskCompletion = null;
 	#lastTimestamp = null;
@@ -541,7 +567,7 @@ class LatencyMetricsTracker {
 		const durationMs = Math.max(0, endedAt - startedAt);
 		const tick = Number.isSafeInteger(world?.tickCount) ? world.tickCount : this.#raw.ticks.length + 1;
 		const virtualTimestampMs = finiteOrNull(world?.timeMs);
-		this.#push(this.#raw.ticks, { tick, wallDurationMs: durationMs, cpuWallDurationMs: durationMs, virtualTimestampMs });
+		this.#push(this.#raw.ticks, { tick, wallDurationMs: durationMs, virtualTimestampMs });
 		this.#push(this.#tickDurations, durationMs);
 		this.#observeWorld(world, endedAt, virtualTimestampMs);
 	}
@@ -657,6 +683,7 @@ class LatencyMetricsTracker {
 		this.#push(this.#raw.actionCommandAcceptance, value);
 		if (!this.#acceptances.has(agentId)) this.#acceptances.set(agentId, value);
 		if (isPhysicalMovementAction(value.actionType)) this.#movementActions.set(agentId, { ...value, completedTick: null });
+		if (value.actionType === 'chat' && this.#declaredEvents().some((event) => /message|agent_message|direct/i.test(String(event?.kind ?? event?.type ?? '')))) this.#conversationPollPending = true;
 		this.#advancePlanning(agentId, wallTimestampMs, true);
 		this.#recordReaction(agentId, value);
 	}
@@ -697,7 +724,14 @@ class LatencyMetricsTracker {
 			if (movement?.completedTick !== null && movement?.completedTick !== world?.tickCount) this.#movementActions.delete(agentId);
 			this.#observeDeclaredEvents(agentId, state, wallTimestampMs, virtualTimestampMs, initial);
 		}
-		for (const event of world?.conversationEvents?.() ?? []) {
+		if (this.#conversationPollPending) this.#observeConversationEvents(world, wallTimestampMs, virtualTimestampMs);
+	}
+
+	#observeConversationEvents(world, wallTimestampMs, virtualTimestampMs) {
+		const conversationHistory = world?.conversationEvents?.() ?? [];
+		const newConversationEvents = Array.isArray(conversationHistory) ? conversationHistory.slice(this.#conversationCursor) : [];
+		this.#conversationCursor += newConversationEvents.length;
+		for (const event of newConversationEvents) {
 			if (!event?.eventId || this.#seenConversationEvents.has(event.eventId)) continue;
 			const declared = this.#declaredEvent(event.eventId, event.kind ?? event.type);
 			if (!declared || !/message|agent_message|direct/i.test(String(declared.kind ?? declared.type ?? event.kind ?? event.type))) continue;
@@ -707,6 +741,8 @@ class LatencyMetricsTracker {
 			this.#directMessages.set(event.eventId, value);
 			this.#push(this.#raw.directMessageReaction, { ...value, reactionWallLatencyMs: null, reactionVirtualLatencyMs: null });
 		}
+		const declaredMessageIds = this.#declaredEvents().filter((event) => /message|agent_message|direct/i.test(String(event?.kind ?? event?.type ?? ''))).map((event) => event?.eventId).filter(Boolean);
+		this.#conversationPollPending = declaredMessageIds.some((eventId) => !this.#seenConversationEvents.has(eventId));
 	}
 
 	#observeDeclaredEvents(agentId, state, wallTimestampMs, virtualTimestampMs, initial) {
@@ -840,11 +876,8 @@ function summarizeTickDurations(values, rawTicks) {
 	const maxMs = sorted.length === 0 ? null : sorted.at(-1);
 	return {
 		count: sorted.length,
+		basis: 'monotonic_wall_duration_ms',
 		wallDurationSamplesMs: rawTicks.map((row) => row.wallDurationMs),
-		cpuWallDurationP50Ms: percentile(sorted, 0.50),
-		cpuWallDurationP95Ms: percentile(sorted, 0.95),
-		cpuWallDurationP99Ms: percentile(sorted, 0.99),
-		cpuWallDurationMaxMs: maxMs,
 		p50Ms: percentile(sorted, 0.50),
 		p95Ms: percentile(sorted, 0.95),
 		p99Ms: percentile(sorted, 0.99),
@@ -1088,7 +1121,8 @@ function runWithDeadline(task, deadline, code = 'TRIAL_TIMEOUT') {
 	if (remaining <= 0) return Promise.reject(coded(code, 'trial deadline elapsed'));
 	return withTimeout(Promise.resolve().then(task), remaining, code);
 }
-function createTrialRecorder(recorder, { trial, repetition, measurementContext = {}, metrics = null }) {
+function createTrialRecorder(recorder, { trial, repetition, measurementContext = {}, metrics = null, enabled = true }) {
+	if (!enabled) return DISABLED_BENCHMARK_RECORDER;
 	let count = 0;
 	return {
 		record(stage, context = {}, fields = {}) {
@@ -1220,7 +1254,28 @@ function cleanupSnapshot(bridge, sampler, cleanupErrors = []) {
 	const samplerErrors = sampler?.errors?.length ?? 0;
 	return { ok: activeActions === 0 && listeners === 0 && relays === 0 && pendingObservations === 0 && !samplerActive && cleanupErrors.length === 0, activeActions, listeners, relays, pendingObservations, samplerActive, samplerErrors, errors: cleanupErrors.slice(0, 16) };
 }
-function trialResult(trial, repetition, status, error, startedAt, outcomeHash, cleanup, context = {}) { return { ...context, trialId: trial.id, repetition, status, scenarioId: trial.scenarioId, seed: trial.seed, agentLoad: trial.agentLoad, mode: trial.mode, providerProfile: trial.providerProfile, providerIdentity: { provider: trial.providerProfile.provider, synthetic: trial.mode !== 'live' }, ...(outcomeHash ? { outcomeHash } : {}), ...(error ? { error: { code: sanitizeDiagnosticErrorCode(error, { fallback: 'TRIAL_FAILED' }), message: boundedError(error) } } : {}), cleanup: cleanup ?? { ok: true, activeActions: 0, listeners: 0 }, durationMs: Math.max(0, Math.round(performance.now() - startedAt)) }; }
+function trialResult(trial, repetition, status, error, startedAt, outcomeHash, cleanup, context = {}, timing = {}) {
+	const endedAt = performance.now();
+	const measurementStartedAt = Number.isFinite(timing.measurementStartedAt) ? timing.measurementStartedAt : null;
+	const setupSpansMs = isRecord(timing.setupSpansMs) ? timing.setupSpansMs : {};
+	return {
+		...context,
+		trialId: trial.id, repetition, status, scenarioId: trial.scenarioId, seed: trial.seed, agentLoad: trial.agentLoad, mode: trial.mode,
+		providerProfile: trial.providerProfile, providerIdentity: { provider: trial.providerProfile.provider, synthetic: trial.mode !== 'live' },
+		...(outcomeHash ? { outcomeHash } : {}),
+		...(error ? { error: { code: sanitizeDiagnosticErrorCode(error, { fallback: 'TRIAL_FAILED' }), message: boundedError(error) } } : {}),
+		cleanup: cleanup ?? { ok: true, activeActions: 0, listeners: 0 },
+		timingScope: 'full_path',
+		durationMs: Math.max(0, Math.round(endedAt - startedAt)),
+		taskDurationMs: measurementStartedAt === null ? null : Math.max(0, Math.round(endedAt - measurementStartedAt)),
+		setupDurationMs: Math.max(0, Math.round((measurementStartedAt ?? endedAt) - startedAt)),
+		totalDurationMs: Math.max(0, Math.round(endedAt - startedAt)),
+		setupSpansMs: {
+			providerStart: finiteOrNull(setupSpansMs.providerStart),
+			coordinatorStart: finiteOrNull(setupSpansMs.coordinatorStart),
+		},
+	};
+}
 function cleanupError() { return null; }
 async function writeArtifacts(directory, output, recorder, artifactFs = {}) {
 	const fs = { mkdir, rename, rm, writeFile, ...artifactFs };

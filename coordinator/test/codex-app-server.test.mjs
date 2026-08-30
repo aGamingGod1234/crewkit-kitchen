@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -185,6 +185,30 @@ test('reuses a complete private desktop runtime before any Windows package disco
 		assert.equal(launch.command, path.join(cachedRuntime, 'codex.exe'));
 		assert.equal(discoveryCalls, 0);
 		assert.deepEqual(launch.args, buildCodexArgs(config));
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test('desktop runtime selection observes cache upgrades and rejects incomplete versions', () => {
+	const root = mkdtempSync(path.join(tmpdir(), 'arena-codex-cache-generation-'));
+	try {
+		const localAppData = path.join(root, 'Local');
+		const firstRuntime = path.join(localAppData, 'ArenaAgents', 'codex-runtime', '26.818.8289.0');
+		const upgradedRuntime = path.join(localAppData, 'ArenaAgents', 'codex-runtime', '26.819.1.0');
+		writeDesktopRuntime(firstRuntime, 'first-runtime');
+		const dependencies = {
+			platform: 'win32',
+			env: { LOCALAPPDATA: localAppData },
+			spawnSync: () => { throw new Error('complete cache must avoid package discovery'); },
+		};
+
+		assert.equal(resolveCodexLaunch(config, dependencies).command, path.join(firstRuntime, 'codex.exe'));
+		writeDesktopRuntime(upgradedRuntime, 'upgraded-runtime');
+		assert.equal(resolveCodexLaunch(config, dependencies).command, path.join(upgradedRuntime, 'codex.exe'));
+
+		unlinkSync(path.join(upgradedRuntime, 'codex-command-runner.exe'));
+		assert.equal(resolveCodexLaunch(config, dependencies).command, path.join(firstRuntime, 'codex.exe'));
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

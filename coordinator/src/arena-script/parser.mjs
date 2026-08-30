@@ -6,6 +6,7 @@ import {
 	normalizeArenaScriptLimits,
 } from './limits.mjs';
 import { PLAYER_MEMBER_PRIMITIVES, SCRIPT_API_CALL_PATHS } from './minecraft-api.mjs';
+import { FACT_DOMAIN } from './fact-domains.mjs';
 
 const ALLOWED_GLOBALS = new Set([
 	'program',
@@ -131,6 +132,7 @@ function validateProgram(ast, limits) {
 		policyCount: 0,
 		unhandledPolicy: null,
 		watcherCount: 0,
+		watchers: [],
 		primitiveCalls: new Set(),
 		userDeclarations: new Set(),
 		functionBindingsByNode: new WeakMap(),
@@ -153,6 +155,7 @@ function validateProgram(ast, limits) {
 		stepLocations: createFrozenMap(state.stepLocations),
 		unhandledPolicy: state.unhandledPolicy,
 		watcherCount: state.watcherCount,
+		watchers: state.watchers,
 		primitiveCalls: Object.freeze([...state.primitiveCalls].sort()),
 	};
 }
@@ -534,6 +537,62 @@ function validateWatcher(node, state, context) {
 	}
 	validatePureCondition(node.arguments[0]);
 	validateWatcherHandler(node.arguments[2], state, context.scope);
+	state.watchers.push(Object.freeze({
+		id: `watcher-${state.watcherCount - 1}`,
+		mode,
+		factDependencyMask: watcherFactDependencyMask(node.arguments[0]),
+	}));
+}
+
+function watcherFactDependencyMask(condition) {
+	let mask = 0;
+	let dependsOnRuntimeState = false;
+	const visit = (node) => {
+		if (!node || typeof node !== 'object' || dependsOnRuntimeState) return;
+		if (Array.isArray(node)) {
+			for (const child of node) visit(child);
+			return;
+		}
+		if (isFunctionNode(node)) {
+			if (node.params.length > 0) dependsOnRuntimeState = true;
+			visit(node.body);
+			return;
+		}
+		if (node.type === 'CallExpression') {
+			const path = staticMemberPath(node.callee)?.join('.') ?? null;
+			switch (path) {
+				case 'player.state': mask |= FACT_DOMAIN.player; break;
+				case 'world.items': mask |= FACT_DOMAIN.worldItems; break;
+				case 'world.entities': mask |= FACT_DOMAIN.worldEntities; break;
+				case 'world.blocks': mask |= FACT_DOMAIN.worldBlocks; break;
+				case 'inventory.count': mask |= FACT_DOMAIN.inventoryItems; break;
+				case 'inventory.countTag': mask |= FACT_DOMAIN.inventoryTagCounts; break;
+				case 'world.nearest': mask |= FACT_DOMAIN.player; break;
+				default: dependsOnRuntimeState = true; return;
+			}
+			visit(node.arguments);
+			return;
+		}
+		if (node.type === 'MemberExpression') {
+			visit(node.object);
+			if (node.computed) visit(node.property);
+			return;
+		}
+		if (node.type === 'Property') {
+			if (node.computed) visit(node.key);
+			visit(node.value);
+			return;
+		}
+		if (node.type === 'Identifier' || node.type === 'VariableDeclarator' || node.type === 'FunctionDeclaration') {
+			dependsOnRuntimeState = true;
+			return;
+		}
+		for (const [key, value] of Object.entries(node)) {
+			if (key !== 'loc' && key !== 'start' && key !== 'end' && key !== 'type') visit(value);
+		}
+	};
+	visit(condition);
+	return dependsOnRuntimeState ? null : mask;
 }
 
 const WATCHER_FORBIDDEN_PATHS = new Set([

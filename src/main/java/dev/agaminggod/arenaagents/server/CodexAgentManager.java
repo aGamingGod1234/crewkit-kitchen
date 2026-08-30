@@ -71,7 +71,6 @@ public final class CodexAgentManager {
 	private static final Map<MinecraftServer, CodexAgentManager> INSTANCES = new WeakHashMap<>();
 	private static final int AGENT_TICKET_RADIUS = 2;
 	private static final long PLAYER_SPAWN_TIMEOUT_MS = 10_000L;
-	private static final long VANILLA_DEATH_REMOVAL_GRACE_MS = 1_000L;
 	private static final long RECOVERY_RETRY_DELAY_MS = 30_000L;
 	private static final long CANCELLED_SPAWN_RETENTION_MS = 120_000L;
 	private static final String HIDDEN_AGENT_TEAM = "arenaagents_hidden";
@@ -488,10 +487,15 @@ public final class CodexAgentManager {
 			OfflineAgentPlayers.VanillaRespawnTarget target = OfflineAgentPlayers.resolveVanillaRespawn(server, death);
 			long now = System.currentTimeMillis();
 			VanillaRespawnAttempt attempt = new VanillaRespawnAttempt(
-					record, target, now + VANILLA_DEATH_REMOVAL_GRACE_MS, now + PLAYER_SPAWN_TIMEOUT_MS);
+					record, target, now + PLAYER_SPAWN_TIMEOUT_MS);
 			Optional<ServerPlayer> existing = findAgentPlayer(record.agentId());
 			if (existing.isPresent()) {
-				AgentInputRuntime.clear(server, record.agentId());
+				ServerPlayer player = existing.orElseThrow();
+				if (AgentRespawnSpawnPolicy.existingPlayerAction(player.isAlive())
+						== AgentRespawnSpawnPolicy.ExistingPlayerAction.REMOVE_STALE_PLAYER) {
+					AgentInputRuntime.clear(server, record.agentId());
+					OfflineAgentPlayers.remove(player);
+				}
 				pendingPlayerSpawns.put(record.agentId(), attempt.deadlineEpochMs());
 			} else {
 				requestVanillaRespawnPlayer(attempt, now);
@@ -509,11 +513,6 @@ public final class CodexAgentManager {
 			throw new AgentDomainException("STALE_RESPAWN_ATTEMPT", "Dead lifecycle changed during respawn");
 		}
 		Optional<ServerPlayer> found = findAgentPlayer(attempt.deadRecord().agentId());
-		if (!attempt.spawnRequested && found.isPresent() && nowEpochMs >= attempt.removalGraceDeadlineEpochMs) {
-			OfflineAgentPlayers.remove(found.orElseThrow());
-			attempt.deadlineEpochMs = nowEpochMs + PLAYER_SPAWN_TIMEOUT_MS;
-			return false;
-		}
 		AgentRespawnSpawnPolicy.Decision decision = AgentRespawnSpawnPolicy.decide(
 				attempt.spawnRequested, found.isPresent(), nowEpochMs, attempt.deadlineEpochMs()
 		);
@@ -613,7 +612,6 @@ public final class CodexAgentManager {
 	public static final class VanillaRespawnAttempt {
 		private final AgentRecord deadRecord;
 		private final OfflineAgentPlayers.VanillaRespawnTarget target;
-		private final long removalGraceDeadlineEpochMs;
 		private long deadlineEpochMs;
 		private boolean spawnRequested;
 		private ServerPlayer verifiedPlayer;
@@ -621,12 +619,10 @@ public final class CodexAgentManager {
 		private VanillaRespawnAttempt(
 				AgentRecord deadRecord,
 				OfflineAgentPlayers.VanillaRespawnTarget target,
-				long removalGraceDeadlineEpochMs,
 				long deadlineEpochMs
 		) {
 			this.deadRecord = deadRecord;
 			this.target = target;
-			this.removalGraceDeadlineEpochMs = removalGraceDeadlineEpochMs;
 			this.deadlineEpochMs = deadlineEpochMs;
 		}
 
@@ -706,7 +702,8 @@ public final class CodexAgentManager {
 					recoveryRecord = disconnected.after();
 				}
 				if (recoveryAttempted) continue;
-				recoveryAttempted = recoverOfflinePlayer(recoveryTarget, now);
+				recoveryAttempted = true;
+				recoverOfflinePlayer(recoveryTarget, now);
 			}
 		}
 	}

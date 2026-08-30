@@ -37,6 +37,7 @@ export class ModelCatalogCache {
 	#source = null;
 	#failureCount = 0;
 	#failureCode = null;
+	#builtinModels = [];
 
 	constructor(loader, { ttlMs = DEFAULT_CATALOG_TTL_MS, now = Date.now, builtinModels = [], refreshTimeoutMs = DEFAULT_REFRESH_TIMEOUT_MS, scheduleTimeout = setTimeout, cancelTimeout = clearTimeout } = {}) {
 		if (typeof loader !== 'function') throw new TypeError('model catalog loader must be a function');
@@ -52,7 +53,8 @@ export class ModelCatalogCache {
 		this.#cancelTimeout = cancelTimeout;
 		if (!Array.isArray(builtinModels)) throw new TypeError('catalog builtinModels must be an array');
 		if (builtinModels.length > 0) {
-			this.#models = normalizeCatalog(builtinModels);
+			this.#builtinModels = normalizeCatalog(builtinModels);
+			this.#models = this.#builtinModels;
 			this.#source = 'builtin';
 		}
 	}
@@ -78,7 +80,7 @@ export class ModelCatalogCache {
 				if (generation !== this.#refreshGeneration) throw new ModelCatalogError('STALE_CATALOG_REFRESH', 'Model catalog refresh was superseded');
 				const normalized = normalizeCatalog(models);
 				if (normalized.length === 0) throw new ModelCatalogError('INVALID_CATALOG', 'Model catalog must contain at least one visible model');
-				this.#models = normalized;
+				this.#models = mergeRequiredModels(normalized, this.#builtinModels);
 				this.#refreshedAtEpochMs = this.#now();
 				this.#source = 'live';
 				this.#failureCount = 0;
@@ -136,6 +138,29 @@ export class ModelCatalogCache {
 		}
 		return { valid, invalid };
 	}
+}
+
+function mergeRequiredModels(models, requiredModels) {
+	const merged = models.map((model) => ({ ...model }));
+	for (const required of requiredModels) {
+		const index = merged.findIndex((model) => model.id === required.id || model.model === required.model);
+		if (index < 0) {
+			merged.push({ ...required });
+			continue;
+		}
+		const discovered = merged[index];
+		merged[index] = {
+			...discovered,
+			reasoningEfforts: orderValues(
+				[...new Set([...discovered.reasoningEfforts, ...required.reasoningEfforts])],
+				PREFERRED_REASONING_EFFORTS,
+			),
+			serviceTiers: discovered.serviceTiers.length === 0
+				? []
+				: orderValues([...new Set([...discovered.serviceTiers, ...required.serviceTiers])], PREFERRED_SERVICE_TIERS),
+		};
+	}
+	return orderModels(merged);
 }
 
 export function normalizeCatalog(value) {

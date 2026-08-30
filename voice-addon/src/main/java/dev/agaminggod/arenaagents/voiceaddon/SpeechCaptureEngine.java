@@ -23,7 +23,9 @@ final class SpeechCaptureEngine implements AutoCloseable {
 	private static final long MAX_DECODER_RETRY_NANOS = TimeUnit.SECONDS.toNanos(30L);
 	private final Transcriber transcriber;
 	private final ScheduledExecutorService scheduler;
-	private final long silenceMilliseconds;
+	private final long minimumSilenceMilliseconds;
+	private final long maximumSilenceMilliseconds;
+	private final int adaptiveAfterSamples;
 	private final int maxSamples;
 	private final Consumer<InputLatency> latencyObserver;
 	private final LongSupplier monotonicNanos;
@@ -45,7 +47,8 @@ final class SpeechCaptureEngine implements AutoCloseable {
 			long silenceMilliseconds,
 			int maxSamples
 	) {
-		this(transcriber, scheduler, silenceMilliseconds, maxSamples, ignored -> { }, System::nanoTime);
+		this(transcriber, scheduler, silenceMilliseconds, silenceMilliseconds, Integer.MAX_VALUE,
+				maxSamples, ignored -> { }, System::nanoTime);
 	}
 
 	SpeechCaptureEngine(
@@ -55,7 +58,8 @@ final class SpeechCaptureEngine implements AutoCloseable {
 			int maxSamples,
 			Consumer<InputLatency> latencyObserver
 	) {
-		this(transcriber, scheduler, silenceMilliseconds, maxSamples, latencyObserver, System::nanoTime);
+		this(transcriber, scheduler, silenceMilliseconds, silenceMilliseconds, Integer.MAX_VALUE,
+				maxSamples, latencyObserver, System::nanoTime);
 	}
 
 	SpeechCaptureEngine(
@@ -66,11 +70,46 @@ final class SpeechCaptureEngine implements AutoCloseable {
 			Consumer<InputLatency> latencyObserver,
 			LongSupplier monotonicNanos
 	) {
+		this(transcriber, scheduler, silenceMilliseconds, silenceMilliseconds, Integer.MAX_VALUE,
+				maxSamples, latencyObserver, monotonicNanos);
+	}
+
+	SpeechCaptureEngine(
+			Transcriber transcriber,
+			ScheduledExecutorService scheduler,
+			long minimumSilenceMilliseconds,
+			long maximumSilenceMilliseconds,
+			int adaptiveAfterSamples,
+			int maxSamples,
+			Consumer<InputLatency> latencyObserver
+	) {
+		this(transcriber, scheduler, minimumSilenceMilliseconds, maximumSilenceMilliseconds,
+				adaptiveAfterSamples, maxSamples, latencyObserver, System::nanoTime);
+	}
+
+	SpeechCaptureEngine(
+			Transcriber transcriber,
+			ScheduledExecutorService scheduler,
+			long minimumSilenceMilliseconds,
+			long maximumSilenceMilliseconds,
+			int adaptiveAfterSamples,
+			int maxSamples,
+			Consumer<InputLatency> latencyObserver,
+			LongSupplier monotonicNanos
+	) {
 		this.transcriber = Objects.requireNonNull(transcriber, "transcriber must not be null");
 		this.scheduler = Objects.requireNonNull(scheduler, "scheduler must not be null");
-		if (silenceMilliseconds < 1L) throw new IllegalArgumentException("silenceMilliseconds must be positive");
+		if (minimumSilenceMilliseconds < 1L) {
+			throw new IllegalArgumentException("minimumSilenceMilliseconds must be positive");
+		}
+		if (maximumSilenceMilliseconds < minimumSilenceMilliseconds) {
+			throw new IllegalArgumentException("maximumSilenceMilliseconds must not be less than its minimum");
+		}
+		if (adaptiveAfterSamples < 1) throw new IllegalArgumentException("adaptiveAfterSamples must be positive");
 		if (maxSamples < 1) throw new IllegalArgumentException("maxSamples must be positive");
-		this.silenceMilliseconds = silenceMilliseconds;
+		this.minimumSilenceMilliseconds = minimumSilenceMilliseconds;
+		this.maximumSilenceMilliseconds = maximumSilenceMilliseconds;
+		this.adaptiveAfterSamples = adaptiveAfterSamples;
 		this.maxSamples = maxSamples;
 		this.latencyObserver = Objects.requireNonNull(latencyObserver, "latencyObserver must not be null");
 		this.monotonicNanos = Objects.requireNonNull(monotonicNanos, "monotonicNanos must not be null");
@@ -132,13 +171,17 @@ final class SpeechCaptureEngine implements AutoCloseable {
 				long timeoutEpoch = ++utterance.timeoutEpoch;
 				utterance.timeout = scheduler.schedule(
 						() -> finishIfCurrent(playerId, current, timeoutEpoch),
-						silenceMilliseconds,
+						endpointDelayMilliseconds(utterance.length),
 						TimeUnit.MILLISECONDS
 				);
 				if (utterance.length >= maxSamples) completed.add(finishLocked(playerId, utterance));
 			}
 		}
 		for (CompletedUtterance utterance : completed) transcribe(utterance);
+	}
+
+	private long endpointDelayMilliseconds(int samples) {
+		return samples >= adaptiveAfterSamples ? minimumSilenceMilliseconds : maximumSilenceMilliseconds;
 	}
 
 	private void recordDecoderFailureLocked(UUID playerId, long now) {

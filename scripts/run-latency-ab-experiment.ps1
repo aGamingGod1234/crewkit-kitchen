@@ -26,7 +26,7 @@ param(
     [ValidateRange(1, 16)]
     [int] $BaselinePlanningConcurrency = 16,
     [ValidateRange(1, 16)]
-    [int] $OptimizedPlanningConcurrency = 4,
+    [int] $OptimizedPlanningConcurrency = 16,
     [ValidateRange(0, 16)]
     [int] $FixedPlanningConcurrency = 0,
     [AllowNull()]
@@ -76,6 +76,10 @@ function Get-OptionalProperty {
         [Parameter(Mandatory = $true)] [string] $Name
     )
     if ($null -eq $Object) { return $null }
+    if ($Object -is [System.Collections.IDictionary]) {
+        if (-not $Object.Contains($Name)) { return $null }
+        return $Object[$Name]
+    }
     $property = $Object.PSObject.Properties[$Name]
     if ($null -eq $property) { return $null }
     return $property.Value
@@ -750,26 +754,6 @@ function Invoke-RunnerProcess {
         StdoutOverflow = $false
         StderrOverflow = $false
     })
-    $stdoutHandler = [Diagnostics.DataReceivedEventHandler] {
-        param($sender, $eventArgs)
-        if ($null -eq $eventArgs.Data) { return }
-        $line = $eventArgs.Data + [Environment]::NewLine
-        $bytes = [Text.Encoding]::UTF8.GetByteCount($line)
-        if (($state.StdoutBytes + $bytes) -gt $OutputLimit) { $state.StdoutOverflow = $true; return }
-        [Threading.Monitor]::Enter($stdout)
-        try { [void]$stdout.Append($line); $state.StdoutBytes += $bytes }
-        finally { [Threading.Monitor]::Exit($stdout) }
-    }
-    $stderrHandler = [Diagnostics.DataReceivedEventHandler] {
-        param($sender, $eventArgs)
-        if ($null -eq $eventArgs.Data) { return }
-        $line = $eventArgs.Data + [Environment]::NewLine
-        $bytes = [Text.Encoding]::UTF8.GetByteCount($line)
-        if (($state.StderrBytes + $bytes) -gt $OutputLimit) { $state.StderrOverflow = $true; return }
-        [Threading.Monitor]::Enter($stderr)
-        try { [void]$stderr.Append($line); $state.StderrBytes += $bytes }
-        finally { [Threading.Monitor]::Exit($stderr) }
-    }
     $process = New-Object Diagnostics.Process
     $startInfo = New-Object Diagnostics.ProcessStartInfo
     $startInfo.FileName = $CommandPlan.Executable
@@ -780,8 +764,6 @@ function Invoke-RunnerProcess {
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
     $process.StartInfo = $startInfo
-    $process.add_OutputDataReceived($stdoutHandler)
-    $process.add_ErrorDataReceived($stderrHandler)
     $startedAt = [DateTime]::UtcNow
     $tracked = New-Object 'System.Collections.Generic.List[int]'
     $timedOut = $false
@@ -792,15 +774,43 @@ function Invoke-RunnerProcess {
         try { $null = $process.Start() }
         catch { $startError = $_.Exception.Message; return [pscustomobject]@{ Started = $false; ExitCode = $null; TimedOut = $false; Stdout = ''; Stderr = ''; StdoutOverflow = $false; StderrOverflow = $false; Cleanup = [pscustomobject]@{ Ok = $true; Remaining = @(); Tracked = @() }; Error = $startError; DurationMs = 0 } }
         $tracked.Add($process.Id) | Out-Null
-        $process.BeginOutputReadLine()
-        $process.BeginErrorReadLine()
-        while (-not $process.HasExited) {
-            foreach ($childId in @(Get-DescendantProcessIds -RootProcessId $process.Id)) {
-                if (-not $tracked.Contains($childId)) { $tracked.Add($childId) | Out-Null }
+        # DataReceived scriptblock delegates are unreliable in Windows
+        # PowerShell 5.1 after a short-lived child exits. Poll both asynchronous
+        # readers on this runspace so the final JSON line is always drained.
+        $stdoutDone = $false
+        $stderrDone = $false
+        $stdoutTask = $process.StandardOutput.ReadLineAsync()
+        $stderrTask = $process.StandardError.ReadLineAsync()
+        while ($true) {
+            while (-not $stdoutDone -and $stdoutTask.IsCompleted) {
+                $line = $stdoutTask.GetAwaiter().GetResult()
+                if ($null -eq $line) { $stdoutDone = $true; break }
+                $textLine = $line + [Environment]::NewLine
+                $bytes = [Text.Encoding]::UTF8.GetByteCount($textLine)
+                if (($state.StdoutBytes + $bytes) -gt $OutputLimit) { $state.StdoutOverflow = $true; break }
+                [void]$stdout.Append($textLine)
+                $state.StdoutBytes += $bytes
+                $stdoutTask = $process.StandardOutput.ReadLineAsync()
+            }
+            while (-not $stderrDone -and $stderrTask.IsCompleted) {
+                $line = $stderrTask.GetAwaiter().GetResult()
+                if ($null -eq $line) { $stderrDone = $true; break }
+                $textLine = $line + [Environment]::NewLine
+                $bytes = [Text.Encoding]::UTF8.GetByteCount($textLine)
+                if (($state.StderrBytes + $bytes) -gt $OutputLimit) { $state.StderrOverflow = $true; break }
+                [void]$stderr.Append($textLine)
+                $state.StderrBytes += $bytes
+                $stderrTask = $process.StandardError.ReadLineAsync()
             }
             if ($state.StdoutOverflow -or $state.StderrOverflow) { break }
+            if ($process.HasExited -and $stdoutDone -and $stderrDone) { break }
+            if (-not $process.HasExited) {
+                foreach ($childId in @(Get-DescendantProcessIds -RootProcessId $process.Id)) {
+                    if (-not $tracked.Contains($childId)) { $tracked.Add($childId) | Out-Null }
+                }
+            }
             if (([DateTime]::UtcNow - $startedAt).TotalSeconds -ge $TimeoutSeconds) { $timedOut = $true; break }
-            Start-Sleep -Milliseconds 25
+            Start-Sleep -Milliseconds 10
         }
         if ($timedOut -or $state.StdoutOverflow -or $state.StderrOverflow) {
             $cleanup = Stop-TrackedProcessTree -RootProcessId $process.Id -TrackedProcessIds @($tracked.ToArray()) -ForceRoot
@@ -814,8 +824,6 @@ function Invoke-RunnerProcess {
         if ($process.HasExited) { $exitCode = $process.ExitCode }
     }
     finally {
-        try { $process.remove_OutputDataReceived($stdoutHandler) } catch { }
-        try { $process.remove_ErrorDataReceived($stderrHandler) } catch { }
         $process.Dispose()
     }
     return [pscustomobject]@{
@@ -913,13 +921,13 @@ function Assert-RunnerResult {
         [object[]] $trialItems = @($trials)
         if ($trialItems.Count -eq 0 -or $trialItems.Count -gt 256) { throw 'Runner aggregate result trials array is outside the bounded range.' }
         $expectedRunnerId = [string]$Context.RunnerTrialId
+        $metadataTrialId = Get-OptionalProperty $metadata 'trialId'
+        if ($null -eq $metadataTrialId -or [string]$metadataTrialId -ne $expectedRunnerId) { throw 'Runner result metadata trial identity does not match the invocation.' }
         $matching = @($trialItems | Where-Object {
             $trialId = Get-OptionalProperty $_ 'trialId'
             $null -ne $trialId -and ([string]$trialId -eq $expectedRunnerId -or [string]$trialId -eq [string]$Context.TrialId)
         })
-        if ($matching.Count -ne 1) { throw "Runner aggregate result does not contain exactly one matching trial: $expectedRunnerId." }
-        $trial = $matching[0]
-        if (-not (Test-PlainObject $trial)) { throw 'Runner aggregate result trial must be a JSON object.' }
+        if ($matching.Count -eq 0 -or $matching.Count -ne $trialItems.Count) { throw "Runner aggregate result contains missing or mixed trial identities: $expectedRunnerId." }
         $metadataArm = Get-OptionalProperty $metadata 'arm'
         if ($null -eq $metadataArm -or ([string]$metadataArm).Trim().ToLowerInvariant() -ne [string]$Context.Arm) { throw "Runner result arm does not match $($Context.Arm)." }
         $metadataRunId = Get-OptionalProperty $metadata 'runId'
@@ -932,19 +940,36 @@ function Assert-RunnerResult {
         $metadataConcurrency = Get-OptionalProperty $metadata 'planningConcurrency'
         if ($null -eq $metadataConcurrency -or [int]$metadataConcurrency -ne [int]$Context.PlanningConcurrency) { throw 'Runner result planning concurrency does not match the invocation.' }
         $rootCleanup = Assert-ResultCleanup -Cleanup (Get-OptionalProperty $Result 'cleanup') -Label 'root'
-        $trialCleanup = Get-OptionalProperty $trial 'cleanup'
-        if ($null -ne $trialCleanup) { $null = Assert-ResultCleanup -Cleanup $trialCleanup -Label 'trial' }
         $statusValue = Get-OptionalProperty $Result 'status'
         if ($null -eq $statusValue) { throw 'Runner aggregate result status is required.' }
         $status = Normalize-ResultStatus ([string]$statusValue)
-        $trialStatusValue = Get-OptionalProperty $trial 'status'
-        if ($null -eq $trialStatusValue) { throw 'Runner aggregate trial status is required.' }
-        $trialStatus = Normalize-ResultStatus ([string]$trialStatusValue)
-        if ($status -eq 'PASSED' -and $trialStatus -notin @('PASSED', 'SKIPPED')) { throw 'Runner aggregate status and matching trial status disagree.' }
-        if ($status -eq 'SKIPPED' -and $trialStatus -ne 'SKIPPED') { throw 'Runner aggregate skipped status and matching trial disagree.' }
-        $duration = Get-OptionalProperty $trial 'durationMs'
-        if ($null -ne $duration) {
-            if (-not (Test-BoundedLatencyNumber $duration)) { throw 'Runner aggregate trial durationMs is not bounded.' }
+        $durations = New-Object 'System.Collections.Generic.List[double]'
+        $repetitions = New-Object 'System.Collections.Generic.HashSet[int]'
+        foreach ($trial in $matching) {
+            if (-not (Test-PlainObject $trial)) { throw 'Runner aggregate result trial must be a JSON object.' }
+            $trialCleanup = Get-OptionalProperty $trial 'cleanup'
+            if ($null -ne $trialCleanup) { $null = Assert-ResultCleanup -Cleanup $trialCleanup -Label 'trial' }
+            $trialStatusValue = Get-OptionalProperty $trial 'status'
+            if ($null -eq $trialStatusValue) { throw 'Runner aggregate trial status is required.' }
+            $trialStatus = Normalize-ResultStatus ([string]$trialStatusValue)
+            if ($status -eq 'PASSED' -and $trialStatus -notin @('PASSED', 'SKIPPED')) { throw 'Runner aggregate status and matching trial status disagree.' }
+            if ($status -eq 'SKIPPED' -and $trialStatus -ne 'SKIPPED') { throw 'Runner aggregate skipped status and matching trial disagree.' }
+            $duration = Get-OptionalProperty $trial 'durationMs'
+            if ($null -ne $duration) {
+                if (-not (Test-BoundedLatencyNumber $duration)) { throw 'Runner aggregate trial durationMs is not bounded.' }
+                $durations.Add([double]$duration) | Out-Null
+            }
+            $repetition = Get-OptionalProperty $trial 'repetition'
+            if ($matching.Count -gt 1) {
+                if ($null -eq $repetition -or [int]$repetition -lt 1 -or -not $repetitions.Add([int]$repetition)) { throw 'Runner aggregate repetitions must be positive and unique.' }
+            }
+        }
+        [double] $durationP95 = 0
+        [bool] $hasDuration = $durations.Count -gt 0
+        if ($hasDuration) {
+            [double[]] $orderedDurations = $durations.ToArray()
+            [Array]::Sort($orderedDurations)
+            $durationP95 = $orderedDurations[[Math]::Max(0, [Math]::Ceiling($orderedDurations.Count * 0.95) - 1)]
         }
         if ($status -eq 'SKIPPED' -and [string]$Context.Mode -ne 'live') { throw 'Only live-provider cells may be SKIPPED.' }
         return [pscustomobject][ordered]@{
@@ -954,10 +979,11 @@ function Assert-RunnerResult {
             arm = [string]$Context.Arm
             seed = [int]$Context.Seed
             status = $status
-            latencyMs = if ($null -ne $duration) { [double]$duration } else { $null }
+            latencyMs = if ($hasDuration) { $durationP95 } else { $null }
+            latencyStatistic = if ($hasDuration) { 'durationMsP95' } else { $null }
             cleanup = ConvertTo-RedactedValue $rootCleanup
             metadata = ConvertTo-RedactedValue $metadata
-            trial = ConvertTo-RedactedValue $trial
+            trials = ConvertTo-RedactedValue @($matching)
         }
     }
 
@@ -1110,10 +1136,11 @@ function Invoke-OneLatencyArm {
                 if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf)) {
                     Write-JsonArtifact -Path $resultPath -Value (ConvertTo-RedactedValue $candidate) -Depth 40
                 }
-                $residue = Find-ArtifactResidue $attemptPath
+                $residue = @(Find-ArtifactResidue $attemptPath)
                 if ($residue.Count -gt 0) { throw "Temporary or backup residue remains: $($residue -join ', ')" }
             }
             catch {
+                $candidate = $null
                 $category = if ($_.Exception.Message -match 'cleanup|residue') { 'cleanup_failure' } elseif ($_.Exception.Message -match 'JSON|result') { 'malformed_result' } else { 'result_validation' }
                 $message = $_.Exception.Message
             }
@@ -1189,7 +1216,7 @@ function Invoke-LatencyAbExperiment {
         [AllowNull()] [AllowEmptyCollection()] [string[]] $BaselineRunnerArguments,
         [AllowNull()] [AllowEmptyCollection()] [string[]] $OptimizedRunnerArguments,
         [ValidateRange(1, 16)] [int] $BaselinePlanningConcurrency = 16,
-        [ValidateRange(1, 16)] [int] $OptimizedPlanningConcurrency = 4,
+        [ValidateRange(1, 16)] [int] $OptimizedPlanningConcurrency = 16,
         [ValidateRange(0, 16)] [int] $FixedPlanningConcurrency = 0,
         [AllowNull()] [string] $BaselineReplayRecordingsPath,
         [AllowNull()] [string] $OptimizedReplayRecordingsPath,
@@ -1298,8 +1325,8 @@ function Invoke-LatencyAbExperiment {
         foreach ($cell in $cells) {
             $firstArm = if ((Get-NextRandomIndex -State $randomState -Bound 2) -eq 0) { 'baseline' } else { 'optimized' }
             $order = if ($firstArm -eq 'baseline') { @('baseline', 'optimized') } else { @('optimized', 'baseline') }
-            $manifest.armOrder.Add("$($cell.TrialId):$($order -join ',')") | Out-Null
             foreach ($armName in $order) {
+                $manifest.armOrder.Add("$($cell.TrialId):$armName") | Out-Null
                 $worktreePath = if ($armName -eq 'baseline') { $resolvedBaseline } else { $resolvedOptimized }
                 $initialState = if ($armName -eq 'baseline') { $baselineState } else { $optimizedState }
                 $armConfig = if ($armName -eq 'baseline') { $baselineConfig } else { $optimizedConfig }

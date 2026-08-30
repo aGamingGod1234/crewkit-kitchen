@@ -141,6 +141,11 @@ test('Cursor parses one JSON result, records provider/API timing, and resumes th
 	assert.match(children[0].stdin.chunks.join(''), /strategic author for one Minecraft player/);
 	assert.match(children[0].stdin.chunks.join(''), /authoritative state/);
 	assert.deepEqual(calls[1].args.slice(-2), ['--resume', 'cursor-session-1']);
+	const prompts = children.map((child) => child.stdin.chunks.join(''));
+	assert.match(prompts[0], /strategic author for one Minecraft player/i);
+	assert.doesNotMatch(prompts[1], /strategic author for one Minecraft player/i);
+	assert.match(prompts[1], /contract already installed in this provider session/i);
+	assert.ok(Buffer.byteLength(prompts[1]) < Buffer.byteLength(prompts[0]) / 4);
 	assert.equal(turns.length, 2);
 	assert.deepEqual(turns[0].timing, { durationMs: 1_234, apiDurationMs: 987, queueWaitMs: 11 });
 	assert.equal(turns[0].agentId, 'cursor-a');
@@ -152,12 +157,14 @@ test('Cursor parses one JSON result, records provider/API timing, and resumes th
 
 test('Cursor structured turns use an isolated prompt and caller-supplied parser', async () => {
 	const children = [];
+	let attempt = 0;
 	const spawn = () => {
 		const child = new FakeChild();
 		children.push(child);
+		attempt += 1;
 		queueMicrotask(() => {
 			child.stdout.emit('data', Buffer.from(JSON.stringify({
-				type: 'result', subtype: 'success', is_error: false, result: '{"requestId":"draft-1"}',
+				type: 'result', subtype: 'success', is_error: false, result: attempt === 1 ? '{"requestId":"draft-1"}' : DECISION,
 				session_id: 'cursor-structured', duration_ms: 1, duration_api_ms: 1,
 			})));
 			child.exitCode = 0;
@@ -173,6 +180,8 @@ test('Cursor structured turns use an isolated prompt and caller-supplied parser'
 	const result = await agent.decide('translate exactly', { goalRevision: 0, systemPrompt: '', parseOutput: JSON.parse });
 	assert.deepEqual(result, { requestId: 'draft-1' });
 	assert.equal(children[0].stdin.chunks.join(''), 'translate exactly');
+	await agent.decide('first gameplay state', { goalRevision: 0 });
+	assert.match(children[1].stdin.chunks.join(''), /strategic author for one Minecraft player/i, 'an isolated structured turn must not suppress the cold gameplay contract');
 	await service.stop();
 });
 
@@ -206,11 +215,15 @@ test('Cursor reports only its bounded visible result through the verbose adapter
 
 test('Cursor parse failures record only a generic structured error', async () => {
 	const secret = 'ARBITRARY_CURSOR_MODEL_SECRET';
-	const spawn = () => {
+	const calls = [];
+	let attempt = 0;
+	const spawn = (command, args) => {
+		calls.push({ command, args });
 		const child = new FakeChild();
+		attempt += 1;
 		queueMicrotask(() => {
 			child.stdout.emit('data', Buffer.from(JSON.stringify({
-				type: 'result', subtype: 'success', is_error: false, result: `not-json ${secret}`,
+				type: 'result', subtype: 'success', is_error: false, result: attempt === 1 ? `not-json ${secret}` : DECISION,
 				session_id: 'cursor-session-secret', duration_ms: 12, duration_api_ms: 9,
 			})));
 			child.exitCode = 0;
@@ -229,6 +242,41 @@ test('Cursor parse failures record only a generic structured error', async () =>
 	assert.equal(rows.length, 1);
 	assert.deepEqual(rows[0].error, { code: 'MALFORMED_DECISION', category: 'decision_parse' });
 	assert.doesNotMatch(JSON.stringify(rows[0]), new RegExp(secret));
+	assert.equal(agent.sessionMetadata().sessionState, 'warm');
+	await agent.decide('correct the rejected envelope', { goalRevision: 1, retry: true });
+	assert.deepEqual(calls[1].args.slice(-2), ['--resume', 'cursor-session-secret']);
+	await service.stop();
+});
+
+test('Cursor exact warm reuse bypasses degraded discovery and stale refreshes are singleflight', async () => {
+	let discoveryCalls = 0;
+	let fail = false;
+	let gate = null;
+	const service = new CursorProviderService(config(), {
+		discoverCatalog: async () => {
+			discoveryCalls += 1;
+			if (gate !== null) await gate;
+			if (fail) throw new Error('offline');
+			return parseCursorModelList(MODELS_OUTPUT);
+		},
+	});
+	const selected = profile({ agentId: 'cursor-warm' });
+	const agent = await service.createAgent(selected);
+	fail = true;
+	await service.catalog.refresh({ force: true });
+	const callsBeforeReuse = discoveryCalls;
+	assert.equal(await service.createAgent(selected), agent);
+	assert.equal(discoveryCalls, callsBeforeReuse);
+
+	let release;
+	gate = new Promise((resolve) => { release = resolve; });
+	const refreshes = [service.catalog.refresh({ force: true }), service.catalog.refresh({ force: true }), service.catalog.refresh()];
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(discoveryCalls, callsBeforeReuse + 1);
+	release();
+	const snapshots = await Promise.all(refreshes);
+	assert.deepEqual(snapshots[1], snapshots[0]);
+	assert.deepEqual(snapshots[2], snapshots[0]);
 	await service.stop();
 });
 

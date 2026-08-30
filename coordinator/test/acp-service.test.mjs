@@ -89,6 +89,10 @@ test('ACP structured turns use an isolated prompt and caller-supplied parser', a
 	const prompt = transport.calls.find((call) => call.method === 'session/prompt').params.prompt[0].text;
 	assert.equal(prompt, 'translate exactly');
 	assert.doesNotMatch(prompt, /strategic author/i);
+	transport.message = DECISION;
+	await agent.decide('first gameplay state', { goalRevision: 0 });
+	const gameplayPrompt = transport.calls.filter((call) => call.method === 'session/prompt')[1].params.prompt[0].text;
+	assert.match(gameplayPrompt, /strategic author for one Minecraft player/i, 'an isolated structured turn must not suppress the cold gameplay contract');
 	await service.stop();
 });
 
@@ -148,6 +152,7 @@ test('ACP transport loss clears the owning session and coalesces one exact repla
 	);
 	const selected = { agentId: 'gemini-lost', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high', serviceTier: 'fast' };
 	const stale = await service.createAgent(selected);
+	await stale.decide('first state', { goalRevision: 0 });
 	transports[0].emit('exit', Object.assign(new Error('ACP exited'), { code: 'PROCESS_EXITED' }));
 	await new Promise((resolve) => setImmediate(resolve));
 	assert.equal(service.getAgent(selected.agentId), null);
@@ -159,6 +164,9 @@ test('ACP transport loss clears the owning session and coalesces one exact repla
 	assert.equal(replacement, duplicate);
 	assert.equal(replacement.sessionGeneration, 2);
 	assert.equal(transports.length, 2);
+	await replacement.decide('restored state', { goalRevision: 0 });
+	const restoredPrompt = transports[1].calls.find((call) => call.method === 'session/prompt').params.prompt[0].text;
+	assert.match(restoredPrompt, /strategic author for one Minecraft player/i, 'a replacement session must restore the full contract');
 	await service.stop();
 });
 
@@ -189,10 +197,15 @@ test('ACP session metadata stays warm and durable across sequential prompts', as
 	const first = agent.sessionMetadata();
 	await agent.decide('second authoritative state', { goalRevision: 2 });
 	const second = agent.sessionMetadata();
+	const prompts = transport.calls.filter((call) => call.method === 'session/prompt').map((call) => call.params.prompt[0].text);
 	assert.equal(first.sessionGeneration, 1);
 	assert.equal(first.sessionState, 'warm');
 	assert.equal(first.continuation, 'durable');
 	assert.deepEqual(second, first);
+	assert.match(prompts[0], /strategic author for one Minecraft player/i);
+	assert.doesNotMatch(prompts[1], /strategic author for one Minecraft player/i);
+	assert.match(prompts[1], /contract already installed in this provider session/i);
+	assert.ok(Buffer.byteLength(prompts[1]) < Buffer.byteLength(prompts[0]) / 4);
 	await service.stop();
 });
 
@@ -373,6 +386,7 @@ test('ACP refreshes dependent capabilities after changing the model', async () =
 
 test('Kimi catalog retains the last discovered display names when a later CLI refresh fails', async () => {
 	let fail = false;
+	let discoveryCalls = 0;
 	const discovered = [{
 		id: 'kimi-code/kimi-for-coding',
 		model: 'kimi-code/kimi-for-coding',
@@ -382,7 +396,7 @@ test('Kimi catalog retains the last discovered display names when a later CLI re
 	}];
 	const service = new AcpProviderService(
 		{ provider: 'kimi', cwd: 'C:\\workspace', catalogDiscovery: true },
-		{ discoverCatalog: async () => { if (fail) throw new Error('offline'); return discovered; } },
+		{ discoverCatalog: async () => { discoveryCalls += 1; if (fail) throw new Error('offline'); return discovered; } },
 	);
 	const first = await service.catalog.refresh({ force: true });
 	fail = true;
@@ -390,6 +404,59 @@ test('Kimi catalog retains the last discovered display names when a later CLI re
 	assert.deepEqual(retained, first);
 	assert.equal(retained.models[0].displayName, 'K2.7 Coding');
 	assert.equal(service.catalog.stale, true);
+	const transport = new FakeAcpTransport([
+		{ id: 'model', category: 'model', type: 'select', currentValue: 'kimi-code/kimi-for-coding', options: [{ value: 'kimi-code/kimi-for-coding' }] },
+		{ id: 'thinking', category: 'thought_level', type: 'select', currentValue: 'high', options: [{ value: 'high' }] },
+	]);
+	const warmService = new AcpProviderService(
+		{ provider: 'kimi', cwd: 'C:\\workspace', catalogDiscovery: true },
+		{ discoverCatalog: async () => { discoveryCalls += 1; if (fail) throw new Error('offline'); return discovered; }, transportFactory: () => transport },
+	);
+	fail = false;
+	const selected = { agentId: 'kimi-warm', provider: 'kimi', model: 'kimi-code/kimi-for-coding', reasoningEffort: 'high' };
+	const agent = await warmService.createAgent(selected);
+	fail = true;
+	await warmService.catalog.refresh({ force: true });
+	const callsBeforeReuse = discoveryCalls;
+	assert.equal(await warmService.createAgent(selected), agent);
+	assert.equal(discoveryCalls, callsBeforeReuse, 'exact warm reuse must not wait for degraded discovery');
+	await warmService.stop();
+});
+
+test('ACP coalesces concurrent stale catalog refreshes', async () => {
+	let discoveryCalls = 0;
+	let release;
+	const gate = new Promise((resolve) => { release = resolve; });
+	const discovered = [{ id: 'kimi-code/k3', model: 'kimi-code/k3', displayName: 'K3', reasoningEfforts: ['high'], serviceTiers: [] }];
+	const service = new AcpProviderService(
+		{ provider: 'kimi', cwd: 'C:\\workspace', catalogDiscovery: true },
+		{ discoverCatalog: async () => { discoveryCalls += 1; await gate; return discovered; } },
+	);
+	const refreshes = [service.catalog.refresh({ force: true }), service.catalog.refresh({ force: true }), service.catalog.refresh()];
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(discoveryCalls, 1);
+	release();
+	const snapshots = await Promise.all(refreshes);
+	assert.deepEqual(snapshots[1], snapshots[0]);
+	assert.deepEqual(snapshots[2], snapshots[0]);
+});
+
+test('ACP parse correction retains the accepted session and compact planner contract', async () => {
+	const transport = new FakeAcpTransport(options());
+	transport.message = '{"summary":"bad","directive":"replace","source":null}';
+	const service = new AcpProviderService({ provider: 'gemini', cwd: 'C:\\workspace', models: ['auto', 'gemini-pro'] }, { transportFactory: () => transport });
+	const agent = await service.createAgent({ agentId: 'gemini-correction', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high' });
+	await agent.setGoalRevision(2);
+	await assert.rejects(agent.decide('authoritative state', { goalRevision: 2 }), (error) => error?.code === 'DECISION_FIELD_MISMATCH');
+	assert.equal(agent.sessionMetadata().sessionState, 'warm');
+	transport.message = DECISION;
+	await agent.decide('correct the rejected envelope', { goalRevision: 2, retry: true });
+	const prompts = transport.calls.filter((call) => call.method === 'session/prompt');
+	assert.equal(prompts.length, 2);
+	assert.equal(prompts.every((call) => call.params.sessionId === 'session-1'), true);
+	assert.match(prompts[0].params.prompt[0].text, /strategic author/i);
+	assert.doesNotMatch(prompts[1].params.prompt[0].text, /strategic author/i);
+	await service.stop();
 });
 
 test('Kimi catalog discovery receives only the Kimi provider environment', async () => {

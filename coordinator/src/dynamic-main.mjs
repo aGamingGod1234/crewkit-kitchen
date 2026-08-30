@@ -67,6 +67,8 @@ const MAX_CONVERSATION_WAKE_TRANSACTIONS = 4_096;
 const DEFAULT_CONNECTION_OPERATION_CAP = 256;
 const DEFAULT_AGENT_OPERATION_CAP = 32;
 const MAX_PUBLIC_NARRATIVE_RAW_CHARS = 1_024;
+const DEFAULT_MAX_PENDING_AGENT_OPERATIONS = 64;
+const DEFAULT_MAX_PENDING_AGENT_TRANSACTIONS = 16;
 const DEFAULT_VOICE_PORT = 8_766;
 const DEFAULT_VOICE_MAX_CONCURRENT = 5;
 const DEFAULT_VOICE_PROFILE_ASSIGNMENTS_PATH = path.join('runtime', 'voice-profile-assignments.json');
@@ -153,8 +155,10 @@ export class DynamicCoordinator extends EventEmitter {
 	#verboseEnabled = false;
 	#runtimeGeneration;
 	#verboseTransitions = new ReportingTransitionDeduper();
+	#maxPendingAgentOperations;
+	#maxPendingAgentTransactions;
 
-	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, goalSupervisor, codexControlProtocol = 'native_tools', traceWriter = null, providerTurnRecorder = null, runtimeGeneration = null, benchmarkRecorder = null, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval, setGoalSpecTimeout = defaultGoalSpecTimeout, clearGoalSpecTimeout = clearTimeout, connectionOperationCap = DEFAULT_CONNECTION_OPERATION_CAP, agentOperationCap = DEFAULT_AGENT_OPERATION_CAP, goalSpecRequestCap = connectionOperationCap }) {
+	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, goalSupervisor, codexControlProtocol = 'native_tools', traceWriter = null, providerTurnRecorder = null, runtimeGeneration = null, benchmarkRecorder = null, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval, setGoalSpecTimeout = defaultGoalSpecTimeout, clearGoalSpecTimeout = clearTimeout, connectionOperationCap = DEFAULT_CONNECTION_OPERATION_CAP, agentOperationCap = DEFAULT_AGENT_OPERATION_CAP, goalSpecRequestCap = connectionOperationCap, maxPendingAgentOperations = DEFAULT_MAX_PENDING_AGENT_OPERATIONS, maxPendingAgentTransactions = DEFAULT_MAX_PENDING_AGENT_TRANSACTIONS }) {
 		super();
 		this.#registry = requireDependency(registry, 'registry');
 		this.#scheduler = requireDependency(scheduler, 'scheduler');
@@ -176,8 +180,12 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#codexControlProtocol = codexControlProtocol;
 		if (typeof controlNow !== 'function') throw new TypeError('controlNow must be a function');
 		if (typeof epochNow !== 'function') throw new TypeError('epochNow must be a function');
+		if (!Number.isSafeInteger(maxPendingAgentOperations) || maxPendingAgentOperations < 1) throw new TypeError('maxPendingAgentOperations must be a positive safe integer');
+		if (!Number.isSafeInteger(maxPendingAgentTransactions) || maxPendingAgentTransactions < 1) throw new TypeError('maxPendingAgentTransactions must be a positive safe integer');
 		this.#controlNow = controlNow;
 		this.#epochNow = epochNow;
+		this.#maxPendingAgentOperations = maxPendingAgentOperations;
+		this.#maxPendingAgentTransactions = maxPendingAgentTransactions;
 		const programBridge = {
 			send: (type, agentId, payload) => this.#sendRuntimeMessage('program', type, agentId, payload),
 		};
@@ -332,7 +340,7 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#unbindBridge();
 		this.#scheduler.close('Dynamic coordinator stopped');
 		this.#goalSupervisor.close();
-		await Promise.allSettled([this.#reconciliation, ...this.#agentOperations.values()]);
+		await Promise.allSettled([this.#reconciliation, ...[...this.#agentOperations.values()].map((queue) => queue.drainPromise)]);
 		this.#agentOperations.clear();
 		this.#agentOperationCounts.clear();
 		this.#totalAgentOperations = 0;
@@ -399,7 +407,7 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#publishVerbose(record.agentId, record.goalRevision, 'lifecycle', 'Agent registered and ready.', connectionEpoch);
 			this.#prewarmNativeAgent(record);
 			await this.#publishStatus(connectionEpoch);
-		}, { connectionEpoch }));
+		}, { connectionEpoch, transactional: true }));
 		this.#listen('agent_removed', (message, connectionEpoch) => this.#run(async () => {
 			await this.#reconciliation;
 			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return;
@@ -494,27 +502,9 @@ export class DynamicCoordinator extends EventEmitter {
 			), connectionEpoch);
 		});
 		this.#listen('goal_control', (message, connectionEpoch) => {
-			const previous = this.#registry.get(message.agentId);
 			let record;
-			try {
-				record = this.#registry.applyGoalControl(message.agentId, message.payload);
-			} catch (error) {
-				void this.#reportAgentError(message.agentId, error, connectionEpoch);
-				return;
-			}
-			const lifecycleChanged = previous !== null && !['queue', 'dequeue'].includes(message.payload.operation)
-				&& (record.goalRevision > previous.goalRevision
-					|| (record.goalRevision === previous.goalRevision && ['dead', 'respawn'].includes(message.payload.operation)));
 			let nativeDisposal = Promise.resolve();
-			if (lifecycleChanged) {
-				this.#cancelGoalSpecRequests(message.agentId);
-				this.#retireGoalSupervision(previous, message.payload.operation);
-				this.#invalidateAcceptedLifecycle(message.agentId);
-				this.#beginGoalControlInterruption(message, connectionEpoch);
-				this.#programRuntime.onGoalControl(previous, message.payload.operation);
-				nativeDisposal = Promise.resolve(this.#nativeRuntime.dispose(previous.agentId, `goal_${message.payload.operation}`));
-			}
-			const lifecycleGeneration = this.#lifecycleGeneration(message.agentId);
+			let lifecycleGeneration;
 			return this.#enqueueAgent(message.agentId, async () => {
 				await nativeDisposal;
 				const acceptedStillCurrent = () => {
@@ -548,6 +538,25 @@ export class DynamicCoordinator extends EventEmitter {
 				}
 				if (!acceptedStillCurrent()) return;
 				this.emit('goalControl', record);
+			}, {
+				connectionEpoch,
+				transactional: true,
+				onAdmitted: () => {
+					const previous = this.#registry.get(message.agentId);
+					record = this.#registry.applyGoalControl(message.agentId, message.payload);
+					const lifecycleChanged = previous !== null && !['queue', 'dequeue'].includes(message.payload.operation)
+						&& (record.goalRevision > previous.goalRevision
+							|| (record.goalRevision === previous.goalRevision && ['dead', 'respawn'].includes(message.payload.operation)));
+					if (lifecycleChanged) {
+						this.#cancelGoalSpecRequests(message.agentId);
+						this.#retireGoalSupervision(previous, message.payload.operation);
+						this.#invalidateAcceptedLifecycle(message.agentId);
+						this.#beginGoalControlInterruption(message, connectionEpoch);
+						this.#programRuntime.onGoalControl(previous, message.payload.operation);
+						nativeDisposal = Promise.resolve(this.#nativeRuntime.dispose(previous.agentId, `goal_${message.payload.operation}`));
+					}
+					lifecycleGeneration = this.#lifecycleGeneration(message.agentId);
+				},
 			});
 		});
 		this.#listen('conversation_event', (message, connectionEpoch) => {
@@ -566,7 +575,7 @@ export class DynamicCoordinator extends EventEmitter {
 					}
 				}
 				this.emit('conversationEvent', message);
-			}, { waitForReconciliation: false, connectionEpoch });
+			}, { waitForReconciliation: false, connectionEpoch, transactional: true });
 		});
 		this.#listen('conversation_wake', (message, connectionEpoch) => {
 			return this.#enqueueAgent(message.agentId, async () => {
@@ -616,7 +625,7 @@ export class DynamicCoordinator extends EventEmitter {
 				await this.#sendForEpoch(connectionEpoch, 'agent_ready', record.agentId, { goalRevision: record.goalRevision });
 				this.emit('conversationEvent', { ...message, payload: message.payload.event });
 				this.emit('goalControl', record);
-			}, { waitForReconciliation: false, connectionEpoch });
+			}, { waitForReconciliation: false, connectionEpoch, transactional: true });
 		});
 		this.#listen('observation', (message, connectionEpoch) => {
 			const receiptMonotonicMs = safeClockRead(this.#controlNow);
@@ -714,7 +723,15 @@ export class DynamicCoordinator extends EventEmitter {
 						conversationContext: this.#conversationMemory(record.agentId).toPlannerContext(),
 					}),
 				});
-			}, { connectionEpoch });
+			}, {
+				connectionEpoch,
+				coalesceKey: message.payload.attention === false
+					&& message.payload.trigger === undefined
+					&& !this.#pendingAttention.has(message.agentId)
+					&& !this.#supervisedObservationRequests.has(message.agentId)
+					? `quiet-observation:${connectionEpoch}:${lifecycleGeneration}:${message.payload.goalRevision}`
+					: null,
+			});
 		});
 		this.#listen('action_progress', (message, connectionEpoch) => {
 			return this.#enqueueAgent(message.agentId, async () => {
@@ -765,7 +782,7 @@ export class DynamicCoordinator extends EventEmitter {
 				} finally {
 					if (acknowledge) await this.#acknowledgeActionResult(message, connectionEpoch);
 				}
-			}, { connectionEpoch });
+			}, { connectionEpoch, terminal: true });
 		});
 		this.#listen('goal_completion_result', (message, connectionEpoch) => {
 			return this.#enqueueAgent(message.agentId, async () => {
@@ -774,7 +791,7 @@ export class DynamicCoordinator extends EventEmitter {
 				if (this.#usesNativeTools(current) && this.#nativeRuntime.onCompletionResult(current, message.payload)) return;
 				const accepted = this.#programRuntime.onCompletionResult(current, message.payload);
 				if (!accepted) throw new ProtocolV2Error('UNEXPECTED_COMPLETION_RESULT', `Agent '${message.agentId}' has no matching completion request`);
-			}, { connectionEpoch });
+			}, { connectionEpoch, transactional: true });
 		});
 		this.#listen('disconnected', (event) => {
 			const connectionEpoch = this.#eventConnectionEpoch(event);
@@ -840,6 +857,7 @@ export class DynamicCoordinator extends EventEmitter {
 			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
 			const providers = result.providers ?? result.codex;
 			await this.#publishCatalog(providers.catalog, connectionEpoch);
+			const deadStatePlans = [];
 			for (const profile of providers.valid) {
 				if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
 				const record = this.#registry.get(profile.agentId);
@@ -852,7 +870,7 @@ export class DynamicCoordinator extends EventEmitter {
 				this.#supportedAgentIds.add(profile.agentId);
 				this.#publishVerbose(record.agentId, record.goalRevision, 'lifecycle', 'Agent reconciled and ready.', connectionEpoch);
 				this.#prewarmNativeAgent(record);
-				if (record.state === DynamicAgentState.DEAD) await this.#installDeadStatePlan(record, record.death, connectionEpoch);
+				if (record.state === DynamicAgentState.DEAD) deadStatePlans.push(this.#installDeadStatePlan(record, record.death, connectionEpoch));
 			}
 			for (const invalid of providers.invalid) {
 				if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
@@ -863,6 +881,7 @@ export class DynamicCoordinator extends EventEmitter {
 					message: sanitizeDiagnosticText(invalid.message ?? 'Provider profile is unavailable.', { maxBytes: 2_048 }),
 				});
 			}
+			await Promise.all(deadStatePlans);
 			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
 			this.#reconciledStatus = this.#readyRegistry.every(({ agentId }) => this.#supportedAgentIds.has(agentId));
 			if (this.#disconnectedAt !== null) this.#disconnectedAt = null;
@@ -1323,7 +1342,7 @@ export class DynamicCoordinator extends EventEmitter {
 				existing.pending = mergePlannerRequest(existing.pending, request);
 				return;
 			}
-			if (request.priority === 'urgent' && existing.request.priority !== 'urgent' && this.#scheduler.pendingAgentIds?.includes(record.agentId)) {
+			if (request.priority === 'urgent' && existing.request.priority !== 'urgent') {
 				// Retain the urgent payload before cancellation settles. The scheduler
 				// may reject the queued turn immediately, so interruption alone cannot
 				// be the handoff mechanism for the replacement request.
@@ -1718,18 +1737,79 @@ export class DynamicCoordinator extends EventEmitter {
 		return this.#lifecycleGeneration(agentId) === generation;
 	}
 
-	#enqueueAgent(agentId, operation, { waitForReconciliation = true, connectionEpoch = this.#connectionEpoch } = {}) {
+	#enqueueAgent(agentId, operation, { waitForReconciliation = true, connectionEpoch = this.#connectionEpoch, coalesceKey = null, terminal = false, transactional = false, onAdmitted = null } = {}) {
 		const releaseCapacity = this.#reserveAgentOperation(agentId);
-		const previous = this.#agentOperations.get(agentId) ?? Promise.resolve();
-		const current = previous.catch(() => {})
-			.then(() => this.#isConnectionEpochCurrent(connectionEpoch) && waitForReconciliation ? this.#reconciliation : undefined)
-			.then(() => this.#isConnectionEpochCurrent(connectionEpoch) ? operation() : undefined);
-		this.#agentOperations.set(agentId, current);
-		current.catch((error) => this.#reportAgentError(agentId, error, connectionEpoch)).finally(() => {
-			if (this.#agentOperations.get(agentId) === current) this.#agentOperations.delete(agentId);
-			releaseCapacity();
-		});
-		return current;
+		let resolve;
+		let reject;
+		const promise = new Promise((resolveValue, rejectValue) => { resolve = resolveValue; reject = rejectValue; });
+		const waiter = {
+			resolve: (value) => { releaseCapacity(); resolve(value); },
+			reject: (error) => { releaseCapacity(); reject(error); },
+		};
+		let queue = this.#agentOperations.get(agentId);
+		if (queue === undefined) {
+			queue = { items: [], drainPromise: null };
+			this.#agentOperations.set(agentId, queue);
+		}
+		const tail = queue.items.at(-1);
+		if (coalesceKey !== null && tail?.coalesceKey === coalesceKey) {
+			for (const superseded of tail.waiters) superseded.resolve(undefined);
+			tail.operation = operation;
+			tail.waitForReconciliation = waitForReconciliation;
+			tail.connectionEpoch = connectionEpoch;
+			tail.transactional = transactional;
+			tail.waiters = [waiter];
+		} else {
+			const pendingTerminal = queue.items.find((item) => item.terminal === true);
+			if (terminal && pendingTerminal !== undefined) {
+				for (const superseded of pendingTerminal.waiters) superseded.resolve(undefined);
+				pendingTerminal.operation = operation;
+				pendingTerminal.waitForReconciliation = waitForReconciliation;
+				pendingTerminal.connectionEpoch = connectionEpoch;
+				pendingTerminal.coalesceKey = coalesceKey;
+				pendingTerminal.transactional = transactional;
+				pendingTerminal.waiters = [waiter];
+				promise.catch((error) => this.#reportAgentError(agentId, error, connectionEpoch));
+				return promise;
+			}
+			const ordinaryPending = queue.items.filter((item) => item.terminal !== true && item.transactional !== true).length;
+			const transactionalPending = queue.items.filter((item) => item.transactional === true).length;
+			const capacity = transactional ? this.#maxPendingAgentTransactions : this.#maxPendingAgentOperations;
+			const pending = transactional ? transactionalPending : ordinaryPending;
+			if (!terminal && pending >= capacity) {
+				const lane = transactional ? 'transactional' : 'ordinary';
+				const error = codedRuntimeError('AGENT_EVENT_BACKPRESSURE', `Agent '${agentId}' has ${capacity} pending ${lane} coordinator events`);
+				waiter.reject(error);
+				promise.catch((caught) => this.#reportAgentError(agentId, caught, connectionEpoch));
+				return promise;
+			}
+			try {
+				if (onAdmitted !== null) onAdmitted();
+			} catch (error) {
+				waiter.reject(error);
+				promise.catch((caught) => this.#reportAgentError(agentId, caught, connectionEpoch));
+				if (queue.items.length === 0 && this.#agentOperations.get(agentId) === queue) this.#agentOperations.delete(agentId);
+				return promise;
+			}
+			queue.items.push({ operation, waitForReconciliation, connectionEpoch, coalesceKey, terminal, transactional, waiters: [waiter] });
+		}
+		promise.catch((error) => this.#reportAgentError(agentId, error, connectionEpoch));
+		if (queue.drainPromise === null) queue.drainPromise = Promise.resolve().then(() => this.#drainAgentOperations(agentId, queue));
+		return promise;
+	}
+
+	async #drainAgentOperations(agentId, queue) {
+		while (queue.items.length > 0) {
+			const item = queue.items.shift();
+			try {
+				if (this.#isConnectionEpochCurrent(item.connectionEpoch) && item.waitForReconciliation) await this.#reconciliation;
+				const value = this.#isConnectionEpochCurrent(item.connectionEpoch) ? await item.operation() : undefined;
+				for (const waiter of item.waiters) waiter.resolve(value);
+			} catch (error) {
+				for (const waiter of item.waiters) waiter.reject(error);
+			}
+		}
+		if (this.#agentOperations.get(agentId) === queue) this.#agentOperations.delete(agentId);
 	}
 
 	#reserveAgentOperation(agentId) {
@@ -2305,6 +2385,8 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		clearStatusInterval: dependencies.clearStatusInterval,
 		setGoalSpecTimeout: dependencies.setGoalSpecTimeout,
 		clearGoalSpecTimeout: dependencies.clearGoalSpecTimeout,
+		maxPendingAgentOperations: dependencies.maxPendingAgentOperations,
+		maxPendingAgentTransactions: dependencies.maxPendingAgentTransactions,
 		connectionOperationCap: dependencies.connectionOperationCap,
 		agentOperationCap: dependencies.agentOperationCap,
 		goalSpecRequestCap: dependencies.goalSpecRequestCap,

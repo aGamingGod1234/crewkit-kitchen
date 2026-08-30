@@ -5,8 +5,10 @@ import dev.agaminggod.arenaagents.agent.AgentConstants;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.server.bridge.MultiplexedServerBridge;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
+import net.minecraft.core.BlockPos;
 import net.minecraft.world.phys.Vec3;
 
 public final class ObservationBudgetVerification {
@@ -144,6 +146,24 @@ public final class ObservationBudgetVerification {
 				"touch-distance awareness does not disappear outside the camera cone");
 		assertFalse(ObservationVisibility.isWithinViewCone(eye, forward, new Vec3(8.0D, 1.6D, 0.0D)),
 				"a distant side target is outside the bounded visual cone");
+		HashMap<Long, Boolean> blockVisibility = new HashMap<>();
+		AtomicInteger blockTraces = new AtomicInteger();
+		BlockPos sharedPosition = new BlockPos(4, 64, 7);
+		assertTrue(ObservationVisibility.memoizedBlockVisibility(
+				blockVisibility, sharedPosition, position -> blockTraces.incrementAndGet() == 1),
+				"first block visibility lookup uses the ray result");
+		assertTrue(ObservationVisibility.memoizedBlockVisibility(
+				blockVisibility, new BlockPos(4, 64, 7), position -> false),
+				"block and container sections share a cached visible result");
+		assertFalse(ObservationVisibility.memoizedBlockVisibility(
+				blockVisibility, new BlockPos(5, 64, 7), position -> {
+					blockTraces.incrementAndGet();
+					return false;
+				}), "a distinct block retains its own visibility result");
+		assertFalse(ObservationVisibility.memoizedBlockVisibility(
+				blockVisibility, new BlockPos(5, 64, 7), position -> true),
+				"occluded block results are cached as well as visible results");
+		assertEquals(2, blockTraces.get(), "two positions require two block ray traces");
 		ObservationDispatchQueue<String> burst = new ObservationDispatchQueue<>(
 				AgentConstants.DEFAULT_AGENT_LIMIT,
 				AgentConstants.DEFAULT_AGENT_LIMIT
@@ -157,7 +177,7 @@ public final class ObservationBudgetVerification {
 		burst.drain(burstFirst::add);
 		assertEquals(AgentConstants.DEFAULT_AGENT_LIMIT, burstFirst.size(), "one drain serves the sixteen-agent tick budget");
 		assertEquals(0, burst.pendingCount(), "sixteen-agent burst clears in one drain");
-		return 53;
+		return 58;
 	}
 
 	private static JsonObject movingObservation(double x, double yaw, String selectedItem, double entityDistance) {

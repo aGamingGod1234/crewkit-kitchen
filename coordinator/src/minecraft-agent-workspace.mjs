@@ -52,6 +52,11 @@ export class MinecraftAgentWorkspace {
 
 	async #replace(template, destination) {
 		const content = await this.fs.readFile(path.join(this.templateRoot, template), 'utf8');
+		try {
+			if (await this.fs.readFile(destination, 'utf8') === content) return;
+		} catch (error) {
+			if (error?.code !== 'ENOENT') throw error;
+		}
 		const temporary = path.join(
 			path.dirname(destination),
 			`.${path.basename(destination)}.${process.pid}.${randomUUID()}.tmp`,

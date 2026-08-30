@@ -9,7 +9,7 @@ import { BenchmarkRecorder } from '../src/benchmark/benchmark-recorder.mjs';
 import { createReplayProvider, createReplayRecord } from '../src/benchmark/provider-replay.mjs';
 import { getSimulatorScenario } from '../src/simulator/simulator-scenarios.mjs';
 import { compileScenarioDecision } from '../src/benchmark/scenario-program.mjs';
-import { VIRTUAL_TICK_MS } from '../src/simulator/virtual-world.mjs';
+import { VIRTUAL_TICK_MS, VirtualWorld } from '../src/simulator/virtual-world.mjs';
 
 const PROFILE = Object.freeze({ provider: 'instant', model: 'deterministic-v1', reasoningEffort: 'fixed', serviceTier: 'local' });
 const SOURCE = 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); program.finish("done");';
@@ -134,7 +134,10 @@ test('reports explicit injected wall-clock and virtual-clock measurements', asyn
 	assert.ok(metrics.result.totalVirtualWorldDurationMs >= metrics.result.taskCompletionVirtualDurationMs);
 	assert.equal(metrics.result.tick.over50MsCount, metrics.result.tick.count);
 	assert.equal(metrics.result.tick.maxMs >= 50, true);
+	assert.equal(metrics.result.tick.basis, 'monotonic_wall_duration_ms');
+	assert.equal(metrics.result.tick.cpuWallDurationP95Ms, undefined);
 	assert.ok(metrics.raw.ticks.length > 0);
+	assert.equal(metrics.raw.ticks.every((tick) => tick.cpuWallDurationMs === undefined), true);
 	assert.ok(metrics.raw.providerPlanningWait.length > 0);
 });
 
@@ -190,6 +193,13 @@ test('preserves bounded pairing context and reports per-trial process deltas', a
 	assert.deepEqual(trial.systemSummary.cpuDelta, { basis: 'process_resource_usage_delta_ms', userMs: 7, systemMs: 2, totalMs: 9 });
 	assert.deepEqual(trial.systemSummary.memoryDelta, { basis: 'process_memory_sample_delta_bytes', rssBytes: 30, heapUsedBytes: 20 });
 	assert.equal(trial.systemSummary.memoryPeak.rssBytes, 130);
+	assert.equal(trial.timingScope, 'full_path');
+	assert.ok(trial.durationMs >= 0);
+	assert.ok(trial.taskDurationMs >= 0);
+	assert.ok(trial.setupDurationMs >= 0);
+	assert.equal(trial.totalDurationMs, trial.durationMs);
+	assert.ok(trial.durationMs >= trial.taskDurationMs + trial.setupDurationMs - 1);
+	assert.ok(Number.isFinite(trial.setupSpansMs.coordinatorStart));
 });
 
 test('records only declared hazard and direct-message event timing', async () => {
@@ -259,6 +269,34 @@ test('measurement instrumentation does not change authoritative action command b
 	assert.match(disabled.trials[0].debug.actionCommandHash, /^sha256:/);
 	assert.equal(enabled.trials[0].debug.actionCommandHash, disabled.trials[0].debug.actionCommandHash);
 	assert.equal(enabled.trials[0].status, disabled.trials[0].status);
+	assert.equal(disabled.trials[0].metrics, null);
+	assert.equal(disabled.trials[0].systemSummary, null);
+	assert.equal(disabled.trials[0].benchmark.eventCount, 0);
+	assert.deepEqual(disabled.trials[0].benchmark.traces, []);
+	assert.equal(disabled.summary, 0);
+});
+
+test('polls conversation history only while a declared chat event is pending', async () => {
+	const original = VirtualWorld.prototype.conversationEvents;
+	let calls = 0;
+	VirtualWorld.prototype.conversationEvents = function measuredConversationEvents() { calls += 1; return original.call(this); };
+	try {
+		const base = matrix().trials[0];
+		const result = await runLatencyMatrix({
+			matrix: matrix({ trials: [{ ...base, id: 'message-scan', scenarioId: 'direct-message-wake', turnCap: 40 }] }),
+			scenarioResolver: (id) => {
+				const scenario = getSimulatorScenario(id);
+				return { ...scenario, commands: [{ actionId: 'scan-delay', actionType: 'wait', arguments: { durationMs: 1_000 } }, ...scenario.commands] };
+			},
+			artifactDirectory: null,
+		});
+		assert.equal(result.trials[0].status, 'PASSED');
+		assert.equal(result.trials[0].metrics.raw.directMessageReaction.length, 1);
+		assert.ok(calls > 0);
+		assert.ok(calls < result.trials[0].metrics.raw.ticks.length, `conversation history was read ${calls} times for ${result.trials[0].metrics.raw.ticks.length} ticks`);
+	} finally {
+		VirtualWorld.prototype.conversationEvents = original;
+	}
 });
 
 test('marks synthetic identity and returns scoped benchmark and system summaries', async () => {
@@ -285,7 +323,9 @@ test('marks synthetic identity and returns scoped benchmark and system summaries
 test('shipped default matrix proves physical stone-tool success for every isolated load', async () => {
 	const result = await runLatencyMatrix({ artifactDirectory: null });
 	assert.equal(result.status, 'PASSED');
-	assert.deepEqual(result.trials.map((trial) => trial.status), ['PASSED', 'PASSED', 'PASSED', 'PASSED']);
+	assert.equal(result.trials.length, 20);
+	assert.ok(result.trials.every((trial) => trial.status === 'PASSED'));
+	assert.deepEqual([...new Set(result.trials.map((trial) => trial.repetition))], [1, 2, 3, 4, 5]);
 	assert.ok(result.trials.every((trial) => trial.debug?.scenarioPassed === true));
 	assert.ok(result.trials.every((trial) => trial.debug?.turnCount <= trial.agentLoad * 2));
 	assert.ok(result.trials.every((trial) => trial.debug?.scenarioEvidence?.every((agent) => agent.actionResults === 3 && agent.succeeded === 3 && agent.cancelled === 0 && agent.failed === 0)));

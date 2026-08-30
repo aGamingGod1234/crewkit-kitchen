@@ -1045,7 +1045,13 @@ async function ignoredAbortReleasesCapacity() {
 	let releaseReplacement;
 	let activePromises = 0;
 	let maxActivePromises = 0;
-	const scheduler = new PlanningScheduler({ maxConcurrent: 1, maxPending: 1, scheduleTimeout: timers.schedule, cancelTimeout: timers.cancel });
+	const scheduler = new PlanningScheduler({
+		maxConcurrent: 1,
+		maxPending: 1,
+		settlementGraceMs: 5,
+		scheduleTimeout: timers.schedule,
+		cancelTimeout: timers.cancel,
+	});
 	const schedulerLeases = new SchedulerLeaseGauge(scheduler);
 	const ignored = scheduler.schedule('fault-agent', async () => {
 		activePromises += 1;
@@ -1068,8 +1074,15 @@ async function ignoredAbortReleasesCapacity() {
 	assert.equal(timers.snapshot().requestedDelays[0], 20);
 	await timers.runNext();
 	await ignoredOutcome;
+	assert.equal(scheduler.activeCount, 0, 'the ignored-abort turn retains the physical slot during grace');
+	assert.equal(scheduler.pendingCount, 1, 'replacement work remains queued during grace');
+	assert.equal(scheduler.pressureSnapshot.settling, 1);
+	assert.equal(activePromises, 1, 'replacement work cannot overlap during grace');
+	assert.equal(maxActivePromises, 1);
+	assert.equal(timers.snapshot().requestedDelays[1], 5);
+	await timers.runNext();
 	assert.equal(scheduler.activeCount, 1, 'the replacement owns the released scheduler slot');
-	assert.equal(activePromises, 2, 'the ignored-abort promise remains owned while replacement capacity is released');
+	assert.equal(activePromises, 2, 'forced release permits replacement after the bounded grace');
 	schedulerLeases.sample();
 	releaseReplacement();
 	assert.equal(await replacement, 'healthy');
@@ -1078,14 +1091,14 @@ async function ignoredAbortReleasesCapacity() {
 	scheduler.close();
 	schedulerLeases.sample();
 	return evidence({
-		recovery: { healthy: scheduler.activeCount === 0 && scheduler.pendingCount === 0, permanentLatch: false, stateBefore: 'lease_expired', stateAfter: 'capacity_available', nextProbeAtEpochMs: 20, attemptTimes: [0, 20], probeDeadlines: [20], retryDelays: [20], attemptCount: 2 },
+		recovery: { healthy: scheduler.activeCount === 0 && scheduler.pendingCount === 0, permanentLatch: false, stateBefore: 'lease_expired', stateAfter: 'capacity_available', nextProbeAtEpochMs: 25, attemptTimes: [0, 25], probeDeadlines: [20, 25], retryDelays: [20, 5], attemptCount: 2 },
 		states: notApplicable('states', 'PlanningScheduler does not own agent domain lifecycle state.'),
 		profile: notApplicable('profile', 'Scheduler capacity is provider-profile agnostic and cannot mutate a profile.'),
 		resources: resources({
 			leases: schedulerLeases.evidence('PlanningScheduler active lease sampler'),
 			sessions: notApplicable('sessions', 'The scheduler test deliberately uses no provider session.'),
 			actions: notApplicable('actions', 'Planning tasks do not invoke the Minecraft action bridge in this scenario.'),
-			timers: timers.evidence('PlanningScheduler injected lease timer'),
+			timers: timers.evidence('PlanningScheduler injected lease and settlement timers'),
 			promises: promiseEvidence(activePromises, maxActivePromises, 'underlying abort-ignoring task ownership counter'),
 			childProcesses: notApplicable('childProcesses', 'This in-process scheduler fixture has no child-process creation capability.'),
 			listeners: notApplicable('listeners', 'PlanningScheduler exposes no event-listener surface.'),

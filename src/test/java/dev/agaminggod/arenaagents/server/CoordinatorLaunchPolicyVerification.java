@@ -6,10 +6,10 @@ public final class CoordinatorLaunchPolicyVerification {
 
 	public static int verify() {
 		long createdAt = 10_000L;
-		assertFalse(CoordinatorLaunchPolicy.shouldStart(false, false, createdAt, createdAt), "startup grace prevents a duplicate coordinator");
+		assertTrue(CoordinatorLaunchPolicy.shouldStart(false, false, createdAt, createdAt), "owned coordinator starts without an artificial delay");
 		assertFalse(CoordinatorLaunchPolicy.shouldStart(true, false, createdAt, createdAt + 5_000L), "authenticated coordinator is reused");
 		assertFalse(CoordinatorLaunchPolicy.shouldStart(false, true, createdAt, createdAt + 5_000L), "live owned coordinator is retained");
-		assertTrue(CoordinatorLaunchPolicy.shouldStart(false, false, createdAt, createdAt + CoordinatorLaunchPolicy.STARTUP_GRACE_MS), "missing coordinator starts after grace");
+		assertTrue(CoordinatorLaunchPolicy.shouldStart(false, false, createdAt, createdAt + CoordinatorLaunchPolicy.STARTUP_GRACE_MS), "missing coordinator starts immediately");
 		CoordinatorLaunchPolicy.RestartBudget budget = new CoordinatorLaunchPolicy.RestartBudget();
 		long[] expectedDelays = {1_000L, 2_000L, 5_000L, 15_000L, 30_000L, 30_000L, 30_000L, 30_000L};
 		for (int crash = 0; crash < expectedDelays.length; crash++) {

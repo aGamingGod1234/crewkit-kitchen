@@ -248,6 +248,26 @@ test('bootstrap catalog is complete before mixed-provider profiles can be accept
 	]);
 });
 
+test('bootstrap catalog delegates profile-aware fast paths to the selected provider', async () => {
+	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
+	let receivedRecords = null;
+	services.codex.bootstrapCatalog = async (records) => {
+		receivedRecords = records;
+		return {
+			refreshedAtEpochMs: 0,
+			models: [{ id: 'codex-model', model: 'codex-model', displayName: 'Codex model', reasoningEfforts: ['high'], serviceTiers: ['fast'] }],
+			source: 'builtin',
+		};
+	};
+	services.codex.catalog.refresh = async () => { throw new Error('generic refresh bypassed provider fast path'); };
+	const router = new ProviderService(services);
+
+	const record = profile('codex');
+	const snapshot = await router.bootstrapCatalog([record]);
+	assert.deepEqual(receivedRecords, [record]);
+	assert.deepEqual(snapshot.models.map(({ provider, id }) => ({ provider, id })), [{ provider: 'codex', id: 'codex-model' }]);
+});
+
 test('concurrent creation coalesces one lazy startup for the selected provider', async () => {
 	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
 	let releaseStart;

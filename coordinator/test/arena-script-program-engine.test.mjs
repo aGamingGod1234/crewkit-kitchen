@@ -141,6 +141,34 @@ test('watchers fire on false-to-true edges and boundary handlers wait for the ac
 	assert.deepEqual(dispatched.map((row) => row.action.type), ['navigate_to', 'wait']);
 });
 
+test('fact-domain watcher pruning matches always-evaluate edge and interrupt ordering', () => {
+	const runSequence = (condition, prefix = '') => {
+		const traces = [];
+		const run = engineFor(`
+			program.onUnhandledAttention("continue_and_notify");
+			${prefix}
+			program.watch(() => ${condition}, { mode: "interrupt" }, async () => { await player.wait(9); });
+			await player.wait(1);
+		`, { trace: (event, fields) => { if (event === 'watcher_fired') traces.push(fields.eventSequence); } });
+		run.engine.ingestObservation({ observation: observation({ entities: [{ stableId: 'mob-1', type: 'minecraft:zombie', x: 2, y: 64, z: 0 }] }), eventSequence: 2 });
+		run.engine.ingestObservation({ observation: observation({ player: { x: 0, y: 64, z: 0, health: 19 } }), eventSequence: 3 });
+		run.engine.ingestActionResult({ actionId: run.dispatched[0].actionId, state: 'CANCELLED', reasonCode: 'INTERRUPTED', eventSequence: 4 });
+		run.engine.ingestActionResult({ actionId: run.dispatched[1].actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 5 });
+		run.engine.ingestObservation({ observation: observation(), eventSequence: 5 });
+		run.engine.ingestObservation({ observation: observation({ blocks: [{ stableId: 'block-1', blockId: 'minecraft:stone', x: 1, y: 64, z: 0 }] }), eventSequence: 6 });
+		run.engine.ingestObservation({ observation: observation({ player: { x: 0, y: 64, z: 0, health: 19 } }), eventSequence: 7 });
+		return {
+			traces,
+			cancelled: run.cancelled.length,
+			actions: run.dispatched.map(({ action }) => ({ type: action.type, arguments: { ...action.arguments } })),
+		};
+	};
+	const pruned = runSequence('player.state().health < 20');
+	const alwaysEvaluated = runSequence('player.state().health < threshold', 'const threshold = 20;');
+	assert.deepEqual(pruned, alwaysEvaluated);
+	assert.deepEqual(pruned.traces, [3, 7]);
+});
+
 test('coalesces one pending latch per watcher and preserves the newest facts sequence', () => {
 	const traces = [];
 	const { engine, dispatched } = engineFor(`

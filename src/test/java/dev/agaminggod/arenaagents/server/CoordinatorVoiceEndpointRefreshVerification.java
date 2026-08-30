@@ -31,7 +31,8 @@ public final class CoordinatorVoiceEndpointRefreshVerification {
 			System.clearProperty("arenaagents.voiceUrl");
 			Files.writeString(config, "{\"voice\":{\"port\":18766}}", StandardCharsets.UTF_8);
 			MutableResolver managedResolver = new MutableResolver(config, "managed-initial");
-			managed = supervisor(managedResolver, "00000000-0000-0000-0000-000000000801");
+			String managedLaunchId = "00000000-0000-0000-0000-000000000801";
+			managed = supervisor(managedResolver, managedLaunchId);
 
 			assertEquals("http://127.0.0.1:18766/v1/tts", System.getProperty("arenaagents.voiceUrl"),
 					"initial dependency preparation publishes the config-derived voice endpoint");
@@ -43,7 +44,7 @@ public final class CoordinatorVoiceEndpointRefreshVerification {
 			Files.writeString(config, "{\"voice\":{\"port\":18767}}", StandardCharsets.UTF_8);
 			managedResolver.fingerprint = "managed-config-only-change";
 			managed.publishDependencyFingerprintChange();
-			managed.tick(false, null, 0L);
+			managed.tick(true, managedLaunchId, 1L);
 			assertEquals("http://127.0.0.1:18767/v1/tts", System.getProperty("arenaagents.voiceUrl"),
 					"config-only dependency changes replace the supervisor-managed voice endpoint");
 			assertTrue(managed.voiceConfigurationRevision() > initialVoiceRevision,
@@ -53,7 +54,8 @@ public final class CoordinatorVoiceEndpointRefreshVerification {
 
 			long refreshedRevision = managed.voiceConfigurationRevision();
 			managed.publishDependencyFingerprintChange();
-			managed.tick(false, null, 0L);
+			managed.tick(true, managedLaunchId, 1L);
+			managed.tick(true, managedLaunchId, 1L);
 			assertEquals(refreshedRevision, managed.voiceConfigurationRevision(),
 					"an unchanged resolved endpoint does not recreate the voice client");
 
@@ -68,7 +70,8 @@ public final class CoordinatorVoiceEndpointRefreshVerification {
 			long bridgeRevisionBeforeSecretRotation = managed.bridgeRevision();
 			managedResolver.rotateSecret("managed-secret-only-change", "w".repeat(32));
 			managed.publishDependencyFingerprintChange();
-			managed.tick(false, null, 0L);
+			managed.tick(true, managedLaunchId, 1L);
+			managed.tick(true, managedLaunchId, 1L);
 			assertEquals(endpointRevisionBeforeSecretRotation, managed.voiceConfigurationRevision(),
 					"secret-only rotation preserves the endpoint-only revision");
 			assertTrue(managed.bridgeRevision() > bridgeRevisionBeforeSecretRotation,
@@ -88,7 +91,8 @@ public final class CoordinatorVoiceEndpointRefreshVerification {
 			String explicitOverride = "http://127.0.0.1:19999/v1/tts";
 			System.setProperty("arenaagents.voiceUrl", explicitOverride);
 			MutableResolver overrideResolver = new MutableResolver(config, "override-initial");
-			overridden = supervisor(overrideResolver, "00000000-0000-0000-0000-000000000802");
+			String overrideLaunchId = "00000000-0000-0000-0000-000000000802";
+			overridden = supervisor(overrideResolver, overrideLaunchId);
 			assertEquals(explicitOverride, System.getProperty("arenaagents.voiceUrl"),
 					"initial preparation leaves an explicit user voice endpoint untouched");
 			long overrideRevision = overridden.voiceConfigurationRevision();
@@ -96,7 +100,7 @@ public final class CoordinatorVoiceEndpointRefreshVerification {
 			Files.writeString(config, "{\"voice\":{\"port\":18768}}", StandardCharsets.UTF_8);
 			overrideResolver.fingerprint = "explicit-override-config-change";
 			overridden.publishDependencyFingerprintChange();
-			overridden.tick(false, null, 0L);
+			overridden.tick(true, overrideLaunchId, 1L);
 			assertEquals(explicitOverride, System.getProperty("arenaagents.voiceUrl"),
 					"config changes never replace an explicit user voice endpoint override");
 			assertEquals(overrideRevision, overridden.voiceConfigurationRevision(),
@@ -163,9 +167,22 @@ public final class CoordinatorVoiceEndpointRefreshVerification {
 	private static CoordinatorProcessSupervisor supervisor(MutableResolver resolver, String launchId) {
 		return new CoordinatorProcessSupervisor(
 				Path.of("build", "voice-endpoint-refresh-game"), Map.of(), () -> 100_000L, resolver,
-				request -> { throw new AssertionError("voice endpoint refresh must not launch before startup grace"); },
+				request -> new OwnedTestChild(),
 				() -> launchId, Runnable::run, runtimeRoot -> 0, task -> { }
 		);
+	}
+
+	private static final class OwnedTestChild implements CoordinatorProcessSupervisor.ChildProcess {
+		private boolean alive = true;
+
+		@Override
+		public boolean isAlive() { return alive; }
+
+		@Override
+		public long pid() { return 10_000L; }
+
+		@Override
+		public void terminate() { alive = false; }
 	}
 
 	private static final class MutableResolver implements CoordinatorProcessSupervisor.DependencyResolver {
