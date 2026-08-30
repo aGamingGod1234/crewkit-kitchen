@@ -852,7 +852,7 @@ $node = Resolve-Node
 $serverLauncher = Join-Path $ServerTemplate 'fabric-server-launch.jar'
 if (-not (Test-Path -LiteralPath $ServerTemplate -PathType Container)) { throw "Missing server template: $ServerTemplate" }
 if (-not (Test-Path -LiteralPath $serverLauncher -PathType Leaf)) { throw "Missing Fabric server launcher: $serverLauncher" }
-$builtJar = Join-Path $root 'build\libs\arena-agents-0.1.0.jar'
+$builtJar = Join-Path $root 'build\libs\arena-agents-0.2.0.jar'
 if (-not (Test-Path -LiteralPath $builtJar -PathType Leaf)) { throw "Missing built mod JAR: $builtJar" }
 $matrix = Read-Matrix $MatrixPath
 $selected = @($matrix.scenarios | Where-Object { [string]::IsNullOrWhiteSpace($ScenarioId) -or [string] $_.id -eq $ScenarioId })

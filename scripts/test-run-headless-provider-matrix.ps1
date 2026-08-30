@@ -48,12 +48,20 @@ input.on('line', (line) => {
         const request = JSON.parse(line);
         if (!Number.isInteger(request.id)) return;
         if (request.method === 'model/list' && existsSync(`${process.env.APPDATA}/no-catalog`)) return;
-        const result = request.method === 'model/list' ? { data: [], nextCursor: null } : {};
+        const result = request.method === 'model/list' ? {
+            data: [{
+                id: 'fixture',
+                model: 'fixture',
+                supportedReasoningEfforts: [{ reasoningEffort: 'low' }],
+                serviceTiers: [{ id: 'fast' }, { id: 'priority' }],
+            }],
+            nextCursor: null,
+        } : {};
         process.stdout.write(`${JSON.stringify({ id: request.id, result })}\n`);
     } catch {}
 });
 '@ | Set-Content -LiteralPath $fakeCodex -NoNewline
-	Set-Content -LiteralPath (Join-Path $Root 'build\libs\arena-agents-0.1.0.jar') -Value 'fixture' -NoNewline
+	Set-Content -LiteralPath (Join-Path $Root 'build\libs\arena-agents-0.2.0.jar') -Value 'fixture' -NoNewline
 	Set-Content -LiteralPath (Join-Path $Root 'runtime\server-template\fabric-server-launch.jar') -Value 'not-a-real-jar' -NoNewline
 	Set-Content -LiteralPath (Join-Path $Root 'runtime\server-template\world\stale.dat') -Value 'must not be copied' -NoNewline
 	$dynamicConfig = [pscustomobject]@{
@@ -89,10 +97,14 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.security.MessageDigest;
+import java.util.Base64;
 import java.util.Properties;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 
 public final class FakeServer {
     private static int readLittleEndian(InputStream input) throws IOException {
@@ -161,18 +173,55 @@ public final class FakeServer {
         return Integer.parseInt(matcher.group(1));
     }
 
+    private static String jsonString(String json, String field) throws IOException {
+        Matcher matcher = Pattern.compile("\\\"" + Pattern.quote(field) + "\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"").matcher(json);
+        if (!matcher.find()) throw new IOException("missing JSON field: " + field);
+        return matcher.group(1);
+    }
+
+    private static String optionalJsonString(String json, String field) {
+        Matcher matcher = Pattern.compile("\\\"" + Pattern.quote(field) + "\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"").matcher(json);
+        return matcher.find() ? matcher.group(1) : null;
+    }
+
+    private static String authenticationProof(String secret, String role, String clientNonce,
+                                               String serverNonce, String serverInstanceId, String launchId) throws Exception {
+        String context = String.join("\0", "arena-agents-v2", role, clientNonce, serverNonce, serverInstanceId)
+            + ("coordinator".equals(role) ? "\0" + (launchId == null ? "" : launchId) : "");
+        Mac mac = Mac.getInstance("HmacSHA256");
+        mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(mac.doFinal(context.getBytes(StandardCharsets.UTF_8)));
+    }
+
     private static void serveBridge(Socket socket, AtomicBoolean running) {
         try (socket; BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8)); OutputStream output = socket.getOutputStream()) {
+            String challenge = reader.readLine();
+            if (challenge == null) return;
+            String challengeId = jsonString(challenge, "messageId");
+            String clientNonce = jsonString(challenge, "clientNonce");
+            String serverNonce = Base64.getUrlEncoder().withoutPadding().encodeToString(
+                MessageDigest.getInstance("SHA-256").digest("fake-server".getBytes(StandardCharsets.UTF_8))
+            );
+            String secret = Files.readString(Path.of(System.getProperty("arenaagents.bridgeSecretFile"))).trim();
+            String serverProof = authenticationProof(secret, "server", clientNonce, serverNonce, "fake-server", null);
+            String authResponse = "{\"protocolVersion\":2,\"serverInstanceId\":\"fake-server\",\"agentId\":\"server\",\"type\":\"auth_response\",\"messageId\":\"fake-auth\",\"payload\":{\"replyTo\":\"" + challengeId + "\",\"clientNonce\":\"" + clientNonce + "\",\"serverNonce\":\"" + serverNonce + "\",\"proof\":\"" + serverProof + "\"}}\n";
+            output.write(authResponse.getBytes(StandardCharsets.UTF_8));
+            output.flush();
             String hello = reader.readLine();
             if (hello == null) return;
             if ("1".equals(System.getenv("ARENA_HEADLESS_FAKE_NO_HELLO_ACK"))) return;
-            Matcher messageId = Pattern.compile("\\\"messageId\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"").matcher(hello);
-            if (!messageId.find()) return;
-            String response = "{\"protocolVersion\":2,\"serverInstanceId\":\"fake-server\",\"agentId\":\"server\",\"type\":\"hello_ack\",\"messageId\":\"fake-ack\",\"payload\":{\"replyTo\":\"" + messageId.group(1) + "\",\"authenticated\":true,\"registry\":[]}}\n";
+            String helloId = jsonString(hello, "messageId");
+            String launchId = optionalJsonString(hello, "launchId");
+            String coordinatorProof = jsonString(hello, "proof");
+            String expectedProof = authenticationProof(secret, "coordinator", clientNonce, serverNonce, "fake-server", launchId);
+            if (!MessageDigest.isEqual(coordinatorProof.getBytes(StandardCharsets.UTF_8), expectedProof.getBytes(StandardCharsets.UTF_8))) return;
+            String launchField = launchId == null ? "" : ",\"launchId\":\"" + launchId + "\"";
+            String response = "{\"protocolVersion\":2,\"serverInstanceId\":\"fake-server\",\"agentId\":\"server\",\"type\":\"hello_ack\",\"messageId\":\"fake-ack\",\"payload\":{\"replyTo\":\"" + helloId + "\",\"authenticated\":true,\"registry\":[]" + launchField + "}}\n";
             output.write(response.getBytes(StandardCharsets.UTF_8));
             output.flush();
             while (running.get() && reader.readLine() != null) { }
-        } catch (IOException ignored) {
+        } catch (Exception exception) {
+            exception.printStackTrace();
         }
     }
 

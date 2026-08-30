@@ -65,7 +65,9 @@ function Get-ExpectedCoordinatorFiles([string] $CoordinatorRoot) {
         $rootPath = Join-Path $CoordinatorRoot $root
         if (-not (Test-Path -LiteralPath $rootPath -PathType Container)) { throw "Missing coordinator runtime root: $rootPath" }
         foreach ($file in Get-ChildItem -LiteralPath $rootPath -Recurse -File) {
-            $paths.Add($file.FullName.Substring($CoordinatorRoot.Length + 1).Replace('\', '/'))
+            $relative = $file.FullName.Substring($CoordinatorRoot.Length + 1).Replace('\', '/')
+            if ($relative -match '(^|/)__pycache__(/|$)' -or $relative -match '\.pyc$') { continue }
+            $paths.Add($relative)
         }
     }
     return @($paths | Sort-Object -Unique)
@@ -127,7 +129,7 @@ Assert-NoReparse $project 'project root'
 Assert-NoReparse $game 'game directory'
 $mods = Resolve-ContainedPath $game (Join-Path $game 'mods') 'mods target'
 $runtime = Resolve-ContainedPath $game (Join-Path $game 'arena-agents-runtime') 'runtime target'
-$jar = Join-Path $project 'build\libs\arena-agents-0.1.0.jar'
+$jar = Join-Path $project 'build\libs\arena-agents-0.2.0.jar'
 $coordinator = Join-Path $project 'coordinator'
 Assert-NoReparse $mods 'mods target'
 Assert-NoReparse $runtime 'runtime target'
@@ -159,14 +161,14 @@ $backup = Join-Path $game ('.arena-agents-backup-' + [DateTime]::UtcNow.ToString
 $stageMods = Join-Path $stage 'mods'
 $stageCoordinator = Join-Path $stage 'coordinator'
 $installedCoordinator = Join-Path $runtime 'coordinator'
-$installedJar = Join-Path $mods 'arena-agents-0.1.0.jar'
+$installedJar = Join-Path $mods 'arena-agents-0.2.0.jar'
 $backupMade = $false
 $oldArena = @()
 try {
     Assert-NoReparse $stage 'staging path'
     Assert-NoReparse $backup 'backup path'
     New-Item -ItemType Directory -Force -Path $stageMods, $stageCoordinator | Out-Null
-    Copy-Item -LiteralPath $jar -Destination (Join-Path $stageMods 'arena-agents-0.1.0.jar') -Force
+    Copy-Item -LiteralPath $jar -Destination (Join-Path $stageMods 'arena-agents-0.2.0.jar') -Force
     Copy-ExpectedCoordinator $coordinator $stageCoordinator $expected
     foreach ($relative in $expected) {
         $sourceHash = (Get-FileHash (Join-Path $coordinator ($relative.Replace('/', '\'))) -Algorithm SHA256).Hash
@@ -194,7 +196,7 @@ try {
     Assert-NoReparseTree $stage 'staging path before mutation'
     Assert-NoReparseTree $backup 'backup path before mutation'
     foreach ($old in $oldArena) { Remove-Item -LiteralPath $old.FullName -Force }
-    Copy-Item -LiteralPath (Join-Path $stageMods 'arena-agents-0.1.0.jar') -Destination $installedJar -Force
+    Copy-Item -LiteralPath (Join-Path $stageMods 'arena-agents-0.2.0.jar') -Destination $installedJar -Force
     if ($FailurePoint -eq 'AfterJarSwap') { throw 'Injected failure after JAR swap.' }
     New-Item -ItemType Directory -Force -Path $runtime | Out-Null
     if (Test-Path -LiteralPath $installedCoordinator) { Remove-Item -LiteralPath $installedCoordinator -Recurse -Force }

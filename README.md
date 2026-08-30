@@ -42,7 +42,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-launcher-profiles.ps1
 
 Preparation is repeatable and verifies copied world artifacts before reuse. See [runtime/README.md](runtime/README.md) for the isolated installation layout.
 
-The Reliability workflow publishes a verified `arena-agents-modpack-0.1.0` artifact. Build the same self-contained archive locally with `.\gradlew.bat packageWindowsDistribution`; it is written to `build\distributions\arena-agents-modpack-0.1.0.zip`. Its installer creates a separate `%APPDATA%\.minecraft-arena-agents` launcher profile, generates a local bridge secret, and copies Arena Agents, Fabric API, Fabric Carpet, the coordinator, and its pinned Node.js runtime without packaging credentials, worlds, logs, or secrets.
+The Reliability workflow publishes a verified `arena-agents-modpack-0.2.0` artifact. Build the same self-contained archive locally with `.\gradlew.bat packageWindowsDistribution`; it is written to `build\distributions\arena-agents-modpack-0.2.0.zip`. Its installer creates a separate `%APPDATA%\.minecraft-arena-agents` launcher profile, generates a local bridge secret, and copies Arena Agents, Fabric API, Fabric Carpet, the coordinator, and its pinned Node.js runtime without packaging credentials, worlds, logs, or secrets.
 
 ## Run summonable NPC mode
 

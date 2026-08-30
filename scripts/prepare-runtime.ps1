@@ -30,7 +30,7 @@ $Agent55 = [IO.Path]::GetFullPath((Join-Path $env:APPDATA '.minecraft-agent-55')
 $Agent56 = [IO.Path]::GetFullPath((Join-Path $env:APPDATA '.minecraft-agent-56'))
 $JavaHome = Join-Path $Runtime 'toolchains\temurin-25\jdk-25.0.3+9'
 $Java = Join-Path $JavaHome 'bin\java.exe'
-$AgentJar = Join-Path $Project 'build\libs\arena-agents-0.1.0.jar'
+$AgentJar = Join-Path $Project 'build\libs\arena-agents-0.2.0.jar'
 $FabricApi = Join-Path $Minecraft "mods\fabric-api-$FabricApiVersion.jar"
 $Installer = Join-Path $Downloads "fabric-installer-$InstallerVersion.jar"
 $WorldEvidence = Join-Path $Evidence 'world-copy.json'
@@ -129,7 +129,7 @@ Write-AgentConfig $Agent55 'agent-55' 25571
 Write-AgentConfig $Agent56 'agent-56' 25572
 foreach ($gameDirectory in @($Agent55, $Agent56)) {
     Copy-Item -LiteralPath $FabricApi -Destination (Join-Path $gameDirectory "mods\fabric-api-$FabricApiVersion.jar") -Force
-    Copy-Item -LiteralPath $AgentJar -Destination (Join-Path $gameDirectory 'mods\arena-agents-0.1.0.jar') -Force
+    Copy-Item -LiteralPath $AgentJar -Destination (Join-Path $gameDirectory 'mods\arena-agents-0.2.0.jar') -Force
 }
 
 New-Item -ItemType Directory -Force -Path $Server,(Join-Path $Server 'mods') | Out-Null
@@ -140,7 +140,7 @@ if (-not (Test-Path -LiteralPath $serverLauncher -PathType Leaf)) {
 }
 if (-not (Test-Path -LiteralPath $serverLauncher -PathType Leaf)) { throw "Fabric server launcher is missing: $serverLauncher" }
 Copy-Item -LiteralPath $FabricApi -Destination (Join-Path $Server "mods\fabric-api-$FabricApiVersion.jar") -Force
-Copy-Item -LiteralPath $AgentJar -Destination (Join-Path $Server 'mods\arena-agents-0.1.0.jar') -Force
+Copy-Item -LiteralPath $AgentJar -Destination (Join-Path $Server 'mods\arena-agents-0.2.0.jar') -Force
 
 if (-not (Test-Path -LiteralPath $TargetWorld)) {
     New-Item -ItemType Directory -Path $TargetWorld | Out-Null

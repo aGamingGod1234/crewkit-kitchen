@@ -120,6 +120,10 @@ def coordinatorRuntimeIncludes = [
 	'src/**',
 	'node_modules/acorn/**',
 ]
+def coordinatorRuntimeExcludes = [
+	'**/__pycache__/**',
+	'**/*.pyc',
+]
 def coordinatorDirectory = layout.projectDirectory.dir('coordinator')
 def coordinatorPackageJson = coordinatorDirectory.file('package.json')
 def coordinatorPackageLock = coordinatorDirectory.file('package-lock.json')
@@ -195,6 +199,7 @@ tasks.register('generateCoordinatorManifest') {
 	dependsOn tasks.named('installCoordinatorProductionDependencies')
 	inputs.files(fileTree(coordinatorDirectory) {
 		coordinatorRuntimeIncludes.each { include it }
+		coordinatorRuntimeExcludes.each { exclude it }
 	}).withPathSensitivity(PathSensitivity.RELATIVE)
 	outputs.file(coordinatorManifest)
 
@@ -202,6 +207,7 @@ tasks.register('generateCoordinatorManifest') {
 		def coordinatorRoot = coordinatorDirectory.asFile
 		def files = fileTree(coordinatorRoot) {
 			coordinatorRuntimeIncludes.each { include it }
+			coordinatorRuntimeExcludes.each { exclude it }
 		}.files
 		def prefixLength = coordinatorRoot.absolutePath.length() + 1
 		def entries = files
@@ -229,6 +235,7 @@ jar {
 	from("coordinator") {
 		into "arena-agents/coordinator"
 		coordinatorRuntimeIncludes.each { include it }
+		coordinatorRuntimeExcludes.each { exclude it }
 	}
 	from(coordinatorManifest) {
 		into "arena-agents/coordinator"
@@ -255,6 +262,7 @@ tasks.register('stageWindowsDistribution', Sync) {
 	from('coordinator') {
 		into 'coordinator'
 		coordinatorRuntimeIncludes.each { include it }
+		coordinatorRuntimeExcludes.each { exclude it }
 	}
 	from(bundledNodeRuntime) { into 'runtime/toolchains/node' }
 	from('scripts') {

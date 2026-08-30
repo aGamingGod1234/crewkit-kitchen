@@ -121,7 +121,7 @@ if (-not $SkipBuild) {
 	}
 }
 
-$arenaJar = Join-Path $project 'build\libs\arena-agents-0.1.0.jar'
+$arenaJar = Join-Path $project 'build\libs\arena-agents-0.2.0.jar'
 $carpetJar = Join-Path $project 'libs\fabric-carpet-26.1+v260402.jar'
 foreach ($required in @($arenaJar, $carpetJar)) {
 	if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "Missing required mod JAR: $required" }

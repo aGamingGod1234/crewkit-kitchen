@@ -16,7 +16,7 @@ $ProfileName = 'Arena Agents'
 $MinimumSecretLength = 32
 $SecretByteCount = 32
 $ExpectedModNames = @(
-    'arena-agents-0.1.0.jar'
+    'arena-agents-0.2.0.jar'
     'fabric-api-0.150.0+26.1.2.jar'
     'fabric-carpet-26.1+v260402.jar'
 )
