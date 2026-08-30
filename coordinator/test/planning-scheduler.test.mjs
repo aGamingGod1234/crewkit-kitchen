@@ -194,13 +194,17 @@ test('cancelling a pending turn releases capacity for another agent', async () =
 });
 
 test('hard planning lease starts recovery but retains capacity until physical settlement', async () => {
-	let timeoutCallback;
+	const timers = [];
 	const cancelled = [];
 	const expired = [];
 	const scheduler = new PlanningScheduler({
 		maxConcurrent: 1,
 		maxPending: 1,
-		scheduleTimeout: (callback, delay) => { timeoutCallback = callback; assert.equal(delay, 25); return 1; },
+		scheduleTimeout: (callback, delay) => {
+			const timer = { callback, delay };
+			timers.push(timer);
+			return timer;
+		},
 		cancelTimeout: (handle) => cancelled.push(handle),
 	});
 	const ignoredAbort = deferred();
@@ -210,7 +214,8 @@ test('hard planning lease starts recovery but retains capacity until physical se
 	});
 	await Promise.resolve();
 	assert.equal(scheduler.activeCount, 1);
-	timeoutCallback();
+	assert.equal(timers[0].delay, 25);
+	timers[0].callback();
 	await assert.rejects(run, (error) => error?.code === 'PLANNING_LEASE_EXPIRED');
 	assert.equal(scheduler.activeCount, 0);
 	assert.equal(expired.length, 1);
@@ -226,7 +231,109 @@ test('hard planning lease starts recovery but retains capacity until physical se
 	assert.equal(await replacement, 'replacement');
 	assert.equal(scheduler.pressureSnapshot.settling, 0);
 	assert.equal(await scheduler.schedule('agent-a', async () => 'recovered'), 'recovered');
-	assert.deepEqual(cancelled, [1]);
+	assert.equal(timers[1].delay, 5_000);
+	assert.deepEqual(cancelled, [timers[0], timers[1]]);
+});
+
+test('lease expiry force-releases ignored-abort work only after recovery receives its settlement grace', async () => {
+	const timers = [];
+	let recoveryStarted = false;
+	const scheduler = new PlanningScheduler({
+		maxConcurrent: 1,
+		maxPending: 1,
+		settlementGraceMs: 10,
+		scheduleTimeout(callback, delay) {
+			if (delay === 10) assert.equal(recoveryStarted, true, 'recovery starts before the grace window');
+			const timer = { callback, delay };
+			timers.push(timer);
+			return timer;
+		},
+		cancelTimeout() {},
+	});
+	const hung = scheduler.schedule('agent-a', () => new Promise(() => {}), {
+		leaseTimeoutMs: 25,
+		onLeaseExpired() {
+			recoveryStarted = true;
+			return new Promise(() => {});
+		},
+	});
+	await Promise.resolve();
+	let replacementStarted = false;
+	const replacement = scheduler.schedule('agent-b', async () => {
+		replacementStarted = true;
+		return 'replacement';
+	});
+
+	assert.equal(timers[0].delay, 25);
+	timers[0].callback();
+	await assert.rejects(hung, (error) => error.code === 'PLANNING_LEASE_EXPIRED');
+	assert.equal(timers[1].delay, 10);
+	assert.equal(replacementStarted, false);
+	assert.equal(scheduler.hasScheduled('agent-a'), true);
+	await assert.rejects(scheduler.schedule('agent-a', async () => 'overlap'), (error) => error.code === 'PLAN_CANCELLING');
+
+	timers[1].callback();
+	assert.equal(await replacement, 'replacement');
+	assert.equal(replacementStarted, true);
+	assert.equal(scheduler.hasScheduled('agent-a'), false);
+	assert.equal(await scheduler.schedule('agent-a', async () => 'recovered'), 'recovered');
+});
+
+test('cancellation without a lease force-releases ignored-abort work after the settlement grace', async () => {
+	const timers = [];
+	const scheduler = new PlanningScheduler({
+		maxConcurrent: 1,
+		maxPending: 1,
+		settlementGraceMs: 10,
+		scheduleTimeout(callback, delay) {
+			const timer = { callback, delay };
+			timers.push(timer);
+			return timer;
+		},
+		cancelTimeout() {},
+	});
+	const hung = scheduler.schedule('agent-a', () => new Promise(() => {}));
+	await Promise.resolve();
+	scheduler.cancel('agent-a', 'superseded');
+	let replacementStarted = false;
+	const replacement = scheduler.schedule('agent-b', async () => {
+		replacementStarted = true;
+		return 'replacement';
+	});
+	await Promise.resolve();
+	assert.equal(timers[0].delay, 10);
+	assert.equal(replacementStarted, false);
+	assert.equal(scheduler.hasScheduled('agent-a'), true);
+
+	timers[0].callback();
+	await assert.rejects(hung, (error) => error.code === 'PLAN_CANCELLED');
+	assert.equal(await replacement, 'replacement');
+	assert.equal(scheduler.hasScheduled('agent-a'), false);
+});
+
+test('closing the scheduler cancels lease and settlement timers and removes settling fences', async () => {
+	const timers = [];
+	const cancelled = [];
+	const scheduler = new PlanningScheduler({
+		maxConcurrent: 1,
+		maxPending: 0,
+		settlementGraceMs: 10,
+		scheduleTimeout(callback, delay) {
+			const timer = { callback, delay };
+			timers.push(timer);
+			return timer;
+		},
+		cancelTimeout: (timer) => cancelled.push(timer),
+	});
+	const hung = scheduler.schedule('agent-a', () => new Promise(() => {}), { leaseTimeoutMs: 25 });
+	await Promise.resolve();
+	scheduler.close('shutdown');
+	await assert.rejects(hung, (error) => error.code === 'PLAN_CANCELLED');
+	assert.deepEqual(timers.map((timer) => timer.delay), [25, 10]);
+	assert.deepEqual(cancelled, timers);
+	assert.equal(scheduler.pressureSnapshot.settling, 0);
+	assert.equal(scheduler.pressureSnapshot.used, 0);
+	assert.equal(scheduler.hasScheduled('agent-a'), false);
 });
 
 test('a failed provider turn releases its slot without affecting another lane', async () => {

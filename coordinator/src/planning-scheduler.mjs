@@ -7,6 +7,7 @@ const MIN_ADAPTIVE_CONCURRENCY = 4;
 const MAX_ADAPTIVE_CONCURRENCY = 16;
 const DEFAULT_URGENT_RESERVE = 1;
 const DEFAULT_MAX_AUXILIARY_PENDING = DEFAULT_AGENT_CAP;
+const DEFAULT_SETTLEMENT_GRACE_MS = 5_000;
 const HEALTHY_WINDOW = 4;
 const TICK_PRESSURE_WINDOW = 3;
 const DEFAULT_LANE = 'default';
@@ -215,6 +216,7 @@ export class PlanningScheduler {
 	#scheduleTimeout;
 	#cancelTimeout;
 	#maxAuxiliaryPending;
+	#settlementGraceMs;
 
 	constructor({
 		maxConcurrent = DEFAULT_MAX_CONCURRENT,
@@ -230,6 +232,7 @@ export class PlanningScheduler {
 		onPressure = () => {},
 		recorder = null,
 		benchmarkRecorder = null,
+		settlementGraceMs = DEFAULT_SETTLEMENT_GRACE_MS,
 		scheduleTimeout = defaultScheduleTimeout,
 		cancelTimeout = clearTimeout,
 	} = {}) {
@@ -239,6 +242,7 @@ export class PlanningScheduler {
 		if (!Number.isSafeInteger(maxAuxiliaryPending) || maxAuxiliaryPending < 0 || maxAuxiliaryPending > DEFAULT_AGENT_CAP) throw new TypeError(`maxAuxiliaryPending must be in [0, ${DEFAULT_AGENT_CAP}]`);
 		if (maxConcurrent + maxPending > DEFAULT_AGENT_CAP) throw new TypeError(`planning capacity must not exceed ${DEFAULT_AGENT_CAP}`);
 		if (!Number.isSafeInteger(urgentBurstLimit) || urgentBurstLimit <= 0) throw new TypeError('urgentBurstLimit must be a positive safe integer');
+		if (!Number.isSafeInteger(settlementGraceMs) || settlementGraceMs <= 0) throw new TypeError('settlementGraceMs must be a positive safe integer');
 		if (typeof onPressure !== 'function') throw new TypeError('onPressure must be a function');
 		if (typeof scheduleTimeout !== 'function') throw new TypeError('scheduleTimeout must be a function');
 		if (typeof cancelTimeout !== 'function') throw new TypeError('cancelTimeout must be a function');
@@ -248,6 +252,7 @@ export class PlanningScheduler {
 		this.#maxPending = maxPending;
 		this.#maxAuxiliaryPending = maxAuxiliaryPending;
 		this.#maxUrgentBurst = urgentBurstLimit;
+		this.#settlementGraceMs = settlementGraceMs;
 		this.#onPressure = onPressure;
 		this.#recorder = selectedRecorder;
 		this.#scheduleTimeout = scheduleTimeout;
@@ -371,8 +376,10 @@ export class PlanningScheduler {
 			const error = new PlanningSchedulerError('PLAN_CANCELLED', reason);
 			active.cancelError = error;
 			active.controller.abort(error);
+			this.#cancelLeaseTimeout(active);
 			this.#active.delete(agentId);
 			this.#settling.set(agentId, active);
+			this.#scheduleSettlementDeadline(active);
 			this.#record('scheduler_cancelled', agentId, { lane: active.lane, priority: active.priority, ...this.#snapshot() });
 		}
 		this.#drain();
@@ -384,6 +391,7 @@ export class PlanningScheduler {
 		if (this.#closed) return;
 		this.#closed = true;
 		for (const agentId of [...this.#pending.keys(), ...this.#active.keys()]) this.cancel(agentId, reason);
+		for (const [agentId, entry] of [...this.#settling.entries()]) this.#forceRelease(agentId, entry.controller, 'scheduler_closed');
 	}
 
 	#lane(lane) {
@@ -402,10 +410,17 @@ export class PlanningScheduler {
 			if (entry === null) break;
 			this.#pending.delete(entry.agentId);
 			const controller = new AbortController();
-			const active = { ...entry, controller, timeoutHandle: null, cancelError: null, promiseSettled: false };
+			const active = {
+				...entry,
+				controller,
+				leaseTimeoutHandle: null,
+				settlementTimeoutHandle: null,
+				cancelError: null,
+				promiseSettled: false,
+			};
 			this.#active.set(entry.agentId, active);
 			if (entry.leaseTimeoutMs !== null) {
-				active.timeoutHandle = this.#scheduleTimeout(() => this.#expire(entry.agentId, controller), entry.leaseTimeoutMs);
+				active.leaseTimeoutHandle = this.#scheduleTimeout(() => this.#expire(entry.agentId, controller), entry.leaseTimeoutMs);
 			}
 			this.#record('scheduler_admitted', entry.agentId, {
 				lane: entry.lane,
@@ -471,7 +486,8 @@ export class PlanningScheduler {
 		const settling = this.#settling.get(agentId);
 		const entry = active?.controller === controller ? active : (settling?.controller === controller ? settling : null);
 		if (entry === null) return;
-		if (entry.timeoutHandle !== null) this.#cancelTimeout(entry.timeoutHandle);
+		this.#cancelLeaseTimeout(entry);
+		this.#cancelSettlementTimeout(entry);
 		if (active === entry) this.#active.delete(agentId);
 		if (settling === entry) this.#settling.delete(agentId);
 		this.#record('scheduler_released', agentId, {
@@ -492,11 +508,10 @@ export class PlanningScheduler {
 		const active = this.#active.get(agentId);
 		const settling = this.#settling.get(agentId);
 		const entry = active?.controller === controller ? active : (settling?.controller === controller ? settling : null);
-		if (entry === null) return;
+		if (entry === null || entry.cancelError !== null) return;
 		const error = new PlanningSchedulerError('PLANNING_LEASE_EXPIRED', `Planning lease for '${agentId}' expired after ${entry.leaseTimeoutMs} ms`);
 		controller.abort(error);
-		if (entry.timeoutHandle !== null) this.#cancelTimeout(entry.timeoutHandle);
-		entry.timeoutHandle = null;
+		this.#cancelLeaseTimeout(entry);
 		if (active === entry) {
 			this.#active.delete(agentId);
 			this.#settling.set(agentId, entry);
@@ -514,8 +529,49 @@ export class PlanningScheduler {
 				error,
 			})).catch(() => undefined);
 		} catch { /* recovery cannot retain scheduler capacity */ }
+		this.#scheduleSettlementDeadline(entry);
 		this.#record('scheduler_lease_expired', agentId, { lane: entry.lane, priority: entry.priority, ...this.#snapshot() });
 		this.#drain();
+	}
+
+	#scheduleSettlementDeadline(entry) {
+		if (this.#settling.get(entry.agentId) !== entry || entry.settlementTimeoutHandle !== null) return;
+		entry.settlementTimeoutHandle = this.#scheduleTimeout(
+			() => this.#forceRelease(entry.agentId, entry.controller, 'settlement_grace_expired'),
+			this.#settlementGraceMs,
+		);
+	}
+
+	#forceRelease(agentId, controller, reason) {
+		const entry = this.#settling.get(agentId);
+		if (entry?.controller !== controller) return;
+		this.#cancelLeaseTimeout(entry);
+		this.#cancelSettlementTimeout(entry);
+		this.#settling.delete(agentId);
+		this.#record('scheduler_forced_release', agentId, {
+			lane: entry.lane,
+			priority: entry.priority,
+			reason,
+			...this.#snapshot(),
+		});
+		this.#drain();
+		this.#notifyPressure();
+		if (!entry.promiseSettled) {
+			entry.promiseSettled = true;
+			entry.reject(entry.cancelError ?? new PlanningSchedulerError('PLAN_CANCELLED', 'Planning turn settlement grace expired'));
+		}
+	}
+
+	#cancelLeaseTimeout(entry) {
+		if (entry.leaseTimeoutHandle === null) return;
+		this.#cancelTimeout(entry.leaseTimeoutHandle);
+		entry.leaseTimeoutHandle = null;
+	}
+
+	#cancelSettlementTimeout(entry) {
+		if (entry.settlementTimeoutHandle === null) return;
+		this.#cancelTimeout(entry.settlementTimeoutHandle);
+		entry.settlementTimeoutHandle = null;
 	}
 
 	#snapshot() {

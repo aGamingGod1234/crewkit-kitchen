@@ -846,7 +846,7 @@ test('native turn keeps scheduler and selected Codex profile while delegating bo
 test('hung native turn releases scheduler capacity without tearing down a newer exact generation', async () => {
 	const nativeRecord = { ...RECORD, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'xhigh' };
 	const fingerprint = profileFingerprint(nativeRecord);
-	const scheduler = new PlanningScheduler({ maxConcurrent: 1, maxPending: 1 });
+	const scheduler = new PlanningScheduler({ maxConcurrent: 1, maxPending: 1, settlementGraceMs: 5 });
 	let actStarted;
 	const started = new Promise((resolve) => { actStarted = resolve; });
 	const first = {
