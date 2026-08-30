@@ -1781,9 +1781,17 @@ public final class CoordinatorProcessSupervisorVerification {
 			supervisor.tick(true, originalBridge.authenticatedLaunchId(), originalBridge.authenticatedSessionGeneration());
 			assertEquals(2, launcher.launches.size(), "secret repair relaunches one matching coordinator child");
 			long repairedRevision = supervisor.bridgeRevision();
-			slot.reconcile(repairedRevision, () ->
-					MultiplexedServerBridge.withPreparedSecret(manager, port, ownedSupervisor.bridgeSecret()));
-			MultiplexedServerBridge repairedBridge = slot.bridge();
+			MultiplexedServerBridge repairedBridge = null;
+			long rebindDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5L);
+			do {
+				slot.reconcile(repairedRevision, () ->
+						MultiplexedServerBridge.withPreparedSecret(manager, port, ownedSupervisor.bridgeSecret()));
+				repairedBridge = slot.bridge();
+				if (repairedBridge != null) break;
+				clock.advance(1_000L);
+				Thread.sleep(25L);
+			} while (System.nanoTime() < rebindDeadline);
+			assertTrue(repairedBridge != null, "secret repair rebinds through the BridgeSlot retry policy");
 			assertFalse(originalBridge == repairedBridge, "secret repair replaces the cached Java bridge instance");
 			assertEquals(dev.agaminggod.arenaagents.agent.AgentLifecycleState.DISCONNECTED,
 					manager.registry().require(active.agentId()).state(),
