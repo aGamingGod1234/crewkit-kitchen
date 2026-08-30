@@ -1015,18 +1015,18 @@ public final class VerificationMain {
 						+ challenge.get("nonce").getAsString() + "\",\"nonce\":\"" + BridgeAuthentication.newNonce() + "\"}");
 				assertErrorCode(codec, missingProof, "MISSING_FIELD", "hello response requires coordinator proof");
 			}
-			try (Socket invalidProof = openClient(port)) {
-				JsonObject challenge = readMessage(codec, invalidProof);
+			try (HandshakeClient invalidProof = openHandshakeWithRetry(codec, port)) {
+				JsonObject challenge = invalidProof.challenge();
 				String responseId = "invalid-proof";
 				String coordinatorNonce = BridgeAuthentication.newNonce();
-				writeMessage(codec, invalidProof, helloResponseEnvelope(
+				writeMessage(codec, invalidProof.socket(), helloResponseEnvelope(
 						challenge.get("messageId").getAsString(),
 						responseId,
 						challenge.get("nonce").getAsString(),
 						coordinatorNonce,
 						"impostor-bridge-secret-0123456789"
 				));
-				assertErrorCode(codec, invalidProof, "AUTHENTICATION_FAILED", "hello rejects impostor proof");
+				assertErrorCode(codec, invalidProof.socket(), "AUTHENTICATION_FAILED", "hello rejects impostor proof");
 			}
 			try (Socket authenticated = connectAuthenticatedWithRetry(codec, port, "valid-secret")) {
 				assertTrue(authenticated.isConnected(), "valid bridge proof authenticates");
@@ -1481,6 +1481,43 @@ public final class VerificationMain {
 			Thread.sleep(AUTHENTICATION_RETRY_DELAY_MS);
 		}
 		throw new AssertionError("session did not reconnect", lastFailure);
+	}
+
+	private static HandshakeClient openHandshakeWithRetry(ProtocolCodec codec, int port) throws Exception {
+		long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(ASYNC_TIMEOUT_MS);
+		Throwable lastFailure = null;
+		while (System.nanoTime() < deadline) {
+			Socket socket = null;
+			try {
+				socket = openClient(port);
+				JsonObject challenge = readMessage(codec, socket);
+				String type = challenge.has("type") ? challenge.get("type").getAsString() : "";
+				if ("hello_challenge".equals(type)) {
+					HandshakeClient client = new HandshakeClient(socket, challenge);
+					socket = null;
+					return client;
+				}
+				if (!"error".equals(type)
+						|| !challenge.has("code")
+						|| !"SESSION_ACTIVE".equals(challenge.get("code").getAsString())) {
+					throw new AssertionError("unexpected bridge handshake response: " + challenge);
+				}
+				lastFailure = new ProtocolException("SESSION_ACTIVE", "previous bridge session is still closing");
+			} catch (IOException exception) {
+				lastFailure = exception;
+			} finally {
+				if (socket != null) socket.close();
+			}
+			Thread.sleep(AUTHENTICATION_RETRY_DELAY_MS);
+		}
+		throw new AssertionError("bridge handshake slot did not reopen", lastFailure);
+	}
+
+	private record HandshakeClient(Socket socket, JsonObject challenge) implements AutoCloseable {
+		@Override
+		public void close() throws IOException {
+			socket.close();
+		}
 	}
 
 	private static void writeMessage(ProtocolCodec codec, Socket socket, String json) throws IOException {
