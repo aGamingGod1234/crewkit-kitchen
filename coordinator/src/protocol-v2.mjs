@@ -100,6 +100,8 @@ const FACTUAL_PLAYER_FIELDS = new Set([
 const FACTUAL_TOP_LEVEL_PATHS = new Set([
 	'ready', 'status', 'position', 'velocity', 'view', 'inventory', 'entities', 'blocks', 'nearbyContainers', 'world', 'currentAction', 'lastResult',
 ]);
+const TRUSTED_ENVELOPES = new WeakSet();
+const TRUSTED_PAYLOAD_TYPES = new WeakMap();
 
 export class ProtocolV2Error extends Error {
 	constructor(code, message, options) {
@@ -121,6 +123,10 @@ export function createProtocolV2Envelope({ serverInstanceId, agentId, type, mess
 }
 
 export function validateProtocolV2Envelope(value, { direction } = {}) {
+	if (value !== null && typeof value === 'object' && TRUSTED_ENVELOPES.has(value)) {
+		validateDirection(value.type, direction);
+		return value;
+	}
 	if (!isPlainObject(value)) throw new ProtocolV2Error('INVALID_ENVELOPE', 'Protocol v2 envelope must be an object');
 	const keys = Object.keys(value);
 	const expectedKeys = ['protocolVersion', 'serverInstanceId', 'agentId', 'type', 'messageId', 'payload'];
@@ -132,8 +138,7 @@ export function validateProtocolV2Envelope(value, { direction } = {}) {
 	const type = requireIdentifier(value.type, 'type');
 	const messageId = requireText(value.messageId, 'messageId', MAX_COMMAND_ID_LENGTH);
 	if (!isPlainObject(value.payload)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Protocol v2 payload must be an object');
-	if (direction === 'coordinator_to_server' && !COORDINATOR_TYPES.has(type)) throw new ProtocolV2Error('INVALID_MESSAGE_TYPE', `Message type '${type}' is not coordinator-to-server`);
-	if (direction === 'server_to_coordinator' && !SERVER_TYPES.has(type)) throw new ProtocolV2Error('INVALID_MESSAGE_TYPE', `Message type '${type}' is not server-to-coordinator`);
+	validateDirection(type, direction);
 	if ((type === 'hello' || type === 'hello_ack' || type === 'catalog_request' || type === 'catalog_snapshot' || type === 'coordinator_status' || type === 'verbose_control' || type === 'heartbeat' || type === 'shutdown') && agentId !== 'server') {
 		throw new ProtocolV2Error('INVALID_AGENT_SCOPE', `Message type '${type}' must use agentId 'server'`);
 	}
@@ -147,10 +152,19 @@ export function validateProtocolV2Envelope(value, { direction } = {}) {
 	if (type === 'conversation_wake' && payload.event.recipientId !== agentId) {
 		throw new ProtocolV2Error('INVALID_AGENT_SCOPE', 'conversation_wake event recipientId must match the envelope agentId');
 	}
-	return { protocolVersion: MULTIPLEXED_PROTOCOL_VERSION, serverInstanceId, agentId, type, messageId, payload };
+	const normalized = deepFreeze({ protocolVersion: MULTIPLEXED_PROTOCOL_VERSION, serverInstanceId, agentId, type, messageId, payload });
+	TRUSTED_ENVELOPES.add(normalized);
+	return normalized;
 }
 
 export function validateProtocolV2Payload(type, value) {
+	if (value !== null && typeof value === 'object' && TRUSTED_PAYLOAD_TYPES.get(value) === type) return value;
+	const normalized = deepFreeze(normalizeProtocolV2Payload(type, value));
+	TRUSTED_PAYLOAD_TYPES.set(normalized, type);
+	return normalized;
+}
+
+function normalizeProtocolV2Payload(type, value) {
 	if (!isPlainObject(value)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${type} payload must be an object`);
 	switch (type) {
 		case 'hello':
@@ -278,6 +292,11 @@ export function validateProtocolV2Payload(type, value) {
 		default:
 			throw new ProtocolV2Error('INVALID_MESSAGE_TYPE', `Unsupported protocol v2 payload type '${String(type)}'`);
 	}
+}
+
+function validateDirection(type, direction) {
+	if (direction === 'coordinator_to_server' && !COORDINATOR_TYPES.has(type)) throw new ProtocolV2Error('INVALID_MESSAGE_TYPE', `Message type '${type}' is not coordinator-to-server`);
+	if (direction === 'server_to_coordinator' && !SERVER_TYPES.has(type)) throw new ProtocolV2Error('INVALID_MESSAGE_TYPE', `Message type '${type}' is not server-to-coordinator`);
 }
 
 function normalizeCompletionFact(value, index) {

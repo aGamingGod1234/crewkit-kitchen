@@ -66,7 +66,13 @@ test('accepts every exact action shape and returns a detached value', () => {
 		{ type: 'menu_button', menuId: 'minecraft:enchantment', buttonId: 1, timeoutMs: 5_000 },
 		{ type: 'anvil_rename', menuId: 'minecraft:anvil', name: 'Explorer', timeoutMs: 5_000 },
 	];
-	for (const action of actions) assert.deepEqual(validateAction(action), action);
+	for (const action of actions) {
+		const normalized = validateAction(action);
+		assert.deepEqual(normalized, action);
+		assert.notStrictEqual(normalized, action);
+		assert.equal(Object.isFrozen(normalized), true);
+		assert.strictEqual(validateAction(normalized), normalized);
+	}
 });
 
 test('rejects unknown fields, unsupported actions, and unsafe numeric/text values', () => {

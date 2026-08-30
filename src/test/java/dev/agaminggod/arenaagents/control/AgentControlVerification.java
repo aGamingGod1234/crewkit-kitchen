@@ -52,6 +52,14 @@ public final class AgentControlVerification {
 		);
 		AgentControlSnapshot snapshot = AgentControlSnapshot.fromRecords(true, NOW_EPOCH_MS, List.of(record));
 		AgentControlSnapshot decoded = AgentControlSnapshotCodec.decode(AgentControlSnapshotCodec.encode(snapshot));
+		AgentControlSnapshotPayload outboundPayload = AgentControlSnapshotPayload.fromSnapshot(snapshot);
+		assertTrue(outboundPayload.snapshot() == snapshot, "trusted outbound snapshots skip a JSON parse");
+		AgentControlSnapshotPayload inboundPayload = new AgentControlSnapshotPayload(outboundPayload.encodedSnapshot());
+		assertTrue(inboundPayload.snapshot() == inboundPayload.snapshot(), "validated inbound snapshots are parsed once");
+		expectFailure(
+				() -> AgentControlSnapshotCodec.decode("🙂".repeat(AgentControlSnapshotCodec.MAX_ENCODED_BYTES / 2)),
+				"snapshot wire limit counts UTF-8 bytes"
+		);
 		AgentControlAgent agent = decoded.agents().getFirst();
 
 		assertEquals(snapshot, decoded, "snapshot JSON round trip");
@@ -91,7 +99,7 @@ public final class AgentControlVerification {
 				() -> new AgentControlSnapshot(true, NOW_EPOCH_MS, java.util.Collections.nCopies(17, agent)),
 				"snapshot agent bound"
 		);
-		return 14;
+		return 17;
 	}
 
 	private static int verifyProviderPresets() {

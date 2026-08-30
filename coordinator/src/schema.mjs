@@ -27,6 +27,7 @@ const ENVELOPE_KEYS = ['protocolVersion', 'agentId', 'type', 'messageId'];
 const ACTION_TYPES = new Set(Object.keys(ACTION_FIELDS));
 const TERMINAL_STATES = new Set(TERMINAL_ACTION_STATES);
 const FACES = new Set(BLOCK_FACES);
+const TRUSTED_ACTIONS = new WeakSet();
 const INTEGER_MIN = -2_147_483_648;
 const INTEGER_MAX = 2_147_483_647;
 
@@ -39,6 +40,7 @@ export class ValidationError extends Error {
 }
 
 export function validateAction(value) {
+	if (value !== null && typeof value === 'object' && TRUSTED_ACTIONS.has(value)) return value;
 	const action = requireObject(value, 'action');
 	const type = requireText(action.type, 'action.type', MAX_REASON_CODE_LENGTH);
 	if (!ACTION_TYPES.has(type)) throw invalid('UNKNOWN_ACTION', `Unsupported action '${type}'`);
@@ -191,7 +193,9 @@ export function validateAction(value) {
 			if (action.count < 1 || action.count > 64) throw invalid('INVALID_FIELD', 'action.count must be between 1 and 64');
 			break;
 	}
-	return structuredClone(action);
+	const normalized = deepFreeze(structuredClone(action));
+	TRUSTED_ACTIONS.add(normalized);
+	return normalized;
 }
 
 export function createActionCommand(actionValue, { commandId, issuedAtEpochMs }) {

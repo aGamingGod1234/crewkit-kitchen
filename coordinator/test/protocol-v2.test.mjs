@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter, once } from 'node:events';
 import test from 'node:test';
 
-import { MultiplexedServerBridge, ProtocolV2Error, validateProtocolV2Envelope, validateProtocolV2Payload } from '../src/protocol-v2.mjs';
+import { createProtocolV2Envelope, MultiplexedServerBridge, ProtocolV2Error, validateProtocolV2Envelope, validateProtocolV2Payload } from '../src/protocol-v2.mjs';
 import { completionContractFingerprint } from '../src/goal-contract.mjs';
 import { goalSpecFingerprint } from '../src/goal-spec.mjs';
 
@@ -704,13 +704,28 @@ function readyServerObservation(goalRevision = 4) {
 
 test('protocol v2 envelope is strict and directional', () => {
 	const message = serverEnvelope('catalog_request', 'server', 'server-1');
-	assert.equal(validateProtocolV2Envelope(message, { direction: 'server_to_coordinator' }).protocolVersion, 2);
+	const validated = validateProtocolV2Envelope(message, { direction: 'server_to_coordinator' });
+	assert.equal(validated.protocolVersion, 2);
+	assert.notStrictEqual(validated, message);
+	assert.equal(Object.isFrozen(validated), true);
+	assert.equal(Object.isFrozen(validated.payload), true);
+	assert.strictEqual(validateProtocolV2Envelope(validated, { direction: 'server_to_coordinator' }), validated);
+	assert.throws(() => { validated.payload.changed = true; }, TypeError);
 	assert.throws(
 		() => validateProtocolV2Envelope({ ...message, unexpected: true }),
 		(error) => error instanceof ProtocolV2Error && error.code === 'INVALID_FIELD',
 	);
 	assert.throws(
 		() => validateProtocolV2Envelope(message, { direction: 'coordinator_to_server' }),
+		(error) => error.code === 'INVALID_MESSAGE_TYPE',
+	);
+	const outbound = createProtocolV2Envelope({
+		serverInstanceId: 'server-instance', agentId: 'agent-a', type: 'planning_state', messageId: 'planning-1',
+		payload: { goalRevision: 1, state: 'thinking' },
+	});
+	assert.strictEqual(validateProtocolV2Envelope(outbound, { direction: 'coordinator_to_server' }), outbound);
+	assert.throws(
+		() => validateProtocolV2Envelope(outbound, { direction: 'server_to_coordinator' }),
 		(error) => error.code === 'INVALID_MESSAGE_TYPE',
 	);
 });

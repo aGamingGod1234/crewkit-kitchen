@@ -6,10 +6,27 @@ public final class SnapshotRefreshPolicy {
 	}
 
 	public static Tick advance(int countdown, boolean connected, int intervalTicks) {
+		return advance(countdown, connected, true, intervalTicks, intervalTicks);
+	}
+
+	public static Tick advance(
+			int countdown,
+			boolean connected,
+			boolean controlsVisible,
+			int visibleIntervalTicks,
+			int hiddenIntervalTicks
+	) {
 		if (countdown < 0) throw new IllegalArgumentException("countdown must not be negative");
-		if (intervalTicks <= 0) throw new IllegalArgumentException("intervalTicks must be positive");
+		if (visibleIntervalTicks <= 0) throw new IllegalArgumentException("visibleIntervalTicks must be positive");
+		if (hiddenIntervalTicks < visibleIntervalTicks) {
+			throw new IllegalArgumentException("hiddenIntervalTicks must be at least visibleIntervalTicks");
+		}
 		if (!connected) return new Tick(0, false);
-		if (countdown == 0) return new Tick(intervalTicks - 1, true);
+		if (countdown == 0) {
+			int interval = controlsVisible ? visibleIntervalTicks : hiddenIntervalTicks;
+			return new Tick(interval - 1, true);
+		}
+		if (controlsVisible && countdown >= visibleIntervalTicks) return new Tick(0, false);
 		return new Tick(countdown - 1, false);
 	}
 
