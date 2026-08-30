@@ -138,8 +138,8 @@ public final class BundledCoordinatorInstallerVerification {
 		Process process = new ProcessBuilder(
 				executable,
 				"-cp",
-				System.getProperty("java.class.path"),
-				CoordinatorProcessOwnershipVerification.Sleeper.class.getName(),
+				CoordinatorProcessOwnershipVerification.fixtureClassPath(),
+				CoordinatorProcessFixture.class.getName(),
 				main.toString()
 		).start();
 		Thread.sleep(100L);
