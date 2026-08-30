@@ -128,7 +128,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			AgentConstants.DEFAULT_AGENT_LIMIT,
 			OBSERVATIONS_PER_TICK,
 			(agentId, payload) -> ServerObservationWireBudget.fit(payload, candidate ->
-					codec.encodedBytes(new BridgeEnvelope(
+					codec.encodedLineBytes(new BridgeEnvelope(
 							2, serverInstanceId, agentId.toString(), "observation",
 							MAX_OBSERVATION_MESSAGE_ID, candidate
 					)) <= BridgeEnvelopeCodec.MAX_LINE_BYTES)
@@ -2099,7 +2099,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		if (session != source || !source.open.get() || !source.authenticated.get()) return false;
 		BridgeEnvelope envelope = new BridgeEnvelope(2, serverInstanceId, agentId.toString(), "observation",
 				"server-" + messageIds.incrementAndGet(), payload);
-		if (codec.encodedBytes(envelope) > BridgeEnvelopeCodec.MAX_LINE_BYTES) {
+		if (codec.encodedLineBytes(envelope) > BridgeEnvelopeCodec.MAX_LINE_BYTES) {
 			throw new BridgeProtocolException("LINE_TOO_LARGE", "Fitted observation exceeds the actual wire envelope");
 		}
 		source.enqueue(envelope);
@@ -2845,6 +2845,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			if (ordered.isEmpty() || !"hello_ack".equals(ordered.getFirst().type())) {
 				throw new IllegalArgumentException("handshake must begin with hello_ack");
 			}
+			ordered.forEach(codec::encodeFrame);
 			if (outbound.remainingCapacity() < ordered.size()) {
 				throw new BridgeProtocolException("CONNECTION_BACKPRESSURE", "Outbound queue cannot publish handshake replay batch");
 			}
@@ -2865,6 +2866,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 
 		void enqueue(BridgeEnvelope envelope) {
+			codec.encodeFrame(envelope);
 			synchronized (publicationLock) {
 				synchronized (this) {
 					if (!open.get() || !authenticated.get()) {
@@ -2879,6 +2881,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 
 		void enqueuePair(BridgeEnvelope first, BridgeEnvelope second, Runnable beforeEnqueue) {
+			codec.encodeFrame(first);
+			codec.encodeFrame(second);
 			synchronized (publicationLock) {
 				synchronized (this) {
 					if (!open.get() || !authenticated.get()) throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Bridge session closed before paired publication");
@@ -2901,6 +2905,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 
 		void enqueueAtomically(BridgeEnvelope envelope, Runnable beforeEnqueue) {
+			codec.encodeFrame(envelope);
 			synchronized (publicationLock) {
 				synchronized (this) {
 					if (!open.get() || !authenticated.get()) throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Bridge session closed before atomic publication");
@@ -2962,8 +2967,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			try (BufferedOutputStream output = new BufferedOutputStream(socket.getOutputStream())) {
 				while (open.get()) {
 					BridgeEnvelope envelope = outbound.take();
-					byte[] bytes = codec.encode(envelope).getBytes(StandardCharsets.UTF_8);
-					output.write(bytes);
+					BridgeEnvelopeCodec.EncodedFrame frame = codec.encodeFrame(envelope);
+					output.write(frame.bytesView());
 					output.flush();
 					synchronized (this) {
 						queuedByAgent.computeIfPresent(envelope.agentId(), (id, count) -> count <= 1 ? null : count - 1);

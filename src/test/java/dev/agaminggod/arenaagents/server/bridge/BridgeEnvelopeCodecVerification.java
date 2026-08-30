@@ -44,6 +44,7 @@ public final class BridgeEnvelopeCodecVerification {
 		boundedPayload.addProperty("text", "a".repeat(BridgeEnvelopeCodec.MAX_LINE_BYTES - fixedJsonBytes));
 		BridgeEnvelope exactLimit = new BridgeEnvelope(2, "server-instance", "agent", "observation", "utf8-bound", boundedPayload);
 		assertEquals(BridgeEnvelopeCodec.MAX_LINE_BYTES + 1, codec.encodeFrame(exactLimit).byteLength(), "line limit excludes the newline delimiter");
+		assertEquals(BridgeEnvelopeCodec.MAX_LINE_BYTES, codec.encodedLineBytes(exactLimit), "line sizing excludes only the frame delimiter");
 		boundedPayload.addProperty("text", boundedPayload.get("text").getAsString() + "a");
 		expectFailure(() -> codec.encode(new BridgeEnvelope(2, "server-instance", "agent", "observation", "utf8-bound", boundedPayload)), "LINE_TOO_LARGE");
 		JsonObject waitArguments = new JsonObject();

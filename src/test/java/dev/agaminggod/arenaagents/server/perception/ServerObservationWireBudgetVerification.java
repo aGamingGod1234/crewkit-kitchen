@@ -66,8 +66,8 @@ public final class ServerObservationWireBudgetVerification {
 			oversized.getAsJsonArray("entities").add(entity);
 		}
 		ServerObservationWireBudget.Fitted wireFitted = ServerObservationWireBudget.fit(oversized,
-				candidate -> codec.encodedBytes(envelope(candidate)) <= BridgeEnvelopeCodec.MAX_LINE_BYTES);
-		assertTrue(codec.encodedBytes(envelope(wireFitted.observation())) <= BridgeEnvelopeCodec.MAX_LINE_BYTES,
+				candidate -> codec.encodedLineBytes(envelope(candidate)) <= BridgeEnvelopeCodec.MAX_LINE_BYTES);
+		assertTrue(codec.encodedLineBytes(envelope(wireFitted.observation())) <= BridgeEnvelopeCodec.MAX_LINE_BYTES,
 				"worst-case complete envelope with maximum message ID fits the wire limit");
 		assertEquals("nearest", wireFitted.observation().getAsJsonArray("entities").get(0).getAsJsonObject()
 				.get("name").getAsString(), "wire fitting retains the nearest original entity");
@@ -75,7 +75,7 @@ public final class ServerObservationWireBudgetVerification {
 		JsonObject impossible = observation();
 		impossible.getAsJsonObject("lastResult").addProperty("message", "x".repeat(BridgeEnvelopeCodec.MAX_LINE_BYTES));
 		assertThrowsCode(() -> ServerObservationWireBudget.fit(impossible,
-				candidate -> codec.encodedBytes(envelope(candidate)) <= BridgeEnvelopeCodec.MAX_LINE_BYTES),
+				candidate -> codec.encodedLineBytes(envelope(candidate)) <= BridgeEnvelopeCodec.MAX_LINE_BYTES),
 				"OBSERVATION_TOO_LARGE", "protected essentials fail closed when they cannot fit");
 		return 20;
 	}

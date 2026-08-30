@@ -135,6 +135,11 @@ public final class BridgeEnvelopeCodec {
 		return encodedFrameUnchecked(envelope).byteLength();
 	}
 
+	/** Returns the exact UTF-8 JSON line size, excluding the newline frame delimiter. */
+	public int encodedLineBytes(BridgeEnvelope envelope) {
+		return encodedFrameUnchecked(envelope).byteLength() - 1;
+	}
+
 	public EncodedFrame encodeFrame(BridgeEnvelope envelope) {
 		EncodedFrame encoded = encodedFrameUnchecked(envelope);
 		if (encoded.byteLength() - 1 > MAX_LINE_BYTES) {
