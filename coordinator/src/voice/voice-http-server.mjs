@@ -22,6 +22,7 @@ export function createVoiceHttpServer({
 	host = '127.0.0.1',
 	port = 8_766,
 	maxConcurrent = 5,
+	reservedStt = maxConcurrent > 1 ? 1 : 0,
 	requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
 	now = Date.now,
 	scheduleProbe = defaultSchedule,
@@ -36,6 +37,9 @@ export function createVoiceHttpServer({
 	if (host !== '127.0.0.1' && host !== '::1') throw new TypeError('voice server must bind to loopback');
 	if (!Number.isSafeInteger(port) || port < 0 || port > 65_535) throw new TypeError('port is invalid');
 	if (!Number.isSafeInteger(maxConcurrent) || maxConcurrent < 1 || maxConcurrent > 5) throw new TypeError('maxConcurrent must be between 1 and 5');
+	if (!Number.isSafeInteger(reservedStt) || reservedStt < 0 || reservedStt >= maxConcurrent) {
+		throw new TypeError('reservedStt must be between 0 and maxConcurrent - 1');
+	}
 	if (!Number.isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 1 || requestTimeoutMs > 600_000) throw new TypeError('requestTimeoutMs must be between 1 and 600000');
 	if (typeof now !== 'function' || typeof scheduleProbe !== 'function' || typeof cancelProbe !== 'function') {
 		throw new TypeError('voice probe clock and scheduler must be functions');
@@ -46,7 +50,11 @@ export function createVoiceHttpServer({
 	if (maxProbeDelayMs < initialProbeDelayMs) throw new TypeError('maxProbeDelayMs must not be less than initialProbeDelayMs');
 
 	let active = 0;
+	let activeTts = 0;
+	let activeStt = 0;
 	const controllers = new Set();
+	const inFlightTts = new Map();
+	const lifecycleRecordedErrors = new WeakSet();
 	const failureListeners = new Set();
 	let startPromise = null;
 	let closePromise = null;
@@ -65,6 +73,7 @@ export function createVoiceHttpServer({
 		...lifecycleOptions,
 	});
 	const sttUnavailable = sttProvider === null || sttProvider instanceof NoSttProvider;
+	const effectiveReservedStt = sttUnavailable ? 0 : reservedStt;
 	const sttLifecycle = new VoiceChannelLifecycle({
 		component: 'voice:stt', boundary: 'voice_stt_provider',
 		probe: sttUnavailable ? null : (signal) => probeStt(sttProvider, signal),
@@ -74,7 +83,15 @@ export function createVoiceHttpServer({
 	});
 	const server = createServer(async (request, response) => {
 		if (request.method === 'GET' && request.url === '/health') {
-			respondJson(response, 200, { ready: true, active, maxConcurrent });
+			const admittedReservedStt = currentReservedStt();
+			respondJson(response, 200, {
+				ready: true,
+				active,
+				activeTts,
+				activeStt,
+				maxConcurrent,
+				reservedStt: admittedReservedStt,
+			});
 			return;
 		}
 		if (request.method !== 'POST' || !['/v1/tts', '/v1/stt'].includes(request.url)) {
@@ -85,8 +102,10 @@ export function createVoiceHttpServer({
 			respondJson(response, 401, { code: 'UNAUTHORIZED' });
 			return;
 		}
-		if (active >= maxConcurrent) {
-			respondJson(response, 429, { code: 'TTS_CAPACITY' });
+		const channel = request.url === '/v1/stt' ? 'stt' : 'tts';
+		const ttsLimit = maxConcurrent - currentReservedStt();
+		if (active >= maxConcurrent || (channel === 'tts' && activeTts >= ttsLimit)) {
+			respondJson(response, 429, { code: channel === 'stt' ? 'STT_CAPACITY' : 'TTS_CAPACITY' });
 			return;
 		}
 		const controller = new AbortController();
@@ -94,10 +113,14 @@ export function createVoiceHttpServer({
 		let released = false;
 		let providerOperation = null;
 		active += 1;
+		if (channel === 'stt') activeStt += 1;
+		else activeTts += 1;
 		const release = () => {
 			if (released) return;
 			released = true;
 			active -= 1;
+			if (channel === 'stt') activeStt -= 1;
+			else activeTts -= 1;
 			controllers.delete(controller);
 		};
 		const onRequestAborted = () => controller.abort();
@@ -150,24 +173,15 @@ export function createVoiceHttpServer({
 			let output = cache.get(cacheKey);
 			if (output === null) {
 				attemptedLifecycle = ttsLifecycle;
-				providerOperation = Promise.resolve().then(() => provider.synthesize({
-						text: payload.text,
-						voiceId: profile.voiceId,
-						speed: profile.speed,
-						signal: controller.signal,
-					}));
-				const synthesized = validateSynthesis(await awaitAbortable(providerOperation, controller.signal));
-				output = resampleS16leMono(synthesized.pcm, synthesized.sampleRateHz, 48_000, 20);
-				if (output.length === 0) throw typedError('TTS_MALFORMED_AUDIO', 'TTS output was empty');
-				ttsLifecycle.recordReady();
-				if (synthesized.cacheable !== false) {
-					const completedKey = synthesisCacheKey(
-						profile,
-						payload,
-						synthesisCacheNamespace(synthesized, provider, profileNamespace),
-					);
-					cache.set(completedKey, output);
-				}
+				const joined = joinTtsSynthesis({
+					cacheKey,
+					profile,
+					profileNamespace,
+					payload,
+					signal: controller.signal,
+				});
+				providerOperation = joined.owner ? joined.operation : joined.waiter;
+				output = await joined.waiter;
 			}
 			response.writeHead(200, {
 				'Content-Type': 'audio/L16',
@@ -179,11 +193,18 @@ export function createVoiceHttpServer({
 			});
 			response.end(output);
 		} catch (error) {
-			if (attemptedLifecycle !== null && error?.name !== 'AbortError') attemptedLifecycle.recordFailure(error);
+			const recordLifecycle = attemptedLifecycle !== null
+				&& error?.name !== 'AbortError'
+				&& (error === null || (typeof error !== 'object' && typeof error !== 'function')
+					|| !lifecycleRecordedErrors.has(error));
+			if (recordLifecycle && error !== null && (typeof error === 'object' || typeof error === 'function')) {
+				lifecycleRecordedErrors.add(error);
+			}
 			if (!response.headersSent) respondJson(response, statusFor(error), {
 				code: String(error?.code ?? 'TTS_ERROR').slice(0, 64),
 				message: String(error?.message ?? error).slice(0, 256),
 			});
+			if (recordLifecycle) attemptedLifecycle.recordFailure(error);
 		} finally {
 			clearTimeout(timeout);
 			request.off('aborted', onRequestAborted);
@@ -192,6 +213,57 @@ export function createVoiceHttpServer({
 			else providerOperation.then(release, release);
 		}
 	});
+
+	function currentReservedStt() {
+		return effectiveReservedStt > 0 && sttLifecycle.snapshot().state === 'ready' ? effectiveReservedStt : 0;
+	}
+
+	function joinTtsSynthesis({ cacheKey, profile, profileNamespace, payload, signal }) {
+		let entry = inFlightTts.get(cacheKey);
+		let owner = false;
+		if (entry === undefined) {
+			owner = true;
+			const providerController = new AbortController();
+			entry = { providerController, waiters: 0, settled: false, operation: null };
+			const current = entry;
+			entry.operation = Promise.resolve().then(async () => {
+				try {
+					const synthesized = validateSynthesis(await provider.synthesize({
+						text: payload.text,
+						voiceId: profile.voiceId,
+						speed: profile.speed,
+						signal: providerController.signal,
+					}));
+					const output = resampleS16leMono(synthesized.pcm, synthesized.sampleRateHz, 48_000, 20);
+					if (output.length === 0) throw typedError('TTS_MALFORMED_AUDIO', 'TTS output was empty');
+					if (!providerController.signal.aborted && synthesized.cacheable !== false) {
+						const completedKey = synthesisCacheKey(
+							profile,
+							payload,
+							synthesisCacheNamespace(synthesized, provider, profileNamespace),
+						);
+						cache.set(completedKey, output);
+					}
+					if (!providerController.signal.aborted) ttsLifecycle.recordReady();
+					return output;
+				} finally {
+					current.settled = true;
+					if (inFlightTts.get(cacheKey) === current) inFlightTts.delete(cacheKey);
+				}
+			});
+			entry.operation.catch(() => {});
+			inFlightTts.set(cacheKey, entry);
+		}
+		entry.waiters += 1;
+		const current = entry;
+		const waiter = awaitAbortable(current.operation, signal).finally(() => {
+			current.waiters -= 1;
+			if (current.waiters !== 0 || current.settled) return;
+			if (inFlightTts.get(cacheKey) === current) inFlightTts.delete(cacheKey);
+			current.providerController.abort(abortError('All synthesis waiters cancelled'));
+		});
+		return { owner, operation: current.operation, waiter };
+	}
 	const notifyFailure = (error) => {
 		for (const listener of [...failureListeners]) {
 			try { listener(error); } catch { /* optional lifecycle listeners are isolated */ }
@@ -634,7 +706,7 @@ function statusFor(error) {
 	if (error?.httpStatus === 503) return 503;
 	if (error?.name === 'AbortError' || error?.name === 'TimeoutError') return 504;
 	if (error?.code === 'TTS_RATE_LIMITED' || error?.code === 'TTS_CAPACITY') return 429;
-	if (error?.code === 'STT_RATE_LIMITED') return 429;
+	if (error?.code === 'STT_RATE_LIMITED' || error?.code === 'STT_CAPACITY') return 429;
 	if (error?.code === 'STT_UNAVAILABLE') return 503;
 	if (['INVALID_REQUEST', 'INVALID_JSON', 'REQUEST_TOO_LARGE'].includes(error?.code)) return 400;
 	return 502;
@@ -674,6 +746,12 @@ function awaitAbortable(value, signal) {
 function abortReason(signal) {
 	if (signal.reason instanceof Error) return signal.reason;
 	const error = new Error('Voice provider request was cancelled');
+	error.name = 'AbortError';
+	return error;
+}
+
+function abortError(message) {
+	const error = new Error(message);
 	error.name = 'AbortError';
 	return error;
 }

@@ -25,6 +25,7 @@ final class SpeechCaptureEngineVerification {
 	static int verify() throws Exception {
 		int assertions = 0;
 		assertions += verifyProductionSpeechEndpointFlushesWithinBudget();
+		assertions += verifyAdaptiveEndpointShortensEstablishedUtterances();
 		assertions += verifyInputLatencyReportsOneCompletedUtterance();
 		assertions += verifySilenceFlushesOneOrderedUtterance();
 		assertions += verifyCanceledRunningSilenceTimerCannotFinishNewerAudio();
@@ -114,6 +115,26 @@ final class SpeechCaptureEngineVerification {
 				"production speech endpoint flushes within the conversational latency budget");
 		engine.close();
 		return 1;
+	}
+
+	private static int verifyAdaptiveEndpointShortensEstablishedUtterances() {
+		RecordingTranscriber transcriber = new RecordingTranscriber();
+		ManualScheduledExecutor scheduler = new ManualScheduledExecutor();
+		SpeechCaptureEngine engine = new SpeechCaptureEngine(
+				transcriber, scheduler, 100L, 300L, 4, 32, ignored -> { }
+		);
+		engine.accept(PLAYER, false, new byte[] { 1, 2 }, RecordingDecoder::new, Runnable::run,
+				(playerId, text, whispering) -> { });
+		engine.accept(PLAYER, false, new byte[] { 3, 4 }, RecordingDecoder::new, Runnable::run,
+				(playerId, text, whispering) -> { });
+		assertEquals(300L, scheduler.tasks.get(0).delayMilliseconds,
+				"short speech keeps the pause-preserving endpoint");
+		assertEquals(100L, scheduler.tasks.get(1).delayMilliseconds,
+				"established speech uses the low-latency endpoint");
+		assertEquals(true, scheduler.tasks.get(0).isCancelled(),
+				"the adaptive timer still fences the older endpoint epoch");
+		engine.close();
+		return 3;
 	}
 
 	private static int verifySilenceFlushesOneOrderedUtterance() throws Exception {
@@ -632,7 +653,7 @@ final class SpeechCaptureEngineVerification {
 
 		@Override
 		public ScheduledFuture<?> schedule(Runnable command, long delay, TimeUnit unit) {
-			ManualFuture future = new ManualFuture(command);
+			ManualFuture future = new ManualFuture(command, unit.toMillis(delay));
 			tasks.add(future);
 			return future;
 		}
@@ -666,11 +687,13 @@ final class SpeechCaptureEngineVerification {
 
 	private static final class ManualFuture implements ScheduledFuture<Object> {
 		private final Runnable command;
+		private final long delayMilliseconds;
 		private boolean cancelled;
 		private boolean done;
 
-		private ManualFuture(Runnable command) {
+		private ManualFuture(Runnable command, long delayMilliseconds) {
 			this.command = command;
+			this.delayMilliseconds = delayMilliseconds;
 		}
 
 		private void runEvenIfCancelled() {

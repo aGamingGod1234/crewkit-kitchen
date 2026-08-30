@@ -41,6 +41,7 @@ final class VoiceWorkerClientsVerification {
 		assertions += verifySttClientSendsPcmMetadataAndBoundsTranscript();
 		assertions += verifySttClientRejectsMalformedInputAndResponse();
 		assertions += verifySttUnavailablePreservesWorkerCode();
+		assertions += verifySttCapacityPreservesWorkerCode();
 		assertions += verifyClientsRejectWrongResponseMediaTypes();
 		assertions += verifyConfiguredDeadlineReachesBothHttpClients();
 		return assertions;
@@ -259,6 +260,24 @@ final class VoiceWorkerClientsVerification {
 			assertWorkerFailure("STT_UNAVAILABLE", () -> client.transcribe(
 					PLAYER, 1L, false, new short[] { 1 }
 			).join(), "STT unavailable response");
+			unavailable.assertHealthy();
+		}
+		return 1;
+	}
+
+	private static int verifySttCapacityPreservesWorkerCode() throws Exception {
+		try (WorkerServer unavailable = new WorkerServer(exchange -> respond(
+				exchange,
+				429,
+				"{\"code\":\"STT_CAPACITY\"}".getBytes(StandardCharsets.UTF_8),
+				"application/json"
+		))) {
+			SpeechWorkerClient client = new SpeechWorkerClient(
+					HttpClient.newHttpClient(), unavailable.uri("/v1/stt"), SECRET
+			);
+			assertWorkerFailure("STT_CAPACITY", () -> client.transcribe(
+					PLAYER, 1L, false, new short[] { 1 }
+			).join(), "STT capacity response");
 			unavailable.assertHealthy();
 		}
 		return 1;

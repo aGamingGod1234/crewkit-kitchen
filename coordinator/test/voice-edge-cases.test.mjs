@@ -446,6 +446,109 @@ test('voice worker enforces its shared TTS and STT concurrency limit', async () 
 	});
 });
 
+test('TTS saturation preserves a reserved STT slot with channel-specific capacity errors', async () => {
+	let release;
+	const waiting = new Promise((resolve) => { release = resolve; });
+	let entered = 0;
+	await withWorker({
+		maxConcurrent: 3,
+		provider: { async synthesize() { entered += 1; await waiting; return validSynthesis(); } },
+		sttProvider: { async transcribe() { return { transcript: 'urgent speech', confidence: 1 }; } },
+	}, async ({ baseUrl }) => {
+		const first = fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders(), body: JSON.stringify({ ...ttsPayload(), text: 'first' }),
+		});
+		const second = fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders(), body: JSON.stringify({ ...ttsPayload(), text: 'second', conversationSequence: 2 }),
+		});
+		await eventually(() => entered === 2);
+		const blockedTts = await fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders(), body: JSON.stringify({ ...ttsPayload(), text: 'third', conversationSequence: 3 }),
+		});
+		assert.equal(blockedTts.status, 429);
+		assert.equal((await blockedTts.json()).code, 'TTS_CAPACITY');
+		const speech = await fetch(`${baseUrl}/v1/stt`, {
+			method: 'POST', headers: sttHeaders(), body: Buffer.alloc(2),
+		});
+		assert.equal(speech.status, 200);
+		assert.equal((await speech.json()).transcript, 'urgent speech');
+		const snapshot = await health(baseUrl);
+		assert.equal(snapshot.activeTts, 2);
+		assert.equal(snapshot.reservedStt, 1);
+		release();
+		assert.deepEqual(await Promise.all([(await first).status, (await second).status]), [200, 200]);
+	});
+});
+
+test('a degraded STT channel returns its reservation to TTS', async () => {
+	let release;
+	const waiting = new Promise((resolve) => { release = resolve; });
+	let entered = 0;
+	await withWorker({
+		maxConcurrent: 3,
+		provider: { async synthesize() { entered += 1; await waiting; return validSynthesis(); } },
+		sttProvider: { async transcribe() {
+			throw Object.assign(new Error('offline'), { code: 'STT_UNAVAILABLE' });
+		} },
+		initialProbeDelayMs: 1_000,
+	}, async ({ baseUrl }) => {
+		const unavailable = await fetch(`${baseUrl}/v1/stt`, {
+			method: 'POST', headers: sttHeaders(), body: Buffer.alloc(2),
+		});
+		assert.equal(unavailable.status, 503);
+		assert.equal((await health(baseUrl)).reservedStt, 0);
+		const requests = ['one', 'two', 'three'].map((text, index) => fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders(),
+			body: JSON.stringify({ ...ttsPayload(), text, conversationSequence: index + 1 }),
+		}));
+		await eventually(() => entered === 3);
+		release();
+		assert.deepEqual((await Promise.all(requests)).map(({ status }) => status), [200, 200, 200]);
+	});
+});
+
+test('identical TTS misses share one synthesis while each waiter keeps independent cancellation', async () => {
+	let calls = 0;
+	let providerSignal;
+	let release;
+	const waiting = new Promise((resolve) => { release = resolve; });
+	let entered;
+	const providerEntered = new Promise((resolve) => { entered = resolve; });
+	await withWorker({
+		provider: { async synthesize({ signal }) {
+			calls += 1;
+			providerSignal = signal;
+			entered();
+			await waiting;
+			return validSynthesis();
+		} },
+	}, async ({ baseUrl }) => {
+		const cancelledController = new AbortController();
+		const cancelled = fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders({ Connection: 'close' }),
+			body: JSON.stringify(ttsPayload()), signal: cancelledController.signal,
+		});
+		await providerEntered;
+		const surviving = fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders({ Connection: 'close' }),
+			body: JSON.stringify({ ...ttsPayload(), conversationSequence: 2 }),
+		});
+		await eventuallyActive(baseUrl, 2);
+		cancelledController.abort();
+		await assert.rejects(cancelled, (error) => error?.name === 'AbortError');
+		assert.equal(providerSignal.aborted, false, 'one waiter cannot cancel shared synthesis needed by another');
+		release();
+		assert.equal((await surviving).status, 200);
+		assert.equal(calls, 1);
+		const cached = await fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders({ Connection: 'close' }),
+			body: JSON.stringify({ ...ttsPayload(), conversationSequence: 3 }),
+		});
+		assert.equal(cached.status, 200);
+		assert.equal(calls, 1, 'the shared success is cached once');
+	});
+});
+
 test('TTS route aborts synthesis when the client closes before the response', async () => {
 	let entered;
 	const providerEntered = new Promise((resolve) => { entered = resolve; });

@@ -13,6 +13,8 @@ import org.slf4j.LoggerFactory;
 final class HumanSpeechCapture implements ServerSpeechCaptureRegistry.Capture {
 	private static final Logger LOGGER = LoggerFactory.getLogger(HumanSpeechCapture.class);
 	private static final int MAX_SAMPLES = 48_000 * 20;
+	private static final int ADAPTIVE_ENDPOINT_AFTER_SAMPLES = 48_000 / 2;
+	private static final long MIN_SILENCE_MILLISECONDS = 160L;
 	private static final long SILENCE_MILLISECONDS = 300L;
 	private static final ConsentCapture CONSENT_CAPTURE = resolveConsentCapture();
 	private final SpeechCaptureEngine engine;
@@ -23,7 +25,9 @@ final class HumanSpeechCapture implements ServerSpeechCaptureRegistry.Capture {
 				java.util.concurrent.Executors.newSingleThreadScheduledExecutor(
 						runnable -> Thread.ofPlatform().daemon().name("arenaagents-stt").unstarted(runnable)
 				),
+				MIN_SILENCE_MILLISECONDS,
 				SILENCE_MILLISECONDS,
+				ADAPTIVE_ENDPOINT_AFTER_SAMPLES,
 				MAX_SAMPLES,
 				latency -> LOGGER.info(
 						"Voice input latency player={} sequence={} endpointMs={} transcriptionMs={} totalMs={}",
