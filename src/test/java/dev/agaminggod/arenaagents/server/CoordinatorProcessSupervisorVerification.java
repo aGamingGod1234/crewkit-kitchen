@@ -1973,7 +1973,7 @@ public final class CoordinatorProcessSupervisorVerification {
 			MultiplexedServerBridge reboundBridge = slot.bridge();
 			assertTrue(reboundBridge != null && reboundBridge != originalBridge,
 					"production reconciliation replaces the listener after a port-only change");
-			try (ServerSocket released = new ServerSocket(originalPort, 1, InetAddress.getLoopbackAddress())) {
+			try (ServerSocket released = bindLoopbackEventually(originalPort)) {
 				assertEquals(originalPort, released.getLocalPort(), "port-only reconciliation releases the old listener");
 			}
 			reboundConnection = authenticate(
