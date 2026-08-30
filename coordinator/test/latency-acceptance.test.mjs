@@ -98,6 +98,7 @@ test('normalizes a machine-readable acceptance policy and derives the p95 ratio'
 test('instrumentation comparison checks action parity, sample count, and measured overhead', () => {
 	const run = (scale, changed = false) => ({ trials: Array.from({ length: 5 }, (_, index) => ({
 		trialId: 'cell', repetition: index + 1, status: 'PASSED', durationMs: 100 * scale,
+		cleanup: { ok: true },
 		debug: { actionCommandHash: changed && index === 0 ? 'changed' : 'same', scenarioDigest: 'facts' },
 	})) });
 	const passing = compareInstrumentationRuns({ enabled: run(1.02), disabled: run(1), maxP95Ratio: 1.05 });
@@ -109,10 +110,27 @@ test('instrumentation comparison checks action parity, sample count, and measure
 });
 
 test('instrumentation parity fails closed when behavior hashes are absent', () => {
-	const run = { trials: Array.from({ length: 5 }, (_, index) => ({ trialId: 'cell', repetition: index + 1, status: 'PASSED', durationMs: 100, debug: {} })) };
+	const run = { trials: Array.from({ length: 5 }, (_, index) => ({ trialId: 'cell', repetition: index + 1, status: 'PASSED', durationMs: 100, cleanup: { ok: true }, debug: {} })) };
 	const result = compareInstrumentationRuns({ enabled: run, disabled: run });
 	assert.equal(result.status, 'FAILED');
 	assert.equal(result.checks.find((check) => check.code === 'INSTRUMENTATION_BEHAVIOR_PARITY').status, 'FAILED');
+});
+
+test('instrumentation comparison excludes failed or unclean trials from parity and overhead samples', () => {
+	const run = (status, cleanupOk) => ({ trials: Array.from({ length: 5 }, (_, index) => ({
+		trialId: 'cell', repetition: index + 1, status, durationMs: 100, cleanup: { ok: cleanupOk },
+		debug: { actionCommandHash: 'same', scenarioDigest: 'facts' },
+	})) });
+	for (const [enabled, disabled] of [
+		[run('FAILED', true), run('FAILED', true)],
+		[run('PASSED', false), run('PASSED', false)],
+	]) {
+		const result = compareInstrumentationRuns({ enabled, disabled });
+		assert.equal(result.status, 'FAILED');
+		assert.equal(result.checks.find((check) => check.code === 'INSTRUMENTATION_SAMPLE_COUNT').observed.successfulPairs, 0);
+		assert.equal(result.checks.find((check) => check.code === 'INSTRUMENTATION_P95_OVERHEAD').observedRatio, null);
+		assert.ok(result.pairs.every((pair) => pair.behaviorParity === false && pair.durationRatio === null));
+	}
 });
 
 test('instrumentation comparison counterbalances execution order', async () => {
@@ -121,7 +139,7 @@ test('instrumentation comparison counterbalances execution order', async () => {
 		minimumSamples: 2,
 		runMatrix: async ({ instrumentation }) => {
 			observed.push(instrumentation ? 'enabled' : 'disabled');
-			return { trials: [{ trialId: 'cell', repetition: 1, status: 'PASSED', durationMs: instrumentation ? 102 : 100, debug: { actionCommandHash: 'actions', scenarioDigest: 'scenario' } }] };
+			return { trials: [{ trialId: 'cell', repetition: 1, status: 'PASSED', durationMs: instrumentation ? 102 : 100, cleanup: { ok: true }, debug: { actionCommandHash: 'actions', scenarioDigest: 'scenario' } }] };
 		},
 	});
 	assert.deepEqual(observed, ['disabled', 'enabled', 'enabled', 'disabled']);

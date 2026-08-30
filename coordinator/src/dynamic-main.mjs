@@ -390,7 +390,7 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#publishVerbose(record.agentId, record.goalRevision, 'lifecycle', 'Agent registered and ready.', connectionEpoch);
 			this.#prewarmNativeAgent(record);
 			await this.#publishStatus(connectionEpoch);
-		}, { connectionEpoch }));
+		}, { connectionEpoch, lossless: true }));
 		this.#listen('agent_removed', (message, connectionEpoch) => this.#run(async () => {
 			await this.#reconciliation;
 			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return;
@@ -532,7 +532,7 @@ export class DynamicCoordinator extends EventEmitter {
 				}
 				if (!acceptedStillCurrent()) return;
 				this.emit('goalControl', record);
-			});
+			}, { connectionEpoch, lossless: true });
 		});
 		this.#listen('conversation_event', (message, connectionEpoch) => {
 			this.#enqueueAgent(message.agentId, async () => {
@@ -550,7 +550,7 @@ export class DynamicCoordinator extends EventEmitter {
 					}
 				}
 				this.emit('conversationEvent', message);
-			}, { waitForReconciliation: false, connectionEpoch });
+			}, { waitForReconciliation: false, connectionEpoch, lossless: true });
 		});
 		this.#listen('conversation_wake', (message, connectionEpoch) => {
 			this.#enqueueAgent(message.agentId, async () => {
@@ -600,7 +600,7 @@ export class DynamicCoordinator extends EventEmitter {
 				await this.#sendForEpoch(connectionEpoch, 'agent_ready', record.agentId, { goalRevision: record.goalRevision });
 				this.emit('conversationEvent', { ...message, payload: message.payload.event });
 				this.emit('goalControl', record);
-			}, { waitForReconciliation: false, connectionEpoch });
+			}, { waitForReconciliation: false, connectionEpoch, lossless: true });
 		});
 		this.#listen('observation', (message, connectionEpoch) => {
 			const receiptMonotonicMs = safeClockRead(this.#controlNow);
@@ -766,7 +766,7 @@ export class DynamicCoordinator extends EventEmitter {
 				if (this.#usesNativeTools(current) && this.#nativeRuntime.onCompletionResult(current, message.payload)) return;
 				const accepted = this.#programRuntime.onCompletionResult(current, message.payload);
 				if (!accepted) throw new ProtocolV2Error('UNEXPECTED_COMPLETION_RESULT', `Agent '${message.agentId}' has no matching completion request`);
-			}, { connectionEpoch });
+			}, { connectionEpoch, lossless: true });
 		});
 		this.#listen('disconnected', (event) => {
 			const connectionEpoch = this.#eventConnectionEpoch(event);
@@ -1710,7 +1710,7 @@ export class DynamicCoordinator extends EventEmitter {
 		return this.#lifecycleGeneration(agentId) === generation;
 	}
 
-	#enqueueAgent(agentId, operation, { waitForReconciliation = true, connectionEpoch = this.#connectionEpoch, coalesceKey = null, terminal = false } = {}) {
+	#enqueueAgent(agentId, operation, { waitForReconciliation = true, connectionEpoch = this.#connectionEpoch, coalesceKey = null, terminal = false, lossless = false } = {}) {
 		let resolve;
 		let reject;
 		const promise = new Promise((resolveValue, rejectValue) => { resolve = resolveValue; reject = rejectValue; });
@@ -1726,6 +1726,7 @@ export class DynamicCoordinator extends EventEmitter {
 			tail.operation = operation;
 			tail.waitForReconciliation = waitForReconciliation;
 			tail.connectionEpoch = connectionEpoch;
+			tail.lossless = lossless;
 			tail.waiters = [waiter];
 		} else {
 			const pendingTerminal = queue.items.find((item) => item.terminal === true);
@@ -1735,19 +1736,20 @@ export class DynamicCoordinator extends EventEmitter {
 				pendingTerminal.waitForReconciliation = waitForReconciliation;
 				pendingTerminal.connectionEpoch = connectionEpoch;
 				pendingTerminal.coalesceKey = coalesceKey;
+				pendingTerminal.lossless = lossless;
 				pendingTerminal.waiters = [waiter];
 				promise.catch((error) => this.#reportAgentError(agentId, error, connectionEpoch));
 				return promise;
 			}
 			const terminalPending = pendingTerminal !== undefined;
-			const ordinaryPending = queue.items.length - (terminalPending ? 1 : 0);
-			if (!terminal && ordinaryPending >= this.#maxPendingAgentOperations) {
-				const error = codedRuntimeError('AGENT_EVENT_BACKPRESSURE', `Agent '${agentId}' has ${this.#maxPendingAgentOperations} pending coordinator events`);
+			const ordinaryPending = queue.items.filter((item) => item.terminal !== true && item.lossless !== true).length;
+			if (!terminal && !lossless && ordinaryPending >= this.#maxPendingAgentOperations) {
+				const error = codedRuntimeError('AGENT_EVENT_BACKPRESSURE', `Agent '${agentId}' has ${this.#maxPendingAgentOperations} pending ordinary coordinator events`);
 				reject(error);
 				promise.catch((caught) => this.#reportAgentError(agentId, caught, connectionEpoch));
 				return promise;
 			}
-			queue.items.push({ operation, waitForReconciliation, connectionEpoch, coalesceKey, terminal, waiters: [waiter] });
+			queue.items.push({ operation, waitForReconciliation, connectionEpoch, coalesceKey, terminal, lossless, waiters: [waiter] });
 		}
 		promise.catch((error) => this.#reportAgentError(agentId, error, connectionEpoch));
 		if (queue.drainPromise === null) queue.drainPromise = Promise.resolve().then(() => this.#drainAgentOperations(agentId, queue));

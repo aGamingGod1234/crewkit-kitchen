@@ -490,6 +490,12 @@ async function runConcurrentHeadlessScenario({
 				diagnostics: member.diagnostics,
 			});
 		});
+		const factualAssertionCount = assertions.filter((assertion) => assertion.type === 'rcon').length;
+		const factualSuccess = factualAssertionCount > 0 && members.every((member) => {
+			const results = evidenceResult.byAgent.get(member.agentId)?.assertionResult.results
+				.filter((assertion) => assertion.type === 'rcon') ?? [];
+			return results.length === factualAssertionCount && results.every((assertion) => assertion.passed);
+		});
 		const failed = agentReports.some((member) => member.status === 'FAILED');
 		const skipped = agentReports.some((member) => member.status === 'SKIPPED');
 		const passed = agentReports.some((member) => member.status === 'PASSED');
@@ -500,7 +506,7 @@ async function runConcurrentHeadlessScenario({
 		const elapsedMs = Math.max(0, Number(now()) - startedAt);
 		let report = scenarioReport(status, scenario, {
 			classification, lifecycle: members.every((member) => member.lifecycle === 'COMPLETED') ? 'COMPLETED' : null,
-			elapsedMs, commands, agents: agentReports,
+			elapsedMs, commands, agents: agentReports, factualSuccess,
 			evidence: evidenceSummary(directory, evidenceResult.fileEvidence, protocolAudit),
 			timings: timingSummary(profile, aggregateEvidence, aggregateAudit, elapsedMs),
 			metrics: performanceMetrics(profile, aggregateEvidence, aggregateAudit, exactAgentIds, { minecraftMspt }),

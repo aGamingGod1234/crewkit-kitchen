@@ -42,26 +42,34 @@ export function compareInstrumentationRuns({ enabled, disabled, maxP95Ratio = 1.
 		if (!peer) throw new TypeError(`instrumentation comparison is missing disabled trial '${printableKey(key)}'`);
 		const enabledDurationMs = finiteDuration(trial.durationMs);
 		const disabledDurationMs = finiteDuration(peer.durationMs);
+		const successful = trial.status === 'PASSED' && peer.status === 'PASSED'
+			&& trial.cleanup?.ok === true && peer.cleanup?.ok === true;
 		const actionHash = nonblankHash(trial.debug?.actionCommandHash) && trial.debug.actionCommandHash === peer.debug?.actionCommandHash;
 		const scenarioHash = nonblankHash(trial.debug?.scenarioDigest) && trial.debug.scenarioDigest === peer.debug?.scenarioDigest;
 		pairs.push({
 			key: printableKey(key),
-			behaviorParity: trial.status === peer.status && actionHash && scenarioHash,
+			successful,
+			behaviorParity: successful && actionHash && scenarioHash,
+			enabledStatus: trial.status,
+			disabledStatus: peer.status,
+			enabledCleanupOk: trial.cleanup?.ok === true,
+			disabledCleanupOk: peer.cleanup?.ok === true,
 			enabledDurationMs,
 			disabledDurationMs,
-			durationRatio: enabledDurationMs === null || disabledDurationMs === null || disabledDurationMs === 0 ? null : enabledDurationMs / disabledDurationMs,
+			durationRatio: !successful || enabledDurationMs === null || disabledDurationMs === null || disabledDurationMs === 0 ? null : enabledDurationMs / disabledDurationMs,
 		});
 		disabledByKey.delete(key);
 	}
 	if (disabledByKey.size > 0) throw new TypeError(`instrumentation comparison has extra disabled trial '${printableKey(disabledByKey.keys().next().value)}'`);
-	const enabledDurations = pairs.map((pair) => pair.enabledDurationMs).filter(Number.isFinite).sort((a, b) => a - b);
-	const disabledDurations = pairs.map((pair) => pair.disabledDurationMs).filter(Number.isFinite).sort((a, b) => a - b);
+	const successfulPairs = pairs.filter((pair) => pair.successful);
+	const enabledDurations = successfulPairs.map((pair) => pair.enabledDurationMs).filter(Number.isFinite).sort((a, b) => a - b);
+	const disabledDurations = successfulPairs.map((pair) => pair.disabledDurationMs).filter(Number.isFinite).sort((a, b) => a - b);
 	const durationRatios = pairs.map((pair) => pair.durationRatio).filter(Number.isFinite).sort((a, b) => a - b);
 	const enabledP95Ms = percentile(enabledDurations, 0.95);
 	const disabledP95Ms = percentile(disabledDurations, 0.95);
 	const p95Ratio = percentile(durationRatios, 0.95);
 	const checks = [
-		{ code: 'INSTRUMENTATION_SAMPLE_COUNT', status: pairs.length >= minimumSamples && durationRatios.length >= minimumSamples ? 'PASSED' : 'FAILED', observed: { pairs: pairs.length, pairedRatios: durationRatios.length }, required: minimumSamples },
+		{ code: 'INSTRUMENTATION_SAMPLE_COUNT', status: successfulPairs.length >= minimumSamples && durationRatios.length >= minimumSamples ? 'PASSED' : 'FAILED', observed: { pairs: pairs.length, successfulPairs: successfulPairs.length, pairedRatios: durationRatios.length }, required: minimumSamples },
 		{ code: 'INSTRUMENTATION_BEHAVIOR_PARITY', status: pairs.length > 0 && pairs.every((pair) => pair.behaviorParity) ? 'PASSED' : 'FAILED', mismatches: pairs.filter((pair) => !pair.behaviorParity).map((pair) => pair.key) },
 		{ code: 'INSTRUMENTATION_P95_OVERHEAD', status: p95Ratio !== null && p95Ratio <= maxP95Ratio ? 'PASSED' : 'FAILED', observedRatio: p95Ratio, maximumRatio: maxP95Ratio, enabledP95Ms, disabledP95Ms, basis: 'nearest-rank p95 of paired enabled/disabled full-path duration ratios' },
 	];

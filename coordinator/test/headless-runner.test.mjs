@@ -240,12 +240,17 @@ test('summons, starts, and polls an eight-agent exact-profile roster concurrentl
 			}
 			if (command.startsWith('codex start ')) { await phaseBarrier('start', 8); return { text: 'started' }; }
 			if (command.startsWith('codex status ')) { await phaseBarrier('status', 8); return { text: 'state=COMPLETED' }; }
+			if (command.startsWith('data get entity ')) return { text: 'minecraft:wooden_pickaxe' };
 			return { text: 'ok' };
 		},
 		close: async () => {},
 	};
 	const report = await runHeadlessScenario({
-		scenario: scenario({ rosterSize: 8, assert: [{ type: 'lifecycle', state: 'COMPLETED' }, { type: 'chat', message: 'HEADLESS_PASS' }] }),
+		scenario: scenario({ rosterSize: 8, assert: [
+			{ type: 'lifecycle', state: 'COMPLETED' },
+			{ type: 'chat', message: 'HEADLESS_PASS' },
+			{ type: 'rcon', command: 'data get entity {agent} Inventory', match: 'minecraft:wooden_pickaxe' },
+		] }),
 		runDirectory: 'C:/runs/eight-agents', rcon, now: () => 100,
 		readFile: async (file) => {
 			if (String(file).endsWith('protocol.jsonl')) return jsonl(names.map((name, index) => ({
@@ -262,6 +267,7 @@ test('summons, starts, and polls an eight-agent exact-profile roster concurrentl
 	assert.equal(report.status, 'PASSED');
 	assert.equal(report.rosterSize, 8);
 	assert.equal(report.agents.length, 8);
+	assert.equal(report.factualSuccess, true);
 	assert.deepEqual(report.agents.map((agent) => agent.agentId), Array.from({ length: 8 }, (_value, index) => `agent-id-${index + 1}`));
 	assert.ok(report.agents.every((agent) => agent.assertions.every((assertion) => assertion.passed)));
 	assert.equal(maxActiveByPhase.get('summon'), 8);

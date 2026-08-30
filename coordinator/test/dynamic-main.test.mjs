@@ -3806,6 +3806,69 @@ test('per-agent event intake reserves terminal-result capacity under ordinary ov
 	}
 });
 
+test('per-agent event intake keeps accepted lifecycle transactions lossless under ordinary overflow', async () => {
+	const bridge = new FakeBridge();
+	const registry = new AgentRegistry();
+	let releaseReconciliation;
+	const reconciliationGate = new Promise((resolve) => { releaseReconciliation = resolve; });
+	const planner = new FakePlanner(registry);
+	planner.beginReconcile = (records, options = undefined) => {
+		const reconciled = registry.reconcile(records, options);
+		return {
+			registry: reconciled,
+			complete: reconciliationGate.then(() => ({ registry: reconciled, providers: { valid: reconciled.records, invalid: [], catalog: { models: [] } } })),
+		};
+	};
+	const coordinator = createDynamicCoordinator(
+		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'arena_script' } },
+		{ bridge, registry, planner, codexService: new FakeProvider(), maxPendingAgentOperations: 1 },
+	);
+	const errors = [];
+	coordinator.on('runtimeError', (error) => errors.push(error));
+	await coordinator.start();
+	try {
+		bridge.emit('ready', { serverInstanceId: 'test', registry: [
+			{ ...record('agent-a'), state: DynamicAgentState.STARTING, currentGoal: 'Wait.', goalRevision: 1 },
+			record('agent-b'),
+		] });
+		await new Promise((resolve) => setImmediate(resolve));
+		const observation = (eventSequence, goalRevision = 1) => ({
+			goalRevision, eventSequence, attention: true,
+			observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+		});
+		bridge.emit('observation', { agentId: 'agent-a', payload: observation(1) });
+		bridge.emit('observation', { agentId: 'agent-b', payload: observation(1, 0) });
+		await new Promise((resolve) => setImmediate(resolve));
+		bridge.emit('observation', { agentId: 'agent-a', payload: observation(2) });
+		bridge.emit('observation', { agentId: 'agent-b', payload: observation(2, 0) });
+		bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'steer', goalRevision: 2, goal: 'Respond now.', updatedAtEpochMs: 2 } });
+		bridge.emit('conversation_event', { agentId: 'agent-a', payload: {
+			sequence: 1, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
+			text: 'Are you there?', goalRevision: 2, observedAtEpochMs: 1_787_184_000_000,
+		} });
+		bridge.emit('goal_completion_result', { agentId: 'agent-a', payload: {
+			goalRevision: 0, requestId: 'stale-completion', status: 'rejected', reasonCode: 'STALE_GOAL_REVISION',
+		} });
+		bridge.emit('conversation_wake', { agentId: 'agent-b', payload: {
+			transactionId: 'wake-overflow-1',
+			event: { sequence: 1, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-b', scope: 'direct', text: 'Wake up.', goalRevision: 0, observedAtEpochMs: 1_787_184_000_001 },
+			control: { operation: 'start', goalRevision: 1, updatedAtEpochMs: 3, goal: 'Answer the player.' },
+		} });
+		bridge.emit('observation', { agentId: 'agent-a', payload: observation(3) });
+		bridge.emit('observation', { agentId: 'agent-b', payload: observation(3, 0) });
+		await eventually(() => errors.filter((error) => error?.code === 'AGENT_EVENT_BACKPRESSURE').length === 2);
+		releaseReconciliation();
+		await eventually(() => bridge.sent.some((message) => message.type === 'agent_ready' && message.payload.goalRevision === 2));
+		await eventually(() => bridge.sent.some((message) => message.type === 'conversation_wake_ack' && message.payload.transactionId === 'wake-overflow-1'));
+		assert.equal(registry.get('agent-a').goalRevision, 2);
+		assert.equal(registry.get('agent-b').goalRevision, 1);
+		assert.equal(errors.filter((error) => error?.code === 'AGENT_EVENT_BACKPRESSURE').length, 2);
+	} finally {
+		releaseReconciliation?.();
+		await coordinator.stop();
+	}
+});
+
 test('dead-agent recovery does not delay readiness for later reconciled agents', async () => {
 	const bridge = new FakeBridge();
 	const registry = new AgentRegistry();
