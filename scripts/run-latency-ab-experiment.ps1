@@ -750,26 +750,6 @@ function Invoke-RunnerProcess {
         StdoutOverflow = $false
         StderrOverflow = $false
     })
-    $stdoutHandler = [Diagnostics.DataReceivedEventHandler] {
-        param($sender, $eventArgs)
-        if ($null -eq $eventArgs.Data) { return }
-        $line = $eventArgs.Data + [Environment]::NewLine
-        $bytes = [Text.Encoding]::UTF8.GetByteCount($line)
-        if (($state.StdoutBytes + $bytes) -gt $OutputLimit) { $state.StdoutOverflow = $true; return }
-        [Threading.Monitor]::Enter($stdout)
-        try { [void]$stdout.Append($line); $state.StdoutBytes += $bytes }
-        finally { [Threading.Monitor]::Exit($stdout) }
-    }
-    $stderrHandler = [Diagnostics.DataReceivedEventHandler] {
-        param($sender, $eventArgs)
-        if ($null -eq $eventArgs.Data) { return }
-        $line = $eventArgs.Data + [Environment]::NewLine
-        $bytes = [Text.Encoding]::UTF8.GetByteCount($line)
-        if (($state.StderrBytes + $bytes) -gt $OutputLimit) { $state.StderrOverflow = $true; return }
-        [Threading.Monitor]::Enter($stderr)
-        try { [void]$stderr.Append($line); $state.StderrBytes += $bytes }
-        finally { [Threading.Monitor]::Exit($stderr) }
-    }
     $process = New-Object Diagnostics.Process
     $startInfo = New-Object Diagnostics.ProcessStartInfo
     $startInfo.FileName = $CommandPlan.Executable
@@ -780,8 +760,6 @@ function Invoke-RunnerProcess {
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
     $process.StartInfo = $startInfo
-    $process.add_OutputDataReceived($stdoutHandler)
-    $process.add_ErrorDataReceived($stderrHandler)
     $startedAt = [DateTime]::UtcNow
     $tracked = New-Object 'System.Collections.Generic.List[int]'
     $timedOut = $false
@@ -792,15 +770,43 @@ function Invoke-RunnerProcess {
         try { $null = $process.Start() }
         catch { $startError = $_.Exception.Message; return [pscustomobject]@{ Started = $false; ExitCode = $null; TimedOut = $false; Stdout = ''; Stderr = ''; StdoutOverflow = $false; StderrOverflow = $false; Cleanup = [pscustomobject]@{ Ok = $true; Remaining = @(); Tracked = @() }; Error = $startError; DurationMs = 0 } }
         $tracked.Add($process.Id) | Out-Null
-        $process.BeginOutputReadLine()
-        $process.BeginErrorReadLine()
-        while (-not $process.HasExited) {
-            foreach ($childId in @(Get-DescendantProcessIds -RootProcessId $process.Id)) {
-                if (-not $tracked.Contains($childId)) { $tracked.Add($childId) | Out-Null }
+        # DataReceived scriptblock delegates are unreliable in Windows
+        # PowerShell 5.1 after a short-lived child exits. Poll both asynchronous
+        # readers on this runspace so the final JSON line is always drained.
+        $stdoutDone = $false
+        $stderrDone = $false
+        $stdoutTask = $process.StandardOutput.ReadLineAsync()
+        $stderrTask = $process.StandardError.ReadLineAsync()
+        while ($true) {
+            while (-not $stdoutDone -and $stdoutTask.IsCompleted) {
+                $line = $stdoutTask.GetAwaiter().GetResult()
+                if ($null -eq $line) { $stdoutDone = $true; break }
+                $textLine = $line + [Environment]::NewLine
+                $bytes = [Text.Encoding]::UTF8.GetByteCount($textLine)
+                if (($state.StdoutBytes + $bytes) -gt $OutputLimit) { $state.StdoutOverflow = $true; break }
+                [void]$stdout.Append($textLine)
+                $state.StdoutBytes += $bytes
+                $stdoutTask = $process.StandardOutput.ReadLineAsync()
+            }
+            while (-not $stderrDone -and $stderrTask.IsCompleted) {
+                $line = $stderrTask.GetAwaiter().GetResult()
+                if ($null -eq $line) { $stderrDone = $true; break }
+                $textLine = $line + [Environment]::NewLine
+                $bytes = [Text.Encoding]::UTF8.GetByteCount($textLine)
+                if (($state.StderrBytes + $bytes) -gt $OutputLimit) { $state.StderrOverflow = $true; break }
+                [void]$stderr.Append($textLine)
+                $state.StderrBytes += $bytes
+                $stderrTask = $process.StandardError.ReadLineAsync()
             }
             if ($state.StdoutOverflow -or $state.StderrOverflow) { break }
+            if ($process.HasExited -and $stdoutDone -and $stderrDone) { break }
+            if (-not $process.HasExited) {
+                foreach ($childId in @(Get-DescendantProcessIds -RootProcessId $process.Id)) {
+                    if (-not $tracked.Contains($childId)) { $tracked.Add($childId) | Out-Null }
+                }
+            }
             if (([DateTime]::UtcNow - $startedAt).TotalSeconds -ge $TimeoutSeconds) { $timedOut = $true; break }
-            Start-Sleep -Milliseconds 25
+            Start-Sleep -Milliseconds 10
         }
         if ($timedOut -or $state.StdoutOverflow -or $state.StderrOverflow) {
             $cleanup = Stop-TrackedProcessTree -RootProcessId $process.Id -TrackedProcessIds @($tracked.ToArray()) -ForceRoot
@@ -814,8 +820,6 @@ function Invoke-RunnerProcess {
         if ($process.HasExited) { $exitCode = $process.ExitCode }
     }
     finally {
-        try { $process.remove_OutputDataReceived($stdoutHandler) } catch { }
-        try { $process.remove_ErrorDataReceived($stderrHandler) } catch { }
         $process.Dispose()
     }
     return [pscustomobject]@{
@@ -1110,10 +1114,11 @@ function Invoke-OneLatencyArm {
                 if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf)) {
                     Write-JsonArtifact -Path $resultPath -Value (ConvertTo-RedactedValue $candidate) -Depth 40
                 }
-                $residue = Find-ArtifactResidue $attemptPath
+                $residue = @(Find-ArtifactResidue $attemptPath)
                 if ($residue.Count -gt 0) { throw "Temporary or backup residue remains: $($residue -join ', ')" }
             }
             catch {
+                $candidate = $null
                 $category = if ($_.Exception.Message -match 'cleanup|residue') { 'cleanup_failure' } elseif ($_.Exception.Message -match 'JSON|result') { 'malformed_result' } else { 'result_validation' }
                 $message = $_.Exception.Message
             }
@@ -1298,8 +1303,8 @@ function Invoke-LatencyAbExperiment {
         foreach ($cell in $cells) {
             $firstArm = if ((Get-NextRandomIndex -State $randomState -Bound 2) -eq 0) { 'baseline' } else { 'optimized' }
             $order = if ($firstArm -eq 'baseline') { @('baseline', 'optimized') } else { @('optimized', 'baseline') }
-            $manifest.armOrder.Add("$($cell.TrialId):$($order -join ',')") | Out-Null
             foreach ($armName in $order) {
+                $manifest.armOrder.Add("$($cell.TrialId):$armName") | Out-Null
                 $worktreePath = if ($armName -eq 'baseline') { $resolvedBaseline } else { $resolvedOptimized }
                 $initialState = if ($armName -eq 'baseline') { $baselineState } else { $optimizedState }
                 $armConfig = if ($armName -eq 'baseline') { $baselineConfig } else { $optimizedConfig }
