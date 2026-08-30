@@ -1790,7 +1790,9 @@ public final class CoordinatorProcessSupervisorVerification {
 			assertEquals(dev.agaminggod.arenaagents.agent.AgentLifecycleState.DISCONNECTED,
 					manager.registry().require(active.agentId()).state(),
 					"bridge replacement drains the authenticated session disconnect before dropping the old bridge");
-			repairedConnection = authenticate(port, repairedSecret, supervisor.snapshot().launchId(), "repaired-secret");
+			repairedConnection = authenticateEventually(
+					port, repairedSecret, supervisor.snapshot().launchId(), "repaired-secret"
+			);
 			supervisor.tick(true, repairedBridge.authenticatedLaunchId(), repairedBridge.authenticatedSessionGeneration());
 			assertEquals(CoordinatorRecoveryState.HEALTHY, supervisor.snapshot().state(),
 					"matching repaired child authenticates automatically through the rebound bridge");
@@ -2716,6 +2718,25 @@ public final class CoordinatorProcessSupervisorVerification {
 			closeSocket(socket);
 			throw failure;
 		}
+	}
+
+	private static Socket authenticateEventually(
+			int port,
+			String secret,
+			String launchId,
+			String messageId
+	) throws Exception {
+		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5L);
+		Exception lastFailure = null;
+		for (int attempt = 1; System.nanoTime() < deadline; attempt++) {
+			try {
+				return authenticate(port, secret, launchId, messageId + "-" + attempt);
+			} catch (IOException | dev.agaminggod.arenaagents.server.bridge.BridgeProtocolException retryable) {
+				lastFailure = retryable;
+				Thread.sleep(25L);
+			}
+		}
+		throw new IOException("Rebound bridge did not accept authentication before its deadline", lastFailure);
 	}
 
 	private static String authenticationProof(

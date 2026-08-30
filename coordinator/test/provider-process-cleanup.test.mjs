@@ -263,7 +263,10 @@ test('Windows cleanup accepts a late exit when forced taskkill reports an alread
 	};
 
 	await terminateChildProcess(child, {
-		timeoutMs: 50,
+		// This assertion exercises the late-exit path, not the minimum timeout.
+		// Leave enough headroom for a loaded Windows CI runner to schedule the
+		// setImmediate callback after the graceful taskkill wait.
+		timeoutMs: 250,
 		platform: 'win32',
 		execFile: execute,
 	});
