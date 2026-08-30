@@ -111,7 +111,7 @@ export function createVoiceHttpServer({
 		controllers.add(controller);
 		let released = false;
 		let providerOperation = null;
-		let releaseSharedTtsCapacity = null;
+		let completeSharedTtsRequest = null;
 		active += 1;
 		if (channel === 'stt') activeStt += 1;
 		else activeTts += 1;
@@ -181,7 +181,7 @@ export function createVoiceHttpServer({
 					signal: controller.signal,
 				});
 				attemptedLifecycle = null;
-				releaseSharedTtsCapacity = joined.releaseCapacity;
+				completeSharedTtsRequest = joined.complete;
 				output = await joined.waiter;
 			}
 			response.writeHead(200, {
@@ -204,7 +204,7 @@ export function createVoiceHttpServer({
 			clearTimeout(timeout);
 			request.off('aborted', onRequestAborted);
 			response.off('close', onResponseClosed);
-			if (releaseSharedTtsCapacity !== null) releaseSharedTtsCapacity(release);
+			if (completeSharedTtsRequest !== null) completeSharedTtsRequest(release);
 			else if (providerOperation === null) release();
 			else providerOperation.then(release, release);
 		}
@@ -218,7 +218,15 @@ export function createVoiceHttpServer({
 		let entry = inFlightTts.get(cacheKey);
 		if (entry === undefined) {
 			const providerController = new AbortController();
-			entry = { providerController, waiters: 0, settled: false, operation: null };
+			entry = {
+				providerController,
+				waiters: 0,
+				settled: false,
+				failed: false,
+				failure: undefined,
+				failureRecorded: false,
+				operation: null,
+			};
 			const current = entry;
 			entry.operation = Promise.resolve().then(async () => {
 				try {
@@ -241,11 +249,13 @@ export function createVoiceHttpServer({
 					if (!providerController.signal.aborted) ttsLifecycle.recordReady();
 					return output;
 				} catch (error) {
-					if (error?.name !== 'AbortError') ttsLifecycle.recordFailure(error);
+					current.failed = true;
+					current.failure = error;
 					throw error;
 				} finally {
 					current.settled = true;
 					if (inFlightTts.get(cacheKey) === current) inFlightTts.delete(cacheKey);
+					if (current.waiters === 0) recordTtsFlightFailure(current);
 				}
 			});
 			entry.operation.catch(() => {});
@@ -253,19 +263,29 @@ export function createVoiceHttpServer({
 		}
 		entry.waiters += 1;
 		const current = entry;
-		const waiter = awaitAbortable(current.operation, signal).finally(() => {
-			current.waiters -= 1;
-			if (current.waiters !== 0 || current.settled) return;
-			if (inFlightTts.get(cacheKey) === current) inFlightTts.delete(cacheKey);
-			current.providerController.abort(abortError('All synthesis waiters cancelled'));
-		});
+		const waiter = awaitAbortable(current.operation, signal);
+		let completed = false;
 		return {
 			waiter,
-			releaseCapacity(release) {
+			complete(release) {
+				if (completed) return;
+				completed = true;
+				current.waiters -= 1;
+				if (current.waiters === 0 && !current.settled) {
+					if (inFlightTts.get(cacheKey) === current) inFlightTts.delete(cacheKey);
+					current.providerController.abort(abortError('All synthesis waiters cancelled'));
+				}
 				if (current.waiters > 0 || current.settled) release();
 				else current.operation.then(release, release);
+				if (current.waiters === 0 && current.settled) recordTtsFlightFailure(current);
 			},
 		};
+	}
+
+	function recordTtsFlightFailure(entry) {
+		if (entry.failureRecorded || !entry.failed || entry.failure?.name === 'AbortError') return;
+		entry.failureRecorded = true;
+		ttsLifecycle.recordFailure(entry.failure);
 	}
 	const notifyFailure = (error) => {
 		for (const listener of [...failureListeners]) {
