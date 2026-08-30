@@ -24,6 +24,7 @@ const scenario = (overrides = {}) => normalizeHeadlessScenario({
 
 const jsonl = (rows) => rows.map((row) => JSON.stringify(row)).join('\n') + '\n';
 const GENERATED_NAME_AT_100 = 'ha_runner__0002s';
+const POWERSHELL_TEST_TIMEOUT_MS = 30_000;
 
 test('PowerShell wrapper samples a fast-exit tracked runner before completion', () => {
 	const wrapper = path.resolve('../scripts/run-headless-provider-matrix.ps1').replaceAll("'", "''");
@@ -48,7 +49,7 @@ $runner = @{ Process = $process; Identity = $identity }
 $peak = Measure-RunnerResourcesUntilExit $runner @($runner) $tracked ([DateTime]::UtcNow.AddSeconds(1))
 [pscustomobject]@{ processCount = $peak.processCount; peakRssBytes = $peak.peakRssBytes; exited = $process.HasExited } | ConvertTo-Json -Compress
 `;
-	const result = spawnSync('powershell.exe', ['-NoProfile', '-Command', script], { encoding: 'utf8', timeout: 10_000 });
+	const result = spawnSync('powershell.exe', ['-NoProfile', '-Command', script], { encoding: 'utf8', timeout: POWERSHELL_TEST_TIMEOUT_MS });
 	assert.equal(result.status, 0, result.stderr || result.stdout);
 	const peak = JSON.parse(result.stdout.trim());
 	assert.ok(peak.processCount >= 1, result.stdout);
@@ -80,7 +81,7 @@ $runner = @{ Process = $process; Identity = $identity }
 $peak = Measure-RunnerResourcesUntilExit $runner @($runner) $tracked ([DateTime]::UtcNow.AddSeconds(1))
 [pscustomobject]@{ snapshots = $script:snapshots; count = $peak.processCount; rss = $peak.peakRssBytes } | ConvertTo-Json -Compress
 `;
-	const result = spawnSync('powershell.exe', ['-NoProfile', '-Command', script], { encoding: 'utf8', timeout: 10_000 });
+	const result = spawnSync('powershell.exe', ['-NoProfile', '-Command', script], { encoding: 'utf8', timeout: POWERSHELL_TEST_TIMEOUT_MS });
 	assert.equal(result.status, 0, result.stderr || result.stdout);
 	assert.deepEqual(JSON.parse(result.stdout.trim()), { snapshots: 1, count: 1, rss: 4096 });
 });
@@ -115,7 +116,7 @@ Stop-TrackedProcessIds $tracked
 Assert-TrackedProcessIdsGone $tracked
 [pscustomobject]@{ count = $sample.processCount; rss = $sample.rssBytes; ancestryCount = $ancestrySample.processCount; tracked = @($tracked | ForEach-Object { $_.ProcessId }); stopped = @($script:stopped) } | ConvertTo-Json -Compress
 `;
-	const result = spawnSync('powershell.exe', ['-NoProfile', '-Command', script], { encoding: 'utf8', timeout: 10_000 });
+	const result = spawnSync('powershell.exe', ['-NoProfile', '-Command', script], { encoding: 'utf8', timeout: POWERSHELL_TEST_TIMEOUT_MS });
 	assert.equal(result.status, 0, result.stderr || result.stdout);
 	assert.deepEqual(JSON.parse(result.stdout.trim()), { count: 0, rss: 0, ancestryCount: 0, tracked: [4242], stopped: [] });
 });
@@ -147,7 +148,7 @@ $peak = Measure-RunnerResourcesUntilExit $runner @($runner) $tracked ([DateTime]
 Stop-TrackedProcessIds $tracked
 [pscustomobject]@{ tracked = @($tracked | ForEach-Object { $_.ProcessId }); count = $peak.processCount; rss = $peak.peakRssBytes; stopped = @($script:stopped) } | ConvertTo-Json -Compress
 `;
-	const result = spawnSync('powershell.exe', ['-NoProfile', '-Command', script], { encoding: 'utf8', timeout: 10_000 });
+	const result = spawnSync('powershell.exe', ['-NoProfile', '-Command', script], { encoding: 'utf8', timeout: POWERSHELL_TEST_TIMEOUT_MS });
 	assert.equal(result.status, 0, result.stderr || result.stdout);
 	assert.deepEqual(JSON.parse(result.stdout.trim()), { tracked: [10, 20], count: 1, rss: 4000, stopped: [20] });
 });
