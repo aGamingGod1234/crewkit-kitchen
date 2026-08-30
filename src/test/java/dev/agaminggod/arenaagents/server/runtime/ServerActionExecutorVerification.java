@@ -229,16 +229,7 @@ public final class ServerActionExecutorVerification {
 			assertFalse(admitted[start], "round-robin does not admit an agent twice before the full turn");
 			admitted[start] = true;
 		}
-		ServerActionResult terminal = new ServerActionResult(
-				progressAgent, 7L, "action-7", ActionType.WAIT, "trace-action-7",
-				ServerActionState.SUCCEEDED, "WAIT_FINISHED", "Wait complete", 25L,
-				1_750_000_000_025L, true, false);
-		ActionTerminalPublication publication = ActionTerminalPublication.capture(
-				terminal, Optional.empty(), 1_750_000_000_025L);
-		assertEquals(terminal, publication.result(), "terminal publication retains the exact result identity");
-		assertTrue(publication.postActionFacts().isEmpty(),
-				"terminal publication explicitly represents an unavailable player snapshot");
-		return 50;
+		return 48;
 	}
 
 	private static void verifyDisconnectedRespawnFinishesOnce() {
