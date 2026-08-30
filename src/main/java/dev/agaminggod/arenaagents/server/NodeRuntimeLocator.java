@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Duration;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -19,20 +20,46 @@ final class NodeRuntimeLocator {
 	private static final int MAX_VERSION_OUTPUT_BYTES = 512;
 	private static final Duration VERSION_PROBE_TIMEOUT = Duration.ofSeconds(2);
 	private static final Pattern VERSION = Pattern.compile("^v?(\\d+)(?:\\..*)?\\s*$");
+	private static CacheEntry productionCache;
 
 	private NodeRuntimeLocator() {
 	}
 
-	static LocatedNode locate(Path packageRoot) {
-		return locate(
-				packageRoot,
-				System.getProperty(PROPERTY),
-				System.getenv("PATH"),
-				NodeRuntimeLocator::probeVersion
-		);
+	static synchronized LocatedNode locate(Path packageRoot) {
+		Path root = requireRoot(packageRoot);
+		String explicit = System.getProperty(PROPERTY);
+		CacheKey key = cacheKey(root, explicit);
+		if (productionCache != null && productionCache.key().equals(key)) return productionCache.node();
+		LocatedNode located = locate(root, explicit, NodeRuntimeLocator::probeVersion);
+		productionCache = new CacheEntry(key, located);
+		return located;
 	}
 
-	static LocatedNode locate(Path packageRoot, String explicitPath, String path, Probe probe) {
+	private static CacheKey cacheKey(Path root, String explicitPath) {
+		String configured = explicitPath == null ? "" : explicitPath.trim();
+		Path candidate = bundledCandidate(root);
+		if (!configured.isEmpty()) {
+			try {
+				candidate = Path.of(configured).toAbsolutePath().normalize();
+			} catch (RuntimeException ignored) {
+				candidate = null;
+			}
+		}
+		return new CacheKey(root, configured, fileIdentity(candidate));
+	}
+
+	private static String fileIdentity(Path candidate) {
+		if (candidate == null) return "invalid";
+		try {
+			BasicFileAttributes attributes = Files.readAttributes(candidate, BasicFileAttributes.class);
+			return candidate + ":" + attributes.size() + ":" + attributes.lastModifiedTime().toMillis()
+					+ ":" + String.valueOf(attributes.fileKey());
+		} catch (IOException | RuntimeException failure) {
+			return candidate + ":unreadable";
+		}
+	}
+
+	static LocatedNode locate(Path packageRoot, String explicitPath, Probe probe) {
 		Path root = requireRoot(packageRoot);
 		String configured = explicitPath == null ? "" : explicitPath.trim();
 		if (!configured.isEmpty()) {
@@ -54,14 +81,9 @@ final class NodeRuntimeLocator {
 		if (Files.exists(bundled)) {
 			return inspect(bundled, Source.BUNDLED_PROFILE, probe);
 		}
-
-		Path pathCandidate = firstPathCandidate(path);
-		if (pathCandidate == null) {
-			throw failure("NODE_RUNTIME_NOT_FOUND",
-					"Node.js 22+ was not found; set -Darenaagents.nodePath to an absolute executable "
-							+ "or install/ship the bundled profile runtime");
-		}
-		return inspect(pathCandidate, Source.PATH, probe);
+		throw failure("NODE_RUNTIME_NOT_FOUND",
+				"Node.js 22+ was not found; set -Darenaagents.nodePath to an absolute executable "
+						+ "or install/ship the bundled profile runtime");
 	}
 
 	private static Path requireRoot(Path packageRoot) {
@@ -76,28 +98,11 @@ final class NodeRuntimeLocator {
 				: packageRoot.resolve("runtime/toolchains/node/bin/node");
 	}
 
-	private static Path firstPathCandidate(String path) {
-		if (path == null || path.isBlank()) return null;
-		String executableName = isWindows() ? "node.exe" : "node";
-		for (String entry : path.split(java.util.regex.Pattern.quote(java.io.File.pathSeparator), -1)) {
-			if (entry.isBlank()) continue;
-			Path directory;
-			try {
-				directory = Path.of(entry);
-			} catch (RuntimeException ignored) {
-				continue;
-			}
-			Path candidate = directory.resolve(executableName).toAbsolutePath().normalize();
-			if (Files.exists(candidate)) return candidate;
-		}
-		return null;
-	}
-
 	private static LocatedNode inspect(Path candidate, Source source, Probe probe) {
 		if (!Files.isRegularFile(candidate) || !Files.isExecutable(candidate)) {
 			String code = source == Source.EXPLICIT_PROPERTY
 					? "NODE_RUNTIME_EXPLICIT_INVALID"
-					: source == Source.BUNDLED_PROFILE ? "NODE_RUNTIME_BUNDLED_INVALID" : "NODE_RUNTIME_NOT_FOUND";
+					: "NODE_RUNTIME_BUNDLED_INVALID";
 			throw failure(code, remediation(source) + ": " + candidate);
 		}
 		String version;
@@ -106,7 +111,7 @@ final class NodeRuntimeLocator {
 		} catch (Exception exception) {
 			String code = source == Source.EXPLICIT_PROPERTY
 					? "NODE_RUNTIME_EXPLICIT_INVALID"
-					: source == Source.BUNDLED_PROFILE ? "NODE_RUNTIME_BUNDLED_INVALID" : "NODE_RUNTIME_NOT_FOUND";
+					: "NODE_RUNTIME_BUNDLED_INVALID";
 			throw failure(code, "Could not run Node.js --version for " + candidate, exception);
 		}
 		Matcher matcher = VERSION.matcher(version == null ? "" : version.trim());
@@ -130,12 +135,7 @@ final class NodeRuntimeLocator {
 		return switch (source) {
 			case EXPLICIT_PROPERTY -> "Configured Node executable is missing or not executable";
 			case BUNDLED_PROFILE -> "Bundled profile Node executable is missing or not executable";
-			case PATH -> "PATH Node executable is missing or not executable";
 		};
-	}
-
-	private static boolean isWindows() {
-		return System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("win");
 	}
 
 	private static String probeVersion(Path executable) throws IOException {
@@ -180,8 +180,7 @@ final class NodeRuntimeLocator {
 
 	enum Source {
 		EXPLICIT_PROPERTY,
-		BUNDLED_PROFILE,
-		PATH
+		BUNDLED_PROFILE
 	}
 
 	record LocatedNode(Path executable, Source source, int majorVersion) {
@@ -189,6 +188,12 @@ final class NodeRuntimeLocator {
 			executable = executable.toAbsolutePath().normalize();
 			if (majorVersion < MIN_MAJOR_VERSION) throw new IllegalArgumentException("Node version is unsupported");
 		}
+	}
+
+	private record CacheKey(Path root, String explicitPath, String executableIdentity) {
+	}
+
+	private record CacheEntry(CacheKey key, LocatedNode node) {
 	}
 
 	@FunctionalInterface

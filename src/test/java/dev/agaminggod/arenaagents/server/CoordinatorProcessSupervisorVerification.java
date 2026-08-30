@@ -19,9 +19,11 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.ArrayDeque;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.Deque;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -34,6 +36,8 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 
 /** Fault-injection verification for coordinator recovery ownership and deadlines. */
 public final class CoordinatorProcessSupervisorVerification {
@@ -62,8 +66,8 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyStaleLaunchAuthenticationIsRejected();
 		verifyStaleLaunchCannotSuppressReplacement();
 		verifyReconnectRecoveryAndExpiry();
-		verifyExternalCoordinatorReconnectGrace();
-		verifySlowPreparationPreservesExternalAdoptionWindow();
+		verifyAutoStartOwnsLaunchDespiteExternalAuthentication();
+		verifySlowPreparationStillOwnsLaunch();
 		verifyContinuousStabilityResetsFailures();
 		verifyCandidatePromotionUsesMaintenanceWorker();
 		verifyCandidatePromotionRefreshesOwnedFingerprintBaseline();
@@ -83,6 +87,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyBlockingMaintenanceNeverBlocksTicks();
 		verifyBlockedMaintenanceWaitsForRetryDeadline();
 		verifyProductionDependencyMonitorWakesOnRelevantFileChange();
+		verifyManifestFingerprintCoversEveryListedModule();
 		verifyExternalFingerprintChangeStillReplacesHealthyChild();
 		verifyWorkerFingerprintObservationAdvancesMonitorBaseline();
 		verifyDependencyWakeSurvivesInflightFailure();
@@ -107,7 +112,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyCloseWaitsForInflightOwnedLaunchCleanup();
 		verifyCloseTerminatesChildBehindBlockedMaintenance();
 		verifyCloseIsIdempotent();
-		return isWindows() ? 311 : 301;
+		return isWindows() ? 306 : 296;
 	}
 
 	private static void verifyPosixLaunchGateCommand() {
@@ -532,6 +537,18 @@ public final class CoordinatorProcessSupervisorVerification {
 		CoordinatorProcessSupervisor.PreparedRuntime runtime = preparedRuntime(maximumSecret);
 		assertEquals(maximumSecret, runtime.bridgeSecret(),
 				"production supervisor accepts the protocol bridge-secret upper bound");
+		assertTrue(!runtime.bridgeSecret().equals(runtime.voiceSecret()),
+				"compatibility construction derives a distinct voice credential");
+		try {
+			new CoordinatorProcessSupervisor.PreparedRuntime(
+					runtime.root(), runtime.coordinatorRoot(), runtime.main(), runtime.config(), runtime.secret(),
+					runtime.voiceSecretPath(), runtime.nodeExecutable(), runtime.bridgeSecret(), runtime.bridgeSecret(),
+					runtime.bridgePort(), runtime.generationId(), runtime.candidate(), runtime.lastKnownGoodAvailable()
+			);
+			throw new AssertionError("canonical runtime must reject shared bridge and voice credentials");
+		} catch (IllegalArgumentException expected) {
+			assertTrue(expected.getMessage().contains("distinct"), "shared-secret rejection names the invariant");
+		}
 		try {
 			preparedRuntime("s".repeat(513));
 		} catch (IllegalArgumentException expected) {
@@ -1213,44 +1230,19 @@ public final class CoordinatorProcessSupervisorVerification {
 		fixture.supervisor.close();
 	}
 
-	private static void verifyExternalCoordinatorReconnectGrace() {
+	private static void verifyAutoStartOwnsLaunchDespiteExternalAuthentication() {
 		Fixture fixture = Fixture.ready();
 		fixture.supervisor.tick(true, null, 1L, true);
-		assertEquals(CoordinatorRecoveryState.HEALTHY, fixture.supervisor.snapshot().state(),
-				"an authenticated coordinator without a launch ID is adopted");
-		assertEquals(0, fixture.launcher.launches.size(), "adoption does not launch a competing coordinator");
-
-		fixture.supervisor.tick(false, null, 1L, false);
-		CoordinatorRecoverySnapshot degraded = fixture.supervisor.snapshot();
-		assertEquals(CoordinatorRecoveryState.DEGRADED, degraded.state(),
-				"an adopted coordinator receives reconnect grace after disconnect");
-		assertEquals(fixture.clock.now + RECONNECT_TIMEOUT_MS, degraded.reconnectDeadlineEpochMs(),
-				"adopted coordinator reconnect grace is bounded");
-		assertEquals(0, fixture.launcher.launches.size(), "disconnect does not immediately launch a competitor");
-
-		fixture.clock.advance(RECONNECT_TIMEOUT_MS - 1L);
-		fixture.supervisor.tick(false, null, 1L, false);
-		assertEquals(0, fixture.launcher.launches.size(), "competitor remains suppressed throughout reconnect grace");
-		fixture.supervisor.tick(true, null, 2L, true);
-		assertEquals(CoordinatorRecoveryState.HEALTHY, fixture.supervisor.snapshot().state(),
-				"an adopted coordinator can reconnect with a fresh authenticated session");
-		assertEquals(0, fixture.launcher.launches.size(), "successful reconnect keeps the external coordinator adopted");
-
-		fixture.supervisor.tick(false, null, 2L, false);
-		assertEquals(CoordinatorRecoveryState.DEGRADED, fixture.supervisor.snapshot().state(),
-				"a later disconnect starts a fresh reconnect window");
-		fixture.clock.advance(RECONNECT_TIMEOUT_MS - 1L);
-		fixture.supervisor.tick(false, null, 2L, false);
-		assertEquals(0, fixture.launcher.launches.size(), "the fresh reconnect window is honored in full");
-		fixture.clock.advance(1L);
-		fixture.supervisor.tick(false, null, 2L, false);
-		assertEquals(1, fixture.launcher.launches.size(), "a competitor launches only after reconnect grace expires");
 		assertEquals(CoordinatorRecoveryState.AUTHENTICATING, fixture.supervisor.snapshot().state(),
-				"the replacement must authenticate after the external grace expires");
+				"auto-start requires authentication from its owned launch generation");
+		assertEquals(1, fixture.launcher.launches.size(),
+				"an authenticated launch without an owned ID cannot suppress auto-start");
+		assertTrue(fixture.supervisor.snapshot().launchId() != null,
+				"auto-start assigns an owned launch identity before accepting readiness");
 		fixture.supervisor.close();
 	}
 
-	private static void verifySlowPreparationPreservesExternalAdoptionWindow() {
+	private static void verifySlowPreparationStillOwnsLaunch() {
 		FakeClock externalClock = new FakeClock();
 		MutableDependencies externalDependencies = MutableDependencies.ready();
 		FakeLauncher externalLauncher = new FakeLauncher();
@@ -1267,10 +1259,10 @@ public final class CoordinatorProcessSupervisorVerification {
 			assertEquals(0, externalLauncher.launches.size(),
 					"expired process-start time does not launch before the prepared bridge can listen");
 			externalSupervisor.tickWithBridgeListener(true, null, 1L, true, true);
-			assertEquals(CoordinatorRecoveryState.HEALTHY, externalSupervisor.snapshot().state(),
-					"external coordinator authenticates after the delayed listener becomes available");
-			assertEquals(0, externalLauncher.launches.size(),
-					"delayed external authentication never races a supervisor-owned child");
+			assertEquals(CoordinatorRecoveryState.AUTHENTICATING, externalSupervisor.snapshot().state(),
+					"delayed preparation still waits for authentication from its owned launch");
+			assertEquals(1, externalLauncher.launches.size(),
+					"external authentication cannot adopt the auto-start supervisor after delayed preparation");
 		} finally {
 			externalSupervisor.close();
 		}
@@ -1289,16 +1281,48 @@ public final class CoordinatorProcessSupervisorVerification {
 			launchSupervisor.tickWithBridgeListener(false, null, 0L, false, false);
 			assertEquals(0, launchLauncher.launches.size(), "normal auto-start waits until the bridge listener exists");
 			launchSupervisor.tickWithBridgeListener(false, null, 0L, false, true);
-			launchClock.advance(STARTUP_GRACE_MS - 1L);
-			launchSupervisor.tickWithBridgeListener(false, null, 0L, false, true);
-			assertEquals(0, launchLauncher.launches.size(), "normal auto-start honors the listener adoption window in full");
-			launchClock.advance(1L);
-			launchSupervisor.tickWithBridgeListener(false, null, 0L, false, true);
-			assertEquals(1, launchLauncher.launches.size(), "normal auto-start launches after the listener adoption window");
+			assertEquals(1, launchLauncher.launches.size(), "normal auto-start launches as soon as its bridge can accept authentication");
 			assertEquals(CoordinatorRecoveryState.AUTHENTICATING, launchSupervisor.snapshot().state(),
 					"normal auto-start still enters coordinator authentication");
 		} finally {
 			launchSupervisor.close();
+		}
+	}
+
+	private static void verifyManifestFingerprintCoversEveryListedModule() {
+		Path root = null;
+		try {
+			root = Files.createTempDirectory("arena-manifest-fingerprint-");
+			Path coordinator = root.resolve("coordinator");
+			Path module = coordinator.resolve("src/codex-service.mjs");
+			Path manifest = coordinator.resolve(".arena-agents-bundle-manifest");
+			Files.createDirectories(module.getParent());
+			Files.writeString(module, "alpha", StandardCharsets.UTF_8);
+			Files.writeString(manifest, "0".repeat(64) + " src/codex-service.mjs\n", StandardCharsets.UTF_8);
+			FileTime originalTime = Files.getLastModifiedTime(module);
+			String initial = CoordinatorProcessSupervisor.DefaultDependencyResolver.manifestFilesStamp(manifest);
+
+			Files.writeString(module, "omega", StandardCharsets.UTF_8);
+			Files.setLastModifiedTime(module, FileTime.fromMillis(originalTime.toMillis() + 2_000L));
+			String changed = CoordinatorProcessSupervisor.DefaultDependencyResolver.manifestFilesStamp(manifest);
+			assertFalse(initial.equals(changed),
+					"manifest fingerprint detects a changed manifest-listed module without hashing it on every poll");
+
+			Files.delete(module);
+			String missing = CoordinatorProcessSupervisor.DefaultDependencyResolver.manifestFilesStamp(manifest);
+			assertFalse(changed.equals(missing), "manifest fingerprint detects a deleted listed module");
+			assertTrue(missing.contains("missing"), "missing module state is explicit in the dependency fingerprint");
+
+			FileTime manifestTime = Files.getLastModifiedTime(manifest);
+			Files.writeString(manifest, "1".repeat(64) + " src/codex-service.mjs\n", StandardCharsets.UTF_8);
+			Files.setLastModifiedTime(manifest, manifestTime);
+			String upgraded = CoordinatorProcessSupervisor.DefaultDependencyResolver.manifestFilesStamp(manifest);
+			assertFalse(missing.equals(upgraded),
+					"manifest fingerprint detects a same-size package upgrade even when mtime is preserved");
+		} catch (IOException exception) {
+			throw new AssertionError("manifest fingerprint verification failed", exception);
+		} finally {
+			if (root != null) deleteTree(root);
 		}
 	}
 
@@ -1936,8 +1960,8 @@ public final class CoordinatorProcessSupervisorVerification {
 					"disabled coordinator autostart stops only child-process supervision");
 			assertEquals(0, launcher.launches.size(),
 					"disabled coordinator autostart never launches a child coordinator");
-			assertTrue(CodexAgentServerRuntime.voiceConfigurationPrepared(supervisor),
-					"bridge-secret-only explicit setup initializes voice through the worker's supported fallback");
+			assertFalse(CodexAgentServerRuntime.voiceConfigurationPrepared(supervisor),
+					"bridge-secret-only explicit setup leaves voice disabled without its dedicated secret");
 			slot = new CodexAgentServerRuntime.BridgeSlot(System::currentTimeMillis);
 			CodexAgentServerRuntime.reconcileBridgeConfiguration(slot, uninitializedManager(), supervisor);
 			assertTrue(slot.bridge() != null, "explicit bridge secret still constructs the Java listener");
@@ -2072,10 +2096,13 @@ public final class CoordinatorProcessSupervisorVerification {
 				new CoordinatorProcessSupervisor.OwnedMaintenanceWorker(), runtimeRoot -> 0, task -> { }
 		);
 		await(dependenciesResolved, "production maintenance worker resolves startup dependencies");
-		supervisor.tick(false, null, 0L);
+		long configuredDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5L);
+		while (!supervisor.configured() && System.nanoTime() < configuredDeadline) {
+			supervisor.tick(false, null, 0L);
+			Thread.onSpinWait();
+		}
 		assertTrue(supervisor.configured(), "startup dependencies publish before the launch race");
 
-		clock.advance(STARTUP_GRACE_MS);
 		long launchDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5L);
 		while (launcher.started.getCount() > 0L && System.nanoTime() < launchDeadline) {
 			supervisor.tick(false, null, 0L);
@@ -2146,6 +2173,10 @@ public final class CoordinatorProcessSupervisorVerification {
 			assertEquals(launcher.launches.getFirst().generationId(),
 					launcher.launches.getFirst().environment().get("ARENA_AGENT_COORDINATOR_RUNTIME_GENERATION"),
 					"exact runtime generation is passed through the child environment");
+			assertEquals("s".repeat(32), launcher.launches.getFirst().environment().get("ARENA_AGENT_BRIDGE_SECRET"),
+					"control bridge receives only its credential");
+			assertEquals("v".repeat(32), launcher.launches.getFirst().environment().get("ARENA_AGENT_VOICE_SECRET"),
+					"voice worker receives its distinct least-privilege credential");
 			UUID.fromString(authenticating.launchId());
 		}
 	}
@@ -2170,8 +2201,14 @@ public final class CoordinatorProcessSupervisorVerification {
 				Path.of("build", "supervisor-runtime", "coordinator", "src", "dynamic-main.mjs"),
 				Path.of("build", "supervisor-runtime", "coordinator", "config", "dynamic-agents.json"),
 				Path.of("build", "supervisor-runtime", "runtime", "bridge-secret.txt"),
+				Path.of("build", "supervisor-runtime", "runtime", "voice-secret.txt"),
 				Path.of("build", "supervisor-runtime", "runtime", "toolchains", "node", "node.exe"),
-				"s".repeat(32)
+				"s".repeat(32),
+				"v".repeat(32),
+				25_570,
+				GENERATION_A,
+				false,
+				true
 		);
 		private String fingerprint;
 		private CoordinatorProcessSupervisor.DependencyResolution result;
@@ -2586,19 +2623,59 @@ public final class CoordinatorProcessSupervisorVerification {
 		try {
 			BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
 			socket.setSoTimeout(2_000);
+			String clientNonce = Base64.getUrlEncoder().withoutPadding().encodeToString(
+					MessageDigest.getInstance("SHA-256").digest(messageId.getBytes(StandardCharsets.UTF_8))
+			);
+			JsonObject challenge = new JsonObject();
+			challenge.addProperty("clientNonce", clientNonce);
+			socket.getOutputStream().write(codec.encode(new BridgeEnvelope(
+					2, "pending", "server", "auth_challenge", messageId + "-challenge", challenge
+			)).getBytes(StandardCharsets.UTF_8));
+			socket.getOutputStream().flush();
+			BridgeEnvelope response = codec.decode(reader.readLine());
+			assertEquals("auth_response", response.type(), "matching child proves the server identity first");
+			String serverNonce = response.payload().get("serverNonce").getAsString();
+			assertEquals(
+					authenticationProof(secret, "server", clientNonce, serverNonce, response.serverInstanceId(), null),
+					response.payload().get("proof").getAsString(),
+					"matching child proves possession of the prepared secret"
+			);
 			JsonObject hello = new JsonObject();
-			hello.addProperty("secret", secret);
+			hello.addProperty("replyTo", response.messageId());
+			hello.addProperty("clientNonce", clientNonce);
+			hello.addProperty("serverNonce", serverNonce);
+			hello.addProperty("proof", authenticationProof(
+					secret, "coordinator", clientNonce, serverNonce, response.serverInstanceId(), launchId
+			));
 			hello.addProperty("launchId", launchId);
 			socket.getOutputStream().write(codec.encode(new BridgeEnvelope(
-					2, "coordinator", "server", "hello", messageId, hello
+					2, response.serverInstanceId(), "server", "hello", messageId, hello
 			)).getBytes(StandardCharsets.UTF_8));
 			socket.getOutputStream().flush();
 			assertEquals("hello_ack", codec.decode(reader.readLine()).type(), "matching child receives hello acknowledgement");
+			assertEquals("verbose_control", codec.decode(reader.readLine()).type(), "matching child receives verbose control");
 			return socket;
 		} catch (Exception failure) {
 			closeSocket(socket);
 			throw failure;
 		}
+	}
+
+	private static String authenticationProof(
+			String secret,
+			String role,
+			String clientNonce,
+			String serverNonce,
+			String serverInstanceId,
+			String launchId
+	) throws Exception {
+		String context = String.join("\0", "arena-agents-v2", role, clientNonce, serverNonce, serverInstanceId)
+				+ ("coordinator".equals(role) ? "\0" + (launchId == null ? "" : launchId) : "");
+		Mac mac = Mac.getInstance("HmacSHA256");
+		mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+		return Base64.getUrlEncoder().withoutPadding().encodeToString(
+				mac.doFinal(context.getBytes(StandardCharsets.UTF_8))
+		);
 	}
 
 	private static void closeSocket(Socket socket) {

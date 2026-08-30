@@ -8,6 +8,13 @@ plugins {
 version = project.mod_version
 group = project.maven_group
 
+allprojects {
+	dependencyLocking {
+		lockAllConfigurations()
+		lockMode = LockMode.STRICT
+	}
+}
+
 base {
 	archivesName = project.archives_base_name
 }
@@ -46,8 +53,42 @@ dependencies {
 	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
 	compileOnly "net.java.dev.jna:jna:5.17.0"
 	compileOnly files("libs/fabric-carpet-26.1+v260402.jar")
+	testRuntimeOnly files("libs/fabric-carpet-26.1+v260402.jar")
 	standaloneFabricApi("net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}") {
 		transitive = false
+	}
+}
+
+def carpetDependency = layout.projectDirectory.file('libs/fabric-carpet-26.1+v260402.jar')
+def localDependencyChecksums = layout.projectDirectory.file('libs/checksums.sha256')
+
+tasks.register('verifyLocalDependencies') {
+	group = 'verification'
+	description = 'Verifies tracked local dependency hashes against the reviewed provenance record.'
+	inputs.files(carpetDependency, localDependencyChecksums)
+
+	doLast {
+		def checksumFile = localDependencyChecksums.asFile
+		def records = checksumFile.readLines('UTF-8')
+			.collect { it.trim() }
+			.findAll { !it.isEmpty() && !it.startsWith('#') }
+		if (records.size() != 1) {
+			throw new GradleException("Expected exactly one local dependency checksum in ${project.relativePath(checksumFile)}.")
+		}
+
+		def record = records[0] =~ /^([0-9a-fA-F]{64})\s+\*?(.+)$/
+		if (!record.matches() || record.group(2) != carpetDependency.asFile.name) {
+			throw new GradleException("Invalid Carpet checksum record in ${project.relativePath(checksumFile)}.")
+		}
+
+		def expectedHash = record.group(1).toLowerCase(Locale.ROOT)
+		def actualHash = MessageDigest.getInstance('SHA-256')
+			.digest(carpetDependency.asFile.bytes)
+			.encodeHex()
+			.toString()
+		if (actualHash != expectedHash) {
+			throw new GradleException("Local dependency checksum mismatch: ${project.relativePath(carpetDependency.asFile)}")
+		}
 	}
 }
 
@@ -61,6 +102,7 @@ processResources {
 }
 
 tasks.withType(JavaCompile).configureEach {
+	dependsOn tasks.named('verifyLocalDependencies')
 	options.release = 25
 }
 

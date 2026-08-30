@@ -5,6 +5,8 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFileAttributeView;
+import java.nio.file.attribute.PosixFilePermission;
 import java.security.MessageDigest;
 import java.util.Comparator;
 import java.util.HexFormat;
@@ -12,6 +14,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -44,6 +47,7 @@ public final class BundledCoordinatorInstallerVerification {
 	private static int verifySupervisorAutomaticallyRestoresCorruptedRuntime() throws Exception {
 		Path root = Files.createTempDirectory("arena-supervisor-corrupt-lkg");
 		String oldPackageRoot = System.getProperty("arenaagents.packageRoot");
+		String oldNodePath = System.getProperty(NodeRuntimeLocator.PROPERTY);
 		CoordinatorProcessSupervisor supervisor = null;
 		Process staleCoordinator = null;
 		try {
@@ -58,6 +62,7 @@ public final class BundledCoordinatorInstallerVerification {
 			Files.delete(fixture.activeMain());
 			Path game = blockBundledRefresh(root.resolve("game"));
 			System.setProperty("arenaagents.packageRoot", fixture.packageRoot().toString());
+			System.setProperty(NodeRuntimeLocator.PROPERTY, findHostNode().toString());
 			FakeClock clock = new FakeClock();
 			FakeLauncher launcher = new FakeLauncher();
 			AtomicInteger launchIds = new AtomicInteger();
@@ -104,8 +109,23 @@ public final class BundledCoordinatorInstallerVerification {
 				CoordinatorProcessOwnership.terminateTree(staleCoordinator.toHandle());
 			}
 			restoreProperty("arenaagents.packageRoot", oldPackageRoot);
+			restoreProperty(NodeRuntimeLocator.PROPERTY, oldNodePath);
 			deleteTree(root);
 		}
+	}
+
+	private static Path findHostNode() throws IOException {
+		String path = System.getenv("PATH");
+		boolean windows = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("win");
+		String executableName = windows ? "node.exe" : "node";
+		if (path != null) {
+			for (String entry : path.split(java.util.regex.Pattern.quote(java.io.File.pathSeparator), -1)) {
+				if (entry.isBlank()) continue;
+				Path candidate = Path.of(entry).resolve(executableName).toAbsolutePath().normalize();
+				if (Files.isRegularFile(candidate) && Files.isExecutable(candidate)) return candidate;
+			}
+		}
+		throw new IOException("Node 22+ is required for the supervisor recovery verification fixture");
 	}
 
 	private static Process startOwnedSleeper(Path main) throws Exception {
@@ -545,15 +565,21 @@ public final class BundledCoordinatorInstallerVerification {
 	private static int verifyConfiguredSecretPathUsesPreparedRuntime() {
 		Path preparedSecret = Path.of("prepared-runtime", "runtime", "bridge-secret.txt")
 				.toAbsolutePath().normalize();
+		Path preparedVoiceSecret = Path.of("prepared-runtime", "runtime", "voice-secret.txt")
+				.toAbsolutePath().normalize();
 		String oldBridgeSecret = System.getProperty("arenaagents.bridgeSecretFile");
+		String oldVoiceSecret = System.getProperty("arenaagents.voiceSecretFile");
 		try {
 			System.setProperty("arenaagents.bridgeSecretFile", "development-runtime/runtime/bridge-secret.txt");
-			CoordinatorProcessSupervisor.configureSharedBridgeSecretPath(preparedSecret);
+			CoordinatorProcessSupervisor.configureSharedSecretPaths(preparedSecret, preparedVoiceSecret);
 			assertEquals(preparedSecret.toString(), System.getProperty("arenaagents.bridgeSecretFile"),
 					"prepared runtime overrides a stale development bridge secret path");
-			return 1;
+			assertEquals(preparedVoiceSecret.toString(), System.getProperty("arenaagents.voiceSecretFile"),
+					"prepared runtime configures its distinct voice secret path");
+			return 2;
 		} finally {
 			restoreProperty("arenaagents.bridgeSecretFile", oldBridgeSecret);
+			restoreProperty("arenaagents.voiceSecretFile", oldVoiceSecret);
 		}
 	}
 
@@ -644,7 +670,12 @@ public final class BundledCoordinatorInstallerVerification {
 			assertTrue(BundledCoordinatorInstaller.install(packageRoot, resource(initialResources)),
 					"fresh JAR install extracts the bundled coordinator");
 			Path secret = packageRoot.resolve("runtime/bridge-secret.txt");
+			Path voiceSecret = packageRoot.resolve("runtime/voice-secret.txt");
 			assertTrue(Files.isRegularFile(secret), "fresh JAR install creates the shared bridge secret");
+			assertTrue(Files.isRegularFile(voiceSecret), "fresh JAR install creates the voice-only secret");
+			assertOwnerOnlyIfSupported(packageRoot.resolve("runtime"), true, "runtime directory is owner-only");
+			assertOwnerOnlyIfSupported(secret, false, "bridge secret is owner-only");
+			assertOwnerOnlyIfSupported(voiceSecret, false, "voice secret is owner-only");
 			BundledCoordinatorInstaller.RuntimePackage prepared = BundledCoordinatorInstaller.prepare(packageRoot);
 			assertEquals(packageRoot.toAbsolutePath().normalize(), prepared.root(), "preparation returns normalized package root");
 			assertEquals(packageRoot.resolve("coordinator").toAbsolutePath().normalize(), prepared.coordinatorRoot(),
@@ -654,9 +685,14 @@ public final class BundledCoordinatorInstallerVerification {
 			assertEquals(packageRoot.resolve("runtime/dynamic-agents.json").toAbsolutePath().normalize(), prepared.config(),
 					"preparation returns canonical external config");
 			assertEquals(secret.toAbsolutePath().normalize(), prepared.secret(), "preparation returns the canonical secret path");
+			assertEquals(voiceSecret.toAbsolutePath().normalize(), prepared.voiceSecret(),
+					"preparation returns the canonical voice secret path");
+			assertFalse(Files.readString(secret).equals(Files.readString(voiceSecret)),
+					"bridge and voice channels receive distinct credentials");
 			assertFalse(Files.exists(packageRoot.resolve("coordinator/runtime/bridge-secret.txt")),
 					"preparation never copies the shared secret into the coordinator tree");
 			String secretFingerprint = sha256(Files.readAllBytes(secret));
+			String voiceSecretFingerprint = sha256(Files.readAllBytes(voiceSecret));
 			assertTrue(Files.readString(secret, StandardCharsets.UTF_8).trim().length() >= 32,
 					"fresh shared bridge secret is bounded and usable");
 			assertFalse(Files.exists(packageRoot.resolve("coordinator/config/dynamic-agents.json")),
@@ -677,9 +713,11 @@ public final class BundledCoordinatorInstallerVerification {
 					"user provider config survives a bundled coordinator upgrade");
 			assertEquals(secretFingerprint, sha256(Files.readAllBytes(secret)),
 					"coordinator upgrade keeps the one shared bridge secret");
+			assertEquals(voiceSecretFingerprint, sha256(Files.readAllBytes(voiceSecret)),
+					"coordinator upgrade keeps the voice-only secret");
 			assertFalse(BundledCoordinatorInstaller.install(packageRoot, resource(upgradedResources)),
 					"matching coordinator upgrade is idempotent after preserving custom config");
-			return 13;
+			return 19;
 		} finally {
 			deleteTree(packageRoot);
 		}
@@ -815,6 +853,15 @@ public final class BundledCoordinatorInstallerVerification {
 
 	private static void assertFalse(boolean condition, String label) {
 		assertTrue(!condition, label);
+	}
+
+	private static void assertOwnerOnlyIfSupported(Path target, boolean directory, String label) throws IOException {
+		if (Files.getFileAttributeView(target, PosixFileAttributeView.class) == null) return;
+		var permissions = Files.getPosixFilePermissions(target);
+		Set<PosixFilePermission> expected = directory
+				? Set.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE)
+				: Set.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE);
+		assertEquals(expected, permissions, label);
 	}
 
 	private static void restoreProperty(String name, String value) {

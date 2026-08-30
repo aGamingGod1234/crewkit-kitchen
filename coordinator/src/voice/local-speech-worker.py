@@ -1,4 +1,5 @@
 import base64
+import collections
 import contextlib
 import hashlib
 import json
@@ -21,6 +22,48 @@ _stt_model = None
 _model_lock = threading.RLock()
 _warmup_lock = threading.Lock()
 _response_lock = threading.Lock()
+
+
+class _WeightedRequestQueue:
+    """Serializes GPU work while letting live recognition pass queued synthesis."""
+
+    def __init__(self, maximum_stt_burst=3):
+        self._condition = threading.Condition()
+        self._stt = collections.deque()
+        self._tts = collections.deque()
+        self._control = collections.deque()
+        self._maximum_stt_burst = maximum_stt_burst
+        self._stt_burst = 0
+        self._closed = False
+
+    def put(self, line, operation):
+        with self._condition:
+            if self._closed:
+                return False
+            target = self._stt if operation == "stt" else self._tts if operation == "tts" else self._control
+            target.append(line)
+            self._condition.notify()
+            return True
+
+    def take(self):
+        with self._condition:
+            while not self._closed and not (self._stt or self._tts or self._control):
+                self._condition.wait()
+            if not (self._stt or self._tts or self._control):
+                return None
+            if self._stt and (self._stt_burst < self._maximum_stt_burst or not self._tts):
+                self._stt_burst += 1
+                return self._stt.popleft()
+            if self._tts:
+                self._stt_burst = 0
+                return self._tts.popleft()
+            self._stt_burst = 0
+            return self._control.popleft()
+
+    def close(self):
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
 
 def _load_tts():
     global _tts_model
@@ -242,9 +285,33 @@ def _handle_request(line):
         _respond({"id": request_id, "ok": False, "code": _error_code(operation, error), "message": message})
 
 
+def _operation_for_line(line):
+    try:
+        request = json.loads(line)
+        operation = request.get("op")
+        return operation if operation in {"stt", "tts", "warmup"} else "control"
+    except Exception:
+        return "control"
+
+
 def main():
-    for line in sys.stdin:
-        threading.Thread(target=_handle_request, args=(line,), daemon=True).start()
+    requests = _WeightedRequestQueue()
+    dispatcher = threading.Thread(target=_dispatch_requests, args=(requests,), daemon=True)
+    dispatcher.start()
+    try:
+        for line in sys.stdin:
+            requests.put(line, _operation_for_line(line))
+    finally:
+        requests.close()
+        dispatcher.join(timeout=1)
+
+
+def _dispatch_requests(requests):
+    while True:
+        line = requests.take()
+        if line is None:
+            return
+        _handle_request(line)
 
 
 if __name__ == "__main__":

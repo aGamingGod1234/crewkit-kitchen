@@ -62,6 +62,7 @@ export function buildCodexArgs(config) {
 export function resolveCodexLaunch(config, dependencies = {}) {
 	const platform = dependencies.platform ?? process.platform;
 	const environment = createProviderChildEnvironment(
+		'codex',
 		dependencies.env ?? config.environment ?? process.env,
 		config.bridgeSecretEnvironmentVariable,
 	);
@@ -74,7 +75,9 @@ export function resolveCodexLaunch(config, dependencies = {}) {
 	}
 	if (platform === 'win32') {
 		const desktopCli = cacheInstalledCodexDesktopCli(environment, dependencies);
-		if (desktopCli !== null) return { command: desktopCli, args: buildCodexArgs(config), environment };
+		if (desktopCli !== null) {
+			return { command: desktopCli, args: buildCodexArgs(config), environment };
+		}
 	}
 	return { command: 'codex', args: buildCodexArgs(config), environment };
 }

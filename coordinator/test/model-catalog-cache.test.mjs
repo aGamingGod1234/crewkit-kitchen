@@ -106,7 +106,7 @@ test('malformed refresh retains the previous valid catalog as last_valid', async
 	assert.equal(cache.stale, true, 'a retained snapshot remains eligible for automatic refresh');
 });
 
-test('catalog uses only its deterministic exact-profile builtin until live discovery recovers', async () => {
+test('catalog retains its deterministic exact profile when live discovery recovers', async () => {
 	let available = false;
 	const builtin = {
 		id: 'gpt-5.6-terra', model: 'gpt-5.6-terra', displayName: 'GPT-5.6 Terra',
@@ -131,7 +131,8 @@ test('catalog uses only its deterministic exact-profile builtin until live disco
 	available = true;
 	const live = await cache.refresh({ force: true });
 	assert.equal(live.source, 'live');
-	assert.deepEqual(live.models.map(({ id }) => id), ['gpt-5.6-sol']);
+	assert.deepEqual(live.models.map(({ id }) => id), ['gpt-5.6-terra', 'gpt-5.6-sol']);
+	assert.equal(cache.assertSupported('gpt-5.6-terra', 'xhigh', 'priority').id, 'gpt-5.6-terra');
 });
 
 test('a timed-out catalog attempt is evicted and its late result cannot replace a fresh generation', async () => {

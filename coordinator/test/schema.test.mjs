@@ -33,6 +33,7 @@ const readyObservation = () => ({
 test('accepts every exact action shape and returns a detached value', () => {
 	const actions = [
 		{ type: 'move_to', x: 1.25, y: 64, z: -2, tolerance: 0.5, sprint: true },
+		{ type: 'control', forward: 1, strafe: -0.5, jump: true, sneak: false, sprint: true, attack: false, use: true, yaw: 90, pitch: -15, selectedSlot: 2, hand: 'off', ticks: 20 },
 		{ type: 'look_at', x: 1, y: 2, z: 3 },
 		{ type: 'attack', targetId: '00000000-0000-0000-0000-000000000001', timeoutMs: 5_000 },
 		{ type: 'select_item', itemId: 'minecraft:diamond_sword' },
@@ -66,13 +67,43 @@ test('accepts every exact action shape and returns a detached value', () => {
 		{ type: 'menu_button', menuId: 'minecraft:enchantment', buttonId: 1, timeoutMs: 5_000 },
 		{ type: 'anvil_rename', menuId: 'minecraft:anvil', name: 'Explorer', timeoutMs: 5_000 },
 	];
-	for (const action of actions) assert.deepEqual(validateAction(action), action);
+	for (const action of actions) {
+		const normalized = validateAction(action);
+		assert.deepEqual(normalized, action);
+		assert.notStrictEqual(normalized, action);
+		assert.equal(Object.isFrozen(normalized), true);
+		assert.strictEqual(validateAction(normalized), normalized);
+	}
+});
+
+test('validates the detached action values before assigning the trusted brand', () => {
+	let reads = 0;
+	const action = { type: 'wait' };
+	Object.defineProperty(action, 'durationMs', {
+		enumerable: true,
+		get() {
+			reads += 1;
+			return reads === 1 ? 100 : -1;
+		},
+	});
+	const normalized = validateAction(action);
+	assert.equal(reads, 1);
+	assert.equal(normalized.durationMs, 100);
+	assert.strictEqual(validateAction(normalized), normalized);
+	assert.equal(createActionCommand(normalized, { commandId: 'command-accessor', issuedAtEpochMs: 1 }).durationMs, 100);
+
+	const invalid = { type: 'wait' };
+	Object.defineProperty(invalid, 'durationMs', { enumerable: true, get: () => -1 });
+	assert.throws(() => validateAction(invalid), /between 1 and 600000/);
 });
 
 test('rejects unknown fields, unsupported actions, and unsafe numeric/text values', () => {
 	assert.throws(() => validateAction({ type: 'wait', durationMs: 1, surprise: true }), /Unknown field/);
 	assert.throws(() => validateAction({ type: 'teleport', x: 0 }), /Unsupported action/);
 	assert.throws(() => validateAction({ type: 'look_at', x: Infinity, y: 0, z: 0 }), /finite/);
+	assert.throws(() => validateAction({ type: 'control', forward: 2, strafe: 0, jump: false, sneak: false, sprint: false, attack: false, use: false, yaw: 0, pitch: 0, selectedSlot: 0, hand: 'main', ticks: 1 }), /forward/);
+	assert.throws(() => validateAction({ type: 'control', forward: 0, strafe: 0, jump: false, sneak: false, sprint: false, attack: false, use: false, yaw: 0, pitch: 0, selectedSlot: 0, hand: 'left', ticks: 1 }), /hand/);
+	assert.throws(() => validateAction({ type: 'control', forward: 0, strafe: 0, jump: false, sneak: false, sprint: false, attack: false, use: false, yaw: 0, pitch: 0, selectedSlot: 0, hand: 'main', ticks: 201 }), /ticks/);
 	assert.throws(() => validateAction({ type: 'break_block', x: 1.1, y: 0, z: 0, timeoutMs: 1 }), /32-bit integer/);
 	assert.throws(() => validateAction({ type: 'wait', durationMs: 0 }), /between 1 and 600000/);
 	assert.throws(() => validateAction({ type: 'drop_item', slot: 36, count: 1 }), /between 0 and 35/);

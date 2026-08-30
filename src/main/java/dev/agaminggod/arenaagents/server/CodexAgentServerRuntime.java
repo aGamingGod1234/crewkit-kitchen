@@ -16,6 +16,7 @@ import dev.agaminggod.arenaagents.server.voice.VoiceConsentRegistry;
 import dev.agaminggod.arenaagents.server.goal.GoalVerificationRuntime;
 import dev.agaminggod.arenaagents.server.goal.GoalSafetyController;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationCollector;
+import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
 import dev.agaminggod.arenaagents.scenario.runtime.ScenarioRuntimeService;
 import java.util.Map;
 import java.util.HashMap;
@@ -52,6 +53,7 @@ public final class CodexAgentServerRuntime {
 	private static final Map<MinecraftServer, Map<String, Long>> PLANNING_UPDATES = new ConcurrentHashMap<>();
 	private static final Map<MinecraftServer, GoalVerificationRuntime> GOAL_VERIFIERS = new ConcurrentHashMap<>();
 	private static final Map<MinecraftServer, GoalSafetyController> GOAL_SAFETY = new ConcurrentHashMap<>();
+	private static final java.util.Set<MinecraftServer> RESTORED_SERVERS = ConcurrentHashMap.newKeySet();
 	private static final long PLANNING_UPDATE_INTERVAL_MS = 30_000L;
 	private static final long COORDINATOR_STATUS_MAXIMUM_AGE_MS = 2_500L;
 	private static final int MIN_EXPLICIT_SECRET_CHARACTERS = 32;
@@ -96,7 +98,8 @@ public final class CodexAgentServerRuntime {
 			return;
 		}
 		ServerLifecycleEvents.SERVER_STARTED.register(CodexAgentServerRuntime::start);
-		ServerTickEvents.END_SERVER_TICK.register(CodexAgentServerRuntime::tick);
+		ServerTickEvents.START_SERVER_TICK.register(CodexAgentServerRuntime::startTick);
+		ServerTickEvents.END_SERVER_TICK.register(CodexAgentServerRuntime::endTick);
 		ServerLifecycleEvents.SERVER_STOPPING.register(CodexAgentServerRuntime::stop);
 		ServerLifecycleEvents.END_DATA_PACK_RELOAD.register((server, resourceManager, success) ->
 				ServerObservationCollector.clearTagCache());
@@ -275,7 +278,13 @@ public final class CodexAgentServerRuntime {
 		if (preparedSecret != null) slot.reconcile(revision, () -> factory.apply(preparedSecret));
 	}
 
-	private static void tick(MinecraftServer server) {
+	private static void startTick(MinecraftServer server) {
+		if (!RESTORED_SERVERS.contains(server)) return;
+		MultiplexedServerBridge bridge = bridge(server);
+		if (bridge != null) bridge.startTick();
+	}
+
+	private static void endTick(MinecraftServer server) {
 		CodexAgentManager manager = CodexAgentManager.get(server);
 		CoordinatorProcessSupervisor supervisor = COORDINATORS.get(server);
 		MultiplexedServerBridge bridge = bridge(server);
@@ -307,12 +316,15 @@ public final class CodexAgentServerRuntime {
 		}
 		}
 		MultiplexedServerBridge activeBridge = bridge;
-		runRestoredStateTick(ScenarioRuntimeService.restorePersistedState(server), () -> {
+		boolean restored = ScenarioRuntimeService.restorePersistedState(server);
+		if (restored) RESTORED_SERVERS.add(server);
+		runRestoredStateTick(restored, () -> {
 			manager.reconcileDeaths();
 			manager.maintainChunkTickets();
 			VoiceSubsystemRuntime.tick(server);
 			maintainPlanningProgress(manager);
-			if (activeBridge != null) activeBridge.tick();
+			if (activeBridge != null) activeBridge.endTick();
+			AgentInputRuntime.tick(server);
 			ScenarioRuntimeService.tick(server);
 		});
 	}
@@ -504,6 +516,7 @@ public final class CodexAgentServerRuntime {
 		PLANNING_UPDATES.remove(server);
 		GOAL_VERIFIERS.remove(server);
 		VOICE_GATES.remove(server);
+		RESTORED_SERVERS.remove(server);
 		GoalSafetyController safety = GOAL_SAFETY.remove(server);
 		CoordinatorProcessSupervisor supervisor = COORDINATORS.remove(server);
 		BridgeSlot bridgeSlot = BRIDGE_SLOTS.remove(server);
@@ -550,12 +563,12 @@ public final class CodexAgentServerRuntime {
 		if (supervisor == null) return false;
 		if (supervisor.configured()) return true;
 		return supervisor.snapshot().state() == CoordinatorRecoveryState.STOPPED
-				&& acceptedSecretFile(configuredVoiceSecretFile(), Path.of("runtime", "bridge-secret.txt"));
+				&& acceptedSecretFile(configuredVoiceSecretFile(), Path.of("runtime", "voice-secret.txt"));
 	}
 
 	static long voiceConfigurationRevision(CoordinatorProcessSupervisor supervisor) {
 		long explicitSecretRevision = supervisor.snapshot().state() == CoordinatorRecoveryState.STOPPED
-				? explicitSecretFileRevision(configuredVoiceSecretFile(), Path.of("runtime", "bridge-secret.txt"))
+				? explicitSecretFileRevision(configuredVoiceSecretFile(), Path.of("runtime", "voice-secret.txt"))
 				: 0L;
 		return java.util.Objects.hash(
 				supervisor.voiceConfigurationRevision(), supervisor.sharedSecretRevision(), supervisor.secretPath(),
@@ -564,10 +577,7 @@ public final class CodexAgentServerRuntime {
 	}
 
 	private static String configuredVoiceSecretFile() {
-		return System.getProperty(
-				"arenaagents.voiceSecretFile",
-				System.getProperty("arenaagents.bridgeSecretFile", "runtime/bridge-secret.txt")
-		);
+		return System.getProperty("arenaagents.voiceSecretFile", "runtime/voice-secret.txt");
 	}
 
 	private static boolean acceptedSecretFile(String configuredPath, Path fallbackPath) {

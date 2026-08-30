@@ -40,6 +40,28 @@ Bad:
 {"tool":"observe","arguments":{"radius":10}}
 ```
 
+## control - Hold one complete player input frame for a bounded number of server ticks.
+
+Use this for precise jumps, strafing, sprint timing, attacks, item use, view direction, and hotbar selection. Minecraft releases every held input when the segment completes, is cancelled, or stops renewing.
+
+Formatting:
+
+```text executor-format
+{"tool":"control","arguments":{"forward":<required finite number -1..1>,"strafe":<required finite number -1..1>,"jump":<required true|false>,"sneak":<required true|false>,"sprint":<required true|false>,"attack":<required true|false>,"use":<required true|false>,"yaw":<required finite number -180..180>,"pitch":<required finite number -90..90>,"selectedSlot":<required integer 0..8>,"hand":<required main|off>,"ticks":<required integer 1..200>}}
+```
+
+Good:
+
+```json executor-call
+{"tool":"control","arguments":{"forward":1,"strafe":0,"jump":true,"sneak":false,"sprint":true,"attack":false,"use":false,"yaw":0,"pitch":0,"selectedSlot":0,"hand":"main","ticks":8}}
+```
+
+Bad:
+
+```json executor-bad-call
+{"tool":"control","arguments":{"forward":1,"jump":true,"hand":"left","ticks":8}}
+```
+
 ## moveTo - Navigate the player to an observed position and return the body result.
 
 Formatting:
@@ -191,6 +213,26 @@ Good:
 # Advanced act actions
 
 Every action below uses the top-level act wrapper. The inner arguments object must contain exactly the listed fields. These action types may also be used inside sequence without the outer tool wrapper.
+
+## act / control - Hold one complete player input frame for a bounded number of server ticks.
+
+Formatting:
+
+```text executor-format
+{"tool":"act","arguments":{"actionType":"control","arguments":{"forward":<required finite number -1..1>,"strafe":<required finite number -1..1>,"jump":<required true|false>,"sneak":<required true|false>,"sprint":<required true|false>,"attack":<required true|false>,"use":<required true|false>,"yaw":<required finite number -180..180>,"pitch":<required finite number -90..90>,"selectedSlot":<required integer 0..8>,"hand":<required main|off>,"ticks":<required integer 1..200>}}}
+```
+
+Good:
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"control","arguments":{"forward":0,"strafe":1,"jump":false,"sneak":true,"sprint":false,"attack":false,"use":true,"yaw":90,"pitch":15,"selectedSlot":3,"hand":"off","ticks":10}}}
+```
+
+Bad:
+
+```json executor-bad-call
+{"tool":"act","arguments":{"actionType":"control","arguments":{"forward":0,"strafe":2,"jump":false,"sneak":true,"sprint":false,"attack":false,"use":false,"yaw":90,"pitch":15,"selectedSlot":3,"hand":"main","ticks":10}}}
+```
 
 ## act / move_to - Move directly to a position and return the body result.
 

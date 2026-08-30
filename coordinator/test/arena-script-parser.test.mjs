@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { parseArenaScript } from '../src/arena-script/parser.mjs';
+import { FACT_DOMAIN } from '../src/arena-script/fact-domains.mjs';
 
 test('compiles a bounded program and records its model-owned policy', () => {
 	const compiled = parseArenaScript(`
@@ -80,6 +81,27 @@ test('admits only factual observed-candidate queries in watcher conditions', () 
 		program.watch(() => world.nearest(world.items({ itemId: "minecraft:oak_log" })) !== null, { mode: "boundary" }, async () => {});
 	`));
 	assert.throws(() => parseArenaScript('program.onUnhandledAttention("continue_and_notify"); program.watch(() => player.mine({ x: 1 }), { mode: "boundary" }, async () => {});'), (error) => error.code === 'UNSUPPORTED_SYNTAX');
+});
+
+test('precomputes conservative watcher mode and fact dependency metadata', () => {
+	const compiled = parseArenaScript(`
+		program.onUnhandledAttention("continue_and_notify");
+		program.watch(() => player.state().health < 10, { mode: "interrupt" }, async () => {});
+		program.watch(() => world.nearest(world.items({ itemId: "minecraft:oak_log" })) !== null, { mode: "boundary" }, async () => {});
+		program.watch(() => inventory.countTag("#minecraft:logs") > 0, { mode: "boundary" }, async () => {});
+	`);
+	assert.deepEqual(compiled.watchers.map(({ id, mode, factDependencyMask }) => ({ id, mode, factDependencyMask })), [
+		{ id: 'watcher-0', mode: 'interrupt', factDependencyMask: FACT_DOMAIN.player },
+		{ id: 'watcher-1', mode: 'boundary', factDependencyMask: FACT_DOMAIN.player | FACT_DOMAIN.worldItems },
+		{ id: 'watcher-2', mode: 'boundary', factDependencyMask: FACT_DOMAIN.inventoryTagCounts },
+	]);
+
+	const closure = parseArenaScript(`
+		program.onUnhandledAttention("continue_and_notify");
+		const threshold = 10;
+		program.watch(() => player.state().health < threshold, { mode: "boundary" }, async () => {});
+	`);
+	assert.equal(closure.watchers[0].factDependencyMask, null, 'closure state must force evaluation on every observation');
 });
 
 test('requires watchers to appear in the top-level registration prologue', () => {

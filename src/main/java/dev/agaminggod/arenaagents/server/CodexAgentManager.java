@@ -521,7 +521,13 @@ public final class CodexAgentManager {
 					record, target, now + VANILLA_DEATH_REMOVAL_GRACE_MS, now + PLAYER_SPAWN_TIMEOUT_MS);
 			Optional<ServerPlayer> existing = findAgentPlayer(record.agentId());
 			if (existing.isPresent()) {
+				ServerPlayer player = existing.orElseThrow();
 				AgentInputRuntime.clear(server, record.agentId());
+				if (AgentRespawnSpawnPolicy.existingPlayerAction(player.isAlive())
+						== AgentRespawnSpawnPolicy.ExistingPlayerAction.REMOVE_STALE_PLAYER) {
+					attempt.removalRequested = true;
+					OfflineAgentPlayers.remove(player);
+				}
 				pendingPlayerSpawns.put(record.agentId(), attempt.deadlineEpochMs());
 			} else {
 				requestVanillaRespawnPlayer(attempt, now);
@@ -863,6 +869,10 @@ public final class CodexAgentManager {
 	public boolean captureDeath(ServerPlayer player, DamageSource source) {
 		Objects.requireNonNull(player, "player must not be null");
 		Objects.requireNonNull(source, "source must not be null");
+		Optional<AgentRecord> matchedRecord = records().stream()
+				.filter(record -> OfflineAgentPlayers.isManagedFakePlayer(player, record.agentId(), record.profile()))
+				.findFirst();
+		if (matchedRecord.isEmpty()) return false;
 		long now = System.currentTimeMillis();
 		String cause;
 		try {
@@ -870,10 +880,7 @@ public final class CodexAgentManager {
 		} catch (RuntimeException ignored) {
 			cause = "Agent died";
 		}
-		records().stream()
-				.filter(record -> OfflineAgentPlayers.offlineUuid(record.agentId(), record.profile()).equals(player.getUUID()))
-				.findFirst()
-				.ifPresent(record -> AgentInputRuntime.clear(server, record.agentId()));
+		AgentInputRuntime.clear(server, matchedRecord.orElseThrow().agentId());
 		return AgentDeathCapture.record(
 				savedData.registry(), player.getUUID(), deathSnapshot(player, cause, now), now
 		);

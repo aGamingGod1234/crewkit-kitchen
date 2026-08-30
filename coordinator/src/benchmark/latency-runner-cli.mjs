@@ -204,7 +204,7 @@ function buildLiveProviderOptions(matrix, args, cwd) {
 	for (const trial of matrix?.trials ?? []) {
 		if (trial?.mode !== 'live') continue;
 		const profile = trial.providerProfile;
-		if (!isPlainRecord(profile) || !['codex', 'gemini', 'kimi'].includes(profile.provider)) throw cliUsage('live trial providerProfile is invalid');
+		if (!isPlainRecord(profile) || !['codex', 'kimi'].includes(profile.provider)) throw cliUsage('live trial providerProfile is invalid');
 		const normalized = {};
 		for (const field of ['model', 'reasoningEffort', 'serviceTier']) {
 			if (typeof profile[field] !== 'string' || profile[field].trim().length === 0 || Buffer.byteLength(profile[field], 'utf8') > 128) throw cliUsage(`live provider ${field} is invalid`);
@@ -232,7 +232,6 @@ function buildLiveProviderOptions(matrix, args, cwd) {
 			modelReasoningEfforts: { [profile.model]: [profile.reasoningEffort] },
 		};
 		if (provider === 'kimi') providerConfig.executable = 'kimi';
-		if (provider === 'gemini') providerConfig.executable = 'gemini';
 		config[provider] = providerConfig;
 	}
 	return { planningTimeoutMs, options: { cwd, config, planningTimeoutMs } };
@@ -303,7 +302,12 @@ function publicTrial(trial, matrixTrial = null) {
 		...(isPlainRecord(trial.cleanup) ? { cleanup: publicCleanup(trial.cleanup) } : {}),
 		...(isPlainRecord(trial.metrics) ? { metrics: publicMetrics(trial.metrics) } : {}),
 		...(isPlainRecord(trial.systemSummary) ? { systemSummary: publicSystemSummary(trial.systemSummary) } : {}),
+		timingScope: trial.timingScope === 'full_path' ? 'full_path' : null,
 		durationMs: Number.isFinite(trial.durationMs) && trial.durationMs >= 0 ? Math.min(Math.round(trial.durationMs), Number.MAX_SAFE_INTEGER) : null,
+		taskDurationMs: Number.isFinite(trial.taskDurationMs) && trial.taskDurationMs >= 0 ? Math.min(Math.round(trial.taskDurationMs), Number.MAX_SAFE_INTEGER) : null,
+		setupDurationMs: Number.isFinite(trial.setupDurationMs) && trial.setupDurationMs >= 0 ? Math.min(Math.round(trial.setupDurationMs), Number.MAX_SAFE_INTEGER) : null,
+		totalDurationMs: Number.isFinite(trial.totalDurationMs) && trial.totalDurationMs >= 0 ? Math.min(Math.round(trial.totalDurationMs), Number.MAX_SAFE_INTEGER) : null,
+		...(isPlainRecord(trial.setupSpansMs) ? { setupSpansMs: numericFields(trial.setupSpansMs, ['providerStart', 'coordinatorStart']) } : {}),
 	};
 }
 
@@ -362,7 +366,7 @@ function publicSystemSummary(summary) {
 }
 
 function metricNumericKeys(key) {
-	if (key === 'tick') return ['count', 'cpuWallDurationP50Ms', 'cpuWallDurationP95Ms', 'cpuWallDurationP99Ms', 'cpuWallDurationMaxMs', 'p50Ms', 'p95Ms', 'p99Ms', 'maxMs', 'over50MsCount'];
+	if (key === 'tick') return ['count', 'p50Ms', 'p95Ms', 'p99Ms', 'maxMs', 'over50MsCount'];
 	if (key === 'planningIdle') return ['localActiveWallDurationMs', 'planningIdleWallDurationMs'];
 	return ['count', 'schedulerWaitWallP50Ms', 'schedulerWaitWallP95Ms', 'schedulerWaitWallP99Ms', 'planningWaitWallP50Ms', 'planningWaitWallP95Ms', 'planningWaitWallP99Ms', 'providerWaitWallP50Ms', 'providerWaitWallP95Ms', 'providerWaitWallP99Ms'];
 }

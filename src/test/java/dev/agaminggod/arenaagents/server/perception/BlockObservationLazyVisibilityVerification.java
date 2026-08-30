@@ -1,6 +1,7 @@
 package dev.agaminggod.arenaagents.server.perception;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Random;
@@ -49,7 +50,17 @@ public final class BlockObservationLazyVisibilityVerification {
 							ServerObservationCollector.MAX_BLOCKS_PER_TYPE, visible),
 					"lazy visibility selection is independent of scan order (seed " + seed + ")"
 			);
-			assertions += 2;
+			assertEquals(
+					lazy,
+					BlockObservationOrdering.selectOrdered(
+							BlockObservationOrdering.ordered(candidates),
+							ServerObservationCollector.MAX_BLOCKS,
+							ServerObservationCollector.MAX_BLOCKS_PER_TYPE,
+							visible
+					),
+					"cached ordered candidates preserve exact selection (seed " + seed + ")"
+			);
+			assertions += 3;
 		}
 
 		List<BlockObservationOrdering.Candidate> saturated = new ArrayList<>();
@@ -87,7 +98,100 @@ public final class BlockObservationLazyVisibilityVerification {
 		assertEquals(2, boundedChecks.get(), "a satisfied global quota stops visibility testing immediately");
 		assertions += 1;
 
+		ArrayList<SightCandidate> crowded = new ArrayList<>();
+		for (int index = 511; index >= 0; index--) crowded.add(new SightCandidate(index, true));
+		AtomicInteger lineOfSightChecks = new AtomicInteger();
+		List<SightCandidate> visibleEntities = ServerObservationCollector.selectNearestVisible(
+				crowded,
+				Comparator.comparingInt(SightCandidate::distance),
+				ServerObservationCollector.MAX_ENTITIES,
+				candidate -> {
+					lineOfSightChecks.incrementAndGet();
+					return candidate.visible();
+				}
+		);
+		assertEquals(
+				java.util.stream.IntStream.range(0, ServerObservationCollector.MAX_ENTITIES)
+						.mapToObj(index -> new SightCandidate(index, true)).toList(),
+				visibleEntities,
+				"nearest-first entity selection preserves the former visible ordering"
+		);
+		assertEquals(
+				ServerObservationCollector.MAX_ENTITIES,
+				lineOfSightChecks.get(),
+				"crowded observations stop line-of-sight work at the entity limit"
+		);
+		assertEquals(513, BlockObservationOrdering.ordered(crowdedBlocks()).size(),
+				"the raw spatial cache retains candidates beyond the former four-times quota");
+
+		AtomicInteger uniformOccludedChecks = new AtomicInteger();
+		BlockObservationOrdering.selectOrderedWithVisibilityBudget(
+				BlockObservationOrdering.ordered(crowdedBlocks()),
+				ServerObservationCollector.MAX_BLOCKS,
+				ServerObservationCollector.MAX_BLOCKS_PER_TYPE,
+				ServerObservationCollector.MAX_BLOCK_VISIBILITY_CHECKS,
+				ServerObservationCollector.MAX_BLOCK_VISIBILITY_CHECKS_PER_TYPE,
+				candidate -> {
+					uniformOccludedChecks.incrementAndGet();
+					return false;
+				});
+		assertEquals(ServerObservationCollector.MAX_BLOCK_VISIBILITY_CHECKS_PER_TYPE,
+				uniformOccludedChecks.get(),
+				"uniform occlusion cannot exceed the per-type raycast budget");
+
+		ArrayList<BlockObservationOrdering.Candidate> diverseOccluded = new ArrayList<>();
+		for (int index = 0; index < 600; index++) {
+			diverseOccluded.add(new BlockObservationOrdering.Candidate(
+					index, 0, 0, "fixture:block_" + index));
+		}
+		AtomicInteger diverseOccludedChecks = new AtomicInteger();
+		BlockObservationOrdering.selectOrderedWithVisibilityBudget(
+				BlockObservationOrdering.ordered(diverseOccluded),
+				ServerObservationCollector.MAX_BLOCKS,
+				ServerObservationCollector.MAX_BLOCKS_PER_TYPE,
+				ServerObservationCollector.MAX_BLOCK_VISIBILITY_CHECKS,
+				ServerObservationCollector.MAX_BLOCK_VISIBILITY_CHECKS_PER_TYPE,
+				candidate -> {
+					diverseOccludedChecks.incrementAndGet();
+					return false;
+				});
+		assertEquals(ServerObservationCollector.MAX_BLOCK_VISIBILITY_CHECKS,
+				diverseOccludedChecks.get(),
+				"diverse occlusion cannot exceed the global raycast budget");
+
+		ArrayList<BlockObservationOrdering.Candidate> coneFiltered = new ArrayList<>();
+		for (int index = 0; index < 40; index++) {
+			coneFiltered.add(new BlockObservationOrdering.Candidate(
+					index + 1, 0, 0, "minecraft:stone"));
+		}
+		AtomicInteger raycastsAfterCone = new AtomicInteger();
+		List<BlockObservationOrdering.Candidate> selectedAfterCone =
+				BlockObservationOrdering.selectOrderedWithVisibilityBudget(
+						BlockObservationOrdering.ordered(coneFiltered),
+						ServerObservationCollector.MAX_BLOCKS,
+						ServerObservationCollector.MAX_BLOCKS_PER_TYPE,
+						ServerObservationCollector.MAX_BLOCK_VISIBILITY_CHECKS,
+						ServerObservationCollector.MAX_BLOCK_VISIBILITY_CHECKS_PER_TYPE,
+						candidate -> candidate.x() > 32,
+						candidate -> {
+							raycastsAfterCone.incrementAndGet();
+							return true;
+						});
+		assertEquals(8, selectedAfterCone.size(),
+				"cheap cone rejects do not hide later visible blocks of the same type");
+		assertEquals(8, raycastsAfterCone.get(),
+				"only cone-eligible candidates consume the raycast budget");
+		assertions += 7;
+
 		return assertions;
+	}
+
+	private static List<BlockObservationOrdering.Candidate> crowdedBlocks() {
+		ArrayList<BlockObservationOrdering.Candidate> candidates = new ArrayList<>();
+		for (int index = 0; index < 513; index++) {
+			candidates.add(new BlockObservationOrdering.Candidate(index, 0, 0, "minecraft:stone"));
+		}
+		return candidates;
 	}
 
 	private static List<BlockObservationOrdering.Candidate> visibleAll(
@@ -138,5 +242,8 @@ public final class BlockObservationLazyVisibilityVerification {
 
 	private static void assertTrue(boolean condition, String label) {
 		if (!condition) throw new AssertionError(label);
+	}
+
+	private record SightCandidate(int distance, boolean visible) {
 	}
 }

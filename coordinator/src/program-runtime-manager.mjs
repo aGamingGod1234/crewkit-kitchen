@@ -159,6 +159,7 @@ export class ProgramRuntimeManager {
 			priority: payload.priority,
 			trigger: payload.trigger,
 		});
+		if (payload.attention === true && payload.priority === 'urgent') this.#preemptOrdinaryReactive(state);
 		this.#flushDeferredProgramTrace(state);
 		this.#syncState(record, state);
 		if (this.#rearmReactiveRecovery(state, { observation, eventSequence })) {
@@ -172,6 +173,7 @@ export class ProgramRuntimeManager {
 		const state = this.#states.get(record.agentId);
 		if (!state || state.disposed || state.goalRevision !== record.goalRevision) return null;
 		const snapshot = state.engine.notifyAttention({ priority, trigger });
+		if (priority === 'urgent') this.#preemptOrdinaryReactive(state);
 		if (priority === 'urgent' && this.#rearmReactiveRecovery(state, { observation: state.observation })) {
 			if (!state.reactiveRequestActive) this.#resumeReactiveRecovery(state);
 		}
@@ -342,6 +344,8 @@ export class ProgramRuntimeManager {
 			lastReceiptEpochMs: null,
 			reactiveRequest: null,
 			reactiveRequestActive: false,
+			reactiveActiveRequest: null,
+			reactivePreemptionRequested: false,
 			reactiveRecovery: null,
 			recoveryRequested: false,
 			explicitPause: false,
@@ -501,11 +505,16 @@ export class ProgramRuntimeManager {
 			while (!state.disposed && state.reactiveRequest !== null) {
 				const request = state.reactiveRequest;
 				state.reactiveRequest = null;
+				state.reactiveActiveRequest = request;
 				await this.#runReactiveDecision(state, request);
+				state.reactiveActiveRequest = null;
+				state.reactivePreemptionRequested = false;
 				// Give planner cleanup a turn before starting the newest coalesced request.
 				if (state.reactiveRequest !== null) await Promise.resolve();
 			}
 		} finally {
+			state.reactiveActiveRequest = null;
+			state.reactivePreemptionRequested = false;
 			const pending = state.disposed ? null : state.reactiveRequest;
 			state.reactiveRequest = null;
 			state.reactiveRequestActive = false;
@@ -590,6 +599,10 @@ export class ProgramRuntimeManager {
 			}
 			this.#syncState(record, state);
 		} catch (error) {
+			if (error?.code === 'PLAN_CANCELLED' && state.reactivePreemptionRequested && context.priority !== 'urgent') {
+				state.engine.failDirectiveRequest(context);
+				return;
+			}
 			if (classifyRecoveryFailure(error).retryable) {
 				state.reactiveRecovery = { kind: 'reactive', context: Object.freeze({ ...context }), fresh: false };
 				this.#requestRecoveryLease(record, state, 'reactive_provider_failure', error);
@@ -604,6 +617,21 @@ export class ProgramRuntimeManager {
 				this.#reportError(record.agentId, correctionError);
 			} else this.#reportError(record.agentId, error);
 			this.#syncState(record, state);
+		}
+	}
+
+	#preemptOrdinaryReactive(state) {
+		if (state.disposed || state.reactiveActiveRequest?.priority === 'urgent' || state.reactivePreemptionRequested) return;
+		if (state.reactiveActiveRequest === null || typeof this.#planner.interrupt !== 'function') return;
+		state.reactivePreemptionRequested = true;
+		try {
+			void Promise.resolve(this.#planner.interrupt(state.agentId, 'Urgent reactive planning trigger')).catch((error) => {
+				state.reactivePreemptionRequested = false;
+				if (!state.disposed) this.#reportError(state.agentId, error);
+			});
+		} catch (error) {
+			state.reactivePreemptionRequested = false;
+			this.#reportError(state.agentId, error);
 		}
 	}
 

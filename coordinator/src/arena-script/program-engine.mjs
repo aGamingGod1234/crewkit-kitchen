@@ -1,5 +1,6 @@
 import { ArenaScriptInterpreter } from './interpreter.mjs';
-import { createInterpreterFacts } from './facts.mjs';
+import { changedInterpreterFactDomains, createInterpreterFacts } from './facts.mjs';
+import { ALL_FACT_DOMAINS } from './fact-domains.mjs';
 import { SCRIPT_BINDINGS } from './minecraft-api.mjs';
 
 const ORDINARY_PRIORITY = 'ordinary';
@@ -10,6 +11,7 @@ const DEFAULT_ATTENTION_TRIGGER = 'attention';
 export class ArenaScriptEngine {
 	#callbacks; #vm = null; #program = null; #facts = null; #eventSequence = -1; #factsSequence = -1; #generation = 0; #lifecycleEpoch = 0; #continuationEpoch = 0;
 	#active = null; #pendingResult = null; #boundary = []; #boundaryByWatcher = new Map(); #watcherTruth = new Map(); #cancelling = null;
+	#watcherMetadata = [];
 	#transition = null; #pendingRequest = null; #coalescedRequest = null; #pendingReplacement = null; #suspendedResult = null; #resumableUnhandled = false; #requestUpdate = null; #completed = new Map(); #deferredBase = null; #continuationRequired = false; #status = 'IDLE';
 
 	constructor({ dispatch, cancel, requestModel, trace = () => {} } = {}) {
@@ -19,7 +21,7 @@ export class ArenaScriptEngine {
 	}
 
 	install(input) {
-		const target = normalizeInstall(input);
+		const target = normalizeInstall(input, this.#facts);
 		const baseline = this.#transition?.kind === 'install' ? this.#transition.target : this.#program;
 		const relation = baseline ? installationRelation(target, baseline) : 1;
 		if (relation < 0) return this.snapshot();
@@ -37,12 +39,14 @@ export class ArenaScriptEngine {
 		if (!this.#isLive() || !Number.isSafeInteger(eventSequence) || eventSequence < 0 || eventSequence < this.#eventSequence) return this.snapshot();
 		const mayResume = this.#pendingResult && eventSequence >= this.#pendingResult.eventSequence;
 		if (eventSequence === this.#eventSequence && !mayResume && this.#factsSequence >= eventSequence) return this.snapshot();
-		this.#facts = createInterpreterFacts(observation);
+		const previousFacts = this.#facts;
+		this.#facts = createInterpreterFacts(observation, previousFacts);
+		const changedFactDomains = changedInterpreterFactDomains(previousFacts, this.#facts);
 		this.#factsSequence = eventSequence;
 		this.#eventSequence = Math.max(this.#eventSequence, eventSequence);
 		this.#fencePendingRequest();
 		this.#tryPendingReplacement();
-		const edges = this.#updateWatchers();
+		const edges = this.#updateWatchers(changedFactDomains);
 		if (this.#pendingResult && !this.#cancelling && eventSequence >= this.#pendingResult.eventSequence) this.#resumeOrRunBoundary();
 		else if (!this.#active && !this.#cancelling && this.#boundary.length > 0) this.#runBoundary();
 		if (attention && edges === 0) this.#requestModel(null, { priority, trigger });
@@ -209,14 +213,18 @@ export class ArenaScriptEngine {
 		this.#factsSequence = latestFactsSequence;
 		this.#eventSequence = latestSequence;
 		this.#vm = new ArenaScriptInterpreter(target.compiled, SCRIPT_BINDINGS);
+		this.#watcherMetadata = watcherMetadata(target.compiled);
 		this.#status = 'ACTIVE';
 		this.#handleYield(this.#vm.start(this.#facts), 'step');
-		for (let index = 0; index < target.compiled.watcherCount && this.#isLive(); index += 1) this.#watcherTruth.set(`watcher-${index}`, this.#vm.evaluateWatcher(`watcher-${index}`, this.#facts));
+		for (let index = 0; index < target.compiled.watcherCount && this.#isLive(); index += 1) {
+			const watcherId = this.#watcherMetadata[index].id;
+			this.#watcherTruth.set(watcherId, this.#vm.evaluateWatcher(watcherId, this.#facts));
+		}
 		return this.snapshot();
 	}
 
 	#clear(resetGeneration = true) {
-		this.#vm = null; this.#program = null; this.#facts = null; this.#eventSequence = -1; this.#factsSequence = -1; this.#active = null; this.#pendingResult = null;
+		this.#vm = null; this.#program = null; this.#facts = null; this.#eventSequence = -1; this.#factsSequence = -1; this.#active = null; this.#pendingResult = null; this.#watcherMetadata = [];
 		this.#boundary = []; this.#boundaryByWatcher.clear(); this.#watcherTruth.clear(); this.#cancelling = null; this.#transition = null; this.#pendingRequest = null; this.#coalescedRequest = null; this.#pendingReplacement = null; this.#suspendedResult = null; this.#resumableUnhandled = false; this.#requestUpdate = null; this.#completed.clear(); this.#deferredBase = null; this.#continuationRequired = false; this.#status = 'IDLE';
 		if (resetGeneration) this.#generation += 1;
 	}
@@ -238,16 +246,18 @@ export class ArenaScriptEngine {
 		return this.snapshot();
 	}
 
-	#updateWatchers() {
+	#updateWatchers(changedFactDomains = ALL_FACT_DOMAINS) {
 		let edges = 0;
 		for (let index = 0; index < this.#program.compiled.watcherCount; index += 1) {
-			const watcherId = `watcher-${index}`;
+			const metadata = this.#watcherMetadata[index];
+			if (Number.isSafeInteger(metadata?.factDependencyMask) && (metadata.factDependencyMask & changedFactDomains) === 0) continue;
+			const watcherId = metadata.id;
 			const trueNow = this.#vm.evaluateWatcher(watcherId, this.#facts);
 			const wasTrue = this.#watcherTruth.get(watcherId) === true;
 			this.#watcherTruth.set(watcherId, trueNow);
 			if (!trueNow || wasTrue) continue;
 			edges += 1;
-			const latch = freezeRecord({ watcherId, mode: watcherMode(this.#program.compiled, index), eventSequence: this.#eventSequence, generation: this.#generation, facts: this.#facts });
+			const latch = freezeRecord({ watcherId, mode: metadata.mode, eventSequence: this.#eventSequence, generation: this.#generation, facts: this.#facts });
 			this.#emitTrace('watcher_fired', { watcherId, mode: latch.mode, eventSequence: this.#eventSequence, generation: this.#generation });
 			if (latch.mode === 'interrupt' && this.#active && !this.#cancelling) {
 				this.#cancelling = { kind: 'watcher', actionId: this.#active.actionId, latch };
@@ -337,13 +347,14 @@ export class ArenaScriptEngine {
 	}
 	#refreshInstalledFacts(target) {
 		if (target.eventSequence < this.#eventSequence || target.factsSequence < this.#factsSequence) return this.snapshot();
+		const changedFactDomains = changedInterpreterFactDomains(this.#facts, target.facts);
 		this.#facts = target.facts; this.#factsSequence = target.factsSequence;
 		this.#eventSequence = target.eventSequence;
 		this.#program = freezeRecord({ ...this.#program, eventSequence: target.eventSequence, factsSequence: target.factsSequence });
 		this.#fencePendingRequest();
 		if (!this.#isLive()) return this.snapshot();
 		this.#tryPendingReplacement();
-		this.#updateWatchers();
+		this.#updateWatchers(changedFactDomains);
 		if (this.#pendingResult && !this.#cancelling && this.#factsSequence >= this.#pendingResult.eventSequence) this.#resumeOrRunBoundary();
 		else if (!this.#active && !this.#cancelling && this.#boundary.length > 0) this.#runBoundary();
 		this.#requestExhaustedContinuation();
@@ -419,12 +430,12 @@ export class ArenaScriptEngine {
 	}
 }
 
-function normalizeInstall(input) {
+function normalizeInstall(input, previousFacts = null) {
 	if (!input || typeof input !== 'object' || !input.compiled?.ast || !Object.isFrozen(input.compiled)) throw new TypeError('ArenaScriptEngine requires a frozen compiled program');
 	const { agentId, modelIdentity, goalRevision } = input;
 	for (const [field, value] of [['agentId', agentId], ['provider', input.provider ?? 'unknown-provider'], ['modelIdentity', modelIdentity], ['reasoningEffort', input.reasoningEffort ?? 'unknown-reasoning'], ['serviceTier', input.serviceTier ?? 'unknown-tier'], ['traceId', input.traceId ?? defaultTraceId(agentId, goalRevision, input.version)], ['programId', input.programId]]) if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError(`ArenaScriptEngine ${field} must be a nonempty string`);
 	for (const [field, value] of [['goalRevision', goalRevision], ['version', input.version], ['eventSequence', input.eventSequence]]) if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`ArenaScriptEngine ${field} must be a nonnegative safe integer`);
-	const facts = createInterpreterFacts(input.observation);
+	const facts = createInterpreterFacts(input.observation, previousFacts);
 	return freezeRecord({ agentId: agentId.trim(), provider: (input.provider ?? 'unknown-provider').trim(), goalRevision, modelIdentity: modelIdentity.trim(), reasoningEffort: (input.reasoningEffort ?? 'unknown-reasoning').trim(), serviceTier: (input.serviceTier ?? 'unknown-tier').trim(), traceId: normalizeTraceId(input.traceId ?? defaultTraceId(agentId, goalRevision, input.version)), programId: input.programId.trim(), version: input.version, compiled: input.compiled, facts, factsSequence: input.eventSequence, eventSequence: input.eventSequence });
 }
 function normalizeDirectiveReplacement(input, current, requestedTraceId = undefined) {
@@ -492,7 +503,19 @@ function sameRequest(value, request) {
 	].every((key) => value[key] === request[key]);
 }
 function watcherExecution(authority, executionFactsSequence = authority.eventSequence) { return freezeRecord({ authority, executionFactsSequence }); }
-function watcherMode(compiled, index) { const watches = []; for (const statement of compiled.ast.body) { const call = statement.type === 'ExpressionStatement' ? statement.expression : null; if (call?.type === 'CallExpression' && call.callee.type === 'MemberExpression' && call.callee.object.name === 'program' && call.callee.property.name === 'watch') watches.push(call); } return watches[index]?.arguments[1]?.properties?.find((property) => property.key.name === 'mode')?.value?.value ?? 'boundary'; }
+function watcherMetadata(compiled) {
+	if (Array.isArray(compiled.watchers) && compiled.watchers.length === compiled.watcherCount) return compiled.watchers;
+	const watches = [];
+	for (const statement of compiled.ast.body) {
+		const call = statement.type === 'ExpressionStatement' ? statement.expression : null;
+		if (call?.type === 'CallExpression' && call.callee.type === 'MemberExpression' && call.callee.object.name === 'program' && call.callee.property.name === 'watch') watches.push(call);
+	}
+	return Object.freeze(Array.from({ length: compiled.watcherCount }, (_unused, index) => freezeRecord({
+		id: `watcher-${index}`,
+		mode: watches[index]?.arguments[1]?.properties?.find((property) => property.key.name === 'mode')?.value?.value ?? 'boundary',
+		factDependencyMask: null,
+	})));
+}
 function freezeRecord(values) { return Object.freeze(Object.assign(Object.create(null), values)); }
 function normalizePriority(value) { return value === URGENT_PRIORITY ? URGENT_PRIORITY : ORDINARY_PRIORITY; }
 function normalizeTrigger(value) { return typeof value === 'string' && value.trim().length > 0 ? value.trim().slice(0, 128) : DEFAULT_ATTENTION_TRIGGER; }

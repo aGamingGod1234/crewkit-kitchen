@@ -15,8 +15,8 @@ public final class AgentGroupSavedData extends SavedData {
 	private static final String PAYLOAD_FIELD = "payload";
 	private static final String PAYLOAD_CHUNKS_FIELD = "payload_chunks";
 	private static final Codec<AgentGroupSavedData> CODEC = RecordCodecBuilder.create(instance -> instance.group(
-			Codec.STRING.optionalFieldOf(PAYLOAD_FIELD, "").forGetter(data -> ""),
-			Codec.STRING.listOf().optionalFieldOf(PAYLOAD_CHUNKS_FIELD, List.of())
+			ChunkedSavedPayload.legacyCodec().optionalFieldOf(PAYLOAD_FIELD, "").forGetter(data -> ""),
+			ChunkedSavedPayload.chunksCodec().optionalFieldOf(PAYLOAD_CHUNKS_FIELD, List.of())
 					.forGetter(data -> ChunkedSavedPayload.split(data.encodePayload()))
 	).apply(instance, AgentGroupSavedData::decodePayload));
 	public static final SavedDataType<AgentGroupSavedData> TYPE = new SavedDataType<>(

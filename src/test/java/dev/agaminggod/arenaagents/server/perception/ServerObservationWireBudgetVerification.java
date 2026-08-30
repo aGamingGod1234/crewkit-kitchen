@@ -8,6 +8,8 @@ import dev.agaminggod.arenaagents.server.bridge.BridgeProtocolException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 public final class ServerObservationWireBudgetVerification {
 	private static final String MAX_MESSAGE_ID = "m".repeat(128);
@@ -24,12 +26,15 @@ public final class ServerObservationWireBudgetVerification {
 				codec.encodedBytes(utf8Envelope), "encoded byte count includes UTF-8 and newline");
 
 		JsonObject source = observation();
-		ServerObservationWireBudget.Fitted reduced = ServerObservationWireBudget.fit(source, candidate ->
-				!hasCandidateTags(candidate)
+		AtomicInteger stagedFitChecks = new AtomicInteger();
+		ServerObservationWireBudget.Fitted reduced = ServerObservationWireBudget.fit(source, candidate -> {
+			stagedFitChecks.incrementAndGet();
+			return !hasCandidateTags(candidate)
 						&& candidate.getAsJsonArray("blocks").size() == 1
 						&& candidate.getAsJsonArray("nearbyContainers").size() == 1
 						&& candidate.getAsJsonArray("entities").size() == 1
-						&& candidate.getAsJsonObject("player").getAsJsonArray("effects").size() == 1);
+						&& candidate.getAsJsonObject("player").getAsJsonArray("effects").size() == 1;
+		});
 		JsonObject fitted = reduced.observation();
 		assertEquals(List.of("candidateTags", "blocks", "nearbyContainers", "entities", "player.effects"),
 				reduced.reductions(), "deterministic reduction order");
@@ -52,6 +57,17 @@ public final class ServerObservationWireBudgetVerification {
 				"reduction report is immutable");
 		fitted.remove("player");
 		assertTrue(reduced.observation().has("player"), "fitted observation accessor is detached");
+		assertEquals(6, stagedFitChecks.get(),
+				"each staged reduction performs one complete-envelope check without duplicate fitting");
+
+		AtomicReference<JsonObject> exposedCandidate = new AtomicReference<>();
+		ServerObservationWireBudget.Fitted isolated = ServerObservationWireBudget.fit(source, candidate -> {
+			exposedCandidate.set(candidate);
+			return true;
+		});
+		exposedCandidate.get().remove("player");
+		assertTrue(isolated.observation().has("player"),
+				"a fitting predicate cannot retain a mutable alias to the fitted observation");
 
 		JsonObject oversized = observation();
 		for (int index = 0; index < 64; index++) {
@@ -60,8 +76,8 @@ public final class ServerObservationWireBudgetVerification {
 			oversized.getAsJsonArray("entities").add(entity);
 		}
 		ServerObservationWireBudget.Fitted wireFitted = ServerObservationWireBudget.fit(oversized,
-				candidate -> codec.encodedBytes(envelope(candidate)) <= BridgeEnvelopeCodec.MAX_LINE_BYTES);
-		assertTrue(codec.encodedBytes(envelope(wireFitted.observation())) <= BridgeEnvelopeCodec.MAX_LINE_BYTES,
+				candidate -> codec.encodedLineBytes(envelope(candidate)) <= BridgeEnvelopeCodec.MAX_LINE_BYTES);
+		assertTrue(codec.encodedLineBytes(envelope(wireFitted.observation())) <= BridgeEnvelopeCodec.MAX_LINE_BYTES,
 				"worst-case complete envelope with maximum message ID fits the wire limit");
 		assertEquals("nearest", wireFitted.observation().getAsJsonArray("entities").get(0).getAsJsonObject()
 				.get("name").getAsString(), "wire fitting retains the nearest original entity");
@@ -80,7 +96,7 @@ public final class ServerObservationWireBudgetVerification {
 		JsonObject impossible = observation();
 		impossible.getAsJsonObject("lastResult").addProperty("message", "x".repeat(BridgeEnvelopeCodec.MAX_LINE_BYTES));
 		assertThrowsCode(() -> ServerObservationWireBudget.fit(impossible,
-				candidate -> codec.encodedBytes(envelope(candidate)) <= BridgeEnvelopeCodec.MAX_LINE_BYTES),
+				candidate -> codec.encodedLineBytes(envelope(candidate)) <= BridgeEnvelopeCodec.MAX_LINE_BYTES),
 				"OBSERVATION_TOO_LARGE", "protected essentials fail closed when they cannot fit");
 		return 21;
 	}

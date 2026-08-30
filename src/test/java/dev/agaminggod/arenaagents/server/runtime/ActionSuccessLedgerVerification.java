@@ -6,6 +6,10 @@ import dev.agaminggod.arenaagents.protocol.ActionType;
 public final class ActionSuccessLedgerVerification {
 	private ActionSuccessLedgerVerification() { }
 
+	public static void main(String[] arguments) {
+		System.out.println("PASS: " + verify() + " action success ledger assertions");
+	}
+
 	public static int verify() {
 		AgentId agent = AgentId.parse("00000000-0000-0000-0000-000000000001");
 		ActionSuccessLedger ledger = new ActionSuccessLedger();
@@ -15,9 +19,15 @@ public final class ActionSuccessLedgerVerification {
 		assertEquals(1, ledger.count(agent, 4L, "craft_inventory"), "only successful physical actions count");
 		assertEquals(0, ledger.count(agent, 4L, "complete_goal"), "completion cannot count itself");
 		assertEquals(0, ledger.count(agent, 3L, "craft_inventory"), "counts are revision scoped");
+		ledger.record(result(agent, 5L, ActionType.MOVE_TO, ServerActionState.SUCCEEDED));
+		ledger.retainRevision(agent, 5L);
+		assertEquals(0, ledger.count(agent, 4L, "craft_inventory"), "goal transition evicts historical revisions");
+		assertEquals(1, ledger.count(agent, 5L, "move_to"), "goal transition retains the active revision");
 		ledger.clear(agent, 4L);
 		assertEquals(0, ledger.count(agent, 4L, "craft_inventory"), "clearing a revision is idempotent");
-		return 4;
+		ledger.clear(agent);
+		assertEquals(0, ledger.count(agent, 5L, "move_to"), "agent removal evicts every retained revision");
+		return 7;
 	}
 
 	private static ServerActionResult result(AgentId agent, long revision, ActionType type, ServerActionState state) {

@@ -17,7 +17,7 @@
         "reasoningEffort": "fixed",
         "serviceTier": "local"
       },
-      "repetitions": 1,
+      "repetitions": 5,
       "turnBudgetMs": 5000,
       "trialBudgetMs": 30000,
       "turnCap": 8,
@@ -35,7 +35,7 @@
         "reasoningEffort": "fixed",
         "serviceTier": "local"
       },
-      "repetitions": 1,
+      "repetitions": 5,
       "turnBudgetMs": 5000,
       "trialBudgetMs": 30000,
       "turnCap": 8,
@@ -53,7 +53,7 @@
         "reasoningEffort": "fixed",
         "serviceTier": "local"
       },
-      "repetitions": 1,
+      "repetitions": 5,
       "turnBudgetMs": 5000,
       "trialBudgetMs": 30000,
       "turnCap": 8,
@@ -71,7 +71,7 @@
         "reasoningEffort": "fixed",
         "serviceTier": "local"
       },
-      "repetitions": 1,
+      "repetitions": 5,
       "turnBudgetMs": 5000,
       "trialBudgetMs": 30000,
       "turnCap": 8,

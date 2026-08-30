@@ -27,9 +27,49 @@ $RuntimeDirectory = Join-Path $PackageRoot 'runtime'
 $RuntimeDeploymentHelper = Join-Path $PSScriptRoot 'distribution-runtime.ps1'
 $StartupPackagingPreflight = Join-Path $PSScriptRoot 'verify-startup-packaging.ps1'
 $SecretPath = Join-Path $RuntimeDirectory 'bridge-secret.txt'
+$VoiceSecretPath = Join-Path $RuntimeDirectory 'voice-secret.txt'
 $ResolvedGameDirectory = [IO.Path]::GetFullPath($GameDirectory)
 $InstalledPackageRoot = Join-Path $ResolvedGameDirectory 'arena-agents-runtime'
 $VersionMetadata = Join-Path $env:APPDATA ".minecraft\versions\$VersionId\$VersionId.json"
+
+function Set-OwnerOnlyAccess([string] $Path, [bool] $Directory = $false) {
+    $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $acl = if ($Directory) {
+        [Security.AccessControl.DirectorySecurity]::new()
+    } else {
+        [Security.AccessControl.FileSecurity]::new()
+    }
+    $acl.SetOwner($currentUser)
+    $acl.SetAccessRuleProtection($true, $false)
+    $inheritance = if ($Directory) {
+        [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    } else {
+        [Security.AccessControl.InheritanceFlags]::None
+    }
+    $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+        $currentUser,
+        [Security.AccessControl.FileSystemRights]::FullControl,
+        $inheritance,
+        [Security.AccessControl.PropagationFlags]::None,
+        [Security.AccessControl.AccessControlType]::Allow
+    )
+    [void]$acl.AddAccessRule($rule)
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Initialize-PrivateSecret([string] $Path, [string] $Label) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        $bytes = New-Object byte[] $SecretByteCount
+        $random = [Security.Cryptography.RandomNumberGenerator]::Create()
+        try { $random.GetBytes($bytes) } finally { $random.Dispose() }
+        $secretValue = (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
+        [IO.File]::WriteAllText($Path, $secretValue, $Utf8NoBom)
+    }
+    Set-OwnerOnlyAccess $Path
+    $value = [IO.File]::ReadAllText($Path).Trim()
+    if ($value.Length -lt $MinimumSecretLength) { throw "The package $Label secret is too short." }
+    $value
+}
 
 if (Get-Process -Name MinecraftLauncher,Minecraft -ErrorAction SilentlyContinue) {
     throw 'Close Minecraft and Minecraft Launcher before installing Arena Agents.'
@@ -65,15 +105,10 @@ foreach ($required in @($LauncherProfiles, $VersionMetadata, $ModsSource, $Runti
 & $StartupPackagingPreflight -PackageRoot $PackageRoot
 
 New-Item -ItemType Directory -Force -Path $RuntimeDirectory, (Join-Path $ResolvedGameDirectory 'mods'), $InstalledPackageRoot | Out-Null
-if (-not (Test-Path -LiteralPath $SecretPath -PathType Leaf)) {
-    $bytes = New-Object byte[] $SecretByteCount
-    $random = [Security.Cryptography.RandomNumberGenerator]::Create()
-    try { $random.GetBytes($bytes) } finally { $random.Dispose() }
-    $secretValue = (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
-    [IO.File]::WriteAllText($SecretPath, $secretValue, $Utf8NoBom)
-}
-$secret = [IO.File]::ReadAllText($SecretPath).Trim()
-if ($secret.Length -lt $MinimumSecretLength) { throw 'The package bridge secret is too short.' }
+Set-OwnerOnlyAccess $RuntimeDirectory $true
+$secret = Initialize-PrivateSecret $SecretPath 'bridge'
+$voiceSecret = Initialize-PrivateSecret $VoiceSecretPath 'voice'
+if ($secret -eq $voiceSecret) { throw 'Bridge and voice secrets must be distinct.' }
 
 $includedMods = @(Get-ChildItem -LiteralPath $ModsSource -Filter '*.jar' -File)
 $unexpectedMods = @(Compare-Object -ReferenceObject $ExpectedModNames -DifferenceObject @($includedMods.Name) -PassThru)
@@ -86,6 +121,10 @@ foreach ($mod in $includedMods) {
 
 New-Item -ItemType Directory -Force -Path (Join-Path $InstalledPackageRoot 'runtime') | Out-Null
 Copy-Item -LiteralPath $SecretPath -Destination (Join-Path $InstalledPackageRoot 'runtime\bridge-secret.txt') -Force
+Copy-Item -LiteralPath $VoiceSecretPath -Destination (Join-Path $InstalledPackageRoot 'runtime\voice-secret.txt') -Force
+Set-OwnerOnlyAccess (Join-Path $InstalledPackageRoot 'runtime') $true
+Set-OwnerOnlyAccess (Join-Path $InstalledPackageRoot 'runtime\bridge-secret.txt')
+Set-OwnerOnlyAccess (Join-Path $InstalledPackageRoot 'runtime\voice-secret.txt')
 $runtimeDeployment = Install-ArenaCoordinatorRuntime -SourceRoot $PackageRoot -InstalledPackageRoot $InstalledPackageRoot
 
 $resolvedProfiles = (Resolve-Path -LiteralPath $LauncherProfiles).Path
@@ -93,7 +132,7 @@ $document = Get-Content -LiteralPath $resolvedProfiles -Raw | ConvertFrom-Json
 if ($null -eq $document.profiles) {
     $document | Add-Member -MemberType NoteProperty -Name profiles -Value ([pscustomobject]@{})
 }
-$javaArguments = "-Xms1G -Xmx4G -Darenaagents.bridgeSecretFile=`"$SecretPath`" -Darenaagents.packageRoot=`"$InstalledPackageRoot`""
+$javaArguments = "-Xms1G -Xmx4G -Darenaagents.bridgeSecretFile=`"$SecretPath`" -Darenaagents.voiceSecretFile=`"$VoiceSecretPath`" -Darenaagents.packageRoot=`"$InstalledPackageRoot`""
 $expected = [ordered]@{
     gameDir = $ResolvedGameDirectory
     javaArgs = $javaArguments

@@ -2,7 +2,7 @@ import { ArenaScriptError, executionError } from './errors.mjs';
 import { types as nodeTypes } from 'node:util';
 import { DEFAULT_ARENA_SCRIPT_LIMITS, normalizeArenaScriptLimits } from './limits.mjs';
 import { PLAYER_MEMBER_PRIMITIVES } from './minecraft-api.mjs';
-import { filterObserved, markObservedCandidateSet, nearestFromCurrent } from './facts.mjs';
+import { filterObserved, isTrustedInterpreterFacts, markObservedCandidateSet, nearestFromCurrent } from './facts.mjs';
 import { MAX_LINE_BYTES } from '../constants.mjs';
 
 const CAPABILITY_NAMES = new Set(['program', 'player', 'world', 'inventory']);
@@ -894,6 +894,7 @@ function normalizeActionResult(result) {
 }
 
 function freezeFacts(facts) {
+	if (isTrustedInterpreterFacts(facts)) return facts;
 	const root = exactOwnDataRecord(facts, 'facts', ['player', 'world', 'inventory']);
 	const inventoryEntries = ownDataEntries(root.inventory, 'facts.inventory');
 	const inventory = Object.fromEntries(inventoryEntries);

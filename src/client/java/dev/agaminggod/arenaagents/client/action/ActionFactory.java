@@ -48,7 +48,7 @@ public final class ActionFactory {
 					arguments.get("face").getAsString(),
 					arguments.get("itemId").getAsString()
 			);
-			case SET_DOOR, PICK_UP_ITEM, DROP_ITEM, NAVIGATE_TO, FIGHT_TARGET, FLEE_FROM, FOLLOW_ENTITY,
+			case CONTROL, SET_DOOR, PICK_UP_ITEM, DROP_ITEM, NAVIGATE_TO, FIGHT_TARGET, FLEE_FROM, FOLLOW_ENTITY,
 					BUILD_SEQUENCE ->
 					deferred(command.type(), "server-side NPC execution");
 			case TRANSFER_CONTAINER, CRAFT_INVENTORY, CRAFT_TABLE, FURNACE_TRANSACTION,

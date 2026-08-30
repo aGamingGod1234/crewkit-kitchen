@@ -48,6 +48,7 @@ public final class ServerNavigationController implements ServerController {
 	private WaypointProgress progress;
 	private double lastProgressValue;
 	private InputLease inputLease;
+	private LeasedServerInputController inputController;
 	private AgentInputStates.MotorState motorState;
 	private ResourceKey<Level> startingDimension;
 
@@ -94,16 +95,16 @@ public final class ServerNavigationController implements ServerController {
 			return succeed(player, "DESTINATION_REACHED", "Destination reached");
 		}
 		if (plan == null) {
-			TickResult planned = replan(player, nowEpochMs, elapsedMs, remaining, false);
+			TickResult planned = replan(player, world, nowEpochMs, elapsedMs, remaining, false);
 			if (planned != null) return planned;
 		}
 		List<PathNode> nodes = plan.nodes();
 		if (waypointIndex >= nodes.size()) {
-			return replanOrResult(player, nowEpochMs, elapsedMs, remaining);
+			return replanOrResult(player, world, nowEpochMs, elapsedMs, remaining);
 		}
 		PathNode waypoint = nodes.get(waypointIndex);
 		if (!world.isStandable(waypoint.position())) {
-			TickResult replanned = replan(player, nowEpochMs, elapsedMs, remaining, true);
+			TickResult replanned = replan(player, world, nowEpochMs, elapsedMs, remaining, true);
 			if (replanned != null) return replanned;
 			nodes = plan.nodes();
 			waypoint = nodes.get(waypointIndex);
@@ -117,7 +118,7 @@ public final class ServerNavigationController implements ServerController {
 		if (reached) {
 			waypointIndex++;
 			if (waypointIndex >= nodes.size()) {
-				return replanOrResult(player, nowEpochMs, elapsedMs, remaining);
+				return replanOrResult(player, world, nowEpochMs, elapsedMs, remaining);
 			}
 			waypoint = nodes.get(waypointIndex);
 			finalWaypoint = waypointIndex == nodes.size() - 1;
@@ -128,12 +129,12 @@ public final class ServerNavigationController implements ServerController {
 			return fail(player, "PATH_BLOCKED", "Navigation could not recover from repeated stalls", update.progress());
 		}
 		if (update.decision() == WaypointProgress.Decision.REPLAN) {
-			TickResult replanned = replan(player, nowEpochMs, elapsedMs, remaining, true);
+			TickResult replanned = replan(player, world, nowEpochMs, elapsedMs, remaining, true);
 			if (replanned != null) return replanned;
 			waypoint = plan.nodes().get(waypointIndex);
 			target = targetFor(world, waypoint, waypointIndex == plan.nodes().size() - 1);
 		}
-		drive(player, waypoint, target, nowEpochMs);
+		drive(player, world, waypoint, target, nowEpochMs);
 		return TickResult.running(update.progress());
 	}
 
@@ -144,19 +145,26 @@ public final class ServerNavigationController implements ServerController {
 			return;
 		}
 		try {
-			AgentInputRuntime.controller(player).release(inputLease);
+			inputController.release(inputLease);
 		} catch (LeasedServerInputController.StaleInputLeaseException ignored) {
 			// A lifecycle clear may already have invalidated every lease.
 		}
 		inputLease = null;
+		inputController = null;
 		motorState = null;
 	}
 
-	private TickResult replanOrResult(ServerPlayer player, long nowEpochMs, long elapsedMs, double remaining) {
+	private TickResult replanOrResult(
+			ServerPlayer player,
+			MinecraftNavigationWorld world,
+			long nowEpochMs,
+			long elapsedMs,
+			double remaining
+	) {
 		if (satisfiesDestinationTolerance(remaining, tolerance)) {
 			return succeed(player, "DESTINATION_REACHED", "Destination reached");
 		}
-		TickResult replanned = replan(player, nowEpochMs, elapsedMs, remaining, false);
+		TickResult replanned = replan(player, world, nowEpochMs, elapsedMs, remaining, false);
 		return replanned == null ? TickResult.running(currentProgress()) : replanned;
 	}
 
@@ -238,12 +246,12 @@ public final class ServerNavigationController implements ServerController {
 
 	private TickResult replan(
 			ServerPlayer player,
+			MinecraftNavigationWorld world,
 			long nowEpochMs,
 			long elapsedMs,
 			double remaining,
 			boolean recovery
 	) {
-		MinecraftNavigationWorld world = new MinecraftNavigationWorld(player.level());
 		GridPosition start = nearestStandable(world, new GridPosition(
 				player.blockPosition().getX(),
 				player.blockPosition().getY(),
@@ -304,12 +312,18 @@ public final class ServerNavigationController implements ServerController {
 		return null;
 	}
 
-	private void drive(ServerPlayer player, PathNode waypoint, Vec3 target, long nowEpochMs) {
+	private void drive(
+			ServerPlayer player,
+			MinecraftNavigationWorld world,
+			PathNode waypoint,
+			Vec3 target,
+			long nowEpochMs
+	) {
 		boolean gapJump = waypoint.traversal() == TraversalType.JUMP_GAP;
-		boolean shallowWater = new MinecraftNavigationWorld(player.level()).isShallowWater(waypoint.position());
-		LeasedServerInputController controller = AgentInputRuntime.controller(player);
+		boolean shallowWater = world.isShallowWater(waypoint.position());
 		if (inputLease == null) {
-			inputLease = controller.acquire(AgentInputRuntime.requireAgentId(player), InputOwner.NAVIGATION, 100);
+			inputController = AgentInputRuntime.controller(player);
+			inputLease = inputController.acquire(AgentInputRuntime.requireAgentId(player), InputOwner.NAVIGATION, 100);
 		}
 		Vec3 lookTarget = target.add(0.0D, 0.85D, 0.0D);
 		Vec3 delta = lookTarget.subtract(player.getEyePosition());
@@ -331,7 +345,7 @@ public final class ServerNavigationController implements ServerController {
 				nowEpochMs
 		);
 		motorState = step.state();
-		controller.apply(inputLease, new dev.agaminggod.arenaagents.server.runtime.input.AgentInputState(
+		inputController.apply(inputLease, new dev.agaminggod.arenaagents.server.runtime.input.AgentInputState(
 				step.forward(), step.strafe(), step.jump(), false, step.sprint(),
 				false, false, step.state().yaw(), step.state().pitch(),
 				player.getInventory().getSelectedSlot(), InteractionHand.MAIN_HAND

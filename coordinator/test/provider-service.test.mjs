@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { AntigravityProviderService } from '../src/antigravity-service.mjs';
+import { ANTIGRAVITY_INTERNAL_TEST_MODE, AntigravityProviderService } from '../src/antigravity-service.mjs';
 import { ProviderService } from '../src/provider-service.mjs';
 
 class FakeService {
@@ -152,6 +152,7 @@ test('provider reconciliation retains a Gemini fast profile and rejects a tier m
 		cwd: 'C:\\workspace',
 		models: ['gemini-3.1-pro'],
 		modelReasoningEfforts: { 'gemini-3.1-pro': ['high', 'low'] },
+		testOnlyMode: ANTIGRAVITY_INTERNAL_TEST_MODE,
 	});
 	const router = new ProviderService({
 		codex: new FakeService('codex'),
@@ -265,6 +266,26 @@ test('bootstrap catalog is complete before mixed-provider profiles can be accept
 		['gemini', 'gemini-model'],
 		['kimi', 'kimi-model'],
 	]);
+});
+
+test('bootstrap catalog delegates profile-aware fast paths to the selected provider', async () => {
+	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
+	let receivedRecords = null;
+	services.codex.bootstrapCatalog = async (records) => {
+		receivedRecords = records;
+		return {
+			refreshedAtEpochMs: 0,
+			models: [{ id: 'codex-model', model: 'codex-model', displayName: 'Codex model', reasoningEfforts: ['high'], serviceTiers: ['fast'] }],
+			source: 'builtin',
+		};
+	};
+	services.codex.catalog.refresh = async () => { throw new Error('generic refresh bypassed provider fast path'); };
+	const router = new ProviderService(services);
+
+	const record = profile('codex');
+	const snapshot = await router.bootstrapCatalog([record]);
+	assert.deepEqual(receivedRecords, [record]);
+	assert.deepEqual(snapshot.models.map(({ provider, id }) => ({ provider, id })), [{ provider: 'codex', id: 'codex-model' }]);
 });
 
 test('concurrent creation coalesces one lazy startup for the selected provider', async () => {

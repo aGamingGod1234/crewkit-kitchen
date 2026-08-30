@@ -42,6 +42,10 @@ public final class BridgeSession implements AutoCloseable {
 	private static final String FIELD_TYPE = "type";
 	private static final String FIELD_MESSAGE_ID = "messageId";
 	private static final String FIELD_COMMAND = "command";
+	private static final String FIELD_CHALLENGE = "challenge";
+	private static final String FIELD_NONCE = "nonce";
+	private static final String FIELD_PROOF = "proof";
+	private static final String FIELD_REPLY_TO = "replyTo";
 	private static final String GENERATED_MESSAGE_ID_PREFIX = "server-";
 	private static final String MAXIMUM_GENERATED_MESSAGE_ID = GENERATED_MESSAGE_ID_PREFIX
 			+ "9".repeat(ProtocolConstants.MAX_COMMAND_ID_LENGTH - GENERATED_MESSAGE_ID_PREFIX.length());
@@ -69,6 +73,7 @@ public final class BridgeSession implements AutoCloseable {
 	private final InputStream input;
 	private final OutputStream output;
 	private final BlockingQueue<String> outbound;
+	private final String bridgeNonce = BridgeAuthentication.newNonce();
 	private final Set<String> inboundMessageIds = new HashSet<>();
 	private final AtomicBoolean closeStarted = new AtomicBoolean();
 	private final AtomicLong outboundSequence = new AtomicLong();
@@ -77,8 +82,9 @@ public final class BridgeSession implements AutoCloseable {
 	private final Object lifecycleLock = new Object();
 	private final Object outputLock = new Object();
 
-	private volatile SessionState state = SessionState.AWAITING_HELLO;
+	private volatile SessionState state = SessionState.AWAITING_RESPONSE;
 	private boolean started;
+	private String challengeMessageId;
 	private volatile Thread readerThread;
 	private volatile Thread writerThread;
 
@@ -133,6 +139,11 @@ public final class BridgeSession implements AutoCloseable {
 				return;
 			}
 			started = true;
+			String challenge = codec.encode(createChallenge());
+			if (!outbound.offer(challenge)) {
+				close();
+				throw outboundQueueFull();
+			}
 			writerThread = createDaemon("writer", this::writerLoop);
 			readerThread = createDaemon("reader", this::readerLoop);
 			writerThread.start();
@@ -211,7 +222,7 @@ public final class BridgeSession implements AutoCloseable {
 			if (!isAuthenticated()) {
 				writeError(new ProtocolException(
 						"AUTHENTICATION_TIMEOUT",
-						"Bridge hello was not received within " + AUTHENTICATION_TIMEOUT_MS + " ms",
+						"Bridge authentication response was not received within " + AUTHENTICATION_TIMEOUT_MS + " ms",
 						exception
 				));
 			}
@@ -254,12 +265,12 @@ public final class BridgeSession implements AutoCloseable {
 		String messageId = requireBoundedString(message, FIELD_MESSAGE_ID, ProtocolConstants.MAX_COMMAND_ID_LENGTH);
 		rememberMessageId(messageId);
 
-		if (!isAuthenticated() && !"hello".equals(type)) {
-			throw new ProtocolException("AUTHENTICATION_REQUIRED", "First bridge message must be hello");
+		if (!isAuthenticated() && !"hello_response".equals(type)) {
+			throw new ProtocolException("AUTHENTICATION_REQUIRED", "Bridge authentication response is required");
 		}
 
 		switch (type) {
-			case "hello" -> handleHello(message, messageId);
+			case "hello_response" -> handleHelloResponse(message, messageId);
 			case "action_command" -> handleActionCommand(message);
 			case "cancel_action" -> handleCancelAction(message);
 			case "request_observation" -> handleObservationRequest(message);
@@ -271,18 +282,46 @@ public final class BridgeSession implements AutoCloseable {
 		}
 	}
 
-	private void handleHello(JsonObject message, String messageId) {
-		validateFields(message, ENVELOPE_FIELDS);
+	private void handleHelloResponse(JsonObject message, String messageId) {
+		validateFields(message, ENVELOPE_FIELDS, FIELD_CHALLENGE, FIELD_NONCE, FIELD_PROOF);
+		String challenge = requireAuthenticationToken(message, FIELD_CHALLENGE, true);
+		String coordinatorNonce = requireAuthenticationToken(message, FIELD_NONCE, true);
+		String suppliedProof = requireAuthenticationToken(message, FIELD_PROOF, false);
 		synchronized (lifecycleLock) {
-			ensureAwaitingHello();
+			ensureAwaitingResponse();
+			if (!bridgeNonce.equals(challenge)) {
+				throw new ProtocolException("AUTHENTICATION_FAILED", "Bridge challenge was not accepted");
+			}
+			String expectedProof = BridgeAuthentication.coordinatorProof(
+					config.bridgeSecret(),
+					config.agentId(),
+					challengeMessageId,
+					messageId,
+					bridgeNonce,
+					coordinatorNonce
+			);
+			if (!BridgeAuthentication.proofsMatch(expectedProof, suppliedProof)) {
+				throw new ProtocolException("AUTHENTICATION_FAILED", "Coordinator proof was not accepted");
+			}
 		}
 		JsonObject acknowledgement = createEnvelope("hello_ack");
-		acknowledgement.addProperty("replyTo", messageId);
+		acknowledgement.addProperty(FIELD_REPLY_TO, messageId);
+		acknowledgement.addProperty(
+				FIELD_PROOF,
+				BridgeAuthentication.bridgeProof(
+						config.bridgeSecret(),
+						config.agentId(),
+						challengeMessageId,
+						messageId,
+						bridgeNonce,
+						coordinatorNonce
+				)
+		);
 		String encoded = codec.encode(acknowledgement);
 		resetReadTimeout();
 		boolean queued;
 		synchronized (lifecycleLock) {
-			ensureAwaitingHello();
+			ensureAwaitingResponse();
 			queued = outbound.offer(encoded);
 			if (queued) {
 				state = SessionState.AUTHENTICATED;
@@ -294,12 +333,19 @@ public final class BridgeSession implements AutoCloseable {
 		}
 	}
 
-	private void ensureAwaitingHello() {
+	private JsonObject createChallenge() {
+		JsonObject challenge = createEnvelope("hello_challenge");
+		challenge.addProperty(FIELD_NONCE, bridgeNonce);
+		challengeMessageId = challenge.get(FIELD_MESSAGE_ID).getAsString();
+		return challenge;
+	}
+
+	private void ensureAwaitingResponse() {
 		if (state == SessionState.CLOSED) {
 			throw new ProtocolException("SESSION_CLOSED", "Bridge session is closed");
 		}
-		if (state != SessionState.AWAITING_HELLO) {
-			throw new ProtocolException("ALREADY_AUTHENTICATED", "hello is only valid as the first message");
+		if (state != SessionState.AWAITING_RESPONSE) {
+			throw new ProtocolException("ALREADY_AUTHENTICATED", "hello_response is only valid before authentication");
 		}
 	}
 
@@ -556,6 +602,14 @@ public final class BridgeSession implements AutoCloseable {
 		return value;
 	}
 
+	private static String requireAuthenticationToken(JsonObject object, String field, boolean nonce) {
+		String value = requireBoundedString(object, field, BridgeAuthentication.TOKEN_LENGTH);
+		if (nonce ? !BridgeAuthentication.isNonce(value) : !BridgeAuthentication.isProof(value)) {
+			throw invalidField(field, nonce ? "a 256-bit base64url nonce" : "a SHA-256 HMAC proof");
+		}
+		return value;
+	}
+
 	private static JsonElement requireField(JsonObject object, String field) {
 		if (!object.has(field) || object.get(field).isJsonNull()) {
 			throw new ProtocolException(
@@ -670,7 +724,7 @@ public final class BridgeSession implements AutoCloseable {
 	}
 
 	private enum SessionState {
-		AWAITING_HELLO,
+		AWAITING_RESPONSE,
 		AUTHENTICATED,
 		CLOSED
 	}

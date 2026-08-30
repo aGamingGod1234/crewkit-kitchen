@@ -4,18 +4,21 @@ import com.google.gson.Gson;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import java.nio.charset.StandardCharsets;
 import java.util.Objects;
 
 public final class AgentControlSnapshotCodec {
 	private static final Gson GSON = new Gson();
-	public static final int MAX_ENCODED_LENGTH = 32_767;
+	public static final int MAX_ENCODED_BYTES = 32_767;
+	@Deprecated(forRemoval = false)
+	public static final int MAX_ENCODED_LENGTH = MAX_ENCODED_BYTES;
 
 	private AgentControlSnapshotCodec() {
 	}
 
 	public static String encode(AgentControlSnapshot snapshot) {
 		String encoded = GSON.toJson(Objects.requireNonNull(snapshot, "snapshot must not be null"));
-		if (encoded.length() > MAX_ENCODED_LENGTH) {
+		if (utf8Bytes(encoded) > MAX_ENCODED_BYTES) {
 			throw new IllegalArgumentException("Control snapshot exceeds the wire limit");
 		}
 		return encoded;
@@ -23,7 +26,7 @@ public final class AgentControlSnapshotCodec {
 
 	public static AgentControlSnapshot decode(String encoded) {
 		String checked = Objects.requireNonNull(encoded, "encoded must not be null");
-		if (checked.length() > MAX_ENCODED_LENGTH) {
+		if (utf8Bytes(checked) > MAX_ENCODED_BYTES) {
 			throw new IllegalArgumentException("Control snapshot exceeds the wire limit");
 		}
 		try {
@@ -48,6 +51,10 @@ public final class AgentControlSnapshotCodec {
 		} catch (RuntimeException exception) {
 			throw new IllegalArgumentException("Invalid control snapshot", exception);
 		}
+	}
+
+	private static int utf8Bytes(String value) {
+		return value.getBytes(StandardCharsets.UTF_8).length;
 	}
 
 	private static int schemaVersion(JsonObject object) {

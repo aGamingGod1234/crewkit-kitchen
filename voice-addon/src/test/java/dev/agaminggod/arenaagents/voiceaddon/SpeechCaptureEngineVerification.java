@@ -27,6 +27,7 @@ final class SpeechCaptureEngineVerification {
 	static int verify() throws Exception {
 		int assertions = 0;
 		assertions += verifyProductionSpeechEndpointFlushesWithinBudget();
+		assertions += verifyAdaptiveEndpointShortensEstablishedUtterances();
 		assertions += verifyInputLatencyReportsOneCompletedUtterance();
 		assertions += verifySilenceFlushesOneOrderedUtterance();
 		assertions += verifyDeliveryContextIsCapturedAtUtteranceStart();
@@ -39,6 +40,7 @@ final class SpeechCaptureEngineVerification {
 		assertions += verifyDecoderCloseFailureDoesNotWedgeLaterSpeech();
 		assertions += verifyTranscriptsDeliverInUtteranceOrder();
 		assertions += verifyFailedEarlierTranscriptReleasesCompletedSuccessor();
+		assertions += verifyPendingUtteranceCoalescesToLatest();
 		assertions += verifyUnavailableSttRecoversAfterBackoff();
 		assertions += verifyCapacitySttRecoversAfterBackoff();
 		assertions += verifyRateLimitedSttRecoversAfterBackoff();
@@ -167,6 +169,26 @@ final class SpeechCaptureEngineVerification {
 				"production speech endpoint flushes within the conversational latency budget");
 		engine.close();
 		return 1;
+	}
+
+	private static int verifyAdaptiveEndpointShortensEstablishedUtterances() {
+		RecordingTranscriber transcriber = new RecordingTranscriber();
+		ManualScheduledExecutor scheduler = new ManualScheduledExecutor();
+		SpeechCaptureEngine engine = new SpeechCaptureEngine(
+				transcriber, scheduler, 100L, 300L, 4, 32, ignored -> { }
+		);
+		engine.accept(PLAYER, false, new byte[] { 1, 2 }, RecordingDecoder::new, Runnable::run,
+				(playerId, text, whispering) -> { });
+		engine.accept(PLAYER, false, new byte[] { 3, 4 }, RecordingDecoder::new, Runnable::run,
+				(playerId, text, whispering) -> { });
+		assertEquals(300L, scheduler.tasks.get(0).delayMilliseconds,
+				"short speech keeps the pause-preserving endpoint");
+		assertEquals(100L, scheduler.tasks.get(1).delayMilliseconds,
+				"established speech uses the low-latency endpoint");
+		assertEquals(true, scheduler.tasks.get(0).isCancelled(),
+				"the adaptive timer still fences the older endpoint epoch");
+		engine.close();
+		return 3;
 	}
 
 	private static int verifySilenceFlushesOneOrderedUtterance() throws Exception {
@@ -363,16 +385,17 @@ final class SpeechCaptureEngineVerification {
 		engine.accept(PLAYER, false, new byte[] { 1 }, RecordingDecoder::new, Runnable::run, delivery);
 		engine.accept(PLAYER, true, new byte[] { 2 }, RecordingDecoder::new, Runnable::run, delivery);
 
-		transcriber.complete(2L, "second");
-		assertEquals(List.of(), delivered, "later transcript waits for the prior utterance");
+		assertEquals(false, transcriber.pending.containsKey(2L), "successor waits behind active STT");
 		transcriber.complete(1L, "first");
+		assertEquals(true, transcriber.pending.containsKey(2L), "successor starts after active STT completes");
+		transcriber.complete(2L, "second");
 		assertEquals(
 				List.of(new Delivered(PLAYER, "first", false), new Delivered(PLAYER, "second", true)),
 				delivered,
-				"transcripts deliver in captured utterance order"
+				"bounded successor delivers in utterance order"
 		);
 		engine.close();
-		return 2;
+		return 3;
 	}
 
 	private static int verifyFailedEarlierTranscriptReleasesCompletedSuccessor() {
@@ -384,15 +407,38 @@ final class SpeechCaptureEngineVerification {
 		engine.accept(PLAYER, false, new byte[] { 1 }, RecordingDecoder::new, Runnable::run, delivery);
 		engine.accept(PLAYER, true, new byte[] { 2 }, RecordingDecoder::new, Runnable::run, delivery);
 
+		assertEquals(1, transcriber.pending.size(), "per-player STT admission remains bounded to one request");
+		transcriber.fail(1L, new VoiceWorkerClient.VoiceWorkerException("STT_PROVIDER_ERROR", "temporary failure"));
+		assertEquals(true, transcriber.pending.containsKey(2L), "successor starts after an ordinary STT failure");
 		transcriber.complete(2L, "second");
-		assertEquals(List.of(), delivered, "completed successor waits while the earlier STT request is active");
-		transcriber.fail(1L, new VoiceWorkerClient.VoiceWorkerException(
-				"STT_UNAVAILABLE", "Speech recognition became unavailable"
-		));
 		assertEquals(List.of(new Delivered(PLAYER, "second", true)), delivered,
-				"failed earlier STT releases the already-completed successor in sequence order");
+				"failed earlier STT advances ordering before the successor delivers");
 		engine.close();
-		return 2;
+		return 3;
+	}
+
+	private static int verifyPendingUtteranceCoalescesToLatest() {
+		ControlledTranscriber transcriber = new ControlledTranscriber();
+		SpeechCaptureEngine engine = new SpeechCaptureEngine(transcriber, scheduler(), 5_000L, 1);
+		List<Delivered> delivered = new ArrayList<>();
+		SpeechCaptureEngine.TranscriptDelivery delivery = (playerId, text, whispering) ->
+				delivered.add(new Delivered(playerId, text, whispering));
+		engine.accept(PLAYER, false, new byte[] { 1 }, RecordingDecoder::new, Runnable::run, delivery);
+		engine.accept(PLAYER, true, new byte[] { 2 }, RecordingDecoder::new, Runnable::run, delivery);
+		engine.accept(PLAYER, false, new byte[] { 3 }, RecordingDecoder::new, Runnable::run, delivery);
+
+		assertEquals(1, transcriber.pending.size(), "only the active STT reaches the worker");
+		transcriber.complete(1L, "first");
+		assertEquals(false, transcriber.pending.containsKey(2L), "superseded pending speech never reaches STT");
+		assertEquals(true, transcriber.pending.containsKey(3L), "latest bounded pending speech reaches STT");
+		transcriber.complete(3L, "third");
+		assertEquals(
+				List.of(new Delivered(PLAYER, "first", false), new Delivered(PLAYER, "third", false)),
+				delivered,
+				"coalescing retains one latest utterance without blocking transcript order"
+		);
+		engine.close();
+		return 4;
 	}
 
 	private static int verifyUnavailableSttRecoversAfterBackoff() {
@@ -604,10 +650,9 @@ final class SpeechCaptureEngineVerification {
 				(playerId, text, whispering) -> delivered.add(new Delivered(playerId, text, whispering))
 		);
 		CompletableFuture<SpeechWorkerClient.Transcript> firstPending = transcriber.pending.get(1L);
-		CompletableFuture<SpeechWorkerClient.Transcript> secondPending = transcriber.pending.get(2L);
 		engine.close();
 		assertEquals(true, firstPending.isCancelled(), "close cancels the first pending STT request");
-		assertEquals(true, secondPending.isCancelled(), "close cancels the replacement STT request");
+		assertEquals(false, transcriber.pending.containsKey(2L), "bounded pending replacement is discarded on close");
 		assertEquals(List.of(), delivered, "a late cancelled transcript cannot deliver after close");
 		return 3;
 	}
@@ -806,7 +851,7 @@ final class SpeechCaptureEngineVerification {
 
 		@Override
 		public ScheduledFuture<?> schedule(Runnable command, long delay, TimeUnit unit) {
-			ManualFuture future = new ManualFuture(command);
+			ManualFuture future = new ManualFuture(command, unit.toMillis(delay));
 			tasks.add(future);
 			return future;
 		}
@@ -840,11 +885,13 @@ final class SpeechCaptureEngineVerification {
 
 	private static final class ManualFuture implements ScheduledFuture<Object> {
 		private final Runnable command;
+		private final long delayMilliseconds;
 		private boolean cancelled;
 		private boolean done;
 
-		private ManualFuture(Runnable command) {
+		private ManualFuture(Runnable command, long delayMilliseconds) {
 			this.command = command;
+			this.delayMilliseconds = delayMilliseconds;
 		}
 
 		private void runEvenIfCancelled() {

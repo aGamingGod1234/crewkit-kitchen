@@ -123,7 +123,11 @@ export class ProviderService extends EventEmitter {
 	}
 	async bootstrapCatalog(recordsOrProviders = undefined) {
 		const providers = normalizeProviderSelection(recordsOrProviders ?? [], this.#services, { defaultToAll: recordsOrProviders === undefined });
-		return this.catalog.refresh({ providers });
+		const profileRecords = Array.isArray(recordsOrProviders)
+			&& recordsOrProviders.every((value) => value !== null && typeof value === 'object' && !Array.isArray(value))
+			? recordsOrProviders
+			: undefined;
+		return this.catalog.refresh({ providers, profileRecords });
 	}
 
 	recoverySnapshot() {
@@ -893,7 +897,7 @@ class CombinedProviderCatalog {
 		this.lastValid = new Map();
 		this.stale = false;
 	}
-	async refresh({ providers = undefined, fallbackProviders = [], ...options } = {}) {
+	async refresh({ providers = undefined, fallbackProviders = [], profileRecords = undefined, ...options } = {}) {
 		const selected = normalizeProviderSelection(providers ?? [], this.services, { defaultToAll: providers === undefined });
 		const fallbackOnly = new Set(normalizeProviderSelection(fallbackProviders, this.services, { defaultToAll: false }));
 		const settled = await Promise.all(selected.map(async (provider) => {
@@ -903,7 +907,11 @@ class CombinedProviderCatalog {
 				return retained === undefined ? null : { provider, ...structuredClone(retained), source: 'last_valid' };
 			}
 			try {
-				const raw = await this.execute(provider, async () => validateCatalogSnapshot(await service.catalog.refresh(options), provider));
+				const providerRecords = profileRecords?.filter((record) => normalizeProvider(record.provider) === provider);
+				const load = providerRecords !== undefined && typeof service.bootstrapCatalog === 'function'
+					? () => service.bootstrapCatalog(providerRecords)
+					: () => service.catalog.refresh(options);
+				const raw = await this.execute(provider, async () => validateCatalogSnapshot(await load(), provider));
 				const source = catalogSource(raw.source, service.catalog.stale, this.lastValid.has(provider));
 				this.recordOutcome(provider, source, raw.recovery);
 				if (source === 'live') this.lastValid.set(provider, raw);

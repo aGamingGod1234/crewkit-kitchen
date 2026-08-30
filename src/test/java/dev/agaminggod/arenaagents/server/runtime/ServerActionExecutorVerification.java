@@ -10,6 +10,11 @@ import dev.agaminggod.arenaagents.server.runtime.controller.ServerCombatControll
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerController;
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerItemPickupController;
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerNavigationController;
+import dev.agaminggod.arenaagents.server.runtime.input.AgentInputState;
+import dev.agaminggod.arenaagents.server.runtime.input.InputLease;
+import dev.agaminggod.arenaagents.server.runtime.input.InputOwner;
+import dev.agaminggod.arenaagents.server.runtime.input.InputStateSink;
+import dev.agaminggod.arenaagents.server.runtime.input.LeasedServerInputController;
 
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.protocol.ActionType;
@@ -24,6 +29,7 @@ import dev.agaminggod.arenaagents.server.runtime.transaction.ServerTransactionAd
 import java.util.concurrent.atomic.AtomicInteger;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.world.InteractionHand;
 import net.minecraft.world.phys.Vec3;
 
 public final class ServerActionExecutorVerification {
@@ -180,7 +186,7 @@ public final class ServerActionExecutorVerification {
 		), "provenance rejects negative event sequences");
 		for (ActionType type : ActionType.values()) {
 			boolean expectedPrimitive = switch (type) {
-				case MOVE_TO, NAVIGATE_TO, LOOK_AT, ATTACK, SELECT_ITEM, USE_ITEM, BREAK_BLOCK, PLACE_BLOCK, PICK_UP_ITEM,
+				case CONTROL, MOVE_TO, NAVIGATE_TO, LOOK_AT, ATTACK, SELECT_ITEM, USE_ITEM, BREAK_BLOCK, PLACE_BLOCK, PICK_UP_ITEM,
 						CHAT, WAIT, SET_DOOR, DROP_ITEM, TRANSFER_CONTAINER, CRAFT_INVENTORY, CRAFT_TABLE,
 						FURNACE_TRANSACTION, EQUIP_ITEM, SELECT_TOOL, BLOCK_WITH_SHIELD, USE_RANGED,
 						INTERACT_BLOCK, INTERACT_ENTITY, DISMOUNT, START_FALL_FLYING -> true;
@@ -193,6 +199,18 @@ public final class ServerActionExecutorVerification {
 		}
 		assertThrows(AgentDomainException.class, () -> ServerActionExecutor.requireArenaScriptPrimitive(ActionType.FIGHT_TARGET),
 				"program primitive entry point rejects high-level controller actions");
+		JsonObject mainHand = new JsonObject();
+		mainHand.addProperty("hand", "main");
+		assertEquals(net.minecraft.world.InteractionHand.MAIN_HAND, ServerActionExecutor.hand(mainHand),
+				"raw control maps the main-hand wire value");
+		JsonObject offHand = new JsonObject();
+		offHand.addProperty("hand", "off");
+		assertEquals(net.minecraft.world.InteractionHand.OFF_HAND, ServerActionExecutor.hand(offHand),
+				"raw control maps the offhand wire value");
+		JsonObject invalidHand = new JsonObject();
+		invalidHand.addProperty("hand", "left");
+		assertThrows(AgentDomainException.class, () -> ServerActionExecutor.hand(invalidHand),
+				"raw control rejects an unknown hand value");
 		ServerActionProgress progress = new ServerActionProgress(
 				progressAgent, 7L, "action-7", ActionType.NAVIGATE_TO, 0.5D, 250L, 1_750_000_000_250L
 		);
@@ -223,6 +241,7 @@ public final class ServerActionExecutorVerification {
 		assertFalse(ServerActionExecutor.isCurrentCoordinatorGeneration(4L, 5L),
 				"respawn completion from a disconnected coordinator generation is ignored");
 		verifyDisconnectedRespawnFinishesOnce();
+		verifyDisconnectedControlNeutralizesLease();
 		assertThrows(IllegalArgumentException.class, () -> new ServerActionProgress(
 				progressAgent, 7L, "action-7", ActionType.NAVIGATE_TO, 1.1D, 250L, 1_750_000_000_250L
 		), "progress rejects fractions above one");
@@ -289,7 +308,46 @@ public final class ServerActionExecutorVerification {
 			assertFalse(admitted[start], "round-robin does not admit an agent twice before the full turn");
 			admitted[start] = true;
 		}
-		return 97;
+		return 107;
+	}
+
+	private static void verifyDisconnectedControlNeutralizesLease() {
+		AgentId agentId = AgentId.random();
+		List<AgentId> cleared = new ArrayList<>();
+		InputStateSink sink = new InputStateSink() {
+			@Override
+			public void apply(AgentId ignored, AgentInputState previous, AgentInputState state) {
+			}
+
+			@Override
+			public void clear(AgentId clearedAgent, AgentInputState previous) {
+				cleared.add(clearedAgent);
+			}
+		};
+		LeasedServerInputController controller = new LeasedServerInputController(sink);
+		InputLease lease = controller.acquire(agentId, InputOwner.DIRECT_CONTROL, 250);
+		controller.apply(lease, new AgentInputState(
+				1.0F, -1.0F, true, true, true, true, true,
+				90.0F, 15.0F, 4, InteractionHand.OFF_HAND
+		));
+		Object action = new Object();
+		Map<AgentId, Object> active = new LinkedHashMap<>();
+		active.put(agentId, action);
+		AtomicInteger lifecycleFinishes = new AtomicInteger();
+		assertTrue(ServerActionExecutor.finishDisconnectedControl(
+				active, agentId, action, () -> controller.clear(agentId), lifecycleFinishes::incrementAndGet
+		), "coordinator disconnect fences the active control action");
+		assertTrue(active.isEmpty(), "disconnected control cannot tick again");
+		assertTrue(controller.currentState(agentId).isEmpty(), "disconnect removes the active control lease immediately");
+		assertEquals(List.of(agentId), cleared, "disconnect neutralizes the physical input sink once");
+		assertThrows(IllegalStateException.class, () -> controller.apply(lease, new AgentInputState(
+				1.0F, 0.0F, false, false, true, false, false,
+				0.0F, 0.0F, 0, InteractionHand.MAIN_HAND
+		)), "disconnected control lease cannot renew");
+		assertEquals(1, lifecycleFinishes.get(), "disconnect finishes the control lifecycle once");
+		assertFalse(ServerActionExecutor.finishDisconnectedControl(
+				active, agentId, action, () -> controller.clear(agentId), lifecycleFinishes::incrementAndGet
+		), "duplicate disconnect cannot neutralize the same control twice");
 	}
 
 	private static void verifyDisconnectedRespawnFinishesOnce() {

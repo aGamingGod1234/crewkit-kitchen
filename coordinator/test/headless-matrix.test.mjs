@@ -32,6 +32,7 @@ test('normalizes one bounded real-provider scenario', () => {
 	assert.equal(matrix.version, 1);
 	assert.ok(Object.isFrozen(matrix));
 	assert.ok(Object.isFrozen(matrix.scenarios[0]));
+	assert.throws(() => normalizeHeadlessScenario(validScenario({ provider: 'gemini' })), /unsupported provider/i);
 });
 
 test('normalizes only supported concurrent roster sizes', () => {
@@ -53,8 +54,8 @@ test('accepts Cursor Composer and Grok scenarios through the same matrix schema'
 
 test('checked-in live matrix covers every provider with real model and setting combinations', () => {
 	const matrix = normalizeHeadlessMatrix(JSON.parse(readFileSync(new URL('../config/headless-provider-matrix.json', import.meta.url), 'utf8')));
-	assert.equal(matrix.scenarios.length, 19);
-	for (const provider of ['codex', 'gemini', 'kimi', 'cursor']) {
+	assert.equal(matrix.scenarios.length, 15);
+	for (const provider of ['codex', 'kimi', 'cursor']) {
 		const scenarios = matrix.scenarios.filter((scenario) => scenario.provider === provider);
 		assert.ok(new Set(scenarios.map((scenario) => scenario.model)).size >= 2, `${provider} needs at least two models`);
 		for (const model of new Set(scenarios.map((scenario) => scenario.model))) {

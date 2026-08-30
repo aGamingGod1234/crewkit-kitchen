@@ -221,11 +221,21 @@ def main():
         "a transient channel warmup failure must be retried in the same worker"
     )
 
+    priority_queue = worker._WeightedRequestQueue(maximum_stt_burst=3)
+    for value, operation in (
+        ("tts-1", "tts"), ("tts-2", "tts"),
+        ("stt-1", "stt"), ("stt-2", "stt"), ("stt-3", "stt"), ("stt-4", "stt"),
+    ):
+        priority_queue.put(value, operation)
+    weighted_order = [priority_queue.take() for _ in range(6)]
+    priority_queue.close()
+
     print(json.dumps({
         "requests": request_count,
         "warmupRequests": len(warmup_results),
         "maximumConcurrentInference": tracker.maximum,
         "maximumConcurrentWarmupOrInference": warmup_tracker.maximum,
+        "weightedOrder": weighted_order,
     }))
 
 

@@ -29,4 +29,17 @@ public final class ActionSuccessLedger {
 		revisions.remove(goalRevision);
 		if (revisions.isEmpty()) counts.remove(agentId);
 	}
+
+	public synchronized void retainRevision(AgentId agentId, long goalRevision) {
+		Map<Long, Map<String, Integer>> revisions = counts.get(
+				Objects.requireNonNull(agentId, "agentId must not be null")
+		);
+		if (revisions == null) return;
+		revisions.keySet().removeIf(revision -> revision != goalRevision);
+		if (revisions.isEmpty()) counts.remove(agentId);
+	}
+
+	public synchronized void clear(AgentId agentId) {
+		counts.remove(Objects.requireNonNull(agentId, "agentId must not be null"));
+	}
 }

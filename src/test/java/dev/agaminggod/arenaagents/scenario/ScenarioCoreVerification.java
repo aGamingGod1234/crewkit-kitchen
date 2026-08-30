@@ -62,6 +62,7 @@ public final class ScenarioCoreVerification {
 		assertions += verifyDeterministicDirectorEvents();
 		assertions += verifySafeEventMarkers();
 		assertions += verifyRuntimeClockDispatch();
+		assertions += verifyLegacyRuntimeClockBoundaryRestore();
 		assertions += verifyPhases();
 		assertions += verifyLifecycle();
 		assertions += verifyScoringAndEvidence();
@@ -333,6 +334,8 @@ public final class ScenarioCoreVerification {
 				"the route varies landing widths instead of repeating one staircase shape");
 		assertTrue(lane.platforms().stream().map(ScenarioParkourCourse.Platform::y).distinct().count() >= 6,
 				"the route has meaningful vertical composition");
+		assertTrue(lane.platforms().stream().map(ScenarioParkourCourse.Platform::x).distinct().count() >= 2,
+				"the route requires lateral movement instead of following one straight axis");
 		assertTrue(lane.transitionsReachable(),
 				"every progressive parkour transition stays inside the controller reach envelope");
 
@@ -416,7 +419,7 @@ public final class ScenarioCoreVerification {
 				"sixteen-player survival-games arena scales beyond the old small combat box");
 		assertTrue(pvpByPosition.values().stream().anyMatch(placement -> placement.state().getBlock() == Blocks.WATER),
 				"survival-games arena contains navigable terrain rather than only stone and lava");
-		return 33;
+		return 34;
 	}
 
 	private static int verifyParkourParticipantRuntime() {
@@ -990,14 +993,63 @@ public final class ScenarioCoreVerification {
 				new HashSet<>(directedEvents).size(),
 				"runtime clock dispatches every directed event exactly once"
 		);
-		assertEquals(0, finishSignals, "configured duration never ends an open-ended scenario");
-		assertEquals(ScenarioSessionState.RUNNING, session.state(), "runtime clock remains running beyond former duration");
-		assertEquals(session.config().durationTicks() + 2L, clock.snapshot().elapsedTick(),
-				"elapsed telemetry continues increasing beyond the phase schedule");
-		session.finish(clock.snapshot().elapsedTick(), "Operator ended observation");
-		assertTrue(clock.tick().finishedNow(), "explicit gameplay or operator completion ends the runtime once");
+		assertEquals(1, finishSignals, "configured duration ends the scenario exactly once");
+		assertEquals(ScenarioSessionState.FINISHED, session.state(), "runtime clock finishes at the configured duration");
+		assertEquals(session.config().durationTicks(), clock.snapshot().elapsedTick(),
+				"elapsed telemetry stops at the configured duration");
+		assertEquals(Optional.of("Configured scenario duration elapsed"), session.completionReason(),
+				"duration completion records a stable reason");
 		assertTrue(!clock.tick().finishedNow(), "terminal completion is emitted only once");
-		return 6;
+		return 7;
+	}
+
+	private static int verifyLegacyRuntimeClockBoundaryRestore() {
+		ScenarioSession exactSession = runningClockSession();
+		long durationTicks = exactSession.config().durationTicks();
+		ScenarioRuntimeClock exactClock = ScenarioRuntimeClock.restore(
+				exactSession,
+				new ScenarioRuntimeClock.Snapshot(1, durationTicks, 0, Optional.empty(), false)
+		);
+		assertEquals(ScenarioSessionState.FINISHED, exactSession.state(),
+				"legacy clock at duration finishes during restore");
+		assertEquals(durationTicks, exactClock.snapshot().elapsedTick(),
+				"legacy clock at duration keeps bounded elapsed telemetry");
+		assertTrue(exactClock.snapshot().finished(), "legacy clock at duration migrates to a finished snapshot");
+		ScenarioRuntimeClock.Update exactUpdate = exactClock.tick();
+		assertEquals(durationTicks, exactUpdate.elapsedTick(), "restored duration clock does not consume another tick");
+		assertTrue(exactUpdate.enteredPhase().isEmpty(), "restored duration clock enters no extra phase");
+		assertEquals(List.of(), exactUpdate.directedEvents(), "restored duration clock dispatches no extra event");
+		assertTrue(!exactUpdate.finishedNow(), "restored duration clock does not emit a duplicate finish edge");
+
+		ScenarioSession overflowSession = runningClockSession();
+		ScenarioRuntimeClock overflowClock = ScenarioRuntimeClock.restore(
+				overflowSession,
+				new ScenarioRuntimeClock.Snapshot(1, durationTicks + 1L, 0, Optional.empty(), false)
+		);
+		assertEquals(ScenarioSessionState.FINISHED, overflowSession.state(),
+				"legacy clock beyond duration finishes during restore");
+		assertEquals(durationTicks, overflowClock.snapshot().elapsedTick(),
+				"legacy clock beyond duration clamps elapsed telemetry");
+		assertTrue(overflowClock.snapshot().finished(), "legacy overflow clock migrates to a finished snapshot");
+		ScenarioRuntimeClock.Update overflowUpdate = overflowClock.tick();
+		assertEquals(durationTicks, overflowUpdate.elapsedTick(), "restored overflow clock does not consume another tick");
+		assertTrue(overflowUpdate.enteredPhase().isEmpty(), "restored overflow clock enters no extra phase");
+		assertEquals(List.of(), overflowUpdate.directedEvents(), "restored overflow clock dispatches no extra event");
+		assertTrue(!overflowUpdate.finishedNow(), "restored overflow clock does not emit a duplicate finish edge");
+		assertEquals(Optional.of("Configured scenario duration elapsed"), overflowSession.completionReason(),
+				"legacy duration migration records the canonical finish reason");
+		return 15;
+	}
+
+	private static ScenarioSession runningClockSession() {
+		ScenarioSession session = new ScenarioSession(
+				config(ScenarioPresets.require("last-valley"), 151L, 152L, participants(2))
+		);
+		session.markReady(0L);
+		session.beginCountdown(0L);
+		session.start(0L);
+		session.pauseForRecovery(0L);
+		return session;
 	}
 
 	private static int verifyPhases() {

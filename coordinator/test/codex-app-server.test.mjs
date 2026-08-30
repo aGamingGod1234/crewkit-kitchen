@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -190,6 +190,30 @@ test('reuses a complete private desktop runtime before any Windows package disco
 	}
 });
 
+test('desktop runtime selection observes cache upgrades and rejects incomplete versions', () => {
+	const root = mkdtempSync(path.join(tmpdir(), 'arena-codex-cache-generation-'));
+	try {
+		const localAppData = path.join(root, 'Local');
+		const firstRuntime = path.join(localAppData, 'ArenaAgents', 'codex-runtime', '26.818.8289.0');
+		const upgradedRuntime = path.join(localAppData, 'ArenaAgents', 'codex-runtime', '26.819.1.0');
+		writeDesktopRuntime(firstRuntime, 'first-runtime');
+		const dependencies = {
+			platform: 'win32',
+			env: { LOCALAPPDATA: localAppData },
+			spawnSync: () => { throw new Error('complete cache must avoid package discovery'); },
+		};
+
+		assert.equal(resolveCodexLaunch(config, dependencies).command, path.join(firstRuntime, 'codex.exe'));
+		writeDesktopRuntime(upgradedRuntime, 'upgraded-runtime');
+		assert.equal(resolveCodexLaunch(config, dependencies).command, path.join(upgradedRuntime, 'codex.exe'));
+
+		unlinkSync(path.join(upgradedRuntime, 'codex-command-runner.exe'));
+		assert.equal(resolveCodexLaunch(config, dependencies).command, path.join(firstRuntime, 'codex.exe'));
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 test('reuses the user profile cache when a packaged launcher redirects LOCALAPPDATA', () => {
 	const root = mkdtempSync(path.join(tmpdir(), 'arena-codex-packaged-env-'));
 	try {
@@ -223,6 +247,8 @@ test('Codex launch retains provider configuration but strips bridge credentials'
 		env: {
 			APPDATA: 'C:\\Users\\lucas\\AppData\\Roaming',
 			PATH: 'C:\\Windows\\System32',
+			OPENAI_API_KEY: 'openai-key',
+			FISH_AUDIO_API_KEY: 'voice-key',
 			ARENA_AGENT_BRIDGE_SECRET: 'bridge-secret',
 			ARENA_AGENT_BRIDGE_SECRET_FILE: 'C:\\runtime\\bridge.secret',
 		},
@@ -230,6 +256,8 @@ test('Codex launch retains provider configuration but strips bridge credentials'
 		existsSync: () => true,
 	});
 	assert.equal(launch.environment.PATH, 'C:\\Windows\\System32');
+	assert.equal(launch.environment.OPENAI_API_KEY, 'openai-key');
+	assert.equal(launch.environment.FISH_AUDIO_API_KEY, undefined);
 	assert.equal(launch.environment.ARENA_AGENT_BRIDGE_SECRET, undefined);
 	assert.equal(launch.environment.ARENA_AGENT_BRIDGE_SECRET_FILE, undefined);
 });

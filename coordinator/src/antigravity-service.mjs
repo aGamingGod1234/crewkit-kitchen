@@ -1,4 +1,4 @@
-import { spawn as nodeSpawn } from 'node:child_process';
+import { execFile as nodeExecFile, spawn as nodeSpawn } from 'node:child_process';
 
 import { AcpProtocolError } from './acp-transport.mjs';
 import { terminateChildProcess } from './child-process-lifecycle.mjs';
@@ -26,6 +26,9 @@ const GEMINI_MODEL_REASONING = Object.freeze({
 	'gemini-3.5-flash': Object.freeze(['high', 'medium', 'low']),
 });
 
+// A non-serializable token keeps the unsafe planner path out of production configuration.
+export const ANTIGRAVITY_INTERNAL_TEST_MODE = Symbol('ANTIGRAVITY_INTERNAL_TEST_MODE');
+
 export class AntigravityProviderService {
 	#config;
 	#dependencies;
@@ -35,15 +38,24 @@ export class AntigravityProviderService {
 	#replacing = new Map();
 	#sessionGenerations = new Map();
 	#lifecycleGeneration = 0;
+	#plannerEnabled;
 
 	constructor(config, dependencies = {}) {
+		this.#plannerEnabled = config?.testOnlyMode === ANTIGRAVITY_INTERNAL_TEST_MODE;
 		this.#config = validateServiceConfig(config);
+		const environment = createProviderChildEnvironment(
+			'gemini',
+			dependencies.env ?? this.#config.environment ?? process.env,
+			this.#config.bridgeSecretEnvironmentVariable,
+		);
 		this.#dependencies = {
 			spawn: dependencies.spawn ?? nodeSpawn,
 			discoverCatalog: dependencies.discoverCatalog ?? discoverAntigravityCatalog,
-			execFile: dependencies.execFile,
+			execFile: dependencies.execFile ?? nodeExecFile,
+			environment,
 			terminate: dependencies.terminate ?? terminateChildProcess,
 			platform: dependencies.platform ?? process.platform,
+			plannerEnabled: this.#plannerEnabled,
 		};
 		this.#workspaceManager = dependencies.workspaceManager ?? null;
 		if (this.#workspaceManager !== null && typeof this.#workspaceManager.prepare !== 'function') {
@@ -57,29 +69,31 @@ export class AntigravityProviderService {
 	getAgent(agentId) { return this.#agents.get(agentId) ?? null; }
 
 	async createAgent(profileValue, { recoverySummary = null } = {}) {
+		this.#assertPlannerAvailable();
 		const lifecycleGeneration = this.#lifecycleGeneration;
-		await this.catalog.refresh();
-		assertLifecycleActive(lifecycleGeneration, this.#lifecycleGeneration);
-		const profile = validateProfile(profileValue, this.#config);
-		const replacing = this.#replacing.get(profile.agentId);
+		const requested = profileIdentity(profileValue, this.#config);
+		const replacing = this.#replacing.get(requested.agentId);
 		if (replacing !== undefined) {
-			if (!profilesMatch(replacing.profile, profile)) throw new AcpProtocolError('AGENT_PROFILE_CONFLICT', PROFILE_CONFLICT_MESSAGE);
+			if (!profilesMatch(replacing.profile, requested)) throw new AcpProtocolError('AGENT_PROFILE_CONFLICT', PROFILE_CONFLICT_MESSAGE);
 			return replacing.promise;
 		}
-		const existing = this.#agents.get(profile.agentId);
+		const existing = this.#agents.get(requested.agentId);
 		if (existing !== undefined) {
-			if (!existing.matchesProfile(profile)) {
+			if (!existing.matchesProfile(requested)) {
 				throw new AcpProtocolError('AGENT_PROFILE_CONFLICT', PROFILE_CONFLICT_MESSAGE);
 			}
 			return existing;
 		}
-		const creating = this.#creating.get(profile.agentId);
+		const creating = this.#creating.get(requested.agentId);
 		if (creating !== undefined) {
-			if (!profilesMatch(creating.profile, profile)) {
+			if (!profilesMatch(creating.profile, requested)) {
 				throw new AcpProtocolError('AGENT_PROFILE_CONFLICT', PROFILE_CONFLICT_MESSAGE);
 			}
 			return creating.promise;
 		}
+		await this.catalog.refresh();
+		assertLifecycleActive(lifecycleGeneration, this.#lifecycleGeneration);
+		const profile = validateProfile(profileValue, this.#config);
 		const promise = this.#createAgentOnce(profile, recoverySummary, lifecycleGeneration);
 		this.#creating.set(profile.agentId, { profile, promise });
 		try {
@@ -90,6 +104,7 @@ export class AntigravityProviderService {
 	}
 
 	async replaceAgent(profileValue, { recoverySummary = null, expectedSessionGeneration = null } = {}) {
+		this.#assertPlannerAvailable();
 		const lifecycleGeneration = this.#lifecycleGeneration;
 		await this.catalog.refresh();
 		assertLifecycleActive(lifecycleGeneration, this.#lifecycleGeneration);
@@ -170,6 +185,18 @@ export class AntigravityProviderService {
 
 	async reconcile(records, { signal } = {}) {
 		if (!Array.isArray(records)) throw new TypeError('gemini reconciliation records must be an array');
+		if (!this.#plannerEnabled) {
+			return {
+				valid: [],
+				invalid: records.map((profile) => ({
+					profile,
+					code: 'PROVIDER_UNAVAILABLE',
+					message: unavailablePlannerMessage(),
+				})),
+				removed: [],
+				catalog: await this.catalog.refresh(),
+			};
+		}
 		assertReconciliationActive(signal);
 		await this.catalog.refresh();
 		assertReconciliationActive(signal);
@@ -209,6 +236,14 @@ export class AntigravityProviderService {
 		this.#agents.clear();
 		await Promise.allSettled(agents.map((agent) => agent.dispose()));
 	}
+
+	#assertPlannerAvailable() {
+		if (!this.#plannerEnabled) throw new AcpProtocolError('PROVIDER_UNAVAILABLE', unavailablePlannerMessage());
+	}
+}
+
+function unavailablePlannerMessage() {
+	return 'Gemini planning is disabled because Antigravity CLI does not provide an enforceable no-tool execution boundary';
 }
 
 function assertReconciliationActive(signal) {
@@ -309,6 +344,8 @@ class AntigravityAgent {
 			if (signal?.aborted || goalRevision !== this.#goalRevision) {
 				throw new AcpProtocolError('STALE_PLAN', 'gemini result belongs to an obsolete goal');
 			}
+			this.#hasConversation = true;
+			this.#sessionState = 'warm';
 			reportVisibleOutput(onVerbose, decisionText);
 			let decision;
 			let parseError = null;
@@ -327,8 +364,6 @@ class AntigravityAgent {
 				timing: providerTiming(Math.max(0, performance.now() - turnStartedAt), null, queueWaitMs),
 			});
 			if (parseError !== null) throw parseError;
-			this.#hasConversation = true;
-			this.#sessionState = 'warm';
 			return decision;
 		} catch (error) {
 			if (!outputHandled) recordProviderTurn(turnRecorder, {
@@ -402,7 +437,8 @@ export function buildAntigravityLaunch(profile, configValue = {}, dependencies =
 		],
 		options: {
 			cwd: dependencies.cwd ?? config.cwd,
-			env: createProviderChildEnvironment(
+		env: createProviderChildEnvironment(
+				'gemini',
 				dependencies.env ?? config.environment ?? process.env,
 				config.bridgeSecretEnvironmentVariable,
 			),
@@ -524,15 +560,28 @@ class AntigravityCatalog {
 	#config;
 	#dependencies;
 	#snapshot = null;
+	#refreshPromise = null;
 
 	constructor(config, dependencies) {
 		this.#config = config;
 		this.#dependencies = dependencies;
-		this.stale = config.catalogDiscovery === true;
+		this.stale = dependencies.plannerEnabled && config.catalogDiscovery === true;
 	}
 
 	async refresh({ force = false } = {}) {
+		if (!this.#dependencies.plannerEnabled) {
+			this.stale = false;
+			return { provider: 'gemini', refreshedAtEpochMs: Date.now(), models: [] };
+		}
 		if (!force && !this.stale && this.#snapshot !== null) return structuredClone(this.#snapshot);
+		if (this.#refreshPromise !== null) return structuredClone(await this.#refreshPromise);
+		const refreshPromise = this.#refreshOnce();
+		this.#refreshPromise = refreshPromise;
+		try { return structuredClone(await refreshPromise); }
+		finally { if (this.#refreshPromise === refreshPromise) this.#refreshPromise = null; }
+	}
+
+	async #refreshOnce() {
 		let models = null;
 		let discoveryFailed = false;
 		if (this.#config.catalogDiscovery === true) {
@@ -540,13 +589,14 @@ class AntigravityCatalog {
 				models = await this.#dependencies.discoverCatalog({
 					executable: this.#config.executable,
 					execFile: this.#dependencies.execFile,
+					environment: this.#dependencies.environment,
 					timeoutMs: this.#config.catalogDiscoveryTimeoutMs,
 				});
 			} catch {
 				discoveryFailed = true;
 				if (this.#snapshot !== null) {
 					this.stale = true;
-					return structuredClone(this.#snapshot);
+					return this.#snapshot;
 				}
 			}
 		}
@@ -559,10 +609,11 @@ class AntigravityCatalog {
 			models: models.map((model) => ({ ...model, reasoningEfforts: [...model.reasoningEfforts], serviceTiers: [...(model.serviceTiers ?? [])] })),
 		};
 		this.stale = discoveryFailed;
-		return structuredClone(this.#snapshot);
+		return this.#snapshot;
 	}
 
 	assertSupported(model, reasoningEffort) {
+		if (!this.#dependencies.plannerEnabled) throw new AcpProtocolError('PROVIDER_UNAVAILABLE', unavailablePlannerMessage());
 		if (!this.#config.models.includes(model)) throw new AcpProtocolError('UNSUPPORTED_MODEL', `gemini model '${model}' is not configured`);
 		if (!this.#config.modelReasoningEfforts[model]?.includes(reasoningEffort)) {
 			throw new AcpProtocolError('UNSUPPORTED_THINKING', `gemini model '${model}' does not support thinking '${reasoningEffort}'`);
@@ -585,10 +636,11 @@ function validateServiceConfig(config) {
 		throw new TypeError('Antigravity service config must be an object');
 	}
 	if ((config.provider ?? 'gemini') !== 'gemini') throw new TypeError('Antigravity provider must be gemini');
+	const { testOnlyMode: _testOnlyMode, ...configValue } = config;
 	const models = requireStringArray(config.models ?? Object.keys(GEMINI_MODEL_REASONING), 'models');
 	const configuredEfforts = config.modelReasoningEfforts ?? GEMINI_MODEL_REASONING;
 	return {
-		...config,
+		...configValue,
 		provider: 'gemini',
 		cwd: requireText(config.cwd, 'cwd'),
 		executable: requireText(config.executable ?? DEFAULT_EXECUTABLE, 'executable'),
@@ -606,20 +658,24 @@ function validateServiceConfig(config) {
 }
 
 function validateProfile(value, config) {
-	if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('agent profile must be an object');
-	const profile = {
-		agentId: requireText(value.agentId, 'agentId'),
-		provider: value.provider ?? 'codex',
-		model: requireText(value.model, 'model'),
-		reasoningEffort: requireText(value.reasoningEffort, 'reasoningEffort'),
-		serviceTier: requireText(value.serviceTier ?? config.serviceTier ?? DEFAULT_SERVICE_TIER, 'serviceTier'),
-	};
+	const profile = profileIdentity(value, config);
 	if (profile.provider !== 'gemini') throw new AcpProtocolError('PROVIDER_MISMATCH', `Expected gemini profile, received ${profile.provider}`);
 	if (!config.models.includes(profile.model)) throw new AcpProtocolError('UNSUPPORTED_MODEL', `gemini model '${profile.model}' is not configured`);
 	if (!config.modelReasoningEfforts[profile.model]?.includes(profile.reasoningEffort)) {
 		throw new AcpProtocolError('UNSUPPORTED_THINKING', `gemini model '${profile.model}' does not support thinking '${profile.reasoningEffort}'`);
 	}
 	return profile;
+}
+
+function profileIdentity(value, config) {
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('agent profile must be an object');
+	return {
+		agentId: requireText(value.agentId, 'agentId'),
+		provider: value.provider ?? 'codex',
+		model: requireText(value.model, 'model'),
+		reasoningEffort: requireText(value.reasoningEffort, 'reasoningEffort'),
+		serviceTier: requireText(value.serviceTier ?? config.serviceTier ?? DEFAULT_SERVICE_TIER, 'serviceTier'),
+	};
 }
 
 function profilesMatch(left, right) {

@@ -64,7 +64,7 @@ import net.minecraft.world.phys.Vec3;
 
 public final class ServerActionExecutor {
 	private static final Set<ActionType> ARENA_SCRIPT_PRIMITIVES = Set.of(
-			ActionType.MOVE_TO, ActionType.NAVIGATE_TO, ActionType.LOOK_AT, ActionType.ATTACK,
+			ActionType.MOVE_TO, ActionType.NAVIGATE_TO, ActionType.CONTROL, ActionType.LOOK_AT, ActionType.ATTACK,
 			ActionType.SELECT_ITEM, ActionType.USE_ITEM, ActionType.BREAK_BLOCK, ActionType.PLACE_BLOCK,
 			ActionType.CHAT, ActionType.WAIT, ActionType.SET_DOOR, ActionType.PICK_UP_ITEM, ActionType.DROP_ITEM,
 			ActionType.TRANSFER_CONTAINER, ActionType.CRAFT_INVENTORY, ActionType.CRAFT_TABLE,
@@ -288,9 +288,33 @@ public final class ServerActionExecutor {
 		}
 	}
 
-	/** Fences and rolls back physical respawns when the coordinator session disappears. */
+	/** Fences coordinator-owned physical work when the authenticated session disappears. */
 	public synchronized void coordinatorDisconnected() {
 		coordinatorGeneration++;
+		for (ActiveAction action : new ArrayList<>(active.values())) {
+			if (!action.isControl()) continue;
+			try {
+				finishDisconnectedControl(
+						active,
+						action.request().agentId(),
+						action,
+						() -> {
+							ServerTransactionAdapter.runBestEffort(
+									() -> pendingCompletions.remove(action.request().agentId()),
+									action::neutralizeDisconnectedControl,
+									() -> releaseResourceLease(action)
+							);
+						},
+						() -> {
+							try {
+								router.actionFinished(action.request().agentId(), action.request().goalRevision());
+							} catch (AgentDomainException stale) { }
+						}
+				);
+			} catch (RuntimeException ignored) {
+				// Every neutralization step is best effort and the action has already been fenced from later ticks.
+			}
+		}
 		for (PendingRespawn pending : new ArrayList<>(pendingRespawns.values())) {
 			finishDisconnectedRespawn(
 					pendingRespawns,
@@ -300,6 +324,22 @@ public final class ServerActionExecutor {
 					() -> AgentChatReporter.respawnDisconnected(manager, pending.attempt().deadRecord())
 			);
 		}
+	}
+
+	static boolean finishDisconnectedControl(
+			Map<AgentId, ?> activeActions,
+			AgentId agentId,
+			Object action,
+			Runnable neutralize,
+			Runnable lifecycleFinish
+	) {
+		if (!activeActions.remove(agentId, action)) return false;
+		try {
+			neutralize.run();
+		} finally {
+			lifecycleFinish.run();
+		}
+		return true;
 	}
 
 	static boolean finishDisconnectedRespawn(
@@ -449,6 +489,24 @@ public final class ServerActionExecutor {
 		}
 		JsonObject arguments = request.arguments();
 		return switch (request.type()) {
+			case CONTROL -> ActiveAction.control(
+					request,
+					player,
+					new AgentInputState(
+							(float) number(arguments, "forward"),
+							(float) number(arguments, "strafe"),
+							bool(arguments, "jump"),
+							bool(arguments, "sneak"),
+							bool(arguments, "sprint"),
+							bool(arguments, "attack"),
+							bool(arguments, "use"),
+							(float) number(arguments, "yaw"),
+							(float) number(arguments, "pitch"),
+							integer(arguments, "selectedSlot"),
+							hand(arguments)
+					),
+					integer(arguments, "ticks")
+			);
 			case MOVE_TO, NAVIGATE_TO -> ActiveAction.controller(
 					request,
 					player,
@@ -1393,7 +1451,7 @@ public final class ServerActionExecutor {
 		}
 	}
 
-	private static InteractionHand hand(JsonObject arguments) {
+	static InteractionHand hand(JsonObject arguments) {
 		return switch (string(arguments, "hand")) {
 			case "main" -> InteractionHand.MAIN_HAND;
 			case "off" -> InteractionHand.OFF_HAND;
@@ -1517,7 +1575,7 @@ public final class ServerActionExecutor {
 	}
 
 	private static final class ActiveAction {
-		private enum Mode { IMMEDIATE, MOVE, USE, BREAK, PLACE, WAIT, CONTROLLER, TRANSACTION }
+		private enum Mode { IMMEDIATE, CONTROL, MOVE, USE, BREAK, PLACE, WAIT, CONTROLLER, TRANSACTION }
 
 		private final ServerActionRequest request;
 		private final ServerPlayer player;
@@ -1547,6 +1605,9 @@ public final class ServerActionExecutor {
 		private boolean physicalAttempted;
 		private double lastProgress;
 		private InputLease inputLease;
+		private AgentInputState controlState;
+		private int controlDurationTicks;
+		private int controlElapsedTicks;
 
 		private ActiveAction(
 				ServerActionRequest request,
@@ -1578,6 +1639,23 @@ public final class ServerActionExecutor {
 
 		static ActiveAction immediate(ServerActionRequest request, ServerPlayer player, Runnable operation) {
 			return new ActiveAction(request, player, Mode.IMMEDIATE, DEFAULT_TIMEOUT_MS, operation, null, 0.0D, false, null);
+		}
+
+		static ActiveAction control(
+				ServerActionRequest request,
+				ServerPlayer player,
+				AgentInputState state,
+				int durationTicks
+		) {
+			ActiveAction action = new ActiveAction(
+					request, player, Mode.CONTROL, DEFAULT_TIMEOUT_MS, null, null, 0.0D, false, null
+			);
+			action.controlState = Objects.requireNonNull(state, "control state must not be null");
+			if (durationTicks < 1 || durationTicks > 200) {
+				throw new IllegalArgumentException("control duration must be 1..200 ticks");
+			}
+			action.controlDurationTicks = durationTicks;
+			return action;
 		}
 
 		static ActiveAction move(
@@ -1698,6 +1776,11 @@ public final class ServerActionExecutor {
 						physicalAttempted = true;
 						immediate.run();
 					}
+					case CONTROL -> {
+						physicalAttempted = true;
+						applyControlInput();
+						return null;
+					}
 					case MOVE -> {
 						physicalAttempted = true;
 						applyLookingInput(InputOwner.NAVIGATION, 100, destination, 1.0F, true, false, false);
@@ -1725,7 +1808,16 @@ public final class ServerActionExecutor {
 				if (mode == Mode.IMMEDIATE) return result(ServerActionState.SUCCEEDED, "ACTION_COMPLETED", "Action completed", now);
 			}
 
-			if (mode == Mode.MOVE) {
+			if (mode == Mode.CONTROL) {
+				physicalAttempted = true;
+				applyControlInput();
+				controlElapsedTicks++;
+				lastProgress = (double) controlElapsedTicks / controlDurationTicks;
+				if (controlElapsedTicks >= controlDurationTicks) {
+					return result(ServerActionState.SUCCEEDED, "CONTROL_SEGMENT_COMPLETED", "Control segment completed", now);
+				}
+				return null;
+			} else if (mode == Mode.MOVE) {
 				double distance = player.position().distanceTo(destination);
 				lastProgress = progress.progress(distance);
 				physicalAttempted = true;
@@ -1895,6 +1987,25 @@ public final class ServerActionExecutor {
 					0.0F, 0.0F, false, player.isShiftKeyDown(), player.isSprinting(), attack, use,
 					player.getYRot(), player.getXRot(), player.getInventory().getSelectedSlot(), InteractionHand.MAIN_HAND
 			));
+		}
+
+		boolean isControl() {
+			return mode == Mode.CONTROL;
+		}
+
+		void neutralizeDisconnectedControl() {
+			ServerTransactionAdapter.runBestEffort(
+					this::releaseInput,
+					() -> AgentInputRuntime.clear(player),
+					() -> OfflineAgentPlayers.actions(player).stopAll(),
+					player::stopUsingItem
+			);
+		}
+
+		private void applyControlInput() {
+			LeasedServerInputController input = AgentInputRuntime.controller(player);
+			if (inputLease == null) inputLease = input.acquire(request.agentId(), InputOwner.DIRECT_CONTROL, 250);
+			input.apply(inputLease, controlState);
 		}
 
 		private void releaseInput() {

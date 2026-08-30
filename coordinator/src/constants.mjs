@@ -43,6 +43,7 @@ export const TERMINAL_ACTION_STATES = Object.freeze([
 
 export const ACTION_FIELDS = Object.freeze({
 	move_to: Object.freeze(['x', 'y', 'z', 'tolerance', 'sprint']),
+	control: Object.freeze(['forward', 'strafe', 'jump', 'sneak', 'sprint', 'attack', 'use', 'yaw', 'pitch', 'selectedSlot', 'hand', 'ticks']),
 	look_at: Object.freeze(['x', 'y', 'z']),
 	attack: Object.freeze(['targetId', 'timeoutMs']),
 	select_item: Object.freeze(['itemId']),

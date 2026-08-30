@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { HeadlessRconClient } from './headless-rcon.mjs';
 import { sanitizeDiagnosticErrorStack, sanitizeDiagnosticText, sanitizeDiagnosticValue } from './diagnostic-sanitizer.mjs';
 
-const PROVIDERS = new Set(['codex', 'gemini', 'kimi', 'cursor']);
+const PROVIDERS = new Set(['codex', 'kimi', 'cursor']);
 const MAX_TIMEOUT_MS = 900_000;
 const MAX_DIAGNOSTICS = 4096;
 const MAX_TEXT = 4096;
@@ -378,14 +378,12 @@ async function runConcurrentHeadlessScenario({
 		started: false,
 	}));
 	const commands = [];
-	const rconEvidence = [];
 	const command = async (value, { readOnly = false, deadlineMs = deadline, attempt = 0 } = {}) => {
 		const commandText = String(value);
 		if (readOnly && !isReadOnlyRcon(commandText)) throw new Error(`RCON assertion command is not read-only: ${commandText}`);
 		commands.push(commandText);
 		const result = await withDeadline(() => rcon.command(commandText), deadlineMs, () => logicalNow(now, startedAt, attempt), 'HEADLESS_TIMEOUT');
 		const textValue = boundedText(result?.text ?? result, MAX_EVIDENCE_BYTES);
-		if (readOnly) rconEvidence.push({ command: commandText, text: textValue });
 		return { result, text: textValue };
 	};
 	try {
@@ -464,7 +462,7 @@ async function runConcurrentHeadlessScenario({
 		try { minecraftMspt = parseMinecraftMspt((await command('tick query')).text); } catch { /* optional server metric */ }
 		const evidenceResult = await collectConcurrentHeadlessEvidence({
 			members, directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets, protocolAuditOffset,
-			assertions, rconEvidence, readOnlyCommand: (value) => command(value, { readOnly: true }), deadline, now, startedAt, poll,
+			assertions, readOnlyCommand: (value) => command(value, { readOnly: true }), deadline, now, startedAt, poll,
 		});
 		const exactAgentIds = members.map((member) => member.agentId).filter(Boolean);
 		const aggregateEvidence = isolateRosterFileEvidence(evidenceResult.fileEvidence, members);
@@ -490,17 +488,24 @@ async function runConcurrentHeadlessScenario({
 				diagnostics: member.diagnostics,
 			});
 		});
+		const factualAssertionCount = assertions.filter((assertion) => assertion.type === 'rcon').length;
+		const factualSuccess = factualAssertionCount > 0 && members.every((member) => {
+			const results = evidenceResult.byAgent.get(member.agentId)?.assertionResult.results
+				.filter((assertion) => assertion.type === 'rcon') ?? [];
+			return results.length === factualAssertionCount && results.every((assertion) => assertion.passed);
+		});
 		const failed = agentReports.some((member) => member.status === 'FAILED');
 		const skipped = agentReports.some((member) => member.status === 'SKIPPED');
 		const passed = agentReports.some((member) => member.status === 'PASSED');
-		const status = failed || skipped ? 'FAILED' : passed ? 'PASSED' : 'FAILED';
+		const factualFailure = scenario.requireFactualSuccess && !factualSuccess;
+		const status = failed || skipped || factualFailure ? 'FAILED' : passed ? 'PASSED' : 'FAILED';
 		const classification = failed
 			? (agentReports.some((member) => member.classification === 'ASSERTION_MISMATCH') ? 'ASSERTION_MISMATCH' : 'ERROR')
-			: skipped ? 'SKIPPED_PROFILE' : passed ? 'PASSED' : 'ERROR';
+			: skipped ? 'SKIPPED_PROFILE' : factualFailure ? 'FAILED_USER_OBJECTIVE' : passed ? 'PASSED' : 'ERROR';
 		const elapsedMs = Math.max(0, Number(now()) - startedAt);
 		let report = scenarioReport(status, scenario, {
 			classification, lifecycle: members.every((member) => member.lifecycle === 'COMPLETED') ? 'COMPLETED' : null,
-			elapsedMs, commands, agents: agentReports,
+			elapsedMs, commands, agents: agentReports, factualSuccess,
 			evidence: evidenceSummary(directory, evidenceResult.fileEvidence, protocolAudit),
 			timings: timingSummary(profile, aggregateEvidence, aggregateAudit, elapsedMs),
 			metrics: performanceMetrics(profile, aggregateEvidence, aggregateAudit, exactAgentIds, { minecraftMspt }),
@@ -829,12 +834,21 @@ function boundedAgentId(value) {
 	return typeof value === 'string' && value.length > 0 && value.length <= 128 && !/[\u0000-\u001f\u007f]/.test(value) ? value : null;
 }
 
-async function collectConcurrentHeadlessEvidence({ members, directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets, protocolAuditOffset, assertions, rconEvidence, readOnlyCommand, deadline, now, startedAt, poll }) {
-	for (const assertion of assertions) {
-		if (assertion.type !== 'rcon' || logicalNow(now, startedAt, 0) >= deadline) continue;
-		try { await withDeadline(() => readOnlyCommand(assertion.command), deadline, () => logicalNow(now, startedAt, 0), 'HEADLESS_TIMEOUT'); }
-		catch (error) { if (error?.code !== 'HEADLESS_TIMEOUT') throw error; }
-	}
+async function collectConcurrentHeadlessEvidence({ members, directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets, protocolAuditOffset, assertions, readOnlyCommand, deadline, now, startedAt, poll }) {
+	const rconEvidenceByAgent = new Map();
+	await Promise.all(members.filter((member) => member.agentId !== null).map(async (member) => {
+		const evidence = [];
+		rconEvidenceByAgent.set(member.agentId, evidence);
+		for (const assertion of resolveAgentAssertions(assertions, member.generatedName)) {
+			if (assertion.type !== 'rcon' || logicalNow(now, startedAt, 0) >= deadline) continue;
+			try {
+				const result = await withDeadline(() => readOnlyCommand(assertion.command), deadline, () => logicalNow(now, startedAt, 0), 'HEADLESS_TIMEOUT');
+				evidence.push({ command: assertion.command, text: result.text });
+			} catch (error) {
+				if (error?.code !== 'HEADLESS_TIMEOUT') throw error;
+			}
+		}
+	}));
 	let attempt = 0;
 	const currentAudit = () => auditRows(protocolAudit).slice(protocolAuditOffset);
 	let fileEvidence;
@@ -845,8 +859,9 @@ async function collectConcurrentHeadlessEvidence({ members, directory, readFile,
 		for (const member of members.filter((entry) => entry.agentId !== null)) {
 			const isolated = isolateFileEvidence(fileEvidence, member.agentId, member.generatedName);
 			const audit = currentAudit().filter((row) => rowMatchesAgent(row, member.agentId));
-			const evidence = makeEvidence({ terminalState: member.lifecycle, protocolAudit: audit, ...isolated, rcon: rconEvidence });
-			byAgent.set(member.agentId, { fileEvidence: isolated, evidence, assertionResult: evaluateHeadlessAssertions(assertions, evidence) });
+			const evidence = makeEvidence({ terminalState: member.lifecycle, protocolAudit: audit, ...isolated, rcon: rconEvidenceByAgent.get(member.agentId) ?? [] });
+			const resolvedAssertions = resolveAgentAssertions(assertions, member.generatedName);
+			byAgent.set(member.agentId, { fileEvidence: isolated, evidence, assertionResult: evaluateHeadlessAssertions(resolvedAssertions, evidence) });
 		}
 	};
 	await evaluate();

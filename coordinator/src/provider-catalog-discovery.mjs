@@ -31,14 +31,15 @@ export function parseAntigravityModelsOutput(output) {
 	return [...models.values()];
 }
 
-export async function discoverAntigravityCatalog({ executable = 'agy', execFile = nodeExecFile, timeoutMs = DEFAULT_DISCOVERY_TIMEOUT_MS } = {}) {
+export async function discoverAntigravityCatalog({ executable = 'agy', execFile = nodeExecFile, environment, timeoutMs = DEFAULT_DISCOVERY_TIMEOUT_MS } = {}) {
+	const childEnvironment = requireEnvironment(environment);
 	if (execFile === nodeExecFile) {
-		const result = spawnSync(executable, ['models'], { encoding: 'utf8', timeout: timeoutMs, windowsHide: true, maxBuffer: 1_024 * 1_024 });
+		const result = spawnSync(executable, ['models'], { encoding: 'utf8', timeout: timeoutMs, windowsHide: true, maxBuffer: 1_024 * 1_024, env: childEnvironment });
 		if (result.error !== undefined) throw new Error(`Provider model discovery failed (${result.error.code ?? 'command_error'})`);
 		if (result.status !== 0) throw new Error(`Provider model discovery failed (exit_${result.status})`);
 		return parseAntigravityModelsOutput(result.stdout);
 	}
-	const result = await runExecFile(execFile, executable, ['models'], timeoutMs);
+	const result = await runExecFile(execFile, executable, ['models'], timeoutMs, childEnvironment);
 	return parseAntigravityModelsOutput(result.stdout);
 }
 
@@ -81,8 +82,8 @@ function firstDisplayName(camelCase, snakeCase, fallback) {
 	return fallback;
 }
 
-export async function discoverKimiCatalog({ executable = 'kimi', execFile = nodeExecFile, timeoutMs = DEFAULT_DISCOVERY_TIMEOUT_MS } = {}) {
-	const result = await runExecFile(execFile, executable, ['provider', 'list', '--json'], timeoutMs);
+export async function discoverKimiCatalog({ executable = 'kimi', execFile = nodeExecFile, environment, timeoutMs = DEFAULT_DISCOVERY_TIMEOUT_MS } = {}) {
+	const result = await runExecFile(execFile, executable, ['provider', 'list', '--json'], timeoutMs, requireEnvironment(environment));
 	let document;
 	try {
 		document = JSON.parse(result.stdout);
@@ -107,10 +108,10 @@ function baseModelId(wireId, effort, displayName) {
 	return wireId.endsWith(suffix) ? wireId.slice(0, -suffix.length) : wireId;
 }
 
-function runExecFile(execFile, command, args, timeoutMs) {
+function runExecFile(execFile, command, args, timeoutMs, environment) {
 	return new Promise((resolve, reject) => {
 		try {
-			execFile(command, args, { timeout: timeoutMs, windowsHide: true, maxBuffer: 1_024 * 1_024 }, (error, stdout) => {
+			execFile(command, args, { timeout: timeoutMs, windowsHide: true, maxBuffer: 1_024 * 1_024, env: environment }, (error, stdout) => {
 				if (error !== null && error !== undefined) {
 					const wrapped = new Error(`Provider model discovery failed (${error.code ?? 'command_error'})`);
 					wrapped.code = error.code ?? 'DISCOVERY_FAILED';
@@ -123,4 +124,11 @@ function runExecFile(execFile, command, args, timeoutMs) {
 			reject(error);
 		}
 	});
+}
+
+function requireEnvironment(environment) {
+	if (environment === null || typeof environment !== 'object' || Array.isArray(environment)) {
+		throw new TypeError('provider catalog environment must be an object');
+	}
+	return environment;
 }

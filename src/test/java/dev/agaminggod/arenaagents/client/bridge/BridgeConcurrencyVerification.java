@@ -6,19 +6,13 @@ import dev.agaminggod.arenaagents.client.config.AgentConfig;
 import dev.agaminggod.arenaagents.protocol.ProtocolCodec;
 import dev.agaminggod.arenaagents.protocol.ProtocolException;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.io.PipedInputStream;
-import java.io.PipedOutputStream;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.net.SocketAddress;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -47,11 +41,7 @@ public final class BridgeConcurrencyVerification {
 				);
 				try {
 					session.start();
-					codec.writeLine(
-							client.getOutputStream(),
-							"{\"protocolVersion\":1,\"agentId\":\"" + config.agentId()
-									+ "\",\"type\":\"hello\",\"messageId\":\"ordered-hello\"}"
-					);
+					AuthenticationAttempt attempt = respondToChallenge(client, config, codec, "ordered-response");
 					outbound.awaitFirstOffer();
 
 					AtomicReference<Throwable> prematureSend = new AtomicReference<>();
@@ -76,8 +66,9 @@ public final class BridgeConcurrencyVerification {
 
 					outbound.releaseFirstOffer();
 					JsonObject acknowledgement = readMessage(client, codec);
+					verifyAcknowledgement(acknowledgement, config, attempt);
 					if (!"hello_ack".equals(acknowledgement.get("type").getAsString())) {
-						throw new AssertionError("hello acknowledgement was not the first outbound frame");
+						throw new AssertionError("mutual authentication acknowledgement was not received");
 					}
 					String eventId = session.sendEvent("significant_event", null);
 					JsonObject event = readMessage(client, codec);
@@ -96,16 +87,18 @@ public final class BridgeConcurrencyVerification {
 			AgentConfig config,
 			ProtocolCodec codec
 	) throws Exception {
-		BlockingSocket socket = new BlockingSocket();
 		CountDownLatch callbackStarted = new CountDownLatch(1);
 		CountDownLatch callbackCompleted = new CountDownLatch(1);
 		AtomicReference<Thread> callbackThread = new AtomicReference<>();
 		AtomicReference<Throwable> callbackEscape = new AtomicReference<>();
-		BridgeSession session = new BridgeSession(
-				config,
-				socket,
-				codec,
-				task -> callbackThread.set(Thread.ofPlatform()
+		try (ServerSocket listener = new ServerSocket()) {
+			listener.bind(new InetSocketAddress("127.0.0.1", config.bridgePort()));
+			try (Socket client = openClient(config.bridgePort()); Socket accepted = listener.accept()) {
+				BridgeSession session = new BridgeSession(
+						config,
+						accepted,
+						codec,
+						task -> callbackThread.set(Thread.ofPlatform()
 						.name("arenaagents-verification-blocked-output-callback")
 						.daemon(true)
 						.start(() -> {
@@ -117,42 +110,38 @@ public final class BridgeConcurrencyVerification {
 								callbackCompleted.countDown();
 							}
 						})),
-				command -> {
+						command -> {
 					callbackStarted.countDown();
 					throw new IllegalStateException("callback failed");
-				},
-				() -> { }
-		);
-		try {
-			session.start();
-			codec.writeLine(
-					socket.peerInput(),
-					"{\"protocolVersion\":1,\"agentId\":\"" + config.agentId()
-							+ "\",\"type\":\"hello\",\"messageId\":\"blocked-output-hello\"}"
-			);
-			socket.awaitOutputWrite();
-			codec.writeLine(
-					socket.peerInput(),
-					"{\"protocolVersion\":1,\"agentId\":\"" + config.agentId()
-							+ "\",\"type\":\"action_command\",\"messageId\":\"blocked-output-action\","
-							+ "\"command\":{\"protocolVersion\":1,\"commandId\":\"blocked-output-command\","
-							+ "\"type\":\"wait\",\"issuedAtEpochMs\":1,\"durationMs\":1}}"
-			);
-			awaitLatch(callbackStarted, "failing callback did not begin");
-			awaitLatch(callbackCompleted, "callback failure waited for blocked output");
-			if (!socket.isClosed()) {
-				throw new AssertionError("callback failure did not close the socket");
+						},
+						() -> { }
+				);
+				try {
+					session.start();
+					authenticate(client, config, codec, "callback-response");
+					codec.writeLine(
+							client.getOutputStream(),
+							"{\"protocolVersion\":1,\"agentId\":\"" + config.agentId()
+									+ "\",\"type\":\"action_command\",\"messageId\":\"blocked-output-action\","
+									+ "\"command\":{\"protocolVersion\":1,\"commandId\":\"blocked-output-command\","
+									+ "\"type\":\"wait\",\"issuedAtEpochMs\":1,\"durationMs\":1}}"
+					);
+					awaitLatch(callbackStarted, "failing callback did not begin");
+					awaitLatch(callbackCompleted, "callback failure did not complete");
+					if (!accepted.isClosed()) {
+						throw new AssertionError("callback failure did not close the socket");
+					}
+					if (callbackEscape.get() != null) {
+						throw new AssertionError("callback failure escaped its executor", callbackEscape.get());
+					}
+				} finally {
+					session.close();
+					Thread thread = callbackThread.get();
+					if (thread != null) {
+						thread.join(SOCKET_TIMEOUT_MS);
+					}
+				}
 			}
-			if (callbackEscape.get() != null) {
-				throw new AssertionError("callback failure escaped its executor", callbackEscape.get());
-			}
-		} finally {
-			session.close();
-			Thread thread = callbackThread.get();
-			if (thread != null) {
-				thread.join(SOCKET_TIMEOUT_MS);
-			}
-			socket.close();
 		}
 	}
 
@@ -184,12 +173,7 @@ public final class BridgeConcurrencyVerification {
 				sessionReference.set(session);
 				try {
 					session.start();
-					codec.writeLine(
-							client.getOutputStream(),
-							"{\"protocolVersion\":1,\"agentId\":\"" + config.agentId()
-									+ "\",\"type\":\"hello\",\"messageId\":\"overflow-hello\"}"
-					);
-					readMessage(client, codec);
+					authenticate(client, config, codec, "overflow-response");
 
 					AtomicReference<Throwable> overflowFailure = new AtomicReference<>();
 					Thread overflowingSender = Thread.ofPlatform()
@@ -267,7 +251,7 @@ public final class BridgeConcurrencyVerification {
 			}
 			releaseAdmission.countDown();
 
-			if (receivesHelloAcknowledgement(client, config, codec)) {
+			if (receivesHelloAcknowledgement(client, codec)) {
 				throw new AssertionError("session admitted and acknowledged hello after server close");
 			}
 			awaitCondition(
@@ -286,6 +270,62 @@ public final class BridgeConcurrencyVerification {
 			server.close();
 			if (closeThread != null) {
 				closeThread.join(SOCKET_TIMEOUT_MS);
+			}
+		}
+	}
+
+	public static void verifyMutualAuthenticationRejectsReplayAndImpostor(AgentConfig config, ProtocolCodec codec)
+			throws Exception {
+		String replay;
+		int replaySourcePort = config.bridgePort();
+		try (BridgeServer server = new BridgeServer(config, codec, Runnable::run, command -> { })) {
+			server.start();
+			try (Socket client = openClient(replaySourcePort)) {
+				JsonObject challenge = readMessage(client, codec);
+				replay = responseForChallenge(challenge, config, "replay-response", BridgeAuthentication.newNonce());
+				codec.writeLine(client.getOutputStream(), replay);
+				verifyAcknowledgement(readMessage(client, codec), config, attemptFromChallenge(challenge, "replay-response", replay));
+			}
+		}
+
+		int replayTargetPort;
+		try (ServerSocket reservation = new ServerSocket()) {
+			reservation.bind(new InetSocketAddress("127.0.0.1", 0));
+			replayTargetPort = reservation.getLocalPort();
+		}
+		AgentConfig replayConfig = new AgentConfig(
+				config.agentId(), replayTargetPort, config.observationRadius(), true, config.bridgeSecret()
+		);
+		try (BridgeServer server = new BridgeServer(replayConfig, codec, Runnable::run, command -> { })) {
+			server.start();
+			try (Socket client = openClient(replayTargetPort)) {
+				readMessage(client, codec);
+				codec.writeLine(client.getOutputStream(), replay);
+				assertErrorCode(readMessage(client, codec), "AUTHENTICATION_FAILED", "replayed response is rejected");
+			}
+		}
+
+		int impostorPort;
+		try (ServerSocket reservation = new ServerSocket()) {
+			reservation.bind(new InetSocketAddress("127.0.0.1", 0));
+			impostorPort = reservation.getLocalPort();
+		}
+		AgentConfig impostorConfig = new AgentConfig(
+				config.agentId(), impostorPort, config.observationRadius(), true, config.bridgeSecret()
+		);
+		try (BridgeServer server = new BridgeServer(impostorConfig, codec, Runnable::run, command -> { })) {
+			server.start();
+			try (Socket client = openClient(impostorPort)) {
+				JsonObject challenge = readMessage(client, codec);
+				String impostorResponse = responseForChallenge(
+						challenge,
+						new AgentConfig(config.agentId(), impostorPort, config.observationRadius(), true,
+								"impostor-bridge-secret-0123456789"),
+						"impostor-response",
+						BridgeAuthentication.newNonce()
+				);
+				codec.writeLine(client.getOutputStream(), impostorResponse);
+				assertErrorCode(readMessage(client, codec), "AUTHENTICATION_FAILED", "impostor proof is rejected");
 			}
 		}
 	}
@@ -350,17 +390,86 @@ public final class BridgeConcurrencyVerification {
 		return JsonParser.parseString(line).getAsJsonObject();
 	}
 
-	private static boolean receivesHelloAcknowledgement(
+	private static JsonObject authenticate(Socket client, AgentConfig config, ProtocolCodec codec, String responseId)
+			throws IOException {
+		AuthenticationAttempt attempt = respondToChallenge(client, config, codec, responseId);
+		JsonObject acknowledgement = readMessage(client, codec);
+		verifyAcknowledgement(acknowledgement, config, attempt);
+		return acknowledgement;
+	}
+
+	private static AuthenticationAttempt respondToChallenge(
 			Socket client,
 			AgentConfig config,
+			ProtocolCodec codec,
+			String responseId
+	) throws IOException {
+		JsonObject challenge = readMessage(client, codec);
+		String coordinatorNonce = BridgeAuthentication.newNonce();
+		String response = responseForChallenge(challenge, config, responseId, coordinatorNonce);
+		codec.writeLine(client.getOutputStream(), response);
+		return attemptFromChallenge(challenge, responseId, response);
+	}
+
+	private static String responseForChallenge(
+			JsonObject challenge,
+			AgentConfig config,
+			String responseId,
+			String coordinatorNonce
+	) {
+		if (!"hello_challenge".equals(challenge.get("type").getAsString())) {
+			throw new AssertionError("bridge did not issue an authentication challenge");
+		}
+		String challengeId = challenge.get("messageId").getAsString();
+		String bridgeNonce = challenge.get("nonce").getAsString();
+		return "{\"protocolVersion\":1,\"agentId\":\"" + config.agentId()
+				+ "\",\"type\":\"hello_response\",\"messageId\":\"" + responseId
+				+ "\",\"challenge\":\"" + bridgeNonce + "\",\"nonce\":\"" + coordinatorNonce
+				+ "\",\"proof\":\"" + BridgeAuthentication.coordinatorProof(
+						config.bridgeSecret(), config.agentId(), challengeId, responseId, bridgeNonce, coordinatorNonce
+				) + "\"}";
+	}
+
+	private static AuthenticationAttempt attemptFromChallenge(JsonObject challenge, String responseId, String response) {
+		String bridgeNonce = challenge.get("nonce").getAsString();
+		JsonObject responseObject = JsonParser.parseString(response).getAsJsonObject();
+		return new AuthenticationAttempt(
+				challenge.get("messageId").getAsString(), responseId, bridgeNonce, responseObject.get("nonce").getAsString()
+		);
+	}
+
+	private static void verifyAcknowledgement(JsonObject acknowledgement, AgentConfig config, AuthenticationAttempt attempt) {
+		if (!"hello_ack".equals(acknowledgement.get("type").getAsString())) {
+			throw new AssertionError("bridge did not complete mutual authentication");
+		}
+		if (!attempt.responseMessageId().equals(acknowledgement.get("replyTo").getAsString())) {
+			throw new AssertionError("bridge acknowledgement did not bind the coordinator response");
+		}
+		String expected = BridgeAuthentication.bridgeProof(
+				config.bridgeSecret(),
+				config.agentId(),
+				attempt.challengeMessageId(),
+				attempt.responseMessageId(),
+				attempt.bridgeNonce(),
+				attempt.coordinatorNonce()
+		);
+		if (!BridgeAuthentication.proofsMatch(expected, acknowledgement.get("proof").getAsString())) {
+			throw new AssertionError("bridge acknowledgement proof did not authenticate the bridge");
+		}
+	}
+
+	private static void assertErrorCode(JsonObject response, String expectedCode, String label) {
+		if (!"error".equals(response.get("type").getAsString())
+				|| !expectedCode.equals(response.get("code").getAsString())) {
+			throw new AssertionError(label + ": expected " + expectedCode + " error");
+		}
+	}
+
+	private static boolean receivesHelloAcknowledgement(
+			Socket client,
 			ProtocolCodec codec
 	) {
 		try {
-			codec.writeLine(
-					client.getOutputStream(),
-					"{\"protocolVersion\":1,\"agentId\":\"" + config.agentId()
-							+ "\",\"type\":\"hello\",\"messageId\":\"close-race-hello\"}"
-			);
 			String line = codec.readLine(client.getInputStream());
 			if (line == null) {
 				return false;
@@ -399,16 +508,24 @@ public final class BridgeConcurrencyVerification {
 		boolean getAsBoolean();
 	}
 
+	private record AuthenticationAttempt(
+			String challengeMessageId,
+			String responseMessageId,
+			String bridgeNonce,
+			String coordinatorNonce
+	) {
+	}
+
 	private static final class BlockingFirstOfferQueue extends LinkedBlockingQueue<String> {
 		private static final long serialVersionUID = 1L;
 
 		private final CountDownLatch firstOfferEntered = new CountDownLatch(1);
 		private final CountDownLatch releaseFirstOffer = new CountDownLatch(1);
-		private final AtomicBoolean blockFirstOffer = new AtomicBoolean(true);
+		private final AtomicInteger offerCount = new AtomicInteger();
 
 		@Override
 		public boolean offer(String message) {
-			if (blockFirstOffer.compareAndSet(true, false)) {
+			if (offerCount.incrementAndGet() == 2) {
 				firstOfferEntered.countDown();
 				awaitFirstOfferRelease();
 			}
@@ -454,7 +571,7 @@ public final class BridgeConcurrencyVerification {
 
 		@Override
 		public boolean offer(String message) {
-			if (offerCount.incrementAndGet() == 2) {
+			if (offerCount.incrementAndGet() == 3) {
 				overflowOfferEntered.countDown();
 				awaitUninterruptibly(releaseOverflowOffer);
 				return false;
@@ -468,108 +585,6 @@ public final class BridgeConcurrencyVerification {
 
 		private void releaseOverflowOffer() {
 			releaseOverflowOffer.countDown();
-		}
-	}
-
-	private static final class BlockingSocket extends Socket {
-		private static final int REMOTE_PORT = 24_731;
-
-		private final PipedInputStream input = new PipedInputStream();
-		private final PipedOutputStream peerInput;
-		private final BlockingOutputStream output = new BlockingOutputStream();
-		private final AtomicBoolean closed = new AtomicBoolean();
-
-		private BlockingSocket() throws IOException {
-			peerInput = new PipedOutputStream(input);
-		}
-
-		@Override
-		public SocketAddress getRemoteSocketAddress() {
-			return new InetSocketAddress("127.0.0.1", REMOTE_PORT);
-		}
-
-		@Override
-		public void setTcpNoDelay(boolean enabled) {
-			// This controlled socket has no TCP transport to configure.
-		}
-
-		@Override
-		public void setSoTimeout(int timeout) {
-			// Blocking behavior is controlled explicitly by the test streams.
-		}
-
-		@Override
-		public InputStream getInputStream() {
-			return input;
-		}
-
-		@Override
-		public OutputStream getOutputStream() {
-			return output;
-		}
-
-		private OutputStream peerInput() {
-			return peerInput;
-		}
-
-		private void awaitOutputWrite() throws InterruptedException {
-			awaitLatch(output.writeEntered(), "writer did not block on controlled output");
-		}
-
-		@Override
-		public boolean isClosed() {
-			return closed.get();
-		}
-
-		@Override
-		public void close() throws IOException {
-			if (!closed.compareAndSet(false, true)) {
-				return;
-			}
-			output.close();
-			IOException failure = null;
-			try {
-				peerInput.close();
-			} catch (IOException exception) {
-				failure = exception;
-			}
-			try {
-				input.close();
-			} catch (IOException exception) {
-				if (failure == null) {
-					failure = exception;
-				} else {
-					failure.addSuppressed(exception);
-				}
-			}
-			if (failure != null) {
-				throw failure;
-			}
-		}
-	}
-
-	private static final class BlockingOutputStream extends OutputStream {
-		private final CountDownLatch writeEntered = new CountDownLatch(1);
-		private final CountDownLatch releaseWrite = new CountDownLatch(1);
-		private final AtomicBoolean closed = new AtomicBoolean();
-
-		@Override
-		public void write(int value) throws IOException {
-			writeEntered.countDown();
-			awaitUninterruptibly(releaseWrite);
-			if (closed.get()) {
-				throw new IOException("controlled output is closed");
-			}
-		}
-
-		private CountDownLatch writeEntered() {
-			return writeEntered;
-		}
-
-		@Override
-		public void close() {
-			closed.set(true);
-			releaseWrite.countDown();
 		}
 	}
 

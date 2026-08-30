@@ -102,11 +102,74 @@ test('Codex catalog fallback contains only the configured exact launch profile',
 	}, { transport });
 	await service.start();
 	try {
+		assert.equal(transport.calls.some(({ method }) => method === 'model/list'), false);
 		const snapshot = service.catalog.snapshot();
 		assert.equal(snapshot.source, 'builtin');
 		assert.deepEqual(snapshot.models.map(({ id, reasoningEfforts, serviceTiers }) => ({ id, reasoningEfforts, serviceTiers })), [{
 			id: 'gpt-5.6-terra', reasoningEfforts: ['xhigh'], serviceTiers: ['priority'],
 		}]);
+	} finally {
+		await service.stop();
+	}
+});
+
+test('configured Codex profile creates a thread without waiting for live catalog discovery', async () => {
+	const transport = new FakeSharedTransport();
+	let catalogRequested = false;
+	transport.request = async (method, params, options) => {
+		transport.calls.push({ method, params, options });
+		if (method === 'initialize') return { userAgent: 'fake' };
+		if (method === 'model/list') {
+			catalogRequested = true;
+			return new Promise(() => {});
+		}
+		if (method === 'thread/start') return { thread: { id: 'thread-fast-start' } };
+		throw new Error(`Unexpected method ${method}`);
+	};
+	const service = new CodexService({
+		cwd: 'C:\\workspace',
+		launchProfile: { model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' },
+	}, { transport });
+	try {
+		const agent = await service.createAgent(profile('configured-fast-start'));
+		const bootstrapped = await service.bootstrapCatalog([profile('configured-fast-start')]);
+		const reconciled = await service.reconcile([profile('configured-fast-start')]);
+		assert.equal(agent.agentId, 'configured-fast-start');
+		assert.equal(bootstrapped.source, 'builtin');
+		assert.deepEqual(reconciled.valid.map(({ agentId }) => agentId), ['configured-fast-start']);
+		assert.equal(catalogRequested, false);
+		assert.equal(transport.calls.some(({ method }) => method === 'thread/start'), true);
+	} finally {
+		await service.stop();
+	}
+});
+
+test('live discovery cannot evict the exact configured Codex launch profile', async () => {
+	const transport = new FakeSharedTransport();
+	transport.request = async (method, params, options) => {
+		transport.calls.push({ method, params, options });
+		if (method === 'initialize') return { userAgent: 'fake' };
+		if (method === 'model/list') return {
+			data: [{
+				id: 'gpt-other', model: 'gpt-other',
+				supportedReasoningEfforts: [{ reasoningEffort: 'medium' }], serviceTiers: [{ id: 'priority' }],
+			}],
+			nextCursor: null,
+		};
+		if (method === 'thread/start') return { thread: { id: 'thread-exact-after-refresh' } };
+		throw new Error(`Unexpected method ${method}`);
+	};
+	const service = new CodexService({
+		cwd: 'C:\\workspace',
+		launchProfile: { model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' },
+	}, { transport });
+	try {
+		await service.start();
+		const live = await service.catalog.refresh({ force: true });
+		const agent = await service.createAgent(profile('exact-after-live-refresh'));
+		assert.equal(live.source, 'live');
+		assert.deepEqual(live.models.map(({ id }) => id), ['gpt-5.6-sol', 'gpt-other']);
+		assert.equal(agent.agentId, 'exact-after-live-refresh');
 	} finally {
 		await service.stop();
 	}
@@ -766,7 +829,7 @@ test('native Codex turn executes a Minecraft tool and returns its result before 
 	await agent.setGoalRevision(1);
 
 	const threadStart = transport.calls.find((call) => call.method === 'thread/start').params;
-	assert.deepEqual(threadStart.dynamicTools.map((tool) => tool.name), ['observe', 'moveTo', 'mine', 'say', 'wait', 'act', 'sequence', 'finish']);
+	assert.deepEqual(threadStart.dynamicTools.map((tool) => tool.name), ['observe', 'control', 'moveTo', 'mine', 'say', 'wait', 'act', 'sequence', 'finish']);
 	assert.equal(threadStart.baseInstructions.length < 1_500, true);
 
 	const executed = [];

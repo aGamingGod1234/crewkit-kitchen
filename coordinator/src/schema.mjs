@@ -27,6 +27,7 @@ const ENVELOPE_KEYS = ['protocolVersion', 'agentId', 'type', 'messageId'];
 const ACTION_TYPES = new Set(Object.keys(ACTION_FIELDS));
 const TERMINAL_STATES = new Set(TERMINAL_ACTION_STATES);
 const FACES = new Set(BLOCK_FACES);
+const TRUSTED_ACTIONS = new WeakSet();
 const INTEGER_MIN = -2_147_483_648;
 const INTEGER_MAX = 2_147_483_647;
 
@@ -39,7 +40,8 @@ export class ValidationError extends Error {
 }
 
 export function validateAction(value) {
-	const action = requireObject(value, 'action');
+	if (value !== null && typeof value === 'object' && TRUSTED_ACTIONS.has(value)) return value;
+	const action = structuredClone(requireObject(value, 'action'));
 	const type = requireText(action.type, 'action.type', MAX_REASON_CODE_LENGTH);
 	if (!ACTION_TYPES.has(type)) throw invalid('UNKNOWN_ACTION', `Unsupported action '${type}'`);
 	const requiredFields = type === 'place_block'
@@ -52,6 +54,16 @@ export function validateAction(value) {
 			requireCoordinates(action, false, 'action');
 			requireFiniteRange(action.tolerance, 'action.tolerance', MIN_MOVEMENT_TOLERANCE, MAX_MOVEMENT_TOLERANCE);
 			requireBoolean(action.sprint, 'action.sprint');
+			break;
+		case 'control':
+			requireFiniteRange(action.forward, 'action.forward', -1, 1);
+			requireFiniteRange(action.strafe, 'action.strafe', -1, 1);
+			for (const field of ['jump', 'sneak', 'sprint', 'attack', 'use']) requireBoolean(action[field], `action.${field}`);
+			requireFiniteRange(action.yaw, 'action.yaw', -180, 180);
+			requireFiniteRange(action.pitch, 'action.pitch', -90, 90);
+			requireIntRange(action.selectedSlot, 'action.selectedSlot', 0, 8);
+			requireOneOf(action.hand, 'action.hand', ['main', 'off']);
+			requireIntRange(action.ticks, 'action.ticks', 1, 200);
 			break;
 		case 'navigate_to':
 			requireCoordinates(action, false, 'action');
@@ -191,7 +203,9 @@ export function validateAction(value) {
 			if (action.count < 1 || action.count > 64) throw invalid('INVALID_FIELD', 'action.count must be between 1 and 64');
 			break;
 	}
-	return structuredClone(action);
+	const normalized = deepFreeze(action);
+	TRUSTED_ACTIONS.add(normalized);
+	return normalized;
 }
 
 export function createActionCommand(actionValue, { commandId, issuedAtEpochMs }) {

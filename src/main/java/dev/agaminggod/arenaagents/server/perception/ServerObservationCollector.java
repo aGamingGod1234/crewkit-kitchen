@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.Function;
+import java.util.function.Predicate;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -42,6 +43,8 @@ public final class ServerObservationCollector {
 	public static final int MAX_BLOCKS = 128;
 	public static final int BLOCK_RADIUS = 6;
 	public static final int MAX_BLOCKS_PER_TYPE = 8;
+	static final int MAX_BLOCK_VISIBILITY_CHECKS = MAX_BLOCKS * 4;
+	static final int MAX_BLOCK_VISIBILITY_CHECKS_PER_TYPE = MAX_BLOCKS_PER_TYPE * 4;
 	public static final int MAX_NEARBY_TRANSACTION_TARGETS = 16;
 	public static final int MAX_OBSERVATION_TAGS = 32;
 	public static final int MAX_TAG_COUNT_ENTRIES = 128;
@@ -81,6 +84,7 @@ public final class ServerObservationCollector {
 		}
 
 		ServerLevel level = agent.level();
+		ObservationVisibility.Frame visibility = ObservationVisibility.frame(level, agent);
 		observation.add("position", vector(agent.position()));
 		observation.add("velocity", vector(agent.getDeltaMovement()));
 		JsonObject view = new JsonObject();
@@ -103,7 +107,7 @@ public final class ServerObservationCollector {
 		player.addProperty("suffocating", agent.isInWall());
 		player.addProperty("fallDistance", finite(agent.fallDistance));
 		LivingEntity attacker = agent.getLastHurtByMob();
-		if (attacker != null && attacker.isAlive() && ObservationVisibility.canSeeEntity(agent, attacker)) {
+		if (attacker != null && attacker.isAlive() && visibility.canSeeEntity(attacker)) {
 			JsonObject threat = new JsonObject();
 			threat.addProperty("uuid", attacker.getUUID().toString());
 			threat.addProperty("type", BuiltInRegistries.ENTITY_TYPE.getKey(attacker.getType()).toString());
@@ -115,8 +119,8 @@ public final class ServerObservationCollector {
 		observation.add("interaction", interaction(agentId, agent));
 
 		observation.add("inventory", inventory(agent));
-		observation.add("entities", entities(level, agent));
-		JsonObject spatial = spatialObservation(agentId, level, agent);
+		observation.add("entities", entities(level, agent, visibility));
+		JsonObject spatial = spatialObservation(agentId, level, agent, visibility);
 		observation.add("blocks", spatial.get("blocks"));
 		observation.add("nearbyContainers", spatial.get("nearbyContainers"));
 		JsonObject world = new JsonObject();
@@ -177,7 +181,12 @@ public final class ServerObservationCollector {
 		return List.copyOf(changed);
 	}
 
-	private JsonObject spatialObservation(AgentId agentId, ServerLevel level, ServerPlayer agent) {
+	private JsonObject spatialObservation(
+			AgentId agentId,
+			ServerLevel level,
+			ServerPlayer agent,
+			ObservationVisibility.Frame visibility
+	) {
 		BlockPos position = agent.blockPosition();
 		RawSpatialObservation.Key key = new RawSpatialObservation.Key(
 				agentId,
@@ -191,8 +200,8 @@ public final class ServerObservationCollector {
 		RawSpatialObservation raw = spatialCache.getOrCompute(
 				key, level.getGameTime(), () -> rawSpatialObservation(level, agent, position));
 		JsonObject value = new JsonObject();
-		value.add("blocks", blocks(level, agent, raw.blocks()));
-		value.add("nearbyContainers", nearbyTransactionTargets(level, agent, raw.containers()));
+		value.add("blocks", blocks(level, agent, raw.blocks(), visibility));
+		value.add("nearbyContainers", nearbyTransactionTargets(agent, raw.containers(), visibility));
 		return value;
 	}
 
@@ -236,14 +245,15 @@ public final class ServerObservationCollector {
 		interaction.addProperty("useRemainingTicks", Math.max(0, agent.getUseItemRemainingTicks()));
 		interaction.addProperty("attackCooldown", finite(agent.getAttackStrengthScale(0.0F)));
 
-		AgentInputState input = AgentInputRuntime.controller(agent).currentState(agentId)
+		var currentInput = AgentInputRuntime.controller(agent).currentState(agentId);
+		AgentInputState input = currentInput
 				.orElseGet(() -> AgentInputState.idle(
 						agent.getYRot(),
 						agent.getXRot(),
 						agent.getInventory().getSelectedSlot()
 				));
 		JsonObject inputJson = new JsonObject();
-		inputJson.addProperty("active", AgentInputRuntime.controller(agent).currentState(agentId).isPresent());
+		inputJson.addProperty("active", currentInput.isPresent());
 		inputJson.addProperty("forward", finite(input.forward()));
 		inputJson.addProperty("strafe", finite(input.strafe()));
 		inputJson.addProperty("jump", input.jump());
@@ -312,14 +322,16 @@ public final class ServerObservationCollector {
 
 	private static JsonArray effects(ServerPlayer agent) {
 		JsonArray values = new JsonArray();
-		agent.getActiveEffects().stream().limit(32).forEach(effect -> {
+		int count = 0;
+		for (var effect : agent.getActiveEffects()) {
+			if (count++ == 32) break;
 			JsonObject json = new JsonObject();
 			json.addProperty("effectId", effect.getEffect().unwrapKey()
 					.map(key -> key.identifier().toString()).orElse(effect.getDescriptionId()));
 			json.addProperty("amplifier", effect.getAmplifier());
 			json.addProperty("duration", effect.getDuration());
 			values.add(json);
-		});
+		}
 		return values;
 	}
 
@@ -327,13 +339,14 @@ public final class ServerObservationCollector {
 		JsonObject inventory = new JsonObject();
 		JsonArray items = new JsonArray();
 		Map<String, Integer> tagCounts = new HashMap<>();
-		for (EquipmentSlot slot : EquipmentSlot.values()) {
+		for (EquipmentSlot slot : EQUIPMENT_SLOTS) {
 			ItemStack stack = agent.getItemBySlot(slot);
 			if (stack.isEmpty()) continue;
-			JsonObject item = item(stack);
+			List<String> tags = tagValues(stack.typeHolder());
+			JsonObject item = item(stack, tags);
 			item.addProperty("slot", slot.getName());
 			items.add(item);
-			addTagCounts(tagCounts, stack);
+			addTagCounts(tagCounts, stack.getCount(), tags);
 		}
 		Inventory playerInventory = agent.getInventory();
 		int selectedMainHandSlot = playerInventory.getSelectedSlot();
@@ -345,11 +358,12 @@ public final class ServerObservationCollector {
 			)) continue;
 			ItemStack stack = playerInventory.getItem(slot);
 			if (stack.isEmpty()) continue;
-			JsonObject item = item(stack);
+			List<String> tags = tagValues(stack.typeHolder());
+			JsonObject item = item(stack, tags);
 			item.addProperty("slot", slot);
 			item.addProperty("hotbar", slot < 9);
 			items.add(item);
-			addTagCounts(tagCounts, stack);
+			addTagCounts(tagCounts, stack.getCount(), tags);
 		}
 		inventory.add("items", items);
 		JsonObject counts = new JsonObject();
@@ -360,21 +374,31 @@ public final class ServerObservationCollector {
 		return inventory;
 	}
 
-	private static JsonObject item(ItemStack stack) {
+	private static JsonObject item(ItemStack stack, List<String> tags) {
 		JsonObject item = new JsonObject();
 		item.addProperty("itemId", BuiltInRegistries.ITEM.getKey(stack.getItem()).toString());
 		item.addProperty("count", stack.getCount());
 		item.addProperty("damage", stack.getDamageValue());
 		item.addProperty("maxDamage", stack.getMaxDamage());
-		item.add("tags", tags(stack.typeHolder()));
+		item.add("tags", tags(tags));
 		return item;
 	}
 
-	static void addTagCounts(Map<String, Integer> counts, ItemStack stack) {
-		tags(stack.typeHolder()).forEach(tag -> counts.merge(tag.getAsString(), stack.getCount(), Integer::sum));
+	private static void addTagCounts(Map<String, Integer> counts, int stackCount, List<String> tags) {
+		tags.forEach(tag -> counts.merge(tag, stackCount, Integer::sum));
 	}
 
 	static JsonArray tags(Holder<?> holder) {
+		return tags(tagValues(holder));
+	}
+
+	private static JsonArray tags(List<String> tags) {
+		JsonArray values = new JsonArray();
+		tags.forEach(values::add);
+		return values;
+	}
+
+	private static List<String> tagValues(Holder<?> holder) {
 		List<String> cached;
 		synchronized (TAG_VALUES) {
 			cached = TAG_VALUES.get(holder);
@@ -384,9 +408,7 @@ public final class ServerObservationCollector {
 				TAG_VALUES.put(holder, cached);
 			}
 		}
-		JsonArray values = new JsonArray();
-		cached.forEach(values::add);
-		return values;
+		return cached;
 	}
 
 	/** Clears holder-derived tag values after datapack tags are reloaded. */
@@ -396,13 +418,25 @@ public final class ServerObservationCollector {
 		}
 	}
 
-	private static JsonArray entities(ServerLevel level, ServerPlayer agent) {
+	private static JsonArray entities(
+			ServerLevel level,
+			ServerPlayer agent,
+			ObservationVisibility.Frame visibility
+	) {
 		JsonArray values = new JsonArray();
-		level.getEntities(agent, agent.getBoundingBox().inflate(32.0D), Entity::isAlive).stream()
-				.filter(entity -> ObservationVisibility.canSeeEntity(agent, entity))
-				.sorted(Comparator.comparingDouble(agent::distanceToSqr))
-				.limit(MAX_ENTITIES)
-				.forEach(entity -> {
+		ArrayList<EntityCandidate> candidates = new ArrayList<>();
+		for (Entity entity : level.getEntities(agent, agent.getBoundingBox().inflate(32.0D), Entity::isAlive)) {
+			if (visibility.isEntityWithinView(entity)) {
+				candidates.add(new EntityCandidate(entity, agent.distanceToSqr(entity)));
+			}
+		}
+		for (EntityCandidate candidate : selectNearestVisible(
+				candidates,
+				Comparator.comparingDouble(EntityCandidate::distanceSquared),
+				MAX_ENTITIES,
+				entry -> visibility.hasLineOfSight(entry.entity())
+		)) {
+			Entity entity = candidate.entity();
 					JsonObject json = new JsonObject();
 					json.addProperty("uuid", entity.getUUID().toString());
 					json.addProperty("type", BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString());
@@ -418,17 +452,39 @@ public final class ServerObservationCollector {
 						json.add("tags", tags(itemEntity.getItem().typeHolder()));
 					}
 					values.add(json);
-				});
+		}
 		return values;
+	}
+
+	static <T> List<T> selectNearestVisible(
+			List<T> candidates,
+			Comparator<? super T> nearestFirst,
+			int maximumEntries,
+			Predicate<? super T> visible
+	) {
+		Objects.requireNonNull(candidates, "candidates must not be null");
+		Objects.requireNonNull(nearestFirst, "nearestFirst must not be null");
+		Objects.requireNonNull(visible, "visible must not be null");
+		if (maximumEntries <= 0) throw new IllegalArgumentException("maximumEntries must be positive");
+		ArrayList<T> ordered = new ArrayList<>(candidates);
+		ordered.sort(nearestFirst);
+		ArrayList<T> selected = new ArrayList<>(Math.min(maximumEntries, ordered.size()));
+		for (T candidate : ordered) {
+			if (!visible.test(candidate)) continue;
+			selected.add(candidate);
+			if (selected.size() == maximumEntries) break;
+		}
+		return List.copyOf(selected);
 	}
 
 	private static RawSpatialObservation rawSpatialObservation(ServerLevel level, ServerPlayer agent, BlockPos center) {
 		ArrayList<BlockObservationOrdering.Candidate> candidates = new ArrayList<>();
 		ArrayList<RawSpatialObservation.ContainerCandidate> containers = new ArrayList<>();
+		BlockPos.MutableBlockPos position = new BlockPos.MutableBlockPos();
 		for (int y = -3; y <= 3; y++) {
 			for (int x = -BLOCK_RADIUS; x <= BLOCK_RADIUS; x++) {
 				for (int z = -BLOCK_RADIUS; z <= BLOCK_RADIUS; z++) {
-					BlockPos position = center.offset(x, y, z);
+					position.set(center.getX() + x, center.getY() + y, center.getZ() + z);
 					if (!level.hasChunkAt(position)) continue;
 					BlockState state = level.getBlockState(position);
 					if (state.isAir()) continue;
@@ -440,17 +496,13 @@ public final class ServerObservationCollector {
 					if (!capabilities.isEmpty()) {
 						containers.add(new RawSpatialObservation.ContainerCandidate(
 								position.getX(), position.getY(), position.getZ(), blockId, capabilities,
-								agent.distanceToSqr(Vec3.atCenterOf(position))));
+								agent.distanceToSqr(position.getX() + 0.5D, position.getY() + 0.5D,
+										position.getZ() + 0.5D)));
 					}
 				}
 			}
 		}
-		List<RawSpatialObservation.BlockCandidate> blocks = BlockObservationOrdering.select(
-				candidates, MAX_BLOCKS * 4, MAX_BLOCKS_PER_TYPE * 4).stream()
-				.map(candidate -> new RawSpatialObservation.BlockCandidate(
-						center.getX() + candidate.x(), center.getY() + candidate.y(), center.getZ() + candidate.z(),
-						candidate.blockId()))
-				.toList();
+		List<BlockObservationOrdering.Candidate> blocks = BlockObservationOrdering.ordered(candidates);
 		containers.sort(Comparator.comparingDouble(RawSpatialObservation.ContainerCandidate::distanceSquared)
 				.thenComparingInt(RawSpatialObservation.ContainerCandidate::y)
 				.thenComparingInt(RawSpatialObservation.ContainerCandidate::x)
@@ -462,22 +514,21 @@ public final class ServerObservationCollector {
 	private static JsonArray blocks(
 			ServerLevel level,
 			ServerPlayer agent,
-			List<RawSpatialObservation.BlockCandidate> candidates
+			List<BlockObservationOrdering.Candidate> candidates,
+			ObservationVisibility.Frame visibility
 	) {
-		ArrayList<BlockObservationOrdering.Candidate> relative = new ArrayList<>(candidates.size());
 		BlockPos center = agent.blockPosition();
-		for (RawSpatialObservation.BlockCandidate candidate : candidates) {
-			relative.add(new BlockObservationOrdering.Candidate(
-					candidate.x() - center.getX(), candidate.y() - center.getY(), candidate.z() - center.getZ(),
-					candidate.blockId()));
-		}
 		JsonArray values = new JsonArray();
-		for (BlockObservationOrdering.Candidate candidate : BlockObservationOrdering.select(
-				relative,
+		for (BlockObservationOrdering.Candidate candidate : BlockObservationOrdering.selectOrderedWithVisibilityBudget(
+				candidates,
 				MAX_BLOCKS,
 				MAX_BLOCKS_PER_TYPE,
-				selectable -> ObservationVisibility.canSeeBlock(
-						level, agent, center.offset(selectable.x(), selectable.y(), selectable.z()))
+				MAX_BLOCK_VISIBILITY_CHECKS,
+				MAX_BLOCK_VISIBILITY_CHECKS_PER_TYPE,
+				selectable -> visibility.isBlockWithinView(
+						center.offset(selectable.x(), selectable.y(), selectable.z())),
+				selectable -> visibility.hasLineOfSight(
+						center.offset(selectable.x(), selectable.y(), selectable.z()))
 		)) {
 			BlockPos position = center.offset(candidate.x(), candidate.y(), candidate.z());
 			BlockState state = level.getBlockState(position);
@@ -488,10 +539,11 @@ public final class ServerObservationCollector {
 			json.addProperty("blockId", candidate.blockId());
 			json.add("tags", tags(state.typeHolder()));
 			JsonArray placeableFaces = new JsonArray();
+			boolean withinInteractionRange = agent.isWithinBlockInteractionRange(position, 1.0D);
 			BlockPlacementAttemptPolicy.supportedFaces(face ->
-					state.isFaceSturdy(level, position, face)
+					withinInteractionRange
+							&& state.isFaceSturdy(level, position, face)
 							&& level.getBlockState(position.relative(face)).canBeReplaced()
-							&& agent.isWithinBlockInteractionRange(position, 1.0D)
 			).forEach(face -> placeableFaces.add(face.getSerializedName()));
 			json.add("placeableFaces", placeableFaces);
 			values.add(json);
@@ -500,16 +552,17 @@ public final class ServerObservationCollector {
 	}
 
 	private static JsonArray nearbyTransactionTargets(
-			ServerLevel level,
 			ServerPlayer agent,
-			List<RawSpatialObservation.ContainerCandidate> candidates
+			List<RawSpatialObservation.ContainerCandidate> candidates,
+			ObservationVisibility.Frame visibility
 	) {
 		JsonArray values = new JsonArray();
 		for (RawSpatialObservation.ContainerCandidate candidate : candidates) {
 			if (values.size() == MAX_NEARBY_TRANSACTION_TARGETS) break;
 			BlockPos position = new BlockPos(candidate.x(), candidate.y(), candidate.z());
-			if (!ObservationVisibility.canSeeBlock(level, agent, position)) continue;
-			double distanceSquared = agent.distanceToSqr(Vec3.atCenterOf(position));
+			if (!visibility.canSeeBlock(position)) continue;
+			double distanceSquared = agent.distanceToSqr(
+					candidate.x() + 0.5D, candidate.y() + 0.5D, candidate.z() + 0.5D);
 			JsonObject json = new JsonObject();
 			json.addProperty("x", candidate.x());
 			json.addProperty("y", candidate.y());
@@ -597,6 +650,12 @@ public final class ServerObservationCollector {
 		double fallDistance,
 		java.util.UUID lastAttacker
 	) {
+	}
+
+	private record EntityCandidate(Entity entity, double distanceSquared) {
+		private EntityCandidate {
+			Objects.requireNonNull(entity, "entity must not be null");
+		}
 	}
 
 	/** Exact, allocation-free comparison of the fields used by inventorySignature while shapes are stable. */

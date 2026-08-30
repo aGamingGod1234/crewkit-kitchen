@@ -2,6 +2,7 @@ package dev.agaminggod.arenaagents.server;
 
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public final class AgentRecoverySpawnPolicyVerification {
 	private AgentRecoverySpawnPolicyVerification() {
@@ -19,12 +20,18 @@ public final class AgentRecoverySpawnPolicyVerification {
 				67, true, true, true, true, true, true, true);
 		AgentRecoverySpawnPolicy.Column unsupportedSand = new AgentRecoverySpawnPolicy.Column(
 				63, true, false, true, true, true, true, true);
+		AtomicInteger sampled = new AtomicInteger();
 		Optional<AgentRecoverySpawnPolicy.Position> selected = AgentRecoverySpawnPolicy.selectNearestDryPosition(
 				8, 8, 0, 15, 0, 15,
-				(x, z) -> x == 9 && z == 8 ? safeLand : unsafeWater
+				(x, z) -> {
+					sampled.incrementAndGet();
+					return x == 9 && z == 8 ? safeLand : unsafeWater;
+				}
 		);
 		assertEquals(Optional.of(new AgentRecoverySpawnPolicy.Position(9, 67, 8)), selected,
 				"submerged chunk center is rejected for the nearest dry supported column");
+		assertions++;
+		assertEquals(5, sampled.get(), "nearest-first recovery stops sampling after the first safe distance tier");
 		assertions++;
 
 		Optional<AgentRecoverySpawnPolicy.Position> shiftingFloor = AgentRecoverySpawnPolicy.selectNearestDryPosition(
