@@ -140,7 +140,13 @@ try {
 	$start.RedirectStandardError = $true
 	$process = [Diagnostics.Process]::new()
 	$process.StartInfo = $start
-	if (-not $process.Start()) { throw 'Fabric server process did not start.' }
+	$hostInputEncoding = [Console]::InputEncoding
+	try {
+		[Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
+		if (-not $process.Start()) { throw 'Fabric server process did not start.' }
+	} finally {
+		[Console]::InputEncoding = $hostInputEncoding
+	}
 	$processStarted = $true
 	$standardOutputTask = $process.StandardOutput.ReadLineAsync()
 	$standardErrorTask = $process.StandardError.ReadLineAsync()
