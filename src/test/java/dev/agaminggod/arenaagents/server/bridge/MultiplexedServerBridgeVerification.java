@@ -390,6 +390,11 @@ public final class MultiplexedServerBridgeVerification {
 					writeEnvelope(socket, codec, new BridgeEnvelope(
 							2, acknowledgement.serverInstanceId(), "server", "catalog_snapshot", "empty-catalog-" + attempt, catalog
 					));
+					awaitServerTaskCount(bridge, 1,
+							"empty catalog attempt " + attempt + " reaches the server-task handoff");
+					bridge.tick();
+					assertTrue(!catalogDiscoveryPending(bridge),
+							"empty catalog attempt " + attempt + " is applied before retry time advances");
 					nanoTime.addAndGet(60_000_000_000L);
 					if (attempt == 4) {
 						setQueuedCount(bridge, "server", MultiplexedServerBridge.AGENT_QUEUE_CAP);
@@ -2618,6 +2623,42 @@ public final class MultiplexedServerBridgeVerification {
 
 		private void releaseAccept() {
 			releaseAccept.countDown();
+		}
+	}
+
+	private static boolean catalogDiscoveryPending(MultiplexedServerBridge bridge) {
+		try {
+			Object publicationLock = readPrivateField(bridge, "publicationLock");
+			synchronized (publicationLock) {
+				return (boolean) readPrivateField(bridge, "catalogDiscoveryPending");
+			}
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("could not inspect catalog discovery state", exception);
+		}
+	}
+
+	private static void awaitServerTaskCount(
+			MultiplexedServerBridge bridge,
+			int expected,
+			String label
+	) {
+		long deadline = System.nanoTime() + 2_000_000_000L;
+		while (serverTaskCount(bridge) != expected && System.nanoTime() < deadline) {
+			try {
+				Thread.sleep(1L);
+			} catch (InterruptedException exception) {
+				Thread.currentThread().interrupt();
+				throw new AssertionError(label + " was interrupted", exception);
+			}
+		}
+		assertEquals(expected, serverTaskCount(bridge), label);
+	}
+
+	private static int serverTaskCount(MultiplexedServerBridge bridge) {
+		try {
+			return ((BoundedServerTaskQueue) readPrivateField(bridge, "serverTasks")).pendingCount();
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("could not inspect inbound server tasks", exception);
 		}
 	}
 
