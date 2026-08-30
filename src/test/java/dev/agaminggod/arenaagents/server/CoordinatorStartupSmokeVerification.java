@@ -31,7 +31,7 @@ import java.util.Map;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
-/** Starts one staged coordinator with an isolated, empty PATH and validates its first catalog. */
+/** Starts one staged coordinator with an isolated provider PATH and validates its first catalog. */
 public final class CoordinatorStartupSmokeVerification {
 	private static final long STARTUP_TIMEOUT_MS = 15_000L;
 
@@ -69,7 +69,7 @@ public final class CoordinatorStartupSmokeVerification {
 					"custom package ownership is reaped before launch");
 			int credentialAssertions = verifyOptionalVoiceCredential(packageRoot.resolve("credential-test"));
 			Path node = stageBundledNode(packageRoot);
-			Path fakeAppData = stageFakeCodex(packageRoot);
+			FakeCodexEnvironment fakeCodex = stageFakeCodex(packageRoot, node);
 			Path secret = packageRoot.resolve("runtime/bridge-secret.txt");
 			Files.createDirectories(secret.getParent());
 			Files.writeString(secret, "s".repeat(32), StandardCharsets.UTF_8);
@@ -87,12 +87,12 @@ public final class CoordinatorStartupSmokeVerification {
 			try (ServerSocket bridge = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
 				int voicePort = unusedLoopbackPort();
 				writeSmokeConfig(packageRoot, bridge.getLocalPort(), voicePort);
-				Map<String, String> emptyPath = new HashMap<>();
-				emptyPath.put("PATH", "");
-				emptyPath.put("APPDATA", fakeAppData.toString());
-				emptyPath.put("FISH_AUDIO_API_KEY", "");
-				emptyPath.put("FISH_API_KEY", "");
-				supervisor = new CoordinatorProcessSupervisor(packageRoot.resolve("game"), emptyPath);
+				Map<String, String> isolatedEnvironment = new HashMap<>();
+				isolatedEnvironment.put("PATH", fakeCodex.path());
+				isolatedEnvironment.put("APPDATA", fakeCodex.appData().toString());
+				isolatedEnvironment.put("FISH_AUDIO_API_KEY", "");
+				isolatedEnvironment.put("FISH_API_KEY", "");
+				supervisor = new CoordinatorProcessSupervisor(packageRoot.resolve("game"), isolatedEnvironment);
 				long configurationDeadline = System.currentTimeMillis() + STARTUP_TIMEOUT_MS;
 				while (!supervisor.configured() && System.currentTimeMillis() < configurationDeadline) {
 					supervisor.tick(false);
@@ -360,7 +360,7 @@ public final class CoordinatorStartupSmokeVerification {
 		}
 	}
 
-	private static Path stageFakeCodex(Path root) throws IOException {
+	private static FakeCodexEnvironment stageFakeCodex(Path root, Path node) throws IOException {
 		Path entrypoint = root.resolve("fake-appdata/npm/node_modules/@openai/codex/bin/codex.js");
 		Files.createDirectories(entrypoint.getParent());
 		Files.writeString(entrypoint, """
@@ -375,7 +375,21 @@ public final class CoordinatorStartupSmokeVerification {
 					process.stdout.write(JSON.stringify({ id: request.id, result }) + '\\n');
 				});
 				""", StandardCharsets.UTF_8);
-		return root.resolve("fake-appdata");
+		Path appData = root.resolve("fake-appdata");
+		if (isWindows()) return new FakeCodexEnvironment(appData, "");
+		Path bin = root.resolve("fake-bin");
+		Path launcher = bin.resolve("codex");
+		Files.createDirectories(bin);
+		Files.writeString(launcher, "#!/bin/sh\nexec " + shellQuote(node) + " " + shellQuote(entrypoint) + " \"$@\"\n",
+				StandardCharsets.UTF_8);
+		if (!launcher.toFile().setExecutable(true, true) && !Files.isExecutable(launcher)) {
+			throw new IOException("could not make the fake Codex launcher executable");
+		}
+		return new FakeCodexEnvironment(appData, bin.toString());
+	}
+
+	private static String shellQuote(Path path) {
+		return "'" + path.toString().replace("'", "'\"'\"'") + "'";
 	}
 
 	private static void writeSmokeConfig(Path root, int port, int voicePort) throws IOException {
@@ -488,5 +502,8 @@ public final class CoordinatorStartupSmokeVerification {
 
 	private static void assertTrue(boolean condition, String label) {
 		if (!condition) throw new AssertionError(label);
+	}
+
+	private record FakeCodexEnvironment(Path appData, String path) {
 	}
 }

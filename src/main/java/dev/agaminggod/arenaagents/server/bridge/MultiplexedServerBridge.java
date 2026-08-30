@@ -387,6 +387,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		ServerSocket socket = null;
 		try {
 			socket = socketFactory.open();
+			socket.setReuseAddress(true);
 			socket.bind(new InetSocketAddress(InetAddress.getByName(LOOPBACK_HOST), port), 1);
 			serverSocket = socket;
 			manager.setRuntimeHooks(this);

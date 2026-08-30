@@ -13,6 +13,7 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.lang.reflect.Field;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
@@ -687,7 +688,9 @@ public final class CoordinatorProcessSupervisorVerification {
 			authenticated = null;
 			slot.close();
 			slot = null;
-			try (ServerSocket rebound = new ServerSocket(port, 1, InetAddress.getLoopbackAddress())) {
+			try (ServerSocket rebound = new ServerSocket()) {
+				rebound.setReuseAddress(true);
+				rebound.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), port), 1);
 				assertEquals(port, rebound.getLocalPort(), "closing recovered BridgeSlot releases its listener once");
 			}
 		} catch (Exception exception) {
