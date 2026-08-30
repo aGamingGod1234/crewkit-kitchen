@@ -12,6 +12,7 @@ final class ExactHandUseDriver {
 	static final int REPEAT_COOLDOWN_TICKS = 3;
 
 	private final Map<AgentId, UseState> states = new LinkedHashMap<>();
+	private final Map<AgentId, Long> lastExecutionTicks = new LinkedHashMap<>();
 
 	void start(AgentId agentId, InteractionHand hand, PlayerUseAccess player) {
 		Objects.requireNonNull(agentId, "agentId must not be null");
@@ -23,7 +24,8 @@ final class ExactHandUseDriver {
 		states.put(agentId, new UseState(hand));
 	}
 
-	void tick(AgentId agentId, InteractionHand hand, PlayerUseAccess player) {
+	void tick(AgentId agentId, InteractionHand hand, PlayerUseAccess player, long serverTick) {
+		if (!claimExecution(agentId, serverTick)) return;
 		executeUse(agentId, hand, player);
 	}
 
@@ -31,13 +33,21 @@ final class ExactHandUseDriver {
 			AgentId agentId,
 			InteractionHand hand,
 			PlayerUseAccess player,
-			Supplier<Boolean> attack
+			Supplier<Boolean> attack,
+			long serverTick
 	) {
 		Objects.requireNonNull(attack, "attack must not be null");
+		if (!claimExecution(agentId, serverTick)) return null;
 		if (executeUse(agentId, hand, player)) return null;
 		Boolean attackResult = attack.get();
 		if (Boolean.TRUE.equals(attackResult)) executeUse(agentId, hand, player);
 		return attackResult;
+	}
+
+	private boolean claimExecution(AgentId agentId, long serverTick) {
+		Objects.requireNonNull(agentId, "agentId must not be null");
+		Long previousTick = lastExecutionTicks.put(agentId, serverTick);
+		return previousTick == null || previousTick.longValue() != serverTick;
 	}
 
 	private boolean executeUse(AgentId agentId, InteractionHand hand, PlayerUseAccess player) {
@@ -75,7 +85,9 @@ final class ExactHandUseDriver {
 	}
 
 	void discard(AgentId agentId) {
-		states.remove(Objects.requireNonNull(agentId, "agentId must not be null"));
+		Objects.requireNonNull(agentId, "agentId must not be null");
+		states.remove(agentId);
+		lastExecutionTicks.remove(agentId);
 	}
 
 	interface PlayerUseAccess {

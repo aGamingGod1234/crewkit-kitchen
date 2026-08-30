@@ -46,7 +46,8 @@ public final class CarpetActionArbitration {
 				binding.agentId(),
 				binding.hand(),
 				new CarpetInputStateSink.MinecraftPlayerUseAccess(player),
-				attack
+				attack,
+				player.level().getServer().getTickCount()
 		);
 	}
 

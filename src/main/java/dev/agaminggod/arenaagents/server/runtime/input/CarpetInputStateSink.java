@@ -83,7 +83,12 @@ public final class CarpetInputStateSink implements InputStateSink {
 			return;
 		}
 		CarpetActionArbitration.unbind(agentId);
-		useDriver.tick(agentId, state.hand(), new MinecraftPlayerUseAccess(player));
+		useDriver.tick(
+				agentId,
+				state.hand(),
+				new MinecraftPlayerUseAccess(player),
+				player.level().getServer().getTickCount()
+		);
 	}
 
 	@Override

@@ -102,23 +102,23 @@ public final class InputStateVerification {
 		ExactHandUseDriver driver = new ExactHandUseDriver();
 		RecordingUseAccess block = RecordingUseAccess.target(ExactHandUseDriver.TargetKind.BLOCK, true, true);
 		driver.start(AGENT, InteractionHand.MAIN_HAND, block);
-		driver.tick(AGENT, InteractionHand.MAIN_HAND, block);
+		driver.tick(AGENT, InteractionHand.MAIN_HAND, block, 1L);
 		assertEquals(List.of(InteractionHand.MAIN_HAND), block.targetHands,
 				"block use receives only the requested main hand");
 		assertEquals(List.of(), block.itemHands, "consumed block use does not fall through to item use");
 		assertEquals(List.of(InteractionHand.MAIN_HAND), block.swingHands,
 				"server-authoritative block success swings the requested hand");
 		for (int tick = 0; tick < ExactHandUseDriver.REPEAT_COOLDOWN_TICKS; tick++) {
-			driver.tick(AGENT, InteractionHand.MAIN_HAND, block);
+			driver.tick(AGENT, InteractionHand.MAIN_HAND, block, tick + 2L);
 		}
 		assertEquals(1, block.targetHands.size(), "block use waits for Carpet's pinned repeat cooldown");
-		driver.tick(AGENT, InteractionHand.MAIN_HAND, block);
+		driver.tick(AGENT, InteractionHand.MAIN_HAND, block, 5L);
 		assertEquals(2, block.targetHands.size(), "held block use repeats after the pinned cooldown");
 		driver.stop(AGENT, block);
 
 		RecordingUseAccess entity = RecordingUseAccess.target(ExactHandUseDriver.TargetKind.ENTITY, true, false);
 		driver.start(AGENT, InteractionHand.OFF_HAND, entity);
-		driver.tick(AGENT, InteractionHand.OFF_HAND, entity);
+		driver.tick(AGENT, InteractionHand.OFF_HAND, entity, 10L);
 		assertEquals(List.of(InteractionHand.OFF_HAND), entity.targetHands,
 				"entity use receives only the requested offhand");
 		assertEquals(List.of(), entity.itemHands, "consumed entity use does not fall through to item use");
@@ -126,14 +126,14 @@ public final class InputStateVerification {
 
 		RecordingUseAccess heldItem = RecordingUseAccess.item();
 		driver.start(AGENT, InteractionHand.OFF_HAND, heldItem);
-		driver.tick(AGENT, InteractionHand.OFF_HAND, heldItem);
+		driver.tick(AGENT, InteractionHand.OFF_HAND, heldItem, 20L);
 		assertEquals(List.of(), heldItem.targetHands,
 				"missed target does not fabricate a target interaction");
 		assertEquals(List.of(InteractionHand.OFF_HAND), heldItem.itemHands,
 				"item use starts with the requested offhand");
 		assertEquals(InteractionHand.OFF_HAND, heldItem.usedHand(), "held item reports the requested active hand");
 		for (int tick = 0; tick <= ExactHandUseDriver.REPEAT_COOLDOWN_TICKS; tick++) {
-			driver.tick(AGENT, InteractionHand.OFF_HAND, heldItem);
+			driver.tick(AGENT, InteractionHand.OFF_HAND, heldItem, tick + 21L);
 		}
 		assertEquals(1, heldItem.itemHands.size(), "active held item is not restarted while its key remains down");
 		driver.stop(AGENT, heldItem);
@@ -145,13 +145,13 @@ public final class InputStateVerification {
 		switchHands.usedHand = InteractionHand.OFF_HAND;
 		driver.start(AGENT, InteractionHand.MAIN_HAND, switchHands);
 		assertEquals(1, switchHands.releaseCalls, "starting main-hand use releases an existing offhand use");
-		driver.tick(AGENT, InteractionHand.MAIN_HAND, switchHands);
+		driver.tick(AGENT, InteractionHand.MAIN_HAND, switchHands, 30L);
 		assertEquals(List.of(InteractionHand.MAIN_HAND), switchHands.itemHands,
 				"main-hand selection cannot fall back to the offhand");
 		assertEquals(InteractionHand.MAIN_HAND, switchHands.usedHand(), "main hand becomes the observed active hand");
 		driver.start(AGENT, InteractionHand.OFF_HAND, switchHands);
 		assertEquals(2, switchHands.releaseCalls, "switching hands releases the previous held use");
-		driver.tick(AGENT, InteractionHand.OFF_HAND, switchHands);
+		driver.tick(AGENT, InteractionHand.OFF_HAND, switchHands, 31L);
 		assertEquals(List.of(InteractionHand.MAIN_HAND, InteractionHand.OFF_HAND), switchHands.itemHands,
 				"hand switch starts the newly requested hand");
 		assertEquals(InteractionHand.OFF_HAND, switchHands.usedHand(), "offhand becomes the observed active hand");
@@ -165,7 +165,7 @@ public final class InputStateVerification {
 				AGENT, InteractionHand.OFF_HAND, combinedBlock, () -> {
 					blockAttacks[0]++;
 					return true;
-				}
+				}, 40L
 		);
 		assertTrue(blockResult == null, "consumed exact-hand block use skips Carpet attack");
 		assertEquals(0, blockAttacks[0], "consumed exact-hand block use never calls the attack action");
@@ -179,7 +179,7 @@ public final class InputStateVerification {
 				AGENT, InteractionHand.OFF_HAND, combinedEntity, () -> {
 					entityAttacks[0]++;
 					return true;
-				}
+				}, 50L
 		);
 		assertTrue(entityResult == null, "consumed exact-hand entity use skips Carpet attack");
 		assertEquals(0, entityAttacks[0], "consumed exact-hand entity use never calls the attack action");
@@ -190,13 +190,13 @@ public final class InputStateVerification {
 		Boolean raisedShield = driver.arbitrate(AGENT, InteractionHand.OFF_HAND, shield, () -> {
 			shieldAttacks[0]++;
 			return true;
-		});
+		}, 60L);
 		assertTrue(raisedShield == null, "raising an offhand shield suppresses the combined attack");
 		assertEquals(0, shieldAttacks[0], "offhand shield prevents physical attack execution");
 		Boolean heldShield = driver.arbitrate(AGENT, InteractionHand.OFF_HAND, shield, () -> {
 			shieldAttacks[0]++;
 			return true;
-		});
+		}, 61L);
 		assertTrue(heldShield == null, "held offhand shield keeps the combined attack suppressed");
 		assertEquals(0, shieldAttacks[0], "held offhand shield cannot attack during use cooldown");
 		driver.stop(AGENT, shield);
@@ -206,7 +206,7 @@ public final class InputStateVerification {
 		Boolean resumedAttack = driver.arbitrate(AGENT, InteractionHand.OFF_HAND, releasedShield, () -> {
 			shieldAttacks[0]++;
 			return false;
-		});
+		}, 62L);
 		assertEquals(Boolean.FALSE, resumedAttack, "failed use returns the retained continuous attack result");
 		assertEquals(1, shieldAttacks[0], "the same scheduled attack resumes after held use stops consuming");
 		driver.stop(AGENT, releasedShield);
@@ -217,7 +217,7 @@ public final class InputStateVerification {
 		Boolean retryResult = driver.arbitrate(AGENT, InteractionHand.MAIN_HAND, retry, () -> {
 			retry.events.add("attack");
 			return true;
-		});
+		}, 70L);
 		assertEquals(Boolean.TRUE, retryResult, "failed use preserves Carpet's successful attack result");
 		assertEquals(2, retry.targetHands.size(), "successful attack retries exact-hand use before arbitration returns");
 		assertEquals(
@@ -233,13 +233,28 @@ public final class InputStateVerification {
 				ExactHandUseDriver.TargetKind.BLOCK, 2, false
 		);
 		Boolean failedAttackResult = driver.arbitrate(
-				AGENT, InteractionHand.MAIN_HAND, failedAttack, () -> false
+				AGENT, InteractionHand.MAIN_HAND, failedAttack, () -> false, 80L
 		);
 		assertEquals(Boolean.FALSE, failedAttackResult, "failed Carpet attack result is preserved");
 		assertEquals(1, failedAttack.targetHands.size(), "failed attack does not trigger the post-attack use retry");
 		driver.stop(AGENT, failedAttack);
+
+		RecordingUseAccess transition = RecordingUseAccess.target(
+				ExactHandUseDriver.TargetKind.BLOCK, true, false
+		);
+		driver.arbitrate(AGENT, InteractionHand.MAIN_HAND, transition, () -> true, 90L);
+		driver.arbitrate(AGENT, InteractionHand.MAIN_HAND, transition, () -> true, 91L);
+		driver.arbitrate(AGENT, InteractionHand.MAIN_HAND, transition, () -> true, 92L);
+		driver.arbitrate(AGENT, InteractionHand.MAIN_HAND, transition, () -> true, 93L);
+		assertEquals(1, transition.targetHands.size(), "combined use consumes its final cooldown tick once");
+		driver.tick(AGENT, InteractionHand.MAIN_HAND, transition, 93L);
+		assertEquals(1, transition.targetHands.size(),
+				"same-tick combined-to-use-only transition cannot execute use twice");
+		driver.tick(AGENT, InteractionHand.MAIN_HAND, transition, 94L);
+		assertEquals(2, transition.targetHands.size(), "held use resumes on the following server tick");
+		driver.stop(AGENT, transition);
 		driver.discard(AGENT);
-		return 35;
+		return 38;
 	}
 
 	private static int verifyBoundedMotor() {
