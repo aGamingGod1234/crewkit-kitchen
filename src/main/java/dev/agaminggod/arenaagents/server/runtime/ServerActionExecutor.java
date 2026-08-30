@@ -98,6 +98,7 @@ public final class ServerActionExecutor {
 	private final Map<AgentId, CleanupRetry<ServerActionResult>> pendingCompletions = new LinkedHashMap<>();
 	private final Map<AgentId, PendingRespawn> pendingRespawns = new LinkedHashMap<>();
 	private final Map<AgentId, ServerActionResult> lastResults = new LinkedHashMap<>();
+	private final Map<AgentId, ActionTerminalPublication> lastPublications = new LinkedHashMap<>();
 	private long coordinatorGeneration;
 	private long pathfindingRoundRobinCursor;
 
@@ -419,6 +420,11 @@ public final class ServerActionExecutor {
 		return lastResults.get(agentId);
 	}
 
+	/** Latest immutable result-plus-facts unit, ready for a future wire-schema integration. */
+	public synchronized ActionTerminalPublication lastPublication(AgentId agentId) {
+		return lastPublications.get(agentId);
+	}
+
 	public synchronized List<ServerActionRequest> activeRequests() {
 		return active.values().stream().map(ActiveAction::request).toList();
 	}
@@ -672,6 +678,10 @@ public final class ServerActionExecutor {
 
 	private void publish(ServerActionResult result) {
 		lastResults.put(result.agentId(), result);
+		lastPublications.put(result.agentId(), ActionTerminalPublication.capture(
+				result,
+				manager.server() == null ? Optional.empty() : manager.findAgentPlayer(result.agentId()),
+				System.currentTimeMillis()));
 		actionSuccessLedger.record(result);
 		try {
 			AgentChatReporter.result(manager, manager.registry().require(result.agentId()), result);

@@ -50,6 +50,7 @@ public final class CodexAgentServerRuntime {
 	private static final Map<MinecraftServer, Map<String, Long>> PLANNING_UPDATES = new ConcurrentHashMap<>();
 	private static final Map<MinecraftServer, GoalVerificationRuntime> GOAL_VERIFIERS = new ConcurrentHashMap<>();
 	private static final Map<MinecraftServer, GoalSafetyController> GOAL_SAFETY = new ConcurrentHashMap<>();
+	private static final java.util.Set<MinecraftServer> RESTORED_SERVERS = ConcurrentHashMap.newKeySet();
 	private static final long PLANNING_UPDATE_INTERVAL_MS = 30_000L;
 	private static final long COORDINATOR_STATUS_MAXIMUM_AGE_MS = 2_500L;
 	private static final int MIN_EXPLICIT_SECRET_CHARACTERS = 32;
@@ -94,7 +95,8 @@ public final class CodexAgentServerRuntime {
 			return;
 		}
 		ServerLifecycleEvents.SERVER_STARTED.register(CodexAgentServerRuntime::start);
-		ServerTickEvents.END_SERVER_TICK.register(CodexAgentServerRuntime::tick);
+		ServerTickEvents.START_SERVER_TICK.register(CodexAgentServerRuntime::startTick);
+		ServerTickEvents.END_SERVER_TICK.register(CodexAgentServerRuntime::endTick);
 		ServerLifecycleEvents.SERVER_STOPPING.register(CodexAgentServerRuntime::stop);
 		ServerLifecycleEvents.END_DATA_PACK_RELOAD.register((server, resourceManager, success) ->
 				ServerObservationCollector.clearTagCache());
@@ -273,7 +275,13 @@ public final class CodexAgentServerRuntime {
 		if (preparedSecret != null) slot.reconcile(revision, () -> factory.apply(preparedSecret));
 	}
 
-	private static void tick(MinecraftServer server) {
+	private static void startTick(MinecraftServer server) {
+		if (!RESTORED_SERVERS.contains(server)) return;
+		MultiplexedServerBridge bridge = bridge(server);
+		if (bridge != null) bridge.startTick();
+	}
+
+	private static void endTick(MinecraftServer server) {
 		CodexAgentManager manager = CodexAgentManager.get(server);
 		CoordinatorProcessSupervisor supervisor = COORDINATORS.get(server);
 		MultiplexedServerBridge bridge = bridge(server);
@@ -305,12 +313,14 @@ public final class CodexAgentServerRuntime {
 		}
 		}
 		MultiplexedServerBridge activeBridge = bridge;
-		runRestoredStateTick(ScenarioRuntimeService.restorePersistedState(server), () -> {
+		boolean restored = ScenarioRuntimeService.restorePersistedState(server);
+		if (restored) RESTORED_SERVERS.add(server);
+		runRestoredStateTick(restored, () -> {
 			manager.reconcileDeaths();
 			manager.maintainChunkTickets();
 			VoiceSubsystemRuntime.tick(server);
 			maintainPlanningProgress(manager);
-			if (activeBridge != null) activeBridge.tick();
+			if (activeBridge != null) activeBridge.endTick();
 			ScenarioRuntimeService.tick(server);
 		});
 	}
@@ -467,6 +477,7 @@ public final class CodexAgentServerRuntime {
 		PLANNING_UPDATES.remove(server);
 		GOAL_VERIFIERS.remove(server);
 		VOICE_GATES.remove(server);
+		RESTORED_SERVERS.remove(server);
 		GoalSafetyController safety = GOAL_SAFETY.remove(server);
 		CoordinatorProcessSupervisor supervisor = COORDINATORS.remove(server);
 		BridgeSlot bridgeSlot = BRIDGE_SLOTS.remove(server);

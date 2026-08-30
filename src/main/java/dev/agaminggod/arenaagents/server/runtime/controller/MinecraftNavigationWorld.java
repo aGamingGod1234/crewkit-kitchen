@@ -14,6 +14,8 @@ import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.shapes.VoxelShape;
 
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -27,6 +29,10 @@ public final class MinecraftNavigationWorld implements WalkabilityView {
 	};
 
 	private final ServerLevel level;
+	private final Map<GridPosition, Cell> cells = new HashMap<>();
+	private final Map<GridPosition, Boolean> shallowWater = new HashMap<>();
+	private long cacheHits;
+	private long cacheMisses;
 
 	public MinecraftNavigationWorld(ServerLevel level) {
 		this.level = Objects.requireNonNull(level, "level must not be null");
@@ -35,22 +41,39 @@ public final class MinecraftNavigationWorld implements WalkabilityView {
 	@Override
 	public Cell cellAt(GridPosition position) {
 		Objects.requireNonNull(position, "position must not be null");
+		Cell cached = cells.get(position);
+		if (cached != null) {
+			cacheHits++;
+			return cached;
+		}
+		cacheMisses++;
 		if (level.isOutsideBuildHeight(position.y())
 				|| !level.hasChunk(position.x() >> 4, position.z() >> 4)) {
+			cells.put(position, Cell.UNLOADED);
+			shallowWater.put(position, false);
 			return Cell.UNLOADED;
 		}
 		BlockPos blockPosition = new BlockPos(position.x(), position.y(), position.z());
 		BlockState state = level.getBlockState(blockPosition);
 		VoxelShape collision = state.getCollisionShape(level, blockPosition);
-		return classifyCell(state, collision, state.is(Blocks.WATER) && isBoundedShallowWater(blockPosition));
+		boolean boundedShallowWater = state.is(Blocks.WATER) && isBoundedShallowWater(blockPosition);
+		Cell cell = classifyCell(state, collision, boundedShallowWater);
+		cells.put(position, cell);
+		shallowWater.put(position, boundedShallowWater);
+		return cell;
 	}
 
 	boolean isShallowWater(GridPosition position) {
 		Objects.requireNonNull(position, "position must not be null");
-		return cellAt(position) == Cell.CLEAR
-				&& level.getBlockState(new BlockPos(position.x(), position.y(), position.z()))
-				.getFluidState().is(FluidTags.WATER);
+		cellAt(position);
+		return shallowWater.getOrDefault(position, false);
 	}
+
+	CacheMetrics cacheMetrics() {
+		return new CacheMetrics(cacheHits, cacheMisses, cells.size());
+	}
+
+	record CacheMetrics(long hits, long misses, int cachedCells) { }
 
 	double supportHeight(GridPosition feetPosition, double worldX, double worldZ) {
 		Objects.requireNonNull(feetPosition, "feetPosition must not be null");
