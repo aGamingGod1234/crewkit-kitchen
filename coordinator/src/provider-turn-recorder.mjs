@@ -3,6 +3,7 @@ import { appendFile as defaultAppendFile } from 'node:fs/promises';
 
 import { BestEffortDiagnosticQueue } from './best-effort-diagnostic-queue.mjs';
 import { sanitizeDiagnosticText, truncateDiagnosticUtf8 } from './diagnostic-sanitizer.mjs';
+import { preparePrivateArtifact } from './private-artifact-permissions.mjs';
 
 const MAX_PRIVATE_TEXT_BYTES = 65_536;
 const MAX_PUBLIC_EXCERPT_BYTES = 512;
@@ -15,12 +16,14 @@ export class ProviderTurnRecorder {
 	#privatePath;
 	#publicSink;
 	#appendFile;
+	#preparePrivateArtifact;
+	#ready;
 	#now;
 	#queue;
 	#closed = false;
 	#closePromise = null;
 
-	constructor({ runId, scenarioId, privatePath, publicSink = null, appendFile = defaultAppendFile, now = Date.now, ...queueOptions } = {}) {
+	constructor({ runId, scenarioId, privatePath, publicSink = null, appendFile = defaultAppendFile, preparePrivateArtifact: prepareArtifact = null, now = Date.now, ...queueOptions } = {}) {
 		if (typeof runId !== 'string' || runId.trim() === '') throw new TypeError('runId must be nonblank');
 		if (typeof scenarioId !== 'string' || scenarioId.trim() === '') throw new TypeError('scenarioId must be nonblank');
 		if (privatePath !== null && privatePath !== undefined && (typeof privatePath !== 'string' || privatePath.trim() === '')) throw new TypeError('privatePath must be nonblank or null');
@@ -32,6 +35,8 @@ export class ProviderTurnRecorder {
 		this.#privatePath = privatePath ?? null;
 		this.#publicSink = publicSink;
 		this.#appendFile = appendFile;
+		this.#preparePrivateArtifact = prepareArtifact ?? (appendFile === defaultAppendFile ? preparePrivateArtifact : async () => {});
+		this.#ready = this.#privatePath === null ? Promise.resolve(true) : this.#preparePrivateArtifact(this.#privatePath).then(() => true, () => false);
 		this.#now = now;
 		this.#queue = new BestEffortDiagnosticQueue(queueOptions);
 	}
@@ -43,13 +48,16 @@ export class ProviderTurnRecorder {
 			const privateRow = privateRecord(row);
 			const publicRow = publicRecord(row);
 			const encoded = `${JSON.stringify(privateRow)}\n`;
-			this.#queue.submit(() => {
+			this.#queue.submit(async () => {
 				const writes = [];
 				if (this.#publicSink !== null) {
 					try { writes.push(this.#publicSink(publicRow)); } catch { /* observational */ }
 				}
 				if (this.#privatePath !== null) {
-					try { writes.push(this.#appendFile(this.#privatePath, encoded, { encoding: 'utf8', flag: 'a' })); }
+					try {
+						if (!await this.#ready) return Promise.allSettled(writes);
+						writes.push(this.#appendFile(this.#privatePath, encoded, { encoding: 'utf8', flag: 'a', mode: 0o600 }));
+					}
 					catch { /* observational */ }
 				}
 				return Promise.allSettled(writes);

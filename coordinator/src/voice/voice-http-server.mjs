@@ -1,4 +1,5 @@
 import { createServer } from 'node:http';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 
 import { NoSttProvider } from './deepgram-stt-provider.mjs';
 import { resampleS16leMono } from './pcm-audio.mjs';
@@ -12,6 +13,11 @@ const DEFAULT_INITIAL_PROBE_DELAY_MS = 1_000;
 const DEFAULT_MAX_PROBE_DELAY_MS = 30_000;
 const DEFAULT_PROBE_TIMEOUT_MS = 10_000;
 const PROBE_PROFILE = builtInVoiceProfiles()[0];
+const AUTH_VERSION = 'arena-voice-v1';
+const AUTH_MAX_CLOCK_SKEW_MS = 30_000;
+const AUTH_NONCE_BYTES = 24;
+const MAX_AUTH_NONCES = 2_048;
+const DEFAULT_STT_PLAYER_MIN_INTERVAL_MS = 1_000;
 
 export function createVoiceHttpServer({
 	provider,
@@ -22,6 +28,7 @@ export function createVoiceHttpServer({
 	host = '127.0.0.1',
 	port = 8_766,
 	maxConcurrent = 5,
+	sttPlayerMinIntervalMs = DEFAULT_STT_PLAYER_MIN_INTERVAL_MS,
 	requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
 	now = Date.now,
 	scheduleProbe = defaultSchedule,
@@ -36,6 +43,9 @@ export function createVoiceHttpServer({
 	if (host !== '127.0.0.1' && host !== '::1') throw new TypeError('voice server must bind to loopback');
 	if (!Number.isSafeInteger(port) || port < 0 || port > 65_535) throw new TypeError('port is invalid');
 	if (!Number.isSafeInteger(maxConcurrent) || maxConcurrent < 1 || maxConcurrent > 5) throw new TypeError('maxConcurrent must be between 1 and 5');
+	if (!Number.isSafeInteger(sttPlayerMinIntervalMs) || sttPlayerMinIntervalMs < 1 || sttPlayerMinIntervalMs > 60_000) {
+		throw new TypeError('sttPlayerMinIntervalMs must be between 1 and 60000');
+	}
 	if (!Number.isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 1 || requestTimeoutMs > 600_000) throw new TypeError('requestTimeoutMs must be between 1 and 600000');
 	if (typeof now !== 'function' || typeof scheduleProbe !== 'function' || typeof cancelProbe !== 'function') {
 		throw new TypeError('voice probe clock and scheduler must be functions');
@@ -53,6 +63,9 @@ export function createVoiceHttpServer({
 	let live = false;
 	let closing = false;
 	let terminalFailure = null;
+	const authenticatedNonces = new Map();
+	const activeSttPlayers = new Set();
+	const sttNextAllowedAt = new Map();
 	const lifecycleOptions = {
 		now, schedule: scheduleProbe, cancelSchedule: cancelProbe,
 		initialRetryMs: initialProbeDelayMs, maxRetryMs: maxProbeDelayMs, probeTimeoutMs,
@@ -81,23 +94,45 @@ export function createVoiceHttpServer({
 			respondJson(response, 404, { code: 'NOT_FOUND' });
 			return;
 		}
-		if (request.headers.authorization !== `Bearer ${secret}`) {
+		const preparedAuthentication = prepareRequestAuthentication(request, authenticatedNonces, Date.now());
+		if (preparedAuthentication === null) {
+			respondJson(response, 401, { code: 'UNAUTHORIZED' });
+			return;
+		}
+		let requestBody;
+		try {
+			const maximumBytes = request.url === '/v1/stt' ? 48_000 * 2 * 20 : MAX_REQUEST_BYTES;
+			requestBody = await readRequestBody(request, maximumBytes, requestTimeoutMs);
+		} catch (error) {
+			if (!response.headersSent && !response.destroyed) respondJson(response, statusFor(error), {
+				code: String(error?.code ?? 'INVALID_REQUEST').slice(0, 64),
+				message: String(error?.message ?? error).slice(0, 256),
+			});
+			return;
+		}
+		const authentication = authenticateRequest(
+			request, secret, authenticatedNonces, preparedAuthentication, requestBody,
+		);
+		if (authentication === null) {
 			respondJson(response, 401, { code: 'UNAUTHORIZED' });
 			return;
 		}
 		if (active >= maxConcurrent) {
-			respondJson(response, 429, { code: 'TTS_CAPACITY' });
+			const code = request.url === '/v1/stt' ? 'STT_RATE_LIMITED' : 'TTS_CAPACITY';
+			respondAuthenticatedJson(response, 429, { code }, secret, authentication.nonce);
 			return;
 		}
 		const controller = new AbortController();
 		controllers.add(controller);
 		let released = false;
 		let providerOperation = null;
+		let sttPlayerId = null;
 		active += 1;
 		const release = () => {
 			if (released) return;
 			released = true;
 			active -= 1;
+			if (sttPlayerId !== null) activeSttPlayers.delete(sttPlayerId);
 			controllers.delete(controller);
 		};
 		const onRequestAborted = () => controller.abort();
@@ -119,7 +154,21 @@ export function createVoiceHttpServer({
 					throw typedError('STT_UNAVAILABLE', 'Speech recognition is not configured');
 				}
 				const metadata = validateSttHeaders(request.headers);
-				const pcm = await awaitAbortable(readBytes(request, 48_000 * 2 * 20), controller.signal);
+				const playerKey = metadata.playerId.toLowerCase();
+				const currentTime = Date.now();
+				for (const [candidate, retryAt] of sttNextAllowedAt) {
+					if (retryAt <= currentTime && !activeSttPlayers.has(candidate)) sttNextAllowedAt.delete(candidate);
+				}
+				if (activeSttPlayers.has(playerKey)) {
+					throw typedError('STT_PLAYER_BUSY', 'A transcription is already active for this player');
+				}
+				if (currentTime < (sttNextAllowedAt.get(playerKey) ?? 0)) {
+					throw typedError('STT_RATE_LIMITED', 'Player transcription rate limit exceeded');
+				}
+				activeSttPlayers.add(playerKey);
+				sttPlayerId = playerKey;
+				sttNextAllowedAt.set(playerKey, currentTime + sttPlayerMinIntervalMs);
+				const pcm = validatePcmBody(requestBody);
 				attemptedLifecycle = sttLifecycle;
 				providerOperation = Promise.resolve().then(() => sttProvider.transcribe({
 					pcm,
@@ -127,17 +176,17 @@ export function createVoiceHttpServer({
 				}));
 				const result = validateTranscriptResult(await awaitAbortable(providerOperation, controller.signal));
 				sttLifecycle.recordReady();
-				respondJson(response, 200, {
+				respondAuthenticatedJson(response, 200, {
 					playerId: metadata.playerId,
 					utteranceSequence: metadata.utteranceSequence,
 					whispering: metadata.whispering,
 					transcript: result.transcript,
 					confidence: result.confidence,
-				});
+				}, secret, authentication.nonce);
 				return;
 			}
 			requireJsonContentType(request.headers['content-type']);
-			const payload = validateRequest(await awaitAbortable(readJson(request), controller.signal));
+			const payload = validateRequest(parseJson(requestBody));
 			if (provider === null) {
 				attemptedLifecycle = ttsLifecycle;
 				const error = typedError('TTS_UNAVAILABLE', 'Speech synthesis is not configured');
@@ -169,21 +218,18 @@ export function createVoiceHttpServer({
 					cache.set(completedKey, output);
 				}
 			}
-			response.writeHead(200, {
-				'Content-Type': 'audio/L16',
-				'Content-Length': output.length,
+			respondAuthenticatedBytes(response, 200, output, 'audio/l16', secret, authentication.nonce, {
 				'X-Audio-Sample-Rate': '48000',
 				'X-Audio-Channels': '1',
 				'X-Voice-Profile': profile.profileId,
 				'Cache-Control': 'private, immutable',
 			});
-			response.end(output);
 		} catch (error) {
 			if (attemptedLifecycle !== null && error?.name !== 'AbortError') attemptedLifecycle.recordFailure(error);
-			if (!response.headersSent) respondJson(response, statusFor(error), {
+			if (!response.headersSent) respondAuthenticatedJson(response, statusFor(error), {
 				code: String(error?.code ?? 'TTS_ERROR').slice(0, 64),
 				message: String(error?.message ?? error).slice(0, 256),
-			});
+			}, secret, authentication.nonce);
 		} finally {
 			clearTimeout(timeout);
 			request.off('aborted', onRequestAborted);
@@ -293,6 +339,9 @@ export function createVoiceHttpServer({
 					catch { /* close still flushes assignments after a failed bind */ }
 				}
 				for (const controller of controllers) controller.abort();
+				authenticatedNonces.clear();
+				activeSttPlayers.clear();
+				sttNextAllowedAt.clear();
 				if (server.listening) {
 					await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 				}
@@ -546,32 +595,41 @@ function voiceFailureCode(error) {
 	return typeof value === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(value) ? value : 'VOICE_UNAVAILABLE';
 }
 
-async function readJson(request) {
-	const chunks = [];
-	let bytes = 0;
-	for await (const chunk of request) {
-		bytes += chunk.length;
-		if (bytes > MAX_REQUEST_BYTES) throw typedError('REQUEST_TOO_LARGE', 'Voice request exceeds 8 KiB');
-		chunks.push(chunk);
-	}
+function parseJson(body) {
 	try {
-		return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+		return JSON.parse(body.toString('utf8'));
 	} catch {
 		throw typedError('INVALID_JSON', 'Voice request must be valid JSON');
 	}
 }
 
-async function readBytes(request, maximum) {
+async function readRequestBody(request, maximum, deadlineMs) {
 	const chunks = [];
 	let bytes = 0;
-	for await (const chunk of request) {
-		bytes += chunk.length;
-		if (bytes > maximum) throw typedError('REQUEST_TOO_LARGE', 'Audio request exceeds the 20 second limit');
-		chunks.push(chunk);
+	let timedOut = false;
+	const timeout = setTimeout(() => {
+		timedOut = true;
+		request.destroy(typedError('REQUEST_TIMEOUT', 'Voice request body timed out'));
+	}, deadlineMs);
+	timeout.unref?.();
+	try {
+		for await (const chunk of request) {
+			bytes += chunk.length;
+			if (bytes > maximum) throw typedError('REQUEST_TOO_LARGE', 'Voice request exceeds its byte limit');
+			chunks.push(chunk);
+		}
+		return Buffer.concat(chunks);
+	} catch (error) {
+		if (timedOut) throw typedError('REQUEST_TIMEOUT', 'Voice request body timed out');
+		throw error;
+	} finally {
+		clearTimeout(timeout);
 	}
-	const result = Buffer.concat(chunks);
-	if (result.length === 0 || result.length % 2 !== 0) throw typedError('STT_MALFORMED_AUDIO', 'STT audio is invalid');
-	return result;
+}
+
+function validatePcmBody(body) {
+	if (body.length === 0 || body.length % 2 !== 0) throw typedError('STT_MALFORMED_AUDIO', 'STT audio is invalid');
+	return body;
 }
 
 function validateSttHeaders(headers) {
@@ -634,8 +692,9 @@ function statusFor(error) {
 	if (error?.httpStatus === 503) return 503;
 	if (error?.name === 'AbortError' || error?.name === 'TimeoutError') return 504;
 	if (error?.code === 'TTS_RATE_LIMITED' || error?.code === 'TTS_CAPACITY') return 429;
-	if (error?.code === 'STT_RATE_LIMITED') return 429;
+	if (error?.code === 'STT_RATE_LIMITED' || error?.code === 'STT_PLAYER_BUSY') return 429;
 	if (error?.code === 'STT_UNAVAILABLE') return 503;
+	if (error?.code === 'REQUEST_TIMEOUT') return 408;
 	if (['INVALID_REQUEST', 'INVALID_JSON', 'REQUEST_TOO_LARGE'].includes(error?.code)) return 400;
 	return 502;
 }
@@ -644,6 +703,126 @@ function respondJson(response, status, value) {
 	const body = Buffer.from(JSON.stringify(value));
 	response.writeHead(status, { 'Content-Type': 'application/json', 'Content-Length': body.length });
 	response.end(body);
+}
+
+function respondAuthenticatedJson(response, status, value, secret, requestNonce) {
+	respondAuthenticatedBytes(
+		response, status, Buffer.from(JSON.stringify(value)), 'application/json', secret, requestNonce,
+	);
+}
+
+function respondAuthenticatedBytes(response, status, body, contentType, secret, requestNonce, headers = {}) {
+	const signature = signResponse(secret, requestNonce, status, contentType, body);
+	response.writeHead(status, {
+		...headers,
+		'Content-Type': contentType,
+		'Content-Length': body.length,
+		'X-Voice-Response-Signature': signature,
+	});
+	response.end(body);
+}
+
+export function createVoiceRequestHeaders({
+	secret,
+	method = 'POST',
+	path,
+	contentType = '',
+	identityHeaders = {},
+	body = Buffer.alloc(0),
+	timestamp = Date.now(),
+	nonce = randomBytes(AUTH_NONCE_BYTES).toString('base64url'),
+} = {}) {
+	if (typeof secret !== 'string' || secret.length < 16) throw new TypeError('voice secret must contain at least 16 characters');
+	if (method !== 'POST' || !['/v1/tts', '/v1/stt'].includes(path)) throw new TypeError('voice request target is invalid');
+	if (!Number.isSafeInteger(timestamp) || timestamp < 0) throw new TypeError('voice request timestamp is invalid');
+	if (!isAuthenticationNonce(nonce)) throw new TypeError('voice request nonce is invalid');
+	if (!Buffer.isBuffer(body) && typeof body !== 'string' && !(body instanceof Uint8Array)) {
+		throw new TypeError('voice request body must be bytes or a string');
+	}
+	const normalizedMethod = method.toUpperCase();
+	return Object.freeze({
+		'X-Voice-Nonce': nonce,
+		'X-Voice-Timestamp': String(timestamp),
+		'X-Voice-Signature': signRequest(
+			secret, normalizedMethod, path, timestamp, nonce, contentType, identityHeaders, Buffer.from(body),
+		),
+	});
+}
+
+function prepareRequestAuthentication(request, nonces, currentTime) {
+	const nonce = request.headers['x-voice-nonce'];
+	const rawTimestamp = request.headers['x-voice-timestamp'];
+	const signature = request.headers['x-voice-signature'];
+	if (!isAuthenticationNonce(nonce)
+			|| typeof rawTimestamp !== 'string'
+			|| !/^\d{1,16}$/.test(rawTimestamp)
+			|| typeof signature !== 'string') return null;
+	const timestamp = Number(rawTimestamp);
+	if (!Number.isSafeInteger(timestamp) || Math.abs(currentTime - timestamp) > AUTH_MAX_CLOCK_SKEW_MS) return null;
+	for (const [candidate, expiresAt] of nonces) {
+		if (expiresAt <= currentTime) nonces.delete(candidate);
+	}
+	if (nonces.has(nonce) || nonces.size >= MAX_AUTH_NONCES) return null;
+	return { nonce, timestamp, signature, authenticatedAt: currentTime };
+}
+
+function authenticateRequest(request, secret, nonces, authentication, body) {
+	const { nonce, timestamp, signature, authenticatedAt } = authentication;
+	if (nonces.has(nonce)) return null;
+	const expected = signRequest(
+		secret, request.method, request.url, timestamp, nonce,
+		request.headers['content-type'], request.headers, body,
+	);
+	if (!safeSignatureEquals(signature, expected)) return null;
+	nonces.set(nonce, authenticatedAt + AUTH_MAX_CLOCK_SKEW_MS);
+	return { nonce };
+}
+
+function signRequest(secret, method, path, timestamp, nonce, contentType, identityHeaders, body) {
+	const digest = createHash('sha256').update(body).digest('hex');
+	return createHmac('sha256', secret)
+		.update(`${AUTH_VERSION}\nrequest\n${method}\n${path}\n${timestamp}\n${nonce}\n${canonicalContentType(contentType)}\n${canonicalIdentity(identityHeaders)}\n${digest}`, 'utf8')
+		.digest('base64url');
+}
+
+function canonicalContentType(value) {
+	return typeof value === 'string' ? value.trim().toLowerCase().replace(/\s+/g, '') : '';
+}
+
+function canonicalIdentity(headers) {
+	return `player-id=${canonicalHeader(headers, 'x-player-id', true)}\n`
+		+ `utterance-sequence=${canonicalHeader(headers, 'x-utterance-sequence', false)}\n`
+		+ `whispering=${canonicalHeader(headers, 'x-whispering', true)}`;
+}
+
+function canonicalHeader(headers, name, lowercase) {
+	let value;
+	if (headers instanceof Headers) value = headers.get(name);
+	else if (headers !== null && typeof headers === 'object') {
+		const entry = Object.entries(headers).find(([candidate]) => candidate.toLowerCase() === name);
+		value = entry?.[1];
+	}
+	if (typeof value !== 'string') return '';
+	const normalized = value.trim();
+	return lowercase ? normalized.toLowerCase() : normalized;
+}
+
+function signResponse(secret, requestNonce, status, contentType, body) {
+	const digest = createHash('sha256').update(body).digest('hex');
+	return createHmac('sha256', secret)
+		.update(`${AUTH_VERSION}\nresponse\n${requestNonce}\n${status}\n${contentType}\n${digest}`, 'utf8')
+		.digest('base64url');
+}
+
+function safeSignatureEquals(actual, expected) {
+	if (!/^[A-Za-z0-9_-]{43}$/.test(actual)) return false;
+	const actualBytes = Buffer.from(actual, 'base64url');
+	const expectedBytes = Buffer.from(expected, 'base64url');
+	return actualBytes.length === expectedBytes.length && timingSafeEqual(actualBytes, expectedBytes);
+}
+
+function isAuthenticationNonce(value) {
+	return typeof value === 'string' && /^[A-Za-z0-9_-]{32}$/.test(value);
 }
 
 function typedError(code, message) {

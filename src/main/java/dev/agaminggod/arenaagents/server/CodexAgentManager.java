@@ -795,6 +795,10 @@ public final class CodexAgentManager {
 	public boolean captureDeath(ServerPlayer player, DamageSource source) {
 		Objects.requireNonNull(player, "player must not be null");
 		Objects.requireNonNull(source, "source must not be null");
+		Optional<AgentRecord> matchedRecord = records().stream()
+				.filter(record -> OfflineAgentPlayers.isManagedFakePlayer(player, record.agentId(), record.profile()))
+				.findFirst();
+		if (matchedRecord.isEmpty()) return false;
 		long now = System.currentTimeMillis();
 		String cause;
 		try {
@@ -802,10 +806,7 @@ public final class CodexAgentManager {
 		} catch (RuntimeException ignored) {
 			cause = "Agent died";
 		}
-		records().stream()
-				.filter(record -> OfflineAgentPlayers.offlineUuid(record.agentId(), record.profile()).equals(player.getUUID()))
-				.findFirst()
-				.ifPresent(record -> AgentInputRuntime.clear(server, record.agentId()));
+		AgentInputRuntime.clear(server, matchedRecord.orElseThrow().agentId());
 		return AgentDeathCapture.record(
 				savedData.registry(), player.getUUID(), deathSnapshot(player, cause, now), now
 		);

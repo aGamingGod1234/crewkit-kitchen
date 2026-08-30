@@ -12,10 +12,20 @@ import dev.agaminggod.arenaagents.protocol.ProtocolException;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.LinkOption;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.AclEntry;
+import java.nio.file.attribute.AclEntryPermission;
+import java.nio.file.attribute.AclEntryType;
+import java.nio.file.attribute.AclFileAttributeView;
+import java.nio.file.attribute.PosixFileAttributeView;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.UserPrincipal;
+import java.util.EnumSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 import net.fabricmc.loader.api.FabricLoader;
@@ -29,12 +39,14 @@ public final class AgentConfigLoader {
 	private static final String FIELD_BRIDGE_PORT = "bridgePort";
 	private static final String FIELD_OBSERVATION_RADIUS = "observationRadius";
 	private static final String FIELD_ENABLED = "enabled";
+	private static final String FIELD_BRIDGE_SECRET = "bridgeSecret";
 	private static final String FIELD_HOST = "host";
 	private static final Set<String> ALLOWED_FIELDS = Set.of(
 			FIELD_AGENT_ID,
 			FIELD_BRIDGE_PORT,
 			FIELD_OBSERVATION_RADIUS,
 			FIELD_ENABLED,
+			FIELD_BRIDGE_SECRET,
 			FIELD_HOST
 	);
 	private static final Set<String> LOOPBACK_HOST_NAMES = Set.of(
@@ -83,6 +95,9 @@ public final class AgentConfigLoader {
 
 	public static AgentConfig load(Path path) throws IOException {
 		Path configPath = requirePath(path);
+		if (Files.isSymbolicLink(configPath)) {
+			throw new ProtocolException("CONFIG_PERMISSIONS_REQUIRED", "Credential-bearing config must not be a symbolic link");
+		}
 		long size = Files.size(configPath);
 		if (size > MAX_CONFIG_BYTES) {
 			throw new ProtocolException(
@@ -90,7 +105,9 @@ public final class AgentConfigLoader {
 					"Agent config exceeds maximum of " + MAX_CONFIG_BYTES + " UTF-8 bytes"
 			);
 		}
-		return parse(Files.readString(configPath, StandardCharsets.UTF_8));
+		AgentConfig config = parse(Files.readString(configPath, StandardCharsets.UTF_8));
+		enforcePrivateCredentialPermissions(configPath, config);
+		return config;
 	}
 
 	public static AgentConfig parse(String json) throws ProtocolException {
@@ -101,7 +118,8 @@ public final class AgentConfigLoader {
 				requireString(object, FIELD_AGENT_ID),
 				requireInteger(object, FIELD_BRIDGE_PORT),
 				requireInteger(object, FIELD_OBSERVATION_RADIUS),
-				requireBoolean(object, FIELD_ENABLED)
+				requireBoolean(object, FIELD_ENABLED),
+				optionalString(object, FIELD_BRIDGE_SECRET)
 		);
 	}
 
@@ -189,6 +207,82 @@ public final class AgentConfigLoader {
 
 	private static String requireString(JsonObject object, String field) {
 		JsonElement element = requireField(object, field);
+		if (!element.isJsonPrimitive() || !element.getAsJsonPrimitive().isString()) {
+			throw invalidField(field, "a string");
+		}
+		return element.getAsString();
+	}
+
+	private static void enforcePrivateCredentialPermissions(Path path, AgentConfig config) {
+		if (config.bridgeSecret().isEmpty()) {
+			return;
+		}
+		try {
+			PosixFileAttributeView posix = Files.getFileAttributeView(
+					path,
+					PosixFileAttributeView.class,
+					LinkOption.NOFOLLOW_LINKS
+			);
+			if (posix != null) {
+				Set<PosixFilePermission> ownerOnly = EnumSet.of(
+						PosixFilePermission.OWNER_READ,
+						PosixFilePermission.OWNER_WRITE
+				);
+				Files.setPosixFilePermissions(path, ownerOnly);
+				if (!posix.readAttributes().permissions().equals(ownerOnly)) {
+					throw privatePermissionsRequired();
+				}
+				return;
+			}
+
+			AclFileAttributeView acl = Files.getFileAttributeView(
+					path,
+					AclFileAttributeView.class,
+					LinkOption.NOFOLLOW_LINKS
+			);
+			if (acl == null) {
+				throw privatePermissionsRequired();
+			}
+			String currentUserName = System.getProperty("user.name");
+			if (currentUserName == null || currentUserName.isBlank()) throw privatePermissionsRequired();
+			UserPrincipal owner = path.getFileSystem().getUserPrincipalLookupService()
+					.lookupPrincipalByName(currentUserName);
+			acl.setOwner(owner);
+			Set<AclEntryPermission> ownerPermissions = EnumSet.allOf(AclEntryPermission.class);
+			AclEntry ownerEntry = AclEntry.newBuilder()
+					.setType(AclEntryType.ALLOW)
+					.setPrincipal(owner)
+					.setPermissions(ownerPermissions)
+					.build();
+			acl.setAcl(List.of(ownerEntry));
+			List<AclEntry> applied = acl.getAcl();
+			if (applied.size() != 1
+					|| applied.getFirst().type() != AclEntryType.ALLOW
+					|| !owner.equals(applied.getFirst().principal())
+					|| !applied.getFirst().permissions().containsAll(ownerPermissions)) {
+				throw privatePermissionsRequired();
+			}
+		} catch (IOException | UnsupportedOperationException | SecurityException exception) {
+			throw new ProtocolException(
+					"CONFIG_PERMISSIONS_REQUIRED",
+					"Credential-bearing config requires owner-only filesystem permissions",
+					exception
+			);
+		}
+	}
+
+	private static ProtocolException privatePermissionsRequired() {
+		return new ProtocolException(
+				"CONFIG_PERMISSIONS_REQUIRED",
+				"Credential-bearing config requires owner-only filesystem permissions"
+		);
+	}
+
+	private static String optionalString(JsonObject object, String field) {
+		if (!object.has(field) || object.get(field).isJsonNull()) {
+			return AgentConfig.DEFAULT_BRIDGE_SECRET;
+		}
+		JsonElement element = object.get(field);
 		if (!element.isJsonPrimitive() || !element.getAsJsonPrimitive().isString()) {
 			throw invalidField(field, "a string");
 		}

@@ -13,6 +13,8 @@ import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.util.Base64;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
@@ -131,7 +133,7 @@ public final class AgentVerboseVerification {
 			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
 				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
 				socket.setSoTimeout(1_000);
-				sendHello(socket, codec, secret, "hello-verbose-event");
+				sendHello(socket, reader, codec, secret, "hello-verbose-event");
 				BridgeEnvelope helloAck = codec.decode(reader.readLine());
 				assertEquals("hello_ack", helloAck.type(), "event fixture authenticates");
 				assertEquals("verbose_control", codec.decode(reader.readLine()).type(), "event fixture receives control");
@@ -184,7 +186,7 @@ public final class AgentVerboseVerification {
 			try (Socket first = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
 				 BufferedReader reader = new BufferedReader(new InputStreamReader(first.getInputStream(), StandardCharsets.UTF_8))) {
 				first.setSoTimeout(1_000);
-				sendHello(first, codec, secret, "hello-verbose-first");
+				sendHello(first, reader, codec, secret, "hello-verbose-first");
 				assertEquals("hello_ack", codec.decode(reader.readLine()).type(), "first session authenticates");
 				assertEquals(false, codec.decode(reader.readLine()).payload().get("enabled").getAsBoolean(),
 						"first session receives disabled control");
@@ -203,7 +205,7 @@ public final class AgentVerboseVerification {
 			try (Socket second = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
 				 BufferedReader reader = new BufferedReader(new InputStreamReader(second.getInputStream(), StandardCharsets.UTF_8))) {
 				second.setSoTimeout(1_000);
-				sendHello(second, codec, secret, "hello-verbose-second");
+				sendHello(second, reader, codec, secret, "hello-verbose-second");
 				assertEquals("hello_ack", codec.decode(reader.readLine()).type(), "replacement session authenticates");
 				assertEquals(true, codec.decode(reader.readLine()).payload().get("enabled").getAsBoolean(),
 						"replacement coordinator inherits the enabled server setting");
@@ -237,12 +239,7 @@ public final class AgentVerboseVerification {
 			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
 				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
 				socket.setSoTimeout(750);
-				JsonObject hello = new JsonObject();
-				hello.addProperty("secret", secret);
-				socket.getOutputStream().write(codec.encode(new BridgeEnvelope(
-						2, "coordinator", "server", "hello", "hello-verbose-default", hello
-				)).getBytes(StandardCharsets.UTF_8));
-				socket.getOutputStream().flush();
+				sendHello(socket, reader, codec, secret, "hello-verbose-default");
 
 				assertEquals("hello_ack", codec.decode(reader.readLine()).type(),
 						"authentication acknowledges the coordinator first");
@@ -289,12 +286,28 @@ public final class AgentVerboseVerification {
 		}
 	}
 
-	private static void sendHello(Socket socket, BridgeEnvelopeCodec codec, String secret, String messageId)
-			throws java.io.IOException {
-		JsonObject hello = new JsonObject();
-		hello.addProperty("secret", secret);
+	private static void sendHello(Socket socket, BufferedReader reader, BridgeEnvelopeCodec codec, String secret, String messageId)
+			throws Exception {
+		String clientNonce = Base64.getUrlEncoder().withoutPadding().encodeToString(
+				MessageDigest.getInstance("SHA-256").digest(messageId.getBytes(StandardCharsets.UTF_8))
+		);
+		JsonObject challenge = new JsonObject();
+		challenge.addProperty("clientNonce", clientNonce);
 		socket.getOutputStream().write(codec.encode(new BridgeEnvelope(
-				2, "coordinator", "server", "hello", messageId, hello
+				2, "pending", "server", "auth_challenge", messageId + "-challenge", challenge
+		)).getBytes(StandardCharsets.UTF_8));
+		socket.getOutputStream().flush();
+		BridgeEnvelope response = codec.decode(reader.readLine());
+		String serverNonce = response.payload().get("serverNonce").getAsString();
+		JsonObject hello = new JsonObject();
+		hello.addProperty("replyTo", response.messageId());
+		hello.addProperty("clientNonce", clientNonce);
+		hello.addProperty("serverNonce", serverNonce);
+		hello.addProperty("proof", MultiplexedServerBridge.authenticationProof(
+				secret, "coordinator", clientNonce, serverNonce, response.serverInstanceId(), null
+		));
+		socket.getOutputStream().write(codec.encode(new BridgeEnvelope(
+				2, response.serverInstanceId(), "server", "hello", messageId, hello
 		)).getBytes(StandardCharsets.UTF_8));
 		socket.getOutputStream().flush();
 	}

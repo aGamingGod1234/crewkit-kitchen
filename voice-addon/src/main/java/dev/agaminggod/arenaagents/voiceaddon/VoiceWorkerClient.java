@@ -7,13 +7,16 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicReference;
 
 final class VoiceWorkerClient {
 	private static final int MAX_SAMPLES = 48_000 * 20;
@@ -45,10 +48,11 @@ final class VoiceWorkerClient {
 	}
 
 	VoiceWorkerClient(HttpClient client, URI endpoint, String secret, Duration requestTimeout) {
-		this.client = client;
-		this.endpoint = endpoint;
+		this.client = java.util.Objects.requireNonNull(client, "client must not be null");
+		this.endpoint = java.util.Objects.requireNonNull(endpoint, "endpoint must not be null");
+		if (secret == null || secret.length() < 16) throw new IllegalArgumentException("secret is too short");
 		this.secret = secret;
-		this.requestTimeout = requestTimeout;
+		this.requestTimeout = java.util.Objects.requireNonNull(requestTimeout, "requestTimeout must not be null");
 	}
 
 	CompletableFuture<short[]> synthesize(VoiceRequest request) {
@@ -58,18 +62,42 @@ final class VoiceWorkerClient {
 		payload.addProperty("profileId", request.profileId());
 		payload.addProperty("radius", request.radius());
 		payload.addProperty("conversationSequence", request.conversationSequence());
-		HttpRequest httpRequest = HttpRequest.newBuilder(endpoint)
+		String contentType = "application/json";
+		byte[] requestBody = payload.toString().getBytes(StandardCharsets.UTF_8);
+		HttpRequest.Builder requestBuilder = HttpRequest.newBuilder(endpoint)
 				.timeout(requestTimeout)
-				.header("Authorization", "Bearer " + secret)
-				.header("Content-Type", "application/json")
-				.POST(HttpRequest.BodyPublishers.ofString(payload.toString(), StandardCharsets.UTF_8))
-				.build();
-		CompletableFuture<HttpResponse<byte[]>> exchange = client.sendAsync(
-				httpRequest, HttpResponse.BodyHandlers.ofByteArray()
+				.header("Content-Type", contentType);
+		String requestNonce = VoiceHttpAuthentication.authenticate(
+				requestBuilder, secret, "POST", endpoint, contentType, Map.of(), requestBody
 		);
-		CompletableFuture<short[]> result = exchange.thenApply(response -> {
+		HttpRequest httpRequest = requestBuilder
+				.POST(HttpRequest.BodyPublishers.ofByteArray(requestBody))
+				.build();
+		CompletableFuture<HttpResponse<InputStream>> exchange = client.sendAsync(
+				httpRequest, HttpResponse.BodyHandlers.ofInputStream()
+		);
+		AtomicReference<CompletableFuture<byte[]>> bodyRead = new AtomicReference<>();
+		CompletableFuture<short[]> result = exchange.thenCompose(response -> {
+					int maximumBytes = response.statusCode() == 200 ? MAX_SAMPLES * 2 : 8 * 1024;
+					CompletableFuture<byte[]> reading = VoiceHttpAuthentication.readAuthenticatedBody(
+							response, secret, requestNonce, maximumBytes, requestTimeout, () -> exchange.cancel(true)
+					);
+					bodyRead.set(reading);
+					return reading.thenApply(bytes -> decodeResponse(response, bytes));
+				});
+		result.whenComplete((samples, failure) -> {
+			if (result.isCancelled()) {
+				CompletableFuture<byte[]> reading = bodyRead.get();
+				if (reading != null) reading.cancel(true);
+				exchange.cancel(true);
+			}
+		});
+		return result;
+	}
+
+	private static short[] decodeResponse(HttpResponse<?> response, byte[] bytes) {
 					if (response.statusCode() != 200) {
-						throw workerHttpFailure(response);
+						throw workerHttpFailure(response, bytes);
 					}
 					String contentType = response.headers().firstValue("Content-Type").orElse("")
 							.toLowerCase(Locale.ROOT).split(";", 2)[0].strip();
@@ -80,7 +108,6 @@ final class VoiceWorkerClient {
 								"VOICE_WORKER_AUDIO", "Voice worker returned invalid 48 kHz mono PCM metadata"
 						);
 					}
-					byte[] bytes = response.body();
 					if (bytes.length == 0 || bytes.length % 2 != 0 || bytes.length > MAX_SAMPLES * 2) {
 						throw new VoiceWorkerException("VOICE_WORKER_AUDIO", "Voice worker returned invalid 48 kHz mono PCM");
 					}
@@ -88,21 +115,16 @@ final class VoiceWorkerClient {
 					short[] samples = new short[bytes.length / 2];
 					buffer.asShortBuffer().get(samples);
 					return samples;
-				});
-		result.whenComplete((samples, failure) -> {
-			if (result.isCancelled()) exchange.cancel(true);
-		});
-		return result;
 	}
 
-	private static VoiceWorkerException workerHttpFailure(HttpResponse<byte[]> response) {
+	private static VoiceWorkerException workerHttpFailure(HttpResponse<?> response, byte[] body) {
 		String code = "VOICE_WORKER_HTTP";
 		String contentType = response.headers().firstValue("Content-Type").orElse("")
 				.toLowerCase(Locale.ROOT).split(";", 2)[0].strip();
-		if (contentType.equals("application/json") && response.body().length <= 1_024) {
+		if (contentType.equals("application/json") && body.length <= 1_024) {
 			try {
 				JsonObject payload = com.google.gson.JsonParser.parseString(
-						new String(response.body(), StandardCharsets.UTF_8)
+						new String(body, StandardCharsets.UTF_8)
 				).getAsJsonObject();
 				if (payload.has("code") && payload.get("code").isJsonPrimitive()) {
 					String candidate = payload.get("code").getAsString();

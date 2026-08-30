@@ -223,6 +223,8 @@ test('Codex launch retains provider configuration but strips bridge credentials'
 		env: {
 			APPDATA: 'C:\\Users\\lucas\\AppData\\Roaming',
 			PATH: 'C:\\Windows\\System32',
+			OPENAI_API_KEY: 'openai-key',
+			FISH_AUDIO_API_KEY: 'voice-key',
 			ARENA_AGENT_BRIDGE_SECRET: 'bridge-secret',
 			ARENA_AGENT_BRIDGE_SECRET_FILE: 'C:\\runtime\\bridge.secret',
 		},
@@ -230,6 +232,8 @@ test('Codex launch retains provider configuration but strips bridge credentials'
 		existsSync: () => true,
 	});
 	assert.equal(launch.environment.PATH, 'C:\\Windows\\System32');
+	assert.equal(launch.environment.OPENAI_API_KEY, 'openai-key');
+	assert.equal(launch.environment.FISH_AUDIO_API_KEY, undefined);
 	assert.equal(launch.environment.ARENA_AGENT_BRIDGE_SECRET, undefined);
 	assert.equal(launch.environment.ARENA_AGENT_BRIDGE_SECRET_FILE, undefined);
 });

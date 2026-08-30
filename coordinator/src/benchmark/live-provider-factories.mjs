@@ -29,7 +29,7 @@ export function createLiveProviderFactory(providerValue, options = {}) {
 	const bridgeSecretEnvironmentVariable = options.bridgeSecretEnvironmentVariable
 		?? options.config?.bridge?.secretEnvironmentVariable
 		?? DEFAULT_BRIDGE_SECRET_ENVIRONMENT_VARIABLE;
-	const providerEnvironment = createProviderChildEnvironment(environment, bridgeSecretEnvironmentVariable);
+	const providerEnvironment = createProviderChildEnvironment(provider, environment, bridgeSecretEnvironmentVariable);
 	const config = providerConfig(provider, options.config, options);
 	const workspaceManager = options.workspaceManager
 		?? new AgentWorkspaceManager(options.workspaceRoot ?? options.config?.workspaceRoot ?? path.join(process.cwd(), 'runtime', 'agent-workspaces'), options.workspaceDependencies);

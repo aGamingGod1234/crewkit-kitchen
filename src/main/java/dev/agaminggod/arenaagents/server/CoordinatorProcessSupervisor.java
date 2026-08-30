@@ -10,7 +10,10 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.HexFormat;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -376,8 +379,10 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			Path main,
 			Path config,
 			Path secret,
+			Path voiceSecretPath,
 			Path nodeExecutable,
 			String bridgeSecret,
+			String voiceSecret,
 			int bridgePort,
 			String generationId,
 			boolean candidate,
@@ -393,7 +398,8 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				String bridgeSecret
 		) {
 			this(
-					root, coordinatorRoot, main, config, secret, nodeExecutable, bridgeSecret, 25_570,
+					root, coordinatorRoot, main, config, secret, defaultVoiceSecretPath(secret), nodeExecutable,
+					bridgeSecret, derivedVoiceSecret(bridgeSecret), 25_570,
 					"0".repeat(64), false, false
 			);
 		}
@@ -410,7 +416,26 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				boolean candidate,
 				boolean lastKnownGoodAvailable
 		) {
-			this(root, coordinatorRoot, main, config, secret, nodeExecutable, bridgeSecret, 25_570,
+			this(root, coordinatorRoot, main, config, secret, defaultVoiceSecretPath(secret), nodeExecutable,
+					bridgeSecret, derivedVoiceSecret(bridgeSecret), 25_570,
+					generationId, candidate, lastKnownGoodAvailable);
+		}
+
+		PreparedRuntime(
+				Path root,
+				Path coordinatorRoot,
+				Path main,
+				Path config,
+				Path secret,
+				Path nodeExecutable,
+				String bridgeSecret,
+				int bridgePort,
+				String generationId,
+				boolean candidate,
+				boolean lastKnownGoodAvailable
+		) {
+			this(root, coordinatorRoot, main, config, secret, defaultVoiceSecretPath(secret), nodeExecutable,
+					bridgeSecret, derivedVoiceSecret(bridgeSecret), bridgePort,
 					generationId, candidate, lastKnownGoodAvailable);
 		}
 
@@ -420,10 +445,20 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			main = normalized(main, "coordinator main");
 			config = normalized(config, "coordinator config");
 			secret = normalized(secret, "bridge secret");
+			voiceSecretPath = normalized(voiceSecretPath, "voice secret");
 			nodeExecutable = nodeExecutable == null ? null : normalized(nodeExecutable, "Node executable");
 			bridgeSecret = Objects.requireNonNull(bridgeSecret, "bridge secret value must not be null").strip();
+			voiceSecret = Objects.requireNonNull(voiceSecret, "voice secret value must not be null").strip();
 			if (bridgeSecret.length() < 32 || bridgeSecret.length() > MAX_BRIDGE_SECRET_LENGTH) {
 				throw new IllegalArgumentException("bridge secret value is invalid");
+			}
+			if (voiceSecret.length() < 32 || voiceSecret.length() > MAX_BRIDGE_SECRET_LENGTH) {
+				throw new IllegalArgumentException("voice secret value is invalid");
+			}
+			if (MessageDigest.isEqual(
+					bridgeSecret.getBytes(StandardCharsets.UTF_8), voiceSecret.getBytes(StandardCharsets.UTF_8)
+			)) {
+				throw new IllegalArgumentException("bridge and voice secrets must be distinct");
 			}
 			if (bridgePort < 1_024 || bridgePort > 65_535) {
 				throw new IllegalArgumentException("bridge port must be between 1024 and 65535");
@@ -431,6 +466,24 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			generationId = Objects.requireNonNull(generationId, "generation ID must not be null");
 			if (!generationId.matches("[0-9a-f]{64}")) {
 				throw new IllegalArgumentException("coordinator generation ID is invalid");
+			}
+		}
+
+		private static Path defaultVoiceSecretPath(Path bridgeSecretPath) {
+			return Objects.requireNonNull(bridgeSecretPath, "bridge secret must not be null")
+					.resolveSibling("voice-secret.txt");
+		}
+
+		private static String derivedVoiceSecret(String bridgeSecret) {
+			try {
+				MessageDigest digest = MessageDigest.getInstance("SHA-256");
+				digest.update("arena-agents-voice-secret-v1\0".getBytes(StandardCharsets.UTF_8));
+				return HexFormat.of().formatHex(digest.digest(
+						Objects.requireNonNull(bridgeSecret, "bridge secret must not be null")
+								.getBytes(StandardCharsets.UTF_8)
+				));
+			} catch (NoSuchAlgorithmException exception) {
+				throw new IllegalStateException("SHA-256 is unavailable", exception);
 			}
 		}
 
@@ -475,6 +528,10 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 
 	synchronized Path secretPath() {
 		return runtime == null ? null : runtime.secret();
+	}
+
+	synchronized Path voiceSecretPath() {
+		return runtime == null ? null : runtime.voiceSecretPath();
 	}
 
 	synchronized String bridgeSecret() {
@@ -789,8 +846,10 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 						|| !Objects.equals(previous.main(), runtime.main())
 						|| !Objects.equals(previous.config(), runtime.config())
 						|| !Objects.equals(previous.secret(), runtime.secret())
+						|| !Objects.equals(previous.voiceSecretPath(), runtime.voiceSecretPath())
 						|| !Objects.equals(previous.nodeExecutable(), runtime.nodeExecutable())
 						|| !Objects.equals(previous.bridgeSecret(), runtime.bridgeSecret())
+						|| !Objects.equals(previous.voiceSecret(), runtime.voiceSecret())
 						|| previous.bridgePort() != runtime.bridgePort()
 						|| !Objects.equals(previous.generationId(), runtime.generationId())
 		);
@@ -804,11 +863,13 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			candidateAttemptQualified = false;
 			rollbackRequested = false;
 		}
-		if (runtime != null) configureSharedBridgeSecretPath(runtime.secret());
+		if (runtime != null) configureSharedSecretPaths(runtime.secret(), runtime.voiceSecretPath());
 		if (runtime != null) configureSharedVoiceEndpoint(runtime.config());
 		boolean sharedSecretChanged = runtime != null && (previous == null
 				|| !previous.secret().equals(runtime.secret())
-				|| !previous.bridgeSecret().equals(runtime.bridgeSecret()));
+				|| !previous.voiceSecretPath().equals(runtime.voiceSecretPath())
+				|| !previous.bridgeSecret().equals(runtime.bridgeSecret())
+				|| !previous.voiceSecret().equals(runtime.voiceSecret()));
 		if (sharedSecretChanged) sharedSecretRevision++;
 		if (runtime != null && (sharedSecretChanged
 				|| previous.bridgePort() != runtime.bridgePort())) {
@@ -1119,7 +1180,8 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private static PreparedRuntime withGeneration(PreparedRuntime runtime, GenerationStatus status) {
 		return new PreparedRuntime(
 				runtime.root(), runtime.coordinatorRoot(), runtime.main(), runtime.config(), runtime.secret(),
-				runtime.nodeExecutable(), runtime.bridgeSecret(), runtime.bridgePort(), status.generationId(), status.candidate(),
+				runtime.voiceSecretPath(), runtime.nodeExecutable(), runtime.bridgeSecret(), runtime.voiceSecret(),
+				runtime.bridgePort(), status.generationId(), status.candidate(),
 				status.lastKnownGoodAvailable()
 		);
 	}
@@ -1178,6 +1240,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		}
 		configureVoiceProviderCredential(prepared.root(), environment);
 		environment.put("ARENA_AGENT_BRIDGE_SECRET", prepared.bridgeSecret());
+		environment.put("ARENA_AGENT_VOICE_SECRET", prepared.voiceSecret());
 		environment.put("ARENA_AGENT_COORDINATOR_LAUNCH_ID", ownedLaunchId);
 		environment.put("ARENA_AGENT_COORDINATOR_RUNTIME_GENERATION", prepared.generationId());
 		Path logs = gameDirectory.resolve("logs");
@@ -1365,10 +1428,11 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		return !"false".equalsIgnoreCase(System.getProperty("arenaagents.coordinatorAutoStart"));
 	}
 
-	static void configureSharedBridgeSecretPath(Path secretPath) {
-		Path canonical = secretPath.toAbsolutePath().normalize();
-		System.setProperty("arenaagents.bridgeSecretFile", canonical.toString());
-		System.setProperty("arenaagents.voiceSecretFile", canonical.toString());
+	static void configureSharedSecretPaths(Path bridgeSecretPath, Path voiceSecretPath) {
+		Path canonicalBridge = bridgeSecretPath.toAbsolutePath().normalize();
+		Path canonicalVoice = voiceSecretPath.toAbsolutePath().normalize();
+		System.setProperty("arenaagents.bridgeSecretFile", canonicalBridge.toString());
+		System.setProperty("arenaagents.voiceSecretFile", canonicalVoice.toString());
 	}
 
 	void configureSharedVoiceEndpoint(Path configPath) {
@@ -1453,6 +1517,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 
 	private static boolean isPackageRoot(Path candidate) {
 		return Files.isRegularFile(candidate.resolve("runtime/bridge-secret.txt"))
+				&& Files.isRegularFile(candidate.resolve("runtime/voice-secret.txt"))
 				&& Files.isRegularFile(candidate.resolve("coordinator/src/dynamic-main.mjs"))
 				&& Files.isRegularFile(candidate.resolve("runtime/dynamic-agents.json"));
 	}
@@ -1987,14 +2052,13 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			ArrayList<String> values = new ArrayList<>();
 			values.add(Objects.toString(System.getProperty("arenaagents.packageRoot"), ""));
 			values.add(Objects.toString(System.getProperty(NodeRuntimeLocator.PROPERTY), ""));
-			String path = effectiveEnvironmentValue("PATH");
-			values.add(Objects.toString(path, ""));
 			values.add(fileStamp(root.resolve("coordinator/.arena-agents-bundle-manifest")));
 			values.add(fileStamp(root.resolve("coordinator.last-known-good/.arena-agents-bundle-manifest")));
 			values.add(fileStamp(root.resolve("coordinator/src/dynamic-main.mjs")));
 			values.add(fileStamp(root.resolve("runtime/coordinator-generation.properties")));
 			values.add(fileStamp(root.resolve("runtime/dynamic-agents.json")));
 			values.add(fileStamp(root.resolve("runtime/bridge-secret.txt")));
+			values.add(fileStamp(root.resolve("runtime/voice-secret.txt")));
 			values.add(fileStamp(bundledNode(root)));
 			String explicit = System.getProperty(NodeRuntimeLocator.PROPERTY);
 			if (explicit != null && !explicit.isBlank()) {
@@ -2002,18 +2066,6 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 					values.add(fileStamp(Path.of(explicit)));
 				} catch (RuntimeException invalid) {
 					values.add("invalid-explicit-node");
-				}
-			}
-			String executableName = System.getProperty("os.name", "")
-					.toLowerCase(java.util.Locale.ROOT).contains("win") ? "node.exe" : "node";
-			if (path != null && !path.isBlank()) {
-				for (String entry : path.split(java.util.regex.Pattern.quote(java.io.File.pathSeparator), -1)) {
-					if (entry.isBlank()) continue;
-					try {
-						values.add(fileStamp(Path.of(entry).resolve(executableName)));
-					} catch (RuntimeException invalid) {
-						values.add("invalid-path-entry");
-					}
 				}
 			}
 			for (Map.Entry<String, String> override : environmentOverrides.entrySet()) {
@@ -2027,8 +2079,16 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		@Override
 		public DependencyResolution resolve() {
 			BundledCoordinatorInstaller.RuntimePackage prepared = null;
+			Path installedRoot = gameDirectory.resolve("arena-agents-runtime");
+			Path existingRoot = findPackageRoot(gameDirectory);
+			Path nodeRoot = existingRoot == null ? installedRoot : existingRoot;
+			NodeRuntimeLocator.LocatedNode node;
 			try {
-				Path installedRoot = gameDirectory.resolve("arena-agents-runtime");
+				node = NodeRuntimeLocator.locate(nodeRoot);
+			} catch (NodeRuntimeLocator.NodeRuntimeFailure failure) {
+				return DependencyResolution.blocked(null, failure.code(), failure.getMessage());
+			}
+			try {
 				IOException installFailure = null;
 				try {
 					if (BundledCoordinatorInstaller.installBundled(installedRoot)) {
@@ -2068,15 +2128,10 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 						throw invalidRuntime;
 					}
 				}
-				String secret = Files.readString(prepared.secret(), StandardCharsets.UTF_8).trim();
 				validateConfig(prepared.config());
-				PreparedRuntime partial = prepared(prepared, null, secret);
-				try {
-					NodeRuntimeLocator.LocatedNode node = NodeRuntimeLocator.locate(prepared.root());
-					return DependencyResolution.ready(prepared(prepared, node.executable(), secret));
-				} catch (NodeRuntimeLocator.NodeRuntimeFailure failure) {
-					return DependencyResolution.blocked(partial, failure.code(), failure.getMessage());
-				}
+				String secret = Files.readString(prepared.secret(), StandardCharsets.UTF_8).trim();
+				String voiceSecret = Files.readString(prepared.voiceSecret(), StandardCharsets.UTF_8).trim();
+				return DependencyResolution.ready(prepared(prepared, node.executable(), secret, voiceSecret));
 			} catch (IOException failure) {
 				return DependencyResolution.blocked(
 						prepared == null ? null : safePartial(prepared),
@@ -2091,20 +2146,15 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			}
 		}
 
-		private String effectiveEnvironmentValue(String name) {
-			for (Map.Entry<String, String> override : environmentOverrides.entrySet()) {
-				if (override.getKey().equalsIgnoreCase(name)) return override.getValue();
-			}
-			return System.getenv(name);
-		}
-
 		private static PreparedRuntime prepared(
 				BundledCoordinatorInstaller.RuntimePackage runtime,
 				Path node,
-				String secret
+				String secret,
+				String voiceSecret
 		) {
 			return new PreparedRuntime(
-					runtime.root(), runtime.coordinatorRoot(), runtime.main(), runtime.config(), runtime.secret(), node, secret,
+					runtime.root(), runtime.coordinatorRoot(), runtime.main(), runtime.config(), runtime.secret(),
+					runtime.voiceSecret(), node, secret, voiceSecret,
 					bridgePort(runtime.config()), runtime.generationId(), runtime.candidate(), runtime.lastKnownGoodAvailable()
 			);
 		}
@@ -2112,7 +2162,8 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		private static PreparedRuntime safePartial(BundledCoordinatorInstaller.RuntimePackage runtime) {
 			try {
 				String secret = Files.readString(runtime.secret(), StandardCharsets.UTF_8).trim();
-				return prepared(runtime, null, secret);
+				String voiceSecret = Files.readString(runtime.voiceSecret(), StandardCharsets.UTF_8).trim();
+				return prepared(runtime, null, secret, voiceSecret);
 			} catch (IOException | RuntimeException ignored) {
 				return null;
 			}

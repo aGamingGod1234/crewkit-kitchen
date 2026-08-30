@@ -16,8 +16,8 @@ public final class ScenarioSavedData extends SavedData {
 	private static final String PAYLOAD_FIELD = "payload";
 	private static final String PAYLOAD_CHUNKS_FIELD = "payload_chunks";
 	private static final Codec<ScenarioSavedData> CODEC = RecordCodecBuilder.create(instance -> instance.group(
-			Codec.STRING.optionalFieldOf(PAYLOAD_FIELD, "").forGetter(data -> ""),
-			Codec.STRING.listOf().optionalFieldOf(PAYLOAD_CHUNKS_FIELD, List.of()).forGetter(data -> ChunkedSavedPayload.split(data.encodePayload()))
+			ChunkedSavedPayload.legacyCodec().optionalFieldOf(PAYLOAD_FIELD, "").forGetter(data -> ""),
+			ChunkedSavedPayload.chunksCodec().optionalFieldOf(PAYLOAD_CHUNKS_FIELD, List.of()).forGetter(data -> ChunkedSavedPayload.split(data.encodePayload()))
 	).apply(instance, ScenarioSavedData::decodePayload));
 	public static final SavedDataType<ScenarioSavedData> TYPE = new SavedDataType<>(
 			Identifier.fromNamespaceAndPath("arenaagents", "scenario_run"),

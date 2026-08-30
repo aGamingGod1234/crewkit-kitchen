@@ -22,17 +22,25 @@ import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 
 /** Starts one staged coordinator with an isolated, empty PATH and validates its first catalog. */
 public final class CoordinatorStartupSmokeVerification {
 	private static final long STARTUP_TIMEOUT_MS = 15_000L;
 
 	private CoordinatorStartupSmokeVerification() {
+	}
+
+	public static void main(String[] arguments) throws Exception {
+		if (arguments.length != 0) throw new IllegalArgumentException("Coordinator startup smoke takes no arguments");
+		verify();
 	}
 
 	public static int verify() throws Exception {
@@ -49,6 +57,9 @@ public final class CoordinatorStartupSmokeVerification {
 		String oldVoiceRequestTimeout = System.getProperty("arenaagents.voiceRequestTimeoutMs");
 		CoordinatorProcessSupervisor supervisor = null;
 		try {
+			int trustBoundaryAssertions = verifyPathRejectedBeforeSecretRead(
+					packageRoot.resolve("path-rejection"), oldPackageRoot, oldNodePath
+			);
 			stageCoordinator(sourceCoordinator, packageRoot);
 			System.setProperty("arenaagents.packageRoot", packageRoot.toString());
 			assertEquals(2, CoordinatorProcessSupervisor.ownershipRoots(packageRoot.resolve("game")).size(),
@@ -106,7 +117,7 @@ public final class CoordinatorStartupSmokeVerification {
 						if (completeHandshakeAndCatalog(socket)) {
 							assertTrue(awaitLoopbackListener(voicePort, 5_000L),
 								"runtime Fish credential starts the loopback voice worker");
-							return 12 + credentialAssertions;
+							return 12 + credentialAssertions + trustBoundaryAssertions;
 						}
 					} catch (java.net.SocketTimeoutException ignored) {
 						// The supervisor's startup grace is intentionally polled without shell state.
@@ -152,11 +163,35 @@ public final class CoordinatorStartupSmokeVerification {
 		BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
 		try (BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
 			 BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8))) {
+			String secret = "s".repeat(32);
+			JsonObject challenge = JsonParser.parseString(reader.readLine()).getAsJsonObject();
+			assertEquals("auth_challenge", challenge.get("type").getAsString(),
+					"coordinator starts without releasing a secret-derived proof");
+			String clientNonce = challenge.getAsJsonObject("payload").get("clientNonce").getAsString();
+			String serverNonce = Base64.getUrlEncoder().withoutPadding().encodeToString(
+					MessageDigest.getInstance("SHA-256").digest("startup-smoke-server".getBytes(StandardCharsets.UTF_8))
+			);
+			JsonObject authPayload = new JsonObject();
+			authPayload.addProperty("replyTo", challenge.get("messageId").getAsString());
+			authPayload.addProperty("clientNonce", clientNonce);
+			authPayload.addProperty("serverNonce", serverNonce);
+			authPayload.addProperty("proof", authenticationProof(
+					secret, "server", clientNonce, serverNonce, "startup-smoke-server", null
+			));
+			writer.write(codec.encode(new BridgeEnvelope(
+					2, "startup-smoke-server", "server", "auth_response", "startup-smoke-auth", authPayload
+			)));
+			writer.flush();
 			String helloLine = reader.readLine();
 			JsonObject hello = JsonParser.parseString(helloLine).getAsJsonObject();
-			assertEquals("hello", hello.get("type").getAsString(), "coordinator starts with hello");
+			assertEquals("hello", hello.get("type").getAsString(), "coordinator authenticates after the server proof");
 			String launchId = hello.getAsJsonObject("payload").get("launchId").getAsString();
 			java.util.UUID.fromString(launchId);
+			assertEquals(
+					authenticationProof(secret, "coordinator", clientNonce, serverNonce, "startup-smoke-server", launchId),
+					hello.getAsJsonObject("payload").get("proof").getAsString(),
+					"coordinator proof is bound to both nonces and the staged launch identity"
+			);
 			JsonObject payload = new JsonObject();
 			payload.addProperty("replyTo", hello.get("messageId").getAsString());
 			payload.addProperty("authenticated", true);
@@ -199,6 +234,61 @@ public final class CoordinatorStartupSmokeVerification {
 			assertTrue(stagedModelReady, "catalog-ready boundary contains the staged Codex model");
 			return true;
 		}
+	}
+
+	private static int verifyPathRejectedBeforeSecretRead(
+			Path root,
+			String oldPackageRoot,
+			String oldNodePath
+	) throws Exception {
+		Path maliciousDirectory = root.resolve("malicious-path");
+		Path maliciousNode = maliciousDirectory.resolve(isWindows() ? "node.exe" : "node");
+		Files.createDirectories(maliciousDirectory);
+		stageHostNode(maliciousNode);
+		Path invalidSecret = root.resolve("runtime/bridge-secret.txt");
+		Files.createDirectories(invalidSecret);
+		Map<String, String> maliciousPath = new HashMap<>();
+		maliciousPath.put("PATH", maliciousDirectory.toString());
+		CoordinatorProcessSupervisor blocked = null;
+		try {
+			System.setProperty("arenaagents.packageRoot", root.toString());
+			System.clearProperty(NodeRuntimeLocator.PROPERTY);
+			blocked = new CoordinatorProcessSupervisor(root.resolve("game"), maliciousPath);
+			long deadline = System.currentTimeMillis() + STARTUP_TIMEOUT_MS;
+			while (blocked.failureCode() == null && System.currentTimeMillis() < deadline) {
+				blocked.tick(false);
+				Thread.sleep(10L);
+			}
+			assertEquals("NODE_RUNTIME_NOT_FOUND", blocked.failureCode(),
+					"malicious PATH cannot satisfy coordinator Node trust");
+			assertTrue(Files.isDirectory(invalidSecret),
+					"Node trust fails before the bridge secret target is examined");
+			assertTrue(!Files.exists(root.resolve("coordinator")),
+					"Node trust fails before coordinator installation reads or creates secrets");
+			return 3;
+		} finally {
+			if (blocked != null) blocked.close();
+			restoreProperty("arenaagents.packageRoot", oldPackageRoot);
+			restoreProperty(NodeRuntimeLocator.PROPERTY, oldNodePath);
+			deleteTree(root);
+		}
+	}
+
+	private static String authenticationProof(
+			String secret,
+			String role,
+			String clientNonce,
+			String serverNonce,
+			String serverInstanceId,
+			String launchId
+	) throws Exception {
+		String context = String.join("\0", "arena-agents-v2", role, clientNonce, serverNonce, serverInstanceId)
+				+ ("coordinator".equals(role) ? "\0" + (launchId == null ? "" : launchId) : "");
+		Mac mac = Mac.getInstance("HmacSHA256");
+		mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+		return Base64.getUrlEncoder().withoutPadding().encodeToString(
+				mac.doFinal(context.getBytes(StandardCharsets.UTF_8))
+		);
 	}
 
 	private static void stageCoordinator(Path source, Path root) throws IOException {
@@ -247,18 +337,22 @@ public final class CoordinatorStartupSmokeVerification {
 	}
 
 	private static Path stageBundledNode(Path root) throws IOException {
-		Path hostNode = findHostNode();
 		Path bundled = isWindows()
 				? root.resolve("runtime/toolchains/node/node.exe")
 				: root.resolve("runtime/toolchains/node/bin/node");
 		Files.createDirectories(bundled.getParent());
+		stageHostNode(bundled);
+		return bundled;
+	}
+
+	private static void stageHostNode(Path target) throws IOException {
+		Path hostNode = findHostNode();
 		try {
-			Files.createLink(bundled, hostNode);
+			Files.createLink(target, hostNode);
 		} catch (IOException linkUnavailable) {
 			// The fallback is temporary test state only; no runtime binary is stored in git or the release archive.
-			Files.copy(hostNode, bundled, StandardCopyOption.REPLACE_EXISTING);
+			Files.copy(hostNode, target, StandardCopyOption.REPLACE_EXISTING);
 		}
-		return bundled;
 	}
 
 	private static Path stageFakeCodex(Path root) throws IOException {

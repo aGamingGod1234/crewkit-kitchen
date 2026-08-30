@@ -513,12 +513,12 @@ public final class CodexAgentServerRuntime {
 		if (supervisor == null) return false;
 		if (supervisor.configured()) return true;
 		return supervisor.snapshot().state() == CoordinatorRecoveryState.STOPPED
-				&& acceptedSecretFile(configuredVoiceSecretFile(), Path.of("runtime", "bridge-secret.txt"));
+				&& acceptedSecretFile(configuredVoiceSecretFile(), Path.of("runtime", "voice-secret.txt"));
 	}
 
 	static long voiceConfigurationRevision(CoordinatorProcessSupervisor supervisor) {
 		long explicitSecretRevision = supervisor.snapshot().state() == CoordinatorRecoveryState.STOPPED
-				? explicitSecretFileRevision(configuredVoiceSecretFile(), Path.of("runtime", "bridge-secret.txt"))
+				? explicitSecretFileRevision(configuredVoiceSecretFile(), Path.of("runtime", "voice-secret.txt"))
 				: 0L;
 		return java.util.Objects.hash(
 				supervisor.voiceConfigurationRevision(), supervisor.sharedSecretRevision(), supervisor.secretPath(),
@@ -527,10 +527,7 @@ public final class CodexAgentServerRuntime {
 	}
 
 	private static String configuredVoiceSecretFile() {
-		return System.getProperty(
-				"arenaagents.voiceSecretFile",
-				System.getProperty("arenaagents.bridgeSecretFile", "runtime/bridge-secret.txt")
-		);
+		return System.getProperty("arenaagents.voiceSecretFile", "runtime/voice-secret.txt");
 	}
 
 	private static boolean acceptedSecretFile(String configuredPath, Path fallbackPath) {

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter, once } from 'node:events';
 import test from 'node:test';
 
-import { MultiplexedServerBridge, ProtocolV2Error, validateProtocolV2Envelope, validateProtocolV2Payload } from '../src/protocol-v2.mjs';
+import { createBridgeAuthenticationProof, MultiplexedServerBridge, ProtocolV2Error, validateProtocolV2Envelope, validateProtocolV2Payload } from '../src/protocol-v2.mjs';
 import { completionContractFingerprint } from '../src/goal-contract.mjs';
 import { goalSpecFingerprint } from '../src/goal-spec.mjs';
 
@@ -22,15 +22,43 @@ const VERBOSE_STAGES = Object.freeze([
 
 class FakeSocket extends EventEmitter {
 	writes = [];
+	authenticationWrites = [];
 	destroyed = false;
 	writable = true;
+	paused = false;
+	autoAuthenticate;
+
+	constructor({ autoAuthenticate = true } = {}) {
+		super();
+		this.autoAuthenticate = autoAuthenticate;
+	}
 
 	write(value) {
-		this.writes.push(String(value));
+		const encoded = String(value);
+		const envelope = JSON.parse(encoded);
+		if (envelope.type === 'auth_challenge') {
+			this.authenticationWrites.push(encoded);
+			if (!this.autoAuthenticate) return this.writable;
+			const serverNonce = Buffer.alloc(32, 7).toString('base64url');
+			this.emit('data', `${JSON.stringify(serverEnvelope('auth_response', 'server', 'server-auth-response', {
+				replyTo: envelope.messageId,
+				clientNonce: envelope.payload.clientNonce,
+				serverNonce,
+				proof: createBridgeAuthenticationProof(SECRET, 'server', {
+					clientNonce: envelope.payload.clientNonce,
+					serverNonce,
+					serverInstanceId: 'server-instance',
+				}),
+			}))}\n`);
+			return this.writable;
+		}
+		this.writes.push(encoded);
 		return this.writable;
 	}
 
 	setNoDelay() {}
+	pause() { this.paused = true; }
+	resume() { this.paused = false; }
 
 	destroy() {
 		if (this.destroyed) return;
@@ -38,6 +66,28 @@ class FakeSocket extends EventEmitter {
 		this.emit('close');
 	}
 }
+
+test('coordinator rejects an unauthenticated server before sending a secret-derived proof', async (t) => {
+	const socket = new FakeSocket({ autoAuthenticate: false });
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
+		socketFactory: () => socket, schedule: () => 1, cancelSchedule: () => {},
+	});
+	t.after(() => bridge.stop());
+	bridge.start();
+	socket.emit('connect');
+	const challenge = JSON.parse(socket.authenticationWrites[0]);
+	assert.equal(challenge.payload.secret, undefined);
+	const rejected = once(bridge, 'protocolError');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('auth_response', 'server', 'forged-server-proof', {
+		replyTo: challenge.messageId,
+		clientNonce: challenge.payload.clientNonce,
+		serverNonce: Buffer.alloc(32, 9).toString('base64url'),
+		proof: Buffer.alloc(32, 8).toString('base64url'),
+	}))}\n`);
+	const [error] = await rejected;
+	assert.equal(error.code, 'SERVER_AUTHENTICATION_FAILED');
+	assert.deepEqual(socket.writes, [], 'no coordinator proof is sent to an unauthenticated peer');
+});
 
 class ManualTimerQueue {
 	#nextId = 0;
@@ -60,9 +110,12 @@ class ManualTimerQueue {
 }
 
 test('optional launch identity is authenticated without weakening manual coordinators', async () => {
-	assert.deepEqual(validateProtocolV2Payload('hello', { secret: SECRET }), { secret: SECRET });
-	assert.deepEqual(validateProtocolV2Payload('hello', { secret: SECRET, launchId: LAUNCH_ID }), {
-		secret: SECRET,
+	const clientNonce = Buffer.alloc(32, 1).toString('base64url');
+	const serverNonce = Buffer.alloc(32, 2).toString('base64url');
+	const proof = Buffer.alloc(32, 3).toString('base64url');
+	assert.deepEqual(validateProtocolV2Payload('auth_challenge', { clientNonce }), { clientNonce });
+	assert.deepEqual(validateProtocolV2Payload('hello', { replyTo: 'server-auth', clientNonce, serverNonce, proof, launchId: LAUNCH_ID }), {
+		replyTo: 'server-auth', clientNonce, serverNonce, proof,
 		launchId: LAUNCH_ID,
 	});
 	assert.deepEqual(validateProtocolV2Payload('hello_ack', {
@@ -80,6 +133,8 @@ test('optional launch identity is authenticated without weakening manual coordin
 	socket.emit('connect');
 	const hello = JSON.parse(socket.writes[0]);
 	assert.equal(hello.payload.launchId, LAUNCH_ID);
+	assert.equal(hello.payload.secret, undefined);
+	assert.equal(JSON.parse(socket.authenticationWrites[0]).payload.secret, undefined);
 	const ready = once(bridge, 'ready');
 	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-launch-ack', {
 		replyTo: hello.messageId,
@@ -426,7 +481,7 @@ test('traced action commands, progress, and results round-trip one bounded trace
 	}), /traceId/i);
 });
 
-test('terminal result acknowledgements are strict and make replay idempotent', async (t) => {
+test('terminal result retries are delivered until the application acknowledges them', async (t) => {
 	assert.deepEqual(
 		validateProtocolV2Payload('action_result_ack', { goalRevision: 4, actionId: 'action-ack-1' }),
 		{ goalRevision: 4, actionId: 'action-ack-1' },
@@ -453,20 +508,50 @@ test('terminal result acknowledgements are strict and make replay idempotent', a
 	}))}\n`);
 	await ready;
 	const payload = actionResult('action-ack-1');
+	await bridge.send('action_command', 'agent-a', actionCommand('action-ack-1'));
 	const delivered = [];
 	const errors = [];
-	bridge.on('action_result', (event) => delivered.push(event));
+	bridge.on('action_result', (event) => {
+		delivered.push(event);
+		if (delivered.length === 1) event.waitUntil(Promise.reject(new Error('application processing failed')));
+	});
 	bridge.on('protocolError', (error) => errors.push(error));
 	socket.emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-result-ack-1', payload))}\n`);
 	await new Promise((resolve) => setImmediate(resolve));
 	assert.equal(delivered.length, 1);
-	await bridge.acknowledgeActionResult('agent-a', payload, { connectionEpoch: 1 });
-	assert.equal(JSON.parse(socket.writes.at(-1)).type, 'action_result_ack');
 	socket.emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-result-ack-replay', payload))}\n`);
 	await new Promise((resolve) => setImmediate(resolve));
-	assert.equal(delivered.length, 1, 'acknowledged replay is not emitted twice');
+	assert.equal(delivered.length, 2, 'an unacknowledged result is retried through application processing');
+	assert.equal(socket.writes.filter((line) => JSON.parse(line).type === 'action_result_ack').length, 0);
+	await bridge.acknowledgeActionResult('agent-a', payload, { connectionEpoch: 1 });
+	assert.equal(JSON.parse(socket.writes.at(-1)).type, 'action_result_ack');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-result-ack-after-processing', payload))}\n`);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(delivered.length, 2, 'only an application-acknowledged replay is suppressed');
 	assert.deepEqual(errors, [], 'acknowledged replay does not tear down the bridge');
 	assert.equal(socket.writes.filter((line) => JSON.parse(line).type === 'action_result_ack').length, 2, 'replay is re-acknowledged');
+});
+
+test('terminal results for actions not issued by the coordinator fail closed', async (t) => {
+	const socket = new FakeSocket();
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
+		socketFactory: () => socket, schedule: () => 1, cancelSchedule: () => {}, currentRevision: () => 4,
+	});
+	t.after(() => bridge.stop());
+	bridge.start();
+	socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-ready-unissued', {
+		replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()],
+	}))}\n`);
+	let delivered = false;
+	bridge.on('action_result', () => { delivered = true; });
+	const rejected = once(bridge, 'protocolError');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-unissued-result', actionResult('server-chosen-action')))}\n`);
+	const [error] = await rejected;
+	assert.equal(error.code, 'UNISSUED_ACTION_RESULT');
+	assert.equal(delivered, false);
+	assert.equal(socket.destroyed, true);
 });
 
 test('protocol v2 accepts only coordinate-free respawn arguments', () => {
@@ -591,6 +676,17 @@ function actionResult(actionId, goalRevision = 4) {
 		message: '',
 		elapsedMs: 10,
 		observedAtEpochMs: 20,
+	};
+}
+
+function actionCommand(actionId, goalRevision = 4) {
+	return {
+		traceId: `trace-${actionId}`,
+		goalRevision,
+		actionId,
+		actionType: 'wait',
+		arguments: { durationMs: 25 },
+		provenance: PROVENANCE,
 	};
 }
 
@@ -727,7 +823,7 @@ test('multiplexed bridge authenticates once and learns the complete registry sna
 	socket.emit('connect');
 	const hello = JSON.parse(socket.writes[0]);
 	assert.equal(hello.type, 'hello');
-	assert.equal(hello.payload.secret, SECRET);
+	assert.equal(hello.payload.secret, undefined);
 	const ready = once(bridge, 'ready');
 	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-1', {
 		replyTo: hello.messageId,
@@ -742,6 +838,36 @@ test('multiplexed bridge authenticates once and learns the complete registry sna
 	await bridge.send('planning_state', 'agent-a', { goalRevision: 4, state: 'PLANNING' });
 	assert.equal(JSON.parse(socket.writes.at(-1)).agentId, 'agent-a');
 	bridge.stop();
+});
+
+test('authenticated inbound work pauses reads and fails closed at aggregate capacity', async (t) => {
+	const socket = new FakeSocket();
+	const bridge = new MultiplexedServerBridge({
+		port: 25570, secret: SECRET, inboundConnectionQueueCap: 2, inboundAgentQueueCap: 2,
+	}, {
+		socketFactory: () => socket, schedule: () => 1, cancelSchedule: () => {}, currentRevision: () => 4,
+	});
+	t.after(() => bridge.stop());
+	bridge.on('action_progress', (event) => event.waitUntil(new Promise(() => {})));
+	bridge.start();
+	socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-ready-backpressure', {
+		replyTo: hello.messageId, authenticated: true, registry: [{ ...registeredRecord(), goalRevision: 4 }],
+	}))}\n`);
+	for (let index = 0; index < 2; index++) {
+		socket.emit('data', `${JSON.stringify(serverEnvelope('action_progress', 'agent-a', `progress-${index}`, {
+			traceId: TRACE_ID, goalRevision: 4, actionId: `action-${index}`, state: 'RUNNING', progress: 0.5,
+		}))}\n`);
+	}
+	assert.equal(socket.paused, true);
+	const rejected = once(bridge, 'protocolError');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('action_progress', 'agent-a', 'progress-overflow', {
+		traceId: TRACE_ID, goalRevision: 4, actionId: 'action-overflow', state: 'RUNNING', progress: 0.5,
+	}))}\n`);
+	const [error] = await rejected;
+	assert.equal(error.code, 'CONNECTION_INBOUND_BACKPRESSURE');
+	assert.equal(socket.destroyed, true);
 });
 
 test('unused coordinator wake requests are not part of protocol v2', () => {
@@ -775,16 +901,19 @@ test('multiplexed bridge audits validated detached inbound and outbound envelope
 		goalRevision: 4, actionId: 'action-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE,
 	});
 	assert.deepEqual(audit.map(({ direction, envelope }) => [direction, envelope.messageId, envelope.type, envelope.agentId]), [
-		['coordinator_to_server', 'coordinator-v2-1', 'hello', 'server'],
+		['coordinator_to_server', 'coordinator-v2-1', 'auth_challenge', 'server'],
+		['server_to_coordinator', 'server-auth-response', 'auth_response', 'server'],
+		['coordinator_to_server', 'coordinator-v2-2', 'hello', 'server'],
 		['server_to_coordinator', 'server-1', 'hello_ack', 'server'],
 		['server_to_coordinator', 'server-2', 'observation', 'agent-a'],
-		['coordinator_to_server', 'coordinator-v2-2', 'agent_ready', 'agent-a'],
-		['coordinator_to_server', 'coordinator-v2-3', 'action_command', 'agent-a'],
+		['coordinator_to_server', 'coordinator-v2-3', 'agent_ready', 'agent-a'],
+		['coordinator_to_server', 'coordinator-v2-4', 'action_command', 'agent-a'],
 	]);
-	assert.equal(JSON.parse(socket.writes[0]).payload.secret, SECRET);
-	assert.equal(audit[0].envelope.payload.secret, '[REDACTED]');
+	assert.equal(JSON.parse(socket.writes[0]).payload.secret, undefined);
+	assert.equal(audit[0].envelope.type, 'auth_challenge');
+	assert.equal(audit[0].envelope.payload.secret, undefined);
 	assert.doesNotMatch(JSON.stringify(audit), new RegExp(SECRET));
-	audit[2].envelope.payload.position.x = 999;
+	audit[4].envelope.payload.position.x = 999;
 	assert.equal(receivedObservation.payload.position.x, 10.5);
 	bridge.stop();
 });
@@ -837,7 +966,11 @@ test('bridge preserves ready and disconnected events while exposing authenticate
 		replyTo: firstHello.messageId, authenticated: true, registry: [activeRecord],
 	}))}\n`);
 	await new Promise((resolve) => setImmediate(resolve));
-	sockets[0].emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-result-before-reconnect', actionResult('action-before-reconnect')))}\n`);
+	const reconnectResult = actionResult('action-before-reconnect');
+	await bridge.send('action_command', 'agent-a', actionCommand('action-before-reconnect'));
+	sockets[0].emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-result-before-reconnect', reconnectResult))}\n`);
+	await new Promise((resolve) => setImmediate(resolve));
+	await bridge.acknowledgeActionResult('agent-a', reconnectResult, { connectionEpoch: 1 });
 	sockets[0].destroy();
 	const [disconnectedEvent] = await disconnected;
 	assert.equal(disconnectedEvent.connectionEpoch, 1);
@@ -860,7 +993,6 @@ test('bridge preserves ready and disconnected events while exposing authenticate
 	sockets[1].emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-result-replayed', actionResult('action-before-reconnect')))}\n`);
 	await new Promise((resolve) => setImmediate(resolve));
 	assert.equal(deliveredResults.length, 1, 'socket-drop replay must not be emitted twice');
-	await bridge.acknowledgeActionResult('agent-a', actionResult('action-before-reconnect'), { connectionEpoch: 2 });
 	assert.equal(JSON.parse(sockets[1].writes.at(-1)).type, 'action_result_ack');
 });
 
@@ -932,9 +1064,9 @@ test('bridge probes an authenticated peer and reconnects when heartbeat silence 
 	assert.equal(typeof reconnect, 'function');
 });
 
-test('terminal action replay stays rejected after bounded diagnostic history rolls over', async (t) => {
+test('terminal action retention rejects identities after bounded issued-action rollover', async (t) => {
 	const socket = new FakeSocket();
-	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET, trackedTerminalActionIdCap: 2 }, {
 		socketFactory: () => socket,
 		schedule: () => 1,
 		cancelSchedule: () => {},
@@ -947,16 +1079,16 @@ test('terminal action replay stays rejected after bounded diagnostic history rol
 	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-1', {
 		replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()],
 	}))}\n`);
-	for (let index = 0; index <= 4_096; index += 1) {
+	for (let index = 0; index < 3; index += 1) {
 		const actionId = `action-${index}`;
+		await bridge.send('action_command', 'agent-a', actionCommand(actionId, 0));
 		socket.emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', `server-result-${index}`, actionResult(actionId, 0)))}\n`);
 	}
-	const errors = [];
-	bridge.on('protocolError', (error) => errors.push(error));
+	const rejected = once(bridge, 'protocolError');
 	socket.emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-result-replay', actionResult('action-0', 0)))}\n`);
-
-	assert.equal(socket.destroyed, true);
-	assert.equal(errors.at(-1)?.code, 'DUPLICATE_TERMINAL_RESULT');
+	const [error] = await rejected;
+	assert.equal(error.code, 'UNISSUED_ACTION_RESULT');
+	assert.equal(socket.destroyed, true, 'an evicted issued identity cannot authorize a later terminal result');
 });
 
 test('multiplexed bridge rejects stale revisions before writing', async () => {
@@ -1160,8 +1292,13 @@ test('a newer lifecycle revision removes queued stale agent readiness under back
 test('strict payload validators accept every current wire shape and reject unknown fields', () => {
 	const catalog = { refreshedAtEpochMs: 1, models: [{ id: 'gpt-5.6-sol', model: 'gpt-5.6-sol', displayName: 'GPT 5.6 Sol', reasoningEfforts: ['high'], serviceTiers: ['fast'] }] };
 	const goalFingerprint = 'a'.repeat(64);
+	const clientNonce = Buffer.alloc(32, 1).toString('base64url');
+	const serverNonce = Buffer.alloc(32, 2).toString('base64url');
+	const proof = Buffer.alloc(32, 3).toString('base64url');
 	const messages = [
-		['hello', { secret: SECRET }],
+		['auth_challenge', { clientNonce }],
+		['auth_response', { replyTo: 'coordinator-1', clientNonce, serverNonce, proof }],
+		['hello', { replyTo: 'server-1', clientNonce, serverNonce, proof }],
 		['hello_ack', { replyTo: 'coordinator-1', authenticated: true, registry: [registeredRecord()] }],
 		['catalog_request', {}],
 		['catalog_snapshot', catalog],

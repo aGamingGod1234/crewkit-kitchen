@@ -4,11 +4,56 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { startVoiceWorker } from '../src/dynamic-main.mjs';
+import { startVoiceWorker as startVoiceWorkerRuntime } from '../src/dynamic-main.mjs';
 import { FishTtsProvider } from '../src/voice/fish-tts-provider.mjs';
+import { createVoiceRequestHeaders } from '../src/voice/voice-http-server.mjs';
 
 const SECRET = 'voice-bootstrap-test-secret';
+const VOICE_SECRET = 'dedicated-voice-bootstrap-secret';
 const PLAYER = '10000000-0000-4000-8000-000000000001';
+
+function fetch(input, init = {}) {
+	const headers = new Headers(init.headers);
+	const url = new URL(typeof input === 'string' ? input : input.url);
+	if (init.method === 'POST' && ['/v1/tts', '/v1/stt'].includes(url.pathname)
+			&& headers.has('X-Voice-Signature')) {
+		const signed = createVoiceRequestHeaders({
+			secret: VOICE_SECRET,
+			path: url.pathname,
+			contentType: headers.get('Content-Type') ?? '',
+			identityHeaders: headers,
+			body: init.body == null ? Buffer.alloc(0) : Buffer.from(init.body),
+			timestamp: Number(headers.get('X-Voice-Timestamp')),
+			nonce: headers.get('X-Voice-Nonce'),
+		});
+		for (const [name, value] of Object.entries(signed)) headers.set(name, value);
+		return globalThis.fetch(input, { ...init, headers });
+	}
+	return globalThis.fetch(input, init);
+}
+
+function voiceAuth(pathname) {
+	return createVoiceRequestHeaders({ secret: VOICE_SECRET, path: pathname });
+}
+
+function startVoiceWorker(config, environment = {}, dependencies = {}) {
+	return startVoiceWorkerRuntime(
+		{ ...config, voice: { ...config.voice, secret: config.voice?.secret ?? SECRET } },
+		environment,
+		dependencies,
+	);
+}
+
+test('voice bootstrap fails closed when the dedicated voice secret is unavailable', async () => {
+	await assert.rejects(startVoiceWorkerRuntime({
+		bridge: { secret: SECRET },
+		voice: { port: 8_766, secretFile: 'missing-voice-secret.txt' },
+	}, {}, {
+		platform: 'linux',
+		createLocalSpeechProvider: async () => ({ async close() {} }),
+		readVoiceSecret: async () => { throw new Error('missing'); },
+	}), (error) => error.code === 'VOICE_SECRET_UNAVAILABLE');
+});
 
 test('voice bootstrap uses credential-free Windows speech when Fish is not configured', async () => {
 	let profileLoads = 0;
@@ -20,7 +65,7 @@ test('voice bootstrap uses credential-free Windows speech when Fish is not confi
 	};
 	const created = await startVoiceWorker({
 		bridge: { secret: SECRET },
-		voice: { port: 0 },
+		voice: { secret: VOICE_SECRET, port: 0 },
 		fishApiKey: 'config-must-not-be-used',
 	}, {}, {
 		platform: 'win32',
@@ -43,7 +88,7 @@ test('voice bootstrap remains disabled without a provider on non-Windows hosts',
 	let profileLoads = 0;
 	const worker = await startVoiceWorker({
 		bridge: { secret: SECRET },
-		voice: { port: 0 },
+		voice: { secret: VOICE_SECRET, port: 0 },
 	}, {}, {
 		platform: 'linux',
 		loadProfileStore: async () => { profileLoads++; return { store: { resolve() {} } }; },
@@ -60,7 +105,7 @@ test('voice bootstrap starts Deepgram-only STT with no TTS provider on non-Windo
 	await writeFile(profilePath, '{ malformed assignments', 'utf8');
 	const created = await startVoiceWorker({
 		bridge: { secret: SECRET },
-		voice: { port: 0 },
+		voice: { secret: VOICE_SECRET, port: 0 },
 	}, { DEEPGRAM_API_KEY: 'deepgram-only-key' }, {
 		platform: 'linux',
 		profilePath,
@@ -82,7 +127,7 @@ test('voice bootstrap starts Deepgram-only STT with no TTS provider on non-Windo
 		assert.equal(snapshots.find(({ component }) => component === 'voice:stt').state, 'ready');
 		const ttsResponse = await fetch(`http://127.0.0.1:${created.server.address().port}/v1/tts`, {
 			method: 'POST',
-			headers: { Authorization: `Bearer ${SECRET}`, 'Content-Type': 'application/json' },
+			headers: { ...voiceAuth('/v1/tts'), 'Content-Type': 'application/json' },
 			body: JSON.stringify({
 				agentId: PLAYER,
 				conversationSequence: 1,
@@ -96,7 +141,7 @@ test('voice bootstrap starts Deepgram-only STT with no TTS provider on non-Windo
 		const response = await fetch(`http://127.0.0.1:${created.server.address().port}/v1/stt`, {
 			method: 'POST',
 			headers: {
-				Authorization: `Bearer ${SECRET}`,
+				...voiceAuth('/v1/stt'),
 				'Content-Type': 'audio/l16;rate=48000;channels=1',
 				'X-Player-Id': PLAYER,
 				'X-Utterance-Sequence': '1',
@@ -121,7 +166,7 @@ test('voice bootstrap keeps malformed profile assignments fatal when TTS is avai
 		await assert.rejects(
 			startVoiceWorker({
 				bridge: { secret: SECRET },
-				voice: { port: 0 },
+				voice: { secret: VOICE_SECRET, port: 0 },
 			}, { FISH_AUDIO_API_KEY: 'fish-key' }, {
 				platform: 'linux',
 				profilePath,
@@ -144,7 +189,7 @@ test('voice bootstrap reads Fish and optional STT credentials from environment o
 	const profiles = { store: { resolve() {} }, flush: async () => {} };
 	const created = await startVoiceWorker({
 		bridge: { secret: SECRET },
-		voice: { port: 8766, maxConcurrent: 2 },
+		voice: { secret: VOICE_SECRET, port: 8766, maxConcurrent: 2 },
 		fishApiKey: 'config-must-not-be-used',
 	}, {
 		FISH_AUDIO_API_KEY: '',
@@ -173,7 +218,7 @@ test('voice bootstrap reads Fish and optional STT credentials from environment o
 	assert.equal(created, worker);
 	assert.equal(captured.fishApiKey, 'fish-from-environment');
 	assert.equal(captured.deepgramApiKey, 'deepgram-from-environment');
-	assert.equal(captured.serverOptions.secret, SECRET);
+	assert.equal(captured.serverOptions.secret, VOICE_SECRET);
 	assert.equal(captured.serverOptions.port, 8766);
 	assert.equal(captured.serverOptions.maxConcurrent, 2);
 	assert.equal(captured.started, true);
@@ -191,7 +236,7 @@ test('Windows voice bootstrap falls back to local speech when Fish rejects a sta
 	let localCalls = 0;
 	const worker = await startVoiceWorker({
 		bridge: { secret: SECRET },
-		voice: { port: 8_766 },
+		voice: { secret: VOICE_SECRET, port: 8_766 },
 	}, { FISH_AUDIO_API_KEY: 'stale-fish-credential' }, {
 		platform: 'win32',
 		loadProfileStore: async () => ({ store: { resolve() {} } }),
@@ -225,7 +270,7 @@ test('Windows Fish fallback opens a bounded circuit and recovers through one hal
 	let provider;
 	const worker = await startVoiceWorker({
 		bridge: { secret: SECRET },
-		voice: { port: 8_766 },
+		voice: { secret: VOICE_SECRET, port: 8_766 },
 	}, { FISH_AUDIO_API_KEY: 'configured-fish-credential' }, {
 		platform: 'win32',
 		voiceFallbackNow: () => now,
@@ -308,7 +353,7 @@ test('Fish fetch failures open the Windows circuit without treating invalid requ
 	let fetchCalls = 0;
 	let windowsCalls = 0;
 	let provider;
-	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { secret: VOICE_SECRET, port: 8_766 } }, {
 		FISH_AUDIO_API_KEY: 'configured-fish-credential',
 	}, {
 		platform: 'win32',
@@ -353,7 +398,7 @@ test('Fish fetch failures open the Windows circuit without treating invalid requ
 test('voice bootstrap closes a worker when binding fails', async () => {
 	let closes = 0;
 	await assert.rejects(
-		startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 0 } }, { FISH_AUDIO_API_KEY: 'fish-from-environment' }, {
+		startVoiceWorker({ bridge: { secret: SECRET }, voice: { secret: VOICE_SECRET, port: 0 } }, { FISH_AUDIO_API_KEY: 'fish-from-environment' }, {
 			loadProfileStore: async () => ({ store: { resolve() {} } }),
 			createVoiceServer: () => ({
 				async start() { throw new Error('bind failed'); },
@@ -373,7 +418,7 @@ test('voice bootstrap closes a prepared local provider when later setup fails', 
 		async close() { closes += 1; },
 	};
 	await assert.rejects(
-		startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {}, {
+		startVoiceWorker({ bridge: { secret: SECRET }, voice: { secret: VOICE_SECRET, port: 8_766 } }, {}, {
 			platform: 'win32',
 			createLocalSpeechProvider: async () => local,
 			loadProfileStore: async () => { throw new Error('profile setup failed'); },
@@ -396,7 +441,7 @@ test('voice bootstrap prefers one local speech runtime for both expressive TTS a
 	};
 	const created = await startVoiceWorker({
 		bridge: { secret: SECRET },
-		voice: { port: 8_766 },
+		voice: { secret: VOICE_SECRET, port: 8_766 },
 	}, {}, {
 		platform: 'win32',
 		loadProfileStore: async () => ({ store: { resolve() {} } }),
@@ -434,7 +479,7 @@ test('runtime local TTS failures switch concurrent requests once to Fish while l
 		async transcribe() { return { transcript: 'local hearing remains active', confidence: 1 }; },
 		async close() { localCloses += 1; },
 	};
-	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 0 } }, {
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { secret: VOICE_SECRET, port: 0 } }, {
 		FISH_AUDIO_API_KEY: 'fish-key',
 	}, {
 		platform: 'linux',
@@ -460,7 +505,7 @@ test('runtime local TTS failures switch concurrent requests once to Fish while l
 		const baseUrl = `http://127.0.0.1:${worker.server.address().port}`;
 		const request = (text, conversationSequence) => fetch(`${baseUrl}/v1/tts`, {
 			method: 'POST',
-			headers: { Authorization: `Bearer ${SECRET}`, 'Content-Type': 'application/json' },
+			headers: { ...voiceAuth('/v1/tts'), 'Content-Type': 'application/json' },
 			body: JSON.stringify({
 				agentId: '00000000-0000-4000-8000-000000000001',
 				conversationSequence,
@@ -501,7 +546,7 @@ test('cached local speech is not returned after runtime failover to Fish', async
 		async transcribe() { return { transcript: '', confidence: 0 }; },
 		async close() {},
 	};
-	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 0 } }, {
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { secret: VOICE_SECRET, port: 0 } }, {
 		FISH_AUDIO_API_KEY: 'fish-key',
 	}, {
 		platform: 'linux',
@@ -523,7 +568,7 @@ test('cached local speech is not returned after runtime failover to Fish', async
 		const baseUrl = `http://127.0.0.1:${worker.server.address().port}`;
 		const request = async (text, conversationSequence) => fetch(`${baseUrl}/v1/tts`, {
 			method: 'POST',
-			headers: { Authorization: `Bearer ${SECRET}`, 'Content-Type': 'application/json' },
+			headers: { ...voiceAuth('/v1/tts'), 'Content-Type': 'application/json' },
 			body: JSON.stringify({
 				agentId: '00000000-0000-4000-8000-000000000001', conversationSequence,
 				profileId: 'voice.auto.v1', radius: 48, text,
@@ -554,7 +599,7 @@ test('nested runtime fallback caches a successful Fish probe only as Fish audio'
 		async transcribe() { return { transcript: '', confidence: 0 }; },
 		async close() {},
 	};
-	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 0 } }, {
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { secret: VOICE_SECRET, port: 0 } }, {
 		FISH_AUDIO_API_KEY: 'fish-key',
 	}, {
 		platform: 'win32',
@@ -586,7 +631,7 @@ test('nested runtime fallback caches a successful Fish probe only as Fish audio'
 		let sequence = 0;
 		const request = (text) => fetch(`${baseUrl}/v1/tts`, {
 			method: 'POST',
-			headers: { Authorization: `Bearer ${SECRET}`, 'Content-Type': 'application/json' },
+			headers: { ...voiceAuth('/v1/tts'), 'Content-Type': 'application/json' },
 			body: JSON.stringify({
 				agentId: '00000000-0000-4000-8000-000000000001', conversationSequence: ++sequence,
 				profileId: 'voice.auto.v1', radius: 48, text,
@@ -626,7 +671,7 @@ test('runtime local STT failures switch concurrent requests once to Deepgram whi
 		},
 		async close() { localCloses += 1; },
 	};
-	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { secret: VOICE_SECRET, port: 8_766 } }, {
 		DEEPGRAM_API_KEY: 'deepgram-key',
 	}, {
 		platform: 'linux',
@@ -668,7 +713,7 @@ test('voice bootstrap applies the configured local inference deadline to live HT
 	let serverOptions;
 	const worker = await startVoiceWorker({
 		bridge: { secret: SECRET },
-		voice: { port: 8_766, localSpeechTimeoutMs: 91_234 },
+		voice: { secret: VOICE_SECRET, port: 8_766, localSpeechTimeoutMs: 91_234 },
 	}, {}, {
 		platform: 'win32',
 		createLocalSpeechProvider: async (options) => {
@@ -702,7 +747,7 @@ test('runtime local TTS failure uses credential-free Windows speech when Fish is
 		async transcribe() { return { transcript: 'still local', confidence: 1 }; },
 		async close() { localCloses += 1; },
 	};
-	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {}, {
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { secret: VOICE_SECRET, port: 8_766 } }, {}, {
 		platform: 'win32',
 		createLocalSpeechProvider: async () => local,
 		loadProfileStore: async () => ({ store: { resolve() {} } }),
@@ -730,7 +775,7 @@ test('replacement workers release each profile owner exactly once', async () => 
 	let profileCloses = 0;
 	let serverCloses = 0;
 	for (let generation = 1; generation <= 2; generation += 1) {
-		const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {
+		const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { secret: VOICE_SECRET, port: 8_766 } }, {
 			FISH_AUDIO_API_KEY: 'fish-key',
 		}, {
 			platform: 'linux',
@@ -761,7 +806,7 @@ test('pre-worker bootstrap failures close every loaded profile owner across retr
 	let profileCloses = 0;
 	for (let attempt = 1; attempt <= 3; attempt += 1) {
 		await assert.rejects(
-			startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {
+			startVoiceWorker({ bridge: { secret: SECRET }, voice: { secret: VOICE_SECRET, port: 8_766 } }, {
 				FISH_AUDIO_API_KEY: 'fish-key',
 			}, {
 				platform: 'linux',
@@ -797,7 +842,7 @@ test('voice bootstrap exposes slow local warmup without delaying the bound worke
 		async transcribe() { return { transcript: '', confidence: 0 }; },
 		async close() {},
 	};
-	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {}, {
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { secret: VOICE_SECRET, port: 8_766 } }, {}, {
 		platform: 'win32',
 		loadProfileStore: async () => ({ store: { resolve() {} } }),
 		createLocalSpeechProvider: async () => local,
@@ -824,7 +869,7 @@ test('local model warmup failure switches both channels to configured remote pro
 	};
 	const fish = { async synthesize() { return {}; } };
 	const deepgram = { async transcribe() { return { transcript: 'fallback', confidence: 1 }; } };
-	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { secret: VOICE_SECRET, port: 8_766 } }, {
 		FISH_AUDIO_API_KEY: 'fish-key',
 		DEEPGRAM_API_KEY: 'deepgram-key',
 	}, {
@@ -865,7 +910,7 @@ test('TTS-only warmup failure keeps ready local STT while routing speech to Fish
 		async transcribe() { return { transcript: 'local Whisper stayed ready', confidence: 1 }; },
 		async close() { localCloses += 1; },
 	};
-	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { secret: VOICE_SECRET, port: 8_766 } }, {
 		FISH_AUDIO_API_KEY: 'fish-key',
 	}, {
 		platform: 'linux',
@@ -909,7 +954,7 @@ test('independent runtime channel failovers release the shared local worker exac
 		},
 		async close() { localCloses += 1; },
 	};
-	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { secret: VOICE_SECRET, port: 8_766 } }, {
 		FISH_AUDIO_API_KEY: 'fish-key',
 		DEEPGRAM_API_KEY: 'deepgram-key',
 	}, {
@@ -965,7 +1010,7 @@ test('local model warmup failure preserves Deepgram-only STT on non-Windows host
 		async transcribe() { throw new Error('failed local STT must not receive traffic'); },
 		async close() { localCloses += 1; },
 	};
-	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { secret: VOICE_SECRET, port: 8_766 } }, {
 		DEEPGRAM_API_KEY: 'deepgram-key',
 	}, {
 		platform: 'linux',
@@ -1011,7 +1056,7 @@ test('malformed TTS profile state cannot block Deepgram after local warmup fails
 		async close() {},
 	};
 	try {
-		const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {
+		const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { secret: VOICE_SECRET, port: 8_766 } }, {
 			DEEPGRAM_API_KEY: 'deepgram-key',
 		}, {
 			platform: 'linux',
@@ -1042,7 +1087,7 @@ test('local cleanup failure cannot roll back a successful external fallback swit
 		async transcribe() { throw new Error('closed local STT must not receive traffic'); },
 		async close() { throw new Error('local process already exited'); },
 	};
-	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { secret: VOICE_SECRET, port: 8_766 } }, {
 		FISH_AUDIO_API_KEY: 'fish-key',
 		DEEPGRAM_API_KEY: 'deepgram-key',
 	}, {
@@ -1068,7 +1113,7 @@ test('local cleanup failure cannot roll back a successful external fallback swit
 test('voice bootstrap propagates startup cancellation into provider discovery', async () => {
 	const controller = new AbortController();
 	let observedSignal = null;
-	const starting = startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {}, {
+	const starting = startVoiceWorker({ bridge: { secret: SECRET }, voice: { secret: VOICE_SECRET, port: 8_766 } }, {}, {
 		platform: 'win32',
 		signal: controller.signal,
 		createLocalSpeechProvider: async ({ signal }) => {
@@ -1091,7 +1136,7 @@ test('voice bootstrap propagates startup cancellation into HTTP binding', async 
 	let observedSignal = null;
 	let markStartEntered;
 	const startEntered = new Promise((resolve) => { markStartEntered = resolve; });
-	const starting = startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {
+	const starting = startVoiceWorker({ bridge: { secret: SECRET }, voice: { secret: VOICE_SECRET, port: 8_766 } }, {
 		FISH_API_KEY: 'test-key',
 	}, {
 		signal: controller.signal,
@@ -1121,7 +1166,7 @@ test('voice bootstrap keeps supervisor ownership over the production profile rea
 	const controller = new AbortController();
 	const unrelated = new AbortController();
 	let observedSignal = null;
-	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { secret: VOICE_SECRET, port: 8_766 } }, {
 		FISH_API_KEY: 'test-key',
 	}, {
 		signal: controller.signal,

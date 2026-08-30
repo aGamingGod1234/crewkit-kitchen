@@ -7,12 +7,15 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.time.Duration;
 import java.util.Locale;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicReference;
 
 final class SpeechWorkerClient {
 	private static final int MAX_SAMPLES = 48_000 * 20;
@@ -56,21 +59,49 @@ final class SpeechWorkerClient {
 		}
 		ByteBuffer pcm = ByteBuffer.allocate(samples.length * 2).order(ByteOrder.LITTLE_ENDIAN);
 		pcm.asShortBuffer().put(samples);
-		HttpRequest request = HttpRequest.newBuilder(endpoint)
+		byte[] requestBody = pcm.array();
+		String contentType = "audio/l16;rate=48000;channels=1";
+		Map<String, String> identityHeaders = Map.of(
+				"x-player-id", playerId.toString(),
+				"x-utterance-sequence", Long.toString(utteranceSequence),
+				"x-whispering", Boolean.toString(whispering)
+		);
+		HttpRequest.Builder requestBuilder = HttpRequest.newBuilder(endpoint)
 				.timeout(requestTimeout)
-				.header("Authorization", "Bearer " + secret)
-				.header("Content-Type", "audio/l16;rate=48000;channels=1")
+				.header("Content-Type", contentType)
 				.header("X-Player-Id", playerId.toString())
 				.header("X-Utterance-Sequence", Long.toString(utteranceSequence))
-				.header("X-Whispering", Boolean.toString(whispering))
-				.POST(HttpRequest.BodyPublishers.ofByteArray(pcm.array()))
-				.build();
-		CompletableFuture<HttpResponse<String>> exchange = client.sendAsync(
-				request, HttpResponse.BodyHandlers.ofString()
+				.header("X-Whispering", Boolean.toString(whispering));
+		String requestNonce = VoiceHttpAuthentication.authenticate(
+				requestBuilder, secret, "POST", endpoint, contentType, identityHeaders, requestBody
 		);
-		CompletableFuture<Transcript> result = exchange.thenApply(response -> {
+		HttpRequest request = requestBuilder
+				.POST(HttpRequest.BodyPublishers.ofByteArray(requestBody))
+				.build();
+		CompletableFuture<HttpResponse<InputStream>> exchange = client.sendAsync(
+				request, HttpResponse.BodyHandlers.ofInputStream()
+		);
+		AtomicReference<CompletableFuture<byte[]>> bodyRead = new AtomicReference<>();
+		CompletableFuture<Transcript> result = exchange.thenCompose(response -> {
+					CompletableFuture<byte[]> reading = VoiceHttpAuthentication.readAuthenticatedBody(
+							response, secret, requestNonce, 8 * 1024, requestTimeout, () -> exchange.cancel(true)
+					);
+					bodyRead.set(reading);
+					return reading.thenApply(responseBytes -> decodeResponse(response, responseBytes));
+				});
+		result.whenComplete((transcript, failure) -> {
+			if (result.isCancelled()) {
+				CompletableFuture<byte[]> reading = bodyRead.get();
+				if (reading != null) reading.cancel(true);
+				exchange.cancel(true);
+			}
+		});
+		return result;
+	}
+
+	private static Transcript decodeResponse(HttpResponse<?> response, byte[] responseBytes) {
 					if (response.statusCode() != 200) {
-						throw workerHttpFailure(response);
+						throw workerHttpFailure(response, responseBytes);
 					}
 					try {
 						String contentType = response.headers().firstValue("Content-Type").orElse("")
@@ -80,7 +111,9 @@ final class SpeechWorkerClient {
 									"STT_WORKER_RESPONSE", "Speech worker returned a non-JSON transcript"
 							);
 						}
-						JsonObject payload = JsonParser.parseString(response.body()).getAsJsonObject();
+						JsonObject payload = JsonParser.parseString(
+								new String(responseBytes, java.nio.charset.StandardCharsets.UTF_8)
+						).getAsJsonObject();
 						if (!payload.has("transcript") || !payload.get("transcript").isJsonPrimitive()
 								|| !payload.has("confidence") || !payload.get("confidence").isJsonPrimitive()) {
 							throw new IllegalArgumentException("missing transcript fields");
@@ -100,20 +133,17 @@ final class SpeechWorkerClient {
 								"STT_WORKER_RESPONSE", "Speech worker returned an invalid transcript", exception
 						);
 					}
-				});
-		result.whenComplete((transcript, failure) -> {
-			if (result.isCancelled()) exchange.cancel(true);
-		});
-		return result;
 	}
 
-	private static VoiceWorkerClient.VoiceWorkerException workerHttpFailure(HttpResponse<String> response) {
+	private static VoiceWorkerClient.VoiceWorkerException workerHttpFailure(HttpResponse<?> response, byte[] body) {
 		String code = "STT_WORKER_HTTP";
 		String contentType = response.headers().firstValue("Content-Type").orElse("")
 				.toLowerCase(Locale.ROOT).split(";", 2)[0].strip();
 		if (contentType.equals("application/json")) {
 			try {
-				JsonObject payload = JsonParser.parseString(response.body()).getAsJsonObject();
+				JsonObject payload = JsonParser.parseString(
+						new String(body, java.nio.charset.StandardCharsets.UTF_8)
+				).getAsJsonObject();
 				if (payload.has("code") && payload.get("code").isJsonPrimitive()
 						&& payload.get("code").getAsString().equals("STT_UNAVAILABLE")) {
 					code = "STT_UNAVAILABLE";

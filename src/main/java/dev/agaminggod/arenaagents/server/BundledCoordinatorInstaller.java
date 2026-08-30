@@ -3,6 +3,7 @@ package dev.agaminggod.arenaagents.server;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.Writer;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
@@ -10,11 +11,21 @@ import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.AclEntry;
+import java.nio.file.attribute.AclEntryPermission;
+import java.nio.file.attribute.AclEntryType;
+import java.nio.file.attribute.AclFileAttributeView;
+import java.nio.file.attribute.FileAttribute;
+import java.nio.file.attribute.PosixFileAttributeView;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.nio.file.attribute.UserPrincipal;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
@@ -30,6 +41,7 @@ final class BundledCoordinatorInstaller {
 	private static final String BUNDLED_CONFIG_PATH = "config/dynamic-agents.json";
 	private static final String CONFIG_PATH = "runtime/dynamic-agents.json";
 	private static final String SECRET_PATH = "runtime/bridge-secret.txt";
+	private static final String VOICE_SECRET_PATH = "runtime/voice-secret.txt";
 	private static final String STATE_PATH = "runtime/coordinator-generation.properties";
 	private static final String ACTIVE_NAME = "coordinator";
 	private static final String LAST_KNOWN_GOOD_NAME = "coordinator.last-known-good";
@@ -38,6 +50,14 @@ final class BundledCoordinatorInstaller {
 	private static final int MAX_STATE_BYTES = 4_096;
 	private static final int SWAP_ATTEMPTS = 21;
 	private static final long SWAP_RETRY_DELAY_MS = 50L;
+	private static final Set<PosixFilePermission> OWNER_ONLY_DIRECTORY = Set.of(
+			PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE
+	);
+	private static final Set<PosixFilePermission> OWNER_ONLY_FILE = Set.of(
+			PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE
+	);
+	private static final FileAttribute<Set<PosixFilePermission>> OWNER_ONLY_FILE_ATTRIBUTE =
+			PosixFilePermissions.asFileAttribute(OWNER_ONLY_FILE);
 
 	private BundledCoordinatorInstaller() {
 	}
@@ -92,13 +112,13 @@ final class BundledCoordinatorInstaller {
 				&& !generationId.equals(state.activeGeneration())
 				&& generationMatches(active, state.activeGeneration())) {
 			ensureExternalConfig(root, active, entries, resources);
-			ensureSecret(root.resolve(SECRET_PATH));
+			ensureRuntimeSecrets(root);
 			cleanupStaging(root, null);
 			return false;
 		}
 		if (generationId.equals(generationOf(active)) && installedFilesMatch(active, entries)) {
 			ensureExternalConfig(root, active, entries, resources);
-			ensureSecret(root.resolve(SECRET_PATH));
+			ensureRuntimeSecrets(root);
 			GenerationState reconciled = reconcileReadyState(root, state, generationId);
 			if (!reconciled.equals(state)) writeState(root, reconciled);
 			cleanupStaging(root, null);
@@ -111,7 +131,7 @@ final class BundledCoordinatorInstaller {
 		Files.writeString(staging.resolve(INSTALLED_MANIFEST_NAME), manifest, StandardCharsets.UTF_8);
 		validateGeneration(staging, generationId);
 		ensureExternalConfig(root, active, entries, resources);
-		ensureSecret(root.resolve(SECRET_PATH));
+		ensureRuntimeSecrets(root);
 
 		String previousActive = generationOf(active);
 		String verified = state.phase().equals(Phase.READY.value) ? state.verifiedGeneration() : "";
@@ -437,24 +457,84 @@ final class BundledCoordinatorInstaller {
 		}
 	}
 
-	private static void ensureSecret(Path secret) throws IOException {
+	private static void ensureRuntimeSecrets(Path root) throws IOException {
+		ensureSecret(root.resolve(SECRET_PATH), "Bridge");
+		ensureSecret(root.resolve(VOICE_SECRET_PATH), "Voice");
+	}
+
+	private static void ensureSecret(Path secret, String label) throws IOException {
+		ensurePrivateDirectory(secret.getParent());
 		if (Files.exists(secret, LinkOption.NOFOLLOW_LINKS)) {
 			if (!Files.isRegularFile(secret, LinkOption.NOFOLLOW_LINKS) || linked(secret)) {
-				throw new IOException("Bridge secret is not a regular external file");
+				throw new IOException(label + " secret is not a regular external file");
 			}
+			ensureOwnerOnly(secret, false);
 			String value = Files.readString(secret, StandardCharsets.UTF_8).trim();
 			if (value.length() >= 32) return;
-			throw new IOException("Bridge secret is invalid");
+			throw new IOException(label + " secret is invalid");
 		}
-		Files.createDirectories(secret.getParent());
 		byte[] bytes = new byte[32];
 		new SecureRandom().nextBytes(bytes);
-		String value = HexFormat.of().formatHex(bytes);
+		ByteBuffer value = StandardCharsets.UTF_8.encode(HexFormat.of().formatHex(bytes));
 		try {
-			Files.writeString(secret, value, StandardCharsets.UTF_8, StandardOpenOption.CREATE_NEW);
+			writeNewPrivateSecret(secret, value);
 		} catch (java.nio.file.FileAlreadyExistsException ignored) {
+			if (!Files.isRegularFile(secret, LinkOption.NOFOLLOW_LINKS) || linked(secret)) {
+				throw new IOException(label + " secret is not a regular external file", ignored);
+			}
+			ensureOwnerOnly(secret, false);
 			String existing = Files.readString(secret, StandardCharsets.UTF_8).trim();
-			if (existing.length() < 32) throw new IOException("Bridge secret is invalid", ignored);
+			if (existing.length() < 32) throw new IOException(label + " secret is invalid", ignored);
+		}
+	}
+
+	private static void writeNewPrivateSecret(Path secret, ByteBuffer value) throws IOException {
+		boolean posix = Files.getFileAttributeView(secret, PosixFileAttributeView.class, LinkOption.NOFOLLOW_LINKS) != null;
+		try (var channel = posix
+				? Files.newByteChannel(secret, Set.of(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE), OWNER_ONLY_FILE_ATTRIBUTE)
+				: Files.newByteChannel(secret, Set.of(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE))) {
+			while (value.hasRemaining()) channel.write(value);
+		}
+		ensureOwnerOnly(secret, false);
+	}
+
+	private static void ensurePrivateDirectory(Path directory) throws IOException {
+		Files.createDirectories(directory);
+		if (!Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS) || linked(directory)) {
+			throw new IOException("Coordinator runtime directory is unsafe");
+		}
+		ensureOwnerOnly(directory, true);
+	}
+
+	/** Uses POSIX modes where available and an explicit owner-only DACL on Windows filesystems. */
+	private static void ensureOwnerOnly(Path target, boolean directory) throws IOException {
+		Set<PosixFilePermission> expected = directory ? OWNER_ONLY_DIRECTORY : OWNER_ONLY_FILE;
+		PosixFileAttributeView posix = Files.getFileAttributeView(target, PosixFileAttributeView.class, LinkOption.NOFOLLOW_LINKS);
+		if (posix != null) {
+			posix.setPermissions(expected);
+			if (!posix.readAttributes().permissions().equals(expected)) {
+				throw new IOException("Could not enforce private coordinator runtime permissions");
+			}
+			return;
+		}
+		AclFileAttributeView acl = Files.getFileAttributeView(target, AclFileAttributeView.class, LinkOption.NOFOLLOW_LINKS);
+		if (acl == null) throw new IOException("Filesystem cannot enforce private coordinator runtime permissions");
+		try {
+			UserPrincipal owner = acl.getOwner();
+			AclEntry ownerOnly = AclEntry.newBuilder()
+					.setType(AclEntryType.ALLOW)
+					.setPrincipal(owner)
+					.setPermissions(EnumSet.allOf(AclEntryPermission.class))
+					.build();
+			acl.setAcl(List.of(ownerOnly));
+			List<AclEntry> entries = acl.getAcl();
+			if (entries.size() != 1 || entries.getFirst().type() != AclEntryType.ALLOW
+					|| !entries.getFirst().principal().equals(owner)
+					|| !entries.getFirst().permissions().containsAll(EnumSet.allOf(AclEntryPermission.class))) {
+				throw new IOException("Could not enforce private coordinator runtime permissions");
+			}
+		} catch (UnsupportedOperationException exception) {
+			throw new IOException("Filesystem cannot enforce private coordinator runtime permissions", exception);
 		}
 	}
 
@@ -468,17 +548,29 @@ final class BundledCoordinatorInstaller {
 		Path main = active.resolve("src/dynamic-main.mjs").normalize();
 		Path config = root.resolve(CONFIG_PATH).normalize();
 		Path secret = root.resolve(SECRET_PATH).normalize();
+		Path voiceSecret = root.resolve(VOICE_SECRET_PATH).normalize();
 		if (!Files.isRegularFile(main, LinkOption.NOFOLLOW_LINKS)
 				|| !Files.isRegularFile(config, LinkOption.NOFOLLOW_LINKS)) {
 			throw new IOException("Coordinator package is incomplete; install the bundled coordinator runtime");
 		}
 		if (!Files.isRegularFile(secret, LinkOption.NOFOLLOW_LINKS)) throw new IOException("Bridge secret file is missing");
+		if (!Files.isRegularFile(voiceSecret, LinkOption.NOFOLLOW_LINKS)) throw new IOException("Voice secret file is missing");
+		ensurePrivateDirectory(secret.getParent());
+		if (linked(secret)) throw new IOException("Bridge secret is not a regular external file");
+		if (linked(voiceSecret)) throw new IOException("Voice secret is not a regular external file");
+		ensureOwnerOnly(secret, false);
+		ensureOwnerOnly(voiceSecret, false);
 		String value = Files.readString(secret, StandardCharsets.UTF_8).trim();
+		String voiceValue = Files.readString(voiceSecret, StandardCharsets.UTF_8).trim();
 		if (value.length() < 32) throw new IOException("Bridge secret is invalid");
+		if (voiceValue.length() < 32) throw new IOException("Voice secret is invalid");
+		if (MessageDigest.isEqual(value.getBytes(StandardCharsets.UTF_8), voiceValue.getBytes(StandardCharsets.UTF_8))) {
+			throw new IOException("Bridge and voice secrets must be distinct");
+		}
 		boolean lkgAvailable = !state.lastKnownGoodGeneration().isBlank()
 				&& generationMatches(root.resolve(LAST_KNOWN_GOOD_NAME), state.lastKnownGoodGeneration());
 		return new RuntimePackage(
-				root, active, main, config, secret, generation,
+				root, active, main, config, secret, voiceSecret, generation,
 				generation.equals(state.candidateGeneration()), lkgAvailable
 		);
 	}
@@ -625,7 +717,9 @@ final class BundledCoordinatorInstaller {
 		if (Files.exists(root, LinkOption.NOFOLLOW_LINKS) && linked(root)) {
 			throw new IOException("Coordinator package root is linked or a reparse point");
 		}
-		for (String relative : List.of(ACTIVE_NAME, LAST_KNOWN_GOOD_NAME, "runtime", STATE_PATH, CONFIG_PATH, SECRET_PATH)) {
+		for (String relative : List.of(
+				ACTIVE_NAME, LAST_KNOWN_GOOD_NAME, "runtime", STATE_PATH, CONFIG_PATH, SECRET_PATH, VOICE_SECRET_PATH
+		)) {
 			Path target = root.resolve(relative).normalize();
 			assertContained(root, target);
 			assertNoLinkedAncestors(root, target);
@@ -827,6 +921,7 @@ final class BundledCoordinatorInstaller {
 			Path main,
 			Path config,
 			Path secret,
+			Path voiceSecret,
 			String generationId,
 			boolean candidate,
 			boolean lastKnownGoodAvailable
@@ -837,6 +932,7 @@ final class BundledCoordinatorInstaller {
 			main = main.toAbsolutePath().normalize();
 			config = config.toAbsolutePath().normalize();
 			secret = secret.toAbsolutePath().normalize();
+			voiceSecret = voiceSecret.toAbsolutePath().normalize();
 			generationId = Objects.requireNonNull(generationId, "generation ID must not be null");
 		}
 	}

@@ -5,6 +5,20 @@ import { ControlLatencyRegistry } from '../src/control-latency-registry.mjs';
 import { ProviderTurnRecorder } from '../src/provider-turn-recorder.mjs';
 import { createProviderTurnTelemetry } from '../src/provider-turn-telemetry.mjs';
 
+test('prepares the private provider-turn artifact before appending', async () => {
+	const prepared = [];
+	const writes = [];
+	const recorder = new ProviderTurnRecorder({
+		runId: 'run-private-path', scenarioId: 'scenario-private-path', privatePath: 'private.jsonl',
+		preparePrivateArtifact: async (filePath) => { prepared.push(filePath); },
+		appendFile: async (_filePath, _text, options) => { writes.push(options); },
+	});
+	await recorder.record({ provider: 'codex', model: 'm' });
+	await recorder.close();
+	assert.deepEqual(prepared, ['private.jsonl']);
+	assert.deepEqual(writes, [{ encoding: 'utf8', flag: 'a', mode: 0o600 }]);
+});
+
 test('records bounded redacted private turns and hash/excerpt-only public rows', async () => {
 	const privateRows = [];
 	const publicRows = [];

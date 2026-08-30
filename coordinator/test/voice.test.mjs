@@ -5,7 +5,29 @@ import { FishTtsProvider } from '../src/voice/fish-tts-provider.mjs';
 import { DeepgramSttProvider } from '../src/voice/deepgram-stt-provider.mjs';
 import { resampleS16leMono } from '../src/voice/pcm-audio.mjs';
 import { TtsCache } from '../src/voice/tts-cache.mjs';
-import { createVoiceHttpServer } from '../src/voice/voice-http-server.mjs';
+import { createVoiceHttpServer, createVoiceRequestHeaders } from '../src/voice/voice-http-server.mjs';
+
+const VOICE_TEST_SECRET = 'voice-test-secret-value';
+
+function fetch(input, init = {}) {
+	const headers = new Headers(init.headers);
+	const url = new URL(typeof input === 'string' ? input : input.url);
+	if (init.method === 'POST' && ['/v1/tts', '/v1/stt'].includes(url.pathname)
+			&& headers.has('X-Voice-Signature')) {
+		const signed = createVoiceRequestHeaders({
+			secret: VOICE_TEST_SECRET,
+			path: url.pathname,
+			contentType: headers.get('Content-Type') ?? '',
+			identityHeaders: headers,
+			body: init.body == null ? Buffer.alloc(0) : Buffer.from(init.body),
+			timestamp: Number(headers.get('X-Voice-Timestamp')),
+			nonce: headers.get('X-Voice-Nonce'),
+		});
+		for (const [name, value] of Object.entries(signed)) headers.set(name, value);
+		return globalThis.fetch(input, { ...init, headers });
+	}
+	return globalThis.fetch(input, init);
+}
 import { builtInVoiceProfiles, VoiceProfileStore } from '../src/voice/voice-profile-store.mjs';
 
 const AGENT_ONE = '00000000-0000-4000-8000-000000000001';
@@ -75,16 +97,25 @@ test('loopback voice worker authenticates, caches, and emits 48 kHz PCM', async 
 	});
 	try {
 		assert.equal((await fetch(url, { method: 'POST', body })).status, 401);
+		assert.equal((await fetch(url, {
+			method: 'POST', headers: { Authorization: 'Bearer voice-test-secret-value' }, body,
+		})).status, 401);
+		let lastHeaders;
 		for (let index = 0; index < 2; index++) {
+			lastHeaders = {
+				...createVoiceRequestHeaders({ secret: 'voice-test-secret-value', path: '/v1/tts' }),
+				'Content-Type': 'application/json',
+			};
 			const response = await fetch(url, {
 				method: 'POST',
-				headers: { Authorization: 'Bearer voice-test-secret-value', 'Content-Type': 'application/json' },
+				headers: lastHeaders,
 				body,
 			});
 			assert.equal(response.status, 200);
 			assert.equal(response.headers.get('x-audio-sample-rate'), '48000');
 			assert.equal((await response.arrayBuffer()).byteLength, 4_800 * 2);
 		}
+		assert.equal((await fetch(url, { method: 'POST', headers: lastHeaders, body })).status, 401);
 		assert.equal(calls, 1);
 	} finally {
 		await worker.close();
@@ -120,7 +151,7 @@ test('loopback speech route preserves player identity, utterance order, and whis
 		const response = await fetch(`http://127.0.0.1:${address.port}/v1/stt`, {
 			method: 'POST',
 			headers: {
-				Authorization: 'Bearer voice-test-secret-value',
+				...createVoiceRequestHeaders({ secret: 'voice-test-secret-value', path: '/v1/stt' }),
 				'Content-Type': 'audio/l16;rate=48000;channels=1',
 				'X-Player-Id': AGENT_TWO,
 				'X-Utterance-Sequence': '7',
