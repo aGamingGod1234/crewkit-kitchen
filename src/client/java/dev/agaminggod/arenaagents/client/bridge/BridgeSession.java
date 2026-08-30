@@ -244,6 +244,9 @@ public final class BridgeSession implements AutoCloseable {
 			while (isOpen() || !outbound.isEmpty()) {
 				String message = outbound.poll(WRITER_POLL_MS, TimeUnit.MILLISECONDS);
 				if (message != null) {
+					synchronized (lifecycleLock) {
+						// Do not expose a queued handshake frame before its state transition is published.
+					}
 					writeNow(message);
 				}
 			}
