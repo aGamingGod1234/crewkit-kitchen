@@ -83,8 +83,11 @@ async function withActiveState(action) {
 function writeResult(status = 'PASSED') {
 	const result = {
 		status,
-		metadata: { arm, runId, sourceHash, configHash, planningConcurrency },
-		trials: [{ trialId, status, durationMs: 12, cleanup: { ok: true, tempResidue: 0, backupResidue: 0 }, ...(label ? { label } : {}) }],
+		metadata: { arm, runId, sourceHash, configHash, trialId, planningConcurrency },
+		trials: [
+			{ trialId, repetition: 1, status, durationMs: 12, cleanup: { ok: true, tempResidue: 0, backupResidue: 0 }, ...(label ? { label } : {}) },
+			{ trialId, repetition: 2, status, durationMs: 18, cleanup: { ok: true, tempResidue: 0, backupResidue: 0 }, ...(label ? { label } : {}) },
+		],
 		cleanup: { ok: true, activeActions: 0, listeners: 0 },
 		summary: 1,
 	};

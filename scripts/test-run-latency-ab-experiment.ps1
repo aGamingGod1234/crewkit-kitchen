@@ -96,6 +96,9 @@ try {
     $firstManifest = Get-ManifestFromOutput $firstOutput
     Assert-Fixture ([string]$firstManifest.Status -eq 'passed') 'A successful fixture run did not pass.'
     Assert-Fixture ([int]$firstManifest.results.Count -eq 8) 'Expected one result per pair and arm.'
+    Assert-Fixture ([int]$firstManifest.results[0].result.trials.Count -eq 2) 'Aggregate runner repetitions were not preserved.'
+    Assert-Fixture ([double]$firstManifest.results[0].latencyMs -eq 18) 'Aggregate runner latency was not summarized as repetition p95.'
+    Assert-Fixture ([bool]$firstManifest.results[0].cleanupOk) 'Validated cleanup status was not preserved in the manifest summary.'
     Assert-Fixture ([int]$firstManifest.armConfig.baseline.planningConcurrency -eq 16) 'Baseline planning concurrency was not recorded.'
     Assert-Fixture ([int]$firstManifest.armConfig.optimized.planningConcurrency -eq 16) 'Optimized planning concurrency was not recorded.'
     Assert-Fixture ([string]$firstManifest.armConfig.baseline.runnerArguments[-1] -eq 'baseline') 'Baseline runner arguments were not recorded.'

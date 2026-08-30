@@ -76,6 +76,10 @@ function Get-OptionalProperty {
         [Parameter(Mandatory = $true)] [string] $Name
     )
     if ($null -eq $Object) { return $null }
+    if ($Object -is [System.Collections.IDictionary]) {
+        if (-not $Object.Contains($Name)) { return $null }
+        return $Object[$Name]
+    }
     $property = $Object.PSObject.Properties[$Name]
     if ($null -eq $property) { return $null }
     return $property.Value
@@ -917,13 +921,13 @@ function Assert-RunnerResult {
         [object[]] $trialItems = @($trials)
         if ($trialItems.Count -eq 0 -or $trialItems.Count -gt 256) { throw 'Runner aggregate result trials array is outside the bounded range.' }
         $expectedRunnerId = [string]$Context.RunnerTrialId
+        $metadataTrialId = Get-OptionalProperty $metadata 'trialId'
+        if ($null -eq $metadataTrialId -or [string]$metadataTrialId -ne $expectedRunnerId) { throw 'Runner result metadata trial identity does not match the invocation.' }
         $matching = @($trialItems | Where-Object {
             $trialId = Get-OptionalProperty $_ 'trialId'
             $null -ne $trialId -and ([string]$trialId -eq $expectedRunnerId -or [string]$trialId -eq [string]$Context.TrialId)
         })
-        if ($matching.Count -ne 1) { throw "Runner aggregate result does not contain exactly one matching trial: $expectedRunnerId." }
-        $trial = $matching[0]
-        if (-not (Test-PlainObject $trial)) { throw 'Runner aggregate result trial must be a JSON object.' }
+        if ($matching.Count -eq 0 -or $matching.Count -ne $trialItems.Count) { throw "Runner aggregate result contains missing or mixed trial identities: $expectedRunnerId." }
         $metadataArm = Get-OptionalProperty $metadata 'arm'
         if ($null -eq $metadataArm -or ([string]$metadataArm).Trim().ToLowerInvariant() -ne [string]$Context.Arm) { throw "Runner result arm does not match $($Context.Arm)." }
         $metadataRunId = Get-OptionalProperty $metadata 'runId'
@@ -936,19 +940,36 @@ function Assert-RunnerResult {
         $metadataConcurrency = Get-OptionalProperty $metadata 'planningConcurrency'
         if ($null -eq $metadataConcurrency -or [int]$metadataConcurrency -ne [int]$Context.PlanningConcurrency) { throw 'Runner result planning concurrency does not match the invocation.' }
         $rootCleanup = Assert-ResultCleanup -Cleanup (Get-OptionalProperty $Result 'cleanup') -Label 'root'
-        $trialCleanup = Get-OptionalProperty $trial 'cleanup'
-        if ($null -ne $trialCleanup) { $null = Assert-ResultCleanup -Cleanup $trialCleanup -Label 'trial' }
         $statusValue = Get-OptionalProperty $Result 'status'
         if ($null -eq $statusValue) { throw 'Runner aggregate result status is required.' }
         $status = Normalize-ResultStatus ([string]$statusValue)
-        $trialStatusValue = Get-OptionalProperty $trial 'status'
-        if ($null -eq $trialStatusValue) { throw 'Runner aggregate trial status is required.' }
-        $trialStatus = Normalize-ResultStatus ([string]$trialStatusValue)
-        if ($status -eq 'PASSED' -and $trialStatus -notin @('PASSED', 'SKIPPED')) { throw 'Runner aggregate status and matching trial status disagree.' }
-        if ($status -eq 'SKIPPED' -and $trialStatus -ne 'SKIPPED') { throw 'Runner aggregate skipped status and matching trial disagree.' }
-        $duration = Get-OptionalProperty $trial 'durationMs'
-        if ($null -ne $duration) {
-            if (-not (Test-BoundedLatencyNumber $duration)) { throw 'Runner aggregate trial durationMs is not bounded.' }
+        $durations = New-Object 'System.Collections.Generic.List[double]'
+        $repetitions = New-Object 'System.Collections.Generic.HashSet[int]'
+        foreach ($trial in $matching) {
+            if (-not (Test-PlainObject $trial)) { throw 'Runner aggregate result trial must be a JSON object.' }
+            $trialCleanup = Get-OptionalProperty $trial 'cleanup'
+            if ($null -ne $trialCleanup) { $null = Assert-ResultCleanup -Cleanup $trialCleanup -Label 'trial' }
+            $trialStatusValue = Get-OptionalProperty $trial 'status'
+            if ($null -eq $trialStatusValue) { throw 'Runner aggregate trial status is required.' }
+            $trialStatus = Normalize-ResultStatus ([string]$trialStatusValue)
+            if ($status -eq 'PASSED' -and $trialStatus -notin @('PASSED', 'SKIPPED')) { throw 'Runner aggregate status and matching trial status disagree.' }
+            if ($status -eq 'SKIPPED' -and $trialStatus -ne 'SKIPPED') { throw 'Runner aggregate skipped status and matching trial disagree.' }
+            $duration = Get-OptionalProperty $trial 'durationMs'
+            if ($null -ne $duration) {
+                if (-not (Test-BoundedLatencyNumber $duration)) { throw 'Runner aggregate trial durationMs is not bounded.' }
+                $durations.Add([double]$duration) | Out-Null
+            }
+            $repetition = Get-OptionalProperty $trial 'repetition'
+            if ($matching.Count -gt 1) {
+                if ($null -eq $repetition -or [int]$repetition -lt 1 -or -not $repetitions.Add([int]$repetition)) { throw 'Runner aggregate repetitions must be positive and unique.' }
+            }
+        }
+        [double] $durationP95 = 0
+        [bool] $hasDuration = $durations.Count -gt 0
+        if ($hasDuration) {
+            [double[]] $orderedDurations = $durations.ToArray()
+            [Array]::Sort($orderedDurations)
+            $durationP95 = $orderedDurations[[Math]::Max(0, [Math]::Ceiling($orderedDurations.Count * 0.95) - 1)]
         }
         if ($status -eq 'SKIPPED' -and [string]$Context.Mode -ne 'live') { throw 'Only live-provider cells may be SKIPPED.' }
         return [pscustomobject][ordered]@{
@@ -958,10 +979,11 @@ function Assert-RunnerResult {
             arm = [string]$Context.Arm
             seed = [int]$Context.Seed
             status = $status
-            latencyMs = if ($null -ne $duration) { [double]$duration } else { $null }
+            latencyMs = if ($hasDuration) { $durationP95 } else { $null }
+            latencyStatistic = if ($hasDuration) { 'durationMsP95' } else { $null }
             cleanup = ConvertTo-RedactedValue $rootCleanup
             metadata = ConvertTo-RedactedValue $metadata
-            trial = ConvertTo-RedactedValue $trial
+            trials = ConvertTo-RedactedValue @($matching)
         }
     }
 
