@@ -52,6 +52,7 @@ test('does not call live providers and keeps factual/cleanup evidence separate f
 		cleanup: { ok: true, processTreeClean: true, listenersClosed: true },
 	});
 	assert.equal(report.resources.cpu.p95, 3);
+	assert.equal(report.resources.cpu.basis, 'process_cpu_interval_delta_ms');
 	assert.equal(report.resources.minecraftTick.p99, 4);
 	assert.deepEqual(report.missingPhases, []);
 	assert.equal(validateTask9TrialReport(report), true);
@@ -69,12 +70,13 @@ test('adapts deterministic runner output into raw evidence artifacts', async () 
 			assert.equal(options.matrix.trials[0].providerAvailabilityRequired, true);
 			return {
 				status: 'PASSED', rawEvents: phases.map((event) => ({ ...event, trialId: 'stone', repetition: 1 })),
-				trials: [{ trialId: 'stone', repetition: 1, status: 'PASSED', scenarioId: 'stone-tool-gathering', seed: 20260821, agentLoad: 4, providerProfile: profile, metrics: { raw: { ticks: [{ wallDurationMs: 2 }] } }, systemSummary: { rawSamples: [{ cpu: { totalMs: 1 }, memory: { rssBytes: 2 } }] }, debug: { scenarioPassed: true }, cleanup: { ok: true, activeActions: 0, listeners: 0, relays: 0 } }],
+				trials: [{ trialId: 'stone', repetition: 1, status: 'PASSED', scenarioId: 'stone-tool-gathering', seed: 20260821, agentLoad: 4, providerProfile: profile, metrics: { raw: { ticks: [{ wallDurationMs: 2 }] } }, systemSummary: { rawSamples: [{ cpu: { totalMs: 10 }, memory: { rssBytes: 2 } }, { cpu: { totalMs: 14 }, memory: { rssBytes: 3 } }] }, debug: { scenarioPassed: true }, cleanup: { ok: true, activeActions: 0, listeners: 0, relays: 0 } }],
 			};
 		},
 	});
 	assert.equal(output.status, 'PASSED');
 	assert.equal(output.trials[0].correctness.factualSuccess, true);
+	assert.deepEqual(output.trials[0].resources.cpu.raw, [4]);
 	assert.deepEqual(output.trials[0].missingPhases, []);
 	const files = await readdir(root);
 	assert.ok(files.includes('run-manifest.json'));

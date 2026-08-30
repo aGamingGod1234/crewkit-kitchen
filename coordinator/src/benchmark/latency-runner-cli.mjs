@@ -304,6 +304,9 @@ function publicTrial(trial, matrixTrial = null) {
 		...(isPlainRecord(trial.metrics) ? { metrics: publicMetrics(trial.metrics) } : {}),
 		...(isPlainRecord(trial.systemSummary) ? { systemSummary: publicSystemSummary(trial.systemSummary) } : {}),
 		durationMs: Number.isFinite(trial.durationMs) && trial.durationMs >= 0 ? Math.min(Math.round(trial.durationMs), Number.MAX_SAFE_INTEGER) : null,
+		setupDurationMs: Number.isFinite(trial.setupDurationMs) && trial.setupDurationMs >= 0 ? Math.min(Math.round(trial.setupDurationMs), Number.MAX_SAFE_INTEGER) : null,
+		totalDurationMs: Number.isFinite(trial.totalDurationMs) && trial.totalDurationMs >= 0 ? Math.min(Math.round(trial.totalDurationMs), Number.MAX_SAFE_INTEGER) : null,
+		...(isPlainRecord(trial.setupSpansMs) ? { setupSpansMs: numericFields(trial.setupSpansMs, ['providerStart', 'coordinatorStart']) } : {}),
 	};
 }
 
@@ -362,7 +365,7 @@ function publicSystemSummary(summary) {
 }
 
 function metricNumericKeys(key) {
-	if (key === 'tick') return ['count', 'cpuWallDurationP50Ms', 'cpuWallDurationP95Ms', 'cpuWallDurationP99Ms', 'cpuWallDurationMaxMs', 'p50Ms', 'p95Ms', 'p99Ms', 'maxMs', 'over50MsCount'];
+	if (key === 'tick') return ['count', 'p50Ms', 'p95Ms', 'p99Ms', 'maxMs', 'over50MsCount'];
 	if (key === 'planningIdle') return ['localActiveWallDurationMs', 'planningIdleWallDurationMs'];
 	return ['count', 'schedulerWaitWallP50Ms', 'schedulerWaitWallP95Ms', 'schedulerWaitWallP99Ms', 'planningWaitWallP50Ms', 'planningWaitWallP95Ms', 'planningWaitWallP99Ms', 'providerWaitWallP50Ms', 'providerWaitWallP95Ms', 'providerWaitWallP99Ms'];
 }

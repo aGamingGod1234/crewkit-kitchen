@@ -153,7 +153,9 @@ export function buildTask9TrialReport({ identity, status, events = [], cpuSample
 	const phaseNames = new Set(normalizedEvents.map((event) => event.phase));
 	const missingPhases = TASK9_REQUIRED_PHASES.filter((phase) => !phaseNames.has(phase));
 	const resourceSamples = {
-		cpu: summarizeTask9Samples(cpuSamples), rss: summarizeTask9Samples(rssSamples), minecraftTick: summarizeTask9Samples(tickSamples),
+		cpu: { basis: 'process_cpu_interval_delta_ms', ...summarizeTask9Samples(cpuSamples) },
+		rss: { basis: 'process_resident_set_bytes', ...summarizeTask9Samples(rssSamples) },
+		minecraftTick: { basis: 'monotonic_wall_duration_ms', ...summarizeTask9Samples(tickSamples) },
 	};
 	let previousSequence = 0;
 	let previousMonotonicMs = 0;
@@ -200,7 +202,7 @@ export async function runTask9SimulatorMatrix({ matrix, runMatrix = runLatencyMa
 			cellId: `${trial.trialId}/rep-${trial.repetition}`, scenarioId: trial.scenarioId, seed: trial.seed, agentLoad: trial.agentLoad,
 			providerProfile: trial.providerProfile, sourceHash: options.sourceHash ?? null, configHash: options.configHash ?? null,
 		};
-		return buildTask9TrialReport({ identity, status: trial.status, events, cpuSamples: samples.map((sample) => sample.cpu?.totalMs).filter(Number.isFinite), rssSamples: samples.map((sample) => sample.memory?.rssBytes).filter(Number.isFinite), tickSamples: raw.ticks?.map((sample) => sample.wallDurationMs).filter(Number.isFinite) ?? [], factualSuccess: trial.debug?.scenarioPassed === true, fairness: trial.fairness, cleanup: normalizeTask9Cleanup(trial.cleanup), correctness: { authoritative: trial.debug?.scenarioEvidence ?? null }, retries: trial.retries ?? {} });
+		return buildTask9TrialReport({ identity, status: trial.status, events, cpuSamples: processCpuIntervalDeltas(samples), rssSamples: samples.map((sample) => sample.memory?.rssBytes).filter(Number.isFinite), tickSamples: raw.ticks?.map((sample) => sample.wallDurationMs).filter(Number.isFinite) ?? [], factualSuccess: trial.debug?.scenarioPassed === true, fairness: trial.fairness, cleanup: normalizeTask9Cleanup(trial.cleanup), correctness: { authoritative: trial.debug?.scenarioEvidence ?? null }, retries: trial.retries ?? {} });
 	});
 	const output = { schemaVersion: TASK9_SCHEMA_VERSION, status: trials.some((trial) => trial.status === 'FAILED' || trial.status === 'TIMED_OUT') ? 'FAILED' : run?.status ?? 'FAILED', runManifest: createTask9RunManifest({ runId: options.runId ?? 'task9-run', arm: options.arm ?? null, sourceCommit: options.sourceCommit ?? 'unknown', sourceHash: options.sourceHash ?? 'unknown', matrixHash: hashJson(normalized), configHash: options.configHash ?? hashJson(normalized), pairingKey: options.pairingKey ?? 'task9', providerProfile: normalized.trials[0]?.providerProfile ?? { provider: 'replay', model: 'unknown', reasoningEffort: 'fixed', serviceTier: 'synthetic-delayed' }, scheduler: options.scheduler ?? { mode: 'fixed', fixedConcurrency: options.planningConcurrency ?? 16 }, order: trials.map((trial) => `${trial.cellId}/${trial.arm ?? 'unknown'}`) }), trials };
 	for (const trial of trials) validateTask9TrialReport(trial);
@@ -240,6 +242,16 @@ function freeze(value) { if (!value || typeof value !== 'object' || Object.isFro
 function percentile(values, fraction) { return values.length === 0 ? null : values[Math.max(0, Math.ceil(values.length * fraction) - 1)]; }
 function hashJson(value) { return `sha256:${createHash('sha256').update(JSON.stringify(value)).digest('hex')}`; }
 function safeFileSegment(value) { return String(value ?? 'trial').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 120); }
+
+function processCpuIntervalDeltas(samples) {
+	const result = [];
+	for (let index = 1; index < samples.length; index += 1) {
+		const previous = samples[index - 1]?.cpu?.totalMs;
+		const current = samples[index]?.cpu?.totalMs;
+		if (Number.isFinite(previous) && Number.isFinite(current) && current >= previous) result.push(current - previous);
+	}
+	return result;
+}
 
 function normalizeRawPhaseEvent(event) {
 	const stage = String(event?.phase ?? event?.stage ?? '');

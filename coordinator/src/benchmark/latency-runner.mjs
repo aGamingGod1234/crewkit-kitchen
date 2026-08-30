@@ -113,6 +113,8 @@ export async function runLatencyMatrix(options = {}) {
 async function runTrial({ matrix, trial, repetition, scenarioResolver, providerFactories, recorder, measurementContext = {}, wallClock, wallClockBasis = 'process_monotonic_ms', measurementsEnabled = true, ...options }) {
 	const startedAt = performance.now();
 	const deadline = startedAt + trial.trialBudgetMs;
+	let measurementStartedAt = null;
+	const setupSpansMs = { providerStart: null, coordinatorStart: null };
 	let provider = null;
 	let coordinator = null;
 	let bridge = null;
@@ -164,15 +166,17 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 		registerProviderCleanup();
 		if (provider === null || provider === undefined || provider.available === false) {
 			const error = coded('PROVIDER_UNAVAILABLE', boundedError(provider?.reason ?? 'provider is unavailable'));
-			result = trialResult(trial, repetition, trial.providerAvailabilityRequired ? 'FAILED' : 'SKIPPED', error, startedAt, null, null, measurementContext);
+			result = trialResult(trial, repetition, trial.providerAvailabilityRequired ? 'FAILED' : 'SKIPPED', error, startedAt, null, null, measurementContext, { measurementStartedAt, setupSpansMs });
 			return result;
 		}
 		if (trial.mode === 'replay' && !provider.createAgent) provider = createReplayProvider({ ...options, ...trial.replay, recordings: options.replayRecordings, trialId: trial.id, providerProfile: trial.providerProfile, scenario: rawScenario, prompt: trial.prompt ?? options.replayPrompt ?? 'latency-replay-prompt', protocolVersion: matrix.protocolVersion });
 		registerProviderCleanup();
 		validateProviderIdentity(provider, trial);
 		if (typeof provider.start === 'function') {
+			const providerStartedAt = performance.now();
 			try { await runWithDeadline(() => provider.start(), deadline); }
 			catch (error) { await stopProviderAfterTimeout(); throw error; }
+			finally { setupSpansMs.providerStart = Math.max(0, performance.now() - providerStartedAt); }
 		}
 
 		const goal = scenario.goal ?? `Complete ${trial.scenarioId}`;
@@ -213,6 +217,14 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 		coordinator.on('runtimeError', runtimeListener);
 		cleanup.push(() => coordinator?.off?.('runtimeError', runtimeListener));
 		cleanup.push(() => coordinator?.stop());
+		const reconciled = new Promise((resolve) => coordinator.once('reconciled', resolve));
+		const coordinatorStartedAt = performance.now();
+		try {
+			await runWithDeadline(() => coordinator.start(), deadline);
+			await runWithDeadline(() => reconciled, deadline);
+		} finally {
+			setupSpansMs.coordinatorStart = Math.max(0, performance.now() - coordinatorStartedAt);
+		}
 		const samplerOptions = options.systemSamplerOptions ?? {};
 		sampler = options.systemSampler
 			?? options.systemSamplerFactory?.({ ...samplerOptions, schedulerReader: options.schedulerReader ?? samplerOptions.schedulerReader ?? (() => schedulerSnapshot(scheduler)), processReader: options.processReader ?? samplerOptions.processReader, childProcessReader: options.childProcessReader ?? samplerOptions.childProcessReader ?? (() => null) })
@@ -220,9 +232,7 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 		sampler.start();
 		sampler.sample?.();
 		cleanup.push(() => sampler?.stop());
-		const reconciled = new Promise((resolve) => coordinator.once('reconciled', resolve));
-		await runWithDeadline(() => coordinator.start(), deadline);
-		await runWithDeadline(() => reconciled, deadline);
+		measurementStartedAt = performance.now();
 		for (const agentId of scenario.agentIds) {
 			trialRecorder.record('goal_received', { agentId, goalRevision: 1 });
 			bridge.startAgent(agentId, goal, goalSpec);
@@ -242,7 +252,7 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 		const error = runtimeError ? coded(runtimeError.code, runtimeError.message) : status === 'TIMED_OUT' ? coded('TURN_CAP', `trial exceeded the ${trial.turnCap}-turn cap`) : !scenarioPassed ? coded('SCENARIO_ASSERTION_FAILED', 'authoritative scenario outcome did not satisfy its success predicate') : null;
 		metrics.markTaskCompletion({ status, agentIds: scenario.agentIds });
 		const outcomeHash = hash({ trialId: trial.id, repetition, status, scenarioId: trial.scenarioId, seed: trial.seed, agentLoad: trial.agentLoad, providerProfile: trial.providerProfile, statuses, turnCount, scenarioDigest });
-		result = trialResult(trial, repetition, status, error, startedAt, outcomeHash, cleanupSnapshot(bridge, sampler), measurementContext);
+		result = trialResult(trial, repetition, status, error, startedAt, outcomeHash, cleanupSnapshot(bridge, sampler), measurementContext, { measurementStartedAt, setupSpansMs });
 		result.benchmark = { eventCount: trialRecorder?.count ?? 0, traces: latencyRegistry.traceSnapshot() };
 		result.debug = { statuses, turnCount, runtimeErrors, scenarioPassed, scenarioDigest, scenarioEvidence: scenarioEvidence(virtual, scenario.agentIds), actionCommandHash: hash(authoritativeCommands(virtual)) };
 	} catch (error) {
@@ -253,7 +263,7 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 			const runtimeError = providerError ?? runtimeErrors.find((entry) => entry.code && !['TRIAL_TIMEOUT'].includes(entry.code));
 			if (runtimeError) typed = coded(runtimeError.code, runtimeError.message);
 		}
-		result = trialResult(trial, repetition, isTimeoutErrorCode(typed.code) ? 'TIMED_OUT' : 'FAILED', typed, startedAt, null, cleanupSnapshot(bridge, sampler), measurementContext);
+		result = trialResult(trial, repetition, isTimeoutErrorCode(typed.code) ? 'TIMED_OUT' : 'FAILED', typed, startedAt, null, cleanupSnapshot(bridge, sampler), measurementContext, { measurementStartedAt, setupSpansMs });
 		result.benchmark = { eventCount: trialRecorder?.count ?? 0, traces: latencyRegistry.traceSnapshot() };
 		result.debug = {
 			runtimeErrors,
@@ -481,6 +491,8 @@ class LatencyMetricsTracker {
 	#planning = new Map();
 	#baseline = new Map();
 	#seenConversationEvents = new Set();
+	#conversationCursor = 0;
+	#conversationPollPending = false;
 	#tickDurations = [];
 	#taskCompletion = null;
 	#lastTimestamp = null;
@@ -541,7 +553,7 @@ class LatencyMetricsTracker {
 		const durationMs = Math.max(0, endedAt - startedAt);
 		const tick = Number.isSafeInteger(world?.tickCount) ? world.tickCount : this.#raw.ticks.length + 1;
 		const virtualTimestampMs = finiteOrNull(world?.timeMs);
-		this.#push(this.#raw.ticks, { tick, wallDurationMs: durationMs, cpuWallDurationMs: durationMs, virtualTimestampMs });
+		this.#push(this.#raw.ticks, { tick, wallDurationMs: durationMs, virtualTimestampMs });
 		this.#push(this.#tickDurations, durationMs);
 		this.#observeWorld(world, endedAt, virtualTimestampMs);
 	}
@@ -657,6 +669,7 @@ class LatencyMetricsTracker {
 		this.#push(this.#raw.actionCommandAcceptance, value);
 		if (!this.#acceptances.has(agentId)) this.#acceptances.set(agentId, value);
 		if (isPhysicalMovementAction(value.actionType)) this.#movementActions.set(agentId, { ...value, completedTick: null });
+		if (value.actionType === 'chat' && this.#declaredEvents().some((event) => /message|agent_message|direct/i.test(String(event?.kind ?? event?.type ?? '')))) this.#conversationPollPending = true;
 		this.#advancePlanning(agentId, wallTimestampMs, true);
 		this.#recordReaction(agentId, value);
 	}
@@ -697,7 +710,14 @@ class LatencyMetricsTracker {
 			if (movement?.completedTick !== null && movement?.completedTick !== world?.tickCount) this.#movementActions.delete(agentId);
 			this.#observeDeclaredEvents(agentId, state, wallTimestampMs, virtualTimestampMs, initial);
 		}
-		for (const event of world?.conversationEvents?.() ?? []) {
+		if (this.#conversationPollPending) this.#observeConversationEvents(world, wallTimestampMs, virtualTimestampMs);
+	}
+
+	#observeConversationEvents(world, wallTimestampMs, virtualTimestampMs) {
+		const conversationHistory = world?.conversationEvents?.() ?? [];
+		const newConversationEvents = Array.isArray(conversationHistory) ? conversationHistory.slice(this.#conversationCursor) : [];
+		this.#conversationCursor += newConversationEvents.length;
+		for (const event of newConversationEvents) {
 			if (!event?.eventId || this.#seenConversationEvents.has(event.eventId)) continue;
 			const declared = this.#declaredEvent(event.eventId, event.kind ?? event.type);
 			if (!declared || !/message|agent_message|direct/i.test(String(declared.kind ?? declared.type ?? event.kind ?? event.type))) continue;
@@ -707,6 +727,8 @@ class LatencyMetricsTracker {
 			this.#directMessages.set(event.eventId, value);
 			this.#push(this.#raw.directMessageReaction, { ...value, reactionWallLatencyMs: null, reactionVirtualLatencyMs: null });
 		}
+		const declaredMessageIds = this.#declaredEvents().filter((event) => /message|agent_message|direct/i.test(String(event?.kind ?? event?.type ?? ''))).map((event) => event?.eventId).filter(Boolean);
+		this.#conversationPollPending = declaredMessageIds.some((eventId) => !this.#seenConversationEvents.has(eventId));
 	}
 
 	#observeDeclaredEvents(agentId, state, wallTimestampMs, virtualTimestampMs, initial) {
@@ -840,11 +862,8 @@ function summarizeTickDurations(values, rawTicks) {
 	const maxMs = sorted.length === 0 ? null : sorted.at(-1);
 	return {
 		count: sorted.length,
+		basis: 'monotonic_wall_duration_ms',
 		wallDurationSamplesMs: rawTicks.map((row) => row.wallDurationMs),
-		cpuWallDurationP50Ms: percentile(sorted, 0.50),
-		cpuWallDurationP95Ms: percentile(sorted, 0.95),
-		cpuWallDurationP99Ms: percentile(sorted, 0.99),
-		cpuWallDurationMaxMs: maxMs,
 		p50Ms: percentile(sorted, 0.50),
 		p95Ms: percentile(sorted, 0.95),
 		p99Ms: percentile(sorted, 0.99),
@@ -1220,7 +1239,26 @@ function cleanupSnapshot(bridge, sampler, cleanupErrors = []) {
 	const samplerErrors = sampler?.errors?.length ?? 0;
 	return { ok: activeActions === 0 && listeners === 0 && relays === 0 && pendingObservations === 0 && !samplerActive && cleanupErrors.length === 0, activeActions, listeners, relays, pendingObservations, samplerActive, samplerErrors, errors: cleanupErrors.slice(0, 16) };
 }
-function trialResult(trial, repetition, status, error, startedAt, outcomeHash, cleanup, context = {}) { return { ...context, trialId: trial.id, repetition, status, scenarioId: trial.scenarioId, seed: trial.seed, agentLoad: trial.agentLoad, mode: trial.mode, providerProfile: trial.providerProfile, providerIdentity: { provider: trial.providerProfile.provider, synthetic: trial.mode !== 'live' }, ...(outcomeHash ? { outcomeHash } : {}), ...(error ? { error: { code: sanitizeDiagnosticErrorCode(error, { fallback: 'TRIAL_FAILED' }), message: boundedError(error) } } : {}), cleanup: cleanup ?? { ok: true, activeActions: 0, listeners: 0 }, durationMs: Math.max(0, Math.round(performance.now() - startedAt)) }; }
+function trialResult(trial, repetition, status, error, startedAt, outcomeHash, cleanup, context = {}, timing = {}) {
+	const endedAt = performance.now();
+	const measurementStartedAt = Number.isFinite(timing.measurementStartedAt) ? timing.measurementStartedAt : null;
+	const setupSpansMs = isRecord(timing.setupSpansMs) ? timing.setupSpansMs : {};
+	return {
+		...context,
+		trialId: trial.id, repetition, status, scenarioId: trial.scenarioId, seed: trial.seed, agentLoad: trial.agentLoad, mode: trial.mode,
+		providerProfile: trial.providerProfile, providerIdentity: { provider: trial.providerProfile.provider, synthetic: trial.mode !== 'live' },
+		...(outcomeHash ? { outcomeHash } : {}),
+		...(error ? { error: { code: sanitizeDiagnosticErrorCode(error, { fallback: 'TRIAL_FAILED' }), message: boundedError(error) } } : {}),
+		cleanup: cleanup ?? { ok: true, activeActions: 0, listeners: 0 },
+		durationMs: measurementStartedAt === null ? null : Math.max(0, Math.round(endedAt - measurementStartedAt)),
+		setupDurationMs: Math.max(0, Math.round((measurementStartedAt ?? endedAt) - startedAt)),
+		totalDurationMs: Math.max(0, Math.round(endedAt - startedAt)),
+		setupSpansMs: {
+			providerStart: finiteOrNull(setupSpansMs.providerStart),
+			coordinatorStart: finiteOrNull(setupSpansMs.coordinatorStart),
+		},
+	};
+}
 function cleanupError() { return null; }
 async function writeArtifacts(directory, output, recorder, artifactFs = {}) {
 	const fs = { mkdir, rename, rm, writeFile, ...artifactFs };

@@ -87,7 +87,7 @@ try {
         BaselineRunnerArguments = @('--shared-state-path', $statePath, '--retry-once', '--label', 'baseline')
         OptimizedRunnerArguments = @('--shared-state-path', $statePath, '--retry-once', '--label', 'optimized')
         BaselinePlanningConcurrency = 16
-        OptimizedPlanningConcurrency = 4
+        OptimizedPlanningConcurrency = 16
         BaselineReplayRecordingsPath = $baselineReplayPath
         OptimizedReplayRecordingsPath = $optimizedReplayPath
     }
@@ -97,7 +97,7 @@ try {
     Assert-Fixture ([string]$firstManifest.Status -eq 'passed') 'A successful fixture run did not pass.'
     Assert-Fixture ([int]$firstManifest.results.Count -eq 8) 'Expected one result per pair and arm.'
     Assert-Fixture ([int]$firstManifest.armConfig.baseline.planningConcurrency -eq 16) 'Baseline planning concurrency was not recorded.'
-    Assert-Fixture ([int]$firstManifest.armConfig.optimized.planningConcurrency -eq 4) 'Optimized planning concurrency was not recorded.'
+    Assert-Fixture ([int]$firstManifest.armConfig.optimized.planningConcurrency -eq 16) 'Optimized planning concurrency was not recorded.'
     Assert-Fixture ([string]$firstManifest.armConfig.baseline.runnerArguments[-1] -eq 'baseline') 'Baseline runner arguments were not recorded.'
     Assert-Fixture ([string]$firstManifest.armConfig.optimized.runnerArguments[-1] -eq 'optimized') 'Optimized runner arguments were not recorded.'
     Assert-Fixture ([string]$firstManifest.armConfig.baseline.replayRecordingsPath -eq [IO.Path]::GetFullPath($baselineReplayPath)) 'Baseline replay path was not recorded.'

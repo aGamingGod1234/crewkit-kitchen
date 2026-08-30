@@ -26,7 +26,7 @@ param(
     [ValidateRange(1, 16)]
     [int] $BaselinePlanningConcurrency = 16,
     [ValidateRange(1, 16)]
-    [int] $OptimizedPlanningConcurrency = 4,
+    [int] $OptimizedPlanningConcurrency = 16,
     [ValidateRange(0, 16)]
     [int] $FixedPlanningConcurrency = 0,
     [AllowNull()]
@@ -1189,7 +1189,7 @@ function Invoke-LatencyAbExperiment {
         [AllowNull()] [AllowEmptyCollection()] [string[]] $BaselineRunnerArguments,
         [AllowNull()] [AllowEmptyCollection()] [string[]] $OptimizedRunnerArguments,
         [ValidateRange(1, 16)] [int] $BaselinePlanningConcurrency = 16,
-        [ValidateRange(1, 16)] [int] $OptimizedPlanningConcurrency = 4,
+        [ValidateRange(1, 16)] [int] $OptimizedPlanningConcurrency = 16,
         [ValidateRange(0, 16)] [int] $FixedPlanningConcurrency = 0,
         [AllowNull()] [string] $BaselineReplayRecordingsPath,
         [AllowNull()] [string] $OptimizedReplayRecordingsPath,
