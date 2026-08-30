@@ -14,6 +14,7 @@ public final class AgentActivityPresentation {
 
 	public static String action(ActionType type) {
 		return switch (Objects.requireNonNull(type, "type must not be null")) {
+			case CONTROL -> "Controlling player inputs";
 			case MOVE_TO, NAVIGATE_TO -> "Moving to the next position";
 			case LOOK_AT -> "Looking around";
 			case ATTACK, FIGHT_TARGET -> "Engaging a target";

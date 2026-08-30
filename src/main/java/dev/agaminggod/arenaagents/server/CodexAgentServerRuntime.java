@@ -15,6 +15,7 @@ import dev.agaminggod.arenaagents.server.voice.VoiceConsentRegistry;
 import dev.agaminggod.arenaagents.server.goal.GoalVerificationRuntime;
 import dev.agaminggod.arenaagents.server.goal.GoalSafetyController;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationCollector;
+import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
 import dev.agaminggod.arenaagents.scenario.runtime.ScenarioRuntimeService;
 import java.util.Map;
 import java.util.HashMap;
@@ -311,6 +312,7 @@ public final class CodexAgentServerRuntime {
 			VoiceSubsystemRuntime.tick(server);
 			maintainPlanningProgress(manager);
 			if (activeBridge != null) activeBridge.tick();
+			AgentInputRuntime.tick(server);
 			ScenarioRuntimeService.tick(server);
 		});
 	}

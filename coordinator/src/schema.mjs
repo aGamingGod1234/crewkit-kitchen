@@ -53,6 +53,15 @@ export function validateAction(value) {
 			requireFiniteRange(action.tolerance, 'action.tolerance', MIN_MOVEMENT_TOLERANCE, MAX_MOVEMENT_TOLERANCE);
 			requireBoolean(action.sprint, 'action.sprint');
 			break;
+		case 'control':
+			requireFiniteRange(action.forward, 'action.forward', -1, 1);
+			requireFiniteRange(action.strafe, 'action.strafe', -1, 1);
+			for (const field of ['jump', 'sneak', 'sprint', 'attack', 'use']) requireBoolean(action[field], `action.${field}`);
+			requireFiniteRange(action.yaw, 'action.yaw', -180, 180);
+			requireFiniteRange(action.pitch, 'action.pitch', -90, 90);
+			requireIntRange(action.selectedSlot, 'action.selectedSlot', 0, 8);
+			requireIntRange(action.ticks, 'action.ticks', 1, 200);
+			break;
 		case 'navigate_to':
 			requireCoordinates(action, false, 'action');
 			requireFiniteRange(action.tolerance, 'action.tolerance', MIN_MOVEMENT_TOLERANCE, MAX_MOVEMENT_TOLERANCE);

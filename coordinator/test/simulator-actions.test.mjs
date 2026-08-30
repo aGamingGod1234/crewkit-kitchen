@@ -256,6 +256,7 @@ test('every production action type is implemented or terminates with an explicit
 	const uuid = MOB;
 	const validArguments = {
 		move_to: { x: 1, y: 1, z: 0, tolerance: 0.1, sprint: false },
+		control: { forward: 1, strafe: 0, jump: false, sneak: false, sprint: true, attack: false, use: false, yaw: 0, pitch: 0, selectedSlot: 0, ticks: 1 },
 		look_at: { x: 1, y: 1, z: 0 },
 		attack: { targetId: uuid, timeoutMs: 1_000 },
 		select_item: { itemId: 'minecraft:stick' },

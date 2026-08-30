@@ -43,6 +43,9 @@ public final class ScenarioRuntimeClock {
 		this.nextEventIndex = snapshot.nextEventIndex();
 		this.activePhaseId = snapshot.activePhaseId().orElse(null);
 		this.finished = snapshot.finished();
+		if (finished && !session.state().terminal()) {
+			throw new IllegalArgumentException("INVALID_SCENARIO_SNAPSHOT: active session cannot have a finished clock");
+		}
 	}
 
 	public static ScenarioRuntimeClock restore(ScenarioSession session, Snapshot snapshot) {
@@ -101,7 +104,12 @@ public final class ScenarioRuntimeClock {
 			);
 		}
 		elapsedTick++;
-		return new Update(currentTick, enteredPhase, due, false);
+		boolean finishedNow = elapsedTick >= session.config().durationTicks();
+		if (finishedNow) {
+			session.finish(currentTick, "Configured scenario duration elapsed");
+			finished = true;
+		}
+		return new Update(currentTick, enteredPhase, due, finishedNow);
 	}
 
 	public record Snapshot(

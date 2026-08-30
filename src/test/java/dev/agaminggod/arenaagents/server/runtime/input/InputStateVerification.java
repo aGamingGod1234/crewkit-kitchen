@@ -17,6 +17,7 @@ public final class InputStateVerification {
 		assertions += verifyCompleteInputState();
 		assertions += verifyLeasePreemptionAndRestoration();
 		assertions += verifyClearReleasesEveryPressedInput();
+		assertions += verifyLeaseDeadman();
 		assertions += verifyBoundedMotor();
 		return assertions;
 	}
@@ -70,6 +71,27 @@ public final class InputStateVerification {
 		assertEquals(List.of(AGENT), sink.cleared, "clear reaches the physical sink once");
 		assertThrows(() -> controller.apply(lease, state(1.0F, true, true)), "cleared lease cannot affect a respawned player");
 		return 3;
+	}
+
+	private static int verifyLeaseDeadman() {
+		RecordingSink sink = new RecordingSink();
+		LeasedServerInputController controller = new LeasedServerInputController(sink);
+		InputLease lease = controller.acquire(AGENT, InputOwner.INTERACTION, 300);
+		controller.apply(lease, state(1.0F, true, true));
+		for (long tick = 1; tick < LeasedServerInputController.LEASE_TIMEOUT_TICKS; tick++) controller.tick();
+		assertEquals(true, controller.currentState(AGENT).isPresent(), "lease remains active inside its renewal window");
+		controller.tick();
+		assertEquals(true, controller.currentState(AGENT).isEmpty(), "silent lease expires at the deadman deadline");
+		assertEquals(List.of(AGENT), sink.cleared, "deadman neutralizes held physical input once");
+		assertThrows(() -> controller.apply(lease, state(1.0F, true, true)), "expired lease cannot resume input");
+
+		InputLease renewed = controller.acquire(AGENT, InputOwner.NAVIGATION, 100);
+		for (int cycle = 0; cycle < 3; cycle++) {
+			controller.apply(renewed, state(1.0F, false, false));
+			for (long tick = 1; tick < LeasedServerInputController.LEASE_TIMEOUT_TICKS; tick++) controller.tick();
+		}
+		assertEquals(true, controller.currentState(AGENT).isPresent(), "regular input application renews the lease");
+		return 5;
 	}
 
 	private static int verifyBoundedMotor() {

@@ -8,6 +8,7 @@ import java.util.stream.Collectors;
 
 public enum ActionType {
 	MOVE_TO("move_to"),
+	CONTROL("control"),
 	LOOK_AT("look_at"),
 	ATTACK("attack"),
 	SELECT_ITEM("select_item"),

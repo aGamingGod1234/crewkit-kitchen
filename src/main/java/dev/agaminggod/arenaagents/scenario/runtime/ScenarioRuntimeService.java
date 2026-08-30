@@ -1044,7 +1044,7 @@ public final class ScenarioRuntimeService {
 	private static ScenarioAgentEvent.ActionFamily actionFamily(String wireName) {
 		if (wireName == null) return ScenarioAgentEvent.ActionFamily.OTHER;
 		return switch (wireName) {
-			case "move_to", "navigate_to", "follow_entity", "look_at" -> ScenarioAgentEvent.ActionFamily.MOVEMENT;
+			case "control", "move_to", "navigate_to", "follow_entity", "look_at" -> ScenarioAgentEvent.ActionFamily.MOVEMENT;
 			case "break_block", "pick_up_item" -> ScenarioAgentEvent.ActionFamily.HARVEST;
 			case "place_block" -> ScenarioAgentEvent.ActionFamily.BUILD;
 			case "craft_inventory", "craft_table", "furnace_transaction", "transfer_container",

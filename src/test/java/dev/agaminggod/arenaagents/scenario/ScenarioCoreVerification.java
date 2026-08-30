@@ -333,6 +333,8 @@ public final class ScenarioCoreVerification {
 				"the route varies landing widths instead of repeating one staircase shape");
 		assertTrue(lane.platforms().stream().map(ScenarioParkourCourse.Platform::y).distinct().count() >= 6,
 				"the route has meaningful vertical composition");
+		assertTrue(lane.platforms().stream().map(ScenarioParkourCourse.Platform::x).distinct().count() >= 2,
+				"the route requires lateral movement instead of following one straight axis");
 		assertTrue(lane.transitionsReachable(),
 				"every progressive parkour transition stays inside the controller reach envelope");
 
@@ -416,7 +418,7 @@ public final class ScenarioCoreVerification {
 				"sixteen-player survival-games arena scales beyond the old small combat box");
 		assertTrue(pvpByPosition.values().stream().anyMatch(placement -> placement.state().getBlock() == Blocks.WATER),
 				"survival-games arena contains navigable terrain rather than only stone and lava");
-		return 33;
+		return 34;
 	}
 
 	private static int verifyParkourParticipantRuntime() {
@@ -990,14 +992,14 @@ public final class ScenarioCoreVerification {
 				new HashSet<>(directedEvents).size(),
 				"runtime clock dispatches every directed event exactly once"
 		);
-		assertEquals(0, finishSignals, "configured duration never ends an open-ended scenario");
-		assertEquals(ScenarioSessionState.RUNNING, session.state(), "runtime clock remains running beyond former duration");
-		assertEquals(session.config().durationTicks() + 2L, clock.snapshot().elapsedTick(),
-				"elapsed telemetry continues increasing beyond the phase schedule");
-		session.finish(clock.snapshot().elapsedTick(), "Operator ended observation");
-		assertTrue(clock.tick().finishedNow(), "explicit gameplay or operator completion ends the runtime once");
+		assertEquals(1, finishSignals, "configured duration ends the scenario exactly once");
+		assertEquals(ScenarioSessionState.FINISHED, session.state(), "runtime clock finishes at the configured duration");
+		assertEquals(session.config().durationTicks(), clock.snapshot().elapsedTick(),
+				"elapsed telemetry stops at the configured duration");
+		assertEquals(Optional.of("Configured scenario duration elapsed"), session.completionReason(),
+				"duration completion records a stable reason");
 		assertTrue(!clock.tick().finishedNow(), "terminal completion is emitted only once");
-		return 6;
+		return 7;
 	}
 
 	private static int verifyPhases() {
