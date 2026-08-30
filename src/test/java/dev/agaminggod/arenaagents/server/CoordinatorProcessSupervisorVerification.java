@@ -688,9 +688,7 @@ public final class CoordinatorProcessSupervisorVerification {
 			authenticated = null;
 			slot.close();
 			slot = null;
-			try (ServerSocket rebound = new ServerSocket()) {
-				rebound.setReuseAddress(true);
-				rebound.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), port), 1);
+			try (ServerSocket rebound = bindLoopbackEventually(port)) {
 				assertEquals(port, rebound.getLocalPort(), "closing recovered BridgeSlot releases its listener once");
 			}
 		} catch (Exception exception) {
@@ -2737,6 +2735,24 @@ public final class CoordinatorProcessSupervisorVerification {
 			}
 		}
 		throw new IOException("Rebound bridge did not accept authentication before its deadline", lastFailure);
+	}
+
+	private static ServerSocket bindLoopbackEventually(int port) throws Exception {
+		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3L);
+		java.net.BindException lastFailure = null;
+		do {
+			ServerSocket socket = new ServerSocket();
+			try {
+				socket.setReuseAddress(true);
+				socket.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), port), 1);
+				return socket;
+			} catch (java.net.BindException retryable) {
+				lastFailure = retryable;
+				socket.close();
+				Thread.sleep(25L);
+			}
+		} while (System.nanoTime() < deadline);
+		throw new IOException("Closed bridge listener was not released before its deadline", lastFailure);
 	}
 
 	private static String authenticationProof(
