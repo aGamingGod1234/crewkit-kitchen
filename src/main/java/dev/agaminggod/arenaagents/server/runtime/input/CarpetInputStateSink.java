@@ -6,6 +6,7 @@ import dev.agaminggod.arenaagents.server.CodexAgentManager;
 import dev.agaminggod.arenaagents.server.OfflineAgentPlayers;
 import java.util.Objects;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.InteractionHand;
 
 public final class CarpetInputStateSink implements InputStateSink {
 	private final CodexAgentManager manager;
@@ -22,9 +23,10 @@ public final class CarpetInputStateSink implements InputStateSink {
 		boolean resetActions = previous != null && (
 				(previous.jump() && !state.jump())
 						|| (previous.attack() && !state.attack())
-						|| (previous.use() && !state.use())
+						|| shouldStopUsing(previous, state)
 		);
 		if (resetActions) actions.stopAll();
+		if (shouldStopUsing(previous, state)) player.stopUsingItem();
 		actions.look(state.yaw(), state.pitch())
 				.setForward(state.forward())
 				.setStrafing(state.strafe())
@@ -37,9 +39,22 @@ public final class CarpetInputStateSink implements InputStateSink {
 		if (state.attack() && (resetActions || previous == null || !previous.attack())) {
 			actions.start(EntityPlayerActionPack.ActionType.ATTACK, EntityPlayerActionPack.Action.continuous());
 		}
-		if (state.use() && (resetActions || previous == null || !previous.use())) {
-			actions.start(EntityPlayerActionPack.ActionType.USE, EntityPlayerActionPack.Action.continuous());
+		if (shouldStartUsing(previous, state, resetActions)) {
+			if (state.hand() == InteractionHand.MAIN_HAND) {
+				actions.start(EntityPlayerActionPack.ActionType.USE, EntityPlayerActionPack.Action.continuous());
+			} else {
+				player.gameMode.useItem(player, player.level(), player.getItemInHand(state.hand()), state.hand());
+			}
 		}
+	}
+
+	static boolean shouldStopUsing(AgentInputState previous, AgentInputState state) {
+		return previous != null && previous.use()
+				&& (!state.use() || previous.hand() != state.hand());
+	}
+
+	static boolean shouldStartUsing(AgentInputState previous, AgentInputState state, boolean resetActions) {
+		return state.use() && (resetActions || previous == null || !previous.use() || previous.hand() != state.hand());
 	}
 
 	@Override

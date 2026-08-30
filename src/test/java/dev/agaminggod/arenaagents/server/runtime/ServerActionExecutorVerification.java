@@ -144,6 +144,18 @@ public final class ServerActionExecutorVerification {
 		}
 		assertThrows(AgentDomainException.class, () -> ServerActionExecutor.requireArenaScriptPrimitive(ActionType.FIGHT_TARGET),
 				"program primitive entry point rejects high-level controller actions");
+		JsonObject mainHand = new JsonObject();
+		mainHand.addProperty("hand", "main");
+		assertEquals(net.minecraft.world.InteractionHand.MAIN_HAND, ServerActionExecutor.hand(mainHand),
+				"raw control maps the main-hand wire value");
+		JsonObject offHand = new JsonObject();
+		offHand.addProperty("hand", "off");
+		assertEquals(net.minecraft.world.InteractionHand.OFF_HAND, ServerActionExecutor.hand(offHand),
+				"raw control maps the offhand wire value");
+		JsonObject invalidHand = new JsonObject();
+		invalidHand.addProperty("hand", "left");
+		assertThrows(AgentDomainException.class, () -> ServerActionExecutor.hand(invalidHand),
+				"raw control rejects an unknown hand value");
 		ServerActionProgress progress = new ServerActionProgress(
 				progressAgent, 7L, "action-7", ActionType.NAVIGATE_TO, 0.5D, 250L, 1_750_000_000_250L
 		);
@@ -229,7 +241,7 @@ public final class ServerActionExecutorVerification {
 			assertFalse(admitted[start], "round-robin does not admit an agent twice before the full turn");
 			admitted[start] = true;
 		}
-		return 48;
+		return 51;
 	}
 
 	private static void verifyDisconnectedRespawnFinishesOnce() {

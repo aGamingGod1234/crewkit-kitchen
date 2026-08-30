@@ -388,6 +388,7 @@ public final class ProtocolCodec {
 		requireFiniteRange(command, FIELD_YAW, -180.0D, 180.0D);
 		requireFiniteRange(command, FIELD_PITCH, -90.0D, 90.0D);
 		requireIntegralRange(command, FIELD_SELECTED_SLOT, 0L, 8L);
+		requireOneOf(command, FIELD_HAND, List.of("main", "off"));
 		requireIntegralRange(command, FIELD_TICKS, 1L, 200L);
 	}
 
@@ -820,7 +821,7 @@ public final class ProtocolCodec {
 		fields.put(ActionType.MOVE_TO, List.of(FIELD_X, FIELD_Y, FIELD_Z, FIELD_TOLERANCE, FIELD_SPRINT));
 		fields.put(ActionType.CONTROL, List.of(
 				FIELD_FORWARD, FIELD_STRAFE, FIELD_JUMP, FIELD_SNEAK, FIELD_SPRINT,
-				FIELD_ATTACK, FIELD_USE, FIELD_YAW, FIELD_PITCH, FIELD_SELECTED_SLOT, FIELD_TICKS
+				FIELD_ATTACK, FIELD_USE, FIELD_YAW, FIELD_PITCH, FIELD_SELECTED_SLOT, FIELD_HAND, FIELD_TICKS
 		));
 		fields.put(ActionType.LOOK_AT, List.of(FIELD_X, FIELD_Y, FIELD_Z));
 		fields.put(ActionType.ATTACK, List.of(FIELD_TARGET_ID, FIELD_TIMEOUT_MS));

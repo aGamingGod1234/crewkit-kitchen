@@ -86,10 +86,10 @@ test('advertised native actions exactly match Java model-authored dispatch', asy
 test('native Minecraft tool calls normalize to exact existing body actions', () => {
 	assert.deepEqual(normalizeMinecraftToolCall('control', {
 		forward: 1, strafe: -0.5, jump: true, sneak: false, sprint: true,
-		attack: false, use: false, yaw: 90, pitch: -15, selectedSlot: 2, ticks: 20,
+		attack: false, use: true, yaw: 90, pitch: -15, selectedSlot: 2, hand: 'off', ticks: 20,
 	}), {
 		kind: 'action', actionType: 'control',
-		arguments: { forward: 1, strafe: -0.5, jump: true, sneak: false, sprint: true, attack: false, use: false, yaw: 90, pitch: -15, selectedSlot: 2, ticks: 20 },
+		arguments: { forward: 1, strafe: -0.5, jump: true, sneak: false, sprint: true, attack: false, use: true, yaw: 90, pitch: -15, selectedSlot: 2, hand: 'off', ticks: 20 },
 	});
 	assert.deepEqual(normalizeMinecraftToolCall('moveTo', { x: 1, y: 64, z: -2 }), {
 		kind: 'action', actionType: 'navigate_to', arguments: { x: 1, y: 64, z: -2, tolerance: 1, sprint: true, timeoutMs: 30_000 },

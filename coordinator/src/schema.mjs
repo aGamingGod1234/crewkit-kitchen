@@ -60,6 +60,7 @@ export function validateAction(value) {
 			requireFiniteRange(action.yaw, 'action.yaw', -180, 180);
 			requireFiniteRange(action.pitch, 'action.pitch', -90, 90);
 			requireIntRange(action.selectedSlot, 'action.selectedSlot', 0, 8);
+			requireOneOf(action.hand, 'action.hand', ['main', 'off']);
 			requireIntRange(action.ticks, 'action.ticks', 1, 200);
 			break;
 		case 'navigate_to':

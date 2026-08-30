@@ -445,7 +445,7 @@ public final class ServerActionExecutor {
 							(float) number(arguments, "yaw"),
 							(float) number(arguments, "pitch"),
 							integer(arguments, "selectedSlot"),
-							InteractionHand.MAIN_HAND
+							hand(arguments)
 					),
 					integer(arguments, "ticks")
 			);
@@ -1241,7 +1241,7 @@ public final class ServerActionExecutor {
 		}
 	}
 
-	private static InteractionHand hand(JsonObject arguments) {
+	static InteractionHand hand(JsonObject arguments) {
 		return switch (string(arguments, "hand")) {
 			case "main" -> InteractionHand.MAIN_HAND;
 			case "off" -> InteractionHand.OFF_HAND;

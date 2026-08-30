@@ -31,8 +31,9 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 		yaw: numberSchema(-180, 180),
 		pitch: numberSchema(-90, 90),
 		selectedSlot: integerSchema(0, 8),
+		hand: { type: 'string', enum: ['main', 'off'] },
 		ticks: integerSchema(1, 200),
-	}, ['forward', 'strafe', 'jump', 'sneak', 'sprint', 'attack', 'use', 'yaw', 'pitch', 'selectedSlot', 'ticks'])),
+	}, ['forward', 'strafe', 'jump', 'sneak', 'sprint', 'attack', 'use', 'yaw', 'pitch', 'selectedSlot', 'hand', 'ticks'])),
 	tool('moveTo', 'Navigate toward one coordinate through bounded loaded safe waypoints and wait for success or a factual failure/timeout.', objectSchema({
 		x: numberSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT),
 		y: numberSchema(-2_048, 2_048),
@@ -77,7 +78,7 @@ export function normalizeMinecraftToolCall(name, value) {
 			requireExactKeys(args, []);
 			return { kind: 'observe' };
 		case 'control':
-			requireExactKeys(args, ['forward', 'strafe', 'jump', 'sneak', 'sprint', 'attack', 'use', 'yaw', 'pitch', 'selectedSlot', 'ticks']);
+			requireExactKeys(args, ['forward', 'strafe', 'jump', 'sneak', 'sprint', 'attack', 'use', 'yaw', 'pitch', 'selectedSlot', 'hand', 'ticks']);
 			try {
 				return {
 					kind: 'action',

@@ -18,6 +18,7 @@ public final class InputStateVerification {
 		assertions += verifyLeasePreemptionAndRestoration();
 		assertions += verifyClearReleasesEveryPressedInput();
 		assertions += verifyLeaseDeadman();
+		assertions += verifyUseHandTransitions();
 		assertions += verifyBoundedMotor();
 		return assertions;
 	}
@@ -94,6 +95,22 @@ public final class InputStateVerification {
 		return 5;
 	}
 
+	private static int verifyUseHandTransitions() {
+		AgentInputState mainUse = state(0.0F, false, true);
+		AgentInputState offhandUse = withHand(mainUse, InteractionHand.OFF_HAND);
+		assertEquals(true, CarpetInputStateSink.shouldStopUsing(mainUse, offhandUse),
+				"changing hand releases the previous held use");
+		assertEquals(true, CarpetInputStateSink.shouldStartUsing(mainUse, offhandUse, true),
+				"changing hand starts use with the requested hand");
+		assertEquals(false, CarpetInputStateSink.shouldStopUsing(offhandUse, offhandUse),
+				"stable offhand use remains held");
+		assertEquals(false, CarpetInputStateSink.shouldStartUsing(offhandUse, offhandUse, false),
+				"stable offhand use is not restarted");
+		assertEquals(true, CarpetInputStateSink.shouldStopUsing(offhandUse, state(0.0F, false, false)),
+				"releasing use neutralizes the selected hand");
+		return 5;
+	}
+
 	private static int verifyBoundedMotor() {
 		AgentInputStates.MotorState initial = AgentInputStates.MotorState.initial(170.0F, 20.0F);
 		AgentInputStates.MotorStep turn = AgentInputStates.stepMotor(
@@ -163,6 +180,13 @@ public final class InputStateVerification {
 		return new AgentInputState(
 				forward, 0.0F, false, false, forward > 0.0F, attack, use,
 				0.0F, 0.0F, 0, InteractionHand.MAIN_HAND
+		);
+	}
+
+	private static AgentInputState withHand(AgentInputState state, InteractionHand hand) {
+		return new AgentInputState(
+				state.forward(), state.strafe(), state.jump(), state.sneak(), state.sprint(), state.attack(), state.use(),
+				state.yaw(), state.pitch(), state.selectedSlot(), hand
 		);
 	}
 

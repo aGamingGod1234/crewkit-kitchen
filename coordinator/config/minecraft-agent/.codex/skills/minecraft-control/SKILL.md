@@ -47,19 +47,19 @@ Use this for precise jumps, strafing, sprint timing, attacks, item use, view dir
 Formatting:
 
 ```text executor-format
-{"tool":"control","arguments":{"forward":<required finite number -1..1>,"strafe":<required finite number -1..1>,"jump":<required true|false>,"sneak":<required true|false>,"sprint":<required true|false>,"attack":<required true|false>,"use":<required true|false>,"yaw":<required finite number -180..180>,"pitch":<required finite number -90..90>,"selectedSlot":<required integer 0..8>,"ticks":<required integer 1..200>}}
+{"tool":"control","arguments":{"forward":<required finite number -1..1>,"strafe":<required finite number -1..1>,"jump":<required true|false>,"sneak":<required true|false>,"sprint":<required true|false>,"attack":<required true|false>,"use":<required true|false>,"yaw":<required finite number -180..180>,"pitch":<required finite number -90..90>,"selectedSlot":<required integer 0..8>,"hand":<required main|off>,"ticks":<required integer 1..200>}}
 ```
 
 Good:
 
 ```json executor-call
-{"tool":"control","arguments":{"forward":1,"strafe":0,"jump":true,"sneak":false,"sprint":true,"attack":false,"use":false,"yaw":0,"pitch":0,"selectedSlot":0,"ticks":8}}
+{"tool":"control","arguments":{"forward":1,"strafe":0,"jump":true,"sneak":false,"sprint":true,"attack":false,"use":false,"yaw":0,"pitch":0,"selectedSlot":0,"hand":"main","ticks":8}}
 ```
 
 Bad:
 
 ```json executor-bad-call
-{"tool":"control","arguments":{"forward":1,"jump":true,"ticks":8}}
+{"tool":"control","arguments":{"forward":1,"jump":true,"hand":"left","ticks":8}}
 ```
 
 ## moveTo - Navigate the player to an observed position and return the body result.
@@ -219,19 +219,19 @@ Every action below uses the top-level act wrapper. The inner arguments object mu
 Formatting:
 
 ```text executor-format
-{"tool":"act","arguments":{"actionType":"control","arguments":{"forward":<required finite number -1..1>,"strafe":<required finite number -1..1>,"jump":<required true|false>,"sneak":<required true|false>,"sprint":<required true|false>,"attack":<required true|false>,"use":<required true|false>,"yaw":<required finite number -180..180>,"pitch":<required finite number -90..90>,"selectedSlot":<required integer 0..8>,"ticks":<required integer 1..200>}}}
+{"tool":"act","arguments":{"actionType":"control","arguments":{"forward":<required finite number -1..1>,"strafe":<required finite number -1..1>,"jump":<required true|false>,"sneak":<required true|false>,"sprint":<required true|false>,"attack":<required true|false>,"use":<required true|false>,"yaw":<required finite number -180..180>,"pitch":<required finite number -90..90>,"selectedSlot":<required integer 0..8>,"hand":<required main|off>,"ticks":<required integer 1..200>}}}
 ```
 
 Good:
 
 ```json executor-call
-{"tool":"act","arguments":{"actionType":"control","arguments":{"forward":0,"strafe":1,"jump":false,"sneak":true,"sprint":false,"attack":false,"use":false,"yaw":90,"pitch":15,"selectedSlot":3,"ticks":10}}}
+{"tool":"act","arguments":{"actionType":"control","arguments":{"forward":0,"strafe":1,"jump":false,"sneak":true,"sprint":false,"attack":false,"use":true,"yaw":90,"pitch":15,"selectedSlot":3,"hand":"off","ticks":10}}}
 ```
 
 Bad:
 
 ```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"control","arguments":{"forward":0,"strafe":2,"jump":false,"sneak":true,"sprint":false,"attack":false,"use":false,"yaw":90,"pitch":15,"selectedSlot":3,"ticks":10}}}
+{"tool":"act","arguments":{"actionType":"control","arguments":{"forward":0,"strafe":2,"jump":false,"sneak":true,"sprint":false,"attack":false,"use":false,"yaw":90,"pitch":15,"selectedSlot":3,"hand":"main","ticks":10}}}
 ```
 
 ## act / move_to - Move directly to a position and return the body result.
