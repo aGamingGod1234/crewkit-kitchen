@@ -7,9 +7,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -636,36 +639,6 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			nextRetryEpochMs = Math.max(nextRetryEpochMs, now);
 		}
 
-		if (bridgeAuthenticated && authenticatedLaunchId == null) {
-			state = CoordinatorRecoveryState.HEALTHY;
-			nextRetryEpochMs = 0L;
-			reconnectDeadlineEpochMs = 0L;
-			coordinatorReconciled = coordinatorReady;
-			clearDiagnostic();
-			submitDependencyMaintenance(now, false, false);
-			return;
-		}
-		if (launchId == null
-				&& (state == CoordinatorRecoveryState.HEALTHY || state == CoordinatorRecoveryState.DEGRADED)) {
-			if (state == CoordinatorRecoveryState.HEALTHY) {
-				state = CoordinatorRecoveryState.DEGRADED;
-				coordinatorReconciled = false;
-				reconnectDeadlineEpochMs = now + RECONNECT_TIMEOUT_MS;
-				nextRetryEpochMs = reconnectDeadlineEpochMs;
-				authenticatedSinceEpochMs = 0L;
-				stabilityCredited = false;
-				setDiagnostic(
-						"COORDINATOR_BRIDGE_DISCONNECTED",
-						"Authenticated external coordinator bridge disconnected; waiting for reconnection",
-						"bridge_reconnect"
-				);
-			}
-			if (now < reconnectDeadlineEpochMs) {
-				submitDependencyMaintenance(now, false, false);
-				return;
-			}
-			reconnectDeadlineEpochMs = 0L;
-		}
 		if (now >= nextRetryEpochMs) {
 			submitLaunchMaintenance(now);
 			drainMaintenanceResults(now);
@@ -1992,9 +1965,8 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			values.add(Objects.toString(System.getProperty(NodeRuntimeLocator.PROPERTY), ""));
 			String path = effectiveEnvironmentValue("PATH");
 			values.add(Objects.toString(path, ""));
-			values.add(fileStamp(root.resolve("coordinator/.arena-agents-bundle-manifest")));
-			values.add(fileStamp(root.resolve("coordinator.last-known-good/.arena-agents-bundle-manifest")));
-			values.add(fileStamp(root.resolve("coordinator/src/dynamic-main.mjs")));
+			values.add(manifestFilesStamp(root.resolve("coordinator/.arena-agents-bundle-manifest")));
+			values.add(manifestFilesStamp(root.resolve("coordinator.last-known-good/.arena-agents-bundle-manifest")));
 			values.add(fileStamp(root.resolve("runtime/coordinator-generation.properties")));
 			values.add(fileStamp(root.resolve("runtime/dynamic-agents.json")));
 			values.add(fileStamp(root.resolve("runtime/bridge-secret.txt")));
@@ -2035,7 +2007,17 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		@Override
 		public synchronized DependencyResolution resolve(String fingerprint) {
 			if (cachedReadyResolution != null && Objects.equals(cachedFingerprint, fingerprint)) {
-				return cachedReadyResolution;
+				try {
+					BundledCoordinatorInstaller.RuntimePackage validated =
+							BundledCoordinatorInstaller.validate(cachedReadyResolution.runtime().root());
+					if (validated.generationId().equals(cachedReadyResolution.runtime().generationId())) {
+						return cachedReadyResolution;
+					}
+				} catch (IOException | RuntimeException invalidCachedRuntime) {
+					// Fall through to installation/rollback recovery for an incomplete cached generation.
+				}
+				cachedFingerprint = null;
+				cachedReadyResolution = null;
 			}
 			DependencyResolution resolution = resolveUncached();
 			if (resolution.ready()) {
@@ -2183,6 +2165,39 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				return normalized + ":" + Files.size(normalized) + ":" + Files.getLastModifiedTime(normalized).toMillis();
 			} catch (IOException | RuntimeException failure) {
 				return Objects.toString(path) + ":unreadable";
+			}
+		}
+
+		static String manifestFilesStamp(Path manifest) {
+			StringBuilder stamp = new StringBuilder(fileStamp(manifest)).append(':').append(contentStamp(manifest));
+			Path coordinator = manifest.toAbsolutePath().normalize().getParent();
+			if (coordinator == null || !Files.isRegularFile(manifest)) return stamp.toString();
+			try {
+				for (String line : Files.readAllLines(manifest, StandardCharsets.UTF_8)) {
+					if (line.isBlank()) continue;
+					int separator = line.indexOf(' ');
+					if (separator != 64 || line.length() <= 65) return stamp.append(":invalid").toString();
+					Path file = coordinator.resolve(line.substring(separator + 1)).normalize();
+					if (!file.startsWith(coordinator)) return stamp.append(":escaped").toString();
+					stamp.append('|').append(coordinator.relativize(file)).append(':').append(fileStamp(file));
+				}
+			} catch (IOException | RuntimeException failure) {
+				return stamp.append(":unreadable-files").toString();
+			}
+			return stamp.toString();
+		}
+
+		private static String contentStamp(Path path) {
+			if (!Files.isRegularFile(path)) return "missing";
+			try (InputStream input = Files.newInputStream(path)) {
+				MessageDigest digest = MessageDigest.getInstance("SHA-256");
+				byte[] buffer = new byte[16 * 1_024];
+				for (int read; (read = input.read(buffer)) >= 0; ) {
+					if (read > 0) digest.update(buffer, 0, read);
+				}
+				return java.util.HexFormat.of().formatHex(digest.digest());
+			} catch (IOException | NoSuchAlgorithmException | RuntimeException failure) {
+				return "unreadable";
 			}
 		}
 

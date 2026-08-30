@@ -490,8 +490,12 @@ public final class CodexAgentManager {
 					record, target, now + PLAYER_SPAWN_TIMEOUT_MS);
 			Optional<ServerPlayer> existing = findAgentPlayer(record.agentId());
 			if (existing.isPresent()) {
-				AgentInputRuntime.clear(server, record.agentId());
-				OfflineAgentPlayers.remove(existing.orElseThrow());
+				ServerPlayer player = existing.orElseThrow();
+				if (AgentRespawnSpawnPolicy.existingPlayerAction(player.isAlive())
+						== AgentRespawnSpawnPolicy.ExistingPlayerAction.REMOVE_STALE_PLAYER) {
+					AgentInputRuntime.clear(server, record.agentId());
+					OfflineAgentPlayers.remove(player);
+				}
 				pendingPlayerSpawns.put(record.agentId(), attempt.deadlineEpochMs());
 			} else {
 				requestVanillaRespawnPlayer(attempt, now);

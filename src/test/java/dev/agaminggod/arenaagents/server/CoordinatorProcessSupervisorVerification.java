@@ -62,8 +62,8 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyStaleLaunchAuthenticationIsRejected();
 		verifyStaleLaunchCannotSuppressReplacement();
 		verifyReconnectRecoveryAndExpiry();
-		verifyExternalCoordinatorReconnectGrace();
-		verifySlowPreparationPreservesExternalAdoptionWindow();
+		verifyAutoStartOwnsLaunchDespiteExternalAuthentication();
+		verifySlowPreparationStillOwnsLaunch();
 		verifyContinuousStabilityResetsFailures();
 		verifyCandidatePromotionUsesMaintenanceWorker();
 		verifyCandidatePromotionRefreshesOwnedFingerprintBaseline();
@@ -83,6 +83,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyBlockingMaintenanceNeverBlocksTicks();
 		verifyBlockedMaintenanceWaitsForRetryDeadline();
 		verifyProductionDependencyMonitorWakesOnRelevantFileChange();
+		verifyManifestFingerprintCoversEveryListedModule();
 		verifyExternalFingerprintChangeStillReplacesHealthyChild();
 		verifyWorkerFingerprintObservationAdvancesMonitorBaseline();
 		verifyDependencyWakeSurvivesInflightFailure();
@@ -107,7 +108,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyCloseWaitsForInflightOwnedLaunchCleanup();
 		verifyCloseTerminatesChildBehindBlockedMaintenance();
 		verifyCloseIsIdempotent();
-		return isWindows() ? 311 : 301;
+		return isWindows() ? 306 : 296;
 	}
 
 	private static void verifyPosixLaunchGateCommand() {
@@ -1213,44 +1214,19 @@ public final class CoordinatorProcessSupervisorVerification {
 		fixture.supervisor.close();
 	}
 
-	private static void verifyExternalCoordinatorReconnectGrace() {
+	private static void verifyAutoStartOwnsLaunchDespiteExternalAuthentication() {
 		Fixture fixture = Fixture.ready();
 		fixture.supervisor.tick(true, null, 1L, true);
-		assertEquals(CoordinatorRecoveryState.HEALTHY, fixture.supervisor.snapshot().state(),
-				"an authenticated coordinator without a launch ID is adopted");
-		assertEquals(0, fixture.launcher.launches.size(), "adoption does not launch a competing coordinator");
-
-		fixture.supervisor.tick(false, null, 1L, false);
-		CoordinatorRecoverySnapshot degraded = fixture.supervisor.snapshot();
-		assertEquals(CoordinatorRecoveryState.DEGRADED, degraded.state(),
-				"an adopted coordinator receives reconnect grace after disconnect");
-		assertEquals(fixture.clock.now + RECONNECT_TIMEOUT_MS, degraded.reconnectDeadlineEpochMs(),
-				"adopted coordinator reconnect grace is bounded");
-		assertEquals(0, fixture.launcher.launches.size(), "disconnect does not immediately launch a competitor");
-
-		fixture.clock.advance(RECONNECT_TIMEOUT_MS - 1L);
-		fixture.supervisor.tick(false, null, 1L, false);
-		assertEquals(0, fixture.launcher.launches.size(), "competitor remains suppressed throughout reconnect grace");
-		fixture.supervisor.tick(true, null, 2L, true);
-		assertEquals(CoordinatorRecoveryState.HEALTHY, fixture.supervisor.snapshot().state(),
-				"an adopted coordinator can reconnect with a fresh authenticated session");
-		assertEquals(0, fixture.launcher.launches.size(), "successful reconnect keeps the external coordinator adopted");
-
-		fixture.supervisor.tick(false, null, 2L, false);
-		assertEquals(CoordinatorRecoveryState.DEGRADED, fixture.supervisor.snapshot().state(),
-				"a later disconnect starts a fresh reconnect window");
-		fixture.clock.advance(RECONNECT_TIMEOUT_MS - 1L);
-		fixture.supervisor.tick(false, null, 2L, false);
-		assertEquals(0, fixture.launcher.launches.size(), "the fresh reconnect window is honored in full");
-		fixture.clock.advance(1L);
-		fixture.supervisor.tick(false, null, 2L, false);
-		assertEquals(1, fixture.launcher.launches.size(), "a competitor launches only after reconnect grace expires");
 		assertEquals(CoordinatorRecoveryState.AUTHENTICATING, fixture.supervisor.snapshot().state(),
-				"the replacement must authenticate after the external grace expires");
+				"auto-start requires authentication from its owned launch generation");
+		assertEquals(1, fixture.launcher.launches.size(),
+				"an authenticated launch without an owned ID cannot suppress auto-start");
+		assertTrue(fixture.supervisor.snapshot().launchId() != null,
+				"auto-start assigns an owned launch identity before accepting readiness");
 		fixture.supervisor.close();
 	}
 
-	private static void verifySlowPreparationPreservesExternalAdoptionWindow() {
+	private static void verifySlowPreparationStillOwnsLaunch() {
 		FakeClock externalClock = new FakeClock();
 		MutableDependencies externalDependencies = MutableDependencies.ready();
 		FakeLauncher externalLauncher = new FakeLauncher();
@@ -1267,10 +1243,10 @@ public final class CoordinatorProcessSupervisorVerification {
 			assertEquals(0, externalLauncher.launches.size(),
 					"expired process-start time does not launch before the prepared bridge can listen");
 			externalSupervisor.tickWithBridgeListener(true, null, 1L, true, true);
-			assertEquals(CoordinatorRecoveryState.HEALTHY, externalSupervisor.snapshot().state(),
-					"external coordinator authenticates after the delayed listener becomes available");
-			assertEquals(0, externalLauncher.launches.size(),
-					"delayed external authentication never races a supervisor-owned child");
+			assertEquals(CoordinatorRecoveryState.AUTHENTICATING, externalSupervisor.snapshot().state(),
+					"delayed preparation still waits for authentication from its owned launch");
+			assertEquals(1, externalLauncher.launches.size(),
+					"external authentication cannot adopt the auto-start supervisor after delayed preparation");
 		} finally {
 			externalSupervisor.close();
 		}
@@ -1294,6 +1270,43 @@ public final class CoordinatorProcessSupervisorVerification {
 					"normal auto-start still enters coordinator authentication");
 		} finally {
 			launchSupervisor.close();
+		}
+	}
+
+	private static void verifyManifestFingerprintCoversEveryListedModule() {
+		Path root = null;
+		try {
+			root = Files.createTempDirectory("arena-manifest-fingerprint-");
+			Path coordinator = root.resolve("coordinator");
+			Path module = coordinator.resolve("src/codex-service.mjs");
+			Path manifest = coordinator.resolve(".arena-agents-bundle-manifest");
+			Files.createDirectories(module.getParent());
+			Files.writeString(module, "alpha", StandardCharsets.UTF_8);
+			Files.writeString(manifest, "0".repeat(64) + " src/codex-service.mjs\n", StandardCharsets.UTF_8);
+			FileTime originalTime = Files.getLastModifiedTime(module);
+			String initial = CoordinatorProcessSupervisor.DefaultDependencyResolver.manifestFilesStamp(manifest);
+
+			Files.writeString(module, "omega", StandardCharsets.UTF_8);
+			Files.setLastModifiedTime(module, FileTime.fromMillis(originalTime.toMillis() + 2_000L));
+			String changed = CoordinatorProcessSupervisor.DefaultDependencyResolver.manifestFilesStamp(manifest);
+			assertFalse(initial.equals(changed),
+					"manifest fingerprint detects a changed manifest-listed module without hashing it on every poll");
+
+			Files.delete(module);
+			String missing = CoordinatorProcessSupervisor.DefaultDependencyResolver.manifestFilesStamp(manifest);
+			assertFalse(changed.equals(missing), "manifest fingerprint detects a deleted listed module");
+			assertTrue(missing.contains("missing"), "missing module state is explicit in the dependency fingerprint");
+
+			FileTime manifestTime = Files.getLastModifiedTime(manifest);
+			Files.writeString(manifest, "1".repeat(64) + " src/codex-service.mjs\n", StandardCharsets.UTF_8);
+			Files.setLastModifiedTime(manifest, manifestTime);
+			String upgraded = CoordinatorProcessSupervisor.DefaultDependencyResolver.manifestFilesStamp(manifest);
+			assertFalse(missing.equals(upgraded),
+					"manifest fingerprint detects a same-size package upgrade even when mtime is preserved");
+		} catch (IOException exception) {
+			throw new AssertionError("manifest fingerprint verification failed", exception);
+		} finally {
+			if (root != null) deleteTree(root);
 		}
 	}
 

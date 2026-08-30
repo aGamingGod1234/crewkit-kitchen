@@ -132,11 +132,44 @@ test('configured Codex profile creates a thread without waiting for live catalog
 	}, { transport });
 	try {
 		const agent = await service.createAgent(profile('configured-fast-start'));
+		const bootstrapped = await service.bootstrapCatalog([profile('configured-fast-start')]);
 		const reconciled = await service.reconcile([profile('configured-fast-start')]);
 		assert.equal(agent.agentId, 'configured-fast-start');
+		assert.equal(bootstrapped.source, 'builtin');
 		assert.deepEqual(reconciled.valid.map(({ agentId }) => agentId), ['configured-fast-start']);
 		assert.equal(catalogRequested, false);
 		assert.equal(transport.calls.some(({ method }) => method === 'thread/start'), true);
+	} finally {
+		await service.stop();
+	}
+});
+
+test('live discovery cannot evict the exact configured Codex launch profile', async () => {
+	const transport = new FakeSharedTransport();
+	transport.request = async (method, params, options) => {
+		transport.calls.push({ method, params, options });
+		if (method === 'initialize') return { userAgent: 'fake' };
+		if (method === 'model/list') return {
+			data: [{
+				id: 'gpt-other', model: 'gpt-other',
+				supportedReasoningEfforts: [{ reasoningEffort: 'medium' }], serviceTiers: [{ id: 'priority' }],
+			}],
+			nextCursor: null,
+		};
+		if (method === 'thread/start') return { thread: { id: 'thread-exact-after-refresh' } };
+		throw new Error(`Unexpected method ${method}`);
+	};
+	const service = new CodexService({
+		cwd: 'C:\\workspace',
+		launchProfile: { model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' },
+	}, { transport });
+	try {
+		await service.start();
+		const live = await service.catalog.refresh({ force: true });
+		const agent = await service.createAgent(profile('exact-after-live-refresh'));
+		assert.equal(live.source, 'live');
+		assert.deepEqual(live.models.map(({ id }) => id), ['gpt-5.6-sol', 'gpt-other']);
+		assert.equal(agent.agentId, 'exact-after-live-refresh');
 	} finally {
 		await service.stop();
 	}

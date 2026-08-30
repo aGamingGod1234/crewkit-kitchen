@@ -79,6 +79,13 @@ export class CodexService {
 	get started() { return this.#started; }
 	get agentIds() { return [...this.#agents.keys()]; }
 
+	async bootstrapCatalog(records) {
+		if (!Array.isArray(records)) throw new TypeError('Codex bootstrap records must be an array');
+		return this.#catalog.stale && this.#requiresLiveCatalog(records)
+			? this.#catalog.refresh()
+			: this.#catalog.snapshot();
+	}
+
 	async start() {
 		if (this.#started) return;
 		if (this.#starting !== null) return this.#starting.promise;
@@ -238,9 +245,7 @@ export class CodexService {
 				removed.push(agentId);
 			}
 		}
-		const requiresLiveCatalog = this.#exactLaunchProfile === null
-			|| records.some((record) => !profilesMatch(this.#exactLaunchProfile, { provider: 'codex', ...record }));
-		const catalog = this.#catalog.stale && requiresLiveCatalog
+		const catalog = this.#catalog.stale && this.#requiresLiveCatalog(records)
 			? await this.#catalog.refresh()
 			: this.#catalog.snapshot();
 		assertReconciliationActive(signal);
@@ -311,6 +316,11 @@ export class CodexService {
 
 	#assertLifecycleCurrent(lifecycleGeneration) {
 		if (lifecycleGeneration !== this.#lifecycleGeneration) throw new CodexProtocolError('PROVIDER_STOPPED', 'Codex service lifecycle was stopped');
+	}
+
+	#requiresLiveCatalog(records) {
+		return this.#exactLaunchProfile === null
+			|| records.some((record) => !profilesMatch(this.#exactLaunchProfile, { provider: 'codex', ...record }));
 	}
 
 	async #listModels() {
