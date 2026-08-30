@@ -49,12 +49,13 @@ final class BoundedServerTaskQueue {
 	synchronized boolean offer(Lane lane, Runnable task) {
 		Objects.requireNonNull(lane, "lane must not be null");
 		Objects.requireNonNull(task, "task must not be null");
-		int admissionLimit = switch (lane) {
-			case URGENT -> capacity;
-			case CONTROL -> capacity - urgentReserve;
-			case BULK -> capacity - urgentReserve - controlReserve;
-		};
-		if (pendingCountUnsafe() >= admissionLimit) {
+		int pending = pendingCountUnsafe();
+		int nonUrgent = control.size() + bulk.size();
+		int bulkCapacity = capacity - urgentReserve - controlReserve;
+		boolean full = pending >= capacity
+				|| (lane == Lane.CONTROL && nonUrgent >= capacity - urgentReserve)
+				|| (lane == Lane.BULK && (bulk.size() >= bulkCapacity || nonUrgent >= capacity - urgentReserve));
+		if (full) {
 			rejected++;
 			return false;
 		}

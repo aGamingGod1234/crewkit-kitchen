@@ -371,7 +371,6 @@ export class PlanningScheduler {
 			const error = new PlanningSchedulerError('PLAN_CANCELLED', reason);
 			active.cancelError = error;
 			active.controller.abort(error);
-			if (active.timeoutHandle !== null) this.#cancelTimeout(active.timeoutHandle);
 			this.#active.delete(agentId);
 			this.#settling.set(agentId, active);
 			this.#record('scheduler_cancelled', agentId, { lane: active.lane, priority: active.priority, ...this.#snapshot() });
@@ -398,12 +397,12 @@ export class PlanningScheduler {
 	}
 
 	#drain() {
-		while (!this.#closed && this.#active.size < this.#controller.target && this.#pending.size > 0) {
+		while (!this.#closed && this.#physicallyOccupiedCount() < this.#controller.target && this.#pending.size > 0) {
 			const entry = this.#nextEntry();
 			if (entry === null) break;
 			this.#pending.delete(entry.agentId);
 			const controller = new AbortController();
-			const active = { ...entry, controller, timeoutHandle: null, cancelError: null };
+			const active = { ...entry, controller, timeoutHandle: null, cancelError: null, promiseSettled: false };
 			this.#active.set(entry.agentId, active);
 			if (entry.leaseTimeoutMs !== null) {
 				active.timeoutHandle = this.#scheduleTimeout(() => this.#expire(entry.agentId, controller), entry.leaseTimeoutMs);
@@ -428,7 +427,8 @@ export class PlanningScheduler {
 
 	#nextEntry() {
 		let priority = this.#nextPriority();
-		if (priority === ORDINARY_PRIORITY && this.activeOrdinaryCount >= this.#ordinaryActiveLimit()) {
+		const physicallyActiveOrdinary = this.activeOrdinaryCount + this.#countSettlingPriority(ORDINARY_PRIORITY);
+		if (priority === ORDINARY_PRIORITY && physicallyActiveOrdinary >= this.#ordinaryActiveLimit()) {
 			if (!this.#hasPendingPriority(URGENT_PRIORITY)) return null;
 			priority = URGENT_PRIORITY;
 		}
@@ -480,34 +480,46 @@ export class PlanningScheduler {
 			...this.#snapshot(),
 		});
 		this.#drain();
-		if (entry.cancelError !== null) entry.reject(entry.cancelError);
-		else if (error !== null) entry.reject(error);
-		else entry.resolve(value);
+		if (!entry.promiseSettled) {
+			entry.promiseSettled = true;
+			if (entry.cancelError !== null) entry.reject(entry.cancelError);
+			else if (error !== null) entry.reject(error);
+			else entry.resolve(value);
+		}
 	}
 
 	#expire(agentId, controller) {
 		const active = this.#active.get(agentId);
-		if (active?.controller !== controller) return;
-		const error = new PlanningSchedulerError('PLANNING_LEASE_EXPIRED', `Planning lease for '${agentId}' expired after ${active.leaseTimeoutMs} ms`);
+		const settling = this.#settling.get(agentId);
+		const entry = active?.controller === controller ? active : (settling?.controller === controller ? settling : null);
+		if (entry === null) return;
+		const error = new PlanningSchedulerError('PLANNING_LEASE_EXPIRED', `Planning lease for '${agentId}' expired after ${entry.leaseTimeoutMs} ms`);
 		controller.abort(error);
-		if (active.timeoutHandle !== null) this.#cancelTimeout(active.timeoutHandle);
-		this.#active.delete(agentId);
-		active.reject(error);
+		if (entry.timeoutHandle !== null) this.#cancelTimeout(entry.timeoutHandle);
+		entry.timeoutHandle = null;
+		if (active === entry) {
+			this.#active.delete(agentId);
+			this.#settling.set(agentId, entry);
+		}
+		if (!entry.promiseSettled) {
+			entry.promiseSettled = true;
+			entry.reject(entry.cancelError ?? error);
+		}
 		try {
-			void Promise.resolve(active.onLeaseExpired?.({
+			void Promise.resolve(entry.onLeaseExpired?.({
 				agentId,
-				lane: active.lane,
-				priority: active.priority,
+				lane: entry.lane,
+				priority: entry.priority,
 				signal: controller.signal,
 				error,
 			})).catch(() => undefined);
 		} catch { /* recovery cannot retain scheduler capacity */ }
-		this.#record('scheduler_lease_expired', agentId, { lane: active.lane, priority: active.priority, ...this.#snapshot() });
+		this.#record('scheduler_lease_expired', agentId, { lane: entry.lane, priority: entry.priority, ...this.#snapshot() });
 		this.#drain();
 	}
 
 	#snapshot() {
-		const used = this.#active.size + this.#pending.size;
+		const used = this.#physicallyOccupiedCount() + this.#pending.size;
 		const controller = this.#controller?.snapshot() ?? {
 			mode: 'fixed', configuredTarget: this.#maxConcurrent, target: this.#maxConcurrent,
 			minConcurrency: MIN_ADAPTIVE_CONCURRENCY, maxConcurrency: MAX_ADAPTIVE_CONCURRENCY,
@@ -554,6 +566,18 @@ export class PlanningScheduler {
 		return count;
 	}
 
+	#countSettlingPriority(priority, capacityClass = null) {
+		let count = 0;
+		for (const entry of this.#settling.values()) {
+			if (entry.priority === priority && (capacityClass === null || entry.capacityClass === capacityClass)) count += 1;
+		}
+		return count;
+	}
+
+	#physicallyOccupiedCount() {
+		return this.#active.size + this.#settling.size;
+	}
+
 	#countPendingPriority(priority, capacityClass = null) {
 		let count = 0;
 		for (const entry of this.#pending.values()) {
@@ -574,11 +598,12 @@ export class PlanningScheduler {
 
 	#wouldExceedCapacity(priority, capacityClass) {
 		if (capacityClass === 'auxiliary') return this.pendingAuxiliaryCount >= this.#maxAuxiliaryPending;
-		const used = this.#active.size + this.#pending.size - this.pendingAuxiliaryCount;
+		const used = this.#physicallyOccupiedCount() + this.#pending.size - this.pendingAuxiliaryCount;
 		if (used >= this.totalCapacity) return true;
 		if (priority !== ORDINARY_PRIORITY || this.#urgentReserve === 0) return false;
-		const ordinaryUsed = this.activeOrdinaryCount + this.#countPendingPriority(ORDINARY_PRIORITY, 'default');
-		const urgentUsed = this.activeUrgentCount + this.pendingUrgentCount;
+		const ordinaryUsed = this.activeOrdinaryCount + this.#countSettlingPriority(ORDINARY_PRIORITY, 'default')
+			+ this.#countPendingPriority(ORDINARY_PRIORITY, 'default');
+		const urgentUsed = this.activeUrgentCount + this.#countSettlingPriority(URGENT_PRIORITY) + this.pendingUrgentCount;
 		const ordinaryLimit = this.totalCapacity - Math.max(this.#urgentReserve, urgentUsed);
 		return ordinaryUsed >= ordinaryLimit;
 	}

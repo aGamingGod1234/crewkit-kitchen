@@ -3751,8 +3751,11 @@ test('urgent observation preempts an active ordinary provider turn and installs 
 	}
 });
 
-test('per-agent event intake rejects non-coalescible overflow at its configured bound', async () => {
+test('per-agent event intake reserves terminal-result capacity under ordinary overflow', async () => {
 	const bridge = new FakeBridge();
+	bridge.acknowledgeActionResult = async (agentId, payload) => {
+		bridge.sent.push({ type: 'action_result_ack', agentId, payload });
+	};
 	const registry = new AgentRegistry();
 	let releaseReconciliation;
 	const reconciliationGate = new Promise((resolve) => { releaseReconciliation = resolve; });
@@ -3783,6 +3786,20 @@ test('per-agent event intake rejects non-coalescible overflow at its configured 
 		bridge.emit('observation', { agentId: 'agent-a', payload: payload(2) });
 		bridge.emit('observation', { agentId: 'agent-a', payload: payload(3) });
 		await eventually(() => errors.some((error) => error?.code === 'AGENT_EVENT_BACKPRESSURE'));
+		const terminalResult = {
+			goalRevision: 0,
+			actionId: 'stale-terminal-result',
+			state: 'SUCCEEDED',
+			reasonCode: 'DONE',
+		};
+		bridge.emit('action_result', { agentId: 'agent-a', payload: terminalResult });
+		bridge.emit('action_result', { agentId: 'agent-a', payload: terminalResult });
+		releaseReconciliation();
+		await eventually(() => bridge.sent.some((message) => message.type === 'action_result_ack'
+			&& message.payload.actionId === 'stale-terminal-result'));
+		assert.equal(bridge.sent.filter((message) => message.type === 'action_result_ack'
+			&& message.payload.actionId === 'stale-terminal-result').length, 1);
+		assert.equal(errors.filter((error) => error?.code === 'AGENT_EVENT_BACKPRESSURE').length, 1);
 	} finally {
 		releaseReconciliation?.();
 		await coordinator.stop();

@@ -549,6 +549,69 @@ test('identical TTS misses share one synthesis while each waiter keeps independe
 	});
 });
 
+test('cancelling a shared TTS owner transfers its capacity to a surviving waiter', async () => {
+	let calls = 0;
+	let release;
+	const waiting = new Promise((resolve) => { release = resolve; });
+	let entered;
+	const providerEntered = new Promise((resolve) => { entered = resolve; });
+	await withWorker({
+		maxConcurrent: 3,
+		provider: { async synthesize() {
+			calls += 1;
+			entered();
+			await waiting;
+			return validSynthesis();
+		} },
+		sttProvider: { async transcribe() { return { transcript: '', confidence: 1 }; } },
+	}, async ({ baseUrl }) => {
+		const ownerController = new AbortController();
+		const owner = fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders({ Connection: 'close' }),
+			body: JSON.stringify(ttsPayload()), signal: ownerController.signal,
+		});
+		await providerEntered;
+		const survivor = fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders({ Connection: 'close' }),
+			body: JSON.stringify({ ...ttsPayload(), conversationSequence: 2 }),
+		});
+		await eventuallyActive(baseUrl, 2);
+		ownerController.abort();
+		await assert.rejects(owner, (error) => error?.name === 'AbortError');
+		await eventually(async () => (await health(baseUrl)).activeTts === 1);
+
+		const unrelated = fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders({ Connection: 'close' }),
+			body: JSON.stringify({ ...ttsPayload(), text: 'different', conversationSequence: 3 }),
+		});
+		await eventually(() => calls === 2);
+		release();
+		assert.deepEqual(await Promise.all([(await survivor).status, (await unrelated).status]), [200, 200]);
+	});
+});
+
+test('a shared provider error degrades TTS and STT independently', async () => {
+	const shared = Object.assign(new Error('shared local worker failure'), { code: 'LOCAL_SPEECH_UNAVAILABLE' });
+	await withWorker({
+		provider: { async synthesize() { throw shared; } },
+		sttProvider: { async transcribe() { throw shared; } },
+		initialProbeDelayMs: 1_000,
+	}, async ({ worker, baseUrl }) => {
+		const tts = await fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders(), body: JSON.stringify(ttsPayload()),
+		});
+		const stt = await fetch(`${baseUrl}/v1/stt`, {
+			method: 'POST', headers: sttHeaders(), body: Buffer.alloc(2),
+		});
+		assert.equal(tts.status, 502);
+		assert.equal(stt.status, 502);
+		const snapshots = Object.fromEntries(worker.statusSnapshots().map((snapshot) => [snapshot.component, snapshot]));
+		assert.equal(snapshots['voice:tts'].state, 'degraded');
+		assert.equal(snapshots['voice:stt'].state, 'degraded');
+		assert.equal((await health(baseUrl)).reservedStt, 0);
+	});
+});
+
 test('TTS route aborts synthesis when the client closes before the response', async () => {
 	let entered;
 	const providerEntered = new Promise((resolve) => { entered = resolve; });
@@ -1242,7 +1305,7 @@ async function eventuallyActive(baseUrl, expected) {
 
 async function eventually(predicate) {
 	for (let attempt = 0; attempt < 100; attempt += 1) {
-		if (predicate()) return;
+		if (await predicate()) return;
 		await new Promise((resolve) => setTimeout(resolve, 5));
 	}
 	throw new Error('voice lifecycle did not reach the expected state');

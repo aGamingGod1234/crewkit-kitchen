@@ -59,7 +59,24 @@ public final class BoundedServerTaskQueueVerification {
 				"control traffic is isolated from bulk traffic");
 		assertEquals(BoundedServerTaskQueue.Lane.BULK, MultiplexedServerBridge.inboundLane("verbose_event"),
 				"verbose telemetry cannot consume reserved action capacity");
-		return 30;
+
+		queue = new BoundedServerTaskQueue(8, 2, 2);
+		assertTrue(queue.offer(BoundedServerTaskQueue.Lane.URGENT, () -> { }),
+				"first early urgent task uses urgent capacity");
+		assertTrue(queue.offer(BoundedServerTaskQueue.Lane.URGENT, () -> { }),
+				"second early urgent task uses urgent capacity");
+		for (int index = 0; index < 4; index++) {
+			assertTrue(queue.offer(BoundedServerTaskQueue.Lane.BULK, () -> { }),
+					"early urgent work does not consume bulk capacity");
+		}
+		assertFalse(queue.offer(BoundedServerTaskQueue.Lane.BULK, () -> { }),
+				"bulk remains bounded after reverse-order admission");
+		assertTrue(queue.offer(BoundedServerTaskQueue.Lane.CONTROL, () -> { }),
+				"control reserve remains available after urgent and bulk admission");
+		assertTrue(queue.offer(BoundedServerTaskQueue.Lane.CONTROL, () -> { }),
+				"second control reserve remains available after urgent and bulk admission");
+		assertEquals(8, queue.pendingCount(), "reverse-order admission fills the queue without wasting capacity");
+		return 40;
 	}
 
 	private static void assertTrue(boolean value, String label) {

@@ -757,7 +757,7 @@ export class DynamicCoordinator extends EventEmitter {
 				} finally {
 					if (acknowledge) await this.#acknowledgeActionResult(message, connectionEpoch);
 				}
-			}, { connectionEpoch });
+			}, { connectionEpoch, terminal: true });
 		});
 		this.#listen('goal_completion_result', (message, connectionEpoch) => {
 			this.#enqueueAgent(message.agentId, async () => {
@@ -1710,7 +1710,7 @@ export class DynamicCoordinator extends EventEmitter {
 		return this.#lifecycleGeneration(agentId) === generation;
 	}
 
-	#enqueueAgent(agentId, operation, { waitForReconciliation = true, connectionEpoch = this.#connectionEpoch, coalesceKey = null } = {}) {
+	#enqueueAgent(agentId, operation, { waitForReconciliation = true, connectionEpoch = this.#connectionEpoch, coalesceKey = null, terminal = false } = {}) {
 		let resolve;
 		let reject;
 		const promise = new Promise((resolveValue, rejectValue) => { resolve = resolveValue; reject = rejectValue; });
@@ -1722,18 +1722,32 @@ export class DynamicCoordinator extends EventEmitter {
 		}
 		const tail = queue.items.at(-1);
 		if (coalesceKey !== null && tail?.coalesceKey === coalesceKey) {
+			for (const superseded of tail.waiters) superseded.resolve(undefined);
 			tail.operation = operation;
 			tail.waitForReconciliation = waitForReconciliation;
 			tail.connectionEpoch = connectionEpoch;
-			tail.waiters.push(waiter);
+			tail.waiters = [waiter];
 		} else {
-			if (queue.items.length >= this.#maxPendingAgentOperations) {
+			const pendingTerminal = queue.items.find((item) => item.terminal === true);
+			if (terminal && pendingTerminal !== undefined) {
+				for (const superseded of pendingTerminal.waiters) superseded.resolve(undefined);
+				pendingTerminal.operation = operation;
+				pendingTerminal.waitForReconciliation = waitForReconciliation;
+				pendingTerminal.connectionEpoch = connectionEpoch;
+				pendingTerminal.coalesceKey = coalesceKey;
+				pendingTerminal.waiters = [waiter];
+				promise.catch((error) => this.#reportAgentError(agentId, error, connectionEpoch));
+				return promise;
+			}
+			const terminalPending = pendingTerminal !== undefined;
+			const ordinaryPending = queue.items.length - (terminalPending ? 1 : 0);
+			if (!terminal && ordinaryPending >= this.#maxPendingAgentOperations) {
 				const error = codedRuntimeError('AGENT_EVENT_BACKPRESSURE', `Agent '${agentId}' has ${this.#maxPendingAgentOperations} pending coordinator events`);
 				reject(error);
 				promise.catch((caught) => this.#reportAgentError(agentId, caught, connectionEpoch));
 				return promise;
 			}
-			queue.items.push({ operation, waitForReconciliation, connectionEpoch, coalesceKey, waiters: [waiter] });
+			queue.items.push({ operation, waitForReconciliation, connectionEpoch, coalesceKey, terminal, waiters: [waiter] });
 		}
 		promise.catch((error) => this.#reportAgentError(agentId, error, connectionEpoch));
 		if (queue.drainPromise === null) queue.drainPromise = Promise.resolve().then(() => this.#drainAgentOperations(agentId, queue));

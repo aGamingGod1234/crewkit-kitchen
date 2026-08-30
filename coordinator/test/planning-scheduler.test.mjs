@@ -127,8 +127,8 @@ test('cancelling an active turn aborts its dependency-injected signal', async ()
 	assert.equal(signal.aborted, true);
 });
 
-test('cancelling ignored-abort work releases global capacity but fences its agent until settlement', async () => {
-	const scheduler = new PlanningScheduler({ maxConcurrent: 1, maxPending: 0 });
+test('cancelling ignored-abort work retains global capacity and fences its agent until settlement', async () => {
+	const scheduler = new PlanningScheduler({ maxConcurrent: 1, maxPending: 1 });
 	const ignoredAbort = deferred();
 	const cancelled = scheduler.schedule('agent-a', () => ignoredAbort.promise);
 	await Promise.resolve();
@@ -136,10 +136,38 @@ test('cancelling ignored-abort work releases global capacity but fences its agen
 	assert.equal(scheduler.activeCount, 0);
 	assert.equal(scheduler.hasScheduled('agent-a'), true);
 	await assert.rejects(scheduler.schedule('agent-a', async () => 'overlap'), (error) => error.code === 'PLAN_CANCELLING');
-	assert.equal(await scheduler.schedule('agent-b', async () => 'available'), 'available');
+	let replacementStarted = false;
+	const replacement = scheduler.schedule('agent-b', async () => { replacementStarted = true; return 'available'; });
+	await Promise.resolve();
+	assert.equal(replacementStarted, false, 'physically settling work still occupies provider concurrency');
 	ignoredAbort.resolve('late result');
 	await assert.rejects(cancelled, (error) => error.code === 'PLAN_CANCELLED');
+	assert.equal(await replacement, 'available');
 	assert.equal(scheduler.hasScheduled('agent-a'), false);
+});
+
+test('settling ordinary work continues to preserve urgent active capacity', async () => {
+	const scheduler = new PlanningScheduler({ maxConcurrent: 3, maxPending: 3, urgentReserve: 1 });
+	const firstGate = deferred();
+	const secondGate = deferred();
+	const first = scheduler.schedule('ordinary-a', () => firstGate.promise);
+	const second = scheduler.schedule('ordinary-b', () => secondGate.promise);
+	await Promise.resolve();
+
+	scheduler.cancel('ordinary-a', 'superseded');
+	let thirdStarted = false;
+	const third = scheduler.schedule('ordinary-c', async () => { thirdStarted = true; });
+	await Promise.resolve();
+	assert.equal(thirdStarted, false);
+
+	assert.equal(await scheduler.schedule('urgent', async () => 'urgent', { priority: 'urgent' }), 'urgent');
+	assert.equal(thirdStarted, false);
+	firstGate.resolve();
+	await assert.rejects(first, (error) => error.code === 'PLAN_CANCELLED');
+	await Promise.resolve();
+	assert.equal(thirdStarted, true);
+	secondGate.resolve();
+	await Promise.all([second, third]);
 });
 
 test('cancelling an admitted task before its microtask starts never invokes provider work', async () => {
@@ -165,13 +193,13 @@ test('cancelling a pending turn releases capacity for another agent', async () =
 	assert.equal(await replacement, 'replacement');
 });
 
-test('hard planning lease releases capacity and fences a late ignored-abort completion', async () => {
+test('hard planning lease starts recovery but retains capacity until physical settlement', async () => {
 	let timeoutCallback;
 	const cancelled = [];
 	const expired = [];
 	const scheduler = new PlanningScheduler({
 		maxConcurrent: 1,
-		maxPending: 0,
+		maxPending: 1,
 		scheduleTimeout: (callback, delay) => { timeoutCallback = callback; assert.equal(delay, 25); return 1; },
 		cancelTimeout: (handle) => cancelled.push(handle),
 	});
@@ -187,16 +215,17 @@ test('hard planning lease releases capacity and fences a late ignored-abort comp
 	assert.equal(scheduler.activeCount, 0);
 	assert.equal(expired.length, 1);
 	assert.equal(expired[0].signal.aborted, true);
+	assert.equal(scheduler.pressureSnapshot.settling, 1);
 
-	const replacementGate = deferred();
-	const replacement = scheduler.schedule('agent-a', () => replacementGate.promise);
+	let replacementStarted = false;
+	const replacement = scheduler.schedule('agent-b', async () => { replacementStarted = true; return 'replacement'; });
 	await Promise.resolve();
-	assert.equal(scheduler.activeCount, 1);
+	assert.equal(replacementStarted, false);
+	await assert.rejects(scheduler.schedule('agent-a', async () => 'overlap'), (error) => error.code === 'PLAN_CANCELLING');
 	ignoredAbort.resolve('late');
-	await Promise.resolve();
-	assert.equal(scheduler.activeCount, 1, 'late completion cannot release the replacement generation');
-	replacementGate.resolve('replacement');
 	assert.equal(await replacement, 'replacement');
+	assert.equal(scheduler.pressureSnapshot.settling, 0);
+	assert.equal(await scheduler.schedule('agent-a', async () => 'recovered'), 'recovered');
 	assert.deepEqual(cancelled, [1]);
 });
 

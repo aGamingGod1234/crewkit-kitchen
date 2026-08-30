@@ -54,7 +54,6 @@ export function createVoiceHttpServer({
 	let activeStt = 0;
 	const controllers = new Set();
 	const inFlightTts = new Map();
-	const lifecycleRecordedErrors = new WeakSet();
 	const failureListeners = new Set();
 	let startPromise = null;
 	let closePromise = null;
@@ -112,6 +111,7 @@ export function createVoiceHttpServer({
 		controllers.add(controller);
 		let released = false;
 		let providerOperation = null;
+		let releaseSharedTtsCapacity = null;
 		active += 1;
 		if (channel === 'stt') activeStt += 1;
 		else activeTts += 1;
@@ -180,7 +180,8 @@ export function createVoiceHttpServer({
 					payload,
 					signal: controller.signal,
 				});
-				providerOperation = joined.owner ? joined.operation : joined.waiter;
+				attemptedLifecycle = null;
+				releaseSharedTtsCapacity = joined.releaseCapacity;
 				output = await joined.waiter;
 			}
 			response.writeHead(200, {
@@ -193,13 +194,7 @@ export function createVoiceHttpServer({
 			});
 			response.end(output);
 		} catch (error) {
-			const recordLifecycle = attemptedLifecycle !== null
-				&& error?.name !== 'AbortError'
-				&& (error === null || (typeof error !== 'object' && typeof error !== 'function')
-					|| !lifecycleRecordedErrors.has(error));
-			if (recordLifecycle && error !== null && (typeof error === 'object' || typeof error === 'function')) {
-				lifecycleRecordedErrors.add(error);
-			}
+			const recordLifecycle = attemptedLifecycle !== null && error?.name !== 'AbortError';
 			if (!response.headersSent) respondJson(response, statusFor(error), {
 				code: String(error?.code ?? 'TTS_ERROR').slice(0, 64),
 				message: String(error?.message ?? error).slice(0, 256),
@@ -209,7 +204,8 @@ export function createVoiceHttpServer({
 			clearTimeout(timeout);
 			request.off('aborted', onRequestAborted);
 			response.off('close', onResponseClosed);
-			if (providerOperation === null) release();
+			if (releaseSharedTtsCapacity !== null) releaseSharedTtsCapacity(release);
+			else if (providerOperation === null) release();
 			else providerOperation.then(release, release);
 		}
 	});
@@ -220,9 +216,7 @@ export function createVoiceHttpServer({
 
 	function joinTtsSynthesis({ cacheKey, profile, profileNamespace, payload, signal }) {
 		let entry = inFlightTts.get(cacheKey);
-		let owner = false;
 		if (entry === undefined) {
-			owner = true;
 			const providerController = new AbortController();
 			entry = { providerController, waiters: 0, settled: false, operation: null };
 			const current = entry;
@@ -246,6 +240,9 @@ export function createVoiceHttpServer({
 					}
 					if (!providerController.signal.aborted) ttsLifecycle.recordReady();
 					return output;
+				} catch (error) {
+					if (error?.name !== 'AbortError') ttsLifecycle.recordFailure(error);
+					throw error;
 				} finally {
 					current.settled = true;
 					if (inFlightTts.get(cacheKey) === current) inFlightTts.delete(cacheKey);
@@ -262,7 +259,13 @@ export function createVoiceHttpServer({
 			if (inFlightTts.get(cacheKey) === current) inFlightTts.delete(cacheKey);
 			current.providerController.abort(abortError('All synthesis waiters cancelled'));
 		});
-		return { owner, operation: current.operation, waiter };
+		return {
+			waiter,
+			releaseCapacity(release) {
+				if (current.waiters > 0 || current.settled) release();
+				else current.operation.then(release, release);
+			},
+		};
 	}
 	const notifyFailure = (error) => {
 		for (const listener of [...failureListeners]) {
