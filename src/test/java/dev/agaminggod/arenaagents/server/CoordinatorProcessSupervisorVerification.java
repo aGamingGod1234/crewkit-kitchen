@@ -2896,10 +2896,24 @@ public final class CoordinatorProcessSupervisorVerification {
 		} catch (IOException exception) {
 			throw new AssertionError("could not enumerate coordinator verification fixture", exception);
 		}
-		try {
-			for (Path path : paths) Files.deleteIfExists(path);
-		} catch (IOException exception) {
-			throw new AssertionError("could not clean coordinator verification fixture", exception);
+		for (Path path : paths) {
+			long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5L);
+			while (true) {
+				try {
+					Files.deleteIfExists(path);
+					break;
+				} catch (IOException exception) {
+					if (System.nanoTime() >= deadline) {
+						throw new AssertionError("could not clean coordinator verification fixture", exception);
+					}
+					try {
+						Thread.sleep(25L);
+					} catch (InterruptedException interrupted) {
+						Thread.currentThread().interrupt();
+						throw new AssertionError("coordinator verification cleanup was interrupted", interrupted);
+					}
+				}
+			}
 		}
 	}
 
