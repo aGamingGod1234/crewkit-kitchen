@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { createFactView } from '../src/arena-script/facts.mjs';
+import {
+	changedInterpreterFactDomains,
+	createFactView,
+	createInterpreterFacts,
+	isTrustedInterpreterFacts,
+} from '../src/arena-script/facts.mjs';
+import { ALL_FACT_DOMAINS, FACT_DOMAIN } from '../src/arena-script/fact-domains.mjs';
 
 function observation(overrides = {}) {
 	return {
@@ -81,4 +87,51 @@ test('omits candidates with invalid coordinates rather than assigning a syntheti
 		items: [{ stableId: 'bad-coordinate', itemId: 'minecraft:oak_log', count: 1, x: Number.NaN, y: 64, z: 0 }],
 	}));
 	assert.equal(facts.world.items({ itemId: 'minecraft:oak_log' }).length, 0);
+});
+
+test('trusted interpreter facts share unchanged domains without exposing a forgeable brand', () => {
+	const first = createInterpreterFacts(observation({
+		items: [{ stableId: 'item', itemId: 'minecraft:oak_log', count: 1, x: 1, y: 64, z: 0 }],
+	}));
+	const identical = createInterpreterFacts(observation({
+		items: [{ stableId: 'item', itemId: 'minecraft:oak_log', count: 1, x: 1, y: 64, z: 0 }],
+	}), first);
+	assert.equal(identical, first);
+	assert.equal(changedInterpreterFactDomains(first, identical), 0);
+
+	const healthChanged = createInterpreterFacts(observation({
+		player: { x: 0, y: 64, z: 0, health: 19 },
+		items: [{ stableId: 'item', itemId: 'minecraft:oak_log', count: 1, x: 1, y: 64, z: 0 }],
+	}), first);
+	assert.equal(healthChanged.world.items, first.world.items);
+	assert.equal(healthChanged.inventory.items, first.inventory.items);
+	assert.equal(healthChanged.inventory.tagCounts, first.inventory.tagCounts);
+	assert.equal(changedInterpreterFactDomains(first, healthChanged), FACT_DOMAIN.player);
+	assert.equal(isTrustedInterpreterFacts(healthChanged), true);
+	const negativeZero = createInterpreterFacts(observation({
+		player: { x: -0, y: 64, z: 0, health: 20 },
+		items: [{ stableId: 'item', itemId: 'minecraft:oak_log', count: 1, x: 1, y: 64, z: 0 }],
+	}), first);
+	assert.equal(changedInterpreterFactDomains(first, negativeZero), FACT_DOMAIN.player);
+
+	const imitation = Object.freeze({ ...healthChanged });
+	assert.equal(isTrustedInterpreterFacts(imitation), false);
+	assert.equal(changedInterpreterFactDomains(healthChanged, imitation), ALL_FACT_DOMAINS);
+});
+
+test('trusted fact creation still validates every new observation before reusing prior data', () => {
+	const trusted = createInterpreterFacts(observation());
+	let reads = 0;
+	const hostilePlayer = Object.defineProperty({}, 'health', { enumerable: true, get() { reads += 1; return 20; } });
+	assert.throws(() => createInterpreterFacts(observation({ player: hostilePlayer }), trusted), TypeError);
+	assert.equal(reads, 0);
+});
+
+test('fact trees beyond interpreter limits never receive the trusted fast-path brand', () => {
+	const oversized = createInterpreterFacts(observation({
+		items: Array.from({ length: 257 }, (_unused, index) => ({
+			stableId: `item-${index}`, itemId: 'minecraft:stone', count: 1, x: index, y: 64, z: 0,
+		})),
+	}));
+	assert.equal(isTrustedInterpreterFacts(oversized), false);
 });

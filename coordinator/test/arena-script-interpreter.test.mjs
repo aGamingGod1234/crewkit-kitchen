@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { ArenaScriptInterpreter } from '../src/arena-script/interpreter.mjs';
+import { createInterpreterFacts } from '../src/arena-script/facts.mjs';
 import { parseArenaScript } from '../src/arena-script/parser.mjs';
 
 const ACTION_BINDINGS = Object.freeze(Object.assign(Object.create(null), {
@@ -360,6 +361,20 @@ test('bounds canonical facts, results, and command output without native stack o
 
 	const outputVm = interpreter('program.onUnhandledAttention("continue_and_notify"); await player.navigateTo(player.state());');
 	assert.throws(() => outputVm.start(facts({ player: { blob: 'x'.repeat(8_193) } })), (error) => error.code === 'OUTPUT_LIMIT');
+});
+
+test('factory-normalized facts outside canonical limits stay on the rejecting validation path', () => {
+	const oversized = createInterpreterFacts({
+		player: { x: 0, y: 64, z: 0, health: 20 },
+		items: Array.from({ length: 257 }, (_unused, index) => ({
+			stableId: `item-${index}`, itemId: 'minecraft:stone', count: 1, x: index, y: 64, z: 0,
+		})),
+		entities: [], blocks: [], inventory: { items: [], tagCounts: {} },
+	});
+	assert.throws(
+		() => interpreter('program.onUnhandledAttention("continue_and_notify");').start(oversized),
+		(error) => error.code === 'FACT_LIMIT',
+	);
 });
 
 test('accepts a full bounded Minecraft block observation above the old 16 KiB fact ceiling', () => {
