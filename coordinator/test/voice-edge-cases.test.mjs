@@ -211,7 +211,7 @@ test('abort-ignoring provider probe never accumulates a replacement call', async
 			method: 'POST', headers: ttsHeaders(), body: JSON.stringify(ttsPayload()),
 		});
 		assert.equal(failed.status, 502);
-		await new Promise((resolve) => setTimeout(resolve, 50));
+		await eventually(() => aborts === 1);
 		assert.equal(probes, 1, 'one unresolved provider call retains exact probe ownership');
 		assert.equal(aborts, 1, 'probe deadline aborts the underlying provider call');
 		assert.equal(worker.statusSnapshots().find(({ component }) => component === 'voice:tts').state, 'degraded');

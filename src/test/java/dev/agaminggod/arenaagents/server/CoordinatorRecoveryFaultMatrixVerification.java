@@ -76,6 +76,8 @@ public final class CoordinatorRecoveryFaultMatrixVerification {
 			supervisor.close();
 			for (Process process : launcher.processes) {
 				if (process.isAlive()) CoordinatorProcessOwnership.terminateTree(process.toHandle());
+				assertTrue(process.waitFor(5L, TimeUnit.SECONDS),
+						"real authentication smoke releases child process " + process.pid());
 			}
 			assertTrue(launcher.processes.stream().noneMatch(Process::isAlive),
 					"real authentication smoke releases every child process");
