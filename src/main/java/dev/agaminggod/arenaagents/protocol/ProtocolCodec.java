@@ -34,6 +34,16 @@ public final class ProtocolCodec {
 	private static final String FIELD_Z = "z";
 	private static final String FIELD_TOLERANCE = "tolerance";
 	private static final String FIELD_SPRINT = "sprint";
+	private static final String FIELD_FORWARD = "forward";
+	private static final String FIELD_STRAFE = "strafe";
+	private static final String FIELD_JUMP = "jump";
+	private static final String FIELD_SNEAK = "sneak";
+	private static final String FIELD_ATTACK = "attack";
+	private static final String FIELD_USE = "use";
+	private static final String FIELD_YAW = "yaw";
+	private static final String FIELD_PITCH = "pitch";
+	private static final String FIELD_SELECTED_SLOT = "selectedSlot";
+	private static final String FIELD_TICKS = "ticks";
 	private static final String FIELD_TARGET_SELECTOR = "targetSelector";
 	private static final String FIELD_TARGET_ID = "targetId";
 	private static final String FIELD_TIMEOUT_MS = "timeoutMs";
@@ -293,6 +303,7 @@ public final class ProtocolCodec {
 
 		switch (actionType) {
 			case MOVE_TO -> validateMoveTo(arguments);
+			case CONTROL -> validateControl(arguments);
 			case LOOK_AT -> validateCoordinates(arguments, false);
 			case ATTACK -> validateAttack(arguments);
 			case SELECT_ITEM -> requireIdentifier(arguments, FIELD_ITEM_ID);
@@ -366,6 +377,19 @@ public final class ProtocolCodec {
 			);
 		}
 		requireBoolean(command, FIELD_SPRINT);
+	}
+
+	private static void validateControl(JsonObject command) throws ProtocolException {
+		requireFiniteRange(command, FIELD_FORWARD, -1.0D, 1.0D);
+		requireFiniteRange(command, FIELD_STRAFE, -1.0D, 1.0D);
+		for (String field : List.of(FIELD_JUMP, FIELD_SNEAK, FIELD_SPRINT, FIELD_ATTACK, FIELD_USE)) {
+			requireBoolean(command, field);
+		}
+		requireFiniteRange(command, FIELD_YAW, -180.0D, 180.0D);
+		requireFiniteRange(command, FIELD_PITCH, -90.0D, 90.0D);
+		requireIntegralRange(command, FIELD_SELECTED_SLOT, 0L, 8L);
+		requireOneOf(command, FIELD_HAND, List.of("main", "off"));
+		requireIntegralRange(command, FIELD_TICKS, 1L, 200L);
 	}
 
 	private static void validateChat(JsonObject arguments) throws ProtocolException {
@@ -795,6 +819,10 @@ public final class ProtocolCodec {
 	private static Map<ActionType, List<String>> createActionFields() {
 		Map<ActionType, List<String>> fields = new EnumMap<>(ActionType.class);
 		fields.put(ActionType.MOVE_TO, List.of(FIELD_X, FIELD_Y, FIELD_Z, FIELD_TOLERANCE, FIELD_SPRINT));
+		fields.put(ActionType.CONTROL, List.of(
+				FIELD_FORWARD, FIELD_STRAFE, FIELD_JUMP, FIELD_SNEAK, FIELD_SPRINT,
+				FIELD_ATTACK, FIELD_USE, FIELD_YAW, FIELD_PITCH, FIELD_SELECTED_SLOT, FIELD_HAND, FIELD_TICKS
+		));
 		fields.put(ActionType.LOOK_AT, List.of(FIELD_X, FIELD_Y, FIELD_Z));
 		fields.put(ActionType.ATTACK, List.of(FIELD_TARGET_ID, FIELD_TIMEOUT_MS));
 		fields.put(ActionType.SELECT_ITEM, List.of(FIELD_ITEM_ID));

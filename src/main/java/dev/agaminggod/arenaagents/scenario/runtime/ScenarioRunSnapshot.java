@@ -201,7 +201,13 @@ public record ScenarioRunSnapshot(
 		);
 		ScenarioSessionState restoredState = state == ScenarioSessionState.RUNNING
 				? ScenarioSessionState.PAUSED_RECOVERY : state;
-		return ScenarioSession.restore(config, restoredState, scores, completionReason, lastElapsedTick);
+		return ScenarioSession.restore(
+				config,
+				restoredState,
+				scores,
+				completionReason,
+				Math.min(lastElapsedTick, durationTicks)
+		);
 	}
 
 	public ScenarioRunSnapshot failed(String reason) {

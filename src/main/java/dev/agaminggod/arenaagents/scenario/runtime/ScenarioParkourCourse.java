@@ -26,7 +26,7 @@ public record ScenarioParkourCourse(List<Lane> lanes) {
 			),
 			List.of(
 					step(0, 1, 1, 2), step(0, 0, 2, 2), step(0, 1, 1, 1), step(0, 0, 2, 2),
-					step(0, 0, 1, 1), step(0, 1, 1, 2), step(0, 0, 2, 1), step(0, 0, 2, 3)
+					step(1, 0, 1, 1), step(0, 1, 1, 2), step(0, 0, 2, 1), step(0, 0, 2, 3)
 			),
 			List.of(
 					step(0, 1, 1, 1), step(0, 0, 2, 1), step(0, 1, 1, 1), step(0, 0, 2, 1),
@@ -34,7 +34,7 @@ public record ScenarioParkourCourse(List<Lane> lanes) {
 			),
 			List.of(
 					step(0, 1, 1, 1), step(0, 0, 2, 1), step(0, 1, 1, 1), step(0, 0, 1, 1),
-					step(0, 1, 1, 1), step(0, 0, 2, 1), step(0, 1, 1, 1), step(0, 0, 2, 3)
+					step(0, 1, 1, 1), step(0, 0, 2, 1), step(0, 1, 1, 1), step(-1, 0, 2, 3)
 			)
 	);
 

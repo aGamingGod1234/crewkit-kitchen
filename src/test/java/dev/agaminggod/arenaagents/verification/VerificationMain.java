@@ -320,6 +320,7 @@ public final class VerificationMain {
 	private static void verifyActionWireNames() {
 		List<String> expectedWireNames = List.of(
 				"move_to",
+				"control",
 				"look_at",
 				"attack",
 				"select_item",
@@ -366,6 +367,9 @@ public final class VerificationMain {
 
 	private static void verifyValidActionUnion(ProtocolCodec codec) throws ProtocolException {
 		assertDecodedType(codec, "move_to", "\"x\":1.5,\"y\":64,\"z\":-2.5,\"tolerance\":0.75,\"sprint\":true", ActionType.MOVE_TO);
+		assertDecodedType(codec, "control", "\"forward\":1,\"strafe\":-0.5,\"jump\":true,\"sneak\":false,"
+				+ "\"sprint\":true,\"attack\":false,\"use\":true,\"yaw\":90,\"pitch\":-15,\"selectedSlot\":2,\"hand\":\"off\",\"ticks\":20",
+				ActionType.CONTROL);
 		assertDecodedType(codec, "look_at", "\"x\":1,\"y\":65.25,\"z\":3", ActionType.LOOK_AT);
 		assertDecodedType(codec, "attack", "\"targetId\":\"00000000-0000-0000-0000-000000000001\",\"timeoutMs\":5000", ActionType.ATTACK);
 		assertDecodedType(codec, "select_item", "\"itemId\":\"minecraft:diamond_sword\"", ActionType.SELECT_ITEM);
@@ -416,6 +420,16 @@ public final class VerificationMain {
 				"OUT_OF_RANGE",
 				"durationMs",
 				"overlong wait"
+		);
+		expectProtocolException(
+				() -> codec.decodeCommand(commandJson(
+						"control",
+						"\"forward\":0,\"strafe\":0,\"jump\":false,\"sneak\":false,\"sprint\":false,"
+								+ "\"attack\":false,\"use\":false,\"yaw\":0,\"pitch\":0,\"selectedSlot\":0,\"hand\":\"left\",\"ticks\":1"
+				)),
+				"INVALID_FIELD",
+				"hand",
+				"control hand selector"
 		);
 
 		ActionCommand command = codec.decodeCommand(commandJson("wait", "\"durationMs\":250"));

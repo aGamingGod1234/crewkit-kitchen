@@ -406,6 +406,21 @@ public final class ScenarioRuntimeService {
 		ScenarioRuntimeClock clock = ScenarioRuntimeClock.restore(session, snapshot.clock());
 		state.publicEvents.clear();
 		state.publicEvents.addAll(snapshot.publicEvents());
+		if (session.state().terminal()) {
+			ScenarioRunSnapshot migrated = ScenarioRunSnapshot.capture(
+					session,
+					clock,
+					snapshot.dimensionId(),
+					snapshot.operatorId(),
+					snapshot.boundAgentIds(),
+					snapshot.parkourCheckpoints(),
+					snapshot.origin(),
+					snapshot.reset(),
+					snapshot.publicEvents()
+			);
+			state.cleanup = new CleanupJob(migrated, snapshot.boundAgentIds(), 0);
+			return retryFailedRecoveryCleanup(state, server);
+		}
 		state.recovery = new RecoveryJob(snapshot, session, clock, savedLevel, 0L);
 		return true;
 	}
@@ -1044,7 +1059,7 @@ public final class ScenarioRuntimeService {
 	private static ScenarioAgentEvent.ActionFamily actionFamily(String wireName) {
 		if (wireName == null) return ScenarioAgentEvent.ActionFamily.OTHER;
 		return switch (wireName) {
-			case "move_to", "navigate_to", "follow_entity", "look_at" -> ScenarioAgentEvent.ActionFamily.MOVEMENT;
+			case "control", "move_to", "navigate_to", "follow_entity", "look_at" -> ScenarioAgentEvent.ActionFamily.MOVEMENT;
 			case "break_block", "pick_up_item" -> ScenarioAgentEvent.ActionFamily.HARVEST;
 			case "place_block" -> ScenarioAgentEvent.ActionFamily.BUILD;
 			case "craft_inventory", "craft_table", "furnace_transaction", "transfer_container",
