@@ -216,6 +216,11 @@ def main():
     worker._load_tts = fail_tts_warmup
     assert worker._warmup() == {"sttReady": True, "ttsReady": False}
 
+    worker._load_tts = tracked_loader("_tts_model", tts_model)
+    assert worker._warmup() == {"sttReady": True, "ttsReady": True}, (
+        "a transient channel warmup failure must be retried in the same worker"
+    )
+
     print(json.dumps({
         "requests": request_count,
         "warmupRequests": len(warmup_results),

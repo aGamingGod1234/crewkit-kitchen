@@ -27,11 +27,13 @@ export class ProgramRuntimeManager {
 	#plannerContext;
 	#recorder;
 	#completionRetryDelayMs;
+	#completionRetryLimit;
+	#cancellationAckTimeoutMs;
 	#setTimeout;
 	#clearTimeout;
 	#requestRecovery;
 
-	constructor({ registry, bridge, planner, reportError = () => {}, trace = () => {}, onCompleted = () => {}, onCompletionRequested = () => {}, requestRecovery = () => {}, plannerContext = () => ({}), compilerCorrectionLimit = 1, latencyRegistry = null, clock = performance.now.bind(performance), recorder = null, benchmarkRecorder = null, completionRetryDelayMs = 1_000, setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout } = {}) {
+	constructor({ registry, bridge, planner, reportError = () => {}, trace = () => {}, onCompleted = () => {}, onCompletionRequested = () => {}, requestRecovery = () => {}, plannerContext = () => ({}), compilerCorrectionLimit = 1, latencyRegistry = null, clock = performance.now.bind(performance), recorder = null, benchmarkRecorder = null, completionRetryDelayMs = 1_000, completionRetryLimit = 5, cancellationAckTimeoutMs = 5_000, setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout } = {}) {
 		if (!registry || !bridge || !planner) throw new TypeError('registry, bridge, and planner are required');
 		if (typeof bridge.send !== 'function' || typeof planner.requestPlan !== 'function') throw new TypeError('bridge.send and planner.requestPlan are required');
 		if (typeof reportError !== 'function') throw new TypeError('reportError must be a function');
@@ -59,8 +61,12 @@ export class ProgramRuntimeManager {
 		this.#clock = clock;
 		this.#recorder = selectedRecorder;
 		if (!Number.isSafeInteger(completionRetryDelayMs) || completionRetryDelayMs < 0) throw new TypeError('completionRetryDelayMs must be a non-negative safe integer');
-		if (typeof setTimeoutFn !== 'function' || typeof clearTimeoutFn !== 'function') throw new TypeError('completion retry timer functions are required');
+		if (!Number.isSafeInteger(completionRetryLimit) || completionRetryLimit < 0) throw new TypeError('completionRetryLimit must be a non-negative safe integer');
+		if (!Number.isSafeInteger(cancellationAckTimeoutMs) || cancellationAckTimeoutMs <= 0) throw new TypeError('cancellationAckTimeoutMs must be a positive safe integer');
+		if (typeof setTimeoutFn !== 'function' || typeof clearTimeoutFn !== 'function') throw new TypeError('timer functions are required');
 		this.#completionRetryDelayMs = completionRetryDelayMs;
+		this.#completionRetryLimit = completionRetryLimit;
+		this.#cancellationAckTimeoutMs = cancellationAckTimeoutMs;
 		this.#setTimeout = setTimeoutFn;
 		this.#clearTimeout = clearTimeoutFn;
 	}
@@ -97,7 +103,7 @@ export class ProgramRuntimeManager {
 			payload.verified === true ? null : payload.reasonCode,
 		);
 		if (payload.verified !== true) {
-			state.completionRequested = false;
+			this.#resetCompletionPublication(state);
 			state.terminalStatus = null;
 			state.engine.requestCorrection({
 				trigger: 'completion_verification_failed',
@@ -120,6 +126,9 @@ export class ProgramRuntimeManager {
 		if (!state || state.disposed || state.goalRevision !== record.goalRevision) return null;
 		const eventSequence = this.#acceptServerEvent(state, payload.eventSequence);
 		if (eventSequence === null) return state.engine.snapshot();
+		if (state.completionPublicationExhausted && state.completionPublicationRearmable && state.engine.snapshot().status === 'FINISHED') {
+			this.#resetCompletionPublication(state);
+		}
 		const observation = payload.observation ?? payload;
 		this.#record('observation_received', record, { eventSequence, attention: payload.attention === true });
 		state.observation = observation;
@@ -197,6 +206,7 @@ export class ProgramRuntimeManager {
 		if (active === null || internalActionId !== active) return false;
 		const actionTraceId = state.actionTraceIds.get(payload.actionId) ?? state.traceId;
 		if (payload.traceId !== undefined && payload.traceId !== actionTraceId) return false;
+		this.#clearCancellation(state, internalActionId);
 		const barrierEventSequence = (state.lastServerEventSequence ?? 0) + 1;
 		const resultEventSequence = barrierEventSequence;
 		const timing = state.actionTiming.get(payload.actionId);
@@ -264,6 +274,7 @@ export class ProgramRuntimeManager {
 		if (!state) return;
 		state.disposed = true;
 		this.#clearCompletionRetry(state);
+		this.#clearAllCancellations(state);
 		state.engine.dispose();
 		this.#states.delete(record.agentId);
 	}
@@ -273,6 +284,7 @@ export class ProgramRuntimeManager {
 		if (!state) return;
 		state.disposed = true;
 		this.#clearCompletionRetry(state);
+		this.#clearAllCancellations(state);
 		state.engine.dispose();
 		this.#states.delete(agentId);
 	}
@@ -304,7 +316,7 @@ export class ProgramRuntimeManager {
 			serviceTier: record.serviceTier ?? 'priority',
 			traceId: traceId === null || traceId === undefined ? defaultTraceId(record.agentId, record.goalRevision, 1) : validateTraceId(traceId),
 			planningSequence: 1,
-			version: this.#versions.get(versionKey(record)) ?? 0,
+			version: this.#versions.get(record.agentId) ?? 0,
 			lifecycle: (this.#lifecycles.get(record.agentId) ?? 0) + 1,
 			sequence: Number.isSafeInteger(eventSequence) && eventSequence >= 0 ? eventSequence : 0,
 			lastServerEventSequence: Number.isSafeInteger(eventSequence) && eventSequence >= 1 ? eventSequence : null,
@@ -322,6 +334,9 @@ export class ProgramRuntimeManager {
 			completionRequested: false,
 			completionResult: null,
 			completionRetryTimer: null,
+			completionRetryAttempts: 0,
+			completionPublicationExhausted: false,
+			completionPublicationRearmable: false,
 			branchReceipt: null,
 			lastReceiptMonotonicMs: null,
 			lastReceiptEpochMs: null,
@@ -335,6 +350,7 @@ export class ProgramRuntimeManager {
 			worldActionTraceIds: new Set(),
 			verificationTraceIds: new Set(),
 			pendingServerResult: null,
+			cancellations: new Map(),
 			engine: null,
 		};
 		state.engine = new ArenaScriptEngine({
@@ -363,7 +379,8 @@ export class ProgramRuntimeManager {
 		}
 		const version = state.version + 1;
 		state.version = version;
-		this.#versions.set(versionKey(record), version);
+		this.#versions.set(record.agentId, version);
+		this.#resetCompletionPublication(state);
 		const sequence = this.#installationSequence(state, eventSequence);
 		state.observation = observation;
 		const installed = state.engine.install({
@@ -390,6 +407,7 @@ export class ProgramRuntimeManager {
 		const correctionKey = context === null ? `initial:${eventSequence}` : requestKey(context);
 		const attempts = state.corrections.get(correctionKey) ?? 0;
 		if (attempts >= this.#compilerCorrectionLimit) {
+			state.corrections.delete(correctionKey);
 			if (context !== null) state.engine.failDirectiveRequest(context);
 			this.#reportError(record.agentId, codedError('ARENA_SCRIPT_COMPILER_EXHAUSTED', 'ArenaScript compiler correction budget is exhausted'));
 			return null;
@@ -411,9 +429,16 @@ export class ProgramRuntimeManager {
 				planningPriority: context?.priority,
 				priority: context?.priority,
 			});
-			if (state.disposed || this.#registry.get(record.agentId)?.goalRevision !== record.goalRevision) return null;
+			if (state.disposed || this.#registry.get(record.agentId)?.goalRevision !== record.goalRevision) {
+				state.corrections.delete(correctionKey);
+				return null;
+			}
 			if (decision?.directive !== 'replace') throw codedError('INVALID_COMPILER_CORRECTION', 'Compiler correction must replace with fresh ArenaScript source');
-			if (context === null) return this.#installSource(state, record, decision.source, observation, eventSequence);
+			if (context === null) {
+				const installed = await this.#installSource(state, record, decision.source, observation, eventSequence);
+				if (installed !== null) state.corrections.delete(correctionKey);
+				return installed;
+			}
 			if (!sameEngineRequest(state.engine.snapshot(), context)) {
 				state.engine.failDirectiveRequest(context);
 				this.#traceState(state, 'program_replacement_rejected', {
@@ -422,6 +447,7 @@ export class ProgramRuntimeManager {
 					eventSequence: context.eventSequence,
 					result: { code: 'STALE_MODEL_REQUEST' },
 				});
+				state.corrections.delete(correctionKey);
 				return null;
 			}
 			let compiled;
@@ -441,9 +467,11 @@ export class ProgramRuntimeManager {
 			}
 			const version = state.version + 1;
 			state.version = version;
-			this.#versions.set(versionKey(record), version);
+			this.#versions.set(record.agentId, version);
+			this.#resetCompletionPublication(state);
 			state.engine.applyDirective({ ...context, traceId: decision.traceId ?? state.traceId, directive: 'replace', install: { programId: `program-${record.goalRevision}-${version}`, version, compiled } });
 			this.#traceProgramInstall(state, record, decision.source, version, context.eventSequence);
+			state.corrections.delete(correctionKey);
 			return state.engine.snapshot();
 		} catch (requestError) {
 			if (classifyRecoveryFailure(requestError).retryable) {
@@ -457,6 +485,7 @@ export class ProgramRuntimeManager {
 				this.#requestRecoveryLease(record, state, 'compiler_correction_provider_failure', requestError);
 				return null;
 			}
+			state.corrections.delete(correctionKey);
 			this.#reportError(record.agentId, requestError);
 			return null;
 		}
@@ -544,7 +573,8 @@ export class ProgramRuntimeManager {
 				}
 				const version = state.version + 1;
 				state.version = version;
-				this.#versions.set(versionKey(record), version);
+				this.#versions.set(record.agentId, version);
+				this.#resetCompletionPublication(state);
 				state.engine.applyDirective({ ...context, traceId: decision.traceId ?? state.traceId, directive: 'replace', install: { programId: `program-${record.goalRevision}-${version}`, version, compiled } });
 				this.#traceProgramInstall(state, record, decision.source, version, context.eventSequence);
 			} else {
@@ -679,21 +709,51 @@ export class ProgramRuntimeManager {
 
 	async #cancel(state, actionId) {
 		const externalActionId = [...state.actionIds].find(([, internal]) => internal === actionId)?.[0] ?? `${state.agentId}:${actionId}`;
+		if (!state.disposed && this.#states.get(state.agentId) === state && !state.cancellations.has(actionId)) {
+			const timer = this.#setTimeout(() => {
+				if (state.cancellations.get(actionId) !== timer) return;
+				state.cancellations.delete(actionId);
+				const record = this.#registry.get(state.agentId);
+				if (state.disposed || this.#states.get(state.agentId) !== state || record === null || record.goalRevision !== state.goalRevision) return;
+				state.actionIds.delete(externalActionId);
+				state.actionTraceIds.delete(externalActionId);
+				state.actionTiming.delete(externalActionId);
+				state.actionMetadata.delete(externalActionId);
+				state.engine.failCancellation({ actionId, eventSequence: ++state.sequence, reasonCode: 'CANCEL_ACK_TIMEOUT' });
+				this.#syncState(record, state);
+			}, this.#cancellationAckTimeoutMs);
+			state.cancellations.set(actionId, timer);
+			timer?.unref?.();
+		}
 		try { await this.#bridge.send('action_cancel', state.agentId, { goalRevision: state.goalRevision, actionId: externalActionId }); }
 		catch (error) {
+			const record = this.#registry.get(state.agentId);
+			if (!state.cancellations.has(actionId) || state.disposed || this.#states.get(state.agentId) !== state || record === null || record.goalRevision !== state.goalRevision) return;
+			this.#clearCancellation(state, actionId);
 			const reasonCode = stableFailureCode(error);
 			state.actionIds.delete(externalActionId);
 			state.actionTraceIds.delete(externalActionId);
 			state.actionTiming.delete(externalActionId);
 			state.actionMetadata.delete(externalActionId);
 			state.engine.failCancellation({ actionId, eventSequence: ++state.sequence, reasonCode: 'CANCEL_SEND_FAILED' });
-			const record = this.#registry.get(state.agentId);
-			if (record !== null) this.#syncState(record, state);
+			this.#syncState(record, state);
 			const reported = error && typeof error === 'object' && typeof error.code === 'string'
 				? error
 				: Object.assign(new Error(String(error?.message ?? error ?? 'cancel transport failed')), { code: reasonCode, cause: error });
 			this.#reportError(state.agentId, reported);
 		}
+	}
+
+	#clearCancellation(state, actionId) {
+		const timer = state.cancellations.get(actionId);
+		if (timer === undefined) return;
+		this.#clearTimeout(timer);
+		state.cancellations.delete(actionId);
+	}
+
+	#clearAllCancellations(state) {
+		for (const timer of state.cancellations.values()) this.#clearTimeout(timer);
+		state.cancellations.clear();
 	}
 
 	#acceptServerEvent(state, candidate) {
@@ -827,8 +887,8 @@ export class ProgramRuntimeManager {
 			} catch { return; }
 		}
 		this.#record(phase, record, fields);
-		if (phase === 'first_world_action') state.worldActionTraceIds.add(traceId);
-		if (phase === 'completion_verification') state.verificationTraceIds.add(traceId);
+		if (phase === 'first_world_action') addBoundedSetValue(state.worldActionTraceIds, traceId);
+		if (phase === 'completion_verification') addBoundedSetValue(state.verificationTraceIds, traceId);
 	}
 
 	#record(stage, record, fields = {}) {
@@ -951,7 +1011,7 @@ export class ProgramRuntimeManager {
 	}
 
 	#requestCompletion(record, state) {
-		if (state.completionRequested) return;
+		if (state.completionRequested || state.completionPublicationExhausted) return;
 		if (state.goalFingerprint === null) {
 			this.#reportError(record.agentId, codedError('GOAL_SPEC_REQUIRED', 'Minecraft has not supplied an immutable goal specification'));
 			return;
@@ -965,19 +1025,36 @@ export class ProgramRuntimeManager {
 		};
 		try {
 			Promise.resolve(this.#onCompletionRequested(request)).catch((error) => {
+				if (!this.#isCurrentState(record, state)) return;
 				state.completionRequested = false;
 				if (isRetryableCompletionError(error)) this.#scheduleCompletionRetry(record, state);
-				else this.#reportError(record.agentId, error);
+				else {
+					state.completionPublicationExhausted = true;
+					state.completionPublicationRearmable = false;
+					this.#reportError(record.agentId, error);
+				}
 			});
 		} catch (error) {
+			if (!this.#isCurrentState(record, state)) return;
 			state.completionRequested = false;
 			if (isRetryableCompletionError(error)) this.#scheduleCompletionRetry(record, state);
-			else this.#reportError(record.agentId, error);
+			else {
+				state.completionPublicationExhausted = true;
+				state.completionPublicationRearmable = false;
+				this.#reportError(record.agentId, error);
+			}
 		}
 	}
 
 	#scheduleCompletionRetry(record, state) {
 		if (state.disposed || state.completionRetryTimer !== null) return;
+		if (state.completionRetryAttempts >= this.#completionRetryLimit) {
+			state.completionPublicationExhausted = true;
+			state.completionPublicationRearmable = true;
+			this.#reportError(record.agentId, codedError('COMPLETION_PUBLICATION_EXHAUSTED', 'Completion publication retry budget is exhausted'));
+			return;
+		}
+		state.completionRetryAttempts += 1;
 		state.completionRetryTimer = this.#setTimeout(() => {
 			state.completionRetryTimer = null;
 			const current = this.#registry.get(record.agentId);
@@ -991,6 +1068,18 @@ export class ProgramRuntimeManager {
 		if (state.completionRetryTimer === null) return;
 		this.#clearTimeout(state.completionRetryTimer);
 		state.completionRetryTimer = null;
+	}
+
+	#resetCompletionPublication(state) {
+		this.#clearCompletionRetry(state);
+		state.completionRequested = false;
+		state.completionRetryAttempts = 0;
+		state.completionPublicationExhausted = false;
+		state.completionPublicationRearmable = false;
+	}
+
+	#isCurrentState(record, state) {
+		return !state.disposed && this.#states.get(record.agentId) === state && this.#registry.get(record.agentId)?.goalRevision === state.goalRevision;
 	}
 }
 
@@ -1010,7 +1099,11 @@ function compileGoalProgram(source, goalSpec) {
 	return compiled;
 }
 
-function versionKey(record) { return `${record.agentId}\u0000${record.goalRevision}`; }
+function addBoundedSetValue(values, value, limit = 128) {
+	if (values.has(value)) return;
+	values.add(value);
+	if (values.size > limit) values.delete(values.values().next().value);
+}
 function advancingTimestamp(state, field, value) {
 	const timestamp = monotonicTimestamp(value);
 	if (timestamp === null || (state[field] !== null && timestamp < state[field])) return null;

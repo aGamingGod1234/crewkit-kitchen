@@ -17,7 +17,21 @@ public final class ActionProgressTrackerVerification {
 		assertEquals(false, policy.shouldEmit(0.01D, 1_100L), "jitter is suppressed");
 		assertEquals(true, policy.shouldEmit(0.06D, 1_200L), "material progress emits");
 		assertEquals(true, policy.shouldEmit(0.06D, 2_200L), "heartbeat emits without progress");
-		return 9;
+
+		ActionProgressTracker rollbackTracker = new ActionProgressTracker(10.0D, 1_000L, 300L);
+		assertEquals(false, rollbackTracker.stalled(10.0D, 1_200L), "stall time accumulates before a clock rollback");
+		assertEquals(false, rollbackTracker.stalled(10.0D, 900L), "clock rollback does not manufacture a timeout");
+		assertEquals(true, rollbackTracker.stalled(10.0D, 1_000L), "stall time resumes from the corrected wall clock");
+
+		ActionProgressTracker overflowTracker = new ActionProgressTracker(10.0D, Long.MIN_VALUE, 1L);
+		assertEquals(true, overflowTracker.stalled(10.0D, Long.MAX_VALUE), "overflowing timestamp distance saturates as elapsed");
+
+		ActionProgressEmissionPolicy rollbackPolicy = new ActionProgressEmissionPolicy(0.05D, 300L);
+		assertEquals(true, rollbackPolicy.shouldEmit(0.0D, 1_000L), "rollback policy emits its first sample");
+		assertEquals(false, rollbackPolicy.shouldEmit(0.0D, 1_200L), "heartbeat time accumulates before rollback");
+		assertEquals(false, rollbackPolicy.shouldEmit(0.0D, 900L), "progress emission tolerates a corrected wall clock");
+		assertEquals(true, rollbackPolicy.shouldEmit(0.0D, 1_000L), "heartbeat resumes after rollback");
+		return 17;
 	}
 
 	private static void assertEquals(Object expected, Object actual, String label) {

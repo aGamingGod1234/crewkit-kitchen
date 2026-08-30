@@ -83,6 +83,7 @@ public final class ServerActionExecutor {
 	private static final long PLACE_TIMEOUT_MS = 5_000L;
 	private static final double PROGRESS_EMISSION_DELTA = 0.05D;
 	private static final long PROGRESS_HEARTBEAT_MS = 1_000L;
+	static final int MAX_CLEANUP_ATTEMPTS = 8;
 
 	private final CodexAgentManager manager;
 	private final AgentRuntimeRouter router;
@@ -95,8 +96,11 @@ public final class ServerActionExecutor {
 	private final ServerAgentConversationRouter conversationRouter;
 	private final ActionSuccessLedger actionSuccessLedger;
 	private final Map<AgentId, ActiveAction> active = new LinkedHashMap<>();
+	private final Map<AgentId, ActiveAction> quarantinedActions = new LinkedHashMap<>();
 	private final Map<AgentId, CleanupRetry<ServerActionResult>> pendingCompletions = new LinkedHashMap<>();
+	private final Map<AgentId, TerminalPublication<ServerActionResult>> pendingPublications = new LinkedHashMap<>();
 	private final Map<AgentId, PendingRespawn> pendingRespawns = new LinkedHashMap<>();
+	private final Map<AgentId, String> quarantinedAgents = new LinkedHashMap<>();
 	private final Map<AgentId, ServerActionResult> lastResults = new LinkedHashMap<>();
 	private long coordinatorGeneration;
 	private long pathfindingRoundRobinCursor;
@@ -179,7 +183,11 @@ public final class ServerActionExecutor {
 			submitVanillaRespawn(request);
 			return;
 		}
-		if (active.containsKey(request.agentId()) || pendingCompletions.containsKey(request.agentId()) || pendingRespawns.containsKey(request.agentId())) {
+		String quarantineReason = quarantinedAgents.get(request.agentId());
+		if (quarantineReason != null) {
+			throw new AgentDomainException("ACTION_RUNTIME_QUARANTINED", quarantineReason);
+		}
+		if (actionInFlight(request.agentId())) {
 			throw new AgentDomainException("ACTION_ALREADY_ACTIVE", "Agent already has an active action");
 		}
 		if (request.type() == ActionType.COMPLETE_GOAL) {
@@ -198,11 +206,6 @@ public final class ServerActionExecutor {
 			active.put(request.agentId(), createAction(request, player));
 		} catch (RuntimeException exception) {
 			try {
-				if (player != null) OfflineAgentPlayers.stop(player);
-			} catch (RuntimeException stopFailure) {
-				exception.addSuppressed(stopFailure);
-			}
-			try {
 				router.actionFinished(request.agentId(), request.goalRevision());
 			} catch (AgentDomainException stale) { }
 			String reason = exception instanceof AgentDomainException domain ? domain.code() : "ACTION_REJECTED";
@@ -213,13 +216,13 @@ public final class ServerActionExecutor {
 	private void submitVanillaRespawn(ServerActionRequest request) {
 		CodexAgentManager.VanillaRespawnAttempt attempt = null;
 		try {
-			if (active.containsKey(request.agentId()) || pendingCompletions.containsKey(request.agentId()) || pendingRespawns.containsKey(request.agentId())) {
+			if (actionInFlight(request.agentId())) {
 				throw new AgentDomainException("ACTION_ALREADY_ACTIVE", "Agent already has an active action");
 			}
 			attempt = manager.beginVanillaRespawn(request.agentId());
 			AgentChatReporter.acting(manager, attempt.deadRecord(), request);
 			pendingRespawns.put(request.agentId(), new PendingRespawn(
-					request, attempt, System.currentTimeMillis(), coordinatorGeneration
+					request, attempt, new ElapsedTimeAccumulator(System.currentTimeMillis()), coordinatorGeneration
 			));
 		} catch (RuntimeException exception) {
 			if (attempt != null) manager.rollbackVanillaRespawn(attempt);
@@ -250,14 +253,20 @@ public final class ServerActionExecutor {
 
 	public synchronized void tick() {
 		long now = System.currentTimeMillis();
+		retryPendingPublications();
 		List<ActiveAction> actions = new ArrayList<>(active.values());
 		try (ServerPathPlanner.TickScope ignored = ServerPathPlanner.beginServerTick()) {
 			for (PendingRespawn pending : new ArrayList<>(pendingRespawns.values())) tickRespawn(pending, now);
+			for (ActiveAction action : new ArrayList<>(quarantinedActions.values())) {
+				CleanupRetry<ServerActionResult> pending = pendingCompletions.get(action.request().agentId());
+				if (pending != null) finish(action, pending.pending());
+			}
 			if (actions.isEmpty()) return;
 			int start = roundRobinStart(pathfindingRoundRobinCursor, actions.size());
 			pathfindingRoundRobinCursor++;
 			for (int offset = 0; offset < actions.size(); offset++) {
 				ActiveAction action = actions.get((start + offset) % actions.size());
+				if (pendingPublications.containsKey(action.request().agentId())) continue;
 				CleanupRetry<ServerActionResult> pending = pendingCompletions.get(action.request().agentId());
 				if (pending != null) {
 					finish(action, pending.pending());
@@ -317,16 +326,17 @@ public final class ServerActionExecutor {
 				return;
 			}
 			if (!manager.verifyVanillaRespawn(pending.attempt(), now)) return;
-			ServerActionResult result = result(pending.request(), ServerActionState.SUCCEEDED, "VANILLA_RESPAWNED", "Respawned at the vanilla target", now - pending.startedAtEpochMs(), true, true);
+			ServerActionResult result = result(pending.request(), ServerActionState.SUCCEEDED, "VANILLA_RESPAWNED", "Respawned at the vanilla target", pending.elapsedTime().advance(now), true, true);
 			manager.commitVanillaRespawn(pending.attempt(), (transition, commit) -> publishRespawn(result, transition, commit));
 			pendingRespawns.remove(pending.request().agentId(), pending);
+			quarantinedAgents.remove(pending.request().agentId());
 		} catch (RuntimeException exception) {
 			pendingRespawns.remove(pending.request().agentId(), pending);
 			manager.rollbackVanillaRespawn(pending.attempt());
 			if (!isCurrentCoordinatorGeneration(pending.coordinatorGeneration(), coordinatorGeneration)
 					|| isCoordinatorDisconnected(exception)) return;
 			String reason = exception instanceof AgentDomainException domain ? domain.code() : "RESPAWN_REJECTED";
-			emit(pending.request(), ServerActionState.FAILED, reason, safeMessage(exception), now - pending.startedAtEpochMs(), false, false);
+			emit(pending.request(), ServerActionState.FAILED, reason, safeMessage(exception), pending.elapsedTime().advance(now), false, false);
 		}
 	}
 
@@ -359,10 +369,13 @@ public final class ServerActionExecutor {
 		PendingRespawn respawn = pendingRespawns.remove(agentId);
 		if (respawn != null) {
 			manager.rollbackVanillaRespawn(respawn.attempt());
-			emit(respawn.request(), ServerActionState.CANCELLED, "ACTION_CANCELLED", reason == null ? "Action cancelled" : reason, System.currentTimeMillis() - respawn.startedAtEpochMs(), false, false);
+			emit(respawn.request(), ServerActionState.CANCELLED, "ACTION_CANCELLED", reason == null ? "Action cancelled" : reason,
+					respawn.elapsedTime().advance(System.currentTimeMillis()), false, false);
 			return true;
 		}
 		ActiveAction action = active.get(agentId);
+		if (action == null) action = quarantinedActions.get(agentId);
+		if (pendingPublications.containsKey(agentId)) return true;
 		if (action == null) return false;
 		String cancellationReason = reason == null ? "Action cancelled" : reason;
 		CleanupRetry<ServerActionResult> pending = pendingCompletions.get(agentId);
@@ -377,6 +390,7 @@ public final class ServerActionExecutor {
 		} catch (RuntimeException teardownFailure) {
 			CleanupRetry<ServerActionResult> retry = new CleanupRetry<>();
 			retry.retain(result);
+			retry.recordFailure();
 			pendingCompletions.put(agentId, retry);
 			return true;
 		}
@@ -388,6 +402,7 @@ public final class ServerActionExecutor {
 		Objects.requireNonNull(agentId, "agentId must not be null");
 		Objects.requireNonNull(actionId, "actionId must not be null");
 		ActiveAction action = active.get(agentId);
+		if (action == null) action = quarantinedActions.get(agentId);
 		PendingRespawn respawn = pendingRespawns.get(agentId);
 		if (action == null && respawn == null) return false;
 		if (respawn != null) {
@@ -406,13 +421,16 @@ public final class ServerActionExecutor {
 	}
 
 	private void complete(ActiveAction action, ServerActionResult result) {
-		active.remove(action.request().agentId(), action);
-		pendingCompletions.remove(action.request().agentId());
-		releaseResourceLease(action);
-		try {
-			router.actionFinished(action.request().agentId(), action.request().goalRevision());
-		} catch (AgentDomainException stale) { }
-		publish(result);
+		TerminalPublication<ServerActionResult> publication = retainPublication(result, true);
+		attemptPublication(action, publication);
+	}
+
+	private boolean actionInFlight(AgentId agentId) {
+		return active.containsKey(agentId)
+				|| quarantinedActions.containsKey(agentId)
+				|| pendingCompletions.containsKey(agentId)
+				|| pendingPublications.containsKey(agentId)
+				|| pendingRespawns.containsKey(agentId);
 	}
 
 	public synchronized ServerActionResult lastResult(AgentId agentId) {
@@ -608,13 +626,99 @@ public final class ServerActionExecutor {
 		try {
 			completed = retry.complete(action::cleanup);
 		} catch (RuntimeException teardownFailure) {
+			if (retry.exhausted(MAX_CLEANUP_ATTEMPTS) && !quarantinedAgents.containsKey(agentId)) {
+				quarantine(action, teardownFailure);
+			}
+			return;
+		}
+		if (quarantinedAgents.containsKey(agentId)) {
+			recoverQuarantined(action);
 			return;
 		}
 		complete(action, completed);
 	}
 
+	private void quarantine(ActiveAction action, RuntimeException teardownFailure) {
+		AgentId agentId = action.request().agentId();
+		String message = "Action cleanup failed after " + MAX_CLEANUP_ATTEMPTS
+				+ " attempts; physical actions are quarantined while cleanup retries automatically: "
+				+ safeMessage(teardownFailure);
+		quarantinedAgents.put(agentId, message);
+		active.remove(agentId, action);
+		quarantinedActions.put(agentId, action);
+		publish(action.result(ServerActionState.FAILED, "ACTION_CLEANUP_FAILED", message, System.currentTimeMillis()));
+	}
+
+	private void recoverQuarantined(ActiveAction action) {
+		AgentId agentId = action.request().agentId();
+		releaseResourceLease(action);
+		try {
+			router.actionFinished(agentId, action.request().goalRevision());
+		} catch (AgentDomainException stale) { }
+		quarantinedActions.remove(agentId, action);
+		pendingCompletions.remove(agentId);
+		quarantinedAgents.remove(agentId);
+	}
+
+	private TerminalPublication<ServerActionResult> retainPublication(
+			ServerActionResult result,
+			boolean completesAction
+	) {
+		AgentId agentId = result.agentId();
+		TerminalPublication<ServerActionResult> existing = pendingPublications.get(agentId);
+		if (existing != null) return existing;
+		TerminalPublication<ServerActionResult> publication = new TerminalPublication<>(result, completesAction);
+		pendingPublications.put(agentId, publication);
+		return publication;
+	}
+
+	private void retryPendingPublications() {
+		for (var entry : new ArrayList<>(pendingPublications.entrySet())) {
+			TerminalPublication<ServerActionResult> publication = entry.getValue();
+			attemptPublication(publication.completesAction() ? active.get(entry.getKey()) : null, publication);
+		}
+	}
+
+	private void attemptPublication(
+			ActiveAction action,
+			TerminalPublication<ServerActionResult> publication
+	) {
+		try {
+			boolean delivered = publication.publish(
+					() -> preparePublication(action, publication.value()),
+					resultSink
+			);
+			if (!delivered) return;
+		} catch (RuntimeException publicationFailure) {
+			return;
+		}
+		ServerActionResult result = publication.value();
+		if (action != null) {
+			active.remove(result.agentId(), action);
+			pendingCompletions.remove(result.agentId());
+		}
+		pendingPublications.remove(result.agentId(), publication);
+	}
+
+	private void preparePublication(ActiveAction action, ServerActionResult result) {
+		if (action != null) {
+			releaseResourceLease(action);
+			try {
+				router.actionFinished(result.agentId(), result.goalRevision());
+			} catch (AgentDomainException stale) { }
+		}
+		lastResults.put(result.agentId(), result);
+		actionSuccessLedger.record(result);
+		try {
+			AgentChatReporter.result(manager, manager.registry().require(result.agentId()), result);
+		} catch (RuntimeException ignored) {
+			// Terminal delivery must survive presentation or agent-removal races.
+		}
+	}
+
 	static final class CleanupRetry<T> {
 		private T pending;
+		private int failureCount;
 
 		synchronized void retain(T candidate) {
 			Objects.requireNonNull(candidate, "candidate must not be null");
@@ -633,9 +737,82 @@ public final class ServerActionExecutor {
 		synchronized T complete(Runnable cleanup) {
 			Objects.requireNonNull(cleanup, "cleanup must not be null");
 			T retained = pending();
-			cleanup.run();
+			try {
+				cleanup.run();
+			} catch (RuntimeException failure) {
+				failureCount++;
+				throw failure;
+			}
 			pending = null;
 			return retained;
+		}
+
+		synchronized int failureCount() {
+			return failureCount;
+		}
+
+		synchronized void recordFailure() {
+			failureCount++;
+		}
+
+		synchronized boolean exhausted(int maximumAttempts) {
+			if (maximumAttempts <= 0) throw new IllegalArgumentException("maximumAttempts must be positive");
+			return failureCount >= maximumAttempts;
+		}
+	}
+
+	static final class TerminalPublication<T> {
+		private enum Phase { NEW, PREPARING, READY, DELIVERING, DELIVERED }
+
+		private final T value;
+		private final boolean completesAction;
+		private Phase phase = Phase.NEW;
+
+		TerminalPublication(T value) {
+			this(value, false);
+		}
+
+		TerminalPublication(T value, boolean completesAction) {
+			this.value = Objects.requireNonNull(value, "value must not be null");
+			this.completesAction = completesAction;
+		}
+
+		synchronized T value() {
+			return value;
+		}
+
+		synchronized boolean hasPending() {
+			return phase != Phase.DELIVERED;
+		}
+
+		boolean completesAction() {
+			return completesAction;
+		}
+
+		synchronized boolean publish(Runnable preparation, Consumer<T> sink) {
+			Objects.requireNonNull(preparation, "preparation must not be null");
+			Objects.requireNonNull(sink, "sink must not be null");
+			if (phase == Phase.DELIVERED) return true;
+			if (phase == Phase.PREPARING || phase == Phase.DELIVERING) return false;
+			if (phase == Phase.NEW) {
+				phase = Phase.PREPARING;
+				try {
+					preparation.run();
+					phase = Phase.READY;
+				} catch (RuntimeException failure) {
+					phase = Phase.NEW;
+					throw failure;
+				}
+			}
+			phase = Phase.DELIVERING;
+			try {
+				sink.accept(value);
+				phase = Phase.DELIVERED;
+				return true;
+			} catch (RuntimeException failure) {
+				phase = Phase.READY;
+				throw failure;
+			}
 		}
 	}
 
@@ -671,14 +848,7 @@ public final class ServerActionExecutor {
 	}
 
 	private void publish(ServerActionResult result) {
-		lastResults.put(result.agentId(), result);
-		actionSuccessLedger.record(result);
-		try {
-			AgentChatReporter.result(manager, manager.registry().require(result.agentId()), result);
-		} catch (AgentDomainException ignored) {
-			// The agent may have been removed while its terminal result was in flight.
-		}
-		resultSink.accept(result);
+		attemptPublication(null, retainPublication(result, false));
 	}
 
 	private void publishRespawn(ServerActionResult result, AgentTransition transition, Runnable commit) {
@@ -710,7 +880,7 @@ public final class ServerActionExecutor {
 	private record PendingRespawn(
 			ServerActionRequest request,
 			CodexAgentManager.VanillaRespawnAttempt attempt,
-			long startedAtEpochMs,
+			ElapsedTimeAccumulator elapsedTime,
 			long coordinatorGeneration
 	) { }
 
@@ -1352,7 +1522,8 @@ public final class ServerActionExecutor {
 		private final ServerActionRequest request;
 		private final ServerPlayer player;
 		private final Mode mode;
-		private final long startedAt;
+		private final ElapsedTimeAccumulator elapsedTime;
+		private final net.minecraft.resources.ResourceKey<net.minecraft.world.level.Level> startingDimension;
 		private final long timeoutMs;
 		private final Runnable immediate;
 		private final Vec3 destination;
@@ -1391,7 +1562,9 @@ public final class ServerActionExecutor {
 			this.request = request;
 			this.player = player;
 			this.mode = mode;
-			this.startedAt = System.currentTimeMillis();
+			this.startingDimension = player == null ? null : player.level().dimension();
+			long startedAt = System.currentTimeMillis();
+			this.elapsedTime = new ElapsedTimeAccumulator(startedAt);
 			this.timeoutMs = Math.max(1L, timeoutMs);
 			this.immediate = immediate;
 			this.destination = destination;
@@ -1512,8 +1685,12 @@ public final class ServerActionExecutor {
 		}
 
 		ServerActionResult tick(long now) {
+			if (startingDimension != null && !startingDimension.equals(player.level().dimension())) {
+				return result(ServerActionState.FAILED, "ACTION_DIMENSION_CHANGED",
+						"Agent player changed dimension during action execution", now);
+			}
 			if (!player.isAlive()) return result(ServerActionState.FAILED, "AGENT_DEAD", "Agent player died", now);
-			long elapsed = Math.max(0L, now - startedAt);
+			long elapsed = elapsedTime.advance(now);
 			if (!executionStarted) {
 				executionStarted = true;
 				switch (mode) {
@@ -1654,7 +1831,7 @@ public final class ServerActionExecutor {
 					request.type(),
 					request.traceId(),
 					bounded,
-					Math.max(0L, now - startedAt),
+					elapsedTime.advance(now),
 					now
 			);
 		}
@@ -1681,8 +1858,7 @@ public final class ServerActionExecutor {
 			ServerTransactionAdapter.runBestEffort(
 					() -> { if (transaction != null) transaction.cancel(reason); },
 					() -> { if (controller != null) controller.cancel(player); },
-					this::releaseInput,
-					() -> OfflineAgentPlayers.stop(player)
+					this::releaseInput
 			);
 		}
 
@@ -1690,8 +1866,7 @@ public final class ServerActionExecutor {
 			ServerTransactionAdapter.runBestEffort(
 					() -> { if (transaction != null) transaction.cleanup(); },
 					() -> { if (controller != null) controller.cancel(player); },
-					this::releaseInput,
-					() -> OfflineAgentPlayers.stop(player)
+					this::releaseInput
 			);
 		}
 
@@ -1726,7 +1901,7 @@ public final class ServerActionExecutor {
 			if (inputLease == null) return;
 			try {
 				AgentInputRuntime.controller(player).release(inputLease);
-			} catch (IllegalStateException ignored) {
+			} catch (LeasedServerInputController.StaleInputLeaseException ignored) {
 				// A lifecycle clear may already have invalidated every lease.
 			}
 			inputLease = null;
@@ -1742,7 +1917,7 @@ public final class ServerActionExecutor {
 					state,
 					reasonCode,
 					message,
-					Math.max(0L, now - startedAt),
+					elapsedTime.advance(now),
 					now,
 					executionStarted,
 					physicalAttempted

@@ -332,6 +332,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 	#outboundQueue = [];
 	#queuedByAgent = new Map();
 	#writeBlocked = false;
+	#blockedWriteEntry = null;
 	#inboundMessageIds = new Set();
 	#terminalActionIds = new Set();
 	#terminalActionsByGoal = new Map();
@@ -428,7 +429,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 		socket.on('data', (chunk) => this.#onData(socket, connectionEpoch, chunk));
 		socket.on('drain', () => this.#onDrain(socket, connectionEpoch));
 		socket.on('error', (error) => {
-			if (this.#isCurrentConnection(socket, connectionEpoch)) this.emit('transportError', error);
+			if (this.#isCurrentConnection(socket, connectionEpoch)) this.#emitSafely('transportError', error);
 		});
 		socket.on('close', () => this.#onClose(socket, connectionEpoch));
 	}
@@ -491,7 +492,6 @@ export class MultiplexedServerBridge extends EventEmitter {
 		this.#trackInboundRevision(envelope);
 		this.#assertRevision(envelope, REVISION_GUARDED_INBOUND_TYPES);
 		if (this.#trackTerminalResult(envelope)) {
-			this.#refreshHeartbeatDeadline(socket, connectionEpoch);
 			void this.acknowledgeActionResult(envelope.agentId, envelope.payload, { connectionEpoch }).catch(() => {});
 			return;
 		}
@@ -504,10 +504,10 @@ export class MultiplexedServerBridge extends EventEmitter {
 			this.#observedRevisions.delete(envelope.agentId);
 			this.#terminalActionsByGoal.delete(envelope.agentId);
 		}
-		this.#refreshHeartbeatDeadline(socket, connectionEpoch);
+		if (envelope.type === 'heartbeat') this.#refreshHeartbeatDeadline(socket, connectionEpoch);
 		const event = { ...envelope, connectionEpoch };
-		this.emit(envelope.type, event);
-		this.emit('message', event);
+		this.#emitSafely(envelope.type, event);
+		this.#emitSafely('message', event);
 	}
 
 	#acceptHelloAck(envelope, socket, connectionEpoch) {
@@ -541,8 +541,8 @@ export class MultiplexedServerBridge extends EventEmitter {
 			registry: structuredClone(registry),
 			...(this.#launchId === null ? {} : { launchId: this.#launchId }),
 		};
-		this.emit('ready', connection);
-		if (recovered) this.emit('recovered', { ...connection, registry: structuredClone(registry) });
+		this.#emitSafely('ready', connection);
+		if (recovered) this.#emitSafely('recovered', { ...connection, registry: structuredClone(registry) });
 	}
 
 	#assertRevision(envelope, guardedTypes) {
@@ -550,6 +550,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 		const revision = envelope.payload.goalRevision;
 		if (!Number.isSafeInteger(revision) || revision < 0) throw new ProtocolV2Error('INVALID_GOAL_REVISION', `${envelope.type} requires a nonnegative goalRevision`);
 		const current = this.#trackedRevision(envelope.agentId);
+		if (envelope.type === 'action_result' && current !== null && current !== undefined && revision < current) return;
 		if (current !== null && current !== undefined && revision !== current) throw new ProtocolV2Error('STALE_GOAL_REVISION', `Message revision ${revision} does not match current revision ${current}`);
 	}
 
@@ -607,16 +608,19 @@ export class MultiplexedServerBridge extends EventEmitter {
 	#trackTerminalResult(envelope) {
 		if (envelope.type !== 'action_result' || !TERMINAL_ACTION_STATES.has(envelope.payload.state)) return;
 		const actionId = requireIdentifier(envelope.payload.actionId ?? envelope.payload.commandId, 'actionId');
-		const goal = this.#ensureTerminalGoal(envelope.agentId, envelope.payload.goalRevision);
 		const key = `${envelope.agentId}:${envelope.payload.goalRevision}:${actionId}`;
 		const fingerprint = JSON.stringify(envelope.payload);
 		const previous = this.#terminalResultsByKey.get(key);
 		if (previous !== undefined) {
 			if (previous !== fingerprint) throw new ProtocolV2Error('DUPLICATE_TERMINAL_RESULT', `Action '${actionId}' changed its terminal result`);
-			return true;
+			return this.#acknowledgedTerminalActionIds.has(key);
 		}
-		if (goal.actionIds.has(actionId)) throw new ProtocolV2Error('DUPLICATE_TERMINAL_RESULT', `Duplicate terminal result for action '${actionId}'`);
-		goal.actionIds.add(actionId);
+		const activeGoal = this.#terminalActionsByGoal.get(envelope.agentId);
+		const goal = activeGoal !== undefined && envelope.payload.goalRevision < activeGoal.goalRevision
+			? null
+			: this.#ensureTerminalGoal(envelope.agentId, envelope.payload.goalRevision);
+		if (goal?.actionIds.has(actionId)) throw new ProtocolV2Error('DUPLICATE_TERMINAL_RESULT', `Duplicate terminal result for action '${actionId}'`);
+		goal?.actionIds.add(actionId);
 		this.#terminalResultsByKey.set(key, fingerprint);
 		const evicted = rememberBounded(this.#terminalActionIds, key, MAX_TRACKED_TERMINAL_ACTION_IDS);
 		if (evicted !== undefined) {
@@ -707,18 +711,30 @@ export class MultiplexedServerBridge extends EventEmitter {
 				this.#invokeAudit('coordinator_to_server', entry.envelope);
 				writable = socket.write(entry.encoded);
 			} catch (error) { entry.reject(error); this.#fail(error); return; }
-			entry.resolve(entry.envelope.messageId);
 			if (!writable) {
 				this.#writeBlocked = true;
+				this.#blockedWriteEntry = entry;
 				return;
 			}
+			entry.resolve(entry.envelope.messageId);
 		}
 	}
 
 	#onDrain(socket, connectionEpoch) {
 		if (!this.#isCurrentConnection(socket, connectionEpoch)) return;
 		this.#writeBlocked = false;
+		const blocked = this.#blockedWriteEntry;
+		this.#blockedWriteEntry = null;
+		blocked?.resolve(blocked.envelope.messageId);
 		this.#flush();
+	}
+
+	#emitSafely(eventName, ...arguments_) {
+		try { this.emit(eventName, ...arguments_); }
+		catch (error) {
+			if (eventName === 'listenerError') return;
+			try { this.emit('listenerError', error, { eventName }); } catch {}
+		}
 	}
 
 	#invokeAudit(direction, envelope) {
@@ -742,13 +758,15 @@ export class MultiplexedServerBridge extends EventEmitter {
 	}
 
 	#clearOutboundQueue(error) {
+		this.#blockedWriteEntry?.reject(error);
+		this.#blockedWriteEntry = null;
 		for (const entry of this.#outboundQueue.splice(0)) entry.reject(error);
 		this.#queuedByAgent.clear();
 	}
 
 	#fail(error, socket = this.#socket, connectionEpoch = this.#connectionEpoch) {
 		if (!this.#isCurrentConnection(socket, connectionEpoch)) return;
-		this.emit('protocolError', error instanceof Error ? error : new ProtocolV2Error('PROTOCOL_ERROR', String(error)));
+		this.#emitSafely('protocolError', error instanceof Error ? error : new ProtocolV2Error('PROTOCOL_ERROR', String(error)));
 		socket.destroy();
 	}
 
@@ -763,7 +781,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 		this.#helloMessageId = null;
 		this.#knownAgentIds.clear();
 		this.#clearOutboundQueue(new ProtocolV2Error('BRIDGE_DISCONNECTED', 'Multiplexed bridge disconnected'));
-		if (wasReady) this.emit('disconnected', { connectionEpoch, serverInstanceId: this.#serverInstanceId });
+		if (wasReady) this.#emitSafely('disconnected', { connectionEpoch, serverInstanceId: this.#serverInstanceId });
 		if (!this.#running || this.#reconnectHandle !== null) return;
 		const delay = this.#reconnectDelayMs;
 		this.#reconnectDelayMs = Math.min(this.#maxReconnectDelayMs, this.#reconnectDelayMs * 2);

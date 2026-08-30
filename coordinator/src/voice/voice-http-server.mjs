@@ -46,6 +46,7 @@ export function createVoiceHttpServer({
 	if (maxProbeDelayMs < initialProbeDelayMs) throw new TypeError('maxProbeDelayMs must not be less than initialProbeDelayMs');
 
 	let active = 0;
+	let activeTts = 0;
 	const controllers = new Set();
 	const failureListeners = new Set();
 	let startPromise = null;
@@ -65,6 +66,7 @@ export function createVoiceHttpServer({
 		...lifecycleOptions,
 	});
 	const sttUnavailable = sttProvider === null || sttProvider instanceof NoSttProvider;
+	const maxTtsConcurrent = sttUnavailable ? maxConcurrent : Math.max(1, maxConcurrent - 1);
 	const sttLifecycle = new VoiceChannelLifecycle({
 		component: 'voice:stt', boundary: 'voice_stt_provider',
 		probe: sttUnavailable ? null : (signal) => probeStt(sttProvider, signal),
@@ -85,8 +87,9 @@ export function createVoiceHttpServer({
 			respondJson(response, 401, { code: 'UNAUTHORIZED' });
 			return;
 		}
-		if (active >= maxConcurrent) {
-			respondJson(response, 429, { code: 'TTS_CAPACITY' });
+		const sttRequest = request.url === '/v1/stt';
+		if (active >= maxConcurrent || (!sttRequest && activeTts >= maxTtsConcurrent)) {
+			respondJson(response, 429, { code: sttRequest ? 'STT_CAPACITY' : 'TTS_CAPACITY' });
 			return;
 		}
 		const controller = new AbortController();
@@ -94,10 +97,12 @@ export function createVoiceHttpServer({
 		let released = false;
 		let providerOperation = null;
 		active += 1;
+		if (!sttRequest) activeTts += 1;
 		const release = () => {
 			if (released) return;
 			released = true;
 			active -= 1;
+			if (!sttRequest) activeTts -= 1;
 			controllers.delete(controller);
 		};
 		const onRequestAborted = () => controller.abort();
@@ -634,7 +639,7 @@ function statusFor(error) {
 	if (error?.httpStatus === 503) return 503;
 	if (error?.name === 'AbortError' || error?.name === 'TimeoutError') return 504;
 	if (error?.code === 'TTS_RATE_LIMITED' || error?.code === 'TTS_CAPACITY') return 429;
-	if (error?.code === 'STT_RATE_LIMITED') return 429;
+	if (error?.code === 'STT_RATE_LIMITED' || error?.code === 'STT_CAPACITY') return 429;
 	if (error?.code === 'STT_UNAVAILABLE') return 503;
 	if (['INVALID_REQUEST', 'INVALID_JSON', 'REQUEST_TOO_LARGE'].includes(error?.code)) return 400;
 	return 502;

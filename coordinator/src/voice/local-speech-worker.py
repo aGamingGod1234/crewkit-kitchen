@@ -20,7 +20,6 @@ _stt_model = None
 # and inference even when the RPC worker handles several requests concurrently.
 _model_lock = threading.RLock()
 _warmup_lock = threading.Lock()
-_warmup_started = False
 _response_lock = threading.Lock()
 
 def _load_tts():
@@ -83,14 +82,10 @@ def _warmup_model(name, loader):
 
 
 def _warmup():
-    global _warmup_started
     with _warmup_lock:
-        if _warmup_started:
-            return {"sttReady": _stt_model is not None, "ttsReady": _tts_model is not None}
-        _warmup_started = True
         results = {
-            "stt": _warmup_model("STT", _load_stt),
-            "tts": _warmup_model("TTS", _load_tts),
+            "stt": _stt_model is not None or _warmup_model("STT", _load_stt),
+            "tts": _tts_model is not None or _warmup_model("TTS", _load_tts),
         }
         return {"sttReady": results["stt"], "ttsReady": results["tts"]}
 

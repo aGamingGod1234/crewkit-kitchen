@@ -406,10 +406,13 @@ export class PlanningScheduler {
 	}
 
 	#nextEntry() {
-		const priority = this.#nextPriority();
+		let priority = this.#nextPriority();
+		if (priority === ORDINARY_PRIORITY && this.activeOrdinaryCount >= this.#ordinaryActiveLimit()) {
+			if (!this.#hasPendingPriority(URGENT_PRIORITY)) return null;
+			priority = URGENT_PRIORITY;
+		}
 		const lane = this.#nextLane(priority);
 		if (lane === null) return null;
-		if (priority === ORDINARY_PRIORITY && this.activeOrdinaryCount >= this.#ordinaryActiveLimit()) return null;
 		const entry = this.#lanes.get(lane)[priority].shift() ?? null;
 		if (entry !== null) {
 			this.#lastLane = lane;

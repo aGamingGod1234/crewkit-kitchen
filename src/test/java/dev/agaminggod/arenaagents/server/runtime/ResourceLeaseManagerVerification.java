@@ -28,7 +28,17 @@ public final class ResourceLeaseManagerVerification {
 				"the same coordinate in another dimension is independent");
 		assertTrue(leases.acquire("block:minecraft:overworld:1", first, 6_002L, 5_000L),
 				"expired targets are reusable by another owner");
-		return 6;
+
+		ResourceLeaseManager rollbackLeases = new ResourceLeaseManager();
+		assertTrue(rollbackLeases.acquire("resource", first, 1_000L, 300L), "rollback lease is acquired");
+		assertTrue(rollbackLeases.isHeldBy("resource", first, 1_200L), "lease time accumulates before rollback");
+		assertTrue(rollbackLeases.isHeldBy("resource", first, 900L), "clock rollback does not expire a lease early");
+		assertFalse(rollbackLeases.isHeldBy("resource", first, 1_000L), "lease expires after accumulated active time");
+
+		ResourceLeaseManager overflowLeases = new ResourceLeaseManager();
+		assertTrue(overflowLeases.acquire("overflow", first, Long.MIN_VALUE, 1L), "overflow lease is acquired");
+		assertFalse(overflowLeases.isHeldBy("overflow", first, Long.MAX_VALUE), "overflowing timestamp distance expires safely");
+		return 12;
 	}
 
 	private static void assertTrue(boolean condition, String label) {

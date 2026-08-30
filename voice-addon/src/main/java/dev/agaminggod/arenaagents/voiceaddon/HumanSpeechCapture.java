@@ -4,7 +4,10 @@ import de.maxhenkel.voicechat.api.VoicechatServerApi;
 import de.maxhenkel.voicechat.api.events.MicrophonePacketEvent;
 import de.maxhenkel.voicechat.api.opus.OpusDecoder;
 import dev.agaminggod.arenaagents.server.CodexAgentServerRuntime;
+import dev.agaminggod.arenaagents.server.conversation.ServerAgentConversationRouter.ProximitySpeechAudience;
+import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicReference;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import org.slf4j.Logger;
@@ -44,15 +47,23 @@ final class HumanSpeechCapture implements ServerSpeechCaptureRegistry.Capture {
 					byte[] opus = event.getPacket().getOpusEncodedData().clone();
 					if (opus.length == 0 || opus.length > 8_192) return;
 					VoicechatServerApi api = event.getVoicechat();
+					boolean whispering = event.getPacket().isWhispering();
 					engine.accept(
 							player.getUUID(),
-							event.getPacket().isWhispering(),
+							whispering,
 							opus,
 							() -> decoder(api.createDecoder()),
 							server::execute,
-							(playerId, transcript, whispering) -> CodexAgentServerRuntime.deliverHumanSpeech(
-									server, playerId, transcript, whispering
-							)
+							() -> {
+								AtomicReference<Optional<ProximitySpeechAudience>> audience =
+										new AtomicReference<>(Optional.empty());
+								server.execute(() -> audience.set(CodexAgentServerRuntime.captureHumanSpeechAudience(
+										server, player.getUUID(), whispering
+								)));
+								return (playerId, transcript, ignoredWhispering) -> audience.get().ifPresent(
+										snapshot -> CodexAgentServerRuntime.deliverHumanSpeech(server, snapshot, transcript)
+								);
+							}
 					);
 				}
 		);

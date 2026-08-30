@@ -1,5 +1,6 @@
 package dev.agaminggod.arenaagents.server.runtime.controller;
 
+import dev.agaminggod.arenaagents.server.runtime.ElapsedTimeAccumulator;
 import java.util.List;
 import java.util.Objects;
 import net.minecraft.core.Direction;
@@ -11,7 +12,7 @@ public final class ServerBuildSequenceController implements ServerController {
 	private static final double NAVIGATION_TOLERANCE = 4.0D;
 
 	private final List<Placement> placements;
-	private final long startedAt;
+	private final ElapsedTimeAccumulator elapsedTime;
 	private final long timeoutMs;
 	private final PlacementDriver driver;
 	private int index;
@@ -28,14 +29,14 @@ public final class ServerBuildSequenceController implements ServerController {
 			throw new IllegalArgumentException("placements must contain 1 to 32 entries");
 		}
 		if (timeoutMs <= 0L) throw new IllegalArgumentException("timeoutMs must be positive");
-		this.startedAt = startedAt;
+		this.elapsedTime = new ElapsedTimeAccumulator(startedAt);
 		this.timeoutMs = timeoutMs;
 		this.driver = Objects.requireNonNull(driver, "driver must not be null");
 	}
 
 	@Override
 	public TickResult tick(ServerPlayer player, long nowEpochMs) {
-		long elapsed = Math.max(0L, nowEpochMs - startedAt);
+		long elapsed = elapsedTime.advance(nowEpochMs);
 		if (elapsed >= timeoutMs) {
 			return failure("BUILD_SEQUENCE_TIMEOUT", "sequence timeout", progress());
 		}

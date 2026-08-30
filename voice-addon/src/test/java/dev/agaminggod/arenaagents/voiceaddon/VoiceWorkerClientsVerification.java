@@ -40,7 +40,7 @@ final class VoiceWorkerClientsVerification {
 		assertions += verifySttCancellationStopsTheHttpExchange();
 		assertions += verifySttClientSendsPcmMetadataAndBoundsTranscript();
 		assertions += verifySttClientRejectsMalformedInputAndResponse();
-		assertions += verifySttUnavailablePreservesWorkerCode();
+		assertions += verifySttBackoffCodesPreserved();
 		assertions += verifyClientsRejectWrongResponseMediaTypes();
 		assertions += verifyConfiguredDeadlineReachesBothHttpClients();
 		return assertions;
@@ -245,7 +245,7 @@ final class VoiceWorkerClientsVerification {
 		return 2;
 	}
 
-	private static int verifySttUnavailablePreservesWorkerCode() throws Exception {
+	private static int verifySttBackoffCodesPreserved() throws Exception {
 		try (WorkerServer unavailable = new WorkerServer(exchange -> respond(
 				exchange,
 				503,
@@ -261,7 +261,37 @@ final class VoiceWorkerClientsVerification {
 			).join(), "STT unavailable response");
 			unavailable.assertHealthy();
 		}
-		return 1;
+		try (WorkerServer saturated = new WorkerServer(exchange -> respond(
+				exchange,
+				429,
+				"{\"code\":\"STT_CAPACITY\",\"message\":\"Speech recognition is busy\"}"
+						.getBytes(StandardCharsets.UTF_8),
+				"application/json"
+		))) {
+			SpeechWorkerClient client = new SpeechWorkerClient(
+					HttpClient.newHttpClient(), saturated.uri("/v1/stt"), SECRET
+			);
+			assertWorkerFailure("STT_CAPACITY", () -> client.transcribe(
+					PLAYER, 1L, false, new short[] { 1 }
+			).join(), "STT capacity response");
+			saturated.assertHealthy();
+		}
+		try (WorkerServer rateLimited = new WorkerServer(exchange -> respond(
+				exchange,
+				429,
+				"{\"code\":\"STT_RATE_LIMITED\",\"message\":\"Speech provider rate limit reached\"}"
+						.getBytes(StandardCharsets.UTF_8),
+				"application/json"
+		))) {
+			SpeechWorkerClient client = new SpeechWorkerClient(
+					HttpClient.newHttpClient(), rateLimited.uri("/v1/stt"), SECRET
+			);
+			assertWorkerFailure("STT_RATE_LIMITED", () -> client.transcribe(
+					PLAYER, 1L, false, new short[] { 1 }
+			).join(), "STT provider rate-limit response");
+			rateLimited.assertHealthy();
+		}
+		return 3;
 	}
 
 	private static VoiceRequest request() {

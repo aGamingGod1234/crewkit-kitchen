@@ -135,6 +135,47 @@ test('accepts model-authored locals, conditionals, bounded for loops, and watche
 	assert.equal(compiled.watcherCount, 1);
 });
 
+test('rejects local identifiers outside their lexical lifetime', () => {
+	for (const source of [
+		'program.onUnhandledAttention("continue_and_notify"); { const hidden = 1; } await player.wait(hidden);',
+		'program.onUnhandledAttention("continue_and_notify"); for (let index = 0; index < 1; index += 1) {} await player.wait(index);',
+		'program.onUnhandledAttention("continue_and_notify"); function local(value) {} await player.wait(value);',
+		'program.onUnhandledAttention("continue_and_notify"); await player.wait(later); const later = 1;',
+	]) {
+		assert.throws(
+			() => parseArenaScript(source),
+			(error) => error.name === 'ArenaScriptError' && error.code === 'UNSAFE_MEMBER_ACCESS',
+		);
+	}
+});
+
+test('preserves hoisted functions and deferred closure references', () => {
+	assert.doesNotThrow(() => parseArenaScript(`
+		program.onUnhandledAttention("continue_and_notify");
+		program.watch(() => true, { mode: "boundary" }, async () => { await later(); });
+		const later = async () => { await player.wait(1); };
+		hoisted();
+		function hoisted() {}
+	`));
+});
+
+test('rejects immediate local calls before their closure dependencies are initialized', () => {
+	for (const source of [
+		'program.onUnhandledAttention("continue_and_notify"); const use = () => later; use(); const later = 1; await player.wait(1);',
+		'program.onUnhandledAttention("continue_and_notify"); const first = () => second(); const second = () => later; first(); const later = 1; await player.wait(1);',
+		'program.onUnhandledAttention("continue_and_notify"); const outer = () => { const use = () => later; use(); const later = 1; }; outer(); await player.wait(1);',
+		'program.onUnhandledAttention("continue_and_notify"); const outer = () => { const first = () => second(); const second = () => later; first(); const later = 1; }; outer(); await player.wait(1);',
+	]) {
+		assert.throws(
+			() => parseArenaScript(source),
+			(error) => error.name === 'ArenaScriptError' && error.code === 'UNSAFE_MEMBER_ACCESS',
+		);
+	}
+	assert.doesNotThrow(
+		() => parseArenaScript('program.onUnhandledAttention("continue_and_notify"); const use = () => later; const later = 1; use(); await player.wait(1);'),
+	);
+});
+
 test('rejects source over the configured byte limit', () => {
 	assert.throws(
 		() => parseArenaScript('x'.repeat(20), { limits: { sourceBytes: 4 } }),

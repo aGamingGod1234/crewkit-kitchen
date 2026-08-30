@@ -34,6 +34,16 @@ public final class ServerObservationWireBudget {
 		JsonObject player = object(candidate, "player");
 		trimTail(candidate, player == null ? null : player.get("effects"), fitsCompleteEnvelope,
 				"player.effects", reductions);
+		if (fitsCompleteEnvelope.test(candidate)) return new Fitted(candidate, reductions);
+
+		if (dropSingleton(candidate.get("blocks"), "blocks", reductions)
+				&& fitsCompleteEnvelope.test(candidate)) return new Fitted(candidate, reductions);
+		if (dropSingleton(candidate.get("nearbyContainers"), "nearbyContainers", reductions)
+				&& fitsCompleteEnvelope.test(candidate)) return new Fitted(candidate, reductions);
+		if (dropSingleton(candidate.get("entities"), "entities", reductions)
+				&& fitsCompleteEnvelope.test(candidate)) return new Fitted(candidate, reductions);
+		if (dropSingleton(player == null ? null : player.get("effects"), "player.effects", reductions)
+				&& fitsCompleteEnvelope.test(candidate)) return new Fitted(candidate, reductions);
 		if (!fitsCompleteEnvelope.test(candidate)) {
 			throw new BridgeProtocolException("OBSERVATION_TOO_LARGE",
 					"Protected observation facts exceed the complete bridge envelope limit");
@@ -90,6 +100,13 @@ public final class ServerObservationWireBudget {
 		}
 		setPrefix(values, original, retained);
 		reductions.add(reduction);
+	}
+
+	private static boolean dropSingleton(JsonElement value, String reduction, List<String> reductions) {
+		if (value == null || !value.isJsonArray() || value.getAsJsonArray().size() != 1) return false;
+		value.getAsJsonArray().remove(0);
+		if (!reductions.contains(reduction)) reductions.add(reduction);
+		return true;
 	}
 
 	private static void setPrefix(JsonArray target, List<JsonElement> source, int size) {

@@ -125,6 +125,7 @@ export class DynamicCoordinator extends EventEmitter {
 	#started = false;
 	#stopping = false;
 	#closed = false;
+	#stopPromise = null;
 	#healthRegistry;
 	#latencyRegistry;
 	#controlNow;
@@ -310,8 +311,14 @@ export class DynamicCoordinator extends EventEmitter {
 		}
 	}
 
-	async stop() {
-		if (this.#stopping || this.#closed) return;
+	stop() {
+		if (this.#stopPromise !== null) return this.#stopPromise;
+		this.#stopPromise = this.#stopOnce();
+		return this.#stopPromise;
+	}
+
+	async #stopOnce() {
+		if (this.#closed) return;
 		this.#stopping = true;
 		this.#connected = false;
 		this.#setVerboseEnabled(false);
@@ -2770,10 +2777,15 @@ function createLocalSpeechFailover(localProvider, {
 		if (error?.name === 'AbortError' || signal?.aborted) throw error;
 		const ttsUsable = ttsReady || fishApiKey !== null || platform === 'win32';
 		const sttUsable = sttReady || deepgramApiKey !== null;
-		if (!ttsUsable && !sttUsable) throw error;
 		if (!ttsReady && !sttReady) {
+			if (!ttsUsable && !sttUsable) throw error;
 			await closeLocal();
 			throwIfVoiceStartupAborted(signal);
+			await Promise.all([
+				switchTtsToFallback(error, signal, true),
+				switchSttToFallback(error, signal, true),
+			]);
+			return;
 		}
 		await Promise.all([
 			ttsReady ? undefined : switchTtsToFallback(error, signal, true),
@@ -2844,6 +2856,21 @@ function createLocalSpeechFailover(localProvider, {
 					throw new TypeError('local speech warmup must return channel readiness');
 				}
 				if (readiness.sttReady && readiness.ttsReady) return;
+				const retryLocalOnlyChannel = (!readiness.sttReady && deepgramApiKey === null)
+						|| (!readiness.ttsReady && fishApiKey === null && platform !== 'win32');
+				if (retryLocalOnlyChannel && (readiness.sttReady || readiness.ttsReady)) {
+					try {
+						const retried = await localProvider.warmup({ signal });
+						if (retried === null || typeof retried !== 'object'
+								|| typeof retried.sttReady !== 'boolean' || typeof retried.ttsReady !== 'boolean') {
+							throw new TypeError('local speech warmup must return channel readiness');
+						}
+						readiness = retried;
+					} catch (error) {
+						if (error?.name === 'AbortError' || signal?.aborted) throw error;
+					}
+					if (readiness.sttReady && readiness.ttsReady) return;
+				}
 				const error = Object.assign(new Error('Local speech warmup did not initialize every channel'), {
 					code: 'LOCAL_SPEECH_WARMUP_FAILED',
 				});

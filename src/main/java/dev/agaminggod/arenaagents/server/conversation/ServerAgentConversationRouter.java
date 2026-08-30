@@ -21,8 +21,10 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.function.Consumer;
 import net.minecraft.network.chat.Component;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.level.Level;
 
 public final class ServerAgentConversationRouter implements AgentConversationRouter {
 	public static final double DEFAULT_PROXIMITY_RANGE = 48.0D;
@@ -156,20 +158,39 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 	}
 
 	public DeliveryReceipt deliverPlayerProximitySpeech(ServerPlayer source, String text, double range) {
+		return deliverPlayerProximitySpeech(capturePlayerProximitySpeechAudience(source, range), text);
+	}
+
+	public ProximitySpeechAudience capturePlayerProximitySpeechAudience(ServerPlayer source, double range) {
 		Objects.requireNonNull(source, "source must not be null");
 		if (!Double.isFinite(range) || range <= 0.0D || range > 128.0D) {
 			throw new IllegalArgumentException("Speech range must be between 0 and 128 blocks");
 		}
-		ArrayList<String> delivered = new ArrayList<>();
+		ArrayList<AgentId> recipients = new ArrayList<>();
 		double rangeSquared = range * range;
 		for (OnlineParticipant participant : onlineParticipants(source)) {
 			AgentRecord target = participant.agentRecord();
 			if (target == null || participant.player() == source) continue;
 			if (participant.player().level() != source.level()
 					|| source.distanceToSqr(participant.player()) > rangeSquared) continue;
+			recipients.add(target.agentId());
+		}
+		return new ProximitySpeechAudience(source.getUUID(), source.level().dimension(), recipients);
+	}
+
+	public DeliveryReceipt deliverPlayerProximitySpeech(ProximitySpeechAudience audience, String text) {
+		Objects.requireNonNull(audience, "audience must not be null");
+		ServerLevel sourceLevel = manager.server().getLevel(audience.sourceDimension());
+		if (sourceLevel == null) return new DeliveryReceipt(List.of(), List.of());
+		Map<AgentId, AgentRecord> currentRecords = new LinkedHashMap<>();
+		for (AgentRecord record : manager.records()) currentRecords.put(record.agentId(), record);
+		ArrayList<String> delivered = new ArrayList<>();
+		for (AgentId recipientId : audience.recipientAgentIds()) {
+			AgentRecord target = currentRecords.get(recipientId);
+			if (target == null) continue;
 			publishToAgent(target, new ConversationEvent(
 					target.agentId(),
-					source.getUUID().toString(),
+					audience.sourcePlayerId().toString(),
 					target.agentId().toString(),
 					ConversationAudience.PROXIMITY,
 					ConversationKind.PROXIMITY_SPEECH,
@@ -177,11 +198,25 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 					target.goalRevision(),
 					System.currentTimeMillis(),
 					0L,
-					dimensionId(source)
-			), source.level());
+					audience.sourceDimension().identifier().toString()
+			), sourceLevel);
 			delivered.add(target.agentId().toString());
 		}
 		return new DeliveryReceipt(List.copyOf(delivered), List.of());
+	}
+
+	public record ProximitySpeechAudience(
+			UUID sourcePlayerId,
+			ResourceKey<Level> sourceDimension,
+			List<AgentId> recipientAgentIds
+	) {
+		public ProximitySpeechAudience {
+			Objects.requireNonNull(sourcePlayerId, "sourcePlayerId must not be null");
+			Objects.requireNonNull(sourceDimension, "sourceDimension must not be null");
+			recipientAgentIds = List.copyOf(Objects.requireNonNull(
+					recipientAgentIds, "recipientAgentIds must not be null"
+			));
+		}
 	}
 
 	@Override

@@ -1,14 +1,17 @@
 package dev.agaminggod.arenaagents.server.runtime.controller;
 
-import dev.agaminggod.arenaagents.server.OfflineAgentPlayers;
+import dev.agaminggod.arenaagents.server.runtime.ElapsedTimeAccumulator;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputStates;
 import dev.agaminggod.arenaagents.server.runtime.input.InputLease;
 import dev.agaminggod.arenaagents.server.runtime.input.InputOwner;
 import dev.agaminggod.arenaagents.server.runtime.input.LeasedServerInputController;
+import dev.agaminggod.arenaagents.server.runtime.transaction.ServerTransactionAdapter;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.Vec3;
 
 import java.util.Objects;
@@ -22,7 +25,8 @@ public final class ServerCombatController implements ServerController {
 
 	private final Entity target;
 	private final CombatIntent intent;
-	private final long startedAt;
+	private final ElapsedTimeAccumulator elapsedTime;
+	private final ResourceKey<Level> startingDimension;
 	private final CombatPolicy policy = new CombatPolicy();
 	private ServerNavigationController navigation;
 	private Vec3 navigationTarget;
@@ -32,15 +36,21 @@ public final class ServerCombatController implements ServerController {
 	public ServerCombatController(Entity target, CombatIntent intent, long startedAt) {
 		this.target = Objects.requireNonNull(target, "target must not be null");
 		this.intent = Objects.requireNonNull(intent, "intent must not be null");
-		this.startedAt = startedAt;
+		this.elapsedTime = new ElapsedTimeAccumulator(startedAt);
+		this.startingDimension = target.level().dimension();
 	}
 
 	@Override
 	public TickResult tick(ServerPlayer player, long nowEpochMs) {
+		if (!remainsInDimension(startingDimension, player.level().dimension())) {
+			return failed(player, "ACTION_DIMENSION_CHANGED",
+					"Agent player changed dimension during combat");
+		}
+		long elapsedMs = elapsedTime.advance(nowEpochMs);
 		if (!player.isAlive()) {
 			return failed(player, "AGENT_DEAD", "Agent player died");
 		}
-		if (Math.max(0L, nowEpochMs - startedAt) >= intent.timeoutMs()) {
+		if (elapsedMs >= intent.timeoutMs()) {
 			return failed(player, "ACTION_TIMED_OUT", "Controller action timed out");
 		}
 		boolean targetAlive = target.isAlive() && !target.isRemoved();
@@ -86,13 +96,14 @@ public final class ServerCombatController implements ServerController {
 				applyCombatInput(player, true, nowEpochMs);
 				yield TickResult.running(progress(distance));
 			}
-			case APPROACH -> navigate(player, target.position(), policyRange, true, nowEpochMs, distance);
+			case APPROACH -> navigate(player, target.position(), policyRange, true, nowEpochMs, elapsedMs, distance);
 			case RETREAT -> navigate(
 					player,
 					retreatDestination(player.position(), target.position(), intent.desiredRange(), distance),
 					1.25D,
 					true,
 					nowEpochMs,
+					elapsedMs,
 					distance
 			);
 		};
@@ -100,10 +111,11 @@ public final class ServerCombatController implements ServerController {
 
 	@Override
 	public void cancel(ServerPlayer player) {
-		stopNavigation(player);
-		releaseCombat(player);
-		motorState = null;
-		OfflineAgentPlayers.stop(player);
+		ServerTransactionAdapter.runBestEffort(
+				() -> stopNavigation(player),
+				() -> releaseCombat(player),
+				() -> motorState = null
+		);
 	}
 
 	private TickResult navigate(
@@ -112,6 +124,7 @@ public final class ServerCombatController implements ServerController {
 			double tolerance,
 			boolean sprint,
 			long nowEpochMs,
+			long elapsedMs,
 			double targetDistance
 	) {
 		releaseCombat(player);
@@ -119,7 +132,7 @@ public final class ServerCombatController implements ServerController {
 				|| navigationTarget.distanceToSqr(destination) > PURSUIT_REPLAN_DISTANCE_SQUARED) {
 			stopNavigation(player);
 			navigationTarget = destination;
-			long remainingTimeout = Math.max(1_000L, intent.timeoutMs() - Math.max(0L, nowEpochMs - startedAt));
+			long remainingTimeout = remainingNavigationTimeout(intent.timeoutMs(), elapsedMs);
 			navigation = new ServerNavigationController(
 					destination,
 					Math.max(0.5D, tolerance),
@@ -141,6 +154,15 @@ public final class ServerCombatController implements ServerController {
 		return navigationResult.state() == State.FAILED
 				? navigationResult
 				: TickResult.running(combatProgress);
+	}
+
+	static boolean remainsInDimension(ResourceKey<Level> startingDimension, ResourceKey<Level> currentDimension) {
+		return ServerNavigationController.remainsInDimension(startingDimension, currentDimension);
+	}
+
+	static long remainingNavigationTimeout(long timeoutMs, long elapsedMs) {
+		if (timeoutMs <= 0L || elapsedMs < 0L) throw new IllegalArgumentException("invalid timeout state");
+		return Math.max(1_000L, timeoutMs - elapsedMs);
 	}
 
 	private void stopNavigation(ServerPlayer player) {
@@ -192,7 +214,7 @@ public final class ServerCombatController implements ServerController {
 		if (combatLease == null) return;
 		try {
 			AgentInputRuntime.controller(player).release(combatLease);
-		} catch (IllegalStateException ignored) {
+		} catch (LeasedServerInputController.StaleInputLeaseException ignored) {
 			// A lifecycle clear may already have invalidated every lease.
 		}
 		combatLease = null;

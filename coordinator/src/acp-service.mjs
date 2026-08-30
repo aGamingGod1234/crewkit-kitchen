@@ -215,13 +215,22 @@ class AcpAgent {
 	matchesProfile(profile) { return profilesMatch(this.#profile, profile); }
 
 	async start(cwd) {
+		this.#assertAvailable();
 		await this.#transport.start();
+		this.#assertAvailable();
 		const initialized = await this.#transport.request('initialize', { protocolVersion: 1, clientCapabilities: CLIENT_CAPABILITIES, clientInfo: CLIENT_INFO });
+		this.#assertAvailable();
 		if (initialized?.protocolVersion !== 1) throw new AcpProtocolError('UNSUPPORTED_PROTOCOL', `${this.provider} ACP did not negotiate protocol version 1`);
 		const session = await this.#transport.request('session/new', { cwd, mcpServers: [] });
+		this.#assertAvailable();
 		if (typeof session?.sessionId !== 'string' || session.sessionId.length === 0) throw new AcpProtocolError('INVALID_SESSION', `${this.provider} ACP session/new returned no sessionId`);
 		this.#sessionId = session.sessionId;
 		await this.#applyConfig(session.configOptions ?? []);
+		this.#assertAvailable();
+	}
+
+	#assertAvailable() {
+		if (this.#disposed) throw this.#invalidationError ?? new AcpProtocolError('AGENT_DISPOSED', `${this.provider} agent '${this.agentId}' is disposed`);
 	}
 
 	async #applyConfig(configOptions) {
@@ -355,7 +364,11 @@ class AcpAgent {
 		}
 	}
 
-	interrupt() { if (this.#sessionId !== null) this.#transport.notify('session/cancel', { sessionId: this.#sessionId }); }
+	interrupt() {
+		if (this.#sessionId === null) return;
+		try { this.#transport.notify('session/cancel', { sessionId: this.#sessionId }); }
+		catch { /* cancellation is best effort; the bounded turn remains authoritative */ }
+	}
 	async dispose() { if (this.#disposed) return; this.#disposed = true; if (this.#active) this.interrupt(); await this.#transport.stop(); }
 	invalidateTransport(error) {
 		if (this.#invalidationError !== null) return;

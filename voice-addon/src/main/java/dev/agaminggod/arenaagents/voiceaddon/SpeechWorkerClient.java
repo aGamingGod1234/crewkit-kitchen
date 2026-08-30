@@ -11,11 +11,15 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.time.Duration;
 import java.util.Locale;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 
 final class SpeechWorkerClient {
 	private static final int MAX_SAMPLES = 48_000 * 20;
+	private static final Set<String> STT_WORKER_ERROR_CODES = Set.of(
+			"STT_CAPACITY", "STT_RATE_LIMITED", "STT_UNAVAILABLE"
+	);
 	private final HttpClient client;
 	private final URI endpoint;
 	private final String secret;
@@ -114,9 +118,9 @@ final class SpeechWorkerClient {
 		if (contentType.equals("application/json")) {
 			try {
 				JsonObject payload = JsonParser.parseString(response.body()).getAsJsonObject();
-				if (payload.has("code") && payload.get("code").isJsonPrimitive()
-						&& payload.get("code").getAsString().equals("STT_UNAVAILABLE")) {
-					code = "STT_UNAVAILABLE";
+				if (payload.has("code") && payload.get("code").isJsonPrimitive()) {
+					String candidate = payload.get("code").getAsString();
+					if (STT_WORKER_ERROR_CODES.contains(candidate)) code = candidate;
 				}
 			} catch (RuntimeException ignored) {
 				// Invalid error bodies remain a generic bounded HTTP failure.

@@ -97,6 +97,38 @@ test('urgent turns lead ordinary turns but ordinary work is admitted after a bou
 	assert.deepEqual(started.slice(0, 5), ['bootstrap', 'urgent-0', 'urgent-1', 'urgent-2', 'ordinary']);
 });
 
+test('the reserved urgent slot remains usable after the bounded urgent burst', async () => {
+	const scheduler = new PlanningScheduler({
+		planningMode: 'adaptive',
+		maxConcurrent: 4,
+		maxPending: 12,
+		urgentReserve: 1,
+		maxUrgentBurst: 3,
+	});
+	const ordinaryGates = Array.from({ length: 4 }, () => deferred());
+	const ordinaryRuns = ordinaryGates.slice(0, 3).map((gate, index) =>
+		scheduler.schedule(`ordinary-${index}`, () => gate.promise));
+	const queuedOrdinary = scheduler.schedule('ordinary-queued', () => ordinaryGates[3].promise);
+	const urgentGates = Array.from({ length: 4 }, () => deferred());
+	const started = [];
+	const urgentRuns = urgentGates.map((gate, index) => scheduler.schedule(`urgent-${index}`, () => {
+		started.push(index);
+		return gate.promise;
+	}, { priority: 'urgent' }));
+
+	await Promise.resolve();
+	for (let index = 0; index < 3; index += 1) {
+		urgentGates[index].resolve();
+		await new Promise((resolve) => setImmediate(resolve));
+	}
+	const observed = [...started];
+	for (const gate of ordinaryGates) gate.resolve();
+	urgentGates[3].resolve();
+	await Promise.allSettled([...ordinaryRuns, queuedOrdinary, ...urgentRuns]);
+
+	assert.deepEqual(observed, [0, 1, 2, 3]);
+});
+
 test('scheduler permits at most one active or pending turn per agent', async () => {
 	const scheduler = new PlanningScheduler({ maxConcurrent: 1 });
 	const gate = deferred();

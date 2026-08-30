@@ -7,6 +7,10 @@ public final class AgentRecoverySpawnPolicyVerification {
 	private AgentRecoverySpawnPolicyVerification() {
 	}
 
+	public static void main(String[] args) {
+		System.out.println("PASS: " + verify() + " recovery policy assertions");
+	}
+
 	public static int verify() {
 		int assertions = 0;
 		AgentRecoverySpawnPolicy.Column unsafeWater = new AgentRecoverySpawnPolicy.Column(
@@ -55,6 +59,13 @@ public final class AgentRecoverySpawnPolicyVerification {
 		assertEquals(OptionalInt.empty(), AgentRecoverySpawnPolicy.selectNearestSafeY(
 				64, -64, 319, y -> y == 128),
 				"recovery rejects safe-looking terrain outside the bounded persisted-height search");
+		assertions++;
+
+		CodexAgentManager.RecoveryAttemptGate attemptGate = new CodexAgentManager.RecoveryAttemptGate();
+		assertEquals(true, attemptGate.tryClaim(), "the first missing agent can claim this tick's recovery attempt");
+		assertions++;
+		assertEquals(false, attemptGate.tryClaim(),
+				"a failed first recovery still consumes the tick budget and prevents recovery fan-out");
 		assertions++;
 		return assertions;
 	}

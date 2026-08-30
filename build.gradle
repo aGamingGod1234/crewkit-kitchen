@@ -71,20 +71,90 @@ def coordinatorRuntimeIncludes = [
 	'src/**',
 	'node_modules/acorn/**',
 ]
+def coordinatorDirectory = layout.projectDirectory.dir('coordinator')
+def coordinatorPackageJson = coordinatorDirectory.file('package.json')
+def coordinatorPackageLock = coordinatorDirectory.file('package-lock.json')
+def coordinatorAcornDirectory = coordinatorDirectory.dir('node_modules/acorn')
+def coordinatorAcornPackage = coordinatorDirectory.file('node_modules/acorn/package.json')
+def coordinatorAcornModule = coordinatorDirectory.file('node_modules/acorn/dist/acorn.mjs')
 def coordinatorManifest = layout.buildDirectory.file('generated/coordinator/coordinator-manifest.txt')
+def isWindowsHost = System.getProperty('os.name', '').toLowerCase(Locale.ROOT).contains('win')
+def nodeRuntimeInstaller = layout.projectDirectory.file('scripts/install-node-runtime.ps1')
+def bundledNodeRuntime = layout.projectDirectory.dir('runtime/toolchains/node')
+
+tasks.register('assembleWindowsNodeRuntime', Exec) {
+	group = 'build setup'
+	description = 'Downloads and verifies the pinned Windows Node.js runtime for the standalone distribution.'
+	onlyIf { isWindowsHost }
+	commandLine 'powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+			nodeRuntimeInstaller.asFile.absolutePath, '-ProjectRoot', layout.projectDirectory.asFile.absolutePath
+	inputs.file(nodeRuntimeInstaller)
+	outputs.dir(bundledNodeRuntime)
+}
+
+if (isWindowsHost) {
+	tasks.named('build') {
+		dependsOn tasks.named('assembleWindowsNodeRuntime')
+	}
+}
+
+tasks.register('installCoordinatorProductionDependencies', Exec) {
+	group = 'build setup'
+	description = 'Installs the coordinator production dependencies exactly as locked for packaging.'
+	workingDir coordinatorDirectory
+	def isWindows = isWindowsHost
+	def npmExecutable = isWindows ? 'npm.cmd' : 'npm'
+	commandLine npmExecutable, 'ci', '--ignore-scripts', '--omit=dev'
+	ignoreExitValue = true
+	inputs.files(coordinatorPackageJson, coordinatorPackageLock)
+			.withPathSensitivity(PathSensitivity.RELATIVE)
+	outputs.dir(coordinatorAcornDirectory)
+
+	doFirst {
+		def path = System.getenv('PATH')
+		def available = path != null && path
+				.split(java.util.regex.Pattern.quote(File.pathSeparator))
+				.find { entry ->
+					def executable = new File(entry, npmExecutable)
+					!entry.isBlank() && executable.isFile() && (isWindows || executable.canExecute())
+				}
+		if (!available) {
+			throw new GradleException(
+					'Coordinator packaging requires npm on PATH to install locked production dependencies.'
+			)
+		}
+	}
+
+	doLast {
+		if (executionResult.get().exitValue != 0) {
+			throw new GradleException('Coordinator packaging failed because npm ci did not complete successfully.')
+		}
+		def missing = [coordinatorAcornPackage, coordinatorAcornModule]
+				.collect { it.asFile }
+				.findAll { !it.isFile() }
+		if (!missing.isEmpty()) {
+			throw new GradleException(
+					'Coordinator packaging failed because npm ci did not install the required Acorn runtime.'
+			)
+		}
+	}
+}
 
 tasks.register('generateCoordinatorManifest') {
 	group = 'build'
 	description = 'Generates the deterministic runtime coordinator file manifest.'
-	inputs.dir(layout.projectDirectory.dir('coordinator'))
+	dependsOn tasks.named('installCoordinatorProductionDependencies')
+	inputs.files(fileTree(coordinatorDirectory) {
+		coordinatorRuntimeIncludes.each { include it }
+	}).withPathSensitivity(PathSensitivity.RELATIVE)
 	outputs.file(coordinatorManifest)
 
 	doLast {
-		def coordinatorDirectory = layout.projectDirectory.dir('coordinator').asFile
-		def files = fileTree(coordinatorDirectory) {
+		def coordinatorRoot = coordinatorDirectory.asFile
+		def files = fileTree(coordinatorRoot) {
 			coordinatorRuntimeIncludes.each { include it }
 		}.files
-		def prefixLength = coordinatorDirectory.absolutePath.length() + 1
+		def prefixLength = coordinatorRoot.absolutePath.length() + 1
 		def entries = files
 			.collect {
 				def path = it.absolutePath.substring(prefixLength).replaceAll('\\\\', '/')

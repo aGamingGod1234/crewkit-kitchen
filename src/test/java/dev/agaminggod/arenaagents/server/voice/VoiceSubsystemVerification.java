@@ -2,6 +2,7 @@ package dev.agaminggod.arenaagents.server.voice;
 
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.server.CodexAgentServerRuntime;
+import dev.agaminggod.arenaagents.server.conversation.ServerAgentConversationRouter;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -35,6 +36,14 @@ public final class VoiceSubsystemVerification {
 		if (!CodexAgentServerRuntime.deliverHumanSpeech(null, humanPlayer, "must stay private", false)
 				.deliveredIds().isEmpty()) {
 			throw new AssertionError("Revoked consent must fence buffered or in-flight speech delivery");
+		}
+		assertions++;
+		var capturedAudience = new ServerAgentConversationRouter.ProximitySpeechAudience(
+				humanPlayer, net.minecraft.world.level.Level.OVERWORLD, List.of(firstAgentId())
+		);
+		if (!CodexAgentServerRuntime.deliverHumanSpeech(null, capturedAudience, "still private")
+				.deliveredIds().isEmpty()) {
+			throw new AssertionError("Revoked consent must fence delivery through a captured speech-time audience");
 		}
 		assertions++;
 		if (VoiceConsentRegistry.captureWhileGranted(null, humanPlayer, () -> {
@@ -87,6 +96,10 @@ public final class VoiceSubsystemVerification {
 			throw new AssertionError("Shutdown must unregister the remaining channel");
 		}
 		return assertions + 1 + VoiceSubsystemRuntimeVerification.verify();
+	}
+
+	private static AgentId firstAgentId() {
+		return AgentId.parse("00000000-0000-0000-0000-000000000001");
 	}
 
 	private static final class RecordingSubsystem implements VoiceSubsystem {

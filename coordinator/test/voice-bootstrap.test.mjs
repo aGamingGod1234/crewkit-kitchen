@@ -472,7 +472,8 @@ test('runtime local TTS failures switch concurrent requests once to Fish while l
 		const responses = await Promise.all([request('first request', 1), request('second request', 2)]);
 		assert.deepEqual(responses.map(({ status }) => status), [200, 200], 'the failed local requests recover in the same HTTP attempts');
 		assert.equal(fishProviders, 1, 'concurrent local failures create one shared fallback provider');
-		assert.equal(localTtsCalls, 2);
+		assert.ok(localTtsCalls >= 1 && localTtsCalls <= 2,
+			'the first local failure may switch routing before the second request reaches the local provider');
 		assert.equal(fishCalls, 2);
 		assert.equal(localCloses, 0, 'local speech remains alive for STT after a TTS-only failover');
 		assert.equal((await local.transcribe()).transcript, 'local hearing remains active');
@@ -888,6 +889,48 @@ test('TTS-only warmup failure keeps ready local STT while routing speech to Fish
 		assert.equal((await active.provider.synthesize({ text: 'hello' })).provider, 'fish');
 		assert.equal((await active.sttProvider.transcribe({ pcm: Buffer.alloc(2) })).transcript, 'local Whisper stayed ready');
 		assert.equal(localCloses, 0, 'the shared worker remains owned by the ready STT channel');
+	} finally {
+		await worker.close();
+	}
+	assert.equal(localCloses, 1);
+});
+
+test('STT-only warmup failure keeps ready local TTS while routing speech to Deepgram', async () => {
+	let active;
+	let localCloses = 0;
+	let deepgramProviders = 0;
+	let warmupCalls = 0;
+	const local = {
+		async warmup() {
+			warmupCalls += 1;
+			return { sttReady: false, ttsReady: true };
+		},
+		async synthesize() { return { provider: 'local' }; },
+		async transcribe() { throw new Error('failed local STT must not receive traffic'); },
+		async close() { localCloses += 1; },
+	};
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {
+		DEEPGRAM_API_KEY: 'deepgram-key',
+	}, {
+		platform: 'linux',
+		createLocalSpeechProvider: async () => local,
+		loadProfileStore: async () => ({ store: { resolve() {} } }),
+		createSttProvider: () => {
+			deepgramProviders += 1;
+			return { async transcribe() { return { transcript: 'deepgram', confidence: 1 }; } };
+		},
+		createVoiceServer: (options) => {
+			active = options;
+			return { async start() {}, async close() {} };
+		},
+	});
+	try {
+		await worker.warmup();
+		assert.equal(warmupCalls, 1, 'a configured external STT fallback does not wait on a local-only retry');
+		assert.equal(deepgramProviders, 1);
+		assert.equal((await active.provider.synthesize({ text: 'hello' })).provider, 'local');
+		assert.equal((await active.sttProvider.transcribe({ pcm: Buffer.alloc(2) })).transcript, 'deepgram');
+		assert.equal(localCloses, 0, 'the ready local TTS channel retains the shared worker');
 	} finally {
 		await worker.close();
 	}

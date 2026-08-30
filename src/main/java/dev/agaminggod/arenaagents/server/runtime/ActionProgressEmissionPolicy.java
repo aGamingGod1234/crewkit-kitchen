@@ -5,7 +5,7 @@ final class ActionProgressEmissionPolicy {
 	private final long heartbeatMs;
 	private boolean emitted;
 	private double lastProgress;
-	private long lastEmittedAt;
+	private ElapsedTimeAccumulator timeSinceEmission;
 
 	ActionProgressEmissionPolicy(double materialDelta, long heartbeatMs) {
 		if (!Double.isFinite(materialDelta) || materialDelta <= 0.0D || materialDelta > 1.0D || heartbeatMs <= 0L) {
@@ -19,14 +19,14 @@ final class ActionProgressEmissionPolicy {
 		if (!Double.isFinite(progress) || progress < 0.0D || progress > 1.0D || nowEpochMs < 0L) {
 			throw new IllegalArgumentException("invalid action progress sample");
 		}
-		if (emitted && nowEpochMs < lastEmittedAt) throw new IllegalArgumentException("action progress clock moved backwards");
+		long elapsedSinceEmission = emitted ? timeSinceEmission.advance(nowEpochMs) : 0L;
 		boolean shouldEmit = !emitted
 				|| progress >= lastProgress + materialDelta
-				|| nowEpochMs - lastEmittedAt >= heartbeatMs;
+				|| elapsedSinceEmission >= heartbeatMs;
 		if (shouldEmit) {
 			emitted = true;
 			lastProgress = Math.max(lastProgress, progress);
-			lastEmittedAt = nowEpochMs;
+			timeSinceEmission = new ElapsedTimeAccumulator(nowEpochMs);
 		}
 		return shouldEmit;
 	}

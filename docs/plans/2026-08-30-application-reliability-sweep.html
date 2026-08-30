@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agent Arena reliability sweep</title>
+  <style>
+    :root { color-scheme: dark; --bg: #0b0d10; --panel: #14181d; --line: #29313a; --text: #eef2f5; --muted: #9aa6b2; --accent: #7dd3a7; --warn: #f0bf68; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.55 system-ui, sans-serif; }
+    main { width: min(760px, calc(100% - 32px)); margin: 0 auto; padding: 48px 0 64px; }
+    h1 { margin: 0 0 8px; font-size: clamp(2rem, 7vw, 3.4rem); line-height: 1.03; letter-spacing: -0.04em; }
+    h2 { margin: 32px 0 12px; font-size: 1rem; color: var(--accent); text-transform: uppercase; letter-spacing: .12em; }
+    p { margin: 0 0 12px; }
+    .lede { max-width: 60ch; color: var(--muted); font-size: 1.08rem; }
+    .meta { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 20px; color: var(--muted); font-size: .9rem; }
+    .meta span { border: 1px solid var(--line); border-radius: 999px; padding: 5px 10px; }
+    ol, ul { margin: 0; padding-left: 1.25rem; }
+    li { margin: 8px 0; }
+    .note { margin-top: 28px; padding: 16px 18px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+    .note strong { color: var(--warn); }
+    code { color: #c6e7d5; font: .9em ui-monospace, monospace; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Agent Arena reliability sweep</h1>
+    <p class="lede">Find reproducible failures across the coordinator, Minecraft runtime, proximity voice, client controls, and their shared boundaries. Fix the highest-value issues and leave focused regression coverage.</p>
+    <div class="meta"><span>Completed 30 Aug 2026</span><span>9 parallel audits</span><span>Status: verified</span></div>
+
+    <h2>Scope</h2>
+    <ul>
+      <li>Coordinator lifecycle, scheduling, provider handling, and ArenaScript execution</li>
+      <li>Protocol framing, reconnects, ordering, backpressure, and malformed input</li>
+      <li>Agent persistence, server restarts, action cancellation, navigation, combat, and perception</li>
+      <li>Client control state and proximity voice lifecycle</li>
+      <li>Build, CI, platform behavior, resource cleanup, and missing reliability tests</li>
+    </ul>
+
+    <h2>Method</h2>
+    <ol>
+      <li>Fetch GitHub and preserve local work.</li>
+      <li>Run independent read-only audits with file ownership split by subsystem.</li>
+      <li>Reproduce findings with short deterministic tests. Reject findings that code or tests disprove.</li>
+      <li>Fix severe and likely failures with the smallest safe changes.</li>
+      <li>Run subsystem tests, full coordinator tests, Gradle verification, and diff checks.</li>
+      <li>Review the final patch for cross-system regressions and report deferred risks.</li>
+    </ol>
+
+    <h2>Decisions</h2>
+    <ul>
+      <li>Existing staged and untracked files remain protected unless a verified fix must touch them.</li>
+      <li>No visual application control or live multiplayer interaction without explicit permission.</li>
+      <li>Tests must catch a named failure, not merely add broad smoke coverage.</li>
+      <li>High-impact correctness, recovery, and resource leaks outrank cosmetic cleanup.</li>
+    </ul>
+
+    <h2>Result</h2>
+    <ul>
+      <li>Fixed terminal-result replay loss, stale cancellation mutation, lexical-scope crashes, scheduler starvation, completion retry exhaustion, and incomplete shutdown waiting.</li>
+      <li>Made action cleanup recoverable, input leases transactional, timeouts safe across clock rollback, cross-dimension actions fenced, and failed inventory interactions reversible.</li>
+      <li>Isolated multiplayer speech backoff, preserved provider rate-limit signals, made voice warmup degrade per channel, and retained speech-time audience boundaries.</li>
+      <li>Preserved client preferences and scenario rosters through fallback catalogs, blocked stale launches, and removed unsafe unnamed-summon auto-selection.</li>
+      <li>Added locked coordinator dependencies, pinned verified Node.js packaging, transactional distribution updates, omitted verification groups, and Windows/Linux reliability CI.</li>
+      <li>From a clean checkout: 1,221 coordinator tests passed with 2 intentional skips, 14,290 core/protocol/bridge assertions passed, and 277 voice-addon assertions passed.</li>
+      <li>The CI-equivalent Java 25 package build passed, all 119 embedded coordinator files were verified, and distribution rollback plus startup preflight checks passed.</li>
+    </ul>
+
+    <div class="note"><strong>Complete:</strong> all validated findings selected by the reliability sweep were implemented and verified. Unrelated local work remains preserved outside the pull request.</div>
+  </main>
+</body>
+</html>

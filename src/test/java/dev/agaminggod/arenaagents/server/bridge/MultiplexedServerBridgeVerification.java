@@ -205,7 +205,10 @@ public final class MultiplexedServerBridgeVerification {
 				assertTrue(ledger.retain(result), "terminal result is retained before the coordinator closes");
 				assertTrue(ledger.claim(result, session(bridge)), "first session owns the initial result delivery");
 				bridge.tick();
-				assertTrue(!firstReader.ready(), "claimed terminal result is not replayed twice on the first session");
+				assertNoActionResult(
+						first, firstReader, codec, result.actionId(),
+						"claimed terminal result is not replayed twice on the first session"
+				);
 			}
 
 			MultiplexedServerBridge activeBridge = bridge;
@@ -2765,6 +2768,37 @@ public final class MultiplexedServerBridgeVerification {
 	private static void writeEnvelope(Socket socket, BridgeEnvelopeCodec codec, BridgeEnvelope envelope) throws Exception {
 		socket.getOutputStream().write(codec.encode(envelope).getBytes(StandardCharsets.UTF_8));
 		socket.getOutputStream().flush();
+	}
+
+	private static void assertNoActionResult(
+			Socket socket,
+			BufferedReader reader,
+			BridgeEnvelopeCodec codec,
+			String actionId,
+			String label
+	) throws Exception {
+		int previousTimeout = socket.getSoTimeout();
+		long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(200L);
+		try {
+			while (System.nanoTime() < deadline) {
+				long remainingNanos = deadline - System.nanoTime();
+				socket.setSoTimeout((int) Math.max(1L, TimeUnit.NANOSECONDS.toMillis(remainingNanos)));
+				String line;
+				try {
+					line = reader.readLine();
+				} catch (SocketTimeoutException expected) {
+					return;
+				}
+				if (line == null) return;
+				BridgeEnvelope envelope = codec.decode(line);
+				if ("action_result".equals(envelope.type())
+						&& actionId.equals(envelope.payload().get("actionId").getAsString())) {
+					throw new AssertionError(label);
+				}
+			}
+		} finally {
+			socket.setSoTimeout(previousTimeout);
+		}
 	}
 
 	private static void verifyObservationPublicationLifecycle(AgentId agent) {

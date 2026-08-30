@@ -16,7 +16,10 @@ public final class ResourceLeaseManager {
 		Lease current = leases.get(key);
 		if (current != null && !current.owner().equals(owner)) return false;
 		if (current == null && leases.size() >= MAX_LEASES) return false;
-		leases.put(key, new Lease(Objects.requireNonNull(owner), nowEpochMs + Math.clamp(requestedMs, 1L, MAX_LEASE_MS)));
+		leases.put(key, new Lease(
+				Objects.requireNonNull(owner),
+				new ElapsedTimeAccumulator(nowEpochMs),
+				Math.clamp(requestedMs, 1L, MAX_LEASE_MS)));
 		return true;
 	}
 
@@ -29,7 +32,7 @@ public final class ResourceLeaseManager {
 	}
 
 	public synchronized void cleanup(long nowEpochMs) {
-		leases.entrySet().removeIf(entry -> entry.getValue().expiresAtEpochMs() <= nowEpochMs);
+		leases.entrySet().removeIf(entry -> entry.getValue().expired(nowEpochMs));
 	}
 
 	public synchronized boolean isHeldBy(String resourceKey, AgentId owner, long nowEpochMs) {
@@ -43,5 +46,9 @@ public final class ResourceLeaseManager {
 		return value;
 	}
 
-	private record Lease(AgentId owner, long expiresAtEpochMs) { }
+	private record Lease(AgentId owner, ElapsedTimeAccumulator elapsed, long durationMs) {
+		private boolean expired(long nowEpochMs) {
+			return elapsed.advance(nowEpochMs) >= durationMs;
+		}
+	}
 }
