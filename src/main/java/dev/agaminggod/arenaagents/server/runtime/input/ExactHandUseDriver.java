@@ -4,9 +4,10 @@ import dev.agaminggod.arenaagents.agent.AgentId;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.Supplier;
 import net.minecraft.world.InteractionHand;
 
-/** Runs Carpet-compatible use-key repeats without Carpet's main-then-offhand fallback. */
+/** Runs exact-hand use with Carpet's combined use-before-attack arbitration. */
 final class ExactHandUseDriver {
 	static final int REPEAT_COOLDOWN_TICKS = 3;
 
@@ -23,15 +24,32 @@ final class ExactHandUseDriver {
 	}
 
 	void tick(AgentId agentId, InteractionHand hand, PlayerUseAccess player) {
+		executeUse(agentId, hand, player);
+	}
+
+	Boolean arbitrate(
+			AgentId agentId,
+			InteractionHand hand,
+			PlayerUseAccess player,
+			Supplier<Boolean> attack
+	) {
+		Objects.requireNonNull(attack, "attack must not be null");
+		if (executeUse(agentId, hand, player)) return null;
+		Boolean attackResult = attack.get();
+		if (Boolean.TRUE.equals(attackResult)) executeUse(agentId, hand, player);
+		return attackResult;
+	}
+
+	private boolean executeUse(AgentId agentId, InteractionHand hand, PlayerUseAccess player) {
 		Objects.requireNonNull(player, "player must not be null");
 		start(agentId, hand, player);
 		UseState state = states.get(agentId);
 		if (state.cooldownTicks > 0) {
 			state.cooldownTicks--;
-			return;
+			return true;
 		}
 		if (player.isUsingItem()) {
-			if (player.usedHand() == hand) return;
+			if (player.usedHand() == hand) return true;
 			player.releaseUsingItem();
 		}
 		TargetAttempt target = switch (Objects.requireNonNull(player.target(), "target must not be null")) {
@@ -43,9 +61,11 @@ final class ExactHandUseDriver {
 		if (target.consumed()) {
 			if (target.swing()) player.swing(hand);
 			state.cooldownTicks = REPEAT_COOLDOWN_TICKS;
-			return;
+			return true;
 		}
-		if (player.useItem(hand)) state.cooldownTicks = REPEAT_COOLDOWN_TICKS;
+		if (!player.useItem(hand)) return false;
+		state.cooldownTicks = REPEAT_COOLDOWN_TICKS;
+		return true;
 	}
 
 	void stop(AgentId agentId, PlayerUseAccess player) {

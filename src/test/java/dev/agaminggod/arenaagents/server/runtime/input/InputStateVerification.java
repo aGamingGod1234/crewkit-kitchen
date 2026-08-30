@@ -156,7 +156,90 @@ public final class InputStateVerification {
 				"hand switch starts the newly requested hand");
 		assertEquals(InteractionHand.OFF_HAND, switchHands.usedHand(), "offhand becomes the observed active hand");
 		driver.stop(AGENT, switchHands);
-		return 19;
+
+		int[] blockAttacks = {0};
+		RecordingUseAccess combinedBlock = RecordingUseAccess.target(
+				ExactHandUseDriver.TargetKind.BLOCK, true, false
+		);
+		Boolean blockResult = driver.arbitrate(
+				AGENT, InteractionHand.OFF_HAND, combinedBlock, () -> {
+					blockAttacks[0]++;
+					return true;
+				}
+		);
+		assertTrue(blockResult == null, "consumed exact-hand block use skips Carpet attack");
+		assertEquals(0, blockAttacks[0], "consumed exact-hand block use never calls the attack action");
+		driver.stop(AGENT, combinedBlock);
+
+		int[] entityAttacks = {0};
+		RecordingUseAccess combinedEntity = RecordingUseAccess.target(
+				ExactHandUseDriver.TargetKind.ENTITY, true, false
+		);
+		Boolean entityResult = driver.arbitrate(
+				AGENT, InteractionHand.OFF_HAND, combinedEntity, () -> {
+					entityAttacks[0]++;
+					return true;
+				}
+		);
+		assertTrue(entityResult == null, "consumed exact-hand entity use skips Carpet attack");
+		assertEquals(0, entityAttacks[0], "consumed exact-hand entity use never calls the attack action");
+		driver.stop(AGENT, combinedEntity);
+
+		RecordingUseAccess shield = RecordingUseAccess.item();
+		int[] shieldAttacks = {0};
+		Boolean raisedShield = driver.arbitrate(AGENT, InteractionHand.OFF_HAND, shield, () -> {
+			shieldAttacks[0]++;
+			return true;
+		});
+		assertTrue(raisedShield == null, "raising an offhand shield suppresses the combined attack");
+		assertEquals(0, shieldAttacks[0], "offhand shield prevents physical attack execution");
+		Boolean heldShield = driver.arbitrate(AGENT, InteractionHand.OFF_HAND, shield, () -> {
+			shieldAttacks[0]++;
+			return true;
+		});
+		assertTrue(heldShield == null, "held offhand shield keeps the combined attack suppressed");
+		assertEquals(0, shieldAttacks[0], "held offhand shield cannot attack during use cooldown");
+		driver.stop(AGENT, shield);
+		RecordingUseAccess releasedShield = RecordingUseAccess.target(
+				ExactHandUseDriver.TargetKind.BLOCK, false, false
+		);
+		Boolean resumedAttack = driver.arbitrate(AGENT, InteractionHand.OFF_HAND, releasedShield, () -> {
+			shieldAttacks[0]++;
+			return false;
+		});
+		assertEquals(Boolean.FALSE, resumedAttack, "failed use returns the retained continuous attack result");
+		assertEquals(1, shieldAttacks[0], "the same scheduled attack resumes after held use stops consuming");
+		driver.stop(AGENT, releasedShield);
+
+		RecordingUseAccess retry = RecordingUseAccess.targetAfterFailures(
+				ExactHandUseDriver.TargetKind.BLOCK, 1, false
+		);
+		Boolean retryResult = driver.arbitrate(AGENT, InteractionHand.MAIN_HAND, retry, () -> {
+			retry.events.add("attack");
+			return true;
+		});
+		assertEquals(Boolean.TRUE, retryResult, "failed use preserves Carpet's successful attack result");
+		assertEquals(2, retry.targetHands.size(), "successful attack retries exact-hand use before arbitration returns");
+		assertEquals(
+				List.of("block:MAIN_HAND", "item:MAIN_HAND", "attack", "block:MAIN_HAND"),
+				retry.events,
+				"combined arbitration performs use, attack, and retry in one synchronous update"
+		);
+		assertEquals(1L, retry.events.stream().filter("attack"::equals).count(),
+				"same-update exact-hand retry executes only one physical attack");
+		driver.stop(AGENT, retry);
+
+		RecordingUseAccess failedAttack = RecordingUseAccess.targetAfterFailures(
+				ExactHandUseDriver.TargetKind.BLOCK, 2, false
+		);
+		Boolean failedAttackResult = driver.arbitrate(
+				AGENT, InteractionHand.MAIN_HAND, failedAttack, () -> false
+		);
+		assertEquals(Boolean.FALSE, failedAttackResult, "failed Carpet attack result is preserved");
+		assertEquals(1, failedAttack.targetHands.size(), "failed attack does not trigger the post-attack use retry");
+		driver.stop(AGENT, failedAttack);
+		driver.discard(AGENT);
+		return 35;
 	}
 
 	private static int verifyBoundedMotor() {
@@ -260,20 +343,24 @@ public final class InputStateVerification {
 		private final List<InteractionHand> targetHands = new ArrayList<>();
 		private final List<InteractionHand> itemHands = new ArrayList<>();
 		private final List<InteractionHand> swingHands = new ArrayList<>();
+		private final List<String> events = new ArrayList<>();
 		private boolean usingItem;
 		private InteractionHand usedHand = InteractionHand.MAIN_HAND;
 		private int releaseCalls;
+		private int remainingTargetFailures;
 
 		private RecordingUseAccess(
 				ExactHandUseDriver.TargetKind targetKind,
 				boolean targetConsumes,
 				boolean targetSwings,
-				boolean itemConsumes
+				boolean itemConsumes,
+				int remainingTargetFailures
 		) {
 			this.targetKind = targetKind;
 			this.targetConsumes = targetConsumes;
 			this.targetSwings = targetSwings;
 			this.itemConsumes = itemConsumes;
+			this.remainingTargetFailures = remainingTargetFailures;
 		}
 
 		private static RecordingUseAccess target(
@@ -281,11 +368,19 @@ public final class InputStateVerification {
 				boolean consumes,
 				boolean swings
 		) {
-			return new RecordingUseAccess(kind, consumes, swings, false);
+			return new RecordingUseAccess(kind, consumes, swings, false, 0);
+		}
+
+		private static RecordingUseAccess targetAfterFailures(
+				ExactHandUseDriver.TargetKind kind,
+				int failures,
+				boolean swings
+		) {
+			return new RecordingUseAccess(kind, true, swings, false, failures);
 		}
 
 		private static RecordingUseAccess item() {
-			return new RecordingUseAccess(ExactHandUseDriver.TargetKind.MISS, false, false, true);
+			return new RecordingUseAccess(ExactHandUseDriver.TargetKind.MISS, false, false, true, 0);
 		}
 
 		@Override
@@ -312,6 +407,11 @@ public final class InputStateVerification {
 		@Override
 		public ExactHandUseDriver.TargetAttempt useBlock(InteractionHand hand) {
 			targetHands.add(hand);
+			events.add("block:" + hand);
+			if (remainingTargetFailures > 0) {
+				remainingTargetFailures--;
+				return ExactHandUseDriver.TargetAttempt.pass();
+			}
 			return !targetConsumes
 					? ExactHandUseDriver.TargetAttempt.pass()
 					: ExactHandUseDriver.TargetAttempt.consumed(targetSwings);
@@ -320,6 +420,11 @@ public final class InputStateVerification {
 		@Override
 		public ExactHandUseDriver.TargetAttempt useEntity(InteractionHand hand) {
 			targetHands.add(hand);
+			events.add("entity:" + hand);
+			if (remainingTargetFailures > 0) {
+				remainingTargetFailures--;
+				return ExactHandUseDriver.TargetAttempt.pass();
+			}
 			return !targetConsumes
 					? ExactHandUseDriver.TargetAttempt.pass()
 					: ExactHandUseDriver.TargetAttempt.consumed(targetSwings);
@@ -328,6 +433,7 @@ public final class InputStateVerification {
 		@Override
 		public boolean useItem(InteractionHand hand) {
 			itemHands.add(hand);
+			events.add("item:" + hand);
 			if (itemConsumes) {
 				usingItem = true;
 				usedHand = hand;

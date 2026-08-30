@@ -31,7 +31,11 @@ public final class CarpetInputStateSink implements InputStateSink {
 	@Override
 	public void apply(AgentId agentId, AgentInputState previous, AgentInputState state) {
 		ServerPlayer player = manager.findAgentPlayer(agentId).orElse(null);
-		if (player == null) return;
+		if (player == null) {
+			CarpetActionArbitration.unbind(agentId);
+			useDriver.discard(agentId);
+			return;
+		}
 		EntityPlayerActionPack actions = OfflineAgentPlayers.actions(player);
 		boolean resetActions = previous != null && (
 				(previous.jump() && !state.jump())
@@ -55,21 +59,36 @@ public final class CarpetInputStateSink implements InputStateSink {
 			actions.start(EntityPlayerActionPack.ActionType.ATTACK, EntityPlayerActionPack.Action.continuous());
 		}
 		if (state.use()) useDriver.start(agentId, state.hand(), useAccess);
+		if (state.use() && state.attack()) {
+			CarpetActionArbitration.bind(player, agentId, state.hand(), useDriver);
+		} else {
+			CarpetActionArbitration.unbind(agentId);
+		}
 	}
 
 	@Override
 	public void tick(AgentId agentId, AgentInputState state) {
-		if (!state.use()) return;
+		if (!state.use()) {
+			CarpetActionArbitration.unbind(agentId);
+			return;
+		}
 		ServerPlayer player = manager.findAgentPlayer(agentId).orElse(null);
 		if (player == null) {
+			CarpetActionArbitration.unbind(agentId);
 			useDriver.discard(agentId);
 			return;
 		}
+		if (state.attack()) {
+			CarpetActionArbitration.bind(player, agentId, state.hand(), useDriver);
+			return;
+		}
+		CarpetActionArbitration.unbind(agentId);
 		useDriver.tick(agentId, state.hand(), new MinecraftPlayerUseAccess(player));
 	}
 
 	@Override
 	public void clear(AgentId agentId, AgentInputState previous) {
+		CarpetActionArbitration.unbind(agentId);
 		ServerPlayer player = manager.findAgentPlayer(agentId).orElse(null);
 		if (player == null) {
 			useDriver.discard(agentId);
@@ -79,11 +98,11 @@ public final class CarpetInputStateSink implements InputStateSink {
 		}
 	}
 
-	private static final class MinecraftPlayerUseAccess implements ExactHandUseDriver.PlayerUseAccess {
+	static final class MinecraftPlayerUseAccess implements ExactHandUseDriver.PlayerUseAccess {
 		private final ServerPlayer player;
 		private HitResult target;
 
-		private MinecraftPlayerUseAccess(ServerPlayer player) {
+		MinecraftPlayerUseAccess(ServerPlayer player) {
 			this.player = player;
 		}
 
