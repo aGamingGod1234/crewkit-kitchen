@@ -2285,14 +2285,21 @@ public final class MultiplexedServerBridgeVerification {
 			MultiplexedServerBridge activeBridge = bridge;
 			assertTrue(!activeBridge.observationPublicationForVerification().hasActiveSession(),
 					"bridge starts without an accepted session");
-			try (Socket unauthenticated = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, activeBridge.boundPortForVerification());
-				 Socket authenticated = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, activeBridge.boundPortForVerification());
-				 BufferedReader reader = new BufferedReader(new InputStreamReader(authenticated.getInputStream(), StandardCharsets.UTF_8))) {
+			try (Socket unauthenticated = new Socket(
+					MultiplexedServerBridge.LOOPBACK_HOST, activeBridge.boundPortForVerification())) {
+				awaitCondition(() -> preauthSessionCount(activeBridge) == 1,
+						"silent candidate is admitted before the authenticated connection starts");
 				assertTrue(!activeBridge.observationPublicationForVerification().hasActiveSession(),
 						"an unauthenticated socket cannot claim the primary publication session");
-				authenticate(authenticated, reader, new BridgeEnvelopeCodec(), secret, null, "hello-after-silent-candidate");
-				awaitCondition(activeBridge.observationPublicationForVerification()::hasActiveSession,
-						"a valid coordinator authenticates while a silent candidate remains connected");
+				try (Socket authenticated = new Socket(
+						MultiplexedServerBridge.LOOPBACK_HOST, activeBridge.boundPortForVerification());
+					 BufferedReader reader = new BufferedReader(new InputStreamReader(
+							 authenticated.getInputStream(), StandardCharsets.UTF_8))) {
+					authenticate(authenticated, reader, new BridgeEnvelopeCodec(), secret, null,
+							"hello-after-silent-candidate");
+					awaitCondition(activeBridge.observationPublicationForVerification()::hasActiveSession,
+							"a valid coordinator authenticates while a silent candidate remains connected");
+				}
 			}
 			awaitCondition(() -> !activeBridge.observationPublicationForVerification().hasActiveSession(),
 					"session close deactivates publication and clears lifecycle ownership");
@@ -2373,7 +2380,10 @@ public final class MultiplexedServerBridgeVerification {
 	@SuppressWarnings("unchecked")
 	private static int preauthSessionCount(MultiplexedServerBridge bridge) {
 		try {
-			return ((Set<Object>) readPrivateField(bridge, "preauthSessions")).size();
+			Object publicationLock = readPrivateField(bridge, "publicationLock");
+			synchronized (publicationLock) {
+				return ((Set<Object>) readPrivateField(bridge, "preauthSessions")).size();
+			}
 		} catch (ReflectiveOperationException exception) {
 			throw new AssertionError("could not inspect bounded pre-authentication sessions", exception);
 		}
