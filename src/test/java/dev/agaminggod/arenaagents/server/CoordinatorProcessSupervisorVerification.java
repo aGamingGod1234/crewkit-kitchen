@@ -2890,16 +2890,16 @@ public final class CoordinatorProcessSupervisorVerification {
 	}
 
 	private static void deleteTree(Path root) {
-		try (var paths = Files.walk(root)) {
-			paths.sorted(java.util.Comparator.reverseOrder()).forEach(path -> {
-				try {
-					Files.deleteIfExists(path);
-				} catch (IOException exception) {
-					throw new java.io.UncheckedIOException(exception);
-				}
-			});
-		} catch (IOException | java.io.UncheckedIOException exception) {
-			throw new AssertionError("could not clean secret repair fixture", exception);
+		List<Path> paths;
+		try (var walk = Files.walk(root)) {
+			paths = walk.sorted(java.util.Comparator.reverseOrder()).toList();
+		} catch (IOException exception) {
+			throw new AssertionError("could not enumerate coordinator verification fixture", exception);
+		}
+		try {
+			for (Path path : paths) Files.deleteIfExists(path);
+		} catch (IOException exception) {
+			throw new AssertionError("could not clean coordinator verification fixture", exception);
 		}
 	}
 
