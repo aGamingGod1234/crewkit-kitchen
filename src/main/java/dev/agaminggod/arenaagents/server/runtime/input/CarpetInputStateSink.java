@@ -100,6 +100,7 @@ public final class CarpetInputStateSink implements InputStateSink {
 		} else {
 			OfflineAgentPlayers.actions(player).stopAll();
 			useDriver.stop(agentId, new MinecraftPlayerUseAccess(player));
+			useDriver.discard(agentId);
 		}
 	}
 

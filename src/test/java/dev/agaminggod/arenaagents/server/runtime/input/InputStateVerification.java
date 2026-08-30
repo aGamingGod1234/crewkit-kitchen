@@ -253,8 +253,22 @@ public final class InputStateVerification {
 		driver.tick(AGENT, InteractionHand.MAIN_HAND, transition, 94L);
 		assertEquals(2, transition.targetHands.size(), "held use resumes on the following server tick");
 		driver.stop(AGENT, transition);
+
+		RecordingUseAccess cleared = RecordingUseAccess.target(
+				ExactHandUseDriver.TargetKind.BLOCK, true, false
+		);
+		driver.tick(AGENT, InteractionHand.MAIN_HAND, cleared, 100L);
+		driver.stop(AGENT, cleared);
 		driver.discard(AGENT);
-		return 38;
+		RecordingUseAccess restartedAfterClear = RecordingUseAccess.target(
+				ExactHandUseDriver.TargetKind.BLOCK, true, false
+		);
+		driver.tick(AGENT, InteractionHand.MAIN_HAND, restartedAfterClear, 100L);
+		assertEquals(1, restartedAfterClear.targetHands.size(),
+				"full clear discards the historical execution stamp before controller reuse");
+		driver.stop(AGENT, restartedAfterClear);
+		driver.discard(AGENT);
+		return 39;
 	}
 
 	private static int verifyBoundedMotor() {
