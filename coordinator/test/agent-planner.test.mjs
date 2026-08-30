@@ -919,7 +919,13 @@ test('a native lease expiring during initial creation cannot replace a newly ins
 	const turn = planner.requestNativeTurn({ agentId: AGENT_ID, input: 'keep working', goalRevision: GOAL_REVISION, executeTool: async () => ({ state: 'SUCCEEDED' }) });
 	await started;
 	current = second;
-	await assert.rejects(turn, (error) => error?.code === 'PLANNING_LEASE_EXPIRED');
+	await assert.rejects(
+		Promise.race([
+			turn,
+			new Promise((_, reject) => setTimeout(() => reject(Object.assign(new Error('native lease did not expire'), { code: 'TEST_TIMEOUT' })), 75)),
+		]),
+		(error) => error?.code === 'PLANNING_LEASE_EXPIRED',
+	);
 	assert.equal(replacements.length, 0, 'an unowned creation lease cannot tear down a later current generation');
 	scheduler.close();
 });

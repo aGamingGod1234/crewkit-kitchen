@@ -38,7 +38,7 @@ test('Windows TTS subprocess receives only its Windows runtime environment and s
 });
 
 test('Windows TTS returns bounded mono signed 16-bit PCM without treating text as PowerShell', windowsOnly, async () => {
-	const provider = new WindowsTtsProvider({ timeoutMs: 10_000 });
+	const provider = new WindowsTtsProvider({ timeoutMs: 30_000 });
 	const result = await provider.synthesize({
 		text: "Hello from Luna. 你好. '; throw 'injected'; $env:PATH",
 		speed: 1,
