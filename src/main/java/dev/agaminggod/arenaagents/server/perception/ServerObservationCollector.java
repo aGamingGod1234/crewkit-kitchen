@@ -43,6 +43,8 @@ public final class ServerObservationCollector {
 	public static final int MAX_BLOCKS = 128;
 	public static final int BLOCK_RADIUS = 6;
 	public static final int MAX_BLOCKS_PER_TYPE = 8;
+	static final int MAX_BLOCK_VISIBILITY_CHECKS = MAX_BLOCKS * 4;
+	static final int MAX_BLOCK_VISIBILITY_CHECKS_PER_TYPE = MAX_BLOCKS_PER_TYPE * 4;
 	public static final int MAX_NEARBY_TRANSACTION_TARGETS = 16;
 	public static final int MAX_OBSERVATION_TAGS = 32;
 	public static final int MAX_TAG_COUNT_ENTRIES = 128;
@@ -516,10 +518,12 @@ public final class ServerObservationCollector {
 	) {
 		BlockPos center = agent.blockPosition();
 		JsonArray values = new JsonArray();
-		for (BlockObservationOrdering.Candidate candidate : BlockObservationOrdering.selectOrdered(
+		for (BlockObservationOrdering.Candidate candidate : BlockObservationOrdering.selectOrderedWithVisibilityBudget(
 				candidates,
 				MAX_BLOCKS,
 				MAX_BLOCKS_PER_TYPE,
+				MAX_BLOCK_VISIBILITY_CHECKS,
+				MAX_BLOCK_VISIBILITY_CHECKS_PER_TYPE,
 				selectable -> visibility.canSeeBlock(
 						center.offset(selectable.x(), selectable.y(), selectable.z()))
 		)) {

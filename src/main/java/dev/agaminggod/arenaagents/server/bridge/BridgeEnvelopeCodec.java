@@ -173,16 +173,21 @@ public final class BridgeEnvelopeCodec {
 
 	public static final class EncodedFrame {
 		private final byte[] bytes;
-		private final String utf8;
+		private volatile String utf8;
 
 		private EncodedFrame(byte[] bytes) {
 			this.bytes = bytes;
-			this.utf8 = new String(bytes, StandardCharsets.UTF_8);
 		}
 
 		public int byteLength() { return bytes.length; }
 		public byte[] bytes() { return bytes.clone(); }
 		byte[] bytesView() { return bytes; }
-		public String utf8() { return utf8; }
+		public String utf8() {
+			String value = utf8;
+			if (value != null) return value;
+			value = new String(bytes, StandardCharsets.UTF_8);
+			utf8 = value;
+			return value;
+		}
 	}
 }

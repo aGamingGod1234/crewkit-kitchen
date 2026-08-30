@@ -39,16 +39,37 @@ public final class BlockObservationOrdering {
 			int maximumPerBlockType,
 			Predicate<Candidate> admissible
 	) {
+		return selectOrderedWithVisibilityBudget(
+				ordered, maximumEntries, maximumPerBlockType,
+				Integer.MAX_VALUE, Integer.MAX_VALUE, admissible);
+	}
+
+	static List<Candidate> selectOrderedWithVisibilityBudget(
+			List<Candidate> ordered,
+			int maximumEntries,
+			int maximumPerBlockType,
+			int maximumVisibilityChecks,
+			int maximumVisibilityChecksPerBlockType,
+			Predicate<Candidate> admissible
+	) {
 		Objects.requireNonNull(ordered, "ordered must not be null");
 		Objects.requireNonNull(admissible, "admissible must not be null");
-		if (maximumEntries <= 0 || maximumPerBlockType <= 0) {
+		if (maximumEntries <= 0 || maximumPerBlockType <= 0
+				|| maximumVisibilityChecks <= 0 || maximumVisibilityChecksPerBlockType <= 0) {
 			throw new IllegalArgumentException("observation limits must be positive");
 		}
 		ArrayList<Candidate> selected = new ArrayList<>(Math.min(maximumEntries, ordered.size()));
 		Map<String, Integer> counts = new HashMap<>();
+		Map<String, Integer> visibilityChecksByType = new HashMap<>();
+		int visibilityChecks = 0;
 		for (Candidate candidate : ordered) {
 			int count = counts.getOrDefault(candidate.blockId(), 0);
 			if (count >= maximumPerBlockType) continue;
+			if (visibilityChecks >= maximumVisibilityChecks) break;
+			int typeChecks = visibilityChecksByType.getOrDefault(candidate.blockId(), 0);
+			if (typeChecks >= maximumVisibilityChecksPerBlockType) continue;
+			visibilityChecks++;
+			visibilityChecksByType.put(candidate.blockId(), typeChecks + 1);
 			if (!admissible.test(candidate)) continue;
 			selected.add(candidate);
 			counts.put(candidate.blockId(), count + 1);

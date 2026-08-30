@@ -123,7 +123,42 @@ public final class BlockObservationLazyVisibilityVerification {
 		);
 		assertEquals(513, BlockObservationOrdering.ordered(crowdedBlocks()).size(),
 				"the raw spatial cache retains candidates beyond the former four-times quota");
-		assertions += 3;
+
+		AtomicInteger uniformOccludedChecks = new AtomicInteger();
+		BlockObservationOrdering.selectOrderedWithVisibilityBudget(
+				BlockObservationOrdering.ordered(crowdedBlocks()),
+				ServerObservationCollector.MAX_BLOCKS,
+				ServerObservationCollector.MAX_BLOCKS_PER_TYPE,
+				ServerObservationCollector.MAX_BLOCK_VISIBILITY_CHECKS,
+				ServerObservationCollector.MAX_BLOCK_VISIBILITY_CHECKS_PER_TYPE,
+				candidate -> {
+					uniformOccludedChecks.incrementAndGet();
+					return false;
+				});
+		assertEquals(ServerObservationCollector.MAX_BLOCK_VISIBILITY_CHECKS_PER_TYPE,
+				uniformOccludedChecks.get(),
+				"uniform occlusion cannot exceed the per-type raycast budget");
+
+		ArrayList<BlockObservationOrdering.Candidate> diverseOccluded = new ArrayList<>();
+		for (int index = 0; index < 600; index++) {
+			diverseOccluded.add(new BlockObservationOrdering.Candidate(
+					index, 0, 0, "fixture:block_" + index));
+		}
+		AtomicInteger diverseOccludedChecks = new AtomicInteger();
+		BlockObservationOrdering.selectOrderedWithVisibilityBudget(
+				BlockObservationOrdering.ordered(diverseOccluded),
+				ServerObservationCollector.MAX_BLOCKS,
+				ServerObservationCollector.MAX_BLOCKS_PER_TYPE,
+				ServerObservationCollector.MAX_BLOCK_VISIBILITY_CHECKS,
+				ServerObservationCollector.MAX_BLOCK_VISIBILITY_CHECKS_PER_TYPE,
+				candidate -> {
+					diverseOccludedChecks.incrementAndGet();
+					return false;
+				});
+		assertEquals(ServerObservationCollector.MAX_BLOCK_VISIBILITY_CHECKS,
+				diverseOccludedChecks.get(),
+				"diverse occlusion cannot exceed the global raycast budget");
+		assertions += 5;
 
 		return assertions;
 	}
