@@ -5,14 +5,17 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { evaluateLatencyAcceptance, normalizeLatencyAcceptancePolicy } from '../src/benchmark/latency-acceptance.mjs';
-import { compareInstrumentationRuns } from '../src/benchmark/instrumentation-comparison.mjs';
+import { compareInstrumentationRuns, runInstrumentationComparison } from '../src/benchmark/instrumentation-comparison.mjs';
 import { main as acceptanceMain } from '../src/benchmark/latency-acceptance-cli.mjs';
 
 function evidence(latencyScale = 1, overrides = {}) {
 	const trials = [];
 	for (const sessionState of ['cold', 'warm']) for (const agentLoad of [1, 8, 16]) for (let repetition = 1; repetition <= 5; repetition += 1) trials.push({
-		trialId: `${sessionState}-${agentLoad}`, repetition, agentLoad, sessionState, status: 'PASSED', factualSuccess: true, synthetic: false,
-		latencyMs: (100 + repetition) * latencyScale, tickP95Ms: 20, spans: { actionMs: (40 + repetition) * latencyScale },
+		trialId: `${sessionState}-${agentLoad}`, repetition, scenarioId: `scenario-${agentLoad}`, seed: 41 + repetition, agentLoad, sessionState,
+		mode: 'live', timingScope: 'full_path', evidenceSource: 'fabric-headless', workloadConfigHash: 'workload-v1', sourceHash: 'implementation-v1',
+		providerProfile: { provider: 'codex', model: 'gpt-5', reasoningEffort: 'high', serviceTier: 'priority' },
+		status: 'PASSED', factualSuccess: true, synthetic: false,
+		latencyMs: (100 + repetition) * latencyScale, tickP95Ms: 20, spans: { actionMs: (40 + repetition) * latencyScale, voiceMs: (20 + repetition) * latencyScale },
 		...overrides,
 	});
 	return { trials };
@@ -30,7 +33,7 @@ test('certifies 2x only with cold and warm live evidence at 1, 8, and 16 agents'
 	const result = evaluateLatencyAcceptance({ baseline: evidence(1), optimized: evidence(0.5), instrumentationComparison: instrumentation() });
 	assert.equal(result.status, 'PASSED');
 	assert.equal(result.claimCertified, true);
-	assert.equal(result.checks.filter((check) => check.code === 'VOICE_SPAN').every((check) => check.status === 'NOT_APPLICABLE'), true);
+	assert.equal(result.checks.filter((check) => check.code === 'VOICE_SPAN').every((check) => check.status === 'PASSED'), true);
 	assert.equal(result.checks.filter((check) => check.code === 'ACTION_SPAN').every((check) => check.status === 'PASSED'), true);
 });
 
@@ -51,6 +54,38 @@ test('fails when a span exists in only one arm instead of hiding lost instrument
 	const result = evaluateLatencyAcceptance({ baseline, optimized, instrumentationComparison: instrumentation() });
 	assert.equal(result.status, 'FAILED');
 	assert.equal(result.checks.filter((check) => check.code === 'ACTION_SPAN').every((check) => check.status === 'FAILED'), true);
+	assert.equal(result.checks.filter((check) => check.code === 'REQUIRED_SPAN_EVIDENCE').every((check) => check.status === 'FAILED'), true);
+});
+
+test('rejects duplicate repetitions before percentiles can count copied samples', () => {
+	const baseline = evidence(1);
+	baseline.trials[1] = { ...baseline.trials[0] };
+	assert.throws(() => evaluateLatencyAcceptance({ baseline, optimized: evidence(0.5), instrumentationComparison: instrumentation() }), /duplicate repetition/);
+});
+
+test('fails workload pairing when provider, source, configuration, or scenario differs', () => {
+	for (const mutation of [
+		(trial) => ({ ...trial, scenarioId: 'different-scenario' }),
+		(trial) => ({ ...trial, providerProfile: { ...trial.providerProfile, model: 'different-model' } }),
+		(trial) => ({ ...trial, evidenceSource: 'different-runner' }),
+		(trial) => ({ ...trial, workloadConfigHash: 'different-config' }),
+	]) {
+		const optimized = evidence(0.5);
+		optimized.trials[0] = mutation(optimized.trials[0]);
+		const result = evaluateLatencyAcceptance({ baseline: evidence(1), optimized, instrumentationComparison: instrumentation() });
+		assert.equal(result.status, 'FAILED');
+		assert.ok(result.checks.some((check) => check.code === 'WORKLOAD_PAIRING' && check.status === 'FAILED'));
+	}
+});
+
+test('rejects post-setup timing scopes and MSPT is not accepted as tick p95', () => {
+	const postSetup = evidence(0.5, { timingScope: 'task_only' });
+	assert.throws(() => evaluateLatencyAcceptance({ baseline: evidence(1), optimized: postSetup, instrumentationComparison: instrumentation() }), /timingScope must be full_path/);
+	const optimized = evidence(0.5);
+	optimized.trials = optimized.trials.map(({ tickP95Ms: _tick, ...trial }) => ({ ...trial, metrics: { resources: { minecraftMspt: 20 } } }));
+	const result = evaluateLatencyAcceptance({ baseline: evidence(1), optimized, instrumentationComparison: instrumentation() });
+	assert.equal(result.status, 'FAILED');
+	assert.ok(result.checks.some((check) => check.code === 'REQUIRED_SPAN_EVIDENCE' && check.status === 'FAILED'));
 });
 
 test('normalizes a machine-readable acceptance policy and derives the p95 ratio', () => {
@@ -71,6 +106,27 @@ test('instrumentation comparison checks action parity, sample count, and measure
 	const failing = compareInstrumentationRuns({ enabled: run(1.1, true), disabled: run(1), maxP95Ratio: 1.05 });
 	assert.equal(failing.status, 'FAILED');
 	assert.equal(failing.checks.find((check) => check.code === 'INSTRUMENTATION_BEHAVIOR_PARITY').status, 'FAILED');
+});
+
+test('instrumentation parity fails closed when behavior hashes are absent', () => {
+	const run = { trials: Array.from({ length: 5 }, (_, index) => ({ trialId: 'cell', repetition: index + 1, status: 'PASSED', durationMs: 100, debug: {} })) };
+	const result = compareInstrumentationRuns({ enabled: run, disabled: run });
+	assert.equal(result.status, 'FAILED');
+	assert.equal(result.checks.find((check) => check.code === 'INSTRUMENTATION_BEHAVIOR_PARITY').status, 'FAILED');
+});
+
+test('instrumentation comparison counterbalances execution order', async () => {
+	const observed = [];
+	const result = await runInstrumentationComparison({
+		minimumSamples: 2,
+		runMatrix: async ({ instrumentation }) => {
+			observed.push(instrumentation ? 'enabled' : 'disabled');
+			return { trials: [{ trialId: 'cell', repetition: 1, status: 'PASSED', durationMs: instrumentation ? 102 : 100, debug: { actionCommandHash: 'actions', scenarioDigest: 'scenario' } }] };
+		},
+	});
+	assert.deepEqual(observed, ['disabled', 'enabled', 'enabled', 'disabled']);
+	assert.equal(result.status, 'PASSED');
+	assert.deepEqual(result.orders, [['disabled', 'enabled'], ['enabled', 'disabled']]);
 });
 
 test('acceptance CLI writes a machine-readable report and returns claim status', async () => {

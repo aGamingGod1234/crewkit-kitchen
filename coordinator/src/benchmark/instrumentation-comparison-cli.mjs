@@ -7,7 +7,7 @@ export async function main(argv = process.argv.slice(2)) {
 	try {
 		const args = parse(argv);
 		const result = await runInstrumentationComparison(args);
-		process.stdout.write(JSON.stringify({ status: result.status, order: result.order, artifact: path.join(args.artifactDirectory, 'instrumentation-comparison.json') }) + '\n');
+		process.stdout.write(JSON.stringify({ status: result.status, orders: result.orders, artifact: path.join(args.artifactDirectory, 'instrumentation-comparison.json') }) + '\n');
 		return result.status === 'PASSED' ? 0 : 1;
 	} catch (error) {
 		process.stderr.write(`instrumentation-comparison: ${String(error?.message ?? error).slice(0, 512)}\n`);

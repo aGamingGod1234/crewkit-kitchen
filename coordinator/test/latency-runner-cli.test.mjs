@@ -326,7 +326,7 @@ test('publishes bounded numeric metrics and CPU/memory summaries without raw pri
 	try {
 		await runLatencyRunnerCli(['--matrix', files.matrix, '--artifact-directory', files.artifacts], {
 			runLatencyMatrix: async () => ({ status: 'PASSED', trials: [{
-				trialId: 'metrics', status: 'PASSED',
+				trialId: 'metrics', status: 'PASSED', timingScope: 'full_path', durationMs: 20, taskDurationMs: 12, setupDurationMs: 8, totalDurationMs: 20,
 				metrics: { version: 1, clockBasis: { wall: 'process_monotonic_ms', virtual: 'virtual_world_ms' }, result: { taskCompletionWallDurationMs: 12, tick: { count: 3, p95Ms: 4 }, privateNumber: 99 }, raw: { ticks: [{ prompt: 'secret', wallDurationMs: 2 }] }, context: { pairingKey: 'private' } },
 				systemSummary: { sampleCount: 2, cpu: { totalMs: { p95: 7 }, privateNumber: { p95: 999 } }, memory: { rssBytes: { p95: 100 } }, privateNumber: 999, errors: [{ message: 'provider response' }] },
 			}], cleanup: { ok: true } }),
@@ -334,6 +334,9 @@ test('publishes bounded numeric metrics and CPU/memory summaries without raw pri
 		});
 		const trial = JSON.parse(io.stdout[0]).trials[0];
 		assert.equal(trial.metrics.result.taskCompletionWallDurationMs, 12);
+		assert.equal(trial.timingScope, 'full_path');
+		assert.equal(trial.durationMs, 20);
+		assert.equal(trial.taskDurationMs, 12);
 		assert.equal(trial.metrics.result.tick.p95Ms, 4);
 		assert.equal(trial.metrics.result.privateNumber, undefined);
 		assert.equal(trial.metrics.raw, undefined);

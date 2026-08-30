@@ -189,9 +189,12 @@ test('preserves bounded pairing context and reports per-trial process deltas', a
 	assert.deepEqual(trial.systemSummary.cpuDelta, { basis: 'process_resource_usage_delta_ms', userMs: 7, systemMs: 2, totalMs: 9 });
 	assert.deepEqual(trial.systemSummary.memoryDelta, { basis: 'process_memory_sample_delta_bytes', rssBytes: 30, heapUsedBytes: 20 });
 	assert.equal(trial.systemSummary.memoryPeak.rssBytes, 130);
+	assert.equal(trial.timingScope, 'full_path');
 	assert.ok(trial.durationMs >= 0);
+	assert.ok(trial.taskDurationMs >= 0);
 	assert.ok(trial.setupDurationMs >= 0);
-	assert.ok(trial.totalDurationMs >= trial.durationMs + trial.setupDurationMs - 1);
+	assert.equal(trial.totalDurationMs, trial.durationMs);
+	assert.ok(trial.durationMs >= trial.taskDurationMs + trial.setupDurationMs - 1);
 	assert.ok(Number.isFinite(trial.setupSpansMs.coordinatorStart));
 });
 
@@ -262,6 +265,11 @@ test('measurement instrumentation does not change authoritative action command b
 	assert.match(disabled.trials[0].debug.actionCommandHash, /^sha256:/);
 	assert.equal(enabled.trials[0].debug.actionCommandHash, disabled.trials[0].debug.actionCommandHash);
 	assert.equal(enabled.trials[0].status, disabled.trials[0].status);
+	assert.equal(disabled.trials[0].metrics, null);
+	assert.equal(disabled.trials[0].systemSummary, null);
+	assert.equal(disabled.trials[0].benchmark.eventCount, 0);
+	assert.deepEqual(disabled.trials[0].benchmark.traces, []);
+	assert.equal(disabled.summary, 0);
 });
 
 test('polls conversation history only while a declared chat event is pending', async () => {
