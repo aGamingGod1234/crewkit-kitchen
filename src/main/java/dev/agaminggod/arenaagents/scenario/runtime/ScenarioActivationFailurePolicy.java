@@ -18,8 +18,8 @@ public final class ScenarioActivationFailurePolicy {
 		return failure instanceof AgentDomainException domain && RETRYABLE_CODES.contains(domain.code());
 	}
 
-	/** A verified, inactive arena is replaceable even when its contestant launch is waiting on automation. */
+	/** Pending preparation keeps ownership until the operator uses the explicit cancellation path. */
 	public static boolean mayReplacePendingLaunch(boolean building, boolean pendingActivation, boolean running) {
-		return !building && pendingActivation && !running;
+		return false;
 	}
 }

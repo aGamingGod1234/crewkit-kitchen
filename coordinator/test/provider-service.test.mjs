@@ -80,7 +80,7 @@ function profile(provider, overrides = {}) {
 		provider,
 		model: `${provider}-model`,
 		reasoningEffort: 'high',
-		serviceTier: 'fast',
+		serviceTier: ['codex', 'cursor'].includes(provider) ? 'fast' : 'priority',
 		...overrides,
 	};
 }
@@ -128,7 +128,6 @@ test('provider router rejects every profile mutation for an existing agent ID', 
 	assert.equal(agent.provider, 'codex');
 
 	for (const mutation of [
-		{ provider: 'gemini' },
 		{ model: 'codex-other-model' },
 		{ reasoningEffort: 'low' },
 		{ serviceTier: 'priority' },
@@ -140,13 +139,14 @@ test('provider router rejects every profile mutation for an existing agent ID', 
 				&& !error?.message.includes('secret'),
 		);
 	}
+	await assert.rejects(router.createAgent({ ...selected, provider: 'gemini' }), /fast is available only/);
 	assert.equal(services.codex.created.length, 1);
 	assert.equal(services.gemini.created.length, 0);
 	assert.equal(services.kimi.created.length, 0);
 	await router.stop();
 });
 
-test('provider reconciliation retains a Gemini fast profile and rejects a tier mutation', async () => {
+test('provider reconciliation retains a Gemini priority profile and rejects a fast tier', async () => {
 	const gemini = new AntigravityProviderService({
 		provider: 'gemini',
 		cwd: 'C:\\workspace',
@@ -162,15 +162,15 @@ test('provider reconciliation retains a Gemini fast profile and rejects a tier m
 	const selected = profile('gemini', {
 		agentId: 'gemini-session',
 		model: 'gemini-3.1-pro',
-		serviceTier: 'fast',
+		serviceTier: 'priority',
 	});
 	const agent = await router.createAgent(selected);
 	const reconciliation = await router.reconcile([selected]);
 	assert.deepEqual(reconciliation.valid, [selected], 'reconciliation preserves the complete Gemini profile');
 	assert.equal(await router.createAgent(selected), agent, 'same profile reuses the existing Gemini session');
 	await assert.rejects(
-		router.createAgent({ ...selected, serviceTier: 'priority' }),
-		(error) => error?.code === 'AGENT_PROFILE_CONFLICT',
+		router.createAgent({ ...selected, serviceTier: 'fast' }),
+		/fast is available only/,
 	);
 	await router.stop();
 });
@@ -354,11 +354,12 @@ test('stop fences a start-delayed creation before the backend can create or assi
 		services.codex.stopped = true;
 		releaseStart();
 	};
-	const router = new ProviderService(services, { operationTimeoutMs: 20 });
+	const router = new ProviderService(services, { operationTimeoutMs: 1_000 });
 	const creating = router.createAgent(profile('codex', { agentId: 'late-create' }));
+	const creationRejected = assert.rejects(creating, (error) => error?.code === 'PROVIDER_STOPPED');
 	await new Promise((resolve) => setImmediate(resolve));
 	await router.stop();
-	await assert.rejects(creating, (error) => error?.code === 'PROVIDER_STOPPED');
+	await creationRejected;
 	assert.equal(services.codex.created.length, 0, 'the continuation after the released start is fenced');
 	assert.equal(router.getAgent('late-create'), null);
 });
@@ -378,12 +379,13 @@ test('stop performs final backend cleanup after an already-entered create settle
 	};
 	const router = new ProviderService(services, { operationTimeoutMs: 100 });
 	const creating = router.createAgent(profile('codex', { agentId: 'entered-create' }));
+	const creationRejected = assert.rejects(creating, (error) => error?.code === 'PROVIDER_STOPPED');
 	await new Promise((resolve) => setImmediate(resolve));
 	const stopping = router.stop();
 	await new Promise((resolve) => setImmediate(resolve));
 	releaseCreate();
 	await stopping;
-	await assert.rejects(creating, (error) => error?.code === 'PROVIDER_STOPPED');
+	await creationRejected;
 	assert.equal(services.codex.created.length, 0, 'no backend agent survives coordinator shutdown');
 	assert.equal(stopCalls, 2, 'a final stop cleans mutations that settled after the initial abort');
 });

@@ -759,6 +759,38 @@ test('hello acknowledgement retains death facts for restart reconciliation', () 
 	);
 });
 
+test('goal lifecycle wire text uses Java-compatible UTF-16 code-unit limits', () => {
+	for (const accepted of ['x'.repeat(4_096), '\u{1f642}'.repeat(2_048)]) {
+		assert.equal(validateProtocolV2Payload('goal_control', {
+			operation: 'start', goalRevision: 1, updatedAtEpochMs: 2, goal: accepted,
+		}).goal.length, 4_096);
+	}
+	for (const rejected of ['x'.repeat(4_097), '\u{1f642}'.repeat(2_049)]) {
+		assert.throws(() => validateProtocolV2Payload('goal_control', {
+			operation: 'start', goalRevision: 1, updatedAtEpochMs: 2, goal: rejected,
+		}), /4096/);
+	}
+});
+
+test('wire registry rejects states that cannot round-trip through the Java agent domain', () => {
+	assert.throws(
+		() => validateProtocolV2Payload('agent_registered', { ...registeredRecord(), state: 'ACTING' }),
+		/ACTING agents require a current goal/,
+	);
+	assert.throws(
+		() => validateProtocolV2Payload('agent_registered', { ...registeredRecord(), currentGoal: 'Impossible.' }),
+		/IDLE agents cannot have a current goal/,
+	);
+	assert.throws(
+		() => validateProtocolV2Payload('agent_registered', { ...registeredRecord(), provider: 'kimi', serviceTier: 'fast' }),
+		/fast is available only/,
+	);
+	assert.throws(
+		() => validateProtocolV2Payload('agent_registered', { ...registeredRecord(), updatedAtEpochMs: 0 }),
+		/timestamps are invalid/,
+	);
+});
+
 function registeredRecord(agentId = 'agent-a') {
 	return {
 		schemaVersion: 1,
@@ -1319,7 +1351,7 @@ test('an application listener failure does not tear down the authenticated trans
 	assert.equal(socket.writes.some((wire) => JSON.parse(wire).type === 'action_result_ack'), false, 'listener failure leaves the result unacknowledged for replay');
 });
 
-test('terminal action retention rejects identities after bounded issued-action rollover', async (t) => {
+test('terminal action retention keeps bounded replay proofs after payload rollover', async (t) => {
 	const socket = new FakeSocket();
 	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET, trackedTerminalActionIdCap: 2 }, {
 		socketFactory: () => socket,
@@ -1334,16 +1366,40 @@ test('terminal action retention rejects identities after bounded issued-action r
 	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-1', {
 		replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()],
 	}))}\n`);
+	const delivered = [];
+	bridge.on('action_result', (event) => delivered.push(event));
 	for (let index = 0; index < 3; index += 1) {
 		const actionId = `action-${index}`;
 		await bridge.send('action_command', 'agent-a', actionCommand(actionId, 0));
 		socket.emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', `server-result-${index}`, actionResult(actionId, 0)))}\n`);
 	}
-	const rejected = once(bridge, 'protocolError');
 	socket.emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-result-replay', actionResult('action-0', 0)))}\n`);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(delivered.length, 4, 'an exact unacknowledged retired result is restored and redelivered');
+
+	await bridge.acknowledgeActionResult('agent-a', actionResult('action-0', 0));
+	for (let index = 3; index < 5; index += 1) {
+		const actionId = `action-${index}`;
+		await bridge.send('action_command', 'agent-a', actionCommand(actionId, 0));
+		socket.emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', `server-result-${index}`, actionResult(actionId, 0)))}\n`);
+	}
+	const acknowledgementsBeforeReplay = socket.writes.filter((line) => JSON.parse(line).type === 'action_result_ack').length;
+	socket.emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-result-acknowledged-replay', actionResult('action-0', 0)))}\n`);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(delivered.length, 6, 'an acknowledged retired result is not redelivered');
+	assert.equal(
+		socket.writes.filter((line) => JSON.parse(line).type === 'action_result_ack').length,
+		acknowledgementsBeforeReplay + 1,
+		'an acknowledged retired replay is acknowledged idempotently',
+	);
+
+	const rejected = once(bridge, 'protocolError');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-result-mutated-replay', {
+		...actionResult('action-0', 0), message: 'mutated result',
+	}))}\n`);
 	const [error] = await rejected;
-	assert.equal(error.code, 'UNISSUED_ACTION_RESULT');
-	assert.equal(socket.destroyed, true, 'an evicted issued identity cannot authorize a later terminal result');
+	assert.equal(error.code, 'DUPLICATE_TERMINAL_RESULT');
+	assert.equal(socket.destroyed, true, 'a retired identity cannot be reused with a changed terminal payload');
 });
 
 test('multiplexed bridge rejects stale revisions before writing', async () => {

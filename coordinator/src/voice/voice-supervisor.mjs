@@ -4,6 +4,7 @@ const DEFAULT_STARTUP_TIMEOUT_MS = 10_000;
 const DEFAULT_WARMUP_TIMEOUT_MS = 30_000;
 const DEFAULT_CLEANUP_TIMEOUT_MS = 1_000;
 const MAX_FAILURE_REPORTS_PER_OUTAGE = 3;
+const MAX_PENDING_REMOVALS = 4_096;
 
 export class VoiceSupervisor {
 	#startWorker;
@@ -30,6 +31,7 @@ export class VoiceSupervisor {
 	#workerCloses = new WeakMap();
 	#onFailure;
 	#reportedFailureCodes = new Set();
+	#pendingRemovals = new Set();
 
 	constructor({
 		startWorker,
@@ -93,6 +95,15 @@ export class VoiceSupervisor {
 			generation: this.#statusGeneration,
 			lastRecoveryAtEpochMs: this.#lastRecoveryAt,
 		}));
+	}
+
+	removeAgent(agentId) {
+		if (typeof agentId !== 'string' || agentId.trim().length === 0) throw new TypeError('agentId must be a nonblank string');
+		this.#pendingRemovals.add(agentId);
+		while (this.#pendingRemovals.size > MAX_PENDING_REMOVALS) {
+			this.#pendingRemovals.delete(this.#pendingRemovals.values().next().value);
+		}
+		return this.#drainRemoval(agentId);
 	}
 
 	close() {
@@ -224,6 +235,19 @@ export class VoiceSupervisor {
 		this.#failureCode = null;
 		this.#nextRetryAt = null;
 		this.#statusGeneration += 1;
+		for (const agentId of this.#pendingRemovals) void this.#drainRemoval(agentId);
+	}
+
+	async #drainRemoval(agentId) {
+		const worker = this.#live?.worker;
+		if (worker === undefined || typeof worker.removeAgent !== 'function') return false;
+		try {
+			await worker.removeAgent(agentId);
+			this.#pendingRemovals.delete(agentId);
+			return true;
+		} catch {
+			return false;
+		}
 	}
 
 	#workerFailed(owner, worker, error) {

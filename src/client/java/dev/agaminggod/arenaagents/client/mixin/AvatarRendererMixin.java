@@ -27,12 +27,7 @@ abstract class AvatarRendererMixin {
 	private void arenaagents$hideAgentName(Avatar avatar, double distance, CallbackInfoReturnable<Boolean> callback) {
 		avatar.getProfile().name().ifPresent(name -> {
 			Optional<AgentControlAgent> snapshotAgent = AgentControlClient.agentForPlayer(name);
-			if (snapshotAgent.isPresent()) {
-				if (hasExpectedOfflineUuid(avatar, snapshotAgent.orElseThrow())) callback.setReturnValue(false);
-				return;
-			}
-			if (AgentIdentity.skinForPlayerName(name).isPresent()
-					&& avatar.getUUID().equals(AgentIdentity.offlinePlayerUuid(name))) {
+			if (snapshotAgent.filter(agent -> hasExpectedOfflineUuid(avatar, agent)).isPresent()) {
 				callback.setReturnValue(false);
 			}
 		});

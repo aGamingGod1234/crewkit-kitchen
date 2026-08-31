@@ -13,6 +13,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.StandardCopyOption;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -163,10 +165,24 @@ public final class ScenarioMatchResultVerification {
 			assertFalse(persistence.poll(21L).durable(), "retry starts after bounded backoff");
 			assertTrue(persistence.poll(22L).durable(), "successful retry marks result durable");
 			assertEquals(2, persistence.poll(22L).attempts(), "result persistence records both attempts");
+
+			Path fallbackSource = directory.resolve("fallback.tmp");
+			Path fallbackTarget = directory.resolve("fallback.json");
+			Files.writeString(fallbackSource, "durable", StandardCharsets.UTF_8);
+			AtomicInteger moveAttempts = new AtomicInteger();
+			MatchResultWriter.moveDurably(fallbackSource, fallbackTarget, (source, target, options) -> {
+				if (moveAttempts.incrementAndGet() == 1) {
+					throw new AtomicMoveNotSupportedException(source.toString(), target.toString(), "simulated");
+				}
+				return Files.move(source, target, options);
+			});
+			assertEquals("durable", Files.readString(fallbackTarget),
+					"unsupported atomic moves use the synced same-directory fallback");
+			assertEquals(2, moveAttempts.get(), "fallback is attempted once after atomic capability rejection");
 		} finally {
 			deleteTree(directory);
 		}
-		return 35;
+		return 37;
 	}
 
 	private static void setSparseLength(Path path, long length) throws IOException {

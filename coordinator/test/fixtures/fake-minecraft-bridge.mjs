@@ -339,7 +339,7 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 			skinVariant: 'default',
 			state,
 			goalRevision: revision,
-			currentGoal: this.#scenario.goal ?? 'gather wood and craft a wooden pickaxe',
+			currentGoal: state === 'IDLE' ? null : this.#scenario.goal ?? 'gather wood and craft a wooden pickaxe',
 			currentGoalSpec: this.#record.goalSpec ?? null,
 			queue: [],
 			createdAtEpochMs: 1,

@@ -1,3 +1,5 @@
+import { readBoundedResponseBody } from './bounded-response-body.mjs';
+
 const DEFAULT_ENDPOINT = 'https://api.fish.audio/v1/tts';
 const DEFAULT_MODEL = 's2.1-pro-free';
 const MAX_PCM_BYTES = 44_100 * 2 * 20;
@@ -30,7 +32,8 @@ export class FishTtsProvider {
 		if ([...text].length > 280) throw new TypeError('text must be at most 280 Unicode code points');
 		if (!Number.isFinite(speed) || speed < 0.5 || speed > 2) throw new TypeError('speed must be between 0.5 and 2');
 		const timeoutSignal = AbortSignal.timeout(this.#timeoutMs);
-		const combinedSignal = signal === undefined ? timeoutSignal : AbortSignal.any([signal, timeoutSignal]);
+		const responseController = new AbortController();
+		const combinedSignal = AbortSignal.any([responseController.signal, timeoutSignal, ...(signal === undefined ? [] : [signal])]);
 		let response;
 		try {
 			response = await this.#fetch(this.#endpoint, {
@@ -62,11 +65,12 @@ export class FishTtsProvider {
 			error.retryAfter = retryAfter;
 			throw error;
 		}
-		const declaredLength = Number(response.headers?.get?.('content-length'));
-		if (Number.isFinite(declaredLength) && declaredLength > MAX_PCM_BYTES) {
-			throw typedError('TTS_AUDIO_TOO_LONG', 'Fish TTS response exceeds the 20 second PCM limit');
-		}
-		const pcm = Buffer.from(await response.arrayBuffer());
+		const pcm = await readBoundedResponseBody(
+			response,
+			MAX_PCM_BYTES,
+			() => typedError('TTS_AUDIO_TOO_LONG', 'Fish TTS response exceeds the 20 second PCM limit'),
+			{ onLimit: (error) => responseController.abort(error) },
+		);
 		if (pcm.length === 0 || pcm.length % 2 !== 0 || pcm.length > MAX_PCM_BYTES) {
 			throw typedError('TTS_MALFORMED_AUDIO', 'Fish TTS returned invalid mono signed 16-bit PCM');
 		}

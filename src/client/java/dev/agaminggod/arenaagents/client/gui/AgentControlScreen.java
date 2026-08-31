@@ -34,10 +34,10 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Set;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.AbstractWidget;
-import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.components.MultiLineEditBox;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.input.KeyEvent;
@@ -85,7 +85,9 @@ public final class AgentControlScreen extends Screen {
 	private boolean feedbackError;
 	private PendingSummon pendingSummon;
 	private int liveScroll;
+	private int liveFeedScroll;
 	private boolean compactGroupComposer;
+	private ConsoleMutationState mutationState = ConsoleMutationState.initial(0L);
 	private Page page = Page.OVERVIEW;
 	private ConsoleEditBox nameInput;
 	private ConsoleEditBox groupNameInput;
@@ -111,7 +113,7 @@ public final class AgentControlScreen extends Screen {
 		this.page = initialPage;
 		AgentControlClient.Preferences preferences = AgentControlClient.preferences();
 		CreateSelection normalized = normalizeCreateSelection(
-				preferences.provider(), preferences.model(), preferences.reasoning(), serviceTier);
+				preferences.provider(), preferences.model(), preferences.reasoning(), preferences.serviceTier());
 		provider = normalized.provider();
 		model = normalized.model();
 		reasoning = normalized.reasoning();
@@ -128,8 +130,27 @@ public final class AgentControlScreen extends Screen {
 	}
 
 	public void acceptSnapshot(AgentControlSnapshot nextSnapshot) {
-		AgentControlSnapshot previous = snapshot;
+		acceptSnapshot(nextSnapshot, 0L, true);
+	}
+
+	public void acceptSnapshot(
+			AgentControlSnapshot nextSnapshot,
+			long acknowledgedMutationId,
+			boolean contentChanged
+	) {
 		AgentControlSnapshot checkedSnapshot = Objects.requireNonNull(nextSnapshot, "nextSnapshot must not be null");
+		if (!mutationState.accepts(checkedSnapshot.generatedAtEpochMs())) return;
+		boolean mutationWasPending = mutationState.mutationPending();
+		mutationState = mutationState.accept(checkedSnapshot.generatedAtEpochMs(), acknowledgedMutationId);
+		if (!contentChanged) {
+			snapshot = checkedSnapshot;
+			if (mutationWasPending && !mutationState.mutationPending()) {
+				if (!feedbackError) feedback = "";
+				if (minecraft != null && !textEditorFocused()) rebuildWidgets();
+			}
+			return;
+		}
+		AgentControlSnapshot previous = snapshot;
 		normalizeCreateSelection();
 		List<AgentRosterEntry> candidateEntries = rosterEntries(checkedSnapshot);
 		Map<String, AgentVisualIdentity.Resolved> candidateVisuals = rosterVisuals(checkedSnapshot);
@@ -157,8 +178,11 @@ public final class AgentControlScreen extends Screen {
 			page = Page.OVERVIEW;
 			compactGroupComposer = false;
 		}
-		if (minecraft != null && !(getFocused() instanceof EditBox)
-				&& !(getFocused() instanceof MultiLineEditBox)) rebuildWidgets();
+		if (minecraft != null && !textEditorFocused()) rebuildWidgets();
+	}
+
+	private boolean textEditorFocused() {
+		return getFocused() instanceof ConsoleEditBox || getFocused() instanceof MultiLineEditBox;
 	}
 
 	private void replaceSnapshot(AgentControlSnapshot nextSnapshot) {
@@ -168,6 +192,7 @@ public final class AgentControlScreen extends Screen {
 		rosterState.reconcile(candidateEntries);
 		rosterState.focus(managementSelection.selectedAgentId());
 		snapshot = nextSnapshot;
+		mutationState = ConsoleMutationState.initial(nextSnapshot.generatedAtEpochMs());
 		rosterEntries = candidateEntries;
 		rosterVisuals = candidateVisuals;
 		selectSavedGroup(AgentControlGroupSelection.resolve("", snapshot.groups()));
@@ -195,6 +220,12 @@ public final class AgentControlScreen extends Screen {
 	@Override
 	public Component getNarrationMessage() {
 		MutableComponent narration = getTitle().copy();
+		if (snapshot == null) {
+			appendNarration(narration, Component.literal(AgentControlClient.snapshotError()
+					.orElse("Loading agent roster")));
+		} else if (!snapshot.canControl()) {
+			appendNarration(narration, Component.literal("View only. Operator permission is required to make changes"));
+		}
 		switch (page) {
 			case OVERVIEW -> appendAgentNarration(narration, selectedAgent(), true);
 			case GROUP -> appendGroupNarration(narration);
@@ -240,13 +271,18 @@ public final class AgentControlScreen extends Screen {
 			return;
 		}
 		appendNarration(narration, Component.literal(arena.scenarioTitle() + ", " + arena.phaseTitle()));
-		if (arena.standings().isEmpty()) return;
-		int index = Math.clamp(liveScroll, 0, arena.standings().size() - 1);
-		ArenaSpectatorSnapshot.Standing standing = arena.standings().get(index);
-		appendNarration(narration, Component.literal("Rank " + standing.rank() + ", "
-				+ standing.displayName() + ", score " + ArenaSpectatorHud.scoreText(standing.score())
-				+ ", health " + standing.healthPercent() + "%, "
-				+ ArenaHudPresentation.statusLabel(standing.status())));
+		if (!arena.standings().isEmpty()) {
+			int index = Math.clamp(liveScroll, 0, arena.standings().size() - 1);
+			ArenaSpectatorSnapshot.Standing standing = arena.standings().get(index);
+			appendNarration(narration, Component.literal("Rank " + standing.rank() + ", "
+					+ standing.displayName() + ", score " + ArenaSpectatorHud.scoreText(standing.score())
+					+ ", health " + standing.healthPercent() + "%, "
+					+ ArenaHudPresentation.statusLabel(standing.status())));
+		}
+		if (!arena.feed().isEmpty()) {
+			int feedIndex = Math.clamp(arena.feed().size() - 1 - liveFeedScroll, 0, arena.feed().size() - 1);
+			appendNarration(narration, Component.literal("Match activity: " + arena.feed().get(feedIndex).message()));
+		}
 	}
 
 	private static void appendBuildNarration(MutableComponent narration, ScenarioBuildProgress build) {
@@ -256,13 +292,16 @@ public final class AgentControlScreen extends Screen {
 		}
 		String status = switch (build.status()) {
 			case BUILDING -> "Building arena";
+			case CONFIRMATION_REQUIRED -> "Arena confirmation required";
 			case READY -> "Arena ready";
 			case FAILED -> "Build failed";
+			case CANCELLED -> "Arena build cancelled";
 		};
 		appendNarration(narration, Component.literal(status + ", " + build.scenarioTitle() + ", "
 				+ build.percent() + "%, " + build.humanPhase() + ", "
 				+ build.completed() + " of " + build.total()));
-		if (build.status() == ScenarioBuildProgress.Status.FAILED && !build.detail().isBlank()) {
+		if (build.status() != ScenarioBuildProgress.Status.BUILDING
+				&& build.status() != ScenarioBuildProgress.Status.READY && !build.detail().isBlank()) {
 			appendNarration(narration, Component.literal(build.detail()));
 		}
 	}
@@ -328,6 +367,16 @@ public final class AgentControlScreen extends Screen {
 				AgentControlLayout shell = layout();
 				LiveArenaLayout live = LiveArenaLayout.calculate(
 						shell.contentWidth(), shell.contentHeight(), arena.standings().size());
+				int feedTop = liveFeedTop(shell, live, Math.min(live.visibleCount(), arena.standings().size()));
+				if (mouseY >= feedTop && feedTop < shell.contentBottom() - 14 && !arena.feed().isEmpty()) {
+					LiveFeedViewport viewport = LiveFeedViewport.calculate(
+							arena.feed().size(), shell.contentBottom() - feedTop - 14, liveFeedScroll);
+					int nextFeed = viewport.scrollBy(verticalAmount > 0.0D ? -1 : 1);
+					if (nextFeed != liveFeedScroll) {
+						liveFeedScroll = nextFeed;
+						return true;
+					}
+				}
 				int next = Math.clamp(liveScroll + (verticalAmount > 0.0D ? -live.columns() : live.columns()),
 						0, live.maximumScroll());
 				if (next != liveScroll) {
@@ -341,14 +390,54 @@ public final class AgentControlScreen extends Screen {
 
 	@Override
 	public boolean keyPressed(KeyEvent event) {
-		if (event.key() == GLFW.GLFW_KEY_ESCAPE && page == Page.GROUP
-				&& !rosterState.selectedIds().isEmpty()) {
-			rosterState.clearSelection();
-			compactGroupComposer = false;
-			rebuildWidgets();
+		if (page == Page.LIVE && handleLiveKeyboardScroll(event.key())) return true;
+		if (event.key() == GLFW.GLFW_KEY_ESCAPE) {
+			if (page == Page.OVERVIEW || page == Page.LIVE) return super.keyPressed(event);
+			navigateBack();
 			return true;
 		}
 		return super.keyPressed(event);
+	}
+
+	private boolean handleLiveKeyboardScroll(int key) {
+		ArenaSpectatorSnapshot arena = AgentControlClient.spectatorState().snapshot().orElse(null);
+		if (arena == null) return false;
+		AgentControlLayout shell = layout();
+		LiveArenaLayout live = LiveArenaLayout.calculate(
+				shell.contentWidth(), shell.contentHeight(), arena.standings().size());
+		if (key == GLFW.GLFW_KEY_UP || key == GLFW.GLFW_KEY_DOWN) {
+			int direction = key == GLFW.GLFW_KEY_UP ? -live.columns() : live.columns();
+			int next = Math.clamp(liveScroll + direction, 0, live.maximumScroll());
+			if (next == liveScroll) return false;
+			liveScroll = next;
+			return true;
+		}
+		int feedTop = liveFeedTop(shell, live, Math.min(live.visibleCount(), arena.standings().size()));
+		LiveFeedViewport feed = LiveFeedViewport.calculate(
+				arena.feed().size(), Math.max(20, shell.contentBottom() - feedTop - 14), liveFeedScroll);
+		int nextFeed = switch (key) {
+			case GLFW.GLFW_KEY_PAGE_UP -> feed.pageUp();
+			case GLFW.GLFW_KEY_PAGE_DOWN -> feed.pageDown();
+			case GLFW.GLFW_KEY_HOME -> 0;
+			case GLFW.GLFW_KEY_END -> feed.maximumScroll();
+			default -> liveFeedScroll;
+		};
+		if (nextFeed == liveFeedScroll) return false;
+		liveFeedScroll = nextFeed;
+		return true;
+	}
+
+	private void navigateBack() {
+		if (page == Page.REMOVE_CONFIRM) {
+			show(Page.MANAGE);
+			return;
+		}
+		if (page == Page.GROUP && compactGroupComposer) {
+			compactGroupComposer = false;
+			rebuildWidgets();
+			return;
+		}
+		show(Page.OVERVIEW);
 	}
 
 	private void addNavigation() {
@@ -795,6 +884,7 @@ public final class AgentControlScreen extends Screen {
 					provider = value;
 					model = AgentControlCatalog.defaultModel(provider);
 					reasoning = AgentControlCatalog.defaultReasoning(provider, model);
+					serviceTier = AgentControlCatalog.defaultServiceTier(provider, model);
 					rememberPreferences();
 					rebuildWidgets();
 				}));
@@ -803,6 +893,7 @@ public final class AgentControlScreen extends Screen {
 				value -> Component.literal(AgentControlCatalog.displayName(provider, value)), value -> {
 					model = value;
 					reasoning = AgentControlCatalog.defaultReasoning(provider, model);
+					serviceTier = AgentControlCatalog.defaultServiceTier(provider, model);
 					rememberPreferences();
 					rebuildWidgets();
 				}));
@@ -817,7 +908,10 @@ public final class AgentControlScreen extends Screen {
 			addRenderableWidget(new ConsoleCycleButton<>(font, x + half + GAP, y, half, ROW_HEIGHT,
 					Component.literal("Speed mode"), AgentControlCatalog.serviceTiers(provider, model), serviceTier,
 					value -> Component.literal(AgentControlPresentation.speedLabel(value)),
-					value -> serviceTier = value));
+					value -> {
+						serviceTier = value;
+						rememberPreferences();
+					}));
 		} else {
 			ConsoleButton unavailableSpeed = consoleButton(Component.translatable("screen.arenaagents.speed_unavailable"), x + half + GAP, y,
 					half, ROW_HEIGHT, false, () -> { });
@@ -931,16 +1025,18 @@ public final class AgentControlScreen extends Screen {
 
 	private void addCreateFooter() {
 		int y = layout().footerY();
-		addRenderableWidget(consoleButton("Cancel", contentLeft(), y, 96, ROW_HEIGHT, false,
-				() -> show(Page.OVERVIEW)));
-		addRenderableWidget(primaryButton("Create agent", contentRight() - 130, y, 130, ROW_HEIGHT,
-				this::submitSummon));
+		addRenderableWidget(consoleButton("Back to agents", contentLeft(), y, 130, ROW_HEIGHT, false,
+				this::navigateBack));
+		ConsoleButton create = primaryButton("Create agent", contentRight() - 130, y, 130, ROW_HEIGHT,
+				this::submitSummon);
+		create.active = canControl();
+		addRenderableWidget(create);
 	}
 
 	private void addBackFooter() {
 		int y = layout().footerY();
 		addRenderableWidget(consoleButton("Back to agents", contentLeft(), y, 130, ROW_HEIGHT, false,
-				() -> show(Page.OVERVIEW)));
+				this::navigateBack));
 	}
 
 	private void renderShell(GuiGraphicsExtractor graphics) {
@@ -1074,9 +1170,14 @@ public final class AgentControlScreen extends Screen {
 					live.cardWidth(), live.cardHeight());
 		}
 		int shown = end - liveScroll;
-		int rows = (shown + live.columns() - 1) / live.columns();
-		int feedTop = gridTop + rows * (live.cardHeight() + LiveArenaLayout.ROW_GAP) + 2;
+		int feedTop = liveFeedTop(layout, live, shown);
 		if (feedTop < layout.contentBottom() - 30) renderActivityFeed(graphics, arena.feed(), left, feedTop, available);
+	}
+
+	private static int liveFeedTop(AgentControlLayout layout, LiveArenaLayout live, int shownStandings) {
+		int rows = (shownStandings + live.columns() - 1) / live.columns();
+		return layout.contentTop() + live.gridTopOffset()
+				+ rows * (live.cardHeight() + LiveArenaLayout.ROW_GAP) + 2;
 	}
 
 	private void renderBuildProgress(GuiGraphicsExtractor graphics, ScenarioBuildProgress build, boolean detailed) {
@@ -1085,10 +1186,17 @@ public final class AgentControlScreen extends Screen {
 		int top = layout.contentTop();
 		int right = contentRight();
 		int color = build.status() == ScenarioBuildProgress.Status.FAILED ? ERROR
-				: build.status() == ScenarioBuildProgress.Status.READY ? SUCCESS : ACCENT;
+				: build.status() == ScenarioBuildProgress.Status.READY ? SUCCESS
+				: build.status() == ScenarioBuildProgress.Status.CANCELLED ? MUTED : ACCENT;
 		graphics.fill(left, top, right, top + (detailed ? 104 : 38), SURFACE);
-		graphics.text(font, build.status() == ScenarioBuildProgress.Status.BUILDING ? "Building arena"
-				: build.status() == ScenarioBuildProgress.Status.READY ? "Arena ready" : "Build failed",
+		String heading = switch (build.status()) {
+			case BUILDING -> "Building arena";
+			case CONFIRMATION_REQUIRED -> "Confirm arena build";
+			case READY -> "Arena ready";
+			case FAILED -> "Build failed";
+			case CANCELLED -> "Arena build cancelled";
+		};
+		graphics.text(font, heading,
 				left + 12, top + 10, color, false);
 		graphics.text(font, fit(build.scenarioTitle(), Math.max(40, right - left - 170)), left + 12, top + 24, TEXT, false);
 		String percentage = build.percent() + "%";
@@ -1154,14 +1262,23 @@ public final class AgentControlScreen extends Screen {
 			int top,
 			int width
 	) {
-		graphics.text(font, "Recent match activity", left, top, MUTED, false);
-		int y = top + 14;
 		if (feed.isEmpty()) {
+			graphics.text(font, "Recent match activity", left, top, MUTED, false);
+			int y = top + 14;
 			graphics.text(font, "Waiting for the first scored action.", left, y, MUTED, false);
 			return;
 		}
-		for (ScenarioPublicEvent event : feed.reversed()) {
-			if (y > layout().contentBottom() - 17) break;
+		LiveFeedViewport viewport = LiveFeedViewport.calculate(
+				feed.size(), layout().contentBottom() - top - 14, liveFeedScroll);
+		liveFeedScroll = viewport.scroll();
+		int shown = Math.min(viewport.visibleRows(), feed.size() - viewport.scroll());
+		String heading = viewport.maximumScroll() == 0 ? "Recent match activity"
+				: "Match activity, " + (viewport.scroll() + 1) + " to "
+						+ (viewport.scroll() + shown) + " of " + feed.size();
+		graphics.text(font, fit(heading, width), left, top, MUTED, false);
+		int y = top + 14;
+		for (int index = 0; index < shown; index++) {
+			ScenarioPublicEvent event = feed.get(viewport.sourceIndex(feed.size(), index));
 			graphics.fill(left, y, left + width, y + 17, TRACK);
 			graphics.text(font, fit(event.message(), width - 82), left + 7, y + 4, TEXT, false);
 			String state = ArenaHudPresentation.statusLabel(event.state());
@@ -1173,7 +1290,11 @@ public final class AgentControlScreen extends Screen {
 	private void renderOverview(GuiGraphicsExtractor graphics) {
 		AgentControlLayout layout = layout();
 		if (snapshot == null) {
-			graphics.text(font, "Loading your agents...", contentLeft(), layout.contentTop() + 27, MUTED, false);
+			Optional<String> error = AgentControlClient.snapshotError();
+			graphics.text(font, error.isPresent() ? "Agent roster unavailable" : "Loading your agents...",
+					contentLeft(), layout.contentTop() + 27, error.isPresent() ? ERROR : MUTED, false);
+			error.ifPresent(message -> graphics.text(font, fit(message, contentWidth()), contentLeft(),
+					layout.contentTop() + 43, MUTED, false));
 			return;
 		}
 		if (snapshot.agents().isEmpty()) {
@@ -1266,6 +1387,14 @@ public final class AgentControlScreen extends Screen {
 			int y = layout.sideNavigation() ? layout.footerY() - 14 : layout.contentTop() - 9;
 			ConsoleText.centered(graphics, font, fit(feedback, layout.contentWidth()), width / 2, y,
 					feedbackError ? ERROR : SUCCESS);
+		} else if (mutationState.mutationPending()) {
+			AgentControlLayout layout = layout();
+			ConsoleText.centered(graphics, font, "Waiting for the server update...", width / 2,
+					layout.sideNavigation() ? layout.footerY() - 14 : layout.contentTop() - 9, ACCENT);
+		} else if (snapshot != null && !snapshot.canControl()) {
+			AgentControlLayout layout = layout();
+			ConsoleText.centered(graphics, font, "View only. Operator permission is required to make changes.",
+					width / 2, layout.sideNavigation() ? layout.footerY() - 14 : layout.contentTop() - 9, ACCENT);
 		} else if (page != Page.LIVE) {
 			ScenarioBuildProgress build = AgentControlClient.buildProgressState().progress().orElse(null);
 			if (build != null && build.status() == ScenarioBuildProgress.Status.BUILDING) {
@@ -1303,6 +1432,7 @@ public final class AgentControlScreen extends Screen {
 	private void submitPrompt(String operation) {
 		AgentControlAgent agent = selectedAgent();
 		if (agent == null) return;
+		if (rejectPendingMutation()) return;
 		if (!canUseAutomation()) {
 			setFeedback(snapshot == null ? "Automation is not ready" : snapshot.automationStatus(), true);
 			return;
@@ -1317,6 +1447,7 @@ public final class AgentControlScreen extends Screen {
 
 	private void submitGroupPrompt(String operation) {
 		List<AgentControlAgent> agents = selectedGroupAgents();
+		if (rejectPendingMutation()) return;
 		if (!canUseAutomation()) {
 			setFeedback(snapshot == null ? "Automation is not ready" : snapshot.automationStatus(), true);
 			return;
@@ -1332,15 +1463,20 @@ public final class AgentControlScreen extends Screen {
 			prompt = promptInput.getValue();
 			List<String> accepted = new ArrayList<>();
 			List<String> rejected = new ArrayList<>();
+			long latestMutationId = 0L;
 			for (AgentControlAgent agent : agents) {
-				if (AgentControlClient.sendCommand(
-						AgentControlCommandBuilder.prompt(operation, agent.agentId(), prompt))) {
+				OptionalLong receipt = AgentControlClient.sendCommandWithReceipt(
+						AgentControlCommandBuilder.prompt(operation, agent.agentId(), prompt));
+				if (receipt.isPresent()) {
 					accepted.add(agent.displayName());
+					latestMutationId = receipt.getAsLong();
 				} else {
 					rejected.add(agent.displayName());
 				}
 			}
+			if (latestMutationId > 0L) mutationState = mutationState.beginMutation(latestMutationId);
 			setFeedback(AgentControlActions.deliverySummary(accepted, rejected), !rejected.isEmpty());
+			rebuildWidgets();
 		} catch (IllegalArgumentException exception) {
 			setFeedback(exception.getMessage(), true);
 		}
@@ -1366,12 +1502,26 @@ public final class AgentControlScreen extends Screen {
 	}
 
 	private boolean send(String command, String pendingMessage) {
-		if (AgentControlClient.sendCommand(command)) {
+		if (rejectPendingMutation()) return false;
+		if (!serverCanControl()) {
+			setFeedback("View only. Operator permission is required to make changes.", true);
+			return false;
+		}
+		OptionalLong receipt = AgentControlClient.sendCommandWithReceipt(command);
+		if (receipt.isPresent()) {
+			mutationState = mutationState.beginMutation(receipt.getAsLong());
 			setFeedback(pendingMessage + " Awaiting server update.", false);
+			rebuildWidgets();
 			return true;
 		}
 		setFeedback("Not connected to a compatible server", true);
 		return false;
+	}
+
+	private boolean rejectPendingMutation() {
+		if (!mutationState.mutationPending()) return false;
+		setFeedback("Wait for the current server update before sending another command.", true);
+		return true;
 	}
 
 	private void show(Page next) {
@@ -1392,13 +1542,13 @@ public final class AgentControlScreen extends Screen {
 	}
 
 	private void rememberPreferences() {
-		AgentControlClient.rememberPreferences(provider, model, reasoning);
+		AgentControlClient.rememberPreferences(provider, model, reasoning, serviceTier);
 	}
 
 	private void normalizeCreateSelection() {
 		AgentControlClient.Preferences remembered = AgentControlClient.preferences();
 		CreateSelection normalized = normalizeCreateSelection(
-				remembered.provider(), remembered.model(), remembered.reasoning(), serviceTier);
+				remembered.provider(), remembered.model(), remembered.reasoning(), remembered.serviceTier());
 		provider = normalized.provider();
 		model = normalized.model();
 		reasoning = normalized.reasoning();
@@ -1610,6 +1760,10 @@ public final class AgentControlScreen extends Screen {
 	}
 
 	private boolean canControl() {
+		return serverCanControl() && !mutationState.mutationPending();
+	}
+
+	private boolean serverCanControl() {
 		return snapshot != null && snapshot.canControl();
 	}
 

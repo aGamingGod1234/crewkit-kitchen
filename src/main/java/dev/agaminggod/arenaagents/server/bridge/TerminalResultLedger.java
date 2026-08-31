@@ -2,6 +2,10 @@ package dev.agaminggod.arenaagents.server.bridge;
 
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionResult;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -18,30 +22,39 @@ import java.util.UUID;
  * and makes the result eligible for the next session.</p>
  */
 final class TerminalResultLedger {
-	private static final int MAX_RESULTS_PER_AGENT = 4_096;
+	private static final int MAX_PENDING_RESULTS = 4_096;
+	private static final int MAX_RETIRED_RESULTS = 4_096;
 	private final Map<AgentId, GoalFence> goalFences = new LinkedHashMap<>();
 	private final LinkedHashMap<Key, Entry> pending = new LinkedHashMap<>();
+	private final LinkedHashMap<Key, RetiredEntry> retired = new LinkedHashMap<>();
 
-	/** Advances a lifecycle revision while retaining terminal results for the same logical goal. */
+	/** Advances the live lifecycle fence without pruning globally retained terminal identities. */
 	synchronized void beginGoal(AgentId agentId, long goalRevision, UUID logicalGoalId) {
 		Objects.requireNonNull(agentId, "agentId must not be null");
 		if (goalRevision < 0L) throw new IllegalArgumentException("goalRevision must be nonnegative");
-		GoalFence previous = goalFences.put(agentId, new GoalFence(goalRevision, logicalGoalId));
-		if (previous != null && logicalGoalId != null && logicalGoalId.equals(previous.logicalGoalId())) return;
-		removeOtherGoals(agentId, logicalGoalId);
+		goalFences.put(agentId, new GoalFence(goalRevision, logicalGoalId));
 	}
 
-	/** Retains a result only when it belongs to the current goal fence. */
+	/** Retains every trusted terminal result until acknowledgement or global FIFO retirement. */
 	synchronized boolean retain(ServerActionResult result) {
 		Objects.requireNonNull(result, "result must not be null");
 		GoalFence current = goalFences.get(result.agentId());
-		if (current != null && current.goalRevision() != result.goalRevision()) return false;
 		UUID logicalGoalId = current == null ? null : current.logicalGoalId();
 		if (current == null) goalFences.put(result.agentId(), new GoalFence(result.goalRevision(), null));
 		Key key = new Key(result.agentId(), result.goalRevision(), result.actionId());
-		if (pending.containsKey(key)) return true;
+		Entry existing = pending.get(key);
+		if (existing != null) {
+			requireSameResult(existing.result(), result);
+			return true;
+		}
+		RetiredEntry retiredEntry = retired.get(key);
+		if (retiredEntry != null) {
+			requireSameResult(retiredEntry.fingerprint(), result);
+			if (retiredEntry.acknowledged()) return false;
+			retired.remove(key);
+		}
 		pending.put(key, new Entry(result, logicalGoalId));
-		trimAgent(result.agentId());
+		trimPending();
 		return true;
 	}
 
@@ -80,38 +93,89 @@ final class TerminalResultLedger {
 	synchronized boolean acknowledge(AgentId agentId, long goalRevision, String actionId) {
 		Objects.requireNonNull(agentId, "agentId must not be null");
 		Objects.requireNonNull(actionId, "actionId must not be null");
-		return pending.remove(new Key(agentId, goalRevision, actionId)) != null;
+		Key key = new Key(agentId, goalRevision, actionId);
+		Entry entry = pending.remove(key);
+		if (entry != null) {
+			retire(key, entry, true);
+			return true;
+		}
+		RetiredEntry retiredEntry = retired.get(key);
+		if (retiredEntry == null) return false;
+		if (!retiredEntry.acknowledged()) retired.put(key, retiredEntry.acknowledge());
+		return true;
 	}
 
 	synchronized void remove(AgentId agentId) {
 		Objects.requireNonNull(agentId, "agentId must not be null");
 		goalFences.remove(agentId);
-		for (Iterator<Key> iterator = pending.keySet().iterator(); iterator.hasNext();) {
-			if (iterator.next().agentId().equals(agentId)) iterator.remove();
-		}
+		removeAgent(pending, agentId);
+		removeAgent(retired, agentId);
 	}
 
 	synchronized int pendingCount() {
 		return pending.size();
 	}
 
-	private void removeOtherGoals(AgentId agentId, UUID logicalGoalId) {
-		for (Iterator<Key> iterator = pending.keySet().iterator(); iterator.hasNext();) {
-			Key key = iterator.next();
-			if (key.agentId().equals(agentId)
-					&& (logicalGoalId == null || !logicalGoalId.equals(pending.get(key).logicalGoalId()))) iterator.remove();
+	private void trimPending() {
+		while (pending.size() > MAX_PENDING_RESULTS) {
+			Map.Entry<Key, Entry> oldest = pending.entrySet().iterator().next();
+			pending.remove(oldest.getKey());
+			retire(oldest.getKey(), oldest.getValue(), false);
 		}
 	}
 
-	private void trimAgent(AgentId agentId) {
-		int count = 0;
-		for (Key key : pending.keySet()) if (key.agentId().equals(agentId)) count++;
-		if (count <= MAX_RESULTS_PER_AGENT) return;
-		for (Iterator<Key> iterator = pending.keySet().iterator(); iterator.hasNext() && count > MAX_RESULTS_PER_AGENT;) {
-			if (iterator.next().agentId().equals(agentId)) {
-				iterator.remove();
-				count--;
-			}
+	private void retire(Key key, Entry entry, boolean acknowledged) {
+		RetiredEntry previous = retired.remove(key);
+		boolean finalAcknowledged = acknowledged || previous != null && previous.acknowledged();
+		retired.put(key, new RetiredEntry(fingerprint(entry.result()), entry.logicalGoalId(), finalAcknowledged));
+		while (retired.size() > MAX_RETIRED_RESULTS) retired.remove(retired.keySet().iterator().next());
+	}
+
+	private static void requireSameResult(ServerActionResult expected, ServerActionResult actual) {
+		if (!expected.equals(actual)) {
+			throw new IllegalStateException("Terminal action identity is bound to a different result");
+		}
+	}
+
+	private static void requireSameResult(String expectedFingerprint, ServerActionResult actual) {
+		if (!expectedFingerprint.equals(fingerprint(actual))) {
+			throw new IllegalStateException("Terminal action identity is bound to a different result");
+		}
+	}
+
+	private static String fingerprint(ServerActionResult result) {
+		try {
+			MessageDigest digest = MessageDigest.getInstance("SHA-256");
+			update(digest, result.agentId().toString());
+			update(digest, Long.toString(result.goalRevision()));
+			update(digest, result.actionId());
+			update(digest, result.actionType().wireName());
+			update(digest, result.traceId());
+			update(digest, result.state().name());
+			update(digest, result.reasonCode());
+			update(digest, result.message());
+			update(digest, Long.toString(result.elapsedMs()));
+			update(digest, Long.toString(result.observedAtEpochMs()));
+			update(digest, Boolean.toString(result.executionStarted()));
+			update(digest, Boolean.toString(result.physicalAttempted()));
+			return HexFormat.of().formatHex(digest.digest());
+		} catch (NoSuchAlgorithmException exception) {
+			throw new IllegalStateException("SHA-256 is unavailable", exception);
+		}
+	}
+
+	private static void update(MessageDigest digest, String value) {
+		byte[] bytes = value == null ? new byte[0] : value.getBytes(StandardCharsets.UTF_8);
+		digest.update((byte) (bytes.length >>> 24));
+		digest.update((byte) (bytes.length >>> 16));
+		digest.update((byte) (bytes.length >>> 8));
+		digest.update((byte) bytes.length);
+		digest.update(bytes);
+	}
+
+	private static void removeAgent(Map<Key, ?> entries, AgentId agentId) {
+		for (Iterator<Key> iterator = entries.keySet().iterator(); iterator.hasNext();) {
+			if (iterator.next().agentId().equals(agentId)) iterator.remove();
 		}
 	}
 
@@ -122,6 +186,12 @@ final class TerminalResultLedger {
 	private record Key(AgentId agentId, long goalRevision, String actionId) { }
 
 	private record GoalFence(long goalRevision, UUID logicalGoalId) { }
+
+	private record RetiredEntry(String fingerprint, UUID logicalGoalId, boolean acknowledged) {
+		private RetiredEntry acknowledge() {
+			return acknowledged ? this : new RetiredEntry(fingerprint, logicalGoalId, true);
+		}
+	}
 
 	private static final class Entry {
 		private final ServerActionResult result;

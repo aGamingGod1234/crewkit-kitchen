@@ -3,6 +3,7 @@ param([string] $ProjectRoot)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'project-metadata.ps1')
 if ([string]::IsNullOrWhiteSpace($ProjectRoot)) { $ProjectRoot = Split-Path -Parent $PSScriptRoot }
 
 $Project = [IO.Path]::GetFullPath($ProjectRoot)
@@ -12,7 +13,7 @@ $Coordinator = Join-Path $Project 'coordinator'
 $CoordinatorPackagingVerifier = Join-Path $Project 'scripts\verify-coordinator-packaging.ps1'
 $DistributionRuntimeVerifier = Join-Path $Project 'scripts\verify-distribution-runtime.ps1'
 $StartupPackagingVerifier = Join-Path $Project 'scripts\verify-startup-packaging.ps1'
-$AgentJar = Join-Path $Project 'build\libs\arena-agents-0.2.0.jar'
+$AgentJar = Resolve-ArenaModJar $Project
 if (-not (Test-Path -LiteralPath $Java -PathType Leaf)) { throw "Missing project JDK: $Java" }
 if (-not (Test-Path -LiteralPath (Join-Path $Coordinator 'package.json') -PathType Leaf)) { throw 'Missing coordinator package.json.' }
 if (-not (Test-Path -LiteralPath $CoordinatorPackagingVerifier -PathType Leaf)) { throw 'Missing coordinator packaging verifier.' }

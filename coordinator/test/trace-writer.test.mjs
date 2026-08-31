@@ -2,6 +2,29 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { observationHash, redact, TraceWriter } from '../src/trace-writer.mjs';
+import { RotatingJsonlSink } from '../src/rotating-jsonl-sink.mjs';
+
+test('rotating JSONL sinks bound active size, age, and retained generations', async () => {
+	let active = { size: 20, mtimeMs: 0 };
+	const operations = [];
+	const sink = new RotatingJsonlSink('trace.jsonl', {
+		maxFileBytes: 24,
+		maxFileAgeMs: 10,
+		retainedGenerations: 2,
+		now: () => 20,
+		stat: async () => active,
+		unlink: async (file) => { operations.push(['unlink', file]); },
+		rename: async (from, to) => { operations.push(['rename', from, to]); if (from === 'trace.jsonl') active = null; },
+		appendFile: async (file, encoded) => { operations.push(['append', file, encoded]); active = { size: Buffer.byteLength(encoded), mtimeMs: 20 }; },
+	});
+	await sink.append('{"event":"new"}\n', { encoding: 'utf8' });
+	assert.deepEqual(operations.slice(0, 4), [
+		['unlink', 'trace.jsonl.2'],
+		['rename', 'trace.jsonl.1', 'trace.jsonl.2'],
+		['rename', 'trace.jsonl', 'trace.jsonl.1'],
+		['append', 'trace.jsonl', '{"event":"new"}\n'],
+	]);
+});
 
 test('prepares both trace artifacts privately before appending', async () => {
 	const prepared = [];

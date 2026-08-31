@@ -9,6 +9,8 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'offline-server-policy.ps1')
+. (Join-Path $PSScriptRoot 'project-metadata.ps1')
 
 $MinecraftPort = 25565
 $BridgePort = 25570
@@ -112,8 +114,9 @@ $Server = Join-Path $Project 'runtime\server'
 $Coordinator = Join-Path $Project 'coordinator'
 $Java = Join-Path $Project 'runtime\toolchains\temurin-25\jdk-25.0.3+9\bin\java.exe'
 $ServerLauncher = Join-Path $Server 'fabric-server-launch.jar'
-$BuiltMod = Join-Path $Project 'build\libs\arena-agents-0.2.0.jar'
-$ServerMod = Join-Path $Server 'mods\arena-agents-0.2.0.jar'
+$ServerProperties = Join-Path $Server 'server.properties'
+$BuiltMod = Resolve-ArenaModJar $Project
+$ServerMod = Join-Path $Server "mods\$([IO.Path]::GetFileName($BuiltMod))"
 $CoordinatorMain = Join-Path $Coordinator 'src\dynamic-main.mjs'
 $CoordinatorConfig = Join-Path $Coordinator 'config\dynamic-agents.json'
 $SecretPath = Join-Path $Project 'runtime\bridge-secret.txt'
@@ -122,6 +125,7 @@ $ServerLog = Join-Path $Server 'logs\latest.log'
 foreach ($required in @(
 	$Java,
 	$ServerLauncher,
+	$ServerProperties,
 	$BuiltMod,
 	$CoordinatorMain,
 	$CoordinatorConfig,
@@ -131,6 +135,7 @@ foreach ($required in @(
 		throw "Missing headless smoke prerequisite: $required"
 	}
 }
+Assert-ArenaOfflineServerLoopback $ServerProperties -RequireOffline
 if ((Test-Port $MinecraftPort) -or (Test-Port $BridgePort)) {
 	throw "Headless smoke requires free ports $MinecraftPort and $BridgePort"
 }

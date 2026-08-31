@@ -1,5 +1,7 @@
 package dev.agaminggod.arenaagents.server;
 
+import dev.agaminggod.arenaagents.agent.AgentEntityLocation;
+
 public final class AgentRespawnSpawnPolicyVerification {
 	private AgentRespawnSpawnPolicyVerification() {
 	}
@@ -124,7 +126,59 @@ public final class AgentRespawnSpawnPolicyVerification {
 		), "successful retry reaches durable deletion");
 		assertEquals(2, physicalCleanupCalls.get(), "retry performs physical cleanup again");
 		assertEquals(1, durableDeleteCalls.get(), "durable deletion happens once after cleanup succeeds");
-		return 24;
+
+		java.util.Set<String> currentNames = java.util.Set.of("c00_11111111", "k20_22222222");
+		assertEquals(
+				java.util.List.of("c01_DEADBEEF", "legacy_33333333"),
+				CodexAgentManager.staleHiddenTeamMembers(
+						java.util.List.of("c00_11111111", "c01_DEADBEEF", "k20_22222222", "legacy_33333333"),
+						currentNames
+				),
+				"startup pruning selects only hidden-team identities absent from the current registry"
+		);
+		assertEquals(java.util.List.of(), CodexAgentManager.staleHiddenTeamMembers(currentNames, currentNames),
+				"repeated hidden-team cleanup is idempotent");
+		assertEquals(java.util.List.of("c00_11111111"), CodexAgentManager.staleHiddenTeamMembers(
+				java.util.List.of("c00_11111111"), java.util.Set.of()),
+				"removing the final registry record marks its hidden-team membership stale");
+		assertTrue(CodexAgentManager.shouldPersistEntityLocation(Long.MIN_VALUE, 10_000L, false),
+				"the first exact location is persisted immediately");
+		assertFalse(CodexAgentManager.shouldPersistEntityLocation(10_000L, 10_999L, false),
+				"the hot tick loop does not dirty saved data before the one-second bound");
+		assertTrue(CodexAgentManager.shouldPersistEntityLocation(10_000L, 11_000L, false),
+				"exact location persistence runs at the one-second bound");
+		assertTrue(CodexAgentManager.shouldPersistEntityLocation(10_999L, 10_999L, true),
+				"shutdown forces the final exact position and view write");
+
+		AgentEntityLocation exactLocation = AgentEntityLocation.exact(
+				"minecraft:overworld", -2, 2, -16.25D, 70.75D, 32.5D, 120.0F, -15.0F
+		);
+		java.util.concurrent.atomic.AtomicInteger safetyChecks = new java.util.concurrent.atomic.AtomicInteger();
+		CodexAgentManager.ExactRecoveryCoordinates exact = CodexAgentManager.exactRecoveryCoordinates(
+				exactLocation,
+				(x, y, z) -> {
+					safetyChecks.incrementAndGet();
+					assertEquals(-17, x, "exact recovery checks the saved feet X block");
+					assertEquals(70, y, "exact recovery checks the saved feet Y block");
+					assertEquals(32, z, "exact recovery checks the saved feet Z block");
+					return true;
+				}
+		).orElseThrow();
+		assertEquals(1, safetyChecks.get(), "exact recovery checks its feet, head, and floor column once");
+		assertEquals(-16.25D, exact.x(), "safe recovery preserves exact X");
+		assertEquals(70.75D, exact.y(), "safe recovery preserves exact Y");
+		assertEquals(32.5D, exact.z(), "safe recovery preserves exact Z");
+		assertEquals(120.0F, exact.yaw(), "safe recovery preserves yaw");
+		assertEquals(-15.0F, exact.pitch(), "safe recovery preserves pitch");
+		assertTrue(CodexAgentManager.exactRecoveryCoordinates(exactLocation, (x, y, z) -> false).isEmpty(),
+				"an unsafe exact column yields to the bounded nearby fallback");
+		assertTrue(CodexAgentManager.exactRecoveryCoordinates(
+				new AgentEntityLocation("minecraft:overworld", 0, 0),
+				(x, y, z) -> {
+					throw new AssertionError("coarse snapshots must skip exact recovery");
+				}
+		).isEmpty(), "coarse snapshots continue directly to bounded recovery");
+		return 42;
 	}
 
 	private static RuntimeException expectRuntimeFailure(Runnable operation) {

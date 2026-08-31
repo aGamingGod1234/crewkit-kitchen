@@ -26,6 +26,8 @@ final class VoicechatServerBindingsVerification {
 		bindings.started(apiA);
 		bindings.started(apiA);
 		VoicechatServerBindings.Binding<Object> original = bindings.configure(server, first);
+		assertSame(server, bindings.configuredServer(apiA),
+				"voice callback resolves its Minecraft server without reading a Minecraft player");
 		bindings.accept(server, apiA, null);
 		java.util.UUID speakingPlayer = java.util.UUID.randomUUID();
 		bindings.cancel(server, speakingPlayer);
@@ -43,6 +45,8 @@ final class VoicechatServerBindingsVerification {
 		bindings.stopped(apiA);
 		assertEquals(false, reconfigured.active(), "stop fences the live registration");
 		bindings.started(apiB);
+		assertSame(server, bindings.configuredServer(apiB),
+				"restarted voice API resolves the existing Minecraft server before handoff");
 		assertEquals(true, reconfigured.active(),
 				"the current binding adopts a newer voice-chat generation without reconfiguring Minecraft");
 		assertSame(apiB, reconfigured.owner(),
@@ -94,7 +98,7 @@ final class VoicechatServerBindingsVerification {
 		assertSame(apiB, repeatedB.owner(), "the newest pending API owns the configured server");
 		assertEquals(true, repeatedB.active(),
 				"stale stop and close from a displaced registration cannot clear the current API");
-		return 17;
+		return 19;
 	}
 
 	private static VoiceSubsystemConfiguration configuration(int port, char secret) {
@@ -124,7 +128,7 @@ final class VoicechatServerBindingsVerification {
 		}
 
 		@Override
-		public void accept(de.maxhenkel.voicechat.api.events.MicrophonePacketEvent event) {
+		public void accept(MicrophonePacketSnapshot packet) {
 		}
 
 		@Override

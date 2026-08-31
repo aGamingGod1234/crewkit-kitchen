@@ -15,7 +15,8 @@ class UncooperativeChild extends EventEmitter {
 		super();
 		this.stdout = new EventEmitter();
 		this.stderr = new EventEmitter();
-		this.stdin = { write() {} };
+		this.stdin = new EventEmitter();
+		this.stdin.write = () => {};
 		this.killed = false;
 		this.exitCode = null;
 		this.signalCode = null;
@@ -28,6 +29,31 @@ class UncooperativeChild extends EventEmitter {
 		return true;
 	}
 }
+
+test('provider transports own late stdio EPIPE errors and reject pending work once', async () => {
+	for (const [name, create] of [
+		['Codex', (child) => new CodexStdioTransport(
+			{ model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' },
+			{ spawn: spawnUncooperativeChild(child), stopTimeoutMs: FAST_STOP_TIMEOUT_MS },
+		)],
+		['ACP', (child) => new AcpStdioTransport(
+			{ provider: 'kimi', cwd: process.cwd() },
+			{ spawn: spawnUncooperativeChild(child), stopTimeoutMs: FAST_STOP_TIMEOUT_MS },
+		)],
+	]) {
+		const child = new UncooperativeChild();
+		const transport = create(child);
+		const exits = [];
+		transport.on('exit', (error) => exits.push(error));
+		await transport.start();
+		const pending = transport.request('pending/request', {}, { timeoutMs: SETTLE_TIMEOUT_MS });
+		child.stdin.emit('error', Object.assign(new Error('broken pipe'), { code: 'EPIPE' }));
+		await assert.rejects(pending, (error) => error?.code === 'PROCESS_IO_ERROR');
+		assert.equal(exits.length, 1, `${name} reports one owned transport loss`);
+		assert.throws(() => transport.notify('after/error'), (error) => error?.code === 'TRANSPORT_NOT_RUNNING');
+		await transport.stop();
+	}
+});
 
 function spawnUncooperativeChild(child) {
 	return () => {
@@ -208,7 +234,7 @@ test('Windows cleanup terminates the complete provider process tree', async () =
 	};
 
 	await terminateChildProcess(child, {
-		timeoutMs: FAST_STOP_TIMEOUT_MS,
+		timeoutMs: 50,
 		platform: 'win32',
 		execFile: execute,
 	});
@@ -237,11 +263,34 @@ test('Windows cleanup accepts a late exit when forced taskkill reports an alread
 	};
 
 	await terminateChildProcess(child, {
-		timeoutMs: FAST_STOP_TIMEOUT_MS,
+		// This assertion exercises the late-exit path, not the minimum timeout.
+		// Leave enough headroom for a loaded Windows CI runner to schedule the
+		// setImmediate callback after the graceful taskkill wait.
+		timeoutMs: 250,
 		platform: 'win32',
 		execFile: execute,
 	});
 	assert.equal(calls, 2);
+});
+
+test('Windows cleanup has one outer deadline when taskkill never settles', async () => {
+	const child = new UncooperativeChild();
+	child.pid = 4_244;
+	let calls = 0;
+	const startedAt = Date.now();
+
+	await assert.rejects(
+		terminateChildProcess(child, {
+			timeoutMs: 20,
+			platform: 'win32',
+			execFile: () => { calls += 1; },
+		}),
+		/before the 20ms deadline/,
+	);
+
+	assert.equal(calls, 1);
+	assert.ok(Date.now() - startedAt < 250);
+	assert.deepEqual(child.signals, ['SIGKILL']);
 });
 
 

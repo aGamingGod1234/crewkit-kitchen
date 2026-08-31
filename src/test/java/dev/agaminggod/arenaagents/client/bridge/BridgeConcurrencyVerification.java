@@ -9,6 +9,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -62,6 +63,15 @@ public final class BridgeConcurrencyVerification {
 					if (!(prematureSend.get() instanceof ProtocolException exception)
 							|| !"NO_AUTHENTICATED_SESSION".equals(exception.code())) {
 						throw new AssertionError("session became authenticated before hello acknowledgement was queued");
+					}
+					client.setSoTimeout(100);
+					try {
+						readMessage(client, codec);
+						throw new AssertionError("hello acknowledgement escaped before authentication was published");
+					} catch (SocketTimeoutException expected) {
+						// The writer must wait for the handshake state transition to finish.
+					} finally {
+						client.setSoTimeout(SOCKET_TIMEOUT_MS);
 					}
 
 					outbound.releaseFirstOffer();
@@ -526,8 +536,10 @@ public final class BridgeConcurrencyVerification {
 		@Override
 		public boolean offer(String message) {
 			if (offerCount.incrementAndGet() == 2) {
+				boolean offered = super.offer(message);
 				firstOfferEntered.countDown();
 				awaitFirstOfferRelease();
+				return offered;
 			}
 			return super.offer(message);
 		}

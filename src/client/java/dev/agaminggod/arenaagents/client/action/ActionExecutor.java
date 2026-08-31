@@ -176,6 +176,21 @@ public final class ActionExecutor {
 		return cancel(reason);
 	}
 
+	/** Releases client controls and forgets all status owned by a closed bridge session. */
+	public void reset() {
+		requireClientThread();
+		activeCommand = null;
+		activeAction = null;
+		state = null;
+		lastResult = null;
+		startedAtMonotonicMs = 0L;
+		lastProgressAtMonotonicMs = 0L;
+		activeTimeoutMs = 0L;
+		lastEventFailure = null;
+		knownCommandIds.clear();
+		context.releaseAll();
+	}
+
 	public ActionState state() {
 		return state;
 	}

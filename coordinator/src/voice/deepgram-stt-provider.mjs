@@ -1,5 +1,8 @@
+import { readBoundedResponseBody } from './bounded-response-body.mjs';
+
 const DEFAULT_ENDPOINT = 'https://api.deepgram.com/v1/listen?model=nova-3&smart_format=true&language=en&encoding=linear16&sample_rate=48000&channels=1';
 const MAX_PCM_BYTES = 48_000 * 2 * 20;
+const MAX_RESPONSE_BYTES = 256 * 1_024;
 
 export class DeepgramSttProvider {
 	#apiKey;
@@ -21,7 +24,8 @@ export class DeepgramSttProvider {
 			throw typedError('STT_MALFORMED_AUDIO', 'STT input must be at most 20 seconds of 48 kHz mono PCM');
 		}
 		const timeoutSignal = AbortSignal.timeout(this.#timeoutMs);
-		const combinedSignal = signal === undefined ? timeoutSignal : AbortSignal.any([signal, timeoutSignal]);
+		const responseController = new AbortController();
+		const combinedSignal = AbortSignal.any([responseController.signal, timeoutSignal, ...(signal === undefined ? [] : [signal])]);
 		const response = await this.#fetch(this.#endpoint, {
 			method: 'POST',
 			headers: {
@@ -39,7 +43,15 @@ export class DeepgramSttProvider {
 			if (response.status === 429) error.retryAfter = response.headers?.get?.('retry-after');
 			throw error;
 		}
-		const document = await response.json();
+		const body = await readBoundedResponseBody(
+			response,
+			MAX_RESPONSE_BYTES,
+			() => typedError('STT_RESPONSE_TOO_LARGE', 'Deepgram STT response exceeds the 256 KiB limit'),
+			{ onLimit: (error) => responseController.abort(error) },
+		);
+		let document;
+		try { document = JSON.parse(body.toString('utf8')); }
+		catch { throw typedError('STT_PROVIDER_ERROR', 'Deepgram STT returned malformed JSON'); }
 		const alternative = document?.results?.channels?.[0]?.alternatives?.[0];
 		const transcript = typeof alternative?.transcript === 'string' ? alternative.transcript.trim() : '';
 		if (transcript === '') return Object.freeze({ transcript: '', confidence: 0 });

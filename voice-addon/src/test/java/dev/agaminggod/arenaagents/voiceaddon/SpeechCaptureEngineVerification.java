@@ -193,7 +193,7 @@ final class SpeechCaptureEngineVerification {
 
 	private static int verifySilenceFlushesOneOrderedUtterance() throws Exception {
 		RecordingTranscriber transcriber = new RecordingTranscriber();
-		ScheduledExecutorService scheduler = scheduler();
+		ManualScheduledExecutor scheduler = new ManualScheduledExecutor();
 		SpeechCaptureEngine engine = new SpeechCaptureEngine(transcriber, scheduler, 20L, 32);
 		List<Delivered> delivered = new ArrayList<>();
 		CountDownLatch latch = new CountDownLatch(1);
@@ -204,6 +204,7 @@ final class SpeechCaptureEngineVerification {
 		Queue<RecordingDecoder> decoders = new ArrayDeque<>();
 		engine.accept(PLAYER, false, new byte[] { 1, 2 }, () -> decoder(decoders), Runnable::run, delivery);
 		engine.accept(PLAYER, false, new byte[] { 3 }, () -> decoder(decoders), Runnable::run, delivery);
+		scheduler.runEvenIfCancelled(1);
 		assertEquals(true, latch.await(2, TimeUnit.SECONDS), "silence flush completed");
 		Captured captured = transcriber.captured.getFirst();
 		assertEquals(1L, captured.sequence, "first utterance sequence");

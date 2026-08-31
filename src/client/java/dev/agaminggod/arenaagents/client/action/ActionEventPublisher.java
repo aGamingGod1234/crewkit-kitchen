@@ -6,7 +6,7 @@ import dev.agaminggod.arenaagents.protocol.ActionResult;
 import java.util.Objects;
 import java.util.function.Consumer;
 
-public final class ActionEventPublisher implements ActionExecutor.EventSink {
+public final class ActionEventPublisher implements ActionExecutor.EventSink, ClientActionRuntime.SessionEventSink {
 	public static final String EVENT_ACTION_PROGRESS = "action_progress";
 	public static final String EVENT_ACTION_RESULT = "action_result";
 
@@ -24,6 +24,11 @@ public final class ActionEventPublisher implements ActionExecutor.EventSink {
 
 	@Override
 	public void onProgress(ActionProgress progress) {
+		onProgress(0L, progress);
+	}
+
+	@Override
+	public void onProgress(long sessionId, ActionProgress progress) {
 		Objects.requireNonNull(progress, "progress must not be null");
 		JsonObject payload = new JsonObject();
 		payload.addProperty("commandId", progress.commandId());
@@ -32,11 +37,16 @@ public final class ActionEventPublisher implements ActionExecutor.EventSink {
 		payload.addProperty("elapsedMs", progress.elapsedMs());
 		payload.addProperty("message", progress.message());
 		payload.addProperty("observedAtEpochMs", progress.observedAtEpochMs());
-		send(EVENT_ACTION_PROGRESS, payload);
+		send(sessionId, EVENT_ACTION_PROGRESS, payload);
 	}
 
 	@Override
 	public void onResult(ActionResult result) {
+		onResult(0L, result);
+	}
+
+	@Override
+	public void onResult(long sessionId, ActionResult result) {
 		Objects.requireNonNull(result, "result must not be null");
 		JsonObject payload = new JsonObject();
 		payload.addProperty("commandId", result.commandId());
@@ -44,16 +54,17 @@ public final class ActionEventPublisher implements ActionExecutor.EventSink {
 		payload.addProperty("reasonCode", result.reasonCode());
 		payload.addProperty("message", result.message());
 		payload.addProperty("completedAtEpochMs", result.completedAtEpochMs());
-		send(EVENT_ACTION_RESULT, payload);
+		send(sessionId, EVENT_ACTION_RESULT, payload);
 	}
 
 	public RuntimeException lastFailure() {
 		return lastFailure;
 	}
 
-	private void send(String type, JsonObject payload) {
+	private void send(long sessionId, String type, JsonObject payload) {
 		try {
-			bridgeServer.sendEvent(type, payload);
+			if (sessionId == 0L) bridgeServer.sendEvent(type, payload);
+			else bridgeServer.sendEvent(sessionId, type, payload);
 		} catch (RuntimeException exception) {
 			lastFailure = exception;
 			try {

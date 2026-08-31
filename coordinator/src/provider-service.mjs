@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 
-const PROVIDERS = Object.freeze(['codex', 'gemini', 'kimi', 'cursor']);
+import { PROVIDER_IDS, assertProviderServiceTier, normalizeProviderId } from './provider-identity.mjs';
 const DEFAULT_SERVICE_TIER = 'priority';
 const PROFILE_KEYS = Object.freeze(['agentId', 'provider', 'model', 'reasoningEffort', 'serviceTier']);
 const DEFAULT_OPERATION_TIMEOUT_MS = 60_000;
@@ -56,7 +56,7 @@ export class ProviderService extends EventEmitter {
 		this.#scheduleTimeout = scheduleTimeout;
 		this.#cancelTimeout = cancelTimeout;
 		this.#now = now;
-		this.#services = new Map(PROVIDERS.filter((provider) => services[provider] !== undefined).map((provider) => {
+		this.#services = new Map(PROVIDER_IDS.filter((provider) => services[provider] !== undefined).map((provider) => {
 			const service = services[provider];
 			if (service === null || service === undefined) throw new TypeError(`${provider} service is required`);
 			return [provider, service];
@@ -876,10 +876,13 @@ function selectRecoveryBoundary(failures, { automaticOnly = false, requireDeadli
 
 function freezeProfile(value) {
 	if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('provider agent profile must be an object');
+	const provider = normalizeProvider(value.provider);
+	const serviceTier = value.serviceTier ?? DEFAULT_SERVICE_TIER;
+	assertProviderServiceTier(provider, serviceTier);
 	return Object.freeze({
 		...value,
-		provider: normalizeProvider(value.provider),
-		serviceTier: value.serviceTier ?? DEFAULT_SERVICE_TIER,
+		provider,
+		serviceTier,
 	});
 }
 
@@ -942,8 +945,7 @@ class CombinedProviderCatalog {
 
 function normalizeProvider(value) {
 	const provider = value ?? 'codex';
-	if (!PROVIDERS.includes(provider)) throw new TypeError(`provider must be one of ${PROVIDERS.join(', ')}`);
-	return provider;
+	return normalizeProviderId(provider);
 }
 
 function normalizeProviderSelection(values, services, { defaultToAll }) {

@@ -282,23 +282,38 @@ export class CodexStdioTransport extends EventEmitter {
 			child.once('error', onError);
 			if (Number.isInteger(child.pid) && child.pid > 0) onSpawn();
 		});
+		this.#ownRuntimeErrors(child);
 	}
 
-	request(method, params = {}, { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS } = {}) {
+	request(method, params = {}, { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, signal } = {}) {
 		this.#requireRunning();
+		if (signal?.aborted) return Promise.reject(new CodexProtocolError('REQUEST_ABORTED', `Codex request '${method}' was aborted`));
 		const id = this.#nextRequestId();
 		return new Promise((resolve, reject) => {
+			const onAbort = () => {
+				if (!this.#pending.delete(id)) return;
+				clearTimeout(timer);
+				this.#rememberTimedOutRequest(id);
+				reject(new CodexProtocolError('REQUEST_ABORTED', `Codex request '${method}' was aborted`));
+			};
 			const timer = setTimeout(() => {
 				this.#pending.delete(id);
+				signal?.removeEventListener?.('abort', onAbort);
 				this.#rememberTimedOutRequest(id);
 				reject(new CodexProtocolError('REQUEST_TIMEOUT', `Codex request '${method}' timed out after ${timeoutMs} ms`));
 			}, timeoutMs);
-			this.#pending.set(id, { method, resolve, reject, timer });
+			this.#pending.set(id, { method, resolve, reject, timer, signal, onAbort });
+			signal?.addEventListener?.('abort', onAbort, { once: true });
+			if (signal?.aborted) {
+				onAbort();
+				return;
+			}
 			try {
 				this.#write({ id, method, params });
 			} catch (error) {
 				clearTimeout(timer);
 				this.#pending.delete(id);
+				signal?.removeEventListener?.('abort', onAbort);
 				reject(error);
 			}
 		});
@@ -349,6 +364,7 @@ export class CodexStdioTransport extends EventEmitter {
 			}
 			this.#pending.delete(message.id);
 			clearTimeout(pending.timer);
+			pending.signal?.removeEventListener?.('abort', pending.onAbort);
 			if (Object.hasOwn(message, 'error')) pending.reject(new CodexProtocolError('RPC_ERROR', `${pending.method}: ${rpcErrorMessage(message.error)}`));
 			else if (Object.hasOwn(message, 'result')) pending.resolve(message.result);
 			else pending.reject(new CodexProtocolError('INVALID_RESPONSE', `Codex response for '${pending.method}' has no result or error`));
@@ -367,6 +383,28 @@ export class CodexStdioTransport extends EventEmitter {
 		const error = new CodexProtocolError('PROCESS_EXITED', `Codex app-server exited (code=${String(code)}, signal=${String(signal)})`);
 		this.#rejectPending(error);
 		this.emit('exit', error);
+	}
+
+	#ownRuntimeErrors(child) {
+		const own = (source) => source?.on?.('error', (error) => this.#onRuntimeError(child, error));
+		own(child);
+		own(child.stdin);
+		own(child.stdout);
+		own(child.stderr);
+	}
+
+	#onRuntimeError(child, cause) {
+		if (child !== this.#child) return;
+		this.#child = null;
+		const error = new CodexProtocolError(
+			'PROCESS_IO_ERROR',
+			`Codex app-server process I/O failed: ${sanitizeDiagnosticErrorMessage(cause)}`,
+			{ cause },
+		);
+		this.#rejectPending(error);
+		this.emit('exit', error);
+		void terminateChildProcess(child, { timeoutMs: this.#stopTimeoutMs })
+			.catch((stopError) => this.emit('protocolError', stopError));
 	}
 
 	#write(message) {
@@ -393,10 +431,51 @@ export class CodexStdioTransport extends EventEmitter {
 	#rejectPending(error) {
 		for (const pending of this.#pending.values()) {
 			clearTimeout(pending.timer);
+			pending.signal?.removeEventListener?.('abort', pending.onAbort);
 			pending.reject(error);
 		}
 		this.#pending.clear();
 	}
+}
+
+export async function listCodexModels(transport, {
+	signal,
+	maxPages = 32,
+	maxModels = 512,
+	yieldControl = () => new Promise((resolve) => setImmediate(resolve)),
+} = {}) {
+	const models = [];
+	const seenCursors = new Set();
+	let cursor = null;
+	for (let page = 0; page < maxPages; page += 1) {
+		throwIfCatalogAborted(signal);
+		const response = await transport.request(
+			'model/list',
+			{ cursor, limit: 100, includeHidden: false },
+			{ signal },
+		);
+		throwIfCatalogAborted(signal);
+		if (!Array.isArray(response?.data)) throw new CodexProtocolError('INVALID_CATALOG', 'model/list response must contain a data array');
+		if (models.length + response.data.length > maxModels) {
+			throw new CodexProtocolError('CATALOG_MODEL_LIMIT', `Codex model catalog exceeds ${maxModels} entries`);
+		}
+		models.push(...response.data);
+		const nextCursor = response.nextCursor ?? null;
+		if (nextCursor === null) return models;
+		if (typeof nextCursor !== 'string' || nextCursor.trim().length === 0 || nextCursor.length > 1_024) {
+			throw new CodexProtocolError('INVALID_CATALOG_CURSOR', 'model/list nextCursor must be a bounded nonblank string or null');
+		}
+		if (seenCursors.has(nextCursor)) throw new CodexProtocolError('CATALOG_CURSOR_LOOP', 'model/list repeated a pagination cursor');
+		seenCursors.add(nextCursor);
+		cursor = nextCursor;
+		if (page + 1 >= maxPages) throw new CodexProtocolError('CATALOG_PAGE_LIMIT', `Codex model catalog exceeds ${maxPages} pages`);
+		await yieldControl();
+	}
+	throw new CodexProtocolError('CATALOG_PAGE_LIMIT', `Codex model catalog exceeds ${maxPages} pages`);
+}
+
+function throwIfCatalogAborted(signal) {
+	if (signal?.aborted) throw new CodexProtocolError('REQUEST_ABORTED', 'Codex model catalog refresh was aborted');
 }
 
 export class CodexAgent {
@@ -501,15 +580,7 @@ export class CodexAgent {
 	}
 
 	async #listModels() {
-		const models = [];
-		let cursor = null;
-		do {
-			const response = await this.#transport.request('model/list', { cursor, limit: 100, includeHidden: false });
-			if (!Array.isArray(response?.data)) throw new CodexProtocolError('INVALID_CATALOG', 'model/list response must contain a data array');
-			models.push(...response.data);
-			cursor = response.nextCursor ?? null;
-		} while (cursor !== null);
-		return models;
+		return listCodexModels(this.#transport);
 	}
 
 	#collectTurn() {
@@ -566,14 +637,7 @@ export async function checkCodexModelProfile(configValue, transport = new CodexS
 	try {
 		await transport.request('initialize', { clientInfo: CLIENT_INFO, capabilities: CLIENT_CAPABILITIES });
 		transport.notify('initialized', {});
-		const models = [];
-		let cursor = null;
-		do {
-			const response = await transport.request('model/list', { cursor, limit: 100, includeHidden: false });
-			if (!Array.isArray(response?.data)) throw new CodexProtocolError('INVALID_CATALOG', 'model/list response must contain a data array');
-			models.push(...response.data);
-			cursor = response.nextCursor ?? null;
-		} while (cursor !== null);
+		const models = await listCodexModels(transport);
 		return verifyModelProfile(models, config);
 	} finally {
 		await transport.stop();

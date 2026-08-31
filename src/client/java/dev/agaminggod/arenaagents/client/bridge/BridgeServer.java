@@ -142,6 +142,32 @@ public final class BridgeServer implements AutoCloseable {
 		return session.sendEvent(type, payload);
 	}
 
+	public String sendEvent(long sessionId, String type, JsonObject payload) {
+		BridgeSession session;
+		synchronized (lifecycleLock) {
+			session = activeSession;
+		}
+		if (session == null || session.sessionId() != sessionId || !session.isAuthenticated()) {
+			throw new ProtocolException("STALE_BRIDGE_SESSION", "Bridge event belongs to a closed coordinator session");
+		}
+		return session.sendEvent(type, payload);
+	}
+
+	public long authenticatedSessionId() {
+		synchronized (lifecycleLock) {
+			return activeSession != null && activeSession.isAuthenticated() ? activeSession.sessionId() : 0L;
+		}
+	}
+
+	public void rotateSession() {
+		BridgeSession session;
+		synchronized (lifecycleLock) {
+			session = activeSession;
+			activeSession = null;
+		}
+		if (session != null) session.close();
+	}
+
 	public int encodedEventBytesAtMaximumEnvelope(String type, JsonObject payload) {
 		return BridgeSession.encodedEventBytesAtMaximumEnvelope(config, codec, type, payload);
 	}

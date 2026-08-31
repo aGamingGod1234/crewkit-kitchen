@@ -508,6 +508,25 @@ test('normalizes fixed and adaptive planning modes with production bounds', () =
 	assert.throws(() => normalizeDynamicConfig({ ...base, limits: { agentCap: 16, planningConcurrency: 17, planningMode: 'adaptive' } }), /adaptive planningConcurrency/);
 });
 
+test('dynamic config migrates legacy input and rejects unknown or future schema keys', () => {
+	const legacy = {
+		bridge: { port: 25570, secret: 's'.repeat(32) },
+		codex: {},
+		cursor: { serviceTiers: ['priority', 'fast'] },
+	};
+	const migrated = normalizeDynamicConfig(legacy);
+	assert.equal(migrated.schemaVersion, 1);
+	assert.equal(Object.hasOwn(migrated.cursor, 'serviceTiers'), false);
+	assert.throws(() => normalizeDynamicConfig({ ...legacy, schemaVersion: 2 }), /schemaVersion 2/);
+	assert.throws(() => normalizeDynamicConfig({ ...legacy, misspelledLimit: 1 }), /config\.misspelledLimit/);
+	assert.throws(() => normalizeDynamicConfig({ ...legacy, bridge: { ...legacy.bridge, reconnectDelay: 5 } }), /bridge\.reconnectDelay/);
+	assert.throws(() => normalizeDynamicConfig({
+		...legacy,
+		schemaVersion: 1,
+		cursor: { serviceTiers: ['priority'] },
+	}), /cursor\.serviceTiers/);
+});
+
 test('verbose feed never publishes raw provider chunks', async () => {
 	const registry = new AgentRegistry();
 	const planner = new FakePlanner(registry);
@@ -1969,7 +1988,8 @@ test('an invalid higher-revision conversation wake cannot retire the live native
 
 test('agent removal terminates ArenaScript supervision for the removed goal', async () => {
 	const goalSupervisor = new RecordingGoalSupervisor();
-	const run = await start({ goalSupervisor });
+	const removedProfiles = [];
+	const run = await start({ goalSupervisor, runtimeHooks: { onRemoved: (agentId) => removedProfiles.push(agentId) } });
 	try {
 		run.bridge.emit('goal_control', {
 			agentId: 'agent-a',
@@ -1983,6 +2003,7 @@ test('agent removal terminates ArenaScript supervision for the removed goal', as
 
 		assert.equal(goalSupervisor.terminations.length, 1);
 		assert.equal(goalSupervisor.terminations[0].goalRevision, 1);
+		assert.deepEqual(removedProfiles, ['agent-a']);
 	} finally {
 		await run.coordinator.stop();
 	}
@@ -2145,7 +2166,7 @@ test('coordinator reconnect preserves player pause and schedules one plan for du
 	};
 	const active = {
 		...record('agent-a'), state: DynamicAgentState.ACTING, currentGoal: 'Keep working.', goalRevision: 4,
-		provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'max', serviceTier: 'fast',
+		provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'max', serviceTier: 'priority',
 	};
 	const paused = { ...record('agent-b'), state: DynamicAgentState.PAUSED, currentGoal: 'Wait for Lucas.', goalRevision: 2 };
 	const run = await start({ registry, planner, initialRegistry: [active, paused] });

@@ -15,7 +15,12 @@ public final class VoiceConsentCommandVerification {
 				CodexAgentCommands.voiceConsentConfirmation(false),
 				"voice consent revocation remains explicit"
 		);
-		return 2;
+		assertEquals(
+				"VOICE_UNAVAILABLE: Install and start the Arena Agents Voice add-on with Simple Voice Chat",
+				CodexAgentCommands.voiceUnavailableMessage(),
+				"missing optional voice components report an actionable error"
+		);
+		return 3;
 	}
 
 	private static void assertEquals(String expected, String actual, String label) {

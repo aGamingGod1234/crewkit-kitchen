@@ -1,6 +1,5 @@
 package dev.agaminggod.arenaagents.voiceaddon;
 
-import de.maxhenkel.voicechat.api.events.MicrophonePacketEvent;
 import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemConfiguration;
 import java.util.Map;
 import java.util.Objects;
@@ -51,7 +50,7 @@ final class VoicechatServerBindings<S, O> {
 		return new ConfiguredBinding(server, association, association.revision);
 	}
 
-	void accept(S server, O owner, MicrophonePacketEvent event) {
+	void accept(S server, O owner, MicrophonePacketSnapshot packet) {
 		synchronized (this) {
 			Association association = associations.get(server);
 			if (association != null && association.configured && !association.registration.live
@@ -61,7 +60,22 @@ final class VoicechatServerBindings<S, O> {
 			if (association == null || !association.configured || !association.registration.live
 					|| association.registration.owner != owner) return;
 		}
-		captures.accept(server, owner, event);
+		captures.accept(server, owner, packet);
+	}
+
+	synchronized S configuredServer(O owner) {
+		S match = null;
+		for (Map.Entry<S, Association> candidate : associations.entrySet()) {
+			Association association = candidate.getValue();
+			boolean ownsCurrent = association.configured && association.registration.live
+					&& association.registration.owner == owner;
+			boolean canAdoptPending = association.configured && !association.registration.live
+					&& pending != null && pending.live && pending.owner == owner;
+			if (!ownsCurrent && !canAdoptPending) continue;
+			if (match != null && match != candidate.getKey()) return null;
+			match = candidate.getKey();
+		}
+		return match;
 	}
 
 	void cancel(S server, java.util.UUID playerId) {

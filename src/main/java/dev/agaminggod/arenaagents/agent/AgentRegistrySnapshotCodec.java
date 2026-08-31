@@ -10,6 +10,7 @@ import com.google.gson.JsonParser;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.OptionalDouble;
 import java.util.OptionalInt;
 import java.util.UUID;
 
@@ -97,6 +98,8 @@ public final class AgentRegistrySnapshotCodec {
 		ArrayList<AgentGoal> queue = new ArrayList<>(queueJson.size());
 		AgentProfile profile = decodeProfile(requireObject(requireElement(json, "profile"), "profile"));
 		AgentLifecycleState state = parseEnum(AgentLifecycleState.class, requireString(json, "state"), "state");
+		Optional<AgentGoal> currentGoal = optionalGoal(json, "current_goal", state);
+		state = migrateLegacyCompletedState(state, currentGoal);
 		for (JsonElement element : queueJson) {
 			queue.add(GOAL_CODEC.decode(requireObject(element, "queued goal"), dev.agaminggod.arenaagents.agent.goal.GoalStatus.ACTIVE));
 		}
@@ -108,7 +111,7 @@ public final class AgentRegistrySnapshotCodec {
 				profile,
 				state,
 				optionalBoolean(json, "resume_after_respawn", false),
-				optionalGoal(json, "current_goal", state),
+				currentGoal,
 				requireLong(json, "goal_revision"),
 				queue,
 				requireString(json, "last_summary"),
@@ -120,6 +123,19 @@ public final class AgentRegistrySnapshotCodec {
 				requireLong(json, "updated_at_epoch_ms"),
 				requireString(json, "last_error")
 		);
+	}
+
+	private static AgentLifecycleState migrateLegacyCompletedState(
+			AgentLifecycleState state,
+			Optional<AgentGoal> currentGoal
+	) {
+		if (state != AgentLifecycleState.COMPLETED) return state;
+		if (currentGoal.map(AgentGoal::status)
+				.filter(status -> status == dev.agaminggod.arenaagents.agent.goal.GoalStatus.SATISFIED)
+				.isPresent()) {
+			return state;
+		}
+		return currentGoal.isPresent() ? AgentLifecycleState.PAUSED : AgentLifecycleState.IDLE;
 	}
 
 	private static JsonObject encodeDeathSnapshot(AgentDeathSnapshot death) {
@@ -161,6 +177,11 @@ public final class AgentRegistrySnapshotCodec {
 		json.addProperty("chunk_z", location.chunkZ());
 		if (location.blockY().isPresent()) json.addProperty("block_y", location.blockY().getAsInt());
 		else json.add("block_y", null);
+		addOptionalDouble(json, "exact_x", location.exactX());
+		addOptionalDouble(json, "exact_y", location.exactY());
+		addOptionalDouble(json, "exact_z", location.exactZ());
+		addOptionalDouble(json, "yaw", location.yaw());
+		addOptionalDouble(json, "pitch", location.pitch());
 		return json;
 	}
 
@@ -173,13 +194,28 @@ public final class AgentRegistrySnapshotCodec {
 				requireString(json, "dimension"),
 				requireInt(json, "chunk_x"),
 				requireInt(json, "chunk_z"),
-				optionalInt(json, "block_y")
+				optionalInt(json, "block_y"),
+				optionalFiniteDouble(json, "exact_x"),
+				optionalFiniteDouble(json, "exact_y"),
+				optionalFiniteDouble(json, "exact_z"),
+				optionalFiniteDouble(json, "yaw"),
+				optionalFiniteDouble(json, "pitch")
 		));
+	}
+
+	private static void addOptionalDouble(JsonObject object, String field, OptionalDouble value) {
+		if (value.isPresent()) object.addProperty(field, value.getAsDouble());
+		else object.add(field, null);
 	}
 
 	private static OptionalInt optionalInt(JsonObject object, String field) {
 		if (!object.has(field) || object.get(field).isJsonNull()) return OptionalInt.empty();
 		return OptionalInt.of(requireInt(object, field));
+	}
+
+	private static OptionalDouble optionalFiniteDouble(JsonObject object, String field) {
+		if (!object.has(field) || object.get(field).isJsonNull()) return OptionalDouble.empty();
+		return OptionalDouble.of(requireDouble(object, field));
 	}
 
 	private static JsonObject encodeProfile(AgentProfile profile) {

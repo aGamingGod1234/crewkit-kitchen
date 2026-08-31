@@ -33,12 +33,18 @@ public final class MapBlockStateCatalogExporter {
 		Path output = Path.of(args[0]).toAbsolutePath().normalize();
 		byte[] encoded = encodeCatalog();
 		if (args.length == 2) {
-			if (!Files.isRegularFile(output) || !java.util.Arrays.equals(encoded, Files.readAllBytes(output))) {
+			if (!Files.isRegularFile(output) || !java.util.Arrays.equals(encoded, normalizedCatalogBytes(output))) {
 				throw new IllegalStateException("pinned block-state catalog differs from the resolved Minecraft 26.1.2 registry");
 			}
 			return;
 		}
 		writeAtomically(output, encoded);
+	}
+
+	private static byte[] normalizedCatalogBytes(Path output) throws IOException {
+		return Files.readString(output, StandardCharsets.UTF_8)
+				.replace("\r\n", "\n")
+				.getBytes(StandardCharsets.UTF_8);
 	}
 
 	private static void writeAtomically(Path output, byte[] encoded) throws IOException {

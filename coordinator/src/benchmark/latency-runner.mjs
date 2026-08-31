@@ -459,7 +459,7 @@ class VirtualMinecraftBridgeAdapter extends EventEmitter {
 	}
 	publish(agentId, options) { return this.#virtual.publish(agentId, options); }
 	flush() { return this.#virtual.flush(); }
-	startAgent(agentId, goal, goalSpec) { this.emit('goal_control', { agentId, payload: { operation: 'start', goalRevision: 1, goal, goalSpec, updatedAtEpochMs: 0 } }); }
+	startAgent(agentId, goal, goalSpec) { this.emit('goal_control', { agentId, payload: { operation: 'start', goalRevision: 1, goal, goalSpec, updatedAtEpochMs: 1 } }); }
 	get activeActionIds() { return this.#virtual.activeActionIds; }
 }
 

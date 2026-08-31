@@ -146,6 +146,17 @@ test('fact ledger projects keyed upserts and replacement deltas from a revision 
 	assert.equal(changed.nextRevision > changed.baseRevision, true);
 });
 
+test('unchanged heartbeat facts refresh expiry without advancing the planner revision', () => {
+	const ledger = new FactLedger({ maximumEntries: 4 });
+	ledger.add({ key: 'vitals', fact: '{"health":20}', source: 'observation', tick: 1, dimension: 'minecraft:overworld', expiresAtTick: 5, confidence: 1 });
+	const revision = ledger.delta(null, 1).nextRevision;
+	ledger.add({ key: 'vitals', fact: '{"health":20}', source: 'observation', tick: 2, dimension: 'minecraft:overworld', expiresAtTick: 10, confidence: 1 });
+	const unchanged = ledger.delta(revision, 2);
+	assert.equal(unchanged.nextRevision, revision);
+	assert.deepEqual(unchanged.upserts, []);
+	assert.equal(ledger.snapshot(6)[0].expiresAtTick, 10, 'the quiet refresh still extends factual freshness');
+});
+
 test('fact ledger emits expiry tombstones and falls back when a revision base is evicted', () => {
 	const ledger = new FactLedger({ maximumEntries: 1 });
 	ledger.add({ key: 'short', fact: 'temporary', source: 'observation', tick: 1, dimension: 'minecraft:overworld', expiresAtTick: 2, confidence: 1 });

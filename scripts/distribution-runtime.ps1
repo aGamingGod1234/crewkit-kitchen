@@ -207,8 +207,58 @@ function Install-ArenaCoordinatorRuntime {
 		return [PSCustomObject]@{
 			ActivePath = $activeCoordinator
 			BackupPath = $(if ($hadCoordinator) { $backupPath } else { $null })
+			HadCoordinator = $hadCoordinator
 			NodePath = Join-Path $activeNodeDirectory $(if ($env:OS -eq 'Windows_NT') { 'node.exe' } else { 'bin/node' })
+			NodeDirectory = $activeNodeDirectory
 			NodeBackupPath = $(if ($hadNode) { $nodeBackupPath } else { $null })
+			HadNode = $hadNode
+		}
+	} finally {
+		if ($null -ne $lock) { $lock.Dispose() }
+	}
+}
+
+function Undo-ArenaCoordinatorRuntimeInstall {
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory)] [string] $InstalledPackageRoot,
+		[Parameter(Mandatory)] [psobject] $Deployment
+	)
+
+	$resolvedInstalledRoot = [IO.Path]::GetFullPath($InstalledPackageRoot)
+	$activeCoordinator = Assert-ArenaRuntimeChildPath $resolvedInstalledRoot ([string] $Deployment.ActivePath)
+	$activeNodeDirectory = Assert-ArenaRuntimeChildPath $resolvedInstalledRoot ([string] $Deployment.NodeDirectory)
+	$backupCoordinator = if ([string]::IsNullOrWhiteSpace([string] $Deployment.BackupPath)) { $null } else {
+		Assert-ArenaRuntimeChildPath $resolvedInstalledRoot ([string] $Deployment.BackupPath)
+	}
+	$backupNode = if ([string]::IsNullOrWhiteSpace([string] $Deployment.NodeBackupPath)) { $null } else {
+		Assert-ArenaRuntimeChildPath $resolvedInstalledRoot ([string] $Deployment.NodeBackupPath)
+	}
+	$lockPath = Join-Path $resolvedInstalledRoot '.arena-runtime-install.lock'
+	$lock = $null
+	try {
+		try {
+			$lock = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+		} catch {
+			throw "Another Arena Agents runtime installation is already in progress: $($_.Exception.Message)"
+		}
+		$runtimes = @(
+			[pscustomobject]@{ Active = $activeCoordinator; Backup = $backupCoordinator; HadActive = [bool] $Deployment.HadCoordinator; Label = 'coordinator' },
+			[pscustomobject]@{ Active = $activeNodeDirectory; Backup = $backupNode; HadActive = [bool] $Deployment.HadNode; Label = 'Node.js' }
+		)
+		foreach ($runtime in $runtimes) {
+			if ($runtime.HadActive -and ($null -eq $runtime.Backup -or -not (Test-Path -LiteralPath $runtime.Backup -PathType Container))) {
+				throw "Cannot restore the previous $($runtime.Label) runtime because its backup is missing."
+			}
+		}
+		foreach ($runtime in $runtimes) {
+			if (Test-Path -LiteralPath $runtime.Active) {
+				Remove-Item -LiteralPath $runtime.Active -Recurse -Force -ErrorAction Stop
+			}
+			if ($null -ne $runtime.Backup) {
+				New-Item -ItemType Directory -Force -Path (Split-Path -Parent $runtime.Active) | Out-Null
+				Move-Item -LiteralPath $runtime.Backup -Destination $runtime.Active -ErrorAction Stop
+			}
 		}
 	} finally {
 		if ($null -ne $lock) { $lock.Dispose() }

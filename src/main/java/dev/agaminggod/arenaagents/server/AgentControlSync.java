@@ -5,14 +5,20 @@ import dev.agaminggod.arenaagents.control.AgentControlGroup;
 import dev.agaminggod.arenaagents.control.AgentControlSnapshot;
 import dev.agaminggod.arenaagents.control.AgentControlSnapshotPayload;
 import dev.agaminggod.arenaagents.scenario.ScenarioLaunchPayload;
+import dev.agaminggod.arenaagents.scenario.ScenarioCancelPayload;
 import dev.agaminggod.arenaagents.scenario.ScenarioPresets;
+import dev.agaminggod.arenaagents.scenario.presentation.ArenaSpectatorClearPayload;
 import dev.agaminggod.arenaagents.scenario.presentation.ArenaSpectatorSnapshot;
 import dev.agaminggod.arenaagents.scenario.presentation.ArenaSpectatorSnapshotPayload;
 import dev.agaminggod.arenaagents.scenario.presentation.ScenarioBuildProgress;
+import dev.agaminggod.arenaagents.scenario.presentation.ScenarioBuildProgressClearPayload;
 import dev.agaminggod.arenaagents.scenario.presentation.ScenarioBuildProgressPayload;
+import dev.agaminggod.arenaagents.scenario.presentation.ScenarioPresentationExpiry;
 import dev.agaminggod.arenaagents.scenario.runtime.ScenarioRuntimeService;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -25,6 +31,7 @@ import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.network.chat.Component;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -42,6 +49,7 @@ public final class AgentControlSync {
 		}
 		PayloadTypeRegistry.serverboundPlay().register(AgentControlRequestPayload.TYPE, AgentControlRequestPayload.CODEC);
 		PayloadTypeRegistry.serverboundPlay().register(ScenarioLaunchPayload.TYPE, ScenarioLaunchPayload.CODEC);
+		PayloadTypeRegistry.serverboundPlay().register(ScenarioCancelPayload.TYPE, ScenarioCancelPayload.CODEC);
 		PayloadTypeRegistry.clientboundPlay().register(AgentControlSnapshotPayload.TYPE, AgentControlSnapshotPayload.CODEC);
 		PayloadTypeRegistry.clientboundPlay().register(
 				ArenaSpectatorSnapshotPayload.TYPE,
@@ -50,6 +58,14 @@ public final class AgentControlSync {
 		PayloadTypeRegistry.clientboundPlay().register(
 				ScenarioBuildProgressPayload.TYPE,
 				ScenarioBuildProgressPayload.CODEC
+		);
+		PayloadTypeRegistry.clientboundPlay().register(
+				ScenarioBuildProgressClearPayload.TYPE,
+				ScenarioBuildProgressClearPayload.CODEC
+		);
+		PayloadTypeRegistry.clientboundPlay().register(
+				ArenaSpectatorClearPayload.TYPE,
+				ArenaSpectatorClearPayload.CODEC
 		);
 		boolean receiverRegistered = ServerPlayNetworking.registerGlobalReceiver(
 				AgentControlRequestPayload.TYPE,
@@ -70,16 +86,45 @@ public final class AgentControlSync {
 								} catch (RuntimeException exception) {
 									publishRejectedBuild(context.player(), payload, exception);
 								}
-							}
+							},
+							() -> publishRejectedBuild(
+									context.player(), payload,
+									new IllegalStateException("Operator permission is required to launch an arena")
+							)
 					);
 				})
 		);
 		if (!scenarioReceiverRegistered) {
 			throw new IllegalStateException("Arena Agents scenario launch receiver is already registered");
 		}
+		boolean scenarioCancelReceiverRegistered = ServerPlayNetworking.registerGlobalReceiver(
+				ScenarioCancelPayload.TYPE,
+				(payload, context) -> context.server().execute(() -> executeAuthorizedControlAction(
+						GoalControl.mayControl(context.player().createCommandSourceStack()),
+						() -> {
+							try {
+								ScenarioRuntimeService.cancel(context.player(), payload.buildId());
+								sendCurrentBuildProgress(context.player());
+							} catch (RuntimeException exception) {
+								context.player().sendSystemMessage(Component.literal(safeMessage(exception)));
+								sendCurrentBuildProgress(context.player());
+							}
+						},
+						() -> publishControlDenial(context.player(),
+								"Operator permission is required to cancel an arena")
+				))
+		);
+		if (!scenarioCancelReceiverRegistered) {
+			throw new IllegalStateException("Arena Agents scenario cancel receiver is already registered");
+		}
 		ServerTickEvents.END_SERVER_TICK.register(AgentControlSync::publishSpectatorSnapshot);
 		ServerTickEvents.END_SERVER_TICK.register(AgentControlSync::publishBuildProgress);
 		registered = true;
+	}
+
+	private static void publishControlDenial(ServerPlayer player, String message) {
+		player.sendSystemMessage(Component.literal(message));
+		sendSnapshot(player);
 	}
 
 	private static void sendCurrentBuildProgress(ServerPlayer player) {
@@ -112,6 +157,7 @@ public final class AgentControlSync {
 				origin.getX(), origin.getY(), origin.getZ(), detail);
 		try {
 			ServerPlayNetworking.send(player, ScenarioBuildProgressPayload.fromProgress(rejected));
+			rememberRejectedBuild(player.level().getServer(), player.getUUID(), rejected);
 		} catch (RuntimeException sendFailure) {
 			LOGGER.warn("Could not send rejected arena status to {}", player.getScoreboardName(), sendFailure);
 		}
@@ -119,25 +165,64 @@ public final class AgentControlSync {
 
 	private static synchronized void publishBuildProgress(MinecraftServer server) {
 		Optional<ScenarioBuildProgress> current = ScenarioRuntimeService.buildProgress(server);
-		if (current.isEmpty()) return;
 		SpectatorPublication publication = SPECTATOR_PUBLICATIONS.computeIfAbsent(
 				server, ignored -> new SpectatorPublication());
+		if (current.isEmpty()) {
+			clearBuildProgress(server, publication);
+			return;
+		}
 		ScenarioBuildProgress progress = current.orElseThrow();
+		if (publication.buildExpired(progress, publication.currentTick())) {
+			clearBuildProgress(server, publication);
+			return;
+		}
 		Set<UUID> connectedPlayers = new HashSet<>();
 		for (ServerPlayer player : server.getPlayerList().getPlayers()) {
 			connectedPlayers.add(player.getUUID());
 			if (!ServerPlayNetworking.canSend(player, ScenarioBuildProgressPayload.TYPE)) continue;
+			ScenarioBuildProgress selected = publication.directBuild(player.getUUID(), publication.currentTick())
+					.orElse(progress);
 			ScenarioBuildProgress previous = publication.lastBuildByPlayer.get(player.getUUID());
-			if (previous != null && previous.buildId().equals(progress.buildId())
-					&& previous.revision() >= progress.revision()) continue;
+			if (previous != null && previous.buildId().equals(selected.buildId())
+					&& previous.revision() >= selected.revision()) continue;
 			try {
-				ServerPlayNetworking.send(player, ScenarioBuildProgressPayload.fromProgress(progress));
-				publication.lastBuildByPlayer.put(player.getUUID(), progress);
+				ServerPlayNetworking.send(player, ScenarioBuildProgressPayload.fromProgress(selected));
+				publication.rememberBuild(player.getUUID(), selected);
 			} catch (RuntimeException exception) {
 				LOGGER.warn("Could not send Arena Agents build progress to {}", player.getScoreboardName(), exception);
 			}
 		}
 		publication.lastBuildByPlayer.keySet().retainAll(connectedPlayers);
+		publication.directBuildTerminalTicks.keySet().retainAll(connectedPlayers);
+	}
+
+	private static void clearBuildProgress(MinecraftServer server, SpectatorPublication publication) {
+		if (publication.lastBuildByPlayer.isEmpty()) return;
+		Set<UUID> connectedPlayers = new HashSet<>();
+		for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+			connectedPlayers.add(player.getUUID());
+			if (publication.directBuild(player.getUUID(), publication.currentTick()).isPresent()) continue;
+			if (!publication.lastBuildByPlayer.containsKey(player.getUUID())
+					|| !ServerPlayNetworking.canSend(player, ScenarioBuildProgressClearPayload.TYPE)) continue;
+			try {
+				ServerPlayNetworking.send(player, ScenarioBuildProgressClearPayload.INSTANCE);
+				publication.forgetBuild(player.getUUID());
+			} catch (RuntimeException exception) {
+				LOGGER.warn("Could not clear Arena Agents build progress for {}",
+						player.getScoreboardName(), exception);
+			}
+		}
+		publication.lastBuildByPlayer.keySet().retainAll(connectedPlayers);
+		publication.directBuildTerminalTicks.keySet().retainAll(connectedPlayers);
+	}
+
+	private static synchronized void rememberRejectedBuild(
+			MinecraftServer server,
+			UUID playerId,
+			ScenarioBuildProgress rejected
+	) {
+		SPECTATOR_PUBLICATIONS.computeIfAbsent(server, ignored -> new SpectatorPublication())
+				.rememberDirectBuild(playerId, rejected);
 	}
 
 	private static synchronized void publishSpectatorSnapshot(MinecraftServer server) {
@@ -146,14 +231,41 @@ public final class AgentControlSync {
 				ignored -> new SpectatorPublication()
 		);
 		long currentTick = publication.nextTick();
+		if (!publication.cadence.due(currentTick)) return;
+		Set<UUID> connectedPlayers = new HashSet<>();
+		List<ServerPlayer> recipients = new ArrayList<>();
+		boolean hasClearRecipient = false;
+		for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+			connectedPlayers.add(player.getUUID());
+			if (ServerPlayNetworking.canSend(player, ArenaSpectatorSnapshotPayload.TYPE)) recipients.add(player);
+			if (publication.lastByPlayer.containsKey(player.getUUID())
+					&& ServerPlayNetworking.canSend(player, ArenaSpectatorClearPayload.TYPE)) {
+				hasClearRecipient = true;
+			}
+		}
+		publication.lastByPlayer.keySet().retainAll(connectedPlayers);
+		if (recipients.isEmpty() && !hasClearRecipient) return;
 		Optional<ArenaSpectatorSnapshot.PublicView> view = ScenarioRuntimeService.spectatorView(server);
 		Optional<ArenaSpectatorSnapshot.PublicView> retainedView = ArenaSpectatorSnapshot.retainPublication(
 				Optional.ofNullable(publication.retainedView),
 				view
 		);
 		publication.retainedView = retainedView.orElse(null);
-		if (retainedView.isEmpty()) return;
-		if (!publication.cadence.due(currentTick)) return;
+		if (retainedView.isEmpty()) {
+			clearSpectatorView(server, publication);
+			publication.cadence.markPublished(currentTick);
+			return;
+		}
+		if (publication.spectatorExpired(publication.retainedView, currentTick)) {
+			clearSpectatorView(server, publication);
+			publication.retainedView = null;
+			publication.cadence.markPublished(currentTick);
+			return;
+		}
+		if (recipients.isEmpty()) {
+			publication.cadence.markPublished(currentTick);
+			return;
+		}
 		ArenaSpectatorSnapshot.PublicView publicView = publication.retainedView;
 		if (!publicView.runId().equals(publication.runId)) {
 			publication.runId = publicView.runId();
@@ -163,10 +275,7 @@ public final class AgentControlSync {
 				publication.nextRevision(),
 				publicView
 		);
-		Set<UUID> connectedPlayers = new HashSet<>();
-		for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-			connectedPlayers.add(player.getUUID());
-			if (!ServerPlayNetworking.canSend(player, ArenaSpectatorSnapshotPayload.TYPE)) continue;
+		for (ServerPlayer player : recipients) {
 			try {
 				ArenaSpectatorSnapshot previous = publication.lastByPlayer.get(player.getUUID());
 				ArenaSpectatorSnapshotPayload payload = previous == null
@@ -178,8 +287,24 @@ public final class AgentControlSync {
 				LOGGER.warn("Could not send Arena Agents spectator snapshot to {}", player.getScoreboardName(), exception);
 			}
 		}
-		publication.lastByPlayer.keySet().retainAll(connectedPlayers);
 		publication.cadence.markPublished(currentTick);
+	}
+
+	private static void clearSpectatorView(MinecraftServer server, SpectatorPublication publication) {
+		Set<UUID> connectedPlayers = new HashSet<>();
+		for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+			connectedPlayers.add(player.getUUID());
+			if (!publication.lastByPlayer.containsKey(player.getUUID())
+					|| !ServerPlayNetworking.canSend(player, ArenaSpectatorClearPayload.TYPE)) continue;
+			try {
+				ServerPlayNetworking.send(player, ArenaSpectatorClearPayload.INSTANCE);
+				publication.lastByPlayer.remove(player.getUUID());
+			} catch (RuntimeException exception) {
+				LOGGER.warn("Could not clear Arena Agents spectator view for {}",
+						player.getScoreboardName(), exception);
+			}
+		}
+		publication.lastByPlayer.keySet().retainAll(connectedPlayers);
 	}
 
 	private static String safeMessage(Throwable throwable) {
@@ -196,54 +321,139 @@ public final class AgentControlSync {
 	public static void sendSnapshot(ServerPlayer player) {
 		try {
 			boolean canControl = GoalControl.mayControl(player.createCommandSourceStack());
-			executeAuthorizedControlAction(canControl, () -> {
-				CodexAgentManager manager = CodexAgentManager.get(player.level().getServer());
-				AgentControlSnapshot snapshot = AgentControlSnapshot.fromRecords(
-						true,
-						CodexAgentServerRuntime.automationAvailable(player.level().getServer()),
-						CodexAgentServerRuntime.automationStatus(player.level().getServer()),
-						System.currentTimeMillis(),
-						manager.records(),
-						manager.groups().stream()
-								.map(group -> new AgentControlGroup(
-										group.name(),
-										group.memberIds().stream().map(Object::toString).toList()
-								))
-								.toList(),
-						CodexAgentServerRuntime.modelCatalog(player.level().getServer())
-				);
-				if (ServerPlayNetworking.canSend(player, AgentControlSnapshotPayload.TYPE)) {
-					ServerPlayNetworking.send(player, AgentControlSnapshotPayload.fromSnapshot(snapshot));
-				}
-			});
+			CodexAgentManager manager = CodexAgentManager.get(player.level().getServer());
+			AgentControlSnapshot snapshot = AgentControlSnapshot.fromRecords(
+					canControl,
+					CodexAgentServerRuntime.automationAvailable(player.level().getServer()),
+					CodexAgentServerRuntime.automationStatus(player.level().getServer()),
+					nextControlRevision(player.level().getServer()),
+					manager.records(),
+					manager.groups().stream()
+							.map(group -> new AgentControlGroup(
+									group.name(),
+									group.memberIds().stream().map(Object::toString).toList()
+							))
+							.toList(),
+					CodexAgentServerRuntime.modelCatalog(player.level().getServer())
+			);
+			if (ServerPlayNetworking.canSend(player, AgentControlSnapshotPayload.TYPE)) {
+				ServerPlayNetworking.send(player, AgentControlSnapshotPayload.fromSnapshot(snapshot));
+			}
 		} catch (RuntimeException exception) {
 			LOGGER.warn("Could not send Arena Agents control snapshot to {}", player.getScoreboardName(), exception);
 		}
 	}
 
+	private static synchronized long nextControlRevision(MinecraftServer server) {
+		return SPECTATOR_PUBLICATIONS.computeIfAbsent(server, ignored -> new SpectatorPublication())
+				.nextControlRevision(System.currentTimeMillis());
+	}
+
 	static boolean executeAuthorizedControlAction(boolean canControl, Runnable action) {
+		return executeAuthorizedControlAction(canControl, action, () -> { });
+	}
+
+	static boolean executeAuthorizedControlAction(boolean canControl, Runnable action, Runnable denied) {
 		Objects.requireNonNull(action, "action must not be null");
-		if (!canControl) return false;
+		Objects.requireNonNull(denied, "denied action must not be null");
+		if (!canControl) {
+			denied.run();
+			return false;
+		}
 		action.run();
 		return true;
 	}
 
-	private static final class SpectatorPublication {
+	static final class SpectatorPublication {
 		private final ArenaSpectatorSnapshot.PublicationCadence cadence =
 				new ArenaSpectatorSnapshot.PublicationCadence(4);
 		private final Map<UUID, ArenaSpectatorSnapshot> lastByPlayer = new LinkedHashMap<>();
 		private final Map<UUID, ScenarioBuildProgress> lastBuildByPlayer = new LinkedHashMap<>();
+		private final Map<UUID, Long> directBuildTerminalTicks = new LinkedHashMap<>();
 		private long serverTick;
 		private long revision;
+		private long controlRevision;
+		private long buildTerminalTick = -1L;
+		private String terminalBuildId = "";
+		private long spectatorTerminalTick = -1L;
+		private String terminalSpectatorRunId = "";
 		private String runId = "";
 		private ArenaSpectatorSnapshot.PublicView retainedView;
+
+		void rememberBuild(UUID playerId, ScenarioBuildProgress progress) {
+			lastBuildByPlayer.put(Objects.requireNonNull(playerId, "playerId must not be null"),
+					Objects.requireNonNull(progress, "progress must not be null"));
+		}
+
+		void rememberDirectBuild(UUID playerId, ScenarioBuildProgress progress) {
+			rememberDirectBuild(playerId, progress, currentTick());
+		}
+
+		void rememberDirectBuild(UUID playerId, ScenarioBuildProgress progress, long publishedTick) {
+			if (publishedTick < 0L) throw new IllegalArgumentException("publishedTick must not be negative");
+			rememberBuild(playerId, progress);
+			directBuildTerminalTicks.put(playerId, publishedTick);
+		}
+
+		Optional<ScenarioBuildProgress> directBuild(UUID playerId, long currentTick) {
+			Long firstTerminalTick = directBuildTerminalTicks.get(playerId);
+			if (firstTerminalTick == null) return Optional.empty();
+			if (ScenarioPresentationExpiry.expired(
+					firstTerminalTick, currentTick, ScenarioPresentationExpiry.BUILD_TERMINAL_TTL_TICKS)) {
+				directBuildTerminalTicks.remove(playerId);
+				return Optional.empty();
+			}
+			return Optional.ofNullable(lastBuildByPlayer.get(playerId));
+		}
+
+		void forgetBuild(UUID playerId) {
+			lastBuildByPlayer.remove(playerId);
+			directBuildTerminalTicks.remove(playerId);
+		}
 
 		private long nextTick() {
 			return ++serverTick;
 		}
 
+		private long currentTick() {
+			return serverTick;
+		}
+
 		private long nextRevision() {
 			return ++revision;
+		}
+
+		private long nextControlRevision(long wallClock) {
+			controlRevision = Math.max(wallClock, controlRevision + 1L);
+			return controlRevision;
+		}
+
+		private boolean buildExpired(ScenarioBuildProgress progress, long currentTick) {
+			if (!progress.terminal()) {
+				terminalBuildId = "";
+				buildTerminalTick = -1L;
+				return false;
+			}
+			if (!progress.buildId().equals(terminalBuildId)) {
+				terminalBuildId = progress.buildId();
+				buildTerminalTick = currentTick;
+			}
+			return ScenarioPresentationExpiry.expired(
+					buildTerminalTick, currentTick, ScenarioPresentationExpiry.BUILD_TERMINAL_TTL_TICKS);
+		}
+
+		private boolean spectatorExpired(ArenaSpectatorSnapshot.PublicView view, long currentTick) {
+			if (!view.terminal()) {
+				terminalSpectatorRunId = "";
+				spectatorTerminalTick = -1L;
+				return false;
+			}
+			if (!view.runId().equals(terminalSpectatorRunId)) {
+				terminalSpectatorRunId = view.runId();
+				spectatorTerminalTick = currentTick;
+			}
+			return ScenarioPresentationExpiry.expired(
+					spectatorTerminalTick, currentTick, ScenarioPresentationExpiry.SPECTATOR_TERMINAL_TTL_TICKS);
 		}
 	}
 }

@@ -16,10 +16,11 @@ import net.minecraft.resources.Identifier;
 /** Strict JSON envelope for server-to-client arena construction progress. */
 public record ScenarioBuildProgressPayload(String encodedProgress) implements CustomPacketPayload {
 	public static final int MAX_ENCODED_BYTES = 8_192;
-	private static final int SCHEMA_VERSION = 1;
+	private static final int SCHEMA_VERSION = 2;
 	private static final Set<String> KEYS = Set.of(
 			"schemaVersion", "buildId", "scenarioTitle", "phase", "revision",
-			"completed", "total", "changedBlocks", "originX", "originY", "originZ", "status", "detail"
+			"completed", "total", "changedBlocks", "originX", "originY", "originZ", "status", "detail",
+			"errorCode", "confirmationToken"
 	);
 	public static final Type<ScenarioBuildProgressPayload> TYPE = new Type<>(
 			Identifier.fromNamespaceAndPath("arenaagents", "scenario_build_progress")
@@ -55,6 +56,8 @@ public record ScenarioBuildProgressPayload(String encodedProgress) implements Cu
 		root.addProperty("originZ", progress.originZ());
 		root.addProperty("status", progress.status().wireName());
 		root.addProperty("detail", progress.detail());
+		root.addProperty("errorCode", progress.errorCode());
+		root.addProperty("confirmationToken", progress.confirmationToken());
 		return new ScenarioBuildProgressPayload(root.toString());
 	}
 
@@ -71,8 +74,10 @@ public record ScenarioBuildProgressPayload(String encodedProgress) implements Cu
 				exactInt(root, "originX"),
 				exactInt(root, "originY"),
 				exactInt(root, "originZ"),
-				ScenarioBuildProgress.Status.fromWireName(text(root, "status", 16)),
-				text(root, "detail", ScenarioBuildProgress.MAX_DETAIL_LENGTH)
+				ScenarioBuildProgress.Status.fromWireName(text(root, "status", 32)),
+				text(root, "detail", ScenarioBuildProgress.MAX_DETAIL_LENGTH),
+				optionalText(root, "errorCode", ScenarioBuildProgress.MAX_ERROR_CODE_LENGTH),
+				optionalText(root, "confirmationToken", ScenarioBuildProgress.MAX_CONFIRMATION_TOKEN_LENGTH)
 		);
 	}
 
@@ -106,6 +111,18 @@ public record ScenarioBuildProgressPayload(String encodedProgress) implements Cu
 		}
 		String value = root.get(field).getAsString();
 		if (value.isBlank() || value.length() > maximum || value.indexOf('\n') >= 0 || value.indexOf('\r') >= 0) {
+			throw new IllegalArgumentException(field + " is invalid");
+		}
+		return value;
+	}
+
+	private static String optionalText(JsonObject root, String field, int maximum) {
+		if (!root.has(field) || !root.get(field).isJsonPrimitive()
+				|| !root.get(field).getAsJsonPrimitive().isString()) {
+			throw new IllegalArgumentException(field + " must be a string");
+		}
+		String value = root.get(field).getAsString();
+		if (value.length() > maximum || value.indexOf('\n') >= 0 || value.indexOf('\r') >= 0) {
 			throw new IllegalArgumentException(field + " is invalid");
 		}
 		return value;

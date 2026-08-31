@@ -3,12 +3,14 @@ package dev.agaminggod.arenaagents.server.group;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public final class AgentGroupRegistryVerification {
 	private static final AgentId FLINT = new AgentId(UUID.fromString("11111111-1111-1111-1111-111111111111"));
 	private static final AgentId MOSS = new AgentId(UUID.fromString("22222222-2222-2222-2222-222222222222"));
+	private static final AgentId DELETED = new AgentId(UUID.fromString("33333333-3333-3333-3333-333333333333"));
 
 	private AgentGroupRegistryVerification() {
 	}
@@ -67,7 +69,29 @@ public final class AgentGroupRegistryVerification {
 		savedData.registry().save("Party", List.of(FLINT, MOSS));
 		assertEquals("Party", savedData.registry().require("party").name(),
 				"world saved data owns the persistent group registry");
-		return 17;
+
+		AtomicInteger cleanupChanges = new AtomicInteger();
+		AgentGroupRegistry cleanup = new AgentGroupRegistry(cleanupChanges::incrementAndGet);
+		cleanup.save("Mixed", List.of(FLINT, DELETED, MOSS));
+		cleanup.save("Only deleted", List.of(DELETED));
+		cleanupChanges.set(0);
+		assertEquals(2, cleanup.retainMembers(Set.of(FLINT, MOSS)),
+				"startup cleanup removes every membership for an identity missing from the registry");
+		assertEquals(List.of(new AgentGroup("Mixed", List.of(FLINT, MOSS))), cleanup.groups(),
+				"startup cleanup deletes empty groups and keeps current members in order");
+		assertEquals(1, cleanupChanges.get(), "one startup cleanup pass dirties saved data once");
+		assertTrue(!cleanup.removeMember(DELETED), "repeated cleanup is idempotent");
+		assertEquals(1, cleanupChanges.get(), "idempotent cleanup does not dirty saved data");
+		assertTrue(cleanup.removeMember(FLINT), "agent removal purges the identity from every saved group");
+		assertEquals(List.of(MOSS), cleanup.require("Mixed").memberIds(),
+				"agent removal keeps the remaining current membership");
+		AgentGroupRegistry reloadedCleanup = AgentGroupRegistry.restore(
+				AgentGroupSnapshotCodec.decode(AgentGroupSnapshotCodec.encode(cleanup.snapshot())),
+				() -> { }
+		);
+		assertEquals(List.of(MOSS), reloadedCleanup.require("Mixed").memberIds(),
+				"cleaned membership remains clean after reload");
+		return 25;
 	}
 
 	private static void expectDomain(Runnable action, String code, String label) {
@@ -83,5 +107,9 @@ public final class AgentGroupRegistryVerification {
 		if (!java.util.Objects.equals(expected, actual)) {
 			throw new AssertionError(label + ": expected=" + expected + ", actual=" + actual);
 		}
+	}
+
+	private static void assertTrue(boolean value, String label) {
+		if (!value) throw new AssertionError(label + ": expected true");
 	}
 }

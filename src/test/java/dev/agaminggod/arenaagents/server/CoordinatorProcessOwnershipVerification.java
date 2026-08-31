@@ -313,8 +313,8 @@ public final class CoordinatorProcessOwnershipVerification {
 		Process process = new ProcessBuilder(
 				java,
 				"-cp",
-				System.getProperty("java.class.path"),
-				Sleeper.class.getName(),
+				fixtureClassPath(),
+				CoordinatorProcessFixture.class.getName(),
 				main.toString()
 		).start();
 		Thread.sleep(100L);
@@ -327,14 +327,18 @@ public final class CoordinatorProcessOwnershipVerification {
 		Process process = new ProcessBuilder(
 				java,
 				"-cp",
-				System.getProperty("java.class.path"),
-				TreeSleeper.class.getName(),
+				fixtureClassPath(),
+				CoordinatorProcessTreeFixture.class.getName(),
 				main.toString()
 		).start();
 		long deadline = System.currentTimeMillis() + 5_000L;
 		while (process.toHandle().descendants().findAny().isEmpty() && System.currentTimeMillis() < deadline) Thread.sleep(25L);
 		assertTrue(process.isAlive(), "ownership tree fixture process started");
 		return process;
+	}
+
+	static String fixtureClassPath() throws Exception {
+		return Path.of(CoordinatorProcessFixture.class.getProtectionDomain().getCodeSource().getLocation().toURI()).toString();
 	}
 
 	private static void deleteTree(Path root) throws Exception {
@@ -376,29 +380,4 @@ public final class CoordinatorProcessOwnershipVerification {
 		if (!condition) throw new AssertionError(label);
 	}
 
-	public static final class Sleeper {
-		private Sleeper() {
-		}
-
-		public static void main(String[] args) throws Exception {
-			Thread.sleep(TimeUnit.MINUTES.toMillis(5));
-		}
-	}
-
-	public static final class TreeSleeper {
-		private TreeSleeper() {
-		}
-
-		public static void main(String[] args) throws Exception {
-			String java = Path.of(System.getProperty("java.home"), "bin", isWindows() ? "java.exe" : "java").toString();
-			new ProcessBuilder(
-					java,
-					"-cp",
-					System.getProperty("java.class.path"),
-					Sleeper.class.getName(),
-					args[0]
-			).start();
-			Thread.sleep(TimeUnit.MINUTES.toMillis(5));
-		}
-	}
 }

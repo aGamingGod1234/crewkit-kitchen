@@ -6,6 +6,8 @@ import {
 	MAX_REASON_CODE_LENGTH,
 	MAX_RESULT_MESSAGE_LENGTH,
 } from './constants.mjs';
+import { normalizeProviderId } from './provider-identity.mjs';
+import { REGISTERED_AGENT_SCHEMA_VERSION, validateRegisteredAgentContract } from './registered-agent-contract.mjs';
 
 export const DynamicAgentState = Object.freeze({
 	IDLE: 'IDLE',
@@ -107,7 +109,7 @@ export class AgentRegistry {
 		const id = requireIdentifier(agentId, 'agentId');
 		const current = this.#agents.get(id);
 		if (current === undefined) throw new AgentRegistryError('UNKNOWN_AGENT', `Unknown agent '${id}'`);
-		const updated = reduceGoalControl(current, value, { queueCap: this.#queueCap });
+		const updated = validateMutation(reduceGoalControl(current, value, { queueCap: this.#queueCap }));
 		this.#agents.set(id, updated);
 		return clone(updated);
 	}
@@ -121,7 +123,7 @@ export class AgentRegistry {
 		}
 		const revision = nonnegativeInteger(value.goalRevision, 'goalRevision');
 		if (revision > current.goalRevision) {
-			const updated = reduceGoalControl(current, value, { queueCap: this.#queueCap });
+			const updated = validateMutation(reduceGoalControl(current, value, { queueCap: this.#queueCap }));
 			this.#agents.set(id, updated);
 			return clone(updated);
 		}
@@ -136,12 +138,12 @@ export class AgentRegistry {
 			throw new AgentRegistryError('INVALID_AGENT_STATE', `Conversation wake cannot re-arm ${current.state}`);
 		}
 		if ([DynamicAgentState.PAUSED, DynamicAgentState.DISCONNECTED].includes(current.state)) {
-			const updated = {
+			const updated = validateMutation({
 				...current,
 				state: DynamicAgentState.STARTING,
 				updatedAtEpochMs: nonnegativeInteger(value.updatedAtEpochMs ?? this.#now(), 'updatedAtEpochMs'),
 				lastError: null,
-			};
+			});
 			this.#agents.set(id, updated);
 			return clone(updated);
 		}
@@ -155,12 +157,12 @@ export class AgentRegistry {
 		if (!DYNAMIC_AGENT_STATES.has(state)) throw new AgentRegistryError('INVALID_AGENT_STATE', `Unsupported state '${String(state)}'`);
 		if (goalRevision !== undefined) assertCurrentGoalRevision(current, goalRevision);
 		if (state !== current.state && !ALLOWED_STATE_TRANSITIONS[current.state].has(state)) throw new AgentRegistryError('ILLEGAL_STATE_TRANSITION', `Agent cannot transition from ${current.state} to ${state}`);
-		const updated = {
+		const updated = validateMutation({
 			...current,
 			state,
 			lastError: normalizeError(error),
 			updatedAtEpochMs: this.#now(),
-		};
+		});
 		this.#agents.set(id, updated);
 		return clone(updated);
 	}
@@ -205,15 +207,17 @@ export function normalizeAgentRecord(value, { queueCap = DEFAULT_GOAL_QUEUE_CAP,
 	const queue = value.queue ?? [];
 	if (!Array.isArray(queue)) throw new TypeError('agent queue must be an array');
 	if (queue.length > queueCap) throw new AgentRegistryError('GOAL_QUEUE_FULL', `Agent goal queue exceeds ${queueCap} entries`);
-	return {
-		schemaVersion: positiveInteger(value.schemaVersion ?? 1, 'schemaVersion'),
+	const provider = requireProvider(recovery ? value.provider : value.provider ?? 'codex');
+	const serviceTier = requireIdentifier(recovery ? value.serviceTier : value.serviceTier ?? 'priority', 'serviceTier');
+	const record = {
+		schemaVersion: positiveInteger(value.schemaVersion ?? REGISTERED_AGENT_SCHEMA_VERSION, 'schemaVersion'),
 		agentId: requireIdentifier(value.agentId, 'agentId'),
 		entityUuid: optionalIdentifier(value.entityUuid, 'entityUuid'),
 		name: optionalText(value.name, 'name', MAX_IDENTIFIER_LENGTH),
-		provider: requireProvider(recovery ? value.provider : value.provider ?? 'codex'),
+		provider,
 		model: requireIdentifier(value.model, 'model'),
 		reasoningEffort: requireIdentifier(value.reasoningEffort, 'reasoningEffort'),
-		serviceTier: requireIdentifier(recovery ? value.serviceTier : value.serviceTier ?? 'priority', 'serviceTier'),
+		serviceTier,
 		skinVariant: requireIdentifier(value.skinVariant ?? 'default', 'skinVariant'),
 		state: normalizedState,
 		currentGoal: optionalGoal(value.currentGoal),
@@ -223,16 +227,19 @@ export function normalizeAgentRecord(value, { queueCap = DEFAULT_GOAL_QUEUE_CAP,
 		lastSummary: optionalText(value.lastSummary, 'lastSummary', MAX_RESULT_MESSAGE_LENGTH),
 		death: normalizeDeath(value.death, state),
 		respawnPolicy: isPlainObject(value.respawnPolicy) ? clone(value.respawnPolicy) : {},
-		createdAtEpochMs: nonnegativeInteger(value.createdAtEpochMs ?? 0, 'createdAtEpochMs'),
-		updatedAtEpochMs: nonnegativeInteger(value.updatedAtEpochMs ?? 0, 'updatedAtEpochMs'),
+		createdAtEpochMs: nonnegativeInteger(value.createdAtEpochMs ?? 1, 'createdAtEpochMs'),
+		updatedAtEpochMs: nonnegativeInteger(value.updatedAtEpochMs ?? value.createdAtEpochMs ?? 1, 'updatedAtEpochMs'),
 		lastError: normalizeError(value.lastError),
 	};
+	return validateRegisteredAgentContract(record, (message) => new AgentRegistryError('INVALID_AGENT_STATE', message));
+}
+
+function validateMutation(record) {
+	return validateRegisteredAgentContract(record, (message) => new AgentRegistryError('INVALID_AGENT_STATE', message));
 }
 
 function requireProvider(value) {
-	const provider = requireIdentifier(value, 'provider').toLowerCase();
-	if (!['codex', 'gemini', 'kimi', 'cursor'].includes(provider)) throw new TypeError(`provider must be one of codex, gemini, kimi, or cursor`);
-	return provider;
+	return normalizeProviderId(requireIdentifier(value, 'provider'));
 }
 
 export function reduceGoalControl(recordValue, controlValue, { queueCap = DEFAULT_GOAL_QUEUE_CAP } = {}) {

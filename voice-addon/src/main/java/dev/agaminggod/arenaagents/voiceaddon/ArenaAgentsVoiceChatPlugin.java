@@ -8,6 +8,7 @@ import de.maxhenkel.voicechat.api.events.VoicechatServerStartedEvent;
 import de.maxhenkel.voicechat.api.events.VoicechatServerStoppedEvent;
 import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemConfiguration;
 import java.util.Objects;
+import java.util.UUID;
 import java.util.function.Function;
 import net.minecraft.server.MinecraftServer;
 
@@ -22,7 +23,7 @@ public final class ArenaAgentsVoiceChatPlugin implements VoicechatPlugin {
 	private final Function<MicrophonePacketEvent, Object> packetServer;
 
 	public ArenaAgentsVoiceChatPlugin() {
-		this(PRODUCTION_BINDINGS, ArenaAgentsVoiceChatPlugin::consentingServer);
+		this(PRODUCTION_BINDINGS, null);
 	}
 
 	ArenaAgentsVoiceChatPlugin(
@@ -37,7 +38,7 @@ public final class ArenaAgentsVoiceChatPlugin implements VoicechatPlugin {
 			Function<MicrophonePacketEvent, Object> packetServer
 	) {
 		this.bindings = Objects.requireNonNull(bindings, "server bindings must not be null");
-		this.packetServer = Objects.requireNonNull(packetServer, "packet server resolver must not be null");
+		this.packetServer = packetServer;
 	}
 
 	@Override
@@ -57,8 +58,27 @@ public final class ArenaAgentsVoiceChatPlugin implements VoicechatPlugin {
 
 	private void onMicrophonePacket(MicrophonePacketEvent event) {
 		try {
-			Object server = packetServer.apply(event);
-			if (server != null) bindings.accept(server, event.getVoicechat(), event);
+			if (packetServer != null) {
+				Object server = packetServer.apply(event);
+				if (server != null) bindings.accept(server, event.getVoicechat(), new MicrophonePacketSnapshot(
+						server, new UUID(0L, 0L), event.getVoicechat(), false, new byte[0]
+				));
+				return;
+			}
+			MicrophonePacketSnapshot captured = MicrophonePacketSnapshot.capture(event);
+			if (captured == null) return;
+			Object configured = bindings.configuredServer(captured.voicechat());
+			if (!(configured instanceof MinecraftServer server)) return;
+			MicrophonePacketSnapshot packet = captured.forServer(server);
+			server.execute(() -> acceptOnServer(server, packet));
+		} catch (RuntimeException exception) {
+			LOGGER.error("Arena Agents proximity speech capture could not start", exception);
+		}
+	}
+
+	private void acceptOnServer(MinecraftServer server, MicrophonePacketSnapshot packet) {
+		try {
+			bindings.accept(server, packet.voicechat(), packet);
 		} catch (RuntimeException exception) {
 			LOGGER.error("Arena Agents proximity speech capture could not start", exception);
 		}
@@ -72,16 +92,6 @@ public final class ArenaAgentsVoiceChatPlugin implements VoicechatPlugin {
 		ArenaAgentsVoiceChatPlugin plugin = activePlugin;
 		if (plugin == null) throw new IllegalStateException("Simple Voice Chat plugin has not registered its events");
 		return plugin.configureServer(server, configuration);
-	}
-
-	private static Object consentingServer(MicrophonePacketEvent event) {
-		if (event.getSenderConnection() == null) return null;
-		Object rawPlayer = event.getSenderConnection().getPlayer().getPlayer();
-		if (!(rawPlayer instanceof net.minecraft.server.level.ServerPlayer player)) return null;
-		MinecraftServer server = player.level().getServer();
-		return dev.agaminggod.arenaagents.server.CodexAgentServerRuntime.hasVoiceConsent(
-				server, player.getUUID()
-		) ? server : null;
 	}
 
 	static final class ConfiguredServer implements AutoCloseable {

@@ -23,6 +23,7 @@ public final class ScenarioLaunchCodec {
 		root.addProperty("mapVersion", request.mapVersion());
 		root.addProperty("deterministicEvents", request.deterministicEvents());
 		root.addProperty("placementMode", request.placementMode().wireName());
+		root.addProperty("confirmationToken", request.confirmationToken());
 		JsonArray roster = new JsonArray();
 		for (ScenarioAgentSpec agent : request.roster()) {
 			JsonObject value = new JsonObject();
@@ -49,7 +50,8 @@ public final class ScenarioLaunchCodec {
 			throw new IllegalArgumentException("scenario launch request is empty or too large");
 		}
 		JsonObject root = JsonParser.parseString(encoded).getAsJsonObject();
-		requireKeys(root, Set.of("scenarioId", "mapVersion", "deterministicEvents", "placementMode", "roster"));
+		requireKeys(root, Set.of(
+				"scenarioId", "mapVersion", "deterministicEvents", "placementMode", "confirmationToken", "roster"));
 		ArrayList<ScenarioAgentSpec> roster = new ArrayList<>();
 		for (var element : root.getAsJsonArray("roster")) {
 			JsonObject value = element.getAsJsonObject();
@@ -78,14 +80,16 @@ public final class ScenarioLaunchCodec {
 				root.get("mapVersion").getAsString(),
 				root.get("deterministicEvents").getAsBoolean(),
 				ScenarioPlacementMode.parse(root.get("placementMode").getAsString()),
-				roster
+				roster,
+				root.get("confirmationToken").getAsString()
 		);
 		return new ScenarioLaunchRequest(
 				request.scenarioId(),
 				request.mapVersion(),
 				request.deterministicEvents(),
 				request.placementMode(),
-				request.roster()
+				request.roster(),
+				request.confirmationToken()
 		);
 	}
 

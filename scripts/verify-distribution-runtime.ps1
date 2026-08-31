@@ -112,6 +112,15 @@ try {
 	Assert-Equal 1 $coordinatorBackups.Count 'Repeated installs must retain only one coordinator backup'
 	Assert-Equal 1 $nodeBackups.Count 'Repeated installs must retain only one Node.js backup'
 	Write-Host 'PASS: repeated installs keep one bounded last-known-good runtime generation'
+	[IO.File]::WriteAllText((Join-Path $sourceCoordinator 'src\dynamic-main.mjs'), 'new-runtime-v6')
+	[IO.File]::WriteAllText($sourceNode, 'node-runtime-v6')
+	$deploymentToUndo = Install-ArenaCoordinatorRuntime -SourceRoot $sourceRoot -InstalledPackageRoot $installedRoot
+	Assert-Equal 'new-runtime-v6' ([IO.File]::ReadAllText((Join-Path $activeCoordinator 'src\dynamic-main.mjs'))) 'Rollback fixture must install the candidate coordinator'
+	Assert-Equal 'node-runtime-v6' ([IO.File]::ReadAllText($activeNode)) 'Rollback fixture must install the candidate Node.js runtime'
+	Undo-ArenaCoordinatorRuntimeInstall -InstalledPackageRoot $installedRoot -Deployment $deploymentToUndo
+	Assert-Equal 'new-runtime-v5' ([IO.File]::ReadAllText((Join-Path $activeCoordinator 'src\dynamic-main.mjs'))) 'Outer package rollback must restore the previous coordinator'
+	Assert-Equal 'node-runtime-v5' ([IO.File]::ReadAllText($activeNode)) 'Outer package rollback must restore the previous Node.js runtime'
+	Write-Host 'PASS: an outer package transaction can roll back a completed runtime promotion'
 	Write-Host 'PASS: bundled Node.js deployment and rapid repeated updates are self-contained'
 } finally {
 	if (Test-Path -LiteralPath $testRoot) {

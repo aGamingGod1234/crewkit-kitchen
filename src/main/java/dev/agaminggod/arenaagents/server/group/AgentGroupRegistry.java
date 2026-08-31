@@ -7,6 +7,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 public final class AgentGroupRegistry {
 	public static final int SCHEMA_VERSION = 1;
@@ -53,6 +54,45 @@ public final class AgentGroupRegistry {
 		if (removed == null) throw new AgentDomainException("GROUP_NOT_FOUND", "Unknown saved group: " + name);
 		onChange.run();
 		return removed;
+	}
+
+	/** Removes deleted agent identities and drops groups that no longer have a member. */
+	public synchronized int retainMembers(Set<AgentId> currentAgentIds) {
+		Set<AgentId> checkedIds = Set.copyOf(Objects.requireNonNull(
+				currentAgentIds, "currentAgentIds must not be null"
+		));
+		int removedMembers = 0;
+		var iterator = groups.entrySet().iterator();
+		while (iterator.hasNext()) {
+			Map.Entry<String, AgentGroup> entry = iterator.next();
+			AgentGroup group = entry.getValue();
+			List<AgentId> retained = group.memberIds().stream().filter(checkedIds::contains).toList();
+			removedMembers += group.memberIds().size() - retained.size();
+			if (retained.isEmpty()) {
+				iterator.remove();
+			} else if (retained.size() != group.memberIds().size()) {
+				entry.setValue(new AgentGroup(group.name(), retained));
+			}
+		}
+		if (removedMembers > 0) onChange.run();
+		return removedMembers;
+	}
+
+	public synchronized boolean removeMember(AgentId agentId) {
+		AgentId checkedId = Objects.requireNonNull(agentId, "agentId must not be null");
+		boolean changed = false;
+		var iterator = groups.entrySet().iterator();
+		while (iterator.hasNext()) {
+			Map.Entry<String, AgentGroup> entry = iterator.next();
+			AgentGroup group = entry.getValue();
+			if (!group.memberIds().contains(checkedId)) continue;
+			List<AgentId> retained = group.memberIds().stream().filter(memberId -> !memberId.equals(checkedId)).toList();
+			if (retained.isEmpty()) iterator.remove();
+			else entry.setValue(new AgentGroup(group.name(), retained));
+			changed = true;
+		}
+		if (changed) onChange.run();
+		return changed;
 	}
 
 	public synchronized List<AgentGroup> groups() {

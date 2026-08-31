@@ -11,9 +11,12 @@ import dev.agaminggod.arenaagents.client.presentation.ScenarioResultsScreen;
 import dev.agaminggod.arenaagents.client.presentation.SpectatorCameraAssistant;
 import dev.agaminggod.arenaagents.client.presentation.ScenarioBuildProgressState;
 import dev.agaminggod.arenaagents.scenario.ScenarioAgentSpec;
+import dev.agaminggod.arenaagents.scenario.ScenarioCancelPayload;
 import dev.agaminggod.arenaagents.scenario.ScenarioLaunchPayload;
 import dev.agaminggod.arenaagents.scenario.ScenarioLaunchRequest;
+import dev.agaminggod.arenaagents.scenario.presentation.ArenaSpectatorClearPayload;
 import dev.agaminggod.arenaagents.scenario.presentation.ArenaSpectatorSnapshotPayload;
+import dev.agaminggod.arenaagents.scenario.presentation.ScenarioBuildProgressClearPayload;
 import dev.agaminggod.arenaagents.scenario.presentation.ScenarioBuildProgressPayload;
 import dev.agaminggod.arenaagents.control.AgentControlCatalog;
 import dev.agaminggod.arenaagents.control.AgentControlModelOption;
@@ -21,10 +24,12 @@ import dev.agaminggod.arenaagents.control.AgentControlRequestPayload;
 import dev.agaminggod.arenaagents.control.AgentControlSnapshot;
 import dev.agaminggod.arenaagents.control.AgentControlSnapshotPayload;
 import dev.agaminggod.arenaagents.control.AgentControlSnapshotStore;
+import java.util.ArrayDeque;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Set;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
@@ -68,6 +73,8 @@ public final class AgentControlClient {
 	private static final Set<String> KNOWN_AGENT_IDS = new LinkedHashSet<>();
 	private static int refreshCountdown;
 	private static int snapshotContentHash;
+	private static String snapshotError = "";
+	private static final SnapshotAcknowledgements SNAPSHOT_ACKNOWLEDGEMENTS = new SnapshotAcknowledgements();
 
 	private AgentControlClient() {
 	}
@@ -90,6 +97,13 @@ public final class AgentControlClient {
 		if (!spectatorReceiverRegistered) {
 			throw new IllegalStateException("Arena Agents spectator snapshot receiver is already registered");
 		}
+		boolean spectatorClearReceiverRegistered = ClientPlayNetworking.registerGlobalReceiver(
+				ArenaSpectatorClearPayload.TYPE,
+				(payload, context) -> context.client().execute(SPECTATOR_STATE::clear)
+		);
+		if (!spectatorClearReceiverRegistered) {
+			throw new IllegalStateException("Arena Agents spectator clear receiver is already registered");
+		}
 		boolean buildProgressReceiverRegistered = ClientPlayNetworking.registerGlobalReceiver(
 				ScenarioBuildProgressPayload.TYPE,
 				(payload, context) -> context.client().execute(() -> {
@@ -102,10 +116,23 @@ public final class AgentControlClient {
 		if (!buildProgressReceiverRegistered) {
 			throw new IllegalStateException("Arena Agents build progress receiver is already registered");
 		}
+		boolean buildProgressClearReceiverRegistered = ClientPlayNetworking.registerGlobalReceiver(
+				ScenarioBuildProgressClearPayload.TYPE,
+				(payload, context) -> context.client().execute(() -> {
+					BUILD_PROGRESS_STATE.clear();
+					if (context.client().screen instanceof ScenarioSetupScreen screen) {
+						screen.acceptBuildProgressClear();
+					}
+				})
+		);
+		if (!buildProgressClearReceiverRegistered) {
+			throw new IllegalStateException("Arena Agents build progress clear receiver is already registered");
+		}
 		ArenaSpectatorHud.register(SPECTATOR_STATE, BUILD_PROGRESS_STATE);
 		ClientTickEvents.END_CLIENT_TICK.register(AgentControlClient::tick);
 		ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> clearConnectionState());
 		ScenarioLaunchRegistry.register(AgentControlClient::launchScenario);
+		ScenarioLaunchRegistry.registerCancel(AgentControlClient::cancelScenario);
 		registered = true;
 	}
 
@@ -153,28 +180,41 @@ public final class AgentControlClient {
 		return KNOWN_AGENT_IDS;
 	}
 
-	public static void rememberPreferences(String provider, String model, String reasoning) {
-		preferences = new Preferences(provider, model, reasoning);
+	public static Optional<String> snapshotError() {
+		return Optional.of(snapshotError).filter(value -> !value.isBlank());
+	}
+
+	public static void rememberPreferences(String provider, String model, String reasoning, String serviceTier) {
+		preferences = new Preferences(provider, model, reasoning, serviceTier);
 	}
 
 	public static void requestSnapshot() {
 		try {
 			if (ClientPlayNetworking.canSend(AgentControlRequestPayload.TYPE)) {
+				snapshotError = "";
 				ClientPlayNetworking.send(AgentControlRequestPayload.INSTANCE);
+				SNAPSHOT_ACKNOWLEDGEMENTS.recordRequest();
+			} else {
+				snapshotError = "This server does not support the Field Console";
 			}
 		} catch (IllegalStateException exception) {
+			snapshotError = "The Field Console is disconnected";
 			LOGGER.debug("Arena Agents control snapshot request skipped while disconnected");
 		}
 	}
 
 	public static boolean sendCommand(String command) {
+		return sendCommandWithReceipt(command).isPresent();
+	}
+
+	public static OptionalLong sendCommandWithReceipt(String command) {
 		Minecraft client = Minecraft.getInstance();
 		if (client.getConnection() == null) {
-			return false;
+			return OptionalLong.empty();
 		}
 		client.getConnection().sendCommand(Objects.requireNonNull(command, "command must not be null"));
 		refreshCountdown = 2;
-		return true;
+		return OptionalLong.of(SNAPSHOT_ACKNOWLEDGEMENTS.beginMutation());
 	}
 
 	private static ScenarioLaunchRegistry.Result launchScenario(ScenarioLaunchPlan plan) {
@@ -196,7 +236,8 @@ public final class AgentControlClient {
 							agent.serviceTier(),
 							Optional.of(agent.team()).filter(value -> !value.isBlank()),
 							agent.gameMode()
-					)).toList()
+					)).toList(),
+					plan.confirmationToken()
 			);
 			BUILD_PROGRESS_STATE.clear();
 			ClientPlayNetworking.send(ScenarioLaunchPayload.fromRequest(request));
@@ -249,16 +290,21 @@ public final class AgentControlClient {
 
 	private static void acceptSnapshot(AgentControlSnapshot nextSnapshot) {
 		Objects.requireNonNull(nextSnapshot, "nextSnapshot must not be null");
+		long acknowledgedMutationId = SNAPSHOT_ACKNOWLEDGEMENTS.acceptSnapshot();
 		AgentControlSnapshot previous = SNAPSHOTS.current().orElse(null);
+		if (!SnapshotRevisionPolicy.isNewer(previous, nextSnapshot)) return;
 		List<AgentControlModelOption> previousCatalog = previous == null ? List.of() : previous.catalog();
 		if (!SNAPSHOTS.accept(nextSnapshot)) {
 			return;
 		}
+		snapshotError = "";
 		boolean catalogChanged = !previousCatalog.equals(nextSnapshot.catalog());
 		int nextContentHash = contentHash(nextSnapshot);
 		Minecraft client = Minecraft.getInstance();
 		if (previous != null && snapshotContentHash == nextContentHash && sameContent(previous, nextSnapshot)) {
-			if (client.screen instanceof AgentControlScreen screen) screen.acceptSnapshot(nextSnapshot);
+			if (client.screen instanceof AgentControlScreen screen) {
+				screen.acceptSnapshot(nextSnapshot, acknowledgedMutationId, false);
+			}
 			return;
 		}
 		snapshotContentHash = nextContentHash;
@@ -266,7 +312,7 @@ public final class AgentControlClient {
 		catalogAuthoritative = true;
 		normalizePreferences();
 		if (client.screen instanceof AgentControlScreen screen) {
-			screen.acceptSnapshot(nextSnapshot);
+			screen.acceptSnapshot(nextSnapshot, acknowledgedMutationId, true);
 		} else if (catalogChanged && client.screen instanceof ScenarioSetupScreen screen) {
 			screen.acceptCatalogUpdate();
 		}
@@ -298,6 +344,8 @@ public final class AgentControlClient {
 		CAMERA_ASSISTANT.resetTracking();
 		refreshCountdown = 0;
 		snapshotContentHash = 0;
+		snapshotError = "";
+		SNAPSHOT_ACKNOWLEDGEMENTS.clear();
 	}
 
 	private static int contentHash(AgentControlSnapshot snapshot) {
@@ -319,17 +367,23 @@ public final class AgentControlClient {
 		preferences = Preferences.reconcile(preferences, catalogAuthoritative);
 	}
 
-	public record Preferences(String provider, String model, String reasoning) {
+	public record Preferences(String provider, String model, String reasoning, String serviceTier) {
 		public Preferences {
 			provider = AgentControlCatalog.requireProvider(provider);
 			model = Objects.requireNonNull(model, "model must not be null");
 			reasoning = Objects.requireNonNull(reasoning, "reasoning must not be null");
+			serviceTier = Objects.requireNonNull(serviceTier, "serviceTier must not be null");
+		}
+
+		public Preferences(String provider, String model, String reasoning) {
+			this(provider, model, reasoning, AgentControlCatalog.defaultServiceTier(provider, model));
 		}
 
 		private static Preferences defaults() {
 			String provider = AgentControlCatalog.providers().getFirst();
 			String model = AgentControlCatalog.defaultModel(provider);
-			return new Preferences(provider, model, AgentControlCatalog.defaultReasoning(provider, model));
+			return new Preferences(provider, model, AgentControlCatalog.defaultReasoning(provider, model),
+					AgentControlCatalog.defaultServiceTier(provider, model));
 		}
 
 		static Preferences reconcile(Preferences current, boolean authoritative) {
@@ -341,7 +395,50 @@ public final class AgentControlClient {
 					? checked.model() : AgentControlCatalog.defaultModel(provider);
 			String reasoning = AgentControlCatalog.reasoningEfforts(provider, model).contains(checked.reasoning())
 					? checked.reasoning() : AgentControlCatalog.defaultReasoning(provider, model);
-			return new Preferences(provider, model, reasoning);
+			List<String> serviceTiers = AgentControlCatalog.serviceTiers(provider, model);
+			String serviceTier = serviceTiers.contains(checked.serviceTier())
+					? checked.serviceTier() : AgentControlCatalog.defaultServiceTier(provider, model);
+			return new Preferences(provider, model, reasoning, serviceTier);
 		}
 	}
+
+	private static ScenarioLaunchRegistry.Result cancelScenario(String buildId) {
+		try {
+			if (!ClientPlayNetworking.canSend(ScenarioCancelPayload.TYPE)) {
+				return new ScenarioLaunchRegistry.Result(false, "The server does not support arena cancellation");
+			}
+			ClientPlayNetworking.send(new ScenarioCancelPayload(buildId));
+			return new ScenarioLaunchRegistry.Result(true, "Cancellation request sent");
+		} catch (RuntimeException exception) {
+			String message = exception.getMessage();
+			return new ScenarioLaunchRegistry.Result(
+					false, message == null || message.isBlank() ? exception.getClass().getSimpleName() : message);
+		}
+	}
+
+	static final class SnapshotAcknowledgements {
+		private final ArrayDeque<Long> requests = new ArrayDeque<>();
+		private long nextMutationId;
+		private long mutationForNextRequest;
+
+		long beginMutation() {
+			mutationForNextRequest = ++nextMutationId;
+			return mutationForNextRequest;
+		}
+
+		void recordRequest() {
+			requests.addLast(mutationForNextRequest);
+			mutationForNextRequest = 0L;
+		}
+
+		long acceptSnapshot() {
+			return requests.isEmpty() ? 0L : requests.removeFirst();
+		}
+
+		void clear() {
+			requests.clear();
+			mutationForNextRequest = 0L;
+		}
+	}
+
 }

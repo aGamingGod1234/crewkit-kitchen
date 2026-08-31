@@ -22,6 +22,7 @@ import java.util.function.Consumer;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.minecraft.client.Minecraft;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -37,6 +38,7 @@ public final class ArenaAgentsClient implements ClientModInitializer {
 	private ProtocolCodec protocolCodec;
 	private ObservationCollector observationCollector;
 	private ClientActionRuntime actionRuntime;
+	private long observationSessionId;
 
 	@Override
 	public void onInitializeClient() {
@@ -59,12 +61,15 @@ public final class ArenaAgentsClient implements ClientModInitializer {
 				bridgeServer,
 				exception -> LOGGER.warn("Could not publish an Arena Agents action event", exception)
 		);
-		actionRuntime = new ClientActionRuntime(new MinecraftActionContext(minecraft), actionPublisher);
+		actionRuntime = new ClientActionRuntime(
+				new MinecraftActionContext(minecraft),
+				(ClientActionRuntime.SessionEventSink) actionPublisher
+		);
 		observationCollector = new ObservationCollector(
 				minecraft,
 				config.observationRadius(),
-				actionRuntime::currentStatus,
-				actionRuntime::lastResult
+				() -> actionRuntime.currentStatus(observationSessionId),
+				() -> actionRuntime.lastResult(observationSessionId)
 		);
 		if (!startBridgeOrCleanup(
 				bridgeServer::start,
@@ -83,6 +88,8 @@ public final class ArenaAgentsClient implements ClientModInitializer {
 			return;
 		}
 		GoalReceiver.register(actionRuntime, bridgeServer);
+		ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> bridgeServer.rotateSession());
+		ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> bridgeServer.rotateSession());
 		ClientTickEvents.END_CLIENT_TICK.register(client -> actionRuntime.tick());
 		ClientLifecycleEvents.CLIENT_STOPPING.register(client -> stopClient());
 	}
@@ -103,8 +110,14 @@ public final class ArenaAgentsClient implements ClientModInitializer {
 		actionRuntime = null;
 	}
 
-	private void publishObservation() {
-		Observation observation = observationCollector.collect();
+	private void publishObservation(long sessionId) {
+		observationSessionId = sessionId;
+		Observation observation;
+		try {
+			observation = observationCollector.collect();
+		} finally {
+			observationSessionId = 0L;
+		}
 		ObservationWireBudget.FittedObservation fitted = ObservationWireBudget.fit(
 				observation,
 				protocolCodec,
@@ -112,7 +125,7 @@ public final class ArenaAgentsClient implements ClientModInitializer {
 				EVENT_OBSERVATION
 		);
 		JsonObject payload = fitted.payload();
-		bridgeServer.sendEvent(EVENT_OBSERVATION, payload);
+		bridgeServer.sendEvent(sessionId, EVENT_OBSERVATION, payload);
 	}
 
 	private final class ClientBridgeEventSink implements BridgeEventSink {
@@ -122,13 +135,34 @@ public final class ArenaAgentsClient implements ClientModInitializer {
 		}
 
 		@Override
+		public void onActionCommand(long sessionId, ActionCommand command) {
+			actionRuntime.onActionCommand(sessionId, command);
+		}
+
+		@Override
 		public void onCancelAction(String commandId) {
 			actionRuntime.onCancelAction(commandId, COORDINATOR_CANCEL_REASON);
 		}
 
 		@Override
+		public void onCancelAction(long sessionId, String commandId) {
+			actionRuntime.onCancelAction(sessionId, commandId, COORDINATOR_CANCEL_REASON);
+		}
+
+		@Override
 		public void onObservationRequested() {
-			publishObservation();
+			long sessionId = bridgeServer.authenticatedSessionId();
+			if (sessionId != 0L) publishObservation(sessionId);
+		}
+
+		@Override
+		public void onObservationRequested(long sessionId) {
+			publishObservation(sessionId);
+		}
+
+		@Override
+		public void onSessionClosed(long sessionId) {
+			actionRuntime.onSessionClosed(sessionId);
 		}
 	}
 

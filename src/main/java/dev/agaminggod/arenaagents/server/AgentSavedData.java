@@ -20,6 +20,7 @@ import dev.agaminggod.arenaagents.server.goal.OperatorConfirmationLedger;
 import dev.agaminggod.arenaagents.server.goal.OperatorConfirmationLedgerCodec;
 import dev.agaminggod.arenaagents.server.goal.SurvivalProgressLedger;
 import dev.agaminggod.arenaagents.server.goal.SurvivalProgressLedgerCodec;
+import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -31,6 +32,7 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.util.datafix.DataFixTypes;
 import net.minecraft.world.level.saveddata.SavedData;
 import net.minecraft.world.level.saveddata.SavedDataType;
+import net.minecraft.world.level.storage.LevelResource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -151,6 +153,12 @@ public final class AgentSavedData extends SavedData {
 	public static AgentSavedData get(MinecraftServer server) {
 		Objects.requireNonNull(server, "server must not be null");
 		return server.overworld().getDataStorage().computeIfAbsent(TYPE);
+	}
+
+	/** Sidecar path used for synchronous action write-ahead durability. */
+	public static Path actionJournalPath(MinecraftServer server) {
+		Objects.requireNonNull(server, "server must not be null");
+		return server.getWorldPath(LevelResource.ROOT).resolve("data").resolve("arenaagents-action-journal.json");
 	}
 
 	public AgentRegistry registry() {

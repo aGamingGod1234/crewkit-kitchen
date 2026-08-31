@@ -108,6 +108,21 @@ public final class ScenarioBuildProgressVerification {
 		assertEquals(ScenarioBuildProgress.Status.FAILED, failedTick.status(),
 				"a failed reset tick becomes failed instead of invalid building progress");
 		assertEquals(21, failedTick.changedBlocks(), "terminal reset mapping preserves actual world changes");
+		assertEquals("RESET_VERIFICATION_MISMATCH", failedTick.errorCode(),
+				"terminal reset errors retain a stable machine-readable code");
+		ScenarioBuildProgress confirmation = ScenarioBuildProgress.confirmationRequired(
+				"build-4", "The Last Valley", 1L, 0, 70, 0,
+				"Confirm overwrite", "token-1");
+		assertEquals(ScenarioBuildProgress.Status.CONFIRMATION_REQUIRED, confirmation.status(),
+				"destructive preflight is distinct from a failed build");
+		assertFalse(confirmation.terminal(), "confirmation remains actionable");
+		ScenarioBuildProgress cancelled = ScenarioBuildProgress.cancelled(
+				"build-4", "The Last Valley", 2L, 12, 4, 0, 70, 0, "Cancelled safely");
+		assertTrue(cancelled.terminal(), "cancelled build is terminal");
+		assertTrue(dev.agaminggod.arenaagents.scenario.presentation.ScenarioPresentationExpiry.expired(
+				10L, 10L + dev.agaminggod.arenaagents.scenario.presentation.ScenarioPresentationExpiry.BUILD_TERMINAL_TTL_TICKS,
+				dev.agaminggod.arenaagents.scenario.presentation.ScenarioPresentationExpiry.BUILD_TERMINAL_TTL_TICKS),
+				"terminal build publication expires at its bounded retention window");
 
 		assertThrows(IllegalArgumentException.class, () -> new ScenarioBuildProgress(
 				"", "title", "phase", 1L, 0, 0, 0, 0, 0, 0,
@@ -120,7 +135,7 @@ public final class ScenarioBuildProgressVerification {
 				ScenarioBuildProgress.Status.BUILDING, "detail"), "completed cannot exceed total");
 		assertThrows(IllegalArgumentException.class, () -> new ScenarioBuildProgressPayload(
 				"{\"schemaVersion\":999}"), "unsupported payload schema is rejected");
-		return 31;
+		return 37;
 	}
 
 	private static void assertTrue(boolean condition, String label) {

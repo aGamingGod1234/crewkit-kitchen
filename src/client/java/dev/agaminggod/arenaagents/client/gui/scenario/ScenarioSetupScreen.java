@@ -214,8 +214,10 @@ public final class ScenarioSetupScreen extends Screen {
 		}
 		String status = switch (progress.status()) {
 			case BUILDING -> "Building arena";
+			case CONFIRMATION_REQUIRED -> "Destructive site confirmation required";
 			case READY -> "Arena ready";
 			case FAILED -> "Build failed";
+			case CANCELLED -> "Build cancelled";
 		};
 		appendNarration(narration, Component.literal(status + ", " + progress.percent() + "%, "
 				+ progress.humanPhase() + ", " + progress.completed() + " of " + progress.total()));
@@ -436,13 +438,18 @@ public final class ScenarioSetupScreen extends Screen {
 		int buttonWidth = layout.footerButtonWidth();
 		addRenderableWidget(consoleButton("Close", layout.contentLeft(), layout.footerY(), buttonWidth,
 				ROW_HEIGHT, false, this::onClose));
-		if (progress != null && progress.status() == ScenarioBuildProgress.Status.FAILED) {
+		if (progress != null && progress.status() == ScenarioBuildProgress.Status.CONFIRMATION_REQUIRED) {
 			addRenderableWidget(new ConsoleButton(font, layout.contentRight() - buttonWidth, layout.footerY(), buttonWidth,
-					ROW_HEIGHT, Component.literal("Retry build"), false, GOLD, ConsoleButton.Tone.PRIMARY, () -> {
-				launchPending = false;
-				setFeedback("Review the setup, then retry the arena build.", false);
-				rebuildWidgets();
-			}));
+					ROW_HEIGHT, Component.literal("Confirm overwrite"), false, GOLD, ConsoleButton.Tone.PRIMARY,
+					() -> confirmLaunch(progress.confirmationToken())));
+		} else if (progress != null && progress.status() == ScenarioBuildProgress.Status.FAILED) {
+			addRenderableWidget(new ConsoleButton(font, layout.contentRight() - buttonWidth, layout.footerY(), buttonWidth,
+					ROW_HEIGHT, Component.literal("Clean up site"), false, GOLD, ConsoleButton.Tone.PRIMARY,
+					() -> cancelBuild(progress.buildId())));
+		} else if (progress != null && !progress.terminal()) {
+			addRenderableWidget(new ConsoleButton(font, layout.contentRight() - buttonWidth, layout.footerY(), buttonWidth,
+					ROW_HEIGHT, Component.literal("Cancel build"), false, GOLD, ConsoleButton.Tone.PRIMARY,
+					() -> cancelBuild(progress.buildId())));
 		} else {
 			addRenderableWidget(new ConsoleButton(font, layout.contentRight() - buttonWidth, layout.footerY(), buttonWidth,
 					ROW_HEIGHT, Component.literal("Open live arena"), false, GOLD, ConsoleButton.Tone.PRIMARY,
@@ -814,9 +821,12 @@ public final class ScenarioSetupScreen extends Screen {
 	) {
 		ScenarioBuildProgress progress = AgentControlClient.buildProgressState().progress().orElse(null);
 		int y = layout.contentTop();
-		int color = progress == null ? GOLD
-				: progress.status() == ScenarioBuildProgress.Status.FAILED ? ERROR
-				: progress.status() == ScenarioBuildProgress.Status.READY ? SUCCESS : GOLD;
+		int color = progress == null ? GOLD : switch (progress.status()) {
+			case FAILED -> ERROR;
+			case READY -> SUCCESS;
+			case CANCELLED -> MUTED;
+			case BUILDING, CONFIRMATION_REQUIRED -> GOLD;
+		};
 		graphics.fill(x, y, x + width, layout.contentBottom(), SURFACE_COLOR);
 		if (progress == null) {
 			graphics.text(font, "Build request sent", x + 12, y + 12, GOLD, false);
@@ -824,8 +834,13 @@ public final class ScenarioSetupScreen extends Screen {
 					x + 12, y + 31, TEXT, false);
 			return;
 		}
-		String heading = progress.status() == ScenarioBuildProgress.Status.BUILDING ? "Building arena"
-				: progress.status() == ScenarioBuildProgress.Status.READY ? "Arena ready" : "Build failed";
+		String heading = switch (progress.status()) {
+			case BUILDING -> "Building arena";
+			case CONFIRMATION_REQUIRED -> "Confirm site overwrite";
+			case READY -> "Arena ready";
+			case FAILED -> "Build failed";
+			case CANCELLED -> "Build cancelled";
+		};
 		graphics.text(font, heading, x + 12, y + 12, color, false);
 		graphics.text(font, fit(progress.scenarioTitle(), width - 100), x + 12, y + 27, TEXT, false);
 		String percentage = progress.percent() + "%";
@@ -851,7 +866,8 @@ public final class ScenarioSetupScreen extends Screen {
 			if (progress != null) {
 				message = progress.detail();
 				color = progress.status() == ScenarioBuildProgress.Status.FAILED ? ERROR
-						: progress.status() == ScenarioBuildProgress.Status.READY ? SUCCESS : GOLD;
+						: progress.status() == ScenarioBuildProgress.Status.READY ? SUCCESS
+						: progress.status() == ScenarioBuildProgress.Status.CANCELLED ? MUTED : GOLD;
 			}
 		} else if (message.isBlank() && state.step() == ScenarioWizardStep.ROSTER) {
 			message = "Editing agent " + (state.selectedIndex() + 1) + " of " + state.roster().size()
@@ -889,6 +905,13 @@ public final class ScenarioSetupScreen extends Screen {
 
 	public void acceptBuildProgress() {
 		if (minecraft != null && launchPending) rebuildWidgets();
+	}
+
+	public void acceptBuildProgressClear() {
+		if (!launchPending) return;
+		launchPending = false;
+		setFeedback("", false);
+		if (minecraft != null) rebuildWidgets();
 	}
 
 	public void acceptCatalogUpdate() {
@@ -957,9 +980,26 @@ public final class ScenarioSetupScreen extends Screen {
 		}
 	}
 
+	private void confirmLaunch(String confirmationToken) {
+		ScenarioLaunchRegistry.Result result = launchSafely(state, confirmationToken);
+		setFeedback(result.message(), !result.accepted());
+		if (result.accepted()) launchPending = true;
+		rebuildWidgets();
+	}
+
+	private void cancelBuild(String buildId) {
+		ScenarioLaunchRegistry.Result result = ScenarioLaunchRegistry.cancel(buildId);
+		setFeedback(result.message(), !result.accepted());
+		rebuildWidgets();
+	}
+
 	static ScenarioLaunchRegistry.Result launchSafely(ScenarioSetupState state) {
+		return launchSafely(state, "");
+	}
+
+	static ScenarioLaunchRegistry.Result launchSafely(ScenarioSetupState state, String confirmationToken) {
 		try {
-			return ScenarioLaunchRegistry.launch(state.launchPlan());
+			return ScenarioLaunchRegistry.launch(state.launchPlan(confirmationToken));
 		} catch (IllegalArgumentException | IllegalStateException exception) {
 			String message = exception.getMessage();
 			return new ScenarioLaunchRegistry.Result(

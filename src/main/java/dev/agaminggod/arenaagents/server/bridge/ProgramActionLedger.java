@@ -60,6 +60,18 @@ final class ProgramActionLedger {
 		trim(completed);
 	}
 
+	synchronized void rollback(ServerActionRequest request) {
+		GoalExecutionFence fence = executionFences.get(request.agentId());
+		if (fence == null || fence.goalRevision() != request.goalRevision()) return;
+		LinkedHashMap<String, ActionProvenance> entries = accepted.get(request.agentId());
+		if (entries == null || !request.provenance().equals(entries.get(request.actionId()))) return;
+		entries.remove(request.actionId());
+		LinkedHashMap<ActionProvenance, String> actionIds = actionIdsByProgramStep.get(request.agentId());
+		if (actionIds != null) actionIds.remove(request.provenance(), request.actionId());
+		fence.provenanceByActionId().remove(request.actionId(), request.provenance());
+		fence.actionIdByProgramStep().remove(request.provenance(), request.actionId());
+	}
+
 	synchronized void remove(AgentId agentId) {
 		accepted.remove(agentId);
 		terminal.remove(agentId);

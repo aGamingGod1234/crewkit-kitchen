@@ -22,21 +22,10 @@ abstract class AbstractClientPlayerMixin {
 		AbstractClientPlayer player = (AbstractClientPlayer) (Object) this;
 		String profileName = player.getGameProfile().name();
 		AgentControlAgent agent = AgentControlClient.agentForPlayer(profileName).orElse(null);
-		if (agent != null && !player.getUUID().equals(AgentIdentity.offlinePlayerUuid(agent.playerName()))) return;
-		AgentIdentity.SkinIdentity fallback = agent == null
-				? AgentIdentity.skinForPlayerName(profileName).orElse(null) : null;
-		if (agent == null && fallback == null) return;
-		if (fallback != null && !player.getUUID().equals(AgentIdentity.offlinePlayerUuid(profileName))) return;
+		if (agent == null || !player.getUUID().equals(AgentIdentity.offlinePlayerUuid(agent.playerName()))) return;
 
-		AgentVisualIdentity.Resolved identity;
-		if (agent != null) {
-			identity = AgentVisualIdentity.resolve(agent.provider(), agent.model(), agent.skinVariant());
-		} else if (fallback.modelFamily().isBlank()) {
-			identity = AgentVisualIdentity.resolveProviderFallback(fallback.provider(), fallback.variant());
-		} else {
-			identity = AgentVisualIdentity.resolveFamily(
-					fallback.provider(), fallback.modelFamily(), fallback.variant());
-		}
+		AgentVisualIdentity.Resolved identity = AgentVisualIdentity.resolve(
+				agent.provider(), agent.model(), agent.skinVariant());
 		Identifier texture = CodexAgentRenderer.textureFor(identity);
 		ClientAsset.Texture body = new ClientAsset.ResourceTexture(texture, texture);
 		callback.setReturnValue(new PlayerSkin(body, null, null, PlayerModelType.WIDE, false));

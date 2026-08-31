@@ -57,6 +57,11 @@ public final class ScenarioSavedData extends SavedData {
 		setDirty();
 	}
 
+	public static void saveNow(MinecraftServer server) {
+		Objects.requireNonNull(server, "server must not be null");
+		server.overworld().getDataStorage().saveAndJoin();
+	}
+
 	private String encodePayload() {
 		return snapshot == null ? "" : snapshot.toJson();
 	}

@@ -13,6 +13,7 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.lang.reflect.Field;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
@@ -87,6 +88,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyBlockingMaintenanceNeverBlocksTicks();
 		verifyBlockedMaintenanceWaitsForRetryDeadline();
 		verifyProductionDependencyMonitorWakesOnRelevantFileChange();
+		verifyProductionDependencyMonitorAvoidsManifestMemberPolling();
 		verifyManifestFingerprintCoversEveryListedModule();
 		verifyExternalFingerprintChangeStillReplacesHealthyChild();
 		verifyWorkerFingerprintObservationAdvancesMonitorBaseline();
@@ -112,7 +114,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyCloseWaitsForInflightOwnedLaunchCleanup();
 		verifyCloseTerminatesChildBehindBlockedMaintenance();
 		verifyCloseIsIdempotent();
-		return isWindows() ? 306 : 296;
+		return isWindows() ? 369 : 359;
 	}
 
 	private static void verifyPosixLaunchGateCommand() {
@@ -686,7 +688,7 @@ public final class CoordinatorProcessSupervisorVerification {
 			authenticated = null;
 			slot.close();
 			slot = null;
-			try (ServerSocket rebound = new ServerSocket(port, 1, InetAddress.getLoopbackAddress())) {
+			try (ServerSocket rebound = bindLoopbackEventually(port)) {
 				assertEquals(port, rebound.getLocalPort(), "closing recovered BridgeSlot releases its listener once");
 			}
 		} catch (Exception exception) {
@@ -1326,6 +1328,53 @@ public final class CoordinatorProcessSupervisorVerification {
 		}
 	}
 
+	private static void verifyProductionDependencyMonitorAvoidsManifestMemberPolling() {
+		String oldPackageRoot = System.getProperty("arenaagents.packageRoot");
+		Path root = null;
+		try {
+			root = Files.createTempDirectory("arena-cheap-dependency-monitor-");
+			Path module = root.resolve("coordinator/src/codex-service.mjs");
+			Path manifest = root.resolve("coordinator/.arena-agents-bundle-manifest");
+			Path generation = root.resolve("runtime/coordinator-generation.properties");
+			Files.createDirectories(module.getParent());
+			Files.createDirectories(generation.getParent());
+			Files.writeString(module, "alpha", StandardCharsets.UTF_8);
+			Files.writeString(manifest, "0".repeat(64) + " src/codex-service.mjs\n", StandardCharsets.UTF_8);
+			Files.writeString(generation, "generation=alpha\n", StandardCharsets.UTF_8);
+			FileTime initialManifestTime = Files.getLastModifiedTime(manifest);
+			FileTime initialGenerationTime = Files.getLastModifiedTime(generation);
+			System.setProperty("arenaagents.packageRoot", root.toString());
+			CoordinatorProcessSupervisor.DefaultDependencyResolver resolver =
+					new CoordinatorProcessSupervisor.DefaultDependencyResolver(root.resolve("game"), Map.of());
+			String initial = resolver.monitorFingerprint();
+			for (int second = 0; second < 60; second++) {
+				assertEquals(initial, resolver.monitorFingerprint(),
+						"unchanged monitor token stays stable without reading manifest-listed modules");
+			}
+
+			FileTime originalModuleTime = Files.getLastModifiedTime(module);
+			Files.writeString(module, "omega", StandardCharsets.UTF_8);
+			Files.setLastModifiedTime(module, FileTime.fromMillis(originalModuleTime.toMillis() + 2_000L));
+			assertEquals(initial, resolver.monitorFingerprint(),
+					"fast monitor token does not stat every manifest-listed module");
+
+			Files.writeString(generation, "generation=beta\n", StandardCharsets.UTF_8);
+			Files.setLastModifiedTime(generation, FileTime.fromMillis(initialGenerationTime.toMillis() + 2_000L));
+			String generationChanged = resolver.monitorFingerprint();
+			assertFalse(initial.equals(generationChanged),
+					"generation journal changes are visible on the next one-second monitor poll");
+			Files.writeString(manifest, "1".repeat(64) + " src/codex-service.mjs\n", StandardCharsets.UTF_8);
+			Files.setLastModifiedTime(manifest, FileTime.fromMillis(initialManifestTime.toMillis() + 2_000L));
+			assertFalse(generationChanged.equals(resolver.monitorFingerprint()),
+					"manifest changes are visible on the next one-second monitor poll");
+		} catch (IOException exception) {
+			throw new AssertionError("cheap dependency monitor verification failed", exception);
+		} finally {
+			restoreProperty("arenaagents.packageRoot", oldPackageRoot);
+			if (root != null) deleteTree(root);
+		}
+	}
+
 	private static void verifyContinuousStabilityResetsFailures() {
 		Fixture fixture = Fixture.ready();
 		fixture.startFirstProcess();
@@ -1732,14 +1781,24 @@ public final class CoordinatorProcessSupervisorVerification {
 			supervisor.tick(true, originalBridge.authenticatedLaunchId(), originalBridge.authenticatedSessionGeneration());
 			assertEquals(2, launcher.launches.size(), "secret repair relaunches one matching coordinator child");
 			long repairedRevision = supervisor.bridgeRevision();
-			slot.reconcile(repairedRevision, () ->
-					MultiplexedServerBridge.withPreparedSecret(manager, port, ownedSupervisor.bridgeSecret()));
-			MultiplexedServerBridge repairedBridge = slot.bridge();
+			MultiplexedServerBridge repairedBridge = null;
+			long rebindDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5L);
+			do {
+				slot.reconcile(repairedRevision, () ->
+						MultiplexedServerBridge.withPreparedSecret(manager, port, ownedSupervisor.bridgeSecret()));
+				repairedBridge = slot.bridge();
+				if (repairedBridge != null) break;
+				clock.advance(1_000L);
+				Thread.sleep(25L);
+			} while (System.nanoTime() < rebindDeadline);
+			assertTrue(repairedBridge != null, "secret repair rebinds through the BridgeSlot retry policy");
 			assertFalse(originalBridge == repairedBridge, "secret repair replaces the cached Java bridge instance");
 			assertEquals(dev.agaminggod.arenaagents.agent.AgentLifecycleState.DISCONNECTED,
 					manager.registry().require(active.agentId()).state(),
 					"bridge replacement drains the authenticated session disconnect before dropping the old bridge");
-			repairedConnection = authenticate(port, repairedSecret, supervisor.snapshot().launchId(), "repaired-secret");
+			repairedConnection = authenticateEventually(
+					port, repairedSecret, supervisor.snapshot().launchId(), "repaired-secret"
+			);
 			supervisor.tick(true, repairedBridge.authenticatedLaunchId(), repairedBridge.authenticatedSessionGeneration());
 			assertEquals(CoordinatorRecoveryState.HEALTHY, supervisor.snapshot().state(),
 					"matching repaired child authenticates automatically through the rebound bridge");
@@ -1914,7 +1973,7 @@ public final class CoordinatorProcessSupervisorVerification {
 			MultiplexedServerBridge reboundBridge = slot.bridge();
 			assertTrue(reboundBridge != null && reboundBridge != originalBridge,
 					"production reconciliation replaces the listener after a port-only change");
-			try (ServerSocket released = new ServerSocket(originalPort, 1, InetAddress.getLoopbackAddress())) {
+			try (ServerSocket released = bindLoopbackEventually(originalPort)) {
 				assertEquals(originalPort, released.getLocalPort(), "port-only reconciliation releases the old listener");
 			}
 			reboundConnection = authenticate(
@@ -1978,6 +2037,12 @@ public final class CoordinatorProcessSupervisorVerification {
 			Files.writeString(secretFile, rotatedSecret, StandardCharsets.UTF_8);
 			Files.setLastModifiedTime(secretFile, originalTimestamp);
 			CodexAgentServerRuntime.reconcileBridgeConfiguration(slot, uninitializedManager(), supervisor);
+			long rotationDeadline = System.currentTimeMillis() + 3_000L;
+			while ((slot.bridge() == null || slot.bridge() == initialBridge)
+					&& System.currentTimeMillis() < rotationDeadline) {
+				Thread.sleep(25L);
+				CodexAgentServerRuntime.reconcileBridgeConfiguration(slot, uninitializedManager(), supervisor);
+			}
 			assertTrue(slot.bridge() != null && slot.bridge() != initialBridge,
 					"same-size same-timestamp rotation after byte 257 rebinds the explicit Java bridge");
 			try (Socket connection = authenticate(
@@ -2661,6 +2726,43 @@ public final class CoordinatorProcessSupervisorVerification {
 		}
 	}
 
+	private static Socket authenticateEventually(
+			int port,
+			String secret,
+			String launchId,
+			String messageId
+	) throws Exception {
+		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5L);
+		Exception lastFailure = null;
+		for (int attempt = 1; System.nanoTime() < deadline; attempt++) {
+			try {
+				return authenticate(port, secret, launchId, messageId + "-" + attempt);
+			} catch (IOException | dev.agaminggod.arenaagents.server.bridge.BridgeProtocolException retryable) {
+				lastFailure = retryable;
+				Thread.sleep(25L);
+			}
+		}
+		throw new IOException("Rebound bridge did not accept authentication before its deadline", lastFailure);
+	}
+
+	private static ServerSocket bindLoopbackEventually(int port) throws Exception {
+		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3L);
+		java.net.BindException lastFailure = null;
+		do {
+			ServerSocket socket = new ServerSocket();
+			try {
+				socket.setReuseAddress(true);
+				socket.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), port), 1);
+				return socket;
+			} catch (java.net.BindException retryable) {
+				lastFailure = retryable;
+				socket.close();
+				Thread.sleep(25L);
+			}
+		} while (System.nanoTime() < deadline);
+		throw new IOException("Closed bridge listener was not released before its deadline", lastFailure);
+	}
+
 	private static String authenticationProof(
 			String secret,
 			String role,
@@ -2788,16 +2890,30 @@ public final class CoordinatorProcessSupervisorVerification {
 	}
 
 	private static void deleteTree(Path root) {
-		try (var paths = Files.walk(root)) {
-			paths.sorted(java.util.Comparator.reverseOrder()).forEach(path -> {
+		List<Path> paths;
+		try (var walk = Files.walk(root)) {
+			paths = walk.sorted(java.util.Comparator.reverseOrder()).toList();
+		} catch (IOException exception) {
+			throw new AssertionError("could not enumerate coordinator verification fixture", exception);
+		}
+		for (Path path : paths) {
+			long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5L);
+			while (true) {
 				try {
 					Files.deleteIfExists(path);
+					break;
 				} catch (IOException exception) {
-					throw new java.io.UncheckedIOException(exception);
+					if (System.nanoTime() >= deadline) {
+						throw new AssertionError("could not clean coordinator verification fixture", exception);
+					}
+					try {
+						Thread.sleep(25L);
+					} catch (InterruptedException interrupted) {
+						Thread.currentThread().interrupt();
+						throw new AssertionError("coordinator verification cleanup was interrupted", interrupted);
+					}
 				}
-			});
-		} catch (IOException | java.io.UncheckedIOException exception) {
-			throw new AssertionError("could not clean secret repair fixture", exception);
+			}
 		}
 	}
 

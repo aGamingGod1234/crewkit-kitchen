@@ -279,6 +279,7 @@ def safe_extract(
     """
 
     requested_destination = Path(destination)
+    returned_destination = requested_destination.absolute()
     _reject_linked_path(requested_destination)
     if requested_destination.exists():
         raise ArchiveSafetyError(f"destination already exists: {requested_destination}")
@@ -334,7 +335,7 @@ def safe_extract(
         child_pins.clear()
         temporary_root.replace(resolved_destination)
         temporary_root = None
-        return [resolved_destination / member.relative_path for member in approved if not member.is_directory]
+        return [returned_destination / member.relative_path for member in approved if not member.is_directory]
     except (ArchiveSafetyError, zipfile.BadZipFile, RuntimeError, OSError) as error:
         if isinstance(error, ArchiveSafetyError):
             raise

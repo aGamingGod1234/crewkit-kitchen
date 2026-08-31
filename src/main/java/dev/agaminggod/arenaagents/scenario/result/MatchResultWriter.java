@@ -196,15 +196,33 @@ public final class MatchResultWriter {
 				while (buffer.hasRemaining()) channel.write(buffer);
 				channel.force(true);
 			}
-			try {
-				Files.move(temporary, target,
-						StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-				moved = true;
-			} catch (AtomicMoveNotSupportedException exception) {
-				throw new IOException("ATOMIC_RESULT_WRITE_UNAVAILABLE: " + target, exception);
-			}
+			moveDurably(temporary, target, Files::move);
+			moved = true;
 		} finally {
 			if (!moved) Files.deleteIfExists(temporary);
 		}
+	}
+
+	/**
+	 * Uses an atomic rename when the filesystem supports it. Filesystems that reject
+	 * atomic moves fall back to a same-directory replacement of the already-synced
+	 * temporary file. The fallback prevents a permanent capability mismatch from
+	 * holding the scenario result latch forever.
+	 */
+	public static void moveDurably(Path temporary, Path target, MoveOperation move) throws IOException {
+		Objects.requireNonNull(temporary, "temporary must not be null");
+		Objects.requireNonNull(target, "target must not be null");
+		Objects.requireNonNull(move, "move must not be null");
+		try {
+			move.move(temporary, target,
+					StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+		} catch (AtomicMoveNotSupportedException unsupported) {
+			move.move(temporary, target, StandardCopyOption.REPLACE_EXISTING);
+		}
+	}
+
+	@FunctionalInterface
+	public interface MoveOperation {
+		Path move(Path source, Path target, java.nio.file.CopyOption... options) throws IOException;
 	}
 }

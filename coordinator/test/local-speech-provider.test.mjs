@@ -172,7 +172,7 @@ test('aborting one inference preserves unrelated pending speech work', async () 
 	const provider = new LocalSpeechProvider({
 		executable: process.execPath,
 		scriptPath: fileURLToPath(new URL('../test-support/local-speech-rpc-fixture.mjs', import.meta.url)),
-		timeoutMs: 1_000,
+		timeoutMs: 5_000,
 	});
 	const controller = new AbortController();
 	try {

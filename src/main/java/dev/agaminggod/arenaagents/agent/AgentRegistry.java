@@ -326,28 +326,25 @@ public final class AgentRegistry {
 		return apply(AgentLifecycleReducer.rejectQueuedGoal(require(id), expectedGoalId, reason, nowEpochMs));
 	}
 
-	/** Applies a coordinator-owned terminal state, promoting queued work when present. */
+	/** Accepts a repeated coordinator completion only after factual satisfaction already completed the goal. */
 	public synchronized AgentRecord coordinatorCompleted(AgentId id, long revision, long nowEpochMs) {
 		AgentRecord current = require(id);
 		if (current.goalRevision() != revision) {
 			throw new AgentDomainException("STALE_REVISION", "Coordinator completion revision is stale");
 		}
-		if (current.state() == AgentLifecycleState.COMPLETED) return current;
-		if (!current.state().isActive()) {
-			throw new AgentDomainException("INVALID_AGENT_STATE", "Coordinator completion requires an active agent");
+		if (current.state() == AgentLifecycleState.COMPLETED
+				&& current.currentGoal().filter(goal -> goal.status() == dev.agaminggod.arenaagents.agent.goal.GoalStatus.SATISFIED).isPresent()) {
+			return current;
 		}
-		if (!current.queuedGoals().isEmpty()) {
-			return apply(AgentLifecycleReducer.completeGoal(current, revision, nowEpochMs)).after();
-		}
-		AgentRecord completed = current.withLifecycle(
-				AgentLifecycleState.COMPLETED,
-				current.currentGoal(),
-				current.goalRevision(),
-				current.queuedGoals(),
-				nowEpochMs,
-				""
-		);
-		return apply(new AgentTransition(current, completed, false, false)).after();
+		throw new AgentDomainException("GOAL_NOT_SATISFIED", "Coordinator completion cannot replace factual goal satisfaction");
+	}
+
+	public synchronized AgentRecord setRespawnPolicy(AgentId id, RespawnPolicy policy, long nowEpochMs) {
+		AgentRecord revised = require(id).withRespawnPolicy(
+				Objects.requireNonNull(policy, "policy must not be null"), nowEpochMs);
+		records.put(id, revised);
+		onChange.run();
+		return revised;
 	}
 
 	public synchronized AgentTransition fail(AgentId id, String message, long nowEpochMs) {

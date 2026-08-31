@@ -97,6 +97,7 @@ export class AcpStdioTransport extends EventEmitter {
 			child.once('error', onError);
 			if (Number.isInteger(child.pid) && child.pid > 0) onSpawn();
 		});
+		this.#ownRuntimeErrors(child);
 	}
 
 	request(method, params = {}, { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS } = {}) {
@@ -168,6 +169,28 @@ export class AcpStdioTransport extends EventEmitter {
 		const error = new AcpProtocolError('PROCESS_EXITED', `${this.#config.provider} ACP exited (code=${String(code)}, signal=${String(signal)})`);
 		this.#rejectPending(error);
 		this.emit('exit', error);
+	}
+
+	#ownRuntimeErrors(child) {
+		const own = (source) => source?.on?.('error', (error) => this.#onRuntimeError(child, error));
+		own(child);
+		own(child.stdin);
+		own(child.stdout);
+		own(child.stderr);
+	}
+
+	#onRuntimeError(child, cause) {
+		if (child !== this.#child) return;
+		this.#child = null;
+		const error = new AcpProtocolError(
+			'PROCESS_IO_ERROR',
+			`${this.#config.provider} ACP process I/O failed: ${sanitizeDiagnosticErrorMessage(cause)}`,
+			{ cause },
+		);
+		this.#rejectPending(error);
+		this.emit('exit', error);
+		void terminateChildProcess(child, { timeoutMs: this.#stopTimeoutMs })
+			.catch((stopError) => this.emit('protocolError', stopError));
 	}
 
 	#write(message) { this.#requireRunning(); this.#child.stdin.write(encodeJsonLine(message, { maxBytes: MAX_LINE_BYTES })); }

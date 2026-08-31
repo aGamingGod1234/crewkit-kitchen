@@ -338,6 +338,10 @@ public final class ScenarioSetupState {
 	}
 
 	public ScenarioLaunchPlan launchPlan() {
+		return launchPlan("");
+	}
+
+	public ScenarioLaunchPlan launchPlan(String confirmationToken) {
 		List<String> errors = validationErrors();
 		if (!errors.isEmpty()) {
 			throw new IllegalStateException(String.join("; ", errors));
@@ -362,7 +366,8 @@ public final class ScenarioSetupState {
 				selectedScenario.mapVersion(),
 				deterministicEvents,
 				placementMode,
-				agents
+				agents,
+				Objects.requireNonNull(confirmationToken, "confirmationToken must not be null")
 		);
 	}
 

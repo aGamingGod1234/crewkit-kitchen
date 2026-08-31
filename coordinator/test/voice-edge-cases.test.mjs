@@ -211,7 +211,7 @@ test('abort-ignoring provider probe never accumulates a replacement call', async
 			method: 'POST', headers: ttsHeaders(), body: JSON.stringify(ttsPayload()),
 		});
 		assert.equal(failed.status, 502);
-		await new Promise((resolve) => setTimeout(resolve, 50));
+		await eventually(() => aborts === 1);
 		assert.equal(probes, 1, 'one unresolved provider call retains exact probe ownership');
 		assert.equal(aborts, 1, 'probe deadline aborts the underlying provider call');
 		assert.equal(worker.statusSnapshots().find(({ component }) => component === 'voice:tts').state, 'degraded');
@@ -956,17 +956,22 @@ test('TTS route aborts synthesis when the client closes before the response', as
 	});
 });
 
-test('client cancellation retains its shared slot until abort-ignoring TTS settles', async () => {
-	let first = true;
-	let releaseLate;
-	const late = new Promise((resolve) => { releaseLate = resolve; });
+test('abort-ignoring TTS exhausts physical capacity once and fences the worker generation', async () => {
+	const releases = [];
+	let providerCalls = 0;
+	let probes = 0;
 	await withWorker({
 		maxConcurrent: 1,
-		provider: { async synthesize() {
-			if (first) { first = false; return late; }
+		provider: { async synthesize({ text }) {
+			providerCalls += 1;
+			if (text.startsWith('cancel')) return new Promise((resolve) => releases.push(resolve));
 			return validSynthesis();
-		} },
-	}, async ({ baseUrl }) => {
+		}, async probe() { probes += 1; } },
+		initialProbeDelayMs: 5,
+		maxProbeDelayMs: 5,
+	}, async ({ worker, baseUrl }) => {
+		let terminalFailures = 0;
+		worker.onFailure(() => { terminalFailures += 1; });
 		const controller = new AbortController();
 		const cancelled = fetch(`${baseUrl}/v1/tts`, {
 			method: 'POST', headers: ttsHeaders(), body: JSON.stringify({ ...ttsPayload(), text: 'cancel me' }), signal: controller.signal,
@@ -974,20 +979,41 @@ test('client cancellation retains its shared slot until abort-ignoring TTS settl
 		await eventuallyActive(baseUrl, 1);
 		controller.abort();
 		await assert.rejects(cancelled, (error) => error?.name === 'AbortError');
-		assert.equal((await health(baseUrl)).active, 1);
-		try {
-			const replacement = await fetch(`${baseUrl}/v1/tts`, {
-				method: 'POST', headers: ttsHeaders(), body: JSON.stringify({ ...ttsPayload(), text: 'replacement' }),
-			});
-			assert.equal(replacement.status, 429);
-		} finally {
-			releaseLate(validSynthesis());
-		}
 		await eventuallyActive(baseUrl, 0);
 		const replacement = await fetch(`${baseUrl}/v1/tts`, {
 			method: 'POST', headers: ttsHeaders(), body: JSON.stringify({ ...ttsPayload(), text: 'replacement' }),
 		});
 		assert.equal(replacement.status, 200);
+
+		const secondController = new AbortController();
+		const second = fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders(), body: JSON.stringify({ ...ttsPayload(), text: 'cancel two', conversationSequence: 2 }), signal: secondController.signal,
+		});
+		await eventuallyActive(baseUrl, 1);
+		secondController.abort();
+		await assert.rejects(second, (error) => error?.name === 'AbortError');
+		await eventuallyActive(baseUrl, 0);
+		const bounded = await fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders(), body: JSON.stringify({ ...ttsPayload(), text: 'third provider call', conversationSequence: 3 }),
+		});
+		assert.equal(bounded.status, 429, 'abort-ignoring physical synthesis remains globally bounded');
+		assert.equal((await bounded.json()).code, 'TTS_CAPACITY');
+		const ttsStatus = worker.statusSnapshots().find(({ component }) => component === 'voice:tts');
+		assert.equal(ttsStatus.state, 'degraded');
+		assert.equal(ttsStatus.failureCode, 'TTS_PROVIDER_CAPACITY_STALLED');
+		assert.equal(ttsStatus.nextProbeAtEpochMs, null);
+		await new Promise((resolve) => setTimeout(resolve, 25));
+		assert.equal(probes, 0, 'capacity fencing cannot create another abort-ignoring provider operation');
+		assert.equal(providerCalls, 3);
+		assert.equal(terminalFailures, 0, 'an in-process orphan cannot trigger an unbounded replacement generation');
+
+		for (const release of releases) release(validSynthesis());
+		await new Promise((resolve) => setImmediate(resolve));
+		const stillFenced = await fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders(), body: JSON.stringify({ ...ttsPayload(), text: 'fenced generation', conversationSequence: 4 }),
+		});
+		assert.equal(stillFenced.status, 429);
+		assert.equal(providerCalls, 3, 'late settlement cannot weaken the per-generation physical bound');
 	});
 });
 
@@ -1566,6 +1592,47 @@ test('Fish provider preserves rate-limit retry metadata', async () => {
 		assert.equal(error.retryAfter, '12');
 		return true;
 	});
+});
+
+test('removed voice assignments are pruned before the next store reload', async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), 'arena-voice-profile-remove-'));
+	const file = path.join(root, 'assignments.json');
+	try {
+		const created = await loadPersistentVoiceProfileStore(file);
+		created.store.resolve(AGENT);
+		await created.flush();
+		assert.equal(created.store.remove(AGENT), true);
+		assert.equal(created.store.remove(AGENT), false);
+		await created.close();
+
+		const document = JSON.parse(await readFile(file, 'utf8'));
+		assert.equal(Object.hasOwn(document.assignments, AGENT), false);
+		const reloaded = await loadPersistentVoiceProfileStore(file);
+		assert.equal(Object.hasOwn(reloaded.store.snapshotAssignments(), AGENT), false);
+		await reloaded.close();
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test('remote voice providers stop reading response bodies at their byte ceilings', async () => {
+	let fishCancelled = false;
+	const fishBody = new ReadableStream({
+		pull(controller) { controller.enqueue(new Uint8Array(512 * 1_024)); },
+		cancel() { fishCancelled = true; },
+	});
+	const fish = new FishTtsProvider({
+		apiKey: 'fish-test-token',
+		fetchImpl: async () => new Response(fishBody, { status: 200 }),
+	});
+	await assert.rejects(fish.synthesize({ text: 'Hello', voiceId: 'voice-id' }), (error) => error.code === 'TTS_AUDIO_TOO_LONG');
+	assert.equal(fishCancelled, true);
+
+	const deepgram = new DeepgramSttProvider({
+		apiKey: 'deepgram-test-token',
+		fetchImpl: async () => new Response(new Uint8Array(256 * 1_024 + 1), { status: 200 }),
+	});
+	await assert.rejects(deepgram.transcribe({ pcm: Buffer.alloc(2) }), (error) => error.code === 'STT_RESPONSE_TOO_LARGE');
 });
 
 test('Deepgram provider rejects unbounded or incomplete PCM before fetch', async () => {

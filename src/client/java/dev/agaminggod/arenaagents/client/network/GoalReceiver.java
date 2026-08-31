@@ -27,7 +27,11 @@ public final class GoalReceiver {
 	public static void register(ClientActionRuntime actionRuntime, BridgeServer bridgeServer) {
 		Objects.requireNonNull(actionRuntime, "actionRuntime must not be null");
 		Objects.requireNonNull(bridgeServer, "bridgeServer must not be null");
-		GoalReceiver receiver = new GoalReceiver(actionRuntime::stop, bridgeServer::sendEvent);
+		GoalReceiver receiver = new GoalReceiver(actionRuntime::stop, (type, payload) -> {
+			long sessionId = bridgeServer.authenticatedSessionId();
+			if (sessionId == 0L) throw new IllegalStateException("No authenticated coordinator session is active");
+			bridgeServer.sendEvent(sessionId, type, payload);
+		});
 		boolean registered = ClientPlayNetworking.registerGlobalReceiver(
 				GoalPayload.TYPE,
 				(payload, context) -> {

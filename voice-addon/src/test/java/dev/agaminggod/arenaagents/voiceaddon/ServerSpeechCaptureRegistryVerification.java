@@ -275,7 +275,7 @@ public final class ServerSpeechCaptureRegistryVerification {
 		}
 
 		@Override
-		public synchronized void accept(MicrophonePacketEvent event) {
+		public synchronized void accept(MicrophonePacketSnapshot packet) {
 			if (acceptFailure != null) throw acceptFailure;
 			accepts++;
 		}
