@@ -1,0 +1,4 @@
+{
+  "name": "Arena Agents",
+  "install": "bash .cursor/install.sh"
+}
