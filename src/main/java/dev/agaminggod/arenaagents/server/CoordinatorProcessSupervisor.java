@@ -2047,9 +2047,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 
 		@Override
 		public String fingerprint() {
-			Path installedRoot = gameDirectory.resolve("arena-agents-runtime");
-			Path packageRoot = findPackageRoot(gameDirectory);
-			Path root = packageRoot == null ? installedRoot : packageRoot;
+			Path root = selectedRuntimeRoot(gameDirectory);
 			ArrayList<String> values = new ArrayList<>();
 			values.add(Objects.toString(System.getProperty("arenaagents.packageRoot"), ""));
 			values.add(Objects.toString(System.getProperty(NodeRuntimeLocator.PROPERTY), ""));
@@ -2157,22 +2155,22 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 
 		private DependencyResolution resolveUncached() {
 			BundledCoordinatorInstaller.RuntimePackage prepared = null;
-			Path installedRoot = gameDirectory.resolve("arena-agents-runtime");
-			Path existingRoot = findPackageRoot(gameDirectory);
-			Path installationRoot = configuredProperty("arenaagents.packageRoot") == null
-					? installedRoot
-					: existingRoot;
-			Path nodeRoot = existingRoot == null ? installedRoot : existingRoot;
+			Path runtimeRoot = selectedRuntimeRoot(gameDirectory);
 			NodeRuntimeLocator.LocatedNode node;
 			try {
-				node = NodeRuntimeLocator.locate(nodeRoot);
-			} catch (NodeRuntimeLocator.NodeRuntimeFailure failure) {
-				return DependencyResolution.blocked(null, failure.code(), failure.getMessage());
+				if (recoverInterruptedDistributionNode(runtimeRoot)) {
+					LOGGER.warn("Recovered the bundled Node.js runtime after an interrupted Arena Agents update");
+				}
+				node = NodeRuntimeLocator.locate(runtimeRoot);
+			} catch (IOException | NodeRuntimeLocator.NodeRuntimeFailure failure) {
+				String code = failure instanceof NodeRuntimeLocator.NodeRuntimeFailure nodeFailure
+						? nodeFailure.code() : "NODE_RUNTIME_RECOVERY_FAILED";
+				return DependencyResolution.blocked(null, code, failure.getMessage());
 			}
 			try {
 				IOException installFailure = null;
 				try {
-					if (installationRoot != null && BundledCoordinatorInstaller.installBundled(installationRoot)) {
+					if (BundledCoordinatorInstaller.installBundled(runtimeRoot)) {
 						LOGGER.info("Installed the bundled Arena Agents coordinator runtime");
 					}
 				} catch (IOException failure) {
@@ -2182,7 +2180,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				Path discoveredRoot = findPackageRoot(gameDirectory);
 				if (discoveredRoot == null && installFailure != null) {
 					try {
-						if (BundledCoordinatorInstaller.restoreLastKnownGoodIfActiveInvalid(installedRoot)) {
+						if (BundledCoordinatorInstaller.restoreLastKnownGoodIfActiveInvalid(runtimeRoot)) {
 							LOGGER.warn("Restored the verified Arena Agents coordinator runtime after the active installation became invalid");
 							discoveredRoot = findPackageRoot(gameDirectory);
 						}
@@ -2225,6 +2223,67 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 						failure.getMessage() == null ? "Coordinator startup dependencies are unavailable" : failure.getMessage()
 				);
 			}
+		}
+
+		static Path selectedRuntimeRoot(Path gameDirectory) {
+			Path configuredOrDiscovered = findPackageRoot(gameDirectory);
+			return configuredOrDiscovered == null
+					? gameDirectory.resolve("arena-agents-runtime").toAbsolutePath().normalize()
+					: configuredOrDiscovered;
+		}
+
+		static boolean recoverInterruptedDistributionNode(Path runtimeRoot) throws IOException {
+			Path root = runtimeRoot.toAbsolutePath().normalize();
+			Path active = root.resolve("runtime/toolchains/node").normalize();
+			if (Files.exists(active)) return false;
+			Path journal = root.resolve(".arena-runtime-transaction.json");
+			if (!Files.isRegularFile(journal) || Files.size(journal) > 16_384L) return false;
+			JsonObject document;
+			try {
+				document = JsonParser.parseString(Files.readString(journal, StandardCharsets.UTF_8)).getAsJsonObject();
+			} catch (RuntimeException invalid) {
+				throw new IOException("Interrupted runtime update journal is invalid", invalid);
+			}
+			JsonObject node = requiredJournalObject(document, "Node");
+			Path recordedActive = containedJournalPath(root, node, "Active");
+			Path backup = containedJournalPath(root, node, "Backup");
+			containedJournalPath(root, node, "Staging");
+			if (!recordedActive.equals(active)) {
+				throw new IOException("Interrupted runtime update journal targets an unexpected Node.js directory");
+			}
+			boolean windows = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("win");
+			Path backupExecutable = windows ? backup.resolve("node.exe") : backup.resolve("bin/node");
+			if (!Files.isDirectory(backup) || Files.isSymbolicLink(backup)
+					|| !Files.isRegularFile(backupExecutable)) {
+				throw new IOException("Interrupted runtime update has no validated Node.js backup");
+			}
+			Files.createDirectories(active.getParent());
+			Files.move(backup, active);
+			return true;
+		}
+
+		private static JsonObject requiredJournalObject(JsonObject document, String field) throws IOException {
+			if (!document.has(field) || !document.get(field).isJsonObject()) {
+				throw new IOException("Interrupted runtime update journal is missing " + field);
+			}
+			return document.getAsJsonObject(field);
+		}
+
+		private static Path containedJournalPath(Path root, JsonObject object, String field) throws IOException {
+			if (!object.has(field) || !object.get(field).isJsonPrimitive()
+					|| !object.getAsJsonPrimitive(field).isString()) {
+				throw new IOException("Interrupted runtime update journal has an invalid " + field + " path");
+			}
+			Path path;
+			try {
+				path = Path.of(object.get(field).getAsString()).toAbsolutePath().normalize();
+			} catch (RuntimeException invalid) {
+				throw new IOException("Interrupted runtime update journal has an invalid " + field + " path", invalid);
+			}
+			if (!path.startsWith(root) || path.equals(root)) {
+				throw new IOException("Interrupted runtime update journal path escapes the package root");
+			}
+			return path;
 		}
 
 		private static PreparedRuntime prepared(

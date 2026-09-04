@@ -23,11 +23,17 @@ public final class VoiceSubsystemVerification {
 			throw new AssertionError("Human proximity transcription must default to disabled");
 		}
 		assertions++;
-		VoiceConsentRegistry.grant(null, humanPlayer);
+		VoiceConsentRegistry.playerConnected(null, humanPlayer);
 		if (!VoiceConsentRegistry.granted(null, humanPlayer)) {
-			throw new AssertionError("Granted consent must remain active during the current connection");
+			throw new AssertionError("Joining must make agent voice transcription ready without a command");
 		}
 		assertions++;
+		VoiceConsentRegistry.revoke(null, humanPlayer);
+		if (VoiceConsentRegistry.granted(null, humanPlayer)) {
+			throw new AssertionError("Explicit voice opt-out must remain effective for the connection");
+		}
+		assertions++;
+		VoiceConsentRegistry.playerConnected(null, humanPlayer);
 		VoiceConsentRegistry.playerDisconnected(null, humanPlayer);
 		if (VoiceConsentRegistry.granted(null, humanPlayer)) {
 			throw new AssertionError("Disconnect must revoke consent before a later connection");
@@ -81,8 +87,16 @@ public final class VoiceSubsystemVerification {
 		tracker.reconcile(live, subsystem);
 		if (subsystem.registered.size() != 2) throw new AssertionError("Live agents must register once");
 		assertions++;
+		if (!tracker.containsEntity(firstEntity) || tracker.containsEntity(UUID.randomUUID())) {
+			throw new AssertionError("Voice input must identify only registered agent players");
+		}
+		assertions++;
 		tracker.reconcile(live, subsystem);
 		if (subsystem.registered.size() != 2) throw new AssertionError("Registration must be idempotent");
+		assertions++;
+		if (!subsystem.refreshed.equals(List.of(first, second))) {
+			throw new AssertionError("Unchanged agents must refresh recoverable voice registration");
+		}
 		assertions++;
 		live.put(first, respawnedEntity);
 		live.remove(second);
@@ -104,10 +118,12 @@ public final class VoiceSubsystemVerification {
 
 	private static final class RecordingSubsystem implements VoiceSubsystem {
 		private final List<AgentId> registered = new ArrayList<>();
+		private final List<AgentId> refreshed = new ArrayList<>();
 		private final List<AgentId> unregistered = new ArrayList<>();
 
 		@Override public boolean available() { return true; }
 		@Override public void registerAgent(AgentId agentId, UUID entityId) { registered.add(agentId); }
+		@Override public void refreshAgent(AgentId agentId, UUID entityId) { refreshed.add(agentId); }
 		@Override public void unregisterAgent(AgentId agentId) { unregistered.add(agentId); }
 		@Override public CompletionStage<VoiceReceipt> speak(VoiceRequest request) {
 			return CompletableFuture.completedFuture(VoiceReceipt.accepted());

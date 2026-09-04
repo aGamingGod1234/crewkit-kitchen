@@ -132,6 +132,7 @@ public final class GoalVerificationRuntime {
 				continue;
 			}
 			if (!record.state().isActive() || record.currentGoal().isEmpty()) continue;
+			if (record.state() == dev.agaminggod.arenaagents.agent.AgentLifecycleState.ACTING) continue;
 			GoalStatus status = record.currentGoal().orElseThrow().status();
 			if (status != GoalStatus.ACTIVE && status != GoalStatus.RECOVERING) continue;
 			GoalCompletionVerifier.VerificationResult result = verifySafely(record, tick);

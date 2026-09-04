@@ -10,11 +10,28 @@ import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentIdentity;
 import dev.agaminggod.arenaagents.agent.AgentProfile;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
+import java.io.IOException;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.protocol.game.ServerboundClientCommandPacket;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.advancements.AdvancementHolder;
+import net.minecraft.stats.Stat;
+import net.minecraft.stats.StatType;
+import net.minecraft.world.scores.ScoreAccess;
+import net.minecraft.world.scores.ScoreHolder;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.level.block.BedBlock;
 import net.minecraft.world.level.block.RespawnAnchorBlock;
@@ -24,7 +41,9 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.GameType;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.entity.Relative;
 import net.minecraft.util.Mth;
+import net.minecraft.world.level.storage.LevelResource;
 
 public final class OfflineAgentPlayers {
 	private OfflineAgentPlayers() {
@@ -36,6 +55,14 @@ public final class OfflineAgentPlayers {
 
 	public static UUID offlineUuid(AgentId agentId, AgentProfile profile) {
 		return AgentIdentity.offlinePlayerUuid(playerName(agentId, profile));
+	}
+
+	static String legacyTransportPlayerName(AgentId agentId, AgentProfile profile) {
+		return legacyPlayerNames(agentId, profile).getLast();
+	}
+
+	static List<String> legacyPlayerNames(AgentId agentId, AgentProfile profile) {
+		return AgentIdentity.legacyPlayerNames(agentId, profile);
 	}
 
 	public static void spawn(
@@ -67,7 +94,7 @@ public final class OfflineAgentPlayers {
 		}
 		UUID uuid = offlineUuid(agentId, profile);
 		boolean accepted;
-		OfflineAgentProfileLookup.begin(uuid);
+		OfflineAgentProfileLookup.begin(name, uuid);
 		try {
 			accepted = EntityPlayerMPFake.createFake(
 					name,
@@ -80,7 +107,7 @@ public final class OfflineAgentPlayers {
 					gameMode == GameType.CREATIVE || gameMode == GameType.SPECTATOR
 			);
 		} finally {
-			OfflineAgentProfileLookup.end(uuid);
+			OfflineAgentProfileLookup.end(name, uuid);
 		}
 		if (!accepted) {
 			throw new AgentDomainException("PLAYER_SPAWN_FAILED", "Carpet rejected the offline agent player spawn");
@@ -94,6 +121,169 @@ public final class OfflineAgentPlayers {
 		if (isManagedFakePlayer(byUuid, expectedUuid, expectedName)) return Optional.of(byUuid);
 		ServerPlayer byName = server.getPlayerList().getPlayerByName(expectedName);
 		return isManagedFakePlayer(byName, expectedUuid, expectedName) ? Optional.of(byName) : Optional.empty();
+	}
+
+	/** Finds either deployed technical username without mistaking an ordinary player for a managed fake. */
+	public static Optional<ServerPlayer> findLegacyPlayer(
+			MinecraftServer server,
+			AgentId agentId,
+			AgentProfile profile
+	) {
+		Objects.requireNonNull(server, "server must not be null");
+		ArrayList<ServerPlayer> matches = new ArrayList<>();
+		for (String legacyName : legacyPlayerNames(agentId, profile)) {
+			findByIdentity(server, legacyName).filter(player -> !matches.contains(player)).ifPresent(matches::add);
+		}
+		if (matches.size() > 1) {
+			throw new AgentDomainException(
+					"AMBIGUOUS_LEGACY_AGENT_PLAYER", "Multiple legacy bodies exist for one Arena agent");
+		}
+		return matches.stream().findFirst();
+	}
+
+	/**
+	 * Saves exact UUID-owned progress before the canonical profile is constructed. The legacy body remains connected
+	 * and authoritative until {@link #completeConnectedLegacyMigration(LegacyBodyMigration, ServerPlayer)} succeeds.
+	 */
+	public static Optional<LegacyBodyMigration> stageConnectedLegacyMigration(
+			MinecraftServer server,
+			AgentId agentId,
+			AgentProfile profile
+	) {
+		ServerPlayer legacy = findLegacyPlayer(server, agentId, profile).orElse(null);
+		if (legacy == null) return Optional.empty();
+		String canonicalName = playerName(agentId, profile);
+		UUID canonicalUuid = offlineUuid(agentId, profile);
+		legacy.getStats().save();
+		legacy.getAdvancements().save();
+		copyLegacyIdentityFiles(
+				server.getWorldPath(LevelResource.PLAYER_STATS_DIR),
+				server.getWorldPath(LevelResource.PLAYER_ADVANCEMENTS_DIR),
+				legacy.getUUID(), canonicalUuid);
+		return Optional.of(new LegacyBodyMigration(legacy, canonicalUuid, canonicalName));
+	}
+
+	/** Commits an already staged migration only after the canonical fake player is fully connected. */
+	public static ServerPlayer completeConnectedLegacyMigration(
+			LegacyBodyMigration migration,
+			ServerPlayer canonical
+	) {
+		Objects.requireNonNull(migration, "migration must not be null");
+		Objects.requireNonNull(canonical, "canonical player must not be null");
+		ServerPlayer legacy = migration.legacyPlayer();
+		if (!isManagedFakePlayer(canonical, migration.canonicalUuid(), migration.canonicalName())) {
+			throw new AgentDomainException(
+					"INVALID_CANONICAL_AGENT_PLAYER", "Replacement is not the staged canonical fake player");
+		}
+		if (!(legacy instanceof EntityPlayerMPFake) || legacy.isRemoved()) {
+			throw new AgentDomainException(
+					"LEGACY_AGENT_PLAYER_GONE", "Legacy player disappeared before migration committed");
+		}
+		stop(legacy);
+		canonical.restoreFrom(legacy, true);
+		canonical.teleportTo(
+				legacy.level(), legacy.getX(), legacy.getY(), legacy.getZ(), Set.<Relative>of(),
+				legacy.getYRot(), legacy.getXRot(), false);
+		canonical.setDeltaMovement(legacy.getDeltaMovement());
+		copyStats(legacy, canonical);
+		copyAdvancements(legacy, canonical);
+		copyScoreboard(legacy, canonical);
+		canonical.getStats().save();
+		canonical.getAdvancements().save();
+		remove(legacy);
+		return canonical;
+	}
+
+	static void copyLegacyIdentityFiles(Path statsDirectory, Path advancementsDirectory, UUID oldUuid, UUID newUuid) {
+		Objects.requireNonNull(statsDirectory, "statsDirectory must not be null");
+		Objects.requireNonNull(advancementsDirectory, "advancementsDirectory must not be null");
+		Objects.requireNonNull(oldUuid, "oldUuid must not be null");
+		Objects.requireNonNull(newUuid, "newUuid must not be null");
+		if (oldUuid.equals(newUuid)) return;
+		copyIdentityFile(statsDirectory, oldUuid, newUuid);
+		copyIdentityFile(advancementsDirectory, oldUuid, newUuid);
+	}
+
+	private static Optional<ServerPlayer> findByIdentity(MinecraftServer server, String name) {
+		UUID uuid = AgentIdentity.offlinePlayerUuid(name);
+		ServerPlayer byUuid = server.getPlayerList().getPlayer(uuid);
+		if (isManagedFakePlayer(byUuid, uuid, name)) return Optional.of(byUuid);
+		ServerPlayer byName = server.getPlayerList().getPlayerByName(name);
+		return isManagedFakePlayer(byName, uuid, name) ? Optional.of(byName) : Optional.empty();
+	}
+
+	private static void copyIdentityFile(Path directory, UUID oldUuid, UUID newUuid) {
+		Path source = directory.resolve(oldUuid + ".json");
+		if (!Files.isRegularFile(source)) return;
+		Path target = directory.resolve(newUuid + ".json");
+		Path staged = directory.resolve(newUuid + ".json.arenaagents-migrating");
+		try {
+			Files.createDirectories(directory);
+			Files.copy(source, staged, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.COPY_ATTRIBUTES);
+			try {
+				Files.move(staged, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+			} catch (AtomicMoveNotSupportedException ignored) {
+				Files.move(staged, target, StandardCopyOption.REPLACE_EXISTING);
+			}
+		} catch (IOException exception) {
+			throw new AgentDomainException(
+					"AGENT_IDENTITY_MIGRATION_FAILED", "Could not preserve legacy player progress: " + exception.getMessage());
+		} finally {
+			try {
+				Files.deleteIfExists(staged);
+			} catch (IOException ignored) {
+				// A later migration attempt replaces the bounded staging file.
+			}
+		}
+	}
+
+	private static void copyStats(ServerPlayer source, ServerPlayer target) {
+		for (StatType<?> type : BuiltInRegistries.STAT_TYPE) copyStats(type, source, target);
+	}
+
+	private static <T> void copyStats(StatType<T> type, ServerPlayer source, ServerPlayer target) {
+		for (Stat<T> stat : type) target.getStats().setValue(target, stat, source.getStats().getValue(stat));
+	}
+
+	private static void copyAdvancements(ServerPlayer source, ServerPlayer target) {
+		for (AdvancementHolder advancement : source.level().getServer().getAdvancements().getAllAdvancements()) {
+			Set<String> completed = new HashSet<>();
+			source.getAdvancements().getOrStartProgress(advancement).getCompletedCriteria().forEach(completed::add);
+			ArrayList<String> targetCompleted = new ArrayList<>();
+			target.getAdvancements().getOrStartProgress(advancement)
+					.getCompletedCriteria().forEach(targetCompleted::add);
+			for (String criterion : targetCompleted) {
+				if (!completed.contains(criterion)) target.getAdvancements().revoke(advancement, criterion);
+			}
+			for (String criterion : completed) target.getAdvancements().award(advancement, criterion);
+		}
+	}
+
+	private static void copyScoreboard(ServerPlayer source, ServerPlayer target) {
+		var scoreboard = source.level().getScoreboard();
+		ScoreHolder sourceHolder = ScoreHolder.forNameOnly(source.getScoreboardName());
+		ScoreHolder targetHolder = ScoreHolder.forNameOnly(target.getScoreboardName());
+		for (var objective : scoreboard.getObjectives()) {
+			var sourceInfo = scoreboard.getPlayerScoreInfo(sourceHolder, objective);
+			if (sourceInfo == null) continue;
+			ScoreAccess sourceAccess = scoreboard.getOrCreatePlayerScore(sourceHolder, objective);
+			ScoreAccess targetAccess = scoreboard.getOrCreatePlayerScore(targetHolder, objective);
+			targetAccess.set(sourceInfo.value());
+			if (sourceInfo.isLocked()) targetAccess.lock();
+			else targetAccess.unlock();
+			targetAccess.display(sourceAccess.display());
+			targetAccess.numberFormatOverride(sourceInfo.numberFormat());
+		}
+		var team = scoreboard.getPlayersTeam(source.getScoreboardName());
+		if (team != null) scoreboard.addPlayerToTeam(target.getScoreboardName(), team);
+	}
+
+	public record LegacyBodyMigration(ServerPlayer legacyPlayer, UUID canonicalUuid, String canonicalName) {
+		public LegacyBodyMigration {
+			Objects.requireNonNull(legacyPlayer, "legacyPlayer must not be null");
+			Objects.requireNonNull(canonicalUuid, "canonicalUuid must not be null");
+			canonicalName = Objects.requireNonNull(canonicalName, "canonicalName must not be null");
+		}
 	}
 
 	static boolean isManagedFakePlayer(ServerPlayer player, AgentId agentId, AgentProfile profile) {
@@ -137,6 +327,31 @@ public final class OfflineAgentPlayers {
 		EntityPlayerMPFake fake = requireFakePlayer(player);
 		stop(fake);
 		fake.kill(Component.literal("Arena agent removed"));
+	}
+
+	static void retainConnectedDeath(ServerPlayer player) {
+		EntityPlayerMPFake fake = requireFakePlayer(player);
+		stop(fake);
+		fake.setHealth(0.0F);
+	}
+
+	static ServerPlayer respawnConnected(ServerPlayer player) {
+		EntityPlayerMPFake fake = requireFakePlayer(player);
+		if (fake.isAlive()) {
+			throw new AgentDomainException("AGENT_NOT_DEAD", "Only a dead connected agent player can be respawned");
+		}
+		UUID expectedUuid = fake.getUUID();
+		String expectedName = fake.getGameProfile().name();
+		var connection = fake.connection;
+		connection.handleClientCommand(new ServerboundClientCommandPacket(
+				ServerboundClientCommandPacket.Action.PERFORM_RESPAWN
+		));
+		ServerPlayer replacement = connection.player;
+		if (replacement == fake || !isManagedFakePlayer(replacement, expectedUuid, expectedName)
+				|| !replacement.isAlive()) {
+			throw new AgentDomainException("PLAYER_SPAWN_FAILED", "Vanilla did not replace the connected agent player");
+		}
+		return replacement;
 	}
 
 	private static EntityPlayerMPFake requireFakePlayer(ServerPlayer player) {

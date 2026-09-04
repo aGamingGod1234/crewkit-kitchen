@@ -5,10 +5,17 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.AclEntry;
+import java.nio.file.attribute.AclEntryFlag;
+import java.nio.file.attribute.AclEntryPermission;
+import java.nio.file.attribute.AclEntryType;
+import java.nio.file.attribute.AclFileAttributeView;
 import java.nio.file.attribute.PosixFileAttributeView;
 import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.UserPrincipal;
 import java.security.MessageDigest;
 import java.util.Comparator;
+import java.util.EnumSet;
 import java.util.HexFormat;
 import java.util.ArrayList;
 import java.util.List;
@@ -28,6 +35,8 @@ public final class BundledCoordinatorInstallerVerification {
 
 	public static int verify() throws Exception {
 		int assertions = 0;
+		assertions += verifyPrivateAclUsesInteractiveUser();
+		assertions += verifyWindowsRuntimeAclReachesStateFile();
 		assertions += verifyConfiguredSecretPathUsesPreparedRuntime();
 		assertions += verifyVerifiedGenerationCanRollbackCandidate();
 		assertions += verifyRejectedGenerationMarkerSafety();
@@ -42,6 +51,64 @@ public final class BundledCoordinatorInstallerVerification {
 		assertions += verifyInterruptedSwapRecoversPreviousCoordinator();
 		assertions += verifyTransientDirectoryLockIsRetried();
 		return assertions;
+	}
+
+	private static int verifyWindowsRuntimeAclReachesStateFile() throws Exception {
+		Path packageRoot = Files.createTempDirectory("arena-coordinator-windows-acl");
+		try {
+			Path runtime = packageRoot.resolve("runtime");
+			if (Files.getFileAttributeView(runtime, AclFileAttributeView.class) == null) return 0;
+			byte[] main = "acl main".getBytes(StandardCharsets.UTF_8);
+			byte[] config = "{}".getBytes(StandardCharsets.UTF_8);
+			String manifest = manifest(entry("src/dynamic-main.mjs", main), entry("config/dynamic-agents.json", config));
+			BundledCoordinatorInstaller.install(packageRoot, resource(resources(manifest, main, config)));
+
+			UserPrincipal currentUser = packageRoot.getFileSystem().getUserPrincipalLookupService()
+					.lookupPrincipalByName(System.getProperty("user.name"));
+			assertPrivateWindowsAcl(
+					runtime,
+					currentUser,
+					Set.of(AclEntryFlag.DIRECTORY_INHERIT, AclEntryFlag.FILE_INHERIT),
+					"runtime directory ACL is inherited by new coordinator state"
+			);
+			assertPrivateWindowsAcl(
+					runtime.resolve("coordinator-generation.properties"),
+					currentUser,
+					Set.of(),
+					"coordinator journal is readable and writable by the interactive user"
+			);
+			return 10;
+		} finally {
+			deleteTree(packageRoot);
+		}
+	}
+
+	private static void assertPrivateWindowsAcl(
+			Path target,
+			UserPrincipal currentUser,
+			Set<AclEntryFlag> expectedFlags,
+			String label
+	) throws IOException {
+		AclFileAttributeView acl = Files.getFileAttributeView(target, AclFileAttributeView.class);
+		assertEquals(currentUser, acl.getOwner(), label + " owner");
+		List<AclEntry> entries = acl.getAcl();
+		assertEquals(1, entries.size(), label + " entry count");
+		AclEntry entry = entries.getFirst();
+		assertEquals(AclEntryType.ALLOW, entry.type(), label + " entry type");
+		assertEquals(currentUser, entry.principal(), label + " principal");
+		assertEquals(expectedFlags, entry.flags(), label + " inheritance flags");
+		assertTrue(entry.permissions().containsAll(EnumSet.allOf(AclEntryPermission.class)), label + " permissions");
+	}
+
+	private static int verifyPrivateAclUsesInteractiveUser() {
+		UserPrincipal currentUser = () -> "DESKTOP\\User";
+		UserPrincipal inheritedOwner = () -> "BUILTIN\\Administrators";
+		assertEquals(
+				currentUser,
+				BundledCoordinatorInstaller.privateAclPrincipal(currentUser, inheritedOwner),
+				"private Windows ACL grants the interactive user instead of an inherited administrator owner"
+		);
+		return 1;
 	}
 
 	private static int verifySupervisorAutomaticallyRestoresCorruptedRuntime() throws Exception {

@@ -25,6 +25,7 @@ test('adapts protocol entities and blocks into bounded factual candidate records
 	assert.deepEqual(adapted.items, [{ stableId: '00000000-0000-0000-0000-000000000001', itemId: 'minecraft:oak_log', count: 1, distance: 2, tags: ['#minecraft:item'], x: 2, y: 64, z: 0 }]);
 	assert.deepEqual(adapted.entities, [{ stableId: '00000000-0000-0000-0000-000000000001', type: 'minecraft:item', distance: 2, tags: ['#minecraft:item'], x: 2, y: 64, z: 0, itemId: 'minecraft:oak_log', count: 1 }]);
 	assert.deepEqual(adapted.blocks, [{ stableId: '4,64,0', blockId: 'minecraft:oak_log', tags: ['#minecraft:logs'], x: 4, y: 64, z: 0 }]);
+	assert.equal(Object.hasOwn(adapted, 'landmarks'), false);
 	assert.deepEqual(adapted.inventory, { items: [{ itemId: 'minecraft:oak_log', count: 2, slot: 0, tags: ['#minecraft:logs'] }], tagCounts: { '#minecraft:logs': 2 } });
 	assert.equal(Object.hasOwn(adapted.items[0], 'reachable'), false);
 	assert.deepEqual(adapted.items[0].tags, ['#minecraft:item']);
@@ -44,6 +45,7 @@ test('preserves every protocol-v2 fact needed by native observe and action tools
 		},
 		entities: [{ uuid: 'mob-1', type: 'minecraft:zombie', name: 'Zombie', distance: 3, position: { x: 3, y: 64, z: 0 }, isPlayer: false }],
 		blocks: [{ x: 1, y: 64, z: 0, blockId: 'minecraft:chest', placeableFaces: ['up', 'north'] }],
+		landmarks: [{ x: 18, y: 66, z: 4, blockId: 'minecraft:oak_log', distance: 18.5, bearing: 32, elevation: 4, tags: ['#minecraft:logs'] }],
 		nearbyContainers: [{ x: 1, y: 64, z: 0, blockId: 'minecraft:chest', distance: 1, withinInteractionRange: true, capabilities: ['transfer'] }],
 		world: { dimension: 'minecraft:overworld', gameTime: 10, dayTime: 10, raining: true, thundering: false },
 		currentAction: { active: true, actionId: 'action-1', actionType: 'navigate_to' },
@@ -62,6 +64,10 @@ test('preserves every protocol-v2 fact needed by native observe and action tools
 	assert.deepEqual(adapted.inventory.items[0], { itemId: 'minecraft:iron_pickaxe', count: 1, slot: 2, tags: ['#minecraft:tools'], damage: 12, maxDamage: 250, hotbar: true });
 	assert.equal(adapted.entities[0].name, 'Zombie');
 	assert.deepEqual(adapted.blocks[0].placeableFaces, ['up', 'north']);
+	assert.deepEqual(adapted.landmarks[0], {
+		stableId: '18,66,4', blockId: 'minecraft:oak_log', distance: 18.5, bearing: 32, elevation: 4,
+		tags: ['#minecraft:logs'], x: 18, y: 66, z: 4,
+	});
 	assert.equal(adapted.nearbyContainers[0].withinInteractionRange, true);
 	assert.equal(adapted.world.dimension, 'minecraft:overworld');
 	assert.equal(adapted.currentAction.actionId, 'action-1');
@@ -129,4 +135,5 @@ test('rejects non-finite coordinates and observations over protocol bounds', () 
 	assert.throws(() => adaptObservation(wireObservation({ position: { x: Number.NaN, y: 64, z: 0 } })), /finite number/);
 	assert.throws(() => adaptObservation(wireObservation({ entities: Array.from({ length: 65 }, (_, index) => ({ uuid: String(index), type: 'minecraft:zombie', position: { x: index, y: 64, z: 0 } })) })), /entities exceeds bound/);
 	assert.throws(() => adaptObservation(wireObservation({ blocks: Array.from({ length: 129 }, (_, index) => ({ x: index, y: 64, z: 0, blockId: 'minecraft:stone' })) })), /blocks exceeds bound/);
+	assert.throws(() => adaptObservation(wireObservation({ landmarks: Array.from({ length: 33 }, (_, index) => ({ x: index, y: 64, z: 0, blockId: 'minecraft:oak_log', distance: 1, bearing: 0, elevation: 0 })) })), /landmarks exceeds bound/);
 });

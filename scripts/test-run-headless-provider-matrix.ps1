@@ -17,6 +17,9 @@ if ($wrapperSource -notmatch "'cursor'\s*\{\s*return") {
 if ($wrapperSource -notmatch '\$MaxSelectedScenarios\s*=\s*24') {
 	throw 'Expected lifecycle wrapper to allow the complete 18-profile provider matrix within a 24-scenario bound'
 }
+if ($wrapperSource -notmatch 'Test-CoordinatorReady\s+\$protocolAudit\s+\$Scenario') {
+	throw 'Expected lifecycle runs to wait for the scenario provider catalog before summoning'
+}
 
 function Assert-Fails([scriptblock] $Action, [string] $Pattern) {
 	try {
@@ -36,6 +39,7 @@ function Set-TestEnvironment([string] $Name, [string] $Value) {
 function New-Fixture([string] $Root) {
 	New-Item -ItemType Directory -Path (Join-Path $Root 'build\libs'), (Join-Path $Root 'runtime\server-template\mods'), (Join-Path $Root 'runtime\server-template\logs'), (Join-Path $Root 'runtime\server-template\world'), (Join-Path $Root 'coordinator\config') -Force | Out-Null
 	Copy-Item -LiteralPath (Join-Path $PSScriptRoot '..\coordinator\src') -Destination (Join-Path $Root 'coordinator\src') -Recurse -Force
+	Copy-Item -LiteralPath (Join-Path $PSScriptRoot '..\coordinator\config\minecraft-agent') -Destination (Join-Path $Root 'coordinator\config\minecraft-agent') -Recurse -Force
 	Copy-Item -LiteralPath (Join-Path $PSScriptRoot '..\coordinator\node_modules\acorn') -Destination (Join-Path $Root 'coordinator\node_modules\acorn') -Recurse -Force
 	$fakeCodex = Join-Path $Root 'fake-appdata\npm\node_modules\@openai\codex\bin\codex.js'
 	New-Item -ItemType Directory -Path (Split-Path -Parent $fakeCodex) -Force | Out-Null
@@ -218,6 +222,8 @@ public final class FakeServer {
             String launchField = launchId == null ? "" : ",\"launchId\":\"" + launchId + "\"";
             String response = "{\"protocolVersion\":2,\"serverInstanceId\":\"fake-server\",\"agentId\":\"server\",\"type\":\"hello_ack\",\"messageId\":\"fake-ack\",\"payload\":{\"replyTo\":\"" + helloId + "\",\"authenticated\":true,\"registry\":[]" + launchField + "}}\n";
             output.write(response.getBytes(StandardCharsets.UTF_8));
+            String catalogRequest = "{\"protocolVersion\":2,\"serverInstanceId\":\"fake-server\",\"agentId\":\"server\",\"type\":\"catalog_request\",\"messageId\":\"fake-catalog-request\",\"payload\":{}}\n";
+            output.write(catalogRequest.getBytes(StandardCharsets.UTF_8));
             output.flush();
             while (running.get() && reader.readLine() != null) { }
         } catch (Exception exception) {
@@ -278,14 +284,30 @@ public final class FakeServer {
     }
 }
 '@ | Set-Content -LiteralPath $source -NoNewline
-	$javac = (Get-Command javac -ErrorAction Stop).Source
-	$jarTool = Join-Path (Split-Path -Parent $javac) 'jar.exe'
-	if (-not (Test-Path -LiteralPath $jarTool -PathType Leaf)) { throw "Missing test JAR tool: $jarTool" }
+	$pathJavac = (Get-Command javac -ErrorAction Stop).Source
+	$registryJdkHome = try {
+		$jdk = Get-ItemProperty 'HKLM:\SOFTWARE\JavaSoft\JDK' -ErrorAction Stop
+		(Get-ItemProperty ("HKLM:\SOFTWARE\JavaSoft\JDK\" + $jdk.CurrentVersion) -ErrorAction Stop).JavaHome
+	} catch { $null }
+	$toolchainBins = @(
+		(Split-Path -Parent $pathJavac),
+		$(if (-not [string]::IsNullOrWhiteSpace($registryJdkHome)) { Join-Path $registryJdkHome 'bin' }),
+		$(if (-not [string]::IsNullOrWhiteSpace($env:JAVA_HOME)) { Join-Path $env:JAVA_HOME 'bin' })
+	) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+	$toolchainBin = $toolchainBins | Where-Object {
+		(Test-Path -LiteralPath (Join-Path $_ 'java.exe') -PathType Leaf) -and
+		(Test-Path -LiteralPath (Join-Path $_ 'javac.exe') -PathType Leaf) -and
+		(Test-Path -LiteralPath (Join-Path $_ 'jar.exe') -PathType Leaf)
+	} | Select-Object -First 1
+	if ($null -eq $toolchainBin) { throw 'Could not find a complete test JDK containing java.exe, javac.exe, and jar.exe' }
+	$javac = Join-Path $toolchainBin 'javac.exe'
+	$jarTool = Join-Path $toolchainBin 'jar.exe'
 	& $javac -d $classes $source
 	if ($LASTEXITCODE -ne 0) { throw 'Could not compile dummy Fabric server fixture' }
 	& $jarTool --create --file $jar --main-class FakeServer -C $classes FakeServer.class
 	if ($LASTEXITCODE -ne 0) { throw 'Could not package dummy Fabric server fixture' }
-	Set-TestEnvironment 'ARENA_HEADLESS_JAVA' ((Get-Command java -ErrorAction Stop).Source)
+	$java = Join-Path $toolchainBin 'java.exe'
+	Set-TestEnvironment 'ARENA_HEADLESS_JAVA' $java
 }
 
 function Stop-TestProcessTree([int] $ProcessId) {
@@ -484,6 +506,7 @@ try {
 
 	# Exercise a successful normal path with the same fake server and verify the
 	# wrapper's graceful-stop snapshot also removes the server's child helper.
+	Set-TestEnvironment 'ARENA_HEADLESS_STARTUP_TIMEOUT_SECONDS' '15'
 	$successMatrix = Join-Path $fixture 'success-matrix.json'
 	Set-Content -LiteralPath $successMatrix -Value '{"version":1,"scenarios":[{"id":"fixture","provider":"codex","model":"fixture","reasoningEffort":"low","task":"fixture","timeoutMs":1000,"assert":[{"type":"lifecycle","state":"COMPLETED"}]}]}' -NoNewline
 	Set-TestEnvironment 'ARENA_HEADLESS_MINECRAFT_PORT' '39168'
@@ -496,6 +519,18 @@ try {
 	if ($successMatrixReport.scenarios[0].profile.serviceTier -ne 'priority') { throw 'Omitted serviceTier did not default to priority through the wrapper' }
 	if (@(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'FakeServer|Start-Sleep -Seconds 3' }).Count -gt 0) { throw 'Successful normal cleanup left dummy server descendants running' }
 	Write-Output 'PASS successful normal cleanup and descendant verification'
+
+	$repetitionMatrix = Join-Path $fixture 'repetition-matrix.json'
+	Set-Content -LiteralPath $repetitionMatrix -Value '{"version":1,"scenarios":[{"id":"fixture","provider":"codex","model":"fixture","reasoningEffort":"low","task":"fixture","timeoutMs":1000,"repetitions":2,"assert":[{"type":"lifecycle","state":"COMPLETED"}]}]}' -NoNewline
+	Set-TestEnvironment 'ARENA_HEADLESS_MINECRAFT_PORT' '39174'
+	Set-TestEnvironment 'ARENA_HEADLESS_RCON_PORT' '39175'
+	Set-TestEnvironment 'ARENA_HEADLESS_BRIDGE_PORT' '39176'
+	& $scriptPath -ProjectRoot $fixture -MatrixPath $repetitionMatrix -ServerTemplate (Join-Path $fixture 'runtime\server-template') | Out-Null
+	$repetitionReportPath = Join-Path (Get-ChildItem -LiteralPath $runRoot -Directory | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1).FullName 'matrix-report.json'
+	$repetitionReport = Get-Content -Raw -LiteralPath $repetitionReportPath | ConvertFrom-Json
+	$innerRepetitions = @($repetitionReport.scenarios[0].scenarios)
+	if ($repetitionReport.status -ne 'PASSED' -or $repetitionReport.scenarios[0].status -ne 'PASSED' -or $innerRepetitions.Count -ne 2 -or @($innerRepetitions | Where-Object { $_.status -ne 'PASSED' }).Count -gt 0) { throw 'Repeated scenario reports were not aggregated correctly' }
+	Write-Output 'PASS repeated scenario report aggregation'
 
 	$skipMatrix = Join-Path $fixture 'skip-matrix.json'
 	Set-Content -LiteralPath $skipMatrix -Value '{"version":1,"scenarios":[{"id":"fixture","provider":"codex","model":"missing","reasoningEffort":"low","task":"fixture","timeoutMs":1000,"assert":[{"type":"lifecycle","state":"COMPLETED"}]}]}' -NoNewline

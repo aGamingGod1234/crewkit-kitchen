@@ -1,6 +1,6 @@
 import { types as nodeTypes } from 'node:util';
 
-import { MAX_BLOCKS, MAX_EFFECTS, MAX_ENTITIES, MAX_INVENTORY_SUMMARIES, MAX_OBSERVATION_TAGS, MAX_TAG_COUNT_ENTRIES } from './constants.mjs';
+import { MAX_BLOCKS, MAX_EFFECTS, MAX_ENTITIES, MAX_INVENTORY_SUMMARIES, MAX_LANDMARKS, MAX_OBSERVATION_TAGS, MAX_TAG_COUNT_ENTRIES } from './constants.mjs';
 
 const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 const COORDINATE_FIELDS = ['x', 'y', 'z'];
@@ -58,6 +58,9 @@ export function adaptObservation(value) {
 		if (blockIds.has(block.stableId)) throw new TypeError(`duplicate block identity '${block.stableId}'`);
 		blockIds.add(block.stableId);
 	}
+	const landmarks = Object.hasOwn(source, 'landmarks')
+		? boundedDataArray(source.landmarks, 'landmarks', MAX_LANDMARKS).map((value, index) => landmarkFacts(value, index))
+		: undefined;
 
 	const inventorySource = ownDataRecord(source.inventory, 'wire observation.inventory');
 	const inventoryItems = boundedDataArray(inventorySource.items, 'inventory.items', MAX_INVENTORY_SUMMARIES)
@@ -72,6 +75,7 @@ export function adaptObservation(value) {
 		items,
 		entities,
 		blocks,
+		...(landmarks === undefined ? {} : { landmarks }),
 		inventory: {
 			items: inventoryItems,
 			...(Object.hasOwn(inventorySource, 'selectedItem') ? { selectedItem: identifier(inventorySource.selectedItem, 'inventory.selectedItem') } : {}),
@@ -118,6 +122,20 @@ function blockFacts(value, index) {
 		blockId: identifier(source.blockId, `blocks[${index}].blockId`),
 		...(Object.hasOwn(source, 'placeableFaces') ? { placeableFaces: identifierList(source.placeableFaces, `blocks[${index}].placeableFaces`, 6) } : {}),
 		...(Object.hasOwn(source, 'tags') ? { tags: tags(source.tags, `blocks[${index}].tags`) } : {}),
+		x: point.x, y: point.y, z: point.z,
+	};
+}
+
+function landmarkFacts(value, index) {
+	const source = ownDataRecord(value, `landmarks[${index}]`);
+	const point = coordinateSource(source, `landmarks[${index}]`);
+	return {
+		stableId: `${point.x},${point.y},${point.z}`,
+		blockId: identifier(source.blockId, `landmarks[${index}].blockId`),
+		distance: nonNegativeNumber(source.distance, `landmarks[${index}].distance`),
+		bearing: boundedNumber(source.bearing, `landmarks[${index}].bearing`, -180, 180),
+		elevation: boundedNumber(source.elevation, `landmarks[${index}].elevation`, -90, 90),
+		...(Object.hasOwn(source, 'tags') ? { tags: tags(source.tags, `landmarks[${index}].tags`) } : {}),
 		x: point.x, y: point.y, z: point.z,
 	};
 }
@@ -336,6 +354,18 @@ function boolean(value, label) {
 function finiteNumber(value, label) {
 	if (typeof value !== 'number' || !Number.isFinite(value)) throw new TypeError(`${label} must be a finite number`);
 	return value;
+}
+
+function nonNegativeNumber(value, label) {
+	const number = finiteNumber(value, label);
+	if (number < 0) throw new TypeError(`${label} must be non-negative`);
+	return number;
+}
+
+function boundedNumber(value, label, minimum, maximum) {
+	const number = finiteNumber(value, label);
+	if (number < minimum || number > maximum) throw new TypeError(`${label} must be between ${minimum} and ${maximum}`);
+	return number;
 }
 
 function positiveInteger(value, label) {

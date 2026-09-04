@@ -2,7 +2,7 @@
 param(
     [Parameter(Mandatory = $true)] [string] $ProjectRoot,
     [Parameter(Mandatory = $true)] [string] $GameDirectory,
-    [ValidateSet('None', 'AfterJarsBackup', 'AfterBackup', 'AfterJarSwap', 'AfterCoordinatorSwap')]
+    [ValidateSet('None', 'AfterJarsBackup', 'AfterBackup', 'AfterJarSwap', 'AfterCoordinatorSwap', 'AfterNodeSwap', 'AfterGenerationStateSwap')]
     [string] $FailurePoint = 'None',
     [switch] $TestProcessClassification
 )
@@ -36,6 +36,34 @@ function Assert-NoReparseTree([string] $Path, [string] $Label) {
     if (-not (Test-Path -LiteralPath $Path)) { return }
     foreach ($item in @(Get-Item -LiteralPath $Path -Force) + @(Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction Stop)) {
         if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "$Label contains a reparse point: $($item.FullName)" }
+    }
+}
+
+function Ensure-CurrentUserRuntimeAccess([string] $Path) {
+    $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
+    $directGrant = "*$($currentUser.Value):F"
+    & $icacls $Path '/grant:r' $directGrant '/T' '/C' '/Q' | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not repair the installed runtime tree for the current Windows user. Run the updater from that user's elevated PowerShell session."
+    }
+    $inheritableGrant = "*$($currentUser.Value):(OI)(CI)F"
+    & $icacls $Path '/grant:r' $inheritableGrant '/Q' | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Could not make repaired runtime access inheritable.' }
+    foreach ($required in @(
+        $Path,
+        (Join-Path $Path 'runtime\coordinator-generation.properties'),
+        (Join-Path $Path 'runtime\dynamic-agents.json'),
+        (Join-Path $Path 'coordinator\src\dynamic-main.mjs'),
+        (Join-Path $Path 'runtime\toolchains\node\node.exe')
+    )) {
+        if (-not (Test-Path -LiteralPath $required)) { continue }
+        $acl = Get-Acl -LiteralPath $required -ErrorAction Stop
+        $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+        $hasFullControl = @($rules | Where-Object {
+            $_.IdentityReference -eq $currentUser -and $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and ($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -eq [Security.AccessControl.FileSystemRights]::FullControl
+        }).Count -gt 0
+        if (-not $hasFullControl) { throw "Could not verify current-user access to installed runtime path: $required" }
     }
 }
 
@@ -123,6 +151,22 @@ function Copy-ExpectedCoordinator([string] $Source, [string] $Destination, [stri
     }
 }
 
+function Copy-InstalledCoordinatorManifest([string] $JarPath, [string] $Destination) {
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [IO.Compression.ZipFile]::OpenRead($JarPath)
+    try {
+        $entry = $zip.GetEntry('arena-agents/coordinator/coordinator-manifest.txt')
+        if ($null -eq $entry) { throw 'Embedded coordinator manifest is missing.' }
+        $target = Join-Path $Destination '.arena-agents-bundle-manifest'
+        $input = $entry.Open()
+        try {
+            $output = [IO.File]::Open($target, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            try { $input.CopyTo($output) } finally { $output.Dispose() }
+        } finally { $input.Dispose() }
+    } finally { $zip.Dispose() }
+}
+
 $project = [IO.Path]::GetFullPath($ProjectRoot)
 $game = [IO.Path]::GetFullPath($GameDirectory)
 $gradlePropertiesPath = Join-Path $project 'gradle.properties'
@@ -139,10 +183,15 @@ foreach ($line in Get-Content -LiteralPath $gradlePropertiesPath) {
 function Test-CoreArenaModName([string] $Name) {
 	return $Name -match '^(?i:arena-agents)-(?!voice-).+\.jar$'
 }
+
+function Test-ArenaVoiceModName([string] $Name) {
+	return $Name -match '^(?i:arena-agents-voice)-.+\.jar$'
+}
 foreach ($requiredProperty in @('mod_version', 'fabric_api_version', 'carpet_version')) {
 	if (-not $gradleProperties.Contains($requiredProperty)) { throw "Missing Gradle property '$requiredProperty'." }
 }
 $modJarName = "arena-agents-$($gradleProperties.mod_version).jar"
+$voiceJarName = "arena-agents-voice-$($gradleProperties.mod_version).jar"
 $fabricApiJarName = "fabric-api-$($gradleProperties.fabric_api_version).jar"
 $carpetJarName = "fabric-carpet-$($gradleProperties.carpet_version).jar"
 Assert-NoReparse $project 'project root'
@@ -150,14 +199,22 @@ Assert-NoReparse $game 'game directory'
 $mods = Resolve-ContainedPath $game (Join-Path $game 'mods') 'mods target'
 $runtime = Resolve-ContainedPath $game (Join-Path $game 'arena-agents-runtime') 'runtime target'
 $jar = Join-Path $project ("build\libs\" + $modJarName)
+$voiceJar = Join-Path $project ("voice-addon\build\libs\" + $voiceJarName)
 $coordinator = Join-Path $project 'coordinator'
+$nodeDirectory = Join-Path $project 'runtime\toolchains\node'
+$node = Join-Path $nodeDirectory 'node.exe'
+$runtimeInstaller = Join-Path $project 'scripts\distribution-runtime.ps1'
+$startupVerifier = Join-Path $project 'scripts\verify-startup-packaging.ps1'
 Assert-NoReparse $mods 'mods target'
 Assert-NoReparse $runtime 'runtime target'
 Assert-NoReparse $coordinator 'coordinator root'
+Assert-NoReparse $nodeDirectory 'bundled Node.js root'
+$runtimeState = Resolve-ContainedPath $runtime (Join-Path $runtime 'runtime') 'runtime state target'
+Assert-NoReparse $runtimeState 'runtime state target'
 Assert-NoReparseTree $coordinator 'coordinator root'
+Assert-NoReparseTree $nodeDirectory 'bundled Node.js root'
 Assert-NoReparseTree $mods 'mods target'
-Assert-NoReparseTree $runtime 'runtime target'
-foreach ($required in @($jar, (Join-Path $coordinator 'package.json'), (Join-Path $coordinator 'src'))) {
+foreach ($required in @($jar, $voiceJar, (Join-Path $coordinator 'package.json'), (Join-Path $coordinator 'src'), $node, $runtimeInstaller, $startupVerifier)) {
     if (-not (Test-Path -LiteralPath $required)) { throw "Missing packaging prerequisite: $required" }
 }
 if (Get-Process -Name MinecraftLauncher, Minecraft -ErrorAction SilentlyContinue) { throw 'Close Minecraft and Minecraft Launcher before updating the normal profile.' }
@@ -170,7 +227,11 @@ foreach ($process in $javaProcesses) {
 foreach ($dependency in @($fabricApiJarName, $carpetJarName)) {
     if (-not (Test-Path -LiteralPath (Join-Path $mods $dependency) -PathType Leaf)) { throw "Required dependency is missing from target mods: $dependency" }
 }
+Assert-NoReparseTree $runtime 'runtime target'
+if (Test-Path -LiteralPath $runtime -PathType Container) { Ensure-CurrentUserRuntimeAccess $runtime }
 
+& $startupVerifier -PackageRoot $project
+. $runtimeInstaller
 $expected = Get-ExpectedCoordinatorFiles $coordinator
 $secret = Join-Path $runtime 'runtime\bridge-secret.txt'
 if (-not (Test-Path -LiteralPath $secret -PathType Leaf)) { throw "Installed bridge secret is missing: $secret" }
@@ -179,32 +240,42 @@ Assert-ArchiveParity $jar $coordinator $expected
 $stage = Join-Path $game ('.arena-agents-update-' + [guid]::NewGuid().ToString('N'))
 $backup = Join-Path $game ('.arena-agents-backup-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ') + '-' + [guid]::NewGuid().ToString('N'))
 $stageMods = Join-Path $stage 'mods'
-$stageCoordinator = Join-Path $stage 'coordinator'
-$installedCoordinator = Join-Path $runtime 'coordinator'
+$stagePackage = Join-Path $stage 'package'
+$stageCoordinator = Join-Path $stagePackage 'coordinator'
+$stageNodeDirectory = Join-Path $stagePackage 'runtime\toolchains\node'
 $installedJar = Join-Path $mods $modJarName
+$installedVoiceJar = Join-Path $mods $voiceJarName
 $backupMade = $false
 $oldArena = @()
 try {
     Assert-NoReparse $stage 'staging path'
     Assert-NoReparse $backup 'backup path'
-    New-Item -ItemType Directory -Force -Path $stageMods, $stageCoordinator | Out-Null
+    New-Item -ItemType Directory -Force -Path $stageMods, $stageCoordinator, $stageNodeDirectory | Out-Null
     Copy-Item -LiteralPath $jar -Destination (Join-Path $stageMods $modJarName) -Force
+    Copy-Item -LiteralPath $voiceJar -Destination (Join-Path $stageMods $voiceJarName) -Force
     Copy-ExpectedCoordinator $coordinator $stageCoordinator $expected
+    Copy-InstalledCoordinatorManifest $jar $stageCoordinator
+    foreach ($entry in Get-ChildItem -LiteralPath $nodeDirectory -Force) {
+        Copy-Item -LiteralPath $entry.FullName -Destination $stageNodeDirectory -Recurse -Force
+    }
     foreach ($relative in $expected) {
         $sourceHash = (Get-FileHash (Join-Path $coordinator ($relative.Replace('/', '\'))) -Algorithm SHA256).Hash
         $stageHash = (Get-FileHash (Join-Path $stageCoordinator ($relative.Replace('/', '\'))) -Algorithm SHA256).Hash
         if ($sourceHash -ne $stageHash) { throw "Staged coordinator hash mismatch: $relative" }
     }
+    if ((Get-FileHash (Join-Path $stageNodeDirectory 'node.exe') -Algorithm SHA256).Hash -ne (Get-FileHash $node -Algorithm SHA256).Hash) {
+        throw 'Staged Node.js runtime hash mismatch.'
+    }
     New-Item -ItemType Directory -Force -Path $backup | Out-Null
-    $oldArena = @(Get-ChildItem -LiteralPath $mods -File -ErrorAction SilentlyContinue | Where-Object { Test-CoreArenaModName $_.Name })
+    $oldArena = @(Get-ChildItem -LiteralPath $mods -File -ErrorAction SilentlyContinue |
+            Where-Object { (Test-CoreArenaModName $_.Name) -or (Test-ArenaVoiceModName $_.Name) })
     foreach ($old in $oldArena) { Assert-NoReparseTree $old.FullName "Arena JAR $($old.Name)" }
     foreach ($old in $oldArena) { Copy-Item -LiteralPath $old.FullName -Destination (Join-Path $backup $old.Name) -Force }
     if ($FailurePoint -eq 'AfterJarsBackup') { throw 'Injected failure after JAR backup.' }
-    if (Test-Path -LiteralPath $installedCoordinator) { Copy-Item -LiteralPath $installedCoordinator -Destination (Join-Path $backup 'coordinator') -Recurse -Force }
     Assert-NoReparseTree $backup 'backup path'
     foreach ($item in @(Get-ChildItem -LiteralPath $backup -Recurse -File)) {
         $relative = $item.FullName.Substring($backup.Length + 1)
-        $source = if ($relative.StartsWith('coordinator\')) { Join-Path $installedCoordinator $relative.Substring('coordinator'.Length).TrimStart('\') } else { Join-Path $mods $relative }
+        $source = Join-Path $mods $relative
         if ((Get-FileHash $source -Algorithm SHA256).Hash -ne (Get-FileHash $item.FullName -Algorithm SHA256).Hash) { throw "Backup hash mismatch: $relative" }
     }
     if ((Get-FileHash $secret -Algorithm SHA256).Hash -ne $secretHash) { throw 'Bridge secret changed during backup.' }
@@ -217,25 +288,25 @@ try {
     Assert-NoReparseTree $backup 'backup path before mutation'
     foreach ($old in $oldArena) { Remove-Item -LiteralPath $old.FullName -Force }
     Copy-Item -LiteralPath (Join-Path $stageMods $modJarName) -Destination $installedJar -Force
+    Copy-Item -LiteralPath (Join-Path $stageMods $voiceJarName) -Destination $installedVoiceJar -Force
     if ($FailurePoint -eq 'AfterJarSwap') { throw 'Injected failure after JAR swap.' }
-    New-Item -ItemType Directory -Force -Path $runtime | Out-Null
-    if (Test-Path -LiteralPath $installedCoordinator) { Remove-Item -LiteralPath $installedCoordinator -Recurse -Force }
-    Copy-Item -LiteralPath $stageCoordinator -Destination $installedCoordinator -Recurse -Force
-    if ($FailurePoint -eq 'AfterCoordinatorSwap') { throw 'Injected failure after coordinator swap.' }
     if ((Get-FileHash $installedJar -Algorithm SHA256).Hash -ne (Get-FileHash $jar -Algorithm SHA256).Hash) { throw 'Installed JAR hash verification failed.' }
-    foreach ($relative in $expected) {
-        if ((Get-FileHash (Join-Path $installedCoordinator ($relative.Replace('/', '\'))) -Algorithm SHA256).Hash -ne (Get-FileHash (Join-Path $coordinator ($relative.Replace('/', '\'))) -Algorithm SHA256).Hash) { throw "Installed coordinator hash verification failed: $relative" }
+    if ((Get-FileHash $installedVoiceJar -Algorithm SHA256).Hash -ne (Get-FileHash $voiceJar -Algorithm SHA256).Hash) { throw 'Installed voice-addon JAR hash verification failed.' }
+    $runtimeFailurePoint = switch ($FailurePoint) {
+        'AfterCoordinatorSwap' { 'AfterCoordinatorPromotion' }
+        'AfterNodeSwap' { 'AfterNodePromotion' }
+        'AfterGenerationStateSwap' { 'AfterGenerationStatePromotion' }
+        default { 'None' }
     }
-    if ((Get-FileHash $secret -Algorithm SHA256).Hash -ne $secretHash) { throw 'Installed bridge secret changed.' }
+    Install-ArenaCoordinatorRuntime -SourceRoot $stagePackage -InstalledPackageRoot $runtime -FailurePoint $runtimeFailurePoint | Out-Null
     Write-Host "Normal profile updated: $game"
     Write-Host "Jar SHA-256: $((Get-FileHash $installedJar -Algorithm SHA256).Hash)"
+    Write-Host "Voice addon SHA-256: $((Get-FileHash $installedVoiceJar -Algorithm SHA256).Hash)"
 } catch {
     if ($backupMade) {
         if (Test-Path -LiteralPath $installedJar) { Remove-Item -LiteralPath $installedJar -Force }
-        if (Test-Path -LiteralPath $installedCoordinator) { Remove-Item -LiteralPath $installedCoordinator -Recurse -Force }
+        if (Test-Path -LiteralPath $installedVoiceJar) { Remove-Item -LiteralPath $installedVoiceJar -Force }
         foreach ($old in $oldArena) { $saved = Join-Path $backup $old.Name; if (Test-Path -LiteralPath $saved) { Copy-Item -LiteralPath $saved -Destination $old.FullName -Force } }
-        $oldCoordinator = Join-Path $backup 'coordinator'
-        if (Test-Path -LiteralPath $oldCoordinator) { Copy-Item -LiteralPath $oldCoordinator -Destination $installedCoordinator -Recurse -Force }
         foreach ($old in $oldArena) { if ((Get-FileHash $old.FullName -Algorithm SHA256).Hash -ne (Get-FileHash (Join-Path $backup $old.Name) -Algorithm SHA256).Hash) { throw "Rollback hash verification failed; preserved backup: $backup" } }
         if ((Get-FileHash $secret -Algorithm SHA256).Hash -ne $secretHash) { throw "Rollback secret verification failed; preserved backup: $backup" }
         Write-Host "Rollback completed; verified backup preserved at $backup"

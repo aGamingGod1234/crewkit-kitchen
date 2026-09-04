@@ -61,7 +61,9 @@ export class FishTtsProvider {
 		if (!response.ok) {
 			const retryAfter = response.headers?.get?.('retry-after');
 			const error = new Error(`Fish TTS failed with HTTP ${response.status}`);
-			error.code = response.status === 429 ? 'TTS_RATE_LIMITED' : 'TTS_PROVIDER_ERROR';
+			error.code = response.status === 401 || response.status === 403
+				? 'TTS_AUTHENTICATION_FAILED'
+				: response.status === 429 ? 'TTS_RATE_LIMITED' : 'TTS_PROVIDER_ERROR';
 			error.retryAfter = retryAfter;
 			throw error;
 		}

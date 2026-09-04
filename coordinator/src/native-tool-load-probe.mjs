@@ -107,7 +107,7 @@ try {
 	);
 	const sequenceMoveThenMine = await runPhase(
 		'sequence_move_then_mine',
-		'event: probe only. You are at x=0,y=64,z=0 and a stone block is at x=2,y=64,z=1. Call sequence exactly once with navigate_to near the block followed by break_block on that exact block. End this turn after the sequence result.',
+		'event: probe only. You are at x=0,y=64,z=0 and an observed minecraft:stone block is at x=2,y=64,z=1. Call sequence exactly once with navigate_to near the block followed by break_block on that exact block with expectedBlockId minecraft:stone. End this turn after the sequence result.',
 		['sequence:navigate_to,break_block'],
 	);
 

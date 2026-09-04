@@ -216,6 +216,24 @@ public final class ServerActionExecutorVerification {
 		);
 		assertEquals(progressAgent, progress.agentId(), "progress retains agent identity");
 		assertEquals(0.5D, progress.progress(), "progress retains bounded fraction");
+		ServerActionObservation observation = new ServerActionObservation(
+				42L, 1_750_000_000_250L,
+				new ServerActionObservation.Position(1.25D, 64.0D, -2.5D),
+				new ServerActionObservation.Position(0.0D, 0.0D, 0.1D),
+				90.0D, 12.0D,
+				new ServerActionObservation.Collision(false, true, false),
+				new ServerActionObservation.RayTarget("block", new ServerActionObservation.Position(2.0D, 64.0D, -2.0D), "minecraft:oak_log", "west", 2.75D),
+				new ServerActionObservation.Reach(2.75D, 4.5D, true),
+				new ServerActionObservation.Target("block", new ServerActionObservation.Position(2.0D, 64.0D, -2.0D), "minecraft:oak_log", "minecraft:oak_log", "minecraft:oak_log", "minecraft:oak_log", false, null, null, null),
+				new ServerActionObservation.Progress(0.25D, "block_damage", true)
+		);
+		ServerActionProgress observedProgress = new ServerActionProgress(
+				progressAgent, 7L, "action-observed", ActionType.BREAK_BLOCK, "trace-observed", 0.25D, 250L, 1_750_000_000_250L, observation
+		);
+		assertEquals(42L, observation.worldTick(), "action observation retains the server world tick without claiming a coordinator sequence");
+		assertEquals(observation, observedProgress.actionObservation(), "progress retains authoritative action observation");
+		assertThrows(IllegalArgumentException.class, () -> new ServerActionObservation.Progress(0.25D, "timer", true),
+				"action observations reject executor timer progress bases");
 		ServerActionRequest cancellationTarget = new ServerActionRequest(
 				progressAgent, 7L, "action-7", ActionType.WAIT, new JsonObject(), provenance);
 		assertThrows(NullPointerException.class, () -> new ServerActionRequest(
@@ -355,15 +373,14 @@ public final class ServerActionExecutorVerification {
 		Object pending = new Object();
 		Map<AgentId, Object> pendingRespawns = new LinkedHashMap<>();
 		pendingRespawns.put(agentId, pending);
-		AtomicInteger rollbacks = new AtomicInteger();
 		AtomicInteger terminalReports = new AtomicInteger();
 		assertTrue(finishDisconnectedRespawn(
-				pendingRespawns, agentId, pending, rollbacks::incrementAndGet, terminalReports::incrementAndGet),
+				pendingRespawns, agentId, pending, terminalReports::incrementAndGet),
 				"the accepted pending respawn is finished at disconnect");
 		assertFalse(finishDisconnectedRespawn(
-				pendingRespawns, agentId, pending, rollbacks::incrementAndGet, terminalReports::incrementAndGet),
+				pendingRespawns, agentId, pending, terminalReports::incrementAndGet),
 				"a second disconnect cannot finish the same respawn twice");
-		assertEquals(1, rollbacks.get(), "pending respawn rollback runs exactly once");
+		assertTrue(pendingRespawns.isEmpty(), "disconnect only detaches the coordinator observer");
 		assertEquals(1, terminalReports.get(), "pending respawn terminal reporting runs exactly once");
 	}
 
@@ -371,14 +388,13 @@ public final class ServerActionExecutorVerification {
 			Map<AgentId, ?> pendingRespawns,
 			AgentId agentId,
 			Object pending,
-			Runnable rollback,
 			Runnable terminalReport
 	) {
 		try {
 			var method = ServerActionExecutor.class.getDeclaredMethod(
-					"finishDisconnectedRespawn", Map.class, AgentId.class, Object.class, Runnable.class, Runnable.class);
+					"finishDisconnectedRespawn", Map.class, AgentId.class, Object.class, Runnable.class);
 			method.setAccessible(true);
-			return (boolean) method.invoke(null, pendingRespawns, agentId, pending, rollback, terminalReport);
+			return (boolean) method.invoke(null, pendingRespawns, agentId, pending, terminalReport);
 		} catch (ReflectiveOperationException exception) {
 			throw new AssertionError("missing pending-respawn disconnect boundary", exception);
 		}

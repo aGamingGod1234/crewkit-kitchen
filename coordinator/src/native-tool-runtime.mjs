@@ -9,6 +9,7 @@ export class NativeToolRuntime {
 	#actions = new Map();
 	#completions = new Map();
 	#staleActions = new Map();
+	#executionEpochs = new Map();
 	#sequence = 0;
 
 	constructor({ bridge, registry = null, onFinish = async () => ({ state: 'FINISH_REQUESTED' }), trace = () => {} } = {}) {
@@ -60,14 +61,42 @@ export class NativeToolRuntime {
 		}
 		if (request.tool.kind === 'finish') return this.#finish(request, record, lifecycleGeneration);
 		const tool = constrainGoalBoundNavigation(request.tool, record.currentGoalSpec);
-		if (tool.kind === 'sequence') return this.#executeSequence({ ...request, tool }, record);
+		if (tool.kind === 'sequence') return this.#executeSequence({ ...request, tool }, record, this.#executionEpoch(record.agentId));
+		if (tool.kind === 'lookAround') return this.#executeLookAround(request, record, tool, this.#executionEpoch(record.agentId));
 		if (tool.kind !== 'action') throw codedError('INVALID_NATIVE_TOOL', 'Native tool did not normalize to an action');
 		return this.#executeAction(request, record, tool);
 	}
 
-	async #executeSequence(request, record) {
+	async #executeLookAround(request, record, tool, executionEpoch) {
+		const source = this.#observations.get(record.agentId)?.observation ?? {};
+		const input = source.interaction?.input ?? {};
+		const selectedSlot = Number.isSafeInteger(input.selectedSlot) && input.selectedSlot >= 0 && input.selectedSlot <= 8
+			? input.selectedSlot : 0;
+		const hand = input.hand === 'off_hand' ? 'off' : 'main';
+		const results = [];
+		for (let index = 0; index < tool.steps; index += 1) {
+			if (this.#executionEpoch(record.agentId) !== executionEpoch) throw codedError('NATIVE_ACTION_CANCELLED', 'Camera sweep cancelled before its next step');
+			const action = {
+				kind: 'action',
+				actionType: 'control',
+				arguments: {
+					forward: 0, strafe: 0, jump: false, sneak: false, sprint: false,
+					attack: false, use: false,
+					yaw: wrapDegrees(tool.centerYaw + ((index + 1) * 360) / tool.steps),
+					pitch: tool.pitch, selectedSlot, hand, ticks: tool.ticksPerStep,
+				},
+			};
+			const result = await this.#executeAction(request, record, action, index);
+			results.push({ actionType: action.actionType, ...result });
+			if (result.state !== 'SUCCEEDED') return { state: result.state, completed: results.length, failedAt: index, results };
+		}
+		return { state: 'SUCCEEDED', completed: results.length, results };
+	}
+
+	async #executeSequence(request, record, executionEpoch) {
 		const results = [];
 		for (let index = 0; index < request.tool.actions.length; index += 1) {
+			if (this.#executionEpoch(record.agentId) !== executionEpoch) throw codedError('NATIVE_ACTION_CANCELLED', 'Native sequence cancelled before its next action');
 			const action = request.tool.actions[index];
 			const result = await this.#executeAction(request, record, { kind: 'action', ...action }, index);
 			results.push({ actionType: action.actionType, ...result });
@@ -126,7 +155,15 @@ export class NativeToolRuntime {
 	onActionProgress(record, payload = {}) {
 		const active = this.#actions.get(record.agentId);
 		if (active === undefined || active.goalRevision !== record.goalRevision || active.actionId !== payload.actionId) return false;
-		this.#trace('native_tool_action_progress', { agentId: record.agentId, goalRevision: record.goalRevision, actionId: active.actionId });
+		const observation = payload.actionObservation === undefined ? undefined : structuredClone(payload.actionObservation);
+		this.#trace('native_tool_action_progress', {
+			agentId: record.agentId,
+			goalRevision: record.goalRevision,
+			actionId: active.actionId,
+			...(payload.progress === undefined ? {} : { progress: payload.progress }),
+			...(payload.elapsedMs === undefined ? {} : { elapsedMs: payload.elapsedMs }),
+			...(observation === undefined ? {} : { actionObservation: observation }),
+		});
 		return true;
 	}
 
@@ -139,6 +176,8 @@ export class NativeToolRuntime {
 			reasonCode: String(payload.reasonCode ?? '').slice(0, 128),
 			...(payload.message === undefined ? {} : { message: String(payload.message).slice(0, 2_048) }),
 			...(payload.executionStarted === undefined ? {} : { executionStarted: payload.executionStarted === true }),
+			...(payload.physicalAttempted === undefined ? {} : { physicalAttempted: payload.physicalAttempted === true }),
+			...(payload.actionObservation === undefined ? {} : { actionObservation: structuredClone(payload.actionObservation) }),
 		};
 		this.#trace('native_tool_action_completed', { agentId: record.agentId, goalRevision: record.goalRevision, actionId: active.actionId, ...result });
 		active.resolve(result);
@@ -165,6 +204,7 @@ export class NativeToolRuntime {
 	}
 
 	async dispose(agentId, reason = 'disposed') {
+		this.#executionEpochs.set(agentId, this.#executionEpoch(agentId) + 1);
 		this.#observations.delete(agentId);
 		const active = this.#actions.get(agentId);
 		const completion = this.#completions.get(agentId);
@@ -182,6 +222,8 @@ export class NativeToolRuntime {
 		}
 		return active !== undefined || completion !== undefined;
 	}
+
+	#executionEpoch(agentId) { return this.#executionEpochs.get(agentId) ?? 0; }
 
 	#rememberStaleAction(agentId, active) {
 		let stale = this.#staleActions.get(agentId);
@@ -290,5 +332,9 @@ function validateRequest(request, record) {
 }
 
 function safeSegment(value) { return String(value).replace(/[^A-Za-z0-9._:-]/g, '_') || 'item'; }
+function wrapDegrees(value) {
+	const wrapped = ((value + 180) % 360 + 360) % 360 - 180;
+	return wrapped === -180 ? 180 : wrapped;
+}
 function actionResultKey(goalRevision, actionId) { return `${goalRevision}:${String(actionId ?? '')}`; }
 function codedError(code, message) { return Object.assign(new Error(message), { code }); }

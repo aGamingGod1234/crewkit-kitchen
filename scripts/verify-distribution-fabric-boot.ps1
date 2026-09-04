@@ -87,7 +87,7 @@ foreach ($required in @(
 	if (-not (Test-Path -LiteralPath $required)) { throw "Fabric boot prerequisite is missing: $required" }
 }
 $packageMods = @(Get-ChildItem -LiteralPath (Join-Path $package 'mods') -Filter '*.jar' -File)
-if ($packageMods.Count -ne 3) { throw "The staged distribution must contain exactly three mod JARs; found $($packageMods.Count)." }
+if ($packageMods.Count -ne 5) { throw "The staged distribution must contain exactly five mod JARs; found $($packageMods.Count)." }
 
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("arena-distribution-boot-" + [Guid]::NewGuid().ToString('N'))
 $server = Join-Path $testRoot 'server'

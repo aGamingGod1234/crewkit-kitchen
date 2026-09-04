@@ -58,7 +58,26 @@ public final class GoalVerificationRuntimeVerification {
 		assertions += verifyQueuedPromotionAfterEvidence();
 		assertions += verifyQueuedKillActivationBoundary();
 		assertions += verifyRequestedCompletionLifecycle();
+		assertions += verifyActionCompletionPrecedesFactualCompletion();
 		return assertions;
+	}
+
+	private static int verifyActionCompletionPrecedesFactualCompletion() {
+		Fixture fixture = fixture(new GoalPredicate.PositionWithin(1.0, 64.0, 0.0, 1.0, 1), 825L);
+		long revision = fixture.record().goalRevision();
+		fixture.registry.beginAction(fixture.agentId, revision, fixture.now);
+		fixture.facts.position = new GoalCompletionVerifier.Position(1.0, 64.0, 0.0);
+		assertEquals(0, fixture.runtime.tick().size(),
+				"proactive verification waits while an authoritative world action is still running");
+		assertEquals(AgentLifecycleState.ACTING, fixture.record().state(),
+				"a satisfied predicate cannot cancel its still-running action");
+		fixture.registry.actionFinished(fixture.agentId, revision, fixture.now + 1L);
+		fixture.advance();
+		assertEquals(1, fixture.runtime.tick().size(),
+				"factual verification completes immediately after the action result is committed");
+		assertEquals(GoalStatus.SATISFIED, fixture.goalStatus(),
+				"post-action factual completion retains authoritative evidence");
+		return 4;
 	}
 
 	private static int verifyExactInventoryAndIdempotence() {

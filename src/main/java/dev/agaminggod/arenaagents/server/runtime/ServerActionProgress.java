@@ -12,7 +12,8 @@ public record ServerActionProgress(
 	String traceId,
 	double progress,
 		long elapsedMs,
-		long observedAtEpochMs
+	long observedAtEpochMs,
+	ServerActionObservation actionObservation
 ) {
 	public ServerActionProgress {
 		agentId = Objects.requireNonNull(agentId, "agentId must not be null");
@@ -31,12 +32,24 @@ public record ServerActionProgress(
 		if (elapsedMs < 0L || observedAtEpochMs < 0L) {
 			throw new IllegalArgumentException("progress timestamps must be non-negative");
 		}
+		if (actionObservation != null && actionObservation.progress() != null
+				&& Double.compare(progress, actionObservation.progress().value()) != 0) {
+			throw new IllegalArgumentException("progress must equal actionObservation.progress.value");
+		}
 	}
 
 	public ServerActionProgress(
 			AgentId agentId, long goalRevision, String actionId, ActionType actionType,
 			double progress, long elapsedMs, long observedAtEpochMs
 	) {
-		this(agentId, goalRevision, actionId, actionType, null, progress, elapsedMs, observedAtEpochMs);
+		this(agentId, goalRevision, actionId, actionType, null, progress, elapsedMs, observedAtEpochMs, null);
 	}
+
+	public ServerActionProgress(
+			AgentId agentId, long goalRevision, String actionId, ActionType actionType,
+			String traceId, double progress, long elapsedMs, long observedAtEpochMs
+	) {
+		this(agentId, goalRevision, actionId, actionType, traceId, progress, elapsedMs, observedAtEpochMs, null);
+	}
+
 }

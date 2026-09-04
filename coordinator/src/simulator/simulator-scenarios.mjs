@@ -10,7 +10,7 @@ const scenarioList = [
 		world: baseWorld({ agentId: 'stone-agent', inventory: [{ itemId: 'minecraft:stick', count: 2, slot: 0 }, { itemId: 'minecraft:cobblestone', count: 3, slot: 1 }], blocks: [{ x: 0, y: 0, z: 0, blockId: 'minecraft:stone' }, { x: 1, y: 0, z: 0, blockId: 'minecraft:stone' }, { x: 1, y: 1, z: 0, blockId: 'minecraft:stone' }] }),
 		commands: [
 			{ actionId: 'stone-navigate', actionType: 'navigate_to', arguments: { x: 0, y: 1, z: 1, tolerance: 0.2, sprint: true, timeoutMs: 1_000 } },
-			{ actionId: 'stone-mine', actionType: 'break_block', arguments: { x: 1, y: 1, z: 0, timeoutMs: 1_000 } },
+			{ actionId: 'stone-mine', actionType: 'break_block', arguments: { x: 1, y: 1, z: 0, expectedBlockId: 'minecraft:stone', timeoutMs: 1_000 } },
 			{ actionId: 'stone-craft', actionType: 'craft_inventory', arguments: { recipeId: 'minecraft:stone_pickaxe', count: 1, timeoutMs: 1_000 } },
 		],
 		events: [],

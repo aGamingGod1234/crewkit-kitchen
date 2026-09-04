@@ -26,15 +26,22 @@ export class DeepgramSttProvider {
 		const timeoutSignal = AbortSignal.timeout(this.#timeoutMs);
 		const responseController = new AbortController();
 		const combinedSignal = AbortSignal.any([responseController.signal, timeoutSignal, ...(signal === undefined ? [] : [signal])]);
-		const response = await this.#fetch(this.#endpoint, {
-			method: 'POST',
-			headers: {
-				Authorization: `Token ${this.#apiKey}`,
-				'Content-Type': 'audio/l16;rate=48000;channels=1',
-			},
-			body: pcm,
-			signal: combinedSignal,
-		});
+		let response;
+		try {
+			response = await this.#fetch(this.#endpoint, {
+				method: 'POST',
+				headers: {
+					Authorization: `Token ${this.#apiKey}`,
+					'Content-Type': 'audio/l16;rate=48000;channels=1',
+				},
+				body: pcm,
+				signal: combinedSignal,
+			});
+		} catch (error) {
+			if (error?.name === 'AbortError' || signal?.aborted) throw error;
+			if (error instanceof TypeError) throw typedError('STT_PROVIDER_ERROR', 'Deepgram STT transport failed');
+			throw error;
+		}
 		if (!response.ok) {
 			const error = typedError(
 				response.status === 429 ? 'STT_RATE_LIMITED' : 'STT_PROVIDER_ERROR',

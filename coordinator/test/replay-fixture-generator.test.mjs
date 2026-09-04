@@ -55,26 +55,28 @@ function activeActionHazardScenario() {
 }
 
 async function withLavaAttentionDuringActiveWait(callback) {
-	const originalEmit = VirtualMinecraftBridge.prototype.emit;
 	const errors = [];
-	const triggered = new WeakMap();
-	VirtualMinecraftBridge.prototype.emit = function emitWithHazardAttention(type, entry) {
-		const emitted = originalEmit.call(this, type, entry);
-		if (type === 'progress' && entry?.envelope?.payload?.actionType === 'wait') {
+	const virtualBridgeFactory = (options) => {
+		const bridge = new VirtualMinecraftBridge(options);
+		const triggered = new Set();
+		const onProgress = (entry) => {
+			if (entry?.envelope?.payload?.actionType !== 'wait') return;
 			const agentId = entry.envelope.agentId;
-			const agents = triggered.get(this) ?? new Set();
-			triggered.set(this, agents);
-			if (!agents.has(agentId)) {
-				agents.add(agentId);
-				void this.publish(agentId, { attention: true, changedFacts: ['player.health'] }).catch((error) => errors.push(error));
-			}
-		}
-		return emitted;
+			if (triggered.has(agentId)) return;
+			triggered.add(agentId);
+			void bridge.publish(agentId, { attention: true, changedFacts: ['player.health'] }).catch((error) => errors.push(error));
+		};
+		bridge.on('progress', onProgress);
+		const stop = bridge.stop.bind(bridge);
+		bridge.stop = () => {
+			bridge.off('progress', onProgress);
+			return stop();
+		};
+		return bridge;
 	};
 	try {
-		return await callback();
+		return await callback(virtualBridgeFactory);
 	} finally {
-		VirtualMinecraftBridge.prototype.emit = originalEmit;
 		assert.deepEqual(errors, []);
 	}
 }
@@ -139,11 +141,12 @@ test('ordinary delayed stone records remain single-turn and replay without promp
 
 test('records a cleanup-aborted continuation after hazard attention during an active action', async () => {
 	const delayedMatrix = activeActionHazardMatrix();
-	await withLavaAttentionDuringActiveWait(async () => {
+	await withLavaAttentionDuringActiveWait(async (virtualBridgeFactory) => {
 		const fixture = await generateReplayRecordings({
 			matrix: delayedMatrix,
 			scenarioResolver: () => activeActionHazardScenario(),
 			delayMs: ({ turnIndex }) => turnIndex === 0 ? 10 : 500,
+			virtualBridgeFactory,
 		});
 		assert.ok(fixture.recordings.every((record) => record.decisions.length >= 2));
 
@@ -152,6 +155,7 @@ test('records a cleanup-aborted continuation after hazard attention during an ac
 			scenarioResolver: () => activeActionHazardScenario(),
 			replayRecordings: fixture.recordings,
 			artifactDirectory: null,
+			virtualBridgeFactory,
 		});
 
 		assert.equal(replay.status, 'PASSED', JSON.stringify(replay.trials.map((trial) => trial.error)));

@@ -33,6 +33,22 @@ public final class ScenarioLaunchRuntimeVerification {
 				request.placementMode(), request.roster(), "confirm-123");
 		assertEquals("confirm-123", ScenarioLaunchCodec.decode(ScenarioLaunchCodec.encode(confirmed)).confirmationToken(),
 				"one-time site confirmation token survives the launch payload");
+		ScenarioLaunchRequest normalizedNames = new ScenarioLaunchRequest(
+				"citadel-collapse",
+				ScenarioPresets.require("citadel-collapse").mapVersion(),
+				true,
+				ScenarioPlacementMode.AT_PLAYER,
+				List.of(
+						new ScenarioAgentSpec(1, "GPT-5.6-Sol", "codex", "gpt-5.6-sol", "high", "fast",
+								Optional.of("amber"), AgentGameMode.SURVIVAL),
+						new ScenarioAgentSpec(2, "GPT 5.6 Sol", "codex", "gpt-5.6-sol", "high", "fast",
+								Optional.of("azure"), AgentGameMode.SURVIVAL)
+				)
+		);
+		assertEquals("GPT_5_6_Sol", normalizedNames.roster().get(0).displayName(),
+				"scenario launch boundary materializes a Minecraft-safe public name");
+		assertEquals("GPT_5_6_Sol2", normalizedNames.roster().get(1).displayName(),
+				"scenario launch boundary resolves case-insensitive canonical collisions");
 		expectIllegalArgument(
 				() -> new ScenarioLaunchRequest(
 						"thinking-tower",
@@ -53,7 +69,7 @@ public final class ScenarioLaunchRuntimeVerification {
 				"locked parkour mode rejects survival"
 		);
 
-		return 3;
+		return 5;
 	}
 
 	private static void expectIllegalArgument(Runnable action, String message) {

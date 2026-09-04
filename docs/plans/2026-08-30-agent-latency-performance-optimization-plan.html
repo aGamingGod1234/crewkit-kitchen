@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agent Arena latency plan</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b0d10;
+      --text: #f3f5f7;
+      --muted: #9aa3ad;
+      --line: #2a3038;
+      --accent: #85e0b6;
+      --warn: #f3c978;
+      --max: 920px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 16px/1.55 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main { width: min(var(--max), 100%); margin: 0 auto; padding: 56px 24px 88px; }
+    header { padding-bottom: 34px; border-bottom: 1px solid var(--line); }
+    .eyebrow { color: var(--accent); font-size: .78rem; font-weight: 750; letter-spacing: .12em; text-transform: uppercase; }
+    h1 { max-width: 760px; margin: 12px 0 18px; font-size: clamp(2.35rem, 8vw, 5.4rem); line-height: .98; letter-spacing: -.055em; }
+    h2 { margin: 0 0 14px; font-size: 1.35rem; letter-spacing: -.02em; }
+    h3 { margin: 0 0 7px; font-size: 1rem; }
+    p { max-width: 760px; margin: 0 0 14px; }
+    .lede { color: #c8cfd6; font-size: 1.13rem; }
+    .meta { display: flex; flex-wrap: wrap; gap: 18px 28px; margin-top: 24px; color: var(--muted); font-size: .9rem; }
+    .meta strong { display: block; color: var(--text); font-size: 1rem; }
+    section { padding: 34px 0; border-bottom: 1px solid var(--line); }
+    .outcomes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 22px; }
+    .number { display: block; color: var(--accent); font-size: 1.6rem; font-weight: 760; letter-spacing: -.03em; }
+    .muted { color: var(--muted); }
+    ol, ul { margin: 0; padding-left: 1.25rem; }
+    li { margin: .58rem 0; }
+    .steps { list-style: none; padding: 0; counter-reset: step; }
+    .steps > li { counter-increment: step; display: grid; grid-template-columns: 42px 1fr; gap: 14px; padding: 22px 0; margin: 0; border-top: 1px solid var(--line); }
+    .steps > li::before { content: counter(step, decimal-leading-zero); color: var(--accent); font: 700 .82rem/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .steps ul { color: #c8cfd6; }
+    .gate { display: grid; grid-template-columns: 180px 1fr; gap: 18px; padding: 15px 0; border-top: 1px solid var(--line); }
+    .gate strong { color: var(--accent); }
+    .warning { color: var(--warn); }
+    code { color: #b7d8ff; font: .9em ui-monospace, SFMono-Regular, Consolas, monospace; }
+    footer { padding-top: 28px; color: var(--muted); font-size: .88rem; }
+    @media (max-width: 700px) {
+      main { padding: 34px 18px 64px; }
+      .outcomes { grid-template-columns: 1fr; }
+      .gate { grid-template-columns: 1fr; gap: 4px; }
+      .steps > li { grid-template-columns: 32px 1fr; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">Agent Arena / implementation plan / 30 Aug 2026</div>
+    <h1>Cut the time between intent and action.</h1>
+    <p class="lede">Reduce cold startup, provider wait, observation churn, action admission, and speech delay. The target is a measured 2x improvement where the application controls the latency, without changing the selected model profile or weakening factual action checks.</p>
+    <div class="meta">
+      <div><strong>Ready</strong>Status</div>
+      <div><strong>1, 8, 16 agents</strong>Primary loads</div>
+      <div><strong>Cold and warm</strong>Separate results</div>
+      <div><strong>Factual parity</strong>Quality gate</div>
+    </div>
+  </header>
+
+  <section>
+    <h2>Outcome</h2>
+    <div class="outcomes">
+      <div><span class="number">0.5x</span><span class="muted">Target p95 time to first authoritative action in the predeclared cells.</span></div>
+      <div><span class="number">20 TPS</span><span class="muted">Minecraft remains within the 50 ms tick budget at supported load.</span></div>
+      <div><span class="number">No loss</span><span class="muted">Goal completion, target provenance, consent, cancellation, and stale-work fencing remain intact.</span></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Scope</h2>
+    <ul>
+      <li>Coordinator startup, agent creation, warm session reuse, planning, retries, and urgent attention.</li>
+      <li>Observation capture, semantic deduplication, prompt projection, ArenaScript watchers, protocol encoding, and queueing.</li>
+      <li>Minecraft action admission, navigation, combat, post-action facts, and restore or respawn work.</li>
+      <li>Microphone endpointing, STT admission, TTS generation, caching, streaming, and first audible packet.</li>
+      <li>A fair real headless A/B run with identical concurrency and instrumentation in both arms.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Work sequence</h2>
+    <ol class="steps">
+      <li>
+        <div>
+          <h3>Establish honest phase timing</h3>
+          <ul>
+            <li>Separate startup, queue wait, provider time, parse, dispatch, Minecraft acceptance, first displacement, completion, STT, first PCM byte, and first outbound voice packet.</li>
+            <li>Fix the A/B defaults so both arms use identical planning concurrency. Measure trace overhead with tracing on and off.</li>
+            <li>Record cold and warm results separately. Keep failures and timeouts in the report.</li>
+          </ul>
+        </div>
+      </li>
+      <li>
+        <div>
+          <h3>Stop redundant observations and model wakes</h3>
+          <ul>
+            <li>Do not build full observations at 20 Hz for idle, paused, completed, or error agents.</li>
+            <li>Use semantic thresholds for movement, velocity, fall progress, air, and action-owned inventory churn.</li>
+            <li>Apply cheap distance and view-cone filters before raycasts. Reuse visibility and world-cell work within one tick.</li>
+            <li>Budget native and ArenaScript input by factual priority, with explicit omitted counts.</li>
+          </ul>
+        </div>
+      </li>
+      <li>
+        <div>
+          <h3>Shrink the provider hot path</h3>
+          <ul>
+            <li>Return exact existing sessions before catalog discovery.</li>
+            <li>Install the planner contract once. Warm turns send authoritative state deltas and a short invariant reminder.</li>
+            <li>Keep provider continuation after local parse errors and send only bounded correction details.</li>
+            <li>Make the output schema reject invalid directive and source combinations before generation completes.</li>
+          </ul>
+        </div>
+      </li>
+      <li>
+        <div>
+          <h3>Make urgent work actually urgent</h3>
+          <ul>
+            <li>Let damage, conversation, and other priority escalations interrupt stale ordinary thinking.</li>
+            <li>Make ACP cancellation settle promptly. Replace an unresponsive transport after a short grace period.</li>
+            <li>Bound each agent event queue and coalesce only safe consecutive observations.</li>
+            <li>Keep bounded pending capacity for goal translation even when all 16 agents are active.</li>
+          </ul>
+        </div>
+      </li>
+      <li>
+        <div>
+          <h3>Remove cold-start floors</h3>
+          <ul>
+            <li>Launch the owned bundled coordinator immediately after bridge bind. Keep the 3-second grace only for explicit external coordinators.</li>
+            <li>Cache runtime fingerprints, Node identity, Codex executable discovery, catalog state, and unchanged workspace templates.</li>
+            <li>Bound prewarm fanout and allow real goals to preempt queued prewarm work.</li>
+            <li>Publish provisional readiness for the configured exact profile while full catalog discovery continues in the background.</li>
+          </ul>
+        </div>
+      </li>
+      <li>
+        <div>
+          <h3>Start and continue actions sooner</h3>
+          <ul>
+            <li>Admit actions and apply input at the start of a server tick. Keep result and observation publication at the end.</li>
+            <li>Reserve queue capacity for actions and cancellation while preserving per-agent ordering.</li>
+            <li>Attach authoritative post-action facts to terminal results so sequential actions avoid an extra observation exchange.</li>
+            <li>Expose bounded sustained combat and pursuit using exact observed target IDs.</li>
+          </ul>
+        </div>
+      </li>
+      <li>
+        <div>
+          <h3>Reduce tick and coordinator CPU</h3>
+          <ul>
+            <li>Encode each outbound observation once, reuse its bytes for sizing and writing, and flush bounded batches.</li>
+            <li>Stop deep-copying the same trusted normalized payload at every internal boundary.</li>
+            <li>Brand fully validated immutable ArenaScript facts privately, then reuse them across watcher checks.</li>
+            <li>Cache navigation cells per tick and add replan hysteresis for moving targets.</li>
+          </ul>
+        </div>
+      </li>
+      <li>
+        <div>
+          <h3>Cut speech response time</h3>
+          <ul>
+            <li>Replace the fixed 300 ms endpoint delay with adaptive local voice activity detection.</li>
+            <li>Reserve STT admission and use weighted scheduling so TTS cannot reject player speech.</li>
+            <li>Singleflight identical TTS misses. Separate STT and TTS worker failure domains.</li>
+            <li>Stream PCM through Node and Java into bounded playback queues. Keep cancellation and consent checks at every ownership boundary.</li>
+          </ul>
+        </div>
+      </li>
+      <li>
+        <div>
+          <h3>Prove the result in the real path</h3>
+          <ul>
+            <li>Run paired baseline and optimized builds against the same headless Fabric world, provider profile, prompt, concurrency, timeout, seed, and instrumentation.</li>
+            <li>Use at least 10 paired repetitions per primary cell. Treat p95 and p99 as provisional below 30 samples.</li>
+            <li>Test direct messages, movement, mining, combat, speech, death, restore, and 16-agent mixed load.</li>
+          </ul>
+        </div>
+      </li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>Acceptance gates</h2>
+    <div class="gate"><strong>Decision</strong><span>Optimized p95 is at most half of baseline p95 for the declared goal-to-first-action cells, with factual success unchanged.</span></div>
+    <div class="gate"><strong>Cold startup</strong><span>Bridge listening to coordinator authentication and summon to agent ready each improve by at least 50 percent.</span></div>
+    <div class="gate"><strong>Action</strong><span>Wire receipt to first movement loses one server tick at p50 and does not regress result ordering.</span></div>
+    <div class="gate"><strong>Voice input</strong><span>Last microphone packet to STT dispatch stays below 180 ms p95 on a warm provider.</span></div>
+    <div class="gate"><strong>Voice output</strong><span>Cached TTS request to playback start stays below 100 ms p95. First-audio delay does not grow with utterance length after streaming.</span></div>
+    <div class="gate"><strong>Load</strong><span>One, eight, and sixteen agents complete with no starvation, no stale action acceptance, and Minecraft p95 tick time below 50 ms.</span></div>
+  </section>
+
+  <section>
+    <h2>Decisions and limits</h2>
+    <ul>
+      <li>Keep planning concurrency at 16 for the main comparison. The earlier 16-to-4 reduction made load-16 completion roughly three times slower.</li>
+      <li>Do not silently lower the user-selected reasoning effort or service tier.</li>
+      <li>Do not run Minecraft world reads or mutations on background threads.</li>
+      <li>Do not cache model decisions, race duplicate model calls, or dispatch partial unvalidated output.</li>
+      <li>Do not claim 2x from simulator timing alone. The release claim needs the real headless path.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Risks</h2>
+    <ul>
+      <li><span class="warning">Missed attention.</span> Semantic observation suppression needs explicit hazard, target, inventory, conversation, and action-result tests.</li>
+      <li><span class="warning">Ordering bugs.</span> Priority lanes and start-tick admission must retain action-before-cancel and result-before-post-action-facts rules.</li>
+      <li><span class="warning">Voice privacy.</span> Consent revocation must cancel owned microphone work even if TTS cancellation becomes less destructive.</li>
+      <li><span class="warning">Misleading wins.</span> Provider variance, unequal concurrency, setup cost, and trace overhead can fake an improvement unless the paired experiment controls them.</li>
+    </ul>
+  </section>
+
+  <footer>
+    Source: repository-wide read-only audit by ten reviewers. The audit found opportunities but did not implement performance changes.
+  </footer>
+</main>
+</body>
+</html>

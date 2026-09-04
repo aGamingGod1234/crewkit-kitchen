@@ -116,6 +116,23 @@ public final class DurableActionJournalVerification {
 		repaired.terminal(result(afterCompaction, "DONE"));
 		assertEntry(DurableActionJournal.open(compactPath, 4), DurableActionJournal.Phase.TERMINAL,
 				afterCompaction, result(afterCompaction, "DONE"));
+
+		Path detachedPath = directory.resolve("detached.json");
+		DurableActionJournal detached = DurableActionJournal.open(detachedPath);
+		ServerActionRequest detachedRequest = request(agentId, 13L, "detached-reply", "detached-step", 9L);
+		ServerActionResult detachedResult = result(detachedRequest, "DONE");
+		if (detached.terminalIfAccepted(detachedResult)) {
+			throw new AssertionError("A detached reply must not require a journal entry");
+		}
+		if (!detached.snapshot().isEmpty()) {
+			throw new AssertionError("Skipping journal terminalization must not invent an entry");
+		}
+		detached.accept(detachedRequest, goalId);
+		if (!detached.terminalIfAccepted(detachedResult)) {
+			throw new AssertionError("Accepted actions must still terminalize");
+		}
+		assertEntry(detached, DurableActionJournal.Phase.TERMINAL, detachedRequest, detachedResult);
+
 		try (var files = Files.list(directory)) {
 			if (files.anyMatch(file -> file.getFileName().toString().contains(".tmp-"))) {
 				throw new AssertionError("Journal left a temporary file after atomic replacement");
@@ -123,7 +140,7 @@ public final class DurableActionJournalVerification {
 		} catch (IOException exception) {
 			throw new AssertionError(exception);
 		}
-		return 20;
+		return 23;
 	}
 
 	private static void assertEntry(

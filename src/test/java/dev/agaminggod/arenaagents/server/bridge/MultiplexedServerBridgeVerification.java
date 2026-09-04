@@ -31,6 +31,7 @@ import dev.agaminggod.arenaagents.server.perception.ServerObservationWireBudget;
 import dev.agaminggod.arenaagents.server.runtime.ActionProvenance;
 import dev.agaminggod.arenaagents.server.runtime.GoalCompletionVerifier;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionProgress;
+import dev.agaminggod.arenaagents.server.runtime.ServerActionObservation;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionRequest;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionResult;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionState;
@@ -165,6 +166,7 @@ public final class MultiplexedServerBridgeVerification {
 		assertTrue(!terminalPersisted.get(), "failed respawn commit leaves the accepted journal phase intact");
 		verifyDeathFacts();
 		verifyTraceWireValidation();
+		verifyIdleDirectReplyRevisionPolicy(registered.getFirst());
 		verifyExactTargetObservationLedger(registered.getFirst().agentId());
 		verifyConversationAttention(registered.getFirst().agentId());
 		verifyObservationCadence(candidates);
@@ -188,7 +190,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyImmediateHandshakeClosePreservesDisconnect();
 		verifyPendingRegistrationMarkerIsFenced();
 		verifyAtomicPublicationRacesSessionClose();
-		return 278;
+		return 287;
 	}
 
 	private static void verifyAcceptedActionRecoversWithoutReplay() {
@@ -234,6 +236,54 @@ public final class MultiplexedServerBridgeVerification {
 			deleteIfExists(secretFile);
 			deleteIfExists(journalFile);
 		}
+	}
+
+	private static void verifyIdleDirectReplyRevisionPolicy(AgentRecord idle) {
+		ActionProvenance provenance = new ActionProvenance(
+				idle.profile().provider(), idle.profile().model(), idle.profile().reasoning(),
+				idle.profile().serviceTier(), "conversation-only", 1L, "reply", 0L
+		);
+		JsonObject direct = new JsonObject();
+		direct.addProperty("message", "Hello");
+		direct.addProperty("audience", "direct");
+		direct.addProperty("recipientId", "10000000-0000-4000-8000-000000000001");
+		ServerActionRequest directReply = new ServerActionRequest(
+				idle.agentId(), idle.goalRevision(), "idle-direct", ActionType.CHAT, direct, provenance
+		);
+		assertTrue(MultiplexedServerBridge.acceptsActionRevision(idle, directReply),
+				"an idle conversation may issue only its same-revision private reply");
+		assertTrue(MultiplexedServerBridge.isDetachedConversationReply(idle, directReply),
+				"an idle private reply bypasses goal-action lifecycle transitions");
+		JsonObject proximityArguments = direct.deepCopy();
+		proximityArguments.addProperty("audience", "proximity");
+		proximityArguments.remove("recipientId");
+		ServerActionRequest proximityReply = new ServerActionRequest(
+				idle.agentId(), idle.goalRevision(), "idle-proximity", ActionType.CHAT, proximityArguments, provenance
+		);
+		assertTrue(MultiplexedServerBridge.acceptsActionRevision(idle, proximityReply),
+				"an idle proximity conversation may reply on the same channel");
+		assertTrue(MultiplexedServerBridge.isDetachedConversationReply(idle, proximityReply),
+				"an idle proximity reply bypasses goal-action lifecycle transitions");
+		assertTrue(!MultiplexedServerBridge.acceptsActionRevision(idle, new ServerActionRequest(
+				idle.agentId(), idle.goalRevision() + 1L, "idle-proximity-stale", ActionType.CHAT,
+				proximityArguments, provenance
+		)), "a proximity reply cannot cross a lifecycle revision");
+
+		JsonObject publicArguments = direct.deepCopy();
+		publicArguments.addProperty("audience", "public");
+		ServerActionRequest publicReply = new ServerActionRequest(
+				idle.agentId(), idle.goalRevision(), "idle-public", ActionType.CHAT, publicArguments, provenance
+		);
+		assertTrue(!MultiplexedServerBridge.acceptsActionRevision(idle, publicReply),
+				"idle conversation cannot publish chat");
+		assertTrue(!MultiplexedServerBridge.isDetachedConversationReply(idle, publicReply),
+				"public chat cannot enter the detached reply executor");
+		assertTrue(!MultiplexedServerBridge.acceptsActionRevision(idle, new ServerActionRequest(
+				idle.agentId(), idle.goalRevision(), "idle-wait", ActionType.WAIT, new JsonObject(), provenance
+		)), "idle conversation cannot execute physical actions");
+		assertTrue(!MultiplexedServerBridge.acceptsActionRevision(idle, new ServerActionRequest(
+				idle.agentId(), idle.goalRevision() + 1L, "idle-stale", ActionType.CHAT, direct, provenance
+		)), "idle conversation cannot cross a lifecycle revision");
 	}
 
 	/**
@@ -538,6 +588,12 @@ public final class MultiplexedServerBridgeVerification {
 					"Get a good pickaxe", List.of("minecraft:diamond_pickaxe", "minecraft:iron_pickaxe"),
 					Optional.empty(), DraftIntent.CONFIRM_TRANSLATION, 1_001L, idle.goalRevision(), Optional.empty()
 			);
+			assertEquals(
+					"Proposed goal for \"Get a good pickaxe\": Goal set: obtain minecraft:iron_pickaxe. Confirm or cancel draft "
+							+ requestId + ".",
+					MultiplexedServerBridge.goalProposalMessage(draft, "Goal set:\n obtain minecraft:iron_pickaxe"),
+					"player goal proposal is a readable sentence without raw predicate JSON"
+			);
 			manager.stageGoalDraft(draft);
 			bridge = new MultiplexedServerBridge(manager, 0, secretFile);
 			bridge.start();
@@ -728,6 +784,111 @@ public final class MultiplexedServerBridgeVerification {
 						() -> manager.resolveGoalDraft(
 								legacyItemBypassId, countedItemRequester, false, GoalDraftChoice.CONFIRM),
 						"GOAL_TRANSLATION_CONSTRAINT_MISMATCH");
+
+				String reportedRequest = "Go beat the game and kill the Ender Dragon";
+				GoalPredicate dragonKill = new GoalPredicate.EntityKilledByAgent("minecraft:ender_dragon", true);
+				GoalPredicate redundantDragonConfirmation = new GoalPredicate.AllOf(List.of(
+						new GoalPredicate.OperatorConfirmed(), dragonKill));
+				var dragonConstraint = new GoalCompiler().translationConstraintFor(
+						reportedRequest, net.minecraft.core.RegistryAccess.EMPTY);
+				UUID invalidManagerId = UUID.fromString("00000000-0000-0000-0000-000000000311");
+				manager.stageGoalDraft(managerTranslationDraft(
+						invalidManagerId, idle.agentId(),
+						UUID.fromString("00000000-0000-0000-0000-000000000312"),
+						reportedRequest, dragonConstraint, DraftIntent.TRANSLATE_START,
+						manager.registry().require(idle.agentId()), 1_007L));
+				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
+						"goal_spec_proposal", "proposal-manager-bypass",
+						goalSpecProposal(invalidManagerId, new GoalPredicate.OperatorConfirmed())));
+				BridgeEnvelope managerBypass = pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "goal_spec_result", null);
+				assertEquals("GOAL_TRANSLATION_CONSTRAINT_MISMATCH",
+						managerBypass.payload().get("reasonCode").getAsString(),
+						"a Manager request cannot auto-activate an operator-confirmed placeholder");
+				assertEquals(AgentLifecycleState.IDLE, manager.registry().require(idle.agentId()).state(),
+						"an invalid Manager translation activates nothing");
+
+				UUID managerStartId = UUID.fromString("00000000-0000-0000-0000-000000000313");
+				manager.stageGoalDraft(managerTranslationDraft(
+						managerStartId, idle.agentId(),
+						UUID.fromString("00000000-0000-0000-0000-000000000314"),
+						reportedRequest, dragonConstraint, DraftIntent.TRANSLATE_START,
+						manager.registry().require(idle.agentId()), 1_008L));
+				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
+						"goal_spec_proposal", "proposal-manager-start",
+						goalSpecProposal(managerStartId, redundantDragonConfirmation)));
+				BridgeEnvelope managerStarted = pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "goal_spec_result", null);
+				assertEquals("accepted", managerStarted.payload().get("status").getAsString(),
+						"a verified Manager translation is accepted");
+				assertEquals("PROPOSAL_ACTIVATED", managerStarted.payload().get("reasonCode").getAsString(),
+						"a verified Manager start activates without a second confirmation");
+				AgentRecord started = manager.registry().require(idle.agentId());
+				assertEquals(AgentLifecycleState.STARTING, started.state(),
+						"the verified Manager proposal starts the agent");
+				assertEquals(dragonKill, started.currentGoal().orElseThrow().spec().completion(),
+						"the bridge removes redundant manual confirmation from the objective terminal result");
+				assertTrue(manager.goalDraft(managerStartId).isEmpty(),
+						"activation consumes the durable Manager draft");
+
+				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
+						"goal_spec_proposal", "proposal-manager-start-replay",
+						goalSpecProposal(managerStartId, redundantDragonConfirmation)));
+				BridgeEnvelope startReplay = pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "goal_spec_result", null);
+				assertEquals("PROPOSAL_ALREADY_ACTIVATED", startReplay.payload().get("reasonCode").getAsString(),
+						"an identical Manager start replay is acknowledged idempotently");
+				assertEquals(started.goalRevision(), manager.registry().require(idle.agentId()).goalRevision(),
+						"an identical start replay cannot activate a second goal revision");
+				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
+						"goal_spec_proposal", "proposal-manager-start-conflict", goalSpecProposal(
+								managerStartId, new GoalPredicate.EntityKilledByAgent("minecraft:zombie", true))));
+				BridgeEnvelope startConflict = pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "goal_spec_result", null);
+				assertEquals("GOAL_DRAFT_PROPOSAL_CONFLICT",
+						startConflict.payload().get("reasonCode").getAsString(),
+						"a changed replay cannot replace an already activated Manager proposal");
+				assertEquals(started.goalRevision(), manager.registry().require(idle.agentId()).goalRevision(),
+						"a changed replay cannot activate a second goal revision");
+
+				UUID managerQueueId = UUID.fromString("00000000-0000-0000-0000-000000000315");
+				manager.stageGoalDraft(managerTranslationDraft(
+						managerQueueId, idle.agentId(),
+						UUID.fromString("00000000-0000-4000-8000-000000000316"),
+						reportedRequest, dragonConstraint, DraftIntent.TRANSLATE_QUEUE,
+						manager.registry().require(idle.agentId()), 1_009L));
+				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
+						"goal_spec_proposal", "proposal-manager-queue", goalSpecProposal(managerQueueId, dragonKill)));
+				BridgeEnvelope managerQueued = pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "goal_spec_result", null);
+				assertEquals("PROPOSAL_ACTIVATED", managerQueued.payload().get("reasonCode").getAsString(),
+						"a verified Manager queue proposal is applied automatically");
+				assertEquals(1, manager.registry().require(idle.agentId()).queuedGoals().size(),
+						"the verified queue proposal appends one goal");
+				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
+						"goal_spec_proposal", "proposal-manager-queue-replay", goalSpecProposal(managerQueueId, dragonKill)));
+				BridgeEnvelope queueReplay = pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "goal_spec_result", null);
+				assertEquals("PROPOSAL_ALREADY_ACTIVATED", queueReplay.payload().get("reasonCode").getAsString(),
+						"an identical queue replay is acknowledged idempotently");
+				assertEquals(1, manager.registry().require(idle.agentId()).queuedGoals().size(),
+						"an identical queue replay cannot append the goal twice");
+
+				UUID staleManagerId = UUID.fromString("00000000-0000-0000-0000-000000000317");
+				manager.stageGoalDraft(managerTranslationDraft(
+						staleManagerId, idle.agentId(),
+						UUID.fromString("00000000-0000-4000-8000-000000000318"),
+						reportedRequest, dragonConstraint, DraftIntent.TRANSLATE_QUEUE,
+						manager.registry().require(idle.agentId()), 1_010L));
+				manager.registry().stop(idle.agentId(), 1_011L);
+				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
+						"goal_spec_proposal", "proposal-manager-stale", goalSpecProposal(staleManagerId, dragonKill)));
+				BridgeEnvelope staleManager = pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "goal_spec_result", null);
+				assertEquals("STALE_GOAL_DRAFT", staleManager.payload().get("reasonCode").getAsString(),
+						"a proposal fenced to an old Manager goal revision is rejected");
+				assertEquals(1, manager.registry().require(idle.agentId()).queuedGoals().size(),
+						"a stale Manager proposal activates nothing");
 			}
 		} catch (Exception exception) {
 			throw new AssertionError("goal specification proposal lifecycle failed", exception);
@@ -737,6 +898,24 @@ public final class MultiplexedServerBridgeVerification {
 				throw new AssertionError("could not remove goal spec bridge secret", exception);
 			}
 		}
+	}
+
+	private static PendingGoalDraft managerTranslationDraft(
+			UUID requestId,
+			dev.agaminggod.arenaagents.agent.AgentId agentId,
+			UUID requesterId,
+			String request,
+			dev.agaminggod.arenaagents.server.goal.GoalTranslationConstraint constraint,
+			DraftIntent intent,
+			AgentRecord record,
+			long createdAtTick
+	) {
+		return new PendingGoalDraft(
+				requestId, agentId, requesterId, request,
+				dev.agaminggod.arenaagents.agent.goal.GoalPredicate.DEFAULT_DIMENSION,
+				List.of("minecraft:ender_dragon"), constraint, Optional.empty(), intent,
+				createdAtTick, record.goalRevision(), PendingGoalDraft.expectedGoalIdFor(record)
+		);
 	}
 
 	private static JsonObject goalSpecProposal(UUID requestId, String itemId) {
@@ -2136,6 +2315,19 @@ public final class MultiplexedServerBridgeVerification {
 		ServerActionResult result = new ServerActionResult(agent, 1L, "action-1", ActionType.WAIT, traceId, ServerActionState.SUCCEEDED, "DONE", "", 2L, 3L);
 		assertEquals(traceId, progress.traceId(), "first progress retains the action trace ID");
 		assertEquals(traceId, result.traceId(), "terminal result retains the action trace ID");
+		ServerActionObservation evidence = new ServerActionObservation(
+				42L, 1_750_000_000_250L,
+				new ServerActionObservation.Position(1.0D, 64.0D, 2.0D),
+				null, 0.0D, 0.0D, null,
+				new ServerActionObservation.RayTarget("block", new ServerActionObservation.Position(2.0D, 64.0D, 2.0D), "minecraft:oak_log", "north", 3.0D),
+				new ServerActionObservation.Reach(3.0D, 4.5D, true),
+				new ServerActionObservation.Target("block", new ServerActionObservation.Position(2.0D, 64.0D, 2.0D), "minecraft:oak_log", "minecraft:oak_log", "minecraft:oak_log", "minecraft:oak_log", false, null, null, null),
+				new ServerActionObservation.Progress(0.25D, "block_damage", true)
+		);
+		JsonObject evidenceWire = invokeActionObservationPayload(evidence);
+		assertEquals(42L, evidenceWire.get("worldTick").getAsLong(), "action evidence preserves the server world tick");
+		assertEquals("minecraft:oak_log", evidenceWire.getAsJsonObject("lookedAt").get("id").getAsString(), "action evidence preserves the server ray target");
+		assertEquals("block_damage", evidenceWire.getAsJsonObject("progress").get("basis").getAsString(), "action evidence preserves the factual progress basis");
 		assertThrows(IllegalArgumentException.class, () -> new ServerActionRequest(agent, 1L, "action-1", ActionType.WAIT, arguments, tracedProvenance, "trace-other"),
 				"direct request construction rejects mismatched top-level and provenance traces");
 		ServerActionRequest legacy = new ServerActionRequest(agent, 1L, "action-legacy", ActionType.WAIT, arguments, provenance);
@@ -2688,6 +2880,16 @@ public final class MultiplexedServerBridgeVerification {
 			method.invoke(bridge, progress);
 		} catch (ReflectiveOperationException exception) {
 			throw new AssertionError("could not publish action progress", exception);
+		}
+	}
+
+	private static JsonObject invokeActionObservationPayload(ServerActionObservation observation) {
+		try {
+			var method = MultiplexedServerBridge.class.getDeclaredMethod("actionObservationPayload", ServerActionObservation.class);
+			method.setAccessible(true);
+			return (JsonObject) method.invoke(null, observation);
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("could not serialize action observation", exception);
 		}
 	}
 

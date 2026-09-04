@@ -103,6 +103,13 @@ final class DurableActionJournal {
 		persist(admission.entries(), new Mutation(admission.removed(), List.of(accepted), List.of(), List.of()));
 	}
 
+	synchronized boolean terminalIfAccepted(ServerActionResult result) {
+		Objects.requireNonNull(result, "result must not be null");
+		if (entries.get(ActionKey.from(result)) == null) return false;
+		terminal(result);
+		return true;
+	}
+
 	synchronized void terminal(ServerActionResult result) {
 		Objects.requireNonNull(result, "result must not be null");
 		ActionKey key = ActionKey.from(result);

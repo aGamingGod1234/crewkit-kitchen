@@ -248,6 +248,7 @@ test('Codex launch retains provider configuration but strips bridge credentials'
 		env: {
 			APPDATA: 'C:\\Users\\lucas\\AppData\\Roaming',
 			PATH: 'C:\\Windows\\System32',
+			CODEX_HOME: 'C:\\Users\\lucas\\.codex',
 			OPENAI_API_KEY: 'openai-key',
 			FISH_AUDIO_API_KEY: 'voice-key',
 			ARENA_AGENT_BRIDGE_SECRET: 'bridge-secret',
@@ -257,10 +258,25 @@ test('Codex launch retains provider configuration but strips bridge credentials'
 		existsSync: () => true,
 	});
 	assert.equal(launch.environment.PATH, 'C:\\Windows\\System32');
+	assert.equal(launch.environment.CODEX_HOME, 'C:\\Users\\lucas\\.codex');
 	assert.equal(launch.environment.OPENAI_API_KEY, 'openai-key');
 	assert.equal(launch.environment.FISH_AUDIO_API_KEY, undefined);
 	assert.equal(launch.environment.ARENA_AGENT_BRIDGE_SECRET, undefined);
 	assert.equal(launch.environment.ARENA_AGENT_BRIDGE_SECRET_FILE, undefined);
+});
+
+test('updates the Codex home before startup without changing model launch arguments', async () => {
+	const child = new FakeStdioChild();
+	let launchEnvironment;
+	const transport = new CodexStdioTransport(config, { spawn: (_command, _args, options) => { launchEnvironment = options.env; return child; } });
+	transport.setEnvironment({ CODEX_HOME: 'C:\\isolated-codex-home', OPENAI_API_KEY: 'openai-key' });
+	const started = transport.start();
+	child.emit('spawn');
+	await started;
+	assert.equal(launchEnvironment.CODEX_HOME, 'C:\\isolated-codex-home');
+	assert.equal(launchEnvironment.OPENAI_API_KEY, 'openai-key');
+	assert.throws(() => transport.setEnvironment({ CODEX_HOME: 'C:\\other' }), /cannot change after startup/);
+	await transport.stop();
 });
 
 test('a stopped child late spawn error cannot orphan its running replacement transport', async () => {

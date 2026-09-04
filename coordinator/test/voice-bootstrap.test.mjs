@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { startVoiceWorker as startVoiceWorkerRuntime } from '../src/dynamic-main.mjs';
+import { DeepgramSttProvider } from '../src/voice/deepgram-stt-provider.mjs';
 import { FishTtsProvider } from '../src/voice/fish-tts-provider.mjs';
 import { createVoiceRequestHeaders } from '../src/voice/voice-http-server.mjs';
 
@@ -463,7 +464,123 @@ test('voice bootstrap prefers one local speech runtime for both expressive TTS a
 	assert.equal(localCloses, 1);
 });
 
-test('runtime local TTS failures switch concurrent requests once to Fish while local STT stays available', async () => {
+test('configured expressive Fish TTS and low-latency Deepgram STT stay primary over local speech', async () => {
+	let active;
+	let localTtsCalls = 0;
+	let localSttCalls = 0;
+	let fishCalls = 0;
+	let deepgramCalls = 0;
+	const local = {
+		async synthesize() { localTtsCalls += 1; return { provider: 'local-chatterbox' }; },
+		async transcribe() { localSttCalls += 1; return { transcript: 'local whisper', confidence: 1 }; },
+		async close() {},
+	};
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { secret: VOICE_SECRET, port: 8_766 } }, {
+		FISH_AUDIO_API_KEY: 'fish-key',
+		DEEPGRAM_API_KEY: 'deepgram-key',
+	}, {
+		platform: 'win32',
+		createLocalSpeechProvider: async () => local,
+		loadProfileStore: async () => ({ store: { resolve() {} } }),
+		createTtsProvider: () => ({
+			async synthesize() { fishCalls += 1; return { provider: 'fish', model: 's2.1-pro-free' }; },
+		}),
+		createSttProvider: () => ({
+			async transcribe() { deepgramCalls += 1; return { transcript: 'deepgram', confidence: 1 }; },
+		}),
+		createWindowsTtsProvider: () => ({ async synthesize() { return { provider: 'windows' }; } }),
+		createVoiceServer: (options) => {
+			active = options;
+			return { async start() {}, async close() {} };
+		},
+	});
+	try {
+		assert.equal((await active.provider.synthesize({ text: 'hello' })).provider, 'fish');
+		assert.equal((await active.sttProvider.transcribe({ pcm: Buffer.alloc(2) })).transcript, 'deepgram');
+		assert.deepEqual([fishCalls, deepgramCalls, localTtsCalls, localSttCalls], [1, 1, 0, 0]);
+	} finally {
+		await worker.close();
+	}
+});
+
+test('missing Fish credentials emit a bounded startup diagnostic with the actual local provider', async () => {
+	const diagnostics = [];
+	const local = {
+		cacheNamespace: () => 'local-chatterbox/chatterbox-v1',
+		async synthesize() { return { provider: 'local' }; },
+		async transcribe() { return { transcript: '', confidence: 0 }; },
+		async close() {},
+	};
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { secret: VOICE_SECRET, port: 8_766 } }, {}, {
+		platform: 'linux',
+		createLocalSpeechProvider: async () => local,
+		loadProfileStore: async () => ({ store: { resolve() {} } }),
+		reportVoiceDiagnostic: (event) => diagnostics.push(event),
+		createVoiceServer: () => ({ async start() {}, async close() {} }),
+	});
+	try {
+		assert.deepEqual(diagnostics, [{
+			code: 'VOICE_TTS_REMOTE_UNCONFIGURED',
+			effectiveProvider: 'local-chatterbox/chatterbox-v1',
+			reason: 'fish_credential_missing',
+		}]);
+		assert.ok(JSON.stringify(diagnostics).length <= 256);
+	} finally {
+		await worker.close();
+	}
+});
+
+test('Fish failure reports the fallback reason and the HTTP seam exposes local synthesis', async () => {
+	const diagnostics = [];
+	const local = {
+		cacheNamespace: () => 'local-chatterbox/chatterbox-v1',
+		async synthesize() {
+			return { sampleRateHz: 48_000, channels: 1, sampleFormat: 's16le', pcm: Buffer.alloc(960, 1) };
+		},
+		async transcribe() { return { transcript: '', confidence: 0 }; },
+		async close() {},
+	};
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { secret: VOICE_SECRET, port: 0 } }, {
+		FISH_AUDIO_API_KEY: 'must-never-appear-in-diagnostics',
+	}, {
+		platform: 'linux',
+		createLocalSpeechProvider: async () => local,
+		loadProfileStore: async () => ({ store: { resolve() { return {
+			profileId: 'voice.test', provider: 'fish', model: 's2.1-pro-free', voiceId: 'fish-id', revision: 1, speed: 1,
+		}; } } }),
+		createTtsProvider: () => ({
+			cacheNamespace: () => 'fish/s2.1-pro-free',
+			async synthesize() { throw Object.assign(new Error('remote rejected a credential'), { code: 'TTS_AUTHENTICATION_FAILED' }); },
+		}),
+		reportVoiceDiagnostic: (event) => diagnostics.push(event),
+	});
+	try {
+		const body = JSON.stringify({
+			agentId: PLAYER, conversationSequence: 1, profileId: 'voice.auto.v1', radius: 48, text: 'Fallback truthfully.',
+		});
+		const response = await fetch(`http://127.0.0.1:${worker.server.address().port}/v1/tts`, {
+			method: 'POST', headers: { ...voiceAuth('/v1/tts'), 'Content-Type': 'application/json' }, body,
+		});
+		assert.equal(response.status, 200);
+		assert.equal(response.headers.get('x-voice-synthesizer'), 'local-chatterbox/chatterbox-v1');
+		await response.arrayBuffer();
+		assert.equal(
+			worker.statusSnapshots().find(({ component }) => component === 'voice:tts').effectiveProvider,
+			'local-chatterbox/chatterbox-v1',
+		);
+		assert.ok(diagnostics.some((event) => event.code === 'VOICE_TTS_FALLBACK_ACTIVATED'
+			&& event.primaryProvider === 'fish/s2.1-pro-free'
+			&& event.effectiveProvider === 'local-chatterbox/chatterbox-v1'
+			&& event.failureCode === 'TTS_AUTHENTICATION_FAILED'));
+		assert.ok(diagnostics.some((event) => event.code === 'VOICE_TTS_EFFECTIVE_PROVIDER'
+			&& event.effectiveProvider === 'local-chatterbox/chatterbox-v1'));
+		assert.doesNotMatch(JSON.stringify(diagnostics), /must-never-appear-in-diagnostics|remote rejected a credential/);
+	} finally {
+		await worker.close();
+	}
+});
+
+test('configured Fish handles concurrent TTS while local STT remains available as the independent channel', async () => {
 	let localTtsCalls = 0;
 	let localCloses = 0;
 	let fishProviders = 0;
@@ -517,8 +634,7 @@ test('runtime local TTS failures switch concurrent requests once to Fish while l
 		const responses = await Promise.all([request('first request', 1), request('second request', 2)]);
 		assert.deepEqual(responses.map(({ status }) => status), [200, 200], 'the failed local requests recover in the same HTTP attempts');
 		assert.equal(fishProviders, 1, 'concurrent local failures create one shared fallback provider');
-		assert.ok(localTtsCalls >= 1 && localTtsCalls <= 2,
-			'the first local failure may switch routing before the second request reaches the local provider');
+		assert.equal(localTtsCalls, 0, 'configured Fish stays primary instead of waiting for local TTS to fail');
 		assert.equal(fishCalls, 2);
 		assert.equal(localCloses, 0, 'local speech remains alive for STT after a TTS-only failover');
 		assert.equal((await local.transcribe()).transcript, 'local hearing remains active');
@@ -530,7 +646,7 @@ test('runtime local TTS failures switch concurrent requests once to Fish while l
 	assert.equal(profileCloses, 1);
 });
 
-test('cached local speech is not returned after runtime failover to Fish', async () => {
+test('configured Fish cache never returns local speech', async () => {
 	let localCalls = 0;
 	let fishCalls = 0;
 	const local = {
@@ -578,7 +694,7 @@ test('cached local speech is not returned after runtime failover to Fish', async
 		assert.equal((await request('repeat me', 1)).status, 200);
 		assert.equal((await request('switch provider', 2)).status, 200);
 		assert.equal((await request('repeat me', 3)).status, 200);
-		assert.equal(localCalls, 2);
+		assert.equal(localCalls, 0);
 		assert.equal(fishCalls, 2, 'the repeated utterance is synthesized by Fish after failover');
 	} finally {
 		await worker.close();
@@ -657,7 +773,7 @@ test('nested runtime fallback caches a successful Fish probe only as Fish audio'
 	}
 });
 
-test('runtime local STT failures switch concurrent requests once to Deepgram while local TTS stays available', async () => {
+test('configured Deepgram handles concurrent STT while local TTS stays available', async () => {
 	let active;
 	let localSttCalls = 0;
 	let localCloses = 0;
@@ -698,7 +814,7 @@ test('runtime local STT failures switch concurrent requests once to Deepgram whi
 			active.sttProvider.transcribe({ pcm: Buffer.alloc(2) }),
 		]);
 		assert.deepEqual(results.map(({ transcript }) => transcript), ['remote transcript', 'remote transcript']);
-		assert.equal(localSttCalls, 2);
+		assert.equal(localSttCalls, 0, 'configured Deepgram stays primary instead of waiting for local Whisper to fail');
 		assert.equal(deepgramProviders, 1, 'concurrent local failures create one shared Deepgram provider');
 		assert.equal(deepgramCalls, 2);
 		assert.equal((await active.provider.synthesize({ text: 'still local' })).provider, 'local');
@@ -707,6 +823,41 @@ test('runtime local STT failures switch concurrent requests once to Deepgram whi
 		await worker.close();
 	}
 	assert.equal(localCloses, 1);
+});
+
+test('Deepgram transport failure falls back to local hearing', async () => {
+	let active;
+	let localSttCalls = 0;
+	const local = {
+		async synthesize() { return { provider: 'local' }; },
+		async transcribe() {
+			localSttCalls += 1;
+			return { transcript: 'local fallback', confidence: 1 };
+		},
+		async close() {},
+	};
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { secret: VOICE_SECRET, port: 8_766 } }, {
+		DEEPGRAM_API_KEY: 'deepgram-key',
+	}, {
+		platform: 'linux',
+		createLocalSpeechProvider: async () => local,
+		loadProfileStore: async () => ({ store: { resolve() {} } }),
+		createSttProvider: () => new DeepgramSttProvider({
+			apiKey: 'deepgram-key',
+			fetchImpl: async () => { throw new TypeError('fetch failed'); },
+		}),
+		createVoiceServer: (options) => {
+			active = options;
+			return { async start() {}, async close() {} };
+		},
+	});
+	try {
+		const result = await active.sttProvider.transcribe({ pcm: Buffer.alloc(2) });
+		assert.equal(result.transcript, 'local fallback');
+		assert.equal(localSttCalls, 1, 'a transient remote transport failure keeps speech recognition available');
+	} finally {
+		await worker.close();
+	}
 });
 
 test('voice bootstrap applies the configured local inference deadline to live HTTP requests', async () => {
@@ -886,7 +1037,7 @@ test('local model warmup failure switches both channels to configured remote pro
 	});
 	try {
 		await worker.warmup();
-		assert.equal(localCloses, 1, 'the unused local process is released as soon as routing changes');
+		assert.equal(localCloses, 0, 'the local process remains available as a runtime fallback');
 		assert.notEqual(active.provider, local);
 		assert.notEqual(active.sttProvider, local);
 		assert.equal((await active.sttProvider.transcribe({ pcm: Buffer.alloc(2) })).transcript, 'fallback');
@@ -1034,7 +1185,7 @@ test('independent runtime channel failovers release the shared local worker exac
 		]);
 		assert.deepEqual(transcripts.map(({ transcript }) => transcript), ['deepgram', 'deepgram']);
 		assert.equal(deepgramProviders, 1, 'concurrent failures share one STT fallback');
-		assert.equal(localCloses, 1, 'the second channel transition releases the unused model process');
+		assert.equal(localCloses, 0, 'the local model remains available as a fallback for either remote channel');
 	} finally {
 		await Promise.all([worker.close(), worker.close()]);
 	}
@@ -1063,7 +1214,7 @@ test('local model warmup failure preserves Deepgram-only STT on non-Windows host
 		createWindowsTtsProvider: () => { throw new Error('Windows TTS must not be created on Linux'); },
 		createSttProvider: ({ apiKey }) => {
 			assert.equal(apiKey, 'deepgram-key');
-			assert.equal(localCloses, 1, 'Deepgram must not overlap the failed local provider');
+			assert.equal(localCloses, 0, 'Deepgram starts as the primary STT provider');
 			deepgramProviders += 1;
 			return { async transcribe() { return { transcript: 'remote', confidence: 1 }; } };
 		},
@@ -1074,12 +1225,12 @@ test('local model warmup failure preserves Deepgram-only STT on non-Windows host
 	});
 	try {
 		await worker.warmup();
-		assert.equal(localCloses, 1, 'failed local provider is closed before fallback traffic starts');
+		assert.equal(localCloses, 0, 'failed local TTS cannot disable primary Deepgram hearing');
 		assert.equal(deepgramProviders, 1);
 		assert.equal((await active.sttProvider.transcribe({ pcm: Buffer.alloc(2) })).transcript, 'remote');
 		await assert.rejects(
 			active.provider.synthesize({ text: 'hi' }),
-			(error) => error?.code === 'TTS_UNAVAILABLE',
+			/failed local TTS/,
 		);
 	} finally {
 		await worker.close();

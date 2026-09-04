@@ -61,34 +61,45 @@ dependencies {
 
 def carpetJarName = "fabric-carpet-${project.carpet_version}.jar"
 def carpetDependency = layout.projectDirectory.file("libs/${carpetJarName}")
+def voicechatJarName = "voicechat-fabric-${project.voicechat_version}.jar"
+def voicechatDependency = layout.projectDirectory.file("libs/${voicechatJarName}")
 def localDependencyChecksums = layout.projectDirectory.file('libs/checksums.sha256')
+def localDependencyJars = fileTree(layout.projectDirectory.dir('libs')) {
+	include '*.jar'
+}
 
 tasks.register('verifyLocalDependencies') {
 	group = 'verification'
 	description = 'Verifies tracked local dependency hashes against the reviewed provenance record.'
-	inputs.files(carpetDependency, localDependencyChecksums)
+	inputs.files(localDependencyJars, localDependencyChecksums)
 
 	doLast {
 		def checksumFile = localDependencyChecksums.asFile
+		def libsDir = checksumFile.parentFile
 		def records = checksumFile.readLines('UTF-8')
 			.collect { it.trim() }
 			.findAll { !it.isEmpty() && !it.startsWith('#') }
-		if (records.size() != 1) {
-			throw new GradleException("Expected exactly one local dependency checksum in ${project.relativePath(checksumFile)}.")
+		if (records.isEmpty()) {
+			throw new GradleException("Expected local dependency checksums in ${project.relativePath(checksumFile)}.")
 		}
 
-		def record = records[0] =~ /^([0-9a-fA-F]{64})\s+\*?(.+)$/
-		if (!record.matches() || record.group(2) != carpetDependency.asFile.name) {
-			throw new GradleException("Invalid Carpet checksum record in ${project.relativePath(checksumFile)}.")
-		}
-
-		def expectedHash = record.group(1).toLowerCase(Locale.ROOT)
-		def actualHash = MessageDigest.getInstance('SHA-256')
-			.digest(carpetDependency.asFile.bytes)
-			.encodeHex()
-			.toString()
-		if (actualHash != expectedHash) {
-			throw new GradleException("Local dependency checksum mismatch: ${project.relativePath(carpetDependency.asFile)}")
+		records.each { line ->
+			def matcher = line =~ /^([0-9a-fA-F]{64})\s+\*?([^\/\\]+)$/
+			if (!matcher.matches()) {
+				throw new GradleException("Invalid checksum record in ${project.relativePath(checksumFile)}: ${line}")
+			}
+			def expectedHash = matcher.group(1).toLowerCase(Locale.ROOT)
+			def jarFile = new File(libsDir, matcher.group(2))
+			if (!jarFile.isFile()) {
+				throw new GradleException("Missing local dependency: ${project.relativePath(jarFile)}")
+			}
+			def actualHash = MessageDigest.getInstance('SHA-256')
+				.digest(jarFile.bytes)
+				.encodeHex()
+				.toString()
+			if (actualHash != expectedHash) {
+				throw new GradleException("Local dependency checksum mismatch: ${project.relativePath(jarFile)}")
+			}
 		}
 	}
 }
@@ -256,6 +267,8 @@ tasks.register('generateDistributionMetadata') {
 	inputs.property 'loaderVersion', project.loader_version
 	inputs.property 'fabricApiVersion', project.fabric_api_version
 	inputs.property 'carpetVersion', project.carpet_version
+	inputs.property 'voicechatVersion', project.voicechat_version
+	inputs.property 'voiceAddonVersion', project.version
 	outputs.file distributionMetadata
 
 	doLast {
@@ -267,6 +280,8 @@ tasks.register('generateDistributionMetadata') {
 				"loader_version=${project.loader_version}",
 				"fabric_api_version=${project.fabric_api_version}",
 				"carpet_version=${project.carpet_version}",
+				"voicechat_version=${project.voicechat_version}",
+				"voice_addon_version=${project.version}",
 		].join('\n') + '\n', 'UTF-8')
 	}
 }
@@ -274,7 +289,7 @@ tasks.register('generateDistributionMetadata') {
 tasks.register('stageWindowsDistribution', Sync) {
 	group = 'distribution'
 	description = 'Stages the self-contained Windows mod pack with its verified Node.js runtime.'
-	dependsOn tasks.named('jar'), tasks.named('assembleWindowsNodeRuntime'), tasks.named('installCoordinatorProductionDependencies'), tasks.named('generateCoordinatorManifest'), tasks.named('generateDistributionMetadata')
+	dependsOn tasks.named('jar'), project(':voice-addon').tasks.named('jar'), tasks.named('assembleWindowsNodeRuntime'), tasks.named('installCoordinatorProductionDependencies'), tasks.named('generateCoordinatorManifest'), tasks.named('generateDistributionMetadata')
 	onlyIf { isWindowsHost }
 	into stagedStandaloneDistribution
 
@@ -282,8 +297,13 @@ tasks.register('stageWindowsDistribution', Sync) {
 		into 'mods'
 		rename { "arena-agents-${project.version}.jar" }
 	}
+	from(project(':voice-addon').tasks.named('jar').flatMap { it.archiveFile }) {
+		into 'mods'
+		rename { "arena-agents-voice-${project.version}.jar" }
+	}
 	from(configurations.standaloneFabricApi) { into 'mods' }
 	from(carpetDependency) { into 'mods' }
+	from(voicechatDependency) { into 'mods' }
 	from('coordinator') {
 		into 'coordinator'
 		coordinatorRuntimeIncludes.each { include it }

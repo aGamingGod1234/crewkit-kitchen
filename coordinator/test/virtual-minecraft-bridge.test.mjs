@@ -252,7 +252,7 @@ test('bridge executes a Task 4 mining action over multiple virtual ticks', async
 	const bridge = new VirtualMinecraftBridge({ world, agentRecords: { alice: { agentId: 'alice', goalRevision: 1 } } });
 	const manager = managerEvents();
 	bridge.attach(manager);
-	await bridge.send('action_command', 'alice', command('mine-1', 'break_block', { x: 1, y: 1, z: 0, timeoutMs: 1_000 }));
+	await bridge.send('action_command', 'alice', command('mine-1', 'break_block', { x: 1, y: 1, z: 0, expectedBlockId: 'minecraft:stone', timeoutMs: 1_000 }));
 	world.stepTicks(1);
 	assert.ok(world.blockAt(1, 1, 0), 'the block must remain while mining is in progress');
 	world.stepTicks(5);

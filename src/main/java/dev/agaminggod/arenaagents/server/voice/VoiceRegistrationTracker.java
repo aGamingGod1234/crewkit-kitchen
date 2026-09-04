@@ -18,7 +18,10 @@ final class VoiceRegistrationTracker {
 		}
 		for (Map.Entry<AgentId, UUID> entry : current.entrySet()) {
 			UUID previous = registered.get(entry.getKey());
-			if (entry.getValue().equals(previous)) continue;
+			if (entry.getValue().equals(previous)) {
+				subsystem.refreshAgent(entry.getKey(), entry.getValue());
+				continue;
+			}
 			if (previous != null) subsystem.unregisterAgent(entry.getKey());
 			subsystem.registerAgent(entry.getKey(), entry.getValue());
 			registered.put(entry.getKey(), entry.getValue());
@@ -28,5 +31,9 @@ final class VoiceRegistrationTracker {
 	void clear(VoiceSubsystem subsystem) {
 		for (AgentId agentId : registered.keySet().stream().toList()) subsystem.unregisterAgent(agentId);
 		registered.clear();
+	}
+
+	boolean containsEntity(UUID entityId) {
+		return registered.containsValue(Objects.requireNonNull(entityId, "entityId must not be null"));
 	}
 }

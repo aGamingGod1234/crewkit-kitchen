@@ -329,12 +329,18 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 		return routeCompiledSpeechGoal(
 				target.state(), event.kind(), compilation,
 				() -> {
+					DraftIntent intent = GoalCompiler.isDeterministicTranslation(event.text())
+							? DraftIntent.TRANSLATE_START : DraftIntent.CONFIRM_TRANSLATION;
 					PendingGoalDraft draft = draft(
-							target, event, sourceLevel, Optional.empty(), DraftIntent.CONFIRM_TRANSLATION);
+							target, event, sourceLevel, Optional.empty(), intent);
 					manager.stageGoalDraft(draft);
 					goalSpecRequestSink.publish(draft);
-					notifyRequester(draft, compilation.playerMessage()
-							+ " Draft " + draft.draftId() + " is waiting for clarification.");
+					if (intent == DraftIntent.TRANSLATE_START) {
+						notifyRequester(draft, "I understood the goal and will start it after validation.");
+					} else {
+						notifyRequester(draft, compilation.playerMessage()
+								+ " Draft " + draft.draftId() + " is waiting for clarification.");
+					}
 				},
 				message -> notifyRequester(requestingPlayerId(event), message)
 		);

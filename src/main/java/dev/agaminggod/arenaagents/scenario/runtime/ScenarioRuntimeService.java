@@ -1,6 +1,7 @@
 package dev.agaminggod.arenaagents.scenario.runtime;
 
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
+import dev.agaminggod.arenaagents.agent.AgentIdentity;
 import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.scenario.ScenarioAgentEvent;
@@ -88,6 +89,9 @@ public final class ScenarioRuntimeService {
 		if (state.activeRun != null || state.pendingResult != null) {
 			throw new IllegalStateException("A scenario is already running");
 		}
+		CodexAgentManager manager = CodexAgentManager.get(server);
+		manager.registry().requireCapacity(request.roster().size());
+		request = reserveScenarioPublicNames(request, manager, server);
 		ScenarioPreset preset = ScenarioPresets.require(request.scenarioId());
 		ServerLevel level = operator.level();
 		BlockPos origin = arenaOrigin(level, preset, operator, request.placementMode());
@@ -154,7 +158,7 @@ public final class ScenarioRuntimeService {
 		ScenarioSavedData.get(server).clear();
 		ScenarioSavedData.saveNow(server);
 		evacuateSite(level, blueprint.siteBounds());
-		removeContestants(CodexAgentManager.get(server), state.agents);
+		removeContestants(manager, state.agents);
 		state.agents = List.of();
 		state.participantByAgent.clear();
 		state.publicEvents.clear();
@@ -181,6 +185,29 @@ public final class ScenarioRuntimeService {
 						+ blueprint.placements().size() + " blueprint blocks will be checked; "
 						+ "construction is happening at this location."
 		);
+	}
+
+	private static ScenarioLaunchRequest reserveScenarioPublicNames(
+			ScenarioLaunchRequest request,
+			CodexAgentManager manager,
+			MinecraftServer server
+	) {
+		ArrayList<String> unavailableNames = new ArrayList<>();
+		manager.records().stream().map(manager::displayName).forEach(unavailableNames::add);
+		server.getPlayerList().getPlayers().stream()
+				.map(player -> player.getGameProfile().name())
+				.forEach(unavailableNames::add);
+		ArrayList<ScenarioAgentSpec> roster = new ArrayList<>(request.roster().size());
+		for (ScenarioAgentSpec agent : request.roster()) {
+			String publicName = AgentIdentity.allocatePublicName(agent.displayName(), unavailableNames);
+			unavailableNames.add(publicName);
+			roster.add(new ScenarioAgentSpec(
+					agent.slot(), publicName, agent.provider(), agent.model(), agent.reasoning(),
+					agent.serviceTier(), agent.team(), agent.gameMode()));
+		}
+		return new ScenarioLaunchRequest(
+				request.scenarioId(), request.mapVersion(), request.deterministicEvents(),
+				request.placementMode(), roster, request.confirmationToken());
 	}
 
 	public static synchronized void tick(MinecraftServer server) {

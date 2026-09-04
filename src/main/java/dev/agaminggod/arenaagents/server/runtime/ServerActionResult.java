@@ -14,9 +14,10 @@ public record ServerActionResult(
 		String reasonCode,
 		String message,
 		long elapsedMs,
-		long observedAtEpochMs,
-		boolean executionStarted,
-		boolean physicalAttempted
+	long observedAtEpochMs,
+	boolean executionStarted,
+	boolean physicalAttempted,
+	ServerActionObservation actionObservation
 ) {
 	public ServerActionResult {
 		Objects.requireNonNull(agentId, "agentId must not be null");
@@ -44,14 +45,23 @@ public record ServerActionResult(
 			AgentId agentId, long goalRevision, String actionId, ActionType actionType,
 			ServerActionState state, String reasonCode, String message, long elapsedMs, long observedAtEpochMs
 	) {
-		this(agentId, goalRevision, actionId, actionType, null, state, reasonCode, message, elapsedMs, observedAtEpochMs, false, false);
+		this(agentId, goalRevision, actionId, actionType, null, state, reasonCode, message, elapsedMs, observedAtEpochMs, false, false, null);
 	}
 
 	public ServerActionResult(
 			AgentId agentId, long goalRevision, String actionId, ActionType actionType,
 			String traceId, ServerActionState state, String reasonCode, String message, long elapsedMs, long observedAtEpochMs
 	) {
-		this(agentId, goalRevision, actionId, actionType, traceId, state, reasonCode, message, elapsedMs, observedAtEpochMs, false, false);
+		this(agentId, goalRevision, actionId, actionType, traceId, state, reasonCode, message, elapsedMs, observedAtEpochMs, false, false, null);
+	}
+
+	public ServerActionResult(
+			AgentId agentId, long goalRevision, String actionId, ActionType actionType,
+			String traceId, ServerActionState state, String reasonCode, String message,
+			long elapsedMs, long observedAtEpochMs, boolean executionStarted, boolean physicalAttempted
+	) {
+		this(agentId, goalRevision, actionId, actionType, traceId, state, reasonCode, message,
+				elapsedMs, observedAtEpochMs, executionStarted, physicalAttempted, null);
 	}
 
 	private static String bounded(String value, int maximum) {

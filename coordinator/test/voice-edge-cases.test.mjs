@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { request as httpRequest } from 'node:http';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { promisify } from 'node:util';
 
 import { DeepgramSttProvider } from '../src/voice/deepgram-stt-provider.mjs';
 import { NoSttProvider } from '../src/voice/deepgram-stt-provider.mjs';
@@ -16,6 +18,7 @@ const SECRET = 'voice-edge-verification-secret';
 const AGENT = '00000000-0000-4000-8000-000000000001';
 const PLAYER = '10000000-0000-4000-8000-000000000001';
 const PLAYER_TWO = '10000000-0000-4000-8000-000000000002';
+const execFileAsync = promisify(execFile);
 
 function fetch(input, init = {}) {
 	const headers = new Headers(init.headers);
@@ -37,6 +40,35 @@ function fetch(input, init = {}) {
 	}
 	return globalThis.fetch(input, init);
 }
+
+test('local speech worker pipe failure rejects requests without crashing the coordinator', async () => {
+	const providerUrl = new URL('../src/voice/local-speech-provider.mjs', import.meta.url).href;
+	const fixtureUrl = new URL('../test-support/local-speech-rpc-fixture.mjs', import.meta.url).href;
+	const script = `
+		import { fileURLToPath } from 'node:url';
+		import { LocalSpeechProvider } from ${JSON.stringify(providerUrl)};
+		const provider = new LocalSpeechProvider({
+			executable: process.execPath,
+			scriptPath: fileURLToPath(${JSON.stringify(fixtureUrl)}),
+			timeoutMs: 10,
+		});
+		const outcomes = await Promise.allSettled(Array.from(
+			{ length: 20 },
+			() => provider.synthesize({ text: 'block-worker' }),
+		));
+		await provider.close();
+		if (!outcomes.every(({ status, reason }) => status === 'rejected'
+				&& reason?.code === 'LOCAL_SPEECH_TIMEOUT')) {
+			throw new Error('local speech pipe failure did not reject every timed-out request');
+		}
+		process.stdout.write('survived\\n');
+	`;
+	const { stdout } = await execFileAsync(process.execPath, ['--input-type=module', '--eval', script], {
+		timeout: 15_000,
+		windowsHide: true,
+	});
+	assert.equal(stdout, 'survived\n');
+});
 
 test('TTS lifecycle automatically probes and recovers while STT remains independently ready', async () => {
 	let calls = 0;
@@ -1647,6 +1679,18 @@ test('Deepgram provider rejects unbounded or incomplete PCM before fetch', async
 		(error) => error.code === 'STT_MALFORMED_AUDIO',
 	);
 	assert.equal(calls, 0);
+});
+
+test('Deepgram transport failures become retryable provider errors', async () => {
+	const provider = new DeepgramSttProvider({
+		apiKey: 'deepgram-test-token',
+		fetchImpl: async () => { throw new TypeError('fetch failed'); },
+	});
+	await assert.rejects(
+		provider.transcribe({ pcm: Buffer.alloc(2) }),
+		(error) => error?.code === 'STT_PROVIDER_ERROR'
+			&& error.message === 'Deepgram STT transport failed',
+	);
 });
 
 test('Deepgram provider preserves rate-limit retry metadata', async () => {

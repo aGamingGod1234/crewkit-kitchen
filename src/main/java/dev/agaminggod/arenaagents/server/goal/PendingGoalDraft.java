@@ -25,6 +25,9 @@ public record PendingGoalDraft(
 		long expectedGoalRevision,
 		Optional<UUID> expectedGoalId
 ) {
+	/** Stable principal for authorized server-console and RCON goal submissions. */
+	public static final UUID SYSTEM_REQUESTER_ID = new UUID(0L, 0L);
+
 	public PendingGoalDraft {
 		Objects.requireNonNull(draftId, "draftId must not be null");
 		Objects.requireNonNull(agentId, "agentId must not be null");
@@ -85,6 +88,11 @@ public record PendingGoalDraft(
 		return new PendingGoalDraft(draftId, agentId, requestingPlayerId, originalRequest, dimensionId, candidateIds,
 				translationConstraint, Optional.of(Objects.requireNonNull(predicate, "predicate must not be null")), intent,
 				createdAtTick, expectedGoalRevision, expectedGoalId);
+	}
+
+	public static UUID requesterId(Optional<UUID> requestingPlayerId) {
+		return Objects.requireNonNull(requestingPlayerId, "requestingPlayerId must not be null")
+				.orElse(SYSTEM_REQUESTER_ID);
 	}
 
 	public boolean matches(AgentRecord record) {

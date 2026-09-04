@@ -1,10 +1,8 @@
 package dev.agaminggod.arenaagents.client.gui;
 
 import dev.agaminggod.arenaagents.control.AgentControlCatalog;
-import dev.agaminggod.arenaagents.control.AgentControlAgent;
 import dev.agaminggod.arenaagents.control.AgentControlModelOption;
 import java.util.List;
-import java.util.Set;
 
 public final class AgentControlLayoutVerification {
 	private AgentControlLayoutVerification() {
@@ -60,34 +58,7 @@ public final class AgentControlLayoutVerification {
 			AgentControlCatalog.resetRuntimeCatalog();
 		}
 
-		AgentControlAgent existing = agent(
-				"12345678-1234-1234-1234-123456789abc", "Existing", "codex", "gpt-5.6-luna");
-		AgentControlAgent summoned = agent(
-				"aaaaaaaa-1234-1234-1234-123456789abc", "Scout", "codex", "gpt-5.6-luna");
-		AgentControlAgent unrelated = agent(
-				"bbbbbbbb-1234-1234-1234-123456789abc", "Other", "gemini", "gemini-3.1-pro");
-		Set<String> baselineIds = Set.of(existing.agentId());
-		assertTrue(AgentControlScreen.PendingSummon.start(
-				baselineIds, "codex", "gpt-5.6-luna", "high", "", 2).isEmpty(),
-				"blank-name summon does not claim an agent without a safe discriminator");
-		AgentControlScreen.PendingSummon pending = AgentControlScreen.PendingSummon.start(
-				baselineIds, "codex", "gpt-5.6-luna", "high", "Scout", 2).orElseThrow();
-		assertEquals(List.of(summoned), pending.matches(List.of(existing, summoned, unrelated)),
-				"pending summon selects only one new agent matching the submitted profile");
-		assertEquals(1, pending.afterMiss().orElseThrow().remainingSnapshots(),
-				"pending summon waits for one later authoritative snapshot");
-		assertTrue(pending.afterMiss().orElseThrow().afterMiss().isEmpty(),
-				"pending summon expires instead of selecting an unrelated future agent");
-		return 29;
-	}
-
-	private static AgentControlAgent agent(
-			String id, String friendlyName, String provider, String model
-	) {
-		return new AgentControlAgent(
-				id, id.substring(0, 8), friendlyName, friendlyName, provider, model, "high",
-				"Agent_" + id.substring(0, 8), 0, "IDLE", "", 0, "", "", true, true
-		);
+		return 25;
 	}
 
 	private static void assertTrue(boolean condition, String label) {

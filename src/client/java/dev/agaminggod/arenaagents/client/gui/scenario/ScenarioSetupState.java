@@ -1,6 +1,7 @@
 package dev.agaminggod.arenaagents.client.gui.scenario;
 
 import dev.agaminggod.arenaagents.agent.AgentGameMode;
+import dev.agaminggod.arenaagents.agent.AgentIdentity;
 import dev.agaminggod.arenaagents.agent.AgentModelNames;
 import dev.agaminggod.arenaagents.agent.AgentVisualIdentity;
 import dev.agaminggod.arenaagents.control.AgentControlCatalog;
@@ -227,19 +228,16 @@ public final class ScenarioSetupState {
 
 	public String displayNameAt(int index) {
 		checkIndex(index);
-		ScenarioAgentConfig config = roster.get(index);
-		String base = config.name().isBlank()
-				? modelDisplayName(config) : config.name();
-		int duplicateIndex = 0;
-		for (int current = 0; current < index; current++) {
-			ScenarioAgentConfig previous = roster.get(current);
-			String previousBase = previous.name().isBlank()
-					? modelDisplayName(previous) : previous.name();
-			if (base.equalsIgnoreCase(previousBase)) {
-				duplicateIndex++;
-			}
+		ArrayList<String> allocated = new ArrayList<>();
+		for (int current = 0; current <= index; current++) {
+			ScenarioAgentConfig config = roster.get(current);
+			String preferred = config.name().isBlank()
+					? AgentIdentity.defaultPublicName(config.provider(), config.model()) : config.name();
+			String publicName = AgentIdentity.allocatePublicName(preferred, allocated);
+			if (current == index) return publicName;
+			allocated.add(publicName);
 		}
-		return duplicateIndex == 0 ? base : base + " (" + duplicateIndex + ")";
+		throw new IllegalStateException("scenario roster index was not allocated");
 	}
 
 	public List<AgentRosterEntry> rosterEntries() {

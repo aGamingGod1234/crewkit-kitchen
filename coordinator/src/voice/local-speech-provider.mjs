@@ -176,6 +176,12 @@ export class LocalSpeechProvider {
 		const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
 		lines.on('line', (line) => this.#acceptResponse(line, child, generation));
 		child.stderr.resume();
+		child.stdin.on('error', () => this.#failProcess(
+			typedError('LOCAL_SPEECH_UNAVAILABLE', 'Local speech worker input failed'),
+			child,
+			generation,
+			true,
+		));
 		child.once('error', () => this.#failProcess(typedError('LOCAL_SPEECH_UNAVAILABLE', 'Local speech worker could not start'), child, generation));
 		child.once('close', (code) => this.#failProcess(typedError(
 			'LOCAL_SPEECH_UNAVAILABLE',

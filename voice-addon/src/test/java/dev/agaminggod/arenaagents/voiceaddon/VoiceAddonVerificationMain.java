@@ -19,7 +19,9 @@ public final class VoiceAddonVerificationMain {
 		assertions += VoicechatServerBindingsVerification.verify();
 		assertions += ServerSpeechCaptureRegistryVerification.verify();
 		assertions += VoicePlaybackCoordinatorVerification.verify();
+		assertions += SyntheticPlayerVoiceTransportVerification.verify();
 		assertions += SpeechCaptureEngineVerification.verify();
+		assertions += HumanSpeechCaptureVerification.verify();
 		assertions += VoiceWorkerClientsVerification.verify();
 		assertions += NodeVoiceWorkerIntegrationVerification.verify();
 		System.out.println("PASS: " + assertions + " voice-addon assertions");

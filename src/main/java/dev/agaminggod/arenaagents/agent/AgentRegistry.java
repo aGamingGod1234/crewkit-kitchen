@@ -20,17 +20,19 @@ public final class AgentRegistry {
 	private final int maxAgents;
 	private final int queueLimit;
 	private final Map<AgentId, AgentRecord> records;
+	private final Map<String, AgentId> legacyNameAliases;
 	private final Runnable onChange;
 	private final Consumer<AgentTransition> transitionSink;
 
 	public AgentRegistry(int maxAgents, int queueLimit, Runnable onChange, Consumer<AgentTransition> transitionSink) {
-		this(maxAgents, queueLimit, Map.of(), onChange, transitionSink);
+		this(maxAgents, queueLimit, Map.of(), Map.of(), onChange, transitionSink);
 	}
 
 	private AgentRegistry(
 			int maxAgents,
 			int queueLimit,
 			Map<AgentId, AgentRecord> initialRecords,
+			Map<String, AgentId> initialLegacyNameAliases,
 			Runnable onChange,
 			Consumer<AgentTransition> transitionSink
 	) {
@@ -45,6 +47,8 @@ public final class AgentRegistry {
 				AgentConstants.MAX_CONFIGURED_QUEUE_LIMIT
 		);
 		this.records = new LinkedHashMap<>(Objects.requireNonNull(initialRecords, "initialRecords must not be null"));
+		this.legacyNameAliases = new LinkedHashMap<>(Objects.requireNonNull(
+				initialLegacyNameAliases, "initialLegacyNameAliases must not be null"));
 		if (records.size() > maxAgents) {
 			throw new AgentDomainException("AGENT_LIMIT_EXCEEDED", "Snapshot contains more agents than its configured limit");
 		}
@@ -83,15 +87,25 @@ public final class AgentRegistry {
 				pendingConversationWakeAgents, "pendingConversationWakeAgents must not be null"
 		));
 		LinkedHashMap<AgentId, AgentRecord> recovered = new LinkedHashMap<>();
+		LinkedHashMap<String, AgentId> legacyAliases = new LinkedHashMap<>();
+		ArrayList<String> allocatedNames = new ArrayList<>();
+		boolean publicNamesMigrated = false;
 		for (AgentRecord record : snapshot.records()) {
 			AgentRecord revised = wakeAgents.contains(record.agentId())
 					? recoverConversationWake(record, nowEpochMs)
 					: AgentLifecycleReducer.recoverAfterReload(record, nowEpochMs);
+			AgentProfile recoveredProfile = revised.profile();
+			revised = migratePublicName(revised, allocatedNames, legacyAliases);
+			publicNamesMigrated |= !recoveredProfile.equals(revised.profile());
+			allocatedNames.add(revised.profile().userName().orElseThrow());
 			if (recovered.put(revised.agentId(), revised) != null) {
 				throw new AgentDomainException("DUPLICATE_AGENT_ID", "Duplicate agent ID in snapshot: " + revised.agentId());
 			}
 		}
-		return new AgentRegistry(snapshot.maxAgents(), snapshot.queueLimit(), recovered, onChange, transitionSink);
+		AgentRegistry registry = new AgentRegistry(
+				snapshot.maxAgents(), snapshot.queueLimit(), recovered, legacyAliases, onChange, transitionSink);
+		if (publicNamesMigrated) onChange.run();
+		return registry;
 	}
 
 	private static AgentRecord recoverConversationWake(AgentRecord record, long nowEpochMs) {
@@ -157,20 +171,44 @@ public final class AgentRegistry {
 			AgentGameMode gameMode,
 			long nowEpochMs
 	) {
+		return create(provider, model, reasoning, serviceTier, userName, gameMode, nowEpochMs, List.of());
+	}
+
+	/** Creates an agent while reserving live GameProfile names from the same server namespace. */
+	public synchronized AgentRecord create(
+			String provider,
+			String model,
+			String reasoning,
+			String serviceTier,
+			Optional<String> userName,
+			AgentGameMode gameMode,
+			long nowEpochMs,
+			Collection<String> unavailablePlayerNames
+	) {
 		if (records.size() >= maxAgents) {
 			throw new AgentDomainException("AGENT_LIMIT_REACHED", "Agent limit reached: " + maxAgents);
 		}
 		Optional<String> checkedName = Objects.requireNonNull(userName, "userName must not be null")
 				.map(AgentValidators::requireUserName);
-		checkedName.ifPresent(this::requireUniqueName);
 		AgentId id;
 		do {
 			id = AgentId.random();
 		} while (records.containsKey(id));
-		int skinVariant = Math.floorMod(id.value().hashCode(), AgentConstants.DEFAULT_SKIN_VARIANT_COUNT);
-		AgentProfile profile = new AgentProfile(provider, model, reasoning, serviceTier, checkedName, skinVariant, gameMode);
-		AgentRecord created = AgentRecord.create(id, profile, nowEpochMs);
-		records.put(id, created);
+		AgentId createdId = id;
+		int skinVariant = Math.floorMod(createdId.value().hashCode(), AgentConstants.DEFAULT_SKIN_VARIANT_COUNT);
+		String preferredName = checkedName.orElseGet(() -> AgentIdentity.defaultPublicName(provider, model));
+		ArrayList<String> unavailableNames = new ArrayList<>(allocatedPublicNames());
+		unavailableNames.addAll(Objects.requireNonNull(
+				unavailablePlayerNames, "unavailablePlayerNames must not be null"));
+		String publicName = AgentIdentity.allocatePublicName(preferredName, unavailableNames);
+		AgentProfile profile = new AgentProfile(
+				provider, model, reasoning, serviceTier, Optional.of(publicName), skinVariant, gameMode);
+		AgentRecord created = AgentRecord.create(createdId, profile, nowEpochMs);
+		records.put(createdId, created);
+		AgentIdentity.legacyPlayerNames(createdId, profile)
+				.forEach(name -> registerLegacyAlias(name, createdId));
+		checkedName.filter(name -> !AgentIdentity.sameIdentity(name, publicName))
+				.ifPresent(name -> registerLegacyAlias(name, createdId));
 		onChange.run();
 		return created;
 	}
@@ -485,6 +523,7 @@ public final class AgentRegistry {
 		if (removed == null) {
 			throw new AgentDomainException("AGENT_NOT_FOUND", "Unknown agent: " + id);
 		}
+		legacyNameAliases.values().removeIf(id::equals);
 		onChange.run();
 		return removed;
 	}
@@ -519,6 +558,10 @@ public final class AgentRegistry {
 						|| record.profile().userName().map(name -> name.toLowerCase(Locale.ROOT).equals(folded)).orElse(false))
 				.toList();
 		if (matches.isEmpty()) {
+			AgentId alias = legacyNameAliases.get(folded);
+			if (alias != null) return require(alias);
+		}
+		if (matches.isEmpty()) {
 			throw new AgentDomainException("AGENT_NOT_FOUND", "Unknown agent: " + checked);
 		}
 		if (matches.size() > 1) {
@@ -539,6 +582,7 @@ public final class AgentRegistry {
 			selectors.add(record.agentId().shortValue());
 			record.profile().userName().ifPresent(selectors::add);
 		}
+		selectors.addAll(legacyNameAliases.keySet());
 		return List.copyOf(selectors);
 	}
 
@@ -564,20 +608,54 @@ public final class AgentRegistry {
 		return transition;
 	}
 
-	private void requireUniqueName(String proposedName) {
-		String folded = proposedName.toLowerCase(Locale.ROOT);
-		boolean duplicate = records.values().stream()
+	private List<String> allocatedPublicNames() {
+		return records.values().stream()
+				.map(record -> record.profile().userName().orElseGet(() ->
+						AgentIdentity.defaultPublicName(record.profile().provider(), record.profile().model())))
+				.toList();
+	}
+
+	private void registerLegacyAlias(String alias, AgentId id) {
+		String folded = alias.toLowerCase(Locale.ROOT);
+		boolean publicNameOwnsAlias = records.values().stream()
 				.flatMap(record -> record.profile().userName().stream())
-				.anyMatch(existing -> existing.toLowerCase(Locale.ROOT).equals(folded));
-		if (duplicate) {
-			throw new AgentDomainException("DUPLICATE_AGENT_NAME", "Agent name is already in use: " + proposedName);
+				.anyMatch(name -> name.equalsIgnoreCase(alias));
+		if (!publicNameOwnsAlias) legacyNameAliases.putIfAbsent(folded, id);
+	}
+
+	private static AgentRecord migratePublicName(
+			AgentRecord record,
+			Collection<String> allocatedNames,
+			Map<String, AgentId> legacyAliases
+	) {
+		AgentProfile profile = record.profile();
+		String previous = profile.userName().orElseGet(() ->
+				AgentIdentity.defaultPublicName(profile.provider(), profile.model()));
+		String canonical = AgentIdentity.allocatePublicName(previous, allocatedNames);
+		if (!previous.equals(canonical)) {
+			legacyAliases.putIfAbsent(previous.toLowerCase(Locale.ROOT), record.agentId());
 		}
+		AgentProfile migratedProfile = new AgentProfile(
+				profile.provider(), profile.model(), profile.reasoning(), profile.serviceTier(), Optional.of(canonical),
+				profile.skinVariant(), profile.gameMode());
+		AgentIdentity.legacyPlayerNames(record.agentId(), migratedProfile)
+				.forEach(name -> legacyAliases.putIfAbsent(name.toLowerCase(Locale.ROOT), record.agentId()));
+		if (profile.userName().filter(canonical::equals).isPresent()) return record;
+		return new AgentRecord(
+				record.schemaVersion(), record.agentId(), record.entityUuid(), record.entityLocation(), migratedProfile,
+				record.state(), record.resumeAfterRespawn(), record.currentGoal(), record.goalRevision(),
+				record.queuedGoals(), record.lastSummary(), record.inventorySnapshot(), record.automaticProgress(),
+				record.respawnPolicy(), record.deathSnapshot(), record.createdAtEpochMs(), record.updatedAtEpochMs(),
+				record.lastError());
 	}
 
 	private static void validateUniqueNames(Collection<AgentRecord> records) {
 		ArrayList<String> names = new ArrayList<>();
 		for (AgentRecord record : records) {
 			record.profile().userName().ifPresent(name -> {
+				if (!AgentIdentity.isPublicName(name)) {
+					throw new AgentDomainException("INVALID_AGENT_NAME", "Agent public name is not Minecraft-safe: " + name);
+				}
 				String folded = name.toLowerCase(Locale.ROOT);
 				if (names.contains(folded)) {
 					throw new AgentDomainException("DUPLICATE_AGENT_NAME", "Duplicate agent name in snapshot: " + name);

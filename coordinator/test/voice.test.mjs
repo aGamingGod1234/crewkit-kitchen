@@ -122,6 +122,73 @@ test('loopback voice worker authenticates, caches, and emits 48 kHz PCM', async 
 	}
 });
 
+test('Fish provider identifies a rejected credential without exposing response details', async () => {
+	const provider = new FishTtsProvider({
+		apiKey: 'secret-test-token',
+		fetchImpl: async () => new Response('credential details must stay private', { status: 401 }),
+	});
+	await assert.rejects(
+		provider.synthesize({ text: 'Hello', voiceId: 'voice-id' }),
+		(error) => error?.code === 'TTS_AUTHENTICATION_FAILED'
+			&& error.message === 'Fish TTS failed with HTTP 401'
+			&& !error.message.includes('credential details'),
+	);
+});
+
+test('TTS responses expose the effective synthesizer namespace instead of profile metadata', async () => {
+	let calls = 0;
+	const diagnostics = [];
+	const provider = {
+		cacheNamespace: () => 'fish/s2.1-pro-free',
+		async synthesize() {
+			calls += 1;
+			return { sampleRateHz: 48_000, channels: 1, sampleFormat: 's16le', pcm: Buffer.alloc(960, 1) };
+		},
+	};
+	const worker = createVoiceHttpServer({
+		provider,
+		profileStore: new VoiceProfileStore(),
+		secret: VOICE_TEST_SECRET,
+		cache: new TtsCache({ maxBytes: 1024 * 1024 }),
+		port: 0,
+		onDiagnostic: (event) => diagnostics.push(event),
+	});
+	const address = await worker.start();
+	const body = JSON.stringify({
+		agentId: AGENT_ONE,
+		text: 'Report the real synthesizer.',
+		profileId: 'voice.auto.v1',
+		radius: 48,
+		conversationSequence: 1,
+	});
+	try {
+		for (let index = 0; index < 2; index++) {
+			const response = await fetch(`http://127.0.0.1:${address.port}/v1/tts`, {
+				method: 'POST',
+				headers: {
+					...createVoiceRequestHeaders({ secret: VOICE_TEST_SECRET, path: '/v1/tts' }),
+					'Content-Type': 'application/json',
+				},
+				body,
+			});
+			assert.equal(response.status, 200);
+			assert.equal(response.headers.get('x-voice-synthesizer'), 'fish/s2.1-pro-free');
+			await response.arrayBuffer();
+		}
+		assert.equal(calls, 1, 'the cached response preserves the completed synthesizer identity');
+		assert.equal(
+			worker.statusSnapshots().find(({ component }) => component === 'voice:tts').effectiveProvider,
+			'fish/s2.1-pro-free',
+		);
+		assert.deepEqual(diagnostics, [{
+			code: 'VOICE_TTS_EFFECTIVE_PROVIDER',
+			effectiveProvider: 'fish/s2.1-pro-free',
+		}]);
+	} finally {
+		await worker.close();
+	}
+});
+
 test('Deepgram provider sends bounded linear PCM and returns only the final transcript', async () => {
 	let captured;
 	const provider = new DeepgramSttProvider({

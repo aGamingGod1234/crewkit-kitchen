@@ -29,6 +29,14 @@ final class SpeechCaptureEngineVerification {
 		assertions += verifyProductionSpeechEndpointFlushesWithinBudget();
 		assertions += verifyAdaptiveEndpointShortensEstablishedUtterances();
 		assertions += verifyInputLatencyReportsOneCompletedUtterance();
+		assertions += verifySuccessfulInputActivityLifecycle();
+		assertions += verifyBlankAndFailedInputActivityLifecycles();
+		assertions += verifyDecodedSilenceDoesNotStartSpeech();
+		assertions += verifyMidUtteranceQuietFramesAreRetained();
+		assertions += verifySparseFrameNoiseDoesNotStartSpeech();
+		assertions += verifyOpusSilenceArtifactDoesNotStartSpeech();
+		assertions += verifyHungTranscriptionTimesOutAndReleasesPlayer();
+		assertions += verifyThrowingInputObserverCannotInterruptDelivery();
 		assertions += verifySilenceFlushesOneOrderedUtterance();
 		assertions += verifyDeliveryContextIsCapturedAtUtteranceStart();
 		assertions += verifyCanceledRunningSilenceTimerCannotFinishNewerAudio();
@@ -53,6 +61,256 @@ final class SpeechCaptureEngineVerification {
 		assertions += verifyCloseDiscardsPartialSpeechAndClosesDecoder();
 		assertions += verifyCloseContinuesAfterDecoderCloseFailure();
 		return assertions;
+	}
+
+	private static int verifySuccessfulInputActivityLifecycle() {
+		List<SpeechCaptureEngine.InputActivity> activity = new ArrayList<>();
+		SpeechCaptureEngine engine = new SpeechCaptureEngine(
+				(playerId, sequence, whispering, samples) -> CompletableFuture.completedFuture(
+						new SpeechWorkerClient.Transcript("hello", 0.9D)
+				),
+				scheduler(), 5_000L, 5_000L, 1, 1, ignored -> { }, activity::add, System::nanoTime
+		);
+		engine.accept(PLAYER, false, new byte[] { 1 }, RecordingDecoder::new, Runnable::run,
+				(playerId, text, whispering) -> { });
+		assertEquals(
+				List.of(
+						SpeechCaptureEngine.InputActivity.Phase.RECEIVED,
+						SpeechCaptureEngine.InputActivity.Phase.PROCESSING,
+						SpeechCaptureEngine.InputActivity.Phase.RECOGNIZED
+				),
+				activity.stream().map(SpeechCaptureEngine.InputActivity::phase).toList(),
+				"one successful utterance reports truthful input phases once"
+		);
+		assertEquals(List.of(1L, 1L, 1L),
+				activity.stream().map(SpeechCaptureEngine.InputActivity::utteranceSequence).toList(),
+				"input phases retain the utterance identity");
+		engine.close();
+		return 2;
+	}
+
+	private static int verifyBlankAndFailedInputActivityLifecycles() {
+		List<SpeechCaptureEngine.InputActivity> blankActivity = new ArrayList<>();
+		SpeechCaptureEngine blank = new SpeechCaptureEngine(
+				(playerId, sequence, whispering, samples) -> CompletableFuture.completedFuture(
+						new SpeechWorkerClient.Transcript(" ", 0.1D)
+				),
+				scheduler(), 5_000L, 5_000L, 1, 1, ignored -> { }, blankActivity::add, System::nanoTime
+		);
+		blank.accept(PLAYER, false, new byte[] { 1 }, RecordingDecoder::new, Runnable::run,
+				(playerId, text, whispering) -> { });
+		assertEquals(
+				List.of(
+						SpeechCaptureEngine.InputActivity.Phase.RECEIVED,
+						SpeechCaptureEngine.InputActivity.Phase.PROCESSING,
+						SpeechCaptureEngine.InputActivity.Phase.NO_SPEECH
+				),
+				blankActivity.stream().map(SpeechCaptureEngine.InputActivity::phase).toList(),
+				"blank recognition reports no speech instead of a false delivery"
+		);
+		blank.close();
+
+		List<SpeechCaptureEngine.InputActivity> failedActivity = new ArrayList<>();
+		SpeechCaptureEngine failed = new SpeechCaptureEngine(
+				(playerId, sequence, whispering, samples) -> CompletableFuture.failedFuture(
+						new VoiceWorkerClient.VoiceWorkerException("STT_UNAVAILABLE", "private provider detail")
+				),
+				scheduler(), 5_000L, 5_000L, 1, 1, ignored -> { }, failedActivity::add, System::nanoTime
+		);
+		failed.accept(PLAYER, false, new byte[] { 1 }, RecordingDecoder::new, Runnable::run,
+				(playerId, text, whispering) -> { });
+		assertEquals(
+				List.of(
+						SpeechCaptureEngine.InputActivity.Phase.RECEIVED,
+						SpeechCaptureEngine.InputActivity.Phase.PROCESSING,
+						SpeechCaptureEngine.InputActivity.Phase.FAILED
+				),
+				failedActivity.stream().map(SpeechCaptureEngine.InputActivity::phase).toList(),
+				"failed recognition reports one safe terminal input phase"
+		);
+		failed.close();
+		return 2;
+	}
+
+	private static int verifyDecodedSilenceDoesNotStartSpeech() {
+		RecordingTranscriber transcriber = new RecordingTranscriber();
+		List<SpeechCaptureEngine.InputActivity> activity = new ArrayList<>();
+		int[] deliveryContexts = { 0 };
+		SpeechCaptureEngine engine = new SpeechCaptureEngine(
+				transcriber, scheduler(), 5_000L, 5_000L, 1, 960, ignored -> { }, activity::add,
+				System::nanoTime
+		);
+		PcmDecoder encodedSilence = new PcmDecoder(new short[960]);
+		engine.accept(PLAYER, false, new byte[] { 1 }, () -> encodedSilence, Runnable::run,
+				(playerId, sequence) -> {
+					deliveryContexts[0]++;
+					return (ignoredPlayer, ignoredText, ignoredWhispering) -> { };
+				});
+		assertEquals(0, deliveryContexts[0], "PCM silence creates no delivery context");
+		assertEquals(0, transcriber.captured.size(), "PCM silence never reaches STT");
+		assertEquals(List.of(), activity, "PCM silence reports no speech activity");
+		assertEquals(true, encodedSilence.closed, "PCM silence closes its transient decoder");
+
+		PcmDecoder codecSilenceArtifact = new PcmDecoder(repeatedSamples(960, 2));
+		engine.accept(PLAYER, false, new byte[] { 2 }, () -> codecSilenceArtifact, Runnable::run,
+				(playerId, sequence) -> {
+					deliveryContexts[0]++;
+					return (ignoredPlayer, ignoredText, ignoredWhispering) -> { };
+				});
+		assertEquals(0, deliveryContexts[0], "codec silence artifact creates no delivery context");
+		assertEquals(0, transcriber.captured.size(), "codec silence artifact never reaches STT");
+		assertEquals(true, codecSilenceArtifact.closed, "codec silence artifact closes its transient decoder");
+
+		PcmDecoder speech = new PcmDecoder(repeatedSamples(960, 1_000));
+		engine.accept(PLAYER, false, new byte[] { 3 }, () -> speech, Runnable::run,
+				(playerId, sequence) -> {
+					deliveryContexts[0]++;
+					return (ignoredPlayer, ignoredText, ignoredWhispering) -> { };
+				});
+		assertEquals(1, deliveryContexts[0], "speech creates exactly one delivery context after silence");
+		assertEquals(1, transcriber.captured.size(), "speech after silence reaches STT once");
+		assertEquals(1L, transcriber.captured.getFirst().sequence,
+				"silence does not consume an utterance sequence");
+		assertEquals(List.of(
+				SpeechCaptureEngine.InputActivity.Phase.RECEIVED,
+				SpeechCaptureEngine.InputActivity.Phase.PROCESSING,
+				SpeechCaptureEngine.InputActivity.Phase.RECOGNIZED
+		), activity.stream().map(SpeechCaptureEngine.InputActivity::phase).toList(),
+				"speech after silence starts a truthful lifecycle");
+		assertEquals(true, speech.closed, "speech decoder closes after reaching its sample cap");
+		engine.close();
+		return 10;
+	}
+
+	private static int verifyMidUtteranceQuietFramesAreRetained() {
+		RecordingTranscriber transcriber = new RecordingTranscriber();
+		ManualScheduledExecutor scheduler = new ManualScheduledExecutor();
+		short[] speech = repeatedSamples(960, 1_000);
+		short[] quiet = repeatedSamples(960, 2);
+		SequenceDecoder decoder = new SequenceDecoder(speech, quiet);
+		SpeechCaptureEngine engine = new SpeechCaptureEngine(
+				transcriber, scheduler, 20L, 20L, 1, 4_096, ignored -> { }
+		);
+		engine.accept(PLAYER, false, new byte[] { 1 }, () -> decoder, Runnable::run,
+				(playerId, text, whispering) -> { });
+		engine.accept(PLAYER, false, new byte[] { 2 }, () -> {
+			throw new AssertionError("mid-utterance packets must keep the started decoder");
+		}, Runnable::run, (playerId, text, whispering) -> { });
+		assertEquals(0, transcriber.captured.size(), "quiet frames keep the utterance open until endpointing");
+		assertEquals(true, scheduler.tasks.get(0).isCancelled(), "a later quiet frame refreshes endpointing");
+		scheduler.runEvenIfCancelled(1);
+		assertEquals(1, transcriber.captured.size(), "endpointing transcribes the complete utterance once");
+		short[] captured = transcriber.captured.getFirst().samples;
+		assertEquals(1_920, captured.length, "mid-utterance quiet frames remain in the captured PCM");
+		assertEquals(true, Arrays.equals(speech, Arrays.copyOfRange(captured, 0, 960)),
+				"the utterance still starts with the speech frame");
+		assertEquals(true, Arrays.equals(quiet, Arrays.copyOfRange(captured, 960, 1_920)),
+				"internal quiet frames are not dropped before STT");
+		engine.close();
+		return 6;
+	}
+
+	private static int verifyHungTranscriptionTimesOutAndReleasesPlayer() {
+		ManualScheduledExecutor scheduler = new ManualScheduledExecutor();
+		List<NonCancellableFuture<SpeechWorkerClient.Transcript>> requests = new ArrayList<>();
+		List<SpeechCaptureEngine.InputActivity> activity = new ArrayList<>();
+		SpeechCaptureEngine engine = new SpeechCaptureEngine(
+				(playerId, sequence, whispering, samples) -> {
+					NonCancellableFuture<SpeechWorkerClient.Transcript> request = new NonCancellableFuture<>();
+					requests.add(request);
+					return request;
+				},
+				scheduler, 5_000L, 5_000L, 1, 1, ignored -> { }, activity::add, System::nanoTime, 10L
+		);
+		engine.accept(PLAYER, false, new byte[] { 1 }, RecordingDecoder::new, Runnable::run,
+				(playerId, text, whispering) -> { });
+		scheduler.runEvenIfCancelled(0);
+		assertEquals(1, requests.size(), "one speech request is submitted");
+		engine.accept(PLAYER, true, new byte[] { 2 }, RecordingDecoder::new, Runnable::run,
+				(playerId, text, whispering) -> { });
+		assertEquals(1, requests.size(), "a successor waits behind the active speech request");
+
+		/* Task 1 is the deadline scheduled by the first completed utterance. */
+		scheduler.runEvenIfCancelled(1);
+		assertEquals(true, requests.getFirst().cancellationAttempted,
+				"the transcription deadline cancels the underlying request");
+		assertEquals(2, requests.size(), "the timeout releases the player for its pending successor");
+		assertEquals(List.of(
+				SpeechCaptureEngine.InputActivity.Phase.RECEIVED,
+				SpeechCaptureEngine.InputActivity.Phase.PROCESSING,
+				SpeechCaptureEngine.InputActivity.Phase.RECEIVED,
+				SpeechCaptureEngine.InputActivity.Phase.FAILED,
+				SpeechCaptureEngine.InputActivity.Phase.PROCESSING
+		), activity.stream().map(SpeechCaptureEngine.InputActivity::phase).toList(),
+				"a hung request reaches a bounded terminal phase and unblocks later speech");
+		engine.close();
+		return 5;
+	}
+
+	private static int verifySparseFrameNoiseDoesNotStartSpeech() {
+		RecordingTranscriber transcriber = new RecordingTranscriber();
+		List<SpeechCaptureEngine.InputActivity> activity = new ArrayList<>();
+		short[] sparseSamples = new short[960];
+		sparseSamples[480] = Short.MAX_VALUE;
+		PcmDecoder sparseNoise = new PcmDecoder(sparseSamples);
+		SpeechCaptureEngine engine = new SpeechCaptureEngine(
+				transcriber, scheduler(), 5_000L, 5_000L, 1, 960, ignored -> { }, activity::add,
+				System::nanoTime
+		);
+		int[] deliveryContexts = { 0 };
+		engine.accept(PLAYER, false, new byte[] { 1 }, () -> sparseNoise, Runnable::run,
+				(playerId, sequence) -> {
+					deliveryContexts[0]++;
+					return (ignoredPlayer, ignoredText, ignoredWhispering) -> { };
+				});
+		assertEquals(false, DecodedPcmSpeechDetector.hasSpeech(sparseSamples),
+				"a single full-scale sample is not a speech frame");
+		assertEquals(true, DecodedPcmSpeechDetector.hasSpeech(repeatedSamples(960, 110)),
+				"a sustained quiet frame remains eligible for speech recognition");
+		assertEquals(0, deliveryContexts[0], "sparse frame noise creates no delivery context");
+		assertEquals(0, transcriber.captured.size(), "sparse frame noise never reaches STT");
+		assertEquals(List.of(), activity, "sparse frame noise reports no speech activity");
+		assertEquals(true, sparseNoise.closed, "sparse frame noise closes its transient decoder");
+		engine.close();
+		return 4;
+	}
+
+	private static int verifyOpusSilenceArtifactDoesNotStartSpeech() {
+		RecordingTranscriber transcriber = new RecordingTranscriber();
+		List<SpeechCaptureEngine.InputActivity> activity = new ArrayList<>();
+		/* Actual Opus encoding of a 960-sample zero frame decodes to this tiny codec artifact. */
+		short[] decodedSilence = repeatedSamples(960, 2);
+		PcmDecoder frameDecoder = new PcmDecoder(decodedSilence);
+		SpeechCaptureEngine engine = new SpeechCaptureEngine(
+				transcriber, scheduler(), 5_000L, 5_000L, 1, decodedSilence.length, ignored -> { }, activity::add,
+				System::nanoTime
+		);
+		engine.accept(PLAYER, false, new byte[] { 1 }, () -> frameDecoder, Runnable::run,
+				(playerId, sequence) -> (ignoredPlayer, ignoredText, ignoredWhispering) -> { });
+		assertEquals(false, DecodedPcmSpeechDetector.hasSpeech(decodedSilence),
+				"actual Opus-encoded silence is rejected at the decoded PCM boundary");
+		assertEquals(0, transcriber.captured.size(), "actual Opus silence never reaches STT");
+		assertEquals(List.of(), activity, "actual Opus silence reports no speech activity");
+		assertEquals(true, frameDecoder.closed, "actual Opus silence closes its transient decoder");
+		engine.close();
+		return 4;
+	}
+
+	private static int verifyThrowingInputObserverCannotInterruptDelivery() {
+		int[] deliveries = { 0 };
+		SpeechCaptureEngine engine = new SpeechCaptureEngine(
+				(playerId, sequence, whispering, samples) -> CompletableFuture.completedFuture(
+						new SpeechWorkerClient.Transcript("still delivered", 0.9D)
+				),
+				scheduler(), 5_000L, 5_000L, 1, 1, ignored -> { }, ignored -> {
+					throw new IllegalStateException("observer failure");
+				}, System::nanoTime
+		);
+		engine.accept(PLAYER, false, new byte[] { 1 }, RecordingDecoder::new, Runnable::run,
+				(playerId, text, whispering) -> deliveries[0]++);
+		assertEquals(1, deliveries[0], "operator diagnostics cannot interrupt transcript delivery");
+		engine.close();
+		return 1;
 	}
 
 	private static int verifyWhisperChangeFlushesBeforeReplacementFailure() {
@@ -80,7 +338,7 @@ final class SpeechCaptureEngineVerification {
 		List<String> listeners = new ArrayList<>(List.of("near-at-speech-time"));
 		List<List<String>> deliveredTo = new ArrayList<>();
 		int[] contextCaptures = { 0 };
-		SpeechCaptureEngine.TranscriptDeliveryFactory deliveryFactory = () -> {
+		SpeechCaptureEngine.TranscriptDeliveryFactory deliveryFactory = (capturedPlayerId, utteranceSequence) -> {
 			contextCaptures[0]++;
 			List<String> capturedListeners = List.copyOf(listeners);
 			return (playerId, transcript, whispering) -> deliveredTo.add(capturedListeners);
@@ -763,6 +1021,12 @@ final class SpeechCaptureEngineVerification {
 		return decoder;
 	}
 
+	private static short[] repeatedSamples(int length, int value) {
+		short[] samples = new short[length];
+		Arrays.fill(samples, (short) value);
+		return samples;
+	}
+
 	private static void assertEquals(Object expected, Object actual, String message) {
 		if (!java.util.Objects.equals(expected, actual)) {
 			throw new AssertionError(message + ": expected=" + expected + ", actual=" + actual);
@@ -838,6 +1102,42 @@ final class SpeechCaptureEngineVerification {
 			closed = true;
 			if (closeAttempted != null) closeAttempted.countDown();
 			if (closeFailure != null) throw closeFailure;
+		}
+	}
+
+	private static final class SequenceDecoder implements SpeechCaptureEngine.Decoder {
+		private final Queue<short[]> frames;
+
+		private SequenceDecoder(short[]... frames) {
+			this.frames = new ArrayDeque<>(List.of(frames));
+		}
+
+		@Override
+		public short[] decode(byte[] opus) {
+			return frames.remove().clone();
+		}
+
+		@Override
+		public void close() {
+		}
+	}
+
+	private static final class PcmDecoder implements SpeechCaptureEngine.Decoder {
+		private final short[] decoded;
+		private boolean closed;
+
+		private PcmDecoder(short[] decoded) {
+			this.decoded = decoded.clone();
+		}
+
+		@Override
+		public short[] decode(byte[] opus) {
+			return decoded.clone();
+		}
+
+		@Override
+		public void close() {
+			closed = true;
 		}
 	}
 

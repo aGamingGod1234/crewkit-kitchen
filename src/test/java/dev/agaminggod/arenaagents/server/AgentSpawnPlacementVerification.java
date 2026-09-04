@@ -46,9 +46,8 @@ public final class AgentSpawnPlacementVerification {
 		if (!playerName.equals(OfflineAgentPlayers.playerName(id, profile))) {
 			throw new AssertionError("offline agent username is not stable: " + playerName);
 		}
-		if (!AgentIdentity.skinForPlayerName(playerName).orElseThrow()
-				.equals(new AgentIdentity.SkinIdentity("codex", "sol", 0))) {
-			throw new AssertionError("offline agent username lost its manifest transport identity: " + playerName);
+		if (AgentIdentity.skinForPlayerName(playerName).isPresent()) {
+			throw new AssertionError("public player name must not impersonate the legacy skin transport: " + playerName);
 		}
 		return 13;
 	}

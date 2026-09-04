@@ -57,12 +57,14 @@ test('Minecraft control reference covers every executor tool and action with acc
 
 test('native Minecraft tools expose the common fast path plus one validated advanced body operation', () => {
 	assert.deepEqual(MINECRAFT_DYNAMIC_TOOLS.map((tool) => tool.name), [
-		'observe', 'control', 'moveTo', 'mine', 'say', 'wait', 'act', 'sequence', 'finish',
+		'observe', 'lookAround', 'control', 'moveTo', 'mine', 'say', 'wait', 'act', 'sequence', 'finish',
 	]);
 	assert.ok(MINECRAFT_DYNAMIC_TOOLS.every((tool) => tool.type === 'function'));
 	assert.ok(NATIVE_AGENT_INSTRUCTIONS.length < 1_500);
 	assert.match(NATIVE_AGENT_INSTRUCTIONS, /Act as soon as it is safe/i);
+	assert.match(MINECRAFT_DYNAMIC_TOOLS.find((tool) => tool.name === 'sequence').description, /Prefer sequence for safe 2\+ action chains/i);
 	assert.match(NATIVE_AGENT_INSTRUCTIONS, /speech playback is asynchronous/i);
+	assert.match(NATIVE_AGENT_INSTRUCTIONS, /visible landmarks/i);
 });
 
 test('advertised native actions exactly match Java model-authored dispatch', async () => {
@@ -91,11 +93,16 @@ test('native Minecraft tool calls normalize to exact existing body actions', () 
 		kind: 'action', actionType: 'control',
 		arguments: { forward: 1, strafe: -0.5, jump: true, sneak: false, sprint: true, attack: false, use: true, yaw: 90, pitch: -15, selectedSlot: 2, hand: 'off', ticks: 20 },
 	});
+	assert.deepEqual(normalizeMinecraftToolCall('lookAround', {
+		centerYaw: 170, pitch: 0, steps: 4, ticksPerStep: 3,
+	}), {
+		kind: 'lookAround', centerYaw: 170, pitch: 0, steps: 4, ticksPerStep: 3,
+	});
 	assert.deepEqual(normalizeMinecraftToolCall('moveTo', { x: 1, y: 64, z: -2 }), {
 		kind: 'action', actionType: 'navigate_to', arguments: { x: 1, y: 64, z: -2, tolerance: 1, sprint: true, timeoutMs: 30_000 },
 	});
-	assert.deepEqual(normalizeMinecraftToolCall('mine', { x: 2, y: 63, z: 4 }), {
-		kind: 'action', actionType: 'break_block', arguments: { x: 2, y: 63, z: 4, timeoutMs: 15_000 },
+	assert.deepEqual(normalizeMinecraftToolCall('mine', { x: 2, y: 63, z: 4, expectedBlockId: 'minecraft:stone' }), {
+		kind: 'action', actionType: 'break_block', arguments: { x: 2, y: 63, z: 4, expectedBlockId: 'minecraft:stone', timeoutMs: 15_000 },
 	});
 	assert.deepEqual(normalizeMinecraftToolCall('say', { message: 'hi', recipientId: 'agent-b' }), {
 		kind: 'action', actionType: 'chat', arguments: { message: 'hi', audience: 'direct', recipientId: 'agent-b' },
@@ -125,13 +132,13 @@ test('native Minecraft tool calls normalize to exact existing body actions', () 
 	assert.deepEqual(normalizeMinecraftToolCall('sequence', {
 		actions: [
 			{ actionType: 'navigate_to', arguments: { x: 2, y: 64, z: 1 } },
-			{ actionType: 'break_block', arguments: { x: 2, y: 64, z: 1 } },
+			{ actionType: 'break_block', arguments: { x: 2, y: 64, z: 1, expectedBlockId: 'minecraft:stone' } },
 		],
 	}), {
 		kind: 'sequence',
 		actions: [
 			{ actionType: 'navigate_to', arguments: { x: 2, y: 64, z: 1, tolerance: 1, sprint: true, timeoutMs: 30_000 } },
-			{ actionType: 'break_block', arguments: { x: 2, y: 64, z: 1, timeoutMs: 15_000 } },
+			{ actionType: 'break_block', arguments: { x: 2, y: 64, z: 1, expectedBlockId: 'minecraft:stone', timeoutMs: 15_000 } },
 		],
 	});
 });
@@ -139,7 +146,9 @@ test('native Minecraft tool calls normalize to exact existing body actions', () 
 test('native Minecraft boundary rejects unknown, oversized, and malformed calls', () => {
 	assert.throws(() => normalizeMinecraftToolCall('attack', {}), (error) => error?.code === 'UNKNOWN_MINECRAFT_TOOL');
 	assert.throws(() => normalizeMinecraftToolCall('moveTo', { x: '1', y: 2, z: 3 }), (error) => error?.code === 'INVALID_MINECRAFT_TOOL_ARGUMENTS');
+	assert.throws(() => normalizeMinecraftToolCall('mine', { x: 1, y: 64, z: 2 }), (error) => error?.code === 'INVALID_MINECRAFT_TOOL_ARGUMENTS');
 	assert.throws(() => normalizeMinecraftToolCall('control', { forward: 1 }), (error) => error?.code === 'INVALID_MINECRAFT_TOOL_ARGUMENTS');
+	assert.throws(() => normalizeMinecraftToolCall('lookAround', { centerYaw: 0, pitch: 0, steps: 1, ticksPerStep: 3 }), (error) => error?.code === 'INVALID_MINECRAFT_TOOL_ARGUMENTS');
 	assert.throws(() => normalizeMinecraftToolCall('say', { message: 'x'.repeat(257) }), (error) => error?.code === 'INVALID_MINECRAFT_TOOL_ARGUMENTS');
 	assert.throws(() => normalizeMinecraftToolCall('say', { message: 'hi', audience: 'direct' }), (error) => error?.code === 'INVALID_MINECRAFT_TOOL_ARGUMENTS');
 	assert.throws(() => normalizeMinecraftToolCall('say', { message: 'hi', audience: 'proximity', recipientId: 'agent-b' }), (error) => error?.code === 'INVALID_MINECRAFT_TOOL_ARGUMENTS');
@@ -161,4 +170,19 @@ test('tool results are compact deterministic inputText content', () => {
 	});
 	assert.match(toolResultContent({ detail: 'x'.repeat(20_000) }).contentItems[0].text, /TRUNCATED/);
 	assert.equal(toolResultContent({ detail: 'x'.repeat(20_000) }).contentItems[0].text.length <= 16_384, true);
+});
+
+test('oversized sequence results retain every authoritative step status', () => {
+	const content = toolResultContent({
+		state: 'SUCCEEDED', completed: 8,
+		results: Array.from({ length: 8 }, (_, index) => ({
+			actionType: 'break_block', state: 'SUCCEEDED', reasonCode: `STEP_${index + 1}`,
+			actionObservation: { detail: 'x'.repeat(8_000), step: index + 1 },
+		})),
+	});
+	assert.equal(content.contentItems[0].text.length <= 16_384, true);
+	const result = JSON.parse(content.contentItems[0].text);
+	assert.equal(result.state, 'SUCCEEDED');
+	assert.equal(result.results.length, 8);
+	assert.deepEqual(result.results.map(({ state, reasonCode }) => ({ state, reasonCode })), Array.from({ length: 8 }, (_, index) => ({ state: 'SUCCEEDED', reasonCode: `STEP_${index + 1}` })));
 });

@@ -14,7 +14,7 @@ const MAX_EVIDENCE_TAIL_BYTES = 262_144;
 const MAX_SCENARIOS = 24;
 const MAX_MATRIX_REPORT_BYTES = 262_144;
 const POLL_INTERVAL_MS = 50;
-const SCENARIO_KEYS = new Set(['id', 'provider', 'model', 'reasoningEffort', 'serviceTier', 'task', 'timeoutMs', 'rosterSize', 'assert', 'assertions', 'repetitions', 'planningTimeoutMs', 'scenarioTimeoutMs', 'requireFactualSuccess']);
+const SCENARIO_KEYS = new Set(['id', 'provider', 'model', 'reasoningEffort', 'serviceTier', 'task', 'timeoutMs', 'rosterSize', 'assert', 'assertions', 'repetitions', 'planningTimeoutMs', 'scenarioTimeoutMs', 'requireFactualSuccess', 'setupBlocks']);
 const ASSERTION_KEYS = {
 	lifecycle: new Set(['type', 'state']),
 	chat: new Set(['type', 'message']),
@@ -78,6 +78,17 @@ function normalizeAssertion(value, index) {
 	return freeze(result);
 }
 
+function normalizeSetupBlock(value, index) {
+	const field = `setupBlocks[${index}]`;
+	exactKeys(value, new Set(['x', 'y', 'z', 'blockId']), field);
+	for (const coordinate of ['x', 'y', 'z']) {
+		if (!Number.isSafeInteger(value?.[coordinate]) || Math.abs(value[coordinate]) > 30_000_000) throw new RangeError(`${field}.${coordinate} must be a bounded integer`);
+	}
+	const blockId = text(value.blockId, `${field}.blockId`);
+	if (!/^[a-z0-9_.-]+:[a-z0-9_./-]+$/.test(blockId) || blockId === 'minecraft:air') throw new TypeError(`${field}.blockId must be a non-air namespaced block ID`);
+	return freeze({ x: value.x, y: value.y, z: value.z, blockId });
+}
+
 export function normalizeHeadlessScenario(value, index = 0) {
 	exactKeys(value, SCENARIO_KEYS, `scenarios[${index}]`);
 	if (typeof value?.id !== 'string' || /[\\/\u0000-\u001f\u007f]/.test(value.id) || value.id.includes('..')) throw new TypeError(`scenarios[${index}].id must be a safe path segment`);
@@ -88,6 +99,7 @@ export function normalizeHeadlessScenario(value, index = 0) {
 	if (!Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_TIMEOUT_MS) throw new RangeError('timeoutMs must be between 1 and 900000');
 	const rosterSize = value.rosterSize ?? 1;
 	if (![1, 8, 16].includes(rosterSize)) throw new RangeError('rosterSize must be one of 1, 8, or 16');
+	if (value.setupBlocks !== undefined && (!Array.isArray(value.setupBlocks) || value.setupBlocks.length === 0 || value.setupBlocks.length > 32)) throw new RangeError('setupBlocks must contain between 1 and 32 blocks');
 	const scenario = {
 		id: text(value.id, `scenarios[${index}].id`), provider: text(value.provider, `scenarios[${index}].provider`),
 		model: text(value.model, `scenarios[${index}].model`), reasoningEffort: text(value.reasoningEffort, `scenarios[${index}].reasoningEffort`),
@@ -96,6 +108,7 @@ export function normalizeHeadlessScenario(value, index = 0) {
 		planningTimeoutMs: value.planningTimeoutMs === undefined ? null : boundedPositiveInteger(value.planningTimeoutMs, `scenarios[${index}].planningTimeoutMs`),
 		scenarioTimeoutMs: value.scenarioTimeoutMs === undefined ? timeoutMs : boundedPositiveInteger(value.scenarioTimeoutMs, `scenarios[${index}].scenarioTimeoutMs`),
 		requireFactualSuccess: value.requireFactualSuccess === true,
+		setupBlocks: (value.setupBlocks ?? []).map(normalizeSetupBlock),
 		assertions: assertions.map(normalizeAssertion),
 	};
 	if (scenario.repetitions > 32) throw new RangeError(`scenarios[${index}].repetitions must not exceed 32`);
@@ -233,6 +246,7 @@ export async function runHeadlessScenario({
 	let diagnostics = '';
 	let minecraftMspt = null;
 	let closed = false;
+	let summoned = false;
 	const command = async (value, { readOnly = false, deadlineMs = deadline, attempt = 0 } = {}) => {
 		const commandText = String(value);
 		if (readOnly && !isReadOnlyRcon(commandText)) throw new Error(`RCON assertion command is not read-only: ${commandText}`);
@@ -250,6 +264,10 @@ export async function runHeadlessScenario({
 			if (isFailedResponse(floor.text)) throw new Error('Could not prepare the headless arena floor');
 			const clearance = await command('execute in minecraft:overworld run fill -8 201 -8 8 204 8 minecraft:air');
 			if (isFailedResponse(clearance.text)) throw new Error('Could not clear the headless arena spawn');
+			for (const block of scenario.setupBlocks ?? []) {
+				const setup = await command(`execute in minecraft:overworld run setblock ${block.x} ${block.y} ${block.z} ${block.blockId}`);
+				if (isFailedResponse(setup.text)) throw new Error('Could not place a headless arena fixture block');
+			}
 			summon = await command(`execute in minecraft:overworld positioned 0.5 201 0.5 run codex summon-configured ${scenario.provider} ${scenario.model} ${scenario.reasoningEffort} ${scenario.serviceTier ?? 'priority'} survival ${generatedName}`);
 		} finally {
 			const cleanupDeadline = Math.max(deadline, Number(now()) + 10_000);
@@ -264,8 +282,18 @@ export async function runHeadlessScenario({
 			classification = 'ERROR';
 			diagnostics = summon.text;
 		}
+		if (isAcceptedResponse(summon.text)) summoned = true;
 		if (classification === null) {
-			await command(`codex start ${generatedName} ${scenario.task}`, { attempt: 0 });
+			if (isPendingJoinResponse(summon.text)) {
+				await waitForAgentReady({ generatedName, command, poll, deadline, now, startedAt });
+			}
+			const start = await command(`codex start ${generatedName} ${scenario.task}`, { attempt: 0 });
+			if (isFailedResponse(start.text)) {
+				classification = 'ERROR';
+				diagnostics = start.text;
+			}
+		}
+		if (classification === null) {
 			let attempts = 0;
 			while (terminalState === null) {
 				if (logicalNow(now, startedAt, attempts) >= deadline) { classification = 'TIMEOUT'; break; }
@@ -295,14 +323,14 @@ export async function runHeadlessScenario({
 		const evidenceResult = await collectHeadlessEvidence({
 			directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets, protocolAuditOffset, assertions, terminalState, rconEvidence,
 			readOnlyCommand: (value) => command(value, { readOnly: true, attempt: 0 }),
-			deadline, now, startedAt, poll, scenario, generatedName,
+			deadline, now, startedAt, poll, scenario, generatedName, waitForEvidence: classification === null,
 		});
 		const { scopedEvidence, scopedAudit, identity, assertionResult } = evidenceResult;
 		const factualAssertions = assertions.filter((assertion) => assertion.type === 'rcon');
 		const factualSuccess = factualAssertions.length > 0
 			&& assertionResult.results.filter((result) => result.type === 'rcon').every((result) => result.passed);
 		const resolvedAgentId = identity.agentId;
-		if (identity.error !== null) {
+		if (identity.error !== null && classification === null) {
 			classification = 'ERROR';
 			diagnostics = identity.error;
 		}
@@ -320,6 +348,12 @@ export async function runHeadlessScenario({
 			cleanup: { status: 'PENDING' },
 		});
 		try {
+			if (summoned) {
+				const cleanupDeadline = Math.max(deadline, Number(now()) + 10_000);
+				const removal = await command(`codex remove ${generatedName}`, { deadlineMs: cleanupDeadline });
+				if (isFailedResponse(removal.text)) throw new Error('Could not remove the headless scenario agent');
+				summoned = false;
+			}
 			await closeResources(rcon, providerTurnRecorder);
 			closed = true;
 		} catch (error) {
@@ -330,8 +364,16 @@ export async function runHeadlessScenario({
 	} catch (error) {
 		diagnostics = boundedText(error?.message ?? error, MAX_DIAGNOSTICS);
 		let cleanupError = null;
+		if (summoned) {
+			try {
+				const cleanupDeadline = Math.max(deadline, Number(now()) + 10_000);
+				const removal = await command(`codex remove ${generatedName}`, { deadlineMs: cleanupDeadline });
+				if (isFailedResponse(removal.text)) throw new Error('Could not remove the headless scenario agent');
+				summoned = false;
+			} catch (errorDuringRemoval) { cleanupError = errorDuringRemoval; }
+		}
 		try { await closeResources(rcon, providerTurnRecorder); }
-		catch (errorDuringCleanup) { cleanupError = errorDuringCleanup; }
+		catch (errorDuringCleanup) { if (cleanupError === null) cleanupError = errorDuringCleanup; }
 		const failureClassification = cleanupError !== null ? 'CLEANUP_FAILURE' : classification ?? (error?.code === 'HEADLESS_TIMEOUT' ? 'TIMEOUT' : 'ERROR');
 		const status = failureClassification === 'SKIPPED_PROFILE' ? 'SKIPPED' : 'FAILED';
 		const report = scenarioReport(status, scenario, {
@@ -376,6 +418,7 @@ async function runConcurrentHeadlessScenario({
 		classification: null,
 		diagnostics: '',
 		started: false,
+		summoned: false,
 	}));
 	const commands = [];
 	const command = async (value, { readOnly = false, deadlineMs = deadline, attempt = 0 } = {}) => {
@@ -393,6 +436,10 @@ async function runConcurrentHeadlessScenario({
 			if (isFailedResponse(floor.text)) throw new Error('Could not prepare the headless arena floor');
 			const clearance = await command('execute in minecraft:overworld run fill -8 201 -8 8 204 8 minecraft:air');
 			if (isFailedResponse(clearance.text)) throw new Error('Could not clear the headless arena spawn');
+			for (const block of scenario.setupBlocks ?? []) {
+				const setup = await command(`execute in minecraft:overworld run setblock ${block.x} ${block.y} ${block.z} ${block.blockId}`);
+				if (isFailedResponse(setup.text)) throw new Error('Could not place a headless arena fixture block');
+			}
 			const summons = await Promise.allSettled(members.map((member) => {
 				const position = rosterPosition(member.index);
 				return command(`execute in minecraft:overworld positioned ${position.x} 201 ${position.z} run codex summon-configured ${scenario.provider} ${scenario.model} ${scenario.reasoningEffort} ${scenario.serviceTier ?? 'priority'} survival ${member.generatedName}`);
@@ -410,6 +457,9 @@ async function runConcurrentHeadlessScenario({
 				else if (!isAcceptedResponse(result.value.text)) {
 					member.classification = 'ERROR';
 					member.diagnostics = result.value.text;
+				} else {
+					member.summoned = true;
+					member.awaitReady = isPendingJoinResponse(result.value.text);
 				}
 			}
 		} finally {
@@ -422,9 +472,20 @@ async function runConcurrentHeadlessScenario({
 			protocolAudit, providerTurnsPath, evidenceOffsets, deadline, now, startedAt, poll,
 		});
 		const startable = members.filter((member) => member.classification === null && member.agentId !== null);
-		const starts = await Promise.allSettled(startable.map((member) => command(`codex start ${member.generatedName} ${scenario.task}`)));
-		for (let index = 0; index < starts.length; index += 1) {
+		const readiness = await Promise.allSettled(startable.map((member) => member.awaitReady
+				? waitForAgentReady({ generatedName: member.generatedName, command, poll, deadline, now, startedAt })
+				: Promise.resolve()));
+		for (let index = 0; index < readiness.length; index += 1) {
+			if (readiness[index].status === 'fulfilled') continue;
 			const member = startable[index];
+			const failure = readiness[index].reason;
+			member.classification = failure?.code === 'HEADLESS_TIMEOUT' ? 'TIMEOUT' : 'ERROR';
+			member.diagnostics = boundedText(failure?.message ?? failure, MAX_DIAGNOSTICS);
+		}
+		const readyToStart = startable.filter((member) => member.classification === null);
+		const starts = await Promise.allSettled(readyToStart.map((member) => command(`codex start ${member.generatedName} ${scenario.task}`)));
+		for (let index = 0; index < starts.length; index += 1) {
+			const member = readyToStart[index];
 			const result = starts[index];
 			if (result.status === 'rejected' || isFailedResponse(result.value?.text)) {
 				member.classification = result.status === 'rejected' && result.reason?.code === 'HEADLESS_TIMEOUT' ? 'TIMEOUT' : 'ERROR';
@@ -511,13 +572,18 @@ async function runConcurrentHeadlessScenario({
 			metrics: performanceMetrics(profile, aggregateEvidence, aggregateAudit, exactAgentIds, { minecraftMspt }),
 			cleanup: { status: 'PENDING' },
 		});
-		try { await closeResources(rcon, providerTurnRecorder); }
+		try {
+			await removeHeadlessMembers(members, command, Math.max(deadline, Number(now()) + 10_000));
+			await closeResources(rcon, providerTurnRecorder);
+		}
 		catch (error) { return finishReport(scenario, report, directory, writeFile, 'CLEANUP_FAILURE', error); }
 		report = scenarioReport(report.status, scenario, { ...report, cleanup: { status: 'CLEAN' } });
 		return persistReportOrFailure(scenario, report, directory, writeFile);
 	} catch (error) {
 		let cleanupError = null;
-		try { await closeResources(rcon, providerTurnRecorder); } catch (failure) { cleanupError = failure; }
+		try { await removeHeadlessMembers(members, command, Math.max(deadline, Number(now()) + 10_000)); }
+		catch (failure) { cleanupError = failure; }
+		try { await closeResources(rcon, providerTurnRecorder); } catch (failure) { if (cleanupError === null) cleanupError = failure; }
 		return persistReportOrFailure(scenario, scenarioReport('FAILED', scenario, {
 			classification: cleanupError === null ? (error?.code === 'HEADLESS_TIMEOUT' ? 'TIMEOUT' : 'ERROR') : 'CLEANUP_FAILURE',
 			diagnostics: cleanupError?.message ?? error?.message ?? String(error), commands,
@@ -525,6 +591,18 @@ async function runConcurrentHeadlessScenario({
 			cleanup: cleanupError === null ? { status: 'CLEAN' } : { status: 'FAILED', diagnostics: cleanupError.message },
 		}), directory, writeFile);
 	}
+}
+
+async function removeHeadlessMembers(members, command, deadlineMs) {
+	const summoned = members.filter((member) => member.summoned);
+	const removals = await Promise.allSettled(summoned.map((member) => command(`codex remove ${member.generatedName}`, { deadlineMs })));
+	let failed = false;
+	for (let index = 0; index < removals.length; index += 1) {
+		const removal = removals[index];
+		if (removal.status === 'fulfilled' && !isFailedResponse(removal.value.text)) summoned[index].summoned = false;
+		else failed = true;
+	}
+	if (failed) throw new Error('Could not remove every headless scenario agent');
 }
 
 export async function writeHeadlessReport(runDirectory, report, writeFile = defaultWriteFile) {
@@ -698,8 +776,14 @@ function objectSubset(expected, actual) {
 function makeEvidence({ terminalState, protocolAudit, protocolRows = [], traceRows = [], serverLog = '', rcon = [] }) {
 	const rows = [...protocolRows, ...auditRows(protocolAudit)];
 	const normalizedRows = rows.map(unwrapAuditRow).filter(Boolean);
+	const resultByActionId = new Map(normalizedRows
+			.filter((row) => row.type === 'action_result' && typeof row.payload?.actionId === 'string')
+			.map((row) => [row.payload.actionId, row.payload]));
 	const actions = [
-		...normalizedRows.filter((row) => row.type === 'action_command').map((row) => row.payload ?? row),
+		...normalizedRows.filter((row) => row.type === 'action_command').map((row) => {
+			const action = row.payload ?? row;
+			return { ...action, result: resultByActionId.get(action.actionId) ?? null };
+		}),
 		...traceRows.filter((row) => row.event === 'program_step' && typeof row.actionType === 'string')
 			.map((row) => ({ actionType: row.actionType, arguments: row.arguments ?? {}, result: row.result ?? null })),
 	];
@@ -714,7 +798,7 @@ function makeEvidence({ terminalState, protocolAudit, protocolRows = [], traceRo
 	return { lifecycle: terminalState, terminalState, chats, actions, program, rcon };
 }
 
-async function collectHeadlessEvidence({ directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets, protocolAuditOffset, assertions, terminalState, rconEvidence, readOnlyCommand, deadline, now, startedAt, poll, scenario, generatedName }) {
+async function collectHeadlessEvidence({ directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets, protocolAuditOffset, assertions, terminalState, rconEvidence, readOnlyCommand, deadline, now, startedAt, poll, scenario, generatedName, waitForEvidence = true }) {
 	const resolvedAssertions = resolveAgentAssertions(assertions, generatedName);
 	for (const assertion of resolvedAssertions) {
 		if (assertion.type !== 'rcon' || logicalNow(now, startedAt, 0) >= deadline) continue;
@@ -747,7 +831,7 @@ async function collectHeadlessEvidence({ directory, readFile, tailReader, protoc
 	};
 	await evaluate();
 	const waitsForFiles = assertions.some((assertion) => assertion.type !== 'lifecycle' && assertion.type !== 'rcon');
-	while (!assertionResult.passed && waitsForFiles && logicalNow(now, startedAt, attempt) < deadline) {
+	while (waitForEvidence && !assertionResult.passed && waitsForFiles && logicalNow(now, startedAt, attempt) < deadline) {
 		try {
 			await withDeadline(() => poll({ phase: 'evidence', attempt, deadline, evidence, now }), deadline, () => logicalNow(now, startedAt, attempt), 'HEADLESS_TIMEOUT');
 		} catch (error) { if (error?.code === 'HEADLESS_TIMEOUT') break; throw error; }
@@ -764,7 +848,7 @@ async function resolveConcurrentAgentIds({ members, scenario, directory, readFil
 		const rows = [...fileEvidence.protocolRows, ...auditRows(protocolAudit)].map(unwrapAuditRow).filter(Boolean);
 		for (const member of members) {
 			if (member.agentId !== null || member.classification !== null) continue;
-			const candidates = rows.filter((row) => row.type === 'agent_snapshot' && row.payload?.name === member.generatedName);
+			const candidates = rows.filter((row) => isAuthoritativeAgentIdentityRow(row) && row.payload?.name === member.generatedName);
 			if (candidates.length === 0) continue;
 			const exact = candidates.filter((row) => row.payload?.provider === scenario.provider
 				&& row.payload?.model === scenario.model
@@ -809,7 +893,7 @@ function authoritativeAgentId(row) {
 
 function resolveExactSnapshotAgentId(fileEvidence, protocolAudit, scenario, generatedName) {
 	const rows = [...(fileEvidence.protocolRows ?? []), ...auditRows(protocolAudit)].map(unwrapAuditRow).filter(Boolean);
-	const snapshots = rows.filter((row) => row.type === 'agent_snapshot');
+	const snapshots = rows.filter(isAuthoritativeAgentIdentityRow);
 	if (snapshots.length === 0) {
 		const labelled = rows.some(rowHasAgentIdentity)
 			|| (fileEvidence.traceRows ?? []).some(rowHasAgentIdentity)
@@ -879,7 +963,7 @@ function isolateFileEvidence(fileEvidence, agentId, generatedName) {
 	const providerTurnSummaries = (fileEvidence.providerTurnSummaries ?? []).filter((row) => row.agentId === agentId).slice(-256);
 	const lines = String(fileEvidence.serverLog ?? '').split(/\r?\n/).filter((line) => line.includes(agentId) || line.includes(generatedName)).slice(-256);
 	return {
-		protocolRows: (fileEvidence.protocolRows ?? []).filter((row) => rowMatchesAgent(row, agentId)).slice(-256),
+		protocolRows: (fileEvidence.protocolRows ?? []).filter((row) => rowMatchesAgent(row, agentId)),
 		traceRows: (fileEvidence.traceRows ?? []).filter((row) => rowMatchesAgent(row, agentId)).slice(-256),
 		serverLog: lines.join('\n'), paths: fileEvidence.paths,
 		providerTurnsRows: providerTurnSummaries.length, providerTurnSummaries,
@@ -894,7 +978,7 @@ function isolateRosterFileEvidence(fileEvidence, members) {
 	const providerTurnSummaries = (fileEvidence.providerTurnSummaries ?? []).filter((row) => ids.has(row.agentId)).slice(-limit);
 	const lines = String(fileEvidence.serverLog ?? '').split(/\r?\n/).filter((line) => labels.some((value) => line.includes(value))).slice(-limit);
 	return {
-		protocolRows: (fileEvidence.protocolRows ?? []).filter(matches).slice(-limit),
+		protocolRows: (fileEvidence.protocolRows ?? []).filter(matches),
 		traceRows: (fileEvidence.traceRows ?? []).filter(matches).slice(-limit),
 		serverLog: lines.join('\n'), paths: fileEvidence.paths,
 		providerTurnsRows: providerTurnSummaries.length, providerTurnSummaries,
@@ -921,22 +1005,76 @@ function rowMatchesAgent(row, agentId) {
 }
 
 function rowHasAgentIdentity(row) {
-	return boundedAgentId(row?.agentId ?? row?.envelope?.agentId ?? row?.payload?.agentId ?? row?.envelope?.payload?.agentId) !== null;
+	const agentId = boundedAgentId(row?.agentId ?? row?.envelope?.agentId ?? row?.payload?.agentId ?? row?.envelope?.payload?.agentId);
+	return agentId !== null && agentId !== 'server';
+}
+
+function isAuthoritativeAgentIdentityRow(row) {
+	return row?.type === 'agent_registered' || row?.type === 'agent_snapshot';
 }
 
 async function readEvidence(directory, readFile, tailReader, protocolAudit, providerTurnsPath = null, offsets = {}) {
 	const { protocol: protocolPath, coordinator: coordinatorPath, server: serverPath, providerTurns } = resolveEvidencePaths(directory, protocolAudit, providerTurnsPath);
-	const [protocolText, coordinatorText, serverLog, providerTurnsText] = await Promise.all([
-		readBoundedTail(tailReader, protocolPath, offsets.protocol), readBoundedTail(tailReader, coordinatorPath, offsets.coordinator), readBoundedTail(tailReader, serverPath, offsets.server),
+	const [protocolRows, coordinatorText, serverLog, providerTurnsText] = await Promise.all([
+		readProtocolEvidence(protocolPath, offsets.protocol, tailReader), readBoundedTail(tailReader, coordinatorPath, offsets.coordinator), readBoundedTail(tailReader, serverPath, offsets.server),
 		providerTurns === null ? '' : readBoundedTail(tailReader, providerTurns, offsets.providerTurns),
 	]);
 	const providerTurnRows = providerTurns === null ? [] : parseJsonl(providerTurnsText);
 	return {
-		protocolRows: parseJsonl(protocolText), traceRows: parseJsonl(coordinatorText), serverLog,
+		protocolRows, traceRows: parseJsonl(coordinatorText), serverLog,
 		paths: { protocol: protocolPath, coordinator: coordinatorPath, server: serverPath, ...(providerTurns === null ? {} : { providerTurns }) },
 		providerTurnsRows: providerTurnRows.length,
 		providerTurnSummaries: providerTurnRows.map(providerTurnSummary).filter(Boolean),
 	};
+}
+
+async function readProtocolEvidence(file, offset = 0, tailReader = defaultReadTail) {
+	let handle;
+	try {
+		handle = await defaultOpen(file, 'r');
+		const size = Number((await handle.stat()).size);
+		// Real protocol audits are identity-scoped below, so retain durable rows from the
+		// whole file even when high-frequency observations have advanced past the capture offset.
+		let position = 0;
+		let carry = '';
+		const decoder = new TextDecoder('utf-8');
+		const durable = [];
+		const observations = [];
+		const telemetry = [];
+		const buffer = Buffer.allocUnsafe(64 * 1024);
+		const retain = (row) => {
+			const type = unwrapAuditRow(row)?.type;
+			if (type === 'observation') retainBounded(observations, row, 256);
+			else if (['heartbeat', 'coordinator_status', 'catalog_snapshot', 'catalog_request'].includes(type)) retainBounded(telemetry, row, 128);
+			else retainBounded(durable, row, 4096);
+		};
+		while (position < size) {
+			const length = Math.min(buffer.length, size - position);
+			const { bytesRead } = await handle.read(buffer, 0, length, position);
+			if (bytesRead <= 0) break;
+			position += bytesRead;
+			const text = carry + decoder.decode(buffer.subarray(0, bytesRead), { stream: position < size });
+			const lines = text.split(/\r?\n/);
+			carry = lines.pop() ?? '';
+			for (const line of lines) {
+				if (line.trim() === '') continue;
+				try { retain(JSON.parse(line)); } catch { /* a concurrently appended partial record is retried later */ }
+			}
+		}
+		if (carry.trim() !== '') {
+			try { retain(JSON.parse(carry)); } catch { /* ignore an incomplete final record */ }
+		}
+		return [...durable, ...telemetry, ...observations];
+	} catch {
+		return parseJsonl(await readBoundedTail(tailReader, file, offset));
+	} finally {
+		await handle?.close?.().catch(() => {});
+	}
+}
+
+function retainBounded(rows, row, limit) {
+	rows.push(row);
+	if (rows.length > limit) rows.splice(0, rows.length - limit);
 }
 
 function resolveEvidencePaths(directory, protocolAudit, providerTurnsPath) {
@@ -1196,14 +1334,41 @@ function parseLifecycle(value) {
 	return match ? match[1] : null;
 }
 
-function isFailedResponse(value) { return /(?:\bERROR\b|\bFAILED\b|unknown agent|unable to|rejected)/i.test(String(value ?? '')); }
+async function waitForAgentReady({ generatedName, command, poll, deadline, now, startedAt }) {
+	let attempt = 0;
+	while (logicalNow(now, startedAt, attempt) < deadline) {
+		const status = await command(`codex status ${generatedName}`, { attempt });
+		if (/\|\s*READY\s*\./i.test(status.text)) return;
+		const lifecycle = parseLifecycle(status.text);
+		if (lifecycle === 'ERROR' || lifecycle === 'DEAD') {
+			throw new Error(`Agent became ${lifecycle.toLowerCase()} before its goal could start`);
+		}
+		await withDeadline(
+				() => poll({ phase: 'readiness', attempt, deadline, status: status.text, now }),
+				deadline, () => logicalNow(now, startedAt, attempt), 'HEADLESS_TIMEOUT');
+		attempt += 1;
+	}
+	throw headlessTimeout();
+}
+
+function isFailedResponse(value) {
+	const textValue = String(value ?? '');
+	return /(?:\bERROR\b|\bFAILED\b|unknown agent|unable to|rejected)/i.test(textValue)
+			|| /\b[A-Z][A-Z0-9_]{2,}:/.test(textValue);
+}
 function isSkippedResponse(value) { return /(?:SKIP|unavailable|not logged in|not installed|profile unavailable|catalog unavailable|catalog\s+rejected)/i.test(String(value ?? '')); }
-function isAcceptedResponse(value) { return /^Created .+\. It is ready for a task\.$/i.test(String(value ?? '').trim()); }
+function isAcceptedResponse(value) {
+	return /^(?:Created .+\. It is ready for a task\.|Creating .+\. It will be ready when its player joins\.)$/i.test(String(value ?? '').trim());
+}
+function isPendingJoinResponse(value) {
+	return /^Creating .+\. It will be ready when its player joins\.$/i.test(String(value ?? '').trim());
+}
 function isReadOnlyRcon(value) {
 	const source = String(value ?? '');
 	if (/[\u0000-\u001f\u007f;&|`]/.test(source)) return false;
 	const command = source.trim().replace(/^\/+/, '').replace(/\s+/g, ' ');
-	return /^(?:list(?:\s+.*)?|seed|difficulty|data\s+get(?:\s+.*)?|time\s+query\s+(?:day|daytime|gametime)|weather\s+query|gamerule\s+[A-Za-z0-9_.-]+)$/.test(command);
+	return /^(?:list(?:\s+.*)?|seed|difficulty|data\s+get(?:\s+.*)?|time\s+query\s+(?:day|daytime|gametime)|weather\s+query|gamerule\s+[A-Za-z0-9_.-]+)$/.test(command)
+		|| /^execute if block -?\d+ -?\d+ -?\d+ [a-z0-9_.-]+:[a-z0-9_./-]+ run data get entity [A-Za-z0-9_.-]{1,64}(?: [A-Za-z0-9_.\[\]-]{1,128})?$/.test(command);
 }
 function validateRunnerScenario(scenario, assertions) {
 	for (const field of ['id', 'provider', 'model', 'reasoningEffort', 'serviceTier', 'task']) {

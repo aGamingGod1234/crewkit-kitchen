@@ -9,6 +9,7 @@ import {
 	LOOPBACK_HOST,
 	MAX_BRIDGE_SECRET_LENGTH,
 	MAX_BLOCKS,
+	MAX_LANDMARKS,
 	MAX_CHAT_LENGTH,
 	MAX_CONVERSATION_LENGTH,
 	MAX_COMMAND_ID_LENGTH,
@@ -106,7 +107,7 @@ const FACTUAL_PLAYER_FIELDS = new Set([
 	'onFire', 'air', 'maxAir', 'suffocating', 'fallDistance', 'lastAttacker', 'effects',
 ]);
 const FACTUAL_TOP_LEVEL_PATHS = new Set([
-	'ready', 'status', 'position', 'velocity', 'view', 'inventory', 'entities', 'blocks', 'nearbyContainers', 'world', 'currentAction', 'lastResult',
+	'ready', 'status', 'position', 'velocity', 'view', 'inventory', 'entities', 'blocks', 'landmarks', 'nearbyContainers', 'world', 'currentAction', 'lastResult',
 ]);
 const TRUSTED_ENVELOPES = new WeakSet();
 const TRUSTED_PAYLOAD_TYPES = new WeakMap();
@@ -1500,7 +1501,7 @@ function normalizeConversationWake(value) {
 }
 
 function normalizeObservation(value) {
-	const allowed = ['goalRevision', 'observedAtEpochMs', 'ready', 'status', 'eventSequence', 'attention', 'changedFacts', 'position', 'velocity', 'view', 'player', 'inventory', 'entities', 'blocks', 'nearbyContainers', 'world', 'currentAction', 'lastResult', 'interaction'];
+	const allowed = ['goalRevision', 'observedAtEpochMs', 'ready', 'status', 'eventSequence', 'attention', 'changedFacts', 'position', 'velocity', 'view', 'player', 'inventory', 'entities', 'blocks', 'landmarks', 'nearbyContainers', 'world', 'currentAction', 'lastResult', 'interaction'];
 	exactKeys(value, allowed, ['goalRevision', 'observedAtEpochMs', 'ready', 'status'], 'observation');
 	const normalized = {
 		goalRevision: revision(value.goalRevision, 'goalRevision'),
@@ -1516,7 +1517,7 @@ function normalizeObservation(value) {
 		if (normalized.attention === false && normalized.changedFacts?.length > 0) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Non-attention observation cannot contain changed facts');
 		return normalized;
 	}
-	for (const key of allowed.slice(4).filter((field) => field !== 'interaction')) if (!Object.hasOwn(value, key)) throw new ProtocolV2Error('MISSING_FIELD', `observation field '${key}' is required when ready`);
+	for (const key of allowed.slice(4).filter((field) => field !== 'interaction' && field !== 'landmarks')) if (!Object.hasOwn(value, key)) throw new ProtocolV2Error('MISSING_FIELD', `observation field '${key}' is required when ready`);
 	normalized.eventSequence = positiveInteger(value.eventSequence, 'eventSequence');
 	normalized.attention = boolean(value.attention, 'attention');
 	normalized.changedFacts = changedFactPaths(value.changedFacts);
@@ -1528,6 +1529,7 @@ function normalizeObservation(value) {
 	normalized.inventory = inventoryObservation(value.inventory);
 	normalized.entities = boundedArray(value.entities, 'entities', MAX_ENTITIES).map(entityObservation);
 	normalized.blocks = boundedArray(value.blocks, 'blocks', MAX_BLOCKS).map(blockObservation);
+	if (Object.hasOwn(value, 'landmarks')) normalized.landmarks = boundedArray(value.landmarks, 'landmarks', MAX_LANDMARKS).map(landmarkObservation);
 	normalized.nearbyContainers = boundedArray(value.nearbyContainers, 'nearbyContainers', MAX_NEARBY_TRANSACTION_TARGETS).map(nearbyContainerObservation);
 	normalized.world = worldObservation(value.world);
 	normalized.currentAction = currentActionObservation(value.currentAction);
@@ -1637,8 +1639,72 @@ function isFactualChangedPath(path) {
 	return /^blocks\.-?\d+,-?\d+,-?\d+$/.test(path);
 }
 
+function normalizeActionObservation(value) {
+	const field = 'actionObservation';
+	exactKeys(value, ['worldTick', 'observedAtEpochMs', 'position', 'velocity', 'yaw', 'pitch', 'collision', 'lookedAt', 'reach', 'target', 'progress'], ['observedAtEpochMs'], field);
+	const normalized = {
+		observedAtEpochMs: nonnegativeInteger(value.observedAtEpochMs, `${field}.observedAtEpochMs`),
+	};
+	if (value.worldTick !== undefined) normalized.worldTick = nonnegativeInteger(value.worldTick, `${field}.worldTick`);
+	if (value.position !== undefined) normalized.position = vector(value.position, `${field}.position`);
+	if (value.velocity !== undefined) normalized.velocity = vector(value.velocity, `${field}.velocity`);
+	if (value.yaw !== undefined) normalized.yaw = finiteNumber(value.yaw, `${field}.yaw`);
+	if (value.pitch !== undefined) normalized.pitch = finiteNumber(value.pitch, `${field}.pitch`);
+	if (value.collision !== undefined) {
+		exactKeys(value.collision, ['horizontal', 'vertical', 'inWall'], ['horizontal', 'vertical', 'inWall'], `${field}.collision`);
+		normalized.collision = {
+			horizontal: boolean(value.collision.horizontal, `${field}.collision.horizontal`),
+			vertical: boolean(value.collision.vertical, `${field}.collision.vertical`),
+			inWall: boolean(value.collision.inWall, `${field}.collision.inWall`),
+		};
+	}
+	if (value.lookedAt !== undefined) normalized.lookedAt = normalizeActionLookTarget(value.lookedAt, `${field}.lookedAt`);
+	if (value.reach !== undefined) {
+		exactKeys(value.reach, ['distance', 'max', 'within'], ['distance', 'max', 'within'], `${field}.reach`);
+		normalized.reach = {
+			distance: nonnegativeFiniteNumber(value.reach.distance, `${field}.reach.distance`),
+			max: nonnegativeFiniteNumber(value.reach.max, `${field}.reach.max`),
+			within: boolean(value.reach.within, `${field}.reach.within`),
+		};
+	}
+	if (value.target !== undefined) normalized.target = normalizeActionTarget(value.target, `${field}.target`);
+	if (value.progress !== undefined) {
+		exactKeys(value.progress, ['value', 'basis', 'verified'], ['value', 'basis', 'verified'], `${field}.progress`);
+		const basis = requireIdentifier(value.progress.basis, `${field}.progress.basis`);
+		if (!['world_position', 'block_damage', 'world_mutation', 'none'].includes(basis)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}.progress.basis is invalid`);
+		const progress = finiteNumber(value.progress.value, `${field}.progress.value`);
+		if (progress < 0 || progress > 1) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}.progress.value must be in [0, 1]`);
+		normalized.progress = { value: progress, basis, verified: boolean(value.progress.verified, `${field}.progress.verified`) };
+	}
+	return normalized;
+}
+
+function normalizeActionLookTarget(value, field) {
+	exactKeys(value, ['type', 'position', 'id', 'face', 'hitDistance'], ['type', 'hitDistance'], field);
+	const type = requireIdentifier(value.type, `${field}.type`);
+	if (!['miss', 'block', 'entity', 'item'].includes(type)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}.type is invalid`);
+	const normalized = { type, hitDistance: nonnegativeFiniteNumber(value.hitDistance, `${field}.hitDistance`) };
+	if (value.position !== undefined) normalized.position = vector(value.position, `${field}.position`);
+	if (value.id !== undefined) normalized.id = requireIdentifier(value.id, `${field}.id`);
+	if (value.face !== undefined) normalized.face = requireIdentifier(value.face, `${field}.face`);
+	return normalized;
+}
+
+function normalizeActionTarget(value, field) {
+	exactKeys(value, ['kind', 'position', 'expectedId', 'currentId', 'beforeId', 'afterId', 'worldChanged', 'distanceRemaining', 'tolerance', 'standable'], ['kind', 'position'], field);
+	const normalized = { kind: requireIdentifier(value.kind, `${field}.kind`), position: vector(value.position, `${field}.position`) };
+	for (const key of ['expectedId', 'currentId', 'beforeId', 'afterId']) {
+		if (value[key] !== undefined) normalized[key] = requireIdentifier(value[key], `${field}.${key}`);
+	}
+	if (value.worldChanged !== undefined) normalized.worldChanged = boolean(value.worldChanged, `${field}.worldChanged`);
+	if (value.distanceRemaining !== undefined) normalized.distanceRemaining = nonnegativeFiniteNumber(value.distanceRemaining, `${field}.distanceRemaining`);
+	if (value.tolerance !== undefined) normalized.tolerance = nonnegativeFiniteNumber(value.tolerance, `${field}.tolerance`);
+	if (value.standable !== undefined) normalized.standable = boolean(value.standable, `${field}.standable`);
+	return normalized;
+}
+
 function normalizeActionProgress(value) {
-	const allowed = ['traceId', 'goalRevision', 'actionId', 'commandId', 'actionType', 'state', 'message', 'progress', 'elapsedMs', 'observedAtEpochMs'];
+	const allowed = ['traceId', 'goalRevision', 'actionId', 'commandId', 'actionType', 'state', 'message', 'progress', 'elapsedMs', 'observedAtEpochMs', 'actionObservation'];
 	exactKeys(value, allowed, ['traceId', 'goalRevision', 'actionId'], 'action_progress');
 	const actionId = requireIdentifier(value.actionId, 'actionId');
 	if (value.commandId !== undefined && value.commandId !== actionId) throw new ProtocolV2Error('INVALID_PAYLOAD', 'commandId must match actionId');
@@ -1647,14 +1713,24 @@ function normalizeActionProgress(value) {
 	if (value.actionType !== undefined) normalized.actionType = requireIdentifier(value.actionType, 'actionType');
 	if (value.state !== undefined) normalized.state = boundedText(value.state, 'state', MAX_REASON_CODE_LENGTH);
 	if (value.message !== undefined) normalized.message = boundedText(value.message, 'message', MAX_RESULT_MESSAGE_LENGTH, 0);
-	if (value.progress !== undefined) normalized.progress = finiteNumber(value.progress, 'progress');
+	if (value.progress !== undefined) {
+		normalized.progress = finiteNumber(value.progress, 'progress');
+		if (normalized.progress < 0 || normalized.progress > 1) throw new ProtocolV2Error('INVALID_PAYLOAD', 'progress must be in [0, 1]');
+	}
 	if (value.elapsedMs !== undefined) normalized.elapsedMs = nonnegativeInteger(value.elapsedMs, 'elapsedMs');
 	if (value.observedAtEpochMs !== undefined) normalized.observedAtEpochMs = nonnegativeInteger(value.observedAtEpochMs, 'observedAtEpochMs');
+	if (value.actionObservation !== undefined) {
+		normalized.actionObservation = normalizeActionObservation(value.actionObservation);
+		if (normalized.progress !== undefined && normalized.actionObservation.progress !== undefined
+				&& normalized.progress !== normalized.actionObservation.progress.value) {
+			throw new ProtocolV2Error('INVALID_PAYLOAD', 'progress must equal actionObservation.progress.value');
+		}
+	}
 	return normalized;
 }
 
 function normalizeActionResult(value) {
-	const allowed = ['traceId', 'goalRevision', 'actionId', 'commandId', 'actionType', 'state', 'reasonCode', 'message', 'elapsedMs', 'observedAtEpochMs', 'executionStarted', 'physicalAttempted', 'replayProof'];
+	const allowed = ['traceId', 'goalRevision', 'actionId', 'commandId', 'actionType', 'state', 'reasonCode', 'message', 'elapsedMs', 'observedAtEpochMs', 'executionStarted', 'physicalAttempted', 'actionObservation', 'replayProof'];
 	exactKeys(value, allowed, ['traceId', 'goalRevision', 'actionId', 'commandId', 'actionType', 'state', 'reasonCode', 'message', 'elapsedMs', 'observedAtEpochMs'], 'action_result');
 	const actionId = requireIdentifier(value.actionId, 'actionId');
 	if (value.commandId !== actionId) throw new ProtocolV2Error('INVALID_PAYLOAD', 'commandId must match actionId');
@@ -1680,6 +1756,7 @@ function normalizeActionResult(value) {
 		if (typeof value.physicalAttempted !== 'boolean') throw new ProtocolV2Error('INVALID_PAYLOAD', 'physicalAttempted must be a boolean');
 		normalized.physicalAttempted = value.physicalAttempted;
 	}
+	if (value.actionObservation !== undefined) normalized.actionObservation = normalizeActionObservation(value.actionObservation);
 	if (value.replayProof !== undefined) normalized.replayProof = authenticationToken(value.replayProof, 'replayProof');
 	if (normalized.physicalAttempted === true && normalized.executionStarted !== true) throw new ProtocolV2Error('INVALID_PAYLOAD', 'physicalAttempted requires executionStarted');
 	return normalized;
@@ -1874,6 +1951,25 @@ function blockObservation(value, index) {
 		blockId: requireIdentifier(value.blockId, `${field}.blockId`),
 		placeableFaces,
 	};
+	if (value.tags !== undefined) normalized.tags = observationTags(value.tags, `${field}.tags`);
+	return normalized;
+}
+
+function landmarkObservation(value, index) {
+	const field = `landmarks[${index}]`;
+	if (!isPlainObject(value)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be an object`);
+	exactKeys(value, ['x', 'y', 'z', 'blockId', 'distance', 'bearing', 'elevation', 'tags'], ['x', 'y', 'z', 'blockId', 'distance', 'bearing', 'elevation'], field);
+	const normalized = {
+		x: integer(value.x, `${field}.x`),
+		y: integer(value.y, `${field}.y`),
+		z: integer(value.z, `${field}.z`),
+		blockId: requireIdentifier(value.blockId, `${field}.blockId`),
+		distance: nonnegativeFiniteNumber(value.distance, `${field}.distance`),
+		bearing: finiteNumber(value.bearing, `${field}.bearing`),
+		elevation: finiteNumber(value.elevation, `${field}.elevation`),
+	};
+	if (normalized.bearing < -180 || normalized.bearing > 180) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}.bearing must be in [-180, 180]`);
+	if (normalized.elevation < -90 || normalized.elevation > 90) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}.elevation must be in [-90, 90]`);
 	if (value.tags !== undefined) normalized.tags = observationTags(value.tags, `${field}.tags`);
 	return normalized;
 }

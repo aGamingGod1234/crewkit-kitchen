@@ -23,13 +23,15 @@ public final class AgentIdentityVerification {
 		AgentId id = new AgentId(UUID.fromString("193a9add-1234-5678-9abc-123456789abc"));
 		AgentProfile sol = new AgentProfile("codex", "gpt-5.6-sol", "high", "fast", Optional.empty(), 2,
 				AgentGameMode.SURVIVAL);
-		assertEquals("Sol GTqa3RI0VniavBI0VniavA", AgentIdentity.displayName(id, sol),
-				"default operator name combines the canonical short model label and full encoded ID");
+		assertEquals("GPT_5_6_Sol", AgentIdentity.displayName(id, sol),
+				"unnamed agents use a readable Minecraft-safe public name");
 		AgentId samePrefixId = new AgentId(UUID.fromString("193a9add-2222-2222-9abc-123456789abc"));
-		assertTrue(!AgentIdentity.displayName(id, sol).equalsIgnoreCase(AgentIdentity.displayName(samePrefixId, sol)),
-				"same-model IDs sharing their first eight hex characters keep distinct operator names");
-		assertEquals("c02_193A9ADD", AgentIdentity.playerName(id, sol),
-				"fake-player username carries the exact manifest transport identity");
+		assertEquals(AgentIdentity.displayName(id, sol), AgentIdentity.displayName(samePrefixId, sol),
+				"the registry, not a UUID hash, owns same-model collision suffixes");
+		assertEquals("GPT_5_6_Sol", AgentIdentity.playerName(id, sol),
+				"fake-player username is the same public name shown everywhere else");
+		assertEquals(List.of("Sol2_C7CA442D", "c02_193A9ADD"), AgentIdentity.legacyPlayerNames(id, sol),
+				"both previously deployed technical handles remain discoverable for state migration");
 		assertTrue(AgentIdentity.playerName(id, sol).length() <= 16,
 				"fake-player username stays within Minecraft's limit");
 		assertTrue(AgentIdentity.playerName(id, sol).matches("[A-Za-z0-9_]+"),
@@ -49,6 +51,9 @@ public final class AgentIdentityVerification {
 		assertEquals(new AgentIdentity.SkinIdentity("codex", "sol", 2),
 				AgentIdentity.skinForPlayerName("c02_193A9ADD").orElseThrow(),
 				"manifest player names expose the exact family and variant before the first client snapshot");
+		assertEquals(new AgentIdentity.SkinIdentity("codex", "sol", 2),
+				AgentIdentity.skinForPlayerName("Sol2_193A9ADD").orElseThrow(),
+				"recognizable player names retain the exact family and variant before the first client snapshot");
 		AgentIdentity.SkinIdentity currentTransport = AgentIdentity.skinForPlayerName("r22_193A9ADD").orElseThrow();
 		AgentVisualIdentity.Resolved currentTransportResolved = AgentVisualIdentity.resolveFamily(
 				currentTransport.provider(), currentTransport.modelFamily(), currentTransport.variant());
@@ -81,14 +86,11 @@ public final class AgentIdentityVerification {
 				"ordinary player names are not mistaken for arena identities");
 		AgentProfile kimiLong = new AgentProfile(
 				"kimi", "kimi-code/k3-256k", "max", "priority", Optional.empty(), 1, AgentGameMode.SURVIVAL);
-		assertEquals("k11_193A9ADD", AgentIdentity.playerName(id, kimiLong),
-				"digit-bearing model families remain regex-safe and exact");
-		assertEquals(new AgentIdentity.SkinIdentity("kimi", "k3_long", 1),
-				AgentIdentity.skinForPlayerName(AgentIdentity.playerName(id, kimiLong)).orElseThrow(),
-				"digit-bearing manifest identity round-trips");
+		assertEquals("Kimi_K3_256K", AgentIdentity.playerName(id, kimiLong),
+				"digit-bearing model families remain readable and Minecraft-safe");
 		AgentProfile legacyVariant = new AgentProfile(
 				"codex", "gpt-5.6-sol", "high", "priority", Optional.empty(), 6, AgentGameMode.SURVIVAL);
-		assertEquals("c02_193A9ADD", AgentIdentity.playerName(id, legacyVariant),
+		assertEquals("GPT_5_6_Sol", AgentIdentity.playerName(id, legacyVariant),
 				"legacy persisted variants normalize through the canonical manifest count");
 		assertEquals(2, AgentVisualIdentity.normalizedVariant(6),
 				"legacy entity variants normalize through the manifest-owned variant count");
@@ -97,8 +99,25 @@ public final class AgentIdentityVerification {
 		AgentProfile named = new AgentProfile("codex", "gpt-5.6-sol", "low", "priority", Optional.of("Rook"), 0,
 				AgentGameMode.SURVIVAL);
 		assertEquals("Rook", AgentIdentity.displayName(id, named), "explicit names remain authoritative");
-		assertEquals(Optional.of("⌁ Rook · Sol"), AgentIdentity.worldTag(named), "explicit world tag");
-		assertTrue(AgentIdentity.worldTag(sol).isEmpty(), "unnamed agents have no world tag");
+		assertEquals("Rook", AgentIdentity.playerName(id, named), "explicit names are exact /msg targets");
+		assertEquals("Rook0_C7CA442D", AgentIdentity.legacyReadablePlayerName(id, named),
+				"the immediately preceding readable/hash handle remains deterministic after canonicalization");
+		assertEquals(Optional.of("Rook"), AgentIdentity.worldTag(named), "explicit world tag has no provider decoration");
+		assertEquals(Optional.of("GPT_5_6_Sol"), AgentIdentity.worldTag(sol),
+				"unnamed agents expose the same public name in the world");
+		assertEquals("Builder_One", AgentIdentity.canonicalPublicName(" Builder One "),
+				"spaces become Minecraft-safe separators");
+		assertEquals("Agent_42", AgentIdentity.canonicalPublicName("42"),
+				"public names always begin with a letter");
+		assertEquals("GPT_5_6_Sol2", AgentIdentity.allocatePublicName(
+				"GPT 5.6 Sol", List.of("gpt_5_6_sol")),
+				"the smallest case-insensitive numeric suffix resolves a collision");
+		assertEquals("GPT_5_6_Sol3", AgentIdentity.allocatePublicName(
+				"GPT_5_6_Sol2", List.of("GPT_5_6_Sol", "GPT_5_6_Sol2")),
+				"already allocated scenario suffixes advance instead of nesting suffixes");
+		assertEquals("ExactlyFifteenC2", AgentIdentity.allocatePublicName(
+				"ExactlyFifteenChars", List.of("ExactlyFifteenCh")),
+				"collision suffixes retain the sixteen-character Minecraft bound");
 
 		assertEquals("GPT 5.6 Sol WM", AgentModelNames.displayName("codex", "gpt-5.6-sol-wm"),
 				"Codex display name is canonical");
@@ -147,9 +166,24 @@ public final class AgentIdentityVerification {
 				assertEquals(resolved,
 						AgentVisualIdentity.resolveTransportCode(resolved.transportCode()).orElseThrow(),
 						"transport identity round-trips");
+				String recognizableCode = AgentIdentity.recognizablePlayerCode(
+						resolved.shortModelLabel(), resolved.individualVariant());
+				assertEquals(resolved,
+						AgentVisualIdentity.resolveRecognizablePlayerCode(recognizableCode).orElseThrow(),
+						"recognizable player prefix round-trips without losing its skin");
 				assertTrue(texturePaths.add(resolved.texturePath()), "manifest texture paths are globally unique");
 				byte[] textureBytes = readTexture(resolved.texturePath());
 				assertRgbaSkin(textureBytes, resolved.texturePath());
+				String locatorIcon = "assets/arenaagents/textures/gui/sprites/hud/locator_bar_dot/agent/"
+						+ resolved.transportCode() + ".png";
+				byte[] locatorBytes = readResource(locatorIcon);
+				assertEquals(16, readBigEndianInt(locatorBytes, 16), "locator face sprite has 16px width");
+				assertEquals(16, readBigEndianInt(locatorBytes, 20), "locator face sprite has 16px height");
+				String locatorStyle = "assets/arenaagents/waypoint_style/agent/"
+						+ resolved.transportCode() + ".json";
+				assertTrue(new String(readResource(locatorStyle), StandardCharsets.UTF_8)
+						.contains("arenaagents:agent/" + resolved.transportCode()),
+						"locator style points at the matching face sprite");
 				assertTrue(textureBytesByProvider
 						.computeIfAbsent(resolved.providerKey(), ignored -> new HashSet<>())
 						.add(Base64.getEncoder().encodeToString(textureBytes)),
@@ -219,11 +253,15 @@ public final class AgentIdentityVerification {
 	private static byte[] readTexture(String texturePath) {
 		String[] location = texturePath.split(":", 2);
 		String resourcePath = "assets/" + location[0] + "/" + location[1];
+		return readResource(resourcePath);
+	}
+
+	private static byte[] readResource(String resourcePath) {
 		try (var stream = AgentIdentityVerification.class.getClassLoader().getResourceAsStream(resourcePath)) {
-			if (stream == null) throw new AssertionError("manifest texture is missing: " + texturePath);
+			if (stream == null) throw new AssertionError("resource is missing: " + resourcePath);
 			return stream.readAllBytes();
 		} catch (IOException exception) {
-			throw new AssertionError("manifest texture could not be read: " + texturePath, exception);
+			throw new AssertionError("resource could not be read: " + resourcePath, exception);
 		}
 	}
 

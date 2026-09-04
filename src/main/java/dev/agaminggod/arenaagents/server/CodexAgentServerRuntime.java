@@ -15,6 +15,7 @@ import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemRuntime;
 import dev.agaminggod.arenaagents.server.voice.VoiceConsentRegistry;
 import dev.agaminggod.arenaagents.server.goal.GoalVerificationRuntime;
 import dev.agaminggod.arenaagents.server.goal.GoalSafetyController;
+import dev.agaminggod.arenaagents.server.goal.GoalSubmission;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationCollector;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
 import dev.agaminggod.arenaagents.scenario.runtime.ScenarioRuntimeService;
@@ -41,6 +42,7 @@ import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.core.registries.BuiltInRegistries;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -103,6 +105,8 @@ public final class CodexAgentServerRuntime {
 		ServerLifecycleEvents.SERVER_STOPPING.register(CodexAgentServerRuntime::stop);
 		ServerLifecycleEvents.END_DATA_PACK_RELOAD.register((server, resourceManager, success) ->
 				ServerObservationCollector.clearTagCache());
+		ServerPlayConnectionEvents.JOIN.register((handler, sender, server) ->
+				VoiceConsentRegistry.playerConnected(server, handler.getPlayer().getUUID()));
 		ServerPlayConnectionEvents.DISCONNECT.register((handler, server) ->
 				VoiceConsentRegistry.playerDisconnected(server, handler.getPlayer().getUUID()));
 		ServerLivingEntityEvents.ALLOW_DEATH.register((entity, source, damageAmount) -> {
@@ -307,13 +311,6 @@ public final class CodexAgentServerRuntime {
 			reconcileVoice(server, supervisor);
 		GoalSafetyController safety = GOAL_SAFETY.get(server);
 		if (safety != null) safety.tick();
-		GoalVerificationRuntime goalVerifier = GOAL_VERIFIERS.get(server);
-		if (goalVerifier != null) {
-			for (var transition : goalVerifier.tick()) {
-				transition.after().currentGoal().flatMap(dev.agaminggod.arenaagents.agent.AgentGoal::evidence)
-					.ifPresent(evidence -> reportProactiveGoalVerification(manager, transition.after(), evidence));
-			}
-		}
 		}
 		MultiplexedServerBridge activeBridge = bridge;
 		boolean restored = ScenarioRuntimeService.restorePersistedState(server);
@@ -324,6 +321,7 @@ public final class CodexAgentServerRuntime {
 			VoiceSubsystemRuntime.tick(server);
 			maintainPlanningProgress(manager);
 			if (activeBridge != null) activeBridge.endTick();
+			verifyGoals(server, manager);
 			AgentInputRuntime.tick(server);
 			ScenarioRuntimeService.tick(server);
 		});
@@ -399,6 +397,29 @@ public final class CodexAgentServerRuntime {
 		if (!automationAvailable(server)) {
 			throw new AgentDomainException("AUTOMATION_UNAVAILABLE", automationStatus(server));
 		}
+	}
+
+	private static void verifyGoals(MinecraftServer server, CodexAgentManager manager) {
+		GoalVerificationRuntime goalVerifier = GOAL_VERIFIERS.get(server);
+		if (goalVerifier == null) return;
+		for (var transition : goalVerifier.tick()) {
+			transition.after().currentGoal().flatMap(dev.agaminggod.arenaagents.agent.AgentGoal::evidence)
+					.ifPresent(evidence -> reportProactiveGoalVerification(manager, transition.after(), evidence));
+		}
+	}
+
+	public static GoalSubmission submitGoal(
+			MinecraftServer server,
+			String selector,
+			String prompt,
+			ServerLevel sourceLevel,
+			Optional<UUID> requestingPlayerId,
+			GoalSubmission.Operation operation
+	) {
+		requireAutomation(server);
+		MultiplexedServerBridge bridge = bridge(server);
+		if (bridge == null) throw new AgentDomainException("AUTOMATION_UNAVAILABLE", automationStatus(server));
+		return bridge.submitGoal(selector, prompt, sourceLevel, requestingPlayerId, operation);
 	}
 
 	public static DeliveryReceipt sendDirectMessage(

@@ -103,7 +103,8 @@ public final class LegacyVoiceProviderClasspathScenario {
 							UUID ignoredEntity,
 							int ignoredRadius,
 							short[] ignoredSamples,
-							Runnable ignoredStopped
+							Runnable ignoredStopped,
+							Runnable ignoredFailed
 					) {
 						throw new AssertionError("Pending synthesis must not reach playback");
 					}

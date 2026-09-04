@@ -49,6 +49,7 @@ public final class AttentionSignalPolicy {
 				|| !Objects.equals(previous.get("view"), current.get("view"));
 		if (!activeActionWindow && !viewpointChanged) {
 			addEntityMembershipChanges(facts, entityIds(previous), entityIds(current));
+			addChanged(facts, "landmarks", previous.get("landmarks"), current.get("landmarks"));
 		}
 		return facts.stream().limit(AttentionFactDelta.MAX_CHANGED_FACTS).toList();
 	}

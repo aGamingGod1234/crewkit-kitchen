@@ -163,13 +163,18 @@ export class CodexService {
 		this.#catalog.assertSupported(profile.model, profile.reasoningEffort, profile.serviceTier);
 		let cwd;
 		let selectedCapabilityRoots = [];
+		let minecraftInstructions = '';
 		if (controlProtocol === 'native_tools' && this.#minecraftWorkspace !== null) {
-			const prepared = await this.#minecraftWorkspace.prepare();
+			const prepared = await this.#minecraftWorkspace.prepare({ sourceCodexHome: this.#codexEnvironment().CODEX_HOME });
 			if (prepared === null || typeof prepared !== 'object' || typeof prepared.cwd !== 'string' || !Array.isArray(prepared.selectedCapabilityRoots)) {
 				throw new TypeError('minecraftWorkspace.prepare() must return cwd and selectedCapabilityRoots');
 			}
 			cwd = prepared.cwd;
 			selectedCapabilityRoots = [...prepared.selectedCapabilityRoots];
+			if (prepared.instructions !== undefined && typeof prepared.instructions !== 'string') {
+				throw new TypeError('minecraftWorkspace.prepare().instructions must be a string when provided');
+			}
+			minecraftInstructions = prepared.instructions?.trim() ?? '';
 		} else {
 			cwd = this.#workspaceManager === null
 				? this.#config.cwd
@@ -189,7 +194,7 @@ export class CodexService {
 			environments: [],
 			ephemeral: true,
 			baseInstructions: controlProtocol === 'native_tools'
-				? NATIVE_AGENT_INSTRUCTIONS
+				? nativeInstructions(minecraftInstructions)
 				: controlProtocol === 'goal_spec' ? goalSpecInstructions() : PLANNER_SYSTEM_PROMPT,
 			developerInstructions: controlProtocol === 'native_tools'
 				? nativeRecoveryInstructions(recoverySummary)
@@ -283,6 +288,7 @@ export class CodexService {
 	}
 
 	async #startOnce(attempt) {
+		await this.#prepareMinecraftLaunch();
 		const transportStart = Promise.resolve().then(() => this.#transport.start({ signal: attempt.controller.signal }));
 		try {
 			await withStartupDeadline(transportStart, this.#config.startupTimeoutMs, this.#startupSchedule, this.#startupCancelSchedule, attempt.controller);
@@ -308,6 +314,22 @@ export class CodexService {
 		}
 	}
 
+	async #prepareMinecraftLaunch() {
+		if (this.#minecraftWorkspace === null || typeof this.#transport.setEnvironment !== 'function') return;
+		const prepared = await this.#minecraftWorkspace.prepare({ sourceCodexHome: this.#codexEnvironment().CODEX_HOME });
+		if (prepared === null || typeof prepared !== 'object') return;
+		if (prepared.codexHome === undefined) return;
+		if (typeof prepared.codexHome !== 'string' || prepared.codexHome.trim().length === 0) {
+			throw new TypeError('minecraftWorkspace.prepare().codexHome must be a nonblank path when provided');
+		}
+		const baseEnvironment = this.#codexEnvironment();
+		this.#transport.setEnvironment({ ...baseEnvironment, CODEX_HOME: prepared.codexHome });
+	}
+
+	#codexEnvironment() {
+		return this.#config.environment ?? this.#config.launchProfile?.environment ?? process.env;
+	}
+
 	#assertStartupCurrent(attempt) {
 		if (attempt.controller.signal.aborted || attempt.generation !== this.#startupGeneration || this.#starting !== attempt) {
 			throw new CodexProtocolError('STALE_PROVIDER_START', 'Codex startup attempt was superseded');
@@ -326,6 +348,11 @@ export class CodexService {
 	async #listModels({ signal } = {}) {
 		return listCodexModels(this.#transport, { signal });
 	}
+}
+
+function nativeInstructions(minecraftInstructions) {
+	if (minecraftInstructions === '') return NATIVE_AGENT_INSTRUCTIONS;
+	return `${NATIVE_AGENT_INSTRUCTIONS}\n\nWorkspace instructions for this Minecraft body (authoritative):\n${minecraftInstructions}`;
 }
 
 export class SharedCodexAgent {

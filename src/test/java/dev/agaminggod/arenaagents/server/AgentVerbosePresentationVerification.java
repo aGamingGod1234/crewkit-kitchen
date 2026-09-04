@@ -46,6 +46,9 @@ public final class AgentVerbosePresentationVerification {
 				rendered("retry", "The path is blocked. Trying another route."), "retries use the Problem label");
 		assertEquals("[Sol] Error: Movement timed out after 15 seconds.",
 				rendered("error", "Movement timed out after 15 seconds."), "terminal failures use the Error label");
+		assertEquals("[Sol] Voice: Processing nearby speech.",
+				rendered("voice", "Processing nearby speech."), "voice input has a truthful dedicated label");
+		assertTrue(curatedStage("voice"), "voice input milestones are visible when verbose mode is enabled");
 		assertTrue(curatedStage("output"), "public agent summaries remain visible");
 		assertTrue(!curatedStage("provider"), "provider plumbing is not a player-facing stage");
 		assertTrue(!curatedStage("lifecycle"), "lifecycle plumbing is not a player-facing stage");

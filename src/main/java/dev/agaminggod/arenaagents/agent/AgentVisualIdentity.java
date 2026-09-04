@@ -120,6 +120,22 @@ public final class AgentVisualIdentity {
 		));
 	}
 
+	/** Resolves the readable model-plus-variant prefix used by Minecraft player names. */
+	public static Optional<Resolved> resolveRecognizablePlayerCode(String code) {
+		if (code == null || code.isBlank()) return Optional.empty();
+		String checked = code.toLowerCase(Locale.ROOT);
+		Resolved match = null;
+		for (TransportIdentity transport : MANIFEST.transportCodes().values()) {
+			Resolved candidate = resolved(transport.provider(), transport.family(), transport.variant());
+			String candidateCode = AgentIdentity.recognizablePlayerCode(
+					candidate.shortModelLabel(), candidate.individualVariant()).toLowerCase(Locale.ROOT);
+			if (!candidateCode.equals(checked)) continue;
+			if (match != null && !match.equals(candidate)) return Optional.empty();
+			match = candidate;
+		}
+		return Optional.ofNullable(match);
+	}
+
 	static void validateManifest(String encoded) {
 		parseManifest(requireObject(JsonParser.parseString(requireText(encoded, "manifest")), "manifest"));
 	}

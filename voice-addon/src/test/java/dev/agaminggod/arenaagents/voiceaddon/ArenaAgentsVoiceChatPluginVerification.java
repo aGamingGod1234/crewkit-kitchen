@@ -4,6 +4,7 @@ import de.maxhenkel.voicechat.api.VoicechatServerApi;
 import de.maxhenkel.voicechat.api.events.Event;
 import de.maxhenkel.voicechat.api.events.EventRegistration;
 import de.maxhenkel.voicechat.api.events.MicrophonePacketEvent;
+import de.maxhenkel.voicechat.api.events.VoiceDistanceEvent;
 import de.maxhenkel.voicechat.api.events.VoicechatServerStartedEvent;
 import de.maxhenkel.voicechat.api.events.VoicechatServerStoppedEvent;
 import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemConfiguration;
@@ -48,6 +49,7 @@ final class ArenaAgentsVoiceChatPluginVerification {
 		}, packetServers::get);
 		RecordingEventRegistration events = new RecordingEventRegistration();
 		plugin.registerEvents(events);
+		events.fire(VoiceDistanceEvent.class, distanceEvent());
 
 		events.fire(VoicechatServerStartedEvent.class, serverEvent(VoicechatServerStartedEvent.class, apiA));
 		ArenaAgentsVoiceChatPlugin.ConfiguredServer configuredA = plugin.configureServer(serverA, configurationA);
@@ -211,6 +213,10 @@ final class ArenaAgentsVoiceChatPluginVerification {
 		MicrophonePacketEvent event = serverEvent(MicrophonePacketEvent.class, api);
 		packetServers.put(event, server);
 		events.fire(MicrophonePacketEvent.class, event);
+	}
+
+	private static VoiceDistanceEvent distanceEvent() {
+		return proxy(VoiceDistanceEvent.class, (proxy, method, arguments) -> defaultValue(method.getReturnType()));
 	}
 
 	private static RecordingCapture onlyCapture(

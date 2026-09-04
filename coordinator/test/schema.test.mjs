@@ -38,7 +38,7 @@ test('accepts every exact action shape and returns a detached value', () => {
 		{ type: 'attack', targetId: '00000000-0000-0000-0000-000000000001', timeoutMs: 5_000 },
 		{ type: 'select_item', itemId: 'minecraft:diamond_sword' },
 		{ type: 'use_item', durationMs: 250 },
-		{ type: 'break_block', x: 1, y: 64, z: 2, timeoutMs: 5_000 },
+		{ type: 'break_block', x: 1, y: 64, z: 2, expectedBlockId: 'minecraft:stone', timeoutMs: 5_000 },
 		{ type: 'pick_up_item', targetSelector: '00000000-0000-0000-0000-000000000002' },
 		{ type: 'place_block', x: 1, y: 64, z: 2, face: 'up', itemId: 'minecraft:stone' },
 		{ type: 'chat', message: 'Ready.' },
@@ -104,7 +104,9 @@ test('rejects unknown fields, unsupported actions, and unsafe numeric/text value
 	assert.throws(() => validateAction({ type: 'control', forward: 2, strafe: 0, jump: false, sneak: false, sprint: false, attack: false, use: false, yaw: 0, pitch: 0, selectedSlot: 0, hand: 'main', ticks: 1 }), /forward/);
 	assert.throws(() => validateAction({ type: 'control', forward: 0, strafe: 0, jump: false, sneak: false, sprint: false, attack: false, use: false, yaw: 0, pitch: 0, selectedSlot: 0, hand: 'left', ticks: 1 }), /hand/);
 	assert.throws(() => validateAction({ type: 'control', forward: 0, strafe: 0, jump: false, sneak: false, sprint: false, attack: false, use: false, yaw: 0, pitch: 0, selectedSlot: 0, hand: 'main', ticks: 201 }), /ticks/);
-	assert.throws(() => validateAction({ type: 'break_block', x: 1.1, y: 0, z: 0, timeoutMs: 1 }), /32-bit integer/);
+	assert.throws(() => validateAction({ type: 'break_block', x: 1.1, y: 0, z: 0, expectedBlockId: 'minecraft:stone', timeoutMs: 1 }), /32-bit integer/);
+	assert.throws(() => validateAction({ type: 'break_block', x: 1, y: 64, z: 2, timeoutMs: 1 }), /expectedBlockId/);
+	assert.throws(() => validateAction({ type: 'break_block', x: 1, y: 64, z: 2, expectedBlockId: 'minecraft:air', timeoutMs: 1 }), /non-air/);
 	assert.throws(() => validateAction({ type: 'wait', durationMs: 0 }), /between 1 and 600000/);
 	assert.throws(() => validateAction({ type: 'drop_item', slot: 36, count: 1 }), /between 0 and 35/);
 	assert.equal(validateAction({ type: 'chat', message: '\ud83d\ude80'.repeat(512) }).message, '\ud83d\ude80'.repeat(512));

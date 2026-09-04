@@ -1,6 +1,11 @@
 package dev.agaminggod.arenaagents.server;
 
 import dev.agaminggod.arenaagents.agent.AgentEntityLocation;
+import dev.agaminggod.arenaagents.agent.AgentId;
+import dev.agaminggod.arenaagents.agent.AgentProfile;
+import dev.agaminggod.arenaagents.agent.AgentRecord;
+import java.util.LinkedHashMap;
+import java.util.Optional;
 
 public final class AgentRespawnSpawnPolicyVerification {
 	private AgentRespawnSpawnPolicyVerification() {
@@ -45,14 +50,24 @@ public final class AgentRespawnSpawnPolicyVerification {
 				"accepted spawn without a physical player times out"
 		);
 		assertEquals(
+				AgentRespawnSpawnPolicy.ExistingPlayerAction.RESPAWN_CONNECTED_PLAYER,
+				AgentRespawnSpawnPolicy.existingPlayerAction(true, false),
+				"a retained dead Carpet player respawns through its existing connection"
+		);
+		assertEquals(
+				AgentRespawnSpawnPolicy.ExistingPlayerAction.RESPAWN_CONNECTED_PLAYER,
+				AgentRespawnSpawnPolicy.existingPlayerAction(true, true),
+				"Carpet's temporary post-death health reset cannot turn a retained death into a second disconnect"
+		);
+		assertEquals(
 				AgentRespawnSpawnPolicy.ExistingPlayerAction.WAIT_FOR_NATURAL_REMOVAL,
-				AgentRespawnSpawnPolicy.existingPlayerAction(false),
-				"a dead Carpet player must finish its own disconnect without a second kill"
+				AgentRespawnSpawnPolicy.existingPlayerAction(false, false),
+				"an unretained dead Carpet player may finish its stock disconnect"
 		);
 		assertEquals(
 				AgentRespawnSpawnPolicy.ExistingPlayerAction.REMOVE_STALE_PLAYER,
-				AgentRespawnSpawnPolicy.existingPlayerAction(true),
-				"a stale live player must be removed before replacement"
+				AgentRespawnSpawnPolicy.existingPlayerAction(false, true),
+				"an unrelated stale live player must be removed before replacement"
 		);
 		CodexAgentManager.RespawnRemovalDecision beforeGrace = CodexAgentManager.respawnRemovalDecision(
 				false, false, true, 999L, 1_000L, deadline);
@@ -178,7 +193,59 @@ public final class AgentRespawnSpawnPolicyVerification {
 					throw new AssertionError("coarse snapshots must skip exact recovery");
 				}
 		).isEmpty(), "coarse snapshots continue directly to bounded recovery");
-		return 42;
+
+		var inFlight = new java.util.LinkedHashMap<dev.agaminggod.arenaagents.agent.AgentId, Object>();
+		var agentId = dev.agaminggod.arenaagents.agent.AgentId.random();
+		var starts = new java.util.concurrent.atomic.AtomicInteger();
+		Object first = CodexAgentManager.singleFlight(inFlight, agentId, () -> {
+			starts.incrementAndGet();
+			return new Object();
+		});
+		Object second = CodexAgentManager.singleFlight(inFlight, agentId, () -> {
+			starts.incrementAndGet();
+			return new Object();
+		});
+		assertSame(first, second, "automatic and coordinator respawn requests share one attempt");
+		assertEquals(1, starts.get(), "only one physical respawn attempt can start per agent");
+		assertEquals(1, inFlight.size(), "single-flight ownership keeps one pending respawn entry");
+
+		AgentId abortId = AgentId.random();
+		AgentRecord deadRecord = AgentRecord.create(
+				abortId, new AgentProfile("codex", "gpt-5.6-sol", "high", Optional.empty(), 0), 1_000L);
+		CodexAgentManager.VanillaRespawnAttempt attempt = vanillaRespawnAttempt(deadRecord);
+		var pending = new LinkedHashMap<AgentId, CodexAgentManager.VanillaRespawnAttempt>();
+		pending.put(abortId, attempt);
+		assertTrue(CodexAgentManager.abortPendingVerifiedRespawn(pending, attempt),
+				"cancellation removes the manager-owned pending respawn");
+		assertTrue(pending.isEmpty(), "a cancelled respawn cannot remain eligible to commit");
+		assertFalse(CodexAgentManager.abortPendingVerifiedRespawn(pending, attempt),
+				"a second cancel cannot abort a respawn that already left the map");
+		CodexAgentManager.VanillaRespawnAttempt replacement = vanillaRespawnAttempt(deadRecord);
+		pending.put(abortId, replacement);
+		assertFalse(CodexAgentManager.abortPendingVerifiedRespawn(pending, attempt),
+				"cancellation cannot abort a replacement attempt");
+		assertSame(replacement, pending.get(abortId), "a newer pending respawn stays in flight");
+
+		assertTrue(CodexAgentManager.shouldRetryConnectedRespawn(true, true, true),
+				"publication failure keeps a healthy connected replacement for retry");
+		assertFalse(CodexAgentManager.shouldRetryConnectedRespawn(true, false, true),
+				"a missing connected replacement falls back to recovery");
+		assertFalse(CodexAgentManager.shouldRetryConnectedRespawn(false, true, true),
+				"legacy createFake failures retain their existing rollback semantics");
+		assertFalse(CodexAgentManager.shouldRetryConnectedRespawn(true, true, false),
+				"a superseded lifecycle cannot replay an old connected respawn commit");
+		return 56;
+	}
+
+	private static CodexAgentManager.VanillaRespawnAttempt vanillaRespawnAttempt(AgentRecord deadRecord) {
+		try {
+			var constructor = CodexAgentManager.VanillaRespawnAttempt.class.getDeclaredConstructor(
+					AgentRecord.class, OfflineAgentPlayers.VanillaRespawnTarget.class, long.class, long.class);
+			constructor.setAccessible(true);
+			return constructor.newInstance(deadRecord, null, 0L, 0L);
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("missing vanilla respawn attempt constructor", exception);
+		}
 	}
 
 	private static RuntimeException expectRuntimeFailure(Runnable operation) {

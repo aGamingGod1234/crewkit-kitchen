@@ -7,7 +7,10 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.WeakHashMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeUnit;
 import java.nio.charset.StandardCharsets;
@@ -26,6 +29,8 @@ public final class VoiceSubsystemRuntime {
 	private static final long INITIAL_START_RETRY_NANOS = TimeUnit.SECONDS.toNanos(1L);
 	private static final long MAX_START_RETRY_NANOS = TimeUnit.SECONDS.toNanos(30L);
 	private static final Map<MinecraftServer, Holder> INSTANCES = new WeakHashMap<>();
+	private static final ConcurrentMap<MinecraftServer, Set<java.util.UUID>> AGENT_PLAYERS =
+			new ConcurrentHashMap<>();
 	private static final Map<MinecraftServer, StartupRetry> STARTUP_RETRIES = new WeakHashMap<>();
 	private static final Map<MinecraftServer, LegacyStartupRetry> LEGACY_STARTUP_RETRIES = new WeakHashMap<>();
 	private static final Map<MinecraftServer, LinkedHashMap<AgentId, String>> AVAILABILITY_DIAGNOSTICS =
@@ -99,6 +104,7 @@ public final class VoiceSubsystemRuntime {
 				&& safelyAvailable(server, existing.subsystem())) return true;
 		if (existing != null) {
 			INSTANCES.remove(server);
+			AGENT_PLAYERS.remove(server);
 			close(server, existing);
 		}
 		boolean foundProvider = false;
@@ -111,6 +117,7 @@ public final class VoiceSubsystemRuntime {
 				INSTANCES.put(server, new Holder(
 						configuration, candidate, new VoiceRegistrationTracker(), new LinkedHashMap<>()
 				));
+				AGENT_PLAYERS.put(server, Set.of());
 				STARTUP_RETRIES.remove(server);
 				reportRuntimeRecovery(server);
 				return true;
@@ -126,6 +133,7 @@ public final class VoiceSubsystemRuntime {
 		INSTANCES.put(server, new Holder(
 				configuration, NoVoiceSubsystem.INSTANCE, new VoiceRegistrationTracker(), new LinkedHashMap<>()
 		));
+		AGENT_PLAYERS.put(server, Set.of());
 		return true;
 	}
 
@@ -142,6 +150,7 @@ public final class VoiceSubsystemRuntime {
 		manager.records().forEach(record -> manager.findAgentPlayer(record.agentId())
 				.filter(player -> player.isAlive())
 				.ifPresent(player -> current.put(record.agentId(), player.getUUID())));
+		AGENT_PLAYERS.put(server, Set.copyOf(current.values()));
 		try {
 			holder.tracker().reconcile(current, holder.subsystem());
 		} catch (RuntimeException exception) {
@@ -248,7 +257,14 @@ public final class VoiceSubsystemRuntime {
 		if (holder != null) holder.subsystem().cancelHumanSpeech(playerId);
 	}
 
+	public static boolean isAgentPlayer(MinecraftServer server, java.util.UUID playerId) {
+		Objects.requireNonNull(server, "server must not be null");
+		Objects.requireNonNull(playerId, "playerId must not be null");
+		return AGENT_PLAYERS.getOrDefault(server, Set.of()).contains(playerId);
+	}
+
 	public static synchronized void close(MinecraftServer server) {
+		AGENT_PLAYERS.remove(server);
 		AVAILABILITY_DIAGNOSTICS.remove(server);
 		STARTUP_RETRIES.remove(server);
 		LEGACY_STARTUP_RETRIES.remove(server);

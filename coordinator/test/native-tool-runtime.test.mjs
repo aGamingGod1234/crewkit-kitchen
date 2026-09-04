@@ -55,6 +55,31 @@ test('native body dispatches one correlated action and resolves only its matchin
 	assert.deepEqual(await result, { state: 'SUCCEEDED', reasonCode: '', executionStarted: true });
 });
 
+test('native action preserves authoritative progress and terminal observation evidence', async () => {
+	const sent = [];
+	const traces = [];
+	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async (...args) => sent.push(args) }, trace: (...args) => traces.push(args) });
+	const pending = runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-evidence', callId: 'call-evidence',
+		tool: { kind: 'action', actionType: 'mine', arguments: { x: 2, y: 64, z: 1, timeoutMs: 10_000 } },
+	}, record());
+	await Promise.resolve();
+	const actionId = sent[0][2].actionId;
+	const actionObservation = { worldTick: 9, observedAtEpochMs: 100, target: { kind: 'block', position: { x: 2, y: 64, z: 1 }, currentId: 'minecraft:oak_log' }, progress: { value: 0.25, basis: 'block_damage', verified: true } };
+	assert.equal(runtime.onActionProgress(record(), { goalRevision: 3, actionId, progress: 0.25, actionObservation }), true);
+	const progressTrace = traces.find(([event]) => event === 'native_tool_action_progress');
+	assert.ok(progressTrace);
+	const resultObservation = { ...actionObservation, worldTick: 10, target: { ...actionObservation.target, currentId: 'minecraft:air', worldChanged: true }, progress: { value: 1, basis: 'world_mutation', verified: true } };
+	assert.equal(runtime.onActionResult(record(), {
+		goalRevision: 3, actionId, state: 'SUCCEEDED', reasonCode: 'BLOCK_BROKEN', executionStarted: true, physicalAttempted: true,
+		actionObservation: resultObservation,
+	}), true);
+	assert.deepEqual(await pending, {
+		state: 'SUCCEEDED', reasonCode: 'BLOCK_BROKEN', executionStarted: true, physicalAttempted: true, actionObservation: resultObservation,
+	});
+	assert.deepEqual(progressTrace[1].actionObservation, actionObservation);
+});
+
 test('native observe returns latest compact facts without sending a body command', async () => {
 	const sent = [];
 	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async (...args) => sent.push(args) } });
@@ -67,6 +92,31 @@ test('native observe returns latest compact facts without sending a body command
 		observation: { player: { health: 18 }, blocks: [{ blockId: 'minecraft:stone', x: 1, y: 63, z: 1 }] },
 	});
 	assert.deepEqual(sent, []);
+});
+
+test('lookAround turns the real player in bounded steps and preserves the observed hand and slot', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) } });
+	runtime.updateObservation(record(), {
+		interaction: { input: { selectedSlot: 3, hand: 'off_hand' } },
+	}, { eventSequence: 1 });
+	const pending = runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-look', callId: 'look-1',
+		tool: { kind: 'lookAround', centerYaw: 0, pitch: 5, steps: 4, ticksPerStep: 2 },
+	}, record());
+	for (const [index, yaw] of [90, 180, -90, 0].entries()) {
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(sent.length, index + 1);
+		assert.deepEqual(sent[index][2].arguments, {
+			forward: 0, strafe: 0, jump: false, sneak: false, sprint: false,
+			attack: false, use: false, yaw, pitch: 5, selectedSlot: 3, hand: 'off', ticks: 2,
+		});
+		runtime.onActionResult(record(), { actionId: sent[index][2].actionId, state: 'SUCCEEDED', reasonCode: '' });
+	}
+	assert.deepEqual(await pending, {
+		state: 'SUCCEEDED', completed: 4,
+		results: [0, 1, 2, 3].map((index) => ({ actionType: 'control', state: 'SUCCEEDED', reasonCode: '' })),
+	});
 });
 
 test('native lifecycle disposal cancels an outstanding body action and rejects the tool', async () => {
@@ -319,7 +369,7 @@ test('native sequence executes model-authored actions in order and returns every
 			kind: 'sequence',
 			actions: [
 				{ actionType: 'navigate_to', arguments: { x: 2, y: 64, z: 1, tolerance: 1, sprint: true, timeoutMs: 30_000 } },
-				{ actionType: 'break_block', arguments: { x: 2, y: 64, z: 1, timeoutMs: 15_000 } },
+				{ actionType: 'break_block', arguments: { x: 2, y: 64, z: 1, expectedBlockId: 'minecraft:stone', timeoutMs: 15_000 } },
 			],
 		},
 	}, record());
@@ -348,7 +398,7 @@ test('native sequence stops before later actions after the first factual failure
 			kind: 'sequence',
 			actions: [
 				{ actionType: 'navigate_to', arguments: { x: 2, y: 64, z: 1, tolerance: 1, sprint: true, timeoutMs: 30_000 } },
-				{ actionType: 'break_block', arguments: { x: 2, y: 64, z: 1, timeoutMs: 15_000 } },
+				{ actionType: 'break_block', arguments: { x: 2, y: 64, z: 1, expectedBlockId: 'minecraft:stone', timeoutMs: 15_000 } },
 			],
 		},
 	}, record());
@@ -360,5 +410,25 @@ test('native sequence stops before later actions after the first factual failure
 		failedAt: 0,
 		results: [{ actionType: 'navigate_to', state: 'FAILED', reasonCode: 'NO_PATH', executionStarted: true }],
 	});
+	assert.equal(sent.length, 1);
+});
+
+test('native sequence is cancelled if the lifecycle is disposed between steps', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) } });
+	const pending = runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-sequence-dispose', callId: 'sequence-dispose',
+		tool: {
+			kind: 'sequence',
+			actions: [
+				{ actionType: 'wait', arguments: { durationMs: 1 } },
+				{ actionType: 'wait', arguments: { durationMs: 1 } },
+			],
+		},
+	}, record());
+	await new Promise((resolve) => setImmediate(resolve));
+	runtime.onActionResult(record(), { actionId: sent[0][2].actionId, state: 'SUCCEEDED', reasonCode: '' });
+	await runtime.dispose('agent-a', 'goal_replaced');
+	await assert.rejects(pending, (error) => error?.code === 'NATIVE_ACTION_CANCELLED');
 	assert.equal(sent.length, 1);
 });

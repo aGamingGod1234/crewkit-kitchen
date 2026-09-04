@@ -53,13 +53,15 @@ try {
 	}
 
 	$properties = Read-Properties (Read-ZipText $archive 'distribution.properties')
-	foreach ($required in @('mod_version', 'minecraft_version', 'loader_version', 'fabric_api_version', 'carpet_version')) {
+	foreach ($required in @('mod_version', 'minecraft_version', 'loader_version', 'fabric_api_version', 'carpet_version', 'voicechat_version', 'voice_addon_version')) {
 		if (-not $properties.Contains($required)) { throw "Distribution metadata is missing '$required'." }
 	}
 	$expectedMods = @(
 		"mods/arena-agents-$($properties.mod_version).jar"
+		"mods/arena-agents-voice-$($properties.voice_addon_version).jar"
 		"mods/fabric-api-$($properties.fabric_api_version).jar"
 		"mods/fabric-carpet-$($properties.carpet_version).jar"
+		"mods/voicechat-fabric-$($properties.voicechat_version).jar"
 	)
 	$actualMods = @($files | Where-Object { $_ -like 'mods/*.jar' } | Sort-Object)
 	if (@(Compare-Object ($expectedMods | Sort-Object) $actualMods).Count -ne 0) {

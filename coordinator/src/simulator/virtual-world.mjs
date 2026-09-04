@@ -420,6 +420,9 @@ export class VirtualWorld extends EventEmitter {
 				const target = { x: args.x, y: args.y, z: args.z };
 				const remaining = distance(player.position, target);
 				if (remaining <= args.tolerance) {
+					if (!this.#isPositionClear(target)) {
+						return { done: true, state: 'FAILED', reasonCode: 'DESTINATION_BLOCKED', changed: false };
+					}
 					player.velocity = { x: 0, y: 0, z: 0 };
 					return { done: true, state: 'SUCCEEDED', reasonCode: 'ARRIVED', changed: true };
 				}
@@ -685,6 +688,13 @@ export class VirtualWorld extends EventEmitter {
 		probe.y -= 0.01;
 		for (const block of this.#blocks.values()) if (isSolid(block.blockId) && playerIntersectsBlock(probe, block)) return true;
 		return false;
+	}
+
+	#isPositionClear(position) {
+		for (const block of this.#blocks.values()) {
+			if (isSolid(block.blockId) && playerIntersectsBlock(position, block)) return false;
+		}
+		return true;
 	}
 
 	#applyEnvironment(player) {

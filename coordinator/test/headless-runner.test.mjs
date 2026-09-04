@@ -159,12 +159,15 @@ test('runs a real-provider scenario with exact RCON sequence and injected eviden
 	let clock = 100;
 	let recorderClosed = 0;
 	const files = new Map([
-		['protocol.jsonl', jsonl([{ direction: 'outbound', envelope: { type: 'coordinator_status', payload: {
-			circuits: [{ provider: 'codex', model: 'gpt-5.6-sol', operation: 'decide', count: 2, p50Ms: 321, p95Ms: 654, failureRate: 0, circuit: 'closed' }],
-			latencies: [{ operation: 'observation_to_plan', count: 1, p50Ms: 700, p95Ms: 700 }],
-		} } }])],
+		['protocol.jsonl', jsonl([
+			{ direction: 'outbound', envelope: { type: 'coordinator_status', payload: {
+				circuits: [{ provider: 'codex', model: 'gpt-5.6-sol', operation: 'decide', count: 2, p50Ms: 321, p95Ms: 654, failureRate: 0, circuit: 'closed' }],
+				latencies: [{ operation: 'observation_to_plan', count: 1, p50Ms: 700, p95Ms: 700 }],
+			} } },
+			{ direction: 'outbound', envelope: { type: 'action_command', payload: { actionId: 'move-1', actionType: 'move', arguments: { x: 1, y: 0, z: 0 } } } },
+			{ direction: 'inbound', envelope: { type: 'action_result', payload: { actionId: 'move-1', actionType: 'move', state: 'SUCCEEDED', reasonCode: 'DESTINATION_REACHED' } } },
+		])],
 		['coordinator.jsonl', jsonl([
-			{ event: 'program_step', actionType: 'move', arguments: { x: 1, y: 0, z: 0 }, result: { state: 'SUCCEEDED', reasonCode: 'DONE' } },
 			{ event: 'program_step', actionType: 'chat', arguments: { message: 'HEADLESS_PASS' }, result: null },
 			{ event: 'program_step', actionType: 'chat', arguments: { message: 'HEADLESS_PASS' }, result: { state: 'SUCCEEDED', reasonCode: 'DONE' } },
 			{ event: 'program_finished', status: 'COMPLETED' },
@@ -180,6 +183,7 @@ test('runs a real-provider scenario with exact RCON sequence and injected eviden
 			if (command.startsWith('codex start ')) return { text: 'Goal started.' };
 			if (command.startsWith('codex status ')) return { text: statusReads++ === 0 ? 'state=RUNNING' : 'state=COMPLETED' };
 			if (command === 'data get entity @s Pos') return { text: '[1.0d, 64.0d, 1.0d]' };
+			if (command.startsWith('codex remove ')) return { text: 'Removed runner-case-agent.' };
 			throw new Error(`unexpected command: ${command}`);
 		},
 		close: async () => {},
@@ -201,7 +205,8 @@ test('runs a real-provider scenario with exact RCON sequence and injected eviden
 	assert.equal(commands[4], 'execute in minecraft:overworld run forceload remove 0 0');
 	assert.equal(commands[5], `codex start ${generatedName} Do the bounded task`);
 	assert.equal(commands[6], `codex status ${generatedName}`);
-	assert.equal(commands.at(-1), 'data get entity @s Pos');
+	assert.ok(commands.indexOf('data get entity @s Pos') < commands.indexOf(`codex remove ${generatedName}`));
+	assert.equal(commands.at(-1), `codex remove ${generatedName}`);
 	assert.equal(commands.some((command) => command.includes('action_result')), false);
 	assert.equal(recorderClosed, 1);
 	assert.equal(report.assertions.every((result) => result.passed), true);
@@ -283,7 +288,10 @@ test('summons, starts, and polls an eight-agent exact-profile roster concurrentl
 	assert.equal(maxActiveByPhase.get('start'), 8);
 	assert.equal(maxActiveByPhase.get('status'), 8);
 	const summons = commands.filter((command) => command.includes('summon-configured'));
+	const removals = commands.filter((command) => command.startsWith('codex remove '));
 	assert.equal(summons.length, 8);
+	assert.equal(removals.length, 8);
+	assert.deepEqual(new Set(removals.map((command) => command.split(' ').at(-1))), new Set(names));
 	assert.ok(summons.every((command) => command.includes(' codex gpt-5.6-sol high priority survival ')));
 	assert.equal(new Set(summons.map((command) => command.match(/positioned ([^ ]+ [^ ]+ [^ ]+)/)?.[1])).size, 8);
 });
@@ -407,10 +415,10 @@ test('reports bounded p50 p95 p99 metrics and null provider-native token categor
 	assert.ok(Buffer.byteLength(JSON.stringify(report.metrics), 'utf8') < 16_384);
 });
 
-test('binds single-agent metrics to the authoritative snapshot ID instead of the generated selector', async () => {
+test('accepts the production summon response and binds metrics to the authoritative registration ID', async () => {
 	const generatedName = GENERATED_NAME_AT_100;
 	const files = new Map([
-		['protocol.jsonl', jsonl([{ direction: 'server_to_coordinator', envelope: { type: 'agent_snapshot', agentId: 'authoritative-single', payload: {
+		['protocol.jsonl', jsonl([{ direction: 'server_to_coordinator', envelope: { type: 'agent_registered', agentId: 'authoritative-single', payload: {
 			agentId: 'authoritative-single', name: generatedName, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority',
 		} } }])],
 		['provider.jsonl', jsonl([
@@ -418,13 +426,16 @@ test('binds single-agent metrics to the authoritative snapshot ID instead of the
 			{ agentId: 'authoritative-single', provider: 'codex', model: 'gpt-5.6-sol', timing: { durationMs: 12, apiDurationMs: 10 } },
 		])],
 	]);
+	let statusReads = 0;
+	const commands = [];
 	const report = await runHeadlessScenario({
-		scenario: scenario({ assert: [{ type: 'lifecycle', state: 'COMPLETED' }] }), runDirectory: 'C:/runs/single-authoritative',
-		rcon: { command: async (command) => ({ text: command.includes('summon-configured') ? `Created ${generatedName}. It is ready for a task.` : command.startsWith('codex status') ? 'state=COMPLETED' : 'ok' }), close: async () => {} },
+		scenario: scenario({ setupBlocks: [{ x: 2, y: 201, z: 0, blockId: 'minecraft:oak_log' }], assert: [{ type: 'lifecycle', state: 'COMPLETED' }] }), runDirectory: 'C:/runs/single-authoritative',
+		rcon: { command: async (command) => { commands.push(command); return { text: command.includes('summon-configured') ? `Creating ${generatedName}. It will be ready when its player joins.` : command.startsWith('codex status') ? statusReads++ === 0 ? `${generatedName} | Ready. Current task: none. Queued tasks: 0.` : 'state=COMPLETED' : 'ok' }; }, close: async () => {} },
 		now: () => 100, providerTurnsPath: 'C:/provider.jsonl', protocolAudit: 'C:/protocol.jsonl',
 		readFile: async (file) => files.get(String(file).replace('C:/', '')) ?? '', writeFile: async () => {}, poll: async () => {},
 	});
 	assert.deepEqual(report.metrics.latencyMs.inference, { count: 1, p50: 10, p95: 10, p99: 10 });
+	assert.ok(commands.indexOf('execute in minecraft:overworld run setblock 2 201 0 minecraft:oak_log') < commands.findIndex((command) => command.includes('summon-configured')));
 });
 
 test('evaluates single-agent assertions only after exact authoritative identity isolation', async () => {
@@ -577,6 +588,30 @@ test('isolates early agent evidence before applying row bounds across more than 
 	assert.ok(report.agents.every((agent) => agent.assertions.every((assertion) => assertion.passed)));
 });
 
+test('retains authoritative action and chat evidence ahead of hundreds of later observations', async () => {
+	const generatedName = GENERATED_NAME_AT_100;
+	const agentId = 'durable-evidence-agent';
+	const protocol = jsonl([
+		{ envelope: { type: 'agent_registered', agentId, payload: { agentId, name: generatedName, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority' } } },
+		{ envelope: { type: 'action_command', agentId, payload: { actionId: 'chat-1', actionType: 'chat', arguments: { message: 'HEADLESS_PASS' } } } },
+		{ envelope: { type: 'action_result', agentId, payload: { actionId: 'chat-1', actionType: 'chat', state: 'SUCCEEDED' } } },
+		{ envelope: { type: 'action_command', agentId, payload: { actionId: 'move-1', actionType: 'move', arguments: { x: 1 } } } },
+		{ envelope: { type: 'action_result', agentId, payload: { actionId: 'move-1', actionType: 'move', state: 'SUCCEEDED' } } },
+		...Array.from({ length: 400 }, (_value, eventSequence) => ({ envelope: { type: 'observation', agentId, payload: { eventSequence } } })),
+	]);
+	const report = await runHeadlessScenario({
+		scenario: scenario({ assert: [
+			{ type: 'lifecycle', state: 'COMPLETED' },
+			{ type: 'chat', message: 'HEADLESS_PASS' },
+			{ type: 'action', actionType: 'move', args: { x: 1 }, resultState: 'SUCCEEDED' },
+		] }), runDirectory: 'C:/runs/durable-evidence', now: () => 100,
+		rcon: { command: async (command) => ({ text: command.includes('summon-configured') ? `Created ${generatedName}. It is ready for a task.` : command.startsWith('codex status') ? 'state=COMPLETED' : 'ok' }), close: async () => {} },
+		readFile: async (file) => String(file).endsWith('protocol.jsonl') ? protocol : '', writeFile: async () => {}, poll: async () => {},
+	});
+	assert.equal(report.status, 'PASSED');
+	assert.ok(report.assertions.every((assertion) => assertion.passed));
+});
+
 test('releases the temporary spawn chunk when summon fails', async () => {
 	const commands = [];
 	const report = await runHeadlessScenario({
@@ -727,6 +762,24 @@ test('rejects mutation-capable RCON assertion commands using a conservative allo
 		assert.equal(forwarded, false);
 		assert.equal(report.classification, 'ERROR');
 	}
+});
+
+test('allows a bounded block predicate to guard a read-only entity query', async () => {
+	let forwarded = false;
+	const report = await runHeadlessScenario({
+		scenario: scenario({ assert: [
+			{ type: 'lifecycle', state: 'COMPLETED' },
+			{ type: 'rcon', command: 'execute if block 2 201 0 minecraft:air run data get entity {agent} Pos', match: 'entity data' },
+		] }),
+		runDirectory: 'C:/runs/rcon-block-predicate',
+		rcon: { command: async (command) => {
+			if (command.startsWith('execute if block')) { forwarded = true; return { text: 'test_agent has the following entity data' }; }
+			return { text: command.includes('summon-configured') ? 'Created test_agent. It is ready for a task.' : command.startsWith('codex status') ? 'runner | Task complete. Goal finished.' : 'ok' };
+		}, close: async () => {} },
+		now: () => 1, readFile: async () => '', poll: async () => {}, writeFile: async () => {},
+	});
+	assert.equal(forwarded, true);
+	assert.equal(report.status, 'PASSED');
 });
 
 test('returns cleanup failure even when cleanup report writing also fails', async () => {

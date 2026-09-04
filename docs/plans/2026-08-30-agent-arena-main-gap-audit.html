@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Agent Arena main audit</title>
+  <style>
+    :root {
+      --bg: #0c0d0f;
+      --surface: #121419;
+      --line: #292d35;
+      --text: #f3f1eb;
+      --muted: #a9abb2;
+      --accent: #97f0c1;
+      --danger: #ffb4a9;
+      --warn: #f3d18a;
+      --info: #b7caf7;
+      --max: 1120px;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 16px/1.58 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    a { color: var(--accent); text-underline-offset: 3px; }
+    main { width: min(calc(100% - 32px), var(--max)); margin: 0 auto; padding: 72px 0 96px; }
+    header { max-width: 820px; padding-bottom: 46px; }
+    .eyebrow { color: var(--accent); font: 650 13px/1.3 ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .08em; text-transform: uppercase; }
+    h1 { margin: 12px 0 16px; font-size: clamp(40px, 7vw, 72px); line-height: .98; letter-spacing: -.045em; }
+    h2 { margin: 0 0 20px; font-size: clamp(25px, 4vw, 36px); line-height: 1.1; letter-spacing: -.025em; }
+    h3 { margin: 0 0 8px; font-size: 18px; line-height: 1.25; }
+    p { margin: 0 0 14px; }
+    .lede { max-width: 720px; color: #d9d7d0; font-size: clamp(18px, 2.4vw, 23px); line-height: 1.42; }
+    .meta { display: flex; flex-wrap: wrap; gap: 8px 22px; margin-top: 25px; color: var(--muted); font-size: 14px; }
+    nav { display: flex; flex-wrap: wrap; gap: 8px 18px; border-block: 1px solid var(--line); padding: 14px 0; margin-bottom: 64px; font-size: 14px; }
+    section { scroll-margin-top: 24px; padding: 0 0 64px; }
+    .summary { display: grid; grid-template-columns: repeat(4, 1fr); border-block: 1px solid var(--line); margin-top: 28px; }
+    .metric { padding: 20px 18px 20px 0; }
+    .metric strong { display: block; font-size: 25px; line-height: 1.1; }
+    .metric span { color: var(--muted); font-size: 13px; }
+    .callout { border-left: 3px solid var(--accent); padding: 4px 0 4px 20px; max-width: 820px; }
+    .callout.warn { border-color: var(--warn); }
+    .status-grid { display: grid; grid-template-columns: 180px 1fr; border-top: 1px solid var(--line); }
+    .status-grid > div { border-bottom: 1px solid var(--line); padding: 13px 0; }
+    .status-grid .label { color: var(--muted); font-size: 14px; }
+    code { color: #d8e5ff; font: 13px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }
+    .phases { counter-reset: phase; border-top: 1px solid var(--line); }
+    .phase { display: grid; grid-template-columns: 54px minmax(0, 1fr) 180px; gap: 18px; border-bottom: 1px solid var(--line); padding: 22px 0; }
+    .phase::before { counter-increment: phase; content: "0" counter(phase); color: var(--accent); font: 700 14px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .phase p { color: var(--muted); margin: 4px 0 0; }
+    .phase .exit { color: var(--info); font-size: 14px; }
+    details { border-top: 1px solid var(--line); }
+    details:last-child { border-bottom: 1px solid var(--line); }
+    summary { cursor: pointer; list-style: none; padding: 19px 0; font-weight: 680; font-size: 19px; }
+    summary::-webkit-details-marker { display: none; }
+    summary::after { content: "+"; float: right; color: var(--accent); }
+    details[open] summary::after { content: "−"; }
+    .register { list-style: none; padding: 0; margin: 0 0 28px; counter-reset: item; }
+    .register li { counter-increment: item; display: grid; grid-template-columns: 62px minmax(0, 1fr); gap: 16px; border-top: 1px solid var(--line); padding: 19px 0; }
+    .register li::before { content: attr(data-id); color: var(--muted); font: 650 12px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .register p { margin: 5px 0 0; color: #d1d0cb; }
+    .register .evidence { color: var(--muted); font-size: 13px; }
+    .priority { display: inline-block; margin-left: 8px; color: var(--warn); font: 650 12px/1 ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .p0 { color: var(--danger); }
+    .p2 { color: var(--info); }
+    .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 36px; }
+    ul { margin: 8px 0 0; padding-left: 20px; }
+    li + li { margin-top: 8px; }
+    .small { color: var(--muted); font-size: 14px; }
+    footer { border-top: 1px solid var(--line); padding-top: 24px; color: var(--muted); font-size: 13px; }
+    @media (max-width: 760px) {
+      main { width: min(calc(100% - 24px), var(--max)); padding-top: 42px; }
+      .summary { grid-template-columns: 1fr 1fr; }
+      .phase { grid-template-columns: 38px 1fr; }
+      .phase .exit { grid-column: 2; }
+      .status-grid { grid-template-columns: 1fr; }
+      .status-grid .label { border-bottom: 0; padding-bottom: 0; }
+      .status-grid .label + div { padding-top: 3px; }
+      .two-col { grid-template-columns: 1fr; gap: 28px; }
+      .register li { grid-template-columns: 46px minmax(0, 1fr); gap: 8px; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">Repository audit · 30 August 2026</div>
+    <h1>Agent Arena main audit</h1>
+    <p class="lede">A release-focused plan built from parallel XHigh reviews of security, runtime reliability, performance, architecture, product, frontend, protocol, CI, and packaging.</p>
+    <div class="meta">
+      <span>Commit <code>4c83bd29ee016f2d7ab8881496028861a3dd4658</code></span>
+      <span>Branch baseline <code>origin/main</code></span>
+      <span>Scope: full repository</span>
+    </div>
+    <div class="summary" aria-label="Audit summary">
+      <div class="metric"><strong>0</strong><span>open pull requests</span></div>
+      <div class="metric"><strong>9/9</strong><span>worker slots filled</span></div>
+      <div class="metric"><strong>56</strong><span>consolidated gaps</span></div>
+      <div class="metric"><strong>0</strong><span>test failures</span></div>
+    </div>
+  </header>
+
+  <nav aria-label="Page sections">
+    <a href="#verdict">Verdict</a>
+    <a href="#source">Source state</a>
+    <a href="#sequence">Sequence</a>
+    <a href="#register">Full register</a>
+    <a href="#security">Security model</a>
+    <a href="#verified">Verified controls</a>
+  </nav>
+
+  <section id="verdict">
+    <h2>Verdict</h2>
+    <div class="callout">
+      <p><strong>The core is stronger than its rough edges suggest.</strong> Protocol bounds, signed local bridges, lifecycle recovery, observation budgets, voice consent, archive containment, and the test suite are substantial. The next release should still wait for six issues: the offline gameplay listener, a reconnect lock-order deadlock, missing durable journals around actions and arena preparation, destructive arena placement without preflight, and non-transactional installation.</p>
+    </div>
+    <p class="small" style="margin-top:18px">The most valuable work is not a broad rewrite. It is a short hardening pass around boundaries where process lifetime, disk durability, thread ownership, and user confirmation currently disagree.</p>
+  </section>
+
+  <section id="source">
+    <h2>Source state and proof</h2>
+    <div class="status-grid">
+      <div class="label">GitHub</div><div>No open pull requests. Nothing required merging.</div>
+      <div class="label">Local main</div><div><code>main</code> was advanced to <code>origin/main</code>. Both resolve to <code>4c83bd2</code>.</div>
+      <div class="label">Active checkout</div><div>The existing feature checkout was fast-forwarded to the same commit. Lucas's modified and untracked files were preserved.</div>
+      <div class="label">Node verification</div><div><code>npm test</code>: 1,306 tests, 1,303 passed, 3 skipped, 0 failed.</div>
+      <div class="label">Java verification</div><div><code>gradlew check --offline</code>: passed with 14,586 protocol and bridge assertions plus 296 voice assertions.</div>
+      <div class="label">Environment note</div><div>The machine's persistent <code>JAVA_HOME</code> selects JDK 21. Verification passed after a task-scoped override to the installed JDK 25. No persistent setting was changed.</div>
+      <div class="label">Security workbench</div><div>The canonical local scan contract was validated and sealed. The advisory connector was not connected, so protected workbench display status could not be confirmed.</div>
+    </div>
+  </section>
+
+  <section id="sequence">
+    <h2>Recommended implementation sequence</h2>
+    <div class="phases">
+      <div class="phase">
+        <div><h3>Close exposed and destructive boundaries</h3><p>Bind every offline Minecraft listener to loopback. Add arena site validation, exact bounds, occupancy checks, safe evacuation, and a one-time destructive confirmation.</p></div>
+        <div class="exit">Exit: remote joins fail and unconfirmed builds mutate nothing.</div>
+      </div>
+      <div class="phase">
+        <div><h3>Make state transitions durable and deadlock-free</h3><p>Remove the hello-path lock inversion. Journal accepted actions and arena preparation before their first irreversible effect. Align terminal replay retention.</p></div>
+        <div class="exit">Exit: crash injection and reconnect interleavings recover cleanly.</div>
+      </div>
+      <div class="phase">
+        <div><h3>Harden providers and installation</h3><p>Own child-process error events, bound pagination and remote bodies, make installation transactional, and make packaging instructions match the shipped files.</p></div>
+        <div class="exit">Exit: provider faults cannot terminate or wedge the coordinator.</div>
+      </div>
+      <div class="phase">
+        <div><h3>Cut steady-state cost</h3><p>Rotate traces, batch diagnostic writes, reduce observation copies, avoid repeated goal verification, and replace full dependency scans with a coarse change detector.</p></div>
+        <div class="exit">Exit: unchanged play has near-zero avoidable disk and allocation churn.</div>
+      </div>
+      <div class="phase">
+        <div><h3>Repair product contracts and UX</h3><p>Unify limits and service tiers, return explicit permission results, add cancel and in-flight states, fix accessibility, and remove or complete advertised capabilities.</p></div>
+        <div class="exit">Exit: every visible action reaches a clear success, rejection, or recovery state.</div>
+      </div>
+    </div>
+  </section>
+
+  <section id="register">
+    <h2>Full gap register</h2>
+    <p class="small">Priority means ordering, not effort. P0 blocks the next release. P1 should follow immediately. P2 belongs in the planned backlog. Open each group for evidence and the smallest useful fix.</p>
+
+    <details open>
+      <summary>Security and destructive operations · 4</summary>
+      <ol class="register">
+        <li data-id="SEC-01"><div><h3>Offline gameplay listeners accept unauthenticated network peers <span class="priority p0">P0</span></h3><p>Headless and prepared runtimes set <code>online-mode=false</code> but omit <code>server-ip=127.0.0.1</code>. A LAN peer can join, mutate the benchmark world, or fill slots.</p><p class="evidence"><code>server-template/server.properties:1-4</code>, <code>scripts/run-headless-provider-matrix.ps1:603-612</code>, <code>scripts/prepare-runtime.ps1:195-210</code>. Add loopback binding everywhere, fail closed, and test generated properties.</p></div></li>
+        <li data-id="SEC-02"><div><h3>Arena launch can erase a large live-world area without preflight <span class="priority p0">P0</span></h3><p><code>AT_PLAYER</code> can clear a 129 by 129 footprint up to world height on one click, without border, height, occupancy, structure, evacuation, preview, or overwrite checks.</p><p class="evidence"><code>ScenarioRuntimeService.java:1308-1320</code>, <code>ScenarioArenaBlueprint.java:70-85</code>, <code>ScenarioArenaResetJob.java:191-225</code>. Require a server verdict and one-time confirmation token before mutation.</p></div></li>
+        <li data-id="SEC-03"><div><h3>Legacy client actions can cross play sessions <span class="priority p2">P2</span></h3><p>The opt-in legacy bridge lives for the client process, not the current server connection. A delayed command from server A can execute after the user joins server B.</p><p class="evidence"><code>ArenaAgentsClient.java:41-97,118-131</code>, <code>ActionCommand.java:5-25</code>. Rotate a play-session nonce and cancel actions on disconnect.</p></div></li>
+        <li data-id="SEC-04"><div><h3>Name-pattern fallback can disguise offline-mode human players <span class="priority p2">P2</span></h3><p>A human with an agent-like name and matching offline UUID can receive the hidden name and agent skin even without registry membership.</p><p class="evidence"><code>AgentIdentity.java:15-17,94-113</code>, <code>AvatarRendererMixin.java:27-37</code>. Make the server snapshot authoritative.</p></div></li>
+      </ol>
+    </details>
+
+    <details open>
+      <summary>Reliability and concurrency · 12</summary>
+      <ol class="register">
+        <li data-id="REL-01"><div><h3>Coordinator reconnect can deadlock the Minecraft server <span class="priority p0">P0</span></h3><p>The socket hello path holds <code>publicationLock</code> then requests the synchronized registry. Server lifecycle paths hold the registry then enter publication.</p><p class="evidence"><code>MultiplexedServerBridge.java:917,946-956</code>, <code>AgentRegistry.java:241-246,533-566</code>. Prepare handshake state on the server thread, then publish an immutable batch.</p></div></li>
+        <li data-id="REL-02"><div><h3>A hard server crash can duplicate accepted world actions <span class="priority p0">P0</span></h3><p>Acceptance and replay ledgers are process-local. A crash after effect but before result loses the terminal outcome and allows a non-idempotent retry.</p><p class="evidence"><code>MultiplexedServerBridge.java:1608-1613,1771-1783</code>, <code>ProgramActionLedger.java:15-18</code>, <code>AgentSavedData.java:60-81</code>. Add a bounded write-ahead action journal.</p></div></li>
+        <li data-id="REL-03"><div><h3>Arena build and activation ownership disappears across crashes <span class="priority p0">P0</span></h3><p>Preparation is in memory until the run becomes active. Partial terrain edits and summoned contestants can survive without a durable owner or cleanup retry.</p><p class="evidence"><code>ScenarioRuntimeService.java:112-128,542-647,782-792,1074-1171</code>. Persist a preparation journal before the first block edit.</p></div></li>
+        <li data-id="REL-04"><div><h3>Terminal replay retention disagrees across Node and Java <span class="priority">P1</span></h3><p>Node evicts from a global cap while Java retains per agent, and a secondary Node set grows without a matching bound. A legitimate replay can become a duplicate error after eviction.</p><p class="evidence"><code>protocol-v2.mjs:79-80,850-916</code>, <code>TerminalResultLedger.java:20-45,106-115</code>. Define one retention model and make replay proof idempotent after eviction.</p></div></li>
+        <li data-id="REL-05"><div><h3>Provider stdio errors can escape as uncaught EPIPE <span class="priority">P1</span></h3><p>Child process streams are written without persistent error ownership. Provider exit timing can terminate the coordinator rather than reject one request.</p><p class="evidence"><code>acp-transport.mjs:87-117,173</code>, <code>codex-app-server.mjs:268-304,372-379</code>. Attach lifecycle error listeners and settle pending work once.</p></div></li>
+        <li data-id="REL-06"><div><h3>A never-settling TTS provider can consume capacity forever <span class="priority">P1</span></h3><p>Timeout aborts the signal, but capacity is released only when the raw provider promise settles. A provider that ignores abort permanently occupies a slot.</p><p class="evidence"><code>voice-http-server.mjs:158-194,272-278,339-357</code>. Race the provider with a server-owned terminal timeout and release exactly once.</p></div></li>
+        <li data-id="REL-07"><div><h3>Unsupported atomic moves can block all future scenarios <span class="priority">P1</span></h3><p>Result persistence treats a permanent filesystem capability failure as transient, retries every second forever, and retains <code>pendingResult</code>.</p><p class="evidence"><code>MatchResultWriter.java:186-208</code>, <code>ScenarioResultPersistence.java:26-50</code>, <code>ScenarioRuntimeService.java:973-989</code>. Detect capability once and use a documented fallback or actionable terminal state.</p></div></li>
+        <li data-id="REL-08"><div><h3>Scenario jobs retain stale player session objects <span class="priority p2">P2</span></h3><p>Disconnect and reconnect during build can send updates or teleport a removed <code>ServerPlayer</code> instance.</p><p class="evidence"><code>ScenarioRuntimeService.java:557-646,782-800,1408-1462</code>. Store UUID and resolve the live session at each use.</p></div></li>
+        <li data-id="REL-09"><div><h3>Fast reconnect can permanently desynchronize spectator deltas <span class="priority p2">P2</span></h3><p>The server may retain the UUID baseline while the client clears its base, causing every later chained delta to be rejected.</p><p class="evidence"><code>AgentControlSync.java:143-182</code>, <code>ArenaSpectatorState.java:22-39,51-59</code>. Clear on disconnect or add full-resync request and acknowledgement.</p></div></li>
+        <li data-id="REL-10"><div><h3>Windows provider termination has no hard outer deadline <span class="priority p2">P2</span></h3><p>The timeout starts after awaiting <code>taskkill</code>, so a hung OS helper can stall shutdown indefinitely.</p><p class="evidence"><code>child-process-lifecycle.mjs:24-37</code>. Put the complete termination sequence behind one deadline.</p></div></li>
+        <li data-id="REL-11"><div><h3>Recovery relocates agents to chunk centers <span class="priority p2">P2</span></h3><p>Only dimension, chunk, and integer Y survive restart. Agents can move roughly 11 blocks, leave a work site, change floors, and lose rotation.</p><p class="evidence"><code>AgentEntityLocation.java:6-21</code>, <code>CodexAgentManager.java:969-1056,1314-1324</code>. Persist bounded exact position and view with safe fallback migration.</p></div></li>
+        <li data-id="REL-12"><div><h3>Terminal results and build publications never expire <span class="priority p2">P2</span></h3><p>Late joiners can receive an old result popup and terminal deltas continue indefinitely.</p><p class="evidence"><code>ArenaSpectatorSnapshot.java:94-102</code>, <code>AgentControlSync.java:143-182</code>, <code>AgentControlClient.java:281-288</code>. Add a bounded retention window or recipient acknowledgement.</p></div></li>
+      </ol>
+    </details>
+
+    <details>
+      <summary>Performance and resource use · 8</summary>
+      <ol class="register">
+        <li data-id="PERF-01"><div><h3>Coordinator traces grow without rotation <span class="priority">P1</span></h3><p>Normal operation appends public and private JSONL forever. Every event opens two files and writes one row, increasing disk use and antivirus overhead.</p><p class="evidence"><code>dynamic-main.mjs:1917-1922,2419</code>, <code>trace-writer.mjs:18,91-96</code>. Rotate by size and age, cap generations, and batch through the diagnostic queue.</p></div></li>
+        <li data-id="PERF-02"><div><h3>Observation publication performs repeated deep copies and serialization <span class="priority">P1</span></h3><p>Bounded observations still pass through roughly eight copies across budgeting, retention, and wire serialization during bursts.</p><p class="evidence"><code>MultiplexedServerBridge.java:2748-2804</code>, <code>ServerObservationWireBudget.java:20,59-61,140-149</code>. Build one immutable wire projection and retain encoded bytes where safe.</p></div></li>
+        <li data-id="PERF-03"><div><h3>Failed non-kill goals are verified twice every tick <span class="priority">P1</span></h3><p>Repeated expensive predicates run before and after failure handling even when no relevant world fact changed.</p><p class="evidence"><code>GoalCompletionVerifier.java:55-66,98-118,273-277</code>, <code>GoalVerificationRuntime.java:122-140</code>. Cache by fact revision and verify once per changed input.</p></div></li>
+        <li data-id="PERF-04"><div><h3>Dependency monitoring rescans manifests four times per second <span class="priority">P1</span></h3><p>An unchanged installation can trigger hundreds of metadata operations every 250 ms, especially costly on Windows.</p><p class="evidence"><code>CoordinatorProcessSupervisor.java:230-233,1544-1569,1604-1620,2021-2049,2221-2237</code>. Poll coarse stamps every 1 to 5 seconds or use <code>WatchService</code>.</p></div></li>
+        <li data-id="PERF-05"><div><h3>Codex model pagination has no page bound, repeated-cursor guard, or cancellation <span class="priority">P1</span></h3><p>A faulty provider can create a tight async loop and starve useful work.</p><p class="evidence"><code>codex-service.mjs:326-335</code>, <code>codex-app-server.mjs:503-577</code>, <code>model-catalog-cache.mjs:66-77</code>. Bound pages, reject repeated cursors, yield, and honor abort.</p></div></li>
+        <li data-id="PERF-06"><div><h3>Unchanged heartbeats and fact baselines still churn allocations <span class="priority p2">P2</span></h3><p>Steady-state updates rebuild objects and baselines instead of reusing revisions.</p><p class="evidence"><code>dynamic-main.mjs</code> heartbeat and fact-ledger publication paths. Gate on revision change and reuse immutable snapshots.</p></div></li>
+        <li data-id="PERF-07"><div><h3>Spectator views are built before cadence decides to publish <span class="priority p2">P2</span></h3><p>Presentation work can be paid even when the four-tick publication gate emits nothing.</p><p class="evidence"><code>AgentControlSync.java:143-182</code>. Move snapshot construction behind cadence and recipient checks.</p></div></li>
+        <li data-id="PERF-08"><div><h3>Remote voice responses are fully buffered before size enforcement <span class="priority p2">P2</span></h3><p>Fish audio and Deepgram JSON can consume unbounded memory before application limits are checked.</p><p class="evidence"><code>fish</code> response path <code>:65-70</code>, Deepgram response path <code>:34-48</code>. Stream with byte ceilings and abort oversized bodies.</p></div></li>
+      </ol>
+    </details>
+
+    <details>
+      <summary>Architecture, protocol, and state contracts · 8</summary>
+      <ol class="register">
+        <li data-id="ARC-01"><div><h3>Goal length limits disagree across Java and Node <span class="priority">P1</span></h3><p>The UI accepts 4,096 UTF-16 units while Node accepts 2,048 code points. A goal can pass the UI, fail protocol validation, and tear down the bridge.</p><p class="evidence"><code>AgentConstants.java:11</code>, <code>AgentControlScreen.java:1543-1565</code>, <code>goal-spec.mjs:8,64-74</code>. Define one byte or code-point contract and reject locally.</p></div></li>
+        <li data-id="ARC-02"><div><h3>Scenario preflight drops requested service tier <span class="priority">P1</span></h3><p>Tier-aware coordinator state exists, but the scenario agent spec and preflight do not carry the preference, so readiness can approve the wrong execution class.</p><p class="evidence"><code>ScenarioAgentSpec.java:8-16</code>, <code>ScenarioRuntimeService.java:695-700</code>, <code>ScenarioPreflight.java:26-79</code>. Carry tier through request, preflight, activation, and results.</p></div></li>
+        <li data-id="ARC-03"><div><h3>Node accepts agent states Java considers impossible <span class="priority">P1</span></h3><p>Cross-runtime domain validation is asymmetric, allowing snapshots that cannot round-trip safely.</p><p class="evidence"><code>agent-registry.mjs:198-229</code>, <code>protocol-v2.mjs:1321-1360</code>, <code>AgentRecord.java:16-35</code>. Generate both validators from one state schema.</p></div></li>
+        <li data-id="ARC-04"><div><h3>COMPLETED can coexist with an unsatisfied ACTIVE goal <span class="priority">P1</span></h3><p>The Java registry and UI tolerate a contradictory domain state and publish it as done.</p><p class="evidence"><code>AgentRecord.java:8-35,104-106</code>, <code>AgentRegistry.java:329-350</code>, <code>MultiplexedServerBridge.java:2158-2167</code>. Make the illegal combination unrepresentable.</p></div></li>
+        <li data-id="ARC-05"><div><h3>External coordinator config silently preserves typos and stale defaults <span class="priority">P1</span></h3><p>Unknown or malformed values quietly fall back, and upgrades preserve the external config indefinitely.</p><p class="evidence"><code>dynamic-main.mjs:2442-2468</code>, <code>BundledCoordinatorInstaller.java:407-420</code>. Validate a versioned schema, report unknown keys, and migrate explicitly.</p></div></li>
+        <li data-id="ARC-06"><div><h3>The live coordinator and bridge are oversized ownership boundaries <span class="priority p2">P2</span></h3><p><code>dynamic-main.mjs</code> and <code>MultiplexedServerBridge</code> combine lifecycle, transport, policy, persistence, and presentation, increasing lock and state coupling.</p><p class="evidence">Large multi-domain modules in <code>coordinator/src/dynamic-main.mjs</code> and <code>MultiplexedServerBridge.java</code>. Extract only along existing lifecycle seams after the P0 fixes.</p></div></li>
+        <li data-id="ARC-07"><div><h3>Legacy v1 and current server-native control duplicate policy surfaces <span class="priority p2">P2</span></h3><p>Two runtimes carry separate session, command, status, and safety semantics, including known cross-session behavior.</p><p class="evidence"><code>ArenaAgentsClient.java</code>, <code>GoalControl.java</code>, current multiplexed bridge. Deprecate v1 or define a bounded compatibility lifetime.</p></div></li>
+        <li data-id="ARC-08"><div><h3>Provider identity and model preference are represented in several layers <span class="priority p2">P2</span></h3><p>Duplicated normalization and defaults make capability drift easy, as shown by service-tier and Gemini discrepancies.</p><p class="evidence"><code>provider-services.mjs</code>, provider backends, scenario specs, and UI model state. Centralize a small provider capability contract.</p></div></li>
+      </ol>
+    </details>
+
+    <details>
+      <summary>Packaging, CI, and operations · 8</summary>
+      <ol class="register">
+        <li data-id="OPS-01"><div><h3>Packaged installation is not transactional <span class="priority p0">P0</span></h3><p>The installer mutates the target before all profile validation completes, and upgrades can leave duplicate mod versions.</p><p class="evidence"><code>scripts/install-distribution.ps1:113,130-149</code>. Stage, validate, then atomically swap, following <code>install-normal-profile-update.ps1:159</code>.</p></div></li>
+        <li data-id="OPS-02"><div><h3>The downloadable archive instructions reference files not shipped <span class="priority">P1</span></h3><p>The README's setup commands cannot work from the release archive, which contains only three scripts and omits referenced preparation and profile installers.</p><p class="evidence"><code>README.md:34</code>, <code>build.gradle:268</code>. Define and test one archive-native happy path.</p></div></li>
+        <li data-id="OPS-03"><div><h3>The documented prepare and start flow contradicts itself <span class="priority">P1</span></h3><p>Preparation writes <code>online-mode=false</code>, while normal start requires <code>online-mode=true</code>.</p><p class="evidence"><code>scripts/prepare-runtime.ps1:197-200</code>, <code>scripts/start-test-server.ps1:23-30</code>. Separate offline smoke setup from the normal authenticated flow.</p></div></li>
+        <li data-id="OPS-04"><div><h3>CI never boots a real Fabric server <span class="priority">P1</span></h3><p>Current checks prove class presence and static contracts, but not mixin application, server start, bridge handshake, or one real action.</p><p class="evidence"><code>build.gradle:292</code>, workflow static checks around <code>:57</code>, <code>README.md:89</code>. Add one bounded boot and handshake job.</p></div></li>
+        <li data-id="OPS-05"><div><h3>POSIX process-group behavior is not exercised in Linux CI <span class="priority">P1</span></h3><p>The portable suite excludes the wrapper tests that specifically verify signal and descendant cleanup.</p><p class="evidence"><code>package.json:19</code>, CI Ubuntu job around <code>:18</code>, <code>posix-process-wrapper</code> tests. Add the focused suite to Linux.</p></div></li>
+        <li data-id="OPS-06"><div><h3>Map integrity verifiers are not release gates <span class="priority p2">P2</span></h3><p>Useful map and arena checks exist but can drift without failing the release workflow.</p><p class="evidence">Repository map verification scripts and CI workflow. Add them to the packaging gate.</p></div></li>
+        <li data-id="OPS-07"><div><h3>Fabric accepts every Carpet version despite binary mixins <span class="priority p2">P2</span></h3><p>Metadata declares <code>carpet: *</code> while required mixins bind private internals from one tested build, turning incompatibility into a startup crash.</p><p class="evidence"><code>fabric.mod.json:25-31</code>, <code>build.gradle:50-56</code>, <code>arenaagents.mixins.json:1-13</code>. Declare the tested range or add a compatibility plugin.</p></div></li>
+        <li data-id="OPS-08"><div><h3>Release version knowledge is duplicated in scripts <span class="priority p2">P2</span></h3><p>Hard-coded version strings can diverge from Gradle metadata and package names.</p><p class="evidence">Release wrapper and distribution scripts containing <code>0.2.0</code>. Derive from one build property.</p></div></li>
+      </ol>
+    </details>
+
+    <details>
+      <summary>Product and frontend · 8</summary>
+      <ol class="register">
+        <li data-id="UX-01"><div><h3>Non-operators never receive the read-only console state <span class="priority">P1</span></h3><p>The UI supports view-only mode, but the server silently drops the whole snapshot and hardcodes <code>canControl=true</code> for authorized users. Non-operators see endless syncing.</p><p class="evidence"><code>AgentControlSync.java:196-228</code>, <code>AgentControlScreen.java:966-978</code>. Always return bounded state or explicit denial.</p></div></li>
+        <li data-id="UX-02"><div><h3>Mutation controls allow duplicate click submissions <span class="priority">P1</span></h3><p>Create and similar buttons remain active while a request is in flight, with no operation identity or terminal state in the interaction.</p><p class="evidence"><code>ConsoleButton.java:113-116</code>, <code>AgentControlScreen.java:932-937,1368-1374</code>. Disable until acknowledgement and show one concise pending state.</p></div></li>
+        <li data-id="UX-03"><div><h3>Arena preparation has no cancel path <span class="priority">P1</span></h3><p>Large builds and coordinator waits cannot be cancelled, and pending activation can retry without a clear operator recovery action.</p><p class="evidence"><code>ScenarioRuntimeService.java:69-139,580-647,1074-1077</code>, <code>ScenarioSetupScreen.java:415-450,815-843</code>. Add server-owned cancellation with phase-safe rollback.</p></div></li>
+        <li data-id="UX-04"><div><h3>Escape discards nested work without matching visible controls <span class="priority p2">P2</span></h3><p>Keyboard escape can leave nested setup or discard draft state differently from the labeled Back and Cancel actions.</p><p class="evidence"><code>AgentControlScreen.java:342-351,932-944</code>, <code>ScenarioSetupScreen.java:264-276</code>. Use one navigation state machine and confirm only material loss.</p></div></li>
+        <li data-id="UX-05"><div><h3>Live and results data depend on mouse-wheel scrolling <span class="priority p2">P2</span></h3><p>Long results and feeds lack keyboard scrolling and complete screen-reader narration.</p><p class="evidence"><code>AgentControlScreen.java:235-249,325-338,779-784</code>, <code>ScenarioResultsScreen.java:37-71</code>. Add focusable regions, keyboard scrolling, position narration, and a concise summary.</p></div></li>
+        <li data-id="UX-06"><div><h3>Identical snapshots can rebuild visible UI state <span class="priority p2">P2</span></h3><p>Client screens can recompose from snapshots whose meaningful revision did not change, risking focus and scroll churn.</p><p class="evidence">Agent control snapshot handling and screen rebuild paths. Gate rebuilds on revision and preserve focus by stable identity.</p></div></li>
+        <li data-id="UX-07"><div><h3>Results prioritize technical metadata over standings <span class="priority p2">P2</span></h3><p>The main player question, who won and why, competes with session and protocol details.</p><p class="evidence"><code>ScenarioResultsScreen.java</code>. Lead with winner, ranking, objective, and decisive events; move diagnostics below.</p></div></li>
+        <li data-id="UX-08"><div><h3>Denied scenario launches report success locally <span class="priority p2">P2</span></h3><p>A stale-authorized client can show “request sent” while the server silently ignores the payload.</p><p class="evidence"><code>AgentControlSync.java:61-75</code>, <code>AgentControlClient.java:180-206</code>. Return a terminal rejection with the server reason.</p></div></li>
+      </ol>
+    </details>
+
+    <details>
+      <summary>Feature promises and lifecycle cleanup · 8</summary>
+      <ol class="register">
+        <li data-id="PROD-01"><div><h3>Normal agents respawn automatically despite the model-authority promise <span class="priority">P1</span></h3><p>The default lifecycle revives agents without a model or operator choice, conflicting with README language about model-owned decisions.</p><p class="evidence"><code>AgentRecord.java:52</code>, <code>CodexAgentManager.java:716</code>, <code>README.md:95-111</code>. Either change the default or state the exception clearly.</p></div></li>
+        <li data-id="PROD-02"><div><h3>Gemini is advertised but unavailable in production <span class="priority">P1</span></h3><p>The Antigravity Gemini planner requires an internal test-only token, so the public capability cannot complete safely.</p><p class="evidence"><code>antigravity-service.mjs:44,188,241,568-616</code>. Remove the claim until a supported production mode exists.</p></div></li>
+        <li data-id="PROD-03"><div><h3>Manual launch requires Codex login for non-Codex providers <span class="priority">P1</span></h3><p>Kimi or Cursor-only users still fail the launcher preflight even though provider services are independent.</p><p class="evidence"><code>scripts/start-dynamic-coordinator.ps1:23-30</code>, <code>dynamic-main.mjs:2326-2341</code>. Check only the selected providers.</p></div></li>
+        <li data-id="PROD-04"><div><h3>Prepared legacy client config is invalid <span class="priority">P1</span></h3><p>Runtime preparation enables the legacy bridge without writing the required bridge secret, so the loader rejects it.</p><p class="evidence"><code>scripts/prepare-runtime.ps1</code> config generation and <code>AgentConfig.java</code> validation. Keep it disabled or write a complete secure config.</p></div></li>
+        <li data-id="PROD-05"><div><h3>Removed agents leave stale group and scoreboard members <span class="priority p2">P2</span></h3><p>Groups retain dead IDs and the hidden scoreboard team grows one unique member per historical agent.</p><p class="evidence"><code>CodexAgentManager.java:926-933,1124-1162</code> and group removal paths. Make both indexes part of required cleanup and prune on startup.</p></div></li>
+        <li data-id="PROD-06"><div><h3>Voice profiles retain removed agent assignments <span class="priority p2">P2</span></h3><p>Per-agent voice mappings can grow without deletion across repeated create and remove cycles.</p><p class="evidence">Voice assignment persistence and agent cleanup paths. Remove on agent deletion and prune unknown IDs on load.</p></div></li>
+        <li data-id="PROD-07"><div><h3>Public voice commands exist without the addon in the distribution <span class="priority p2">P2</span></h3><p>Users can discover commands for a feature the standard package does not install.</p><p class="evidence">Distribution manifest, voice addon module, and public command registration. Ship it as an explicit optional component or hide commands when absent.</p></div></li>
+        <li data-id="PROD-08"><div><h3>README capability lists and workspace claims have drifted <span class="priority p2">P2</span></h3><p>Default Codex uses native tools, threads share <code>runtime/minecraft-agent</code>, and the exact primitive list no longer matches the runtime.</p><p class="evidence"><code>README.md</code>, provider defaults, and native Codex runtime setup. Document behavior from generated capability metadata.</p></div></li>
+      </ol>
+    </details>
+  </section>
+
+  <section id="security">
+    <h2>Security model reviewed</h2>
+    <div class="two-col">
+      <div>
+        <h3>Protected assets</h3>
+        <ul>
+          <li>World and arena integrity</li>
+          <li>Agent lifecycle, goals, provenance, and results</li>
+          <li>Bridge and voice secrets</li>
+          <li>Provider login and API credentials</li>
+          <li>Coordinator code, configuration, traces, and bundles</li>
+        </ul>
+      </div>
+      <div>
+        <h3>Trust boundaries</h3>
+        <ul>
+          <li>Minecraft client to server</li>
+          <li>Server to local coordinator</li>
+          <li>Coordinator to external providers</li>
+          <li>Model output to authorized world action</li>
+          <li>Voice addon to local worker</li>
+          <li>Packaged bundle to installed runtime</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout warn" style="margin-top:28px">
+      <p><strong>One confirmed security finding:</strong> offline Minecraft gameplay sockets are not loopback-bound. Bridge and voice services were cleared for remote exposure because they bind locally and authenticate messages. Privileged controls are operator-gated, archives and NBT are bounded, model text is treated as untrusted, voice consent is enforced, and provider processes do not inherit unrelated credentials.</p>
+    </div>
+  </section>
+
+  <section id="verified">
+    <h2>Controls worth preserving</h2>
+    <div class="two-col">
+      <ul>
+        <li>Bounded server task queues and tick-start draining</li>
+        <li>Directional schemas and authenticated bridge traffic</li>
+        <li>Loopback, signed voice worker requests, and session consent</li>
+        <li>Archive containment, file count, size, and NBT bounds</li>
+        <li>Spatial scan cache, inventory arrays, tag cache, and pathfinding budgets</li>
+        <li>Protocol backpressure and bounded observation queues</li>
+      </ul>
+      <ul>
+        <li>Coordinator last-known-good rollback and runtime transaction support</li>
+        <li>Bundle, wrapper, and Carpet integrity checks</li>
+        <li>Result I/O stays off the Minecraft game thread</li>
+        <li>Dimension-aware recovery with bounded safe-position fallback</li>
+        <li>Strong focus versus selection visuals and keyboard roster navigation</li>
+        <li>Identity is not conveyed by color alone</li>
+      </ul>
+    </div>
+  </section>
+
+  <section>
+    <h2>Decisions and open questions</h2>
+    <ul>
+      <li>Choose a product policy for result durability on filesystems without atomic rename. Infinite retries should end either way.</li>
+      <li>Confirm Simple Voice Chat callback-thread guarantees. If callbacks are off-thread, resolve all Minecraft objects through <code>server.execute</code>.</li>
+      <li>Decide whether normal-agent auto-respawn is an intentional exception or a contract bug.</li>
+      <li>Decide whether legacy v1 control still earns its separate security and lifecycle surface.</li>
+    </ul>
+  </section>
+
+  <footer>
+    Generated from a clean audit worktree at <code>origin/main</code>. Findings are consolidated across all specialist passes, with duplicate symptoms merged under their root boundary. This document proposes work only; it does not implement fixes.
+  </footer>
+</main>
+</body>
+</html>

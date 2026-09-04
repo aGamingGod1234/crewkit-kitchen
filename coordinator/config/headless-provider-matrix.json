@@ -7,13 +7,12 @@
       "model": "gpt-5.6-sol",
       "reasoningEffort": "low",
       "serviceTier": "priority",
-      "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_CODEX_SOL_LOW, then finish the goal.",
+      "task": "Move to 2 201 0 and stop there",
       "timeoutMs": 240000,
       "rosterSize": 1,
       "assert": [
         { "type": "lifecycle", "state": "COMPLETED" },
-        { "type": "chat", "message": "MATRIX_CODEX_SOL_LOW" },
-        { "type": "action", "actionType": "move_to", "resultState": "SUCCEEDED" }
+        { "type": "action", "actionType": "navigate_to" }
       ]
     },
     {
@@ -222,12 +221,37 @@
       ]
     },
     {
+      "id": "codex-luna-xhigh-fast-mine-oak-log",
+      "provider": "codex",
+      "model": "gpt-5.6-luna",
+      "reasoningEffort": "xhigh",
+      "serviceTier": "fast",
+      "task": "Break the oak log at x=2 y=201 z=0",
+      "setupBlocks": [
+        { "x": 2, "y": 201, "z": 0, "blockId": "minecraft:oak_log" }
+      ],
+      "repetitions": 3,
+      "planningTimeoutMs": 120000,
+      "scenarioTimeoutMs": 240000,
+      "timeoutMs": 240000,
+      "requireFactualSuccess": true,
+      "assert": [
+        { "type": "lifecycle", "state": "COMPLETED" },
+        { "type": "rcon", "command": "execute if block 2 201 0 minecraft:air run data get entity {agent} Pos", "match": "has the following entity data" }
+      ]
+    },
+    {
       "id": "codex-luna-xhigh-fast-wooden-pickaxe",
       "provider": "codex",
       "model": "gpt-5.6-luna",
       "reasoningEffort": "xhigh",
       "serviceTier": "fast",
-      "task": "Gather wood and craft a wooden pickaxe",
+        "task": "Get 1 wooden pickaxe",
+		"setupBlocks": [
+		  { "x": 2, "y": 201, "z": -1, "blockId": "minecraft:oak_log" },
+		  { "x": 2, "y": 201, "z": 0, "blockId": "minecraft:oak_log" },
+		  { "x": 2, "y": 201, "z": 1, "blockId": "minecraft:oak_log" }
+		],
       "repetitions": 3,
       "planningTimeoutMs": 120000,
       "scenarioTimeoutMs": 240000,

@@ -20,7 +20,7 @@ Formatting, Good, and Bad blocks each show one direct native tool call. Only an 
 
 # Top-level tools
 
-## observe - Refresh the latest compact player, inventory, nearby block, entity, goal, and conversation facts.
+## observe - Refresh the latest compact player, inventory, close-up block, farther visible landmark, entity, goal, and conversation facts.
 
 Formatting:
 
@@ -38,6 +38,28 @@ Bad:
 
 ```json executor-bad-call
 {"tool":"observe","arguments":{"radius":10}}
+```
+
+## lookAround - Turn the player through a bounded camera sweep and refresh visible landmarks.
+
+This is a real body action: the player rotates in short steps. It does not reveal blocks through walls or make distant landmarks mineable. The observation contains sparse first-visible surfaces up to 256 blocks, capped by loaded chunks, not a cube scan of hidden blocks. Copy the current `view.yaw` and `view.pitch` from the latest observation, call `observe` after the sweep, then inspect the newly visible landmarks before choosing a target.
+
+Formatting:
+
+```text executor-format
+{"tool":"lookAround","arguments":{"centerYaw":<required finite number -180..180 from the latest view> ,"pitch":<required finite number -90..90>,"steps":<required integer 2..8>,"ticksPerStep":<required integer 1..20>}}
+```
+
+Good:
+
+```json executor-call
+{"tool":"lookAround","arguments":{"centerYaw":90,"pitch":0,"steps":4,"ticksPerStep":3}}
+```
+
+Bad:
+
+```json executor-bad-call
+{"tool":"lookAround","arguments":{"centerYaw":90,"pitch":0,"steps":1,"ticksPerStep":3}}
 ```
 
 ## control - Hold one complete player input frame for a bounded number of server ticks.
@@ -62,7 +84,9 @@ Bad:
 {"tool":"control","arguments":{"forward":1,"jump":true,"hand":"left","ticks":8}}
 ```
 
-## moveTo - Navigate the player to an observed position and return the body result.
+## moveTo - Navigate the player to one short, confirmed waypoint and return the body result.
+
+Use `control` for ordinary exploration and sustained traversal. `moveTo` is bounded pathing for a waypoint you already chose from the latest sight facts.
 
 Formatting:
 
@@ -82,18 +106,20 @@ Bad:
 {"tool":"moveTo","arguments":{"x":"12-1","y":"64+10","z":5}}
 ```
 
-## mine - Break one observed block and return the body result. Success proves the block broke, not that its drop was collected.
+## mine - Break one observed, visible block and return the body result. Success proves the block broke, not that its drop was collected.
+
+Before calling mine, use the latest observation and copy `interaction.rayTarget.x/y/z` and its non-air `blockId` exactly. If the target is not under the crosshair, call `act/look_at`, observe again, then mine. The server rejects missing or stale `expectedBlockId`, air, out-of-range, and occluded targets. The ray target must still be the requested block when the action starts.
 
 Formatting:
 
 ```text executor-format
-{"tool":"mine","arguments":{"x":<required integer -30000000..30000000>,"y":<required integer -2048..2048>,"z":<required integer -30000000..30000000>,"timeoutMs":<optional integer 1..120000; default 15000>}}
+{"tool":"mine","arguments":{"x":<required integer -30000000..30000000>,"y":<required integer -2048..2048>,"z":<required integer -30000000..30000000>,"expectedBlockId":<required non-air blockId from the latest rayTarget>,"timeoutMs":<optional integer 1..120000; default 15000>}}
 ```
 
 Good:
 
 ```json executor-call
-{"tool":"mine","arguments":{"x":11,"y":64,"z":10,"timeoutMs":15000}}
+{"tool":"mine","arguments":{"x":11,"y":64,"z":10,"expectedBlockId":"minecraft:oak_log","timeoutMs":15000}}
 ```
 
 Bad:
@@ -173,7 +199,7 @@ Formatting:
 Good:
 
 ```json executor-call
-{"tool":"sequence","arguments":{"actions":[{"actionType":"navigate_to","arguments":{"x":11,"y":64,"z":10,"tolerance":1,"sprint":true,"timeoutMs":30000}},{"actionType":"break_block","arguments":{"x":11,"y":64,"z":10,"timeoutMs":15000}}]}}
+{"tool":"sequence","arguments":{"actions":[{"actionType":"navigate_to","arguments":{"x":11,"y":64,"z":10,"tolerance":1,"sprint":true,"timeoutMs":30000}},{"actionType":"break_block","arguments":{"x":11,"y":64,"z":10,"expectedBlockId":"minecraft:oak_log","timeoutMs":15000}}]}}
 ```
 
 Bad:
@@ -207,7 +233,7 @@ Bad:
 Good:
 
 ```json executor-calls
-{"calls":[{"tool":"say","arguments":{"message":"I am getting wood now.","audience":"proximity"}},{"tool":"mine","arguments":{"x":11,"y":64,"z":10,"timeoutMs":15000}}]}
+{"calls":[{"tool":"say","arguments":{"message":"I am getting wood now.","audience":"proximity"}},{"tool":"mine","arguments":{"x":11,"y":64,"z":10,"expectedBlockId":"minecraft:oak_log","timeoutMs":15000}}]}
 ```
 
 # Advanced act actions
@@ -505,7 +531,7 @@ Formatting:
 Good:
 
 ```json executor-call
-{"tool":"act","arguments":{"actionType":"break_block","arguments":{"x":11,"y":64,"z":10,"timeoutMs":15000}}}
+{"tool":"act","arguments":{"actionType":"break_block","arguments":{"x":11,"y":64,"z":10,"expectedBlockId":"minecraft:oak_log","timeoutMs":15000}}}
 ```
 
 Bad:

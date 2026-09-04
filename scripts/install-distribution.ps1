@@ -26,7 +26,7 @@ foreach ($line in Get-Content -LiteralPath $PackageMetadataPath) {
 	if ($PackageMetadata.Contains($key)) { throw "Duplicate package metadata: $key" }
 	$PackageMetadata[$key] = $value
 }
-foreach ($required in @('mod_version', 'minecraft_version', 'loader_version', 'fabric_api_version', 'carpet_version')) {
+foreach ($required in @('mod_version', 'minecraft_version', 'loader_version', 'fabric_api_version', 'carpet_version', 'voicechat_version', 'voice_addon_version')) {
 	if (-not $PackageMetadata.Contains($required)) { throw "Package metadata is missing '$required'." }
 }
 $ModVersion = [string] $PackageMetadata.mod_version
@@ -39,8 +39,10 @@ $MinimumSecretLength = 32
 $SecretByteCount = 32
 $ExpectedModNames = @(
 	"arena-agents-$ModVersion.jar"
+	"arena-agents-voice-$($PackageMetadata.voice_addon_version).jar"
 	"fabric-api-$($PackageMetadata.fabric_api_version).jar"
 	"fabric-carpet-$($PackageMetadata.carpet_version).jar"
+	"voicechat-fabric-$($PackageMetadata.voicechat_version).jar"
 )
 $Utf8NoBom = [Text.UTF8Encoding]::new($false)
 $ModsSource = Join-Path $PackageRoot 'mods'
@@ -180,7 +182,8 @@ if ($null -ne $existing) {
 }
 
 function Test-PackageOwnedModName([string] $Name) {
-	if ($Name -match '^(?i:fabric-api|fabric-carpet)-.+\.jar$') { return $true }
+	if ($Name -match '^(?i:fabric-api|fabric-carpet|voicechat-fabric)-.+\.jar$') { return $true }
+	if ($Name -match '^(?i:arena-agents-voice)-.+\.jar$') { return $true }
 	return $Name -match '^(?i:arena-agents)-(?!voice-).+\.jar$'
 }
 

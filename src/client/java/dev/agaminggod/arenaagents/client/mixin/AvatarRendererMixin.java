@@ -24,11 +24,16 @@ abstract class AvatarRendererMixin {
 			at = @At("HEAD"),
 			cancellable = true
 	)
-	private void arenaagents$hideAgentName(Avatar avatar, double distance, CallbackInfoReturnable<Boolean> callback) {
+	private void arenaagents$showAgentName(Avatar avatar, double distance, CallbackInfoReturnable<Boolean> callback) {
 		avatar.getProfile().name().ifPresent(name -> {
 			Optional<AgentControlAgent> snapshotAgent = AgentControlClient.agentForPlayer(name);
-			if (snapshotAgent.filter(agent -> hasExpectedOfflineUuid(avatar, agent)).isPresent()) {
-				callback.setReturnValue(false);
+			if (snapshotAgent.isPresent()) {
+				if (hasExpectedOfflineUuid(avatar, snapshotAgent.orElseThrow())) callback.setReturnValue(true);
+				return;
+			}
+			if (AgentIdentity.skinForPlayerName(name).isPresent()
+					&& avatar.getUUID().equals(AgentIdentity.offlinePlayerUuid(name))) {
+				callback.setReturnValue(true);
 			}
 		});
 	}
@@ -47,7 +52,17 @@ abstract class AvatarRendererMixin {
 				.flatMap(AgentControlClient::agentForPlayer)
 				.filter(candidate -> hasExpectedOfflineUuid(avatar, candidate))
 				.orElse(null);
-		if (agent == null) return;
+		if (agent == null) {
+			avatar.getProfile().name()
+					.filter(name -> AgentIdentity.skinForPlayerName(name).isPresent())
+					.filter(name -> avatar.getUUID().equals(AgentIdentity.offlinePlayerUuid(name)))
+					.ifPresent(name -> {
+						state.nameTag = Component.literal(name);
+						state.nameTagAttachment = avatar.getAttachments().getNullable(
+								EntityAttachment.NAME_TAG, 0, avatar.getYRot());
+					});
+			return;
+		}
 
 		state.nameTag = null;
 		state.nameTagAttachment = null;

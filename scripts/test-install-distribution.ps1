@@ -38,6 +38,7 @@ try {
 	[IO.File]::WriteAllText((Join-Path $mods 'arena-agents-old-unparseable.jar'), 'old arena')
 	[IO.File]::WriteAllText((Join-Path $mods 'fabric-api-old.jar'), 'old api')
 	[IO.File]::WriteAllText((Join-Path $mods 'fabric-carpet-old.jar'), 'old carpet')
+	[IO.File]::WriteAllText((Join-Path $mods 'voicechat-fabric-old.jar'), 'old voicechat')
 	[IO.File]::WriteAllText((Join-Path $mods 'unrelated.jar'), 'keep')
 	$voiceAddon = Join-Path $mods 'arena-agents-voice-0.1.0.jar'
 	[IO.File]::WriteAllText($voiceAddon, 'optional voice addon')
@@ -47,20 +48,24 @@ try {
 	& $installer -JavaPath $JavaPath -LauncherProfiles $launcherProfiles -GameDirectory $game
 	$expectedModNames = @(
 		"arena-agents-$($metadata.mod_version).jar",
+		"arena-agents-voice-$($metadata.voice_addon_version).jar",
 		"fabric-api-$($metadata.fabric_api_version).jar",
-		"fabric-carpet-$($metadata.carpet_version).jar"
+		"fabric-carpet-$($metadata.carpet_version).jar",
+		"voicechat-fabric-$($metadata.voicechat_version).jar"
 	)
 	$owned = @(Get-ChildItem -LiteralPath $mods -Filter '*.jar' -File |
 		Where-Object {
-			$_.Name -match '^(?i:fabric-api|fabric-carpet)-.+\.jar$' -or
-			$_.Name -match '^(?i:arena-agents)-(?!voice-).+\.jar$'
+			$_.Name -match '^(?i:fabric-api|fabric-carpet|voicechat-fabric)-.+\.jar$' -or
+			$_.Name -match '^(?i:arena-agents).+\.jar$'
 		} |
 		Select-Object -ExpandProperty Name | Sort-Object)
 	if (@(Compare-Object ($expectedModNames | Sort-Object) $owned).Count -ne 0) { throw 'Successful package update retained a stale package-owned JAR.' }
 	if (-not (Test-Path -LiteralPath (Join-Path $mods 'unrelated.jar') -PathType Leaf)) { throw 'Successful package update removed an unrelated mod.' }
-	if (-not (Test-Path -LiteralPath $voiceAddon -PathType Leaf) -or
-		(Get-FileHash -LiteralPath $voiceAddon -Algorithm SHA256).Hash -ne $voiceAddonHash) {
-		throw 'Successful package update removed or changed the optional Arena Agents Voice add-on.'
+	if (Test-Path -LiteralPath $voiceAddon -PathType Leaf) {
+		throw 'Successful package update retained a stale Arena Agents Voice add-on.'
+	}
+	if (Test-Path -LiteralPath (Join-Path $mods 'voicechat-fabric-old.jar') -PathType Leaf) {
+		throw 'Successful package update retained a stale Simple Voice Chat JAR.'
 	}
 	foreach ($secretName in @('bridge-secret.txt', 'voice-secret.txt')) {
 		if (-not (Test-Path -LiteralPath (Join-Path $installedRoot "runtime\$secretName") -PathType Leaf)) { throw "Installed secret is missing: $secretName" }
@@ -93,7 +98,7 @@ try {
 	if (@(Compare-Object $runtimeBefore (File-Snapshot $installedRoot)).Count -ne 0) { throw 'Runtime rollback failed after profile promotion.' }
 	if ((Get-FileHash -LiteralPath $launcherProfiles -Algorithm SHA256).Hash -ne $profilesBefore) { throw 'Profile rollback failed after profile promotion.' }
 
-	Write-Host 'PASS: packaged install removes stale core JARs, preserves the voice add-on, and rolls back runtime, mods, and launcher profile together'
+	Write-Host 'PASS: packaged install removes stale core and voice JARs, and rolls back runtime, mods, and launcher profile together'
 } finally {
 	$env:APPDATA = $previousAppData
 	if (Test-Path -LiteralPath $testRoot) { Remove-Item -LiteralPath $testRoot -Recurse -Force }

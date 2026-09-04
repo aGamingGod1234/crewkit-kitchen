@@ -611,6 +611,7 @@ test('native Codex threads share the Minecraft workspace and selected skill root
 			prepared.push('prepared');
 			return {
 				cwd: 'C:\\shared\\minecraft-agent',
+				instructions: 'Minecraft-only instructions: use the native tools.',
 				selectedCapabilityRoots: [{ id: 'minecraft-control', location: { type: 'environment', environmentId: 'local', path: 'C:\\shared\\minecraft-agent\\.codex\\skills\\minecraft-control' } }],
 			};
 		},
@@ -625,7 +626,29 @@ test('native Codex threads share the Minecraft workspace and selected skill root
 		assert.deepEqual(call.params.runtimeWorkspaceRoots, ['C:\\shared\\minecraft-agent']);
 		assert.deepEqual(call.params.selectedCapabilityRoots, [{ id: 'minecraft-control', location: { type: 'environment', environmentId: 'local', path: 'C:\\shared\\minecraft-agent\\.codex\\skills\\minecraft-control' } }]);
 		assert.equal(call.params.sandbox, 'read-only');
+		assert.match(call.params.baseInstructions, /Minecraft-only instructions: use the native tools\./);
 	}
+	await service.stop();
+});
+
+test('prepares the isolated Minecraft Codex home before transport startup', async () => {
+	const transport = new FakeSharedTransport();
+	const order = [];
+	transport.setEnvironment = (environment) => {
+		order.push('environment');
+		assert.equal(environment.CODEX_HOME, 'C:\\isolated\\minecraft\\.codex-home');
+		assert.equal(environment.OPENAI_API_KEY, 'openai-key');
+	};
+	transport.start = async () => { order.push('start'); };
+	const minecraftWorkspace = {
+		async prepare() {
+			order.push('prepare');
+			return { cwd: 'C:\\isolated\\minecraft', codexHome: 'C:\\isolated\\minecraft\\.codex-home', selectedCapabilityRoots: [] };
+		},
+	};
+	const service = new CodexService({ cwd: 'C:\\workspace', environment: { CODEX_HOME: 'C:\\Users\\lucas\\.codex', OPENAI_API_KEY: 'openai-key' } }, { transport, minecraftWorkspace });
+	await service.start();
+	assert.deepEqual(order, ['prepare', 'environment', 'start']);
 	await service.stop();
 });
 
@@ -829,7 +852,7 @@ test('native Codex turn executes a Minecraft tool and returns its result before 
 	await agent.setGoalRevision(1);
 
 	const threadStart = transport.calls.find((call) => call.method === 'thread/start').params;
-	assert.deepEqual(threadStart.dynamicTools.map((tool) => tool.name), ['observe', 'control', 'moveTo', 'mine', 'say', 'wait', 'act', 'sequence', 'finish']);
+	assert.deepEqual(threadStart.dynamicTools.map((tool) => tool.name), ['observe', 'lookAround', 'control', 'moveTo', 'mine', 'say', 'wait', 'act', 'sequence', 'finish']);
 	assert.equal(threadStart.baseInstructions.length < 1_500, true);
 
 	const executed = [];

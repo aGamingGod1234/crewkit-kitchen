@@ -89,6 +89,8 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyBlockedMaintenanceWaitsForRetryDeadline();
 		verifyProductionDependencyMonitorWakesOnRelevantFileChange();
 		verifyProductionDependencyMonitorAvoidsManifestMemberPolling();
+		verifyConfiguredRuntimeRootOwnsBundledRefresh();
+		verifyInterruptedDistributionNodeRecoversBeforeLookup();
 		verifyManifestFingerprintCoversEveryListedModule();
 		verifyExternalFingerprintChangeStillReplacesHealthyChild();
 		verifyWorkerFingerprintObservationAdvancesMonitorBaseline();
@@ -114,7 +116,55 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyCloseWaitsForInflightOwnedLaunchCleanup();
 		verifyCloseTerminatesChildBehindBlockedMaintenance();
 		verifyCloseIsIdempotent();
-		return isWindows() ? 369 : 359;
+		return isWindows() ? 374 : 364;
+	}
+
+	private static void verifyConfiguredRuntimeRootOwnsBundledRefresh() {
+		String previous = System.getProperty("arenaagents.packageRoot");
+		try {
+			Path configured = Path.of("build", "configured-runtime-refresh").toAbsolutePath().normalize();
+			System.setProperty("arenaagents.packageRoot", configured.toString());
+			assertEquals(configured,
+					CoordinatorProcessSupervisor.DefaultDependencyResolver.selectedRuntimeRoot(
+							Path.of("build", "different-game-directory")
+					),
+					"the configured runtime is refreshed instead of an unused game-local copy");
+		} finally {
+			restoreProperty("arenaagents.packageRoot", previous);
+		}
+	}
+
+	private static void verifyInterruptedDistributionNodeRecoversBeforeLookup() {
+		Path root = null;
+		try {
+			root = Files.createTempDirectory("arena-interrupted-node-");
+			Path active = root.resolve("runtime/toolchains/node");
+			Path backup = root.resolve("node-runtime-backups/node-fixture");
+			Path staged = root.resolve("runtime/toolchains/node.staging-fixture");
+			Path executable = isWindows() ? backup.resolve("node.exe") : backup.resolve("bin/node");
+			Files.createDirectories(executable.getParent());
+			Files.writeString(executable, "bundled node", StandardCharsets.UTF_8);
+			JsonObject node = new JsonObject();
+			node.addProperty("Active", active.toString());
+			node.addProperty("Backup", backup.toString());
+			node.addProperty("Staging", staged.toString());
+			JsonObject journal = new JsonObject();
+			journal.add("Node", node);
+			Files.writeString(root.resolve(".arena-runtime-transaction.json"), journal.toString(), StandardCharsets.UTF_8);
+
+			assertTrue(CoordinatorProcessSupervisor.DefaultDependencyResolver.recoverInterruptedDistributionNode(root),
+					"startup restores Node from the updater journal before runtime lookup");
+			Path recoveredExecutable = isWindows() ? active.resolve("node.exe") : active.resolve("bin/node");
+			assertEquals("bundled node", Files.readString(recoveredExecutable),
+					"the validated backup becomes the active bundled Node runtime");
+			assertFalse(Files.exists(backup), "startup consumes the backup directory it restored");
+			assertFalse(CoordinatorProcessSupervisor.DefaultDependencyResolver.recoverInterruptedDistributionNode(root),
+					"repeating startup recovery is idempotent");
+		} catch (IOException exception) {
+			throw new AssertionError("Interrupted distribution Node recovery verification failed", exception);
+		} finally {
+			deleteTree(root);
+		}
 	}
 
 	private static void verifyPosixLaunchGateCommand() {

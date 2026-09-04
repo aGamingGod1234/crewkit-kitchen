@@ -66,6 +66,8 @@ const GOAL_SPEC_PROPOSAL_RETRY_MS = 5_000;
 const TERMINAL_GOAL_SPEC_REJECTIONS = new Set(['UNKNOWN_GOAL_DRAFT', 'GOAL_DRAFT_AGENT_MISMATCH', 'STALE_GOAL_DRAFT']);
 const QUIET_LIFECYCLE_ERRORS = new Set(['PLAN_CANCELLED', 'STALE_PLAN', 'STALE_GOAL_REVISION', 'GOAL_REVISION_COLLISION']);
 const MAX_CONVERSATION_WAKE_TRANSACTIONS = 4_096;
+const MAX_NATIVE_MOVEMENT_HISTORY = 12;
+const MAX_NATIVE_RESOURCE_MEMORY = 512;
 const DEFAULT_CONNECTION_OPERATION_CAP = 256;
 const DEFAULT_AGENT_OPERATION_CAP = 32;
 const MAX_PUBLIC_NARRATIVE_RAW_CHARS = 1_024;
@@ -86,7 +88,11 @@ const STT_ONLY_PROFILE_STORE = Object.freeze({
 	resolve() { throw new Error('voice profiles are unavailable without TTS'); },
 });
 const WINDOWS_TTS_FALLBACK_CODES = new Set([
+	'LOCAL_SPEECH_ERROR',
+	'LOCAL_SPEECH_UNAVAILABLE',
+	'LOCAL_TTS_ERROR',
 	'TTS_AUDIO_TOO_LONG',
+	'TTS_AUTHENTICATION_FAILED',
 	'TTS_MALFORMED_AUDIO',
 	'TTS_PROVIDER_ERROR',
 	'TTS_RATE_LIMITED',
@@ -123,6 +129,7 @@ export class DynamicCoordinator extends EventEmitter {
 	#nativeConversationSequences = new Map();
 	#nativeConversationRecoveries = new Map();
 	#nativeObservationSignatures = new Map();
+	#nativeWorldSignals = new Map();
 	#supervisedObservationRequests = new Map();
 	#conversationWakeTransactions = new Map();
 	#goalSpecRequests = new Map();
@@ -374,6 +381,7 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#nativeConversationSequences.clear();
 		this.#nativeConversationRecoveries.clear();
 		this.#nativeObservationSignatures.clear();
+		this.#nativeWorldSignals.clear();
 		this.#supervisedObservationRequests.clear();
 		this.#conversationWakeTransactions.clear();
 		this.#cancelGoalSpecRequests();
@@ -448,6 +456,7 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#nativeConversationSequences.delete(message.agentId);
 			this.#nativeConversationRecoveries.delete(message.agentId);
 			this.#nativeObservationSignatures.delete(message.agentId);
+			this.#nativeWorldSignals.delete(message.agentId);
 			this.#supervisedObservationRequests.delete(message.agentId);
 			this.#forgetConversationWakes(message.agentId);
 			this.#cancelGoalSpecRequests(message.agentId);
@@ -657,7 +666,10 @@ export class DynamicCoordinator extends EventEmitter {
 				this.#goalSupervisor.factualProgress(supervisionKey, factualProgressSignature(wireObservation), factualProgressDetails(wireObservation));
 				if (this.#usesNativeTools(record)) this.#nativeRuntimeEpochs.set(record.agentId, connectionEpoch);
 				const observation = adaptObservation(wireObservation);
-				const classified = classifyObservationTrigger(message.payload, wireObservation);
+				const worldSignals = this.#usesNativeTools(record)
+					? this.#rememberNativeWorldSignals(record, lifecycleGeneration, connectionEpoch, observation)
+					: null;
+				const classified = classifyObservationTrigger(message.payload, wireObservation, worldSignals);
 				const pendingAttention = this.#pendingAttention.get(record.agentId);
 				const attention = pendingAttention?.goalRevision === record.goalRevision
 					? mergeAttentionTrigger(classified, pendingAttention)
@@ -1034,6 +1046,33 @@ export class DynamicCoordinator extends EventEmitter {
 				death,
 			}),
 		}, { preserveState: true, kind: 'death' });
+	}
+
+	#rememberNativeWorldSignals(record, lifecycleGeneration, connectionEpoch, observation) {
+		const previous = this.#nativeWorldSignals.get(record.agentId);
+		const sameLifecycle = previous?.goalRevision === record.goalRevision
+			&& previous.lifecycleGeneration === lifecycleGeneration
+			&& previous.connectionEpoch === connectionEpoch;
+		const state = sameLifecycle
+			? previous
+			: { goalRevision: record.goalRevision, lifecycleGeneration, connectionEpoch, positions: [], resources: new Set() };
+		const positionKey = nativeBlockPositionKey(observation?.player);
+		const previousPositionKey = state.positions.at(-1);
+		if (positionKey !== null && positionKey !== previousPositionKey) {
+			state.positions.push(positionKey);
+			if (state.positions.length > MAX_NATIVE_MOVEMENT_HISTORY) state.positions.shift();
+		}
+		let resourceDiscovery = false;
+		for (const candidate of observedResourceCandidates(observation)) {
+			if (!state.resources.has(candidate)) resourceDiscovery = true;
+			state.resources.add(candidate);
+		}
+		while (state.resources.size > MAX_NATIVE_RESOURCE_MEMORY) state.resources.delete(state.resources.values().next().value);
+		this.#nativeWorldSignals.set(record.agentId, state);
+		return {
+			movementLoop: detectMovementLoop(state.positions),
+			resourceDiscovery,
+		};
 	}
 
 	#usesNativeTools(record) {
@@ -1707,6 +1746,7 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#nativeConversationRecoveries.delete(agentId);
 		this.#providerProbeDeadlines.delete(agentId);
 		this.#deferredProviderRecovery.delete(agentId);
+		this.#nativeWorldSignals.delete(agentId);
 		this.#advanceLifecycleGeneration(agentId);
 	}
 
@@ -2157,6 +2197,7 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#nativeConversationSequences.clear();
 		this.#nativeConversationRecoveries.clear();
 		this.#nativeObservationSignatures.clear();
+		this.#nativeWorldSignals.clear();
 		this.#supervisedObservationRequests.clear();
 		this.#conversationWakeTransactions.clear();
 		this.#providerWork.clear();
@@ -2638,8 +2679,10 @@ export function createVoiceSupervisor(config, environment = process.env, depende
 	if (!Number.isSafeInteger(localSpeechTimeoutMs) || localSpeechTimeoutMs < 1 || localSpeechTimeoutMs > 600_000) {
 		throw new TypeError('voice.localSpeechTimeoutMs must be between 1 and 600000');
 	}
+	const reportVoiceDiagnostic = dependencies.reportVoiceDiagnostic ?? writeVoiceDiagnostic;
+	if (typeof reportVoiceDiagnostic !== 'function') throw new TypeError('reportVoiceDiagnostic must be a function');
 	const startWorker = dependencies.startWorker
-		?? (({ signal }) => startVoiceWorker(config, environment, { signal }));
+		?? (({ signal }) => startVoiceWorker(config, environment, { signal, reportVoiceDiagnostic }));
 	const reportFailure = dependencies.reportFailure ?? (({ failureCode }) => {
 		process.stderr.write(`[voice-supervisor] ${failureCode}: proximity speech unavailable; retrying automatically\n`);
 	});
@@ -2694,6 +2737,8 @@ export async function startVoiceWorker(config, environment = process.env, depend
 		throw new TypeError('voice.localSpeechTimeoutMs must be between 1 and 600000');
 	}
 	const signal = dependencies.signal;
+	const reportVoiceDiagnostic = dependencies.reportVoiceDiagnostic ?? (() => {});
+	if (typeof reportVoiceDiagnostic !== 'function') throw new TypeError('reportVoiceDiagnostic must be a function');
 	if (signal !== undefined && (signal === null || typeof signal !== 'object' || typeof signal.aborted !== 'boolean')) {
 		throw new TypeError('voice startup signal must be an AbortSignal');
 	}
@@ -2760,7 +2805,17 @@ export async function startVoiceWorker(config, environment = process.env, depend
 		let sttProvider;
 		let ownedSpeechProvider = localSpeechProvider;
 		if (localSpeechProvider !== null) {
-			const fallback = createLocalSpeechFailover(localSpeechProvider, {
+			const fallback = fishApiKey !== null || deepgramApiKey !== null
+				? createRemoteFirstSpeechRouting(localSpeechProvider, {
+					fishApiKey,
+					deepgramApiKey,
+					platform,
+					createTtsProvider,
+					createWindowsTtsProvider,
+					createSttProvider,
+					fallbackCircuit: voiceFallbackCircuitOptions(dependencies),
+				})
+				: createLocalSpeechFailover(localSpeechProvider, {
 				fishApiKey,
 				deepgramApiKey,
 				platform,
@@ -2768,7 +2823,7 @@ export async function startVoiceWorker(config, environment = process.env, depend
 				createWindowsTtsProvider,
 				createSttProvider,
 				fallbackCircuit: voiceFallbackCircuitOptions(dependencies),
-			});
+				});
 			provider = fallback.tts;
 			sttProvider = fallback.stt;
 			ownedSpeechProvider = fallback;
@@ -2781,6 +2836,17 @@ export async function startVoiceWorker(config, environment = process.env, depend
 			}
 			sttProvider = deepgramApiKey === null ? new NoSttProvider() : createSttProvider({ apiKey: deepgramApiKey });
 		}
+		emitVoiceDiagnostic(reportVoiceDiagnostic, fishApiKey === null
+			? {
+				code: 'VOICE_TTS_REMOTE_UNCONFIGURED',
+				effectiveProvider: voiceProviderNamespace(provider, 'tts/unavailable'),
+				reason: 'fish_credential_missing',
+			}
+			: {
+				code: 'VOICE_TTS_REMOTE_CONFIGURED',
+				effectiveProvider: voiceProviderNamespace(provider, 'fish/s2.1-pro-free'),
+				reason: 'fish_credential_configured',
+			});
 		worker = createServer({
 			provider,
 			sttProvider,
@@ -2789,6 +2855,7 @@ export async function startVoiceWorker(config, environment = process.env, depend
 			port: voice.port ?? DEFAULT_VOICE_PORT,
 			maxConcurrent: voice.maxConcurrent ?? DEFAULT_VOICE_MAX_CONCURRENT,
 			requestTimeoutMs: localSpeechTimeoutMs,
+			onDiagnostic: reportVoiceDiagnostic,
 		});
 		throwIfVoiceStartupAborted(signal);
 		if (worker === null || typeof worker !== 'object' || typeof worker.start !== 'function' || typeof worker.close !== 'function') {
@@ -2808,6 +2875,71 @@ export async function startVoiceWorker(config, environment = process.env, depend
 		);
 		throw error;
 	}
+}
+
+function createRemoteFirstSpeechRouting(localProvider, {
+	fishApiKey,
+	deepgramApiKey,
+	platform,
+	createTtsProvider,
+	createWindowsTtsProvider,
+	createSttProvider,
+	fallbackCircuit,
+}) {
+	const owned = new Set([localProvider]);
+	let provider = localProvider;
+	let sttProvider = localProvider;
+	let localTtsFallback = localProvider;
+	if (platform === 'win32') {
+		const windows = createWindowsTtsProvider({});
+		owned.add(windows);
+		localTtsFallback = ttsProviderWithFallback(localProvider, windows, fallbackCircuit);
+	}
+	if (fishApiKey !== null) {
+		const fish = createTtsProvider({ apiKey: fishApiKey });
+		owned.add(fish);
+		provider = ttsProviderWithFallback(fish, localTtsFallback, fallbackCircuit);
+	} else {
+		provider = localTtsFallback;
+	}
+	if (deepgramApiKey !== null) {
+		const deepgram = createSttProvider({ apiKey: deepgramApiKey });
+		owned.add(deepgram);
+		sttProvider = sttProviderWithFallback(deepgram, localProvider);
+	}
+	const localIsPrimary = fishApiKey === null || deepgramApiKey === null;
+	let warmupPromise = null;
+	return Object.freeze({
+		tts: provider,
+		stt: sttProvider,
+		warmup({ signal } = {}) {
+			if (!localIsPrimary || typeof localProvider.warmup !== 'function') return;
+			warmupPromise ??= Promise.resolve(localProvider.warmup({ signal })).catch((error) => {
+				if (error?.name === 'AbortError' || signal?.aborted) {
+					warmupPromise = null;
+					throw error;
+				}
+				return undefined;
+			});
+			return warmupPromise;
+		},
+		async close() {
+			await Promise.allSettled([...owned].map((candidate) => candidate?.close?.()));
+		},
+	});
+}
+
+function sttProviderWithFallback(primary, fallback) {
+	return Object.freeze({
+		async transcribe(request) {
+			try {
+				return await primary.transcribe(request);
+			} catch (error) {
+				if (!shouldUseLocalSttFallback(error, request?.signal)) throw error;
+				return fallback.transcribe(request);
+			}
+		},
+	});
 }
 
 function canUseVolatileLocalProfiles({ error, localSpeechProvider, fishApiKey, deepgramApiKey, platform }) {
@@ -3101,6 +3233,7 @@ function voiceFallbackCircuitOptions(dependencies) {
 		now: dependencies.voiceFallbackNow ?? Date.now,
 		baseDelayMs: dependencies.voiceFallbackBaseDelayMs ?? DEFAULT_FISH_FALLBACK_BASE_DELAY_MS,
 		maxDelayMs: dependencies.voiceFallbackMaxDelayMs ?? DEFAULT_FISH_FALLBACK_MAX_DELAY_MS,
+		onDiagnostic: dependencies.reportVoiceDiagnostic ?? (() => {}),
 	};
 }
 
@@ -3108,8 +3241,10 @@ function ttsProviderWithFallback(primary, fallback, {
 	now = Date.now,
 	baseDelayMs = DEFAULT_FISH_FALLBACK_BASE_DELAY_MS,
 	maxDelayMs = DEFAULT_FISH_FALLBACK_MAX_DELAY_MS,
+	onDiagnostic = () => {},
 } = {}) {
 	if (typeof now !== 'function') throw new TypeError('Fish fallback clock must be a function');
+	if (typeof onDiagnostic !== 'function') throw new TypeError('Fish fallback diagnostic reporter must be a function');
 	if (!Number.isSafeInteger(baseDelayMs) || baseDelayMs < 1) throw new TypeError('Fish fallback base delay must be positive');
 	if (!Number.isSafeInteger(maxDelayMs) || maxDelayMs < baseDelayMs) throw new TypeError('Fish fallback maximum delay must not be less than its base delay');
 	let consecutiveFailures = 0;
@@ -3120,11 +3255,19 @@ function ttsProviderWithFallback(primary, fallback, {
 		if (!Number.isSafeInteger(value) || value < 0) throw new TypeError('Fish fallback clock must return a non-negative safe integer');
 		return value;
 	};
-	const recordFailure = () => {
+	const primaryProvider = voiceProviderNamespace(primary, 'tts/primary');
+	const fallbackProvider = voiceProviderNamespace(fallback, 'tts/fallback');
+	const recordFailure = (error) => {
 		consecutiveFailures = Math.min(consecutiveFailures + 1, 31);
 		const exponent = Math.min(consecutiveFailures - 1, 30);
 		const delay = Math.min(maxDelayMs, baseDelayMs * (2 ** exponent));
 		nextProbeAt = Math.min(Number.MAX_SAFE_INTEGER, readNow() + delay);
+		emitVoiceDiagnostic(onDiagnostic, {
+			code: 'VOICE_TTS_FALLBACK_ACTIVATED',
+			primaryProvider,
+			effectiveProvider: fallbackProvider,
+			failureCode: voiceDiagnosticFailureCode(error),
+		});
 	};
 	const synthesizeFallback = async (request) => {
 		const output = await fallback.synthesize(request);
@@ -3134,14 +3277,20 @@ function ttsProviderWithFallback(primary, fallback, {
 		);
 	};
 	const attemptPrimary = async (request) => {
+		const recovering = nextProbeAt !== null;
 		try {
 			const output = await primary.synthesize(request);
 			consecutiveFailures = 0;
 			nextProbeAt = null;
+			if (recovering) emitVoiceDiagnostic(onDiagnostic, {
+				code: 'VOICE_TTS_PRIMARY_RESTORED',
+				primaryProvider,
+				effectiveProvider: primaryProvider,
+			});
 			return tagSynthesisCacheNamespace(output, providerCacheNamespace(primary, 'fish/s2.1-pro-free'));
 		} catch (error) {
 			if (!shouldUseWindowsTtsFallback(error)) throw error;
-			recordFailure();
+			recordFailure(error);
 			return synthesizeFallback(request);
 		}
 	};
@@ -3158,6 +3307,33 @@ function ttsProviderWithFallback(primary, fallback, {
 			return probePromise;
 		},
 	});
+}
+
+function voiceProviderNamespace(provider, fallback) {
+	try {
+		const namespace = providerCacheNamespace(provider, fallback);
+		return /^[a-z0-9][a-z0-9._/-]{0,127}$/.test(namespace) ? namespace : 'tts/unspecified';
+	} catch {
+		return 'tts/unspecified';
+	}
+}
+
+function voiceDiagnosticFailureCode(error) {
+	const value = error?.code;
+	return typeof value === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(value) ? value : 'TTS_PROVIDER_ERROR';
+}
+
+function emitVoiceDiagnostic(reporter, event) {
+	try { reporter(Object.freeze({ ...event })); }
+	catch { /* voice diagnostics are observational */ }
+}
+
+function writeVoiceDiagnostic(event) {
+	const fields = Object.entries(event)
+		.filter(([key]) => key !== 'code')
+		.map(([key, value]) => `${key}=${value}`)
+		.join(' ');
+	process.stderr.write(`[voice] ${event.code}${fields === '' ? '' : ` ${fields}`}\n`);
 }
 
 function shouldUseWindowsTtsFallback(error) {
@@ -3405,10 +3581,9 @@ function finiteOrNull(value) {
 	return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
-function classifyObservationTrigger(payload, observation) {
+export function classifyObservationTrigger(payload, observation, signals = null) {
 	const explicitTrigger = typeof payload.trigger === 'string' && payload.trigger.trim().length > 0 ? payload.trigger.trim().slice(0, 128) : null;
 	const attention = payload.attention === true;
-	if (!attention && explicitTrigger === null) return { attention: false, priority: 'ordinary', trigger: 'observation' };
 	if (explicitTrigger !== null) return { attention: true, priority: payload.priority === 'urgent' ? 'urgent' : 'ordinary', trigger: explicitTrigger };
 	const changedFacts = Array.isArray(payload.changedFacts) ? payload.changedFacts : [];
 	const joinedFacts = changedFacts.filter((value) => typeof value === 'string').join('|').toLowerCase();
@@ -3419,8 +3594,63 @@ function classifyObservationTrigger(payload, observation) {
 	if (joinedFacts.includes('suffoc') || joinedFacts.includes('air')) return { attention: true, priority: 'urgent', trigger: 'suffocation' };
 	if (joinedFacts.includes('fall')) return { attention: true, priority: 'urgent', trigger: 'fall' };
 	if (Array.isArray(observation?.blocks) && observation.blocks.some((block) => typeof block?.blockId === 'string' && block.blockId.toLowerCase().includes('lava'))) return { attention: true, priority: 'urgent', trigger: 'lava' };
+	if (signals?.movementLoop === true) return { attention: true, priority: 'urgent', trigger: 'movement_loop' };
+	if (signals?.resourceDiscovery === true) return { attention: true, priority: 'urgent', trigger: 'resource_discovery' };
+	if (!attention) return { attention: false, priority: 'ordinary', trigger: 'observation' };
 	return { attention: true, priority: 'ordinary', trigger: 'attention' };
 }
+
+/** Detects a repeated two-point walk without flagging ordinary forward travel. */
+export function detectMovementLoop(positionKeys) {
+	if (!Array.isArray(positionKeys) || positionKeys.length < 4) return false;
+	const tail = positionKeys.slice(-6);
+	if (tail.length < 4) return false;
+	const unique = new Set(tail);
+	if (unique.size !== 2) return false;
+	for (let index = 2; index < tail.length; index += 1) {
+		if (tail[index] !== tail[index - 2]) return false;
+	}
+	return true;
+}
+
+function nativeBlockPositionKey(player) {
+	if (![player?.x, player?.y, player?.z].every((value) => typeof value === 'number' && Number.isFinite(value))) return null;
+	return `${Math.round(player.x)},${Math.round(player.y)},${Math.round(player.z)}`;
+}
+
+function observedResourceCandidates(observation) {
+	const candidates = [];
+	for (const block of observation?.blocks ?? []) {
+		if (!isResourceBlock(block)) continue;
+		candidates.push(`block:${block.x},${block.y},${block.z}:${block.blockId}`);
+	}
+	for (const landmark of observation?.landmarks ?? []) {
+		if (!isResourceBlock(landmark)) continue;
+		candidates.push(`landmark:${landmark.x},${landmark.y},${landmark.z}:${landmark.blockId}`);
+	}
+	for (const item of observation?.items ?? []) {
+		if (typeof item?.stableId !== 'string' || typeof item?.itemId !== 'string') continue;
+		candidates.push(`item:${item.stableId}:${item.itemId}`);
+	}
+	return candidates;
+}
+
+function isResourceBlock(block) {
+	const blockId = typeof block?.blockId === 'string' ? block.blockId.toLowerCase() : '';
+	const blockTags = Array.isArray(block?.tags) ? block.tags : [];
+	return blockTags.some((tag) => typeof tag === 'string' && (
+		tag === '#minecraft:logs'
+		|| tag === '#minecraft:leaves'
+		|| tag === '#minecraft:ores'
+		|| tag === '#minecraft:crops'
+		|| tag === '#minecraft:flowers'
+	)) || RESOURCE_BLOCK_SUFFIXES.some((suffix) => blockId.endsWith(suffix));
+}
+
+const RESOURCE_BLOCK_SUFFIXES = Object.freeze([
+	'_log', '_wood', '_ore', '_leaves', '_crop', '_crops', '_flower', '_mushroom',
+	'crafting_table', 'furnace', 'chest', 'barrel', 'hay_block', 'pumpkin', 'melon',
+]);
 
 function mergeAttentionTrigger(previous, next) {
 	const priority = previous?.priority === 'urgent' || next?.priority === 'urgent' ? 'urgent' : 'ordinary';
@@ -3461,6 +3691,7 @@ export function buildNativeEventInput(record, { event, trigger, observation = {}
 		items: (observation.items ?? []).slice(0, 16),
 		entities: (observation.entities ?? []).filter((entity) => entity?.type !== 'minecraft:item').slice(0, 16),
 		blocks: (observation.blocks ?? []).slice(0, 32),
+		...(observation.landmarks === undefined ? {} : { landmarks: observation.landmarks.slice(0, 32) }),
 		...(observation.nearbyContainers === undefined ? {} : { nearbyContainers: observation.nearbyContainers.slice(0, 16) }),
 		...(observation.world === undefined ? {} : { world: observation.world }),
 		...(observation.currentAction === undefined ? {} : { currentAction: observation.currentAction }),
@@ -3490,7 +3721,7 @@ export function buildNativeEventInput(record, { event, trigger, observation = {}
 	if (Buffer.byteLength(json, 'utf8') > 16_384) {
 		json = JSON.stringify({
 			...payload,
-			observation: { player: compactObservation.player, inventory: { items: compactObservation.inventory.items.slice(0, 16) }, items: [], entities: [], blocks: compactObservation.blocks.slice(0, 12) },
+			observation: { player: compactObservation.player, inventory: { items: compactObservation.inventory.items.slice(0, 16) }, items: [], entities: [], blocks: compactObservation.blocks.slice(0, 12), landmarks: (compactObservation.landmarks ?? []).slice(0, 12) },
 			conversation: { ...unreadConversation, entries: unreadConversation.entries.slice(-8) },
 		});
 	}
@@ -3513,6 +3744,9 @@ function nativeActionableObservationProjection(observation) {
 	if (observation.entities !== undefined) projection.entities = observation.entities.map(({ distance, ...entity }) => entity);
 	if (observation.nearbyContainers !== undefined) {
 		projection.nearbyContainers = observation.nearbyContainers.map(({ distance, ...container }) => container);
+	}
+	if (observation.landmarks !== undefined) {
+		projection.landmarks = observation.landmarks.map(({ distance, bearing, elevation, ...landmark }) => landmark);
 	}
 	if (observation.world !== undefined) {
 		const { gameTime, dayTime, ...world } = observation.world;

@@ -72,10 +72,45 @@ test('movement is a multi-tick action with displacement and a bounded yaw rate',
 	assert.ok(simulationWorld.playerState(PLAYER).position.x >= 1.8);
 });
 
+test('movement rejects a destination whose actor body intersects a solid block', () => {
+	const simulationWorld = world({
+		blocks: [
+			{ x: 0, y: 0, z: 0, blockId: 'minecraft:stone' },
+			{ x: 1, y: 0, z: 0, blockId: 'minecraft:stone' },
+			{ x: 2, y: 0, z: 0, blockId: 'minecraft:stone' },
+			{ x: 1, y: 1, z: 0, blockId: 'minecraft:stone' },
+		],
+	});
+	const runtime = new ActionRuntime();
+	runtime.accept(command('blocked-destination', 'navigate_to', {
+		x: 1.2, y: 1, z: 0, tolerance: 1, sprint: false, timeoutMs: 1_000,
+	}));
+	const result = run(runtime, simulationWorld, 'blocked-destination');
+	assert.equal(result.state, 'FAILED');
+	assert.equal(result.reasonCode, 'DESTINATION_BLOCKED');
+	assert.ok(simulationWorld.playerState(PLAYER).position.x < 1, 'failed movement must not enter the wall');
+});
+
+test('movement times out after physics stops the actor at a wall', () => {
+	const simulationWorld = world({
+		blocks: [0, 1, 2, 3].map((x) => ({ x, y: 0, z: 0, blockId: 'minecraft:stone' })).concat([
+			{ x: 1, y: 1, z: 0, blockId: 'minecraft:stone' },
+		]),
+	});
+	const runtime = new ActionRuntime();
+	runtime.accept(command('wall-stall', 'navigate_to', {
+		x: 3, y: 1, z: 0, tolerance: 0.1, sprint: false, timeoutMs: 1_000,
+	}));
+	const result = run(runtime, simulationWorld, 'wall-stall');
+	assert.equal(result.state, 'TIMED_OUT');
+	assert.equal(result.reasonCode, 'ACTION_TIMEOUT');
+	assert.ok(simulationWorld.playerState(PLAYER).position.x <= 0.7, 'physics must keep the actor on the near side of the wall');
+});
+
 test('mining takes simulated time, then removes the block and creates the declared drop', () => {
 	const simulationWorld = world({ blocks: [{ x: 1, y: 1, z: 0, blockId: 'minecraft:stone' }] });
 	const runtime = new ActionRuntime();
-	runtime.accept(command('mine', 'break_block', { x: 1, y: 1, z: 0, timeoutMs: 1_000 }));
+	runtime.accept(command('mine', 'break_block', { x: 1, y: 1, z: 0, expectedBlockId: 'minecraft:stone', timeoutMs: 1_000 }));
 	runtime.tick(simulationWorld);
 	assert.ok(simulationWorld.blockAt(1, 1, 0), 'target must remain until mining completes');
 	assert.equal(runtime.resultFor('mine'), undefined);
@@ -170,7 +205,7 @@ test('mining keeps the target block and inventory bytes unchanged when its drop 
 	});
 	const before = simulationWorld.inventories(PLAYER);
 	const runtime = new ActionRuntime();
-	runtime.accept(command('full-mine', 'break_block', { x: 1, y: 1, z: 0, timeoutMs: 1_000 }));
+	runtime.accept(command('full-mine', 'break_block', { x: 1, y: 1, z: 0, expectedBlockId: 'minecraft:stone', timeoutMs: 1_000 }));
 	const result = run(runtime, simulationWorld, 'full-mine');
 	assert.equal(result.state, 'FAILED');
 	assert.equal(result.reasonCode, 'WORLD_CAPACITY_EXCEEDED');
@@ -261,7 +296,7 @@ test('every production action type is implemented or terminates with an explicit
 		attack: { targetId: uuid, timeoutMs: 1_000 },
 		select_item: { itemId: 'minecraft:stick' },
 		use_item: { durationMs: 1 },
-		break_block: { x: 1, y: 1, z: 0, timeoutMs: 1_000 },
+		break_block: { x: 1, y: 1, z: 0, expectedBlockId: 'minecraft:stone', timeoutMs: 1_000 },
 		pick_up_item: { targetSelector: uuid },
 		place_block: { x: 1, y: 1, z: 0, face: 'up', itemId: 'minecraft:cobblestone' },
 		chat: { message: 'hi', audience: 'direct', recipientId: uuid },

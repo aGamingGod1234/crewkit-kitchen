@@ -68,6 +68,7 @@ public final class ProtocolCodec {
 	private static final String FIELD_DESTINATION_KIND = "destinationKind";
 	private static final String FIELD_DESTINATION_SLOT = "destinationSlot";
 	private static final String FIELD_EXPECTED_ITEM_ID = "expectedItemId";
+	private static final String FIELD_EXPECTED_BLOCK_ID = "expectedBlockId";
 	private static final String FIELD_RECIPE_ID = "recipeId";
 	private static final String FIELD_OPERATION = "operation";
 	private static final String FIELD_INVENTORY_SLOT = "inventorySlot";
@@ -447,6 +448,11 @@ public final class ProtocolCodec {
 	private static void validateBreakBlock(JsonObject command) throws ProtocolException {
 		validateCoordinates(command, true);
 		requireDuration(command, FIELD_TIMEOUT_MS);
+		// Kept nullable at the wire boundary for legacy callers; the server executor
+		// rejects a missing value before announcing or attempting the break.
+		if (command.has(FIELD_EXPECTED_BLOCK_ID) && !command.get(FIELD_EXPECTED_BLOCK_ID).isJsonNull()) {
+			requireIdentifier(command, FIELD_EXPECTED_BLOCK_ID);
+		}
 	}
 
 	private static void validatePlaceBlock(JsonObject command) throws ProtocolException {
@@ -827,7 +833,7 @@ public final class ProtocolCodec {
 		fields.put(ActionType.ATTACK, List.of(FIELD_TARGET_ID, FIELD_TIMEOUT_MS));
 		fields.put(ActionType.SELECT_ITEM, List.of(FIELD_ITEM_ID));
 		fields.put(ActionType.USE_ITEM, List.of(FIELD_DURATION_MS));
-		fields.put(ActionType.BREAK_BLOCK, List.of(FIELD_X, FIELD_Y, FIELD_Z, FIELD_TIMEOUT_MS));
+		fields.put(ActionType.BREAK_BLOCK, List.of(FIELD_X, FIELD_Y, FIELD_Z, FIELD_TIMEOUT_MS, FIELD_EXPECTED_BLOCK_ID));
 		fields.put(ActionType.PLACE_BLOCK, List.of(FIELD_X, FIELD_Y, FIELD_Z, FIELD_FACE, FIELD_ITEM_ID, FIELD_DESIRED_STATE));
 		fields.put(ActionType.BUILD_SEQUENCE, List.of(FIELD_PLACEMENTS, FIELD_TIMEOUT_MS));
 		fields.put(ActionType.CHAT, List.of(FIELD_MESSAGE, FIELD_AUDIENCE, FIELD_RECIPIENT_ID));

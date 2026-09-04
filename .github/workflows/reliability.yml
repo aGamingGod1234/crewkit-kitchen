@@ -91,6 +91,7 @@ jobs:
           $archive = ".\build\distributions\$env:DISTRIBUTION_NAME.zip"
           .\scripts\verify-coordinator-packaging.ps1 -JarPath $builtMod
           .\scripts\verify-distribution-runtime.ps1
+          .\scripts\test-install-normal-profile-update.ps1 -ProjectRoot .
           $unpacked = Join-Path $env:RUNNER_TEMP 'arena-agents-standalone'
           Expand-Archive -LiteralPath $archive -DestinationPath $unpacked
           $packagedMod = Join-Path $unpacked "mods\arena-agents-$env:MOD_VERSION.jar"

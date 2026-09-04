@@ -33,7 +33,7 @@ test('collects eight logs across two trees using fresh inventory facts and prove
 		program.onUnhandledAttention("continue_and_notify");
 		await program.repeatUntil(() => inventory.count("minecraft:oak_log") >= 8, { maxIterations: 8 }, async () => {
 			const tree = world.nearest(world.blocks({ blockId: "minecraft:oak_log" }));
-			if (tree !== null) await player.mine({ x: tree.x, y: tree.y, z: tree.z, timeoutMs: 1 });
+			if (tree !== null) await player.mine({ x: tree.x, y: tree.y, z: tree.z, expectedBlockId: tree.blockId, timeoutMs: 1 });
 		});
 		program.finish("Collected eight logs");
 	`);
@@ -90,7 +90,7 @@ test('reports a disappearing observed block as a typed model-visible failure', a
 	await disappeared.install(`
 		program.onUnhandledAttention("continue_and_notify");
 		const tree = world.nearest(world.blocks({ blockId: "minecraft:oak_log" }));
-		const result = await tryResult(player.mine({ x: tree.x, y: tree.y, z: tree.z, timeoutMs: 5_000 }));
+		const result = await tryResult(player.mine({ x: tree.x, y: tree.y, z: tree.z, expectedBlockId: tree.blockId, timeoutMs: 5_000 }));
 		if (!result.succeeded) program.checkpoint(result.reason);
 		if (inventory.count("minecraft:oak_log") < 1) program.checkpoint("BLOCK_DROPPED_NO_LOG");
 		program.finish("picked up");
@@ -135,7 +135,7 @@ test('runs a matching damage watcher without a provider turn and follows both un
 	await matching.install(`
 		program.onUnhandledAttention("continue_and_notify");
 		program.watch(() => player.state().health < 20, { mode: "interrupt" }, async () => { await player.wait(1); });
-		await player.mine({ x: 1, y: 64, z: 0, timeoutMs: 1 });
+		await player.mine({ x: 1, y: 64, z: 0, expectedBlockId: "minecraft:oak_log", timeoutMs: 1 });
 		program.finish("damage handled");
 	`);
 	await eventually(() => matching.bridge.sent.filter((entry) => entry.type === 'action_command').some((entry) => entry.payload.actionType === 'wait'));
@@ -174,7 +174,7 @@ test('runs pre-authored falling and lava interrupts without another provider tur
 	await falling.install(`
 		program.onUnhandledAttention("continue_and_notify");
 		program.watch(() => player.state().fallDistance > 3, { mode: "interrupt" }, async () => { await player.wait(1); });
-		await player.mine({ x: 1, y: 64, z: 0, timeoutMs: 1 });
+		await player.mine({ x: 1, y: 64, z: 0, expectedBlockId: "minecraft:oak_log", timeoutMs: 1 });
 	`);
 	await eventually(() => falling.bridge.sent.filter((entry) => entry.type === 'action_command').some((entry) => entry.payload.actionType === 'wait'));
 	assert.equal(falling.plannerCalls.length, 0);
@@ -186,7 +186,7 @@ test('runs pre-authored falling and lava interrupts without another provider tur
 			? { attentionObservation: observation({ player: { fire: true } }), defer: true }
 			: { observation: observation({ player: { fire: true } }) },
 	});
-	await lava.install('program.onUnhandledAttention("continue_and_notify"); program.watch(() => player.state().fire === true, { mode: "interrupt" }, async () => { await player.wait(1); }); await player.mine({ x: 1, y: 64, z: 0, timeoutMs: 1 });');
+	await lava.install('program.onUnhandledAttention("continue_and_notify"); program.watch(() => player.state().fire === true, { mode: "interrupt" }, async () => { await player.wait(1); }); await player.mine({ x: 1, y: 64, z: 0, expectedBlockId: "minecraft:oak_log", timeoutMs: 1 });');
 	await eventually(() => lava.bridge.sent.filter((entry) => entry.type === 'action_command').some((entry) => entry.payload.actionType === 'wait'));
 	assert.equal(lava.plannerCalls.length, 0);
 	assertCommandProvenance(commandPayloads(lava.bridge), SELECTED_PROFILE, 'program-1-1');

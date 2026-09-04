@@ -21,6 +21,7 @@ export const MIN_MOVEMENT_TOLERANCE = 0.01;
 export const MAX_MOVEMENT_TOLERANCE = 16;
 export const MAX_ENTITIES = 64;
 export const MAX_BLOCKS = 128;
+export const MAX_LANDMARKS = 32;
 export const MAX_EFFECTS = 32;
 export const MAX_INVENTORY_SUMMARIES = 64;
 export const MAX_OBSERVATION_TAGS = 32;
@@ -48,7 +49,7 @@ export const ACTION_FIELDS = Object.freeze({
 	attack: Object.freeze(['targetId', 'timeoutMs']),
 	select_item: Object.freeze(['itemId']),
 	use_item: Object.freeze(['durationMs']),
-	break_block: Object.freeze(['x', 'y', 'z', 'timeoutMs']),
+	break_block: Object.freeze(['x', 'y', 'z', 'expectedBlockId', 'timeoutMs']),
 	pick_up_item: Object.freeze(['targetSelector']),
 	place_block: Object.freeze(['x', 'y', 'z', 'face', 'itemId', 'desiredState']),
 	chat: Object.freeze(['message', 'audience', 'recipientId']),

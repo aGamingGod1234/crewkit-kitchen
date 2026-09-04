@@ -41,10 +41,17 @@ test('translated movement and kill predicates enforce executable post-activation
 	assert.deepEqual(parseGoalSpec(killSpec), killSpec);
 
 	for (const schema of [GOAL_PREDICATE_SCHEMA, GOAL_SPEC_PROPOSAL_SCHEMA.$defs.predicate]) {
-		const positionSchema = schema.oneOf.find(entry => entry.properties.type.const === 'position_within');
-		const killSchema = schema.oneOf.find(entry => entry.properties.type.const === 'entity_killed_by_agent');
+		const positionSchema = schema.anyOf.find(entry => entry.properties.type.const === 'position_within');
+		const killSchema = schema.anyOf.find(entry => entry.properties.type.const === 'entity_killed_by_agent');
 		assert.equal(positionSchema.properties.radius.minimum, 0.01);
+		assert.deepEqual(positionSchema.properties.dimensionId.type, ['string', 'null']);
+		assert.equal(positionSchema.required.includes('dimensionId'), true);
 		assert.equal(killSchema.properties.afterGoalStart.const, true);
+	}
+	assert.equal(JSON.stringify(GOAL_SPEC_PROPOSAL_SCHEMA).includes('"oneOf"'), false);
+	assert.equal(JSON.stringify(GOAL_SPEC_PROPOSAL_SCHEMA).includes('"additionalProperties":{"type":"string"}'), false);
+	for (const variant of GOAL_SPEC_PROPOSAL_SCHEMA.$defs.predicate.anyOf) {
+		assert.equal(variant.properties.type.type, 'string');
 	}
 });
 

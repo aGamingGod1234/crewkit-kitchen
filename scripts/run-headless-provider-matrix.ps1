@@ -62,11 +62,55 @@ function Test-BindFailure([string] $ServerLogPath, [string] $ServerStderrPath) {
 	return $text -match '(?i)(address already in use|failed to bind|could not bind|bind.+failed|port.+already)'
 }
 
-function Test-CoordinatorReady([string] $ProtocolAuditPath) {
-	$text = Read-Text $ProtocolAuditPath
-	$authenticated = $text -match '"direction"\s*:\s*"server_to_coordinator"[^\r\n]*"type"\s*:\s*"hello_ack"'
-	$catalogPublished = $text -match '"direction"\s*:\s*"coordinator_to_server"[^\r\n]*"type"\s*:\s*"catalog_snapshot"'
-	return $authenticated -and $catalogPublished
+function Test-CoordinatorReady([string] $ProtocolAuditPath, $Scenario) {
+	if (-not (Test-Path -LiteralPath $ProtocolAuditPath -PathType Leaf)) { return $false }
+	$scenarioServiceTier = 'priority'
+	if ($null -ne $Scenario.PSObject.Properties['serviceTier'] -and $null -ne $Scenario.serviceTier) {
+		$scenarioServiceTier = [string] $Scenario.serviceTier
+	}
+	$authenticated = $false
+	$profileReady = $false
+	$providerSettled = $false
+	$providerCatalogReady = $false
+	foreach ($line in @(Get-Content -LiteralPath $ProtocolAuditPath -ErrorAction SilentlyContinue)) {
+		if ([string]::IsNullOrWhiteSpace($line)) { continue }
+		try { $row = $line | ConvertFrom-Json } catch { continue }
+		$envelope = $row.envelope
+		if ($null -eq $envelope) { continue }
+		$helloAcknowledged = [string] $row.direction -eq 'server_to_coordinator' `
+				-and [string] $envelope.type -eq 'hello_ack' `
+				-and $envelope.payload.authenticated -eq $true
+		if ($helloAcknowledged) {
+			$authenticated = $true
+		}
+		if ([string] $row.direction -eq 'coordinator_to_server' -and [string] $envelope.type -eq 'coordinator_status') {
+			$providerComponent = "provider:$([string] $Scenario.provider)"
+			$providerSettled = @($envelope.payload.components | Where-Object {
+				[string] $_.component -eq $providerComponent -and [string] $_.state -in @('ready', 'degraded')
+			}).Count -gt 0
+		}
+		if ([string] $row.direction -ne 'coordinator_to_server' -or [string] $envelope.type -ne 'catalog_snapshot') { continue }
+		foreach ($model in @($envelope.payload.models)) {
+			if ([string] $model.provider -eq [string] $Scenario.provider) { $providerCatalogReady = $true }
+			$modelId = if ($null -ne $model.model) { [string] $model.model } else { [string] $model.id }
+			$efforts = @($model.reasoningEfforts | ForEach-Object {
+				if ($_ -is [string]) { [string] $_ } elseif ($null -ne $_.reasoningEffort) { [string] $_.reasoningEffort }
+			})
+			$tiers = @($model.serviceTiers | ForEach-Object {
+				if ($_ -is [string]) { [string] $_ } elseif ($null -ne $_.id) { [string] $_.id }
+			})
+			$tierReady = $tiers.Count -eq 0 -or $tiers -contains $scenarioServiceTier
+			$matchesProfile = [string] $model.provider -eq [string] $Scenario.provider `
+					-and $modelId -eq [string] $Scenario.model `
+					-and $efforts -contains [string] $Scenario.reasoningEffort `
+					-and $tierReady
+			if ($matchesProfile) {
+				$profileReady = $true
+				break
+			}
+		}
+	}
+	return $authenticated -and ($profileReady -or ($providerSettled -and $providerCatalogReady))
 }
 
 function Protect-LocalFile([string] $Path) {
@@ -722,7 +766,7 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 			try {
 				Wait-Condition {
 					if ($coordinatorHandle.Process.HasExited) { throw "Coordinator exited before bridge readiness: $(ConvertTo-BoundedText (Read-Text $coordinatorStderrPath) $MaxDiagnosticText)" }
-					(Test-Port $bridgePort) -and (Test-CoordinatorReady $protocolAudit)
+					(Test-Port $bridgePort) -and (Test-CoordinatorReady $protocolAudit $Scenario)
 				} $StartupTimeoutSeconds 'Coordinator bridge did not become ready'
 				$coordinatorReady = $true
 			} catch {
@@ -774,9 +818,17 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 		$peakRssBytes = [long] $resourcePeak.peakRssBytes
 		$runnerExit = $runnerHandle.Process.ExitCode
 		Complete-RedirectedProcess $runnerHandle
-		$runnerReport = Read-BoundedJson (Join-Path $scenarioDirectory 'report.json') $MaxMatrixReportBytes 'runner scenario report'
-		if ([string] $runnerReport.scenarioId -ne $scenarioId -or @('PASSED', 'FAILED', 'SKIPPED') -notcontains [string] $runnerReport.status) {
-			throw "Runner scenario report for '$scenarioId' is invalid"
+		if ($repetitions -eq 1) {
+			$runnerReport = Read-BoundedJson (Join-Path $scenarioDirectory 'report.json') $MaxMatrixReportBytes 'runner scenario report'
+			if ([string] $runnerReport.scenarioId -ne $scenarioId -or @('PASSED', 'FAILED', 'SKIPPED') -notcontains [string] $runnerReport.status) {
+				throw "Runner scenario report for '$scenarioId' is invalid"
+			}
+		} else {
+			$runnerReport = Read-BoundedJson (Join-Path $scenarioDirectory 'matrix-report.json') $MaxMatrixReportBytes 'runner repetition report'
+			$repetitionReports = @($runnerReport.scenarios)
+			if (@('PASSED', 'FAILED', 'SKIPPED') -notcontains [string] $runnerReport.status -or $repetitionReports.Count -ne $repetitions -or @($repetitionReports | Where-Object { [string] $_.scenarioId -ne $scenarioId -or @('PASSED', 'FAILED', 'SKIPPED') -notcontains [string] $_.status }).Count -gt 0) {
+				throw "Runner repetition report for '$scenarioId' is invalid"
+			}
 		}
 		if ($runnerExit -ne 0) { throw "Scenario '$scenarioId' failed with runner exit code $runnerExit" }
 	} catch {
@@ -826,7 +878,7 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 	$reportFields['exitCode'] = $runnerExit
 	$reportFields['cleanup'] = [pscustomobject]@{
 		status = $cleanupStatus
-		runner = if ($null -eq $runnerReport) { $null } else { $runnerReport.cleanup }
+		runner = if ($null -eq $runnerReport -or $null -eq $runnerReport.PSObject.Properties['cleanup']) { $null } else { $runnerReport.cleanup }
 		processIds = @($processIds | ForEach-Object { [int] $_.ProcessId } | Select-Object -Unique)
 		diagnostics = if ($null -eq $cleanupFailure) { $null } else { ConvertTo-BoundedText $cleanupFailure.Exception.Message $MaxDiagnosticText }
 	}

@@ -249,6 +249,12 @@ export class CodexStdioTransport extends EventEmitter {
 		this.#stopTimeoutMs = dependencies.stopTimeoutMs ?? DEFAULT_CHILD_STOP_TIMEOUT_MS;
 	}
 
+	setEnvironment(environment) {
+		if (this.#child !== null) throw new CodexProtocolError('TRANSPORT_RUNNING', 'Codex environment cannot change after startup');
+		if (environment === null || typeof environment !== 'object' || Array.isArray(environment)) throw new TypeError('Codex launch environment must be an object');
+		this.#config = { ...this.#config, environment: { ...environment } };
+	}
+
 	async start() {
 		if (this.#child !== null) return;
 		this.#decoder = new JsonlDecoder({ maxBytes: APP_SERVER_MAX_LINE_BYTES });

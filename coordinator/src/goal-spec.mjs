@@ -19,40 +19,44 @@ export class GoalSpecError extends Error {
 
 const predicateVariants = [
 	objectSchema(['type', 'itemId', 'count'], {
-		type: { const: 'inventory_contains' }, itemId: { type: 'string' }, count: { type: 'integer', minimum: 1 },
+		type: { type: 'string', const: 'inventory_contains' }, itemId: { type: 'string' }, count: { type: 'integer', minimum: 1 },
 	}),
-	objectSchema(['type', 'x', 'y', 'z', 'radius', 'stableTicks'], {
-		type: { const: 'position_within' }, dimensionId: { type: 'string' }, x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
+	objectSchema(['type', 'dimensionId', 'x', 'y', 'z', 'radius', 'stableTicks'], {
+		type: { type: 'string', const: 'position_within' }, dimensionId: { type: ['string', 'null'] }, x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
 		radius: { type: 'number', minimum: MIN_MOVEMENT_TOLERANCE }, stableTicks: { type: 'integer', minimum: 1 },
 	}),
-	objectSchema(['type', 'advancementId'], { type: { const: 'advancement_granted' }, advancementId: { type: 'string' } }),
+	objectSchema(['type', 'advancementId'], { type: { type: 'string', const: 'advancement_granted' }, advancementId: { type: 'string' } }),
 	objectSchema(['type', 'entityType', 'afterGoalStart'], {
-		type: { const: 'entity_killed_by_agent' }, entityType: { type: 'string' }, afterGoalStart: { const: true },
+		type: { type: 'string', const: 'entity_killed_by_agent' }, entityType: { type: 'string' }, afterGoalStart: { type: 'boolean', const: true },
 	}),
-	objectSchema(['type', 'x', 'y', 'z', 'blockId', 'properties'], {
-		type: { const: 'block_matches' }, dimensionId: { type: 'string' }, x: { type: 'integer' }, y: { type: 'integer' }, z: { type: 'integer' },
-		blockId: { type: 'string' }, properties: { type: 'object', additionalProperties: { type: 'string' }, maxProperties: 16 },
+	objectSchema(['type', 'dimensionId', 'x', 'y', 'z', 'blockId', 'properties'], {
+		type: { type: 'string', const: 'block_matches' }, dimensionId: { type: ['string', 'null'] }, x: { type: 'integer' }, y: { type: 'integer' }, z: { type: 'integer' },
+		blockId: { type: 'string' }, properties: {
+			type: 'array', maxItems: 16, items: objectSchema(['name', 'value'], {
+				name: { type: 'string' }, value: { type: 'string' },
+			}),
+		},
 	}),
-	objectSchema(['type', 'ticks'], { type: { const: 'survive_duration' }, ticks: { type: 'integer', minimum: 1 } }),
-	objectSchema(['type'], { type: { const: 'operator_confirmed' } }),
+	objectSchema(['type', 'ticks'], { type: { type: 'string', const: 'survive_duration' }, ticks: { type: 'integer', minimum: 1 } }),
+	objectSchema(['type'], { type: { type: 'string', const: 'operator_confirmed' } }),
 	objectSchema(['type', 'predicates'], {
-		type: { const: 'all_of' }, predicates: { type: 'array', minItems: 1, maxItems: MAX_LEAVES, items: { $ref: '#/$defs/predicate' } },
+		type: { type: 'string', const: 'all_of' }, predicates: { type: 'array', minItems: 1, maxItems: MAX_LEAVES, items: { $ref: '#/$defs/predicate' } },
 	}),
 	objectSchema(['type', 'predicates'], {
-		type: { const: 'any_of' }, predicates: { type: 'array', minItems: 1, maxItems: MAX_LEAVES, items: { $ref: '#/$defs/predicate' } },
+		type: { type: 'string', const: 'any_of' }, predicates: { type: 'array', minItems: 1, maxItems: MAX_LEAVES, items: { $ref: '#/$defs/predicate' } },
 	}),
 ];
 
 export const GOAL_PREDICATE_SCHEMA = deepFreeze({
-	oneOf: predicateVariants,
-	$defs: { predicate: { oneOf: predicateVariants } },
+	anyOf: predicateVariants,
+	$defs: { predicate: { anyOf: predicateVariants } },
 });
 
 export const GOAL_SPEC_PROPOSAL_SCHEMA = deepFreeze({
 	type: 'object',
 	additionalProperties: false,
 	required: ['requestId', 'summary', 'predicate'],
-	$defs: { predicate: { oneOf: predicateVariants } },
+	$defs: { predicate: { anyOf: predicateVariants } },
 	properties: {
 		requestId: { type: 'string', pattern: UUID.source, minLength: 36, maxLength: 36 },
 		summary: { type: 'string', minLength: 1, maxLength: 256 },

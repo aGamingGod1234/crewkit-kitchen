@@ -9,6 +9,9 @@ public interface VoiceSubsystem extends AutoCloseable {
 
 	void registerAgent(AgentId agentId, UUID entityId);
 
+	default void refreshAgent(AgentId agentId, UUID entityId) {
+	}
+
 	void unregisterAgent(AgentId agentId);
 
 	CompletionStage<VoiceReceipt> speak(VoiceRequest request);

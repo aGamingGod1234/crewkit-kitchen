@@ -397,7 +397,7 @@ function nativeRequest(record, goalRevision, turn, call, action) {
 function actionTool(action, goalRevision = 1) {
 	switch (action) {
 		case 'observe': return { kind: 'observe' };
-		case 'mine': return { kind: 'action', actionType: 'break_block', arguments: { x: 0, y: 64, z: 0, timeoutMs: 1_000 } };
+		case 'mine': return { kind: 'action', actionType: 'break_block', arguments: { x: 0, y: 64, z: 0, expectedBlockId: 'minecraft:stone', timeoutMs: 1_000 } };
 		case 'move_to': return { kind: 'action', actionType: 'navigate_to', arguments: { x: 1, y: 64, z: 0, tolerance: 1, sprint: false, timeoutMs: 1_000 } };
 		case 'pick_up_item': return { kind: 'action', actionType: 'pick_up_item', arguments: { targetSelector: '00000000-0000-4000-8000-000000000001' } };
 		case 'craft_inventory': return { kind: 'action', actionType: 'craft_inventory', arguments: { recipeId: 'minecraft:wooden_pickaxe', count: 1, timeoutMs: 1_000 } };

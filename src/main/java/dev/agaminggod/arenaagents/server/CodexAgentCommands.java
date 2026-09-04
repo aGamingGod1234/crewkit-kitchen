@@ -13,6 +13,7 @@ import dev.agaminggod.arenaagents.agent.AgentTransition;
 import dev.agaminggod.arenaagents.server.group.AgentGroup;
 import dev.agaminggod.arenaagents.server.group.AgentGroupSpawnCoordinator;
 import dev.agaminggod.arenaagents.server.goal.GoalDraftChoice;
+import dev.agaminggod.arenaagents.server.goal.GoalSubmission;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
@@ -116,13 +117,13 @@ public final class CodexAgentCommands {
 								.then(Commands.literal("off").executes(context -> voiceConsent(context, false)))
 								.then(Commands.literal("status").executes(CodexAgentCommands::voiceConsentStatus)))
 						.then(goalDraftCommands())
-						.then(promptCommand("start", CodexAgentManager::start))
+						.then(goalPromptCommand("start", GoalSubmission.Operation.START))
 						.then(agentCommand("stop", CodexAgentManager::stop))
 						.then(agentCommand("resume", CodexAgentManager::resume))
 						.then(Commands.literal("respawn")
 								.requires(GoalControl::mayControl)
 								.then(agentArgument().executes(CodexAgentCommands::respawn)))
-						.then(promptCommand("queue", CodexAgentManager::queue))
+						.then(goalPromptCommand("queue", GoalSubmission.Operation.QUEUE))
 						.then(promptCommand("steer", (manager, selector, prompt, ignored) -> manager.steer(selector, prompt)))
 						.then(Commands.literal("status")
 								.requires(GoalControl::mayControl)
@@ -287,6 +288,18 @@ public final class CodexAgentCommands {
 		);
 	}
 
+	private static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> goalPromptCommand(
+			String literal,
+			GoalSubmission.Operation operation
+	) {
+		return Commands.literal(literal).requires(GoalControl::mayControl).then(
+				agentArgument().then(
+						Commands.argument(ARGUMENT_PROMPT, StringArgumentType.greedyString())
+								.executes(context -> runGoalPromptOperation(context, literal, operation))
+				)
+		);
+	}
+
 	private static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> agentCommand(
 			String literal,
 			AgentOperation operation
@@ -381,6 +394,36 @@ public final class CodexAgentCommands {
 			String prompt = StringArgumentType.getString(context, ARGUMENT_PROMPT);
 			AgentTransition transition = operation.apply(manager(context), selector, prompt, context.getSource().getLevel());
 			reportTransition(context, operationName, transition);
+			return 1;
+		} catch (AgentDomainException exception) {
+			throw commandFailure(exception);
+		} catch (RuntimeException exception) {
+			throw unexpectedFailure(operationName, exception);
+		}
+	}
+
+	private static int runGoalPromptOperation(
+			CommandContext<CommandSourceStack> context,
+			String operationName,
+			GoalSubmission.Operation operation
+	) throws CommandSyntaxException {
+		try {
+			CodexAgentServerRuntime.requireAutomation(context.getSource().getServer());
+			String selector = StringArgumentType.getString(context, ARGUMENT_AGENT);
+			String prompt = StringArgumentType.getString(context, ARGUMENT_PROMPT);
+			Optional<UUID> requester = context.getSource().getEntity() instanceof ServerPlayer player
+					? Optional.of(player.getUUID()) : Optional.empty();
+			GoalSubmission submission = CodexAgentServerRuntime.submitGoal(
+					context.getSource().getServer(), selector, prompt, context.getSource().getLevel(), requester, operation);
+			if (submission.transition().isPresent()) {
+				reportTransition(context, operationName, submission.transition().orElseThrow());
+			} else {
+				var draft = submission.pendingDraft().orElseThrow();
+				String name = manager(context).displayName(manager(context).registry().require(draft.agentId()));
+				context.getSource().sendSuccess(() -> Component.literal(
+						"The coordinator is interpreting the goal for " + name
+								+ ". It will " + operationName + " automatically after server validation."), false);
+			}
 			return 1;
 		} catch (AgentDomainException exception) {
 			throw commandFailure(exception);

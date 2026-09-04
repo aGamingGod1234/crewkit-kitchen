@@ -37,6 +37,7 @@ export function createVoiceHttpServer({
 	initialProbeDelayMs = DEFAULT_INITIAL_PROBE_DELAY_MS,
 	maxProbeDelayMs = DEFAULT_MAX_PROBE_DELAY_MS,
 	probeTimeoutMs = DEFAULT_PROBE_TIMEOUT_MS,
+	onDiagnostic = null,
 } = {}) {
 	if (provider !== null && typeof provider?.synthesize !== 'function') throw new TypeError('provider.synthesize is required');
 	if (profileStore === null || typeof profileStore?.resolve !== 'function') throw new TypeError('profileStore.resolve is required');
@@ -54,6 +55,7 @@ export function createVoiceHttpServer({
 	if (typeof now !== 'function' || typeof scheduleProbe !== 'function' || typeof cancelProbe !== 'function') {
 		throw new TypeError('voice probe clock and scheduler must be functions');
 	}
+	if (onDiagnostic !== null && typeof onDiagnostic !== 'function') throw new TypeError('onDiagnostic must be a function');
 	for (const [name, value] of Object.entries({ initialProbeDelayMs, maxProbeDelayMs, probeTimeoutMs })) {
 		if (!Number.isSafeInteger(value) || value < 1 || value > 120_000) throw new TypeError(`${name} must be between 1 and 120000`);
 	}
@@ -75,6 +77,7 @@ export function createVoiceHttpServer({
 	let live = false;
 	let closing = false;
 	let terminalFailure = null;
+	let reportedTtsProvider = null;
 	const authenticatedNonces = new Map();
 	const activeSttPlayers = new Set();
 	const sttNextAllowedAt = new Map();
@@ -243,26 +246,30 @@ export function createVoiceHttpServer({
 				throw error;
 			}
 			const profile = profileStore.resolve(payload.agentId);
-			const profileNamespace = `${profile.provider}/${profile.model}`;
-			const cacheKey = synthesisCacheKey(profile, payload, providerCacheNamespace(provider, profileNamespace));
-			let output = cache.get(cacheKey);
-			if (output === null) {
+			const requestedProvider = effectiveProviderNamespace(provider);
+			const cacheKey = synthesisCacheKey(profile, payload, requestedProvider);
+			const cached = cache.get(cacheKey);
+			let synthesis;
+			if (cached === null) {
 				attemptedLifecycle = ttsLifecycle;
 				const joined = joinTtsSynthesis({
 					cacheKey,
 					profile,
-					profileNamespace,
 					payload,
 					signal: controller.signal,
 				});
 				attemptedLifecycle = null;
 				completeSharedTtsRequest = joined.complete;
-				output = await joined.waiter;
+				synthesis = await joined.waiter;
+			} else {
+				synthesis = Object.freeze({ pcm: cached, effectiveProvider: requestedProvider });
 			}
-			respondAuthenticatedBytes(response, 200, output, 'audio/l16', secret, authentication.nonce, {
+			reportEffectiveTtsProvider(synthesis.effectiveProvider);
+			respondAuthenticatedBytes(response, 200, synthesis.pcm, 'audio/l16', secret, authentication.nonce, {
 				'X-Audio-Sample-Rate': '48000',
 				'X-Audio-Channels': '1',
 				'X-Voice-Profile': profile.profileId,
+				'X-Voice-Synthesizer': synthesis.effectiveProvider,
 				'Cache-Control': 'private, immutable',
 			});
 		} catch (error) {
@@ -286,7 +293,7 @@ export function createVoiceHttpServer({
 		return effectiveReservedStt > 0 && sttLifecycle.snapshot().state === 'ready' ? effectiveReservedStt : 0;
 	}
 
-	function joinTtsSynthesis({ cacheKey, profile, profileNamespace, payload, signal }) {
+	function joinTtsSynthesis({ cacheKey, profile, payload, signal }) {
 		let entry = inFlightTts.get(cacheKey);
 		if (entry === undefined) {
 			if (providerTtsStalled || activeProviderTts >= maxProviderTts) {
@@ -316,16 +323,17 @@ export function createVoiceHttpServer({
 					}));
 					const output = resampleS16leMono(synthesized.pcm, synthesized.sampleRateHz, 48_000, 20);
 					if (output.length === 0) throw typedError('TTS_MALFORMED_AUDIO', 'TTS output was empty');
+					const completedProvider = effectiveSynthesisNamespace(synthesized, provider);
 					if (!providerController.signal.aborted && synthesized.cacheable !== false) {
 						const completedKey = synthesisCacheKey(
 							profile,
 							payload,
-							synthesisCacheNamespace(synthesized, provider, profileNamespace),
+							completedProvider,
 						);
 						cache.set(completedKey, output);
 					}
 					if (!providerController.signal.aborted) ttsLifecycle.recordReady();
-					return output;
+					return Object.freeze({ pcm: output, effectiveProvider: completedProvider });
 				} catch (error) {
 					current.failed = true;
 					current.failure = error;
@@ -358,6 +366,21 @@ export function createVoiceHttpServer({
 				if (current.waiters === 0 && current.settled) recordTtsFlightFailure(current);
 			},
 		};
+	}
+
+	function reportEffectiveTtsProvider(effectiveProvider) {
+		if (effectiveProvider === reportedTtsProvider) return;
+		reportedTtsProvider = effectiveProvider;
+		try {
+			onDiagnostic?.(Object.freeze({ code: 'VOICE_TTS_EFFECTIVE_PROVIDER', effectiveProvider }));
+		} catch { /* provider diagnostics are observational */ }
+	}
+
+	function ttsStatusSnapshot() {
+		return Object.freeze({
+			...ttsLifecycle.snapshot(),
+			effectiveProvider: effectiveProviderNamespace(provider),
+		});
 	}
 
 	function recordTtsFlightFailure(entry) {
@@ -408,10 +431,10 @@ export function createVoiceHttpServer({
 			};
 		},
 		statusSnapshot() {
-			return aggregateVoiceStatus(ttsLifecycle.snapshot(), sttLifecycle.snapshot());
+			return aggregateVoiceStatus(ttsStatusSnapshot(), sttLifecycle.snapshot());
 		},
 		statusSnapshots() {
-			const tts = ttsLifecycle.snapshot();
+			const tts = ttsStatusSnapshot();
 			const stt = sttLifecycle.snapshot();
 			return Object.freeze([aggregateVoiceStatus(tts, stt), tts, stt]);
 		},
@@ -481,6 +504,28 @@ export function createVoiceHttpServer({
 			return closePromise;
 		},
 	});
+}
+
+function effectiveProviderNamespace(provider) {
+	try {
+		return boundedProviderNamespace(providerCacheNamespace(provider, 'tts/unspecified'));
+	} catch {
+		return 'tts/unspecified';
+	}
+}
+
+function effectiveSynthesisNamespace(synthesis, provider) {
+	try {
+		return boundedProviderNamespace(synthesisCacheNamespace(synthesis, provider, 'tts/unspecified'));
+	} catch {
+		return 'tts/unspecified';
+	}
+}
+
+function boundedProviderNamespace(value) {
+	return typeof value === 'string' && /^[a-z0-9][a-z0-9._/-]{0,127}$/.test(value)
+		? value
+		: 'tts/unspecified';
 }
 
 function synthesisCacheKey(profile, payload, synthesizer) {
@@ -695,6 +740,7 @@ function aggregateVoiceStatus(tts, stt) {
 	if (failed === undefined) {
 		return Object.freeze({
 			component: 'voice', state: 'ready', fallbackMode: null, boundary: null, failureCode: null,
+			effectiveTtsProvider: tts.effectiveProvider ?? null,
 			consecutiveFailureCount: 0, nextProbeAtEpochMs: null,
 			generation: tts.generation + stt.generation,
 			lastRecoveryAtEpochMs: latestRecovery(tts, stt),
@@ -702,6 +748,7 @@ function aggregateVoiceStatus(tts, stt) {
 	}
 	return Object.freeze({
 		component: 'voice', state: failed.state, fallbackMode: 'text', boundary: 'voice_provider',
+		effectiveTtsProvider: tts.effectiveProvider ?? null,
 		failureCode: failed.failureCode,
 		consecutiveFailureCount: Math.max(tts.consecutiveFailureCount, stt.consecutiveFailureCount),
 		nextProbeAtEpochMs: earliestProbe(tts, stt),

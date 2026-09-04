@@ -1,5 +1,7 @@
 package dev.agaminggod.arenaagents.scenario;
 
+import dev.agaminggod.arenaagents.agent.AgentIdentity;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
@@ -35,10 +37,13 @@ public record ScenarioLaunchRequest(
 				|| confirmationToken.indexOf('\r') >= 0) {
 			throw new IllegalArgumentException("confirmation token is invalid");
 		}
-		roster = List.copyOf(Objects.requireNonNull(roster, "roster must not be null"));
-		preset.validateAgentCount(roster.size());
+		List<ScenarioAgentSpec> suppliedRoster = List.copyOf(
+				Objects.requireNonNull(roster, "roster must not be null"));
+		preset.validateAgentCount(suppliedRoster.size());
 		HashSet<Integer> slots = new HashSet<>();
-		for (ScenarioAgentSpec agent : roster) {
+		ArrayList<String> allocatedNames = new ArrayList<>();
+		ArrayList<ScenarioAgentSpec> normalizedRoster = new ArrayList<>(suppliedRoster.size());
+		for (ScenarioAgentSpec agent : suppliedRoster) {
 			Objects.requireNonNull(agent, "roster must not contain null");
 			if (!slots.add(agent.slot())) {
 				throw new IllegalArgumentException("scenario roster slots must be unique");
@@ -49,6 +54,12 @@ public record ScenarioLaunchRequest(
 						preset.title() + " requires " + preset.requiredGameMode() + " game mode"
 				);
 			}
+			String publicName = AgentIdentity.allocatePublicName(agent.displayName(), allocatedNames);
+			allocatedNames.add(publicName);
+			normalizedRoster.add(new ScenarioAgentSpec(
+					agent.slot(), publicName, agent.provider(), agent.model(), agent.reasoning(),
+					agent.serviceTier(), agent.team(), agent.gameMode()));
 		}
+		roster = List.copyOf(normalizedRoster);
 	}
 }

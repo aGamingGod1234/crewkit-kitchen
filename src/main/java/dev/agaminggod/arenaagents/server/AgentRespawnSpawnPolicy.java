@@ -13,11 +13,13 @@ public final class AgentRespawnSpawnPolicy {
 	}
 
 	public enum ExistingPlayerAction {
+		RESPAWN_CONNECTED_PLAYER,
 		WAIT_FOR_NATURAL_REMOVAL,
 		REMOVE_STALE_PLAYER
 	}
 
-	public static ExistingPlayerAction existingPlayerAction(boolean playerAlive) {
+	public static ExistingPlayerAction existingPlayerAction(boolean retainedAfterDeath, boolean playerAlive) {
+		if (retainedAfterDeath) return ExistingPlayerAction.RESPAWN_CONNECTED_PLAYER;
 		return playerAlive
 				? ExistingPlayerAction.REMOVE_STALE_PLAYER
 				: ExistingPlayerAction.WAIT_FOR_NATURAL_REMOVAL;

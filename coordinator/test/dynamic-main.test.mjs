@@ -2076,7 +2076,7 @@ test('native model-authored sequence keeps lifecycle acting until its final body
 				kind: 'sequence',
 				actions: [
 					{ actionType: 'navigate_to', arguments: { x: 2, y: 64, z: 1, tolerance: 1, sprint: true, timeoutMs: 30_000 } },
-					{ actionType: 'break_block', arguments: { x: 2, y: 64, z: 1, timeoutMs: 15_000 } },
+					{ actionType: 'break_block', arguments: { x: 2, y: 64, z: 1, expectedBlockId: 'minecraft:stone', timeoutMs: 15_000 } },
 				],
 			},
 		});

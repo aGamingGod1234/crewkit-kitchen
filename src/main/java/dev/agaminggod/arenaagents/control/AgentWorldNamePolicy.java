@@ -1,7 +1,5 @@
 package dev.agaminggod.arenaagents.control;
 
-import dev.agaminggod.arenaagents.agent.AgentModelNames;
-import dev.agaminggod.arenaagents.agent.AgentVisualIdentity;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -12,10 +10,7 @@ public final class AgentWorldNamePolicy {
 
 	public static Optional<String> tag(AgentControlAgent agent) {
 		Objects.requireNonNull(agent, "agent must not be null");
-		if (agent.friendlyName().isBlank()) return Optional.empty();
-		AgentVisualIdentity.Resolved identity = AgentVisualIdentity.resolve(
-				agent.provider(), agent.model(), agent.skinVariant());
-		return Optional.of(identity.providerGlyph() + " " + agent.friendlyName() + " · "
-				+ AgentModelNames.shortLabel(agent.provider(), agent.model()));
+		String displayName = agent.displayName();
+		return displayName.isBlank() ? Optional.empty() : Optional.of(displayName);
 	}
 }

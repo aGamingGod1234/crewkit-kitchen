@@ -177,7 +177,10 @@ final class VoicePlaybackCoordinator implements AutoCloseable {
 		try {
 			playback = Objects.requireNonNull(transport.create(
 					request.agentId(), entityId, request.radius(), samples,
-					() -> completePlayed(request.agentId(), result)
+					() -> completePlayed(request.agentId(), result),
+					() -> completeDegraded(request, result, Boundary.PLAYBACK, new Diagnostic(
+							"VOICE_PLAYBACK_STREAM_FAILED", "Voice playback stopped before all audio was sent"
+					))
 			), "transport returned null playback");
 		} catch (UnavailableException exception) {
 			completeDegraded(request, result, Boundary.PLAYBACK, new Diagnostic(
@@ -459,7 +462,14 @@ final class VoicePlaybackCoordinator implements AutoCloseable {
 	interface Transport {
 		boolean available();
 
-		Playback create(AgentId agentId, UUID entityId, int radius, short[] samples, Runnable onStopped);
+		Playback create(
+				AgentId agentId,
+				UUID entityId,
+				int radius,
+				short[] samples,
+				Runnable onStopped,
+				Runnable onFailed
+		);
 	}
 
 	interface Playback {

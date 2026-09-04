@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Implementation plan for player-parity controls and real map integration in Agent Arena.">
+  <title>Agent Arena player parity and map integration</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0e1013;
+      --surface: #15181d;
+      --line: #2b3038;
+      --text: #f4f1e8;
+      --muted: #a9afb9;
+      --accent: #f2b84b;
+      --good: #75c695;
+      --warn: #e1a85b;
+      --max: 1040px;
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 16px/1.6 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      width: min(calc(100% - 32px), var(--max));
+      margin: 0 auto;
+      padding: 64px 0 80px;
+    }
+
+    header {
+      padding-bottom: 36px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    h1, h2, h3 { line-height: 1.15; letter-spacing: -0.025em; }
+    h1 { max-width: 760px; margin: 0; font-size: clamp(2.25rem, 6vw, 4.7rem); }
+    h2 { margin: 0 0 18px; font-size: clamp(1.45rem, 3vw, 2rem); }
+    h3 { margin: 0 0 10px; font-size: 1.05rem; }
+    p { margin: 0 0 16px; }
+    a { color: var(--accent); text-underline-offset: 3px; }
+
+    .eyebrow {
+      margin-bottom: 18px;
+      color: var(--accent);
+      font-size: 0.78rem;
+      font-weight: 700;
+      letter-spacing: 0.13em;
+      text-transform: uppercase;
+    }
+
+    .lede {
+      max-width: 780px;
+      margin-top: 24px;
+      color: var(--muted);
+      font-size: 1.1rem;
+    }
+
+    .meta {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 18px;
+      margin-top: 32px;
+    }
+
+    .meta div { padding-top: 12px; border-top: 1px solid var(--line); }
+    .meta dt { color: var(--muted); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.08em; }
+    .meta dd { margin: 5px 0 0; font-weight: 650; }
+
+    section { padding: 42px 0; border-bottom: 1px solid var(--line); }
+    section:last-child { border-bottom: 0; }
+    .muted { color: var(--muted); }
+
+    .decision {
+      max-width: 860px;
+      padding-left: 20px;
+      border-left: 3px solid var(--accent);
+      font-size: 1.15rem;
+    }
+
+    .status-list, .scope-grid, .phase-list { display: grid; gap: 0; }
+
+    .status-row, .scope-row {
+      display: grid;
+      grid-template-columns: 180px 1fr;
+      gap: 24px;
+      padding: 17px 0;
+      border-top: 1px solid var(--line);
+    }
+
+    .status-row:first-child, .scope-row:first-child { border-top: 0; }
+    .state { color: var(--good); font-weight: 700; }
+    .pending { color: var(--warn); }
+
+    .phase {
+      display: grid;
+      grid-template-columns: 72px minmax(0, 1fr) minmax(220px, 0.55fr);
+      gap: 24px;
+      padding: 26px 0;
+      border-top: 1px solid var(--line);
+    }
+
+    .phase:first-child { border-top: 0; }
+    .phase-number { color: var(--accent); font-size: 1.25rem; font-weight: 750; }
+    .phase ul, .plain-list { margin: 10px 0 0; padding-left: 20px; }
+    .phase li, .plain-list li { margin: 7px 0; }
+
+    .proof {
+      padding-left: 18px;
+      border-left: 1px solid var(--line);
+      color: var(--muted);
+    }
+
+    .proof strong { display: block; margin-bottom: 8px; color: var(--text); }
+
+    code {
+      padding: 2px 5px;
+      border: 1px solid var(--line);
+      background: var(--surface);
+      color: #f6dca4;
+      font: 0.88em/1.4 ui-monospace, SFMono-Regular, Consolas, monospace;
+    }
+
+    footer { padding-top: 34px; color: var(--muted); font-size: 0.9rem; }
+
+    @media (max-width: 760px) {
+      main { width: min(calc(100% - 24px), var(--max)); padding-top: 38px; }
+      .meta { grid-template-columns: 1fr; }
+      .status-row, .scope-row, .phase { grid-template-columns: 1fr; gap: 8px; }
+      .phase-number { font-size: 0.9rem; }
+      .proof { margin-top: 8px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div class="eyebrow">Agent Arena implementation plan</div>
+      <h1>Player parity and real map integration</h1>
+      <p class="lede">Turn the current fake-player runtime into a reliable Minecraft player controller, connect imported arena modules to live matches, and replace technical block layouts with one polished PvP arena and one sixteen-stage parkour course.</p>
+      <dl class="meta">
+        <div><dt>Status</dt><dd>Ready for implementation</dd></div>
+        <div><dt>Prepared</dt><dd>30 August 2026</dd></div>
+        <div><dt>Delivery rule</dt><dd>Each phase ends green</dd></div>
+      </dl>
+    </header>
+
+    <section>
+      <h2>Goal</h2>
+      <p class="decision">Agents should complete the same meaningful Survival, Adventure, and Creative gameplay tasks as human players. Models choose goals, strategy, targets, and short control segments. Deterministic controllers execute time-sensitive movement and combat at Minecraft tick rate.</p>
+    </section>
+
+    <section>
+      <h2>Current position</h2>
+      <div class="status-list">
+        <div class="status-row"><div class="state">Verified</div><div>The coordinator exposes 29 semantic actions and passed 1,200 tests with two skips.</div></div>
+        <div class="status-row"><div class="state">Converted locally</div><div>BizCub's fire arena is a deterministic schema-1 module with 45,352 blocks and geometry hash <code>498440a1…0133</code>.</div></div>
+        <div class="status-row"><div class="pending">Not connected</div><div>Live scenarios still use the hardcoded Java arena builder. Module loading, composition, anchors, and safety checks remain test-only.</div></div>
+        <div class="status-row"><div class="pending">Not proven</div><div>Scoring, directed events, duration termination, real sixteen-agent capacity, and broad player control are incomplete.</div></div>
+        <div class="status-row"><div class="pending">License gate</div><div>BizCub declares MIT on Modrinth, but the source archive lacks author-retained license text. Keep the prototype local until permission evidence meets repository policy.</div></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Scope</h2>
+      <div class="scope-grid">
+        <div class="scope-row"><h3>Included</h3><div>Scenario rules, arena manifests, module integration, player control, menu gestures, fresh observations, permissions, resets, and real multi-agent verification.</div></div>
+        <div class="scope-row"><h3>Deferred</h3><div>Rare workstations, complete vehicle support, advanced elytra play, editable books and signs, arbitrary modded menus, and more than one polished map per core category.</div></div>
+        <div class="scope-row"><h3>Excluded</h3><div>Client settings, resource-pack prompts, operator-only commands, raw packet control, downloaded command blocks, unknown datapacks, imported entities, and custom loot NBT.</div></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Implementation sequence</h2>
+      <div class="phase-list">
+        <article class="phase">
+          <div class="phase-number">01</div>
+          <div>
+            <h3>Make each arena a real game</h3>
+            <ul>
+              <li>Enforce configured match duration.</li>
+              <li>Apply directed events to the world or remove unsupported copy.</li>
+              <li>Award scores from server evidence and persist the audit trail.</li>
+              <li>Finish matches from authoritative rules, not agent claims.</li>
+            </ul>
+          </div>
+          <div class="proof"><strong>Exit check</strong>Each category completes one deterministic headless match with earned scores, applied events, and a durable result.</div>
+        </article>
+
+        <article class="phase">
+          <div class="phase-number">02</div>
+          <div>
+            <h3>Connect arena modules to production</h3>
+            <ul>
+              <li>Add a versioned arena manifest for module paths, transforms, offsets, spawns, objectives, and spectator positions.</li>
+              <li>Route launch through the loader, composer, safety policy, and reset job.</li>
+              <li>Make spawning and match results consume composed anchors and hashes.</li>
+              <li>Keep the procedural builder as a temporary fallback.</li>
+            </ul>
+          </div>
+          <div class="proof"><strong>Exit check</strong>One project-owned fixture launches through the production module path at 1, 2, 4, 8, and 16 players, then resets twice without residue.</div>
+        </article>
+
+        <article class="phase">
+          <div class="phase-number">03</div>
+          <div>
+            <h3>Add the player control contract</h3>
+            <ul>
+              <li>Define one canonical capability manifest shared by Java, coordinator schemas, documentation, and simulator checks.</li>
+              <li>Add bounded control segments containing movement, look, held inputs, pulses, hotbar slot, and hand.</li>
+              <li>Keep <code>moveTo</code> and existing semantic actions as compatibility adapters.</li>
+              <li>Add input lease expiry, guaranteed neutralization, out-of-band cancellation, and tick-based deadlines.</li>
+              <li>Fix offhand application, block protection, door reach, melee range, and item-use postconditions.</li>
+            </ul>
+          </div>
+          <div class="proof"><strong>Exit check</strong>Timed jump, strafe attack, crouch placement, offhand shield, cancellation, death, disconnect, and lease-expiry tests all pass through a real fake player.</div>
+        </article>
+
+        <article class="phase">
+          <div class="phase-number">04</div>
+          <div>
+            <h3>Make observation and menus reliable</h3>
+            <ul>
+              <li>Make <code>observe</code> request and await a newer event sequence.</li>
+              <li>Page dense observations by section and cursor instead of replacing them with a truncation sentinel.</li>
+              <li>Add collision, fluid, climbable, equipment, velocity, pose, vehicle, projectile, block-state, and exact ray-target facts.</li>
+              <li>Replace menu one-offs with state-fenced click, button, recipe, text, and close gestures.</li>
+            </ul>
+          </div>
+          <div class="proof"><strong>Exit check</strong>A repeated-block parkour fixture reconstructs without data loss, post-action facts are fresh, and delayed clicks cannot affect a newer menu.</div>
+        </article>
+
+        <article class="phase">
+          <div class="phase-number">05</div>
+          <div>
+            <h3>Ship one PvP arena and one parkour curriculum</h3>
+            <ul>
+              <li>Resolve BizCub permission evidence or choose another source before tracking geometry.</li>
+              <li>Curate spawn, camera, goal, hazard, and connection anchors for the selected PvP arena.</li>
+              <li>Rebuild cages, hazards, resets, and scoring as server-owned mechanics.</li>
+              <li>Create sixteen ordered parkour stages with a route descriptor for checkpoint order, lane ownership, jump mechanics, and difficulty.</li>
+              <li>Use Parkour Masters only as a design reference unless its license gate is resolved.</li>
+            </ul>
+          </div>
+          <div class="proof"><strong>Exit check</strong>Human review approves PvP sightlines and parkour readability. Automated runs prove spawns, routes, checkpoints, completion, and reset at supported roster sizes.</div>
+        </article>
+
+        <article class="phase">
+          <div class="phase-number">06</div>
+          <div>
+            <h3>Contain agents and prove sixteen-player operation</h3>
+            <ul>
+              <li>Restrict arena agents to allowed match regions and normal vanilla permissions.</li>
+              <li>Give provider subprocesses an allowlisted environment.</li>
+              <li>Reserve cancellation and hazard capacity in the coordinator and bridge queues.</li>
+              <li>Feed measured Minecraft tick pressure into adaptive admission.</li>
+              <li>Run real headless trials at 1, 4, 8, and 16 agents.</li>
+            </ul>
+          </div>
+          <div class="proof"><strong>Exit check</strong>A 30-minute sixteen-agent run holds at least 19.5 TPS, keeps tick p95 at or below 50 ms, and ends with no stale inputs, actions, queues, processes, or false completions.</div>
+        </article>
+      </div>
+    </section>
+
+    <section>
+      <h2>Decisions that should not drift</h2>
+      <ul class="plain-list">
+        <li>Player parity means gameplay outcomes available to a normal server player. It does not include client settings or operator powers.</li>
+        <li>The model chooses strategy and short intent segments. Deterministic controllers handle 20 Hz timing.</li>
+        <li>The model-facing interface converges on <code>observe</code>, <code>moveTo</code>, <code>control</code>, <code>menu</code>, <code>say</code>, and <code>finish</code>.</li>
+        <li>Imported maps contribute reviewed geometry only. The mod owns scoring, events, loot, checkpoints, resets, and completion.</li>
+        <li>Protocol changes use a locked coordinator and mod pair or a versioned migration. Protocol v2 semantics do not change silently.</li>
+        <li>Licensing, immutable hashes, safe extraction, DataFixer upgrades, and block-only conversion stay mandatory.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Main risks</h2>
+      <ul class="plain-list">
+        <li>Concurrent worktree changes can invalidate baselines. Start implementation only after active local work is isolated.</li>
+        <li>Short control segments can create excessive model traffic. Batch frames and retain long-distance navigation.</li>
+        <li>Parkour cannot use the existing walk-only reachability check. It needs a transition model for jumps, climbs, water, slime, and falls.</li>
+        <li>Detailed geometry will still feel empty if scoring and world events remain metadata.</li>
+        <li>A platform license label alone does not satisfy the repository's retained-permission policy.</li>
+        <li>Sixteen-agent confidence requires real Minecraft bodies and provider processes, not replay or simulator-only soaks.</li>
+      </ul>
+    </section>
+
+    <footer>
+      Prepared from a ten-agent code, runtime, arena, protocol, licensing, and map-intake audit. The local BizCub conversion remains under ignored research storage and is not approved for release.
+    </footer>
+  </main>
+</body>
+</html>

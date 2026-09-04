@@ -15,6 +15,7 @@ import dev.agaminggod.arenaagents.server.VoiceConsentCommandVerification;
 import dev.agaminggod.arenaagents.client.ArenaAgentsClientBootstrapVerification;
 import dev.agaminggod.arenaagents.client.ArenaSpectatorStateVerification;
 import dev.agaminggod.arenaagents.client.gui.AgentControlLayoutVerification;
+import dev.agaminggod.arenaagents.client.gui.AgentControlSubmissionVerification;
 import dev.agaminggod.arenaagents.client.gui.AgentRosterGridLayoutVerification;
 import dev.agaminggod.arenaagents.client.gui.AgentRosterGridVerification;
 import dev.agaminggod.arenaagents.client.gui.ConsoleThemeVerification;
@@ -239,6 +240,7 @@ public final class VerificationMain {
 		passedAssertions += AgentControlSelectionStateVerification.verify();
 		passedAssertions += AgentRosterViewStateVerification.verify();
 		passedAssertions += AgentControlLayoutVerification.verify();
+		passedAssertions += AgentControlSubmissionVerification.verify();
 		passedAssertions += BlockObservationOrderingVerification.verify();
 		passedAssertions += BlockObservationLazyVisibilityVerification.verify();
 		passedAssertions += InventoryObservationSlotsVerification.verify();

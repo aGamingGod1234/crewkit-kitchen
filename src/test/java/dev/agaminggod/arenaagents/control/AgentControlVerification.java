@@ -65,6 +65,10 @@ public final class AgentControlVerification {
 		assertEquals(snapshot, decoded, "snapshot JSON round trip");
 		assertEquals(AGENT_UUID, agent.agentId(), "snapshot carries stable full agent ID");
 		assertEquals("Builder", agent.displayName(), "snapshot carries optional user name");
+		assertEquals(Optional.of("Builder"), AgentWorldNamePolicy.tag(agent),
+				"world tags use the exact public name without a provider glyph or model suffix");
+		assertEquals(Optional.empty(), AgentWorldNamePolicy.tag(agent(AGENT_UUID, "   ")),
+				"blank display names omit the world tag");
 		assertEquals("Build a safe house", agent.currentGoal(), "snapshot carries active goal");
 		assertEquals(1, agent.queuedGoalCount(), "snapshot carries queue count");
 		assertEquals(false, agent.automaticProgress(), "snapshot carries automatic progress preference");
@@ -99,7 +103,7 @@ public final class AgentControlVerification {
 				() -> new AgentControlSnapshot(true, NOW_EPOCH_MS, java.util.Collections.nCopies(17, agent)),
 				"snapshot agent bound"
 		);
-		return 17;
+		return 18;
 	}
 
 	private static int verifyProviderPresets() {

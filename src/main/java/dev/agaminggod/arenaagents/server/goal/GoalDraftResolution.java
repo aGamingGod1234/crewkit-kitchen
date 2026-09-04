@@ -24,6 +24,18 @@ public final class GoalDraftResolution {
 		if (draft.proposedPredicate().isEmpty()) {
 			throw new AgentDomainException("GOAL_DRAFT_NOT_READY", "The goal draft does not have a validated completion rule yet");
 		}
+		if (draft.intent() == DraftIntent.TRANSLATE_START) {
+			if (choice != GoalDraftChoice.CONFIRM) {
+				throw new AgentDomainException("GOAL_DRAFT_CHOICE_INVALID", "Confirm or cancel this requested start");
+			}
+			return Operation.START;
+		}
+		if (draft.intent() == DraftIntent.TRANSLATE_QUEUE) {
+			if (choice != GoalDraftChoice.CONFIRM) {
+				throw new AgentDomainException("GOAL_DRAFT_CHOICE_INVALID", "Confirm or cancel this requested queue addition");
+			}
+			return Operation.QUEUE;
+		}
 		boolean replacesExistingGoal = draft.expectedGoalId().isPresent();
 		return switch (choice) {
 			case CONFIRM -> {

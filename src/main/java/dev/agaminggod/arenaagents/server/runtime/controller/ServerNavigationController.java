@@ -34,6 +34,7 @@ public final class ServerNavigationController implements ServerController {
 	private static final int MAX_REPLANS = 3;
 	private static final double INTERMEDIATE_WAYPOINT_HORIZONTAL_TOLERANCE_SQUARED = 0.36D;
 	private static final double INTERMEDIATE_WAYPOINT_VERTICAL_TOLERANCE = 0.25D;
+	private static final double ENDPOINT_STABILITY_DISTANCE = 0.1D;
 	// Plans are rebuilt from current world state; the replan cap and action deadline bound identical retries
 	// without retaining stale edge bans that could reject terrain after it changes.
 
@@ -47,6 +48,11 @@ public final class ServerNavigationController implements ServerController {
 	private int waypointIndex;
 	private WaypointProgress progress;
 	private double lastProgressValue;
+	private Vec3 navigationStartPosition;
+	private GridPosition resolvedEndpointPosition;
+	private Vec3 resolvedEndpointTarget;
+	private Vec3 endpointStabilityPosition;
+	private boolean endpointStabilityConfirmed;
 	private InputLease inputLease;
 	private LeasedServerInputController inputController;
 	private AgentInputStates.MotorState motorState;
@@ -90,21 +96,21 @@ public final class ServerNavigationController implements ServerController {
 			return fail(player, "ACTION_TIMEOUT", "Navigation timed out", currentProgress());
 		}
 		MinecraftNavigationWorld world = new MinecraftNavigationWorld(player.level());
-		double remaining = player.position().distanceTo(destinationTarget(world));
-		if (satisfiesDestinationTolerance(remaining, tolerance)) {
-			return succeed(player, "DESTINATION_REACHED", "Destination reached");
-		}
+		if (navigationStartPosition == null) navigationStartPosition = player.position();
 		if (plan == null) {
-			TickResult planned = replan(player, world, nowEpochMs, elapsedMs, remaining, false);
+			TickResult planned = replan(player, world, nowEpochMs, elapsedMs, false);
 			if (planned != null) return planned;
 		}
+		lastProgressValue = navigationProgress(player.position());
+		TickResult endpointResult = verifyEndpoint(world, player);
+		if (endpointResult != null) return endpointResult;
 		List<PathNode> nodes = plan.nodes();
 		if (waypointIndex >= nodes.size()) {
-			return replanOrResult(player, world, nowEpochMs, elapsedMs, remaining);
+			return replanOrResult(player, world, nowEpochMs, elapsedMs);
 		}
 		PathNode waypoint = nodes.get(waypointIndex);
 		if (!world.isStandable(waypoint.position())) {
-			TickResult replanned = replan(player, world, nowEpochMs, elapsedMs, remaining, true);
+			TickResult replanned = replan(player, world, nowEpochMs, elapsedMs, true);
 			if (replanned != null) return replanned;
 			nodes = plan.nodes();
 			waypoint = nodes.get(waypointIndex);
@@ -114,11 +120,11 @@ public final class ServerNavigationController implements ServerController {
 		boolean reached = reachedTarget(world, player.position(), waypoint, finalWaypoint);
 		double activeWaypointDistance = player.position().distanceTo(target);
 		WaypointProgress.Update update = progress.observe(activeWaypointDistance, reached, nowEpochMs);
-		lastProgressValue = update.progress();
+		lastProgressValue = navigationProgress(player.position());
 		if (reached) {
 			waypointIndex++;
 			if (waypointIndex >= nodes.size()) {
-				return replanOrResult(player, world, nowEpochMs, elapsedMs, remaining);
+				return replanOrResult(player, world, nowEpochMs, elapsedMs);
 			}
 			waypoint = nodes.get(waypointIndex);
 			finalWaypoint = waypointIndex == nodes.size() - 1;
@@ -126,16 +132,16 @@ public final class ServerNavigationController implements ServerController {
 			progress.waypointAdvanced(player.position().distanceTo(target), nowEpochMs);
 		}
 		if (update.decision() == WaypointProgress.Decision.FAIL) {
-			return fail(player, "PATH_BLOCKED", "Navigation could not recover from repeated stalls", update.progress());
+			return fail(player, "PATH_BLOCKED", "Navigation could not recover from repeated stalls", lastProgressValue);
 		}
 		if (update.decision() == WaypointProgress.Decision.REPLAN) {
-			TickResult replanned = replan(player, world, nowEpochMs, elapsedMs, remaining, true);
+			TickResult replanned = replan(player, world, nowEpochMs, elapsedMs, true);
 			if (replanned != null) return replanned;
 			waypoint = plan.nodes().get(waypointIndex);
 			target = targetFor(world, waypoint, waypointIndex == plan.nodes().size() - 1);
 		}
 		drive(player, world, waypoint, target, nowEpochMs);
-		return TickResult.running(update.progress());
+		return TickResult.running(lastProgressValue);
 	}
 
 	@Override
@@ -158,14 +164,14 @@ public final class ServerNavigationController implements ServerController {
 			ServerPlayer player,
 			MinecraftNavigationWorld world,
 			long nowEpochMs,
-			long elapsedMs,
-			double remaining
+			long elapsedMs
 	) {
-		if (satisfiesDestinationTolerance(remaining, tolerance)) {
-			return succeed(player, "DESTINATION_REACHED", "Destination reached");
-		}
-		TickResult replanned = replan(player, world, nowEpochMs, elapsedMs, remaining, false);
-		return replanned == null ? TickResult.running(currentProgress()) : replanned;
+		TickResult endpointResult = verifyEndpoint(world, player);
+		if (endpointResult != null) return endpointResult;
+		TickResult replanned = replan(player, world, nowEpochMs, elapsedMs, false);
+		if (replanned != null) return replanned;
+		lastProgressValue = navigationProgress(player.position());
+		return TickResult.running(currentProgress());
 	}
 
 	static boolean satisfiesDestinationTolerance(double remaining, double tolerance) {
@@ -213,6 +219,118 @@ public final class ServerNavigationController implements ServerController {
 		return new Vec3(horizontalTarget.x, targetY, horizontalTarget.z);
 	}
 
+	/**
+	 * Returns the last server-observed navigation facts for callers that publish action evidence.
+	 * The endpoint is retained from the selected final path node, never inferred from raw proximity.
+	 */
+	public AuthoritativeState authoritativeState(ServerPlayer player, long observedAtEpochMs) {
+		Objects.requireNonNull(player, "player must not be null");
+		MinecraftNavigationWorld world = new MinecraftNavigationWorld(player.level());
+		Vec3 position = player.position();
+		lastProgressValue = navigationProgress(position);
+		boolean endpointStandable = resolvedEndpointPosition != null && resolvedEndpointTarget != null
+				&& world.isStandable(resolvedEndpointPosition)
+				&& Double.isFinite(world.supportHeight(
+						resolvedEndpointPosition,
+						resolvedEndpointTarget.x,
+						resolvedEndpointTarget.z));
+		boolean withinTolerance = resolvedEndpointTarget != null
+				&& satisfiesDestinationTolerance(position.distanceTo(resolvedEndpointTarget), tolerance);
+		boolean noCollision = player.level().noCollision(player.getBoundingBox());
+		boolean physicallyValid = endpointStandable && withinTolerance && noCollision
+				&& !player.isInWall() && player.onGround();
+		boolean stable = physicallyValid && endpointStabilityConfirmed && endpointStabilityPosition != null
+				&& position.distanceTo(endpointStabilityPosition) <= ENDPOINT_STABILITY_DISTANCE;
+		return new AuthoritativeState(
+				position,
+				grid(position),
+				destination,
+				resolvedEndpointTarget,
+				resolvedEndpointPosition,
+				resolvedEndpointTarget == null ? null : position.distanceTo(resolvedEndpointTarget),
+				tolerance,
+				lastProgressValue,
+				endpointStandable,
+				withinTolerance,
+				noCollision,
+				player.isInWall(),
+				player.onGround(),
+				stable,
+				observedAtEpochMs
+		);
+	}
+
+	public record AuthoritativeState(
+			Vec3 position,
+			GridPosition blockPosition,
+			Vec3 requestedDestination,
+			Vec3 resolvedEndpoint,
+			GridPosition resolvedEndpointBlock,
+			Double distanceToEndpoint,
+			double tolerance,
+			double progress,
+			boolean endpointStandable,
+			boolean withinTolerance,
+			boolean noCollision,
+			boolean inWall,
+			boolean onGround,
+			boolean stable,
+			long observedAtEpochMs
+	) {
+	}
+
+	private TickResult verifyEndpoint(MinecraftNavigationWorld world, ServerPlayer player) {
+		if (resolvedEndpointPosition == null || resolvedEndpointTarget == null) {
+			endpointStabilityPosition = null;
+			endpointStabilityConfirmed = false;
+			return null;
+		}
+		boolean endpointStandable = world.isStandable(resolvedEndpointPosition)
+				&& Double.isFinite(world.supportHeight(
+						resolvedEndpointPosition,
+						resolvedEndpointTarget.x,
+						resolvedEndpointTarget.z));
+		boolean withinTolerance = satisfiesDestinationTolerance(
+				player.position().distanceTo(resolvedEndpointTarget), tolerance);
+		boolean physicallyValid = endpointStandable && withinTolerance
+				&& player.level().noCollision(player.getBoundingBox())
+				&& !player.isInWall() && player.onGround();
+		if (!physicallyValid) {
+			endpointStabilityPosition = null;
+			endpointStabilityConfirmed = false;
+			return null;
+		}
+		if (endpointStabilityPosition != null
+				&& player.position().distanceTo(endpointStabilityPosition) <= ENDPOINT_STABILITY_DISTANCE) {
+			endpointStabilityConfirmed = true;
+			return succeed(player, "DESTINATION_REACHED", "Destination reached at a verified standing position");
+		}
+		endpointStabilityPosition = player.position();
+		endpointStabilityConfirmed = false;
+		cancel(player);
+		return TickResult.running(lastProgressValue);
+	}
+
+	private double navigationProgress(Vec3 position) {
+		Vec3 target = resolvedEndpointTarget == null ? destination : resolvedEndpointTarget;
+		if (navigationStartPosition == null) navigationStartPosition = position;
+		return progressFromActualDistance(navigationStartPosition, target, position, lastProgressValue);
+	}
+
+	static double progressFromActualDistance(Vec3 start, Vec3 endpoint, Vec3 current, double previousProgress) {
+		Objects.requireNonNull(start, "start must not be null");
+		Objects.requireNonNull(endpoint, "endpoint must not be null");
+		Objects.requireNonNull(current, "current must not be null");
+		double startDistance = start.distanceTo(endpoint);
+		double remaining = current.distanceTo(endpoint);
+		if (!Double.isFinite(startDistance) || !Double.isFinite(remaining)) return previousProgress;
+		double currentProgress = startDistance <= 1.0E-7D
+				? (remaining <= 1.0E-7D ? 1.0D : 0.0D)
+				: 1.0D - remaining / startDistance;
+		if (!Double.isFinite(currentProgress)) return previousProgress;
+		return Math.max(0.0D, Math.min(1.0D, currentProgress));
+	}
+
 	private boolean reachedTarget(
 			MinecraftNavigationWorld world,
 			Vec3 playerPosition,
@@ -225,15 +343,6 @@ public final class ServerNavigationController implements ServerController {
 				finalWaypoint,
 				world.supportHeight(waypoint.position(), playerPosition.x, playerPosition.z)
 		);
-	}
-
-	private Vec3 destinationTarget(MinecraftNavigationWorld world) {
-		GridPosition destinationPosition = grid(destination);
-		if (!world.isStandable(destinationPosition)) return destination;
-		double supportHeight = world.supportHeight(destinationPosition, destination.x, destination.z);
-		return Double.isFinite(supportHeight) && !hasFullBlockSupportHeight(destinationPosition, supportHeight)
-				? new Vec3(destination.x, supportHeight, destination.z)
-				: destination;
 	}
 
 	private static boolean hasFullBlockSupportHeight(GridPosition position, double supportHeight) {
@@ -249,7 +358,6 @@ public final class ServerNavigationController implements ServerController {
 			MinecraftNavigationWorld world,
 			long nowEpochMs,
 			long elapsedMs,
-			double remaining,
 			boolean recovery
 	) {
 		GridPosition start = nearestStandable(world, new GridPosition(
@@ -298,6 +406,18 @@ public final class ServerNavigationController implements ServerController {
 					"No bounded safe path is currently available", currentProgress());
 		}
 		plan = candidate;
+		if (finalSegment) {
+			PathNode finalNode = candidate.nodes().get(candidate.nodes().size() - 1);
+			resolvedEndpointPosition = finalNode.position();
+			resolvedEndpointTarget = targetFor(world, finalNode, true);
+			endpointStabilityPosition = null;
+			endpointStabilityConfirmed = false;
+		} else {
+			resolvedEndpointPosition = null;
+			resolvedEndpointTarget = null;
+			endpointStabilityPosition = null;
+			endpointStabilityConfirmed = false;
+		}
 		waypointIndex = Math.min(1, Math.max(0, candidate.nodes().size() - 1));
 		PathNode activeWaypoint = candidate.nodes().get(waypointIndex);
 		boolean finalWaypoint = waypointIndex == candidate.nodes().size() - 1;

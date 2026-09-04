@@ -60,7 +60,7 @@ export class CodexService {
   return {
    async setGoalRevision() {},
    async act(input, context) {
-    const call = async (actionType) => context.executeTool({ tool: { kind: 'action', actionType } });
+    const call = async (actionType) => context.executeTool({ tool: { kind: 'action', actionType, ...(actionType === 'break_block' ? { arguments: { x: 2, y: 64, z: 1, expectedBlockId: 'minecraft:stone', timeoutMs: 15_000 } } : {}) } });
     if (input.includes('mine the known')) { await call('navigate_to'); await call('break_block'); return ${resultExpression}; }
     if (input.includes('craft_inventory')) { await call('craft_inventory'); return ${resultExpression}; }
     await call('chat'); return ${resultExpression};

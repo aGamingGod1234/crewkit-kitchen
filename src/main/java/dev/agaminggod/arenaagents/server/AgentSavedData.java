@@ -285,7 +285,7 @@ public final class AgentSavedData extends SavedData {
 		PendingGoalDraft draft = goalDrafts.get(draftId);
 		if (draft == null) throw new AgentDomainException("UNKNOWN_GOAL_DRAFT", "Goal draft does not exist");
 		if (!draft.agentId().equals(agentId)) throw new AgentDomainException("GOAL_DRAFT_AGENT_MISMATCH", "Goal draft belongs to another agent");
-		if (draft.intent() != dev.agaminggod.arenaagents.server.goal.DraftIntent.CONFIRM_TRANSLATION) {
+		if (!draft.intent().acceptsCoordinatorProposal()) {
 			throw new AgentDomainException("GOAL_DRAFT_INTENT_MISMATCH", "Only translation drafts accept coordinator proposals");
 		}
 		AgentRecord record = registry.records().stream()

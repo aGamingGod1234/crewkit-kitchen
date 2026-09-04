@@ -56,7 +56,7 @@ test('a failed factual completion reopens a finished program for an urgent corre
 test('requests a continuation when the traced one-action mining program falls off its end', () => {
 	const { engine, dispatched, modelRequests } = engineFor(`
 		program.onUnhandledAttention("continue_and_notify");
-		const mined = await tryResult(player.mine({ x: 47, y: 93, z: -23, timeoutMs: 30_000 }));
+		const mined = await tryResult(player.mine({ x: 47, y: 93, z: -23, expectedBlockId: "minecraft:stone", timeoutMs: 30_000 }));
 		if (!mined.succeeded) program.checkpoint("mining failed");
 		if (!mined.succeeded) program.checkpoint("mining still failed");
 	`);
@@ -107,7 +107,7 @@ test('measures a multi-tree pickup loop instead of assuming a tree yield or pick
 			{ maxIterations: 8 },
 			async () => {
 				const tree = world.nearest(world.blocks({ tag: "#minecraft:logs" }));
-				if (tree !== null) await player.mine(tree.position);
+				if (tree !== null) await player.mine({ x: tree.x, y: tree.y, z: tree.z, expectedBlockId: tree.blockId });
 			}
 		);
 		program.finish("Collected at least eight logs");

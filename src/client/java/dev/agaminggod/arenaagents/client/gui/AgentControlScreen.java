@@ -36,6 +36,8 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.AbstractWidget;
 import net.minecraft.client.gui.components.MultiLineEditBox;
@@ -83,7 +85,7 @@ public final class AgentControlScreen extends Screen {
 	private String selectedSavedGroupName = "";
 	private String feedback = "";
 	private boolean feedbackError;
-	private PendingSummon pendingSummon;
+	private final SingleSubmissionGate summonSubmission = new SingleSubmissionGate();
 	private int liveScroll;
 	private int liveFeedScroll;
 	private boolean compactGroupComposer;
@@ -163,10 +165,6 @@ public final class AgentControlScreen extends Screen {
 		if (!resolvedGroup.equals(selectedSavedGroupName)) selectSavedGroup(resolvedGroup);
 		if (previous != null && snapshot.generatedAtEpochMs() > previous.generatedAtEpochMs() && !feedbackError) {
 			feedback = "";
-		}
-		if (pendingSummon != null && previous != null
-				&& snapshot.generatedAtEpochMs() > previous.generatedAtEpochMs()) {
-			reconcilePendingSummon();
 		}
 		if (!AgentControlLayout.rosterFiltersVisible(snapshot.agents().size())) {
 			setRosterFilterWithoutRebuild(AgentRosterFilter.all());
@@ -1029,7 +1027,7 @@ public final class AgentControlScreen extends Screen {
 				this::navigateBack));
 		ConsoleButton create = primaryButton("Create agent", contentRight() - 130, y, 130, ROW_HEIGHT,
 				this::submitSummon);
-		create.active = canControl();
+		create.active = canControl() && !summonSubmission.claimed();
 		addRenderableWidget(create);
 	}
 
@@ -1408,25 +1406,23 @@ public final class AgentControlScreen extends Screen {
 	}
 
 	private void submitSummon() {
+		String command;
 		try {
 			name = nameInput.getValue();
-			String command = AgentControlCommandBuilder.summon(
+			command = AgentControlCommandBuilder.summon(
 					provider, model, reasoning, serviceTier, name, gameMode);
-			boolean sent = send(command, "Creating agent...");
-			pendingSummon = sent ? PendingSummon.start(
-					snapshot == null ? Set.of() : snapshot.agents().stream()
-							.map(AgentControlAgent::agentId).collect(java.util.stream.Collectors.toSet()),
-					provider,
-					model,
-					reasoning,
-					name.strip().replaceAll("\\s+", " "),
-					2
-			).orElse(null) : null;
-			rememberPreferences();
 		} catch (IllegalArgumentException exception) {
-			pendingSummon = null;
 			setFeedback(exception.getMessage(), true);
+			return;
 		}
+		dispatchSummonOnce(
+				summonSubmission,
+				() -> send(command, "Creating agent..."),
+				() -> {
+					rememberPreferences();
+					onClose();
+				}
+		);
 	}
 
 	private void submitPrompt(String operation) {
@@ -1554,18 +1550,6 @@ public final class AgentControlScreen extends Screen {
 		reasoning = normalized.reasoning();
 		serviceTier = normalized.serviceTier();
 		if (AgentControlClient.catalogAuthoritative()) rememberPreferences();
-	}
-
-	private void reconcilePendingSummon() {
-		List<AgentControlAgent> matches = pendingSummon.matches(snapshot.agents());
-		if (matches.size() == 1) {
-			selectAgent(matches.getFirst().agentId());
-			pendingSummon = null;
-			page = Page.OVERVIEW;
-			feedback = "";
-			return;
-		}
-		pendingSummon = matches.isEmpty() ? pendingSummon.afterMiss().orElse(null) : null;
 	}
 
 	static CreateSelection normalizeCreateSelection(
@@ -1817,49 +1801,36 @@ public final class AgentControlScreen extends Screen {
 	record CreateSelection(String provider, String model, String reasoning, String serviceTier) {
 	}
 
-	record PendingSummon(
-			Set<String> existingAgentIds,
-			String provider,
-			String model,
-			String reasoning,
-			String friendlyName,
-			int remainingSnapshots
+	static boolean dispatchSummonOnce(
+			SingleSubmissionGate gate,
+			BooleanSupplier dispatch,
+			Runnable onAccepted
 	) {
-		PendingSummon {
-			existingAgentIds = Set.copyOf(existingAgentIds);
-			Objects.requireNonNull(provider, "provider must not be null");
-			Objects.requireNonNull(model, "model must not be null");
-			Objects.requireNonNull(reasoning, "reasoning must not be null");
-			friendlyName = Objects.requireNonNullElse(friendlyName, "");
-			if (friendlyName.isBlank()) throw new IllegalArgumentException("friendlyName must not be blank");
-			if (remainingSnapshots < 1) throw new IllegalArgumentException("remainingSnapshots must be positive");
+		Objects.requireNonNull(gate, "gate must not be null");
+		Objects.requireNonNull(dispatch, "dispatch must not be null");
+		Objects.requireNonNull(onAccepted, "accepted callback must not be null");
+		if (!gate.tryClaim()) return false;
+		if (!dispatch.getAsBoolean()) {
+			gate.release();
+			return false;
+		}
+		onAccepted.run();
+		return true;
+	}
+
+	static final class SingleSubmissionGate {
+		private final AtomicBoolean claimed = new AtomicBoolean();
+
+		boolean tryClaim() {
+			return claimed.compareAndSet(false, true);
 		}
 
-		static Optional<PendingSummon> start(
-				Set<String> existingAgentIds,
-				String provider,
-				String model,
-				String reasoning,
-				String friendlyName,
-				int remainingSnapshots
-		) {
-			String checkedName = Objects.requireNonNullElse(friendlyName, "");
-			return checkedName.isBlank() ? Optional.empty() : Optional.of(new PendingSummon(
-					existingAgentIds, provider, model, reasoning, checkedName, remainingSnapshots));
+		boolean claimed() {
+			return claimed.get();
 		}
 
-		List<AgentControlAgent> matches(List<AgentControlAgent> agents) {
-			return agents.stream()
-					.filter(agent -> !existingAgentIds.contains(agent.agentId()))
-					.filter(agent -> agent.provider().equals(provider) && agent.model().equals(model)
-							&& agent.reasoning().equals(reasoning))
-					.filter(agent -> friendlyName.isBlank() || agent.friendlyName().equals(friendlyName))
-					.toList();
-		}
-
-		Optional<PendingSummon> afterMiss() {
-			return remainingSnapshots == 1 ? Optional.empty() : Optional.of(new PendingSummon(
-					existingAgentIds, provider, model, reasoning, friendlyName, remainingSnapshots - 1));
+		void release() {
+			claimed.set(false);
 		}
 	}
 

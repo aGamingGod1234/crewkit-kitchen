@@ -26,8 +26,9 @@ test('headless CLI exception writer redacts and bounds the stack it emits', () =
 });
 
 test('normalizes one bounded real-provider scenario', () => {
-	const matrix = normalizeHeadlessMatrix({ version: 1, scenarios: [validScenario()] });
+	const matrix = normalizeHeadlessMatrix({ version: 1, scenarios: [validScenario({ setupBlocks: [{ x: 2, y: 201, z: 0, blockId: 'minecraft:oak_log' }] })] });
 	assert.deepEqual(matrix.scenarios[0].assertions, [{ type: 'lifecycle', state: 'COMPLETED' }]);
+	assert.deepEqual(matrix.scenarios[0].setupBlocks, [{ x: 2, y: 201, z: 0, blockId: 'minecraft:oak_log' }]);
 	assert.equal(matrix.scenarios[0].rosterSize, 1);
 	assert.equal(matrix.version, 1);
 	assert.ok(Object.isFrozen(matrix));
@@ -54,15 +55,17 @@ test('accepts Cursor Composer and Grok scenarios through the same matrix schema'
 
 test('checked-in live matrix covers every provider with real model and setting combinations', () => {
 	const matrix = normalizeHeadlessMatrix(JSON.parse(readFileSync(new URL('../config/headless-provider-matrix.json', import.meta.url), 'utf8')));
-	assert.equal(matrix.scenarios.length, 15);
+	assert.equal(matrix.scenarios.length, 16);
 	for (const provider of ['codex', 'kimi', 'cursor']) {
 		const scenarios = matrix.scenarios.filter((scenario) => scenario.provider === provider);
 		assert.ok(new Set(scenarios.map((scenario) => scenario.model)).size >= 2, `${provider} needs at least two models`);
 		for (const model of new Set(scenarios.map((scenario) => scenario.model))) {
 			assert.ok(new Set(scenarios.filter((scenario) => scenario.model === model).map((scenario) => `${scenario.reasoningEffort}/${scenario.serviceTier}`)).size >= 2, `${provider}/${model} needs two settings`);
 		}
-		assert.ok(scenarios.every((scenario) => scenario.id === 'codex-luna-xhigh-fast-wooden-pickaxe'
+		assert.ok(scenarios.every((scenario) => ['codex-luna-xhigh-fast-mine-oak-log', 'codex-luna-xhigh-fast-wooden-pickaxe'].includes(scenario.id)
 			? scenario.requireFactualSuccess && scenario.assertions.some((assertion) => assertion.type === 'rcon')
+			: scenario.id === 'codex-sol-low-priority'
+				? scenario.assertions.some((assertion) => assertion.type === 'action' && assertion.actionType === 'navigate_to')
 			: scenario.provider === 'codex'
 				? ['chat', 'action'].every((type) => scenario.assertions.some((assertion) => assertion.type === type))
 				: ['chat', 'action', 'program'].every((type) => scenario.assertions.some((assertion) => assertion.type === type))));
@@ -92,6 +95,7 @@ test('supports every bounded assertion shape and rejects unknown keys', () => {
 	const normalized = normalizeHeadlessScenario(validScenario({ assert: assertions }), 0);
 	assert.deepEqual(normalized.assertions, assertions);
 	assert.throws(() => normalizeHeadlessScenario({ ...validScenario(), extra: true }, 0), /unknown|key/i);
+	assert.throws(() => normalizeHeadlessScenario({ ...validScenario(), setupBlocks: [{ x: 0, y: 201, z: 0, blockId: 'minecraft:air' }] }, 0), /non-air/i);
 });
 
 test('selects all scenarios or one exact ID', () => {

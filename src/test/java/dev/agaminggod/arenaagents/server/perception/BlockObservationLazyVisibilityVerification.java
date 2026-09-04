@@ -8,6 +8,10 @@ import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Predicate;
+import java.util.HashMap;
+import java.util.Map;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.block.Blocks;
 
 public final class BlockObservationLazyVisibilityVerification {
 	private static final String[] BLOCK_IDS = {
@@ -182,6 +186,27 @@ public final class BlockObservationLazyVisibilityVerification {
 		assertEquals(8, raycastsAfterCone.get(),
 				"only cone-eligible candidates consume the raycast budget");
 		assertions += 7;
+
+		Map<BlockPos, net.minecraft.world.level.block.state.BlockState> mutableStates = new HashMap<>();
+		BlockPos cachedPosition = new BlockPos(1, 0, 0);
+		List<BlockObservationOrdering.Candidate> cached = List.of(
+				new BlockObservationOrdering.Candidate(1, 0, 0, "minecraft:stone"));
+		mutableStates.put(cachedPosition, Blocks.STONE.defaultBlockState());
+		assertEquals(
+				List.of(new BlockObservationOrdering.Candidate(1, 0, 0, "minecraft:stone")),
+				ServerObservationCollector.refreshCurrentBlockCandidates(cached, BlockPos.ZERO, mutableStates::get),
+				"cached candidates initially reflect the live block state");
+		mutableStates.put(cachedPosition, Blocks.DIRT.defaultBlockState());
+		assertEquals(
+				List.of(new BlockObservationOrdering.Candidate(1, 0, 0, "minecraft:dirt")),
+				ServerObservationCollector.refreshCurrentBlockCandidates(cached, BlockPos.ZERO, mutableStates::get),
+				"cached candidates refresh their block ID after an in-window mutation");
+		mutableStates.put(cachedPosition, Blocks.AIR.defaultBlockState());
+		assertEquals(
+				List.of(),
+				ServerObservationCollector.refreshCurrentBlockCandidates(cached, BlockPos.ZERO, mutableStates::get),
+				"cached candidates omit a block that became air");
+		assertions += 3;
 
 		return assertions;
 	}

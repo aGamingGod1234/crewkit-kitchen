@@ -41,12 +41,14 @@ import dev.agaminggod.arenaagents.server.goal.GoalPredicateWorldValidator;
 import dev.agaminggod.arenaagents.server.goal.GoalInventoryCapacity;
 import dev.agaminggod.arenaagents.server.goal.GoalSpecWireCodec;
 import dev.agaminggod.arenaagents.server.goal.GoalVerificationRuntime;
+import dev.agaminggod.arenaagents.server.goal.GoalSubmission;
 import dev.agaminggod.arenaagents.server.perception.ObservationDispatchQueue;
 import dev.agaminggod.arenaagents.server.perception.AttentionFactDelta;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationCollector;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationWireBudget;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionExecutor;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionProgress;
+import dev.agaminggod.arenaagents.server.runtime.ServerActionObservation;
 import dev.agaminggod.arenaagents.server.runtime.ActionProvenance;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionRequest;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionResult;
@@ -75,6 +77,7 @@ import java.util.Base64;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -115,6 +118,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private static final int MIN_SECRET_LENGTH = 32;
 	private static final int MAX_SECRET_LENGTH = 512;
 	private static final int MAX_TRACKED_IDS = 4_096;
+	private static final int MAX_ACTIVATED_GOAL_SPEC_REQUESTS = AgentConstants.DEFAULT_AGENT_LIMIT * 2;
 	private static final int SERVER_TASK_BULK_CAP = 4_096;
 	private static final int SERVER_TASK_URGENT_RESERVE = 512;
 	private static final int SERVER_TASK_CONTROL_RESERVE = 512;
@@ -177,6 +181,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private final LinkedHashSet<Session> preauthSessions = new LinkedHashSet<>();
 	private final ArrayDeque<Long> preauthAccepts = new ArrayDeque<>();
 	private final Map<AgentId, RecoveryObservationIdentity> recoveryObservationIdentities = new HashMap<>();
+	private final Map<UUID, ActivatedGoalSpecRequest> activatedGoalSpecRequests = new LinkedHashMap<>();
 	private volatile Runnable handshakeSnapshotHook = () -> { };
 	private volatile java.util.function.Consumer<AutoCloseable> handshakeCommittedHook = ignored -> { };
 	private boolean disconnectInProgress;
@@ -591,6 +596,19 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		return catalogModels;
 	}
 
+	public GoalSubmission submitGoal(
+			String selector,
+			String prompt,
+			net.minecraft.server.level.ServerLevel sourceLevel,
+			Optional<UUID> requestingPlayerId,
+			GoalSubmission.Operation operation
+	) {
+		if (!authenticated()) {
+			throw new AgentDomainException("COORDINATOR_DISCONNECTED", COORDINATOR_OFFLINE_MESSAGE);
+		}
+		return manager.submitGoal(selector, prompt, sourceLevel, requestingPlayerId, operation, this::publishGoalSpecRequest);
+	}
+
 	public DeliveryReceipt sendPlayerDirectMessage(ServerPlayer source, AgentId recipientAgentId, String text) {
 		if (!authenticated()) {
 			throw new AgentDomainException("COORDINATOR_DISCONNECTED", COORDINATOR_OFFLINE_MESSAGE);
@@ -737,6 +755,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		terminalResults.remove(agentId);
 		actionJournal.remove(agentId);
 		observationPublication.remove(agentId);
+		activatedGoalSpecRequests.entrySet().removeIf(entry -> entry.getValue().agentId().equals(agentId));
 		synchronized (publicationLock) {
 			coordinatorReadyAgentIds.remove(agentId);
 			recoveryObservationIdentities.remove(agentId);
@@ -1083,6 +1102,18 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			if (predicateElement == null || !predicateElement.isJsonObject()) {
 				throw new BridgeProtocolException("INVALID_GOAL_PREDICATE", "goal_spec_proposal.predicate must be an object");
 			}
+			GoalPredicate decodedPredicate = GOAL_SPEC_WIRE_CODEC.decodePredicate(predicateElement.getAsJsonObject());
+			ActivatedGoalSpecRequest activated = activatedGoalSpecRequests.get(requestId);
+			if (activated != null) {
+				if (!activated.agentId().equals(agentId)) {
+					throw new AgentDomainException("GOAL_DRAFT_AGENT_MISMATCH", "Goal draft belongs to another agent");
+				}
+				if (!activated.predicate().equals(decodedPredicate)) {
+					throw new AgentDomainException("GOAL_DRAFT_PROPOSAL_CONFLICT", "Goal draft already activated with a different proposal");
+				}
+				sendGoalSpecResult(agentId, requestIdValue, "accepted", "PROPOSAL_ALREADY_ACTIVATED");
+				return;
+			}
 			PendingGoalDraft draft = manager.goalDraft(requestId)
 					.orElseThrow(() -> new AgentDomainException("UNKNOWN_GOAL_DRAFT", "Goal draft does not exist"));
 			if (!draft.agentId().equals(agentId)) {
@@ -1092,7 +1123,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				throw new AgentDomainException("STALE_GOAL_DRAFT", "Goal draft no longer matches the target goal revision");
 			}
 			GoalPredicate predicate = GoalPredicateWorldValidator.bindToDimension(
-					GOAL_SPEC_WIRE_CODEC.decodePredicate(predicateElement.getAsJsonObject()), draft.dimensionId());
+					manager.normalizeGoalDraftTranslation(draft, decodedPredicate), draft.dimensionId());
 			GoalPredicateWorldValidator.validateTranslatedProposal(predicate);
 			manager.validateGoalDraftTranslation(draft, predicate);
 			validateProposalIdentifiers(predicate, Set.copyOf(draft.candidateIds()));
@@ -1107,15 +1138,51 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			boolean duplicate = draft.proposedPredicate().isPresent();
 			PendingGoalDraft updated = manager.updateGoalDraftProposal(requestId, agentId, predicate);
 			ServerPlayer player = manager.server() == null ? null : manager.server().getPlayerList().getPlayer(updated.requestingPlayerId());
+			Optional<CodexAgentManager.GoalDraftResult> activatedResult = manager.activateTranslatedManagerDraft(updated);
+			if (activatedResult.isPresent()) {
+				recordActivatedGoalSpecRequest(requestId, agentId, decodedPredicate);
+				if (player != null) {
+					String operation = activatedResult.orElseThrow().operation() == dev.agaminggod.arenaagents.server.goal.GoalDraftResolution.Operation.QUEUE
+							? "queued" : "started";
+					player.sendSystemMessage(net.minecraft.network.chat.Component.literal(
+							"Validated goal " + operation + ": " + summary));
+				}
+				sendGoalSpecResult(agentId, requestIdValue, "accepted", "PROPOSAL_ACTIVATED");
+				return;
+			}
 			if (player != null && !duplicate) {
 				player.sendSystemMessage(net.minecraft.network.chat.Component.literal(
-						"Proposed goal for \"" + updated.originalRequest() + "\": " + summary
-								+ " Predicate: " + GOAL_SPEC_WIRE_CODEC.encodePredicate(predicate) + ". Confirm or cancel draft " + updated.draftId() + "."));
+						goalProposalMessage(updated, summary)));
 			}
 			sendGoalSpecResult(agentId, requestIdValue, "accepted", duplicate ? "PROPOSAL_ALREADY_STAGED" : "PROPOSAL_STAGED");
 		} catch (AgentDomainException | BridgeProtocolException exception) {
 			String code = exception instanceof AgentDomainException domain ? domain.code() : ((BridgeProtocolException) exception).code();
 			sendGoalSpecResult(agentId, requestIdValue, "rejected", code);
+		}
+	}
+
+	static String goalProposalMessage(PendingGoalDraft draft, String summary) {
+		Objects.requireNonNull(draft, "draft must not be null");
+		String cleanSummary = Objects.requireNonNull(summary, "summary must not be null")
+				.replaceAll("\\s+", " ").strip();
+		if (cleanSummary.isEmpty()) throw new IllegalArgumentException("summary must not be blank");
+		char lastCharacter = cleanSummary.charAt(cleanSummary.length() - 1);
+		String sentence = ".!?".indexOf(lastCharacter) >= 0 ? cleanSummary : cleanSummary + ".";
+		return "Proposed goal for \"" + draft.originalRequest() + "\": " + sentence
+				+ " Confirm or cancel draft " + draft.draftId() + ".";
+	}
+
+	private void recordActivatedGoalSpecRequest(UUID requestId, AgentId agentId, GoalPredicate predicate) {
+		activatedGoalSpecRequests.put(requestId, new ActivatedGoalSpecRequest(agentId, predicate));
+		while (activatedGoalSpecRequests.size() > MAX_ACTIVATED_GOAL_SPEC_REQUESTS) {
+			activatedGoalSpecRequests.remove(activatedGoalSpecRequests.keySet().iterator().next());
+		}
+	}
+
+	private record ActivatedGoalSpecRequest(AgentId agentId, GoalPredicate predicate) {
+		private ActivatedGoalSpecRequest {
+			Objects.requireNonNull(agentId, "agentId must not be null");
+			Objects.requireNonNull(predicate, "predicate must not be null");
 		}
 	}
 
@@ -1766,17 +1833,21 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		try {
 			ServerActionRequest request = decodeActionRequest(envelope);
 			AgentRecord record = validateActionProvenance(request);
-			actionJournal.accept(request, logicalGoalId(record));
-			durableAccepted = true;
-			try {
-				programActions.accept(request);
-				actionExecutor.submitProgramPrimitive(request);
-			} catch (RuntimeException exception) {
-				if (actionJournal.rollbackAccepted(request)) {
-					durableAccepted = false;
-					programActions.rollback(request);
+			if (isDetachedConversationReply(record, request)) {
+				actionExecutor.submitConversationReply(request);
+			} else {
+				actionJournal.accept(request, logicalGoalId(record));
+				durableAccepted = true;
+				try {
+					programActions.accept(request);
+					actionExecutor.submitProgramPrimitive(request);
+				} catch (RuntimeException exception) {
+					if (actionJournal.rollbackAccepted(request)) {
+						durableAccepted = false;
+						programActions.rollback(request);
+					}
+					throw exception;
 				}
-				throw exception;
 			}
 		} catch (BridgeProtocolException | AgentDomainException exception) {
 			if (durableAccepted) throw exception;
@@ -1879,7 +1950,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		AgentRecord record = manager.registry().require(request.agentId());
 		boolean respawn = request.type() == ActionType.RESPAWN;
 		if ((respawn && (record.state() != AgentLifecycleState.DEAD || request.goalRevision() != record.goalRevision()))
-				|| (!respawn && !record.acceptsRevision(request.goalRevision()))) {
+				|| (!respawn && !acceptsActionRevision(record, request))) {
 			throw new AgentDomainException("STALE_REVISION", "Coordinator action revision is stale");
 		}
 		ActionProvenance provenance = request.provenance();
@@ -1905,6 +1976,20 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			);
 		}
 		return record;
+	}
+
+	static boolean acceptsActionRevision(AgentRecord record, ServerActionRequest request) {
+		if (record.acceptsRevision(request.goalRevision())) return true;
+		return isDetachedConversationReply(record, request);
+	}
+
+	static boolean isDetachedConversationReply(AgentRecord record, ServerActionRequest request) {
+		if (request.goalRevision() != record.goalRevision() || request.type() != ActionType.CHAT) return false;
+		if (record.state() != AgentLifecycleState.IDLE
+				&& record.state() != AgentLifecycleState.PAUSED
+				&& record.state() != AgentLifecycleState.COMPLETED) return false;
+		ConversationAudience audience = ConversationAudience.parse(nullableString(request.arguments(), "audience"));
+		return audience == ConversationAudience.DIRECT || audience == ConversationAudience.PROXIMITY;
 	}
 
 	private static ActionProvenance decodeActionProvenance(JsonObject payload) {
@@ -1938,7 +2023,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	private void sendActionResult(ServerActionResult result) {
-		actionJournal.terminal(result);
+		actionJournal.terminalIfAccepted(result);
 		programActions.terminal(result);
 		observations.invalidate(result.agentId());
 		ScenarioRuntimeService.onAgentAction(
@@ -2145,6 +2230,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		payload.addProperty("observedAtEpochMs", result.observedAtEpochMs());
 		payload.addProperty("executionStarted", result.executionStarted());
 		payload.addProperty("physicalAttempted", result.physicalAttempted());
+		if (result.actionObservation() != null) payload.add("actionObservation", actionObservationPayload(result.actionObservation()));
 		payload.addProperty("replayProof", actionResultReplayProof(
 				secret, target.clientNonce, target.serverNonce, serverInstanceId,
 				result.agentId().toString(), result.goalRevision(), result.actionId()
@@ -2239,11 +2325,120 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		payload.addProperty("progress", progress.progress());
 		payload.addProperty("elapsedMs", progress.elapsedMs());
 		payload.addProperty("observedAtEpochMs", progress.observedAtEpochMs());
+		if (progress.actionObservation() != null) payload.add("actionObservation", actionObservationPayload(progress.actionObservation()));
 		send("action_progress", progress.agentId().toString(), payload);
-		verboseState.progressMilestone(progress).ifPresent(milestone ->
-				reportVerbose(progress.agentId(), "progress",
-						AgentActivityPresentation.progress(progress.actionType(), milestone)));
+		if (progress.actionObservation() == null || progress.actionObservation().progress() == null
+				|| progress.actionObservation().progress().verified()) {
+			verboseState.progressMilestone(progress).ifPresent(milestone -> {
+				String message = progress.actionObservation() == null
+						? AgentActivityPresentation.progress(progress.actionType(), milestone)
+						: actionObservationProgressMessage(progress.actionObservation(), milestone);
+				reportVerbose(progress.agentId(), "progress", message);
+			});
+		}
 		queueObservation(progress.agentId());
+	}
+
+	private static JsonObject actionObservationPayload(ServerActionObservation observation) {
+		JsonObject payload = new JsonObject();
+		if (observation.worldTick() != null) payload.addProperty("worldTick", observation.worldTick());
+		payload.addProperty("observedAtEpochMs", observation.observedAtEpochMs());
+		addPosition(payload, "position", observation.position());
+		addPosition(payload, "velocity", observation.velocity());
+		payload.addProperty("yaw", observation.yaw());
+		payload.addProperty("pitch", observation.pitch());
+		if (observation.collision() != null) {
+			JsonObject collision = new JsonObject();
+			collision.addProperty("horizontal", observation.collision().horizontal());
+			collision.addProperty("vertical", observation.collision().vertical());
+			collision.addProperty("inWall", observation.collision().inWall());
+			payload.add("collision", collision);
+		}
+		if (observation.lookedAt() != null) {
+			ServerActionObservation.RayTarget lookedAt = observation.lookedAt();
+			JsonObject look = new JsonObject();
+			look.addProperty("type", lookedAt.type());
+			addPosition(look, "position", lookedAt.position());
+			if (lookedAt.id() != null) look.addProperty("id", lookedAt.id());
+			if (lookedAt.face() != null) look.addProperty("face", lookedAt.face());
+			look.addProperty("hitDistance", lookedAt.hitDistance());
+			payload.add("lookedAt", look);
+		}
+		if (observation.reach() != null) {
+			ServerActionObservation.Reach reach = observation.reach();
+			JsonObject value = new JsonObject();
+			value.addProperty("distance", reach.distance());
+			value.addProperty("max", reach.max());
+			value.addProperty("within", reach.within());
+			payload.add("reach", value);
+		}
+		if (observation.target() != null) {
+			ServerActionObservation.Target target = observation.target();
+			JsonObject value = new JsonObject();
+			value.addProperty("kind", target.kind());
+			addPosition(value, "position", target.position());
+			if (target.expectedId() != null) value.addProperty("expectedId", target.expectedId());
+			if (target.currentId() != null) value.addProperty("currentId", target.currentId());
+			if (target.beforeId() != null) value.addProperty("beforeId", target.beforeId());
+			if (target.afterId() != null) value.addProperty("afterId", target.afterId());
+			if (target.worldChanged() != null) value.addProperty("worldChanged", target.worldChanged());
+			if (target.distanceRemaining() != null) value.addProperty("distanceRemaining", target.distanceRemaining());
+			if (target.tolerance() != null) value.addProperty("tolerance", target.tolerance());
+			if (target.standable() != null) value.addProperty("standable", target.standable());
+			payload.add("target", value);
+		}
+		if (observation.progress() != null) {
+			ServerActionObservation.Progress progress = observation.progress();
+			JsonObject value = new JsonObject();
+			value.addProperty("value", progress.value());
+			value.addProperty("basis", progress.basis());
+			value.addProperty("verified", progress.verified());
+			payload.add("progress", value);
+		}
+		return payload;
+	}
+
+	private static void addPosition(JsonObject parent, String name, ServerActionObservation.Position position) {
+		if (position == null) return;
+		JsonObject value = new JsonObject();
+		value.addProperty("x", position.x());
+		value.addProperty("y", position.y());
+		value.addProperty("z", position.z());
+		parent.add(name, value);
+	}
+
+	private static String actionObservationProgressMessage(ServerActionObservation observation, int milestone) {
+		StringBuilder message = new StringBuilder("Verified ").append(milestone).append("% progress");
+		if (observation.progress() != null) message.append(" (basis=").append(observation.progress().basis()).append(')');
+		if (observation.lookedAt() != null && observation.lookedAt().id() != null) {
+			message.append("; looking at ").append(observation.lookedAt().id());
+		}
+		if (observation.reach() != null) {
+			message.append("; reach=").append(formatDecimal(observation.reach().distance()))
+					.append('/').append(formatDecimal(observation.reach().max()));
+		}
+		if (observation.target() != null) {
+			ServerActionObservation.Target target = observation.target();
+			if (target.kind().equals("block") && target.position() != null) {
+				message.append("; target=").append(formatPosition(target.position()));
+			}
+			if (target.distanceRemaining() != null) {
+				message.append("; remaining=").append(formatDecimal(target.distanceRemaining()));
+			}
+			if (target.tolerance() != null) message.append("; tolerance=").append(formatDecimal(target.tolerance()));
+		}
+		if (observation.collision() != null && (observation.collision().horizontal() || observation.collision().inWall())) {
+			message.append("; collision=true");
+		}
+		return message.toString();
+	}
+
+	private static String formatPosition(ServerActionObservation.Position position) {
+		return '(' + formatDecimal(position.x()) + ',' + formatDecimal(position.y()) + ',' + formatDecimal(position.z()) + ')';
+	}
+
+	private static String formatDecimal(double value) {
+		return String.format(java.util.Locale.ROOT, "%.2f", value);
 	}
 
 	private void reportVerbose(AgentId agentId, String stage, String message) {

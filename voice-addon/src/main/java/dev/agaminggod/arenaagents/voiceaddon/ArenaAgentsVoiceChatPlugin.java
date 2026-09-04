@@ -4,6 +4,7 @@ import de.maxhenkel.voicechat.api.VoicechatPlugin;
 import de.maxhenkel.voicechat.api.VoicechatServerApi;
 import de.maxhenkel.voicechat.api.events.EventRegistration;
 import de.maxhenkel.voicechat.api.events.MicrophonePacketEvent;
+import de.maxhenkel.voicechat.api.events.VoiceDistanceEvent;
 import de.maxhenkel.voicechat.api.events.VoicechatServerStartedEvent;
 import de.maxhenkel.voicechat.api.events.VoicechatServerStoppedEvent;
 import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemConfiguration;
@@ -52,6 +53,7 @@ public final class ArenaAgentsVoiceChatPlugin implements VoicechatPlugin {
 		registration.registerEvent(VoicechatServerStartedEvent.class,
 				event -> bindings.started(event.getVoicechat()));
 		registration.registerEvent(MicrophonePacketEvent.class, this::onMicrophonePacket);
+		registration.registerEvent(VoiceDistanceEvent.class, SyntheticPlayerVoiceTransport::applyPlaybackDistance);
 		registration.registerEvent(VoicechatServerStoppedEvent.class,
 				event -> bindings.stopped(event.getVoicechat()));
 	}

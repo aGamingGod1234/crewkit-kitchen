@@ -135,6 +135,10 @@ export function validateAction(value) {
 			break;
 		case 'break_block':
 			requireCoordinates(action, true, 'action');
+			requireText(action.expectedBlockId, 'action.expectedBlockId', MAX_IDENTIFIER_LENGTH);
+			if (action.expectedBlockId.endsWith(':air') || action.expectedBlockId === 'minecraft:air') {
+				throw invalid('INVALID_FIELD', 'action.expectedBlockId must identify a non-air block');
+			}
 			requireDuration(action.timeoutMs, 'action.timeoutMs');
 			break;
 		case 'pick_up_item':

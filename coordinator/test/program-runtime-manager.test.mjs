@@ -404,7 +404,7 @@ test('corrects an acknowledgement-only program before dispatching it for a physi
 			return {
 				summary: 'Begin gathering materials.',
 				directive: 'replace',
-				source: 'program.onUnhandledAttention("continue_and_notify"); await player.mine({ x: 1, y: 64, z: 1, timeoutMs: 30000 });',
+			source: 'program.onUnhandledAttention("continue_and_notify"); await player.mine({ x: 1, y: 64, z: 1, expectedBlockId: "minecraft:stone", timeoutMs: 30000 });',
 			};
 		} },
 		reportError: (_agentId, error) => errors.push(error),

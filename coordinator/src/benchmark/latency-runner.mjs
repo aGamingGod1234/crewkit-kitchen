@@ -39,6 +39,10 @@ const DISABLED_LATENCY_REGISTRY = Object.freeze({
 	performanceSnapshot: () => [],
 });
 
+function createDefaultVirtualBridge(options) {
+	return new VirtualMinecraftBridge(options);
+}
+
 /** Strictly validate and freeze a latency matrix before executing it. */
 export function normalizeLatencyMatrix(value) {
 	if (!isRecord(value)) throw new TypeError('latency matrix must be an object');
@@ -86,6 +90,8 @@ export async function runLatencyMatrix(options = {}) {
 	if (typeof scenarioResolver !== 'function') throw new TypeError('scenarioResolver must be a function');
 	const providerFactories = options.providerFactories ?? {};
 	if (!isRecord(providerFactories)) throw new TypeError('providerFactories must be an object');
+	const virtualBridgeFactory = options.virtualBridgeFactory ?? createDefaultVirtualBridge;
+	if (typeof virtualBridgeFactory !== 'function') throw new TypeError('virtualBridgeFactory must be a function');
 	const measurementContext = normalizeBenchmarkContext(options);
 	const wallClockBasis = options.wallClock !== undefined || options.wallNow !== undefined ? 'injected_monotonic_ms' : 'process_monotonic_ms';
 	const wallClock = createMonotonicClock(options.wallClock ?? options.wallNow ?? (() => performance.now()), 'wall clock');
@@ -97,7 +103,7 @@ export async function runLatencyMatrix(options = {}) {
 	try {
 		for (const trial of matrix.trials) {
 			for (let repetition = 1; repetition <= trial.repetitions; repetition += 1) {
-				const result = await runTrial({ ...options, matrix, trial, repetition, scenarioResolver, providerFactories, recorder, measurementContext, wallClock, wallClockBasis, measurementsEnabled });
+				const result = await runTrial({ ...options, matrix, trial, repetition, scenarioResolver, providerFactories, virtualBridgeFactory, recorder, measurementContext, wallClock, wallClockBasis, measurementsEnabled });
 				results.push(result);
 				if (result.status === 'FAILED' && result.error?.code === 'PROVIDER_UNAVAILABLE' && trial.providerAvailabilityRequired) requiredFailure = result.error;
 			}
@@ -122,7 +128,7 @@ export async function runLatencyMatrix(options = {}) {
 }
 
 
-async function runTrial({ matrix, trial, repetition, scenarioResolver, providerFactories, recorder, measurementContext = {}, wallClock, wallClockBasis = 'process_monotonic_ms', measurementsEnabled = true, ...options }) {
+async function runTrial({ matrix, trial, repetition, scenarioResolver, providerFactories, virtualBridgeFactory, recorder, measurementContext = {}, wallClock, wallClockBasis = 'process_monotonic_ms', measurementsEnabled = true, ...options }) {
 	const startedAt = performance.now();
 	const deadline = startedAt + trial.trialBudgetMs;
 	let measurementStartedAt = null;
@@ -198,7 +204,7 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 		world = new VirtualWorld(scenario.world, { scheduler: manualScheduler() });
 		metrics?.attachWorld(world, scenario, scenario.agentIds);
 		initialSnapshots = new Map(scenario.agentIds.map((agentId) => [agentId, captureScenarioInitialSnapshot({ manifest: scenario.agentManifests?.[agentId] ?? rawScenario, world, agentId })]));
-		const virtual = new VirtualMinecraftBridge({ world, agentRecords: virtualRecords, serverInstanceId: `latency-${trial.id}-${repetition}` });
+		const virtual = virtualBridgeFactory({ world, agentRecords: virtualRecords, serverInstanceId: `latency-${trial.id}-${repetition}`, trial, repetition });
 		bridge = new VirtualMinecraftBridgeAdapter(virtual, records, {
 			scenario,
 			initialSnapshots,

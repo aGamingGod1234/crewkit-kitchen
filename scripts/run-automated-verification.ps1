@@ -13,12 +13,14 @@ $Coordinator = Join-Path $Project 'coordinator'
 $CoordinatorPackagingVerifier = Join-Path $Project 'scripts\verify-coordinator-packaging.ps1'
 $DistributionRuntimeVerifier = Join-Path $Project 'scripts\verify-distribution-runtime.ps1'
 $StartupPackagingVerifier = Join-Path $Project 'scripts\verify-startup-packaging.ps1'
+$NormalProfileUpdaterVerifier = Join-Path $Project 'scripts\test-install-normal-profile-update.ps1'
 $AgentJar = Resolve-ArenaModJar $Project
 if (-not (Test-Path -LiteralPath $Java -PathType Leaf)) { throw "Missing project JDK: $Java" }
 if (-not (Test-Path -LiteralPath (Join-Path $Coordinator 'package.json') -PathType Leaf)) { throw 'Missing coordinator package.json.' }
 if (-not (Test-Path -LiteralPath $CoordinatorPackagingVerifier -PathType Leaf)) { throw 'Missing coordinator packaging verifier.' }
 if (-not (Test-Path -LiteralPath $DistributionRuntimeVerifier -PathType Leaf)) { throw 'Missing distribution runtime verifier.' }
 if (-not (Test-Path -LiteralPath $StartupPackagingVerifier -PathType Leaf)) { throw 'Missing startup packaging verifier.' }
+if (-not (Test-Path -LiteralPath $NormalProfileUpdaterVerifier -PathType Leaf)) { throw 'Missing normal profile updater verifier.' }
 
 $env:JAVA_HOME = $JavaHome
 Push-Location $Project
@@ -32,6 +34,7 @@ try {
 & $CoordinatorPackagingVerifier -JarPath $AgentJar
 & $DistributionRuntimeVerifier
 & $StartupPackagingVerifier -PackageRoot $Project
+& $NormalProfileUpdaterVerifier -ProjectRoot $Project
 
 Push-Location $Coordinator
 try {

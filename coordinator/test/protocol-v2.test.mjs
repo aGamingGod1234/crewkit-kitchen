@@ -485,6 +485,43 @@ test('traced action commands, progress, and results round-trip one bounded trace
 	}), /traceId/i);
 });
 
+test('action observations are optional but strictly validate authoritative movement and mining facts', () => {
+	const actionObservation = {
+		worldTick: 42,
+		observedAtEpochMs: 1_750_000_000_250,
+		position: { x: 1.25, y: 64, z: -2.5 },
+		velocity: { x: 0, y: 0, z: 0.1 },
+		yaw: 90,
+		pitch: 12,
+		collision: { horizontal: false, vertical: true, inWall: false },
+		lookedAt: { type: 'block', position: { x: 2, y: 64, z: -2 }, id: 'minecraft:oak_log', face: 'west', hitDistance: 2.75 },
+		reach: { distance: 2.75, max: 4.5, within: true },
+		target: {
+			kind: 'block', position: { x: 2, y: 64, z: -2 }, expectedId: 'minecraft:oak_log', currentId: 'minecraft:oak_log',
+			beforeId: 'minecraft:oak_log', afterId: 'minecraft:oak_log', worldChanged: false,
+		},
+		progress: { value: 0.25, basis: 'block_damage', verified: true },
+	};
+	const progress = validateProtocolV2Payload('action_progress', {
+		traceId: TRACE_ID, goalRevision: 1, actionId: 'action-observed', actionType: 'mine', progress: 0.25,
+		actionObservation,
+	});
+	const result = validateProtocolV2Payload('action_result', {
+		traceId: TRACE_ID, goalRevision: 1, actionId: 'action-observed', commandId: 'action-observed', actionType: 'mine',
+		state: 'SUCCEEDED', reasonCode: 'BLOCK_BROKEN', message: '', elapsedMs: 10, observedAtEpochMs: 20,
+		actionObservation: { ...actionObservation, target: { ...actionObservation.target, currentId: 'minecraft:air', afterId: 'minecraft:air', worldChanged: true }, progress: { value: 1, basis: 'world_mutation', verified: true } },
+	});
+	assert.equal(progress.actionObservation.progress.basis, 'block_damage');
+	assert.equal(result.actionObservation.target.worldChanged, true);
+	assert.throws(() => validateProtocolV2Payload('action_progress', {
+		traceId: TRACE_ID, goalRevision: 1, actionId: 'action-observed', actionObservation: { ...actionObservation, progress: { value: 0.5, basis: 'timer', verified: true } },
+	}), /basis/i);
+	assert.throws(() => validateProtocolV2Payload('action_result', {
+		traceId: TRACE_ID, goalRevision: 1, actionId: 'action-observed', commandId: 'action-observed', actionType: 'mine', state: 'SUCCEEDED', reasonCode: 'DONE', message: '', elapsedMs: 10, observedAtEpochMs: 20,
+		actionObservation: { ...actionObservation, reach: { distance: -1, max: 4.5, within: false } },
+	}), /distance/i);
+});
+
 test('terminal result retries are delivered until the application acknowledges them', async (t) => {
 	assert.deepEqual(
 		validateProtocolV2Payload('action_result_ack', { goalRevision: 4, actionId: 'action-ack-1' }),
@@ -934,6 +971,9 @@ function readyServerObservation(goalRevision = 4) {
 		}],
 		blocks: [{
 			x: 11, y: 64, z: -3, blockId: 'minecraft:oak_log', placeableFaces: ['up', 'north'], tags: ['#minecraft:logs'],
+		}],
+		landmarks: [{
+			x: 28, y: 66, z: -1, blockId: 'minecraft:oak_log', distance: 17.8, bearing: 24, elevation: 3, tags: ['#minecraft:logs'],
 		}],
 		nearbyContainers: [{
 			x: 12,
@@ -1818,6 +1858,9 @@ test('accepts the exact rich ready observation emitted by ServerObservationColle
 	assert.equal(normalized.entities[2].itemId, 'minecraft:oak_log');
 	assert.equal(normalized.entities[2].count, 1);
 	assert.deepEqual(normalized.blocks[0].placeableFaces, ['up', 'north']);
+	assert.deepEqual(normalized.landmarks[0], {
+		x: 28, y: 66, z: -1, blockId: 'minecraft:oak_log', distance: 17.8, bearing: 24, elevation: 3, tags: ['#minecraft:logs'],
+	});
 	assert.deepEqual(normalized.nearbyContainers[0].capabilities, ['transfer_container']);
 });
 

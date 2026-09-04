@@ -9,6 +9,7 @@ import dev.agaminggod.arenaagents.agent.goal.GoalEvidence;
 import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
 import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
 import java.util.LinkedHashMap;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -37,6 +38,7 @@ public final class GoalCompilerVerification {
 		assertions += verifyExactItemAndAmbiguity();
 		assertions += verifyInventoryCapacity();
 		assertions += verifyExactPositionEntityAndAdvancement();
+		assertions += verifyManagerSubmissionFlow();
 		assertions += verifyCompoundItemsAndKills();
 		assertions += verifyKillCountTranslationBounds();
 		assertions += verifyTranslatedKillConstraints();
@@ -48,7 +50,17 @@ public final class GoalCompilerVerification {
 		assertions += verifyDraftRevisionBinding();
 		assertions += verifyDraftAuthorizationAndChoices();
 		assertions += verifySpecAwareLifecycleStart();
+		assertions += verifyRequesterPrincipal();
 		return assertions;
+	}
+
+	private static int verifyRequesterPrincipal() {
+		UUID playerId = UUID.randomUUID();
+		assertEquals(playerId, PendingGoalDraft.requesterId(Optional.of(playerId)),
+				"in-game semantic goals retain the requesting player principal");
+		assertEquals(PendingGoalDraft.SYSTEM_REQUESTER_ID, PendingGoalDraft.requesterId(Optional.empty()),
+				"authorized console semantic goals use the explicit system principal");
+		return 2;
 	}
 
 	private static int verifyExactItemAndAmbiguity() {
@@ -212,6 +224,60 @@ public final class GoalCompilerVerification {
 				"beating the game freezes an agent-attributed dragon kill"
 		);
 		assertEquals(
+				GoalCompilation.Kind.NEEDS_TRANSLATION,
+				compiler.compile("Go beat the game and kill the Ender Dragon", RegistryAccess.EMPTY, 1_200L).kind(),
+				"a natural game-completion request enters semantic goal translation"
+		);
+		assertEquals(true,
+				GoalCompiler.isDeterministicTranslation("Go and beat the game and kill the Ender Dragon"),
+				"the unambiguous dragon completion phrase can start without asking the player to restate it");
+		assertEquals(true,
+				GoalCompiler.isDeterministicTranslation("Kill the Ender Dragon and beat the game"),
+				"the same unambiguous dragon completion remains deterministic when spoken in the other order");
+		assertEquals(false,
+				GoalCompiler.isDeterministicTranslation("Beat the game"),
+				"the direct beat-the-game command remains an already compiled goal");
+		assertEquals(false,
+				GoalCompiler.isDeterministicTranslation("Go beat the game and kill a zombie"),
+				"an unrelated compound phrase still requires semantic translation and validation");
+		assertEquals(
+				List.of("minecraft:ender_dragon"),
+				compiler.candidateIdsFor("Go beat the game and kill the Ender Dragon", RegistryAccess.EMPTY),
+				"the coordinator receives the bounded terminal-result candidate"
+		);
+		assertEquals(
+				List.of("minecraft:ender_dragon"),
+				compiler.candidateIdsFor("Go and beat the game and kill the enemy dragon", RegistryAccess.EMPTY),
+				"a common spoken enemy-dragon transcription keeps the same candidate"
+		);
+		GoalTranslationConstraint dragonConstraint = compiler.translationConstraintFor(
+				"Go beat the game and kill the Ender Dragon", RegistryAccess.EMPTY);
+		expectCode("GOAL_TRANSLATION_CONSTRAINT_MISMATCH",
+				() -> dragonConstraint.validate(new GoalPredicate.OperatorConfirmed()),
+				"operator confirmation cannot replace the requested terminal result");
+		expectCode("GOAL_TRANSLATION_CONSTRAINT_MISMATCH",
+				() -> dragonConstraint.validate(new GoalPredicate.EntityKilledByAgent("minecraft:zombie", true)),
+				"a translated goal cannot substitute a different enemy");
+		assertSucceeds(
+				() -> dragonConstraint.validate(new GoalPredicate.EntityKilledByAgent("minecraft:ender_dragon", true)),
+				"the server constraint accepts the inferred Ender Dragon terminal result");
+		assertEquals(
+				new GoalPredicate.EntityKilledByAgent("minecraft:ender_dragon", true),
+				compiler.normalizeTranslatedPredicate(
+						"Go beat the game and kill the Ender Dragon",
+						new GoalPredicate.AllOf(List.of(
+								new GoalPredicate.OperatorConfirmed(),
+								new GoalPredicate.EntityKilledByAgent("minecraft:ender_dragon", true)
+						))
+				),
+				"beat-the-game translation removes redundant manual confirmation from the objective dragon result"
+		);
+		assertEquals(
+				GoalCompilation.Kind.NEEDS_TRANSLATION,
+				compiler.compile("Go beat the game and kill a zombie", RegistryAccess.EMPTY, 1_200L).kind(),
+				"a separate trailing result is not discarded as redundant dragon wording"
+		);
+		assertEquals(
 				new GoalPredicate.AdvancementGranted("minecraft:story/mine_stone"),
 				compiler.compile("Complete advancement minecraft:story/mine_stone", RegistryAccess.EMPTY, 1_200L,
 						id -> id.equals("minecraft:story/mine_stone"))
@@ -335,7 +401,7 @@ public final class GoalCompilerVerification {
 				compiler.candidateIdsFor("Earn the Stone Age advancement", RegistryAccess.EMPTY, manyLiveAdvancements).size(),
 				"natural advancement candidates remain bounded"
 		);
-		return 28;
+		return 35;
 	}
 
 	private static int verifyCompoundItemsAndKills() {
@@ -431,6 +497,53 @@ public final class GoalCompilerVerification {
 				"summed duplicate requirements are revalidated against inventory capacity"
 		);
 		return 16;
+	}
+
+	private static int verifyManagerSubmissionFlow() {
+		GoalCompiler compiler = new GoalCompiler();
+		String request = "Go beat the game and kill the Ender Dragon";
+		GoalCompilation compilation = compiler.compile(request, RegistryAccess.EMPTY, 1_200L);
+		AgentRecord idle = AgentRecord.create(
+				AgentId.random(),
+				new AgentProfile("codex", "gpt-5.6-sol", "high", Optional.empty(), 0),
+				10_000L
+		);
+		PendingGoalDraft draft = new PendingGoalDraft(
+				UUID.randomUUID(), idle.agentId(), UUID.randomUUID(), request,
+				List.of("minecraft:ender_dragon"), Optional.empty(), DraftIntent.TRANSLATE_START,
+				1_200L, idle.goalRevision(), Optional.empty()
+		);
+		ArrayList<String> events = new ArrayList<>();
+		GoalSubmission submission = GoalSubmissionFlow.route(
+				compilation,
+				spec -> { throw new AssertionError("translation must not activate a goal"); },
+				() -> draft,
+				staged -> events.add("staged:" + staged.draftId()),
+				published -> events.add("published:" + published.draftId())
+		);
+		assertEquals(Optional.empty(), submission.transition(),
+				"Manager translation does not activate before a proposal is confirmed");
+		assertEquals(Optional.of(draft), submission.pendingDraft(),
+				"Manager translation returns the durable pending draft");
+		assertEquals(List.of("staged:" + draft.draftId(), "published:" + draft.draftId()), events,
+				"Manager translation persists the draft before publishing goal_spec_request");
+		expectCode("GOAL_DRAFT_NOT_READY",
+				() -> GoalDraftResolution.authorize(draft, draft.requestingPlayerId(), false, GoalDraftChoice.CONFIRM),
+				"an unverified coordinator draft cannot activate");
+		PendingGoalDraft validated = draft.withProposedPredicate(
+				new GoalPredicate.EntityKilledByAgent("minecraft:ender_dragon", true));
+		assertEquals(GoalDraftResolution.Operation.START,
+				GoalDraftResolution.authorize(validated, draft.requestingPlayerId(), false, GoalDraftChoice.CONFIRM),
+				"the requested start activates only after a validated proposal is confirmed");
+		PendingGoalDraft queued = new PendingGoalDraft(
+				UUID.randomUUID(), idle.agentId(), draft.requestingPlayerId(), request,
+				List.of("minecraft:ender_dragon"), validated.proposedPredicate(), DraftIntent.TRANSLATE_QUEUE,
+				1_200L, idle.goalRevision(), Optional.empty()
+		);
+		assertEquals(GoalDraftResolution.Operation.QUEUE,
+				GoalDraftResolution.authorize(queued, queued.requestingPlayerId(), false, GoalDraftChoice.CONFIRM),
+				"a translated Manager queue request preserves its requested operation");
+		return 6;
 	}
 
 	private static int verifyExplicitAlternativeCandidates() {

@@ -20,6 +20,10 @@ import dev.agaminggod.arenaagents.server.goal.GoalCompilation;
 import dev.agaminggod.arenaagents.server.goal.GoalCompiler;
 import dev.agaminggod.arenaagents.server.goal.GoalInventoryCapacity;
 import dev.agaminggod.arenaagents.server.goal.GoalPredicateWorldValidator;
+import dev.agaminggod.arenaagents.server.goal.GoalSpecRequestSink;
+import dev.agaminggod.arenaagents.server.goal.GoalSubmission;
+import dev.agaminggod.arenaagents.server.goal.GoalSubmissionFlow;
+import dev.agaminggod.arenaagents.server.goal.DraftIntent;
 import dev.agaminggod.arenaagents.agent.CodexAgentEntities;
 import dev.agaminggod.arenaagents.agent.CodexAgentEntity;
 import dev.agaminggod.arenaagents.server.group.AgentGroup;
@@ -50,6 +54,8 @@ import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.Identifier;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
@@ -64,7 +70,8 @@ import net.minecraft.world.level.block.FallingBlock;
 import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.scores.PlayerTeam;
-import net.minecraft.world.scores.Team;
+import net.minecraft.world.waypoints.WaypointStyleAsset;
+import net.minecraft.world.waypoints.WaypointStyleAssets;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -77,7 +84,7 @@ public final class CodexAgentManager {
 	private static final long RECOVERY_RETRY_DELAY_MS = 30_000L;
 	private static final long CANCELLED_SPAWN_RETENTION_MS = 120_000L;
 	private static final long LOCATION_PERSIST_INTERVAL_MS = 1_000L;
-	private static final String HIDDEN_AGENT_TEAM = "arenaagents_hidden";
+	private static final String LEGACY_HIDDEN_AGENT_TEAM = "arenaagents_hidden";
 	private static final TicketType AGENT_TICKET_TYPE = new TicketType(
 			TicketType.NO_TIMEOUT,
 			TicketType.FLAG_LOADING | TicketType.FLAG_SIMULATION | TicketType.FLAG_KEEP_DIMENSION_ACTIVE
@@ -92,6 +99,9 @@ public final class CodexAgentManager {
 	private final Map<AgentId, Long> pendingPlayerSpawns = new LinkedHashMap<>();
 	private final Map<AgentId, VanillaRespawnAttempt> pendingVerifiedRespawns = new LinkedHashMap<>();
 	private final Map<AgentId, Long> lastLocationPersistenceEpochMs = new LinkedHashMap<>();
+	private Map<AgentId, OfflineAgentPlayers.LegacyBodyMigration> pendingLegacyMigrations = new LinkedHashMap<>();
+	private Set<AgentId> pendingLegacyCanonicalRemovals = new LinkedHashSet<>();
+	private Map<AgentId, ServerPlayer> retainedDeadPlayers = new LinkedHashMap<>();
 	private final Set<AgentId> pendingAgentRegistrations = ConcurrentHashMap.newKeySet();
 	private final Set<AgentId> pendingEntityRecoveries = new LinkedHashSet<>();
 	private final PendingSpawnCancellationLedger cancelledPlayerSpawns =
@@ -122,12 +132,28 @@ public final class CodexAgentManager {
 		}
 	}
 
+	private synchronized Map<AgentId, ServerPlayer> retainedDeadPlayers() {
+		if (retainedDeadPlayers == null) retainedDeadPlayers = new LinkedHashMap<>();
+		return retainedDeadPlayers;
+	}
+
+	private synchronized Map<AgentId, OfflineAgentPlayers.LegacyBodyMigration> pendingLegacyMigrations() {
+		if (pendingLegacyMigrations == null) pendingLegacyMigrations = new LinkedHashMap<>();
+		return pendingLegacyMigrations;
+	}
+
+	private synchronized Set<AgentId> pendingLegacyCanonicalRemovals() {
+		if (pendingLegacyCanonicalRemovals == null) pendingLegacyCanonicalRemovals = new LinkedHashSet<>();
+		return pendingLegacyCanonicalRemovals;
+	}
+
 	private void releaseOwnedState() {
 		releaseOnce(
-				releaseStarted,
+			releaseStarted,
 				runtimeHooks::onServerStopping,
 				this::persistLiveAgentLocations,
 				this::releasePendingVerifiedRespawns,
+				() -> retainedDeadPlayers().clear(),
 				this::releaseChunkTickets,
 				() -> savedData.setRuntimeHooks(AgentRuntimeHooks.NO_OP),
 				() -> AgentInputRuntime.release(server)
@@ -205,10 +231,14 @@ public final class CodexAgentManager {
 		Objects.requireNonNull(position, "position must not be null");
 		long now = System.currentTimeMillis();
 		AgentRegistry registry = savedData.registry();
+		List<String> livePlayerNames = server.getPlayerList().getPlayers().stream()
+				.map(player -> player.getGameProfile().name())
+				.toList();
 		AgentRecord created;
 		synchronized (registry) {
 			created = runtimeHooks.withinPublicationBoundary(() -> {
-				AgentRecord record = registry.create(provider, model, reasoning, serviceTier, userName, gameMode, now);
+				AgentRecord record = registry.create(
+						provider, model, reasoning, serviceTier, userName, gameMode, now, livePlayerNames);
 				pendingAgentRegistrations.add(record.agentId());
 				return record;
 			});
@@ -370,6 +400,15 @@ public final class CodexAgentManager {
 		return Optional.of(new GoalDraftResult(operation, draft.agentId(), Optional.of(transition)));
 	}
 
+	public Optional<GoalDraftResult> activateTranslatedManagerDraft(PendingGoalDraft draft) {
+		Objects.requireNonNull(draft, "draft must not be null");
+		if (draft.intent() != DraftIntent.TRANSLATE_START && draft.intent() != DraftIntent.TRANSLATE_QUEUE) {
+			return Optional.empty();
+		}
+		return resolveGoalDraft(
+				draft.draftId(), draft.requestingPlayerId(), false, GoalDraftChoice.CONFIRM);
+	}
+
 	public void validateGoalDraftTranslation(PendingGoalDraft draft, GoalPredicate predicate) {
 		Objects.requireNonNull(draft, "draft must not be null");
 		Objects.requireNonNull(predicate, "predicate must not be null");
@@ -377,6 +416,13 @@ public final class CodexAgentManager {
 		RegistryAccess registries = server == null ? RegistryAccess.EMPTY : server.registryAccess();
 		GoalCompiler compiler = goalCompiler == null ? new GoalCompiler() : goalCompiler;
 		compiler.translationConstraintFor(draft.originalRequest(), registries).validate(predicate);
+	}
+
+	public GoalPredicate normalizeGoalDraftTranslation(PendingGoalDraft draft, GoalPredicate predicate) {
+		Objects.requireNonNull(draft, "draft must not be null");
+		Objects.requireNonNull(predicate, "predicate must not be null");
+		GoalCompiler compiler = goalCompiler == null ? new GoalCompiler() : goalCompiler;
+		return compiler.normalizeTranslatedPredicate(draft.originalRequest(), predicate);
 	}
 
 	static void validateGoalDraftPredicate(
@@ -403,10 +449,12 @@ public final class CodexAgentManager {
 		if (GoalPredicateWorldValidator.requiresLiveLevel(predicate)) {
 			GoalPredicateWorldValidator.validate(server, predicate);
 		}
+		RegistryAccess registries = server == null ? RegistryAccess.EMPTY : server.registryAccess();
 		validateGoalDraftPredicate(
 				predicate,
-				server.registryAccess(),
+				registries,
 				id -> {
+					if (server == null) return false;
 					Identifier identifier = Identifier.tryParse(id);
 					return identifier != null && server.getAdvancements().get(identifier) != null;
 				}
@@ -490,18 +538,76 @@ public final class CodexAgentManager {
 		return savedData.registry().queue(record.agentId(), compileGoal(prompt, sourceLevel), System.currentTimeMillis());
 	}
 
+	public GoalSubmission submitGoal(
+			String selector,
+			String prompt,
+			ServerLevel sourceLevel,
+			Optional<UUID> requestingPlayerId,
+			GoalSubmission.Operation operation,
+			GoalSpecRequestSink requestSink
+	) {
+		AgentRecord record = resolve(selector);
+		Objects.requireNonNull(requestingPlayerId, "requestingPlayerId must not be null");
+		Objects.requireNonNull(operation, "operation must not be null");
+		Objects.requireNonNull(requestSink, "requestSink must not be null");
+		GoalCompilation compilation = compileGoalResult(prompt, sourceLevel);
+		return GoalSubmissionFlow.route(
+				compilation,
+				spec -> switch (operation) {
+					case START -> savedData.registry().start(record.agentId(), spec, System.currentTimeMillis());
+					case QUEUE -> savedData.registry().queue(record.agentId(), spec, System.currentTimeMillis());
+				},
+				() -> translatedSubmissionDraft(record, prompt, sourceLevel, requestingPlayerId, operation),
+				this::stageGoalDraft,
+				requestSink
+		);
+	}
+
+	private PendingGoalDraft translatedSubmissionDraft(
+			AgentRecord record,
+			String prompt,
+			ServerLevel sourceLevel,
+			Optional<UUID> requestingPlayerId,
+			GoalSubmission.Operation operation
+	) {
+		UUID requester = PendingGoalDraft.requesterId(requestingPlayerId);
+		return new PendingGoalDraft(
+				UUID.randomUUID(), record.agentId(), requester, prompt,
+				sourceLevel.dimension().identifier().toString(),
+				goalCompiler.candidateIdsFor(prompt, server.registryAccess(), liveAdvancementTitles()),
+				goalCompiler.translationConstraintFor(prompt, server.registryAccess()), Optional.empty(),
+				operation == GoalSubmission.Operation.START ? DraftIntent.TRANSLATE_START : DraftIntent.TRANSLATE_QUEUE,
+				server.getTickCount(), record.goalRevision(), PendingGoalDraft.expectedGoalIdFor(record)
+		);
+	}
+
+	private Map<String, String> liveAdvancementTitles() {
+		LinkedHashMap<String, String> titles = new LinkedHashMap<>();
+		for (var advancement : server.getAdvancements().getAllAdvancements()) {
+			titles.put(
+					advancement.id().toString(),
+					advancement.value().display().map(display -> display.getTitle().getString()).orElse("")
+			);
+		}
+		return Map.copyOf(titles);
+	}
+
 	private GoalSpec compileGoal(String prompt, ServerLevel sourceLevel) {
-		GoalCompilation compilation = goalCompiler.compile(
+		GoalCompilation compilation = compileGoalResult(prompt, sourceLevel);
+		return compilation.acceptedSpec().orElseThrow(() -> new AgentDomainException(
+				"GOAL_REQUIRES_CLARIFICATION",
+				compilation.playerMessage()
+		));
+	}
+
+	private GoalCompilation compileGoalResult(String prompt, ServerLevel sourceLevel) {
+		return goalCompiler.compile(
 				prompt,
 				server.registryAccess(),
 				server.getTickCount(),
 				id -> server.getAdvancements().get(net.minecraft.resources.Identifier.parse(id)) != null,
 				Objects.requireNonNull(sourceLevel, "sourceLevel must not be null")
 		);
-		return compilation.acceptedSpec().orElseThrow(() -> new AgentDomainException(
-				"GOAL_REQUIRES_CLARIFICATION",
-				compilation.playerMessage()
-		));
 	}
 
 	public AgentTransition steer(String selector, String prompt) {
@@ -509,7 +615,7 @@ public final class CodexAgentManager {
 		return savedData.registry().steer(record.agentId(), prompt, System.currentTimeMillis());
 	}
 
-	public VanillaRespawnAttempt beginVanillaRespawn(AgentId agentId) {
+	private VanillaRespawnAttempt beginVanillaRespawn(AgentId agentId) {
 		AgentRecord record = savedData.registry().require(Objects.requireNonNull(agentId, "agentId must not be null"));
 		if (record.state() != dev.agaminggod.arenaagents.agent.AgentLifecycleState.DEAD) {
 			throw new AgentDomainException("AGENT_NOT_DEAD", "Only a dead Codex agent can be respawned");
@@ -527,13 +633,31 @@ public final class CodexAgentManager {
 			if (existing.isPresent()) {
 				ServerPlayer player = existing.orElseThrow();
 				AgentInputRuntime.clear(server, record.agentId());
-				if (AgentRespawnSpawnPolicy.existingPlayerAction(player.isAlive())
-						== AgentRespawnSpawnPolicy.ExistingPlayerAction.REMOVE_STALE_PLAYER) {
-					attempt.removalRequested = true;
-					OfflineAgentPlayers.remove(player);
+				AgentRespawnSpawnPolicy.ExistingPlayerAction action = AgentRespawnSpawnPolicy.existingPlayerAction(
+						retainedDeadPlayers().get(record.agentId()) == player,
+						player.isAlive()
+				);
+				switch (action) {
+					case RESPAWN_CONNECTED_PLAYER -> {
+						ServerPlayer replacement = OfflineAgentPlayers.respawnConnected(player);
+						retainedDeadPlayers().remove(record.agentId(), player);
+						attempt.connectedRespawn = true;
+						attempt.spawnRequested = true;
+						attempt.deadlineEpochMs = now + PLAYER_SPAWN_TIMEOUT_MS;
+						if (!OfflineAgentPlayers.isManagedFakePlayer(
+								replacement, record.agentId(), record.profile())) {
+							throw new AgentDomainException("PLAYER_SPAWN_FAILED", "Vanilla respawn changed the managed player identity");
+						}
+					}
+					case REMOVE_STALE_PLAYER -> {
+						attempt.removalRequested = true;
+						OfflineAgentPlayers.remove(player);
+					}
+					case WAIT_FOR_NATURAL_REMOVAL -> { }
 				}
 				pendingPlayerSpawns.put(record.agentId(), attempt.deadlineEpochMs());
 			} else {
+				retainedDeadPlayers().remove(record.agentId());
 				requestVanillaRespawnPlayer(attempt, now);
 			}
 			return attempt;
@@ -549,19 +673,21 @@ public final class CodexAgentManager {
 			throw new AgentDomainException("STALE_RESPAWN_ATTEMPT", "Dead lifecycle changed during respawn");
 		}
 		Optional<ServerPlayer> found = findAgentPlayer(attempt.deadRecord().agentId());
-		RespawnRemovalDecision removal = respawnRemovalDecision(
-				attempt.spawnRequested,
-				attempt.removalRequested,
-				found.isPresent(),
-				nowEpochMs,
-				attempt.removalGraceDeadlineEpochMs,
-				attempt.deadlineEpochMs
-		);
-		attempt.deadlineEpochMs = removal.deadlineEpochMs();
-		if (removal.requestRemoval()) {
-			attempt.removalRequested = true;
-			OfflineAgentPlayers.remove(found.orElseThrow());
-			return false;
+		if (!attempt.connectedRespawn) {
+			RespawnRemovalDecision removal = respawnRemovalDecision(
+					attempt.spawnRequested,
+					attempt.removalRequested,
+					found.isPresent(),
+					nowEpochMs,
+					attempt.removalGraceDeadlineEpochMs,
+					attempt.deadlineEpochMs
+			);
+			attempt.deadlineEpochMs = removal.deadlineEpochMs();
+			if (removal.requestRemoval()) {
+				attempt.removalRequested = true;
+				OfflineAgentPlayers.remove(found.orElseThrow());
+				return false;
+			}
 		}
 		AgentRespawnSpawnPolicy.Decision decision = AgentRespawnSpawnPolicy.decide(
 				attempt.spawnRequested, found.isPresent(), nowEpochMs, attempt.deadlineEpochMs()
@@ -582,6 +708,10 @@ public final class CodexAgentManager {
 		}
 		ServerPlayer player = found.orElseThrow();
 		if (!player.isAlive()) throw new AgentDomainException("PLAYER_SPAWN_FAILED", "Respawned player is not alive");
+		if (attempt.connectedRespawn) {
+			attempt.verifiedPlayer = player;
+			return true;
+		}
 		Vec3 finalPosition = attempt.target().finalPosition(player);
 		if (player.level() != attempt.target().level() || player.position().distanceToSqr(finalPosition) > 1.0E-8D
 				|| Math.abs(player.getYRot() - attempt.target().yaw()) > 0.001F || Math.abs(player.getXRot() - attempt.target().pitch()) > 0.001F) {
@@ -641,7 +771,7 @@ public final class CodexAgentManager {
 		ServerPlayer player = Objects.requireNonNull(attempt.verifiedPlayer, "respawn must be physically verified before commit");
 		Runnable rollbackWorld = () -> { };
 		try {
-			rollbackWorld = attempt.target().commitWorldEffects();
+			if (!attempt.connectedRespawn) rollbackWorld = attempt.target().commitWorldEffects();
 			AgentEntityLocation location = entityLocation(player);
 			AgentTransition transition = savedData.registry().respawnAtomically(
 					attempt.deadRecord().agentId(), player.getUUID(), location, System.currentTimeMillis(),
@@ -660,7 +790,7 @@ public final class CodexAgentManager {
 			return transition;
 		} catch (RuntimeException exception) {
 			rollbackWorld.run();
-			rollbackVanillaRespawn(attempt.deadRecord());
+			if (!attempt.connectedRespawn) rollbackVanillaRespawn(attempt.deadRecord());
 			throw exception;
 		}
 	}
@@ -672,6 +802,7 @@ public final class CodexAgentManager {
 	private void rollbackVanillaRespawn(AgentRecord deadRecord) {
 		releaseChunkTicket(deadRecord.agentId());
 		pendingPlayerSpawns.remove(deadRecord.agentId());
+		retainedDeadPlayers().remove(deadRecord.agentId());
 		AgentInputRuntime.clear(server, deadRecord.agentId());
 		OfflineAgentPlayers.find(server, deadRecord.agentId(), deadRecord.profile()).ifPresent(OfflineAgentPlayers::remove);
 	}
@@ -683,6 +814,8 @@ public final class CodexAgentManager {
 		private long deadlineEpochMs;
 		private boolean spawnRequested;
 		private boolean removalRequested;
+		private boolean connectedRespawn;
+		private long nextCommitAttemptEpochMs;
 		private ServerPlayer verifiedPlayer;
 
 		private VanillaRespawnAttempt(
@@ -716,12 +849,16 @@ public final class CodexAgentManager {
 		}
 		for (AgentRecord record : records()) {
 			if (record.state() == dev.agaminggod.arenaagents.agent.AgentLifecycleState.DEAD) {
+				ServerPlayer retained = retainedDeadPlayers().get(record.agentId());
+				if (retained != null && findAgentPlayer(record.agentId()).filter(player -> player == retained).isEmpty()) {
+					retainedDeadPlayers().remove(record.agentId(), retained);
+				}
 				pendingEntityRecoveries.remove(record.agentId());
 				if (record.respawnPolicy() == dev.agaminggod.arenaagents.agent.RespawnPolicy.RESPAWN_AUTOMATICALLY
 						&& !pendingVerifiedRespawns.containsKey(record.agentId())
 						&& pendingPlayerSpawns.getOrDefault(record.agentId(), 0L) <= now) {
 					try {
-						pendingVerifiedRespawns.put(record.agentId(), beginVanillaRespawn(record.agentId()));
+						requestVerifiedRespawn(record.agentId());
 					} catch (RuntimeException exception) {
 						scheduleRecoveryRetry(record.agentId(), now);
 						LOGGER.warn("Could not begin automatic respawn for agent {}", record.agentId(), exception);
@@ -729,7 +866,56 @@ public final class CodexAgentManager {
 				}
 				continue;
 			}
+			retainedDeadPlayers().remove(record.agentId());
+			if (pendingLegacyCanonicalRemovals().contains(record.agentId())) {
+				Optional<ServerPlayer> rejectedCanonical = findAgentPlayer(record.agentId());
+				if (rejectedCanonical.isPresent()) {
+					try {
+						OfflineAgentPlayers.remove(rejectedCanonical.orElseThrow());
+					} catch (RuntimeException exception) {
+						LOGGER.warn("Could not finish rolling back canonical migration player for agent {}",
+								record.agentId(), exception);
+					}
+					scheduleRecoveryRetry(record.agentId(), now);
+					continue;
+				}
+				pendingLegacyCanonicalRemovals().remove(record.agentId());
+			}
+			OfflineAgentPlayers.LegacyBodyMigration legacyMigration = pendingLegacyMigrations().get(record.agentId());
+			if (legacyMigration == null
+					&& pendingPlayerSpawns.getOrDefault(record.agentId(), 0L) > now
+					&& findAgentPlayer(record.agentId()).isEmpty()) {
+				continue;
+			}
+			if (legacyMigration == null) {
+				try {
+					legacyMigration = OfflineAgentPlayers.stageConnectedLegacyMigration(
+							server, record.agentId(), record.profile()).orElse(null);
+					if (legacyMigration != null) pendingLegacyMigrations().put(record.agentId(), legacyMigration);
+				} catch (RuntimeException exception) {
+					scheduleRecoveryRetry(record.agentId(), now);
+					LOGGER.warn("Could not stage legacy player migration for agent {}", record.agentId(), exception);
+					continue;
+				}
+			}
 			Optional<ServerPlayer> player = findAgentPlayer(record.agentId());
+			if (player.isPresent() && legacyMigration != null) {
+				try {
+					OfflineAgentPlayers.completeConnectedLegacyMigration(legacyMigration, player.orElseThrow());
+					pendingLegacyMigrations().remove(record.agentId(), legacyMigration);
+				} catch (RuntimeException exception) {
+					pendingLegacyCanonicalRemovals().add(record.agentId());
+					try {
+						OfflineAgentPlayers.remove(player.orElseThrow());
+					} catch (RuntimeException cleanupFailure) {
+						exception.addSuppressed(cleanupFailure);
+					}
+					pendingPlayerSpawns.remove(record.agentId());
+					scheduleRecoveryRetry(record.agentId(), now);
+					LOGGER.warn("Could not commit legacy player migration for agent {}", record.agentId(), exception);
+					continue;
+				}
+			}
 			if (player.isPresent() && player.get().isAlive()) {
 				pendingPlayerSpawns.remove(record.agentId());
 				seenPlayers.add(record.agentId());
@@ -744,10 +930,7 @@ public final class CodexAgentManager {
 					);
 					lastLocationPersistenceEpochMs.put(record.agentId(), now);
 				}
-				// Identity and status belong in the field console, not as noisy world-space labels.
-				player.get().setCustomName(null);
-				player.get().setCustomNameVisible(false);
-				hideWorldName(player.get());
+				applyWorldIdentity(player.get(), attached);
 				trackChunkTicket(record.agentId(), player.get(), now);
 				publishPendingRegistration(attached);
 				if (pendingEntityRecoveries.remove(record.agentId())
@@ -796,7 +979,7 @@ public final class CodexAgentManager {
 			currentPlayerNames.add(AgentIdentity.playerName(record.agentId(), record.profile()));
 		}
 		groupSavedData.registry().retainMembers(currentIds);
-		PlayerTeam team = server.getScoreboard().getPlayerTeam(HIDDEN_AGENT_TEAM);
+		PlayerTeam team = server.getScoreboard().getPlayerTeam(LEGACY_HIDDEN_AGENT_TEAM);
 		if (team == null) return;
 		for (String trackedName : staleHiddenTeamMembers(team.getPlayers(), currentPlayerNames)) {
 			server.getScoreboard().removePlayerFromTeam(trackedName, team);
@@ -841,14 +1024,57 @@ public final class CodexAgentManager {
 		return record;
 	}
 
-	private void requestVerifiedRespawn(AgentId agentId) {
-		if (pendingVerifiedRespawns.containsKey(agentId)) return;
+	public VanillaRespawnAttempt requestVerifiedRespawn(AgentId agentId) {
+		VanillaRespawnAttempt pending = pendingVerifiedRespawns.get(agentId);
+		if (pending != null) return pending;
 		long now = System.currentTimeMillis();
 		if (pendingPlayerSpawns.getOrDefault(agentId, 0L) > now) {
 			throw new AgentDomainException("RESPAWN_ALREADY_PENDING", "The agent player is already respawning");
 		}
-		pendingVerifiedRespawns.put(agentId, beginVanillaRespawn(agentId));
+		return singleFlight(pendingVerifiedRespawns, agentId, () -> beginVanillaRespawn(agentId));
 	}
+
+	public boolean cancelVerifiedRespawn(VanillaRespawnAttempt attempt) {
+		Objects.requireNonNull(attempt, "attempt must not be null");
+		if (!abortPendingVerifiedRespawn(pendingVerifiedRespawns, attempt)) return false;
+		rollbackVanillaRespawn(attempt);
+		return true;
+	}
+
+	static boolean abortPendingVerifiedRespawn(
+			Map<AgentId, VanillaRespawnAttempt> pending,
+			VanillaRespawnAttempt attempt
+	) {
+		Objects.requireNonNull(pending, "pending must not be null");
+		Objects.requireNonNull(attempt, "attempt must not be null");
+		return pending.remove(attempt.deadRecord().agentId(), attempt);
+	}
+
+	static <T> T singleFlight(Map<AgentId, T> inFlight, AgentId agentId, Supplier<T> start) {
+		Objects.requireNonNull(inFlight, "inFlight must not be null");
+		Objects.requireNonNull(agentId, "agentId must not be null");
+		Objects.requireNonNull(start, "start must not be null");
+		T existing = inFlight.get(agentId);
+		if (existing != null) return existing;
+		T started = Objects.requireNonNull(start.get(), "start must return an attempt");
+		inFlight.put(agentId, started);
+		return started;
+	}
+
+	public VerifiedRespawnState verifiedRespawnState(VanillaRespawnAttempt attempt) {
+		Objects.requireNonNull(attempt, "attempt must not be null");
+		AgentId agentId = attempt.deadRecord().agentId();
+		AgentRecord current = savedData.registry().require(agentId);
+		if (!current.equals(attempt.deadRecord())) {
+			return current.state() != dev.agaminggod.arenaagents.agent.AgentLifecycleState.DEAD
+					&& findAgentPlayer(agentId).filter(ServerPlayer::isAlive).isPresent()
+					? VerifiedRespawnState.SUCCEEDED : VerifiedRespawnState.FAILED;
+		}
+		return pendingVerifiedRespawns.get(agentId) == attempt
+				? VerifiedRespawnState.PENDING : VerifiedRespawnState.FAILED;
+	}
+
+	public enum VerifiedRespawnState { PENDING, SUCCEEDED, FAILED }
 
 	private AgentGroupSpawnCoordinator.MemberStatus ensureGroupMemberPresent(AgentId agentId) {
 		AgentRecord record;
@@ -874,6 +1100,7 @@ public final class CodexAgentManager {
 		for (Map.Entry<AgentId, VanillaRespawnAttempt> entry : List.copyOf(pendingVerifiedRespawns.entrySet())) {
 			AgentId agentId = entry.getKey();
 			VanillaRespawnAttempt attempt = entry.getValue();
+			if (nowEpochMs < attempt.nextCommitAttemptEpochMs) continue;
 			try {
 				if (!verifyVanillaRespawn(attempt, nowEpochMs)) continue;
 				commitVanillaRespawn(attempt, (transition, commit) -> {
@@ -882,6 +1109,13 @@ public final class CodexAgentManager {
 				});
 				pendingVerifiedRespawns.remove(agentId, attempt);
 			} catch (RuntimeException exception) {
+				boolean replacementAlive = findAgentPlayer(agentId).filter(ServerPlayer::isAlive).isPresent();
+				boolean deadRecordCurrent = savedData.registry().require(agentId).equals(attempt.deadRecord());
+				if (shouldRetryConnectedRespawn(attempt.connectedRespawn, replacementAlive, deadRecordCurrent)) {
+					attempt.nextCommitAttemptEpochMs = nowEpochMs + 1_000L;
+					LOGGER.warn("Could not publish connected respawn for agent {}; retrying in place", agentId, exception);
+					continue;
+				}
 				pendingVerifiedRespawns.remove(agentId, attempt);
 				rollbackVanillaRespawn(attempt);
 				scheduleRecoveryRetry(agentId, nowEpochMs);
@@ -890,12 +1124,35 @@ public final class CodexAgentManager {
 		}
 	}
 
+	static boolean shouldRetryConnectedRespawn(
+			boolean connectedRespawn,
+			boolean replacementAlive,
+			boolean deadRecordCurrent
+	) {
+		return connectedRespawn && replacementAlive && deadRecordCurrent;
+	}
+
 	private void releasePendingVerifiedRespawns() {
 		Runnable[] cleanupSteps = List.copyOf(pendingVerifiedRespawns.values()).stream()
 				.map(attempt -> (Runnable) () -> rollbackVanillaRespawn(attempt))
 				.toArray(Runnable[]::new);
 		pendingVerifiedRespawns.clear();
 		runCleanupSteps(cleanupSteps);
+	}
+
+	/** Keeps a managed dead fake player connected so vanilla can replace it without leave/join broadcasts. */
+	public boolean retainConnectedDeath(ServerPlayer player) {
+		Objects.requireNonNull(player, "player must not be null");
+		Optional<AgentRecord> matchedRecord = records().stream()
+				.filter(record -> record.state() == dev.agaminggod.arenaagents.agent.AgentLifecycleState.DEAD)
+				.filter(record -> record.respawnPolicy() != dev.agaminggod.arenaagents.agent.RespawnPolicy.REMOVE_ON_DEATH)
+				.filter(record -> OfflineAgentPlayers.isManagedFakePlayer(player, record.agentId(), record.profile()))
+				.findFirst();
+		if (matchedRecord.isEmpty()) return false;
+		AgentId agentId = matchedRecord.orElseThrow().agentId();
+		OfflineAgentPlayers.retainConnectedDeath(player);
+		retainedDeadPlayers().put(agentId, player);
+		return true;
 	}
 
 	public boolean captureDeath(ServerPlayer player, DamageSource source) {
@@ -955,17 +1212,23 @@ public final class CodexAgentManager {
 	}
 
 
-	private void hideWorldName(ServerPlayer player) {
-		PlayerTeam team = server.getScoreboard().getPlayerTeam(HIDDEN_AGENT_TEAM);
-		if (team == null) {
-			team = server.getScoreboard().addPlayerTeam(HIDDEN_AGENT_TEAM);
-			team.setNameTagVisibility(Team.Visibility.NEVER);
+	private void applyWorldIdentity(ServerPlayer player, AgentRecord record) {
+		PlayerTeam hidden = server.getScoreboard().getPlayerTeam(LEGACY_HIDDEN_AGENT_TEAM);
+		if (hidden != null && server.getScoreboard().getPlayersTeam(player.getScoreboardName()) == hidden) {
+			server.getScoreboard().removePlayerFromTeam(player.getScoreboardName(), hidden);
 		}
-		server.getScoreboard().addPlayerToTeam(player.getScoreboardName(), team);
+		player.setCustomName(Component.literal(displayName(record)));
+		player.setCustomNameVisible(true);
+		String stylePath = "agent/" + record.profile().visualIdentity().transportCode();
+		ResourceKey<WaypointStyleAsset> style = ResourceKey.create(
+				WaypointStyleAssets.ROOT_ID,
+				Identifier.fromNamespaceAndPath("arenaagents", stylePath)
+		);
+		player.waypointIcon().style = style;
 	}
 
 	private void removeHiddenWorldName(String playerName) {
-		PlayerTeam team = server.getScoreboard().getPlayerTeam(HIDDEN_AGENT_TEAM);
+		PlayerTeam team = server.getScoreboard().getPlayerTeam(LEGACY_HIDDEN_AGENT_TEAM);
 		if (team != null && team.getPlayers().contains(playerName)) {
 			server.getScoreboard().removePlayerFromTeam(playerName, team);
 			if (team.getPlayers().isEmpty()) server.getScoreboard().removePlayerTeam(team);
@@ -1262,12 +1525,21 @@ public final class CodexAgentManager {
 	public AgentRecord remove(String selector) {
 		AgentRecord record = resolve(selector);
 		Optional<ServerPlayer> player = findAgentPlayer(record.agentId());
+		OfflineAgentPlayers.LegacyBodyMigration pendingLegacy = pendingLegacyMigrations().get(record.agentId());
+		Optional<ServerPlayer> legacyPlayer = pendingLegacy == null
+				? OfflineAgentPlayers.findLegacyPlayer(server, record.agentId(), record.profile())
+				: Optional.of(pendingLegacy.legacyPlayer());
+		retainedDeadPlayers().remove(record.agentId());
 		AgentInputRuntime.clear(server, record.agentId());
 		long terminalRevision = record.goalRevision() == Long.MAX_VALUE
 				? Long.MAX_VALUE
 				: record.goalRevision() + 1L;
 		AgentRecord removed = runtimeHooks.withinPublicationBoundary(() -> deleteAfterRequiredCleanup(
-				() -> player.ifPresent(OfflineAgentPlayers::remove),
+				() -> {
+					player.ifPresent(OfflineAgentPlayers::remove);
+					legacyPlayer.filter(legacy -> player.filter(legacy::equals).isEmpty())
+							.ifPresent(OfflineAgentPlayers::remove);
+				},
 				() -> AgentRemovalCoordinator.removeRegistryFirst(
 						savedData.registry(),
 						record.agentId(),
@@ -1286,6 +1558,9 @@ public final class CodexAgentManager {
 									},
 									() -> pendingAgentRegistrations.remove(record.agentId()),
 									() -> pendingEntityRecoveries.remove(record.agentId()),
+									() -> pendingLegacyMigrations().remove(record.agentId()),
+									() -> pendingLegacyCanonicalRemovals().remove(record.agentId()),
+									() -> retainedDeadPlayers().remove(record.agentId()),
 									() -> seenPlayers.remove(record.agentId()),
 									() -> removeHiddenWorldName(AgentIdentity.playerName(
 											record.agentId(), record.profile())),

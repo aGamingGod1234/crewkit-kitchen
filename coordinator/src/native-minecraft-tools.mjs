@@ -10,16 +10,24 @@ import { validateAction } from './schema.mjs';
 const MAX_TOOL_RESULT_BYTES = 16_384;
 const COORDINATE_LIMIT = 30_000_000;
 const MAX_SEQUENCE_ACTIONS = 8;
+const MAX_LOOK_AROUND_STEPS = 8;
+const MAX_LOOK_AROUND_TICKS = 20;
 const NATIVE_ACTION_TYPES = Object.freeze(Object.keys(ACTION_FIELDS));
 
-export const NATIVE_AGENT_INSTRUCTIONS = `You control one live Minecraft player. You are the only brain choosing what it does.
+export const NATIVE_AGENT_INSTRUCTIONS = `You control one live Minecraft player and choose every action.
 
-Act as soon as it is safe. Do not wait to solve the whole goal and do not narrate a plan. Call the smallest useful Minecraft tool now, inspect its factual result, then choose the next tool. Keep each decision local and brief even when your configured reasoning effort is high.
+Act as soon as it is safe. Do not wait to solve the whole goal or narrate a plan. Call the smallest useful tool, inspect its factual result, then choose the next. Keep decisions brief even with high reasoning.
 
-Use observe only when the latest event and tool results lack needed facts. The goalSpec predicate is Minecraft's immutable completion contract; choose action arguments that satisfy it exactly. Use moveTo, mine, say, and wait for common operations. moveTo uses bounded loaded waypoints and may time out before a distant destination. Use act for another supported player action. Use sequence for a short exact chain you can choose now; it stops on the first failed action. Call finish only to ask Minecraft to verify the immutable active goal. Minecraft decides whether the goal is complete and returns expected and observed facts. If verification fails, use those facts and continue working. Never claim an action happened unless its tool result confirms it. When an event has mode conversation_only, only observe if necessary and reply through say; do not take a physical action or call finish. Plain assistant text is not visible in Minecraft, so communicate through say. For nearby voice, say at most 12 words with audience proximity, then immediately call the first physical tool because speech playback is asynchronous.`;
+Use observe when facts are missing or stale. goalSpec is Minecraft's immutable completion contract. observe includes close-up interactable blocks and sparse first-visible landmarks out to the loaded view distance; landmarks are guidance, so walk/look at them and re-observe before mining. Use lookAround for a bounded camera sweep when the current view misses useful terrain. Use control for normal exploration and traversal; use moveTo only for a short confirmed waypoint. Mine only an observed, visible, in-range block: copy exact rayTarget coordinates and non-air blockId into expectedBlockId. If it is not under the crosshair, use act/look_at, observe, then mine. Use sequence for 2+ safe actions with factual arguments, keep it short, split when later arguments depend on results, and never batch speculative navigation or combat. It stops on the first failure. Use act for supported actions. finish only asks Minecraft to verify the goal. Never claim an action unless its result confirms it. conversation_only: use say, with no physical action or finish. Plain text is not visible. For nearby voice, say at most 12 words with proximity, then call the first physical tool because speech playback is asynchronous.`;
 
 export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
-	tool('observe', 'Return the latest compact player, inventory, nearby block, entity, goal, and conversation facts.', objectSchema({})),
+	tool('observe', 'Return the latest compact player, inventory, close-up block, farther visible landmark, entity, goal, and conversation facts.', objectSchema({})),
+	tool('lookAround', 'Turn the player through 2 to 8 short camera steps; call observe afterward to inspect the newly visible landmarks.', objectSchema({
+		centerYaw: numberSchema(-180, 180),
+		pitch: numberSchema(-90, 90),
+		steps: integerSchema(2, MAX_LOOK_AROUND_STEPS),
+		ticksPerStep: integerSchema(1, MAX_LOOK_AROUND_TICKS),
+	}, ['centerYaw', 'pitch', 'steps', 'ticksPerStep'])),
 	tool('control', 'Hold one complete player input frame for 1 to 200 server ticks. Use for precise movement, jumps, attacks, item use, view, and hotbar control.', objectSchema({
 		forward: numberSchema(-1, 1),
 		strafe: numberSchema(-1, 1),
@@ -34,7 +42,7 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 		hand: { type: 'string', enum: ['main', 'off'] },
 		ticks: integerSchema(1, 200),
 	}, ['forward', 'strafe', 'jump', 'sneak', 'sprint', 'attack', 'use', 'yaw', 'pitch', 'selectedSlot', 'hand', 'ticks'])),
-	tool('moveTo', 'Navigate toward one coordinate through bounded loaded safe waypoints and wait for success or a factual failure/timeout.', objectSchema({
+	tool('moveTo', 'Navigate toward one short, confirmed waypoint through bounded loaded safe waypoints; use control for ordinary exploration.', objectSchema({
 		x: numberSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT),
 		y: numberSchema(-2_048, 2_048),
 		z: numberSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT),
@@ -42,12 +50,13 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 		sprint: { type: 'boolean' },
 		timeoutMs: integerSchema(1, 120_000),
 	}, ['x', 'y', 'z'])),
-	tool('mine', 'Mine one known block coordinate and wait for the body result.', objectSchema({
+	tool('mine', 'Mine one observed, visible, in-range block coordinate with its exact current blockId.', objectSchema({
 		x: integerSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT),
 		y: integerSchema(-2_048, 2_048),
 		z: integerSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT),
+		expectedBlockId: { type: 'string', minLength: 1, maxLength: MAX_IDENTIFIER_LENGTH },
 		timeoutMs: integerSchema(1, 120_000),
-	}, ['x', 'y', 'z'])),
+	}, ['x', 'y', 'z', 'expectedBlockId'])),
 	tool('say', 'Send public chat, a private message, or nearby proximity speech.', objectSchema({
 		message: { type: 'string', minLength: 1, maxLength: MAX_CHAT_LENGTH },
 		audience: { type: 'string', enum: ['public', 'direct', 'proximity'] },
@@ -60,7 +69,7 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 		actionType: { type: 'string', enum: NATIVE_ACTION_TYPES },
 		arguments: { type: 'object' },
 	}, ['actionType', 'arguments'])),
-	tool('sequence', 'Execute 2 to 8 exact actions in order, stopping on the first factual failure.', objectSchema({
+	tool('sequence', 'Prefer sequence for safe 2+ action chains. Execute 2 to 8 exact model-authored actions in order, stopping on the first factual failure; use separate calls when a later step needs fresh facts.', objectSchema({
 		actions: {
 			type: 'array', minItems: 2, maxItems: MAX_SEQUENCE_ACTIONS,
 			items: objectSchema({ actionType: { type: 'string', enum: NATIVE_ACTION_TYPES }, arguments: { type: 'object' } }, ['actionType', 'arguments']),
@@ -77,6 +86,15 @@ export function normalizeMinecraftToolCall(name, value) {
 		case 'observe':
 			requireExactKeys(args, []);
 			return { kind: 'observe' };
+		case 'lookAround':
+			requireExactKeys(args, ['centerYaw', 'pitch', 'steps', 'ticksPerStep']);
+			return {
+				kind: 'lookAround',
+				centerYaw: finiteNumber(args.centerYaw, 'centerYaw', -180, 180),
+				pitch: finiteNumber(args.pitch, 'pitch', -90, 90),
+				steps: integer(args.steps, 'steps', 2, MAX_LOOK_AROUND_STEPS),
+				ticksPerStep: integer(args.ticksPerStep, 'ticksPerStep', 1, MAX_LOOK_AROUND_TICKS),
+			};
 		case 'control':
 			requireExactKeys(args, ['forward', 'strafe', 'jump', 'sneak', 'sprint', 'attack', 'use', 'yaw', 'pitch', 'selectedSlot', 'hand', 'ticks']);
 			try {
@@ -104,7 +122,7 @@ export function normalizeMinecraftToolCall(name, value) {
 				},
 			};
 		case 'mine':
-			requireExactKeys(args, ['x', 'y', 'z', 'timeoutMs']);
+			requireExactKeys(args, ['x', 'y', 'z', 'expectedBlockId', 'timeoutMs']);
 			return {
 				kind: 'action',
 				actionType: 'break_block',
@@ -112,6 +130,7 @@ export function normalizeMinecraftToolCall(name, value) {
 					x: integer(args.x, 'x', -COORDINATE_LIMIT, COORDINATE_LIMIT),
 					y: integer(args.y, 'y', -2_048, 2_048),
 					z: integer(args.z, 'z', -COORDINATE_LIMIT, COORDINATE_LIMIT),
+					expectedBlockId: boundedText(args.expectedBlockId, 'expectedBlockId', MAX_IDENTIFIER_LENGTH),
 					timeoutMs: optionalInteger(args.timeoutMs, 15_000, 'timeoutMs', 1, 120_000),
 				},
 			};
@@ -136,6 +155,10 @@ export function normalizeMinecraftToolCall(name, value) {
 			requireExactKeys(args, ['actionType', 'arguments']);
 			if (typeof args.actionType !== 'string' || !NATIVE_ACTION_TYPES.includes(args.actionType)) invalid('actionType is not supported');
 			const actionArguments = requireObject(args.arguments);
+			if (args.actionType === 'break_block') {
+				const normalized = normalizeMinecraftToolCall('mine', actionArguments);
+				return { kind: 'action', actionType: normalized.actionType, arguments: normalized.arguments };
+			}
 			try {
 				const normalizedArguments = stripActionType(validateAction({ type: args.actionType, ...actionArguments }));
 				return { kind: 'action', actionType: args.actionType, arguments: normalizedArguments };
@@ -182,11 +205,47 @@ function normalizeSequenceAction(value) {
 
 export function toolResultContent(value, success = true) {
 	let text = JSON.stringify(value ?? null);
+	if (Buffer.byteLength(text, 'utf8') > MAX_TOOL_RESULT_BYTES && isSequenceResult(value)) {
+		text = JSON.stringify(compactSequenceResult(value));
+	}
 	if (Buffer.byteLength(text, 'utf8') > MAX_TOOL_RESULT_BYTES) {
 		text = JSON.stringify({ state: 'TRUNCATED', detail: 'Tool result exceeded the coordinator limit. Call observe for fresh compact facts.' });
 	}
 	return { success, contentItems: [{ type: 'inputText', text }] };
 }
+
+function isSequenceResult(value) {
+	return value !== null && typeof value === 'object' && !Array.isArray(value) && Array.isArray(value.results);
+}
+
+function compactSequenceResult(value) {
+	const sourceResults = value.results.slice(0, MAX_SEQUENCE_ACTIONS);
+	const result = {
+		state: boundedResultField(value.state, 64),
+		completed: safeResultInteger(value.completed),
+		...(safeResultInteger(value.failedAt) === null ? {} : { failedAt: safeResultInteger(value.failedAt) }),
+		results: sourceResults.map((step) => ({
+			actionType: boundedResultField(step?.actionType, 64),
+			state: boundedResultField(step?.state, 64),
+			reasonCode: boundedResultField(step?.reasonCode, 128),
+			...(step?.executionStarted === undefined ? {} : { executionStarted: step.executionStarted === true }),
+			...(step?.physicalAttempted === undefined ? {} : { physicalAttempted: step.physicalAttempted === true }),
+		})),
+	};
+	let omittedObservations = sourceResults.length !== value.results.length;
+	for (let index = 0; index < sourceResults.length; index += 1) {
+		const observation = sourceResults[index]?.actionObservation;
+		if (observation === undefined) continue;
+		const candidate = { ...result, results: result.results.map((step, stepIndex) => stepIndex === index ? { ...step, actionObservation: observation } : step) };
+		if (Buffer.byteLength(JSON.stringify(candidate), 'utf8') <= MAX_TOOL_RESULT_BYTES) result.results[index] = candidate.results[index];
+		else omittedObservations = true;
+	}
+	if (omittedObservations) result.detail = 'Some per-action observations were omitted by the coordinator result limit; call observe for fresh compact facts.';
+	return result;
+}
+
+function boundedResultField(value, maximum) { return String(value ?? '').slice(0, maximum); }
+function safeResultInteger(value) { return Number.isSafeInteger(value) ? value : null; }
 
 function tool(name, description, inputSchema) {
 	return Object.freeze({ type: 'function', name, description, inputSchema: Object.freeze(inputSchema) });

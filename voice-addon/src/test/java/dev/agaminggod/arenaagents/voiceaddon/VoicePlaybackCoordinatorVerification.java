@@ -29,6 +29,7 @@ final class VoicePlaybackCoordinatorVerification {
 		assertions += verifyStopFailureCannotBlockReplacement();
 		assertions += verifyStopReplacementAndCloseCancelPendingSynthesis();
 		assertions += verifyFailuresCompleteAndDoNotWedgeLaterSpeech();
+		assertions += verifyAsynchronousStreamFailureRequestsTextFallback();
 		assertions += verifyUnavailableWorkerReportsSafeDiagnostic();
 		assertions += verifyDiagnosticsReportOnlyStateTransitions();
 		assertions += verifyStartFailureWinsOverSynchronousStopCallback();
@@ -250,6 +251,22 @@ final class VoicePlaybackCoordinatorVerification {
 		return 1;
 	}
 
+	private static int verifyAsynchronousStreamFailureRequestsTextFallback() {
+		RecordingSynthesizer synthesizer = new RecordingSynthesizer();
+		RecordingTransport transport = new RecordingTransport();
+		VoicePlaybackCoordinator coordinator = new VoicePlaybackCoordinator(synthesizer, Runnable::run, transport);
+		coordinator.registerAgent(AGENT, ENTITY);
+		CompletableFuture<VoiceReceipt> receipt = coordinator.speak(request(52L)).toCompletableFuture();
+		synthesizer.completeNext(new short[] { 1, 2 });
+		transport.created.getFirst().playback.fail();
+		assertEquals(VoiceReceipt.Status.DEGRADED_TO_TEXT, receipt.join().status(),
+				"asynchronous stream failure degrades to text");
+		assertEquals(true, receipt.join().requiresTextFallback(),
+				"asynchronous stream failure requests text fallback");
+		coordinator.close();
+		return 2;
+	}
+
 	private static int verifyUnregisterAndCloseStopPlayback() {
 		RecordingSynthesizer synthesizer = new RecordingSynthesizer();
 		RecordingTransport transport = new RecordingTransport();
@@ -324,10 +341,13 @@ final class VoicePlaybackCoordinatorVerification {
 				UUID entityId,
 				int radius,
 				short[] samples,
-				Runnable onStopped
+				Runnable onStopped,
+				Runnable onFailed
 		) {
 			if (createFailure != null) throw createFailure;
-			RecordingPlayback playback = new RecordingPlayback(onStopped, startFailure, stopFailure, stopCompletes);
+			RecordingPlayback playback = new RecordingPlayback(
+					onStopped, onFailed, startFailure, stopFailure, stopCompletes
+			);
 			created.add(new CreatedPlayback(agentId, entityId, radius, samples.clone(), playback));
 			return playback;
 		}
@@ -335,6 +355,7 @@ final class VoicePlaybackCoordinatorVerification {
 
 	private static final class RecordingPlayback implements VoicePlaybackCoordinator.Playback {
 		private final Runnable onStopped;
+		private final Runnable onFailed;
 		private final RuntimeException startFailure;
 		private final RuntimeException stopFailure;
 		private final boolean stopCompletes;
@@ -343,11 +364,13 @@ final class VoicePlaybackCoordinatorVerification {
 
 		private RecordingPlayback(
 				Runnable onStopped,
+				Runnable onFailed,
 				RuntimeException startFailure,
 				RuntimeException stopFailure,
 				boolean stopCompletes
 		) {
 			this.onStopped = onStopped;
+			this.onFailed = onFailed;
 			this.startFailure = startFailure;
 			this.stopFailure = stopFailure;
 			this.stopCompletes = stopCompletes;
@@ -368,6 +391,10 @@ final class VoicePlaybackCoordinatorVerification {
 
 		private void finish() {
 			onStopped.run();
+		}
+
+		private void fail() {
+			onFailed.run();
 		}
 	}
 

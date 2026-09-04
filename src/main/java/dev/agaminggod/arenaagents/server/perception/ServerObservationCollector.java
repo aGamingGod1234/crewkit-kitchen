@@ -33,6 +33,7 @@ import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.BlockHitResult;
@@ -43,8 +44,16 @@ public final class ServerObservationCollector {
 	public static final int MAX_BLOCKS = 128;
 	public static final int BLOCK_RADIUS = 6;
 	public static final int MAX_BLOCKS_PER_TYPE = 8;
+	/** Sparse first-surface hits let the agent see structures and resources at player-like distances. */
+	public static final int MAX_LANDMARKS = 32;
+	public static final int LANDMARK_SIGHT_DISTANCE = 256;
 	static final int MAX_BLOCK_VISIBILITY_CHECKS = MAX_BLOCKS * 4;
 	static final int MAX_BLOCK_VISIBILITY_CHECKS_PER_TYPE = MAX_BLOCKS_PER_TYPE * 4;
+	private static final int MAX_LANDMARK_VISIBILITY_CHECKS = MAX_LANDMARKS * 3;
+	private static final int[] SIGHT_YAW_OFFSETS = {
+		-42, -35, -28, -21, -14, -7, 0, 7, 14, 21, 28, 35, 42
+	};
+	private static final int[] SIGHT_PITCH_OFFSETS = {-24, -16, -8, 0, 8, 16, 24};
 	public static final int MAX_NEARBY_TRANSACTION_TARGETS = 16;
 	public static final int MAX_OBSERVATION_TAGS = 32;
 	public static final int MAX_TAG_COUNT_ENTRIES = 128;
@@ -122,6 +131,7 @@ public final class ServerObservationCollector {
 		observation.add("entities", entities(level, agent, visibility));
 		JsonObject spatial = spatialObservation(agentId, level, agent, visibility);
 		observation.add("blocks", spatial.get("blocks"));
+		observation.add("landmarks", spatial.get("landmarks"));
 		observation.add("nearbyContainers", spatial.get("nearbyContainers"));
 		JsonObject world = new JsonObject();
 		world.addProperty("dimension", level.dimension().identifier().toString());
@@ -198,9 +208,10 @@ public final class ServerObservationCollector {
 		RawSpatialObservation.Key previous = spatialKeys.put(agentId, key);
 		if (previous != null && !previous.equals(key)) spatialCache.invalidate(previous);
 		RawSpatialObservation raw = spatialCache.getOrCompute(
-				key, level.getGameTime(), () -> rawSpatialObservation(level, agent, position));
+			key, level.getGameTime(), () -> rawSpatialObservation(level, agent, position));
 		JsonObject value = new JsonObject();
 		value.add("blocks", blocks(level, agent, raw.blocks(), visibility));
+		value.add("landmarks", landmarks(level, agent, visibility));
 		value.add("nearbyContainers", nearbyTransactionTargets(agent, raw.containers(), visibility));
 		return value;
 	}
@@ -511,6 +522,46 @@ public final class ServerObservationCollector {
 				containers.stream().limit(MAX_NEARBY_TRANSACTION_TARGETS * 4L).toList());
 	}
 
+	private static boolean isVisualLandmark(String blockId) {
+		String path = blockId.substring(blockId.indexOf(':') + 1);
+		return path.endsWith("_log") || path.endsWith("_wood") || path.endsWith("_ore")
+				|| path.endsWith("_leaves") || path.endsWith("_flower") || path.endsWith("_mushroom")
+				|| path.equals("cobblestone") || path.equals("mossy_cobblestone")
+				|| path.endsWith("_stone_bricks") || path.endsWith("_brick") || path.endsWith("_bricks")
+				|| path.endsWith("_planks") || path.equals("glass") || path.equals("glass_pane")
+				|| path.endsWith("_glass") || path.endsWith("_glass_pane")
+				|| path.endsWith("_terracotta") || path.endsWith("_concrete")
+				|| path.endsWith("_wall") || path.endsWith("_stairs") || path.endsWith("_slab")
+				|| path.equals("water") || path.equals("lava") || path.equals("crafting_table")
+				|| path.equals("furnace") || path.equals("chest") || path.equals("barrel")
+				|| path.contains("portal") || path.equals("hay_block") || path.equals("pumpkin")
+				|| path.equals("melon") || path.equals("torch") || path.endsWith("_torch")
+				|| path.equals("lantern") || path.equals("soul_lantern") || path.equals("bell")
+				|| path.equals("campfire") || path.equals("soul_campfire") || path.equals("bookshelf");
+	}
+
+	private static int landmarkPriority(String blockId) {
+		String path = blockId.substring(blockId.indexOf(':') + 1);
+		if (path.endsWith("_log") || path.endsWith("_wood")) return 0;
+		if (isStructureLandmark(path)) return 1;
+		if (path.endsWith("_ore")) return 2;
+		if (path.equals("water") || path.equals("lava") || path.contains("portal")) return 3;
+		if (path.equals("crafting_table") || path.equals("furnace") || path.equals("chest") || path.equals("barrel")) return 4;
+		return 5;
+	}
+
+	private static boolean isStructureLandmark(String path) {
+		return path.equals("cobblestone") || path.equals("mossy_cobblestone")
+				|| path.endsWith("_stone_bricks") || path.endsWith("_brick") || path.endsWith("_bricks")
+				|| path.endsWith("_planks") || path.equals("glass") || path.equals("glass_pane")
+				|| path.endsWith("_glass") || path.endsWith("_glass_pane")
+				|| path.endsWith("_terracotta") || path.endsWith("_concrete")
+				|| path.endsWith("_wall") || path.endsWith("_stairs") || path.endsWith("_slab")
+				|| path.equals("torch") || path.endsWith("_torch") || path.equals("lantern")
+				|| path.equals("soul_lantern") || path.equals("bell") || path.equals("campfire")
+				|| path.equals("soul_campfire") || path.equals("bookshelf");
+	}
+
 	private static JsonArray blocks(
 			ServerLevel level,
 			ServerPlayer agent,
@@ -519,24 +570,32 @@ public final class ServerObservationCollector {
 	) {
 		BlockPos center = agent.blockPosition();
 		JsonArray values = new JsonArray();
+		Map<BlockObservationOrdering.Candidate, BlockObservationOrdering.Candidate> currentCandidates = new HashMap<>();
 		for (BlockObservationOrdering.Candidate candidate : BlockObservationOrdering.selectOrderedWithVisibilityBudget(
 				candidates,
 				MAX_BLOCKS,
 				MAX_BLOCKS_PER_TYPE,
 				MAX_BLOCK_VISIBILITY_CHECKS,
 				MAX_BLOCK_VISIBILITY_CHECKS_PER_TYPE,
-				selectable -> visibility.isBlockWithinView(
-						center.offset(selectable.x(), selectable.y(), selectable.z())),
+				selectable -> {
+					BlockObservationOrdering.Candidate current = refreshCurrentBlockCandidate(
+							selectable, center, level::getBlockState);
+					if (current == null) return false;
+					currentCandidates.put(selectable, current);
+					return visibility.isBlockWithinView(center.offset(selectable.x(), selectable.y(), selectable.z()));
+				},
 				selectable -> visibility.hasLineOfSight(
 						center.offset(selectable.x(), selectable.y(), selectable.z()))
 		)) {
+			BlockObservationOrdering.Candidate current = currentCandidates.get(candidate);
+			if (current == null) continue;
 			BlockPos position = center.offset(candidate.x(), candidate.y(), candidate.z());
 			BlockState state = level.getBlockState(position);
 			JsonObject json = new JsonObject();
 			json.addProperty("x", position.getX());
 			json.addProperty("y", position.getY());
 			json.addProperty("z", position.getZ());
-			json.addProperty("blockId", candidate.blockId());
+			json.addProperty("blockId", current.blockId());
 			json.add("tags", tags(state.typeHolder()));
 			JsonArray placeableFaces = new JsonArray();
 			boolean withinInteractionRange = agent.isWithinBlockInteractionRange(position, 1.0D);
@@ -549,6 +608,137 @@ public final class ServerObservationCollector {
 			values.add(json);
 		}
 		return values;
+	}
+
+	private static JsonArray landmarks(
+			ServerLevel level,
+			ServerPlayer agent,
+			ObservationVisibility.Frame visibility
+	) {
+		JsonArray values = new JsonArray();
+		int visibilityChecks = 0;
+		HashSet<String> types = new HashSet<>();
+		BlockPos center = agent.blockPosition();
+		for (VisibleSurfaceCandidate candidate : visibleSurfaceCandidates(level, agent, center)) {
+			if (values.size() == MAX_LANDMARKS || visibilityChecks >= MAX_LANDMARK_VISIBILITY_CHECKS) break;
+			BlockPos position = center.offset(candidate.x(), candidate.y(), candidate.z());
+			if (!visibility.isBlockWithinView(position)) continue;
+			visibilityChecks++;
+			if (!visibility.hasLineOfSight(position)) continue;
+			String type = candidate.blockId().substring(candidate.blockId().indexOf(':') + 1);
+			String family = type.endsWith("_log") || type.endsWith("_wood") ? "wood"
+					: type.endsWith("_ore") ? "ore" : type;
+			if (!types.add(family) && values.size() >= MAX_LANDMARKS / 2) continue;
+			Vec3 delta = Vec3.atCenterOf(position).subtract(agent.getEyePosition());
+			double horizontal = Math.sqrt(delta.x * delta.x + delta.z * delta.z);
+			double targetYaw = Math.toDegrees(Math.atan2(-delta.x, delta.z));
+			double bearing = net.minecraft.util.Mth.wrapDegrees((float) (targetYaw - agent.getYRot()));
+			double elevation = Math.toDegrees(Math.atan2(delta.y, horizontal));
+			JsonObject json = new JsonObject();
+			json.addProperty("x", position.getX());
+			json.addProperty("y", position.getY());
+			json.addProperty("z", position.getZ());
+			json.addProperty("blockId", candidate.blockId());
+			json.addProperty("distance", finite(Math.sqrt(candidate.distanceSquared())));
+			json.addProperty("bearing", finite(bearing));
+			json.addProperty("elevation", finite(elevation));
+			json.add("tags", tags(agent.level().getBlockState(position).typeHolder()));
+			values.add(json);
+		}
+		return values;
+	}
+
+	/**
+	 * Samples the first visible surface along a sparse camera fan. This scales with the number of
+	 * sight rays instead of the cube of the sight distance, so long-range vision remains bounded.
+	 */
+	private static List<VisibleSurfaceCandidate> visibleSurfaceCandidates(
+			ServerLevel level,
+			ServerPlayer agent,
+			BlockPos center
+	) {
+		Map<Long, VisibleSurfaceCandidate> candidates = new HashMap<>();
+		Vec3 eye = agent.getEyePosition();
+		for (int pitchOffset : SIGHT_PITCH_OFFSETS) {
+			float pitch = net.minecraft.util.Mth.clamp(agent.getXRot() + pitchOffset, -90.0F, 90.0F);
+			for (int yawOffset : SIGHT_YAW_OFFSETS) {
+				float yaw = agent.getYRot() + yawOffset;
+				Vec3 direction = Vec3.directionFromRotation(pitch, yaw);
+				Vec3 endpoint = loadedSightEndpoint(level, eye, direction);
+				if (endpoint == null) continue;
+				BlockHitResult hit = level.clip(new ClipContext(
+						eye,
+						endpoint,
+						ClipContext.Block.VISUAL,
+						ClipContext.Fluid.NONE,
+						agent
+				));
+				if (hit.getType() != HitResult.Type.BLOCK) continue;
+				BlockPos position = hit.getBlockPos();
+				if (!level.hasChunkAt(position)) continue;
+				double distanceSquared = agent.distanceToSqr(
+						position.getX() + 0.5D,
+						position.getY() + 0.5D,
+						position.getZ() + 0.5D
+				);
+				if (distanceSquared <= (double) BLOCK_RADIUS * BLOCK_RADIUS) continue;
+				String blockId = BuiltInRegistries.BLOCK.getKey(level.getBlockState(position).getBlock()).toString();
+				if (!isVisualLandmark(blockId)) continue;
+				candidates.putIfAbsent(position.asLong(), new VisibleSurfaceCandidate(
+						position.getX() - center.getX(),
+						position.getY() - center.getY(),
+						position.getZ() - center.getZ(),
+						blockId,
+						distanceSquared
+				));
+			}
+		}
+		return candidates.values().stream()
+				.sorted(Comparator
+						.comparingInt((VisibleSurfaceCandidate candidate) -> landmarkPriority(candidate.blockId()))
+						.thenComparingDouble(VisibleSurfaceCandidate::distanceSquared)
+						.thenComparingInt(VisibleSurfaceCandidate::y)
+						.thenComparingInt(VisibleSurfaceCandidate::x)
+						.thenComparingInt(VisibleSurfaceCandidate::z))
+				.toList();
+	}
+
+	/** Keep clipping inside the contiguous loaded view instead of making long rays load chunks. */
+	private static Vec3 loadedSightEndpoint(ServerLevel level, Vec3 origin, Vec3 direction) {
+		for (int distance = LANDMARK_SIGHT_DISTANCE; distance >= 16; distance -= 16) {
+			Vec3 endpoint = origin.add(direction.scale(distance));
+			if (level.hasChunkAt(BlockPos.containing(endpoint))) return endpoint;
+		}
+		return null;
+	}
+
+	/** Re-reads cached spatial candidates so mutation cannot leave stale block IDs or air entries. */
+	static List<BlockObservationOrdering.Candidate> refreshCurrentBlockCandidates(
+			List<BlockObservationOrdering.Candidate> candidates,
+			BlockPos center,
+			Function<BlockPos, BlockState> stateAt
+	) {
+		Objects.requireNonNull(candidates, "candidates must not be null");
+		Objects.requireNonNull(center, "center must not be null");
+		Objects.requireNonNull(stateAt, "stateAt must not be null");
+		ArrayList<BlockObservationOrdering.Candidate> current = new ArrayList<>(candidates.size());
+		for (BlockObservationOrdering.Candidate candidate : candidates) {
+			BlockObservationOrdering.Candidate refreshed = refreshCurrentBlockCandidate(candidate, center, stateAt);
+			if (refreshed != null) current.add(refreshed);
+		}
+		return List.copyOf(current);
+	}
+
+	private static BlockObservationOrdering.Candidate refreshCurrentBlockCandidate(
+			BlockObservationOrdering.Candidate candidate,
+			BlockPos center,
+			Function<BlockPos, BlockState> stateAt
+	) {
+		BlockPos position = center.offset(candidate.x(), candidate.y(), candidate.z());
+		BlockState state = Objects.requireNonNull(stateAt.apply(position), "stateAt must not return null");
+		if (state.isAir()) return null;
+		String blockId = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+		return new BlockObservationOrdering.Candidate(candidate.x(), candidate.y(), candidate.z(), blockId);
 	}
 
 	private static JsonArray nearbyTransactionTargets(

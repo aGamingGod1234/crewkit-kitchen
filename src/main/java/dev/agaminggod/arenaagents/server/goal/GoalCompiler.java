@@ -41,6 +41,12 @@ public final class GoalCompiler {
 	private static final Pattern KILL = Pattern.compile("^(?:kill|slay|defeat) (?:(?:the|a|an) )?(.+)$");
 	private static final Pattern KILL_COUNT = Pattern.compile("^([+-]?\\d+)\\s+(.+)$");
 	private static final Pattern BEAT_GAME = Pattern.compile("^beat (?:the )?game$");
+	private static final Pattern BEAT_GAME_TRANSLATION = Pattern.compile(
+			"^(?:(?:go(?: and)?\\s+)?beat (?:the )?game"
+					+ "(?:\\s+and\\s+(?:kill|slay|defeat) (?:(?:the|a|an) )?(?:ender|enemy) dragon)?"
+					+ "|(?:go(?: and)?\\s+)?(?:kill|slay|defeat) (?:(?:the|a|an) )?(?:ender|enemy) dragon"
+					+ "\\s+and\\s+beat (?:the )?game)$"
+	);
 	private static final Pattern ITEM = Pattern.compile("^(get|obtain|collect|bring|craft|make) (?:me )?(?:([+-]?\\d\\S*) )?(?:(?:a|an|some) )?(.+?)(?: for me)?$");
 	private static final Pattern ITEM_ALTERNATIVE_COUNT = Pattern.compile("^([+-]?\\d\\S*)\\s+(.+)$");
 	private static final Pattern BLOCK = Pattern.compile("^(build|construct|place|put|set|mine|break|destroy) (?:with |using |from )?(?:(?:a|an|some|the) )?(.+?)(?: for me)?$");
@@ -224,6 +230,15 @@ public final class GoalCompiler {
 	}
 
 	/**
+	 * Returns true for the one spoken compound goal whose wording maps to a single,
+	 * server-constrained terminal result without a player choosing among candidates.
+	 */
+	public static boolean isDeterministicTranslation(String request) {
+		String command = normalizedCommand(request);
+		return BEAT_GAME_TRANSLATION.matcher(command).matches() && !BEAT_GAME.matcher(command).matches();
+	}
+
+	/**
 	 * Speech is only consumed as a goal change when the agent is idle, or the player already
 	 * opted into replace/queue through {@code /agent goal}. Busy agents keep working and still hear the line.
 	 */
@@ -251,6 +266,14 @@ public final class GoalCompiler {
 		if (!budget.valid()) {
 			throw new AgentDomainException("GOAL_TRANSLATION_CONSTRAINT_MISMATCH", budget.rejection());
 		}
+		if (BEAT_GAME_TRANSLATION.matcher(command).matches() && !BEAT_GAME.matcher(command).matches()) {
+			return new GoalTranslationConstraint(
+					List.of(new GoalTranslationConstraint.KillClause(List.of(
+							new GoalTranslationConstraint.KillAlternative(List.of("minecraft:ender_dragon"), 1)
+					))),
+					List.of()
+			);
+		}
 		ArrayList<GoalTranslationConstraint.KillClause> killClauses = new ArrayList<>();
 		ArrayList<GoalTranslationConstraint.ItemClause> itemClauses = new ArrayList<>();
 		if (clauses.size() > 1) {
@@ -275,6 +298,35 @@ public final class GoalCompiler {
 		return killClauses.isEmpty() && itemClauses.isEmpty()
 				? GoalTranslationConstraint.none()
 				: new GoalTranslationConstraint(killClauses, itemClauses);
+	}
+
+	/** Removes redundant subjective confirmation from Minecraft's objective beat-the-game terminal result. */
+	public GoalPredicate normalizeTranslatedPredicate(String request, GoalPredicate predicate) {
+		Objects.requireNonNull(predicate, "predicate must not be null");
+		String command = stripTrailingPunctuation(stripPoliteness(
+				AgentValidators.normalizePrompt(request).toLowerCase(Locale.ROOT)));
+		if (!BEAT_GAME_TRANSLATION.matcher(command).matches() || BEAT_GAME.matcher(command).matches()) return predicate;
+		GoalPredicate normalized = withoutOperatorConfirmation(predicate);
+		return normalized == null ? predicate : normalized;
+	}
+
+	private static GoalPredicate withoutOperatorConfirmation(GoalPredicate predicate) {
+		return switch (predicate) {
+			case GoalPredicate.OperatorConfirmed ignored -> null;
+			case GoalPredicate.AllOf value -> normalizedCompound(value.predicates(), true);
+			case GoalPredicate.AnyOf value -> normalizedCompound(value.predicates(), false);
+			default -> predicate;
+		};
+	}
+
+	private static GoalPredicate normalizedCompound(List<GoalPredicate> predicates, boolean allOf) {
+		List<GoalPredicate> normalized = predicates.stream()
+				.map(GoalCompiler::withoutOperatorConfirmation)
+				.filter(Objects::nonNull)
+				.toList();
+		if (normalized.isEmpty()) return null;
+		if (normalized.size() == 1) return normalized.getFirst();
+		return allOf ? new GoalPredicate.AllOf(normalized) : new GoalPredicate.AnyOf(normalized);
 	}
 
 	public List<String> candidateIdsFor(
@@ -305,7 +357,7 @@ public final class GoalCompiler {
 			return relatedCandidates(ClauseKind.ITEM, item.group(3), registries);
 		}
 		Matcher kill = KILL.matcher(command);
-		if (BEAT_GAME.matcher(command).matches()) return List.of("minecraft:ender_dragon");
+		if (BEAT_GAME_TRANSLATION.matcher(command).matches()) return List.of("minecraft:ender_dragon");
 		if (kill.matches()) {
 			return relatedCandidates(ClauseKind.KILL, stripKillCount(kill.group(1)), registries);
 		}

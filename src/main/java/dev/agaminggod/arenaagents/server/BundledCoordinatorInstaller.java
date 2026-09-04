@@ -12,6 +12,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.AclEntry;
+import java.nio.file.attribute.AclEntryFlag;
 import java.nio.file.attribute.AclEntryPermission;
 import java.nio.file.attribute.AclEntryType;
 import java.nio.file.attribute.AclFileAttributeView;
@@ -520,22 +521,51 @@ final class BundledCoordinatorInstaller {
 		AclFileAttributeView acl = Files.getFileAttributeView(target, AclFileAttributeView.class, LinkOption.NOFOLLOW_LINKS);
 		if (acl == null) throw new IOException("Filesystem cannot enforce private coordinator runtime permissions");
 		try {
-			UserPrincipal owner = acl.getOwner();
+			String currentUserName = System.getProperty("user.name");
+			if (currentUserName == null || currentUserName.isBlank()) {
+				throw new IOException("Could not resolve the current user for private coordinator runtime permissions");
+			}
+			UserPrincipal currentUser = target.getFileSystem().getUserPrincipalLookupService()
+					.lookupPrincipalByName(currentUserName);
+			UserPrincipal owner = privateAclPrincipal(currentUser, acl.getOwner());
+			Set<AclEntryFlag> flags = directory
+					? EnumSet.of(AclEntryFlag.DIRECTORY_INHERIT, AclEntryFlag.FILE_INHERIT)
+					: Set.of();
 			AclEntry ownerOnly = AclEntry.newBuilder()
 					.setType(AclEntryType.ALLOW)
 					.setPrincipal(owner)
 					.setPermissions(EnumSet.allOf(AclEntryPermission.class))
+					.setFlags(flags)
 					.build();
-			acl.setAcl(List.of(ownerOnly));
+			if (!privateWindowsAclMatches(acl, owner, ownerOnly)) {
+				acl.setOwner(owner);
+				acl.setAcl(List.of(ownerOnly));
+			}
 			List<AclEntry> entries = acl.getAcl();
-			if (entries.size() != 1 || entries.getFirst().type() != AclEntryType.ALLOW
+			if (!acl.getOwner().equals(owner)
+					|| entries.size() != 1 || entries.getFirst().type() != AclEntryType.ALLOW
 					|| !entries.getFirst().principal().equals(owner)
+					|| !entries.getFirst().flags().equals(flags)
 					|| !entries.getFirst().permissions().containsAll(EnumSet.allOf(AclEntryPermission.class))) {
 				throw new IOException("Could not enforce private coordinator runtime permissions");
 			}
 		} catch (UnsupportedOperationException exception) {
 			throw new IOException("Filesystem cannot enforce private coordinator runtime permissions", exception);
 		}
+	}
+
+	private static boolean privateWindowsAclMatches(
+			AclFileAttributeView acl,
+			UserPrincipal owner,
+			AclEntry expected
+	) throws IOException {
+		List<AclEntry> entries = acl.getAcl();
+		return acl.getOwner().equals(owner) && entries.size() == 1 && entries.getFirst().equals(expected);
+	}
+
+	static UserPrincipal privateAclPrincipal(UserPrincipal currentUser, UserPrincipal filesystemOwner) {
+		Objects.requireNonNull(filesystemOwner, "filesystemOwner");
+		return Objects.requireNonNull(currentUser, "currentUser");
 	}
 
 	private static RuntimePackage validatedPackage(Path root) throws IOException {
@@ -641,6 +671,7 @@ final class BundledCoordinatorInstaller {
 		if (!Files.isRegularFile(stateFile, LinkOption.NOFOLLOW_LINKS) || linked(stateFile)) {
 			throw new IOException("Coordinator generation state is not a regular external file");
 		}
+		ensureOwnerOnly(stateFile, false);
 		byte[] encoded;
 		try (InputStream input = Files.newInputStream(stateFile)) {
 			encoded = input.readNBytes(MAX_STATE_BYTES + 1);
@@ -672,7 +703,7 @@ final class BundledCoordinatorInstaller {
 	private static void writeState(Path root, GenerationState state) throws IOException {
 		state.validate();
 		Path target = root.resolve(STATE_PATH);
-		Files.createDirectories(target.getParent());
+		ensurePrivateDirectory(target.getParent());
 		Path staging = target.resolveSibling(target.getFileName() + ".staging-" + UUID.randomUUID());
 		Properties values = new Properties();
 		values.setProperty("phase", state.phase());
@@ -687,11 +718,13 @@ final class BundledCoordinatorInstaller {
 			try (Writer writer = Files.newBufferedWriter(staging, StandardCharsets.UTF_8, StandardOpenOption.CREATE_NEW)) {
 				values.store(writer, "Arena Agents coordinator generation state");
 			}
+			ensureOwnerOnly(staging, false);
 			try {
 				Files.move(staging, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
 			} catch (AtomicMoveNotSupportedException unsupported) {
 				Files.move(staging, target, StandardCopyOption.REPLACE_EXISTING);
 			}
+			ensureOwnerOnly(target, false);
 		} finally {
 			Files.deleteIfExists(staging);
 		}

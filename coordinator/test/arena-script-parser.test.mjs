@@ -80,7 +80,17 @@ test('admits only factual observed-candidate queries in watcher conditions', () 
 		program.onUnhandledAttention("continue_and_notify");
 		program.watch(() => world.nearest(world.items({ itemId: "minecraft:oak_log" })) !== null, { mode: "boundary" }, async () => {});
 	`));
-	assert.throws(() => parseArenaScript('program.onUnhandledAttention("continue_and_notify"); program.watch(() => player.mine({ x: 1 }), { mode: "boundary" }, async () => {});'), (error) => error.code === 'UNSUPPORTED_SYNTAX');
+	assert.throws(() => parseArenaScript('program.onUnhandledAttention("continue_and_notify"); program.watch(() => player.wait(1), { mode: "boundary" }, async () => {});'), (error) => error.code === 'UNSUPPORTED_SYNTAX');
+});
+
+test('requires mine calls to carry the observed non-air block id', () => {
+	assert.doesNotThrow(() => parseArenaScript('program.onUnhandledAttention("continue_and_notify"); await player.mine({ x: 1, y: 64, z: 0, expectedBlockId: "minecraft:stone" });'));
+	for (const source of [
+		'program.onUnhandledAttention("continue_and_notify"); await player.mine({ x: 1, y: 64, z: 0 });',
+		'program.onUnhandledAttention("continue_and_notify"); await player.mine({ x: 1, y: 64, z: 0, expectedBlockId: "minecraft:air" });',
+	]) {
+		assert.throws(() => parseArenaScript(source), (error) => error.code === 'INVALID_ARENA_SCRIPT_COMMAND');
+	}
 });
 
 test('precomputes conservative watcher mode and fact dependency metadata', () => {

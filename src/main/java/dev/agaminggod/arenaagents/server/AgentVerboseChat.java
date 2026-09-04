@@ -22,10 +22,10 @@ public final class AgentVerboseChat {
 	private static final Logger LOGGER = LoggerFactory.getLogger(AgentVerboseChat.class);
 	private static final Set<String> STAGES = Set.of(
 			"conversation", "lifecycle", "planner", "provider", "output", "decision",
-			"agent_message", "action", "progress", "result", "retry", "error"
+			"agent_message", "action", "progress", "result", "retry", "error", "voice"
 	);
 	private static final Set<String> CURATED_STAGES = Set.of(
-			"planner", "output", "agent_message", "decision", "action", "progress", "result", "retry", "error"
+			"planner", "output", "agent_message", "decision", "action", "progress", "result", "retry", "error", "voice"
 	);
 	private static final Pattern UUID_PATTERN = Pattern.compile(
 			"(?i)\\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\b"
@@ -138,6 +138,18 @@ public final class AgentVerboseChat {
 		}
 	}
 
+	public static void reportSystem(MinecraftServer server, String stage, String message) {
+		try {
+			if (!AgentVerboseState.enabled(server) || !curatedStage(stage)) return;
+			Component line = line("Voice", "voice", stage, sanitizeMessage(message));
+			for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+				if (GoalControl.mayControl(player.createCommandSourceStack())) player.sendSystemMessage(line);
+			}
+		} catch (RuntimeException exception) {
+			LOGGER.warn("Could not publish system verbose {} event", stage, exception);
+		}
+	}
+
 	static Component line(String agentName, String provider, String stage, String message) {
 		MutableComponent prefix = Component.literal("[" + agentName + "]")
 				.withStyle(familyColor(provider));
@@ -155,6 +167,7 @@ public final class AgentVerboseChat {
 			case "result" -> "Result";
 			case "retry" -> "Problem";
 			case "error" -> "Error";
+			case "voice" -> "Voice";
 			default -> throw new IllegalArgumentException("Unsupported verbose stage: " + stage);
 		};
 	}

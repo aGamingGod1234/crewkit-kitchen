@@ -4,9 +4,12 @@
   "compatibilityLevel": "JAVA_25",
   "mixins": [
     "EntityPlayerActionInvoker",
+    "EntityPlayerActionPackAccessor",
     "EntityPlayerActionPackMixin",
     "EntityPlayerMPFakeMixin",
-    "MsgCommandMixin"
+    "MsgCommandMixin",
+    "ServerPlayerGameModeBreakAccessor",
+    "ServerPlayerGameModeMixin"
   ],
   "injectors": {
     "defaultRequire": 1

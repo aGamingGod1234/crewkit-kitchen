@@ -24,6 +24,9 @@ public final class ServerObservationWireBudget {
 		if (removeCandidateTags(candidate)) reductions.add("candidateTags");
 		if (fitsCompleteEnvelope.test(candidate)) return fitted(candidate, reductions);
 
+		if (trimTail(candidate, candidate.get("landmarks"), fitsCompleteEnvelope, "landmarks", reductions)) {
+			return fitted(candidate, reductions);
+		}
 		if (trimTail(candidate, candidate.get("blocks"), fitsCompleteEnvelope, "blocks", reductions)) {
 			return fitted(candidate, reductions);
 		}
@@ -41,6 +44,8 @@ public final class ServerObservationWireBudget {
 			return fitted(candidate, reductions);
 		}
 
+		if (dropSingleton(candidate.get("landmarks"), "landmarks", reductions)
+				&& fitsCompleteEnvelope.test(candidate)) return fitted(candidate, reductions);
 		if (dropSingleton(candidate.get("blocks"), "blocks", reductions)
 				&& fitsCompleteEnvelope.test(candidate)) return fitted(candidate, reductions);
 		if (dropSingleton(candidate.get("nearbyContainers"), "nearbyContainers", reductions)
@@ -63,7 +68,7 @@ public final class ServerObservationWireBudget {
 
 	private static boolean removeCandidateTags(JsonObject observation) {
 		boolean changed = false;
-		for (String field : List.of("blocks", "nearbyContainers", "entities")) {
+		for (String field : List.of("blocks", "landmarks", "nearbyContainers", "entities")) {
 			changed |= removeTags(array(observation, field));
 		}
 		JsonObject inventory = object(observation, "inventory");

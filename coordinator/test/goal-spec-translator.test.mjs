@@ -60,6 +60,76 @@ test('translator accepts a constrained proposal from the provider adapter', asyn
 	assert.equal(proposal.predicate.type, 'any_of');
 });
 
+test('translator normalizes strict structured-output nulls and block property entries', async () => {
+	const request = {
+		requestId: '00000000-0000-4000-8000-000000000012',
+		originalRequest: 'Find the powered lever at 1 2 3',
+		candidateIds: ['minecraft:lever'],
+	};
+	const translator = new GoalSpecTranslator({
+		generate: async ({ schema }) => {
+			const blockSchema = schema.$defs.predicate.anyOf.find(entry => entry.properties.type.const === 'block_matches');
+			assert.equal(blockSchema.required.includes('dimensionId'), true);
+			assert.equal(blockSchema.properties.properties.type, 'array');
+			return {
+				requestId: request.requestId,
+				summary: 'Find the powered lever',
+				predicate: {
+					type: 'block_matches', dimensionId: null, x: 1, y: 2, z: 3,
+					blockId: 'minecraft:lever', properties: [{ name: 'powered', value: 'true' }],
+				},
+			};
+		},
+	});
+	const proposal = await translator.translate(request);
+	assert.deepEqual(proposal.predicate, {
+		type: 'block_matches', x: 1, y: 2, z: 3,
+		blockId: 'minecraft:lever', properties: { powered: 'true' },
+	});
+});
+
+test('translator rejects duplicate structured block property names', async () => {
+	const request = {
+		requestId: '00000000-0000-4000-8000-000000000013',
+		originalRequest: 'Find the powered lever at 1 2 3',
+		candidateIds: ['minecraft:lever'],
+	};
+	const translator = new GoalSpecTranslator({ generate: async () => ({
+		requestId: request.requestId,
+		summary: 'Find the lever',
+		predicate: {
+			type: 'block_matches', dimensionId: null, x: 1, y: 2, z: 3, blockId: 'minecraft:lever',
+			properties: [{ name: 'powered', value: 'true' }, { name: 'powered', value: 'false' }],
+		},
+	}) });
+	await assert.rejects(() => translator.translate(request), error => error?.code === 'MALFORMED_GOAL_SPEC_PROPOSAL');
+});
+
+test('translator rejects malformed structured block property entries', async () => {
+	const request = {
+		requestId: '00000000-0000-4000-8000-000000000014',
+		originalRequest: 'Find the powered lever at 1 2 3',
+		candidateIds: ['minecraft:lever'],
+	};
+	const malformed = [
+		[{}],
+		[{ name: 'powered' }],
+		[{ name: ' ', value: 'true' }],
+		[{ name: 'powered', value: '' }],
+	];
+	for (const properties of malformed) {
+		const translator = new GoalSpecTranslator({ generate: async () => ({
+			requestId: request.requestId,
+			summary: 'Find the lever',
+			predicate: {
+				type: 'block_matches', dimensionId: null, x: 1, y: 2, z: 3, blockId: 'minecraft:lever',
+				properties,
+			},
+		}) });
+		await assert.rejects(() => translator.translate(request), error => error?.code === 'MALFORMED_GOAL_SPEC_PROPOSAL');
+	}
+});
+
 test('translator rejects candidate IDs the server did not supply', async () => {
 	const translator = new GoalSpecTranslator({
 		generate: async () => ({

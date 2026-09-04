@@ -33,5 +33,4 @@ last-known-good coordinator and Node.js backup.
 Run the same command again after an interrupted update. The runtime installer
 recovers its recorded transaction before it starts the new update.
 
-The optional Arena Agents Voice add-on and Simple Voice Chat are not in this ZIP.
-The base mod works without them.
+The ZIP includes Arena Agents, Arena Agents Voice, Fabric API, Fabric Carpet, and Simple Voice Chat.

@@ -2,10 +2,9 @@ package dev.agaminggod.arenaagents.voiceaddon;
 
 import de.maxhenkel.voicechat.api.VoicechatPlugin;
 import de.maxhenkel.voicechat.api.VoicechatServerApi;
-import de.maxhenkel.voicechat.api.audiochannel.AudioPlayer;
-import de.maxhenkel.voicechat.api.audiochannel.EntityAudioChannel;
 import de.maxhenkel.voicechat.api.events.EventRegistration;
 import de.maxhenkel.voicechat.api.events.MicrophonePacketEvent;
+import de.maxhenkel.voicechat.api.events.VoiceDistanceEvent;
 import de.maxhenkel.voicechat.api.events.VoicechatServerStartedEvent;
 import de.maxhenkel.voicechat.api.events.VoicechatServerStoppedEvent;
 import dev.agaminggod.arenaagents.agent.AgentId;
@@ -27,7 +26,6 @@ import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.CompletionStage;
 import net.minecraft.server.MinecraftServer;
-import net.minecraft.world.entity.Entity;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -55,6 +53,7 @@ public final class ArenaAgentsVoiceProvider implements VoiceSubsystemProvider, V
 		registration.registerEvent(VoicechatServerStartedEvent.class,
 				event -> legacyServerApi = event.getVoicechat());
 		registration.registerEvent(MicrophonePacketEvent.class, this::onLegacyMicrophonePacket);
+		registration.registerEvent(VoiceDistanceEvent.class, SyntheticPlayerVoiceTransport::applyPlaybackDistance);
 		registration.registerEvent(VoicechatServerStoppedEvent.class, event -> {
 			if (legacyServerApi == event.getVoicechat()) legacyServerApi = null;
 			HumanSpeechCapture capture = legacySpeechCapture;
@@ -227,14 +226,16 @@ public final class ArenaAgentsVoiceProvider implements VoiceSubsystemProvider, V
 
 	private static final class LegacyVoiceSubsystem implements VoiceSubsystem {
 		private final MinecraftServer server;
+		private final SyntheticPlayerVoiceTransport transport;
 		private final VoicePlaybackCoordinator playback;
 
 		private LegacyVoiceSubsystem(MinecraftServer server, VoiceWorkerClient worker) {
 			this.server = Objects.requireNonNull(server, "server must not be null");
+			this.transport = new SyntheticPlayerVoiceTransport(() -> legacyServerApi);
 			this.playback = new VoicePlaybackCoordinator(
 					worker::synthesize,
 					server::execute,
-					new LegacyVoiceTransport(),
+					transport,
 					latency -> LOGGER.info(
 							"Voice output latency agent={} sequence={} synthesisMs={} firstPlaybackMs={}",
 							latency.agentId(), latency.conversationSequence(), latency.synthesisMilliseconds(),
@@ -251,11 +252,18 @@ public final class ArenaAgentsVoiceProvider implements VoiceSubsystemProvider, V
 		@Override
 		public void registerAgent(AgentId agentId, UUID entityId) {
 			playback.registerAgent(agentId, entityId);
+			transport.registerAgent(agentId, entityId);
+		}
+
+		@Override
+		public void refreshAgent(AgentId agentId, UUID entityId) {
+			transport.registerAgent(agentId, entityId);
 		}
 
 		@Override
 		public void unregisterAgent(AgentId agentId) {
 			playback.unregisterAgent(agentId);
+			transport.unregisterAgent(agentId);
 		}
 
 		@Override
@@ -276,62 +284,14 @@ public final class ArenaAgentsVoiceProvider implements VoiceSubsystemProvider, V
 
 		@Override
 		public void close() {
-			playback.close();
-			if (legacyMinecraftServer == server) legacyMinecraftServer = null;
-		}
-
-		private Entity findEntity(UUID entityId) {
-			if (entityId == null) return null;
-			for (var level : server.getAllLevels()) {
-				Entity entity = level.getEntity(entityId);
-				if (entity != null && entity.isAlive()) return entity;
-			}
-			return null;
-		}
-
-		private final class LegacyVoiceTransport implements VoicePlaybackCoordinator.Transport {
-			@Override
-			public boolean available() {
-				return legacyServerApi != null;
-			}
-
-			@Override
-			public VoicePlaybackCoordinator.Playback create(
-					AgentId agentId,
-					UUID entityId,
-					int radius,
-					short[] samples,
-					Runnable onStopped
-			) {
-				VoicechatServerApi api = legacyServerApi;
-				if (api == null) {
-					throw new VoicePlaybackCoordinator.UnavailableException("Voice channel is unavailable");
+			try {
+				playback.close();
+			} finally {
+				try {
+					transport.close();
+				} finally {
+					if (legacyMinecraftServer == server) legacyMinecraftServer = null;
 				}
-				Entity entity = findEntity(entityId);
-				if (entity == null) {
-					throw new VoicePlaybackCoordinator.UnavailableException("Agent entity is unavailable");
-				}
-				UUID channelId = UUID.nameUUIDFromBytes(
-						("arenaagents-voice:" + agentId).getBytes(StandardCharsets.UTF_8)
-				);
-				EntityAudioChannel channel = api.createEntityAudioChannel(channelId, api.fromEntity(entity));
-				if (channel == null) {
-					throw new VoicePlaybackCoordinator.UnavailableException(
-							"Simple Voice Chat rejected the entity channel"
-					);
-				}
-				channel.setDistance(radius);
-				AudioPlayer audioPlayer = api.createAudioPlayer(channel, api.createEncoder(), samples);
-				if (audioPlayer == null) {
-					throw new VoicePlaybackCoordinator.UnavailableException(
-							"Simple Voice Chat rejected the audio player"
-					);
-				}
-				audioPlayer.setOnStopped(onStopped);
-				return new VoicePlaybackCoordinator.Playback() {
-					@Override public void start() { audioPlayer.startPlaying(); }
-					@Override public void stop() { audioPlayer.stopPlaying(); }
-				};
 			}
 		}
 	}

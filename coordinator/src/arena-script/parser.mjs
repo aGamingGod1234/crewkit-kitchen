@@ -441,6 +441,9 @@ function validateCallExpression(node, state, context) {
 	if (pathEqual(path, ['player', 'navigateTo'])) {
 		validateNavigateTarget(node, context.scope);
 	}
+	if (pathEqual(path, ['player', 'mine'])) {
+		validateMineTarget(node);
+	}
 	if (path?.[0] === 'player' && Object.hasOwn(PLAYER_MEMBER_PRIMITIVES, path[1])) {
 		validatePlayerPrimitiveArity(node, path[1]);
 		state.primitiveCalls.add(PLAYER_MEMBER_PRIMITIVES[path[1]]);
@@ -465,6 +468,20 @@ function validatePlayerPrimitiveArity(node, memberName) {
 	}
 	if (node.arguments.length !== 1) {
 		throw arenaError('INVALID_ARENA_SCRIPT_COMMAND', `player.${memberName} requires exactly one action argument`, node);
+	}
+}
+
+function validateMineTarget(node) {
+	const argument = node.arguments[0];
+	if (!argument || argument.type !== 'ObjectExpression') {
+		throw arenaError('INVALID_ARENA_SCRIPT_COMMAND', 'player.mine requires an object containing expectedBlockId', node);
+	}
+	const expected = argument.properties.find((property) => propertyName(property.key) === 'expectedBlockId');
+	if (!expected) {
+		throw arenaError('INVALID_ARENA_SCRIPT_COMMAND', 'player.mine requires the observed non-air expectedBlockId', argument);
+	}
+	if (expected.value?.type === 'Literal' && (typeof expected.value.value !== 'string' || expected.value.value.trim() === '' || /(?:^|:)air$/u.test(expected.value.value))) {
+		throw arenaError('INVALID_ARENA_SCRIPT_COMMAND', 'player.mine expectedBlockId must identify a non-air block', expected.value);
 	}
 }
 

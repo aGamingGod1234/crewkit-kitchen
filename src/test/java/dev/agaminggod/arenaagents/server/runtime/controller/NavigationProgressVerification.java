@@ -75,6 +75,14 @@ public final class NavigationProgressVerification {
 				"the requested tolerance includes its exact boundary");
 		assertTrue(!ServerNavigationController.satisfiesDestinationTolerance(1.01D, 1.0D),
 				"path exhaustion outside the requested tolerance must replan");
+		Vec3 progressStart = new Vec3(0.0D, 64.0D, 0.0D);
+		Vec3 progressEndpoint = new Vec3(10.0D, 64.0D, 0.0D);
+		assertEquals(0.4D, ServerNavigationController.progressFromActualDistance(
+				progressStart, progressEndpoint, new Vec3(4.0D, 64.0D, 0.0D), 0.0D),
+				"navigation progress is derived from actual endpoint distance");
+		assertEquals(0.25D, ServerNavigationController.progressFromActualDistance(
+				progressStart, progressEndpoint, new Vec3(2.5D, 64.0D, 0.0D), 0.4D),
+				"backtracking is reflected instead of freezing a stale best progress value");
 		ServerNavigationController intermediateNavigation = new ServerNavigationController(
 				new Vec3(2.5D, 65.0D, 2.5D), 0.2D, false, 0L, 1_000L);
 		PathNode jumpWaypoint = new PathNode(new GridPosition(2, 65, 2), TraversalType.JUMP_UP);

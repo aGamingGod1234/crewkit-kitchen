@@ -257,11 +257,25 @@ public final class AgentRegistryVerification {
 		AgentRecord named = registry.create("gpt-5.5", "high", Optional.of("Scout"), START_TIME);
 		assertEquals(named.agentId(), registry.resolve("scout").agentId(), "case-insensitive name resolution");
 		assertEquals(named.agentId(), registry.resolve(named.agentId().shortValue()).agentId(), "short ID resolution");
-		expectFailure(
-				() -> registry.create("gpt-5.6-sol", "high", Optional.of("SCOUT"), START_TIME + 1L),
-				"DUPLICATE_AGENT_NAME"
-		);
-		return 3;
+		AgentRecord suffixed = registry.create(
+				"gpt-5.6-sol", "high", Optional.of("SCOUT"), START_TIME + 1L);
+		assertEquals("SCOUT2", suffixed.profile().userName().orElseThrow(),
+				"duplicate public names receive the smallest numeric suffix automatically");
+		assertEquals(suffixed.agentId(), registry.resolve("scout2").agentId(),
+				"the allocated public name is a command selector");
+		AgentRecord automatic = registry.create("gpt-5.6-sol", "high", Optional.empty(), START_TIME + 2L);
+		AgentRecord automatic2 = registry.create("gpt-5.6-sol", "high", Optional.empty(), START_TIME + 3L);
+		assertEquals("GPT_5_6_Sol", automatic.profile().userName().orElseThrow(),
+				"blank direct summons materialize a stable model-derived public name");
+		assertEquals("GPT_5_6_Sol2", automatic2.profile().userName().orElseThrow(),
+				"same-model direct summons receive a stable collision suffix");
+		AgentRegistry liveNameRegistry = AgentRegistry.createDefault(() -> { }, transition -> { });
+		AgentRecord liveNameCollision = liveNameRegistry.create(
+				"codex", "gpt-5.6-sol", "high", "priority", Optional.empty(), AgentGameMode.SURVIVAL,
+				START_TIME + 4L, List.of("HumanPlayer", "gpt_5_6_sol"));
+		assertEquals("GPT_5_6_Sol2", liveNameCollision.profile().userName().orElseThrow(),
+				"live GameProfile names share the same case-insensitive allocation namespace");
+		return 8;
 	}
 
 	private static int verifyPersistenceRecovery() {
@@ -325,7 +339,31 @@ public final class AgentRegistryVerification {
 		String legacyTier = encoded.replace(",\"service_tier\":\"fast\"", "");
 		assertEquals("priority", codec.decode(legacyTier).records().get(1).profile().serviceTier(),
 				"legacy service tier migration defaults to priority");
-		return 5;
+
+		AgentProfile legacyNamed = new AgentProfile(
+				"codex", "gpt-5.6-sol", "high", "priority", Optional.of("GPT-5.6-Sol"), 0,
+				AgentGameMode.SURVIVAL);
+		AgentProfile collidingLegacyNamed = new AgentProfile(
+				"codex", "gpt-5.6-sol", "high", "priority", Optional.of("GPT 5.6 Sol"), 1,
+				AgentGameMode.SURVIVAL);
+		AgentRecord legacyNamedRecord = AgentRecord.create(AgentId.random(), legacyNamed, START_TIME + 2L);
+		AgentRecord collidingLegacyRecord = AgentRecord.create(
+				AgentId.random(), collidingLegacyNamed, START_TIME + 3L);
+		int[] migrationChanges = {0};
+		AgentRegistry migratedNames = AgentRegistry.restore(new AgentRegistry.Snapshot(
+				AgentConstants.SCHEMA_VERSION, AgentConstants.DEFAULT_AGENT_LIMIT,
+				AgentConstants.DEFAULT_QUEUE_LIMIT, List.of(legacyNamedRecord, collidingLegacyRecord)
+		), () -> migrationChanges[0]++, transition -> { }, START_TIME + 4L);
+		assertEquals("GPT_5_6_Sol",
+				migratedNames.require(legacyNamedRecord.agentId()).profile().userName().orElseThrow(),
+				"restore canonicalizes a legacy decorated public name deterministically");
+		assertEquals("GPT_5_6_Sol2",
+				migratedNames.require(collidingLegacyRecord.agentId()).profile().userName().orElseThrow(),
+				"restore resolves canonicalization collisions in persisted record order");
+		assertEquals(legacyNamedRecord.agentId(), migratedNames.resolve("GPT-5.6-Sol").agentId(),
+				"the legacy selector remains available during the migration session");
+		assertEquals(1, migrationChanges[0], "public-name migration dirties the restored snapshot exactly once");
+		return 9;
 	}
 
 	private static int verifyEntityLocationPersistenceAndMigration() {

@@ -163,6 +163,31 @@ test('a goal may complete during planning without fabricating a physical action'
 	assert.equal(registry.get('agent-a').state, DynamicAgentState.COMPLETED);
 });
 
+test('server promotion after coordinator completion consumes the queued head', () => {
+	const registry = new AgentRegistry({ queueCap: 2 });
+	registry.register(record('agent-a'));
+	registry.applyGoalControl('agent-a', { operation: 'start', goalRevision: 1, goal: 'A' });
+	registry.applyGoalControl('agent-a', { operation: 'queue', goalRevision: 1, goal: 'B' });
+	registry.applyGoalControl('agent-a', { operation: 'queue', goalRevision: 1, goal: 'C' });
+	registry.setState('agent-a', DynamicAgentState.PLANNING, { goalRevision: 1 });
+	registry.setState('agent-a', DynamicAgentState.ACTING, { goalRevision: 1 });
+	registry.setState('agent-a', DynamicAgentState.COMPLETED, { goalRevision: 1 });
+
+	const promoted = registry.applyGoalControl('agent-a', { operation: 'start', goalRevision: 2, goal: 'B' });
+	assert.equal(promoted.state, DynamicAgentState.STARTING);
+	assert.equal(promoted.currentGoal, 'B');
+	assert.deepEqual(promoted.queue.map((entry) => entry.goal), ['C']);
+});
+
+test('a goal may complete during planning without fabricating a physical action', () => {
+	const registry = new AgentRegistry();
+	registry.register(record('agent-a'));
+	registry.applyGoalControl('agent-a', { operation: 'start', goalRevision: 1, goal: 'Inspect current facts' });
+	registry.setState('agent-a', DynamicAgentState.PLANNING, { goalRevision: 1 });
+	registry.setState('agent-a', DynamicAgentState.COMPLETED, { goalRevision: 1 });
+	assert.equal(registry.get('agent-a').state, DynamicAgentState.COMPLETED);
+});
+
 test('server start promotions reject a goal that is not the queued head', () => {
 	const registry = new AgentRegistry({ queueCap: 2 });
 	registry.register(record('agent-a'));

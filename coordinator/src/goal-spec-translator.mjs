@@ -32,7 +32,7 @@ export class GoalSpecTranslator {
 			try { value = JSON.parse(output); }
 			catch (error) { throw codedError('MALFORMED_GOAL_SPEC_PROPOSAL', 'Translator output must be one JSON object', error); }
 		}
-		const proposal = parseGoalSpecProposal(value);
+		const proposal = parseGoalSpecProposal(normalizeStructuredProposal(value));
 		if (proposal.requestId !== request.requestId) {
 			throw codedError('GOAL_SPEC_REQUEST_MISMATCH', 'Translator proposal does not match the outstanding request');
 		}
@@ -44,6 +44,37 @@ export class GoalSpecTranslator {
 		}
 		return proposal;
 	}
+}
+
+function normalizeStructuredProposal(value) {
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) return value;
+	return { ...value, predicate: normalizeStructuredPredicate(value.predicate) };
+}
+
+function normalizeStructuredPredicate(value) {
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) return value;
+	const normalized = { ...value };
+	if (normalized.dimensionId === null) delete normalized.dimensionId;
+	if (Array.isArray(normalized.predicates)) {
+		normalized.predicates = normalized.predicates.map(normalizeStructuredPredicate);
+	}
+	if (normalized.type === 'block_matches' && Array.isArray(normalized.properties)) {
+		const entries = normalized.properties.map(entry => {
+			if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+				throw codedError('MALFORMED_GOAL_SPEC_PROPOSAL', 'Translator block properties must be name/value objects');
+			}
+			const { name, value } = entry;
+			if (typeof name !== 'string' || name.trim() === '' || typeof value !== 'string' || value.trim() === '') {
+				throw codedError('MALFORMED_GOAL_SPEC_PROPOSAL', 'Translator block properties require nonblank string name and value');
+			}
+			return [name, value];
+		});
+		if (new Set(entries.map(([name]) => name)).size !== entries.length) {
+			throw codedError('MALFORMED_GOAL_SPEC_PROPOSAL', 'Translator block properties contain a duplicate name');
+		}
+		normalized.properties = Object.fromEntries(entries);
+	}
+	return normalized;
 }
 
 export function buildGoalSpecTranslatorPrompt(requestValue, { correctiveFeedback = null } = {}) {
