@@ -57,13 +57,15 @@ test('Minecraft control reference covers every executor tool and action with acc
 
 test('native Minecraft tools expose the common fast path plus one validated advanced body operation', () => {
 	assert.deepEqual(MINECRAFT_DYNAMIC_TOOLS.map((tool) => tool.name), [
-		'observe', 'lookAround', 'control', 'moveTo', 'mine', 'say', 'wait', 'act', 'sequence', 'finish',
+		'observe', 'lookAround', 'control', 'moveTo', 'exploreFrontier', 'mine', 'say', 'wait', 'act', 'sequence', 'finish',
 	]);
 	assert.ok(MINECRAFT_DYNAMIC_TOOLS.every((tool) => tool.type === 'function'));
 	assert.ok(NATIVE_AGENT_INSTRUCTIONS.length < 1_500);
 	assert.match(NATIVE_AGENT_INSTRUCTIONS, /Act as soon as it is safe/i);
 	assert.match(MINECRAFT_DYNAMIC_TOOLS.find((tool) => tool.name === 'sequence').description, /Prefer sequence for safe 2\+ action chains/i);
 	assert.match(NATIVE_AGENT_INSTRUCTIONS, /speech playback is asynchronous/i);
+	assert.match(NATIVE_AGENT_INSTRUCTIONS, /exploreFrontier/);
+	assert.match(NATIVE_AGENT_INSTRUCTIONS, /death is the same goal/i);
 	assert.match(NATIVE_AGENT_INSTRUCTIONS, /visible landmarks/i);
 });
 
@@ -100,6 +102,12 @@ test('native Minecraft tool calls normalize to exact existing body actions', () 
 	});
 	assert.deepEqual(normalizeMinecraftToolCall('moveTo', { x: 1, y: 64, z: -2 }), {
 		kind: 'action', actionType: 'navigate_to', arguments: { x: 1, y: 64, z: -2, tolerance: 1, sprint: true, timeoutMs: 30_000 },
+	});
+	assert.deepEqual(normalizeMinecraftToolCall('exploreFrontier', {}), {
+		kind: 'explore_frontier', arguments: { seek: 'any', radius: 24, timeoutMs: 15_000 },
+	});
+	assert.deepEqual(normalizeMinecraftToolCall('exploreFrontier', { seek: 'nether', radius: 24, timeoutMs: 15_000 }), {
+		kind: 'explore_frontier', arguments: { seek: 'nether', radius: 24, timeoutMs: 15_000 },
 	});
 	assert.deepEqual(normalizeMinecraftToolCall('mine', { x: 2, y: 63, z: 4, expectedBlockId: 'minecraft:stone' }), {
 		kind: 'action', actionType: 'break_block', arguments: { x: 2, y: 63, z: 4, expectedBlockId: 'minecraft:stone', timeoutMs: 15_000 },
@@ -170,6 +178,52 @@ test('tool results are compact deterministic inputText content', () => {
 	});
 	assert.match(toolResultContent({ detail: 'x'.repeat(20_000) }).contentItems[0].text, /TRUNCATED/);
 	assert.equal(toolResultContent({ detail: 'x'.repeat(20_000) }).contentItems[0].text.length <= 16_384, true);
+	const truncatedDeath = toolResultContent({
+		observation: {
+			player: { health: 0, dead: true },
+			inventory: { items: Array.from({ length: 64 }, (_, index) => ({ itemId: `minecraft:filler_${index}`, count: 64 })) },
+			death: { cause: 'lava', x: 12, y: 64, z: -8, dimensionId: 'minecraft:overworld' },
+			recovery: {
+				lastDeath: { cause: 'lava', x: 12, y: 64, z: -8, dimensionId: 'minecraft:overworld' },
+				lastLostInventory: [{ itemId: 'minecraft:stone_pickaxe', count: 1 }],
+				alreadyHave: ['minecraft:crafting_table'],
+				facts: 'Current inventory is empty. Lost on death: minecraft:stone_pickaxe.',
+			},
+			failureClass: 'recover',
+			world: { dimension: 'minecraft:overworld' },
+			blocks: Array.from({ length: 400 }, (_, index) => ({ blockId: 'minecraft:stone', x: index, y: 64, z: 0 })),
+		},
+	});
+	assert.match(truncatedDeath.contentItems[0].text, /lastDeath/);
+	assert.match(truncatedDeath.contentItems[0].text, /alreadyHave/);
+	assert.match(truncatedDeath.contentItems[0].text, /stone_pickaxe/);
+	assert.doesNotMatch(truncatedDeath.contentItems[0].text, /"state":"TRUNCATED"/);
+	const oversizedIds = {
+		observation: {
+			recovery: {
+				lastLostInventory: Array.from({ length: 16 }, (_, index) => ({
+					itemId: `minecraft:${'a'.repeat(240)}_${index}`,
+					count: 64,
+				})),
+				alreadyHave: Array.from({ length: 32 }, (_, index) => `minecraft:${'b'.repeat(240)}_${index}`),
+				doNotRedo: Array.from({ length: 24 }, (_, index) => `minecraft:${'c'.repeat(240)}_${index}`),
+				facts: 'f'.repeat(8_000),
+			},
+		},
+	};
+	const bounded = toolResultContent(oversizedIds);
+	assert.equal(bounded.contentItems[0].text.length <= 16_384, true);
+	assert.ok(Buffer.byteLength(bounded.contentItems[0].text, 'utf8') <= 16_384);
+});
+
+test('tool result byte cap still applies when survival facts are oversized', () => {
+	const text = toolResultContent({
+		observation: {
+			death: { cause: 'lava', x: 1, y: 64, z: 2, dimensionId: 'minecraft:overworld' },
+			recovery: { facts: 'x'.repeat(40_000) },
+		},
+	}).contentItems[0].text;
+	assert.equal(Buffer.byteLength(text, 'utf8') <= 16_384, true);
 });
 
 test('oversized sequence results retain every authoritative step status', () => {

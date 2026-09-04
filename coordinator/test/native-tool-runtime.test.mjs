@@ -55,6 +55,23 @@ test('native body dispatches one correlated action and resolves only its matchin
 	assert.deepEqual(await result, { state: 'SUCCEEDED', reasonCode: '', executionStarted: true });
 });
 
+test('native action results do not attach stale recovery without a fresh observation', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async (...args) => sent.push(args) } });
+	const current = record();
+	runtime.updateObservation(current, {
+		player: { x: 0, y: 64, z: 0, dead: false },
+		inventory: { items: [{ itemId: 'minecraft:iron_pickaxe', count: 1 }] },
+	}, { eventSequence: 1 });
+	const pending = runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-stale-recovery', callId: 'call-stale-recovery',
+		tool: { kind: 'action', actionType: 'wait', arguments: { durationMs: 1 } },
+	}, current);
+	await Promise.resolve();
+	runtime.onActionResult(current, { goalRevision: 3, actionId: sent[0][2].actionId, state: 'SUCCEEDED', reasonCode: 'ACTION_COMPLETED' });
+	const result = await pending;
+	assert.equal(result.recovery, undefined);
+	});
 test('native action preserves authoritative progress and terminal observation evidence', async () => {
 	const sent = [];
 	const traces = [];
@@ -210,6 +227,7 @@ test('goal-bound navigation cannot succeed outside the immutable position radius
 	assert.deepEqual(await pending, {
 		state: 'FAILED', reasonCode: 'PATH_BLOCKED',
 		message: 'Navigation could not recover from repeated stalls', executionStarted: true,
+		failureClass: 'explore',
 	});
 });
 
@@ -408,9 +426,252 @@ test('native sequence stops before later actions after the first factual failure
 		state: 'FAILED',
 		completed: 1,
 		failedAt: 0,
-		results: [{ actionType: 'navigate_to', state: 'FAILED', reasonCode: 'NO_PATH', executionStarted: true }],
+		results: [{ actionType: 'navigate_to', state: 'FAILED', reasonCode: 'NO_PATH', executionStarted: true, failureClass: 'explore' }],
 	});
 	assert.equal(sent.length, 1);
+});
+
+test('exploreFrontier walks one occupancy hop through navigate_to', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async (...args) => sent.push(args) } });
+	const current = record({ currentGoal: 'Beat Minecraft', currentGoalSpec: record().currentGoalSpec });
+	runtime.updateObservation(current, {
+		player: { x: 0, y: 64, z: 0, health: 20 },
+		position: { x: 0, y: 64, z: 0 },
+		world: { dimension: 'minecraft:overworld' },
+		inventory: { items: [{ itemId: 'minecraft:iron_pickaxe', count: 1 }] },
+		blocks: [],
+	}, { eventSequence: 4 });
+	const pending = runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-explore', callId: 'explore-1',
+		tool: { kind: 'explore_frontier', arguments: { seek: 'nether', radius: 24, timeoutMs: 15_000 } },
+	}, current);
+	await Promise.resolve();
+	assert.equal(sent[0][0], 'action_command');
+	assert.equal(sent[0][2].actionType, 'navigate_to');
+	assert.equal(Number.isFinite(sent[0][2].arguments.x), true);
+	runtime.onActionResult(current, {
+		goalRevision: 3, actionId: sent[0][2].actionId, state: 'SUCCEEDED', reasonCode: 'DESTINATION_REACHED', executionStarted: true,
+	});
+	const result = await pending;
+	assert.equal(result.state, 'SUCCEEDED');
+	assert.equal(result.frontier.kind, 'frontier');
+	assert.equal(result.frontier.seek, 'nether');
+});
+
+test('exploreFrontier reports CUE_IN_VIEW without dispatching a walk', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async (...args) => sent.push(args) } });
+	const current = record({ currentGoal: 'Beat Minecraft' });
+	runtime.updateObservation(current, {
+		player: { x: 0, y: 64, z: 0 },
+		position: { x: 0, y: 64, z: 0 },
+		world: { dimension: 'minecraft:overworld' },
+		blocks: [{ blockId: 'minecraft:obsidian', x: 1, y: 64, z: 0 }],
+		inventory: { items: [] },
+	}, { eventSequence: 2 });
+	const result = await runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-cue', callId: 'explore-cue',
+		tool: { kind: 'explore_frontier', arguments: { seek: 'nether' } },
+	}, current);
+	assert.equal(result.state, 'SUCCEEDED');
+	assert.equal(result.reasonCode, 'CUE_IN_VIEW');
+	assert.equal(result.frontier.kind, 'cue_in_view');
+	assert.deepEqual(sent, []);
+});
+
+test('exploreFrontier without a current observation fails as NO_OBSERVATION', async () => {
+	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async () => {} } });
+	const result = await runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-empty', callId: 'explore-empty',
+		tool: { kind: 'explore_frontier', arguments: { seek: 'any' } },
+	}, record());
+	assert.equal(result.state, 'FAILED');
+	assert.equal(result.reasonCode, 'NO_OBSERVATION');
+	assert.equal(result.failureClass, 'replan');
+});
+
+test('a blocked frontier hop is not retried on the next exploreFrontier call', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async (...args) => sent.push(args) } });
+	const current = record({ currentGoal: 'Beat Minecraft' });
+	const observation = {
+		player: { x: 0, y: 64, z: 0 },
+		position: { x: 0, y: 64, z: 0 },
+		world: { dimension: 'minecraft:overworld' },
+		blocks: [],
+		inventory: { items: [] },
+	};
+	runtime.updateObservation(current, observation, { eventSequence: 1 });
+	const first = runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-block-1', callId: 'explore-block-1',
+		tool: { kind: 'explore_frontier', arguments: { seek: 'any', radius: 24 } },
+	}, current);
+	await Promise.resolve();
+	const firstDestination = { ...sent[0][2].arguments };
+	runtime.onActionResult(current, {
+		goalRevision: 3, actionId: sent[0][2].actionId, state: 'FAILED', reasonCode: 'PATH_BLOCKED', executionStarted: true,
+	});
+	await first;
+	const second = runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-block-2', callId: 'explore-block-2',
+		tool: { kind: 'explore_frontier', arguments: { seek: 'any', radius: 24 } },
+	}, current);
+	await Promise.resolve();
+	assert.equal(sent[1][2].actionType, 'navigate_to');
+	assert.notDeepEqual(
+		{ x: sent[1][2].arguments.x, z: sent[1][2].arguments.z },
+		{ x: firstDestination.x, z: firstDestination.z },
+	);
+	runtime.onActionResult(current, {
+		goalRevision: 3, actionId: sent[1][2].actionId, state: 'SUCCEEDED', reasonCode: 'DESTINATION_REACHED',
+	});
+	await second;
+});
+
+test('a non-path frontier failure does not poison the destination cell', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async (...args) => sent.push(args) } });
+	const current = record({ currentGoal: 'Beat Minecraft' });
+	const observation = {
+		player: { x: 0, y: 64, z: 0 },
+		position: { x: 0, y: 64, z: 0 },
+		world: { dimension: 'minecraft:overworld' },
+		blocks: [],
+		inventory: { items: [] },
+	};
+	runtime.updateObservation(current, observation, { eventSequence: 1 });
+	const first = runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-unloaded-1', callId: 'explore-unloaded-1',
+		tool: { kind: 'explore_frontier', arguments: { seek: 'any', radius: 24 } },
+	}, current);
+	await Promise.resolve();
+	const firstDestination = { x: sent[0][2].arguments.x, z: sent[0][2].arguments.z };
+	runtime.onActionResult(current, {
+		goalRevision: 3, actionId: sent[0][2].actionId, state: 'FAILED', reasonCode: 'TARGET_NOT_LOADED', executionStarted: true,
+	});
+	await first;
+	const second = runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-unloaded-2', callId: 'explore-unloaded-2',
+		tool: { kind: 'explore_frontier', arguments: { seek: 'any', radius: 24 } },
+	}, current);
+	await Promise.resolve();
+	assert.deepEqual({ x: sent[1][2].arguments.x, z: sent[1][2].arguments.z }, firstDestination);
+	runtime.onActionResult(current, {
+		goalRevision: 3, actionId: sent[1][2].actionId, state: 'SUCCEEDED', reasonCode: 'DESTINATION_REACHED', executionStarted: true,
+	});
+	await second;
+});
+
+test('a timed-out frontier hop is not permanently blocked', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async (...args) => sent.push(args) } });
+	const current = record({ currentGoal: 'Beat Minecraft' });
+	runtime.updateObservation(current, {
+		player: { x: 0, y: 64, z: 0 },
+		position: { x: 0, y: 64, z: 0 },
+		world: { dimension: 'minecraft:overworld' },
+		blocks: [],
+		inventory: { items: [] },
+	}, { eventSequence: 1 });
+	const first = runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-timeout-1', callId: 'explore-timeout-1',
+		tool: { kind: 'explore_frontier', arguments: { seek: 'any', radius: 24 } },
+	}, current);
+	await Promise.resolve();
+	const firstDestination = { x: sent[0][2].arguments.x, z: sent[0][2].arguments.z };
+	runtime.onActionResult(current, {
+		goalRevision: 3, actionId: sent[0][2].actionId, state: 'FAILED', reasonCode: 'ACTION_TIMEOUT', executionStarted: true,
+	});
+	await first;
+	const second = runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-timeout-2', callId: 'explore-timeout-2',
+		tool: { kind: 'explore_frontier', arguments: { seek: 'any', radius: 24 } },
+	}, current);
+	await Promise.resolve();
+	assert.deepEqual({ x: sent[1][2].arguments.x, z: sent[1][2].arguments.z }, firstDestination);
+	runtime.onActionResult(current, {
+		goalRevision: 3, actionId: sent[1][2].actionId, state: 'SUCCEEDED', reasonCode: 'DESTINATION_REACHED',
+	});
+	await second;
+});
+
+test('action results omit recovery until a fresh observation arrives', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async (...args) => sent.push(args) } });
+	runtime.updateObservation(record(), {
+		player: { x: 0, y: 64, z: 0, dead: false },
+		inventory: { items: [{ itemId: 'minecraft:oak_log', count: 4 }] },
+		world: { dimension: 'minecraft:overworld' },
+	}, { eventSequence: 2 });
+	const pending = runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-craft', callId: 'craft-1',
+		tool: { kind: 'action', actionType: 'wait', arguments: { durationMs: 1 } },
+	}, record());
+	await Promise.resolve();
+	runtime.onActionResult(record(), {
+		goalRevision: 3, actionId: sent[0][2].actionId, state: 'SUCCEEDED', reasonCode: '', executionStarted: true,
+	});
+	const result = await pending;
+	assert.equal(result.recovery, undefined);
+});
+
+test('death force-updates the observation cache and keeps last live inventory as lost, not held', async () => {
+	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async () => {} } });
+	const current = record();
+	runtime.updateObservation(current, {
+		player: { x: 8, y: 64, z: 2, health: 18, dead: false },
+		inventory: { items: [{ itemId: 'minecraft:stone_pickaxe', count: 1 }] },
+		blocks: [{ blockId: 'minecraft:crafting_table', x: 9, y: 64, z: 2 }],
+		world: { dimension: 'minecraft:overworld' },
+	}, { eventSequence: 6 });
+	const death = { cause: 'lava', x: 8, y: 64, z: 2, dimensionId: 'minecraft:overworld' };
+	assert.equal(runtime.updateObservation(current, { death }, { eventSequence: 6, force: true }), true);
+	const decorated = runtime.decorateObservation(current, { death });
+	assert.equal(decorated.continuity.phase, 'dead');
+	assert.equal(decorated.failureClass, 'recover');
+	assert.equal(decorated.inventory.items.length, 0);
+	assert.equal(decorated.recovery.lastLostInventory[0].itemId, 'minecraft:stone_pickaxe');
+	assert.equal(decorated.recovery.alreadyHave.includes('minecraft:stone_pickaxe'), false);
+	assert.match(decorated.recovery.facts, /Current inventory is empty/);
+	assert.ok(decorated.options.some((option) => option.id === 'recover_corpse'));
+});
+
+test('bridge disconnect keeps recovery memory until the agent is removed', async () => {
+	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async () => {} } });
+	const current = record();
+	runtime.updateObservation(current, {
+		player: { x: 1, y: 64, z: 1, dead: false },
+		inventory: { items: [{ itemId: 'minecraft:iron_pickaxe', count: 1 }] },
+		world: { dimension: 'minecraft:overworld' },
+	}, { eventSequence: 3 });
+	await runtime.dispose('agent-a', 'bridge_disconnected');
+	const decorated = runtime.decorateObservation(current, {
+		player: { x: 1, y: 64, z: 1, dead: false },
+		inventory: { items: [{ itemId: 'minecraft:iron_pickaxe', count: 1 }] },
+		world: { dimension: 'minecraft:overworld' },
+	});
+	assert.ok(decorated.recovery.doNotRedo.includes('minecraft:stone_pickaxe'));
+	await runtime.dispose('agent-a', 'agent_removed');
+	const forgotten = runtime.decorateObservation(current, {
+		player: { x: 1, y: 64, z: 1, dead: false },
+		inventory: { items: [] },
+		world: { dimension: 'minecraft:overworld' },
+	});
+	assert.equal(forgotten.recovery?.doNotRedo?.includes('minecraft:stone_pickaxe') === true, false);
+});
+
+test('empty decorate payloads do not wipe live inventory memory', async () => {
+	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async () => {} } });
+	const current = record();
+	runtime.updateObservation(current, {
+		player: { x: 0, y: 64, z: 0, dead: false },
+		inventory: { items: [{ itemId: 'minecraft:diamond_pickaxe', count: 1 }] },
+		world: { dimension: 'minecraft:overworld' },
+	}, { eventSequence: 2 });
+	const decorated = runtime.decorateObservation(current, {});
+	assert.ok(decorated.recovery.alreadyHave.includes('minecraft:diamond_pickaxe'));
+	assert.equal(decorated.inventory.items[0].itemId, 'minecraft:diamond_pickaxe');
 });
 
 test('native sequence is cancelled if the lifecycle is disposed between steps', async () => {

@@ -11,16 +11,18 @@ Tell the executor what to do by emitting a native tool call. Plain assistant tex
 
 Use this loop:
 
-1. Read the newest event and the last tool result.
+1. Read the newest event and the last tool result. Death is the same run and the same goal, not a new episode.
 2. If a required coordinate, UUID, inventory fact, or world fact is missing or stale, call observe where needed.
-3. Emit the smallest useful speech or physical call using exact observed facts.
-4. Read the result. Continue the active goal, recover, or finish with evidence.
+3. Emit a useful speech or physical call using exact observed facts. Honor recovery, options, and failureClass as hints, not orders.
+4. Read the result. Continue the active goal, recover, explore, or finish with evidence.
+
+Recovery is coordinator-authored observation data, not a new planner. After death it names `lastDeath`, current inventory, `lastLostInventory`, and currently evidenced `alreadyHave` so you can choose whether to go back for the corpse or recraft. When present, `options[]` lists currently feasible skills (`recover_corpse`, `explore_frontier`, `interact_cue`) and `failureClass` labels the last body fault (`recover`, `replan`, `explore`, `skip`). The wrap never dispatches an action for you.
 
 Formatting, Good, and Bad blocks each show one direct native tool call. Only an explicitly combined turn uses a calls array. Formatting blocks show every accepted field, and all numeric ranges are inclusive. Required fields must be present. Optional fields may be omitted; never copy placeholder text into a call. Do not send unknown fields or arithmetic expressions. Copy coordinates, UUIDs, item IDs, recipe IDs, menu IDs, slots, selectors, and block faces from current observations or tool results.
 
 # Top-level tools
 
-## observe - Refresh the latest compact player, inventory, close-up block, farther visible landmark, entity, goal, and conversation facts.
+## observe - Refresh the latest compact player, inventory, nearby block, farther visible landmark, entity, goal, conversation, and recovery facts.
 
 Formatting:
 
@@ -104,6 +106,28 @@ Bad:
 
 ```json executor-bad-call
 {"tool":"moveTo","arguments":{"x":"12-1","y":"64+10","z":5}}
+```
+
+## exploreFrontier - Walk one bounded hop into unknown adjacent space or toward a visible biome/structure cue.
+
+Use this when the goal needs Nether access, a biome, or a structure that is not in the latest observation. The executor scores occupancy frontiers and visible cues; it does not random-walk. A CUE_IN_VIEW result means interact or mine the returned cue instead of calling exploreFrontier again. NO_FRONTIER means choose a different useful action.
+
+Formatting:
+
+```text executor-format
+{"tool":"exploreFrontier","arguments":{"seek":<optional "any"|"nether"|"cave"|"village"|"structure"; default any>,"radius":<optional integer 8..32; default 24>,"timeoutMs":<optional integer 1..120000; default 15000>,"heading":<optional "north"|"south"|"east"|"west">}}
+```
+
+Good:
+
+```json executor-call
+{"tool":"exploreFrontier","arguments":{"seek":"nether","radius":24,"timeoutMs":15000}}
+```
+
+Bad:
+
+```json executor-bad-call
+{"tool":"exploreFrontier","arguments":{"seek":"random"}}
 ```
 
 ## mine - Break one observed, visible block and return the body result. Success proves the block broke, not that its drop was collected.
@@ -234,6 +258,12 @@ Good:
 
 ```json executor-calls
 {"calls":[{"tool":"say","arguments":{"message":"I am getting wood now.","audience":"proximity"}},{"tool":"mine","arguments":{"x":11,"y":64,"z":10,"expectedBlockId":"minecraft:oak_log","timeoutMs":15000}}]}
+```
+
+Good:
+
+```json executor-calls
+{"calls":[{"tool":"say","arguments":{"message":"I will search for a portal.","audience":"proximity"}},{"tool":"exploreFrontier","arguments":{"seek":"nether"}}]}
 ```
 
 # Advanced act actions
@@ -924,6 +954,9 @@ Bad:
 
 - SUCCEEDED confirms only the action named in that result.
 - PATH_BLOCKED, ACTION_TIMEOUT, moved or missing targets, death, and reconnects require fresh facts and another useful call.
+- After death, this is the same run. Read recovery.lastDeath, current inventory, and lastLostInventory, then choose recover the corpse or recraft. Do not restart recipes for items already evidenced in inventory, drops, or placed stations.
+- Honor `failureClass` as a hint: recover after death, explore after PATH_BLOCKED / NO_FRONTIER, replan after TARGET_NOT_VISIBLE / TARGET_TOO_FAR / NO_OBSERVATION, skip RECIPE_NOT_FOUND. Successful reason codes such as BLOCK_BROKEN do not carry a failureClass.
+- After exploreFrontier, read frontier.kind. CUE_IN_VIEW is success at the cue; NO_FRONTIER and a blocked hop require a different action, not another identical wander. If `options` includes `explore_frontier` or `interact_cue`, those are copyable waypoints, not orders.
 - After mine or break_block, observe and collect the visible drop before relying on inventory. A successful break does not prove pickup.
 - After a failed completion verifier, continue the same active goal.
 - Proximity speech is asynchronous. After say or act/chat, issue the first known physical call immediately instead of waiting for playback.

@@ -1,4 +1,16 @@
 import { validateTraceId } from './control-latency-registry.mjs';
+import { ExplorationOccupancy, extractDimension, extractPosition } from './explore-frontier.mjs';
+import { hasDurableObservationFacts, RecoveryProgressStore } from './recovery-progress-wrap.mjs';
+import { classifyBodyFailure, composeTwoCallView } from './two-call-llm-wrap.mjs';
+
+const FORGET_REASONS = /agent_removed|server_replaced|coordinator_stopped/;
+const FRONTIER_BLOCKING_REASONS = new Set([
+	'PATH_BLOCKED',
+	'DESTINATION_BLOCKED',
+	'NO_PATH',
+	'NO_STANDABLE_PATH',
+	'PATH_LIMIT_REACHED',
+]);
 
 export class NativeToolRuntime {
 	#bridge;
@@ -6,37 +18,90 @@ export class NativeToolRuntime {
 	#onFinish;
 	#trace;
 	#observations = new Map();
+	#lastLive = new Map();
 	#actions = new Map();
 	#completions = new Map();
 	#staleActions = new Map();
+	#occupancy = new ExplorationOccupancy();
+	#recovery = new RecoveryProgressStore();
+	#decorateObservation;
+	#resolveFrontier;
 	#executionEpochs = new Map();
 	#sequence = 0;
 
-	constructor({ bridge, registry = null, onFinish = async () => ({ state: 'FINISH_REQUESTED' }), trace = () => {} } = {}) {
+	constructor({
+		bridge,
+		registry = null,
+		onFinish = async () => ({ state: 'FINISH_REQUESTED' }),
+		trace = () => {},
+		decorateObservation = null,
+		resolveFrontier = null,
+	} = {}) {
 		if (typeof bridge?.send !== 'function') throw new TypeError('bridge.send must be a function');
 		if (registry !== null && typeof registry?.get !== 'function') throw new TypeError('registry.get must be a function');
 		if (typeof onFinish !== 'function') throw new TypeError('onFinish must be a function');
 		if (typeof trace !== 'function') throw new TypeError('trace must be a function');
+		if (decorateObservation !== null && typeof decorateObservation !== 'function') throw new TypeError('decorateObservation must be a function');
+		if (resolveFrontier !== null && typeof resolveFrontier !== 'function') throw new TypeError('resolveFrontier must be a function');
 		this.#bridge = bridge;
 		this.#registry = registry;
 		this.#onFinish = onFinish;
 		this.#trace = trace;
+		this.#decorateObservation = decorateObservation;
+		this.#resolveFrontier = resolveFrontier;
 	}
 
-	updateObservation(record, observation, { eventSequence = 0, conversation = undefined } = {}) {
+	updateObservation(record, observation, { eventSequence = 0, conversation = undefined, force = false } = {}) {
 		validateRecord(record);
 		if (!Number.isSafeInteger(eventSequence) || eventSequence < 0) throw new TypeError('eventSequence must be a nonnegative safe integer');
+		if (force !== true && force !== false) throw new TypeError('force must be a boolean');
 		const latest = this.#observations.get(record.agentId);
-		if (latest?.goalRevision === record.goalRevision && eventSequence <= latest.eventSequence) return false;
+		if (!force && latest?.goalRevision === record.goalRevision && eventSequence <= latest.eventSequence) return false;
+		const storedSequence = force && latest?.goalRevision === record.goalRevision
+			? Math.max(eventSequence, latest.eventSequence)
+			: eventSequence;
+		const raw = mergeDeathObservation(observation ?? {}, this.#lastLive.get(record.agentId));
+		if (hasDurableObservationFacts(raw) && raw.death == null && raw.status !== 'PLAYER_DEAD' && raw.player?.dead !== true) {
+			this.#lastLive.set(record.agentId, {
+				observation: structuredClone(raw),
+				eventSequence: storedSequence,
+				goalRevision: record.goalRevision,
+			});
+		}
+		this.#recovery.remember(record.agentId, record.goalRevision, raw);
+		this.#occupancy.ingest(record.agentId, raw);
 		this.#observations.set(record.agentId, {
 			goalRevision: record.goalRevision,
-			eventSequence,
+			eventSequence: storedSequence,
 			goal: record.currentGoal ?? null,
 			goalSpec: record.currentGoalSpec ?? null,
-			observation: structuredClone(observation ?? {}),
+			observation: structuredClone(raw),
 			...(conversation === undefined ? {} : { conversation: structuredClone(conversation) }),
 		});
 		return true;
+	}
+
+	snapshotLive(agentId) {
+		const live = this.#lastLive.get(agentId);
+		return live === undefined ? null : structuredClone(live);
+	}
+
+	decorateObservation(record, observation = {}) {
+		validateRecord(record);
+		const latest = this.#observations.get(record.agentId);
+		const cached = latest?.goalRevision === record.goalRevision ? latest.observation : undefined;
+		const live = this.#lastLive.get(record.agentId)?.observation;
+		const source = resolveDecorateSource(observation, cached, live);
+		if (hasDurableObservationFacts(observation) && !isSparseDeathObservation(observation)) {
+			this.#recovery.remember(record.agentId, record.goalRevision, observation);
+		} else if (isSparseDeathObservation(observation) && hasDurableObservationFacts(source)) {
+			this.#recovery.remember(record.agentId, record.goalRevision, source);
+		}
+		return composeTwoCallView(source, this.#recovery.snapshot(record.agentId, source), {
+			occupancy: this.#occupancy,
+			agentId: record.agentId,
+			goal: record.currentGoal ?? record.currentGoalSpec?.originalRequest ?? null,
+		});
 	}
 
 	hasCurrent(record) {
@@ -54,17 +119,111 @@ export class NativeToolRuntime {
 				eventSequence: 0,
 				goal: record.currentGoal ?? null,
 				goalSpec: record.currentGoalSpec ?? null,
-				observation: {},
+				observation: this.#decorate(record, {}),
 			};
-			const { goalRevision: _goalRevision, ...facts } = latest;
-			return structuredClone(facts);
+			const { goalRevision: _goalRevision, ...facts } = structuredClone(latest);
+			facts.observation = this.#decorate(record, facts.observation ?? {});
+			return facts;
 		}
 		if (request.tool.kind === 'finish') return this.#finish(request, record, lifecycleGeneration);
+		if (request.tool.kind === 'explore_frontier') return this.#exploreFrontier(request, record);
 		const tool = constrainGoalBoundNavigation(request.tool, record.currentGoalSpec);
 		if (tool.kind === 'sequence') return this.#executeSequence({ ...request, tool }, record, this.#executionEpoch(record.agentId));
 		if (tool.kind === 'lookAround') return this.#executeLookAround(request, record, tool, this.#executionEpoch(record.agentId));
 		if (tool.kind !== 'action') throw codedError('INVALID_NATIVE_TOOL', 'Native tool did not normalize to an action');
 		return this.#executeAction(request, record, tool);
+	}
+
+	#decorate(record, observation = {}) {
+		if (this.#decorateObservation !== null) return this.#decorateObservation(record, observation);
+		return this.decorateObservation(record, observation);
+	}
+
+	#ingestFrontierArrival(record, actionObservation, destination, dimension) {
+		const arrival = frontierArrivalObservation(actionObservation, destination, dimension);
+		this.#occupancy.ingest(record.agentId, arrival);
+		const latest = this.#observations.get(record.agentId);
+		if (latest === undefined || latest.goalRevision !== record.goalRevision) return;
+		const position = extractPosition(arrival);
+		if (position === null) return;
+		const current = latest.observation ?? {};
+		latest.observation = {
+			...current,
+			position,
+			player: { ...(typeof current.player === 'object' && current.player !== null ? current.player : {}), ...position },
+			world: { ...(typeof current.world === 'object' && current.world !== null ? current.world : {}), dimension: extractDimension(arrival) },
+		};
+	}
+
+	async #exploreFrontier(request, record) {
+		const latest = this.#observations.get(record.agentId);
+		const args = request.tool.arguments ?? {};
+		if (this.#resolveFrontier !== null) {
+			const destination = this.#resolveFrontier(record, args);
+			if (destination !== null && destination !== undefined && Number.isFinite(destination.x) && Number.isFinite(destination.z)) {
+				const move = constrainGoalBoundNavigation({
+					kind: 'action',
+					actionType: 'navigate_to',
+					arguments: {
+						x: destination.x,
+						y: Number.isFinite(destination.y) ? destination.y : 64,
+						z: destination.z,
+						tolerance: Number.isFinite(destination.tolerance) ? destination.tolerance : 1,
+						sprint: destination.sprint !== false,
+						timeoutMs: args.timeoutMs ?? destination.timeoutMs ?? 15_000,
+					},
+				}, record.currentGoalSpec);
+				return this.#executeAction(request, record, move);
+			}
+		}
+		if (latest?.goalRevision !== record.goalRevision) {
+			return frontierResult('FAILED', 'NO_OBSERVATION', 'No frontier resolver or current observation is available.', {
+				kind: 'no_observation', seek: args.seek ?? 'any', radius: args.radius ?? 24,
+				dimension: 'minecraft:overworld', destination: null, cue: null, reason: 'NO_OBSERVATION',
+			});
+		}
+		const observation = latest.observation ?? {};
+		const selection = this.#occupancy.select(record.agentId, observation, {
+			seek: args.seek ?? 'any',
+			radius: args.radius ?? 24,
+			heading: args.heading,
+		});
+		this.#trace('native_explore_frontier_selected', {
+			agentId: record.agentId,
+			goalRevision: record.goalRevision,
+			kind: selection.kind,
+			seek: selection.seek,
+			reason: selection.reason,
+		});
+		if (selection.kind === 'no_observation') {
+			return frontierResult('FAILED', 'NO_OBSERVATION', 'Latest observation has no player position for frontier selection.', selection);
+		}
+		if (selection.kind === 'no_frontier') {
+			return frontierResult('FAILED', 'NO_FRONTIER', selection.reason, selection);
+		}
+		if (selection.kind === 'cue_in_view') {
+			return frontierResult('SUCCEEDED', 'CUE_IN_VIEW', selection.reason, selection);
+		}
+		const destination = selection.destination;
+		const move = constrainGoalBoundNavigation({
+			kind: 'action',
+			actionType: 'navigate_to',
+			arguments: {
+				x: destination.x,
+				y: destination.y,
+				z: destination.z,
+				tolerance: 1,
+				sprint: true,
+				timeoutMs: args.timeoutMs ?? 15_000,
+			},
+		}, record.currentGoalSpec);
+		const result = await this.#executeAction(request, record, move);
+		if (result.state !== 'SUCCEEDED' && FRONTIER_BLOCKING_REASONS.has(result.reasonCode)) {
+			this.#occupancy.markBlocked(record.agentId, selection.dimension, destination.x, destination.z);
+		} else if (result.state === 'SUCCEEDED') {
+			this.#ingestFrontierArrival(record, result.actionObservation, destination, selection.dimension);
+		}
+		return { ...result, frontier: compactFrontier(selection) };
 	}
 
 	async #executeLookAround(request, record, tool, executionEpoch) {
@@ -171,13 +330,22 @@ export class NativeToolRuntime {
 		const active = this.#actions.get(record.agentId);
 		if (active === undefined || active.goalRevision !== record.goalRevision || active.actionId !== payload.actionId) return false;
 		this.#actions.delete(record.agentId);
+		const observation = payload.actionObservation;
+		const recovery = hasAuthoritativeActionObservation(observation)
+			? this.#recovery.snapshot(record.agentId, observation)
+			: null;
+		const state = String(payload.state ?? 'FAILED').slice(0, 64);
+		const reasonCode = String(payload.reasonCode ?? '').slice(0, 128);
+		const failureClass = classifyBodyFailure(reasonCode, state);
 		const result = {
-			state: String(payload.state ?? 'FAILED').slice(0, 64),
-			reasonCode: String(payload.reasonCode ?? '').slice(0, 128),
+			state,
+			reasonCode,
 			...(payload.message === undefined ? {} : { message: String(payload.message).slice(0, 2_048) }),
 			...(payload.executionStarted === undefined ? {} : { executionStarted: payload.executionStarted === true }),
 			...(payload.physicalAttempted === undefined ? {} : { physicalAttempted: payload.physicalAttempted === true }),
 			...(payload.actionObservation === undefined ? {} : { actionObservation: structuredClone(payload.actionObservation) }),
+			...(recovery === null ? {} : { recovery }),
+			...(failureClass === null ? {} : { failureClass }),
 		};
 		this.#trace('native_tool_action_completed', { agentId: record.agentId, goalRevision: record.goalRevision, actionId: active.actionId, ...result });
 		active.resolve(result);
@@ -205,6 +373,11 @@ export class NativeToolRuntime {
 
 	async dispose(agentId, reason = 'disposed') {
 		this.#executionEpochs.set(agentId, this.#executionEpoch(agentId) + 1);
+		if (FORGET_REASONS.test(String(reason))) {
+			this.#recovery.forget(agentId);
+			this.#occupancy.clear(agentId);
+			this.#lastLive.delete(agentId);
+		}
 		this.#observations.delete(agentId);
 		const active = this.#actions.get(agentId);
 		const completion = this.#completions.get(agentId);
@@ -236,7 +409,14 @@ export class NativeToolRuntime {
 	}
 
 	async disposeAll(reason = 'coordinator_stopped') {
-		await Promise.allSettled([...new Set([...this.#observations.keys(), ...this.#actions.keys(), ...this.#completions.keys()])].map((agentId) => this.dispose(agentId, reason)));
+		const agentIds = new Set([
+			...this.#observations.keys(),
+			...this.#actions.keys(),
+			...this.#completions.keys(),
+			...this.#lastLive.keys(),
+		]);
+		await Promise.allSettled([...agentIds].map((agentId) => this.dispose(agentId, reason)));
+		if (FORGET_REASONS.test(String(reason))) this.#recovery.clear();
 	}
 
 	async #finish(request, record, lifecycleGeneration) {
@@ -329,6 +509,94 @@ function validateRequest(request, record) {
 	if (typeof request.turnId !== 'string' || request.turnId.length === 0) throw new TypeError('native tool turnId must be nonblank');
 	if (typeof request.callId !== 'string' || request.callId.length === 0) throw new TypeError('native tool callId must be nonblank');
 	if (request.tool === null || typeof request.tool !== 'object') throw new TypeError('native tool must be normalized');
+}
+
+function hasAuthoritativeActionObservation(observation) {
+	return observation !== null && typeof observation === 'object'
+		&& (observation.inventory !== undefined || observation.death != null);
+}
+
+function resolveDecorateSource(observation, cached, live) {
+	if (isSparseDeathObservation(observation) && hasDurableObservationFacts(cached ?? {})) return cached;
+	if (isSparseDeathObservation(observation) && hasDurableObservationFacts(live ?? {})) {
+		return mergeDeathObservation(observation, { observation: live });
+	}
+	if (hasDurableObservationFacts(observation)) return observation;
+	return cached ?? live ?? observation;
+}
+
+function isSparseDeathObservation(observation) {
+	return observation?.death != null
+		&& observation.inventory === undefined
+		&& observation.player === undefined
+		&& observation.world === undefined;
+}
+
+function mergeDeathObservation(observation, lastLive) {
+	if (observation?.death == null || lastLive == null) return observation;
+	const live = lastLive.observation ?? lastLive;
+	if (live === null || typeof live !== 'object') return observation;
+	return {
+		...live,
+		...observation,
+		ready: false,
+		status: 'PLAYER_DEAD',
+		player: {
+			...(typeof live.player === 'object' && live.player !== null ? live.player : {}),
+			...(typeof observation.player === 'object' && observation.player !== null ? observation.player : {}),
+			dead: true,
+			health: 0,
+			x: observation.death.x,
+			y: observation.death.y,
+			z: observation.death.z,
+		},
+		inventory: observation.inventory ?? { items: [] },
+		lastLiveInventory: live.inventory ?? null,
+		continuity: { sameGoal: true, phase: 'dead' },
+		death: observation.death,
+	};
+}
+
+function frontierResult(state, reasonCode, message, selection) {
+	const failureClass = classifyBodyFailure(reasonCode, state);
+	return {
+		state,
+		reasonCode,
+		message,
+		frontier: compactFrontier(selection),
+		...(failureClass === null ? {} : { failureClass }),
+	};
+}
+
+function compactFrontier(selection) {
+	return {
+		kind: selection.kind,
+		seek: selection.seek,
+		radius: selection.radius,
+		dimension: selection.dimension,
+		destination: selection.destination,
+		cue: selection.cue,
+		knownCells: selection.knownCells ?? 0,
+		frontierCount: selection.frontierCount ?? 0,
+		reason: selection.reason ?? '',
+	};
+}
+
+function frontierArrivalObservation(actionObservation, destination, dimension) {
+	const source = actionObservation !== null && typeof actionObservation === 'object' ? actionObservation : {};
+	const position = extractPosition(source)
+		?? (Number.isFinite(destination?.x) && Number.isFinite(destination?.z)
+			? { x: destination.x, y: Number.isFinite(destination.y) ? destination.y : 64, z: destination.z }
+			: null);
+	if (position === null) {
+		return { world: { dimension } };
+	}
+	return {
+		...source,
+		position,
+		player: { ...(typeof source.player === 'object' && source.player !== null ? source.player : {}), ...position },
+		world: { ...(typeof source.world === 'object' && source.world !== null ? source.world : {}), dimension },
+	};
 }
 
 function safeSegment(value) { return String(value).replace(/[^A-Za-z0-9._:-]/g, '_') || 'item'; }

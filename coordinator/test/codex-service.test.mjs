@@ -852,7 +852,7 @@ test('native Codex turn executes a Minecraft tool and returns its result before 
 	await agent.setGoalRevision(1);
 
 	const threadStart = transport.calls.find((call) => call.method === 'thread/start').params;
-	assert.deepEqual(threadStart.dynamicTools.map((tool) => tool.name), ['observe', 'lookAround', 'control', 'moveTo', 'mine', 'say', 'wait', 'act', 'sequence', 'finish']);
+	assert.deepEqual(threadStart.dynamicTools.map((tool) => tool.name), ['observe', 'lookAround', 'control', 'moveTo', 'exploreFrontier', 'mine', 'say', 'wait', 'act', 'sequence', 'finish']);
 	assert.equal(threadStart.baseInstructions.length < 1_500, true);
 
 	const executed = [];

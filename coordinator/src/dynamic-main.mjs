@@ -1010,12 +1010,18 @@ export class DynamicCoordinator extends EventEmitter {
 		if (this.#usesNativeTools(record)) {
 			this.#nativeRuntimeEpochs.set(record.agentId, connectionEpoch);
 			const observation = { death: structuredClone(death) };
-			this.#nativeRuntime.updateObservation(record, observation, { eventSequence: 0, conversation: this.#conversationMemory(record.agentId).history() });
+			const live = this.#nativeRuntime.snapshotLive(record.agentId);
+			const eventSequence = Number.isSafeInteger(live?.eventSequence) ? live.eventSequence : 0;
+			this.#nativeRuntime.updateObservation(record, observation, {
+				eventSequence,
+				conversation: this.#conversationMemory(record.agentId).history(),
+				force: true,
+			});
 			return this.#scheduleNativeTurn(record, {
 				agentId: record.agentId,
 				goalRevision: record.goalRevision,
 				observation,
-				eventSequence: 0,
+				eventSequence,
 				priority: 'urgent',
 				trigger: 'player_death',
 				preserveState: true,
@@ -1245,7 +1251,9 @@ export class DynamicCoordinator extends EventEmitter {
 				&& !(toolRequest.tool.kind === 'action' && toolRequest.tool.actionType === 'chat')) {
 			throw Object.assign(new Error('Idle conversation turns may only observe and reply with chat'), { code: 'CONVERSATION_ONLY' });
 		}
-		const executesBody = toolRequest.tool.kind === 'action' || toolRequest.tool.kind === 'sequence';
+		const executesBody = toolRequest.tool.kind === 'action'
+			|| toolRequest.tool.kind === 'sequence'
+			|| toolRequest.tool.kind === 'explore_frontier';
 		const supervisionKind = executesBody ? 'action' : toolRequest.tool.kind === 'finish' ? 'completion' : null;
 		let supervisionToken = null;
 		let result;
@@ -2310,7 +2318,11 @@ export class DynamicCoordinator extends EventEmitter {
 		const conversation = memory.unread(afterSequence);
 		request.nativeConversationDelivery = { afterSequence, nextSequence: conversation.nextSequence };
 		this.#nativeConversationSequences.set(record.agentId, conversation.nextSequence);
-		const input = buildNativeEventInput(record, { ...request.nativeEvent, conversation });
+		const input = buildNativeEventInput(record, {
+			...request.nativeEvent,
+			observation: this.#nativeRuntime.decorateObservation(record, request.nativeEvent.observation ?? {}),
+			conversation,
+		});
 		return request.retryInstruction === undefined ? input : `${input}\n${request.retryInstruction}`;
 	}
 
@@ -3684,20 +3696,25 @@ export function buildNativeEventInput(record, { event, trigger, observation = {}
 		...(observation.velocity === undefined ? {} : { velocity: observation.velocity }),
 		player: observation.player ?? {},
 		inventory: {
-			items: (observation.inventory?.items ?? []).slice(0, 32),
+			items: asArray(observation.inventory?.items).slice(0, 32),
 			...(observation.inventory?.selectedItem === undefined ? {} : { selectedItem: observation.inventory.selectedItem }),
 			...(observation.inventory?.tagCounts === undefined ? {} : { tagCounts: observation.inventory.tagCounts }),
 		},
-		items: (observation.items ?? []).slice(0, 16),
-		entities: (observation.entities ?? []).filter((entity) => entity?.type !== 'minecraft:item').slice(0, 16),
-		blocks: (observation.blocks ?? []).slice(0, 32),
-		...(observation.landmarks === undefined ? {} : { landmarks: observation.landmarks.slice(0, 32) }),
-		...(observation.nearbyContainers === undefined ? {} : { nearbyContainers: observation.nearbyContainers.slice(0, 16) }),
+		items: asArray(observation.items).slice(0, 16),
+		entities: asArray(observation.entities).filter((entity) => entity?.type !== 'minecraft:item').slice(0, 16),
+		blocks: asArray(observation.blocks).slice(0, 32),
+		...(Array.isArray(observation.landmarks) ? { landmarks: observation.landmarks.slice(0, 32) } : {}),
+		...(Array.isArray(observation.nearbyContainers) ? { nearbyContainers: observation.nearbyContainers.slice(0, 16) } : {}),
 		...(observation.world === undefined ? {} : { world: observation.world }),
 		...(observation.currentAction === undefined ? {} : { currentAction: observation.currentAction }),
 		...(observation.lastResult === undefined ? {} : { lastResult: observation.lastResult }),
 		...(observation.interaction === undefined ? {} : { interaction: observation.interaction }),
 		...(observation.death === undefined ? {} : { death: observation.death }),
+		...(observation.recovery === undefined ? {} : { recovery: observation.recovery }),
+		...(Array.isArray(observation.options) ? { options: observation.options.slice(0, 4) } : {}),
+		...(observation.failureClass === undefined ? {} : { failureClass: observation.failureClass }),
+		...(observation.continuity === undefined ? {} : { continuity: observation.continuity }),
+		...(observation.lastLiveInventory === undefined ? {} : { lastLiveInventory: observation.lastLiveInventory }),
 	};
 	const unreadConversation = Array.isArray(conversation)
 		? { mode: 'unread', baseSequence: null, nextSequence: conversation.at(-1)?.sequence ?? -1, entries: conversation }
@@ -3721,28 +3738,79 @@ export function buildNativeEventInput(record, { event, trigger, observation = {}
 	if (Buffer.byteLength(json, 'utf8') > 16_384) {
 		json = JSON.stringify({
 			...payload,
-			observation: { player: compactObservation.player, inventory: { items: compactObservation.inventory.items.slice(0, 16) }, items: [], entities: [], blocks: compactObservation.blocks.slice(0, 12), landmarks: (compactObservation.landmarks ?? []).slice(0, 12) },
+			observation: {
+				player: compactObservation.player,
+				inventory: { items: compactObservation.inventory.items.slice(0, 16) },
+				items: [],
+				entities: [],
+				blocks: compactObservation.blocks.slice(0, 12),
+				...(Array.isArray(compactObservation.landmarks) ? { landmarks: compactObservation.landmarks.slice(0, 12) } : {}),
+				...(compactObservation.world === undefined ? {} : { world: compactWorldForEvent(compactObservation.world) }),
+				...(compactObservation.lastResult === undefined ? {} : { lastResult: compactLastResultForEvent(compactObservation.lastResult) }),
+				...(compactObservation.recovery === undefined ? {} : { recovery: compactRecoveryForEvent(compactObservation.recovery) }),
+				...(Array.isArray(compactObservation.options) ? { options: compactObservation.options.slice(0, 2) } : {}),
+				...(compactObservation.failureClass === undefined ? {} : { failureClass: compactObservation.failureClass }),
+				...(compactObservation.death === undefined ? {} : { death: compactObservation.death }),
+				...(compactObservation.continuity === undefined ? {} : { continuity: compactObservation.continuity }),
+				...(compactObservation.lastLiveInventory === undefined ? {} : { lastLiveInventory: compactObservation.lastLiveInventory }),
+			},
 			conversation: { ...unreadConversation, entries: unreadConversation.entries.slice(-8) },
 		});
 	}
 	return `Live Minecraft event. Choose and call the smallest useful tool now.\n${json}`;
 }
 
-function nativeObservationSignature(observation) {
+function compactRecoveryForEvent(recovery) {
+	if (recovery === null || typeof recovery !== 'object') return recovery;
+	return {
+		...(recovery.lastDeath === undefined ? {} : { lastDeath: recovery.lastDeath }),
+		...(Array.isArray(recovery.lastLostInventory) ? { lastLostInventory: recovery.lastLostInventory.slice(0, 16) } : {}),
+		...(Array.isArray(recovery.alreadyHave) ? { alreadyHave: recovery.alreadyHave.slice(-32) } : {}),
+		...(Array.isArray(recovery.doNotRedo) ? { doNotRedo: recovery.doNotRedo.slice(0, 24) } : {}),
+		...(typeof recovery.facts === 'string' ? { facts: recovery.facts } : {}),
+	};
+}
+
+function compactLastResultForEvent(lastResult) {
+	if (lastResult === null || typeof lastResult !== 'object') return lastResult;
+	return {
+		...(lastResult.state === undefined ? {} : { state: lastResult.state }),
+		...(lastResult.reasonCode === undefined ? {} : { reasonCode: lastResult.reasonCode }),
+	};
+}
+
+function compactWorldForEvent(world) {
+	if (world === null || typeof world !== 'object') return world;
+	return {
+		...(world.dimension === undefined ? {} : { dimension: world.dimension }),
+		...(world.dimensionId === undefined ? {} : { dimensionId: world.dimensionId }),
+	};
+}
+
+function asArray(value) {
+	return Array.isArray(value) ? value : [];
+}
+
+export function nativeObservationSignature(observation) {
 	return createHash('sha256').update(JSON.stringify(sortFactualValue(nativeActionableObservationProjection(observation)))).digest('hex');
 }
 
 function nativeActionableObservationProjection(observation) {
 	const projection = { ...observation };
+	delete projection.recovery;
+	delete projection.options;
+	delete projection.failureClass;
+	delete projection.continuity;
+	delete projection.lastLiveInventory;
 	if (observation.player !== undefined) {
 		projection.player = { ...observation.player };
 		if (observation.player.effects !== undefined) {
 			projection.player.effects = observation.player.effects.map(({ duration, ...effect }) => effect);
 		}
 	}
-	if (observation.items !== undefined) projection.items = observation.items.map(({ distance, ...item }) => item);
-	if (observation.entities !== undefined) projection.entities = observation.entities.map(({ distance, ...entity }) => entity);
-	if (observation.nearbyContainers !== undefined) {
+	if (Array.isArray(observation.items)) projection.items = observation.items.map(({ distance, ...item }) => item);
+	if (Array.isArray(observation.entities)) projection.entities = observation.entities.map(({ distance, ...entity }) => entity);
+	if (Array.isArray(observation.nearbyContainers)) {
 		projection.nearbyContainers = observation.nearbyContainers.map(({ distance, ...container }) => container);
 	}
 	if (observation.landmarks !== undefined) {

@@ -16,12 +16,12 @@ const NATIVE_ACTION_TYPES = Object.freeze(Object.keys(ACTION_FIELDS));
 
 export const NATIVE_AGENT_INSTRUCTIONS = `You control one live Minecraft player and choose every action.
 
-Act as soon as it is safe. Do not wait to solve the whole goal or narrate a plan. Call the smallest useful tool, inspect its factual result, then choose the next. Keep decisions brief even with high reasoning.
+Act as soon as it is safe. This is one continuous run: death is the same goal, not a new episode. Check recovery (lastDeath, current inventory, lastLostInventory) before choosing corpse recovery or recrafting, and do not redo work already evidenced.
 
-Use observe when facts are missing or stale. goalSpec is Minecraft's immutable completion contract. observe includes close-up interactable blocks and sparse first-visible landmarks out to the loaded view distance; landmarks are guidance, so walk/look at them and re-observe before mining. Use lookAround for a bounded camera sweep when the current view misses useful terrain. Use control for normal exploration and traversal; use moveTo only for a short confirmed waypoint. Mine only an observed, visible, in-range block: copy exact rayTarget coordinates and non-air blockId into expectedBlockId. If it is not under the crosshair, use act/look_at, observe, then mine. Use sequence for 2+ safe actions with factual arguments, keep it short, split when later arguments depend on results, and never batch speculative navigation or combat. It stops on the first failure. Use act for supported actions. finish only asks Minecraft to verify the goal. Never claim an action unless its result confirms it. conversation_only: use say, with no physical action or finish. Plain text is not visible. For nearby voice, say at most 12 words with proximity, then call the first physical tool because speech playback is asynchronous.`;
+Call the smallest useful Minecraft tool, inspect its factual result, then choose the next. goalSpec is the immutable completion contract; options and failureClass are hints. observe includes close-up blocks and sparse first-visible landmarks out to loaded view distance. Use lookAround when the current view misses terrain, control for normal traversal, moveTo for a short confirmed waypoint, and exploreFrontier when Nether, biome, cave, or structure facts are not in view. Mine only an observed visible block using exact rayTarget coordinates and non-air blockId as expectedBlockId. Use sequence for 2+ safe factual actions, split when later steps need fresh facts, and stop on failure. Use act for supported actions and finish only to ask Minecraft to verify the goal. Never claim an action without its result. conversation_only uses say only. Plain text is not visible. For nearby voice, say at most 12 words with proximity, then call the first physical tool because speech playback is asynchronous.`;
 
 export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
-	tool('observe', 'Return the latest compact player, inventory, close-up block, farther visible landmark, entity, goal, and conversation facts.', objectSchema({})),
+	tool('observe', 'Return the latest compact player, inventory, close-up blocks, farther visible landmarks, entities, goal, conversation, and recovery facts. options and failureClass are hints.', objectSchema({})),
 	tool('lookAround', 'Turn the player through 2 to 8 short camera steps; call observe afterward to inspect the newly visible landmarks.', objectSchema({
 		centerYaw: numberSchema(-180, 180),
 		pitch: numberSchema(-90, 90),
@@ -50,6 +50,12 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 		sprint: { type: 'boolean' },
 		timeoutMs: integerSchema(1, 120_000),
 	}, ['x', 'y', 'z'])),
+	tool('exploreFrontier', 'Walk one bounded hop into unknown adjacent space or toward a visible biome/structure cue. Use when needed Nether, cave, village, or structure facts are not in view. Not a random walk.', objectSchema({
+		seek: { type: 'string', enum: ['any', 'nether', 'cave', 'village', 'structure'] },
+		radius: integerSchema(8, 32),
+		timeoutMs: integerSchema(1, 120_000),
+		heading: { type: 'string', enum: ['north', 'south', 'east', 'west'] },
+	})),
 	tool('mine', 'Mine one observed, visible, in-range block coordinate with its exact current blockId.', objectSchema({
 		x: integerSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT),
 		y: integerSchema(-2_048, 2_048),
@@ -121,6 +127,21 @@ export function normalizeMinecraftToolCall(name, value) {
 					timeoutMs: optionalInteger(args.timeoutMs, 30_000, 'timeoutMs', 1, 120_000),
 				},
 			};
+		case 'exploreFrontier': {
+			requireExactKeys(args, ['seek', 'radius', 'timeoutMs', 'heading']);
+			const seek = args.seek === undefined ? 'any' : args.seek;
+			if (!['any', 'nether', 'cave', 'village', 'structure'].includes(seek)) invalid('seek is not supported');
+			if (args.heading !== undefined && !['north', 'south', 'east', 'west'].includes(args.heading)) invalid('heading is not supported');
+			return {
+				kind: 'explore_frontier',
+				arguments: {
+					seek,
+					radius: optionalInteger(args.radius, 24, 'radius', 8, 32),
+					timeoutMs: optionalInteger(args.timeoutMs, 15_000, 'timeoutMs', 1, 120_000),
+					...(args.heading === undefined ? {} : { heading: args.heading }),
+				},
+			};
+		}
 		case 'mine':
 			requireExactKeys(args, ['x', 'y', 'z', 'expectedBlockId', 'timeoutMs']);
 			return {
@@ -204,9 +225,21 @@ function normalizeSequenceAction(value) {
 }
 
 export function toolResultContent(value, success = true) {
-	let text = JSON.stringify(value ?? null);
-	if (Buffer.byteLength(text, 'utf8') > MAX_TOOL_RESULT_BYTES && isSequenceResult(value)) {
-		text = JSON.stringify(compactSequenceResult(value));
+	const candidates = [
+		value ?? null,
+		...(isSequenceResult(value) ? [compactSequenceResult(value)] : []),
+		compactToolResult(value),
+		{ state: 'TRUNCATED', ...survivalFacts(value, 8) },
+		{ state: 'TRUNCATED', ...survivalFacts(value, 2) },
+		{ state: 'TRUNCATED', detail: 'Tool result exceeded the coordinator limit. Call observe for fresh compact facts.' },
+	];
+	let text = JSON.stringify(candidates[0]);
+	for (const candidate of candidates) {
+		text = JSON.stringify(candidate);
+		if (Buffer.byteLength(text, 'utf8') <= MAX_TOOL_RESULT_BYTES) break;
+	}
+	if (Buffer.byteLength(text, 'utf8') > MAX_TOOL_RESULT_BYTES) {
+		text = JSON.stringify({ state: 'TRUNCATED', detail: 'Tool result exceeded the coordinator limit. Call observe for fresh compact facts.' });
 	}
 	if (Buffer.byteLength(text, 'utf8') > MAX_TOOL_RESULT_BYTES) {
 		text = JSON.stringify({ state: 'TRUNCATED', detail: 'Tool result exceeded the coordinator limit. Call observe for fresh compact facts.' });
@@ -214,6 +247,85 @@ export function toolResultContent(value, success = true) {
 	return { success, contentItems: [{ type: 'inputText', text }] };
 }
 
+function compactToolResult(value) {
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+		return { state: 'TRUNCATED', detail: 'Tool result exceeded the coordinator limit. Call observe for fresh compact facts.' };
+	}
+	const observation = value.observation !== null && typeof value.observation === 'object' ? value.observation : value;
+	const hasMinecraftFacts = observation.player !== undefined
+		|| observation.inventory !== undefined
+		|| observation.death !== undefined
+		|| observation.recovery !== undefined
+		|| value.state !== undefined
+		|| value.reasonCode !== undefined;
+	if (!hasMinecraftFacts) {
+		return { state: 'TRUNCATED', detail: 'Tool result exceeded the coordinator limit. Call observe for fresh compact facts.' };
+	}
+	return {
+		...(value.state === undefined ? {} : { state: value.state }),
+		...(value.reasonCode === undefined ? {} : { reasonCode: value.reasonCode }),
+		...(value.eventSequence === undefined ? {} : { eventSequence: value.eventSequence }),
+		...(value.goal === undefined ? {} : { goal: value.goal }),
+		observation: {
+			player: observation.player ?? {},
+			inventory: { items: asToolArray(observation.inventory?.items).slice(0, 16) },
+			...(observation.death === undefined ? {} : { death: observation.death }),
+			...(observation.recovery === undefined ? {} : { recovery: compactRecovery(observation.recovery, 8) }),
+			...(Array.isArray(observation.options) ? { options: observation.options.slice(0, 2) } : {}),
+			...(observation.failureClass === undefined ? {} : { failureClass: observation.failureClass }),
+			...(observation.lastResult === undefined ? {} : { lastResult: compactLastResult(observation.lastResult) }),
+			...(observation.world === undefined ? {} : { world: compactWorld(observation.world) }),
+			...(observation.continuity === undefined ? {} : { continuity: observation.continuity }),
+			...(observation.lastLiveInventory === undefined ? {} : { lastLiveInventory: observation.lastLiveInventory }),
+		},
+		...survivalFacts(value),
+	};
+}
+
+function asToolArray(value) {
+	return Array.isArray(value) ? value : [];
+}
+
+function survivalFacts(value, maxStacks = 16) {
+	const observation = value?.observation !== null && typeof value?.observation === 'object' ? value.observation : value;
+	return {
+		...(observation?.death === undefined ? {} : { death: observation.death }),
+		...(observation?.recovery === undefined ? {} : { recovery: compactRecovery(observation.recovery, maxStacks) }),
+		...(value?.recovery === undefined ? {} : { recovery: compactRecovery(value.recovery, maxStacks) }),
+		...(observation?.failureClass === undefined && value?.failureClass === undefined ? {} : { failureClass: observation?.failureClass ?? value.failureClass }),
+		...(Array.isArray(observation?.options) ? { options: observation.options.slice(0, 2) } : {}),
+	};
+}
+
+function compactRecovery(recovery, maxStacks = 16) {
+	if (recovery === null || typeof recovery !== 'object') return recovery;
+	const lostCap = Math.min(16, maxStacks);
+	const haveCap = Math.min(32, Math.max(2, maxStacks * 2));
+	const redoCap = Math.min(24, Math.max(2, maxStacks));
+	return {
+		...(recovery.lastDeath === undefined ? {} : { lastDeath: recovery.lastDeath }),
+		...(Array.isArray(recovery.lastLostInventory) ? { lastLostInventory: recovery.lastLostInventory.slice(0, lostCap) } : {}),
+		...(Array.isArray(recovery.alreadyHave) ? { alreadyHave: recovery.alreadyHave.slice(-haveCap) } : {}),
+		...(Array.isArray(recovery.doNotRedo) ? { doNotRedo: recovery.doNotRedo.slice(0, redoCap) } : {}),
+		...(typeof recovery.facts === 'string' ? { facts: recovery.facts.slice(0, maxStacks <= 2 ? 160 : 512) } : {}),
+	};
+}
+
+function compactLastResult(lastResult) {
+	if (lastResult === null || typeof lastResult !== 'object') return lastResult;
+	return {
+		...(lastResult.state === undefined ? {} : { state: lastResult.state }),
+		...(lastResult.reasonCode === undefined ? {} : { reasonCode: lastResult.reasonCode }),
+	};
+}
+
+function compactWorld(world) {
+	if (world === null || typeof world !== 'object') return world;
+	return {
+		...(world.dimension === undefined ? {} : { dimension: world.dimension }),
+		...(world.dimensionId === undefined ? {} : { dimensionId: world.dimensionId }),
+	};
+}
 function isSequenceResult(value) {
 	return value !== null && typeof value === 'object' && !Array.isArray(value) && Array.isArray(value.results);
 }
