@@ -222,7 +222,9 @@ public final class MultiplexedServerBridgeVerification {
 			bridge = new MultiplexedServerBridge(manager, 0, secretFile, ServerSocket::new, System::nanoTime, journal);
 			bridge.hydrateActionJournalForVerification();
 
-			DurableActionJournal.Entry recovered = DurableActionJournal.open(journalFile).snapshot().getFirst();
+			journal.close();
+			DurableActionJournal recoveredJournal = DurableActionJournal.open(journalFile);
+			DurableActionJournal.Entry recovered = recoveredJournal.snapshot().getFirst();
 			assertEquals(DurableActionJournal.Phase.TERMINAL, recovered.phase(),
 					"accepted-only crash recovery is durably terminalized");
 			assertEquals("RECOVERY_UNCERTAIN", recovered.result().reasonCode(),
@@ -231,6 +233,7 @@ public final class MultiplexedServerBridgeVerification {
 					"uncertain recovery result is hydrated for coordinator replay");
 			ProgramActionLedger actions = (ProgramActionLedger) readPrivateField(bridge, "programActions");
 			assertThrowsDomain(() -> actions.accept(request), "ACTION_REPLAY");
+			recoveredJournal.close();
 		} catch (ReflectiveOperationException | IOException exception) {
 			throw new AssertionError("accepted action crash recovery verification failed", exception);
 		} finally {

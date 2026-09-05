@@ -30,7 +30,7 @@ import java.util.function.Function;
 import java.util.zip.CRC32C;
 
 /** Synchronous write-ahead journal for coordinator-issued physical actions. */
-final class DurableActionJournal {
+final class DurableActionJournal implements AutoCloseable {
 	static final int MAX_ENTRIES = 4_096;
 	private static final int SCHEMA_VERSION = 1;
 	private static final byte[] LOG_HEADER = "AAAJNL2\n".getBytes(StandardCharsets.US_ASCII);
@@ -42,6 +42,14 @@ final class DurableActionJournal {
 	private LinkedHashMap<ActionKey, Entry> entries;
 	private int persistedEventCount;
 	private long persistedBytes;
+	private FileChannel persistentChannel;
+	private long appendCount;
+	private long compactionCount;
+	private long appendNanos;
+	private long slowestAppendNanos;
+	private long compactionNanos;
+	private long slowestCompactionNanos;
+	private boolean closed;
 
 	private DurableActionJournal(Path path, int maximumEntries, int compactionEventLimit, Loaded loaded) {
 		this.path = path;
@@ -72,7 +80,9 @@ final class DurableActionJournal {
 		} else if (loaded.persistedBytes() >= 0L && Files.exists(normalized)) {
 			truncateTail(normalized, loaded.persistedBytes());
 		}
-		return new DurableActionJournal(normalized, maximumEntries, compactionEventLimit, loaded);
+		DurableActionJournal journal = new DurableActionJournal(normalized, maximumEntries, compactionEventLimit, loaded);
+		journal.openPersistentChannelIfPresent();
+		return journal;
 	}
 
 	static DurableActionJournal inMemory() {
@@ -97,10 +107,9 @@ final class DurableActionJournal {
 				throw new AgentDomainException("ACTION_REPLAY", "Program step is already bound to action ID " + entry.request().actionId());
 			}
 		}
-		Admission admission = copyForAdmission();
+		List<ActionKey> removed = admissionRemovals();
 		Entry accepted = new Entry(request, logicalGoalId, Phase.ACCEPTED, null);
-		admission.entries().put(key, accepted);
-		persist(admission.entries(), new Mutation(admission.removed(), List.of(accepted), List.of(), List.of()));
+		persist(new Mutation(removed, List.of(accepted), List.of(), List.of()));
 	}
 
 	synchronized boolean terminalIfAccepted(ServerActionResult result) {
@@ -122,9 +131,7 @@ final class DurableActionJournal {
 			if (prior.result().equals(result)) return;
 			throw new AgentDomainException("ACTION_RESULT_REPLAY_CONFLICT", "Action already has a different durable terminal result");
 		}
-		LinkedHashMap<ActionKey, Entry> next = new LinkedHashMap<>(entries);
-		next.put(key, new Entry(prior.request(), prior.logicalGoalId(), Phase.TERMINAL, result));
-		persist(next, new Mutation(List.of(), List.of(), List.of(result), List.of()));
+		persist(new Mutation(List.of(), List.of(), List.of(result), List.of()));
 	}
 
 	synchronized boolean acknowledge(AgentId agentId, long goalRevision, String actionId) {
@@ -133,51 +140,49 @@ final class DurableActionJournal {
 		if (prior == null) return false;
 		if (prior.phase() == Phase.ACCEPTED) return false;
 		if (prior.phase() == Phase.ACKNOWLEDGED) return true;
-		LinkedHashMap<ActionKey, Entry> next = new LinkedHashMap<>(entries);
-		next.put(key, new Entry(prior.request(), prior.logicalGoalId(), Phase.ACKNOWLEDGED, prior.result()));
-		persist(next, new Mutation(List.of(), List.of(), List.of(), List.of(key)));
+		persist(new Mutation(List.of(), List.of(), List.of(), List.of(key)));
 		return true;
 	}
 
 	/** Converts crash-stranded acceptances with one durable append and one fsync. */
 	synchronized void terminalizeAccepted(Function<ServerActionRequest, ServerActionResult> resultFactory) {
 		Objects.requireNonNull(resultFactory, "resultFactory must not be null");
-		LinkedHashMap<ActionKey, Entry> next = new LinkedHashMap<>(entries);
 		List<ServerActionResult> terminalized = new ArrayList<>();
-		for (Map.Entry<ActionKey, Entry> current : entries.entrySet()) {
-			Entry entry = current.getValue();
+		for (Entry entry : entries.values()) {
 			if (entry.phase() != Phase.ACCEPTED) continue;
 			ServerActionResult result = Objects.requireNonNull(resultFactory.apply(entry.request()), "recovery result must not be null");
 			verifyResult(entry.request(), result);
-			Entry terminal = new Entry(entry.request(), entry.logicalGoalId(), Phase.TERMINAL, result);
-			next.put(current.getKey(), terminal);
 			terminalized.add(result);
 		}
-		if (!terminalized.isEmpty()) persist(next, new Mutation(List.of(), List.of(), terminalized, List.of()));
+		if (!terminalized.isEmpty()) persist(new Mutation(List.of(), List.of(), terminalized, List.of()));
 	}
 
 	synchronized boolean rollbackAccepted(ServerActionRequest request) {
 		ActionKey key = ActionKey.from(request);
 		Entry prior = entries.get(key);
 		if (prior == null || prior.phase() != Phase.ACCEPTED || !prior.request().equals(request)) return false;
-		LinkedHashMap<ActionKey, Entry> next = new LinkedHashMap<>(entries);
-		next.remove(key);
-		persist(next, new Mutation(List.of(key), List.of(), List.of(), List.of()));
+		persist(new Mutation(List.of(key), List.of(), List.of(), List.of()));
 		return true;
 	}
 
 	synchronized void retainGoal(AgentId agentId, UUID logicalGoalId) {
-		LinkedHashMap<ActionKey, Entry> next = new LinkedHashMap<>(entries);
-		next.entrySet().removeIf(entry -> entry.getKey().agentId().equals(agentId)
-				&& entry.getValue().phase() == Phase.ACKNOWLEDGED
-				&& !Objects.equals(entry.getValue().logicalGoalId(), logicalGoalId));
-		if (next.size() != entries.size()) persist(next, removalMutation(entries, next));
+		List<ActionKey> removed = new ArrayList<>();
+		for (Map.Entry<ActionKey, Entry> entry : entries.entrySet()) {
+			if (entry.getKey().agentId().equals(agentId)
+					&& entry.getValue().phase() == Phase.ACKNOWLEDGED
+					&& !Objects.equals(entry.getValue().logicalGoalId(), logicalGoalId)) {
+				removed.add(entry.getKey());
+			}
+		}
+		if (!removed.isEmpty()) persist(new Mutation(List.copyOf(removed), List.of(), List.of(), List.of()));
 	}
 
 	synchronized void remove(AgentId agentId) {
-		LinkedHashMap<ActionKey, Entry> next = new LinkedHashMap<>(entries);
-		next.entrySet().removeIf(entry -> entry.getKey().agentId().equals(agentId));
-		if (next.size() != entries.size()) persist(next, removalMutation(entries, next));
+		List<ActionKey> removed = new ArrayList<>();
+		for (ActionKey key : entries.keySet()) {
+			if (key.agentId().equals(agentId)) removed.add(key);
+		}
+		if (!removed.isEmpty()) persist(new Mutation(List.copyOf(removed), List.of(), List.of(), List.of()));
 	}
 
 	synchronized List<Entry> snapshot() {
@@ -188,51 +193,56 @@ final class DurableActionJournal {
 		return persistedEventCount;
 	}
 
-	private Admission copyForAdmission() {
-		LinkedHashMap<ActionKey, Entry> next = new LinkedHashMap<>(entries);
-		List<ActionKey> removed = new ArrayList<>(1);
-		while (next.size() >= maximumEntries) {
-			ActionKey removable = null;
-			for (Map.Entry<ActionKey, Entry> candidate : next.entrySet()) {
-				if (candidate.getValue().phase() == Phase.ACKNOWLEDGED) {
-					removable = candidate.getKey();
-					break;
-				}
-			}
-			if (removable == null) {
-				throw new AgentDomainException("ACTION_JOURNAL_FULL", "Durable action journal is full of unacknowledged actions");
-			}
-			next.remove(removable);
-			removed.add(removable);
-		}
-		return new Admission(next, removed);
+	synchronized PerformanceSnapshot performanceSnapshotForVerification() {
+		return new PerformanceSnapshot(
+				persistedEventCount, persistedBytes, appendCount, compactionCount,
+				appendNanos, slowestAppendNanos, compactionNanos, slowestCompactionNanos
+		);
 	}
 
-	private void persist(LinkedHashMap<ActionKey, Entry> next, Mutation mutation) {
+	private List<ActionKey> admissionRemovals() {
+		if (entries.size() < maximumEntries) return List.of();
+		List<ActionKey> removed = new ArrayList<>(1);
+		int retainedSize = entries.size();
+		for (Map.Entry<ActionKey, Entry> candidate : entries.entrySet()) {
+			if (retainedSize < maximumEntries) break;
+			if (candidate.getValue().phase() != Phase.ACKNOWLEDGED) continue;
+			removed.add(candidate.getKey());
+			retainedSize--;
+		}
+		if (retainedSize >= maximumEntries) {
+			throw new AgentDomainException("ACTION_JOURNAL_FULL", "Durable action journal is full of unacknowledged actions");
+		}
+		return List.copyOf(removed);
+	}
+
+	private void persist(Mutation mutation) {
+		if (closed) throw new AgentDomainException("ACTION_JOURNAL_CLOSED", "Durable action journal is closed");
 		if (path != null) {
+			long started = System.nanoTime();
 			if (persistedEventCount >= compactionEventLimit) compact();
 			byte[] frame = encodeFrame(mutation);
-			if (!Files.exists(path) || persistedBytes == 0L) {
-				writeLog(path, List.of(frame));
-				persistedBytes = fileSize(path);
-			} else {
-				appendFrame(path, frame);
-				persistedBytes += frame.length;
-			}
+			appendFrame(frame);
+			long elapsed = Math.max(0L, System.nanoTime() - started);
+			appendCount++;
+			appendNanos += elapsed;
+			slowestAppendNanos = Math.max(slowestAppendNanos, elapsed);
 			persistedEventCount++;
 		}
-		entries = next;
+		applyMutation(entries, mutation);
 	}
 
 	private void compact() {
+		long started = System.nanoTime();
+		closePersistentChannel();
 		writeSnapshot(path, entries);
 		persistedEventCount = entries.size();
 		persistedBytes = fileSize(path);
-	}
-
-	private static Mutation removalMutation(Map<ActionKey, Entry> before, Map<ActionKey, Entry> after) {
-		List<ActionKey> removed = before.keySet().stream().filter(key -> !after.containsKey(key)).toList();
-		return new Mutation(removed, List.of(), List.of(), List.of());
+		openPersistentChannel();
+		long elapsed = Math.max(0L, System.nanoTime() - started);
+		compactionCount++;
+		compactionNanos += elapsed;
+		slowestCompactionNanos = Math.max(slowestCompactionNanos, elapsed);
 	}
 
 	private static Loaded read(Path path, int maximumEntries) {
@@ -306,15 +316,47 @@ final class DurableActionJournal {
 		}
 	}
 
-	private static void writeSnapshot(Path path, LinkedHashMap<ActionKey, Entry> entries) {
-		List<byte[]> frames = new ArrayList<>(entries.size());
-		for (Entry entry : entries.values()) {
-			frames.add(encodeFrame(new Mutation(List.of(), List.of(entry), List.of(), List.of())));
-		}
-		writeLog(path, frames);
+	private static void writeSnapshot(Path path, Map<ActionKey, Entry> entries) {
+		writeLog(path, channel -> {
+			for (Entry entry : entries.values()) {
+				writeFully(channel, ByteBuffer.wrap(encodeFrame(
+						new Mutation(List.of(), List.of(entry), List.of(), List.of()))));
+			}
+		});
 	}
 
-	private static void writeLog(Path path, List<byte[]> frames) {
+	private void openPersistentChannelIfPresent() {
+		if (path == null || persistedBytes == 0L || !Files.exists(path)) return;
+		openPersistentChannel();
+	}
+
+	private void openPersistentChannel() {
+		if (path == null || persistentChannel != null) return;
+		try {
+			FileChannel opened = FileChannel.open(path, StandardOpenOption.WRITE);
+			if (opened.size() != persistedBytes) {
+				opened.close();
+				throw new IOException("action journal changed after it was read");
+			}
+			opened.position(persistedBytes);
+			persistentChannel = opened;
+		} catch (IOException exception) {
+			throw ioFailure("Could not open action journal for durable appends", exception);
+		}
+	}
+
+	private void closePersistentChannel() {
+		FileChannel active = persistentChannel;
+		persistentChannel = null;
+		if (active == null) return;
+		try {
+			active.close();
+		} catch (IOException exception) {
+			throw ioFailure("Could not close action journal", exception);
+		}
+	}
+
+	private static void writeLog(Path path, FrameWriter frames) {
 		Path parent = path.getParent();
 		if (parent == null) throw new AgentDomainException("ACTION_JOURNAL_IO", "Action journal path has no parent directory");
 		Path temporary = parent.resolve(path.getFileName() + ".tmp-" + UUID.randomUUID());
@@ -322,7 +364,7 @@ final class DurableActionJournal {
 			Files.createDirectories(parent);
 			try (FileChannel channel = FileChannel.open(temporary, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
 				writeFully(channel, ByteBuffer.wrap(LOG_HEADER));
-				for (byte[] frame : frames) writeFully(channel, ByteBuffer.wrap(frame));
+				frames.write(channel);
 				channel.force(true);
 			}
 			Files.move(temporary, path, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
@@ -333,24 +375,48 @@ final class DurableActionJournal {
 				exception.addSuppressed(suppressed);
 			}
 			throw new AgentDomainException("ACTION_JOURNAL_IO", "Could not durably write action journal: " + exception.getMessage());
+		} catch (RuntimeException exception) {
+			try {
+				Files.deleteIfExists(temporary);
+			} catch (IOException suppressed) {
+				exception.addSuppressed(suppressed);
+			}
+			throw exception;
 		}
 	}
 
-	private static void appendFrame(Path path, byte[] frame) {
-		long originalSize = fileSize(path);
-		try (FileChannel channel = FileChannel.open(path, StandardOpenOption.WRITE)) {
-			channel.position(originalSize);
-			writeFully(channel, ByteBuffer.wrap(frame));
-			channel.force(true);
+	private void appendFrame(byte[] frame) {
+		if (persistentChannel == null) {
+			if (!Files.exists(path) || persistedBytes == 0L) {
+				writeLog(path, channel -> writeFully(channel, ByteBuffer.wrap(frame)));
+				persistedBytes = fileSize(path);
+				openPersistentChannel();
+				return;
+			}
+			openPersistentChannel();
+		}
+		long originalSize = persistedBytes;
+		try {
+			persistentChannel.position(originalSize);
+			writeFully(persistentChannel, ByteBuffer.wrap(frame));
+			persistentChannel.force(true);
+			persistedBytes += frame.length;
 		} catch (IOException exception) {
-			try (FileChannel channel = FileChannel.open(path, StandardOpenOption.WRITE)) {
-				channel.truncate(originalSize);
-				channel.force(true);
+			try {
+				persistentChannel.position(originalSize);
+				persistentChannel.truncate(originalSize);
+				persistentChannel.force(true);
 			} catch (IOException suppressed) {
 				exception.addSuppressed(suppressed);
 			}
 			throw new AgentDomainException("ACTION_JOURNAL_IO", "Could not durably append action journal: " + exception.getMessage());
 		}
+	}
+
+	private static AgentDomainException ioFailure(String message, IOException cause) {
+		AgentDomainException failure = new AgentDomainException("ACTION_JOURNAL_IO", message + ": " + cause.getMessage());
+		failure.initCause(cause);
+		return failure;
 	}
 
 	private static byte[] encodeFrame(Mutation mutation) {
@@ -433,6 +499,20 @@ final class DurableActionJournal {
 			entries.put(key, new Entry(prior.request(), prior.logicalGoalId(), Phase.ACKNOWLEDGED, prior.result()));
 		}
 		if (entries.size() > maximumEntries) throw corrupt("entry limit exceeded");
+	}
+
+	private static void applyMutation(LinkedHashMap<ActionKey, Entry> entries, Mutation mutation) {
+		for (ActionKey key : mutation.removed()) entries.remove(key);
+		for (Entry entry : mutation.put()) entries.put(ActionKey.from(entry.request()), entry);
+		for (ServerActionResult result : mutation.terminal()) {
+			ActionKey key = ActionKey.from(result);
+			Entry prior = entries.get(key);
+			entries.put(key, new Entry(prior.request(), prior.logicalGoalId(), Phase.TERMINAL, result));
+		}
+		for (ActionKey key : mutation.acknowledged()) {
+			Entry prior = entries.get(key);
+			entries.put(key, new Entry(prior.request(), prior.logicalGoalId(), Phase.ACKNOWLEDGED, prior.result()));
+		}
 	}
 
 	private static JsonObject encodeKey(ActionKey key) {
@@ -624,6 +704,13 @@ final class DurableActionJournal {
 		return exception;
 	}
 
+	@Override
+	public synchronized void close() {
+		if (closed) return;
+		closed = true;
+		closePersistentChannel();
+	}
+
 	enum Phase { ACCEPTED, TERMINAL, ACKNOWLEDGED }
 
 	record Entry(ServerActionRequest request, UUID logicalGoalId, Phase phase, ServerActionResult result) {
@@ -632,8 +719,6 @@ final class DurableActionJournal {
 			Objects.requireNonNull(phase, "phase must not be null");
 		}
 	}
-
-	private record Admission(LinkedHashMap<ActionKey, Entry> entries, List<ActionKey> removed) { }
 
 	private record Mutation(
 			List<ActionKey> removed,
@@ -648,6 +733,22 @@ final class DurableActionJournal {
 			long persistedBytes,
 			boolean legacy
 	) { }
+
+	record PerformanceSnapshot(
+			int persistedEventCount,
+			long persistedBytes,
+			long appendCount,
+			long compactionCount,
+			long appendNanos,
+			long slowestAppendNanos,
+			long compactionNanos,
+			long slowestCompactionNanos
+	) { }
+
+	@FunctionalInterface
+	private interface FrameWriter {
+		void write(FileChannel channel) throws IOException;
+	}
 
 	private record ActionKey(AgentId agentId, long goalRevision, String actionId) {
 		private static ActionKey from(ServerActionRequest request) {
