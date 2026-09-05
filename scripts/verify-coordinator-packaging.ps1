@@ -48,6 +48,10 @@ try {
 		'src/job-gate.mjs',
 		'src/posix-process-group.mjs',
 		'src/posix-process-wrapper.mjs',
+		'src/voice/local-speech-requirements.txt',
+		'src/voice/local-speech-worker.py',
+		'config/minecraft-agent/AGENTS.md',
+		'config/minecraft-agent/.codex/skills/minecraft-control/SKILL.md',
         'node_modules/acorn/package.json',
         'node_modules/acorn/dist/acorn.mjs'
     )) {
@@ -62,6 +66,31 @@ try {
     if ($forbidden.Count -ne 0) {
         throw "Forbidden coordinator entries are embedded: $($forbidden -join ', ')"
     }
+
+	$developmentOnly = @(
+		'src/benchmark/',
+		'src/simulator/',
+		'src/headless-matrix.mjs',
+		'src/headless-rcon.mjs',
+		'src/native-tool-ab-runner.mjs',
+		'src/native-tool-ab-trial.mjs',
+		'src/native-tool-cli-boundary.mjs',
+		'src/native-tool-load-probe.mjs',
+		'src/native-tool-probe.mjs',
+		'config/headless-provider-matrix.json',
+		'config/latency-acceptance.json',
+		'config/latency-experiment-matrix.json',
+		'config/latency-headless-matrix.json',
+		'config/latency-matrix.json',
+		'config/task9-performance-matrix.json'
+	)
+	$embeddedDevelopment = @($expected | Where-Object {
+		$entry = $_
+		$developmentOnly | Where-Object { $entry -eq $_ -or $entry.StartsWith($_) }
+	})
+	if ($embeddedDevelopment.Count -ne 0) {
+		throw "Development-only coordinator entries are embedded: $($embeddedDevelopment -join ', ')"
+	}
 
 	foreach ($record in $manifestRecords) {
 		$entry = $archive.GetEntry($prefix + $record.Path)
