@@ -4,7 +4,7 @@ Arena Agents is a Fabric + Carpet mod pack and local coordinator for Minecraft J
 
 Each agent is a real `ServerPlayer` with vanilla collision, gravity, health, hunger, inventory, and Survival/Creative/Adventure capabilities. It also has its own provider, model, thinking setting, planner session, provider-scoped working directory, goal queue, lifecycle, readable model name, and provider-themed client skin.
 
-The coordinator uses one model-authored ArenaScript control path for every summonable NPC. The former fixed two-client planner is retired and is not a runtime fallback.
+The coordinator uses the selected provider's control path for every summonable NPC: Codex defaults to native Minecraft tools, while Kimi and Cursor use model-authored ArenaScript. The former fixed two-client planner is retired and is not a runtime fallback.
 
 ## Safety boundaries
 
@@ -23,13 +23,21 @@ powershell -ExecutionPolicy Bypass -File .\scripts\run-automated-verification.ps
 
 This source-checkout command expects the project-local Java 25 toolchain under `runtime/toolchains/temurin-25`. It runs the Java/Fabric verification suite and coordinator tests. CI also checks the tracked map catalog and modules, Linux process-group cleanup, the Windows distribution transaction, and a bounded Fabric boot using the exact ZIP mod set. These checks do not call a model provider.
 
+For fast local iteration when the source and dependencies are unchanged, run the incremental route:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\run-incremental-verification.ps1
+```
+
+It keeps Gradle outputs and the build cache. It supplements, and does not replace, the clean no-cache command above or the release/CI checks.
+
 For the heavier eight-agent reliability gate, run:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-performance-reliability-verification.ps1
 ```
 
-This repeats the isolated eight-agent soak 50 times after the clean verifier. The summonable-agent path permits 16 concurrent planner turns, sends at most eight queued observations per server tick, caches expensive spatial sections for 10 ticks, and throttles action progress to a material 5% change or a one-second heartbeat. Each provider turn returns one ArenaScript envelope; the local interpreter schedules one authorized physical primitive at a time. Optional bounded `coordinator_status.latencies` rows expose sample count, p50, and p95 durations without prompts, observations, model output, or credentials. See [the measured headless report](docs/plans/2026-08-11-eight-agent-performance-reliability-report.md).
+This repeats the isolated eight-agent soak 50 times after the clean verifier. The summonable-agent path permits 16 concurrent planner turns, sends at most eight queued observations per server tick, caches expensive spatial sections for 10 ticks, and throttles action progress to a material 5% change or a one-second heartbeat. ArenaScript providers return one validated program envelope and the local interpreter schedules one authorized physical primitive at a time; Codex's native-tools path retains its own tool-session contract. Optional bounded `coordinator_status.latencies` rows expose sample count, p50, and p95 durations without prompts, observations, model output, or credentials. See [the measured headless report](docs/plans/2026-08-11-eight-agent-performance-reliability-report.md).
 
 ## Prepare the source-checkout runtime
 
