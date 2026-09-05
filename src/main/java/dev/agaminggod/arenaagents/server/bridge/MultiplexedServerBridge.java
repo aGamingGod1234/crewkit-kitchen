@@ -2471,13 +2471,13 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	private void sendObservation(AgentId agentId) {
-		boolean heartbeat = observationPublication.takeHeartbeat(agentId);
 		if (!manager.isCoordinatorVisible(agentId)) return;
 		if (manager.server() == null) return;
 		Session source = session;
 		if (source == null || !source.authenticated.get()) {
 			return;
 		}
+		boolean heartbeat = observationPublication.takeHeartbeat(agentId);
 		final JsonObject observation;
 		try {
 			observation = observations.collect(agentId);
