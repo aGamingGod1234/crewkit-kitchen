@@ -3386,7 +3386,7 @@ public final class MultiplexedServerBridgeVerification {
 
 	private static void verifyObservationCadence(List<AgentId> agents) {
 		MultiplexedServerBridge.ObservationPublication publication =
-				new MultiplexedServerBridge.ObservationPublication(16, 16);
+				new MultiplexedServerBridge.ObservationPublication(16, 16, 1);
 		List<AgentId> heartbeats = new ArrayList<>();
 		for (int tick = 0; tick < agents.size(); tick++) {
 			publication.scheduleIdleHeartbeat(agents);
@@ -3436,6 +3436,68 @@ public final class MultiplexedServerBridgeVerification {
 		assertTrue(publication.pendingCount() > 0, "heartbeat remains queued before a session reset");
 		MultiplexedServerBridge.onSessionClosed(publication, session);
 		assertEquals(0, publication.pendingCount(), "session cleanup clears pending idle heartbeats");
+		verifyDueHeartbeatCadence(agents.subList(0, Math.min(2, agents.size())));
+	}
+
+	private static void verifyDueHeartbeatCadence(List<AgentId> agents) {
+		MultiplexedServerBridge.ObservationPublication publication =
+				new MultiplexedServerBridge.ObservationPublication(16, 16, 3);
+		Object session = new Object();
+		MultiplexedServerBridge.onSessionAccepted(publication, session);
+		List<AgentId> emitted = new ArrayList<>();
+		for (int tick = 0; tick < 8; tick++) {
+			final long observedAt = 2_000L + tick;
+			publication.scheduleIdleHeartbeat(agents);
+			publication.drain(agentId -> {
+				emitted.add(agentId);
+				assertTrue(publication.takeHeartbeat(agentId), "scheduled work is marked as a heartbeat");
+				assertEquals(MultiplexedServerBridge.ObservationPublication.Result.COMMITTED,
+						publication.publish(agentId, session, observation("00000000-0000-0000-0000-000000000002", observedAt),
+								(ignoredAgent, ignoredPayload) -> true, true),
+						"a due heartbeat commits and advances its next due tick");
+			});
+		}
+		assertEquals(List.of(agents.get(0), agents.get(1), agents.get(0), agents.get(1), agents.get(0), agents.get(1)),
+				emitted, "minimum interval spaces each agent while retaining fair rotation");
+
+		MultiplexedServerBridge.ObservationPublication retryPublication =
+				new MultiplexedServerBridge.ObservationPublication(16, 16, 3);
+		MultiplexedServerBridge.onSessionAccepted(retryPublication, session);
+		retryPublication.scheduleIdleHeartbeat(List.of(agents.get(0)));
+		List<AgentId> retryDrain = new ArrayList<>();
+		retryPublication.drain(agentId -> {
+			retryDrain.add(agentId);
+			assertTrue(retryPublication.takeHeartbeat(agentId), "failed heartbeat is identified for retry");
+			assertEquals(MultiplexedServerBridge.ObservationPublication.Result.DELIVERY_RETRY,
+					retryPublication.publish(agentId, session, observation("00000000-0000-0000-0000-000000000002", 3_000L),
+								(ignoredAgent, ignoredPayload) -> false, true),
+						"a failed heartbeat remains undelivered");
+		});
+		assertTrue(retryPublication.offerHeartbeat(agents.get(0)), "failed heartbeat can be requeued");
+		retryPublication.drain(agentId -> {
+			assertTrue(retryPublication.takeHeartbeat(agentId), "requeued heartbeat retains its bypass marker");
+			assertEquals(MultiplexedServerBridge.ObservationPublication.Result.COMMITTED,
+					retryPublication.publish(agentId, session, observation("00000000-0000-0000-0000-000000000002", 3_001L),
+								(ignoredAgent, ignoredPayload) -> true, true),
+						"a requeued heartbeat commits successfully");
+		});
+		assertEquals(List.of(agents.get(0)), retryDrain, "only the failed agent is retried");
+
+		MultiplexedServerBridge.ObservationPublication cleanupPublication =
+				new MultiplexedServerBridge.ObservationPublication(16, 16, 3);
+		Object oldSession = new Object();
+		Object newSession = new Object();
+		MultiplexedServerBridge.onSessionAccepted(cleanupPublication, oldSession);
+		cleanupPublication.scheduleIdleHeartbeat(List.of(agents.get(0)));
+		MultiplexedServerBridge.onSessionAccepted(cleanupPublication, newSession);
+		assertEquals(0, cleanupPublication.pendingCount(), "session replacement clears queued heartbeat state");
+		cleanupPublication.scheduleIdleHeartbeat(List.of(agents.get(0)));
+		List<AgentId> freshSession = new ArrayList<>();
+		cleanupPublication.drain(agentId -> {
+			freshSession.add(agentId);
+			assertTrue(cleanupPublication.takeHeartbeat(agentId), "fresh session starts with a due heartbeat");
+		});
+		assertEquals(List.of(agents.get(0)), freshSession, "session replacement does not delay first observation");
 	}
 
 	private static JsonObject observation(String targetId, long observedAtEpochMs) {
