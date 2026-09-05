@@ -23,6 +23,15 @@ public final class BridgeEnvelopeCodecVerification {
 		BridgeEnvelopeCodec.EncodedFrame secondFrame = codec.encodeFrame(source);
 		assertEquals(true, firstFrame == secondFrame, "an immutable envelope caches one encoded frame");
 		assertEquals(codec.encode(source).getBytes(StandardCharsets.UTF_8).length, firstFrame.byteLength(), "encoded frame reports exact wire bytes");
+		assertEquals(codec.encodedLineBytes(source), codec.encodedLineBytesForPayload(
+				source.protocolVersion(), source.serverInstanceId(), source.agentId(), source.type(), source.messageId(),
+				source.payload()), "transient payload sizing matches the envelope encoder");
+		JsonObject escapedPayload = new JsonObject();
+		escapedPayload.addProperty("text", "quotes \\\" slash \\\\ newline \\n unicode 世界 🌍");
+		BridgeEnvelope escaped = new BridgeEnvelope(2, "server-\\\"instance", "agent-\\\\id", "observation", "message-\\\"1", escapedPayload);
+		assertEquals(codec.encodedLineBytes(escaped), codec.encodedLineBytesForPayload(
+				escaped.protocolVersion(), escaped.serverInstanceId(), escaped.agentId(), escaped.type(), escaped.messageId(),
+				escaped.payload()), "transient sizing preserves escaping and multibyte UTF-8");
 		byte[] detachedBytes = firstFrame.bytes();
 		detachedBytes[0] = (byte) 'x';
 		assertEquals((byte) '{', firstFrame.bytes()[0], "public frame bytes are detached");

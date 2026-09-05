@@ -15,6 +15,7 @@ import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.Objects;
 import java.util.Set;
 
 public final class BridgeEnvelopeCodec {
@@ -140,6 +141,29 @@ public final class BridgeEnvelopeCodec {
 		return encodedFrameUnchecked(envelope).byteLength() - 1;
 	}
 
+	/**
+	 * Returns an exact UTF-8 JSON line size for a transient payload probe without allocating an
+	 * envelope, defensive payload copy, or disposable newline frame. The metadata values are owned
+	 * by the caller for the duration of this call; callers that need envelope validation should use
+	 * {@link #encodedLineBytes(BridgeEnvelope)} instead.
+	 */
+	int encodedLineBytesForPayload(
+			int protocolVersion,
+			String serverInstanceId,
+			String agentId,
+			String type,
+			String messageId,
+			JsonObject payload
+	) {
+		Objects.requireNonNull(serverInstanceId, "serverInstanceId must not be null");
+		Objects.requireNonNull(agentId, "agentId must not be null");
+		Objects.requireNonNull(type, "type must not be null");
+		Objects.requireNonNull(messageId, "messageId must not be null");
+		Objects.requireNonNull(payload, "payload must not be null");
+		return serialize(protocolVersion, serverInstanceId, agentId, type, messageId, payload)
+				.getBytes(StandardCharsets.UTF_8).length;
+	}
+
 	public EncodedFrame encodeFrame(BridgeEnvelope envelope) {
 		EncodedFrame encoded = encodedFrameUnchecked(envelope);
 		if (encoded.byteLength() - 1 > MAX_LINE_BYTES) {
@@ -161,13 +185,31 @@ public final class BridgeEnvelopeCodec {
 	}
 
 	private static String serialize(BridgeEnvelope envelope) {
+		return serialize(
+				envelope.protocolVersion(),
+				envelope.serverInstanceId(),
+				envelope.agentId(),
+				envelope.type(),
+				envelope.messageId(),
+				envelope.payloadView()
+		);
+	}
+
+	private static String serialize(
+			int protocolVersion,
+			String serverInstanceId,
+			String agentId,
+			String type,
+			String messageId,
+			JsonObject payload
+	) {
 		JsonObject object = new JsonObject();
-		object.addProperty("protocolVersion", envelope.protocolVersion());
-		object.addProperty("serverInstanceId", envelope.serverInstanceId());
-		object.addProperty("agentId", envelope.agentId());
-		object.addProperty("type", envelope.type());
-		object.addProperty("messageId", envelope.messageId());
-		object.add("payload", envelope.payloadView());
+		object.addProperty("protocolVersion", protocolVersion);
+		object.addProperty("serverInstanceId", serverInstanceId);
+		object.addProperty("agentId", agentId);
+		object.addProperty("type", type);
+		object.addProperty("messageId", messageId);
+		object.add("payload", payload);
 		return GSON.toJson(object);
 	}
 

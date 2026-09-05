@@ -149,10 +149,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			AgentConstants.DEFAULT_AGENT_LIMIT,
 			OBSERVATIONS_PER_TICK,
 			(agentId, payload) -> ServerObservationWireBudget.fit(payload, candidate ->
-					codec.encodedLineBytes(new BridgeEnvelope(
+					codec.encodedLineBytesForPayload(
 							2, serverInstanceId, agentId.toString(), "observation",
 							MAX_OBSERVATION_MESSAGE_ID, candidate
-					)) <= BridgeEnvelopeCodec.MAX_LINE_BYTES)
+					) <= BridgeEnvelopeCodec.MAX_LINE_BYTES)
 	);
 	private final String secret;
 	private final int port;
