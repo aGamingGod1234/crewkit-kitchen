@@ -126,6 +126,8 @@ public final class AgentRegistryVerification {
 		registry.requireCapacity(4);
 		AgentRecord created = registry.create("gpt-5.6-sol", "HIGH", Optional.of("Builder"), START_TIME);
 		assertEquals(3, registry.availableCapacity(), "creating an agent consumes one capacity slot");
+		assertTrue(registry.contains(created.agentId()), "registry membership lookup finds the current agent");
+		assertTrue(!registry.contains(AgentId.random()), "registry membership lookup rejects an unknown agent");
 		expectFailure(() -> registry.requireCapacity(4), "AGENT_LIMIT_REACHED");
 		assertEquals(AgentLifecycleState.IDLE, created.state(), "new agent is idle");
 		assertEquals(RespawnPolicy.PAUSE_UNTIL_RESPAWN, created.respawnPolicy(),
@@ -171,7 +173,7 @@ public final class AgentRegistryVerification {
 		assertEquals(AgentLifecycleState.DISCONNECTED, disconnected.after().state(), "disconnect state");
 		AgentTransition resumedAfterDisconnect = registry.resume(created.agentId(), START_TIME + 8L);
 		assertEquals(AgentLifecycleState.STARTING, resumedAfterDisconnect.after().state(), "resume after coordinator reconnect");
-		return 24;
+		return 26;
 	}
 
 	private static int verifyCoordinatorCompletion() {

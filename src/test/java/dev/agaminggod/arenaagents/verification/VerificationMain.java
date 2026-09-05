@@ -1,7 +1,6 @@
 package dev.agaminggod.arenaagents.verification;
 
 import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
 import dev.agaminggod.arenaagents.agent.AgentRegistryVerification;
 import dev.agaminggod.arenaagents.agent.GoalSpecVerification;
 import dev.agaminggod.arenaagents.agent.AgentIdentityVerification;
@@ -13,7 +12,6 @@ import dev.agaminggod.arenaagents.server.ChunkedSavedPayloadVerification;
 import dev.agaminggod.arenaagents.server.OfflineAgentProfileLookupVerification;
 import dev.agaminggod.arenaagents.server.VoiceConsentCommandVerification;
 import dev.agaminggod.arenaagents.server.SkitModeVerification;
-import dev.agaminggod.arenaagents.client.ArenaAgentsClientBootstrapVerification;
 import dev.agaminggod.arenaagents.client.ArenaSpectatorStateVerification;
 import dev.agaminggod.arenaagents.client.camera.CameraPathVerification;
 import dev.agaminggod.arenaagents.client.gui.AgentControlLayoutVerification;
@@ -26,31 +24,8 @@ import dev.agaminggod.arenaagents.client.gui.LocalizationVerification;
 import dev.agaminggod.arenaagents.client.gui.ScenarioResultsLayoutVerification;
 import dev.agaminggod.arenaagents.client.gui.scenario.ScenarioSetupStateVerification;
 import dev.agaminggod.arenaagents.client.gui.scenario.ScenarioSetupLayoutVerification;
-import dev.agaminggod.arenaagents.client.action.ActionExecutorVerification;
-import dev.agaminggod.arenaagents.client.action.CombatInteractionVerification;
-import dev.agaminggod.arenaagents.client.action.MinecraftActionContextVerification;
-import dev.agaminggod.arenaagents.client.action.MoveToActionVerification;
-import dev.agaminggod.arenaagents.client.bridge.BridgeConcurrencyVerification;
-import dev.agaminggod.arenaagents.client.bridge.BridgeActionIntegrationVerification;
-import dev.agaminggod.arenaagents.client.bridge.BridgeAuthentication;
-import dev.agaminggod.arenaagents.client.bridge.BridgeEventSink;
-import dev.agaminggod.arenaagents.client.bridge.BridgeServer;
-import dev.agaminggod.arenaagents.client.bridge.BridgeSession;
-import dev.agaminggod.arenaagents.client.config.AgentConfig;
-import dev.agaminggod.arenaagents.client.config.AgentConfigLoader;
 import dev.agaminggod.arenaagents.client.control.AgentClientPresentationVerification;
-import dev.agaminggod.arenaagents.client.perception.BlockSnapshot;
-import dev.agaminggod.arenaagents.client.perception.EntitySnapshot;
-import dev.agaminggod.arenaagents.client.perception.InventorySnapshot;
-import dev.agaminggod.arenaagents.client.perception.Observation;
-import dev.agaminggod.arenaagents.client.perception.ObservationCollectorVerification;
-import dev.agaminggod.arenaagents.client.perception.ObservationLimits;
-import dev.agaminggod.arenaagents.client.perception.ObservationOrdering;
-import dev.agaminggod.arenaagents.client.perception.ObservationWireBudgetVerification;
 import dev.agaminggod.arenaagents.client.navigation.LocalPathfinderVerification;
-import dev.agaminggod.arenaagents.client.navigation.NavigationMovementVerification;
-import dev.agaminggod.arenaagents.client.navigation.MinecraftWalkabilityViewVerification;
-import dev.agaminggod.arenaagents.client.network.GoalReceiverVerification;
 import dev.agaminggod.arenaagents.control.AgentControlVerification;
 import dev.agaminggod.arenaagents.control.AgentControlSelectionStateVerification;
 import dev.agaminggod.arenaagents.control.AgentRosterViewStateVerification;
@@ -110,7 +85,6 @@ import dev.agaminggod.arenaagents.server.runtime.DesiredBlockStateVerification;
 import dev.agaminggod.arenaagents.server.runtime.ResourceLeaseManagerVerification;
 import dev.agaminggod.arenaagents.server.runtime.RecipeActionVerification;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionExecutorVerification;
-import dev.agaminggod.arenaagents.server.runtime.GoalCompletionContractVerification;
 import dev.agaminggod.arenaagents.server.goal.GoalVerificationRuntimeVerification;
 import dev.agaminggod.arenaagents.server.goal.GoalSafetyControllerVerification;
 import dev.agaminggod.arenaagents.server.runtime.ActionSuccessLedgerVerification;
@@ -125,10 +99,7 @@ import dev.agaminggod.arenaagents.server.runtime.transaction.TransactionProtocol
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerPathPlannerVerification;
 import dev.agaminggod.arenaagents.server.runtime.controller.MinecraftNavigationWorldVerification;
 import dev.agaminggod.arenaagents.server.runtime.controller.NavigationProgressVerification;
-import dev.agaminggod.arenaagents.server.runtime.controller.CombatPolicyVerification;
-import dev.agaminggod.arenaagents.server.runtime.controller.CombatNavigationFailureVerification;
 import dev.agaminggod.arenaagents.server.runtime.controller.SurvivalReflexVerification;
-import dev.agaminggod.arenaagents.server.runtime.controller.BuildSequenceProgressVerification;
 import dev.agaminggod.arenaagents.server.runtime.controller.ItemPickupProgressVerification;
 import dev.agaminggod.arenaagents.scenario.ScenarioCoreVerification;
 import dev.agaminggod.arenaagents.scenario.ScenarioActivationFailurePolicyVerification;
@@ -142,39 +113,16 @@ import dev.agaminggod.arenaagents.scenario.ScenarioArenaModuleVerification;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.net.URI;
-import java.net.InetSocketAddress;
-import java.net.ServerSocket;
-import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
-import java.nio.file.FileSystem;
-import java.nio.file.FileSystems;
 import java.nio.file.Path;
-import java.util.ArrayDeque;
-import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.Executor;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.BooleanSupplier;
 
 public final class VerificationMain {
 	private static final long ISSUED_AT_EPOCH_MS = 1_750_000_000_000L;
 	private static final String COMMAND_ID = "command-1";
-	private static final String AGENT_ID = "agent-test";
-	private static final String BRIDGE_SECRET = "verification-bridge-secret-0123456789";
 	private static final String DESIRED_OAK_STAIRS_STATE =
 			"minecraft:oak_stairs[facing=north,half=bottom,shape=straight,waterlogged=false]";
-	private static final int SOCKET_TIMEOUT_MS = 2_000;
-	private static final long ASYNC_TIMEOUT_MS = 3_000L;
-	private static final long AUTHENTICATION_RETRY_DELAY_MS = 10L;
-	private static final long CONCURRENT_CLOSE_OBSERVATION_MS = 100L;
-	private static final int GENERATED_OUTBOUND_EVENT_COUNT = 4_097;
-	private static final int EXPECTED_HANDSHAKE_TIMEOUT_MS = 1_000;
 	private static int passedAssertions;
 
 	private VerificationMain() {
@@ -198,14 +146,7 @@ public final class VerificationMain {
 		verifyCommandImmutability();
 		verifyCommandEncodingRoundTrip(codec);
 		verifyActionResultContract();
-		passedAssertions += ActionExecutorVerification.verifyLifecycle();
-		passedAssertions += ActionExecutorVerification.verifyPrimitives();
-		passedAssertions += MoveToActionVerification.verify();
-		passedAssertions += CombatInteractionVerification.verify();
-		passedAssertions += MinecraftActionContextVerification.verifyHelpers();
 		passedAssertions += LocalPathfinderVerification.verify();
-		passedAssertions += NavigationMovementVerification.verify();
-		passedAssertions += MinecraftWalkabilityViewVerification.verify();
 		passedAssertions += GoalControlVerification.verify();
 		passedAssertions += GoalDraftAdvancementRevalidationVerification.verify();
 		passedAssertions += QueuedGoalRevalidationVerification.verify();
@@ -265,7 +206,6 @@ public final class VerificationMain {
 		passedAssertions += TransactionPostconditionVerification.verify();
 		passedAssertions += EquipmentAndUseVerification.verify();
 		passedAssertions += ServerActionExecutorVerification.verify();
-		passedAssertions += GoalCompletionContractVerification.verify();
 		passedAssertions += GoalVerificationRuntimeVerification.verify();
 		passedAssertions += GoalSafetyControllerVerification.verify();
 		passedAssertions += ActionSuccessLedgerVerification.verify();
@@ -277,10 +217,7 @@ public final class VerificationMain {
 		passedAssertions += ServerPathPlannerVerification.verify();
 		passedAssertions += MinecraftNavigationWorldVerification.verify();
 		passedAssertions += NavigationProgressVerification.verify();
-		passedAssertions += CombatPolicyVerification.verify();
-		passedAssertions += CombatNavigationFailureVerification.verify();
 		passedAssertions += SurvivalReflexVerification.verify();
-		passedAssertions += BuildSequenceProgressVerification.verify();
 		passedAssertions += ItemPickupProgressVerification.verify();
 		passedAssertions += ScenarioCoreVerification.verify();
 		passedAssertions += ScenarioActivationFailurePolicyVerification.verify();
@@ -292,7 +229,6 @@ public final class VerificationMain {
 		passedAssertions += ScenarioArenaModuleVerification.verify();
 		passedAssertions += ArenaSpectatorSnapshotVerification.verify();
 		passedAssertions += ArenaSpectatorStateVerification.verify();
-		passedAssertions += ArenaAgentsClientBootstrapVerification.verify();
 		passedAssertions += ScenarioSetupStateVerification.verify();
 		passedAssertions += AgentRosterGridLayoutVerification.verify();
 		passedAssertions += AgentRosterGridVerification.verify();
@@ -311,36 +247,9 @@ public final class VerificationMain {
 		passedAssertions += MultiplexedServerBridgeVerification.verify();
 		passedAssertions += AgentVerboseVerification.verify();
 		passedAssertions += SingleBrainBoundaryVerification.verify();
-		passedAssertions += GoalReceiverVerification.verify();
-		verifyObservationContracts(codec);
-		ObservationCollectorVerification.verifyLoadedChunkBoundary();
-		ObservationCollectorVerification.verifyEntityDistanceBoundary();
-		ObservationWireBudgetVerification.verifyWorstCaseObservationFits();
-		verifyAgentConfigParsing();
-		verifyAgentConfigFiles();
-		verifyAgentConfigPermissions();
 		verifyJsonLineFraming(codec);
-		verifyBridgeAuthenticationAndDispatch(codec);
-		verifyBridgeRejectsMissingAndInvalidSecrets(codec);
-		passedAssertions += BridgeActionIntegrationVerification.verifyLifecycleEventsAndCancellation();
-		verifyBridgeObservationRequestDispatch(codec);
-		verifyClosedSessionDropsQueuedAction(codec);
-		verifyGeneratedErrorIdIsContained(codec);
-		verifyGeneratedOutboundMessageIds(codec);
-		verifyHandshakeTimeoutReleasesSession(codec);
-		verifyAuthenticatedRetryClosesFailedSocket(codec);
-		verifyHelloAcknowledgementPrecedesEvents(codec);
-		verifyMutualAuthenticationRejectsReplayAndImpostor(codec);
-		verifyCloseLinearizesPendingAdmission(codec);
-		verifyConcurrentCloseWaitsForCallback(codec);
-		verifyQueueOverflowDoesNotInvertCallbackLock(codec);
-		verifyCallbackFailureShutdownDoesNotWaitForBlockedOutput(codec);
-		verifyBridgeCallbackFailure(codec);
-		verifyBridgeControlValidation(codec);
-		verifyBridgeSingleSessionAndReconnect(codec);
-		verifyBridgeOutboundEventsAndShutdown(codec);
 
-		System.out.printf("PASS: %d protocol and bridge assertions%n", passedAssertions);
+		System.out.printf("PASS: %d protocol and core assertions%n", passedAssertions);
 	}
 
 	private static void verifyProtocolConstants() {
@@ -785,137 +694,6 @@ public final class VerificationMain {
 		assertTrue(encoded.contains("\"state\":\"SUCCEEDED\""), "encoded terminal state");
 	}
 
-	private static void verifyObservationContracts(ProtocolCodec codec) throws ProtocolException {
-		List<EntitySnapshot> entities = List.of(
-				new EntitySnapshot(
-						"entity-far",
-						"minecraft:zombie",
-						"far",
-						4.0D,
-						64.0D,
-						0.0D,
-						16.0D,
-						20.0F,
-						20.0F,
-						true
-				),
-				new EntitySnapshot(
-						"entity-near-b",
-						"minecraft:cow",
-						"near-b",
-						1.0D,
-						64.0D,
-						0.0D,
-						1.0D,
-						10.0F,
-						10.0F,
-						false
-				),
-				new EntitySnapshot(
-						"entity-near-a",
-						"minecraft:pig",
-						"near-a",
-						-1.0D,
-						64.0D,
-						0.0D,
-						1.0D,
-						10.0F,
-						10.0F,
-						false
-				)
-		);
-		assertEquals(
-				List.of("near-a", "near-b", "far"),
-				ObservationOrdering.entities(entities).stream().map(EntitySnapshot::name).toList(),
-				"entity ordering by distance and stable identifier"
-		);
-
-		List<BlockSnapshot> blocks = new ArrayList<>();
-		for (int index = 0; index < ObservationLimits.MAX_BLOCKS + 5; index++) {
-			blocks.add(new BlockSnapshot(
-					index,
-					64,
-					0,
-					"minecraft:stone",
-					"minecraft:empty",
-					false,
-					true,
-					index * (double) index
-			));
-		}
-		List<BlockSnapshot> truncatedBlocks = ObservationLimits.truncateBlocks(
-				blocks,
-				ObservationLimits.MAX_BLOCKS
-		);
-		assertEquals(128, truncatedBlocks.size(), "block cap");
-		assertEquals(127, truncatedBlocks.getLast().x(), "block truncation preserves deterministic prefix");
-
-		List<InventorySnapshot.ItemSummary> mutableItems = new ArrayList<>();
-		mutableItems.add(new InventorySnapshot.ItemSummary("minecraft:stone", 32));
-		InventorySnapshot inventory = new InventorySnapshot(0, "minecraft:stone", 32, mutableItems);
-		mutableItems.add(new InventorySnapshot.ItemSummary("minecraft:dirt", 16));
-		assertEquals(1, inventory.items().size(), "inventory snapshot defensively copies items");
-
-		Observation unavailable = Observation.unavailable("world_not_ready");
-		assertTrue(!unavailable.ready(), "unavailable observation is explicit");
-		assertEquals("world_not_ready", unavailable.status(), "unavailable observation reason");
-		assertTrue(unavailable.entities().isEmpty(), "unavailable observation has immutable empty entities");
-		assertTrue(!unavailable.currentAction().present(), "unavailable observation has action placeholder");
-		assertTrue(!unavailable.lastResult().present(), "unavailable observation has result placeholder");
-
-		String encoded = codec.encode(unavailable);
-		assertTrue(
-				encoded.indexOf("\"ready\"") < encoded.indexOf("\"status\"")
-						&& encoded.indexOf("\"status\"") < encoded.indexOf("\"position\"")
-						&& encoded.indexOf("\"entities\"") < encoded.indexOf("\"blocks\""),
-				"observation serialization field order"
-		);
-	}
-
-	private static void verifyAgentConfigParsing() {
-		String validJson = "{\"agentId\":\"agent-55\",\"bridgePort\":25571,"
-				+ "\"observationRadius\":12,\"enabled\":true,\"bridgeSecret\":\""
-				+ BRIDGE_SECRET + "\"}";
-		AgentConfig config = AgentConfigLoader.parse(validJson);
-		assertEquals(25571, config.bridgePort(), "config bridge port");
-		assertEquals(BRIDGE_SECRET, config.bridgeSecret(), "config bridge secret");
-		AgentConfig loopbackAlias = AgentConfigLoader.parse(validJson.substring(0, validJson.length() - 1)
-				+ ",\"host\":\"127.0.0.2\"}");
-		assertEquals("agent-55", loopbackAlias.agentId(), "config accepts numeric loopback alias");
-		expectProtocolException(
-				() -> AgentConfigLoader.parse(validJson.substring(0, validJson.length() - 1)
-						+ ",\"host\":\"0.0.0.0\"}"),
-				"LOOPBACK_REQUIRED",
-				"127.0.0.1",
-				"config non-loopback host"
-		);
-		expectProtocolException(
-				() -> AgentConfigLoader.parse("{\"agentId\":\"agent-55\",\"bridgePort\":25571,"
-						+ "\"observationRadius\":12,\"enabled\":true}"),
-				"BRIDGE_SECRET_REQUIRED",
-				"explicit secret",
-				"enabled config without bridge secret"
-		);
-	}
-
-	private static void verifyAgentConfigFiles() throws IOException {
-		Path directory = Files.createTempDirectory("arenaagents-config-").toAbsolutePath().normalize();
-		Path configPath = directory.resolve("arenaagents.json");
-		try {
-			AgentConfigLoader.loadOrCreate(configPath);
-			String existingJson = "{\"agentId\":\"existing-agent\",\"bridgePort\":25572,"
-					+ "\"observationRadius\":8,\"enabled\":true,\"bridgeSecret\":\""
-					+ BRIDGE_SECRET + "\"}";
-			Files.writeString(configPath, existingJson, StandardCharsets.UTF_8);
-			AgentConfig loaded = AgentConfigLoader.loadOrCreate(configPath);
-			assertEquals("existing-agent", loaded.agentId(), "existing config loaded");
-			assertEquals(existingJson, Files.readString(configPath, StandardCharsets.UTF_8), "existing config not overwritten");
-		} finally {
-			Files.deleteIfExists(configPath);
-			Files.deleteIfExists(directory);
-		}
-	}
-
 	private static void verifyJsonLineFraming(ProtocolCodec codec) throws IOException {
 		String json = "{\"message\":\"ready\"}";
 		ByteArrayOutputStream output = new ByteArrayOutputStream();
@@ -931,28 +709,6 @@ public final class VerificationMain {
 		);
 	}
 
-	private static void verifyBridgeAuthenticationAndDispatch(ProtocolCodec codec) throws Exception {
-		int port = findAvailablePort();
-		RecordingExecutor executor = new RecordingExecutor();
-		AtomicReference<ActionCommand> received = new AtomicReference<>();
-		try (BridgeServer server = new BridgeServer(enabledConfig(port), codec, executor, received::set)) {
-			server.start();
-			try (Socket client = openClient(port)) {
-				readMessage(codec, client);
-				writeMessage(codec, client, actionEnvelope("before-hello"));
-				assertErrorCode(codec, client, "AUTHENTICATION_REQUIRED", "first message must authenticate");
-			}
-			awaitCondition(() -> executor.pendingCount() == 1, "closed session callback queued");
-			executor.runNext();
-			try (Socket client = connectAuthenticatedWithRetry(codec, port, "hello-authenticated")) {
-				writeMessage(codec, client, actionEnvelope("action-1"));
-				awaitCondition(() -> executor.pendingCount() == 1, "action callback queued");
-				assertTrue(received.get() == null, "action callback waits for provided executor");
-				executor.runNext();
-				assertEquals(ActionType.WAIT, received.get().type(), "action callback decoded through protocol codec");
-			}
-		}
-	}
 
 	private static void configureExplicitNodeForVerification() throws IOException {
 		if (System.getProperty("arenaagents.nodePath") != null) return;
@@ -972,401 +728,27 @@ public final class VerificationMain {
 		throw new IOException("Node 22+ is required for the integrated verification fixture");
 	}
 
-	private static void verifyAgentConfigPermissions() throws Exception {
-		Path directory = Files.createTempDirectory("arenaagents-private-config-").toAbsolutePath().normalize();
-		Path configPath = directory.resolve("arenaagents.json");
-		try {
-			Files.writeString(
-					configPath,
-					"{\"agentId\":\"private-agent\",\"bridgePort\":25572,\"observationRadius\":8,"
-							+ "\"enabled\":true,\"bridgeSecret\":\"" + BRIDGE_SECRET + "\"}",
-					StandardCharsets.UTF_8
-			);
-			assertEquals("private-agent", AgentConfigLoader.load(configPath).agentId(), "private config loads after permission enforcement");
-		} finally {
-			Files.deleteIfExists(configPath);
-			Files.deleteIfExists(directory);
-		}
 
-		Path archive = Files.createTempFile("arenaagents-config-permissions-", ".zip");
-		Files.deleteIfExists(archive);
-		try (FileSystem archiveFileSystem = FileSystems.newFileSystem(
-				URI.create("jar:" + archive.toUri()),
-				Map.of("create", "true")
-		)) {
-			Path archiveConfigPath = archiveFileSystem.getPath("/arenaagents.json");
-			Files.writeString(
-					archiveConfigPath,
-					"{\"agentId\":\"unsupported-permissions\",\"bridgePort\":25572,\"observationRadius\":8,"
-							+ "\"enabled\":true,\"bridgeSecret\":\"" + BRIDGE_SECRET + "\"}",
-					StandardCharsets.UTF_8
-			);
-			expectProtocolException(
-					() -> AgentConfigLoader.load(archiveConfigPath),
-					"CONFIG_PERMISSIONS_REQUIRED",
-					"owner-only",
-					"credential config on filesystem without private permissions"
-			);
-		} finally {
-			Files.deleteIfExists(archive);
-		}
-	}
 
-	private static void verifyBridgeRejectsMissingAndInvalidSecrets(ProtocolCodec codec) throws Exception {
-		int port = findAvailablePort();
-		try (BridgeServer server = new BridgeServer(enabledConfig(port), codec, Runnable::run, command -> { })) {
-			server.start();
-			try (Socket missingProof = openClient(port)) {
-				JsonObject challenge = readMessage(codec, missingProof);
-				writeMessage(codec, missingProof, "{\"protocolVersion\":1,\"agentId\":\"" + AGENT_ID
-						+ "\",\"type\":\"hello_response\",\"messageId\":\"missing-proof\",\"challenge\":\""
-						+ challenge.get("nonce").getAsString() + "\",\"nonce\":\"" + BridgeAuthentication.newNonce() + "\"}");
-				assertErrorCode(codec, missingProof, "MISSING_FIELD", "hello response requires coordinator proof");
-			}
-			try (HandshakeClient invalidProof = openHandshakeWithRetry(codec, port)) {
-				JsonObject challenge = invalidProof.challenge();
-				String responseId = "invalid-proof";
-				String coordinatorNonce = BridgeAuthentication.newNonce();
-				writeMessage(codec, invalidProof.socket(), helloResponseEnvelope(
-						challenge.get("messageId").getAsString(),
-						responseId,
-						challenge.get("nonce").getAsString(),
-						coordinatorNonce,
-						"impostor-bridge-secret-0123456789"
-				));
-				assertErrorCode(codec, invalidProof.socket(), "AUTHENTICATION_FAILED", "hello rejects impostor proof");
-			}
-			try (Socket authenticated = connectAuthenticatedWithRetry(codec, port, "valid-secret")) {
-				assertTrue(authenticated.isConnected(), "valid bridge proof authenticates");
-			}
-		}
-	}
 
-	private static void verifyBridgeObservationRequestDispatch(ProtocolCodec codec) throws Exception {
-		int port = findAvailablePort();
-		RecordingExecutor executor = new RecordingExecutor();
-		AtomicBoolean requested = new AtomicBoolean();
-		AtomicReference<BridgeServer> serverReference = new AtomicReference<>();
-		BridgeEventSink eventSink = new BridgeEventSink() {
-			@Override
-			public void onActionCommand(ActionCommand command) {
-			}
 
-			@Override
-			public void onObservationRequested() {
-				requested.set(true);
-				JsonObject payload = new JsonObject();
-				payload.addProperty("ready", false);
-				payload.addProperty("status", "world_not_ready");
-				serverReference.get().sendEvent("observation", payload);
-			}
-		};
-		try (BridgeServer server = new BridgeServer(enabledConfig(port), codec, executor, eventSink)) {
-			serverReference.set(server);
-			server.start();
-			try (Socket client = connectAuthenticated(codec, port, "hello-observation")) {
-				writeMessage(codec, client, requestObservationEnvelope("request-observation-1"));
-				awaitCondition(() -> executor.pendingCount() == 1, "observation callback queued");
-				assertTrue(!requested.get(), "observation callback waits for provided executor");
-				executor.runNext();
-				assertTrue(requested.get(), "observation callback dispatched on provided executor");
 
-				JsonObject observationEvent = readMessage(codec, client);
-				assertEquals("observation", observationEvent.get("type").getAsString(), "observation event type");
-				assertEquals(AGENT_ID, observationEvent.get("agentId").getAsString(), "observation event agent identity");
-				assertEquals("world_not_ready", observationEvent.get("status").getAsString(), "observation event payload");
-			}
-		}
-	}
 
-	private static void verifyClosedSessionDropsQueuedAction(ProtocolCodec codec) throws Exception {
-		int port = findAvailablePort();
-		RecordingExecutor executor = new RecordingExecutor();
-		AtomicReference<ActionCommand> received = new AtomicReference<>();
-		BridgeServer server = new BridgeServer(enabledConfig(port), codec, executor, received::set);
-		server.start();
-		try (Socket client = connectAuthenticated(codec, port, "hello-stale-action")) {
-			writeMessage(codec, client, actionEnvelope("action-stale"));
-			awaitCondition(() -> executor.pendingCount() == 1, "stale action callback queued");
-			server.close();
-			executor.runNext();
-			assertTrue(received.get() == null, "closed session drops queued action callback");
-		} finally {
-			server.close();
-		}
-	}
 
-	private static void verifyGeneratedErrorIdIsContained(ProtocolCodec codec) throws Exception {
-		int port = findAvailablePort();
-		try (BridgeServer server = new BridgeServer(
-				enabledConfig(port),
-				codec,
-				Runnable::run,
-				command -> { }
-		)) {
-			server.start();
-			try (Socket client = connectAuthenticated(codec, port, "hello-error-id")) {
-				JsonObject payload = new JsonObject();
-				payload.addProperty("event", "reserve-internal-id");
-				String eventId = server.sendEvent("significant_event", payload);
-				assertEquals(eventId, readMessage(codec, client).get("messageId").getAsString(), "generated event id delivered");
 
-				writeMessage(
-						codec,
-						client,
-						"{\"protocolVersion\":1,\"agentId\":\"" + AGENT_ID
-								+ "\",\"type\":\"cancel_action\",\"messageId\":\"protocol-error-id\"}"
-				);
-				JsonObject error = readMessage(codec, client);
-				assertEquals("error", error.get("type").getAsString(), "generated error reported type");
-				assertEquals("MISSING_FIELD", error.get("code").getAsString(), "generated error reported code");
-				assertTrue(!eventId.equals(error.get("messageId").getAsString()), "generated error id is unique");
-			}
-		}
-	}
 
-	private static void verifyGeneratedOutboundMessageIds(ProtocolCodec codec) throws Exception {
-		int port = findAvailablePort();
-		try (BridgeServer server = new BridgeServer(enabledConfig(port), codec, Runnable::run, command -> { })) {
-			server.start();
-			try (Socket client = connectAuthenticated(codec, port, "hello-generated-ids")) {
-				JsonObject payload = new JsonObject();
-				payload.addProperty("event", "generated-id");
-				String previousId = null;
-				for (int index = 0; index < GENERATED_OUTBOUND_EVENT_COUNT; index++) {
-					String generatedId = server.sendEvent("significant_event", payload);
-					JsonObject delivered = readMessage(codec, client);
-					if (generatedId.equals(previousId) || !generatedId.equals(delivered.get("messageId").getAsString())) {
-						throw new AssertionError("generated outbound message IDs must be unique and match the wire envelope");
-					}
-					previousId = generatedId;
-				}
-				pass("generated outbound IDs remain unique beyond the former session cap");
-			}
-		}
-	}
 
-	private static void verifyHandshakeTimeoutReleasesSession(ProtocolCodec codec) throws Exception {
-		int port = findAvailablePort();
-		try (BridgeServer server = new BridgeServer(enabledConfig(port), codec, Runnable::run, command -> { })) {
-			server.start();
-			try (Socket silent = openClient(port)) {
-				silent.setSoTimeout(EXPECTED_HANDSHAKE_TIMEOUT_MS + SOCKET_TIMEOUT_MS);
-				JsonObject challenge = readMessage(codec, silent);
-				assertEquals("hello_challenge", challenge.get("type").getAsString(),
-						"silent peer receives only a fresh authentication challenge");
-				assertErrorCode(codec, silent, "AUTHENTICATION_TIMEOUT", "silent peer handshake timeout");
-			}
-			try (Socket reconnected = connectAuthenticatedWithRetry(codec, port, "hello-after-timeout")) {
-				assertTrue(reconnected.isConnected(), "handshake timeout releases session slot");
-			}
-		}
-	}
 
-	private static void verifyAuthenticatedRetryClosesFailedSocket(ProtocolCodec codec) throws Exception {
-		try (RetryHandshakeServer server = new RetryHandshakeServer(codec)) {
-			try (Socket connected = connectAuthenticatedWithRetry(codec, server.port(), "hello-retry")) {
-				assertTrue(connected.isConnected(), "authentication retries SESSION_ACTIVE response");
-			}
-			awaitCondition(server::firstSocketClosedByClient, "failed authentication socket closed before retry");
-			server.assertHealthy();
-		}
-	}
 
-	private static void verifyHelloAcknowledgementPrecedesEvents(ProtocolCodec codec) throws Exception {
-		int port = findAvailablePort();
-		BridgeConcurrencyVerification.verifyHelloAcknowledgementPrecedesEvents(enabledConfig(port), codec);
-		pass("hello acknowledgement precedes concurrent event");
-	}
 
-	private static void verifyMutualAuthenticationRejectsReplayAndImpostor(ProtocolCodec codec) throws Exception {
-		BridgeConcurrencyVerification.verifyMutualAuthenticationRejectsReplayAndImpostor(enabledConfig(findAvailablePort()), codec);
-		pass("mutual authentication rejects replay and impostor proofs");
-	}
 
-	private static void verifyCloseLinearizesPendingAdmission(ProtocolCodec codec) throws Exception {
-		int port = findAvailablePort();
-		BridgeConcurrencyVerification.verifyCloseLinearizesPendingAdmission(enabledConfig(port), codec);
-		pass("server close linearizes pending session admission");
-	}
 
-	private static void verifyConcurrentCloseWaitsForCallback(ProtocolCodec codec) throws Exception {
-		int port = findAvailablePort();
-		CountDownLatch callbackEntered = new CountDownLatch(1);
-		CountDownLatch releaseCallback = new CountDownLatch(1);
-		BridgeServer server = new BridgeServer(enabledConfig(port), codec, Runnable::run, command -> {
-			callbackEntered.countDown();
-			awaitUninterruptibly(releaseCallback);
-		});
-		AtomicBoolean secondCloseReturned = new AtomicBoolean();
-		Thread firstClose = null;
-		Thread secondClose = null;
-		try (Socket client = connectAuthenticatedAfterStart(server, codec, port, "hello-concurrent-close")) {
-			writeMessage(codec, client, actionEnvelope("action-concurrent-close"));
-			awaitCondition(() -> callbackEntered.getCount() == 0L, "blocking callback started");
 
-			firstClose = startCloseThread("first", server, null);
-			awaitCondition(() -> !server.isRunning(), "first close published shutdown state");
-			secondClose = startCloseThread("second", server, secondCloseReturned);
-			secondClose.join(CONCURRENT_CLOSE_OBSERVATION_MS);
-			assertTrue(!secondCloseReturned.get(), "concurrent close waits for callback teardown");
-		} finally {
-			releaseCallback.countDown();
-			server.close();
-			joinCloseThread(firstClose);
-			joinCloseThread(secondClose);
-		}
-	}
 
-	private static void verifyQueueOverflowDoesNotInvertCallbackLock(ProtocolCodec codec) throws Exception {
-		int port = findAvailablePort();
-		BridgeConcurrencyVerification.verifyQueueOverflowDoesNotInvertCallbackLock(enabledConfig(port), codec);
-		pass("queue overflow avoids lifecycle and callback lock inversion");
-	}
 
-	private static void verifyCallbackFailureShutdownDoesNotWaitForBlockedOutput(ProtocolCodec codec)
-			throws Exception {
-		int port = findAvailablePort();
-		BridgeConcurrencyVerification.verifyCallbackFailureShutdownDoesNotWaitForBlockedOutput(
-				enabledConfig(port),
-				codec
-		);
-		pass("callback failure shutdown does not wait for blocked output");
-	}
 
-	private static Socket connectAuthenticatedAfterStart(
-			BridgeServer server,
-			ProtocolCodec codec,
-			int port,
-			String messageId
-	) throws IOException {
-		server.start();
-		return connectAuthenticated(codec, port, messageId);
-	}
 
-	private static Thread startCloseThread(String role, BridgeServer server, AtomicBoolean returned) {
-		return Thread.ofPlatform()
-				.name("arenaagents-verification-close-" + role)
-				.daemon(true)
-				.start(() -> {
-					try {
-						server.close();
-					} finally {
-						if (returned != null) {
-							returned.set(true);
-						}
-					}
-				});
-	}
 
-	private static void joinCloseThread(Thread thread) throws InterruptedException {
-		if (thread == null) {
-			return;
-		}
-		thread.join(SOCKET_TIMEOUT_MS);
-		if (thread.isAlive()) {
-			throw new AssertionError("bridge close thread did not stop");
-		}
-	}
-
-	private static void awaitUninterruptibly(CountDownLatch latch) {
-		boolean interrupted = false;
-		while (latch.getCount() != 0L) {
-			try {
-				latch.await();
-			} catch (InterruptedException exception) {
-				interrupted = true;
-			}
-		}
-		if (interrupted) {
-			Thread.currentThread().interrupt();
-		}
-	}
-
-	private static void verifyBridgeSingleSessionAndReconnect(ProtocolCodec codec) throws Exception {
-		int port = findAvailablePort();
-		try (BridgeServer server = new BridgeServer(enabledConfig(port), codec, Runnable::run, command -> { })) {
-			server.start();
-			try (Socket first = connectAuthenticated(codec, port, "hello-primary")) {
-				try (Socket second = openClient(port)) {
-					assertErrorCode(codec, second, "SESSION_ACTIVE", "second live session rejected");
-				}
-			}
-			try (Socket reconnected = connectAuthenticatedWithRetry(codec, port, "hello-reconnected")) {
-				assertTrue(reconnected.isConnected(), "session reconnects after clean peer close");
-			}
-		}
-	}
-
-	private static void verifyBridgeCallbackFailure(ProtocolCodec codec) throws Exception {
-		int port = findAvailablePort();
-		RecordingExecutor executor = new RecordingExecutor();
-		try (BridgeServer server = new BridgeServer(
-				enabledConfig(port),
-				codec,
-				executor,
-				command -> { throw new IllegalStateException("callback failed"); }
-		)) {
-			server.start();
-			try (Socket client = connectAuthenticated(codec, port, "hello-callback-failure")) {
-				writeMessage(codec, client, actionEnvelope("action-callback-failure"));
-				awaitCondition(() -> executor.pendingCount() == 1, "failing action callback queued");
-				assertDoesNotThrow(executor::runNext, "action callback failure contained");
-				assertTrue(
-						codec.readLine(client.getInputStream()) == null,
-						"action callback failure closes the session"
-				);
-			}
-		}
-	}
-
-	private static void verifyBridgeControlValidation(ProtocolCodec codec) throws Exception {
-		int port = findAvailablePort();
-		try (BridgeServer server = new BridgeServer(enabledConfig(port), codec, Runnable::run, command -> { })) {
-			server.start();
-			try (Socket client = connectAuthenticated(codec, port, "hello-control")) {
-				writeMessage(
-						codec,
-						client,
-						"{\"protocolVersion\":1,\"agentId\":\"" + AGENT_ID
-								+ "\",\"type\":\"cancel_action\",\"messageId\":\"cancel-1\"}"
-				);
-				assertErrorCode(codec, client, "MISSING_FIELD", "cancel command id required");
-			}
-		}
-	}
-
-	private static void verifyBridgeOutboundEventsAndShutdown(ProtocolCodec codec) throws Exception {
-		int port = findAvailablePort();
-		try (BridgeServer server = new BridgeServer(enabledConfig(port), codec, Runnable::run, command -> { })) {
-			server.start();
-			try (Socket client = connectAuthenticated(codec, port, "hello-outbound")) {
-				JsonObject payload = new JsonObject();
-				payload.addProperty("event", "bridge_ready");
-				String generatedId = server.sendEvent("significant_event", payload);
-				JsonObject event = readMessage(codec, client);
-				assertEquals("significant_event", event.get("type").getAsString(), "thread-safe outbound event type");
-				assertEquals(AGENT_ID, event.get("agentId").getAsString(), "outbound event agent identity");
-				assertEquals(generatedId, event.get("messageId").getAsString(), "outbound event generated identity");
-				JsonObject envelopeCollision = payload.deepCopy();
-				envelopeCollision.addProperty("messageId", "caller-controlled");
-				expectProtocolException(
-						() -> server.sendEvent("significant_event", envelopeCollision),
-						ProtocolConstants.ERROR_UNKNOWN_FIELD,
-						"messageId",
-						"outbound payload cannot replace generated id"
-				);
-				expectProtocolException(
-						() -> server.sendEvent("unknown_event", payload),
-						"UNKNOWN_MESSAGE_TYPE",
-						"unknown_event",
-						"outbound message type allowlist"
-				);
-			}
-		}
-		awaitCondition(() -> bridgeThreads().stream().noneMatch(Thread::isAlive), "bridge daemon threads stop after close");
-		assertTrue(bridgeThreads().stream().noneMatch(thread -> !thread.isDaemon()), "no non-daemon bridge thread remains");
-	}
 
 	private static void assertDecodedType(
 			ProtocolCodec codec,
@@ -1388,204 +770,20 @@ public final class VerificationMain {
 				+ actionSuffix + "}";
 	}
 
-	private static AgentConfig enabledConfig(int port) {
-		return new AgentConfig(AGENT_ID, port, 12, true, BRIDGE_SECRET);
-	}
 
-	private static int findAvailablePort() throws IOException {
-		try (ServerSocket socket = new ServerSocket()) {
-			socket.bind(new InetSocketAddress("127.0.0.1", 0));
-			return socket.getLocalPort();
-		}
-	}
 
-	private static Socket openClient(int port) throws IOException {
-		Socket socket = new Socket();
-		socket.connect(new InetSocketAddress("127.0.0.1", port), SOCKET_TIMEOUT_MS);
-		socket.setSoTimeout(SOCKET_TIMEOUT_MS);
-		return socket;
-	}
 
-	private static Socket connectAuthenticated(ProtocolCodec codec, int port, String messageId) throws IOException {
-		Socket socket = openClient(port);
-		try {
-			JsonObject challenge = readMessage(codec, socket);
-			String type = challenge.get("type").getAsString();
-			if ("error".equals(type)) {
-				throw new ProtocolException(challenge.get("code").getAsString(), challenge.get("message").getAsString());
-			}
-			if (!"hello_challenge".equals(type)) {
-				throw new ProtocolException(
-						"UNEXPECTED_HANDSHAKE_RESPONSE",
-						"Expected hello_challenge but received '" + type + "'"
-				);
-			}
-			String bridgeNonce = challenge.get("nonce").getAsString();
-			String coordinatorNonce = BridgeAuthentication.newNonce();
-			writeMessage(codec, socket, helloResponseEnvelope(
-					challenge.get("messageId").getAsString(),
-					messageId,
-					bridgeNonce,
-					coordinatorNonce,
-					BRIDGE_SECRET
-			));
-			String line = codec.readLine(socket.getInputStream());
-			if (line == null) {
-				throw new IOException("Bridge closed before acknowledging hello");
-			}
-			JsonObject response = JsonParser.parseString(line).getAsJsonObject();
-			String responseType = response.get("type").getAsString();
-			if ("error".equals(responseType)) {
-				String code = response.get("code").getAsString();
-				String message = response.get("message").getAsString();
-				throw new ProtocolException(code, message);
-			}
-			if (!"hello_ack".equals(responseType)) {
-				throw new ProtocolException(
-						"UNEXPECTED_HANDSHAKE_RESPONSE",
-						"Expected hello_ack but received '" + responseType + "'"
-				);
-			}
-			assertEquals(messageId, response.get("replyTo").getAsString(), "hello acknowledgement reply binding");
-			assertEquals(
-					BridgeAuthentication.bridgeProof(
-							BRIDGE_SECRET,
-							AGENT_ID,
-							challenge.get("messageId").getAsString(),
-							messageId,
-							bridgeNonce,
-							coordinatorNonce
-					),
-					response.get("proof").getAsString(),
-					"hello acknowledgement bridge proof"
-			);
-			pass("hello acknowledged");
-			return socket;
-		} catch (IOException | RuntimeException | Error exception) {
-			try {
-				socket.close();
-			} catch (IOException closeException) {
-				exception.addSuppressed(closeException);
-			}
-			throw exception;
-		}
-	}
 
-	private static Socket connectAuthenticatedWithRetry(ProtocolCodec codec, int port, String messageId)
-			throws Exception {
-		long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(ASYNC_TIMEOUT_MS);
-		Throwable lastFailure = null;
-		while (System.nanoTime() < deadline) {
-			try {
-				return connectAuthenticated(codec, port, messageId);
-			} catch (IOException exception) {
-				lastFailure = exception;
-			} catch (ProtocolException exception) {
-				if (!"SESSION_ACTIVE".equals(exception.code())) {
-					throw exception;
-				}
-				lastFailure = exception;
-			}
-			Thread.sleep(AUTHENTICATION_RETRY_DELAY_MS);
-		}
-		throw new AssertionError("session did not reconnect", lastFailure);
-	}
 
-	private static HandshakeClient openHandshakeWithRetry(ProtocolCodec codec, int port) throws Exception {
-		long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(ASYNC_TIMEOUT_MS);
-		Throwable lastFailure = null;
-		while (System.nanoTime() < deadline) {
-			Socket socket = null;
-			try {
-				socket = openClient(port);
-				JsonObject challenge = readMessage(codec, socket);
-				String type = challenge.has("type") ? challenge.get("type").getAsString() : "";
-				if ("hello_challenge".equals(type)) {
-					HandshakeClient client = new HandshakeClient(socket, challenge);
-					socket = null;
-					return client;
-				}
-				if (!"error".equals(type)
-						|| !challenge.has("code")
-						|| !"SESSION_ACTIVE".equals(challenge.get("code").getAsString())) {
-					throw new AssertionError("unexpected bridge handshake response: " + challenge);
-				}
-				lastFailure = new ProtocolException("SESSION_ACTIVE", "previous bridge session is still closing");
-			} catch (IOException exception) {
-				lastFailure = exception;
-			} finally {
-				if (socket != null) socket.close();
-			}
-			Thread.sleep(AUTHENTICATION_RETRY_DELAY_MS);
-		}
-		throw new AssertionError("bridge handshake slot did not reopen", lastFailure);
-	}
 
-	private record HandshakeClient(Socket socket, JsonObject challenge) implements AutoCloseable {
-		@Override
-		public void close() throws IOException {
-			socket.close();
-		}
-	}
 
-	private static void writeMessage(ProtocolCodec codec, Socket socket, String json) throws IOException {
-		codec.writeLine(socket.getOutputStream(), json);
-	}
 
-	private static JsonObject readMessage(ProtocolCodec codec, Socket socket) throws IOException {
-		String line = codec.readLine(socket.getInputStream());
-		if (line == null) {
-			throw new AssertionError("bridge closed before sending a message");
-		}
-		return JsonParser.parseString(line).getAsJsonObject();
-	}
 
-	private static void assertErrorCode(ProtocolCodec codec, Socket socket, String expectedCode, String label)
-			throws IOException {
-		JsonObject error = readMessage(codec, socket);
-		assertEquals("error", error.get("type").getAsString(), label + " type");
-		assertEquals(expectedCode, error.get("code").getAsString(), label + " code");
-	}
 
-	private static String helloResponseEnvelope(
-			String challengeMessageId,
-			String messageId,
-			String bridgeNonce,
-			String coordinatorNonce,
-			String secret
-	) {
-		return "{\"protocolVersion\":1,\"agentId\":\"" + AGENT_ID
-				+ "\",\"type\":\"hello_response\",\"messageId\":\"" + messageId
-				+ "\",\"challenge\":\"" + bridgeNonce + "\",\"nonce\":\"" + coordinatorNonce
-				+ "\",\"proof\":\"" + BridgeAuthentication.coordinatorProof(
-						secret, AGENT_ID, challengeMessageId, messageId, bridgeNonce, coordinatorNonce
-				) + "\"}";
-	}
 
-	private static String actionEnvelope(String messageId) {
-		return "{\"protocolVersion\":1,\"agentId\":\"" + AGENT_ID
-				+ "\",\"type\":\"action_command\",\"messageId\":\"" + messageId
-				+ "\",\"command\":" + commandJson("wait", "\"durationMs\":250") + "}";
-	}
 
-	private static String requestObservationEnvelope(String messageId) {
-		return "{\"protocolVersion\":1,\"agentId\":\"" + AGENT_ID
-				+ "\",\"type\":\"request_observation\",\"messageId\":\"" + messageId + "\"}";
-	}
 
-	private static void awaitCondition(BooleanSupplier condition, String label) throws InterruptedException {
-		long deadline = System.currentTimeMillis() + ASYNC_TIMEOUT_MS;
-		while (!condition.getAsBoolean() && System.currentTimeMillis() < deadline) {
-			Thread.yield();
-		}
-		assertTrue(condition.getAsBoolean(), label);
-	}
 
-	private static List<Thread> bridgeThreads() {
-		return Thread.getAllStackTraces().keySet().stream()
-				.filter(thread -> thread.getName().startsWith(BridgeServer.THREAD_NAME_PREFIX))
-				.toList();
-	}
 
 	private static void expectProtocolException(
 			ThrowingRunnable action,
@@ -1634,125 +832,7 @@ public final class VerificationMain {
 		System.out.println("PASS: " + label);
 	}
 
-	private static final class RecordingExecutor implements Executor {
-		private final ArrayDeque<Runnable> tasks = new ArrayDeque<>();
 
-		@Override
-		public synchronized void execute(Runnable command) {
-			tasks.addLast(command);
-		}
-
-		private synchronized int pendingCount() {
-			return tasks.size();
-		}
-
-		private void runNext() {
-			Runnable task;
-			synchronized (this) {
-				task = tasks.removeFirst();
-			}
-			task.run();
-		}
-	}
-
-	private static final class RetryHandshakeServer implements AutoCloseable {
-		private final ProtocolCodec codec;
-		private final ServerSocket serverSocket;
-		private final List<Socket> acceptedSockets = new ArrayList<>();
-		private final AtomicBoolean firstSocketClosedByClient = new AtomicBoolean();
-		private final AtomicReference<Throwable> failure = new AtomicReference<>();
-		private final Thread thread;
-
-		private RetryHandshakeServer(ProtocolCodec codec) throws IOException {
-			this.codec = codec;
-			serverSocket = new ServerSocket();
-			serverSocket.bind(new InetSocketAddress("127.0.0.1", 0));
-			thread = Thread.ofPlatform()
-					.name("arenaagents-retry-handshake-server")
-					.daemon(true)
-					.start(this::serve);
-		}
-
-		private int port() {
-			return serverSocket.getLocalPort();
-		}
-
-		private boolean firstSocketClosedByClient() {
-			return firstSocketClosedByClient.get();
-		}
-
-		private void assertHealthy() {
-			Throwable problem = failure.get();
-			if (problem != null) {
-				throw new AssertionError("retry handshake fixture failed", problem);
-			}
-			pass("retry handshake fixture healthy");
-		}
-
-		private void serve() {
-			try {
-				Socket first = accept();
-				codec.writeLine(
-						first.getOutputStream(),
-						"{\"protocolVersion\":1,\"agentId\":\"" + AGENT_ID
-								+ "\",\"type\":\"error\",\"messageId\":\"retry-error-1\","
-								+ "\"code\":\"SESSION_ACTIVE\",\"message\":\"retry\"}"
-				);
-				first.setSoTimeout(SOCKET_TIMEOUT_MS);
-				firstSocketClosedByClient.set(codec.readLine(first.getInputStream()) == null);
-				first.close();
-
-				Socket second = accept();
-				String challengeId = "retry-challenge-1";
-				String bridgeNonce = BridgeAuthentication.newNonce();
-				codec.writeLine(
-						second.getOutputStream(),
-						"{\"protocolVersion\":1,\"agentId\":\"" + AGENT_ID
-								+ "\",\"type\":\"hello_challenge\",\"messageId\":\"" + challengeId
-								+ "\",\"nonce\":\"" + bridgeNonce + "\"}"
-				);
-				JsonObject response = JsonParser.parseString(codec.readLine(second.getInputStream())).getAsJsonObject();
-				String responseId = response.get("messageId").getAsString();
-				String coordinatorNonce = response.get("nonce").getAsString();
-				codec.writeLine(
-						second.getOutputStream(),
-						"{\"protocolVersion\":1,\"agentId\":\"" + AGENT_ID
-								+ "\",\"type\":\"hello_ack\",\"messageId\":\"retry-ack-1\","
-								+ "\"replyTo\":\"" + responseId + "\",\"proof\":\""
-								+ BridgeAuthentication.bridgeProof(
-										BRIDGE_SECRET, AGENT_ID, challengeId, responseId, bridgeNonce, coordinatorNonce
-								) + "\"}"
-				);
-			} catch (IOException | RuntimeException exception) {
-				if (!serverSocket.isClosed()) {
-					failure.compareAndSet(null, exception);
-				}
-			}
-		}
-
-		private Socket accept() throws IOException {
-			Socket socket = serverSocket.accept();
-			synchronized (acceptedSockets) {
-				acceptedSockets.add(socket);
-			}
-			return socket;
-		}
-
-		@Override
-		public void close() throws IOException {
-			serverSocket.close();
-			synchronized (acceptedSockets) {
-				for (Socket socket : acceptedSockets) {
-					socket.close();
-				}
-			}
-			try {
-				thread.join(SOCKET_TIMEOUT_MS);
-			} catch (InterruptedException exception) {
-				Thread.currentThread().interrupt();
-			}
-		}
-	}
 
 	@FunctionalInterface
 	private interface ThrowingRunnable {

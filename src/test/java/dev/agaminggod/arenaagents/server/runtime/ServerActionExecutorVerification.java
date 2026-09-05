@@ -6,7 +6,6 @@ import dev.agaminggod.arenaagents.agent.AgentGameMode;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.server.AgentSavedData;
 import dev.agaminggod.arenaagents.server.CodexAgentManager;
-import dev.agaminggod.arenaagents.server.runtime.controller.ServerCombatController;
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerController;
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerItemPickupController;
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerNavigationController;
@@ -197,8 +196,15 @@ public final class ServerActionExecutorVerification {
 			assertEquals(expectedPrimitive, ServerActionExecutor.isArenaScriptPrimitive(type),
 					"server primitive parity for " + type.wireName());
 		}
-		assertThrows(AgentDomainException.class, () -> ServerActionExecutor.requireArenaScriptPrimitive(ActionType.FIGHT_TARGET),
-				"program primitive entry point rejects high-level controller actions");
+		for (ActionType retired : List.of(
+				ActionType.BUILD_SEQUENCE,
+				ActionType.FIGHT_TARGET,
+				ActionType.FLEE_FROM,
+				ActionType.FOLLOW_ENTITY
+		)) {
+			assertThrows(AgentDomainException.class, () -> ServerActionExecutor.requireArenaScriptPrimitive(retired),
+					"program primitive entry point rejects retired controller action " + retired.wireName());
+		}
 		JsonObject mainHand = new JsonObject();
 		mainHand.addProperty("hand", "main");
 		assertEquals(net.minecraft.world.InteractionHand.MAIN_HAND, ServerActionExecutor.hand(mainHand),
@@ -250,8 +256,6 @@ public final class ServerActionExecutorVerification {
 		assertDoesNotThrow(() -> new ServerNavigationController(
 				Vec3.ZERO, 1.0D, false, 0L, 1_000L).cancel(null),
 				"navigation without an acquired lease does not clear unrelated player input");
-		assertDoesNotThrow(() -> uninitializedCombatController().cancel(null),
-				"combat without acquired leases does not clear unrelated player input");
 		assertDoesNotThrow(() -> uninitializedItemPickupController().cancel(null),
 				"item pickup without acquired navigation does not clear unrelated player input");
 		assertTrue(ServerActionExecutor.isCurrentCoordinatorGeneration(4L, 4L),
@@ -564,17 +568,6 @@ public final class ServerActionExecutorVerification {
 			cleanup.invoke(action);
 		} catch (ReflectiveOperationException exception) {
 			throw new AssertionError("could not exercise action-owned cleanup", exception);
-		}
-	}
-
-	private static ServerCombatController uninitializedCombatController() {
-		try {
-			Field field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
-			field.setAccessible(true);
-			sun.misc.Unsafe unsafe = (sun.misc.Unsafe) field.get(null);
-			return (ServerCombatController) unsafe.allocateInstance(ServerCombatController.class);
-		} catch (ReflectiveOperationException exception) {
-			throw new AssertionError("could not allocate combat cleanup probe", exception);
 		}
 	}
 

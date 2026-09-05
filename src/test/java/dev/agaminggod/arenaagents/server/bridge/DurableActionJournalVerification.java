@@ -9,6 +9,7 @@ import dev.agaminggod.arenaagents.server.runtime.ServerActionRequest;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionResult;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionState;
 import java.io.IOException;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -30,13 +31,24 @@ public final class DurableActionJournalVerification {
 		UUID goalId = UUID.randomUUID();
 		ServerActionRequest request = request(agentId, 8L, "action-accepted", "step-accepted", 1L);
 
-		DurableActionJournal.open(path).accept(request, goalId);
+		DurableActionJournal accepted = DurableActionJournal.open(path);
+		accepted.accept(request, goalId);
+		accepted.close();
 		DurableActionJournal acceptedReload = DurableActionJournal.open(path);
+		if (persistentChannel(acceptedReload) != null) {
+			throw new AssertionError("Loading an existing journal must not acquire an append channel before its owner starts");
+		}
 		assertEntry(acceptedReload, DurableActionJournal.Phase.ACCEPTED, request, null);
 		expectFailure(() -> acceptedReload.accept(request, goalId), "ACTION_REPLAY");
 
 		ServerActionResult uncertain = recoveryResult(request);
 		acceptedReload.terminal(uncertain);
+		FileChannel appendChannel = persistentChannel(acceptedReload);
+		if (appendChannel == null || !appendChannel.isOpen()) {
+			throw new AssertionError("First mutation must acquire a persistent append channel");
+		}
+		acceptedReload.close();
+		if (appendChannel.isOpen()) throw new AssertionError("Closing the journal must release its append channel");
 		DurableActionJournal terminalReload = DurableActionJournal.open(path);
 		assertEntry(terminalReload, DurableActionJournal.Phase.TERMINAL, request, uncertain);
 		UUID replacementGoalId = UUID.randomUUID();
@@ -44,12 +56,14 @@ public final class DurableActionJournalVerification {
 		assertEntry(terminalReload, DurableActionJournal.Phase.TERMINAL, request, uncertain);
 		terminalReload.terminal(uncertain);
 		if (!terminalReload.acknowledge(agentId, 8L, request.actionId())) throw new AssertionError("Terminal result was not acknowledged");
+		terminalReload.close();
 
 		DurableActionJournal acknowledgedReload = DurableActionJournal.open(path);
 		assertEntry(acknowledgedReload, DurableActionJournal.Phase.ACKNOWLEDGED, request, uncertain);
 		if (!acknowledgedReload.acknowledge(agentId, 8L, request.actionId())) throw new AssertionError("Duplicate acknowledgement was not idempotent");
 		acknowledgedReload.retainGoal(agentId, replacementGoalId);
 		if (!acknowledgedReload.snapshot().isEmpty()) throw new AssertionError("Superseded acknowledged entry was not reclaimed");
+		acknowledgedReload.close();
 
 		Path capacityPath = directory.resolve("capacity.json");
 		DurableActionJournal capacity = DurableActionJournal.open(capacityPath, 2);
@@ -63,11 +77,14 @@ public final class DurableActionJournalVerification {
 		capacity.terminal(firstResult);
 		capacity.acknowledge(agentId, 9L, first.actionId());
 		capacity.accept(third, goalId);
+		capacity.close();
 		DurableActionJournal capacityReload = DurableActionJournal.open(capacityPath, 2);
 		if (capacityReload.snapshot().size() != 2
 				|| capacityReload.snapshot().stream().anyMatch(entry -> entry.request().actionId().equals(first.actionId()))) {
 			throw new AssertionError("Acknowledged entry was not pressure-evicted before protected entries");
 		}
+		capacity.close();
+		capacityReload.close();
 
 		Path batchPath = directory.resolve("batch.journal");
 		ServerActionRequest batchFirst = request(agentId, 10L, "batch-1", "batch-step-1", 5L);
@@ -75,6 +92,7 @@ public final class DurableActionJournalVerification {
 		DurableActionJournal batch = DurableActionJournal.open(batchPath, 4);
 		batch.accept(batchFirst, goalId);
 		batch.accept(batchSecond, goalId);
+		batch.close();
 		DurableActionJournal batchReload = DurableActionJournal.open(batchPath, 4);
 		int eventsBeforeRecovery = batchReload.persistedEventCountForVerification();
 		batchReload.terminalizeAccepted(DurableActionJournalVerification::recoveryResult);
@@ -86,6 +104,11 @@ public final class DurableActionJournalVerification {
 				|| recoveredBatch.snapshot().stream().anyMatch(entry -> entry.phase() != DurableActionJournal.Phase.TERMINAL)) {
 			throw new AssertionError("Batched uncertain outcomes did not survive reload");
 		}
+		if (batchReload.performanceSnapshotForVerification().appendCount() != 1L) {
+			throw new AssertionError("Journal append instrumentation did not count each durable mutation");
+		}
+		batchReload.close();
+		recoveredBatch.close();
 
 		Path compactPath = directory.resolve("compact.journal");
 		DurableActionJournal compact = DurableActionJournal.open(compactPath, 4, 4);
@@ -99,6 +122,10 @@ public final class DurableActionJournalVerification {
 		if (compact.persistedEventCountForVerification() != 1) {
 			throw new AssertionError("Journal did not compact bounded history before the next append");
 		}
+		if (compact.performanceSnapshotForVerification().compactionCount() != 1L) {
+			throw new AssertionError("Journal compaction instrumentation did not record the bounded rewrite");
+		}
+		compact.close();
 		long validSize;
 		try {
 			validSize = Files.size(compactPath);
@@ -114,8 +141,10 @@ public final class DurableActionJournalVerification {
 		}
 		assertEntry(repaired, DurableActionJournal.Phase.ACCEPTED, afterCompaction, null);
 		repaired.terminal(result(afterCompaction, "DONE"));
-		assertEntry(DurableActionJournal.open(compactPath, 4), DurableActionJournal.Phase.TERMINAL,
-				afterCompaction, result(afterCompaction, "DONE"));
+		repaired.close();
+		DurableActionJournal repairedReload = DurableActionJournal.open(compactPath, 4);
+		assertEntry(repairedReload, DurableActionJournal.Phase.TERMINAL, afterCompaction, result(afterCompaction, "DONE"));
+		repairedReload.close();
 
 		Path detachedPath = directory.resolve("detached.json");
 		DurableActionJournal detached = DurableActionJournal.open(detachedPath);
@@ -132,6 +161,7 @@ public final class DurableActionJournalVerification {
 			throw new AssertionError("Accepted actions must still terminalize");
 		}
 		assertEntry(detached, DurableActionJournal.Phase.TERMINAL, detachedRequest, detachedResult);
+		detached.close();
 
 		try (var files = Files.list(directory)) {
 			if (files.anyMatch(file -> file.getFileName().toString().contains(".tmp-"))) {
@@ -140,7 +170,17 @@ public final class DurableActionJournalVerification {
 		} catch (IOException exception) {
 			throw new AssertionError(exception);
 		}
-		return 23;
+		return 26;
+	}
+
+	private static FileChannel persistentChannel(DurableActionJournal journal) {
+		try {
+			var field = DurableActionJournal.class.getDeclaredField("persistentChannel");
+			field.setAccessible(true);
+			return (FileChannel) field.get(journal);
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("Could not inspect journal channel ownership", exception);
+		}
 	}
 
 	private static void assertEntry(

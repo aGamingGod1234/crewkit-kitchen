@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { goalSpecFingerprint } from '../src/goal-spec.mjs';
+import { nativeObservationSignature } from '../src/dynamic-main.mjs';
 import { constrainGoalBoundNavigation, NativeToolRuntime } from '../src/native-tool-runtime.mjs';
 
 function record(overrides = {}) {
@@ -109,6 +110,65 @@ test('native observe returns latest compact facts without sending a body command
 		observation: { player: { health: 18 }, blocks: [{ blockId: 'minecraft:stone', x: 1, y: 63, z: 1 }] },
 	});
 	assert.deepEqual(sent, []);
+});
+
+test('identical heartbeat refresh advances sequence without re-ingesting world state', async () => {
+	const runtime = new NativeToolRuntime({ bridge: { send: async () => {} } });
+	const current = record();
+	const conversation = {
+		mode: 'history',
+		nextSequence: 4,
+		entries: [{ sequence: 4, kind: 'agent_message', sourceId: 'agent-b', recipientId: 'agent-a', text: 'hello' }],
+	};
+	const observation = {
+		player: { x: 0, y: 64, z: 0, health: 20, dead: false },
+		inventory: { items: [{ itemId: 'minecraft:stone', count: 1 }] },
+	};
+	runtime.updateObservation(current, observation, { eventSequence: 1, conversation });
+	assert.equal(runtime.refreshObservation(current, observation, { eventSequence: 2 }), true);
+	const result = await runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-refresh', callId: 'observe-refresh', tool: { kind: 'observe' },
+	}, current);
+	assert.equal(result.eventSequence, 2);
+	assert.deepEqual(result.observation, {
+		...observation,
+		recovery: {
+			alreadyHave: ['minecraft:stone'],
+			alreadyHaveFacts: [{ kind: 'inventory', itemId: 'minecraft:stone', count: 1 }],
+			doNotRedo: [],
+			facts: 'Currently evidenced: minecraft:stone.',
+		},
+	});
+	assert.deepEqual(result.conversation, conversation);
+	assert.equal(runtime.refreshObservation(current, observation, { eventSequence: 2 }), false, 'duplicate sequence is ignored');
+});
+
+test('unchanged actionable heartbeat still refreshes clocks, cooldowns, effects, and live evidence', async () => {
+	const runtime = new NativeToolRuntime({ bridge: { send: async () => {} } });
+	const current = record();
+	const initial = {
+		player: { x: 0, y: 64, z: 0, dead: false, effects: [{ id: 'speed', duration: 100 }] },
+		inventory: { items: [{ itemId: 'minecraft:stone', count: 1 }] },
+		world: { gameTime: 100, dayTime: 100 },
+		interaction: { attackCooldown: 0.1, useRemainingTicks: 20 },
+	};
+	const latest = structuredClone(initial);
+	latest.player.effects[0].duration = 90;
+	latest.world = { gameTime: 110, dayTime: 110 };
+	latest.interaction = { attackCooldown: 0.9, useRemainingTicks: 10 };
+	assert.equal(nativeObservationSignature(initial), nativeObservationSignature(latest));
+	runtime.updateObservation(current, initial, { eventSequence: 1 });
+	assert.equal(runtime.refreshObservation(current, latest, { eventSequence: 2 }), true);
+	const result = await runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-refresh', callId: 'observe-refresh', tool: { kind: 'observe' },
+	}, current);
+	assert.equal(result.eventSequence, 2);
+	assert.deepEqual(result.observation.world, latest.world);
+	assert.deepEqual(result.observation.interaction, latest.interaction);
+	assert.deepEqual(result.observation.player.effects, latest.player.effects);
+	assert.deepEqual(runtime.snapshotLive(current.agentId), { observation: latest, eventSequence: 2, goalRevision: 3 });
+	latest.world.gameTime = 999;
+	assert.equal(runtime.snapshotLive(current.agentId).observation.world.gameTime, 110, 'snapshot owns its raw facts');
 });
 
 test('lookAround turns the real player in bounded steps and preserves the observed hand and slot', async () => {

@@ -105,6 +105,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	public static final int DEFAULT_PORT = 25_570;
 	public static final int CONNECTION_QUEUE_CAP = 256;
 	public static final int AGENT_QUEUE_CAP = 32;
+	/** Default idle heartbeat spacing; urgent and explicitly requested observations are unaffected. */
+	public static final int DEFAULT_HEARTBEAT_MIN_INTERVAL_TICKS = 10;
 	private static final int OBSERVATIONS_PER_TICK = AgentConstants.DEFAULT_AGENT_LIMIT;
 	private static final int HANDSHAKE_TIMEOUT_MS = 5_000;
 	private static final int PREAUTH_SESSION_CAP = 8;
@@ -129,6 +131,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private static final long CATALOG_DISCOVERY_RETRY_BASE_NANOS = 50_000_000L;
 	private static final int CATALOG_DISCOVERY_MAX_BACKOFF_SHIFT = 6;
 	private static final String MAX_OBSERVATION_MESSAGE_ID = "m".repeat(128);
+	private static final String HEARTBEAT_MIN_INTERVAL_TICKS_PROPERTY =
+			"arenaagents.observationHeartbeatMinIntervalTicks";
 	private static final String COORDINATOR_OFFLINE_MESSAGE =
 			"AI agent coordinator is offline; check logs/arena-agents-coordinator-error.log for the startup cause";
 	private static final Logger LOGGER = LoggerFactory.getLogger(MultiplexedServerBridge.class);
@@ -148,11 +152,12 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private final ObservationPublication observationPublication = new ObservationPublication(
 			AgentConstants.DEFAULT_AGENT_LIMIT,
 			OBSERVATIONS_PER_TICK,
+			configuredHeartbeatMinimumIntervalTicks(),
 			(agentId, payload) -> ServerObservationWireBudget.fit(payload, candidate ->
-					codec.encodedLineBytes(new BridgeEnvelope(
+					codec.encodedLineBytesForPayload(
 							2, serverInstanceId, agentId.toString(), "observation",
 							MAX_OBSERVATION_MESSAGE_ID, candidate
-					)) <= BridgeEnvelopeCodec.MAX_LINE_BYTES)
+					) <= BridgeEnvelopeCodec.MAX_LINE_BYTES)
 	);
 	private final String secret;
 	private final int port;
@@ -802,6 +807,14 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	@Override
 	public synchronized void close() {
+		try {
+			closeTransport();
+		} finally {
+			actionJournal.close();
+		}
+	}
+
+	private void closeTransport() {
 		List<Session> candidates;
 		synchronized (publicationLock) {
 			running.set(false);
@@ -823,9 +836,13 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	/** Rebinding runs on the server thread, so finish the old session's state transition before replacement. */
-	public void closeAndDrainDisconnect() {
-		close();
-		publishPendingDisconnects();
+	public synchronized void closeAndDrainDisconnect() {
+		try {
+			closeTransport();
+			publishPendingDisconnects();
+		} finally {
+			actionJournal.close();
+		}
 	}
 
 	private void acceptLoop() {
@@ -2713,6 +2730,26 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		return parsed;
 	}
 
+	static int configuredHeartbeatMinimumIntervalTicks() {
+		String configured = System.getProperty(HEARTBEAT_MIN_INTERVAL_TICKS_PROPERTY);
+		if (configured == null || configured.isBlank()) return DEFAULT_HEARTBEAT_MIN_INTERVAL_TICKS;
+		final int parsed;
+		try {
+			parsed = Integer.parseInt(configured);
+		} catch (NumberFormatException exception) {
+			throw new IllegalArgumentException(
+					HEARTBEAT_MIN_INTERVAL_TICKS_PROPERTY + " must be an integer from 1 to " + Integer.MAX_VALUE,
+					exception
+			);
+		}
+		if (parsed < 1) {
+			throw new IllegalArgumentException(
+					HEARTBEAT_MIN_INTERVAL_TICKS_PROPERTY + " must be an integer from 1 to " + Integer.MAX_VALUE
+			);
+		}
+		return parsed;
+	}
+
 	private static String readSecret(Path path) {
 		try {
 			if (!Files.isRegularFile(path)) {
@@ -2947,15 +2984,18 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		private final PublishedObservationState published;
 		private final int queueCapacity;
 		private final int perTickLimit;
+		private final int heartbeatMinimumIntervalTicks;
 		private final java.util.function.BiFunction<AgentId, JsonObject, ServerObservationWireBudget.Fitted> fitter;
 		private final LinkedHashSet<AgentId> urgent = new LinkedHashSet<>();
 		private final Set<AgentId> heartbeatPending = new HashSet<>();
+		private final Map<AgentId, Long> nextHeartbeatTick = new HashMap<>();
 		private final AtomicLong sequences = new AtomicLong();
 		private Object activeSession;
 		private int heartbeatCursor;
+		private long heartbeatTick;
 
 		ObservationPublication(int queueCapacity, int perTickLimit) {
-			this(queueCapacity, perTickLimit,
+			this(queueCapacity, perTickLimit, DEFAULT_HEARTBEAT_MIN_INTERVAL_TICKS,
 					(agentId, observation) -> new ServerObservationWireBudget.Fitted(observation, List.of()));
 		}
 
@@ -2964,8 +3004,26 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				int perTickLimit,
 				java.util.function.BiFunction<AgentId, JsonObject, ServerObservationWireBudget.Fitted> fitter
 		) {
+			this(queueCapacity, perTickLimit, DEFAULT_HEARTBEAT_MIN_INTERVAL_TICKS, fitter);
+		}
+
+		ObservationPublication(int queueCapacity, int perTickLimit, int heartbeatMinimumIntervalTicks) {
+			this(queueCapacity, perTickLimit, heartbeatMinimumIntervalTicks,
+					(agentId, observation) -> new ServerObservationWireBudget.Fitted(observation, List.of()));
+		}
+
+		ObservationPublication(
+				int queueCapacity,
+				int perTickLimit,
+				int heartbeatMinimumIntervalTicks,
+				java.util.function.BiFunction<AgentId, JsonObject, ServerObservationWireBudget.Fitted> fitter
+		) {
+			if (heartbeatMinimumIntervalTicks < 1) {
+				throw new IllegalArgumentException("heartbeat minimum interval must be positive");
+			}
 			this.queueCapacity = queueCapacity;
 			this.perTickLimit = perTickLimit;
+			this.heartbeatMinimumIntervalTicks = heartbeatMinimumIntervalTicks;
 			queue = new ObservationDispatchQueue<>(queueCapacity, perTickLimit);
 			published = new PublishedObservationState(queueCapacity);
 			this.fitter = Objects.requireNonNull(fitter, "fitter must not be null");
@@ -3034,7 +3092,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			}
 		}
 
-		/** Queues one heartbeat per call and rotates fairly across the supplied roster. */
+		/** Queues one due heartbeat per call and rotates fairly across the supplied roster. */
 		void scheduleIdleHeartbeat(List<AgentId> agents) {
 			Objects.requireNonNull(agents, "agents must not be null");
 			List<AgentId> roster = agents.stream()
@@ -3042,19 +3100,38 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 					.distinct()
 					.toList();
 			synchronized (lifecycleLock) {
+				if (heartbeatTick < Long.MAX_VALUE) heartbeatTick += 1L;
+				nextHeartbeatTick.keySet().removeIf(agentId -> !roster.contains(agentId));
+				heartbeatPending.removeIf(agentId -> !roster.contains(agentId));
 				if (roster.isEmpty()) {
 					heartbeatCursor = 0;
 					return;
 				}
-				heartbeatCursor %= roster.size();
-				AgentId agentId = roster.get(heartbeatCursor++);
-				if (urgent.contains(agentId)) return;
-				try {
-					if (queue.offer(agentId)) heartbeatPending.add(agentId);
-				} catch (IllegalStateException ignored) {
-					// A full coalescing queue defers this heartbeat to a later rotation.
+				int start = Math.floorMod(heartbeatCursor, roster.size());
+				for (int offset = 0; offset < roster.size(); offset++) {
+					int index = (start + offset) % roster.size();
+					AgentId agentId = roster.get(index);
+					if (urgent.contains(agentId) || !heartbeatDue(agentId)) continue;
+					try {
+						boolean queued = queue.offer(agentId) || queue.contains(agentId);
+						if (queued) {
+							heartbeatPending.add(agentId);
+							heartbeatCursor = (index + 1) % roster.size();
+							return;
+						}
+					} catch (IllegalStateException ignored) {
+						// A full coalescing queue defers this heartbeat to a later rotation.
+						return;
+					}
 				}
+				// No agent was due; keep rotating from the next roster member on the next tick.
+				heartbeatCursor = (start + 1) % roster.size();
 			}
+		}
+
+		private boolean heartbeatDue(AgentId agentId) {
+			Long due = nextHeartbeatTick.get(agentId);
+			return due == null || due <= heartbeatTick;
 		}
 
 		boolean takeHeartbeat(AgentId agentId) {
@@ -3087,6 +3164,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				queue.remove(agentId);
 				urgent.remove(agentId);
 				heartbeatPending.remove(agentId);
+				nextHeartbeatTick.remove(agentId);
 				published.remove(agentId);
 			}
 		}
@@ -3140,6 +3218,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				}
 				if (!writer.send(agentId, delivery)) return Result.DELIVERY_RETRY;
 				published.commit(agentId, delivery);
+				nextHeartbeatTick.put(agentId, nextHeartbeatDeadline());
 				return Result.COMMITTED;
 			}
 		}
@@ -3156,8 +3235,15 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			queue.clear();
 			urgent.clear();
 			heartbeatPending.clear();
+			nextHeartbeatTick.clear();
 			heartbeatCursor = 0;
+			heartbeatTick = 0L;
 			published.clear();
+		}
+
+		private long nextHeartbeatDeadline() {
+			long interval = heartbeatMinimumIntervalTicks;
+			return heartbeatTick > Long.MAX_VALUE - interval ? Long.MAX_VALUE : heartbeatTick + interval;
 		}
 	}
 

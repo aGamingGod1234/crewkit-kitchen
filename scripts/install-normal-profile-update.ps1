@@ -83,6 +83,23 @@ if ($TestProcessClassification) {
 }
 
 function Get-ExpectedCoordinatorFiles([string] $CoordinatorRoot) {
+    $developmentOnly = @(
+        'config/headless-provider-matrix.json',
+        'config/latency-acceptance.json',
+        'config/latency-experiment-matrix.json',
+        'config/latency-headless-matrix.json',
+        'config/latency-matrix.json',
+        'config/task9-performance-matrix.json',
+        'src/benchmark/',
+        'src/simulator/',
+        'src/headless-matrix.mjs',
+        'src/headless-rcon.mjs',
+        'src/native-tool-ab-runner.mjs',
+        'src/native-tool-ab-trial.mjs',
+        'src/native-tool-cli-boundary.mjs',
+        'src/native-tool-load-probe.mjs',
+        'src/native-tool-probe.mjs'
+    )
     $paths = [Collections.Generic.List[string]]::new()
     foreach ($fixed in @('package.json', 'package-lock.json')) {
         $file = Join-Path $CoordinatorRoot $fixed
@@ -95,6 +112,7 @@ function Get-ExpectedCoordinatorFiles([string] $CoordinatorRoot) {
         foreach ($file in Get-ChildItem -LiteralPath $rootPath -Recurse -File) {
             $relative = $file.FullName.Substring($CoordinatorRoot.Length + 1).Replace('\', '/')
             if ($relative -match '(^|/)__pycache__(/|$)' -or $relative -match '\.pyc$') { continue }
+            if ($developmentOnly | Where-Object { $relative -ieq $_ -or $relative.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }) { continue }
             $paths.Add($relative)
         }
     }

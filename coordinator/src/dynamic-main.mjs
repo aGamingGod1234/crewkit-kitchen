@@ -305,6 +305,7 @@ export class DynamicCoordinator extends EventEmitter {
 			}
 		}
 		if (['provider', 'action', 'completion'].includes(lease.kind)) {
+			this.#nativeObservationSignatures.delete(key.agentId);
 			void this.#nativeRuntime.dispose(key.agentId, `${lease.kind}_lease_expired`)
 				.catch((error) => this.#reportAgentError(key.agentId, error, connectionEpoch));
 		}
@@ -678,8 +679,6 @@ export class DynamicCoordinator extends EventEmitter {
 				const ledger = this.#ledger(record.agentId);
 				ledger.ingest('observation', wireObservation);
 				if (this.#usesNativeTools(record)) {
-					const memory = this.#conversationMemory(record.agentId);
-					this.#nativeRuntime.updateObservation(record, observation, { eventSequence: message.payload.eventSequence, conversation: memory.history() });
 					const observationSignature = nativeObservationSignature(observation);
 					const previousSignature = this.#nativeObservationSignatures.get(record.agentId);
 					const supervisedRequest = this.#supervisedObservationRequests.get(record.agentId);
@@ -698,7 +697,11 @@ export class DynamicCoordinator extends EventEmitter {
 						connectionEpoch,
 						signature: observationSignature,
 					});
-					if (unchangedHeartbeat) return;
+					const memory = this.#conversationMemory(record.agentId);
+					if (unchangedHeartbeat) {
+						if (this.#nativeRuntime.refreshObservation(record, observation, { eventSequence: message.payload.eventSequence, conversation: memory.history() })) return;
+					}
+					this.#nativeRuntime.updateObservation(record, observation, { eventSequence: message.payload.eventSequence, conversation: memory.history() });
 					this.#goalSupervisor.observed(supervisionKey);
 					this.#scheduleNativeTurn(record, {
 						agentId: record.agentId,
@@ -1346,6 +1349,7 @@ export class DynamicCoordinator extends EventEmitter {
 			return null;
 		}
 		await this.#nativeRuntime.dispose(work.agentId, 'native_turn_failed');
+		this.#nativeObservationSignatures.delete(work.agentId);
 		if (classification === 'terminal') {
 			this.#goalSupervisor.terminate(work.supervisionKey);
 			if ([DynamicAgentState.STARTING, DynamicAgentState.PLANNING, DynamicAgentState.ACTING].includes(record.state)) {

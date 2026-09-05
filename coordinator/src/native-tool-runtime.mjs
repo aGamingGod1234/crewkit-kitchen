@@ -51,7 +51,11 @@ export class NativeToolRuntime {
 		this.#resolveFrontier = resolveFrontier;
 	}
 
-	updateObservation(record, observation, { eventSequence = 0, conversation = undefined, force = false } = {}) {
+	updateObservation(record, observation, options = {}) {
+		return this.#storeObservation(record, observation, options);
+	}
+
+	#storeObservation(record, observation, { eventSequence = 0, conversation = undefined, force = false } = {}, reuseWorldFacts = false) {
 		validateRecord(record);
 		if (!Number.isSafeInteger(eventSequence) || eventSequence < 0) throw new TypeError('eventSequence must be a nonnegative safe integer');
 		if (force !== true && force !== false) throw new TypeError('force must be a boolean');
@@ -68,8 +72,10 @@ export class NativeToolRuntime {
 				goalRevision: record.goalRevision,
 			});
 		}
-		this.#recovery.remember(record.agentId, record.goalRevision, raw);
-		this.#occupancy.ingest(record.agentId, raw);
+		if (!reuseWorldFacts) {
+			this.#recovery.remember(record.agentId, record.goalRevision, raw);
+			this.#occupancy.ingest(record.agentId, raw);
+		}
 		this.#observations.set(record.agentId, {
 			goalRevision: record.goalRevision,
 			eventSequence: storedSequence,
@@ -79,6 +85,21 @@ export class NativeToolRuntime {
 			...(conversation === undefined ? {} : { conversation: structuredClone(conversation) }),
 		});
 		return true;
+	}
+
+	/**
+	 * Reuses durable facts when the actionable signature matches, but refreshes raw
+	 * observations because clocks, effect durations, and cooldowns are excluded from it.
+	 */
+	refreshObservation(record, observation, { eventSequence = 0, conversation = undefined } = {}) {
+		validateRecord(record);
+		if (!Number.isSafeInteger(eventSequence) || eventSequence < 0) throw new TypeError('eventSequence must be a nonnegative safe integer');
+		const latest = this.#observations.get(record.agentId);
+		if (latest === undefined || latest.goalRevision !== record.goalRevision || eventSequence <= latest.eventSequence) return false;
+		return this.#storeObservation(record, observation, {
+			eventSequence,
+			conversation: conversation ?? latest.conversation,
+		}, true);
 	}
 
 	snapshotLive(agentId) {

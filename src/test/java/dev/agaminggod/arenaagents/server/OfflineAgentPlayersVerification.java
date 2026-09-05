@@ -46,6 +46,13 @@ public final class OfflineAgentPlayersVerification {
 		AgentId agentId = new AgentId(UUID.fromString("193a9add-1234-5678-9abc-123456789abc"));
 		AgentProfile profile = new AgentProfile(
 				"codex", "gpt-5.6-sol", "high", "priority", Optional.empty(), 2, AgentGameMode.SURVIVAL);
+		AgentProfile renamedProfile = new AgentProfile(
+				"codex", "gpt-5.6-sol", "high", "priority", Optional.of("RenamedAgent"), 2, AgentGameMode.SURVIVAL);
+		assertEquals("RenamedAgent", OfflineAgentPlayers.playerName(agentId, renamedProfile),
+				"profile changes replace cached technical names");
+		assertEquals(OfflineAgentPlayers.offlineUuid(agentId, renamedProfile),
+				UUID.nameUUIDFromBytes(("OfflinePlayer:RenamedAgent").getBytes(StandardCharsets.UTF_8)),
+				"profile changes replace cached offline UUIDs");
 		assertEquals("c02_193A9ADD", OfflineAgentPlayers.legacyTransportPlayerName(agentId, profile),
 				"the previous installed username remains discoverable for one-time migration");
 		assertEquals(List.of("Sol2_C7CA442D", "c02_193A9ADD"),

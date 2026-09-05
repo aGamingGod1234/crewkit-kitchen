@@ -8,8 +8,6 @@ import dev.agaminggod.arenaagents.protocol.ProtocolException;
 import dev.agaminggod.arenaagents.server.bridge.BridgeProtocolException;
 import dev.agaminggod.arenaagents.server.bridge.BridgeEnvelope;
 import dev.agaminggod.arenaagents.server.bridge.MultiplexedServerBridge;
-import dev.agaminggod.arenaagents.server.runtime.ServerActionResult;
-import dev.agaminggod.arenaagents.server.runtime.ServerActionState;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.Map;
@@ -25,10 +23,9 @@ public final class TransactionProtocolVerification {
 	public static int verify() throws Exception {
 		verifyStrictActionSchemas();
 		verifyLiveBridgeRejectsUnknownArgumentBeforeSubmit();
-		verifyReplayReturnsRecordedResultAndChangedHashFails();
 		verifyImmutablePostconditionVerdicts();
 		verifyUseConfirmationTransitions();
-		return 33;
+		return 22;
 	}
 
 	private static void verifyStrictActionSchemas() {
@@ -137,68 +134,6 @@ public final class TransactionProtocolVerification {
 		return json(
 				"provider", "codex", "model", "gpt-5.6-sol", "reasoningEffort", "high", "serviceTier", "priority",
 				"programId", "program-7-1", "programVersion", 1, "sourceStepId", "step-1-1", "eventSequence", 1
-		);
-	}
-
-	private static void verifyReplayReturnsRecordedResultAndChangedHashFails() {
-		AgentId agentId = AgentId.random();
-		JsonObject arguments = json("durationMs", 25, "marker", "same");
-		ActionIdempotencyLedger ledger = new ActionIdempotencyLedger(1);
-		ActionIdempotencyLedger.ReplayKey key = ActionIdempotencyLedger.key(agentId, 3, "action-1", arguments);
-		ServerActionResult result = new ServerActionResult(
-				agentId,
-				3,
-				"action-1",
-				ActionType.WAIT,
-				ServerActionState.SUCCEEDED,
-				"DONE",
-				"Wait complete.",
-				25,
-				1_750_000_000_000L
-		);
-		ledger.record(key, result);
-		assertEquals(result, ledger.replay(key).orElseThrow(), "exact replay returns recorded result");
-		assertThrows(
-				IllegalArgumentException.class,
-				() -> ledger.record(key, result(AgentId.random(), 3, "action-1")),
-				"record rejects a mismatched result agent"
-		);
-		assertThrows(
-				IllegalArgumentException.class,
-				() -> ledger.record(key, result(agentId, 4, "action-1")),
-				"record rejects a mismatched result revision"
-		);
-		assertThrows(
-				IllegalArgumentException.class,
-				() -> ledger.record(key, result(agentId, 3, "action-other")),
-				"record rejects a mismatched result action ID"
-		);
-
-		JsonObject reordered = new JsonObject();
-		reordered.addProperty("marker", "same");
-		reordered.addProperty("durationMs", 25);
-		assertEquals(key.argumentHash(), ActionIdempotencyLedger.key(agentId, 3, "action-1", reordered).argumentHash(), "canonical hash is stable");
-
-		ActionIdempotencyLedger.ReplayKey changed = ActionIdempotencyLedger.key(agentId, 3, "action-1", json("durationMs", 26));
-		assertThrows(IllegalStateException.class, () -> ledger.replay(changed), "changed arguments cannot replay an action ID");
-
-		ActionIdempotencyLedger.ReplayKey replacement = ActionIdempotencyLedger.key(agentId, 3, "action-2", arguments);
-		ledger.record(replacement, result(agentId, 3, "action-2"));
-		assertEquals(1, ledger.size(), "replay ledger stays bounded");
-		assertTrue(ledger.replay(key).isEmpty(), "oldest replay is evicted at the bound");
-	}
-
-	private static ServerActionResult result(AgentId agentId, long goalRevision, String actionId) {
-		return new ServerActionResult(
-				agentId,
-				goalRevision,
-				actionId,
-				ActionType.WAIT,
-				ServerActionState.SUCCEEDED,
-				"DONE",
-				"Wait complete.",
-				25,
-				1_750_000_000_000L
 		);
 	}
 

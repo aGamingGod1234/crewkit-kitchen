@@ -31,9 +31,6 @@ loom {
 
 	def developmentBridgeSecret = layout.projectDirectory.file('runtime/bridge-secret.txt').asFile.absolutePath
 	runs {
-		client {
-			vmArg "-Darenaagents.bridgeSecretFile=${developmentBridgeSecret}"
-		}
 		server {
 			vmArg "-Darenaagents.bridgeSecretFile=${developmentBridgeSecret}"
 		}
@@ -135,6 +132,23 @@ def coordinatorRuntimeIncludes = [
 def coordinatorRuntimeExcludes = [
 	'**/__pycache__/**',
 	'**/*.pyc',
+	// Keep benchmark, simulator, headless and native-tool experiments in the
+	// repository, but do not ship them in the production coordinator runtime.
+	'config/headless-provider-matrix.json',
+	'config/latency-acceptance.json',
+	'config/latency-experiment-matrix.json',
+	'config/latency-headless-matrix.json',
+	'config/latency-matrix.json',
+	'config/task9-performance-matrix.json',
+	'src/benchmark/**',
+	'src/simulator/**',
+	'src/headless-matrix.mjs',
+	'src/headless-rcon.mjs',
+	'src/native-tool-ab-runner.mjs',
+	'src/native-tool-ab-trial.mjs',
+	'src/native-tool-cli-boundary.mjs',
+	'src/native-tool-load-probe.mjs',
+	'src/native-tool-probe.mjs',
 ]
 def coordinatorDirectory = layout.projectDirectory.dir('coordinator')
 def coordinatorPackageJson = coordinatorDirectory.file('package.json')

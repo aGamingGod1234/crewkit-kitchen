@@ -100,6 +100,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyAuthenticatedReconnectRecovery();
 		verifyTerminalReplaySurvivesDisconnectRevision();
 		verifyAcceptedActionRecoversWithoutReplay();
+		verifyRebindPersistsCancellationBeforeClosingJournal();
 		verifyObsoletePlannerReadinessIsIgnored();
 		verifyAgentErrorRevisionGate();
 		verifyRespawnContinuationPayload();
@@ -192,7 +193,57 @@ public final class MultiplexedServerBridgeVerification {
 		verifyImmediateHandshakeClosePreservesDisconnect();
 		verifyPendingRegistrationMarkerIsFenced();
 		verifyAtomicPublicationRacesSessionClose();
-		return 287;
+		return 290;
+	}
+
+	@SuppressWarnings("unchecked")
+	private static void verifyRebindPersistsCancellationBeforeClosingJournal() {
+		MultiplexedServerBridge bridge = null;
+		Path secretFile = null;
+		Path journalFile = null;
+		try {
+			secretFile = Files.createTempFile("arena-agents-rebind-secret-", ".txt");
+			Files.writeString(secretFile, "0123456789abcdef0123456789abcdef");
+			journalFile = Files.createTempFile("arena-agents-rebind-journal-", ".json");
+			Files.delete(journalFile);
+			CodexAgentManager manager = uninitializedManager();
+			AgentRecord created = manager.registry().create("gpt-5.6-sol", "high", Optional.of("Rebind"), 4_000L);
+			AgentRecord started = manager.registry().start(created.agentId(), "wait", 4_001L).after();
+			JsonObject arguments = new JsonObject();
+			arguments.addProperty("durationMs", 1000L);
+			ServerActionRequest request = new ServerActionRequest(
+					started.agentId(), started.goalRevision(), "wait-before-rebind", ActionType.WAIT, arguments,
+					new ActionProvenance("codex", "gpt-5.6-sol", "high", "priority", "rebind", 1L, "wait", 1L)
+			);
+			DurableActionJournal journal = DurableActionJournal.open(journalFile);
+			journal.accept(request, started.currentGoal().orElseThrow().goalId());
+			bridge = new MultiplexedServerBridge(manager, 0, secretFile, ServerSocket::new, System::nanoTime, journal);
+			ServerActionExecutor executor = (ServerActionExecutor) readPrivateField(bridge, "actionExecutor");
+			Class<?> actionClass = Class.forName(ServerActionExecutor.class.getName() + "$ActiveAction");
+			Method waitFor = actionClass.getDeclaredMethod("waitFor", ServerActionRequest.class, ServerPlayer.class, long.class);
+			waitFor.setAccessible(true);
+			((Map<AgentId, Object>) readPrivateField(executor, "active")).put(
+					started.agentId(), waitFor.invoke(null, request, null, 1000L));
+			((AgentSavedData) readPrivateField(manager, "savedData")).setRuntimeHooks(new AgentRuntimeHooks() {
+				@Override public void onTransition(AgentTransition transition) {
+					if (transition.cancelAction()) executor.cancel(transition.after().agentId(), "Bridge rebind");
+				}
+			});
+			((AtomicBoolean) readPrivateField(bridge, "activeDisconnectPending")).set(true);
+			bridge.closeAndDrainDisconnect();
+			try (DurableActionJournal reopened = DurableActionJournal.open(journalFile)) {
+				DurableActionJournal.Entry entry = reopened.snapshot().getFirst();
+				assertEquals(DurableActionJournal.Phase.TERMINAL, entry.phase(), "rebind persists cancellation before closing the journal");
+				assertEquals("ACTION_CANCELLED", entry.result().reasonCode(), "rebind retains the definite cancellation outcome");
+			}
+			assertTrue(((Map<?, ?>) readPrivateField(executor, "active")).isEmpty(), "rebind finishes the cancelled action");
+		} catch (ReflectiveOperationException | IOException exception) {
+			throw new AssertionError("rebind journal verification failed", exception);
+		} finally {
+			if (bridge != null) bridge.close();
+			deleteIfExists(secretFile);
+			deleteIfExists(journalFile);
+		}
 	}
 
 	private static void verifyAcceptedActionRecoversWithoutReplay() {
@@ -222,7 +273,9 @@ public final class MultiplexedServerBridgeVerification {
 			bridge = new MultiplexedServerBridge(manager, 0, secretFile, ServerSocket::new, System::nanoTime, journal);
 			bridge.hydrateActionJournalForVerification();
 
-			DurableActionJournal.Entry recovered = DurableActionJournal.open(journalFile).snapshot().getFirst();
+			journal.close();
+			DurableActionJournal recoveredJournal = DurableActionJournal.open(journalFile);
+			DurableActionJournal.Entry recovered = recoveredJournal.snapshot().getFirst();
 			assertEquals(DurableActionJournal.Phase.TERMINAL, recovered.phase(),
 					"accepted-only crash recovery is durably terminalized");
 			assertEquals("RECOVERY_UNCERTAIN", recovered.result().reasonCode(),
@@ -231,6 +284,7 @@ public final class MultiplexedServerBridgeVerification {
 					"uncertain recovery result is hydrated for coordinator replay");
 			ProgramActionLedger actions = (ProgramActionLedger) readPrivateField(bridge, "programActions");
 			assertThrowsDomain(() -> actions.accept(request), "ACTION_REPLAY");
+			recoveredJournal.close();
 		} catch (ReflectiveOperationException | IOException exception) {
 			throw new AssertionError("accepted action crash recovery verification failed", exception);
 		} finally {
@@ -3386,7 +3440,7 @@ public final class MultiplexedServerBridgeVerification {
 
 	private static void verifyObservationCadence(List<AgentId> agents) {
 		MultiplexedServerBridge.ObservationPublication publication =
-				new MultiplexedServerBridge.ObservationPublication(16, 16);
+				new MultiplexedServerBridge.ObservationPublication(16, 16, 1);
 		List<AgentId> heartbeats = new ArrayList<>();
 		for (int tick = 0; tick < agents.size(); tick++) {
 			publication.scheduleIdleHeartbeat(agents);
@@ -3436,6 +3490,68 @@ public final class MultiplexedServerBridgeVerification {
 		assertTrue(publication.pendingCount() > 0, "heartbeat remains queued before a session reset");
 		MultiplexedServerBridge.onSessionClosed(publication, session);
 		assertEquals(0, publication.pendingCount(), "session cleanup clears pending idle heartbeats");
+		verifyDueHeartbeatCadence(agents.subList(0, Math.min(2, agents.size())));
+	}
+
+	private static void verifyDueHeartbeatCadence(List<AgentId> agents) {
+		MultiplexedServerBridge.ObservationPublication publication =
+				new MultiplexedServerBridge.ObservationPublication(16, 16, 3);
+		Object session = new Object();
+		MultiplexedServerBridge.onSessionAccepted(publication, session);
+		List<AgentId> emitted = new ArrayList<>();
+		for (int tick = 0; tick < 8; tick++) {
+			final long observedAt = 2_000L + tick;
+			publication.scheduleIdleHeartbeat(agents);
+			publication.drain(agentId -> {
+				emitted.add(agentId);
+				assertTrue(publication.takeHeartbeat(agentId), "scheduled work is marked as a heartbeat");
+				assertEquals(MultiplexedServerBridge.ObservationPublication.Result.COMMITTED,
+						publication.publish(agentId, session, observation("00000000-0000-0000-0000-000000000002", observedAt),
+								(ignoredAgent, ignoredPayload) -> true, true),
+						"a due heartbeat commits and advances its next due tick");
+			});
+		}
+		assertEquals(List.of(agents.get(0), agents.get(1), agents.get(0), agents.get(1), agents.get(0), agents.get(1)),
+				emitted, "minimum interval spaces each agent while retaining fair rotation");
+
+		MultiplexedServerBridge.ObservationPublication retryPublication =
+				new MultiplexedServerBridge.ObservationPublication(16, 16, 3);
+		MultiplexedServerBridge.onSessionAccepted(retryPublication, session);
+		retryPublication.scheduleIdleHeartbeat(List.of(agents.get(0)));
+		List<AgentId> retryDrain = new ArrayList<>();
+		retryPublication.drain(agentId -> {
+			retryDrain.add(agentId);
+			assertTrue(retryPublication.takeHeartbeat(agentId), "failed heartbeat is identified for retry");
+			assertEquals(MultiplexedServerBridge.ObservationPublication.Result.DELIVERY_RETRY,
+					retryPublication.publish(agentId, session, observation("00000000-0000-0000-0000-000000000002", 3_000L),
+								(ignoredAgent, ignoredPayload) -> false, true),
+						"a failed heartbeat remains undelivered");
+		});
+		assertTrue(retryPublication.offerHeartbeat(agents.get(0)), "failed heartbeat can be requeued");
+		retryPublication.drain(agentId -> {
+			assertTrue(retryPublication.takeHeartbeat(agentId), "requeued heartbeat retains its bypass marker");
+			assertEquals(MultiplexedServerBridge.ObservationPublication.Result.COMMITTED,
+					retryPublication.publish(agentId, session, observation("00000000-0000-0000-0000-000000000002", 3_001L),
+								(ignoredAgent, ignoredPayload) -> true, true),
+						"a requeued heartbeat commits successfully");
+		});
+		assertEquals(List.of(agents.get(0)), retryDrain, "only the failed agent is retried");
+
+		MultiplexedServerBridge.ObservationPublication cleanupPublication =
+				new MultiplexedServerBridge.ObservationPublication(16, 16, 3);
+		Object oldSession = new Object();
+		Object newSession = new Object();
+		MultiplexedServerBridge.onSessionAccepted(cleanupPublication, oldSession);
+		cleanupPublication.scheduleIdleHeartbeat(List.of(agents.get(0)));
+		MultiplexedServerBridge.onSessionAccepted(cleanupPublication, newSession);
+		assertEquals(0, cleanupPublication.pendingCount(), "session replacement clears queued heartbeat state");
+		cleanupPublication.scheduleIdleHeartbeat(List.of(agents.get(0)));
+		List<AgentId> freshSession = new ArrayList<>();
+		cleanupPublication.drain(agentId -> {
+			freshSession.add(agentId);
+			assertTrue(cleanupPublication.takeHeartbeat(agentId), "fresh session starts with a due heartbeat");
+		});
+		assertEquals(List.of(agents.get(0)), freshSession, "session replacement does not delay first observation");
 	}
 
 	private static JsonObject observation(String targetId, long observedAtEpochMs) {
