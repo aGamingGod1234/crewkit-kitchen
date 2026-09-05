@@ -111,6 +111,37 @@ test('native observe returns latest compact facts without sending a body command
 	assert.deepEqual(sent, []);
 });
 
+test('identical heartbeat refresh advances sequence without re-ingesting world state', async () => {
+	const runtime = new NativeToolRuntime({ bridge: { send: async () => {} } });
+	const current = record();
+	const conversation = {
+		mode: 'history',
+		nextSequence: 4,
+		entries: [{ sequence: 4, kind: 'agent_message', sourceId: 'agent-b', recipientId: 'agent-a', text: 'hello' }],
+	};
+	const observation = {
+		player: { x: 0, y: 64, z: 0, health: 20, dead: false },
+		inventory: { items: [{ itemId: 'minecraft:stone', count: 1 }] },
+	};
+	runtime.updateObservation(current, observation, { eventSequence: 1, conversation });
+	assert.equal(runtime.refreshObservation(current, { eventSequence: 2 }), true);
+	const result = await runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-refresh', callId: 'observe-refresh', tool: { kind: 'observe' },
+	}, current);
+	assert.equal(result.eventSequence, 2);
+	assert.deepEqual(result.observation, {
+		...observation,
+		recovery: {
+			alreadyHave: ['minecraft:stone'],
+			alreadyHaveFacts: [{ kind: 'inventory', itemId: 'minecraft:stone', count: 1 }],
+			doNotRedo: [],
+			facts: 'Currently evidenced: minecraft:stone.',
+		},
+	});
+	assert.deepEqual(result.conversation, conversation);
+	assert.equal(runtime.refreshObservation(current, { eventSequence: 2 }), false, 'duplicate sequence is ignored');
+});
+
 test('lookAround turns the real player in bounded steps and preserves the observed hand and slot', async () => {
 	const sent = [];
 	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) } });

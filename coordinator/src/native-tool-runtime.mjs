@@ -81,6 +81,26 @@ export class NativeToolRuntime {
 		return true;
 	}
 
+	/**
+	 * Advances metadata for a known-identical heartbeat without re-ingesting world facts.
+	 * The caller must have already computed the factual and actionable signatures. This
+	 * intentionally leaves observation, last-live, recovery, and occupancy state intact.
+	 */
+	refreshObservation(record, { eventSequence = 0, conversation = undefined } = {}) {
+		validateRecord(record);
+		if (!Number.isSafeInteger(eventSequence) || eventSequence < 0) throw new TypeError('eventSequence must be a nonnegative safe integer');
+		const latest = this.#observations.get(record.agentId);
+		if (latest === undefined || latest.goalRevision !== record.goalRevision || eventSequence <= latest.eventSequence) return false;
+		this.#observations.set(record.agentId, {
+			...latest,
+			goal: record.currentGoal ?? null,
+			goalSpec: record.currentGoalSpec ?? null,
+			eventSequence,
+			...(conversation === undefined ? {} : { conversation: structuredClone(conversation) }),
+		});
+		return true;
+	}
+
 	snapshotLive(agentId) {
 		const live = this.#lastLive.get(agentId);
 		return live === undefined ? null : structuredClone(live);
