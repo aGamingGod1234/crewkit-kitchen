@@ -137,13 +137,16 @@ def _tts(request):
     text = request.get("text")
     voice_id = request.get("voiceId", "local.default.v1")
     speed = request.get("speed", 1)
+    tone = request.get("tone", "neutral")
     if not isinstance(text, str) or not text.strip() or len(text) > MAX_TTS_CODE_POINTS:
         raise ValueError("TTS text must contain 1 to 280 code points")
     if not isinstance(voice_id, str) or not voice_id.strip():
         raise ValueError("TTS voice ID is invalid")
     if not isinstance(speed, (int, float)) or not math.isfinite(speed) or speed < 0.5 or speed > 2:
         raise ValueError("TTS speed is invalid")
-    conditioning = _voice_conditioning(voice_id)
+    if not isinstance(tone, str) or not tone.strip() or len(tone) > 32 or not tone.replace("_", "").replace("-", "").isalnum():
+        raise ValueError("TTS tone is invalid")
+    conditioning = _voice_conditioning(voice_id, tone)
     with _model_lock:
         model = _load_tts()
         with contextlib.redirect_stdout(sys.stderr):
@@ -163,7 +166,7 @@ def _tts(request):
     }
 
 
-def _voice_conditioning(voice_id):
+def _voice_conditioning(voice_id, tone="neutral"):
     digest = hashlib.sha256(voice_id.encode("utf-8")).digest()
     expression = int.from_bytes(digest[:2], "big") / 0xFFFF
     variation = int.from_bytes(digest[2:4], "big") / 0xFFFF
@@ -173,6 +176,23 @@ def _voice_conditioning(voice_id):
     configured = _configured_tts_tuning()
     exaggeration = configured.get("exaggeration", exaggeration)
     cfg_weight = configured.get("cfg_weight", cfg_weight)
+    # Keep voice identity stable while making cinematic cues easy to direct.
+    # These values are deliberately bounded because Chatterbox can become
+    # unstable when conditioning is pushed too far.
+    tone_adjustments = {
+        "neutral": (0.00, 0.00, 0.00),
+        "warm": (0.05, -0.03, -0.02),
+        "excited": (0.18, -0.08, 0.04),
+        "serious": (-0.08, 0.08, -0.03),
+        "dramatic": (0.14, 0.04, 0.05),
+        "whisper": (-0.12, 0.10, -0.04),
+        "robotic": (-0.16, 0.16, -0.06),
+        "angry": (0.20, 0.02, 0.06),
+    }
+    exaggeration_delta, cfg_delta, temperature_delta = tone_adjustments.get(tone.lower(), (0.00, 0.00, 0.00))
+    exaggeration = max(0.30, min(1.00, exaggeration + exaggeration_delta))
+    cfg_weight = max(0.10, min(0.90, cfg_weight + cfg_delta))
+    temperature = max(0.50, min(1.20, temperature + temperature_delta))
     return {
         "exaggeration": exaggeration,
         "cfg_weight": cfg_weight,

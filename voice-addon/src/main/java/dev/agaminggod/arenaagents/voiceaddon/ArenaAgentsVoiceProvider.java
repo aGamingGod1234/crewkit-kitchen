@@ -119,6 +119,7 @@ public final class ArenaAgentsVoiceProvider implements VoiceSubsystemProvider, V
 
 	private void acceptLegacyPacketOnServer(MinecraftServer server, MicrophonePacketSnapshot packet) {
 		try {
+			if (dev.agaminggod.arenaagents.server.voice.VoiceSubsystemRuntime.isAgentPlayer(server, packet.playerId())) return;
 			HumanSpeechCapture capture = legacySpeechCapture;
 			if (capture == null) {
 				synchronized (ArenaAgentsVoiceProvider.class) {

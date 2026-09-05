@@ -670,7 +670,7 @@ public final class ServerObservationCollector {
 						eye,
 						endpoint,
 						ClipContext.Block.VISUAL,
-						ClipContext.Fluid.NONE,
+						ClipContext.Fluid.ANY,
 						agent
 				));
 				if (hit.getType() != HitResult.Type.BLOCK) continue;

@@ -22,10 +22,22 @@ abstract class AbstractClientPlayerMixin {
 		AbstractClientPlayer player = (AbstractClientPlayer) (Object) this;
 		String profileName = player.getGameProfile().name();
 		AgentControlAgent agent = AgentControlClient.agentForPlayer(profileName).orElse(null);
-		if (agent == null || !player.getUUID().equals(AgentIdentity.offlinePlayerUuid(agent.playerName()))) return;
-
-		AgentVisualIdentity.Resolved identity = AgentVisualIdentity.resolve(
-				agent.provider(), agent.model(), agent.skinVariant());
+		AgentVisualIdentity.Resolved identity;
+		if (agent != null) {
+			// The UUID check prevents a similarly named human player from inheriting
+			// an agent's skin when the roster snapshot is already available.
+			if (!player.getUUID().equals(AgentIdentity.offlinePlayerUuid(agent.playerName()))) return;
+			identity = AgentVisualIdentity.resolve(agent.provider(), agent.model(), agent.skinVariant());
+		} else {
+			// A fake player can render before the first roster snapshot reaches the
+			// client. The technical transport/recognizable name still carries enough
+			// signed identity to select its persisted skin during that gap.
+			AgentIdentity.SkinIdentity fallback = AgentIdentity.skinForPlayerName(profileName).orElse(null);
+			if (fallback == null || !player.getUUID().equals(AgentIdentity.offlinePlayerUuid(profileName))) return;
+			identity = fallback.modelFamily().isBlank()
+					? AgentVisualIdentity.resolveProviderFallback(fallback.provider(), fallback.variant())
+					: AgentVisualIdentity.resolveFamily(fallback.provider(), fallback.modelFamily(), fallback.variant());
+		}
 		Identifier texture = CodexAgentRenderer.textureFor(identity);
 		ClientAsset.Texture body = new ClientAsset.ResourceTexture(texture, texture);
 		callback.setReturnValue(new PlayerSkin(body, null, null, PlayerModelType.WIDE, false));

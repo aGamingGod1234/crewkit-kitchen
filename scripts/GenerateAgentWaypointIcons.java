@@ -34,15 +34,16 @@ public final class GenerateAgentWaypointIcons {
 			String code = variants.group(2).toLowerCase();
 			if (!codes.add(code)) throw new IllegalStateException("Duplicate transport code: " + code);
 			BufferedImage skin = ImageIO.read(resources.resolve("textures/entity/" + textureName + ".png").toFile());
-			if (skin == null || skin.getWidth() != 64 || skin.getHeight() != 64) {
-				throw new IllegalStateException("Expected a 64x64 skin: " + textureName);
+			if (skin == null || skin.getWidth() != skin.getHeight() || skin.getWidth() % 64 != 0) {
+				throw new IllegalStateException("Expected a square 64x64-compatible skin: " + textureName);
 			}
+			int scale = skin.getWidth() / 64;
 			BufferedImage head = new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB);
 			Graphics2D graphics = head.createGraphics();
 			graphics.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
-			graphics.drawImage(skin.getSubimage(8, 8, 8, 8), 0, 0, 16, 16, null);
+			graphics.drawImage(skin.getSubimage(8 * scale, 8 * scale, 8 * scale, 8 * scale), 0, 0, 16, 16, null);
 			graphics.setComposite(AlphaComposite.SrcOver);
-			graphics.drawImage(skin.getSubimage(40, 8, 8, 8), 0, 0, 16, 16, null);
+			graphics.drawImage(skin.getSubimage(40 * scale, 8 * scale, 8 * scale, 8 * scale), 0, 0, 16, 16, null);
 			graphics.dispose();
 			ImageIO.write(head, "png", spriteRoot.resolve(code + ".png").toFile());
 			Files.writeString(styleRoot.resolve(code + ".json"),

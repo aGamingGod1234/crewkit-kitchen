@@ -2,6 +2,9 @@ package dev.agaminggod.arenaagents.server;
 
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.StringArgumentType;
+import com.mojang.brigadier.arguments.IntegerArgumentType;
+import com.mojang.brigadier.arguments.FloatArgumentType;
+import com.mojang.brigadier.arguments.DoubleArgumentType;
 import com.mojang.brigadier.context.CommandContext;
 import com.mojang.brigadier.exceptions.CommandSyntaxException;
 import com.mojang.brigadier.exceptions.DynamicCommandExceptionType;
@@ -10,6 +13,7 @@ import dev.agaminggod.arenaagents.agent.AgentGameMode;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.AgentTransition;
+import dev.agaminggod.arenaagents.control.AgentControlCatalog;
 import dev.agaminggod.arenaagents.server.group.AgentGroup;
 import dev.agaminggod.arenaagents.server.group.AgentGroupSpawnCoordinator;
 import dev.agaminggod.arenaagents.server.goal.GoalDraftChoice;
@@ -22,11 +26,17 @@ import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.SharedSuggestionProvider;
+import net.minecraft.commands.arguments.coordinates.Vec3Argument;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.phys.Vec3;
 import dev.agaminggod.arenaagents.server.voice.VoiceConsentRegistry;
+import dev.agaminggod.arenaagents.server.voice.VoiceCue;
+import dev.agaminggod.arenaagents.server.voice.VoiceDirector;
+import dev.agaminggod.arenaagents.server.voice.VoiceDirectorSavedData;
+import dev.agaminggod.arenaagents.server.voice.VoiceProfile;
+import dev.agaminggod.arenaagents.server.voice.VoiceScript;
 import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemRuntime;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -38,8 +48,16 @@ public final class CodexAgentCommands {
 	private static final String DEFAULT_CODEX_SERVICE_TIER = "fast";
 	private static final String PROVIDER_CODEX = "codex";
 	private static final String PROVIDER_GEMINI = "gemini";
+	private static final String PROVIDER_CLAUDE = "claude";
 	private static final String PROVIDER_KIMI = "kimi";
 	private static final String PROVIDER_CURSOR = "cursor";
+	private static final List<String> VOICE_PROFILE_IDS = List.of(
+			VoiceProfile.DEFAULT_PROFILE_ID,
+			"voice.moss.v1", "voice.flint.v1", "voice.ember.v1", "voice.wren.v1", "voice.cedar.v1",
+			"voice.sable.v1", "voice.quill.v1", "voice.rook.v1", "voice.juniper.v1", "voice.vale.v1",
+			"voice.kestrel.v1", "voice.sol.v1", "voice.reed.v1", "voice.nova.v1", "voice.ash.v1", "voice.piper.v1");
+	private static final List<String> VOICE_TONES = List.of(
+			"neutral", "warm", "excited", "serious", "dramatic", "whisper", "robotic", "angry");
 	private static final String ARGUMENT_AGENT = "agent";
 	private static final String ARGUMENT_GAME_MODE = "game_mode";
 	private static final String ARGUMENT_DRAFT = "draft_id";
@@ -136,7 +154,137 @@ public final class CodexAgentCommands {
 						.then(Commands.literal("auto")
 								.requires(GoalControl::mayControl)
 								.then(agentArgument().executes(CodexAgentCommands::toggleAutomatic)))
-		);
+						.then(skitCommands())
+						);
+	}
+
+	private static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> skitCommands() {
+		var skit = Commands.literal("skit").requires(GoalControl::mayControl);
+		skit.then(Commands.literal("on").executes(context -> toggleSkit(context, true)));
+		skit.then(Commands.literal("off").executes(context -> toggleSkit(context, false)));
+		skit.then(Commands.literal("status").executes(CodexAgentCommands::skitStatus));
+
+		var summon = Commands.literal("summon");
+		var provider = Commands.argument("provider", StringArgumentType.word())
+				.suggests((context, builder) -> SharedSuggestionProvider.suggest(
+						List.of(PROVIDER_CODEX, PROVIDER_GEMINI, PROVIDER_CLAUDE, PROVIDER_KIMI, PROVIDER_CURSOR), builder));
+		provider.then(Commands.argument("name", StringArgumentType.string()).executes(CodexAgentCommands::skitSummon));
+		provider.then(Commands.literal("model")
+				.then(Commands.argument(ARGUMENT_MODEL, AgentModelArgumentType.model())
+						.suggests((context, builder) -> SharedSuggestionProvider.suggest(
+							skitModels(StringArgumentType.getString(context, ARGUMENT_PROVIDER)), builder))
+						.then(Commands.argument("name", StringArgumentType.string()).executes(CodexAgentCommands::skitSummon))));
+		summon.then(provider);
+		skit.then(summon);
+
+		var at = Commands.literal("at");
+		var position = Commands.argument("position", Vec3Argument.vec3(false));
+		var yaw = Commands.argument("yaw", FloatArgumentType.floatArg(-360.0F, 360.0F));
+		yaw.then(Commands.argument("pitch", FloatArgumentType.floatArg(-90.0F, 90.0F))
+				.executes(CodexAgentCommands::placeAt));
+		position.then(yaw);
+		at.then(position);
+		var relative = Commands.literal("relative")
+				.then(Commands.argument("right", DoubleArgumentType.doubleArg(-128.0D, 128.0D))
+						.then(Commands.argument("up", DoubleArgumentType.doubleArg(-128.0D, 128.0D))
+								.then(Commands.argument("forward", DoubleArgumentType.doubleArg(-128.0D, 128.0D))
+										.executes(CodexAgentCommands::placeRelative))));
+		var lookAt = Commands.literal("look_at")
+				.then(Commands.argument("target", Vec3Argument.vec3(false))
+						.executes(CodexAgentCommands::placeLookingAt));
+		var place = Commands.literal("place");
+		place.then(agentArgument()
+				.then(Commands.literal("here").executes(CodexAgentCommands::placeHere))
+				.then(at)
+				.then(relative)
+				.then(lookAt));
+		skit.then(place);
+
+		var create = Commands.literal("create");
+		create.then(Commands.argument("script", StringArgumentType.word())
+				.then(agentArgument().executes(CodexAgentCommands::createSkitScript)));
+		var add = Commands.literal("add");
+		var addScript = Commands.argument("script", StringArgumentType.word());
+		var delay = Commands.argument("delay", IntegerArgumentType.integer(0, SkitStep.MAX_DELAY_TICKS));
+		var addPosition = Commands.argument("position", Vec3Argument.vec3(false));
+		var addYaw = Commands.argument("yaw", FloatArgumentType.floatArg(-360.0F, 360.0F));
+		addYaw.then(Commands.argument("pitch", FloatArgumentType.floatArg(-90.0F, 90.0F))
+				.executes(CodexAgentCommands::addSkitStep));
+		addPosition.then(addYaw);
+		delay.then(addPosition);
+		addScript.then(delay);
+		add.then(addScript);
+		var play = Commands.literal("play");
+		var playScript = Commands.argument("script", StringArgumentType.word())
+				.executes(context -> playSkitScript(context, null));
+		playScript.then(agentArgument().executes(context -> playSkitScript(
+				context, StringArgumentType.getString(context, ARGUMENT_AGENT))));
+		play.then(playScript);
+		var script = Commands.literal("script");
+		script.then(create).then(add).then(Commands.literal("list").executes(CodexAgentCommands::listSkitScripts))
+				.then(Commands.literal("delete").then(Commands.argument("script", StringArgumentType.word())
+						.executes(CodexAgentCommands::deleteSkitScript)))
+				.then(play).then(Commands.literal("stop")
+						.then(agentArgument().executes(CodexAgentCommands::stopSkitScript)))
+				.then(actionCommand());
+		skit.then(script);
+		skit.then(voiceCommands());
+		return skit;
+	}
+
+	private static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> actionCommand() {
+		var action = Commands.literal("action");
+		var script = Commands.argument("script", StringArgumentType.word());
+		var type = Commands.argument("action", StringArgumentType.word())
+				.executes(CodexAgentCommands::addSkitAction)
+				.then(Commands.argument("args", StringArgumentType.greedyString())
+						.executes(CodexAgentCommands::addSkitAction));
+		script.then(type);
+		action.then(script);
+		return action;
+	}
+
+	private static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> voiceCommands() {
+		var voice = Commands.literal("voice");
+		var profile = Commands.literal("profile")
+				.then(agentArgument().then(Commands.argument("profile", StringArgumentType.word())
+						.suggests((context, builder) -> SharedSuggestionProvider.suggest(VOICE_PROFILE_IDS, builder))
+						.executes(CodexAgentCommands::setVoiceProfile)
+						.then(Commands.argument("tone", StringArgumentType.word())
+							.suggests((context, builder) -> SharedSuggestionProvider.suggest(VOICE_TONES, builder))
+							.executes(CodexAgentCommands::setVoiceProfile)
+								.then(Commands.argument("speed", DoubleArgumentType.doubleArg(0.5D, 2.0D))
+										.executes(CodexAgentCommands::setVoiceProfile)
+										.then(Commands.argument("radius", IntegerArgumentType.integer(1, 128))
+												.executes(CodexAgentCommands::setVoiceProfile))))));
+		voice.then(profile);
+		voice.then(Commands.literal("profiles").executes(CodexAgentCommands::listVoiceProfiles));
+
+		var say = Commands.literal("say")
+				.then(agentArgument().then(Commands.argument("text", StringArgumentType.greedyString())
+						.executes(CodexAgentCommands::sayVoice)));
+		voice.then(say);
+
+		var script = Commands.literal("script");
+		script.then(Commands.literal("create")
+				.then(Commands.argument("name", StringArgumentType.word())
+						.then(agentArgument().executes(CodexAgentCommands::createVoiceScript))));
+		var add = Commands.literal("add")
+				.then(Commands.argument("name", StringArgumentType.word())
+						.then(Commands.argument("delay", IntegerArgumentType.integer(0, VoiceCue.MAX_DELAY_TICKS))
+								.then(Commands.argument("text", StringArgumentType.greedyString())
+										.executes(CodexAgentCommands::addVoiceCue))));
+		script.then(add);
+		script.then(Commands.literal("play")
+				.then(Commands.argument("name", StringArgumentType.word())
+						.executes(context -> playVoiceScript(context, null))
+						.then(agentArgument().executes(context -> playVoiceScript(
+								context, StringArgumentType.getString(context, ARGUMENT_AGENT))))));
+		script.then(Commands.literal("list").executes(CodexAgentCommands::listVoiceScripts));
+		script.then(Commands.literal("stop")
+				.then(agentArgument().executes(CodexAgentCommands::stopVoiceScript)));
+		voice.then(script);
+		return voice;
 	}
 
 	private static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> goalDraftCommands() {
@@ -226,6 +374,393 @@ public final class CodexAgentCommands {
 				false
 		);
 		return 1;
+	}
+
+	private static int toggleSkit(CommandContext<CommandSourceStack> context, boolean enabled) {
+		boolean actual = SkitModeRuntime.setEnabled(context.getSource().getServer(), enabled);
+		context.getSource().sendSuccess(() -> Component.literal("Agent skit mode " + (actual ? "enabled" : "disabled") + "."), false);
+		return actual ? 1 : 0;
+	}
+
+	private static int skitStatus(CommandContext<CommandSourceStack> context) {
+		SkitModeSavedData data = SkitModeSavedData.get(context.getSource().getServer());
+		context.getSource().sendSuccess(() -> Component.literal("Agent skit mode is " + (data.enabled() ? "enabled" : "disabled")
+				+ ". Saved placements: " + data.placements().size() + ", scripts: " + data.scripts().size() + "."), false);
+		return data.enabled() ? 1 : 0;
+	}
+
+	private static int skitSummon(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
+		try {
+			SkitModeRuntime.requireEnabled(context.getSource().getServer());
+			String provider = StringArgumentType.getString(context, "provider").toLowerCase(java.util.Locale.ROOT);
+			String name = StringArgumentType.getString(context, "name");
+			Vec3 position = context.getSource().getPosition();
+			String model = explicitModel(context).orElseGet(() -> switch (provider) {
+				case PROVIDER_CODEX -> DEFAULT_MODEL;
+				case PROVIDER_GEMINI -> "gemini-3.1-pro";
+				case PROVIDER_CLAUDE -> "claude-sonnet-4-6";
+				case PROVIDER_KIMI -> "kimi-code/k3";
+				case PROVIDER_CURSOR -> "composer-2.5";
+				default -> throw new AgentDomainException("INVALID_PROVIDER", "Unsupported skit provider: " + provider);
+			});
+			String managerProvider = PROVIDER_CLAUDE.equals(provider) ? PROVIDER_GEMINI : provider;
+			String reasoning = PROVIDER_CODEX.equals(provider) ? DEFAULT_REASONING
+					: PROVIDER_CLAUDE.equals(provider) ? "thinking" : "high";
+			AgentRecord record = manager(context).summon(
+					context.getSource().getLevel(), position, managerProvider, model, reasoning,
+					PROVIDER_CODEX.equals(provider) ? DEFAULT_CODEX_SERVICE_TIER : "priority",
+					Optional.of(name), AgentGameMode.SURVIVAL);
+			context.getSource().sendSuccess(() -> Component.literal("Creating skit agent " + manager(context).displayName(record) + "."), false);
+			return 1;
+		} catch (AgentDomainException exception) {
+			throw commandFailure(exception);
+		} catch (RuntimeException exception) {
+			throw unexpectedFailure("skit summon", exception);
+		}
+	}
+
+	private static Optional<String> explicitModel(CommandContext<CommandSourceStack> context) {
+		try {
+			return Optional.of(context.getArgument(ARGUMENT_MODEL, String.class));
+		} catch (IllegalArgumentException ignored) {
+			return Optional.empty();
+		}
+	}
+
+	private static List<String> skitModels(String provider) {
+		String catalogProvider = PROVIDER_CLAUDE.equals(provider) ? PROVIDER_GEMINI : provider;
+		try {
+			return AgentControlCatalog.models(catalogProvider);
+		} catch (IllegalArgumentException ignored) {
+			return List.of();
+		}
+	}
+
+	private static int placeHere(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
+		try {
+			if (!(context.getSource().getEntity() instanceof ServerPlayer player)) {
+				throw new AgentDomainException("PLAYER_REQUIRED", "The 'here' placement must be run by an in-game player");
+			}
+			Vec3 position = player.position();
+			SkitModeRuntime.place(manager(context), StringArgumentType.getString(context, ARGUMENT_AGENT),
+					(ServerLevel) player.level(), position.x, position.y, position.z, player.getYRot(), player.getXRot());
+			context.getSource().sendSuccess(() -> Component.literal("Placed agent at your current position and facing."), false);
+			return 1;
+		} catch (AgentDomainException exception) {
+			throw commandFailure(exception);
+		} catch (RuntimeException exception) {
+			throw unexpectedFailure("skit place", exception);
+		}
+	}
+
+	private static int placeAt(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
+		try {
+			Vec3 position = Vec3Argument.getVec3(context, "position");
+			float yaw = FloatArgumentType.getFloat(context, "yaw");
+			float pitch = FloatArgumentType.getFloat(context, "pitch");
+			SkitModeRuntime.place(manager(context), StringArgumentType.getString(context, ARGUMENT_AGENT),
+					context.getSource().getLevel(), position.x, position.y, position.z, yaw, pitch);
+			context.getSource().sendSuccess(() -> Component.literal("Placed agent at " + position.x + " " + position.y + " " + position.z + "."), false);
+			return 1;
+		} catch (AgentDomainException exception) {
+			throw commandFailure(exception);
+		} catch (RuntimeException exception) {
+			throw unexpectedFailure("skit place", exception);
+		}
+	}
+
+	private static int placeRelative(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
+		try {
+			if (!(context.getSource().getEntity() instanceof ServerPlayer player)) {
+				throw new AgentDomainException("PLAYER_REQUIRED", "Relative placement must be run by an in-game player");
+			}
+			SkitModeRuntime.placeRelative(manager(context), StringArgumentType.getString(context, ARGUMENT_AGENT), player,
+					DoubleArgumentType.getDouble(context, "right"), DoubleArgumentType.getDouble(context, "up"),
+					DoubleArgumentType.getDouble(context, "forward"));
+			context.getSource().sendSuccess(() -> Component.literal("Placed agent relative to your position and facing."), false);
+			return 1;
+		} catch (AgentDomainException exception) {
+			throw commandFailure(exception);
+		} catch (RuntimeException exception) {
+			throw unexpectedFailure("skit place relative", exception);
+		}
+	}
+
+	private static int placeLookingAt(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
+		try {
+			if (!(context.getSource().getEntity() instanceof ServerPlayer player)) {
+				throw new AgentDomainException("PLAYER_REQUIRED", "Look-at placement must be run by an in-game player");
+			}
+			SkitModeRuntime.placeLookingAt(manager(context), StringArgumentType.getString(context, ARGUMENT_AGENT), player,
+					Vec3Argument.getVec3(context, "target"));
+			context.getSource().sendSuccess(() -> Component.literal("Placed agent facing the target point."), false);
+			return 1;
+		} catch (AgentDomainException exception) {
+			throw commandFailure(exception);
+		} catch (RuntimeException exception) {
+			throw unexpectedFailure("skit place look_at", exception);
+		}
+	}
+
+	private static int addSkitAction(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
+		try {
+			String scriptName = StringArgumentType.getString(context, "script");
+			String actionName = StringArgumentType.getString(context, "action").toLowerCase(java.util.Locale.ROOT);
+			String rawArgs = context.getNodes().stream().anyMatch(node -> "args".equals(node.getNode().getName()))
+					? StringArgumentType.getString(context, "args") : "";
+			SkitScript script = SkitModeSavedData.get(context.getSource().getServer()).script(scriptName);
+			if (script == null) throw new AgentDomainException("SKIT_SCRIPT_NOT_FOUND", "No skit script named " + scriptName);
+			SkitPlacement endpoint = SkitModeRuntime.savedPlacement(manager(context), script.agentSelector())
+					.orElseThrow(() -> new AgentDomainException("SKIT_PLACEMENT_NOT_FOUND", "Place the agent before adding an action"));
+			SkitAction action = parseSkitAction(actionName, rawArgs);
+			SkitModeRuntime.addAction(context.getSource().getServer(), scriptName, endpoint, action);
+			context.getSource().sendSuccess(() -> Component.literal("Added " + actionName + " action to " + scriptName + "."), false);
+			return 1;
+		} catch (AgentDomainException exception) {
+			throw commandFailure(exception);
+		} catch (RuntimeException exception) {
+			throw unexpectedFailure("skit script action", exception);
+		}
+	}
+
+	private static SkitAction parseSkitAction(String name, String rawArgs) {
+		List<String> args = rawArgs == null || rawArgs.isBlank() ? List.of() : Arrays.asList(rawArgs.strip().split("\\s+"));
+		return switch (name) {
+			case "move" -> SkitAction.move(integerArg(args, 0, "duration"), floatArg(args, 1, 1.0F), floatArg(args, 2, 0.0F), boolArg(args, 3, false));
+			case "wait" -> SkitAction.waitTicks(integerArg(args, 0, "duration"));
+			case "jump" -> SkitAction.jump();
+			case "equip" -> SkitAction.equip(stringArg(args, 0, "item"));
+			case "use" -> SkitAction.use(integerOptional(args, 0, 1));
+			case "swing" -> SkitAction.swing();
+			case "emote" -> SkitAction.emote(integerOptional(args, 0, 20), boolArg(args, 1, false));
+			default -> throw new AgentDomainException("SKIT_ACTION_UNKNOWN", "Unknown action '" + name + "'. Use move, wait, jump, equip, use, swing, or emote.");
+		};
+	}
+
+	private static int integerArg(List<String> args, int index, String name) {
+		if (index >= args.size()) throw new AgentDomainException("SKIT_ACTION_ARGUMENT", name + " is required");
+		try { return Integer.parseInt(args.get(index)); }
+		catch (NumberFormatException exception) { throw new AgentDomainException("SKIT_ACTION_ARGUMENT", name + " must be an integer"); }
+	}
+
+	private static int integerOptional(List<String> args, int index, int fallback) {
+		if (index >= args.size()) return fallback;
+		try { return Integer.parseInt(args.get(index)); }
+		catch (NumberFormatException exception) { throw new AgentDomainException("SKIT_ACTION_ARGUMENT", "duration must be an integer"); }
+	}
+
+	private static float floatArg(List<String> args, int index, float fallback) {
+		if (index >= args.size()) return fallback;
+		try { return Float.parseFloat(args.get(index)); }
+		catch (NumberFormatException exception) { throw new AgentDomainException("SKIT_ACTION_ARGUMENT", "movement values must be numbers"); }
+	}
+
+	private static boolean boolArg(List<String> args, int index, boolean fallback) {
+		if (index >= args.size()) return fallback;
+		if ("true".equalsIgnoreCase(args.get(index))) return true;
+		if ("false".equalsIgnoreCase(args.get(index))) return false;
+		throw new AgentDomainException("SKIT_ACTION_ARGUMENT", "boolean values must be true or false");
+	}
+
+	private static String stringArg(List<String> args, int index, String name) {
+		if (index >= args.size() || args.get(index).isBlank()) throw new AgentDomainException("SKIT_ACTION_ARGUMENT", name + " is required");
+		return args.get(index);
+	}
+
+	private static int setVoiceProfile(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
+		try {
+			String selector = StringArgumentType.getString(context, ARGUMENT_AGENT);
+			String profileId = StringArgumentType.getString(context, "profile");
+			if (!VOICE_PROFILE_IDS.contains(profileId)) {
+				throw new AgentDomainException("VOICE_PROFILE_UNKNOWN", "Unknown voice profile. Use /codex skit voice profiles");
+			}
+			String tone = getOptionalString(context, "tone", VoiceProfile.DEFAULT_TONE);
+			double speed = getOptionalDouble(context, "speed", VoiceProfile.DEFAULT_SPEED);
+			int radius = getOptionalInt(context, "radius", VoiceProfile.DEFAULT_RADIUS);
+			AgentId agentId = manager(context).resolve(selector).agentId();
+			VoiceDirector.setProfile(context.getSource().getServer(), agentId, new VoiceProfile(profileId, tone, speed, radius));
+			context.getSource().sendSuccess(() -> Component.literal("Voice profile set for " + selector + "."), false);
+			return 1;
+		} catch (AgentDomainException exception) {
+			throw commandFailure(exception);
+		} catch (RuntimeException exception) {
+			throw unexpectedFailure("skit voice profile", exception);
+		}
+	}
+
+	private static int sayVoice(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
+		try {
+			AgentId agentId = manager(context).resolve(StringArgumentType.getString(context, ARGUMENT_AGENT)).agentId();
+			VoiceDirector.say(context.getSource().getServer(), agentId, StringArgumentType.getString(context, "text"));
+			return 1;
+		} catch (AgentDomainException exception) {
+			throw commandFailure(exception);
+		} catch (RuntimeException exception) {
+			throw unexpectedFailure("skit voice say", exception);
+		}
+	}
+
+	private static int listVoiceProfiles(CommandContext<CommandSourceStack> context) {
+		context.getSource().sendSuccess(() -> Component.literal("Voice catalog: " + String.join(", ", VOICE_PROFILE_IDS)), false);
+		return 1;
+	}
+
+	private static int createVoiceScript(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
+		try {
+			VoiceDirector.createScript(context.getSource().getServer(), StringArgumentType.getString(context, "name"),
+					StringArgumentType.getString(context, ARGUMENT_AGENT));
+			context.getSource().sendSuccess(() -> Component.literal("Created voice script."), false);
+			return 1;
+		} catch (AgentDomainException exception) {
+			throw commandFailure(exception);
+		} catch (RuntimeException exception) {
+			throw unexpectedFailure("skit voice script create", exception);
+		}
+	}
+
+	private static int addVoiceCue(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
+		try {
+			VoiceDirector.addCue(context.getSource().getServer(), StringArgumentType.getString(context, "name"),
+					new VoiceCue(IntegerArgumentType.getInteger(context, "delay"), StringArgumentType.getString(context, "text")));
+			context.getSource().sendSuccess(() -> Component.literal("Added voice cue."), false);
+			return 1;
+		} catch (AgentDomainException exception) {
+			throw commandFailure(exception);
+		} catch (RuntimeException exception) {
+			throw unexpectedFailure("skit voice script add", exception);
+		}
+	}
+
+	private static int playVoiceScript(CommandContext<CommandSourceStack> context, String selectorOverride) throws CommandSyntaxException {
+		try {
+			VoiceScript script = VoiceDirector.play(manager(context), StringArgumentType.getString(context, "name"), selectorOverride);
+			context.getSource().sendSuccess(() -> Component.literal("Playing voice script " + script.name() + "."), false);
+			return 1;
+		} catch (AgentDomainException exception) {
+			throw commandFailure(exception);
+		} catch (RuntimeException exception) {
+			throw unexpectedFailure("skit voice script play", exception);
+		}
+	}
+
+	private static int listVoiceScripts(CommandContext<CommandSourceStack> context) {
+		List<VoiceScript> scripts = VoiceDirectorSavedData.get(context.getSource().getServer()).scripts();
+		if (scripts.isEmpty()) {
+			context.getSource().sendSuccess(() -> Component.literal("No voice scripts saved."), false);
+			return 0;
+		}
+		for (VoiceScript script : scripts) context.getSource().sendSuccess(
+				() -> Component.literal(script.name() + " | " + script.agentSelector() + " | " + script.cues().size() + " cues"), false);
+		return scripts.size();
+	}
+
+	private static int stopVoiceScript(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
+		try {
+			AgentId agentId = manager(context).resolve(StringArgumentType.getString(context, ARGUMENT_AGENT)).agentId();
+			VoiceDirector.stop(context.getSource().getServer(), agentId);
+			context.getSource().sendSuccess(() -> Component.literal("Stopped voice playback."), false);
+			return 1;
+		} catch (AgentDomainException exception) {
+			throw commandFailure(exception);
+		} catch (RuntimeException exception) {
+			throw unexpectedFailure("skit voice script stop", exception);
+		}
+	}
+
+	private static String getOptionalString(CommandContext<CommandSourceStack> context, String name, String fallback) {
+		try { return StringArgumentType.getString(context, name); }
+		catch (IllegalArgumentException ignored) { return fallback; }
+	}
+
+	private static double getOptionalDouble(CommandContext<CommandSourceStack> context, String name, double fallback) {
+		try { return DoubleArgumentType.getDouble(context, name); }
+		catch (IllegalArgumentException ignored) { return fallback; }
+	}
+
+	private static int getOptionalInt(CommandContext<CommandSourceStack> context, String name, int fallback) {
+		try { return IntegerArgumentType.getInteger(context, name); }
+		catch (IllegalArgumentException ignored) { return fallback; }
+	}
+
+	private static int createSkitScript(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
+		try {
+			String name = StringArgumentType.getString(context, "script");
+			String agent = StringArgumentType.getString(context, ARGUMENT_AGENT);
+			SkitModeRuntime.createScript(context.getSource().getServer(), name, agent);
+			context.getSource().sendSuccess(() -> Component.literal("Created skit script " + name + " for " + agent + "."), false);
+			return 1;
+		} catch (AgentDomainException exception) {
+			throw commandFailure(exception);
+		} catch (RuntimeException exception) {
+			throw unexpectedFailure("skit script create", exception);
+		}
+	}
+
+	private static int addSkitStep(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
+		try {
+			Vec3 position = Vec3Argument.getVec3(context, "position");
+			SkitStep step = new SkitStep(IntegerArgumentType.getInteger(context, "delay"), new SkitPlacement(
+					context.getSource().getLevel().dimension().identifier().toString(), position.x, position.y, position.z,
+					FloatArgumentType.getFloat(context, "yaw"), FloatArgumentType.getFloat(context, "pitch")));
+			SkitScript script = SkitModeRuntime.addStep(context.getSource().getServer(),
+					StringArgumentType.getString(context, "script"), step);
+			context.getSource().sendSuccess(() -> Component.literal("Added step " + script.steps().size() + " to " + script.name() + "."), false);
+			return script.steps().size();
+		} catch (AgentDomainException exception) {
+			throw commandFailure(exception);
+		} catch (RuntimeException exception) {
+			throw unexpectedFailure("skit script add", exception);
+		}
+	}
+
+	private static int listSkitScripts(CommandContext<CommandSourceStack> context) {
+		List<SkitScript> scripts = SkitModeSavedData.get(context.getSource().getServer()).scripts();
+		if (scripts.isEmpty()) {
+			context.getSource().sendSuccess(() -> Component.literal("No skit scripts saved."), false);
+			return 0;
+		}
+		for (SkitScript script : scripts) context.getSource().sendSuccess(
+				() -> Component.literal(script.name() + " | " + script.agentSelector() + " | " + script.steps().size() + " steps"), false);
+		return scripts.size();
+	}
+
+	private static int deleteSkitScript(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
+		try {
+			String name = StringArgumentType.getString(context, "script");
+			SkitModeRuntime.deleteScript(context.getSource().getServer(), name);
+			context.getSource().sendSuccess(() -> Component.literal("Deleted skit script " + name + "."), false);
+			return 1;
+		} catch (AgentDomainException exception) {
+			throw commandFailure(exception);
+		} catch (RuntimeException exception) {
+			throw unexpectedFailure("skit script delete", exception);
+		}
+	}
+
+	private static int playSkitScript(CommandContext<CommandSourceStack> context, String selectorOverride) throws CommandSyntaxException {
+		try {
+			String name = StringArgumentType.getString(context, "script");
+			SkitScript script = SkitModeRuntime.play(manager(context), name, selectorOverride);
+			context.getSource().sendSuccess(() -> Component.literal("Playing skit " + script.name() + "."), false);
+			return 1;
+		} catch (AgentDomainException exception) {
+			throw commandFailure(exception);
+		} catch (RuntimeException exception) {
+			throw unexpectedFailure("skit script play", exception);
+		}
+	}
+
+	private static int stopSkitScript(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
+		try {
+			String selector = StringArgumentType.getString(context, ARGUMENT_AGENT);
+			SkitModeRuntime.stop(context.getSource().getServer(), selector);
+			context.getSource().sendSuccess(() -> Component.literal("Stopped skit playback for " + selector + "."), false);
+			return 1;
+		} catch (AgentDomainException exception) {
+			throw commandFailure(exception);
+		} catch (RuntimeException exception) {
+			throw unexpectedFailure("skit script stop", exception);
+		}
 	}
 
 	private static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> configuredSummon() {

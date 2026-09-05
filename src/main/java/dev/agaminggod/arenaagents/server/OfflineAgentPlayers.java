@@ -157,6 +157,7 @@ public final class OfflineAgentPlayers {
 		legacy.getStats().save();
 		legacy.getAdvancements().save();
 		copyLegacyIdentityFiles(
+				server.getWorldPath(LevelResource.PLAYER_DATA_DIR),
 				server.getWorldPath(LevelResource.PLAYER_STATS_DIR),
 				server.getWorldPath(LevelResource.PLAYER_ADVANCEMENTS_DIR),
 				legacy.getUUID(), canonicalUuid);
@@ -194,6 +195,25 @@ public final class OfflineAgentPlayers {
 		return canonical;
 	}
 
+	static void copyLegacyIdentityFiles(
+			Path playerDataDirectory,
+			Path statsDirectory,
+			Path advancementsDirectory,
+			UUID oldUuid,
+			UUID newUuid
+	) {
+		Objects.requireNonNull(playerDataDirectory, "playerDataDirectory must not be null");
+		Objects.requireNonNull(statsDirectory, "statsDirectory must not be null");
+		Objects.requireNonNull(advancementsDirectory, "advancementsDirectory must not be null");
+		Objects.requireNonNull(oldUuid, "oldUuid must not be null");
+		Objects.requireNonNull(newUuid, "newUuid must not be null");
+		if (oldUuid.equals(newUuid)) return;
+		copyIdentityFile(playerDataDirectory, oldUuid, newUuid, ".dat");
+		copyIdentityFile(statsDirectory, oldUuid, newUuid);
+		copyIdentityFile(advancementsDirectory, oldUuid, newUuid);
+	}
+
+	/** Compatibility helper for callers that only migrate the JSON identity stores. */
 	static void copyLegacyIdentityFiles(Path statsDirectory, Path advancementsDirectory, UUID oldUuid, UUID newUuid) {
 		Objects.requireNonNull(statsDirectory, "statsDirectory must not be null");
 		Objects.requireNonNull(advancementsDirectory, "advancementsDirectory must not be null");
@@ -213,10 +233,14 @@ public final class OfflineAgentPlayers {
 	}
 
 	private static void copyIdentityFile(Path directory, UUID oldUuid, UUID newUuid) {
-		Path source = directory.resolve(oldUuid + ".json");
+		copyIdentityFile(directory, oldUuid, newUuid, ".json");
+	}
+
+	private static void copyIdentityFile(Path directory, UUID oldUuid, UUID newUuid, String extension) {
+		Path source = directory.resolve(oldUuid + extension);
 		if (!Files.isRegularFile(source)) return;
-		Path target = directory.resolve(newUuid + ".json");
-		Path staged = directory.resolve(newUuid + ".json.arenaagents-migrating");
+		Path target = directory.resolve(newUuid + extension);
+		Path staged = directory.resolve(newUuid + extension + ".arenaagents-migrating");
 		try {
 			Files.createDirectories(directory);
 			Files.copy(source, staged, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.COPY_ATTRIBUTES);

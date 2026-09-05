@@ -46,6 +46,21 @@ public final class AgentModelNames {
 		return names == null ? readable(key.slug()) : names.shortLabel();
 	}
 
+	/** Model label formatting used by the in-world tag, where the family separator is useful at a glance. */
+	public static String tagName(String provider, String slug) {
+		ModelKey key = key(provider, slug);
+		if (key.provider().equals("codex")) {
+			return switch (key.slug()) {
+				case "gpt-5.6-sol" -> "GPT 5.6-Sol";
+				case "gpt-5.6-sol-wm" -> "GPT 5.6-Sol WM";
+				case "gpt-5.6-terra" -> "GPT 5.6-Terra";
+				case "gpt-5.6-luna" -> "GPT 5.6-Luna";
+				default -> displayName(key.provider(), key.slug());
+			};
+		}
+		return displayName(key.provider(), key.slug());
+	}
+
 	private static Map.Entry<ModelKey, Names> entry(
 			String provider,
 			String slug,

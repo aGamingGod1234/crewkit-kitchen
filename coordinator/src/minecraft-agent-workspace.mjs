@@ -92,8 +92,7 @@ export class MinecraftAgentWorkspace {
 		const destination = path.join(this.codexHome, 'auth.json');
 		const source = path.resolve(sourceCodexHome);
 		if (source === path.resolve(this.codexHome)) {
-			await this.fs.rm(destination, { force: true });
-			this.#lastSyncedSourceAuth = null;
+			this.#lastSyncedSourceAuth = await this.#readOptionalAuth(destination);
 			return;
 		}
 		const sourceContent = await this.#readOptionalAuth(path.join(source, 'auth.json'));

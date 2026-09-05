@@ -245,7 +245,13 @@ export function createVoiceHttpServer({
 				error.httpStatus = 503;
 				throw error;
 			}
-			const profile = profileStore.resolve(payload.agentId);
+			const selectedProfile = typeof profileStore.resolveRequested === 'function'
+				? profileStore.resolveRequested(payload.agentId, payload.profileId)
+				: profileStore.resolve(payload.agentId);
+			const profile = Object.freeze({
+				...selectedProfile,
+				speed: payload.profileId === 'voice.auto.v1' ? selectedProfile.speed : payload.speed,
+			});
 			const requestedProvider = effectiveProviderNamespace(provider);
 			const cacheKey = synthesisCacheKey(profile, payload, requestedProvider);
 			const cached = cache.get(cacheKey);
@@ -319,6 +325,7 @@ export function createVoiceHttpServer({
 						text: payload.text,
 						voiceId: profile.voiceId,
 						speed: profile.speed,
+						tone: payload.tone,
 						signal: providerController.signal,
 					}));
 					const output = resampleS16leMono(synthesized.pcm, synthesized.sampleRateHz, 48_000, 20);
@@ -537,6 +544,7 @@ function synthesisCacheKey(profile, payload, synthesizer) {
 		profileRevision: profile.revision,
 		text: payload.text.normalize('NFC').trim(),
 		speed: profile.speed,
+		tone: payload.tone,
 		format: 's16le',
 		sampleRate: 48_000,
 	});
@@ -893,12 +901,22 @@ function validateTranscriptResult(value) {
 function validateRequest(value) {
 	if (value === null || typeof value !== 'object' || Array.isArray(value)) throw typedError('INVALID_REQUEST', 'Voice request must be an object');
 	const keys = Object.keys(value).sort();
-	if (keys.join(',') !== 'agentId,conversationSequence,profileId,radius,text') throw typedError('INVALID_REQUEST', 'Voice request fields are invalid');
+	const keyShape = keys.join(',');
+	if (keyShape !== 'agentId,conversationSequence,profileId,radius,speed,text,tone'
+			&& keyShape !== 'agentId,conversationSequence,profileId,radius,text') throw typedError('INVALID_REQUEST', 'Voice request fields are invalid');
+	if (keyShape === 'agentId,conversationSequence,profileId,radius,text') {
+		value = { ...value, speed: 1, tone: 'neutral' };
+	}
 	if (!/^[0-9a-f-]{36}$/i.test(value.agentId)) throw typedError('INVALID_REQUEST', 'agentId must be a UUID');
 	if (typeof value.text !== 'string' || value.text.trim() === '' || [...value.text].length > 280) throw typedError('INVALID_REQUEST', 'text must contain 1 to 280 code points');
-	if (value.profileId !== 'voice.auto.v1') throw typedError('INVALID_REQUEST', 'profileId is not supported');
+	if (typeof value.profileId !== 'string' || !/^voice\.[a-z0-9_.-]+\.v1$/.test(value.profileId)) throw typedError('INVALID_REQUEST', 'profileId is invalid');
+	if (value.profileId !== 'voice.auto.v1' && !builtInVoiceProfiles().some((profile) => profile.profileId === value.profileId)) {
+		throw typedError('INVALID_REQUEST', 'profileId is not in the installed voice catalog');
+	}
 	if (!Number.isSafeInteger(value.radius) || value.radius < 1 || value.radius > 128) throw typedError('INVALID_REQUEST', 'radius is invalid');
 	if (!Number.isSafeInteger(value.conversationSequence) || value.conversationSequence < 0) throw typedError('INVALID_REQUEST', 'conversationSequence is invalid');
+	if (typeof value.speed !== 'number' || !Number.isFinite(value.speed) || value.speed < 0.5 || value.speed > 2) throw typedError('INVALID_REQUEST', 'speed is invalid');
+	if (typeof value.tone !== 'string' || !/^[A-Za-z0-9_.:-]{1,32}$/.test(value.tone)) throw typedError('INVALID_REQUEST', 'tone is invalid');
 	return value;
 }
 

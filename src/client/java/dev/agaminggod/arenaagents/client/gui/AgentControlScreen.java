@@ -846,10 +846,12 @@ public final class AgentControlScreen extends Screen {
 				() -> show(Page.MANAGE));
 		manage.active = canControl() && selectedAgent() != null;
 		addRenderableWidget(manage);
+		addRenderableWidget(consoleButton("Open Director", x, y + 96, width, ROW_HEIGHT, false,
+				this::openDirector));
 	}
 
 	private void addCompactOverviewActions(int x, int y, int width) {
-		int buttonWidth = (width - GAP * 2) / 3;
+		int buttonWidth = (width - GAP * 3) / 4;
 		ConsoleButton create = primaryButton("Create", x, y, buttonWidth, ROW_HEIGHT, () -> show(Page.CREATE));
 		create.active = canControl();
 		addRenderableWidget(create);
@@ -857,10 +859,16 @@ public final class AgentControlScreen extends Screen {
 				false, () -> show(Page.TASK));
 		task.active = canUseAutomation() && selectedAgent() != null;
 		addRenderableWidget(task);
-		ConsoleButton manage = consoleButton("Manage", x + (buttonWidth + GAP) * 2, y,
-				width - (buttonWidth + GAP) * 2, ROW_HEIGHT, false, () -> show(Page.MANAGE));
+		ConsoleButton manage = consoleButton("Manage", x + (buttonWidth + GAP) * 2, y, buttonWidth, ROW_HEIGHT,
+				false, () -> show(Page.MANAGE));
 		manage.active = canControl() && selectedAgent() != null;
 		addRenderableWidget(manage);
+		addRenderableWidget(consoleButton("Director", x + (buttonWidth + GAP) * 3, y,
+				width - (buttonWidth + GAP) * 3, ROW_HEIGHT, false, this::openDirector));
+	}
+
+	private void openDirector() {
+		if (minecraft != null) minecraft.setScreen(new SkitDirectorScreen(this));
 	}
 
 	private void initLive() {
@@ -1016,9 +1024,14 @@ public final class AgentControlScreen extends Screen {
 	private void addOverviewFooter() {
 		int y = layout().footerY();
 		int x = contentLeft();
-		addRenderableWidget(consoleButton("Refresh", x, y, 96, ROW_HEIGHT, false,
+		int buttonWidth = (contentWidth() - GAP * 2) / 3;
+		addRenderableWidget(consoleButton("Refresh", x, y, buttonWidth, ROW_HEIGHT, false,
 				AgentControlClient::requestSnapshot));
-		addRenderableWidget(consoleButton("Close", contentRight() - 96, y, 96, ROW_HEIGHT, false, this::onClose));
+		ConsoleButton skit = consoleButton("Enable skit mode", x + buttonWidth + GAP, y, buttonWidth, ROW_HEIGHT, false,
+				() -> send("codex skit on", "Enabling skit mode..."));
+		skit.active = canControl();
+		addRenderableWidget(skit);
+		addRenderableWidget(consoleButton("Close", contentRight() - buttonWidth, y, buttonWidth, ROW_HEIGHT, false, this::onClose));
 	}
 
 	private void addCreateFooter() {

@@ -11,7 +11,7 @@ The finished mod pack will provide server-owned, custom humanoid Codex agents ra
 - Operators can summon up to the configured agent cap. The default cap is 16 and can be raised.
 - Each agent has a stable logical ID, optional unique display name, Codex model, reasoning effort, skin variant, state, current goal, and queued goals.
 - The visible nametag is exactly `<model> · <reasoning-effort>`.
-- Skins are bundled, original OpenAI-inspired designs. Official OpenAI logo artwork is not copied.
+- Skins are bundled, original pixel-art interpretations of the configured company visual identities. Official logo artwork is not copied; see `docs/agent-logo-skins.md` for references and attribution.
 - A newly summoned agent is `IDLE`: it does not navigate, look around, attack, or interact until started.
 - Codex uses the authenticated local Codex app-server on the same machine as the Minecraft server. No API key or OAuth token is stored in the mod, world, trace, or agent data.
 - Singleplayer integrated servers and dedicated servers use the same server-authoritative implementation.

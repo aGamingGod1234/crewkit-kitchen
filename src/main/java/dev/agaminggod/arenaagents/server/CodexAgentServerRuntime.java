@@ -13,6 +13,7 @@ import dev.agaminggod.arenaagents.server.conversation.DeliveryReceipt;
 import dev.agaminggod.arenaagents.server.conversation.ServerAgentConversationRouter;
 import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemRuntime;
 import dev.agaminggod.arenaagents.server.voice.VoiceConsentRegistry;
+import dev.agaminggod.arenaagents.server.voice.VoiceDirector;
 import dev.agaminggod.arenaagents.server.goal.GoalVerificationRuntime;
 import dev.agaminggod.arenaagents.server.goal.GoalSafetyController;
 import dev.agaminggod.arenaagents.server.goal.GoalSubmission;
@@ -319,10 +320,12 @@ public final class CodexAgentServerRuntime {
 			manager.reconcileDeaths();
 			manager.maintainChunkTickets();
 			VoiceSubsystemRuntime.tick(server);
+			VoiceDirector.tick(server);
 			maintainPlanningProgress(manager);
 			if (activeBridge != null) activeBridge.endTick();
 			verifyGoals(server, manager);
 			AgentInputRuntime.tick(server);
+			SkitModeRuntime.tick(server);
 			ScenarioRuntimeService.tick(server);
 		});
 	}
@@ -543,11 +546,13 @@ public final class CodexAgentServerRuntime {
 		BridgeSlot bridgeSlot = BRIDGE_SLOTS.remove(server);
 		try {
 			if (safety != null) safety.close();
+			VoiceDirector.release(server);
 			VoiceSubsystemRuntime.close(server);
 			VoiceConsentRegistry.clear(server);
 			CodexAgentManager.release(server);
 		} finally {
 			ScenarioRuntimeService.release(server);
+			SkitModeRuntime.release(server);
 			if (bridgeSlot != null) bridgeSlot.close();
 			if (supervisor != null) supervisor.close();
 			AgentVerboseState.release(server);

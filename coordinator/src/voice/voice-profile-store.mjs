@@ -69,6 +69,15 @@ export class VoiceProfileStore {
 		return VOICE_PROFILES[index];
 	}
 
+	/** Resolves an explicit director-selected profile without changing automatic assignments. */
+	resolveRequested(agentId, profileId) {
+		if (profileId === 'voice.auto.v1') return this.resolve(agentId);
+		if (!isUuid(agentId)) throw new TypeError('agentId must be a UUID');
+		const profileIndex = VOICE_PROFILES.findIndex((entry) => entry.profileId === profileId);
+		if (profileIndex < 0) throw new TypeError('voice profile is not in the installed catalog');
+		return VOICE_PROFILES[profileIndex];
+	}
+
 	remove(agentId) {
 		if (!isUuid(agentId)) throw new TypeError('agentId must be a UUID');
 		const index = this.#assignments.get(agentId);

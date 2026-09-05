@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Arena Agents Director Mode</title>
+  <style>
+    :root{color-scheme:dark;--bg:#0b1118;--panel:#121c26;--line:#263746;--text:#edf4f7;--muted:#9fb1bc;--accent:#7ee2bb;--warn:#f5c777}
+    *{box-sizing:border-box}body{margin:0;background:linear-gradient(145deg,#091017,#0d1822);color:var(--text);font:15px/1.55 system-ui,-apple-system,Segoe UI,sans-serif}
+    main{max-width:880px;margin:auto;padding:32px 18px 56px}h1{font-size:clamp(28px,6vw,48px);line-height:1.05;margin:0 0 12px}h2{font-size:20px;margin:28px 0 10px}p{margin:8px 0;color:var(--muted)}.lede{font-size:18px;color:var(--text);max-width:720px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin:18px 0}.card{background:color-mix(in srgb,var(--panel) 92%,transparent);border:1px solid var(--line);border-radius:12px;padding:15px}.card h3{margin:0 0 4px;font-size:16px}.tag{display:inline-block;border:1px solid #3f6b5e;color:var(--accent);border-radius:99px;padding:3px 9px;font-size:12px;margin:3px 4px 0 0}code{color:#d8f8e9;background:#0b141c;border:1px solid #20313d;border-radius:5px;padding:1px 5px}ul{padding-left:22px;color:var(--muted)}li{margin:5px 0}.risk{border-left:3px solid var(--warn);padding-left:12px}.small{font-size:13px}
+  </style>
+</head>
+<body><main>
+  <span class="tag">PR #32 expansion</span><span class="tag">Director mode</span>
+  <h1>Make skits feel like a tiny film set</h1>
+  <p class="lede">Expand the opt-in skit workspace into a director workflow for repeatable actor blocking, timed gameplay actions, proximity-voice dialogue, and smooth camera shots, while leaving ordinary agent control and ordinary player/mob rendering unchanged.</p>
+
+  <h2>Scope</h2>
+  <div class="grid">
+    <article class="card"><h3>Actors</h3><p>Place by crosshair, current position, relative offsets, and look-at targets. Add timeline actions beyond teleport poses.</p></article>
+    <article class="card"><h3>Voice</h3><p>Choose a voice profile per agent, set delivery controls, and schedule exact dialogue cues through the optional voice add-on.</p></article>
+    <article class="card"><h3>Camera</h3><p>Record camera keyframes in-world and replay them with bounded smooth interpolation for simple cinematic shots.</p></article>
+    <article class="card"><h3>Safety</h3><p>Keep the mode explicitly enabled, server-authoritative, world-persisted, bounded, and independently stoppable.</p></article>
+  </div>
+
+  <h2>Implementation sequence</h2>
+  <ul>
+    <li>Define compatible persisted director data and command vocabulary.</li>
+    <li>Add intuitive actor placement and action timeline primitives.</li>
+    <li>Connect voice profiles and speech cues to the existing authenticated TTS worker and Simple Voice Chat sender.</li>
+    <li>Add camera path capture/playback without replacing normal player camera control.</li>
+    <li>Run focused Java/voice verification, document the in-game workflow, and refresh the mobile gallery.</li>
+  </ul>
+
+  <h2>Important decisions</h2>
+  <ul>
+    <li>Director timelines are deterministic and server-owned. They do not create a second AI control protocol.</li>
+    <li>Actions that need real Minecraft physics remain explicit and fail closed. A teleport pose cannot pretend to be a real elytra flight.</li>
+    <li>Voice remains optional. Without the voice add-on, text staging and camera playback continue and speech reports a bounded unavailable state.</li>
+    <li>Camera interpolation is bounded by keyframe count and duration so a recording cannot create an unbounded tick workload.</li>
+  </ul>
+
+  <h2>Risks and verification</h2>
+  <p class="risk">Simple Voice Chat APIs and Minecraft camera ownership are integration boundaries. The implementation will preserve the existing fallback behavior, test serialization and stop/restart paths, and avoid claiming smooth physics where the runtime only has discrete actions.</p>
+  <h2>Delivered command surface</h2>
+  <ul>
+    <li><code>/codex skit place ... relative</code> and <code>look_at</code> make actor blocking faster.</li>
+    <li><code>/codex skit script action ...</code> adds move, wait, jump, equip, use, swing, and emote cues.</li>
+    <li><code>/codex skit voice ...</code> selects a catalog voice, tone, speed, radius, and timed dialogue.</li>
+    <li><code>/camera path ...</code> records and smoothly replays client-local cinematic paths.</li>
+  </ul>
+  <p class="small">Status: implemented and verified in the open PR.</p>
+</main></body></html>

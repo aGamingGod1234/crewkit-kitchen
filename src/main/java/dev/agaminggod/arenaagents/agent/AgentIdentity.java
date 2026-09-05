@@ -42,6 +42,16 @@ public final class AgentIdentity {
 		return playerName(id, profile);
 	}
 
+	/** Returns the readable tag shown above a spawned player, without changing its safe technical name. */
+	public static String displayNameTag(AgentProfile profile) {
+		Objects.requireNonNull(profile, "profile must not be null");
+		String technicalName = displayName(profile);
+		String defaultTechnicalName = defaultPublicName(profile.provider(), profile.model());
+		return technicalName.equals(defaultTechnicalName)
+				? AgentModelNames.tagName(profile.provider(), profile.model())
+				: technicalName;
+	}
+
 	static String canonicalIdentityKey(String value) {
 		return Objects.requireNonNull(value, "identity value must not be null").toLowerCase(Locale.ROOT);
 	}

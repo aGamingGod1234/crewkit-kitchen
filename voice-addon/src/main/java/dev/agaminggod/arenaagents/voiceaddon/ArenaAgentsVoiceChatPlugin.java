@@ -8,6 +8,7 @@ import de.maxhenkel.voicechat.api.events.VoiceDistanceEvent;
 import de.maxhenkel.voicechat.api.events.VoicechatServerStartedEvent;
 import de.maxhenkel.voicechat.api.events.VoicechatServerStoppedEvent;
 import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemConfiguration;
+import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemRuntime;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.function.Function;
@@ -80,6 +81,7 @@ public final class ArenaAgentsVoiceChatPlugin implements VoicechatPlugin {
 
 	private void acceptOnServer(MinecraftServer server, MicrophonePacketSnapshot packet) {
 		try {
+			if (VoiceSubsystemRuntime.isAgentPlayer(server, packet.playerId())) return;
 			bindings.accept(server, packet.voicechat(), packet);
 		} catch (RuntimeException exception) {
 			LOGGER.error("Arena Agents proximity speech capture could not start", exception);

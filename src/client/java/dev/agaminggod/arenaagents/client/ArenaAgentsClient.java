@@ -6,6 +6,7 @@ import dev.agaminggod.arenaagents.client.action.ClientActionRuntime;
 import dev.agaminggod.arenaagents.client.action.MinecraftActionContext;
 import dev.agaminggod.arenaagents.client.bridge.BridgeEventSink;
 import dev.agaminggod.arenaagents.client.bridge.BridgeServer;
+import dev.agaminggod.arenaagents.client.camera.CameraDirectorClient;
 import dev.agaminggod.arenaagents.client.config.AgentConfig;
 import dev.agaminggod.arenaagents.client.config.AgentConfigLoader;
 import dev.agaminggod.arenaagents.client.control.AgentControlClient;
@@ -43,6 +44,7 @@ public final class ArenaAgentsClient implements ClientModInitializer {
 	@Override
 	public void onInitializeClient() {
 		CodexAgentRenderers.register();
+		CameraDirectorClient.register();
 		AgentControlClient.register();
 		AgentConfig config = loadConfig();
 		if (!config.enabled()) {

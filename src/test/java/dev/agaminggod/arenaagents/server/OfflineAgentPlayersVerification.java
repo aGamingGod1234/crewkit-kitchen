@@ -52,20 +52,24 @@ public final class OfflineAgentPlayersVerification {
 				OfflineAgentPlayers.legacyPlayerNames(agentId, profile),
 				"both deployed fake-player handle generations are migration candidates");
 		verifyIdentityFileMigration();
-		return 11;
+		return 12;
 	}
 
 	private static void verifyIdentityFileMigration() {
 		try {
 			Path root = Files.createTempDirectory("arena-agent-identity-migration-");
+			Path playerData = Files.createDirectories(root.resolve("playerdata"));
 			Path stats = Files.createDirectories(root.resolve("stats"));
 			Path advancements = Files.createDirectories(root.resolve("advancements"));
 			UUID oldUuid = UUID.fromString("193a9add-1234-5678-9abc-123456789abc");
 			UUID newUuid = UUID.fromString("293a9add-1234-5678-9abc-123456789abc");
+			Files.writeString(playerData.resolve(oldUuid + ".dat"), "player progress");
 			Files.writeString(stats.resolve(oldUuid + ".json"), "{\"mined\":17}");
 			Files.writeString(advancements.resolve(oldUuid + ".json"), "{\"story/root\":true}");
 			Files.writeString(stats.resolve(newUuid + ".json"), "stale");
-			OfflineAgentPlayers.copyLegacyIdentityFiles(stats, advancements, oldUuid, newUuid);
+			OfflineAgentPlayers.copyLegacyIdentityFiles(playerData, stats, advancements, oldUuid, newUuid);
+			assertEquals("player progress", Files.readString(playerData.resolve(newUuid + ".dat")),
+					"playerdata migrates before the canonical profile is constructed");
 			assertEquals("{\"mined\":17}", Files.readString(stats.resolve(newUuid + ".json")),
 					"stats migrate before the canonical profile is constructed");
 			assertEquals("{\"story/root\":true}", Files.readString(advancements.resolve(newUuid + ".json")),

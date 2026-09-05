@@ -21,6 +21,18 @@ public final class AgentIdentityVerification {
 
 	public static int verify() {
 		AgentId id = new AgentId(UUID.fromString("193a9add-1234-5678-9abc-123456789abc"));
+		for (String brand : List.of("openai", "claude", "deepseek", "gemini", "kimi")) {
+			for (int variant = 0; variant < AgentVisualIdentity.INDIVIDUAL_VARIANT_COUNT; variant++) {
+				String texturePath = AgentVisualIdentity.brandTexturePath(brand, variant);
+				assertEquals("arenaagents:textures/entity/brand_" + brand + "_agent_" + variant + ".png",
+						texturePath, "brand skin path is stable for " + brand);
+				assertRgbaSkin(readTexture(texturePath), texturePath, 512);
+			}
+		}
+		expectIllegalArgument(() -> AgentVisualIdentity.brandTexturePath("unknown", 0),
+				"unknown company brand skin is rejected");
+		expectIllegalArgument(() -> AgentVisualIdentity.brandTexturePath("openai", 4),
+				"company brand skin variant stays within the four persisted variants");
 		AgentProfile sol = new AgentProfile("codex", "gpt-5.6-sol", "high", "fast", Optional.empty(), 2,
 				AgentGameMode.SURVIVAL);
 		assertEquals("GPT_5_6_Sol", AgentIdentity.displayName(id, sol),
@@ -30,6 +42,8 @@ public final class AgentIdentityVerification {
 				"the registry, not a UUID hash, owns same-model collision suffixes");
 		assertEquals("GPT_5_6_Sol", AgentIdentity.playerName(id, sol),
 				"fake-player username is the same public name shown everywhere else");
+		assertEquals("GPT 5.6-Sol", AgentIdentity.displayNameTag(sol),
+				"generated model names use readable punctuation in the visible name tag");
 		assertEquals(List.of("Sol2_C7CA442D", "c02_193A9ADD"), AgentIdentity.legacyPlayerNames(id, sol),
 				"both previously deployed technical handles remain discoverable for state migration");
 		assertTrue(AgentIdentity.playerName(id, sol).length() <= 16,
@@ -99,6 +113,7 @@ public final class AgentIdentityVerification {
 		AgentProfile named = new AgentProfile("codex", "gpt-5.6-sol", "low", "priority", Optional.of("Rook"), 0,
 				AgentGameMode.SURVIVAL);
 		assertEquals("Rook", AgentIdentity.displayName(id, named), "explicit names remain authoritative");
+		assertEquals("Rook", AgentIdentity.displayNameTag(named), "explicit names remain authoritative in visible tags");
 		assertEquals("Rook", AgentIdentity.playerName(id, named), "explicit names are exact /msg targets");
 		assertEquals("Rook0_C7CA442D", AgentIdentity.legacyReadablePlayerName(id, named),
 				"the immediately preceding readable/hash handle remains deterministic after canonicalization");
@@ -159,6 +174,15 @@ public final class AgentIdentityVerification {
 				assertEquals(model.chassis(), resolved.providerChassis(), "provider chassis remains distinct");
 				assertEquals(model.family(), resolved.modelFamilyKey(), "model resolves to its named family slot");
 				assertEquals(variant, resolved.individualVariant(), "all four individual variants resolve");
+				String expectedBrand = model.provider().equals("codex") ? "openai"
+						: model.provider().equals("kimi") ? "kimi"
+						: model.provider().equals("gemini") && model.family().equals("claude") ? "claude"
+						: model.provider().equals("gemini") ? "gemini" : null;
+				if (expectedBrand != null) {
+					assertEquals(AgentVisualIdentity.brandTexturePath(expectedBrand, variant),
+							AgentVisualIdentity.renderTexturePath(resolved),
+							"provider render selects the persistent " + expectedBrand + " brand skin");
+				}
 				assertTrue(resolved.texturePath().startsWith(
 						"arenaagents:textures/entity/" + model.provider() + "_"),
 						"texture stays in the provider's project namespace");
@@ -173,7 +197,7 @@ public final class AgentIdentityVerification {
 						"recognizable player prefix round-trips without losing its skin");
 				assertTrue(texturePaths.add(resolved.texturePath()), "manifest texture paths are globally unique");
 				byte[] textureBytes = readTexture(resolved.texturePath());
-				assertRgbaSkin(textureBytes, resolved.texturePath());
+				assertRgbaSkin(textureBytes, resolved.texturePath(), model.provider().equals("cursor") ? 64 : 512);
 				String locatorIcon = "assets/arenaagents/textures/gui/sprites/hud/locator_bar_dot/agent/"
 						+ resolved.transportCode() + ".png";
 				byte[] locatorBytes = readResource(locatorIcon);
@@ -265,7 +289,7 @@ public final class AgentIdentityVerification {
 		}
 	}
 
-	private static void assertRgbaSkin(byte[] bytes, String texturePath) {
+	private static void assertRgbaSkin(byte[] bytes, String texturePath, int expectedSize) {
 		assertTrue(bytes.length >= 29, texturePath + " contains a complete PNG header");
 		assertTrue(bytes[0] == (byte) 137 && bytes[1] == 80 && bytes[2] == 78 && bytes[3] == 71
 				&& bytes[4] == 13 && bytes[5] == 10 && bytes[6] == 26 && bytes[7] == 10,
@@ -273,8 +297,8 @@ public final class AgentIdentityVerification {
 		assertEquals(13, readBigEndianInt(bytes, 8), texturePath + " has a complete IHDR payload");
 		assertEquals("IHDR", new String(bytes, 12, 4, StandardCharsets.US_ASCII),
 				texturePath + " begins with IHDR");
-		assertEquals(64, readBigEndianInt(bytes, 16), texturePath + " has 64px width");
-		assertEquals(64, readBigEndianInt(bytes, 20), texturePath + " has 64px height");
+		assertEquals(expectedSize, readBigEndianInt(bytes, 16), texturePath + " has expected width");
+		assertEquals(expectedSize, readBigEndianInt(bytes, 20), texturePath + " has expected height");
 		assertEquals(8, Byte.toUnsignedInt(bytes[24]), texturePath + " uses 8-bit channels");
 		assertEquals(6, Byte.toUnsignedInt(bytes[25]), texturePath + " uses RGBA color");
 	}

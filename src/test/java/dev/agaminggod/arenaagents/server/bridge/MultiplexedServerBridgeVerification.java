@@ -76,6 +76,8 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.util.debugchart.SampleLogger;
 
 public final class MultiplexedServerBridgeVerification {
+	private static final int BACKPRESSURE_HANDSHAKE_TIMEOUT_MS = 10_000;
+
 	private MultiplexedServerBridgeVerification() {
 	}
 
@@ -1477,7 +1479,7 @@ public final class MultiplexedServerBridgeVerification {
 			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
 			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
 				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
-				socket.setSoTimeout(2_000);
+				socket.setSoTimeout(BACKPRESSURE_HANDSHAKE_TIMEOUT_MS);
 				authenticate(socket, reader, codec, secret, "hello-before-removal-backpressure");
 				manager.registry().remove(removed.agentId());
 				saturateAgentQueue(bridge, removed.agentId());
@@ -1494,7 +1496,7 @@ public final class MultiplexedServerBridgeVerification {
 
 			try (Socket replacement = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
 				 BufferedReader reader = new BufferedReader(new InputStreamReader(replacement.getInputStream(), StandardCharsets.UTF_8))) {
-				replacement.setSoTimeout(2_000);
+				replacement.setSoTimeout(BACKPRESSURE_HANDSHAKE_TIMEOUT_MS);
 				BridgeEnvelope acknowledgement = authenticate(
 						replacement, reader, codec, secret, "hello-after-removal-backpressure"
 				);

@@ -555,7 +555,7 @@ Bad:
 Formatting:
 
 ```text executor-format
-{"tool":"act","arguments":{"actionType":"break_block","arguments":{"x":<required 32-bit integer -2147483648..2147483647>,"y":<required 32-bit integer -2147483648..2147483647>,"z":<required 32-bit integer -2147483648..2147483647>,"timeoutMs":<required integer 1..600000>}}}
+{"tool":"act","arguments":{"actionType":"break_block","arguments":{"x":<required 32-bit integer -2147483648..2147483647>,"y":<required 32-bit integer -2147483648..2147483647>,"z":<required 32-bit integer -2147483648..2147483647>,"expectedBlockId":<required non-air namespaced block id 1..256 characters>,"timeoutMs":<required integer 1..600000>}}}
 ```
 
 Good:

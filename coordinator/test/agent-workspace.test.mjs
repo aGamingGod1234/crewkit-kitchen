@@ -139,6 +139,24 @@ test('synchronizes only auth into the isolated Codex home', async (t) => {
 	assert.equal(await readFile(path.join(prepared.cwd, 'AGENTS.md'), 'utf8'), '# Minecraft instructions\n');
 });
 
+test('preserves auth when the configured source is the isolated Codex home', async (t) => {
+	const root = await mkdtemp(path.join(os.tmpdir(), 'minecraft-agent-codex-same-home-'));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const workspaceRoot = path.join(root, 'runtime', 'minecraft-agent');
+	const templateRoot = path.join(root, 'templates');
+	await mkdir(path.join(templateRoot, '.codex', 'skills', 'minecraft-control'), { recursive: true });
+	await writeFile(path.join(templateRoot, 'AGENTS.md'), '# Minecraft instructions\n', 'utf8');
+	await writeFile(path.join(templateRoot, '.codex', 'skills', 'minecraft-control', 'SKILL.md'), '# Minecraft skill\n', 'utf8');
+	await mkdir(path.join(workspaceRoot, '.codex-home'), { recursive: true });
+	await writeFile(path.join(workspaceRoot, '.codex-home', 'auth.json'), '{"tokens":"keep"}\n', 'utf8');
+
+	const workspace = new MinecraftAgentWorkspace({ root: workspaceRoot, templateRoot }, {
+		sourceCodexHome: path.join(workspaceRoot, '.codex-home'),
+	});
+	const prepared = await workspace.prepare();
+	assert.equal(await readFile(path.join(prepared.codexHome, 'auth.json'), 'utf8'), '{"tokens":"keep"}\n');
+});
+
 test('re-syncs Codex auth when isolated credentials are missing or source rotates', async (t) => {
 	const root = await mkdtemp(path.join(os.tmpdir(), 'minecraft-agent-codex-auth-resync-'));
 	t.after(() => rm(root, { recursive: true, force: true }));

@@ -38,6 +38,6 @@ public final class CodexAgentRenderer extends HumanoidMobRenderer<
 	}
 
 	public static Identifier textureFor(AgentVisualIdentity.Resolved identity) {
-		return Identifier.parse(identity.texturePath());
+		return Identifier.parse(AgentVisualIdentity.renderTexturePath(identity));
 	}
 }

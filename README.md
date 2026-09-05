@@ -81,6 +81,81 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-dynamic-coordinator.ps1
 
 `/codex summon` and the legacy two-argument form use the configured Codex default. The command center asks each installed provider CLI for its current model catalog and uses a bounded built-in catalog when discovery is unavailable. Availability still depends on the installed CLI, its login, and that provider's model access. Player-facing speed choices are `Normal` and `Fast mode`; provider wire values stay internal. A newly summoned NPC remains idle until `/codex start`; `stop` freezes its active work, `queue` preserves later goals, and `steer` interrupts the current plan at a higher revision.
 
+### Run skit mode
+
+Skit mode is a deliberate, world-persisted toggle for staging short-form scenes. It
+does not give agents a second control system. Turn it on, summon a named agent,
+place it at your feet or at exact coordinates, then replay a saved timeline:
+
+For a point-and-click workflow, press `G` to open the Field Console and choose
+**Director**. Its Spawn, Actions, Voice, and Camera tabs cover the same staging
+workflow without requiring chat commands.
+
+```text
+/codex skit on
+/codex skit summon codex ChatGPT
+/codex skit summon claude Claude
+/codex skit summon kimi Kimi
+/codex skit summon codex model gpt-5.6-sol "GPT 5.6-Sol"
+/codex skit place ChatGPT here
+/codex skit place Claude at 12 72 -4 180 0
+/codex skit place Claude relative 2 0 4
+/codex skit place Claude look_at 12 73 -4
+/codex skit script create takeoff ChatGPT
+/codex skit script add takeoff 0 12 72 -4 180 0
+/codex skit script add takeoff 40 12 80 -4 180 10
+/codex skit script add takeoff 80 12 72 -4 180 0
+/codex skit script action takeoff move 40 1 0 true
+/codex skit script action takeoff equip minecraft:elytra
+/codex skit script action takeoff jump
+/codex skit script play takeoff
+/codex skit voice profile Claude voice.ember.v1 dramatic 1.05 64
+/codex skit voice say Claude "You should not have come here."
+/codex skit voice script create intro Claude
+/codex skit voice script add intro 0 "Now run."
+/codex skit voice script play intro
+/codex skit off
+/camera path start intro
+/camera path keyframe
+/camera path keyframe
+/camera path stop
+/camera path play intro
+```
+
+Run the `/camera` commands on the client that is recording. Camera paths are
+client-local and do not change server or agent state.
+
+`place` stores position, yaw, and pitch. Script steps store a delay in ticks and
+teleport the selected agent when they fire, which makes takeoff, flight poses, and
+landings repeatable for recording. `relative` places an actor by right/up/forward
+offsets from the operator, while `look_at` keeps the actor at the operator and
+turns them toward a target point. Action steps can move smoothly between the
+current placement and the saved endpoint, wait, jump, equip an item, use the held
+item, swing, or hold a sneak/emote pose.
+
+Use `skit summon <provider> model <exact-slug> <name>` when a scene needs a
+specific model. The technical Minecraft username remains safe and unique, while
+the visible name tag uses the readable model/name label.
+
+Voice profiles are persisted per agent. The profile ID selects the local TTS voice
+identity, while `tone`, `speed`, and `radius` control delivery and proximity range.
+Voice scripts schedule exact lines in ticks. They require the optional Arena Agents
+Voice add-on and Simple Voice Chat; without those installed, the rest of the skit
+system continues and speech reports the normal bounded fallback.
+
+The client-only camera director records the operator's current camera position and
+rotation as keyframes, then replays them with smooth position interpolation and
+shortest-turn rotation. Paths are stored locally in
+`config/arenaagents/camera-paths.json`, support looping playback, and can be
+deleted/listed without changing server or agent state. The five brand-forward skin families live in
+the main renderer, including the standalone DeepSeek texture family. DeepSeek is
+not a summon provider in this checkout yet, so its skin is available for the
+identity pipeline without pretending that a backend exists.
+Brand agent textures are authored at 512x512 while retaining the vanilla 64x64 UV
+layout. That gives each visible 8x8 head face a 64px logo raster, while ordinary
+player and mob textures remain at their native resolutions. These are mod assets,
+not files for the vanilla skin-upload screen.
+
 Every NPC receives a stable directory beneath `runtime/agent-workspaces/<provider>/<agent-id>`. Codex uses an isolated thread per NPC on its shared app server. Kimi keeps one ACP process and session per NPC. Cursor uses the native `agent` launcher and resumes that NPC's session. Gemini records remain recoverable, but attempts to plan return `PROVIDER_UNAVAILABLE`. The coordinator passes only the provider-specific environment allowlist. It does not copy bridge secrets or OAuth state into agent directories.
 
 Invalid ArenaScript source receives bounded compiler diagnostics and a corrective turn from the same selected provider/model/session. Repeated physical-action failures remain bounded factual evidence for the next model decision; they never make the runtime choose to abandon the goal. Kimi reads the existing `~/.kimi-code` OAuth state and receives its effort through an isolated process environment. Missing authentication, unavailable models, timeouts, and bounded-output failures stop only the affected NPC.

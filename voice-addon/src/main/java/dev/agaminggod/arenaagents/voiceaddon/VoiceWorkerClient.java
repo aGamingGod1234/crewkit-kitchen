@@ -60,6 +60,8 @@ final class VoiceWorkerClient {
 		payload.addProperty("agentId", request.agentId().toString());
 		payload.addProperty("text", request.text());
 		payload.addProperty("profileId", request.profileId());
+		payload.addProperty("speed", request.speed());
+		payload.addProperty("tone", request.tone());
 		payload.addProperty("radius", request.radius());
 		payload.addProperty("conversationSequence", request.conversationSequence());
 		String contentType = "application/json";

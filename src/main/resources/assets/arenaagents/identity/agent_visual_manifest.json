@@ -1,5 +1,57 @@
 {
   "schemaVersion": 1,
+  "brandSkins": [
+    {
+      "key": "openai",
+      "label": "ChatGPT / OpenAI",
+      "variants": [
+        {"texturePath": "arenaagents:textures/entity/brand_openai_agent_0.png"},
+        {"texturePath": "arenaagents:textures/entity/brand_openai_agent_1.png"},
+        {"texturePath": "arenaagents:textures/entity/brand_openai_agent_2.png"},
+        {"texturePath": "arenaagents:textures/entity/brand_openai_agent_3.png"}
+      ]
+    },
+    {
+      "key": "claude",
+      "label": "Claude",
+      "variants": [
+        {"texturePath": "arenaagents:textures/entity/brand_claude_agent_0.png"},
+        {"texturePath": "arenaagents:textures/entity/brand_claude_agent_1.png"},
+        {"texturePath": "arenaagents:textures/entity/brand_claude_agent_2.png"},
+        {"texturePath": "arenaagents:textures/entity/brand_claude_agent_3.png"}
+      ]
+    },
+    {
+      "key": "deepseek",
+      "label": "DeepSeek",
+      "variants": [
+        {"texturePath": "arenaagents:textures/entity/brand_deepseek_agent_0.png"},
+        {"texturePath": "arenaagents:textures/entity/brand_deepseek_agent_1.png"},
+        {"texturePath": "arenaagents:textures/entity/brand_deepseek_agent_2.png"},
+        {"texturePath": "arenaagents:textures/entity/brand_deepseek_agent_3.png"}
+      ]
+    },
+    {
+      "key": "gemini",
+      "label": "Gemini",
+      "variants": [
+        {"texturePath": "arenaagents:textures/entity/brand_gemini_agent_0.png"},
+        {"texturePath": "arenaagents:textures/entity/brand_gemini_agent_1.png"},
+        {"texturePath": "arenaagents:textures/entity/brand_gemini_agent_2.png"},
+        {"texturePath": "arenaagents:textures/entity/brand_gemini_agent_3.png"}
+      ]
+    },
+    {
+      "key": "kimi",
+      "label": "Kimi",
+      "variants": [
+        {"texturePath": "arenaagents:textures/entity/brand_kimi_agent_0.png"},
+        {"texturePath": "arenaagents:textures/entity/brand_kimi_agent_1.png"},
+        {"texturePath": "arenaagents:textures/entity/brand_kimi_agent_2.png"},
+        {"texturePath": "arenaagents:textures/entity/brand_kimi_agent_3.png"}
+      ]
+    }
+  ],
   "providers": [
     {
       "key": "codex",

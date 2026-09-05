@@ -28,6 +28,7 @@ public final class AgentVisualIdentity {
 	private static final String MANIFEST_RESOURCE =
 			"assets/arenaagents/identity/agent_visual_manifest.json";
 	private static final Set<String> REQUIRED_PROVIDERS = Set.of("codex", "gemini", "kimi", "cursor");
+	private static final Set<String> REQUIRED_BRANDS = Set.of("openai", "claude", "deepseek", "gemini", "kimi");
 	private static final Pattern KEY = Pattern.compile("[a-z][a-z0-9_]*");
 	private static final Pattern TRANSPORT_CODE = Pattern.compile("[a-z][a-z0-9]{1,6}");
 	private static final Pattern TEXTURE_PATH = Pattern.compile(
@@ -68,6 +69,27 @@ public final class AgentVisualIdentity {
 
 	public static int normalizedVariant(int variant) {
 		return Math.floorMod(variant, INDIVIDUAL_VARIANT_COUNT);
+	}
+
+	/** Returns the bundled company-brand skin path for a cinematic or custom summon. */
+	public static String brandTexturePath(String brand, int variant) {
+		String brandKey = requireText(brand, "brand").toLowerCase(Locale.ROOT);
+		requireVariant(variant);
+		List<String> variants = MANIFEST.brandSkinPaths().get(brandKey);
+		if (variants == null) throw new IllegalArgumentException("Unsupported brand skin: " + brandKey);
+		return variants.get(variant);
+	}
+
+	/** Selects the company-brand texture used by every client-side agent render. */
+	public static String renderTexturePath(Resolved identity) {
+		Objects.requireNonNull(identity, "identity must not be null");
+		String brand = switch (identity.providerKey()) {
+			case "codex" -> "openai";
+			case "gemini" -> identity.modelFamilyKey().equals("claude") ? "claude" : "gemini";
+			case "kimi" -> "kimi";
+			default -> null;
+		};
+		return brand == null ? identity.texturePath() : brandTexturePath(brand, identity.individualVariant());
 	}
 
 	private static Resolved resolved(
@@ -153,7 +175,7 @@ public final class AgentVisualIdentity {
 	}
 
 	private static Manifest parseManifest(JsonObject root) {
-		requireKeys(root, Set.of("schemaVersion", "providers"), "manifest");
+		requireKeys(root, Set.of("schemaVersion", "brandSkins", "providers"), "manifest");
 		if (requiredInt(root, "schemaVersion", "manifest") != 1) {
 			throw invalid("manifest schemaVersion must be 1");
 		}
@@ -175,7 +197,45 @@ public final class AgentVisualIdentity {
 		if (!byProvider.keySet().equals(REQUIRED_PROVIDERS)) {
 			throw invalid("manifest providers must be exactly " + REQUIRED_PROVIDERS);
 		}
-		return new Manifest(Map.copyOf(byProvider), Map.copyOf(byTransportCode));
+		Map<String, List<String>> brandSkinPaths = parseBrandSkins(root.getAsJsonArray("brandSkins"));
+		return new Manifest(Map.copyOf(byProvider), Map.copyOf(byTransportCode), brandSkinPaths);
+	}
+
+	private static Map<String, List<String>> parseBrandSkins(JsonArray brands) {
+		if (brands.size() != REQUIRED_BRANDS.size()) {
+			throw invalid("brandSkins must declare exactly " + REQUIRED_BRANDS.size() + " brands");
+		}
+		Map<String, List<String>> pathsByBrand = new LinkedHashMap<>();
+		Set<String> texturePaths = new HashSet<>();
+		for (JsonElement brandElement : brands) {
+			JsonObject brand = requireObject(brandElement, "brand skin");
+			requireKeys(brand, Set.of("key", "label", "variants"), "brand skin");
+			String key = requiredKey(brand, "key", "brand skin");
+			if (!REQUIRED_BRANDS.contains(key)) throw invalid("unsupported brand skin: " + key);
+			if (pathsByBrand.containsKey(key)) throw invalid("duplicate brand skin: " + key);
+			requiredString(brand, "label", "brand skin " + key);
+			JsonArray variants = requiredArray(brand, "variants", "brand skin " + key);
+			if (variants.size() != INDIVIDUAL_VARIANT_COUNT) {
+				throw invalid("brand skin " + key + " must declare exactly four variants");
+			}
+			List<String> paths = new ArrayList<>(INDIVIDUAL_VARIANT_COUNT);
+			for (JsonElement variantElement : variants) {
+				JsonObject variant = requireObject(variantElement, "brand skin variant");
+				requireKeys(variant, Set.of("texturePath"), "brand skin variant");
+				String texturePath = requiredString(variant, "texturePath", "brand skin variant");
+				if (!TEXTURE_PATH.matcher(texturePath).matches()
+						|| !texturePath.startsWith("arenaagents:textures/entity/brand_")) {
+					throw invalid("brand skin texture must be project-owned: " + texturePath);
+				}
+				if (!texturePaths.add(texturePath)) throw invalid("duplicate texture path: " + texturePath);
+				paths.add(texturePath);
+			}
+			pathsByBrand.put(key, List.copyOf(paths));
+		}
+		if (!pathsByBrand.keySet().equals(REQUIRED_BRANDS)) {
+			throw invalid("brand skins must be exactly " + REQUIRED_BRANDS);
+		}
+		return Map.copyOf(pathsByBrand);
 	}
 
 	private static ProviderIdentity parseProvider(
@@ -341,8 +401,9 @@ public final class AgentVisualIdentity {
 	}
 
 	private record Manifest(
-			Map<String, ProviderIdentity> providers,
-			Map<String, TransportIdentity> transportCodes
+		Map<String, ProviderIdentity> providers,
+		Map<String, TransportIdentity> transportCodes,
+		Map<String, List<String>> brandSkinPaths
 	) {
 	}
 

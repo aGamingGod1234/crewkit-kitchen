@@ -75,12 +75,13 @@ export class LocalSpeechProvider {
 		return Object.freeze({ sttReady: response.sttReady, ttsReady: response.ttsReady });
 	}
 
-	async synthesize({ text, voiceId = 'local.default.v1', speed = 1, signal } = {}) {
+	async synthesize({ text, voiceId = 'local.default.v1', speed = 1, tone = 'neutral', signal } = {}) {
 		if (typeof text !== 'string' || text.trim() === '') throw new TypeError('text must not be blank');
 		if ([...text].length > MAX_TTS_TEXT_CODE_POINTS) throw new TypeError('text must be at most 280 Unicode code points');
 		if (!Number.isFinite(speed) || speed < 0.5 || speed > 2) throw new TypeError('speed must be between 0.5 and 2');
 		if (typeof voiceId !== 'string' || voiceId.trim() === '') throw new TypeError('voiceId must not be blank');
-		const response = await this.#request({ op: 'tts', text, voiceId, speed }, signal);
+		if (typeof tone !== 'string' || !/^[A-Za-z0-9_.:-]{1,32}$/.test(tone)) throw new TypeError('tone is invalid');
+		const response = await this.#request({ op: 'tts', text, voiceId, speed, tone }, signal);
 		const sampleRateHz = response.sampleRateHz;
 		const pcm = decodePcm(response.pcmBase64);
 		if (!Number.isSafeInteger(sampleRateHz) || sampleRateHz !== 24_000

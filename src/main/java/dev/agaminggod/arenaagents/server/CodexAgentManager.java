@@ -59,6 +59,7 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.players.NameAndId;
 import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.server.level.TicketType;
 import net.minecraft.world.entity.Entity;
@@ -236,42 +237,55 @@ public final class CodexAgentManager {
 				.toList();
 		AgentRecord created;
 		synchronized (registry) {
-			created = runtimeHooks.withinPublicationBoundary(() -> {
-				AgentRecord record = registry.create(
-						provider, model, reasoning, serviceTier, userName, gameMode, now, livePlayerNames);
-				pendingAgentRegistrations.add(record.agentId());
-				return record;
-			});
+			List<String> unavailableNames = new java.util.ArrayList<>(livePlayerNames);
+			while (true) {
+				created = runtimeHooks.withinPublicationBoundary(() -> {
+					AgentRecord record = registry.create(
+							provider, model, reasoning, serviceTier, userName, gameMode, now, unavailableNames);
+					pendingAgentRegistrations.add(record.agentId());
+					return record;
+				});
+				String technicalName = AgentIdentity.playerName(created.agentId(), created.profile());
+				if (!isPersistedPlayerNameReserved(technicalName)) break;
+				unavailableNames.add(technicalName);
+				AgentRecord rejected = created;
+				runtimeHooks.withinPublicationBoundary(() -> {
+					registry.remove(rejected.agentId());
+					pendingAgentRegistrations.remove(rejected.agentId());
+					return null;
+				});
+			}
 		}
+		AgentRecord finalCreated = created;
 		try {
-			runtimeHooks.validateProfile(created.profile());
+			runtimeHooks.validateProfile(finalCreated.profile());
 			OfflineAgentPlayers.spawn(
 					server,
-					created.agentId(),
-					created.profile(),
+					finalCreated.agentId(),
+					finalCreated.profile(),
 					position,
 					0.0F,
 					0.0F,
 					level.dimension(),
 					gameMode
 			);
-			pendingPlayerSpawns.put(created.agentId(), now + PLAYER_SPAWN_TIMEOUT_MS);
-			return created;
+			pendingPlayerSpawns.put(finalCreated.agentId(), now + PLAYER_SPAWN_TIMEOUT_MS);
+			return finalCreated;
 		} catch (RuntimeException exception) {
-			releaseChunkTicket(created.agentId());
-			pendingEntityRecoveries.remove(created.agentId());
-			OfflineAgentPlayers.find(server, created.agentId(), created.profile()).ifPresent(OfflineAgentPlayers::remove);
-			if (pendingPlayerSpawns.remove(created.agentId()) != null) {
-				cancelledPlayerSpawns.record(created.agentId(), created.profile(), System.currentTimeMillis());
+			releaseChunkTicket(finalCreated.agentId());
+			pendingEntityRecoveries.remove(finalCreated.agentId());
+			OfflineAgentPlayers.find(server, finalCreated.agentId(), finalCreated.profile()).ifPresent(OfflineAgentPlayers::remove);
+			if (pendingPlayerSpawns.remove(finalCreated.agentId()) != null) {
+				cancelledPlayerSpawns.record(finalCreated.agentId(), finalCreated.profile(), System.currentTimeMillis());
 			}
 			synchronized (registry) {
 				runtimeHooks.withinPublicationBoundary(() -> {
 					try {
-						registry.remove(created.agentId());
+						registry.remove(finalCreated.agentId());
 					} catch (AgentDomainException ignored) {
 						// The record may already have been removed by a failing integration hook.
 					} finally {
-						pendingAgentRegistrations.remove(created.agentId());
+						pendingAgentRegistrations.remove(finalCreated.agentId());
 					}
 					return null;
 				});
@@ -280,13 +294,21 @@ public final class CodexAgentManager {
 		}
 	}
 
+	private boolean isPersistedPlayerNameReserved(String name) {
+		UUID offlineUuid = AgentIdentity.offlinePlayerUuid(name);
+		if (server.getPlayerList().loadPlayerData(new NameAndId(offlineUuid, name)).isPresent()) return true;
+		return server.services().nameToIdCache().get(name).isPresent();
+	}
+
 	public AgentTransition start(String selector, String prompt, ServerLevel sourceLevel) {
 		AgentRecord record = resolve(selector);
+		SkitModeRuntime.requireNormalControlAllowed(server, record.agentId());
 		return savedData.registry().start(record.agentId(), compileGoal(prompt, sourceLevel), System.currentTimeMillis());
 	}
 
 	public AgentTransition startSubjective(String selector, String prompt) {
 		AgentRecord record = resolve(selector);
+		SkitModeRuntime.requireNormalControlAllowed(server, record.agentId());
 		return savedData.registry().start(record.agentId(), prompt, System.currentTimeMillis());
 	}
 
@@ -296,8 +318,9 @@ public final class CodexAgentManager {
 			ServerLevel sourceLevel,
 			BiConsumer<AgentTransition, Runnable> publicationBarrier
 	) {
+		SkitModeRuntime.requireNormalControlAllowed(server, Objects.requireNonNull(agentId, "agentId must not be null"));
 		return savedData.registry().startAtomically(
-				Objects.requireNonNull(agentId, "agentId must not be null"),
+				agentId,
 				compileGoal(prompt, sourceLevel),
 				System.currentTimeMillis(),
 				Objects.requireNonNull(publicationBarrier, "publicationBarrier must not be null")
@@ -311,6 +334,7 @@ public final class CodexAgentManager {
 	) {
 		Objects.requireNonNull(event, "event must not be null");
 		Objects.requireNonNull(publicationBarrier, "publicationBarrier must not be null");
+		SkitModeRuntime.requireNormalControlAllowed(server, event.agentId());
 		PendingConversationWake[] staged = { null };
 		try {
 			return savedData.registry().startAtomically(
@@ -379,6 +403,7 @@ public final class CodexAgentManager {
 			return Optional.of(new GoalDraftResult(operation, draft.agentId(), Optional.empty()));
 		}
 		AgentRecord record = savedData.registry().require(draft.agentId());
+		SkitModeRuntime.requireNormalControlAllowed(server, draft.agentId());
 		if (!draft.matches(record)) throw new AgentDomainException("STALE_GOAL_DRAFT", "Goal draft no longer matches the target goal revision");
 		GoalPredicate predicate = draft.proposedPredicate().orElseThrow();
 		validateGoalDraftTranslation(draft, predicate);
@@ -530,11 +555,13 @@ public final class CodexAgentManager {
 
 	public AgentTransition resume(String selector) {
 		AgentRecord record = resolve(selector);
+		SkitModeRuntime.requireNormalControlAllowed(server, record.agentId());
 		return savedData.registry().resume(record.agentId(), System.currentTimeMillis());
 	}
 
 	public AgentTransition queue(String selector, String prompt, ServerLevel sourceLevel) {
 		AgentRecord record = resolve(selector);
+		SkitModeRuntime.requireNormalControlAllowed(server, record.agentId());
 		return savedData.registry().queue(record.agentId(), compileGoal(prompt, sourceLevel), System.currentTimeMillis());
 	}
 
@@ -547,6 +574,7 @@ public final class CodexAgentManager {
 			GoalSpecRequestSink requestSink
 	) {
 		AgentRecord record = resolve(selector);
+		SkitModeRuntime.requireNormalControlAllowed(server, record.agentId());
 		Objects.requireNonNull(requestingPlayerId, "requestingPlayerId must not be null");
 		Objects.requireNonNull(operation, "operation must not be null");
 		Objects.requireNonNull(requestSink, "requestSink must not be null");
@@ -1217,7 +1245,7 @@ public final class CodexAgentManager {
 		if (hidden != null && server.getScoreboard().getPlayersTeam(player.getScoreboardName()) == hidden) {
 			server.getScoreboard().removePlayerFromTeam(player.getScoreboardName(), hidden);
 		}
-		player.setCustomName(Component.literal(displayName(record)));
+		player.setCustomName(Component.literal(AgentIdentity.displayNameTag(record.profile())));
 		player.setCustomNameVisible(true);
 		String stylePath = "agent/" + record.profile().visualIdentity().transportCode();
 		ResourceKey<WaypointStyleAsset> style = ResourceKey.create(
@@ -1530,6 +1558,7 @@ public final class CodexAgentManager {
 				? OfflineAgentPlayers.findLegacyPlayer(server, record.agentId(), record.profile())
 				: Optional.of(pendingLegacy.legacyPlayer());
 		retainedDeadPlayers().remove(record.agentId());
+		SkitModeRuntime.stop(server, record.agentId());
 		AgentInputRuntime.clear(server, record.agentId());
 		long terminalRevision = record.goalRevision() == Long.MAX_VALUE
 				? Long.MAX_VALUE

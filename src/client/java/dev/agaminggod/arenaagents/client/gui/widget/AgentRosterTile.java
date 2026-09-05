@@ -65,7 +65,7 @@ public final class AgentRosterTile extends AbstractWidget implements ConsoleFocu
 		this.entry = Objects.requireNonNull(entry, "entry must not be null");
 		AgentVisualIdentity.Resolved checkedVisual = Objects.requireNonNull(
 				visual, "visual identity must not be null");
-		this.texture = Identifier.parse(checkedVisual.texturePath());
+		this.texture = Identifier.parse(AgentVisualIdentity.renderTexturePath(checkedVisual));
 		if (position < 1 || total < position) {
 			throw new IllegalArgumentException("Roster tile position must be within the filtered total");
 		}
