@@ -193,6 +193,7 @@ public final class VerificationMain {
 		passedAssertions += ServerObservationTagCacheVerification.verify();
 		passedAssertions += ServerObservationInventorySnapshotVerification.verify();
 		passedAssertions += ObservationBudgetVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.world.WorldMutationRevisionsVerification.verify();
 		passedAssertions += ServerObservationRayTargetVerification.verify();
 		passedAssertions += ServerObservationWireBudgetVerification.verify();
 		passedAssertions += ActionProgressTrackerVerification.verify();

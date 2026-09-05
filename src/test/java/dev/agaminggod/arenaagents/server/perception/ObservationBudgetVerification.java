@@ -177,7 +177,43 @@ public final class ObservationBudgetVerification {
 		burst.drain(burstFirst::add);
 		assertEquals(AgentConstants.DEFAULT_AGENT_LIMIT, burstFirst.size(), "one drain serves the sixteen-agent tick budget");
 		assertEquals(0, burst.pendingCount(), "sixteen-agent burst clears in one drain");
-		return 58;
+		return 58 + verifyLandmarkContext();
+	}
+
+	private static int verifyLandmarkContext() {
+		net.minecraft.server.Bootstrap.bootStrap();
+		var scaffolding = net.minecraft.world.level.block.Blocks.SCAFFOLDING.defaultBlockState();
+		var origin = BlockPos.ZERO;
+		var world = net.minecraft.world.level.EmptyBlockGetter.INSTANCE;
+		assertFalse(scaffolding.getVisualShape(world, origin, new LandmarkShapeContext(false)).isEmpty(),
+				"standing above scaffolding blocks visual rays");
+		assertTrue(scaffolding.getVisualShape(world, origin, new LandmarkShapeContext(true)).isEmpty(),
+				"descending changes visual rays without requiring a block mutation");
+		ObservationSectionCache<ServerObservationCollector.LandmarkSampleKey, Integer> cache =
+				new ObservationSectionCache<>(16, 200L, value -> value);
+		AtomicInteger samples = new AtomicInteger();
+		var initial = landmarkKey(1L, false, 64.0D);
+		assertEquals(1, cache.getOrCompute(initial, 100L, samples::incrementAndGet), "initial landmark fan sampled");
+		assertEquals(1, cache.getOrCompute(initial, 101L, samples::incrementAndGet), "stationary fan reused across ticks");
+		assertEquals(2, cache.getOrCompute(landmarkKey(2L, false, 64.0D), 101L, samples::incrementAndGet),
+				"world revision refreshes candidates in the same tick");
+		assertEquals(3, cache.getOrCompute(landmarkKey(2L, true, 64.0D), 101L, samples::incrementAndGet),
+				"descending refreshes candidates even with unchanged eyes and blocks");
+		assertEquals(4, cache.getOrCompute(landmarkKey(2L, true, 63.9D), 101L, samples::incrementAndGet),
+				"collision context feet refresh candidates even with unchanged eyes");
+		return 7;
+	}
+
+	private static ServerObservationCollector.LandmarkSampleKey landmarkKey(long revision, boolean descending, double feetY) {
+		return new ServerObservationCollector.LandmarkSampleKey(AgentId.parse("00000000-0000-0000-0000-000000000001"),
+				"minecraft:overworld", 0, 64, 0, 0.0D, 65.62D, 0.0D, 0.0F, 0.0F,
+				feetY, descending, net.minecraft.world.item.Items.AIR, revision);
+	}
+
+	private static final class LandmarkShapeContext extends net.minecraft.world.phys.shapes.EntityCollisionContext {
+		private LandmarkShapeContext(boolean descending) {
+			super(descending, false, 2.0D, net.minecraft.world.item.ItemStack.EMPTY, false, null);
+		}
 	}
 
 	private static JsonObject movingObservation(double x, double yaw, String selectedItem, double entityDistance) {

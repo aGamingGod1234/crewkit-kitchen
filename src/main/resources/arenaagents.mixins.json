@@ -7,6 +7,10 @@
     "EntityPlayerActionPackAccessor",
     "EntityPlayerActionPackMixin",
     "EntityPlayerMPFakeMixin",
+    "LevelMutationRevisionMixin",
+    "LevelChunkMutationRevisionMixin",
+    "ShulkerShapeRevisionMixin",
+    "PistonShapeRevisionMixin",
     "MsgCommandMixin",
     "ServerPlayerGameModeBreakAccessor",
     "ServerPlayerGameModeMixin"

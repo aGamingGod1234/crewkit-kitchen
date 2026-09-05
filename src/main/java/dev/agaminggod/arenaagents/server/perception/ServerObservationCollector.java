@@ -12,6 +12,7 @@ import dev.agaminggod.arenaagents.server.runtime.ServerActionResult;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputState;
 import dev.agaminggod.arenaagents.server.runtime.menu.MenuCapabilityRegistry;
+import dev.agaminggod.arenaagents.world.WorldMutationRevisionAccess;
 import java.util.Comparator;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -61,12 +62,17 @@ public final class ServerObservationCollector {
 	private static final int SPATIAL_CACHE_CAPACITY = 16;
 	/** Spatial block/container scans are expensive; movement and view changes still invalidate the key immediately. */
 	private static final long SPATIAL_CACHE_TICKS = 10L;
+	private static final int LANDMARK_CACHE_CAPACITY = 16;
+	/** Mutation revision keys provide freshness; this age bounds retained stationary poses. */
+	private static final long LANDMARK_CACHE_TICKS = 200L;
 	private static final EquipmentSlot[] EQUIPMENT_SLOTS = EquipmentSlot.values();
 
 	private final CodexAgentManager manager;
 	private final ServerActionExecutor actionExecutor;
 	private final ObservationSectionCache<RawSpatialObservation.Key, RawSpatialObservation> spatialCache =
 			new ObservationSectionCache<>(SPATIAL_CACHE_CAPACITY, SPATIAL_CACHE_TICKS, value -> value);
+	private final ObservationSectionCache<LandmarkSampleKey, List<VisibleSurfaceCandidate>> landmarkCache =
+			new ObservationSectionCache<>(LANDMARK_CACHE_CAPACITY, LANDMARK_CACHE_TICKS, value -> value);
 	private final Map<AgentId, RawSpatialObservation.Key> spatialKeys = new HashMap<>();
 	private final Map<AgentId, RawPlayerState> lastRawStates = new HashMap<>();
 	private final Map<AgentId, InventorySnapshot> lastInventories = new HashMap<>();
@@ -149,14 +155,19 @@ public final class ServerObservationCollector {
 		Objects.requireNonNull(agentId, "agentId must not be null");
 		spatialKeys.remove(agentId);
 		spatialCache.invalidateMatching(key -> key.agentId().equals(agentId));
+		landmarkCache.invalidateMatching(key -> key.agentId().equals(agentId));
 		synchronized (lastRawStates) {
 			lastRawStates.remove(agentId);
 			lastInventories.remove(agentId);
 		}
 	}
 
-	/** Returns loaded agents whose compact factual player or inventory state changed since the last sample. */
-	public List<AgentId> changedActiveAgents() {
+	/**
+	 * Samples the supplied roster, allowing the bridge to reuse the visibility-filtered
+	 * roster it already computed for observation scheduling.
+	 */
+	public List<AgentId> changedActiveAgents(List<AgentRecord> records) {
+		Objects.requireNonNull(records, "records must not be null");
 		List<AgentId> changed = new ArrayList<>();
 		if (manager.server() == null) {
 			synchronized (lastRawStates) {
@@ -166,7 +177,7 @@ public final class ServerObservationCollector {
 			return List.of();
 		}
 		HashSet<AgentId> tracked = new HashSet<>();
-		for (AgentRecord record : manager.records()) {
+		for (AgentRecord record : records) {
 			AgentId agentId = record.agentId();
 			tracked.add(agentId);
 			ServerPlayer agent = manager.findAgentPlayer(agentId).orElse(null);
@@ -209,19 +220,38 @@ public final class ServerObservationCollector {
 		if (previous != null && !previous.equals(key)) spatialCache.invalidate(previous);
 		RawSpatialObservation raw = spatialCache.getOrCompute(
 			key, level.getGameTime(), () -> rawSpatialObservation(level, agent, position));
+		Vec3 eye = agent.getEyePosition();
+		LandmarkSampleKey landmarkKey = new LandmarkSampleKey(
+			agentId,
+			level.dimension().identifier().toString(),
+			position.getX(),
+			position.getY(),
+			position.getZ(),
+			eye.x,
+			eye.y,
+			eye.z,
+			agent.getYRot(),
+			agent.getXRot(),
+			agent.getY(),
+			agent.isDescending(),
+			agent.getMainHandItem().getItem(),
+			worldMutationRevision(level, position)
+		);
+		List<VisibleSurfaceCandidate> landmarkCandidates = landmarkCache.getOrCompute(
+			landmarkKey,
+			level.getGameTime(),
+			() -> visibleSurfaceCandidates(level, agent, position)
+		);
 		JsonObject value = new JsonObject();
 		value.add("blocks", blocks(level, agent, raw.blocks(), visibility));
-		value.add("landmarks", landmarks(level, agent, visibility));
+		value.add("landmarks", landmarks(level, agent, visibility, landmarkCandidates));
 		value.add("nearbyContainers", nearbyTransactionTargets(agent, raw.containers(), visibility));
 		return value;
 	}
 
 	private JsonObject currentAction(AgentId agentId) {
 		JsonObject json = new JsonObject();
-		ServerActionRequest request = actionExecutor.activeRequests().stream()
-				.filter(candidate -> candidate.agentId().equals(agentId))
-				.findFirst()
-				.orElse(null);
+		ServerActionRequest request = actionExecutor.activeRequest(agentId);
 		json.addProperty("active", request != null);
 		if (request != null) {
 			json.addProperty("actionId", request.actionId());
@@ -613,13 +643,14 @@ public final class ServerObservationCollector {
 	private static JsonArray landmarks(
 			ServerLevel level,
 			ServerPlayer agent,
-			ObservationVisibility.Frame visibility
+			ObservationVisibility.Frame visibility,
+			List<VisibleSurfaceCandidate> candidates
 	) {
 		JsonArray values = new JsonArray();
 		int visibilityChecks = 0;
 		HashSet<String> types = new HashSet<>();
 		BlockPos center = agent.blockPosition();
-		for (VisibleSurfaceCandidate candidate : visibleSurfaceCandidates(level, agent, center)) {
+		for (VisibleSurfaceCandidate candidate : candidates) {
 			if (values.size() == MAX_LANDMARKS || visibilityChecks >= MAX_LANDMARK_VISIBILITY_CHECKS) break;
 			BlockPos position = center.offset(candidate.x(), candidate.y(), candidate.z());
 			if (!visibility.isBlockWithinView(position)) continue;
@@ -658,13 +689,14 @@ public final class ServerObservationCollector {
 			BlockPos center
 	) {
 		Map<Long, VisibleSurfaceCandidate> candidates = new HashMap<>();
+		Map<Long, Boolean> loadedChunks = new HashMap<>();
 		Vec3 eye = agent.getEyePosition();
 		for (int pitchOffset : SIGHT_PITCH_OFFSETS) {
 			float pitch = net.minecraft.util.Mth.clamp(agent.getXRot() + pitchOffset, -90.0F, 90.0F);
 			for (int yawOffset : SIGHT_YAW_OFFSETS) {
 				float yaw = agent.getYRot() + yawOffset;
 				Vec3 direction = Vec3.directionFromRotation(pitch, yaw);
-				Vec3 endpoint = loadedSightEndpoint(level, eye, direction);
+				Vec3 endpoint = loadedSightEndpoint(level, eye, direction, loadedChunks);
 				if (endpoint == null) continue;
 				BlockHitResult hit = level.clip(new ClipContext(
 						eye,
@@ -675,7 +707,7 @@ public final class ServerObservationCollector {
 				));
 				if (hit.getType() != HitResult.Type.BLOCK) continue;
 				BlockPos position = hit.getBlockPos();
-				if (!level.hasChunkAt(position)) continue;
+				if (!hasLoadedChunk(level, position, loadedChunks)) continue;
 				double distanceSquared = agent.distanceToSqr(
 						position.getX() + 0.5D,
 						position.getY() + 0.5D,
@@ -693,23 +725,49 @@ public final class ServerObservationCollector {
 				));
 			}
 		}
-		return candidates.values().stream()
-				.sorted(Comparator
-						.comparingInt((VisibleSurfaceCandidate candidate) -> landmarkPriority(candidate.blockId()))
-						.thenComparingDouble(VisibleSurfaceCandidate::distanceSquared)
-						.thenComparingInt(VisibleSurfaceCandidate::y)
-						.thenComparingInt(VisibleSurfaceCandidate::x)
-						.thenComparingInt(VisibleSurfaceCandidate::z))
-				.toList();
+		ArrayList<VisibleSurfaceCandidate> ordered = new ArrayList<>(candidates.values());
+		ordered.sort(Comparator
+				.comparingInt((VisibleSurfaceCandidate candidate) -> landmarkPriority(candidate.blockId()))
+				.thenComparingDouble(VisibleSurfaceCandidate::distanceSquared)
+				.thenComparingInt(VisibleSurfaceCandidate::y)
+				.thenComparingInt(VisibleSurfaceCandidate::x)
+				.thenComparingInt(VisibleSurfaceCandidate::z));
+		return List.copyOf(ordered);
 	}
 
 	/** Keep clipping inside the contiguous loaded view instead of making long rays load chunks. */
-	private static Vec3 loadedSightEndpoint(ServerLevel level, Vec3 origin, Vec3 direction) {
+	private static Vec3 loadedSightEndpoint(
+			ServerLevel level,
+			Vec3 origin,
+			Vec3 direction,
+			Map<Long, Boolean> loadedChunks
+	) {
 		for (int distance = LANDMARK_SIGHT_DISTANCE; distance >= 16; distance -= 16) {
 			Vec3 endpoint = origin.add(direction.scale(distance));
-			if (level.hasChunkAt(BlockPos.containing(endpoint))) return endpoint;
+			if (hasLoadedChunk(level, BlockPos.containing(endpoint), loadedChunks)) return endpoint;
 		}
 		return null;
+	}
+
+	private static boolean hasLoadedChunk(ServerLevel level, BlockPos position, Map<Long, Boolean> loadedChunks) {
+		long chunkKey = (((long) (position.getX() >> 4)) << 32)
+				^ ((long) (position.getZ() >> 4) & 0xffffffffL);
+		Boolean loaded = loadedChunks.get(chunkKey);
+		if (loaded == null) {
+			loaded = level.hasChunkAt(position);
+			loadedChunks.put(chunkKey, loaded);
+		}
+		return loaded;
+	}
+
+	private static long worldMutationRevision(ServerLevel level, BlockPos center) {
+		if (level instanceof WorldMutationRevisionAccess revision) {
+			// Include neighboring shapes that extend into the sampled volume.
+			return revision.arenaagents$worldMutationRevision(center, LANDMARK_SIGHT_DISTANCE + 1);
+		}
+		// Verification doubles may not load the Fabric mixin; changing game time is
+		// a conservative fallback that disables cross-tick reuse rather than risking stale facts.
+		return level.getGameTime();
 	}
 
 	/** Re-reads cached spatial candidates so mutation cannot leave stale block IDs or air entries. */
@@ -845,6 +903,35 @@ public final class ServerObservationCollector {
 	private record EntityCandidate(Entity entity, double distanceSquared) {
 		private EntityCandidate {
 			Objects.requireNonNull(entity, "entity must not be null");
+		}
+	}
+
+	record LandmarkSampleKey(
+			AgentId agentId,
+			String dimension,
+			int centerX,
+			int centerY,
+			int centerZ,
+			double eyeX,
+			double eyeY,
+			double eyeZ,
+			float yaw,
+			float pitch,
+			double feetY,
+			boolean descending,
+			net.minecraft.world.item.Item heldItem,
+			long mutationRevision
+	) {
+		LandmarkSampleKey {
+			Objects.requireNonNull(agentId, "agentId must not be null");
+			Objects.requireNonNull(heldItem, "heldItem must not be null");
+			if (Objects.requireNonNull(dimension, "dimension must not be null").isBlank()) {
+				throw new IllegalArgumentException("dimension must not be blank");
+			}
+			if (!Double.isFinite(eyeX) || !Double.isFinite(eyeY) || !Double.isFinite(eyeZ)
+					|| !Double.isFinite(feetY) || !Float.isFinite(yaw) || !Float.isFinite(pitch) || mutationRevision < 0L) {
+				throw new IllegalArgumentException("landmark sample key contains invalid geometry");
+			}
 		}
 	}
 

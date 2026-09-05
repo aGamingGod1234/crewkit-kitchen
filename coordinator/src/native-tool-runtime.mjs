@@ -65,9 +65,13 @@ export class NativeToolRuntime {
 			? Math.max(eventSequence, latest.eventSequence)
 			: eventSequence;
 		const raw = mergeDeathObservation(observation ?? {}, this.#lastLive.get(record.agentId));
+		// Keep one owned raw snapshot for both internal consumers. Public snapshot
+		// methods still clone at their boundaries, so sharing here does not expose
+		// mutable coordinator state while avoiding a duplicate deep copy per update.
+		const storedObservation = structuredClone(raw);
 		if (hasDurableObservationFacts(raw) && raw.death == null && raw.status !== 'PLAYER_DEAD' && raw.player?.dead !== true) {
 			this.#lastLive.set(record.agentId, {
-				observation: structuredClone(raw),
+				observation: storedObservation,
 				eventSequence: storedSequence,
 				goalRevision: record.goalRevision,
 			});
@@ -81,7 +85,7 @@ export class NativeToolRuntime {
 			eventSequence: storedSequence,
 			goal: record.currentGoal ?? null,
 			goalSpec: record.currentGoalSpec ?? null,
-			observation: structuredClone(raw),
+			observation: storedObservation,
 			...(conversation === undefined ? {} : { conversation: structuredClone(conversation) }),
 		});
 		return true;
@@ -113,12 +117,18 @@ export class NativeToolRuntime {
 		const cached = latest?.goalRevision === record.goalRevision ? latest.observation : undefined;
 		const live = this.#lastLive.get(record.agentId)?.observation;
 		const source = resolveDecorateSource(observation, cached, live);
+		// Cached and live snapshots share one owned raw object. Give callers an
+		// isolated view when decoration falls back to either store (including death
+		// merging), while the normal durable-observation path remains allocation-free.
+		const ownedSource = source === cached || source === live || isSparseDeathObservation(observation)
+			? structuredClone(source)
+			: source;
 		if (hasDurableObservationFacts(observation) && !isSparseDeathObservation(observation)) {
 			this.#recovery.remember(record.agentId, record.goalRevision, observation);
 		} else if (isSparseDeathObservation(observation) && hasDurableObservationFacts(source)) {
 			this.#recovery.remember(record.agentId, record.goalRevision, source);
 		}
-		return composeTwoCallView(source, this.#recovery.snapshot(record.agentId, source), {
+		return composeTwoCallView(ownedSource, this.#recovery.snapshot(record.agentId, ownedSource), {
 			occupancy: this.#occupancy,
 			agentId: record.agentId,
 			goal: record.currentGoal ?? record.currentGoalSpec?.originalRequest ?? null,

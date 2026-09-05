@@ -523,8 +523,11 @@ public final class ServerActionExecutor {
 		return lastResults.get(agentId);
 	}
 
-	public synchronized List<ServerActionRequest> activeRequests() {
-		return active.values().stream().map(ActiveAction::request).toList();
+	/** Returns the active request for one agent without materializing the full active set. */
+	public synchronized ServerActionRequest activeRequest(AgentId agentId) {
+		Objects.requireNonNull(agentId, "agentId must not be null");
+		ActiveAction action = active.get(agentId);
+		return action == null ? null : action.request();
 	}
 
 	private ActiveAction createAction(ServerActionRequest request, ServerPlayer player) {
