@@ -541,6 +541,10 @@ public final class AgentRegistry {
 		return record;
 	}
 
+	public synchronized boolean contains(AgentId id) {
+		return records.containsKey(Objects.requireNonNull(id, "id must not be null"));
+	}
+
 	public synchronized AgentRecord resolve(String selector) {
 		String checked = AgentValidators.requireNonBlank(selector, "agent", 64).trim();
 		try {

@@ -5,6 +5,7 @@ import carpet.helpers.EntityPlayerActionPack;
 import carpet.patches.EntityPlayerMPFake;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.AgentDeathSnapshot;
+import dev.agaminggod.arenaagents.agent.AgentConstants;
 import dev.agaminggod.arenaagents.agent.AgentGameMode;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentIdentity;
@@ -17,7 +18,9 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -46,15 +49,41 @@ import net.minecraft.util.Mth;
 import net.minecraft.world.level.storage.LevelResource;
 
 public final class OfflineAgentPlayers {
+	private static final Map<AgentId, CachedIdentity> IDENTITIES = new LinkedHashMap<>();
+
 	private OfflineAgentPlayers() {
 	}
 
 	public static String playerName(AgentId agentId, AgentProfile profile) {
-		return AgentIdentity.playerName(agentId, profile);
+		return identity(agentId, profile).playerName();
 	}
 
 	public static UUID offlineUuid(AgentId agentId, AgentProfile profile) {
-		return AgentIdentity.offlinePlayerUuid(playerName(agentId, profile));
+		return identity(agentId, profile).offlineUuid();
+	}
+
+	/** Drops only immutable derived identity data; live ServerPlayer instances are never cached here. */
+	static synchronized void invalidateIdentity(AgentId agentId) {
+		IDENTITIES.remove(Objects.requireNonNull(agentId, "agentId must not be null"));
+	}
+
+	static synchronized void clearIdentityCache() {
+		IDENTITIES.clear();
+	}
+
+	private static synchronized CachedIdentity identity(AgentId agentId, AgentProfile profile) {
+		AgentId checkedId = Objects.requireNonNull(agentId, "agentId must not be null");
+		AgentProfile checkedProfile = Objects.requireNonNull(profile, "profile must not be null");
+		CachedIdentity cached = IDENTITIES.get(checkedId);
+		if (cached != null && cached.profile().equals(checkedProfile)) return cached;
+		String playerName = AgentIdentity.playerName(checkedId, checkedProfile);
+		CachedIdentity revised = new CachedIdentity(
+				checkedProfile, playerName, AgentIdentity.offlinePlayerUuid(playerName));
+		if (!IDENTITIES.containsKey(checkedId) && IDENTITIES.size() >= AgentConstants.MAX_CONFIGURED_AGENTS) {
+			IDENTITIES.remove(IDENTITIES.keySet().iterator().next());
+		}
+		IDENTITIES.put(checkedId, revised);
+		return revised;
 	}
 
 	static String legacyTransportPlayerName(AgentId agentId, AgentProfile profile) {
@@ -88,11 +117,12 @@ public final class OfflineAgentPlayers {
 			net.minecraft.resources.ResourceKey<net.minecraft.world.level.Level> dimension,
 			GameType gameMode
 	) {
-		String name = playerName(agentId, profile);
+		CachedIdentity expected = identity(agentId, profile);
+		String name = expected.playerName();
 		if (server.getPlayerList().getPlayerByName(name) != null || EntityPlayerMPFake.isSpawningPlayer(name)) {
 			throw new AgentDomainException("AGENT_PLAYER_EXISTS", "The offline player for this agent already exists");
 		}
-		UUID uuid = offlineUuid(agentId, profile);
+		UUID uuid = expected.offlineUuid();
 		boolean accepted;
 		OfflineAgentProfileLookup.begin(name, uuid);
 		try {
@@ -115,8 +145,9 @@ public final class OfflineAgentPlayers {
 	}
 
 	public static Optional<ServerPlayer> find(MinecraftServer server, AgentId agentId, AgentProfile profile) {
-		UUID expectedUuid = offlineUuid(agentId, profile);
-		String expectedName = playerName(agentId, profile);
+		CachedIdentity expected = identity(agentId, profile);
+		UUID expectedUuid = expected.offlineUuid();
+		String expectedName = expected.playerName();
 		ServerPlayer byUuid = server.getPlayerList().getPlayer(expectedUuid);
 		if (isManagedFakePlayer(byUuid, expectedUuid, expectedName)) return Optional.of(byUuid);
 		ServerPlayer byName = server.getPlayerList().getPlayerByName(expectedName);
@@ -152,8 +183,9 @@ public final class OfflineAgentPlayers {
 	) {
 		ServerPlayer legacy = findLegacyPlayer(server, agentId, profile).orElse(null);
 		if (legacy == null) return Optional.empty();
-		String canonicalName = playerName(agentId, profile);
-		UUID canonicalUuid = offlineUuid(agentId, profile);
+		CachedIdentity canonical = identity(agentId, profile);
+		String canonicalName = canonical.playerName();
+		UUID canonicalUuid = canonical.offlineUuid();
 		legacy.getStats().save();
 		legacy.getAdvancements().save();
 		copyLegacyIdentityFiles(
@@ -311,7 +343,16 @@ public final class OfflineAgentPlayers {
 	}
 
 	static boolean isManagedFakePlayer(ServerPlayer player, AgentId agentId, AgentProfile profile) {
-		return isManagedFakePlayer(player, offlineUuid(agentId, profile), playerName(agentId, profile));
+		CachedIdentity expected = identity(agentId, profile);
+		return isManagedFakePlayer(player, expected.offlineUuid(), expected.playerName());
+	}
+
+	private record CachedIdentity(AgentProfile profile, String playerName, UUID offlineUuid) {
+		private CachedIdentity {
+			Objects.requireNonNull(profile, "profile must not be null");
+			Objects.requireNonNull(playerName, "playerName must not be null");
+			Objects.requireNonNull(offlineUuid, "offlineUuid must not be null");
+		}
 	}
 
 	private static boolean isManagedFakePlayer(ServerPlayer player, UUID expectedUuid, String expectedName) {

@@ -129,7 +129,11 @@ public final class CodexAgentManager {
 	public static synchronized void release(MinecraftServer server) {
 		CodexAgentManager manager = INSTANCES.remove(server);
 		if (manager != null) {
-			manager.releaseOwnedState();
+			try {
+				manager.releaseOwnedState();
+			} finally {
+				OfflineAgentPlayers.clearIdentityCache();
+			}
 		}
 	}
 
@@ -245,13 +249,14 @@ public final class CodexAgentManager {
 					pendingAgentRegistrations.add(record.agentId());
 					return record;
 				});
-				String technicalName = AgentIdentity.playerName(created.agentId(), created.profile());
+				String technicalName = OfflineAgentPlayers.playerName(created.agentId(), created.profile());
 				if (!isPersistedPlayerNameReserved(technicalName)) break;
 				unavailableNames.add(technicalName);
 				AgentRecord rejected = created;
 				runtimeHooks.withinPublicationBoundary(() -> {
 					registry.remove(rejected.agentId());
 					pendingAgentRegistrations.remove(rejected.agentId());
+					OfflineAgentPlayers.invalidateIdentity(rejected.agentId());
 					return null;
 				});
 			}
@@ -286,6 +291,7 @@ public final class CodexAgentManager {
 						// The record may already have been removed by a failing integration hook.
 					} finally {
 						pendingAgentRegistrations.remove(finalCreated.agentId());
+						OfflineAgentPlayers.invalidateIdentity(finalCreated.agentId());
 					}
 					return null;
 				});
@@ -1004,7 +1010,7 @@ public final class CodexAgentManager {
 		Set<String> currentPlayerNames = new LinkedHashSet<>();
 		for (AgentRecord record : records()) {
 			currentIds.add(record.agentId());
-			currentPlayerNames.add(AgentIdentity.playerName(record.agentId(), record.profile()));
+			currentPlayerNames.add(OfflineAgentPlayers.playerName(record.agentId(), record.profile()));
 		}
 		groupSavedData.registry().retainMembers(currentIds);
 		PlayerTeam team = server.getScoreboard().getPlayerTeam(LEGACY_HIDDEN_AGENT_TEAM);
@@ -1591,7 +1597,7 @@ public final class CodexAgentManager {
 									() -> pendingLegacyCanonicalRemovals().remove(record.agentId()),
 									() -> retainedDeadPlayers().remove(record.agentId()),
 									() -> seenPlayers.remove(record.agentId()),
-									() -> removeHiddenWorldName(AgentIdentity.playerName(
+							() -> removeHiddenWorldName(OfflineAgentPlayers.playerName(
 											record.agentId(), record.profile())),
 									() -> groupSavedData.registry().removeMember(record.agentId())
 							);
@@ -1603,7 +1609,8 @@ public final class CodexAgentManager {
 		runCleanupSteps(
 				() -> lastLocationPersistenceEpochMs.remove(record.agentId()),
 				() -> savedData.clearConversationWake(record.agentId()),
-				() -> savedData.clearGoalDrafts(record.agentId())
+				() -> savedData.clearGoalDrafts(record.agentId()),
+				() -> OfflineAgentPlayers.invalidateIdentity(record.agentId())
 		);
 		return removed;
 	}
@@ -1650,8 +1657,7 @@ public final class CodexAgentManager {
 
 	public boolean isCoordinatorVisible(AgentId agentId) {
 		Objects.requireNonNull(agentId, "agentId must not be null");
-		return !pendingAgentRegistrations.contains(agentId)
-				&& records().stream().anyMatch(record -> record.agentId().equals(agentId));
+		return !pendingAgentRegistrations.contains(agentId) && savedData.registry().contains(agentId);
 	}
 
 	private void publishPendingRegistration(AgentRecord record) {

@@ -120,12 +120,12 @@ public final class GoalVerificationRuntime {
 	}
 
 	public List<AgentTransition> tick() {
-		synchronizeProgress();
+		List<AgentRecord> snapshots = synchronizeProgress();
 		long tick = serverTick.getAsLong();
 		long now = epochMillis.getAsLong();
 		if (tick < 0L) throw new IllegalStateException("Server tick must be nonnegative");
 		ArrayList<AgentTransition> transitions = new ArrayList<>();
-		for (AgentRecord snapshot : registry.records()) {
+		for (AgentRecord snapshot : snapshots) {
 			AgentRecord record = registry.require(snapshot.agentId());
 			if (readyToPromote(record)) {
 				promoteFirstValidQueuedGoal(record, now, transitions);
@@ -139,14 +139,16 @@ public final class GoalVerificationRuntime {
 			if (!result.verified()) continue;
 			transitions.add(registry.satisfyGoal(record.agentId(), record.goalRevision(), result.evidence(tick), now));
 		}
-		synchronizeProgress();
-		Set<UUID> currentGoals = registry.records().stream().flatMap(record -> record.currentGoal().stream())
+		List<AgentRecord> currentRecords = synchronizeProgress();
+		Set<UUID> currentGoals = currentRecords.stream().flatMap(record -> record.currentGoal().stream())
 				.map(AgentGoal::goalId).collect(java.util.stream.Collectors.toUnmodifiableSet());
 		verifier.retainGoals(currentGoals);
-		faults.entrySet().removeIf(entry -> registry.records().stream().noneMatch(record ->
-				record.agentId().equals(entry.getKey())
-						&& record.currentGoal().isPresent()
-						&& record.goalRevision() == entry.getValue().goalRevision()));
+		Map<AgentId, Long> currentGoalRevisions = new HashMap<>();
+		for (AgentRecord record : currentRecords) {
+			if (record.currentGoal().isPresent()) currentGoalRevisions.put(record.agentId(), record.goalRevision());
+		}
+		faults.entrySet().removeIf(entry -> !Objects.equals(
+				currentGoalRevisions.get(entry.getKey()), entry.getValue().goalRevision()));
 		return List.copyOf(transitions);
 	}
 
@@ -263,11 +265,12 @@ public final class GoalVerificationRuntime {
 		return List.copyOf(faults.values());
 	}
 
-	private void synchronizeProgress() {
+	private List<AgentRecord> synchronizeProgress() {
 		ArrayList<AgentKillLedger.KillProgressRequirement> requirements = new ArrayList<>();
 		ArrayList<SurvivalProgressLedger.Requirement> survivalRequirements = new ArrayList<>();
 		Set<UUID> activeGoalIds = new java.util.HashSet<>();
-		for (AgentRecord record : registry.records()) {
+		List<AgentRecord> records = registry.records();
+		for (AgentRecord record : records) {
 			AgentGoal goal = record.currentGoal().orElse(null);
 			if (goal == null || goal.status() != GoalStatus.ACTIVE && goal.status() != GoalStatus.RECOVERING) continue;
 			activeGoalIds.add(goal.goalId());
@@ -284,6 +287,7 @@ public final class GoalVerificationRuntime {
 		killLedger.synchronizeProgress(requirements);
 		survivalProgress.synchronizeProgress(survivalRequirements);
 		operatorConfirmations.retainGoals(activeGoalIds);
+		return records;
 	}
 
 	private static void collectSurvivalRequirements(
