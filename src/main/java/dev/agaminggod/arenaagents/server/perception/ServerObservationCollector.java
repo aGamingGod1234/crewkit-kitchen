@@ -162,11 +162,6 @@ public final class ServerObservationCollector {
 		}
 	}
 
-	/** Returns loaded agents whose compact factual player or inventory state changed since the last sample. */
-	public List<AgentId> changedActiveAgents() {
-		return changedActiveAgents(manager.records());
-	}
-
 	/**
 	 * Samples the supplied roster, allowing the bridge to reuse the visibility-filtered
 	 * roster it already computed for observation scheduling.
