@@ -110,7 +110,6 @@ import dev.agaminggod.arenaagents.server.runtime.DesiredBlockStateVerification;
 import dev.agaminggod.arenaagents.server.runtime.ResourceLeaseManagerVerification;
 import dev.agaminggod.arenaagents.server.runtime.RecipeActionVerification;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionExecutorVerification;
-import dev.agaminggod.arenaagents.server.runtime.GoalCompletionContractVerification;
 import dev.agaminggod.arenaagents.server.goal.GoalVerificationRuntimeVerification;
 import dev.agaminggod.arenaagents.server.goal.GoalSafetyControllerVerification;
 import dev.agaminggod.arenaagents.server.runtime.ActionSuccessLedgerVerification;
@@ -125,10 +124,7 @@ import dev.agaminggod.arenaagents.server.runtime.transaction.TransactionProtocol
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerPathPlannerVerification;
 import dev.agaminggod.arenaagents.server.runtime.controller.MinecraftNavigationWorldVerification;
 import dev.agaminggod.arenaagents.server.runtime.controller.NavigationProgressVerification;
-import dev.agaminggod.arenaagents.server.runtime.controller.CombatPolicyVerification;
-import dev.agaminggod.arenaagents.server.runtime.controller.CombatNavigationFailureVerification;
 import dev.agaminggod.arenaagents.server.runtime.controller.SurvivalReflexVerification;
-import dev.agaminggod.arenaagents.server.runtime.controller.BuildSequenceProgressVerification;
 import dev.agaminggod.arenaagents.server.runtime.controller.ItemPickupProgressVerification;
 import dev.agaminggod.arenaagents.scenario.ScenarioCoreVerification;
 import dev.agaminggod.arenaagents.scenario.ScenarioActivationFailurePolicyVerification;
@@ -265,7 +261,6 @@ public final class VerificationMain {
 		passedAssertions += TransactionPostconditionVerification.verify();
 		passedAssertions += EquipmentAndUseVerification.verify();
 		passedAssertions += ServerActionExecutorVerification.verify();
-		passedAssertions += GoalCompletionContractVerification.verify();
 		passedAssertions += GoalVerificationRuntimeVerification.verify();
 		passedAssertions += GoalSafetyControllerVerification.verify();
 		passedAssertions += ActionSuccessLedgerVerification.verify();
@@ -277,10 +272,7 @@ public final class VerificationMain {
 		passedAssertions += ServerPathPlannerVerification.verify();
 		passedAssertions += MinecraftNavigationWorldVerification.verify();
 		passedAssertions += NavigationProgressVerification.verify();
-		passedAssertions += CombatPolicyVerification.verify();
-		passedAssertions += CombatNavigationFailureVerification.verify();
 		passedAssertions += SurvivalReflexVerification.verify();
-		passedAssertions += BuildSequenceProgressVerification.verify();
 		passedAssertions += ItemPickupProgressVerification.verify();
 		passedAssertions += ScenarioCoreVerification.verify();
 		passedAssertions += ScenarioActivationFailurePolicyVerification.verify();

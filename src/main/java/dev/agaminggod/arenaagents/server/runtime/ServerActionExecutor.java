@@ -5,9 +5,7 @@ import carpet.script.utils.Tracer;
 import com.google.gson.JsonObject;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.AgentId;
-import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.AgentTransition;
-import dev.agaminggod.arenaagents.agent.AgentIdentity;
 import dev.agaminggod.arenaagents.protocol.ActionType;
 import dev.agaminggod.arenaagents.server.AgentChatReporter;
 import dev.agaminggod.arenaagents.server.AgentRuntimeRouter;
@@ -17,9 +15,6 @@ import dev.agaminggod.arenaagents.server.perception.ObservationVisibility;
 import dev.agaminggod.arenaagents.server.conversation.ConversationAudience;
 import dev.agaminggod.arenaagents.server.conversation.ServerAgentConversationRouter;
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerController;
-import dev.agaminggod.arenaagents.server.runtime.controller.ServerBuildSequenceController;
-import dev.agaminggod.arenaagents.server.runtime.controller.CombatIntent;
-import dev.agaminggod.arenaagents.server.runtime.controller.ServerCombatController;
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerNavigationController;
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerItemPickupController;
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerPathPlanner;
@@ -52,9 +47,7 @@ import net.minecraft.resources.Identifier;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
-import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.item.ItemEntity;
-import net.minecraft.world.entity.monster.Enemy;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.item.BlockItem;
@@ -536,8 +529,7 @@ public final class ServerActionExecutor {
 
 	private ActiveAction createAction(ServerActionRequest request, ServerPlayer player) {
 		if (player.gameMode.getGameModeForPlayer() == GameType.ADVENTURE
-				&& (request.type() == ActionType.BREAK_BLOCK || request.type() == ActionType.PLACE_BLOCK
-				|| request.type() == ActionType.BUILD_SEQUENCE)) {
+				&& (request.type() == ActionType.BREAK_BLOCK || request.type() == ActionType.PLACE_BLOCK)) {
 			throw new AgentDomainException("GAME_MODE_RESTRICTED", "Adventure agents cannot break or place blocks");
 		}
 		JsonObject arguments = request.arguments();
@@ -649,16 +641,6 @@ public final class ServerActionExecutor {
 					throw exception;
 				}
 			}
-			case BUILD_SEQUENCE -> ActiveAction.controller(
-					request,
-					player,
-					new ServerBuildSequenceController(
-							buildPlacements(arguments),
-							System.currentTimeMillis(),
-							integer(arguments, "timeoutMs"),
-							new BuildSequencePlacementDriver(request)
-					)
-			);
 			case CHAT -> ActiveAction.immediate(request, player, () -> sendConversation(request, arguments));
 			case WAIT -> ActiveAction.waitFor(request, player, integer(arguments, "durationMs"));
 			case SET_DOOR -> ActiveAction.immediate(request, player, () -> requireResult(
@@ -678,48 +660,6 @@ public final class ServerActionExecutor {
 			case DROP_ITEM -> ActiveAction.immediate(request, player, () -> requireResult(
 					advancedInteractions.drop(player, integer(arguments, "slot"), integer(arguments, "count"))
 			));
-			case FIGHT_TARGET -> ActiveAction.controller(
-					request,
-					player,
-					new ServerCombatController(
-							findTarget(player, string(arguments, "targetSelector")),
-							new CombatIntent(
-									string(arguments, "targetSelector"),
-									number(arguments, "desiredRange"),
-									integer(arguments, "timeoutMs"),
-									CombatIntent.Mode.FIGHT
-							),
-							System.currentTimeMillis()
-					)
-			);
-			case FLEE_FROM -> ActiveAction.controller(
-					request,
-					player,
-					new ServerCombatController(
-							findTarget(player, string(arguments, "targetSelector")),
-							new CombatIntent(
-									string(arguments, "targetSelector"),
-									number(arguments, "distance"),
-									integer(arguments, "timeoutMs"),
-									CombatIntent.Mode.FLEE
-							),
-							System.currentTimeMillis()
-					)
-			);
-			case FOLLOW_ENTITY -> ActiveAction.controller(
-					request,
-					player,
-					new ServerCombatController(
-							findTarget(player, string(arguments, "targetSelector")),
-							new CombatIntent(
-									string(arguments, "targetSelector"),
-									number(arguments, "distance"),
-									integer(arguments, "timeoutMs"),
-									CombatIntent.Mode.FOLLOW
-							),
-							System.currentTimeMillis()
-					)
-			);
 			case TRANSFER_CONTAINER, CRAFT_INVENTORY, CRAFT_TABLE, FURNACE_TRANSACTION,
 					EQUIP_ITEM, SELECT_TOOL, BLOCK_WITH_SHIELD, USE_RANGED,
 					MENU_TRANSFER, MENU_BUTTON, ANVIL_RENAME -> ActiveAction.transaction(
@@ -728,6 +668,10 @@ public final class ServerActionExecutor {
 					advancedInteractions.begin(player, request, arguments)
 			);
 			case RESPAWN, COMPLETE_GOAL -> throw new IllegalStateException("respawn and complete_goal are handled before action creation");
+			default -> throw new AgentDomainException(
+					"UNSUPPORTED_ACTION",
+					"Action type is not supported by the server executor: " + request.type().wireName()
+			);
 		};
 	}
 
@@ -1041,95 +985,6 @@ public final class ServerActionExecutor {
 			throw new AgentDomainException("TARGET_NOT_VISIBLE", "Observed target is no longer visible");
 		}
 		return target;
-	}
-
-	private static Entity findTarget(ServerPlayer player, String selector) {
-		ServerLevel level = player.level();
-		String normalized = EntityTargetSelector.normalize(selector);
-		java.util.function.Predicate<Entity> predicate;
-		if ("nearest_hostile".equals(normalized)) {
-			predicate = entity -> entity instanceof Enemy && entity.isAlive();
-		} else if ("nearest_player".equals(normalized)) {
-			predicate = entity -> entity instanceof ServerPlayer && entity != player && entity.isAlive();
-		} else if ("nearest_living".equals(normalized)) {
-			predicate = entity -> entity instanceof LivingEntity && entity != player && entity.isAlive();
-		} else {
-			List<AgentRecord> records = managerRecords(level);
-			ServerPlayer named = level.getServer().getPlayerList().getPlayerByName(normalized);
-			boolean eligibleNamedPlayer = named != null && named != player && named.isAlive();
-			String ordinaryPlayerName = eligibleNamedPlayer
-					? named.getGameProfile().name()
-					: null;
-			Optional<NamedTargetIdentity> identity = resolveNamedTargetIdentity(
-					normalized, records, ordinaryPlayerName, eligibleNamedPlayer ? named.getUUID() : null);
-			if (identity.isPresent()) {
-				NamedTargetIdentity resolved = identity.orElseThrow();
-				if (resolved.ordinaryPlayerName().isPresent()) return named;
-				AgentId agentId = resolved.agentId().orElseThrow();
-				AgentRecord record = records.stream()
-						.filter(candidate -> candidate.agentId().equals(agentId))
-						.findFirst()
-						.orElseThrow();
-				ServerPlayer agentPlayer = OfflineAgentPlayers.find(
-						level.getServer(), record.agentId(), record.profile()).orElse(null);
-				if (agentPlayer != null && agentPlayer != player && agentPlayer.isAlive()) return agentPlayer;
-			}
-			try {
-				UUID uuid = UUID.fromString(normalized);
-				Entity direct = level.getEntity(uuid);
-				if (direct != null && direct.isAlive()) return direct;
-			} catch (IllegalArgumentException ignored) {
-			}
-			throw new AgentDomainException("TARGET_NOT_FOUND", "Unknown or unavailable target selector: " + selector);
-		}
-		return level.getEntities(player, player.getBoundingBox().inflate(128.0D), predicate)
-				.stream()
-				.filter(entity -> ObservationVisibility.canSeeEntity(player, entity))
-				.min(Comparator.comparingDouble(player::distanceToSqr))
-				.orElseThrow(() -> new AgentDomainException("TARGET_NOT_FOUND", "No matching target is nearby"));
-	}
-
-	static Optional<NamedTargetIdentity> resolveNamedTargetIdentity(
-			String normalized,
-			List<AgentRecord> records,
-			String matchedPlayerName,
-			UUID matchedPlayerUuid
-	) {
-		String checked = Objects.requireNonNull(normalized, "normalized must not be null");
-		List<AgentRecord> checkedRecords = List.copyOf(Objects.requireNonNull(records, "records must not be null"));
-		List<AgentRecord> agentMatches = checkedRecords.stream()
-				.filter(record -> AgentIdentity.sameIdentity(
-						AgentIdentity.displayName(record.agentId(), record.profile()), checked)
-						|| record.profile().userName().filter(name -> AgentIdentity.sameIdentity(name, checked)).isPresent())
-				.toList();
-		boolean matchedFakePlayer = matchedPlayerUuid != null && checkedRecords.stream()
-				.anyMatch(record -> OfflineAgentPlayers.offlineUuid(record.agentId(), record.profile())
-						.equals(matchedPlayerUuid));
-		String ordinaryPlayerName = matchedFakePlayer ? null : matchedPlayerName;
-		if (agentMatches.size() > 1 || (!agentMatches.isEmpty() && ordinaryPlayerName != null)) {
-			throw new AgentDomainException("AMBIGUOUS_TARGET", "Target selector is ambiguous: " + checked);
-		}
-		if (!agentMatches.isEmpty()) {
-			return Optional.of(NamedTargetIdentity.agent(agentMatches.getFirst().agentId()));
-		}
-		if (ordinaryPlayerName != null) {
-			return Optional.of(NamedTargetIdentity.ordinaryPlayer(ordinaryPlayerName));
-		}
-		return Optional.empty();
-	}
-
-	record NamedTargetIdentity(Optional<AgentId> agentId, Optional<String> ordinaryPlayerName) {
-		private static NamedTargetIdentity agent(AgentId agentId) {
-			return new NamedTargetIdentity(Optional.of(agentId), Optional.empty());
-		}
-
-		private static NamedTargetIdentity ordinaryPlayer(String playerName) {
-			return new NamedTargetIdentity(Optional.empty(), Optional.of(playerName));
-		}
-	}
-
-	private static List<dev.agaminggod.arenaagents.agent.AgentRecord> managerRecords(ServerLevel level) {
-		return CodexAgentManager.get(level.getServer()).records();
 	}
 
 	private static void selectItem(ServerPlayer player, String itemId) {
@@ -1510,25 +1365,6 @@ public final class ServerActionExecutor {
 		return BlockPos.containing(number(arguments, "x"), number(arguments, "y"), number(arguments, "z"));
 	}
 
-	private static List<ServerBuildSequenceController.Placement> buildPlacements(JsonObject arguments) {
-		List<ServerBuildSequenceController.Placement> placements = new ArrayList<>();
-		arguments.getAsJsonArray("placements").forEach(element -> {
-			JsonObject placement = element.getAsJsonObject();
-			Direction face = Direction.byName(string(placement, "face"));
-			if (face == null) throw new AgentDomainException("INVALID_FIELD", "Unknown placement face");
-			placements.add(new ServerBuildSequenceController.Placement(
-					integer(placement, "x"),
-					integer(placement, "y"),
-					integer(placement, "z"),
-					face,
-					string(placement, "itemId"),
-					placement.has("desiredState") && !placement.get("desiredState").isJsonNull()
-							? string(placement, "desiredState") : null
-			));
-		});
-		return List.copyOf(placements);
-	}
-
 	private static String string(JsonObject object, String field) {
 		return object.get(field).getAsString();
 	}
@@ -1680,84 +1516,6 @@ public final class ServerActionExecutor {
 
 	static String failureReason(Throwable throwable) {
 		return throwable instanceof AgentDomainException domain ? domain.code() : "ACTION_EXCEPTION";
-	}
-
-	private final class BuildSequencePlacementDriver implements ServerBuildSequenceController.PlacementDriver {
-		private final ServerActionRequest parent;
-		private ActiveAction child;
-
-		private BuildSequencePlacementDriver(ServerActionRequest parent) {
-			this.parent = parent;
-		}
-
-		@Override
-		public boolean isInRange(ServerPlayer player, ServerBuildSequenceController.Placement placement) {
-			if (player == null) return false;
-			BlockPos target = new BlockPos(placement.x(), placement.y(), placement.z());
-			BlockPos support = target.relative(placement.face().getOpposite());
-			return player.isWithinBlockInteractionRange(support, 1.0D);
-		}
-
-		@Override
-		public ServerController.TickResult tick(
-				ServerPlayer player,
-				ServerBuildSequenceController.Placement placement,
-				int index,
-				long nowEpochMs
-		) {
-			try {
-				if (child == null) {
-					JsonObject arguments = new JsonObject();
-					arguments.addProperty("x", placement.x());
-					arguments.addProperty("y", placement.y());
-					arguments.addProperty("z", placement.z());
-					arguments.addProperty("face", placement.face().getName());
-					arguments.addProperty("itemId", placement.itemId());
-					if (placement.desiredState() == null) arguments.add("desiredState", com.google.gson.JsonNull.INSTANCE);
-					else arguments.addProperty("desiredState", placement.desiredState());
-					child = createAction(new ServerActionRequest(
-							parent.agentId(), parent.goalRevision(), parent.actionId(), ActionType.PLACE_BLOCK, arguments, parent.provenance(), parent.traceId()
-					), player);
-				}
-				ServerActionResult result = child.tick(nowEpochMs);
-				if (result == null) return ServerController.TickResult.running(child.lastProgress);
-				ActiveAction completed = child;
-				double completedProgress = child.lastProgress;
-				child = null;
-				cleanupChild(completed);
-				if (result.state() == ServerActionState.SUCCEEDED) {
-					return ServerController.TickResult.succeeded(result.reasonCode(), result.message());
-				}
-				return ServerController.TickResult.failed(result.reasonCode(), result.message(), completedProgress);
-			} catch (RuntimeException failure) {
-				if (child != null) {
-					ActiveAction failed = child;
-					child = null;
-					try { cleanupChild(failed); } catch (RuntimeException ignored) { }
-				}
-				return ServerController.TickResult.failed(failureReason(failure), safeMessage(failure), 0.0D);
-			}
-		}
-
-		@Override
-		public void cancel(ServerPlayer player) {
-			if (child == null) return;
-			ActiveAction cancelled = child;
-			child = null;
-			try {
-				cancelled.cancel("Build sequence cancelled");
-			} finally {
-				releaseResourceLease(cancelled);
-			}
-		}
-
-		private void cleanupChild(ActiveAction action) {
-			try {
-				action.cleanup();
-			} finally {
-				releaseResourceLease(action);
-			}
-		}
 	}
 
 	private static final class ActiveAction {
