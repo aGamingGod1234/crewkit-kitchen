@@ -40,6 +40,8 @@ import java.util.UUID;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerChunkEvents;
+import dev.agaminggod.arenaagents.world.WorldMutationRevisionAccess;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
@@ -101,6 +103,10 @@ public final class CodexAgentServerRuntime {
 			return;
 		}
 		ServerLifecycleEvents.SERVER_STARTED.register(CodexAgentServerRuntime::start);
+		ServerChunkEvents.CHUNK_LOAD.register((level, chunk, newChunk) ->
+				((WorldMutationRevisionAccess) level).arenaagents$recordWorldMutation(chunk.getPos().getWorldPosition()));
+		ServerChunkEvents.CHUNK_UNLOAD.register((level, chunk) ->
+				((WorldMutationRevisionAccess) level).arenaagents$recordWorldMutation(chunk.getPos().getWorldPosition()));
 		ServerTickEvents.START_SERVER_TICK.register(CodexAgentServerRuntime::startTick);
 		ServerTickEvents.END_SERVER_TICK.register(CodexAgentServerRuntime::endTick);
 		ServerLifecycleEvents.SERVER_STOPPING.register(CodexAgentServerRuntime::stop);

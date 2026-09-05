@@ -1,6 +1,10 @@
 package dev.agaminggod.arenaagents.world;
 
-/** Exposes the monotonic block-mutation revision maintained on each Minecraft level. */
+import net.minecraft.core.BlockPos;
+
+/** Exposes regional mutation revisions maintained on each Minecraft level. */
 public interface WorldMutationRevisionAccess {
-	long arenaagents$worldMutationRevision();
+	long arenaagents$worldMutationRevision(BlockPos center, int radius);
+
+	void arenaagents$recordWorldMutation(BlockPos position);
 }

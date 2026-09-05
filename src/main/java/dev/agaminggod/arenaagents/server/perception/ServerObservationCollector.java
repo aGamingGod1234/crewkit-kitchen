@@ -237,7 +237,10 @@ public final class ServerObservationCollector {
 			eye.z,
 			agent.getYRot(),
 			agent.getXRot(),
-			worldMutationRevision(level)
+			agent.getY(),
+			agent.isDescending(),
+			agent.getMainHandItem().getItem(),
+			worldMutationRevision(level, position)
 		);
 		List<VisibleSurfaceCandidate> landmarkCandidates = landmarkCache.getOrCompute(
 			landmarkKey,
@@ -762,9 +765,10 @@ public final class ServerObservationCollector {
 		return loaded;
 	}
 
-	private static long worldMutationRevision(ServerLevel level) {
+	private static long worldMutationRevision(ServerLevel level, BlockPos center) {
 		if (level instanceof WorldMutationRevisionAccess revision) {
-			return revision.arenaagents$worldMutationRevision();
+			// Include neighboring shapes that extend into the sampled volume.
+			return revision.arenaagents$worldMutationRevision(center, LANDMARK_SIGHT_DISTANCE + 1);
 		}
 		// Verification doubles may not load the Fabric mixin; changing game time is
 		// a conservative fallback that disables cross-tick reuse rather than risking stale facts.
@@ -907,7 +911,7 @@ public final class ServerObservationCollector {
 		}
 	}
 
-	private record LandmarkSampleKey(
+	record LandmarkSampleKey(
 			AgentId agentId,
 			String dimension,
 			int centerX,
@@ -918,15 +922,19 @@ public final class ServerObservationCollector {
 			double eyeZ,
 			float yaw,
 			float pitch,
+			double feetY,
+			boolean descending,
+			net.minecraft.world.item.Item heldItem,
 			long mutationRevision
 	) {
-		private LandmarkSampleKey {
+		LandmarkSampleKey {
 			Objects.requireNonNull(agentId, "agentId must not be null");
+			Objects.requireNonNull(heldItem, "heldItem must not be null");
 			if (Objects.requireNonNull(dimension, "dimension must not be null").isBlank()) {
 				throw new IllegalArgumentException("dimension must not be blank");
 			}
 			if (!Double.isFinite(eyeX) || !Double.isFinite(eyeY) || !Double.isFinite(eyeZ)
-					|| !Float.isFinite(yaw) || !Float.isFinite(pitch) || mutationRevision < 0L) {
+					|| !Double.isFinite(feetY) || !Float.isFinite(yaw) || !Float.isFinite(pitch) || mutationRevision < 0L) {
 				throw new IllegalArgumentException("landmark sample key contains invalid geometry");
 			}
 		}
