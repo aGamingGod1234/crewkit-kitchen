@@ -100,6 +100,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyAuthenticatedReconnectRecovery();
 		verifyTerminalReplaySurvivesDisconnectRevision();
 		verifyAcceptedActionRecoversWithoutReplay();
+		verifyRebindPersistsCancellationBeforeClosingJournal();
 		verifyObsoletePlannerReadinessIsIgnored();
 		verifyAgentErrorRevisionGate();
 		verifyRespawnContinuationPayload();
@@ -192,7 +193,57 @@ public final class MultiplexedServerBridgeVerification {
 		verifyImmediateHandshakeClosePreservesDisconnect();
 		verifyPendingRegistrationMarkerIsFenced();
 		verifyAtomicPublicationRacesSessionClose();
-		return 287;
+		return 290;
+	}
+
+	@SuppressWarnings("unchecked")
+	private static void verifyRebindPersistsCancellationBeforeClosingJournal() {
+		MultiplexedServerBridge bridge = null;
+		Path secretFile = null;
+		Path journalFile = null;
+		try {
+			secretFile = Files.createTempFile("arena-agents-rebind-secret-", ".txt");
+			Files.writeString(secretFile, "0123456789abcdef0123456789abcdef");
+			journalFile = Files.createTempFile("arena-agents-rebind-journal-", ".json");
+			Files.delete(journalFile);
+			CodexAgentManager manager = uninitializedManager();
+			AgentRecord created = manager.registry().create("gpt-5.6-sol", "high", Optional.of("Rebind"), 4_000L);
+			AgentRecord started = manager.registry().start(created.agentId(), "wait", 4_001L).after();
+			JsonObject arguments = new JsonObject();
+			arguments.addProperty("durationMs", 1000L);
+			ServerActionRequest request = new ServerActionRequest(
+					started.agentId(), started.goalRevision(), "wait-before-rebind", ActionType.WAIT, arguments,
+					new ActionProvenance("codex", "gpt-5.6-sol", "high", "priority", "rebind", 1L, "wait", 1L)
+			);
+			DurableActionJournal journal = DurableActionJournal.open(journalFile);
+			journal.accept(request, started.currentGoal().orElseThrow().goalId());
+			bridge = new MultiplexedServerBridge(manager, 0, secretFile, ServerSocket::new, System::nanoTime, journal);
+			ServerActionExecutor executor = (ServerActionExecutor) readPrivateField(bridge, "actionExecutor");
+			Class<?> actionClass = Class.forName(ServerActionExecutor.class.getName() + "$ActiveAction");
+			Method waitFor = actionClass.getDeclaredMethod("waitFor", ServerActionRequest.class, ServerPlayer.class, long.class);
+			waitFor.setAccessible(true);
+			((Map<AgentId, Object>) readPrivateField(executor, "active")).put(
+					started.agentId(), waitFor.invoke(null, request, null, 1000L));
+			((AgentSavedData) readPrivateField(manager, "savedData")).setRuntimeHooks(new AgentRuntimeHooks() {
+				@Override public void onTransition(AgentTransition transition) {
+					if (transition.cancelAction()) executor.cancel(transition.after().agentId(), "Bridge rebind");
+				}
+			});
+			((AtomicBoolean) readPrivateField(bridge, "activeDisconnectPending")).set(true);
+			bridge.closeAndDrainDisconnect();
+			try (DurableActionJournal reopened = DurableActionJournal.open(journalFile)) {
+				DurableActionJournal.Entry entry = reopened.snapshot().getFirst();
+				assertEquals(DurableActionJournal.Phase.TERMINAL, entry.phase(), "rebind persists cancellation before closing the journal");
+				assertEquals("ACTION_CANCELLED", entry.result().reasonCode(), "rebind retains the definite cancellation outcome");
+			}
+			assertTrue(((Map<?, ?>) readPrivateField(executor, "active")).isEmpty(), "rebind finishes the cancelled action");
+		} catch (ReflectiveOperationException | IOException exception) {
+			throw new AssertionError("rebind journal verification failed", exception);
+		} finally {
+			if (bridge != null) bridge.close();
+			deleteIfExists(secretFile);
+			deleteIfExists(journalFile);
+		}
 	}
 
 	private static void verifyAcceptedActionRecoversWithoutReplay() {

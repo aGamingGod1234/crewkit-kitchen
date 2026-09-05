@@ -80,9 +80,7 @@ final class DurableActionJournal implements AutoCloseable {
 		} else if (loaded.persistedBytes() >= 0L && Files.exists(normalized)) {
 			truncateTail(normalized, loaded.persistedBytes());
 		}
-		DurableActionJournal journal = new DurableActionJournal(normalized, maximumEntries, compactionEventLimit, loaded);
-		journal.openPersistentChannelIfPresent();
-		return journal;
+		return new DurableActionJournal(normalized, maximumEntries, compactionEventLimit, loaded);
 	}
 
 	static DurableActionJournal inMemory() {
@@ -325,21 +323,24 @@ final class DurableActionJournal implements AutoCloseable {
 		});
 	}
 
-	private void openPersistentChannelIfPresent() {
-		if (path == null || persistedBytes == 0L || !Files.exists(path)) return;
-		openPersistentChannel();
-	}
-
 	private void openPersistentChannel() {
 		if (path == null || persistentChannel != null) return;
 		try {
 			FileChannel opened = FileChannel.open(path, StandardOpenOption.WRITE);
-			if (opened.size() != persistedBytes) {
-				opened.close();
-				throw new IOException("action journal changed after it was read");
+			try {
+				if (opened.size() != persistedBytes) {
+					throw new IOException("action journal changed after it was read");
+				}
+				opened.position(persistedBytes);
+				persistentChannel = opened;
+			} catch (IOException | RuntimeException | Error failure) {
+				try {
+					opened.close();
+				} catch (IOException closeFailure) {
+					failure.addSuppressed(closeFailure);
+				}
+				throw failure;
 			}
-			opened.position(persistedBytes);
-			persistentChannel = opened;
 		} catch (IOException exception) {
 			throw ioFailure("Could not open action journal for durable appends", exception);
 		}

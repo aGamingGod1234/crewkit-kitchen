@@ -89,13 +89,15 @@ test('strictly normalizes matrix identity, budgets, loads, and unique trial IDs'
 });
 
 test('runs deterministic instant full-path trials at every declared load', async () => {
+	// This checks coordinator behavior; shared CI runners need scheduling headroom.
+	const trials = matrix().trials.map((trial) => ({ ...trial, turnBudgetMs: 1_000, trialBudgetMs: 10_000 }));
 	const result = await runLatencyMatrix({
-		matrix: matrix(),
+		matrix: matrix({ trials }),
 		scenarioResolver: () => fixtureScenario(),
 		providerFactories: { instant: () => instantProvider() },
 		artifactDirectory: null,
 	});
-	assert.equal(result.status, 'PASSED');
+	assert.equal(result.status, 'PASSED', JSON.stringify(result.trials.map(({ id, status, error }) => ({ id, status, error }))));
 	assert.deepEqual(result.trials.map((trial) => trial.agentLoad), [1, 4, 8, 16]);
 	assert.ok(result.trials.every((trial) => trial.status === 'PASSED'));
 	assert.ok(result.trials.every((trial) => trial.outcomeHash.startsWith('sha256:')));

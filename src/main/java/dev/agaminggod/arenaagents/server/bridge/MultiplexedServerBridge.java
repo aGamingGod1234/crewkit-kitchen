@@ -807,6 +807,14 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	@Override
 	public synchronized void close() {
+		try {
+			closeTransport();
+		} finally {
+			actionJournal.close();
+		}
+	}
+
+	private void closeTransport() {
 		List<Session> candidates;
 		synchronized (publicationLock) {
 			running.set(false);
@@ -825,13 +833,16 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			}
 		} catch (IOException ignored) {
 		}
-		actionJournal.close();
 	}
 
 	/** Rebinding runs on the server thread, so finish the old session's state transition before replacement. */
-	public void closeAndDrainDisconnect() {
-		close();
-		publishPendingDisconnects();
+	public synchronized void closeAndDrainDisconnect() {
+		try {
+			closeTransport();
+			publishPendingDisconnects();
+		} finally {
+			actionJournal.close();
+		}
 	}
 
 	private void acceptLoop() {

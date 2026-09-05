@@ -9,6 +9,7 @@ import dev.agaminggod.arenaagents.server.runtime.ServerActionRequest;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionResult;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionState;
 import java.io.IOException;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -34,12 +35,20 @@ public final class DurableActionJournalVerification {
 		accepted.accept(request, goalId);
 		accepted.close();
 		DurableActionJournal acceptedReload = DurableActionJournal.open(path);
+		if (persistentChannel(acceptedReload) != null) {
+			throw new AssertionError("Loading an existing journal must not acquire an append channel before its owner starts");
+		}
 		assertEntry(acceptedReload, DurableActionJournal.Phase.ACCEPTED, request, null);
 		expectFailure(() -> acceptedReload.accept(request, goalId), "ACTION_REPLAY");
 
 		ServerActionResult uncertain = recoveryResult(request);
 		acceptedReload.terminal(uncertain);
+		FileChannel appendChannel = persistentChannel(acceptedReload);
+		if (appendChannel == null || !appendChannel.isOpen()) {
+			throw new AssertionError("First mutation must acquire a persistent append channel");
+		}
 		acceptedReload.close();
+		if (appendChannel.isOpen()) throw new AssertionError("Closing the journal must release its append channel");
 		DurableActionJournal terminalReload = DurableActionJournal.open(path);
 		assertEntry(terminalReload, DurableActionJournal.Phase.TERMINAL, request, uncertain);
 		UUID replacementGoalId = UUID.randomUUID();
@@ -161,7 +170,17 @@ public final class DurableActionJournalVerification {
 		} catch (IOException exception) {
 			throw new AssertionError(exception);
 		}
-		return 23;
+		return 26;
+	}
+
+	private static FileChannel persistentChannel(DurableActionJournal journal) {
+		try {
+			var field = DurableActionJournal.class.getDeclaredField("persistentChannel");
+			field.setAccessible(true);
+			return (FileChannel) field.get(journal);
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("Could not inspect journal channel ownership", exception);
+		}
 	}
 
 	private static void assertEntry(

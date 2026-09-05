@@ -697,10 +697,10 @@ export class DynamicCoordinator extends EventEmitter {
 						connectionEpoch,
 						signature: observationSignature,
 					});
-					if (unchangedHeartbeat) {
-						if (this.#nativeRuntime.refreshObservation(record, { eventSequence: message.payload.eventSequence })) return;
-					}
 					const memory = this.#conversationMemory(record.agentId);
+					if (unchangedHeartbeat) {
+						if (this.#nativeRuntime.refreshObservation(record, observation, { eventSequence: message.payload.eventSequence, conversation: memory.history() })) return;
+					}
 					this.#nativeRuntime.updateObservation(record, observation, { eventSequence: message.payload.eventSequence, conversation: memory.history() });
 					this.#goalSupervisor.observed(supervisionKey);
 					this.#scheduleNativeTurn(record, {

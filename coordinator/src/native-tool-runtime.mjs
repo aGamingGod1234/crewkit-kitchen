@@ -51,7 +51,11 @@ export class NativeToolRuntime {
 		this.#resolveFrontier = resolveFrontier;
 	}
 
-	updateObservation(record, observation, { eventSequence = 0, conversation = undefined, force = false } = {}) {
+	updateObservation(record, observation, options = {}) {
+		return this.#storeObservation(record, observation, options);
+	}
+
+	#storeObservation(record, observation, { eventSequence = 0, conversation = undefined, force = false } = {}, reuseWorldFacts = false) {
 		validateRecord(record);
 		if (!Number.isSafeInteger(eventSequence) || eventSequence < 0) throw new TypeError('eventSequence must be a nonnegative safe integer');
 		if (force !== true && force !== false) throw new TypeError('force must be a boolean');
@@ -68,8 +72,10 @@ export class NativeToolRuntime {
 				goalRevision: record.goalRevision,
 			});
 		}
-		this.#recovery.remember(record.agentId, record.goalRevision, raw);
-		this.#occupancy.ingest(record.agentId, raw);
+		if (!reuseWorldFacts) {
+			this.#recovery.remember(record.agentId, record.goalRevision, raw);
+			this.#occupancy.ingest(record.agentId, raw);
+		}
 		this.#observations.set(record.agentId, {
 			goalRevision: record.goalRevision,
 			eventSequence: storedSequence,
@@ -82,23 +88,18 @@ export class NativeToolRuntime {
 	}
 
 	/**
-	 * Advances metadata for a known-identical heartbeat without re-ingesting world facts.
-	 * The caller must have already computed the factual and actionable signatures. This
-	 * intentionally leaves observation, last-live, recovery, and occupancy state intact.
+	 * Reuses durable facts when the actionable signature matches, but refreshes raw
+	 * observations because clocks, effect durations, and cooldowns are excluded from it.
 	 */
-	refreshObservation(record, { eventSequence = 0, conversation = undefined } = {}) {
+	refreshObservation(record, observation, { eventSequence = 0, conversation = undefined } = {}) {
 		validateRecord(record);
 		if (!Number.isSafeInteger(eventSequence) || eventSequence < 0) throw new TypeError('eventSequence must be a nonnegative safe integer');
 		const latest = this.#observations.get(record.agentId);
 		if (latest === undefined || latest.goalRevision !== record.goalRevision || eventSequence <= latest.eventSequence) return false;
-		this.#observations.set(record.agentId, {
-			...latest,
-			goal: record.currentGoal ?? null,
-			goalSpec: record.currentGoalSpec ?? null,
+		return this.#storeObservation(record, observation, {
 			eventSequence,
-			...(conversation === undefined ? {} : { conversation: structuredClone(conversation) }),
-		});
-		return true;
+			conversation: conversation ?? latest.conversation,
+		}, true);
 	}
 
 	snapshotLive(agentId) {
