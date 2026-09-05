@@ -437,9 +437,11 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		publishPendingVerboseControl();
 		publishCatalogDiscoveryRetry();
 		replayPendingTerminalResults();
-		List<AgentId> observationAgents = registeredObservationIds(manager.coordinatorVisibleRecords());
-		for (AgentId agentId : observations.changedActiveAgents()) {
-			if (!observationAgents.contains(agentId)) continue;
+		List<AgentRecord> visibleRecords = manager.coordinatorVisibleRecords();
+		List<AgentId> observationAgents = registeredObservationIds(visibleRecords);
+		Set<AgentId> observationAgentSet = Set.copyOf(observationAgents);
+		for (AgentId agentId : observations.changedActiveAgents(visibleRecords)) {
+			if (!observationAgentSet.contains(agentId)) continue;
 			observationPublication.markAttention(agentId);
 			queueUrgentObservation(agentId);
 		}

@@ -511,6 +511,10 @@ public final class ServerActionExecutorVerification {
 			Field activeField = ServerActionExecutor.class.getDeclaredField("active");
 			activeField.setAccessible(true);
 			((Map<AgentId, Object>) activeField.get(executor)).put(agent.agentId(), action);
+			assertEquals(request, executor.activeRequest(agent.agentId()),
+					"direct active-action lookup returns the exact request without materializing the active set");
+			assertTrue(executor.activeRequest(AgentId.random()) == null,
+					"direct active-action lookup is empty for an unrelated agent");
 			var resultMethod = actionClass.getDeclaredMethod(
 					"result", ServerActionState.class, String.class, String.class, long.class);
 			resultMethod.setAccessible(true);

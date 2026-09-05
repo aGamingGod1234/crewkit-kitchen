@@ -732,6 +732,9 @@ test('empty decorate payloads do not wipe live inventory memory', async () => {
 	const decorated = runtime.decorateObservation(current, {});
 	assert.ok(decorated.recovery.alreadyHave.includes('minecraft:diamond_pickaxe'));
 	assert.equal(decorated.inventory.items[0].itemId, 'minecraft:diamond_pickaxe');
+	decorated.inventory.items[0].count = 99;
+	assert.equal(runtime.snapshotLive(current.agentId).observation.inventory.items[0].count, 1,
+		'fallback decoration owns its nested facts when raw stores share a snapshot');
 });
 
 test('native sequence is cancelled if the lifecycle is disposed between steps', async () => {
