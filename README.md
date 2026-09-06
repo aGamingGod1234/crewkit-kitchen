@@ -196,7 +196,7 @@ move_to, navigate_to, look_at, attack, select_item, use_item, break_block, pick_
 
 `await player.control({...})` combines movement, looking, jumping, sneaking, sprinting, attacking, and item use in one complete input frame for 1 to 200 ticks. It also accepts the selected hotbar slot and hand. Codex's native `control` tool uses the same action. Different agents can act concurrently; physical commands for one body remain sequential, while speech can run independently.
 
-The virtual benchmark simulator supports a smaller action set and does not simulate `control` frames. Programs using them return `SIMULATOR_UNSUPPORTED_ACTION` there; that result measures a simulator limitation, not Minecraft or provider capability.
+The virtual benchmark simulator supports a smaller action set and does not simulate `control` frames. Scenario compilation rejects unsupported actions with `SIMULATOR_UNSUPPORTED_ACTION` before generating a program. Provider-authored programs using them still return that error during simulation. This error identifies a simulator limitation; production ArenaScript continues to support `player.control`.
 
 The current native-tool and ArenaScript APIs do not expose a wiki lookup. Their factual queries report observed world/player/inventory state; they do not fetch external game knowledge. External wiki access would require a separately bounded, source-attributed knowledge integration within the provider execution boundary.
 

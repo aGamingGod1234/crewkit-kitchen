@@ -93,7 +93,7 @@ public final class SkitDirectorScreen extends Screen {
 		for (int index = 0; index < Tab.values().length; index++) {
 			Tab value = Tab.values()[index];
 			int x = left + index * (tabWidth + GAP);
-			addRenderableWidget(button(value.label, x, top + 42,
+			addRenderableWidget(button(value.label, x, top + (compact() ? 14 : 42),
 					index == 3 ? left + width - x : tabWidth, ROW, value == tab,
 					() -> { tab = value; scrollRows = 0; rebuildWidgets(); }));
 		}
@@ -105,7 +105,7 @@ public final class SkitDirectorScreen extends Screen {
 			case CAMERA -> initCamera();
 		}
 		buildingContent = false;
-		addRenderableWidget(button("Back to console", left, panelTop() + panelHeight() - 30, 140, ROW, false, this::onClose));
+		addRenderableWidget(button("Back to console", left, panelTop() + panelHeight() - (compact() ? ROW : 30), 140, ROW, false, this::onClose));
 	}
 
 	private void clearFields() {
@@ -322,7 +322,8 @@ public final class SkitDirectorScreen extends Screen {
 	@Override
 	public boolean mouseScrolled(double mouseX, double mouseY, double horizontal, double vertical) {
 		if (mouseX >= panelLeft() && mouseX <= panelLeft() + panelWidth()
-				&& mouseY >= panelTop() + 72 && mouseY < panelTop() + panelHeight() - 38 && vertical != 0) {
+				&& mouseY >= panelTop() + contentOffset(panelHeight()) - GAP
+				&& mouseY < contentBottom() + 4 && vertical != 0) {
 			int next = Math.clamp(scrollRows + (vertical > 0 ? -1 : 1), 0, maxScrollRows());
 			if (next != scrollRows) {
 				scrollRows = next;
@@ -342,13 +343,15 @@ public final class SkitDirectorScreen extends Screen {
 		graphics.fill(0, 0, width, height, BACKDROP);
 		graphics.fill(left - 1, top - 1, right + 1, bottom + 1, PANEL_EDGE);
 		graphics.fill(left, top, right, bottom, PANEL);
-		graphics.text(font, "Skit Director", left + 16, top + 12, TEXT, false);
-		graphics.text(font, font.plainSubstrByWidth("Place actors, compose motion, direct voices, and record camera takes", panelWidth() - 32), left + 16, top + 25, MUTED, false);
-		graphics.text(font, font.plainSubstrByWidth(tab.help, panelWidth() - 32), left + 16, top + 63, ACCENT, false);
+		graphics.text(font, "Skit Director", left + 16, top + (compact() ? 2 : 12), TEXT, false);
+		if (!compact()) {
+			graphics.text(font, font.plainSubstrByWidth("Place actors, compose motion, direct voices, and record camera takes", panelWidth() - 32), left + 16, top + 25, MUTED, false);
+			graphics.text(font, font.plainSubstrByWidth(tab.help, panelWidth() - 32), left + 16, top + 63, ACCENT, false);
+		}
 		if (!feedback.isBlank()) graphics.text(font, font.plainSubstrByWidth(feedback, panelWidth() - 164), left + 152, bottom - 22, feedbackError ? ERROR : SUCCESS, false);
 		if (maxScrollRows() > 0) {
-			int trackTop = top + 78;
-			int trackHeight = panelHeight() - 120;
+			int trackTop = top + contentOffset(panelHeight());
+			int trackHeight = Math.max(12, contentBottom() - trackTop);
 			int thumb = Math.max(12, trackHeight / (maxScrollRows() + 1));
 			int thumbY = trackTop + (trackHeight - thumb) * scrollRows / maxScrollRows();
 			graphics.fill(right - 8, trackTop, right - 6, trackTop + trackHeight, PANEL_EDGE);
@@ -367,14 +370,18 @@ public final class SkitDirectorScreen extends Screen {
 	private int panelHeight() { return Math.min(390, Math.max(0, height - 20)); }
 	private int panelLeft() { return (width - panelWidth()) / 2; }
 	private int panelTop() { return (height - panelHeight()) / 2; }
-	private int contentTop() { return panelTop() + 78 - scrollRows * (ROW + GAP); }
+	private boolean compact() { return panelHeight() < 180; }
+	private static int contentOffset(int panelHeight) { return panelHeight < 180 ? 44 : 78; }
+	private static int contentBottomInset(int panelHeight) { return panelHeight < 180 ? 30 : 42; }
+	private int contentBottom() { return panelTop() + panelHeight() - contentBottomInset(panelHeight()); }
+	private int contentTop() { return panelTop() + contentOffset(panelHeight()) - scrollRows * (ROW + GAP); }
 	private int maxScrollRows() { return maxScrollRows(panelHeight(), tab.rows); }
 	private static int maxScrollRows(int panelHeight, int rows) {
-		int visibleRows = Math.max(1, (panelHeight - 120 + GAP) / (ROW + GAP));
+		int visibleRows = Math.max(1, (panelHeight - contentOffset(panelHeight) - contentBottomInset(panelHeight) + GAP) / (ROW + GAP));
 		return Math.max(0, rows - visibleRows);
 	}
 	private boolean contentVisible(int y, int height) {
-		return y >= panelTop() + 78 && y + height <= panelTop() + panelHeight() - 42;
+		return y >= panelTop() + contentOffset(panelHeight()) && y + height <= contentBottom();
 	}
 	private int[] columns() {
 		int left = panelLeft() + 16;

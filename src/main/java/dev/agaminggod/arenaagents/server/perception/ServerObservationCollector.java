@@ -745,13 +745,17 @@ public final class ServerObservationCollector {
 			Vec3 direction,
 			Predicate<BlockPos> loaded
 	) {
+		return loadedSightEndpoint(origin, direction, LANDMARK_SIGHT_DISTANCE, loaded);
+	}
+
+	static Vec3 loadedSightEndpoint(Vec3 origin, Vec3 direction, double maximumDistance, Predicate<BlockPos> loaded) {
 		BlockPos start = BlockPos.containing(origin);
 		if (!loaded.test(start)) return null;
 		int chunkX = start.getX() >> 4;
 		int chunkZ = start.getZ() >> 4;
 		// Vanilla clipping extends its start backwards by 1e-7 of the ray length.
 		// Check that tiny segment too, including either side of a chunk corner.
-		BlockPos clipStart = BlockPos.containing(origin.subtract(direction.scale(LANDMARK_SIGHT_DISTANCE * 1.0E-7D)));
+		BlockPos clipStart = BlockPos.containing(origin.subtract(direction.scale(maximumDistance * 1.0E-7D)));
 		for (int x = Math.min(chunkX, clipStart.getX() >> 4); x <= Math.max(chunkX, clipStart.getX() >> 4); x++) {
 			for (int z = Math.min(chunkZ, clipStart.getZ() >> 4); z <= Math.max(chunkZ, clipStart.getZ() >> 4); z++) {
 				if ((x != chunkX || z != chunkZ) && !loaded.test(new BlockPos(x << 4, start.getY(), z << 4))) return null;
@@ -767,7 +771,10 @@ public final class ServerObservationCollector {
 				: ((chunkZ + (stepZ > 0 ? 1 : 0)) * 16.0D - origin.z) / direction.z;
 		while (true) {
 			double boundary = Math.min(nextX, nextZ);
-			if (boundary > LANDMARK_SIGHT_DISTANCE) return origin.add(direction.scale(LANDMARK_SIGHT_DISTANCE));
+			// The far endpoint is expanded by vanilla clipping as well.
+			if (boundary > maximumDistance * (1.0D + 1.0E-7D)) {
+				return origin.add(direction.scale(maximumDistance));
+			}
 			// Block clipping visits a side cell when two chunk boundaries coincide.
 			if (nextX == nextZ && (!loaded.test(new BlockPos((chunkX + stepX) << 4, start.getY(), chunkZ << 4))
 					|| !loaded.test(new BlockPos(chunkX << 4, start.getY(), (chunkZ + stepZ) << 4)))) {

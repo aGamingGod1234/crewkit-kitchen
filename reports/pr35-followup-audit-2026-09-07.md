@@ -34,13 +34,13 @@ Some of these gaps predate the PR but sit directly in the behavior this improvem
 
 ## Remaining limits
 
-The virtual simulator rejects `control` with `SIMULATOR_UNSUPPORTED_ACTION` even though the benchmark compiler accepts it. README now states this explicitly. Implementing Minecraft control physics in the virtual simulator is separate work; these failures cannot be interpreted as provider capability failures.
+The virtual simulator does not implement combined `control` physics. Scenario compilation now rejects unsupported simulator commands before a benchmark starts. Production ArenaScript still supports them. Provider-authored control frames sent directly to the simulator remain unsupported, so such failures cannot be interpreted as provider capability failures.
 
 No live Minecraft rendering, authenticated provider sessions, real speech playback, or FPS/TPS measurement was performed. Skit lifecycle paths were traced through production callers, but current skit tests use fake performers rather than actual Carpet player death/replacement. Camera tests use headless Minecraft fixtures. These checks do not establish universal vanilla or modded parity.
 
-Malformed manually edited skit persistence can still throw from constructors, and shared mining validation accepts cave-air/void-air identifiers that Java later rejects. Neither produced a new valid-user-flow regression, so speculative changes were omitted.
+Malformed manually edited skit persistence can still throw from constructors. No valid user flow producing this corruption was established, so speculative persistence changes were omitted.
 
-## Verification
+## First batch verification
 
 | Check | Final result |
 | --- | --- |
@@ -53,4 +53,21 @@ Malformed manually edited skit persistence can still throw from constructors, an
 
 The first Gradle attempt used an older configured JDK and failed before compilation; setting JAVA_HOME to the installed Java 25 toolchain resolved it. Final local evidence is in `audit-gradle-final.log` and `audit-coordinator-final.log`; generated logs are excluded from version control. The installer touched only its generated temporary profile.
 
-All GitHub checks on the original PR head passed. CodeRabbit completed with a walkthrough and no actionable inline findings; Copilot could not review because its quota was exhausted. Codex review still reported running at the final check, with no inline findings available. No bot comments were treated as verified defects without evidence. Follow-up changes require pushing and fresh CI before they can be considered checked on GitHub.
+All GitHub checks on the original PR head passed. CodeRabbit completed with a walkthrough and no actionable inline findings; Copilot could not review because its quota was exhausted. Codex subsequently reported three findings: invisible blocks, stale Director catalog controls, and unsupported simulator commands. The first batch fixed the first two; the next batch fixes the compiler boundary. The first pushed batch exposed a Windows replay fixture timing race, described below.
+
+## Second iteration
+
+After permission to push and continue, the reviewers revisited the affected production paths and the new CI results. Additional verified fixes:
+
+- **Failed physical application.** A sink can start movement or attack before throwing. Failed application previously left an empty logical lease, and release/expiry then skipped physical cleanup. The controller now retains uncertain physical state until it can clear it and restore the correct owner. Tests cover first application, expiration, preemption, and failed restoration.
+- **Ray endpoint and center recheck.** Vanilla expands both clipping endpoints. The far expansion could enter an unloaded chunk just beyond range, and a final center-directed ray could cross a different unloaded corner than its original sampling ray. Shared chunk checks now cover each actual segment, with vanilla traversal regressions in positive, negative, and diagonal directions.
+- **Unavailable observation recovery.** A PLAYER_UNAVAILABLE snapshot could overwrite the last live inventory with synthetic empty data. It now remains visible as unavailable while preserving real inventory evidence for a later death observation.
+- **Async diagnostics.** Rejected trace promises are contained alongside synchronous trace failures. The regression waits across event-loop turns so an escaping rejection fails the test.
+- **Simulator admission and respawn.** Compilation uses the simulator's shared action capabilities and fails unsupported manifests early. A check of every shipped command-bearing scenario also exposed incorrect `player.respawn({})` generation; the compiler now emits the required zero-argument call.
+- **Camera clock corrections.** Capturing after a backwards server clock update could introduce duplicate keyframe ticks and make a take unsaveable. GUI and command capture reject backwards samples while preserving the take.
+- **Camera eye height.** Actual Minecraft Camera alignment showed a recorded Y of 64 rendering at 65.62 because the camera retained the player's interpolated eye height. A narrowly scoped accessor resets both cached heights on playback start and restoration. Headless tests exercise the real alignment method at partial ticks.
+- **Short Director windows.** A 120-pixel logical viewport, reachable with forced Unicode scaling, hid all content controls. Compact header/footer spacing leaves a scrollable content row. A new verification suite exercises real widgets on all four tabs, hit testing, draft retention, and catalog alias removal without opening a window.
+- **All vanilla air variants.** Shared mining validation now rejects cave air and void air before dispatch, with all native entrypoints checked.
+- **Deterministic hazard replay fixture.** Windows CI reproduced a turn-2 prompt mismatch because independent provider timers allowed different lava damage during capture and replay. The fixture now gates its world clock until all four initial actions are accepted. A deliberately late third provider callback reproduces the original failure without this gate; exact prompt hashing remains unchanged.
+
+Second-iteration local verification passed: Gradle `check build verifyCore`, 14,716 protocol/core assertions, 385 voice assertions, and the full coordinator suite with 1,428 total tests, 1,425 passed, three platform skips, and no failures or cancellations. Logs: `audit-iteration2-gradle.log`, `audit-iteration2-coordinator.log`. An independent reviewer inspected the combined follow-up patch and found no further confirmed regression. Fresh GitHub CI remains necessary for each pushed head.

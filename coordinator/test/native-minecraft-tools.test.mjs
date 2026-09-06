@@ -182,13 +182,15 @@ test('advanced actions cannot override their discriminator through nested argume
 });
 
 test('all native mining paths reject air before dispatch', () => {
-	const args = { x: 2, y: 63, z: 4, expectedBlockId: 'minecraft:air', timeoutMs: 15_000 };
-	const action = { actionType: 'break_block', arguments: args };
-	assert.throws(() => normalizeMinecraftToolCall('mine', args), { code: 'INVALID_MINECRAFT_TOOL_ARGUMENTS' });
-	assert.throws(() => normalizeMinecraftToolCall('act', action), { code: 'INVALID_MINECRAFT_TOOL_ARGUMENTS' });
-	assert.throws(() => normalizeMinecraftToolCall('sequence', {
-		actions: [{ actionType: 'wait', arguments: { durationMs: 1 } }, action],
-	}), { code: 'INVALID_MINECRAFT_TOOL_ARGUMENTS' });
+	for (const expectedBlockId of ['minecraft:air', 'minecraft:cave_air', 'minecraft:void_air']) {
+		const args = { x: 2, y: 63, z: 4, expectedBlockId, timeoutMs: 15_000 };
+		const action = { actionType: 'break_block', arguments: args };
+		assert.throws(() => normalizeMinecraftToolCall('mine', args), { code: 'INVALID_MINECRAFT_TOOL_ARGUMENTS' });
+		assert.throws(() => normalizeMinecraftToolCall('act', action), { code: 'INVALID_MINECRAFT_TOOL_ARGUMENTS' });
+		assert.throws(() => normalizeMinecraftToolCall('sequence', {
+			actions: [{ actionType: 'wait', arguments: { durationMs: 1 } }, action],
+		}), { code: 'INVALID_MINECRAFT_TOOL_ARGUMENTS' });
+	}
 });
 
 test('tool results are compact deterministic inputText content', () => {

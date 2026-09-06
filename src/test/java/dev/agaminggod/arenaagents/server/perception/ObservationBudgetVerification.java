@@ -331,7 +331,57 @@ public final class ObservationBudgetVerification {
 			return null;
 		}, ignored -> Boolean.FALSE);
 		assertTrue(visits.get() > 256, "loaded boundary rays retain vanilla traversal through the expanded endpoints");
-		return 14;
+		int assertions = 14;
+		for (int sign : new int[] {-1, 1}) {
+			Vec3 axis = new Vec3(sign, 0.0D, 0.0D);
+			Vec3 diagonal = new Vec3(sign, 0.0D, sign).normalize();
+			assertions += verifyExpandedSightEndpoint(new Vec3(-sign * 1.0E-5D, 64.0D, 0.5D), axis,
+					position -> sign > 0 ? position.getX() < 256 : position.getX() >= -256);
+			Vec3 diagonalEndpoint = new Vec3(sign * (192.0D - 1.0E-5D), 64.0D, sign * (192.0D - 1.0E-5D));
+			assertions += verifyExpandedSightEndpoint(diagonalEndpoint.subtract(diagonal.scale(256.0D)), diagonal,
+					position -> sign > 0 ? position.getX() < 192 && position.getZ() < 192
+							: position.getX() >= -192 && position.getZ() >= -192);
+		}
+		return assertions + verifyLoadedCenterTrace();
+	}
+
+	private static int verifyLoadedCenterTrace() {
+		Vec3 origin = new Vec3(0.5D, 64.5D, 0.5D);
+		Vec3 direction = new Vec3(1.01D, 0.0D, 1.0D).normalize();
+		BlockPos target = new BlockPos(16, 64, 16);
+		java.util.function.Predicate<BlockPos> loaded = position -> (position.getX() >> 4) != 0 || (position.getZ() >> 4) != 1;
+		Vec3 endpoint = ServerObservationCollector.loadedSightEndpoint(origin, direction, loaded);
+		BlockPos sampled = BlockGetter.traverseBlocks(origin, endpoint, Boolean.TRUE, (ignored, position) -> {
+			if (!loaded.test(position)) throw new AssertionError("the guarded sample must stay loaded");
+			return position.equals(target) ? position.immutable() : null;
+		}, ignored -> null);
+		assertEquals(target, sampled, "the fan can safely sample a block through the loaded side of a corner");
+		assertTrue(BlockGetter.traverseBlocks(origin, Vec3.atCenterOf(target), Boolean.TRUE,
+				(ignored, position) -> !loaded.test(position) ? Boolean.TRUE : null, ignored -> Boolean.FALSE),
+				"rechecking the sampled block center takes a different path through the unloaded side");
+		assertFalse(ObservationVisibility.hasLoadedSightPath(origin, Vec3.atCenterOf(target), loaded),
+				"final visibility rejects the unloaded center path before clipping");
+		AtomicInteger checks = new AtomicInteger();
+		assertTrue(ObservationVisibility.hasLoadedSightPath(origin, new Vec3(3.5D, 64.5D, 0.5D), position -> {
+			checks.incrementAndGet();
+			return position.getX() < 16;
+		}), "nearby visibility ignores unloaded chunks beyond its actual target");
+		assertEquals(1, checks.get(), "a short center trace checks only its own chunk");
+		return 5;
+	}
+
+	private static int verifyExpandedSightEndpoint(Vec3 origin, Vec3 direction,
+			java.util.function.Predicate<BlockPos> loaded) {
+		Vec3 nominalEndpoint = origin.add(direction.scale(ServerObservationCollector.LANDMARK_SIGHT_DISTANCE));
+		assertTrue(BlockGetter.traverseBlocks(origin, nominalEndpoint, Boolean.TRUE,
+				(ignored, position) -> !loaded.test(position) ? Boolean.TRUE : null, ignored -> Boolean.FALSE),
+				"vanilla's expanded endpoint crosses the nominally out-of-range unloaded boundary");
+		Vec3 endpoint = ServerObservationCollector.loadedSightEndpoint(origin, direction, loaded);
+		assertTrue(endpoint != null, "loaded ray still has a usable endpoint before the far boundary");
+		assertFalse(BlockGetter.traverseBlocks(origin, endpoint, Boolean.TRUE,
+				(ignored, position) -> !loaded.test(position) ? Boolean.TRUE : null, ignored -> Boolean.FALSE),
+				"the guarded ray never traverses the unloaded chunk beyond its expanded endpoint");
+		return 3;
 	}
 
 	private static int verifyLandmarkContext() {

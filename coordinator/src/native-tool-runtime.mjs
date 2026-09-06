@@ -47,7 +47,7 @@ export class NativeToolRuntime {
 		this.#registry = registry;
 		this.#onFinish = onFinish;
 		this.#trace = (event, fields) => {
-			try { trace(event, fields); } catch { /* diagnostics cannot interrupt gameplay */ }
+			try { Promise.resolve(trace(event, fields)).catch(() => {}); } catch { /* diagnostics cannot interrupt gameplay */ }
 		};
 		this.#decorateObservation = decorateObservation;
 		this.#resolveFrontier = resolveFrontier;
@@ -71,7 +71,7 @@ export class NativeToolRuntime {
 		// methods still clone at their boundaries, so sharing here does not expose
 		// mutable coordinator state while avoiding a duplicate deep copy per update.
 		const storedObservation = structuredClone(raw);
-		if (hasDurableObservationFacts(raw) && raw.death == null && raw.status !== 'PLAYER_DEAD' && raw.player?.dead !== true) {
+		if (hasDurableObservationFacts(raw) && raw.ready !== false && raw.death == null && raw.status !== 'PLAYER_DEAD' && raw.player?.dead !== true) {
 			this.#lastLive.set(record.agentId, {
 				observation: storedObservation,
 				eventSequence: storedSequence,

@@ -20,6 +20,8 @@ public final class InputStateVerification {
 		assertions += verifyOwnedReleasePreservesSystemLease();
 		assertions += verifyClearReleasesEveryPressedInput();
 		assertions += verifyFailedApplyRemainsRetryable();
+		assertions += verifyPartialApplyCleanup();
+		assertions += verifyPartialTransitionsRestoreLeaseOwner();
 		assertions += verifyFailedReleaseRemainsRetryable();
 		assertions += verifyFailedPreemptingReleaseRemainsRetryable();
 		assertions += verifyLeaseDeadman();
@@ -200,6 +202,75 @@ public final class InputStateVerification {
 		controller.release(safety);
 		assertEquals(List.of(AGENT), sink.cleared, "system input clears only when its own lease releases");
 		return 3;
+	}
+
+	private static int verifyPartialApplyCleanup() {
+		for (boolean expire : new boolean[] {false, true}) {
+			PartialSink sink = new PartialSink();
+			LeasedServerInputController controller = new LeasedServerInputController(sink);
+			InputLease lease = controller.acquire(AGENT, InputOwner.INTERACTION, 300);
+			if (expire) {
+				for (long tick = 1; tick < LeasedServerInputController.LEASE_TIMEOUT_TICKS; tick++) controller.tick();
+			}
+			sink.failApply = true;
+			assertThrows(() -> controller.apply(lease, state(1.0F, true, true)), "partial apply reports failure");
+			assertTrue(sink.physical != null, "the failing sink already changed physical inputs");
+			assertTrue(controller.currentState(AGENT).isEmpty(), "partial application does not become logical input");
+			if (expire) controller.tick();
+			else controller.release(lease);
+			assertTrue(sink.physical == null, "release and expiry clear partial physical inputs");
+			assertEquals(1, sink.clears, "partial first application retains one physical cleanup obligation");
+		}
+		return 10;
+	}
+
+	private static int verifyPartialTransitionsRestoreLeaseOwner() {
+		PartialSink sink = new PartialSink();
+		LeasedServerInputController controller = new LeasedServerInputController(sink);
+		InputLease navigation = controller.acquire(AGENT, InputOwner.NAVIGATION, 100);
+		AgentInputState walking = state(1.0F, false, false);
+		AgentInputState attacking = state(0.0F, true, true);
+		controller.apply(navigation, walking);
+		InputLease failedCombat = controller.acquire(AGENT, InputOwner.COMBAT, 200);
+		sink.failApply = true;
+		assertThrows(() -> controller.apply(failedCombat, attacking), "partial preemption reports failure");
+		assertEquals(walking, controller.currentState(AGENT).orElseThrow(), "failed preemption preserves the logical winner");
+		controller.release(failedCombat);
+		assertEquals(walking, sink.physical, "releasing failed preemption restores the lower-priority physical input");
+		InputLease combat = controller.acquire(AGENT, InputOwner.COMBAT, 200);
+		controller.apply(combat, attacking);
+		InputLease activeCombat = combat;
+		sink.failApply = true;
+		assertThrows(() -> controller.release(activeCombat), "partial restoration reports failure");
+		assertEquals(attacking, controller.currentState(AGENT).orElseThrow(), "failed release preserves the owning lease");
+		controller.tick();
+		assertEquals(attacking, sink.physical, "the next tick restores the authoritative owner after partial restoration");
+		controller.release(combat);
+		assertEquals(walking, sink.physical, "the retained lower-priority lease restores after successful release");
+		controller.release(navigation);
+		assertTrue(sink.physical == null, "final release clears restored inputs");
+		return 8;
+	}
+
+	private static final class PartialSink implements InputStateSink {
+		private AgentInputState physical;
+		private boolean failApply;
+		private int clears;
+
+		@Override
+		public void apply(AgentId agentId, AgentInputState previous, AgentInputState state) {
+			physical = state;
+			if (failApply) {
+				failApply = false;
+				throw new IllegalStateException("apply failed after physical mutation");
+			}
+		}
+
+		@Override
+		public void clear(AgentId agentId, AgentInputState previous) {
+			physical = null;
+			clears++;
+		}
 	}
 
 	private static int verifyFailedApplyRemainsRetryable() {

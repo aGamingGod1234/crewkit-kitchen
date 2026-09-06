@@ -4,6 +4,7 @@ import test from 'node:test';
 import { goalSpecFingerprint } from '../src/goal-spec.mjs';
 import { nativeObservationSignature } from '../src/dynamic-main.mjs';
 import { constrainGoalBoundNavigation, NativeToolRuntime } from '../src/native-tool-runtime.mjs';
+import { adaptObservation } from '../src/observation-adapter.mjs';
 
 function record(overrides = {}) {
 	const fields = {
@@ -80,6 +81,32 @@ test('native telemetry exceptions cannot interrupt body dispatch or completion',
 	assert.equal(runtime.onActionProgress(record(), { actionId: sent[0][2].actionId, progress: 0.5 }), true);
 	assert.equal(runtime.onActionResult(record(), { actionId: sent[0][2].actionId, state: 'SUCCEEDED', reasonCode: 'DONE' }), true);
 	assert.equal((await pending).state, 'SUCCEEDED');
+});
+
+test('rejected asynchronous native telemetry never escapes as an unhandled rejection', async () => {
+	const sent = [];
+	const traces = [];
+	const runtime = new NativeToolRuntime({
+		registry: testRegistry, bridge: { send: async (...args) => sent.push(args) },
+		trace: async (event) => {
+			traces.push(event);
+			throw new Error('telemetry storage unavailable');
+		},
+	});
+	const pending = runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-async-telemetry', callId: 'call-async-telemetry',
+		tool: { kind: 'action', actionType: 'wait', arguments: { durationMs: 1 } },
+	}, record());
+	await new Promise((resolve) => setImmediate(resolve));
+	const actionId = sent[0][2].actionId;
+	assert.equal(runtime.onActionProgress(record(), { actionId, progress: 0.5 }), true);
+	assert.equal(runtime.onActionResult(record(), { actionId, state: 'SUCCEEDED', reasonCode: 'DONE' }), true);
+	assert.equal((await pending).state, 'SUCCEEDED');
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(traces, [
+		'native_tool_dispatch_started', 'native_tool_command_sent',
+		'native_tool_action_progress', 'native_tool_action_completed',
+	]);
 });
 
 test('native action is rejected before bridge enqueue when the registry has advanced', async () => {
@@ -737,6 +764,38 @@ test('action results omit recovery until a fresh observation arrives', async () 
 	});
 	const result = await pending;
 	assert.equal(result.recovery, undefined);
+});
+
+test('unavailable observations preserve live inventory for death recovery and resume live updates when ready', async () => {
+	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async () => {} } });
+	const current = record();
+	const live = {
+		ready: true,
+		player: { x: 8, y: 64, z: 2, health: 18, dead: false },
+		inventory: { items: [{ itemId: 'minecraft:iron_pickaxe', count: 1 }] },
+		world: { dimension: 'minecraft:overworld' },
+	};
+	runtime.updateObservation(current, live, { eventSequence: 1 });
+	const unavailable = adaptObservation({ ready: false, status: 'PLAYER_UNAVAILABLE' });
+	runtime.updateObservation(current, unavailable, { eventSequence: 2 });
+	runtime.refreshObservation(current, unavailable, { eventSequence: 3 });
+	const observed = await runtime.execute({
+		agentId: current.agentId, goalRevision: current.goalRevision,
+		turnId: 'turn-unavailable', callId: 'observe-unavailable', tool: { kind: 'observe' },
+	}, current);
+	assert.equal(observed.observation.ready, false);
+	assert.equal(observed.observation.status, 'PLAYER_UNAVAILABLE');
+	assert.equal(observed.eventSequence, 3);
+	assert.deepEqual(runtime.snapshotLive(current.agentId).observation, live);
+	const death = { cause: 'lava', x: 8, y: 64, z: 2, dimensionId: 'minecraft:overworld' };
+	runtime.updateObservation(current, { death }, { eventSequence: 3, force: true });
+	const dead = runtime.decorateObservation(current, { death });
+	assert.deepEqual(dead.recovery.lastLostInventory, live.inventory.items);
+	assert.equal(dead.recovery.alreadyHave.includes('minecraft:iron_pickaxe'), false);
+	const resumed = { ...live, inventory: { items: [{ itemId: 'minecraft:oak_log', count: 4 }] } };
+	runtime.updateObservation(current, resumed, { eventSequence: 4 });
+	assert.deepEqual(runtime.snapshotLive(current.agentId).observation, resumed);
+	assert.equal(runtime.decorateObservation(current, {}).recovery.alreadyHave.includes('minecraft:oak_log'), true);
 });
 
 test('death force-updates the observation cache and keeps last live inventory as lost, not held', async () => {

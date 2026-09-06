@@ -106,8 +106,17 @@ public final class ObservationVisibility {
 		}
 
 		private boolean traceBlock(BlockPos position) {
+			if (!hasLoadedSightPath(eye, Vec3.atCenterOf(position), level::hasChunkAt)) return false;
 			return ObservationVisibility.traceBlock(level, CollisionContext.of(observer), eye, position);
 		}
+	}
+
+	static boolean hasLoadedSightPath(Vec3 origin, Vec3 target, Predicate<BlockPos> loaded) {
+		Vec3 delta = target.subtract(origin);
+		double distance = delta.length();
+		Vec3 direction = delta.normalize();
+		Vec3 endpoint = ServerObservationCollector.loadedSightEndpoint(origin, direction, distance, loaded);
+		return origin.add(direction.scale(distance)).equals(endpoint);
 	}
 
 	static boolean traceBlock(BlockGetter level, CollisionContext context, Vec3 eye, BlockPos position) {

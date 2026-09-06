@@ -10,6 +10,7 @@ import com.google.gson.JsonParseException;
 import com.google.gson.JsonIOException;
 import com.mojang.brigadier.arguments.BoolArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
+import dev.agaminggod.arenaagents.client.mixin.CameraEyeHeightAccessor;
 import java.io.IOException;
 import java.io.Reader;
 import java.io.Writer;
@@ -89,6 +90,7 @@ public final class CameraDirectorClient {
 		}
 		long elapsed = Math.max(0L, client.level.getGameTime() - recording.startedAt());
 		if (elapsed > CameraPath.MAX_DURATION_TICKS) { guiFeedback("This camera path has reached its one-hour limit.", true); return; }
+		if (elapsed < recording.frames().getLast().tick()) { guiFeedback("The world clock moved backwards. Wait before capturing another keyframe.", true); return; }
 		CameraKeyframe frame = new CameraKeyframe((int) elapsed, client.player.getX(), client.player.getEyeY(), client.player.getZ(), client.player.getYRot(), client.player.getXRot());
 		if (recording.frames().size() >= CameraPath.MAX_KEYFRAMES && recording.frames().stream().noneMatch(existing -> existing.tick() == frame.tick())) {
 			guiFeedback("This camera path has reached its keyframe limit.", true);
@@ -186,6 +188,7 @@ public final class CameraDirectorClient {
 		}
 		long elapsed = Math.max(0L, client.level.getGameTime() - recording.startedAt());
 		if (elapsed > CameraPath.MAX_DURATION_TICKS) return error(source, "This camera path has reached its one-hour limit.");
+		if (elapsed < recording.frames().getLast().tick()) return error(source, "The world clock moved backwards. Wait before capturing another keyframe.");
 		CameraKeyframe frame = new CameraKeyframe((int) elapsed, client.player.getX(), client.player.getEyeY(), client.player.getZ(), client.player.getYRot(), client.player.getXRot());
 		if (recording.frames().size() >= CameraPath.MAX_KEYFRAMES && recording.frames().stream().noneMatch(existing -> existing.tick() == frame.tick())) {
 			return error(source, "This camera path has reached its keyframe limit (" + CameraPath.MAX_KEYFRAMES + ").");
@@ -335,8 +338,16 @@ public final class CameraDirectorClient {
 		if (created) {
 			cameraAnchor.setOldPosAndRot();
 			client.level.addFreshEntity(cameraAnchor);
-			client.setCameraEntity(cameraAnchor);
+			setCamera(client, cameraAnchor);
 		}
+	}
+
+	private static void setCamera(Minecraft client, Entity entity) {
+		client.setCameraEntity(entity);
+		CameraEyeHeightAccessor camera = (CameraEyeHeightAccessor) client.gameRenderer.getMainCamera();
+		float height = entity == null ? 0.0F : entity.getEyeHeight();
+		camera.arenaagents$setEyeHeight(height);
+		camera.arenaagents$setEyeHeightOld(height);
 	}
 
 	private static void stopPlayback(Minecraft client) {
@@ -351,7 +362,7 @@ public final class CameraDirectorClient {
 		if (restore == null || restore.isRemoved() || restore.level() != client.level
 				|| (restore instanceof LocalPlayer && restore != client.player)) restore = client.player;
 		if (client.level == null || (restore != null && (restore.isRemoved() || restore.level() != client.level))) restore = null;
-		client.setCameraEntity(restore);
+		setCamera(client, restore);
 		if (previousCameraType != null) {
 			client.options.setCameraType(previousCameraType);
 			previousCameraType = null;

@@ -1,6 +1,7 @@
 package dev.agaminggod.arenaagents.client.camera;
 
 import com.google.gson.JsonObject;
+import dev.agaminggod.arenaagents.client.mixin.CameraEyeHeightAccessor;
 import java.io.IOException;
 import java.io.Writer;
 import java.lang.reflect.Field;
@@ -14,12 +15,14 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
+import net.minecraft.client.Camera;
 import net.minecraft.client.CameraType;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.Options;
 import net.minecraft.client.gui.Gui;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.client.renderer.GameRenderer;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
@@ -52,8 +55,8 @@ public final class CameraPathVerification {
 		try {
 			return 6 + verifyDelayedStart() + verifyUnboundedYaw() + verifyReplacement()
 					+ verifyRestart() + verifySaveFailure() + verifyDeleteAndClearFailure()
-					+ verifyMalformedStorage() + verifyRecordingLevelChange()
-					+ verifyPlaybackLevelChange() + verifyPlaybackRespawn() + verifyWriterFailure() + verifyAnchorAndPerspective();
+					+ verifyMalformedStorage() + verifyRecordingLevelChange() + verifyRecordingClockCorrection()
+					+ verifyPlaybackLevelChange() + verifyPlaybackRespawn() + verifyWriterFailure() + verifyAnchorAndPerspective() + verifyRenderedEyeHeight();
 		} catch (Exception exception) {
 			throw new AssertionError("camera verification failed", exception);
 		}
@@ -190,6 +193,31 @@ public final class CameraPathVerification {
 		return 4;
 	}
 
+	private static int verifyRecordingClockCorrection() throws Exception {
+		for (boolean command : new boolean[] {false, true}) {
+			try (Fixture fixture = new Fixture()) {
+				CameraDirectorClient.startRecordingFromGui("clock", false);
+				fixture.level.gameTime = 120;
+				CameraDirectorClient.recordKeyframeFromGui();
+				fixture.level.gameTime = 119;
+				if (command) assertEquals(0, fixture.command("recordKeyframe"), "command rejects a backwards clock capture");
+				else {
+					CameraDirectorClient.recordKeyframeFromGui();
+					assertTrue(fixture.gui.message.contains("clock moved backwards"), "GUI explains why the backwards clock capture was rejected");
+				}
+				fixture.level.gameTime = 120;
+				CameraDirectorClient.recordKeyframeFromGui();
+				fixture.level.gameTime = 140;
+				CameraDirectorClient.recordKeyframeFromGui();
+				assertEquals(1, fixture.command("stopRecording"), "clock correction leaves the recording saveable");
+				CameraPath saved = fixture.paths.get("clock");
+				assertTrue(saved.keyframes().stream().map(CameraKeyframe::tick).toList().equals(List.of(0, 20, 40)), "clock correction cannot add out-of-order or duplicate keyframes");
+				assertTrue(state("recording") == null, "saving after clock recovery ends the take");
+			}
+		}
+		return 8;
+	}
+
 	private static int verifyPlaybackLevelChange() throws Exception {
 		try (Fixture fixture = new Fixture()) {
 			fixture.paths.put("intro", savedPath("intro"));
@@ -275,6 +303,29 @@ public final class CameraPathVerification {
 		return 10;
 	}
 
+	private static int verifyRenderedEyeHeight() throws Exception {
+		try (Fixture fixture = new Fixture()) {
+			fixture.paths.put("intro", savedPath("intro"));
+			setField(fixture.client.player, Entity.class, "eyeHeight", 1.62F);
+			fixture.renderCamera.arenaagents$setEyeHeight(1.62F);
+			fixture.renderCamera.arenaagents$setEyeHeightOld(1.62F);
+			CameraDirectorClient.playFromGui("intro", false);
+			Method align = Camera.class.getDeclaredMethod("alignWithEntity", float.class);
+			align.setAccessible(true);
+			for (float partialTick : new float[] {0.0F, 0.5F, 1.0F}) {
+				align.invoke(fixture.renderCamera, partialTick);
+				assertEquals(64, fixture.renderCamera.position().y, "rendered first pose must not inherit the player's eye height at partial tick " + partialTick);
+			}
+			CameraDirectorClient.stopPlaybackFromGui();
+			for (String name : new String[] {"eyeHeight", "eyeHeightOld"}) {
+				Field field = Camera.class.getDeclaredField(name);
+				field.setAccessible(true);
+				assertEquals(1.62F, field.getFloat(fixture.renderCamera), "restoring the player immediately restores " + name);
+			}
+		}
+		return 5;
+	}
+
 	private static CameraPath savedPath(String name) {
 		return new CameraPath(name, List.of(new CameraKeyframe(0, 100, 64, 200, 45, 10),
 				new CameraKeyframe(20, 110, 65, 210, 90, 20)));
@@ -318,6 +369,7 @@ public final class CameraPathVerification {
 		private final Minecraft previousClient;
 		private final HeadlessClient client;
 		private final HeadlessGui gui;
+		private final HeadlessCamera renderCamera;
 		private HeadlessLevel level;
 
 		@SuppressWarnings("unchecked")
@@ -341,6 +393,10 @@ public final class CameraPathVerification {
 			setField(client, Minecraft.class, "options", allocate(Options.class));
 			setField(client, Minecraft.class, "gui", gui);
 			setField(null, Minecraft.class, "instance", client);
+			renderCamera = new HeadlessCamera();
+			GameRenderer renderer = allocate(GameRenderer.class);
+			setField(renderer, GameRenderer.class, "mainCamera", renderCamera);
+			setField(client, Minecraft.class, "gameRenderer", renderer);
 			client.options.setCameraType(CameraType.FIRST_PERSON);
 			changeLevel();
 			client.camera = client.player;
@@ -391,10 +447,24 @@ public final class CameraPathVerification {
 		@Override public Entity getCameraEntity() { return camera; }
 		@Override public void setCameraEntity(Entity entity) {
 			camera = entity;
+			gameRenderer.getMainCamera().setEntity(entity);
 			if (entity instanceof Marker) {
 				initialPoseReady = entity.getX() == 100 && entity.xo == entity.getX()
 						&& entity.yo == entity.getY() && entity.zo == entity.getZ()
 						&& entity.yRotO == entity.getYRot() && entity.xRotO == entity.getXRot();
+			}
+		}
+	}
+
+	/** The two accessors stand in for Fabric's mixin; positioning uses the real Minecraft Camera. */
+	private static final class HeadlessCamera extends Camera implements CameraEyeHeightAccessor {
+		@Override public void arenaagents$setEyeHeight(float height) { setHeight("eyeHeight", height); }
+		@Override public void arenaagents$setEyeHeightOld(float height) { setHeight("eyeHeightOld", height); }
+		private void setHeight(String name, float height) {
+			try {
+				setField(this, Camera.class, name, height);
+			} catch (ReflectiveOperationException exception) {
+				throw new AssertionError(exception);
 			}
 		}
 	}

@@ -14,6 +14,7 @@ import dev.agaminggod.arenaagents.server.VoiceConsentCommandVerification;
 import dev.agaminggod.arenaagents.server.SkitModeVerification;
 import dev.agaminggod.arenaagents.client.ArenaSpectatorStateVerification;
 import dev.agaminggod.arenaagents.client.camera.CameraPathVerification;
+import dev.agaminggod.arenaagents.client.gui.SkitDirectorLayoutVerification;
 import dev.agaminggod.arenaagents.client.gui.AgentControlLayoutVerification;
 import dev.agaminggod.arenaagents.client.gui.AgentControlSubmissionVerification;
 import dev.agaminggod.arenaagents.client.gui.AgentRosterGridLayoutVerification;
@@ -173,6 +174,7 @@ public final class VerificationMain {
 		passedAssertions += VoiceConsentCommandVerification.verify();
 		passedAssertions += SkitModeVerification.verify();
 		passedAssertions += CameraPathVerification.verify();
+		passedAssertions += SkitDirectorLayoutVerification.verify();
 		passedAssertions += AgentSpawnPlacementVerification.verify();
 		passedAssertions += ChunkedSavedPayloadVerification.verify();
 		passedAssertions += OfflineAgentProfileLookupVerification.verify();
