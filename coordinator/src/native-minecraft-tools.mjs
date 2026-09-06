@@ -144,17 +144,20 @@ export function normalizeMinecraftToolCall(name, value) {
 		}
 		case 'mine':
 			requireExactKeys(args, ['x', 'y', 'z', 'expectedBlockId', 'timeoutMs']);
-			return {
-				kind: 'action',
-				actionType: 'break_block',
-				arguments: {
+			try {
+				const action = validateAction({
+					type: 'break_block',
 					x: integer(args.x, 'x', -COORDINATE_LIMIT, COORDINATE_LIMIT),
 					y: integer(args.y, 'y', -2_048, 2_048),
 					z: integer(args.z, 'z', -COORDINATE_LIMIT, COORDINATE_LIMIT),
 					expectedBlockId: boundedText(args.expectedBlockId, 'expectedBlockId', MAX_IDENTIFIER_LENGTH),
 					timeoutMs: optionalInteger(args.timeoutMs, 15_000, 'timeoutMs', 1, 120_000),
-				},
-			};
+				});
+				return { kind: 'action', actionType: action.type, arguments: stripActionType(action) };
+			} catch (error) {
+				invalid(error?.message ?? 'invalid mining arguments');
+			}
+			break;
 		case 'say': {
 			requireExactKeys(args, ['message', 'audience', 'recipientId']);
 			const message = boundedText(args.message, 'message', MAX_CHAT_LENGTH);
@@ -176,6 +179,7 @@ export function normalizeMinecraftToolCall(name, value) {
 			requireExactKeys(args, ['actionType', 'arguments']);
 			if (typeof args.actionType !== 'string' || !NATIVE_ACTION_TYPES.includes(args.actionType)) invalid('actionType is not supported');
 			const actionArguments = requireObject(args.arguments);
+			if (Object.hasOwn(actionArguments, 'type')) invalid('arguments.type is reserved; use actionType');
 			if (args.actionType === 'break_block') {
 				const normalized = normalizeMinecraftToolCall('mine', actionArguments);
 				return { kind: 'action', actionType: normalized.actionType, arguments: normalized.arguments };
@@ -225,24 +229,19 @@ function normalizeSequenceAction(value) {
 }
 
 export function toolResultContent(value, success = true) {
-	const candidates = [
-		value ?? null,
-		...(isSequenceResult(value) ? [compactSequenceResult(value)] : []),
-		compactToolResult(value),
-		{ state: 'TRUNCATED', ...survivalFacts(value, 8) },
-		{ state: 'TRUNCATED', ...survivalFacts(value, 2) },
-		{ state: 'TRUNCATED', detail: 'Tool result exceeded the coordinator limit. Call observe for fresh compact facts.' },
-	];
-	let text = JSON.stringify(candidates[0]);
-	for (const candidate of candidates) {
-		text = JSON.stringify(candidate);
-		if (Buffer.byteLength(text, 'utf8') <= MAX_TOOL_RESULT_BYTES) break;
-	}
+	let text = JSON.stringify(value ?? null);
 	if (Buffer.byteLength(text, 'utf8') > MAX_TOOL_RESULT_BYTES) {
-		text = JSON.stringify({ state: 'TRUNCATED', detail: 'Tool result exceeded the coordinator limit. Call observe for fresh compact facts.' });
-	}
-	if (Buffer.byteLength(text, 'utf8') > MAX_TOOL_RESULT_BYTES) {
-		text = JSON.stringify({ state: 'TRUNCATED', detail: 'Tool result exceeded the coordinator limit. Call observe for fresh compact facts.' });
+		const candidates = [
+			...(isSequenceResult(value) ? [compactSequenceResult(value)] : []),
+			compactToolResult(value),
+			{ state: 'TRUNCATED', ...survivalFacts(value, 8) },
+			{ state: 'TRUNCATED', ...survivalFacts(value, 2) },
+			{ state: 'TRUNCATED', detail: 'Tool result exceeded the coordinator limit. Call observe for fresh compact facts.' },
+		];
+		for (const candidate of candidates) {
+			text = JSON.stringify(candidate);
+			if (Buffer.byteLength(text, 'utf8') <= MAX_TOOL_RESULT_BYTES) break;
+		}
 	}
 	return { success, contentItems: [{ type: 'inputText', text }] };
 }

@@ -12,7 +12,9 @@ public record SkitPlacement(String dimension, double x, double y, double z, floa
 	private static final double MAX_Y = 4_096.0D;
 	public SkitPlacement {
 		dimension = Objects.requireNonNull(dimension, "dimension must not be null").strip();
-		if (dimension.isEmpty()) throw new IllegalArgumentException("dimension must not be empty");
+		if (!dimension.matches("[a-z0-9_.-]+:[a-z0-9_/.-]+")) {
+			throw new IllegalArgumentException("dimension must be a namespaced dimension identifier");
+		}
 		finite(x, "x");
 		finite(y, "y");
 		finite(z, "z");
@@ -33,12 +35,15 @@ public record SkitPlacement(String dimension, double x, double y, double z, floa
 
 	/** Places an actor relative to the player's view: right, up, then forward blocks. */
 	public static SkitPlacement relativeTo(ServerPlayer player, double right, double up, double forward) {
-		SkitPlacement base = fromPlayer(player);
-		float yawRadians = (float) Math.toRadians(base.yaw());
+		return relativeTo(fromPlayer(player), right, up, forward);
+	}
+
+	static SkitPlacement relativeTo(SkitPlacement base, double right, double up, double forward) {
+		double yawRadians = Math.toRadians(base.yaw());
 		return new SkitPlacement(base.dimension(),
-				base.x() + right * Math.cos(yawRadians) - forward * Math.sin(yawRadians),
+				base.x() - right * Math.cos(yawRadians) - forward * Math.sin(yawRadians),
 				base.y() + up,
-				base.z() + right * Math.sin(yawRadians) + forward * Math.cos(yawRadians),
+				base.z() - right * Math.sin(yawRadians) + forward * Math.cos(yawRadians),
 				base.yaw(), base.pitch());
 	}
 

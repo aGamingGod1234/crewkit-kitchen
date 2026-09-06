@@ -128,6 +128,7 @@ function normalizeCommand(command, defaultTimeoutTicks) {
 	const sourceArguments = command.arguments ?? (command.action ? withoutType(command.action) : undefined);
 	if (!sourceArguments || typeof sourceArguments !== 'object' || Array.isArray(sourceArguments)) throw codedError('INVALID_ACTION', 'command.arguments must be an object');
 	const argumentsValue = clone(sourceArguments);
+	if (Object.hasOwn(argumentsValue, 'type')) throw codedError('INVALID_ACTION', 'arguments.type is reserved; use actionType');
 	try { validateAction({ type: actionType, ...argumentsValue }); }
 	catch (error) { throw codedError(error.code ?? 'INVALID_ACTION', error.message); }
 	const timeoutMs = argumentsValue.timeoutMs;

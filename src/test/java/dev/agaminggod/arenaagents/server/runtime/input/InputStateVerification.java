@@ -24,9 +24,66 @@ public final class InputStateVerification {
 		assertions += verifyFailedPreemptingReleaseRemainsRetryable();
 		assertions += verifyLeaseDeadman();
 		assertions += verifyFailedDeadmanRemainsRetryable();
+		assertions += verifyDeadmanFailureDoesNotBlockOtherAgents();
+		assertions += verifyTickFailureDoesNotBlockOtherAgents();
 		assertions += verifyExactHandUseDriver();
 		assertions += verifyBoundedMotor();
+		assertions += verifyMotorWorldHeading();
 		return assertions;
+	}
+
+	private static int verifyDeadmanFailureDoesNotBlockOtherAgents() {
+		FailingSink sink = new FailingSink();
+		LeasedServerInputController controller = new LeasedServerInputController(sink);
+		AgentId other = AgentId.random();
+		controller.apply(controller.acquire(AGENT, InputOwner.INTERACTION, 300), state(0.0F, true, true));
+		controller.apply(controller.acquire(other, InputOwner.INTERACTION, 300), state(0.0F, true, true));
+		for (long tick = 1; tick < LeasedServerInputController.LEASE_TIMEOUT_TICKS; tick++) controller.tick();
+		sink.failNextClear();
+		assertThrows(controller::tick, "deadman failure remains visible to the caller");
+		assertTrue(controller.currentState(AGENT).isPresent(), "failed cleanup keeps its lease for retry");
+		assertTrue(controller.currentState(other).isEmpty(), "one failed cleanup must not leave another agent attacking");
+		assertEquals(2, sink.clearAttempts, "all expired agents receive a cleanup attempt");
+		controller.tick();
+		assertTrue(controller.currentState(AGENT).isEmpty(), "failed agent is cleaned on the next tick");
+		return 5;
+	}
+
+	private static int verifyTickFailureDoesNotBlockOtherAgents() {
+		AgentId other = AgentId.random();
+		List<AgentId> ticked = new ArrayList<>();
+		InputStateSink sink = new InputStateSink() {
+			@Override
+			public void apply(AgentId agentId, AgentInputState previous, AgentInputState state) { }
+
+			@Override
+			public void clear(AgentId agentId, AgentInputState previous) { }
+
+			@Override
+			public void tick(AgentId agentId, AgentInputState state) {
+				ticked.add(agentId);
+				if (agentId.equals(AGENT)) throw new IllegalStateException("unavailable player");
+			}
+		};
+		LeasedServerInputController controller = new LeasedServerInputController(sink);
+		controller.apply(controller.acquire(AGENT, InputOwner.INTERACTION, 300), state(0.0F, false, true));
+		controller.apply(controller.acquire(other, InputOwner.INTERACTION, 300), state(0.0F, false, true));
+		assertThrows(controller::tick, "physical tick failure remains visible to the caller");
+		assertEquals(List.of(AGENT, other), ticked, "one broken player must not starve another player's held use");
+		return 2;
+	}
+
+	private static int verifyMotorWorldHeading() {
+		for (float targetYaw : new float[] {-90.0F, 90.0F}) {
+			AgentInputStates.MotorStep step = AgentInputStates.stepMotor(
+					AgentInputStates.MotorState.initial(0.0F, 0.0F),
+					new AgentInputStates.MotorTarget(targetYaw, 0.0F, true, false, false), 0L);
+			net.minecraft.world.phys.Vec3 movement = new net.minecraft.world.phys.Vec3(step.strafe(), 0.0D, step.forward())
+					.yRot((float) -Math.toRadians(step.yaw()));
+			assertTrue(targetYaw < 0.0F ? movement.x > 0.0D : movement.x < 0.0D,
+					"a turn toward " + (targetYaw < 0.0F ? "east" : "west") + " must move toward that waypoint");
+		}
+		return 2;
 	}
 
 	private static int verifyCompleteInputState() {
@@ -471,14 +528,14 @@ public final class InputStateVerification {
 				6L
 		);
 		assertEquals(true, repulsed.jump(), "a released jump request can pulse again");
-		AgentInputStates.MotorState facingEast = new AgentInputStates.MotorState(-90.0F, 0.0F, 0.0F, 1.0F, false);
-		AgentInputStates.MotorStep turningNorth = AgentInputStates.stepMotor(
+		AgentInputStates.MotorState facingEast = new AgentInputStates.MotorState(-90.0F, 0.0F, 0.0F, -1.0F, false);
+		AgentInputStates.MotorStep turningSouth = AgentInputStates.stepMotor(
 				facingEast,
 				new AgentInputStates.MotorTarget(0.0F, 0.0F, true, false, false),
 				7L
 		);
-		float remainingYaw = AgentInputStates.shortestAngleDelta(turningNorth.state().yaw(), 0.0F);
-		assertEquals((float) Math.sin(Math.toRadians(remainingYaw)), turningNorth.strafe(),
+		float remainingYaw = AgentInputStates.shortestAngleDelta(turningSouth.state().yaw(), 0.0F);
+		assertEquals(-(float) Math.sin(Math.toRadians(remainingYaw)), turningSouth.strafe(),
 				"movement is relative to the yaw applied this tick instead of the stale previous yaw");
 		return 14;
 	}

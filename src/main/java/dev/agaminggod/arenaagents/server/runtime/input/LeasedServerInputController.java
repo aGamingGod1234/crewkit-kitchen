@@ -99,6 +99,7 @@ public final class LeasedServerInputController implements ServerInputController 
 	/** Advances the server-tick deadman and neutralizes leases that stopped renewing. */
 	public synchronized void tick() {
 		currentTick = Math.incrementExact(currentTick);
+		RuntimeException failure = null;
 		var agents = states.entrySet().iterator();
 		while (agents.hasNext()) {
 			Map.Entry<AgentId, LinkedHashMap<InputLease, LeaseState>> entry = agents.next();
@@ -109,17 +110,30 @@ public final class LeasedServerInputController implements ServerInputController 
 			if (!expired) continue;
 			AgentInputState current = winningStateAfterExpiration(agentStates, currentTick).orElse(null);
 			long nextRevision = Math.incrementExact(mutationRevision);
-			if (!Objects.equals(previous, current)) {
-				if (current == null) sink.clear(agentId, previous);
-				else sink.apply(agentId, previous, current);
+			try {
+				if (!Objects.equals(previous, current)) {
+					if (current == null) sink.clear(agentId, previous);
+					else sink.apply(agentId, previous, current);
+				}
+				agentStates.entrySet().removeIf(lease -> lease.getValue().deadlineTick() <= currentTick);
+				if (agentStates.isEmpty()) agents.remove();
+				mutationRevision = nextRevision;
+			} catch (RuntimeException exception) {
+				if (failure == null) failure = exception;
+				else if (failure != exception) failure.addSuppressed(exception);
 			}
-			agentStates.entrySet().removeIf(lease -> lease.getValue().deadlineTick() <= currentTick);
-			if (agentStates.isEmpty()) agents.remove();
-			mutationRevision = nextRevision;
 		}
 		for (Map.Entry<AgentId, LinkedHashMap<InputLease, LeaseState>> entry : states.entrySet()) {
-			winningState(entry.getValue()).ifPresent(state -> sink.tick(entry.getKey(), state));
+			// A failed expiration still owns its physical state until cleanup succeeds.
+			if (entry.getValue().values().stream().anyMatch(state -> state.deadlineTick() <= currentTick)) continue;
+			try {
+				winningState(entry.getValue()).ifPresent(state -> sink.tick(entry.getKey(), state));
+			} catch (RuntimeException exception) {
+				if (failure == null) failure = exception;
+				else if (failure != exception) failure.addSuppressed(exception);
+			}
 		}
+		if (failure != null) throw failure;
 	}
 
 	private long deadline() {

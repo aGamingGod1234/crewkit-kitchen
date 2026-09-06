@@ -55,6 +55,14 @@ test('rejects unsupported or over-limit manifest commands before compiling', () 
 	assert.throws(() => compileScenarioProgram({ ...manifest, commands: [{ ...manifest.commands[0], arguments: { ...manifest.commands[0].arguments, bad: undefined } }] }), /JSON|serializ/i);
 });
 
+test('benchmark and simulator reject nested action discriminators before dispatch', () => {
+	const command = { agentId: 'agent-a', actionId: 'bad', actionType: 'respawn', arguments: { type: 'wait', durationMs: 1 } };
+	assert.throws(() => compileScenarioProgram({ id: 'discriminator', commands: [command] }), /arguments\.type is reserved/);
+	const runtime = new ActionRuntime();
+	assert.throws(() => runtime.accept(command), /arguments\.type is reserved/);
+	assert.deepEqual(runtime.activeActionIds, []);
+});
+
 async function executeManifest(manifest, commandIndexes = manifest.commands.map((_, index) => index)) {
 	const world = VirtualWorld.fromScenario(manifest.world);
 	const bridge = new VirtualMinecraftBridge({ world, actionRuntime: new ActionRuntime() });

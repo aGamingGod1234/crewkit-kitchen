@@ -9,11 +9,15 @@ public record SkitScript(String name, String agentSelector, List<SkitStep> steps
 
 	public SkitScript {
 		name = requireName(name, "name");
-		agentSelector = requireName(agentSelector, "agentSelector");
+		agentSelector = Objects.requireNonNull(agentSelector, "agentSelector must not be null").strip();
+		if (agentSelector.isEmpty() || agentSelector.length() > 64
+				|| agentSelector.codePoints().anyMatch(Character::isISOControl)) {
+			throw new IllegalArgumentException("agentSelector must be 1-64 characters without control characters");
+		}
 		Objects.requireNonNull(steps, "steps must not be null");
 		if (steps.size() > MAX_STEPS) throw new IllegalArgumentException("A skit script may contain at most " + MAX_STEPS + " steps");
-		steps = List.copyOf(steps);
 		if (steps.stream().anyMatch(Objects::isNull)) throw new IllegalArgumentException("steps must not contain null");
+		steps = List.copyOf(steps);
 	}
 
 	public SkitScript append(SkitStep step) {

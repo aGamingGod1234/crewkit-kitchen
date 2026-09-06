@@ -166,6 +166,7 @@ function normalizeManifestCommands(manifest, limits) {
 		if (!member) throw codedError('UNSUPPORTED_MAPPING', `unsupported ArenaScript mapping for action '${String(actionType)}'`);
 		const args = command.arguments ?? command.args;
 		assertJsonObject(args, `manifest.commands[${index}].arguments`);
+		if (Object.hasOwn(args, 'type')) throw codedError('INVALID_COMMAND', 'arguments.type is reserved; use actionType');
 		try { validateAction({ type: actionType, ...args }); }
 		catch (error) { throw codedError(error.code ?? 'INVALID_COMMAND', error.message); }
 		return Object.freeze({ actionId, actionType, member, arguments: deepClone(args) });

@@ -19,6 +19,69 @@ function record(overrides = {}) {
 
 const testRegistry = { get: (agentId) => record({ agentId }) };
 
+for (const kind of ['action', 'finish']) {
+	test(`cancelling ${kind} settles before its bridge publication`, async () => {
+		let releasePublication;
+		const publication = new Promise((resolve) => { releasePublication = resolve; });
+		const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: (type) => type === 'action_cancel' ? Promise.resolve() : publication } });
+		let cancellation;
+		const pending = runtime.execute({
+			agentId: 'agent-a', goalRevision: 3, turnId: 'turn-cancel', callId: 'call-cancel',
+			tool: kind === 'action' ? { kind, actionType: 'wait', arguments: { durationMs: 1 } } : { kind, summary: 'done' },
+		}, record()).catch((error) => { cancellation = error.code; });
+		await runtime.dispose('agent-a', 'bridge_disconnected');
+		for (let index = 0; index < 8; index += 1) await Promise.resolve();
+		const cancellationBeforeDelivery = cancellation;
+		releasePublication();
+		await pending;
+		assert.match(cancellationBeforeDelivery ?? '', /^NATIVE_(ACTION|COMPLETION)_CANCELLED$/);
+	});
+
+	test(`a late ${kind} publication failure cannot erase replacement work`, async () => {
+		const published = [];
+		let rejectOldPublication;
+		const oldPublication = new Promise((resolve, reject) => { rejectOldPublication = reject; });
+		const publicationType = kind === 'action' ? 'action_command' : 'goal_completed';
+		const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: (type, agentId, payload) => {
+			if (type !== publicationType) return Promise.resolve();
+			published.push(payload);
+			return published.length === 1 ? oldPublication : Promise.resolve();
+		} } });
+		const request = {
+			agentId: 'agent-a', goalRevision: 3, turnId: 'turn-race', callId: 'call-race',
+			tool: kind === 'action' ? { kind, actionType: 'wait', arguments: { durationMs: 1 } } : { kind, summary: 'done' },
+		};
+		const oldResult = runtime.execute(request, record()).catch((error) => error);
+		await runtime.dispose('agent-a', 'bridge_disconnected');
+		const replacement = runtime.execute({ ...request, callId: 'call-replacement' }, record()).catch((error) => error);
+		rejectOldPublication(new Error('old connection failed late'));
+		assert.match((await oldResult).code, /^NATIVE_(ACTION|COMPLETION)_CANCELLED$/);
+		assert.equal(published.length, 2);
+		const accepted = kind === 'action'
+			? runtime.onActionResult(record(), { actionId: published[1].actionId, goalRevision: 3, state: 'SUCCEEDED', reasonCode: 'DONE' })
+			: runtime.onCompletionResult(record(), { traceId: published[1].traceId, goalFingerprint: published[1].goalFingerprint, goalRevision: 3, verified: false, reasonCode: 'INVENTORY_MISSING', facts: [] });
+		assert.equal(accepted, true, 'late failure must only remove its own pending publication');
+		assert.equal((await replacement).state, kind === 'action' ? 'SUCCEEDED' : 'ACTIVE');
+	});
+}
+
+test('native telemetry exceptions cannot interrupt body dispatch or completion', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({
+		registry: testRegistry, bridge: { send: async (...args) => sent.push(args) },
+		trace: () => { throw new Error('telemetry unavailable'); },
+	});
+	const pending = runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-telemetry', callId: 'call-telemetry',
+		tool: { kind: 'action', actionType: 'wait', arguments: { durationMs: 1 } },
+	}, record()).catch((error) => error);
+	await Promise.resolve();
+	assert.equal(sent.length, 1);
+	assert.equal(runtime.onActionProgress(record(), { actionId: sent[0][2].actionId, progress: 0.5 }), true);
+	assert.equal(runtime.onActionResult(record(), { actionId: sent[0][2].actionId, state: 'SUCCEEDED', reasonCode: 'DONE' }), true);
+	assert.equal((await pending).state, 'SUCCEEDED');
+});
+
 test('native action is rejected before bridge enqueue when the registry has advanced', async () => {
 	const sent = [];
 	const runtime = new NativeToolRuntime({

@@ -118,9 +118,9 @@ workflow without requiring chat commands.
 /codex skit script action takeoff jump
 /codex skit script play takeoff
 /codex skit voice profile Claude voice.ember.v1 dramatic 1.05 64
-/codex skit voice say Claude "You should not have come here."
+/codex skit voice say Claude You should not have come here.
 /codex skit voice script create intro Claude
-/codex skit voice script add intro 0 "Now run."
+/codex skit voice script add intro 0 Now run.
 /codex skit voice script play intro
 /codex skit off
 /camera path start intro
@@ -191,8 +191,12 @@ The selected provider, model, reasoning effort, and service tier own gameplay st
 The interpreter has no shell, filesystem, network, credential, or ambient Minecraft authority. Its exact `SCRIPT_PRIMITIVES` set is:
 
 ```text
-move_to, navigate_to, look_at, attack, select_item, use_item, break_block, pick_up_item, place_block, chat, wait, set_door, drop_item, transfer_container, craft_inventory, craft_table, furnace_transaction, equip_item, select_tool, block_with_shield, use_ranged, interact_block, interact_entity, dismount, start_fall_flying, menu_transfer, menu_button, anvil_rename, respawn
+move_to, navigate_to, look_at, attack, select_item, use_item, break_block, pick_up_item, place_block, chat, wait, set_door, drop_item, transfer_container, craft_inventory, craft_table, furnace_transaction, equip_item, select_tool, block_with_shield, use_ranged, interact_block, interact_entity, dismount, start_fall_flying, menu_transfer, menu_button, anvil_rename, respawn, control
 ```
+
+`await player.control({...})` combines movement, looking, jumping, sneaking, sprinting, attacking, and item use in one complete input frame for 1 to 200 ticks. It also accepts the selected hotbar slot and hand. Codex's native `control` tool uses the same action. Different agents can act concurrently; physical commands for one body remain sequential, while speech can run independently.
+
+The current native-tool and ArenaScript APIs do not expose a wiki lookup. Their factual queries report observed world/player/inventory state; they do not fetch external game knowledge. External wiki access would require a separately bounded, source-attributed knowledge integration within the provider execution boundary.
 
 Model-authored `repeatUntil`/`watch` loops and factual queries replace high-level fight, flee, follow, pickup, and build controllers; the runtime does not synthesize those strategies. Every command carries the agent, goal revision, program/version, source step, event sequence, and selected-model provenance before Minecraft accepts it.
 

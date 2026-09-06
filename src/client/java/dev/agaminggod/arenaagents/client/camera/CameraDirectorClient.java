@@ -25,7 +25,9 @@ import net.fabricmc.fabric.api.client.command.v2.ClientCommands;
 import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
+import net.minecraft.client.CameraType;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.commands.SharedSuggestionProvider;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.entity.Entity;
@@ -46,6 +48,7 @@ public final class CameraDirectorClient {
 	private static Playback playback;
 	private static Marker cameraAnchor;
 	private static Entity previousCamera;
+	private static CameraType previousCameraType;
 	private static boolean registered;
 
 	private CameraDirectorClient() {
@@ -67,14 +70,7 @@ public final class CameraDirectorClient {
 	public static void startRecordingFromGui(String name, boolean replace) {
 		Minecraft client = Minecraft.getInstance();
 		try {
-			validateName(name);
-			if (replace) PATHS.remove(name);
-			if (PATHS.containsKey(name)) throw new IllegalArgumentException("A camera path named " + name + " already exists.");
-			if (PATHS.size() >= MAX_PATHS) throw new IllegalArgumentException("Camera path limit reached (" + MAX_PATHS + ").");
-			if (client.level == null || client.player == null) throw new IllegalArgumentException("You must be in a world to record a camera path.");
-			stopPlayback(client);
-			recording = new Recording(name, client.level.getGameTime(), new ArrayList<>());
-			recordKeyframeFromGui();
+			name = beginRecording(client, name, replace);
 			guiFeedback("Recording camera path '" + name + "'. Capture keyframes as you move, then save recording.", false);
 		} catch (IllegalArgumentException exception) {
 			guiFeedback(exception.getMessage(), true);
@@ -84,7 +80,11 @@ public final class CameraDirectorClient {
 	public static void recordKeyframeFromGui() {
 		Minecraft client = Minecraft.getInstance();
 		if (recording == null) { guiFeedback("No camera path is recording.", true); return; }
-		if (client.level == null || client.player == null) { guiFeedback("You must remain in a world while recording.", true); return; }
+		if (!recordingInCurrentLevel(client)) {
+			recording = null;
+			guiFeedback("Recording cancelled because you left its world.", true);
+			return;
+		}
 		long elapsed = Math.max(0L, client.level.getGameTime() - recording.startedAt());
 		if (elapsed > CameraPath.MAX_DURATION_TICKS) { guiFeedback("This camera path has reached its one-hour limit.", true); return; }
 		CameraKeyframe frame = new CameraKeyframe((int) elapsed, client.player.getX(), client.player.getEyeY(), client.player.getZ(), client.player.getYRot(), client.player.getXRot());
@@ -101,13 +101,12 @@ public final class CameraDirectorClient {
 		Minecraft client = Minecraft.getInstance();
 		if (recording == null) { guiFeedback("No camera path is recording.", true); return; }
 		try {
-			CameraPath saved = new CameraPath(recording.name(), recording.frames());
-			PATHS.put(saved.name(), saved);
-			recording = null;
-			save(client);
+			CameraPath saved = finishRecording(client);
 			guiFeedback("Saved camera path '" + saved.name() + "' (" + saved.keyframes().size() + " keyframes).", false);
 		} catch (IllegalArgumentException exception) {
 			guiFeedback(exception.getMessage(), true);
+		} catch (IOException exception) {
+			guiFeedback("Could not save camera path. Recording kept; try saving again.", true);
 		}
 	}
 
@@ -119,7 +118,8 @@ public final class CameraDirectorClient {
 		if (path.durationTicks() < MIN_PLAYBACK_TICKS) { guiFeedback("Add a second keyframe so the camera has a duration to play.", true); return; }
 		stopPlayback(client);
 		previousCamera = client.getCameraEntity();
-		playback = new Playback(path, client.level.getGameTime(), loop);
+		previousCameraType = client.options.getCameraType();
+		playback = new Playback(path, client.level, client.level.getGameTime(), loop);
 		apply(client, path.sample(0.0D));
 		guiFeedback("Playing camera path '" + path.name() + "'" + (loop ? " on loop." : "."), false);
 	}
@@ -167,13 +167,7 @@ public final class CameraDirectorClient {
 
 	private static int startRecording(FabricClientCommandSource source, String name) {
 		try {
-			validateName(name);
-			if (PATHS.containsKey(name)) return error(source, "A camera path named " + name + " already exists. Delete it first or choose another name.");
-			if (PATHS.size() >= MAX_PATHS) return error(source, "Camera path limit reached (" + MAX_PATHS + "). Delete an old path first.");
-			if (source.getClient().level == null || source.getClient().player == null) return error(source, "You must be in a world to record a camera path.");
-			stopPlayback(source.getClient());
-			recording = new Recording(name, source.getClient().level.getGameTime(), new ArrayList<>());
-			recordKeyframe(source);
+			name = beginRecording(source.getClient(), name, false);
 			source.sendFeedback(Component.literal("Recording camera path '" + name + "'. Move the player/camera, then use /camera path keyframe. Stop saves it."));
 			return 1;
 		} catch (IllegalArgumentException exception) {
@@ -184,7 +178,10 @@ public final class CameraDirectorClient {
 	private static int recordKeyframe(FabricClientCommandSource source) {
 		if (recording == null) return error(source, "No camera path is recording. Start one with /camera path start <name>.");
 		Minecraft client = source.getClient();
-		if (client.level == null || client.player == null) return error(source, "You must remain in a world while recording.");
+		if (!recordingInCurrentLevel(client)) {
+			recording = null;
+			return error(source, "Recording cancelled because you left its world.");
+		}
 		long elapsed = Math.max(0L, client.level.getGameTime() - recording.startedAt());
 		if (elapsed > CameraPath.MAX_DURATION_TICKS) return error(source, "This camera path has reached its one-hour limit.");
 		CameraKeyframe frame = new CameraKeyframe((int) elapsed, client.player.getX(), client.player.getEyeY(), client.player.getZ(), client.player.getYRot(), client.player.getXRot());
@@ -200,15 +197,44 @@ public final class CameraDirectorClient {
 	private static int stopRecording(FabricClientCommandSource source) {
 		if (recording == null) return error(source, "No camera path is recording.");
 		try {
-			CameraPath saved = new CameraPath(recording.name(), recording.frames());
-			PATHS.put(saved.name(), saved);
-			recording = null;
-			save(source.getClient());
+			CameraPath saved = finishRecording(source.getClient());
 			source.sendFeedback(Component.literal("Saved camera path '" + saved.name() + "' (" + saved.keyframes().size() + " keyframes, " + saved.durationTicks() + " ticks)."));
 			return 1;
 		} catch (IllegalArgumentException exception) {
 			return error(source, exception.getMessage());
+		} catch (IOException exception) {
+			return error(source, "Could not save camera path. Recording kept; try saving again.");
 		}
+	}
+
+	private static String beginRecording(Minecraft client, String name, boolean replace) {
+		name = validateName(name);
+		if (recording != null) throw new IllegalArgumentException("A camera path is already recording. Save it before starting another.");
+		boolean exists = PATHS.containsKey(name);
+		if (exists && !replace) throw new IllegalArgumentException("A camera path named " + name + " already exists.");
+		if (!exists && PATHS.size() >= MAX_PATHS) throw new IllegalArgumentException("Camera path limit reached (" + MAX_PATHS + ").");
+		if (client.level == null || client.player == null) throw new IllegalArgumentException("You must be in a world to record a camera path.");
+		CameraKeyframe first = new CameraKeyframe(0, client.player.getX(), client.player.getEyeY(), client.player.getZ(), client.player.getYRot(), client.player.getXRot());
+		stopPlayback(client);
+		recording = new Recording(name, client.level, client.level.getGameTime(), new ArrayList<>(List.of(first)));
+		return name;
+	}
+
+	private static boolean recordingInCurrentLevel(Minecraft client) {
+		return recording != null && client.level != null && client.player != null && recording.level() == client.level;
+	}
+
+	private static CameraPath finishRecording(Minecraft client) throws IOException {
+		if (!recordingInCurrentLevel(client)) {
+			recording = null;
+			throw new IllegalArgumentException("Recording cancelled because you left its world.");
+		}
+		CameraPath saved = new CameraPath(recording.name(), recording.frames());
+		Map<String, CameraPath> next = new LinkedHashMap<>(PATHS);
+		next.put(saved.name(), saved);
+		save(client, next);
+		recording = null;
+		return saved;
 	}
 
 	private static int play(FabricClientCommandSource source, String name, boolean loop) {
@@ -219,7 +245,8 @@ public final class CameraDirectorClient {
 		if (path.durationTicks() < MIN_PLAYBACK_TICKS) return error(source, "Add a second keyframe so the camera has a duration to play.");
 		stopPlayback(client);
 		previousCamera = client.getCameraEntity();
-		playback = new Playback(path, client.level.getGameTime(), loop);
+		previousCameraType = client.options.getCameraType();
+		playback = new Playback(path, client.level, client.level.getGameTime(), loop);
 		apply(client, path.sample(0.0D));
 		source.sendFeedback(Component.literal("Playing camera path '" + name + "'" + (loop ? " on loop" : "") + ". Use /camera path stop-playback to return."));
 		return 1;
@@ -246,24 +273,36 @@ public final class CameraDirectorClient {
 	}
 
 	private static int delete(FabricClientCommandSource source, String name) {
-		if (PATHS.remove(name) == null) return error(source, "No camera path named '" + name + "'.");
-		save(source.getClient());
-		source.sendFeedback(Component.literal("Deleted camera path '" + name + "'."));
-		return 1;
+		Map<String, CameraPath> next = new LinkedHashMap<>(PATHS);
+		if (next.remove(name) == null) return error(source, "No camera path named '" + name + "'.");
+		try {
+			save(source.getClient(), next);
+			source.sendFeedback(Component.literal("Deleted camera path '" + name + "'."));
+			return 1;
+		} catch (IOException exception) {
+			return error(source, "Could not delete camera path. The saved library was kept.");
+		}
 	}
 
 	private static int clear(FabricClientCommandSource source) {
 		if (PATHS.isEmpty()) return error(source, "There are no saved camera paths.");
 		int count = PATHS.size();
-		PATHS.clear();
-		save(source.getClient());
-		source.sendFeedback(Component.literal("Deleted " + count + " camera paths."));
-		return count;
+		try {
+			save(source.getClient(), Map.of());
+			source.sendFeedback(Component.literal("Deleted " + count + " camera paths."));
+			return count;
+		} catch (IOException exception) {
+			return error(source, "Could not clear camera paths. The saved library was kept.");
+		}
 	}
 
 	private static void tick(Minecraft client) {
-		if (recording != null && (client.level == null || client.player == null)) recording = null;
-		if (playback == null || client.level == null || client.player == null) return;
+		if (recording != null && !recordingInCurrentLevel(client)) recording = null;
+		if (playback == null) return;
+		if (client.level == null || client.player == null || playback.level() != client.level) {
+			stopPlayback(client);
+			return;
+		}
 		long elapsed = client.level.getGameTime() - playback.startedAt();
 		if (elapsed >= playback.path().durationTicks()) {
 			if (!playback.loop()) {
@@ -273,27 +312,33 @@ public final class CameraDirectorClient {
 			}
 			long duration = Math.max(1L, playback.path().durationTicks());
 			elapsed %= duration;
-			playback = new Playback(playback.path(), client.level.getGameTime() - elapsed, true);
+			playback = new Playback(playback.path(), playback.level(), client.level.getGameTime() - elapsed, true);
 		}
 		apply(client, playback.path().sample(elapsed));
 	}
 
 	private static void apply(Minecraft client, CameraPose pose) {
 		if (client.level == null) return;
-		if (cameraAnchor == null || cameraAnchor.level() != client.level || cameraAnchor.isRemoved()) {
+		boolean created = cameraAnchor == null || cameraAnchor.level() != client.level || cameraAnchor.isRemoved();
+		if (created) {
 			if (cameraAnchor != null) cameraAnchor.remove(Entity.RemovalReason.DISCARDED);
 			cameraAnchor = EntityType.MARKER.create(client.level, EntitySpawnReason.COMMAND);
 			if (cameraAnchor == null) return;
-			client.level.addFreshEntity(cameraAnchor);
-			client.setCameraEntity(cameraAnchor);
 		}
-		cameraAnchor.setOldPosAndRot(cameraAnchor.position(), cameraAnchor.getYRot(), cameraAnchor.getXRot());
+		if (!created) cameraAnchor.setOldPosAndRot();
 		cameraAnchor.setPos(pose.x(), pose.y(), pose.z());
 		cameraAnchor.setYRot(pose.yaw());
 		cameraAnchor.setXRot(pose.pitch());
+		client.options.setCameraType(CameraType.FIRST_PERSON);
+		if (created) {
+			cameraAnchor.setOldPosAndRot();
+			client.level.addFreshEntity(cameraAnchor);
+			client.setCameraEntity(cameraAnchor);
+		}
 	}
 
 	private static void stopPlayback(Minecraft client) {
+		if (playback == null && cameraAnchor == null && previousCamera == null && previousCameraType == null) return;
 		playback = null;
 		if (cameraAnchor != null) {
 			cameraAnchor.remove(Entity.RemovalReason.DISCARDED);
@@ -301,7 +346,13 @@ public final class CameraDirectorClient {
 		}
 		Entity restore = previousCamera;
 		previousCamera = null;
-		if (client.player != null) client.setCameraEntity(restore == null || restore.isRemoved() ? client.player : restore);
+		if (restore == null || restore.isRemoved() || restore.level() != client.level) restore = client.player;
+		if (client.level == null || (restore != null && (restore.isRemoved() || restore.level() != client.level))) restore = null;
+		client.setCameraEntity(restore);
+		if (previousCameraType != null) {
+			client.options.setCameraType(previousCameraType);
+			previousCameraType = null;
+		}
 	}
 
 	private static void load(Minecraft client) {
@@ -323,20 +374,21 @@ public final class CameraDirectorClient {
 				CameraPath path = new CameraPath(pathObject.get("name").getAsString(), frames);
 				PATHS.put(path.name(), path);
 			}
-		} catch (IOException | JsonParseException | IllegalArgumentException | NullPointerException exception) {
+		} catch (IOException | JsonParseException | IllegalArgumentException | NullPointerException
+				| IllegalStateException | ClassCastException | UnsupportedOperationException exception) {
 			LOGGER.warn("Could not load Arena Agents camera paths; starting with an empty library", exception);
 			PATHS.clear();
 		}
 	}
 
-	private static void save(Minecraft client) {
+	private static void save(Minecraft client, Map<String, CameraPath> library) throws IOException {
 		Path file = storageFile(client);
 		Path temporary = file.resolveSibling(file.getFileName() + ".tmp");
 		try {
 			Files.createDirectories(file.getParent());
 			JsonObject root = new JsonObject();
 			JsonArray paths = new JsonArray();
-			for (CameraPath path : PATHS.values()) {
+			for (CameraPath path : library.values()) {
 				JsonObject pathObject = new JsonObject();
 				pathObject.addProperty("name", path.name());
 				JsonArray frames = new JsonArray();
@@ -362,8 +414,11 @@ public final class CameraDirectorClient {
 			} catch (AtomicMoveNotSupportedException exception) {
 				Files.move(temporary, file, StandardCopyOption.REPLACE_EXISTING);
 			}
+			PATHS.clear();
+			PATHS.putAll(library);
 		} catch (IOException exception) {
 			LOGGER.warn("Could not save Arena Agents camera paths", exception);
+			throw exception;
 		}
 	}
 
@@ -371,8 +426,9 @@ public final class CameraDirectorClient {
 		return client.gameDirectory.toPath().resolve("config").resolve("arenaagents").resolve("camera-paths.json");
 	}
 
-	private static void validateName(String name) {
-		new CameraPath(name, List.of(new CameraKeyframe(0, 0.0D, 0.0D, 0.0D, 0.0F, 0.0F)));
+	private static String validateName(String name) {
+		if (name == null) throw new IllegalArgumentException("A camera path needs a name.");
+		return new CameraPath(name, List.of(new CameraKeyframe(0, 0.0D, 0.0D, 0.0D, 0.0F, 0.0F))).name();
 	}
 
 	private static int error(FabricClientCommandSource source, String message) {
@@ -380,9 +436,9 @@ public final class CameraDirectorClient {
 		return 0;
 	}
 
-	private record Recording(String name, long startedAt, ArrayList<CameraKeyframe> frames) {
+	private record Recording(String name, ClientLevel level, long startedAt, ArrayList<CameraKeyframe> frames) {
 	}
 
-	private record Playback(CameraPath path, long startedAt, boolean loop) {
+	private record Playback(CameraPath path, ClientLevel level, long startedAt, boolean loop) {
 	}
 }

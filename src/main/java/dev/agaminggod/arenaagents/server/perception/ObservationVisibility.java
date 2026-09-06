@@ -8,10 +8,12 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.level.BlockGetter;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.shapes.CollisionContext;
 
 /** Human-equivalent visual gating for structured server observations. */
 public final class ObservationVisibility {
@@ -102,15 +104,17 @@ public final class ObservationVisibility {
 		}
 
 		private boolean traceBlock(BlockPos position) {
-			BlockHitResult hit = level.clip(new ClipContext(
-					eye,
-					Vec3.atCenterOf(position),
-					ClipContext.Block.VISUAL,
-					ClipContext.Fluid.NONE,
-					observer
-			));
-			return hit.getType() == HitResult.Type.BLOCK && hit.getBlockPos().equals(position);
+			return ObservationVisibility.traceBlock(level, CollisionContext.of(observer), eye, position);
 		}
+	}
+
+	static boolean traceBlock(BlockGetter level, CollisionContext context, Vec3 eye, BlockPos position) {
+		BlockHitResult hit = level.clip(new ClipContext(
+				eye, Vec3.atCenterOf(position), ClipContext.Block.VISUAL, ClipContext.Fluid.NONE, context));
+		// Fluids and partial visual shapes can leave a clear ray without a block hit.
+		return hit.getType() == HitResult.Type.MISS
+				? !level.getBlockState(position).isAir()
+				: hit.getBlockPos().equals(position);
 	}
 
 	static boolean memoizedBlockVisibility(
