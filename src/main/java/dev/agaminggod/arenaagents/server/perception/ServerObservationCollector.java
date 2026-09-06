@@ -756,8 +756,9 @@ public final class ServerObservationCollector {
 		// Vanilla clipping extends its start backwards by 1e-7 of the ray length.
 		// Check that tiny segment too, including either side of a chunk corner.
 		BlockPos clipStart = BlockPos.containing(origin.subtract(direction.scale(maximumDistance * 1.0E-7D)));
-		for (int x = Math.min(chunkX, clipStart.getX() >> 4); x <= Math.max(chunkX, clipStart.getX() >> 4); x++) {
-			for (int z = Math.min(chunkZ, clipStart.getZ() >> 4); z <= Math.max(chunkZ, clipStart.getZ() >> 4); z++) {
+		BlockPos clipAhead = BlockPos.containing(origin.add(direction.scale(maximumDistance * 1.0E-7D)));
+		for (int x = Math.min(clipAhead.getX() >> 4, clipStart.getX() >> 4); x <= Math.max(clipAhead.getX() >> 4, clipStart.getX() >> 4); x++) {
+			for (int z = Math.min(clipAhead.getZ() >> 4, clipStart.getZ() >> 4); z <= Math.max(clipAhead.getZ() >> 4, clipStart.getZ() >> 4); z++) {
 				if ((x != chunkX || z != chunkZ) && !loaded.test(new BlockPos(x << 4, start.getY(), z << 4))) return null;
 			}
 		}
@@ -775,8 +776,8 @@ public final class ServerObservationCollector {
 			if (boundary > maximumDistance * (1.0D + 1.0E-7D)) {
 				return origin.add(direction.scale(maximumDistance));
 			}
-			// Block clipping visits a side cell when two chunk boundaries coincide.
-			if (nextX == nextZ && (!loaded.test(new BlockPos((chunkX + stepX) << 4, start.getY(), chunkZ << 4))
+			// Rounded endpoints can reverse nearly tied crossings, especially near the world border.
+			if (Math.abs(nextX - nextZ) <= 1.0E-4D && (!loaded.test(new BlockPos((chunkX + stepX) << 4, start.getY(), chunkZ << 4))
 					|| !loaded.test(new BlockPos(chunkX << 4, start.getY(), (chunkZ + stepZ) << 4)))) {
 				return boundary <= 0.0D ? null : origin.add(direction.scale(Math.max(0.0D, boundary - 1.0E-4D)));
 			}

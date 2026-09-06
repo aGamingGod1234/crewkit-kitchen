@@ -47,7 +47,10 @@ export class NativeToolRuntime {
 		this.#registry = registry;
 		this.#onFinish = onFinish;
 		this.#trace = (event, fields) => {
-			try { Promise.resolve(trace(event, fields)).catch(() => {}); } catch { /* diagnostics cannot interrupt gameplay */ }
+			try {
+				const completion = trace(event, fields);
+				if (completion !== undefined) Promise.resolve(completion).catch(() => {});
+			} catch { /* diagnostics cannot interrupt gameplay */ }
 		};
 		this.#decorateObservation = decorateObservation;
 		this.#resolveFrontier = resolveFrontier;

@@ -136,7 +136,7 @@ export function validateAction(value) {
 		case 'break_block':
 			requireCoordinates(action, true, 'action');
 			requireText(action.expectedBlockId, 'action.expectedBlockId', MAX_IDENTIFIER_LENGTH);
-			if (action.expectedBlockId.endsWith(':air') || ['minecraft:cave_air', 'minecraft:void_air'].includes(action.expectedBlockId)) {
+			if (action.expectedBlockId.endsWith(':air') || action.expectedBlockId === 'minecraft:cave_air' || action.expectedBlockId === 'minecraft:void_air') {
 				throw invalid('INVALID_FIELD', 'action.expectedBlockId must identify a non-air block');
 			}
 			requireDuration(action.timeoutMs, 'action.timeoutMs');

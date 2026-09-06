@@ -398,6 +398,30 @@ tasks.named('test') {
 	failOnNoDiscoveredTests = false
 }
 
+tasks.register('verifyCameraMixin', JavaExec) {
+	group = 'verification'
+	description = 'Verifies camera accessor transformation in Fabric without starting client main or a world.'
+	dependsOn tasks.named('testClasses'), tasks.named('clientClasses'), tasks.named('processResources'), tasks.named('processClientResources')
+	classpath = sourceSets.test.runtimeClasspath
+	mainClass.set('dev.agaminggod.arenaagents.client.camera.CameraMixinVerification')
+	systemProperty 'java.awt.headless', 'true'
+	systemProperty 'fabric.development', 'true'
+	systemProperty 'fabric.defaultModDistributionNamespace', 'official'
+
+	doFirst {
+		['fabric.gameJarPath': 'minecraft-common-', 'fabric.gameJarPath.client': 'minecraft-clientOnly-'].each { property, prefix ->
+			def jars = classpath.files.findAll { it.name.startsWith(prefix) && it.name.endsWith('.jar') }
+			if (jars.size() != 1) throw new GradleException("Camera mixin verification requires exactly one ${prefix}*.jar; found ${jars.size()}.")
+			systemProperty property, jars.first().absolutePath
+		}
+		systemProperty 'fabric.classPathGroups', (sourceSets.main.output.files + sourceSets.client.output.files)
+			.collect { it.absolutePath }.join(File.pathSeparator)
+		def gameDirectory = layout.buildDirectory.dir('camera-mixin-verification').get().asFile
+		java.nio.file.Files.createDirectories(gameDirectory.toPath())
+		setArgs(['--gameDir', gameDirectory.absolutePath])
+	}
+}
+
 def mapBlockStateCatalog = layout.projectDirectory.file('maps/registries/minecraft-26.1.2-block-states.json')
 def mapCatalogExporterClasses = layout.buildDirectory.dir('classes/java/mapCatalogExporter')
 def mapStructureDataFixerClasses = layout.buildDirectory.dir('classes/java/mapStructureDataFixer')
@@ -466,7 +490,7 @@ tasks.register('upgradeMapStructure', JavaExec) {
 }
 
 tasks.named('check') {
-	dependsOn tasks.named('verifyCore'), tasks.named('verifyEntrypoints'), tasks.named('verifyMapBlockStateCatalog'), tasks.named('verifyMapStructureDataFixer'), ':voice-addon:check'
+	dependsOn tasks.named('verifyCore'), tasks.named('verifyCameraMixin'), tasks.named('verifyEntrypoints'), tasks.named('verifyMapBlockStateCatalog'), tasks.named('verifyMapStructureDataFixer'), ':voice-addon:check'
 }
 
 publishing {

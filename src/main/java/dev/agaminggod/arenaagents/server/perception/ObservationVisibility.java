@@ -10,6 +10,7 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.BlockGetter;
 import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.RenderShape;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.BlockHitResult;
@@ -126,7 +127,9 @@ public final class ObservationVisibility {
 		if (hit.getType() != HitResult.Type.MISS) return hit.getBlockPos().equals(position);
 		BlockState state = level.getBlockState(position);
 		return !state.isAir()
-				&& (state.getRenderShape() != RenderShape.INVISIBLE || !state.getFluidState().isEmpty());
+				&& (state.getRenderShape() != RenderShape.INVISIBLE || !state.getFluidState().isEmpty()
+						// End portal surfaces are drawn by block-entity renderers, despite an invisible block model.
+						|| state.is(Blocks.END_PORTAL) || state.is(Blocks.END_GATEWAY));
 	}
 
 	static boolean memoizedBlockVisibility(

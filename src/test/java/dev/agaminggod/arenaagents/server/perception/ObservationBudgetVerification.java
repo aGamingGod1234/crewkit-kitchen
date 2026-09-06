@@ -189,8 +189,9 @@ public final class ObservationBudgetVerification {
 
 	private static int verifyNonSolidVisibility() {
 		HashMap<BlockPos, BlockState> states = new HashMap<>();
+		HashMap<BlockPos, BlockEntity> blockEntities = new HashMap<>();
 		BlockGetter world = new BlockGetter() {
-			@Override public BlockEntity getBlockEntity(BlockPos position) { return null; }
+			@Override public BlockEntity getBlockEntity(BlockPos position) { return blockEntities.get(position); }
 			@Override public BlockState getBlockState(BlockPos position) {
 				return states.getOrDefault(position, Blocks.AIR.defaultBlockState());
 			}
@@ -203,7 +204,8 @@ public final class ObservationBudgetVerification {
 		Vec3 eye = new Vec3(0.5D, 0.5D, 0.5D);
 		CollisionContext context = CollisionContext.empty();
 		int assertions = 0;
-		for (var block : List.of(Blocks.STONE, Blocks.WATER, Blocks.LAVA, Blocks.DANDELION, Blocks.TORCH, Blocks.OAK_SLAB)) {
+		for (var block : List.of(Blocks.STONE, Blocks.WATER, Blocks.LAVA, Blocks.DANDELION, Blocks.TORCH, Blocks.OAK_SLAB,
+				Blocks.END_PORTAL, Blocks.END_GATEWAY)) {
 			states.put(target, block.defaultBlockState());
 			assertTrue(ObservationVisibility.traceBlock(world, context, eye, target),
 					"clear sight reports visible " + block);
@@ -219,7 +221,15 @@ public final class ObservationBudgetVerification {
 		assertFalse(ObservationVisibility.traceBlock(world, context, eye, target), "a clear ray does not reveal an invisible dry light block");
 		states.put(target, Blocks.LIGHT.defaultBlockState().setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.WATERLOGGED, true));
 		assertTrue(ObservationVisibility.traceBlock(world, context, eye, target), "water in an invisible light block remains visible");
-		return assertions + 3;
+		states.put(target, Blocks.STRUCTURE_VOID.defaultBlockState());
+		assertFalse(ObservationVisibility.traceBlock(world, context, eye, target), "a clear ray does not reveal invisible structure voids");
+		BlockState movingState = Blocks.MOVING_PISTON.defaultBlockState();
+		states.put(target, movingState);
+		blockEntities.put(target, net.minecraft.world.level.block.piston.MovingPistonBlock.newMovingBlockEntity(
+				target, movingState, Blocks.STONE.defaultBlockState(), net.minecraft.core.Direction.SOUTH, true, false));
+		assertTrue(ObservationVisibility.traceBlock(world, context, eye, target),
+				"a direct hit on a moving piston's actual block-entity geometry remains visible");
+		return assertions + 5;
 	}
 
 	private static int verifySpatialMutations() {
@@ -342,7 +352,26 @@ public final class ObservationBudgetVerification {
 					position -> sign > 0 ? position.getX() < 192 && position.getZ() < 192
 							: position.getX() >= -192 && position.getZ() >= -192);
 		}
+		assertions += verifyRoundedChunkCrossing(
+				new Vec3(29999063.99999D, 64.5D, 29999015.99999D),
+				new Vec3(0.7071067811872547D, 0.0D, 0.7071067811858404D), 256.0D,
+				position -> (position.getX() >> 4) != 1874943 || (position.getZ() >> 4) != 1874941);
+		assertions += verifyRoundedChunkCrossing(new Vec3(-16.0D, 64.5D, -16.0D),
+				new Vec3(-0.9863981263522539D, 0.0D, 0.16437377019696023D), 153.9209845965773D,
+				position -> (position.getX() >> 4) != -2 || (position.getZ() >> 4) != -2);
 		return assertions + verifyLoadedCenterTrace();
+	}
+
+	private static int verifyRoundedChunkCrossing(Vec3 origin, Vec3 direction, double distance,
+			java.util.function.Predicate<BlockPos> loaded) {
+		assertTrue(BlockGetter.traverseBlocks(origin, origin.add(direction.scale(distance)), Boolean.TRUE,
+				(ignored, position) -> !loaded.test(position) ? Boolean.TRUE : null, ignored -> Boolean.FALSE),
+				"vanilla traverses the side chunk at a rounded or mixed-direction corner");
+		Vec3 endpoint = ServerObservationCollector.loadedSightEndpoint(origin, direction, distance, loaded);
+		assertTrue(endpoint == null || !BlockGetter.traverseBlocks(origin, endpoint, Boolean.TRUE,
+				(ignored, position) -> !loaded.test(position) ? Boolean.TRUE : null, ignored -> Boolean.FALSE),
+				"corner guards prevent the rounded clip from reading any unloaded side chunk");
+		return 2;
 	}
 
 	private static int verifyLoadedCenterTrace() {
