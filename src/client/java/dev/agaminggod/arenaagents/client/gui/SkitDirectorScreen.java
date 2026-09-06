@@ -78,6 +78,10 @@ public final class SkitDirectorScreen extends Screen {
 		return false;
 	}
 
+	public void acceptCatalogUpdate() {
+		rebuildWidgets();
+	}
+
 	@Override
 	protected void init() {
 		clearFields();

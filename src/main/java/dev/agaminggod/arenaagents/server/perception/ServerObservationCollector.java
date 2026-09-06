@@ -749,6 +749,14 @@ public final class ServerObservationCollector {
 		if (!loaded.test(start)) return null;
 		int chunkX = start.getX() >> 4;
 		int chunkZ = start.getZ() >> 4;
+		// Vanilla clipping extends its start backwards by 1e-7 of the ray length.
+		// Check that tiny segment too, including either side of a chunk corner.
+		BlockPos clipStart = BlockPos.containing(origin.subtract(direction.scale(LANDMARK_SIGHT_DISTANCE * 1.0E-7D)));
+		for (int x = Math.min(chunkX, clipStart.getX() >> 4); x <= Math.max(chunkX, clipStart.getX() >> 4); x++) {
+			for (int z = Math.min(chunkZ, clipStart.getZ() >> 4); z <= Math.max(chunkZ, clipStart.getZ() >> 4); z++) {
+				if ((x != chunkX || z != chunkZ) && !loaded.test(new BlockPos(x << 4, start.getY(), z << 4))) return null;
+			}
+		}
 		int stepX = (int) Math.signum(direction.x);
 		int stepZ = (int) Math.signum(direction.z);
 		double deltaX = stepX == 0 ? Double.POSITIVE_INFINITY : 16.0D / Math.abs(direction.x);

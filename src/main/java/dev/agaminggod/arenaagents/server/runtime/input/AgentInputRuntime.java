@@ -8,8 +8,11 @@ import java.util.Optional;
 import java.util.WeakHashMap;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public final class AgentInputRuntime {
+	private static final Logger LOGGER = LoggerFactory.getLogger(AgentInputRuntime.class);
 	private static final Map<MinecraftServer, LeasedServerInputController> CONTROLLERS = new WeakHashMap<>();
 
 	private AgentInputRuntime() {
@@ -58,7 +61,15 @@ public final class AgentInputRuntime {
 		LeasedServerInputController controller = CONTROLLERS.get(
 				java.util.Objects.requireNonNull(server, "server must not be null")
 		);
-		if (controller != null) controller.tick();
+		if (controller != null) tickController(controller);
+	}
+
+	static void tickController(LeasedServerInputController controller) {
+		try {
+			controller.tick();
+		} catch (RuntimeException failure) {
+			LOGGER.error("Agent input tick failed; retained inputs will retry on the next server tick", failure);
+		}
 	}
 
 	public static synchronized void release(MinecraftServer server) {

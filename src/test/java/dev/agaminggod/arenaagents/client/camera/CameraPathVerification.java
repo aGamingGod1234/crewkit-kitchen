@@ -1,5 +1,8 @@
 package dev.agaminggod.arenaagents.client.camera;
 
+import com.google.gson.JsonObject;
+import java.io.IOException;
+import java.io.Writer;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -50,7 +53,7 @@ public final class CameraPathVerification {
 			return 6 + verifyDelayedStart() + verifyUnboundedYaw() + verifyReplacement()
 					+ verifyRestart() + verifySaveFailure() + verifyDeleteAndClearFailure()
 					+ verifyMalformedStorage() + verifyRecordingLevelChange()
-					+ verifyPlaybackLevelChange() + verifyAnchorAndPerspective();
+					+ verifyPlaybackLevelChange() + verifyPlaybackRespawn() + verifyWriterFailure() + verifyAnchorAndPerspective();
 		} catch (Exception exception) {
 			throw new AssertionError("camera verification failed", exception);
 		}
@@ -207,6 +210,41 @@ public final class CameraPathVerification {
 			assertTrue(fixture.client.camera == null, "missing world cannot retain an old camera entity");
 		}
 		return 6;
+	}
+
+	private static int verifyPlaybackRespawn() throws Exception {
+		try (Fixture fixture = new Fixture()) {
+			fixture.paths.put("intro", savedPath("intro"));
+			fixture.client.options.setCameraType(CameraType.THIRD_PERSON_BACK);
+			CameraDirectorClient.playFromGui("intro", true);
+			Marker anchor = (Marker) state("cameraAnchor");
+			LocalPlayer replacement = allocate(LocalPlayer.class);
+			setField(replacement, Entity.class, "level", fixture.level);
+			fixture.client.player = replacement;
+			fixture.client.setCameraEntity(replacement);
+			invoke("tick", new Class<?>[] {Minecraft.class}, fixture.client);
+			assertTrue(state("playback") == null && state("cameraAnchor") == null, "same-level respawn stops playback");
+			assertTrue(anchor.isRemoved(), "same-level respawn discards the old camera anchor");
+			assertTrue(fixture.client.camera == replacement, "same-level respawn cannot restore the old player camera");
+			assertTrue(fixture.client.options.getCameraType() == CameraType.THIRD_PERSON_BACK, "same-level respawn restores perspective");
+		}
+		return 4;
+	}
+
+	private static int verifyWriterFailure() throws Exception {
+		IOException failure = new IOException("simulated disk full");
+		Writer writer = new Writer() {
+			@Override public void write(char[] buffer, int offset, int length) throws IOException { throw failure; }
+			@Override public void flush() { }
+			@Override public void close() { }
+		};
+		try {
+			invoke("writeJson", new Class<?>[] {JsonObject.class, Writer.class}, new JsonObject(), writer);
+			throw new AssertionError("serialization must report the writer failure");
+		} catch (IOException expected) {
+			assertTrue(expected == failure, "serialization exposes checked IO failures to the save retry handlers");
+		}
+		return 1;
 	}
 
 	private static int verifyAnchorAndPerspective() throws Exception {

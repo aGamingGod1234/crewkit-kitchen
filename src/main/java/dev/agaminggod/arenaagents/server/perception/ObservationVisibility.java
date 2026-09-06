@@ -10,6 +10,8 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.BlockGetter;
 import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.level.block.RenderShape;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
@@ -112,9 +114,10 @@ public final class ObservationVisibility {
 		BlockHitResult hit = level.clip(new ClipContext(
 				eye, Vec3.atCenterOf(position), ClipContext.Block.VISUAL, ClipContext.Fluid.NONE, context));
 		// Fluids and partial visual shapes can leave a clear ray without a block hit.
-		return hit.getType() == HitResult.Type.MISS
-				? !level.getBlockState(position).isAir()
-				: hit.getBlockPos().equals(position);
+		if (hit.getType() != HitResult.Type.MISS) return hit.getBlockPos().equals(position);
+		BlockState state = level.getBlockState(position);
+		return !state.isAir()
+				&& (state.getRenderShape() != RenderShape.INVISIBLE || !state.getFluidState().isEmpty());
 	}
 
 	static boolean memoizedBlockVisibility(

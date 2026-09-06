@@ -26,10 +26,33 @@ public final class InputStateVerification {
 		assertions += verifyFailedDeadmanRemainsRetryable();
 		assertions += verifyDeadmanFailureDoesNotBlockOtherAgents();
 		assertions += verifyTickFailureDoesNotBlockOtherAgents();
+		assertions += verifyRuntimeAllowsFailedCleanupRetry();
 		assertions += verifyExactHandUseDriver();
 		assertions += verifyBoundedMotor();
 		assertions += verifyMotorWorldHeading();
 		return assertions;
+	}
+
+	private static int verifyRuntimeAllowsFailedCleanupRetry() {
+		FailingSink sink = new FailingSink();
+		LeasedServerInputController controller = new LeasedServerInputController(sink);
+		controller.apply(controller.acquire(AGENT, InputOwner.INTERACTION, 300), state(0.0F, true, true));
+		for (long tick = 1; tick < LeasedServerInputController.LEASE_TIMEOUT_TICKS; tick++) {
+			AgentInputRuntime.tickController(controller);
+		}
+		sink.failNextClear();
+		int followingTicks = 0;
+		for (int tick = 0; tick < 2; tick++) {
+			AgentInputRuntime.tickController(controller);
+			followingTicks++;
+			if (tick == 0) {
+				assertTrue(controller.currentState(AGENT).isPresent(), "failed runtime cleanup retains its lease for retry");
+			}
+		}
+		assertEquals(2, followingTicks, "input failures allow subsequent runtime work and the next server tick");
+		assertEquals(2, sink.clearAttempts, "the runtime retries physical cleanup on the next tick");
+		assertTrue(controller.currentState(AGENT).isEmpty(), "the runtime retry releases expired inputs");
+		return 4;
 	}
 
 	private static int verifyDeadmanFailureDoesNotBlockOtherAgents() {

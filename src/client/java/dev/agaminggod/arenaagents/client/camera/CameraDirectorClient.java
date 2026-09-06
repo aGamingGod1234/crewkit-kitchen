@@ -7,6 +7,7 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.google.gson.JsonParseException;
+import com.google.gson.JsonIOException;
 import com.mojang.brigadier.arguments.BoolArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import java.io.IOException;
@@ -28,6 +29,7 @@ import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.minecraft.client.CameraType;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.commands.SharedSuggestionProvider;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.entity.Entity;
@@ -119,7 +121,7 @@ public final class CameraDirectorClient {
 		stopPlayback(client);
 		previousCamera = client.getCameraEntity();
 		previousCameraType = client.options.getCameraType();
-		playback = new Playback(path, client.level, client.level.getGameTime(), loop);
+		playback = new Playback(path, client.level, client.player, client.level.getGameTime(), loop);
 		apply(client, path.sample(0.0D));
 		guiFeedback("Playing camera path '" + path.name() + "'" + (loop ? " on loop." : "."), false);
 	}
@@ -246,7 +248,7 @@ public final class CameraDirectorClient {
 		stopPlayback(client);
 		previousCamera = client.getCameraEntity();
 		previousCameraType = client.options.getCameraType();
-		playback = new Playback(path, client.level, client.level.getGameTime(), loop);
+		playback = new Playback(path, client.level, client.player, client.level.getGameTime(), loop);
 		apply(client, path.sample(0.0D));
 		source.sendFeedback(Component.literal("Playing camera path '" + name + "'" + (loop ? " on loop" : "") + ". Use /camera path stop-playback to return."));
 		return 1;
@@ -299,7 +301,7 @@ public final class CameraDirectorClient {
 	private static void tick(Minecraft client) {
 		if (recording != null && !recordingInCurrentLevel(client)) recording = null;
 		if (playback == null) return;
-		if (client.level == null || client.player == null || playback.level() != client.level) {
+		if (client.level == null || client.player == null || playback.level() != client.level || playback.player() != client.player) {
 			stopPlayback(client);
 			return;
 		}
@@ -312,7 +314,7 @@ public final class CameraDirectorClient {
 			}
 			long duration = Math.max(1L, playback.path().durationTicks());
 			elapsed %= duration;
-			playback = new Playback(playback.path(), playback.level(), client.level.getGameTime() - elapsed, true);
+			playback = new Playback(playback.path(), playback.level(), playback.player(), client.level.getGameTime() - elapsed, true);
 		}
 		apply(client, playback.path().sample(elapsed));
 	}
@@ -346,7 +348,8 @@ public final class CameraDirectorClient {
 		}
 		Entity restore = previousCamera;
 		previousCamera = null;
-		if (restore == null || restore.isRemoved() || restore.level() != client.level) restore = client.player;
+		if (restore == null || restore.isRemoved() || restore.level() != client.level
+				|| (restore instanceof LocalPlayer && restore != client.player)) restore = client.player;
 		if (client.level == null || (restore != null && (restore.isRemoved() || restore.level() != client.level))) restore = null;
 		client.setCameraEntity(restore);
 		if (previousCameraType != null) {
@@ -407,7 +410,7 @@ public final class CameraDirectorClient {
 			}
 			root.add("paths", paths);
 			try (Writer writer = Files.newBufferedWriter(temporary)) {
-				GSON.toJson(root, writer);
+				writeJson(root, writer);
 			}
 			try {
 				Files.move(temporary, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
@@ -418,6 +421,15 @@ public final class CameraDirectorClient {
 			PATHS.putAll(library);
 		} catch (IOException exception) {
 			LOGGER.warn("Could not save Arena Agents camera paths", exception);
+			throw exception;
+		}
+	}
+
+	private static void writeJson(JsonObject root, Writer writer) throws IOException {
+		try {
+			GSON.toJson(root, writer);
+		} catch (JsonIOException exception) {
+			if (exception.getCause() instanceof IOException cause) throw cause;
 			throw exception;
 		}
 	}
@@ -439,6 +451,6 @@ public final class CameraDirectorClient {
 	private record Recording(String name, ClientLevel level, long startedAt, ArrayList<CameraKeyframe> frames) {
 	}
 
-	private record Playback(CameraPath path, ClientLevel level, long startedAt, boolean loop) {
+	private record Playback(CameraPath path, ClientLevel level, LocalPlayer player, long startedAt, boolean loop) {
 	}
 }

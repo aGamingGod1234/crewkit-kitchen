@@ -2107,6 +2107,51 @@ test('native model-authored sequence keeps lifecycle acting until its final body
 	}
 });
 
+test('native lookAround holds an action lease and acting state across its camera steps', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	const goalSupervisor = new RecordingGoalSupervisor();
+	const leases = [];
+	const released = [];
+	goalSupervisor.begin = (key, kind) => {
+		const token = { ...key, kind, operationId: `operation-${leases.length}` };
+		leases.push(token);
+		return token;
+	};
+	goalSupervisor.end = (token) => released.push(token);
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		await request.executeTool({
+			agentId: request.agentId, goalRevision: request.goalRevision,
+			turnId: 'turn-look-around', callId: 'call-look-around',
+			tool: { kind: 'lookAround', centerYaw: 0, pitch: 0, steps: 2, ticksPerStep: 2 },
+		});
+		return { status: 'completed', toolCalls: 1 };
+	};
+	const run = await start({
+		registry, planner, goalSupervisor,
+		config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } },
+	});
+	const commands = () => run.bridge.sent.filter(({ type }) => type === 'action_command');
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Look for trees.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => commands().length === 1);
+		const actionLease = leases.find(({ kind }) => kind === 'action');
+		assert.ok(actionLease, 'camera sweeps need the same action watchdog as other body tools');
+		for (let index = 0; index < 2; index += 1) {
+			await eventually(() => commands().length === index + 1);
+			assert.equal(run.registry.get('agent-a').state, DynamicAgentState.ACTING);
+			assert.equal(released.includes(actionLease), false);
+			assert.equal(commands()[index].payload.actionType, 'control');
+			run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: commands()[index].payload.actionId, state: 'SUCCEEDED', reasonCode: '', executionStarted: true, eventSequence: index + 2 } });
+		}
+		await eventually(() => run.registry.get('agent-a').state === DynamicAgentState.PLANNING);
+		assert.equal(released.filter((token) => token === actionLease).length, 1);
+		assert.equal(leases.filter(({ kind }) => kind === 'action').length, 1);
+	} finally { await run.coordinator.stop(); }
+});
+
 test('a pre-disconnect native completion cannot complete the replacement lifecycle', async () => {
 	const bridge = new DeferredCompletionBridge();
 	const registry = new AgentRegistry();

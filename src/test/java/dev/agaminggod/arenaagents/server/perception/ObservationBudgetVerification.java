@@ -215,7 +215,11 @@ public final class ObservationBudgetVerification {
 		}
 		states.clear();
 		assertFalse(ObservationVisibility.traceBlock(world, context, eye, target), "clear sight never invents an air target");
-		return assertions + 1;
+		states.put(target, Blocks.LIGHT.defaultBlockState());
+		assertFalse(ObservationVisibility.traceBlock(world, context, eye, target), "a clear ray does not reveal an invisible dry light block");
+		states.put(target, Blocks.LIGHT.defaultBlockState().setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.WATERLOGGED, true));
+		assertTrue(ObservationVisibility.traceBlock(world, context, eye, target), "water in an invisible light block remains visible");
+		return assertions + 3;
 	}
 
 	private static int verifySpatialMutations() {
@@ -306,7 +310,28 @@ public final class ObservationBudgetVerification {
 				"fully loaded sight keeps its intended range");
 		assertTrue(checks.get() <= 2 + ServerObservationCollector.LANDMARK_SIGHT_DISTANCE / 8,
 				"sight checks scale with crossed chunks rather than individual blocks");
-		return 9;
+		var boundaryOrigin = new Vec3(0.0D, 64.0D, 0.5D);
+		var forward = new Vec3(1.0D, 0.0D, 0.0D);
+		Boolean entersUnloaded = BlockGetter.traverseBlocks(boundaryOrigin, boundaryOrigin.add(forward.scale(256.0D)),
+				Boolean.TRUE, (ignored, position) -> position.getX() < 0 ? Boolean.TRUE : null, ignored -> Boolean.FALSE);
+		assertTrue(entersUnloaded, "vanilla clipping visits the chunk behind an exact boundary origin");
+		for (double x : new double[] {0.0D, 1.0E-6D}) {
+			assertTrue(ServerObservationCollector.loadedSightEndpoint(new Vec3(x, 64.0D, 0.5D), forward,
+					position -> position.getX() >= 0) == null,
+					"the backwards clip expansion cannot read an unloaded chunk behind the observer");
+		}
+		assertTrue(ServerObservationCollector.loadedSightEndpoint(new Vec3(0.0D, 64.0D, 0.0D),
+				new Vec3(1.0D, 0.0D, 1.0D).normalize(),
+				position -> (position.getX() >> 4) != -1 || (position.getZ() >> 4) != 0) == null,
+				"backwards expansion checks side chunks at an observer corner");
+		endpoint = ServerObservationCollector.loadedSightEndpoint(boundaryOrigin, forward, position -> true);
+		AtomicInteger visits = new AtomicInteger();
+		BlockGetter.traverseBlocks(boundaryOrigin, endpoint, Boolean.TRUE, (ignored, position) -> {
+			visits.incrementAndGet();
+			return null;
+		}, ignored -> Boolean.FALSE);
+		assertTrue(visits.get() > 256, "loaded boundary rays retain vanilla traversal through the expanded endpoints");
+		return 14;
 	}
 
 	private static int verifyLandmarkContext() {
