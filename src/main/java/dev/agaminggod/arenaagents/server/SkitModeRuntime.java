@@ -3,7 +3,6 @@ package dev.agaminggod.arenaagents.server;
 import carpet.helpers.EntityPlayerActionPack;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.AgentId;
-import dev.agaminggod.arenaagents.agent.AgentRecord;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -50,9 +49,9 @@ public final class SkitModeRuntime {
 		Objects.requireNonNull(manager, "manager must not be null");
 		Objects.requireNonNull(level, "level must not be null");
 		requireEnabled(manager.server());
-		AgentRecord record = manager.resolve(selector);
+		SkitActor record = SkitActors.resolve(manager.server(), selector);
 		SkitPlacement placement = new SkitPlacement(level.dimension().identifier().toString(), x, y, z, yaw, pitch);
-		manager.findAgentPlayer(record.agentId()).ifPresentOrElse(
+		SkitActors.find(manager.server(), record.agentId()).filter(ServerPlayer::isAlive).ifPresentOrElse(
 				player -> {
 					stop(manager.server(), record.agentId());
 					teleport(player, level, placement);
@@ -83,13 +82,13 @@ public final class SkitModeRuntime {
 	}
 
 	public static Optional<SkitPlacement> savedPlacement(CodexAgentManager manager, String selector) {
-		AgentRecord record = manager.resolve(selector);
+		SkitActor record = SkitActors.resolve(manager.server(), selector);
 		return Optional.ofNullable(SkitModeSavedData.get(manager.server()).placement(record.agentId().toString()));
 	}
 
 	public static SkitScript createScript(MinecraftServer server, String name, String agentSelector) {
 		requireEnabled(server);
-		SkitScript script = new SkitScript(name, agentSelector, List.of());
+		SkitScript script = new SkitScript(name, SkitActors.resolve(server, agentSelector).agentId().toString(), List.of());
 		SkitModeSavedData.get(server).putScript(script);
 		return script;
 	}
@@ -118,13 +117,9 @@ public final class SkitModeRuntime {
 				.orElseThrow(() -> new AgentDomainException("SKIT_SCRIPT_NOT_FOUND", "No skit script named " + name));
 		if (script.steps().isEmpty()) throw new AgentDomainException("SKIT_SCRIPT_EMPTY", "Skit script has no steps");
 		String selector = selectorOverride == null || selectorOverride.isBlank() ? script.agentSelector() : selectorOverride;
-		AgentRecord record = manager.resolve(selector);
-		if (record.state() != dev.agaminggod.arenaagents.agent.AgentLifecycleState.IDLE
-				|| !record.currentGoal().isEmpty() || !record.queuedGoals().isEmpty()) {
-			throw new AgentDomainException("SKIT_AGENT_BUSY", "Skit playback requires an idle agent with no queued goals");
-		}
+		SkitActor record = SkitActors.resolve(manager.server(), selector);
 		AgentId agentId = record.agentId();
-		ServerPlayer actor = manager.findAgentPlayer(agentId).filter(player -> player.isAlive() && !player.isRemoved())
+		ServerPlayer actor = SkitActors.find(manager.server(), agentId).filter(player -> player.isAlive() && !player.isRemoved())
 				.orElseThrow(() -> new AgentDomainException("AGENT_NOT_PRESENT", "Agent has not joined the world yet"));
 		validateTimeline(script, actor.level().dimension().identifier().toString(),
 				dimension -> findLevel(manager.server(), dimension).isPresent(),
@@ -154,7 +149,7 @@ public final class SkitModeRuntime {
 	}
 
 	public static void stop(MinecraftServer server, String selector) {
-		stop(server, CodexAgentManager.get(server).resolve(selector).agentId());
+		stop(server, SkitActors.resolve(server, selector).agentId());
 	}
 
 	static void stop(MinecraftServer server, AgentId agentId) {
@@ -174,7 +169,7 @@ public final class SkitModeRuntime {
 			try {
 				ServerPlayer actor = run.actor();
 				if (!actor.isAlive() || actor.isRemoved() || actor.level() != run.level()
-						|| manager.findAgentPlayer(entry.getKey()).orElse(null) != actor) {
+						|| SkitActors.find(server, entry.getKey()).orElse(null) != actor) {
 					if (runs.remove(entry.getKey(), run)) cleanup(run);
 					continue;
 				}

@@ -37,7 +37,8 @@ public final class SkitModeSavedData extends SavedData {
 			Codec.BOOL.optionalFieldOf("enabled", false).forGetter(SkitModeSavedData::enabled),
 			Codec.unboundedMap(Codec.STRING, PLACEMENT_CODEC).optionalFieldOf("placements", Map.of())
 					.forGetter(data -> data.placements),
-			SCRIPT_CODEC.listOf().optionalFieldOf("scripts", List.of()).forGetter(data -> List.copyOf(data.scripts.values()))
+			SCRIPT_CODEC.listOf().optionalFieldOf("scripts", List.of()).forGetter(data -> List.copyOf(data.scripts.values())),
+			ActorCodec.VALUE.listOf().optionalFieldOf("actors", List.of()).forGetter(SkitModeSavedData::actors)
 	).apply(instance, SkitModeSavedData::decode));
 	public static final SavedDataType<SkitModeSavedData> TYPE = new SavedDataType<>(
 			Identifier.fromNamespaceAndPath("arenaagents", "skit_mode"), SkitModeSavedData::new, CODEC,
@@ -46,6 +47,15 @@ public final class SkitModeSavedData extends SavedData {
 	private boolean enabled;
 	private final Map<String, SkitPlacement> placements;
 	private final Map<String, SkitScript> scripts;
+	private final Map<dev.agaminggod.arenaagents.agent.AgentId, SkitActor> actors = new LinkedHashMap<>();
+	private static final class ActorCodec {
+		static final Codec<SkitActor> VALUE = RecordCodecBuilder.create(instance -> instance.group(
+				Codec.STRING.xmap(dev.agaminggod.arenaagents.agent.AgentId::parse, Object::toString).fieldOf("id").forGetter(SkitActor::agentId),
+				Codec.STRING.fieldOf("name").forGetter(SkitActor::name),
+				Codec.STRING.fieldOf("appearance").forGetter(SkitActor::appearance),
+				Codec.BOOL.optionalFieldOf("dead", false).forGetter(SkitActor::dead)
+		).apply(instance, SkitActor::new));
+	}
 
 	public SkitModeSavedData() {
 		this(false, Map.of(), List.of());
@@ -61,8 +71,26 @@ public final class SkitModeSavedData extends SavedData {
 		}
 	}
 
-	private static SkitModeSavedData decode(boolean enabled, Map<String, SkitPlacement> placements, List<SkitScript> scripts) {
-		return new SkitModeSavedData(enabled, placements, scripts);
+	private static SkitModeSavedData decode(boolean enabled, Map<String, SkitPlacement> placements, List<SkitScript> scripts, List<SkitActor> actors) {
+		SkitModeSavedData data = new SkitModeSavedData(enabled, placements, scripts);
+		for (SkitActor actor : actors) data.putActor(actor);
+		return data;
+	}
+
+	public List<SkitActor> actors() { return List.copyOf(actors.values()); }
+	public void putActor(SkitActor actor) {
+		if (!actors.containsKey(actor.agentId()) && actors.size() >= 32) throw new IllegalArgumentException("Director cast is full");
+		for (SkitActor other : actors.values()) {
+			if (!other.agentId().equals(actor.agentId()) && other.name().equalsIgnoreCase(actor.name()))
+				throw new IllegalArgumentException("Duplicate actor name");
+		}
+		actors.put(actor.agentId(), actor);
+		setDirty();
+	}
+	public void removeActor(dev.agaminggod.arenaagents.agent.AgentId id) {
+		actors.remove(id);
+		placements.remove(id.toString());
+		setDirty();
 	}
 
 	public static SkitModeSavedData get(MinecraftServer server) {

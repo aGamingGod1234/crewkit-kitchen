@@ -301,7 +301,7 @@ public final class CodexAgentManager {
 
 	private boolean isPersistedPlayerNameReserved(String name) {
 		var cache = (dev.agaminggod.arenaagents.mixin.CachedUserNameToIdResolverAccessor) server.services().nameToIdCache();
-		return AgentPlayerNameReservations.isReserved(
+		return SkitActors.reservesName(server, name) || AgentPlayerNameReservations.isReserved(
 				server.getWorldPath(net.minecraft.world.level.storage.LevelResource.ROOT), cache.arenaagents$cachedProfilesByName(), name);
 	}
 
@@ -1553,6 +1553,12 @@ public final class CodexAgentManager {
 				findAgentPlayer(record.agentId()).ifPresent(entity -> trackChunkTicket(record.agentId(), entity, now));
 			}
 		}
+	}
+
+	void requireStableDirectorTransfer(AgentId id) {
+		if (pendingPlayerSpawns.containsKey(id) || pendingVerifiedRespawns.containsKey(id)
+				|| cancelledPlayerSpawns.active(System.currentTimeMillis()).stream().anyMatch(value -> value.agentId().equals(id)))
+			throw new AgentDomainException("ACTOR_TRANSFER_PENDING", "Wait for the agent's current spawn or respawn to finish before moving it to the cast");
 	}
 
 	public AgentRecord remove(String selector) {

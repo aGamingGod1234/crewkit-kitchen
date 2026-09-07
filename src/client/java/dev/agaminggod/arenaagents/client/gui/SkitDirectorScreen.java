@@ -4,6 +4,7 @@ import com.mojang.brigadier.arguments.StringArgumentType;
 import dev.agaminggod.arenaagents.agent.AgentConstants;
 import dev.agaminggod.arenaagents.client.camera.CameraDirectorClient;
 import dev.agaminggod.arenaagents.client.control.AgentControlClient;
+import dev.agaminggod.arenaagents.client.control.DirectorClientState;
 import dev.agaminggod.arenaagents.client.gui.widget.ConsoleButton;
 import dev.agaminggod.arenaagents.client.gui.widget.ConsoleCycleButton;
 import dev.agaminggod.arenaagents.client.gui.widget.ConsoleEditBox;
@@ -29,7 +30,7 @@ public final class SkitDirectorScreen extends Screen {
 	private static final int ACCENT = ConsoleTheme.ACCENT;
 	private static final int SUCCESS = ConsoleTheme.SUCCESS;
 	private static final int ERROR = ConsoleTheme.ERROR;
-	private static final int ROW = 24;
+	private static final int ROW = 26;
 	private static final int GAP = 6;
 	private static final List<String> PROVIDERS = List.of("codex", "claude", "gemini", "kimi", "cursor");
 	private static final List<String> ACTIONS = List.of("move", "wait", "jump", "equip", "use", "swing", "emote");
@@ -48,7 +49,8 @@ public final class SkitDirectorScreen extends Screen {
 	private boolean buildingContent;
 	private Tab tab = Tab.SPAWN;
 	private String provider = "codex";
-	private String model = "";
+	private String selectedActor = "";
+	private final Map<ConsoleEditBox, String> fieldLabels = new HashMap<>();
 	private String selectedAction = "move";
 	private String voice = VOICES.getFirst();
 	private String tone = "neutral";
@@ -57,7 +59,7 @@ public final class SkitDirectorScreen extends Screen {
 	private String feedback = "";
 	private boolean feedbackError;
 	private ConsoleEditBox actorName;
-	private ConsoleEditBox actorSelector;
+	private String legacyAgent = "";
 	private ConsoleEditBox scriptName;
 	private ConsoleEditBox actionArgs;
 	private ConsoleEditBox right;
@@ -86,6 +88,7 @@ public final class SkitDirectorScreen extends Screen {
 	@Override
 	protected void init() {
 		clearFields();
+		fieldLabels.clear();
 		scrollRows = Math.min(scrollRows, maxScrollRows());
 		int left = panelLeft();
 		int top = panelTop();
@@ -94,8 +97,8 @@ public final class SkitDirectorScreen extends Screen {
 		for (int index = 0; index < Tab.values().length; index++) {
 			Tab value = Tab.values()[index];
 			int x = left + index * (tabWidth + GAP);
-			addRenderableWidget(button(value.label, x, top + (compact() ? 14 : 42),
-					index == 3 ? left + width - x : tabWidth, ROW, value == tab,
+			addRenderableWidget(button(value.label, x, top + (compact() ? 12 : 42),
+					index == 3 ? left + width - x : tabWidth, compact() ? 24 : ROW, value == tab,
 					() -> { tab = value; scrollRows = 0; rebuildWidgets(); }));
 		}
 		buildingContent = true;
@@ -110,47 +113,75 @@ public final class SkitDirectorScreen extends Screen {
 	}
 
 	private void clearFields() {
-		actorName = actorSelector = scriptName = actionArgs = right = up = forward = null;
+		actorName = scriptName = actionArgs = right = up = forward = null;
 		voiceText = voiceScript = voiceDelay = cameraPath = null;
 	}
 
 	private void initSpawn() {
 		int[] c = columns();
 		int y = contentTop();
-		List<String> providers = PROVIDERS.stream().filter(value -> !models(value).isEmpty()).toList();
-		if (providers.isEmpty()) {
-			feedback = "No supported actor providers are available";
-			feedbackError = true;
+		actorName = addEdit("New actor name", "Name", c[0], y, c[2], AgentConstants.MAX_USER_NAME_LENGTH, "director-actor-name");
+		addRenderableWidget(new ConsoleCycleButton<>(font, c[1], y, c[2], ROW, Component.literal("Appearance"),
+				PROVIDERS, provider, this::title, value -> provider = value)).visible = contentVisible(y, ROW);
+		y += ROW + GAP;
+		addRenderableWidget(primary("Spawn here", c[0], y, c[2], ROW, this::summon));
+		boolean enabled = DirectorClientState.snapshot().map(value -> value.enabled()).orElse(false);
+		ConsoleButton mode = button(enabled ? "Disable Director" : "Enable Director", c[1], y, c[2], ROW, enabled,
+				() -> send("codex skit " + (enabled ? "off" : "on"), "Mode change requested"));
+		mode.active = DirectorClientState.snapshot().map(value -> value.canControl()).orElse(false);
+		addRenderableWidget(mode);
+		y += ROW + GAP;
+		addActorPicker(c[0], y, c[2] * 2 + GAP);
+		y += ROW + GAP;
+		addRenderableWidget(button("Respawn", c[0], y, c[2], ROW, false,
+				() -> send("codex skit respawn " + actorTarget(), "Respawn requested")));
+		addRenderableWidget(button("Remove from cast", c[1], y, c[2], ROW, false,
+				() -> send("codex skit remove " + actorTarget(), "Removal requested")));
+		y += ROW + GAP;
+		int third = (c[2] * 2 - GAP) / 3;
+		right = addEdit("Right", "0", c[0], y, third, 24, "director-right");
+		up = addEdit("Up", "0", c[0] + third + GAP, y, third, 24, "director-up");
+		forward = addEdit("Forward", "2", c[0] + 2 * (third + GAP), y, third, 24, "director-forward");
+		y += ROW + GAP;
+		addRenderableWidget(button("Place here", c[0], y, c[2], ROW, false, () -> place("here")));
+		addRenderableWidget(button("Place relative to me", c[1], y, c[2], ROW, false, () -> place("relative")));
+		y += ROW + GAP;
+		addRenderableWidget(button("Face where I look", c[0], y, c[2], ROW, false, () -> place("look_at")));
+		var legacy = DirectorClientState.importCandidates();
+		if (!legacy.isEmpty()) {
+			y += ROW + GAP;
+			if (legacy.stream().noneMatch(agent -> agent.agentId().equals(legacyAgent))) legacyAgent = legacy.getFirst().agentId();
+			addRenderableWidget(new ConsoleCycleButton<>(font, c[0], y, c[2], ROW, Component.literal("Agent"),
+					legacy.stream().map(agent -> agent.agentId()).toList(), legacyAgent,
+					id -> Component.literal(legacy.stream().filter(agent -> agent.agentId().equals(id)).findFirst().orElseThrow().displayName()),
+					value -> legacyAgent = value)).visible = contentVisible(y, ROW);
+			addRenderableWidget(button("Move to cast", c[1], y, c[2], ROW, false,
+					() -> send("codex skit adopt " + word(legacyAgent), "Move to cast requested")));
+		}
+	}
+
+	private void addActorPicker(int x, int y, int width) {
+		var actors = DirectorClientState.snapshot().map(value -> value.actors()).orElse(List.of());
+		if (actors.isEmpty()) {
+			selectedActor = "";
+			ConsoleButton empty = button("Cast is empty", x, y, width, ROW, false, () -> { });
+			empty.active = false;
+			addRenderableWidget(empty);
 			return;
 		}
-		if (!providers.contains(provider)) provider = providers.getFirst();
-		if (!models(provider).contains(model)) model = models(provider).getFirst();
-		addRenderableWidget(new ConsoleCycleButton<>(font, c[0], y, c[2], ROW, Component.literal("Provider"),
-				providers, provider, this::title, value -> { provider = value; model = models(value).getFirst(); rebuildWidgets(); })).visible = contentVisible(y, ROW);
-		addRenderableWidget(new ConsoleCycleButton<>(font, c[1], y, c[2], ROW, Component.literal("Model"),
-				models(provider), model, value -> Component.literal(displayModel(provider, value)), value -> model = value)).visible = contentVisible(y, ROW);
-		y += ROW + GAP;
-		actorName = addEdit("Actor name", "Actor name (required)", c[0], y, c[2], AgentConstants.MAX_USER_NAME_LENGTH, "director-actor-name");
-		actorSelector = addEdit("Agent selector", "agent name or @e", c[1], y, c[2], 64, "director-actor-selector");
-		y += ROW + GAP;
-		ConsoleButton mode = button("Enable skit mode", c[0], y, c[2], ROW, false, () -> send("codex skit on", "Skit mode enabled"));
-		addRenderableWidget(mode);
-		addRenderableWidget(primary("Spawn at my position", c[1], y, c[2], ROW, this::summon));
-		y += ROW + GAP;
-		right = addEdit("Right", "0", c[0], y, (c[2] - GAP) / 2, 24, "director-right");
-		up = addEdit("Up", "0", c[0] + (c[2] + GAP) / 2, y, (c[2] - GAP) / 2, 24, "director-up");
-		y += ROW + GAP;
-		forward = addEdit("Forward", "2", c[0], y, c[2], 24, "director-forward");
-		addRenderableWidget(button("Place here", c[1], y, c[2], ROW, false, () -> place("here")));
-		y += ROW + GAP;
-		addRenderableWidget(button("Place relative to me", c[0], y, c[2], ROW, false, () -> place("relative")));
-		addRenderableWidget(button("Face where I look", c[1], y, c[2], ROW, false, () -> place("look_at")));
+		if (actors.stream().noneMatch(actor -> actor.id().equals(selectedActor))) selectedActor = actors.getFirst().id();
+		addRenderableWidget(new ConsoleCycleButton<>(font, x, y, width, ROW, Component.literal("Cast"),
+				actors.stream().map(actor -> actor.id()).toList(), selectedActor, id -> {
+					var actor = actors.stream().filter(value -> value.id().equals(id)).findFirst().orElseThrow();
+					return Component.literal(actor.name() + (actor.dead() ? " / Dead" : actor.present() ? " / Alive" : " / Offline"));
+				}, value -> selectedActor = value)).visible = contentVisible(y, ROW);
 	}
+	private String actorTarget() { return word(selectedActor); }
 
 	private void initActions() {
 		int[] c = columns();
 		int y = contentTop();
-		actorSelector = addEdit("Agent selector", "agent name or @e", c[0], y, c[2], 64, "director-action-selector");
+		addActorPicker(c[0], y, c[2]);
 		scriptName = addEdit("Script name", "intro", c[1], y, c[2], 64, "director-script-name");
 		y += ROW + GAP;
 		addRenderableWidget(new ConsoleCycleButton<>(font, c[0], y, c[2], ROW, Component.literal("Action"), ACTIONS,
@@ -167,7 +198,7 @@ public final class SkitDirectorScreen extends Screen {
 	private void initVoice() {
 		int[] c = columns();
 		int y = contentTop();
-		actorSelector = addEdit("Agent selector", "agent name or @e", c[0], y, c[2], 64, "director-voice-selector");
+		addActorPicker(c[0], y, c[2]);
 		addRenderableWidget(new ConsoleCycleButton<>(font, c[1], y, c[2], ROW, Component.literal("Voice"), VOICES,
 				voice, Component::literal, value -> voice = value)).visible = contentVisible(y, ROW);
 		y += ROW + GAP;
@@ -190,7 +221,7 @@ public final class SkitDirectorScreen extends Screen {
 		addRenderableWidget(button("Add cue", c[1], y, c[2], ROW, false, () -> voiceScriptCommand("add")));
 		y += ROW + GAP;
 		addRenderableWidget(primary("Play voice script", c[0], y, c[2], ROW, () -> voiceScriptCommand("play")));
-		addRenderableWidget(button("Stop voice", c[1], y, c[2], ROW, false, () -> send("codex skit voice script stop " + word(actorSelector.getValue()), "Voice stopped")));
+		addRenderableWidget(button("Stop voice", c[1], y, c[2], ROW, false, () -> send("codex skit voice script stop " + actorTarget(), "Voice stopped")));
 	}
 
 	private void initCamera() {
@@ -223,15 +254,15 @@ public final class SkitDirectorScreen extends Screen {
 		if (name.isBlank()) {
 			feedback = "Enter an actor name first";
 			feedbackError = true;
-			LOGGER.info("Director spawn rejected locally: actor name is blank; provider={}, model={}", provider, model);
+			LOGGER.info("Director spawn rejected locally: actor name is blank");
 			return;
 		}
-		send("codex skit summon " + provider + " model " + word(model) + " " + word(name), "Spawning " + name);
+		send("codex skit summon " + provider + " " + word(name), "Spawning " + name);
 	}
 
 	private void place(String mode) {
-		if (actorSelector == null) return;
-		String selector = word(actorSelector.getValue().strip());
+
+		String selector = actorTarget();
 		String command = switch (mode) {
 			case "here" -> "codex skit place " + selector + " here";
 			case "relative" -> "codex skit place " + selector + " relative " + number(right, "0") + " " + number(up, "0") + " " + number(forward, "2");
@@ -248,7 +279,7 @@ public final class SkitDirectorScreen extends Screen {
 	}
 
 	private void createScript() {
-		if (scriptName != null && actorSelector != null) send("codex skit script create " + word(scriptName.getValue()) + " " + word(actorSelector.getValue()), "Script created");
+		if (scriptName != null) send("codex skit script create " + word(scriptName.getValue()) + " " + actorTarget(), "Script created");
 	}
 
 	private void addAction() {
@@ -260,7 +291,7 @@ public final class SkitDirectorScreen extends Screen {
 
 	private void scriptCommand(String operation) {
 		if (scriptName == null && !operation.equals("stop")) return;
-		String selector = actorSelector == null ? "" : actorSelector.getValue().strip();
+		String selector = selectedActor;
 		send(scriptCommand(operation, scriptName == null ? "" : scriptName.getValue(), selector), "Script " + operation + " sent");
 	}
 
@@ -276,20 +307,20 @@ public final class SkitDirectorScreen extends Screen {
 	}
 
 	private void setVoice() {
-		if (actorSelector == null) return;
-		send("codex skit voice profile " + word(actorSelector.getValue()) + " " + voice + " " + tone + " " + speed + " " + radius, "Voice profile set");
+
+		send("codex skit voice profile " + actorTarget() + " " + voice + " " + tone + " " + speed + " " + radius, "Voice profile set");
 	}
 
 	private void sayLine() {
-		if (actorSelector == null || voiceText == null) return;
-		send(lineCommand("codex skit voice say " + word(actorSelector.getValue()), voiceText.getValue()), "Line sent");
+		if (voiceText == null) return;
+		send(lineCommand("codex skit voice say " + actorTarget(), voiceText.getValue()), "Line sent");
 	}
 
 	private void voiceScriptCommand(String operation) {
-		if (voiceScript == null || actorSelector == null) return;
+		if (voiceScript == null) return;
 		String name = word(voiceScript.getValue());
-		if (operation.equals("create")) send("codex skit voice script create " + name + " " + word(actorSelector.getValue()), "Voice script created");
-		else if (operation.equals("play")) send("codex skit voice script play " + name + " " + word(actorSelector.getValue()), "Voice script playing");
+		if (operation.equals("create")) send("codex skit voice script create " + name + " " + actorTarget(), "Voice script created");
+		else if (operation.equals("play")) send("codex skit voice script play " + name + " " + actorTarget(), "Voice script playing");
 		else if (voiceText != null) send(lineCommand("codex skit voice script add " + name + " " + number(voiceDelay, "0"), voiceText.getValue()), "Cue added");
 	}
 
@@ -327,13 +358,14 @@ public final class SkitDirectorScreen extends Screen {
 	}
 
 	private ConsoleEditBox addEdit(String label, String placeholder, int x, int y, int width, int limit, String identity) {
-		ConsoleEditBox edit = new ConsoleEditBox(font, x, y, width, ROW, Component.literal(label), Component.literal(placeholder), identity);
+		ConsoleEditBox edit = new ConsoleEditBox(font, x, y + 10, width, ROW - 10, Component.literal(label), Component.literal(placeholder), identity);
 		edit.setMaxLength(limit);
 		String key = identity.endsWith("selector") ? "actor-selector" : identity;
 		edit.setValue(drafts.getOrDefault(key, ""));
 		edit.setResponder(value -> drafts.put(key, value));
 		edit.visible = contentVisible(y, ROW);
 		addRenderableWidget(edit);
+		fieldLabels.put(edit, label);
 		return edit;
 	}
 
@@ -383,10 +415,10 @@ public final class SkitDirectorScreen extends Screen {
 		graphics.fill(0, 0, width, height, BACKDROP);
 		graphics.fill(left - 1, top - 1, right + 1, bottom + 1, PANEL_EDGE);
 		graphics.fill(left, top, right, bottom, PANEL);
-		graphics.text(font, "Skit Director", left + 16, top + (compact() ? 2 : 12), TEXT, false);
+		graphics.text(font, "Director", left + 16, top + (compact() ? 2 : 12), TEXT, false);
 		if (!compact()) {
-			graphics.text(font, font.plainSubstrByWidth("Place actors, compose motion, direct voices, and record camera takes", panelWidth() - 32), left + 16, top + 25, MUTED, false);
-			graphics.text(font, font.plainSubstrByWidth(tab.help, panelWidth() - 32), left + 16, top + 63, ACCENT, false);
+			graphics.text(font, font.plainSubstrByWidth("Cast, actions, voice and camera", panelWidth() - 32), left + 16, top + 25, MUTED, false);
+			graphics.text(font, font.plainSubstrByWidth(tab.help, panelWidth() - 32), left + 16, top + 72, ACCENT, false);
 		}
 		if (!feedback.isBlank()) graphics.text(font, font.plainSubstrByWidth(feedback, panelWidth() - 164), left + 152, bottom - 22, feedbackError ? ERROR : SUCCESS, false);
 		if (maxScrollRows() > 0) {
@@ -397,22 +429,26 @@ public final class SkitDirectorScreen extends Screen {
 			graphics.fill(right - 8, trackTop, right - 6, trackTop + trackHeight, PANEL_EDGE);
 			graphics.fill(right - 8, thumbY, right - 6, thumbY + thumb, MUTED);
 		}
+		fieldLabels.forEach((edit, label) -> { if (edit.visible) graphics.text(font, font.plainSubstrByWidth(label, edit.getWidth()), edit.getX(), edit.getY() - 14, MUTED, false); });
 		super.extractRenderState(graphics, mouseX, mouseY, partialTick);
 	}
 
 	@Override
 	public void onClose() {
-		if (minecraft != null && parent != null) minecraft.setScreen(parent);
+		if (minecraft != null && parent != null) {
+			if (parent instanceof AgentControlScreen console) AgentControlClient.snapshot().ifPresent(console::acceptSnapshot);
+			minecraft.setScreen(parent);
+		}
 		else super.onClose();
 	}
 
 	private int panelWidth() { return Math.min(760, Math.max(300, width - 20)); }
-	private int panelHeight() { return Math.min(390, Math.max(0, height - 20)); }
+	private int panelHeight() { return Math.min(460, Math.max(0, height - 20)); }
 	private int panelLeft() { return (width - panelWidth()) / 2; }
 	private int panelTop() { return (height - panelHeight()) / 2; }
 	private boolean compact() { return panelHeight() < 180; }
-	private static int contentOffset(int panelHeight) { return panelHeight < 180 ? 44 : 78; }
-	private static int contentBottomInset(int panelHeight) { return panelHeight < 180 ? 30 : 42; }
+	private static int contentOffset(int panelHeight) { return panelHeight < 180 ? 42 : 90; }
+	private static int contentBottomInset(int panelHeight) { return panelHeight < 180 ? 32 : 42; }
 	private int contentBottom() { return panelTop() + panelHeight() - contentBottomInset(panelHeight()); }
 	private int contentTop() { return panelTop() + contentOffset(panelHeight()) - scrollRows * (ROW + GAP); }
 	private int maxScrollRows() { return maxScrollRows(panelHeight(), tab.rows); }
@@ -441,21 +477,10 @@ public final class SkitDirectorScreen extends Screen {
 		String value = edit == null ? "" : edit.getValue().strip();
 		return value.isEmpty() ? fallback : value;
 	}
-	private static List<String> models(String selectedProvider) {
-		String catalogProvider = selectedProvider.equals("claude") ? "gemini" : selectedProvider;
-		try { return AgentControlCatalog.models(catalogProvider).stream()
-				.filter(value -> !selectedProvider.equals("claude") || value.startsWith("claude-"))
-				.toList(); }
-		catch (IllegalArgumentException ignored) { return List.of(); }
-	}
-	private String displayModel(String selectedProvider, String selectedModel) {
-		String catalogProvider = selectedProvider.equals("claude") ? "gemini" : selectedProvider;
-		return AgentControlCatalog.displayName(catalogProvider, selectedModel);
-	}
 	private Component title(String value) { return Component.literal(value.substring(0, 1).toUpperCase(Locale.ROOT) + value.substring(1)); }
 
 	private enum Tab {
-		SPAWN("Spawn", "Summon a branded actor and place it where you are staging the shot.", 6),
+		SPAWN("Cast", "Select a cast member to place or respawn.", 8),
 		ACTIONS("Actions", "Build a reusable movement script one action at a time.", 4),
 		VOICE("Voice", "Choose a voice, delivery tone, and line without leaving the world.", 7),
 		CAMERA("Camera", "Record smooth keyframes, then play the take once or on a loop.", 4);

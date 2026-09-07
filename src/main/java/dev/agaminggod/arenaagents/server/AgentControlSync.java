@@ -1,5 +1,6 @@
 package dev.agaminggod.arenaagents.server;
 
+import dev.agaminggod.arenaagents.control.DirectorSnapshotPayload;
 import dev.agaminggod.arenaagents.control.AgentControlRequestPayload;
 import dev.agaminggod.arenaagents.control.AgentControlGroup;
 import dev.agaminggod.arenaagents.control.AgentControlSnapshot;
@@ -51,6 +52,7 @@ public final class AgentControlSync {
 		PayloadTypeRegistry.serverboundPlay().register(ScenarioLaunchPayload.TYPE, ScenarioLaunchPayload.CODEC);
 		PayloadTypeRegistry.serverboundPlay().register(ScenarioCancelPayload.TYPE, ScenarioCancelPayload.CODEC);
 		PayloadTypeRegistry.clientboundPlay().register(AgentControlSnapshotPayload.TYPE, AgentControlSnapshotPayload.CODEC);
+		PayloadTypeRegistry.clientboundPlay().register(DirectorSnapshotPayload.TYPE, DirectorSnapshotPayload.CODEC);
 		PayloadTypeRegistry.clientboundPlay().register(
 				ArenaSpectatorSnapshotPayload.TYPE,
 				ArenaSpectatorSnapshotPayload.CODEC
@@ -320,6 +322,13 @@ public final class AgentControlSync {
 
 	public static void sendSnapshot(ServerPlayer player) {
 		try {
+			var server = player.level().getServer();
+			if (ServerPlayNetworking.canSend(player, DirectorSnapshotPayload.TYPE)) {
+				var actors = SkitActors.records(server).stream().map(actor -> new DirectorSnapshotPayload.Actor(
+						actor.agentId().toString(), actor.name(), dev.agaminggod.arenaagents.agent.AgentIdentity.playerName(actor.agentId(), actor.profile()),
+						actor.appearance(), actor.dead(), SkitActors.find(server, actor.agentId()).filter(ServerPlayer::isAlive).isPresent())).toList();
+				ServerPlayNetworking.send(player, new DirectorSnapshotPayload(SkitModeRuntime.enabled(server), GoalControl.mayControl(player.createCommandSourceStack()), actors));
+			}
 			boolean canControl = GoalControl.mayControl(player.createCommandSourceStack());
 			CodexAgentManager manager = CodexAgentManager.get(player.level().getServer());
 			AgentControlSnapshot snapshot = AgentControlSnapshot.fromRecords(

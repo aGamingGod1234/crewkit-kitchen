@@ -28,6 +28,12 @@ abstract class AbstractClientPlayerMixin {
 			// an agent's skin when the roster snapshot is already available.
 			if (!player.getUUID().equals(AgentIdentity.offlinePlayerUuid(agent.playerName()))) return;
 			identity = AgentVisualIdentity.resolve(agent.provider(), agent.model(), agent.skinVariant());
+		} else if (AgentControlClient.directorSnapshot().stream().flatMap(value -> value.actors().stream())
+				.anyMatch(actor -> actor.playerName().equals(profileName) && player.getUUID().equals(AgentIdentity.offlinePlayerUuid(actor.playerName())))) {
+			var actor = AgentControlClient.directorSnapshot().orElseThrow().actors().stream().filter(value -> value.playerName().equals(profileName)).findFirst().orElseThrow();
+			identity = actor.appearance().equals("claude")
+					? AgentVisualIdentity.resolve("gemini", "claude-sonnet-4-6", 0)
+					: AgentVisualIdentity.resolveProviderFallback(actor.appearance(), 0);
 		} else {
 			// A fake player can render before the first roster snapshot reaches the
 			// client. The technical transport/recognizable name still carries enough

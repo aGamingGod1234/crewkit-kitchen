@@ -176,6 +176,15 @@ public final class CodexAgentCommands {
 						.then(Commands.argument("name", StringArgumentType.string()).executes(CodexAgentCommands::skitSummon))));
 		summon.then(provider);
 		skit.then(summon);
+		skit.then(Commands.literal("adopt").then(agentArgument().executes(context -> {
+			try {
+				SkitActors.adopt(context.getSource().getLevel(), context.getSource().getPosition(), StringArgumentType.getString(context, ARGUMENT_AGENT));
+				context.getSource().sendSuccess(() -> Component.literal("Moved to Director cast. Select the actor and Respawn."), false);
+				return 1;
+			} catch (AgentDomainException exception) { throw commandFailure(exception); }
+		})));
+		skit.then(Commands.literal("respawn").then(actorArgument().executes(context -> actorControl(context, false))));
+		skit.then(Commands.literal("remove").then(actorArgument().executes(context -> actorControl(context, true))));
 
 		var at = Commands.literal("at");
 		var position = Commands.argument("position", Vec3Argument.vec3(false));
@@ -193,7 +202,7 @@ public final class CodexAgentCommands {
 				.then(Commands.argument("target", Vec3Argument.vec3(false))
 						.executes(CodexAgentCommands::placeLookingAt));
 		var place = Commands.literal("place");
-		place.then(agentArgument()
+		place.then(actorArgument()
 				.then(Commands.literal("here").executes(CodexAgentCommands::placeHere))
 				.then(at)
 				.then(relative)
@@ -202,7 +211,7 @@ public final class CodexAgentCommands {
 
 		var create = Commands.literal("create");
 		create.then(Commands.argument("script", StringArgumentType.word())
-				.then(agentArgument().executes(CodexAgentCommands::createSkitScript)));
+				.then(actorArgument().executes(CodexAgentCommands::createSkitScript)));
 		var add = Commands.literal("add");
 		var addScript = Commands.argument("script", StringArgumentType.word());
 		var delay = Commands.argument("delay", IntegerArgumentType.integer(0, SkitStep.MAX_DELAY_TICKS));
@@ -217,7 +226,7 @@ public final class CodexAgentCommands {
 		var play = Commands.literal("play");
 		var playScript = Commands.argument("script", StringArgumentType.word())
 				.executes(context -> playSkitScript(context, null));
-		playScript.then(agentArgument().executes(context -> playSkitScript(
+		playScript.then(actorArgument().executes(context -> playSkitScript(
 				context, StringArgumentType.getString(context, ARGUMENT_AGENT))));
 		play.then(playScript);
 		var script = Commands.literal("script");
@@ -225,7 +234,7 @@ public final class CodexAgentCommands {
 				.then(Commands.literal("delete").then(Commands.argument("script", StringArgumentType.word())
 						.executes(CodexAgentCommands::deleteSkitScript)))
 				.then(play).then(Commands.literal("stop")
-						.then(agentArgument().executes(CodexAgentCommands::stopSkitScript)))
+						.then(actorArgument().executes(CodexAgentCommands::stopSkitScript)))
 				.then(actionCommand());
 		skit.then(script);
 		skit.then(voiceCommands());
@@ -247,7 +256,7 @@ public final class CodexAgentCommands {
 	private static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> voiceCommands() {
 		var voice = Commands.literal("voice");
 		var profile = Commands.literal("profile")
-				.then(agentArgument().then(Commands.argument("profile", StringArgumentType.word())
+				.then(actorArgument().then(Commands.argument("profile", StringArgumentType.word())
 						.suggests((context, builder) -> SharedSuggestionProvider.suggest(VOICE_PROFILE_IDS, builder))
 						.executes(CodexAgentCommands::setVoiceProfile)
 						.then(Commands.argument("tone", StringArgumentType.word())
@@ -261,14 +270,14 @@ public final class CodexAgentCommands {
 		voice.then(Commands.literal("profiles").executes(CodexAgentCommands::listVoiceProfiles));
 
 		var say = Commands.literal("say")
-				.then(agentArgument().then(Commands.argument("text", StringArgumentType.greedyString())
+				.then(actorArgument().then(Commands.argument("text", StringArgumentType.greedyString())
 						.executes(CodexAgentCommands::sayVoice)));
 		voice.then(say);
 
 		var script = Commands.literal("script");
 		script.then(Commands.literal("create")
 				.then(Commands.argument("name", StringArgumentType.word())
-						.then(agentArgument().executes(CodexAgentCommands::createVoiceScript))));
+						.then(actorArgument().executes(CodexAgentCommands::createVoiceScript))));
 		var add = Commands.literal("add")
 				.then(Commands.argument("name", StringArgumentType.word())
 						.then(Commands.argument("delay", IntegerArgumentType.integer(0, VoiceCue.MAX_DELAY_TICKS))
@@ -278,11 +287,11 @@ public final class CodexAgentCommands {
 		script.then(Commands.literal("play")
 				.then(Commands.argument("name", StringArgumentType.word())
 						.executes(context -> playVoiceScript(context, null))
-						.then(agentArgument().executes(context -> playVoiceScript(
+						.then(actorArgument().executes(context -> playVoiceScript(
 								context, StringArgumentType.getString(context, ARGUMENT_AGENT))))));
 		script.then(Commands.literal("list").executes(CodexAgentCommands::listVoiceScripts));
 		script.then(Commands.literal("stop")
-				.then(agentArgument().executes(CodexAgentCommands::stopVoiceScript)));
+				.then(actorArgument().executes(CodexAgentCommands::stopVoiceScript)));
 		voice.then(script);
 		return voice;
 	}
@@ -295,7 +304,7 @@ public final class CodexAgentCommands {
 				.then(goalDraftChoice("cancel", GoalDraftChoice.CANCEL))
 				.then(Commands.literal("complete")
 						.requires(GoalControl::mayControl)
-						.then(agentArgument().executes(CodexAgentCommands::confirmCompletion)));
+						.then(actorArgument().executes(CodexAgentCommands::confirmCompletion)));
 	}
 
 	private static int confirmCompletion(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
@@ -403,16 +412,8 @@ public final class CodexAgentCommands {
 				case PROVIDER_CURSOR -> "composer-2.5";
 				default -> throw new AgentDomainException("INVALID_PROVIDER", "Unsupported skit provider: " + provider);
 			});
-			String managerProvider = PROVIDER_CLAUDE.equals(provider) ? PROVIDER_GEMINI : provider;
-			String reasoning = AgentControlCatalog.defaultReasoning(managerProvider, model);
-			LOGGER.info("Skit spawn requested: provider={}, runtimeProvider={}, model={}, reasoning={}, nameLength={}",
-					provider, managerProvider, model, reasoning, name.length());
-			AgentRecord record = manager(context).summon(
-					context.getSource().getLevel(), position, managerProvider, model, reasoning,
-					PROVIDER_CODEX.equals(provider) ? DEFAULT_CODEX_SERVICE_TIER : "priority",
-					Optional.of(name), AgentGameMode.SURVIVAL);
-			LOGGER.info("Skit spawn accepted: agentId={}, state={}", record.agentId(), record.state());
-			context.getSource().sendSuccess(() -> Component.literal("Creating skit agent " + manager(context).displayName(record) + "."), false);
+			SkitActor actor = SkitActors.summon(context.getSource().getLevel(), position, provider, name);
+			context.getSource().sendSuccess(() -> Component.literal("Created Director actor " + actor.name() + "."), false);
 			return 1;
 		} catch (AgentDomainException exception) {
 			LOGGER.warn("Skit spawn rejected: code={}", exception.code());
@@ -420,6 +421,16 @@ public final class CodexAgentCommands {
 		} catch (RuntimeException exception) {
 			throw unexpectedFailure("skit summon", exception);
 		}
+	}
+
+	private static int actorControl(CommandContext<CommandSourceStack> context, boolean remove) throws CommandSyntaxException {
+		try {
+			String selector = StringArgumentType.getString(context, ARGUMENT_AGENT);
+			if (remove) SkitActors.remove(context.getSource().getServer(), selector);
+			else SkitActors.respawn(context.getSource().getServer(), selector);
+			context.getSource().sendSuccess(() -> Component.literal(remove ? "Actor removed from cast" : "Actor respawned"), false);
+			return 1;
+		} catch (AgentDomainException exception) { throw commandFailure(exception); }
 	}
 
 	private static Optional<String> explicitModel(CommandContext<CommandSourceStack> context) {
@@ -580,7 +591,7 @@ public final class CodexAgentCommands {
 			String tone = getOptionalString(context, "tone", VoiceProfile.DEFAULT_TONE);
 			double speed = getOptionalDouble(context, "speed", VoiceProfile.DEFAULT_SPEED);
 			int radius = getOptionalInt(context, "radius", VoiceProfile.DEFAULT_RADIUS);
-			AgentId agentId = manager(context).resolve(selector).agentId();
+			AgentId agentId = SkitActors.resolve(context.getSource().getServer(), selector).agentId();
 			VoiceDirector.setProfile(context.getSource().getServer(), agentId, new VoiceProfile(profileId, tone, speed, radius));
 			context.getSource().sendSuccess(() -> Component.literal("Voice profile set for " + selector + "."), false);
 			return 1;
@@ -593,7 +604,7 @@ public final class CodexAgentCommands {
 
 	private static int sayVoice(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
 		try {
-			AgentId agentId = manager(context).resolve(StringArgumentType.getString(context, ARGUMENT_AGENT)).agentId();
+			AgentId agentId = SkitActors.resolve(context.getSource().getServer(), StringArgumentType.getString(context, ARGUMENT_AGENT)).agentId();
 			VoiceDirector.say(context.getSource().getServer(), agentId, StringArgumentType.getString(context, "text"));
 			return 1;
 		} catch (AgentDomainException exception) {
@@ -659,7 +670,7 @@ public final class CodexAgentCommands {
 
 	private static int stopVoiceScript(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
 		try {
-			AgentId agentId = manager(context).resolve(StringArgumentType.getString(context, ARGUMENT_AGENT)).agentId();
+			AgentId agentId = SkitActors.resolve(context.getSource().getServer(), StringArgumentType.getString(context, ARGUMENT_AGENT)).agentId();
 			VoiceDirector.stop(context.getSource().getServer(), agentId);
 			context.getSource().sendSuccess(() -> Component.literal("Stopped voice playback."), false);
 			return 1;
@@ -845,6 +856,12 @@ public final class CodexAgentCommands {
 		return Commands.literal(literal).requires(GoalControl::mayControl).then(
 				agentArgument().executes(context -> runAgentOperation(context, literal, operation))
 		);
+	}
+
+	private static com.mojang.brigadier.builder.RequiredArgumentBuilder<CommandSourceStack, String> actorArgument() {
+		return Commands.argument(ARGUMENT_AGENT, StringArgumentType.string()).suggests((context, builder) ->
+				SharedSuggestionProvider.suggest(SkitActors.records(context.getSource().getServer()).stream()
+						.map(actor -> StringArgumentType.escapeIfRequired(actor.name())).toList(), builder));
 	}
 
 	private static com.mojang.brigadier.builder.RequiredArgumentBuilder<CommandSourceStack, String> agentArgument() {

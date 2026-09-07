@@ -142,6 +142,8 @@ public final class AgentControlScreen extends Screen {
 	) {
 		AgentControlSnapshot checkedSnapshot = Objects.requireNonNull(nextSnapshot, "nextSnapshot must not be null");
 		if (!mutationState.accepts(checkedSnapshot.generatedAtEpochMs())) return;
+		contentChanged = contentChanged || snapshot == null || !snapshot.agents().equals(checkedSnapshot.agents())
+				|| !snapshot.groups().equals(checkedSnapshot.groups()) || !snapshot.catalog().equals(checkedSnapshot.catalog());
 		boolean mutationWasPending = mutationState.mutationPending();
 		mutationState = mutationState.accept(checkedSnapshot.generatedAtEpochMs(), acknowledgedMutationId);
 		if (!contentChanged) {
@@ -1024,13 +1026,9 @@ public final class AgentControlScreen extends Screen {
 	private void addOverviewFooter() {
 		int y = layout().footerY();
 		int x = contentLeft();
-		int buttonWidth = (contentWidth() - GAP * 2) / 3;
+		int buttonWidth = (contentWidth() - GAP) / 2;
 		addRenderableWidget(consoleButton("Refresh", x, y, buttonWidth, ROW_HEIGHT, false,
 				AgentControlClient::requestSnapshot));
-		ConsoleButton skit = consoleButton("Enable skit mode", x + buttonWidth + GAP, y, buttonWidth, ROW_HEIGHT, false,
-				() -> send("codex skit on", "Enabling skit mode..."));
-		skit.active = canControl();
-		addRenderableWidget(skit);
 		addRenderableWidget(consoleButton("Close", contentRight() - buttonWidth, y, buttonWidth, ROW_HEIGHT, false, this::onClose));
 	}
 

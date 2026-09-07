@@ -53,7 +53,7 @@ public final class SkitDirectorLayoutVerification {
 						if (!widget.visible) continue;
 						check(widget.getY() >= tabButton.getBottom() + 6 && widget.getBottom() <= back.getY() - 6,
 								"short-window content stays between tabs and footer");
-						check(widget.isMouseOver(widget.getX() + 1, widget.getY() + 1),
+						check(!widget.active || widget.isMouseOver(widget.getX() + 1, widget.getY() + 1),
 								"visible short-window widgets remain hit-testable");
 						reached.add(((ConsoleFocusTarget) widget).consoleFocusIdentity());
 						assertions += 2;
@@ -65,24 +65,21 @@ public final class SkitDirectorLayoutVerification {
 
 			((ConsoleButton) screen.children().getFirst()).onClick(null, false);
 			edit(screen, "actorName").setValue("Draft actor");
-			edit(screen, "actorSelector").setValue("Alex");
+			set(screen, SkitDirectorScreen.class, "selectedActor", "Alex");
 			((ConsoleButton) screen.children().get(2)).onClick(null, false);
-			check(edit(screen, "actorSelector").getValue().equals("Alex"), "actor selection survives tab rebuilds");
+			check(get(screen, "selectedActor").equals(""), "missing actor selection clears against the authoritative empty cast");
 			edit(screen, "voiceText").setValue("A drafted line");
 			screen.acceptCatalogUpdate();
 			check(edit(screen, "voiceText").getValue().equals("A drafted line"), "catalog rebuild preserves voice drafts");
 			((ConsoleButton) screen.children().getFirst()).onClick(null, false);
 			set(screen, SkitDirectorScreen.class, "provider", "claude");
-			set(screen, SkitDirectorScreen.class, "model", "claude-sonnet-4-6");
 			screen.acceptCatalogUpdate();
 			AgentControlCatalog.installRuntimeCatalog(List.of(new AgentControlModelOption(
 					"cursor", "replacement-model", "Replacement model", List.of("high"), List.of("priority"))));
 			screen.acceptCatalogUpdate();
-			check(get(screen, "provider").equals("cursor") && get(screen, "model").equals("replacement-model"),
-					"removing a Claude alias selects an available provider and model");
+			check(get(screen, "provider").equals("claude"), "actor appearance is independent of AI catalog changes");
 			check(edit(screen, "actorName").getValue().equals("Draft actor"), "catalog replacement preserves actor drafts");
-			check(((AbstractWidget) screen.children().get(5)).getMessage().getString().equals("Model: Replacement model"),
-					"rebuilt model widget formats against the replacement catalog");
+			check(screen.children().stream().noneMatch(child -> child instanceof AbstractWidget widget && widget.getMessage().getString().startsWith("Model:")), "cast creation has no AI model selector");
 			return assertions + 7;
 		} finally {
 			AgentControlCatalog.installRuntimeCatalog(previous);
@@ -102,11 +99,12 @@ public final class SkitDirectorLayoutVerification {
 			set(screen, Screen.class, field, new ArrayList<>());
 		}
 		set(screen, SkitDirectorScreen.class, "drafts", new HashMap<String, String>());
+		set(screen, SkitDirectorScreen.class, "fieldLabels", new HashMap<>());
 		Field tab = SkitDirectorScreen.class.getDeclaredField("tab");
 		tab.setAccessible(true);
 		tab.set(screen, tab.getType().getEnumConstants()[0]);
 		for (String[] entry : new String[][] {
-				{"provider", "codex"}, {"model", ""}, {"selectedAction", "move"}, {"voice", "voice.auto.v1"},
+				{"provider", "codex"}, {"selectedActor", ""}, {"legacyAgent", ""}, {"selectedAction", "move"}, {"voice", "voice.auto.v1"},
 				{"tone", "neutral"}, {"speed", "1.0"}, {"radius", "48"}, {"feedback", ""}}) {
 			set(screen, SkitDirectorScreen.class, entry[0], entry[1]);
 		}

@@ -150,6 +150,9 @@ public final class VoiceSubsystemRuntime {
 		manager.records().forEach(record -> manager.findAgentPlayer(record.agentId())
 				.filter(player -> player.isAlive())
 				.ifPresent(player -> current.put(record.agentId(), player.getUUID())));
+		dev.agaminggod.arenaagents.server.SkitActors.records(server).forEach(actor ->
+				dev.agaminggod.arenaagents.server.SkitActors.find(server, actor.agentId()).filter(net.minecraft.server.level.ServerPlayer::isAlive)
+						.ifPresent(player -> current.put(actor.agentId(), player.getUUID())));
 		AGENT_PLAYERS.put(server, Set.copyOf(current.values()));
 		try {
 			holder.tracker().reconcile(current, holder.subsystem());

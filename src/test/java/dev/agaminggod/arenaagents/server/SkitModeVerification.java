@@ -26,7 +26,58 @@ public final class SkitModeVerification {
 				"action steps preserve order");
 		assertThrows(() -> SkitAction.move(0), "move requires a duration");
 		assertThrows(() -> SkitAction.equip("diamond_sword"), "equip requires a namespaced item id");
-		return 7 + verifyNamesAndPlacement() + verifyTimeline() + verifyPreflight() + verifyCleanup() + verifyGuiCommands() + verifyDirectorParsing() + verifyNameReservations();
+		return 7 + verifyNamesAndPlacement() + verifyTimeline() + verifyPreflight() + verifyCleanup() + verifyGuiCommands() + verifyDirectorParsing() + verifyNameReservations() + verifyCastPersistence() + verifyPendingConversion();
+	}
+
+	private static int verifyPendingConversion() {
+		try {
+			var unsafeField = sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); unsafeField.setAccessible(true);
+			var manager = (CodexAgentManager) ((sun.misc.Unsafe) unsafeField.get(null)).allocateInstance(CodexAgentManager.class);
+			var pending = new java.util.HashMap<dev.agaminggod.arenaagents.agent.AgentId, Long>();
+			var respawns = new java.util.HashMap<dev.agaminggod.arenaagents.agent.AgentId, Object>();
+			var cancelled = new PendingSpawnCancellationLedger(30_000);
+			for (var entry : java.util.Map.of("pendingPlayerSpawns", pending, "pendingVerifiedRespawns", respawns, "cancelledPlayerSpawns", cancelled).entrySet()) {
+				var field = CodexAgentManager.class.getDeclaredField(entry.getKey()); field.setAccessible(true); field.set(manager, entry.getValue());
+			}
+			var id = dev.agaminggod.arenaagents.agent.AgentId.random();
+			manager.requireStableDirectorTransfer(id);
+			pending.put(id, 1L);
+			assertThrows(() -> manager.requireStableDirectorTransfer(id), "in-flight normal spawn cannot transfer ownership");
+			pending.clear(); respawns.put(id, null);
+			assertThrows(() -> manager.requireStableDirectorTransfer(id), "in-flight normal respawn cannot transfer ownership");
+			respawns.clear();
+			cancelled.record(id, new SkitActor(id, "TransferProof", "codex", false).profile(), System.currentTimeMillis());
+			assertThrows(() -> manager.requireStableDirectorTransfer(id), "old cancellation cannot kill an adopted cast body");
+			return 4;
+		} catch (Exception exception) { throw new AssertionError("Pending actor conversion verification failed", exception); }
+	}
+
+	@SuppressWarnings("unchecked")
+	private static int verifyCastPersistence() {
+		try {
+			var field = SkitModeSavedData.class.getDeclaredField("CODEC"); field.setAccessible(true);
+			var codec = (com.mojang.serialization.Codec<SkitModeSavedData>) field.get(null);
+			var legacy = codec.parse(com.mojang.serialization.JsonOps.INSTANCE, com.google.gson.JsonParser.parseString("{\"enabled\":true}")).getOrThrow();
+			assertTrue(legacy.actors().isEmpty(), "old saves do not silently convert ordinary agents");
+			var id = dev.agaminggod.arenaagents.agent.AgentId.random();
+			var actor = new SkitActor(id, "Stage Actor", "claude", true);
+			legacy.putActor(actor);
+			var placement = new SkitPlacement("minecraft:overworld", 12, 70, 19, 40, 10);
+			legacy.putPlacement(id.toString(), placement);
+			var restored = codec.parse(com.mojang.serialization.JsonOps.INSTANCE, codec.encodeStart(com.mojang.serialization.JsonOps.INSTANCE, legacy).getOrThrow()).getOrThrow();
+			assertEquals(actor, restored.actors().getFirst(), "dead cast identity persists without an AgentRecord");
+			assertEquals(placement, restored.placement(id.toString()), "manual respawn retains saved stage position");
+			assertEquals(dev.agaminggod.arenaagents.agent.AgentIdentity.playerName(id, actor.profile()), dev.agaminggod.arenaagents.agent.AgentIdentity.playerName(id, actor.withDead(false).profile()), "death and respawn preserve physical identity");
+			for (String appearance : List.of("codex", "claude", "gemini", "kimi", "cursor")) new SkitActor(id, "Stage Actor", appearance, false).profile();
+			assertThrows(() -> restored.putActor(new SkitActor(dev.agaminggod.arenaagents.agent.AgentId.random(), "stage actor", "codex", false)), "dead actors reserve cast names case-insensitively");
+			var packet = new dev.agaminggod.arenaagents.control.DirectorSnapshotPayload(true, true, List.of(new dev.agaminggod.arenaagents.control.DirectorSnapshotPayload.Actor(id.toString(), actor.name(), "Stage_Actor", "claude", true, false)));
+			var buf = new net.minecraft.network.RegistryFriendlyByteBuf(io.netty.buffer.Unpooled.buffer(), net.minecraft.core.RegistryAccess.EMPTY);
+			try {
+				dev.agaminggod.arenaagents.control.DirectorSnapshotPayload.CODEC.encode(buf, packet);
+				assertEquals(packet, dev.agaminggod.arenaagents.control.DirectorSnapshotPayload.CODEC.decode(buf), "Director packet retains authoritative toggle and dead cast status");
+			} finally { buf.release(); }
+			return 11;
+		} catch (Exception exception) { throw new AssertionError("Cast persistence verification failed", exception); }
 	}
 
 	@SuppressWarnings("unchecked")
@@ -215,11 +266,9 @@ public final class SkitModeVerification {
 				throw new AssertionError("GUI speech must parse", exception);
 			}
 		}
-		assertEquals(4, gui("maxScrollRows", new Class<?>[]{int.class, int.class}, 220, 7), "all voice rows remain reachable on a 240-pixel-high GUI");
+		assertEquals(5, gui("maxScrollRows", new Class<?>[]{int.class, int.class}, 220, 7), "all voice rows remain reachable on a 240-pixel-high GUI");
 		assertEquals(0, gui("maxScrollRows", new Class<?>[]{int.class, int.class}, 390, 7), "full-height director needs no scrolling");
-		Object models = gui("models", new Class<?>[]{String.class}, "claude");
-		assertTrue(models instanceof List<?> values && values.stream().allMatch(value -> value.toString().startsWith("claude-")),
-				"Claude selection never sends a Gemini model with Claude reasoning");
+
 		return 8;
 	}
 

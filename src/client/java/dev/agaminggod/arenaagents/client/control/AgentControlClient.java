@@ -68,6 +68,7 @@ public final class AgentControlClient {
 	private static Preferences preferences = Preferences.defaults();
 	private static boolean catalogAuthoritative;
 	private static boolean registered;
+	public static java.util.Optional<dev.agaminggod.arenaagents.control.DirectorSnapshotPayload> directorSnapshot() { return DirectorClientState.snapshot(); }
 	private static final Set<String> HIDDEN_AGENT_IDS = new LinkedHashSet<>();
 	private static final Set<String> AUTOMATIC_AGENT_IDS = new LinkedHashSet<>();
 	private static final Set<String> KNOWN_AGENT_IDS = new LinkedHashSet<>();
@@ -83,6 +84,11 @@ public final class AgentControlClient {
 		if (registered) {
 			return;
 		}
+		ClientPlayNetworking.registerGlobalReceiver(dev.agaminggod.arenaagents.control.DirectorSnapshotPayload.TYPE,
+				(payload, context) -> context.client().execute(() -> {
+					if (!DirectorClientState.accept(payload)) return;
+					if (context.client().screen instanceof dev.agaminggod.arenaagents.client.gui.SkitDirectorScreen screen) screen.acceptCatalogUpdate();
+				}));
 		boolean receiverRegistered = ClientPlayNetworking.registerGlobalReceiver(
 				AgentControlSnapshotPayload.TYPE,
 				(payload, context) -> context.client().execute(() -> acceptSnapshot(payload.snapshot()))
@@ -277,7 +283,8 @@ public final class AgentControlClient {
 			}
 		}
 		boolean connected = client.player != null && client.level != null && client.getConnection() != null;
-		boolean controlsVisible = client.screen instanceof AgentControlScreen
+		boolean controlsVisible = client.screen instanceof dev.agaminggod.arenaagents.client.gui.SkitDirectorScreen
+				|| client.screen instanceof AgentControlScreen
 				|| client.screen instanceof dev.agaminggod.arenaagents.client.gui.scenario.ScenarioSetupScreen;
 		SnapshotRefreshPolicy.Tick refresh = SnapshotRefreshPolicy.advance(
 				refreshCountdown, connected, controlsVisible,
@@ -298,6 +305,9 @@ public final class AgentControlClient {
 			return;
 		}
 		snapshotError = "";
+		DirectorClientState.setImportCandidates(nextSnapshot.agents());
+		if ((previous == null || !previous.agents().equals(nextSnapshot.agents()))
+				&& Minecraft.getInstance().screen instanceof dev.agaminggod.arenaagents.client.gui.SkitDirectorScreen director) director.acceptCatalogUpdate();
 		boolean catalogChanged = !previousCatalog.equals(nextSnapshot.catalog());
 		int nextContentHash = contentHash(nextSnapshot);
 		Minecraft client = Minecraft.getInstance();
@@ -337,6 +347,7 @@ public final class AgentControlClient {
 	}
 
 	private static void clearConnectionState() {
+		DirectorClientState.clear();
 		SNAPSHOTS.clear();
 		AgentControlCatalog.resetRuntimeCatalog();
 		catalogAuthoritative = false;

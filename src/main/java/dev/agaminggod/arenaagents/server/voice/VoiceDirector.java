@@ -28,7 +28,7 @@ public final class VoiceDirector {
 
 	public static VoiceScript createScript(MinecraftServer server, String name, String agentSelector) {
 		SkitModeRuntime.requireEnabled(server);
-		VoiceScript script = new VoiceScript(name, agentSelector, java.util.List.of());
+		VoiceScript script = new VoiceScript(name, dev.agaminggod.arenaagents.server.SkitActors.resolve(server, agentSelector).agentId().toString(), java.util.List.of());
 		VoiceDirectorSavedData.get(server).putScript(script);
 		return script;
 	}
@@ -50,7 +50,9 @@ public final class VoiceDirector {
 				.orElseThrow(() -> new AgentDomainException("VOICE_SCRIPT_NOT_FOUND", "No voice script named " + name));
 		if (script.cues().isEmpty()) throw new AgentDomainException("VOICE_SCRIPT_EMPTY", "Voice script has no cues");
 		String selector = selectorOverride == null || selectorOverride.isBlank() ? script.agentSelector() : selectorOverride;
-		AgentId agentId = manager.resolve(selector).agentId();
+		AgentId agentId = dev.agaminggod.arenaagents.server.SkitActors.resolve(manager.server(), selector).agentId();
+		if (dev.agaminggod.arenaagents.server.SkitActors.find(manager.server(), agentId).filter(net.minecraft.server.level.ServerPlayer::isAlive).isEmpty())
+			throw new AgentDomainException("ACTOR_NOT_PRESENT", "Respawn the actor before playing a voice script");
 		PLAYBACK.computeIfAbsent(manager.server(), ignored -> new ConcurrentHashMap<>())
 				.put(agentId, new Playback(script.cues(), 0,
 					manager.server().getTickCount() + script.cues().getFirst().delayTicks()));
@@ -82,6 +84,10 @@ public final class VoiceDirector {
 		if (runs == null || runs.isEmpty()) return;
 		long tick = server.getTickCount();
 		for (var entry : runs.entrySet()) {
+			if (dev.agaminggod.arenaagents.server.SkitActors.find(server, entry.getKey()).filter(net.minecraft.server.level.ServerPlayer::isAlive).isEmpty()) {
+				stop(server, entry.getKey());
+				continue;
+			}
 			Playback playback = entry.getValue();
 			if (tick < playback.nextTick()) continue;
 			if (playback.index() >= playback.cues().size()) {
@@ -110,6 +116,9 @@ public final class VoiceDirector {
 	}
 
 	private static void speak(MinecraftServer server, AgentId agentId, String text, VoiceProfile profile) {
+		SkitModeRuntime.requireEnabled(server);
+		if (dev.agaminggod.arenaagents.server.SkitActors.find(server, agentId).filter(net.minecraft.server.level.ServerPlayer::isAlive).isEmpty())
+			throw new AgentDomainException("ACTOR_NOT_PRESENT", "Respawn the actor before speaking");
 		long sequence = VoiceSubsystemRuntime.nextConversationSequence(server, agentId);
 		VoiceSubsystemRuntime.speak(server, new VoiceRequest(
 				agentId, text, profile.profileId(), profile.radius(), sequence, profile.speed(), profile.tone()));

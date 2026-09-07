@@ -53,7 +53,8 @@ abstract class EntityPlayerMPFakeMixin {
 	)
 	private void arenaagents$retainManagedDeath(EntityPlayerMPFake player, Component reason) {
 		MinecraftServer server = player.level().getServer();
-		if (server != null && CodexAgentManager.get(server).retainConnectedDeath(player)) return;
+		if (server != null && (dev.agaminggod.arenaagents.server.SkitActors.retainDeath(player)
+				|| CodexAgentManager.get(server).retainConnectedDeath(player))) return;
 		player.kill(reason);
 	}
 }
