@@ -1,5 +1,5 @@
 export const SCRIPT_PRIMITIVES = Object.freeze(new Set([
-	'move_to', 'navigate_to', 'look_at', 'attack', 'select_item', 'use_item',
+	'move_to', 'navigate_to', 'control', 'look_at', 'attack', 'select_item', 'use_item',
 	'break_block', 'pick_up_item', 'place_block', 'chat', 'wait', 'set_door', 'drop_item',
 	'transfer_container', 'craft_inventory', 'craft_table', 'furnace_transaction',
 	'equip_item', 'select_tool', 'block_with_shield', 'use_ranged',
@@ -9,7 +9,7 @@ export const SCRIPT_PRIMITIVES = Object.freeze(new Set([
 ]));
 
 export const PLAYER_MEMBER_PRIMITIVES = Object.freeze({
-	navigateTo: 'navigate_to', lookAt: 'look_at', attack: 'attack',
+	navigateTo: 'navigate_to', control: 'control', lookAt: 'look_at', attack: 'attack',
 	selectItem: 'select_item', useItem: 'use_item', mine: 'break_block', pickUpItem: 'pick_up_item', place: 'place_block',
 	chat: 'chat', wait: 'wait', setDoor: 'set_door', dropItem: 'drop_item',
 	transferContainer: 'transfer_container', craftInventory: 'craft_inventory', craftTable: 'craft_table',

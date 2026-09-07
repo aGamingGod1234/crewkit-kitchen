@@ -9,7 +9,13 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.shapes.CollisionContext;
 
 public final class ObservationBudgetVerification {
 	private ObservationBudgetVerification() {
@@ -177,7 +183,234 @@ public final class ObservationBudgetVerification {
 		burst.drain(burstFirst::add);
 		assertEquals(AgentConstants.DEFAULT_AGENT_LIMIT, burstFirst.size(), "one drain serves the sixteen-agent tick budget");
 		assertEquals(0, burst.pendingCount(), "sixteen-agent burst clears in one drain");
-		return 58 + verifyLandmarkContext();
+		return 58 + verifyLandmarkContext() + verifyCurrentContainers() + verifyLoadedSight() + verifySpatialMutations()
+				+ verifyNonSolidVisibility();
+	}
+
+	private static int verifyNonSolidVisibility() {
+		HashMap<BlockPos, BlockState> states = new HashMap<>();
+		HashMap<BlockPos, BlockEntity> blockEntities = new HashMap<>();
+		BlockGetter world = new BlockGetter() {
+			@Override public BlockEntity getBlockEntity(BlockPos position) { return blockEntities.get(position); }
+			@Override public BlockState getBlockState(BlockPos position) {
+				return states.getOrDefault(position, Blocks.AIR.defaultBlockState());
+			}
+			@Override public FluidState getFluidState(BlockPos position) { return getBlockState(position).getFluidState(); }
+			@Override public int getHeight() { return 384; }
+			@Override public int getMinY() { return -64; }
+		};
+		BlockPos target = new BlockPos(0, 0, 3);
+		BlockPos occluder = new BlockPos(0, 0, 1);
+		Vec3 eye = new Vec3(0.5D, 0.5D, 0.5D);
+		CollisionContext context = CollisionContext.empty();
+		int assertions = 0;
+		for (var block : List.of(Blocks.STONE, Blocks.WATER, Blocks.LAVA, Blocks.DANDELION, Blocks.TORCH, Blocks.OAK_SLAB,
+				Blocks.END_PORTAL, Blocks.END_GATEWAY)) {
+			states.put(target, block.defaultBlockState());
+			assertTrue(ObservationVisibility.traceBlock(world, context, eye, target),
+					"clear sight reports visible " + block);
+			states.put(occluder, Blocks.STONE.defaultBlockState());
+			assertFalse(ObservationVisibility.traceBlock(world, context, eye, target),
+					"a solid wall hides " + block);
+			states.remove(occluder);
+			assertions += 2;
+		}
+		states.clear();
+		assertFalse(ObservationVisibility.traceBlock(world, context, eye, target), "clear sight never invents an air target");
+		states.put(target, Blocks.LIGHT.defaultBlockState());
+		assertFalse(ObservationVisibility.traceBlock(world, context, eye, target), "a clear ray does not reveal an invisible dry light block");
+		states.put(target, Blocks.LIGHT.defaultBlockState().setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.WATERLOGGED, true));
+		assertTrue(ObservationVisibility.traceBlock(world, context, eye, target), "water in an invisible light block remains visible");
+		states.put(target, Blocks.STRUCTURE_VOID.defaultBlockState());
+		assertFalse(ObservationVisibility.traceBlock(world, context, eye, target), "a clear ray does not reveal invisible structure voids");
+		BlockState movingState = Blocks.MOVING_PISTON.defaultBlockState();
+		states.put(target, movingState);
+		blockEntities.put(target, net.minecraft.world.level.block.piston.MovingPistonBlock.newMovingBlockEntity(
+				target, movingState, Blocks.STONE.defaultBlockState(), net.minecraft.core.Direction.SOUTH, true, false));
+		assertTrue(ObservationVisibility.traceBlock(world, context, eye, target),
+				"a direct hit on a moving piston's actual block-entity geometry remains visible");
+		return assertions + 5;
+	}
+
+	private static int verifySpatialMutations() {
+		var agent = AgentId.parse("01234567-89ab-cdef-0123-456789abcdef");
+		var position = new BlockPos(510, 64, 0);
+		var revisions = new dev.agaminggod.arenaagents.world.WorldMutationRevisions();
+		var cache = new ObservationSectionCache<RawSpatialObservation.Key, String>(16, 10L, value -> value);
+		java.util.function.Supplier<RawSpatialObservation.Key> key = () -> ServerObservationCollector.spatialKey(
+				agent, "minecraft:overworld", position,
+				revisions.revision(position.getX(), position.getZ(), ServerObservationCollector.BLOCK_RADIUS));
+		cache.getOrCompute(key.get(), 100L, () -> "empty");
+		revisions.recordMutation(512, 0);
+		assertEquals("chest", cache.getOrCompute(key.get(), 100L, () -> "chest"),
+				"a neighboring-region placement refreshes a stationary observer in the same tick");
+		assertEquals("chest", cache.getOrCompute(key.get(), 101L, () -> "unexpected rescan"),
+				"unchanged local geometry still reuses the cached scan");
+		revisions.recordMutation(4096, 4096);
+		assertEquals("chest", cache.getOrCompute(key.get(), 102L, () -> "unexpected distant rescan"),
+				"unrelated distant changes do not invalidate nearby candidates");
+		return 3;
+	}
+
+	private static int verifyCurrentContainers() {
+		var position = new BlockPos(0, 64, 3);
+		var states = new HashMap<BlockPos, net.minecraft.world.level.block.state.BlockState>();
+		var candidates = List.of(new RawSpatialObservation.ContainerCandidate(0, 64, 3,
+				"minecraft:chest", List.of("transfer_container"), 12.75D));
+		java.util.function.Supplier<com.google.gson.JsonArray> observe = () ->
+				ServerObservationCollector.nearbyTransactionTargets(candidates, states::get, target -> true,
+						new Vec3(0.0D, 64.0D, 0.0D), target -> false);
+		states.put(position, net.minecraft.world.level.block.Blocks.CHEST.defaultBlockState());
+		assertEquals("minecraft:chest", observe.get().get(0).getAsJsonObject().get("blockId").getAsString(),
+				"initial container facts identify the live chest");
+		states.put(position, net.minecraft.world.level.block.Blocks.FURNACE.defaultBlockState());
+		var replacement = observe.get().get(0).getAsJsonObject();
+		assertEquals("minecraft:furnace", replacement.get("blockId").getAsString(),
+				"another player's replacement refreshes the cached container ID immediately");
+		assertEquals("[\"furnace_transaction\"]", replacement.get("capabilities").toString(),
+				"replacement capabilities come from the live block");
+		assertFalse(replacement.get("withinInteractionRange").getAsBoolean(),
+				"container reach uses the player's authoritative interaction range");
+		states.put(position, net.minecraft.world.level.block.Blocks.AIR.defaultBlockState());
+		assertEquals(0, observe.get().size(), "removed containers cannot survive in cached observations");
+		states.put(position, net.minecraft.world.level.block.Blocks.STONE.defaultBlockState());
+		assertEquals(0, observe.get().size(), "ordinary replacement blocks are not transaction targets");
+		assertEquals(0, ServerObservationCollector.nearbyTransactionTargets(candidates, target -> {
+			throw new AssertionError("hidden or unloaded candidates must not read block state");
+		}, target -> false, Vec3.ZERO, target -> true).size(), "visibility and load checks precede state reads");
+		return 7;
+	}
+
+	private static int verifyLoadedSight() {
+		var origin = new Vec3(0.5D, 65.62D, 0.5D);
+		Vec3 endpoint = ServerObservationCollector.loadedSightEndpoint(origin, new Vec3(0.0D, 0.0D, 1.0D),
+				position -> (position.getZ() >> 4) != 1);
+		assertTrue(endpoint != null && endpoint.z > 15.0D && endpoint.z < 16.0D,
+				"sight stops before an unloaded intermediate chunk even when the far endpoint is loaded");
+		endpoint = ServerObservationCollector.loadedSightEndpoint(origin, new Vec3(-1.0D, 0.0D, 0.0D),
+				position -> (position.getX() >> 4) != -1);
+		assertTrue(endpoint != null && endpoint.x > 0.0D && endpoint.x < 0.5D,
+				"negative-axis sight stops on the loaded side of the first boundary");
+		assertTrue(ServerObservationCollector.loadedSightEndpoint(origin, new Vec3(0.0D, 0.0D, 1.0D),
+				position -> false) == null, "an unloaded observer chunk cannot start a sight trace");
+		endpoint = ServerObservationCollector.loadedSightEndpoint(origin, new Vec3(0.0D, 1.0D, 0.0D),
+				position -> true);
+		assertEquals(origin.add(0.0D, ServerObservationCollector.LANDMARK_SIGHT_DISTANCE, 0.0D), endpoint,
+				"a vertical ray stays within the loaded chunk and retains its full length");
+		endpoint = ServerObservationCollector.loadedSightEndpoint(new Vec3(0.5D, 65.62D, 0.6D),
+				new Vec3(1.0D, 0.0D, 1.0D).normalize(),
+				position -> (position.getX() >> 4) != 0 || (position.getZ() >> 4) != 1);
+		assertTrue(endpoint != null && endpoint.z < 16.0D && endpoint.z > 15.9D,
+				"a diagonal ray cannot skip a short crossing through an unloaded chunk near a corner");
+		endpoint = ServerObservationCollector.loadedSightEndpoint(origin,
+				new Vec3(1.0D, 0.0D, 1.0D).normalize(),
+				position -> (position.getX() >> 4) != 0 || (position.getZ() >> 4) != 1);
+		assertTrue(endpoint != null && endpoint.z < 16.0D,
+				"an exact corner crossing cannot enter an unloaded side chunk during block clipping");
+		assertTrue(ServerObservationCollector.loadedSightEndpoint(new Vec3(0.0D, 64.0D, 0.5D),
+				new Vec3(-1.0D, 0.0D, 0.0D), position -> position.getX() >= 0) == null,
+				"a ray starting on the boundary cannot enter the immediately unloaded chunk");
+		AtomicInteger checks = new AtomicInteger();
+		Vec3 direction = new Vec3(0.8D, 0.0D, 0.6D);
+		endpoint = ServerObservationCollector.loadedSightEndpoint(origin, direction, position -> {
+			checks.incrementAndGet();
+			return true;
+		});
+		assertEquals(origin.add(direction.scale(ServerObservationCollector.LANDMARK_SIGHT_DISTANCE)), endpoint,
+				"fully loaded sight keeps its intended range");
+		assertTrue(checks.get() <= 2 + ServerObservationCollector.LANDMARK_SIGHT_DISTANCE / 8,
+				"sight checks scale with crossed chunks rather than individual blocks");
+		var boundaryOrigin = new Vec3(0.0D, 64.0D, 0.5D);
+		var forward = new Vec3(1.0D, 0.0D, 0.0D);
+		Boolean entersUnloaded = BlockGetter.traverseBlocks(boundaryOrigin, boundaryOrigin.add(forward.scale(256.0D)),
+				Boolean.TRUE, (ignored, position) -> position.getX() < 0 ? Boolean.TRUE : null, ignored -> Boolean.FALSE);
+		assertTrue(entersUnloaded, "vanilla clipping visits the chunk behind an exact boundary origin");
+		for (double x : new double[] {0.0D, 1.0E-6D}) {
+			assertTrue(ServerObservationCollector.loadedSightEndpoint(new Vec3(x, 64.0D, 0.5D), forward,
+					position -> position.getX() >= 0) == null,
+					"the backwards clip expansion cannot read an unloaded chunk behind the observer");
+		}
+		assertTrue(ServerObservationCollector.loadedSightEndpoint(new Vec3(0.0D, 64.0D, 0.0D),
+				new Vec3(1.0D, 0.0D, 1.0D).normalize(),
+				position -> (position.getX() >> 4) != -1 || (position.getZ() >> 4) != 0) == null,
+				"backwards expansion checks side chunks at an observer corner");
+		endpoint = ServerObservationCollector.loadedSightEndpoint(boundaryOrigin, forward, position -> true);
+		AtomicInteger visits = new AtomicInteger();
+		BlockGetter.traverseBlocks(boundaryOrigin, endpoint, Boolean.TRUE, (ignored, position) -> {
+			visits.incrementAndGet();
+			return null;
+		}, ignored -> Boolean.FALSE);
+		assertTrue(visits.get() > 256, "loaded boundary rays retain vanilla traversal through the expanded endpoints");
+		int assertions = 14;
+		for (int sign : new int[] {-1, 1}) {
+			Vec3 axis = new Vec3(sign, 0.0D, 0.0D);
+			Vec3 diagonal = new Vec3(sign, 0.0D, sign).normalize();
+			assertions += verifyExpandedSightEndpoint(new Vec3(-sign * 1.0E-5D, 64.0D, 0.5D), axis,
+					position -> sign > 0 ? position.getX() < 256 : position.getX() >= -256);
+			Vec3 diagonalEndpoint = new Vec3(sign * (192.0D - 1.0E-5D), 64.0D, sign * (192.0D - 1.0E-5D));
+			assertions += verifyExpandedSightEndpoint(diagonalEndpoint.subtract(diagonal.scale(256.0D)), diagonal,
+					position -> sign > 0 ? position.getX() < 192 && position.getZ() < 192
+							: position.getX() >= -192 && position.getZ() >= -192);
+		}
+		assertions += verifyRoundedChunkCrossing(
+				new Vec3(29999063.99999D, 64.5D, 29999015.99999D),
+				new Vec3(0.7071067811872547D, 0.0D, 0.7071067811858404D), 256.0D,
+				position -> (position.getX() >> 4) != 1874943 || (position.getZ() >> 4) != 1874941);
+		assertions += verifyRoundedChunkCrossing(new Vec3(-16.0D, 64.5D, -16.0D),
+				new Vec3(-0.9863981263522539D, 0.0D, 0.16437377019696023D), 153.9209845965773D,
+				position -> (position.getX() >> 4) != -2 || (position.getZ() >> 4) != -2);
+		return assertions + verifyLoadedCenterTrace();
+	}
+
+	private static int verifyRoundedChunkCrossing(Vec3 origin, Vec3 direction, double distance,
+			java.util.function.Predicate<BlockPos> loaded) {
+		assertTrue(BlockGetter.traverseBlocks(origin, origin.add(direction.scale(distance)), Boolean.TRUE,
+				(ignored, position) -> !loaded.test(position) ? Boolean.TRUE : null, ignored -> Boolean.FALSE),
+				"vanilla traverses the side chunk at a rounded or mixed-direction corner");
+		Vec3 endpoint = ServerObservationCollector.loadedSightEndpoint(origin, direction, distance, loaded);
+		assertTrue(endpoint == null || !BlockGetter.traverseBlocks(origin, endpoint, Boolean.TRUE,
+				(ignored, position) -> !loaded.test(position) ? Boolean.TRUE : null, ignored -> Boolean.FALSE),
+				"corner guards prevent the rounded clip from reading any unloaded side chunk");
+		return 2;
+	}
+
+	private static int verifyLoadedCenterTrace() {
+		Vec3 origin = new Vec3(0.5D, 64.5D, 0.5D);
+		Vec3 direction = new Vec3(1.01D, 0.0D, 1.0D).normalize();
+		BlockPos target = new BlockPos(16, 64, 16);
+		java.util.function.Predicate<BlockPos> loaded = position -> (position.getX() >> 4) != 0 || (position.getZ() >> 4) != 1;
+		Vec3 endpoint = ServerObservationCollector.loadedSightEndpoint(origin, direction, loaded);
+		BlockPos sampled = BlockGetter.traverseBlocks(origin, endpoint, Boolean.TRUE, (ignored, position) -> {
+			if (!loaded.test(position)) throw new AssertionError("the guarded sample must stay loaded");
+			return position.equals(target) ? position.immutable() : null;
+		}, ignored -> null);
+		assertEquals(target, sampled, "the fan can safely sample a block through the loaded side of a corner");
+		assertTrue(BlockGetter.traverseBlocks(origin, Vec3.atCenterOf(target), Boolean.TRUE,
+				(ignored, position) -> !loaded.test(position) ? Boolean.TRUE : null, ignored -> Boolean.FALSE),
+				"rechecking the sampled block center takes a different path through the unloaded side");
+		assertFalse(ObservationVisibility.hasLoadedSightPath(origin, Vec3.atCenterOf(target), loaded),
+				"final visibility rejects the unloaded center path before clipping");
+		AtomicInteger checks = new AtomicInteger();
+		assertTrue(ObservationVisibility.hasLoadedSightPath(origin, new Vec3(3.5D, 64.5D, 0.5D), position -> {
+			checks.incrementAndGet();
+			return position.getX() < 16;
+		}), "nearby visibility ignores unloaded chunks beyond its actual target");
+		assertEquals(1, checks.get(), "a short center trace checks only its own chunk");
+		return 5;
+	}
+
+	private static int verifyExpandedSightEndpoint(Vec3 origin, Vec3 direction,
+			java.util.function.Predicate<BlockPos> loaded) {
+		Vec3 nominalEndpoint = origin.add(direction.scale(ServerObservationCollector.LANDMARK_SIGHT_DISTANCE));
+		assertTrue(BlockGetter.traverseBlocks(origin, nominalEndpoint, Boolean.TRUE,
+				(ignored, position) -> !loaded.test(position) ? Boolean.TRUE : null, ignored -> Boolean.FALSE),
+				"vanilla's expanded endpoint crosses the nominally out-of-range unloaded boundary");
+		Vec3 endpoint = ServerObservationCollector.loadedSightEndpoint(origin, direction, loaded);
+		assertTrue(endpoint != null, "loaded ray still has a usable endpoint before the far boundary");
+		assertFalse(BlockGetter.traverseBlocks(origin, endpoint, Boolean.TRUE,
+				(ignored, position) -> !loaded.test(position) ? Boolean.TRUE : null, ignored -> Boolean.FALSE),
+				"the guarded ray never traverses the unloaded chunk beyond its expanded endpoint");
+		return 3;
 	}
 
 	private static int verifyLandmarkContext() {

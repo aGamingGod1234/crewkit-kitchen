@@ -112,6 +112,10 @@ public final class AgentControlVerification {
 		assertEquals("xhigh", AgentControlCatalog.defaultReasoning("codex", "gpt-5.6-luna"), "Codex reasoning default");
 		assertEquals("fast", AgentControlCatalog.defaultServiceTier("codex", "gpt-5.6-luna"), "Codex speed default");
 		assertEquals("gemini-3.1-pro", AgentControlCatalog.defaultModel("gemini"), "Gemini model default");
+		assertEquals("thinking", AgentControlCatalog.defaultReasoning("gemini", "claude-sonnet-4-6"),
+				"Claude actors use the Gemini catalog's model-specific reasoning");
+		assertEquals("medium", AgentControlCatalog.defaultReasoning("gemini", "gpt-oss-120b"),
+				"GPT OSS actors use their supported reasoning default");
 		assertEquals("priority", AgentControlCatalog.defaultServiceTier("gemini", "gemini-3.1-pro"),
 				"non-Codex speed default");
 		assertEquals("kimi-code/k3", AgentControlCatalog.defaultModel("kimi"), "Kimi model default");
@@ -139,7 +143,7 @@ public final class AgentControlVerification {
 		assertTrue(!AgentControlCatalog.hasSpeedMode("gemini", "gemini-3.1-pro"),
 				"providers without a speed capability do not show a fake speed choice");
 		expectFailure(() -> AgentControlCatalog.defaultModel("unknown"), "unknown provider");
-		return 18;
+		return 20;
 	}
 
 	private static int verifyCommandConstruction() {

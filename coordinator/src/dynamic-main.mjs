@@ -1257,6 +1257,7 @@ export class DynamicCoordinator extends EventEmitter {
 		}
 		const executesBody = toolRequest.tool.kind === 'action'
 			|| toolRequest.tool.kind === 'sequence'
+			|| toolRequest.tool.kind === 'lookAround'
 			|| toolRequest.tool.kind === 'explore_frontier';
 		const supervisionKind = executesBody ? 'action' : toolRequest.tool.kind === 'finish' ? 'completion' : null;
 		let supervisionToken = null;

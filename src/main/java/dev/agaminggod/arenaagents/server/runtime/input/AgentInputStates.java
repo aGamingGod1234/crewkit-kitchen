@@ -85,9 +85,10 @@ public final class AgentInputStates {
 			// the stop-and-reverse oscillation that a hard yaw snap causes around corners.
 			float relativeRadians = (float) Math.toRadians(shortestAngleDelta(yaw, target.yaw()));
 			desiredForward = Math.max(0.0F, (float) Math.cos(relativeRadians));
-			desiredStrafe = (float) Math.sin(relativeRadians);
+			// Positive strafe is left, opposite the positive yaw turn toward the right.
+			desiredStrafe = -(float) Math.sin(relativeRadians);
 			if (Math.abs(desiredForward) + Math.abs(desiredStrafe) < MOVEMENT_EPSILON) {
-				desiredStrafe = yawDelta < 0.0F ? -1.0F : 1.0F;
+				desiredStrafe = yawDelta < 0.0F ? 1.0F : -1.0F;
 			}
 		}
 		float forward = approach(state.forward(), desiredForward,

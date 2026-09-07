@@ -315,6 +315,8 @@ public final class AgentControlClient {
 			screen.acceptSnapshot(nextSnapshot, acknowledgedMutationId, true);
 		} else if (catalogChanged && client.screen instanceof ScenarioSetupScreen screen) {
 			screen.acceptCatalogUpdate();
+		} else if (catalogChanged && client.screen instanceof dev.agaminggod.arenaagents.client.gui.SkitDirectorScreen screen) {
+			screen.acceptCatalogUpdate();
 		}
 	}
 

@@ -46,7 +46,12 @@ export class NativeToolRuntime {
 		this.#bridge = bridge;
 		this.#registry = registry;
 		this.#onFinish = onFinish;
-		this.#trace = trace;
+		this.#trace = (event, fields) => {
+			try {
+				const completion = trace(event, fields);
+				if (completion !== undefined) Promise.resolve(completion).catch(() => {});
+			} catch { /* diagnostics cannot interrupt gameplay */ }
+		};
 		this.#decorateObservation = decorateObservation;
 		this.#resolveFrontier = resolveFrontier;
 	}
@@ -69,7 +74,7 @@ export class NativeToolRuntime {
 		// methods still clone at their boundaries, so sharing here does not expose
 		// mutable coordinator state while avoiding a duplicate deep copy per update.
 		const storedObservation = structuredClone(raw);
-		if (hasDurableObservationFacts(raw) && raw.death == null && raw.status !== 'PLAYER_DEAD' && raw.player?.dead !== true) {
+		if (hasDurableObservationFacts(raw) && raw.ready !== false && raw.death == null && raw.status !== 'PLAYER_DEAD' && raw.player?.dead !== true) {
 			this.#lastLive.set(record.agentId, {
 				observation: storedObservation,
 				eventSequence: storedSequence,
@@ -324,20 +329,24 @@ export class NativeToolRuntime {
 		let resolveAction;
 		let rejectAction;
 		const result = new Promise((resolve, reject) => { resolveAction = resolve; rejectAction = reject; });
-		this.#actions.set(record.agentId, { actionId, goalRevision: record.goalRevision, resolve: resolveAction, reject: rejectAction });
+		const pending = { actionId, goalRevision: record.goalRevision, resolve: resolveAction, reject: rejectAction };
+		this.#actions.set(record.agentId, pending);
+		const failPublication = (error) => {
+			if (this.#actions.get(record.agentId) === pending) this.#actions.delete(record.agentId);
+			rejectAction(error);
+		};
 		this.#trace('native_tool_dispatch_started', { agentId: record.agentId, goalRevision: record.goalRevision, traceId, actionId, actionType: payload.actionType });
 		try {
 			const current = this.#registry?.get(record.agentId);
 			if (this.#registry !== null && (current === null || current === undefined || current.goalRevision !== record.goalRevision)) {
-				this.#actions.delete(record.agentId);
-				rejectAction(codedError('STALE_PLAN', 'Native action became stale before bridge send'));
+				failPublication(codedError('STALE_PLAN', 'Native action became stale before bridge send'));
 				return result;
 			}
-			await this.#bridge.send('action_command', record.agentId, payload);
-			this.#trace('native_tool_command_sent', { agentId: record.agentId, goalRevision: record.goalRevision, traceId, actionId, actionType: payload.actionType });
+			Promise.resolve(this.#bridge.send('action_command', record.agentId, payload)).then(() => {
+				this.#trace('native_tool_command_sent', { agentId: record.agentId, goalRevision: record.goalRevision, traceId, actionId, actionType: payload.actionType });
+			}, failPublication);
 		} catch (error) {
-			this.#actions.delete(record.agentId);
-			rejectAction(error);
+			failPublication(error);
 		}
 		return result;
 	}
@@ -468,23 +477,27 @@ export class NativeToolRuntime {
 		let resolveCompletion;
 		let rejectCompletion;
 		const completion = new Promise((resolve, reject) => { resolveCompletion = resolve; rejectCompletion = reject; });
-		this.#completions.set(record.agentId, {
+		const pending = {
 			goalRevision: record.goalRevision,
 			traceId,
 			goalFingerprint,
 			resolve: resolveCompletion,
 			reject: rejectCompletion,
-		});
+		};
+		this.#completions.set(record.agentId, pending);
+		const failPublication = (error) => {
+			if (this.#completions.get(record.agentId) === pending) this.#completions.delete(record.agentId);
+			rejectCompletion(error);
+		};
 		try {
-			await this.#bridge.send('goal_completed', record.agentId, {
+			Promise.resolve(this.#bridge.send('goal_completed', record.agentId, {
 				goalRevision: record.goalRevision,
 				goalFingerprint,
 				traceId,
 				profile,
-			});
+			})).catch(failPublication);
 		} catch (error) {
-			this.#completions.delete(record.agentId);
-			rejectCompletion(error);
+			failPublication(error);
 		}
 		const result = await completion;
 		if (result.verified) await this.#onFinish({ record, request, result, lifecycleGeneration });

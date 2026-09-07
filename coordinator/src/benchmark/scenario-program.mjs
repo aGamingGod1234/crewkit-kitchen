@@ -2,6 +2,7 @@ import { DEFAULT_ARENA_SCRIPT_LIMITS, normalizeArenaScriptLimits } from '../aren
 import { parseArenaScript } from '../arena-script/parser.mjs';
 import { PLAYER_MEMBER_PRIMITIVES } from '../arena-script/minecraft-api.mjs';
 import { validateAction } from '../schema.mjs';
+import { SUPPORTED_SIMULATOR_ACTIONS } from '../simulator/action-runtime.mjs';
 import { runScenarioSuccess } from '../simulator/simulator-scenarios.mjs';
 
 const PRIMITIVE_MEMBERS = Object.freeze(Object.fromEntries(
@@ -19,7 +20,7 @@ export function compileScenarioProgram(manifest, { limits = DEFAULT_ARENA_SCRIPT
 	const commands = normalizeManifestCommands(manifest, normalizedLimits);
 	const lines = [
 		'program.onUnhandledAttention("continue_and_notify");',
-		...commands.map(({ member, arguments: args }) => `await player.${member}(${stableJson(args)});`),
+		...commands.map(({ member, arguments: args }) => `await player.${member}(${member === 'respawn' ? '' : stableJson(args)});`),
 		'program.finish("scenario-complete");',
 	];
 	const source = lines.join('\n');
@@ -164,8 +165,10 @@ function normalizeManifestCommands(manifest, limits) {
 		const actionType = command.actionType ?? command.type;
 		const member = PRIMITIVE_MEMBERS[actionType];
 		if (!member) throw codedError('UNSUPPORTED_MAPPING', `unsupported ArenaScript mapping for action '${String(actionType)}'`);
+		if (!SUPPORTED_SIMULATOR_ACTIONS.includes(actionType)) throw codedError('SIMULATOR_UNSUPPORTED_ACTION', `simulator does not support action '${actionType}'`);
 		const args = command.arguments ?? command.args;
 		assertJsonObject(args, `manifest.commands[${index}].arguments`);
+		if (Object.hasOwn(args, 'type')) throw codedError('INVALID_COMMAND', 'arguments.type is reserved; use actionType');
 		try { validateAction({ type: actionType, ...args }); }
 		catch (error) { throw codedError(error.code ?? 'INVALID_COMMAND', error.message); }
 		return Object.freeze({ actionId, actionType, member, arguments: deepClone(args) });

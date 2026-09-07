@@ -108,7 +108,7 @@ test('uses one selected-model ArenaScript contract and envelope schema', () => {
 	assert.match(PLANNER_SYSTEM_PROMPT, /craft.*count.*minimum output.*one recipe execution/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /never retry the same action signature after a deterministic failure/i);
 	assert.deepEqual([...SCRIPT_PRIMITIVES].sort(), [
-		'anvil_rename', 'attack', 'block_with_shield', 'break_block', 'chat', 'craft_inventory', 'craft_table', 'dismount',
+		'anvil_rename', 'attack', 'block_with_shield', 'break_block', 'chat', 'control', 'craft_inventory', 'craft_table', 'dismount',
 		'drop_item', 'equip_item', 'furnace_transaction', 'interact_block', 'interact_entity', 'look_at',
 		'menu_button', 'menu_transfer', 'move_to', 'navigate_to', 'pick_up_item', 'place_block', 'respawn', 'select_item', 'select_tool', 'set_door',
 		'start_fall_flying', 'transfer_container', 'use_item', 'use_ranged', 'wait',

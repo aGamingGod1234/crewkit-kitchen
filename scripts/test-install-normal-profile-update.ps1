@@ -28,6 +28,18 @@ function Assert-SameSnapshot([string[]] $Before, [string[]] $After, [string] $Me
     if (@(Compare-Object $Before $After).Count -ne 0) { throw $Message }
 }
 
+function Invoke-WithFileLockRetry([scriptblock] $Action) {
+    $deadline = [Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        try { & $Action; return } catch {
+            $cause = $_.Exception.GetBaseException()
+            # Windows application scanning can briefly retain a just-executed image.
+            if ($cause -isnot [IO.IOException] -or ($cause.HResult -band 0xffff) -notin @(32, 33) -or $deadline.ElapsedMilliseconds -ge 10000) { throw }
+            Start-Sleep -Milliseconds 100
+        }
+    }
+}
+
 function Assert-CurrentUserRuntimeAccess([string] $Path, [switch] $RequireInheritance) {
     $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().User
     $acl = Get-Acl -LiteralPath $Path
@@ -58,6 +70,7 @@ $externalConfigPath = Join-Path $config 'provider-settings.json'
 $sourceNode = Join-Path $root 'runtime\toolchains\node\node.exe'
 $installedNode = Join-Path $runtime 'toolchains\node\node.exe'
 New-Item -ItemType Directory -Force -Path $mods, $runtimeCoordinator, $runtime, $config | Out-Null
+$verificationFailed = $false
 try {
     Copy-Item -LiteralPath (Join-Path $root ("build\libs\" + $modJarName)) -Destination (Join-Path $mods 'arena-agents-old-unparseable.jar')
     Copy-Item -LiteralPath (Join-Path $root ("voice-addon\build\libs\" + $voiceJarName)) -Destination (Join-Path $mods 'arena-agents-voice-0.0.1.jar')
@@ -118,9 +131,26 @@ try {
     if ((Get-FileHash $installedNode -Algorithm SHA256).Hash -ne (Get-FileHash $sourceNode -Algorithm SHA256).Hash) {
         throw 'Installed Node runtime differs from the bundled runtime.'
     }
-    $nodeVersion = (& $installedNode --version 2>&1 | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0 -or $nodeVersion -notmatch '^v?(?<major>\d+)' -or [int]$Matches.major -lt 22) {
-        throw "Installed Node runtime is not executable Node.js 22+: $nodeVersion"
+    $nodeStart = [Diagnostics.ProcessStartInfo]::new($installedNode, '--version')
+    $nodeStart.UseShellExecute = $false
+    $nodeStart.CreateNoWindow = $true
+    $nodeStart.RedirectStandardOutput = $true
+    $nodeStart.RedirectStandardError = $true
+    $nodeProcess = [Diagnostics.Process]::Start($nodeStart)
+    try {
+        $stdout = $nodeProcess.StandardOutput.ReadToEndAsync()
+        $stderr = $nodeProcess.StandardError.ReadToEndAsync()
+        if (-not $nodeProcess.WaitForExit(10000)) {
+            $nodeProcess.Kill()
+            $nodeProcess.WaitForExit()
+            throw 'Installed Node version probe timed out.'
+        }
+        $nodeVersion = $stdout.GetAwaiter().GetResult().Trim()
+        $nodeError = $stderr.GetAwaiter().GetResult().Trim()
+        $nodeExitCode = $nodeProcess.ExitCode
+    } finally { $nodeProcess.Dispose() }
+    if ($nodeExitCode -ne 0 -or $nodeVersion -notmatch '^v?(?<major>\d+)' -or [int]$Matches.major -lt 22) {
+        throw "Installed Node runtime is not executable Node.js 22+: $nodeVersion $nodeError"
     }
 
     $installedHash = (Get-FileHash (Join-Path $mods $modJarName) -Algorithm SHA256).Hash
@@ -134,7 +164,7 @@ try {
     Assert-CurrentUserRuntimeAccess $installedRoot -RequireInheritance
     Assert-CurrentUserRuntimeAccess $journalPath
 
-    Set-Content -LiteralPath $installedNode -Value 'old-node-fixture'
+    Invoke-WithFileLockRetry { Set-Content -LiteralPath $installedNode -Value 'old-node-fixture' }
     $oldNodeHash = (Get-FileHash -LiteralPath $installedNode -Algorithm SHA256).Hash
     foreach ($failurePoint in @('AfterJarsBackup', 'AfterBackup', 'AfterJarSwap', 'AfterCoordinatorSwap', 'AfterNodeSwap', 'AfterGenerationStateSwap')) {
         $before = Get-FileSnapshot $mods
@@ -153,10 +183,18 @@ try {
         throw 'A subsequent successful update did not replace the old Node runtime.'
     }
     Write-Host "Normal profile updater temp end-to-end test passed with bundled Node.js $nodeVersion."
+} catch {
+    $verificationFailed = $true
+    throw
 } finally {
-    if (Test-Path -LiteralPath $target) {
-        $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-        & (Join-Path $env:SystemRoot 'System32\icacls.exe') $target '/grant:r' "*$currentUser`:F" '/T' '/C' '/Q' | Out-Null
+    try {
+        if (Test-Path -LiteralPath $target) {
+            $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+            & (Join-Path $env:SystemRoot 'System32\icacls.exe') $target '/grant:r' "*$currentUser`:F" '/T' '/C' '/Q' | Out-Null
+            Invoke-WithFileLockRetry { if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force } }
+        }
+    } catch {
+        if (-not $verificationFailed) { throw }
+        Write-Warning "Updater fixture cleanup failed: $_"
     }
-    if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
 }
