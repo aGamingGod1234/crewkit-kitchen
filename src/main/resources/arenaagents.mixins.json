@@ -3,6 +3,7 @@
   "package": "dev.agaminggod.arenaagents.mixin",
   "compatibilityLevel": "JAVA_25",
   "mixins": [
+    "CachedUserNameToIdResolverAccessor",
     "EntityPlayerActionInvoker",
     "EntityPlayerActionPackAccessor",
     "EntityPlayerActionPackMixin",

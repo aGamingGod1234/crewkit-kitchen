@@ -405,13 +405,17 @@ public final class CodexAgentCommands {
 			});
 			String managerProvider = PROVIDER_CLAUDE.equals(provider) ? PROVIDER_GEMINI : provider;
 			String reasoning = AgentControlCatalog.defaultReasoning(managerProvider, model);
+			LOGGER.info("Skit spawn requested: provider={}, runtimeProvider={}, model={}, reasoning={}, nameLength={}",
+					provider, managerProvider, model, reasoning, name.length());
 			AgentRecord record = manager(context).summon(
 					context.getSource().getLevel(), position, managerProvider, model, reasoning,
 					PROVIDER_CODEX.equals(provider) ? DEFAULT_CODEX_SERVICE_TIER : "priority",
 					Optional.of(name), AgentGameMode.SURVIVAL);
+			LOGGER.info("Skit spawn accepted: agentId={}, state={}", record.agentId(), record.state());
 			context.getSource().sendSuccess(() -> Component.literal("Creating skit agent " + manager(context).displayName(record) + "."), false);
 			return 1;
 		} catch (AgentDomainException exception) {
+			LOGGER.warn("Skit spawn rejected: code={}", exception.code());
 			throw commandFailure(exception);
 		} catch (RuntimeException exception) {
 			throw unexpectedFailure("skit summon", exception);

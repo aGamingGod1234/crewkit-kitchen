@@ -59,7 +59,6 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
-import net.minecraft.server.players.NameAndId;
 import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.server.level.TicketType;
 import net.minecraft.world.entity.Entity;
@@ -301,9 +300,9 @@ public final class CodexAgentManager {
 	}
 
 	private boolean isPersistedPlayerNameReserved(String name) {
-		UUID offlineUuid = AgentIdentity.offlinePlayerUuid(name);
-		if (server.getPlayerList().loadPlayerData(new NameAndId(offlineUuid, name)).isPresent()) return true;
-		return server.services().nameToIdCache().get(name).isPresent();
+		var cache = (dev.agaminggod.arenaagents.mixin.CachedUserNameToIdResolverAccessor) server.services().nameToIdCache();
+		return AgentPlayerNameReservations.isReserved(
+				server.getWorldPath(net.minecraft.world.level.storage.LevelResource.ROOT), cache.arenaagents$cachedProfilesByName(), name);
 	}
 
 	public AgentTransition start(String selector, String prompt, ServerLevel sourceLevel) {

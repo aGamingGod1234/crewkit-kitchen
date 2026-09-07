@@ -26,7 +26,21 @@ public final class SkitDirectorLayoutVerification {
 		try {
 			AgentControlCatalog.resetRuntimeCatalog();
 			SkitDirectorScreen screen = fixture();
+			for (String blank : List.of("", "   ")) {
+				edit(screen, "actorName").setValue(blank);
+				var summon = SkitDirectorScreen.class.getDeclaredMethod("summon");
+				summon.setAccessible(true);
+				summon.invoke(screen);
+				check(get(screen, "feedback").equals("Enter an actor name first"), "blank actor name gives actionable feedback without network access");
+			}
 			int assertions = 0;
+			for (var child : screen.children()) {
+				if (child instanceof ConsoleButton button && button.getMessage().getString().equals("Place here")) {
+					button.onClick(null, false);
+					check(get(screen, "feedback").equals("Enter the required name or actor selector"), "empty middle selector is rejected before Brigadier can parse it");
+					assertions++;
+				}
+			}
 			for (int tab = 0; tab < 4; tab++) {
 				((ConsoleButton) screen.children().get(tab)).onClick(null, false);
 				int expected = screen.children().size() - 5;
@@ -69,7 +83,7 @@ public final class SkitDirectorLayoutVerification {
 			check(edit(screen, "actorName").getValue().equals("Draft actor"), "catalog replacement preserves actor drafts");
 			check(((AbstractWidget) screen.children().get(5)).getMessage().getString().equals("Model: Replacement model"),
 					"rebuilt model widget formats against the replacement catalog");
-			return assertions + 5;
+			return assertions + 7;
 		} finally {
 			AgentControlCatalog.installRuntimeCatalog(previous);
 		}

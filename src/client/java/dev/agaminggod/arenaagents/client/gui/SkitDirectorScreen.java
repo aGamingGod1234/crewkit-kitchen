@@ -20,6 +20,7 @@ import net.minecraft.world.phys.Vec3;
 
 /** Point-and-click controls for skit actors, actions, voices, and cinematic camera paths. */
 public final class SkitDirectorScreen extends Screen {
+	private static final org.slf4j.Logger LOGGER = org.slf4j.LoggerFactory.getLogger(SkitDirectorScreen.class);
 	private static final int PANEL = ConsoleTheme.PANEL;
 	private static final int PANEL_EDGE = ConsoleTheme.BORDER;
 	private static final int BACKDROP = ConsoleTheme.BACKDROP;
@@ -129,7 +130,7 @@ public final class SkitDirectorScreen extends Screen {
 		addRenderableWidget(new ConsoleCycleButton<>(font, c[1], y, c[2], ROW, Component.literal("Model"),
 				models(provider), model, value -> Component.literal(displayModel(provider, value)), value -> model = value)).visible = contentVisible(y, ROW);
 		y += ROW + GAP;
-		actorName = addEdit("Actor name", "GPT 5.6-Sol", c[0], y, c[2], AgentConstants.MAX_USER_NAME_LENGTH, "director-actor-name");
+		actorName = addEdit("Actor name", "Actor name (required)", c[0], y, c[2], AgentConstants.MAX_USER_NAME_LENGTH, "director-actor-name");
 		actorSelector = addEdit("Agent selector", "agent name or @e", c[1], y, c[2], 64, "director-actor-selector");
 		y += ROW + GAP;
 		ConsoleButton mode = button("Enable skit mode", c[0], y, c[2], ROW, false, () -> send("codex skit on", "Skit mode enabled"));
@@ -219,6 +220,12 @@ public final class SkitDirectorScreen extends Screen {
 
 	private void summon() {
 		String name = actorName == null ? "" : actorName.getValue().strip();
+		if (name.isBlank()) {
+			feedback = "Enter an actor name first";
+			feedbackError = true;
+			LOGGER.info("Director spawn rejected locally: actor name is blank; provider={}, model={}", provider, model);
+			return;
+		}
 		send("codex skit summon " + provider + " model " + word(model) + " " + word(name), "Spawning " + name);
 	}
 
@@ -264,6 +271,7 @@ public final class SkitDirectorScreen extends Screen {
 	}
 
 	private static String lineCommand(String prefix, String text) {
+		if (text == null || text.isBlank()) throw new DirectorInputException("Enter a line to speak first");
 		return prefix + " " + text;
 	}
 
@@ -286,6 +294,21 @@ public final class SkitDirectorScreen extends Screen {
 	}
 
 	private boolean send(String command, String message) {
+		var connection = minecraft == null ? null : minecraft.getConnection();
+		if (connection != null) {
+			var parsed = connection.getCommands().parse(command, connection.getSuggestionsProvider());
+			String error = commandError(parsed);
+			String path = parsed.getContext().getNodes().stream()
+					.map(node -> node.getNode().getName()).collect(java.util.stream.Collectors.joining("/"));
+			if (error != null) {
+				feedback = error;
+				feedbackError = true;
+				LOGGER.warn("Director command rejected locally: path={}, cursor={}, length={}, executable={}",
+						path, parsed.getReader().getCursor(), command.length(), parsed.getContext().getCommand() != null);
+				return false;
+			}
+			LOGGER.info("Director command submitted: path={}, length={}", path, command.length());
+		}
 		if (AgentControlClient.sendCommand(command)) {
 			feedback = message;
 			feedbackError = false;
@@ -294,6 +317,13 @@ public final class SkitDirectorScreen extends Screen {
 		feedback = "Not connected to a compatible server";
 		feedbackError = true;
 		return false;
+	}
+
+	private static <S> String commandError(com.mojang.brigadier.ParseResults<S> parsed) {
+		var error = net.minecraft.commands.Commands.getParseException(parsed);
+		if (error != null) return "Check required fields and argument values";
+		if (parsed.getContext().getCommand() == null) return "Complete the required fields first";
+		return null;
 	}
 
 	private ConsoleEditBox addEdit(String label, String placeholder, int x, int y, int width, int limit, String identity) {
@@ -308,15 +338,25 @@ public final class SkitDirectorScreen extends Screen {
 	}
 
 	private ConsoleButton button(String label, int x, int y, int width, int height, boolean selected, Runnable action) {
-		ConsoleButton button = new ConsoleButton(font, x, y, width, height, Component.literal(label), selected, ACCENT, action);
+		ConsoleButton button = new ConsoleButton(font, x, y, width, height, Component.literal(label), selected, ACCENT, () -> runAction(action));
 		button.visible = !buildingContent || contentVisible(y, height);
 		return button;
 	}
 
 	private ConsoleButton primary(String label, int x, int y, int width, int height, Runnable action) {
-		ConsoleButton button = new ConsoleButton(font, x, y, width, height, Component.literal(label), false, ACCENT, ConsoleButton.Tone.PRIMARY, action);
+		ConsoleButton button = new ConsoleButton(font, x, y, width, height, Component.literal(label), false, ACCENT, ConsoleButton.Tone.PRIMARY, () -> runAction(action));
 		button.visible = contentVisible(y, height);
 		return button;
+	}
+
+	private void runAction(Runnable action) {
+		try {
+			action.run();
+		} catch (DirectorInputException exception) {
+			feedback = exception.getMessage();
+			feedbackError = true;
+			LOGGER.info("Director form rejected locally: tab={}, reason={}", tab, feedback);
+		}
 	}
 
 	@Override
@@ -390,7 +430,13 @@ public final class SkitDirectorScreen extends Screen {
 		return new int[] {left, left + column + GAP, column};
 	}
 
-	private static String word(String value) { return StringArgumentType.escapeIfRequired(value == null ? "" : value.strip()); }
+	private static String word(String value) {
+		if (value == null || value.isBlank()) throw new DirectorInputException("Enter the required name or actor selector");
+		return StringArgumentType.escapeIfRequired(value.strip());
+	}
+	private static final class DirectorInputException extends IllegalArgumentException {
+		private DirectorInputException(String message) { super(message); }
+	}
 	private String number(ConsoleEditBox edit, String fallback) {
 		String value = edit == null ? "" : edit.getValue().strip();
 		return value.isEmpty() ? fallback : value;

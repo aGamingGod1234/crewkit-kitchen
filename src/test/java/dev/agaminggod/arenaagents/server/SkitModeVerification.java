@@ -26,7 +26,74 @@ public final class SkitModeVerification {
 				"action steps preserve order");
 		assertThrows(() -> SkitAction.move(0), "move requires a duration");
 		assertThrows(() -> SkitAction.equip("diamond_sword"), "equip requires a namespaced item id");
-		return 7 + verifyNamesAndPlacement() + verifyTimeline() + verifyPreflight() + verifyCleanup() + verifyGuiCommands();
+		return 7 + verifyNamesAndPlacement() + verifyTimeline() + verifyPreflight() + verifyCleanup() + verifyGuiCommands() + verifyDirectorParsing() + verifyNameReservations();
+	}
+
+	@SuppressWarnings("unchecked")
+	private static int verifyNameReservations() {
+		try {
+			var world = java.nio.file.Files.createTempDirectory("arena-name-reservation");
+			var calls = new java.util.concurrent.atomic.AtomicInteger();
+			var repository = (com.mojang.authlib.GameProfileRepository) java.lang.reflect.Proxy.newProxyInstance(
+					com.mojang.authlib.GameProfileRepository.class.getClassLoader(), new Class<?>[]{com.mojang.authlib.GameProfileRepository.class},
+					(proxy, method, args) -> { calls.incrementAndGet(); return java.util.Optional.empty(); });
+			var cache = new net.minecraft.server.players.CachedUserNameToIdResolver(repository, world.resolve("usercache.json").toFile());
+			var field = cache.getClass().getDeclaredField("profilesByName");
+			field.setAccessible(true);
+			var names = (java.util.Map<String, ?>) field.get(cache);
+			assertTrue(!AgentPlayerNameReservations.isReserved(world, names, "Fresh_Agent"), "unused name is available without lookup");
+			assertEquals(0, calls.get(), "reservation performs no repository calls");
+			assertTrue(cache.get("Fresh_Agent").isPresent(), "vanilla resolving getter manufactures offline identity, reproducing original bug");
+			assertEquals(1, calls.get(), "vanilla resolving getter performs remote lookup");
+			cache.add(new net.minecraft.server.players.NameAndId(java.util.UUID.randomUUID(), "Human_Name"));
+			assertTrue(AgentPlayerNameReservations.isReserved(world, names, "HUMAN_NAME"), "cached online player names are reserved case-insensitively");
+			assertTrue(!AgentPlayerNameReservations.isReserved(world, names, "Fresh_Agent2"), "next unused candidate remains available after old cache pollution");
+			for (String relative : List.of("playerdata/%s.dat", "playerdata/%s.dat_old", "stats/%s.json", "advancements/%s.json")) {
+				String name = "Saved" + relative.hashCode();
+				var path = world.resolve(relative.formatted(dev.agaminggod.arenaagents.agent.AgentIdentity.offlinePlayerUuid(name)));
+				java.nio.file.Files.createDirectories(path.getParent());
+				java.nio.file.Files.writeString(path, "corrupt-but-owned");
+				assertTrue(AgentPlayerNameReservations.isReserved(world, names, name), "existing saved artifacts remain reserved even when corrupt: " + relative);
+			}
+			assertEquals(1, calls.get(), "all production reservation checks add zero remote lookups");
+			return 11;
+		} catch (Exception exception) {
+			throw new AssertionError("Local player reservation verification failed", exception);
+		}
+	}
+
+	@SuppressWarnings("unchecked")
+	private static int verifyDirectorParsing() {
+		try {
+			Method method = CodexAgentCommands.class.getDeclaredMethod("skitCommands");
+			method.setAccessible(true);
+			var tree = (com.mojang.brigadier.builder.LiteralArgumentBuilder<net.minecraft.commands.CommandSourceStack>) method.invoke(null);
+			// Only bypass authority evaluation; use every production argument and executable node.
+			tree.requires(source -> true);
+			var dispatcher = new com.mojang.brigadier.CommandDispatcher<net.minecraft.commands.CommandSourceStack>();
+			dispatcher.register(net.minecraft.commands.Commands.literal("codex").then(tree));
+			int checks = 0;
+			for (String command : List.of("codex skit summon codex model gpt-5.6-luna ",
+					"codex skit summon codex model gpt-5.6-luna", "codex skit place ",
+					"codex skit script stop ", "codex skit voice say Alex ")) {
+				assertTrue(gui("commandError", new Class<?>[]{com.mojang.brigadier.ParseResults.class}, dispatcher.parse(command, null)) != null,
+						"incomplete Director command is rejected before sending: " + command);
+				checks++;
+			}
+			for (String model : List.of("gpt-5.6-luna", "kimi-code/k3", "claude-sonnet-4-6")) {
+				for (String name : List.of("Alex", "GPT 5.6-Sol", "演员 Lucas", "Alex \"The Builder\"")) {
+					String command = "codex skit summon codex model " + StringArgumentType.escapeIfRequired(model) + " " + StringArgumentType.escapeIfRequired(name);
+					var parsed = dispatcher.parse(command, null);
+					assertTrue(gui("commandError", new Class<?>[]{com.mojang.brigadier.ParseResults.class}, parsed) == null,
+							"complete model/name command passes the real parser");
+					assertEquals(name, parsed.getContext().build(command).getArgument("name", String.class), "actor name survives transport quoting");
+					checks += 2;
+				}
+			}
+			return checks;
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("Production Director command tree verification failed", exception);
+		}
 	}
 
 	private static int verifyNamesAndPlacement() {
