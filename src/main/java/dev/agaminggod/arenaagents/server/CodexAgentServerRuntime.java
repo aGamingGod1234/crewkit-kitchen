@@ -112,8 +112,10 @@ public final class CodexAgentServerRuntime {
 		ServerLifecycleEvents.SERVER_STOPPING.register(CodexAgentServerRuntime::stop);
 		ServerLifecycleEvents.END_DATA_PACK_RELOAD.register((server, resourceManager, success) ->
 				ServerObservationCollector.clearTagCache());
-		ServerPlayConnectionEvents.JOIN.register((handler, sender, server) ->
-				VoiceConsentRegistry.playerConnected(server, handler.getPlayer().getUUID()));
+		ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
+			WorldPlayerNames.get(server).remember(handler.getPlayer().getGameProfile().name(), handler.getPlayer().getUUID());
+			VoiceConsentRegistry.playerConnected(server, handler.getPlayer().getUUID());
+		});
 		ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
 			SkitActors.disconnected(handler.getPlayer());
 			VoiceConsentRegistry.playerDisconnected(server, handler.getPlayer().getUUID());

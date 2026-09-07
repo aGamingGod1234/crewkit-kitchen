@@ -126,7 +126,7 @@ public final class SkitDirectorScreen extends Screen {
 		y += ROW + GAP;
 		addRenderableWidget(primary("Spawn here", c[0], y, c[2], ROW, this::summon));
 		boolean enabled = DirectorClientState.snapshot().map(value -> value.enabled()).orElse(false);
-		ConsoleButton mode = button(enabled ? "Disable Director" : "Enable Director", c[1], y, c[2], ROW, enabled,
+		ConsoleButton mode = button(enabled ? "Disable skit mode" : "Enable skit mode", c[1], y, c[2], ROW, enabled,
 				() -> send("codex skit " + (enabled ? "off" : "on"), "Mode change requested"));
 		mode.active = DirectorClientState.snapshot().map(value -> value.canControl()).orElse(false);
 		addRenderableWidget(mode);
@@ -415,7 +415,7 @@ public final class SkitDirectorScreen extends Screen {
 		graphics.fill(0, 0, width, height, BACKDROP);
 		graphics.fill(left - 1, top - 1, right + 1, bottom + 1, PANEL_EDGE);
 		graphics.fill(left, top, right, bottom, PANEL);
-		graphics.text(font, "Director", left + 16, top + (compact() ? 2 : 12), TEXT, false);
+		graphics.text(font, "Skit Director", left + 16, top + (compact() ? 2 : 12), TEXT, false);
 		if (!compact()) {
 			graphics.text(font, font.plainSubstrByWidth("Cast, actions, voice and camera", panelWidth() - 32), left + 16, top + 25, MUTED, false);
 			graphics.text(font, font.plainSubstrByWidth(tab.help, panelWidth() - 32), left + 16, top + 72, ACCENT, false);

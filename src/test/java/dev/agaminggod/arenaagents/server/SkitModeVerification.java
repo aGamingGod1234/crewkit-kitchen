@@ -92,22 +92,38 @@ public final class SkitModeVerification {
 			var field = cache.getClass().getDeclaredField("profilesByName");
 			field.setAccessible(true);
 			var names = (java.util.Map<String, ?>) field.get(cache);
-			assertTrue(!AgentPlayerNameReservations.isReserved(world, names, "Fresh_Agent"), "unused name is available without lookup");
+			assertTrue(!AgentPlayerNameReservations.isReserved(world, (java.util.UUID) null, "Fresh_Agent"), "unused name is available without lookup");
 			assertEquals(0, calls.get(), "reservation performs no repository calls");
 			assertTrue(cache.get("Fresh_Agent").isPresent(), "vanilla resolving getter manufactures offline identity, reproducing original bug");
 			assertEquals(1, calls.get(), "vanilla resolving getter performs remote lookup");
-			cache.add(new net.minecraft.server.players.NameAndId(java.util.UUID.randomUUID(), "Human_Name"));
-			assertTrue(AgentPlayerNameReservations.isReserved(world, names, "HUMAN_NAME"), "cached online player names are reserved case-insensitively");
-			assertTrue(!AgentPlayerNameReservations.isReserved(world, names, "Fresh_Agent2"), "next unused candidate remains available after old cache pollution");
+			var humanId = java.util.UUID.randomUUID();
+			cache.add(new net.minecraft.server.players.NameAndId(humanId, "Human_Name"));
+			assertTrue(!AgentPlayerNameReservations.isReserved(world, humanId, "HUMAN_NAME"), "a cached player from another world does not reserve this world");
+			var humanData = world.resolve("playerdata").resolve(humanId + ".dat");
+			java.nio.file.Files.createDirectories(humanData.getParent());
+			java.nio.file.Files.writeString(humanData, "owned-online-player");
+			assertTrue(AgentPlayerNameReservations.isReserved(world, humanId, "HUMAN_NAME"), "online player data in this world reserves the cached name");
+			var worldNames = new WorldPlayerNames();
+			worldNames.remember("Human_Name", humanId);
+			var restoredNames = WorldPlayerNames.CODEC.parse(com.mojang.serialization.JsonOps.INSTANCE,
+					WorldPlayerNames.CODEC.encodeStart(com.mojang.serialization.JsonOps.INSTANCE, worldNames).getOrThrow()).getOrThrow();
+			assertTrue(restoredNames.contains("HUMAN_NAME"), "world name cache persists case-insensitive ownership");
+			assertTrue(!new WorldPlayerNames().contains("Human_Name"), "fresh world has an independent name cache");
+			cache.add(new net.minecraft.server.players.NameAndId(java.util.UUID.randomUUID(), "human_name"));
+			assertTrue(restoredNames.contains("Human_Name"), "another world's shared lookup cannot erase recorded ownership");
+			var otherWorld = java.nio.file.Files.createTempDirectory("arena-other-world");
+			assertTrue(!AgentPlayerNameReservations.isReserved(otherWorld, humanId, "HUMAN_NAME"), "one world cannot reserve another world's actor names");
+			assertTrue(!AgentPlayerNameReservations.isReserved(world, dev.agaminggod.arenaagents.agent.AgentIdentity.offlinePlayerUuid("Fresh_Agent"), "Fresh_Agent"), "manufactured cache entries alone never reserve actor names");
+			assertTrue(!AgentPlayerNameReservations.isReserved(world, (java.util.UUID) null, "Fresh_Agent2"), "next unused candidate remains available after old cache pollution");
 			for (String relative : List.of("playerdata/%s.dat", "playerdata/%s.dat_old", "stats/%s.json", "advancements/%s.json")) {
 				String name = "Saved" + relative.hashCode();
 				var path = world.resolve(relative.formatted(dev.agaminggod.arenaagents.agent.AgentIdentity.offlinePlayerUuid(name)));
 				java.nio.file.Files.createDirectories(path.getParent());
 				java.nio.file.Files.writeString(path, "corrupt-but-owned");
-				assertTrue(AgentPlayerNameReservations.isReserved(world, names, name), "existing saved artifacts remain reserved even when corrupt: " + relative);
+				assertTrue(AgentPlayerNameReservations.isReserved(world, (java.util.UUID) null, name), "existing saved artifacts remain reserved even when corrupt: " + relative);
 			}
 			assertEquals(1, calls.get(), "all production reservation checks add zero remote lookups");
-			return 11;
+			return 17;
 		} catch (Exception exception) {
 			throw new AssertionError("Local player reservation verification failed", exception);
 		}
@@ -124,6 +140,11 @@ public final class SkitModeVerification {
 			var dispatcher = new com.mojang.brigadier.CommandDispatcher<net.minecraft.commands.CommandSourceStack>();
 			dispatcher.register(net.minecraft.commands.Commands.literal("codex").then(tree));
 			int checks = 0;
+			for (String command : List.of("codex skit", "codex skit on", "codex skit off", "codex skit status")) {
+				assertTrue(gui("commandError", new Class<?>[]{com.mojang.brigadier.ParseResults.class}, dispatcher.parse(command, null)) == null,
+						"mode command has an executable handler: " + command);
+				checks++;
+			}
 			for (String command : List.of("codex skit summon codex model gpt-5.6-luna ",
 					"codex skit summon codex model gpt-5.6-luna", "codex skit place ",
 					"codex skit script stop ", "codex skit voice say Alex ")) {

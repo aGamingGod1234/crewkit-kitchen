@@ -28,19 +28,21 @@ public final class SkitActors {
 				.flatMap(actor -> OfflineAgentPlayers.find(server, id, actor.profile()));
 	}
 	public static boolean reservesName(MinecraftServer server, String name) {
-		return records(server).stream().anyMatch(actor -> AgentIdentity.playerName(actor.agentId(), actor.profile()).equalsIgnoreCase(name));
+		var cancelled = CANCELLED.get(server);
+		return records(server).stream().anyMatch(actor -> AgentIdentity.playerName(actor.agentId(), actor.profile()).equalsIgnoreCase(name))
+				|| cancelled != null && cancelled.active(System.currentTimeMillis()).stream().anyMatch(entry -> AgentIdentity.playerName(entry.agentId(), entry.profile()).equalsIgnoreCase(name));
 	}
 	public static SkitActor summon(ServerLevel level, Vec3 position, String appearance, String name) {
 		MinecraftServer server = level.getServer();
 		SkitModeRuntime.requireEnabled(server);
 		SkitActor actor = new SkitActor(AgentId.random(), name, appearance, false);
 		String playerName = AgentIdentity.playerName(actor.agentId(), actor.profile());
-		var cache = (dev.agaminggod.arenaagents.mixin.CachedUserNameToIdResolverAccessor) server.services().nameToIdCache();
-		boolean reserved = reservesName(server, playerName) || CodexAgentManager.get(server).records().stream()
+		boolean reserved = reservesName(server, playerName) || CodexAgentManager.get(server).hasPendingPlayerName(playerName)
+				|| carpet.patches.EntityPlayerMPFake.isSpawningPlayer(playerName) || CodexAgentManager.get(server).records().stream()
 				.anyMatch(record -> AgentIdentity.playerName(record.agentId(), record.profile()).equalsIgnoreCase(playerName));
 		if (reserved || server.getPlayerList().getPlayerByName(playerName) != null || AgentPlayerNameReservations.isReserved(
-				server.getWorldPath(net.minecraft.world.level.storage.LevelResource.ROOT), cache.arenaagents$cachedProfilesByName(), playerName))
-			throw new AgentDomainException("ACTOR_NAME_TAKEN", "That player name is already used. Choose another actor name");
+				server, playerName))
+			throw new AgentDomainException("ACTOR_NAME_TAKEN", "That name belongs to a player or actor in this world. Select the existing actor to respawn it, or choose another name");
 		SkitModeSavedData data = SkitModeSavedData.get(server);
 		data.putActor(actor);
 		data.putPlacement(actor.agentId().toString(), new SkitPlacement(level.dimension().identifier().toString(), position.x, position.y, position.z, 0, 0));

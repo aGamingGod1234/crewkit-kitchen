@@ -159,7 +159,7 @@ public final class CodexAgentCommands {
 	}
 
 	private static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> skitCommands() {
-		var skit = Commands.literal("skit").requires(GoalControl::mayControl);
+		var skit = Commands.literal("skit").requires(GoalControl::mayControl).executes(CodexAgentCommands::skitStatus);
 		skit.then(Commands.literal("on").executes(context -> toggleSkit(context, true)));
 		skit.then(Commands.literal("off").executes(context -> toggleSkit(context, false)));
 		skit.then(Commands.literal("status").executes(CodexAgentCommands::skitStatus));
@@ -304,7 +304,7 @@ public final class CodexAgentCommands {
 				.then(goalDraftChoice("cancel", GoalDraftChoice.CANCEL))
 				.then(Commands.literal("complete")
 						.requires(GoalControl::mayControl)
-						.then(actorArgument().executes(CodexAgentCommands::confirmCompletion)));
+						.then(agentArgument().executes(CodexAgentCommands::confirmCompletion)));
 	}
 
 	private static int confirmCompletion(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
@@ -387,14 +387,14 @@ public final class CodexAgentCommands {
 
 	private static int toggleSkit(CommandContext<CommandSourceStack> context, boolean enabled) {
 		boolean actual = SkitModeRuntime.setEnabled(context.getSource().getServer(), enabled);
-		context.getSource().sendSuccess(() -> Component.literal("Agent skit mode " + (actual ? "enabled" : "disabled") + "."), false);
+		context.getSource().sendSuccess(() -> Component.literal("Skit mode " + (actual ? "enabled" : "disabled") + "."), false);
 		return actual ? 1 : 0;
 	}
 
 	private static int skitStatus(CommandContext<CommandSourceStack> context) {
 		SkitModeSavedData data = SkitModeSavedData.get(context.getSource().getServer());
-		context.getSource().sendSuccess(() -> Component.literal("Agent skit mode is " + (data.enabled() ? "enabled" : "disabled")
-				+ ". Saved placements: " + data.placements().size() + ", scripts: " + data.scripts().size() + "."), false);
+		context.getSource().sendSuccess(() -> Component.literal("Skit mode is " + (data.enabled() ? "enabled" : "disabled")
+				+ ". Use /codex skit on to enable or /codex skit off to disable."), false);
 		return data.enabled() ? 1 : 0;
 	}
 

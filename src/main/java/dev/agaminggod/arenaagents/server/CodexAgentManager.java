@@ -299,10 +299,15 @@ public final class CodexAgentManager {
 		}
 	}
 
+	boolean hasPendingPlayerName(String name) {
+		return cancelledPlayerSpawns.active(System.currentTimeMillis()).stream().anyMatch(entry ->
+				dev.agaminggod.arenaagents.agent.AgentIdentity.playerName(entry.agentId(), entry.profile()).equalsIgnoreCase(name));
+	}
+
 	private boolean isPersistedPlayerNameReserved(String name) {
-		var cache = (dev.agaminggod.arenaagents.mixin.CachedUserNameToIdResolverAccessor) server.services().nameToIdCache();
-		return SkitActors.reservesName(server, name) || AgentPlayerNameReservations.isReserved(
-				server.getWorldPath(net.minecraft.world.level.storage.LevelResource.ROOT), cache.arenaagents$cachedProfilesByName(), name);
+		return hasPendingPlayerName(name) || carpet.patches.EntityPlayerMPFake.isSpawningPlayer(name)
+				|| SkitActors.reservesName(server, name) || AgentPlayerNameReservations.isReserved(
+				server, name);
 	}
 
 	public AgentTransition start(String selector, String prompt, ServerLevel sourceLevel) {
