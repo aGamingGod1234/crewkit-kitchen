@@ -10,6 +10,7 @@ import dev.agaminggod.arenaagents.agent.AgentGameMode;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentIdentity;
 import dev.agaminggod.arenaagents.agent.AgentProfile;
+import dev.agaminggod.arenaagents.mixin.ServerGamePacketListenerInvoker;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
 import java.io.IOException;
 import java.nio.file.AtomicMoveNotSupportedException;
@@ -416,6 +417,29 @@ public final class OfflineAgentPlayers {
 				|| !replacement.isAlive()) {
 			throw new AgentDomainException("PLAYER_SPAWN_FAILED", "Vanilla did not replace the connected agent player");
 		}
+		return replacement;
+	}
+
+	/** Cast respawn replaces the body without applying the human hardcore death policy. */
+	static ServerPlayer respawnConnectedActor(ServerPlayer player) {
+		EntityPlayerMPFake fake = requireFakePlayer(player);
+		if (fake.isAlive()) {
+			throw new AgentDomainException("AGENT_NOT_DEAD", "Only a dead connected actor can be respawned");
+		}
+		UUID expectedUuid = fake.getUUID();
+		String expectedName = fake.getGameProfile().name();
+		fake.resetLastActionTime();
+		var connection = fake.connection;
+		ServerPlayer replacement = fake.level().getServer().getPlayerList()
+				.respawn(fake, false, net.minecraft.world.entity.Entity.RemovalReason.KILLED);
+		connection.player = replacement;
+		connection.resetPosition();
+		((ServerGamePacketListenerInvoker) connection).arenaagents$restartClientLoadTimerAfterRespawn();
+		if (replacement == fake || !isManagedFakePlayer(replacement, expectedUuid, expectedName)
+				|| !replacement.isAlive()) {
+			throw new AgentDomainException("PLAYER_SPAWN_FAILED", "Vanilla did not replace the connected agent player");
+		}
+		replacement.setGameMode(GameType.SURVIVAL);
 		return replacement;
 	}
 

@@ -71,7 +71,7 @@ public final class SkitActors {
 		ServerLevel level = level(server, at);
 		if (old != null) {
 			if (old.isAlive()) throw new AgentDomainException("ACTOR_REMOVAL_PENDING", "The previous body is still leaving. Try Respawn again in a moment");
-			ServerPlayer replacement = OfflineAgentPlayers.respawnConnected(old);
+			ServerPlayer replacement = OfflineAgentPlayers.respawnConnectedActor(old);
 			replacement.teleportTo(level, at.x(), at.y(), at.z(), Set.<Relative>of(), at.yaw(), at.pitch(), false);
 		} else spawn(server, actor);
 		SkitModeSavedData.get(server).putActor(actor.withDead(false));

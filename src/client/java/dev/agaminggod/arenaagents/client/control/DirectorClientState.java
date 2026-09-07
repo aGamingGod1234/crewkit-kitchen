@@ -8,7 +8,8 @@ import java.util.Optional;
 /** Server-confirmed Director state, separate from keybindings and the agent roster. */
 public final class DirectorClientState {
 	private static DirectorSnapshotPayload snapshot;
-	private static List<AgentControlAgent> importCandidates = List.of();
+	public record ImportCandidate(String agentId, String displayName) { }
+	private static List<ImportCandidate> importCandidates = List.of();
 	private DirectorClientState() { }
 	public static Optional<DirectorSnapshotPayload> snapshot() { return Optional.ofNullable(snapshot); }
 	public static boolean accept(DirectorSnapshotPayload value) {
@@ -16,7 +17,13 @@ public final class DirectorClientState {
 		snapshot = value;
 		return changed;
 	}
-	public static List<AgentControlAgent> importCandidates() { return importCandidates; }
-	public static void setImportCandidates(List<AgentControlAgent> agents) { importCandidates = List.copyOf(agents); }
+	public static List<ImportCandidate> importCandidates() { return importCandidates; }
+	public static boolean setImportCandidates(List<AgentControlAgent> agents) {
+		List<ImportCandidate> next = agents.stream()
+				.map(agent -> new ImportCandidate(agent.agentId(), agent.displayName())).toList();
+		boolean changed = !next.equals(importCandidates);
+		importCandidates = next;
+		return changed;
+	}
 	public static void clear() { snapshot = null; importCandidates = List.of(); }
 }

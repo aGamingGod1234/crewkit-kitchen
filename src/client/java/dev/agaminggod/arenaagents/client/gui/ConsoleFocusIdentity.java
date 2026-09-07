@@ -9,7 +9,7 @@ public final class ConsoleFocusIdentity {
 	}
 
 	public static String of(AbstractWidget widget) {
-		if (widget instanceof ConsoleFocusTarget target) return normalize(target.consoleFocusIdentity());
+		if (widget instanceof ConsoleFocusTarget target) return target.consoleFocusIdentity();
 		return widget == null ? "" : normalize(widget.getMessage().getString());
 	}
 

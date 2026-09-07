@@ -99,7 +99,7 @@ public final class SkitModeVerification {
 			var humanId = java.util.UUID.randomUUID();
 			cache.add(new net.minecraft.server.players.NameAndId(humanId, "Human_Name"));
 			assertTrue(!AgentPlayerNameReservations.isReserved(world, humanId, "HUMAN_NAME"), "a cached player from another world does not reserve this world");
-			var humanData = world.resolve("playerdata").resolve(humanId + ".dat");
+			var humanData = world.resolve(net.minecraft.world.level.storage.LevelResource.PLAYER_DATA_DIR.id()).resolve(humanId + ".dat");
 			java.nio.file.Files.createDirectories(humanData.getParent());
 			java.nio.file.Files.writeString(humanData, "owned-online-player");
 			assertTrue(AgentPlayerNameReservations.isReserved(world, humanId, "HUMAN_NAME"), "online player data in this world reserves the cached name");
@@ -115,7 +115,14 @@ public final class SkitModeVerification {
 			assertTrue(!AgentPlayerNameReservations.isReserved(otherWorld, humanId, "HUMAN_NAME"), "one world cannot reserve another world's actor names");
 			assertTrue(!AgentPlayerNameReservations.isReserved(world, dev.agaminggod.arenaagents.agent.AgentIdentity.offlinePlayerUuid("Fresh_Agent"), "Fresh_Agent"), "manufactured cache entries alone never reserve actor names");
 			assertTrue(!AgentPlayerNameReservations.isReserved(world, (java.util.UUID) null, "Fresh_Agent2"), "next unused candidate remains available after old cache pollution");
-			for (String relative : List.of("playerdata/%s.dat", "playerdata/%s.dat_old", "stats/%s.json", "advancements/%s.json")) {
+			for (String relative : List.of(
+					net.minecraft.world.level.storage.LevelResource.PLAYER_DATA_DIR.id() + "/%s.dat",
+					net.minecraft.world.level.storage.LevelResource.PLAYER_DATA_DIR.id() + "/%s.dat_old",
+					net.minecraft.world.level.storage.LevelResource.PLAYER_OLD_DATA_DIR.id() + "/%s.dat",
+					net.minecraft.world.level.storage.LevelResource.PLAYER_OLD_DATA_DIR.id() + "/%s.dat_old",
+					net.minecraft.world.level.storage.LevelResource.PLAYER_STATS_DIR.id() + "/%s.json",
+					net.minecraft.world.level.storage.LevelResource.PLAYER_ADVANCEMENTS_DIR.id() + "/%s.json",
+					"playerdata/%s.dat", "playerdata/%s.dat_old", "stats/%s.json", "advancements/%s.json")) {
 				String name = "Saved" + relative.hashCode();
 				var path = world.resolve(relative.formatted(dev.agaminggod.arenaagents.agent.AgentIdentity.offlinePlayerUuid(name)));
 				java.nio.file.Files.createDirectories(path.getParent());
@@ -123,7 +130,7 @@ public final class SkitModeVerification {
 				assertTrue(AgentPlayerNameReservations.isReserved(world, (java.util.UUID) null, name), "existing saved artifacts remain reserved even when corrupt: " + relative);
 			}
 			assertEquals(1, calls.get(), "all production reservation checks add zero remote lookups");
-			return 17;
+			return 23;
 		} catch (Exception exception) {
 			throw new AssertionError("Local player reservation verification failed", exception);
 		}

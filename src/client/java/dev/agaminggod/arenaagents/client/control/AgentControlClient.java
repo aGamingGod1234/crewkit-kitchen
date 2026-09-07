@@ -19,6 +19,8 @@ import dev.agaminggod.arenaagents.scenario.presentation.ArenaSpectatorSnapshotPa
 import dev.agaminggod.arenaagents.scenario.presentation.ScenarioBuildProgressClearPayload;
 import dev.agaminggod.arenaagents.scenario.presentation.ScenarioBuildProgressPayload;
 import dev.agaminggod.arenaagents.control.AgentControlCatalog;
+import dev.agaminggod.arenaagents.control.DirectorCommandRequestPayload;
+import dev.agaminggod.arenaagents.control.DirectorCommandResultPayload;
 import dev.agaminggod.arenaagents.control.AgentControlModelOption;
 import dev.agaminggod.arenaagents.control.AgentControlRequestPayload;
 import dev.agaminggod.arenaagents.control.AgentControlSnapshot;
@@ -89,6 +91,11 @@ public final class AgentControlClient {
 					if (!DirectorClientState.accept(payload)) return;
 					if (context.client().screen instanceof dev.agaminggod.arenaagents.client.gui.SkitDirectorScreen screen) screen.acceptCatalogUpdate();
 				}));
+		if (!ClientPlayNetworking.registerGlobalReceiver(DirectorCommandResultPayload.TYPE,
+				(payload, context) -> context.client().execute(() -> {
+					if (context.client().screen instanceof dev.agaminggod.arenaagents.client.gui.SkitDirectorScreen screen) screen.acceptCommandResult(payload);
+					requestSnapshot();
+				}))) throw new IllegalStateException("Director command result receiver is already registered");
 		boolean receiverRegistered = ClientPlayNetworking.registerGlobalReceiver(
 				AgentControlSnapshotPayload.TYPE,
 				(payload, context) -> context.client().execute(() -> acceptSnapshot(payload.snapshot()))
@@ -213,6 +220,18 @@ public final class AgentControlClient {
 		return sendCommandWithReceipt(command).isPresent();
 	}
 
+	public static boolean sendDirectorCommand(DirectorCommandRequestPayload request) {
+		try {
+			if (!ClientPlayNetworking.canSend(DirectorCommandRequestPayload.TYPE)) return false;
+			ClientPlayNetworking.send(request);
+			SNAPSHOT_ACKNOWLEDGEMENTS.beginMutation();
+			return true;
+		} catch (IllegalStateException exception) {
+			LOGGER.debug("Director command skipped while disconnected");
+			return false;
+		}
+	}
+
 	public static OptionalLong sendCommandWithReceipt(String command) {
 		Minecraft client = Minecraft.getInstance();
 		if (client.getConnection() == null) {
@@ -305,8 +324,8 @@ public final class AgentControlClient {
 			return;
 		}
 		snapshotError = "";
-		DirectorClientState.setImportCandidates(nextSnapshot.agents());
-		if ((previous == null || !previous.agents().equals(nextSnapshot.agents()))
+		boolean importCandidatesChanged = DirectorClientState.setImportCandidates(nextSnapshot.agents());
+		if (importCandidatesChanged
 				&& Minecraft.getInstance().screen instanceof dev.agaminggod.arenaagents.client.gui.SkitDirectorScreen director) director.acceptCatalogUpdate();
 		boolean catalogChanged = !previousCatalog.equals(nextSnapshot.catalog());
 		int nextContentHash = contentHash(nextSnapshot);
@@ -324,8 +343,6 @@ public final class AgentControlClient {
 		if (client.screen instanceof AgentControlScreen screen) {
 			screen.acceptSnapshot(nextSnapshot, acknowledgedMutationId, true);
 		} else if (catalogChanged && client.screen instanceof ScenarioSetupScreen screen) {
-			screen.acceptCatalogUpdate();
-		} else if (catalogChanged && client.screen instanceof dev.agaminggod.arenaagents.client.gui.SkitDirectorScreen screen) {
 			screen.acceptCatalogUpdate();
 		}
 	}

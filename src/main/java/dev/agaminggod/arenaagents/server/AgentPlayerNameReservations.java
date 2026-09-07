@@ -33,9 +33,13 @@ final class AgentPlayerNameReservations {
 
 	private static boolean hasArtifacts(Path world, UUID id) {
 		String uuid = id.toString();
-		return Files.exists(world.resolve("playerdata").resolve(uuid + ".dat"))
-				|| Files.exists(world.resolve("playerdata").resolve(uuid + ".dat_old"))
-				|| Files.exists(world.resolve("stats").resolve(uuid + ".json"))
-				|| Files.exists(world.resolve("advancements").resolve(uuid + ".json"));
+		for (String directory : java.util.List.of(LevelResource.PLAYER_DATA_DIR.id(), LevelResource.PLAYER_OLD_DATA_DIR.id(), "playerdata")) {
+			Path data = world.resolve(directory);
+			if (Files.exists(data.resolve(uuid + ".dat")) || Files.exists(data.resolve(uuid + ".dat_old"))) return true;
+		}
+		for (String directory : java.util.List.of(LevelResource.PLAYER_STATS_DIR.id(), LevelResource.PLAYER_ADVANCEMENTS_DIR.id(), "stats", "advancements")) {
+			if (Files.exists(world.resolve(directory).resolve(uuid + ".json"))) return true;
+		}
+		return false;
 	}
 }

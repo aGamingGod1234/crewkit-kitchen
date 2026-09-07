@@ -173,6 +173,7 @@ public final class VerificationMain {
 		passedAssertions += AgentControlSyncVerification.verify();
 		passedAssertions += VoiceConsentCommandVerification.verify();
 		passedAssertions += SkitModeVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.DirectorCommandsVerification.verify();
 		passedAssertions += CameraPathVerification.verify();
 		passedAssertions += SkitDirectorLayoutVerification.verify();
 		passedAssertions += AgentSpawnPlacementVerification.verify();

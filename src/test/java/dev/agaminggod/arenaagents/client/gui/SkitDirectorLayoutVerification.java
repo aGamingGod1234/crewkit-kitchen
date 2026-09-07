@@ -2,6 +2,9 @@ package dev.agaminggod.arenaagents.client.gui;
 
 import dev.agaminggod.arenaagents.client.gui.widget.ConsoleButton;
 import dev.agaminggod.arenaagents.client.gui.widget.ConsoleEditBox;
+import dev.agaminggod.arenaagents.client.control.DirectorClientState;
+import dev.agaminggod.arenaagents.control.AgentControlAgent;
+import dev.agaminggod.arenaagents.control.DirectorCommandResultPayload;
 import dev.agaminggod.arenaagents.control.AgentControlCatalog;
 import dev.agaminggod.arenaagents.control.AgentControlModelOption;
 import java.lang.reflect.Field;
@@ -33,7 +36,7 @@ public final class SkitDirectorLayoutVerification {
 				summon.invoke(screen);
 				check(get(screen, "feedback").equals("Enter an actor name first"), "blank actor name gives actionable feedback without network access");
 			}
-			int assertions = 0;
+			int assertions = verifySnapshotEditing() + verifyCommandResults();
 			for (var child : screen.children()) {
 				if (child instanceof ConsoleButton button && button.getMessage().getString().equals("Place here")) {
 					button.onClick(null, false);
@@ -86,11 +89,76 @@ public final class SkitDirectorLayoutVerification {
 		}
 	}
 
+	private static int verifySnapshotEditing() throws Exception {
+		DirectorClientState.clear();
+		try {
+			check(DirectorClientState.setImportCandidates(List.of(candidate("Builder", "IDLE"))), "a new import candidate updates the picker");
+			check(!DirectorClientState.setImportCandidates(List.of(candidate("Builder", "RUNNING"))), "ordinary agent activity does not rebuild Director forms");
+			check(DirectorClientState.setImportCandidates(List.of(candidate("Renamed builder", "RUNNING"))), "renaming an import candidate updates the picker");
+			check(DirectorClientState.setImportCandidates(List.of()), "removing an import candidate updates the picker");
+			int assertions = 4;
+			for (InputType input : List.of(InputType.MOUSE, InputType.KEYBOARD_TAB)) {
+				SkitDirectorScreen screen = fixture(input);
+				screen.resize(320, 480);
+				for (String field : List.of("actorName", "up", "forward")) {
+					ConsoleEditBox editor = edit(screen, field);
+					editor.setEditable(false); // Avoid native IME focus hooks in this headless fixture.
+					editor.setValue("Draft actor");
+					editor.setCursorPosition(6);
+					editor.setHighlightPos(11);
+					screen.setFocused(editor);
+					screen.acceptCatalogUpdate();
+					check(screen.getFocused() == editor && edit(screen, field) == editor, "snapshot rebuild keeps " + field + " focused for " + input);
+					check(editor.getCursorPosition() == 6 && editor.getHighlighted().equals("actor"), "snapshot rebuild preserves caret and selection for " + input);
+					editor.insertText("role");
+					screen.acceptCatalogUpdate();
+					check(edit(screen, field).getValue().equals("Draft role"), "replacement text updates the retained selection and draft after a snapshot update");
+					assertions += 3;
+				}
+				((ConsoleButton) screen.children().get(2)).onClick(null, false);
+				for (String identity : List.of("cycle:Voice", "cycle:Tone", "cycle:Speed")) {
+					AbstractWidget cycle = screen.children().stream().filter(AbstractWidget.class::isInstance).map(AbstractWidget.class::cast)
+							.filter(widget -> ConsoleFocusIdentity.of(widget).equals(identity)).findFirst().orElseThrow();
+					screen.setFocused(cycle);
+					screen.acceptCatalogUpdate();
+					check(screen.getFocused() instanceof AbstractWidget focused && ConsoleFocusIdentity.of(focused).equals(identity), "snapshot rebuild preserves the distinct " + identity + " focus target");
+					assertions++;
+				}
+			}
+			return assertions;
+		} finally {
+			DirectorClientState.clear();
+		}
+	}
+
+	private static int verifyCommandResults() throws Exception {
+		SkitDirectorScreen screen = fixture();
+		var pending = java.util.UUID.randomUUID();
+		set(screen, SkitDirectorScreen.class, "pendingCommand", pending);
+		screen.acceptCommandResult(new DirectorCommandResultPayload(java.util.UUID.randomUUID(), true, "Old result"));
+		check(get(screen, "feedback").equals(""), "an unrelated response cannot overwrite pending Director feedback");
+		screen.acceptCommandResult(new DirectorCommandResultPayload(pending, false, "ACTOR_NAME_TAKEN: Select the existing actor to respawn it"));
+		check(get(screen, "feedbackError").equals(true) && get(screen, "feedback").toString().startsWith("ACTOR_NAME_TAKEN"), "the matching server failure is visible in the Director form");
+		check(get(screen, "pendingCommand") == null, "a matching result completes the pending command");
+		screen.acceptCommandResult(new DirectorCommandResultPayload(pending, true, "Late duplicate"));
+		check(get(screen, "feedbackError").equals(true), "a duplicate result cannot replace an already handled failure");
+		return 4;
+	}
+
+	private static AgentControlAgent candidate(String name, String state) {
+		return new AgentControlAgent("12345678-1234-1234-1234-123456789abc", "12345678", name, "codex",
+				"gpt-5.6-sol", "high", "SolCyan_12345678", 0, state, "", 0, "", "", true, true);
+	}
+
 	private static SkitDirectorScreen fixture() throws Exception {
+		return fixture(InputType.MOUSE);
+	}
+
+	private static SkitDirectorScreen fixture(InputType input) throws Exception {
 		net.minecraft.SharedConstants.tryDetectVersion();
 		net.minecraft.server.Bootstrap.bootStrap();
 		Minecraft client = allocate(Minecraft.class);
-		set(client, Minecraft.class, "lastInputType", InputType.MOUSE);
+		set(client, Minecraft.class, "lastInputType", input);
 		SkitDirectorScreen screen = allocate(SkitDirectorScreen.class);
 		set(screen, Screen.class, "minecraft", client);
 		set(screen, Screen.class, "font", new HeadlessFont());

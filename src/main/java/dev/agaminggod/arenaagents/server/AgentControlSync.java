@@ -1,6 +1,8 @@
 package dev.agaminggod.arenaagents.server;
 
 import dev.agaminggod.arenaagents.control.DirectorSnapshotPayload;
+import dev.agaminggod.arenaagents.control.DirectorCommandRequestPayload;
+import dev.agaminggod.arenaagents.control.DirectorCommandResultPayload;
 import dev.agaminggod.arenaagents.control.AgentControlRequestPayload;
 import dev.agaminggod.arenaagents.control.AgentControlGroup;
 import dev.agaminggod.arenaagents.control.AgentControlSnapshot;
@@ -53,6 +55,14 @@ public final class AgentControlSync {
 		PayloadTypeRegistry.serverboundPlay().register(ScenarioCancelPayload.TYPE, ScenarioCancelPayload.CODEC);
 		PayloadTypeRegistry.clientboundPlay().register(AgentControlSnapshotPayload.TYPE, AgentControlSnapshotPayload.CODEC);
 		PayloadTypeRegistry.clientboundPlay().register(DirectorSnapshotPayload.TYPE, DirectorSnapshotPayload.CODEC);
+		PayloadTypeRegistry.serverboundPlay().register(DirectorCommandRequestPayload.TYPE, DirectorCommandRequestPayload.CODEC);
+		PayloadTypeRegistry.clientboundPlay().register(DirectorCommandResultPayload.TYPE, DirectorCommandResultPayload.CODEC);
+		if (!ServerPlayNetworking.registerGlobalReceiver(DirectorCommandRequestPayload.TYPE,
+				(payload, context) -> context.server().execute(() -> {
+					if (!ServerPlayNetworking.canSend(context.player(), DirectorCommandResultPayload.TYPE)) return;
+					var result = DirectorCommands.execute(payload, context.server().getCommands().getDispatcher(), context.player().createCommandSourceStack());
+					ServerPlayNetworking.send(context.player(), result);
+				}))) throw new IllegalStateException("Director command receiver is already registered");
 		PayloadTypeRegistry.clientboundPlay().register(
 				ArenaSpectatorSnapshotPayload.TYPE,
 				ArenaSpectatorSnapshotPayload.CODEC
