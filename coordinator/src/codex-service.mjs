@@ -18,7 +18,7 @@ const MAX_PUBLIC_AGENT_MESSAGE_CANDIDATE_CHARS = 1_280;
 const PROFILE_CONFLICT_MESSAGE = 'Agent profile is immutable for the active Codex session';
 const CLIENT_INFO = Object.freeze({ name: 'arena-agents-coordinator', title: 'Minecraft Codex Agents', version: '2.0.0' });
 const CLIENT_CAPABILITIES = Object.freeze({ experimentalApi: true, requestAttestation: false });
-const CONTROL_PROTOCOLS = new Set(['arena_script', 'native_tools', 'goal_spec']);
+const CONTROL_PROTOCOLS = new Set(['arena_script', 'native_tools', 'goal_spec', 'director_script']);
 
 export class CodexService {
 	#config;
@@ -195,10 +195,10 @@ export class CodexService {
 			ephemeral: true,
 			baseInstructions: controlProtocol === 'native_tools'
 				? nativeInstructions(minecraftInstructions)
-				: controlProtocol === 'goal_spec' ? goalSpecInstructions() : PLANNER_SYSTEM_PROMPT,
+				: controlProtocol === 'director_script' ? 'Translate creative direction into a bounded Minecraft animation draft. Never call tools, inspect files, run commands or execute actions. Return only the supplied JSON schema.' : controlProtocol === 'goal_spec' ? goalSpecInstructions() : PLANNER_SYSTEM_PROMPT,
 			developerInstructions: controlProtocol === 'native_tools'
 				? nativeRecoveryInstructions(recoverySummary)
-				: controlProtocol === 'goal_spec' ? 'Return only one JSON value matching the supplied output schema. Never call tools.' : recoveryInstructions(recoverySummary),
+				: ['goal_spec', 'director_script'].includes(controlProtocol) ? 'Return only one JSON value matching the supplied output schema. Never call tools.' : recoveryInstructions(recoverySummary),
 		}, { timeoutMs: THREAD_START_TIMEOUT_MS });
 		const threadId = requireNestedId(response, 'thread', 'thread/start');
 		if (transportGeneration !== this.#transportGeneration) throw new CodexProtocolError('SESSION_INVALIDATED', 'Codex transport generation was replaced');

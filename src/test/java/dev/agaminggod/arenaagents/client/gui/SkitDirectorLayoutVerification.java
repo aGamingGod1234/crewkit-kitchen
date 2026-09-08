@@ -36,7 +36,10 @@ public final class SkitDirectorLayoutVerification {
 				summon.invoke(screen);
 				check(get(screen, "feedback").equals("Enter an actor name first"), "blank actor name gives actionable feedback without network access");
 			}
-			int assertions = verifySnapshotEditing() + verifyCommandResults() + verifyEditorResponses();
+			((ConsoleButton) screen.children().get(2)).onClick(null, false);
+			check(screen.children().stream().anyMatch(child -> child.getClass().getSimpleName().equals("ConsoleDropdown")), "voice picker opens a list rather than cycling voices");
+			((ConsoleButton) screen.children().getFirst()).onClick(null, false);
+			int assertions = 1 + verifyDropdownAndGeneration() + verifySnapshotEditing() + verifyCommandResults() + verifyEditorResponses();
 			for (var child : screen.children()) {
 				if (child instanceof ConsoleButton button && button.getMessage().getString().equals("Place here")) {
 					button.onClick(null, false);
@@ -89,6 +92,38 @@ public final class SkitDirectorLayoutVerification {
 		}
 	}
 
+	private static int verifyDropdownAndGeneration() throws Exception {
+		DirectorClientState.clear();
+		SkitDirectorScreen screen = fixture();
+		screen.resize(380, 240);
+		((ConsoleButton) screen.children().get(2)).onClick(null, false);
+		var dropdown = (dev.agaminggod.arenaagents.client.gui.widget.ConsoleDropdown<?>) screen.children().stream()
+				.filter(child -> child instanceof dev.agaminggod.arenaagents.client.gui.widget.ConsoleDropdown).findFirst().orElseThrow();
+		dropdown.onClick(null, false);
+		check(dropdown.isOpen(), "click opens all voice choices without changing selection");
+		check(get(screen, "voice").equals("voice.auto.v1"), "opening voices keeps character default");
+		dropdown.keyPressed(new net.minecraft.client.input.KeyEvent(org.lwjgl.glfw.GLFW.GLFW_KEY_DOWN, 0, 0));
+		dropdown.keyPressed(new net.minecraft.client.input.KeyEvent(org.lwjgl.glfw.GLFW.GLFW_KEY_ENTER, 0, 0));
+		check(!dropdown.isOpen() && get(screen, "voice").equals("voice.laura.v1"), "keyboard selection commits the named voice");
+		dropdown.onClick(null, false);
+		screen.keyPressed(new net.minecraft.client.input.KeyEvent(org.lwjgl.glfw.GLFW.GLFW_KEY_ESCAPE, 0, 0));
+		check(!dropdown.isOpen() && get(screen, "voice").equals("voice.laura.v1"), "Escape dismisses voices without leaving the form or changing voice");
+		dropdown.onClick(null, false);
+		screen.mouseClicked(new net.minecraft.client.input.MouseButtonEvent(0, 0, new net.minecraft.client.input.MouseButtonInfo(0, 0)), false);
+		check(!dropdown.isOpen(), "outside click is consumed while dismissing the list");
+		dropdown.onClick(null, false);
+		check(screen.mouseScrolled(0, 0, 0, -1) && dropdown.isOpen(), "scrolling an open dropdown does not scroll or rebuild the form");
+		dropdown.close();
+		var id = java.util.UUID.randomUUID();
+		DirectorClientState.beginGeneration(new dev.agaminggod.arenaagents.control.DirectorGenerationPayload.Request(id, java.util.UUID.randomUUID(), "intro", "Fly here"));
+		check(!DirectorClientState.acceptGeneration(new dev.agaminggod.arenaagents.control.DirectorGenerationPayload.Result(java.util.UUID.randomUUID(), true, "Old result", "other")), "stale generator response cannot finish a new request");
+		check(DirectorClientState.generationPending(), "pending generation survives form recreation");
+		check(DirectorClientState.acceptGeneration(new dev.agaminggod.arenaagents.control.DirectorGenerationPayload.Result(id, true, "Ready", "intro")), "matching generation completes");
+		check(DirectorClientState.takeGenerationResult().orElseThrow().message().equals("Ready") && DirectorClientState.takeGenerationResult().isEmpty(), "completion can be consumed once after returning to Director");
+		DirectorClientState.clear();
+		return 10;
+	}
+
 	private static int verifySnapshotEditing() throws Exception {
 		DirectorClientState.clear();
 		try {
@@ -116,7 +151,7 @@ public final class SkitDirectorLayoutVerification {
 					assertions += 3;
 				}
 				((ConsoleButton) screen.children().get(2)).onClick(null, false);
-				for (String identity : List.of("cycle:Voice", "cycle:Tone", "cycle:Speed")) {
+				for (String identity : List.of("dropdown:Voice", "cycle:Tone", "cycle:Speed")) {
 					AbstractWidget cycle = screen.children().stream().filter(AbstractWidget.class::isInstance).map(AbstractWidget.class::cast)
 							.filter(widget -> ConsoleFocusIdentity.of(widget).equals(identity)).findFirst().orElseThrow();
 					screen.setFocused(cycle);

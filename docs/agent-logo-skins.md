@@ -13,6 +13,7 @@ approximate pixel-art silhouettes:
 - [Claude vector mark](https://cdn.jsdelivr.net/gh/glincker/thesvg@main/public/icons/claude-ai/default.svg)
 - [DeepSeek Terms of Use](https://cdn.deepseek.com/policies/en-US/deepseek-terms-of-use.html)
 - [DeepSeek vector mark](https://github.com/simple-icons/simple-icons/blob/develop/icons/deepseek.svg)
+- [Cursor official brand guidelines](https://cursor.com/brand) and [source assets](https://ptht05hbb1ssoooe.public.blob.vercel-storage.com/assets/brand/cursor-brand-assets.zip), `General Logos/Cube/PNG/CUBE_2D_LIGHT.png`
 - [Google Brand Resource Center](https://about.google/brand-resource-center/)
 - [Gemini icon source](https://commons.wikimedia.org/wiki/File:Google-gemini.svg)
 - [KIMI Brand Guidelines](https://moonshotai.github.io/Branding-Guide/)
@@ -32,8 +33,9 @@ standard skin layout.
 | ChatGPT / OpenAI | `#10A37F` |
 | Claude | `#D97757` |
 | DeepSeek | white body with `#5786FE` blue |
-| Gemini | `#8AB4F8` light blue with Google blue `#4285F4`, purple `#A142F4`, green `#34A853`, and red `#EA4335` |
-| Kimi | `#1783FF` blue with `#004BAA` shading |
+| Gemini | Google blue `#4285F4` with darker `#2553A0` shading, purple `#A142F4`, green `#34A853`, and red `#EA4335` |
+| Kimi | black with the supplied white K mark |
+| Cursor | `#EDECEC` with the official `#26251E` cube mark |
 
 These references remain attribution and design-reference links only. No external
 asset is fetched during the build. Use of a company's marks may require permission

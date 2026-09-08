@@ -4643,3 +4643,22 @@ test('coalesces a burst of two hundred quiet wire observations without losing th
 		assert.equal(watcher.payload.provenance.eventSequence, 201, 'the watcher uses the final accepted quiet fact sequence');
 	} finally { await run.coordinator.stop(); }
 });
+
+test('Director generation handles cast-only requests once and never sends world actions', async () => {
+ const provider=new FakeProvider(); let creations=0;
+ provider.createAgent=async(profile,options)=>{
+  creations++; assert.equal(profile.model,'gpt-5.6-luna'); assert.equal(profile.reasoningEffort,'low'); assert.equal(options.controlProtocol,'director_script');
+  return {setGoalRevision:async()=>{},decide:async(prompt,options)=>options.parseOutput(JSON.stringify({steps:[{action:'jump',arguments:'',destination:'start',right:0,up:0,forward:0}]}))};
+ };
+ provider.removeAgent=async()=>{};
+ const run=await start({codexService:provider});
+ try {
+  const request={agentId:'server',payload:{requestId:'director-test',actorName:'Astra',description:'Jump once'}};
+  run.bridge.emit('director_script_request',request);run.bridge.emit('director_script_request',structuredClone(request));
+  await eventually(()=>run.bridge.sent.some(message=>message.type==='director_script_result'));
+  const replies=run.bridge.sent.filter(message=>message.type==='director_script_result');
+  assert.equal(replies.length,1);assert.equal(creations,1);assert.equal(replies[0].payload.error,'');
+  assert.equal(JSON.parse(replies[0].payload.script).steps[0].action,'jump');
+  assert.equal(run.bridge.sent.filter(message=>message.type==='action_command').length,0);
+ }finally{await run.coordinator.stop();}
+});

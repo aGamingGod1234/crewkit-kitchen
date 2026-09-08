@@ -103,6 +103,26 @@ Creating an existing name is rejected instead of erasing its contents. The edito
 keeps drafts while you close and reopen it in the same connection; saved scripts
 and takes persist in the world. Durations in the editor use seconds.
 
+In Actions, enter a new script name and describe the scene, then choose **Write
+script with Luna**. GPT-5.6 Luna uses low reasoning and writes an editable motion
+script. "Here" is your position when you click Write; "start" is the actor's position.
+Generation needs the connected coordinator and Codex authentication. A completion
+message tells you when the script is saved. Review it before clicking Play.
+
+Voice choices appear in a dropdown as `Name - sound, gender`. Fish synthesis uses
+`s2.1-pro-free`. Character defaults give Astra, Fable, Grok, Gemini, and Kimi distinct
+original voices. **Say line** uses the currently selected settings; **Set voice**
+saves them for that actor's future dialogue.
+
+In Camera, choose **Get camera + dolly rails**. Lay rails on the floor and place the
+camera on a rail. Right-click it to look through the viewfinder; the mouse pans the
+shot. Use powered rails to sustain movement, or leave it stationary for a fixed shot.
+To save a shot, enter its name and choose **Record camera dolly**, then right-click
+the camera. Movement is captured automatically. Sneak saves and exits the viewfinder.
+You can preview the saved shot or assign it to a take. A dolly pass supports about
+102 seconds. This records camera motion, not a video file; use your usual video
+recorder to capture playback.
+
 For a shared take, scroll down in Cast, create a take, and load it. Select an actor,
 enter its action and/or voice script names, then choose **Save actor + starting mark**.
 Repeat for each actor. In Camera, assign a saved path to that take if needed.
@@ -134,7 +154,7 @@ pre-render audio or promise frame-exact dialogue against camera movement.
 /codex skit script action takeoff equip minecraft:elytra
 /codex skit script action takeoff jump
 /codex skit script play takeoff
-/codex skit voice profile Claude voice.ember.v1 dramatic 1.05 64
+/codex skit voice profile Claude voice.adrian.v1 dramatic 1.05 64
 /codex skit voice say Claude You should not have come here.
 /codex skit voice script create intro Claude
 /codex skit voice script add intro 0 Now run.

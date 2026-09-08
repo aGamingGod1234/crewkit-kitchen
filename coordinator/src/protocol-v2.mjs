@@ -43,6 +43,7 @@ export const COORDINATOR_TO_SERVER_TYPES = Object.freeze([
 	'agent_ready',
 	'planning_state',
 	'goal_completed',
+	'director_script_result',
 	'goal_spec_proposal',
 	'conversation_wake_ack',
 	'request_observation',
@@ -67,6 +68,7 @@ export const SERVER_TO_COORDINATOR_TYPES = Object.freeze([
 	'action_progress',
 	'action_result',
 	'goal_completion_result',
+	'director_script_request',
 	'goal_spec_request',
 	'goal_spec_result',
 	'verbose_control',
@@ -255,6 +257,12 @@ function normalizeProtocolV2Payload(type, value) {
 				reasonCode: boundedText(value.reasonCode, 'reasonCode', MAX_REASON_CODE_LENGTH),
 				facts: boundedArray(value.facts, 'facts', MAX_COMPLETION_FACTS).map((fact, index) => normalizeCompletionFact(fact, index)),
 			};
+		case 'director_script_request':
+            exactKeys(value, ['requestId','description','actorName'], ['requestId','description','actorName'], type);
+            return {requestId:requireIdentifier(value.requestId,'requestId'), description:boundedText(value.description,'description',2048), actorName:boundedText(value.actorName,'actorName',64)};
+        case 'director_script_result':
+            exactKeys(value, ['requestId','script','error'], ['requestId','script','error'], type);
+            return {requestId:requireIdentifier(value.requestId,'requestId'), script:boundedText(value.script,'script',32768,0), error:boundedText(value.error,'error',400,0)};
 		case 'goal_spec_request':
 			return parseGoalSpecRequest(value);
 		case 'goal_spec_proposal':

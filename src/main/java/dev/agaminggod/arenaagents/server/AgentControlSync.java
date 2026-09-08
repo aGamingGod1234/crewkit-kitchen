@@ -56,6 +56,11 @@ public final class AgentControlSync {
 		PayloadTypeRegistry.serverboundPlay().register(ScenarioCancelPayload.TYPE, ScenarioCancelPayload.CODEC);
 		PayloadTypeRegistry.clientboundPlay().register(AgentControlSnapshotPayload.TYPE, AgentControlSnapshotPayload.CODEC);
 		PayloadTypeRegistry.clientboundPlay().register(dev.agaminggod.arenaagents.control.DirectorTakePlaybackPayload.TYPE, dev.agaminggod.arenaagents.control.DirectorTakePlaybackPayload.CODEC);
+        PayloadTypeRegistry.serverboundPlay().register(dev.agaminggod.arenaagents.control.DirectorGenerationPayload.Request.TYPE, dev.agaminggod.arenaagents.control.DirectorGenerationPayload.Request.CODEC);
+        PayloadTypeRegistry.clientboundPlay().register(dev.agaminggod.arenaagents.control.DirectorGenerationPayload.Result.TYPE, dev.agaminggod.arenaagents.control.DirectorGenerationPayload.Result.CODEC);
+        ServerPlayNetworking.registerGlobalReceiver(dev.agaminggod.arenaagents.control.DirectorGenerationPayload.Request.TYPE, (payload, context) -> context.server().execute(() -> DirectorScriptGeneration.request(context.player(), payload)));
+        ServerTickEvents.END_SERVER_TICK.register(DirectorScriptGeneration::tick);
+        net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents.SERVER_STOPPED.register(DirectorScriptGeneration::release);
 		PayloadTypeRegistry.serverboundPlay().register(DirectorEditorPayload.Request.TYPE, DirectorEditorPayload.Request.CODEC);
 		PayloadTypeRegistry.clientboundPlay().register(DirectorEditorPayload.Snapshot.TYPE, DirectorEditorPayload.Snapshot.CODEC);
 		if (!ServerPlayNetworking.registerGlobalReceiver(DirectorEditorPayload.Request.TYPE,
@@ -346,7 +351,8 @@ public final class AgentControlSync {
 				var actors = SkitActors.records(server).stream().map(actor -> new DirectorSnapshotPayload.Actor(
 						actor.agentId().toString(), actor.name(), dev.agaminggod.arenaagents.agent.AgentIdentity.playerName(actor.agentId(), actor.profile()),
 						actor.appearance(), actor.dead(), SkitActors.find(server, actor.agentId()).filter(ServerPlayer::isAlive).isPresent(),
-						dev.agaminggod.arenaagents.server.voice.VoiceDirector.status(server, actor.agentId()))).toList();
+						dev.agaminggod.arenaagents.server.voice.VoiceDirector.status(server, actor.agentId()),
+						dev.agaminggod.arenaagents.server.voice.VoiceDirectorSavedData.get(server).profile(actor.agentId()))).toList();
 				ServerPlayNetworking.send(player, new DirectorSnapshotPayload(SkitModeRuntime.enabled(server), GoalControl.mayControl(player.createCommandSourceStack()), actors));
 			}
 			boolean canControl = GoalControl.mayControl(player.createCommandSourceStack());

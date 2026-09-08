@@ -5,7 +5,7 @@ import { NoSttProvider } from './deepgram-stt-provider.mjs';
 import { resampleS16leMono } from './pcm-audio.mjs';
 import { TtsCache } from './tts-cache.mjs';
 import { providerCacheNamespace, synthesisCacheNamespace } from './tts-cache-identity.mjs';
-import { builtInVoiceProfiles } from './voice-profile-store.mjs';
+import { builtInVoiceProfiles, directorVoiceProfiles } from './voice-profile-store.mjs';
 
 const MAX_REQUEST_BYTES = 8 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
@@ -910,7 +910,9 @@ function validateRequest(value) {
 	if (!/^[0-9a-f-]{36}$/i.test(value.agentId)) throw typedError('INVALID_REQUEST', 'agentId must be a UUID');
 	if (typeof value.text !== 'string' || value.text.trim() === '' || [...value.text].length > 280) throw typedError('INVALID_REQUEST', 'text must contain 1 to 280 code points');
 	if (typeof value.profileId !== 'string' || !/^voice\.[a-z0-9_.-]+\.v1$/.test(value.profileId)) throw typedError('INVALID_REQUEST', 'profileId is invalid');
-	if (value.profileId !== 'voice.auto.v1' && !builtInVoiceProfiles().some((profile) => profile.profileId === value.profileId)) {
+	if (value.profileId !== 'voice.auto.v1'
+			&& !directorVoiceProfiles().some((profile) => profile.profileId === value.profileId)
+			&& !builtInVoiceProfiles().some((profile) => profile.profileId === value.profileId)) {
 		throw typedError('INVALID_REQUEST', 'profileId is not in the installed voice catalog');
 	}
 	if (!Number.isSafeInteger(value.radius) || value.radius < 1 || value.radius > 128) throw typedError('INVALID_REQUEST', 'radius is invalid');

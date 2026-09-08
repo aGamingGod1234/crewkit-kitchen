@@ -53,7 +53,7 @@ public final class CameraPathVerification {
 				new CameraKeyframe(0, 0.0D, 0.0D, 0.0D, 0.0F, 0.0F),
 				new CameraKeyframe(0, 1.0D, 0.0D, 0.0D, 0.0F, 0.0F))), "duplicate frame times are rejected");
 		try {
-			return 6 + verifyDelayedStart() + verifyUnboundedYaw() + verifyReplacement()
+			return 6 + verifyDollyCapture() + verifyDelayedStart() + verifyUnboundedYaw() + verifyReplacement()
 					+ verifyRestart() + verifySaveFailure() + verifyDeleteAndClearFailure()
 					+ verifyMalformedStorage() + verifyRecordingLevelChange() + verifyRecordingClockCorrection()
 					+ verifyPlaybackLevelChange() + verifyPlaybackRespawn() + verifyWriterFailure() + verifyAnchorAndPerspective() + verifyRenderedEyeHeight();
@@ -61,6 +61,56 @@ public final class CameraPathVerification {
 			throw new AssertionError("camera verification failed", exception);
 		}
 	}
+
+    private static int verifyDollyCapture() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            CameraDirectorClient.startDollyRecordingFromGui("physical", false);
+            assertTrue(state("recording") == null, "arming waits for a physical camera before recording");
+            assertTrue("physical".equals(state("armedDollyName")), "the next camera click has the chosen path name");
+            var cart = allocate(net.minecraft.world.entity.vehicle.minecart.Minecart.class);
+            setField(cart, Entity.class, "level", fixture.level);
+            setField(cart, Entity.class, "position", new Vec3(10, 64, 20));
+            var cameraId = java.util.UUID.randomUUID();
+            setField(cart, Entity.class, "uuid", cameraId);
+            invoke("enterDolly", new Class<?>[]{Minecraft.class, net.minecraft.world.entity.vehicle.minecart.AbstractMinecart.class}, fixture.client, cart);
+            assertTrue(CameraDirectorClient.isDollyViewfinderActive(), "right-click attaches the viewfinder to the physical dolly");
+            assertTrue(state("recording") != null && state("armedDollyName") == null, "entering the camera starts armed capture once");
+            fixture.client.player.setYRot(405);
+            assertTrue(CameraDirectorClient.dollyCommand(false).equals("codex skit camera roll " + cameraId + " 45.0"), "rolling targets the viewed cart using current local mouse yaw, normalized for commands");
+            fixture.client.player.setYRot(0);
+            setField(fixture.client.options, Options.class, "keyShift", allocate(net.minecraft.client.KeyMapping.class));
+            fixture.level.gameTime += 4;
+            setField(cart, Entity.class, "position", new Vec3(11, 64, 20));
+            invoke("tickDolly", new Class<?>[]{Minecraft.class}, fixture.client);
+            fixture.level.gameTime += 4;
+            setField(cart, Entity.class, "position", new Vec3(12, 64, 20));
+            invoke("tickDolly", new Class<?>[]{Minecraft.class}, fixture.client);
+            fixture.level.gameTime += 12;
+            setField(cart, Entity.class, "position", new Vec3(15, 64, 20));
+            CameraDirectorClient.stopRecordingFromGui();
+            var path = fixture.paths.get("physical");
+            assertEquals(20, path.durationTicks(), "physical capture saves its elapsed duration automatically");
+            assertEquals(4, path.keyframes().size(), "dolly movement is sampled automatically without manual keyframe clicks");
+            assertEquals(5, path.keyframes().getLast().x() - path.keyframes().getFirst().x(), "saved camera movement follows the dolly instead of the player");
+            CameraDirectorClient.stopPlaybackFromGui();
+            assertTrue(!CameraDirectorClient.isDollyViewfinderActive() && fixture.client.camera == fixture.client.player, "leaving the viewfinder restores the player camera");
+            CameraDirectorClient.startDollyRecordingFromGui("physical", false);
+            assertTrue(state("armedDollyName") == null && fixture.paths.get("physical") == path, "arming cannot overwrite an existing saved path");
+            CameraDirectorClient.startDollyRecordingFromGui("dimension", false);
+            invoke("enterDolly", new Class<?>[]{Minecraft.class, net.minecraft.world.entity.vehicle.minecart.AbstractMinecart.class}, fixture.client, cart);
+            fixture.level.gameTime += 4;
+            invoke("tickDolly", new Class<?>[]{Minecraft.class}, fixture.client);
+            var blocked = fixture.storage().resolveSibling("camera-paths.json.tmp");
+            Files.createDirectory(blocked);
+            fixture.changeLevel();
+            invoke("tickDolly", new Class<?>[]{Minecraft.class}, fixture.client);
+            assertTrue(state("recording") != null && !CameraDirectorClient.isDollyViewfinderActive(), "world transition restores camera and retains physical recording when saving fails");
+            Files.delete(blocked);
+            CameraDirectorClient.stopRecordingFromGui();
+            assertTrue(state("recording") == null && fixture.paths.containsKey("dimension"), "physical recording can be saved again after leaving its world");
+        }
+        return 12;
+    }
 
 	private static int verifyDelayedStart() {
 		CameraPath path = new CameraPath("delayed", List.of(

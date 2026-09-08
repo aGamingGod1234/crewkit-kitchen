@@ -18,7 +18,13 @@ public final class VoiceDirector {
 	}
 
 	public static VoiceProfile profile(MinecraftServer server, AgentId agentId) {
-		return VoiceDirectorSavedData.get(server).profile(agentId);
+		VoiceProfile saved = VoiceDirectorSavedData.get(server).profile(agentId);
+		if (!VoiceProfile.DEFAULT_PROFILE_ID.equals(saved.profileId())) return saved;
+		return dev.agaminggod.arenaagents.server.SkitActors.records(server).stream()
+				.filter(actor -> actor.agentId().equals(agentId)).findFirst()
+				.map(actor -> new VoiceProfile(VoiceCatalog.defaultFor(actor.name(), actor.appearance()),
+						saved.tone(), saved.speed(), saved.radius()))
+				.orElse(saved);
 	}
 
 	public static VoiceProfile setProfile(MinecraftServer server, AgentId agentId, VoiceProfile profile) {
@@ -70,12 +76,29 @@ public final class VoiceDirector {
 
 	/** Schedules one line immediately, using the persisted profile for the agent. */
 	public static void say(MinecraftServer server, AgentId agentId, String text) {
+		scheduleLine(server, agentId, new VoiceCue(0, text));
+	}
+
+	/** Queues one preview with exactly the selected settings, without changing saved settings. */
+	public static void say(MinecraftServer server, AgentId agentId, String text, VoiceProfile settings) {
+		var actor = dev.agaminggod.arenaagents.server.SkitActors.resolve(server, agentId.toString());
+		scheduleLine(server, agentId, lineCue(text, settings, actor.name(), actor.appearance()));
+	}
+
+	static VoiceCue lineCue(String text, VoiceProfile settings, String actorName, String appearance) {
+		if (!VoiceCatalog.accepts(settings.profileId())) throw new AgentDomainException(
+				"VOICE_PROFILE_UNKNOWN", "Unknown voice profile. Use /codex skit voice profiles");
+		String id = VoiceProfile.DEFAULT_PROFILE_ID.equals(settings.profileId())
+				? VoiceCatalog.defaultFor(actorName, appearance) : settings.profileId();
+		return new VoiceCue(0, text, id, settings.tone(), settings.speed(), settings.radius());
+	}
+
+	private static void scheduleLine(MinecraftServer server, AgentId agentId, VoiceCue cue) {
 		dev.agaminggod.arenaagents.server.DirectorTakeRuntime.requireUnreserved(server, agentId);
 		SkitModeRuntime.requireEnabled(server);
 		requireAvailable(server);
 		if (dev.agaminggod.arenaagents.server.SkitActors.find(server, agentId).filter(net.minecraft.server.level.ServerPlayer::isAlive).isEmpty())
 			throw new AgentDomainException("ACTOR_NOT_PRESENT", "Respawn the actor before speaking");
-		VoiceCue cue = new VoiceCue(0, text);
 		stop(server, agentId);
 		PLAYBACK.computeIfAbsent(server, ignored -> new ConcurrentHashMap<>())
 				.put(agentId, new DirectorSpeechPlayback(java.util.List.of(cue), server.getTickCount()));

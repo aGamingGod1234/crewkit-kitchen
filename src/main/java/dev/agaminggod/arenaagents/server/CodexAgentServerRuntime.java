@@ -660,6 +660,11 @@ public final class CodexAgentServerRuntime {
 		}
 	}
 
+    public static boolean requestDirectorScript(MinecraftServer server, com.google.gson.JsonObject request) {
+        MultiplexedServerBridge active = bridge(server);
+        return active != null && active.requestDirectorScript(request);
+    }
+
 	private static MultiplexedServerBridge bridge(MinecraftServer server) {
 		BridgeSlot slot = BRIDGE_SLOTS.get(server);
 		return slot == null ? null : slot.bridge();

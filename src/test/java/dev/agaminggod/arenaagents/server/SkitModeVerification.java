@@ -26,7 +26,17 @@ public final class SkitModeVerification {
 				"action steps preserve order");
 		assertThrows(() -> SkitAction.move(0), "move requires a duration");
 		assertThrows(() -> SkitAction.equip("diamond_sword"), "equip requires a namespaced item id");
-		return 7 + DirectorEditorVerification.verify() + DirectorTakeVerification.verify() + verifyNamesAndPlacement() + verifyTimeline() + verifyPreflight() + verifyCleanup() + verifyGuiCommands() + verifyDirectorParsing() + verifyNameReservations() + verifyCastPersistence() + verifyPendingConversion();
+		return 7 + SkitPresentationVerification.verify() + verifyExactActorLabels() + DirectorEditorVerification.verify() + DirectorTakeVerification.verify() + verifyNamesAndPlacement() + verifyTimeline() + verifyPreflight() + verifyCleanup() + verifyGuiCommands() + verifyDirectorParsing() + verifyNameReservations() + verifyCastPersistence() + verifyPendingConversion();
+	}
+
+	private static int verifyExactActorLabels() {
+		var id = dev.agaminggod.arenaagents.agent.AgentId.random();
+		for (String name : List.of("GPT 6-Astra", "Fable 5.1", "Grok_4.6", "Gemini 3.1-Pro", "Kimi K3")) {
+			var actor = new SkitActor(id, name, "codex", false);
+			assertEquals(name, dev.agaminggod.arenaagents.agent.AgentIdentity.displayNameTag(actor.profile()), "actor display preserves requested punctuation");
+			assertEquals(dev.agaminggod.arenaagents.agent.AgentIdentity.canonicalPublicName(name), dev.agaminggod.arenaagents.agent.AgentIdentity.playerName(id, actor.profile()), "technical identity remains stable");
+		}
+		return 10;
 	}
 
 	private static int verifyPendingConversion() {

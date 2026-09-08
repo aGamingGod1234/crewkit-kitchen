@@ -1,0 +1,7 @@
+{
+  "variants": {
+    "": {
+      "model": "arenaagents:block/camera_dolly"
+    }
+  }
+}

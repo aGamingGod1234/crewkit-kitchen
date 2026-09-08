@@ -36,6 +36,7 @@ import dev.agaminggod.arenaagents.server.voice.VoiceCue;
 import dev.agaminggod.arenaagents.server.voice.VoiceDirector;
 import dev.agaminggod.arenaagents.server.voice.VoiceDirectorSavedData;
 import dev.agaminggod.arenaagents.server.voice.VoiceProfile;
+import dev.agaminggod.arenaagents.server.voice.VoiceCatalog;
 import dev.agaminggod.arenaagents.server.voice.VoiceScript;
 import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemRuntime;
 import org.slf4j.Logger;
@@ -51,11 +52,7 @@ public final class CodexAgentCommands {
 	private static final String PROVIDER_CLAUDE = "claude";
 	private static final String PROVIDER_KIMI = "kimi";
 	private static final String PROVIDER_CURSOR = "cursor";
-	private static final List<String> VOICE_PROFILE_IDS = List.of(
-			VoiceProfile.DEFAULT_PROFILE_ID,
-			"voice.moss.v1", "voice.flint.v1", "voice.ember.v1", "voice.wren.v1", "voice.cedar.v1",
-			"voice.sable.v1", "voice.quill.v1", "voice.rook.v1", "voice.juniper.v1", "voice.vale.v1",
-			"voice.kestrel.v1", "voice.sol.v1", "voice.reed.v1", "voice.nova.v1", "voice.ash.v1", "voice.piper.v1");
+	private static final List<String> VOICE_PROFILE_IDS = VoiceCatalog.selectableIds();
 	private static final List<String> VOICE_TONES = List.of(
 			"neutral", "warm", "excited", "serious", "dramatic", "whisper", "robotic", "angry");
 	private static final String ARGUMENT_AGENT = "agent";
@@ -160,6 +157,7 @@ public final class CodexAgentCommands {
 
 	private static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> skitCommands() {
 		var skit = Commands.literal("skit").requires(GoalControl::mayControl).executes(CodexAgentCommands::skitStatus);
+		skit.then(dev.agaminggod.arenaagents.camera.CameraDolly.commands());
 		skit.then(DirectorTakeCommands.commands());
 		skit.then(Commands.literal("on").executes(context -> toggleSkit(context, true)));
 		skit.then(Commands.literal("off").executes(context -> toggleSkit(context, false)));
@@ -274,6 +272,16 @@ public final class CodexAgentCommands {
 				.then(actorArgument().then(Commands.argument("text", StringArgumentType.greedyString())
 						.executes(CodexAgentCommands::sayVoice)));
 		voice.then(say);
+		voice.then(Commands.literal("say_with").then(actorArgument()
+				.then(Commands.argument("profile", StringArgumentType.word())
+						.suggests((context, builder) -> SharedSuggestionProvider.suggest(VOICE_PROFILE_IDS, builder))
+						.then(Commands.argument("tone", StringArgumentType.word())
+								.suggests((context, builder) -> SharedSuggestionProvider.suggest(VOICE_TONES, builder))
+								.then(Commands.argument("speed", DoubleArgumentType.doubleArg(0.5D, 2.0D))
+										.then(Commands.argument("radius", IntegerArgumentType.integer(1, 128))
+												.then(Commands.argument("text", StringArgumentType.greedyString())
+														.executes(CodexAgentCommands::sayVoiceWith))))))));
+
 
 		var script = Commands.literal("script");
 		script.then(Commands.literal("create")
@@ -595,15 +603,16 @@ public final class CodexAgentCommands {
 		try {
 			String selector = StringArgumentType.getString(context, ARGUMENT_AGENT);
 			String profileId = StringArgumentType.getString(context, "profile");
-			if (!VOICE_PROFILE_IDS.contains(profileId)) {
+			if (!VoiceCatalog.accepts(profileId)) {
 				throw new AgentDomainException("VOICE_PROFILE_UNKNOWN", "Unknown voice profile. Use /codex skit voice profiles");
 			}
 			String tone = getOptionalString(context, "tone", VoiceProfile.DEFAULT_TONE);
 			double speed = getOptionalDouble(context, "speed", VoiceProfile.DEFAULT_SPEED);
 			int radius = getOptionalInt(context, "radius", VoiceProfile.DEFAULT_RADIUS);
-			AgentId agentId = SkitActors.resolve(context.getSource().getServer(), selector).agentId();
+			SkitActor actor = SkitActors.resolve(context.getSource().getServer(), selector);
+			AgentId agentId = actor.agentId();
 			VoiceDirector.setProfile(context.getSource().getServer(), agentId, new VoiceProfile(profileId, tone, speed, radius));
-			context.getSource().sendSuccess(() -> Component.literal("Voice profile set for " + selector + "."), false);
+			context.getSource().sendSuccess(() -> Component.literal("Voice profile set for " + actor.name() + "."), false);
 			return 1;
 		} catch (AgentDomainException exception) {
 			throw commandFailure(exception);
@@ -624,8 +633,23 @@ public final class CodexAgentCommands {
 		}
 	}
 
+	private static int sayVoiceWith(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
+		try {
+			AgentId agentId = SkitActors.resolve(context.getSource().getServer(), StringArgumentType.getString(context, ARGUMENT_AGENT)).agentId();
+			VoiceProfile settings = new VoiceProfile(StringArgumentType.getString(context, "profile"),
+					StringArgumentType.getString(context, "tone"), DoubleArgumentType.getDouble(context, "speed"),
+					IntegerArgumentType.getInteger(context, "radius"));
+			VoiceDirector.say(context.getSource().getServer(), agentId, StringArgumentType.getString(context, "text"), settings);
+			return 1;
+		} catch (AgentDomainException exception) {
+			throw commandFailure(exception);
+		} catch (RuntimeException exception) {
+			throw unexpectedFailure("skit voice say with settings", exception);
+		}
+	}
+
 	private static int listVoiceProfiles(CommandContext<CommandSourceStack> context) {
-		context.getSource().sendSuccess(() -> Component.literal("Voice catalog: " + String.join(", ", VOICE_PROFILE_IDS)), false);
+		context.getSource().sendSuccess(() -> Component.literal("Voice catalog: " + String.join("; ", VoiceCatalog.choices().stream().map(choice -> choice.label() + " (" + choice.id() + ")").toList())), false);
 		return 1;
 	}
 

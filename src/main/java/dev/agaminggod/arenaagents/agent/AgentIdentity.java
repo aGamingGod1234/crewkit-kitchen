@@ -45,11 +45,7 @@ public final class AgentIdentity {
 	/** Returns the readable tag shown above a spawned player, without changing its safe technical name. */
 	public static String displayNameTag(AgentProfile profile) {
 		Objects.requireNonNull(profile, "profile must not be null");
-		String technicalName = displayName(profile);
-		String defaultTechnicalName = defaultPublicName(profile.provider(), profile.model());
-		return technicalName.equals(defaultTechnicalName)
-				? AgentModelNames.tagName(profile.provider(), profile.model())
-				: technicalName;
+		return profile.userName().orElseGet(() -> AgentModelNames.tagName(profile.provider(), profile.model()));
 	}
 
 	static String canonicalIdentityKey(String value) {
@@ -69,7 +65,7 @@ public final class AgentIdentity {
 		return canonicalPublicName(AgentModelNames.displayName(provider, model));
 	}
 
-	/** Converts a requested label into the exact name Minecraft, chat, and the UI can share. */
+	/** Converts a requested label into the stable Minecraft profile name. Visible labels stay separate. */
 	public static String canonicalPublicName(String requested) {
 		String source = Objects.requireNonNull(requested, "requested name must not be null").strip();
 		StringBuilder safe = new StringBuilder(Math.min(source.length(), PLAYER_NAME_LIMIT));

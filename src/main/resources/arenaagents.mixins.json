@@ -3,6 +3,7 @@
   "package": "dev.agaminggod.arenaagents.mixin",
   "compatibilityLevel": "JAVA_25",
   "mixins": [
+    "CameraDollyMinecartMixin",
     "CachedUserNameToIdResolverAccessor",
     "CachedProfileInfoAccessor",
     "EntityPlayerActionInvoker",
@@ -14,6 +15,7 @@
     "ShulkerShapeRevisionMixin",
     "PistonShapeRevisionMixin",
     "MsgCommandMixin",
+    "PlayerDisplayNameMixin",
     "ServerGamePacketListenerInvoker",
     "ServerPlayerGameModeBreakAccessor",
     "ServerPlayerGameModeMixin"

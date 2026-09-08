@@ -28,6 +28,11 @@ public final class DirectorCommandsVerification {
 			var response = new DirectorCommandResultPayload(id, false, "ACTOR_NAME_TAKEN: Already used");
 			DirectorCommandResultPayload.CODEC.encode(buffer, response);
 			check(response.equals(DirectorCommandResultPayload.CODEC.decode(buffer)), "result codec preserves the server failure");
+            var voice = new dev.agaminggod.arenaagents.server.voice.VoiceProfile("voice.selene.v1", "excited", 1.25, 64);
+            var snapshot = new dev.agaminggod.arenaagents.control.DirectorSnapshotPayload(true, true, java.util.List.of(
+                    new dev.agaminggod.arenaagents.control.DirectorSnapshotPayload.Actor(id.toString(), "GPT 6-Astra", "GPT_6_Astra", "codex", false, true, "Ready", voice)));
+            dev.agaminggod.arenaagents.control.DirectorSnapshotPayload.CODEC.encode(buffer, snapshot);
+            check(snapshot.equals(dev.agaminggod.arenaagents.control.DirectorSnapshotPayload.CODEC.decode(buffer)), "snapshot preserves saved voice settings on reopen");
 		} finally { buffer.release(); }
 		try {
 			new DirectorCommandRequestPayload(id, "x".repeat(DirectorCommandRequestPayload.MAX_COMMAND_LENGTH + 1));
@@ -61,7 +66,7 @@ public final class DirectorCommandsVerification {
 				"Brigadier domain failure returns to the submitting form");
 		check(!DirectorCommands.execute(new DirectorCommandRequestPayload(id, "codex skit missing"), dispatcher, operator).success(),
 				"server command-tree mismatches return a failure instead of a success receipt");
-		return 10;
+		return 11;
 	}
 
 	private static CommandSourceStack source(PermissionSet permissions) {

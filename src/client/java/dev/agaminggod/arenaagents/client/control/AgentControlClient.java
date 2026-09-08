@@ -94,6 +94,11 @@ public final class AgentControlClient {
 				}));
 		ClientPlayNetworking.registerGlobalReceiver(dev.agaminggod.arenaagents.control.DirectorTakePlaybackPayload.TYPE,
 				(payload, context) -> context.client().execute(() -> dev.agaminggod.arenaagents.client.camera.CameraDirectorClient.acceptTake(payload)));
+		ClientPlayNetworking.registerGlobalReceiver(dev.agaminggod.arenaagents.control.DirectorGenerationPayload.Result.TYPE,
+				(payload, context) -> context.client().execute(() -> {
+					if (DirectorClientState.acceptGeneration(payload) && context.client().gui != null)
+						context.client().gui.setOverlayMessage(net.minecraft.network.chat.Component.literal(payload.message()), false);
+				}));
 		ClientPlayNetworking.registerGlobalReceiver(DirectorEditorPayload.Snapshot.TYPE,
 				(payload, context) -> context.client().execute(() -> {
 					if (context.client().screen instanceof dev.agaminggod.arenaagents.client.gui.SkitDirectorScreen screen) screen.acceptEditorSnapshot(payload);
@@ -225,6 +230,12 @@ public final class AgentControlClient {
 
 	public static boolean sendCommand(String command) {
 		return sendCommandWithReceipt(command).isPresent();
+	}
+
+	public static boolean sendDirectorGeneration(dev.agaminggod.arenaagents.control.DirectorGenerationPayload.Request request) {
+		if (Minecraft.getInstance().getConnection() == null || !ClientPlayNetworking.canSend(dev.agaminggod.arenaagents.control.DirectorGenerationPayload.Request.TYPE)) return false;
+		ClientPlayNetworking.send(request);
+		return true;
 	}
 
 	public static boolean sendDirectorEditor(DirectorEditorPayload.Request request) {

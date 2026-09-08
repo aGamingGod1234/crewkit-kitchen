@@ -53,6 +53,93 @@ public final class CameraDirectorClient {
 	private static Entity previousCamera;
 	private static CameraType previousCameraType;
 	private static boolean registered;
+    private static net.minecraft.world.entity.vehicle.minecart.AbstractMinecart dolly;
+    private static String armedDollyName;
+    private static boolean armedDollyReplace;
+    private static boolean dollyRecording;
+
+    /** Arms physical capture. The next camera dolly clicked becomes the recording camera. */
+    public static void startDollyRecordingFromGui(String name, boolean replace) {
+        try {
+            name = validateName(name);
+            var client = Minecraft.getInstance();
+            if (client.level == null || client.player == null) throw new IllegalArgumentException("Join a world before recording a camera dolly.");
+            if (recording != null) throw new IllegalArgumentException("Save the current camera recording first.");
+            if (PATHS.containsKey(name) && !replace) throw new IllegalArgumentException("A camera path named " + name + " already exists.");
+            if (!PATHS.containsKey(name) && PATHS.size() >= MAX_PATHS) throw new IllegalArgumentException("Camera path library is full.");
+            armedDollyName = name; armedDollyReplace = replace;
+            if (dolly != null) beginDollyCapture(client);
+            if (client.screen != null) client.setScreen(null);
+            guiFeedback(dollyRecording ? "Recording camera dolly. Pan with the mouse; use Roll camera to move, then sneak to save and exit." : "Click your camera dolly to record. Pan with the mouse; sneak to save and leave the viewfinder.", false);
+        } catch (IllegalArgumentException error) { guiFeedback(error.getMessage(), true); }
+    }
+
+    private static void beginDollyCapture(Minecraft client) {
+        if (dolly == null || armedDollyName == null || client.level == null || client.player == null) return;
+        if (recording != null) {
+            armedDollyName = null; guiFeedback("Save the current camera recording first.", true); return;
+        }
+        // Validation happens again because a path may have been saved while capture was armed.
+        if (PATHS.containsKey(armedDollyName) && !armedDollyReplace) {
+            armedDollyName = null; guiFeedback("That camera path already exists. Choose another name.", true); return;
+        }
+        recording = new Recording(armedDollyName, client.level, client.level.getGameTime(), new ArrayList<>(), true);
+        recording.frames().add(dollyFrame(client, 0));
+        armedDollyName = null; dollyRecording = true;
+    }
+
+    private static CameraKeyframe dollyFrame(Minecraft client, int tick) {
+        var look = client.player.getLookAngle();
+        return new CameraKeyframe(tick, dolly.getX() + look.x * 0.7, dolly.getY() + 1.35, dolly.getZ() + look.z * 0.7, client.player.getYRot(), client.player.getXRot());
+    }
+
+    public static boolean isDollyViewfinderActive() { return dolly != null; }
+
+    public static String dollyCommand(boolean stop) {
+        String command = "codex skit camera " + (stop ? "stop" : "roll");
+        var client = Minecraft.getInstance();
+        if (dolly == null || client.player == null) return command;
+        return command + " " + dolly.getUUID() + " " + net.minecraft.util.Mth.wrapDegrees(client.player.getYRot());
+    }
+
+    private static void enterDolly(Minecraft client, net.minecraft.world.entity.vehicle.minecart.AbstractMinecart cart) {
+        if (client.player == null || client.level == null) return;
+        if (dollyRecording && recording != null) {
+            guiFeedback("Camera recording is running. Save it before switching cameras.", false);
+            return;
+        }
+        stopPlayback(client);
+        previousCamera = client.getCameraEntity(); previousCameraType = client.options.getCameraType();
+        dolly = cart;
+        beginDollyCapture(client);
+        guiFeedback(dollyRecording ? "Recording camera dolly. Mouse pans; sneak saves and exits." : "Camera viewfinder. Mouse pans; sneak exits. Use Director to record a path.", false);
+    }
+
+    private static void tickDolly(Minecraft client) {
+        if (dolly == null) return;
+        if (client.player == null || client.level != dolly.level() || dolly.isRemoved() || client.options.keyShift.isDown()) {
+            if (dollyRecording && recording != null) stopRecordingFromGui();
+            stopPlayback(client); return;
+        }
+        var frame = dollyFrame(client, 0);
+        apply(client, new CameraPose(frame.x(), frame.y(), frame.z(), frame.yaw(), frame.pitch()));
+        if (dollyRecording && recording != null) {
+            long elapsed = client.level.getGameTime() - recording.startedAt();
+            if (elapsed > CameraPath.MAX_DURATION_TICKS) {
+                dollyRecording = false;
+                stopRecordingFromGui();
+                return;
+            }
+            if (elapsed > recording.frames().getLast().tick() && elapsed % 4 == 0) {
+                recording.frames().add(dollyFrame(client, (int) elapsed));
+                if (recording.frames().size() >= CameraPath.MAX_KEYFRAMES || elapsed >= CameraPath.MAX_DURATION_TICKS) {
+                    dollyRecording = false;
+                    stopRecordingFromGui();
+                    if (recording == null) guiFeedback("Camera path saved at the recording limit. Viewfinder is still open.", false);
+                }
+            }
+        }
+    }
 
 	private static dev.agaminggod.arenaagents.control.DirectorTakePlaybackPayload scheduledTake;
 	private static net.minecraft.client.multiplayer.ClientLevel takeLevel;
@@ -88,12 +175,19 @@ public final class CameraDirectorClient {
 	public static synchronized void register() {
 		if (registered) return;
 		load(Minecraft.getInstance());
+        net.fabricmc.fabric.api.event.player.UseEntityCallback.EVENT.register((player, level, hand, entity, hit) -> {
+            if (!level.isClientSide() || !dev.agaminggod.arenaagents.camera.CameraDolly.isCamera(entity)) return net.minecraft.world.InteractionResult.PASS;
+            if (player.isShiftKeyDown()) return net.minecraft.world.InteractionResult.SUCCESS;
+            enterDolly(Minecraft.getInstance(), (net.minecraft.world.entity.vehicle.minecart.AbstractMinecart) entity);
+            return net.minecraft.world.InteractionResult.SUCCESS;
+        });
 		ClientCommandRegistrationCallback.EVENT.register((dispatcher, ignored) -> dispatcher.register(commands()));
 		ClientTickEvents.END_CLIENT_TICK.register(CameraDirectorClient::tick);
 		ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
-			scheduledTake = null; takeLevel = null; takeCamera = false;
+			scheduledTake = null; takeLevel = null; takeCamera = false; armedDollyName = null;
+            if (recording != null && recording.physical()) stopRecordingFromGui();
+            else recording = null;
 			stopPlayback(client);
-			recording = null;
 		});
 		registered = true;
 	}
@@ -135,6 +229,7 @@ public final class CameraDirectorClient {
 		if (recording == null) { guiFeedback("No camera path is recording.", true); return; }
 		try {
 			CameraPath saved = finishRecording(client);
+            dollyRecording = false;
 			guiFeedback("Saved camera path '" + saved.name() + "' (" + saved.keyframes().size() + " keyframes).", false);
 		} catch (IllegalArgumentException exception) {
 			guiFeedback(exception.getMessage(), true);
@@ -159,7 +254,7 @@ public final class CameraDirectorClient {
 	}
 
 	public static void stopPlaybackFromGui() {
-		if (playback == null) { guiFeedback("No camera path is playing.", true); return; }
+		if (playback == null && dolly == null) { guiFeedback("No camera path is playing.", true); return; }
 		stopPlayback(Minecraft.getInstance());
 		guiFeedback("Camera path stopped; camera returned to the player.", false);
 	}
@@ -252,7 +347,7 @@ public final class CameraDirectorClient {
 		if (client.level == null || client.player == null) throw new IllegalArgumentException("You must be in a world to record a camera path.");
 		CameraKeyframe first = new CameraKeyframe(0, client.player.getX(), client.player.getEyeY(), client.player.getZ(), client.player.getYRot(), client.player.getXRot());
 		stopPlayback(client);
-		recording = new Recording(name, client.level, client.level.getGameTime(), new ArrayList<>(List.of(first)));
+		recording = new Recording(name, client.level, client.level.getGameTime(), new ArrayList<>(List.of(first)), false);
 		return name;
 	}
 
@@ -261,11 +356,17 @@ public final class CameraDirectorClient {
 	}
 
 	private static CameraPath finishRecording(Minecraft client) throws IOException {
-		if (!recordingInCurrentLevel(client)) {
+        if (recording == null) throw new IllegalArgumentException("No camera path is recording.");
+		if (!recording.physical() && !recordingInCurrentLevel(client)) {
 			recording = null;
 			throw new IllegalArgumentException("Recording cancelled because you left its world.");
 		}
-		CameraPath saved = new CameraPath(recording.name(), recording.frames());
+		if (dollyRecording && dolly != null && recordingInCurrentLevel(client) && recording.frames().size() < CameraPath.MAX_KEYFRAMES) {
+            long elapsed = client.level.getGameTime() - recording.startedAt();
+            if (elapsed > recording.frames().getLast().tick() && elapsed <= CameraPath.MAX_DURATION_TICKS)
+                recording.frames().add(dollyFrame(client, (int) elapsed));
+        }
+        CameraPath saved = new CameraPath(recording.name(), recording.frames());
 		Map<String, CameraPath> next = new LinkedHashMap<>(PATHS);
 		next.put(saved.name(), saved);
 		save(client, next);
@@ -333,6 +434,7 @@ public final class CameraDirectorClient {
 	}
 
 	private static void tick(Minecraft client) {
+        tickDolly(client);
 		if (scheduledTake != null) {
 			if (client.level != takeLevel || client.player == null) { scheduledTake = null; takeLevel = null; }
 			else if (client.level.getGameTime() >= scheduledTake.startGameTime()) {
@@ -343,7 +445,7 @@ public final class CameraDirectorClient {
 				}
 			}
 		}
-		if (recording != null && !recordingInCurrentLevel(client)) recording = null;
+		if (recording != null && !recording.physical() && !recordingInCurrentLevel(client)) recording = null;
 		if (playback == null) return;
 		if (client.level == null || client.player == null || playback.level() != client.level || playback.player() != client.player) {
 			stopPlayback(client);
@@ -392,7 +494,8 @@ public final class CameraDirectorClient {
 	}
 
 	private static void stopPlayback(Minecraft client) {
-		if (playback == null && cameraAnchor == null && previousCamera == null && previousCameraType == null) return;
+		if (playback == null && dolly == null && cameraAnchor == null && previousCamera == null && previousCameraType == null) return;
+        dolly = null; dollyRecording = false;
 		playback = null;
 		if (cameraAnchor != null) {
 			cameraAnchor.remove(Entity.RemovalReason.DISCARDED);
@@ -500,7 +603,7 @@ public final class CameraDirectorClient {
 		return 0;
 	}
 
-	private record Recording(String name, ClientLevel level, long startedAt, ArrayList<CameraKeyframe> frames) {
+	private record Recording(String name, ClientLevel level, long startedAt, ArrayList<CameraKeyframe> frames, boolean physical) {
 	}
 
 	private record Playback(CameraPath path, ClientLevel level, LocalPlayer player, long startedAt, boolean loop) {

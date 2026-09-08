@@ -8,6 +8,7 @@ import dev.agaminggod.arenaagents.client.control.DirectorClientState;
 import dev.agaminggod.arenaagents.client.gui.widget.ConsoleButton;
 import dev.agaminggod.arenaagents.client.gui.widget.ConsoleCycleButton;
 import dev.agaminggod.arenaagents.client.gui.widget.ConsoleEditBox;
+import dev.agaminggod.arenaagents.client.gui.widget.ConsoleDropdown;
 import dev.agaminggod.arenaagents.control.DirectorCommandRequestPayload;
 import dev.agaminggod.arenaagents.control.DirectorEditorPayload;
 import dev.agaminggod.arenaagents.control.DirectorCommandResultPayload;
@@ -40,11 +41,7 @@ public final class SkitDirectorScreen extends Screen {
 	private static final List<String> TONES = List.of("neutral", "warm", "excited", "serious", "dramatic", "whisper", "robotic", "angry");
 	private static final List<String> SPEEDS = List.of("0.75", "1.0", "1.25", "1.5");
 	private static final List<String> RADII = List.of("16", "32", "48", "64", "96");
-	private static final List<String> VOICES = List.of(
-			"voice.auto.v1", "voice.moss.v1", "voice.flint.v1", "voice.ember.v1", "voice.wren.v1",
-			"voice.cedar.v1", "voice.sable.v1", "voice.quill.v1", "voice.rook.v1", "voice.juniper.v1",
-			"voice.vale.v1", "voice.kestrel.v1", "voice.sol.v1", "voice.reed.v1", "voice.nova.v1",
-			"voice.ash.v1", "voice.piper.v1");
+	private static final List<String> VOICES = dev.agaminggod.arenaagents.server.voice.VoiceCatalog.selectableIds();
 
 	private final Screen parent;
 	private final Map<String, String> drafts = DirectorClientState.drafts();
@@ -53,6 +50,7 @@ public final class SkitDirectorScreen extends Screen {
 	private String pendingEditorOperation;
 	private int selectedRow = -1;
 	private ConsoleEditBox actionDuration;
+	private ConsoleEditBox actionDescription;
 	private ConsoleEditBox walkForward;
 	private ConsoleEditBox walkStrafe;
 	private boolean walkSprint;
@@ -66,6 +64,7 @@ public final class SkitDirectorScreen extends Screen {
 	private final Map<ConsoleEditBox, String> fieldLabels = new HashMap<>();
 	private String selectedAction = "move";
 	private String voice = VOICES.getFirst();
+	private ConsoleDropdown<String> voiceDropdown;
 	private String tone = "neutral";
 	private String speed = "1.0";
 	private String radius = "48";
@@ -98,6 +97,7 @@ public final class SkitDirectorScreen extends Screen {
 		selectedActor = drafts.getOrDefault("selected-actor", "");
 		selectedAction = drafts.getOrDefault("selected-action", "move");
 		voice = drafts.getOrDefault("selected-voice", VOICES.getFirst());
+		if (!VOICES.contains(voice)) voice = VOICES.getFirst();
 		tone = drafts.getOrDefault("selected-tone", "neutral"); speed = drafts.getOrDefault("selected-speed", "1.0"); radius = drafts.getOrDefault("selected-radius", "48");
 		walkSprint = Boolean.parseBoolean(drafts.getOrDefault("walk-sprint", "false")); actionSneak = Boolean.parseBoolean(drafts.getOrDefault("action-sneak", "true"));
 		tab = Tab.valueOf(drafts.getOrDefault("selected-tab", "SPAWN"));
@@ -138,6 +138,7 @@ public final class SkitDirectorScreen extends Screen {
 	protected void init() {
 		clearFields();
 		fieldLabels.clear();
+		voiceDropdown = null;
 		scrollRows = Math.min(scrollRows, maxScrollRows());
 		int left = panelLeft();
 		int top = panelTop();
@@ -228,7 +229,7 @@ public final class SkitDirectorScreen extends Screen {
 				actors.stream().map(actor -> actor.id()).toList(), selectedActor, id -> {
 					var actor = actors.stream().filter(value -> value.id().equals(id)).findFirst().orElseThrow();
 					return Component.literal(actor.name() + (actor.dead() ? " / Dead" : actor.present() ? " / Alive" : " / Offline") + (tab == Tab.VOICE && !actor.speechStatus().isEmpty() ? " / " + actor.speechStatus() : ""));
-				}, value -> { selectedActor = value; drafts.put("selected-actor", value); })).visible = contentVisible(y, ROW);
+				}, value -> { selectedActor = value; drafts.put("selected-actor", value); if (tab == Tab.VOICE) rebuildWidgets(); })).visible = contentVisible(y, ROW);
 	}
 	private String actorTarget() { return word(selectedActor); }
 
@@ -237,6 +238,12 @@ public final class SkitDirectorScreen extends Screen {
 		int y = contentTop();
 		addActorPicker(c[0], y, c[2]);
 		scriptName = addEdit("Script name", "intro", c[1], y, c[2], 64, "director-script-name");
+		y += ROW + GAP;
+		actionDescription = addEdit("Describe the action", "Fly here, land, then wave", c[0], y, c[2] * 2 + GAP, 2048, "director-action-description");
+		y += ROW + GAP;
+		var generate = addRenderableWidget(primary(DirectorClientState.generationPending() ? "Luna is writing..." : "Write script with Luna", c[0], y, c[2] * 2 + GAP, ROW, this::generateScript));
+		generate.active = !DirectorClientState.generationPending();
+		generate.setTooltip(net.minecraft.client.gui.components.Tooltip.create(Component.literal("Luna writes a new editable script. Here means your current position; the actor starts where it is. Nothing plays until you click Play.")));
 		y += ROW + GAP;
 		addRenderableWidget(new ConsoleCycleButton<>(font, c[0], y, c[2], ROW, Component.literal("Action"), ACTIONS,
 				selectedAction, value -> Component.literal(value.equals("move") ? "Glide to my position" : value), value -> { selectedAction = value; drafts.put("selected-action", value); drafts.remove("director-action-args"); rebuildWidgets(); })).visible = contentVisible(y, ROW);
@@ -265,20 +272,44 @@ public final class SkitDirectorScreen extends Screen {
 		initLibrary(y + ROW + GAP);
 	}
 
+	private static List<String> withSavedValue(List<String> options, String saved) {
+		return options.contains(saved) ? options : java.util.stream.Stream.concat(options.stream(), java.util.stream.Stream.of(saved)).toList();
+	}
+
+	private String voiceDraftKey(String setting) { return "actor-voice:" + selectedActor + ":" + setting; }
+
+	private String voiceLabel(String id) {
+		if (!id.equals("voice.auto.v1")) return dev.agaminggod.arenaagents.server.voice.VoiceCatalog.label(id);
+		return DirectorClientState.snapshot().stream().flatMap(value -> value.actors().stream()).filter(actor -> actor.id().equals(selectedActor)).findFirst()
+				.map(actor -> "Default: " + dev.agaminggod.arenaagents.server.voice.VoiceCatalog.label(dev.agaminggod.arenaagents.server.voice.VoiceCatalog.defaultFor(actor.name(), actor.appearance())))
+				.orElse("Character default");
+	}
+
+	private void loadActorVoice() {
+		var saved = DirectorClientState.snapshot().stream().flatMap(value -> value.actors().stream()).filter(actor -> actor.id().equals(selectedActor)).findFirst()
+				.map(actor -> actor.voiceProfile()).orElse(dev.agaminggod.arenaagents.server.voice.VoiceProfile.defaults());
+		voice = drafts.getOrDefault(voiceDraftKey("voice"), saved.profileId());
+		tone = drafts.getOrDefault(voiceDraftKey("tone"), saved.tone());
+		speed = drafts.getOrDefault(voiceDraftKey("speed"), Double.toString(saved.speed()));
+		radius = drafts.getOrDefault(voiceDraftKey("radius"), Integer.toString(saved.radius()));
+	}
+
 	private void initVoice() {
 		int[] c = columns();
 		int y = contentTop();
 		addActorPicker(c[0], y, c[2]);
-		addRenderableWidget(new ConsoleCycleButton<>(font, c[1], y, c[2], ROW, Component.literal("Voice"), VOICES,
-				voice, Component::literal, value -> { voice = value; drafts.put("selected-voice", value); })).visible = contentVisible(y, ROW);
+		loadActorVoice();
+		voiceDropdown = addRenderableWidget(new ConsoleDropdown<>(font, c[1], y, c[2], ROW, "Voice", withSavedValue(VOICES, voice),
+				voice, this::voiceLabel, value -> { voice = value; drafts.put(voiceDraftKey("voice"), value); }, width, height));
+		voiceDropdown.visible = contentVisible(y, ROW);
 		y += ROW + GAP;
-		addRenderableWidget(new ConsoleCycleButton<>(font, c[0], y, c[2], ROW, Component.literal("Tone"), TONES,
-				tone, Component::literal, value -> { tone = value; drafts.put("selected-tone", value); })).visible = contentVisible(y, ROW);
-		addRenderableWidget(new ConsoleCycleButton<>(font, c[1], y, c[2], ROW, Component.literal("Speed"), SPEEDS,
-				speed, Component::literal, value -> { speed = value; drafts.put("selected-speed", value); })).visible = contentVisible(y, ROW);
+		addRenderableWidget(new ConsoleCycleButton<>(font, c[0], y, c[2], ROW, Component.literal("Tone"), withSavedValue(TONES, tone),
+				tone, Component::literal, value -> { tone = value; drafts.put(voiceDraftKey("tone"), value); })).visible = contentVisible(y, ROW);
+		addRenderableWidget(new ConsoleCycleButton<>(font, c[1], y, c[2], ROW, Component.literal("Speed"), withSavedValue(SPEEDS, speed),
+				speed, Component::literal, value -> { speed = value; drafts.put(voiceDraftKey("speed"), value); })).visible = contentVisible(y, ROW);
 		y += ROW + GAP;
-		addRenderableWidget(new ConsoleCycleButton<>(font, c[0], y, c[2], ROW, Component.literal("Radius"), RADII,
-				radius, Component::literal, value -> { radius = value; drafts.put("selected-radius", value); })).visible = contentVisible(y, ROW);
+		addRenderableWidget(new ConsoleCycleButton<>(font, c[0], y, c[2], ROW, Component.literal("Radius"), withSavedValue(RADII, radius),
+				radius, Component::literal, value -> { radius = value; drafts.put(voiceDraftKey("radius"), value); })).visible = contentVisible(y, ROW);
 		voiceText = addEdit("Line", "What should they say?", c[1], y, c[2], 280, "director-voice-text");
 		y += ROW + GAP;
 		addRenderableWidget(primary("Set voice", c[0], y, c[2], ROW, this::setVoice));
@@ -424,30 +455,33 @@ public final class SkitDirectorScreen extends Screen {
 	private void initCamera() {
 		int[] c = columns();
 		int y = contentTop();
-		cameraPath = addEdit("Path name", "intro", c[0], y, c[2], 64, "director-camera-path");
-		addRenderableWidget(button("Start recording", c[1], y, c[2], ROW, false, () -> cameraStart(false)));
+		addRenderableWidget(primary("Get camera + dolly rails", c[0], y, c[2] * 2 + GAP, ROW, () -> send("codex skit camera kit")));
 		y += ROW + GAP;
-		addRenderableWidget(primary("Capture keyframe", c[0], y, c[2], ROW, CameraDirectorClient::recordKeyframeFromGui));
-		addRenderableWidget(button("Save recording", c[1], y, c[2], ROW, false, CameraDirectorClient::stopRecordingFromGui));
+		cameraPath = addEdit("Shot name", "intro", c[0], y, c[2], 64, "director-camera-path");
+		addRenderableWidget(primary("Record camera dolly", c[1], y, c[2], ROW, () -> cameraStart(false)));
 		y += ROW + GAP;
-		addRenderableWidget(button("Play once", c[0], y, c[2], ROW, false, () -> cameraPlay(false)));
-		addRenderableWidget(button("Play loop", c[1], y, c[2], ROW, false, () -> cameraPlay(true)));
+		addRenderableWidget(button("Roll camera", c[0], y, c[2], ROW, false, () -> send(CameraDirectorClient.dollyCommand(false))));
+		addRenderableWidget(button("Brake dolly", c[1], y, c[2], ROW, false, () -> send(CameraDirectorClient.dollyCommand(true))));
 		y += ROW + GAP;
-		addRenderableWidget(button("Stop camera", c[0], y, c[2], ROW, false, CameraDirectorClient::stopPlaybackFromGui));
-		addRenderableWidget(button("Retake camera path", c[1], y, c[2], ROW, false, () -> cameraStart(true)));
+		addRenderableWidget(button("Save shot", c[0], y, c[2], ROW, false, CameraDirectorClient::stopRecordingFromGui));
+		addRenderableWidget(button("Retake shot", c[1], y, c[2], ROW, false, () -> cameraStart(true)));
+		y += ROW + GAP;
+		addRenderableWidget(button("Preview shot", c[0], y, c[2], ROW, false, () -> cameraPlay(false)));
+		addRenderableWidget(button("Exit camera", c[1], y, c[2], ROW, false, CameraDirectorClient::stopPlaybackFromGui));
 		y += ROW + GAP;
 		var names = CameraDirectorClient.pathNames();
-		if (!names.isEmpty()) addRenderableWidget(new ConsoleCycleButton<>(font, c[0], y, c[2], ROW, Component.literal("Saved path"), names,
+		if (!names.isEmpty()) addRenderableWidget(new ConsoleCycleButton<>(font, c[0], y, c[2], ROW, Component.literal("Saved shot"), names,
 				names.contains(cameraPath.getValue()) ? cameraPath.getValue() : names.getFirst(), Component::literal, cameraPath::setValue)).visible = contentVisible(y, ROW);
-		addRenderableWidget(button("Assign camera to take", c[1], y, c[2], ROW, false, () -> send("codex skit take camera " + word(drafts.getOrDefault("director-take-name", "")) + " " + word(cameraPath.getValue()) + " " + CameraDirectorClient.pathDuration(cameraPath.getValue()))));
+		addRenderableWidget(button("Assign shot to take", c[1], y, c[2], ROW, false, () -> send("codex skit take camera " + word(drafts.getOrDefault("director-take-name", "")) + " " + word(cameraPath.getValue()) + " " + CameraDirectorClient.pathDuration(cameraPath.getValue()))));
 		y += ROW + GAP;
 		addRenderableWidget(button("Remove take camera", c[0], y, c[2], ROW, false, () -> send("codex skit take camera " + word(drafts.getOrDefault("director-take-name", "")) + " - 0")));
 		addRenderableWidget(button("Stop take", c[1], y, c[2], ROW, false, () -> send("codex skit take stop")));
 	}
 
+
 	private void cameraStart(boolean replace) {
 		if (cameraPath == null) return;
-		CameraDirectorClient.startRecordingFromGui(cameraPath.getValue().strip(), replace);
+		CameraDirectorClient.startDollyRecordingFromGui(cameraPath.getValue().strip(), replace);
 	}
 
 	private void cameraPlay(boolean loop) {
@@ -483,6 +517,22 @@ public final class SkitDirectorScreen extends Screen {
 		return String.format(Locale.ROOT, "%.3f %.3f %.3f", target.x, target.y, target.z);
 	}
 
+	private void generateScript() {
+		if (DirectorClientState.generationPending()) throw new DirectorInputException("Luna is still writing the previous script");
+		if (scriptName == null || actionDescription == null || selectedActor.isBlank()) throw new DirectorInputException("Choose an actor and enter a description first");
+		var request = new dev.agaminggod.arenaagents.control.DirectorGenerationPayload.Request(java.util.UUID.randomUUID(), java.util.UUID.fromString(selectedActor), scriptName.getValue().strip(), actionDescription.getValue().strip());
+		if (!AgentControlClient.sendDirectorGeneration(request)) throw new DirectorInputException("Script generation needs a connected server with Luna support");
+		DirectorClientState.beginGeneration(request);
+		feedback = "Luna is writing your script..."; feedbackError = false;
+		rebuildWidgets();
+	}
+
+	public void acceptGenerationResult(dev.agaminggod.arenaagents.control.DirectorGenerationPayload.Result result) {
+		feedback = result.message(); feedbackError = !result.success();
+		rebuildWidgets();
+		if (result.success() && tab == Tab.ACTIONS && scriptName != null && result.scriptName().equals(scriptName.getValue().strip()) && pendingEditor == null) requestEditor("read", 0);
+	}
+
 	private void createScript() {
 		if (scriptName != null) send("codex skit script create " + word(scriptName.getValue()) + " " + actorTarget());
 	}
@@ -511,7 +561,7 @@ public final class SkitDirectorScreen extends Screen {
 
 	private void sayLine() {
 		if (voiceText == null) return;
-		send(lineCommand("codex skit voice say " + actorTarget(), voiceText.getValue()));
+		send(lineCommand("codex skit voice say_with " + actorTarget() + " " + voice + " " + tone + " " + speed + " " + radius, voiceText.getValue()));
 	}
 
 	private void voiceScriptCommand(String operation) {
@@ -597,6 +647,7 @@ public final class SkitDirectorScreen extends Screen {
 
 	@Override public void tick() {
 		super.tick();
+		DirectorClientState.takeGenerationResult().ifPresent(this::acceptGenerationResult);
 		long now = System.nanoTime();
 		if (pendingCommand != null && now >= commandDeadline || pendingEditor != null && now >= editorDeadline) {
 			pendingCommand = null; pendingEditor = null;
@@ -604,8 +655,19 @@ public final class SkitDirectorScreen extends Screen {
 		}
 	}
 
+	@Override public boolean mouseClicked(net.minecraft.client.input.MouseButtonEvent event, boolean doubled) {
+		if (voiceDropdown != null && voiceDropdown.popupClick(event)) return true;
+		return super.mouseClicked(event, doubled);
+	}
+
+	@Override public boolean keyPressed(net.minecraft.client.input.KeyEvent event) {
+		if (voiceDropdown != null && voiceDropdown.isOpen() && voiceDropdown.keyPressed(event)) return true;
+		return super.keyPressed(event);
+	}
+
 	@Override
 	public boolean mouseScrolled(double mouseX, double mouseY, double horizontal, double vertical) {
+		if (voiceDropdown != null && voiceDropdown.popupScroll(vertical)) return true;
 		if (mouseX >= panelLeft() && mouseX <= panelLeft() + panelWidth()
 				&& mouseY >= panelTop() + contentOffset(panelHeight()) - GAP
 				&& mouseY < contentBottom() + 4 && vertical != 0) {
@@ -649,6 +711,7 @@ public final class SkitDirectorScreen extends Screen {
 		}
 		fieldLabels.forEach((edit, label) -> { if (edit.visible) graphics.text(font, font.plainSubstrByWidth(label, edit.getWidth()), edit.getX(), edit.getY() - 14, MUTED, false); });
 		super.extractRenderState(graphics, mouseX, mouseY, partialTick);
+		if (voiceDropdown != null) voiceDropdown.renderPopup(graphics, mouseX, mouseY);
 	}
 
 	@Override
@@ -699,9 +762,9 @@ public final class SkitDirectorScreen extends Screen {
 
 	private enum Tab {
 		SPAWN("Cast", "Place your cast, then save their scripts and starting marks in a take.", 12),
-		ACTIONS("Actions", "Select a saved script to edit. Glide captures your position when added.", 5),
+		ACTIONS("Actions", "Describe an action for Luna. Here means your position when you click Write.", 7),
 		VOICE("Voice", "Choose a voice, delivery tone, and line without leaving the world.", 7),
-		CAMERA("Camera", "Record a path, then assign it to the take selected in Cast.", 6);
+		CAMERA("Camera", "Lay rails, place a camera, then right-click its viewfinder. Sneak saves and exits.", 7);
 		private final String label;
 		private final String help;
 		private final int rows;

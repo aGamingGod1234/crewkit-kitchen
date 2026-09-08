@@ -137,7 +137,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			"AI agent coordinator is offline; check logs/arena-agents-coordinator-error.log for the startup cause";
 	private static final Logger LOGGER = LoggerFactory.getLogger(MultiplexedServerBridge.class);
 	private static final Set<String> INBOUND_TYPES = Set.of(
-			"auth_challenge", "hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "conversation_wake_ack", "goal_spec_proposal", "request_observation", "action_command", "action_cancel", "action_result_ack", "agent_error", "verbose_event", "heartbeat"
+			"auth_challenge", "hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "conversation_wake_ack", "goal_spec_proposal", "director_script_result", "request_observation", "action_command", "action_cancel", "action_result_ack", "agent_error", "verbose_event", "heartbeat"
 	);
 
 	private final CodexAgentManager manager;
@@ -1078,6 +1078,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			case "goal_completed" -> acceptGoalCompleted(envelope);
 			case "conversation_wake_ack" -> acceptConversationWakeAck(envelope);
 			case "goal_spec_proposal" -> acceptGoalSpecProposal(envelope);
+            case "director_script_result" -> dev.agaminggod.arenaagents.server.DirectorScriptGeneration.accept(manager.server(), envelope.payload());
 			case "request_observation" -> acceptObservationRequest(envelope);
 			case "action_command" -> acceptAction(envelope);
 			case "action_cancel" -> acceptActionCancel(envelope);
@@ -2576,6 +2577,13 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			return false;
 		}
 	}
+
+    public boolean requestDirectorScript(JsonObject payload) {
+        Session active=session;
+        if(active==null || !active.open.get() || !active.authenticated.get()) return false;
+        active.enqueue(new BridgeEnvelope(2,serverInstanceId,"server","director_script_request","server-"+messageIds.incrementAndGet(),payload));
+        return true;
+    }
 
 	private void send(String type, String agentId, JsonObject payload) {
 		Session active = session;

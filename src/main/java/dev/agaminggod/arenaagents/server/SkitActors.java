@@ -27,6 +27,23 @@ public final class SkitActors {
 		return records(server).stream().filter(actor -> actor.agentId().equals(id)).findFirst()
 				.flatMap(actor -> OfflineAgentPlayers.find(server, id, actor.profile()));
 	}
+	/** Resolves labels by offline UUID, never by a human player's matching profile name. */
+	public static Optional<String> displayName(ServerPlayer player) {
+		if (!(player instanceof carpet.patches.EntityPlayerMPFake)) return Optional.empty();
+		return records(player.level().getServer()).stream()
+				.filter(actor -> player.getUUID().equals(OfflineAgentPlayers.offlineUuid(actor.agentId(), actor.profile())))
+				.map(SkitActor::name).findFirst();
+	}
+	static void applyPresentation(ServerPlayer player, SkitActor actor) {
+		var label = net.minecraft.network.chat.Component.literal(actor.name());
+		if (!label.equals(player.getCustomName())) player.setCustomName(label);
+		player.setCustomNameVisible(true);
+		player.waypointIcon().color = Optional.of(0xFFFFFFFF);
+		player.waypointIcon().style = net.minecraft.resources.ResourceKey.create(
+				net.minecraft.world.waypoints.WaypointStyleAssets.ROOT_ID,
+				net.minecraft.resources.Identifier.fromNamespaceAndPath("arenaagents", "agent/" + actor.profile().visualIdentity().transportCode()));
+	}
+
 	public static boolean reservesName(MinecraftServer server, String name) {
 		var cancelled = CANCELLED.get(server);
 		return records(server).stream().anyMatch(actor -> AgentIdentity.playerName(actor.agentId(), actor.profile()).equalsIgnoreCase(name))
@@ -147,7 +164,8 @@ public final class SkitActors {
 		Set<AgentId> connected = CONNECTED.computeIfAbsent(server, ignored -> new HashSet<>());
 		for (SkitActor actor : records(server)) {
 			if (actor.dead()) { connected.remove(actor.agentId()); continue; }
-			if (find(server, actor.agentId()).isPresent()) { connected.add(actor.agentId()); continue; }
+			ServerPlayer body = find(server, actor.agentId()).orElse(null);
+			if (body != null) { applyPresentation(body, actor); connected.add(actor.agentId()); continue; }
 			if (connected.remove(actor.agentId())) {
 				DirectorTakeRuntime.stopActor(server, actor.agentId());
 				SkitModeRuntime.stop(server, actor.agentId());
