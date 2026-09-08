@@ -53,7 +53,7 @@ public final class CameraPathVerification {
 				new CameraKeyframe(0, 0.0D, 0.0D, 0.0D, 0.0F, 0.0F),
 				new CameraKeyframe(0, 1.0D, 0.0D, 0.0D, 0.0F, 0.0F))), "duplicate frame times are rejected");
 		try {
-			return 6 + verifyDollyCapture() + verifyDelayedStart() + verifyUnboundedYaw() + verifyReplacement()
+			return 6 + verifyTripodCapture() + verifyDollyCapture() + verifyDelayedStart() + verifyUnboundedYaw() + verifyReplacement()
 					+ verifyRestart() + verifySaveFailure() + verifyDeleteAndClearFailure()
 					+ verifyMalformedStorage() + verifyRecordingLevelChange() + verifyRecordingClockCorrection()
 					+ verifyPlaybackLevelChange() + verifyPlaybackRespawn() + verifyWriterFailure() + verifyAnchorAndPerspective() + verifyRenderedEyeHeight();
@@ -61,6 +61,49 @@ public final class CameraPathVerification {
 			throw new AssertionError("camera verification failed", exception);
 		}
 	}
+
+    private static int verifyTripodCapture() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            var rig = new dev.agaminggod.arenaagents.camera.CameraRig(EntityType.MARKER, fixture.level);
+            rig.setPos(10, 64, 20);
+            rig.lensHeight(-10); assertEquals(0.7f, rig.lensHeight(), "tripod cannot lower its lens through the floor");
+            rig.lensHeight(100); assertEquals(2.5f, rig.lensHeight(), "tripod has a bounded telescoping range");
+            rig.aim(370, 90); assertEquals(10, rig.getYRot(), "camera pan wraps without unbounded rotation");
+            assertEquals(80, rig.getXRot(), "camera head stops at its tilt limit");
+            rig.aim(0, 0); rig.lensHeight(1);
+            CameraDirectorClient.startDollyRecordingFromGui("tripod", false);
+            invoke("enterDolly", new Class<?>[]{Minecraft.class, Entity.class}, fixture.client, rig);
+            fixture.level.gameTime += 12;
+            rig.lensHeight(2);
+            CameraDirectorClient.stopRecordingFromGui();
+            var path = fixture.paths.get("tripod");
+            assertEquals(1, path.keyframes().getLast().y() - path.keyframes().getFirst().y(), "recorded path follows the physical lens height adjustment");
+            assertEquals(20.7, path.keyframes().getLast().z(), "viewfinder is in front of the lens, outside the camera body");
+            assertEquals(12, path.durationTicks(), "tripod capture has an honest elapsed duration");
+            assertTrue(Files.isRegularFile(fixture.storage()), "tripod recording is saved for later playback");
+            for (int[] size : new int[][] {{426, 240}, {800, 500}}) for (boolean positioning : new boolean[] {false, true}) {
+                var screen = new CameraRigScreen(rig);
+                setField(screen, net.minecraft.client.gui.screens.Screen.class, "minecraft", fixture.client);
+                setField(screen, net.minecraft.client.gui.screens.Screen.class, "font", new CameraTestFont());
+                setField(screen, CameraRigScreen.class, "positioning", positioning);
+                screen.width = size[0]; screen.height = size[1];
+                var init = CameraRigScreen.class.getDeclaredMethod("init"); init.setAccessible(true); init.invoke(screen);
+                var widgets = screen.children().stream().filter(net.minecraft.client.gui.components.AbstractWidget.class::isInstance).map(net.minecraft.client.gui.components.AbstractWidget.class::cast).toList();
+                for (var widget : widgets) assertTrue(widget.getX() >= 0 && widget.getY() >= 0 && widget.getX() + widget.getWidth() <= size[0] && widget.getY() + widget.getHeight() <= size[1], "camera controls stay reachable in both window sizes");
+                for (int i = 0; i < widgets.size(); i++) for (int j = i + 1; j < widgets.size(); j++) {
+                    var a = widgets.get(i); var b = widgets.get(j);
+                    assertTrue(a.getX() + a.getWidth() <= b.getX() || b.getX() + b.getWidth() <= a.getX() || a.getY() + a.getHeight() <= b.getY() || b.getY() + b.getHeight() <= a.getY(), "camera positioning and recording buttons never overlap");
+                }
+            }
+        }
+        return 16;
+    }
+    private static final class CameraTestFont extends net.minecraft.client.gui.Font {
+        CameraTestFont() { super(null); }
+        @Override public int width(String text) { return text.length() * 6; }
+        @Override public String plainSubstrByWidth(String text, int width) { return text.substring(0, Math.min(text.length(), Math.max(0, width / 6))); }
+        @Override public String plainSubstrByWidth(String text, int width, boolean reverse) { int count = Math.min(text.length(), Math.max(0, width / 6)); return reverse ? text.substring(text.length() - count) : text.substring(0, count); }
+    }
 
     private static int verifyDollyCapture() throws Exception {
         try (Fixture fixture = new Fixture()) {
@@ -72,7 +115,7 @@ public final class CameraPathVerification {
             setField(cart, Entity.class, "position", new Vec3(10, 64, 20));
             var cameraId = java.util.UUID.randomUUID();
             setField(cart, Entity.class, "uuid", cameraId);
-            invoke("enterDolly", new Class<?>[]{Minecraft.class, net.minecraft.world.entity.vehicle.minecart.AbstractMinecart.class}, fixture.client, cart);
+            invoke("enterDolly", new Class<?>[]{Minecraft.class, Entity.class}, fixture.client, cart);
             assertTrue(CameraDirectorClient.isDollyViewfinderActive(), "right-click attaches the viewfinder to the physical dolly");
             assertTrue(state("recording") != null && state("armedDollyName") == null, "entering the camera starts armed capture once");
             fixture.client.player.setYRot(405);
@@ -97,7 +140,7 @@ public final class CameraPathVerification {
             CameraDirectorClient.startDollyRecordingFromGui("physical", false);
             assertTrue(state("armedDollyName") == null && fixture.paths.get("physical") == path, "arming cannot overwrite an existing saved path");
             CameraDirectorClient.startDollyRecordingFromGui("dimension", false);
-            invoke("enterDolly", new Class<?>[]{Minecraft.class, net.minecraft.world.entity.vehicle.minecart.AbstractMinecart.class}, fixture.client, cart);
+            invoke("enterDolly", new Class<?>[]{Minecraft.class, Entity.class}, fixture.client, cart);
             fixture.level.gameTime += 4;
             invoke("tickDolly", new Class<?>[]{Minecraft.class}, fixture.client);
             var blocked = fixture.storage().resolveSibling("camera-paths.json.tmp");

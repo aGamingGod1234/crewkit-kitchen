@@ -119,14 +119,17 @@ never fall back to Windows or local synthesis. On the host, configure `FISH_AUDI
 or save a valid key in `arena-agents-runtime/runtime/fish-api-key.txt` beneath the game
 directory, then restart Minecraft. Missing or rejected keys produce a setup error.
 
-In Camera, choose **Get camera + dolly rails**. Lay rails on the floor and place the
-camera on a rail. Right-click it to look through the viewfinder; the mouse pans the
-shot. Use powered rails to sustain movement, or leave it stationary for a fixed shot.
-To save a shot, enter its name and choose **Record camera dolly**, then right-click
-the camera. Movement is captured automatically. Sneak saves and exits the viewfinder.
-You can preview the saved shot or assign it to a take. A dolly pass supports about
-102 seconds. This records camera motion, not a video file; use your usual video
-recorder to capture playback.
+Find **Tripod Camera** in the **Cameras** creative tab, or choose **Get tripod camera**
+in Director. Place it on a solid floor and right-click it. The camera has its own
+**Record** and **Position** tabs: name and record a shot directly, raise or lower
+the lens, pan, tilt, and dolly across the floor without rails. Movement stops after
+five seconds unless braked sooner. **Stop and save** preserves the shot for preview
+or use in a take. Closing the camera brakes it and saves any active recording.
+
+**Viewfinder** opens the lens view; the mouse pans, **K** returns to camera controls,
+and sneak saves and exits. A physical pass supports about 102 seconds. This records
+camera motion, not a video file; use your usual video recorder to capture playback.
+Existing rail-camera saves and manual keyframe commands remain compatible.
 
 For a shared take, scroll down in Cast, create a take, and load it. Select an actor,
 enter its action and/or voice script names, then choose **Save actor + starting mark**.

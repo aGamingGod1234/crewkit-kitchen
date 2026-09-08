@@ -229,17 +229,17 @@ public final class SkitDirectorScreen extends Screen {
 				openDetailsButton("Delivery and saved dialogue", c[0], y, full);
 			}
 			case CAMERA -> {
-				addRenderableWidget(primary("Get camera and rails", c[0], y, full, ROW, () -> send("codex skit camera kit")));
+				addRenderableWidget(primary("Get tripod camera", c[0], y, full, ROW, () -> send("codex skit camera kit")));
 				y += ROW + GAP;
 				cameraPath = addEdit("Shot name", "intro", c[0], y, full, 64, "director-camera-path");
 				y += ROW + GAP;
-				addRenderableWidget(button("Record dolly", c[0], y, c[2], ROW, false, () -> cameraStart(false)));
+				addRenderableWidget(button("Record at camera", c[0], y, c[2], ROW, false, () -> cameraStart(false)));
 				addRenderableWidget(button("Save shot", c[1], y, c[2], ROW, false, CameraDirectorClient::stopRecordingFromGui));
 				y += ROW + GAP;
 				addRenderableWidget(button("Preview shot", c[0], y, c[2], ROW, false, () -> cameraPlay(false)));
 				addRenderableWidget(button("Exit camera", c[1], y, c[2], ROW, false, CameraDirectorClient::stopPlaybackFromGui));
 				y += ROW + GAP;
-				openDetailsButton("Dolly controls and saved shots", c[0], y, full);
+				openDetailsButton("Camera tools and saved shots", c[0], y, full);
 			}
 		}
 	}
@@ -531,10 +531,10 @@ public final class SkitDirectorScreen extends Screen {
 	private void initCamera() {
 		int[] c = columns();
 		int y = contentTop();
-		addRenderableWidget(primary("Get camera + dolly rails", c[0], y, c[2] * 2 + GAP, ROW, () -> send("codex skit camera kit")));
+		addRenderableWidget(primary("Get tripod camera", c[0], y, c[2] * 2 + GAP, ROW, () -> send("codex skit camera kit")));
 		y += ROW + GAP;
 		cameraPath = addEdit("Shot name", "intro", c[0], y, c[2], 64, "director-camera-path");
-		addRenderableWidget(primary("Record camera dolly", c[1], y, c[2], ROW, () -> cameraStart(false)));
+		addRenderableWidget(primary("Record at camera", c[1], y, c[2], ROW, () -> cameraStart(false)));
 		y += ROW + GAP;
 		addRenderableWidget(button("Roll camera", c[0], y, c[2], ROW, false, () -> send(CameraDirectorClient.dollyCommand(false))));
 		addRenderableWidget(button("Brake dolly", c[1], y, c[2], ROW, false, () -> send(CameraDirectorClient.dollyCommand(true))));
@@ -840,7 +840,7 @@ public final class SkitDirectorScreen extends Screen {
 		SPAWN("Cast", "Place your cast, then save their scripts and starting marks in a take.", 12),
 		ACTIONS("Actions", "Describe an action for Luna. Here means your position when you click Write.", 7),
 		VOICE("Voice", "Choose a voice, delivery tone, and line without leaving the world.", 7),
-		CAMERA("Camera", "Lay rails, place a camera, then right-click its viewfinder. Sneak saves and exits.", 7);
+		CAMERA("Camera", "Place a tripod camera on the floor. Right-click it to position and record.", 7);
 		private final String label;
 		private final String help;
 		private final int rows;

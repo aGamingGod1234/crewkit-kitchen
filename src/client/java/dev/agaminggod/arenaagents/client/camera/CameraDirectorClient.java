@@ -53,10 +53,11 @@ public final class CameraDirectorClient {
 	private static Entity previousCamera;
 	private static CameraType previousCameraType;
 	private static boolean registered;
-    private static net.minecraft.world.entity.vehicle.minecart.AbstractMinecart dolly;
+    private static Entity dolly;
     private static String armedDollyName;
     private static boolean armedDollyReplace;
     private static boolean dollyRecording;
+    private static final net.minecraft.client.KeyMapping CAMERA_CONTROLS = new net.minecraft.client.KeyMapping("key.arenaagents.camera_controls", com.mojang.blaze3d.platform.InputConstants.Type.KEYSYM, org.lwjgl.glfw.GLFW.GLFW_KEY_K, net.minecraft.client.KeyMapping.Category.MISC);
 
     /** Arms physical capture. The next camera dolly clicked becomes the recording camera. */
     public static void startDollyRecordingFromGui(String name, boolean replace) {
@@ -70,7 +71,7 @@ public final class CameraDirectorClient {
             armedDollyName = name; armedDollyReplace = replace;
             if (dolly != null) beginDollyCapture(client);
             if (client.screen != null) client.setScreen(null);
-            guiFeedback(dollyRecording ? "Recording camera dolly. Pan with the mouse; use Roll camera to move, then sneak to save and exit." : "Click your camera dolly to record. Pan with the mouse; sneak to save and leave the viewfinder.", false);
+            guiFeedback(dollyRecording ? "Recording camera. Use its Position tab to move; Stop and save finishes the shot." : "Right-click your camera to record. Its own controls can position and save the shot.", false);
         } catch (IllegalArgumentException error) { guiFeedback(error.getMessage(), true); }
     }
 
@@ -89,6 +90,10 @@ public final class CameraDirectorClient {
     }
 
     private static CameraKeyframe dollyFrame(Minecraft client, int tick) {
+        if (dolly instanceof dev.agaminggod.arenaagents.camera.CameraRig rig) {
+            var look = net.minecraft.world.phys.Vec3.directionFromRotation(rig.getXRot(), rig.getYRot());
+            return new CameraKeyframe(tick, rig.getX() + look.x * 0.7, rig.getY() + rig.lensHeight() + look.y * 0.7, rig.getZ() + look.z * 0.7, rig.getYRot(), rig.getXRot());
+        }
         var look = client.player.getLookAngle();
         return new CameraKeyframe(tick, dolly.getX() + look.x * 0.7, dolly.getY() + 1.35, dolly.getZ() + look.z * 0.7, client.player.getYRot(), client.player.getXRot());
     }
@@ -102,7 +107,7 @@ public final class CameraDirectorClient {
         return command + " " + dolly.getUUID() + " " + net.minecraft.util.Mth.wrapDegrees(client.player.getYRot());
     }
 
-    private static void enterDolly(Minecraft client, net.minecraft.world.entity.vehicle.minecart.AbstractMinecart cart) {
+    private static void enterDolly(Minecraft client, Entity cart) {
         if (client.player == null || client.level == null) return;
         if (dollyRecording && recording != null) {
             guiFeedback("Camera recording is running. Save it before switching cameras.", false);
@@ -112,14 +117,35 @@ public final class CameraDirectorClient {
         previousCamera = client.getCameraEntity(); previousCameraType = client.options.getCameraType();
         dolly = cart;
         beginDollyCapture(client);
-        guiFeedback(dollyRecording ? "Recording camera dolly. Mouse pans; sneak saves and exits." : "Camera viewfinder. Mouse pans; sneak exits. Use Director to record a path.", false);
+        guiFeedback(dollyRecording ? "Recording camera dolly. Mouse pans; sneak saves and exits." : "Camera viewfinder. Mouse pans; sneak exits. Right-click the camera to record a shot.", false);
     }
 
+    public static boolean isRecording() { return recording != null; }
+    public static String recordingName() { return recording == null ? "" : recording.name(); }
+    public static void viewCamera(dev.agaminggod.arenaagents.camera.CameraRig rig) {
+        var client = Minecraft.getInstance();
+        if (recording != null && dolly != rig) { guiFeedback("Save the current recording before switching cameras.", true); return; }
+        if (dolly != rig) enterDolly(client, rig);
+        if (client.player != null) { client.player.setYRot(rig.getYRot()); client.player.setXRot(rig.getXRot()); }
+        client.setScreen(null);
+    }
+    public static void recordCamera(dev.agaminggod.arenaagents.camera.CameraRig rig, String name) {
+        if (dolly != rig) enterDolly(Minecraft.getInstance(), rig);
+        startDollyRecordingFromGui(name, false);
+    }
+    public static void rigCommand(dev.agaminggod.arenaagents.camera.CameraRig rig, String operation, float value) {
+        var connection = Minecraft.getInstance().getConnection();
+        if (connection != null) connection.sendCommand("codex skit camera rig " + rig.getUUID() + " " + operation + " " + value);
+    }
     private static void tickDolly(Minecraft client) {
         if (dolly == null) return;
         if (client.player == null || client.level != dolly.level() || dolly.isRemoved() || client.options.keyShift.isDown()) {
             if (dollyRecording && recording != null) stopRecordingFromGui();
             stopPlayback(client); return;
+        }
+        if (dolly instanceof dev.agaminggod.arenaagents.camera.CameraRig rig && client.screen == null && client.level.getGameTime() % 4 == 0) {
+            rigCommand(rig, "yaw", net.minecraft.util.Mth.wrapDegrees(client.player.getYRot()));
+            rigCommand(rig, "pitch", client.player.getXRot());
         }
         var frame = dollyFrame(client, 0);
         apply(client, new CameraPose(frame.x(), frame.y(), frame.z(), frame.yaw(), frame.pitch()));
@@ -175,10 +201,16 @@ public final class CameraDirectorClient {
 	public static synchronized void register() {
 		if (registered) return;
 		load(Minecraft.getInstance());
+        net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper.registerKeyMapping(CAMERA_CONTROLS);
+        net.fabricmc.fabric.api.client.rendering.v1.EntityRendererRegistry.register(dev.agaminggod.arenaagents.camera.CameraDolly.RIG, CameraRigRenderer::new);
         net.fabricmc.fabric.api.event.player.UseEntityCallback.EVENT.register((player, level, hand, entity, hit) -> {
             if (!level.isClientSide() || !dev.agaminggod.arenaagents.camera.CameraDolly.isCamera(entity)) return net.minecraft.world.InteractionResult.PASS;
             if (player.isShiftKeyDown()) return net.minecraft.world.InteractionResult.SUCCESS;
-            enterDolly(Minecraft.getInstance(), (net.minecraft.world.entity.vehicle.minecart.AbstractMinecart) entity);
+            if (entity instanceof dev.agaminggod.arenaagents.camera.CameraRig rig) {
+                if (armedDollyName != null) enterDolly(Minecraft.getInstance(), rig);
+                Minecraft.getInstance().setScreen(new CameraRigScreen(rig));
+            }
+            else enterDolly(Minecraft.getInstance(), entity);
             return net.minecraft.world.InteractionResult.SUCCESS;
         });
 		ClientCommandRegistrationCallback.EVENT.register((dispatcher, ignored) -> dispatcher.register(commands()));
@@ -262,6 +294,7 @@ public final class CameraDirectorClient {
 	private static void guiFeedback(String message, boolean error) {
 		Minecraft client = Minecraft.getInstance();
 		if (client.screen instanceof dev.agaminggod.arenaagents.client.gui.SkitDirectorScreen screen) screen.acceptLocalFeedback(message, error);
+        if (client.screen instanceof CameraRigScreen screen) screen.feedback(message);
 		if (client.gui != null) client.gui.setOverlayMessage(Component.literal(message), true);
 	}
 
@@ -434,6 +467,7 @@ public final class CameraDirectorClient {
 	}
 
 	private static void tick(Minecraft client) {
+        while (CAMERA_CONTROLS.consumeClick()) if (dolly instanceof dev.agaminggod.arenaagents.camera.CameraRig rig && client.screen == null) client.setScreen(new CameraRigScreen(rig));
         tickDolly(client);
 		if (scheduledTake != null) {
 			if (client.level != takeLevel || client.player == null) { scheduledTake = null; takeLevel = null; }

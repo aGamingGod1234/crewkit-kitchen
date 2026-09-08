@@ -68,6 +68,8 @@
   "screen.arenaagents.live.score": "Score",
   "screen.arenaagents.live.more": "%s more agents are available in Live Arena",
   "screen.arenaagents.results.return": "Return to world",
-  "item.arenaagents.camera_dolly": "Camera Dolly",
-  "block.arenaagents.camera_dolly": "Camera"
+  "item.arenaagents.camera_dolly": "Tripod Camera",
+  "block.arenaagents.camera_dolly": "Camera",
+  "entity.arenaagents.camera_rig": "Tripod Camera",
+  "key.arenaagents.camera_controls": "Open Camera Controls"
 }
