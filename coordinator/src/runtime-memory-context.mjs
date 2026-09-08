@@ -116,9 +116,12 @@ export class RuntimeMemoryContext {
 		const agents = agentId === undefined ? [...this.#dispatches.keys()] : [boundedText(agentId, 'agentId', 256)];
 		const results = [];
 		for (const id of agents) {
-			for (const { entry, pending } of this.#dispatches.get(id)?.values() ?? []) {
+			const dispatches = this.#dispatches.get(id);
+			for (const active of [...dispatches?.values() ?? []]) {
+				const { entry, pending } = active;
 				await pending;
 				results.push(await this.#notebook.recordUnknown(id, { ...entry, reasonCode }));
+				if (dispatches.get(entry.actionId) === active) dispatches.delete(entry.actionId);
 			}
 		}
 		return results;

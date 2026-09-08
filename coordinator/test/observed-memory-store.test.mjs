@@ -3,7 +3,7 @@ import test from 'node:test';
 import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ObservedMemoryStore } from '../src/observed-memory-store.mjs';
+import { AtomicAgentStore, ObservedMemoryStore } from '../src/observed-memory-store.mjs';
 
 const view = (worldId, dimension, gameTime, x = 0, blocks = []) => ({ world: { worldId, dimension, gameTime }, position: { x, y: 64, z: 0 }, blocks });
 const stone = { blockId: 'minecraft:stone', x: 12, y: 80, z: 0 };
@@ -84,4 +84,66 @@ test('startup hydration preserves newer observations and flush cannot overwrite 
 	const saved = third.query('a', { worldId: 'one', dimension: 'minecraft:overworld' });
 	assert.equal(saved.position.x, 16);
 	assert.deepEqual(new Set(saved.blocks.map((block) => block.blockId)), new Set(['minecraft:stone', 'minecraft:chest']));
+});
+
+test('cleared agents reload durable facts in the same process without mixing world scopes', async (t) => {
+	const directory = await mkdtemp(join(tmpdir(), 'memory-resummon-'));
+	t.after(() => rm(directory, { recursive: true, force: true }));
+	const memory = new ObservedMemoryStore({ directory });
+	memory.ingest('a', view('one', 'minecraft:overworld', 10, 0, [stone]));
+	memory.ingest('a', view('one', 'minecraft:the_nether', 10, 40));
+	await memory.flush('a');
+	for (const clearAll of [false, true]) {
+		memory.clear(clearAll ? undefined : 'a');
+		assert.equal(memory.query('a', { worldId: 'one', dimension: 'minecraft:overworld' }).knownCells, 0);
+		await memory.load('a');
+		memory.ingest('a', view('two', 'minecraft:overworld', 11, 80));
+		assert.equal(memory.query('a').blocks.length, 0);
+		assert.equal(memory.query('a', { worldId: 'one', dimension: 'minecraft:the_nether' }).blocks.length, 0);
+		assert.deepEqual(memory.query('a', { worldId: 'one', dimension: 'minecraft:overworld' }).blocks.map((block) => block.blockId), ['minecraft:stone']);
+		assert.equal(memory.query('b', { worldId: 'one', dimension: 'minecraft:overworld' }).knownCells, 0);
+	}
+});
+
+test('clear detaches an old load and fences its eventual result from a new lifecycle', async (t) => {
+	const saved = (blockId) => ({ version: 1, scopes: [{
+		worldId: 'one', dimension: 'minecraft:overworld', tick: 10, position: null, cells: [],
+		blocks: [{ ...stone, blockId, key: '12,80,0', firstSeenTick: 10, lastSeenTick: 10 }],
+	}] });
+	let releaseOld;
+	let reads = 0;
+	t.mock.method(AtomicAgentStore.prototype, 'read', () => ++reads === 1
+		? new Promise((resolve) => { releaseOld = resolve; }) : Promise.resolve(saved('minecraft:chest')));
+	const memory = new ObservedMemoryStore();
+	const oldLoad = memory.load('a');
+	memory.clear('a');
+	await memory.load('a');
+	assert.equal(reads, 2);
+	releaseOld(saved('minecraft:stone'));
+	await oldLoad;
+	assert.deepEqual(memory.query('a', { worldId: 'one', dimension: 'minecraft:overworld' }).blocks.map((block) => block.blockId), ['minecraft:chest']);
+});
+
+test('clear fences a flush waiting for hydration so it cannot erase saved history', async (t) => {
+	const directory = await mkdtemp(join(tmpdir(), 'memory-clear-flush-'));
+	t.after(() => rm(directory, { recursive: true, force: true }));
+	const memory = new ObservedMemoryStore({ directory });
+	memory.ingest('a', view('one', 'minecraft:overworld', 10, 0, [stone]));
+	await memory.flush('a');
+	const flushing = memory.flush('a');
+	memory.clear('a');
+	await flushing;
+	await memory.load('a');
+	assert.equal(memory.query('a', { worldId: 'one', dimension: 'minecraft:overworld' }).blocks[0].blockId, 'minecraft:stone');
+});
+
+test('durable reads wait for already queued writes before rehydrating memory', async (t) => {
+	const directory = await mkdtemp(join(tmpdir(), 'memory-write-read-'));
+	t.after(() => rm(directory, { recursive: true, force: true }));
+	const disk = new AtomicAgentStore({ directory, namespace: 'observed' });
+	await disk.write('a', { version: 1, scopes: [] });
+	const next = { version: 1, scopes: [{ worldId: 'one' }] };
+	const writing = disk.write('a', next);
+	assert.deepEqual(await disk.read('a'), next);
+	await writing;
 });

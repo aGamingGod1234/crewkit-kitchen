@@ -297,7 +297,7 @@ export class NativeToolRuntime {
 					if (active.cancelling) return active.result;
 					return this.#cancelAction(record, { actionId: active.actionId, goalRevision: active.goalRevision }, { invalidateProgram: false });
 				},
-				inspect: (query) => this.#inspect(normalizeMinecraftToolCall('inspect', query), record),
+				inspect: async (query) => ({ state: 'SUCCEEDED', reasonCode: 'INSPECTED', ...await this.#inspect(normalizeMinecraftToolCall('inspect', query), record) }),
 				refreshObservation: async () => {
 					const facts = await this.#observe(record);
 					if (facts.freshness.fresh !== true) throw codedError('FRESH_OBSERVATION_REQUIRED', 'Program continuation needs a new authoritative player observation');

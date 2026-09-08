@@ -454,6 +454,15 @@ function Write-BoundedJson([string] $Path, [object] $Value, [int] $MaximumBytes,
 	[IO.File]::WriteAllText($Path, $json, $encoding)
 }
 
+function Get-FileSha256([string] $Path) {
+	$stream = [IO.File]::OpenRead($Path)
+	try {
+		$algorithm = [Security.Cryptography.SHA256]::Create()
+		try { return [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
+		finally { $algorithm.Dispose() }
+	} finally { $stream.Dispose() }
+}
+
 function Read-BoundedJson([string] $Path, [int] $MaximumBytes, [string] $Label) {
 	if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Missing $Label at $Path" }
 	$item = Get-Item -LiteralPath $Path
@@ -679,7 +688,7 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 		$worldManifestPath = Join-Path $scenarioDirectory 'world-manifest.json'
 		$worldManifest = [pscustomobject]@{
 			version = 1; scenarioId = $scenarioId; worldId = $worldName; fresh = $true; world = $Scenario.world
-			modSha256 = (Get-FileHash -LiteralPath $BuiltJar -Algorithm SHA256).Hash.ToLowerInvariant()
+			modSha256 = Get-FileSha256 $BuiltJar
 		}
 		Write-BoundedJson $worldManifestPath $worldManifest $MaxManifestBytes 'world manifest'
 	}

@@ -102,3 +102,62 @@ test('an authoritative terminal replay reconciles a persisted dispatch after coo
 	assert.equal(result.source, 'server_action_result');
 	assert.equal(result.worldId, 'world-one');
 });
+
+test('persisted unknown receipts release dispatch capacity and retained receipts accept late results', async () => {
+	const memory = new RuntimeMemoryContext();
+	memory.observe(record, observation);
+	for (let index = 0; index < 300; index++) {
+		const action = { ...dispatch, actionId: `lost-action-${index}` };
+		await memory.recordDispatch(record, action);
+		const unknown = await memory.markUnknown(record.agentId);
+		assert.equal(unknown.length, 1);
+		assert.equal(unknown[0].actionId, action.actionId);
+		assert.equal(unknown[0].state, 'UNKNOWN');
+	}
+	assert.deepEqual(await memory.markUnknown(record.agentId), []);
+	const unresolved = await memory.unresolved(record);
+	assert.equal(unresolved.total, 128);
+	assert.equal(unresolved.evictedReceipts, 172);
+	assert.equal(await memory.recordResult(record, { actionId: 'lost-action-299', goalRevision: 1,
+		state: 'SUCCEEDED', reasonCode: 'DONE' }), true);
+	assert.equal((await memory.notebook.findReceipt(record.agentId, { actionId: 'lost-action-299' })).source, 'server_action_result');
+	assert.equal((await memory.unresolved(record)).total, 127);
+});
+
+test('failed unknown persistence retains the dispatch for a subsequent retry', async () => {
+	const notebook = new ModelNotebook();
+	const persistUnknown = notebook.recordUnknown.bind(notebook);
+	let fail = true;
+	notebook.recordUnknown = (...args) => fail ? Promise.reject(new Error('disk unavailable')) : persistUnknown(...args);
+	const memory = new RuntimeMemoryContext({ notebook });
+	memory.observe(record, observation);
+	await memory.recordDispatch(record, dispatch);
+	await assert.rejects(memory.markUnknown(record.agentId), /disk unavailable/);
+	assert.equal((await notebook.findReceipt(record.agentId, { actionId: dispatch.actionId })).state, 'DISPATCHED');
+	await assert.rejects(memory.recordDispatch(record, { ...dispatch, arguments: { durationMs: 2 } }), { code: 'RECEIPT_CONFLICT' });
+	fail = false;
+	assert.equal((await memory.markUnknown(record.agentId))[0].state, 'UNKNOWN');
+	assert.deepEqual(await memory.markUnknown(record.agentId), []);
+});
+
+test('a terminal result arriving during unknown persistence remains authoritative', async () => {
+	const notebook = new ModelNotebook();
+	const persistUnknown = notebook.recordUnknown.bind(notebook);
+	const entered = Promise.withResolvers();
+	const release = Promise.withResolvers();
+	notebook.recordUnknown = async (...args) => {
+		entered.resolve();
+		await release.promise;
+		return persistUnknown(...args);
+	};
+	const memory = new RuntimeMemoryContext({ notebook });
+	memory.observe(record, observation);
+	await memory.recordDispatch(record, dispatch);
+	const unknown = memory.markUnknown(record.agentId);
+	await entered.promise;
+	assert.equal(await memory.recordResult(record, { ...dispatch, state: 'SUCCEEDED', reasonCode: 'DONE' }), true);
+	release.resolve();
+	assert.equal((await unknown)[0].state, 'SUCCEEDED');
+	assert.deepEqual(await memory.markUnknown(record.agentId), []);
+	assert.equal((await notebook.findReceipt(record.agentId, { actionId: dispatch.actionId })).source, 'server_action_result');
+});

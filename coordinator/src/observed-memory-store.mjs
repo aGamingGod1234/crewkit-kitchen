@@ -34,6 +34,7 @@ export class AtomicAgentStore {
 	}
 	async read(agentId) {
 		if (this.#directory === null) return null;
+		await this.#writes.get(agentId);
 		try {
 			const bytes = await readFile(this.#path(agentId));
 			if (bytes.length > MAX_FILE_BYTES) throw new Error('MEMORY_FILE_TOO_LARGE');
@@ -111,7 +112,9 @@ export class ObservedMemoryStore {
 		this.#loaded.add(agentId);
 	}
 	async flush(agentId) {
+		const epoch = this.#epochs.get(agentId) ?? 0;
 		await this.load(agentId);
+		if ((this.#epochs.get(agentId) ?? 0) !== epoch) return;
 		const agent = this.#agents.get(agentId);
 		return this.#disk.write(agentId, { version: 1, scopes: agent ? [...agent.scopes.values()].filter((scope) => !scope.worldId.startsWith('session:')).map((scope) => ({ ...scope, cells: [...scope.cells.values()], blocks: [...scope.blocks.values()] })) : [] });
 	}
@@ -167,8 +170,8 @@ export class ObservedMemoryStore {
 		return { worldId, dimension, tick, position: scope?.position ? { ...scope.position } : null, cells, blocks, knownCells: cells.length, seenCells: cells.filter((cell) => cell.seen).length, visitedCells: cells.filter((cell) => cell.visited).length, blockedCells: cells.filter((cell) => cell.blocked).length };
 	}
 	clear(agentId) {
-		for (const id of agentId === undefined ? new Set([...this.#agents.keys(), ...this.#loads.keys()]) : [agentId]) {
-			this.#agents.delete(id); this.#loaded.add(id);
+		for (const id of agentId === undefined ? new Set([...this.#agents.keys(), ...this.#loads.keys(), ...this.#loaded]) : [agentId]) {
+			this.#agents.delete(id); this.#loaded.delete(id); this.#loads.delete(id);
 			this.#epochs.set(id, (this.#epochs.get(id) ?? 0) + 1);
 		}
 	}

@@ -17,6 +17,7 @@ $StartupTimeoutSeconds = 1; $CleanupTimeoutSeconds = 1; $RunnerGraceSeconds = 1
 $GracefulStopTimeoutMilliseconds = 1; $StartupBindRetries = 0; $CoordinatorBindRetries = 0
 $script:nextPort = 40000; $script:starts = @(); $script:launchMode = 'stop'
 function Protect-LocalFile([string] $Path) { }
+function Get-FileHash { throw 'Manifest hashing must not depend on inherited PowerShell module paths' }
 function New-Secret { return 'fixture-private-value' }
 function Reserve-FreePort([int] $Preferred = 0, [int[]] $Exclude = @()) { $script:nextPort += 1; return $script:nextPort }
 function Get-ConfiguredPort([string] $Name) { return 0 }
@@ -61,6 +62,7 @@ try {
 	$identityPath = Join-Path (Split-Path -Parent $report.artifacts.serverDirectory) 'world-manifest.json'
 	$identity = Get-Content -LiteralPath $identityPath -Raw | ConvertFrom-Json
 	Assert-True ($identity.fresh -eq $true -and $identity.world.seed -ceq '9223372036854775807' -and $identity.worldId -eq $report.artifacts.levelName) 'Fresh-world identity lost its exact settings'
+	Assert-True ($identity.modSha256 -ceq 'f16d05ec6b29248d2c61adb1e9263f78e4f7bace1b955014a2d17872cfe4064d') 'Fresh-world identity lost the exact mod hash'
 	Assert-True (@(Get-ChildItem -LiteralPath $report.artifacts.providerWorkspace -Recurse -File).Count -eq 0) 'Evaluator files leaked into the provider workspace'
 	Write-Output 'PASS natural launch writes exact settings and fresh-world identity without changing the template'
 

@@ -1090,6 +1090,49 @@ test('native programs preserve selected authorship and refresh before a dependen
 	assert.equal((await notebook.query('agent-a', { worldId: 'world-a', kind: 'notes' })).entries[0].provenance.programId, sent[0][2].provenance.programId);
 });
 
+test('native programs inspect a raw page, use its facts in an action, and request finish', async () => {
+	const sent = [], queries = [];
+	let sequence = 1;
+	const observation = { player: { x: 0, y: 64, z: 0, health: 20 }, inventory: { items: [] } };
+	let runtime;
+	runtime = new NativeToolRuntime({ bridge: { send: async (...args) => {
+		sent.push(args);
+		if (args[0] === 'action_command') queueMicrotask(() => runtime.onActionResult(record(), { actionId: args[2].actionId, state: 'SUCCEEDED', reasonCode: 'MENU_CLOSED' }));
+	} }, inspectObservation: async (_record, query) => {
+		queries.push(query);
+		return { section: 'menu', eventSequence: 1, menu: { menuId: 'minecraft:generic_9x3', containerId: 3, stateId: 9 } };
+	}, requestObservation: async () => ({ observation, eventSequence: ++sequence }) });
+	runtime.updateObservation(record(), observation, { eventSequence: sequence });
+	const result = await runtime.execute(nativeCall({ kind: 'run_program', source: `
+		program.onUnhandledAttention("continue_and_notify");
+		const page = await world.inspect({ section: "menu" });
+		await player.menuClose({ menuId: page.menu.menuId, containerId: page.menu.containerId, stateId: page.menu.stateId });
+		program.finish("Container closed");
+	` }), record());
+	assert.equal(queries.length, 1);
+	assert.equal(queries[0].section, 'menu');
+	assert.equal(sent.length, 1);
+	assert.equal(sent[0][0], 'action_command');
+	assert.deepEqual(sent[0][2].arguments, { menuId: 'minecraft:generic_9x3', containerId: 3, stateId: 9 });
+	assert.equal(result.reasonCode, 'PROGRAM_FINISH_REQUESTED');
+	assert.equal(result.finishRequested, true);
+	assert.equal(result.actions, 1);
+	assert.equal(result.receipts[0].state, 'SUCCEEDED');
+});
+
+for (const failureMode of ['result', 'throw']) {
+	test(`native program inspection preserves ${failureMode} failure for the authored branch`, async () => {
+		const runtime = new NativeToolRuntime({ bridge: { send: async () => assert.fail('failed inspection dispatched an action') }, inspectObservation: async () => {
+			if (failureMode === 'throw') throw Object.assign(new Error('Inspection expired'), { code: 'INSPECTION_EXPIRED' });
+			return { state: 'FAILED', reasonCode: 'INSPECTION_EXPIRED' };
+		} });
+		runtime.updateObservation(record(), { player: { health: 20 } }, { eventSequence: 1 });
+		const result = await runtime.execute(nativeCall({ kind: 'run_program', source: 'program.onUnhandledAttention("continue_and_notify"); const page = await world.inspect({ section: "menu" }); if (page.state === "FAILED" && page.reasonCode === "INSPECTION_EXPIRED") { program.finish("Inspection expired"); } else { await player.wait(1); }' }), record());
+		assert.equal(result.reasonCode, 'PROGRAM_FINISH_REQUESTED');
+		assert.equal(result.actions, 0);
+	});
+}
+
 test('native program cancellation fences its next step and disposal releases its body', async () => {
 	const sent = [];
 	let runtime;

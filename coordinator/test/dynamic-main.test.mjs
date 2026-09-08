@@ -2306,6 +2306,75 @@ test('native lookAround holds an action lease and acting state across its camera
 	} finally { await run.coordinator.stop(); }
 });
 
+test('native programs and asynchronous action tools acquire body leases while frontier queries stay read-only', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	const bridge = new FakeBridge();
+	const goalSupervisor = new RecordingGoalSupervisor();
+	const leases = [];
+	const released = [];
+	const dispatched = [];
+	let currentTool;
+	let done = false;
+	goalSupervisor.begin = (key, kind) => {
+		const token = { ...key, kind, operationId: `operation-${leases.length}` };
+		leases.push(token);
+		return token;
+	};
+	goalSupervisor.end = (token) => released.push(token);
+	const send = bridge.send.bind(bridge);
+	bridge.send = async (type, agentId, payload, options) => {
+		await send(type, agentId, payload, options);
+		if (type === 'action_cancel') queueMicrotask(() => bridge.emit('action_result', { agentId, payload: { goalRevision: 1, actionId: payload.actionId, state: 'CANCELLED', reasonCode: 'MODEL_CANCELLED', executionStarted: true, eventSequence: 20 } }));
+		if (type === 'action_command') {
+			assert.equal(registry.get(agentId).state, DynamicAgentState.ACTING);
+			const actionLease = leases.findLast(({ kind }) => kind === 'action');
+			assert.ok(actionLease);
+			assert.equal(released.includes(actionLease), false);
+			dispatched.push(currentTool);
+			if (currentTool !== 'start_action') queueMicrotask(() => bridge.emit('action_result', { agentId, payload: { goalRevision: 1, actionId: payload.actionId, state: 'SUCCEEDED', reasonCode: '', executionStarted: true, eventSequence: 20 + dispatched.length } }));
+		}
+		if (type === 'inspection_request' && currentTool === 'explore_frontier') {
+			assert.equal(registry.get(agentId).state, DynamicAgentState.PLANNING);
+			assert.equal(leases.filter(({ kind }) => kind === 'action').length, 3);
+		}
+	};
+	planner.requestNativeTurn = async (request) => {
+		if (done) return { status: 'completed', toolCalls: 0 };
+		planner.requests.push(request);
+		let call = 0;
+		const execute = async (tool) => {
+			currentTool = tool.kind;
+			const result = await request.executeTool({ agentId: request.agentId, goalRevision: request.goalRevision, turnId: 'body-tools', callId: `body-${++call}`, tool });
+			assert.equal(registry.get(request.agentId).state, DynamicAgentState.PLANNING);
+			return result;
+		};
+		const handle = await execute({ kind: 'start_action', actionType: 'wait', arguments: { durationMs: 1000 } });
+		assert.equal(handle.state, 'RUNNING');
+		await execute({ kind: 'replace_action', actionId: handle.actionId, goalRevision: 1, actionType: 'wait', arguments: { durationMs: 1 } });
+		const program = await execute({ kind: 'run_program', source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);' });
+		assert.equal(program.reasonCode, 'PROGRAM_EXHAUSTED');
+		await execute({ kind: 'explore_frontier', arguments: {} });
+		done = true;
+		return { status: 'completed', toolCalls: call };
+	};
+	const run = await start({ bridge, registry, planner, goalSupervisor, config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } } });
+	const errors = [];
+	run.coordinator.on('runtimeError', (error) => errors.push(error));
+	try {
+		bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Inspect and wait.' } });
+		bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		try { await eventually(() => done || errors.length > 0 || bridge.sent.some(({ type }) => type === 'agent_error')); }
+		catch (error) { throw new Error(JSON.stringify({ currentTool, dispatched, messages: bridge.sent.slice(-4) }), { cause: error }); }
+		assert.equal(bridge.sent.some(({ type }) => type === 'agent_error'), false, JSON.stringify(bridge.sent.filter(({ type }) => type === 'agent_error')));
+		assert.deepEqual(errors, []);
+		assert.deepEqual(dispatched, ['start_action', 'replace_action', 'run_program']);
+		const actionLeases = leases.filter(({ kind }) => kind === 'action');
+		assert.equal(actionLeases.length, 3);
+		for (const lease of actionLeases) assert.equal(released.filter((token) => token === lease).length, 1);
+	} finally { await run.coordinator.stop(); }
+});
+
 test('a pre-disconnect native completion cannot complete the replacement lifecycle', async () => {
 	const bridge = new DeferredCompletionBridge();
 	const registry = new AgentRegistry();
