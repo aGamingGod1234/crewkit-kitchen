@@ -5,6 +5,7 @@ import test from 'node:test';
 import { createActionResultReplayProof, createBridgeAuthenticationProof, createProtocolV2Envelope, MultiplexedServerBridge, ProtocolV2Error, validateProtocolV2Envelope, validateProtocolV2Payload } from '../src/protocol-v2.mjs';
 import { completionContractFingerprint } from '../src/goal-contract.mjs';
 import { goalSpecFingerprint } from '../src/goal-spec.mjs';
+import { adaptObservation } from '../src/observation-adapter.mjs';
 
 const SECRET = 's'.repeat(32);
 const LAUNCH_ID = '00000000-0000-0000-0000-000000000123';
@@ -1734,6 +1735,37 @@ test('post-action observation requests carry only the active goal revision', () 
 	);
 });
 
+test('event inspection uses bounded pages and an explicit event sequence cursor', () => {
+	assert.deepEqual(validateProtocolV2Payload('inspection_request', { goalRevision: 4, requestId: 'inspect-1', query: { section: 'events', afterSequence: 17, limit: 8 } }), {
+		goalRevision: 4, requestId: 'inspect-1', query: { section: 'events', afterSequence: 17, offset: 0, limit: 8 },
+	});
+	for (const query of [{ section: 'events', afterSequence: -2 }, { section: 'events', afterSequence: 0.5 }, { section: 'inventory', afterSequence: 1 }, { section: 'events', limit: 33 }]) {
+		assert.throws(() => validateProtocolV2Payload('inspection_request', { goalRevision: 4, requestId: 'inspect-1', query }), ProtocolV2Error);
+	}
+});
+
+test('player packet observations preserve approximate sounds, visible bars, and event attention', () => {
+	const observation = readyServerObservation();
+	observation.attention = true;
+	observation.changedFacts = ['perception'];
+	observation.perception = { latestSequence: 2, earliestSequence: 1, events: [
+		{ type: 'sound', sequence: 1, gameTime: 20, observedAtEpochMs: 100, dimension: 'minecraft:overworld', soundId: 'minecraft:entity.zombie.ambient', direction: 'back_left', range: 'near', elevation: 'below' },
+		{ type: 'action_bar', sequence: 2, gameTime: 21, observedAtEpochMs: 150, dimension: 'minecraft:overworld', text: 'Door locked', textTruncated: false },
+	], bossBars: [{ barId: 'bar-1', name: 'Visible boss', progress: 0.45 }] };
+	const normalized = validateProtocolV2Payload('observation', observation);
+	assert.deepEqual(normalized.perception, observation.perception);
+	assert.deepEqual(normalized.changedFacts, ['perception']);
+	const hiddenCoordinate = structuredClone(observation);
+	hiddenCoordinate.perception.events[0].x = 123;
+	assert.throws(() => validateProtocolV2Payload('observation', hiddenCoordinate), /unknown|field/i);
+	const outOfOrder = structuredClone(observation);
+	outOfOrder.perception.events[1].sequence = 1;
+	assert.throws(() => validateProtocolV2Payload('observation', outOfOrder), /increasing/);
+	const badBar = structuredClone(observation);
+	badBar.perception.bossBars[0].progress = 2;
+	assert.throws(() => validateProtocolV2Payload('observation', badBar), /between 0 and 1/);
+});
+
 test('protocol v2 validates raw transaction arguments before normalizing action commands', () => {
 	const validTransfer = {
 		x: 1, y: 64, z: -2,
@@ -1835,8 +1867,25 @@ test('protocol v2 carries an exact observed dropped-item identity to Minecraft',
 	});
 });
 
-test('accepts the exact rich ready observation emitted by ServerObservationCollector', () => {
+function currentCollectorObservation() {
 	const payload = readyServerObservation();
+	Object.assign(payload.player, { pose: 'standing', swimming: false, gliding: false, sprinting: false, crouching: false,
+		onClimbable: false, inLava: false, horizontalCollision: false, verticalCollision: false, passenger: false });
+	payload.world.worldId = '00000000-0000-0000-0000-000000000999';
+	Object.assign(payload.interaction.menu, { containerId: 0, stateId: 1, slotCount: 46, offset: 0, hasMore: true });
+	Object.assign(payload.interaction.menu.cursor, { damage: 0, maxDamage: 0, maxStackSize: 64, displayName: 'Air', fingerprint: '' });
+	Object.assign(payload.inventory.items[0], { maxStackSize: 1, displayName: 'Iron Chestplate', fingerprint: 'a'.repeat(64) });
+	Object.assign(payload.entities[0], { velocity: { x: 0, y: 0, z: 0 }, yaw: 90, pitch: 0, pose: 'standing',
+		bounds: { minX: 0, minY: 64, minZ: 0, maxX: 0.6, maxY: 65.95, maxZ: 0.6 }, equipment: [], usingItem: false, onFire: false });
+	Object.assign(payload.blocks[0], { state: { axis: 'y' }, bounds: [{ minX: 0, minY: 0, minZ: 0, maxX: 1, maxY: 1, maxZ: 1 }], boundsTruncated: false, replaceable: false });
+	payload.coverage = { mode: 'sampled_visible', complete: false, blocksRadius: 6, landmarkDistanceLimit: 256, entitiesDistanceLimit: 128,
+		sections: Object.fromEntries(['entities', 'blocks', 'landmarks', 'nearbyContainers'].map((field) => [field, { returned: payload[field].length, complete: false }])) };
+	payload.perception = { latestSequence: 0, earliestSequence: 1, events: [], bossBars: [] };
+	return payload;
+}
+
+test('accepts the exact rich ready observation emitted by ServerObservationCollector', () => {
+	const payload = currentCollectorObservation();
 	const normalized = validateProtocolV2Payload('observation', payload);
 	assert.equal(normalized.eventSequence, 7);
 	assert.equal(normalized.attention, false);
@@ -1862,6 +1911,27 @@ test('accepts the exact rich ready observation emitted by ServerObservationColle
 		x: 28, y: 66, z: -1, blockId: 'minecraft:oak_log', distance: 17.8, bearing: 24, elevation: 3, tags: ['#minecraft:logs'],
 	});
 	assert.deepEqual(normalized.nearbyContainers[0].capabilities, ['transfer_container']);
+	assert.deepEqual(normalized.interaction.menu.cursor, payload.interaction.menu.cursor);
+	const adapted = adaptObservation(normalized);
+	assert.equal(adapted.interaction.menu.cursor.maxDamage, 0);
+	assert.equal(adapted.interaction.menu.slotCount, 46);
+	assert.equal(adapted.player.pose, 'standing');
+	assert.equal(adapted.world.worldId, payload.world.worldId);
+});
+
+test('menu cursor durability stays typed and dimension changes remain factual', () => {
+	const payload = currentCollectorObservation();
+	payload.interaction.menu.cursor = { itemId: 'minecraft:iron_sword', count: 1, damage: 12, maxDamage: 250 };
+	payload.interaction.menu.slots[0] = { slot: 0, itemId: 'minecraft:iron_sword', count: 1, damage: 13, maxDamage: 250 };
+	payload.attention = true;
+	payload.changedFacts = ['world.dimension'];
+	const adapted = adaptObservation(validateProtocolV2Payload('observation', payload));
+	assert.equal(adapted.interaction.menu.cursor.damage, 12);
+	assert.equal(adapted.interaction.menu.slots[0].damage, 13);
+	for (const damage of [-1, 0.5, '12']) {
+		payload.interaction.menu.cursor.damage = damage;
+		assert.throws(() => validateProtocolV2Payload('observation', payload), /damage/);
+	}
 });
 
 test('ready observation requires factual delta metadata and rejects decision labels', () => {
@@ -1911,7 +1981,7 @@ test('delivers the rich server observation without tearing down the authenticate
 		'observation',
 		'agent-a',
 		'server-observation-1',
-		readyServerObservation(),
+		currentCollectorObservation(),
 	))}\n`);
 	const [message] = await delivered;
 	assert.equal(message.payload.player.foodLevel, 14);

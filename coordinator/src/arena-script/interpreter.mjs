@@ -1,16 +1,17 @@
 import { ArenaScriptError, executionError } from './errors.mjs';
 import { types as nodeTypes } from 'node:util';
 import { DEFAULT_ARENA_SCRIPT_LIMITS, normalizeArenaScriptLimits } from './limits.mjs';
-import { PLAYER_MEMBER_PRIMITIVES } from './minecraft-api.mjs';
+import { PLAYER_MEMBER_PRIMITIVES, MATH_METHODS } from './minecraft-api.mjs';
 import { filterObserved, isTrustedInterpreterFacts, markObservedCandidateSet, nearestFromCurrent } from './facts.mjs';
 import { MAX_LINE_BYTES } from '../constants.mjs';
 
-const CAPABILITY_NAMES = new Set(['program', 'player', 'world', 'inventory']);
+const CAPABILITY_NAMES = new Set(['program', 'player', 'world', 'inventory', 'math']);
 const CAPABILITY_MEMBERS = Object.freeze({
 	program: new Set(['onUnhandledAttention', 'repeatUntil', 'watch', 'checkpoint', 'finish']),
 	player: new Set([...Object.keys(PLAYER_MEMBER_PRIMITIVES), 'state']),
-	world: new Set(['items', 'entities', 'blocks', 'nearest']),
-	inventory: new Set(['count', 'countTag']),
+	world: new Set(['items', 'entities', 'blocks', 'nearest', 'state', 'menu', 'inspect', 'remember', 'queryMemory']),
+	inventory: new Set(['count', 'countTag', 'slots', 'state']),
+	math: new Set(Object.keys(MATH_METHODS)),
 });
 const FORBIDDEN_MEMBER_NAMES = new Set(['__defineGetter__', '__defineSetter__', '__lookupGetter__', '__lookupSetter__', '__proto__', 'arguments', 'callee', 'caller', 'constructor', 'eval', 'prototype']);
 const ACTION_RESULT_STATES = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT']);
@@ -23,6 +24,8 @@ const DETERMINISTIC_FAILURE_CODES = new Set([
 	'RECIPE_NOT_UNLOCKED',
 ]);
 const PLAYER_PRIMITIVES = PLAYER_MEMBER_PRIMITIVES;
+const COMPOUND_ACTIONS = new Set(['control_sequence', 'edit_book']);
+const COMPOUND_ACTION_BYTES = 32_768;
 const CANONICAL_LIMITS = Object.freeze({ depth: 256, nodes: 4_096, keys: 4_096, stringBytes: 16_384, factBytes: MAX_LINE_BYTES * 2, arrayLength: 256, outputBytes: 4_096, resultBytes: 4_096, watcherIdBytes: 128 });
 const IDLE_YIELD = frozenRecord({ kind: 'idle' });
 
@@ -69,16 +72,17 @@ export class ArenaScriptInterpreter {
 
 	resume(result, facts) {
 		if (this.#waiting === null) throw executionError('NOT_WAITING', 'ArenaScript NOT_WAITING: no command is awaiting a result');
-		const normalizedResult = normalizeActionResult(result);
+		const query = this.#waiting.kind === 'query';
+		const normalizedResult = query ? normalizeQueryResult(result) : normalizeActionResult(result);
 		if (normalizedResult.stateToken !== this.#waiting.stateToken) throw executionError('STALE_STATE_TOKEN', 'ArenaScript STALE_STATE_TOKEN: action result does not match the pending command');
 		const normalizedFacts = freezeFacts(facts);
 		this.#context.facts = normalizedFacts;
-		const repeatedFailure = this.#trackDeterministicFailure(this.#waiting, normalizedResult);
+		const repeatedFailure = query ? null : this.#trackDeterministicFailure(this.#waiting, normalizedResult);
 		if (repeatedFailure !== null) {
 			this.#waiting = null;
 			return this.#replanAtFailure(repeatedFailure);
 		}
-		this.#waiting.environment.setResult(normalizedResult);
+		this.#waiting.environment.setResult(query ? normalizedResult.value : normalizedResult);
 		this.#waiting = null;
 		this.#beginSlice();
 		return this.#run();
@@ -480,6 +484,13 @@ export class ArenaScriptInterpreter {
 		}
 		if (!path) throw this.#error('UNSUPPORTED_SYNTAX', 'ArenaScript UNSUPPORTED_SYNTAX: call target is not declared', node);
 		const callPath = path.join('.');
+		if (path[0] === 'math') {
+			const [operation, minimum, maximum = minimum] = MATH_METHODS[path[1]];
+			if (args.length < minimum || args.length > maximum || args.some((value) => !Number.isFinite(value))) throw this.#error('INVALID_ARGUMENT', 'math calls require a bounded number of finite numeric arguments', node);
+			const result = operation(...args);
+			if (!Number.isFinite(result)) throw this.#error('INVALID_OPERAND', 'math result must be finite', node);
+			return this.#values.push(result);
+		}
 		switch (callPath) {
 			case 'program.onUnhandledAttention': return this.#values.push(undefined);
 			case 'program.watch': return this.#registerWatcher(node, args);
@@ -487,6 +498,13 @@ export class ArenaScriptInterpreter {
 			case 'program.finish': return this.#terminalYield('finish', node, terminalText(args[0], 'finished', node));
 			case 'program.repeatUntil': return this.#repeatUntil(node, args);
 			case 'player.state': return this.#values.push(this.#context.facts.player);
+			case 'world.state': return this.#values.push(this.#context.facts.world.state);
+			case 'world.menu': return this.#values.push(this.#context.facts.world.menu);
+			case 'world.inspect': return this.#yieldQuery('inspect', args, node, environment);
+			case 'world.remember': return this.#yieldQuery('remember', args, node, environment);
+			case 'world.queryMemory': return this.#yieldQuery('queryMemory', args, node, environment);
+			case 'inventory.state': return this.#values.push(this.#context.facts.inventory.state);
+			case 'inventory.slots': return this.#values.push(filterObserved(this.#context.facts.inventory.items, args[0]));
 			case 'world.items': return this.#values.push(filterObserved(this.#context.facts.world.items, args[0]));
 			case 'world.entities': return this.#values.push(filterObserved(this.#context.facts.world.entities, args[0]));
 			case 'world.blocks': return this.#values.push(filterObserved(this.#context.facts.world.blocks, args[0]));
@@ -509,7 +527,8 @@ export class ArenaScriptInterpreter {
 		if (this.#commands >= this.#limits.commandsPerProgram) throw this.#error('COMMAND_LIMIT', `ArenaScript COMMAND_LIMIT: exceeded ${this.#limits.commandsPerProgram} commands`, node);
 		this.#commands += 1;
 		const stateToken = `arena-state-${++this.#sequence}`;
-		const commandArguments = freezeOutput(args.length === 1 ? args[0] : args);
+		const commandArguments = freezeOutput(args.length === 0 ? frozenRecord({}) : args.length === 1 ? args[0] : args,
+			COMPOUND_ACTIONS.has(binding.primitive) ? COMPOUND_ACTION_BYTES : CANONICAL_LIMITS.outputBytes);
 		this.#frames.push({ type: 'pending-result', environment });
 		this.#waiting = {
 			environment,
@@ -525,6 +544,17 @@ export class ArenaScriptInterpreter {
 			call: frozenRecord({ primitive: binding.primitive, arguments: commandArguments }),
 			stateToken,
 		});
+	}
+
+	#yieldQuery(operation, args, node, environment) {
+		if (args.length !== 1 || args[0] === null || typeof args[0] !== 'object' || Array.isArray(args[0])) throw this.#error('INVALID_ARGUMENT', `world.${operation} requires one query record`, node);
+		if (this.#commands >= this.#limits.commandsPerProgram) throw this.#error('COMMAND_LIMIT', 'ArenaScript COMMAND_LIMIT: program command budget exhausted', node);
+		this.#commands += 1;
+		const stateToken = `arena-state-${++this.#sequence}`;
+		const query = freezeOutput(args[0]);
+		this.#frames.push({ type: 'pending-result', environment });
+		this.#waiting = { kind: 'query', environment, stateToken, stepId: stepIdFor(node) };
+		this.#yield = frozenRecord({ kind: 'query', operation, stateToken, stepId: stepIdFor(node), query });
 	}
 
 	#terminalYield(kind, node, value) {
@@ -714,8 +744,8 @@ export class ArenaScriptInterpreter {
 
 	#forEachStart(frame) {
 		const source = this.#values.pop();
-		if (source === null || typeof source !== 'object') throw this.#error('INVALID_ITERABLE', 'ArenaScript INVALID_ITERABLE: loop source must be an object', frame.node);
-		frame.values = frame.node.type === 'ForInStatement' ? Object.keys(source) : [...source];
+		if (!Array.isArray(source) || !Object.isFrozen(source) || source.length > CANONICAL_LIMITS.arrayLength) throw this.#error('INVALID_ITERABLE', 'ArenaScript INVALID_ITERABLE: for-of requires a bounded immutable array', frame.node);
+		frame.values = source;
 		this.#frames.push({ type: 'for-each-next', frame });
 	}
 
@@ -724,13 +754,14 @@ export class ArenaScriptInterpreter {
 		this.#assertLoop(frame.node, frame.iterations);
 		const value = frame.values[frame.iterations++];
 		const left = frame.node.left;
+		const iterationEnvironment = new Environment(frame.environment, this.#context);
 		if (left.type === 'VariableDeclaration') {
 			const name = left.declarations[0]?.id?.name;
 			if (!name) throw this.#error('UNSUPPORTED_SYNTAX', 'ArenaScript UNSUPPORTED_SYNTAX: loop declaration must use an identifier', left);
-			if (frame.iterations === 1) frame.environment.define(name, value, left.kind); else frame.environment.set(name, value, left);
+			iterationEnvironment.define(name, value, left.kind);
 		} else if (left.type === 'Identifier') frame.environment.set(left.name, value, left); else throw this.#error('UNSAFE_MEMBER_ACCESS', 'ArenaScript UNSAFE_MEMBER_ACCESS: loop target must be local', left);
 		this.#frames.push({ type: 'for-each-after-body', frame });
-		this.#frames.push({ type: 'statement', node: frame.node.body, environment: frame.environment });
+		this.#frames.push({ type: 'statement', node: frame.node.body, environment: iterationEnvironment });
 	}
 
 	#forEachAfterBody({ frame }) {
@@ -893,17 +924,28 @@ function normalizeActionResult(result) {
 	return frozenRecord({ stateToken, state, succeeded: state === 'SUCCEEDED', reason: reasonCode, reasonCode });
 }
 
+function normalizeQueryResult(result) {
+	const values = exactOwnDataRecord(result, 'query result', ['stateToken', 'state', 'reasonCode', 'value']);
+	const status = normalizeActionResult({ stateToken: values.stateToken, state: values.state, reasonCode: values.reasonCode });
+	return frozenRecord({ ...status, value: freezeQueryResult(values.value) });
+}
+
+export function freezeQueryResult(value) {
+	ownDataEntries(value, 'query result.value');
+	return freezeDataRecord(value, 'query result.value');
+}
+
 function freezeFacts(facts) {
 	if (isTrustedInterpreterFacts(facts)) return facts;
 	const root = exactOwnDataRecord(facts, 'facts', ['player', 'world', 'inventory']);
 	const inventoryEntries = ownDataEntries(root.inventory, 'facts.inventory');
 	const inventory = Object.fromEntries(inventoryEntries);
-	if (!Object.hasOwn(inventory, 'tagCounts') || inventoryEntries.some(([key]) => !['items', 'tagCounts'].includes(key))) throw executionError('INVALID_FACTS', 'ArenaScript INVALID_FACTS: facts.inventory has an invalid schema');
+	if (!Object.hasOwn(inventory, 'tagCounts') || inventoryEntries.some(([key]) => !['items', 'tagCounts', 'state'].includes(key))) throw executionError('INVALID_FACTS', 'ArenaScript INVALID_FACTS: facts.inventory has an invalid schema');
 	const world = freezeDataRecord(root.world, 'facts.world');
 	return frozenRecord({
 		player: freezeDataRecord(root.player, 'facts.player'),
-		world: frozenRecord({ items: markObservedCandidateSet(freezeDataList(world.items ?? [], 'facts.world.items')), entities: markObservedCandidateSet(freezeDataList(world.entities ?? [], 'facts.world.entities')), blocks: markObservedCandidateSet(freezeDataList(world.blocks ?? [], 'facts.world.blocks')) }),
-		inventory: frozenRecord({ items: freezeDataList(inventory.items ?? [], 'facts.inventory.items'), tagCounts: freezeDataRecord(inventory.tagCounts, 'facts.inventory.tagCounts') }),
+		world: frozenRecord({ items: markObservedCandidateSet(freezeDataList(world.items ?? [], 'facts.world.items')), entities: markObservedCandidateSet(freezeDataList(world.entities ?? [], 'facts.world.entities')), blocks: markObservedCandidateSet(freezeDataList(world.blocks ?? [], 'facts.world.blocks')), state: world.state ?? frozenRecord({}), menu: world.menu ?? null }),
+		inventory: frozenRecord({ items: markObservedCandidateSet(freezeDataList(inventory.items ?? [], 'facts.inventory.items')), tagCounts: freezeDataRecord(inventory.tagCounts, 'facts.inventory.tagCounts'), state: freezeDataRecord(inventory.state ?? {}, 'facts.inventory.state') }),
 	});
 }
 
@@ -957,8 +999,10 @@ function ownDataEntries(value, label, { requireNullPrototype = false, requireFro
 	return entries;
 }
 
-function freezeOutput(value) {
-	return canonicalize(value, { errorCode: 'OUTPUT_LIMIT', invalidCode: 'INVALID_COMMAND', label: 'command argument', maxBytes: CANONICAL_LIMITS.outputBytes, requireNullPrototype: true });
+function freezeOutput(value, maxBytes = CANONICAL_LIMITS.outputBytes) {
+	const output = canonicalize(value, { errorCode: 'OUTPUT_LIMIT', invalidCode: 'INVALID_COMMAND', label: 'command argument', maxBytes, requireNullPrototype: true });
+	if (maxBytes > CANONICAL_LIMITS.outputBytes && Buffer.byteLength(JSON.stringify(output) ?? '') > maxBytes) throw limitError('OUTPUT_LIMIT', 'serialized bytes');
+	return output;
 }
 
 function frozenRecord(values) {

@@ -30,6 +30,11 @@ public final class GoalSpecWireCodec {
 			case GoalPredicate.InventoryContains value -> {
 				json.addProperty("type", "inventory_contains"); json.addProperty("itemId", value.itemId()); json.addProperty("count", value.count());
 			}
+			case GoalPredicate.InventoryContainsAny value -> {
+				json.addProperty("type", "inventory_contains_any");
+				JsonArray items = new JsonArray(); value.itemIds().forEach(items::add);
+				json.add("itemIds", items); json.addProperty("count", value.count());
+			}
 			case GoalPredicate.PositionWithin value -> {
 				json.addProperty("type", "position_within"); json.addProperty("dimensionId", value.dimensionId()); json.addProperty("x", value.x()); json.addProperty("y", value.y());
 				json.addProperty("z", value.z()); json.addProperty("radius", value.radius()); json.addProperty("stableTicks", value.stableTicks());
@@ -74,6 +79,19 @@ public final class GoalSpecWireCodec {
 		String type = string(json, "type");
 		return switch (type) {
 			case "inventory_contains" -> { exact(json, Set.of("type", "itemId", "count")); leaves.add(); yield new GoalPredicate.InventoryContains(string(json, "itemId"), integer(json, "count")); }
+			case "inventory_contains_any" -> {
+				exact(json, Set.of("type", "itemIds", "count")); leaves.add();
+				JsonElement items = json.get("itemIds");
+				if (items == null || !items.isJsonArray() || items.getAsJsonArray().isEmpty()
+						|| items.getAsJsonArray().size() > GoalPredicate.MAX_INVENTORY_ITEM_IDS) throw invalid("itemIds must contain between 1 and 64 entries");
+				leaves.addItemReferences(items.getAsJsonArray().size());
+				ArrayList<String> identifiers = new ArrayList<>(items.getAsJsonArray().size());
+				for (JsonElement item : items.getAsJsonArray()) {
+					if (!item.isJsonPrimitive() || !item.getAsJsonPrimitive().isString()) throw invalid("itemIds entries must be strings");
+					identifiers.add(item.getAsString());
+				}
+				yield new GoalPredicate.InventoryContainsAny(identifiers, integer(json, "count"));
+			}
 			case "position_within" -> { boolean legacy = !json.has("dimensionId"); exact(json, legacy ? Set.of("type", "x", "y", "z", "radius", "stableTicks") : Set.of("type", "dimensionId", "x", "y", "z", "radius", "stableTicks")); leaves.add(); yield new GoalPredicate.PositionWithin(legacy ? GoalPredicate.DEFAULT_DIMENSION : string(json, "dimensionId"), number(json, "x"), number(json, "y"), number(json, "z"), number(json, "radius"), integer(json, "stableTicks")); }
 			case "advancement_granted" -> { exact(json, Set.of("type", "advancementId")); leaves.add(); yield new GoalPredicate.AdvancementGranted(string(json, "advancementId")); }
 			case "entity_killed_by_agent" -> { exact(json, Set.of("type", "entityType", "afterGoalStart")); leaves.add(); yield new GoalPredicate.EntityKilledByAgent(string(json, "entityType"), bool(json, "afterGoalStart")); }
@@ -105,6 +123,7 @@ public final class GoalSpecWireCodec {
 	private static void collectIdentifiers(GoalPredicate predicate, List<String> target) {
 		switch (predicate) {
 			case GoalPredicate.InventoryContains value -> target.add(value.itemId());
+			case GoalPredicate.InventoryContainsAny value -> target.addAll(value.itemIds());
 			case GoalPredicate.AdvancementGranted value -> target.add(value.advancementId());
 			case GoalPredicate.EntityKilledByAgent value -> target.add(value.entityType());
 			case GoalPredicate.BlockMatches value -> target.add(value.blockId());
@@ -131,5 +150,15 @@ public final class GoalSpecWireCodec {
 	private static long longInteger(JsonObject json, String field) { JsonElement value = json.get(field); if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber()) throw invalid(field + " must be an integer"); try { return value.getAsBigDecimal().longValueExact(); } catch (ArithmeticException exception) { throw invalid(field + " must be an integer"); } }
 	private static void exact(JsonObject json, Set<String> fields) { if (!json.keySet().equals(fields)) throw invalid("Predicate fields differ from the closed schema"); }
 	private static AgentDomainException invalid(String message) { return new AgentDomainException("INVALID_GOAL_PREDICATE", message); }
-	private static final class Counter { int value; void add() { if (++value > MAX_LEAVES) throw invalid("Goal predicate has too many leaves"); } }
+	private static final class Counter {
+		int value;
+		int itemReferences;
+		void add() { if (++value > MAX_LEAVES) throw invalid("Goal predicate has too many leaves"); }
+		void addItemReferences(int count) {
+			itemReferences += count;
+			if (itemReferences > GoalPredicate.MAX_INVENTORY_ITEM_IDS) {
+				throw new AgentDomainException("GOAL_PREDICATE_LIMIT_EXCEEDED", "Goal predicate contains too many grouped inventory item IDs");
+			}
+		}
+	}
 }

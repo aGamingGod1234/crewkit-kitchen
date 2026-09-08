@@ -29,7 +29,94 @@ public final class LocalPathfinderVerification {
 		assertions += verifySharedBudgetIsAggregate();
 		assertions += verifySharedBudgetReportsPerRequestDeltas();
 		assertions += verifyOpenSetExhaustionAtNodeBoundIsNoPath();
+		assertions += verifyRetainedSearchContinuesAcrossBudgets();
+		assertions += verifyThreeDimensionalFrontier();
+		assertions += verifyDetourCanStartAwayFromDestination();
+		assertions += verifySurfaceSwimmingAndBreathingClearance();
+		assertions += verifyClimbingToGroundedExit();
 		return assertions;
+	}
+
+	private static int verifyRetainedSearchContinuesAcrossBudgets() {
+		TestWorld world = new TestWorld();
+		for (int x = 0; x <= 24; x++) world.standable(position(x, 64, 0));
+		GridPosition destination = position(24, 64, 0);
+		LocalPathfinder.Search search = new LocalPathfinder().beginSearch(
+				position(0, 64, 0), Set.of(destination), destination, 32, Set.of());
+		PathPlan plan = null;
+		int expanded = 0;
+		int slices = 0;
+		while (!search.finished() && slices++ < 20) {
+			plan = search.advance(world, new LocalPathfinder.SearchBudget(2, TEST_TIME_BUDGET_NANOS, () -> 0L));
+			expanded += plan.expandedNodes();
+		}
+		assertTrue(search.finished(), "small tick budgets eventually finish the retained route");
+		assertEquals(PathOutcome.FOUND, plan.outcome(), "retained search finds the exact destination");
+		assertEquals(destination, plan.nodes().getLast().position(), "resumption preserves endpoint authority");
+		assertEquals(24, expanded, "resumption expands each corridor node once instead of restarting");
+		assertTrue(slices > 1 && search.retainedNodes() <= LocalPathfinder.MAX_RETAINED_NODES, "search remains sliced and memory bounded");
+		return 5;
+	}
+
+	private static int verifyThreeDimensionalFrontier() {
+		TestWorld world = new TestWorld();
+		for (int x = 0; x <= 8; x++) {
+			GridPosition feet = position(x, 64 + Math.min(x, 4), 0);
+			world.standable(feet);
+			world.cell(feet.above(2), WalkabilityView.Cell.CLEAR);
+		}
+		GridPosition focus = position(100, 64, 0);
+		LocalPathfinder.Search search = new LocalPathfinder().beginSearch(position(0, 64, 0), Set.of(), focus, 8, Set.of());
+		PathPlan plan = search.advance(world, new LocalPathfinder.SearchBudget(128, TEST_TIME_BUDGET_NANOS, () -> 0L));
+		assertEquals(PathOutcome.FOUND, plan.outcome(), "a reachable elevated boundary replaces the unsupported straight-line midpoint");
+		assertEquals(position(8, 68, 0), plan.nodes().getLast().position(), "the local frontier retains actual terrain height");
+		assertTrue(plan.nodes().stream().anyMatch(node -> node.traversal() == TraversalType.JUMP_UP), "the frontier has an executable route through the rise");
+		LocalPathfinder.Search visited = new LocalPathfinder().beginSearch(position(0, 64, 0), Set.of(), focus, 8, Set.of(position(8, 68, 0)));
+		assertEquals(PathOutcome.NO_PATH, visited.advance(world,
+				new LocalPathfinder.SearchBudget(128, TEST_TIME_BUDGET_NANOS, () -> 0L)).outcome(), "an exhausted boundary does not repeat forever");
+		return 4;
+	}
+
+	private static int verifyDetourCanStartAwayFromDestination() {
+		TestWorld world = new TestWorld();
+		for (int z = 0; z <= 8; z++) {
+			world.standable(position(0, 64, z));
+			world.standable(position(8, 64, z));
+		}
+		for (int x = 0; x <= 8; x++) world.standable(position(x, 64, 8));
+		GridPosition destination = position(8, 64, 0);
+		LocalPathfinder.Search search = new LocalPathfinder().beginSearch(position(0, 64, 0), Set.of(destination), destination, 8, Set.of());
+		PathPlan plan = search.advance(world, new LocalPathfinder.SearchBudget(128, TEST_TIME_BUDGET_NANOS, () -> 0L));
+		assertEquals(PathOutcome.FOUND, plan.outcome(), "a U-shaped detour reaches the selected goal");
+		assertEquals(position(0, 64, 1), plan.nodes().get(1).position(), "the first detour step may increase distance to the goal");
+		assertEquals(destination, plan.nodes().getLast().position(), "a reachable goal takes precedence over partial frontiers");
+		return 3;
+	}
+
+	private static int verifySurfaceSwimmingAndBreathingClearance() {
+		TestWorld world = new TestWorld().standable(position(0, 64, 0)).standable(position(9, 64, 0));
+		for (int x = 1; x <= 8; x++) {
+			world.cell(position(x, 64, 0), WalkabilityView.Cell.WATER);
+			world.cell(position(x, 65, 0), WalkabilityView.Cell.CLEAR);
+		}
+		PathPlan plan = find(world, position(0, 64, 0), position(9, 64, 0));
+		assertEquals(PathOutcome.FOUND, plan.outcome(), "open surface water can connect supported banks beyond four blocks");
+		assertEquals(8L, plan.nodes().stream().filter(node -> node.traversal() == TraversalType.SWIM).count(), "water transitions are explicit");
+		world.cell(position(4, 65, 0), WalkabilityView.Cell.WATER);
+		assertEquals(PathOutcome.NO_PATH, find(world, position(0, 64, 0), position(9, 64, 0)).outcome(), "surface navigation never silently commits to a submerged passage");
+		return 3;
+	}
+
+	private static int verifyClimbingToGroundedExit() {
+		TestWorld world = new TestWorld().standable(position(0, 64, 0)).standable(position(1, 69, 0));
+		for (int y = 64; y <= 69; y++) world.cell(position(0, y, 0), WalkabilityView.Cell.CLIMBABLE);
+		world.cell(position(0, 70, 0), WalkabilityView.Cell.CLEAR);
+		world.cell(position(0, 71, 0), WalkabilityView.Cell.CLEAR);
+		PathPlan plan = find(world, position(0, 64, 0), position(1, 69, 0));
+		assertEquals(PathOutcome.FOUND, plan.outcome(), "a climbable column connects to a supported exit");
+		assertTrue(plan.nodes().stream().anyMatch(node -> node.traversal() == TraversalType.CLIMB), "vertical climb steps are explicit");
+		assertEquals(position(1, 69, 0), plan.nodes().getLast().position(), "climbing preserves the grounded endpoint");
+		return 3;
 	}
 
 	private static int verifyFlatPath() {

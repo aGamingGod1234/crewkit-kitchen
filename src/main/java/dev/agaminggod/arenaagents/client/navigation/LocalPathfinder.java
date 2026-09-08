@@ -17,6 +17,8 @@ public final class LocalPathfinder implements PathPlanner {
 	public static final int MAX_EXPANDED_NODES = 8_192;
 	public static final long MAX_PLANNING_TIME_NANOS = TimeUnit.MILLISECONDS.toNanos(40L);
 	public static final int MAX_DROP_BLOCKS = 3;
+	public static final int MAX_RETAINED_NODES = 32_768;
+	public static final int MAX_EXPANDED_NODES_PER_SLICE = 512;
 
 	private static final int WALK_COST = 10;
 	private static final int JUMP_UP_COST = 14;
@@ -88,68 +90,124 @@ public final class LocalPathfinder implements PathPlanner {
 		if (view == null || start == null || destination == null || budget == null) {
 			return PathPlan.failed(PathOutcome.INVALID, 0);
 		}
-		int expandedAtStart = budget.expandedNodes();
-		if (!isStandable(view, start) || !isStandable(view, destination)) {
+		if (!view.isTraversable(start) || !view.isTraversable(destination)) {
 			return PathPlan.failed(PathOutcome.INVALID, 0);
 		}
-		if (start.equals(destination)) {
-			return new PathPlan(List.of(new PathNode(start, TraversalType.START)), PathOutcome.FOUND, 0);
+		if (start.equals(destination)) return new PathPlan(List.of(new PathNode(start, TraversalType.START)), PathOutcome.FOUND, 0);
+		return new Search(start, Set.of(destination), destination, 0, Set.of()).advance(view, budget);
+	}
+
+	/** Retains one bounded search. The caller must discard it when its terrain snapshot changes. */
+	public Search beginSearch(GridPosition start, Set<GridPosition> goals, GridPosition destination,
+			int radius, Set<GridPosition> previousFrontiers) {
+		if (radius < 1 || radius > 64) throw new IllegalArgumentException("local search radius must be 1..64");
+		return new Search(start, goals, destination, radius, previousFrontiers);
+	}
+
+	public static final class Search {
+		private final GridPosition start;
+		private final Set<GridPosition> goals;
+		private final GridPosition destination;
+		private final int radius;
+		private final Set<GridPosition> previousFrontiers;
+		private final PriorityQueue<SearchNode> open = new PriorityQueue<>(OPEN_ORDER);
+		private final Map<GridPosition, Long> bestCosts = new HashMap<>();
+		private final Map<GridPosition, ParentEdge> parents = new HashMap<>();
+		private final Set<GridPosition> closed = new HashSet<>();
+		private SearchNode frontier;
+		private long nextSequence;
+		private boolean finished;
+
+		private Search(GridPosition start, Set<GridPosition> goals, GridPosition destination,
+				int radius, Set<GridPosition> previousFrontiers) {
+			this.start = Objects.requireNonNull(start);
+			this.goals = Set.copyOf(goals);
+			this.destination = Objects.requireNonNull(destination);
+			this.radius = radius;
+			this.previousFrontiers = Set.copyOf(previousFrontiers);
+			open.add(new SearchNode(start, 0L, heuristic(start, destination), nextSequence++));
+			bestCosts.put(start, 0L);
 		}
 
-		PriorityQueue<SearchNode> open = new PriorityQueue<>(OPEN_ORDER);
-		Map<GridPosition, Long> bestCosts = new HashMap<>();
-		Map<GridPosition, ParentEdge> parents = new HashMap<>();
-		Set<GridPosition> closed = new HashSet<>();
-		long nextSequence = 0L;
-		long startHeuristic = heuristic(start, destination);
-		open.add(new SearchNode(start, 0L, startHeuristic, nextSequence++));
-		bestCosts.put(start, 0L);
+		public boolean finished() { return finished; }
+		public int retainedNodes() { return bestCosts.size(); }
 
-		while (!open.isEmpty()) {
-			if (budget.timeExceeded()) {
-				return PathPlan.failed(budget.exhaustionOutcome(), budget.expandedNodes() - expandedAtStart);
-			}
-			SearchNode current = open.remove();
-			Long currentBestCost = bestCosts.get(current.position());
-			if (currentBestCost == null || current.pathCost() != currentBestCost || closed.contains(current.position())) {
-				continue;
-			}
-			if (current.position().equals(destination)) {
-				return reconstruct(start, destination, parents, budget.expandedNodes() - expandedAtStart);
-			}
-			if (!budget.tryExpand()) {
-				return PathPlan.failed(budget.exhaustionOutcome(), budget.expandedNodes() - expandedAtStart);
-			}
-			closed.add(current.position());
-
-			for (Neighbor neighbor : neighbors(view, current.position())) {
-				if (closed.contains(neighbor.position())) {
+		public PathPlan advance(WalkabilityView view, SearchBudget budget) {
+			if (finished) throw new IllegalStateException("search has already finished");
+			int expandedAtStart = budget.expandedNodes();
+			if (!view.isTraversable(start)) return finish(PathPlan.failed(PathOutcome.INVALID, 0));
+			while (!open.isEmpty()) {
+				if (budget.timeExceeded()) return PathPlan.failed(budget.exhaustionOutcome(), budget.expandedNodes() - expandedAtStart);
+				if (radius > 0 && budget.expandedNodes() - expandedAtStart >= MAX_EXPANDED_NODES_PER_SLICE) {
+					return PathPlan.failed(PathOutcome.NODE_LIMIT, budget.expandedNodes() - expandedAtStart);
+				}
+				SearchNode current = open.peek();
+				Long currentBestCost = bestCosts.get(current.position());
+				if (currentBestCost == null || current.pathCost() != currentBestCost || closed.contains(current.position())) {
+					open.remove();
 					continue;
 				}
-				long candidateCost = saturatedAdd(current.pathCost(), neighbor.cost());
-				long knownCost = bestCosts.getOrDefault(neighbor.position(), Long.MAX_VALUE);
-				if (candidateCost >= knownCost) {
-					continue;
+				if (goals.contains(current.position())) {
+					return finish(reconstruct(start, current.position(), parents, budget.expandedNodes() - expandedAtStart));
 				}
-				bestCosts.put(neighbor.position(), candidateCost);
-				parents.put(
-						neighbor.position(),
-						new ParentEdge(current.position(), neighbor.traversal())
-				);
-				open.add(new SearchNode(
-						neighbor.position(),
-						candidateCost,
-						heuristic(neighbor.position(), destination),
-						nextSequence++
-				));
+				if (!budget.tryExpand()) return PathPlan.failed(budget.exhaustionOutcome(), budget.expandedNodes() - expandedAtStart);
+				open.remove();
+				closed.add(current.position());
+				if (radius > 0 && isFrontier(view, current.position())
+						&& (frontier == null || current.heuristicCost() < frontier.heuristicCost()
+						|| (current.heuristicCost() == frontier.heuristicCost() && current.pathCost() < frontier.pathCost()))) {
+					frontier = current;
+				}
+				for (Neighbor neighbor : neighbors(view, current.position())) {
+					if (closed.contains(neighbor.position()) || (radius > 0 && distanceFromStart(neighbor.position()) > radius)) continue;
+					long candidateCost = saturatedAdd(current.pathCost(), neighbor.cost());
+					long knownCost = bestCosts.getOrDefault(neighbor.position(), Long.MAX_VALUE);
+					if (candidateCost >= knownCost) continue;
+					if (!bestCosts.containsKey(neighbor.position()) && bestCosts.size() >= MAX_RETAINED_NODES) {
+						return finish(frontierPlan(PathOutcome.NODE_LIMIT, budget.expandedNodes() - expandedAtStart));
+					}
+					bestCosts.put(neighbor.position(), candidateCost);
+					parents.put(neighbor.position(), new ParentEdge(current.position(), neighbor.traversal()));
+					open.add(new SearchNode(neighbor.position(), candidateCost,
+							heuristic(neighbor.position(), destination), nextSequence++));
+				}
 			}
+			return finish(frontierPlan(PathOutcome.NO_PATH, budget.expandedNodes() - expandedAtStart));
 		}
 
-		return PathPlan.failed(PathOutcome.NO_PATH, budget.expandedNodes() - expandedAtStart);
+		private int distanceFromStart(GridPosition position) {
+			return (int) Math.min(Integer.MAX_VALUE, Math.max(absoluteDifference(start.x(), position.x()),
+					Math.max(absoluteDifference(start.y(), position.y()), absoluteDifference(start.z(), position.z()))));
+		}
+
+		private boolean isFrontier(WalkabilityView view, GridPosition position) {
+			int distance = distanceFromStart(position);
+			if (distance < Math.min(8, radius) || previousFrontiers.contains(position)) return false;
+			if (distance == radius) return true;
+			for (int[] offset : CARDINAL_OFFSETS) {
+				if (view.cellAt(position.offset(offset[0], 0, offset[1])) == WalkabilityView.Cell.UNLOADED) return true;
+			}
+			return false;
+		}
+
+		private PathPlan frontierPlan(PathOutcome failure, int expanded) {
+			return frontier == null ? PathPlan.failed(failure, expanded) : reconstruct(start, frontier.position(), parents, expanded);
+		}
+
+		private PathPlan finish(PathPlan result) {
+			finished = true;
+			return result;
+		}
 	}
 
 	private static List<Neighbor> neighbors(WalkabilityView view, GridPosition current) {
 		List<Neighbor> neighbors = new ArrayList<>(CARDINAL_OFFSETS.length);
+		if (view.cellAt(current) == WalkabilityView.Cell.CLIMBABLE) {
+			for (int dy : new int[]{1, -1}) {
+				GridPosition vertical = current.offset(0, dy, 0);
+				if (view.isTraversable(vertical)) neighbors.add(new Neighbor(vertical, TraversalType.CLIMB, 16));
+			}
+		}
 		for (int[] offset : CARDINAL_OFFSETS) {
 			GridPosition sameLevel;
 			try {
@@ -170,8 +228,9 @@ public final class LocalPathfinder implements PathPlanner {
 			GridPosition current,
 			GridPosition sameLevel
 	) {
-		if (isStandable(view, sameLevel)) {
-			return new Neighbor(sameLevel, TraversalType.WALK, WALK_COST);
+		TraversalType traversal = view.traversalAt(sameLevel);
+		if (traversal != null) {
+			return new Neighbor(sameLevel, traversal, traversal == TraversalType.WALK ? WALK_COST : 16);
 		}
 
 		GridPosition jumpDestination;
@@ -206,13 +265,15 @@ public final class LocalPathfinder implements PathPlanner {
 			} catch (ArithmeticException exception) {
 				return null;
 			}
-			if (!isStandable(view, landing)) {
+			TraversalType landingTraversal = view.traversalAt(landing);
+			if (landingTraversal == null) {
 				continue;
 			}
 			if (isClearDropShaft(view, landing, current.y())) {
 				return new Neighbor(
 						landing,
-						TraversalType.DROP_DOWN,
+						landingTraversal == TraversalType.SWIM || landingTraversal == TraversalType.CLIMB
+								? landingTraversal : TraversalType.DROP_DOWN,
 						DROP_BASE_COST + DROP_PER_BLOCK_COST * drop
 				);
 			}
@@ -242,7 +303,7 @@ public final class LocalPathfinder implements PathPlanner {
 	}
 
 	private static boolean isClear(WalkabilityView view, GridPosition position) {
-		return view.cellAt(position) == WalkabilityView.Cell.CLEAR;
+		return view.isBodyClear(position) || view.cellAt(position) == WalkabilityView.Cell.WATER;
 	}
 
 	private static long heuristic(GridPosition position, GridPosition destination) {

@@ -187,3 +187,18 @@ test('fact ledger reset invalidates prior revision cursors before accepting a fr
 	assert.deepEqual(delta.removals, []);
 	assert.deepEqual(delta.upserts.map(({ key }) => key), ['new-world']);
 });
+
+test('fact ledger keeps dimension histories queryable and never reuses another world baseline', () => {
+	const ledger = new FactLedger();
+	ledger.ingest('observation', { position: { x: 1, y: 64, z: 0 }, world: { worldId: 'one', dimension: 'minecraft:overworld', gameTime: 10 }, landmarks: [{ blockId: 'minecraft:stone', x: 8, y: 64, z: 0 }] });
+	ledger.ingest('observation', { position: { x: 2, y: 70, z: 0 }, world: { worldId: 'one', dimension: 'minecraft:the_nether', gameTime: 11 } });
+	assert.match(JSON.stringify(ledger.query({ worldId: 'one', dimension: 'minecraft:overworld' })), /minecraft:stone/);
+	assert.doesNotMatch(ledger.toPlannerFacts(), /minecraft:stone/);
+	const cursor = ledger.delta().nextRevision;
+	ledger.ingest('observation', { position: { x: 3, y: 64, z: 0 }, world: { worldId: 'two', dimension: 'minecraft:the_nether', gameTime: 12 } });
+	assert.equal(ledger.delta(cursor).fullBaseline, true);
+	assert.equal(ledger.query().worldId, 'two');
+	assert.equal(ledger.query({ worldId: 'missing', dimension: 'minecraft:overworld' }).entries.length, 0);
+	ledger.ingest('observation', { position: { x: 4, y: 64, z: 0 }, world: { worldId: 'one', dimension: 'minecraft:overworld', gameTime: 13 } });
+	assert.match(ledger.toPlannerFacts(), /minecraft:stone/);
+});

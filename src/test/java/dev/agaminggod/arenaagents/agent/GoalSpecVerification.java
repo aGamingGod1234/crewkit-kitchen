@@ -5,6 +5,7 @@ import dev.agaminggod.arenaagents.agent.goal.GoalEvidence;
 import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
 import dev.agaminggod.arenaagents.agent.goal.GoalSpecCodec;
 import dev.agaminggod.arenaagents.agent.goal.GoalStatus;
+import dev.agaminggod.arenaagents.server.goal.GoalSpecWireCodec;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import java.util.List;
@@ -18,6 +19,7 @@ public final class GoalSpecVerification {
 	public static int verify() {
 		int assertions = 0;
 		assertions += verifyCanonicalRoundTrip();
+		assertions += verifyInventoryCategory();
 		assertions += verifyClosedSchema();
 		assertions += verifyComplexityBounds();
 		assertions += verifyAgentGoalPersistence();
@@ -44,6 +46,49 @@ public final class GoalSpecVerification {
 		assertEquals(encoded, codec.encode(decoded), "goal spec canonical bytes");
 		assertEquals(64, spec.fingerprint().length(), "goal spec SHA-256 fingerprint length");
 		return 3;
+	}
+
+	private static int verifyInventoryCategory() {
+		GoalSpecCodec codec = new GoalSpecCodec();
+		GoalSpecWireCodec wire = new GoalSpecWireCodec();
+		java.util.ArrayList<String> source = new java.util.ArrayList<>(List.of("minecraft:oak_log", "minecraft:birch_log"));
+		GoalPredicate.InventoryContainsAny category = new GoalPredicate.InventoryContainsAny(source, 3);
+		source.clear();
+		assertEquals(List.of("minecraft:oak_log", "minecraft:birch_log"), category.itemIds(), "category owns the ordered item IDs");
+		GoalSpec spec = GoalSpec.create("Collect any logs", category, 1200L);
+		assertEquals("f83b10c17263df853e9ff267009f9944df8f660818b7037396c607eea8581c90", spec.fingerprint(), "category fingerprint matches coordinator fixture");
+		assertEquals(spec, codec.decode(codec.encode(spec)), "inventory category persisted round-trip");
+		assertEquals("{\"type\":\"inventory_contains_any\",\"item_ids\":[\"minecraft:oak_log\",\"minecraft:birch_log\"],\"count\":3}",
+				codec.encodePredicateObject(category).toString(), "persisted category uses canonical snake-case keys");
+		assertEquals(category, wire.decodePredicate(wire.encodePredicate(category)), "inventory category wire round-trip");
+		assertEquals(category.itemIds(), wire.identifiers(category), "all accepted category identifiers cross validation boundary");
+		expectFailure(() -> new GoalPredicate.InventoryContainsAny(List.of(), 1), "INVALID_GOAL_PREDICATE");
+		expectFailure(() -> new GoalPredicate.InventoryContainsAny(List.of("minecraft:oak_log", "minecraft:oak_log"), 1), "INVALID_GOAL_PREDICATE");
+		expectFailure(() -> new GoalPredicate.InventoryContainsAny(List.of("oak_log"), 1), "INVALID_GOAL_PREDICATE");
+		expectFailure(() -> new GoalPredicate.InventoryContainsAny(category.itemIds(), 0), "INVALID_GOAL_PREDICATE");
+		List<String> identifiers = java.util.stream.IntStream.range(0, 65).mapToObj(index -> "minecraft:test_" + index).toList();
+		expectFailure(() -> new GoalPredicate.InventoryContainsAny(identifiers, 1), "INVALID_GOAL_PREDICATE");
+		GoalPredicate bounded = new GoalPredicate.AllOf(List.of(
+				new GoalPredicate.InventoryContainsAny(identifiers.subList(0, 32), 1),
+				new GoalPredicate.InventoryContainsAny(identifiers.subList(32, 64), 1),
+				new GoalPredicate.InventoryContains("minecraft:stone", 1)));
+		assertEquals(bounded, codec.decode(codec.encode(GoalSpec.create("Bounded categories", bounded, 1))).completion(), "64 grouped references fit alongside exact inventory leaves");
+		assertEquals(bounded, wire.decodePredicate(wire.encodePredicate(bounded)), "64 grouped references fit the wire budget");
+		GoalPredicate excess = new GoalPredicate.AllOf(List.of(
+				new GoalPredicate.InventoryContainsAny(identifiers.subList(0, 32), 1),
+				new GoalPredicate.InventoryContainsAny(identifiers.subList(32, 65), 1)));
+		expectFailure(() -> GoalSpec.create("Too many category references", excess, 1), "GOAL_PREDICATE_LIMIT_EXCEEDED");
+		expectFailure(() -> wire.decodePredicate(wire.encodePredicate(excess)), "GOAL_PREDICATE_LIMIT_EXCEEDED");
+		JsonObject wrongType = wire.encodePredicate(category);
+		wrongType.addProperty("itemIds", "minecraft:oak_log");
+		expectFailure(() -> wire.decodePredicate(wrongType), "INVALID_GOAL_PREDICATE");
+		JsonObject wrongElement = codec.encodePredicateObject(category);
+		wrongElement.getAsJsonArray("item_ids").set(0, new com.google.gson.JsonPrimitive(4));
+		expectFailure(() -> codec.decodePredicateObject(wrongElement), "INVALID_GOAL_SPEC");
+		JsonObject unknown = wire.encodePredicate(category);
+		unknown.addProperty("extra", true);
+		expectFailure(() -> wire.decodePredicate(unknown), "INVALID_GOAL_PREDICATE");
+		return 18;
 	}
 
 	private static int verifyClosedSchema() {

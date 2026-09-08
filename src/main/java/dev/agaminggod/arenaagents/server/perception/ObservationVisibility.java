@@ -80,7 +80,8 @@ public final class ObservationVisibility {
 
 		public boolean isEntityWithinView(Entity entity) {
 			Objects.requireNonNull(entity, "entity must not be null");
-			return isWithinNormalizedViewCone(eye, normalizedView, entity.getBoundingBox().getCenter());
+			return !entity.isInvisibleTo(observer)
+					&& isWithinNormalizedViewCone(eye, normalizedView, entity.getBoundingBox().getCenter());
 		}
 
 		public boolean hasLineOfSight(Entity entity) {

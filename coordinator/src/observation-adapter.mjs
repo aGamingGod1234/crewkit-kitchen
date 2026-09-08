@@ -39,6 +39,8 @@ export function adaptObservation(value) {
 	if (Object.hasOwn(playerSource, 'gameMode')) player.gameMode = identifier(playerSource.gameMode, 'player.gameMode');
 	if (Object.hasOwn(playerSource, 'effects')) player.effects = effectFacts(playerSource.effects);
 	if (Object.hasOwn(playerSource, 'lastAttacker')) player.lastAttacker = attackerFacts(playerSource.lastAttacker);
+	for (const field of ['swimming', 'gliding', 'sprinting', 'crouching', 'onClimbable', 'inLava', 'horizontalCollision', 'verticalCollision', 'passenger']) copyBoolean(playerSource, player, field);
+	copyExtensions(playerSource, player, ['pose', 'vehicle']);
 
 	const entities = boundedDataArray(source.entities, 'entities', MAX_ENTITIES)
 		.map((value, index) => entityFacts(value, index));
@@ -69,6 +71,9 @@ export function adaptObservation(value) {
 	const tagCounts = tagCountsFacts(inventorySource.tagCounts);
 	return {
 		ready: true,
+		...(Object.hasOwn(source, 'observedAtEpochMs') ? { observedAtEpochMs: nonNegativeInteger(source.observedAtEpochMs, 'observedAtEpochMs') } : {}),
+		...(Object.hasOwn(source, 'coverage') ? { coverage: extensionValue(source.coverage, 'coverage') } : {}),
+		...(Object.hasOwn(source, 'perception') ? { perception: extensionValue(source.perception, 'perception') } : {}),
 		...(Object.hasOwn(source, 'status') ? { status: identifier(source.status, 'wire observation.status') } : {}),
 		...(Object.hasOwn(source, 'velocity') ? { velocity: vector(source.velocity, 'wire observation.velocity') } : {}),
 		player,
@@ -110,6 +115,7 @@ function entityFacts(value, index) {
 		result.itemId = identifier(source.itemId, `entities[${index}].itemId`);
 		result.count = positiveInteger(source.count, `entities[${index}].count`);
 	}
+	copyExtensions(source, result, ['velocity', 'yaw', 'pitch', 'pose', 'bounds', 'equipment', 'usingItem', 'onFire']);
 	return result;
 }
 
@@ -117,13 +123,15 @@ function blockFacts(value, index) {
 	const source = ownDataRecord(value, `blocks[${index}]`);
 	const point = coordinateSource(source, `blocks[${index}]`);
 	const stableId = `${point.x},${point.y},${point.z}`;
-	return {
+	const result = {
 		stableId,
 		blockId: identifier(source.blockId, `blocks[${index}].blockId`),
 		...(Object.hasOwn(source, 'placeableFaces') ? { placeableFaces: identifierList(source.placeableFaces, `blocks[${index}].placeableFaces`, 6) } : {}),
 		...(Object.hasOwn(source, 'tags') ? { tags: tags(source.tags, `blocks[${index}].tags`) } : {}),
 		x: point.x, y: point.y, z: point.z,
 	};
+	copyExtensions(source, result, ['state', 'bounds', 'boundsTruncated', 'replaceable', 'fluid', 'text']);
+	return result;
 }
 
 function landmarkFacts(value, index) {
@@ -153,6 +161,7 @@ function inventoryFacts(value, index) {
 	if (Object.hasOwn(source, 'damage')) result.damage = nonNegativeInteger(source.damage, `inventory.items[${index}].damage`);
 	if (Object.hasOwn(source, 'maxDamage')) result.maxDamage = nonNegativeInteger(source.maxDamage, `inventory.items[${index}].maxDamage`);
 	if (Object.hasOwn(source, 'hotbar')) result.hotbar = boolean(source.hotbar, `inventory.items[${index}].hotbar`);
+	copyExtensions(source, result, ['displayName', 'fingerprint', 'maxStackSize', 'tooltip', 'tooltipTruncated']);
 	return result;
 }
 
@@ -186,6 +195,7 @@ function worldFacts(value) {
 	const source = ownDataRecord(value, 'wire observation.world');
 	return {
 		dimension: identifier(source.dimension, 'world.dimension'),
+		...(Object.hasOwn(source, 'worldId') ? { worldId: identifier(source.worldId, 'world.worldId') } : {}),
 		gameTime: nonNegativeInteger(source.gameTime, 'world.gameTime'),
 		dayTime: nonNegativeInteger(source.dayTime, 'world.dayTime'),
 		raining: boolean(source.raining, 'world.raining'),
@@ -245,18 +255,55 @@ function interactionFacts(value) {
 		},
 		menu: {
 			type: identifier(menu.type, 'interaction.menu.type'),
-			cursor: { itemId: identifier(cursor.itemId, 'interaction.menu.cursor.itemId'), count: nonNegativeInteger(cursor.count, 'interaction.menu.cursor.count') },
+			cursor: stackDetails(cursor, 'interaction.menu.cursor'),
 			slots: boundedDataArray(menu.slots, 'interaction.menu.slots', 64).map((entry, index) => {
 				const slot = ownDataRecord(entry, `interaction.menu.slots[${index}]`);
-				return { slot: nonNegativeInteger(slot.slot, `interaction.menu.slots[${index}].slot`), itemId: identifier(slot.itemId, `interaction.menu.slots[${index}].itemId`), count: nonNegativeInteger(slot.count, `interaction.menu.slots[${index}].count`) };
+				return { slot: nonNegativeInteger(slot.slot, `interaction.menu.slots[${index}].slot`), ...stackDetails(slot, `interaction.menu.slots[${index}]`) };
 			}),
 			capabilities: identifierList(menu.capabilities, 'interaction.menu.capabilities', 8),
+			...extensionFields(menu, ['containerId', 'stateId', 'slotCount', 'offset', 'hasMore', 'details']),
 		},
 		rayTarget: ray.type === 'block' ? {
 			type: 'block', x: integer(ray.x, 'interaction.rayTarget.x'), y: integer(ray.y, 'interaction.rayTarget.y'), z: integer(ray.z, 'interaction.rayTarget.z'),
 			face: identifier(ray.face, 'interaction.rayTarget.face'), blockId: identifier(ray.blockId, 'interaction.rayTarget.blockId'),
 		} : { type: identifier(ray.type, 'interaction.rayTarget.type') },
 	};
+}
+
+function stackDetails(source, label) {
+	return {
+		itemId: identifier(source.itemId, `${label}.itemId`),
+		count: nonNegativeInteger(source.count, `${label}.count`),
+		...extensionFields(source, ['displayName', 'fingerprint', 'damage', 'maxDamage', 'maxStackSize', 'tooltip', 'tooltipTruncated', 'x', 'y', 'pickupAllowed', 'slotLimit']),
+	};
+}
+
+function extensionFields(source, fields) {
+	const result = {};
+	copyExtensions(source, result, fields);
+	return result;
+}
+
+function copyExtensions(source, target, fields) {
+	for (const field of fields) if (Object.hasOwn(source, field)) target[field] = extensionValue(source[field], field);
+}
+
+/** Preserve bounded protocol extension data without invoking accessors or accepting executable values. */
+function extensionValue(value, label, depth = 0, budget = { bytes: 0 }) {
+	if (depth > 10) throw new TypeError(`${label} exceeds nesting bound`);
+	if (value === null || typeof value === 'boolean') return value;
+	if (typeof value === 'number') return finiteNumber(value, label);
+	if (typeof value === 'string') {
+		budget.bytes += Buffer.byteLength(value, 'utf8');
+		if (value.length > 8_192 || budget.bytes > 32_768) throw new TypeError(`${label} exceeds text bound`);
+		return value;
+	}
+	if (Array.isArray(value)) return boundedDataArray(value, label, 256)
+		.map((entry, index) => extensionValue(entry, `${label}[${index}]`, depth + 1, budget));
+	const record = ownDataRecord(value, label);
+	const keys = Object.keys(record);
+	if (keys.length > 128) throw new TypeError(`${label} exceeds field bound`);
+	return Object.fromEntries(keys.map((key) => [key, extensionValue(record[key], `${label}.${key}`, depth + 1, budget)]));
 }
 
 function tags(value, label) {

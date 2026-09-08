@@ -3,9 +3,11 @@ import { mkdir as defaultMkdir, open as defaultOpen, readFile as defaultReadFile
 import { fileURLToPath } from 'node:url';
 import { HeadlessRconClient } from './headless-rcon.mjs';
 import { sanitizeDiagnosticErrorStack, sanitizeDiagnosticText, sanitizeDiagnosticValue } from './diagnostic-sanitizer.mjs';
+import { claimNaturalWorld, classifyHeadlessFailure, normalizeHeadlessWorld, parsePlayerPosition, parseServerSeed, summarizeProviderAttestation, validateNaturalWorldManifest } from './headless-world.mjs';
 
 const PROVIDERS = new Set(['codex', 'kimi', 'cursor']);
 const MAX_TIMEOUT_MS = 900_000;
+const MAX_NATURAL_TIMEOUT_MS = 21_600_000;
 const MAX_DIAGNOSTICS = 4096;
 const MAX_TEXT = 4096;
 const MAX_ASSERTION_ARGS = 8192;
@@ -14,7 +16,7 @@ const MAX_EVIDENCE_TAIL_BYTES = 262_144;
 const MAX_SCENARIOS = 24;
 const MAX_MATRIX_REPORT_BYTES = 262_144;
 const POLL_INTERVAL_MS = 50;
-const SCENARIO_KEYS = new Set(['id', 'provider', 'model', 'reasoningEffort', 'serviceTier', 'task', 'timeoutMs', 'rosterSize', 'assert', 'assertions', 'repetitions', 'planningTimeoutMs', 'scenarioTimeoutMs', 'requireFactualSuccess', 'setupBlocks']);
+const SCENARIO_KEYS = new Set(['id', 'provider', 'model', 'reasoningEffort', 'serviceTier', 'task', 'timeoutMs', 'rosterSize', 'assert', 'assertions', 'repetitions', 'planningTimeoutMs', 'scenarioTimeoutMs', 'requireFactualSuccess', 'setupBlocks', 'world']);
 const ASSERTION_KEYS = {
 	lifecycle: new Set(['type', 'state']),
 	chat: new Set(['type', 'message']),
@@ -95,8 +97,10 @@ export function normalizeHeadlessScenario(value, index = 0) {
 	const assertions = value.assert ?? value.assertions;
 	if (value.assert !== undefined && value.assertions !== undefined) throw new TypeError('use only assert or assertions');
 	if (!Array.isArray(assertions) || assertions.length === 0) throw new TypeError('scenario requires one or more assertions');
+	const world = normalizeHeadlessWorld(value.world);
 	const timeoutMs = value.timeoutMs;
-	if (!Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_TIMEOUT_MS) throw new RangeError('timeoutMs must be between 1 and 900000');
+	const maximumTimeoutMs = world.mode === 'natural' ? MAX_NATURAL_TIMEOUT_MS : MAX_TIMEOUT_MS;
+	if (!Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > maximumTimeoutMs) throw new RangeError(`timeoutMs must be between 1 and ${maximumTimeoutMs}`);
 	const rosterSize = value.rosterSize ?? 1;
 	if (![1, 8, 16].includes(rosterSize)) throw new RangeError('rosterSize must be one of 1, 8, or 16');
 	if (value.setupBlocks !== undefined && (!Array.isArray(value.setupBlocks) || value.setupBlocks.length === 0 || value.setupBlocks.length > 32)) throw new RangeError('setupBlocks must contain between 1 and 32 blocks');
@@ -109,9 +113,16 @@ export function normalizeHeadlessScenario(value, index = 0) {
 		scenarioTimeoutMs: value.scenarioTimeoutMs === undefined ? timeoutMs : boundedPositiveInteger(value.scenarioTimeoutMs, `scenarios[${index}].scenarioTimeoutMs`),
 		requireFactualSuccess: value.requireFactualSuccess === true,
 		setupBlocks: (value.setupBlocks ?? []).map(normalizeSetupBlock),
+		world,
 		assertions: assertions.map(normalizeAssertion),
 	};
 	if (scenario.repetitions > 32) throw new RangeError(`scenarios[${index}].repetitions must not exceed 32`);
+	if (scenario.scenarioTimeoutMs > timeoutMs) throw new RangeError('scenarioTimeoutMs must not exceed timeoutMs');
+	if (scenario.world.mode === 'natural') {
+		if (scenario.rosterSize !== 1 || scenario.repetitions !== 1) throw new TypeError('natural evaluations require one agent and one repetition per fresh world; expand repetitions into separate scenarios');
+		if (scenario.setupBlocks.length > 0) throw new TypeError('natural evaluations cannot plant setupBlocks');
+		if (!scenario.requireFactualSuccess || !scenario.assertions.some((assertion) => assertion.type === 'rcon')) throw new TypeError('natural evaluations require independent RCON factual success');
+	}
 	if (!PROVIDERS.has(scenario.provider)) throw new TypeError(`unsupported provider '${scenario.provider}'`);
 	return freeze(scenario);
 }
@@ -138,12 +149,18 @@ export function selectHeadlessScenarios(matrix, selector) {
 export function scenarioReport(status, scenario, fields = {}) {
 	const normalizedStatus = text(status, 'status').toUpperCase();
 	const report = { status: normalizedStatus, scenarioId: scenario.id, rosterSize: scenario.rosterSize ?? 1, profile: { provider: scenario.provider, model: scenario.model, reasoningEffort: scenario.reasoningEffort, serviceTier: scenario.serviceTier } };
+	if (scenario.world?.mode === 'natural') {
+		report.settings = { requested: { ...report.profile }, configured: null, configuredVerified: false, effective: null, evidence: null };
+		report.budget = { wallClockMs: Math.min(scenario.timeoutMs, scenario.scenarioTimeoutMs ?? scenario.timeoutMs) };
+		report.world = { ...scenario.world, worldId: null, fresh: false };
+	}
 	for (const [key, value] of Object.entries(fields)) {
 		if (key === 'status') continue;
 		if (key === 'diagnostics' || key === 'error') report[key] = redactReportText(value, MAX_DIAGNOSTICS);
 		else if (key === 'commands') report[key] = publicCommandRecords(value);
 		else report[key] = boundReportValue(value);
 	}
+	if (report.classification) report.failureCategory = classifyHeadlessFailure(report.classification);
 	return freeze(report);
 }
 
@@ -203,6 +220,7 @@ export async function runHeadlessScenario({
 	protocolAudit = null,
 	providerTurnsPath = null,
 	providerTurnRecorder = null,
+	worldManifest = null,
 	poll = defaultPoll,
 } = {}) {
 	if (!scenario || typeof scenario !== 'object') throw new TypeError('scenario must be an object');
@@ -233,7 +251,7 @@ export async function runHeadlessScenario({
 	const startedAt = Number(now());
 	if (!Number.isFinite(startedAt)) throw new TypeError('now must return a finite number');
 	const generatedName = generatedAgentName(scenario, startedAt);
-	const timeoutMs = scenario.timeoutMs;
+	const timeoutMs = Math.min(scenario.timeoutMs, scenario.scenarioTimeoutMs ?? scenario.timeoutMs);
 	const deadline = startedAt + timeoutMs;
 	const tailReader = readTail ?? (readFile === defaultReadFile
 		? defaultReadTail
@@ -247,6 +265,9 @@ export async function runHeadlessScenario({
 	let minecraftMspt = null;
 	let closed = false;
 	let summoned = false;
+	let naturalWorld = null;
+	let spawnPosition = null;
+	let spawnTicket = null;
 	const command = async (value, { readOnly = false, deadlineMs = deadline, attempt = 0 } = {}) => {
 		const commandText = String(value);
 		if (readOnly && !isReadOnlyRcon(commandText)) throw new Error(`RCON assertion command is not read-only: ${commandText}`);
@@ -256,9 +277,41 @@ export async function runHeadlessScenario({
 		if (readOnly) rconEvidence.push({ command: commandText, text: textValue });
 		return { result, text: textValue };
 	};
+	const releaseSpawnTicket = async () => {
+		if (spawnTicket === null) return;
+		const result = await command(`execute in minecraft:overworld run forceload remove ${spawnTicket.x} ${spawnTicket.z}`, { deadlineMs: Math.max(deadline, Number(now()) + 10_000) });
+		if (isFailedResponse(result.text)) throw new Error('NATURAL_SPAWN_CLEANUP: could not release the spawn chunk ticket');
+		spawnTicket.released = true;
+		spawnTicket = null;
+	};
 	try {
-		await command('execute in minecraft:overworld run forceload add 0 0');
 		let summon;
+		if (scenario.world?.mode === 'natural') {
+			naturalWorld = validateNaturalWorldManifest(worldManifest, scenario.world, scenario.id);
+			const { spawn, gameMode } = scenario.world;
+			const saved = worldManifest.savedSpawn;
+			if (!saved || saved.source !== 'level.dat' || saved.dimension !== 'minecraft:overworld'
+				|| ['x', 'y', 'z'].some((axis) => !Number.isSafeInteger(saved[axis])) || Math.abs(saved.x) > 29_999_984 || Math.abs(saved.z) > 29_999_984 || saved.y < -2048 || saved.y > 2048) throw new Error('NATURAL_SPAWN_EVIDENCE: launcher must read the generated world spawn from level.dat');
+			const origin = spawn.policy === 'surface' ? { x: spawn.x, y: 0, z: spawn.z } : saved;
+			const loading = worldManifest.spawnLoading;
+			if (!loading || loading.operation !== 'temporary_spawn_chunk_loading' || loading.ready !== true || loading.x !== origin.x || loading.z !== origin.z
+				|| loading.terrainModified !== false || loading.inventoryModified !== false || !Number.isFinite(loading.elapsedMs) || loading.elapsedMs < 0 || loading.elapsedMs > 120_000) throw new Error('NATURAL_SPAWN_EVIDENCE: launcher must verify temporary spawn chunk loading');
+			spawnTicket = { operation: loading.operation, x: loading.x, z: loading.z, ready: true, elapsedMs: loading.elapsedMs, terrainModified: false, inventoryModified: false, released: false };
+			naturalWorld = { ...naturalWorld, savedSpawn: { source: saved.source, dimension: saved.dimension, x: saved.x, y: saved.y, z: saved.z }, setupInterventions: [spawnTicket] };
+			const actualSeed = parseServerSeed((await command('seed', { readOnly: true })).text);
+			if (actualSeed !== scenario.world.seed) throw new Error('NATURAL_WORLD_IDENTITY: actual server seed does not match the fresh-world manifest');
+			const difficulty = (await command('difficulty', { readOnly: true })).text;
+			if (!new RegExp(`\\b${scenario.world.difficulty}\\b`, 'i').test(difficulty)) throw new Error('NATURAL_WORLD_IDENTITY: actual server difficulty does not match the scenario');
+			for (const [rule, value] of Object.entries(scenario.world.rules)) {
+				if (isFailedResponse((await command(`gamerule ${rule} ${value}`)).text)) throw new Error(`NATURAL_WORLD_RULE: server rejected gamerule ${rule}`);
+				if (!new RegExp(`\\b${value}\\b`).test((await command(`gamerule ${rule}`, { readOnly: true })).text)) throw new Error(`NATURAL_WORLD_RULE: server did not verify gamerule ${rule}`);
+			}
+			const loaded = await command(`execute in minecraft:overworld if loaded ${origin.x} 0 ${origin.z} run time query gametime`);
+			if (!/\btime is \d+\b/i.test(loaded.text)) throw new Error('NATURAL_SPAWN_LOADING: spawn chunk is no longer loaded');
+			const source = `execute in minecraft:overworld positioned ${origin.x + 0.5} ${origin.y} ${origin.z + 0.5}${spawn.policy === 'surface' ? ' positioned over world_surface' : ''} run `;
+			summon = await command(`${source}codex summon-configured ${scenario.provider} ${scenario.model} ${scenario.reasoningEffort} ${scenario.serviceTier ?? 'priority'} ${gameMode} ${generatedName}`);
+		} else {
+		await command('execute in minecraft:overworld run forceload add 0 0');
 		try {
 			const floor = await command('execute in minecraft:overworld run fill -8 200 -8 8 200 8 minecraft:stone');
 			if (isFailedResponse(floor.text)) throw new Error('Could not prepare the headless arena floor');
@@ -273,6 +326,7 @@ export async function runHeadlessScenario({
 			const cleanupDeadline = Math.max(deadline, Number(now()) + 10_000);
 			await command('execute in minecraft:overworld run forceload remove 0 0', { deadlineMs: cleanupDeadline });
 		}
+		}
 		if (isSkippedResponse(summon.text)) classification = 'SKIPPED_PROFILE';
 		if (classification === null && isFailedResponse(summon.text)) {
 			classification = 'ERROR';
@@ -286,6 +340,11 @@ export async function runHeadlessScenario({
 		if (classification === null) {
 			if (isPendingJoinResponse(summon.text)) {
 				await waitForAgentReady({ generatedName, command, poll, deadline, now, startedAt });
+			}
+			if (naturalWorld !== null) {
+				spawnPosition = parsePlayerPosition((await command(`data get entity ${generatedName} Pos`, { readOnly: true })).text);
+				if (!/entity data:\s*\[\s*\]\s*$/i.test((await command(`data get entity ${generatedName} Inventory`, { readOnly: true })).text)) throw new Error('NATURAL_INVENTORY: newly spawned evaluation player must have an empty inventory');
+				await releaseSpawnTicket();
 			}
 			const start = await command(`codex start ${generatedName} ${scenario.task}`, { attempt: 0 });
 			if (isFailedResponse(start.text)) {
@@ -323,16 +382,25 @@ export async function runHeadlessScenario({
 		const evidenceResult = await collectHeadlessEvidence({
 			directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets, protocolAuditOffset, assertions, terminalState, rconEvidence,
 			readOnlyCommand: (value) => command(value, { readOnly: true, attempt: 0 }),
-			deadline, now, startedAt, poll, scenario, generatedName, waitForEvidence: classification === null,
+			deadline, now, startedAt, poll, scenario, generatedName, spawnPosition, waitForEvidence: classification === null,
 		});
 		const { scopedEvidence, scopedAudit, identity, assertionResult } = evidenceResult;
+		const attestation = summarizeProviderAttestation([...(scopedEvidence.providerTurnSummaries ?? []), ...(scopedEvidence.traceRows ?? [])].map((row) => ({ executionSettings: safeExecutionSettings(row.executionSettings) })), profile);
 		const factualAssertions = assertions.filter((assertion) => assertion.type === 'rcon');
 		const factualSuccess = factualAssertions.length > 0
 			&& assertionResult.results.filter((result) => result.type === 'rcon').every((result) => result.passed);
 		const resolvedAgentId = identity.agentId;
 		if (identity.error !== null && classification === null) {
-			classification = 'ERROR';
+			classification = naturalWorld !== null ? 'PROFILE_MISMATCH' : 'ERROR';
 			diagnostics = identity.error;
+		}
+		if (naturalWorld !== null && !identity.authoritative && classification === null) {
+			classification = 'PROFILE_MISMATCH';
+			diagnostics = 'Natural evaluation requires an authoritative snapshot with the exact requested model settings';
+		}
+		if (naturalWorld !== null && attestation.mismatches.length > 0 && classification === null) {
+			classification = 'PROFILE_MISMATCH';
+			diagnostics = `Provider response reported different ${attestation.mismatches.join(', ')} settings`;
 		}
 		if (classification === null && !assertionResult.passed) classification = 'ASSERTION_MISMATCH';
 		if (classification === null && scenario.requireFactualSuccess && !factualSuccess) classification = 'FAILED_USER_OBJECTIVE';
@@ -341,6 +409,7 @@ export async function runHeadlessScenario({
 		const elapsedMs = Math.max(0, Number(now()) - startedAt);
 		const report = scenarioReport(status, scenario, {
 			classification, generatedName, lifecycle: terminalState, elapsedMs,
+			...(naturalWorld === null ? {} : { world: { ...naturalWorld, spawnPosition }, settings: { requested: { ...profile }, configured: identity.effectiveProfile ?? null, configuredVerified: identity.authoritative, effective: attestation.effective, evidence: attestation.evidence }, budget: { wallClockMs: timeoutMs }, observationMode: 'text_only' }),
 			commands, assertions: assertionResult.results, factualSuccess, evidence: evidenceSummary(directory, scopedEvidence, scopedAudit),
 			timings: timingSummary(profile, scopedEvidence, scopedAudit, elapsedMs),
 			metrics: performanceMetrics(profile, scopedEvidence, scopedAudit, resolvedAgentId, { minecraftMspt }),
@@ -348,6 +417,7 @@ export async function runHeadlessScenario({
 			cleanup: { status: 'PENDING' },
 		});
 		try {
+			await releaseSpawnTicket();
 			if (summoned) {
 				const cleanupDeadline = Math.max(deadline, Number(now()) + 10_000);
 				const removal = await command(`codex remove ${generatedName}`, { deadlineMs: cleanupDeadline });
@@ -364,6 +434,7 @@ export async function runHeadlessScenario({
 	} catch (error) {
 		diagnostics = boundedText(error?.message ?? error, MAX_DIAGNOSTICS);
 		let cleanupError = null;
+		try { await releaseSpawnTicket(); } catch (errorDuringRelease) { cleanupError = errorDuringRelease; }
 		if (summoned) {
 			try {
 				const cleanupDeadline = Math.max(deadline, Number(now()) + 10_000);
@@ -378,6 +449,7 @@ export async function runHeadlessScenario({
 		const status = failureClassification === 'SKIPPED_PROFILE' ? 'SKIPPED' : 'FAILED';
 		const report = scenarioReport(status, scenario, {
 			classification: failureClassification, diagnostics: cleanupError === null ? diagnostics : boundedText(cleanupError?.message ?? cleanupError, MAX_DIAGNOSTICS),
+			...(naturalWorld === null ? {} : { world: { ...naturalWorld, spawnPosition } }),
 			generatedName, commands, cleanup: cleanupError === null ? { status: 'CLEAN' } : { status: 'FAILED', diagnostics: cleanupError?.message ?? String(cleanupError) },
 		});
 		return await persistReportOrFailure(scenario, report, directory, writeFile);
@@ -613,15 +685,16 @@ export async function writeHeadlessReport(runDirectory, report, writeFile = defa
 	await writeFile(path.join(directory, 'report.json'), `${JSON.stringify(bounded, null, 2)}\n`, { encoding: 'utf8' });
 }
 
-const HEADLESS_CLI_USAGE = 'Usage: node src/headless-matrix.mjs --config <absolute-path> --run-directory <absolute-path> --rcon-host <host> --rcon-port <port> --rcon-password-file <absolute-path> [--scenario <id>] [--protocol-audit <absolute-path>] [--provider-turns <absolute-path>] [--require-all]';
+const HEADLESS_CLI_USAGE = 'Usage: node src/headless-matrix.mjs --config <absolute-path> --run-directory <absolute-path> --rcon-host <host> --rcon-port <port> --rcon-password-file <absolute-path> [--scenario <id>] [--protocol-audit <absolute-path>] [--provider-turns <absolute-path>] [--world-manifest <absolute-path>] [--require-all]';
 
 export function parseHeadlessCliArguments(args) {
 	if (!Array.isArray(args)) throw new TypeError('CLI arguments must be an array');
-	const result = { configPath: null, scenarioId: null, runDirectory: null, rconHost: '127.0.0.1', rconPort: null, rconPasswordFile: null, protocolAuditPath: null, providerTurnsPath: null, requireAll: false };
+	const result = { configPath: null, scenarioId: null, runDirectory: null, rconHost: '127.0.0.1', rconPort: null, rconPasswordFile: null, protocolAuditPath: null, providerTurnsPath: null, worldManifestPath: null, requireAll: false };
 	const valueFlags = new Map([
 		['--config', 'configPath'], ['--scenario', 'scenarioId'], ['--run-directory', 'runDirectory'],
 		['--rcon-host', 'rconHost'], ['--rcon-port', 'rconPort'], ['--rcon-password-file', 'rconPasswordFile'],
 		['--protocol-audit', 'protocolAuditPath'], ['--provider-turns', 'providerTurnsPath'],
+		['--world-manifest', 'worldManifestPath'],
 	]);
 	for (let index = 0; index < args.length; index += 1) {
 		const flag = args[index];
@@ -635,7 +708,7 @@ export function parseHeadlessCliArguments(args) {
 	for (const key of ['configPath', 'runDirectory', 'rconPasswordFile']) {
 		if (typeof result[key] !== 'string' || !path.isAbsolute(result[key])) throw new Error(`${key} must be an absolute path\n${HEADLESS_CLI_USAGE}`);
 	}
-	for (const key of ['protocolAuditPath', 'providerTurnsPath']) {
+	for (const key of ['protocolAuditPath', 'providerTurnsPath', 'worldManifestPath']) {
 		if (result[key] !== null && !path.isAbsolute(result[key])) throw new Error(`${key} must be an absolute path`);
 	}
 	if (!Number.isInteger(result.rconPort) || result.rconPort < 1 || result.rconPort > 65535) throw new Error(`rconPort must be a valid port\n${HEADLESS_CLI_USAGE}`);
@@ -656,7 +729,7 @@ export function formatHeadlessCliOutput(report) {
 
 export async function runHeadlessMatrix({
 	configPath, scenarioId = null, runDirectory, rconHost = '127.0.0.1', rconPort, rconPasswordFile,
-	protocolAuditPath = null, providerTurnsPath = null, requireAll = false,
+	protocolAuditPath = null, providerTurnsPath = null, worldManifestPath = null, requireAll = false,
 	readFile = defaultReadFile, writeFile = defaultWriteFile, mkdir = defaultMkdir,
 	readTail = null, fileSize = defaultFileSize,
 	rconFactory = (options) => new HeadlessRconClient(options),
@@ -665,6 +738,13 @@ export async function runHeadlessMatrix({
 	const matrix = normalizeHeadlessMatrix(JSON.parse(await readFile(configPath, 'utf8')));
 	const scenarios = selectHeadlessScenarios(matrix, scenarioId);
 	if (scenarios.length > MAX_SCENARIOS) throw new RangeError(`selected scenario count exceeds bounded maximum of ${MAX_SCENARIOS}`);
+	let worldManifest = null;
+	if (scenarios.some((scenario) => scenario.world.mode === 'natural')) {
+		if (scenarios.length !== 1 || worldManifestPath === null) throw new Error('Natural evaluations require one scenario per isolated server and --world-manifest from the launcher');
+		worldManifest = JSON.parse(await readFile(worldManifestPath, 'utf8'));
+		validateNaturalWorldManifest(worldManifest, scenarios[0].world, scenarios[0].id);
+		await claimNaturalWorld(worldManifestPath, worldManifest.worldId);
+	}
 	const password = String(await readFile(rconPasswordFile, 'utf8')).trim();
 	if (password.length === 0) throw new Error('RCON password file is empty');
 	const runId = path.basename(path.resolve(runDirectory));
@@ -688,6 +768,7 @@ export async function runHeadlessMatrix({
 				writeFile,
 				protocolAudit: protocolAuditPath,
 				providerTurnsPath,
+				worldManifest,
 			});
 			scenarioReports.push(scenario.repetitions === 1 ? report : { ...report, repetition });
 		} catch (error) {
@@ -798,8 +879,8 @@ function makeEvidence({ terminalState, protocolAudit, protocolRows = [], traceRo
 	return { lifecycle: terminalState, terminalState, chats, actions, program, rcon };
 }
 
-async function collectHeadlessEvidence({ directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets, protocolAuditOffset, assertions, terminalState, rconEvidence, readOnlyCommand, deadline, now, startedAt, poll, scenario, generatedName, waitForEvidence = true }) {
-	const resolvedAssertions = resolveAgentAssertions(assertions, generatedName);
+async function collectHeadlessEvidence({ directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets, protocolAuditOffset, assertions, terminalState, rconEvidence, readOnlyCommand, deadline, now, startedAt, poll, scenario, generatedName, spawnPosition = null, waitForEvidence = true }) {
+	const resolvedAssertions = resolveAgentAssertions(assertions, generatedName, spawnPosition);
 	for (const assertion of resolvedAssertions) {
 		if (assertion.type !== 'rcon' || logicalNow(now, startedAt, 0) >= deadline) continue;
 		try { await withDeadline(() => readOnlyCommand(assertion.command), deadline, () => logicalNow(now, startedAt, 0), 'HEADLESS_TIMEOUT'); }
@@ -906,10 +987,17 @@ function resolveExactSnapshotAgentId(fileEvidence, protocolAudit, scenario, gene
 		&& row.payload?.provider === scenario.provider && row.payload?.model === scenario.model
 		&& row.payload?.reasoningEffort === scenario.reasoningEffort && row.payload?.serviceTier === scenario.serviceTier)
 		.map(authoritativeAgentId).filter(Boolean))];
-	if (ids.length === 1) return { agentId: ids[0], authoritative: true, legacy: false, error: null };
+	const matchingNames = snapshots.filter((row) => row.payload?.name === generatedName);
+	const actualProfile = matchingNames.at(-1)?.payload;
+	const effectiveProfile = actualProfile ? Object.fromEntries(['provider', 'model', 'reasoningEffort', 'serviceTier'].map((field) => [field, boundedScalar(actualProfile[field])])) : null;
+	if (scenario.world?.mode === 'natural' && matchingNames.some((row) => ['provider', 'model', 'reasoningEffort', 'serviceTier'].some((field) => row.payload?.[field] !== scenario[field]))) {
+		return { agentId: null, authoritative: false, legacy: false, effectiveProfile, error: 'Authoritative snapshots did not preserve the exact requested model settings throughout the evaluation' };
+	}
+	if (ids.length === 1) return { agentId: ids[0], authoritative: true, legacy: false, error: null, effectiveProfile };
 	return {
 		agentId: null,
 		authoritative: false, legacy: false,
+		effectiveProfile,
 		error: ids.length > 1 ? 'Authoritative agent snapshot identity was ambiguous' : 'Authoritative agent snapshot identity was unavailable for the exact requested profile',
 	};
 }
@@ -1240,7 +1328,16 @@ function providerTurnSummary(row) {
 	if (row.rateLimited !== undefined) summary.rateLimited = row.rateLimited === true;
 	if (row.compaction !== undefined) summary.compaction = row.compaction === true;
 	if (row.error && typeof row.error === 'object' && !Array.isArray(row.error)) summary.error = safeProviderError(row.error);
+	if (row.executionSettings !== undefined) summary.executionSettings = safeExecutionSettings(row.executionSettings);
 	return summary;
+}
+
+function safeExecutionSettings(value) {
+	if (!value || typeof value !== 'object' || !value.effective || !value.evidence) return null;
+	return {
+		effective: Object.fromEntries(['provider', 'model', 'reasoningEffort', 'serviceTier', 'thinkingMode'].map((key) => [key, boundedScalar(value.effective[key])])),
+		evidence: Object.fromEntries(['model', 'reasoningEffort', 'serviceTier'].map((key) => [key, ['provider_reported', 'submitted', 'process_environment', 'launch_argument', 'not_supported', 'unreported'].includes(value.evidence[key]) ? value.evidence[key] : null])),
+	};
 }
 
 const PROVIDER_ERROR_CATEGORIES = new Set(['decision_parse', 'rate_limit', 'timeout', 'cancelled', 'transport', 'provider']);
@@ -1312,9 +1409,12 @@ function generatedAgentName(scenario, timestamp, rosterIndex = null) {
 	return `ha_${id}_${clockSuffix}${rosterSuffix}`;
 }
 
-function resolveAgentAssertions(assertions, generatedName) {
+function resolveAgentAssertions(assertions, generatedName, spawnPosition = null) {
 	return assertions.map((assertion) => assertion.type === 'rcon'
-		? { ...assertion, command: assertion.command.replaceAll('{agent}', generatedName) }
+		? { ...assertion, command: assertion.command.replaceAll('{agent}', generatedName).replace(/\{spawn([XYZ])\}/g, (_, axis) => {
+			if (spawnPosition === null) throw new Error('Spawn-relative assertions require natural-world authoritative spawn evidence');
+			return String(spawnPosition[axis.toLowerCase()]);
+		}) }
 		: assertion);
 }
 
@@ -1367,17 +1467,21 @@ function isReadOnlyRcon(value) {
 	const source = String(value ?? '');
 	if (/[\u0000-\u001f\u007f;&|`]/.test(source)) return false;
 	const command = source.trim().replace(/^\/+/, '').replace(/\s+/g, ' ');
-	return /^(?:list(?:\s+.*)?|seed|difficulty|data\s+get(?:\s+.*)?|time\s+query\s+(?:day|daytime|gametime)|weather\s+query|gamerule\s+[A-Za-z0-9_.-]+)$/.test(command)
-		|| /^execute if block -?\d+ -?\d+ -?\d+ [a-z0-9_.-]+:[a-z0-9_./-]+ run data get entity [A-Za-z0-9_.-]{1,64}(?: [A-Za-z0-9_.\[\]-]{1,128})?$/.test(command);
+	return /^(?:list(?:\s+.*)?|seed|difficulty|data\s+get(?:\s+.*)?|time\s+query\s+(?:day|daytime|gametime)|weather\s+query|gamerule\s+[A-Za-z0-9_:.-]+)$/.test(command)
+		|| /^execute if block -?\d+ -?\d+ -?\d+ [a-z0-9_.-]+:[a-z0-9_./-]+ run data get entity [A-Za-z0-9_.-]{1,64}(?: [A-Za-z0-9_.\[\]-]{1,128})?$/.test(command)
+		|| /^execute if items entity [A-Za-z0-9_]{1,16} (?:(?:inventory|container)\.\*|weapon\.(?:mainhand|offhand)|armor\.\*) #?[a-z0-9_.-]+:[a-z0-9_./-]+ run data get entity [A-Za-z0-9_]{1,16} (?:Pos|Inventory)$/.test(command)
+		|| /^execute if entity @a\[name=[A-Za-z0-9_]{1,16},advancements=\{[a-z0-9_.-]+:[a-z0-9_./-]+=true\}\] run data get entity [A-Za-z0-9_]{1,16} Pos$/.test(command)
+		|| /^execute positioned -?\d+(?:\.\d+)? -?\d+(?:\.\d+)? -?\d+(?:\.\d+)? if entity @a\[name=[A-Za-z0-9_]{1,16},distance=\d+(?:\.\d+)?\.\.\] run data get entity [A-Za-z0-9_]{1,16} Pos$/.test(command);
 }
 function validateRunnerScenario(scenario, assertions) {
 	for (const field of ['id', 'provider', 'model', 'reasoningEffort', 'serviceTier', 'task']) {
 		const value = scenario[field];
 		if (typeof value !== 'string' || value.trim() === '' || value.length > MAX_TEXT || /[\u0000-\u001f\u007f]/.test(value)) throw new TypeError(`scenario.${field} must be bounded text without control characters`);
 	}
-	if (!Number.isSafeInteger(scenario.timeoutMs) || scenario.timeoutMs <= 0 || scenario.timeoutMs > MAX_TIMEOUT_MS) throw new RangeError('scenario.timeoutMs is out of bounds');
+	if (!Number.isSafeInteger(scenario.timeoutMs) || scenario.timeoutMs <= 0 || scenario.timeoutMs > (scenario.world?.mode === 'natural' ? MAX_NATURAL_TIMEOUT_MS : MAX_TIMEOUT_MS)) throw new RangeError('scenario.timeoutMs is out of bounds');
 	if (![1, 8, 16].includes(scenario.rosterSize ?? 1)) throw new RangeError('scenario.rosterSize is out of bounds');
 	if (!Array.isArray(assertions) || assertions.length === 0) throw new TypeError('scenario requires assertions');
+	if (scenario.world?.mode === 'natural' && ((scenario.rosterSize ?? 1) !== 1 || (scenario.repetitions ?? 1) !== 1 || (scenario.setupBlocks ?? []).length > 0 || !scenario.requireFactualSuccess || !assertions.some((assertion) => assertion.type === 'rcon'))) throw new TypeError('natural evaluations require one agent, one fresh world, no planted blocks, and factual assertions');
 }
 function boundedPositiveInteger(value, field) {
 	if (!Number.isSafeInteger(value) || value < 1) throw new RangeError(`${field} must be a positive safe integer`);

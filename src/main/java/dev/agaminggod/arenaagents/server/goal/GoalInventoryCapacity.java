@@ -5,9 +5,11 @@ import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
 import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import net.minecraft.core.Registry;
 import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.component.DataComponents;
@@ -33,9 +35,9 @@ public final class GoalInventoryCapacity {
 	public static boolean exceeds(GoalPredicate predicate, RegistryAccess registries) {
 		Objects.requireNonNull(predicate, "predicate must not be null");
 		Objects.requireNonNull(registries, "registries must not be null");
-		List<Map<String, Integer>> alternatives = requirementAlternatives(predicate);
+		List<Requirements> alternatives = requirementAlternatives(predicate);
 		Map<String, ItemCapacity> capacities = resolveCapacities(alternatives, registries);
-		return alternatives.stream().noneMatch(requirements -> fits(requirements, capacities));
+		return alternatives.stream().noneMatch(requirements -> possiblyFits(requirements, capacities));
 	}
 
 	public static void validateTranslated(GoalPredicate predicate, RegistryAccess registries) {
@@ -47,21 +49,22 @@ public final class GoalInventoryCapacity {
 		}
 	}
 
-	private static List<Map<String, Integer>> requirementAlternatives(GoalPredicate predicate) {
+	private static List<Requirements> requirementAlternatives(GoalPredicate predicate) {
 		return switch (predicate) {
-			case GoalPredicate.InventoryContains value -> List.of(Map.of(value.itemId(), value.count()));
+			case GoalPredicate.InventoryContains value -> List.of(new Requirements(Map.of(value.itemId(), value.count()), List.of()));
+			case GoalPredicate.InventoryContainsAny value -> List.of(new Requirements(Map.of(), List.of(value)));
 			case GoalPredicate.AllOf value -> combineAll(value.predicates());
 			case GoalPredicate.AnyOf value -> combineAlternatives(value.predicates());
-			default -> List.of(Map.of());
+			default -> List.of(new Requirements(Map.of(), List.of()));
 		};
 	}
 
-	private static List<Map<String, Integer>> combineAll(Iterable<GoalPredicate> predicates) {
-		List<Map<String, Integer>> combined = List.of(Map.of());
+	private static List<Requirements> combineAll(Iterable<GoalPredicate> predicates) {
+		List<Requirements> combined = List.of(new Requirements(Map.of(), List.of()));
 		for (GoalPredicate predicate : predicates) {
-			ArrayList<Map<String, Integer>> next = new ArrayList<>();
-			for (Map<String, Integer> existing : combined) {
-				for (Map<String, Integer> addition : requirementAlternatives(predicate)) {
+			ArrayList<Requirements> next = new ArrayList<>();
+			for (Requirements existing : combined) {
+				for (Requirements addition : requirementAlternatives(predicate)) {
 					next.add(merge(existing, addition));
 				}
 			}
@@ -70,32 +73,36 @@ public final class GoalInventoryCapacity {
 		return combined;
 	}
 
-	private static List<Map<String, Integer>> combineAlternatives(Iterable<GoalPredicate> predicates) {
-		ArrayList<Map<String, Integer>> alternatives = new ArrayList<>();
+	private static List<Requirements> combineAlternatives(Iterable<GoalPredicate> predicates) {
+		ArrayList<Requirements> alternatives = new ArrayList<>();
 		for (GoalPredicate predicate : predicates) {
 			alternatives.addAll(requirementAlternatives(predicate));
 		}
 		return List.copyOf(alternatives);
 	}
 
-	private static Map<String, Integer> merge(Map<String, Integer> first, Map<String, Integer> second) {
-		HashMap<String, Integer> combined = new HashMap<>(first);
+	private static Requirements merge(Requirements first, Requirements second) {
+		HashMap<String, Integer> combined = new HashMap<>(first.fixed());
 		try {
-			second.forEach((itemId, count) -> combined.merge(itemId, count, Math::addExact));
+			second.fixed().forEach((itemId, count) -> combined.merge(itemId, count, Math::addExact));
 		} catch (ArithmeticException exception) {
 			throw new AgentDomainException("INVALID_GOAL_PREDICATE", "Combined inventory count is outside the supported range");
 		}
-		return Map.copyOf(combined);
+		ArrayList<GoalPredicate.InventoryContainsAny> categories = new ArrayList<>(first.categories());
+		categories.addAll(second.categories());
+		return new Requirements(Map.copyOf(combined), List.copyOf(categories));
 	}
 
 	private static Map<String, ItemCapacity> resolveCapacities(
-			Iterable<Map<String, Integer>> alternatives,
+			Iterable<Requirements> alternatives,
 			RegistryAccess registries
 	) {
 		Registry<Item> itemRegistry = registries.lookup(Registries.ITEM).orElse(BuiltInRegistries.ITEM);
 		HashMap<String, ItemCapacity> capacities = new HashMap<>();
-		for (Map<String, Integer> requirements : alternatives) {
-			for (String itemId : requirements.keySet()) {
+		for (Requirements requirements : alternatives) {
+			HashSet<String> itemIds = new HashSet<>(requirements.fixed().keySet());
+			for (GoalPredicate.InventoryContainsAny category : requirements.categories()) itemIds.addAll(category.itemIds());
+			for (String itemId : itemIds) {
 				capacities.computeIfAbsent(itemId, ignored -> resolveCapacity(itemId, itemRegistry));
 			}
 		}
@@ -125,8 +132,61 @@ public final class GoalInventoryCapacity {
 		return new ItemCapacity(maxStackSize, offhandCapacity, equipmentSlot, equipmentCapacity);
 	}
 
-	private static boolean fits(Map<String, Integer> requirements, Map<String, ItemCapacity> capacities) {
+	private static boolean possiblyFits(Requirements requirements, Map<String, ItemCapacity> capacities) {
+		if (minimumGeneralSlots(requirements.fixed(), capacities) > Inventory.INVENTORY_SIZE) return false;
+		if (requirements.categories().isEmpty()) return true;
+		ArrayList<RequirementGroup> groups = new ArrayList<>();
+		for (GoalPredicate.InventoryContainsAny category : requirements.categories()) {
+			addGroup(groups, new RequirementGroup(new HashSet<>(category.itemIds()), new HashMap<>(), new ArrayList<>(List.of(category))));
+		}
+		requirements.fixed().forEach((itemId, count) -> addGroup(groups,
+				new RequirementGroup(new HashSet<>(Set.of(itemId)), new HashMap<>(Map.of(itemId, count)), new ArrayList<>())));
+		long lowerBound = 0L;
+		for (RequirementGroup group : groups) {
+			long slots = minimumGeneralSlots(group.fixed, capacities);
+			for (GoalPredicate.InventoryContainsAny category : group.categories) {
+				slots = Math.max(slots, categoryMinimumGeneralSlots(category, capacities));
+			}
+			lowerBound += slots;
+		}
+		// Overlapping categories may share items. Independent groups optimistically share equipment and offhand capacity.
+		return lowerBound <= Inventory.INVENTORY_SIZE;
+	}
+
+	private static void addGroup(List<RequirementGroup> groups, RequirementGroup addition) {
+		for (int index = 0; index < groups.size();) {
+			RequirementGroup existing = groups.get(index);
+			if (java.util.Collections.disjoint(existing.itemIds, addition.itemIds)) {
+				index++;
+				continue;
+			}
+			addition.itemIds.addAll(existing.itemIds);
+			addition.fixed.putAll(existing.fixed);
+			addition.categories.addAll(existing.categories);
+			groups.remove(index);
+			index = 0;
+		}
+		groups.add(addition);
+	}
+
+	private static long categoryMinimumGeneralSlots(GoalPredicate.InventoryContainsAny category, Map<String, ItemCapacity> capacities) {
+		int maxStackSize = 1;
+		int offhandCapacity = 0;
+		EnumMap<EquipmentSlot, Integer> equipment = new EnumMap<>(EquipmentSlot.class);
+		for (String itemId : category.itemIds()) {
+			ItemCapacity capacity = capacities.get(itemId);
+			maxStackSize = Math.max(maxStackSize, capacity.maxStackSize());
+			offhandCapacity = Math.max(offhandCapacity, capacity.offhandCapacity());
+			if (capacity.equipmentSlot() != null) equipment.merge(capacity.equipmentSlot(), capacity.equipmentCapacity(), Math::max);
+		}
+		long remaining = (long) category.count() - offhandCapacity;
+		for (int capacity : equipment.values()) remaining -= capacity;
+		return divideRoundUp(Math.max(0L, remaining), maxStackSize);
+	}
+
+	private static long minimumGeneralSlots(Map<String, Integer> requirements, Map<String, ItemCapacity> capacities) {
 		List<Map.Entry<String, Integer>> items = List.copyOf(requirements.entrySet());
+		long minimum = Long.MAX_VALUE;
 		for (int offhandItem = -1; offhandItem < items.size(); offhandItem++) {
 			long generalSlots = 0L;
 			EnumMap<EquipmentSlot, Long> equipmentSavings = new EnumMap<>(EquipmentSlot.class);
@@ -146,13 +206,19 @@ public final class GoalInventoryCapacity {
 				}
 			}
 			for (long saving : equipmentSavings.values()) generalSlots -= saving;
-			if (generalSlots <= Inventory.INVENTORY_SIZE) return true;
+			minimum = Math.min(minimum, generalSlots);
 		}
-		return false;
+		return minimum;
 	}
 
 	private static long divideRoundUp(long count, int stackSize) {
 		return count == 0L ? 0L : 1L + (count - 1L) / stackSize;
+	}
+
+	private record Requirements(Map<String, Integer> fixed, List<GoalPredicate.InventoryContainsAny> categories) {
+	}
+
+	private record RequirementGroup(Set<String> itemIds, Map<String, Integer> fixed, List<GoalPredicate.InventoryContainsAny> categories) {
 	}
 
 	private record ItemCapacity(

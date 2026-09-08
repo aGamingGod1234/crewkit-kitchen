@@ -14,7 +14,7 @@ public final class AgentActivityPresentation {
 
 	public static String action(ActionType type) {
 		return switch (Objects.requireNonNull(type, "type must not be null")) {
-			case CONTROL -> "Controlling player inputs";
+			case CONTROL, CONTROL_SEQUENCE -> "Controlling player inputs";
 			case MOVE_TO, NAVIGATE_TO -> "Moving to the next position";
 			case LOOK_AT -> "Looking around";
 			case ATTACK, FIGHT_TARGET -> "Engaging a target";
@@ -40,6 +40,13 @@ public final class AgentActivityPresentation {
 			case INTERACT_ENTITY -> "Interacting with an entity";
 			case DISMOUNT -> "Dismounting";
 			case START_FALL_FLYING -> "Starting elytra flight";
+			case SET_FLIGHT -> "Changing flight controls";
+			case WAKE_UP -> "Waking up";
+			case WRITE_SIGN -> "Writing a sign";
+			case EDIT_BOOK -> "Writing a book";
+			case MENU_CLICK -> "Using a menu";
+			case MENU_CLOSE -> "Closing a menu";
+			case BEACON_EFFECTS -> "Selecting beacon effects";
 			case MENU_TRANSFER -> "Moving items in a menu";
 			case MENU_BUTTON -> "Selecting a menu option";
 			case ANVIL_RENAME -> "Naming an item";

@@ -108,6 +108,7 @@ export function createNativeGoalHarness(scenario = {}) {
 		if (normalized.pauseAfterTurn === turn) bridge.pause();
 	};
 	const coordinator = createDynamicCoordinator(nativeConfig(), {
+		memoryDirectory: null,
 		bridge,
 		registry,
 		providerService: provider,

@@ -15,7 +15,6 @@ import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemRuntime;
 import dev.agaminggod.arenaagents.server.voice.VoiceConsentRegistry;
 import dev.agaminggod.arenaagents.server.voice.VoiceDirector;
 import dev.agaminggod.arenaagents.server.goal.GoalVerificationRuntime;
-import dev.agaminggod.arenaagents.server.goal.GoalSafetyController;
 import dev.agaminggod.arenaagents.server.goal.GoalSubmission;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationCollector;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
@@ -57,7 +56,6 @@ public final class CodexAgentServerRuntime {
 	private static final Map<MinecraftServer, VoiceInitializationGate> VOICE_GATES = new ConcurrentHashMap<>();
 	private static final Map<MinecraftServer, Map<String, Long>> PLANNING_UPDATES = new ConcurrentHashMap<>();
 	private static final Map<MinecraftServer, GoalVerificationRuntime> GOAL_VERIFIERS = new ConcurrentHashMap<>();
-	private static final Map<MinecraftServer, GoalSafetyController> GOAL_SAFETY = new ConcurrentHashMap<>();
 	private static final java.util.Set<MinecraftServer> RESTORED_SERVERS = ConcurrentHashMap.newKeySet();
 	private static final long PLANNING_UPDATE_INTERVAL_MS = 30_000L;
 	private static final long COORDINATOR_STATUS_MAXIMUM_AGE_MS = 2_500L;
@@ -140,7 +138,6 @@ public final class CodexAgentServerRuntime {
 				supervisor = previous;
 			}
 		}
-		GOAL_SAFETY.computeIfAbsent(server, ignored -> new GoalSafetyController(manager));
 		GoalVerificationRuntime goalVerifier = GOAL_VERIFIERS.computeIfAbsent(server, ignored -> new GoalVerificationRuntime(
 				manager.registry(),
 				agentId -> manager.findAgentPlayer(agentId).map(dev.agaminggod.arenaagents.server.runtime.GoalCompletionVerifier::minecraftFacts),
@@ -316,8 +313,6 @@ public final class CodexAgentServerRuntime {
 			tryStartBridge(server, manager, supervisor);
 			bridge = bridge(server);
 			reconcileVoice(server, supervisor);
-		GoalSafetyController safety = GOAL_SAFETY.get(server);
-		if (safety != null) safety.tick();
 		}
 		MultiplexedServerBridge activeBridge = bridge;
 		boolean restored = ScenarioRuntimeService.restorePersistedState(server);
@@ -547,11 +542,9 @@ public final class CodexAgentServerRuntime {
 		GOAL_VERIFIERS.remove(server);
 		VOICE_GATES.remove(server);
 		RESTORED_SERVERS.remove(server);
-		GoalSafetyController safety = GOAL_SAFETY.remove(server);
 		CoordinatorProcessSupervisor supervisor = COORDINATORS.remove(server);
 		BridgeSlot bridgeSlot = BRIDGE_SLOTS.remove(server);
 		try {
-			if (safety != null) safety.close();
 			VoiceDirector.release(server);
 			VoiceSubsystemRuntime.close(server);
 			VoiceConsentRegistry.clear(server);

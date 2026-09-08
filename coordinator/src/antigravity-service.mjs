@@ -65,6 +65,9 @@ export class AntigravityProviderService {
 	}
 
 	async start() {}
+	get availability() {
+		return { playable: this.#plannerEnabled, reasonCode: this.#plannerEnabled ? null : 'PROVIDER_UNAVAILABLE', reason: this.#plannerEnabled ? null : unavailablePlannerMessage() };
+	}
 	get agentIds() { return [...this.#agents.keys()]; }
 	getAgent(agentId) { return this.#agents.get(agentId) ?? null; }
 
@@ -571,7 +574,7 @@ class AntigravityCatalog {
 	async refresh({ force = false } = {}) {
 		if (!this.#dependencies.plannerEnabled) {
 			this.stale = false;
-			return { provider: 'gemini', refreshedAtEpochMs: Date.now(), models: [] };
+			return { provider: 'gemini', refreshedAtEpochMs: Date.now(), models: [], availability: { playable: false, reasonCode: 'PROVIDER_UNAVAILABLE', reason: unavailablePlannerMessage() } };
 		}
 		if (!force && !this.stale && this.#snapshot !== null) return structuredClone(this.#snapshot);
 		if (this.#refreshPromise !== null) return structuredClone(await this.#refreshPromise);

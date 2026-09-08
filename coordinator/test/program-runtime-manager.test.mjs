@@ -66,11 +66,146 @@ function harness(options = {}) {
 		completionRetryLimit: options.completionRetryLimit,
 		setTimeoutFn: options.setTimeoutFn,
 		clearTimeoutFn: options.clearTimeoutFn,
+		inspectObservation: options.inspectObservation,
+		memoryOperation: options.memoryOperation,
+		sessionId: options.sessionId,
 	});
 	const installDecision = manager.installDecision.bind(manager);
 	manager.installDecision = (target, decision, context) => installDecision(target, withCompletionContract(decision, target.goalRevision), context);
 	return { manager, registry, sent, requests, completionRequests, errors };
 }
+
+test('inspection uses the injected read-only broker and returns exact menu state to model-authored actions', async () => {
+	const inspected = [];
+	const run = harness({ inspectObservation: async (record, query) => {
+		inspected.push({ record, query });
+		return { state: 'SUCCEEDED', reasonCode: 'INSPECTED', menu: { menuId: 'minecraft:generic_9x3', containerId: 4, stateId: 8 } };
+	} });
+	await run.manager.installDecision(run.registry.get('agent-a'), { directive: 'replace', source: `
+		program.onUnhandledAttention("continue_and_notify");
+		const page = await world.inspect({ section: "menu", offset: 0, limit: 16 });
+		await player.menuClose({ menuId: page.menu.menuId, containerId: page.menu.containerId, stateId: page.menu.stateId });
+	` }, { observation: observation(), eventSequence: 1 });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(inspected.length, 1);
+	assert.equal(inspected[0].record.provider, 'codex');
+	assert.deepEqual({ ...inspected[0].query }, { section: 'menu', offset: 0, limit: 16 });
+	assert.equal(actionCommands(run.sent).length, 1);
+	assert.equal(actionCommands(run.sent)[0].payload.actionType, 'menu_close');
+	assert.equal(actionCommands(run.sent)[0].payload.arguments.stateId, 8);
+	assert.deepEqual(run.errors, []);
+});
+
+test('failed and disposed inspection requests never synthesize fallback actions', async () => {
+	const run = harness({ inspectObservation: async () => { throw Object.assign(new Error('unavailable'), { code: 'INSPECTION_TIMEOUT' }); } });
+	await run.manager.installDecision(run.registry.get('agent-a'), { directive: 'replace', source: `
+		program.onUnhandledAttention("continue_and_notify");
+		const result = await world.inspect({ section: "inventory" });
+		if (result.state === "FAILED") program.checkpoint(result.reasonCode);
+		await player.wait(1);
+	` }, { observation: observation(), eventSequence: 1 });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(actionCommands(run.sent).length, 0);
+	let release;
+	const disposed = harness({ inspectObservation: () => new Promise((resolve) => { release = resolve; }) });
+	await disposed.manager.installDecision(disposed.registry.get('agent-a'), { directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await world.inspect({ section: "inventory" }); await player.wait(1);' }, { observation: observation(), eventSequence: 1 });
+	disposed.manager.dispose('agent-a');
+	release({ state: 'SUCCEEDED', entries: [] });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(actionCommands(disposed.sent).length, 0);
+	assert.equal(disposed.sent.some((message) => message.type === 'action_cancel'), false);
+});
+
+test('focused entity inspection retains its causal target authority while newer compact observations arrive', async () => {
+	const uuid = '11111111-1111-1111-1111-111111111111';
+	let release;
+	const run = harness({ inspectObservation: () => new Promise((resolve) => { release = resolve; }) });
+	await run.manager.installDecision(run.registry.get('agent-a'), { directive: 'replace', source: `
+		program.onUnhandledAttention("continue_and_notify");
+		const page = await world.inspect({ section: "entities", offset: 16, limit: 16 });
+		let target = null;
+		for (const candidate of page.entries) target = candidate;
+		await player.attack({ targetId: target.uuid, timeoutMs: 1000 });
+	` }, { observation: observation(), eventSequence: 1 });
+	await run.manager.onObservation(run.registry.get('agent-a'), { observation: observation(), eventSequence: 3 });
+	release({ section: 'entities', state: 'SUCCEEDED', reasonCode: 'INSPECTED', eventSequence: 2, entries: [{ uuid, type: 'minecraft:zombie' }] });
+	await new Promise((resolve) => setImmediate(resolve));
+	const action = actionCommands(run.sent)[0];
+	assert.equal(action.payload.arguments.targetId, uuid);
+	assert.equal(action.payload.provenance.eventSequence, 2);
+	assert.equal(action.payload.provenance.provider, 'codex');
+	assert.match(action.payload.provenance.sourceStepId, /^step-/);
+	assert.deepEqual(run.errors, []);
+});
+
+test('wire action ids are bounded and unique across fresh coordinator runtimes', async () => {
+	const first = harness(), second = harness();
+	for (const run of [first, second]) await run.manager.installDecision(run.registry.get('agent-a'), { directive: 'replace', source: SOURCE }, { observation: observation(), eventSequence: 1 });
+	const one = actionCommands(first.sent)[0].payload.actionId;
+	const two = actionCommands(second.sent)[0].payload.actionId;
+	assert.notEqual(one, two);
+	assert.match(one, /^program:[a-f0-9-]{36}:[a-f0-9]{64}$/);
+	assert.ok(one.length <= 256);
+	const replayOne = harness({ sessionId: 'synthetic-replay-1' });
+	const replayTwo = harness({ sessionId: 'synthetic-replay-1' });
+	for (const run of [replayOne, replayTwo]) await run.manager.installDecision(run.registry.get('agent-a'), { directive: 'replace', source: SOURCE }, { observation: observation(), eventSequence: 1 });
+	assert.equal(actionCommands(replayOne.sent)[0].payload.actionId, actionCommands(replayTwo.sent)[0].payload.actionId);
+	assert.throws(() => harness({ sessionId: 'unsafe id' }), /sessionId/);
+});
+
+test('model notebook calls share bounded validation and carry the exact author without changing world state', async () => {
+	const calls = [];
+	const run = harness({ memoryOperation: async (record, request) => {
+		calls.push({ record, request });
+		return request.operation === 'write' ? { state: 'SUCCEEDED', reasonCode: 'NOTE_SAVED' }
+			: { state: 'SUCCEEDED', entries: [{ source: 'model_authored', key: 'observation-plan', text: 'Inspect the nearby container.' }] };
+	} });
+	await run.manager.installDecision(run.registry.get('agent-a'), { directive: 'replace', source: `
+		program.onUnhandledAttention("continue_and_notify");
+		await world.remember({ key: "observation-plan", text: "Inspect the nearby container." });
+		const saved = await world.queryMemory({ kind: "notes", limit: 4, offset: 8 });
+		if (saved.entries.length > 0) program.checkpoint("notes available");
+	` }, { observation: observation(), eventSequence: 1 });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(calls.length, 2);
+	assert.equal(calls[0].request.operation, 'write');
+	assert.deepEqual(calls[0].request.arguments, { key: 'observation-plan', text: 'Inspect the nearby container.' });
+	assert.equal(calls[0].request.provenance.model, 'gpt-5.6-sol');
+	assert.equal(calls[0].request.provenance.provider, 'codex');
+	assert.equal(calls[0].request.provenance.goalRevision, 1);
+	assert.match(calls[0].request.provenance.sourceStepId, /^step-/);
+	assert.equal(calls[1].request.arguments.kind, 'notes');
+	assert.equal(calls[1].request.arguments.offset, 8);
+	assert.equal(actionCommands(run.sent).length, 0);
+	assert.deepEqual(run.errors, []);
+});
+
+test('invalid memory requests return factual errors before entering the notebook', async () => {
+	let calls = 0;
+	const run = harness({ memoryOperation: async () => { calls += 1; return { state: 'SUCCEEDED' }; } });
+	await run.manager.installDecision(run.registry.get('agent-a'), { directive: 'replace', source: `
+		program.onUnhandledAttention("continue_and_notify");
+		const result = await world.queryMemory({ kind: "hidden-world", limit: 1000 });
+		if (result.state === "FAILED") program.checkpoint(result.reasonCode);
+	` }, { observation: observation(), eventSequence: 1 });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(calls, 0);
+	assert.equal(actionCommands(run.sent).length, 0);
+});
+
+test('invalid broker results release the query with a factual failure for the authored continuation', async () => {
+	const run = harness({ inspectObservation: async () => ({ menu: { stateId: 1 } }) });
+	await run.manager.installDecision(run.registry.get('agent-a'), { directive: 'replace', source: `
+		program.onUnhandledAttention("continue_and_notify");
+		const result = await world.inspect({ section: "menu" });
+		if (result.reasonCode === "INVALID_QUERY_RESULT") program.checkpoint(result.reasonCode);
+		await player.wait(1);
+	` }, { observation: observation(), eventSequence: 1 });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(actionCommands(run.sent).length, 0);
+	assert.equal(run.registry.get('agent-a').state, DynamicAgentState.PAUSED);
+	assert.deepEqual(run.errors, []);
+});
 
 test('retries a completion publication that was temporarily unavailable', async () => {
 	let attempts = 0;

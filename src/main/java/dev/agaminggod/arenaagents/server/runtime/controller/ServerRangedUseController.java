@@ -17,7 +17,6 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.entity.Entity;
-import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.projectile.arrow.AbstractArrow;
 import net.minecraft.world.item.BowItem;
@@ -26,7 +25,7 @@ import net.minecraft.world.item.ItemStack;
 public final class ServerRangedUseController implements ServerTransactionAdapter.ActiveTransaction {
 	private static final double PROJECTILE_OBSERVATION_RADIUS = 128.0D;
 	private final ServerPlayer player;
-	private final LivingEntity target;
+	private final Entity target;
 	private final InteractionHand hand;
 	private final ItemStack bow;
 	private final ElapsedTimeAccumulator elapsedTime;
@@ -76,7 +75,8 @@ public final class ServerRangedUseController implements ServerTransactionAdapter
 			return finish(ServerTransactionAdapter.TickResult.timedOut(
 					"RANGED_USE_TIMED_OUT", "No newly spawned owned arrow was observed before timeout"));
 		}
-		if (!target.isAlive()) {
+		if (!released && (!target.isAlive() || target.level() != player.level()
+				|| !ObservationVisibility.canSeeEntity(player, target))) {
 			return finish(ServerTransactionAdapter.TickResult.failed("TARGET_UNAVAILABLE", "Ranged target is no longer alive"));
 		}
 		if (!started) {
@@ -203,7 +203,7 @@ public final class ServerRangedUseController implements ServerTransactionAdapter
 		throw new AgentDomainException("BOW_NOT_EQUIPPED", "A bow must be held in either hand");
 	}
 
-	private static LivingEntity resolveExactObservedTarget(ServerPlayer player, String targetId) {
+	private static Entity resolveExactObservedTarget(ServerPlayer player, String targetId) {
 		final UUID uuid;
 		try {
 			uuid = UUID.fromString(targetId);
@@ -211,15 +211,14 @@ public final class ServerRangedUseController implements ServerTransactionAdapter
 			throw new AgentDomainException("TARGET_NOT_FOUND", "Target id is not a UUID");
 		}
 		Entity entity = player.level().getEntity(uuid);
-		if (!(entity instanceof LivingEntity target)
-				|| entity.level() != player.level()
+		if (entity == null || entity.level() != player.level()
 				|| !entity.isAlive()
 				|| entity == player) {
 			throw new AgentDomainException("TARGET_UNAVAILABLE", "Observed ranged target is no longer available");
 		}
-		if (!ObservationVisibility.canSeeEntity(player, target)) {
+		if (!ObservationVisibility.canSeeEntity(player, entity)) {
 			throw new AgentDomainException("TARGET_NOT_VISIBLE", "Observed ranged target is no longer visible");
 		}
-		return target;
+		return entity;
 	}
 }

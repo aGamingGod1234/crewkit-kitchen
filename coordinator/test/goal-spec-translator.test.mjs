@@ -141,6 +141,38 @@ test('translator rejects candidate IDs the server did not supply', async () => {
 	await assert.rejects(() => translator.translate(REQUEST), error => error?.code === 'UNLISTED_GOAL_IDENTIFIER');
 });
 
+test('natural category requests preserve eligible inventory alternatives without weakening the server identifier boundary', async () => {
+	const request = { requestId: REQUEST.requestId, originalRequest: 'Collect at least one log from any tree and keep it in your inventory.',
+		candidateIds: ['oak', 'spruce', 'birch', 'jungle', 'acacia', 'dark_oak', 'mangrove', 'cherry', 'pale_oak']
+			.flatMap((wood) => [`minecraft:${wood}_log`, `minecraft:stripped_${wood}_log`]) };
+	const translator = new GoalSpecTranslator({ generate: async ({ prompt }) => {
+		assert.match(prompt, /any eligible member of a requested category/);
+		assert.match(prompt, /Category ambiguity alone is not a subjective outcome/);
+		assert.match(prompt, /minimum SUM of inventory counts across matching variants and stacks/);
+		assert.match(prompt, /one factual leaf/);
+		return { requestId: request.requestId, summary: 'Keep at least one eligible log in inventory',
+			predicate: { type: 'inventory_contains_any', itemIds: request.candidateIds, count: 1 } };
+	} });
+	const proposal = await translator.translate(request);
+	assert.equal(proposal.predicate.type, 'inventory_contains_any');
+	assert.equal(proposal.predicate.itemIds.length, 18);
+	assert.deepEqual(proposal.predicate.itemIds, request.candidateIds);
+	assert.equal(proposal.predicate.count, 1);
+	await assert.rejects(() => translator.translate({ ...request, candidateIds: [] }), error => error?.code === 'UNLISTED_GOAL_IDENTIFIER');
+	await assert.rejects(() => translator.translate({ ...request, candidateIds: request.candidateIds.slice(0, -1) }), error => error?.code === 'UNLISTED_GOAL_IDENTIFIER');
+});
+
+test('a larger registry candidate catalog cannot bypass the sixteen-leaf predicate budget', async () => {
+	const candidateIds = Array.from({ length: 17 }, (_unused, index) => `minecraft:category_member_${index}`);
+	const request = { requestId: REQUEST.requestId, originalRequest: 'Collect one member of this category.', candidateIds };
+	const leaves = candidateIds.map((itemId) => ({ type: 'inventory_contains', itemId, count: 1 }));
+	let predicate = { type: 'any_of', predicates: leaves.slice(0, 16) };
+	const translator = new GoalSpecTranslator({ generate: async () => ({ requestId: request.requestId, summary: 'Match an eligible item', predicate }) });
+	assert.equal((await translator.translate(request)).predicate.predicates.length, 16);
+	predicate = { type: 'any_of', predicates: [{ type: 'any_of', predicates: leaves.slice(0, 16) }, leaves[16]] };
+	await assert.rejects(() => translator.translate(request), error => error?.code === 'GOAL_PREDICATE_LIMIT_EXCEEDED');
+});
+
 test('translator rejects mismatched request identities', async () => {
 	const translator = new GoalSpecTranslator({
 		generate: async () => ({

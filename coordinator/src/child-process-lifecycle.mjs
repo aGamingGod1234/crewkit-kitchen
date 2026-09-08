@@ -27,7 +27,7 @@ async function terminateWindowsProcessTree(child, timeoutMs, execute) {
 	if (hasExited(child)) return;
 	if (graceful.completed && await waitForExit(child, Math.max(1, Math.floor(remainingMs(deadline) / 2)))) return;
 
-	const forced = remainingMs(deadline) > 0
+	const forced = graceful.completed && remainingMs(deadline) > 0
 		? await runTaskkill(execute, child.pid, true, deadline)
 		: { completed: false, succeeded: false };
 	if (forced.completed && forced.succeeded) return;

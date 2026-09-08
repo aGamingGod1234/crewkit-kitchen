@@ -4,6 +4,29 @@ import test from 'node:test';
 import { ControlLatencyRegistry } from '../src/control-latency-registry.mjs';
 import { ProviderTurnRecorder } from '../src/provider-turn-recorder.mjs';
 import { createProviderTurnTelemetry } from '../src/provider-turn-telemetry.mjs';
+import { createExecutionSettings } from '../src/provider-identity.mjs';
+
+test('preserves bounded requested versus effective execution evidence without filling unknown settings', async () => {
+	const privateRows = [];
+	const publicRows = [];
+	const recorder = new ProviderTurnRecorder({
+		runId: 'settings', scenarioId: 'native', privatePath: 'private.jsonl',
+		appendFile: async (_path, text) => privateRows.push(JSON.parse(text)), publicSink: (row) => publicRows.push(row),
+	});
+	const executionSettings = createExecutionSettings({ provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'xhigh', serviceTier: 'priority' }, {
+		transport: 'acp', controlProtocol: 'arena_script', effective: { model: 'kimi-for-coding', thinkingMode: 'on' },
+		evidence: { model: 'provider_reported', reasoningEffort: 'process_environment', serviceTier: 'not_supported' },
+		limitations: ['effort_not_reported_by_provider'],
+	});
+	executionSettings.unrecognized = { token: 'never-copy' };
+	await recorder.record({ provider: 'kimi', model: 'kimi-code/k3', executionSettings });
+	await recorder.close();
+	delete executionSettings.unrecognized;
+	assert.deepEqual(privateRows[0].executionSettings, executionSettings);
+	assert.deepEqual(publicRows[0].executionSettings, executionSettings);
+	assert.equal(publicRows[0].executionSettings.effective.reasoningEffort, null);
+	assert.equal(JSON.stringify(privateRows).includes('never-copy'), false);
+});
 
 test('prepares the private provider-turn artifact before appending', async () => {
 	const prepared = [];

@@ -217,6 +217,7 @@ export class PlanningScheduler {
 	#cancelTimeout;
 	#maxAuxiliaryPending;
 	#settlementGraceMs;
+	#now;
 
 	constructor({
 		maxConcurrent = DEFAULT_MAX_CONCURRENT,
@@ -235,6 +236,7 @@ export class PlanningScheduler {
 		settlementGraceMs = DEFAULT_SETTLEMENT_GRACE_MS,
 		scheduleTimeout = defaultScheduleTimeout,
 		cancelTimeout = clearTimeout,
+		now = () => performance.now(),
 	} = {}) {
 		if (!Number.isSafeInteger(maxConcurrent) || maxConcurrent <= 0) throw new TypeError('maxConcurrent must be a positive safe integer');
 		if (maxConcurrent > MAX_ADAPTIVE_CONCURRENCY) throw new TypeError(`maxConcurrent must not exceed ${MAX_ADAPTIVE_CONCURRENCY}`);
@@ -246,6 +248,7 @@ export class PlanningScheduler {
 		if (typeof onPressure !== 'function') throw new TypeError('onPressure must be a function');
 		if (typeof scheduleTimeout !== 'function') throw new TypeError('scheduleTimeout must be a function');
 		if (typeof cancelTimeout !== 'function') throw new TypeError('cancelTimeout must be a function');
+		if (typeof now !== 'function') throw new TypeError('now must be a function');
 		const selectedRecorder = recorder ?? benchmarkRecorder;
 		if (selectedRecorder !== null && typeof selectedRecorder.record !== 'function') throw new TypeError('recorder.record must be a function');
 		this.#maxConcurrent = maxConcurrent;
@@ -257,6 +260,7 @@ export class PlanningScheduler {
 		this.#recorder = selectedRecorder;
 		this.#scheduleTimeout = scheduleTimeout;
 		this.#cancelTimeout = cancelTimeout;
+		this.#now = now;
 		const selectedMode = planningMode ?? 'fixed';
 		const selectedReserve = urgentReserve ?? ((mode !== undefined || planningMode !== undefined) && maxConcurrent >= MIN_ADAPTIVE_CONCURRENCY ? DEFAULT_URGENT_RESERVE : 0);
 		const selectedMinConcurrency = selectedMode === 'adaptive' ? minConcurrency : Math.min(minConcurrency, maxConcurrency);
@@ -338,7 +342,7 @@ export class PlanningScheduler {
 	schedule(agentIdValue, task, options = {}) {
 		const agentId = requireAgentId(agentIdValue);
 		if (typeof task !== 'function') throw new TypeError('planning task must be a function');
-		const { lane, priority, capacityClass, leaseTimeoutMs, onLeaseExpired } = normalizeScheduleOptions(options);
+		const { lane, priority, capacityClass, leaseTimeoutMs, maxLeaseDurationMs, onLeaseExpired } = normalizeScheduleOptions(options);
 		this.#record('scheduler_admission_requested', agentId, { lane, priority, ...this.#snapshot() });
 		if (this.#closed) return this.#reject('SCHEDULER_CLOSED', 'Planning scheduler is closed', agentId, lane, priority);
 		if (this.#pending.has(agentId)) return this.#reject('PLAN_ALREADY_QUEUED', `Agent '${agentId}' already has a queued planning turn`, agentId, lane, priority);
@@ -351,7 +355,7 @@ export class PlanningScheduler {
 		}
 
 		const promise = new Promise((resolve, reject) => {
-			const entry = { agentId, task, lane, priority, capacityClass, leaseTimeoutMs, onLeaseExpired, resolve, reject };
+			const entry = { agentId, task, lane, priority, capacityClass, leaseTimeoutMs, maxLeaseDurationMs, onLeaseExpired, resolve, reject };
 			this.#pending.set(agentId, entry);
 			this.#lane(lane)[priority].push(entry);
 		});
@@ -414,13 +418,17 @@ export class PlanningScheduler {
 				...entry,
 				controller,
 				leaseTimeoutHandle: null,
+				leaseGeneration: 0,
+				leasePhase: 'provider',
+				phaseTimeoutMs: entry.leaseTimeoutMs,
+				leaseDeadline: entry.maxLeaseDurationMs === null ? null : this.#now() + entry.maxLeaseDurationMs,
 				settlementTimeoutHandle: null,
 				cancelError: null,
 				promiseSettled: false,
 			};
 			this.#active.set(entry.agentId, active);
 			if (entry.leaseTimeoutMs !== null) {
-				active.leaseTimeoutHandle = this.#scheduleTimeout(() => this.#expire(entry.agentId, controller), entry.leaseTimeoutMs);
+				this.#armLease(active, entry.leaseTimeoutMs);
 			}
 			this.#record('scheduler_admitted', entry.agentId, {
 				lane: entry.lane,
@@ -430,7 +438,8 @@ export class PlanningScheduler {
 			Promise.resolve()
 				.then(() => {
 					if (controller.signal.aborted) throw controller.signal.reason;
-					return entry.task({ agentId: entry.agentId, signal: controller.signal, lane: entry.lane, priority: entry.priority });
+					return entry.task({ agentId: entry.agentId, signal: controller.signal, lane: entry.lane, priority: entry.priority,
+						renewLease: (options) => this.#renewLease(active, options) });
 				})
 				.then(
 					(value) => this.#settle(entry.agentId, controller, null, value),
@@ -504,12 +513,37 @@ export class PlanningScheduler {
 		}
 	}
 
+	#armLease(entry, timeoutMs) {
+		this.#cancelLeaseTimeout(entry);
+		entry.phaseTimeoutMs = timeoutMs;
+		const generation = entry.leaseGeneration;
+		entry.leaseTimeoutHandle = this.#scheduleTimeout(() => {
+			if (entry.leaseGeneration === generation) this.#expire(entry.agentId, entry.controller);
+		}, timeoutMs);
+	}
+
+	#renewLease(entry, { phase = 'provider', timeoutMs = entry.leaseTimeoutMs } = {}) {
+		if (!['provider', 'tool'].includes(phase)) throw new TypeError('planning lease phase must be provider or tool');
+		if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new TypeError('planning renewal timeoutMs must be a positive safe integer');
+		if (entry.leaseDeadline === null || this.#active.get(entry.agentId) !== entry || entry.controller.signal.aborted) return false;
+		const remainingMs = entry.leaseDeadline - this.#now();
+		if (remainingMs <= 0) {
+			this.#expire(entry.agentId, entry.controller);
+			return false;
+		}
+		entry.leasePhase = phase;
+		this.#armLease(entry, Math.min(timeoutMs, remainingMs));
+		return true;
+	}
+
 	#expire(agentId, controller) {
 		const active = this.#active.get(agentId);
 		const settling = this.#settling.get(agentId);
 		const entry = active?.controller === controller ? active : (settling?.controller === controller ? settling : null);
 		if (entry === null || entry.cancelError !== null) return;
-		const error = new PlanningSchedulerError('PLANNING_LEASE_EXPIRED', `Planning lease for '${agentId}' expired after ${entry.leaseTimeoutMs} ms`);
+		const error = new PlanningSchedulerError('PLANNING_LEASE_EXPIRED', `Planning ${entry.leasePhase} lease for '${agentId}' expired after ${entry.phaseTimeoutMs} ms`);
+		error.phase = entry.leasePhase;
+		error.budgetExhausted = entry.leaseDeadline !== null && this.#now() >= entry.leaseDeadline;
 		controller.abort(error);
 		this.#cancelLeaseTimeout(entry);
 		if (active === entry) {
@@ -563,6 +597,7 @@ export class PlanningScheduler {
 	}
 
 	#cancelLeaseTimeout(entry) {
+		entry.leaseGeneration += 1;
 		if (entry.leaseTimeoutHandle === null) return;
 		this.#cancelTimeout(entry.leaseTimeoutHandle);
 		entry.leaseTimeoutHandle = null;
@@ -688,12 +723,15 @@ function normalizeScheduleOptions(options) {
 	if (options === null || typeof options !== 'object' || Array.isArray(options)) throw new TypeError('planning schedule options must be an object');
 	const leaseTimeoutMs = options.leaseTimeoutMs ?? null;
 	if (leaseTimeoutMs !== null && (!Number.isSafeInteger(leaseTimeoutMs) || leaseTimeoutMs <= 0)) throw new TypeError('planning leaseTimeoutMs must be a positive safe integer');
+	const maxLeaseDurationMs = options.maxLeaseDurationMs ?? null;
+	if (maxLeaseDurationMs !== null && (leaseTimeoutMs === null || !Number.isSafeInteger(maxLeaseDurationMs) || maxLeaseDurationMs < leaseTimeoutMs)) throw new TypeError('planning maxLeaseDurationMs must be a safe integer at least leaseTimeoutMs');
 	if (options.onLeaseExpired !== undefined && typeof options.onLeaseExpired !== 'function') throw new TypeError('planning onLeaseExpired must be a function');
 	return {
 		lane: requireLane(options.lane ?? DEFAULT_LANE),
 		priority: requirePriority(options.priority ?? ORDINARY_PRIORITY),
 		capacityClass: requireCapacityClass(options.capacityClass ?? 'default'),
 		leaseTimeoutMs,
+		maxLeaseDurationMs,
 		onLeaseExpired: options.onLeaseExpired ?? null,
 	};
 }

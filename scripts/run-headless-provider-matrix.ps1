@@ -4,6 +4,7 @@ param(
 	[string] $MatrixPath,
 	[string] $ScenarioId,
 	[string] $ServerTemplate,
+	[switch] $CapabilityProbe,
 	[switch] $RequireAll,
 	[switch] $KeepArtifacts
 )
@@ -453,6 +454,15 @@ function Write-BoundedJson([string] $Path, [object] $Value, [int] $MaximumBytes,
 	[IO.File]::WriteAllText($Path, $json, $encoding)
 }
 
+function Get-FileSha256([string] $Path) {
+	$stream = [IO.File]::OpenRead($Path)
+	try {
+		$algorithm = [Security.Cryptography.SHA256]::Create()
+		try { return [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
+		finally { $algorithm.Dispose() }
+	} finally { $stream.Dispose() }
+}
+
 function Read-BoundedJson([string] $Path, [int] $MaximumBytes, [string] $Label) {
 	if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Missing $Label at $Path" }
 	$item = Get-Item -LiteralPath $Path
@@ -552,9 +562,11 @@ function Resolve-Node() {
 	return $node
 }
 
-function Read-Matrix([string] $Path) {
+function Read-Matrix([string] $Path, [string] $Node, [string] $Project) {
 	if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Missing matrix file: $Path" }
-	$matrix = Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
+	$validated = & $Node (Join-Path $Project 'coordinator\src\headless-config.mjs') $Path
+	if ($LASTEXITCODE -ne 0) { throw 'Headless matrix validation failed before server setup' }
+	$matrix = $validated | ConvertFrom-Json
 	if ($null -eq $matrix.scenarios -or @($matrix.scenarios).Count -eq 0) { throw 'Matrix must contain one or more scenarios' }
 	return $matrix
 }
@@ -625,12 +637,20 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 	$scenarioDirectory = Join-Path $RunDirectory ("$(ConvertTo-SafePathSegment $scenarioId)-$([Guid]::NewGuid().ToString('N').Substring(0, 8))")
 	$setupStarted = $false
 	$secretCreated = $false
+	$naturalWorld = $null -ne $Scenario.PSObject.Properties['world'] -and $Scenario.world.mode -eq 'natural'
+	$worldManifestPath = $null
 	try {
 	$setupStarted = $true
 	New-Item -ItemType Directory -Path $scenarioDirectory -Force | Out-Null
 	$serverDirectory = Join-Path $scenarioDirectory 'server'
+	if ($naturalWorld) {
+		if (@(Get-ChildItem -LiteralPath $Template -Recurse -File -Filter 'level.dat').Count -gt 0) { throw 'Natural evaluations require a clean server template without saved worlds' }
+		if (@(Get-ChildItem -LiteralPath $Template -Recurse -Attributes ReparsePoint).Count -gt 0) { throw 'Natural evaluation templates cannot contain linked directories or files' }
+	}
 	Copy-Item -LiteralPath $Template -Destination $serverDirectory -Recurse -Force
-	$world = Join-Path $serverDirectory 'world'
+	$world = [IO.Path]::GetFullPath((Join-Path $serverDirectory 'world'))
+	$serverBoundary = [IO.Path]::GetFullPath($serverDirectory).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+	if (-not $world.StartsWith($serverBoundary, [StringComparison]::OrdinalIgnoreCase)) { throw 'Copied world cleanup escaped the isolated server directory' }
 	if (Test-Path -LiteralPath $world) { Remove-Item -LiteralPath $world -Recurse -Force }
 	$modsDirectory = Join-Path $serverDirectory 'mods'
 	New-Item -ItemType Directory -Path $modsDirectory -Force | Out-Null
@@ -655,6 +675,23 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 		'level-name' = $worldName
 		'pause-when-empty-seconds' = '-1'
 	}
+	if ($naturalWorld) {
+		if (Test-Path -LiteralPath (Join-Path $serverDirectory $worldName)) { throw 'Natural evaluation world must not exist before server startup' }
+		Set-ServerProperties $propertiesPath @{
+			'level-seed' = [string] $Scenario.world.seed
+			'level-type' = [string] $Scenario.world.generator
+			'difficulty' = [string] $Scenario.world.difficulty
+			'gamemode' = [string] $Scenario.world.gameMode
+			'generator-settings' = '{}'
+			'generate-structures' = 'true'
+		}
+		$worldManifestPath = Join-Path $scenarioDirectory 'world-manifest.json'
+		$worldManifest = [pscustomobject]@{
+			version = 1; scenarioId = $scenarioId; worldId = $worldName; fresh = $true; world = $Scenario.world
+			modSha256 = Get-FileSha256 $BuiltJar
+		}
+		Write-BoundedJson $worldManifestPath $worldManifest $MaxManifestBytes 'world manifest'
+	}
 	Assert-ArenaOfflineServerLoopback $propertiesPath -RequireOffline
 	Protect-LocalFile $propertiesPath
 	$logsDirectory = Join-Path $scenarioDirectory 'logs'
@@ -678,6 +715,7 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 		rosterSize = if ($null -eq $Scenario.PSObject.Properties['rosterSize']) { 1 } else { [int] $Scenario.rosterSize }
 		serverDirectory = $serverDirectory; providerWorkspace = $providerWorkspace; protocolAudit = $protocolAudit; providerTurns = $providerTurns
 		ports = [pscustomobject]@{ minecraft = $serverPort; rcon = $rconPort; bridge = $bridgePort }; levelName = $worldName
+		world = if ($naturalWorld) { $Scenario.world } else { [pscustomobject]@{ mode = 'arena' } }
 	}
 	Write-BoundedJson (Join-Path $scenarioDirectory 'manifest.json') $manifest $MaxManifestBytes 'scenario manifest'
 	} catch {
@@ -749,6 +787,7 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 		}
 		# Keep the complete server tree tracked before any coordinator retry can restart it.
 		Add-ProcessTreeSnapshot $processIds $serverHandle.Identity
+		if (-not $CapabilityProbe) {
 		$coordinatorArgs = "$(Quote-Argument (Join-Path $Project 'coordinator\src\dynamic-main.mjs')) --config $(Quote-Argument $coordinatorConfig)"
 		$coordinatorStdoutPath = Join-Path $traceDirectory 'dynamic.stdout.log'
 		$coordinatorStderrPath = Join-Path $traceDirectory 'dynamic.stderr.log'
@@ -796,15 +835,31 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 				Add-ProcessTreeSnapshot $processIds $serverHandle.Identity
 			}
 		}
-		$runnerArgs = "$(Quote-Argument (Join-Path $Project 'coordinator\src\headless-matrix.mjs')) --config $(Quote-Argument $MatrixFile) --scenario $(Quote-Argument $scenarioId) --run-directory $(Quote-Argument $scenarioDirectory) --rcon-host 127.0.0.1 --rcon-port $rconPort --rcon-password-file $(Quote-Argument $secretPath) --protocol-audit $(Quote-Argument $protocolAudit) --provider-turns $(Quote-Argument $providerTurns)"
-		if ($RequireAll) { $runnerArgs += ' --require-all' }
+		}
+		if ($CapabilityProbe) {
+			$runnerArgs = "$(Quote-Argument (Join-Path $Project 'coordinator\src\player-capability-probe.mjs')) --run-directory $(Quote-Argument $scenarioDirectory) --rcon-host 127.0.0.1 --rcon-port $rconPort --rcon-password-file $(Quote-Argument $secretPath) --bridge-port $bridgePort --bridge-secret-file $(Quote-Argument $secretPath) --timeout-ms $([int64] $Scenario.timeoutMs)"
+		} else {
+			if ($naturalWorld) {
+				$spawnArgs = @((Join-Path $Project 'coordinator\src\headless-world-spawn.mjs'), (Join-Path (Join-Path $serverDirectory $worldName) 'level.dat'), '--rcon-port', [string] $rconPort, '--password-file', $secretPath, '--timeout-ms', [string] ([Math]::Min(120000, $StartupTimeoutSeconds * 1000)))
+				if ($Scenario.world.spawn.policy -eq 'surface') { $spawnArgs += @('--surface-x', [string] $Scenario.world.spawn.x, '--surface-z', [string] $Scenario.world.spawn.z) }
+				$spawnEvidenceText = & $Node @spawnArgs
+				if ($LASTEXITCODE -ne 0) { throw 'Natural spawn metadata or chunk readiness failed before agent evaluation' }
+				$spawnEvidence = ($spawnEvidenceText -join "`n") | ConvertFrom-Json
+				$worldManifest | Add-Member -NotePropertyName savedSpawn -NotePropertyValue $spawnEvidence.savedSpawn -Force
+				$worldManifest | Add-Member -NotePropertyName spawnLoading -NotePropertyValue $spawnEvidence.spawnLoading -Force
+				Write-BoundedJson $worldManifestPath $worldManifest $MaxManifestBytes 'world manifest'
+			}
+			$runnerArgs = "$(Quote-Argument (Join-Path $Project 'coordinator\src\headless-matrix.mjs')) --config $(Quote-Argument $MatrixFile) --scenario $(Quote-Argument $scenarioId) --run-directory $(Quote-Argument $scenarioDirectory) --rcon-host 127.0.0.1 --rcon-port $rconPort --rcon-password-file $(Quote-Argument $secretPath) --protocol-audit $(Quote-Argument $protocolAudit) --provider-turns $(Quote-Argument $providerTurns)"
+			if ($naturalWorld) { $runnerArgs += " --world-manifest $(Quote-Argument $worldManifestPath)" }
+			if ($RequireAll) { $runnerArgs += ' --require-all' }
+		}
 		$runnerEnvironment = @{
 			ARENA_HEADLESS_RUN_ID = [IO.Path]::GetFileName($RunDirectory); ARENA_HEADLESS_SCENARIO_ID = $scenarioId
 			ARENA_PROTOCOL_AUDIT_PATH = $protocolAudit; ARENA_PROVIDER_TURNS_PATH = $providerTurns
 		}
 		$runnerHandle = Start-RedirectedProcess $Node $runnerArgs (Join-Path $Project 'coordinator') (Join-Path $traceDirectory 'runner.stdout.log') (Join-Path $traceDirectory 'runner.stderr.log') $runnerEnvironment
 		Add-ProcessTreeSnapshot $processIds $serverHandle.Identity
-		Add-ProcessTreeSnapshot $processIds $coordinatorHandle.Identity
+		if ($null -ne $coordinatorHandle) { Add-ProcessTreeSnapshot $processIds $coordinatorHandle.Identity }
 		Add-ProcessTreeSnapshot $processIds $runnerHandle.Identity
 		$repetitions = if ($null -ne $Scenario.PSObject.Properties['repetitions']) { [Math]::Max(1, [int] $Scenario.repetitions) } else { 1 }
 		$runnerDeadline = [DateTime]::UtcNow.AddMilliseconds(([int64] $Scenario.timeoutMs * $repetitions) + ($RunnerGraceSeconds * 1000))
@@ -818,7 +873,10 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 		$peakRssBytes = [long] $resourcePeak.peakRssBytes
 		$runnerExit = $runnerHandle.Process.ExitCode
 		Complete-RedirectedProcess $runnerHandle
-		if ($repetitions -eq 1) {
+		if ($CapabilityProbe) {
+			$runnerReport = Read-BoundedJson (Join-Path $scenarioDirectory 'player-capability-report.json') $MaxMatrixReportBytes 'player capability probe report'
+			if (@('PASSED', 'FAILED') -notcontains [string] $runnerReport.status) { throw 'Player capability probe returned an invalid status' }
+		} elseif ($repetitions -eq 1) {
 			$runnerReport = Read-BoundedJson (Join-Path $scenarioDirectory 'report.json') $MaxMatrixReportBytes 'runner scenario report'
 			if ([string] $runnerReport.scenarioId -ne $scenarioId -or @('PASSED', 'FAILED', 'SKIPPED') -notcontains [string] $runnerReport.status) {
 				throw "Runner scenario report for '$scenarioId' is invalid"
@@ -910,11 +968,17 @@ if (-not (Test-Path -LiteralPath $ServerTemplate -PathType Container)) { throw "
 if (-not (Test-Path -LiteralPath $serverLauncher -PathType Leaf)) { throw "Missing Fabric server launcher: $serverLauncher" }
 $builtJar = Resolve-ArenaModJar $root
 if (-not (Test-Path -LiteralPath $builtJar -PathType Leaf)) { throw "Missing built mod JAR: $builtJar" }
-$matrix = Read-Matrix $MatrixPath
+$matrix = Read-Matrix $MatrixPath $node $root
 $selected = @($matrix.scenarios | Where-Object { [string]::IsNullOrWhiteSpace($ScenarioId) -or [string] $_.id -eq $ScenarioId })
 if ($selected.Count -eq 0) { throw "Unknown scenario '$ScenarioId'" }
 if ($selected.Count -gt $MaxSelectedScenarios) { throw "Selected scenario count $($selected.Count) exceeds the bounded maximum of $MaxSelectedScenarios" }
 foreach ($scenario in $selected) { Assert-SafeScenarioId ([string] $scenario.id) }
+if ($CapabilityProbe) {
+	if ([string]::IsNullOrWhiteSpace($ScenarioId) -or $selected.Count -ne 1) { throw 'CapabilityProbe requires one explicit ScenarioId' }
+	if ($selected[0].world.mode -ne 'arena') { throw 'CapabilityProbe prepares mechanics fixtures and requires arena mode; natural evaluations preserve terrain' }
+	if (($null -ne $selected[0].PSObject.Properties['repetitions'] -and [int] $selected[0].repetitions -ne 1) -or ($null -ne $selected[0].PSObject.Properties['rosterSize'] -and [int] $selected[0].rosterSize -ne 1)) { throw 'CapabilityProbe requires one agent and one repetition' }
+	if (-not (Test-Path -LiteralPath (Join-Path $root 'coordinator\src\player-capability-probe.mjs') -PathType Leaf)) { throw 'Missing player capability probe script' }
+}
 $manifestScenarios = @(
 	foreach ($scenario in $selected) {
 		$assertionTypes = @()
@@ -948,7 +1012,7 @@ $reports = @()
 $manifestPath = Join-Path $runDirectory 'matrix-manifest.json'
 Write-BoundedJson $manifestPath $manifestSummary $MaxManifestBytes 'matrix manifest'
 foreach ($scenario in $selected) {
-	$preflight = Test-ProviderPreflight ([string] $scenario.provider)
+	$preflight = if ($CapabilityProbe) { [pscustomobject]@{ Available = $true; Reason = $null } } else { Test-ProviderPreflight ([string] $scenario.provider) }
 	if (-not $preflight.Available) {
 		$status = if ($RequireAll) { 'FAILED' } else { 'SKIPPED' }
 		$reports += [pscustomobject]@{ status = $status; scenarioId = (ConvertTo-BoundedText $scenario.id); provider = (ConvertTo-BoundedText $scenario.provider); skippedReason = (ConvertTo-BoundedText $preflight.Reason $MaxDiagnosticText); cleanup = [pscustomobject]@{ status = 'NOT_STARTED' } }

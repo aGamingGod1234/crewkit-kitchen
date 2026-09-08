@@ -4,6 +4,8 @@ import test from 'node:test';
 import { ArenaScriptInterpreter } from '../src/arena-script/interpreter.mjs';
 import { createInterpreterFacts } from '../src/arena-script/facts.mjs';
 import { parseArenaScript } from '../src/arena-script/parser.mjs';
+import { SCRIPT_BINDINGS } from '../src/arena-script/minecraft-api.mjs';
+import { validateAction } from '../src/schema.mjs';
 
 const ACTION_BINDINGS = Object.freeze(Object.assign(Object.create(null), {
 	player: Object.freeze(Object.assign(Object.create(null), {
@@ -30,6 +32,80 @@ function facts(overrides = {}) {
 function actionResult(command, state = 'SUCCEEDED', reasonCode = 'DONE') {
 	return { stateToken: command.stateToken, state, reasonCode };
 }
+
+test('all 64 authored control frames fit the bounded compound payload without raising ordinary output limits', () => {
+	const frame = { forward: 1, strafe: 0, jump: false, sneak: false, sprint: false, attack: false, use: false, yaw: 0, pitch: 0, selectedSlot: 0, hand: 'main', ticks: 2 };
+	const args = { frames: Array.from({ length: 64 }, () => ({ ...frame })), maxTicks: 128 };
+	assert.ok(Buffer.byteLength(JSON.stringify(args)) > 4096);
+	const vm = new ArenaScriptInterpreter(parseArenaScript(`program.onUnhandledAttention("continue_and_notify"); await player.controlSequence(${JSON.stringify(args)});`), SCRIPT_BINDINGS);
+	const command = vm.start(facts());
+	assert.equal(command.call.primitive, 'control_sequence');
+	assert.equal(validateAction({ type: command.call.primitive, ...command.call.arguments }).frames.length, 64);
+	assert.equal(vm.resume(actionResult(command), facts()).kind, 'idle');
+	const tooLarge = { slot: 0, pages: Array.from({ length: 32 }, () => 'x'.repeat(1024)), expectedFingerprint: 'book' };
+	assert.throws(() => new ArenaScriptInterpreter(parseArenaScript(`program.onUnhandledAttention("continue_and_notify"); await player.editBook(${JSON.stringify(tooLarge)});`), SCRIPT_BINDINGS).start(facts()), (error) => error.code === 'OUTPUT_LIMIT');
+});
+
+test('model code compares observed candidates and computes a precise input frame without a target heuristic', () => {
+	const vm = new ArenaScriptInterpreter(parseArenaScript(`
+		program.onUnhandledAttention("continue_and_notify");
+		let target = null;
+		for (const candidate of world.entities()) {
+			if (candidate.velocity.x > 0 && (target === null || candidate.distance > target.distance)) target = candidate;
+		}
+		await player.control({ forward: 0, strafe: 1, jump: false, sneak: true, sprint: false, attack: false, use: false,
+			yaw: math.atan2(target.z, target.x) * 180 / 3.141592653589793, pitch: 0, selectedSlot: 0, hand: "main", ticks: 2 });
+	`), SCRIPT_BINDINGS);
+	const command = vm.start(createInterpreterFacts({ player: { x: 0, y: 64, z: 0 }, entities: [
+		{ stableId: 'near', type: 'minecraft:pig', x: 1, y: 64, z: 0, distance: 1, velocity: { x: -1, y: 0, z: 0 } },
+		{ stableId: 'far', type: 'minecraft:pig', x: 3, y: 64, z: 3, distance: 4.2, velocity: { x: 1, y: 0, z: 0 } },
+	] }));
+	assert.equal(command.call.primitive, 'control');
+	assert.equal(command.call.arguments.yaw, 45);
+	assert.equal(validateAction({ type: command.call.primitive, ...command.call.arguments }).ticks, 2);
+});
+
+test('for-of preserves const isolation and obeys existing loop and operation limits', () => {
+	const source = 'program.onUnhandledAttention("continue_and_notify"); let sum = 0; for (const count of [1, 2, 3]) sum += count; await player.wait(sum);';
+	assert.equal(interpreter(source).start(facts()).call.arguments, 6);
+	assert.throws(() => interpreter(source, { loopIterationsPerYield: 2 }).start(facts()), (error) => error.code === 'LOOP_LIMIT');
+	assert.throws(() => interpreter('program.onUnhandledAttention("continue_and_notify"); for (const count of [1]) count = 2;').start(facts()), (error) => error.code === 'CONST_ASSIGNMENT');
+	assert.throws(() => interpreter('program.onUnhandledAttention("continue_and_notify"); for (const count of player.state()) {}').start(facts()), (error) => error.code === 'INVALID_ITERABLE');
+});
+
+test('safe arithmetic excludes ambient globals, invalid operands and nonfinite results', () => {
+	const vm = interpreter('program.onUnhandledAttention("continue_and_notify"); await player.wait(math.max(1, math.floor(math.hypot(3, 4))));');
+	assert.equal(vm.start(facts()).call.arguments, 5);
+	for (const call of ['math.sqrt(-1)', 'math.atan2(1)', 'math.abs("1")']) {
+		assert.throws(() => interpreter(`program.onUnhandledAttention("continue_and_notify"); await player.wait(${call});`).start(facts()), (error) => ['INVALID_ARGUMENT', 'INVALID_OPERAND'].includes(error.code));
+	}
+	assert.throws(() => interpreter('program.onUnhandledAttention("continue_and_notify"); Math.random();'));
+});
+
+test('all zero-argument player controls emit object arguments accepted by the shared action schema', () => {
+	for (const member of ['dismount', 'startFallFlying', 'wakeUp', 'respawn']) {
+		const vm = new ArenaScriptInterpreter(parseArenaScript(`program.onUnhandledAttention("continue_and_notify"); await player.${member}();`), SCRIPT_BINDINGS);
+		const command = vm.start(facts());
+		assert.equal(Array.isArray(command.call.arguments), false);
+		assert.doesNotThrow(() => validateAction({ type: command.call.primitive, ...command.call.arguments }));
+	}
+});
+
+test('inspection yields a read request and resumes with the full immutable result', () => {
+	const vm = interpreter(`program.onUnhandledAttention("continue_and_notify");
+		const page = await world.inspect({ section: "menu", offset: 0, limit: 16 });
+		let selected = 0;
+		for (const slot of page.menu.slots) { if (slot.itemId === "minecraft:diamond") selected = slot.slot; }
+		await player.wait(selected);
+	`);
+	const query = vm.start(facts());
+	assert.equal(query.kind, 'query');
+	assert.equal(query.query.section, 'menu');
+	assert.equal(query.call, undefined);
+	const value = { state: 'SUCCEEDED', reasonCode: 'INSPECTED', menu: { slots: [{ slot: 7, itemId: 'minecraft:diamond' }] } };
+	const next = vm.resume({ stateToken: query.stateToken, state: 'SUCCEEDED', reasonCode: 'INSPECTED', value }, facts());
+	assert.equal(next.call.arguments, 7);
+});
 
 function boundedCounterSource() {
 	return `

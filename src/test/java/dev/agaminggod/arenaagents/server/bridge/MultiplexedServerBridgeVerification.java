@@ -174,6 +174,9 @@ public final class MultiplexedServerBridgeVerification {
 		verifyConversationAttention(registered.getFirst().agentId());
 		verifyObservationCadence(candidates);
 		verifyObservationPublicationLifecycle(registered.getFirst().agentId());
+		verifyInspectionQueryValidation();
+		verifyInspectionPublication(registered.getFirst().agentId());
+		verifyInspectionWireBudget(registered.getFirst().agentId());
 		verifyEmptyCatalogRequestsLiveDiscovery();
 		verifyRealBridgeSessionLifecycle();
 		verifyPreauthOverflowPreservesIncumbentHandshake();
@@ -193,7 +196,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyImmediateHandshakeClosePreservesDisconnect();
 		verifyPendingRegistrationMarkerIsFenced();
 		verifyAtomicPublicationRacesSessionClose();
-		return 290;
+		return 294;
 	}
 
 	@SuppressWarnings("unchecked")
@@ -629,6 +632,39 @@ public final class MultiplexedServerBridgeVerification {
 		}
 	}
 
+	private static void verifyAlternativeItemProposalIdentifiers(MultiplexedServerBridge bridge) {
+		Set<String> candidates = Set.of("minecraft:oak_log", "minecraft:birch_log");
+		GoalPredicate alternatives = new GoalPredicate.InventoryContainsAny(List.copyOf(candidates), 12);
+		assertDoesNotThrow(() -> validateProposalIdentifiers(bridge, alternatives, candidates),
+				"mixed-item proposals accept every offered live item");
+		assertDoesNotThrow(() -> validateProposalIdentifiers(bridge,
+				new GoalPredicate.AllOf(List.of(alternatives, new GoalPredicate.SurviveDuration(20))), candidates),
+				"nested mixed-item proposals retain identifier validation");
+		assertThrowsCode(() -> validateProposalIdentifiers(bridge,
+				new GoalPredicate.InventoryContainsAny(List.of("minecraft:oak_log", "minecraft:birch_log"), 12),
+				Set.of("minecraft:oak_log")), "GOAL_IDENTIFIER_NOT_CANDIDATE");
+		assertThrowsCode(() -> validateProposalIdentifiers(bridge,
+				new GoalPredicate.AnyOf(List.of(new GoalPredicate.SurviveDuration(20),
+						new GoalPredicate.InventoryContainsAny(List.of("minecraft:oak_log", "example:missing_log"), 12))),
+				Set.of("minecraft:oak_log", "example:missing_log")), "UNKNOWN_GOAL_IDENTIFIER");
+	}
+
+	private static void validateProposalIdentifiers(
+			MultiplexedServerBridge bridge, GoalPredicate predicate, Set<String> candidates
+	) {
+		try {
+			Method method = MultiplexedServerBridge.class.getDeclaredMethod(
+					"validateProposalIdentifiers", GoalPredicate.class, Set.class);
+			method.setAccessible(true);
+			method.invoke(bridge, predicate, candidates);
+		} catch (java.lang.reflect.InvocationTargetException exception) {
+			if (exception.getCause() instanceof RuntimeException cause) throw cause;
+			throw new AssertionError("proposal identifier validation failed", exception.getCause());
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("could not invoke proposal identifier validation", exception);
+		}
+	}
+
 	private static void verifyGoalSpecProposalLifecycle() {
 		MultiplexedServerBridge bridge = null;
 		Path secretFile = null;
@@ -652,6 +688,7 @@ public final class MultiplexedServerBridgeVerification {
 			);
 			manager.stageGoalDraft(draft);
 			bridge = new MultiplexedServerBridge(manager, 0, secretFile);
+			verifyAlternativeItemProposalIdentifiers(bridge);
 			bridge.start();
 			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
 			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
@@ -3552,6 +3589,186 @@ public final class MultiplexedServerBridgeVerification {
 			assertTrue(cleanupPublication.takeHeartbeat(agentId), "fresh session starts with a due heartbeat");
 		});
 		assertEquals(List.of(agents.get(0)), freshSession, "session replacement does not delay first observation");
+	}
+
+	private static void verifyInspectionQueryValidation() {
+		JsonObject query = new JsonObject();
+		query.addProperty("section", "observation");
+		JsonObject normalized = MultiplexedServerBridge.validateInspectionQuery(query);
+		assertEquals(0, normalized.get("offset").getAsInt(), "inspection defaults its offset");
+		assertEquals(16, normalized.get("limit").getAsInt(), "inspection defaults its page size");
+		assertTrue(!query.has("offset"), "inspection validation does not mutate its input");
+		for (String section : List.of("observation", "inventory", "menu", "entities", "blocks", "events", "landmarks", "nearby_containers")) {
+			query.addProperty("section", section);
+			MultiplexedServerBridge.validateInspectionQuery(query);
+		}
+		for (String field : List.of("offset", "limit")) {
+			JsonObject bad = query.deepCopy();
+			bad.addProperty(field, "1");
+			assertThrowsCode(() -> MultiplexedServerBridge.validateInspectionQuery(bad), "INVALID_INSPECTION");
+			bad.addProperty(field, 1.5);
+			assertThrowsCode(() -> MultiplexedServerBridge.validateInspectionQuery(bad), "INVALID_INSPECTION");
+			bad.add(field, com.google.gson.JsonNull.INSTANCE);
+			assertThrowsCode(() -> MultiplexedServerBridge.validateInspectionQuery(bad), "INVALID_INSPECTION");
+		}
+		query.addProperty("section", "observation");
+		query.addProperty("slot", 0);
+		assertThrowsCode(() -> MultiplexedServerBridge.validateInspectionQuery(query), "INVALID_INSPECTION");
+		query.remove("slot");
+		query.addProperty("offset", 4097);
+		assertThrowsCode(() -> MultiplexedServerBridge.validateInspectionQuery(query), "INVALID_INSPECTION");
+		query.remove("offset");
+		query.addProperty("section", "item");
+		assertThrowsCode(() -> MultiplexedServerBridge.validateInspectionQuery(query), "INVALID_INSPECTION");
+		query.addProperty("slot", 40);
+		MultiplexedServerBridge.validateInspectionQuery(query);
+		query.remove("slot");
+		query.addProperty("section", "block");
+		query.addProperty("x", -30_000_000);
+		query.addProperty("y", -64);
+		assertThrowsCode(() -> MultiplexedServerBridge.validateInspectionQuery(query), "INVALID_INSPECTION");
+		query.addProperty("z", 30_000_000);
+		MultiplexedServerBridge.validateInspectionQuery(query);
+		query.addProperty("y", 2049);
+		assertThrowsCode(() -> MultiplexedServerBridge.validateInspectionQuery(query), "INVALID_INSPECTION");
+		JsonObject events = new JsonObject();
+		events.addProperty("section", "events");
+		events.addProperty("afterSequence", -1);
+		MultiplexedServerBridge.validateInspectionQuery(events);
+		events.addProperty("afterSequence", 9_007_199_254_740_992L);
+		assertThrowsCode(() -> MultiplexedServerBridge.validateInspectionQuery(events), "INVALID_INSPECTION");
+		JsonObject recipes = new JsonObject();
+		recipes.addProperty("section", "recipes");
+		recipes.addProperty("recipeId", "minecraft:oak_planks");
+		MultiplexedServerBridge.validateInspectionQuery(recipes);
+		recipes.addProperty("recipeId", "../invalid");
+		assertThrowsCode(() -> MultiplexedServerBridge.validateInspectionQuery(recipes), "INVALID_INSPECTION");
+		recipes.addProperty("recipeId", "minecraft:oak_planks");
+		recipes.addProperty("section", "mechanics");
+		assertThrowsCode(() -> MultiplexedServerBridge.validateInspectionQuery(recipes), "INVALID_INSPECTION");
+	}
+
+	private static void verifyInspectionPublication(AgentId agent) {
+		MultiplexedServerBridge.ObservationPublication publication = new MultiplexedServerBridge.ObservationPublication(16, 16);
+		Object session = new Object();
+		publication.activate(session);
+		JsonObject page = inspectionPage(65, 32);
+		assertThrowsCode(() -> publication.deliverInspection(agent, session, page, (id, value) -> true), "STALE_FACTS");
+		JsonObject baseline = observation(inspectionId(1), 1000);
+		baseline.add("entities", inspectionPage(1, 64).get("entries"));
+		JsonObject world = new JsonObject();
+		world.addProperty("worldId", "test-world");
+		world.addProperty("dimension", "minecraft:overworld");
+		baseline.add("world", world);
+		publication.publish(agent, session, baseline, (id, value) -> true);
+		publication.markAttention(agent);
+		List<JsonObject> deliveries = new ArrayList<>();
+		assertEquals(MultiplexedServerBridge.ObservationPublication.Result.COMMITTED,
+				publication.deliverInspection(agent, session, page, (id, value) -> { deliveries.add(value.deepCopy()); return true; }),
+				"focused entity page publishes successfully");
+		long sequence = deliveries.getFirst().get("eventSequence").getAsLong();
+		assertEquals(1L, sequence, "focused query retains the existing causal observation sequence");
+		assertTrue(!page.has("eventSequence"), "inspection publication does not mutate collector output");
+		for (int index = 1; index <= 96; index++) publication.requireObservedTarget(agent, sequence, inspectionId(index));
+		assertThrowsCode(() -> publication.requireObservedTarget(agent, sequence, inspectionId(97)), "TARGET_NOT_OBSERVED");
+		assertEquals(1, publication.retainedCount(), "inspection preserves exactly one full baseline");
+		assertEquals(MultiplexedServerBridge.ObservationPublication.Result.DELIVERY_RETRY,
+				publication.deliverInspection(agent, session, inspectionPage(97, 1), (id, value) -> false),
+				"failed write does not commit focused target authority");
+		assertThrowsCode(() -> publication.requireObservedTarget(agent, sequence, inspectionId(97)), "TARGET_NOT_OBSERVED");
+		assertThrows(BridgeProtocolException.class, () -> publication.deliverInspection(agent, session, inspectionPage(98, 1),
+				(id, value) -> { throw new BridgeProtocolException("INSPECTION_TOO_LARGE", "oversize"); }), "oversized inspection fails before target commit");
+		assertThrowsCode(() -> publication.requireObservedTarget(agent, sequence, inspectionId(98)), "TARGET_NOT_OBSERVED");
+		JsonObject otherSection = inspectionPage(99, 1);
+		otherSection.addProperty("section", "inventory");
+		publication.deliverInspection(agent, session, otherSection, (id, value) -> true);
+		assertThrowsCode(() -> publication.requireObservedTarget(agent, sequence, inspectionId(99)), "TARGET_NOT_OBSERVED");
+		JsonObject hidden = inspectionPage(100, 1);
+		hidden.add("unreturned", inspectionPage(101, 1).get("entries"));
+		publication.deliverInspection(agent, session, hidden, (id, value) -> true);
+		publication.requireObservedTarget(agent, sequence, inspectionId(100));
+		assertThrowsCode(() -> publication.requireObservedTarget(agent, sequence, inspectionId(101)), "TARGET_NOT_OBSERVED");
+		JsonObject wrongWorld = inspectionPage(102, 1);
+		wrongWorld.addProperty("dimension", "minecraft:the_nether");
+		assertThrowsCode(() -> publication.deliverInspection(agent, session, wrongWorld, (id, value) -> true), "STALE_FACTS");
+		for (int start = 101; start < 320; start += 32) {
+			publication.deliverInspection(agent, session, inspectionPage(start, Math.min(32, 320 - start)), (id, value) -> true);
+		}
+		AtomicBoolean overLimitWritten = new AtomicBoolean();
+		assertThrowsCode(() -> publication.deliverInspection(agent, session, inspectionPage(321, 5), (id, value) -> {
+			overLimitWritten.set(true); return true;
+		}), "INSPECTION_AUTHORITY_LIMIT");
+		assertTrue(!overLimitWritten.get(), "authority capacity cannot silently discard delivered target references");
+		assertEquals(MultiplexedServerBridge.ObservationPublication.Result.COMMITTED,
+				publication.publish(agent, session, baseline, (id, value) -> true), "inspection preserves pending attention and full baseline delta");
+		publication.requireObservedTarget(agent, sequence, inspectionId(100));
+		assertThrowsCode(() -> publication.requireObservedTarget(agent, 2L, inspectionId(100)), "TARGET_NOT_OBSERVED");
+		Object replacement = new Object();
+		publication.activate(replacement);
+		AtomicBoolean staleWritten = new AtomicBoolean();
+		assertEquals(MultiplexedServerBridge.ObservationPublication.Result.STALE_SESSION,
+				publication.deliverInspection(agent, session, page, (id, value) -> { staleWritten.set(true); return true; }),
+				"old session inspection cannot authorize targets in replacement session");
+		assertTrue(!staleWritten.get(), "stale session inspection is not written");
+		assertThrowsCode(() -> publication.requireObservedTarget(agent, sequence, inspectionId(100)), "TARGET_NOT_OBSERVED");
+	}
+
+	private static String inspectionId(int value) { return new UUID(0L, value).toString(); }
+
+	private static JsonObject inspectionPage(int first, int count) {
+		JsonObject result = new JsonObject();
+		result.addProperty("section", "entities");
+		result.addProperty("worldId", "test-world");
+		result.addProperty("dimension", "minecraft:overworld");
+		JsonArray entries = new JsonArray();
+		for (int index = first; index < first + count; index++) entries.add(entity(inspectionId(index)));
+		result.add("entries", entries);
+		return result;
+	}
+
+	private static void verifyInspectionWireBudget(AgentId agent) {
+		BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+		String serverId = UUID.randomUUID().toString();
+		JsonObject correlation = new JsonObject();
+		correlation.addProperty("goalRevision", 9_007_199_254_740_991L);
+		correlation.addProperty("requestId", "r".repeat(128));
+		JsonObject source = observation(inspectionId(1), 1000);
+		source.addProperty("eventSequence", 9_007_199_254_740_991L);
+		source.addProperty("protected", "p".repeat(55_000));
+		JsonArray entities = new JsonArray();
+		for (int index = 0; index < 32; index++) {
+			JsonObject entity = entity(inspectionId(index + 1));
+			entity.addProperty("name", "🧭".repeat(120));
+			entities.add(entity);
+		}
+		source.add("entities", entities);
+		var fitted = MultiplexedServerBridge.fitInspectionObservation(codec, serverId, agent, correlation, source);
+		assertTrue(!fitted.reductions().isEmpty(), "oversized observation is fitted for its correlated envelope");
+		JsonObject reply = MultiplexedServerBridge.inspectionObservationReply(correlation, fitted.observation());
+		assertTrue(codec.encodedLineBytes(new BridgeEnvelope(2, serverId, agent.toString(), "observation", "m".repeat(128), fitted.observation()))
+				<= BridgeEnvelopeCodec.MAX_LINE_BYTES, "normal observation remains within the full wire budget");
+		assertTrue(codec.encodedLineBytes(new BridgeEnvelope(2, serverId, agent.toString(), "inspection_result", "m".repeat(128), reply))
+				<= BridgeEnvelopeCodec.MAX_LINE_BYTES, "correlated observation including request id and nesting remains within the full wire budget");
+		assertEquals(32, source.getAsJsonArray("entities").size(), "wire fitting preserves collector source");
+		JsonObject boundary = observation(inspectionId(1), 1000);
+		boundary.addProperty("eventSequence", 1L);
+		boundary.getAsJsonArray("entities").get(0).getAsJsonObject().addProperty("name", "x".repeat(1024));
+		boundary.addProperty("protected", "");
+		int overhead = codec.encodedLineBytes(new BridgeEnvelope(2, serverId, agent.toString(), "observation", "m".repeat(128), boundary));
+		boundary.addProperty("protected", "p".repeat(BridgeEnvelopeCodec.MAX_LINE_BYTES - overhead));
+		assertEquals(BridgeEnvelopeCodec.MAX_LINE_BYTES,
+				codec.encodedLineBytes(new BridgeEnvelope(2, serverId, agent.toString(), "observation", "m".repeat(128), boundary)),
+				"boundary fixture fits the original observation envelope exactly");
+		assertTrue(codec.encodedLineBytes(new BridgeEnvelope(2, serverId, agent.toString(), "inspection_result", "m".repeat(128),
+				MultiplexedServerBridge.inspectionObservationReply(correlation, boundary))) > BridgeEnvelopeCodec.MAX_LINE_BYTES,
+				"reusing an observation-fitted payload overflows its correlated inspection envelope");
+		var boundaryFit = MultiplexedServerBridge.fitInspectionObservation(codec, serverId, agent, correlation, boundary);
+		assertTrue(codec.encodedLineBytes(new BridgeEnvelope(2, serverId, agent.toString(), "inspection_result", "m".repeat(128),
+				MultiplexedServerBridge.inspectionObservationReply(correlation, boundaryFit.observation()))) <= BridgeEnvelopeCodec.MAX_LINE_BYTES,
+				"inspection fitting fixes the exact double-envelope boundary failure");
+		source.addProperty("protected", "p".repeat(66_000));
+		assertThrows(BridgeProtocolException.class, () -> MultiplexedServerBridge.fitInspectionObservation(codec, serverId, agent, correlation, source),
+				"oversized protected facts fail before any inspection result is published");
 	}
 
 	private static JsonObject observation(String targetId, long observedAtEpochMs) {

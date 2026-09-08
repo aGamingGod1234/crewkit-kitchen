@@ -36,6 +36,65 @@ function acknowledge(engine, dispatched, observationValue, eventSequence) {
 	engine.ingestObservation({ observation: observationValue, eventSequence, attention: false });
 }
 
+test('inspection results resume their exact continuation without physical commands or fabricated provenance', () => {
+	const queries = [];
+	const run = engineFor(`program.onUnhandledAttention("continue_and_notify");
+		const page = await world.inspect({ section: "inventory", offset: 0, limit: 16 });
+		await player.wait(page.entries.length);
+	`, { inspect: (query) => queries.push(query) });
+	assert.equal(run.dispatched.length, 0);
+	assert.equal(run.engine.snapshot().activeActionId, null);
+	assert.equal(run.engine.snapshot().activeQueryId, queries[0].queryId);
+	assert.equal(queries[0].provenance, undefined);
+	run.engine.notifyAttention({ priority: 'urgent', trigger: 'inspection_attention' });
+	assert.equal(run.modelRequests[0].activeActionId, null);
+	run.engine.applyDirective({ ...run.modelRequests[0], directive: 'continue' });
+	run.engine.ingestQueryResult({ queryId: 'stale', value: { state: 'SUCCEEDED', entries: [1] } });
+	assert.equal(run.dispatched.length, 0);
+	run.engine.ingestQueryResult({ queryId: queries[0].queryId, value: { state: 'SUCCEEDED', reasonCode: 'INSPECTED', entries: [1, 2] } });
+	assert.equal(run.dispatched[0].action.arguments, 2);
+	assert.equal(run.engine.snapshot().activeQueryId, null);
+	run.engine.ingestQueryResult({ queryId: queries[0].queryId, value: { state: 'SUCCEEDED', entries: [1] } });
+	assert.equal(run.dispatched.length, 1);
+});
+
+test('replacing a pending inspection fences its late result without cancelling a Minecraft action', () => {
+	const queries = [];
+	const run = engineFor('program.onUnhandledAttention("continue_and_notify"); await world.inspect({ section: "item", slot: 1 }); await player.wait(9);', { inspect: (query) => queries.push(query) });
+	run.engine.install({ agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'replacement', version: 2,
+		compiled: parseArenaScript('program.onUnhandledAttention("continue_and_notify"); await player.wait(3);'), observation: observation(), eventSequence: 2 });
+	assert.deepEqual(run.cancelled, []);
+	assert.equal(run.dispatched[0].action.arguments, 3);
+	run.engine.ingestQueryResult({ queryId: queries[0].queryId, value: { state: 'SUCCEEDED', item: { count: 1 } } });
+	assert.equal(run.dispatched.length, 1);
+});
+
+test('a model-authored interrupt watcher can replace an in-flight read without body cancellation', () => {
+	const queries = [];
+	const run = engineFor(`program.onUnhandledAttention("continue_and_notify");
+		program.watch(() => player.state().health < 10, { mode: "interrupt" }, async () => { await player.wait(4); });
+		await world.inspect({ section: "inventory" });
+	`, { inspect: (query) => queries.push(query) });
+	run.engine.ingestObservation({ observation: observation({ player: { x: 0, y: 64, z: 0, health: 8 } }), eventSequence: 2 });
+	assert.deepEqual(run.cancelled, []);
+	assert.equal(run.dispatched[0].action.arguments, 4);
+	assert.equal(run.dispatched[0].provenance.watcherId, 'watcher-0');
+	run.engine.ingestQueryResult({ queryId: queries[0].queryId, value: { state: 'SUCCEEDED', entries: [] } });
+	assert.equal(run.dispatched.length, 1);
+});
+
+test('inspection rejects unsafe result properties before reading them or losing its continuation', () => {
+	const queries = [];
+	const run = engineFor('program.onUnhandledAttention("continue_and_notify"); await world.inspect({ section: "menu" }); await player.wait(1);', { inspect: (query) => queries.push(query) });
+	let reads = 0;
+	const hostile = Object.defineProperty({}, 'state', { enumerable: true, get() { reads += 1; return 'SUCCEEDED'; } });
+	assert.throws(() => run.engine.ingestQueryResult({ queryId: queries[0].queryId, value: hostile }), (error) => error.code === 'INVALID_FACTS');
+	assert.equal(reads, 0);
+	assert.equal(run.engine.snapshot().activeQueryId, queries[0].queryId);
+	run.engine.ingestQueryResult({ queryId: queries[0].queryId, value: { state: 'FAILED', reasonCode: 'INVALID_INSPECTION' } });
+	assert.equal(run.dispatched.length, 1);
+});
+
 test('a failed factual completion reopens a finished program for an urgent correction', () => {
 	const run = engineFor('program.onUnhandledAttention("continue_and_notify"); program.finish("done");');
 	assert.equal(run.engine.snapshot().status, 'FINISHED');

@@ -6,6 +6,7 @@ import { buildProviderPlannerPrompt } from './prompts.mjs';
 import { createProviderChildEnvironment } from './provider-environment.mjs';
 import { createSessionMetadata, profileFingerprint } from './provider-session.mjs';
 import { reportVisibleOutput } from './verbose-output.mjs';
+import { createExecutionSettings } from './provider-identity.mjs';
 
 const DEFAULT_PLANNING_TIMEOUT_MS = 45_000;
 const DEFAULT_DISCOVERY_TIMEOUT_MS = 15_000;
@@ -120,7 +121,7 @@ export class AcpProviderService {
 		} catch (error) {
 			await transport.stop();
 			if (error?.code === 'PROVIDER_STOPPED') throw error;
-			if (error instanceof AcpProtocolError && ['UNSUPPORTED_MODEL', 'UNSUPPORTED_THINKING'].includes(error.code)) throw error;
+			if (error instanceof AcpProtocolError && ['UNSUPPORTED_MODEL', 'UNSUPPORTED_THINKING', 'PROVIDER_SETTINGS_MISMATCH'].includes(error.code)) throw error;
 			throw new AcpProtocolError('PROVIDER_UNAVAILABLE', `${profile.provider} CLI could not create an ACP session: ${error.message}`, { cause: error });
 		}
 		this.#agents.set(profile.agentId, agent);
@@ -198,6 +199,7 @@ class AcpAgent {
 	#disposed = false;
 	#invalidationError = null;
 	#onInvalidated;
+	#executionSettings;
 
 	constructor(profile, transport, { planningTimeoutMs, maxDecisionBytes, recoverySummary, sessionGeneration = 1, resetReason = null, onInvalidated = () => {} }) {
 		this.#profile = structuredClone(profile);
@@ -208,6 +210,10 @@ class AcpAgent {
 		this.#sessionGeneration = sessionGeneration;
 		this.#resetReason = resetReason ?? null;
 		this.#onInvalidated = onInvalidated;
+		this.#executionSettings = createExecutionSettings(profile, {
+			transport: 'acp', controlProtocol: 'arena_script',
+			evidence: { reasoningEffort: profile.provider === 'kimi' ? 'process_environment' : 'unreported', serviceTier: 'not_supported' },
+		});
 		this.#transport.on?.('exit', (error) => this.#onInvalidated(sessionInvalidated(error, this.provider)));
 		this.#transport.on?.('protocolError', (error) => this.#onInvalidated(sessionInvalidated(error, this.provider)));
 	}
@@ -217,6 +223,7 @@ class AcpAgent {
 	get serviceTier() { return this.#profile.serviceTier; }
 	get sessionGeneration() { return this.#sessionGeneration; }
 	get profileFingerprint() { return profileFingerprint(this.#profile); }
+	get executionSettings() { return structuredClone(this.#executionSettings); }
 	sessionMetadata() {
 		return createSessionMetadata(this.#profile, { sessionGeneration: this.#sessionGeneration, sessionState: this.#sessionState, continuation: 'durable', durability: 'proven', resetReason: this.#resetReason });
 	}
@@ -243,28 +250,49 @@ class AcpAgent {
 
 	async #applyConfig(configOptions) {
 		let currentOptions = configOptions;
+		let requestedModel = this.#profile.model;
 		if (this.#profile.model !== 'auto') {
 			const model = findOption(currentOptions, 'model');
-			const requestedModel = resolveKimiApiKeyModel(this.provider, this.#profile.model, model);
+			requestedModel = resolveKimiApiKeyModel(this.provider, this.#profile.model, model);
 			assertOptionValue(model, requestedModel, 'UNSUPPORTED_MODEL', `${this.provider} model`);
 			if (model.currentValue !== requestedModel) {
 				currentOptions = await this.#setConfig(model.id, requestedModel, currentOptions);
 			}
 		}
+		this.#executionSettings.modelSelector = requestedModel;
+		this.#recordEffectiveSetting('model', findOption(currentOptions, 'model', { optional: true }), requestedModel === 'auto' ? null : requestedModel);
 		const thinking = findOption(currentOptions, 'thought_level', { optional: this.provider === 'kimi' });
-		if (thinking === null) return;
+		if (thinking === null) {
+			this.#executionSettings.limitations.push('effort_not_reported_by_provider');
+			return;
+		}
 		const requested = this.#profile.reasoningEffort;
 		if (this.provider === 'kimi' && isBooleanThinkingOption(thinking)) {
-			if (thinking.currentValue !== 'on') await this.#setConfig(thinking.id, 'on', currentOptions);
+			if (thinking.currentValue !== 'on') currentOptions = await this.#setConfig(thinking.id, 'on', currentOptions);
+			const confirmedThinking = findOption(currentOptions, 'thought_level', { optional: true });
+			if (confirmedThinking?.currentValue === 'off') throw new AcpProtocolError('PROVIDER_SETTINGS_MISMATCH', 'kimi did not enable the selected thinking mode');
+			this.#executionSettings.effective.thinkingMode = confirmedThinking?.currentValue === 'on' ? 'on' : null;
+			this.#executionSettings.limitations.push('effort_not_reported_by_provider');
 			return;
 		}
 		assertOptionValue(thinking, requested, 'UNSUPPORTED_THINKING', `${this.provider} thinking`);
-		if (thinking.currentValue !== requested) await this.#setConfig(thinking.id, requested, currentOptions);
+		if (thinking.currentValue !== requested) currentOptions = await this.#setConfig(thinking.id, requested, currentOptions);
+		this.#recordEffectiveSetting('reasoningEffort', findOption(currentOptions, 'thought_level', { optional: true }), requested);
+	}
+
+	#recordEffectiveSetting(field, option, requested) {
+		const value = option?.currentValue;
+		const reported = typeof value === 'string' && value.length > 0 && value.length <= 256 && !(field === 'model' && value === 'auto') ? value : null;
+		if (reported !== null && requested !== null && reported !== requested) {
+			throw new AcpProtocolError('PROVIDER_SETTINGS_MISMATCH', `${this.provider} did not confirm the selected ${field}`);
+		}
+		this.#executionSettings.effective[field] = reported;
+		this.#executionSettings.evidence[field] = reported === null ? 'submitted' : 'provider_reported';
 	}
 
 	async #setConfig(configId, value, fallbackOptions) {
 		const response = await this.#transport.request('session/set_config_option', { sessionId: this.#sessionId, configId, value });
-		return Array.isArray(response?.configOptions) ? response.configOptions : fallbackOptions;
+		return Array.isArray(response?.configOptions) ? response.configOptions : fallbackOptions.map((option) => option.id === configId ? { ...option, currentValue: null } : option);
 	}
 
 	async setGoalRevision(revision) {
@@ -353,6 +381,7 @@ class AcpAgent {
 			outputHandled = true;
 			const tokens = acpTokenUsage(response?.usage) ?? (this.provider === 'gemini' ? geminiQuotaTokenUsage(response?._meta) : null);
 			recordProviderTurn(turnRecorder, {
+				executionSettings: this.executionSettings,
 				agentId: this.agentId,
 				provider: this.provider, model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input: prompt, output: parseError === null ? decisionText : '', error: structuredProviderError(parseError),
@@ -363,6 +392,7 @@ class AcpAgent {
 			return decision;
 		} catch (error) {
 			if (!outputHandled) recordProviderTurn(turnRecorder, {
+				executionSettings: this.executionSettings,
 				agentId: this.agentId,
 				provider: this.provider, model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input: prompt, output: rawOutput, error,

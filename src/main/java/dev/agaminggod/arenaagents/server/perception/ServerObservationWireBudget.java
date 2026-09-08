@@ -18,50 +18,76 @@ public final class ServerObservationWireBudget {
 		Objects.requireNonNull(source, "source must not be null");
 		Objects.requireNonNull(fitsCompleteEnvelope, "fitsCompleteEnvelope must not be null");
 		JsonObject candidate = source.deepCopy();
+		Predicate<JsonObject> fits = value -> {
+			refreshCoverage(source, value);
+			return fitsCompleteEnvelope.test(value);
+		};
 		ArrayList<String> reductions = new ArrayList<>();
-		if (fitsCompleteEnvelope.test(candidate)) return fitted(candidate, reductions);
+		if (fits.test(candidate)) return fitted(candidate, reductions);
 
 		if (removeCandidateTags(candidate)) reductions.add("candidateTags");
-		if (fitsCompleteEnvelope.test(candidate)) return fitted(candidate, reductions);
+		if (candidate.has("coverage") && !reductions.isEmpty()) candidate.getAsJsonObject("coverage").addProperty("tagsOmitted", true);
+		if (fits.test(candidate)) return fitted(candidate, reductions);
 
-		if (trimTail(candidate, candidate.get("landmarks"), fitsCompleteEnvelope, "landmarks", reductions)) {
+		if (trimTail(candidate, candidate.get("landmarks"), fits, "landmarks", reductions)) {
 			return fitted(candidate, reductions);
 		}
-		if (trimTail(candidate, candidate.get("blocks"), fitsCompleteEnvelope, "blocks", reductions)) {
+		if (trimTail(candidate, candidate.get("blocks"), fits, "blocks", reductions)) {
 			return fitted(candidate, reductions);
 		}
-		if (trimTail(candidate, candidate.get("nearbyContainers"), fitsCompleteEnvelope,
+		if (trimTail(candidate, candidate.get("nearbyContainers"), fits,
 				"nearbyContainers", reductions)) {
 			return fitted(candidate, reductions);
 		}
-		if (trimTail(candidate, candidate.get("entities"), fitsCompleteEnvelope, "entities", reductions)) {
+		if (trimTail(candidate, candidate.get("entities"), fits, "entities", reductions)) {
 			return fitted(candidate, reductions);
 		}
 
 		JsonObject player = object(candidate, "player");
-		if (trimTail(candidate, player == null ? null : player.get("effects"), fitsCompleteEnvelope,
+		if (trimTail(candidate, player == null ? null : player.get("effects"), fits,
 				"player.effects", reductions)) {
 			return fitted(candidate, reductions);
 		}
 
 		if (dropSingleton(candidate.get("landmarks"), "landmarks", reductions)
-				&& fitsCompleteEnvelope.test(candidate)) return fitted(candidate, reductions);
+				&& fits.test(candidate)) return fitted(candidate, reductions);
 		if (dropSingleton(candidate.get("blocks"), "blocks", reductions)
-				&& fitsCompleteEnvelope.test(candidate)) return fitted(candidate, reductions);
+				&& fits.test(candidate)) return fitted(candidate, reductions);
 		if (dropSingleton(candidate.get("nearbyContainers"), "nearbyContainers", reductions)
-				&& fitsCompleteEnvelope.test(candidate)) return fitted(candidate, reductions);
+				&& fits.test(candidate)) return fitted(candidate, reductions);
 		if (dropSingleton(candidate.get("entities"), "entities", reductions)
-				&& fitsCompleteEnvelope.test(candidate)) return fitted(candidate, reductions);
+				&& fits.test(candidate)) return fitted(candidate, reductions);
 		if (dropSingleton(player == null ? null : player.get("effects"), "player.effects", reductions)
-				&& fitsCompleteEnvelope.test(candidate)) return fitted(candidate, reductions);
-		if (!fitsCompleteEnvelope.test(candidate)) {
+				&& fits.test(candidate)) return fitted(candidate, reductions);
+		if (!fits.test(candidate)) {
 			throw new BridgeProtocolException("OBSERVATION_TOO_LARGE",
 					"Protected observation facts exceed the complete bridge envelope limit");
 		}
 		return fitted(candidate, reductions);
 	}
 
+	private static void refreshCoverage(JsonObject source, JsonObject candidate) {
+		JsonObject coverage = object(candidate, "coverage");
+		if (coverage == null) return;
+		JsonObject sections = object(coverage, "sections");
+		if (sections == null) return;
+		JsonObject sourceSections = object(object(source, "coverage"), "sections");
+		for (String field : List.of("blocks", "landmarks", "entities", "nearbyContainers")) {
+			JsonObject section = object(sections, field);
+			JsonObject original = object(sourceSections, field);
+			if (section == null || original == null) continue;
+			int before = original.get("returned").getAsInt()
+					+ (original.has("omittedByWire") ? original.get("omittedByWire").getAsInt() : 0);
+			JsonArray values = array(candidate, field);
+			int returned = values == null ? 0 : values.size();
+			section.addProperty("returned", returned);
+			if (before > returned) section.addProperty("omittedByWire", before - returned);
+		}
+	}
+
 	private static Fitted fitted(JsonObject candidate, List<String> reductions) {
+		// Binary search restores its winning prefix after the last predicate call.
+		refreshCoverage(candidate, candidate);
 		// The predicate has observed candidate, so establish sole ownership before taking the trusted path.
 		return Fitted.trusted(candidate.deepCopy(), reductions);
 	}

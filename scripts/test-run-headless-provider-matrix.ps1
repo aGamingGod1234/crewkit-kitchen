@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-	[switch] $SetupFailureOnly
+	[switch] $SetupFailureOnly,
+	[switch] $KeepFixture
 )
 
 Set-StrictMode -Version Latest
@@ -361,7 +362,7 @@ function Test-FastExitResourceSampling([string] $WorkingDirectory) {
 	$childScript = Join-Path $WorkingDirectory 'fast-child.ps1'
 	$rootScript = Join-Path $WorkingDirectory 'fast-root.ps1'
 	Set-Content -LiteralPath $childScript -Value 'Start-Sleep -Seconds 30' -NoNewline
-	Set-Content -LiteralPath $rootScript -Value "Start-Process powershell -ArgumentList '-NoProfile','-File','$childScript'; Start-Sleep -Milliseconds 100" -NoNewline
+	Set-Content -LiteralPath $rootScript -Value "Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile','-File','$childScript'; Start-Sleep -Milliseconds 100" -NoNewline
 	$treeHandle = Start-RedirectedProcess powershell.exe ("-NoProfile -File `"$rootScript`"") $WorkingDirectory (Join-Path $WorkingDirectory 'fast-tree.stdout.log') (Join-Path $WorkingDirectory 'fast-tree.stderr.log') @{}
 	$treeTracked = [System.Collections.Generic.List[object]]::new()
 	try {
@@ -478,11 +479,11 @@ try {
 	Set-Content -LiteralPath $catalogMatrix -Value '{"version":1,"scenarios":[{"id":"fixture","provider":"codex","model":"fixture","reasoningEffort":"low","serviceTier":"fast","task":"fixture","timeoutMs":1000,"assert":[{"type":"lifecycle","state":"COMPLETED"}]}]}' -NoNewline
 	Set-Content -LiteralPath (Join-Path $fixture 'fake-appdata\no-catalog') -Value 'hold model/list' -NoNewline
 	try {
-		& $scriptPath -ProjectRoot $fixture -MatrixPath $catalogMatrix -ServerTemplate (Join-Path $fixture 'runtime\server-template') | Out-Null
+		Assert-Fails { & $scriptPath -ProjectRoot $fixture -MatrixPath $catalogMatrix -ServerTemplate (Join-Path $fixture 'runtime\server-template') } 'Coordinator (?:bridge did not become ready|exited before bridge readiness)'
 	} finally {
 		Remove-Item -LiteralPath (Join-Path $fixture 'fake-appdata\no-catalog') -Force -ErrorAction SilentlyContinue
 	}
-	Write-Output 'PASS configured bootstrap catalog keeps readiness independent of slow provider discovery'
+	Write-Output 'PASS empty-roster startup waits for advertised provider settings before launching a task'
 	Assert-Fails { & $scriptPath -ProjectRoot $fixture -MatrixPath (Join-Path $fixture 'matrix.json') -ServerTemplate (Join-Path $fixture 'runtime\server-template') } 'ready|timed out|failed|required'
 	if (-not (Test-PortClosed 39165) -or -not (Test-PortClosed 39166) -or -not (Test-PortClosed 39167)) { throw 'Allocated ports remained open after timeout cleanup' }
 	$runRoot = Join-Path $fixture 'runtime\headless-runs'
@@ -512,7 +513,7 @@ try {
 	Set-TestEnvironment 'ARENA_HEADLESS_MINECRAFT_PORT' '39168'
 	Set-TestEnvironment 'ARENA_HEADLESS_RCON_PORT' '39169'
 	Set-TestEnvironment 'ARENA_HEADLESS_BRIDGE_PORT' '39170'
-	& $scriptPath -ProjectRoot $fixture -MatrixPath $successMatrix -ServerTemplate (Join-Path $fixture 'runtime\server-template') | Out-Null
+	& $scriptPath -ProjectRoot $fixture -MatrixPath $successMatrix -ServerTemplate (Join-Path $fixture 'runtime\server-template') -KeepArtifacts:$KeepFixture | Out-Null
 	$successMatrixReportPath = Join-Path (Get-ChildItem -LiteralPath $runRoot -Directory | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1).FullName 'matrix-report.json'
 	$successMatrixReport = Get-Content -Raw -LiteralPath $successMatrixReportPath | ConvertFrom-Json
 	if ($successMatrixReport.status -ne 'PASSED' -or $successMatrixReport.scenarios[0].status -ne 'PASSED' -or $successMatrixReport.scenarios[0].cleanup.status -ne 'CLEAN') { throw 'Successful normal-cleanup fixture did not pass cleanly' }
@@ -575,8 +576,8 @@ try {
 	}
 
 	$dummyScript = Join-Path $project 'dummy-child-tree.ps1'
-	Set-Content -LiteralPath $dummyScript -Value "Start-Process powershell -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 30'`nStart-Sleep -Seconds 30" -NoNewline
-	$dummyRoot = Start-Process powershell -ArgumentList '-NoProfile','-File',$dummyScript -PassThru
+	Set-Content -LiteralPath $dummyScript -Value "Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 30'`nStart-Sleep -Seconds 30" -NoNewline
+	$dummyRoot = Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile','-File',$dummyScript -PassThru
 	try {
 		Start-Sleep -Milliseconds 500
 		Stop-TestProcessTree $dummyRoot.Id
@@ -595,7 +596,9 @@ try {
 	foreach ($name in @('ARENA_HEADLESS_JAVA','ARENA_HEADLESS_SKIP_PROVIDER_PREFLIGHT','ARENA_HEADLESS_MINECRAFT_PORT','ARENA_HEADLESS_RCON_PORT','ARENA_HEADLESS_BRIDGE_PORT','ARENA_HEADLESS_FAKE_NO_HELLO_ACK','ARENA_HEADLESS_FAKE_SUMMON_RESPONSE','ARENA_HEADLESS_STARTUP_TIMEOUT_SECONDS','ARENA_HEADLESS_CLEANUP_TIMEOUT_SECONDS','ARENA_HEADLESS_RUNNER_GRACE_SECONDS','ARENA_HEADLESS_GRACEFUL_STOP_TIMEOUT_SECONDS','ARENA_HEADLESS_OUTPUT_DRAIN_TIMEOUT_MILLISECONDS')) { Set-TestEnvironment $name $null }
 	Set-TestEnvironment 'APPDATA' $originalAppData
 	Set-TestEnvironment 'LOCALAPPDATA' $originalLocalAppData
-	if (Test-Path -LiteralPath $project) {
+	if ($KeepFixture) {
+		Write-Output "Kept diagnostic fixture: $project"
+	} elseif (Test-Path -LiteralPath $project) {
 		$extendedProject = if ($project.StartsWith('\\')) { '\\?\UNC\' + $project.Substring(2) } else { '\\?\' + [IO.Path]::GetFullPath($project) }
 		[IO.Directory]::Delete($extendedProject, $true)
 	}

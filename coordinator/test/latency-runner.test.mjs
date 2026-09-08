@@ -10,6 +10,7 @@ import { createReplayProvider, createReplayRecord } from '../src/benchmark/provi
 import { getSimulatorScenario } from '../src/simulator/simulator-scenarios.mjs';
 import { compileScenarioDecision } from '../src/benchmark/scenario-program.mjs';
 import { VIRTUAL_TICK_MS, VirtualWorld } from '../src/simulator/virtual-world.mjs';
+import { VirtualMinecraftBridge } from '../src/simulator/virtual-minecraft-bridge.mjs';
 
 const PROFILE = Object.freeze({ provider: 'instant', model: 'deterministic-v1', reasoningEffort: 'fixed', serviceTier: 'local' });
 const SOURCE = 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); program.finish("done");';
@@ -591,9 +592,10 @@ test('replay mode uses the same full coordinator path and rejects prompt drift',
 	let prompt = null;
 	const scenario = fixtureScenario();
 	const liveMatrix = matrix({ trials: [{ ...matrix().trials[0], id: 'replay-path', mode: 'live', providerProfile: profile }] });
-	const providerFactory = () => ({ available: true, provider: 'codex', model: profile.model, reasoningEffort: profile.reasoningEffort, serviceTier: profile.serviceTier, providerProfile: profile, async createAgent() { return { async setGoalRevision() {}, async decide(input) { prompt = input; return fixtureDecision(); } }; }, async stop() {} });
+	const providerFactory = () => ({ available: true, synthetic: true, provider: 'codex', model: profile.model, reasoningEffort: profile.reasoningEffort, serviceTier: profile.serviceTier, providerProfile: profile, async createAgent() { return { async setGoalRevision() {}, async decide(input) { prompt = input; return fixtureDecision(); } }; }, async stop() {} });
 	const first = await runLatencyMatrix({ matrix: liveMatrix, scenarioResolver: () => scenario, providerFactories: { codex: providerFactory }, artifactDirectory: null });
 	assert.equal(first.trials[0].status, 'PASSED');
+	assert.match(prompt, /"worldId":"fixture-[a-f0-9]{28}"/);
 	const recording = createReplayRecord({ trialId: 'replay-path', prompt, providerProfile: profile, scenario, protocolVersion: 2, decision: fixtureDecision() });
 	const replayMatrix = matrix({ trials: [{ ...liveMatrix.trials[0], mode: 'replay' }] });
 	const replay = await runLatencyMatrix({
@@ -607,6 +609,33 @@ test('replay mode uses the same full coordinator path and rejects prompt drift',
 		providerFactories: { codex: () => createReplayProvider({ recording, trialId: 'replay-path', prompt: `${prompt}-drift`, providerProfile: profile, scenario, protocolVersion: 2 }) }, artifactDirectory: null,
 	});
 	assert.equal(drift.trials[0].error.code, 'REPLAY_IDENTITY_MISMATCH');
+});
+
+test('only synthetic benchmark sessions reuse fixture identity and preserve an explicit world ID', async () => {
+	const profile = { provider: 'codex', model: 'fixture-model', reasoningEffort: 'high', serviceTier: 'fast' };
+	const scenario = fixtureScenario();
+	scenario.world.worldId = 'fixture-world-session-isolation';
+	const trial = { ...matrix().trials[0], mode: 'live', providerProfile: profile };
+	const run = async (synthetic) => {
+		let virtual;
+		const result = await runLatencyMatrix({
+			matrix: matrix({ trials: [trial] }),
+			scenarioResolver: () => scenario,
+			providerFactories: { codex: () => ({ ...profile, synthetic, available: true, async createAgent() { return { async setGoalRevision() {}, async decide() { return fixtureDecision(); } }; } }) },
+			virtualBridgeFactory: (options) => { virtual = new VirtualMinecraftBridge(options); return virtual; },
+			artifactDirectory: null,
+		});
+		assert.equal(result.status, 'PASSED');
+		assert.equal(virtual.world.observation(scenario.agentId).world.worldId, scenario.world.worldId);
+		return virtual.sent.find((message) => message.type === 'action_command').payload;
+	};
+	const fixtureA = await run(true);
+	const fixtureB = await run(true);
+	assert.deepEqual(fixtureA, fixtureB);
+	const liveA = await run(false);
+	const liveB = await run(false);
+	assert.notEqual(liveA.actionId, liveB.actionId);
+	assert.deepEqual(liveA.provenance, liveB.provenance);
 });
 
 test('Codex benchmark sessions receive the explicit ArenaScript protocol', async () => {
@@ -647,6 +676,7 @@ test('paces delayed replay ticks against wall time instead of racing virtual tim
 	let prompt = null;
 	const liveProvider = () => ({
 		available: true,
+		synthetic: true,
 		provider: profile.provider,
 		model: profile.model,
 		reasoningEffort: profile.reasoningEffort,

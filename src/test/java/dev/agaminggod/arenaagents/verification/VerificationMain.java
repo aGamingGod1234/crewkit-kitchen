@@ -42,6 +42,7 @@ import dev.agaminggod.arenaagents.server.GoalDraftAdvancementRevalidationVerific
 import dev.agaminggod.arenaagents.server.QueuedGoalRevalidationVerification;
 import dev.agaminggod.arenaagents.server.AgentSavedDataGoalDraftVerification;
 import dev.agaminggod.arenaagents.server.goal.GoalCompilerVerification;
+import dev.agaminggod.arenaagents.server.goal.GoalInventoryCapacityVerification;
 import dev.agaminggod.arenaagents.server.conversation.AgentConversationRouterVerification;
 import dev.agaminggod.arenaagents.server.conversation.NativeAgentWhisperTargetsVerification;
 import dev.agaminggod.arenaagents.server.group.AgentGroupRegistryVerification;
@@ -87,7 +88,6 @@ import dev.agaminggod.arenaagents.server.runtime.ResourceLeaseManagerVerificatio
 import dev.agaminggod.arenaagents.server.runtime.RecipeActionVerification;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionExecutorVerification;
 import dev.agaminggod.arenaagents.server.goal.GoalVerificationRuntimeVerification;
-import dev.agaminggod.arenaagents.server.goal.GoalSafetyControllerVerification;
 import dev.agaminggod.arenaagents.server.runtime.ActionSuccessLedgerVerification;
 import dev.agaminggod.arenaagents.server.runtime.input.InputStateVerification;
 import dev.agaminggod.arenaagents.server.perception.AttentionHazardVerification;
@@ -153,6 +153,7 @@ public final class VerificationMain {
 		passedAssertions += QueuedGoalRevalidationVerification.verify();
 		passedAssertions += AgentSavedDataGoalDraftVerification.verify();
 		passedAssertions += GoalCompilerVerification.verify();
+		passedAssertions += GoalInventoryCapacityVerification.verify();
 		passedAssertions += AgentConversationRouterVerification.verify();
 		passedAssertions += NativeAgentWhisperTargetsVerification.verify();
 		passedAssertions += AgentGroupRegistryVerification.verify();
@@ -210,7 +211,9 @@ public final class VerificationMain {
 		passedAssertions += EquipmentAndUseVerification.verify();
 		passedAssertions += ServerActionExecutorVerification.verify();
 		passedAssertions += GoalVerificationRuntimeVerification.verify();
-		passedAssertions += GoalSafetyControllerVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.perception.ObservationPageVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.perception.PlayerObservationEventsVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.runtime.input.RidingJumpInputVerification.verify();
 		passedAssertions += ActionSuccessLedgerVerification.verify();
 		passedAssertions += InputStateVerification.verify();
 		passedAssertions += AttentionHazardVerification.verify();
@@ -265,6 +268,7 @@ public final class VerificationMain {
 		List<String> expectedWireNames = List.of(
 				"move_to",
 				"control",
+				"control_sequence",
 				"look_at",
 				"attack",
 				"select_item",
@@ -293,6 +297,13 @@ public final class VerificationMain {
 				"interact_entity",
 				"dismount",
 				"start_fall_flying",
+				"wake_up",
+				"set_flight",
+				"write_sign",
+				"edit_book",
+				"menu_click",
+				"menu_close",
+				"beacon_effects",
 				"menu_transfer",
 				"menu_button",
 				"anvil_rename",

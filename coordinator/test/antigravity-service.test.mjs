@@ -189,6 +189,8 @@ test('Antigravity production mode neither advertises nor creates planner session
 	});
 	const catalog = await service.catalog.refresh({ force: true });
 	assert.deepEqual(catalog.models, []);
+	assert.equal(catalog.availability.playable, false);
+	assert.deepEqual(catalog.availability, service.availability);
 	assert.equal(discovered, false);
 	await assert.rejects(
 		service.createAgent(profile({ agentId: 'gemini-boundary' })),

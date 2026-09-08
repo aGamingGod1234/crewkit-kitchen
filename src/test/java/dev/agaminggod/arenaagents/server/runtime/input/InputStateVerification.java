@@ -31,6 +31,7 @@ public final class InputStateVerification {
 		assertions += verifyRuntimeAllowsFailedCleanupRetry();
 		assertions += verifyExactHandUseDriver();
 		assertions += verifyBoundedMotor();
+		assertions += ControlSequenceVerification.verify();
 		assertions += verifyMotorWorldHeading();
 		return assertions;
 	}
@@ -562,11 +563,13 @@ public final class InputStateVerification {
 				ExactHandUseDriver.TargetKind.BLOCK, true, false
 		);
 		driver.tick(AGENT, InteractionHand.MAIN_HAND, restartedAfterClear, 100L);
+		assertEquals(1L, driver.acceptedUses(AGENT), "use receipt counts an accepted vanilla operation");
 		assertEquals(1, restartedAfterClear.targetHands.size(),
 				"full clear discards the historical execution stamp before controller reuse");
 		driver.stop(AGENT, restartedAfterClear);
 		driver.discard(AGENT);
-		return 39;
+		assertEquals(0L, driver.acceptedUses(AGENT), "cleanup clears accepted-use evidence before the next lease");
+		return 41;
 	}
 
 	private static int verifyBoundedMotor() {

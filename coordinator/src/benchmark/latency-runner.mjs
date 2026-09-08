@@ -201,7 +201,8 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 		const goalSpec = benchmarkGoalSpec(goal);
 		records = scenario.agentIds.map((agentId) => ({ agentId, provider: internalProvider(trial.providerProfile.provider), model: trial.providerProfile.model, reasoningEffort: trial.providerProfile.reasoningEffort, serviceTier: trial.providerProfile.serviceTier, state: DynamicAgentState.IDLE, currentGoal: null, currentGoalSpec: null, goalRevision: 0, queue: [] }));
 		const virtualRecords = records.map((record) => ({ ...record, state: DynamicAgentState.STARTING, currentGoal: goal, currentGoalSpec: goalSpec, goalRevision: 1 }));
-		world = new VirtualWorld(scenario.world, { scheduler: manualScheduler() });
+		const fixtureId = `fixture-${hash({ trialId: trial.id, repetition, scenarioId: trial.scenarioId, seed: trial.seed, agentLoad: trial.agentLoad, providerProfile: trial.providerProfile }).slice(7, 35)}`;
+		world = new VirtualWorld({ ...scenario.world, worldId: scenario.world.worldId ?? fixtureId }, { scheduler: manualScheduler() });
 		metrics?.attachWorld(world, scenario, scenario.agentIds);
 		initialSnapshots = new Map(scenario.agentIds.map((agentId) => [agentId, captureScenarioInitialSnapshot({ manifest: scenario.agentManifests?.[agentId] ?? rawScenario, world, agentId })]));
 		const virtual = virtualBridgeFactory({ world, agentRecords: virtualRecords, serverInstanceId: `latency-${trial.id}-${repetition}`, trial, repetition });
@@ -220,6 +221,8 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 		const providerService = factory !== null ? createInjectedProviderService(provider, trial, turnBudget(trial), deadline, () => ++turnCount, stopProvider, stopProviderAfterTimeout) : null;
 		const config = benchmarkCoordinatorConfig(trial.agentLoad, options.planningConcurrency ?? trial.agentLoad);
 		coordinator = createDynamicCoordinator(config, {
+			memoryDirectory: null,
+			...(trial.mode !== 'live' || provider.synthetic === true ? { runtimeSessionId: fixtureId } : {}),
 			bridge,
 			scheduler,
 			benchmarkRecorder: trialRecorder,

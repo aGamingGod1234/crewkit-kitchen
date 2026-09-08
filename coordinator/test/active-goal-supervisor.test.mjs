@@ -68,6 +68,17 @@ test('explicit suspension cancels every owned timer and lease', () => {
 	assert.deepEqual(supervisor.snapshot(key).leases, []);
 });
 
+test('begin forwards an explicit native timeout and progress keeps that timeout', () => {
+	const { supervisor, timers } = timerFixture();
+	supervisor.activate(key);
+	const token = supervisor.begin(key, 'provider', { timeoutMs: 900_000 });
+	assert.equal([...timers.values()][0].delay, 900_000);
+	assert.equal(supervisor.progress(token), true);
+	assert.equal([...timers.values()][0].delay, 900_000);
+	assert.equal(supervisor.snapshot(key).leases[0].timeoutMs, 900_000);
+	supervisor.close();
+});
+
 test('stale tokens cannot settle work belonging to a newer fenced goal', () => {
 	const { supervisor } = timerFixture();
 	supervisor.activate(key);

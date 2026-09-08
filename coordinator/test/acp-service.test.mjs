@@ -32,6 +32,7 @@ class FakeAcpTransport extends EventEmitter {
 			if (params.configId === 'model' && this.configOptionsAfterModel !== null) {
 				this.configOptions = this.configOptionsAfterModel;
 			}
+			this.configOptions = this.configOptions.map((option) => option.id === params.configId ? { ...option, currentValue: params.value } : option);
 			return { configOptions: this.configOptions };
 		}
 		if (method === 'session/prompt') {
@@ -57,6 +58,31 @@ function options({ thinkingValues = ['low', 'medium', 'high'] } = {}) {
 		{ id: 'thinking', category: 'thought_level', type: 'select', currentValue: thinkingValues[0], options: thinkingValues.map((value) => ({ value, name: value })) },
 	];
 }
+
+test('ACP reports confirmed settings and keeps returned metadata independent of the session', async () => {
+	const service = new AcpProviderService({ provider: 'gemini', cwd: 'C:\\workspace', models: ['gemini-pro'] }, { transportFactory: () => new FakeAcpTransport(options()) });
+	const selected = { agentId: 'settings', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high', serviceTier: 'priority' };
+	const agent = await service.createAgent(selected);
+	const settings = agent.executionSettings;
+	assert.deepEqual(settings.effective, { provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high', serviceTier: null, thinkingMode: null });
+	assert.equal(settings.evidence.reasoningEffort, 'provider_reported');
+	settings.requested.model = 'other';
+	assert.equal(agent.executionSettings.requested.model, selected.model);
+	const replacement = await service.replaceAgent(selected);
+	assert.deepEqual(replacement.executionSettings, agent.executionSettings);
+	await service.stop();
+});
+
+test('ACP refuses a provider-reported model substitution instead of changing the selected profile', async () => {
+	const transport = new FakeAcpTransport(options());
+	const request = transport.request.bind(transport);
+	transport.request = async (method, params) => method === 'session/set_config_option' ? { configOptions: transport.configOptions } : request(method, params);
+	const service = new AcpProviderService({ provider: 'gemini', cwd: 'C:\\workspace', models: ['gemini-pro'] }, { transportFactory: () => transport });
+	await assert.rejects(service.createAgent({ agentId: 'mismatch', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high' }), (error) => error.code === 'PROVIDER_SETTINGS_MISMATCH');
+	assert.equal(transport.started, false);
+	assert.equal(service.getAgent('mismatch'), null);
+	await service.stop();
+});
 
 test('Gemini ACP sessions apply the exact model and thinking level and parse planner output', async () => {
 	const transport = new FakeAcpTransport(options());
@@ -344,7 +370,12 @@ test('Kimi ACP treats its boolean thinking switch as enabled while the exact eff
 		{ id: 'thinking', category: 'thought_level', type: 'select', currentValue: 'on', options: [{ value: 'on', name: 'On' }] },
 	]);
 	const service = new AcpProviderService({ provider: 'kimi', cwd: 'C:\\workspace', reasoningEfforts: ['low', 'high', 'max'] }, { transportFactory: () => transport });
-	await service.createAgent({ agentId: 'kimi-low', provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'low' });
+	const agent = await service.createAgent({ agentId: 'kimi-low', provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'low' });
+	assert.equal(agent.executionSettings.requested.reasoningEffort, 'low');
+	assert.equal(agent.executionSettings.effective.reasoningEffort, null);
+	assert.equal(agent.executionSettings.effective.thinkingMode, 'on');
+	assert.equal(agent.executionSettings.evidence.reasoningEffort, 'process_environment');
+	assert.equal(agent.executionSettings.effective.serviceTier, null);
 	assert.equal(transport.calls.some((call) => call.params?.configId === 'thinking' && call.params.value === 'low'), false);
 	await service.stop();
 });
@@ -354,7 +385,10 @@ test('Kimi ACP accepts sessions that expose no thinking control because effort i
 		{ id: 'model', category: 'model', type: 'select', currentValue: 'kimi-code/k3', options: [{ value: 'kimi-code/k3', name: 'K3' }] },
 	]);
 	const service = new AcpProviderService({ provider: 'kimi', cwd: 'C:\\workspace', reasoningEfforts: ['low', 'high', 'max'] }, { transportFactory: () => transport });
-	await service.createAgent({ agentId: 'kimi-no-thinking-option', provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'low' });
+	const agent = await service.createAgent({ agentId: 'kimi-no-thinking-option', provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'low' });
+	assert.equal(agent.executionSettings.effective.reasoningEffort, null);
+	assert.equal(agent.executionSettings.effective.thinkingMode, null);
+	assert.deepEqual(agent.executionSettings.limitations, ['effort_not_reported_by_provider']);
 	assert.equal(transport.calls.some((call) => call.params?.configId === 'thinking'), false);
 	await service.stop();
 });
@@ -370,7 +404,10 @@ test('Kimi K3 uses the API-key-backed Moonshot alias when it is available', asyn
 		},
 	]);
 	const service = new AcpProviderService({ provider: 'kimi', cwd: 'C:\\workspace', reasoningEfforts: ['low', 'high', 'max'] }, { transportFactory: () => transport });
-	await service.createAgent({ agentId: 'kimi-api-k3', provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'high' });
+	const agent = await service.createAgent({ agentId: 'kimi-api-k3', provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'high' });
+	assert.equal(agent.executionSettings.requested.model, 'kimi-code/k3');
+	assert.equal(agent.executionSettings.effective.model, 'moonshot-ai/kimi-k3');
+	assert.equal(agent.executionSettings.transport, 'acp');
 	assert.equal(transport.calls.some((call) => call.params?.configId === 'model'), false);
 	await service.stop();
 });

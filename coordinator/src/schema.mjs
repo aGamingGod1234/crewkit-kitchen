@@ -1,5 +1,8 @@
 import {
 	ACTION_FIELDS,
+	OPTIONAL_ACTION_FIELDS,
+	CONTROL_BRANCH_CONDITIONS,
+	CONTROL_THRESHOLD_MAXIMA,
 	BLOCK_FACES,
 	MAX_BLOCKS,
 	MAX_CONVERSATION_LENGTH,
@@ -28,6 +31,7 @@ const ACTION_TYPES = new Set(Object.keys(ACTION_FIELDS));
 const TERMINAL_STATES = new Set(TERMINAL_ACTION_STATES);
 const FACES = new Set(BLOCK_FACES);
 const TRUSTED_ACTIONS = new WeakSet();
+export const MAX_ACTION_ARGUMENT_BYTES = 32_768;
 const INTEGER_MIN = -2_147_483_648;
 const INTEGER_MAX = 2_147_483_647;
 
@@ -44,9 +48,8 @@ export function validateAction(value) {
 	const action = structuredClone(requireObject(value, 'action'));
 	const type = requireText(action.type, 'action.type', MAX_REASON_CODE_LENGTH);
 	if (!ACTION_TYPES.has(type)) throw invalid('UNKNOWN_ACTION', `Unsupported action '${type}'`);
-	const requiredFields = type === 'place_block'
-		? ACTION_FIELDS[type].filter((field) => field !== 'desiredState')
-		: type === 'chat' ? ['message'] : ACTION_FIELDS[type];
+	const optionalFields = OPTIONAL_ACTION_FIELDS[type] ?? [];
+	const requiredFields = ACTION_FIELDS[type].filter((field) => !optionalFields.includes(field));
 	requireKeys(action, ['type', ...ACTION_FIELDS[type]], 'action', ['type', ...requiredFields]);
 
 	switch (type) {
@@ -64,6 +67,26 @@ export function validateAction(value) {
 			requireIntRange(action.selectedSlot, 'action.selectedSlot', 0, 8);
 			requireOneOf(action.hand, 'action.hand', ['main', 'off']);
 			requireIntRange(action.ticks, 'action.ticks', 1, 200);
+			break;
+		case 'control_sequence':
+			if (!Array.isArray(action.frames) || action.frames.length < 1 || action.frames.length > 64) throw invalid('INVALID_FIELD', 'action.frames must contain 1 to 64 frames');
+			requireIntRange(action.maxTicks, 'action.maxTicks', 1, 2000);
+			for (const frame of action.frames) {
+				requireObject(frame, 'frame');
+				requireKeys(frame, [...ACTION_FIELDS.control, 'branches'], 'frame', ACTION_FIELDS.control);
+				const { branches, ...input } = frame;
+				validateAction({ type: 'control', ...input });
+				if (branches === undefined) continue;
+				if (!Array.isArray(branches) || branches.length > 16) throw invalid('INVALID_FIELD', 'frame.branches must contain at most 16 conditions');
+				for (const branch of branches) {
+					requireObject(branch, 'branch');
+					requireKeys(branch, ['condition', 'value', 'nextFrame'], 'branch');
+					requireOneOf(branch.condition, 'branch.condition', Object.keys(CONTROL_BRANCH_CONDITIONS));
+					if (CONTROL_BRANCH_CONDITIONS[branch.condition] === 'number') requireFiniteRange(branch.value, 'branch.value', 0, CONTROL_THRESHOLD_MAXIMA[branch.condition]);
+					else requireBoolean(branch.value, 'branch.value');
+					requireIntRange(branch.nextFrame, 'branch.nextFrame', 0, action.frames.length);
+				}
+			}
 			break;
 		case 'navigate_to':
 			requireCoordinates(action, false, 'action');
@@ -130,6 +153,10 @@ export function validateAction(value) {
 			requireText(action.itemId, 'action.itemId', MAX_IDENTIFIER_LENGTH);
 			break;
 		case 'use_item':
+			if (action.hand !== undefined) requireOneOf(action.hand, 'action.hand', ['main', 'off']);
+			if (action.expectedItemId !== undefined) requireText(action.expectedItemId, 'action.expectedItemId', MAX_IDENTIFIER_LENGTH);
+			requireDuration(action.durationMs, 'action.durationMs');
+			break;
 		case 'wait':
 			requireDuration(action.durationMs, 'action.durationMs');
 			break;
@@ -165,20 +192,60 @@ export function validateAction(value) {
 			}
 			break;
 		case 'interact_block':
+			validateHitOffsets(action, 0, 1);
 			requireCoordinates(action, true, 'action');
 			if (!FACES.has(action.face)) throw invalid('INVALID_FIELD', `action.face must be one of ${BLOCK_FACES.join(', ')}`);
 			requireOneOf(action.hand, 'action.hand', ['main', 'off']);
 			requireText(action.expectedItemId, 'action.expectedItemId', MAX_IDENTIFIER_LENGTH);
 			break;
 		case 'interact_entity':
+			validateHitOffsets(action, -16, 16);
 			requireTargetId(action.targetId, 'action.targetId');
 			requireOneOf(action.hand, 'action.hand', ['main', 'off']);
 			requireText(action.expectedItemId, 'action.expectedItemId', MAX_IDENTIFIER_LENGTH);
 			break;
 		case 'dismount':
 		case 'start_fall_flying':
+		case 'wake_up':
+			break;
+		case 'set_flight':
+			requireBoolean(action.enabled, 'action.enabled');
+			break;
+		case 'write_sign':
+			requireCoordinates(action, true, 'action');
+			requireBoolean(action.front, 'action.front');
+			for (const field of ['lines', 'expectedLines']) {
+				if (!Array.isArray(action[field]) || action[field].length !== 4 || action[field].some((line) => typeof line !== 'string' || line.length > 384)) throw invalid('INVALID_FIELD', `${field} requires four lines of at most 384 characters`);
+			}
+			break;
+		case 'edit_book':
+			if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 40].includes(action.slot)) throw invalid('INVALID_FIELD', 'Book must be in hotbar or offhand');
+			if (!Array.isArray(action.pages) || action.pages.length > 100 || action.pages.some((page) => typeof page !== 'string' || page.length > 1024)) throw invalid('INVALID_FIELD', 'Book supports at most 100 pages of 1024 characters');
+			if (action.title !== undefined) requireText(action.title, 'action.title', 32);
+			requireText(action.expectedFingerprint, 'action.expectedFingerprint', 256);
+			break;
+		case 'menu_click':
+		case 'menu_close':
+		case 'beacon_effects':
+			requireText(action.menuId, 'action.menuId', MAX_IDENTIFIER_LENGTH);
+			requireIntRange(action.containerId, 'action.containerId', 0, INTEGER_MAX);
+			requireIntRange(action.stateId, 'action.stateId', 0, INTEGER_MAX);
+			if (type === 'beacon_effects') {
+				requireText(action.primaryEffectId, 'action.primaryEffectId', MAX_IDENTIFIER_LENGTH);
+				requireText(action.secondaryEffectId, 'action.secondaryEffectId', MAX_IDENTIFIER_LENGTH);
+			}
+			if (type === 'menu_click') {
+				requireIntRange(action.slot, 'action.slot', -999, 255);
+				if (action.slot < 0 && action.slot !== -999) throw invalid('INVALID_FIELD', 'action.slot must be -999 or a nonnegative slot');
+				requireIntRange(action.button, 'action.button', 0, 40);
+				requireOneOf(action.clickType, 'action.clickType', ['PICKUP', 'QUICK_MOVE', 'SWAP', 'CLONE', 'THROW', 'QUICK_CRAFT', 'PICKUP_ALL']);
+				requireText(action.expectedItemId, 'action.expectedItemId', MAX_IDENTIFIER_LENGTH);
+				requireIntRange(action.expectedCount, 'action.expectedCount', 0, INTEGER_MAX);
+				if (action.expectedFingerprint !== undefined && (typeof action.expectedFingerprint !== 'string' || action.expectedFingerprint.length > 256)) throw invalid('INVALID_FIELD', 'Invalid stack fingerprint');
+			}
 			break;
 		case 'menu_transfer':
+			validateOptionalMenuSession(action);
 			requireText(action.menuId, 'action.menuId', MAX_IDENTIFIER_LENGTH);
 			requireIntRange(action.sourceSlot, 'action.sourceSlot', 0, 255);
 			requireIntRange(action.destinationSlot, 'action.destinationSlot', 0, 255);
@@ -187,11 +254,13 @@ export function validateAction(value) {
 			requireDuration(action.timeoutMs, 'action.timeoutMs');
 			break;
 		case 'menu_button':
+			validateOptionalMenuSession(action);
 			requireText(action.menuId, 'action.menuId', MAX_IDENTIFIER_LENGTH);
 			requireIntRange(action.buttonId, 'action.buttonId', 0, 255);
 			requireDuration(action.timeoutMs, 'action.timeoutMs');
 			break;
 		case 'anvil_rename':
+			validateOptionalMenuSession(action);
 			requireText(action.menuId, 'action.menuId', MAX_IDENTIFIER_LENGTH);
 			requireText(action.name, 'action.name', 50);
 			requireDuration(action.timeoutMs, 'action.timeoutMs');
@@ -207,9 +276,26 @@ export function validateAction(value) {
 			if (action.count < 1 || action.count > 64) throw invalid('INVALID_FIELD', 'action.count must be between 1 and 64');
 			break;
 	}
+	const { type: ignoredType, ...argumentsOnly } = action;
+	const encodedArguments = JSON.stringify(argumentsOnly).replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+	if (Buffer.byteLength(encodedArguments, 'utf8') > MAX_ACTION_ARGUMENT_BYTES) {
+		throw invalid('ACTION_ARGUMENTS_TOO_LARGE', `Action arguments exceed ${MAX_ACTION_ARGUMENT_BYTES} serialized UTF-8 bytes`);
+	}
 	const normalized = deepFreeze(action);
 	TRUSTED_ACTIONS.add(normalized);
 	return normalized;
+}
+
+function validateHitOffsets(action, minimum, maximum) {
+	const present = ['hitX', 'hitY', 'hitZ'].filter((field) => action[field] !== undefined);
+	if (present.length !== 0 && present.length !== 3) throw invalid('INVALID_FIELD', 'hitX, hitY and hitZ must be supplied together');
+	for (const field of present) requireFiniteRange(action[field], `action.${field}`, minimum, maximum);
+}
+
+function validateOptionalMenuSession(action) {
+	if ((action.containerId === undefined) !== (action.stateId === undefined)) throw invalid('INVALID_FIELD', 'containerId and stateId must be supplied together');
+	if (action.containerId === undefined) return;
+	for (const field of ['containerId', 'stateId']) requireIntRange(action[field], field, 0, INTEGER_MAX);
 }
 
 export function createActionCommand(actionValue, { commandId, issuedAtEpochMs }) {

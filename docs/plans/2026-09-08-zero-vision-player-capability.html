@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="A source-backed plan for general Minecraft player capabilities through text tools, with every gameplay decision owned by the selected AI.">
+  <title>A complete player interface | Arena Agents</title>
+  <style>
+    :root { color-scheme: light; --paper:#f7f7f2; --ink:#202c32; --muted:#53616a; --line:#cdd4d1; --accent:#215d4a; --soft:#e7eee8; --max:1100px; }
+    * { box-sizing:border-box; }
+    html { scroll-behavior:smooth; scroll-padding-top:22px; }
+    body { margin:0; background:var(--paper); color:var(--ink); font:16px/1.65 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    main { max-width:var(--max); margin:auto; padding:36px 32px 64px; }
+    a { color:var(--accent); text-underline-offset:4px; }
+    a:focus-visible,summary:focus-visible { outline:3px solid var(--accent); outline-offset:5px; }
+    .top { display:flex; justify-content:space-between; gap:20px; padding-bottom:20px; border-bottom:1px solid var(--line); font-size:.85rem; color:var(--muted); }
+    .brand { color:var(--ink); font-weight:700; letter-spacing:.03em; }
+    header { padding:58px 0 30px; }
+    .eyebrow { margin:0 0 16px; color:var(--accent); font-size:.78rem; font-weight:750; letter-spacing:.12em; text-transform:uppercase; }
+    h1,h2,h3 { line-height:1.13; letter-spacing:-.035em; }
+    h1 { max-width:900px; margin:0; font-size:clamp(2.55rem,6.3vw,4.8rem); font-weight:650; }
+    .lede { max-width:780px; margin:24px 0; color:var(--muted); font-size:1.15rem; }
+    p { margin:0 0 16px; }
+    .facts { display:grid; grid-template-columns:repeat(3,1fr); gap:26px; margin:32px 0 0; }
+    .facts div { border-top:1px solid var(--line); padding-top:12px; }
+    dt { font-size:.75rem; color:var(--muted); text-transform:uppercase; letter-spacing:.07em; }
+    dd { margin:4px 0 0; font-weight:600; }
+    nav { display:flex; flex-wrap:wrap; gap:10px 24px; padding:20px 0 26px; border-bottom:1px solid var(--line); font-size:.9rem; }
+    section { padding:38px 0; border-bottom:1px solid var(--line); }
+    h2 { margin:0 0 20px; font-size:clamp(1.65rem,3vw,2.25rem); font-weight:650; }
+    h3 { margin:0 0 12px; font-size:1.14rem; font-weight:650; }
+    .section-title { display:grid; grid-template-columns:52px 1fr; gap:10px; }
+    .number { font-size:.82rem; color:var(--accent); padding-top:6px; font-variant-numeric:tabular-nums; }
+    .body { margin-left:62px; }
+    .body>p { max-width:850px; }
+    .decision { border-left:3px solid var(--accent); padding:1px 0 1px 20px; margin:22px 0; max-width:900px; }
+    .decision p:last-child { margin-bottom:0; }
+    .muted,small { color:var(--muted); }
+    .columns { display:grid; grid-template-columns:1fr 1fr; gap:32px; margin-top:25px; }
+    ul,ol { margin:12px 0 20px; padding-left:22px; }
+    li { padding-left:3px; margin:8px 0; }
+    strong { font-weight:650; }
+    .loop { display:grid; grid-template-columns:repeat(4,1fr); margin:26px 0; border-top:1px solid var(--line); border-bottom:1px solid var(--line); }
+    .loop div { padding:20px 15px; border-right:1px solid var(--line); }
+    .loop div:first-child { padding-left:0; }
+    .loop div:last-child { border-right:0; }
+    .loop b { display:block; margin-bottom:6px; font-weight:650; }
+    .loop span { display:block; color:var(--muted); font-size:.88rem; }
+    .loop .brain { background:var(--soft); }
+    .table-wrap { width:100%; }
+    table { width:100%; border-collapse:collapse; table-layout:fixed; font-size:.91rem; }
+    th { text-align:left; color:var(--muted); font-size:.73rem; text-transform:uppercase; letter-spacing:.07em; font-weight:650; }
+    th,td { vertical-align:top; padding:14px 14px 14px 0; border-bottom:1px solid var(--line); overflow-wrap:anywhere; }
+    th:last-child,td:last-child { padding-right:0; }
+    td:first-child { font-weight:600; }
+    .capabilities th:first-child { width:20%; }
+    .capabilities th:nth-child(2) { width:43%; }
+    .steps { counter-reset:phase; list-style:none; padding:0; }
+    .steps>li { display:grid; grid-template-columns:42px 1fr; gap:16px; padding:22px 0; margin:0; border-bottom:1px solid var(--line); }
+    .steps>li::before { counter-increment:phase; content:counter(phase,decimal-leading-zero); color:var(--accent); font-size:.88rem; }
+    .steps>li:last-child { border-bottom:0; }
+    .steps p { margin-bottom:8px; }
+    .gate { font-size:.88rem; color:var(--accent); }
+    details { border-top:1px solid var(--line); padding:15px 0; }
+    details:last-child { border-bottom:1px solid var(--line); }
+    summary { cursor:pointer; font-weight:600; line-height:1.45; }
+    details[open] summary { margin-bottom:18px; }
+    details p,details li { font-size:.91rem; }
+    code { font: .87em/1.5 ui-monospace,SFMono-Regular,Consolas,monospace; overflow-wrap:anywhere; }
+    .source { display:block; color:var(--muted); font-size:.78rem; margin-top:7px; }
+    .sources li { padding-bottom:10px; }
+    .sources code { color:var(--muted); }
+    .status { margin:14px 0; font-size:.84rem; color:var(--accent); }
+    footer { padding-top:28px; font-size:.81rem; color:var(--muted); display:flex; justify-content:space-between; gap:20px; }
+    @media(max-width:700px) {
+      main { padding:24px 20px 42px; }
+      header { padding-top:40px; }
+      .top { flex-direction:column; gap:4px; }
+      .facts { gap:15px; }
+      dd { font-size:.9rem; }
+      .section-title { grid-template-columns:32px 1fr; gap:7px; }
+      .body { margin-left:0; }
+      .columns { grid-template-columns:1fr; gap:12px; }
+      .loop { grid-template-columns:1fr 1fr; }
+      .loop div { padding:16px!important; border-bottom:1px solid var(--line); }
+      .loop div:nth-child(2) { border-right:0; }
+      .loop div:nth-child(n+3) { border-bottom:0; }
+      table,tbody,tr,td { display:block; width:100%; }
+      thead { display:none; }
+      tr { padding:16px 0; border-bottom:1px solid var(--line); }
+      td { padding:4px 0; border:0; }
+      td[data-label]::before { content:attr(data-label) " "; display:block; color:var(--muted); font-size:.72rem; text-transform:uppercase; letter-spacing:.04em; margin-bottom:2px; }
+      td:first-child { font-size:1rem; margin-bottom:6px; }
+      .steps>li { grid-template-columns:28px 1fr; gap:9px; }
+      footer { flex-direction:column; gap:4px; }
+    }
+    @media(prefers-reduced-motion:reduce) { html { scroll-behavior:auto; } }
+    @media print { body { background:white; } main { max-width:none; padding:0; } nav { display:none; } details { break-inside:avoid; } h2,h3 { break-after:avoid; } a { color:inherit; } }
+  </style>
+</head>
+<body>
+<main>
+  <div class="top"><span class="brand">ARENA AGENTS / SYSTEM DESIGN</span><span>8 September 2026 · Source reviewed at be64b236</span></div>
+  <header>
+    <p class="eyebrow">Zero vision. Full player agency.</p>
+    <h1>Give the AI a complete player interface.</h1>
+    <p class="lede">Make Minecraft playable through factual text observations and reliable tools. The selected AI chooses what to do, including its reactions. The system supplies the information, hands, and memory to carry those decisions out.</p>
+    <dl class="facts">
+      <div><dt>Review</dt><dd>Nine parallel audits</dd></div>
+      <div><dt>Status</dt><dd>Research complete</dd></div>
+      <div><dt>Delivery</dt><dd>Proposed upgrades</dd></div>
+    </dl>
+  </header>
+  <nav aria-label="Plan sections"><a href="#goal">Goal and boundaries</a><a href="#findings">What blocks it</a><a href="#design">System design</a><a href="#sequence">Build order</a><a href="#proof">Proof</a><a href="#evidence">Technical evidence</a></nav>
+
+  <section id="goal">
+    <div class="section-title"><span class="number">01</span><h2>A general player, on unfamiliar worlds</h2></div>
+    <div class="body">
+      <p>The target is an agent that can learn the situation, choose a strategy, and use ordinary player actions across seeds. Building, exploration, farming, trading, combat, travel, and full-game completion should all use the same systems.</p>
+      <div class="decision"><p><strong>Commit to equal capabilities across supported settings and measured success on unseen seeds.</strong> A universal win guarantee is impossible for unavailable providers, insufficient budgets, weaker decisions, or world rules that prevent completion. Those conditions must be reported honestly.</p></div>
+      <ul>
+        <li>No images, screenshots, rendered frames, or vision models reach the agent. Text describes information a player could perceive, inspect, hear, or remember.</li>
+        <li>The selected provider, model, thinking level, and speed remain in force. Report requested and effective settings. Never silently switch to a stronger model.</li>
+        <li>Respect Survival, Creative, Adventure, and death-policy restrictions. Automatic respawn follows an explicit user setting or model-authorized policy. Equal tools do not erase game-mode rules or remove-on-death behavior.</li>
+        <li>Keep world seeds, unexplored structure locations, hidden mob state, operator commands, and evaluator-only data outside the agent interface.</li>
+      </ul>
+      <p class="muted">For the later completion benchmark, record the chosen definition before each run. Proposed default: an agent-attributed dragon defeat with the corresponding advancement, followed by verified exit through the return portal. Reuse authoritative goal predicates and event evidence. This definition belongs to evaluation, never to execution policy.</p>
+    </div>
+  </section>
+
+  <section id="findings">
+    <div class="section-title"><span class="number">02</span><h2>The foundation exists. The contract is incomplete.</h2></div>
+    <div class="body">
+      <p>Raw input frames, exact-hand use, mining, placement, crafting, menus, short navigation, sequences, recovery, and authoritative completion already exist. Several August plans describe work that has since shipped. Extend these systems.</p>
+      <div class="columns">
+        <div><h3>Four immediate blockers</h3><ul>
+          <li>ArenaScript cannot issue the complete <code>control</code> frame available to native agents.</li>
+          <li>Observations omit menu options, item variants, motion details, and sometimes whole candidate lists.</li>
+          <li>Menu accounting rejects changes outside two slots, including ingredients consumed by a valid result operation.</li>
+          <li>Exploration merges underground and surface locations, forgets other dimensions, and embeds destination preferences.</li>
+        </ul></div>
+        <div><h3>Two design conflicts</h3><ul>
+          <li>A live safety controller independently chooses swimming, escape, defense, and retreat. Goal-text wrappers also suggest progression steps.</li>
+          <li>Fast control and model ownership are split between runtimes. Native tools lack explicit action cancellation and reactive programs; ArenaScript has watchers but loses useful movement and menu facts.</li>
+        </ul><p class="muted">Gemini planning is currently disabled because its adapter cannot enforce the required tool boundary. Treat it as unavailable until that boundary is supported.</p></div>
+      </div>
+      <p><a href="#evidence">Inspect source references and the reproduced failures</a>.</p>
+    </div>
+  </section>
+
+  <section id="design">
+    <div class="section-title"><span class="number">03</span><h2>One body contract. Every decision belongs to the AI.</h2></div>
+    <div class="body">
+      <div class="loop" role="group" aria-label="Repeated control loop: observe, decide, execute, verify, then observe again">
+        <div><b>1. Observe</b><span>Fresh facts, detail queries, remembered places, and uncertainty.</span></div>
+        <div class="brain"><b>2. AI decides</b><span>Goals, targets, routes, timing, resources, reactions, and retry policy.</span></div>
+        <div><b>3. Body executes</b><span>Bounded player inputs or a bounded program authored by that AI.</span></div>
+        <div><b>4. Verify</b><span>Actual outcomes and changes return to the same AI for its next choice.</span></div>
+      </div>
+      <p>Mechanical code may follow an explicitly selected route, maintain an authorized aim constraint, validate reach, and release abandoned input. Choosing to flee, mine a shortcut, build a bridge, change targets, or pursue a structure requires a model decision or its previously authored rule.</p>
+      <p>Reuse the ArenaScript ownership, limits, and cancellation machinery. Add a small server-tick executor for a validated subset of model-authored input programs. The model can define short reactions before entering a risky situation. Each rule has observable conditions, explicit actions, expiry, priorities, and limits. Unknown situations yield to the model.</p>
+      <p class="muted">Example: the AI can authorize a timed shield response to a specified visible projectile condition. The runtime checks that condition and applies the authored input. It never invents a defense or escape plan. Keep lease expiry and stale-command rejection unconditional.</p>
+
+      <div class="table-wrap">
+        <table class="capabilities">
+          <thead><tr><th>System</th><th>Upgrade</th><th>What it enables</th></tr></thead>
+          <tbody>
+            <tr><td>Shared capabilities</td><td data-label="Upgrade">One versioned definition for actions, facts, outcomes, limits, and supported modes. Generate native tools, program bindings, validation, and examples from it.</td><td data-label="Player freedom">Every supported setting can use the same controls. Unsupported combinations fail clearly before a run.</td></tr>
+            <tr><td>Queryable perception</td><td data-label="Upgrade">Freshness barriers, section revisions, coverage counts, pagination, and focused queries for geometry, motion, items, menus, signs, books, maps, and accessible sound/UI events.</td><td data-label="Player freedom">Inspect what matters without a giant prompt. Omitted information stays queryable; unknown space stays unknown.</td></tr>
+            <tr><td>Input and targeting</td><td data-label="Upgrade">Press, hold, update aim, and release within one owned input session. Add action handles, cancel/replace, exact hit points, hand choice, vanilla reach, and honest outcome receipts.</td><td data-label="Player freedom">Precise movement, charging, shielding, utility-item use, moving targets, and nonliving or multipart hit targets.</td></tr>
+            <tr><td>Inventory and menus</td><td data-label="Upgrade">Full slot access, exact stack/component references, slot roles, options/costs/progress, menu instance and state revision. Execute legal clicks, swaps, splits, result-taking, text entry, and close.</td><td data-label="Player freedom">Use ordinary workstations, manage occupied equipment and storage, choose recipes/trades, and inspect item variants.</td></tr>
+            <tr><td>Travel and world memory</td><td data-label="Upgrade">Observed routes keyed by world, dimension, and height. Return factual frontier candidates. Extend traversal to fluids, climbing, tight spaces, vehicles, and gliding; retain bounded incremental search.</td><td data-label="Player freedom">Explore caves, take detours, cross water, revisit places, and travel through observed portals without fixed structure priorities.</td></tr>
+            <tr><td>Model-authored skills</td><td data-label="Upgrade">Shared bounded programs with useful arithmetic, candidate iteration, fresh facts, input continuations, event conditions, explicit yield, and cancellation. Every branch retains model provenance.</td><td data-label="Player freedom">The AI writes, tests, and revises reusable techniques. Routine precision does not require a fresh model round trip for every tick.</td></tr>
+            <tr><td>Continuity and knowledge</td><td data-label="Upgrade">Durable observed-world memory, a model-written notebook, receipt journal, and versioned mechanics/recipe queries. Separate facts, hypotheses, and reusable model-authored skills.</td><td data-label="Player freedom">Resume after context loss or reconnect, learn from failure, and research general mechanics without seed lookups or a built-in progression guide.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="status">All rows above are proposed work. Existing foundations and remaining uncertainties are documented below.</p>
+    </div>
+  </section>
+
+  <section id="sequence">
+    <div class="section-title"><span class="number">04</span><h2>Build in verifiable steps</h2></div>
+    <div class="body">
+      <ol class="steps">
+        <li><div><h3>Unify the contract and fix proven mismatches</h3><p>Add complete controls to program mode. Generate bindings and examples. Fix the invalid watcher example and inconsistent equipment fields. Define outcome levels and model authority before adding more helpers.</p><p class="gate">Gate: equivalent native/program calls validate and dispatch identically; every shipped example executes; requested and effective settings are visible.</p></div></li>
+        <li><div><h3>Make facts fresh and actions accountable</h3><p>Add queryable details and explicit omissions. Introduce menu/stack revisions and action receipts. Fix consuming-menu accounting, held-use lease renewal, and successful-attempt claims that do not prove an effect. Keep strict conservation for storage transfers.</p><p class="gate">Gate: real headless fixtures prove menu, input, and item effects through the production bridge, including stale state and partial execution.</p></div></li>
+        <li><div><h3>Give every model precise, interruptible control</h3><p>Add bounded input continuation, cancel/replace, and the common model-authored reaction contract. Then replace system-authored safety decisions and goal-specific exploration advice. Preserve mechanical input release and cancellation throughout the change.</p><p class="gate">Gate: every physical choice traces to that model's call or authored program. Steering, stopping, death, and restart release old authority.</p></div></li>
+        <li><div><h3>Complete ordinary player interactions and travel</h3><p>Expand menu adapters, inventory operations, hit geometry, item details, and use lifecycles. Add persistent observed routes and movement-state feedback before extending swimming, climbing, vehicles, and flight. Return blockers when a route needs new resources or terrain changes.</p><p class="gate">Gate: unfamiliar building, storage, workstation, traversal, combat, and text-interaction tasks work through the same controls.</p></div></li>
+        <li><div><h3>Preserve learning and prove transfer</h3><p>Persist model notes, observed places, and completed-action evidence. Reconcile uncertain actions before retrying. Extend the current headless runner with natural terrain, held-out seeds, supported settings, explicit budgets, and independent factual outcomes.</p><p class="gate">Gate: long tasks survive context replacement and reconnects without duplicate mutations. Full-game attempts and unrelated tasks share the same tools and prompts.</p></div></li>
+      </ol>
+      <details><summary>Implementation ownership and dependencies</summary>
+        <p>Use one integration owner for the shared contract, protocol, and dispatch changes. After that contract is fixed, assign separate owners to perception, menu transactions, input/reaction execution, and observed-world navigation. The integration owner alone edits shared dispatch and schema files when those branches meet.</p>
+        <p>Keep evaluation fixtures under a separate owner. Introduce one capability family and its real-server proof at a time. No map import, UI redesign, model training, provider substitution, or new gameplay policy is required for this work.</p>
+      </details>
+    </div>
+  </section>
+
+  <section id="proof">
+    <div class="section-title"><span class="number">05</span><h2>Measure capability before measuring wins</h2></div>
+    <div class="body">
+      <p>The existing natural-language game runner uses a prepared platform and supplied blocks. Simulator tests and mocked model programs prove useful contracts, but they cannot establish live player competence.</p>
+      <ol>
+        <li><strong>Contract checks.</strong> Exercise every supported action and fact through both adapters. Test shipped examples, state references, limits, and truthful failure results.</li>
+        <li><strong>Real mechanics.</strong> Use a headless Minecraft server and the production bridge to verify movement, hit outcomes, resource consumption, inventory conservation, menus, portal transitions, and input cleanup. Scripted actions are appropriate at this stage.</li>
+        <li><strong>Real model composition.</strong> Give the selected model general tasks with varied coordinates and materials. Include sorting item variants, reading directions, building, farming, trading, crossing water, fighting moving targets, and returning to a remembered place.</li>
+        <li><strong>Held-out worlds and settings.</strong> Add fresh, unmodified generated worlds. Keep evaluation seeds hidden from the agent and separate development seeds from held-out seeds. Cover every supported profile at least once, then use pairwise operational coverage and targeted repeats after failures.</li>
+        <li><strong>Long runs.</strong> Attempt full-game completion alongside unrelated long tasks. Use the same general interfaces, preserve failures, and record independent outcome evidence.</li>
+      </ol>
+      <p>Report the seed to the evaluator only, game rules, spawn conditions, requested/effective settings, limits, success counts, uncertainty, deaths, interventions, action failures, observation age, latency, and cost. Attribute failures to infrastructure, missing capability, missing information, execution, or model decisions. A win alone does not prove the system generalizes.</p>
+      <details><summary>Acceptance criteria that protect the goal</summary>
+        <ul>
+          <li>Every supported configuration passes the common control/observation conformance suite. Availability and game-rule restrictions remain explicit.</li>
+          <li>Model inputs contain no image content or evaluator-only facts. Each live fact records its perception basis, age, and scope.</li>
+          <li>No physical action lacks model authorization, except neutral input release and other mechanical enforcement.</li>
+          <li>Every reported effect has factual evidence. A swing, item-use attempt, or projectile spawn cannot masquerade as a hit or task completion.</li>
+          <li>Every supported player-accessible detail omitted for size can be queried. Unavailable or unobserved facts remain explicitly unknown. Stale menus, stacks, targets, and world references fail safely without repeating an uncertain side effect.</li>
+          <li>Context replacement, reconnect, dimension transitions, and permitted death recovery preserve relevant knowledge while invalidating live control state.</li>
+          <li>Hold-out results use recorded budgets and all attempted runs. No seed-specific coordinates, win-route scripts, hidden stronger model, or completion-only helpers.</li>
+        </ul>
+      </details>
+      <details><summary>Risks and design decisions</summary>
+        <ul>
+          <li><strong>Model latency:</strong> bounded model-authored programs keep already authorized actions responsive. Measure observation and reaction delay under concurrency. Do not pause the world or make the agent invulnerable to hide slow decisions.</li>
+          <li><strong>Large observations:</strong> use focused queries, paging, and deltas. Increasing every payload limit would raise cost without guaranteeing useful detail.</li>
+          <li><strong>Knowledge leaks:</strong> sounds, maps, hit geometry, and tooltips need explicit player-access rules. Full server state is not an acceptable substitute for vision.</li>
+          <li><strong>Irreversible operations:</strong> record what happened and reconcile with live state after interruption. Generic rollback cannot undo every trade, craft, attack, or consumed item.</li>
+          <li><strong>Version and provider drift:</strong> conformance is tied to the installed game and adapter versions. Mark unsupported combinations unavailable; do not disable enforcement to make a benchmark run.</li>
+          <li><strong>Budgets:</strong> separate model thinking, body execution, and recovery time. Healthy progress may resume with the same selected model within explicit run limits.</li>
+        </ul>
+      </details>
+    </div>
+  </section>
+
+  <section id="evidence">
+    <div class="section-title"><span class="number">06</span><h2>Evidence behind the proposal</h2></div>
+    <div class="body">
+      <p>Nine read-only audits covered actions, perception, navigation, inventory, runtime ownership, settings, validation, prior designs, and adversarial review. No gameplay implementation, live model call, live-server operation, or world change was performed for this plan.</p>
+      <details><summary>Checks performed and what they establish</summary>
+        <ul>
+          <li>Existing offline runs passed: 88 simulator/headless-runner/program tests; 83 native/runtime/program-authority tests; 15 exploration tests; 19 tool/schema tests. These are per-run counts with overlap.</li>
+          <li>Actual module probes showed that exploration merges cave and surface coordinates, forgets another dimension, retains an occupied cell as blocked, and ignores distant landmarks. A cue 96 blocks overhead was classified as in range because distance ignored height.</li>
+          <li>The actual parser rejected the prompt's watcher example because watcher handlers cannot call <code>program.checkpoint</code>. A valid native control frame was rejected by the program interface. Program facts dropped supplied movement, cooldown, and menu details.</li>
+          <li>The compiled transaction validator rejected an anvil-style before/after snapshot that moved the result and consumed input slots: <code>TRANSACTION_CONFLICT: Unexpected slot 0 changed</code>. This proves an accounting-contract mismatch. Each live menu path still needs a real Minecraft fixture.</li>
+          <li>Gemini's production adapter rejected planner creation with <code>PROVIDER_UNAVAILABLE</code> without starting a provider process. Other identified physics and timing issues are source-backed findings awaiting live fixtures.</li>
+        </ul>
+        <p>Passing these tests does not establish successful survival on unseen seeds. It shows why stronger, focused integration evidence is needed.</p>
+      </details>
+      <details><summary>Shared tools, model authority, and settings</summary>
+        <ul class="sources">
+          <li>Native raw controls exist, but program bindings omit them. Native runtime is selected only for Codex.
+            <span class="source"><code>coordinator/src/constants.mjs:47</code> · <code>coordinator/src/native-minecraft-tools.mjs:31</code> · <code>coordinator/src/arena-script/minecraft-api.mjs:1</code> · <code>coordinator/src/dynamic-main.mjs:1089</code></span></li>
+          <li>The safety controller chooses and applies movement/defense using SYSTEM input priority 1000; production registers and ticks it.
+            <span class="source"><code>src/main/java/dev/agaminggod/arenaagents/server/goal/GoalSafetyController.java:45</code> · <code>GoalSafetyController.java:95</code> · <code>server/CodexAgentServerRuntime.java:137</code> · <code>CodexAgentServerRuntime.java:313</code></span></li>
+          <li>Frontier selection uses fixed structure weights; the observation wrapper recognizes completion-related goal text.
+            <span class="source"><code>coordinator/src/explore-frontier.mjs:27</code> · <code>explore-frontier.mjs:125</code> · <code>coordinator/src/two-call-llm-wrap.mjs:116</code></span></li>
+          <li>Urgent native steering leaves the physical action running, while another action is prohibited. ArenaScript watchers provide a useful existing ownership model.
+            <span class="source"><code>coordinator/test/dynamic-main.test.mjs:2548</code> · <code>coordinator/src/native-tool-runtime.mjs:298</code> · <code>coordinator/src/arena-script/program-engine.mjs:251</code></span></li>
+          <li>Gemini's planner is explicitly guarded. Kimi effort mapping can collapse requested effort levels. A 125-second planner lease also needs reconciliation with longer healthy tool work.
+            <span class="source"><code>coordinator/src/antigravity-service.mjs:240</code> · <code>coordinator/src/acp-service.mjs:254</code> · <code>coordinator/src/agent-planner.mjs:17</code></span></li>
+        </ul>
+      </details>
+      <details><summary>Observation, menus, and physical execution</summary>
+        <p class="muted">Java paths below share <code>src/main/java/dev/agaminggod/arenaagents/</code>.</p>
+        <ul class="sources">
+          <li>Menus expose only type, cursor, capabilities, and the first 64 basic stacks. Entity facts omit motion/pose/hit geometry; item facts omit component details.
+            <span class="source"><code>server/perception/ServerObservationCollector.java:313</code> · <code>ServerObservationCollector.java:420</code> · <code>ServerObservationCollector.java:464</code></span></li>
+          <li>Compact native results can omit interaction details; native observe returns a cached snapshot. Wire and event builders trim candidate arrays.
+            <span class="source"><code>coordinator/src/native-minecraft-tools.mjs:269</code> · <code>coordinator/src/native-tool-runtime.mjs:147</code> · <code>coordinator/src/dynamic-main.mjs:3696</code> · <code>server/perception/ServerObservationWireBudget.java:23</code></span></li>
+          <li>Menu transfers reuse exact two-slot verification, and menu identity is checked by type alone. Generic inventory/menu operations remain incomplete.
+            <span class="source"><code>server/runtime/AdvancedInteractionService.java:435</code> · <code>AdvancedInteractionService.java:980</code> · <code>AdvancedInteractionService.java:1189</code> · <code>server/runtime/transaction/TransactionSnapshot.java:104</code> · <code>server/runtime/menu/MenuCapabilityRegistry.java:11</code></span></li>
+          <li>Held use applies input once while leases expire after 40 ticks. Melee uses a fixed six-block check and reports attempted execution. Dedicated ranged use requires a bow and living target; raw controls need broader integration tests.
+            <span class="source"><code>server/runtime/ServerActionExecutor.java:1750</code> · <code>ServerActionExecutor.java:1871</code> · <code>ServerActionExecutor.java:965</code> · <code>server/runtime/input/LeasedServerInputController.java:17</code> · <code>server/runtime/controller/ServerRangedUseController.java:53</code></span></li>
+          <li>Some convenience operations bypass normal interaction checks or choices: direct door state changes, direct menu opening, requested recipe unlocking, and first-match inventory swapping. Audit these against the installed game's player rules.
+            <span class="source"><code>server/runtime/AdvancedInteractionService.java:215</code> · <code>AdvancedInteractionService.java:381</code> · <code>AdvancedInteractionService.java:651</code> · <code>server/runtime/ServerActionExecutor.java:997</code></span></li>
+        </ul>
+      </details>
+      <details><summary>Travel, memory, and evaluation</summary>
+        <ul class="sources">
+          <li>Local traversal supports limited walk/jump/drop transitions and narrow shallow-water crossings. Long routes use a 32-block interpolated waypoint; all dimension transitions fail the active action.
+            <span class="source"><code>src/main/java/dev/agaminggod/arenaagents/client/navigation/LocalPathfinder.java:151</code> · <code>server/runtime/controller/MinecraftNavigationWorld.java:118</code> · <code>server/runtime/controller/ServerNavigationController.java:363</code> · <code>server/runtime/ServerActionExecutor.java:1728</code></span></li>
+          <li>Exploration is a bounded 2D map that resets across dimensions. Program facts and the short fact ledger do not replace durable observed-world memory.
+            <span class="source"><code>coordinator/src/explore-frontier.mjs:75</code> · <code>explore-frontier.mjs:230</code> · <code>coordinator/src/arena-script/facts.mjs:11</code> · <code>coordinator/src/fact-ledger.mjs:55</code></span></li>
+          <li>The existing matrix builds a prepared platform. Its configuration has no natural-world seed or difficulty fields. Factual completion checks are reusable.
+            <span class="source"><code>coordinator/src/headless-matrix.mjs:17</code> · <code>headless-matrix.mjs:263</code> · <code>headless-matrix.mjs:329</code></span></li>
+          <li>Program end-to-end tests use injected source and a fake bridge. The simulator implements a limited action set. Existing advancement and kill predicates can support factual evaluation.
+            <span class="source"><code>coordinator/test/model-authored-programs-e2e.test.mjs:12</code> · <code>coordinator/src/simulator/action-runtime.mjs:4</code> · <code>src/main/java/dev/agaminggod/arenaagents/server/runtime/GoalCompletionVerifier.java:217</code></span></li>
+        </ul>
+      </details>
+    </div>
+  </section>
+  <footer><span>Arena Agents · Research and proposed implementation plan</span><span>No gameplay code changed · Revision 1</span></footer>
+</main>
+</body>
+</html>

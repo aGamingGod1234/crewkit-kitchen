@@ -137,3 +137,37 @@ test('rejects non-finite coordinates and observations over protocol bounds', () 
 	assert.throws(() => adaptObservation(wireObservation({ blocks: Array.from({ length: 129 }, (_, index) => ({ x: index, y: 64, z: 0, blockId: 'minecraft:stone' })) })), /blocks exceeds bound/);
 	assert.throws(() => adaptObservation(wireObservation({ landmarks: Array.from({ length: 33 }, (_, index) => ({ x: index, y: 64, z: 0, blockId: 'minecraft:oak_log', distance: 1, bearing: 0, elevation: 0 })) })), /landmarks exceeds bound/);
 });
+
+test('preserves player-readable motion, geometry, stack variants, and coverage after adaptation', () => {
+	const original = wireObservation({
+		observedAtEpochMs: 1000,
+		coverage: { complete: false, sections: { blocks: { returned: 1, omittedByWire: 7 } } },
+		perception: { latestSequence: 1, earliestSequence: 1, events: [{ type: 'sound', soundId: 'minecraft:entity.zombie.ambient', direction: 'front', range: 'near' }], bossBars: [] },
+		player: { swimming: true, gliding: false, horizontalCollision: true, pose: 'swimming', vehicle: { uuid: 'boat-1', type: 'minecraft:oak_boat' } },
+		entities: [{ uuid: 'mob', type: 'minecraft:zombie', position: { x: 1, y: 64, z: 0 }, velocity: { x: 0.2, y: 0, z: 0 }, pose: 'standing', yaw: 90, equipment: [{ slot: 'mainhand', itemId: 'minecraft:iron_sword', enchanted: true }] }],
+		blocks: [{ x: 1, y: 64, z: 0, blockId: 'minecraft:oak_door', state: { open: 'true', facing: 'north' }, bounds: [{ minX: 0, minY: 0, minZ: 0, maxX: 0.1875, maxY: 1, maxZ: 1 }], replaceable: false }],
+		inventory: { items: [{ slot: 0, itemId: 'minecraft:iron_sword', count: 1, displayName: 'Named sword', fingerprint: 'abc', tooltip: ['Sharpness III'] }] },
+	});
+	const adapted = adaptObservation(original);
+	assert.equal(adapted.observedAtEpochMs, 1000);
+	assert.equal(adapted.coverage.sections.blocks.omittedByWire, 7);
+	assert.equal(adapted.perception.events[0].direction, 'front');
+	assert.equal(adapted.player.vehicle.uuid, 'boat-1');
+	assert.equal(adapted.player.swimming, true);
+	assert.equal(adapted.entities[0].velocity.x, 0.2);
+	assert.equal(adapted.entities[0].equipment[0].enchanted, true);
+	assert.equal(adapted.blocks[0].state.open, 'true');
+	assert.equal(adapted.inventory.items[0].fingerprint, 'abc');
+	original.blocks[0].state.open = 'false';
+	assert.equal(adapted.blocks[0].state.open, 'true', 'adapter owns nested facts independently');
+});
+
+test('new extension facts reject nested executable, non-finite, and unbounded values', () => {
+	let accessed = false;
+	const geometry = {};
+	Object.defineProperty(geometry, 'maxX', { enumerable: true, get() { accessed = true; return 1; } });
+	assert.throws(() => adaptObservation(wireObservation({ blocks: [{ x: 0, y: 64, z: 0, blockId: 'minecraft:stone', bounds: [geometry] }] })), /own data/);
+	assert.equal(accessed, false);
+	assert.throws(() => adaptObservation(wireObservation({ coverage: { returned: Infinity } })), /finite number/);
+	assert.throws(() => adaptObservation(wireObservation({ coverage: { source: 'x'.repeat(8193) } })), /text bound/);
+});

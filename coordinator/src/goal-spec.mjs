@@ -21,6 +21,11 @@ const predicateVariants = [
 	objectSchema(['type', 'itemId', 'count'], {
 		type: { type: 'string', const: 'inventory_contains' }, itemId: { type: 'string' }, count: { type: 'integer', minimum: 1 },
 	}),
+	objectSchema(['type', 'itemIds', 'count'], {
+		type: { type: 'string', const: 'inventory_contains_any' },
+		itemIds: { type: 'array', minItems: 1, maxItems: MAX_CANDIDATES, items: { type: 'string', pattern: IDENTIFIER.source, minLength: 3, maxLength: 256 } },
+		count: { type: 'integer', minimum: 1, maximum: 2_147_483_647 },
+	}),
 	objectSchema(['type', 'dimensionId', 'x', 'y', 'z', 'radius', 'stableTicks'], {
 		type: { type: 'string', const: 'position_within' }, dimensionId: { type: ['string', 'null'] }, x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
 		radius: { type: 'number', minimum: MIN_MOVEMENT_TOLERANCE }, stableTicks: { type: 'integer', minimum: 1 },
@@ -119,6 +124,7 @@ export function goalPredicateIdentifiers(predicate) {
 	const parsed = parsePredicate(predicate, 0, { leaves: 0 });
 	const result = [];
 	visitPredicate(parsed, value => {
+		if (value.type === 'inventory_contains_any') result.push(...value.itemIds);
 		for (const field of ['itemId', 'advancementId', 'entityType', 'blockId']) {
 			if (value[field] !== undefined) result.push(value[field]);
 		}
@@ -136,6 +142,17 @@ function parsePredicate(value, depth, budget) {
 			exactKeys(value, ['type', 'itemId', 'count'], type);
 			result = { type, itemId: identifier(value.itemId, 'itemId'), count: positiveInteger(value.count, 'count') };
 			break;
+		case 'inventory_contains_any': {
+			exactKeys(value, ['type', 'itemIds', 'count'], type);
+			const itemIds = Array.from(requireArray(value.itemIds, 'itemIds', MAX_CANDIDATES, 1), (itemId, index) => identifier(itemId, `itemIds[${index}]`));
+			if (new Set(itemIds).size !== itemIds.length) fail('INVALID_GOAL_PREDICATE', 'itemIds must contain unique identifiers');
+			budget.itemReferences = (budget.itemReferences ?? 0) + itemIds.length;
+			if (budget.itemReferences > MAX_CANDIDATES) fail('GOAL_PREDICATE_LIMIT_EXCEEDED', 'Combined inventory category item references exceed 64');
+			const count = positiveInteger(value.count, 'count');
+			if (count > 2_147_483_647) fail('INVALID_GOAL_PREDICATE', 'count exceeds the server integer limit');
+			result = { type, itemIds, count };
+			break;
+		}
 		case 'position_within':
 			exactKeys(value, value.dimensionId === undefined
 				? ['type', 'x', 'y', 'z', 'radius', 'stableTicks']
@@ -214,6 +231,8 @@ function canonicalPredicate(predicate) {
 	switch (predicate.type) {
 		case 'inventory_contains':
 			return `{"type":"inventory_contains","item_id":${JSON.stringify(predicate.itemId)},"count":${predicate.count}}`;
+		case 'inventory_contains_any':
+			return `{"type":"inventory_contains_any","item_ids":${JSON.stringify(predicate.itemIds)},"count":${predicate.count}}`;
 		case 'position_within':
 			return `{"type":"position_within",${canonicalDimension(predicate)}"x":${javaDouble(predicate.x)},"y":${javaDouble(predicate.y)},"z":${javaDouble(predicate.z)},"radius":${javaDouble(predicate.radius)},"stable_ticks":${predicate.stableTicks}}`;
 		case 'advancement_granted':

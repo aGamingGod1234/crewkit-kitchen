@@ -48,7 +48,35 @@ public final class ServerPathPlannerVerification {
 				"server plan does not cross blocked cells");
 		return 3 + verifyElevationAndHoleSafety() + verifyDeferredPlanningIsRetryable() + verifySharedElapsedBudget()
 				+ verifyRoundRobinAdmissionEventuallyServesAll() + verifyContentionDeferralWindow()
-				+ verifyTickScopeRestoresPreviousBudget();
+				+ verifyTickScopeRestoresPreviousBudget() + verifyRetainedSearchUsesSharedTickBudget();
+	}
+
+	private static int verifyRetainedSearchUsesSharedTickBudget() {
+		ServerPathPlanner planner = new ServerPathPlanner();
+		WalkabilityView view = position -> position.y() == 63 ? WalkabilityView.Cell.SAFE_SUPPORT
+				: position.y() >= 64 && position.y() <= 65 ? WalkabilityView.Cell.CLEAR : WalkabilityView.Cell.BLOCKED;
+		GridPosition firstGoal = new GridPosition(4, 64, 0);
+		GridPosition secondGoal = new GridPosition(4, 64, 1);
+		LocalPathfinder.Search[] searches = {
+				planner.beginSearch(new GridPosition(0, 64, 0), Set.of(firstGoal), firstGoal, 8, Set.of()),
+				planner.beginSearch(new GridPosition(0, 64, 1), Set.of(secondGoal), secondGoal, 8, Set.of())
+		};
+		int expanded = 0;
+		for (int tick = 0; tick < 8; tick++) {
+			try (ServerPathPlanner.TickScope scope = ServerPathPlanner.beginServerTick(2, LocalPathfinder.MAX_PLANNING_TIME_NANOS, () -> 0L)) {
+				for (int offset = 0; offset < searches.length; offset++) {
+					LocalPathfinder.Search search = searches[(tick + offset) % searches.length];
+					if (search.finished()) continue;
+					ServerPathPlanner.PlanningResult result = planner.resume(search, view);
+					if (!result.deferred()) assertEquals(PathOutcome.FOUND, result.plan().outcome(), "retained controller search finishes its selected route");
+				}
+				assertTrue(scope.budget().expandedNodes() <= 2, "resumed searches share one tick expansion limit");
+				expanded += scope.budget().expandedNodes();
+			}
+		}
+		assertTrue(searches[0].finished() && searches[1].finished(), "both retained requests make progress under rotating admission");
+		assertEquals(8, expanded, "retained requests do not repay previous expansion work");
+		return 12;
 	}
 
 	private static int verifyElevationAndHoleSafety() {

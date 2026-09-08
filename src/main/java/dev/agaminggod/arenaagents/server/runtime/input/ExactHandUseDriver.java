@@ -13,6 +13,9 @@ final class ExactHandUseDriver {
 
 	private final Map<AgentId, UseState> states = new LinkedHashMap<>();
 	private final Map<AgentId, Long> lastExecutionTicks = new LinkedHashMap<>();
+	private final Map<AgentId, Long> acceptedUses = new LinkedHashMap<>();
+
+	long acceptedUses(AgentId agentId) { return acceptedUses.getOrDefault(agentId, 0L); }
 
 	void start(AgentId agentId, InteractionHand hand, PlayerUseAccess player) {
 		Objects.requireNonNull(agentId, "agentId must not be null");
@@ -69,11 +72,13 @@ final class ExactHandUseDriver {
 		};
 		Objects.requireNonNull(target, "target attempt must not be null");
 		if (target.consumed()) {
+			acceptedUses.merge(agentId, 1L, Long::sum);
 			if (target.swing()) player.swing(hand);
 			state.cooldownTicks = REPEAT_COOLDOWN_TICKS;
 			return true;
 		}
 		if (!player.useItem(hand)) return false;
+		acceptedUses.merge(agentId, 1L, Long::sum);
 		state.cooldownTicks = REPEAT_COOLDOWN_TICKS;
 		return true;
 	}
@@ -88,6 +93,7 @@ final class ExactHandUseDriver {
 		Objects.requireNonNull(agentId, "agentId must not be null");
 		states.remove(agentId);
 		lastExecutionTicks.remove(agentId);
+		acceptedUses.remove(agentId);
 	}
 
 	interface PlayerUseAccess {

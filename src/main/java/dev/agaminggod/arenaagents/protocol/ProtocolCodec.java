@@ -25,6 +25,7 @@ import java.util.Set;
 import java.util.UUID;
 
 public final class ProtocolCodec {
+	public static final int MAX_ACTION_ARGUMENT_BYTES = 32_768;
 	private static final String FIELD_PROTOCOL_VERSION = ProtocolConstants.FIELD_PROTOCOL_VERSION;
 	private static final String FIELD_COMMAND_ID = "commandId";
 	private static final String FIELD_TYPE = "type";
@@ -305,10 +306,16 @@ public final class ProtocolCodec {
 		switch (actionType) {
 			case MOVE_TO -> validateMoveTo(arguments);
 			case CONTROL -> validateControl(arguments);
+			case CONTROL_SEQUENCE -> validateControlSequence(arguments);
 			case LOOK_AT -> validateCoordinates(arguments, false);
 			case ATTACK -> validateAttack(arguments);
 			case SELECT_ITEM -> requireIdentifier(arguments, FIELD_ITEM_ID);
-			case USE_ITEM, WAIT -> requireDuration(arguments, FIELD_DURATION_MS);
+			case USE_ITEM -> {
+				requireDuration(arguments, FIELD_DURATION_MS);
+				if (present(arguments, FIELD_HAND)) requireOneOf(arguments, FIELD_HAND, List.of("main", "off"));
+				if (present(arguments, FIELD_EXPECTED_ITEM_ID)) requireIdentifier(arguments, FIELD_EXPECTED_ITEM_ID);
+			}
+			case WAIT -> requireDuration(arguments, FIELD_DURATION_MS);
 			case BREAK_BLOCK -> validateBreakBlock(arguments);
 			case PLACE_BLOCK -> validatePlaceBlock(arguments);
 			case BUILD_SEQUENCE -> validateBuildSequence(arguments);
@@ -334,7 +341,27 @@ public final class ProtocolCodec {
 			case USE_RANGED -> validateUseRanged(arguments);
 			case INTERACT_BLOCK -> validateInteractBlock(arguments);
 			case INTERACT_ENTITY -> validateInteractEntity(arguments);
-			case DISMOUNT, START_FALL_FLYING -> { }
+			case DISMOUNT, START_FALL_FLYING, WAKE_UP -> { }
+			case SET_FLIGHT -> requireBoolean(arguments, "enabled");
+			case WRITE_SIGN -> {
+				validateCoordinates(arguments, true);
+				requireBoolean(arguments, "front");
+				validateTextArray(arguments, "lines", 4, 4, 384);
+				validateTextArray(arguments, "expectedLines", 4, 4, 384);
+			}
+			case EDIT_BOOK -> {
+				long slot = requireIntegralLong(arguments, "slot");
+				if (slot != 40 && (slot < 0 || slot > 8)) throw invalidField("Book must be in hotbar or offhand");
+				validateTextArray(arguments, "pages", 0, 100, 1024);
+				if (present(arguments, "title")) requireBoundedText(arguments, "title", 32, false);
+				requireBoundedText(arguments, "expectedFingerprint", 256, false);
+			}
+			case MENU_CLICK, MENU_CLOSE -> validateMenuInput(arguments, actionType == ActionType.MENU_CLICK);
+			case BEACON_EFFECTS -> {
+				validateMenuInput(arguments, false);
+				requireIdentifier(arguments, "primaryEffectId");
+				requireIdentifier(arguments, "secondaryEffectId");
+			}
 			case MENU_TRANSFER -> validateMenuTransfer(arguments);
 			case MENU_BUTTON -> validateMenuButton(arguments);
 			case ANVIL_RENAME -> validateAnvilRename(arguments);
@@ -347,6 +374,10 @@ public final class ProtocolCodec {
 			);
 		}
 		validateKnownArgumentFields(arguments, actionType);
+		if (arguments.toString().getBytes(StandardCharsets.UTF_8).length > MAX_ACTION_ARGUMENT_BYTES) {
+			throw new ProtocolException("ACTION_ARGUMENTS_TOO_LARGE", "Action arguments exceed "
+					+ MAX_ACTION_ARGUMENT_BYTES + " serialized UTF-8 bytes");
+		}
 
 		JsonObject validatedArguments = new JsonObject();
 		for (String field : ACTION_FIELDS.get(actionType)) {
@@ -391,6 +422,65 @@ public final class ProtocolCodec {
 		requireIntegralRange(command, FIELD_SELECTED_SLOT, 0L, 8L);
 		requireOneOf(command, FIELD_HAND, List.of("main", "off"));
 		requireIntegralRange(command, FIELD_TICKS, 1L, 200L);
+	}
+
+	private static boolean present(JsonObject arguments, String field) {
+		return arguments.has(field) && !arguments.get(field).isJsonNull();
+	}
+
+	private static void validateControlSequence(JsonObject arguments) throws ProtocolException {
+		requireIntegralRange(arguments, "maxTicks", 1, 2000);
+		JsonElement value = requireField(arguments, "frames");
+		if (!value.isJsonArray() || value.getAsJsonArray().isEmpty() || value.getAsJsonArray().size() > 64) {
+			throw invalidField("frames must contain 1 to 64 input frames");
+		}
+		int size = value.getAsJsonArray().size();
+		for (JsonElement element : value.getAsJsonArray()) {
+			if (!element.isJsonObject()) throw invalidField("frame must be an object");
+			JsonObject frame = element.getAsJsonObject();
+			validateControl(frame);
+			for (String key : frame.keySet()) if (!ACTION_FIELDS.get(ActionType.CONTROL).contains(key) && !"branches".equals(key)) throw invalidField("Unknown frame field " + key);
+			if (!frame.has("branches")) continue;
+			if (!frame.get("branches").isJsonArray() || frame.getAsJsonArray("branches").size() > 16) throw invalidField("branches must be an array of at most 16 conditions");
+			for (JsonElement branchElement : frame.getAsJsonArray("branches")) {
+				if (!branchElement.isJsonObject()) throw invalidField("branch must be an object");
+				JsonObject branch = branchElement.getAsJsonObject();
+				if (!branch.keySet().equals(Set.of("condition", "value", "nextFrame"))) throw invalidField("branch requires condition, value and nextFrame");
+				String condition = requireIdentifier(branch, "condition");
+				if (Set.of("health_below", "food_below", "air_below").contains(condition)) requireFiniteRange(branch, "value", 0, switch (condition) { case "health_below" -> 2048; case "food_below" -> 20; default -> 100000; });
+				else if (Set.of("on_fire", "in_water", "on_ground", "horizontal_collision", "hurt", "using_item").contains(condition)) requireBoolean(branch, "value");
+				else throw invalidField("Unsupported observed condition " + condition);
+				requireIntegralRange(branch, "nextFrame", 0, size);
+			}
+		}
+	}
+
+	private static void validateMenuInput(JsonObject arguments, boolean click) throws ProtocolException {
+		requireIdentifier(arguments, FIELD_MENU_ID);
+		requireIntegralRange(arguments, "containerId", 0, Integer.MAX_VALUE);
+		requireIntegralRange(arguments, "stateId", 0, Integer.MAX_VALUE);
+		if (!click) return;
+		long slot = requireIntegralLong(arguments, "slot");
+		if (slot != -999 && (slot < 0 || slot > 255)) throw invalidField("slot must be -999 or 0 to 255");
+		requireIntegralRange(arguments, "button", 0, 40);
+		requireOneOf(arguments, "clickType", List.of("PICKUP", "QUICK_MOVE", "SWAP", "CLONE", "THROW", "QUICK_CRAFT", "PICKUP_ALL"));
+		requireIdentifier(arguments, FIELD_EXPECTED_ITEM_ID);
+		requireIntegralRange(arguments, "expectedCount", 0, Integer.MAX_VALUE);
+		if (present(arguments, "expectedFingerprint")) requireBoundedText(arguments, "expectedFingerprint", 256, true);
+	}
+
+	private static void validateTextArray(JsonObject arguments, String field, int minimum, int maximum, int textLimit) throws ProtocolException {
+		JsonElement value = requireField(arguments, field);
+		if (!value.isJsonArray() || value.getAsJsonArray().size() < minimum || value.getAsJsonArray().size() > maximum) throw invalidField("Invalid " + field + " length");
+		for (JsonElement entry : value.getAsJsonArray()) if (!entry.isJsonPrimitive() || !entry.getAsJsonPrimitive().isString() || entry.getAsString().length() > textLimit) throw invalidField("Invalid " + field + " text");
+	}
+
+	private static void validateHitOffsets(JsonObject arguments, double minimum, double maximum) throws ProtocolException {
+		int count = 0;
+		for (String key : List.of("hitX", "hitY", "hitZ")) {
+			if (present(arguments, key)) { count++; requireFiniteRange(arguments, key, minimum, maximum); }
+		}
+		if (count != 0 && count != 3) throw invalidField("hitX, hitY and hitZ must be provided together");
 	}
 
 	private static void validateChat(JsonObject arguments) throws ProtocolException {
@@ -701,6 +791,7 @@ public final class ProtocolCodec {
 	}
 
 	private static void validateInteractBlock(JsonObject arguments) throws ProtocolException {
+		validateHitOffsets(arguments, 0, 1);
 		validateCoordinates(arguments, true);
 		requireOneOf(arguments, FIELD_FACE, BLOCK_FACES);
 		requireOneOf(arguments, FIELD_HAND, List.of("main", "off"));
@@ -708,12 +799,14 @@ public final class ProtocolCodec {
 	}
 
 	private static void validateInteractEntity(JsonObject arguments) throws ProtocolException {
+		validateHitOffsets(arguments, -16, 16);
 		requireUuid(arguments, FIELD_TARGET_ID);
 		requireOneOf(arguments, FIELD_HAND, List.of("main", "off"));
 		requireIdentifier(arguments, FIELD_EXPECTED_ITEM_ID);
 	}
 
 	private static void validateMenuTransfer(JsonObject arguments) throws ProtocolException {
+		validateOptionalMenuSession(arguments);
 		requireIdentifier(arguments, FIELD_MENU_ID);
 		requireIntegralRange(arguments, FIELD_SOURCE_SLOT, 0, 255);
 		requireIntegralRange(arguments, FIELD_DESTINATION_SLOT, 0, 255);
@@ -723,15 +816,27 @@ public final class ProtocolCodec {
 	}
 
 	private static void validateMenuButton(JsonObject arguments) throws ProtocolException {
+		validateOptionalMenuSession(arguments);
 		requireIdentifier(arguments, FIELD_MENU_ID);
 		requireIntegralRange(arguments, FIELD_BUTTON_ID, 0, 255);
 		requireDuration(arguments, FIELD_TIMEOUT_MS);
 	}
 
 	private static void validateAnvilRename(JsonObject arguments) throws ProtocolException {
+		validateOptionalMenuSession(arguments);
 		requireIdentifier(arguments, FIELD_MENU_ID);
 		requireBoundedText(arguments, FIELD_NAME, 50, false);
 		requireDuration(arguments, FIELD_TIMEOUT_MS);
+	}
+
+	private static void validateOptionalMenuSession(JsonObject arguments) throws ProtocolException {
+		if (present(arguments, "containerId") != present(arguments, "stateId")) {
+			throw invalidField("containerId and stateId must be supplied together");
+		}
+		if (present(arguments, "containerId")) {
+			requireIntegralRange(arguments, "containerId", 0, Integer.MAX_VALUE);
+			requireIntegralRange(arguments, "stateId", 0, Integer.MAX_VALUE);
+		}
 	}
 
 	private static String requireBoundedCodePointText(JsonObject object, String field, int maximumLength)
@@ -832,7 +937,8 @@ public final class ProtocolCodec {
 		fields.put(ActionType.LOOK_AT, List.of(FIELD_X, FIELD_Y, FIELD_Z));
 		fields.put(ActionType.ATTACK, List.of(FIELD_TARGET_ID, FIELD_TIMEOUT_MS));
 		fields.put(ActionType.SELECT_ITEM, List.of(FIELD_ITEM_ID));
-		fields.put(ActionType.USE_ITEM, List.of(FIELD_DURATION_MS));
+		fields.put(ActionType.USE_ITEM, List.of(FIELD_DURATION_MS, FIELD_HAND, FIELD_EXPECTED_ITEM_ID));
+		fields.put(ActionType.CONTROL_SEQUENCE, List.of("frames", "maxTicks"));
 		fields.put(ActionType.BREAK_BLOCK, List.of(FIELD_X, FIELD_Y, FIELD_Z, FIELD_TIMEOUT_MS, FIELD_EXPECTED_BLOCK_ID));
 		fields.put(ActionType.PLACE_BLOCK, List.of(FIELD_X, FIELD_Y, FIELD_Z, FIELD_FACE, FIELD_ITEM_ID, FIELD_DESIRED_STATE));
 		fields.put(ActionType.BUILD_SEQUENCE, List.of(FIELD_PLACEMENTS, FIELD_TIMEOUT_MS));
@@ -868,17 +974,24 @@ public final class ProtocolCodec {
 		fields.put(ActionType.BLOCK_WITH_SHIELD, List.of(FIELD_DURATION_MS));
 		fields.put(ActionType.USE_RANGED, List.of(FIELD_TARGET_ID, FIELD_DRAW_DURATION_MS, FIELD_TIMEOUT_MS));
 		fields.put(ActionType.INTERACT_BLOCK, List.of(
-				FIELD_X, FIELD_Y, FIELD_Z, FIELD_FACE, FIELD_HAND, FIELD_EXPECTED_ITEM_ID
+				FIELD_X, FIELD_Y, FIELD_Z, FIELD_FACE, FIELD_HAND, FIELD_EXPECTED_ITEM_ID, "hitX", "hitY", "hitZ"
 		));
-		fields.put(ActionType.INTERACT_ENTITY, List.of(FIELD_TARGET_ID, FIELD_HAND, FIELD_EXPECTED_ITEM_ID));
+		fields.put(ActionType.INTERACT_ENTITY, List.of(FIELD_TARGET_ID, FIELD_HAND, FIELD_EXPECTED_ITEM_ID, "hitX", "hitY", "hitZ"));
 		fields.put(ActionType.DISMOUNT, List.of());
 		fields.put(ActionType.START_FALL_FLYING, List.of());
+		fields.put(ActionType.WAKE_UP, List.of());
+		fields.put(ActionType.SET_FLIGHT, List.of("enabled"));
+		fields.put(ActionType.WRITE_SIGN, List.of("x", "y", "z", "front", "lines", "expectedLines"));
+		fields.put(ActionType.EDIT_BOOK, List.of("slot", "pages", "title", "expectedFingerprint"));
+		fields.put(ActionType.MENU_CLICK, List.of(FIELD_MENU_ID, "containerId", "stateId", "slot", "button", "clickType", FIELD_EXPECTED_ITEM_ID, "expectedCount", "expectedFingerprint"));
+		fields.put(ActionType.MENU_CLOSE, List.of(FIELD_MENU_ID, "containerId", "stateId"));
+		fields.put(ActionType.BEACON_EFFECTS, List.of(FIELD_MENU_ID, "containerId", "stateId", "primaryEffectId", "secondaryEffectId"));
 		fields.put(ActionType.MENU_TRANSFER, List.of(
 				FIELD_MENU_ID, FIELD_SOURCE_SLOT, FIELD_DESTINATION_SLOT,
-				FIELD_COUNT, FIELD_EXPECTED_ITEM_ID, FIELD_TIMEOUT_MS
+				FIELD_COUNT, FIELD_EXPECTED_ITEM_ID, FIELD_TIMEOUT_MS, "containerId", "stateId"
 		));
-		fields.put(ActionType.MENU_BUTTON, List.of(FIELD_MENU_ID, FIELD_BUTTON_ID, FIELD_TIMEOUT_MS));
-		fields.put(ActionType.ANVIL_RENAME, List.of(FIELD_MENU_ID, FIELD_NAME, FIELD_TIMEOUT_MS));
+		fields.put(ActionType.MENU_BUTTON, List.of(FIELD_MENU_ID, FIELD_BUTTON_ID, FIELD_TIMEOUT_MS, "containerId", "stateId"));
+		fields.put(ActionType.ANVIL_RENAME, List.of(FIELD_MENU_ID, FIELD_NAME, FIELD_TIMEOUT_MS, "containerId", "stateId"));
 		fields.put(ActionType.RESPAWN, List.of());
 		fields.put(ActionType.COMPLETE_GOAL, List.of(FIELD_SUMMARY));
 		return Map.copyOf(fields);

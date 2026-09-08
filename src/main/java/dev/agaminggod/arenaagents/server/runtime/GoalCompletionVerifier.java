@@ -106,6 +106,16 @@ public final class GoalCompletionVerifier {
 				return count;
 			}
 
+			@Override public long inventoryCountAny(List<String> itemIds) {
+				Set<String> accepted = Set.copyOf(itemIds);
+				long count = 0;
+				for (int index = 0; index < player.getInventory().getContainerSize(); index++) {
+					ItemStack stack = player.getInventory().getItem(index);
+					if (!stack.isEmpty() && accepted.contains(BuiltInRegistries.ITEM.getKey(stack.getItem()).toString())) count += stack.getCount();
+				}
+				return count;
+			}
+
 			@Override public Position position() {
 				return new Position(player.getX(), player.getY(), player.getZ());
 			}
@@ -184,6 +194,14 @@ public final class GoalCompletionVerifier {
 		if (predicate instanceof GoalPredicate.InventoryContains inventory) {
 			int observed = source.inventoryCount(inventory.itemId());
 			evaluated = leaf("inventory_contains", observed >= inventory.count(), inventory.itemId() + " x" + inventory.count(), inventory.itemId() + " x" + observed);
+			evaluatedLeaves.put(key, evaluated);
+			return evaluated;
+		}
+		if (predicate instanceof GoalPredicate.InventoryContainsAny inventory) {
+			long observed = source.inventoryCountAny(inventory.itemIds());
+			evaluated = leaf("inventory_contains_any", observed >= inventory.count(),
+					"combined count across " + inventory.itemIds().size() + " accepted item IDs >= " + inventory.count(),
+					"combined count " + observed);
 			evaluatedLeaves.put(key, evaluated);
 			return evaluated;
 		}
@@ -355,6 +373,11 @@ public final class GoalCompletionVerifier {
 
 	public interface FactSource {
 		int inventoryCount(String itemId);
+		default long inventoryCountAny(List<String> itemIds) {
+			long count = 0;
+			for (String itemId : itemIds) count += inventoryCount(itemId);
+			return count;
+		}
 		Position position();
 		BlockFact blockAt(int x, int y, int z);
 		boolean advancementGranted(String advancementId);

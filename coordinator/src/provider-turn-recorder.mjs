@@ -96,6 +96,7 @@ function normalizeRecord(fields, runId, scenarioId, timestamp) {
 		provider: boundedMeta(fields.provider),
 		model: boundedMeta(fields.model),
 		reasoningEffort: boundedMeta(fields.reasoningEffort),
+		...(fields.executionSettings == null ? {} : { executionSettings: normalizeExecutionSettings(fields.executionSettings) }),
 		goalRevision: boundedInteger(fields.goalRevision),
 		attempt: boundedInteger(fields.attempt),
 		retry: fields.retry === true,
@@ -126,6 +127,7 @@ function publicRecord(row) {
 		provider: row.provider,
 		model: row.model,
 		reasoningEffort: row.reasoningEffort,
+		...(row.executionSettings === undefined ? {} : { executionSettings: row.executionSettings }),
 		goalRevision: row.goalRevision,
 		attempt: row.attempt,
 		retry: row.retry,
@@ -140,6 +142,20 @@ function publicRecord(row) {
 		inputExcerpt: redactAndBound(row.input, MAX_PUBLIC_EXCERPT_BYTES),
 		outputExcerpt: redactAndBound(row.output, MAX_PUBLIC_EXCERPT_BYTES),
 		...(row.error === undefined ? {} : { error: row.error }),
+	};
+}
+
+function normalizeExecutionSettings(value) {
+	if (typeof value !== 'object' || Array.isArray(value)) throw new TypeError('executionSettings must be an object');
+	const fields = ['provider', 'model', 'reasoningEffort', 'serviceTier'];
+	const pick = (source, keys) => Object.fromEntries(keys.map((key) => [key, boundedMeta(source?.[key])]));
+	return {
+		requested: pick(value.requested, fields), effective: pick(value.effective, [...fields, 'thinkingMode']),
+		...pick(value, ['transport', 'controlProtocol', 'modelSelector']),
+		evidence: pick(value.evidence, ['model', 'reasoningEffort', 'serviceTier']),
+		limitations: Array.isArray(value.limitations) ? value.limitations.slice(0, 16).map(boundedMeta) : [],
+		...(value.limits == null ? {} : { limits: Object.fromEntries(['planningLeaseTimeoutMs', 'nativeTurnBudgetMs']
+			.filter((key) => Number.isSafeInteger(value.limits[key]) && value.limits[key] > 0).map((key) => [key, value.limits[key]])) }),
 	};
 }
 
