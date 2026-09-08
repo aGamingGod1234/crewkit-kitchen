@@ -69,7 +69,8 @@ test('scenario compilation rejects valid production actions the simulator cannot
 		{ actionId: 'dismount', actionType: 'dismount', arguments: {} },
 	];
 	for (const command of commands) {
-		const source = `program.onUnhandledAttention("continue_and_notify"); await player.${command.actionType}(${JSON.stringify(command.arguments)});`;
+		const argumentsSource = Object.keys(command.arguments).length === 0 ? '' : JSON.stringify(command.arguments);
+		const source = `program.onUnhandledAttention("continue_and_notify"); await player.${command.actionType}(${argumentsSource});`;
 		assert.doesNotThrow(() => parseArenaScript(source));
 		assert.throws(() => compileScenarioProgram({ id: 'unsupported-action', commands: [command] }), { code: 'SIMULATOR_UNSUPPORTED_ACTION' });
 	}

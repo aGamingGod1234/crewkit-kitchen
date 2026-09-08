@@ -1,6 +1,7 @@
 package dev.agaminggod.arenaagents.server.runtime.controller;
 
 import dev.agaminggod.arenaagents.client.navigation.WalkabilityView;
+import dev.agaminggod.arenaagents.world.WorldMutationRevisions;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.block.Blocks;
@@ -68,7 +69,61 @@ public final class MinecraftNavigationWorldVerification {
 				.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO)), "a top slab leaves real clearance for a crouching player");
 		assertTrue(!MinecraftNavigationWorld.crouchClearance(Blocks.STONE_SLAB.defaultBlockState()
 				.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO)), "a bottom slab does not invent a crouch passage through solid collision");
-		return 21;
+		return 21 + verifySampledRevisions();
+	}
+
+	private static int verifySampledRevisions() {
+		WorldMutationRevisions revisions = new WorldMutationRevisions();
+		int[] reads = {0};
+		MinecraftNavigationWorld.SampledRevisions snapshot = new MinecraftNavigationWorld.SampledRevisions((center, radius) -> {
+			reads[0]++;
+			assertEquals(9, radius, "a sampled chunk uses bounded neighboring collision scope");
+			return revisions.revision(center.getX(), center.getZ(), radius);
+		});
+		assertTrue(snapshot.isCurrent(), "an empty terrain snapshot has no stale samples");
+		assertEquals(0, reads[0], "an empty snapshot never requests a global revision");
+		snapshot.sample(510, 250);
+		snapshot.sample(511, 255);
+		assertEquals(1, reads[0], "all sampled cells in one chunk share one revision scope");
+		assertTrue(snapshot.isCurrent(), "unchanged terrain retains an incremental search");
+		revisions.revision(10_000, 10_000, 0);
+		revisions.recordMutation(10_000, 10_000);
+		assertTrue(snapshot.isCurrent(), "mutations in another tracked region retain an incremental search");
+		revisions.recordMutation(512, 250);
+		assertTrue(!snapshot.isCurrent(), "neighboring collision changes cross a positive region boundary");
+		assertTrue(!snapshot.isCurrent(), "checking an invalid snapshot cannot silently rebase its cached cells");
+		snapshot.sample(600, 250);
+		assertTrue(!snapshot.isCurrent(), "later samples cannot erase an earlier stale collision scope");
+
+		MinecraftNavigationWorld.SampledRevisions negative = snapshot(revisions);
+		negative.sample(-512, -512);
+		assertTrue(negative.isCurrent(), "negative chunk coordinates begin current");
+		revisions.recordMutation(-513, -513);
+		assertTrue(!negative.isCurrent(), "neighboring collision changes cross negative region boundaries");
+
+		MinecraftNavigationWorld.SampledRevisions dynamic = snapshot(revisions);
+		dynamic.sample(128, 128);
+		BlockState unchanged = Blocks.SHULKER_BOX.defaultBlockState();
+		revisions.recordMutation(128, 128);
+		assertTrue(unchanged == Blocks.SHULKER_BOX.defaultBlockState(), "dynamic collision need not replace a block state");
+		assertTrue(!dynamic.isCurrent(), "a dynamic collision notification invalidates without a block-state comparison");
+
+		MinecraftNavigationWorld.SampledRevisions evicted = snapshot(revisions);
+		evicted.sample(0, 0);
+		for (int index = 1; index <= 300; index++) revisions.revision(index * 2_048, 0, 0);
+		assertTrue(!evicted.isCurrent(), "eviction of regional history cannot revive old navigation cells");
+
+		long[] tick = {1};
+		MinecraftNavigationWorld.SampledRevisions fallback = new MinecraftNavigationWorld.SampledRevisions((center, radius) -> tick[0]);
+		fallback.sample(0, 0);
+		assertTrue(fallback.isCurrent(), "the clock fallback can reuse cells within a tick");
+		tick[0]++;
+		assertTrue(!fallback.isCurrent(), "the clock fallback expires cells when mutation tracking is absent");
+		return 15 + reads[0];
+	}
+
+	private static MinecraftNavigationWorld.SampledRevisions snapshot(WorldMutationRevisions revisions) {
+		return new MinecraftNavigationWorld.SampledRevisions((center, radius) -> revisions.revision(center.getX(), center.getZ(), radius));
 	}
 
 	private static WalkabilityView.Cell classify(BlockState state, boolean boundedShallowWater) {

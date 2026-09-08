@@ -31,47 +31,70 @@ public final class MinecraftNavigationWorld implements WalkabilityView {
 	private final ServerLevel level;
 	private final Map<GridPosition, Cell> cells = new HashMap<>();
 	private final Map<GridPosition, Boolean> shallowWater = new HashMap<>();
-	private final Map<BlockPos, BlockState> sampledStates = new HashMap<>();
 	private final Map<Long, Boolean> sampledChunks = new HashMap<>();
-	private long revision;
+	private final SampledRevisions sampledRevisions;
 	private long cacheHits;
 	private long cacheMisses;
 
 	public MinecraftNavigationWorld(ServerLevel level) {
 		this.level = Objects.requireNonNull(level, "level must not be null");
-		this.revision = mutationRevision();
+		this.sampledRevisions = new SampledRevisions((center, radius) ->
+				level instanceof WorldMutationRevisionAccess access
+						? access.arenaagents$worldMutationRevision(center, radius) : level.getGameTime());
 	}
 
-	/** Retained searches survive unrelated mutations, but never reuse changed sampled terrain. */
+	/** Dynamic collision changes invalidate even when the sampled block states are identical. */
 	boolean isCurrent() {
 		for (Map.Entry<Long, Boolean> entry : sampledChunks.entrySet()) {
 			long key = entry.getKey();
 			if (level.hasChunk((int) (key >> 32), (int) key) != entry.getValue()) return false;
 		}
-		long current = mutationRevision();
-		if (current == revision) return true;
-		for (Map.Entry<BlockPos, BlockState> entry : sampledStates.entrySet()) {
-			if (level.getBlockState(entry.getKey()) != entry.getValue()) return false;
-		}
-		revision = current;
-		return true;
-	}
-
-	private long mutationRevision() {
-		return level instanceof WorldMutationRevisionAccess access
-				? access.arenaagents$worldMutationRevision() : level.getGameTime();
+		return sampledRevisions.isCurrent();
 	}
 
 	private BlockState stateAt(BlockPos position) {
 		hasChunk(position.getX(), position.getZ());
-		BlockState state = level.getBlockState(position);
-		sampledStates.putIfAbsent(position.immutable(), state);
-		return state;
+		return level.getBlockState(position);
 	}
 
 	private boolean hasChunk(int x, int z) {
 		long key = ((long) (x >> 4) << 32) | ((z >> 4) & 0xffffffffL);
-		return sampledChunks.computeIfAbsent(key, ignored -> level.hasChunk(x >> 4, z >> 4));
+		return sampledChunks.computeIfAbsent(key, ignored -> {
+			sampledRevisions.sample(x, z);
+			return level.hasChunk(x >> 4, z >> 4);
+		});
+	}
+
+	@FunctionalInterface
+	interface RevisionReader {
+		long read(BlockPos center, int radius);
+	}
+
+	static final class SampledRevisions {
+		private final RevisionReader reader;
+		private final Map<Long, Long> revisions = new HashMap<>();
+
+		SampledRevisions(RevisionReader reader) {
+			this.reader = Objects.requireNonNull(reader);
+		}
+
+		void sample(int x, int z) {
+			long key = ((long) (x >> 4) << 32) | ((z >> 4) & 0xffffffffL);
+			revisions.computeIfAbsent(key, ignored -> read(key));
+		}
+
+		boolean isCurrent() {
+			for (Map.Entry<Long, Long> entry : revisions.entrySet()) {
+				if (read(entry.getKey()) != entry.getValue()) return false;
+			}
+			return true;
+		}
+
+		private long read(long key) {
+			BlockPos center = new BlockPos(((int) (key >> 32) << 4) + 8, 0, ((int) key << 4) + 8);
+			// Include neighboring blocks whose moving collision can enter a sampled chunk.
+			return reader.read(center, 9);
+		}
 	}
 
 	@Override
