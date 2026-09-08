@@ -13,6 +13,7 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.player.Input;
 import net.minecraft.world.entity.decoration.ItemFrame;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.phys.BlockHitResult;
@@ -33,9 +34,11 @@ public final class CarpetInputStateSink implements InputStateSink {
 		ServerPlayer player = manager.findAgentPlayer(agentId).orElse(null);
 		if (player == null) {
 			CarpetActionArbitration.unbind(agentId);
+			ModelPlayerInputBridge.unbind(agentId);
 			useDriver.discard(agentId);
 			return;
 		}
+		ModelPlayerInputBridge.bind(player, agentId, state);
 		EntityPlayerActionPack actions = OfflineAgentPlayers.actions(player);
 		boolean resetActions = previous != null && (
 				(previous.jump() && !state.jump())
@@ -52,6 +55,8 @@ public final class CarpetInputStateSink implements InputStateSink {
 				.setSneaking(state.sneak())
 				.setSprinting(state.sprint());
 		actions.setSlot(state.selectedSlot() + 1);
+		player.setLastClientInput(new Input(state.forward() > 0, state.forward() < 0,
+				state.strafe() > 0, state.strafe() < 0, state.jump(), state.sneak(), state.sprint()));
 		if (state.jump() && (resetActions || previous == null || !previous.jump())) {
 			actions.start(EntityPlayerActionPack.ActionType.JUMP, EntityPlayerActionPack.Action.continuous());
 		}
@@ -92,13 +97,18 @@ public final class CarpetInputStateSink implements InputStateSink {
 	}
 
 	@Override
+	public long acceptedUses(AgentId agentId) { return useDriver.acceptedUses(agentId); }
+
+	@Override
 	public void clear(AgentId agentId, AgentInputState previous) {
 		CarpetActionArbitration.unbind(agentId);
+		ModelPlayerInputBridge.unbind(agentId);
 		ServerPlayer player = manager.findAgentPlayer(agentId).orElse(null);
 		if (player == null) {
 			useDriver.discard(agentId);
 		} else {
 			OfflineAgentPlayers.actions(player).stopAll();
+			player.setLastClientInput(Input.EMPTY);
 			useDriver.stop(agentId, new MinecraftPlayerUseAccess(player));
 			useDriver.discard(agentId);
 		}
@@ -129,7 +139,7 @@ public final class CarpetInputStateSink implements InputStateSink {
 
 		@Override
 		public ExactHandUseDriver.TargetKind target() {
-			double reach = player.gameMode.isCreative() ? 5.0D : 4.5D;
+			double reach = Math.max(player.blockInteractionRange(), player.entityInteractionRange());
 			target = Tracer.rayTrace(player, 1.0F, reach, false);
 			return switch (target.getType()) {
 				case BLOCK -> ExactHandUseDriver.TargetKind.BLOCK;
@@ -145,7 +155,8 @@ public final class CarpetInputStateSink implements InputStateSink {
 			ServerLevel level = player.level();
 			BlockPos position = hit.getBlockPos();
 			Direction direction = hit.getDirection();
-			if (position.getY() >= level.getMaxY() - (direction == Direction.UP ? 1 : 0)
+			if (!player.isWithinBlockInteractionRange(position, 0.0D)
+					|| position.getY() >= level.getMaxY() - (direction == Direction.UP ? 1 : 0)
 					|| !level.mayInteract(player, position)) {
 				return ExactHandUseDriver.TargetAttempt.pass();
 			}
@@ -165,6 +176,7 @@ public final class CarpetInputStateSink implements InputStateSink {
 			EntityHitResult hit = (EntityHitResult) target;
 			player.resetLastActionTime();
 			Entity target = hit.getEntity();
+			if (!player.isWithinEntityInteractionRange(target, 0.0D)) return ExactHandUseDriver.TargetAttempt.pass();
 			ItemStack held = player.getItemInHand(hand);
 			boolean itemWasEmpty = held.isEmpty();
 			boolean emptyItemFrame = target instanceof ItemFrame frame && frame.getItem().isEmpty();

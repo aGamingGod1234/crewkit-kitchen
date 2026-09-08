@@ -66,6 +66,7 @@ export class ProviderService extends EventEmitter {
 			execute: (provider, operation) => this.#execute(provider, operation, 'catalog', { recordSuccess: false }),
 			recordOutcome: (provider, source, recovery) => this.#recordCatalogOutcome(provider, source, recovery),
 			recovery: () => this.recoverySnapshot(),
+			availability: () => this.availabilitySnapshot(),
 			now: this.#now,
 		});
 	}
@@ -277,6 +278,15 @@ export class ProviderService extends EventEmitter {
 	getAgent(agentId) {
 		if (this.#stopped) return null;
 		return this.#acceptedAgents.get(agentId) ?? null;
+	}
+
+	getExecutionSettings(agentId) {
+		const settings = this.getAgent(agentId)?.executionSettings;
+		return settings === undefined ? null : structuredClone(settings);
+	}
+
+	availabilitySnapshot() {
+		return [...this.#services].map(([provider, service]) => ({ provider, ...(service.availability ?? { playable: true, reasonCode: null, reason: null }) }));
 	}
 
 	async removeAgent(agentId) {
@@ -891,11 +901,12 @@ function assertSameProfile(existing, requested) {
 }
 
 class CombinedProviderCatalog {
-	constructor(services, { execute, recordOutcome, recovery, now }) {
+	constructor(services, { execute, recordOutcome, recovery, availability, now }) {
 		this.services = services;
 		this.execute = execute;
 		this.recordOutcome = recordOutcome;
 		this.recovery = recovery;
+		this.availability = availability;
 		this.now = now;
 		this.lastValid = new Map();
 		this.stale = false;
@@ -935,6 +946,7 @@ class CombinedProviderCatalog {
 			models: snapshots.flatMap((snapshot) => snapshot.models.map((model) => ({ ...model, provider: model.provider ?? snapshot.provider }))),
 			source: combinedSource(snapshots, selected.length),
 			recovery: this.recovery(),
+			availability: this.availability(),
 		};
 	}
 	assertSupported(provider, model, reasoningEffort, serviceTier) {
@@ -1013,7 +1025,7 @@ function validateCatalogSnapshot(value, provider) {
 	if (value === null || typeof value !== 'object' || Array.isArray(value) || !Array.isArray(value.models)) {
 		throw providerError('INVALID_CATALOG', `${provider} catalog snapshot must contain a models array`);
 	}
-	if (value.models.length === 0) throw providerError('INVALID_CATALOG', `${provider} catalog snapshot must contain at least one model`);
+	if (value.models.length === 0 && value.availability?.playable !== false) throw providerError('INVALID_CATALOG', `${provider} catalog snapshot must contain at least one model`);
 	for (const model of value.models) {
 		if (model === null || typeof model !== 'object' || Array.isArray(model)) throw providerError('INVALID_CATALOG', `${provider} catalog model must be an object`);
 		for (const [field, fieldValue] of [['id', model.id], ['model', model.model], ['displayName', model.displayName]]) {

@@ -52,7 +52,7 @@ test('death preserves last live inventory as lastLost, not as currently held alr
 		'lost corpse stacks are not currently evidenced inventory');
 	assert.equal(dead.recovery.alreadyHaveFacts.some((entry) => entry.kind === 'lost_on_death'), false);
 	assert.ok(dead.recovery.alreadyHaveFacts.some((entry) => entry.kind === 'placed' && entry.blockId === 'minecraft:crafting_table'));
-	assert.ok(dead.recovery.doNotRedo.includes('minecraft:crafting_table'));
+	assert.deepEqual(dead.recovery.doNotRedo, []);
 	assert.equal(dead.recovery.doNotRedo.includes('minecraft:stone_pickaxe'), false,
 		'the player may recraft if the corpse is gone');
 	assert.equal(dead.recovery.everPossessed, undefined);
@@ -70,29 +70,29 @@ test('post-respawn empty observe still surfaces last death and lastLost stacks',
 	assert.equal(afterRespawn.recovery.alreadyHave.includes('minecraft:stone_pickaxe'), false);
 });
 
-test('current iron pickaxe skips both wooden and stone pickaxe recipes', () => {
+test('current tools are facts and never suppress model crafting choices', () => {
 	const store = new RecoveryProgressStore();
 	const recovery = store.remember('agent-a', 2, {
 		inventory: { items: [{ itemId: 'minecraft:iron_pickaxe', count: 1, slot: 0 }] },
 		player: { dead: false },
 	});
-	assert.ok(recovery.doNotRedo.includes('minecraft:wooden_pickaxe'));
-	assert.ok(recovery.doNotRedo.includes('minecraft:stone_pickaxe'));
+	assert.deepEqual(recovery.doNotRedo, []);
+	assert.deepEqual(recovery.doNotRedo, []);
 });
 
-test('tool recipe memory is scoped to the tool family', () => {
+test('tool families do not create a system recipe policy', () => {
 	const store = new RecoveryProgressStore();
 	const recovery = store.remember('agent-a', 2, {
 		inventory: { items: [{ itemId: 'minecraft:iron_pickaxe', count: 1, slot: 0 }] },
 		player: { dead: false },
 	});
-	assert.ok(recovery.doNotRedo.includes('minecraft:wooden_pickaxe'));
-	assert.ok(recovery.doNotRedo.includes('minecraft:stone_pickaxe'));
+	assert.deepEqual(recovery.doNotRedo, []);
+	assert.deepEqual(recovery.doNotRedo, []);
 	assert.equal(recovery.doNotRedo.includes('minecraft:wooden_axe'), false);
 	assert.equal(recovery.doNotRedo.includes('minecraft:stone_sword'), false);
 });
 
-test('nearby death drops count as alreadyHave so retrieve beats recraft', () => {
+test('nearby death drops are labeled as observed drops without a retrieval decision', () => {
 	const store = new RecoveryProgressStore();
 	store.remember('lucas', 1, liveObservation());
 	store.remember('lucas', 1, { death: DEATH });
@@ -102,7 +102,7 @@ test('nearby death drops count as alreadyHave so retrieve beats recraft', () => 
 		items: [{ itemId: 'minecraft:stone_pickaxe', count: 1, stableId: 'drop-1', x: DEATH.x, y: DEATH.y, z: DEATH.z }],
 	});
 	assert.ok(wrapped.recovery.alreadyHaveFacts.some((entry) => entry.kind === 'dropped' && entry.itemId === 'minecraft:stone_pickaxe'));
-	assert.ok(wrapped.recovery.doNotRedo.includes('minecraft:wooden_pickaxe'));
+	assert.deepEqual(wrapped.recovery.doNotRedo, []);
 });
 
 test('goal revision replacement keeps lastDeath but drops prior-goal inventory memory', () => {
@@ -121,7 +121,7 @@ test('forget removes one agent without touching another', () => {
 	store.remember('b', 1, liveObservation({ inventory: { items: [{ itemId: 'minecraft:iron_pickaxe', count: 1 }] } }));
 	store.forget('a');
 	assert.equal(store.snapshot('a'), null);
-	assert.ok(store.snapshot('b').doNotRedo.includes('minecraft:stone_pickaxe'));
+	assert.deepEqual(store.snapshot('b').doNotRedo, []);
 });
 
 test('iron ingot is not a completed tool tier and does not skip wooden or stone recipes', () => {
@@ -269,14 +269,14 @@ test('empty inventory while alive does not rewrite lastLost as another death', (
 	assert.equal(afterBreak.alreadyHave.includes('minecraft:wooden_pickaxe'), false);
 });
 
-test('an iron sword does not skip pickaxe recipes', () => {
+test('an iron sword does not prescribe any crafting exclusions', () => {
 	const store = new RecoveryProgressStore();
 	const recovery = store.remember('agent-a', 1, {
 		inventory: { items: [{ itemId: 'minecraft:iron_sword', count: 1 }] },
 		player: { dead: false },
 	});
-	assert.ok(recovery.doNotRedo.includes('minecraft:wooden_sword'));
-	assert.ok(recovery.doNotRedo.includes('minecraft:stone_sword'));
+	assert.deepEqual(recovery.doNotRedo, []);
+	assert.deepEqual(recovery.doNotRedo, []);
 	assert.equal(recovery.doNotRedo.includes('minecraft:wooden_pickaxe'), false);
 	assert.equal(recovery.doNotRedo.includes('minecraft:stone_pickaxe'), false);
 });

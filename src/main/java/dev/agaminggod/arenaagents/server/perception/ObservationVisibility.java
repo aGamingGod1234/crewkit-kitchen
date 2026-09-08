@@ -75,7 +75,8 @@ public final class ObservationVisibility {
 
 		public boolean isEntityWithinView(Entity entity) {
 			Objects.requireNonNull(entity, "entity must not be null");
-			return isWithinNormalizedViewCone(eye, normalizedView, entity.getBoundingBox().getCenter());
+			return !entity.isInvisibleTo(observer)
+					&& isWithinNormalizedViewCone(eye, normalizedView, entity.getBoundingBox().getCenter());
 		}
 
 		public boolean hasLineOfSight(Entity entity) {
@@ -106,7 +107,7 @@ public final class ObservationVisibility {
 					eye,
 					Vec3.atCenterOf(position),
 					ClipContext.Block.VISUAL,
-					ClipContext.Fluid.NONE,
+					level.getFluidState(position).isEmpty() ? ClipContext.Fluid.NONE : ClipContext.Fluid.ANY,
 					observer
 			));
 			return hit.getType() == HitResult.Type.BLOCK && hit.getBlockPos().equals(position);

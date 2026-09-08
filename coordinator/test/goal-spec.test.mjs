@@ -8,9 +8,55 @@ import {
 	parseGoalSpecProposal,
 	parseGoalSpecRequest,
 	goalSpecFingerprint,
+	goalPredicateIdentifiers,
 } from '../src/goal-spec.mjs';
 
 const REQUEST_ID = '00000000-0000-4000-8000-000000000001';
+
+test('compact inventory categories preserve a bounded unique identifier set and count as one factual leaf', () => {
+	const itemIds = Array.from({ length: 64 }, (_unused, index) => `minecraft:category_member_${index}`);
+	const predicate = { type: 'inventory_contains_any', itemIds, count: 3 };
+	const proposal = { requestId: REQUEST_ID, summary: 'Collect three eligible items in total', predicate };
+	const parsed = parseGoalSpecProposal(proposal);
+	assert.deepEqual(parsed, proposal);
+	assert.ok(Object.isFrozen(parsed.predicate.itemIds));
+	assert.deepEqual(goalPredicateIdentifiers(predicate), itemIds);
+	const sixteenLeaves = { type: 'all_of', predicates: [predicate, ...Array.from({ length: 15 }, (_unused, index) => ({ type: 'inventory_contains', itemId: `minecraft:exact_item_${index}`, count: 1 }))] };
+	assert.equal(parseGoalSpecProposal({ ...proposal, predicate: sixteenLeaves }).predicate.predicates.length, 16);
+	assert.throws(() => parseGoalSpecProposal({ ...proposal, predicate: { type: 'all_of', predicates: [sixteenLeaves, { type: 'operator_confirmed' }] } }),
+		error => error?.code === 'GOAL_PREDICATE_LIMIT_EXCEEDED');
+	for (const invalid of [[], new Array(1), [...itemIds, 'minecraft:extra'], ['minecraft:oak_log', 'minecraft:oak_log'], ['minecraft:oak_log', ' minecraft:oak_log '], ['missing_namespace']]) {
+		assert.throws(() => parseGoalSpecProposal({ ...proposal, predicate: { ...predicate, itemIds: invalid } }));
+	}
+	for (const count of [0, -1, 1.5, NaN, 2_147_483_648]) assert.throws(() => parseGoalSpecProposal({ ...proposal, predicate: { ...predicate, count } }));
+	assert.equal(parseGoalSpecProposal({ ...proposal, predicate: { ...predicate, count: 2_147_483_647 } }).predicate.count, 2_147_483_647);
+	assert.throws(() => parseGoalSpecProposal({ ...proposal, predicate: { ...predicate, sourceTag: '#minecraft:logs' } }), error => error?.code === 'UNKNOWN_GOAL_FIELD');
+	for (const schema of [GOAL_PREDICATE_SCHEMA, GOAL_SPEC_PROPOSAL_SCHEMA.$defs.predicate]) {
+		const variant = schema.anyOf.find(entry => entry.properties.type.const === 'inventory_contains_any');
+		assert.equal(variant.properties.itemIds.minItems, 1);
+		assert.equal(variant.properties.itemIds.maxItems, 64);
+		assert.equal(variant.properties.count.maximum, 2_147_483_647);
+	}
+});
+
+test('compact inventory groups share an aggregate sixty-four reference budget across compound branches', () => {
+	const itemIds = Array.from({ length: 33 }, (_unused, index) => `minecraft:category_member_${index}`);
+	const group = { type: 'inventory_contains_any', itemIds: itemIds.slice(0, 32), count: 1 };
+	const proposal = { requestId: REQUEST_ID, summary: 'Collect accepted variants', predicate: { type: 'all_of', predicates: [group, group] } };
+	assert.equal(parseGoalSpecProposal(proposal).predicate.predicates.length, 2);
+	for (const type of ['all_of', 'any_of']) {
+		assert.throws(() => parseGoalSpecProposal({ ...proposal, predicate: { type, predicates: [group, { ...group, itemIds }] } }),
+			error => error?.code === 'GOAL_PREDICATE_LIMIT_EXCEEDED');
+	}
+});
+
+test('compact inventory goal persistence matches the Java item_ids canonical fingerprint and retains array order', () => {
+	const fields = { originalRequest: 'Collect any logs', predicate: { type: 'inventory_contains_any', itemIds: ['minecraft:oak_log', 'minecraft:birch_log'], count: 3 }, createdAtTick: 1200 };
+	const fingerprint = 'f83b10c17263df853e9ff267009f9944df8f660818b7037396c607eea8581c90';
+	assert.equal(goalSpecFingerprint(fields), fingerprint);
+	assert.deepEqual(parseGoalSpec({ ...fields, fingerprint }), { ...fields, fingerprint });
+	assert.notEqual(goalSpecFingerprint({ ...fields, predicate: { ...fields.predicate, itemIds: [...fields.predicate.itemIds].reverse() } }), fingerprint);
+});
 
 test('translated movement and kill predicates enforce executable post-activation invariants', () => {
 	const position = {

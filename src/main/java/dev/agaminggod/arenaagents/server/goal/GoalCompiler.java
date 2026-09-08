@@ -28,6 +28,10 @@ import net.minecraft.world.item.Item;
 public final class GoalCompiler {
 	private static final int MAX_COMPOUND_LEAVES = 16;
 	private static final int MAX_TRANSLATION_CANDIDATES = 64;
+	private static final List<String> SMALL_COUNTS = List.of("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen");
+	private static final List<String> TENS = List.of("twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety");
+	private static final String COUNT = "(?:[+-]?\\d\\S*|" + String.join("|", SMALL_COUNTS)
+			+ "|(?:" + String.join("|", TENS) + ")(?:[ -](?:one|two|three|four|five|six|seven|eight|nine))?)";
 	private static final Pattern POSITION = Pattern.compile(
 			"^(?:go|move|travel|get)(?: to)?(?: coordinates?)?\\s+"
 					+ "(?:x\\s*=\\s*)?(-?\\d+)\\s*,?\\s*"
@@ -39,7 +43,7 @@ public final class GoalCompiler {
 	private static final Pattern ADVANCEMENT_NAME_PREFIX = Pattern.compile("^(?:complete|get|earn) (?:the )?advancement (.+)$");
 	private static final Pattern ADVANCEMENT_NAME_SUFFIX = Pattern.compile("^(?:complete|get|earn) (?:the )?(.+?) advancement$");
 	private static final Pattern KILL = Pattern.compile("^(?:kill|slay|defeat) (?:(?:the|a|an) )?(.+)$");
-	private static final Pattern KILL_COUNT = Pattern.compile("^([+-]?\\d+)\\s+(.+)$");
+	private static final Pattern KILL_COUNT = Pattern.compile("^(?:at least\\s+)?(" + COUNT + ")\\s+(.+)$");
 	private static final Pattern BEAT_GAME = Pattern.compile("^beat (?:the )?game$");
 	private static final Pattern BEAT_GAME_TRANSLATION = Pattern.compile(
 			"^(?:(?:go(?: and)?\\s+)?beat (?:the )?game"
@@ -47,8 +51,9 @@ public final class GoalCompiler {
 					+ "|(?:go(?: and)?\\s+)?(?:kill|slay|defeat) (?:(?:the|a|an) )?(?:ender|enemy) dragon"
 					+ "\\s+and\\s+beat (?:the )?game)$"
 	);
-	private static final Pattern ITEM = Pattern.compile("^(get|obtain|collect|bring|craft|make) (?:me )?(?:([+-]?\\d\\S*) )?(?:(?:a|an|some) )?(.+?)(?: for me)?$");
-	private static final Pattern ITEM_ALTERNATIVE_COUNT = Pattern.compile("^([+-]?\\d\\S*)\\s+(.+)$");
+	private static final Pattern ITEM = Pattern.compile("^(get|obtain|collect|bring|gather|acquire|fetch|craft|make) (?:me )?(?:(?:at least )?(" + COUNT + ") )?(?:(?:a|an|some) )?(.+?)(?: for me)?$");
+	private static final Pattern ITEM_ALTERNATIVE_COUNT = Pattern.compile("^(?:at least\\s+)?(" + COUNT + ")\\s+(.+)$");
+	private static final Pattern REFERENCED_ITEM_CLAUSE = Pattern.compile("^(?:keep|retain|hold|carry)\\s+(?:it|them|these|those)(?:\\s.*)?$");
 	private static final Pattern BLOCK = Pattern.compile("^(build|construct|place|put|set|mine|break|destroy) (?:with |using |from )?(?:(?:a|an|some|the) )?(.+?)(?: for me)?$");
 	private static final Pattern BLOCK_LOCATION_SUFFIX = Pattern.compile(
 			"\\s+(?:at|on)(?: coordinates?)?\\s+"
@@ -163,7 +168,7 @@ public final class GoalCompiler {
 			if (isCraftingVerb(item.group(1))) return craftingNeedsTranslation();
 			int count;
 			try {
-				count = item.group(2) == null ? 1 : Integer.parseInt(item.group(2));
+				count = item.group(2) == null ? 1 : parseCount(item.group(2));
 			} catch (NumberFormatException exception) {
 				return GoalCompilation.rejected("The requested item count is outside the supported range.");
 			}
@@ -276,23 +281,24 @@ public final class GoalCompiler {
 		}
 		ArrayList<GoalTranslationConstraint.KillClause> killClauses = new ArrayList<>();
 		ArrayList<GoalTranslationConstraint.ItemClause> itemClauses = new ArrayList<>();
+		Set<String> catalog = Set.copyOf(candidateIdsFor(request, registries));
 		if (clauses.size() > 1) {
 			for (GoalClause clause : clauses) {
 				if (clause.kind() == ClauseKind.KILL) {
-					killClauses.add(killConstraintFor(clause.target(), registries));
+					killClauses.add(killConstraintFor(clause.target(), registries, catalog));
 				} else if (clause.kind() == ClauseKind.ITEM) {
-					itemClauses.add(itemConstraintFor(clause.target(), clause.count(), registries));
+					itemClauses.add(itemConstraintFor(clause.target(), clause.count(), registries, catalog));
 				}
 			}
 		} else {
 			Matcher kill = KILL.matcher(command);
 			if (kill.matches() && !BEAT_GAME.matcher(command).matches()) {
-				killClauses.add(killConstraintFor(kill.group(1), registries));
+				killClauses.add(killConstraintFor(kill.group(1), registries, catalog));
 			}
 			Matcher item = ITEM.matcher(command);
 			if (item.matches()) {
 				itemClauses.add(itemConstraintFor(
-						item.group(3), item.group(2) == null ? 1 : Integer.parseInt(item.group(2)), registries));
+						item.group(3), item.group(2) == null ? 1 : parseCount(item.group(2)), registries, catalog));
 			}
 		}
 		return killClauses.isEmpty() && itemClauses.isEmpty()
@@ -481,7 +487,7 @@ public final class GoalCompiler {
 		Matcher item = ITEM.matcher(value);
 		if (item.matches()) {
 			try {
-				return new GoalClause(ClauseKind.ITEM, item.group(3), item.group(2) == null ? 1 : Integer.parseInt(item.group(2)), isCraftingVerb(item.group(1)), false);
+				return new GoalClause(ClauseKind.ITEM, item.group(3), item.group(2) == null ? 1 : parseCount(item.group(2)), isCraftingVerb(item.group(1)), false);
 			} catch (NumberFormatException exception) {
 				return new GoalClause(ClauseKind.ITEM, item.group(3), -1, isCraftingVerb(item.group(1)), false);
 			}
@@ -496,6 +502,7 @@ public final class GoalCompiler {
 		if (SURVIVE.matcher(value).matches()) return new GoalClause(ClauseKind.SURVIVE, value, 1, false, false);
 		if (SUBJECTIVE.matcher(value).find()) return new GoalClause(ClauseKind.OPERATOR, value, 1, false, false);
 		if (inherited == null) return null;
+		if (REFERENCED_ITEM_CLAUSE.matcher(value).matches()) return new GoalClause(ClauseKind.OPERATOR, value, 1, false, false);
 		String target = value.replaceFirst("^(?:the|a|an|some)\\s+", "").strip();
 		if (target.isEmpty()) return null;
 		if (inherited.kind() == ClauseKind.KILL) return new GoalClause(ClauseKind.KILL, target, 1, false, false);
@@ -506,10 +513,10 @@ public final class GoalCompiler {
 			return new GoalClause(ClauseKind.ADVANCEMENT, target.replaceFirst("\\s+advancement$", ""), 1, false, false);
 		}
 		if (inherited.kind() != ClauseKind.ITEM) return null;
-		Matcher counted = Pattern.compile("^(?:([+-]?\\d\\S*)\\s+)?(?:(?:the|a|an|some)\\s+)?(.+)$").matcher(value);
+		Matcher counted = Pattern.compile("^(?:(?:at least\\s+)?(" + COUNT + ")\\s+)?(?:(?:the|a|an|some)\\s+)?(.+)$").matcher(value);
 		if (!counted.matches()) return null;
 		try {
-			return new GoalClause(ClauseKind.ITEM, counted.group(2), counted.group(1) == null ? 1 : Integer.parseInt(counted.group(1)), inherited.requiresCreation(), false);
+			return new GoalClause(ClauseKind.ITEM, counted.group(2), counted.group(1) == null ? 1 : parseCount(counted.group(1)), inherited.requiresCreation(), false);
 		} catch (NumberFormatException exception) {
 			return new GoalClause(ClauseKind.ITEM, counted.group(2), -1, inherited.requiresCreation(), false);
 		}
@@ -548,16 +555,16 @@ public final class GoalCompiler {
 
 	private static GoalTranslationConstraint.KillClause killConstraintFor(
 			String target,
-			RegistryAccess registries
+			RegistryAccess registries, Set<String> catalog
 	) {
 		ArrayList<GoalTranslationConstraint.KillAlternative> alternatives = new ArrayList<>();
-		for (String rawAlternative : target.split("\\s+or\\s+", -1)) {
+		for (String rawAlternative : catalogTarget(target).split("\\s+or\\s+", -1)) {
 			String alternative = rawAlternative.strip();
 			Matcher counted = KILL_COUNT.matcher(alternative);
-			int count = counted.matches() ? Integer.parseInt(counted.group(1)) : 1;
+			int count = counted.matches() ? parseCount(counted.group(1)) : 1;
 			String entityTarget = counted.matches() ? counted.group(2) : alternative;
 			alternatives.add(new GoalTranslationConstraint.KillAlternative(
-					relatedCandidates(ClauseKind.KILL, entityTarget, registries), count));
+					requireCatalogCandidates(relatedCandidates(ClauseKind.KILL, entityTarget, registries), catalog), count));
 		}
 		return new GoalTranslationConstraint.KillClause(alternatives);
 	}
@@ -565,9 +572,9 @@ public final class GoalCompiler {
 	private static GoalTranslationConstraint.ItemClause itemConstraintFor(
 			String target,
 			int defaultCount,
-			RegistryAccess registries
+			RegistryAccess registries, Set<String> catalog
 	) {
-		String factualTarget = SUBJECTIVE.matcher(target).replaceAll(" ").replaceAll("\\s+", " ").strip();
+		String factualTarget = catalogTarget(SUBJECTIVE.matcher(target).replaceAll(" ").replaceAll("\\s+", " ").strip());
 		List<String> alternatives = explicitAlternatives(factualTarget);
 		String finalTarget = stripItemAlternativeCount(alternatives.getLast());
 		String sharedNoun = alternatives.size() > 1 ? sharedItemNoun(finalTarget) : "";
@@ -575,15 +582,25 @@ public final class GoalCompiler {
 		for (int index = 0; index < alternatives.size(); index++) {
 			String alternative = alternatives.get(index);
 			Matcher counted = ITEM_ALTERNATIVE_COUNT.matcher(alternative);
-			int count = counted.matches() ? Integer.parseInt(counted.group(1)) : defaultCount;
+			int count = counted.matches() ? parseCount(counted.group(1)) : defaultCount;
 			String itemTarget = counted.matches() ? counted.group(2) : alternative;
 			List<String> candidates = index < alternatives.size() - 1 && !sharedNoun.isEmpty() && !itemTarget.contains(" ")
 					? relatedItems(itemTarget + " " + sharedNoun, registries)
 					: List.of();
 			if (candidates.isEmpty()) candidates = relatedItems(itemTarget, registries);
-			constraints.add(new GoalTranslationConstraint.ItemAlternative(candidates, count));
+			constraints.add(new GoalTranslationConstraint.ItemAlternative(requireCatalogCandidates(candidates, catalog), count));
 		}
 		return new GoalTranslationConstraint.ItemClause(constraints);
+	}
+
+	private static List<String> requireCatalogCandidates(List<String> candidates, Set<String> catalog) {
+		if (candidates.isEmpty()) throw new AgentDomainException("GOAL_TRANSLATION_CANDIDATES_UNAVAILABLE",
+				"No registered item or entity matches a required goal clause; specify its Minecraft name or identifier");
+		if (candidates.size() > MAX_TRANSLATION_CANDIDATES || !catalog.containsAll(candidates)) {
+			throw new AgentDomainException("GOAL_TRANSLATION_CATALOG_TOO_BROAD",
+					"The requested category exceeds the bounded identifier catalog; specify a narrower category");
+		}
+		return candidates;
 	}
 
 	private static TranslationLeafBudget candidateTranslationBudget(String command, List<GoalClause> clauses) {
@@ -635,10 +652,19 @@ public final class GoalCompiler {
 
 	private static int parseItemCount(String value) {
 		try {
-			return Integer.parseInt(value);
+			return parseCount(value);
 		} catch (NumberFormatException exception) {
 			return -1;
 		}
+	}
+
+	private static int parseCount(String value) {
+		int small = SMALL_COUNTS.indexOf(value);
+		if (small >= 0) return small;
+		String[] parts = value.split("[ -]", 2);
+		int tens = TENS.indexOf(parts[0]);
+		if (tens >= 0) return (tens + 2) * 10 + (parts.length == 1 ? 0 : SMALL_COUNTS.indexOf(parts[1]));
+		return Integer.parseInt(value);
 	}
 
 	private static String stripItemAlternativeCount(String target) {
@@ -654,12 +680,12 @@ public final class GoalCompiler {
 			int count = 1;
 			if (counted.matches()) {
 				try {
-					java.math.BigInteger parsed = new java.math.BigInteger(counted.group(1));
-					if (parsed.signum() <= 0) return TranslationLeafBudget.nonpositive();
-					if (parsed.compareTo(java.math.BigInteger.valueOf(MAX_COMPOUND_LEAVES)) > 0) {
+					int parsed = parseCount(counted.group(1));
+					if (parsed <= 0) return TranslationLeafBudget.nonpositive();
+					if (parsed > MAX_COMPOUND_LEAVES) {
 						return TranslationLeafBudget.overBudget();
 					}
-					count = parsed.intValueExact();
+					count = parsed;
 				} catch (NumberFormatException | ArithmeticException exception) {
 					return TranslationLeafBudget.overBudget();
 				}
@@ -694,7 +720,7 @@ public final class GoalCompiler {
 	}
 
 	private static List<String> relatedCandidates(ClauseKind kind, String rawTarget, RegistryAccess registries) {
-		String target = SUBJECTIVE.matcher(rawTarget).replaceAll(" ").replaceAll("\\s+", " ").strip();
+		String target = catalogTarget(SUBJECTIVE.matcher(rawTarget).replaceAll(" ").replaceAll("\\s+", " ").strip());
 		List<String> alternatives = explicitAlternatives(target);
 		String sharedNoun = kind == ClauseKind.ITEM && alternatives.size() > 1
 				? sharedItemNoun(stripItemAlternativeCount(alternatives.getLast()))
@@ -778,7 +804,7 @@ public final class GoalCompiler {
 	}
 
 	private static List<String> relatedItems(String target, RegistryAccess registries) {
-		String wanted = normalizedTarget(target);
+		String wanted = catalogTarget(target);
 		if (wanted.isEmpty()) return List.of();
 		Set<String> forms = singularForms(wanted);
 		Registry<Item> itemRegistry = registries.lookup(Registries.ITEM).orElse(BuiltInRegistries.ITEM);
@@ -799,7 +825,7 @@ public final class GoalCompiler {
 	}
 
 	private static List<String> relatedBlocks(String target, RegistryAccess registries) {
-		String wanted = BLOCK_LOCATION_SUFFIX.matcher(normalizedTarget(target))
+		String wanted = BLOCK_LOCATION_SUFFIX.matcher(catalogTarget(target))
 				.replaceFirst("")
 				.replaceFirst("^(?:with|using|from|of)\\s+", "")
 				.strip();
@@ -813,7 +839,7 @@ public final class GoalCompiler {
 			Block block = blockRegistry.getValue(id);
 			String path = pathName(id);
 			String description = block == null ? "" : descriptionName(block.getDescriptionId());
-			if (wantedForms.contains(normalizedTarget(path)) || wantedForms.contains(normalizedTarget(description))) {
+			if (wantedForms.contains(id.toString()) || wantedForms.contains(normalizedTarget(path)) || wantedForms.contains(normalizedTarget(description))) {
 				matches.add(id.toString());
 				if (matches.size() == MAX_TRANSLATION_CANDIDATES) break;
 			}
@@ -837,13 +863,13 @@ public final class GoalCompiler {
 	}
 
 	private static List<String> relatedEntities(String target, RegistryAccess registries) {
-		String wanted = normalizedTarget(target);
+		String wanted = catalogTarget(target);
 		if (wanted.isEmpty()) return List.of();
 		Set<String> forms = singularForms(wanted);
 		Registry<EntityType<?>> registry = registries.lookup(Registries.ENTITY_TYPE).orElse(BuiltInRegistries.ENTITY_TYPE);
 		return registry.keySet().stream()
 				.filter(id -> forms.stream().anyMatch(form ->
-						pathName(id).equals(form) || pathName(id).endsWith(" " + form)))
+						id.toString().equals(form) || pathName(id).equals(form) || pathName(id).endsWith(" " + form)))
 				.map(Identifier::toString).distinct().sorted().toList();
 	}
 
@@ -860,7 +886,23 @@ public final class GoalCompiler {
 		return value.strip().replaceAll("\\s+", " ");
 	}
 
+	/** Retrieval ignores ordinary source and purpose qualifiers; the model still translates the complete request. */
+	private static String catalogTarget(String value) {
+		String target = normalizedTarget(value).toLowerCase(Locale.ROOT)
+				.replaceFirst("^(?:a|an|the|some|any|either)\\s+", "")
+				.replaceFirst("^(?:kind|type|sort)\\s+of\\s+", "")
+				.replaceFirst("\\s+(?:from|in|into|with|without|for|to|that|which|while|and)\\b.*$", "")
+				.strip();
+		return target.contains(":") ? target : target.replace('_', ' ');
+	}
+
 	private static Set<String> singularForms(String value) {
+		if (value.endsWith("ies") && value.length() > 3) {
+			return Set.of(value, value.substring(0, value.length() - 3) + "y", value.substring(0, value.length() - 1));
+		}
+		if ((value.endsWith("ches") || value.endsWith("shes") || value.endsWith("xes") || value.endsWith("zes")) && value.length() > 2) {
+			return Set.of(value, value.substring(0, value.length() - 2), value.substring(0, value.length() - 1));
+		}
 		if (value.length() > 1 && value.endsWith("s") && !value.endsWith("ss")) {
 			return Set.of(value, value.substring(0, value.length() - 1));
 		}

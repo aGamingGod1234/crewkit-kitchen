@@ -46,6 +46,7 @@ export const COORDINATOR_TO_SERVER_TYPES = Object.freeze([
 	'goal_spec_proposal',
 	'conversation_wake_ack',
 	'request_observation',
+	'inspection_request',
 	'action_command',
 	'action_cancel',
 	'action_result_ack',
@@ -62,6 +63,7 @@ export const SERVER_TO_COORDINATOR_TYPES = Object.freeze([
 	'agent_removed',
 	'goal_control',
 	'observation',
+	'inspection_result',
 	'conversation_event',
 	'conversation_wake',
 	'action_progress',
@@ -76,8 +78,8 @@ export const SERVER_TO_COORDINATOR_TYPES = Object.freeze([
 
 const COORDINATOR_TYPES = new Set(COORDINATOR_TO_SERVER_TYPES);
 const SERVER_TYPES = new Set(SERVER_TO_COORDINATOR_TYPES);
-const REVISION_GUARDED_INBOUND_TYPES = new Set(['observation', 'conversation_event', 'action_progress', 'action_result', 'goal_completion_result']);
-const REVISION_GUARDED_OUTBOUND_TYPES = new Set(['agent_ready', 'planning_state', 'goal_completed', 'conversation_wake_ack', 'request_observation', 'action_command', 'action_cancel', 'agent_error', 'verbose_event']);
+const REVISION_GUARDED_INBOUND_TYPES = new Set(['observation', 'inspection_result', 'conversation_event', 'action_progress', 'action_result', 'goal_completion_result']);
+const REVISION_GUARDED_OUTBOUND_TYPES = new Set(['agent_ready', 'planning_state', 'goal_completed', 'conversation_wake_ack', 'request_observation', 'inspection_request', 'action_command', 'action_cancel', 'agent_error', 'verbose_event']);
 const TERMINAL_ACTION_STATES = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT']);
 const MAX_TRACKED_MESSAGE_IDS = 4_096;
 const MAX_TRACKED_TERMINAL_ACTION_IDS = 4_096;
@@ -107,10 +109,28 @@ const FACTUAL_PLAYER_FIELDS = new Set([
 	'onFire', 'air', 'maxAir', 'suffocating', 'fallDistance', 'lastAttacker', 'effects',
 ]);
 const FACTUAL_TOP_LEVEL_PATHS = new Set([
-	'ready', 'status', 'position', 'velocity', 'view', 'inventory', 'entities', 'blocks', 'landmarks', 'nearbyContainers', 'world', 'currentAction', 'lastResult',
+	'ready', 'status', 'position', 'velocity', 'view', 'inventory', 'entities', 'blocks', 'landmarks', 'nearbyContainers', 'world', 'currentAction', 'lastResult', 'perception',
 ]);
 const TRUSTED_ENVELOPES = new WeakSet();
 const TRUSTED_PAYLOAD_TYPES = new WeakMap();
+const PLAYER_DETAIL_FIELDS = ['pose', 'swimming', 'gliding', 'sprinting', 'crouching', 'onClimbable', 'inLava', 'horizontalCollision', 'verticalCollision', 'passenger', 'vehicle'];
+const STACK_DETAIL_FIELDS = ['displayName', 'fingerprint', 'maxStackSize', 'tooltip', 'tooltipTruncated'];
+const MENU_STACK_DETAIL_FIELDS = ['damage', 'maxDamage', ...STACK_DETAIL_FIELDS];
+const ENTITY_DETAIL_FIELDS = ['velocity', 'yaw', 'pitch', 'pose', 'bounds', 'equipment', 'usingItem', 'onFire'];
+const BLOCK_DETAIL_FIELDS = ['state', 'bounds', 'boundsTruncated', 'replaceable', 'fluid'];
+const MENU_DETAIL_FIELDS = ['containerId', 'stateId', 'slotCount', 'offset', 'hasMore', 'details'];
+
+function optionalObservedDetails(value, fields) {
+	return Object.fromEntries(fields.filter((field) => value[field] !== undefined).map((field) => [field, observedDetails(value[field], field)]));
+}
+
+function optionalMenuStackDetails(value, field) {
+	return {
+		...optionalObservedDetails(value, STACK_DETAIL_FIELDS),
+		...(value.damage === undefined ? {} : { damage: nonnegativeInteger(value.damage, `${field}.damage`) }),
+		...(value.maxDamage === undefined ? {} : { maxDamage: nonnegativeInteger(value.maxDamage, `${field}.maxDamage`) }),
+	};
+}
 
 export class ProtocolV2Error extends Error {
 	constructor(code, message, options) {
@@ -278,6 +298,15 @@ function normalizeProtocolV2Payload(type, value) {
 		case 'request_observation':
 			exactKeys(value, ['goalRevision'], ['goalRevision'], type);
 			return { goalRevision: revision(value.goalRevision, 'goalRevision') };
+		case 'inspection_request':
+			exactKeys(value, ['goalRevision', 'requestId', 'query'], ['goalRevision', 'requestId', 'query'], type);
+			return { goalRevision: revision(value.goalRevision, 'goalRevision'), requestId: requireIdentifier(value.requestId, 'requestId'), query: normalizeInspectionQuery(value.query) };
+		case 'inspection_result': {
+			exactKeys(value, ['goalRevision', 'requestId', 'result', 'error'], ['goalRevision', 'requestId'], type);
+			if ((value.result === undefined) === (value.error === undefined)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Inspection needs exactly one result or error');
+			return { goalRevision: revision(value.goalRevision, 'goalRevision'), requestId: requireIdentifier(value.requestId, 'requestId'),
+				...(value.error === undefined ? { result: observedDetails(value.result, 'inspection.result') } : { error: { code: requireIdentifier(value.error.code, 'error.code'), message: boundedText(value.error.message, 'error.message', 2048) } }) };
+		}
 		case 'action_command':
 			return normalizeActionCommand(value);
 		case 'action_cancel':
@@ -1500,8 +1529,48 @@ function normalizeConversationWake(value) {
 	};
 }
 
+export function normalizeInspectionQuery(value) {
+	exactKeys(value, ['section', 'offset', 'limit', 'slot', 'x', 'y', 'z', 'afterSequence', 'recipeId'], ['section'], 'inspection.query');
+	if (!['observation', 'inventory', 'menu', 'entities', 'blocks', 'item', 'block', 'events', 'landmarks', 'nearby_containers', 'recipes', 'mechanics'].includes(value.section)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Unknown inspection section');
+	const sectionFields = { item: ['slot'], block: ['x', 'y', 'z'], events: ['afterSequence'], recipes: ['recipeId'] };
+	exactKeys(value, ['section', 'offset', 'limit', ...(sectionFields[value.section] ?? [])], ['section'], 'inspection.query');
+	const result = { section: value.section, offset: nonnegativeInteger(value.offset === undefined ? 0 : value.offset, 'query.offset'), limit: positiveInteger(value.limit === undefined ? 16 : value.limit, 'query.limit') };
+	if (result.offset > 4096 || result.limit > 32) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Inspection page exceeds bounds');
+	for (const field of ['slot', 'x', 'y', 'z']) if (value[field] !== undefined) {
+		if (!Number.isSafeInteger(value[field]) || Math.abs(value[field]) > (field === 'y' ? 2048 : 30_000_000)) throw new ProtocolV2Error('INVALID_PAYLOAD', `Invalid inspection ${field}`);
+		result[field] = value[field];
+	}
+	if (value.section === 'item' && (!Number.isSafeInteger(result.slot) || result.slot < 0 || result.slot > 255)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Item inspection requires an inventory slot');
+	if (value.section === 'block' && ['x', 'y', 'z'].some((field) => result[field] === undefined)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Block inspection requires x/y/z');
+	if (value.afterSequence !== undefined && value.section !== 'events') throw new ProtocolV2Error('INVALID_PAYLOAD', 'afterSequence is only valid for event inspection');
+	if (value.section === 'events') {
+		result.afterSequence = value.afterSequence === undefined ? -1 : value.afterSequence;
+		if (!Number.isSafeInteger(result.afterSequence) || result.afterSequence < -1) throw new ProtocolV2Error('INVALID_PAYLOAD', 'afterSequence must be -1 or a nonnegative safe integer');
+	}
+	if (value.recipeId !== undefined) {
+		if (typeof value.recipeId !== 'string' || value.recipeId.length > 256 || !/^[a-z0-9_.-]+:[a-z0-9_./-]+$/.test(value.recipeId)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'recipeId must be a namespaced identifier of at most 256 characters');
+		result.recipeId = value.recipeId;
+	}
+	return result;
+}
+
+function observedDetails(value, field, depth = 0) {
+	if (depth > 12) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} exceeds detail depth`);
+	if (value === null || typeof value === 'boolean') return value;
+	if (typeof value === 'number') return finiteNumber(value, field);
+	if (typeof value === 'string') return boundedText(value, field, 8192, 0);
+	if (Array.isArray(value)) return boundedArray(value, field, 256).map((entry) => observedDetails(entry, field, depth + 1));
+	if (!isPlainObject(value) || Object.keys(value).length > 256) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must contain bounded JSON facts`);
+	const result = {};
+	for (const [key, child] of Object.entries(value)) {
+		if (['__proto__', 'prototype', 'constructor'].includes(key) || key.length > 256) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} contains an invalid fact key`);
+		result[key] = observedDetails(child, `${field}.${key}`, depth + 1);
+	}
+	return result;
+}
+
 function normalizeObservation(value) {
-	const allowed = ['goalRevision', 'observedAtEpochMs', 'ready', 'status', 'eventSequence', 'attention', 'changedFacts', 'position', 'velocity', 'view', 'player', 'inventory', 'entities', 'blocks', 'landmarks', 'nearbyContainers', 'world', 'currentAction', 'lastResult', 'interaction'];
+	const allowed = ['goalRevision', 'observedAtEpochMs', 'ready', 'status', 'eventSequence', 'attention', 'changedFacts', 'position', 'velocity', 'view', 'player', 'inventory', 'entities', 'blocks', 'landmarks', 'nearbyContainers', 'world', 'currentAction', 'lastResult', 'interaction', 'coverage', 'perception'];
 	exactKeys(value, allowed, ['goalRevision', 'observedAtEpochMs', 'ready', 'status'], 'observation');
 	const normalized = {
 		goalRevision: revision(value.goalRevision, 'goalRevision'),
@@ -1517,7 +1586,7 @@ function normalizeObservation(value) {
 		if (normalized.attention === false && normalized.changedFacts?.length > 0) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Non-attention observation cannot contain changed facts');
 		return normalized;
 	}
-	for (const key of allowed.slice(4).filter((field) => field !== 'interaction' && field !== 'landmarks')) if (!Object.hasOwn(value, key)) throw new ProtocolV2Error('MISSING_FIELD', `observation field '${key}' is required when ready`);
+	for (const key of allowed.slice(4).filter((field) => !['interaction', 'landmarks', 'coverage', 'perception'].includes(field))) if (!Object.hasOwn(value, key)) throw new ProtocolV2Error('MISSING_FIELD', `observation field '${key}' is required when ready`);
 	normalized.eventSequence = positiveInteger(value.eventSequence, 'eventSequence');
 	normalized.attention = boolean(value.attention, 'attention');
 	normalized.changedFacts = changedFactPaths(value.changedFacts);
@@ -1535,7 +1604,66 @@ function normalizeObservation(value) {
 	normalized.currentAction = currentActionObservation(value.currentAction);
 	normalized.lastResult = lastResultObservation(value.lastResult);
 	if (value.interaction !== undefined) normalized.interaction = interactionObservation(value.interaction);
+	if (value.coverage !== undefined) normalized.coverage = observedDetails(value.coverage, 'coverage');
+	if (value.perception !== undefined) normalized.perception = perceptionObservation(value.perception);
 	return normalized;
+}
+
+function perceptionObservation(value) {
+	exactKeys(value, ['latestSequence', 'earliestSequence', 'events', 'bossBars'], ['latestSequence', 'earliestSequence', 'events', 'bossBars'], 'perception');
+	const latestSequence = nonnegativeInteger(value.latestSequence, 'perception.latestSequence');
+	const earliestSequence = positiveInteger(value.earliestSequence, 'perception.earliestSequence');
+	if (earliestSequence > latestSequence + 1) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Invalid event retention range');
+	const events = boundedArray(value.events, 'perception.events', 8).map(perceptionEvent);
+	let previousSequence = earliestSequence - 1;
+	for (const event of events) {
+		if (event.sequence <= previousSequence || event.sequence > latestSequence) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Perception events must have retained increasing sequence numbers');
+		previousSequence = event.sequence;
+	}
+	const bossBars = boundedArray(value.bossBars, 'perception.bossBars', 16).map((bar) => {
+		exactKeys(bar, ['barId', 'name', 'progress', 'nameTruncated'], ['barId'], 'bossBar');
+		return { barId: requireIdentifier(bar.barId, 'bossBar.barId'),
+			...(bar.name === undefined ? {} : { name: boundedText(bar.name, 'bossBar.name', 256, 0) }),
+			...(bar.progress === undefined ? {} : { progress: visibleProgress(bar.progress) }),
+			...(bar.nameTruncated === undefined ? {} : { nameTruncated: boolean(bar.nameTruncated, 'bossBar.nameTruncated') }),
+		};
+	});
+	return { latestSequence, earliestSequence, events, bossBars };
+}
+
+function perceptionEvent(value) {
+	const base = ['type', 'sequence', 'gameTime', 'dimension', 'observedAtEpochMs'];
+	const type = value?.type;
+	let detail;
+	if (type === 'sound') detail = ['soundId', 'direction', 'range', 'elevation'];
+	else if (type === 'boss_bar') detail = ['barId', 'name', 'progress'];
+	else if (type === 'boss_bar_removed') detail = ['barId'];
+	else if (['system_message', 'action_bar', 'title', 'subtitle'].includes(type)) detail = ['text', 'textTruncated'];
+	else throw new ProtocolV2Error('INVALID_PAYLOAD', 'Unknown player perception event');
+	exactKeys(value, [...base, ...detail], base, 'perception.event');
+	const result = { type, sequence: positiveInteger(value.sequence, 'event.sequence'), gameTime: nonnegativeInteger(value.gameTime, 'event.gameTime'),
+		dimension: requireIdentifier(value.dimension, 'event.dimension'), observedAtEpochMs: nonnegativeInteger(value.observedAtEpochMs, 'event.observedAtEpochMs') };
+	if (type === 'sound') {
+		result.soundId = boundedText(value.soundId, 'event.soundId', 256);
+		for (const [field, allowed] of Object.entries({ direction: ['front', 'front_right', 'right', 'back_right', 'back', 'back_left', 'left', 'front_left'], range: ['near', 'medium', 'far'], elevation: ['above', 'below', 'level'] })) {
+			if (!allowed.includes(value[field])) throw new ProtocolV2Error('INVALID_PAYLOAD', `Invalid sound ${field}`);
+			result[field] = value[field];
+		}
+	} else if (type.startsWith('boss_bar')) {
+		result.barId = requireIdentifier(value.barId, 'event.barId');
+		if (value.name !== undefined) result.name = boundedText(value.name, 'event.name', 256, 0);
+		if (value.progress !== undefined) result.progress = visibleProgress(value.progress);
+	} else {
+		result.text = boundedText(value.text, 'event.text', 512, 0);
+		if (value.textTruncated !== undefined) result.textTruncated = boolean(value.textTruncated, 'event.textTruncated');
+	}
+	return result;
+}
+
+function visibleProgress(value) {
+	const progress = finiteNumber(value, 'bossBar.progress');
+	if (progress < 0 || progress > 1) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Boss bar progress must be between 0 and 1');
+	return progress;
 }
 
 function interactionObservation(value) {
@@ -1557,19 +1685,21 @@ function interactionObservation(value) {
 	if (!['main_hand', 'off_hand'].includes(hand)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'interaction.input.hand is invalid');
 	const selectedSlot = nonnegativeInteger(value.input.selectedSlot, 'interaction.input.selectedSlot');
 	if (selectedSlot > 8) throw new ProtocolV2Error('INVALID_PAYLOAD', 'interaction.input.selectedSlot must be in [0, 8]');
-	exactKeys(value.menu, ['type', 'cursor', 'slots', 'capabilities'], ['type', 'cursor', 'slots', 'capabilities'], 'interaction.menu');
-	exactKeys(value.menu.cursor, ['itemId', 'count'], ['itemId', 'count'], 'interaction.menu.cursor');
+	exactKeys(value.menu, ['type', 'cursor', 'slots', 'capabilities', ...MENU_DETAIL_FIELDS], ['type', 'cursor', 'slots', 'capabilities'], 'interaction.menu');
+	exactKeys(value.menu.cursor, ['itemId', 'count', ...MENU_STACK_DETAIL_FIELDS], ['itemId', 'count'], 'interaction.menu.cursor');
 	const menuSlots = boundedArray(value.menu.slots, 'interaction.menu.slots', 64).map((slot, index) => {
-		exactKeys(slot, ['slot', 'itemId', 'count'], ['slot', 'itemId', 'count'], `interaction.menu.slots[${index}]`);
+		exactKeys(slot, ['slot', 'itemId', 'count', 'x', 'y', 'slotLimit', 'pickupAllowed', ...MENU_STACK_DETAIL_FIELDS], ['slot', 'itemId', 'count'], `interaction.menu.slots[${index}]`);
 		const slotIndex = nonnegativeInteger(slot.slot, `interaction.menu.slots[${index}].slot`);
 		if (slotIndex > 255) throw new ProtocolV2Error('INVALID_PAYLOAD', `interaction.menu.slots[${index}].slot must be at most 255`);
 		return {
 			slot: slotIndex,
+			...optionalObservedDetails(slot, ['x', 'y', 'slotLimit', 'pickupAllowed']),
+			...optionalMenuStackDetails(slot, `interaction.menu.slots[${index}]`),
 			itemId: requireIdentifier(slot.itemId, `interaction.menu.slots[${index}].itemId`),
 			count: nonnegativeInteger(slot.count, `interaction.menu.slots[${index}].count`),
 		};
 	});
-	const menuCapabilities = boundedArray(value.menu.capabilities, 'interaction.menu.capabilities', 8)
+	const menuCapabilities = boundedArray(value.menu.capabilities, 'interaction.menu.capabilities', 32)
 		.map((capability, index) => requireIdentifier(capability, `interaction.menu.capabilities[${index}]`));
 	const rayAllowed = ['type', 'x', 'y', 'z', 'face', 'blockId'];
 	exactKeys(value.rayTarget, rayAllowed, ['type'], 'interaction.rayTarget');
@@ -1602,8 +1732,10 @@ function interactionObservation(value) {
 			hand,
 		},
 		menu: {
+			...optionalObservedDetails(value.menu, MENU_DETAIL_FIELDS),
 			type: requireIdentifier(value.menu.type, 'interaction.menu.type'),
 			cursor: {
+				...optionalMenuStackDetails(value.menu.cursor, 'interaction.menu.cursor'),
 				itemId: requireIdentifier(value.menu.cursor.itemId, 'interaction.menu.cursor.itemId'),
 				count: nonnegativeInteger(value.menu.cursor.count, 'interaction.menu.cursor.count'),
 			},
@@ -1634,6 +1766,7 @@ function changedFactPaths(value) {
 
 function isFactualChangedPath(path) {
 	if (FACTUAL_TOP_LEVEL_PATHS.has(path)) return true;
+	if (path === 'world.dimension') return true;
 	if (path.startsWith('player.')) return FACTUAL_PLAYER_FIELDS.has(path.slice('player.'.length));
 	if (/^entities\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(path)) return true;
 	return /^blocks\.-?\d+,-?\d+,-?\d+$/.test(path);
@@ -1830,8 +1963,9 @@ function playerObservation(value) {
 		'fallDistance', 'lastAttacker', 'effects',
 	];
 	const required = allowed.filter((field) => field !== 'lastAttacker');
-	exactKeys(value, allowed, required, 'player');
+	exactKeys(value, [...allowed, ...PLAYER_DETAIL_FIELDS], required, 'player');
 	const normalized = {
+		...optionalObservedDetails(value, PLAYER_DETAIL_FIELDS),
 		health: finiteNumber(value.health, 'player.health'),
 		maxHealth: finiteNumber(value.maxHealth, 'player.maxHealth'),
 		armor: nonnegativeInteger(value.armor, 'player.armor'),
@@ -1877,7 +2011,7 @@ function inventoryObservation(value) {
 		items: boundedArray(value.items, 'inventory.items', MAX_INVENTORY_SUMMARIES).map((item, index) => {
 			exactKeys(
 				item,
-				['itemId', 'count', 'damage', 'maxDamage', 'slot', 'hotbar', 'tags'],
+				['itemId', 'count', 'damage', 'maxDamage', 'slot', 'hotbar', 'tags', ...STACK_DETAIL_FIELDS],
 				['itemId', 'count', 'damage', 'maxDamage', 'slot'],
 				`inventory.items[${index}]`,
 			);
@@ -1885,6 +2019,7 @@ function inventoryObservation(value) {
 				? nonnegativeInteger(item.slot, `inventory.items[${index}].slot`)
 				: requireIdentifier(item.slot, `inventory.items[${index}].slot`);
 			const normalized = {
+				...optionalObservedDetails(item, STACK_DETAIL_FIELDS),
 				itemId: requireIdentifier(item.itemId, `inventory.items[${index}].itemId`),
 				count: nonnegativeInteger(item.count, `inventory.items[${index}].count`),
 				damage: nonnegativeInteger(item.damage, `inventory.items[${index}].damage`),
@@ -1906,12 +2041,13 @@ function entityObservation(value, index) {
 	const field = `entities[${index}]`;
 	exactKeys(
 		value,
-		['uuid', 'type', 'name', 'distance', 'position', 'isPlayer', 'itemId', 'count', 'tags'],
+		['uuid', 'type', 'name', 'distance', 'position', 'isPlayer', 'itemId', 'count', 'tags', ...ENTITY_DETAIL_FIELDS],
 		['uuid', 'type', 'name', 'distance', 'position'],
 		field,
 	);
 	const type = requireIdentifier(value.type, `${field}.type`);
 	const normalized = {
+		...optionalObservedDetails(value, ENTITY_DETAIL_FIELDS),
 		uuid: requireIdentifier(value.uuid, `${field}.uuid`),
 		type,
 		name: boundedText(value.name, `${field}.name`, MAX_CHAT_LENGTH),
@@ -1936,7 +2072,7 @@ function entityObservation(value, index) {
 function blockObservation(value, index) {
 	if (!isPlainObject(value)) throw new ProtocolV2Error('INVALID_PAYLOAD', `blocks[${index}] must be an object`);
 	const field = `blocks[${index}]`;
-	exactKeys(value, ['x', 'y', 'z', 'blockId', 'placeableFaces', 'tags'], ['x', 'y', 'z', 'blockId', 'placeableFaces'], field);
+	exactKeys(value, ['x', 'y', 'z', 'blockId', 'placeableFaces', 'tags', ...BLOCK_DETAIL_FIELDS], ['x', 'y', 'z', 'blockId', 'placeableFaces'], field);
 	const placeableFaces = boundedArray(value.placeableFaces, `${field}.placeableFaces`, BLOCK_FACES.length)
 		.map((face, faceIndex) => {
 			const normalized = requireIdentifier(face, `${field}.placeableFaces[${faceIndex}]`);
@@ -1945,6 +2081,7 @@ function blockObservation(value, index) {
 		});
 	if (new Set(placeableFaces).size !== placeableFaces.length) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}.placeableFaces must be unique`);
 	const normalized = {
+		...optionalObservedDetails(value, BLOCK_DETAIL_FIELDS),
 		x: integer(value.x, `${field}.x`),
 		y: integer(value.y, `${field}.y`),
 		z: integer(value.z, `${field}.z`),
@@ -2018,8 +2155,8 @@ function nearbyContainerObservation(value, index) {
 
 function worldObservation(value) {
 	if (!isPlainObject(value)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'world must be an object');
-	exactKeys(value, ['dimension', 'gameTime', 'dayTime', 'raining', 'thundering'], ['dimension', 'gameTime', 'dayTime', 'raining', 'thundering'], 'world');
-	return { dimension: requireIdentifier(value.dimension, 'world.dimension'), gameTime: nonnegativeInteger(value.gameTime, 'world.gameTime'), dayTime: nonnegativeInteger(value.dayTime, 'world.dayTime'), raining: boolean(value.raining, 'world.raining'), thundering: boolean(value.thundering, 'world.thundering') };
+	exactKeys(value, ['dimension', 'worldId', 'gameTime', 'dayTime', 'raining', 'thundering'], ['dimension', 'gameTime', 'dayTime', 'raining', 'thundering'], 'world');
+	return { ...optionalObservedDetails(value, ['worldId']), dimension: requireIdentifier(value.dimension, 'world.dimension'), gameTime: nonnegativeInteger(value.gameTime, 'world.gameTime'), dayTime: nonnegativeInteger(value.dayTime, 'world.dayTime'), raining: boolean(value.raining, 'world.raining'), thundering: boolean(value.thundering, 'world.thundering') };
 }
 
 function currentActionObservation(value) {

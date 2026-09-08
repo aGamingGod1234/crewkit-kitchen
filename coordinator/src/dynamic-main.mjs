@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { AgentPlanner } from './agent-planner.mjs';
 import { AgentRegistry, AgentRegistryError, DynamicAgentState } from './agent-registry.mjs';
 import { ActiveGoalSupervisor } from './active-goal-supervisor.mjs';
+import { MAX_LEASE_TIMEOUT_MS } from './work-lease-supervisor.mjs';
 import { AgentWorkspaceManager } from './agent-workspace.mjs';
 import { MinecraftAgentWorkspace } from './minecraft-agent-workspace.mjs';
 import { AcpProviderService } from './acp-service.mjs';
@@ -17,6 +18,11 @@ import { ControlLatencyRegistry } from './control-latency-registry.mjs';
 import { buildCoordinatorStatus, providerRecoveryComponents } from './coordinator-status.mjs';
 import { ConversationMemory } from './conversation-memory.mjs';
 import { FactLedger } from './fact-ledger.mjs';
+import { InspectionClient } from './inspection-client.mjs';
+import { ModelNotebook } from './model-notebook.mjs';
+import { RuntimeMemoryContext } from './runtime-memory-context.mjs';
+import { ObservedMemoryStore } from './observed-memory-store.mjs';
+import { ExplorationOccupancy } from './explore-frontier.mjs';
 import { ProviderService } from './provider-service.mjs';
 import { ProviderTurnRecorder } from './provider-turn-recorder.mjs';
 import {
@@ -138,6 +144,9 @@ export class DynamicCoordinator extends EventEmitter {
 	#clearGoalSpecTimeout;
 	#programRuntime;
 	#nativeRuntime;
+	#inspections;
+	#playerMemory;
+	#memorySummaries = new Map();
 	#goalSupervisor;
 	#codexControlProtocol;
 	#reconciliation = Promise.resolve();
@@ -169,13 +178,15 @@ export class DynamicCoordinator extends EventEmitter {
 	#maxPendingAgentTransactions;
 	#runtimeHooks;
 
-	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, goalSupervisor, codexControlProtocol = 'native_tools', traceWriter = null, providerTurnRecorder = null, runtimeGeneration = null, runtimeHooks = {}, benchmarkRecorder = null, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval, setGoalSpecTimeout = defaultGoalSpecTimeout, clearGoalSpecTimeout = clearTimeout, connectionOperationCap = DEFAULT_CONNECTION_OPERATION_CAP, agentOperationCap = DEFAULT_AGENT_OPERATION_CAP, goalSpecRequestCap = connectionOperationCap, maxPendingAgentOperations = DEFAULT_MAX_PENDING_AGENT_OPERATIONS, maxPendingAgentTransactions = DEFAULT_MAX_PENDING_AGENT_TRANSACTIONS }) {
+	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, goalSupervisor, codexControlProtocol = 'native_tools', memoryDirectory = null, runtimeSessionId, traceWriter = null, providerTurnRecorder = null, runtimeGeneration = null, runtimeHooks = {}, benchmarkRecorder = null, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval, setGoalSpecTimeout = defaultGoalSpecTimeout, clearGoalSpecTimeout = clearTimeout, connectionOperationCap = DEFAULT_CONNECTION_OPERATION_CAP, agentOperationCap = DEFAULT_AGENT_OPERATION_CAP, goalSpecRequestCap = connectionOperationCap, maxPendingAgentOperations = DEFAULT_MAX_PENDING_AGENT_OPERATIONS, maxPendingAgentTransactions = DEFAULT_MAX_PENDING_AGENT_TRANSACTIONS }) {
 		super();
 		this.#registry = requireDependency(registry, 'registry');
 		this.#scheduler = requireDependency(scheduler, 'scheduler');
 		this.#codexService = requireDependency(codexService, 'codexService');
 		this.#planner = requireDependency(planner, 'planner');
 		this.#bridge = requireDependency(bridge, 'bridge');
+		this.#inspections = new InspectionClient({ send: (type, agentId, payload, options) => this.#sendForEpoch(options.connectionEpoch, type, agentId, payload) });
+		this.#playerMemory = new RuntimeMemoryContext({ notebook: new ModelNotebook({ directory: memoryDirectory }), sessionId: runtimeSessionId });
 		this.#healthRegistry = requireDependency(healthRegistry, 'healthRegistry');
 		this.#latencyRegistry = requireDependency(latencyRegistry, 'latencyRegistry');
 		this.#goalSupervisor = requireDependency(goalSupervisor, 'goalSupervisor');
@@ -207,6 +218,9 @@ export class DynamicCoordinator extends EventEmitter {
 			send: (type, agentId, payload) => this.#sendRuntimeMessage('native', type, agentId, payload),
 		};
 		this.#programRuntime = new ProgramRuntimeManager({
+			sessionId: runtimeSessionId,
+			memoryOperation: (record, operation) => this.#playerMemory.execute(record, operation),
+			inspectObservation: async (record, query, authority = {}) => ({ state: 'SUCCEEDED', reasonCode: 'INSPECTED', ...await this.#inspections.request(record, query, { ...authority, connectionEpoch: this.#connectionEpoch }) }),
 			registry: this.#registry,
 			bridge: programBridge,
 			planner: this.#planner,
@@ -229,6 +243,16 @@ export class DynamicCoordinator extends EventEmitter {
 			benchmarkRecorder,
 		});
 		this.#nativeRuntime = new NativeToolRuntime({
+			sessionId: runtimeSessionId,
+			requestObservation: async (record) => {
+				const result = await this.#inspections.request(record, { section: 'observation' }, { connectionEpoch: this.#connectionEpoch });
+				return { ...result, observation: adaptObservation(result.observation) };
+			},
+			inspectObservation: (record, query, authority = {}) => this.#inspections.request(record, query, { ...authority, connectionEpoch: this.#connectionEpoch }),
+			notebook: this.#playerMemory.notebook,
+			memoryOperation: (record, operation) => this.#playerMemory.execute(record, operation),
+			executionSettings: (record) => this.#planner.getExecutionSettings?.(record.agentId) ?? null,
+			occupancy: new ExplorationOccupancy({ memoryStore: new ObservedMemoryStore({ directory: memoryDirectory }) }),
 			bridge: nativeBridge,
 			registry: this.#registry,
 			trace: (event, fields) => this.#writeTrace(event, fields),
@@ -353,6 +377,7 @@ export class DynamicCoordinator extends EventEmitter {
 	async #stopOnce() {
 		if (this.#closed) return;
 		this.#stopping = true;
+		this.#inspections.cancel();
 		this.#connected = false;
 		this.#setVerboseEnabled(false);
 		if (this.#statusHandle !== null) this.#clearStatusInterval(this.#statusHandle);
@@ -371,6 +396,8 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#lifecycleGenerations.clear();
 		this.#programRuntime.disposeAll();
 		await this.#nativeRuntime.disposeAll();
+		await this.#playerMemory.markUnknown(undefined, 'COORDINATOR_STOPPED').catch((error) => this.#emitRuntimeError(error));
+		this.#memorySummaries.clear();
 		this.#providerRetryAfter.clear();
 		this.#providerProbeDeadlines.clear();
 		this.#deferredProviderRecovery.clear();
@@ -395,6 +422,7 @@ export class DynamicCoordinator extends EventEmitter {
 	}
 
 	#bindBridge() {
+		this.#listen('inspection_result', (message) => { this.#inspections.accept(message); });
 		this.#bindProviderRecovery();
 		this.#listen('ready', (connection) => {
 			const connectionEpoch = this.#acceptReadyEpoch(connection);
@@ -452,6 +480,8 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#providerProbeDeadlines.delete(message.agentId);
 			this.#deferredProviderRecovery.delete(message.agentId);
 			this.#factLedgers.delete(message.agentId);
+			this.#memorySummaries.delete(message.agentId);
+			this.#playerMemory.forget(message.agentId);
 			this.#conversationMemories.delete(message.agentId);
 			this.#contextCursors.delete(message.agentId);
 			this.#nativeConversationSequences.delete(message.agentId);
@@ -667,6 +697,13 @@ export class DynamicCoordinator extends EventEmitter {
 				this.#goalSupervisor.factualProgress(supervisionKey, factualProgressSignature(wireObservation), factualProgressDetails(wireObservation));
 				if (this.#usesNativeTools(record)) this.#nativeRuntimeEpochs.set(record.agentId, connectionEpoch);
 				const observation = adaptObservation(wireObservation);
+				this.#playerMemory.observe(record, observation);
+				const memoryKey = `${record.goalRevision}:${this.#playerMemory.worldId(record)}`;
+				if (this.#memorySummaries.get(record.agentId)?.key !== memoryKey) {
+					const unresolved = await this.#playerMemory.unresolved(record, { limit: 8 });
+					if (!this.#isConnectionEpochCurrent(connectionEpoch) || !this.#isLifecycleGenerationCurrent(record.agentId, lifecycleGeneration)) return;
+					this.#memorySummaries.set(record.agentId, { key: memoryKey, unresolved });
+				}
 				const worldSignals = this.#usesNativeTools(record)
 					? this.#rememberNativeWorldSignals(record, lifecycleGeneration, connectionEpoch, observation)
 					: null;
@@ -702,12 +739,14 @@ export class DynamicCoordinator extends EventEmitter {
 					if (unchangedHeartbeat) {
 						if (this.#nativeRuntime.refreshObservation(record, observation, { eventSequence: message.payload.eventSequence, conversation })) return;
 					}
-					this.#nativeRuntime.updateObservation(record, observation, { eventSequence: message.payload.eventSequence, conversation });
+					this.#nativeRuntime.updateObservation(record, observation, { eventSequence: message.payload.eventSequence, conversation, attention: attention.attention, priority: attention.priority, trigger: attention.trigger });
 					this.#goalSupervisor.observed(supervisionKey);
 					this.#scheduleNativeTurn(record, {
 						agentId: record.agentId,
 						goalRevision: record.goalRevision,
 						observation,
+						memory: this.#memorySummaries.get(record.agentId)?.unresolved,
+						executionSettings: this.#planner.getExecutionSettings?.(record.agentId) ?? null,
 						eventSequence: message.payload.eventSequence,
 						priority: attention.priority,
 						trigger: attention.trigger,
@@ -750,6 +789,8 @@ export class DynamicCoordinator extends EventEmitter {
 						attentionPriority: attention.priority,
 						attentionTrigger: attention.trigger,
 						observation,
+						memory: this.#memorySummaries.get(record.agentId)?.unresolved,
+						executionSettings: this.#planner.getExecutionSettings?.(record.agentId) ?? null,
 					}, {
 						untrustedFacts: ledger.toPlannerFacts(),
 						conversationContext: this.#conversationMemory(record.agentId).toPlannerContext(),
@@ -786,6 +827,9 @@ export class DynamicCoordinator extends EventEmitter {
 			return this.#enqueueAgent(message.agentId, async () => {
 				let acknowledge = false;
 				try {
+					if (message.payload.actionId.startsWith('native:')) await this.#nativeRuntime.reconcileActionReceipt(message.agentId, message.payload);
+					else await this.#playerMemory.recordResult({ agentId: message.agentId, goalRevision: message.payload.goalRevision }, message.payload);
+					this.#memorySummaries.delete(message.agentId);
 					const current = this.#registry.get(message.agentId);
 					if (current === null || message.payload.goalRevision !== current.goalRevision) {
 						acknowledge = true;
@@ -828,6 +872,8 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#listen('disconnected', (event) => {
 			const connectionEpoch = this.#eventConnectionEpoch(event);
 			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return;
+			this.#inspections.cancel(undefined, 'BRIDGE_DISCONNECTED');
+			void this.#playerMemory.markUnknown(undefined, 'BRIDGE_DISCONNECTED').catch((error) => this.#emitRuntimeError(error));
 			this.#connected = false;
 			this.#setVerboseEnabled(false);
 			this.#cancelGoalSpecRequests();
@@ -991,6 +1037,13 @@ export class DynamicCoordinator extends EventEmitter {
 			connectionEpoch = supplied;
 		}
 		if (connectionEpoch <= this.#connectionEpoch) return null;
+		this.#inspections.cancel(undefined, 'STALE_CONNECTION_EPOCH');
+		this.#memorySummaries.clear();
+		if (this.#connectionEpoch > 0) {
+			for (const record of this.#registry.list()) {
+				void this.#nativeRuntime.dispose(record.agentId, 'connection_replaced').catch((error) => this.#emitRuntimeError(error));
+			}
+		}
 		this.#connectionEpoch = connectionEpoch;
 		this.#connected = true;
 		return connectionEpoch;
@@ -1010,6 +1063,7 @@ export class DynamicCoordinator extends EventEmitter {
 		if (death === null || death === undefined) throw new ProtocolV2Error('MISSING_FIELD', `DEAD agent '${record.agentId}' requires death facts`);
 		if (record.currentGoal === null) return;
 		if (this.#programRuntime.hasCurrent(record)) return;
+		this.#playerMemory.observe(record, { death: structuredClone(death) });
 		const lifecycleGeneration = this.#lifecycleGeneration(record.agentId);
 		if (this.#usesNativeTools(record)) {
 			this.#nativeRuntimeEpochs.set(record.agentId, connectionEpoch);
@@ -1161,7 +1215,7 @@ export class DynamicCoordinator extends EventEmitter {
 			traceId: planningTraceId(record.agentId, record.goalRevision, request.lifecycleGeneration, 'native'),
 			promise: null,
 			supervisionKey,
-			supervisionToken: this.#goalSupervisor.begin(supervisionKey, 'provider'),
+			supervisionToken: this.#goalSupervisor.begin(supervisionKey, 'provider', { timeoutMs: Math.min(MAX_LEASE_TIMEOUT_MS, this.#planner.getExecutionSettings?.(record.agentId)?.limits?.nativeTurnBudgetMs ?? MAX_LEASE_TIMEOUT_MS) }),
 			toolSupervisionToken: null,
 			expired: false,
 		};
@@ -1188,6 +1242,9 @@ export class DynamicCoordinator extends EventEmitter {
 				preserveState: request.preserveState === true,
 				traceId: work.traceId,
 				onVerbose: verboseReporter,
+				onProgress: () => {
+					if (this.#providerWork.get(record.agentId) === work && this.#isConnectionEpochCurrent(request.connectionEpoch)) this.#goalSupervisor.progress(work.supervisionToken);
+				},
 				executeTool: (toolRequest) => this.#executeNativeTool(work, toolRequest),
 			}))
 			.then((result) => this.#completeNativeTurn(work, result), (error) => this.#failNativeTurn(work, error))
@@ -1738,6 +1795,8 @@ export class DynamicCoordinator extends EventEmitter {
 	}
 
 	#advanceLifecycleGeneration(agentId) {
+		this.#inspections.cancel(agentId);
+		this.#memorySummaries.delete(agentId);
 		const next = this.#lifecycleGeneration(agentId) + 1;
 		this.#lifecycleGenerations.set(agentId, next);
 		return next;
@@ -1932,6 +1991,10 @@ export class DynamicCoordinator extends EventEmitter {
 		const epochs = kind === 'native' ? this.#nativeRuntimeEpochs : this.#programRuntimeEpochs;
 		const connectionEpoch = epochs.get(agentId);
 		if (type === 'action_cancel' && !this.#isConnectionEpochCurrent(connectionEpoch)) return null;
+		if (kind === 'program' && type === 'action_command') {
+			if (!this.#isConnectionEpochCurrent(connectionEpoch)) throw Object.assign(new Error('Action belongs to an obsolete connection'), { code: 'STALE_SESSION' });
+			await this.#playerMemory.recordDispatch(this.#registry.assertCurrentRevision(agentId, payload.goalRevision), payload);
+		}
 		return this.#sendForEpoch(connectionEpoch, type, agentId, payload);
 	}
 
@@ -2450,6 +2513,8 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		latencyRegistry,
 		goalSupervisor,
 		codexControlProtocol: config.codex.controlProtocol,
+		memoryDirectory: Object.hasOwn(dependencies, 'memoryDirectory') ? dependencies.memoryDirectory : path.join(config.workspaceRoot, 'player-memory'),
+		runtimeSessionId: dependencies.runtimeSessionId,
 		traceWriter: dependencies.traceWriter,
 		providerTurnRecorder,
 		runtimeGeneration: dependencies.runtimeGeneration,

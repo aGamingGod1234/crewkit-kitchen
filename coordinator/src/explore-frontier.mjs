@@ -1,367 +1,78 @@
-/** Bounded occupancy and SayCan-style frontier selection for native exploreFrontier. */
+﻿import { CELL_SIZE, ObservedMemoryStore, observationWorldId, observationDimension, observationPosition, observedBlocks, spatialCellKey } from './observed-memory-store.mjs';
 
-export const CELL_SIZE = 8;
+export { CELL_SIZE, observationWorldId };
 export const DEFAULT_RADIUS = 24;
 export const MIN_RADIUS = 8;
 export const MAX_RADIUS = 32;
 export const MAX_KNOWN_CELLS = 256;
 export const CUE_IN_VIEW_DISTANCE = 2.5;
 export const SEEK_VALUES = Object.freeze(['any', 'nether', 'cave', 'village', 'structure']);
+const NEIGHBORS = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
 
-const CARDINAL = Object.freeze([
-	[1, 0],
-	[0, 1],
-	[-1, 0],
-	[0, -1],
-]);
-const HEADING_VECTORS = Object.freeze({
-	east: { dx: 1, dz: 0 },
-	west: { dx: -1, dz: 0 },
-	south: { dx: 0, dz: 1 },
-	north: { dx: 0, dz: -1 },
-});
-
-const OVERWORLD = Object.freeze(['minecraft:overworld']);
-const NETHER = Object.freeze(['minecraft:the_nether']);
-
-const CUE_WEIGHTS = Object.freeze({
-	nether_portal: { class: 'portal', weight: 100, seek: Object.freeze(['any', 'nether', 'structure']) },
-	obsidian: { class: 'portal', weight: 80, seek: Object.freeze(['any', 'nether', 'structure']) },
-	crying_obsidian: { class: 'portal', weight: 90, seek: Object.freeze(['any', 'nether', 'structure']) },
-	netherrack: { class: 'ruined_portal', weight: 70, seek: Object.freeze(['any', 'nether', 'structure']), dimensions: OVERWORLD },
-	magma_block: { class: 'lava', weight: 55, seek: Object.freeze(['any', 'nether', 'cave']), dimensions: OVERWORLD },
-	blackstone: { class: 'ruined_portal', weight: 60, seek: Object.freeze(['any', 'nether', 'structure']), dimensions: OVERWORLD },
-	gold_block: { class: 'ruined_portal', weight: 65, seek: Object.freeze(['any', 'nether', 'structure']), dimensions: OVERWORLD },
-	lava: { class: 'lava', weight: 50, seek: Object.freeze(['any', 'nether', 'cave']), dimensions: OVERWORLD },
-	nether_bricks: { class: 'fortress', weight: 85, seek: Object.freeze(['any', 'nether', 'structure']), dimensions: NETHER },
-	cracked_nether_bricks: { class: 'fortress', weight: 80, seek: Object.freeze(['any', 'nether', 'structure']), dimensions: NETHER },
-	nether_brick_fence: { class: 'fortress', weight: 88, seek: Object.freeze(['any', 'nether', 'structure']), dimensions: NETHER },
-	nether_brick_stairs: { class: 'fortress', weight: 82, seek: Object.freeze(['any', 'nether', 'structure']), dimensions: NETHER },
-	nether_wart: { class: 'fortress', weight: 70, seek: Object.freeze(['any', 'nether', 'structure']), dimensions: NETHER },
-	gilded_blackstone: { class: 'bastion', weight: 85, seek: Object.freeze(['any', 'nether', 'structure']), dimensions: NETHER },
-	polished_blackstone: { class: 'bastion', weight: 60, seek: Object.freeze(['any', 'nether', 'structure']), dimensions: NETHER },
-	deepslate: { class: 'cave', weight: 30, seek: Object.freeze(['any', 'cave']) },
-	dripstone_block: { class: 'cave', weight: 35, seek: Object.freeze(['any', 'cave']) },
-	pointed_dripstone: { class: 'cave', weight: 35, seek: Object.freeze(['any', 'cave']) },
-	moss_block: { class: 'cave', weight: 28, seek: Object.freeze(['any', 'cave']) },
-	sculk: { class: 'cave', weight: 40, seek: Object.freeze(['any', 'cave', 'structure']) },
-	amethyst_block: { class: 'cave', weight: 38, seek: Object.freeze(['any', 'cave']) },
-	tuff: { class: 'cave', weight: 25, seek: Object.freeze(['any', 'cave']) },
-	spawner: { class: 'dungeon', weight: 85, seek: Object.freeze(['any', 'cave', 'structure']) },
-	bell: { class: 'village', weight: 80, seek: Object.freeze(['any', 'village', 'structure']) },
-	hay_block: { class: 'village', weight: 50, seek: Object.freeze(['any', 'village']) },
-	composter: { class: 'village', weight: 45, seek: Object.freeze(['any', 'village']) },
-	dirt_path: { class: 'village', weight: 40, seek: Object.freeze(['any', 'village']) },
-	white_bed: { class: 'village', weight: 40, seek: Object.freeze(['any', 'village']) },
-	mossy_cobblestone: { class: 'ruins', weight: 42, seek: Object.freeze(['any', 'structure', 'cave']) },
-	cracked_stone_bricks: { class: 'ruins', weight: 40, seek: Object.freeze(['any', 'structure']) },
-	rail: { class: 'mineshaft', weight: 48, seek: Object.freeze(['any', 'cave', 'structure']) },
-	cobweb: { class: 'mineshaft', weight: 32, seek: Object.freeze(['any', 'cave', 'structure']) },
-	kelp: { class: 'ocean', weight: 30, seek: Object.freeze(['any']) },
-	prismarine: { class: 'ocean', weight: 55, seek: Object.freeze(['any', 'structure']) },
-	sandstone: { class: 'desert', weight: 22, seek: Object.freeze(['any']) },
-	cactus: { class: 'desert', weight: 28, seek: Object.freeze(['any']) },
-	terracotta: { class: 'desert', weight: 24, seek: Object.freeze(['any']) },
-});
-
+/** Lists observed positions and unknown neighboring cells. Only the model chooses a destination. */
 export class ExplorationOccupancy {
-	#agents = new Map();
-
-	ingest(agentId, observation) {
-		const map = this.#mapFor(agentId);
-		const position = extractPosition(observation);
-		const dimension = extractDimension(observation);
-		if (position === null) return map;
-		if (map.dimension !== dimension) {
-			map.dimension = dimension;
-			map.cells.clear();
-			map.order.length = 0;
-			map.heading = null;
-		}
-		this.#remember(map, cellKey(position.x, position.z), false);
-		for (const block of visibleBlocks(observation)) {
-			if (Number.isFinite(block.x) && Number.isFinite(block.z)) this.#remember(map, cellKey(block.x, block.z), false);
-		}
-		return map;
+	#memory;
+	constructor({ memoryStore = new ObservedMemoryStore() } = {}) { this.#memory = memoryStore; }
+	ingest(agentId, observation) { return this.#memory.ingest(agentId, observation); }
+	load(agentId) { return this.#memory.load(agentId); }
+	flush(agentId) { return this.#memory.flush(agentId); }
+	markBlocked(agentId, dimension, x, z, options = {}) {
+		const current = this.#memory.query(agentId);
+		this.#memory.markBlocked(agentId, { worldId: options.worldId ?? current.worldId, dimension, x, y: options.y ?? current.position?.y, z, ...options });
 	}
-
-	markBlocked(agentId, dimension, x, z) {
-		const map = this.#mapFor(agentId);
-		if (map.dimension !== dimension) return;
-		this.#remember(map, cellKey(x, z), true);
+	rememberHeading() { /* Compatibility only. Candidate facts have no preferred heading. */ }
+	snapshot(agentId, dimension = null, worldId = undefined) {
+		const value = this.#memory.query(agentId, { ...(dimension === null ? {} : { dimension }), worldId });
+		return { worldId: value.worldId, dimension: value.dimension, knownCells: value.knownCells, seenCells: value.seenCells, visitedCells: value.visitedCells, blockedCells: value.blockedCells };
 	}
-
-	rememberHeading(agentId, from, to) {
-		const map = this.#mapFor(agentId);
-		const dx = to.x - from.x;
-		const dz = to.z - from.z;
-		if (dx === 0 && dz === 0) return;
-		map.heading = { dx, dz };
-	}
-
-	snapshot(agentId, dimension = null) {
-		const map = this.#agents.get(agentId);
-		if (map === undefined) return { dimension: dimension ?? 'minecraft:overworld', knownCells: 0, blockedCells: 0 };
-		if (dimension !== null && map.dimension !== dimension) {
-			return { dimension, knownCells: 0, blockedCells: 0 };
+	candidates(agentId, observation, { radius = DEFAULT_RADIUS, limit = 32, blockId = null } = {}) {
+		if (!Number.isFinite(radius) || radius < MIN_RADIUS || radius > MAX_RADIUS) throw new TypeError('radius must be 8..32');
+		if (!Number.isSafeInteger(limit) || limit < 1 || limit > 64) throw new TypeError('limit must be 1..64');
+		if (blockId !== null && (typeof blockId !== 'string' || blockId.length > 256)) throw new TypeError('blockId must be bounded text');
+		const position = extractPosition(observation), dimension = extractDimension(observation), worldId = observationWorldId(observation);
+		const base = { worldId, dimension, radius, destination: null, cue: null };
+		if (position === null) return { ...base, kind: 'no_observation', candidates: [], reason: 'No observed player position.' };
+		const known = this.#memory.query(agentId, { worldId, dimension, nowTick: observation?.world?.gameTime });
+		const cells = new Map(known.cells.map((cell) => [cell.key, cell]));
+		cells.set(spatialCellKey(position.x, position.y, position.z), { ...(cells.get(spatialCellKey(position.x, position.y, position.z)) ?? {}), visited: true });
+		const blocks = new Map(known.blocks.map((block) => [block.key, block]));
+		for (const block of observedBlocks(observation)) {
+			blocks.set(`${block.x},${block.y},${block.z}`, { ...block, stale: false });
+			const key = spatialCellKey(block.x, block.y, block.z);
+			cells.set(key, { ...cells.get(key), seen: true });
 		}
-		let blockedCells = 0;
-		for (const cell of map.cells.values()) if (cell.blocked) blockedCells += 1;
-		return { dimension: map.dimension, knownCells: map.cells.size, blockedCells };
-	}
-
-	select(agentId, observation, options = {}) {
-		const seek = options.seek ?? 'any';
-		const radius = options.radius ?? DEFAULT_RADIUS;
-		const position = extractPosition(observation);
-		if (position === null) {
-			return { kind: 'no_observation', seek, radius, dimension: extractDimension(observation), destination: null, cue: null };
-		}
-		const map = this.ingest(agentId, observation);
-		if (typeof options.heading === 'string') {
-			const vector = HEADING_VECTORS[options.heading];
-			if (vector !== undefined) map.heading = vector;
-		}
-		const cues = matchingCues(observation, seek);
-		const nearestCue = cues[0] ?? null;
-		if (nearestCue !== null && nearestCue.distance <= CUE_IN_VIEW_DISTANCE) {
-			return compactSelection({
-				kind: 'cue_in_view',
-				seek,
-				radius,
-				dimension: map.dimension,
-				destination: { x: nearestCue.x, y: nearestCue.y, z: nearestCue.z },
-				cue: nearestCue,
-				reason: 'matching cue is already in interaction range',
-			}, map);
-		}
-		if (nearestCue !== null) {
-			const destination = hopToward(position, nearestCue, radius);
-			this.rememberHeading(agentId, position, destination);
-			return compactSelection({
-				kind: 'cue',
-				seek,
-				radius,
-				dimension: map.dimension,
-				destination,
-				cue: nearestCue,
-				reason: 'walk toward a matching visible biome or structure cue',
-			}, map);
-		}
-		const frontier = bestFrontierCell(map, position, radius);
-		if (frontier === null) {
-			return compactSelection({
-				kind: 'no_frontier',
-				seek,
-				radius,
-				dimension: map.dimension,
-				destination: null,
-				cue: null,
-				reason: 'no unknown adjacent cell remains inside the bounded radius',
-			}, map);
-		}
-		const destination = {
-			x: frontier.cx * CELL_SIZE + CELL_SIZE / 2 + 0.5,
-			y: position.y,
-			z: frontier.cz * CELL_SIZE + CELL_SIZE / 2 + 0.5,
-		};
-		this.rememberHeading(agentId, position, destination);
-		return compactSelection({
-			kind: 'frontier',
-			seek,
-			radius,
-			dimension: map.dimension,
-			destination,
-			cue: null,
-			reason: 'walk into unknown space adjacent to mapped occupancy',
-		}, map);
-	}
-
-	clear(agentId) {
-		if (agentId === undefined) this.#agents.clear();
-		else this.#agents.delete(agentId);
-	}
-
-	#mapFor(agentId) {
-		let map = this.#agents.get(agentId);
-		if (map === undefined) {
-			map = { dimension: 'minecraft:overworld', cells: new Map(), order: [], heading: null };
-			this.#agents.set(agentId, map);
-		}
-		return map;
-	}
-
-	#remember(map, key, blocked) {
-		const existing = map.cells.get(key);
-		if (existing !== undefined) {
-			existing.visits += 1;
-			if (blocked) existing.blocked = true;
-			const index = map.order.indexOf(key);
-			if (index >= 0) map.order.splice(index, 1);
-			map.order.push(key);
-			return;
-		}
-		map.cells.set(key, { visits: 1, blocked });
-		map.order.push(key);
-		while (map.cells.size > MAX_KNOWN_CELLS) {
-			const oldest = map.order.shift();
-			if (oldest !== undefined) map.cells.delete(oldest);
-		}
-	}
-}
-
-export function extractPosition(observation) {
-	const source = observation?.position
-		?? observation?.player?.position
-		?? observation?.player;
-	if (source === null || typeof source !== 'object') return null;
-	const x = source.x;
-	const y = source.y;
-	const z = source.z;
-	if (![x, y, z].every(Number.isFinite)) return null;
-	return { x, y, z };
-}
-
-export function extractDimension(observation) {
-	const dimension = observation?.world?.dimension ?? observation?.world?.dimensionId;
-	return typeof dimension === 'string' && dimension.length > 0 ? dimension : 'minecraft:overworld';
-}
-
-export function cellKey(x, z) {
-	return `${Math.floor(x / CELL_SIZE)},${Math.floor(z / CELL_SIZE)}`;
-}
-
-export function cueClassFor(blockId) {
-	return CUE_WEIGHTS[bareBlockName(blockId)] ?? null;
-}
-
-function matchingCues(observation, seek) {
-	const position = extractPosition(observation);
-	const cues = [];
-	for (const block of visibleBlocks(observation)) {
-		const spec = CUE_WEIGHTS[bareBlockName(block.blockId)];
-		if (spec === undefined || !spec.seek.includes(seek)) continue;
-		if (!cueMatchesDimension(spec, extractDimension(observation))) continue;
-		if (![block.x, block.y, block.z].every(Number.isFinite)) continue;
-		const distance = position === null
-			? Number.POSITIVE_INFINITY
-			: Math.hypot(block.x + 0.5 - position.x, block.z + 0.5 - position.z);
-		cues.push({
-			blockId: block.blockId,
-			class: spec.class,
-			weight: spec.weight,
-			x: block.x + 0.5,
-			y: Number.isFinite(block.y) ? block.y : position?.y ?? 64,
-			z: block.z + 0.5,
-			distance,
-		});
-	}
-	cues.sort((left, right) => right.weight - left.weight
-		|| left.distance - right.distance
-		|| left.x - right.x
-		|| left.z - right.z
-		|| left.blockId.localeCompare(right.blockId));
-	return cues;
-}
-
-function cueMatchesDimension(spec, dimension) {
-	if (!Array.isArray(spec.dimensions) || spec.dimensions.length === 0) return true;
-	return spec.dimensions.includes(dimension);
-}
-
-function visibleBlocks(observation) {
-	const blocks = Array.isArray(observation?.blocks) ? observation.blocks : [];
-	const containers = Array.isArray(observation?.nearbyContainers) ? observation.nearbyContainers : [];
-	return [...blocks, ...containers];
-}
-
-function bestFrontierCell(map, position, radius) {
-	const originCx = Math.floor(position.x / CELL_SIZE);
-	const originCz = Math.floor(position.z / CELL_SIZE);
-	const candidates = [];
-	for (const key of map.cells.keys()) {
-		const known = map.cells.get(key);
-		if (known?.blocked) continue;
-		const [cx, cz] = key.split(',').map(Number);
-		for (const [dx, dz] of CARDINAL) {
-			const nx = cx + dx;
-			const nz = cz + dz;
-			const neighborKey = `${nx},${nz}`;
-			const neighbor = map.cells.get(neighborKey);
-			if (neighbor !== undefined) continue;
-			const centerX = nx * CELL_SIZE + CELL_SIZE / 2 + 0.5;
-			const centerZ = nz * CELL_SIZE + CELL_SIZE / 2 + 0.5;
-			const distance = Math.hypot(centerX - position.x, centerZ - position.z);
+		const entries = new Map();
+		for (const block of blocks.values()) {
+			if (block.blockId === 'minecraft:air' || blockId !== null && block.blockId !== blockId) continue;
+			const target = { x: block.x + 0.5, y: block.y + 0.5, z: block.z + 0.5 };
+			const distance = distanceTo(position, target);
 			if (distance > radius) continue;
-			const headingBonus = headingAlignment(map.heading, centerX - position.x, centerZ - position.z);
-			candidates.push({
-				cx: nx,
-				cz: nz,
-				originCx,
-				originCz,
-				distance,
-				score: -distance + headingBonus,
-			});
+			const cell = cells.get(spatialCellKey(block.x, block.y, block.z));
+			const id = `block:${block.x},${block.y},${block.z}`;
+			entries.set(id, { id, kind: 'observed_block', position: target, blockId: block.blockId, ...(block.blockState ? { blockState: block.blockState } : {}), distance, seen: true, visited: cell?.visited === true, blocked: cell?.blocked === true, stale: block.stale === true, reachability: 'unknown' });
 		}
-	}
-	if (candidates.length === 0) return null;
-	candidates.sort((left, right) => right.score - left.score
-		|| left.cx - right.cx
-		|| left.cz - right.cz);
-	return candidates[0];
-}
-
-function headingAlignment(heading, dx, dz) {
-	if (heading === null || (dx === 0 && dz === 0)) return 0;
-	const length = Math.hypot(dx, dz) * Math.hypot(heading.dx, heading.dz);
-	if (length === 0) return 0;
-	return (dx * heading.dx + dz * heading.dz) / length;
-}
-
-function hopToward(from, to, radius) {
-	const dx = to.x - from.x;
-	const dz = to.z - from.z;
-	const distance = Math.hypot(dx, dz);
-	if (distance <= radius) return { x: to.x, y: from.y, z: to.z };
-	const scale = radius / distance;
-	return { x: from.x + dx * scale, y: from.y, z: from.z + dz * scale };
-}
-
-function compactSelection(selection, map) {
-	let frontierCount = 0;
-	for (const key of map.cells.keys()) {
-		if (map.cells.get(key)?.blocked) continue;
-		const [cx, cz] = key.split(',').map(Number);
-		for (const [dx, dz] of CARDINAL) {
-			if (!map.cells.has(`${cx + dx},${cz + dz}`)) frontierCount += 1;
+		if (blockId === null) for (const [key, cell] of cells) {
+			if (cell.blocked || cell.stale) continue;
+			const [cx, cy, cz] = key.split(',').map(Number);
+			for (const [dx, dy, dz] of NEIGHBORS) {
+				const neighbor = `${cx + dx},${cy + dy},${cz + dz}`;
+				if (cells.has(neighbor)) continue;
+				const target = { x: (cx + dx + 0.5) * CELL_SIZE, y: (cy + dy + 0.5) * CELL_SIZE, z: (cz + dz + 0.5) * CELL_SIZE };
+				const distance = distanceTo(position, target);
+				if (distance > radius) continue;
+				const id = `cell:${neighbor}`;
+				entries.set(id, { id, kind: 'unknown_cell', position: target, distance, seen: false, visited: false, blocked: false, stale: false, reachability: 'unknown' });
+			}
 		}
+		const all = [...entries.values()].sort((left, right) => left.distance - right.distance || left.id.localeCompare(right.id));
+		return { ...base, kind: 'candidates', candidates: all.slice(0, limit), totalCandidates: all.length, truncated: all.length > limit, knownCells: known.knownCells, reason: 'Distance-sorted facts. Reachability is unknown; choose a target explicitly.' };
 	}
-	return {
-		...selection,
-		knownCells: map.cells.size,
-		frontierCount,
-		cue: selection.cue === null ? null : {
-			blockId: selection.cue.blockId,
-			class: selection.cue.class,
-			x: selection.cue.x,
-			y: selection.cue.y,
-			z: selection.cue.z,
-			distance: round1(selection.cue.distance),
-		},
-		destination: selection.destination === null ? null : {
-			x: round1(selection.destination.x),
-			y: round1(selection.destination.y),
-			z: round1(selection.destination.z),
-		},
-	};
+	select(agentId, observation, options = {}) { return this.candidates(agentId, observation, options); }
+	clear(agentId) { this.#memory.clear(agentId); }
 }
 
-function bareBlockName(blockId) {
-	if (typeof blockId !== 'string' || blockId.length === 0) return '';
-	const slash = blockId.lastIndexOf(':');
-	return slash >= 0 ? blockId.slice(slash + 1) : blockId;
-}
-
-function round1(value) {
-	return Math.round(value * 10) / 10;
-}
+export const extractPosition = observationPosition;
+export const extractDimension = observationDimension;
+export function cellKey(x, y, z) { return z === undefined ? `${Math.floor(x / CELL_SIZE)},${Math.floor(y / CELL_SIZE)}` : spatialCellKey(x, y, z); }
+export function cueClassFor() { return null; }
+function distanceTo(from, to) { return Math.hypot(to.x - from.x, to.y - from.y, to.z - from.z); }

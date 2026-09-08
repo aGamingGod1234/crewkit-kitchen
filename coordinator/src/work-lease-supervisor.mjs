@@ -8,6 +8,7 @@ export const LEASE_TIMEOUTS_MS = Object.freeze({
 });
 
 export const FACTUAL_PROGRESS_TIMEOUT_MS = 30_000;
+export const MAX_LEASE_TIMEOUT_MS = 900_000;
 
 const AUTOMATED_KINDS = new Set(['scheduled', 'recovery']);
 const MAX_HISTORY = 8;
@@ -70,13 +71,14 @@ export class WorkLeaseSupervisor {
 		return true;
 	}
 
-	acquire(key, kind) {
+	acquire(key, kind, { timeoutMs = LEASE_TIMEOUTS_MS[kind] } = {}) {
 		if (!Object.hasOwn(LEASE_TIMEOUTS_MS, kind)) throw new TypeError(`Unsupported work lease kind '${kind}'`);
 		if (AUTOMATED_KINDS.has(kind)) throw new TypeError(`Work lease kind '${kind}' is supervisor-owned`);
+		if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_LEASE_TIMEOUT_MS) throw new TypeError(`work lease timeoutMs must be a safe integer from 1 to ${MAX_LEASE_TIMEOUT_MS}`);
 		const entry = this.#requireCurrent(key);
 		this.#removeAutomatedLeases(entry);
 		entry.state = 'active';
-		return this.#createLease(entry, kind, false);
+		return this.#createLease(entry, kind, false, timeoutMs);
 	}
 
 	progress(token) {
@@ -85,7 +87,7 @@ export class WorkLeaseSupervisor {
 		const { entry, lease } = resolved;
 		this.#cancelLeaseTimer(lease);
 		lease.lastProgressAt = this.#now();
-		lease.deadline = lease.lastProgressAt + LEASE_TIMEOUTS_MS[lease.kind];
+		lease.deadline = lease.lastProgressAt + lease.timeoutMs;
 		this.#armLease(entry, lease);
 		return true;
 	}
@@ -197,8 +199,10 @@ export class WorkLeaseSupervisor {
 			createdAt: now,
 			lastProgressAt: now,
 			deadline: now + delay,
+			timeoutMs: delay,
 			automated,
 			handle: null,
+			timerGeneration: 0,
 		};
 		entry.leases.set(lease.operationId, lease);
 		this.#armLease(entry, lease);
@@ -207,7 +211,10 @@ export class WorkLeaseSupervisor {
 
 	#armLease(entry, lease) {
 		const delay = Math.max(0, lease.deadline - this.#now());
-		lease.handle = this.#schedule(() => this.#expire(entry, lease), delay);
+		const generation = ++lease.timerGeneration;
+		lease.handle = this.#schedule(() => {
+			if (lease.timerGeneration === generation) this.#expire(entry, lease);
+		}, delay);
 	}
 
 	#expire(entry, lease) {
@@ -326,7 +333,7 @@ function createEntry(key, now) {
 }
 
 function publicLease(lease) {
-	return Object.freeze({ kind: lease.kind, operationId: lease.operationId, createdAt: lease.createdAt, lastProgressAt: lease.lastProgressAt, deadline: lease.deadline });
+	return Object.freeze({ kind: lease.kind, operationId: lease.operationId, createdAt: lease.createdAt, lastProgressAt: lease.lastProgressAt, deadline: lease.deadline, timeoutMs: lease.timeoutMs });
 }
 
 function normalizeKey(value) {

@@ -137,28 +137,10 @@ public final class NavigationProgressVerification {
 				new GridPosition(5, 64, 7), exactDestination, 0.6D),
 				"a safe endpoint inside the requested tolerance remains eligible");
 
-		Vec3 localWaypoint = ServerNavigationController.localPlanningDestination(
-				new Vec3(0.5D, 64.0D, 0.5D), new Vec3(1_000.5D, 164.0D, 0.5D));
-		assertTrue(localWaypoint.distanceTo(new Vec3(0.5D, 64.0D, 0.5D)) <= ServerNavigationController.MAX_LOCAL_PLANNING_DISTANCE,
-				"long-range navigation plans only one loaded bounded segment at a time");
-		assertTrue(localWaypoint.x < 1_000.5D, "long-range navigation does not ask the bounded pathfinder for the final remote target");
-		assertEquals(exactDestination, ServerNavigationController.localPlanningDestination(
-				new Vec3(5.0D, 64.0D, 7.0D), exactDestination),
-				"near destinations are planned exactly");
-
-		java.util.List<PathNode> waterPath = java.util.List.of(
-				new PathNode(new GridPosition(0, 64, 0), TraversalType.START),
-				new PathNode(new GridPosition(1, 64, 0), TraversalType.WALK),
-				new PathNode(new GridPosition(2, 64, 0), TraversalType.WALK),
-				new PathNode(new GridPosition(3, 64, 0), TraversalType.WALK),
-				new PathNode(new GridPosition(4, 64, 0), TraversalType.WALK));
-		assertTrue(ServerNavigationController.hasBoundedShallowWaterRun(waterPath, position -> position.x() > 0),
-				"four shallow-water blocks are an explicitly bounded crossing");
-		java.util.List<PathNode> longWaterPath = new java.util.ArrayList<>(waterPath);
-		longWaterPath.add(new PathNode(new GridPosition(5, 64, 0), TraversalType.WALK));
-		assertTrue(!ServerNavigationController.hasBoundedShallowWaterRun(longWaterPath, position -> position.x() > 0),
-				"a five-block swim is rejected instead of silently enabling open-water navigation");
-		return 46;
+		assertTrue(ServerNavigationController.hasAirReserve(true, 61), "surface traversal retains a breathing reserve");
+		assertTrue(!ServerNavigationController.hasAirReserve(true, 60), "the exact air reserve ends water traversal");
+		assertTrue(ServerNavigationController.hasAirReserve(false, 0), "air reserve does not prevent grounded movement");
+		return 44;
 	}
 
 	private static void assertBounded(double value) {

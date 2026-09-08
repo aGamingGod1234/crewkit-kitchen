@@ -5,7 +5,8 @@ import {
 	DEFAULT_ARENA_SCRIPT_LIMITS,
 	normalizeArenaScriptLimits,
 } from './limits.mjs';
-import { PLAYER_MEMBER_PRIMITIVES, SCRIPT_API_CALL_PATHS } from './minecraft-api.mjs';
+import { PLAYER_MEMBER_PRIMITIVES, SCRIPT_API_CALL_PATHS, PURE_API_PATHS } from './minecraft-api.mjs';
+import { ACTION_FIELDS } from '../constants.mjs';
 import { FACT_DOMAIN } from './fact-domains.mjs';
 
 const ALLOWED_GLOBALS = new Set([
@@ -13,6 +14,7 @@ const ALLOWED_GLOBALS = new Set([
 	'player',
 	'world',
 	'inventory',
+	'math',
 	'tryResult',
 	'undefined',
 	'NaN',
@@ -186,7 +188,7 @@ function statementHasTopLevelEffect(statement) {
 		if (current.type === 'AwaitExpression') return true;
 		if (current.type === 'CallExpression') {
 			const path = staticMemberPath(current.callee)?.join('.');
-			if (path && !['program.onUnhandledAttention', 'program.watch', 'player.state', 'inventory.count', 'inventory.countTag', 'world.items', 'world.entities', 'world.blocks', 'world.nearest'].includes(path)) return true;
+			if (path && !['program.onUnhandledAttention', 'program.watch'].includes(path) && !PURE_API_PATHS.has(path)) return true;
 		}
 		for (const [key, value] of Object.entries(current)) if (!['loc', 'start', 'end', 'type'].includes(key)) stack.push(value);
 	}
@@ -245,7 +247,7 @@ function visit(node, state, context) {
 			visit(node.init, state, { ...context, topLevelExpression: false });
 			return;
 		case 'Identifier':
-			if (!context.binding && ['program', 'player', 'world', 'inventory'].includes(node.name) && !context.capabilityMemberObject) {
+			if (!context.binding && ['program', 'player', 'world', 'inventory', 'math'].includes(node.name) && !context.capabilityMemberObject) {
 				throw arenaError('UNSUPPORTED_SYNTAX', `Arena capability ${node.name} may only be used through an approved direct call`, node);
 			}
 			if (!context.binding && !context.property && !ALLOWED_GLOBALS.has(node.name)) {
@@ -324,8 +326,18 @@ function visit(node, state, context) {
 		case 'WhileStatement':
 		case 'DoWhileStatement':
 		case 'ForInStatement':
-		case 'ForOfStatement':
 			throw arenaError('UNBOUNDED_LOOP', `${node.type} does not have a literal static bound`, node);
+		case 'ForOfStatement': {
+			if (node.await || node.left.type !== 'VariableDeclaration' || !['const', 'let'].includes(node.left.kind)
+				|| node.left.declarations.length !== 1 || node.left.declarations[0].id.type !== 'Identifier') {
+				throw arenaError('UNBOUNDED_LOOP', 'for-of requires one local const or let and a bounded factual or literal array', node);
+			}
+			const loopScope = createLexicalScope(context.scope, [node.left], state, context.functionNode);
+			visit(node.left, state, { ...context, scope: loopScope, topLevelExpression: false });
+			visit(node.right, state, { ...context, topLevelExpression: false });
+			visit(node.body, state, { ...context, scope: loopScope, topLevelExpression: false });
+			return;
+		}
 		case 'ReturnStatement':
 			visit(node.argument, state, { ...context, topLevelExpression: false });
 			return;
@@ -435,13 +447,14 @@ function validateCallExpression(node, state, context) {
 	if (pathEqual(path, ['program', 'watch'])) {
 		validateWatcher(node, state, context);
 	}
-	if (pathEqual(path, ['player', 'attack']) || pathEqual(path, ['player', 'useRanged'])) {
+	const primitive = path?.[0] === 'player' ? PLAYER_MEMBER_PRIMITIVES[path[1]] : null;
+	if (primitive === 'attack' || primitive === 'use_ranged' || primitive === 'interact_entity') {
 		validateExactTargetCall(node);
 	}
-	if (pathEqual(path, ['player', 'navigateTo'])) {
+	if (primitive === 'navigate_to' || primitive === 'move_to') {
 		validateNavigateTarget(node, context.scope);
 	}
-	if (pathEqual(path, ['player', 'mine'])) {
+	if (primitive === 'break_block') {
 		validateMineTarget(node);
 	}
 	if (path?.[0] === 'player' && Object.hasOwn(PLAYER_MEMBER_PRIMITIVES, path[1])) {
@@ -460,9 +473,9 @@ function validateCallExpression(node, state, context) {
 }
 
 function validatePlayerPrimitiveArity(node, memberName) {
-	if (memberName === 'respawn') {
+	if (ACTION_FIELDS[PLAYER_MEMBER_PRIMITIVES[memberName]]?.length === 0) {
 		if (node.arguments.length !== 0) {
-			throw arenaError('INVALID_ARENA_SCRIPT_COMMAND', 'player.respawn requires no arguments', node);
+			throw arenaError('INVALID_ARENA_SCRIPT_COMMAND', `player.${memberName} requires no arguments`, node);
 		}
 		return;
 	}
@@ -610,8 +623,12 @@ function watcherFactDependencyMask(condition) {
 				case 'world.blocks': mask |= FACT_DOMAIN.worldBlocks; break;
 				case 'inventory.count': mask |= FACT_DOMAIN.inventoryItems; break;
 				case 'inventory.countTag': mask |= FACT_DOMAIN.inventoryTagCounts; break;
+				case 'inventory.slots': mask |= FACT_DOMAIN.inventoryItems; break;
+				case 'inventory.state': mask |= FACT_DOMAIN.inventoryState; break;
+				case 'world.state': mask |= FACT_DOMAIN.worldState; break;
+				case 'world.menu': mask |= FACT_DOMAIN.menu; break;
 				case 'world.nearest': mask |= FACT_DOMAIN.player; break;
-				default: dependsOnRuntimeState = true; return;
+				default: if (!path?.startsWith('math.')) { dependsOnRuntimeState = true; return; }
 			}
 			visit(node.arguments);
 			return;
@@ -709,13 +726,13 @@ function validatePureCondition(node) {
 		}
 		if (current.type === 'CallExpression') {
 			const path = staticMemberPath(current.callee)?.join('.');
-			if (!['player.state', 'inventory.count', 'inventory.countTag', 'world.items', 'world.entities', 'world.blocks', 'world.nearest'].includes(path)) {
+			if (!PURE_API_PATHS.has(path)) {
 				throw arenaError('UNSUPPORTED_SYNTAX', 'watcher and repeatUntil conditions can call only factual Arena APIs', current);
 			}
 		}
 		if (current.type === 'MemberExpression') {
 			const path = staticMemberPath(current)?.join('.');
-			if ([...SCRIPT_API_CALL_PATHS].filter((apiPath) => !['player.state', 'inventory.count', 'inventory.countTag', 'world.items', 'world.entities', 'world.blocks', 'world.nearest'].includes(apiPath)).includes(path)
+			if ([...SCRIPT_API_CALL_PATHS].filter((apiPath) => !PURE_API_PATHS.has(apiPath)).includes(path)
 				|| ['program.checkpoint', 'program.finish', 'program.watch', 'program.repeatUntil'].includes(path)) {
 				throw arenaError('UNSUPPORTED_SYNTAX', 'watcher and repeatUntil conditions cannot reference effectful Arena APIs', current);
 			}

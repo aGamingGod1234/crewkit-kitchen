@@ -11,6 +11,7 @@ import dev.agaminggod.arenaagents.agent.AgentProfile;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.AgentRegistry;
 import dev.agaminggod.arenaagents.agent.AgentTransition;
+import dev.agaminggod.arenaagents.mixin.CachedUserNameToIdResolverAccessor;
 import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
 import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
 import dev.agaminggod.arenaagents.server.goal.PendingGoalDraft;
@@ -81,6 +82,7 @@ public final class CodexAgentManager {
 	private static final Map<MinecraftServer, CodexAgentManager> INSTANCES = new WeakHashMap<>();
 	private static final int AGENT_TICKET_RADIUS = 2;
 	private static final long PLAYER_SPAWN_TIMEOUT_MS = 10_000L;
+	private static final int MAX_PLAYER_NAME_ALLOCATION_ATTEMPTS = 64;
 	private static final long VANILLA_DEATH_REMOVAL_GRACE_MS = 1_000L;
 	private static final long RECOVERY_RETRY_DELAY_MS = 30_000L;
 	private static final long CANCELLED_SPAWN_RETENTION_MS = 120_000L;
@@ -241,25 +243,19 @@ public final class CodexAgentManager {
 				.toList();
 		AgentRecord created;
 		synchronized (registry) {
-			List<String> unavailableNames = new java.util.ArrayList<>(livePlayerNames);
-			while (true) {
-				created = runtimeHooks.withinPublicationBoundary(() -> {
+			created = allocatePlayerName(livePlayerNames, unavailableNames ->
+					runtimeHooks.withinPublicationBoundary(() -> {
 					AgentRecord record = registry.create(
 							provider, model, reasoning, serviceTier, userName, gameMode, now, unavailableNames);
 					pendingAgentRegistrations.add(record.agentId());
 					return record;
-				});
-				String technicalName = OfflineAgentPlayers.playerName(created.agentId(), created.profile());
-				if (!isPersistedPlayerNameReserved(technicalName)) break;
-				unavailableNames.add(technicalName);
-				AgentRecord rejected = created;
-				runtimeHooks.withinPublicationBoundary(() -> {
+				}), this::isPersistedPlayerNameReserved,
+				rejected -> runtimeHooks.withinPublicationBoundary(() -> {
 					registry.remove(rejected.agentId());
 					pendingAgentRegistrations.remove(rejected.agentId());
 					OfflineAgentPlayers.invalidateIdentity(rejected.agentId());
 					return null;
-				});
-			}
+				}));
 		}
 		AgentRecord finalCreated = created;
 		try {
@@ -301,9 +297,43 @@ public final class CodexAgentManager {
 	}
 
 	private boolean isPersistedPlayerNameReserved(String name) {
+		return isPersistedPlayerNameReserved(name, server.getWorldPath(net.minecraft.world.level.storage.LevelResource.PLAYER_DATA_DIR),
+				server.services().nameToIdCache(), identity -> server.getPlayerList().loadPlayerData(identity).isPresent());
+	}
+
+	static boolean isPersistedPlayerNameReserved(String name, java.nio.file.Path playerDataDirectory,
+			net.minecraft.server.players.UserNameToIdResolver cache, Predicate<NameAndId> hasPlayerData) {
 		UUID offlineUuid = AgentIdentity.offlinePlayerUuid(name);
-		if (server.getPlayerList().loadPlayerData(new NameAndId(offlineUuid, name)).isPresent()) return true;
-		return server.services().nameToIdCache().get(name).isPresent();
+		if (java.nio.file.Files.exists(playerDataDirectory.resolve(offlineUuid + ".dat"))
+				|| java.nio.file.Files.exists(playerDataDirectory.resolve(offlineUuid + ".dat_old"))
+				|| hasPlayerData.test(new NameAndId(offlineUuid, name))) return true;
+		if (!(cache instanceof CachedUserNameToIdResolverAccessor cached)) {
+			throw new AgentDomainException("PLAYER_NAME_CACHE_UNAVAILABLE", "Player names cannot be checked without a cached-only resolver");
+		}
+		return cached.arenaagents$cachedProfilesByName().containsKey(name.toLowerCase(java.util.Locale.ROOT));
+	}
+
+	/** Keeps name collision retries local and rolls back every rejected registration. */
+	static AgentRecord allocatePlayerName(List<String> livePlayerNames,
+			java.util.function.Function<List<String>, AgentRecord> create,
+			Predicate<String> reserved, java.util.function.Consumer<AgentRecord> reject) {
+		List<String> unavailable = new java.util.ArrayList<>(livePlayerNames);
+		for (int attempt = 0; attempt < MAX_PLAYER_NAME_ALLOCATION_ATTEMPTS; attempt++) {
+			AgentRecord candidate = create.apply(List.copyOf(unavailable));
+			boolean accepted = false;
+			try {
+				String name = AgentIdentity.playerName(candidate.agentId(), candidate.profile());
+				if (!reserved.test(name)) {
+					accepted = true;
+					return candidate;
+				}
+				unavailable.add(name);
+			} finally {
+				if (!accepted) reject.accept(candidate);
+			}
+		}
+		throw new AgentDomainException("AGENT_NAME_ALLOCATION_EXHAUSTED",
+				"Could not allocate an unused player name after 64 candidates; choose another agent name");
 	}
 
 	public AgentTransition start(String selector, String prompt, ServerLevel sourceLevel) {
@@ -505,6 +535,8 @@ public final class CodexAgentManager {
 		switch (predicate) {
 			case GoalPredicate.InventoryContains value -> requireLiveIdentifier(
 					itemExists.test(value.itemId()), "item", value.itemId());
+			case GoalPredicate.InventoryContainsAny value -> value.itemIds().forEach(
+					itemId -> requireLiveIdentifier(itemExists.test(itemId), "item", itemId));
 			case GoalPredicate.EntityKilledByAgent value -> requireLiveIdentifier(
 					entityExists.test(value.entityType()), "entity type", value.entityType());
 			case GoalPredicate.AdvancementGranted value -> {
@@ -605,11 +637,13 @@ public final class CodexAgentManager {
 			GoalSubmission.Operation operation
 	) {
 		UUID requester = PendingGoalDraft.requesterId(requestingPlayerId);
+		List<String> candidateIds = goalCompiler.candidateIdsFor(prompt, server.registryAccess(), liveAdvancementTitles());
+		var constraint = goalCompiler.translationConstraintFor(prompt, server.registryAccess());
+		constraint.requireCatalog(candidateIds);
 		return new PendingGoalDraft(
 				UUID.randomUUID(), record.agentId(), requester, prompt,
 				sourceLevel.dimension().identifier().toString(),
-				goalCompiler.candidateIdsFor(prompt, server.registryAccess(), liveAdvancementTitles()),
-				goalCompiler.translationConstraintFor(prompt, server.registryAccess()), Optional.empty(),
+				candidateIds, constraint, Optional.empty(),
 				operation == GoalSubmission.Operation.START ? DraftIntent.TRANSLATE_START : DraftIntent.TRANSLATE_QUEUE,
 				server.getTickCount(), record.goalRevision(), PendingGoalDraft.expectedGoalIdFor(record)
 		);

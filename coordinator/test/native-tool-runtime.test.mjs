@@ -4,6 +4,7 @@ import test from 'node:test';
 import { goalSpecFingerprint } from '../src/goal-spec.mjs';
 import { nativeObservationSignature } from '../src/dynamic-main.mjs';
 import { constrainGoalBoundNavigation, NativeToolRuntime } from '../src/native-tool-runtime.mjs';
+import { ModelNotebook } from '../src/model-notebook.mjs';
 
 function record(overrides = {}) {
 	const fields = {
@@ -103,6 +104,10 @@ test('native observe returns latest compact facts without sending a body command
 	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async (...args) => sent.push(args) } });
 	runtime.updateObservation(record(), { player: { health: 18 }, blocks: [{ blockId: 'minecraft:stone', x: 1, y: 63, z: 1 }] }, { eventSequence: 4 });
 	const result = await runtime.execute({ agentId: 'agent-a', goalRevision: 3, turnId: 'turn-1', callId: 'observe-1', tool: { kind: 'observe' } }, record());
+	assert.equal(result.freshness.fresh, false);
+	assert.equal(result.freshness.reasonCode, 'FRESH_OBSERVATION_UNAVAILABLE');
+	delete result.freshness;
+	delete result.observation.exploration;
 	assert.deepEqual(result, {
 		eventSequence: 4,
 		goal: 'get one stone',
@@ -130,12 +135,13 @@ test('identical heartbeat refresh advances sequence without re-ingesting world s
 		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-refresh', callId: 'observe-refresh', tool: { kind: 'observe' },
 	}, current);
 	assert.equal(result.eventSequence, 2);
+	assert.equal(result.observation.exploration.destination, null);
+	delete result.observation.exploration;
 	assert.deepEqual(result.observation, {
 		...observation,
 		recovery: {
 			alreadyHave: ['minecraft:stone'],
 			alreadyHaveFacts: [{ kind: 'inventory', itemId: 'minecraft:stone', count: 1 }],
-			doNotRedo: [],
 			facts: 'Currently evidenced: minecraft:stone.',
 		},
 	});
@@ -250,6 +256,9 @@ test('native observe ignores a stale observation event sequence', async () => {
 	const result = await runtime.execute({
 		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-1', callId: 'observe-stale', tool: { kind: 'observe' },
 	}, current);
+	assert.equal(result.freshness.fresh, false);
+	delete result.freshness;
+	delete result.observation.exploration;
 	assert.deepEqual(result, {
 		eventSequence: 8,
 		goal: 'get one stone',
@@ -287,7 +296,7 @@ test('goal-bound navigation cannot succeed outside the immutable position radius
 	assert.deepEqual(await pending, {
 		state: 'FAILED', reasonCode: 'PATH_BLOCKED',
 		message: 'Navigation could not recover from repeated stalls', executionStarted: true,
-		failureClass: 'explore',
+		failureClass: 'path',
 	});
 });
 
@@ -486,174 +495,47 @@ test('native sequence stops before later actions after the first factual failure
 		state: 'FAILED',
 		completed: 1,
 		failedAt: 0,
-		results: [{ actionType: 'navigate_to', state: 'FAILED', reasonCode: 'NO_PATH', executionStarted: true, failureClass: 'explore' }],
+		results: [{ actionType: 'navigate_to', state: 'FAILED', reasonCode: 'NO_PATH', executionStarted: true, failureClass: 'path' }],
 	});
 	assert.equal(sent.length, 1);
 });
 
-test('exploreFrontier walks one occupancy hop through navigate_to', async () => {
+test('exploreFrontier returns observed candidates without choosing or executing a route', async () => {
 	const sent = [];
-	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async (...args) => sent.push(args) } });
-	const current = record({ currentGoal: 'Beat Minecraft', currentGoalSpec: record().currentGoalSpec });
-	runtime.updateObservation(current, {
-		player: { x: 0, y: 64, z: 0, health: 20 },
-		position: { x: 0, y: 64, z: 0 },
-		world: { dimension: 'minecraft:overworld' },
-		inventory: { items: [{ itemId: 'minecraft:iron_pickaxe', count: 1 }] },
-		blocks: [],
-	}, { eventSequence: 4 });
-	const pending = runtime.execute({
-		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-explore', callId: 'explore-1',
-		tool: { kind: 'explore_frontier', arguments: { seek: 'nether', radius: 24, timeoutMs: 15_000 } },
-	}, current);
-	await Promise.resolve();
-	assert.equal(sent[0][0], 'action_command');
-	assert.equal(sent[0][2].actionType, 'navigate_to');
-	assert.equal(Number.isFinite(sent[0][2].arguments.x), true);
-	runtime.onActionResult(current, {
-		goalRevision: 3, actionId: sent[0][2].actionId, state: 'SUCCEEDED', reasonCode: 'DESTINATION_REACHED', executionStarted: true,
-	});
-	const result = await pending;
-	assert.equal(result.state, 'SUCCEEDED');
-	assert.equal(result.frontier.kind, 'frontier');
-	assert.equal(result.frontier.seek, 'nether');
-});
-
-test('exploreFrontier reports CUE_IN_VIEW without dispatching a walk', async () => {
-	const sent = [];
-	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async (...args) => sent.push(args) } });
-	const current = record({ currentGoal: 'Beat Minecraft' });
-	runtime.updateObservation(current, {
-		player: { x: 0, y: 64, z: 0 },
-		position: { x: 0, y: 64, z: 0 },
-		world: { dimension: 'minecraft:overworld' },
-		blocks: [{ blockId: 'minecraft:obsidian', x: 1, y: 64, z: 0 }],
-		inventory: { items: [] },
-	}, { eventSequence: 2 });
-	const result = await runtime.execute({
-		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-cue', callId: 'explore-cue',
-		tool: { kind: 'explore_frontier', arguments: { seek: 'nether' } },
-	}, current);
-	assert.equal(result.state, 'SUCCEEDED');
-	assert.equal(result.reasonCode, 'CUE_IN_VIEW');
-	assert.equal(result.frontier.kind, 'cue_in_view');
+	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) } });
+	runtime.updateObservation(record(), {
+		position: { x: 0, y: 64, z: 0 }, world: { worldId: 'world-a', dimension: 'minecraft:overworld' },
+		blocks: [{ x: 8, y: 64, z: 0, blockId: 'minecraft:stone' }],
+	}, { eventSequence: 1 });
+	const result = await runtime.execute(nativeCall({ kind: 'explore_frontier', arguments: { radius: 24, limit: 32 } }), record());
+	assert.equal(result.kind, 'candidates');
+	assert.equal(result.destination, null);
+	assert.ok(result.candidates.some((entry) => entry.kind === 'observed_block'));
+	assert.equal(result.freshness.fresh, false);
 	assert.deepEqual(sent, []);
 });
 
-test('exploreFrontier without a current observation fails as NO_OBSERVATION', async () => {
-	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async () => {} } });
-	const result = await runtime.execute({
-		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-empty', callId: 'explore-empty',
-		tool: { kind: 'explore_frontier', arguments: { seek: 'any' } },
-	}, record());
-	assert.equal(result.state, 'FAILED');
-	assert.equal(result.reasonCode, 'NO_OBSERVATION');
-	assert.equal(result.failureClass, 'replan');
+test('exploreFrontier uses a new sample and gives the AI explicitly unknown candidates', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({
+		bridge: { send: async (...args) => sent.push(args) },
+		requestObservation: async () => ({ eventSequence: 5, observation: { position: { x: 20, y: 70, z: 2 }, world: { worldId: 'world-a', dimension: 'minecraft:the_nether' } } }),
+	});
+	const result = await runtime.execute(nativeCall({ kind: 'explore_frontier', arguments: { radius: 24, limit: 4 } }), record());
+	assert.equal(result.destination, null);
+	assert.equal(result.dimension, 'minecraft:the_nether');
+	assert.equal(result.freshness.fresh, true);
+	assert.ok(result.candidates.length > 0);
+	assert.ok(result.candidates.every((entry) => entry.reachability === 'unknown'));
+	assert.deepEqual(sent, []);
 });
 
-test('a blocked frontier hop is not retried on the next exploreFrontier call', async () => {
-	const sent = [];
-	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async (...args) => sent.push(args) } });
-	const current = record({ currentGoal: 'Beat Minecraft' });
-	const observation = {
-		player: { x: 0, y: 64, z: 0 },
-		position: { x: 0, y: 64, z: 0 },
-		world: { dimension: 'minecraft:overworld' },
-		blocks: [],
-		inventory: { items: [] },
-	};
-	runtime.updateObservation(current, observation, { eventSequence: 1 });
-	const first = runtime.execute({
-		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-block-1', callId: 'explore-block-1',
-		tool: { kind: 'explore_frontier', arguments: { seek: 'any', radius: 24 } },
-	}, current);
-	await Promise.resolve();
-	const firstDestination = { ...sent[0][2].arguments };
-	runtime.onActionResult(current, {
-		goalRevision: 3, actionId: sent[0][2].actionId, state: 'FAILED', reasonCode: 'PATH_BLOCKED', executionStarted: true,
-	});
-	await first;
-	const second = runtime.execute({
-		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-block-2', callId: 'explore-block-2',
-		tool: { kind: 'explore_frontier', arguments: { seek: 'any', radius: 24 } },
-	}, current);
-	await Promise.resolve();
-	assert.equal(sent[1][2].actionType, 'navigate_to');
-	assert.notDeepEqual(
-		{ x: sent[1][2].arguments.x, z: sent[1][2].arguments.z },
-		{ x: firstDestination.x, z: firstDestination.z },
-	);
-	runtime.onActionResult(current, {
-		goalRevision: 3, actionId: sent[1][2].actionId, state: 'SUCCEEDED', reasonCode: 'DESTINATION_REACHED',
-	});
-	await second;
-});
-
-test('a non-path frontier failure does not poison the destination cell', async () => {
-	const sent = [];
-	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async (...args) => sent.push(args) } });
-	const current = record({ currentGoal: 'Beat Minecraft' });
-	const observation = {
-		player: { x: 0, y: 64, z: 0 },
-		position: { x: 0, y: 64, z: 0 },
-		world: { dimension: 'minecraft:overworld' },
-		blocks: [],
-		inventory: { items: [] },
-	};
-	runtime.updateObservation(current, observation, { eventSequence: 1 });
-	const first = runtime.execute({
-		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-unloaded-1', callId: 'explore-unloaded-1',
-		tool: { kind: 'explore_frontier', arguments: { seek: 'any', radius: 24 } },
-	}, current);
-	await Promise.resolve();
-	const firstDestination = { x: sent[0][2].arguments.x, z: sent[0][2].arguments.z };
-	runtime.onActionResult(current, {
-		goalRevision: 3, actionId: sent[0][2].actionId, state: 'FAILED', reasonCode: 'TARGET_NOT_LOADED', executionStarted: true,
-	});
-	await first;
-	const second = runtime.execute({
-		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-unloaded-2', callId: 'explore-unloaded-2',
-		tool: { kind: 'explore_frontier', arguments: { seek: 'any', radius: 24 } },
-	}, current);
-	await Promise.resolve();
-	assert.deepEqual({ x: sent[1][2].arguments.x, z: sent[1][2].arguments.z }, firstDestination);
-	runtime.onActionResult(current, {
-		goalRevision: 3, actionId: sent[1][2].actionId, state: 'SUCCEEDED', reasonCode: 'DESTINATION_REACHED', executionStarted: true,
-	});
-	await second;
-});
-
-test('a timed-out frontier hop is not permanently blocked', async () => {
-	const sent = [];
-	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async (...args) => sent.push(args) } });
-	const current = record({ currentGoal: 'Beat Minecraft' });
-	runtime.updateObservation(current, {
-		player: { x: 0, y: 64, z: 0 },
-		position: { x: 0, y: 64, z: 0 },
-		world: { dimension: 'minecraft:overworld' },
-		blocks: [],
-		inventory: { items: [] },
-	}, { eventSequence: 1 });
-	const first = runtime.execute({
-		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-timeout-1', callId: 'explore-timeout-1',
-		tool: { kind: 'explore_frontier', arguments: { seek: 'any', radius: 24 } },
-	}, current);
-	await Promise.resolve();
-	const firstDestination = { x: sent[0][2].arguments.x, z: sent[0][2].arguments.z };
-	runtime.onActionResult(current, {
-		goalRevision: 3, actionId: sent[0][2].actionId, state: 'FAILED', reasonCode: 'ACTION_TIMEOUT', executionStarted: true,
-	});
-	await first;
-	const second = runtime.execute({
-		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-timeout-2', callId: 'explore-timeout-2',
-		tool: { kind: 'explore_frontier', arguments: { seek: 'any', radius: 24 } },
-	}, current);
-	await Promise.resolve();
-	assert.deepEqual({ x: sent[1][2].arguments.x, z: sent[1][2].arguments.z }, firstDestination);
-	runtime.onActionResult(current, {
-		goalRevision: 3, actionId: sent[1][2].actionId, state: 'SUCCEEDED', reasonCode: 'DESTINATION_REACHED',
-	});
-	await second;
+test('exploreFrontier reports missing position without inventing a route', async () => {
+	const runtime = new NativeToolRuntime({ bridge: { send: async () => assert.fail('read-only query dispatched movement') } });
+	const result = await runtime.execute(nativeCall({ kind: 'explore_frontier', arguments: {} }), record());
+	assert.equal(result.kind, 'no_observation');
+	assert.equal(result.destination, null);
+	assert.deepEqual(result.candidates, []);
 });
 
 test('action results omit recovery until a fresh observation arrives', async () => {
@@ -689,12 +571,12 @@ test('death force-updates the observation cache and keeps last live inventory as
 	assert.equal(runtime.updateObservation(current, { death }, { eventSequence: 6, force: true }), true);
 	const decorated = runtime.decorateObservation(current, { death });
 	assert.equal(decorated.continuity.phase, 'dead');
-	assert.equal(decorated.failureClass, 'recover');
+	assert.equal(decorated.failureClass, 'lifecycle');
 	assert.equal(decorated.inventory.items.length, 0);
 	assert.equal(decorated.recovery.lastLostInventory[0].itemId, 'minecraft:stone_pickaxe');
 	assert.equal(decorated.recovery.alreadyHave.includes('minecraft:stone_pickaxe'), false);
 	assert.match(decorated.recovery.facts, /Current inventory is empty/);
-	assert.ok(decorated.options.some((option) => option.id === 'recover_corpse'));
+	assert.equal(decorated.options, undefined, 'recovery facts do not prescribe a strategy');
 });
 
 test('bridge disconnect keeps recovery memory until the agent is removed', async () => {
@@ -711,14 +593,15 @@ test('bridge disconnect keeps recovery memory until the agent is removed', async
 		inventory: { items: [{ itemId: 'minecraft:iron_pickaxe', count: 1 }] },
 		world: { dimension: 'minecraft:overworld' },
 	});
-	assert.ok(decorated.recovery.doNotRedo.includes('minecraft:stone_pickaxe'));
+	assert.ok(decorated.recovery.alreadyHave.includes('minecraft:iron_pickaxe'));
+	assert.equal(decorated.recovery.doNotRedo, undefined);
 	await runtime.dispose('agent-a', 'agent_removed');
 	const forgotten = runtime.decorateObservation(current, {
 		player: { x: 1, y: 64, z: 1, dead: false },
 		inventory: { items: [] },
 		world: { dimension: 'minecraft:overworld' },
 	});
-	assert.equal(forgotten.recovery?.doNotRedo?.includes('minecraft:stone_pickaxe') === true, false);
+	assert.equal(forgotten.recovery?.alreadyHave?.includes('minecraft:iron_pickaxe') === true, false);
 });
 
 test('empty decorate payloads do not wipe live inventory memory', async () => {
@@ -755,4 +638,364 @@ test('native sequence is cancelled if the lifecycle is disposed between steps', 
 	await runtime.dispose('agent-a', 'goal_replaced');
 	await assert.rejects(pending, (error) => error?.code === 'NATIVE_ACTION_CANCELLED');
 	assert.equal(sent.length, 1);
+});
+
+function nativeCall(tool, overrides = {}) { return { agentId: 'agent-a', goalRevision: 3, turnId: 'turn-new', callId: 'call-new', tool, ...overrides }; }
+
+test('observe waits for a newer server sample and rejects a cached freshness claim', async () => {
+	let sampled;
+	let barrier;
+	const runtime = new NativeToolRuntime({
+		bridge: { send: async () => {} },
+		requestObservation: async (_record, options) => { barrier = options; return new Promise((resolve) => { sampled = resolve; }); },
+	});
+	runtime.updateObservation(record(), { player: { health: 12 }, observedAtEpochMs: 10 }, { eventSequence: 4 });
+	let returned = false;
+	const pending = runtime.execute(nativeCall({ kind: 'observe' }), record()).then((result) => { returned = true; return result; });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(returned, false);
+	assert.deepEqual(barrier, { afterEventSequence: 4 });
+	sampled({ eventSequence: 5, observation: { player: { health: 9 }, observedAtEpochMs: 20 } });
+	const result = await pending;
+	assert.equal(result.observation.player.health, 9);
+	assert.deepEqual(result.freshness, { fresh: true, afterEventSequence: 4, eventSequence: 5, observedAtEpochMs: 20 });
+	const stale = runtime.execute(nativeCall({ kind: 'observe' }), record());
+	await new Promise((resolve) => setImmediate(resolve));
+	sampled({ eventSequence: 5, observation: { player: { health: 9 } } });
+	await assert.rejects(stale, { code: 'FRESH_OBSERVATION_REQUIRED' });
+});
+
+test('fresh observation cannot repopulate a disposed lifecycle', async () => {
+	let sampled;
+	const runtime = new NativeToolRuntime({ bridge: { send: async () => {} }, requestObservation: async () => new Promise((resolve) => { sampled = resolve; }) });
+	const pending = runtime.execute(nativeCall({ kind: 'observe' }), record());
+	await new Promise((resolve) => setImmediate(resolve));
+	await runtime.dispose('agent-a', 'goal_stopped');
+	sampled({ eventSequence: 1, observation: { player: { health: 20 } } });
+	await assert.rejects(pending, { code: 'STALE_NATIVE_TOOL' });
+	assert.equal(runtime.hasCurrent(record()), false);
+});
+
+test('inspect uses the focused server query and preserves revisions and coverage', async () => {
+	const calls = [];
+	const response = { section: 'block', block: { blockId: 'minecraft:oak_sign', text: ['Turn left'] }, revision: 9, gameTime: 50, coverage: { returned: 1, accessible: true } };
+	const runtime = new NativeToolRuntime({ bridge: { send: async () => assert.fail('inspection mutated player') }, inspectObservation: async (current, query) => { calls.push({ current, query }); return response; } });
+	const query = { kind: 'inspect', section: 'block', x: 1, y: 64, z: 2, offset: 0, limit: 1 };
+	const result = await runtime.execute(nativeCall(query), record());
+	assert.deepEqual(calls[0].query, { section: 'block', x: 1, y: 64, z: 2, offset: 0, limit: 1 });
+	assert.deepEqual(result, response);
+	result.block.text[0] = 'changed';
+	assert.equal(response.block.text[0], 'Turn left');
+	const unavailable = new NativeToolRuntime({ bridge: { send: async () => {} } });
+	await assert.rejects(unavailable.execute(nativeCall(query), record()), { code: 'INSPECTION_UNAVAILABLE' });
+});
+
+test('startAction exposes a handle, progress and an exact terminal receipt', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) } });
+	const handle = await runtime.execute(nativeCall({ kind: 'start_action', actionType: 'wait', arguments: { durationMs: 100 } }), record());
+	assert.equal(handle.state, 'RUNNING');
+	assert.equal(handle.actionId, sent[0][2].actionId);
+	assert.equal(handle.goalRevision, 3);
+	runtime.onActionProgress(record(), { actionId: handle.actionId, progress: 0.5, elapsedMs: 50 });
+	const progress = await runtime.execute(nativeCall({ kind: 'action_status', actionId: handle.actionId }), record());
+	assert.deepEqual(progress.progress, { value: 0.5, elapsedMs: 50 });
+	runtime.onActionResult(record(), { actionId: handle.actionId, state: 'SUCCEEDED', reasonCode: 'ACTION_COMPLETED' });
+	const result = await runtime.execute(nativeCall({ kind: 'action_status', actionId: handle.actionId }), record());
+	assert.equal(result.actionId, handle.actionId);
+	assert.equal(result.state, 'SUCCEEDED');
+	assert.equal(result.reasonCode, 'ACTION_COMPLETED');
+	assert.equal((await runtime.execute(nativeCall({ kind: 'action_status' }), record())).state, 'IDLE');
+});
+
+test('cancel rejects mismatched handles and waits for exact acknowledgement', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) } });
+	const handle = await runtime.execute(nativeCall({ kind: 'start_action', actionType: 'wait', arguments: { durationMs: 100 } }), record());
+	await assert.rejects(runtime.execute(nativeCall({ kind: 'cancel_action', actionId: 'wrong', goalRevision: 3 }), record()), { code: 'STALE_ACTION' });
+	await assert.rejects(runtime.execute(nativeCall({ kind: 'cancel_action', actionId: handle.actionId, goalRevision: 2 }), record()), { code: 'STALE_ACTION' });
+	assert.equal(sent.length, 1);
+	let resolved = false;
+	const pending = runtime.execute(nativeCall({ kind: 'cancel_action', actionId: handle.actionId, goalRevision: 3 }), record()).then((result) => { resolved = true; return result; });
+	await Promise.resolve();
+	assert.deepEqual(sent[1], ['action_cancel', 'agent-a', { actionId: handle.actionId, goalRevision: 3 }]);
+	assert.equal(resolved, false);
+	assert.equal((await runtime.execute(nativeCall({ kind: 'action_status' }), record())).state, 'CANCELLING');
+	assert.equal(runtime.onActionResult(record(), { actionId: 'other', state: 'CANCELLED' }), false);
+	runtime.onActionResult(record(), { actionId: handle.actionId, state: 'CANCELLED', reasonCode: 'ACTION_CANCELLED' });
+	assert.equal((await pending).state, 'CANCELLED');
+});
+
+test('replace dispatches only after acknowledged cancellation and keeps model provenance', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) } });
+	const handle = await runtime.execute(nativeCall({ kind: 'start_action', actionType: 'wait', arguments: { durationMs: 100 } }), record());
+	const pending = runtime.execute(nativeCall({ kind: 'replace_action', actionId: handle.actionId, goalRevision: 3, actionType: 'look_at', arguments: { x: 2, y: 64, z: 3 } }), record());
+	await Promise.resolve();
+	assert.equal(sent.filter(([type]) => type === 'action_command').length, 1);
+	runtime.onActionResult(record(), { actionId: handle.actionId, state: 'CANCELLED', reasonCode: 'ACTION_CANCELLED' });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(sent[2][2].actionType, 'look_at');
+	assert.equal(sent[2][2].provenance.sourceStepId, 'call-new');
+	runtime.onActionResult(record(), { actionId: sent[2][2].actionId, state: 'SUCCEEDED', reasonCode: 'ACTION_COMPLETED' });
+	assert.equal((await pending).state, 'SUCCEEDED');
+});
+
+test('replacement stays unstarted if the previous action finishes before cancellation', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) } });
+	const handle = await runtime.execute(nativeCall({ kind: 'start_action', actionType: 'wait', arguments: { durationMs: 100 } }), record());
+	const pending = runtime.execute(nativeCall({ kind: 'replace_action', actionId: handle.actionId, goalRevision: 3, actionType: 'wait', arguments: { durationMs: 1 } }), record());
+	runtime.onActionResult(record(), { actionId: handle.actionId, state: 'SUCCEEDED', reasonCode: 'ACTION_COMPLETED' });
+	assert.equal((await pending).state, 'REPLACEMENT_NOT_STARTED');
+	assert.equal(sent.filter(([type]) => type === 'action_command').length, 1);
+});
+
+test('notebook scopes model notes and authoritative receipts to the observed world', async () => {
+	const writes = [];
+	const queries = [];
+	const receipts = [];
+	const sent = [];
+	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) }, notebook: {
+		writeNote: async (...args) => { writes.push(args); return { saved: true, provenance: 'model_note' }; },
+		query: async (...args) => { queries.push(args); return { notes: [], receipts: [] }; },
+		recordReceipt: async (...args) => { receipts.push(args); },
+	} });
+	runtime.updateObservation(record(), { world: { worldId: 'world-a', dimension: 'minecraft:overworld' } }, { eventSequence: 1 });
+	await runtime.execute(nativeCall({ kind: 'notebook', key: 'return-route', text: 'Bridge may be east.' }), record());
+	assert.deepEqual(writes[0], ['agent-a', { worldId: 'world-a', key: 'return-route', text: 'Bridge may be east.', goalRevision: 3, provenance: { provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'xhigh', serviceTier: 'fast', goalRevision: 3, turnId: 'turn-new', callId: 'call-new' } }]);
+	await runtime.execute(nativeCall({ kind: 'query_memory', memoryKind: 'notes', offset: 5, limit: 20, text: 'Bridge' }), record());
+	assert.deepEqual(queries[0], ['agent-a', { worldId: 'world-a', kind: 'notes', offset: 5, limit: 20, text: 'Bridge' }]);
+	const handle = await runtime.execute(nativeCall({ kind: 'start_action', actionType: 'wait', arguments: { durationMs: 1 } }), record());
+	runtime.onActionResult(record(), { actionId: handle.actionId, state: 'SUCCEEDED', reasonCode: 'ACTION_COMPLETED', actionObservation: { worldTick: 18 } });
+	await Promise.resolve();
+	assert.deepEqual(receipts[0], ['agent-a', { worldId: 'world-a', actionId: handle.actionId, goalRevision: 3, actionType: 'wait', state: 'SUCCEEDED', reasonCode: 'ACTION_COMPLETED', actionObservation: { worldTick: 18 }, tick: 18 }]);
+});
+
+test('spatial hydration replays queued observations before checkpoint persistence', async () => {
+	let hydrate;
+	const calls = [];
+	const runtime = new NativeToolRuntime({ bridge: { send: async () => {} }, occupancy: {
+		load: async () => { calls.push('load'); await new Promise((resolve) => { hydrate = resolve; }); calls.push('loaded'); },
+		ingest: (_agentId, observation) => calls.push(`ingest:${observation.world.gameTime}`),
+		flush: async () => calls.push('flush'),
+		clear: () => calls.push('clear'),
+		candidates: () => ({ kind: 'candidates', candidates: [], destination: null }),
+	} });
+	runtime.updateObservation(record(), { world: { gameTime: 1 } }, { eventSequence: 1 });
+	runtime.updateObservation(record(), { world: { gameTime: 2 } }, { eventSequence: 2 });
+	await Promise.resolve();
+	assert.deepEqual(calls, ['load']);
+	hydrate();
+	await runtime.initializeMemory('agent-a');
+	assert.deepEqual(calls, ['load', 'loaded', 'ingest:1', 'ingest:2']);
+	await runtime.dispose('agent-a', 'coordinator_stopped');
+	assert.deepEqual(calls.slice(-2), ['flush', 'clear']);
+});
+
+test('native action identities remain unique across runtime restarts and long agent identifiers', async () => {
+	const current = record({ agentId: 'agent-'.repeat(40) });
+	const handles = [];
+	for (let index = 0; index < 2; index++) {
+		const runtime = new NativeToolRuntime({ bridge: { send: async () => {} } });
+		const handle = await runtime.execute(nativeCall({ kind: 'start_action', actionType: 'wait', arguments: { durationMs: 1 } }, { agentId: current.agentId }), current);
+		assert.ok(handle.actionId.length <= 128);
+		handles.push(handle.actionId);
+		runtime.onActionResult(current, { actionId: handle.actionId, state: 'SUCCEEDED', reasonCode: 'ACTION_COMPLETED' });
+	}
+	assert.notEqual(handles[0], handles[1]);
+});
+
+test('fixture session identity is explicit and production runtimes remain random', async () => {
+	const runtime = new NativeToolRuntime({ sessionId: 'fixture-replay', bridge: { send: async () => {} } });
+	const handle = await runtime.execute(nativeCall({ kind: 'start_action', actionType: 'wait', arguments: { durationMs: 1 } }), record());
+	assert.match(handle.actionId, /^native:fixture-replay:1:/);
+	runtime.onActionResult(record(), { actionId: handle.actionId, state: 'SUCCEEDED', reasonCode: '' });
+	assert.throws(() => new NativeToolRuntime({ sessionId: 'unsafe session', bridge: { send: async () => {} } }), /sessionId/);
+	const handles = [];
+	for (let index = 0; index < 2; index++) {
+		const fixture = new NativeToolRuntime({ sessionId: 'fixture-'.padEnd(128, 'a'), bridge: { send: async () => {} } });
+		const result = await fixture.execute(nativeCall({ kind: 'start_action', actionType: 'wait', arguments: { durationMs: 1 } }), record());
+		handles.push(result.actionId);
+		assert.ok(result.actionId.length <= 128);
+		fixture.onActionResult(record(), { actionId: result.actionId, state: 'SUCCEEDED', reasonCode: '' });
+	}
+	assert.equal(handles[0], handles[1]);
+});
+
+test('capabilities and observe disclose effective settings without rewriting the selected profile', async () => {
+	const settings = { requested: { reasoningEffort: 'medium' }, effective: { reasoningEffort: 'high' }, mapping: 'provider supported level' };
+	const runtime = new NativeToolRuntime({ bridge: { send: async () => {} }, executionSettings: (current) => { assert.equal(current.model, record().model); return settings; } });
+	for (const kind of ['capabilities', 'observe']) {
+		const result = await runtime.execute(nativeCall({ kind }), record());
+		assert.deepEqual(result.executionSettings, settings);
+		result.executionSettings.effective.reasoningEffort = 'changed';
+		assert.equal(settings.effective.reasoningEffort, 'high');
+	}
+});
+
+test('native memory operations share the program helper contract and model provenance', async () => {
+	const calls = [];
+	const runtime = new NativeToolRuntime({ bridge: { send: async () => {} }, memoryOperation: async (current, operation) => { calls.push({ current, operation }); return { state: 'SUCCEEDED', reasonCode: 'MEMORY_QUERIED' }; } });
+	await runtime.execute(nativeCall({ kind: 'query_memory', memoryKind: 'receipts', offset: 64, limit: 32 }), record());
+	assert.deepEqual(calls[0].operation.arguments, { kind: 'receipts', offset: 64, limit: 32 });
+	assert.equal(calls[0].operation.operation, 'query');
+	assert.equal(calls[0].operation.provenance.model, record().model);
+	assert.equal(calls[0].operation.provenance.callId, 'call-new');
+});
+
+test('durable preparation fences dispatch and exact cancellation prevents a later send', async () => {
+	let release;
+	const sent = [];
+	const entries = [];
+	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) }, notebook: {
+		writeNote: async () => {}, query: async () => ({}), recordReceipt: async () => {},
+		recordDispatch: async (_agentId, entry) => { entries.push(entry); await new Promise((resolve) => { release = resolve; }); },
+		recordUnknown: async (_agentId, entry) => entries.push(entry),
+	} });
+	runtime.updateObservation(record(), { world: { worldId: 'world-a' } }, { eventSequence: 1 });
+	const pending = runtime.execute(nativeCall({ kind: 'start_action', actionType: 'wait', arguments: { durationMs: 100 } }), record());
+	await Promise.resolve();
+	assert.equal(sent.length, 0);
+	const handle = await runtime.execute(nativeCall({ kind: 'action_status' }), record());
+	assert.equal(handle.state, 'PREPARING');
+	const cancelled = await runtime.execute(nativeCall({ kind: 'cancel_action', actionId: handle.actionId, goalRevision: 3 }), record());
+	assert.equal(cancelled.executionStarted, false);
+	release();
+	assert.equal((await pending).reasonCode, 'CANCELLED_BEFORE_DISPATCH');
+	assert.equal(sent.length, 0);
+	assert.deepEqual(entries[0].arguments, { durationMs: 100 });
+});
+
+test('unknown delivery is inspectable and late terminal evidence cannot cancel a newer action', async () => {
+	const notebook = new ModelNotebook();
+	let fail = true;
+	const runtime = new NativeToolRuntime({ notebook, bridge: { send: async () => { if (fail) throw new Error('socket closed'); } } });
+	runtime.updateObservation(record(), { world: { worldId: 'world-a' } }, { eventSequence: 1 });
+	let unknownId;
+	await assert.rejects(runtime.execute(nativeCall({ kind: 'start_action', actionType: 'wait', arguments: { durationMs: 100 } }), record()), (error) => { unknownId = error.actionId; return error.message === 'socket closed'; });
+	assert.equal((await notebook.findReceipt('agent-a', { actionId: unknownId })).state, 'UNKNOWN');
+	const capabilities = await runtime.execute(nativeCall({ kind: 'capabilities' }), record());
+	assert.equal(capabilities.unresolvedActions.total, 1);
+	assert.equal(capabilities.unresolvedActions.entries[0].actionId, unknownId);
+	fail = false;
+	const next = await runtime.execute(nativeCall({ kind: 'start_action', actionType: 'wait', arguments: { durationMs: 1 } }), record());
+	assert.equal(runtime.onActionResult(record(), { actionId: unknownId, goalRevision: 3, state: 'SUCCEEDED', reasonCode: '', executionStarted: true }), true);
+	assert.equal((await runtime.execute(nativeCall({ kind: 'action_status' }), record())).actionId, next.actionId);
+	assert.equal((await notebook.findReceipt('agent-a', { actionId: unknownId })).state, 'SUCCEEDED');
+	runtime.onActionResult(record(), { actionId: next.actionId, goalRevision: 3, state: 'SUCCEEDED', reasonCode: '' });
+});
+
+test('restart reconciliation updates only matching durable native identities without execution', async () => {
+	const notebook = new ModelNotebook();
+	const actionId = 'native:previous-session:1:agent-a:2';
+	await notebook.recordDispatch('agent-a', { worldId: 'original-world', actionId, goalRevision: 2, actionType: 'wait', arguments: { durationMs: 100 } });
+	const sent = [];
+	const runtime = new NativeToolRuntime({ notebook, bridge: { send: async (...args) => sent.push(args) } });
+	const payload = { actionId, goalRevision: 2, actionType: 'wait', state: 'SUCCEEDED', reasonCode: '', executionStarted: true, actionObservation: { worldTick: 31 } };
+	assert.equal(await runtime.reconcileActionReceipt('agent-a', { ...payload, actionId: 'native:unknown' }), false);
+	assert.equal(await runtime.reconcileActionReceipt('agent-a', { ...payload, goalRevision: 3 }), false);
+	assert.equal(await runtime.reconcileActionReceipt('agent-a', payload), true);
+	assert.equal(await runtime.reconcileActionReceipt('agent-a', payload), true);
+	const saved = await notebook.findReceipt('agent-a', { actionId });
+	assert.equal(saved.worldId, 'original-world');
+	assert.equal(saved.state, 'SUCCEEDED');
+	assert.equal(saved.executionStarted, true);
+	assert.deepEqual(saved.arguments, { durationMs: 100 });
+	assert.equal(sent.length, 0);
+});
+
+test('authoritative result wins over a later bridge send error', async () => {
+	let runtime;
+	runtime = new NativeToolRuntime({ bridge: { send: async (_type, _agentId, payload) => {
+		runtime.onActionResult(record(), { actionId: payload.actionId, state: 'SUCCEEDED', reasonCode: '' });
+		throw new Error('late socket error');
+	} } });
+	const result = await runtime.execute(nativeCall({ kind: 'start_action', actionType: 'wait', arguments: { durationMs: 1 } }), record());
+	assert.equal(result.state, 'SUCCEEDED');
+	assert.equal((await runtime.execute(nativeCall({ kind: 'action_status', actionId: result.actionId }), record())).state, 'SUCCEEDED');
+});
+
+test('focused visible target retains its delivered causal baseline for exact body references', async () => {
+	const sent = [];
+	const targetId = '24f7bbba-c3a7-41e7-831b-bec7291dbb23';
+	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) }, inspectObservation: async () => ({ eventSequence: 8, entries: [{ uuid: targetId }] }) });
+	runtime.updateObservation(record(), { world: { worldId: 'world-a' }, entities: [] }, { eventSequence: 7 });
+	await runtime.execute(nativeCall({ kind: 'inspect', section: 'entities', offset: 20, limit: 10 }), record());
+	runtime.updateObservation(record(), { world: { worldId: 'world-a' }, entities: [] }, { eventSequence: 9 });
+	const handle = await runtime.execute(nativeCall({ kind: 'start_action', actionType: 'attack', arguments: { targetId, timeoutMs: 1000 } }), record());
+	assert.equal(sent[0][2].provenance.eventSequence, 8);
+	runtime.onActionResult(record(), { actionId: handle.actionId, state: 'FAILED', reasonCode: 'TARGET_NOT_VISIBLE' });
+});
+
+test('newly observed visible targets replace stale focused baselines for direct and program actions', async () => {
+	const sent = [];
+	const targetId = '24f7bbba-c3a7-41e7-831b-bec7291dbb23';
+	let runtime;
+	runtime = new NativeToolRuntime({ bridge: { send: async (...args) => {
+		sent.push(args);
+		if (args[0] === 'action_command') queueMicrotask(() => runtime.onActionResult(record(), { actionId: args[2].actionId, state: 'FAILED', reasonCode: 'OUT_OF_REACH' }));
+	} }, inspectObservation: async () => ({ section: 'entities', eventSequence: 1, entries: [{ uuid: targetId }] }) });
+	runtime.updateObservation(record(), { player: { health: 20 }, entities: [] }, { eventSequence: 1 });
+	await runtime.execute(nativeCall({ kind: 'inspect', section: 'entities', offset: 0, limit: 1 }), record());
+	for (const identity of ['uuid', 'stableId']) {
+		runtime.updateObservation(record(), { player: { health: 20 }, entities: [{ [identity]: targetId }] }, { eventSequence: identity === 'uuid' ? 5000 : 5001 });
+		await runtime.execute(nativeCall({ kind: 'action', actionType: 'attack', arguments: { targetId, timeoutMs: 1000 } }), record());
+		assert.equal(sent.at(-1)[2].provenance.eventSequence, identity === 'uuid' ? 5000 : 5001);
+	}
+	await runtime.execute(nativeCall({ kind: 'run_program', source: `program.onUnhandledAttention("continue_and_notify"); await player.attack({ targetId: "${targetId}", timeoutMs: 1000 });` }), record());
+	assert.equal(sent.at(-1)[2].provenance.eventSequence, 5001);
+});
+
+test('native programs preserve selected authorship and refresh before a dependent command', async () => {
+	const notebook = new ModelNotebook();
+	const sent = [];
+	let sequence = 1;
+	const observation = { world: { worldId: 'world-a' }, player: { x: 0, y: 64, z: 0, health: 20 }, blocks: [], entities: [], items: [], inventory: { items: [], tagCounts: {} } };
+	let runtime;
+	runtime = new NativeToolRuntime({ notebook, bridge: { send: async (...args) => {
+		sent.push(args);
+		if (args[0] === 'action_command') queueMicrotask(() => runtime.onActionResult(record(), { actionId: args[2].actionId, state: 'SUCCEEDED', reasonCode: '', executionStarted: true }));
+	} }, requestObservation: async () => ({ observation, eventSequence: ++sequence }) });
+	runtime.updateObservation(record(), observation, { eventSequence: sequence });
+	const result = await runtime.execute(nativeCall({ kind: 'run_program', source: 'program.onUnhandledAttention("continue_and_notify"); await world.remember({ key: "intent", text: "I chose two waits." }); await player.wait(2); await player.wait(3);', maxActions: 4, timeoutMs: 5000 }), record());
+	assert.equal(result.reasonCode, 'PROGRAM_EXHAUSTED');
+	assert.deepEqual(sent.map(([, , payload]) => payload.arguments.durationMs), [2, 3]);
+	assert.deepEqual(sent.map(([, , payload]) => payload.provenance.eventSequence), [1, 2]);
+	assert.ok(sent.every(([, , payload]) => payload.provenance.model === record().model && payload.provenance.reasoningEffort === record().reasoningEffort && payload.provenance.serviceTier === record().serviceTier));
+	assert.match(sent[0][2].provenance.programId, /^native-program-/);
+	assert.match(result.receipts[0].bodyActionId, /^native:/);
+	assert.equal((await notebook.query('agent-a', { worldId: 'world-a', kind: 'notes' })).entries[0].provenance.programId, sent[0][2].provenance.programId);
+});
+
+test('native program cancellation fences its next step and disposal releases its body', async () => {
+	const sent = [];
+	let runtime;
+	runtime = new NativeToolRuntime({ bridge: { send: async (...args) => {
+		sent.push(args);
+		if (args[0] === 'action_cancel') queueMicrotask(() => runtime.onActionResult(record(), { actionId: args[2].actionId, goalRevision: 3, state: 'CANCELLED', reasonCode: 'ACTION_CANCELLED' }));
+	} } });
+	runtime.updateObservation(record(), { player: { x: 0, y: 64, z: 0, health: 20 }, inventory: { items: [] } }, { eventSequence: 1 });
+	const pending = runtime.execute(nativeCall({ kind: 'run_program', source: 'program.onUnhandledAttention("pause_and_notify"); await player.wait(100); await player.wait(3);' }), record());
+	await Promise.resolve();
+	await assert.rejects(runtime.execute(nativeCall({ kind: 'start_action', actionType: 'wait', arguments: { durationMs: 1 } }), record()), { code: 'NATIVE_PROGRAM_IN_PROGRESS' });
+	await runtime.dispose('agent-a', 'goal_changed');
+	const result = await pending;
+	assert.notEqual(result.state, 'SUCCEEDED');
+	assert.equal(sent.filter(([type]) => type === 'action_command').length, 1);
+	assert.ok(sent.some(([type]) => type === 'action_cancel'));
+});
+
+test('focused inspection binds only the page entries actually delivered after native compaction', async () => {
+	const entries = Array.from({ length: 20 }, (_, index) => ({ uuid: `00000000-0000-0000-0000-${String(index).padStart(12, '0')}`, text: 'x'.repeat(2000) }));
+	const sent = [];
+	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) }, inspectObservation: async () => ({ eventSequence: 8, offset: 0, entries }) });
+	runtime.updateObservation(record(), { player: { health: 20 } }, { eventSequence: 7 });
+	const page = await runtime.execute(nativeCall({ kind: 'inspect', section: 'entities', offset: 0, limit: 20 }), record());
+	assert.ok(page.entries.length > 0 && page.entries.length < entries.length);
+	for (const [targetId, expected] of [[page.entries[0].uuid, 8], [entries.at(-1).uuid, 7]]) {
+		const handle = await runtime.execute(nativeCall({ kind: 'start_action', actionType: 'attack', arguments: { targetId, timeoutMs: 1000 } }), record());
+		assert.equal(sent.at(-1)[2].provenance.eventSequence, expected);
+		runtime.onActionResult(record(), { actionId: handle.actionId, state: 'FAILED', reasonCode: 'TARGET_NOT_VISIBLE' });
+	}
 });

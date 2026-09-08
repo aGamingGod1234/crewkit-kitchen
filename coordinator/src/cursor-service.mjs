@@ -9,6 +9,7 @@ import { recordProviderTurn } from './provider-turn-recorder.mjs';
 import { buildProviderPlannerPrompt } from './prompts.mjs';
 import { createSessionMetadata, profileFingerprint } from './provider-session.mjs';
 import { reportVisibleOutput } from './verbose-output.mjs';
+import { createExecutionSettings } from './provider-identity.mjs';
 
 const DEFAULT_MODELS = Object.freeze(['composer-2.5', 'grok-4.5', 'grok-4.6']);
 const DEFAULT_REASONING = Object.freeze({
@@ -238,6 +239,13 @@ class CursorAgent {
 	get serviceTier() { return this.#profile.serviceTier; }
 	get sessionGeneration() { return this.#sessionGeneration; }
 	get profileFingerprint() { return profileFingerprint(this.#profile); }
+	get executionSettings() {
+		return createExecutionSettings(this.#profile, {
+			transport: 'cursor_cli', controlProtocol: 'arena_script', modelSelector: cursorModelSpec(this.#profile),
+			evidence: { model: 'launch_argument', reasoningEffort: 'launch_argument', serviceTier: 'launch_argument' },
+			limitations: ['effective_settings_not_reported_by_provider'],
+		});
+	}
 	sessionMetadata() {
 		return createSessionMetadata(this.#profile, { sessionGeneration: this.#sessionGeneration, sessionState: this.#sessionState, continuation: 'durable', durability: 'provider', resetReason: this.#resetReason });
 	}
@@ -306,6 +314,7 @@ class CursorAgent {
 			}
 			outputHandled = true;
 			recordProviderTurn(turnRecorder, {
+				executionSettings: this.executionSettings,
 				agentId: this.agentId,
 				provider: 'cursor', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input: prompt, output: parseError === null ? result.result : '', error: structuredProviderError(parseError), timing,
@@ -315,6 +324,7 @@ class CursorAgent {
 			return decision;
 		} catch (error) {
 			if (!outputHandled) recordProviderTurn(turnRecorder, {
+				executionSettings: this.executionSettings,
 				agentId: this.agentId,
 				provider: 'cursor', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input: prompt, output: rawOutput, error, timing,

@@ -6,6 +6,7 @@ import { DynamicAgentState } from '../src/agent-registry.mjs';
 import { ControlLatencyRegistry } from '../src/control-latency-registry.mjs';
 import { PlanningScheduler } from '../src/planning-scheduler.mjs';
 import { profileFingerprint } from '../src/provider-session.mjs';
+import { createExecutionSettings } from '../src/provider-identity.mjs';
 
 const AGENT_ID = 'agent-1';
 const GOAL_REVISION = 7;
@@ -23,6 +24,52 @@ const VALID_DECISION = Object.freeze({
 	source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(100);',
 });
 
+test('native planner renews healthy tool work without letting provider events shorten its body budget', async () => {
+	let now = 0;
+	const timers = [];
+	const scheduler = new PlanningScheduler({
+		maxConcurrent: 1, maxPending: 0, now: () => now,
+		scheduleTimeout(callback, delay) { const timer = { callback, delay }; timers.push(timer); return timer; }, cancelTimeout() {},
+	});
+	const record = { ...RECORD, provider: 'codex', model: 'gpt-5.6-sol' };
+	let options;
+	let finishTurn;
+	let finishBody;
+	const body = new Promise((resolve) => { finishBody = resolve; });
+	const reportedProgress = [];
+	const agent = {
+		async setGoalRevision() {},
+		act(_input, value) { options = value; return new Promise((resolve) => { finishTurn = resolve; }); },
+	};
+	const planner = new AgentPlanner({
+		registry: { assertCurrentRevision: () => record, setState() {} }, scheduler,
+		codexService: { async createAgent() { return agent; }, getAgent() { return agent; } },
+	});
+	const run = planner.requestNativeTurn({ agentId: AGENT_ID, input: 'perform selected action', goalRevision: GOAL_REVISION, executeTool: () => body, onProgress: (event) => reportedProgress.push(event) });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(reportedProgress, [], 'scheduler admission does not invent provider progress');
+	now = 120_000;
+	options.onProgress({ phase: 'provider' });
+	const beforeBody = timers.at(-1);
+	const executing = options.executeTool({ tool: { kind: 'action', actionType: 'wait', arguments: { durationMs: 200_000 } } });
+	const bodyTimer = timers.at(-1);
+	assert.equal(bodyTimer.delay, 205_000);
+	options.onProgress({ phase: 'provider' });
+	assert.equal(timers.at(-1), bodyTimer);
+	assert.deepEqual(reportedProgress, [{ phase: 'provider' }, { phase: 'provider' }]);
+	now = 250_000;
+	beforeBody.callback();
+	assert.equal(options.signal.aborted, false, 'the healthy body survives the old planning deadline');
+	finishBody({ state: 'SUCCEEDED' });
+	await executing;
+	assert.equal(timers.at(-1).delay, 125_000);
+	finishTurn({ status: 'completed', toolCalls: 1 });
+	assert.equal((await run).status, 'completed');
+	options.onProgress({ phase: 'provider' });
+	assert.equal(reportedProgress.length, 2, 'settled turns cannot renew outer supervision');
+	scheduler.close();
+});
+
 test('provider profile fingerprints include the exact agent identity', () => {
 	assert.notEqual(
 		profileFingerprint(RECORD),
@@ -33,6 +80,7 @@ test('provider profile fingerprints include the exact agent identity', () => {
 test('goal spec translation uses an isolated structured provider session without changing lifecycle state', async () => {
 	const registry = new FakeRegistry();
 	const calls = [];
+	const turnRecorder = { record() {} };
 	const service = {
 		async createAgent(profile, options) {
 			calls.push({ type: 'create', profile, options });
@@ -50,7 +98,7 @@ test('goal spec translation uses an isolated structured provider session without
 		getAgent() { return null; },
 		async removeAgent(agentId) { calls.push({ type: 'remove', agentId }); return true; },
 	};
-	const planner = createPlannerForService(registry, service);
+	const planner = createPlannerForService(registry, service, 1, { turnRecorder });
 	const proposal = await planner.requestGoalSpec({
 		agentId: AGENT_ID,
 		request: {
@@ -62,6 +110,9 @@ test('goal spec translation uses an isolated structured provider session without
 	assert.equal(calls.find(call => call.type === 'create').options.controlProtocol, 'goal_spec');
 	assert.notEqual(calls.find(call => call.type === 'create').profile.agentId, AGENT_ID);
 	assert.equal(typeof calls.find(call => call.type === 'decide').decisionOptions.parseOutput, 'function');
+	assert.equal(calls.find(call => call.type === 'decide').decisionOptions.turnRecorder, turnRecorder);
+	assert.equal(calls.find(call => call.type === 'decide').decisionOptions.attempt, 1);
+	assert.equal(calls.find(call => call.type === 'decide').decisionOptions.retry, false);
 	assert.equal(calls.at(-1).type, 'remove');
 	assert.deepEqual(registry.states, []);
 });
@@ -800,6 +851,9 @@ test('planning lease expiry tears down only the matching exact provider generati
 
 test('native turn keeps scheduler and selected Codex profile while delegating body execution', async () => {
 	const nativeRecord = { ...RECORD, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'xhigh' };
+	const executionSettings = createExecutionSettings(nativeRecord, { transport: 'app_server', controlProtocol: 'native_tools' });
+	const turns = [];
+	const traceRows = [];
 	const states = [];
 	const registry = {
 		assertCurrentRevision(agentId, goalRevision) {
@@ -812,14 +866,19 @@ test('native turn keeps scheduler and selected Codex profile while delegating bo
 	const calls = [];
 	const executeTool = async () => ({ state: 'SUCCEEDED' });
 	const agent = {
+		get executionSettings() { return executionSettings; },
 		async setGoalRevision(revision) { calls.push(['revision', revision]); },
 		async act(input, options) {
+			executionSettings.effective.model = nativeRecord.model;
+			executionSettings.evidence.model = 'provider_reported';
 			calls.push(['act', input, options.goalRevision, options.executeTool]);
 			return { status: 'completed', toolCalls: 2 };
 		},
 	};
 	const planner = new AgentPlanner({
 		registry,
+		turnRecorder: { record(row) { turns.push(row); } },
+		recorder: { record(stage, _context, fields) { traceRows.push({ stage, ...fields }); } },
 		scheduler: {
 			schedule(_agentId, operation, options) { calls.push(['schedule', options]); return operation({ signal: new AbortController().signal }); },
 			cancel() { return false; },
@@ -841,6 +900,12 @@ test('native turn keeps scheduler and selected Codex profile while delegating bo
 	assert.deepEqual(calls.find((call) => call[0] === 'create')[2], { recoverySummary: null, controlProtocol: 'native_tools' });
 	assert.equal(typeof calls.find((call) => call[0] === 'act')[3], 'function');
 	assert.equal(states[0].state, DynamicAgentState.PLANNING);
+	assert.equal(turns.length, 1);
+	assert.equal(turns[0].executionSettings.effective.model, nativeRecord.model);
+	assert.equal(turns[0].executionSettings.effective.reasoningEffort, null);
+	assert.equal(traceRows.findLast((row) => row.stage === 'provider_response_completed').executionSettings.evidence.model, 'provider_reported');
+	executionSettings.effective.model = null;
+	assert.equal(turns[0].executionSettings.effective.model, nativeRecord.model, 'recorded attestation is a detached snapshot');
 });
 
 test('hung native turn releases scheduler capacity without tearing down a newer exact generation', async () => {
@@ -1013,8 +1078,9 @@ function createPlanner(registry, agent, invalidDecisionRetries) {
 	}, invalidDecisionRetries);
 }
 
-function createPlannerForService(registry, codexService, invalidDecisionRetries = 1) {
+function createPlannerForService(registry, codexService, invalidDecisionRetries = 1, options = {}) {
 	return new AgentPlanner({
+		...options,
 		registry,
 		invalidDecisionRetries,
 		scheduler: {

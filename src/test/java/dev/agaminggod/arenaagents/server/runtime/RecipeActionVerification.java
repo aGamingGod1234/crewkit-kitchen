@@ -28,11 +28,14 @@ public final class RecipeActionVerification {
 				Identifier.parse("minecraft:wooden_pickaxe")
 		);
 		assertFalse(recipeBook.contains(recipeKey), "recipe starts locked");
-		assertTrue(AdvancedInteractionService.ensureRecipeUnlocked(recipeBook, recipeKey),
-				"unlocks a requested recipe");
-		assertTrue(recipeBook.contains(recipeKey), "requested recipe is now available");
-		assertFalse(AdvancedInteractionService.ensureRecipeUnlocked(recipeBook, recipeKey),
-				"does not report a second unlock");
+		assertTrue(AdvancedInteractionService.recipeAllowed(recipeBook, recipeKey, false),
+				"ordinary crafting permits a known grid without granting a recipe unlock");
+		assertFalse(recipeBook.contains(recipeKey), "checking craft access leaves the recipe locked");
+		assertFalse(AdvancedInteractionService.recipeAllowed(recipeBook, recipeKey, true),
+				"limited crafting rejects a locked recipe");
+		recipeBook.add(recipeKey);
+		assertTrue(AdvancedInteractionService.recipeAllowed(recipeBook, recipeKey, true),
+				"limited crafting accepts an already unlocked recipe");
 
 		Map<String, Set<String>> loadedPlankRecipes = Map.of(
 				"minecraft:oak_planks", Set.of("minecraft:oak_log"),
@@ -62,7 +65,7 @@ public final class RecipeActionVerification {
 		assertEquals("RECIPE_PLACEMENT_REJECTED", AdvancedInteractionService.craftPlacementFailureReason(
 				net.minecraft.world.inventory.RecipeBookMenu.PostPlaceAction.NOTHING),
 				"successful placement has no missing-input diagnostic");
-		return 12;
+		return 13;
 	}
 
 	private static void expectFailure(String expectedCode, Runnable action, String label) {

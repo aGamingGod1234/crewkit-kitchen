@@ -5,5 +5,8 @@ public enum TraversalType {
 	WALK,
 	JUMP_UP,
 	JUMP_GAP,
-	DROP_DOWN
+	DROP_DOWN,
+	SWIM,
+	CLIMB,
+	CROUCH
 }

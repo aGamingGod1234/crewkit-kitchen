@@ -22,6 +22,7 @@ public final class GoalDraftAdvancementRevalidationVerification {
 		bindItemStackSize(Items.DIRT, 64);
 		int assertions = 0;
 		assertions += verifyRecursiveLiveIdentifiers();
+		assertions += verifyLiveAlternativeItemIdentifiers();
 		assertions += verifyRestartCapacityRevalidation();
 		return assertions;
 	}
@@ -88,6 +89,26 @@ public final class GoalDraftAdvancementRevalidationVerification {
 				nonAdvancement, ignored -> true, ignored -> false, ignored -> false);
 		pass("non-advancement predicates remain valid when no advancements are registered");
 		return 6;
+	}
+
+	private static int verifyLiveAlternativeItemIdentifiers() {
+		Set<String> liveItems = new LinkedHashSet<>(List.of("example:oak_log", "example:birch_log"));
+		Set<String> checkedItems = new LinkedHashSet<>();
+		GoalPredicate alternatives = new GoalPredicate.InventoryContainsAny(List.copyOf(liveItems), 12);
+		CodexAgentManager.validateLiveGoalIdentifiers(alternatives, itemId -> {
+			checkedItems.add(itemId);
+			return liveItems.contains(itemId);
+		}, ignored -> false, ignored -> false);
+		pass("a mixed-item inventory goal accepts live alternative items");
+		if (!checkedItems.equals(liveItems)) throw new AssertionError("every alternative item must be revalidated");
+		pass("a mixed-item inventory goal checks every listed item against the live registry");
+
+		liveItems.remove("example:birch_log");
+		expectCode("UNKNOWN_GOAL_IDENTIFIER", () -> CodexAgentManager.validateLiveGoalIdentifiers(
+				new GoalPredicate.AnyOf(List.of(new GoalPredicate.SurviveDuration(20), alternatives)),
+				liveItems::contains, ignored -> false, ignored -> false),
+				"a removed alternative item is rejected even when another branch or item remains valid");
+		return 3;
 	}
 
 	private static int verifyRestartCapacityRevalidation() {

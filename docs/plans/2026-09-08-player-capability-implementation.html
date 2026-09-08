@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Implementation status for general Minecraft player tools, text perception and model-authored control in Arena Agents.">
+  <title>Player capability implementation | Arena Agents</title>
+  <style>
+    :root { color-scheme:light; --paper:#f7f7f2; --ink:#202c32; --muted:#53616a; --line:#cdd4d1; --accent:#215d4a; --soft:#e7eee8; }
+    * { box-sizing:border-box; }
+    html { scroll-behavior:smooth; scroll-padding-top:22px; }
+    body { margin:0; background:var(--paper); color:var(--ink); font:16px/1.65 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    main { max-width:1100px; margin:auto; padding:36px 32px 64px; }
+    a { color:var(--accent); text-underline-offset:4px; }
+    a:focus-visible { outline:3px solid var(--accent); outline-offset:5px; }
+    .top { display:flex; justify-content:space-between; gap:20px; padding-bottom:20px; border-bottom:1px solid var(--line); font-size:.85rem; color:var(--muted); }
+    .brand { color:var(--ink); font-weight:700; letter-spacing:.03em; }
+    header { padding:54px 0 30px; }
+    .eyebrow { margin:0 0 16px; color:var(--accent); font-size:.78rem; font-weight:750; letter-spacing:.12em; text-transform:uppercase; }
+    h1,h2,h3 { line-height:1.13; letter-spacing:-.035em; }
+    h1 { max-width:890px; margin:0; font-size:clamp(2.45rem,6.1vw,4.5rem); font-weight:650; }
+    .lede { max-width:790px; margin:24px 0; color:var(--muted); font-size:1.12rem; }
+    p { margin:0 0 16px; }
+    .facts { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:26px; margin:30px 0 0; }
+    .facts div { border-top:1px solid var(--line); padding-top:12px; }
+    dt { font-size:.75rem; color:var(--muted); text-transform:uppercase; letter-spacing:.07em; }
+    dd { margin:4px 0 0; font-weight:600; }
+    nav { display:flex; flex-wrap:wrap; gap:10px 24px; padding:18px 0 24px; border-bottom:1px solid var(--line); font-size:.9rem; }
+    section { padding:36px 0; border-bottom:1px solid var(--line); }
+    h2 { margin:0 0 20px; font-size:clamp(1.65rem,3vw,2.15rem); font-weight:650; }
+    h3 { margin:0 0 10px; font-size:1.08rem; font-weight:650; }
+    .section-title { display:grid; grid-template-columns:52px minmax(0,1fr); gap:10px; }
+    .number { font-size:.82rem; color:var(--accent); padding-top:6px; font-variant-numeric:tabular-nums; }
+    .body { margin-left:62px; }
+    .body>p { max-width:840px; }
+    .decision { border-left:3px solid var(--accent); padding:1px 0 1px 20px; margin:22px 0 0; }
+    .decision p:last-child { margin-bottom:0; }
+    .muted { color:var(--muted); }
+    .loop { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); margin:24px 0; border-top:1px solid var(--line); border-bottom:1px solid var(--line); }
+    .loop div { padding:18px 15px; border-right:1px solid var(--line); }
+    .loop div:first-child { padding-left:0; }
+    .loop div:last-child { border-right:0; }
+    .loop b { display:block; margin-bottom:5px; font-weight:650; }
+    .loop span { display:block; color:var(--muted); font-size:.86rem; }
+    .loop .brain { background:var(--soft); }
+    table { width:100%; border-collapse:collapse; table-layout:fixed; font-size:.91rem; }
+    th { text-align:left; color:var(--muted); font-size:.73rem; text-transform:uppercase; letter-spacing:.07em; font-weight:650; }
+    th,td { vertical-align:top; padding:14px 18px 14px 0; border-bottom:1px solid var(--line); overflow-wrap:anywhere; }
+    th:first-child { width:25%; }
+    th:last-child,td:last-child { padding-right:0; }
+    td:first-child { font-weight:600; }
+    tbody tr:last-child td { border-bottom:0; }
+    .steps { list-style:none; padding:0; margin:0; counter-reset:step; }
+    .steps li { display:grid; grid-template-columns:36px minmax(0,1fr); gap:14px; padding:18px 0; border-bottom:1px solid var(--line); }
+    .steps li::before { counter-increment:step; content:counter(step,decimal-leading-zero); color:var(--accent); font-size:.84rem; }
+    .steps li:last-child { border-bottom:0; padding-bottom:0; }
+    .steps p { margin:0; }
+    footer { padding-top:26px; font-size:.81rem; color:var(--muted); display:flex; justify-content:space-between; gap:20px; }
+    @media(max-width:700px) {
+      main { padding:24px 20px 42px; }
+      header { padding-top:38px; }
+      .top { flex-direction:column; gap:4px; }
+      .facts { gap:14px; }
+      dd { font-size:.9rem; }
+      .section-title { grid-template-columns:30px minmax(0,1fr); gap:7px; }
+      .body { margin-left:0; }
+      .loop { grid-template-columns:1fr 1fr; }
+      .loop div { padding:15px!important; border-bottom:1px solid var(--line); }
+      .loop div:nth-child(2) { border-right:0; }
+      .loop div:nth-child(n+3) { border-bottom:0; }
+      table,tbody,tr,td { display:block; width:100%; }
+      thead { display:none; }
+      tr { padding:14px 0; border-bottom:1px solid var(--line); }
+      tr:last-child { border-bottom:0; }
+      td { padding:3px 0; border:0; }
+      td:first-child { font-size:1rem; margin-bottom:4px; }
+      footer { flex-direction:column; gap:4px; }
+    }
+    @media(max-width:380px) { .facts { grid-template-columns:1fr; gap:10px; } }
+    @media(prefers-reduced-motion:reduce) { html { scroll-behavior:auto; } }
+    @media print { body { background:white; } main { max-width:none; padding:0; } nav { display:none; } section,tr { break-inside:avoid; } a { color:inherit; } }
+  </style>
+</head>
+<body>
+<main>
+  <div class="top"><span class="brand">ARENA AGENTS / IMPLEMENTATION</span><span>8 September 2026</span></div>
+  <header>
+    <p class="eyebrow">Zero vision. Model-owned decisions.</p>
+    <h1>More player control for the same AI.</h1>
+    <p class="lede">General Minecraft tools, richer text facts, model-authored input programs and durable memory are implemented. The selected AI chooses how to use them for building, gathering, travel, combat and long tasks.</p>
+    <dl class="facts">
+      <div><dt>Implementation</dt><dd>Integrated</dd></div>
+      <div><dt>Automated checks</dt><dd>Passing</dd></div>
+      <div><dt>Live mechanics</dt><dd>9 of 9 passed</dd></div>
+    </dl>
+  </header>
+  <nav aria-label="Report sections"><a href="#authority">AI authority</a><a href="#delivered">Delivered upgrades</a><a href="#evidence">Verification</a><a href="#remaining">Remaining work</a><a href="https://r2e47k6e63x5.postplan.dev/">Approved plan</a></nav>
+
+  <section id="authority">
+    <div class="section-title"><span class="number">01</span><h2>The AI remains the brain</h2></div>
+    <div class="body">
+      <p>The AI chooses goals, targets, reactions and retry policy. It can author bounded programs that react to observed conditions. The executor follows those instructions, checks limits and releases expired inputs. Completion strategy remains model-authored.</p>
+      <div class="loop" role="group" aria-label="Control loop">
+        <div><b>Observe</b><span>Fresh text facts and focused detail queries.</span></div>
+        <div class="brain"><b>AI decides</b><span>Tool calls and conditional programs.</span></div>
+        <div><b>Execute</b><span>Ordinary player controls with bounded authority.</span></div>
+        <div><b>Verify</b><span>Actual results and uncertainty return to the AI.</span></div>
+      </div>
+      <p class="muted">The agent receives no rendered frames. The selected provider and settings remain in force; unsupported configurations remain explicit.</p>
+    </div>
+  </section>
+
+  <section id="delivered">
+    <div class="section-title"><span class="number">02</span><h2>What changed</h2></div>
+    <div class="body">
+      <table aria-label="Implemented player capabilities">
+        <thead><tr><th>System</th><th>Implemented change</th></tr></thead>
+        <tbody>
+          <tr><td>Shared tool contract</td><td>Native tools and ArenaScript share general controls, validation and capability descriptions. Actions support owned continuation, cancellation and factual outcome reporting.</td></tr>
+          <tr><td>Model-authored programs</td><td>Bounded conditions, input sequences and reactions carry model authority. Deterministic execution handles timing; the model supplies the behavior.</td></tr>
+          <tr><td>Queryable perception</td><td>Fresh observations and focused pages expose accessible blocks, entities, items, menus, text and events. Coverage and freshness distinguish missing information from current facts.</td></tr>
+          <tr><td>Menus and items</td><td>More item details, exact references, menu revisions, cursor operations, result accounting and text interactions support ordinary inventory and workstation use.</td></tr>
+          <tr><td>Movement</td><td>Navigation retains bounded 3D searches and reachable detours, with supported surface swimming, climbing and crouching. Raw player controls cover vehicle input and gliding.</td></tr>
+          <tr><td>Memory and settings</td><td>Observed places retain world, dimension and height. Model notes and action receipts preserve knowledge and uncertain outcomes. Requested and effective settings are inspectable.</td></tr>
+          <tr><td>Goal verification</td><td>Compact item sets let the model express a factual category goal. Minecraft checks the actual total across the permitted item IDs, with bounded size and no automatic gameplay strategy.</td></tr>
+          <tr><td>Natural-world evaluation</td><td>A runner creates fresh generated-world tasks across supported profiles, difficulties and evaluator-held seeds. Independent factual checks measure outcomes across general tasks.</td></tr>
+        </tbody>
+      </table>
+      <p class="muted">Implemented coverage is broader than the mechanics verified live so far. Vehicle and gliding controls do not imply autonomous navigation in those modes.</p>
+    </div>
+  </section>
+
+  <section id="evidence">
+    <div class="section-title"><span class="number">03</span><h2>What the checks establish</h2></div>
+    <div class="body">
+      <table aria-label="Verification results">
+        <thead><tr><th>Check</th><th>Current result</th></tr></thead>
+        <tbody>
+          <tr><td>Full Node suite</td><td><strong>1,630 passed.</strong> Three intentional platform skips. Covers tool contracts, runtime behavior, authority, memory and coordinator integration.</td></tr>
+          <tr><td>Java verification</td><td><strong>14,932 core assertions passed.</strong> The full build also passed 385 voice-addon assertions. These check validation and execution; they are not counts of completed gameplay tasks.</td></tr>
+          <tr id="live-result"><td>Live mechanics probe</td><td><strong>9 of 9 passed on Minecraft 26.1.2.</strong> Fresh observations, recipe and mechanics queries, control sequences, chest cursor transfers, consuming crafting clicks, swimming, ladder climbing and boat movement. These used operator-built fixtures and the production bridge without a model.</td></tr>
+          <tr><td>Natural-world task, Codex</td><td><strong>Passed in 68 seconds within a 180-second budget.</strong> Sol with low reasoning and priority service collected a log in a fresh survival world. Nine model-authored actions, zero vision, and independent inventory plus lifecycle checks.</td></tr>
+          <tr id="kimi-result"><td>Natural-world task, Kimi</td><td><strong>Timed out before gameplay.</strong> K3 with low reasoning and priority service returned no goal proposal or player action within 240 seconds. Its ACP goal-translation prompt exceeded 120 seconds; the underlying provider cause is unknown.</td></tr>
+          <tr><td>Full-game completion</td><td><strong>Not proved.</strong> A short gathering task does not establish full-game completion or a success rate across seeds and agent settings.</td></tr>
+        </tbody>
+      </table>
+      <p class="muted">Natural runs start with an empty inventory. Setup loads the saved spawn chunk and releases that ticket after joining; it supplies no items or terrain edits. Earlier setup, translation and provider failures are retained. Registered settings are verified; provider-effective settings remain unverified.</p>
+      <div class="decision"><p>There is no guarantee of a win on any seed or any agent setting. Available tools, game rules, provider availability, model decisions and run budgets all affect the outcome. Complex overlapping item requirements can still need clarification.</p></div>
+    </div>
+  </section>
+
+  <section id="remaining">
+    <div class="section-title"><span class="number">04</span><h2>Verified now, broader evaluation next</h2></div>
+    <div class="body">
+      <ol class="steps">
+        <li><div><h3>Live mechanics verified</h3><p>All nine checks passed. The probe verified four planks from one consumed log, exact chest stack transfers, upward water and ladder movement, and boat displacement from authored inputs.</p></div></li>
+        <li><div><h3>Build verified</h3><p>The full build passed and produced the mod distributable. The live probe exercised the production bridge and ordinary player interactions.</p></div></li>
+        <li><div><h3>Measure longer tasks and full-game attempts</h3><p>One fresh natural gathering task passed with Codex. Resolve the Kimi inference timeout, then measure broader tasks across supported profiles and seeds with declared budgets and retained failures.</p></div></li>
+      </ol>
+    </div>
+  </section>
+  <footer><span>Implementation verified. Full-game performance remains unproved.</span><a href="https://r2e47k6e63x5.postplan.dev/">Read the original approved plan</a></footer>
+</main>
+</body>
+</html>

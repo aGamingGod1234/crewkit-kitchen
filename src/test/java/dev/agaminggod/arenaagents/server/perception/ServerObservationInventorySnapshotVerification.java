@@ -56,6 +56,8 @@ public final class ServerObservationInventorySnapshotVerification {
 		assertions += verifyMutation(snapshot, fixture.player(),
 				() -> pickaxe.setDamageValue(1), "inventory item damage");
 		assertions += verifyMutation(snapshot, fixture.player(),
+				() -> pickaxe.set(DataComponents.CUSTOM_NAME, net.minecraft.network.chat.Component.literal("Renamed tool")), "inventory visible component");
+		assertions += verifyMutation(snapshot, fixture.player(),
 				() -> fixture.equipment().set(EquipmentSlot.HEAD, components.damageableStack(Items.IRON_HELMET)), "equipment");
 
 		TestMenu menu = new TestMenu(65);
@@ -77,7 +79,7 @@ public final class ServerObservationInventorySnapshotVerification {
 				() -> menu.setSlot(0, components.stack(Items.DIRT, 4)), "bounded menu slot");
 
 		menu.setSlot(64, components.stack(Items.GOLD_INGOT, 1));
-		assertFalse(snapshot.matchesAndUpdate(fixture.player()), "menu slots beyond the old 64-slot bound are ignored");
+		assertTrue(snapshot.matchesAndUpdate(fixture.player()), "menu slots beyond the old 64-slot bound are observed");
 		assertions += 1;
 		fixture.player().containerMenu = null;
 		assertFalse(snapshot.hasSameShape(fixture.player()), "closing a menu changes snapshot shape");

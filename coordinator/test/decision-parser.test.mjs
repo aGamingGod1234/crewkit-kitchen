@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import { parseDecision } from '../src/decision-parser.mjs';
 import { SCRIPT_PRIMITIVES } from '../src/arena-script/minecraft-api.mjs';
+import { ACTION_FIELDS } from '../src/constants.mjs';
 import {
 	buildPlannerInput,
 	buildProviderPlannerPrompt,
@@ -93,11 +94,11 @@ test('uses one selected-model ArenaScript contract and envelope schema', () => {
 	assert.match(PLANNER_SYSTEM_PROMPT, /multi-tree collection example/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /watcher example/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /compiler diagnostics.*correct/i);
-	assert.match(PLANNER_SYSTEM_PROMPT, /do not use Math/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /no ambient Math/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /no bracket.*computed.*optional member access/i);
-	assert.match(PLANNER_SYSTEM_PROMPT, /do not iterate factual candidate arrays/i);
-	assert.match(PLANNER_SYSTEM_PROMPT, /world\.nearest.*\.length/i);
-	assert.doesNotMatch(PLANNER_SYSTEM_PROMPT, /for \(const candidate of candidates\)/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /for \(const candidate of world\.entities\(criteria\)\)/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /128-iteration and 1024-operation budget/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /world\.nearest.*selects one observed candidate by distance/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /string concatenation.*both operands.*strings/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /do not concatenate numeric candidate fields/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /coordinate-free player\.respawn\(\)/i);
@@ -107,12 +108,7 @@ test('uses one selected-model ArenaScript contract and envelope schema', () => {
 	assert.match(PLANNER_SYSTEM_PROMPT, /craft.*exact registered recipe id/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /craft.*count.*minimum output.*one recipe execution/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /never retry the same action signature after a deterministic failure/i);
-	assert.deepEqual([...SCRIPT_PRIMITIVES].sort(), [
-		'anvil_rename', 'attack', 'block_with_shield', 'break_block', 'chat', 'craft_inventory', 'craft_table', 'dismount',
-		'drop_item', 'equip_item', 'furnace_transaction', 'interact_block', 'interact_entity', 'look_at',
-		'menu_button', 'menu_transfer', 'move_to', 'navigate_to', 'pick_up_item', 'place_block', 'respawn', 'select_item', 'select_tool', 'set_door',
-		'start_fall_flying', 'transfer_container', 'use_item', 'use_ranged', 'wait',
-	]);
+	assert.deepEqual([...SCRIPT_PRIMITIVES].sort(), Object.keys(ACTION_FIELDS).sort());
 	assert.doesNotMatch(PLANNER_SYSTEM_PROMPT, /default priority framework|preserve life before|prefer cooked food/i);
 	assert.deepEqual(PLANNER_OUTPUT_SCHEMA.required, ['summary', 'directive', 'source']);
 	assert.deepEqual(PLANNER_OUTPUT_SCHEMA.properties.directive, {

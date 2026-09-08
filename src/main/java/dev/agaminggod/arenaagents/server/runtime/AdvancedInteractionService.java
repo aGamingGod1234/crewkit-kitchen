@@ -10,12 +10,15 @@ import dev.agaminggod.arenaagents.server.runtime.transaction.TransactionPostcond
 import dev.agaminggod.arenaagents.server.runtime.transaction.TransactionSnapshot;
 import dev.agaminggod.arenaagents.server.runtime.transaction.UseConfirmation;
 import dev.agaminggod.arenaagents.server.runtime.menu.MenuCapabilityRegistry;
+import dev.agaminggod.arenaagents.server.runtime.menu.MenuInspection;
+import dev.agaminggod.arenaagents.server.runtime.menu.MenuStackIdentity;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
 import net.minecraft.core.BlockPos;
@@ -35,14 +38,20 @@ import net.minecraft.world.inventory.AbstractContainerMenu;
 import net.minecraft.world.inventory.AbstractCraftingMenu;
 import net.minecraft.world.inventory.AbstractFurnaceMenu;
 import net.minecraft.world.inventory.AnvilMenu;
+import net.minecraft.world.inventory.BeaconMenu;
 import net.minecraft.world.inventory.ChestMenu;
 import net.minecraft.world.inventory.CraftingMenu;
+import net.minecraft.world.inventory.CrafterMenu;
+import net.minecraft.world.inventory.ContainerInput;
 import net.minecraft.world.inventory.InventoryMenu;
 import net.minecraft.world.inventory.MerchantMenu;
 import net.minecraft.world.inventory.RecipeBookMenu;
 import net.minecraft.world.inventory.Slot;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.ShieldItem;
+import net.minecraft.world.effect.MobEffect;
+import net.minecraft.core.Holder;
+import net.minecraft.world.level.block.entity.BeaconBlockEntity;
 import net.minecraft.world.item.crafting.CraftingInput;
 import net.minecraft.world.item.crafting.CraftingRecipe;
 import net.minecraft.world.item.crafting.Recipe;
@@ -51,10 +60,13 @@ import net.minecraft.world.item.crafting.RecipeManager;
 import net.minecraft.world.item.crafting.RecipeType;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.level.gamerules.GameRules;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 
 public final class AdvancedInteractionService implements ServerTransactionAdapter {
-	private static final double MAX_INTERACTION_DISTANCE_SQUARED = 36.0D;
 	private static final long EQUIPMENT_TIMEOUT_MS = 5_000L;
 	private final ServerProtectionPolicy protection;
 	private final ResourceLeaseManager leases;
@@ -173,12 +185,10 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 		}
 	}
 
-	static boolean ensureRecipeUnlocked(ServerRecipeBook recipeBook, ResourceKey<Recipe<?>> recipeKey) {
+	static boolean recipeAllowed(ServerRecipeBook recipeBook, ResourceKey<Recipe<?>> recipeKey, boolean limitedCrafting) {
 		Objects.requireNonNull(recipeBook, "recipeBook must not be null");
 		Objects.requireNonNull(recipeKey, "recipeKey must not be null");
-		if (recipeBook.contains(recipeKey)) return false;
-		recipeBook.add(recipeKey);
-		return true;
+		return !limitedCrafting || recipeBook.contains(recipeKey);
 	}
 
 	static boolean craftOutputSatisfiesRequest(int outputCount, int requestedCount) {
@@ -208,6 +218,9 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 			case MENU_TRANSFER -> new MenuTransferTransaction(player, request, arguments);
 			case MENU_BUTTON -> new MenuButtonTransaction(player, request, arguments);
 			case ANVIL_RENAME -> new AnvilRenameTransaction(player, request, arguments);
+			case MENU_CLICK -> new MenuClickTransaction(player, request, arguments);
+			case MENU_CLOSE -> new MenuCloseTransaction(player, request, arguments);
+			case BEACON_EFFECTS -> new BeaconEffectsTransaction(player, request, arguments);
 			default -> throw new AgentDomainException("UNSUPPORTED_TRANSACTION", "Action is not a transaction adapter action");
 		};
 	}
@@ -217,11 +230,19 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 		String key = "block:" + level.dimension().identifier() + ":" + position.asLong();
 		if (!leases.acquire(key, id, System.currentTimeMillis(), 5_000L)) return Result.failed("RESOURCE_BUSY", "Door is leased");
 		try {
+			requireBlockPreflight(agent, position);
 			if (!protection.mayModifyBlock(agent, level, position)) return Result.failed("PROTECTION_DENIED", "Door mutation denied");
 			BlockState state = level.getBlockState(position);
 			if (!state.hasProperty(BlockStateProperties.OPEN)) return Result.failed("NOT_A_DOOR", "Block has no open property");
-			if (!level.setBlockAndUpdate(position, state.setValue(BlockStateProperties.OPEN, open))) return Result.failed("DOOR_REJECTED", "World rejected door state");
+			if (state.getValue(BlockStateProperties.OPEN) == open) return Result.succeeded("Door already has the requested state");
+			BlockHitResult hit = visibleBlockHit(agent, position);
+			InteractionResult interaction = agent.gameMode.useItemOn(agent, level, agent.getMainHandItem(), InteractionHand.MAIN_HAND, hit);
+			BlockState after = level.getBlockState(position);
+			if (!interaction.consumesAction() || !after.hasProperty(BlockStateProperties.OPEN)
+					|| after.getValue(BlockStateProperties.OPEN) != open) return Result.failed("DOOR_REJECTED", "Vanilla interaction did not produce the requested door state");
 			return Result.succeeded(open ? "Door opened" : "Door closed");
+		} catch (AgentDomainException exception) {
+			return Result.failed(exception.code(), safeMessage(exception));
 		} finally { leases.release(key, id); }
 	}
 
@@ -278,6 +299,7 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 		String leaseKey;
 		boolean menuOpened;
 		boolean executed;
+		boolean preserveCursor;
 
 		Transaction(ServerPlayer player, ServerActionRequest request, JsonObject arguments, long timeoutMs) {
 			this.player = player;
@@ -318,9 +340,9 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 					this::beforeCleanup,
 					() -> { if (player.isUsingItem()) player.stopUsingItem(); },
 					this::flushRetainedEscrow,
-					() -> returnCarried(player, player.containerMenu),
+					() -> { if (!preserveCursor) returnCarried(player, player.containerMenu); },
 					() -> { if (menuOpened) player.closeContainer(); },
-					() -> returnCarried(player, player.inventoryMenu),
+					() -> { if (!preserveCursor) returnCarried(player, player.inventoryMenu); },
 					() -> { if (leaseKey != null) leases.release(leaseKey, request.agentId()); }
 			));
 		}
@@ -391,7 +413,10 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 			}
 			MenuProvider provider = level.getBlockState(position).getMenuProvider(level, position);
 			if (provider == null) throw new AgentDomainException("UNSUPPORTED_MENU", "Target block has no server menu provider");
-			if (player.openMenu(provider).isEmpty()) {
+			AbstractContainerMenu previous = player.containerMenu;
+			BlockHitResult hit = visibleBlockHit(player, position);
+			InteractionResult interaction = player.gameMode.useItemOn(player, level, player.getMainHandItem(), InteractionHand.MAIN_HAND, hit);
+			if (!interaction.consumesAction() || player.containerMenu == previous) {
 				throw new AgentDomainException("MENU_OPEN_REJECTED", "Server rejected opening the target menu");
 			}
 			menuOpened = true;
@@ -426,43 +451,49 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 	private final class MenuTransferTransaction extends Transaction {
 		MenuTransferTransaction(ServerPlayer player, ServerActionRequest request, JsonObject arguments) {
 			super(player, request, arguments, arguments.get("timeoutMs").getAsLong());
+			preserveCursor = true;
 		}
 
 		@Override
 		TickResult execute(long nowEpochMs) {
 			if (executed) return TickResult.failed("TRANSACTION_CONFLICT", "Menu transfer executed more than once");
 			executed = true;
-			AbstractContainerMenu menu = requireCurrentSupportedMenu(player, text(arguments, "menuId"));
-			return transfer(
-					this,
-					player,
-					menu,
-					integer(arguments, "sourceSlot"),
-					integer(arguments, "destinationSlot"),
-					text(arguments, "expectedItemId"),
-					integer(arguments, "count"),
-					true
-			);
+			AbstractContainerMenu menu = requireMenuForAction(player, arguments);
+			return transferUsingMenuInput(player, menu, integer(arguments, "sourceSlot"),
+					integer(arguments, "destinationSlot"), text(arguments, "expectedItemId"), integer(arguments, "count"));
 		}
 	}
 
 	private final class MenuButtonTransaction extends Transaction {
 		MenuButtonTransaction(ServerPlayer player, ServerActionRequest request, JsonObject arguments) {
 			super(player, request, arguments, arguments.get("timeoutMs").getAsLong());
+			preserveCursor = true;
 		}
 
 		@Override
 		TickResult execute(long nowEpochMs) {
 			if (executed) return TickResult.failed("TRANSACTION_CONFLICT", "Menu button executed more than once");
 			executed = true;
-			AbstractContainerMenu menu = requireCurrentSupportedMenu(player, text(arguments, "menuId"));
+			AbstractContainerMenu menu = requireMenuForAction(player, arguments);
 			int buttonId = integer(arguments, "buttonId");
 			boolean accepted;
 			if (menu instanceof MerchantMenu merchant) {
+				if (buttonId < 0 || buttonId >= merchant.getOffers().size()) {
+					return TickResult.failed("MENU_BUTTON_REJECTED", "The requested merchant offer is not present");
+				}
+				menu.incrementStateId();
 				merchant.setSelectionHint(buttonId);
 				merchant.tryMoveItems(buttonId);
 				accepted = true;
+			} else if (menu instanceof CrafterMenu crafter) {
+				if (buttonId < 0 || buttonId >= 9 || menu.getSlot(buttonId).hasItem()) {
+					return TickResult.failed("MENU_BUTTON_REJECTED", "Only an empty crafter grid slot can be toggled");
+				}
+				menu.incrementStateId();
+				crafter.setSlotState(buttonId, crafter.isSlotDisabled(buttonId));
+				accepted = true;
 			} else {
+				menu.incrementStateId();
 				accepted = menu.clickMenuButton(player, buttonId);
 			}
 			if (!accepted) return TickResult.failed("MENU_BUTTON_REJECTED", "Vanilla menu rejected the requested button");
@@ -474,14 +505,16 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 	private final class AnvilRenameTransaction extends Transaction {
 		AnvilRenameTransaction(ServerPlayer player, ServerActionRequest request, JsonObject arguments) {
 			super(player, request, arguments, arguments.get("timeoutMs").getAsLong());
+			preserveCursor = true;
 		}
 
 		@Override
 		TickResult execute(long nowEpochMs) {
 			if (executed) return TickResult.failed("TRANSACTION_CONFLICT", "Anvil rename executed more than once");
 			executed = true;
-			AbstractContainerMenu current = requireCurrentSupportedMenu(player, text(arguments, "menuId"));
+			AbstractContainerMenu current = requireMenuForAction(player, arguments);
 			if (!(current instanceof AnvilMenu anvil)) return unsupportedMenu(current);
+			anvil.incrementStateId();
 			if (!anvil.setItemName(text(arguments, "name"))) {
 				return TickResult.failed("ANVIL_NAME_REJECTED", "Vanilla anvil rejected the requested name");
 			}
@@ -584,6 +617,130 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 		}
 	}
 
+	private final class MenuClickTransaction extends Transaction {
+		MenuClickTransaction(ServerPlayer player, ServerActionRequest request, JsonObject arguments) {
+			super(player, request, arguments, EQUIPMENT_TIMEOUT_MS);
+			preserveCursor = true;
+		}
+
+		@Override
+		TickResult execute(long nowEpochMs) {
+			if (executed) return TickResult.failed("TRANSACTION_CONFLICT", "Menu input was already applied");
+			executed = true;
+			AbstractContainerMenu menu = requireMenuSession(player, arguments);
+			int slotIndex = integer(arguments, "slot");
+			int button = integer(arguments, "button");
+			ContainerInput input = ContainerInput.valueOf(text(arguments, "clickType"));
+			validateMenuInput(slotIndex, button, input, menu.slots.size());
+			ItemStack observed = slotIndex == AbstractContainerMenu.SLOT_CLICKED_OUTSIDE
+					? menu.getCarried() : menu.getSlot(slotIndex).getItem();
+			String observedId = observed.isEmpty() ? "minecraft:air" : itemId(observed);
+			if (!observedId.equals(text(arguments, "expectedItemId")) || observed.getCount() != integer(arguments, "expectedCount")) {
+				return TickResult.failed("SOURCE_MISMATCH", "Observed slot identity or exact count changed before the input");
+			}
+			if (arguments.has("expectedFingerprint") && !MenuStackIdentity.fingerprint(observed, player.registryAccess())
+					.equals(text(arguments, "expectedFingerprint"))) {
+				return TickResult.failed("SOURCE_MISMATCH", "Observed item components changed before the input");
+			}
+			if ((input == ContainerInput.THROW || slotIndex == AbstractContainerMenu.SLOT_CLICKED_OUTSIDE && input == ContainerInput.PICKUP)
+					&& !protection.mayDropItem(player)) return TickResult.failed("PROTECTION_DENIED", "Item drop denied");
+			TransactionSnapshot before = snapshot(menu);
+			ItemStack cursorBefore = menu.getCarried().copy();
+			int experienceBefore = player.totalExperience;
+			menu.incrementStateId();
+			try {
+				menu.clicked(slotIndex, button, input, player);
+				menu.broadcastChanges();
+			} catch (RuntimeException mutationFailure) {
+				return TickResult.failed("MENU_INPUT_PARTIAL", "Vanilla input raised an exception after it began; inspect the current menu before deciding the next action: " + safeMessage(mutationFailure));
+			}
+			boolean changed = !before.equals(snapshot(menu)) || !ItemStack.matches(cursorBefore, menu.getCarried())
+					|| experienceBefore != player.totalExperience;
+			return TickResult.succeeded(changed ? "MENU_INPUT_APPLIED" : "MENU_INPUT_NO_CHANGE",
+					"Vanilla " + input.name() + " input applied once; containerId=" + menu.containerId + ", stateId=" + menu.getStateId()
+							+ (changed ? "; menu state changed" : "; no slot, cursor or experience change observed"));
+		}
+	}
+
+	private final class MenuCloseTransaction extends Transaction {
+		MenuCloseTransaction(ServerPlayer player, ServerActionRequest request, JsonObject arguments) {
+			super(player, request, arguments, EQUIPMENT_TIMEOUT_MS);
+			preserveCursor = true;
+		}
+
+		@Override
+		TickResult execute(long nowEpochMs) {
+			if (executed) return TickResult.failed("TRANSACTION_CONFLICT", "Menu close was already applied");
+			executed = true;
+			AbstractContainerMenu menu = requireMenuSession(player, arguments);
+			menu.incrementStateId();
+			if (menu == player.inventoryMenu) {
+				menu.removed(player);
+				menu.broadcastChanges();
+			} else {
+				player.closeContainer();
+			}
+			return TickResult.succeeded("MENU_CLOSED", "Vanilla menu close returned carried items and crafting inputs");
+		}
+	}
+
+	private final class BeaconEffectsTransaction extends Transaction {
+		BeaconEffectsTransaction(ServerPlayer player, ServerActionRequest request, JsonObject arguments) {
+			super(player, request, arguments, EQUIPMENT_TIMEOUT_MS);
+			preserveCursor = true;
+		}
+
+		@Override
+		TickResult execute(long nowEpochMs) {
+			if (executed) return TickResult.failed("TRANSACTION_CONFLICT", "Beacon input was already applied");
+			executed = true;
+			AbstractContainerMenu current = requireMenuSession(player, arguments);
+			if (!(current instanceof BeaconMenu beacon)) return unsupportedMenu(current);
+			Optional<Holder<MobEffect>> primary = beaconEffect(text(arguments, "primaryEffectId"));
+			Optional<Holder<MobEffect>> secondary = beaconEffect(text(arguments, "secondaryEffectId"));
+			validateBeaconSelection(beacon.getLevels(), primary, secondary);
+			ItemStack payment = beacon.getSlot(0).getItem();
+			if (!beacon.hasPayment() || !beacon.getSlot(0).mayPlace(payment)) {
+				return TickResult.failed("BEACON_PAYMENT_REQUIRED", "Place an accepted payment in the beacon slot first");
+			}
+			int paymentCount = payment.getCount();
+			beacon.incrementStateId();
+			try {
+				beacon.updateEffects(primary, secondary);
+				beacon.broadcastChanges();
+			} catch (RuntimeException mutationFailure) {
+				return TickResult.failed("MENU_INPUT_PARTIAL", "Beacon input raised an exception after it began; inspect current effects and payment: " + safeMessage(mutationFailure));
+			}
+			if (!Objects.equals(beacon.getPrimaryEffect(), primary.orElse(null))
+					|| !Objects.equals(beacon.getSecondaryEffect(), secondary.orElse(null))
+					|| beacon.getSlot(0).getItem().getCount() != paymentCount - 1) {
+				return TickResult.failed("MENU_INPUT_PARTIAL", "Beacon effects or payment did not match the requested vanilla input; inspect before continuing");
+			}
+			return TickResult.succeeded("BEACON_EFFECTS_SET", "Requested beacon effects applied and one payment consumed by vanilla");
+		}
+	}
+
+	private static Optional<Holder<MobEffect>> beaconEffect(String effectId) {
+		if (effectId.equals("none")) return Optional.empty();
+		Identifier identifier = Identifier.tryParse(effectId);
+		if (identifier == null) throw new AgentDomainException("UNKNOWN_EFFECT", "Beacon effect identifier is invalid");
+		return Optional.of(BuiltInRegistries.MOB_EFFECT.get(identifier)
+				.orElseThrow(() -> new AgentDomainException("UNKNOWN_EFFECT", "Requested effect is not registered")));
+	}
+
+	static void validateBeaconSelection(int levels, Optional<Holder<MobEffect>> primary, Optional<Holder<MobEffect>> secondary) {
+		if (primary.isEmpty()) throw new AgentDomainException("BEACON_PRIMARY_REQUIRED", "The beacon confirm button requires a primary effect");
+		boolean primaryAllowed = false;
+		for (int tier = 0; tier < Math.min(3, levels); tier++) {
+			if (BeaconBlockEntity.BEACON_EFFECTS.get(tier).contains(primary.get())) primaryAllowed = true;
+		}
+		if (!primaryAllowed) throw new AgentDomainException("BEACON_EFFECT_UNAVAILABLE", "The primary effect is unavailable at the current beacon level");
+		if (secondary.isPresent() && (levels < 4 || !secondary.equals(primary)
+				&& !BeaconBlockEntity.BEACON_EFFECTS.get(3).contains(secondary.get()))) {
+			throw new AgentDomainException("BEACON_EFFECT_UNAVAILABLE", "The secondary effect is not an available beacon choice");
+		}
+	}
+
 	private TickResult rollbackToolSelection(
 			Transaction owner,
 			int source,
@@ -648,7 +805,9 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 			if (!(holder.value() instanceof CraftingRecipe craftingRecipe)) {
 				return TickResult.failed("RECIPE_TYPE_MISMATCH", "Requested recipe is not a crafting recipe");
 			}
-			ensureRecipeUnlocked(player.getRecipeBook(), holder.id());
+			if (!recipeAllowed(player.getRecipeBook(), holder.id(), player.level().getGameRules().get(GameRules.LIMITED_CRAFTING))) {
+				return TickResult.failed("RECIPE_LOCKED", "Limited crafting requires an already unlocked recipe");
+			}
 			RecipeBookMenu recipeMenu = (RecipeBookMenu) menu;
 			AbstractCraftingMenu craftingMenu = (AbstractCraftingMenu) menu;
 			List<Slot> gridSlots = craftingMenu.getInputGridSlots();
@@ -912,6 +1071,48 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 				return TickResult.failed("SHIELD_RELEASE_NOT_OBSERVED", "Shield release was not observed after use started");
 			}
 			return TickResult.succeeded("SHIELD_BLOCK_CONFIRMED", "Shield use start and release were both observed");
+		}
+	}
+
+	private static TickResult transferUsingMenuInput(ServerPlayer player, AbstractContainerMenu menu,
+			int sourceIndex, int destinationIndex, String expectedItemId, int count) {
+		if (sourceIndex < 0 || destinationIndex < 0 || sourceIndex >= menu.slots.size()
+				|| destinationIndex >= menu.slots.size() || sourceIndex == destinationIndex) {
+			return TickResult.failed("INVALID_SLOT", "Source or destination menu slot is invalid");
+		}
+		Slot source = menu.getSlot(sourceIndex);
+		Slot destination = menu.getSlot(destinationIndex);
+		ItemStack sourceBefore = source.getItem().copy();
+		ItemStack destinationBefore = destination.getItem().copy();
+		requireExpectedStack(sourceBefore, expectedItemId, count);
+		if (!source.mayPickup(player)) return TickResult.failed("SOURCE_LOCKED", "Vanilla menu denied taking the source stack");
+		if (capacity(destination, sourceBefore) < count) return TickResult.failed("DESTINATION_REJECTED", "Destination cannot accept the requested stack");
+		if (!menu.getCarried().isEmpty()) return TickResult.failed("TRANSACTION_CONFLICT", "Exact transfer requires an empty cursor");
+		if (count != sourceBefore.getCount() && !source.mayPlace(sourceBefore)) {
+			return TickResult.failed("RESULT_COUNT_MISMATCH", "Take a complete result stack, or use individual menu inputs to manage the cursor");
+		}
+		menu.incrementStateId();
+		try {
+			menu.clicked(sourceIndex, 0, ContainerInput.PICKUP, player);
+			if (!ItemStack.matches(sourceBefore, menu.getCarried())) {
+				return TickResult.failed("MENU_INPUT_PARTIAL", "Vanilla source input changed the cursor unexpectedly; inspect the menu before continuing");
+			}
+			if (count == sourceBefore.getCount()) {
+				menu.clicked(destinationIndex, 0, ContainerInput.PICKUP, player);
+			} else {
+				for (int index = 0; index < count; index++) menu.clicked(destinationIndex, 1, ContainerInput.PICKUP, player);
+				menu.clicked(sourceIndex, 0, ContainerInput.PICKUP, player);
+			}
+			ItemStack destinationAfter = destination.getItem();
+			if (!menu.getCarried().isEmpty() || !ItemStack.isSameItemSameComponents(sourceBefore, destinationAfter)
+					|| destinationAfter.getCount() != destinationBefore.getCount() + count) {
+				return TickResult.failed("MENU_INPUT_PARTIAL", "Vanilla input did not produce the requested transfer; inspect current slots and cursor");
+			}
+			return TickResult.succeeded("TRANSACTION_CONFIRMED", "Requested stack moved with vanilla menu inputs; recipe inputs and costs follow vanilla rules");
+		} catch (RuntimeException mutationFailure) {
+			return TickResult.failed("MENU_INPUT_PARTIAL", "Vanilla input raised an exception after it began; inspect current menu state: " + safeMessage(mutationFailure));
+		} finally {
+			menu.broadcastChanges();
 		}
 	}
 
@@ -1188,12 +1389,7 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 
 	private static AbstractContainerMenu requireCurrentSupportedMenu(ServerPlayer player, String expectedMenuId) {
 		AbstractContainerMenu menu = player.containerMenu;
-		String actualMenuId;
-		try {
-			actualMenuId = BuiltInRegistries.MENU.getKey(menu.getType()).toString();
-		} catch (RuntimeException exception) {
-			throw new AgentDomainException("UNSUPPORTED_MENU", "Open menu has no registered vanilla type");
-		}
+		String actualMenuId = MenuInspection.menuId(menu);
 		if (!actualMenuId.equals(expectedMenuId)) {
 			throw new AgentDomainException(
 					"MENU_MISMATCH",
@@ -1201,7 +1397,44 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 			);
 		}
 		MenuCapabilityRegistry.requireSupported(actualMenuId);
+		if (player.isSpectator()) throw new AgentDomainException("MENU_READ_ONLY", "Spectators cannot change menu contents");
+		if (!menu.stillValid(player)) throw new AgentDomainException("MENU_NO_LONGER_VALID", "The open menu is no longer usable by this player");
 		return menu;
+	}
+
+	private static AbstractContainerMenu requireMenuSession(ServerPlayer player, JsonObject arguments) {
+		AbstractContainerMenu menu = requireCurrentSupportedMenu(player, text(arguments, "menuId"));
+		if (menu.containerId != integer(arguments, "containerId")) {
+			throw new AgentDomainException("MENU_MISMATCH", "The observed menu instance is no longer open");
+		}
+		if (menu.getStateId() != integer(arguments, "stateId")) {
+			throw new AgentDomainException("MENU_STATE_CHANGED", "Menu contents changed after observation; inspect the menu again");
+		}
+		return menu;
+	}
+
+	private static AbstractContainerMenu requireMenuForAction(ServerPlayer player, JsonObject arguments) {
+		boolean hasContainer = arguments.has("containerId");
+		boolean hasState = arguments.has("stateId");
+		if (hasContainer != hasState) throw new AgentDomainException("MENU_SESSION_REQUIRED", "Supply both containerId and stateId together");
+		return hasContainer ? requireMenuSession(player, arguments) : requireCurrentSupportedMenu(player, text(arguments, "menuId"));
+	}
+
+	static void validateMenuInput(int slot, int button, ContainerInput input, int slotCount) {
+		boolean outside = slot == AbstractContainerMenu.SLOT_CLICKED_OUTSIDE;
+		if ((!outside && (slot < 0 || slot >= slotCount))
+				|| outside && input != ContainerInput.PICKUP && input != ContainerInput.QUICK_CRAFT) {
+			throw new AgentDomainException("INVALID_SLOT", "Menu input requires a present slot or a supported outside click");
+		}
+		boolean valid = switch (input) {
+			case PICKUP, QUICK_MOVE, THROW, PICKUP_ALL -> button == 0 || button == 1;
+			case SWAP -> button >= 0 && button <= 8 || button == 40;
+			case CLONE -> button == 2;
+			case QUICK_CRAFT -> button >= 0 && button <= 10
+					&& AbstractContainerMenu.getQuickcraftHeader(button) <= 2
+					&& AbstractContainerMenu.getQuickcraftType(button) <= 2;
+		};
+		if (!valid) throw new AgentDomainException("INVALID_BUTTON", "Button is not valid for this vanilla menu input");
 	}
 
 	private static void requireBlockPreflight(ServerPlayer player, BlockPos position) {
@@ -1209,9 +1442,19 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 		if (!level.hasChunkAt(position)) {
 			throw new AgentDomainException("TARGET_NOT_LOADED", "Target chunk is not loaded");
 		}
-		if (player.distanceToSqr(Vec3.atCenterOf(position)) > MAX_INTERACTION_DISTANCE_SQUARED) {
+		if (!player.isWithinBlockInteractionRange(position, 0.0D)) {
 			throw new AgentDomainException("TARGET_TOO_FAR", "Target menu is out of reach");
 		}
+		visibleBlockHit(player, position);
+	}
+
+	private static BlockHitResult visibleBlockHit(ServerPlayer player, BlockPos position) {
+		BlockHitResult hit = player.level().clip(new ClipContext(player.getEyePosition(), Vec3.atCenterOf(position),
+				ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, player));
+		if (hit.getType() != HitResult.Type.BLOCK || !hit.getBlockPos().equals(position)) {
+			throw new AgentDomainException("TARGET_NOT_VISIBLE", "The target block is not visible along the interaction ray");
+		}
+		return hit;
 	}
 
 	private static boolean vanillaFurnaceMenu(AbstractContainerMenu menu) {

@@ -8,7 +8,7 @@ import test from 'node:test';
 import { AgentRegistry, DynamicAgentState } from '../src/agent-registry.mjs';
 import { AgentPlanner } from '../src/agent-planner.mjs';
 import { ControlLatencyRegistry } from '../src/control-latency-registry.mjs';
-import { createDynamicCoordinator, normalizeDynamicConfig, resolveDynamicCliRuntime, startVoiceWorker } from '../src/dynamic-main.mjs';
+import { createDynamicCoordinator as createProductionCoordinator, normalizeDynamicConfig, resolveDynamicCliRuntime, startVoiceWorker } from '../src/dynamic-main.mjs';
 import { PlanningScheduler } from '../src/planning-scheduler.mjs';
 import { ProviderService } from '../src/provider-service.mjs';
 import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
@@ -17,13 +17,27 @@ import { completionContract, withCompletionContract } from './fixtures/completio
 
 const SOURCE = 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2);';
 
+function createDynamicCoordinator(config, dependencies = {}) {
+	return createProductionCoordinator(config, { memoryDirectory: null, ...dependencies });
+}
+
 class FakeBridge extends EventEmitter {
 	ready = false;
 	sent = [];
+	connectionEpoch = 0;
+	connected = false;
+	serverInstanceId = null;
+	automaticInspections = true;
+	latestObservations = new Map();
+	latestSequences = new Map();
 	start() { this.ready = true; }
 	stop() { this.ready = false; }
 	async send(type, agentId, payload, options = {}) {
-		this.sent.push({ type, agentId, payload, connectionEpoch: options.connectionEpoch });
+		const message = { type, agentId, payload, connectionEpoch: options.connectionEpoch };
+		this.sent.push(message);
+		if (type === 'inspection_request' && this.automaticInspections) {
+			queueMicrotask(() => this.sampleInspection(message));
+		}
 		if (type === 'goal_completed') {
 			queueMicrotask(() => this.emit('goal_completion_result', {
 				agentId,
@@ -39,17 +53,59 @@ class FakeBridge extends EventEmitter {
 		}
 	}
 	emit(event, message) {
+		if (event === 'ready') {
+			const epoch = message.connectionEpoch ?? (this.connected && this.serverInstanceId === message.serverInstanceId ? this.connectionEpoch : this.connectionEpoch + 1);
+			if (epoch > this.connectionEpoch) {
+				this.connectionEpoch = epoch;
+				this.connected = true;
+				this.serverInstanceId = message.serverInstanceId;
+				this.latestObservations.clear();
+				this.latestSequences.clear();
+			}
+		}
+		if (event === 'disconnected' && (message?.connectionEpoch ?? this.connectionEpoch) === this.connectionEpoch) this.connected = false;
 		if (event === 'observation' && message?.payload?.observation !== undefined) {
 			const payload = message.payload;
-			return super.emit(event, { ...message, payload: factToWireObservation(payload.observation, payload.goalRevision, payload.eventSequence, payload.attention === true, payload.observedAtEpochMs ?? 1) });
+			message = { ...message, payload: factToWireObservation(payload.observation, payload.goalRevision, payload.eventSequence, payload.attention === true, payload.observedAtEpochMs ?? 1) };
+		}
+		if ((message?.connectionEpoch ?? this.connectionEpoch) === this.connectionEpoch) {
+			if (Number.isSafeInteger(message?.payload?.eventSequence)) {
+				this.latestSequences.set(message.agentId, Math.max(this.latestSequences.get(message.agentId) ?? 0, message.payload.eventSequence));
+			}
+			if (event === 'observation') this.latestObservations.set(message.agentId, structuredClone(message.payload));
 		}
 		return super.emit(event, message);
+	}
+
+	replyInspection(request, result, error = undefined) {
+		this.emit('inspection_result', {
+			connectionEpoch: request.connectionEpoch,
+			agentId: request.agentId,
+			payload: { requestId: request.payload.requestId, goalRevision: request.payload.goalRevision, ...(error === undefined ? { result } : { error }) },
+		});
+	}
+
+	sampleInspection(request) {
+		const previous = this.latestObservations.get(request.agentId);
+		if (previous?.goalRevision !== request.payload.goalRevision || request.connectionEpoch !== this.connectionEpoch) {
+			this.replyInspection(request, undefined, { code: 'STALE_REVISION', message: 'No current player sample is available' });
+			return;
+		}
+		assert.equal(request.payload.query.section, 'observation', 'focused fixture queries must provide their explicit response');
+		const observation = structuredClone(previous);
+		observation.eventSequence = (this.latestSequences.get(request.agentId) ?? previous.eventSequence) + 1;
+		observation.observedAtEpochMs += 1;
+		observation.attention = true;
+		observation.changedFacts = [];
+		this.emit('observation', { agentId: request.agentId, connectionEpoch: request.connectionEpoch, payload: observation });
+		this.replyInspection(request, { observation, eventSequence: observation.eventSequence });
 	}
 }
 
 class DeferredCompletionBridge extends FakeBridge {
 	async send(type, agentId, payload, options = {}) {
-		this.sent.push({ type, agentId, payload, connectionEpoch: options.connectionEpoch });
+		if (type === 'goal_completed') this.sent.push({ type, agentId, payload, connectionEpoch: options.connectionEpoch });
+		else await super.send(type, agentId, payload, options);
 	}
 }
 
@@ -1521,6 +1577,104 @@ test('native Codex control dispatches and returns a real body result inside one 
 		await run.coordinator.stop();
 	}
 });
+
+test('native reads use correlated fresh samples and focused pages while an action remains active', async () => {
+	const bridge = new FakeBridge();
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	const timers = new ManualTimerQueue();
+	const results = {};
+	planner.getExecutionSettings = () => ({ provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high' });
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		let call = 0;
+		const execute = (tool) => request.executeTool({ agentId: request.agentId, goalRevision: request.goalRevision, turnId: 'query-turn', callId: `query-${++call}`, tool });
+		results.handle = await execute({ kind: 'start_action', actionType: 'wait', arguments: { durationMs: 100 } });
+		results.facts = await execute({ kind: 'observe' });
+		results.status = await execute({ kind: 'action_status', actionId: results.handle.actionId });
+		bridge.automaticInspections = false;
+		results.page = await execute({ kind: 'inspect', section: 'inventory', offset: 8, limit: 2 });
+		return { status: 'completed', toolCalls: call };
+	};
+	const run = await start({ bridge, registry, planner, goalSchedule: timers.schedule, cancelGoalSchedule: timers.cancel, config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } } });
+	try {
+		bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Inspect my surroundings.' } });
+		bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 7, observation: { player: { x: 3, y: 64, z: 4, health: 17 } } } });
+		await eventually(() => bridge.sent.filter(({ type }) => type === 'inspection_request').length === 2);
+		const [sample, page] = bridge.sent.filter(({ type }) => type === 'inspection_request');
+		assert.deepEqual(sample.payload.query, { section: 'observation' });
+		assert.equal(sample.connectionEpoch, 1);
+		assert.equal(results.facts.freshness.fresh, true);
+		assert.equal(results.facts.freshness.afterEventSequence, 7);
+		assert.equal(results.facts.eventSequence, 8);
+		assert.equal(results.facts.observation.player.health, 17);
+		assert.deepEqual(results.facts.executionSettings, planner.getExecutionSettings());
+		assert.equal(results.status.state, 'RUNNING');
+		assert.equal(results.status.actionId, results.handle.actionId);
+		assert.deepEqual(page.payload.query, { section: 'inventory', offset: 8, limit: 2 });
+		const response = { entries: [{ slot: 8, itemId: 'minecraft:apple', count: 2 }], coverage: { offset: 8, returned: 1, hasMore: true, nextOffset: 9 }, eventSequence: 8 };
+		bridge.replyInspection(page, response);
+		await eventually(() => results.page !== undefined);
+		assert.deepEqual(results.page, response);
+		assert.equal(bridge.sent.filter(({ type }) => type === 'action_command').length, 1, 'read queries do not dispatch extra body actions');
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+for (const boundary of ['goal revision', 'disconnect', 'connection replacement']) {
+	test(`native inspection cancellation fences delayed replies across ${boundary}`, async () => {
+		const bridge = new FakeBridge();
+		bridge.automaticInspections = false;
+		const registry = new AgentRegistry();
+		const planner = new FakePlanner(registry);
+		const timers = new ManualTimerQueue();
+		const outcomes = [];
+		planner.requestNativeTurn = async (request) => {
+			planner.requests.push(request);
+			const outcome = await request.executeTool({ agentId: request.agentId, goalRevision: request.goalRevision, turnId: `query-${planner.requests.length}`, callId: 'observe', tool: { kind: 'observe' } })
+				.then((result) => ({ result }), (error) => ({ error }));
+			outcomes.push(outcome);
+			return { status: 'completed', toolCalls: 1 };
+		};
+		const run = await start({ bridge, registry, planner, goalSchedule: timers.schedule, cancelGoalSchedule: timers.cancel, config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } } });
+		try {
+			bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Read current surroundings.' } });
+			bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 1, y: 64, z: 0 } } } });
+			await eventually(() => bridge.sent.some(({ type }) => type === 'inspection_request'));
+			const oldQuery = bridge.sent.find(({ type }) => type === 'inspection_request');
+			if (boundary === 'goal revision') {
+				bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'steer', goalRevision: 2, goal: 'Read the changed surroundings.' } });
+			} else if (boundary === 'disconnect') {
+				bridge.emit('disconnected', { connectionEpoch: 1 });
+			} else {
+				bridge.emit('ready', { connectionEpoch: 2, serverInstanceId: 'test', registry: [{ ...record(), state: DynamicAgentState.STARTING, currentGoal: 'Read current surroundings.', goalRevision: 1 }] });
+			}
+			await eventually(() => outcomes.length === 1);
+			assert.equal(outcomes[0].error?.code, { disconnect: 'BRIDGE_DISCONNECTED', 'goal revision': 'INSPECTION_CANCELLED', 'connection replacement': 'STALE_CONNECTION_EPOCH' }[boundary]);
+			if (boundary === 'disconnect') {
+				await eventually(() => registry.get('agent-a').state === DynamicAgentState.DISCONNECTED);
+				bridge.emit('ready', { connectionEpoch: 2, serverInstanceId: 'test', registry: [{ ...record(), state: DynamicAgentState.STARTING, currentGoal: 'Read current surroundings.', goalRevision: 1 }] });
+				await eventually(() => bridge.sent.some(({ type, connectionEpoch }) => type === 'agent_ready' && connectionEpoch === 2));
+			}
+			const revision = boundary === 'goal revision' ? 2 : 1;
+			bridge.emit('observation', { agentId: 'agent-a', connectionEpoch: bridge.connectionEpoch, payload: { goalRevision: revision, eventSequence: 4, observation: { player: { x: 9, y: 64, z: 0 } } } });
+			await eventually(() => bridge.sent.filter(({ type }) => type === 'inspection_request').length === 2);
+			const currentQuery = bridge.sent.filter(({ type }) => type === 'inspection_request')[1];
+			bridge.replyInspection(oldQuery, { observation: factToWireObservation({ player: { x: 100, y: 64, z: 0 } }, 1, 99, true, 99), eventSequence: 99 });
+			await new Promise((resolve) => setImmediate(resolve));
+			assert.equal(outcomes.length, 1, 'retired correlation cannot settle the replacement query');
+			bridge.sampleInspection(currentQuery);
+			await eventually(() => outcomes.length === 2);
+			assert.equal(outcomes[1].error, undefined);
+			assert.equal(outcomes[1].result.observation.player.x, 9);
+			assert.equal(outcomes[1].result.eventSequence, 5);
+			assert.equal(outcomes[1].result.freshness.fresh, true);
+		} finally {
+			await run.coordinator.stop();
+		}
+	});
+}
 
 test('an unfinished native turn with no tools requests a fresh observation instead of stopping', async () => {
 	const timers = new ManualTimerQueue();

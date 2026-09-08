@@ -6,6 +6,7 @@ import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+import net.minecraft.world.level.block.state.properties.SlabType;
 
 public final class MinecraftNavigationWorldVerification {
 	private MinecraftNavigationWorldVerification() {
@@ -22,6 +23,10 @@ public final class MinecraftNavigationWorldVerification {
 				"farmland is real walkable support");
 		assertEquals(WalkabilityView.Cell.SAFE_SUPPORT, classify(Blocks.DIRT_PATH.defaultBlockState(), false),
 				"dirt paths are real walkable support");
+		assertEquals(WalkabilityView.Cell.SAFE_SUPPORT, classify(Blocks.WHITE_CARPET.defaultBlockState(), false),
+				"carpet support comes from actual collision instead of a block-name allowlist");
+		assertEquals(WalkabilityView.Cell.SAFE_SUPPORT, classify(Blocks.SOUL_SAND.defaultBlockState(), false),
+				"soul sand supports the player at its actual collision height");
 
 		BlockState closedDoor = Blocks.OAK_DOOR.defaultBlockState().setValue(BlockStateProperties.OPEN, false);
 		BlockState openDoor = closedDoor.setValue(BlockStateProperties.OPEN, true);
@@ -32,8 +37,8 @@ public final class MinecraftNavigationWorldVerification {
 
 		assertEquals(WalkabilityView.Cell.CLEAR, classify(Blocks.WATER.defaultBlockState(), true),
 				"bounded one-block-deep water is crossable");
-		assertEquals(WalkabilityView.Cell.HAZARD, classify(Blocks.WATER.defaultBlockState(), false),
-				"unbounded water remains hazardous");
+		assertEquals(WalkabilityView.Cell.WATER, classify(Blocks.WATER.defaultBlockState(), false),
+				"open water is represented separately so breathing clearance can govern traversal");
 		assertEquals(WalkabilityView.Cell.HAZARD, classify(Blocks.LAVA.defaultBlockState(), true),
 				"lava never inherits shallow-water traversal");
 		assertEquals(WalkabilityView.Cell.HAZARD, classify(Blocks.MAGMA_BLOCK.defaultBlockState(), false),
@@ -58,7 +63,12 @@ public final class MinecraftNavigationWorldVerification {
 				"empty space never invents support across a hole or cliff");
 		assertTrue(Double.isNaN(collisionHeight(Blocks.STONE.defaultBlockState(), 1.0D, 0.5D)),
 				"support from the adjacent block cannot complete a waypoint early");
-		return 17;
+		assertTrue(MinecraftNavigationWorld.crouchClearance(Blocks.STONE_SLAB.defaultBlockState()
+				.setValue(BlockStateProperties.SLAB_TYPE, SlabType.TOP)
+				.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO)), "a top slab leaves real clearance for a crouching player");
+		assertTrue(!MinecraftNavigationWorld.crouchClearance(Blocks.STONE_SLAB.defaultBlockState()
+				.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO)), "a bottom slab does not invent a crouch passage through solid collision");
+		return 21;
 	}
 
 	private static WalkabilityView.Cell classify(BlockState state, boolean boundedShallowWater) {

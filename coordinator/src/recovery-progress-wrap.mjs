@@ -3,7 +3,6 @@ import { extractDimension } from './explore-frontier.mjs';
 const MAX_PLACED = 16;
 const MAX_DROPPED = 16;
 const MAX_INVENTORY = 32;
-const MAX_DO_NOT_REDO = 24;
 export const MAX_EVER_POSSESSED = 128;
 const WORKSTATION_BLOCKS = new Set([
 	'minecraft:crafting_table',
@@ -24,49 +23,6 @@ const WORKSTATION_BLOCKS = new Set([
 	'minecraft:lodestone',
 	'minecraft:respawn_anchor',
 	'minecraft:end_portal_frame',
-]);
-
-const WOODEN_TOOLS = Object.freeze([
-	'minecraft:wooden_pickaxe',
-	'minecraft:wooden_axe',
-	'minecraft:wooden_sword',
-	'minecraft:wooden_shovel',
-	'minecraft:wooden_hoe',
-]);
-const STONE_TOOLS = Object.freeze([
-	'minecraft:stone_pickaxe',
-	'minecraft:stone_axe',
-	'minecraft:stone_sword',
-	'minecraft:stone_shovel',
-	'minecraft:stone_hoe',
-]);
-const IRON_TOOLS = Object.freeze([
-	'minecraft:iron_pickaxe',
-	'minecraft:iron_axe',
-	'minecraft:iron_sword',
-	'minecraft:iron_shovel',
-	'minecraft:iron_hoe',
-]);
-const GOLDEN_TOOLS = Object.freeze([
-	'minecraft:golden_pickaxe',
-	'minecraft:golden_axe',
-	'minecraft:golden_sword',
-	'minecraft:golden_shovel',
-	'minecraft:golden_hoe',
-]);
-const DIAMOND_TOOLS = Object.freeze([
-	'minecraft:diamond_pickaxe',
-	'minecraft:diamond_axe',
-	'minecraft:diamond_sword',
-	'minecraft:diamond_shovel',
-	'minecraft:diamond_hoe',
-]);
-const NETHERITE_TOOLS = Object.freeze([
-	'minecraft:netherite_pickaxe',
-	'minecraft:netherite_axe',
-	'minecraft:netherite_sword',
-	'minecraft:netherite_shovel',
-	'minecraft:netherite_hoe',
 ]);
 
 /**
@@ -129,32 +85,8 @@ export function hasDurableObservationFacts(observation) {
 		|| observation.world !== undefined;
 }
 
-/**
- * Recipes the two-call LLM should not restart given currently evidenced durable outputs.
- * Lost corpse stacks are not skip-redo: the player may recraft if the corpse is gone.
- */
-export function doNotRedoFor(possessed) {
-	const owned = [...new Set((Array.isArray(possessed) ? possessed : []).filter((value) => typeof value === 'string' && value.length > 0))];
-	const skip = [];
-	const seen = new Set();
-	const add = (itemId) => {
-		if (seen.has(itemId) || skip.length >= MAX_DO_NOT_REDO) return;
-		seen.add(itemId);
-		skip.push(itemId);
-	};
-	for (const family of TOOL_FAMILIES) {
-		const maxTier = owned.reduce((max, itemId) => {
-			if (toolFamily(itemId) !== family) return max;
-			return Math.max(max, toolTier(itemId));
-		}, -1);
-		if (maxTier >= 1) add(`minecraft:wooden_${family}`);
-		if (maxTier >= 2) add(`minecraft:stone_${family}`);
-		if (maxTier >= 3) add(`minecraft:iron_${family}`);
-	}
-	if (owned.includes('minecraft:crafting_table')) add('minecraft:crafting_table');
-	if (owned.includes('minecraft:furnace')) add('minecraft:furnace');
-	return skip;
-}
+/** Compatibility field only. Crafting decisions belong to the selected model. */
+export function doNotRedoFor() { return []; }
 
 function ingestObservation(record, observation) {
 	if (observation?.death !== undefined && observation.death !== null) {
@@ -385,24 +317,6 @@ function subtractRecovered(lost, recovered) {
 		}
 	}
 	return remaining.filter((item) => item.count > 0).slice(0, MAX_INVENTORY).map((item) => Object.freeze(item));
-}
-
-const TOOL_FAMILIES = Object.freeze(['pickaxe', 'axe', 'sword', 'shovel', 'hoe']);
-
-function toolFamily(itemId) {
-	if (typeof itemId !== 'string') return null;
-	const name = itemId.includes(':') ? itemId.slice(itemId.indexOf(':') + 1) : itemId;
-	const family = TOOL_FAMILIES.find((entry) => name.endsWith(`_${entry}`) || name === entry);
-	return family ?? null;
-}
-
-function toolTier(itemId) {
-	if (typeof itemId !== 'string') return -1;
-	if (NETHERITE_TOOLS.includes(itemId)) return 4;
-	if (DIAMOND_TOOLS.includes(itemId)) return 3;
-	if (IRON_TOOLS.includes(itemId)) return 2;
-	if (STONE_TOOLS.includes(itemId) || GOLDEN_TOOLS.includes(itemId)) return 1;
-	return -1;
 }
 
 function emptyRecord(goalRevision, lastDeath = null) {

@@ -7,7 +7,74 @@ import {
 	NATIVE_AGENT_INSTRUCTIONS,
 	normalizeMinecraftToolCall,
 	toolResultContent,
+	minecraftCapabilities,
 } from '../src/native-minecraft-tools.mjs';
+import { ACTION_FIELDS } from '../src/constants.mjs';
+import { parseArenaScript } from '../src/arena-script/parser.mjs';
+
+test('capabilities reflect the shared action contract without inventing fields', () => {
+	assert.deepEqual(minecraftCapabilities().actions.map(({ actionType, fields }) => ({ actionType, fields })), Object.entries(ACTION_FIELDS).map(([actionType, fields]) => ({ actionType, fields: [...fields] })));
+	assert.deepEqual(minecraftCapabilities().actions.find(({ actionType }) => actionType === 'use_item').optionalFields, ['hand', 'expectedItemId']);
+	const copy = minecraftCapabilities();
+	copy.actions[0].fields.push('invented');
+	assert.ok(!minecraftCapabilities().actions[0].fields.includes('invented'));
+	assert.deepEqual(normalizeMinecraftToolCall('capabilities', {}), { kind: 'capabilities' });
+	const reference = minecraftCapabilities({ section: 'program' });
+	assert.deepEqual(normalizeMinecraftToolCall('capabilities', { section: 'program' }), { kind: 'capabilities', section: 'program' });
+	assert.equal(JSON.parse(toolResultContent(reference).contentItems[0].text).reference, reference.reference);
+	assert.match(reference.reference, /program\.watch/);
+});
+
+test('inspection validates the exact server page and target contract', () => {
+	assert.deepEqual(normalizeMinecraftToolCall('inspect', { section: 'inventory', offset: 32 }), { kind: 'inspect', section: 'inventory', offset: 32, limit: 32 });
+	assert.deepEqual(normalizeMinecraftToolCall('inspect', { section: 'item', slot: 7, limit: 1 }), { kind: 'inspect', section: 'item', slot: 7, offset: 0, limit: 1 });
+	assert.deepEqual(normalizeMinecraftToolCall('inspect', { section: 'block', x: 1, y: 64, z: -2 }), { kind: 'inspect', section: 'block', x: 1, y: 64, z: -2, offset: 0, limit: 32 });
+	assert.equal(normalizeMinecraftToolCall('inspect', { section: 'recipes', recipeId: 'minecraft:crafting_table' }).recipeId, 'minecraft:crafting_table');
+	for (const args of [{ section: 'seed' }, { section: 'blocks', limit: 33 }, { section: 'blocks', offset: 4097 }, { section: 'item' }, { section: 'inventory', slot: 2 }, { section: 'block', x: 1, y: 64 }, { section: 'recipes', recipeId: 'invalid id' }, { section: 'menu', recipeId: 'minecraft:a' }]) {
+		assert.throws(() => normalizeMinecraftToolCall('inspect', args), { code: 'INVALID_MINECRAFT_TOOL_ARGUMENTS' });
+	}
+});
+
+test('action handles and memory queries reject ambiguous or unbounded requests', () => {
+	assert.deepEqual(normalizeMinecraftToolCall('startAction', { actionType: 'wait', arguments: { durationMs: 5 } }), { kind: 'start_action', actionType: 'wait', arguments: { durationMs: 5 } });
+	assert.deepEqual(normalizeMinecraftToolCall('cancelAction', { actionId: 'action-1', goalRevision: 4 }), { kind: 'cancel_action', actionId: 'action-1', goalRevision: 4 });
+	assert.deepEqual(normalizeMinecraftToolCall('queryMemory', {}), { kind: 'query_memory', memoryKind: 'all', offset: 0, limit: 20 });
+	assert.equal(normalizeMinecraftToolCall('notebook', { key: 'boundary', text: 'x'.repeat(2048) }).text.length, 2048);
+	for (const [name, args] of [['cancelAction', { actionId: 'action-1' }], ['replaceAction', { actionId: 'action-1', goalRevision: 4, actionType: 'teleport', arguments: {} }], ['notebook', { key: 'a', text: 'x'.repeat(2049) }], ['queryMemory', { kind: 'secret' }], ['queryMemory', { offset: -1 }], ['exploreFrontier', { seek: 'nether' }]]) {
+		assert.throws(() => normalizeMinecraftToolCall(name, args), { code: 'INVALID_MINECRAFT_TOOL_ARGUMENTS' });
+	}
+});
+
+test('oversized observations retain input identity, freshness and explicit omissions', () => {
+	const raw = {
+		eventSequence: 8, freshness: { fresh: true, eventSequence: 8 },
+		observation: {
+			player: { health: 15 }, inventory: { items: [] }, revision: 10,
+			coverage: { entities: { returned: 64, total: 80 } },
+			interaction: { attackCooldown: 0.8, menu: { menuId: 'menu-9', stateRevision: 3, slots: [] }, input: { active: true, hand: 'off_hand' } },
+			entities: Array.from({ length: 64 }, (_, id) => ({ id, name: 'x'.repeat(500) })),
+		},
+	};
+	const result = JSON.parse(toolResultContent(raw).contentItems[0].text);
+	assert.equal(result.truncated, true);
+	assert.deepEqual(result.freshness, raw.freshness);
+	assert.equal(result.observation.interaction.menu.stateRevision, 3);
+	assert.equal(result.observation.interaction.input.hand, 'off_hand');
+	assert.deepEqual(result.observation.coverage, raw.observation.coverage);
+	assert.ok(result.observation.resultCoverage.omittedSections.includes('entities'));
+});
+
+test('oversized inspection pages keep whole entries and a truthful continuation offset', () => {
+	const raw = { section: 'inventory', revision: 7, offset: 10, coverage: { total: 40, returned: 20 }, entries: Array.from({ length: 20 }, (_, index) => ({ slot: index + 10, components: { text: 'x'.repeat(1500) } })) };
+	const content = toolResultContent(raw).contentItems[0].text;
+	const result = JSON.parse(content);
+	assert.ok(Buffer.byteLength(content) <= 16_384);
+	assert.ok(result.entries.length > 0 && result.entries.length < raw.entries.length);
+	assert.deepEqual(result.entries, raw.entries.slice(0, result.entries.length));
+	assert.equal(result.nextOffset, 10 + result.entries.length);
+	assert.equal(result.revision, 7);
+	assert.equal(result.coverage.resultTruncated, true);
+});
 
 test('Minecraft control guidance examples are valid executor tool calls', async () => {
 	const skill = await readFile(new URL('../config/minecraft-agent/.codex/skills/minecraft-control/SKILL.md', import.meta.url), 'utf8');
@@ -40,14 +107,14 @@ test('Minecraft control reference covers every executor tool and action with acc
 		.find(({ name }) => name === 'act')
 		.inputSchema.properties.actionType.enum;
 
-	assert.ok(goodCalls.length >= expectedTools.length + expectedActions.length, 'expected one direct good example per tool and action');
 	assert.deepEqual([...new Set(goodCalls.map(({ tool }) => tool))].sort(), [...expectedTools].sort());
 	assert.deepEqual(
 		[...new Set(goodCalls.filter(({ tool }) => tool === 'act').map(({ arguments: args }) => args.actionType))].sort(),
 		[...expectedActions].sort(),
 	);
 	for (const { tool, arguments: args } of goodCalls) normalizeMinecraftToolCall(tool, args);
-	assert.ok(badCalls.length >= expectedTools.length + expectedActions.length, 'expected at least one rejected example per tool and action');
+	for (const { arguments: args } of goodCalls.filter(({ tool }) => tool === 'runProgram')) parseArenaScript(args.source);
+	assert.ok(badCalls.length >= 6, 'examples cover distinct malformed requests');
 	for (const { tool, arguments: args } of badCalls) {
 		assert.throws(() => normalizeMinecraftToolCall(tool, args), (error) => (
 			error?.code === 'INVALID_MINECRAFT_TOOL_ARGUMENTS' || error?.code === 'UNKNOWN_MINECRAFT_TOOL'
@@ -55,18 +122,35 @@ test('Minecraft control reference covers every executor tool and action with acc
 	}
 });
 
+test('program calls bound source bytes, action count and execution time', () => {
+	const source = 'program.onUnhandledAttention("pause_and_notify"); await player.wait(1);';
+	assert.deepEqual(normalizeMinecraftToolCall('runProgram', { source }), { kind: 'run_program', source, maxActions: 64, timeoutMs: 30000 });
+	for (const args of [{ source, maxActions: 257 }, { source, timeoutMs: 120001 }, { source: '😀'.repeat(20000) }, { source, planner: 'another-model' }]) assert.throws(() => normalizeMinecraftToolCall('runProgram', args), { code: 'INVALID_MINECRAFT_TOOL_ARGUMENTS' });
+});
+
+test('oversized program results preserve factual status, body receipt references and omissions', () => {
+	const raw = { state: 'YIELDED', reasonCode: 'PROGRAM_EXHAUSTED', programId: 'native-program-test', actions: 64, eventSequence: 100, receipts: Array.from({ length: 64 }, (_, index) => ({ actionId: `engine:${index}`, bodyActionId: `native:${index}`, actionType: 'wait', sourceStepId: `step-${index}`, state: index === 63 ? 'FAILED' : 'SUCCEEDED', reasonCode: index === 63 ? 'INPUT_REJECTED' : '', executionStarted: true })), observation: { player: { health: 20 }, detail: 'x'.repeat(30000) } };
+	const result = JSON.parse(toolResultContent(raw).contentItems[0].text);
+	assert.equal(result.programId, raw.programId);
+	assert.equal(result.state, 'YIELDED');
+	assert.equal(result.receipts.at(-1).bodyActionId, 'native:63');
+	assert.equal(result.receipts.at(-1).state, 'FAILED');
+	assert.equal(result.omittedReceipts + result.receipts.length, 64);
+	assert.ok(Buffer.byteLength(JSON.stringify(result)) <= 16384);
+});
+
 test('native Minecraft tools expose the common fast path plus one validated advanced body operation', () => {
 	assert.deepEqual(MINECRAFT_DYNAMIC_TOOLS.map((tool) => tool.name), [
-		'observe', 'lookAround', 'control', 'moveTo', 'exploreFrontier', 'mine', 'say', 'wait', 'act', 'sequence', 'finish',
+		'observe', 'capabilities', 'inspect', 'actionStatus', 'cancelAction', 'replaceAction', 'startAction', 'notebook', 'queryMemory', 'runProgram', 'lookAround', 'control', 'moveTo', 'exploreFrontier', 'mine', 'say', 'wait', 'act', 'sequence', 'finish',
 	]);
 	assert.ok(MINECRAFT_DYNAMIC_TOOLS.every((tool) => tool.type === 'function'));
 	assert.ok(NATIVE_AGENT_INSTRUCTIONS.length < 1_500);
-	assert.match(NATIVE_AGENT_INSTRUCTIONS, /Act as soon as it is safe/i);
+	assert.match(NATIVE_AGENT_INSTRUCTIONS, /you.*choose every action/i);
 	assert.match(MINECRAFT_DYNAMIC_TOOLS.find((tool) => tool.name === 'sequence').description, /Prefer sequence for safe 2\+ action chains/i);
 	assert.match(NATIVE_AGENT_INSTRUCTIONS, /speech playback is asynchronous/i);
 	assert.match(NATIVE_AGENT_INSTRUCTIONS, /exploreFrontier/);
-	assert.match(NATIVE_AGENT_INSTRUCTIONS, /death is the same goal/i);
-	assert.match(NATIVE_AGENT_INSTRUCTIONS, /visible landmarks/i);
+	assert.match(NATIVE_AGENT_INSTRUCTIONS, /death does not change the active goal/i);
+	assert.match(NATIVE_AGENT_INSTRUCTIONS, /omitted or unobserved facts are unknown/i);
 });
 
 test('advertised native actions exactly match Java model-authored dispatch', async () => {
@@ -104,10 +188,10 @@ test('native Minecraft tool calls normalize to exact existing body actions', () 
 		kind: 'action', actionType: 'navigate_to', arguments: { x: 1, y: 64, z: -2, tolerance: 1, sprint: true, timeoutMs: 30_000 },
 	});
 	assert.deepEqual(normalizeMinecraftToolCall('exploreFrontier', {}), {
-		kind: 'explore_frontier', arguments: { seek: 'any', radius: 24, timeoutMs: 15_000 },
+		kind: 'explore_frontier', arguments: { radius: 24, limit: 32 },
 	});
-	assert.deepEqual(normalizeMinecraftToolCall('exploreFrontier', { seek: 'nether', radius: 24, timeoutMs: 15_000 }), {
-		kind: 'explore_frontier', arguments: { seek: 'nether', radius: 24, timeoutMs: 15_000 },
+	assert.deepEqual(normalizeMinecraftToolCall('exploreFrontier', { blockId: 'minecraft:stone', radius: 24, limit: 16 }), {
+		kind: 'explore_frontier', arguments: { blockId: 'minecraft:stone', radius: 24, limit: 16 },
 	});
 	assert.deepEqual(normalizeMinecraftToolCall('mine', { x: 2, y: 63, z: 4, expectedBlockId: 'minecraft:stone' }), {
 		kind: 'action', actionType: 'break_block', arguments: { x: 2, y: 63, z: 4, expectedBlockId: 'minecraft:stone', timeoutMs: 15_000 },

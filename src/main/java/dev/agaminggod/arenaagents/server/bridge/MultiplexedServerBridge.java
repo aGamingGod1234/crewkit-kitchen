@@ -127,6 +127,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private static final int SERVER_TASKS_PER_TICK = 256;
 	private static final int OBSERVATION_HISTORY_CAPACITY = 4_096;
 	private static final int MAX_TARGET_IDS_PER_OBSERVATION = 64;
+	private static final int MAX_TARGET_IDS_WITH_INSPECTIONS = 320;
 	private static final int MAX_CONVERSATION_SOURCES_PER_AGENT = 16;
 	private static final long CATALOG_DISCOVERY_RETRY_BASE_NANOS = 50_000_000L;
 	private static final int CATALOG_DISCOVERY_MAX_BACKOFF_SHIFT = 6;
@@ -137,7 +138,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			"AI agent coordinator is offline; check logs/arena-agents-coordinator-error.log for the startup cause";
 	private static final Logger LOGGER = LoggerFactory.getLogger(MultiplexedServerBridge.class);
 	private static final Set<String> INBOUND_TYPES = Set.of(
-			"auth_challenge", "hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "conversation_wake_ack", "goal_spec_proposal", "request_observation", "action_command", "action_cancel", "action_result_ack", "agent_error", "verbose_event", "heartbeat"
+			"auth_challenge", "hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "conversation_wake_ack", "goal_spec_proposal", "request_observation", "inspection_request", "action_command", "action_cancel", "action_result_ack", "agent_error", "verbose_event", "heartbeat"
 	);
 
 	private final CodexAgentManager manager;
@@ -580,11 +581,20 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			JsonObject observation,
 			ObservationPublication.Writer writer,
 			boolean allowUnchanged) {
+		return publishObservationWithInputGuard(publication, inputController, agentId, sourceSession,
+				observation, writer, allowUnchanged, publication.fitter);
+	}
+
+	private static ObservationPublication.Result publishObservationWithInputGuard(
+			ObservationPublication publication, Optional<LeasedServerInputController> inputController,
+			AgentId agentId, Object sourceSession, JsonObject observation,
+			ObservationPublication.Writer writer, boolean allowUnchanged,
+			java.util.function.BiFunction<AgentId, JsonObject, ServerObservationWireBudget.Fitted> fitter) {
 		Objects.requireNonNull(publication, "publication must not be null");
 		Objects.requireNonNull(inputController, "input controller must not be null");
 		long revision = inputController.map(LeasedServerInputController::mutationRevision).orElse(-1L);
 		try {
-			return publication.publish(agentId, sourceSession, observation, writer, allowUnchanged);
+			return publication.publish(agentId, sourceSession, observation, writer, allowUnchanged, fitter);
 		} finally {
 			if (inputController.isPresent() && inputController.get().mutationRevision() != revision) {
 				throw new BridgeProtocolException(
@@ -919,7 +929,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			case "agent_ready", "planning_state", "goal_completed", "action_command", "action_cancel",
 					"action_result_ack" -> BoundedServerTaskQueue.Lane.URGENT;
 			case "coordinator_status", "conversation_wake_ack", "goal_spec_proposal",
-					"request_observation", "heartbeat" -> BoundedServerTaskQueue.Lane.CONTROL;
+					"request_observation", "inspection_request", "heartbeat" -> BoundedServerTaskQueue.Lane.CONTROL;
 			default -> BoundedServerTaskQueue.Lane.BULK;
 		};
 	}
@@ -1079,6 +1089,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			case "conversation_wake_ack" -> acceptConversationWakeAck(envelope);
 			case "goal_spec_proposal" -> acceptGoalSpecProposal(envelope);
 			case "request_observation" -> acceptObservationRequest(envelope);
+			case "inspection_request" -> acceptInspectionRequest(envelope);
 			case "action_command" -> acceptAction(envelope);
 			case "action_cancel" -> acceptActionCancel(envelope);
 			case "action_result_ack" -> acceptActionResultAck(envelope);
@@ -1209,6 +1220,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		switch (predicate) {
 			case GoalPredicate.InventoryContains value -> validateIdentifier(value.itemId(), candidates,
 					id -> BuiltInRegistries.ITEM.containsKey(id), "item");
+			case GoalPredicate.InventoryContainsAny value -> value.itemIds().forEach(
+					itemId -> validateIdentifier(itemId, candidates, id -> BuiltInRegistries.ITEM.containsKey(id), "item"));
 			case GoalPredicate.AdvancementGranted value -> validateIdentifier(value.advancementId(), candidates,
 					id -> manager.server().getAdvancements().get(id) != null, "advancement");
 			case GoalPredicate.EntityKilledByAgent value -> validateIdentifier(value.entityType(), candidates,
@@ -1252,6 +1265,122 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	private void acceptCoordinatorStatus(JsonObject payload) {
 		CoordinatorStatusStore.update(manager.server(), decodeCoordinatorStatus(payload, System.currentTimeMillis()));
+	}
+
+	private void acceptInspectionRequest(BridgeEnvelope envelope) {
+		AgentId id = AgentId.parse(envelope.agentId());
+		JsonObject payload = envelope.payload();
+		requireKeys(payload, Set.of("goalRevision", "requestId", "query"), "inspection_request");
+		AgentRecord record = manager.registry().require(id);
+		long revision = requiredLong(payload, "goalRevision");
+		String requestId = requiredString(payload, "requestId");
+		if (requestId.length() > 128) throw new BridgeProtocolException("INVALID_FIELD", "Invalid inspection request id");
+		Session source = session;
+		if (source == null) return;
+		JsonObject reply = new JsonObject();
+		reply.addProperty("goalRevision", revision);
+		reply.addProperty("requestId", requestId);
+		try {
+			if (revision != record.goalRevision()) throw new AgentDomainException("STALE_REVISION", "Inspection goal revision is stale");
+			if (!payload.get("query").isJsonObject()) throw new AgentDomainException("INVALID_INSPECTION", "query must be an object");
+			JsonObject query = validateInspectionQuery(payload.getAsJsonObject("query"));
+			String section = requiredString(query, "section");
+			if ("observation".equals(section)) {
+				observations.invalidate(id);
+				JsonObject observation = observations.collect(id);
+				ObservationPublication.Result published = publishObservationWithInputGuard(
+						observationPublication, AgentInputRuntime.existingController(manager.server()), id, source, observation,
+						(agent, fresh) -> {
+							return sendInspectionObservation(source, agent, fresh, inspectionObservationReply(reply, fresh));
+						}, true, (agent, fresh) -> fitInspectionObservation(codec, serverInstanceId, agent, reply, fresh));
+				if (published != ObservationPublication.Result.COMMITTED) throw new AgentDomainException("INSPECTION_UNAVAILABLE", "Fresh observation could not be delivered");
+				return;
+			} else {
+				ServerPlayer player = manager.findAgentPlayer(id).orElseThrow(() -> new AgentDomainException("PLAYER_UNAVAILABLE", "No player to inspect"));
+				JsonObject inspection = observations.collectInspection(player, query);
+				ObservationPublication.Result published = observationPublication.deliverInspection(id, source, inspection,
+						(agent, result) -> {
+							reply.add("result", result);
+							return sendInspectionEnvelope(source, agent, reply);
+						});
+				if (published != ObservationPublication.Result.COMMITTED) throw new AgentDomainException("INSPECTION_UNAVAILABLE", "Inspection session changed before delivery");
+				return;
+			}
+		} catch (IllegalArgumentException | BridgeProtocolException exception) {
+			JsonObject error = new JsonObject();
+			error.addProperty("code", exception instanceof AgentDomainException domain ? domain.code()
+					: exception instanceof BridgeProtocolException protocol ? protocol.code() : "INVALID_INSPECTION");
+			error.addProperty("message", exception.getMessage() == null ? "Inspection unavailable" : exception.getMessage());
+			reply.remove("result");
+			reply.add("error", error);
+		}
+		sendInspectionEnvelope(source, id, reply);
+	}
+
+	static JsonObject validateInspectionQuery(JsonObject query) {
+		Set<String> sections = Set.of("observation", "inventory", "menu", "entities", "blocks", "item", "block", "events", "landmarks", "nearby_containers", "recipes", "mechanics");
+		JsonElement sectionValue = query.get("section");
+		if (sectionValue == null || !sectionValue.isJsonPrimitive() || !sectionValue.getAsJsonPrimitive().isString()
+				|| !sections.contains(sectionValue.getAsString())) throw new AgentDomainException("INVALID_INSPECTION", "Unknown inspection section");
+		String section = sectionValue.getAsString();
+		Set<String> allowed = new HashSet<>(Set.of("section", "offset", "limit"));
+		if ("item".equals(section)) allowed.add("slot");
+		if ("block".equals(section)) allowed.addAll(Set.of("x", "y", "z"));
+		if ("events".equals(section)) allowed.add("afterSequence");
+		if ("recipes".equals(section)) allowed.add("recipeId");
+		if (!allowed.containsAll(query.keySet())) throw new AgentDomainException("INVALID_INSPECTION", "Unexpected field for inspection section");
+		JsonObject result = query.deepCopy();
+		if (!result.has("offset")) result.addProperty("offset", 0);
+		if (!result.has("limit")) result.addProperty("limit", 16);
+		inspectionInteger(result, "offset", 0, 4096);
+		inspectionInteger(result, "limit", 1, 32);
+		if ("item".equals(section)) inspectionInteger(result, "slot", 0, 255);
+		if ("block".equals(section)) {
+			inspectionInteger(result, "x", -30_000_000, 30_000_000);
+			inspectionInteger(result, "y", -2048, 2048);
+			inspectionInteger(result, "z", -30_000_000, 30_000_000);
+		}
+		if (result.has("afterSequence")) inspectionInteger(result, "afterSequence", -1, ActionProvenance.MAX_SAFE_INTEGER);
+		if (result.has("recipeId")) {
+			JsonElement recipe = result.get("recipeId");
+			if (!recipe.isJsonPrimitive() || !recipe.getAsJsonPrimitive().isString() || recipe.getAsString().length() > 256
+					|| !recipe.getAsString().matches("[a-z0-9_.-]+:[a-z0-9_./-]+")) {
+				throw new AgentDomainException("INVALID_INSPECTION", "recipeId must be a namespaced recipe id");
+			}
+		}
+		return result;
+	}
+
+	private static long inspectionInteger(JsonObject query, String field, long minimum, long maximum) {
+		JsonElement value = query.get(field);
+		if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber()) {
+			throw new AgentDomainException("INVALID_INSPECTION", field + " must be a JSON integer");
+		}
+		try {
+			long number = value.getAsBigDecimal().longValueExact();
+			if (number < minimum || number > maximum) throw new ArithmeticException();
+			return number;
+		} catch (ArithmeticException | NumberFormatException exception) {
+			throw new AgentDomainException("INVALID_INSPECTION", field + " is outside the inspection bounds");
+		}
+	}
+
+	static JsonObject inspectionObservationReply(JsonObject correlation, JsonObject observation) {
+		JsonObject reply = correlation.deepCopy();
+		JsonObject result = new JsonObject();
+		result.add("observation", observation.deepCopy());
+		result.add("eventSequence", observation.get("eventSequence"));
+		reply.add("result", result);
+		return reply;
+	}
+
+	static ServerObservationWireBudget.Fitted fitInspectionObservation(
+			BridgeEnvelopeCodec codec, String serverId, AgentId agent, JsonObject correlation, JsonObject observation) {
+		return ServerObservationWireBudget.fit(observation, candidate ->
+				codec.encodedLineBytesForPayload(2, serverId, agent.toString(), "observation", MAX_OBSERVATION_MESSAGE_ID, candidate)
+						<= BridgeEnvelopeCodec.MAX_LINE_BYTES
+				&& codec.encodedLineBytesForPayload(2, serverId, agent.toString(), "inspection_result", MAX_OBSERVATION_MESSAGE_ID,
+						inspectionObservationReply(correlation, candidate)) <= BridgeEnvelopeCodec.MAX_LINE_BYTES);
 	}
 
 	static CoordinatorStatusSnapshot decodeCoordinatorStatus(JsonObject payload, long receivedAtEpochMs) {
@@ -2597,6 +2726,31 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		return true;
 	}
 
+	private boolean sendInspectionEnvelope(Session source, AgentId agentId, JsonObject reply) {
+		if (session != source || !source.open.get() || !source.authenticated.get()) return false;
+		BridgeEnvelope envelope = new BridgeEnvelope(2, serverInstanceId, agentId.toString(), "inspection_result",
+				"server-" + messageIds.incrementAndGet(), reply);
+		if (codec.encodedLineBytes(envelope) > BridgeEnvelopeCodec.MAX_LINE_BYTES) {
+			throw new BridgeProtocolException("INSPECTION_TOO_LARGE", "Inspection reply exceeds the complete bridge envelope limit");
+		}
+		source.enqueue(envelope);
+		return true;
+	}
+
+	private boolean sendInspectionObservation(Session source, AgentId agentId, JsonObject observation, JsonObject reply) {
+		if (session != source || !source.open.get() || !source.authenticated.get()) return false;
+		BridgeEnvelope first = new BridgeEnvelope(2, serverInstanceId, agentId.toString(), "observation",
+				"server-" + messageIds.incrementAndGet(), observation);
+		BridgeEnvelope second = new BridgeEnvelope(2, serverInstanceId, agentId.toString(), "inspection_result",
+				"server-" + messageIds.incrementAndGet(), reply);
+		if (codec.encodedLineBytes(first) > BridgeEnvelopeCodec.MAX_LINE_BYTES
+				|| codec.encodedLineBytes(second) > BridgeEnvelopeCodec.MAX_LINE_BYTES) {
+			throw new BridgeProtocolException("INSPECTION_TOO_LARGE", "Fresh observation reply exceeds the complete bridge envelope limit");
+		}
+		source.enqueuePair(first, second, () -> {});
+		return true;
+	}
+
 	private static JsonObject registeredPayload(AgentRecord record) {
 		JsonObject payload = new JsonObject();
 		payload.addProperty("schemaVersion", record.schemaVersion());
@@ -3198,6 +3352,11 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 
 		Result publish(AgentId agentId, Object sourceSession, JsonObject observation, Writer writer, boolean allowUnchanged) {
+			return publish(agentId, sourceSession, observation, writer, allowUnchanged, fitter);
+		}
+
+		Result publish(AgentId agentId, Object sourceSession, JsonObject observation, Writer writer, boolean allowUnchanged,
+				java.util.function.BiFunction<AgentId, JsonObject, ServerObservationWireBudget.Fitted> deliveryFitter) {
 			Objects.requireNonNull(agentId, "agentId must not be null");
 			Objects.requireNonNull(sourceSession, "sourceSession must not be null");
 			Objects.requireNonNull(observation, "observation must not be null");
@@ -3210,17 +3369,33 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				if (!allowUnchanged && published.hasDelivered(agentId) && !delta.attention()) return Result.SUPPRESSED;
 				JsonObject delivery = observation.deepCopy();
 				attachDelta(delivery, delta);
-				ServerObservationWireBudget.Fitted fitted = fitter.apply(agentId, delivery);
+				ServerObservationWireBudget.Fitted fitted = deliveryFitter.apply(agentId, delivery);
 				delivery = fitted.observation();
 				if (!fitted.reductions().isEmpty()) {
 					delta = published.delta(agentId, delivery, eventSequence, observedAtEpochMs);
 					attachDelta(delivery, delta);
-					delivery = fitter.apply(agentId, delivery).observation();
+					delivery = deliveryFitter.apply(agentId, delivery).observation();
 					attachDelta(delivery, published.delta(agentId, delivery, eventSequence, observedAtEpochMs));
 				}
 				if (!writer.send(agentId, delivery)) return Result.DELIVERY_RETRY;
 				published.commit(agentId, delivery);
 				nextHeartbeatTick.put(agentId, nextHeartbeatDeadline());
+				return Result.COMMITTED;
+			}
+		}
+
+		/** Grants only the entities in a delivered focused page, without replacing the full observation baseline. */
+		Result deliverInspection(AgentId agentId, Object sourceSession, JsonObject inspection, Writer writer) {
+			synchronized (lifecycleLock) {
+				if (activeSession != sourceSession) return Result.STALE_SESSION;
+				long sequence = published.inspectionSequence(agentId, inspection);
+				Set<String> targets = PublishedObservationState.inspectionTargetIds(inspection);
+				published.checkInspectionTargets(agentId, sequence, targets);
+				JsonObject delivery = inspection.deepCopy();
+				delivery.addProperty("eventSequence", sequence);
+				if (!writer.send(agentId, delivery)) return Result.DELIVERY_RETRY;
+				if (activeSession != sourceSession) return Result.STALE_SESSION;
+				published.retainInspectionTargets(agentId, sequence, targets);
 				return Result.COMMITTED;
 			}
 		}
@@ -3288,6 +3463,63 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 		public synchronized boolean hasDelivered(AgentId agentId) {
 			return delivered.containsKey(Objects.requireNonNull(agentId, "agentId must not be null"));
+		}
+
+		private synchronized long inspectionSequence(AgentId agentId, JsonObject inspection) {
+			JsonObject baseline = delivered.get(agentId);
+			if (baseline == null || !baseline.has("eventSequence")) {
+				throw new AgentDomainException("STALE_FACTS", "Read a full observation before focused inspection");
+			}
+			JsonObject world = baseline.has("world") && baseline.get("world").isJsonObject() ? baseline.getAsJsonObject("world") : null;
+			if (world == null || !inspection.has("dimension") || !inspection.has("worldId")
+					|| !Objects.equals(world.get("dimension"), inspection.get("dimension"))
+					|| !Objects.equals(world.get("worldId"), inspection.get("worldId"))) {
+				throw new AgentDomainException("STALE_FACTS", "World changed; read a full observation before focused inspection");
+			}
+			return baseline.get("eventSequence").getAsLong();
+		}
+
+		private synchronized void checkInspectionTargets(AgentId agentId, long sequence, Set<String> targets) {
+			ObservationTargetHistory history = targetHistory.get(agentId);
+			if (history == null || !history.contains(sequence)) throw new AgentDomainException("STALE_FACTS", "Inspection baseline is no longer retained");
+			Set<String> combined = new HashSet<>(history.targets(sequence));
+			combined.addAll(targets);
+			if (combined.size() > MAX_TARGET_IDS_WITH_INSPECTIONS) {
+				throw new AgentDomainException("INSPECTION_AUTHORITY_LIMIT", "Read a new full observation before inspecting more entity targets");
+			}
+		}
+
+		private synchronized void retainInspectionTargets(AgentId agentId, long sequence, Set<String> targets) {
+			if (targets.isEmpty()) return;
+			checkInspectionTargets(agentId, sequence, targets);
+			ObservationTargetHistory history = targetHistory.get(agentId);
+			HashSet<String> combined = new HashSet<>(history.targets(sequence));
+			combined.addAll(targets);
+			history.observations.put(sequence, Set.copyOf(combined));
+		}
+
+		private static Set<String> inspectionTargetIds(JsonObject inspection) {
+			if (!inspection.has("section") || !"entities".equals(inspection.get("section").getAsString())) return Set.of();
+			if (!inspection.has("entries") || !inspection.get("entries").isJsonArray()
+					|| inspection.getAsJsonArray("entries").size() > 32) {
+				throw new AgentDomainException("INVALID_INSPECTION", "Entity inspection must be one bounded page");
+			}
+			HashSet<String> result = new HashSet<>();
+			for (JsonElement entry : inspection.getAsJsonArray("entries")) {
+				if (!entry.isJsonObject()) throw new AgentDomainException("INVALID_INSPECTION", "Invalid inspected entity");
+				JsonElement uuid = entry.getAsJsonObject().get("uuid");
+				if (uuid == null || !uuid.isJsonPrimitive() || !uuid.getAsJsonPrimitive().isString()) {
+					throw new AgentDomainException("INVALID_INSPECTION", "Inspected entity requires a UUID");
+				}
+				String id = uuid.getAsString();
+				try {
+					if (!UUID.fromString(id).toString().equals(id)) throw new IllegalArgumentException();
+				} catch (IllegalArgumentException exception) {
+					throw new AgentDomainException("INVALID_INSPECTION", "Invalid inspected entity UUID");
+				}
+				result.add(id);
+			}
+			return Set.copyOf(result);
 		}
 
 		/** Requires a target id to be present in the exact bounded observation selected by provenance. */

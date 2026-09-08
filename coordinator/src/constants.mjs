@@ -45,10 +45,11 @@ export const TERMINAL_ACTION_STATES = Object.freeze([
 export const ACTION_FIELDS = Object.freeze({
 	move_to: Object.freeze(['x', 'y', 'z', 'tolerance', 'sprint']),
 	control: Object.freeze(['forward', 'strafe', 'jump', 'sneak', 'sprint', 'attack', 'use', 'yaw', 'pitch', 'selectedSlot', 'hand', 'ticks']),
+	control_sequence: Object.freeze(['frames', 'maxTicks']),
 	look_at: Object.freeze(['x', 'y', 'z']),
 	attack: Object.freeze(['targetId', 'timeoutMs']),
 	select_item: Object.freeze(['itemId']),
-	use_item: Object.freeze(['durationMs']),
+	use_item: Object.freeze(['durationMs', 'hand', 'expectedItemId']),
 	break_block: Object.freeze(['x', 'y', 'z', 'expectedBlockId', 'timeoutMs']),
 	pick_up_item: Object.freeze(['targetSelector']),
 	place_block: Object.freeze(['x', 'y', 'z', 'face', 'itemId', 'desiredState']),
@@ -65,14 +66,41 @@ export const ACTION_FIELDS = Object.freeze({
 	select_tool: Object.freeze(['sourceSlot', 'hotbarSlot', 'expectedItemId', 'minRemainingDurability']),
 	block_with_shield: Object.freeze(['durationMs']),
 	use_ranged: Object.freeze(['targetId', 'drawDurationMs', 'timeoutMs']),
-	interact_block: Object.freeze(['x', 'y', 'z', 'face', 'hand', 'expectedItemId']),
-	interact_entity: Object.freeze(['targetId', 'hand', 'expectedItemId']),
+	interact_block: Object.freeze(['x', 'y', 'z', 'face', 'hand', 'expectedItemId', 'hitX', 'hitY', 'hitZ']),
+	interact_entity: Object.freeze(['targetId', 'hand', 'expectedItemId', 'hitX', 'hitY', 'hitZ']),
 	dismount: Object.freeze([]),
 	start_fall_flying: Object.freeze([]),
-	menu_transfer: Object.freeze(['menuId', 'sourceSlot', 'destinationSlot', 'count', 'expectedItemId', 'timeoutMs']),
-	menu_button: Object.freeze(['menuId', 'buttonId', 'timeoutMs']),
-	anvil_rename: Object.freeze(['menuId', 'name', 'timeoutMs']),
+	wake_up: Object.freeze([]),
+	set_flight: Object.freeze(['enabled']),
+	write_sign: Object.freeze(['x', 'y', 'z', 'front', 'lines', 'expectedLines']),
+	edit_book: Object.freeze(['slot', 'pages', 'title', 'expectedFingerprint']),
+	menu_click: Object.freeze(['menuId', 'containerId', 'stateId', 'slot', 'button', 'clickType', 'expectedItemId', 'expectedCount', 'expectedFingerprint']),
+	menu_close: Object.freeze(['menuId', 'containerId', 'stateId']),
+	beacon_effects: Object.freeze(['menuId', 'containerId', 'stateId', 'primaryEffectId', 'secondaryEffectId']),
+	menu_transfer: Object.freeze(['menuId', 'sourceSlot', 'destinationSlot', 'count', 'expectedItemId', 'timeoutMs', 'containerId', 'stateId']),
+	menu_button: Object.freeze(['menuId', 'buttonId', 'timeoutMs', 'containerId', 'stateId']),
+	anvil_rename: Object.freeze(['menuId', 'name', 'timeoutMs', 'containerId', 'stateId']),
 	respawn: Object.freeze([]),
 });
+
+export const OPTIONAL_ACTION_FIELDS = Object.freeze({
+	place_block: Object.freeze(['desiredState']),
+	chat: Object.freeze(['audience', 'recipientId']),
+	use_item: Object.freeze(['hand', 'expectedItemId']),
+	interact_block: Object.freeze(['hitX', 'hitY', 'hitZ']),
+	interact_entity: Object.freeze(['hitX', 'hitY', 'hitZ']),
+	menu_click: Object.freeze(['expectedFingerprint']),
+	edit_book: Object.freeze(['title']),
+	menu_transfer: Object.freeze(['containerId', 'stateId']),
+	menu_button: Object.freeze(['containerId', 'stateId']),
+	anvil_rename: Object.freeze(['containerId', 'stateId']),
+});
+
+export const CONTROL_BRANCH_CONDITIONS = Object.freeze({
+	health_below: 'number', food_below: 'number', air_below: 'number',
+	on_fire: 'boolean', in_water: 'boolean', on_ground: 'boolean',
+	horizontal_collision: 'boolean', hurt: 'boolean', using_item: 'boolean',
+});
+export const CONTROL_THRESHOLD_MAXIMA = Object.freeze({ health_below: 2048, food_below: 20, air_below: 100000 });
 
 export const BLOCK_FACES = Object.freeze(['down', 'up', 'north', 'south', 'west', 'east']);

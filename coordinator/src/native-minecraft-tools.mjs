@@ -1,27 +1,61 @@
 import {
 	ACTION_FIELDS,
+	OPTIONAL_ACTION_FIELDS,
+	CONTROL_BRANCH_CONDITIONS,
 	MAX_CHAT_LENGTH,
 	MAX_DURATION_MS,
 	MAX_IDENTIFIER_LENGTH,
 	MIN_DURATION_MS,
 } from './constants.mjs';
-import { validateAction } from './schema.mjs';
+import { MAX_ACTION_ARGUMENT_BYTES, validateAction } from './schema.mjs';
+import { ARENA_SCRIPT_API_REFERENCE } from './prompts.mjs';
 
 const MAX_TOOL_RESULT_BYTES = 16_384;
 const COORDINATE_LIMIT = 30_000_000;
 const MAX_SEQUENCE_ACTIONS = 8;
 const MAX_LOOK_AROUND_STEPS = 8;
 const MAX_LOOK_AROUND_TICKS = 20;
+const MAX_PROGRAM_SOURCE_BYTES = 65_536;
 const NATIVE_ACTION_TYPES = Object.freeze(Object.keys(ACTION_FIELDS));
+export const INSPECTION_SECTIONS = Object.freeze(['inventory', 'menu', 'entities', 'blocks', 'landmarks', 'nearby_containers', 'item', 'block', 'events', 'recipes', 'mechanics']);
+
+export function minecraftCapabilities({ section = 'all' } = {}) {
+	if (section === 'program') return { version: 1, section: 'program', engine: 'ArenaScript', reference: ARENA_SCRIPT_API_REFERENCE };
+	return {
+		version: 1,
+		actions: Object.entries(ACTION_FIELDS).map(([actionType, fields]) => ({ actionType, fields: [...fields], requiredFields: fields.filter((field) => !(OPTIONAL_ACTION_FIELDS[actionType] ?? []).includes(field)), optionalFields: [...(OPTIONAL_ACTION_FIELDS[actionType] ?? [])] })),
+		controlConditions: { ...CONTROL_BRANCH_CONDITIONS },
+		inspectionSections: [...INSPECTION_SECTIONS],
+		programReference: { tool: 'capabilities', arguments: { section: 'program' } },
+		limits: { sequenceActions: MAX_SEQUENCE_ACTIONS, inspectionPage: 32, resultBytes: MAX_TOOL_RESULT_BYTES, actionArgumentBytes: MAX_ACTION_ARGUMENT_BYTES, programSourceBytes: MAX_PROGRAM_SOURCE_BYTES, programActions: 256, programTimeoutMs: 120_000 },
+	};
+}
 
 export const NATIVE_AGENT_INSTRUCTIONS = `You control one live Minecraft player and choose every action.
 
-Act as soon as it is safe. This is one continuous run: death is the same goal, not a new episode. Check recovery (lastDeath, current inventory, lastLostInventory) before choosing corpse recovery or recrafting, and do not redo work already evidenced.
+Choose the next step from current observations, the user's goal, and your own reasoning. A death does not change the active goal. Historical inventory and death records describe past evidence.
 
-Call the smallest useful Minecraft tool, inspect its factual result, then choose the next. goalSpec is the immutable completion contract; options and failureClass are hints. observe includes close-up blocks and sparse first-visible landmarks out to loaded view distance. Use lookAround when the current view misses terrain, control for normal traversal, moveTo for a short confirmed waypoint, and exploreFrontier when Nether, biome, cave, or structure facts are not in view. Mine only an observed visible block using exact rayTarget coordinates and non-air blockId as expectedBlockId. Use sequence for 2+ safe factual actions, split when later steps need fresh facts, and stop on failure. Use act for supported actions and finish only to ask Minecraft to verify the goal. Never claim an action without its result. conversation_only uses say only. Plain text is not visible. For nearby voice, say at most 12 words with proximity, then call the first physical tool because speech playback is asynchronous.`;
+Use capabilities for supported fields, observe for a fresh sample, and inspect for focused pages. Respect freshness and coverage: omitted or unobserved facts are unknown. exploreFrontier returns candidates; you choose a destination and call moveTo. Use control for precise inputs and sequence for safe steps that need no new facts. startAction returns a handle; actionStatus, cancelAction, and replaceAction require its exact identity. Use act with control_sequence for bounded model-authored tick programs. notebook stores your notes; queryMemory retrieves notes and factual receipts. Mine only observed blocks with their exact blockId. goalSpec is the immutable completion contract. finish requests factual verification. Never claim an effect without evidence. conversation_only uses say only. Plain text is not visible. Nearby speech should be brief; speech playback is asynchronous.`;
 
 export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
-	tool('observe', 'Return the latest compact player, inventory, close-up blocks, farther visible landmarks, entities, goal, conversation, and recovery facts. options and failureClass are hints.', objectSchema({})),
+	tool('observe', 'Request a fresh player observation. Read freshness and coverage; an unavailable freshness barrier returns explicitly stale cached facts.', objectSchema({})),
+	tool('capabilities', 'List action fields, query sections, limits, and runtime support. Request section program for the shared ArenaScript language and API reference before writing a program.', objectSchema({ section: { type: 'string', enum: ['all', 'program'] } })),
+	tool('inspect', 'Request a focused page of player-accessible facts. Item queries need a slot; block queries need visible x/y/z coordinates. Read coverage and freshness.', objectSchema({
+		section: { type: 'string', enum: INSPECTION_SECTIONS }, offset: integerSchema(0, 4_096), limit: integerSchema(1, 32),
+		slot: integerSchema(0, 255), x: integerSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT), y: integerSchema(-2_048, 2_048), z: integerSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT),
+		afterSequence: integerSchema(0, Number.MAX_SAFE_INTEGER),
+		recipeId: { type: 'string', minLength: 1, maxLength: 256, pattern: '^[a-z0-9_.-]+:[a-z0-9_./-]+$' },
+	}, ['section'])),
+	tool('actionStatus', 'Inspect the active action or a retained terminal receipt without changing the player.', objectSchema({ actionId: { type: 'string', minLength: 1, maxLength: 128 } })),
+	tool('cancelAction', 'Cancel the exact active handle and wait for its authoritative terminal result. A stale handle cannot cancel another action.', objectSchema({ actionId: { type: 'string', minLength: 1, maxLength: 128 }, goalRevision: integerSchema(0, Number.MAX_SAFE_INTEGER) }, ['actionId', 'goalRevision'])),
+	tool('replaceAction', 'Cancel the exact active handle, wait for acknowledgement, then execute your replacement. No replacement runs after uncertain cancellation.', objectSchema({
+		actionId: { type: 'string', minLength: 1, maxLength: 128 }, goalRevision: integerSchema(0, Number.MAX_SAFE_INTEGER),
+		actionType: { type: 'string', enum: NATIVE_ACTION_TYPES }, arguments: { type: 'object' },
+	}, ['actionId', 'goalRevision', 'actionType', 'arguments'])),
+	tool('startAction', 'Start one model-chosen action and return its handle immediately. Poll actionStatus for the factual result or cancel the exact handle.', objectSchema({ actionType: { type: 'string', enum: NATIVE_ACTION_TYPES }, arguments: { type: 'object' } }, ['actionType', 'arguments'])),
+	tool('notebook', 'Save or replace one model-written note of up to 2048 characters in this agent and world. Notes are hypotheses or plans, never authoritative game evidence.', objectSchema({ key: { type: 'string', minLength: 1, maxLength: 128 }, text: { type: 'string', minLength: 1, maxLength: 2048 } }, ['key', 'text'])),
+	tool('queryMemory', 'Read this agent and world\'s saved notes and action receipts, including unresolved dispatches. Continue pages with nextOffset. Historical receipts do not establish current world state.', objectSchema({ kind: { type: 'string', enum: ['all', 'notes', 'receipts', 'unresolved'] }, text: { type: 'string', minLength: 1, maxLength: 256 }, offset: integerSchema(0, Number.MAX_SAFE_INTEGER), limit: integerSchema(1, 64) })),
+	tool('runProgram', 'Run bounded ArenaScript that you author using player actions, observed facts, inspections, memory, and explicit watchers. Returns at completion or attention; no other model chooses its behavior.', objectSchema({ source: { type: 'string', minLength: 1, maxLength: MAX_PROGRAM_SOURCE_BYTES }, maxActions: integerSchema(1, 256), timeoutMs: integerSchema(1, 120_000) }, ['source'])),
 	tool('lookAround', 'Turn the player through 2 to 8 short camera steps; call observe afterward to inspect the newly visible landmarks.', objectSchema({
 		centerYaw: numberSchema(-180, 180),
 		pitch: numberSchema(-90, 90),
@@ -50,11 +84,10 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 		sprint: { type: 'boolean' },
 		timeoutMs: integerSchema(1, 120_000),
 	}, ['x', 'y', 'z'])),
-	tool('exploreFrontier', 'Walk one bounded hop into unknown adjacent space or toward a visible biome/structure cue. Use when needed Nether, cave, village, or structure facts are not in view. Not a random walk.', objectSchema({
-		seek: { type: 'string', enum: ['any', 'nether', 'cave', 'village', 'structure'] },
+	tool('exploreFrontier', 'List factual observed or unknown adjacent-space candidates. This tool never chooses or executes a destination; choose explicitly with moveTo.', objectSchema({
 		radius: integerSchema(8, 32),
-		timeoutMs: integerSchema(1, 120_000),
-		heading: { type: 'string', enum: ['north', 'south', 'east', 'west'] },
+		limit: integerSchema(1, 64),
+		blockId: { type: 'string', minLength: 1, maxLength: MAX_IDENTIFIER_LENGTH },
 	})),
 	tool('mine', 'Mine one observed, visible, in-range block coordinate with its exact current blockId.', objectSchema({
 		x: integerSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT),
@@ -92,6 +125,59 @@ export function normalizeMinecraftToolCall(name, value) {
 		case 'observe':
 			requireExactKeys(args, []);
 			return { kind: 'observe' };
+		case 'capabilities':
+			requireExactKeys(args, ['section']);
+			if (args.section !== undefined && !['all', 'program'].includes(args.section)) invalid('capability section is not supported');
+			return { kind: 'capabilities', ...(args.section === undefined ? {} : { section: args.section }) };
+		case 'inspect': {
+			requireExactKeys(args, ['section', 'offset', 'limit', 'slot', 'x', 'y', 'z', 'afterSequence', 'recipeId']);
+			if (!INSPECTION_SECTIONS.includes(args.section)) invalid('section is not supported');
+			const query = { kind: 'inspect', section: args.section, offset: optionalInteger(args.offset, 0, 'offset', 0, 4_096), limit: optionalInteger(args.limit, 32, 'limit', 1, 32) };
+			if (args.section === 'item') query.slot = integer(args.slot, 'slot', 0, 255);
+			else if (args.slot !== undefined) invalid('slot is only valid for item inspection');
+			if (args.section === 'block') {
+				query.x = integer(args.x, 'x', -COORDINATE_LIMIT, COORDINATE_LIMIT);
+				query.y = integer(args.y, 'y', -2_048, 2_048);
+				query.z = integer(args.z, 'z', -COORDINATE_LIMIT, COORDINATE_LIMIT);
+			} else if (args.x !== undefined || args.y !== undefined || args.z !== undefined) invalid('coordinates are only valid for block inspection');
+			if (args.afterSequence !== undefined) {
+				if (args.section !== 'events') invalid('afterSequence is only valid for event inspection');
+				query.afterSequence = integer(args.afterSequence, 'afterSequence', 0, Number.MAX_SAFE_INTEGER);
+			}
+			if (args.recipeId !== undefined) {
+				if (args.section !== 'recipes' || typeof args.recipeId !== 'string' || args.recipeId.length > 256 || !/^[a-z0-9_.-]+:[a-z0-9_./-]+$/.test(args.recipeId)) invalid('recipeId must be a namespaced recipe identifier for recipe inspection');
+				query.recipeId = args.recipeId;
+			}
+			return query;
+		}
+		case 'actionStatus':
+			requireExactKeys(args, ['actionId']);
+			return { kind: 'action_status', ...(args.actionId === undefined ? {} : { actionId: boundedText(args.actionId, 'actionId', 128) }) };
+		case 'cancelAction':
+			requireExactKeys(args, ['actionId', 'goalRevision']);
+			return { kind: 'cancel_action', actionId: boundedText(args.actionId, 'actionId', 128), goalRevision: integer(args.goalRevision, 'goalRevision', 0, Number.MAX_SAFE_INTEGER) };
+		case 'replaceAction': {
+			requireExactKeys(args, ['actionId', 'goalRevision', 'actionType', 'arguments']);
+			const action = normalizeMinecraftToolCall('act', { actionType: args.actionType, arguments: args.arguments });
+			return { ...action, kind: 'replace_action', actionId: boundedText(args.actionId, 'actionId', 128), goalRevision: integer(args.goalRevision, 'goalRevision', 0, Number.MAX_SAFE_INTEGER) };
+		}
+		case 'startAction': {
+			const action = normalizeMinecraftToolCall('act', args);
+			return { ...action, kind: 'start_action' };
+		}
+		case 'notebook':
+			requireExactKeys(args, ['key', 'text']);
+			return { kind: 'notebook', key: boundedText(args.key, 'key', 128), text: boundedText(args.text, 'text', 2048) };
+		case 'queryMemory':
+			requireExactKeys(args, ['kind', 'text', 'limit', 'offset']);
+			if (args.kind !== undefined && !['all', 'notes', 'receipts', 'unresolved'].includes(args.kind)) invalid('kind is not supported');
+			return { kind: 'query_memory', memoryKind: args.kind ?? 'all', offset: optionalInteger(args.offset, 0, 'offset', 0, Number.MAX_SAFE_INTEGER), limit: optionalInteger(args.limit, 20, 'limit', 1, 64), ...(args.text === undefined ? {} : { text: boundedText(args.text, 'text', 256) }) };
+		case 'runProgram': {
+			requireExactKeys(args, ['source', 'maxActions', 'timeoutMs']);
+			const source = boundedText(args.source, 'source', MAX_PROGRAM_SOURCE_BYTES);
+			if (Buffer.byteLength(source, 'utf8') > MAX_PROGRAM_SOURCE_BYTES) invalid('source must fit 65536 UTF-8 bytes');
+			return { kind: 'run_program', source, maxActions: optionalInteger(args.maxActions, 64, 'maxActions', 1, 256), timeoutMs: optionalInteger(args.timeoutMs, 30_000, 'timeoutMs', 1, 120_000) };
+		}
 		case 'lookAround':
 			requireExactKeys(args, ['centerYaw', 'pitch', 'steps', 'ticksPerStep']);
 			return {
@@ -128,17 +214,13 @@ export function normalizeMinecraftToolCall(name, value) {
 				},
 			};
 		case 'exploreFrontier': {
-			requireExactKeys(args, ['seek', 'radius', 'timeoutMs', 'heading']);
-			const seek = args.seek === undefined ? 'any' : args.seek;
-			if (!['any', 'nether', 'cave', 'village', 'structure'].includes(seek)) invalid('seek is not supported');
-			if (args.heading !== undefined && !['north', 'south', 'east', 'west'].includes(args.heading)) invalid('heading is not supported');
+			requireExactKeys(args, ['radius', 'limit', 'blockId']);
 			return {
 				kind: 'explore_frontier',
 				arguments: {
-					seek,
 					radius: optionalInteger(args.radius, 24, 'radius', 8, 32),
-					timeoutMs: optionalInteger(args.timeoutMs, 15_000, 'timeoutMs', 1, 120_000),
-					...(args.heading === undefined ? {} : { heading: args.heading }),
+					limit: optionalInteger(args.limit, 32, 'limit', 1, 64),
+					...(args.blockId === undefined ? {} : { blockId: boundedText(args.blockId, 'blockId', MAX_IDENTIFIER_LENGTH) }),
 				},
 			};
 		}
@@ -227,11 +309,13 @@ function normalizeSequenceAction(value) {
 export function toolResultContent(value, success = true) {
 	const candidates = [
 		value ?? null,
+		...(Array.isArray(value?.entries) ? [compactInspectionResult(value)] : []),
 		...(isSequenceResult(value) ? [compactSequenceResult(value)] : []),
+		...(Array.isArray(value?.receipts) && typeof value?.programId === 'string' ? [compactProgramResult(value)] : []),
 		compactToolResult(value),
-		{ state: 'TRUNCATED', ...survivalFacts(value, 8) },
-		{ state: 'TRUNCATED', ...survivalFacts(value, 2) },
-		{ state: 'TRUNCATED', detail: 'Tool result exceeded the coordinator limit. Call observe for fresh compact facts.' },
+		{ state: 'TRUNCATED', ...resultMetadata(value), ...survivalFacts(value, 8), detail: 'Details exceeded the result limit. Use inspect for focused pages.' },
+		{ state: 'TRUNCATED', ...resultMetadata(value), ...survivalFacts(value, 2), detail: 'Details exceeded the result limit. Use inspect for focused pages.' },
+		{ state: 'TRUNCATED', detail: 'Tool result exceeded the coordinator limit. Use inspect for focused facts; omitted data is unknown.' },
 	];
 	let text = JSON.stringify(candidates[0]);
 	for (const candidate of candidates) {
@@ -262,16 +346,24 @@ function compactToolResult(value) {
 		return { state: 'TRUNCATED', detail: 'Tool result exceeded the coordinator limit. Call observe for fresh compact facts.' };
 	}
 	return {
+		...resultMetadata(value),
+		truncated: true,
+		detail: 'Observation details were omitted by the result limit. Use inspect for focused pages.',
 		...(value.state === undefined ? {} : { state: value.state }),
 		...(value.reasonCode === undefined ? {} : { reasonCode: value.reasonCode }),
 		...(value.eventSequence === undefined ? {} : { eventSequence: value.eventSequence }),
 		...(value.goal === undefined ? {} : { goal: value.goal }),
 		observation: {
+			...resultMetadata(observation),
 			player: observation.player ?? {},
 			inventory: { items: asToolArray(observation.inventory?.items).slice(0, 16) },
+			...(observation.position === undefined ? {} : { position: observation.position }),
+			...(observation.velocity === undefined ? {} : { velocity: observation.velocity }),
+			...(observation.view === undefined ? {} : { view: observation.view }),
+			...(observation.interaction === undefined ? {} : { interaction: compactInteraction(observation.interaction) }),
+			resultCoverage: { inventory: { retained: Math.min(asToolArray(observation.inventory?.items).length, 16), availableInSnapshot: asToolArray(observation.inventory?.items).length }, omittedSections: ['blocks', 'landmarks', 'entities', 'nearbyContainers'].filter((section) => observation[section] !== undefined) },
 			...(observation.death === undefined ? {} : { death: observation.death }),
 			...(observation.recovery === undefined ? {} : { recovery: compactRecovery(observation.recovery, 8) }),
-			...(Array.isArray(observation.options) ? { options: observation.options.slice(0, 2) } : {}),
 			...(observation.failureClass === undefined ? {} : { failureClass: observation.failureClass }),
 			...(observation.lastResult === undefined ? {} : { lastResult: compactLastResult(observation.lastResult) }),
 			...(observation.world === undefined ? {} : { world: compactWorld(observation.world) }),
@@ -280,6 +372,38 @@ function compactToolResult(value) {
 		},
 		...survivalFacts(value),
 	};
+}
+
+function resultMetadata(value) {
+	if (value === null || typeof value !== 'object') return {};
+	return Object.fromEntries(['actionId', 'goalRevision', 'eventSequence', 'freshness', 'coverage', 'revision', 'sectionRevisions', 'observedAtEpochMs', 'executionSettings', 'unresolvedActions'].filter((key) => value[key] !== undefined).map((key) => [key, value[key]]));
+}
+
+function compactInteraction(interaction) {
+	if (interaction === null || typeof interaction !== 'object') return interaction;
+	const menu = interaction.menu;
+	return { ...interaction, ...(menu == null ? {} : { menu: { ...menu, ...(Array.isArray(menu.slots) ? { slots: menu.slots.slice(0, 8), resultCoverage: { retained: Math.min(menu.slots.length, 8), availableInSnapshot: menu.slots.length } } : {}) } }) };
+}
+
+function compactInspectionResult(value) {
+	const result = { ...value, entries: [], truncated: true, detail: 'Inspection entries exceeded the result limit; continue at nextOffset.', coverage: { ...value.coverage, resultTruncated: true } };
+	for (const entry of value.entries) {
+		const candidate = { ...result, entries: [...result.entries, entry] };
+		if (Buffer.byteLength(JSON.stringify(candidate), 'utf8') > MAX_TOOL_RESULT_BYTES - 128) break;
+		result.entries.push(entry);
+	}
+	const offset = Number.isSafeInteger(value.offset) ? value.offset : Number.isSafeInteger(value.coverage?.offset) ? value.coverage.offset : 0;
+	result.nextOffset = offset + result.entries.length;
+	result.coverage.returned = result.entries.length;
+	result.coverage.nextOffset = result.nextOffset;
+	result.coverage.complete = false;
+	if (result.entries.length === 0) {
+		result.reasonCode = 'ENTRY_EXCEEDS_RESULT_LIMIT';
+		result.detail = 'One inspection entry exceeds the result limit. Its contents remain unknown.';
+		result.nextOffset = null;
+		result.coverage.nextOffset = null;
+	}
+	return result;
 }
 
 function asToolArray(value) {
@@ -293,7 +417,6 @@ function survivalFacts(value, maxStacks = 16) {
 		...(observation?.recovery === undefined ? {} : { recovery: compactRecovery(observation.recovery, maxStacks) }),
 		...(value?.recovery === undefined ? {} : { recovery: compactRecovery(value.recovery, maxStacks) }),
 		...(observation?.failureClass === undefined && value?.failureClass === undefined ? {} : { failureClass: observation?.failureClass ?? value.failureClass }),
-		...(Array.isArray(observation?.options) ? { options: observation.options.slice(0, 2) } : {}),
 	};
 }
 
@@ -301,12 +424,10 @@ function compactRecovery(recovery, maxStacks = 16) {
 	if (recovery === null || typeof recovery !== 'object') return recovery;
 	const lostCap = Math.min(16, maxStacks);
 	const haveCap = Math.min(32, Math.max(2, maxStacks * 2));
-	const redoCap = Math.min(24, Math.max(2, maxStacks));
 	return {
 		...(recovery.lastDeath === undefined ? {} : { lastDeath: recovery.lastDeath }),
 		...(Array.isArray(recovery.lastLostInventory) ? { lastLostInventory: recovery.lastLostInventory.slice(0, lostCap) } : {}),
 		...(Array.isArray(recovery.alreadyHave) ? { alreadyHave: recovery.alreadyHave.slice(-haveCap) } : {}),
-		...(Array.isArray(recovery.doNotRedo) ? { doNotRedo: recovery.doNotRedo.slice(0, redoCap) } : {}),
 		...(typeof recovery.facts === 'string' ? { facts: recovery.facts.slice(0, maxStacks <= 2 ? 160 : 512) } : {}),
 	};
 }
@@ -322,12 +443,26 @@ function compactLastResult(lastResult) {
 function compactWorld(world) {
 	if (world === null || typeof world !== 'object') return world;
 	return {
+		...(world.worldId === undefined ? {} : { worldId: world.worldId }),
+		...(world.gameTime === undefined ? {} : { gameTime: world.gameTime }),
 		...(world.dimension === undefined ? {} : { dimension: world.dimension }),
 		...(world.dimensionId === undefined ? {} : { dimensionId: world.dimensionId }),
 	};
 }
 function isSequenceResult(value) {
 	return value !== null && typeof value === 'object' && !Array.isArray(value) && Array.isArray(value.results);
+}
+
+function compactProgramResult(value) {
+	const result = { state: boundedResultField(value.state, 64), reasonCode: boundedResultField(value.reasonCode, 128), programId: boundedResultField(value.programId, 256), actions: safeResultInteger(value.actions), eventSequence: safeResultInteger(value.eventSequence), ...(value.finishRequested === true ? { finishRequested: true } : {}), receipts: [], truncated: true, detail: 'Program observations were omitted. Query historical receipts by bodyActionId and observe for current facts.' };
+	for (const receipt of [...value.receipts].reverse()) {
+		const next = Object.fromEntries(['actionId', 'bodyActionId', 'actionType', 'sourceStepId', 'state', 'reasonCode'].filter((field) => receipt[field] !== undefined).map((field) => [field, boundedResultField(receipt[field], field === 'reasonCode' ? 128 : 256)]));
+		for (const flag of ['executionStarted', 'physicalAttempted']) if (typeof receipt[flag] === 'boolean') next[flag] = receipt[flag];
+		if (Buffer.byteLength(JSON.stringify({ ...result, receipts: [next, ...result.receipts] }), 'utf8') > MAX_TOOL_RESULT_BYTES - 128) break;
+		result.receipts.unshift(next);
+	}
+	result.omittedReceipts = Math.max(0, value.omittedReceipts ?? 0) + value.receipts.length - result.receipts.length;
+	return result;
 }
 
 function compactSequenceResult(value) {

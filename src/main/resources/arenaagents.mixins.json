@@ -3,12 +3,15 @@
   "package": "dev.agaminggod.arenaagents.mixin",
   "compatibilityLevel": "JAVA_25",
   "mixins": [
+    "CachedUserNameToIdResolverAccessor",
+    "CarpetBoatInputMixin",
     "EntityPlayerActionInvoker",
     "EntityPlayerActionPackAccessor",
     "EntityPlayerActionPackMixin",
     "EntityPlayerMPFakeMixin",
     "LevelMutationRevisionMixin",
     "MsgCommandMixin",
+    "PlayerObservationEventsMixin",
     "ServerPlayerGameModeBreakAccessor",
     "ServerPlayerGameModeMixin"
   ],

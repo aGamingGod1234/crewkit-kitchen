@@ -392,6 +392,19 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 				finally { this.recoveryHandles = Math.max(0, this.recoveryHandles - 1); }
 			});
 		}
+		if (type === 'inspection_request') {
+			const dispatchEpoch = this.#connectionEpoch;
+			queueMicrotask(() => {
+				if (dispatchEpoch !== this.#connectionEpoch || envelope.payload.goalRevision !== this.#record.goalRevision) return;
+				const { requestId, goalRevision, query } = envelope.payload;
+				if (query.section !== 'observation') {
+					this.#emitInbound('inspection_result', { requestId, goalRevision, error: { code: 'UNSUPPORTED_INSPECTION', message: 'This fault fixture supports fresh observations only' } }, dispatchEpoch);
+					return;
+				}
+				const observation = structuredClone(this.publishObservation({ attention: false }));
+				this.#emitInbound('inspection_result', { requestId, goalRevision, result: { section: 'observation', eventSequence: observation.eventSequence, observation } }, dispatchEpoch);
+			});
+		}
 		if (type === 'action_command') {
 			const dispatchEpoch = this.#connectionEpoch;
 			queueMicrotask(() => { void this.#executeAction(envelope.payload, dispatchEpoch); });

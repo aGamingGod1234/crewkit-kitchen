@@ -10,6 +10,8 @@ public final class MenuCapabilityRegistryVerification {
 	public static int verify() {
 		int assertions = 0;
 		for (String menuId : List.of(
+				"minecraft:inventory", "minecraft:hopper", "minecraft:shulker_box", "minecraft:generic_9x6",
+				"minecraft:grindstone", "minecraft:cartography_table", "minecraft:beacon", "minecraft:horse",
 				"minecraft:merchant",
 				"minecraft:enchantment",
 				"minecraft:anvil",
@@ -18,7 +20,7 @@ public final class MenuCapabilityRegistryVerification {
 				"minecraft:loom",
 				"minecraft:stonecutter"
 		)) {
-			if (MenuCapabilityRegistry.requireSupported(menuId).isEmpty()) {
+			if (!MenuCapabilityRegistry.requireSupported(menuId).containsAll(List.of("menu_click", "menu_close"))) {
 				throw new AssertionError("Expected capabilities for " + menuId);
 			}
 			assertions++;

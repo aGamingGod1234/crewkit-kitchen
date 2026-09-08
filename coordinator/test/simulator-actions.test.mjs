@@ -289,9 +289,11 @@ test('direct messages accept the production code-point maximum and reject one be
 
 test('every production action type is implemented or terminates with an explicit simulator failure', () => {
 	const uuid = MOB;
+	const inputFrame = { forward: 1, strafe: 0, jump: false, sneak: false, sprint: true, attack: false, use: false, yaw: 0, pitch: 0, selectedSlot: 0, hand: 'main', ticks: 1 };
 	const validArguments = {
 		move_to: { x: 1, y: 1, z: 0, tolerance: 0.1, sprint: false },
-		control: { forward: 1, strafe: 0, jump: false, sneak: false, sprint: true, attack: false, use: false, yaw: 0, pitch: 0, selectedSlot: 0, hand: 'main', ticks: 1 },
+		control: inputFrame,
+		control_sequence: { frames: [inputFrame], maxTicks: 1 },
 		look_at: { x: 1, y: 1, z: 0 },
 		attack: { targetId: uuid, timeoutMs: 1_000 },
 		select_item: { itemId: 'minecraft:stick' },
@@ -316,11 +318,19 @@ test('every production action type is implemented or terminates with an explicit
 		interact_entity: { targetId: uuid, hand: 'main', expectedItemId: 'minecraft:stick' },
 		dismount: {},
 		start_fall_flying: {},
+		wake_up: {},
+		set_flight: { enabled: true },
+		write_sign: { x: 1, y: 1, z: 0, front: true, lines: ['marker', '', '', ''], expectedLines: ['', '', '', ''] },
+		edit_book: { slot: 0, pages: ['field notes'], expectedFingerprint: 'fixture-fingerprint' },
+		menu_click: { menuId: 'menu', containerId: 1, stateId: 0, slot: 0, button: 0, clickType: 'PICKUP', expectedItemId: 'minecraft:stick', expectedCount: 1 },
+		menu_close: { menuId: 'menu', containerId: 1, stateId: 0 },
+		beacon_effects: { menuId: 'menu', containerId: 1, stateId: 0, primaryEffectId: 'minecraft:speed', secondaryEffectId: 'minecraft:regeneration' },
 		menu_transfer: { menuId: 'menu', sourceSlot: 0, destinationSlot: 1, count: 1, expectedItemId: 'minecraft:stick', timeoutMs: 1_000 },
 		menu_button: { menuId: 'menu', buttonId: 0, timeoutMs: 1_000 },
 		anvil_rename: { menuId: 'menu', name: 'name', timeoutMs: 1_000 },
 		respawn: {},
 	};
+	assert.deepEqual(Object.keys(validArguments).sort(), Object.keys(ACTION_FIELDS).sort(), 'each production action needs a valid fixture before simulator support can be evaluated');
 	for (const actionType of Object.keys(ACTION_FIELDS)) {
 		const simulationWorld = world({ entities: [{ id: uuid, type: 'minecraft:zombie', position: { x: 1, y: 1, z: 0 }, health: 3, maxHealth: 3 }], blocks: [{ x: 0, y: 0, z: 0, blockId: 'minecraft:stone' }, { x: 1, y: 0, z: 0, blockId: 'minecraft:crafting_table' }, { x: 1, y: 1, z: 0, blockId: 'minecraft:stone' }], agents: { [PLAYER]: { position: { x: 0, y: 1, z: 0 }, onGround: true, inventory: { items: [{ itemId: 'minecraft:stick', count: 4, slot: 0 }, { itemId: 'minecraft:cobblestone', count: 4, slot: 1 }, { itemId: 'minecraft:oak_log', count: 4, slot: 2 }] } } } });
 		const runtime = new ActionRuntime();

@@ -226,6 +226,7 @@ test('enabled telemetry does not alter fixture action command bytes', async () =
 		registry.register(record);
 		const bridge = new FakeMinecraftBridge({ record, recorder });
 		const manager = new ProgramRuntimeManager({
+			sessionId: 'fixture-telemetry-action-bytes',
 			registry,
 			bridge,
 			planner: { requestPlan: async () => ({ directive: 'continue' }) },

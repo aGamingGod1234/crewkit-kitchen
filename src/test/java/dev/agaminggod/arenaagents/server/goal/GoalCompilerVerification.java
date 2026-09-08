@@ -43,6 +43,8 @@ public final class GoalCompilerVerification {
 		assertions += verifyKillCountTranslationBounds();
 		assertions += verifyTranslatedKillConstraints();
 		assertions += verifyTranslatedItemConstraints();
+		assertions += verifyRegistryCategoryTranslation();
+		assertions += verifyInventoryGroupConstraints();
 		assertions += verifyExplicitAlternativeCandidates();
 		assertions += verifyDraftRoundTrip();
 		assertions += verifyWorldValidation();
@@ -584,9 +586,9 @@ public final class GoalCompilerVerification {
 				"compound clauses union item and kill alternatives"
 		);
 		assertEquals(
-				List.of(),
+				List.of("minecraft:compass", "minecraft:recovery_compass"),
 				compiler.candidateIdsFor("Get a compass to find iron or diamond", RegistryAccess.EMPTY),
-				"or in an unrelated purpose phrase does not publish a partial candidate list"
+				"purpose qualifiers do not invent item alternatives from unrelated nouns"
 		);
 		assertEquals(
 				List.of("minecraft:diamond"),
@@ -807,6 +809,93 @@ public final class GoalCompilerVerification {
 				kills("minecraft:zombie", 3)
 		))), "mixed translations preserve both item and kill quantities");
 		return 19;
+	}
+
+	private static int verifyRegistryCategoryTranslation() {
+		GoalCompiler compiler = new GoalCompiler();
+		String request = "Collect at least one log from any tree and keep it in your inventory.";
+		List<String> logs = net.minecraft.core.registries.BuiltInRegistries.ITEM.keySet().stream()
+				.filter(id -> id.getPath().endsWith("_log")).map(Object::toString).sorted().toList();
+		assertTrue(logs.size() > 16, "registry fixture exceeds the old any-of leaf limit");
+		assertEquals(logs, compiler.candidateIdsFor(request, RegistryAccess.EMPTY),
+				"qualified category retrieves every registered matching item without selecting a progression strategy");
+		assertEquals(GoalCompilation.Kind.NEEDS_TRANSLATION, compiler.compile(request, RegistryAccess.EMPTY, 1000).kind(),
+				"registry retrieval leaves interpretation of the full request to the model");
+		GoalTranslationConstraint constraint = compiler.translationConstraintFor(request, RegistryAccess.EMPTY);
+		assertEquals(1, constraint.itemClauses().size(), "retaining referenced items does not invent another item requirement");
+		assertEquals(logs, constraint.itemClauses().getFirst().alternatives().getFirst().itemIds(),
+				"the translated identifier catalog and required category use the same registry candidates");
+		assertSucceeds(() -> constraint.validate(new GoalPredicate.InventoryContainsAny(logs, 1)),
+				"the complete category remains representable in one model-authored predicate");
+		expectCode("GOAL_TRANSLATION_CONSTRAINT_MISMATCH", () -> constraint.validate(new GoalPredicate.OperatorConfirmed()),
+				"subjective confirmation cannot replace an explicit inventory requirement");
+		for (String verb : List.of("Gather", "Acquire", "Fetch", "Obtain")) {
+			String qualified = verb + " at least three logs from nearby trees and retain them with you";
+			assertEquals(logs, compiler.candidateIdsFor(qualified, RegistryAccess.EMPTY), "ordinary verb and plural wording uses the same catalog");
+			GoalTranslationConstraint counted = compiler.translationConstraintFor(qualified, RegistryAccess.EMPTY);
+			assertSucceeds(() -> counted.validate(new GoalPredicate.InventoryContainsAny(logs, 3)), "spoken minimum quantities remain enforceable");
+			expectCode("GOAL_TRANSLATION_CONSTRAINT_MISMATCH", () -> counted.validate(new GoalPredicate.InventoryContainsAny(logs, 2)),
+					"qualified wording cannot lower the requested count");
+		}
+		List<String> axes = compiler.candidateIdsFor("Acquire two iron axes from a chest", RegistryAccess.EMPTY);
+		assertEquals(List.of("minecraft:iron_axe"), axes, "plural noun forms and source qualifiers work outside the original category");
+		assertSucceeds(() -> compiler.translationConstraintFor("Acquire two iron axes from a chest", RegistryAccess.EMPTY)
+				.validate(new GoalPredicate.InventoryContains("minecraft:iron_axe", 2)), "catalog and constraints preserve ordinary spoken quantities");
+		assertEquals(List.of("minecraft:iron_pickaxe"), compiler.candidateIdsFor("Get minecraft:iron_pickaxe for later", RegistryAccess.EMPTY),
+				"namespaced identifiers retain underscores during qualifier retrieval");
+		assertEquals(List.of("minecraft:cookie"), compiler.candidateIdsFor("Get two cookies for later", RegistryAccess.EMPTY),
+				"plural words ending in ies retain their registered singular e form");
+		expectCode("GOAL_TRANSLATION_CANDIDATES_UNAVAILABLE",
+				() -> compiler.translationConstraintFor("Get two nonexistent_widgets", RegistryAccess.EMPTY),
+				"unmatched factual clauses fail before an impossible provider retry loop");
+		expectCode("GOAL_TRANSLATION_CATALOG_TOO_BROAD",
+				() -> compiler.translationConstraintFor("Get stairs or slab", RegistryAccess.EMPTY),
+				"over-broad categories fail instead of silently dropping required eligible identifiers");
+		return 25;
+	}
+
+	private static int verifyInventoryGroupConstraints() {
+		List<String> first = List.of("minecraft:oak_log", "minecraft:birch_log");
+		List<String> second = List.of("minecraft:birch_log", "minecraft:spruce_log");
+		GoalTranslationConstraint category = inventoryConstraint(List.of(first), List.of(3));
+		assertSucceeds(() -> category.requireCatalog(first), "the actual offered catalog contains all required category identifiers");
+		expectCode("GOAL_TRANSLATION_CATALOG_MISMATCH", () -> category.requireCatalog(List.of("minecraft:oak_log", "minecraft:diamond")),
+				"an unrelated offered candidate cannot conceal a required identifier omitted by a bounded mixed catalog");
+		assertSucceeds(() -> category.validate(new GoalPredicate.AllOf(List.of(
+				new GoalPredicate.InventoryContains("minecraft:oak_log", 1), new GoalPredicate.InventoryContains("minecraft:birch_log", 2)))),
+				"disjoint exact stacks sum toward a category quantity");
+		assertSucceeds(() -> category.validate(new GoalPredicate.InventoryContainsAny(first, 3)), "a matching group proves its summed minimum");
+		expectCode("GOAL_TRANSLATION_CONSTRAINT_MISMATCH", () -> category.validate(
+				new GoalPredicate.InventoryContainsAny(List.of("minecraft:oak_log", "minecraft:diamond"), 3)),
+				"unrelated inventory variants cannot widen a requested category");
+		GoalTranslationConstraint repeated = inventoryConstraint(List.of(first, first), List.of(2, 3));
+		assertSucceeds(() -> repeated.validate(new GoalPredicate.InventoryContainsAny(first, 5)),
+				"one group can prove repeated requested quantities by consuming its guarantee once");
+		expectCode("GOAL_TRANSLATION_CONSTRAINT_MISMATCH", () -> repeated.validate(new GoalPredicate.AllOf(List.of(
+				new GoalPredicate.InventoryContainsAny(first, 2), new GoalPredicate.InventoryContainsAny(first.reversed(), 3)))),
+				"identical unordered evidence groups merge by maximum and cannot fake additive counts");
+		GoalTranslationConstraint overlap = inventoryConstraint(List.of(first, second), List.of(2, 2));
+		expectCode("GOAL_TRANSLATION_CONSTRAINT_MISMATCH", () -> overlap.validate(new GoalPredicate.AllOf(List.of(
+				new GoalPredicate.InventoryContainsAny(first, 2), new GoalPredicate.InventoryContainsAny(second, 2)))),
+				"overlapping group guarantees cannot count the same two birch logs twice");
+		assertSucceeds(() -> overlap.validate(new GoalPredicate.AllOf(List.of(
+				new GoalPredicate.InventoryContains("minecraft:oak_log", 2), new GoalPredicate.InventoryContains("minecraft:spruce_log", 2)))),
+				"independent exact witnesses preserve overlapping requested categories");
+		GoalTranslationConstraint scarcity = inventoryConstraint(List.of(first, List.of("minecraft:birch_log")), List.of(2, 2));
+		assertSucceeds(() -> scarcity.validate(new GoalPredicate.AllOf(List.of(
+				new GoalPredicate.InventoryContains("minecraft:birch_log", 2), new GoalPredicate.InventoryContains("minecraft:oak_log", 2)))),
+				"category allocation preserves evidence needed by a later specific clause");
+		expectCode("GOAL_TRANSLATION_CONSTRAINT_MISMATCH", () -> category.validate(new GoalPredicate.AnyOf(List.of(
+				new GoalPredicate.InventoryContainsAny(first, 3), new GoalPredicate.OperatorConfirmed()))),
+				"every branch must retain the objective category count");
+		return 11;
+	}
+
+	private static GoalTranslationConstraint inventoryConstraint(List<List<String>> groups, List<Integer> counts) {
+		List<GoalTranslationConstraint.ItemClause> clauses = new ArrayList<>();
+		for (int index = 0; index < groups.size(); index++) clauses.add(new GoalTranslationConstraint.ItemClause(List.of(
+				new GoalTranslationConstraint.ItemAlternative(groups.get(index), counts.get(index)))));
+		return new GoalTranslationConstraint(List.of(), clauses);
 	}
 
 	private static int verifyDraftRoundTrip() {
