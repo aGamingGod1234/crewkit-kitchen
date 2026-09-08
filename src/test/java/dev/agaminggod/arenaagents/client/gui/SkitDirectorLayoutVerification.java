@@ -39,7 +39,7 @@ public final class SkitDirectorLayoutVerification {
 			((ConsoleButton) screen.children().get(2)).onClick(null, false);
 			check(screen.children().stream().anyMatch(child -> child.getClass().getSimpleName().equals("ConsoleDropdown")), "voice picker opens a list rather than cycling voices");
 			((ConsoleButton) screen.children().getFirst()).onClick(null, false);
-			int assertions = 1 + verifyDropdownAndGeneration() + verifySnapshotEditing() + verifyCommandResults() + verifyEditorResponses();
+			int assertions = 1 + verifySimpleViews() + verifyDropdownAndGeneration() + verifySnapshotEditing() + verifyCommandResults() + verifyEditorResponses();
 			for (var child : screen.children()) {
 				if (child instanceof ConsoleButton button && button.getMessage().getString().equals("Place here")) {
 					button.onClick(null, false);
@@ -49,12 +49,12 @@ public final class SkitDirectorLayoutVerification {
 			}
 			for (int tab = 0; tab < 4; tab++) {
 				((ConsoleButton) screen.children().get(tab)).onClick(null, false);
-				int expected = screen.children().size() - 5;
+				int expected = screen.children().size() - 6;
 				Set<String> reached = new HashSet<>();
 				do {
 					AbstractWidget tabButton = (AbstractWidget) screen.children().get(tab);
 					AbstractWidget back = (AbstractWidget) screen.children().getLast();
-					for (int index = 4; index < screen.children().size() - 1; index++) {
+					for (int index = 4; index < screen.children().size() - 2; index++) {
 						AbstractWidget widget = (AbstractWidget) screen.children().get(index);
 						if (!widget.visible) continue;
 						check(widget.getY() >= tabButton.getBottom() + 6 && widget.getBottom() <= back.getY() - 6,
@@ -90,6 +90,30 @@ public final class SkitDirectorLayoutVerification {
 		} finally {
 			AgentControlCatalog.installRuntimeCatalog(previous);
 		}
+	}
+
+	private static int verifySimpleViews() throws Exception {
+		DirectorClientState.clear();
+		var screen = fixture();
+		set(screen, SkitDirectorScreen.class, "detailMode", false);
+		screen.resize(800, 500);
+		int checks = 0;
+		for (int tab = 0; tab < 4; tab++) {
+			((ConsoleButton) screen.children().get(tab)).onClick(null, false);
+			long buttons = screen.children().stream().filter(child -> child instanceof ConsoleButton button && button.visible).count();
+			check(buttons <= 11, "simple tabs limit visible commands including navigation");
+			check(screen.children().stream().noneMatch(child -> child instanceof AbstractWidget widget && widget.getMessage().getString().startsWith("Tone:")), "technical settings stay out of the simple view");
+			checks += 2;
+		}
+		((ConsoleButton) screen.children().get(1)).onClick(null, false);
+		edit(screen, "actionDescription").setValue("Fly here and wave");
+		var open = screen.children().stream().filter(child -> child instanceof ConsoleButton button && button.getMessage().getString().equals("Saved scripts and editing")).map(ConsoleButton.class::cast).findFirst().orElseThrow();
+		open.onClick(null, false);
+		check(get(screen, "detailMode").equals(true) && edit(screen, "actionDescription").getValue().equals("Fly here and wave"), "opening editing preserves the natural-language draft");
+		var back = screen.children().stream().filter(child -> child instanceof ConsoleButton button && button.getMessage().getString().equals("Simple view")).map(ConsoleButton.class::cast).findFirst().orElseThrow();
+		back.onClick(null, false);
+		check(get(screen, "detailMode").equals(false) && edit(screen, "actionDescription").getValue().equals("Fly here and wave"), "returning to simple view preserves the draft");
+		return checks + 2;
 	}
 
 	private static int verifyDropdownAndGeneration() throws Exception {
@@ -233,6 +257,7 @@ public final class SkitDirectorLayoutVerification {
 		set(screen, SkitDirectorScreen.class, "fieldLabels", new HashMap<>());
 		set(screen, SkitDirectorScreen.class, "libraries", new HashMap<>());
 		set(screen, SkitDirectorScreen.class, "selectedRow", -1);
+		set(screen, SkitDirectorScreen.class, "detailMode", true);
 		set(screen, SkitDirectorScreen.class, "deleteConfirmation", "");
 		Field tab = SkitDirectorScreen.class.getDeclaredField("tab");
 		tab.setAccessible(true);

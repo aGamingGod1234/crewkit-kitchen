@@ -26,7 +26,7 @@ test('every new Director choice crosses HTTP validation and reaches synthesis', 
   const { createVoiceHttpServer, createVoiceRequestHeaders } = await import('../src/voice/voice-http-server.mjs');
   const references = [];
   const secret = 'director-catalog-fixture';
-  const worker = createVoiceHttpServer({ provider: { async synthesize(request) {
+  const worker = createVoiceHttpServer({ provider: null, fishProvider: { async synthesize(request) {
     references.push(request.voiceId);
     return { sampleRateHz: 48000, channels: 1, sampleFormat: 's16le', pcm: Buffer.alloc(960) };
   } }, profileStore: new VoiceProfileStore(), secret, port: 0 });
@@ -44,3 +44,27 @@ test('every new Director choice crosses HTTP validation and reaches synthesis', 
     assert.deepEqual(references, directorVoiceProfiles().map(choice => choice.voiceId));
   } finally { await worker.close(); }
 });
+
+for (const mode of ['configured', 'missing', 'rejected']) {
+ test(`Director Fish selection never substitutes Windows speech: ${mode}`, async () => {
+  const { createVoiceHttpServer, createVoiceRequestHeaders } = await import('../src/voice/voice-http-server.mjs');
+  let windowsCalls = 0, fishCalls = 0;
+  const pcm = { sampleRateHz: 48000, channels: 1, sampleFormat: 's16le', pcm: Buffer.alloc(960) };
+  const secret = 'director-fish-routing-fixture';
+  const worker = createVoiceHttpServer({
+   provider: { cacheNamespace: () => 'windows/system-speech', async synthesize() { windowsCalls++; return pcm; } },
+   fishProvider: mode === 'missing' ? null : { cacheNamespace: () => 'fish/s2.1-pro-free/delivery-v1', async synthesize() { fishCalls++; if (mode === 'rejected') throw Object.assign(new Error('Fish key rejected'), { code: 'TTS_AUTH_REQUIRED' }); return pcm; } },
+   profileStore: new VoiceProfileStore(), secret, port: 0,
+  });
+  const address = await worker.start();
+  try {
+   const body = JSON.stringify({ agentId: ACTOR, text: 'Hello.', profileId: 'voice.laura.v1', radius: 48, conversationSequence: 1, speed: 1, tone: 'neutral' });
+   const response = await fetch(`http://127.0.0.1:${address.port}/v1/tts`, { method: 'POST', headers: { ...createVoiceRequestHeaders({ secret, path: '/v1/tts', contentType: 'application/json', body: Buffer.from(body) }), 'Content-Type': 'application/json' }, body });
+   assert.equal(response.status, mode === 'configured' ? 200 : mode === 'missing' ? 503 : 502);
+   assert.equal(windowsCalls, 0, 'Fish selections must never speak using the Windows robot');
+   if (mode === 'configured') { assert.match(response.headers.get('x-voice-synthesizer'), /^fish\//); await response.arrayBuffer(); }
+   else assert.match((await response.json()).message, /Fish/);
+   assert.equal(fishCalls, mode === 'missing' ? 0 : 1);
+  } finally { await worker.close(); }
+ });
+}

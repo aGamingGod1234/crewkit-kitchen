@@ -13,6 +13,7 @@ const DEFAULT_INITIAL_PROBE_DELAY_MS = 1_000;
 const DEFAULT_MAX_PROBE_DELAY_MS = 30_000;
 const DEFAULT_PROBE_TIMEOUT_MS = 10_000;
 const PROBE_PROFILE = builtInVoiceProfiles()[0];
+const FISH_DIRECTOR_PROFILES = new Set(directorVoiceProfiles().map(profile => profile.profileId));
 const AUTH_VERSION = 'arena-voice-v1';
 const AUTH_MAX_CLOCK_SKEW_MS = 30_000;
 const AUTH_NONCE_BYTES = 24;
@@ -21,6 +22,7 @@ const DEFAULT_STT_PLAYER_MIN_INTERVAL_MS = 1_000;
 
 export function createVoiceHttpServer({
 	provider,
+	fishProvider = null,
 	sttProvider = null,
 	profileStore,
 	secret,
@@ -39,6 +41,7 @@ export function createVoiceHttpServer({
 	probeTimeoutMs = DEFAULT_PROBE_TIMEOUT_MS,
 	onDiagnostic = null,
 } = {}) {
+	if (fishProvider !== null && typeof fishProvider?.synthesize !== 'function') throw new TypeError('fishProvider.synthesize is required');
 	if (provider !== null && typeof provider?.synthesize !== 'function') throw new TypeError('provider.synthesize is required');
 	if (profileStore === null || typeof profileStore?.resolve !== 'function') throw new TypeError('profileStore.resolve is required');
 	if (typeof secret !== 'string' || secret.length < 16) throw new TypeError('voice secret must contain at least 16 characters');
@@ -239,7 +242,14 @@ export function createVoiceHttpServer({
 			}
 			requireJsonContentType(request.headers['content-type']);
 			const payload = validateRequest(parseJson(requestBody));
-			if (provider === null) {
+			const requiresFish = FISH_DIRECTOR_PROFILES.has(payload.profileId);
+			const requestProvider = requiresFish ? fishProvider : provider;
+			if (requiresFish && requestProvider === null) {
+				const error = typedError('TTS_FISH_NOT_CONFIGURED', 'Fish Audio needs a valid API key on the host. Configure Fish and restart Minecraft; this voice cannot use local speech.');
+				error.httpStatus = 503;
+				throw error;
+			}
+			if (requestProvider === null) {
 				attemptedLifecycle = ttsLifecycle;
 				const error = typedError('TTS_UNAVAILABLE', 'Speech synthesis is not configured');
 				error.httpStatus = 503;
@@ -252,13 +262,14 @@ export function createVoiceHttpServer({
 				...selectedProfile,
 				speed: payload.profileId === 'voice.auto.v1' && !payload.explicitSpeed ? selectedProfile.speed : payload.speed,
 			});
-			const requestedProvider = effectiveProviderNamespace(provider);
+			const requestedProvider = effectiveProviderNamespace(requestProvider);
 			const cacheKey = synthesisCacheKey(profile, payload, requestedProvider);
 			const cached = cache.get(cacheKey);
 			let synthesis;
 			if (cached === null) {
-				attemptedLifecycle = ttsLifecycle;
+				attemptedLifecycle = requestProvider === provider ? ttsLifecycle : null;
 				const joined = joinTtsSynthesis({
+					requestProvider,
 					cacheKey,
 					profile,
 					payload,
@@ -299,7 +310,7 @@ export function createVoiceHttpServer({
 		return effectiveReservedStt > 0 && sttLifecycle.snapshot().state === 'ready' ? effectiveReservedStt : 0;
 	}
 
-	function joinTtsSynthesis({ cacheKey, profile, payload, signal }) {
+	function joinTtsSynthesis({ cacheKey, profile, payload, signal, requestProvider }) {
 		let entry = inFlightTts.get(cacheKey);
 		if (entry === undefined) {
 			if (providerTtsStalled || activeProviderTts >= maxProviderTts) {
@@ -310,6 +321,7 @@ export function createVoiceHttpServer({
 			const providerController = new AbortController();
 			entry = {
 				providerController,
+				tracksLifecycle: requestProvider === provider,
 				waiters: 0,
 				settled: false,
 				failed: false,
@@ -321,7 +333,7 @@ export function createVoiceHttpServer({
 			const current = entry;
 			entry.operation = Promise.resolve().then(async () => {
 				try {
-					const synthesized = validateSynthesis(await provider.synthesize({
+					const synthesized = validateSynthesis(await requestProvider.synthesize({
 						text: payload.text,
 						voiceId: profile.voiceId,
 						speed: profile.speed,
@@ -330,7 +342,7 @@ export function createVoiceHttpServer({
 					}));
 					const output = resampleS16leMono(synthesized.pcm, synthesized.sampleRateHz, 48_000, 20);
 					if (output.length === 0) throw typedError('TTS_MALFORMED_AUDIO', 'TTS output was empty');
-					const completedProvider = effectiveSynthesisNamespace(synthesized, provider);
+					const completedProvider = effectiveSynthesisNamespace(synthesized, requestProvider);
 					if (!providerController.signal.aborted && synthesized.cacheable !== false) {
 						const completedKey = synthesisCacheKey(
 							profile,
@@ -339,7 +351,7 @@ export function createVoiceHttpServer({
 						);
 						cache.set(completedKey, output);
 					}
-					if (!providerController.signal.aborted) ttsLifecycle.recordReady();
+					if (!providerController.signal.aborted && current.tracksLifecycle) ttsLifecycle.recordReady();
 					return Object.freeze({ pcm: output, effectiveProvider: completedProvider });
 				} catch (error) {
 					current.failed = true;
@@ -391,7 +403,7 @@ export function createVoiceHttpServer({
 	}
 
 	function recordTtsFlightFailure(entry) {
-		if (entry.failureRecorded || !entry.failed || entry.failure?.name === 'AbortError') return;
+		if (!entry.tracksLifecycle || entry.failureRecorded || !entry.failed || entry.failure?.name === 'AbortError') return;
 		entry.failureRecorded = true;
 		ttsLifecycle.recordFailure(entry.failure);
 	}

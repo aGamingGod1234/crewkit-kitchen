@@ -58,6 +58,7 @@ public final class SkitDirectorScreen extends Screen {
 	private boolean initialRead;
 	private int scrollRows;
 	private boolean buildingContent;
+	private boolean detailMode;
 	private Tab tab = Tab.SPAWN;
 	private String provider = "codex";
 	private String selectedActor = "";
@@ -152,14 +153,16 @@ public final class SkitDirectorScreen extends Screen {
 					() -> { tab = value; drafts.put("selected-tab", value.name()); scrollRows = 0; selectedRow = -1; rebuildWidgets(); if (tab == Tab.SPAWN || tab == Tab.ACTIONS || tab == Tab.VOICE) requestEditor("read", 0); }));
 		}
 		buildingContent = true;
-		switch (tab) {
+		if (!detailMode) initQuickView();
+		else switch (tab) {
 			case SPAWN -> { initSpawn(); initTake(); }
 			case ACTIONS -> initActions();
 			case VOICE -> initVoice();
 			case CAMERA -> initCamera();
 		}
 		buildingContent = false;
-		if (!compact()) {
+		if (detailMode) addRenderableWidget(button("Simple view", left + width - 110, panelTop() + panelHeight() - (compact() ? ROW : 30), 110, ROW, false, () -> { detailMode = false; scrollRows = 0; rebuildWidgets(); }));
+		if (!compact() && detailMode) {
 			addRenderableWidget(button("Play take", left + width - 172, top + 8, 75, ROW, false, () -> send("codex skit take play " + word(drafts.getOrDefault("director-take-name", "")))));
 			addRenderableWidget(button("Stop take", left + width - 91, top + 8, 75, ROW, false, () -> send("codex skit take stop")));
 		}
@@ -170,6 +173,79 @@ public final class SkitDirectorScreen extends Screen {
 	private void clearFields() {
 		actorName = scriptName = actionArgs = right = up = forward = null;
 		voiceText = voiceScript = voiceDelay = cameraPath = null;
+	}
+
+	/** Everyday controls stay separate from row editing and scene management. */
+	private void initQuickView() {
+		int[] c = columns();
+		int y = contentTop();
+		int full = c[2] * 2 + GAP;
+		switch (tab) {
+			case SPAWN -> {
+				actorName = addEdit("Actor name", "GPT 6-Astra", c[0], y, c[2], AgentConstants.MAX_USER_NAME_LENGTH, "director-actor-name");
+				addRenderableWidget(new ConsoleCycleButton<>(font, c[1], y, c[2], ROW, Component.literal("Appearance"), PROVIDERS, provider, this::title, value -> provider = value)).visible = contentVisible(y, ROW);
+				y += ROW + GAP;
+				boolean enabled = DirectorClientState.snapshot().map(value -> value.enabled()).orElse(false);
+				var spawn = addRenderableWidget(primary("Add actor here", c[0], y, full, ROW, this::summon));
+				spawn.active = enabled;
+				y += ROW + GAP;
+				if (!enabled) {
+					addRenderableWidget(button("Enable Director mode", c[0], y, full, ROW, false, () -> send("codex skit on")));
+					y += ROW + GAP;
+				}
+				addActorPicker(c[0], y, full);
+				y += ROW + GAP;
+				addRenderableWidget(button("Place selected actor here", c[0], y, full, ROW, false, () -> place("here")));
+				y += ROW + GAP;
+				openDetailsButton("Manage cast and scenes", c[0], y, full);
+			}
+			case ACTIONS -> {
+				addActorPicker(c[0], y, c[2]);
+				scriptName = addEdit("Script name", "intro", c[1], y, c[2], 64, "director-script-name");
+				y += ROW + GAP;
+				actionDescription = addEdit("What should happen?", "Fly here, land, then wave", c[0], y, full, 2048, "director-action-description");
+				y += ROW + GAP;
+				var generate = addRenderableWidget(primary(DirectorClientState.generationPending() ? "Luna is writing..." : "Write actions", c[0], y, full, ROW, this::generateScript));
+				generate.active = !DirectorClientState.generationPending();
+				y += ROW + GAP;
+				addRenderableWidget(button("Preview script", c[0], y, c[2], ROW, false, () -> scriptCommand("play")));
+				addRenderableWidget(button("Stop", c[1], y, c[2], ROW, false, () -> scriptCommand("stop")));
+				y += ROW + GAP;
+				openDetailsButton("Saved scripts and editing", c[0], y, full);
+			}
+			case VOICE -> {
+				addActorPicker(c[0], y, full);
+				loadActorVoice();
+				y += ROW + GAP;
+				voiceDropdown = addRenderableWidget(new ConsoleDropdown<>(font, c[0], y, full, ROW, "Voice", withSavedValue(VOICES, voice), voice, this::voiceLabel,
+						value -> { voice = value; drafts.put(voiceDraftKey("voice"), value); }, width, height));
+				voiceDropdown.visible = contentVisible(y, ROW);
+				y += ROW + GAP;
+				voiceText = addEdit("What should they say?", "Your line", c[0], y, full, 280, "director-voice-text");
+				y += ROW + GAP;
+				addRenderableWidget(primary("Listen", c[0], y, c[2], ROW, this::sayLine));
+				addRenderableWidget(button("Save actor voice", c[1], y, c[2], ROW, false, this::setVoice));
+				y += ROW + GAP;
+				openDetailsButton("Delivery and saved dialogue", c[0], y, full);
+			}
+			case CAMERA -> {
+				addRenderableWidget(primary("Get camera and rails", c[0], y, full, ROW, () -> send("codex skit camera kit")));
+				y += ROW + GAP;
+				cameraPath = addEdit("Shot name", "intro", c[0], y, full, 64, "director-camera-path");
+				y += ROW + GAP;
+				addRenderableWidget(button("Record dolly", c[0], y, c[2], ROW, false, () -> cameraStart(false)));
+				addRenderableWidget(button("Save shot", c[1], y, c[2], ROW, false, CameraDirectorClient::stopRecordingFromGui));
+				y += ROW + GAP;
+				addRenderableWidget(button("Preview shot", c[0], y, c[2], ROW, false, () -> cameraPlay(false)));
+				addRenderableWidget(button("Exit camera", c[1], y, c[2], ROW, false, CameraDirectorClient::stopPlaybackFromGui));
+				y += ROW + GAP;
+				openDetailsButton("Dolly controls and saved shots", c[0], y, full);
+			}
+		}
+	}
+
+	private void openDetailsButton(String label, int x, int y, int width) {
+		addRenderableWidget(button(label, x, y, width, ROW, false, () -> { detailMode = true; scrollRows = 0; rebuildWidgets(); requestEditor("read", 0); }));
 	}
 
 	private void initSpawn() {
@@ -732,7 +808,7 @@ public final class SkitDirectorScreen extends Screen {
 	private static int contentBottomInset(int panelHeight) { return panelHeight < 180 ? 32 : 42; }
 	private int contentBottom() { return panelTop() + panelHeight() - contentBottomInset(panelHeight()); }
 	private int contentTop() { return panelTop() + contentOffset(panelHeight()) - scrollRows * (ROW + GAP); }
-	private int maxScrollRows() { return maxScrollRows(panelHeight(), tab.rows + ((tab == Tab.SPAWN || tab == Tab.ACTIONS || tab == Tab.VOICE) ? 5 + libraries.getOrDefault(editorKind(), emptyLibrary()).rows().size() : 0)); }
+	private int maxScrollRows() { if (!detailMode) return maxScrollRows(panelHeight(), tab == Tab.SPAWN ? 6 : 5); return maxScrollRows(panelHeight(), tab.rows + ((tab == Tab.SPAWN || tab == Tab.ACTIONS || tab == Tab.VOICE) ? 5 + libraries.getOrDefault(editorKind(), emptyLibrary()).rows().size() : 0)); }
 	private static int maxScrollRows(int panelHeight, int rows) {
 		int visibleRows = Math.max(1, (panelHeight - contentOffset(panelHeight) - contentBottomInset(panelHeight) + GAP) / (ROW + GAP));
 		return Math.max(0, rows - visibleRows);

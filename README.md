@@ -96,7 +96,9 @@ does not give agents a second control system. Turn it on, summon a named agent,
 place it at your feet or at exact coordinates, then replay a saved timeline:
 
 For a point-and-click workflow, press `G` to open the Field Console and choose
-**Director**. Its Cast, Actions, Voice, and Camera tabs cover the staging workflow
+**Director**. Each tab opens with a focused simple view. Saved scripts, delivery settings,
+cast management, and dolly controls open separately; **Simple view** returns to the everyday controls.
+Its Cast, Actions, Voice, and Camera tabs cover the staging workflow
 without requiring chat commands. In Actions or Voice, create or load a saved script,
 select a row to edit it, then save the row. You can remove rows and undo your last edit.
 Creating an existing name is rejected instead of erasing its contents. The editor
@@ -112,7 +114,10 @@ message tells you when the script is saved. Review it before clicking Play.
 Voice choices appear in a dropdown as `Name - sound, gender`. Fish synthesis uses
 `s2.1-pro-free`. Character defaults give Astra, Fable, Grok, Gemini, and Kimi distinct
 original voices. **Say line** uses the currently selected settings; **Set voice**
-saves them for that actor's future dialogue.
+saves them for that actor's future dialogue. Named Director voices require Fish and
+never fall back to Windows or local synthesis. On the host, configure `FISH_AUDIO_API_KEY`
+or save a valid key in `arena-agents-runtime/runtime/fish-api-key.txt` beneath the game
+directory, then restart Minecraft. Missing or rejected keys produce a setup error.
 
 In Camera, choose **Get camera + dolly rails**. Lay rails on the floor and place the
 camera on a rail. Right-click it to look through the viewfinder; the mouse pans the

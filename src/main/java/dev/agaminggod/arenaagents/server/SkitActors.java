@@ -38,10 +38,19 @@ public final class SkitActors {
 		var label = net.minecraft.network.chat.Component.literal(actor.name());
 		if (!label.equals(player.getCustomName())) player.setCustomName(label);
 		player.setCustomNameVisible(true);
-		player.waypointIcon().color = Optional.of(0xFFFFFFFF);
-		player.waypointIcon().style = net.minecraft.resources.ResourceKey.create(
+		var style = net.minecraft.resources.ResourceKey.create(
 				net.minecraft.world.waypoints.WaypointStyleAssets.ROOT_ID,
 				net.minecraft.resources.Identifier.fromNamespaceAndPath("arenaagents", "agent/" + actor.profile().visualIdentity().transportCode()));
+		var icon = player.waypointIcon();
+		var color = Optional.of(0xFFFFFFFF);
+		if (!style.equals(icon.style) || !color.equals(icon.color)) {
+			// Vanilla's waypoint command reconnects viewers when changing an icon.
+			var manager = player.level().getWaypointManager();
+			manager.untrackWaypoint(player);
+			icon.style = style;
+			icon.color = color;
+			manager.trackWaypoint(player);
+		}
 	}
 
 	public static boolean reservesName(MinecraftServer server, String name) {

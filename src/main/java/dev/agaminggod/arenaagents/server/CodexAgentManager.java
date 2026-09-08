@@ -1284,7 +1284,12 @@ public final class CodexAgentManager {
 				WaypointStyleAssets.ROOT_ID,
 				Identifier.fromNamespaceAndPath("arenaagents", stylePath)
 		);
-		player.waypointIcon().style = style;
+		if (!style.equals(player.waypointIcon().style)) {
+			var manager = player.level().getWaypointManager();
+			manager.untrackWaypoint(player);
+			player.waypointIcon().style = style;
+			manager.trackWaypoint(player);
+		}
 	}
 
 	private void removeHiddenWorldName(String playerName) {
