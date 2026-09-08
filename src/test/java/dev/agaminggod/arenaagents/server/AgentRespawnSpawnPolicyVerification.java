@@ -234,7 +234,7 @@ public final class AgentRespawnSpawnPolicyVerification {
 				"legacy createFake failures retain their existing rollback semantics");
 		assertFalse(CodexAgentManager.shouldRetryConnectedRespawn(true, true, false),
 				"a superseded lifecycle cannot replay an old connected respawn commit");
-		return 56;
+		return 56 + AgentSummonNameVerification.verify();
 	}
 
 	private static CodexAgentManager.VanillaRespawnAttempt vanillaRespawnAttempt(AgentRecord deadRecord) {

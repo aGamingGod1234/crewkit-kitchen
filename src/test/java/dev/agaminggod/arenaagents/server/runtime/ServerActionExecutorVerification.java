@@ -29,7 +29,12 @@ import java.util.concurrent.atomic.AtomicInteger;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.world.InteractionHand;
+import net.minecraft.world.level.EmptyBlockGetter;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.shapes.Shapes;
+import net.minecraft.world.phys.shapes.VoxelShape;
 
 public final class ServerActionExecutorVerification {
 	private ServerActionExecutorVerification() {
@@ -189,7 +194,8 @@ public final class ServerActionExecutorVerification {
 						CHAT, WAIT, SET_DOOR, DROP_ITEM, TRANSFER_CONTAINER, CRAFT_INVENTORY, CRAFT_TABLE,
 						FURNACE_TRANSACTION, EQUIP_ITEM, SELECT_TOOL, BLOCK_WITH_SHIELD, USE_RANGED,
 						INTERACT_BLOCK, INTERACT_ENTITY, DISMOUNT, START_FALL_FLYING -> true;
-				case MENU_TRANSFER, MENU_BUTTON, ANVIL_RENAME -> true;
+				case MENU_TRANSFER, MENU_BUTTON, ANVIL_RENAME, MENU_CLICK, MENU_CLOSE,
+						CONTROL_SEQUENCE, WAKE_UP, SET_FLIGHT, WRITE_SIGN, EDIT_BOOK, BEACON_EFFECTS -> true;
 				case RESPAWN -> true;
 				default -> false;
 			};
@@ -330,7 +336,68 @@ public final class ServerActionExecutorVerification {
 			assertFalse(admitted[start], "round-robin does not admit an agent twice before the full turn");
 			admitted[start] = true;
 		}
-		return 107;
+		verifyModelOnlyControlBoundary();
+		return 112 + dev.agaminggod.arenaagents.protocol.PlayerActionSchemaVerification.verify()
+				+ dev.agaminggod.arenaagents.server.perception.PlayerKnowledgeInspectionVerification.verify()
+				+ verifyInteractionOutlineHit();
+	}
+
+	private static int verifyInteractionOutlineHit() {
+		BlockPos position = new BlockPos(2, 64, 0);
+		Vec3 eye = new Vec3(0.5D, 65.62D, 0.5D);
+		VoxelShape chest = Blocks.CHEST.defaultBlockState().getShape(EmptyBlockGetter.INSTANCE, position);
+		Vec3 unitFace = new Vec3(2.0D, 64.5D, 0.5D);
+		assertTrue(chest.clip(eye, unitFace.add(unitFace.subtract(eye).normalize().scale(0.001D)), position) == null,
+				"the unit-cube face ray stops before an inset chest outline");
+		Vec3 target = ServerActionExecutor.blockInteractionHitLocation(position, Direction.WEST, new JsonObject(), chest);
+		assertEquals(new Vec3(2.0625D, 64.4375D, 0.5D), target, "default chest aim uses its actual west outline face");
+		BlockHitResult hit = chest.clip(eye, target.add(target.subtract(eye).normalize().scale(0.001D)), position);
+		assertTrue(hit != null, "the corrected ray enters the chest outline");
+		assertEquals(Direction.WEST, hit.getDirection(), "the corrected ray hits the requested face");
+		assertEquals(position, hit.getBlockPos(), "the corrected ray retains the requested block identity");
+		assertEquals(unitFace, ServerActionExecutor.blockInteractionHitLocation(position, Direction.WEST,
+				new JsonObject(), Shapes.block()), "full-cube default face remains unchanged");
+		VoxelShape slab = Blocks.OAK_SLAB.defaultBlockState().getShape(EmptyBlockGetter.INSTANCE, position);
+		Vec3 slabTarget = ServerActionExecutor.blockInteractionHitLocation(position, Direction.UP, new JsonObject(), slab);
+		assertEquals(new Vec3(2.5D, 64.5D, 0.5D), slabTarget, "bottom slab aim uses its actual top surface");
+		assertEquals(Direction.UP, slab.clip(new Vec3(2.5D, 66.0D, 0.5D), slabTarget.add(0, -0.001D, 0), position).getDirection(),
+				"a short ray reaches the actual slab top");
+		JsonObject explicit = new JsonObject();
+		explicit.addProperty("hitX", 0.0D);
+		explicit.addProperty("hitY", 0.5D);
+		explicit.addProperty("hitZ", 0.5D);
+		Vec3 supplied = ServerActionExecutor.blockInteractionHitLocation(position, Direction.WEST, explicit, chest);
+		assertEquals(unitFace, supplied, "explicit hit offsets are never moved onto the outline");
+		assertTrue(chest.clip(eye, supplied.add(supplied.subtract(eye).normalize().scale(0.001D)), position) == null,
+				"an explicit ray that stops outside the outline remains invalid");
+		assertThrows(AgentDomainException.class, () -> ServerActionExecutor.blockInteractionHitLocation(
+				position, Direction.WEST, new JsonObject(), Shapes.empty()), "an absent outline cannot invent a default interaction surface");
+		assertEquals(unitFace, ServerActionExecutor.blockInteractionHitLocation(position, Direction.WEST, explicit, Shapes.empty()),
+				"explicit geometry remains authored even when the later vanilla trace cannot hit");
+		return 12;
+	}
+
+	private static void verifyModelOnlyControlBoundary() {
+		try (var compiledRuntime = ServerActionExecutorVerification.class.getResourceAsStream(
+				"/dev/agaminggod/arenaagents/server/CodexAgentServerRuntime.class")) {
+			assertTrue(compiledRuntime != null, "production runtime bytecode is present for the registration check");
+			String references = new String(compiledRuntime.readAllBytes(), java.nio.charset.StandardCharsets.ISO_8859_1);
+			assertFalse(references.contains("GoalSafetyController"), "compiled production runtime cannot register the removed autonomous safety controller");
+		} catch (java.io.IOException exception) {
+			throw new AssertionError("could not inspect production runtime registration", exception);
+		}
+		AgentId agent = AgentId.random();
+		JsonObject arguments = com.google.gson.JsonParser.parseString("{\"frames\":[{\"ticks\":5}],\"maxTicks\":5}").getAsJsonObject();
+		ActionProvenance provenance = new ActionProvenance("codex", "model", "high", "priority", "authored-control", 1L, "step-1", 1L);
+		ServerActionRequest unsigned = new ServerActionRequest(agent, 1L, "control-untraced", ActionType.CONTROL_SEQUENCE, arguments, provenance);
+		ServerActionExecutor executor = new ServerActionExecutor(uninitializedManager(), ignored -> { });
+		assertThrows(AgentDomainException.class, () -> executor.submitProgramPrimitive(unsigned),
+				"conditional input programs cannot bypass the model trace requirement");
+		assertThrows(NullPointerException.class, () -> new ServerActionRequest(agent, 1L, "control-no-author", ActionType.CONTROL_SEQUENCE, arguments, null),
+				"conditional input programs require author provenance before execution");
+		arguments.getAsJsonArray("frames").get(0).getAsJsonObject().addProperty("ticks", 200);
+		assertEquals(5, unsigned.arguments().getAsJsonArray("frames").get(0).getAsJsonObject().get("ticks").getAsInt(),
+				"a submitted model program owns a detached copy of every input frame");
 	}
 
 	private static void verifyDisconnectedControlNeutralizesLease() {

@@ -8,6 +8,8 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.Comparator;
 
 /** Server-authored factual requirements that a translated predicate may not weaken. */
 public record GoalTranslationConstraint(List<KillClause> killClauses, List<ItemClause> itemClauses) {
@@ -40,15 +42,29 @@ public record GoalTranslationConstraint(List<KillClause> killClauses, List<ItemC
 		return NONE;
 	}
 
+	/** A new translation request must offer every identifier needed by its factual constraints. */
+	public void requireCatalog(List<String> candidateIds) {
+		Set<String> offered = Set.copyOf(candidateIds);
+		if (candidateIds.size() > 64 || offered.size() != candidateIds.size()) {
+			throw new AgentDomainException("GOAL_TRANSLATION_CATALOG_TOO_BROAD", "Translation catalog must contain at most 64 unique identifiers");
+		}
+		boolean complete = killClauses.stream().flatMap(clause -> clause.alternatives().stream())
+				.allMatch(alternative -> !alternative.entityTypes().isEmpty() && offered.containsAll(alternative.entityTypes()))
+				&& itemClauses.stream().flatMap(clause -> clause.alternatives().stream())
+						.allMatch(alternative -> !alternative.itemIds().isEmpty() && offered.containsAll(alternative.itemIds()));
+		if (!complete) throw new AgentDomainException("GOAL_TRANSLATION_CATALOG_MISMATCH",
+				"Translation catalog omits a required item or entity identifier; specify a narrower goal");
+	}
+
 	public void validate(GoalPredicate predicate) {
 		Objects.requireNonNull(predicate, "predicate must not be null");
 		if (killClauses.isEmpty() && itemClauses.isEmpty()) return;
 		for (EvidencePath path : evidencePaths(predicate)) {
 			if (!satisfiesKillClauses(path.kills(), 0, new boolean[path.kills().size()])
-					|| !satisfiesItemClauses(new HashMap<>(path.items()), 0)) {
+					|| !satisfiesItemClauses(disjointInventoryEvidence(path.items()), 0)) {
 				throw new AgentDomainException(
 						"GOAL_TRANSLATION_CONSTRAINT_MISMATCH",
-						"Translated predicate does not preserve every requested item or kill count"
+						"Translated predicate does not prove every requested item or kill count; overlapping inventory groups may need a more specific predicate"
 				);
 			}
 		}
@@ -80,36 +96,71 @@ public record GoalTranslationConstraint(List<KillClause> killClauses, List<ItemC
 		return false;
 	}
 
-	private boolean satisfiesItemClauses(Map<String, Integer> available, int clauseIndex) {
+	private boolean satisfiesItemClauses(List<InventoryEvidence> available, int clauseIndex) {
 		if (clauseIndex == itemClauses.size()) return true;
 		for (ItemAlternative alternative : itemClauses.get(clauseIndex).alternatives()) {
-			for (String itemId : alternative.itemIds()) {
-				int prior = available.getOrDefault(itemId, 0);
-				if (prior < alternative.count()) continue;
-				available.put(itemId, prior - alternative.count());
-				if (satisfiesItemClauses(available, clauseIndex + 1)) return true;
-				available.put(itemId, prior);
+			ArrayList<InventoryEvidence> remaining = new ArrayList<>(available);
+			List<Integer> order = java.util.stream.IntStream.range(0, available.size()).boxed()
+					.sorted(Comparator.comparingInt(index -> futureUses(available.get(index), clauseIndex + 1))).toList();
+			int needed = alternative.count();
+			for (int index : order) {
+				InventoryEvidence evidence = remaining.get(index);
+				if (!alternative.itemIds().containsAll(evidence.itemIds())) continue;
+				int claimed = Math.min(needed, evidence.count());
+				needed -= claimed;
+				remaining.set(index, new InventoryEvidence(evidence.itemIds(), evidence.count() - claimed));
+				if (needed == 0) break;
 			}
+			if (needed == 0 && satisfiesItemClauses(remaining, clauseIndex + 1)) return true;
 		}
 		return false;
+	}
+
+	private int futureUses(InventoryEvidence evidence, int start) {
+		int uses = 0;
+		for (int index = start; index < itemClauses.size(); index++) {
+			if (itemClauses.get(index).alternatives().stream().anyMatch(value -> value.itemIds().containsAll(evidence.itemIds()))) uses++;
+		}
+		return uses;
+	}
+
+	/** Disjoint guarantees can add; overlapping guarantees cannot prove independent inventory counts. */
+	private static List<InventoryEvidence> disjointInventoryEvidence(List<InventoryEvidence> evidence) {
+		HashMap<Set<String>, Integer> strongest = new HashMap<>();
+		evidence.forEach(value -> strongest.merge(value.itemIds(), value.count(), Math::max));
+		List<InventoryEvidence> ordered = strongest.entrySet().stream()
+				.map(entry -> new InventoryEvidence(entry.getKey(), entry.getValue()))
+				.sorted(Comparator.comparingInt((InventoryEvidence value) -> value.itemIds().size())
+						.thenComparing(Comparator.comparingInt(InventoryEvidence::count).reversed())
+						.thenComparing(value -> String.join(",", new java.util.TreeSet<>(value.itemIds())))).toList();
+		ArrayList<InventoryEvidence> independent = new ArrayList<>();
+		HashSet<String> claimedIds = new HashSet<>();
+		for (InventoryEvidence value : ordered) {
+			if (value.itemIds().stream().anyMatch(claimedIds::contains)) continue;
+			independent.add(value);
+			claimedIds.addAll(value.itemIds());
+		}
+		return List.copyOf(independent);
 	}
 
 	private static List<EvidencePath> evidencePaths(GoalPredicate predicate) {
 		return switch (predicate) {
 			case GoalPredicate.EntityKilledByAgent value -> List.of(
-					new EvidencePath(List.of(value.entityType()), Map.of()));
+					new EvidencePath(List.of(value.entityType()), List.of()));
 			case GoalPredicate.InventoryContains value -> List.of(
-					new EvidencePath(List.of(), Map.of(value.itemId(), value.count())));
+					new EvidencePath(List.of(), List.of(new InventoryEvidence(Set.of(value.itemId()), value.count()))));
+			case GoalPredicate.InventoryContainsAny value -> List.of(
+					new EvidencePath(List.of(), List.of(new InventoryEvidence(Set.copyOf(value.itemIds()), value.count()))));
 			case GoalPredicate.AllOf value -> allOfPaths(value.predicates());
 			case GoalPredicate.AnyOf value -> value.predicates().stream()
 					.flatMap(child -> evidencePaths(child).stream())
 					.toList();
-			default -> List.of(new EvidencePath(List.of(), Map.of()));
+			default -> List.of(new EvidencePath(List.of(), List.of()));
 		};
 	}
 
 	private static List<EvidencePath> allOfPaths(List<GoalPredicate> predicates) {
-		List<EvidencePath> paths = List.of(new EvidencePath(List.of(), Map.of()));
+		List<EvidencePath> paths = List.of(new EvidencePath(List.of(), List.of()));
 		for (GoalPredicate predicate : predicates) {
 			ArrayList<EvidencePath> combined = new ArrayList<>();
 			for (EvidencePath left : paths) {
@@ -117,9 +168,9 @@ public record GoalTranslationConstraint(List<KillClause> killClauses, List<ItemC
 					ArrayList<String> kills = new ArrayList<>(left.kills().size() + right.kills().size());
 					kills.addAll(left.kills());
 					kills.addAll(right.kills());
-					HashMap<String, Integer> items = new HashMap<>(left.items());
-					right.items().forEach((itemId, count) -> items.merge(itemId, count, Math::max));
-					combined.add(new EvidencePath(List.copyOf(kills), Map.copyOf(items)));
+					ArrayList<InventoryEvidence> items = new ArrayList<>(left.items());
+					items.addAll(right.items());
+					combined.add(new EvidencePath(List.copyOf(kills), List.copyOf(items)));
 				}
 			}
 			paths = List.copyOf(combined);
@@ -127,7 +178,9 @@ public record GoalTranslationConstraint(List<KillClause> killClauses, List<ItemC
 		return paths;
 	}
 
-	private record EvidencePath(List<String> kills, Map<String, Integer> items) {
+	private record InventoryEvidence(Set<String> itemIds, int count) {}
+
+	private record EvidencePath(List<String> kills, List<InventoryEvidence> items) {
 	}
 
 	public record KillClause(List<KillAlternative> alternatives) {

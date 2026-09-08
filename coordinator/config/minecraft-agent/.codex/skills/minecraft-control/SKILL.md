@@ -1,963 +1,581 @@
 ---
 name: minecraft-control
-description: Use when controlling the embodied Minecraft player through native executor tools.
+description: Control the embodied Minecraft player through factual observations, native tools, and bounded input programs.
 ---
 
-# Minecraft executor tool calls
+# Minecraft player control
 
-## Output contract
+Use native tools to act in the world. Plain assistant text has no Minecraft effect. You choose targets, routes, resources, reactions, and retries. The executor applies the inputs you authorize and reports what happened.
 
-Tell the executor what to do by emitting a native tool call. Plain assistant text does nothing in Minecraft. A turn may contain several tool calls. The executor runs them one at a time and returns a structured result after each call. Read that result before emitting a later call whose arguments depend on it.
+## Read facts, choose, act, verify
 
-Use this loop:
+1. Read the current goal, newest event, and last result. Use capabilities for supported fields, runtime availability, and requested versus effective execution settings. Observe repeats the effective settings; a provider mapping does not change your selected identity.
+2. Use observe for a new sample and inspect for details. Check freshness, coverage, world identity, dimension, and revisions before relying on a fact.
+3. Choose a tool or bounded program using observed targets and your own strategy. Sequence only steps whose arguments are already known; inspect results before choosing dependent actions.
+4. Distinguish accepted input, attempted use, projectile spawn, verified effect, and verified goal. Finish asks the server to check the immutable goal contract. A failed check leaves it active.
 
-1. Read the newest event and the last tool result. Death is the same run and the same goal, not a new episode.
-2. If a required coordinate, UUID, inventory fact, or world fact is missing or stale, call observe where needed.
-3. Emit a useful speech or physical call using exact observed facts. Honor recovery, options, and failureClass as hints, not orders.
-4. Read the result. Continue the active goal, recover, explore, or finish with evidence.
+## Observations and memory
 
-Recovery is coordinator-authored observation data, not a new planner. After death it names `lastDeath`, current inventory, `lastLostInventory`, and currently evidenced `alreadyHave` so you can choose whether to go back for the corpse or recraft. When present, `options[]` lists currently feasible skills (`recover_corpse`, `explore_frontier`, `interact_cue`) and `failureClass` labels the last body fault (`recover`, `replan`, `explore`, `skip`). The wrap never dispatches an action for you.
+Observe reports freshness.fresh for the sample barrier. False identifies cached facts. rememberedSections identifies older sections retained during death. A missing entity, block, or slot may be omitted by coverage limits rather than absent. Images and hidden server state are outside this interface.
 
-Formatting, Good, and Bad blocks each show one direct native tool call. Only an explicitly combined turn uses a calls array. Formatting blocks show every accepted field, and all numeric ranges are inclusive. Required fields must be present. Optional fields may be omitted; never copy placeholder text into a call. Do not send unknown fields or arithmetic expressions. Copy coordinates, UUIDs, item IDs, recipe IDs, menu IDs, slots, selectors, and block faces from current observations or tool results.
+Inspect supports inventory, menu, entities, blocks, landmarks, nearby_containers, item, block, events, recipes, and mechanics. Pages use offset 0..4096 and limit 1..32. Item detail requires slot; block detail requires visible x/y/z. Events accept afterSequence for newly delivered player-accessible events. Recipes lists installed rules; an exact recipeId retrieves its ingredient, result, and workstation display details with explicit coverage. Mechanics reports installed version and current native player attributes and abilities. Recipe rules do not reveal hidden resources or positions. Copy returned stack fingerprints, containerId, stateId, raw slot indexes, target identities, and hit geometry. Continue a shortened page using nextOffset; unreturned details remain unknown.
 
-# Top-level tools
+ExploreFrontier lists observed positions and unknown neighboring cells. It never chooses or travels to a destination. Reachability remains unknown until checked by the body. Choose coordinates explicitly with moveTo or input frames. Stored places are scoped to world and dimension and can become stale.
 
-## observe - Refresh the latest compact player, inventory, nearby block, farther visible landmark, entity, goal, conversation, and recovery facts.
+Notebook stores model-authored notes up to 2048 characters. QueryMemory returns historical notes and action receipts with separate provenance; pass offset or the returned nextOffset to continue a page. DISPATCHED and UNKNOWN are unresolved operations, not successful effects. Query kind unresolved retrieves their arguments; observe and capabilities report a bounded summary and count. Receipts distinguish server results from coordinator uncertainty and report evictions. Notes are hypotheses or remembered plans, not proof of current state. After reconnect or context replacement, compare uncertain operations with fresh facts before deciding whether to retry. Death retains the goal where lifecycle policy permits it; current inventory, lastDeath, and lastLostInventory are distinct facts.
 
-Formatting:
+## Input ownership and precision
 
-```text executor-format
-{"tool":"observe","arguments":{}}
-```
+Control holds a complete frame for 1 to 200 server ticks. Supply every input, including false buttons, view, hand, and selectedSlot. Completion, cancellation, and expired leases release input. Vanilla game-mode and interaction restrictions remain authoritative.
 
-Good:
+Act with control_sequence runs 1 to 64 complete frames with maxTicks from 1 to 2000. Each frame has 1 to 200 ticks and up to 16 optional branches. The server checks branches before applying each tick. The first matching branch jumps to its zero-based nextFrame; an index equal to the frame count stops. A jump resets that frame duration. Backward jumps remain bounded by maxTicks. The complete action arguments must fit 32768 UTF-8 JSON bytes, including all frames, branches, or book pages. Per-field limits do not waive this total budget.
+
+Branches read only your player facts. Numeric conditions are health_below (0..2048), food_below (0..20), and air_below (0..100000). Boolean conditions are on_fire, in_water, on_ground, horizontal_collision, hurt, and using_item. You author both condition and response. A completed frame program proves input execution; it does not prove your larger intended effect.
+
+StartAction returns a handle immediately. ActionStatus reads its state or terminal receipt. CancelAction requires the exact actionId and goalRevision and waits for acknowledgement. ReplaceAction starts its replacement only after CANCELLED. If cancellation is unconfirmed or the old action already completed, reassess before another mutation.
+
+RunProgram executes your ArenaScript using the same interpreter as script mode. Source is at most 65536 UTF-8 bytes; maxActions defaults to 64 and caps at 256; timeoutMs defaults to 30000 and caps at 120000. Author an explicit program.onUnhandledAttention mode: continue_and_notify completes the current action before yielding; pause_and_notify cancels it before yielding. Watchers, branches, selected targets, and reactions come from your source. No other model plans its steps. Player calls await correlated physical results and new observation barriers; world.inspect and world.queryMemory are bounded reads, world.remember writes your notes. A deadline or lifecycle change stops further steps and requests release of its physical action; unknown acknowledgement remains uncertain. Program completion or program.finish yields to you; use the separate finish tool for factual goal verification.
+
+## Interaction details
+
+Mining requires an observed, visible, reachable non-air expectedBlockId. A broken block does not prove its drop entered inventory. Melee attempts and bow release do not prove a hit. Use effect evidence, inventory changes, and fresh observations.
+
+Menu clicks use the current menuId, containerId, stateId, raw slot, button, clickType, expectedItemId, and expectedCount. Include expectedFingerprint for exact variants. Inspect after a click because cursor, slots, costs, and options can change. Generic clicks preserve a held cursor; close explicitly when appropriate. Provide containerId and stateId together for legacy menu operations. A rejected or partial operation is not automatically safe to repeat.
+
+Block hit offsets are within the block from 0 to 1. Entity hit offsets are relative to the observed entity position. Copy usable hit geometry and choose the hand explicitly. Sign writes compare expectedLines; book edits compare expectedFingerprint. A book title signs it. Beacon effects use observed legal effect IDs or none. Mechanics still depend on current world, menu, and game-mode state.
+
+## Tool examples
+
+These examples demonstrate accepted syntax, not a world script. Replace illustrative coordinates, UUIDs, handles, slots, revisions, and fingerprints with actual observed references. Numeric arguments are literal values.
+
+### observe
+
+Request a fresh player observation. Read freshness and coverage; an unavailable freshness barrier returns explicitly stale cached facts.
 
 ```json executor-call
 {"tool":"observe","arguments":{}}
 ```
 
-Bad:
+### capabilities
 
-```json executor-bad-call
-{"tool":"observe","arguments":{"radius":10}}
+List the versioned action fields, query sections, limits, and runtime support for this player.
+
+```json executor-call
+{"tool":"capabilities","arguments":{}}
 ```
 
-## lookAround - Turn the player through a bounded camera sweep and refresh visible landmarks.
+Read the shared ArenaScript language and API reference before writing runProgram source.
 
-This is a real body action: the player rotates in short steps. It does not reveal blocks through walls or make distant landmarks mineable. The observation contains sparse first-visible surfaces up to 256 blocks, capped by loaded chunks, not a cube scan of hidden blocks. Copy the current `view.yaw` and `view.pitch` from the latest observation, call `observe` after the sweep, then inspect the newly visible landmarks before choosing a target.
-
-Formatting:
-
-```text executor-format
-{"tool":"lookAround","arguments":{"centerYaw":<required finite number -180..180 from the latest view> ,"pitch":<required finite number -90..90>,"steps":<required integer 2..8>,"ticksPerStep":<required integer 1..20>}}
+```json executor-call
+{"tool":"capabilities","arguments":{"section":"program"}}
 ```
 
-Good:
+### inspect
+
+Request a focused page of player-accessible facts. Item queries need a slot; block queries need visible x/y/z coordinates. Read coverage and freshness.
+
+```json executor-call
+{"tool":"inspect","arguments":{"section":"inventory","offset":0,"limit":16}}
+```
+
+```json executor-call
+{"tool":"inspect","arguments":{"section":"recipes","recipeId":"minecraft:crafting_table","offset":0,"limit":16}}
+```
+
+### actionStatus
+
+Inspect the active action or a retained terminal receipt without changing the player.
+
+```json executor-call
+{"tool":"actionStatus","arguments":{"actionId":"native:agent-a:3:7"}}
+```
+
+### cancelAction
+
+Cancel the exact active handle and wait for its authoritative terminal result. A stale handle cannot cancel another action.
+
+```json executor-call
+{"tool":"cancelAction","arguments":{"actionId":"native:agent-a:3:7","goalRevision":3}}
+```
+
+### replaceAction
+
+Cancel the exact active handle, wait for acknowledgement, then execute your replacement. No replacement runs after uncertain cancellation.
+
+```json executor-call
+{"tool":"replaceAction","arguments":{"actionId":"native:agent-a:3:7","goalRevision":3,"actionType":"look_at","arguments":{"x":12,"y":65,"z":12}}}
+```
+
+### startAction
+
+Start one model-chosen action and return its handle immediately. Poll actionStatus for the factual result or cancel the exact handle.
+
+```json executor-call
+{"tool":"startAction","arguments":{"actionType":"wait","arguments":{"durationMs":500}}}
+```
+
+### notebook
+
+Save or replace one model-written note of up to 2048 characters in this agent and world. Notes are hypotheses or plans, never authoritative game evidence.
+
+```json executor-call
+{"tool":"notebook","arguments":{"key":"return-route","text":"Observed bridge at 12, 64, 12 in the Overworld. Recheck before crossing."}}
+```
+
+### queryMemory
+
+Read this agent and world's saved notes and action receipts. Continue pages with nextOffset. Memory records are historical, not fresh world observations.
+
+```json executor-call
+{"tool":"queryMemory","arguments":{"kind":"notes","text":"bridge","offset":0,"limit":10}}
+```
+
+```json executor-call
+{"tool":"queryMemory","arguments":{"kind":"unresolved","offset":0,"limit":10}}
+```
+
+### runProgram
+
+Run your bounded ArenaScript through the shared interpreter. This example reads the current player state, executes one model-chosen wait, and yields at source exhaustion.
+
+```json executor-call
+{"tool":"runProgram","arguments":{"source":"program.onUnhandledAttention(\"pause_and_notify\"); const self = player.state(); if (self.health > 0) { await player.wait(50); }","maxActions":4,"timeoutMs":5000}}
+```
+
+### lookAround
+
+Turn the player through 2 to 8 short camera steps; call observe afterward to inspect the newly visible landmarks.
 
 ```json executor-call
 {"tool":"lookAround","arguments":{"centerYaw":90,"pitch":0,"steps":4,"ticksPerStep":3}}
 ```
 
-Bad:
+### control
 
-```json executor-bad-call
-{"tool":"lookAround","arguments":{"centerYaw":90,"pitch":0,"steps":1,"ticksPerStep":3}}
-```
-
-## control - Hold one complete player input frame for a bounded number of server ticks.
-
-Use this for precise jumps, strafing, sprint timing, attacks, item use, view direction, and hotbar selection. Minecraft releases every held input when the segment completes, is cancelled, or stops renewing.
-
-Formatting:
-
-```text executor-format
-{"tool":"control","arguments":{"forward":<required finite number -1..1>,"strafe":<required finite number -1..1>,"jump":<required true|false>,"sneak":<required true|false>,"sprint":<required true|false>,"attack":<required true|false>,"use":<required true|false>,"yaw":<required finite number -180..180>,"pitch":<required finite number -90..90>,"selectedSlot":<required integer 0..8>,"hand":<required main|off>,"ticks":<required integer 1..200>}}
-```
-
-Good:
+Hold one complete player input frame for 1 to 200 server ticks. Use for precise movement, jumps, attacks, item use, view, and hotbar control.
 
 ```json executor-call
 {"tool":"control","arguments":{"forward":1,"strafe":0,"jump":true,"sneak":false,"sprint":true,"attack":false,"use":false,"yaw":0,"pitch":0,"selectedSlot":0,"hand":"main","ticks":8}}
 ```
 
-Bad:
+### moveTo
 
-```json executor-bad-call
-{"tool":"control","arguments":{"forward":1,"jump":true,"hand":"left","ticks":8}}
-```
-
-## moveTo - Navigate the player to one short, confirmed waypoint and return the body result.
-
-Use `control` for ordinary exploration and sustained traversal. `moveTo` is bounded pathing for a waypoint you already chose from the latest sight facts.
-
-Formatting:
-
-```text executor-format
-{"tool":"moveTo","arguments":{"x":<required finite number -30000000..30000000>,"y":<required finite number -2048..2048>,"z":<required finite number -30000000..30000000>,"tolerance":<optional finite number 0.01..16; default 1>,"sprint":<optional true|false; default true>,"timeoutMs":<optional integer 1..120000; default 30000>}}
-```
-
-Good:
+Navigate toward one short, confirmed waypoint through bounded loaded safe waypoints; use control for ordinary exploration.
 
 ```json executor-call
 {"tool":"moveTo","arguments":{"x":12,"y":64,"z":12,"tolerance":1,"sprint":true,"timeoutMs":30000}}
 ```
 
-Bad:
+### exploreFrontier
 
-```json executor-bad-call
-{"tool":"moveTo","arguments":{"x":"12-1","y":"64+10","z":5}}
-```
-
-## exploreFrontier - Walk one bounded hop into unknown adjacent space or toward a visible biome/structure cue.
-
-Use this when the goal needs Nether access, a biome, or a structure that is not in the latest observation. The executor scores occupancy frontiers and visible cues; it does not random-walk. A CUE_IN_VIEW result means interact or mine the returned cue instead of calling exploreFrontier again. NO_FRONTIER means choose a different useful action.
-
-Formatting:
-
-```text executor-format
-{"tool":"exploreFrontier","arguments":{"seek":<optional "any"|"nether"|"cave"|"village"|"structure"; default any>,"radius":<optional integer 8..32; default 24>,"timeoutMs":<optional integer 1..120000; default 15000>,"heading":<optional "north"|"south"|"east"|"west">}}
-```
-
-Good:
+List factual observed or unknown adjacent-space candidates. This tool never chooses or executes a destination; choose explicitly with moveTo.
 
 ```json executor-call
-{"tool":"exploreFrontier","arguments":{"seek":"nether","radius":24,"timeoutMs":15000}}
+{"tool":"exploreFrontier","arguments":{"radius":24,"limit":16}}
 ```
 
-Bad:
+### mine
 
-```json executor-bad-call
-{"tool":"exploreFrontier","arguments":{"seek":"random"}}
-```
-
-## mine - Break one observed, visible block and return the body result. Success proves the block broke, not that its drop was collected.
-
-Before calling mine, use the latest observation and copy `interaction.rayTarget.x/y/z` and its non-air `blockId` exactly. If the target is not under the crosshair, call `act/look_at`, observe again, then mine. The server rejects missing or stale `expectedBlockId`, air, out-of-range, and occluded targets. The ray target must still be the requested block when the action starts.
-
-Formatting:
-
-```text executor-format
-{"tool":"mine","arguments":{"x":<required integer -30000000..30000000>,"y":<required integer -2048..2048>,"z":<required integer -30000000..30000000>,"expectedBlockId":<required non-air blockId from the latest rayTarget>,"timeoutMs":<optional integer 1..120000; default 15000>}}
-```
-
-Good:
+Mine one observed, visible, in-range block coordinate with its exact current blockId.
 
 ```json executor-call
 {"tool":"mine","arguments":{"x":11,"y":64,"z":10,"expectedBlockId":"minecraft:oak_log","timeoutMs":15000}}
 ```
 
-Bad:
+### say
 
-```json executor-bad-call
-{"tool":"mine","arguments":{"x":11.5,"y":64,"z":10}}
-```
-
-## say - Send public chat, a direct message, or proximity voice. Proximity playback is asynchronous.
-
-Formatting:
-
-```text executor-format
-{"tool":"say","arguments":{"message":<required nonblank string 1..256 characters>,"audience":<optional "public"|"direct"|"proximity"; default public, or direct when recipientId is present>,"recipientId":<optional nonblank string 1..256 characters; required only for direct and forbidden otherwise>}}
-```
-
-Good:
+Send public chat, a private message, or nearby proximity speech.
 
 ```json executor-call
-{"tool":"say","arguments":{"message":"I am getting wood now.","audience":"proximity"}}
+{"tool":"say","arguments":{"message":"I found the marked chest.","audience":"proximity"}}
 ```
 
-Bad:
+### wait
 
-```json executor-bad-call
-{"tool":"say","arguments":{"message":"Come here.","audience":"direct"}}
-```
-
-## wait - Pause only when time passing is itself required, then return the body result.
-
-Formatting:
-
-```text executor-format
-{"tool":"wait","arguments":{"durationMs":<required integer 1..600000>}}
-```
-
-Good:
+Pause briefly and wait for the body result.
 
 ```json executor-call
 {"tool":"wait","arguments":{"durationMs":500}}
 ```
 
-Bad:
+### act
 
-```json executor-bad-call
-{"tool":"wait","arguments":{"durationMs":0}}
-```
-
-## act - Execute one advanced action. Use one exact actionType and its exact arguments object from the reference below.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":<required supported action name>,"arguments":<required exact object for that actionType>}}
-```
-
-Good:
-
-```json executor-call
-{"tool":"act","arguments":{"actionType":"look_at","arguments":{"x":12,"y":65,"z":12}}}
-```
-
-Bad:
-
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"fly","arguments":{}}}
-```
-
-## sequence - Execute 2 to 8 already-known actions in order, stopping on the first factual failure. Entries are actions, not nested top-level calls.
-
-Formatting:
-
-```text executor-format
-{"tool":"sequence","arguments":{"actions":[<2..8 entries shaped as {"actionType":<supported action name>,"arguments":<exact action arguments>}>]}}
-```
-
-Good:
-
-```json executor-call
-{"tool":"sequence","arguments":{"actions":[{"actionType":"navigate_to","arguments":{"x":11,"y":64,"z":10,"tolerance":1,"sprint":true,"timeoutMs":30000}},{"actionType":"break_block","arguments":{"x":11,"y":64,"z":10,"expectedBlockId":"minecraft:oak_log","timeoutMs":15000}}]}}
-```
-
-Bad:
-
-```json executor-bad-call
-{"tool":"sequence","arguments":{"actions":[{"actionType":"wait","arguments":{"durationMs":500}}]}}
-```
-
-## finish - Request Minecraft to verify whether the whole goal is complete
-
-Formatting:
-
-```text executor-format
-{"tool":"finish","arguments":{"summary":<required nonblank string 1..512 characters>}}
-```
-
-Good:
-
-```json executor-call
-{"tool":"finish","arguments":{"summary":"Crafted and collected the iron pickaxe."}}
-```
-
-Bad:
-
-```json executor-bad-call
-{"tool":"finish","arguments":{"summary":"Done.","completionContract":{"predicates":[{"type":"inventory_min","itemId":"minecraft:iron_pickaxe","count":1}]}}}
-```
-
-## Combined speech and action - Acknowledge a physical task and start it in the same turn
-
-Good:
-
-```json executor-calls
-{"calls":[{"tool":"say","arguments":{"message":"I am getting wood now.","audience":"proximity"}},{"tool":"mine","arguments":{"x":11,"y":64,"z":10,"expectedBlockId":"minecraft:oak_log","timeoutMs":15000}}]}
-```
-
-Good:
-
-```json executor-calls
-{"calls":[{"tool":"say","arguments":{"message":"I will search for a portal.","audience":"proximity"}},{"tool":"exploreFrontier","arguments":{"seek":"nether"}}]}
-```
-
-# Advanced act actions
-
-Every action below uses the top-level act wrapper. The inner arguments object must contain exactly the listed fields. These action types may also be used inside sequence without the outer tool wrapper.
-
-## act / control - Hold one complete player input frame for a bounded number of server ticks.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"control","arguments":{"forward":<required finite number -1..1>,"strafe":<required finite number -1..1>,"jump":<required true|false>,"sneak":<required true|false>,"sprint":<required true|false>,"attack":<required true|false>,"use":<required true|false>,"yaw":<required finite number -180..180>,"pitch":<required finite number -90..90>,"selectedSlot":<required integer 0..8>,"hand":<required main|off>,"ticks":<required integer 1..200>}}}
-```
-
-Good:
-
-```json executor-call
-{"tool":"act","arguments":{"actionType":"control","arguments":{"forward":0,"strafe":1,"jump":false,"sneak":true,"sprint":false,"attack":false,"use":true,"yaw":90,"pitch":15,"selectedSlot":3,"hand":"off","ticks":10}}}
-```
-
-Bad:
-
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"control","arguments":{"forward":0,"strafe":2,"jump":false,"sneak":true,"sprint":false,"attack":false,"use":false,"yaw":90,"pitch":15,"selectedSlot":3,"hand":"main","ticks":10}}}
-```
-
-## act / move_to - Move directly to a position and return the body result.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"move_to","arguments":{"x":<required finite number>,"y":<required finite number>,"z":<required finite number>,"tolerance":<required finite number 0.01..16>,"sprint":<required true|false>}}}
-```
-
-Good:
-
-```json executor-call
-{"tool":"act","arguments":{"actionType":"move_to","arguments":{"x":12,"y":64,"z":12,"tolerance":1,"sprint":true}}}
-```
-
-Bad:
-
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"move_to","arguments":{"x":12,"y":64,"z":12,"tolerance":1}}}
-```
-
-## act / navigate_to - Pathfind to a position and return the body result.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"navigate_to","arguments":{"x":<required finite number>,"y":<required finite number>,"z":<required finite number>,"tolerance":<required finite number 0.01..16>,"sprint":<required true|false>,"timeoutMs":<required integer 1..600000>}}}
-```
-
-Good:
-
-```json executor-call
-{"tool":"act","arguments":{"actionType":"navigate_to","arguments":{"x":12,"y":64,"z":12,"tolerance":1,"sprint":true,"timeoutMs":30000}}}
-```
-
-Bad:
-
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"navigate_to","arguments":{"x":12,"y":64,"z":12,"tolerance":1,"sprint":true,"timeoutMs":0}}}
-```
-
-## act / look_at - Turn the player view toward a position.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"look_at","arguments":{"x":<required finite number>,"y":<required finite number>,"z":<required finite number>}}}
-```
-
-Good:
-
-```json executor-call
-{"tool":"act","arguments":{"actionType":"look_at","arguments":{"x":12,"y":65,"z":12}}}
-```
-
-Bad:
-
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"look_at","arguments":{"x":"tree","y":65,"z":12}}}
-```
-
-## act / attack - Attack one observed entity until the action returns.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"attack","arguments":{"targetId":<required canonical UUID>,"timeoutMs":<required integer 1..600000>}}}
-```
-
-Good:
-
-```json executor-call
-{"tool":"act","arguments":{"actionType":"attack","arguments":{"targetId":"550e8400-e29b-41d4-a716-446655440000","timeoutMs":15000}}}
-```
-
-Bad:
-
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"attack","arguments":{"targetId":"nearest_zombie","timeoutMs":15000}}}
-```
-
-## Unsupported / fight_target - Composite combat is not exposed through native act dispatch.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"fight_target","arguments":{"targetSelector":<required nonblank string 1..256 characters>,"desiredRange":<required finite number 1..6>,"timeoutMs":<required integer 1..600000>}}}
-```
-
-Rejected:
-
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"fight_target","arguments":{"targetSelector":"550e8400-e29b-41d4-a716-446655440000","desiredRange":2,"timeoutMs":30000}}}
-```
-
-Bad:
-
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"fight_target","arguments":{"targetSelector":"550e8400-e29b-41d4-a716-446655440000","desiredRange":7,"timeoutMs":30000}}}
-```
-
-## Unsupported / flee_from - Composite retreat is not exposed through native act dispatch.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"flee_from","arguments":{"targetSelector":<required nonblank string 1..256 characters>,"distance":<required finite number 1..64>,"timeoutMs":<required integer 1..600000>}}}
-```
-
-Rejected:
-
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"flee_from","arguments":{"targetSelector":"550e8400-e29b-41d4-a716-446655440000","distance":12,"timeoutMs":30000}}}
-```
-
-Bad:
-
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"flee_from","arguments":{"targetSelector":"550e8400-e29b-41d4-a716-446655440000","distance":0,"timeoutMs":30000}}}
-```
-
-## Unsupported / follow_entity - Composite following is not exposed through native act dispatch.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"follow_entity","arguments":{"targetSelector":<required nonblank string 1..256 characters>,"distance":<required finite number 1..64>,"timeoutMs":<required integer 1..600000>}}}
-```
-
-Rejected:
-
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"follow_entity","arguments":{"targetSelector":"550e8400-e29b-41d4-a716-446655440000","distance":3,"timeoutMs":30000}}}
-```
-
-Bad:
-
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"follow_entity","arguments":{"targetSelector":"550e8400-e29b-41d4-a716-446655440000","distance":3,"timeoutMs":0}}}
-```
-
-## act / select_item - Select an inventory item by its exact observed item ID.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"select_item","arguments":{"itemId":<required nonblank string 1..256 characters>}}}
-```
-
-Good:
-
-```json executor-call
-{"tool":"act","arguments":{"actionType":"select_item","arguments":{"itemId":"minecraft:oak_log"}}}
-```
-
-Bad:
-
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"select_item","arguments":{"itemId":""}}}
-```
-
-## act / select_tool - Move an observed inventory tool into a hotbar slot and select it.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"select_tool","arguments":{"sourceSlot":<required integer 0..35>,"hotbarSlot":<required integer 0..8>,"expectedItemId":<required nonblank string 1..256 characters>,"minRemainingDurability":<required integer 0..2147483647>}}}
-```
-
-Good:
-
-```json executor-call
-{"tool":"act","arguments":{"actionType":"select_tool","arguments":{"sourceSlot":9,"hotbarSlot":0,"expectedItemId":"minecraft:iron_pickaxe","minRemainingDurability":1}}}
-```
-
-Bad:
-
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"select_tool","arguments":{"sourceSlot":36,"hotbarSlot":0,"expectedItemId":"minecraft:iron_pickaxe","minRemainingDurability":1}}}
-```
-
-## act / equip_item - Equip an observed inventory item in an armor or offhand slot.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"equip_item","arguments":{"sourceSlot":<required integer 0..35>,"targetSlot":<required "head"|"chest"|"legs"|"feet"|"offhand">,"expectedItemId":<required nonblank string 1..256 characters>}}}
-```
-
-Good:
-
-```json executor-call
-{"tool":"act","arguments":{"actionType":"equip_item","arguments":{"sourceSlot":9,"targetSlot":"head","expectedItemId":"minecraft:iron_helmet"}}}
-```
-
-Bad:
-
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"equip_item","arguments":{"sourceSlot":9,"targetSlot":"hand","expectedItemId":"minecraft:iron_helmet"}}}
-```
-
-## act / use_item - Use the currently selected item for the requested duration.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"use_item","arguments":{"durationMs":<required integer 1..600000>}}}
-```
-
-Good:
-
-```json executor-call
-{"tool":"act","arguments":{"actionType":"use_item","arguments":{"durationMs":1000}}}
-```
-
-Bad:
-
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"use_item","arguments":{"durationMs":0}}}
-```
-
-## act / use_ranged - Aim and use a ranged item against an observed entity.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"use_ranged","arguments":{"targetId":<required canonical UUID>,"drawDurationMs":<required integer 1..600000>,"timeoutMs":<required integer 1..600000>}}}
-```
-
-Good:
-
-```json executor-call
-{"tool":"act","arguments":{"actionType":"use_ranged","arguments":{"targetId":"550e8400-e29b-41d4-a716-446655440000","drawDurationMs":1000,"timeoutMs":15000}}}
-```
-
-Bad:
-
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"use_ranged","arguments":{"targetId":"skeleton","drawDurationMs":1000,"timeoutMs":15000}}}
-```
-
-## act / block_with_shield - Raise the selected shield for the requested duration.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"block_with_shield","arguments":{"durationMs":<required integer 1..600000>}}}
-```
-
-Good:
-
-```json executor-call
-{"tool":"act","arguments":{"actionType":"block_with_shield","arguments":{"durationMs":2000}}}
-```
-
-Bad:
-
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"block_with_shield","arguments":{"durationMs":0}}}
-```
-
-## act / break_block - Break one block at integer coordinates and return the body result.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"break_block","arguments":{"x":<required 32-bit integer -2147483648..2147483647>,"y":<required 32-bit integer -2147483648..2147483647>,"z":<required 32-bit integer -2147483648..2147483647>,"expectedBlockId":<required non-air namespaced block id 1..256 characters>,"timeoutMs":<required integer 1..600000>}}}
-```
-
-Good:
-
-```json executor-call
-{"tool":"act","arguments":{"actionType":"break_block","arguments":{"x":11,"y":64,"z":10,"expectedBlockId":"minecraft:oak_log","timeoutMs":15000}}}
-```
-
-Bad:
-
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"break_block","arguments":{"x":11.5,"y":64,"z":10,"timeoutMs":15000}}}
-```
-
-## act / pick_up_item - Collect one visible dropped-item entity using its exact observed stable UUID.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"pick_up_item","arguments":{"targetSelector":<required canonical UUID>}}}
-```
-
-Good:
-
-```json executor-call
-{"tool":"act","arguments":{"actionType":"pick_up_item","arguments":{"targetSelector":"550e8400-e29b-41d4-a716-446655440000"}}}
-```
-
-Bad:
-
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"pick_up_item","arguments":{"targetSelector":"nearest_item"}}}
-```
-
-## act / place_block - Place one exact observed inventory block at integer coordinates.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"place_block","arguments":{"x":<required 32-bit integer>,"y":<required 32-bit integer>,"z":<required 32-bit integer>,"face":<required "down"|"up"|"north"|"south"|"west"|"east">,"itemId":<required nonblank string 1..256 characters>,"desiredState":<optional null or nonblank string 1..512 characters>}}}
-```
-
-Good:
-
-```json executor-call
-{"tool":"act","arguments":{"actionType":"place_block","arguments":{"x":11,"y":64,"z":10,"face":"up","itemId":"minecraft:cobblestone","desiredState":null}}}
-```
-
-Bad:
-
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"place_block","arguments":{"x":11,"y":64,"z":10,"face":"top","itemId":"minecraft:cobblestone"}}}
-```
-
-## Unsupported / build_sequence - Composite building is not exposed through native act dispatch.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"build_sequence","arguments":{"placements":[<1..32 objects each with x:<32-bit integer>, y:<32-bit integer>, z:<32-bit integer>, face:<"down"|"up"|"north"|"south"|"west"|"east">, itemId:<nonblank string 1..256 characters>, desiredState:<optional null or nonblank string 1..512 characters>>],"timeoutMs":<required integer 1..600000>}}}
-```
-
-Rejected:
-
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"build_sequence","arguments":{"placements":[{"x":11,"y":64,"z":10,"face":"up","itemId":"minecraft:cobblestone"}],"timeoutMs":30000}}}
-```
-
-Bad:
-
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"build_sequence","arguments":{"placements":[],"timeoutMs":30000}}}
-```
-
-## act / craft_inventory - Craft an exact recipe that is available in the player inventory.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"craft_inventory","arguments":{"recipeId":<required nonblank string 1..256 characters>,"count":<required integer 1..64>,"timeoutMs":<required integer 1..600000>}}}
-```
-
-Good:
-
-```json executor-call
-{"tool":"act","arguments":{"actionType":"craft_inventory","arguments":{"recipeId":"minecraft:oak_planks","count":4,"timeoutMs":15000}}}
-```
-
-Bad:
-
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"craft_inventory","arguments":{"recipeId":"minecraft:oak_planks","timeoutMs":15000}}}
-```
-
-## act / craft_table - Craft an exact recipe at an observed crafting-table coordinate.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"craft_table","arguments":{"recipeId":<required nonblank string 1..256 characters>,"x":<required 32-bit integer>,"y":<required 32-bit integer>,"z":<required 32-bit integer>,"count":<required integer 1..64>,"timeoutMs":<required integer 1..600000>}}}
-```
-
-Good:
-
-```json executor-call
-{"tool":"act","arguments":{"actionType":"craft_table","arguments":{"recipeId":"minecraft:iron_pickaxe","x":11,"y":64,"z":10,"count":1,"timeoutMs":30000}}}
-```
-
-Bad:
-
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"craft_table","arguments":{"recipeId":"minecraft:iron_pickaxe","x":11.5,"y":64,"z":10,"count":1,"timeoutMs":30000}}}
-```
-
-## act / furnace_transaction - Insert furnace input or fuel, or take furnace output, at an observed furnace.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"furnace_transaction","arguments":{"x":<required 32-bit integer>,"y":<required 32-bit integer>,"z":<required 32-bit integer>,"operation":<required "insert_input"|"insert_fuel"|"take_output">,"inventorySlot":<required integer 0..2147483647>,"count":<required integer 1..64>,"expectedItemId":<required nonblank string 1..256 characters>,"timeoutMs":<required integer 1..600000>}}}
-```
-
-Good:
-
-```json executor-call
-{"tool":"act","arguments":{"actionType":"furnace_transaction","arguments":{"x":11,"y":64,"z":10,"operation":"insert_input","inventorySlot":9,"count":1,"expectedItemId":"minecraft:raw_iron","timeoutMs":15000}}}
-```
-
-Bad:
-
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"furnace_transaction","arguments":{"x":11,"y":64,"z":10,"operation":"smelt","inventorySlot":9,"count":1,"expectedItemId":"minecraft:raw_iron","timeoutMs":15000}}}
-```
-
-## act / transfer_container - Move an exact observed item stack between player inventory and an observed container.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"transfer_container","arguments":{"x":<required 32-bit integer>,"y":<required 32-bit integer>,"z":<required 32-bit integer>,"sourceKind":<required "player"|"container">,"sourceSlot":<required integer 0..2147483647>,"destinationKind":<required "player"|"container">,"destinationSlot":<required integer 0..2147483647>,"count":<required integer 1..64>,"expectedItemId":<required nonblank string 1..256 characters>,"timeoutMs":<required integer 1..600000>}}}
-```
-
-Good:
-
-```json executor-call
-{"tool":"act","arguments":{"actionType":"transfer_container","arguments":{"x":11,"y":64,"z":10,"sourceKind":"player","sourceSlot":9,"destinationKind":"container","destinationSlot":0,"count":1,"expectedItemId":"minecraft:iron_ingot","timeoutMs":15000}}}
-```
-
-Bad:
-
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"transfer_container","arguments":{"x":11,"y":64,"z":10,"sourceKind":"chest","sourceSlot":9,"destinationKind":"player","destinationSlot":0,"count":1,"expectedItemId":"minecraft:iron_ingot","timeoutMs":15000}}}
-```
-
-## act / drop_item - Drop an exact count from an observed player inventory slot.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"drop_item","arguments":{"slot":<required integer 0..35>,"count":<required integer 1..64>}}}
-```
-
-Good:
-
-```json executor-call
-{"tool":"act","arguments":{"actionType":"drop_item","arguments":{"slot":9,"count":1}}}
-```
-
-Bad:
-
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"drop_item","arguments":{"slot":9,"count":0}}}
-```
-
-## act / chat - Send public chat, a direct message, or proximity voice through the advanced action boundary.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"chat","arguments":{"message":<required nonblank string 1..512 code points; maximum 280 for proximity>,"audience":<optional "public"|"direct"|"proximity"; default public>,"recipientId":<optional canonical UUID; required only for direct and forbidden otherwise>}}}
-```
-
-Good:
-
-```json executor-call
-{"tool":"act","arguments":{"actionType":"chat","arguments":{"message":"I found the cave.","audience":"direct","recipientId":"550e8400-e29b-41d4-a716-446655440000"}}}
-```
-
-Bad:
-
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"chat","arguments":{"message":"Come here.","audience":"direct"}}}
-```
-
-## act / wait - Pause within an advanced action or sequence only when time passing is required.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"wait","arguments":{"durationMs":<required integer 1..600000>}}}
-```
-
-Good:
+Execute one supported advanced player action. Supply exactly the fields required by that actionType.
 
 ```json executor-call
 {"tool":"act","arguments":{"actionType":"wait","arguments":{"durationMs":500}}}
 ```
 
-Bad:
+### sequence
 
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"wait","arguments":{"durationMs":0}}}
+Prefer sequence for safe 2+ action chains. Execute 2 to 8 exact model-authored actions in order, stopping on the first factual failure; use separate calls when a later step needs fresh facts.
+
+```json executor-call
+{"tool":"sequence","arguments":{"actions":[{"actionType":"navigate_to","arguments":{"x":11,"y":64,"z":10,"tolerance":1,"sprint":true,"timeoutMs":30000}},{"actionType":"break_block","arguments":{"x":11,"y":64,"z":10,"expectedBlockId":"minecraft:oak_log","timeoutMs":15000}}]}}
 ```
 
-## act / set_door - Open or close a door at observed integer coordinates.
+### finish
 
-Formatting:
+Ask Minecraft to verify the immutable active goal. A failed check keeps the goal active.
 
-```text executor-format
-{"tool":"act","arguments":{"actionType":"set_door","arguments":{"x":<required 32-bit integer>,"y":<required 32-bit integer>,"z":<required 32-bit integer>,"open":<required true|false>}}}
+```json executor-call
+{"tool":"finish","arguments":{"summary":"Crafted and collected the iron pickaxe."}}
 ```
 
-Good:
+## Advanced action reference
+
+Call through act, startAction, or a sequence step. Optional fields may be omitted. Capabilities lists the current action contract.
+
+### move_to
+
+Fields: `x`, `y`, `z`, `tolerance`, `sprint`.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"move_to","arguments":{"x":12,"y":64,"z":12,"tolerance":1,"sprint":true}}}
+```
+
+### control
+
+Fields: `forward`, `strafe`, `jump`, `sneak`, `sprint`, `attack`, `use`, `yaw`, `pitch`, `selectedSlot`, `hand`, `ticks`.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"control","arguments":{"forward":0,"strafe":1,"jump":false,"sneak":true,"sprint":false,"attack":false,"use":true,"yaw":90,"pitch":15,"selectedSlot":3,"hand":"off","ticks":10}}}
+```
+
+### control_sequence
+
+Fields: `frames`, `maxTicks`.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"control_sequence","arguments":{"frames":[{"forward":0.5,"strafe":0,"jump":false,"sneak":false,"sprint":false,"attack":false,"use":false,"yaw":90,"pitch":0,"selectedSlot":0,"hand":"main","ticks":20,"branches":[{"condition":"horizontal_collision","value":true,"nextFrame":1}]},{"forward":0,"strafe":0,"jump":false,"sneak":false,"sprint":false,"attack":false,"use":false,"yaw":90,"pitch":0,"selectedSlot":0,"hand":"main","ticks":1}],"maxTicks":40}}}
+```
+
+### look_at
+
+Fields: `x`, `y`, `z`.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"look_at","arguments":{"x":12,"y":65,"z":12}}}
+```
+
+### attack
+
+Fields: `targetId`, `timeoutMs`.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"attack","arguments":{"targetId":"550e8400-e29b-41d4-a716-446655440000","timeoutMs":15000}}}
+```
+
+### select_item
+
+Fields: `itemId`.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"select_item","arguments":{"itemId":"minecraft:oak_log"}}}
+```
+
+### use_item
+
+Fields: `durationMs`, `hand` optional, `expectedItemId` optional.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"use_item","arguments":{"durationMs":1000,"hand":"main","expectedItemId":"minecraft:apple"}}}
+```
+
+### break_block
+
+Fields: `x`, `y`, `z`, `expectedBlockId`, `timeoutMs`.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"break_block","arguments":{"x":11,"y":64,"z":10,"expectedBlockId":"minecraft:oak_log","timeoutMs":15000}}}
+```
+
+### pick_up_item
+
+Fields: `targetSelector`.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"pick_up_item","arguments":{"targetSelector":"550e8400-e29b-41d4-a716-446655440000"}}}
+```
+
+### place_block
+
+Fields: `x`, `y`, `z`, `face`, `itemId`, `desiredState` optional.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"place_block","arguments":{"x":11,"y":64,"z":10,"face":"up","itemId":"minecraft:cobblestone","desiredState":"minecraft:cobblestone"}}}
+```
+
+### chat
+
+Fields: `message`, `audience` optional, `recipientId` optional.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"chat","arguments":{"message":"I found the cave.","audience":"direct","recipientId":"550e8400-e29b-41d4-a716-446655440000"}}}
+```
+
+### wait
+
+Fields: `durationMs`.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"wait","arguments":{"durationMs":500}}}
+```
+
+### set_door
+
+Fields: `x`, `y`, `z`, `open`.
 
 ```json executor-call
 {"tool":"act","arguments":{"actionType":"set_door","arguments":{"x":11,"y":64,"z":10,"open":true}}}
 ```
 
-Bad:
+### drop_item
 
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"set_door","arguments":{"x":11,"y":64,"z":10,"open":"true"}}}
-```
-
-## act / interact_block - Interact with an observed block using an exact hand, face, and held item.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"interact_block","arguments":{"x":<required 32-bit integer>,"y":<required 32-bit integer>,"z":<required 32-bit integer>,"face":<required "down"|"up"|"north"|"south"|"west"|"east">,"hand":<required "main"|"off">,"expectedItemId":<required nonblank string 1..256 characters>}}}
-```
-
-Good:
+Fields: `slot`, `count`.
 
 ```json executor-call
-{"tool":"act","arguments":{"actionType":"interact_block","arguments":{"x":11,"y":64,"z":10,"face":"up","hand":"main","expectedItemId":"minecraft:bucket"}}}
+{"tool":"act","arguments":{"actionType":"drop_item","arguments":{"slot":9,"count":1}}}
 ```
 
-Bad:
+### navigate_to
 
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"interact_block","arguments":{"x":11,"y":64,"z":10,"face":"up","hand":"right","expectedItemId":"minecraft:bucket"}}}
-```
-
-## act / interact_entity - Interact with an observed entity using an exact hand and held item.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"interact_entity","arguments":{"targetId":<required canonical UUID>,"hand":<required "main"|"off">,"expectedItemId":<required nonblank string 1..256 characters>}}}
-```
-
-Good:
+Fields: `x`, `y`, `z`, `tolerance`, `sprint`, `timeoutMs`.
 
 ```json executor-call
-{"tool":"act","arguments":{"actionType":"interact_entity","arguments":{"targetId":"550e8400-e29b-41d4-a716-446655440000","hand":"main","expectedItemId":"minecraft:wheat"}}}
+{"tool":"act","arguments":{"actionType":"navigate_to","arguments":{"x":12,"y":64,"z":12,"tolerance":1,"sprint":true,"timeoutMs":30000}}}
 ```
 
-Bad:
+### transfer_container
 
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"interact_entity","arguments":{"targetId":"cow","hand":"main","expectedItemId":"minecraft:wheat"}}}
-```
-
-## act / menu_transfer - Transfer an exact stack between two observed slots in an open menu.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"menu_transfer","arguments":{"menuId":<required nonblank string 1..256 characters>,"sourceSlot":<required integer 0..255>,"destinationSlot":<required integer 0..255>,"count":<required integer 1..64>,"expectedItemId":<required nonblank string 1..256 characters>,"timeoutMs":<required integer 1..600000>}}}
-```
-
-Good:
+Fields: `x`, `y`, `z`, `sourceKind`, `sourceSlot`, `destinationKind`, `destinationSlot`, `count`, `expectedItemId`, `timeoutMs`.
 
 ```json executor-call
-{"tool":"act","arguments":{"actionType":"menu_transfer","arguments":{"menuId":"menu-1","sourceSlot":0,"destinationSlot":1,"count":1,"expectedItemId":"minecraft:iron_ingot","timeoutMs":15000}}}
+{"tool":"act","arguments":{"actionType":"transfer_container","arguments":{"x":11,"y":64,"z":10,"sourceKind":"player","sourceSlot":9,"destinationKind":"container","destinationSlot":0,"count":1,"expectedItemId":"minecraft:iron_ingot","timeoutMs":15000}}}
 ```
 
-Bad:
+### craft_inventory
 
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"menu_transfer","arguments":{"menuId":"menu-1","sourceSlot":256,"destinationSlot":1,"count":1,"expectedItemId":"minecraft:iron_ingot","timeoutMs":15000}}}
-```
-
-## act / menu_button - Press one observed button in an open menu.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"menu_button","arguments":{"menuId":<required nonblank string 1..256 characters>,"buttonId":<required integer 0..255>,"timeoutMs":<required integer 1..600000>}}}
-```
-
-Good:
+Fields: `recipeId`, `count`, `timeoutMs`.
 
 ```json executor-call
-{"tool":"act","arguments":{"actionType":"menu_button","arguments":{"menuId":"menu-1","buttonId":0,"timeoutMs":15000}}}
+{"tool":"act","arguments":{"actionType":"craft_inventory","arguments":{"recipeId":"minecraft:oak_planks","count":4,"timeoutMs":15000}}}
 ```
 
-Bad:
+### craft_table
 
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"menu_button","arguments":{"menuId":"menu-1","buttonId":256,"timeoutMs":15000}}}
-```
-
-## act / anvil_rename - Set the rename text in an observed open anvil menu.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"anvil_rename","arguments":{"menuId":<required nonblank string 1..256 characters>,"name":<required nonblank string 1..50 characters>,"timeoutMs":<required integer 1..600000>}}}
-```
-
-Good:
+Fields: `recipeId`, `x`, `y`, `z`, `count`, `timeoutMs`.
 
 ```json executor-call
-{"tool":"act","arguments":{"actionType":"anvil_rename","arguments":{"menuId":"menu-1","name":"Miner","timeoutMs":15000}}}
+{"tool":"act","arguments":{"actionType":"craft_table","arguments":{"recipeId":"minecraft:iron_pickaxe","x":11,"y":64,"z":10,"count":1,"timeoutMs":30000}}}
 ```
 
-Bad:
+### furnace_transaction
 
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"anvil_rename","arguments":{"menuId":"menu-1","name":"","timeoutMs":15000}}}
+Fields: `x`, `y`, `z`, `operation`, `inventorySlot`, `count`, `expectedItemId`, `timeoutMs`.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"furnace_transaction","arguments":{"x":11,"y":64,"z":10,"operation":"insert_input","inventorySlot":9,"count":1,"expectedItemId":"minecraft:raw_iron","timeoutMs":15000}}}
 ```
 
-## act / dismount - Dismount the current ridden entity.
+### equip_item
 
-Formatting:
+Fields: `sourceSlot`, `targetSlot`, `expectedItemId`.
 
-```text executor-format
-{"tool":"act","arguments":{"actionType":"dismount","arguments":{}}}
+```json executor-call
+{"tool":"act","arguments":{"actionType":"equip_item","arguments":{"sourceSlot":9,"targetSlot":"head","expectedItemId":"minecraft:iron_helmet"}}}
 ```
 
-Good:
+### select_tool
+
+Fields: `sourceSlot`, `hotbarSlot`, `expectedItemId`, `minRemainingDurability`.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"select_tool","arguments":{"sourceSlot":9,"hotbarSlot":0,"expectedItemId":"minecraft:iron_pickaxe","minRemainingDurability":1}}}
+```
+
+### block_with_shield
+
+Fields: `durationMs`.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"block_with_shield","arguments":{"durationMs":2000}}}
+```
+
+### use_ranged
+
+Fields: `targetId`, `drawDurationMs`, `timeoutMs`.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"use_ranged","arguments":{"targetId":"550e8400-e29b-41d4-a716-446655440000","drawDurationMs":1000,"timeoutMs":15000}}}
+```
+
+### interact_block
+
+Fields: `x`, `y`, `z`, `face`, `hand`, `expectedItemId`, `hitX` optional, `hitY` optional, `hitZ` optional.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"interact_block","arguments":{"x":11,"y":64,"z":10,"face":"up","hand":"main","expectedItemId":"minecraft:bucket","hitX":0.5,"hitY":1,"hitZ":0.5}}}
+```
+
+### interact_entity
+
+Fields: `targetId`, `hand`, `expectedItemId`, `hitX` optional, `hitY` optional, `hitZ` optional.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"interact_entity","arguments":{"targetId":"550e8400-e29b-41d4-a716-446655440000","hand":"main","expectedItemId":"minecraft:wheat","hitX":0,"hitY":0.8,"hitZ":0}}}
+```
+
+### dismount
+
+No arguments.
 
 ```json executor-call
 {"tool":"act","arguments":{"actionType":"dismount","arguments":{}}}
 ```
 
-Bad:
+### start_fall_flying
 
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"dismount","arguments":{"targetId":"550e8400-e29b-41d4-a716-446655440000"}}}
-```
-
-## act / start_fall_flying - Start elytra fall-flying when the current state permits it.
-
-Formatting:
-
-```text executor-format
-{"tool":"act","arguments":{"actionType":"start_fall_flying","arguments":{}}}
-```
-
-Good:
+No arguments.
 
 ```json executor-call
 {"tool":"act","arguments":{"actionType":"start_fall_flying","arguments":{}}}
 ```
 
-Bad:
+### wake_up
 
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"start_fall_flying","arguments":{"enabled":true}}}
+No arguments.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"wake_up","arguments":{}}}
 ```
 
-## act / respawn - Respawn after death when the current state permits it.
+### set_flight
 
-Formatting:
+Fields: `enabled`.
 
-```text executor-format
-{"tool":"act","arguments":{"actionType":"respawn","arguments":{}}}
+```json executor-call
+{"tool":"act","arguments":{"actionType":"set_flight","arguments":{"enabled":true}}}
 ```
 
-Good:
+### write_sign
+
+Fields: `x`, `y`, `z`, `front`, `lines`, `expectedLines`.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"write_sign","arguments":{"x":11,"y":64,"z":10,"front":true,"lines":["Storage","","",""],"expectedLines":["","","",""]}}}
+```
+
+### edit_book
+
+Fields: `slot`, `pages`, `title` optional, `expectedFingerprint`.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"edit_book","arguments":{"slot":0,"pages":["The bridge is at 12, 64, 12."],"title":"Travel notes","expectedFingerprint":"7ae1bde6c0fc2a4f34d8ad4d405bf364674c4129b8f76164a01eac465c740fd2"}}}
+```
+
+### menu_click
+
+Fields: `menuId`, `containerId`, `stateId`, `slot`, `button`, `clickType`, `expectedItemId`, `expectedCount`, `expectedFingerprint` optional.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"menu_click","arguments":{"menuId":"minecraft:generic_9x3","containerId":2,"stateId":7,"slot":0,"button":0,"clickType":"PICKUP","expectedItemId":"minecraft:iron_ingot","expectedCount":1,"expectedFingerprint":"7ae1bde6c0fc2a4f34d8ad4d405bf364674c4129b8f76164a01eac465c740fd2"}}}
+```
+
+### menu_close
+
+Fields: `menuId`, `containerId`, `stateId`.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"menu_close","arguments":{"menuId":"minecraft:generic_9x3","containerId":2,"stateId":8}}}
+```
+
+### beacon_effects
+
+Fields: `menuId`, `containerId`, `stateId`, `primaryEffectId`, `secondaryEffectId`.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"beacon_effects","arguments":{"menuId":"minecraft:beacon","containerId":2,"stateId":8,"primaryEffectId":"minecraft:speed","secondaryEffectId":"none"}}}
+```
+
+### menu_transfer
+
+Fields: `menuId`, `sourceSlot`, `destinationSlot`, `count`, `expectedItemId`, `timeoutMs`, `containerId` optional, `stateId` optional.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"menu_transfer","arguments":{"menuId":"minecraft:anvil","sourceSlot":0,"destinationSlot":1,"count":1,"expectedItemId":"minecraft:iron_ingot","timeoutMs":15000,"containerId":2,"stateId":7}}}
+```
+
+### menu_button
+
+Fields: `menuId`, `buttonId`, `timeoutMs`, `containerId` optional, `stateId` optional.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"menu_button","arguments":{"menuId":"minecraft:merchant","buttonId":0,"timeoutMs":15000,"containerId":2,"stateId":7}}}
+```
+
+### anvil_rename
+
+Fields: `menuId`, `name`, `timeoutMs`, `containerId` optional, `stateId` optional.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"anvil_rename","arguments":{"menuId":"minecraft:anvil","name":"Miner","timeoutMs":15000,"containerId":2,"stateId":7}}}
+```
+
+### respawn
+
+No arguments.
 
 ```json executor-call
 {"tool":"act","arguments":{"actionType":"respawn","arguments":{}}}
 ```
 
-Bad:
+## Dependent calls and rejected inputs
 
-```json executor-bad-call
-{"tool":"act","arguments":{"actionType":"respawn","arguments":{"immediate":true}}}
+A combined turn can use a known look coordinate and then read its observation. Wait for the observation before choosing an unseen target.
+
+```json executor-calls
+{"calls":[{"tool":"act","arguments":{"actionType":"look_at","arguments":{"x":12,"y":65,"z":12}}},{"tool":"observe","arguments":{}}]}
 ```
 
-# Result handling
+These inputs fail the tool boundary. A valid call can still fail current world checks.
 
-- SUCCEEDED confirms only the action named in that result.
-- PATH_BLOCKED, ACTION_TIMEOUT, moved or missing targets, death, and reconnects require fresh facts and another useful call.
-- After death, this is the same run. Read recovery.lastDeath, current inventory, and lastLostInventory, then choose recover the corpse or recraft. Do not restart recipes for items already evidenced in inventory, drops, or placed stations.
-- Honor `failureClass` as a hint: recover after death, explore after PATH_BLOCKED / NO_FRONTIER, replan after TARGET_NOT_VISIBLE / TARGET_TOO_FAR / NO_OBSERVATION, skip RECIPE_NOT_FOUND. Successful reason codes such as BLOCK_BROKEN do not carry a failureClass.
-- After exploreFrontier, read frontier.kind. CUE_IN_VIEW is success at the cue; NO_FRONTIER and a blocked hop require a different action, not another identical wander. If `options` includes `explore_frontier` or `interact_cue`, those are copyable waypoints, not orders.
-- After mine or break_block, observe and collect the visible drop before relying on inventory. A successful break does not prove pickup.
-- After a failed completion verifier, continue the same active goal.
-- Proximity speech is asynchronous. After say or act/chat, issue the first known physical call immediately instead of waiting for playback.
-- Use wait only when time passing is required by the world. Do not use it to guess whether a drop was collected or to pause between ordinary progression steps.
+```json executor-bad-call
+{"tool":"observe","arguments":{"radius":10}}
+```
+
+```json executor-bad-call
+{"tool":"inspect","arguments":{"section":"item"}}
+```
+
+```json executor-bad-call
+{"tool":"inspect","arguments":{"section":"inventory","limit":33}}
+```
+
+```json executor-bad-call
+{"tool":"control","arguments":{"forward":1,"ticks":8}}
+```
+
+```json executor-bad-call
+{"tool":"cancelAction","arguments":{"actionId":"native:agent-a:3:7"}}
+```
+
+```json executor-bad-call
+{"tool":"exploreFrontier","arguments":{"seek":"nether"}}
+```
+
+```json executor-bad-call
+{"tool":"notebook","arguments":{"key":"route","text":""}}
+```
+
+```json executor-bad-call
+{"tool":"act","arguments":{"actionType":"menu_click","arguments":{"menuId":"minecraft:generic_9x3","containerId":2,"stateId":7,"slot":-1,"button":0,"clickType":"PICKUP","expectedItemId":"minecraft:iron_ingot","expectedCount":1}}}
+```
+
+```json executor-bad-call
+{"tool":"act","arguments":{"actionType":"control_sequence","arguments":{"frames":[{"forward":0,"strafe":0,"jump":false,"sneak":false,"sprint":false,"attack":false,"use":false,"yaw":90,"pitch":0,"selectedSlot":0,"hand":"main","ticks":1}],"maxTicks":0}}}
+```
+
+```json executor-bad-call
+{"tool":"say","arguments":{"message":"Hello","audience":"direct"}}
+```

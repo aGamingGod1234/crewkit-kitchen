@@ -4,6 +4,7 @@ import test from 'node:test';
 
 import { CodexService } from '../src/codex-service.mjs';
 import { profileFingerprint } from '../src/provider-session.mjs';
+import { MINECRAFT_DYNAMIC_TOOLS } from '../src/native-minecraft-tools.mjs';
 import { finishDecisionJson } from './provider-decision-fixtures.mjs';
 
 const MODEL = {
@@ -78,6 +79,43 @@ test('Codex goal-spec turns use the supplied closed schema and parser without Mi
 function profile(agentId) {
 	return { agentId, model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' };
 }
+
+test('Codex distinguishes submitted settings from provider-confirmed values', async () => {
+	const transport = new FakeSharedTransport();
+	const request = transport.request.bind(transport);
+	transport.request = async (method, params, options) => {
+		const result = await request(method, params, options);
+		if (method === 'thread/start') return { ...result, model: params.model, serviceTier: params.serviceTier, reasoningEffort: 'low' };
+		return result;
+	};
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	const agent = await service.createAgent(profile('confirmed'), { controlProtocol: 'arena_script' });
+	assert.equal(agent.executionSettings.effective.model, 'gpt-5.6-sol');
+	assert.equal(agent.executionSettings.effective.serviceTier, 'fast');
+	assert.equal(agent.executionSettings.effective.reasoningEffort, null, 'the thread default is not the requested turn effort');
+	await agent.decide('state', { goalRevision: 0 });
+	assert.equal(agent.executionSettings.requested.reasoningEffort, 'high');
+	assert.equal(agent.executionSettings.effective.reasoningEffort, null);
+	assert.equal(agent.executionSettings.evidence.reasoningEffort, 'submitted');
+	assert.equal(agent.executionSettings.transport, 'codex_app_server');
+	const returned = agent.executionSettings;
+	returned.requested.model = 'other';
+	assert.equal(agent.executionSettings.requested.model, 'gpt-5.6-sol');
+	await service.stop();
+});
+
+test('Codex rejects a confirmed different model before installing a session', async () => {
+	const transport = new FakeSharedTransport();
+	const request = transport.request.bind(transport);
+	transport.request = async (method, params, options) => {
+		const result = await request(method, params, options);
+		return method === 'thread/start' ? { ...result, model: 'different-model' } : result;
+	};
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	await assert.rejects(service.createAgent(profile('mismatch')), (error) => error.code === 'PROVIDER_SETTINGS_MISMATCH');
+	assert.equal(service.getAgent('mismatch'), null);
+	await service.stop();
+});
 
 test('Codex service defaults dynamic profiles to the priority app-server tier', async () => {
 	const transport = new FakeSharedTransport();
@@ -852,7 +890,7 @@ test('native Codex turn executes a Minecraft tool and returns its result before 
 	await agent.setGoalRevision(1);
 
 	const threadStart = transport.calls.find((call) => call.method === 'thread/start').params;
-	assert.deepEqual(threadStart.dynamicTools.map((tool) => tool.name), ['observe', 'lookAround', 'control', 'moveTo', 'exploreFrontier', 'mine', 'say', 'wait', 'act', 'sequence', 'finish']);
+	assert.deepEqual(threadStart.dynamicTools, MINECRAFT_DYNAMIC_TOOLS);
 	assert.equal(threadStart.baseInstructions.length < 1_500, true);
 
 	const executed = [];
@@ -1248,6 +1286,30 @@ test('a real native event takes over in-flight prewarm without waiting or starti
 	assert.deepEqual(executed, [{ kind: 'action', actionType: 'chat', arguments: { message: 'Hi Lucas!', audience: 'public' } }]);
 	assert.equal(transport.calls.filter((call) => call.method === 'turn/start').length, 1);
 	assert.equal(transport.calls.filter((call) => call.method === 'thread/start').length, 1);
+});
+
+test('an adopted prewarm turn forwards current progress and obeys the new cancellation signal', async (t) => {
+	const transport = new FakeSharedTransport();
+	transport.autoComplete = false;
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	t.after(() => service.stop());
+	const warming = service.prewarmAgent(profile('adopt-cancel'), { goalRevision: 0 });
+	void warming.catch(() => {});
+	await new Promise((resolve) => setImmediate(resolve));
+	const agent = await service.createAgent(profile('adopt-cancel'), { controlProtocol: 'native_tools' });
+	const controller = new AbortController();
+	const progress = [];
+	const turn = agent.act('observe', { goalRevision: 0, signal: controller.signal,
+		executeTool: async () => ({ state: 'READY' }), onProgress: (event) => progress.push(event) });
+	await new Promise((resolve) => setImmediate(resolve));
+	transport.emit('serverRequest', { id: 1, method: 'item/tool/call', params: { threadId: 'thread-1', turnId: 'obsolete', callId: 'old', tool: 'observe', arguments: {} } });
+	assert.equal(progress.length, 0);
+	transport.emit('notification', { method: 'item/started', params: { threadId: 'thread-1', turnId: 'turn-1' } });
+	assert.deepEqual(progress, [{ phase: 'provider' }]);
+	const rejected = assert.rejects(turn, (error) => error.code === 'STALE_PLAN');
+	controller.abort();
+	await rejected;
+	assert.equal(transport.calls.some((call) => call.method === 'turn/interrupt' && call.params.turnId === 'turn-1'), true);
 });
 
 test('a real native event starts cleanly after a conversation wake supersedes prewarm revision', async (t) => {

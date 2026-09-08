@@ -32,6 +32,7 @@ const SOLID_EXCEPTIONS = new Set(['minecraft:air', 'minecraft:cave_air', 'minecr
  */
 export class VirtualWorld extends EventEmitter {
 	#dimension;
+	#worldId;
 	#seed;
 	#random;
 	#pickupRadius;
@@ -62,6 +63,7 @@ export class VirtualWorld extends EventEmitter {
 		const source = cloneScenario(scenario);
 		if (!isRecord(source)) throw new TypeError('scenario must be a plain object');
 		this.#dimension = identifier(source.dimension ?? 'minecraft:overworld', 'dimension');
+		this.#worldId = source.worldId === undefined ? undefined : identifier(source.worldId, 'worldId');
 		this.#seed = source.seed ?? 0;
 		this.#random = new SeededRandom(this.#seed);
 		this.#pickupRadius = finiteNonnegative(source.pickupRadius ?? DEFAULT_PICKUP_RADIUS, 'pickupRadius');
@@ -217,6 +219,7 @@ export class VirtualWorld extends EventEmitter {
 			blocks,
 			nearbyContainers: [],
 			world: {
+				...(this.#worldId === undefined ? {} : { worldId: this.#worldId }),
 				dimension: this.#dimension,
 				gameTime: this.#tickCount,
 				dayTime: this.#tickCount % 24_000,

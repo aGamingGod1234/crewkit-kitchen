@@ -43,6 +43,9 @@ public final class AttentionSignalPolicy {
 		if (!activeActionWindow && !inventory(previous).equals(inventory(current))) facts.add("inventory");
 		if (newFailure(previous, current)) facts.add("lastResult");
 		if (!Objects.equals(dimension(previous), dimension(current))) facts.add("world.dimension");
+		JsonObject beforePerception = object(previous, "perception");
+		JsonObject afterPerception = object(current, "perception");
+		if (afterPerception != null) addChanged(facts, "perception", beforePerception == null ? null : beforePerception.get("latestSequence"), afterPerception.get("latestSequence"));
 		addLavaChanges(facts, previous, current);
 
 		boolean viewpointChanged = !Objects.equals(previous.get("position"), current.get("position"))

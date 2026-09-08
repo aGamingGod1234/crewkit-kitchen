@@ -104,6 +104,16 @@ public final class GoalSpecCodec {
 		if (leaves > MAX_LEAF_PREDICATES) {
 			throw failure("GOAL_PREDICATE_LIMIT_EXCEEDED", "Goal predicate contains too many leaves");
 		}
+		if (countInventoryItemIds(predicate) > GoalPredicate.MAX_INVENTORY_ITEM_IDS) {
+			throw failure("GOAL_PREDICATE_LIMIT_EXCEEDED", "Goal predicate contains too many grouped inventory item IDs");
+		}
+	}
+
+	private static int countInventoryItemIds(GoalPredicate predicate) {
+		if (predicate instanceof GoalPredicate.InventoryContainsAny inventory) return inventory.itemIds().size();
+		if (predicate instanceof GoalPredicate.AllOf all) return all.predicates().stream().mapToInt(GoalSpecCodec::countInventoryItemIds).sum();
+		if (predicate instanceof GoalPredicate.AnyOf any) return any.predicates().stream().mapToInt(GoalSpecCodec::countInventoryItemIds).sum();
+		return 0;
 	}
 
 	private static int countLeaves(GoalPredicate predicate, int depth) {
@@ -150,6 +160,13 @@ public final class GoalSpecCodec {
 			case GoalPredicate.InventoryContains inventory -> {
 				json.addProperty("type", "inventory_contains");
 				json.addProperty("item_id", inventory.itemId());
+				json.addProperty("count", inventory.count());
+			}
+			case GoalPredicate.InventoryContainsAny inventory -> {
+				json.addProperty("type", "inventory_contains_any");
+				JsonArray items = new JsonArray();
+				inventory.itemIds().forEach(items::add);
+				json.add("item_ids", items);
 				json.addProperty("count", inventory.count());
 			}
 			case GoalPredicate.PositionWithin position -> {
@@ -219,6 +236,21 @@ public final class GoalSpecCodec {
 			case "inventory_contains" -> {
 				requireExactKeys(json, Set.of("type", "item_id", "count"));
 				yield new GoalPredicate.InventoryContains(string(json, "item_id"), exactInt(json, "count"));
+			}
+			case "inventory_contains_any" -> {
+				requireExactKeys(json, Set.of("type", "item_ids", "count"));
+				JsonArray items = array(json, "item_ids");
+				if (items.isEmpty() || items.size() > GoalPredicate.MAX_INVENTORY_ITEM_IDS) {
+					throw failure("INVALID_GOAL_PREDICATE", "Inventory item IDs must contain between 1 and 64 entries");
+				}
+				ArrayList<String> identifiers = new ArrayList<>(items.size());
+				for (JsonElement item : items) {
+					if (!item.isJsonPrimitive() || !item.getAsJsonPrimitive().isString()) {
+						throw failure("INVALID_GOAL_SPEC", "Inventory item IDs must be strings");
+					}
+					identifiers.add(item.getAsString());
+				}
+				yield new GoalPredicate.InventoryContainsAny(identifiers, exactInt(json, "count"));
 			}
 			case "position_within" -> {
 				boolean legacy = !json.has("dimension_id");

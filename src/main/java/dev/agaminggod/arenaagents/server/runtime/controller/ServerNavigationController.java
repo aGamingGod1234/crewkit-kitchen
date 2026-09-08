@@ -2,10 +2,12 @@ package dev.agaminggod.arenaagents.server.runtime.controller;
 
 import carpet.helpers.EntityPlayerActionPack;
 import dev.agaminggod.arenaagents.client.navigation.GridPosition;
+import dev.agaminggod.arenaagents.client.navigation.LocalPathfinder;
 import dev.agaminggod.arenaagents.client.navigation.PathNode;
 import dev.agaminggod.arenaagents.client.navigation.PathOutcome;
 import dev.agaminggod.arenaagents.client.navigation.PathPlan;
 import dev.agaminggod.arenaagents.client.navigation.TraversalType;
+import dev.agaminggod.arenaagents.client.navigation.WalkabilityView;
 import dev.agaminggod.arenaagents.protocol.ProtocolConstants;
 import dev.agaminggod.arenaagents.server.runtime.ElapsedTimeAccumulator;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
@@ -23,20 +25,18 @@ import java.util.List;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Objects;
-import java.util.function.Predicate;
+import java.util.Set;
+import java.util.LinkedHashSet;
 
 public final class ServerNavigationController implements ServerController {
 	public static final int DEFAULT_MAX_PATH_LENGTH = 256;
 	public static final double MAX_LOCAL_PLANNING_DISTANCE = 32.0D;
-	private static final double INTERMEDIATE_GOAL_TOLERANCE = 6.0D;
-	private static final int MAX_SHALLOW_WATER_PATH_BLOCKS = MinecraftNavigationWorld.MAX_SHALLOW_WATER_CROSSING;
+	private static final int MIN_AIR_RESERVE = 60;
 	private static final long STALL_TIMEOUT_MS = 4_000L;
 	private static final int MAX_REPLANS = 3;
 	private static final double INTERMEDIATE_WAYPOINT_HORIZONTAL_TOLERANCE_SQUARED = 0.36D;
 	private static final double INTERMEDIATE_WAYPOINT_VERTICAL_TOLERANCE = 0.25D;
 	private static final double ENDPOINT_STABILITY_DISTANCE = 0.1D;
-	// Plans are rebuilt from current world state; the replan cap and action deadline bound identical retries
-	// without retaining stale edge bans that could reject terrain after it changes.
 
 	private final Vec3 destination;
 	private final double tolerance;
@@ -44,6 +44,12 @@ public final class ServerNavigationController implements ServerController {
 	private final long timeoutMs;
 	private final ElapsedTimeAccumulator elapsedTime;
 	private final ServerPathPlanner planner = new ServerPathPlanner();
+	private LocalPathfinder.Search search;
+	private MinecraftNavigationWorld searchWorld;
+	private GridPosition searchOrigin;
+	private Set<GridPosition> searchGoals = Set.of();
+	private final LinkedHashSet<GridPosition> previousFrontiers = new LinkedHashSet<>();
+	private boolean searchRecovery;
 	private PathPlan plan;
 	private int waypointIndex;
 	private WaypointProgress progress;
@@ -92,8 +98,14 @@ public final class ServerNavigationController implements ServerController {
 		if (!player.isAlive()) {
 			return fail(player, "AGENT_DEAD", "Agent player died", currentProgress());
 		}
+		if (player.isPassenger() || player.isFallFlying()) {
+			return fail(player, "UNSUPPORTED_NAVIGATION_MODE", "Mounted travel and gliding require player control inputs", currentProgress());
+		}
 		if (elapsedMs >= timeoutMs) {
 			return fail(player, "ACTION_TIMEOUT", "Navigation timed out", currentProgress());
+		}
+		if (!hasAirReserve(player.isInWater(), player.getAirSupply())) {
+			return fail(player, "AIR_RESERVE_REACHED", "Water traversal stopped at its breathing reserve", currentProgress());
 		}
 		MinecraftNavigationWorld world = new MinecraftNavigationWorld(player.level());
 		if (navigationStartPosition == null) navigationStartPosition = player.position();
@@ -109,7 +121,7 @@ public final class ServerNavigationController implements ServerController {
 			return replanOrResult(player, world, nowEpochMs, elapsedMs);
 		}
 		PathNode waypoint = nodes.get(waypointIndex);
-		if (!world.isStandable(waypoint.position())) {
+		if (!world.isTraversable(waypoint.position())) {
 			TickResult replanned = replan(player, world, nowEpochMs, elapsedMs, true);
 			if (replanned != null) return replanned;
 			nodes = plan.nodes();
@@ -202,6 +214,10 @@ public final class ServerNavigationController implements ServerController {
 	}
 
 	private Vec3 targetFor(MinecraftNavigationWorld world, PathNode waypoint, boolean finalWaypoint) {
+		if (!supportedEndpoint(world, waypoint.position())) {
+			if (waypoint.traversal() == TraversalType.SWIM) return center(waypoint.position()).add(0.0D, 0.4D, 0.0D);
+			if (waypoint.traversal() == TraversalType.CLIMB) return center(waypoint.position());
+		}
 		Vec3 horizontalTarget = targetFor(waypoint, finalWaypoint);
 		double supportHeight = world.supportHeight(
 				waypoint.position(), horizontalTarget.x, horizontalTarget.z);
@@ -229,7 +245,7 @@ public final class ServerNavigationController implements ServerController {
 		Vec3 position = player.position();
 		lastProgressValue = navigationProgress(position);
 		boolean endpointStandable = resolvedEndpointPosition != null && resolvedEndpointTarget != null
-				&& world.isStandable(resolvedEndpointPosition)
+				&& supportedEndpoint(world, resolvedEndpointPosition)
 				&& Double.isFinite(world.supportHeight(
 						resolvedEndpointPosition,
 						resolvedEndpointTarget.x,
@@ -285,7 +301,7 @@ public final class ServerNavigationController implements ServerController {
 			endpointStabilityConfirmed = false;
 			return null;
 		}
-		boolean endpointStandable = world.isStandable(resolvedEndpointPosition)
+		boolean endpointStandable = supportedEndpoint(world, resolvedEndpointPosition)
 				&& Double.isFinite(world.supportHeight(
 						resolvedEndpointPosition,
 						resolvedEndpointTarget.x,
@@ -337,6 +353,14 @@ public final class ServerNavigationController implements ServerController {
 			PathNode waypoint,
 			boolean finalWaypoint
 	) {
+		if (!supportedEndpoint(world, waypoint.position())
+				&& (waypoint.traversal() == TraversalType.SWIM || waypoint.traversal() == TraversalType.CLIMB)) {
+			Vec3 target = targetFor(world, waypoint, finalWaypoint);
+			double dx = playerPosition.x - target.x;
+			double dz = playerPosition.z - target.z;
+			return dx * dx + dz * dz <= INTERMEDIATE_WAYPOINT_HORIZONTAL_TOLERANCE_SQUARED
+					&& Math.abs(playerPosition.y - target.y) <= (waypoint.traversal() == TraversalType.SWIM ? 0.7D : 0.25D);
+		}
 		return reachedTarget(
 				playerPosition,
 				waypoint,
@@ -360,50 +384,44 @@ public final class ServerNavigationController implements ServerController {
 			long elapsedMs,
 			boolean recovery
 	) {
-		GridPosition start = nearestStandable(world, new GridPosition(
-				player.blockPosition().getX(),
-				player.blockPosition().getY(),
-				player.blockPosition().getZ()
-		), 1, 2);
-		if (start == null) {
-			return fail(player, "NO_STANDABLE_PATH", "Start has no safe standing position", currentProgress());
+		GridPosition actualOrigin = grid(player.position());
+		if (searchWorld != null && !searchWorld.isCurrent()) {
+			search = null;
+			previousFrontiers.clear();
 		}
-		Vec3 localDestination = localPlanningDestination(center(start), destination);
-		boolean finalSegment = localDestination.equals(destination);
-		List<GridPosition> goals = standableGoalsWithinTolerance(
-				world,
-				localDestination,
-				finalSegment ? tolerance : INTERMEDIATE_GOAL_TOLERANCE,
-				4,
-				finalSegment ? 3 : 6
-		);
-		if (goals.isEmpty()) {
-			return fail(player, "NO_STANDABLE_PATH", "Destination has no safe standing position", currentProgress());
+		if (search != null && !actualOrigin.equals(searchOrigin)) search = null;
+		if (search == null) {
+			cancel(player);
+			plan = null;
+			GridPosition start = nearestTraversable(world, actualOrigin, 1, 2);
+			if (start == null) return fail(player, "NO_STANDABLE_PATH", "Start has no supported, climbable or surface-water position", currentProgress());
+			boolean destinationIsLocal = center(start).distanceTo(destination) <= MAX_LOCAL_PLANNING_DISTANCE;
+			searchGoals = destinationIsLocal ? Set.copyOf(standableGoalsWithinTolerance(
+					world, destination, tolerance, (int) Math.ceil(tolerance) + 1, (int) Math.ceil(tolerance) + 1)) : Set.of();
+			if (destinationIsLocal && searchGoals.isEmpty() && world.cellAt(grid(destination)) != WalkabilityView.Cell.UNLOADED) {
+				return fail(player, "NO_STANDABLE_PATH", "Destination has no supported position within the requested tolerance", currentProgress());
+			}
+			searchWorld = world;
+			searchOrigin = actualOrigin;
+			searchRecovery = recovery;
+			search = planner.beginSearch(start, searchGoals, grid(destination), (int) MAX_LOCAL_PLANNING_DISTANCE, previousFrontiers);
 		}
-		PathPlan candidate = null;
-		boolean pathLimitReached = false;
-		for (GridPosition goal : goals) {
-			ServerPathPlanner.PlanningResult planning = planner.planPath(world, start, goal);
-			if (planning.deferred()) {
-				return shouldRetryPlanning(planning.plan().outcome(), true, elapsedMs, timeoutMs)
-						? TickResult.running(currentProgress())
-						: fail(player, "PATH_LIMIT_REACHED", "Path planning exceeded its navigation deadline", currentProgress());
-			}
-			PathPlan planned = planning.plan();
-			if (planned.outcome() == PathOutcome.FOUND
-					&& planned.nodes().size() <= DEFAULT_MAX_PATH_LENGTH
-					&& hasBoundedShallowWaterRun(planned.nodes(), world::isShallowWater)) {
-				candidate = planned;
-				break;
-			}
-			pathLimitReached |= planned.outcome() == PathOutcome.NODE_LIMIT || planned.outcome() == PathOutcome.TIME_LIMIT;
+		ServerPathPlanner.PlanningResult planning = planner.resume(search, searchWorld);
+		if (planning.deferred()) return TickResult.running(currentProgress());
+		PathPlan candidate = planning.plan();
+		search = null;
+		if (candidate.outcome() != PathOutcome.FOUND) {
+			return fail(player, candidate.outcome() == PathOutcome.NODE_LIMIT ? "PATH_LIMIT_REACHED" : "NO_PATH",
+					"No reachable local route or unexplored route boundary is available", currentProgress());
 		}
-		if (candidate == null) {
-			if (pathLimitReached && shouldRetryPlanning(PathOutcome.NODE_LIMIT, false, elapsedMs, timeoutMs)) {
-				return TickResult.running(currentProgress());
-			}
-			return fail(player, pathLimitReached ? "PATH_LIMIT_REACHED" : "NO_PATH",
-					"No bounded safe path is currently available", currentProgress());
+		if (candidate.nodes().size() > DEFAULT_MAX_PATH_LENGTH) {
+			candidate = new PathPlan(candidate.nodes().subList(0, DEFAULT_MAX_PATH_LENGTH), PathOutcome.FOUND, candidate.expandedNodes());
+		}
+		GridPosition endpoint = candidate.nodes().getLast().position();
+		boolean finalSegment = searchGoals.contains(endpoint);
+		if (!finalSegment) {
+			previousFrontiers.add(endpoint);
+			while (previousFrontiers.size() > 64) previousFrontiers.remove(previousFrontiers.getFirst());
 		}
 		plan = candidate;
 		if (finalSegment) {
@@ -424,7 +442,7 @@ public final class ServerNavigationController implements ServerController {
 		double activeWaypointDistance = player.position().distanceTo(targetFor(world, activeWaypoint, finalWaypoint));
 		if (progress == null) {
 			progress = new WaypointProgress(activeWaypointDistance, nowEpochMs, STALL_TIMEOUT_MS, MAX_REPLANS);
-		} else if (recovery) {
+		} else if (searchRecovery) {
 			progress.replanned(activeWaypointDistance, nowEpochMs);
 		} else {
 			progress.waypointAdvanced(activeWaypointDistance, nowEpochMs);
@@ -441,6 +459,13 @@ public final class ServerNavigationController implements ServerController {
 	) {
 		boolean gapJump = waypoint.traversal() == TraversalType.JUMP_GAP;
 		boolean shallowWater = world.isShallowWater(waypoint.position());
+		boolean swimming = waypoint.traversal() == TraversalType.SWIM || player.isInWater();
+		boolean climbing = waypoint.traversal() == TraversalType.CLIMB;
+		boolean crouching = waypoint.traversal() == TraversalType.CROUCH;
+		double climbDx = player.getX() - target.x;
+		double climbDz = player.getZ() - target.z;
+		boolean atClimbColumn = climbDx * climbDx + climbDz * climbDz <= 0.16D;
+		boolean descendingClimb = climbing && atClimbColumn && target.y < player.getY() - 0.15D;
 		if (inputLease == null) {
 			inputController = AgentInputRuntime.controller(player);
 			inputLease = inputController.acquire(AgentInputRuntime.requireAgentId(player), InputOwner.NAVIGATION, 100);
@@ -452,21 +477,25 @@ public final class ServerNavigationController implements ServerController {
 				(float) Math.toDegrees(Math.atan2(-delta.x, delta.z)));
 		float targetPitch = net.minecraft.util.Mth.clamp(
 				(float) -Math.toDegrees(Math.atan2(delta.y, horizontal)), -90.0F, 90.0F);
+		if (climbing && atClimbColumn) {
+			net.minecraft.core.Direction wall = world.climbDirection(waypoint.position());
+			if (wall != null) targetYaw = (float) Math.toDegrees(Math.atan2(-wall.getStepX(), wall.getStepZ()));
+		}
 		if (motorState == null) motorState = AgentInputStates.MotorState.initial(player.getYRot(), player.getXRot());
 		AgentInputStates.MotorStep step = AgentInputStates.stepMotor(
 				motorState,
 				new AgentInputStates.MotorTarget(
 						targetYaw,
 						targetPitch,
-						true,
-						waypoint.traversal() == TraversalType.JUMP_UP || gapJump || shallowWater,
-						!shallowWater && (sprint || gapJump) && player.getFoodData().getFoodLevel() > 6
+						!descendingClimb,
+						waypoint.traversal() == TraversalType.JUMP_UP || gapJump || shallowWater || swimming || (climbing && target.y > player.getY() + 0.15D),
+						!swimming && !crouching && !climbing && (sprint || gapJump) && player.getFoodData().getFoodLevel() > 6
 				),
 				nowEpochMs
 		);
 		motorState = step.state();
 		inputController.apply(inputLease, new dev.agaminggod.arenaagents.server.runtime.input.AgentInputState(
-				step.forward(), step.strafe(), step.jump(), false, step.sprint(),
+				step.forward(), step.strafe(), step.jump(), crouching, step.sprint(),
 				false, false, step.state().yaw(), step.state().pitch(),
 				player.getInventory().getSelectedSlot(), InteractionHand.MAIN_HAND
 		));
@@ -516,7 +545,7 @@ public final class ServerNavigationController implements ServerController {
 		);
 	}
 
-	private static GridPosition nearestStandable(
+	private static GridPosition nearestTraversable(
 			MinecraftNavigationWorld world,
 			GridPosition origin,
 			int horizontalRadius,
@@ -532,14 +561,14 @@ public final class ServerNavigationController implements ServerController {
 								origin.y() + vertical,
 								origin.z() + dz
 						);
-						if (world.isStandable(above)) return above;
+						if (world.isTraversable(above)) return above;
 						if (vertical > 0) {
 							GridPosition below = new GridPosition(
 									origin.x() + dx,
 									origin.y() - vertical,
 									origin.z() + dz
 							);
-							if (world.isStandable(below)) return below;
+							if (world.isTraversable(below)) return below;
 						}
 					}
 				}
@@ -561,7 +590,7 @@ public final class ServerNavigationController implements ServerController {
 			for (int dz = -horizontalRadius; dz <= horizontalRadius; dz++) {
 				for (int dy = -verticalRadius; dy <= verticalRadius; dy++) {
 					GridPosition candidate = new GridPosition(origin.x() + dx, origin.y() + dy, origin.z() + dz);
-					if (world.isStandable(candidate) && candidateSatisfiesTolerance(candidate, destination, tolerance)) {
+					if (supportedEndpoint(world, candidate) && candidateSatisfiesTolerance(candidate, destination, tolerance)) {
 						candidates.add(candidate);
 					}
 				}
@@ -575,25 +604,12 @@ public final class ServerNavigationController implements ServerController {
 		return candidate.equals(grid(destination)) || center(candidate).distanceTo(destination) <= tolerance;
 	}
 
-	static Vec3 localPlanningDestination(Vec3 start, Vec3 destination) {
-		Objects.requireNonNull(start, "start must not be null");
-		Objects.requireNonNull(destination, "destination must not be null");
-		double distance = start.distanceTo(destination);
-		if (distance <= MAX_LOCAL_PLANNING_DISTANCE) return destination;
-		return start.add(destination.subtract(start).scale(MAX_LOCAL_PLANNING_DISTANCE / distance));
+	private static boolean supportedEndpoint(MinecraftNavigationWorld world, GridPosition position) {
+		TraversalType traversal = world.traversalAt(position);
+		return traversal == TraversalType.WALK || traversal == TraversalType.CROUCH;
 	}
 
-	static boolean hasBoundedShallowWaterRun(
-			List<PathNode> nodes,
-			Predicate<GridPosition> shallowWater
-	) {
-		Objects.requireNonNull(nodes, "nodes must not be null");
-		Objects.requireNonNull(shallowWater, "shallowWater must not be null");
-		int run = 0;
-		for (PathNode node : nodes) {
-			run = shallowWater.test(node.position()) ? run + 1 : 0;
-			if (run > MAX_SHALLOW_WATER_PATH_BLOCKS) return false;
-		}
-		return true;
+	static boolean hasAirReserve(boolean inWater, int air) {
+		return !inWater || air > MIN_AIR_RESERVE;
 	}
 }

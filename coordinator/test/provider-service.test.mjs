@@ -18,6 +18,18 @@ class FakeService {
 	async reconcile(records) { return { valid: records, invalid: [], removed: [], catalog: { provider: this.provider, models: [] } }; }
 }
 
+test('provider catalog exposes enforced adapter unavailability without advertising Gemini models', async () => {
+	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
+	services.gemini = new AntigravityProviderService({ cwd: 'C:\\workspace' });
+	const router = new ProviderService(services);
+	const catalog = await router.catalog.refresh({ providers: ['gemini'] });
+	assert.deepEqual(catalog.models, []);
+	assert.equal(catalog.availability.find((value) => value.provider === 'gemini').playable, false);
+	assert.equal(catalog.availability.find((value) => value.provider === 'gemini').reasonCode, 'PROVIDER_UNAVAILABLE');
+	assert.equal(router.getExecutionSettings('missing'), null);
+	await router.stop();
+});
+
 test('provider router coalesces one exact-profile replacement and rejects tier mutation', async () => {
 	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
 	let release;

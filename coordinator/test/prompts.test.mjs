@@ -4,7 +4,13 @@ import test from 'node:test';
 import { ConversationMemory } from '../src/conversation-memory.mjs';
 import { FactLedger } from '../src/fact-ledger.mjs';
 import { profileFingerprint } from '../src/provider-session.mjs';
-import { PLANNER_SYSTEM_PROMPT, advanceContextCursor, buildPlannerInput, buildSupplementalContext, createContextCursor, contextCursorMatches } from '../src/prompts.mjs';
+import { PLANNER_SYSTEM_PROMPT, SCRIPT_ACTION_REFERENCE, ARENA_SCRIPT_API_REFERENCE, advanceContextCursor, buildPlannerInput, buildSupplementalContext, createContextCursor, contextCursorMatches } from '../src/prompts.mjs';
+import { ACTION_FIELDS } from '../src/constants.mjs';
+import { parseArenaScript } from '../src/arena-script/parser.mjs';
+import { ArenaScriptInterpreter } from '../src/arena-script/interpreter.mjs';
+import { createInterpreterFacts } from '../src/arena-script/facts.mjs';
+import { SCRIPT_BINDINGS, SCRIPT_PRIMITIVES, PLAYER_MEMBER_PRIMITIVES } from '../src/arena-script/minecraft-api.mjs';
+import { validateAction } from '../src/schema.mjs';
 
 const state = {
 	agent: { agentId: 'agent-a', provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority' },
@@ -13,6 +19,63 @@ const state = {
 	observation: { player: { health: 20 }, world: { dimension: 'minecraft:overworld' } },
 };
 const PROFILE_FINGERPRINT = profileFingerprint(state.agent);
+
+test('native program reference shares the actual language, action contract and examples within its response budget', () => {
+	assert.ok(Buffer.byteLength(ARENA_SCRIPT_API_REFERENCE) < 13_000);
+	assert.ok(ARENA_SCRIPT_API_REFERENCE.includes(SCRIPT_ACTION_REFERENCE));
+	assert.match(ARENA_SCRIPT_API_REFERENCE, /Watcher example/);
+	assert.match(ARENA_SCRIPT_API_REFERENCE, /world\.queryMemory/);
+	assert.match(ARENA_SCRIPT_API_REFERENCE, /runtime never requests another model/);
+	assert.doesNotMatch(ARENA_SCRIPT_API_REFERENCE, /Return exactly one JSON object/);
+});
+
+test('script bindings and the installed tool reference include every shared player action', () => {
+	assert.deepEqual([...SCRIPT_PRIMITIVES].sort(), Object.keys(ACTION_FIELDS).sort());
+	for (const primitive of Object.keys(ACTION_FIELDS)) {
+		const member = primitive.replace(/_([a-z])/g, (_match, letter) => letter.toUpperCase());
+		assert.equal(PLAYER_MEMBER_PRIMITIVES[member], primitive);
+		assert.ok(SCRIPT_ACTION_REFERENCE.includes(`player.${member}(`), primitive);
+	}
+	assert.match(SCRIPT_ACTION_REFERENCE, /player\.equipItem\(\{ sourceSlot, targetSlot, expectedItemId \}\)/);
+	assert.doesNotMatch(SCRIPT_ACTION_REFERENCE, /player\.equipItem\([^)]*minRemainingDurability/);
+});
+
+test('every shipped planner example compiles and executes its intended branch with schema-valid player commands', () => {
+	const examples = [...PLANNER_SYSTEM_PROMPT.matchAll(/(?:Multi-tree collection example:|Watcher example[^\n]*)\n([\s\S]*?)(?=\n\n(?:Watcher example|Compiler diagnostics))/g)].map((match) => match[1]);
+	assert.equal(examples.length, 2);
+	const base = { player: { x: 0, y: 64, z: 0, health: 20 }, blocks: [{ stableId: 'block-1', blockId: 'minecraft:oak_log', x: 1, y: 64, z: 0, tags: ['#minecraft:logs'] }],
+		items: [], entities: [], inventory: { items: [], tagCounts: { '#minecraft:logs': 0 } } };
+	const results = [];
+	for (const [index, source] of examples.entries()) {
+		const vm = new ArenaScriptInterpreter(parseArenaScript(source), SCRIPT_BINDINGS);
+		let observation = structuredClone(base);
+		let yielded = vm.start(createInterpreterFacts(observation));
+		const dispatched = [];
+		for (let steps = 0; yielded.kind === 'command' && steps < 8; steps += 1) {
+			const args = yielded.call.primitive === 'wait' ? { durationMs: yielded.call.arguments } : yielded.call.arguments;
+			validateAction({ type: yielded.call.primitive, ...args });
+			dispatched.push(yielded.call.primitive);
+			if (yielded.call.primitive === 'break_block') {
+				observation.blocks = [];
+				observation.items = [{ stableId: '00000000-0000-0000-0000-000000000001', itemId: 'minecraft:oak_log', count: 8, x: 1, y: 64, z: 0, tags: ['#minecraft:logs'] }];
+			} else if (yielded.call.primitive === 'pick_up_item') {
+				observation.items = [];
+				observation.inventory = { items: [{ itemId: 'minecraft:oak_log', count: 8, slot: 0 }], tagCounts: { '#minecraft:logs': 8 } };
+			}
+			yielded = vm.resume({ stateToken: yielded.stateToken, state: 'SUCCEEDED', reasonCode: 'DONE' }, createInterpreterFacts(observation));
+		}
+		if (index === 1) {
+			yielded = vm.runWatcher('watcher-0', createInterpreterFacts({ ...observation, player: { ...observation.player, health: 8 } }));
+			assert.equal(yielded.call.primitive, 'wait');
+			validateAction({ type: 'wait', durationMs: yielded.call.arguments });
+		} else {
+			assert.deepEqual(dispatched, ['break_block', 'pick_up_item']);
+			assert.equal(yielded.kind, 'finish');
+		}
+		results.push(yielded.kind);
+	}
+	assert.deepEqual(results, ['finish', 'command']);
+});
 
 test('planner input always carries complete authoritative state with explicitly labeled empty supplemental deltas', () => {
 	const input = buildPlannerInput(state, {

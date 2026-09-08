@@ -5,6 +5,7 @@ import { normalizeRetryReason, validateTraceId } from './control-latency-registr
 import { ProviderHealthRegistry } from './provider-health-registry.mjs';
 import { profileFingerprint } from './provider-session.mjs';
 import { createProviderTurnTelemetry } from './provider-turn-telemetry.mjs';
+import { recordProviderTurn } from './provider-turn-recorder.mjs';
 import { reportVisibleOutput } from './verbose-output.mjs';
 import { parseGoalSpecRequest } from './goal-spec.mjs';
 import { GoalSpecTranslator } from './goal-spec-translator.mjs';
@@ -15,6 +16,8 @@ const DEFAULT_INVALID_DECISION_RETRIES = 1;
 const MAX_RETRY_ERROR_LENGTH = 512;
 const MAX_VERBOSE_MESSAGE_LENGTH = 256;
 const DEFAULT_PLANNING_LEASE_TIMEOUT_MS = 125_000;
+const DEFAULT_NATIVE_TURN_BUDGET_MS = 900_000;
+const TOOL_SETTLEMENT_GRACE_MS = 5_000;
 const RETRYABLE_DECISION_ERRORS = new Set([
 	'EMPTY_DECISION',
 	'MALFORMED_DECISION',
@@ -37,6 +40,7 @@ export class AgentPlanner {
 	#recorder;
 	#turnRecorder;
 	#planningLeaseTimeoutMs;
+	#nativeTurnBudgetMs;
 
 	constructor({
 		registry,
@@ -51,6 +55,7 @@ export class AgentPlanner {
 		benchmarkRecorder = null,
 		turnRecorder = null,
 		planningLeaseTimeoutMs = DEFAULT_PLANNING_LEASE_TIMEOUT_MS,
+		nativeTurnBudgetMs = Math.max(DEFAULT_NATIVE_TURN_BUDGET_MS, planningLeaseTimeoutMs),
 	}) {
 		if (registry === null || registry === undefined) throw new TypeError('registry is required');
 		if (scheduler === null || scheduler === undefined) throw new TypeError('scheduler is required');
@@ -66,6 +71,7 @@ export class AgentPlanner {
 		if (selectedRecorder !== null && typeof selectedRecorder.record !== 'function') throw new TypeError('recorder.record must be a function');
 		if (turnRecorder !== null && (typeof turnRecorder !== 'object' || typeof turnRecorder.record !== 'function')) throw new TypeError('turnRecorder must provide record or be null');
 		if (!Number.isSafeInteger(planningLeaseTimeoutMs) || planningLeaseTimeoutMs <= 0) throw new TypeError('planningLeaseTimeoutMs must be a positive safe integer');
+		if (!Number.isSafeInteger(nativeTurnBudgetMs) || nativeTurnBudgetMs < planningLeaseTimeoutMs) throw new TypeError('nativeTurnBudgetMs must be a safe integer at least planningLeaseTimeoutMs');
 		this.#registry = registry;
 		this.#scheduler = scheduler;
 		this.#codexService = codexService;
@@ -77,9 +83,18 @@ export class AgentPlanner {
 		this.#recorder = selectedRecorder;
 		this.#turnRecorder = turnRecorder;
 		this.#planningLeaseTimeoutMs = planningLeaseTimeoutMs;
+		this.#nativeTurnBudgetMs = nativeTurnBudgetMs;
 	}
 
 	get healthRegistry() { return this.#healthRegistry; }
+	getExecutionSettings(agentId) {
+		const settings = typeof this.#codexService.getExecutionSettings === 'function'
+			? this.#codexService.getExecutionSettings(agentId)
+			: currentProviderAgent(this.#codexService, agentId)?.executionSettings;
+		if (settings === undefined || settings === null) return null;
+		return { ...structuredClone(settings), limits: { planningLeaseTimeoutMs: this.#planningLeaseTimeoutMs,
+			...(settings.controlProtocol === 'native_tools' ? { nativeTurnBudgetMs: this.#nativeTurnBudgetMs } : {}) } };
+	}
 
 	requestGoalSpec({ agentId, request, correctiveFeedback = null }) {
 		const record = this.#registry.get(agentId);
@@ -104,6 +119,9 @@ export class AgentPlanner {
 						outputSchema: schema,
 						parseOutput: parseGoalSpecJson,
 						systemPrompt: '',
+						...(this.#turnRecorder === null ? {} : { turnRecorder: this.#turnRecorder,
+							attempt: (correctiveFeedback?.attempt ?? 0) + 1, retry: correctiveFeedback !== null,
+							queueWaitMs: elapsed(queuedAt, this.#now()) }),
 					}));
 				} finally {
 					try { await this.#codexService.removeAgent(translatorId); } catch { /* transient cleanup is best effort */ }
@@ -117,17 +135,18 @@ export class AgentPlanner {
 		return this.#scheduler.cancel(goalSpecTranslatorId(agentId, requestId), 'Goal translation was cancelled');
 	}
 
-	requestNativeTurn({ agentId, input, goalRevision, executeTool, recoverySummary = null, preserveState = false, priority = 'ordinary', traceId: requestedTraceId = null, onVerbose = null }) {
+	requestNativeTurn({ agentId, input, goalRevision, executeTool, recoverySummary = null, preserveState = false, priority = 'ordinary', traceId: requestedTraceId = null, onVerbose = null, onProgress = null }) {
 		const record = this.#registry.assertCurrentRevision(agentId, goalRevision);
 		if (record.provider !== 'codex') throw codedError('NATIVE_TOOLS_UNAVAILABLE', 'Native Minecraft tools are currently available for Codex agents only');
 		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('native turn input must be nonblank');
 		if (typeof executeTool !== 'function') throw new TypeError('executeTool must be a function');
+		if (onProgress !== null && typeof onProgress !== 'function') throw new TypeError('onProgress must be a function or null');
 		const traceId = requestedTraceId === null ? defaultTraceId(agentId, goalRevision) : validateTraceId(requestedTraceId);
 		const queuedAt = this.#now();
 		let leaseAgent = null;
 		safeVerbose(onVerbose, 'planner', `Native turn queued with ${priority} priority.`);
 		this.#record('planner_requested', record, { operation: 'native_turn', preserveState, retry: false, lane: record.provider, priority, traceId });
-		return this.#scheduler.schedule(agentId, async ({ signal }) => {
+		return this.#scheduler.schedule(agentId, async ({ signal, renewLease = () => false }) => {
 			const admittedAt = this.#now();
 			const queueWaitMs = elapsed(queuedAt, admittedAt);
 			safeVerbose(onVerbose, 'planner', 'Native turn admitted by the planning scheduler.');
@@ -135,6 +154,7 @@ export class AgentPlanner {
 			this.#registry.assertCurrentRevision(agentId, goalRevision);
 			if (!preserveState) this.#registry.setState(agentId, DynamicAgentState.PLANNING, { goalRevision });
 			leaseAgent = currentProviderAgent(this.#codexService, agentId);
+			let acceptsProgress = true;
 			try {
 				const agent = await this.#providerAttempt(record, {
 					operation: 'create_agent', attempt: 1, queueWaitMs, retry: false, traceId,
@@ -145,36 +165,65 @@ export class AgentPlanner {
 				}, null, onVerbose);
 				leaseAgent = agent;
 				let firstToolAt = null;
+				let toolsExecuting = 0;
+				renewLease({ phase: 'provider' });
 				const result = await this.#providerAttempt(record, {
 					operation: 'native_turn', attempt: 1, queueWaitMs, retry: false, traceId,
 				}, () => agent.act(input, {
 					goalRevision,
 					signal,
 					onVerbose: (stage, message) => safeVerbose(onVerbose, stage, message),
+					onProgress: () => {
+						if (!acceptsProgress || signal.aborted || !this.#isCurrent(agentId, goalRevision)) return;
+						if (toolsExecuting === 0) renewLease({ phase: 'provider' });
+						try { Promise.resolve(onProgress?.({ phase: 'provider' })).catch(() => {}); } catch { /* reporting cannot fail provider work */ }
+					},
 					executeTool: async (request) => {
 						if (firstToolAt === null) {
 							firstToolAt = this.#now();
 							this.#recordTracePhase(record, traceId, 'provider_first_byte', firstToolAt, firstToolAt, 'completed');
 						}
-						return executeTool(request);
+						toolsExecuting += 1;
+						renewLease({ phase: 'tool', timeoutMs: nativeToolLeaseMs(request.tool, this.#planningLeaseTimeoutMs) });
+						try {
+							if (signal.aborted) throw signal.reason;
+							return await executeTool(request);
+						}
+						finally {
+							toolsExecuting -= 1;
+							if (toolsExecuting === 0) renewLease({ phase: 'provider' });
+						}
 					},
 				}), agent, onVerbose);
 				const completedAt = this.#now();
 				if (firstToolAt === null) this.#recordTracePhase(record, traceId, 'provider_first_byte', completedAt, completedAt, 'failed', 'NO_TOOL_CALL');
 				this.#recordTracePhase(record, traceId, 'provider_final_byte', completedAt, completedAt, 'completed');
 				this.#record('planner_decision_completed', record, { operation: 'native_turn', attempt: 1, queueWaitMs, directive: 'native_tools', traceId });
+				this.#recordNativeTurn(record, leaseAgent, input, admittedAt, queueWaitMs);
 				safeVerbose(onVerbose, 'decision', 'Native provider turn completed.');
 				return result;
 			} catch (error) {
+				this.#recordNativeTurn(record, leaseAgent, input, admittedAt, queueWaitMs, error);
 				this.#record('planner_failed', record, { operation: 'native_turn', errorCode: error?.code ?? 'NATIVE_TURN_FAILED', retry: false, traceId });
 				safeVerbose(onVerbose, 'error', verboseErrorMessage('Native turn failed', error));
 				throw error;
+			} finally {
+				acceptsProgress = false;
 			}
 		}, {
 			lane: record.provider,
 			priority,
 			leaseTimeoutMs: this.#planningLeaseTimeoutMs,
+			maxLeaseDurationMs: this.#nativeTurnBudgetMs,
 			onLeaseExpired: () => this.#replaceExactSession(record, leaseAgent, 'native_tools', 'planning_lease_expired'),
+		});
+	}
+
+	#recordNativeTurn(record, agent, input, startedAt, queueWaitMs, error = null) {
+		recordProviderTurn(this.#turnRecorder, {
+			agentId: record.agentId, provider: record.provider, model: record.model, reasoningEffort: record.reasoningEffort,
+			goalRevision: record.goalRevision, attempt: 1, retry: false, input, output: '', error,
+			...readExecutionSettings(agent), timing: { durationMs: elapsed(startedAt, this.#now()), apiDurationMs: null, queueWaitMs },
 		});
 	}
 
@@ -346,13 +395,13 @@ export class AgentPlanner {
 			throw error;
 		}
 		const startedAt = this.#now();
-		this.#record('provider_request_started', record, { ...fields, operation: fields.operation });
+		this.#record('provider_request_started', record, { ...fields, ...readExecutionSettings(sessionAgent), operation: fields.operation });
 		safeVerbose(onVerbose, 'provider', `Provider ${fields.operation} request started (attempt ${fields.attempt}).`);
 		try {
 			const result = await operation();
 			const sessionFields = readSessionFields(sessionAgent ?? result);
 			const durationMs = elapsed(startedAt, this.#now());
-			this.#record('provider_response_completed', record, { ...fields, ...sessionFields, operation: fields.operation, durationMs, errorCode: null });
+			this.#record('provider_response_completed', record, { ...fields, ...sessionFields, ...readExecutionSettings(sessionAgent ?? result), operation: fields.operation, durationMs, errorCode: null });
 			safeVerbose(onVerbose, 'provider', `Provider ${fields.operation} request completed.`);
 			this.#publishTelemetry(createProviderTurnTelemetry({
 				provider: record.provider,
@@ -369,7 +418,7 @@ export class AgentPlanner {
 		} catch (error) {
 			const sessionFields = { ...readSessionFields(sessionAgent), profileFingerprint: healthIdentity.profileFingerprint };
 			const durationMs = elapsed(startedAt, this.#now());
-			this.#record('provider_response_failed', record, { ...fields, ...sessionFields, operation: fields.operation, durationMs, errorCode: error?.code ?? 'ERROR' });
+			this.#record('provider_response_failed', record, { ...fields, ...sessionFields, ...readExecutionSettings(sessionAgent), operation: fields.operation, durationMs, errorCode: error?.code ?? 'ERROR' });
 			safeVerbose(onVerbose, 'provider', verboseErrorMessage(`Provider ${fields.operation} request failed`, error));
 			this.#publishTelemetry(createProviderTurnTelemetry({
 				provider: record.provider,
@@ -506,6 +555,11 @@ export class AgentPlanner {
 	}
 }
 
+function readExecutionSettings(agent) {
+	try { return agent?.executionSettings == null ? {} : { executionSettings: structuredClone(agent.executionSettings) }; }
+	catch { return {}; }
+}
+
 function readSessionFields(agent) {
 	if (agent === null || agent === undefined || typeof agent.sessionMetadata !== 'function') return {};
 	try {
@@ -564,6 +618,16 @@ function codedError(code, message) { return Object.assign(new Error(message), { 
 function elapsed(startedAt, finishedAt) {
 	if (!Number.isFinite(startedAt) || !Number.isFinite(finishedAt)) throw new TypeError('planner clock must return finite values');
 	return Math.max(0, Math.round(finishedAt - startedAt));
+}
+
+function nativeToolLeaseMs(tool, fallbackMs) {
+	const actions = tool?.kind === 'sequence' ? tool.actions : [tool];
+	const durationMs = actions.reduce((total, action) => {
+		const args = action?.arguments ?? {};
+		const declared = args.timeoutMs ?? args.durationMs ?? (Number.isSafeInteger(args.ticks) ? args.ticks * 50 : fallbackMs);
+		return total + (Number.isSafeInteger(declared) && declared > 0 ? declared : fallbackMs);
+	}, 0);
+	return durationMs + TOOL_SETTLEMENT_GRACE_MS;
 }
 
 function buildCorrectiveRetryInput(input, error, retryCount) {

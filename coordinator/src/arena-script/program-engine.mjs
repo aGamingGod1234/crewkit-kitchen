@@ -1,4 +1,4 @@
-import { ArenaScriptInterpreter } from './interpreter.mjs';
+import { ArenaScriptInterpreter, freezeQueryResult } from './interpreter.mjs';
 import { changedInterpreterFactDomains, createInterpreterFacts } from './facts.mjs';
 import { ALL_FACT_DOMAINS } from './fact-domains.mjs';
 import { SCRIPT_BINDINGS } from './minecraft-api.mjs';
@@ -14,10 +14,11 @@ export class ArenaScriptEngine {
 	#watcherMetadata = [];
 	#transition = null; #pendingRequest = null; #coalescedRequest = null; #pendingReplacement = null; #suspendedResult = null; #resumableUnhandled = false; #requestUpdate = null; #completed = new Map(); #deferredBase = null; #continuationRequired = false; #status = 'IDLE';
 
-	constructor({ dispatch, cancel, requestModel, trace = () => {} } = {}) {
+	constructor({ dispatch, cancel, requestModel, inspect = null, trace = () => {} } = {}) {
 		if (typeof dispatch !== 'function' || typeof cancel !== 'function' || typeof requestModel !== 'function') throw new TypeError('ArenaScriptEngine callbacks dispatch, cancel, and requestModel are required');
 		if (typeof trace !== 'function') throw new TypeError('ArenaScriptEngine trace callback must be a function');
-		this.#callbacks = { dispatch, cancel, requestModel, trace };
+		if (inspect !== null && typeof inspect !== 'function') throw new TypeError('ArenaScriptEngine inspect callback must be a function');
+		this.#callbacks = { dispatch, cancel, requestModel, inspect, trace };
 	}
 
 	install(input) {
@@ -72,17 +73,30 @@ export class ArenaScriptEngine {
 	ingestActionResult({ actionId, state, reasonCode, eventSequence } = {}) {
 		if (!Number.isSafeInteger(eventSequence) || eventSequence < 0 || typeof actionId !== 'string' || typeof state !== 'string' || typeof reasonCode !== 'string') return this.snapshot();
 		const signature = `${state}\u0000${reasonCode}\u0000${eventSequence}`;
-		if (!this.#active || actionId !== this.#active.actionId || eventSequence < this.#active.actionDispatchEventSequence) {
+		if (!this.#active || this.#active.kind === 'query' || actionId !== this.#active.actionId || eventSequence < this.#active.actionDispatchEventSequence) {
 			if (this.#completed.has(actionId) && this.#completed.get(actionId) !== signature) return this.snapshot();
 			return this.snapshot();
 		}
+		return this.#settleActiveResult(Object.freeze({ stateToken: this.#active.stateToken, state, reasonCode }), eventSequence, signature);
+	}
+
+	ingestQueryResult({ queryId, value } = {}) {
+		if (!this.#active || this.#active.kind !== 'query' || this.#active.actionId !== queryId) return this.snapshot();
+		value = freezeQueryResult(value);
+		if (!['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT'].includes(value.state)) throw new TypeError('query result requires a factual terminal state');
+		const state = value.state;
+		const reasonCode = typeof value?.reasonCode === 'string' ? value.reasonCode : 'INSPECTED';
+		return this.#settleActiveResult(Object.freeze({ stateToken: this.#active.stateToken, state, reasonCode, value }), this.#eventSequence, `query:${queryId}`);
+	}
+
+	#settleActiveResult(result, eventSequence, signature) {
+		const { state } = result;
 		const active = this.#active;
 		this.#active = null;
 		this.#eventSequence = Math.max(this.#eventSequence, eventSequence);
 		this.#continuationEpoch += 1;
 		this.#fencePendingRequest();
-		this.#completed.set(actionId, signature);
-		const result = Object.freeze({ stateToken: active.stateToken, state, reasonCode });
+		this.#completed.set(active.actionId, signature);
 		if (this.#transition || this.#cancelling) {
 			const cancelling = this.#cancelling;
 			this.#cancelling = null;
@@ -200,7 +214,7 @@ export class ArenaScriptEngine {
 		return latest;
 	}
 
-	snapshot() { const pending = this.#coalescedRequest ?? this.#pendingRequest; return Object.freeze({ status: this.#status, eventSequence: this.#eventSequence, factsSequence: this.#factsSequence, generation: this.#generation, lifecycleEpoch: this.#lifecycleEpoch, continuationEpoch: this.#continuationEpoch, activeActionId: this.#active?.actionId ?? null, programId: this.#program?.programId ?? null, version: this.#program?.version ?? null, pendingRequestPriority: pending?.priority ?? null, pendingRequestTrigger: pending?.trigger ?? null }); }
+	snapshot() { const pending = this.#coalescedRequest ?? this.#pendingRequest; return Object.freeze({ status: this.#status, eventSequence: this.#eventSequence, factsSequence: this.#factsSequence, generation: this.#generation, lifecycleEpoch: this.#lifecycleEpoch, continuationEpoch: this.#continuationEpoch, activeActionId: this.#activeActionId(), activeQueryId: this.#active?.kind === 'query' ? this.#active.actionId : null, programId: this.#program?.programId ?? null, version: this.#program?.version ?? null, pendingRequestPriority: pending?.priority ?? null, pendingRequestTrigger: pending?.trigger ?? null }); }
 
 	#activate(target) {
 		const latestFacts = this.#facts && this.#factsSequence > target.factsSequence ? this.#facts : target.facts;
@@ -229,8 +243,13 @@ export class ArenaScriptEngine {
 		if (resetGeneration) this.#generation += 1;
 	}
 
+	#activeActionId() { return this.#active?.kind === 'query' ? null : this.#active?.actionId ?? null; }
 	#isLive() { return this.#vm !== null && ['ACTIVE', 'SUSPENDING', 'REPLACING', 'FINISHING'].includes(this.#status); }
-	#cancelActive(reason) { if (!this.#active || this.#cancelling) return; this.#cancelling = { kind: 'transition', actionId: this.#active.actionId, reason }; this.#status = reason === 'replace' ? 'REPLACING' : 'SUSPENDING'; this.#callbacks.cancel(this.#active.actionId); }
+	#cancelActive(reason) { if (!this.#active || this.#cancelling) return; this.#cancelling = { kind: 'transition', actionId: this.#active.actionId, reason }; this.#status = reason === 'replace' ? 'REPLACING' : 'SUSPENDING'; this.#cancelCurrentOperation(); }
+	#cancelCurrentOperation() {
+		if (this.#active.kind === 'query') this.ingestQueryResult({ queryId: this.#active.actionId, value: { state: 'CANCELLED', reasonCode: 'QUERY_CANCELLED' } });
+		else this.#callbacks.cancel(this.#active.actionId);
+	}
 	#completeTransition() {
 		const transition = this.#transition; this.#transition = null;
 		if (!transition) return this.snapshot();
@@ -261,7 +280,7 @@ export class ArenaScriptEngine {
 			this.#emitTrace('watcher_fired', { watcherId, mode: latch.mode, eventSequence: this.#eventSequence, generation: this.#generation });
 			if (latch.mode === 'interrupt' && this.#active && !this.#cancelling) {
 				this.#cancelling = { kind: 'watcher', actionId: this.#active.actionId, latch };
-				this.#callbacks.cancel(this.#active.actionId);
+				this.#cancelCurrentOperation();
 			} else this.#queueBoundary(latch);
 		}
 		return edges;
@@ -311,7 +330,7 @@ export class ArenaScriptEngine {
 	}
 
 	#requestModel(actionFailure = null, { priority = ORDINARY_PRIORITY, trigger = DEFAULT_ATTENTION_TRIGGER, decisionContext = null } = {}) {
-		const context = requestContext(this.#program, this.#generation, this.#lifecycleEpoch, this.#continuationEpoch, this.#active?.actionId ?? null, this.#eventSequence, this.#factsSequence, this.#facts, actionFailure, { priority, trigger, decisionContext });
+		const context = requestContext(this.#program, this.#generation, this.#lifecycleEpoch, this.#continuationEpoch, this.#activeActionId(), this.#eventSequence, this.#factsSequence, this.#facts, actionFailure, { priority, trigger, decisionContext });
 		if (this.#pendingRequest) {
 			this.#coalescedRequest = mergeRequestContexts(this.#coalescedRequest ?? this.#pendingRequest, context);
 			return;
@@ -337,7 +356,7 @@ export class ArenaScriptEngine {
 			this.#generation,
 			this.#lifecycleEpoch,
 			this.#continuationEpoch,
-			this.#active?.actionId ?? null,
+			this.#activeActionId(),
 			this.#eventSequence,
 			this.#factsSequence,
 			this.#facts,
@@ -373,6 +392,19 @@ export class ArenaScriptEngine {
 	}
 
 	#handleYield(yielded, source) {
+		if (yielded.kind === 'query') {
+			const queryId = `${this.#program.programId}:${this.#program.version}:${this.#generation}:${yielded.stateToken}`;
+			const authority = source?.authority ?? null;
+			this.#active = { kind: 'query', actionId: queryId, stateToken: yielded.stateToken, generation: this.#generation, source, authority, executionFactsSequence: this.#factsSequence };
+			this.#continuationEpoch += 1;
+			this.#fencePendingRequest();
+			if (this.#callbacks.inspect === null) this.ingestQueryResult({ queryId, value: { state: 'FAILED', reasonCode: 'INSPECTION_UNAVAILABLE' } });
+			else this.#callbacks.inspect(Object.freeze({ queryId, operation: yielded.operation, query: yielded.query,
+				authorship: Object.freeze({ provider: this.#program.provider, model: this.#program.modelIdentity, reasoningEffort: this.#program.reasoningEffort,
+					serviceTier: this.#program.serviceTier, goalRevision: this.#program.goalRevision, programId: this.#program.programId,
+					programVersion: this.#program.version, sourceStepId: yielded.stepId }) }));
+			return;
+		}
 		if (yielded.kind === 'command') {
 			const actionId = `${this.#program.programId}:${this.#program.version}:${this.#generation}:${yielded.stateToken}`;
 			const authority = source?.authority ?? (source && typeof source === 'object' && typeof source.watcherId === 'string' ? source : null);

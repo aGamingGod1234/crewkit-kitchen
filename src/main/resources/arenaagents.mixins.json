@@ -6,6 +6,7 @@
     "CameraDollyMinecartMixin",
     "CachedUserNameToIdResolverAccessor",
     "CachedProfileInfoAccessor",
+    "CarpetBoatInputMixin",
     "EntityPlayerActionInvoker",
     "EntityPlayerActionPackAccessor",
     "EntityPlayerActionPackMixin",
@@ -17,6 +18,7 @@
     "MsgCommandMixin",
     "PlayerDisplayNameMixin",
     "ServerGamePacketListenerInvoker",
+    "PlayerObservationEventsMixin",
     "ServerPlayerGameModeBreakAccessor",
     "ServerPlayerGameModeMixin"
   ],

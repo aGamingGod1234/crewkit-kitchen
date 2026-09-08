@@ -94,6 +94,11 @@ function Get-ExpectedCoordinatorFiles([string] $CoordinatorRoot) {
         'src/simulator/',
         'src/headless-matrix.mjs',
         'src/headless-rcon.mjs',
+        'src/headless-world.mjs',
+        'src/headless-world-spawn.mjs',
+        'src/headless-config.mjs',
+        'src/headless-capabilities.mjs',
+        'src/player-capability-probe.mjs',
         'src/native-tool-ab-runner.mjs',
         'src/native-tool-ab-trial.mjs',
         'src/native-tool-cli-boundary.mjs',
@@ -132,7 +137,12 @@ function Assert-ArchiveParity([string] $JarPath, [string] $CoordinatorRoot, [str
     try {
         $prefix = 'arena-agents/coordinator/'
         $files = @($zip.Entries | Where-Object { $_.FullName.StartsWith($prefix) -and -not $_.FullName.EndsWith('/') -and $_.FullName -ne ($prefix + 'coordinator-manifest.txt') } | ForEach-Object { $_.FullName.Substring($prefix.Length) } | Sort-Object)
-        if (@(Compare-Object -ReferenceObject $Expected -DifferenceObject $files).Count -ne 0) { throw 'Embedded coordinator entries differ from the independently derived source set.' }
+        $differences = @(Compare-Object -ReferenceObject $Expected -DifferenceObject $files)
+        if ($differences.Count -ne 0) {
+            $missing = @($differences | Where-Object SideIndicator -eq '<=' | ForEach-Object InputObject)
+            $unexpected = @($differences | Where-Object SideIndicator -eq '=>' | ForEach-Object InputObject)
+            throw "Embedded coordinator entries differ from the independently derived source set. Missing: $($missing -join ', '); unexpected: $($unexpected -join ', ')."
+        }
         $manifestEntry = $zip.GetEntry($prefix + 'coordinator-manifest.txt')
         if ($null -eq $manifestEntry) { throw 'Embedded coordinator manifest is missing.' }
         $manifestReader = [IO.StreamReader]::new($manifestEntry.Open())

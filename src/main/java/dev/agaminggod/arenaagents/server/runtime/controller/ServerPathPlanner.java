@@ -7,6 +7,7 @@ import dev.agaminggod.arenaagents.client.navigation.PathPlan;
 import dev.agaminggod.arenaagents.client.navigation.WalkabilityView;
 
 import java.util.Objects;
+import java.util.Set;
 import java.util.function.LongSupplier;
 
 /**
@@ -78,6 +79,20 @@ public final class ServerPathPlanner {
 
 	public static TickBudget currentBudget() {
 		return CURRENT_BUDGET.get();
+	}
+
+	public LocalPathfinder.Search beginSearch(GridPosition start, Set<GridPosition> goals,
+			GridPosition destination, int radius, Set<GridPosition> previousFrontiers) {
+		return pathfinder.beginSearch(start, goals, destination, radius, previousFrontiers);
+	}
+
+	public PlanningResult resume(LocalPathfinder.Search search, WalkabilityView view) {
+		TickBudget tick = CURRENT_BUDGET.get();
+		LocalPathfinder.SearchBudget budget = tick == null
+				? new LocalPathfinder.SearchBudget(MAX_EXPANDED_NODES_PER_TICK, MAX_PLANNING_TIME_NANOS_PER_TICK, System::nanoTime)
+				: tick.searchBudget;
+		PathPlan result = search.advance(view, budget);
+		return new PlanningResult(result, !search.finished());
 	}
 
 	public record PlanningResult(PathPlan plan, boolean deferred) {

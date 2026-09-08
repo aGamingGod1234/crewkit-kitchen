@@ -34,6 +34,10 @@ public final class LeasedServerInputController implements ServerInputController 
 		return mutationRevision;
 	}
 
+	public synchronized long acceptedUses(AgentId agentId) {
+		return sink.acceptedUses(agentId);
+	}
+
 	@Override
 	public synchronized InputLease acquire(AgentId agentId, InputOwner owner, int priority) {
 		long nextSequence = Math.incrementExact(sequence);

@@ -9,7 +9,7 @@ export class ActiveGoalSupervisor {
 	}
 
 	activate(key) { return this.#leases.activate(key); }
-	begin(key, kind) { return this.#leases.acquire(key, kind); }
+	begin(key, kind, options) { return this.#leases.acquire(key, kind, options); }
 
 	end(token, { progress = false, scheduleRecovery = true } = {}) {
 		if (progress) this.#leases.progress(token);

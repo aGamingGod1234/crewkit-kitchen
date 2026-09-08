@@ -1,3 +1,5 @@
+import { observationWorldId, observationPosition, observedBlocks } from './observed-memory-store.mjs';
+
 const ALLOWED_SOURCES = new Set(['observation', 'action_result', 'significant_event']);
 const DEFAULT_MAXIMUM_ENTRIES = 12;
 const DEFAULT_MAXIMUM_BYTES = 1_536;
@@ -14,6 +16,8 @@ export class FactLedger {
 	#historyLimit;
 	#lastTick = 0;
 	#lastDimension = 'minecraft:overworld';
+	#worldId = null;
+	#scopes = new Map();
 
 	constructor({ maximumEntries = DEFAULT_MAXIMUM_ENTRIES, maximumBytes = DEFAULT_MAXIMUM_BYTES } = {}) {
 		if (!Number.isSafeInteger(maximumEntries) || maximumEntries < 1) throw new TypeError('maximumEntries must be a positive safe integer');
@@ -53,10 +57,19 @@ export class FactLedger {
 			const world = objectValue(payload.world);
 			let tick = safeTick(world.gameTime, this.#lastTick + 1);
 			const dimension = safeText(world.dimension ?? world.dimensionId, this.#lastDimension, 128);
-			if (this.#revision > 0 && (dimension !== this.#lastDimension || tick < this.#lastTick)) {
-				this.reset();
-				tick = safeTick(world.gameTime, 1);
+			const worldId = observationWorldId(payload);
+			if (this.#worldId !== null && (worldId !== this.#worldId || dimension !== this.#lastDimension)) {
+				this.#scopes.set(JSON.stringify([this.#worldId, this.#lastDimension]), { entries: this.#entries, tick: this.#lastTick });
+				while (this.#scopes.size > 16) this.#scopes.delete(this.#scopes.keys().next().value);
+				const previous = this.#scopes.get(JSON.stringify([worldId, dimension]));
+				this.#entries = previous && tick >= previous.tick ? previous.entries : [];
+				this.#lastTick = previous && tick >= previous.tick ? previous.tick : 0;
+				this.#history = [];
+				this.#revision++;
+			} else if (tick < this.#lastTick) {
+				this.#entries = []; this.#history = []; this.#revision++; this.#lastTick = 0;
 			}
+			this.#worldId = worldId;
 			this.#lastTick = Math.max(this.#lastTick, tick);
 			this.#lastDimension = dimension;
 			this.#ingestObservation(payload, tick, dimension);
@@ -72,7 +85,7 @@ export class FactLedger {
 	}
 
 	#ingestObservation(payload, tick, dimension) {
-		const position = compactNumbers(objectValue(payload.position), ['x', 'y', 'z']);
+		const position = compactNumbers(observationPosition(payload) ?? {}, ['x', 'y', 'z']);
 		if (Object.keys(position).length === 3) this.#addStructured('observation:position', { position }, 'observation', tick, dimension, 200, 1);
 
 		const player = objectValue(payload.player);
@@ -88,6 +101,10 @@ export class FactLedger {
 
 		const weather = compactObject(objectValue(payload.world), ['raining', 'thundering']);
 		if (Object.keys(weather).length > 0) this.#addStructured('observation:world', { weather }, 'observation', tick, dimension, 200, 0.7);
+
+		for (const block of observedBlocks(payload).slice(0, 3)) {
+			this.#addStructured(`observation:block:${block.x},${block.y},${block.z}`, { block }, 'observation', tick, dimension, 200, 1);
+		}
 
 		const nearbyEntities = Array.isArray(payload.entities) ? [...payload.entities]
 			.sort((left, right) => entityDistanceSquared(left) - entityDistanceSquared(right)
@@ -164,6 +181,13 @@ export class FactLedger {
 
 	toPlannerDelta(baseRevision = null, nowTick = this.#lastTick) { return this.delta(baseRevision, nowTick); }
 
+	query({ worldId = this.#worldId, dimension = this.#lastDimension, nowTick } = {}) {
+		const active = worldId === this.#worldId && dimension === this.#lastDimension;
+		const scope = active ? { entries: this.#entries, tick: this.#lastTick } : this.#scopes.get(JSON.stringify([worldId, dimension]));
+		const tick = nowTick ?? scope?.tick ?? 0;
+		return { worldId, dimension, tick, entries: (scope?.entries ?? []).filter((entry) => entry.expiresAtTick > tick).map(cloneEntryWithKey) };
+	}
+
 	reset() {
 		// Keep revisions monotonic so cursors held by an old world cannot be
 		// mistaken for a cursor into the replacement baseline.
@@ -173,6 +197,8 @@ export class FactLedger {
 		this.#sequence = 0;
 		this.#lastTick = 0;
 		this.#lastDimension = 'minecraft:overworld';
+		this.#worldId = null;
+		this.#scopes.clear();
 	}
 
 	#fullDelta(nextRevision) {

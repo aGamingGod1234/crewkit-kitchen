@@ -2,11 +2,14 @@ package dev.agaminggod.arenaagents.server.runtime.controller;
 
 import dev.agaminggod.arenaagents.client.navigation.GridPosition;
 import dev.agaminggod.arenaagents.client.navigation.WalkabilityView;
+import dev.agaminggod.arenaagents.client.navigation.TraversalType;
+import dev.agaminggod.arenaagents.world.WorldMutationRevisionAccess;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.tags.FluidTags;
+import net.minecraft.tags.BlockTags;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
@@ -22,20 +25,109 @@ import java.util.Objects;
  * Read-only, chunk-safe terrain view used by the bounded local planner.
  */
 public final class MinecraftNavigationWorld implements WalkabilityView {
-	static final int MAX_SHALLOW_WATER_CROSSING = 4;
-	private static final Direction[][] CROSSING_AXES = {
-			{Direction.WEST, Direction.EAST},
-			{Direction.NORTH, Direction.SOUTH}
-	};
+	private static final double[] FOOTPRINT_SAMPLES = {0.2D, 0.5D, 0.8D};
+	private static final Direction[] HORIZONTAL_DIRECTIONS = {Direction.WEST, Direction.EAST, Direction.NORTH, Direction.SOUTH};
 
 	private final ServerLevel level;
 	private final Map<GridPosition, Cell> cells = new HashMap<>();
 	private final Map<GridPosition, Boolean> shallowWater = new HashMap<>();
+	private final Map<Long, Boolean> sampledChunks = new HashMap<>();
+	private final SampledRevisions sampledRevisions;
 	private long cacheHits;
 	private long cacheMisses;
 
 	public MinecraftNavigationWorld(ServerLevel level) {
 		this.level = Objects.requireNonNull(level, "level must not be null");
+		this.sampledRevisions = new SampledRevisions((center, radius) ->
+				level instanceof WorldMutationRevisionAccess access
+						? access.arenaagents$worldMutationRevision(center, radius) : level.getGameTime());
+	}
+
+	/** Dynamic collision changes invalidate even when the sampled block states are identical. */
+	boolean isCurrent() {
+		for (Map.Entry<Long, Boolean> entry : sampledChunks.entrySet()) {
+			long key = entry.getKey();
+			if (level.hasChunk((int) (key >> 32), (int) key) != entry.getValue()) return false;
+		}
+		return sampledRevisions.isCurrent();
+	}
+
+	private BlockState stateAt(BlockPos position) {
+		hasChunk(position.getX(), position.getZ());
+		return level.getBlockState(position);
+	}
+
+	private boolean hasChunk(int x, int z) {
+		long key = ((long) (x >> 4) << 32) | ((z >> 4) & 0xffffffffL);
+		return sampledChunks.computeIfAbsent(key, ignored -> {
+			sampledRevisions.sample(x, z);
+			return level.hasChunk(x >> 4, z >> 4);
+		});
+	}
+
+	@FunctionalInterface
+	interface RevisionReader {
+		long read(BlockPos center, int radius);
+	}
+
+	static final class SampledRevisions {
+		private final RevisionReader reader;
+		private final Map<Long, Long> revisions = new HashMap<>();
+
+		SampledRevisions(RevisionReader reader) {
+			this.reader = Objects.requireNonNull(reader);
+		}
+
+		void sample(int x, int z) {
+			long key = ((long) (x >> 4) << 32) | ((z >> 4) & 0xffffffffL);
+			revisions.computeIfAbsent(key, ignored -> read(key));
+		}
+
+		boolean isCurrent() {
+			for (Map.Entry<Long, Long> entry : revisions.entrySet()) {
+				if (read(entry.getKey()) != entry.getValue()) return false;
+			}
+			return true;
+		}
+
+		private long read(long key) {
+			BlockPos center = new BlockPos(((int) (key >> 32) << 4) + 8, 0, ((int) key << 4) + 8);
+			// Include neighboring blocks whose moving collision can enter a sampled chunk.
+			return reader.read(center, 9);
+		}
+	}
+
+	@Override
+	public TraversalType traversalAt(GridPosition position) {
+		TraversalType normal = WalkabilityView.super.traversalAt(position);
+		if (normal != null) return normal;
+		if (cellAt(position) != Cell.CLEAR || cellAt(position.below()) != Cell.SAFE_SUPPORT
+				|| cellAt(position.above()) == Cell.UNLOADED || cellAt(position.above()) == Cell.HAZARD
+				|| cellAt(position.above()) == Cell.WATER) return null;
+		BlockPos head = new BlockPos(position.x(), position.y() + 1, position.z());
+		return crouchClearance(stateAt(head).getCollisionShape(level, head)) ? TraversalType.CROUCH : null;
+	}
+
+	static boolean crouchClearance(VoxelShape headCollision) {
+		for (AABB box : headCollision.toAabbs()) {
+			if (box.maxX > 0.2D && box.minX < 0.8D && box.maxZ > 0.2D && box.minZ < 0.8D
+					&& box.maxY > 0.0D && box.minY < 0.5D) return false;
+		}
+		return true;
+	}
+
+	Direction climbDirection(GridPosition position) {
+		BlockPos block = new BlockPos(position.x(), position.y(), position.z());
+		if (cellAt(position) != Cell.CLIMBABLE) return null;
+		BlockState state = stateAt(block);
+		if (state.hasProperty(BlockStateProperties.HORIZONTAL_FACING)) {
+			return state.getValue(BlockStateProperties.HORIZONTAL_FACING).getOpposite();
+		}
+		for (Direction direction : HORIZONTAL_DIRECTIONS) {
+			GridPosition adjacent = position.offset(direction.getStepX(), 0, direction.getStepZ());
+			if (cellAt(adjacent) == Cell.SAFE_SUPPORT) return direction;
+		}
+		return null;
 	}
 
 	@Override
@@ -48,18 +140,18 @@ public final class MinecraftNavigationWorld implements WalkabilityView {
 		}
 		cacheMisses++;
 		if (level.isOutsideBuildHeight(position.y())
-				|| !level.hasChunk(position.x() >> 4, position.z() >> 4)) {
+				|| !hasChunk(position.x(), position.z())) {
 			cells.put(position, Cell.UNLOADED);
 			shallowWater.put(position, false);
 			return Cell.UNLOADED;
 		}
 		BlockPos blockPosition = new BlockPos(position.x(), position.y(), position.z());
-		BlockState state = level.getBlockState(blockPosition);
+		BlockState state = stateAt(blockPosition);
 		VoxelShape collision = state.getCollisionShape(level, blockPosition);
-		boolean boundedShallowWater = state.is(Blocks.WATER) && isBoundedShallowWater(blockPosition);
-		Cell cell = classifyCell(state, collision, boundedShallowWater);
+		boolean standingWater = state.is(Blocks.WATER) && isOneBlockDeepWater(blockPosition);
+		Cell cell = classifyCell(state, collision, standingWater);
 		cells.put(position, cell);
-		shallowWater.put(position, boundedShallowWater);
+		shallowWater.put(position, standingWater);
 		return cell;
 	}
 
@@ -83,12 +175,12 @@ public final class MinecraftNavigationWorld implements WalkabilityView {
 				feetPosition.z()
 		);
 		if (level.isOutsideBuildHeight(supportPosition.getY())
-				|| !level.hasChunk(supportPosition.getX() >> 4, supportPosition.getZ() >> 4)) {
+				|| !hasChunk(supportPosition.getX(), supportPosition.getZ())) {
 			return Double.NaN;
 		}
 		double localX = worldX - supportPosition.getX();
 		double localZ = worldZ - supportPosition.getZ();
-		BlockState support = level.getBlockState(supportPosition);
+		BlockState support = stateAt(supportPosition);
 		double collisionHeight = collisionHeightAt(
 				support.getCollisionShape(level, supportPosition),
 				localX,
@@ -115,74 +207,47 @@ public final class MinecraftNavigationWorld implements WalkabilityView {
 		return height;
 	}
 
-	static Cell classifyCell(BlockState state, VoxelShape collision, boolean boundedShallowWater) {
+	static Cell classifyCell(BlockState state, VoxelShape collision, boolean standingWater) {
 		Objects.requireNonNull(state, "state must not be null");
 		Objects.requireNonNull(collision, "collision must not be null");
 		if (isIntrinsicHazard(state)) return Cell.HAZARD;
 		if (!state.getFluidState().isEmpty()) {
-			return state.is(Blocks.WATER) && boundedShallowWater
-					? Cell.CLEAR
-					: Cell.HAZARD;
+			if ((!state.is(Blocks.WATER) && !state.getFluidState().is(FluidTags.WATER)) || !collision.isEmpty()) return Cell.HAZARD;
+			return standingWater ? Cell.CLEAR : Cell.WATER;
 		}
+		if (state.is(BlockTags.CLIMBABLE)) return Cell.CLIMBABLE;
 		if (isOpenDoor(state)) return Cell.CLEAR;
 		if (collision.isEmpty()) return Cell.CLEAR;
-		if (Block.isShapeFullBlock(collision) || isWalkablePartialSupport(state)) return Cell.SAFE_SUPPORT;
+		if (Block.isShapeFullBlock(collision) || supportsPlayerFootprint(collision)) return Cell.SAFE_SUPPORT;
 		return Cell.BLOCKED;
-	}
-
-	private boolean isBoundedShallowWater(BlockPos position) {
-		if (!isOneBlockDeepWater(position)) return false;
-		for (Direction[] axis : CROSSING_AXES) {
-			int negativeBank = distanceToDryBank(position, axis[0]);
-			int positiveBank = distanceToDryBank(position, axis[1]);
-			if (negativeBank > 0 && positiveBank > 0
-					&& negativeBank + positiveBank - 1 <= MAX_SHALLOW_WATER_CROSSING) return true;
-		}
-		return false;
-	}
-
-	private int distanceToDryBank(BlockPos origin, Direction direction) {
-		for (int distance = 1; distance <= MAX_SHALLOW_WATER_CROSSING; distance++) {
-			BlockPos candidate = origin.relative(direction, distance);
-			if (!level.hasChunk(candidate.getX() >> 4, candidate.getZ() >> 4)) return -1;
-			if (isOneBlockDeepWater(candidate)) continue;
-			return isDryStandableBank(candidate) ? distance : -1;
-		}
-		return -1;
 	}
 
 	private boolean isOneBlockDeepWater(BlockPos position) {
 		if (level.isOutsideBuildHeight(position.getY()) || level.isOutsideBuildHeight(position.getY() - 1)
-				|| !level.hasChunk(position.getX() >> 4, position.getZ() >> 4)) return false;
-		BlockState water = level.getBlockState(position);
+				|| !hasChunk(position.getX(), position.getZ())) return false;
+		BlockState water = stateAt(position);
 		if (!water.getFluidState().is(FluidTags.WATER)
 				|| !water.getCollisionShape(level, position).isEmpty()) return false;
 		BlockPos abovePosition = position.above();
-		BlockState above = level.getBlockState(abovePosition);
+		BlockState above = stateAt(abovePosition);
 		if (!above.getFluidState().isEmpty() || !above.getCollisionShape(level, abovePosition).isEmpty()) return false;
 		BlockPos supportPosition = position.below();
-		BlockState support = level.getBlockState(supportPosition);
+		BlockState support = stateAt(supportPosition);
 		return classifyCell(support, support.getCollisionShape(level, supportPosition), false) == Cell.SAFE_SUPPORT;
 	}
 
-	private boolean isDryStandableBank(BlockPos feetPosition) {
-		BlockState feet = level.getBlockState(feetPosition);
-		BlockPos headPosition = feetPosition.above();
-		BlockState head = level.getBlockState(headPosition);
-		if (!feet.getFluidState().isEmpty() || !head.getFluidState().isEmpty()
-				|| !feet.getCollisionShape(level, feetPosition).isEmpty()
-				|| !head.getCollisionShape(level, headPosition).isEmpty()) return false;
-		BlockPos supportPosition = feetPosition.below();
-		BlockState support = level.getBlockState(supportPosition);
-		return classifyCell(support, support.getCollisionShape(level, supportPosition), false) == Cell.SAFE_SUPPORT;
-	}
-
-	private static boolean isWalkablePartialSupport(BlockState state) {
-		String path = BuiltInRegistries.BLOCK.getKey(state.getBlock()).getPath();
-		return path.endsWith("_slab")
-				|| path.endsWith("_stairs")
-				|| path.equals("farmland")
-				|| path.equals("dirt_path");
+	private static boolean supportsPlayerFootprint(VoxelShape collision) {
+		java.util.List<AABB> boxes = collision.toAabbs();
+		for (double x : FOOTPRINT_SAMPLES) {
+			for (double z : FOOTPRINT_SAMPLES) {
+				double height = 0.0D;
+				for (AABB box : boxes) {
+					if (x >= box.minX && x <= box.maxX && z >= box.minZ && z <= box.maxZ) height = Math.max(height, box.maxY);
+				}
+				if (height <= 0.0D || height > 1.0D) return false;
+			}
+		}
+		return true;
 	}
 
 	private static boolean isOpenDoor(BlockState state) {

@@ -293,6 +293,29 @@ test('Windows cleanup has one outer deadline when taskkill never settles', async
 	assert.deepEqual(child.signals, ['SIGKILL']);
 });
 
+test('Windows cleanup does not launch another helper after its timer expires before the wall clock deadline', async (t) => {
+	t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000 });
+	const child = new UncooperativeChild();
+	child.pid = 4_245;
+	let calls = 0;
+	const cleanup = terminateChildProcess(child, {
+		timeoutMs: 20,
+		platform: 'win32',
+		execFile: () => { calls += 1; },
+	});
+	const rejected = assert.rejects(cleanup, /before the 20ms deadline/);
+	t.mock.timers.tick(20);
+	// Timers and Date.now() need not agree at the millisecond boundary.
+	t.mock.timers.setTime(1_019);
+	for (let step = 0; step < 3; step++) {
+		await Promise.resolve();
+		t.mock.timers.tick(1);
+	}
+	await rejected;
+	assert.equal(calls, 1);
+	assert.deepEqual(child.signals, ['SIGKILL']);
+});
+
 
 test('Gemini ACP preserves bounded structured 429 metadata without retaining provider data', async () => {
 	const child = new UncooperativeChild();

@@ -83,6 +83,20 @@ test('admits only factual observed-candidate queries in watcher conditions', () 
 	assert.throws(() => parseArenaScript('program.onUnhandledAttention("continue_and_notify"); program.watch(() => player.wait(1), { mode: "boundary" }, async () => {});'), (error) => error.code === 'UNSUPPORTED_SYNTAX');
 });
 
+test('extended fact and math reads are pure while inspection and notebook operations require continuations', () => {
+	const compiled = parseArenaScript(`program.onUnhandledAttention("continue_and_notify");
+		program.watch(() => world.menu() !== null, { mode: "boundary" }, async () => {});
+		program.watch(() => inventory.slots({ itemId: "minecraft:diamond" }).length > 0, { mode: "boundary" }, async () => {});
+		program.watch(() => math.abs(player.state().velocity.y) > 0.5, { mode: "boundary" }, async () => {});
+	`);
+	assert.equal(compiled.watchers[0].factDependencyMask, FACT_DOMAIN.menu);
+	assert.equal(compiled.watchers[1].factDependencyMask, FACT_DOMAIN.inventoryItems);
+	assert.equal(compiled.watchers[2].factDependencyMask, FACT_DOMAIN.player);
+	for (const operation of ['inspect', 'remember', 'queryMemory']) {
+		assert.throws(() => parseArenaScript(`program.onUnhandledAttention("continue_and_notify"); program.watch(() => world.${operation}({}), { mode: "boundary" }, async () => {});`), (error) => error.code === 'UNSUPPORTED_SYNTAX');
+	}
+});
+
 test('requires mine calls to carry the observed non-air block id', () => {
 	assert.doesNotThrow(() => parseArenaScript('program.onUnhandledAttention("continue_and_notify"); await player.mine({ x: 1, y: 64, z: 0, expectedBlockId: "minecraft:stone" });'));
 	for (const source of [
@@ -457,7 +471,7 @@ test('detects recursion through the external binding of a named function express
 });
 
 test('rejects shadowed reserved capabilities and built-ins in local bindings and parameters', () => {
-	for (const name of ['program', 'player', 'world', 'inventory', 'tryResult', 'undefined', 'NaN', 'Infinity']) {
+	for (const name of ['program', 'player', 'world', 'inventory', 'math', 'tryResult', 'undefined', 'NaN', 'Infinity']) {
 		assert.throws(
 			() => parseArenaScript(`const ${name} = 1; program.onUnhandledAttention("continue_and_notify");`),
 			(error) => error.name === 'ArenaScriptError' && error.code === 'UNSUPPORTED_SYNTAX',
@@ -488,7 +502,7 @@ test('rejects every reserved capability name at every supported binding site', (
 		() => parseArenaScript('program.onUnhandledAttention("continue_and_notify"); for (let player=0; player<1; player++){ player.wait(1); }'),
 		(error) => error.name === 'ArenaScriptError' && error.code === 'UNSUPPORTED_SYNTAX',
 	);
-	for (const name of ['program', 'player', 'world', 'inventory', 'tryResult', 'undefined', 'NaN', 'Infinity']) {
+	for (const name of ['program', 'player', 'world', 'inventory', 'math', 'tryResult', 'undefined', 'NaN', 'Infinity']) {
 		for (const source of [
 			`program.onUnhandledAttention("continue_and_notify"); const ${name} = 0;`,
 			`program.onUnhandledAttention("continue_and_notify"); for (let ${name} = 0; ${name} < 1; ${name} += 1) {}`,

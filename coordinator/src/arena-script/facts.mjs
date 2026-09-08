@@ -8,10 +8,6 @@ const OBSERVED_SETS = new WeakSet();
 const CANDIDATE_ORIGINS = new WeakMap();
 const INTERPRETER_FACTS = new WeakSet();
 const FACT_STATS = new WeakMap();
-const PLAYER_FIELDS = ['x', 'y', 'z', 'health', 'hunger', 'air', 'fire', 'fallDistance', 'dead', 'yaw', 'pitch'];
-const CANDIDATE_FIELDS = ['stableId', 'entityId', 'type', 'itemId', 'blockId', 'count', 'x', 'y', 'z', 'distance', 'tags'];
-const ADAPTED_CANDIDATE_FIELDS = new Set([...CANDIDATE_FIELDS, 'name', 'isPlayer', 'placeableFaces']);
-const ADAPTED_INVENTORY_FIELDS = new Set(['itemId', 'count', 'slot', 'tags', 'damage', 'maxDamage', 'hotbar']);
 const TRUST_LIMITS = Object.freeze({ depth: 256, nodes: 4_096, keys: 4_096, stringBytes: 16_384, factBytes: MAX_LINE_BYTES * 2, arrayLength: 256 });
 const EMPTY_FACT_STATS = Object.freeze({ nodes: 0, keys: 0, bytes: 0, depth: -1 });
 
@@ -27,6 +23,8 @@ export function createFactView(observation) {
 	return freezeRecord({
 		player: data.player,
 		world: freezeRecord({
+			state: () => data.world.state,
+			menu: () => data.world.menu,
 			items: (criteria = {}) => query(data.world.items, criteria),
 			entities: (criteria = {}) => query(data.world.entities, criteria),
 			blocks: (criteria = {}) => query(data.world.blocks, criteria),
@@ -35,7 +33,10 @@ export function createFactView(observation) {
 				return nearest(list, origin);
 			},
 		}),
-		inventory: freezeRecord({ count: (itemId) => countInventory(data.inventory.items, itemId), countTag: (tag) => data.inventory.tagCounts[tag] ?? 0 }),
+		inventory: freezeRecord({
+			count: (itemId) => countInventory(data.inventory.items, itemId), countTag: (tag) => data.inventory.tagCounts[tag] ?? 0,
+			slots: (criteria = {}) => filterObserved(data.inventory.items, criteria), state: () => data.inventory.state,
+		}),
 	});
 }
 
@@ -44,9 +45,7 @@ export function createInterpreterFacts(observation = {}, previousFacts = null) {
 	const previous = INTERPRETER_FACTS.has(previousFacts) ? previousFacts : null;
 	const source = ownDataRecord(observation, 'observation');
 	const playerSource = ownDataRecord(source.player ?? Object.create(null), 'observation.player');
-	const player = copyRecord(playerSource, PLAYER_FIELDS, 'observation.player');
-	if (Object.hasOwn(playerSource, 'lastAttacker')) player.lastAttacker = copyAttacker(playerSource.lastAttacker);
-	const frozenPlayer = reuseEqual(previous?.player, freezeRecord(player));
+	const frozenPlayer = reuseEqual(previous?.player, copyFactData(playerSource, 'observation.player'));
 	const inventorySource = ownDataRecord(source.inventory ?? Object.create(null), 'observation.inventory');
 	const tagCounts = Object.create(null);
 	for (const [tag, count] of Object.entries(ownDataRecord(inventorySource.tagCounts ?? Object.create(null), 'observation.inventory.tagCounts'))) {
@@ -57,17 +56,28 @@ export function createInterpreterFacts(observation = {}, previousFacts = null) {
 	const worldBlocks = reuseEqual(previous?.world.blocks, copyCandidates(source.blocks, 'block'));
 	const inventoryItems = reuseEqual(previous?.inventory.items, copyInventory(inventorySource.items));
 	const inventoryTagCounts = reuseEqual(previous?.inventory.tagCounts, freezeRecord(tagCounts));
+	const worldSource = ownDataRecord(source.world ?? Object.create(null), 'observation.world');
+	for (const key of ['coverage', 'observedAtEpochMs', 'worldTick', 'interaction', 'recipes', 'events', 'perception', 'dimension', 'capabilities']) {
+		if (Object.hasOwn(source, key)) worldSource[key] = source[key];
+	}
+	const worldState = reuseEqual(previous?.world.state, copyFactData(worldSource, 'observation.world'));
+	const interaction = ownDataRecord(source.interaction ?? Object.create(null), 'observation.interaction');
+	const menu = reuseEqual(previous?.world.menu, copyFactData(interaction.menu ?? source.menu ?? null, 'observation.menu'));
+	const inventoryMetadata = Object.fromEntries(Object.entries(inventorySource).filter(([key]) => !['items', 'tagCounts'].includes(key)));
+	const inventoryState = reuseEqual(previous?.inventory.state, copyFactData(inventoryMetadata, 'observation.inventory'));
 	if (previous !== null
 		&& frozenPlayer === previous.player
 		&& worldItems === previous.world.items
 		&& worldEntities === previous.world.entities
 		&& worldBlocks === previous.world.blocks
 		&& inventoryItems === previous.inventory.items
-		&& inventoryTagCounts === previous.inventory.tagCounts) return previous;
+		&& inventoryTagCounts === previous.inventory.tagCounts
+		&& worldState === previous.world.state && menu === previous.world.menu
+		&& inventoryState === previous.inventory.state) return previous;
 	const facts = freezeRecord({
 		player: frozenPlayer,
-		world: freezeRecord({ items: worldItems, entities: worldEntities, blocks: worldBlocks }),
-		inventory: freezeRecord({ items: inventoryItems, tagCounts: inventoryTagCounts }),
+		world: freezeRecord({ items: worldItems, entities: worldEntities, blocks: worldBlocks, state: worldState, menu }),
+		inventory: freezeRecord({ items: inventoryItems, tagCounts: inventoryTagCounts, state: inventoryState }),
 	});
 	if (withinInterpreterFactLimits(facts)) INTERPRETER_FACTS.add(facts);
 	return facts;
@@ -88,6 +98,9 @@ export function changedInterpreterFactDomains(previous, next) {
 	if (previous.world.blocks !== next.world.blocks) changed |= FACT_DOMAIN.worldBlocks;
 	if (previous.inventory.items !== next.inventory.items) changed |= FACT_DOMAIN.inventoryItems;
 	if (previous.inventory.tagCounts !== next.inventory.tagCounts) changed |= FACT_DOMAIN.inventoryTagCounts;
+	if (previous.world.state !== next.world.state) changed |= FACT_DOMAIN.worldState;
+	if (previous.world.menu !== next.world.menu) changed |= FACT_DOMAIN.menu;
+	if (previous.inventory.state !== next.inventory.state) changed |= FACT_DOMAIN.inventoryState;
 	return changed;
 }
 
@@ -136,13 +149,13 @@ function copyCandidates(values, kind) {
 function copyCandidate(value, kind) {
 	const source = ownDataRecord(value, `observation ${kind}`);
 	const required = kind === 'item' ? ['stableId', 'itemId', 'count', 'x', 'y', 'z'] : kind === 'entity' ? ['stableId', 'type', 'x', 'y', 'z'] : ['stableId', 'blockId', 'x', 'y', 'z'];
-	if (Reflect.ownKeys(source).some((key) => typeof key !== 'string' || !ADAPTED_CANDIDATE_FIELDS.has(key)) || required.some((key) => !Object.hasOwn(source, key))) throw new TypeError(`observation ${kind} has an invalid schema`);
+	if (required.some((key) => !Object.hasOwn(source, key))) throw new TypeError(`observation ${kind} has an invalid schema`);
 	if (!Number.isFinite(source.x) || !Number.isFinite(source.y) || !Number.isFinite(source.z)) return null;
 	if (typeof source.stableId !== 'string' || source.stableId.length === 0) throw new TypeError(`observation ${kind} has invalid identity`);
 	if (kind === 'item' && (typeof source.itemId !== 'string' || !nonNegativeInteger(source.count))) throw new TypeError('observation item has invalid item fields');
 	if (kind === 'entity' && typeof source.type !== 'string') throw new TypeError('observation entity has invalid type');
 	if (kind === 'block' && typeof source.blockId !== 'string') throw new TypeError('observation block has invalid block id');
-	const copied = copyRecord(source, CANDIDATE_FIELDS, `observation ${kind}`);
+	const copied = Object.assign(Object.create(null), copyFactData(source, `observation ${kind}`));
 	if (Object.hasOwn(source, 'tags')) {
 		const tags = denseDataArray(source.tags, `observation ${kind} tags`);
 		if (tags.some((tag) => typeof tag !== 'string')) throw new TypeError(`observation ${kind} has invalid tags`);
@@ -153,11 +166,11 @@ function copyCandidate(value, kind) {
 }
 
 function copyInventory(values) {
-	if (values === undefined) return Object.freeze([]);
-	return Object.freeze(denseDataArray(values, 'observation inventory items').map((value) => {
+	if (values === undefined) return observedList([]);
+	return observedList(denseDataArray(values, 'observation inventory items').map((value) => {
 		const source = ownDataRecord(value, 'observation inventory item');
-		if (Reflect.ownKeys(source).some((key) => !ADAPTED_INVENTORY_FIELDS.has(key)) || typeof source.itemId !== 'string' || !nonNegativeInteger(source.count)) throw new TypeError('observation inventory item has an invalid schema');
-		const copied = copyRecord(source, ['itemId', 'count', 'slot'], 'observation inventory item');
+		if (typeof source.itemId !== 'string' || !nonNegativeInteger(source.count)) throw new TypeError('observation inventory item has an invalid schema');
+		const copied = Object.assign(Object.create(null), copyFactData(source, 'observation inventory item'));
 		if (Object.hasOwn(source, 'tags')) {
 			const tags = denseDataArray(source.tags, 'observation inventory item tags');
 			if (tags.some((tag) => typeof tag !== 'string')) throw new TypeError('observation inventory item has invalid tags');
@@ -167,13 +180,16 @@ function copyInventory(values) {
 	}));
 }
 
-function copyAttacker(value) {
-	const source = ownDataRecord(value, 'observation.player.lastAttacker');
-	if (Reflect.ownKeys(source).some((key) => !['uuid', 'type', 'distance'].includes(key))
-		|| typeof source.uuid !== 'string' || typeof source.type !== 'string' || !Number.isFinite(source.distance)) {
-		throw new TypeError('observation.player.lastAttacker has an invalid schema');
-	}
-	return freezeRecord({ uuid: source.uuid, type: source.type, distance: source.distance });
+function copyFactData(value, label, ancestors = new Set(), depth = 0) {
+	if (value === null || typeof value === 'string' || typeof value === 'boolean' || Number.isFinite(value)) return value;
+	if (depth > TRUST_LIMITS.depth || ancestors.has(value)) throw new TypeError(`${label} exceeds the depth limit or contains a cycle`);
+	ancestors.add(value);
+	try {
+		if (Array.isArray(value)) return Object.freeze(denseDataArray(value, label).map((entry) => copyFactData(entry, label, ancestors, depth + 1)));
+		const source = ownDataRecord(value, label);
+		return freezeRecord(Object.fromEntries(Object.entries(source).filter(([_key, entry]) => entry !== undefined)
+			.map(([key, entry]) => [key, copyFactData(entry, `${label}.${key}`, ancestors, depth + 1)])));
+	} finally { ancestors.delete(value); }
 }
 
 function denseDataArray(value, label) {
@@ -190,16 +206,6 @@ function denseDataArray(value, label) {
 		copied.push(descriptor.value);
 	}
 	if (keys.length !== length.value + 1) throw new TypeError(`${label} must not have holes or custom keys`);
-	return copied;
-}
-
-function copyRecord(source, names, label) {
-	const copied = Object.create(null);
-	for (const name of names) {
-		if (!Object.hasOwn(source, name)) continue;
-		const value = source[name];
-		if (typeof value === 'string' || typeof value === 'boolean' || Number.isFinite(value)) copied[name] = value;
-	}
 	return copied;
 }
 

@@ -1,12 +1,14 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import { DynamicAgentState } from './agent-registry.mjs';
 import { ArenaScriptError } from './arena-script/errors.mjs';
 import { parseArenaScript } from './arena-script/parser.mjs';
 import { ArenaScriptEngine } from './arena-script/program-engine.mjs';
+import { freezeQueryResult } from './arena-script/interpreter.mjs';
 import { normalizeRetryReason, validateTraceId } from './control-latency-registry.mjs';
 import { buildPlannerInput } from './prompts.mjs';
 import { classifyRecoveryFailure } from './recovery-policy.mjs';
+import { normalizeMinecraftToolCall } from './native-minecraft-tools.mjs';
 
 /** Coordinates model-authored ArenaScript programs for independent agents. */
 export class ProgramRuntimeManager {
@@ -32,8 +34,11 @@ export class ProgramRuntimeManager {
 	#setTimeout;
 	#clearTimeout;
 	#requestRecovery;
+	#inspectObservation;
+	#memoryOperation;
+	#sessionId;
 
-	constructor({ registry, bridge, planner, reportError = () => {}, trace = () => {}, onCompleted = () => {}, onCompletionRequested = () => {}, requestRecovery = () => {}, plannerContext = () => ({}), compilerCorrectionLimit = 1, latencyRegistry = null, clock = performance.now.bind(performance), recorder = null, benchmarkRecorder = null, completionRetryDelayMs = 1_000, completionRetryLimit = 5, cancellationAckTimeoutMs = 5_000, setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout } = {}) {
+	constructor({ registry, bridge, planner, reportError = () => {}, trace = () => {}, onCompleted = () => {}, onCompletionRequested = () => {}, requestRecovery = () => {}, plannerContext = () => ({}), inspectObservation = async () => ({ state: 'FAILED', reasonCode: 'INSPECTION_UNAVAILABLE' }), memoryOperation = async () => ({ state: 'FAILED', reasonCode: 'MEMORY_UNAVAILABLE' }), compilerCorrectionLimit = 1, latencyRegistry = null, clock = performance.now.bind(performance), recorder = null, benchmarkRecorder = null, completionRetryDelayMs = 1_000, completionRetryLimit = 5, cancellationAckTimeoutMs = 5_000, setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout, sessionId = randomUUID() } = {}) {
 		if (!registry || !bridge || !planner) throw new TypeError('registry, bridge, and planner are required');
 		if (typeof bridge.send !== 'function' || typeof planner.requestPlan !== 'function') throw new TypeError('bridge.send and planner.requestPlan are required');
 		if (typeof reportError !== 'function') throw new TypeError('reportError must be a function');
@@ -42,6 +47,10 @@ export class ProgramRuntimeManager {
 		if (typeof onCompletionRequested !== 'function') throw new TypeError('onCompletionRequested must be a function');
 		if (typeof requestRecovery !== 'function') throw new TypeError('requestRecovery must be a function');
 		if (typeof plannerContext !== 'function') throw new TypeError('plannerContext must be a function');
+		if (typeof inspectObservation !== 'function') throw new TypeError('inspectObservation must be a function');
+		if (typeof memoryOperation !== 'function') throw new TypeError('memoryOperation must be a function');
+		if (typeof sessionId !== 'string' || !/^[A-Za-z0-9._:-]{1,128}$/.test(sessionId)) throw new TypeError('sessionId must be a bounded identifier');
+		this.#sessionId = sessionId;
 		this.#registry = registry;
 		this.#bridge = bridge;
 		this.#planner = planner;
@@ -51,6 +60,8 @@ export class ProgramRuntimeManager {
 		this.#onCompletionRequested = onCompletionRequested;
 		this.#requestRecovery = requestRecovery;
 		this.#plannerContext = plannerContext;
+		this.#inspectObservation = inspectObservation;
+		this.#memoryOperation = memoryOperation;
 		if (!Number.isSafeInteger(compilerCorrectionLimit) || compilerCorrectionLimit < 0) throw new TypeError('compilerCorrectionLimit must be a non-negative safe integer');
 		this.#compilerCorrectionLimit = compilerCorrectionLimit;
 		if (latencyRegistry !== null && typeof latencyRegistry.record !== 'function') throw new TypeError('latencyRegistry.record must be a function');
@@ -328,6 +339,7 @@ export class ProgramRuntimeManager {
 			actionTraceIds: new Map(),
 			actionTiming: new Map(),
 			actionMetadata: new Map(),
+			inspectedTargets: new Map(),
 			commands: 0,
 			corrections: new Map(),
 			terminalStatus: null,
@@ -361,6 +373,7 @@ export class ProgramRuntimeManager {
 		};
 		state.engine = new ArenaScriptEngine({
 			dispatch: (command) => { void this.#dispatch(state, command); },
+			inspect: (request) => { void this.#inspect(state, request); },
 			cancel: (actionId) => { void this.#cancel(state, actionId); },
 			requestModel: (context) => { void this.#requestReactiveDecision(state, context); },
 			trace: (event, fields) => this.#traceState(state, event, fields),
@@ -368,6 +381,47 @@ export class ProgramRuntimeManager {
 		this.#states.set(record.agentId, state);
 		this.#lifecycles.set(record.agentId, state.lifecycle);
 		return state;
+	}
+
+	async #inspect(state, { queryId, operation, query, authorship }) {
+		const record = this.#registry.get(state.agentId);
+		if (state.disposed || record?.goalRevision !== state.goalRevision || state.engine.snapshot().activeQueryId !== queryId) return;
+		let value;
+		try {
+			if (operation === 'inspect') value = await this.#inspectObservation(record, query);
+			else {
+				const normalized = normalizeMinecraftToolCall(operation === 'remember' ? 'notebook' : 'queryMemory', query);
+				const args = operation === 'remember' ? { key: normalized.key, text: normalized.text }
+					: { kind: normalized.memoryKind, limit: normalized.limit, ...(normalized.offset === undefined ? {} : { offset: normalized.offset }), ...(normalized.text === undefined ? {} : { text: normalized.text }) };
+				value = await this.#memoryOperation(record, { operation: operation === 'remember' ? 'write' : 'query', arguments: args, provenance: authorship });
+			}
+		}
+		catch (error) { value = { state: 'FAILED', reasonCode: String(error?.code ?? 'INSPECTION_FAILED').slice(0, 128) }; }
+		if (state.disposed || this.#registry.get(state.agentId)?.goalRevision !== state.goalRevision || state.engine.snapshot().activeQueryId !== queryId) return;
+		try {
+			const result = freezeQueryResult(value);
+			if (operation === 'inspect' && query.section === 'entities' && result.state === 'SUCCEEDED'
+				&& result.section === 'entities' && Number.isSafeInteger(result.eventSequence) && result.eventSequence >= 1 && Array.isArray(result.entries)) {
+				for (const entry of result.entries) {
+					const target = entry?.uuid ?? entry?.stableId;
+					if (typeof target !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(target)) continue;
+					state.inspectedTargets.delete(target);
+					state.inspectedTargets.set(target, result.eventSequence);
+					if (state.inspectedTargets.size > 256) state.inspectedTargets.delete(state.inspectedTargets.keys().next().value);
+				}
+			}
+			state.engine.ingestQueryResult({ queryId, value: result });
+			this.#syncState(record, state);
+		} catch (error) {
+			if (state.engine.snapshot().activeQueryId === queryId) {
+				try {
+					state.engine.ingestQueryResult({ queryId, value: { state: 'FAILED', reasonCode: 'INVALID_QUERY_RESULT' } });
+					this.#syncState(record, state);
+					return;
+				} catch (resumeError) { error = resumeError; }
+			}
+			this.#reportError(state.agentId, error);
+		}
 	}
 
 	async #installSource(state, record, source, observation, eventSequence) {
@@ -644,7 +698,7 @@ export class ProgramRuntimeManager {
 		try {
 			const branchSelectedAt = this.#safeNow();
 			this.#ensureActing(record);
-			actionId = `${state.agentId}:${state.goalRevision}:${state.lifecycle}:${++state.commands}:${command.actionId}`;
+			actionId = `program:${this.#sessionId}:${createHash('sha256').update(JSON.stringify([state.agentId, state.goalRevision, state.lifecycle, ++state.commands, command.actionId])).digest('hex')}`;
 			state.actionIds.set(actionId, command.actionId);
 			state.actionTraceIds.set(actionId, state.traceId);
 			state.actionMetadata.set(actionId, { command, branchSelectedAt });
@@ -670,7 +724,10 @@ export class ProgramRuntimeManager {
 				locallyStale = true;
 				throw codedError('STALE_PLAN', 'Program action became stale before bridge send');
 			}
-			await this.#bridge.send('action_command', state.agentId, wireActionCommand(record, actionId, command, state.traceId));
+			const target = command.action.arguments?.targetId ?? command.action.arguments?.targetSelector;
+			const currentTarget = state.observation?.entities?.some((entry) => (entry.stableId ?? entry.uuid) === target) === true;
+			const inspectedSequence = currentTarget ? undefined : state.inspectedTargets.get(target);
+			await this.#bridge.send('action_command', state.agentId, wireActionCommand(record, actionId, command, state.traceId, inspectedSequence));
 			const bridgeSentAt = this.#safeNow();
 			this.#record('action_command_sent', record, { actionId, actionType: command.action.type, eventSequence: command.provenance.eventSequence, durationMs: elapsedOrNull(branchSelectedAt, bridgeSentAt), traceId: state.traceId });
 			if (!state.dispatchTraceRecorded) {
@@ -1147,7 +1204,7 @@ function advancingTimestamp(state, field, value) {
 	if (timestamp !== null) state[field] = timestamp;
 	return timestamp;
 }
-function wireActionCommand(record, actionId, command, traceId) {
+function wireActionCommand(record, actionId, command, traceId, inspectedSequence = undefined) {
 	const action = command?.action;
 	const provenance = command?.provenance;
 	if (!action || typeof action.type !== 'string') {
@@ -1168,7 +1225,7 @@ function wireActionCommand(record, actionId, command, traceId) {
 			programId: provenance.programId,
 			programVersion: provenance.version,
 			sourceStepId: provenance.stepId,
-			eventSequence: provenance.authorizingEventSequence ?? provenance.eventSequence,
+			eventSequence: inspectedSequence ?? provenance.authorizingEventSequence ?? provenance.eventSequence,
 			...(provenance.watcherId === null || provenance.watcherId === undefined ? {} : { watcherId: provenance.watcherId }),
 		}),
 	});

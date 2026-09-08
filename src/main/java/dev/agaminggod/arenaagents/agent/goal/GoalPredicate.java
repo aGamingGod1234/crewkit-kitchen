@@ -8,6 +8,7 @@ import java.util.Objects;
 
 public sealed interface GoalPredicate permits
 		GoalPredicate.InventoryContains,
+		GoalPredicate.InventoryContainsAny,
 		GoalPredicate.PositionWithin,
 		GoalPredicate.AdvancementGranted,
 		GoalPredicate.EntityKilledByAgent,
@@ -17,10 +18,23 @@ public sealed interface GoalPredicate permits
 		GoalPredicate.AllOf,
 		GoalPredicate.AnyOf {
 	String DEFAULT_DIMENSION = "minecraft:overworld";
+	int MAX_INVENTORY_ITEM_IDS = 64;
 
 	record InventoryContains(String itemId, int count) implements GoalPredicate {
 		public InventoryContains {
 			itemId = identifier(itemId, "itemId");
+			if (count <= 0) throw invalid("Inventory count must be positive");
+		}
+	}
+
+	record InventoryContainsAny(List<String> itemIds, int count) implements GoalPredicate {
+		public InventoryContainsAny {
+			Objects.requireNonNull(itemIds, "itemIds must not be null");
+			if (itemIds.isEmpty() || itemIds.size() > MAX_INVENTORY_ITEM_IDS) {
+				throw invalid("Inventory item IDs must contain between 1 and " + MAX_INVENTORY_ITEM_IDS + " entries");
+			}
+			itemIds = itemIds.stream().map(value -> identifier(value, "itemIds entry")).toList();
+			if (new java.util.HashSet<>(itemIds).size() != itemIds.size()) throw invalid("Inventory item IDs must be unique");
 			if (count <= 0) throw invalid("Inventory count must be positive");
 		}
 	}

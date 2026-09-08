@@ -32,6 +32,7 @@ public final class GoalVerificationRuntimeVerification {
 	public static int verify() {
 		int assertions = 0;
 		assertions += verifyExactInventoryAndIdempotence();
+		assertions += verifyInventoryCategorySum();
 		assertions += verifyFailedNonKillLeafMemoization();
 		assertions += verifyStablePositionAndReset();
 		assertions += verifyDimensionBinding();
@@ -95,6 +96,28 @@ public final class GoalVerificationRuntimeVerification {
 		assertEquals(0, fixture.runtime.tick().size(), "later ticks do not repeat terminal satisfaction");
 		assertEquals(1, fixture.transitions.size(), "duplicate evidence cannot emit a second transition");
 		return 8;
+	}
+
+	private static int verifyInventoryCategorySum() {
+		List<String> accepted = List.of("minecraft:oak_log", "minecraft:birch_log");
+		Fixture fixture = fixture(new GoalPredicate.InventoryContainsAny(accepted, 3), 125L);
+		fixture.facts.items.put("minecraft:oak_log", 1);
+		fixture.facts.items.put("minecraft:birch_log", 1);
+		fixture.facts.items.put("minecraft:stone", 64);
+		GoalCompletionVerifier.VerificationResult shortfall = fixture.runtime.evaluate(fixture.agentId);
+		assertEquals(false, shortfall.verified(), "unlisted inventory cannot satisfy the category sum");
+		assertEquals(1, shortfall.facts().size(), "an inventory category produces one factual leaf");
+		assertEquals("combined count 2", shortfall.facts().getFirst().observedValue(), "category evidence sums different accepted IDs");
+		assertEquals(2, fixture.facts.inventoryReads, "failed category fact is memoized during backtracking");
+		fixture.facts.items.put("minecraft:birch_log", 2);
+		GoalCompletionVerifier.VerificationResult satisfied = fixture.runtime.evaluate(fixture.agentId);
+		assertEquals(true, satisfied.verified(), "mixed accepted items satisfy their combined target count");
+		assertEquals("inventory_contains_any", satisfied.facts().getFirst().type(), "category evidence retains its predicate type");
+		assertEquals("combined count 3", satisfied.facts().getFirst().observedValue(), "category evidence reports exact combined count");
+		fixture.facts.items.put("minecraft:oak_log", Integer.MAX_VALUE);
+		assertEquals(2147483649L, fixture.facts.inventoryCountAny(accepted), "category count accumulation cannot overflow a signed integer");
+		assertEquals(1, fixture.runtime.tick().size(), "satisfied category emits one authoritative completion");
+		return 9;
 	}
 
 	private static int verifyFailedNonKillLeafMemoization() {

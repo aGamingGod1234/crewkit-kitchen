@@ -8,6 +8,7 @@ import { createSessionMetadata, profileFingerprint } from './provider-session.mj
 import { recordProviderTurn } from './provider-turn-recorder.mjs';
 import { reportVisibleOutput } from './verbose-output.mjs';
 import { sanitizeDiagnosticText } from './diagnostic-sanitizer.mjs';
+import { createExecutionSettings } from './provider-identity.mjs';
 
 const DEFAULT_PLANNING_TIMEOUT_MS = 45_000;
 const DEFAULT_STARTUP_TIMEOUT_MS = 15_000;
@@ -212,6 +213,7 @@ export class CodexService {
 			sessionGeneration,
 			resetReason: sessionGeneration > 1 ? 'session_replaced' : null,
 			controlProtocol,
+			reportedSettings: response,
 		});
 		if (lifecycleGeneration !== this.#lifecycleGeneration) {
 			await agent.dispose();
@@ -368,6 +370,7 @@ export class SharedCodexAgent {
 	#sessionState = 'cold';
 	#resetReason;
 	#controlProtocol;
+	#executionSettings;
 	#active = null;
 	#prewarmPromise = null;
 	#prewarmTurnPromise = null;
@@ -385,6 +388,12 @@ export class SharedCodexAgent {
 		this.#sessionGeneration = dependencies.sessionGeneration ?? 1;
 		this.#resetReason = dependencies.resetReason ?? null;
 		this.#controlProtocol = validateControlProtocol(dependencies.controlProtocol ?? 'arena_script');
+		this.#executionSettings = createExecutionSettings(profile, {
+			transport: 'codex_app_server', controlProtocol: this.#controlProtocol,
+			modelSelector: profile.model,
+			evidence: { model: 'submitted', serviceTier: 'submitted' },
+		});
+		this.#recordEffectiveSettings(dependencies.reportedSettings, false);
 	}
 
 	get agentId() { return this.#profile.agentId; }
@@ -394,6 +403,17 @@ export class SharedCodexAgent {
 	get planning() { return this.#active !== null; }
 	get sessionGeneration() { return this.#sessionGeneration; }
 	get profileFingerprint() { return profileFingerprint(this.#profile); }
+	get executionSettings() { return structuredClone(this.#executionSettings); }
+	#recordEffectiveSettings(response, turnStarted = true) {
+		if (turnStarted) this.#executionSettings.evidence.reasoningEffort = 'submitted';
+		for (const field of turnStarted ? ['model', 'serviceTier', 'reasoningEffort'] : ['model', 'serviceTier']) {
+			const value = response?.[field] ?? response?.turn?.[field];
+			if (typeof value !== 'string' || value.length === 0 || value.length > 256) continue;
+			if (value !== this.#profile[field]) throw new CodexProtocolError('PROVIDER_SETTINGS_MISMATCH', `Codex did not confirm the selected ${field}`);
+			this.#executionSettings.effective[field] = value;
+			this.#executionSettings.evidence[field] = 'provider_reported';
+		}
+	}
 	sessionMetadata() {
 		return createSessionMetadata(this.#profile, { sessionGeneration: this.#sessionGeneration, sessionState: this.#sessionState, continuation: 'durable', durability: 'proven', resetReason: this.#resetReason });
 	}
@@ -475,6 +495,7 @@ export class SharedCodexAgent {
 			}, () => { /* the awaited race reports the request failure */ });
 			const response = await withTimeout(Promise.race([turnStartPromise, lifecyclePromise]), this.#planningTimeoutMs, this.#schedule, this.#cancelSchedule);
 			active.turnId = requireNestedId(response, 'turn', 'turn/start');
+			this.#recordEffectiveSettings(response);
 			collector.setTurnId(active.turnId);
 			if (this.#active !== active || this.#goalRevision !== goalRevision || lifecycleSettled || signal?.aborted) {
 				try { await this.interrupt(); } catch (error) {
@@ -491,6 +512,7 @@ export class SharedCodexAgent {
 			catch (error) { parseError = error; }
 			outputHandled = true;
 			recordProviderTurn(turnRecorder, {
+				executionSettings: this.executionSettings,
 				agentId: this.agentId, provider: 'codex', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input, output: text, error: parseError,
 				timing: providerTiming(Math.max(0, performance.now() - turnStartedAt), null, queueWaitMs),
@@ -503,6 +525,7 @@ export class SharedCodexAgent {
 			return decision;
 		} catch (error) {
 			if (!outputHandled) recordProviderTurn(turnRecorder, {
+				executionSettings: this.executionSettings,
 				agentId: this.agentId, provider: 'codex', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input, output: rawOutput, error,
 				timing: providerTiming(Math.max(0, performance.now() - turnStartedAt), null, queueWaitMs),
@@ -510,7 +533,7 @@ export class SharedCodexAgent {
 				...(collector.compaction ? { compaction: true } : {}),
 				...(isRateLimitError(error) ? { rateLimited: true } : {}),
 			});
-			if (error?.code === 'PLANNING_TIMEOUT' || error?.code === 'TURN_OUTPUT_LIMIT') {
+			if (['PLANNING_TIMEOUT', 'TURN_OUTPUT_LIMIT', 'PROVIDER_SETTINGS_MISMATCH'].includes(error?.code)) {
 				try { await this.interrupt(); } catch { /* original timeout remains authoritative */ }
 			}
 			throw error;
@@ -548,17 +571,27 @@ export class SharedCodexAgent {
 		return this.#prewarmPromise;
 	}
 
-	async act(input, { goalRevision, signal, executeTool, prewarm = false, onVerbose = null } = {}) {
+	async act(input, { goalRevision, signal, executeTool, prewarm = false, onVerbose = null, onProgress = null } = {}) {
 		if (this.#controlProtocol !== 'native_tools') throw new CodexProtocolError('CONTROL_PROTOCOL_MISMATCH', 'ArenaScript agents must use decide()');
 		if (this.#disposed) throw this.#invalidationError ?? new CodexProtocolError('AGENT_DISPOSED', `Codex agent '${this.agentId}' is disposed`);
 		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('native event input must be nonblank');
 		if (typeof executeTool !== 'function') throw new TypeError('executeTool must be a function');
+		if (onProgress !== null && typeof onProgress !== 'function') throw new TypeError('onProgress must be a function or null');
 		requireRevision(goalRevision);
 		if (goalRevision !== this.#goalRevision) throw new CodexProtocolError('STALE_GOAL_REVISION', `Goal revision ${goalRevision} does not match ${this.#goalRevision}`);
 		if (signal?.aborted) throw signal.reason ?? new CodexProtocolError('TURN_INTERRUPTED', 'Native tool turn was interrupted');
 		if (!prewarm && this.#prewarmPromise !== null && this.#active?.prewarm === true && this.#prewarmTurnPromise !== null) {
-			await this.#steerActiveNativeTurn(input, { goalRevision, executeTool });
-			return this.#prewarmTurnPromise;
+			const adopted = this.#active;
+			const adoptedTurn = this.#prewarmTurnPromise;
+			const abortAdopted = () => { if (this.#active === adopted) void this.interrupt().catch(() => {}); };
+			adopted.onProgress = onProgress;
+			signal?.addEventListener('abort', abortAdopted, { once: true });
+			try {
+				await this.#steerActiveNativeTurn(input, { goalRevision, executeTool });
+				return await adoptedTurn;
+			} finally {
+				signal?.removeEventListener('abort', abortAdopted);
+			}
 		}
 		if (!prewarm && this.#prewarmPromise !== null) {
 			try { await this.#prewarmPromise; } catch { /* a real event continues cold after a failed or interrupted prewarm */ }
@@ -573,7 +606,10 @@ export class SharedCodexAgent {
 			goalRevision,
 			executeTool,
 			onVerbose,
-			onProviderActivity: () => silenceDeadline.restart(),
+			onProviderActivity: () => {
+				silenceDeadline.restart();
+				if (this.#active?.collector === collector) this.#active.onProgress?.({ phase: 'provider' });
+			},
 			onToolExecutionStart: () => silenceDeadline.pause(),
 			onToolExecutionEnd: () => silenceDeadline.resume(),
 		});
@@ -584,6 +620,7 @@ export class SharedCodexAgent {
 		const active = {
 			goalRevision,
 			prewarm,
+			onProgress,
 			turnId: null,
 			turnStartPromise: null,
 			collector,
@@ -623,6 +660,7 @@ export class SharedCodexAgent {
 			}, () => {});
 			const response = await withTimeout(Promise.race([turnStartPromise, lifecyclePromise]), this.#planningTimeoutMs, this.#schedule, this.#cancelSchedule);
 			active.turnId = requireNestedId(response, 'turn', 'turn/start');
+			this.#recordEffectiveSettings(response);
 			collector.setTurnId(active.turnId);
 			if (this.#active !== active || this.#goalRevision !== goalRevision || lifecycleSettled || signal?.aborted) {
 				try { await this.interrupt(); } catch {}
@@ -634,7 +672,7 @@ export class SharedCodexAgent {
 			this.#sessionState = 'warm';
 			return result;
 		} catch (error) {
-			if (error?.code === 'PLANNING_TIMEOUT') {
+			if (['PLANNING_TIMEOUT', 'PROVIDER_SETTINGS_MISMATCH'].includes(error?.code)) {
 				try { await this.interrupt(); } catch {}
 			}
 			throw error;
@@ -891,6 +929,7 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 	};
 	const onServerRequest = (request) => {
 		if (request?.method !== 'item/tool/call' || request.params?.threadId !== threadId) return;
+		if (expectedTurnId !== null && request.params?.turnId !== expectedTurnId) return;
 		onProviderActivity();
 		if (expectedTurnId === null) {
 			if (bufferedRequests.length >= MAX_BUFFERED_TURN_NOTIFICATIONS) {

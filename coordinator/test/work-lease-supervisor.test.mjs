@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { LEASE_TIMEOUTS_MS, WorkLeaseSupervisor } from '../src/work-lease-supervisor.mjs';
+import { LEASE_TIMEOUTS_MS, MAX_LEASE_TIMEOUT_MS, WorkLeaseSupervisor } from '../src/work-lease-supervisor.mjs';
 
 const key = Object.freeze({
 	agentId: 'luna',
@@ -113,6 +113,52 @@ test('bounded progress renews only the matching live lease', async () => {
 	await clock.runDue();
 	assert.equal(expirations.length, 1);
 	assert.equal(expirations[0].lease.operationId, provider.operationId);
+});
+
+test('native outer lease allows queueing past 45 seconds and preserves its bounded override on progress', async () => {
+	const { clock, expirations, supervisor } = fixture();
+	supervisor.activate(key);
+	const provider = supervisor.acquire(key, 'provider', { timeoutMs: 900_000 });
+	clock.advance(125_001);
+	await clock.runDue();
+	assert.equal(expirations.length, 0, 'queued native work is not subject to the default 45-second lease');
+	assert.equal(supervisor.progress(provider), true);
+	const lease = supervisor.snapshot(key).leases[0];
+	assert.equal(lease.timeoutMs, 900_000);
+	assert.equal(lease.deadline, 1_025_001);
+	clock.advance(899_999);
+	await clock.runDue();
+	assert.equal(expirations.length, 0);
+	clock.advance(1);
+	await clock.runDue();
+	assert.equal(expirations.length, 1);
+	assert.equal(expirations[0].lease.operationId, provider.operationId);
+});
+
+test('invalid timeout overrides cannot create unbounded work or remove the existing recovery lease', () => {
+	const { supervisor } = fixture();
+	supervisor.activate(key);
+	for (const timeoutMs of [null, 0, -1, 1.5, NaN, Infinity, MAX_LEASE_TIMEOUT_MS + 1, Number.MAX_SAFE_INTEGER, '900000']) {
+		assert.throws(() => supervisor.acquire(key, 'provider', { timeoutMs }), /timeoutMs/);
+		assert.deepEqual(supervisor.snapshot(key).leases.map((lease) => lease.kind), ['scheduled']);
+	}
+});
+
+test('a queued callback from the prior deadline cannot expire a renewed lease', () => {
+	let now = 0;
+	const callbacks = [];
+	const expirations = [];
+	const supervisor = new WorkLeaseSupervisor({ clock: () => now, schedule: (callback) => { callbacks.push(callback); return callback; }, cancelSchedule() {}, onExpire: (event) => expirations.push(event) });
+	supervisor.activate(key);
+	const provider = supervisor.acquire(key, 'provider', { timeoutMs: 900_000 });
+	const oldCallback = callbacks.at(-1);
+	now = 890_000;
+	supervisor.progress(provider);
+	now = 900_000;
+	oldCallback();
+	assert.deepEqual(expirations, []);
+	assert.equal(supervisor.snapshot(key).leases[0].deadline, 1_790_000);
+	supervisor.close();
 });
 
 test('releasing the final live lease always arms another scheduled-work deadline', () => {

@@ -10,6 +10,59 @@ function deferred() {
 	return { promise, resolve, reject };
 }
 
+test('renewed phase leases fence old timers while retaining a finite overall budget', async () => {
+	let now = 0;
+	const timers = [];
+	const scheduler = new PlanningScheduler({
+		maxConcurrent: 1, maxPending: 0, now: () => now,
+		scheduleTimeout(callback, delay) { const timer = { callback, delay }; timers.push(timer); return timer; },
+		cancelTimeout() {},
+	});
+	const gate = deferred();
+	let task;
+	const run = scheduler.schedule('renewable', (context) => { task = context; return gate.promise; }, { leaseTimeoutMs: 25, maxLeaseDurationMs: 100 });
+	await Promise.resolve();
+	now = 20;
+	assert.equal(task.renewLease({ phase: 'provider' }), true);
+	assert.equal(timers.at(-1).delay, 25);
+	timers[0].callback();
+	assert.equal(task.signal.aborted, false, 'a queued callback from the old lease has no authority');
+	now = 40;
+	assert.equal(task.renewLease({ phase: 'tool', timeoutMs: 80 }), true);
+	assert.equal(timers.at(-1).delay, 60, 'a long tool is bounded by the remaining overall budget');
+	timers[1].callback();
+	assert.equal(task.signal.aborted, false);
+	now = 90;
+	task.renewLease({ phase: 'provider' });
+	assert.equal(timers.at(-1).delay, 10, 'continued activity cannot move the absolute deadline');
+	const rejected = assert.rejects(run, (error) => error.code === 'PLANNING_LEASE_EXPIRED' && error.budgetExhausted === true);
+	now = 100;
+	timers.at(-1).callback();
+	await rejected;
+	assert.equal(task.renewLease({ phase: 'provider' }), false);
+	gate.resolve();
+	await new Promise((resolve) => setImmediate(resolve));
+	scheduler.close();
+});
+
+test('a cancelled lease cannot renew or affect a later turn for the same agent', async () => {
+	const scheduler = new PlanningScheduler({ maxConcurrent: 1, maxPending: 0 });
+	const gate = deferred();
+	let first;
+	const run = scheduler.schedule('reused', (context) => { first = context; return gate.promise; }, { leaseTimeoutMs: 100, maxLeaseDurationMs: 200 });
+	await Promise.resolve();
+	const rejected = assert.rejects(run, (error) => error.code === 'PLAN_CANCELLED');
+	scheduler.cancel('reused');
+	gate.resolve();
+	await rejected;
+	await scheduler.schedule('reused', ({ renewLease, signal }) => {
+		assert.equal(first.renewLease(), false);
+		assert.equal(renewLease(), false, 'a fixed lease does not opt into renewal');
+		assert.equal(signal.aborted, false);
+	}, { leaseTimeoutMs: 100 });
+	scheduler.close();
+});
+
 test('default scheduler admits four turns and retains twelve pending turns', async () => {
 	const scheduler = new PlanningScheduler();
 	const gates = Array.from({ length: 16 }, () => deferred());

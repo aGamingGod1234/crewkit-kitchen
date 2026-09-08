@@ -22,6 +22,7 @@ import dev.agaminggod.arenaagents.server.runtime.transaction.ServerTransactionAd
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputState;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputStates;
+import dev.agaminggod.arenaagents.server.runtime.input.ControlSequence;
 import dev.agaminggod.arenaagents.server.runtime.input.InputLease;
 import dev.agaminggod.arenaagents.server.runtime.input.InputOwner;
 import dev.agaminggod.arenaagents.server.runtime.input.LeasedServerInputController;
@@ -53,15 +54,17 @@ import net.minecraft.world.InteractionResult;
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.context.BlockPlaceContext;
-import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
+import net.minecraft.world.phys.EntityHitResult;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.VoxelShape;
 
 public final class ServerActionExecutor {
 	private static final Set<ActionType> ARENA_SCRIPT_PRIMITIVES = Set.of(
-			ActionType.MOVE_TO, ActionType.NAVIGATE_TO, ActionType.CONTROL, ActionType.LOOK_AT, ActionType.ATTACK,
+			ActionType.MOVE_TO, ActionType.NAVIGATE_TO, ActionType.CONTROL, ActionType.CONTROL_SEQUENCE, ActionType.LOOK_AT, ActionType.ATTACK,
 			ActionType.SELECT_ITEM, ActionType.USE_ITEM, ActionType.BREAK_BLOCK, ActionType.PLACE_BLOCK,
 			ActionType.CHAT, ActionType.WAIT, ActionType.SET_DOOR, ActionType.PICK_UP_ITEM, ActionType.DROP_ITEM,
 			ActionType.TRANSFER_CONTAINER, ActionType.CRAFT_INVENTORY, ActionType.CRAFT_TABLE,
@@ -69,9 +72,9 @@ public final class ServerActionExecutor {
 			ActionType.BLOCK_WITH_SHIELD, ActionType.USE_RANGED, ActionType.RESPAWN
 			, ActionType.INTERACT_BLOCK, ActionType.INTERACT_ENTITY, ActionType.DISMOUNT,
 			ActionType.START_FALL_FLYING, ActionType.MENU_TRANSFER, ActionType.MENU_BUTTON,
-			ActionType.ANVIL_RENAME
+			ActionType.ANVIL_RENAME, ActionType.MENU_CLICK, ActionType.MENU_CLOSE,
+			ActionType.WAKE_UP, ActionType.SET_FLIGHT, ActionType.WRITE_SIGN, ActionType.EDIT_BOOK, ActionType.BEACON_EFFECTS
 	);
-	private static final double MAX_INTERACTION_DISTANCE_SQUARED = 36.0D;
 	private static final Direction[] HORIZONTAL_PLACEMENT_DIRECTIONS = {
 			Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST
 	};
@@ -531,10 +534,6 @@ public final class ServerActionExecutor {
 	}
 
 	private ActiveAction createAction(ServerActionRequest request, ServerPlayer player) {
-		if (player.gameMode.getGameModeForPlayer() == GameType.ADVENTURE
-				&& (request.type() == ActionType.BREAK_BLOCK || request.type() == ActionType.PLACE_BLOCK)) {
-			throw new AgentDomainException("GAME_MODE_RESTRICTED", "Adventure agents cannot break or place blocks");
-		}
 		JsonObject arguments = request.arguments();
 		return switch (request.type()) {
 			case CONTROL -> ActiveAction.control(
@@ -555,6 +554,7 @@ public final class ServerActionExecutor {
 					),
 					integer(arguments, "ticks")
 			);
+			case CONTROL_SEQUENCE -> ActiveAction.controlSequence(request, player, ControlSequence.parse(arguments));
 			case MOVE_TO, NAVIGATE_TO -> ActiveAction.controller(
 					request,
 					player,
@@ -576,22 +576,37 @@ public final class ServerActionExecutor {
 					() -> attack(player, string(arguments, "targetId")));
 			case SELECT_ITEM -> ActiveAction.immediate(request, player,
 					() -> selectItem(player, string(arguments, "itemId")));
-			case USE_ITEM -> ActiveAction.use(request, player, integer(arguments, "durationMs"));
+			case USE_ITEM -> ActiveAction.use(request, player, integer(arguments, "durationMs"),
+					nullableString(arguments, "hand") != null ? hand(arguments) : InteractionHand.MAIN_HAND,
+					nullableString(arguments, "expectedItemId"));
 			case INTERACT_BLOCK -> ActiveAction.immediate(request, player, () -> interactBlock(
 					player,
 					blockPosition(arguments),
 					Direction.byName(string(arguments, "face")),
 					hand(arguments),
-					string(arguments, "expectedItemId")
+					string(arguments, "expectedItemId"), arguments
 			));
 			case INTERACT_ENTITY -> ActiveAction.immediate(request, player, () -> interactEntity(
 					player,
 					string(arguments, "targetId"),
 					hand(arguments),
-					string(arguments, "expectedItemId")
+					string(arguments, "expectedItemId"), arguments
 			));
 			case DISMOUNT -> ActiveAction.immediate(request, player, () -> dismount(player));
 			case START_FALL_FLYING -> ActiveAction.immediate(request, player, () -> startFallFlying(player));
+			case WAKE_UP -> ActiveAction.immediate(request, player, () -> {
+				if (!player.isSleeping()) throw new AgentDomainException("NOT_SLEEPING", "Player is not sleeping");
+				player.stopSleepInBed(false, true);
+				if (player.isSleeping()) throw new AgentDomainException("WAKE_NOT_CONFIRMED", "Vanilla wake-up was not observed");
+			});
+			case SET_FLIGHT -> ActiveAction.immediate(request, player, () -> {
+				boolean enabled = bool(arguments, "enabled");
+				if (enabled && !player.getAbilities().mayfly) throw new AgentDomainException("FLIGHT_NOT_ALLOWED", "Current player abilities do not permit flight");
+				player.getAbilities().flying = enabled;
+				player.onUpdateAbilities();
+			});
+			case WRITE_SIGN -> ActiveAction.transaction(request, player, PlayerTextInteraction.writeSign(player, arguments, protection));
+			case EDIT_BOOK -> ActiveAction.transaction(request, player, PlayerTextInteraction.editBook(player, arguments));
 			case BREAK_BLOCK -> {
 				BlockPos position = blockPosition(arguments);
 				String expectedBlockId = requiredExpectedBlockId(arguments);
@@ -665,7 +680,7 @@ public final class ServerActionExecutor {
 			));
 			case TRANSFER_CONTAINER, CRAFT_INVENTORY, CRAFT_TABLE, FURNACE_TRANSACTION,
 					EQUIP_ITEM, SELECT_TOOL, BLOCK_WITH_SHIELD, USE_RANGED,
-					MENU_TRANSFER, MENU_BUTTON, ANVIL_RENAME -> ActiveAction.transaction(
+					MENU_TRANSFER, MENU_BUTTON, ANVIL_RENAME, MENU_CLICK, MENU_CLOSE, BEACON_EFFECTS -> ActiveAction.transaction(
 					request,
 					player,
 					advancedInteractions.begin(player, request, arguments)
@@ -958,16 +973,24 @@ public final class ServerActionExecutor {
 			long coordinatorGeneration
 	) { }
 
-	private static void attack(ServerPlayer player, String targetId) {
+	private void attack(ServerPlayer player, String targetId) {
 		Entity target = resolveExactObservedTarget(player, targetId);
 		if (target instanceof ServerPlayer targetPlayer
 				&& (targetPlayer.isCreative() || targetPlayer.isSpectator())) {
 			throw new AgentDomainException("TARGET_INVULNERABLE", "Creative and spectator players cannot be valid combat targets");
 		}
-		if (player.distanceToSqr(target) > MAX_INTERACTION_DISTANCE_SQUARED) {
+		if (!protection.mayInteractWithEntity(player, target)) {
+			throw new AgentDomainException("PROTECTION_DENIED", "Attack was denied");
+		}
+		if (!player.isWithinAttackRange(player.getMainHandItem(), target.getBoundingBox(), 0.0D)) {
 			throw new AgentDomainException("TARGET_TOO_FAR", "Attack target is out of reach");
 		}
 		player.lookAt(net.minecraft.commands.arguments.EntityAnchorArgument.Anchor.EYES, target.getEyePosition());
+		HitResult hit = Tracer.rayTrace(player, 1.0F,
+				Math.max(player.entityInteractionRange(), player.getEyePosition().distanceTo(target.getEyePosition()) + 0.1D), false);
+		if (!(hit instanceof EntityHitResult entityHit) || entityHit.getEntity() != target) {
+			throw new AgentDomainException("TARGET_OBSTRUCTED", "Attack target is not under the requested aim ray");
+		}
 		player.attack(target);
 		player.swing(net.minecraft.world.InteractionHand.MAIN_HAND);
 	}
@@ -999,20 +1022,20 @@ public final class ServerActionExecutor {
 		for (int slot = 0; slot < player.getInventory().getContainerSize(); slot++) {
 			ItemStack stack = player.getInventory().getItem(slot);
 			if (!stack.isEmpty() && BuiltInRegistries.ITEM.getKey(stack.getItem()).equals(identifier)) {
+				if (found >= 0) throw new AgentDomainException("AMBIGUOUS_ITEM", "Several slots match this item; choose an exact slot with control, select_tool, or menu_click");
 				found = slot;
-				break;
 			}
 		}
 		if (found < 0 && player.isCreative()) {
-			player.getInventory().setItem(0, new ItemStack(BuiltInRegistries.ITEM.getValue(identifier)));
-			found = 0;
+			found = player.getInventory().getSelectedSlot();
+			if (!player.getInventory().getItem(found).isEmpty()) {
+				throw new AgentDomainException("HOTBAR_SLOT_OCCUPIED", "Select an empty hotbar slot before taking a creative item");
+			}
+			player.getInventory().setItem(found, new ItemStack(BuiltInRegistries.ITEM.getValue(identifier)));
 		}
 		if (found < 0) throw new AgentDomainException("ITEM_NOT_FOUND", "Agent does not have " + itemId);
 		if (found > 8) {
-			ItemStack hotbar = player.getInventory().getItem(0);
-			player.getInventory().setItem(0, player.getInventory().getItem(found));
-			player.getInventory().setItem(found, hotbar);
-			found = 0;
+			throw new AgentDomainException("ITEM_NOT_IN_HOTBAR", "Move the exact inventory slot into a chosen hotbar slot using select_tool or menu_click");
 		}
 		OfflineAgentPlayers.actions(player).setSlot(found + 1);
 	}
@@ -1029,7 +1052,7 @@ public final class ServerActionExecutor {
 		if (!player.level().getBlockState(position).canBeReplaced()) {
 			throw new AgentDomainException("TARGET_OCCUPIED", "Placement target contains " + currentBlockId);
 		}
-		selectItem(player, itemId);
+		if (!BuiltInRegistries.ITEM.getKey(player.getMainHandItem().getItem()).toString().equals(itemId)) selectItem(player, itemId);
 		if (!(player.getMainHandItem().getItem() instanceof BlockItem)) {
 			throw new AgentDomainException("ITEM_NOT_PLACEABLE", itemId + " is not a block item");
 		}
@@ -1107,7 +1130,7 @@ public final class ServerActionExecutor {
 				|| !level.mayInteract(player, support)) {
 			throw new AgentDomainException("PROTECTION_DENIED", "Vanilla placement protection denied the target or support block");
 		}
-		if (!player.isWithinBlockInteractionRange(support, 1.0D)
+		if (!player.isWithinBlockInteractionRange(support, 0.0D)
 				|| !isValidPlacementHit(support, hit.getLocation())) {
 			throw new AgentDomainException("TARGET_TOO_FAR", "Placement hit is out of reach");
 		}
@@ -1253,7 +1276,7 @@ public final class ServerActionExecutor {
 					"Expected " + expectedBlockId + " at " + position + " but found " + currentBlockId
 			);
 		}
-		if (!player.isWithinBlockInteractionRange(position, 1.0D)) {
+		if (!player.isWithinBlockInteractionRange(position, 0.0D)) {
 			throw new AgentDomainException("TARGET_TOO_FAR", "Block is out of reach");
 		}
 		if (player.blockActionRestricted(player.level(), position, player.gameMode.getGameModeForPlayer())) {
@@ -1267,7 +1290,7 @@ public final class ServerActionExecutor {
 	}
 
 	private static HitResult breakRayTarget(ServerPlayer player) {
-		double reach = player.gameMode.isCreative() ? 5.0D : 4.5D;
+		double reach = player.blockInteractionRange();
 		return Tracer.rayTrace(player, 1.0F, reach, false);
 	}
 
@@ -1412,7 +1435,8 @@ public final class ServerActionExecutor {
 			BlockPos position,
 			Direction face,
 			InteractionHand hand,
-			String expectedItemId
+			String expectedItemId,
+			JsonObject arguments
 	) {
 		ServerLevel level = player.level();
 		if (face == null) throw new AgentDomainException("INVALID_FACE", "Interaction face is invalid");
@@ -1428,14 +1452,18 @@ public final class ServerActionExecutor {
 		}
 		ItemStack held = player.getItemInHand(hand);
 		requireHeldItem(held, expectedItemId);
-		Vec3 hitLocation = Vec3.atCenterOf(position).add(
-				face.getStepX() * 0.5D,
-				face.getStepY() * 0.5D,
-				face.getStepZ() * 0.5D
-		);
+		Vec3 hitLocation = blockInteractionHitLocation(position, face, arguments,
+				level.getBlockState(position).getShape(level, position, CollisionContext.of(player)));
+		Vec3 eye = player.getEyePosition();
+		BlockHitResult hit = level.clip(new net.minecraft.world.level.ClipContext(eye,
+				hitLocation.add(hitLocation.subtract(eye).normalize().scale(0.001D)),
+				net.minecraft.world.level.ClipContext.Block.OUTLINE, net.minecraft.world.level.ClipContext.Fluid.NONE, player));
+		if (hit.getType() != HitResult.Type.BLOCK || !hit.getBlockPos().equals(position) || hit.getDirection() != face) {
+			throw new AgentDomainException("TARGET_OBSTRUCTED", "Requested block face is not reachable along the supplied hit ray");
+		}
 		player.lookAt(net.minecraft.commands.arguments.EntityAnchorArgument.Anchor.EYES, hitLocation);
 		InteractionResult result = player.gameMode.useItemOn(
-				player, level, held, hand, new BlockHitResult(hitLocation, face, position, false)
+				player, level, held, hand, hit
 		);
 		if (!result.consumesAction()) {
 			throw new AgentDomainException("INTERACTION_REJECTED", "Vanilla block interaction was not accepted");
@@ -1443,11 +1471,24 @@ public final class ServerActionExecutor {
 		player.swing(hand);
 	}
 
+	static Vec3 blockInteractionHitLocation(BlockPos position, Direction face, JsonObject arguments, VoxelShape outline) {
+		if (arguments.has("hitX") && !arguments.get("hitX").isJsonNull()) {
+			return Vec3.atLowerCornerOf(position).add(number(arguments, "hitX"), number(arguments, "hitY"), number(arguments, "hitZ"));
+		}
+		if (outline.isEmpty()) throw new AgentDomainException("TARGET_OBSTRUCTED", "The requested block has no interaction outline");
+		var bounds = outline.bounds();
+		return Vec3.atLowerCornerOf(position).add(bounds.getCenter()).add(
+				face.getStepX() * bounds.getXsize() * 0.5D,
+				face.getStepY() * bounds.getYsize() * 0.5D,
+				face.getStepZ() * bounds.getZsize() * 0.5D);
+	}
+
 	private void interactEntity(
 			ServerPlayer player,
 			String targetId,
 			InteractionHand hand,
-			String expectedItemId
+			String expectedItemId,
+			JsonObject arguments
 	) {
 		Entity target = resolveExactObservedTarget(player, targetId);
 		if (!player.isWithinEntityInteractionRange(target, 0.0D)) {
@@ -1457,9 +1498,20 @@ public final class ServerActionExecutor {
 			throw new AgentDomainException("PROTECTION_DENIED", "Entity interaction was denied");
 		}
 		requireHeldItem(player.getItemInHand(hand), expectedItemId);
-		player.lookAt(net.minecraft.commands.arguments.EntityAnchorArgument.Anchor.EYES, target.getEyePosition());
-		Vec3 relativeHit = target.getBoundingBox().getCenter().subtract(target.position());
-		InteractionResult result = player.interactOn(target, hand, relativeHit);
+		Vec3 requestedHit = arguments.has("hitX") && !arguments.get("hitX").isJsonNull() ? target.position().add(
+				number(arguments, "hitX"), number(arguments, "hitY"), number(arguments, "hitZ")
+		) : target.getBoundingBox().getCenter();
+		if (!target.getBoundingBox().inflate(0.001D).contains(requestedHit)) {
+			throw new AgentDomainException("INVALID_HIT", "Entity hit must be inside the observed entity bounds");
+		}
+		player.lookAt(net.minecraft.commands.arguments.EntityAnchorArgument.Anchor.EYES, requestedHit);
+		HitResult traced = Tracer.rayTrace(player, 1.0F, player.entityInteractionRange(), false);
+		if (!(traced instanceof EntityHitResult entityHit) || entityHit.getEntity() != target) {
+			throw new AgentDomainException("TARGET_OBSTRUCTED", "Entity is not reachable along the supplied hit ray");
+		}
+		Vec3 relativeHit = traced.getLocation().subtract(target.position());
+		InteractionResult result = target.interact(player, hand, relativeHit);
+		if (!result.consumesAction()) result = player.interactOn(target, hand, relativeHit);
 		if (!result.consumesAction()) {
 			throw new AgentDomainException("INTERACTION_REJECTED", "Vanilla entity interaction was not accepted");
 		}
@@ -1522,7 +1574,7 @@ public final class ServerActionExecutor {
 	}
 
 	private static final class ActiveAction {
-		private enum Mode { IMMEDIATE, CONTROL, MOVE, USE, BREAK, PLACE, WAIT, CONTROLLER, TRANSACTION }
+		private enum Mode { IMMEDIATE, CONTROL, CONTROL_SEQUENCE, MOVE, USE, BREAK, PLACE, WAIT, CONTROLLER, TRANSACTION }
 
 		private final ServerActionRequest request;
 		private final ServerPlayer player;
@@ -1560,6 +1612,12 @@ public final class ServerActionExecutor {
 		private AgentInputState controlState;
 		private int controlDurationTicks;
 		private int controlElapsedTicks;
+		private ControlSequence controlSequence;
+		private InteractionHand useHand;
+		private int useDurationTicks;
+		private int useElapsedTicks;
+		private long useAcceptedBaseline;
+		private boolean useStartObserved;
 
 		private ActiveAction(
 				ServerActionRequest request,
@@ -1622,8 +1680,20 @@ public final class ServerActionExecutor {
 			return new ActiveAction(request, player, Mode.MOVE, timeoutMs, null, destination, tolerance, sprint, null);
 		}
 
-		static ActiveAction use(ServerActionRequest request, ServerPlayer player, long durationMs) {
-			return new ActiveAction(request, player, Mode.USE, durationMs, null, null, 0.0D, false, null);
+		static ActiveAction controlSequence(ServerActionRequest request, ServerPlayer player, ControlSequence sequence) {
+			ActiveAction action = new ActiveAction(request, player, Mode.CONTROL_SEQUENCE,
+					DEFAULT_TIMEOUT_MS, null, null, 0.0D, false, null);
+			action.controlSequence = Objects.requireNonNull(sequence, "sequence must not be null");
+			return action;
+		}
+
+		static ActiveAction use(ServerActionRequest request, ServerPlayer player, long durationMs,
+				InteractionHand hand, String expectedItemId) {
+			if (expectedItemId != null) requireHeldItem(player.getItemInHand(hand), expectedItemId);
+			ActiveAction action = new ActiveAction(request, player, Mode.USE, durationMs, null, null, 0.0D, false, null);
+			action.useHand = hand;
+			action.useDurationTicks = Math.toIntExact(Math.max(1L, (durationMs + 49L) / 50L));
+			return action;
 		}
 
 		static ActiveAction breakBlock(
@@ -1722,8 +1792,9 @@ public final class ServerActionExecutor {
 
 		ServerActionResult tick(long now) {
 			if (startingDimension != null && !startingDimension.equals(player.level().dimension())) {
-				return result(ServerActionState.FAILED, "ACTION_DIMENSION_CHANGED",
-						"Agent player changed dimension during action execution", now);
+				return result(ServerActionState.CANCELLED, "DIMENSION_TRANSITION",
+						"Player changed dimension from " + startingDimension.identifier() + " to " + player.level().dimension().identifier()
+								+ "; this action stopped and its original outcome is unconfirmed", now);
 			}
 			if (!player.isAlive()) return result(ServerActionState.FAILED, "AGENT_DEAD", "Agent player died", now);
 			long elapsed = elapsedTime.advance(now);
@@ -1739,13 +1810,16 @@ public final class ServerActionExecutor {
 						applyControlInput();
 						return null;
 					}
+					case CONTROL_SEQUENCE -> { }
 					case MOVE -> {
 						physicalAttempted = true;
 						applyLookingInput(InputOwner.NAVIGATION, 100, destination, 1.0F, true, false, false);
 					}
 					case USE -> {
 						physicalAttempted = true;
-						applyCurrentLookInput(InputOwner.INTERACTION, 300, false, true);
+						useAcceptedBaseline = AgentInputRuntime.controller(player).acceptedUses(request.agentId());
+						applyUseInput();
+						return null;
 					}
 					case BREAK -> {
 						validateBreakTarget(player, block, expectedBlockId);
@@ -1762,9 +1836,30 @@ public final class ServerActionExecutor {
 					case TRANSACTION -> {
 					}
 				}
-				if (mode == Mode.IMMEDIATE) return result(ServerActionState.SUCCEEDED, "ACTION_COMPLETED", "Action completed", now);
+				if (mode == Mode.IMMEDIATE) {
+					if (request.type() == ActionType.ATTACK) return result(ServerActionState.SUCCEEDED,
+							"ATTACK_APPLIED", "Vanilla attack applied to the requested target; damage or death is not confirmed", now);
+					return result(ServerActionState.SUCCEEDED, "ACTION_COMPLETED", "Action completed", now);
+				}
 			}
 
+			if (mode == Mode.CONTROL_SEQUENCE) return tickControlSequence(now);
+			if (mode == Mode.USE) {
+				useElapsedTicks++;
+				useStartObserved |= player.isUsingItem() && player.getUsedItemHand() == useHand;
+				if (useElapsedTicks >= useDurationTicks) {
+					long accepted = Math.max(0L, AgentInputRuntime.controller(player).acceptedUses(request.agentId()) - useAcceptedBaseline);
+					releaseInput();
+					return accepted > 0
+							? result(ServerActionState.SUCCEEDED, "USE_INPUT_CONFIRMED",
+									"Held use for " + useElapsedTicks + " server ticks; accepted interactions=" + accepted
+											+ ", using state observed=" + useStartObserved + ", input released=true; downstream effects are unconfirmed", now)
+							: result(ServerActionState.FAILED, "USE_NOT_ACCEPTED", "Held use input was released without an accepted vanilla interaction", now);
+				}
+				applyUseInput();
+				lastProgress = (double) useElapsedTicks / useDurationTicks;
+				return null;
+			}
 			if (mode == Mode.CONTROL) {
 				physicalAttempted = true;
 				applyControlInput();
@@ -1864,7 +1959,7 @@ public final class ServerActionExecutor {
 					immediate.run();
 					placementAttempts += 1;
 				}
-			} else if ((mode == Mode.USE || mode == Mode.WAIT) && elapsed >= timeoutMs) {
+			} else if (mode == Mode.WAIT && elapsed >= timeoutMs) {
 				return result(ServerActionState.SUCCEEDED, "ACTION_COMPLETED", "Action completed", now);
 			}
 			if (mode == Mode.CONTROLLER) {
@@ -2096,17 +2191,37 @@ public final class ServerActionExecutor {
 			));
 		}
 
-		private void applyCurrentLookInput(InputOwner owner, int priority, boolean attack, boolean use) {
+		private void applyUseInput() {
 			LeasedServerInputController input = AgentInputRuntime.controller(player);
-			if (inputLease == null) inputLease = input.acquire(request.agentId(), owner, priority);
-			input.apply(inputLease, new AgentInputState(
-					0.0F, 0.0F, false, player.isShiftKeyDown(), player.isSprinting(), attack, use,
-					player.getYRot(), player.getXRot(), player.getInventory().getSelectedSlot(), InteractionHand.MAIN_HAND
-			));
+			if (inputLease == null) inputLease = input.acquire(request.agentId(), InputOwner.INTERACTION, 300);
+			input.apply(inputLease, new AgentInputState(0.0F, 0.0F, false, player.isShiftKeyDown(),
+					player.isSprinting(), false, true, player.getYRot(), player.getXRot(),
+					player.getInventory().getSelectedSlot(), useHand));
+		}
+
+		private ServerActionResult tickControlSequence(long now) {
+			ControlSequence.Step step = controlSequence.next(new ControlSequence.Facts(player.getHealth(),
+					player.getFoodData().getFoodLevel(), player.getAirSupply(), player.isOnFire(), player.isInWater(),
+					player.onGround(), player.horizontalCollision, player.hurtTime > 0, player.isUsingItem()));
+			lastProgress = (double) step.elapsedTicks() / step.maxTicks();
+			if (step.status() == ControlSequence.Status.RUNNING) {
+				physicalAttempted = true;
+				controlState = step.input();
+				applyControlInput();
+				return null;
+			}
+			String detail = "Model-authored control sequence stopped at frame " + step.frameIndex()
+					+ " after " + step.elapsedTicks() + " server ticks; no task outcome is implied";
+			return switch (step.status()) {
+				case COMPLETED -> result(ServerActionState.SUCCEEDED, "CONTROL_SEQUENCE_COMPLETED", detail, now);
+				case BRANCH_STOPPED -> result(ServerActionState.SUCCEEDED, "CONTROL_SEQUENCE_STOPPED", detail, now);
+				case BUDGET_EXHAUSTED -> result(ServerActionState.TIMED_OUT, "CONTROL_SEQUENCE_BUDGET_EXHAUSTED", detail, now);
+				case RUNNING -> throw new IllegalStateException("Running input has no terminal result");
+			};
 		}
 
 		boolean isControl() {
-			return mode == Mode.CONTROL;
+			return mode == Mode.CONTROL || mode == Mode.CONTROL_SEQUENCE;
 		}
 
 		void neutralizeDisconnectedControl() {

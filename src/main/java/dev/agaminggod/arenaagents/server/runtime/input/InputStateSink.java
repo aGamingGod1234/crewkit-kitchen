@@ -8,5 +8,7 @@ public interface InputStateSink {
 	default void tick(AgentId agentId, AgentInputState state) {
 	}
 
+	default long acceptedUses(AgentId agentId) { return 0L; }
+
 	void clear(AgentId agentId, AgentInputState previous);
 }
