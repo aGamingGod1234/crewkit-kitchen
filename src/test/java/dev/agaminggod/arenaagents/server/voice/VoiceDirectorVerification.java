@@ -17,7 +17,7 @@ public final class VoiceDirectorVerification {
 		assertThrows(() -> new VoiceProfile("voice", "neutral", 2.1D, 48), "profile speed is bounded");
 		assertThrows(() -> new VoiceCue(0, "line", "", "", 0.2D, 0), "cue speed is bounded");
 		assertThrows(() -> new VoiceCue(0, "line", "", "", -1D, 129), "cue radius is bounded");
-		return 7;
+		return 7 + DirectorSpeechVerification.verify();
 	}
 
 	private static void assertThrows(Runnable action, String label) {

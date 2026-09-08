@@ -26,7 +26,7 @@ public final class SkitModeVerification {
 				"action steps preserve order");
 		assertThrows(() -> SkitAction.move(0), "move requires a duration");
 		assertThrows(() -> SkitAction.equip("diamond_sword"), "equip requires a namespaced item id");
-		return 7 + verifyNamesAndPlacement() + verifyTimeline() + verifyPreflight() + verifyCleanup() + verifyGuiCommands() + verifyDirectorParsing() + verifyNameReservations() + verifyCastPersistence() + verifyPendingConversion();
+		return 7 + DirectorEditorVerification.verify() + DirectorTakeVerification.verify() + verifyNamesAndPlacement() + verifyTimeline() + verifyPreflight() + verifyCleanup() + verifyGuiCommands() + verifyDirectorParsing() + verifyNameReservations() + verifyCastPersistence() + verifyPendingConversion();
 	}
 
 	private static int verifyPendingConversion() {
@@ -249,7 +249,10 @@ public final class SkitModeVerification {
 				"cross-dimension movement cannot blend unrelated coordinates");
 		assertThrows(() -> SkitModeRuntime.interpolate(origin, endpoint, Float.NaN), "invalid movement progress is rejected");
 		assertEquals(360, SkitModeRuntime.interpolate(origin, endpoint, .5F).yaw(), "actor rotation takes the shortest turn");
-		return 23;
+		FakePerformer waiting = new FakePerformer(origin);
+		SkitModeRuntime.advancePlayback(SkitModeRuntime.Playback.waiting(List.of(new SkitStep(0, endpoint, List.of(SkitAction.waitTicks(20)), false)), 0), 0, waiting);
+		assertEquals(origin, waiting.position(), "new wait actions hold the current pose instead of snapping to their captured endpoint");
+		return 24;
 	}
 
 	private static int verifyPreflight() {

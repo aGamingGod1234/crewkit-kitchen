@@ -332,6 +332,7 @@ public final class CodexAgentServerRuntime {
 			manager.reconcileDeaths();
 			manager.maintainChunkTickets();
 			VoiceSubsystemRuntime.tick(server);
+			DirectorTakeRuntime.tick(server);
 			VoiceDirector.tick(server);
 			maintainPlanningProgress(manager);
 			if (activeBridge != null) activeBridge.endTick();

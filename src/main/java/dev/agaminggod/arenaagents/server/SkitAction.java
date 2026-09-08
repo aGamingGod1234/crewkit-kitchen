@@ -30,10 +30,10 @@ public record SkitAction(
 		}
 		if (type == Type.EQUIP && itemId.isEmpty()) throw new IllegalArgumentException("EQUIP requires an itemId");
 		if (type != Type.EQUIP && !itemId.isEmpty()) throw new IllegalArgumentException("itemId is only valid for EQUIP");
-		if (type != Type.MOVE && (forward != 0.0F || strafe != 0.0F || sprint)) {
+		if (type != Type.MOVE && type != Type.WALK && (forward != 0.0F || strafe != 0.0F || sprint)) {
 			throw new IllegalArgumentException("movement values are only valid for MOVE");
 		}
-		if (type == Type.MOVE && durationTicks == 0) throw new IllegalArgumentException("MOVE requires a positive duration");
+		if ((type == Type.MOVE || type == Type.WALK) && durationTicks == 0) throw new IllegalArgumentException("Movement requires a positive duration");
 	}
 
 	public static SkitAction move(int durationTicks) {
@@ -42,6 +42,10 @@ public record SkitAction(
 
 	public static SkitAction move(int durationTicks, float forward, float strafe, boolean sprint) {
 		return new SkitAction(Type.MOVE, durationTicks, forward, strafe, sprint, false, "");
+	}
+
+	public static SkitAction walk(int durationTicks, float forward, float strafe, boolean sprint) {
+		return new SkitAction(Type.WALK, durationTicks, forward, strafe, sprint, false, "");
 	}
 
 	public static SkitAction waitTicks(int durationTicks) {
@@ -70,6 +74,7 @@ public record SkitAction(
 
 	public enum Type {
 		MOVE,
+		WALK,
 		WAIT,
 		JUMP,
 		EQUIP,

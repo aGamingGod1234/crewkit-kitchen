@@ -9,6 +9,7 @@ import dev.agaminggod.arenaagents.client.gui.widget.ConsoleButton;
 import dev.agaminggod.arenaagents.client.gui.widget.ConsoleCycleButton;
 import dev.agaminggod.arenaagents.client.gui.widget.ConsoleEditBox;
 import dev.agaminggod.arenaagents.control.DirectorCommandRequestPayload;
+import dev.agaminggod.arenaagents.control.DirectorEditorPayload;
 import dev.agaminggod.arenaagents.control.DirectorCommandResultPayload;
 import java.util.List;
 import java.util.HashMap;
@@ -35,7 +36,7 @@ public final class SkitDirectorScreen extends Screen {
 	private static final int ROW = 26;
 	private static final int GAP = 6;
 	private static final List<String> PROVIDERS = List.of("codex", "claude", "gemini", "kimi", "cursor");
-	private static final List<String> ACTIONS = List.of("move", "wait", "jump", "equip", "use", "swing", "emote");
+	private static final List<String> ACTIONS = List.of("move", "walk", "wait", "jump", "equip", "use", "swing", "emote");
 	private static final List<String> TONES = List.of("neutral", "warm", "excited", "serious", "dramatic", "whisper", "robotic", "angry");
 	private static final List<String> SPEEDS = List.of("0.75", "1.0", "1.25", "1.5");
 	private static final List<String> RADII = List.of("16", "32", "48", "64", "96");
@@ -46,7 +47,17 @@ public final class SkitDirectorScreen extends Screen {
 			"voice.ash.v1", "voice.piper.v1");
 
 	private final Screen parent;
-	private final Map<String, String> drafts = new HashMap<>();
+	private final Map<String, String> drafts = DirectorClientState.drafts();
+	private final Map<String, DirectorEditorPayload.Snapshot> libraries = new HashMap<>();
+	private java.util.UUID pendingEditor;
+	private String pendingEditorOperation;
+	private int selectedRow = -1;
+	private ConsoleEditBox actionDuration;
+	private ConsoleEditBox walkForward;
+	private ConsoleEditBox walkStrafe;
+	private boolean walkSprint;
+	private boolean actionSneak = true;
+	private boolean initialRead;
 	private int scrollRows;
 	private boolean buildingContent;
 	private Tab tab = Tab.SPAWN;
@@ -60,6 +71,10 @@ public final class SkitDirectorScreen extends Screen {
 	private String radius = "48";
 	private String feedback = "";
 	private boolean feedbackError;
+	private ConsoleEditBox takeName;
+	private ConsoleEditBox takeMotion;
+	private ConsoleEditBox takeVoice;
+	private String deleteConfirmation = "";
 	private ConsoleEditBox actorName;
 	private String legacyAgent = "";
 	private ConsoleEditBox scriptName;
@@ -73,11 +88,19 @@ public final class SkitDirectorScreen extends Screen {
 	private ConsoleEditBox cameraPath;
 	private ConsoleEditBox retainedEditor;
 	private java.util.UUID pendingCommand;
+	private long commandDeadline;
+	private long editorDeadline;
 
 	public SkitDirectorScreen(Screen parent) {
 		super(Minecraft.getInstance(), ConsoleFont.create(Minecraft.getInstance()),
 				Component.literal("Skit Director"));
 		this.parent = parent;
+		selectedActor = drafts.getOrDefault("selected-actor", "");
+		selectedAction = drafts.getOrDefault("selected-action", "move");
+		voice = drafts.getOrDefault("selected-voice", VOICES.getFirst());
+		tone = drafts.getOrDefault("selected-tone", "neutral"); speed = drafts.getOrDefault("selected-speed", "1.0"); radius = drafts.getOrDefault("selected-radius", "48");
+		walkSprint = Boolean.parseBoolean(drafts.getOrDefault("walk-sprint", "false")); actionSneak = Boolean.parseBoolean(drafts.getOrDefault("action-sneak", "true"));
+		tab = Tab.valueOf(drafts.getOrDefault("selected-tab", "SPAWN"));
 	}
 
 	@Override
@@ -101,11 +124,14 @@ public final class SkitDirectorScreen extends Screen {
 		}
 	}
 
+	public void acceptLocalFeedback(String message, boolean error) { feedback = message; feedbackError = error; }
+
 	public void acceptCommandResult(DirectorCommandResultPayload result) {
 		if (!result.requestId().equals(pendingCommand)) return;
 		pendingCommand = null;
 		feedback = result.message();
 		feedbackError = !result.success();
+		if (result.success() && pendingEditor == null && (tab == Tab.SPAWN || tab == Tab.ACTIONS || tab == Tab.VOICE)) requestEditor("read", 0);
 	}
 
 	@Override
@@ -122,17 +148,22 @@ public final class SkitDirectorScreen extends Screen {
 			int x = left + index * (tabWidth + GAP);
 			addRenderableWidget(button(value.label, x, top + (compact() ? 12 : 42),
 					index == 3 ? left + width - x : tabWidth, compact() ? 24 : ROW, value == tab,
-					() -> { tab = value; scrollRows = 0; rebuildWidgets(); }));
+					() -> { tab = value; drafts.put("selected-tab", value.name()); scrollRows = 0; selectedRow = -1; rebuildWidgets(); if (tab == Tab.SPAWN || tab == Tab.ACTIONS || tab == Tab.VOICE) requestEditor("read", 0); }));
 		}
 		buildingContent = true;
 		switch (tab) {
-			case SPAWN -> initSpawn();
+			case SPAWN -> { initSpawn(); initTake(); }
 			case ACTIONS -> initActions();
 			case VOICE -> initVoice();
 			case CAMERA -> initCamera();
 		}
 		buildingContent = false;
+		if (!compact()) {
+			addRenderableWidget(button("Play take", left + width - 172, top + 8, 75, ROW, false, () -> send("codex skit take play " + word(drafts.getOrDefault("director-take-name", "")))));
+			addRenderableWidget(button("Stop take", left + width - 91, top + 8, 75, ROW, false, () -> send("codex skit take stop")));
+		}
 		addRenderableWidget(button("Back to console", left, panelTop() + panelHeight() - (compact() ? ROW : 30), 140, ROW, false, this::onClose));
+		if (!initialRead && minecraft != null && minecraft.getConnection() != null) { initialRead = true; runAction(() -> requestEditor("read", 0)); }
 	}
 
 	private void clearFields() {
@@ -196,8 +227,8 @@ public final class SkitDirectorScreen extends Screen {
 		addRenderableWidget(new ConsoleCycleButton<>(font, x, y, width, ROW, Component.literal("Cast"),
 				actors.stream().map(actor -> actor.id()).toList(), selectedActor, id -> {
 					var actor = actors.stream().filter(value -> value.id().equals(id)).findFirst().orElseThrow();
-					return Component.literal(actor.name() + (actor.dead() ? " / Dead" : actor.present() ? " / Alive" : " / Offline"));
-				}, value -> selectedActor = value)).visible = contentVisible(y, ROW);
+					return Component.literal(actor.name() + (actor.dead() ? " / Dead" : actor.present() ? " / Alive" : " / Offline") + (tab == Tab.VOICE && !actor.speechStatus().isEmpty() ? " / " + actor.speechStatus() : ""));
+				}, value -> { selectedActor = value; drafts.put("selected-actor", value); })).visible = contentVisible(y, ROW);
 	}
 	private String actorTarget() { return word(selectedActor); }
 
@@ -208,14 +239,30 @@ public final class SkitDirectorScreen extends Screen {
 		scriptName = addEdit("Script name", "intro", c[1], y, c[2], 64, "director-script-name");
 		y += ROW + GAP;
 		addRenderableWidget(new ConsoleCycleButton<>(font, c[0], y, c[2], ROW, Component.literal("Action"), ACTIONS,
-				selectedAction, Component::literal, value -> selectedAction = value)).visible = contentVisible(y, ROW);
-		actionArgs = addEdit("Action args", "move: 40 1 0 true", c[1], y, c[2], 96, "director-action-args");
+				selectedAction, value -> Component.literal(value.equals("move") ? "Glide to my position" : value), value -> { selectedAction = value; drafts.put("selected-action", value); drafts.remove("director-action-args"); rebuildWidgets(); })).visible = contentVisible(y, ROW);
+		actionDuration = addEdit("Duration (seconds)", "2", c[1], y, c[2], 8, "director-action-duration");
+		y += ROW + GAP;
+		actionDuration.active = !List.of("jump", "swing", "equip").contains(selectedAction);
+		if (selectedAction.equals("walk")) {
+			int third = (c[2] * 2 - GAP) / 3;
+			walkForward = addEdit("Forward (-1 to 1)", "1", c[0], y, third, 8, "director-walk-forward");
+			walkStrafe = addEdit("Strafe (-1 to 1)", "0", c[0] + third + GAP, y, third, 8, "director-walk-strafe");
+			addRenderableWidget(new ConsoleCycleButton<>(font, c[0] + 2 * (third + GAP), y, third, ROW, Component.literal("Sprint"), List.of(false,true), walkSprint,
+					value -> Component.literal(value ? "On" : "Off"), value -> { walkSprint = value; drafts.put("walk-sprint", value.toString()); })).visible = contentVisible(y, ROW);
+		} else if (selectedAction.equals("emote")) {
+			addRenderableWidget(new ConsoleCycleButton<>(font, c[0], y, c[2] * 2 + GAP, ROW, Component.literal("Crouch"), List.of(false,true), actionSneak,
+					value -> Component.literal(value ? "On" : "Off"), value -> { actionSneak = value; drafts.put("action-sneak", value.toString()); })).visible = contentVisible(y, ROW);
+		} else {
+			actionArgs = addEdit(selectedAction.equals("equip") ? "Item ID" : "No extra settings needed", selectedAction.equals("equip") ? "minecraft:stick" : "", c[0], y, c[2] * 2 + GAP, 128, "director-action-args");
+			actionArgs.active = selectedAction.equals("equip");
+		}
 		y += ROW + GAP;
 		addRenderableWidget(primary("Create script", c[0], y, c[2], ROW, this::createScript));
-		addRenderableWidget(button("Add action", c[1], y, c[2], ROW, false, this::addAction));
+		addRenderableWidget(button("Add action", c[1], y, c[2], ROW, false, () -> requestEditor("append", 0)));
 		y += ROW + GAP;
 		addRenderableWidget(button("Play script", c[0], y, c[2], ROW, false, () -> scriptCommand("play")));
 		addRenderableWidget(button("Stop actor", c[1], y, c[2], ROW, false, () -> scriptCommand("stop")));
+		initLibrary(y + ROW + GAP);
 	}
 
 	private void initVoice() {
@@ -223,28 +270,155 @@ public final class SkitDirectorScreen extends Screen {
 		int y = contentTop();
 		addActorPicker(c[0], y, c[2]);
 		addRenderableWidget(new ConsoleCycleButton<>(font, c[1], y, c[2], ROW, Component.literal("Voice"), VOICES,
-				voice, Component::literal, value -> voice = value)).visible = contentVisible(y, ROW);
+				voice, Component::literal, value -> { voice = value; drafts.put("selected-voice", value); })).visible = contentVisible(y, ROW);
 		y += ROW + GAP;
 		addRenderableWidget(new ConsoleCycleButton<>(font, c[0], y, c[2], ROW, Component.literal("Tone"), TONES,
-				tone, Component::literal, value -> tone = value)).visible = contentVisible(y, ROW);
+				tone, Component::literal, value -> { tone = value; drafts.put("selected-tone", value); })).visible = contentVisible(y, ROW);
 		addRenderableWidget(new ConsoleCycleButton<>(font, c[1], y, c[2], ROW, Component.literal("Speed"), SPEEDS,
-				speed, Component::literal, value -> speed = value)).visible = contentVisible(y, ROW);
+				speed, Component::literal, value -> { speed = value; drafts.put("selected-speed", value); })).visible = contentVisible(y, ROW);
 		y += ROW + GAP;
 		addRenderableWidget(new ConsoleCycleButton<>(font, c[0], y, c[2], ROW, Component.literal("Radius"), RADII,
-				radius, Component::literal, value -> radius = value)).visible = contentVisible(y, ROW);
+				radius, Component::literal, value -> { radius = value; drafts.put("selected-radius", value); })).visible = contentVisible(y, ROW);
 		voiceText = addEdit("Line", "What should they say?", c[1], y, c[2], 280, "director-voice-text");
 		y += ROW + GAP;
 		addRenderableWidget(primary("Set voice", c[0], y, c[2], ROW, this::setVoice));
 		addRenderableWidget(button("Say line", c[1], y, c[2], ROW, false, this::sayLine));
 		y += ROW + GAP;
 		voiceScript = addEdit("Voice script", "dialogue", c[0], y, c[2], 64, "director-voice-script");
-		voiceDelay = addEdit("Delay ticks", "0", c[1], y, c[2], 8, "director-voice-delay");
+		voiceDelay = addEdit("Pause before line (seconds)", "0", c[1], y, c[2], 8, "director-voice-delay");
 		y += ROW + GAP;
 		addRenderableWidget(button("Create voice script", c[0], y, c[2], ROW, false, () -> voiceScriptCommand("create")));
-		addRenderableWidget(button("Add cue", c[1], y, c[2], ROW, false, () -> voiceScriptCommand("add")));
+		addRenderableWidget(button("Add cue", c[1], y, c[2], ROW, false, () -> requestEditor("append", 0)));
 		y += ROW + GAP;
 		addRenderableWidget(primary("Play voice script", c[0], y, c[2], ROW, () -> voiceScriptCommand("play")));
 		addRenderableWidget(button("Stop voice", c[1], y, c[2], ROW, false, () -> send("codex skit voice script stop " + actorTarget())));
+		initLibrary(y + ROW + GAP);
+	}
+
+	private String editorKind() { return tab == Tab.SPAWN ? "take" : tab == Tab.ACTIONS ? "motion" : "voice"; }
+	private String editorName() { ConsoleEditBox field = editorNameField(); return field == null ? "" : field.getValue().strip(); }
+	private DirectorEditorPayload.Snapshot emptyLibrary() {
+		return new DirectorEditorPayload.Snapshot(new java.util.UUID(0, 0), true, "", editorKind(), "", "", List.of(), 0, 0, List.of());
+	}
+	private void initLibrary(int y) {
+		int[] c = columns();
+		var library = libraries.getOrDefault(editorKind(), emptyLibrary());
+		if (!library.names().isEmpty()) {
+			String name = library.names().contains(editorName()) ? editorName() : "";
+			List<String> choices = new java.util.ArrayList<>(); choices.add(""); choices.addAll(library.names());
+			addRenderableWidget(new ConsoleCycleButton<>(font, c[0], y, c[2], ROW, Component.literal("Saved"), choices, name,
+					value -> Component.literal(value.isEmpty() ? "Choose a script" : value), value -> {
+						if (value.isEmpty()) return;
+						editorNameField().setValue(value);
+						selectedRow = -1;
+						requestEditor("read", 0);
+					})).visible = contentVisible(y, ROW);
+		}
+		addRenderableWidget(button("Load / refresh script", c[1], y, c[2], ROW, false, () -> { selectedRow = -1; requestEditor("read", 0); }));
+		y += ROW + GAP;
+		for (var row : library.rows()) {
+			addRenderableWidget(button((row.index() + 1) + ". " + row.label(), c[0], y, c[2] * 2 + GAP, ROW, selectedRow == row.index(), () -> selectRow(row)));
+			y += ROW + GAP;
+		}
+		ConsoleButton save = button("Save selected row", c[0], y, c[2], ROW, false, () -> requestEditor("replace", library.offset()));
+		save.active = selectedRow >= 0;
+		addRenderableWidget(save);
+		ConsoleButton remove = button("Remove selected row", c[1], y, c[2], ROW, false, () -> requestEditor("remove", library.offset()));
+		remove.active = selectedRow >= 0;
+		addRenderableWidget(remove);
+		y += ROW + GAP;
+		addRenderableWidget(button("Undo last edit", c[0], y, c[2], ROW, false, () -> requestEditor("undo", library.offset())));
+		addRenderableWidget(button(tab == Tab.SPAWN ? "Delete take" : "Delete script", c[1], y, c[2], ROW, false, () -> { String key = editorKind() + ":" + editorName(); if (!deleteConfirmation.equals(key)) { deleteConfirmation = key; feedback = "Click Delete again to permanently delete " + editorName(); feedbackError = true; } else { deleteConfirmation = ""; requestEditor("delete", 0); } }));
+		y += ROW + GAP;
+		ConsoleButton previous = button("Previous rows", c[0], y, c[2], ROW, false, () -> requestEditor("read", Math.max(0, library.offset() - DirectorEditorPayload.PAGE_SIZE)));
+		previous.active = library.offset() > 0;
+		addRenderableWidget(previous);
+		ConsoleButton next = button("Next rows (" + library.total() + " total)", c[1], y, c[2], ROW, false, () -> requestEditor("read", library.offset() + DirectorEditorPayload.PAGE_SIZE));
+		next.active = library.offset() + DirectorEditorPayload.PAGE_SIZE < library.total();
+		addRenderableWidget(next);
+	}
+	private void selectRow(DirectorEditorPayload.Row row) {
+		editorNameField().setValue(libraries.get(editorKind()).name());
+		selectedRow = row.index();
+		if (tab == Tab.SPAWN) {
+			selectedActor = row.action(); drafts.put("selected-actor", selectedActor);
+			String[] scripts = row.arguments().split("\\n", -1);
+			drafts.put("director-take-motion", scripts[0]); drafts.put("director-take-voice", scripts[1]);
+		} else if (tab == Tab.ACTIONS) {
+			if (!ACTIONS.contains(row.action())) { feedback = "Legacy placement row: remove it or keep it unchanged"; feedbackError = true; return; }
+			selectedAction = row.action(); drafts.put("selected-action", selectedAction);
+			String[] parts = row.arguments().split(" ", 2);
+			boolean timed = !List.of("equip", "jump", "swing").contains(selectedAction);
+			if (timed) drafts.put("director-action-duration", Double.toString(Integer.parseInt(parts[0]) / 20.0));
+			drafts.put("director-action-args", selectedAction.equals("equip") ? row.arguments() : "");
+			if (selectedAction.equals("walk") && parts.length == 2) {
+				String[] movement = parts[1].split(" ");
+				drafts.put("director-walk-forward", movement[0]); drafts.put("director-walk-strafe", movement[1]);
+				walkSprint = Boolean.parseBoolean(movement[2]); drafts.put("walk-sprint", movement[2]);
+			} else if (selectedAction.equals("emote") && parts.length == 2) { actionSneak = Boolean.parseBoolean(parts[1]); drafts.put("action-sneak", parts[1]); }
+		} else {
+			drafts.put("director-voice-text", row.arguments());
+			drafts.put("director-voice-delay", Double.toString(Integer.parseInt(row.action()) / 20.0));
+		}
+		rebuildWidgets();
+	}
+	private static String ticks(String seconds) {
+		double value;
+		try { value = Double.parseDouble(seconds); } catch (NumberFormatException exception) { throw new DirectorInputException("Enter a duration in seconds"); }
+		if (!Double.isFinite(value) || value < 0 || value > 3600) throw new DirectorInputException("Duration must be between 0 and 3600 seconds");
+		return Long.toString(Math.round(value * 20));
+	}
+	private void requestEditor(String operation, int offset) {
+		if (tab == Tab.CAMERA) return;
+		if (minecraft == null || minecraft.getConnection() == null) throw new DirectorInputException("Connect to a world to load saved scripts");
+		if (pendingEditor != null) throw new DirectorInputException("Wait for the current edit to finish");
+		var library = libraries.getOrDefault(editorKind(), emptyLibrary());
+		if (!operation.equals("read") && (!library.name().equals(editorName()) || library.revision().isEmpty()))
+			throw new DirectorInputException("Load the saved script before editing");
+		String action = "", args = "";
+		if (operation.equals("append") || operation.equals("replace")) {
+			if (tab == Tab.SPAWN) {
+				action = selectedActor; args = takeMotion.getValue().strip() + "\n" + takeVoice.getValue().strip();
+			} else if (tab == Tab.ACTIONS) {
+				action = selectedAction;
+				String extra = action.equals("walk") ? number(walkForward, "1") + " " + number(walkStrafe, "0") + " " + walkSprint : action.equals("emote") ? Boolean.toString(actionSneak) : number(actionArgs, "");
+				args = switch (action) { case "equip" -> extra; case "jump", "swing" -> ""; case "walk", "emote" -> ticks(number(actionDuration, "2")) + " " + extra; default -> ticks(number(actionDuration, "2")); };
+			} else { action = ticks(number(voiceDelay, "0")); args = voiceText.getValue(); }
+		}
+		var request = new DirectorEditorPayload.Request(java.util.UUID.randomUUID(), editorKind(), editorName(), operation, library.revision(), selectedRow, offset, action, args);
+		if (!AgentControlClient.sendDirectorEditor(request)) throw new DirectorInputException("Script editing needs a connected server with editor support");
+		pendingEditor = request.requestId();
+		editorDeadline = System.nanoTime() + 15_000_000_000L;
+		pendingEditorOperation = operation;
+		feedback = "Loading script...";
+		feedbackError = false;
+	}
+	public void acceptEditorSnapshot(DirectorEditorPayload.Snapshot snapshot) {
+		if (!snapshot.requestId().equals(pendingEditor)) return;
+		pendingEditor = null;
+		// A conflict must be explicitly refreshed before the operator can overwrite newer work.
+		if (snapshot.success()) libraries.put(snapshot.kind(), snapshot);
+		else libraries.remove(snapshot.kind());
+		if (snapshot.success() && List.of("remove", "delete", "undo", "read").contains(pendingEditorOperation)) selectedRow = -1;
+		feedback = snapshot.message();
+		feedbackError = !snapshot.success();
+		acceptCatalogUpdate();
+	}
+
+	private ConsoleEditBox editorNameField() { return tab == Tab.SPAWN ? takeName : tab == Tab.ACTIONS ? scriptName : voiceScript; }
+	private void initTake() {
+		int[] c = columns(); int y = contentTop() + 8 * (ROW + GAP);
+		takeName = addEdit("Take name", "The escape", c[0], y, c[2], 64, "director-take-name");
+		addRenderableWidget(primary("Create take", c[1], y, c[2], ROW, () -> send("codex skit take create " + word(takeName.getValue()))));
+		y += ROW + GAP;
+		takeMotion = addEdit("Actor's action script (optional)", "entrance", c[0], y, c[2], 64, "director-take-motion");
+		takeVoice = addEdit("Actor's voice script (optional)", "dialogue", c[1], y, c[2], 64, "director-take-voice");
+		y += ROW + GAP;
+		addRenderableWidget(button("Save actor + starting mark", c[0], y, c[2] * 2 + GAP, ROW, false, () -> requestEditor("append", 0)));
+		y += ROW + GAP;
+		addRenderableWidget(primary("Play take", c[0], y, c[2], ROW, () -> send("codex skit take play " + word(takeName.getValue()))));
+		addRenderableWidget(button("Stop take", c[1], y, c[2], ROW, false, () -> send("codex skit take stop")));
+		initLibrary(y + ROW + GAP);
 	}
 
 	private void initCamera() {
@@ -260,7 +434,15 @@ public final class SkitDirectorScreen extends Screen {
 		addRenderableWidget(button("Play loop", c[1], y, c[2], ROW, false, () -> cameraPlay(true)));
 		y += ROW + GAP;
 		addRenderableWidget(button("Stop camera", c[0], y, c[2], ROW, false, CameraDirectorClient::stopPlaybackFromGui));
-		addRenderableWidget(button("Start a new take", c[1], y, c[2], ROW, false, () -> cameraStart(true)));
+		addRenderableWidget(button("Retake camera path", c[1], y, c[2], ROW, false, () -> cameraStart(true)));
+		y += ROW + GAP;
+		var names = CameraDirectorClient.pathNames();
+		if (!names.isEmpty()) addRenderableWidget(new ConsoleCycleButton<>(font, c[0], y, c[2], ROW, Component.literal("Saved path"), names,
+				names.contains(cameraPath.getValue()) ? cameraPath.getValue() : names.getFirst(), Component::literal, cameraPath::setValue)).visible = contentVisible(y, ROW);
+		addRenderableWidget(button("Assign camera to take", c[1], y, c[2], ROW, false, () -> send("codex skit take camera " + word(drafts.getOrDefault("director-take-name", "")) + " " + word(cameraPath.getValue()) + " " + CameraDirectorClient.pathDuration(cameraPath.getValue()))));
+		y += ROW + GAP;
+		addRenderableWidget(button("Remove take camera", c[0], y, c[2], ROW, false, () -> send("codex skit take camera " + word(drafts.getOrDefault("director-take-name", "")) + " - 0")));
+		addRenderableWidget(button("Stop take", c[1], y, c[2], ROW, false, () -> send("codex skit take stop")));
 	}
 
 	private void cameraStart(boolean replace) {
@@ -305,13 +487,6 @@ public final class SkitDirectorScreen extends Screen {
 		if (scriptName != null) send("codex skit script create " + word(scriptName.getValue()) + " " + actorTarget());
 	}
 
-	private void addAction() {
-		if (scriptName == null) return;
-		String args = actionArgs == null ? "" : actionArgs.getValue().strip();
-		if (args.startsWith(selectedAction + ":")) args = args.substring(selectedAction.length() + 1).strip();
-		send("codex skit script action " + word(scriptName.getValue()) + " " + selectedAction + (args.isBlank() ? "" : " " + args));
-	}
-
 	private void scriptCommand(String operation) {
 		if (scriptName == null && !operation.equals("stop")) return;
 		String selector = selectedActor;
@@ -348,6 +523,7 @@ public final class SkitDirectorScreen extends Screen {
 	}
 
 	private boolean send(String command) {
+		if (pendingCommand != null && !command.contains(" stop")) throw new DirectorInputException("Wait for the current command to finish");
 		var connection = minecraft == null ? null : minecraft.getConnection();
 		if (connection != null) {
 			var parsed = connection.getCommands().parse(command, connection.getSuggestionsProvider());
@@ -366,6 +542,7 @@ public final class SkitDirectorScreen extends Screen {
 		var request = new DirectorCommandRequestPayload(java.util.UUID.randomUUID(), command);
 		if (AgentControlClient.sendDirectorCommand(request)) {
 			pendingCommand = request.requestId();
+			commandDeadline = System.nanoTime() + 15_000_000_000L;
 			feedback = "Waiting for the server...";
 			feedbackError = false;
 			return true;
@@ -409,13 +586,21 @@ public final class SkitDirectorScreen extends Screen {
 	}
 
 	private void runAction(Runnable action) {
-		pendingCommand = null;
 		try {
 			action.run();
-		} catch (DirectorInputException exception) {
+		} catch (IllegalArgumentException exception) {
 			feedback = exception.getMessage();
 			feedbackError = true;
 			LOGGER.info("Director form rejected locally: tab={}, reason={}", tab, feedback);
+		}
+	}
+
+	@Override public void tick() {
+		super.tick();
+		long now = System.nanoTime();
+		if (pendingCommand != null && now >= commandDeadline || pendingEditor != null && now >= editorDeadline) {
+			pendingCommand = null; pendingEditor = null;
+			libraries.clear(); feedback = "No server response. Refresh before retrying; the last change may have saved"; feedbackError = true;
 		}
 	}
 
@@ -484,7 +669,7 @@ public final class SkitDirectorScreen extends Screen {
 	private static int contentBottomInset(int panelHeight) { return panelHeight < 180 ? 32 : 42; }
 	private int contentBottom() { return panelTop() + panelHeight() - contentBottomInset(panelHeight()); }
 	private int contentTop() { return panelTop() + contentOffset(panelHeight()) - scrollRows * (ROW + GAP); }
-	private int maxScrollRows() { return maxScrollRows(panelHeight(), tab.rows); }
+	private int maxScrollRows() { return maxScrollRows(panelHeight(), tab.rows + ((tab == Tab.SPAWN || tab == Tab.ACTIONS || tab == Tab.VOICE) ? 5 + libraries.getOrDefault(editorKind(), emptyLibrary()).rows().size() : 0)); }
 	private static int maxScrollRows(int panelHeight, int rows) {
 		int visibleRows = Math.max(1, (panelHeight - contentOffset(panelHeight) - contentBottomInset(panelHeight) + GAP) / (ROW + GAP));
 		return Math.max(0, rows - visibleRows);
@@ -513,10 +698,10 @@ public final class SkitDirectorScreen extends Screen {
 	private Component title(String value) { return Component.literal(value.substring(0, 1).toUpperCase(Locale.ROOT) + value.substring(1)); }
 
 	private enum Tab {
-		SPAWN("Cast", "Select a cast member to place or respawn.", 8),
-		ACTIONS("Actions", "Build a reusable movement script one action at a time.", 4),
+		SPAWN("Cast", "Place your cast, then save their scripts and starting marks in a take.", 12),
+		ACTIONS("Actions", "Select a saved script to edit. Glide captures your position when added.", 5),
 		VOICE("Voice", "Choose a voice, delivery tone, and line without leaving the world.", 7),
-		CAMERA("Camera", "Record smooth keyframes, then play the take once or on a loop.", 4);
+		CAMERA("Camera", "Record a path, then assign it to the take selected in Cast.", 6);
 		private final String label;
 		private final String help;
 		private final int rows;

@@ -82,6 +82,7 @@ public final class SkitActors {
 		if (!RESTORED.containsKey(server)) return;
 		for (SkitActor actor : records(server)) {
 			if (!player.getUUID().equals(OfflineAgentPlayers.offlineUuid(actor.agentId(), actor.profile()))) continue;
+			DirectorTakeRuntime.stopActor(server, actor.agentId());
 			SkitModeRuntime.stop(server, actor.agentId());
 			VoiceDirector.stop(server, actor.agentId());
 			SkitModeSavedData.get(server).putActor(actor.withDead(true));
@@ -92,6 +93,7 @@ public final class SkitActors {
 		MinecraftServer server = player.level().getServer();
 		for (SkitActor actor : records(server)) {
 			if (find(server, actor.agentId()).orElse(null) != player) continue;
+			DirectorTakeRuntime.stopActor(server, actor.agentId());
 			SkitModeRuntime.stop(server, actor.agentId());
 			VoiceDirector.stop(server, actor.agentId());
 			OfflineAgentPlayers.retainConnectedDeath(player);
@@ -128,11 +130,13 @@ public final class SkitActors {
 	}
 	public static void remove(MinecraftServer server, String selector) {
 		SkitActor actor = resolve(server, selector);
+		DirectorTakeRuntime.stopActor(server, actor.agentId());
 		SkitModeRuntime.stop(server, actor.agentId());
 		VoiceDirector.stop(server, actor.agentId());
 		CANCELLED.computeIfAbsent(server, ignored -> new PendingSpawnCancellationLedger(30_000)).record(actor.agentId(), actor.profile(), System.currentTimeMillis());
 		find(server, actor.agentId()).ifPresent(OfflineAgentPlayers::remove);
 		dev.agaminggod.arenaagents.server.voice.VoiceSubsystemRuntime.removeAgent(server, actor.agentId());
+		VoiceDirector.forget(server, actor.agentId());
 		SkitModeSavedData.get(server).removeActor(actor.agentId());
 	}
 	public static void tick(MinecraftServer server) {
@@ -145,6 +149,7 @@ public final class SkitActors {
 			if (actor.dead()) { connected.remove(actor.agentId()); continue; }
 			if (find(server, actor.agentId()).isPresent()) { connected.add(actor.agentId()); continue; }
 			if (connected.remove(actor.agentId())) {
+				DirectorTakeRuntime.stopActor(server, actor.agentId());
 				SkitModeRuntime.stop(server, actor.agentId());
 				VoiceDirector.stop(server, actor.agentId());
 				SkitModeSavedData.get(server).putActor(actor.withDead(true));

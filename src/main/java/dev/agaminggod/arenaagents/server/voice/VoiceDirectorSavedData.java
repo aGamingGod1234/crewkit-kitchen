@@ -76,6 +76,10 @@ public final class VoiceDirectorSavedData extends SavedData {
 
 	public Map<String, VoiceProfile> profiles() { return Map.copyOf(profiles); }
 
+	public void removeProfile(AgentId agentId) {
+		if (profiles.remove(agentId.toString()) != null) setDirty();
+	}
+
 	public void putProfile(AgentId agentId, VoiceProfile profile) {
 		Objects.requireNonNull(agentId, "agentId must not be null");
 		Objects.requireNonNull(profile, "profile must not be null");
@@ -86,6 +90,12 @@ public final class VoiceDirectorSavedData extends SavedData {
 
 	public VoiceScript script(String name) { return scripts.get(name); }
 	public List<VoiceScript> scripts() { return List.copyOf(scripts.values()); }
+
+	public void createScript(VoiceScript script) {
+		if (scripts.containsKey(script.name())) throw new dev.agaminggod.arenaagents.agent.AgentDomainException(
+				"VOICE_SCRIPT_EXISTS", "A voice script named " + script.name() + " already exists. Select it to edit, or choose a new name");
+		putScript(script);
+	}
 
 	public void putScript(VoiceScript script) {
 		Objects.requireNonNull(script, "script must not be null");

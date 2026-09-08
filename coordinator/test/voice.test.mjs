@@ -122,6 +122,38 @@ test('loopback voice worker authenticates, caches, and emits 48 kHz PCM', async 
 	}
 });
 
+test('Director explicit speed overrides automatic voice presets', async () => {
+	const speeds = [];
+	const worker = createVoiceHttpServer({ provider: { async synthesize(request) {
+		speeds.push(request.speed);
+		return { sampleRateHz: 48000, channels: 1, sampleFormat: 's16le', pcm: Buffer.alloc(960) };
+	}}, profileStore: new VoiceProfileStore(), secret: 'director-speed-fixture', port: 0 });
+	const address = await worker.start();
+	try {
+		for (const speed of [0.5, 2]) {
+			const body = JSON.stringify({ agentId: AGENT_ONE, text: 'Same line.', profileId: 'voice.auto.v1', radius: 48,
+				conversationSequence: 1, speed, tone: 'neutral' });
+			const headers = createVoiceRequestHeaders({ secret: 'director-speed-fixture', path: '/v1/tts',
+				contentType: 'application/json', body: Buffer.from(body) });
+			const response = await globalThis.fetch(`http://127.0.0.1:${address.port}/v1/tts`, {
+				method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body });
+			assert.equal(response.status, 200);
+			await response.arrayBuffer();
+		}
+		assert.deepEqual(speeds, [0.5, 2], 'distinct speeds must reach synthesis and remain distinct in the cache');
+	} finally { await worker.close(); }
+});
+
+test('Director Fish delivery tones become S2 inline cues', async () => {
+	const texts = [];
+	const provider = new FishTtsProvider({ apiKey: 'director-tone-fixture', fetchImpl: async (_url, request) => {
+		texts.push(JSON.parse(request.body).text);
+		return new Response(Buffer.alloc(4), { status: 200 });
+	}});
+	for (const tone of ['neutral', 'angry', 'whisper']) await provider.synthesize({ text: 'Go.', voiceId: 'voice-id', tone });
+	assert.deepEqual(texts, ['Go.', '[angry] Go.', '[whispering] Go.']);
+});
+
 test('Fish provider identifies a rejected credential without exposing response details', async () => {
 	const provider = new FishTtsProvider({
 		apiKey: 'secret-test-token',

@@ -20,6 +20,7 @@ import dev.agaminggod.arenaagents.scenario.presentation.ScenarioBuildProgressCle
 import dev.agaminggod.arenaagents.scenario.presentation.ScenarioBuildProgressPayload;
 import dev.agaminggod.arenaagents.control.AgentControlCatalog;
 import dev.agaminggod.arenaagents.control.DirectorCommandRequestPayload;
+import dev.agaminggod.arenaagents.control.DirectorEditorPayload;
 import dev.agaminggod.arenaagents.control.DirectorCommandResultPayload;
 import dev.agaminggod.arenaagents.control.AgentControlModelOption;
 import dev.agaminggod.arenaagents.control.AgentControlRequestPayload;
@@ -90,6 +91,12 @@ public final class AgentControlClient {
 				(payload, context) -> context.client().execute(() -> {
 					if (!DirectorClientState.accept(payload)) return;
 					if (context.client().screen instanceof dev.agaminggod.arenaagents.client.gui.SkitDirectorScreen screen) screen.acceptCatalogUpdate();
+				}));
+		ClientPlayNetworking.registerGlobalReceiver(dev.agaminggod.arenaagents.control.DirectorTakePlaybackPayload.TYPE,
+				(payload, context) -> context.client().execute(() -> dev.agaminggod.arenaagents.client.camera.CameraDirectorClient.acceptTake(payload)));
+		ClientPlayNetworking.registerGlobalReceiver(DirectorEditorPayload.Snapshot.TYPE,
+				(payload, context) -> context.client().execute(() -> {
+					if (context.client().screen instanceof dev.agaminggod.arenaagents.client.gui.SkitDirectorScreen screen) screen.acceptEditorSnapshot(payload);
 				}));
 		if (!ClientPlayNetworking.registerGlobalReceiver(DirectorCommandResultPayload.TYPE,
 				(payload, context) -> context.client().execute(() -> {
@@ -218,6 +225,12 @@ public final class AgentControlClient {
 
 	public static boolean sendCommand(String command) {
 		return sendCommandWithReceipt(command).isPresent();
+	}
+
+	public static boolean sendDirectorEditor(DirectorEditorPayload.Request request) {
+		if (Minecraft.getInstance().getConnection() == null || !ClientPlayNetworking.canSend(DirectorEditorPayload.Request.TYPE)) return false;
+		ClientPlayNetworking.send(request);
+		return true;
 	}
 
 	public static boolean sendDirectorCommand(DirectorCommandRequestPayload request) {

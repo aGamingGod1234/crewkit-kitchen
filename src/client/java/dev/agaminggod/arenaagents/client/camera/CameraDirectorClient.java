@@ -54,6 +54,34 @@ public final class CameraDirectorClient {
 	private static CameraType previousCameraType;
 	private static boolean registered;
 
+	private static dev.agaminggod.arenaagents.control.DirectorTakePlaybackPayload scheduledTake;
+	private static net.minecraft.client.multiplayer.ClientLevel takeLevel;
+	private static boolean takeCamera;
+	public static List<String> pathNames() { return List.copyOf(PATHS.keySet()); }
+	public static int pathDuration(String name) { var path = PATHS.get(name); if (path == null || path.durationTicks() < MIN_PLAYBACK_TICKS) throw new IllegalArgumentException("Choose a saved camera path with at least two keyframes"); return Math.toIntExact(path.durationTicks()); }
+	public static void acceptTake(dev.agaminggod.arenaagents.control.DirectorTakePlaybackPayload value) {
+		Minecraft client = Minecraft.getInstance();
+		if (value.startGameTime() < 0) {
+			scheduledTake = null; takeLevel = null;
+			if (takeCamera) stopPlayback(client);
+			takeCamera = false;
+			guiFeedback(value.message(), false);
+			return;
+		}
+		if (client.level == null || client.player == null) return;
+		if (!value.camera().isEmpty()) {
+			try { pathDuration(value.camera()); }
+			catch (IllegalArgumentException error) {
+				if (client.getConnection() != null) client.getConnection().sendCommand("codex skit take stop");
+				guiFeedback("Take cancelled: this client does not have the saved camera path", true);
+				return;
+			}
+		}
+		scheduledTake = value; takeLevel = client.level;
+		if (client.screen != null) client.setScreen(null);
+		guiFeedback(value.message(), false);
+	}
+
 	private CameraDirectorClient() {
 	}
 
@@ -63,6 +91,7 @@ public final class CameraDirectorClient {
 		ClientCommandRegistrationCallback.EVENT.register((dispatcher, ignored) -> dispatcher.register(commands()));
 		ClientTickEvents.END_CLIENT_TICK.register(CameraDirectorClient::tick);
 		ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
+			scheduledTake = null; takeLevel = null; takeCamera = false;
 			stopPlayback(client);
 			recording = null;
 		});
@@ -125,6 +154,7 @@ public final class CameraDirectorClient {
 		previousCameraType = client.options.getCameraType();
 		playback = new Playback(path, client.level, client.player, client.level.getGameTime(), loop);
 		apply(client, path.sample(0.0D));
+		if (client.screen != null) client.setScreen(null);
 		guiFeedback("Playing camera path '" + path.name() + "'" + (loop ? " on loop." : "."), false);
 	}
 
@@ -136,6 +166,7 @@ public final class CameraDirectorClient {
 
 	private static void guiFeedback(String message, boolean error) {
 		Minecraft client = Minecraft.getInstance();
+		if (client.screen instanceof dev.agaminggod.arenaagents.client.gui.SkitDirectorScreen screen) screen.acceptLocalFeedback(message, error);
 		if (client.gui != null) client.gui.setOverlayMessage(Component.literal(message), true);
 	}
 
@@ -302,6 +333,16 @@ public final class CameraDirectorClient {
 	}
 
 	private static void tick(Minecraft client) {
+		if (scheduledTake != null) {
+			if (client.level != takeLevel || client.player == null) { scheduledTake = null; takeLevel = null; }
+			else if (client.level.getGameTime() >= scheduledTake.startGameTime()) {
+				var take = scheduledTake; scheduledTake = null; takeLevel = null;
+				if (!take.camera().isEmpty()) {
+					playFromGui(take.camera(), false);
+					if (playback != null) { playback = new Playback(playback.path(), playback.level(), playback.player(), take.startGameTime(), false); takeCamera = true; }
+				}
+			}
+		}
 		if (recording != null && !recordingInCurrentLevel(client)) recording = null;
 		if (playback == null) return;
 		if (client.level == null || client.player == null || playback.level() != client.level || playback.player() != client.player) {

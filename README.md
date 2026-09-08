@@ -96,8 +96,25 @@ does not give agents a second control system. Turn it on, summon a named agent,
 place it at your feet or at exact coordinates, then replay a saved timeline:
 
 For a point-and-click workflow, press `G` to open the Field Console and choose
-**Director**. Its Spawn, Actions, Voice, and Camera tabs cover the same staging
-workflow without requiring chat commands.
+**Director**. Its Cast, Actions, Voice, and Camera tabs cover the staging workflow
+without requiring chat commands. In Actions or Voice, create or load a saved script,
+select a row to edit it, then save the row. You can remove rows and undo your last edit.
+Creating an existing name is rejected instead of erasing its contents. The editor
+keeps drafts while you close and reopen it in the same connection; saved scripts
+and takes persist in the world. Durations in the editor use seconds.
+
+For a shared take, scroll down in Cast, create a take, and load it. Select an actor,
+enter its action and/or voice script names, then choose **Save actor + starting mark**.
+Repeat for each actor. In Camera, assign a saved path to that take if needed.
+**Play take** restores the recorded actor positions and starts all tracks after a
+three-second countdown. **Stop take** releases the cast, stops speech and restores
+the camera. You can reopen Director during playback. Editing a track preserves its
+starting mark; Save actor + starting mark explicitly captures a new mark.
+
+Camera paths live on the recording client, so play the take from that client.
+Each actor's dialogue waits for audible completion before starting its next pause
+and line. Initial speech can still wait for voice-provider synthesis; takes do not
+pre-render audio or promise frame-exact dialogue against camera movement.
 
 ```text
 /codex skit on
@@ -113,7 +130,7 @@ workflow without requiring chat commands.
 /codex skit script add takeoff 0 12 72 -4 180 0
 /codex skit script add takeoff 40 12 80 -4 180 10
 /codex skit script add takeoff 80 12 72 -4 180 0
-/codex skit script action takeoff move 40 1 0 true
+/codex skit script action takeoff walk 40 1 0 true
 /codex skit script action takeoff equip minecraft:elytra
 /codex skit script action takeoff jump
 /codex skit script play takeoff
@@ -139,7 +156,12 @@ landings repeatable for recording. `relative` places an actor by right/up/forwar
 offsets from the operator, while `look_at` keeps the actor at the operator and
 turns them toward a target point. Action steps can move smoothly between the
 current placement and the saved endpoint, wait, jump, equip an item, use the held
-item, swing, or hold a sneak/emote pose.
+item, swing, or hold a sneak/emote pose. New non-placement actions hold the actor's
+current position instead of snapping back to an earlier mark. In the editor,
+**Glide to my position** records the operator's position when added. `walk` uses
+Minecraft movement and collision with forward, strafe and sprint inputs; `move`
+with a single duration keeps the saved-endpoint glide behavior. Existing saved
+placement timelines retain their behavior.
 
 Use `skit summon <provider> model <exact-slug> <name>` when a scene needs a
 specific model. The technical Minecraft username remains safe and unique, while
@@ -147,9 +169,11 @@ the visible name tag uses the readable model/name label.
 
 Voice profiles are persisted per agent. The profile ID selects the local TTS voice
 identity, while `tone`, `speed`, and `radius` control delivery and proximity range.
-Voice scripts schedule exact lines in ticks. They require the optional Arena Agents
-Voice add-on and Simple Voice Chat; without those installed, the rest of the skit
-system continues and speech reports the normal bounded fallback.
+Voice script pauses are measured from completion of the preceding line. They
+require the optional Arena Agents Voice add-on and Simple Voice Chat. Missing voice
+support or a failed line gives an error and stops the dialogue, including a take
+that depends on it. Stop also cancels the final audible line. Explicit speed and
+supported delivery tone settings reach the synthesis provider.
 
 The client-only camera director records the operator's current camera position and
 rotation as keyframes, then replays them with smooth position interpolation and

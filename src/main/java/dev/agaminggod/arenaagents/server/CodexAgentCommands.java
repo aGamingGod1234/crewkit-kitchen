@@ -160,6 +160,7 @@ public final class CodexAgentCommands {
 
 	private static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> skitCommands() {
 		var skit = Commands.literal("skit").requires(GoalControl::mayControl).executes(CodexAgentCommands::skitStatus);
+		skit.then(DirectorTakeCommands.commands());
 		skit.then(Commands.literal("on").executes(context -> toggleSkit(context, true)));
 		skit.then(Commands.literal("off").executes(context -> toggleSkit(context, false)));
 		skit.then(Commands.literal("status").executes(CodexAgentCommands::skitStatus));
@@ -537,18 +538,27 @@ public final class CodexAgentCommands {
 		}
 	}
 
-	private static SkitAction parseSkitAction(String name, String rawArgs) {
+	static SkitAction parseSkitAction(String name, String rawArgs) {
 		List<String> args = rawArgs == null || rawArgs.isBlank() ? List.of() : Arrays.asList(rawArgs.strip().split("\\s+"));
+		int maximum = switch (name) { case "move", "walk" -> 4; case "emote" -> 2; case "jump", "swing" -> 0; default -> 1; };
+		if (args.size() > maximum) throw new AgentDomainException("SKIT_ACTION_ARGUMENT", "Too many arguments for " + name);
+		try {
 		return switch (name) {
-			case "move" -> SkitAction.move(integerArg(args, 0, "duration"), floatArg(args, 1, 1.0F), floatArg(args, 2, 0.0F), boolArg(args, 3, false));
+			case "move" -> args.size() == 1 ? SkitAction.move(integerArg(args, 0, "duration"))
+					: SkitAction.walk(integerArg(args, 0, "duration"), floatArg(args, 1, 1.0F), floatArg(args, 2, 0.0F), boolArg(args, 3, false));
+			case "walk" -> SkitAction.walk(integerArg(args, 0, "duration"), floatArg(args, 1, 1.0F), floatArg(args, 2, 0.0F), boolArg(args, 3, false));
 			case "wait" -> SkitAction.waitTicks(integerArg(args, 0, "duration"));
 			case "jump" -> SkitAction.jump();
 			case "equip" -> SkitAction.equip(stringArg(args, 0, "item"));
 			case "use" -> SkitAction.use(integerOptional(args, 0, 1));
 			case "swing" -> SkitAction.swing();
 			case "emote" -> SkitAction.emote(integerOptional(args, 0, 20), boolArg(args, 1, false));
-			default -> throw new AgentDomainException("SKIT_ACTION_UNKNOWN", "Unknown action '" + name + "'. Use move, wait, jump, equip, use, swing, or emote.");
+			default -> throw new AgentDomainException("SKIT_ACTION_UNKNOWN", "Unknown action '" + name + "'. Use move, walk, wait, jump, equip, use, swing, or emote.");
 		};
+		} catch (IllegalArgumentException exception) {
+			if (exception instanceof AgentDomainException domain) throw domain;
+			throw new AgentDomainException("SKIT_ACTION_ARGUMENT", exception.getMessage());
+		}
 	}
 
 	private static int integerArg(List<String> args, int index, String name) {
@@ -671,6 +681,7 @@ public final class CodexAgentCommands {
 	private static int stopVoiceScript(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
 		try {
 			AgentId agentId = SkitActors.resolve(context.getSource().getServer(), StringArgumentType.getString(context, ARGUMENT_AGENT)).agentId();
+			DirectorTakeRuntime.stopActor(context.getSource().getServer(), agentId);
 			VoiceDirector.stop(context.getSource().getServer(), agentId);
 			context.getSource().sendSuccess(() -> Component.literal("Stopped voice playback."), false);
 			return 1;

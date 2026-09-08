@@ -250,7 +250,7 @@ export function createVoiceHttpServer({
 				: profileStore.resolve(payload.agentId);
 			const profile = Object.freeze({
 				...selectedProfile,
-				speed: payload.profileId === 'voice.auto.v1' ? selectedProfile.speed : payload.speed,
+				speed: payload.profileId === 'voice.auto.v1' && !payload.explicitSpeed ? selectedProfile.speed : payload.speed,
 			});
 			const requestedProvider = effectiveProviderNamespace(provider);
 			const cacheKey = synthesisCacheKey(profile, payload, requestedProvider);
@@ -917,7 +917,7 @@ function validateRequest(value) {
 	if (!Number.isSafeInteger(value.conversationSequence) || value.conversationSequence < 0) throw typedError('INVALID_REQUEST', 'conversationSequence is invalid');
 	if (typeof value.speed !== 'number' || !Number.isFinite(value.speed) || value.speed < 0.5 || value.speed > 2) throw typedError('INVALID_REQUEST', 'speed is invalid');
 	if (typeof value.tone !== 'string' || !/^[A-Za-z0-9_.:-]{1,32}$/.test(value.tone)) throw typedError('INVALID_REQUEST', 'tone is invalid');
-	return value;
+	return { ...value, explicitSpeed: keys.includes('speed') };
 }
 
 function statusFor(error) {

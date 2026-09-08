@@ -27,6 +27,10 @@ public final class SkitModeRuntime {
 	private static final Logger LOGGER = LoggerFactory.getLogger(SkitModeRuntime.class);
 	private static final Map<MinecraftServer, Map<AgentId, Run>> PLAYBACK = new ConcurrentHashMap<>();
 
+	private static final Map<MinecraftServer, Map<AgentId, String>> STATUS = new ConcurrentHashMap<>();
+	public static String status(MinecraftServer server, AgentId id) { return STATUS.getOrDefault(server, Map.of()).getOrDefault(id, ""); }
+	private static void result(MinecraftServer server, AgentId id, String result) { STATUS.computeIfAbsent(server, ignored -> new ConcurrentHashMap<>()).put(id, result); }
+
 	private SkitModeRuntime() {
 	}
 
@@ -37,7 +41,7 @@ public final class SkitModeRuntime {
 	public static boolean setEnabled(MinecraftServer server, boolean enabled) {
 		SkitModeSavedData data = SkitModeSavedData.get(server);
 		data.setEnabled(enabled);
-		if (!enabled) release(server);
+		if (!enabled) { release(server); dev.agaminggod.arenaagents.server.voice.VoiceDirector.stopAll(server); }
 		return data.enabled();
 	}
 
@@ -50,6 +54,7 @@ public final class SkitModeRuntime {
 		Objects.requireNonNull(level, "level must not be null");
 		requireEnabled(manager.server());
 		SkitActor record = SkitActors.resolve(manager.server(), selector);
+		DirectorTakeRuntime.requireUnreserved(manager.server(), record.agentId());
 		SkitPlacement placement = new SkitPlacement(level.dimension().identifier().toString(), x, y, z, yaw, pitch);
 		SkitActors.find(manager.server(), record.agentId()).filter(ServerPlayer::isAlive).ifPresentOrElse(
 				player -> {
@@ -89,7 +94,7 @@ public final class SkitModeRuntime {
 	public static SkitScript createScript(MinecraftServer server, String name, String agentSelector) {
 		requireEnabled(server);
 		SkitScript script = new SkitScript(name, SkitActors.resolve(server, agentSelector).agentId().toString(), List.of());
-		SkitModeSavedData.get(server).putScript(script);
+		SkitModeSavedData.get(server).createScript(script);
 		return script;
 	}
 
@@ -107,7 +112,9 @@ public final class SkitModeRuntime {
 	public static SkitScript addAction(MinecraftServer server, String name, SkitPlacement endpoint, SkitAction action) {
 		Objects.requireNonNull(endpoint, "endpoint must not be null");
 		Objects.requireNonNull(action, "action must not be null");
-		return addStep(server, name, new SkitStep(0, endpoint, List.of(action)));
+		if (action.type() == SkitAction.Type.EQUIP && !BuiltInRegistries.ITEM.containsKey(Identifier.parse(action.itemId())))
+			throw new AgentDomainException("SKIT_ITEM_NOT_FOUND", "Unknown item: " + action.itemId());
+		return addStep(server, name, new SkitStep(0, endpoint, List.of(action), false));
 	}
 
 	public static SkitScript play(CodexAgentManager manager, String name, String selectorOverride) {
@@ -115,10 +122,16 @@ public final class SkitModeRuntime {
 		SkitModeSavedData data = SkitModeSavedData.get(manager.server());
 		SkitScript script = Optional.ofNullable(data.script(name))
 				.orElseThrow(() -> new AgentDomainException("SKIT_SCRIPT_NOT_FOUND", "No skit script named " + name));
+		return play(manager, script, selectorOverride);
+	}
+
+	static SkitScript play(CodexAgentManager manager, SkitScript script, String selectorOverride) {
+		requireEnabled(manager.server());
 		if (script.steps().isEmpty()) throw new AgentDomainException("SKIT_SCRIPT_EMPTY", "Skit script has no steps");
 		String selector = selectorOverride == null || selectorOverride.isBlank() ? script.agentSelector() : selectorOverride;
 		SkitActor record = SkitActors.resolve(manager.server(), selector);
 		AgentId agentId = record.agentId();
+		DirectorTakeRuntime.requireUnreserved(manager.server(), agentId);
 		ServerPlayer actor = SkitActors.find(manager.server(), agentId).filter(player -> player.isAlive() && !player.isRemoved())
 				.orElseThrow(() -> new AgentDomainException("AGENT_NOT_PRESENT", "Agent has not joined the world yet"));
 		validateTimeline(script, actor.level().dimension().identifier().toString(),
@@ -149,11 +162,16 @@ public final class SkitModeRuntime {
 	}
 
 	public static void stop(MinecraftServer server, String selector) {
-		stop(server, SkitActors.resolve(server, selector).agentId());
+		var id = SkitActors.resolve(server, selector).agentId();
+		DirectorTakeRuntime.stopActor(server, id);
+		stop(server, id);
 	}
+
+	public static boolean isPlaying(MinecraftServer server, AgentId id) { return PLAYBACK.getOrDefault(server, Map.of()).containsKey(id); }
 
 	static void stop(MinecraftServer server, AgentId agentId) {
 		if (server == null) return;
+		Optional.ofNullable(STATUS.get(server)).ifPresent(states -> states.remove(agentId));
 		Map<AgentId, Run> runs = PLAYBACK.get(server);
 		if (runs != null) cleanup(runs.remove(agentId));
 	}
@@ -170,25 +188,29 @@ public final class SkitModeRuntime {
 				ServerPlayer actor = run.actor();
 				if (!actor.isAlive() || actor.isRemoved() || actor.level() != run.level()
 						|| SkitActors.find(server, entry.getKey()).orElse(null) != actor) {
-					if (runs.remove(entry.getKey(), run)) cleanup(run);
+					if (runs.remove(entry.getKey(), run)) { cleanup(run); result(server, entry.getKey(), "Actor left the action scene"); }
 					continue;
 				}
 				Playback playback = run.playback();
 				if (tick < playback.nextTick()) continue;
 				Playback updated = advancePlayback(server, actor, playback, tick);
 				if (updated == null) {
-					if (runs.remove(entry.getKey(), run)) cleanup(run);
+					if (runs.remove(entry.getKey(), run)) { cleanup(run); result(server, entry.getKey(), "Actions finished"); }
 				} else {
 					runs.replace(entry.getKey(), run, new Run(updated, actor, (ServerLevel) actor.level()));
 				}
 			} catch (RuntimeException exception) {
 				if (runs.remove(entry.getKey(), run)) cleanup(run);
+				result(server, entry.getKey(), "An action failed. Check the server log");
 				LOGGER.warn("Stopped skit playback for {} after an action failed", entry.getKey(), exception);
 			}
 		}
 	}
 
 	public static void release(MinecraftServer server) {
+		DirectorTakeRuntime.stopAll(server);
+		DirectorScriptEditor.release(server);
+		STATUS.remove(server);
 		Map<AgentId, Run> runs = PLAYBACK.remove(server);
 		if (runs != null) runs.values().forEach(SkitModeRuntime::cleanup);
 	}
@@ -215,7 +237,7 @@ public final class SkitModeRuntime {
 			Predicate<String> itemExists) {
 		String dimension = initialDimension;
 		for (SkitStep step : script.steps()) {
-			String target = step.placement().dimension();
+			String target = step.actions().isEmpty() || step.placeBeforeActions() || step.actions().stream().anyMatch(action -> action.type() == SkitAction.Type.MOVE) ? step.placement().dimension() : dimension;
 			if (!dimensionExists.test(target)) {
 				throw new AgentDomainException("SKIT_DIMENSION_NOT_FOUND", "Unknown dimension: " + target);
 			}
@@ -258,7 +280,7 @@ public final class SkitModeRuntime {
 			SkitAction action = step.actions().isEmpty() ? null : step.actions().get(playback.actionIndex());
 			boolean firstTick = !playback.started();
 			if (firstTick) {
-				if (playback.actionIndex() == 0 && (action == null || action.type() != SkitAction.Type.MOVE)) {
+				if (playback.actionIndex() == 0 && (action == null || step.placeBeforeActions() && action.type() != SkitAction.Type.MOVE)) {
 					actor.place(step.placement());
 				}
 				playback = playback.begin(actor.position(), tick);
@@ -288,6 +310,10 @@ public final class SkitModeRuntime {
 	private static void applyAction(ServerPlayer actor, SkitStep step, SkitAction action, SkitPlacement origin,
 			long elapsed, boolean firstTick) {
 		switch (action.type()) {
+			case WALK -> {
+				if (firstTick) OfflineAgentPlayers.actions(actor).setForward(action.forward())
+						.setStrafing(action.strafe()).setSprinting(action.sprint());
+			}
 			case MOVE -> {
 				float progress = Math.min(1.0F, (float) elapsed / Math.max(1, action.durationTicks()));
 				SkitPlacement target = step.placement();
@@ -322,7 +348,7 @@ public final class SkitModeRuntime {
 
 	private static void stopAction(ServerPlayer actor, SkitAction action) {
 		if (action.type() == SkitAction.Type.USE) actor.releaseUsingItem();
-		if (action.type() == SkitAction.Type.JUMP || action.type() == SkitAction.Type.MOVE || action.type() == SkitAction.Type.EMOTE) {
+		if (action.type() == SkitAction.Type.JUMP || action.type() == SkitAction.Type.MOVE || action.type() == SkitAction.Type.WALK || action.type() == SkitAction.Type.EMOTE) {
 			OfflineAgentPlayers.actions(actor).stopAll();
 		}
 	}
@@ -343,7 +369,7 @@ public final class SkitModeRuntime {
 				yaw, from.pitch() + (to.pitch() - from.pitch()) * progress);
 	}
 
-	private static Optional<ServerLevel> findLevel(MinecraftServer server, String dimension) {
+	static Optional<ServerLevel> findLevel(MinecraftServer server, String dimension) {
 		for (ServerLevel level : server.getAllLevels()) {
 			if (level.dimension().identifier().toString().equals(dimension)) return Optional.of(level);
 		}

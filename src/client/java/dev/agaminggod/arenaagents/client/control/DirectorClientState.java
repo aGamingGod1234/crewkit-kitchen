@@ -8,6 +8,8 @@ import java.util.Optional;
 /** Server-confirmed Director state, separate from keybindings and the agent roster. */
 public final class DirectorClientState {
 	private static DirectorSnapshotPayload snapshot;
+	private static final java.util.Map<String, String> DRAFTS = new java.util.HashMap<>();
+	public static java.util.Map<String, String> drafts() { return DRAFTS; }
 	public record ImportCandidate(String agentId, String displayName) { }
 	private static List<ImportCandidate> importCandidates = List.of();
 	private DirectorClientState() { }
@@ -25,5 +27,5 @@ public final class DirectorClientState {
 		importCandidates = next;
 		return changed;
 	}
-	public static void clear() { snapshot = null; importCandidates = List.of(); }
+	public static void clear() { snapshot = null; importCandidates = List.of(); DRAFTS.clear(); }
 }
