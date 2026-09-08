@@ -136,15 +136,15 @@
       <table aria-label="Verification results">
         <thead><tr><th>Check</th><th>Current result</th></tr></thead>
         <tbody>
-          <tr><td>Full Node suite</td><td><strong>1,630 passed.</strong> Three intentional platform skips. Covers tool contracts, runtime behavior, authority, memory and coordinator integration.</td></tr>
-          <tr><td>Java verification</td><td><strong>14,932 core assertions passed.</strong> The full build also passed 385 voice-addon assertions. These check validation and execution; they are not counts of completed gameplay tasks.</td></tr>
+          <tr><td>Full Node suite</td><td><strong>1,645 passed.</strong> Three intentional platform skips. Covers tool contracts, runtime behavior, authority, memory and coordinator integration.</td></tr>
+          <tr><td>Java verification</td><td><strong>15,291 core assertions passed.</strong> The full build also passed 385 voice-addon assertions. These check validation and execution; they are not counts of completed gameplay tasks.</td></tr>
           <tr id="live-result"><td>Live mechanics probe</td><td><strong>9 of 9 passed on Minecraft 26.1.2.</strong> Fresh observations, recipe and mechanics queries, control sequences, chest cursor transfers, consuming crafting clicks, swimming, ladder climbing and boat movement. These used operator-built fixtures and the production bridge without a model.</td></tr>
-          <tr><td>Natural-world task, Codex</td><td><strong>Passed in 68 seconds within a 180-second budget.</strong> Sol with low reasoning and priority service collected a log in a fresh survival world. Nine model-authored actions, zero vision, and independent inventory plus lifecycle checks.</td></tr>
-          <tr id="kimi-result"><td>Natural-world task, Kimi</td><td><strong>Timed out before gameplay.</strong> K3 with low reasoning and priority service returned no goal proposal or player action within 240 seconds. Its ACP goal-translation prompt exceeded 120 seconds; the underlying provider cause is unknown.</td></tr>
+          <tr><td>Initial natural-world task, Codex</td><td><strong>Passed in 68 seconds within a 180-second budget.</strong> Sol with low reasoning and priority service collected a log in a fresh survival world. Nine model-authored actions, zero vision, and independent inventory plus lifecycle checks.</td></tr>
+          <tr id="kimi-result"><td>Initial natural-world task, Kimi</td><td><strong>Timed out before gameplay.</strong> K3 with low reasoning and priority service returned no goal proposal or player action within 240 seconds. Its ACP goal-translation prompt exceeded 120 seconds; the underlying provider cause is unknown.</td></tr>
           <tr><td>Full-game completion</td><td><strong>Not proved.</strong> A short gathering task does not establish full-game completion or a success rate across seeds and agent settings.</td></tr>
         </tbody>
       </table>
-      <p class="muted">Natural runs start with an empty inventory. Setup loads the saved spawn chunk and releases that ticket after joining; it supplies no items or terrain edits. Earlier setup, translation and provider failures are retained. Registered settings are verified; provider-effective settings remain unverified.</p>
+      <p class="muted">Natural results were recorded before integration with newer main changes. Automated and mechanics checks were repeated after integration. Natural runs start with an empty inventory. Setup loads the saved spawn chunk and releases that ticket after joining; it supplies no items or terrain edits. Earlier setup, translation and provider failures are retained. Registered settings are verified; provider-effective settings remain unverified.</p>
       <div class="decision"><p>There is no guarantee of a win on any seed or any agent setting. Available tools, game rules, provider availability, model decisions and run budgets all affect the outcome. Complex overlapping item requirements can still need clarification.</p></div>
     </div>
   </section>

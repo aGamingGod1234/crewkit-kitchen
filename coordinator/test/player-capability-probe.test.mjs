@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { fixtureAction, fixtureSetupCommands, inputFrame, menuClickArguments, parseProbeArguments, probeAuditEntry, probeFailureMessage } from '../src/player-capability-probe.mjs';
+import { fixtureAction, fixtureSetupCommands, inputFrame, menuClickArguments, observedHandArguments, parseProbeArguments, probeAuditEntry, probeFailureMessage } from '../src/player-capability-probe.mjs';
 import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
 
 const args = ['--rcon-port', '25579', '--bridge-port', '25580', '--rcon-password-file', 'private/rcon.txt', '--bridge-secret-file', 'private/bridge.txt', '--run-directory', 'run'];
@@ -42,6 +42,20 @@ test('menu fixture clicks use exact inspected container, revision and target sta
 	assert.equal(click.stateId, 7);
 	assert.doesNotThrow(() => fixtureAction(record, { eventSequence: 9 }, 2, 'menu_click', click));
 	assert.throws(() => menuClickArguments(page, 99), /INSPECTION_REQUIRED/);
+});
+
+test('interaction fixtures bind expected hand items to the same fresh observation as action provenance', () => {
+	const beforeOperatorMove = { ready: true, eventSequence: 91, interaction: { mainHandItemId: 'minecraft:air', offHandItemId: 'minecraft:air' } };
+	const afterPickup = { ...beforeOperatorMove, eventSequence: 92, interaction: { mainHandItemId: 'minecraft:leaf_litter', offHandItemId: 'minecraft:stick' } };
+	const args = (fresh) => ({ targetId: '1d934a02-f281-4d5d-a1f5-d36ccf2136f8', ...observedHandArguments(fresh) });
+	const payload = fixtureAction(record, afterPickup, 13, 'interact_entity', args);
+	assert.equal(payload.arguments.expectedItemId, 'minecraft:leaf_litter');
+	assert.equal(payload.arguments.hand, 'main');
+	assert.equal(payload.provenance.eventSequence, 92);
+	assert.equal(fixtureAction(record, beforeOperatorMove, 14, 'interact_entity', args).arguments.expectedItemId, 'minecraft:air');
+	assert.deepEqual(observedHandArguments(afterPickup, 'off'), { hand: 'off', expectedItemId: 'minecraft:stick' });
+	assert.throws(() => observedHandArguments({ ready: true, inventory: { selectedItem: 'minecraft:air' } }), /HAND_OBSERVATION_REQUIRED/);
+	assert.throws(() => observedHandArguments({ ...afterPickup, ready: false }), /HAND_OBSERVATION_REQUIRED/);
 });
 
 test('recipe, mechanics and vehicle fixtures use production query and action contracts', () => {

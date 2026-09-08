@@ -50,13 +50,20 @@ export function inputFrame(overrides = {}) {
 export function fixtureAction(record, observation, ordinal, actionType, args) {
 	const traceId = `mechanics-fixture-${ordinal}`;
 	return validateProtocolV2Payload('action_command', {
-		traceId, actionId: traceId, goalRevision: record.goalRevision, actionType, arguments: args,
+		traceId, actionId: traceId, goalRevision: record.goalRevision, actionType, arguments: typeof args === 'function' ? args(observation) : args,
 		provenance: {
 			provider: record.provider ?? PROFILE.provider, model: record.model, reasoningEffort: record.reasoningEffort,
 			serviceTier: record.serviceTier ?? PROFILE.serviceTier, traceId, programId: 'provider-free-mechanics-fixture',
 			programVersion: 1, sourceStepId: `fixture-step-${ordinal}`, eventSequence: observation.eventSequence,
 		},
 	});
+}
+
+export function observedHandArguments(observation, hand = 'main') {
+	if (!['main', 'off'].includes(hand)) throw new Error('INVALID_FIXTURE_HAND');
+	const expectedItemId = observation?.interaction?.[hand === 'main' ? 'mainHandItemId' : 'offHandItemId'];
+	if (observation?.ready !== true || typeof expectedItemId !== 'string' || !/^[a-z0-9_.-]+:[a-z0-9_./-]+$/.test(expectedItemId)) throw new Error('FRESH_HAND_OBSERVATION_REQUIRED');
+	return { hand, expectedItemId };
 }
 
 export function menuClickArguments(page, slotIndex, clickType = 'PICKUP', button = 0) {
@@ -170,13 +177,16 @@ export async function runPlayerCapabilityProbe(config) {
 		return payload.result;
 	};
 	const action = async (actionType, args) => {
-		await observe();
-		const payload = fixtureAction(record, observation, ++ordinal, actionType, args);
+		const baseline = await observe();
+		const payload = fixtureAction(record, baseline, ++ordinal, actionType, args);
 		const waiting = inbox.wait('action_result', (event) => event.agentId === record.agentId && event.payload.actionId === payload.actionId && TERMINAL.has(event.payload.state));
 		await bridge.send('action_command', record.agentId, payload);
 		const result = (await waiting).payload;
 		await bridge.send('action_result_ack', record.agentId, { goalRevision: record.goalRevision, actionId: payload.actionId });
-		report.actions.push({ actionId: result.actionId, actionType, state: result.state, reasonCode: result.reasonCode, elapsedMs: result.elapsedMs, beforeEventSequence: payload.provenance.eventSequence });
+		report.actions.push({ actionId: result.actionId, actionType, state: result.state, reasonCode: result.reasonCode, elapsedMs: result.elapsedMs, beforeEventSequence: payload.provenance.eventSequence,
+			...(['interact_block', 'interact_entity'].includes(actionType) ? { hand: payload.arguments.hand, expectedItemId: payload.arguments.expectedItemId, observedItemId: observedHandArguments(baseline, payload.arguments.hand).expectedItemId } : {}),
+			...(result.state !== 'SUCCEEDED' ? { message: probeFailureMessage(result, secrets) } : {}),
+		});
 		if (result.state !== 'SUCCEEDED') throw new Error(`ACTION_${actionType}_${result.reasonCode}`);
 		return result;
 	};
@@ -255,7 +265,7 @@ export async function runPlayerCapabilityProbe(config) {
 		});
 		await check('storage menu pickup preserves cursor then deposits exact stack', async () => {
 			await command(`tp ${player} 0.5 64 0.5 -90 0`);
-			await action('interact_block', { x: 2, y: 64, z: 0, face: 'west', hand: 'main', expectedItemId: 'minecraft:air' });
+			await action('interact_block', (fresh) => ({ x: 2, y: 64, z: 0, face: 'west', ...observedHandArguments(fresh) }));
 			const before = await inspect('menu');
 			await action('menu_click', menuClickArguments(before, 0));
 			const carried = await inspect('menu');
@@ -302,10 +312,11 @@ export async function runPlayerCapabilityProbe(config) {
 			await command(`clear ${player}`);
 			await command('summon minecraft:oak_boat 29.5 65 5.5 {Tags:["capability_probe_boat"],Rotation:[-90.0f,0.0f]}');
 			await command(`tp ${player} 27.5 65 5.5 -90 0`);
+			await action('control', inputFrame({ ticks: 2 }));
 			const entities = await inspect('entities');
 			const boat = entities.entries?.find((entry) => entry.type === 'minecraft:oak_boat');
 			assertFact(typeof boat?.uuid === 'string', 'BOAT_FIXTURE_NOT_VISIBLE');
-			await action('interact_entity', { targetId: boat.uuid, hand: 'main', expectedItemId: 'minecraft:air' });
+			await action('interact_entity', (fresh) => ({ targetId: boat.uuid, ...observedHandArguments(fresh) }));
 			await action('control', inputFrame({ ticks: 5 }));
 			const before = await observe();
 			assertFact(before.player.passenger === true && before.player.vehicle?.uuid === boat.uuid, 'BOAT_MOUNT_NOT_CONFIRMED');
