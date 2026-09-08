@@ -18,7 +18,7 @@ public record SkitStep(int delayTicks, SkitPlacement placement, List<SkitAction>
 		Objects.requireNonNull(placement, "placement must not be null");
 		Objects.requireNonNull(actions, "actions must not be null");
 		if (actions.size() > 64) throw new IllegalArgumentException("A skit step may contain at most 64 actions");
-		actions = List.copyOf(actions);
 		if (actions.stream().anyMatch(Objects::isNull)) throw new IllegalArgumentException("actions must not contain null");
+		actions = List.copyOf(actions);
 	}
 }

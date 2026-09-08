@@ -58,6 +58,16 @@ async function withLavaAttentionDuringActiveWait(callback) {
 	const errors = [];
 	const virtualBridgeFactory = (options) => {
 		const bridge = new VirtualMinecraftBridge(options);
+		const waiting = new Set();
+		const tick = options.world.tick;
+		// Start hazard time after every initial action is ready, independent of provider timer jitter.
+		options.world.tick = function () {
+			if (waiting.size === options.agentRecords.length) return tick.call(this);
+		};
+		const onAccepted = (entry) => {
+			if (entry?.envelope?.payload?.actionType === 'wait') waiting.add(entry.envelope.agentId);
+		};
+		bridge.on('accepted', onAccepted);
 		const triggered = new Set();
 		const onProgress = (entry) => {
 			if (entry?.envelope?.payload?.actionType !== 'wait') return;
@@ -69,6 +79,8 @@ async function withLavaAttentionDuringActiveWait(callback) {
 		bridge.on('progress', onProgress);
 		const stop = bridge.stop.bind(bridge);
 		bridge.stop = () => {
+			options.world.tick = tick;
+			bridge.off('accepted', onAccepted);
 			bridge.off('progress', onProgress);
 			return stop();
 		};
@@ -141,14 +153,25 @@ test('ordinary delayed stone records remain single-turn and replay without promp
 
 test('records a cleanup-aborted continuation after hazard attention during an active action', async () => {
 	const delayedMatrix = activeActionHazardMatrix();
+	let initialDelays = 0;
+	const jitteredCaptureTimer = {
+		setTimeout(callback, milliseconds) {
+			// Reproduce one provider callback missing two world ticks under CI load.
+			const late = milliseconds === 10 && ++initialDelays === 3;
+			return setTimeout(callback, milliseconds + (late ? 100 : 0));
+		},
+		clearTimeout,
+	};
 	await withLavaAttentionDuringActiveWait(async (virtualBridgeFactory) => {
 		const fixture = await generateReplayRecordings({
 			matrix: delayedMatrix,
 			scenarioResolver: () => activeActionHazardScenario(),
 			delayMs: ({ turnIndex }) => turnIndex === 0 ? 10 : 500,
+			delayTimer: jitteredCaptureTimer,
 			virtualBridgeFactory,
 		});
 		assert.ok(fixture.recordings.every((record) => record.decisions.length >= 2));
+		assert.equal(initialDelays, 4);
 
 		const replay = await runLatencyMatrix({
 			matrix: delayedMatrix,

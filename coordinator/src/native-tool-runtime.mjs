@@ -70,7 +70,12 @@ export class NativeToolRuntime {
 		this.#bridge = bridge;
 		this.#registry = registry;
 		this.#onFinish = onFinish;
-		this.#trace = trace;
+		this.#trace = (event, fields) => {
+			try {
+				const completion = trace(event, fields);
+				if (completion !== undefined) Promise.resolve(completion).catch(() => {});
+			} catch { /* diagnostics cannot interrupt gameplay */ }
+		};
 		this.#decorateObservation = decorateObservation;
 		this.#requestObservation = requestObservation;
 		this.#inspectObservation = inspectObservation;
@@ -128,7 +133,7 @@ export class NativeToolRuntime {
 		// methods still clone at their boundaries, so sharing here does not expose
 		// mutable coordinator state while avoiding a duplicate deep copy per update.
 		const storedObservation = structuredClone(raw);
-		if (hasDurableObservationFacts(raw) && raw.death == null && raw.status !== 'PLAYER_DEAD' && raw.player?.dead !== true) {
+		if (hasDurableObservationFacts(raw) && raw.ready !== false && raw.death == null && raw.status !== 'PLAYER_DEAD' && raw.player?.dead !== true) {
 			this.#lastLive.set(record.agentId, {
 				observation: storedObservation,
 				eventSequence: storedSequence,
@@ -513,6 +518,19 @@ export class NativeToolRuntime {
 		result.catch(() => {});
 		const active = { actionId, goalRevision: record.goalRevision, actionType: tool.actionType, arguments: structuredClone(tool.arguments), worldId: this.#worldId(record), result, resolve: resolveAction, reject: rejectAction, dispatched: false, ...(programCommand === null ? {} : { engineActionId: programCommand.actionId }) };
 		this.#actions.set(record.agentId, active);
+		const failPublication = async (error) => {
+			if (this.#actions.get(record.agentId) === active) this.#actions.delete(record.agentId);
+			const completed = this.#receipts.get(record.agentId)?.findLast((entry) => entry.actionId === actionId && entry.source === 'server_action_result');
+			if (completed !== undefined) return;
+			const reasonCode = active.dispatched ? 'DISPATCH_RESULT_UNKNOWN' : 'DISPATCH_NOT_SENT';
+			this.#retainReceipt(record, active, { state: 'UNKNOWN', reasonCode, source: 'coordinator_uncertain', worldId: active.worldId });
+			try { await this.#journal('recordUnknown', record.agentId, active, { reasonCode }); }
+			catch (journalError) { this.#trace('native_receipt_persistence_failed', { agentId: record.agentId, actionId, reasonCode: journalError?.code ?? 'MEMORY_WRITE_FAILED' }); }
+			Object.assign(error, { actionId, goalRevision: record.goalRevision });
+			active.publicationError = error;
+			rejectAction(error);
+		};
+		let publication = Promise.resolve();
 		this.#trace('native_tool_dispatch_started', { agentId: record.agentId, goalRevision: record.goalRevision, traceId, actionId, actionType: payload.actionType });
 		try {
 			if (typeof this.#notebook?.recordDispatch === 'function' && active.worldId !== null) await this.#journal('recordDispatch', record.agentId, active, { arguments: active.arguments });
@@ -522,19 +540,15 @@ export class NativeToolRuntime {
 				throw codedError('STALE_PLAN', 'Native action became stale before bridge send');
 			}
 			active.dispatched = true;
-			await this.#bridge.send('action_command', record.agentId, payload);
-			this.#trace('native_tool_command_sent', { agentId: record.agentId, goalRevision: record.goalRevision, traceId, actionId, actionType: payload.actionType });
+			publication = Promise.resolve(this.#bridge.send('action_command', record.agentId, payload)).then(() => {
+				this.#trace('native_tool_command_sent', { agentId: record.agentId, goalRevision: record.goalRevision, traceId, actionId, actionType: payload.actionType });
+			}, failPublication);
 		} catch (error) {
-			if (this.#actions.get(record.agentId) === active) this.#actions.delete(record.agentId);
-			const completed = this.#receipts.get(record.agentId)?.findLast((entry) => entry.actionId === actionId && entry.source === 'server_action_result');
-			if (completed !== undefined) return waitForCompletion ? result : structuredClone(completed);
-			const reasonCode = active.dispatched ? 'DISPATCH_RESULT_UNKNOWN' : 'DISPATCH_NOT_SENT';
-			this.#retainReceipt(record, active, { state: 'UNKNOWN', reasonCode, source: 'coordinator_uncertain', worldId: active.worldId });
-			try { await this.#journal('recordUnknown', record.agentId, active, { reasonCode }); }
-			catch (journalError) { this.#trace('native_receipt_persistence_failed', { agentId: record.agentId, actionId, reasonCode: journalError?.code ?? 'MEMORY_WRITE_FAILED' }); }
-			Object.assign(error, { actionId, goalRevision: record.goalRevision });
-			rejectAction(error);
-			if (!waitForCompletion) throw error;
+			await failPublication(error);
+		}
+		if (!waitForCompletion) {
+			await Promise.race([publication, result]);
+			if (active.publicationError !== undefined) throw active.publicationError;
 		}
 		return waitForCompletion ? result : this.#actionStatus(record, actionId);
 	}
@@ -702,23 +716,27 @@ export class NativeToolRuntime {
 		let resolveCompletion;
 		let rejectCompletion;
 		const completion = new Promise((resolve, reject) => { resolveCompletion = resolve; rejectCompletion = reject; });
-		this.#completions.set(record.agentId, {
+		const pending = {
 			goalRevision: record.goalRevision,
 			traceId,
 			goalFingerprint,
 			resolve: resolveCompletion,
 			reject: rejectCompletion,
-		});
+		};
+		this.#completions.set(record.agentId, pending);
+		const failPublication = (error) => {
+			if (this.#completions.get(record.agentId) === pending) this.#completions.delete(record.agentId);
+			rejectCompletion(error);
+		};
 		try {
-			await this.#bridge.send('goal_completed', record.agentId, {
+			Promise.resolve(this.#bridge.send('goal_completed', record.agentId, {
 				goalRevision: record.goalRevision,
 				goalFingerprint,
 				traceId,
 				profile,
-			});
+			})).catch(failPublication);
 		} catch (error) {
-			this.#completions.delete(record.agentId);
-			rejectCompletion(error);
+			failPublication(error);
 		}
 		const result = await completion;
 		if (result.verified) await this.#onFinish({ record, request, result, lifecycleGeneration });

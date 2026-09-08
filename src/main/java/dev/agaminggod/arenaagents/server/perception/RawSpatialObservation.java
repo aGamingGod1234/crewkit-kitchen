@@ -12,7 +12,7 @@ public record RawSpatialObservation(List<BlockObservationOrdering.Candidate> blo
 		containers = List.copyOf(Objects.requireNonNull(containers, "containers must not be null"));
 	}
 
-	public record Key(AgentId agentId, String dimension, int x, int y, int z) {
+	public record Key(AgentId agentId, String dimension, int x, int y, int z, long mutationRevision) {
 		public Key {
 			Objects.requireNonNull(agentId, "agentId must not be null");
 			if (Objects.requireNonNull(dimension, "dimension must not be null").isBlank()) {

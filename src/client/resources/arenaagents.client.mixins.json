@@ -5,6 +5,7 @@
   "client": [
     "AbstractClientPlayerMixin",
     "AvatarRendererMixin",
+    "CameraEyeHeightAccessor",
     "FontManagerAccessor",
     "MinecraftFontManagerAccessor"
   ],

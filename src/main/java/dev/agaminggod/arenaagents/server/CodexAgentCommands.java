@@ -404,8 +404,7 @@ public final class CodexAgentCommands {
 				default -> throw new AgentDomainException("INVALID_PROVIDER", "Unsupported skit provider: " + provider);
 			});
 			String managerProvider = PROVIDER_CLAUDE.equals(provider) ? PROVIDER_GEMINI : provider;
-			String reasoning = PROVIDER_CODEX.equals(provider) ? DEFAULT_REASONING
-					: PROVIDER_CLAUDE.equals(provider) ? "thinking" : "high";
+			String reasoning = AgentControlCatalog.defaultReasoning(managerProvider, model);
 			AgentRecord record = manager(context).summon(
 					context.getSource().getLevel(), position, managerProvider, model, reasoning,
 					PROVIDER_CODEX.equals(provider) ? DEFAULT_CODEX_SERVICE_TIER : "priority",

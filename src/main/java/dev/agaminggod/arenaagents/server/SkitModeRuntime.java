@@ -9,11 +9,10 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
-import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Predicate;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.Identifier;
-import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
@@ -21,10 +20,13 @@ import net.minecraft.world.entity.Relative;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /** Server-authoritative placement and timeline playback. It never participates in normal agent control. */
 public final class SkitModeRuntime {
-	private static final Map<MinecraftServer, Map<AgentId, Playback>> PLAYBACK = new ConcurrentHashMap<>();
+	private static final Logger LOGGER = LoggerFactory.getLogger(SkitModeRuntime.class);
+	private static final Map<MinecraftServer, Map<AgentId, Run>> PLAYBACK = new ConcurrentHashMap<>();
 
 	private SkitModeRuntime() {
 	}
@@ -36,7 +38,7 @@ public final class SkitModeRuntime {
 	public static boolean setEnabled(MinecraftServer server, boolean enabled) {
 		SkitModeSavedData data = SkitModeSavedData.get(server);
 		data.setEnabled(enabled);
-		if (!enabled) PLAYBACK.remove(server);
+		if (!enabled) release(server);
 		return data.enabled();
 	}
 
@@ -51,7 +53,10 @@ public final class SkitModeRuntime {
 		AgentRecord record = manager.resolve(selector);
 		SkitPlacement placement = new SkitPlacement(level.dimension().identifier().toString(), x, y, z, yaw, pitch);
 		manager.findAgentPlayer(record.agentId()).ifPresentOrElse(
-				player -> teleport(player, level, placement),
+				player -> {
+					stop(manager.server(), record.agentId());
+					teleport(player, level, placement);
+				},
 				() -> { throw new AgentDomainException("AGENT_NOT_PRESENT", "Agent has not joined the world yet"); }
 		);
 		SkitModeSavedData.get(manager.server()).putPlacement(record.agentId().toString(), placement);
@@ -119,8 +124,14 @@ public final class SkitModeRuntime {
 			throw new AgentDomainException("SKIT_AGENT_BUSY", "Skit playback requires an idle agent with no queued goals");
 		}
 		AgentId agentId = record.agentId();
+		ServerPlayer actor = manager.findAgentPlayer(agentId).filter(player -> player.isAlive() && !player.isRemoved())
+				.orElseThrow(() -> new AgentDomainException("AGENT_NOT_PRESENT", "Agent has not joined the world yet"));
+		validateTimeline(script, actor.level().dimension().identifier().toString(),
+				dimension -> findLevel(manager.server(), dimension).isPresent(),
+				item -> BuiltInRegistries.ITEM.containsKey(Identifier.parse(item)));
+		stop(manager.server(), agentId);
 		PLAYBACK.computeIfAbsent(manager.server(), ignored -> new ConcurrentHashMap<>())
-				.put(agentId, Playback.waiting(script.steps(), manager.server().getTickCount()));
+				.put(agentId, new Run(Playback.waiting(script.steps(), manager.server().getTickCount()), actor, (ServerLevel) actor.level()));
 		return script;
 	}
 
@@ -143,42 +154,87 @@ public final class SkitModeRuntime {
 	}
 
 	public static void stop(MinecraftServer server, String selector) {
-		if (!enabled(server)) return;
 		stop(server, CodexAgentManager.get(server).resolve(selector).agentId());
 	}
 
 	static void stop(MinecraftServer server, AgentId agentId) {
 		if (server == null) return;
-		Optional.ofNullable(PLAYBACK.get(server)).ifPresent(runs -> runs.remove(agentId));
+		Map<AgentId, Run> runs = PLAYBACK.get(server);
+		if (runs != null) cleanup(runs.remove(agentId));
 	}
 
 	public static void tick(MinecraftServer server) {
-		if (!enabled(server)) { PLAYBACK.remove(server); return; }
-		Map<AgentId, Playback> runs = PLAYBACK.get(server);
+		if (!enabled(server)) { release(server); return; }
+		Map<AgentId, Run> runs = PLAYBACK.get(server);
 		if (runs == null || runs.isEmpty()) return;
 		long tick = server.getTickCount();
 		CodexAgentManager manager = CodexAgentManager.get(server);
 		for (var entry : runs.entrySet()) {
-			Playback playback = entry.getValue();
-			if (tick < playback.nextTick()) continue;
-			if (playback.index() >= playback.steps().size()) { runs.remove(entry.getKey(), playback); continue; }
-			Optional<ServerPlayer> player;
-			try { player = manager.findAgentPlayer(entry.getKey()); }
-			catch (RuntimeException ignored) {
-				runs.remove(entry.getKey(), playback);
-				continue;
+			Run run = entry.getValue();
+			try {
+				ServerPlayer actor = run.actor();
+				if (!actor.isAlive() || actor.isRemoved() || actor.level() != run.level()
+						|| manager.findAgentPlayer(entry.getKey()).orElse(null) != actor) {
+					if (runs.remove(entry.getKey(), run)) cleanup(run);
+					continue;
+				}
+				Playback playback = run.playback();
+				if (tick < playback.nextTick()) continue;
+				Playback updated = advancePlayback(server, actor, playback, tick);
+				if (updated == null) {
+					if (runs.remove(entry.getKey(), run)) cleanup(run);
+				} else {
+					runs.replace(entry.getKey(), run, new Run(updated, actor, (ServerLevel) actor.level()));
+				}
+			} catch (RuntimeException exception) {
+				if (runs.remove(entry.getKey(), run)) cleanup(run);
+				LOGGER.warn("Stopped skit playback for {} after an action failed", entry.getKey(), exception);
 			}
-			if (player.isEmpty()) continue;
-			ServerPlayer actor = player.orElseThrow();
-			SkitStep step = playback.steps().get(playback.index());
-			Playback updated = advancePlayback(server, actor, playback, step, tick);
-			if (updated == null) runs.remove(entry.getKey(), playback);
-			else runs.replace(entry.getKey(), playback, updated);
 		}
 	}
 
 	public static void release(MinecraftServer server) {
-		PLAYBACK.remove(server);
+		Map<AgentId, Run> runs = PLAYBACK.remove(server);
+		if (runs != null) runs.values().forEach(SkitModeRuntime::cleanup);
+	}
+
+	private static void cleanup(Run run) {
+		if (run == null) return;
+		cleanup(() -> OfflineAgentPlayers.actions(run.actor()).stopAll(), run.actor()::stopUsingItem);
+	}
+
+	static void cleanup(Runnable releaseInputs, Runnable stopUsingItem) {
+		try {
+			releaseInputs.run();
+		} catch (RuntimeException exception) {
+			LOGGER.warn("Could not clear skit actor input", exception);
+		}
+		try {
+			stopUsingItem.run();
+		} catch (RuntimeException exception) {
+			LOGGER.warn("Could not stop skit actor item use", exception);
+		}
+	}
+
+	static void validateTimeline(SkitScript script, String initialDimension, Predicate<String> dimensionExists,
+			Predicate<String> itemExists) {
+		String dimension = initialDimension;
+		for (SkitStep step : script.steps()) {
+			String target = step.placement().dimension();
+			if (!dimensionExists.test(target)) {
+				throw new AgentDomainException("SKIT_DIMENSION_NOT_FOUND", "Unknown dimension: " + target);
+			}
+			if (!step.actions().isEmpty() && step.actions().getFirst().type() == SkitAction.Type.MOVE
+					&& !dimension.equals(target)) {
+				throw new AgentDomainException("SKIT_MOVE_DIMENSION", "Place the actor in the target dimension before moving it");
+			}
+			for (SkitAction action : step.actions()) {
+				if (action.type() == SkitAction.Type.EQUIP && !itemExists.test(action.itemId())) {
+					throw new AgentDomainException("SKIT_ITEM_NOT_FOUND", "Unknown item: " + action.itemId());
+				}
+			}
+			dimension = target;
+		}
 	}
 
 	private static void teleport(ServerPlayer player, ServerLevel level, SkitPlacement placement) {
@@ -186,51 +242,65 @@ public final class SkitModeRuntime {
 		player.setYHeadRot(placement.yaw());
 	}
 
-	private static Playback advancePlayback(MinecraftServer server, ServerPlayer actor, Playback playback, SkitStep step, long tick) {
-		if (!playback.started()) {
-			SkitAction first = step.actions().isEmpty() ? null : step.actions().getFirst();
-			if (first == null || first.type() != SkitAction.Type.MOVE) {
-				findLevel(server, step.placement().dimension()).ifPresent(level -> teleport(actor, level, step.placement()));
+	private static Playback advancePlayback(MinecraftServer server, ServerPlayer actor, Playback playback, long tick) {
+		return advancePlayback(playback, tick, new Performer() {
+			@Override public SkitPlacement position() { return currentPlacement(actor); }
+			@Override public void place(SkitPlacement placement) {
+				ServerLevel level = findLevel(server, placement.dimension())
+						.orElseThrow(() -> new AgentDomainException("SKIT_DIMENSION_NOT_FOUND", "Skit dimension is no longer available"));
+				teleport(actor, level, placement);
 			}
-			SkitPlacement start = currentPlacement(actor);
-			long end = tick + Math.max(1, first == null ? 1 : first.durationTicks());
-			Playback started = playback.begin(start, end);
-			if (first == null) return finishStep(server, started, tick);
-			applyAction(actor, step, first, start, 0, tick, true);
-			return started;
-		}
-
-		SkitAction action = step.actions().get(playback.actionIndex());
-		long elapsed = tick - playback.actionStartTick();
-		applyAction(actor, step, action, playback.actionOrigin(), elapsed, tick, false);
-		if (tick + 1 < playback.actionEndTick()) return playback;
-		stopAction(actor, action);
-		int nextAction = playback.actionIndex() + 1;
-		if (nextAction < step.actions().size()) {
-			SkitAction next = step.actions().get(nextAction);
-			long end = tick + Math.max(1, next.durationTicks());
-			Playback advanced = playback.nextAction(nextAction, tick + 1, end, currentPlacement(actor));
-			applyAction(actor, step, next, advanced.actionOrigin(), 0, tick, true);
-			return advanced;
-		}
-		return finishStep(server, playback, tick);
+			@Override public void perform(SkitStep step, SkitAction action, SkitPlacement origin, long elapsed, boolean firstTick) {
+				applyAction(actor, step, action, origin, elapsed, firstTick);
+			}
+			@Override public void stop(SkitAction action) { stopAction(actor, action); }
+		});
 	}
 
-	private static Playback finishStep(MinecraftServer server, Playback playback, long tick) {
+	static Playback advancePlayback(Playback playback, long tick, Performer actor) {
+		while (playback != null && tick >= playback.nextTick()) {
+			SkitStep step = playback.steps().get(playback.index());
+			SkitAction action = step.actions().isEmpty() ? null : step.actions().get(playback.actionIndex());
+			boolean firstTick = !playback.started();
+			if (firstTick) {
+				if (playback.actionIndex() == 0 && (action == null || action.type() != SkitAction.Type.MOVE)) {
+					actor.place(step.placement());
+				}
+				playback = playback.begin(actor.position(), tick);
+			}
+			if (action == null) {
+				playback = finishStep(playback, tick);
+				continue;
+			}
+			long elapsed = tick - playback.actionStartTick();
+			actor.perform(step, action, playback.actionOrigin(), elapsed, firstTick);
+			if (!playback.actionComplete(tick)) return playback;
+			actor.stop(action);
+			int nextAction = playback.actionIndex() + 1;
+			playback = nextAction < step.actions().size()
+					? playback.nextAction(nextAction, tick) : finishStep(playback, tick);
+		}
+		return playback;
+	}
+
+	static Playback finishStep(Playback playback, long tick) {
 		int next = playback.index() + 1;
 		if (next >= playback.steps().size()) return null;
 		SkitStep nextStep = playback.steps().get(next);
-		return new Playback(playback.steps(), next, tick + Math.max(0, nextStep.delayTicks()), 0, 0, 0, false, null);
+		return new Playback(playback.steps(), next, tick + nextStep.delayTicks(), 0, 0, 0, false, null);
 	}
 
 	private static void applyAction(ServerPlayer actor, SkitStep step, SkitAction action, SkitPlacement origin,
-			long elapsed, long tick, boolean firstTick) {
+			long elapsed, boolean firstTick) {
 		switch (action.type()) {
 			case MOVE -> {
-				float progress = Math.min(1.0F, (elapsed + 1.0F) / Math.max(1, action.durationTicks()));
+				float progress = Math.min(1.0F, (float) elapsed / Math.max(1, action.durationTicks()));
 				SkitPlacement target = step.placement();
 				SkitPlacement interpolated = interpolate(origin, target, progress);
-				findLevel(actor.level().getServer(), interpolated.dimension()).ifPresent(level -> teleport(actor, level, interpolated));
+				if (!actor.level().dimension().identifier().toString().equals(interpolated.dimension())) {
+					throw new AgentDomainException("SKIT_MOVE_DIMENSION", "Actor changed dimension during movement");
+				}
+				teleport(actor, (ServerLevel) actor.level(), interpolated);
 			}
 			case WAIT -> { }
 			case JUMP -> {
@@ -256,6 +326,7 @@ public final class SkitModeRuntime {
 	}
 
 	private static void stopAction(ServerPlayer actor, SkitAction action) {
+		if (action.type() == SkitAction.Type.USE) actor.releaseUsingItem();
 		if (action.type() == SkitAction.Type.JUMP || action.type() == SkitAction.Type.MOVE || action.type() == SkitAction.Type.EMOTE) {
 			OfflineAgentPlayers.actions(actor).stopAll();
 		}
@@ -265,8 +336,11 @@ public final class SkitModeRuntime {
 		return new SkitPlacement(player.level().dimension().identifier().toString(), player.getX(), player.getY(), player.getZ(), player.getYRot(), player.getXRot());
 	}
 
-	private static SkitPlacement interpolate(SkitPlacement from, SkitPlacement to, float progress) {
-		float yaw = from.yaw() + (float) Math.toDegrees(Math.atan2(Math.sin(Math.toRadians(to.yaw() - from.yaw())), Math.cos(Math.toRadians(to.yaw() - from.yaw())))) * progress;
+	static SkitPlacement interpolate(SkitPlacement from, SkitPlacement to, float progress) {
+		if (!from.dimension().equals(to.dimension())) throw new IllegalArgumentException("Cannot interpolate between dimensions");
+		if (!Float.isFinite(progress) || progress < 0.0F || progress > 1.0F) throw new IllegalArgumentException("progress must be between 0 and 1");
+		if (progress == 1.0F) return to;
+		float yaw = from.yaw() + (float) Math.IEEEremainder((double) to.yaw() - from.yaw(), 360.0D) * progress;
 		return new SkitPlacement(to.dimension(),
 				from.x() + (to.x() - from.x()) * progress,
 				from.y() + (to.y() - from.y()) * progress,
@@ -281,20 +355,36 @@ public final class SkitModeRuntime {
 		return Optional.empty();
 	}
 
-	private record Playback(List<SkitStep> steps, int index, long nextTick, int actionIndex,
-			long actionStartTick, long actionEndTick, boolean started, SkitPlacement actionOrigin) {
-		private Playback { steps = List.copyOf(steps); }
+	private record Run(Playback playback, ServerPlayer actor, ServerLevel level) {
+	}
 
-		private static Playback waiting(List<SkitStep> steps, long now) {
+	interface Performer {
+		SkitPlacement position();
+		void place(SkitPlacement placement);
+		void perform(SkitStep step, SkitAction action, SkitPlacement origin, long elapsed, boolean firstTick);
+		void stop(SkitAction action);
+	}
+
+	record Playback(List<SkitStep> steps, int index, long nextTick, int actionIndex,
+			long actionStartTick, long actionEndTick, boolean started, SkitPlacement actionOrigin) {
+		Playback { steps = List.copyOf(steps); }
+
+		static Playback waiting(List<SkitStep> steps, long now) {
 			return new Playback(steps, 0, now + steps.getFirst().delayTicks(), 0, 0, 0, false, null);
 		}
 
-		private Playback begin(SkitPlacement origin, long endTick) {
-			return new Playback(steps, index, nextTick, 0, nextTick, endTick, true, origin);
+		Playback begin(SkitPlacement origin, long tick) {
+			List<SkitAction> actions = steps.get(index).actions();
+			int duration = actions.isEmpty() ? 1 : Math.max(1, actions.get(actionIndex).durationTicks());
+			return new Playback(steps, index, tick, actionIndex, tick, tick + duration, true, origin);
 		}
 
-		private Playback nextAction(int nextIndex, long startTick, long endTick, SkitPlacement origin) {
-			return new Playback(steps, index, startTick, nextIndex, startTick, endTick, true, origin);
+		boolean actionComplete(long tick) {
+			return started && tick >= actionEndTick;
+		}
+
+		Playback nextAction(int nextIndex, long startTick) {
+			return new Playback(steps, index, startTick, nextIndex, 0, 0, false, null);
 		}
 	}
 }

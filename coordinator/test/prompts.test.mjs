@@ -96,6 +96,9 @@ test('planner tells agents to collect observed drops and never pause for routine
 	assert.match(PLANNER_SYSTEM_PROMPT, /Do not use program\.checkpoint for routine reassessment/);
 	assert.match(PLANNER_SYSTEM_PROMPT, /Minecraft owns the immutable goal rule/i);
 	assert.doesNotMatch(PLANNER_SYSTEM_PROMPT, /checkpoint for a new plan/);
+	assert.match(PLANNER_SYSTEM_PROMPT, /player\.control\(\{ forward, strafe, jump, sneak, sprint, attack, use, yaw, pitch, selectedSlot, hand, ticks \}\)/);
+	assert.match(PLANNER_SYSTEM_PROMPT, /Await the frame before the next body action/);
+	assert.match(PLANNER_SYSTEM_PROMPT, /player\.equipItem\(\{ sourceSlot, targetSlot, expectedItemId \}\)/);
 });
 
 test('supplemental context sends changed entries and forces full baselines on stale bindings', () => {

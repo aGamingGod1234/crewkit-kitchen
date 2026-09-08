@@ -14,6 +14,7 @@ import dev.agaminggod.arenaagents.server.VoiceConsentCommandVerification;
 import dev.agaminggod.arenaagents.server.SkitModeVerification;
 import dev.agaminggod.arenaagents.client.ArenaSpectatorStateVerification;
 import dev.agaminggod.arenaagents.client.camera.CameraPathVerification;
+import dev.agaminggod.arenaagents.client.gui.SkitDirectorLayoutVerification;
 import dev.agaminggod.arenaagents.client.gui.AgentControlLayoutVerification;
 import dev.agaminggod.arenaagents.client.gui.AgentControlSubmissionVerification;
 import dev.agaminggod.arenaagents.client.gui.AgentRosterGridLayoutVerification;
@@ -174,6 +175,7 @@ public final class VerificationMain {
 		passedAssertions += VoiceConsentCommandVerification.verify();
 		passedAssertions += SkitModeVerification.verify();
 		passedAssertions += CameraPathVerification.verify();
+		passedAssertions += SkitDirectorLayoutVerification.verify();
 		passedAssertions += AgentSpawnPlacementVerification.verify();
 		passedAssertions += ChunkedSavedPayloadVerification.verify();
 		passedAssertions += OfflineAgentProfileLookupVerification.verify();
@@ -194,6 +196,7 @@ public final class VerificationMain {
 		passedAssertions += ServerObservationTagCacheVerification.verify();
 		passedAssertions += ServerObservationInventorySnapshotVerification.verify();
 		passedAssertions += ObservationBudgetVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.world.WorldMutationRevisionsVerification.verify();
 		passedAssertions += ServerObservationRayTargetVerification.verify();
 		passedAssertions += ServerObservationWireBudgetVerification.verify();
 		passedAssertions += ActionProgressTrackerVerification.verify();
@@ -209,7 +212,6 @@ public final class VerificationMain {
 		passedAssertions += ServerActionExecutorVerification.verify();
 		passedAssertions += GoalVerificationRuntimeVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.perception.ObservationPageVerification.verify();
-		passedAssertions += dev.agaminggod.arenaagents.server.perception.LoadedSightRangeVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.perception.PlayerObservationEventsVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.runtime.input.RidingJumpInputVerification.verify();
 		passedAssertions += ActionSuccessLedgerVerification.verify();

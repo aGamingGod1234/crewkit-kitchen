@@ -71,7 +71,7 @@ public final class ServerObservationCollector {
 	public static final int MAX_TAG_COUNT_ENTRIES = 128;
 	private static final int MAX_ENTITY_NAME_CODE_POINTS = 256;
 	private static final int SPATIAL_CACHE_CAPACITY = 16;
-	/** Spatial block/container scans are expensive; movement and view changes still invalidate the key immediately. */
+	/** Position and local mutations invalidate candidates; facing is filtered on every observation. */
 	private static final long SPATIAL_CACHE_TICKS = 10L;
 	private static final int LANDMARK_CACHE_CAPACITY = 16;
 	/** Mutation revision keys provide freshness; this age bounds retained stationary poses. */
@@ -323,8 +323,10 @@ public final class ServerObservationCollector {
 			}
 			case "nearby_containers" -> {
 				ObservationVisibility.Frame visibility = ObservationVisibility.frame(agent.level(), agent);
-				JsonArray visible = nearbyTransactionTargets(agent,
-						rawSpatialObservation(agent.level(), agent, agent.blockPosition()).containers(), visibility, Integer.MAX_VALUE);
+				JsonArray visible = nearbyTransactionTargets(
+						rawSpatialObservation(agent.level(), agent, agent.blockPosition()).containers(), agent.level()::getBlockState,
+						target -> agent.level().hasChunkAt(target) && visibility.canSeeBlock(target), agent.position(),
+						target -> agent.isWithinBlockInteractionRange(target, 0.0D), Integer.MAX_VALUE);
 				result = ObservationPage.collect(visible.size(), offset, limit, index -> visible.get(index).getAsJsonObject(),
 						"current_visible_menu_blocks_in_13_by_7_by_13_cube");
 			}
@@ -335,7 +337,7 @@ public final class ServerObservationCollector {
 		result.addProperty("gameTime", agent.level().getGameTime());
 		result.addProperty("dimension", agent.level().dimension().identifier().toString());
 		result.addProperty("worldId", ObservedWorldIdentity.get(agent.level().getServer()));
-		result.addProperty("revision", worldMutationRevision(agent.level()));
+		result.addProperty("revision", worldMutationRevision(agent.level(), agent.blockPosition(), LANDMARK_SIGHT_DISTANCE + 1));
 		return result;
 	}
 
@@ -376,11 +378,6 @@ public final class ServerObservationCollector {
 			lastRawStates.remove(agentId);
 			lastInventories.remove(agentId);
 		}
-	}
-
-	/** Returns loaded agents whose compact factual player or inventory state changed since the last sample. */
-	public List<AgentId> changedActiveAgents() {
-		return changedActiveAgents(manager.records());
 	}
 
 	/**
@@ -430,13 +427,8 @@ public final class ServerObservationCollector {
 			ObservationVisibility.Frame visibility
 	) {
 		BlockPos position = agent.blockPosition();
-		RawSpatialObservation.Key key = new RawSpatialObservation.Key(
-				agentId,
-				level.dimension().identifier().toString(),
-				position.getX(),
-				position.getY(),
-				position.getZ()
-		);
+		RawSpatialObservation.Key key = spatialKey(agentId, level.dimension().identifier().toString(),
+				position, worldMutationRevision(level, position, BLOCK_RADIUS));
 		RawSpatialObservation.Key previous = spatialKeys.put(agentId, key);
 		if (previous != null && !previous.equals(key)) spatialCache.invalidate(previous);
 		RawSpatialObservation raw = spatialCache.getOrCompute(
@@ -453,7 +445,10 @@ public final class ServerObservationCollector {
 			eye.z,
 			agent.getYRot(),
 			agent.getXRot(),
-			worldMutationRevision(level)
+			agent.getY(),
+			agent.isDescending(),
+			agent.getMainHandItem().getItem(),
+			worldMutationRevision(level, position, LANDMARK_SIGHT_DISTANCE + 1)
 		);
 		List<VisibleSurfaceCandidate> landmarkCandidates = landmarkCache.getOrCompute(
 			landmarkKey,
@@ -463,8 +458,14 @@ public final class ServerObservationCollector {
 		JsonObject value = new JsonObject();
 		value.add("blocks", blocks(level, agent, raw.blocks(), visibility));
 		value.add("landmarks", landmarks(level, agent, visibility, landmarkCandidates));
-		value.add("nearbyContainers", nearbyTransactionTargets(agent, raw.containers(), visibility));
+		value.add("nearbyContainers", nearbyTransactionTargets(raw.containers(), level::getBlockState,
+				target -> level.hasChunkAt(target) && visibility.canSeeBlock(target), agent.position(),
+				target -> agent.isWithinBlockInteractionRange(target, 0.0D)));
 		return value;
+	}
+
+	static RawSpatialObservation.Key spatialKey(AgentId agentId, String dimension, BlockPos position, long revision) {
+		return new RawSpatialObservation.Key(agentId, dimension, position.getX(), position.getY(), position.getZ(), revision);
 	}
 
 	private JsonObject currentAction(AgentId agentId) {
@@ -805,11 +806,13 @@ public final class ServerObservationCollector {
 				MAX_BLOCK_VISIBILITY_CHECKS,
 				MAX_BLOCK_VISIBILITY_CHECKS_PER_TYPE,
 				selectable -> {
+					BlockPos target = center.offset(selectable.x(), selectable.y(), selectable.z());
+					if (!level.hasChunkAt(target)) return false;
 					BlockObservationOrdering.Candidate current = refreshCurrentBlockCandidate(
 							selectable, center, level::getBlockState);
 					if (current == null) return false;
 					currentCandidates.put(selectable, current);
-					return visibility.isBlockWithinView(center.offset(selectable.x(), selectable.y(), selectable.z()));
+					return visibility.isBlockWithinView(target);
 				},
 				selectable -> visibility.hasLineOfSight(
 						center.offset(selectable.x(), selectable.y(), selectable.z()))
@@ -899,7 +902,8 @@ public final class ServerObservationCollector {
 			for (int yawOffset : SIGHT_YAW_OFFSETS) {
 				float yaw = agent.getYRot() + yawOffset;
 				Vec3 direction = Vec3.directionFromRotation(pitch, yaw);
-				Vec3 endpoint = loadedSightEndpoint(level, eye, direction, loadedChunks);
+				Vec3 endpoint = loadedSightEndpoint(eye, direction,
+						position -> hasLoadedChunk(level, position, loadedChunks));
 				if (endpoint == null) continue;
 				BlockHitResult hit = level.clip(new ClipContext(
 						eye,
@@ -937,16 +941,59 @@ public final class ServerObservationCollector {
 	}
 
 	/** Keep clipping inside the contiguous loaded view instead of making long rays load chunks. */
-	private static Vec3 loadedSightEndpoint(
-			ServerLevel level,
+	static Vec3 loadedSightEndpoint(
 			Vec3 origin,
 			Vec3 direction,
-			Map<Long, Boolean> loadedChunks
+			Predicate<BlockPos> loaded
 	) {
-		double distance = LoadedSightRange.distance(origin.x, origin.z, direction.x, direction.z,
-				LANDMARK_SIGHT_DISTANCE,
-				(chunkX, chunkZ) -> hasLoadedChunk(level, new BlockPos(chunkX * 16, (int) origin.y, chunkZ * 16), loadedChunks));
-		return distance > 0.0D ? origin.add(direction.scale(distance)) : null;
+		return loadedSightEndpoint(origin, direction, LANDMARK_SIGHT_DISTANCE, loaded);
+	}
+
+	static Vec3 loadedSightEndpoint(Vec3 origin, Vec3 direction, double maximumDistance, Predicate<BlockPos> loaded) {
+		BlockPos start = BlockPos.containing(origin);
+		if (!loaded.test(start)) return null;
+		int chunkX = start.getX() >> 4;
+		int chunkZ = start.getZ() >> 4;
+		// Vanilla clipping extends its start backwards by 1e-7 of the ray length.
+		// Check that tiny segment too, including either side of a chunk corner.
+		BlockPos clipStart = BlockPos.containing(origin.subtract(direction.scale(maximumDistance * 1.0E-7D)));
+		BlockPos clipAhead = BlockPos.containing(origin.add(direction.scale(maximumDistance * 1.0E-7D)));
+		for (int x = Math.min(clipAhead.getX() >> 4, clipStart.getX() >> 4); x <= Math.max(clipAhead.getX() >> 4, clipStart.getX() >> 4); x++) {
+			for (int z = Math.min(clipAhead.getZ() >> 4, clipStart.getZ() >> 4); z <= Math.max(clipAhead.getZ() >> 4, clipStart.getZ() >> 4); z++) {
+				if ((x != chunkX || z != chunkZ) && !loaded.test(new BlockPos(x << 4, start.getY(), z << 4))) return null;
+			}
+		}
+		int stepX = (int) Math.signum(direction.x);
+		int stepZ = (int) Math.signum(direction.z);
+		double deltaX = stepX == 0 ? Double.POSITIVE_INFINITY : 16.0D / Math.abs(direction.x);
+		double deltaZ = stepZ == 0 ? Double.POSITIVE_INFINITY : 16.0D / Math.abs(direction.z);
+		double nextX = stepX == 0 ? Double.POSITIVE_INFINITY
+				: ((chunkX + (stepX > 0 ? 1 : 0)) * 16.0D - origin.x) / direction.x;
+		double nextZ = stepZ == 0 ? Double.POSITIVE_INFINITY
+				: ((chunkZ + (stepZ > 0 ? 1 : 0)) * 16.0D - origin.z) / direction.z;
+		while (true) {
+			double boundary = Math.min(nextX, nextZ);
+			// The far endpoint is expanded by vanilla clipping as well.
+			if (boundary > maximumDistance * (1.0D + 1.0E-7D)) {
+				return origin.add(direction.scale(maximumDistance));
+			}
+			// Rounded endpoints can reverse nearly tied crossings, especially near the world border.
+			if (Math.abs(nextX - nextZ) <= 1.0E-4D && (!loaded.test(new BlockPos((chunkX + stepX) << 4, start.getY(), chunkZ << 4))
+					|| !loaded.test(new BlockPos(chunkX << 4, start.getY(), (chunkZ + stepZ) << 4)))) {
+				return boundary <= 0.0D ? null : origin.add(direction.scale(Math.max(0.0D, boundary - 1.0E-4D)));
+			}
+			if (nextX <= boundary) {
+				chunkX += stepX;
+				nextX += deltaX;
+			}
+			if (nextZ <= boundary) {
+				chunkZ += stepZ;
+				nextZ += deltaZ;
+			}
+			if (!loaded.test(new BlockPos(chunkX << 4, start.getY(), chunkZ << 4))) {
+				return boundary <= 0.0D ? null : origin.add(direction.scale(Math.max(0.0D, boundary - 1.0E-4D)));
+			}
+		}
 	}
 
 	private static boolean hasLoadedChunk(ServerLevel level, BlockPos position, Map<Long, Boolean> loadedChunks) {
@@ -960,9 +1007,9 @@ public final class ServerObservationCollector {
 		return loaded;
 	}
 
-	private static long worldMutationRevision(ServerLevel level) {
+	private static long worldMutationRevision(ServerLevel level, BlockPos center, int radius) {
 		if (level instanceof WorldMutationRevisionAccess revision) {
-			return revision.arenaagents$worldMutationRevision();
+			return revision.arenaagents$worldMutationRevision(center, radius);
 		}
 		// Verification doubles may not load the Fabric mixin; changing game time is
 		// a conservative fallback that disables cross-tick reuse rather than risking stale facts.
@@ -998,36 +1045,44 @@ public final class ServerObservationCollector {
 		return new BlockObservationOrdering.Candidate(candidate.x(), candidate.y(), candidate.z(), blockId);
 	}
 
-	private static JsonArray nearbyTransactionTargets(
-			ServerPlayer agent,
+	static JsonArray nearbyTransactionTargets(
 			List<RawSpatialObservation.ContainerCandidate> candidates,
-			ObservationVisibility.Frame visibility
+			Function<BlockPos, BlockState> stateAt,
+			Predicate<BlockPos> visible,
+			Vec3 observerPosition,
+			Predicate<BlockPos> withinInteractionRange
 	) {
-		return nearbyTransactionTargets(agent, candidates, visibility, MAX_NEARBY_TRANSACTION_TARGETS);
+		return nearbyTransactionTargets(candidates, stateAt, visible, observerPosition, withinInteractionRange, MAX_NEARBY_TRANSACTION_TARGETS);
 	}
 
 	private static JsonArray nearbyTransactionTargets(
-			ServerPlayer agent,
 			List<RawSpatialObservation.ContainerCandidate> candidates,
-			ObservationVisibility.Frame visibility,
+			Function<BlockPos, BlockState> stateAt,
+			Predicate<BlockPos> visible,
+			Vec3 observerPosition,
+			Predicate<BlockPos> withinInteractionRange,
 			int maximumEntries
 	) {
 		JsonArray values = new JsonArray();
 		for (RawSpatialObservation.ContainerCandidate candidate : candidates) {
 			if (values.size() == maximumEntries) break;
 			BlockPos position = new BlockPos(candidate.x(), candidate.y(), candidate.z());
-			if (!visibility.canSeeBlock(position)) continue;
-			double distanceSquared = agent.distanceToSqr(
+			if (!visible.test(position)) continue;
+			BlockState state = Objects.requireNonNull(stateAt.apply(position), "stateAt must not return null");
+			String blockId = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+			List<String> currentCapabilities = transactionCapabilities(blockId);
+			if (currentCapabilities.isEmpty()) continue;
+			double distanceSquared = observerPosition.distanceToSqr(
 					candidate.x() + 0.5D, candidate.y() + 0.5D, candidate.z() + 0.5D);
 			JsonObject json = new JsonObject();
 			json.addProperty("x", candidate.x());
 			json.addProperty("y", candidate.y());
 			json.addProperty("z", candidate.z());
-			json.addProperty("blockId", candidate.blockId());
+			json.addProperty("blockId", blockId);
 			json.addProperty("distance", finite(Math.sqrt(distanceSquared)));
-			json.addProperty("withinInteractionRange", agent.isWithinBlockInteractionRange(position, 0.0D));
+			json.addProperty("withinInteractionRange", withinInteractionRange.test(position));
 			JsonArray capabilities = new JsonArray();
-			candidate.capabilities().forEach(capabilities::add);
+			currentCapabilities.forEach(capabilities::add);
 			json.add("capabilities", capabilities);
 			values.add(json);
 		}
@@ -1122,7 +1177,7 @@ public final class ServerObservationCollector {
 		}
 	}
 
-	private record LandmarkSampleKey(
+	record LandmarkSampleKey(
 			AgentId agentId,
 			String dimension,
 			int centerX,
@@ -1133,15 +1188,19 @@ public final class ServerObservationCollector {
 			double eyeZ,
 			float yaw,
 			float pitch,
+			double feetY,
+			boolean descending,
+			net.minecraft.world.item.Item heldItem,
 			long mutationRevision
 	) {
-		private LandmarkSampleKey {
+		LandmarkSampleKey {
 			Objects.requireNonNull(agentId, "agentId must not be null");
+			Objects.requireNonNull(heldItem, "heldItem must not be null");
 			if (Objects.requireNonNull(dimension, "dimension must not be null").isBlank()) {
 				throw new IllegalArgumentException("dimension must not be blank");
 			}
 			if (!Double.isFinite(eyeX) || !Double.isFinite(eyeY) || !Double.isFinite(eyeZ)
-					|| !Float.isFinite(yaw) || !Float.isFinite(pitch) || mutationRevision < 0L) {
+					|| !Double.isFinite(feetY) || !Float.isFinite(yaw) || !Float.isFinite(pitch) || mutationRevision < 0L) {
 				throw new IllegalArgumentException("landmark sample key contains invalid geometry");
 			}
 		}

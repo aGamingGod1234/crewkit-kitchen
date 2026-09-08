@@ -8,10 +8,15 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.level.BlockGetter;
 import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.RenderShape;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.shapes.CollisionContext;
 
 /** Human-equivalent visual gating for structured server observations. */
 public final class ObservationVisibility {
@@ -103,15 +108,29 @@ public final class ObservationVisibility {
 		}
 
 		private boolean traceBlock(BlockPos position) {
-			BlockHitResult hit = level.clip(new ClipContext(
-					eye,
-					Vec3.atCenterOf(position),
-					ClipContext.Block.VISUAL,
-					level.getFluidState(position).isEmpty() ? ClipContext.Fluid.NONE : ClipContext.Fluid.ANY,
-					observer
-			));
-			return hit.getType() == HitResult.Type.BLOCK && hit.getBlockPos().equals(position);
+			if (!hasLoadedSightPath(eye, Vec3.atCenterOf(position), level::hasChunkAt)) return false;
+			return ObservationVisibility.traceBlock(level, CollisionContext.of(observer), eye, position);
 		}
+	}
+
+	static boolean hasLoadedSightPath(Vec3 origin, Vec3 target, Predicate<BlockPos> loaded) {
+		Vec3 delta = target.subtract(origin);
+		double distance = delta.length();
+		Vec3 direction = delta.normalize();
+		Vec3 endpoint = ServerObservationCollector.loadedSightEndpoint(origin, direction, distance, loaded);
+		return origin.add(direction.scale(distance)).equals(endpoint);
+	}
+
+	static boolean traceBlock(BlockGetter level, CollisionContext context, Vec3 eye, BlockPos position) {
+		BlockHitResult hit = level.clip(new ClipContext(
+				eye, Vec3.atCenterOf(position), ClipContext.Block.VISUAL, ClipContext.Fluid.NONE, context));
+		// Fluids and partial visual shapes can leave a clear ray without a block hit.
+		if (hit.getType() != HitResult.Type.MISS) return hit.getBlockPos().equals(position);
+		BlockState state = level.getBlockState(position);
+		return !state.isAir()
+				&& (state.getRenderShape() != RenderShape.INVISIBLE || !state.getFluidState().isEmpty()
+						// End portal surfaces are drawn by block-entity renderers, despite an invisible block model.
+						|| state.is(Blocks.END_PORTAL) || state.is(Blocks.END_GATEWAY));
 	}
 
 	static boolean memoizedBlockVisibility(

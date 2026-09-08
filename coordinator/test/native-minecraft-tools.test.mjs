@@ -255,6 +255,28 @@ test('native Minecraft boundary rejects unknown, oversized, and malformed calls'
 	assert.throws(() => normalizeMinecraftToolCall('sequence', { actions: Array.from({ length: 9 }, () => ({ actionType: 'wait', arguments: { durationMs: 1 } })) }), (error) => error?.code === 'INVALID_MINECRAFT_TOOL_ARGUMENTS');
 });
 
+test('advanced actions cannot override their discriminator through nested arguments', () => {
+	for (const type of ['wait', 'attack']) {
+		const action = { actionType: 'attack', arguments: { type, durationMs: 100 } };
+		assert.throws(() => normalizeMinecraftToolCall('act', action), { code: 'INVALID_MINECRAFT_TOOL_ARGUMENTS' });
+		assert.throws(() => normalizeMinecraftToolCall('sequence', {
+			actions: [{ actionType: 'wait', arguments: { durationMs: 1 } }, action],
+		}), { code: 'INVALID_MINECRAFT_TOOL_ARGUMENTS' });
+	}
+});
+
+test('all native mining paths reject air before dispatch', () => {
+	for (const expectedBlockId of ['minecraft:air', 'minecraft:cave_air', 'minecraft:void_air']) {
+		const args = { x: 2, y: 63, z: 4, expectedBlockId, timeoutMs: 15_000 };
+		const action = { actionType: 'break_block', arguments: args };
+		assert.throws(() => normalizeMinecraftToolCall('mine', args), { code: 'INVALID_MINECRAFT_TOOL_ARGUMENTS' });
+		assert.throws(() => normalizeMinecraftToolCall('act', action), { code: 'INVALID_MINECRAFT_TOOL_ARGUMENTS' });
+		assert.throws(() => normalizeMinecraftToolCall('sequence', {
+			actions: [{ actionType: 'wait', arguments: { durationMs: 1 } }, action],
+		}), { code: 'INVALID_MINECRAFT_TOOL_ARGUMENTS' });
+	}
+});
+
 test('tool results are compact deterministic inputText content', () => {
 	assert.deepEqual(toolResultContent({ state: 'SUCCEEDED', reasonCode: '' }), {
 		success: true,

@@ -55,6 +55,26 @@ test('rejects unsupported or over-limit manifest commands before compiling', () 
 	assert.throws(() => compileScenarioProgram({ ...manifest, commands: [{ ...manifest.commands[0], arguments: { ...manifest.commands[0].arguments, bad: undefined } }] }), /JSON|serializ/i);
 });
 
+test('benchmark and simulator reject nested action discriminators before dispatch', () => {
+	const command = { agentId: 'agent-a', actionId: 'bad', actionType: 'respawn', arguments: { type: 'wait', durationMs: 1 } };
+	assert.throws(() => compileScenarioProgram({ id: 'discriminator', commands: [command] }), /arguments\.type is reserved/);
+	const runtime = new ActionRuntime();
+	assert.throws(() => runtime.accept(command), /arguments\.type is reserved/);
+	assert.deepEqual(runtime.activeActionIds, []);
+});
+
+test('scenario compilation rejects valid production actions the simulator cannot execute', () => {
+	const commands = [
+		{ actionId: 'frame', actionType: 'control', arguments: { forward: 1, strafe: 0, jump: false, sneak: false, sprint: false, attack: false, use: false, yaw: 0, pitch: 0, selectedSlot: 0, hand: 'main', ticks: 1 } },
+		{ actionId: 'dismount', actionType: 'dismount', arguments: {} },
+	];
+	for (const command of commands) {
+		const source = `program.onUnhandledAttention("continue_and_notify"); await player.${command.actionType}(${JSON.stringify(command.arguments)});`;
+		assert.doesNotThrow(() => parseArenaScript(source));
+		assert.throws(() => compileScenarioProgram({ id: 'unsupported-action', commands: [command] }), { code: 'SIMULATOR_UNSUPPORTED_ACTION' });
+	}
+});
+
 async function executeManifest(manifest, commandIndexes = manifest.commands.map((_, index) => index)) {
 	const world = VirtualWorld.fromScenario(manifest.world);
 	const bridge = new VirtualMinecraftBridge({ world, actionRuntime: new ActionRuntime() });
@@ -98,6 +118,7 @@ test('supports every command-bearing manifest through physical outcome derivatio
 	for (const id of listSimulatorScenarios()) {
 		const manifest = getSimulatorScenario(id);
 		if (manifest.commands.length === 0) continue;
+		assert.doesNotThrow(() => compileScenarioProgram(manifest), `${id} must compile for the simulator`);
 		const execution = await executeManifest(manifest);
 		assert.equal(runAuthoritativeScenarioSuccess({ manifest, ...execution }), true, `${id} must pass from simulator state`);
 	}

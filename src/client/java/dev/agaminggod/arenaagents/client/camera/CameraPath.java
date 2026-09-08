@@ -42,7 +42,7 @@ public record CameraPath(String name, List<CameraKeyframe> keyframes) {
 	/** Samples this path in ticks. Position is smoothed; angles use shortest-turn interpolation. */
 	public CameraPose sample(double tick) {
 		if (!Double.isFinite(tick)) throw new IllegalArgumentException("tick must be finite");
-		if (keyframes.size() == 1 || tick <= 0.0D) return pose(keyframes.getFirst());
+		if (keyframes.size() == 1 || tick <= keyframes.getFirst().tick()) return pose(keyframes.getFirst());
 		if (tick >= durationTicks()) return pose(keyframes.getLast());
 		int right = 1;
 		while (right < keyframes.size() && keyframes.get(right).tick() < tick) right++;
@@ -71,8 +71,10 @@ public record CameraPath(String name, List<CameraKeyframe> keyframes) {
 	}
 
 	private static float interpolateAngle(float from, float to, float amount) {
-		float delta = ((to - from + 540.0F) % 360.0F) - 180.0F;
-		return from + delta * amount;
+		double delta = ((double) to - from) % 360.0D;
+		if (delta >= 180.0D) delta -= 360.0D;
+		if (delta < -180.0D) delta += 360.0D;
+		return (float) (from + delta * amount);
 	}
 
 	private static float lerp(float from, float to, float amount) {

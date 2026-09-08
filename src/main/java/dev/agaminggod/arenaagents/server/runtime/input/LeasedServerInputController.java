@@ -21,6 +21,7 @@ public final class LeasedServerInputController implements ServerInputController 
 
 	private final InputStateSink sink;
 	private final Map<AgentId, LinkedHashMap<InputLease, LeaseState>> states = new LinkedHashMap<>();
+	private final Map<AgentId, AgentInputState> uncertainPhysicalStates = new LinkedHashMap<>();
 	private long sequence;
 	private long currentTick;
 	private long mutationRevision;
@@ -59,7 +60,7 @@ public final class LeasedServerInputController implements ServerInputController 
 		AgentInputState current = winningStateAfterApply(agentStates, lease, state);
 		long nextRevision = Math.incrementExact(mutationRevision);
 		long nextDeadline = deadline();
-		if (!Objects.equals(previous, current) && current != null) sink.apply(lease.agentId(), previous, current);
+		transition(lease.agentId(), previous, current);
 		agentStates.put(lease, new LeaseState(state, nextDeadline));
 		mutationRevision = nextRevision;
 	}
@@ -71,10 +72,7 @@ public final class LeasedServerInputController implements ServerInputController 
 		AgentInputState previous = winningState(agentStates).orElse(null);
 		AgentInputState current = winningStateExcluding(agentStates, lease).orElse(null);
 		long nextRevision = Math.incrementExact(mutationRevision);
-		if (!Objects.equals(previous, current)) {
-			if (current == null) sink.clear(lease.agentId(), previous);
-			else sink.apply(lease.agentId(), previous, current);
-		}
+		transition(lease.agentId(), previous, current);
 		agentStates.remove(lease);
 		if (agentStates.isEmpty()) states.remove(lease.agentId());
 		mutationRevision = nextRevision;
@@ -87,7 +85,7 @@ public final class LeasedServerInputController implements ServerInputController 
 		if (current == null) return;
 		AgentInputState previous = winningState(current).orElse(null);
 		long nextRevision = Math.incrementExact(mutationRevision);
-		sink.clear(agentId, previous);
+		clearPhysical(agentId, uncertainPhysicalStates.getOrDefault(agentId, previous));
 		states.remove(agentId);
 		mutationRevision = nextRevision;
 	}
@@ -103,6 +101,7 @@ public final class LeasedServerInputController implements ServerInputController 
 	/** Advances the server-tick deadman and neutralizes leases that stopped renewing. */
 	public synchronized void tick() {
 		currentTick = Math.incrementExact(currentTick);
+		RuntimeException failure = null;
 		var agents = states.entrySet().iterator();
 		while (agents.hasNext()) {
 			Map.Entry<AgentId, LinkedHashMap<InputLease, LeaseState>> entry = agents.next();
@@ -113,17 +112,58 @@ public final class LeasedServerInputController implements ServerInputController 
 			if (!expired) continue;
 			AgentInputState current = winningStateAfterExpiration(agentStates, currentTick).orElse(null);
 			long nextRevision = Math.incrementExact(mutationRevision);
-			if (!Objects.equals(previous, current)) {
-				if (current == null) sink.clear(agentId, previous);
-				else sink.apply(agentId, previous, current);
+			try {
+				transition(agentId, previous, current);
+				agentStates.entrySet().removeIf(lease -> lease.getValue().deadlineTick() <= currentTick);
+				if (agentStates.isEmpty()) agents.remove();
+				mutationRevision = nextRevision;
+			} catch (RuntimeException exception) {
+				if (failure == null) failure = exception;
+				else if (failure != exception) failure.addSuppressed(exception);
 			}
-			agentStates.entrySet().removeIf(lease -> lease.getValue().deadlineTick() <= currentTick);
-			if (agentStates.isEmpty()) agents.remove();
-			mutationRevision = nextRevision;
 		}
 		for (Map.Entry<AgentId, LinkedHashMap<InputLease, LeaseState>> entry : states.entrySet()) {
-			winningState(entry.getValue()).ifPresent(state -> sink.tick(entry.getKey(), state));
+			// A failed expiration still owns its physical state until cleanup succeeds.
+			if (entry.getValue().values().stream().anyMatch(state -> state.deadlineTick() <= currentTick)) continue;
+			try {
+				AgentInputState state = winningState(entry.getValue()).orElse(null);
+				transition(entry.getKey(), state, state);
+				if (state != null) sink.tick(entry.getKey(), state);
+			} catch (RuntimeException exception) {
+				if (failure == null) failure = exception;
+				else if (failure != exception) failure.addSuppressed(exception);
+			}
 		}
+		if (failure != null) throw failure;
+	}
+
+	private void transition(AgentId agentId, AgentInputState previous, AgentInputState current) {
+		// Sink operations can fail after changing some inputs. Reset before restoring a logical winner.
+		if (uncertainPhysicalStates.containsKey(agentId)) {
+			clearPhysical(agentId, uncertainPhysicalStates.get(agentId));
+			previous = null;
+		}
+		if (Objects.equals(previous, current)) return;
+		if (current == null) {
+			clearPhysical(agentId, previous);
+			return;
+		}
+		try {
+			sink.apply(agentId, previous, current);
+		} catch (RuntimeException failure) {
+			uncertainPhysicalStates.put(agentId, current);
+			throw failure;
+		}
+	}
+
+	private void clearPhysical(AgentId agentId, AgentInputState previous) {
+		try {
+			sink.clear(agentId, previous);
+		} catch (RuntimeException failure) {
+			uncertainPhysicalStates.put(agentId, previous);
+			throw failure;
+		}
+		uncertainPhysicalStates.remove(agentId);
 	}
 
 	private long deadline() {

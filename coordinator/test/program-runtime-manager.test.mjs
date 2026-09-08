@@ -524,6 +524,56 @@ test('installs a model-authored program and dispatches its next primitive withou
 	assert.equal(run.requests.length, 0, 'pre-authored continuation must not call the provider');
 });
 
+test('ArenaScript combined controls reach the wire and hold the body until completion', async () => {
+	const frame = {
+		forward: 1, strafe: -0.5, jump: true, sneak: false, sprint: true,
+		attack: false, use: true, yaw: 90, pitch: -15, selectedSlot: 2, hand: 'off', ticks: 20,
+	};
+	for (const provider of ['kimi', 'cursor']) {
+		const run = harness();
+		const agent = run.registry.get('agent-a');
+		agent.provider = provider;
+		await run.manager.installDecision(agent, {
+			summary: 'Move, jump and use the offhand together.', directive: 'replace',
+			source: `program.onUnhandledAttention("continue_and_notify"); await player.control(${JSON.stringify(frame)}); await player.wait(1);`,
+		}, { observation: observation(), eventSequence: 1 });
+		assert.equal(actionCommands(run.sent).length, 1, `${provider} must dispatch one complete frame`);
+		const first = actionCommands(run.sent)[0];
+		const wire = validateProtocolV2Payload('action_command', first.payload);
+		assert.equal(wire.actionType, 'control');
+		assert.deepEqual(wire.arguments, frame);
+		assert.match(wire.provenance.sourceStepId, /^step-\d+-\d+$/);
+		await run.manager.onObservation(agent, { observation: observation(), eventSequence: 2 });
+		assert.equal(actionCommands(run.sent).length, 1, 'a fresh observation cannot overlap body actions');
+		await run.manager.onActionResult(agent, { actionId: first.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE' });
+		await run.manager.onObservation(agent, { observation: observation(), eventSequence: 3 });
+		assert.equal(actionCommands(run.sent).length, 2);
+		assert.equal(actionCommands(run.sent)[1].payload.actionType, 'wait');
+		assert.equal(run.requests.length, 0, 'authored continuation must not spend another model turn');
+		assert.equal(run.errors.length, 0);
+	}
+});
+
+test('scripted control frames are validated at the production protocol boundary', async () => {
+	const frame = {
+		forward: 1, strafe: 0, jump: false, sneak: false, sprint: true,
+		attack: false, use: false, yaw: 0, pitch: 0, selectedSlot: 0, hand: 'main', ticks: 20,
+	};
+	for (const invalidFrame of [{ ...frame, ticks: 201 }, { ...frame, hand: 'both' }, { ...frame, type: 'wait' }, { forward: 1 }]) {
+		const dispatched = [];
+		const run = harness({ bridgeSend: async (type, agentId, payload) => {
+			if (type === 'action_command') dispatched.push(validateProtocolV2Payload(type, payload));
+		} });
+		await run.manager.installDecision(run.registry.get('agent-a'), {
+			summary: 'Control.', directive: 'replace',
+			source: `program.onUnhandledAttention("continue_and_notify"); await player.control(${JSON.stringify(invalidFrame)});`,
+		}, { observation: observation(), eventSequence: 1 });
+		assert.equal(dispatched.length, 0, 'malformed frames must not reach Minecraft');
+		assert.equal(run.errors.length, 1);
+		assert.match(run.errors[0].error.code, /^INVALID_(ACTION|PAYLOAD_FIELD)$/);
+	}
+});
+
 test('corrects an acknowledgement-only program before dispatching it for a physical goal', async () => {
 	const registry = new AgentRegistry();
 	const goalFields = { originalRequest: 'Get an iron pickaxe', predicate: { type: 'inventory_contains', itemId: 'minecraft:iron_pickaxe', count: 1 }, createdAtTick: 1 };

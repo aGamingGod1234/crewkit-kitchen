@@ -20,14 +20,96 @@ public final class InputStateVerification {
 		assertions += verifyOwnedReleasePreservesSystemLease();
 		assertions += verifyClearReleasesEveryPressedInput();
 		assertions += verifyFailedApplyRemainsRetryable();
+		assertions += verifyPartialApplyCleanup();
+		assertions += verifyPartialTransitionsRestoreLeaseOwner();
 		assertions += verifyFailedReleaseRemainsRetryable();
 		assertions += verifyFailedPreemptingReleaseRemainsRetryable();
 		assertions += verifyLeaseDeadman();
 		assertions += verifyFailedDeadmanRemainsRetryable();
+		assertions += verifyDeadmanFailureDoesNotBlockOtherAgents();
+		assertions += verifyTickFailureDoesNotBlockOtherAgents();
+		assertions += verifyRuntimeAllowsFailedCleanupRetry();
 		assertions += verifyExactHandUseDriver();
 		assertions += verifyBoundedMotor();
 		assertions += ControlSequenceVerification.verify();
+		assertions += verifyMotorWorldHeading();
 		return assertions;
+	}
+
+	private static int verifyRuntimeAllowsFailedCleanupRetry() {
+		FailingSink sink = new FailingSink();
+		LeasedServerInputController controller = new LeasedServerInputController(sink);
+		controller.apply(controller.acquire(AGENT, InputOwner.INTERACTION, 300), state(0.0F, true, true));
+		for (long tick = 1; tick < LeasedServerInputController.LEASE_TIMEOUT_TICKS; tick++) {
+			AgentInputRuntime.tickController(controller);
+		}
+		sink.failNextClear();
+		int followingTicks = 0;
+		for (int tick = 0; tick < 2; tick++) {
+			AgentInputRuntime.tickController(controller);
+			followingTicks++;
+			if (tick == 0) {
+				assertTrue(controller.currentState(AGENT).isPresent(), "failed runtime cleanup retains its lease for retry");
+			}
+		}
+		assertEquals(2, followingTicks, "input failures allow subsequent runtime work and the next server tick");
+		assertEquals(2, sink.clearAttempts, "the runtime retries physical cleanup on the next tick");
+		assertTrue(controller.currentState(AGENT).isEmpty(), "the runtime retry releases expired inputs");
+		return 4;
+	}
+
+	private static int verifyDeadmanFailureDoesNotBlockOtherAgents() {
+		FailingSink sink = new FailingSink();
+		LeasedServerInputController controller = new LeasedServerInputController(sink);
+		AgentId other = AgentId.random();
+		controller.apply(controller.acquire(AGENT, InputOwner.INTERACTION, 300), state(0.0F, true, true));
+		controller.apply(controller.acquire(other, InputOwner.INTERACTION, 300), state(0.0F, true, true));
+		for (long tick = 1; tick < LeasedServerInputController.LEASE_TIMEOUT_TICKS; tick++) controller.tick();
+		sink.failNextClear();
+		assertThrows(controller::tick, "deadman failure remains visible to the caller");
+		assertTrue(controller.currentState(AGENT).isPresent(), "failed cleanup keeps its lease for retry");
+		assertTrue(controller.currentState(other).isEmpty(), "one failed cleanup must not leave another agent attacking");
+		assertEquals(2, sink.clearAttempts, "all expired agents receive a cleanup attempt");
+		controller.tick();
+		assertTrue(controller.currentState(AGENT).isEmpty(), "failed agent is cleaned on the next tick");
+		return 5;
+	}
+
+	private static int verifyTickFailureDoesNotBlockOtherAgents() {
+		AgentId other = AgentId.random();
+		List<AgentId> ticked = new ArrayList<>();
+		InputStateSink sink = new InputStateSink() {
+			@Override
+			public void apply(AgentId agentId, AgentInputState previous, AgentInputState state) { }
+
+			@Override
+			public void clear(AgentId agentId, AgentInputState previous) { }
+
+			@Override
+			public void tick(AgentId agentId, AgentInputState state) {
+				ticked.add(agentId);
+				if (agentId.equals(AGENT)) throw new IllegalStateException("unavailable player");
+			}
+		};
+		LeasedServerInputController controller = new LeasedServerInputController(sink);
+		controller.apply(controller.acquire(AGENT, InputOwner.INTERACTION, 300), state(0.0F, false, true));
+		controller.apply(controller.acquire(other, InputOwner.INTERACTION, 300), state(0.0F, false, true));
+		assertThrows(controller::tick, "physical tick failure remains visible to the caller");
+		assertEquals(List.of(AGENT, other), ticked, "one broken player must not starve another player's held use");
+		return 2;
+	}
+
+	private static int verifyMotorWorldHeading() {
+		for (float targetYaw : new float[] {-90.0F, 90.0F}) {
+			AgentInputStates.MotorStep step = AgentInputStates.stepMotor(
+					AgentInputStates.MotorState.initial(0.0F, 0.0F),
+					new AgentInputStates.MotorTarget(targetYaw, 0.0F, true, false, false), 0L);
+			net.minecraft.world.phys.Vec3 movement = new net.minecraft.world.phys.Vec3(step.strafe(), 0.0D, step.forward())
+					.yRot((float) -Math.toRadians(step.yaw()));
+			assertTrue(targetYaw < 0.0F ? movement.x > 0.0D : movement.x < 0.0D,
+					"a turn toward " + (targetYaw < 0.0F ? "east" : "west") + " must move toward that waypoint");
+		}
+		return 2;
 	}
 
 	private static int verifyCompleteInputState() {
@@ -121,6 +203,75 @@ public final class InputStateVerification {
 		controller.release(safety);
 		assertEquals(List.of(AGENT), sink.cleared, "system input clears only when its own lease releases");
 		return 3;
+	}
+
+	private static int verifyPartialApplyCleanup() {
+		for (boolean expire : new boolean[] {false, true}) {
+			PartialSink sink = new PartialSink();
+			LeasedServerInputController controller = new LeasedServerInputController(sink);
+			InputLease lease = controller.acquire(AGENT, InputOwner.INTERACTION, 300);
+			if (expire) {
+				for (long tick = 1; tick < LeasedServerInputController.LEASE_TIMEOUT_TICKS; tick++) controller.tick();
+			}
+			sink.failApply = true;
+			assertThrows(() -> controller.apply(lease, state(1.0F, true, true)), "partial apply reports failure");
+			assertTrue(sink.physical != null, "the failing sink already changed physical inputs");
+			assertTrue(controller.currentState(AGENT).isEmpty(), "partial application does not become logical input");
+			if (expire) controller.tick();
+			else controller.release(lease);
+			assertTrue(sink.physical == null, "release and expiry clear partial physical inputs");
+			assertEquals(1, sink.clears, "partial first application retains one physical cleanup obligation");
+		}
+		return 10;
+	}
+
+	private static int verifyPartialTransitionsRestoreLeaseOwner() {
+		PartialSink sink = new PartialSink();
+		LeasedServerInputController controller = new LeasedServerInputController(sink);
+		InputLease navigation = controller.acquire(AGENT, InputOwner.NAVIGATION, 100);
+		AgentInputState walking = state(1.0F, false, false);
+		AgentInputState attacking = state(0.0F, true, true);
+		controller.apply(navigation, walking);
+		InputLease failedCombat = controller.acquire(AGENT, InputOwner.COMBAT, 200);
+		sink.failApply = true;
+		assertThrows(() -> controller.apply(failedCombat, attacking), "partial preemption reports failure");
+		assertEquals(walking, controller.currentState(AGENT).orElseThrow(), "failed preemption preserves the logical winner");
+		controller.release(failedCombat);
+		assertEquals(walking, sink.physical, "releasing failed preemption restores the lower-priority physical input");
+		InputLease combat = controller.acquire(AGENT, InputOwner.COMBAT, 200);
+		controller.apply(combat, attacking);
+		InputLease activeCombat = combat;
+		sink.failApply = true;
+		assertThrows(() -> controller.release(activeCombat), "partial restoration reports failure");
+		assertEquals(attacking, controller.currentState(AGENT).orElseThrow(), "failed release preserves the owning lease");
+		controller.tick();
+		assertEquals(attacking, sink.physical, "the next tick restores the authoritative owner after partial restoration");
+		controller.release(combat);
+		assertEquals(walking, sink.physical, "the retained lower-priority lease restores after successful release");
+		controller.release(navigation);
+		assertTrue(sink.physical == null, "final release clears restored inputs");
+		return 8;
+	}
+
+	private static final class PartialSink implements InputStateSink {
+		private AgentInputState physical;
+		private boolean failApply;
+		private int clears;
+
+		@Override
+		public void apply(AgentId agentId, AgentInputState previous, AgentInputState state) {
+			physical = state;
+			if (failApply) {
+				failApply = false;
+				throw new IllegalStateException("apply failed after physical mutation");
+			}
+		}
+
+		@Override
+		public void clear(AgentId agentId, AgentInputState previous) {
+			physical = null;
+			clears++;
+		}
 	}
 
 	private static int verifyFailedApplyRemainsRetryable() {
@@ -474,14 +625,14 @@ public final class InputStateVerification {
 				6L
 		);
 		assertEquals(true, repulsed.jump(), "a released jump request can pulse again");
-		AgentInputStates.MotorState facingEast = new AgentInputStates.MotorState(-90.0F, 0.0F, 0.0F, 1.0F, false);
-		AgentInputStates.MotorStep turningNorth = AgentInputStates.stepMotor(
+		AgentInputStates.MotorState facingEast = new AgentInputStates.MotorState(-90.0F, 0.0F, 0.0F, -1.0F, false);
+		AgentInputStates.MotorStep turningSouth = AgentInputStates.stepMotor(
 				facingEast,
 				new AgentInputStates.MotorTarget(0.0F, 0.0F, true, false, false),
 				7L
 		);
-		float remainingYaw = AgentInputStates.shortestAngleDelta(turningNorth.state().yaw(), 0.0F);
-		assertEquals((float) Math.sin(Math.toRadians(remainingYaw)), turningNorth.strafe(),
+		float remainingYaw = AgentInputStates.shortestAngleDelta(turningSouth.state().yaw(), 0.0F);
+		assertEquals(-(float) Math.sin(Math.toRadians(remainingYaw)), turningSouth.strafe(),
 				"movement is relative to the yaw applied this tick instead of the stale previous yaw");
 		return 14;
 	}

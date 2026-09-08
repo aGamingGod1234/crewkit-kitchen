@@ -597,7 +597,7 @@ public final class ServerActionExecutorVerification {
 			assertEquals(1, results.size(), "cleanup quarantine publishes one terminal failure");
 			assertEquals("ACTION_CLEANUP_FAILED", results.getFirst().reasonCode(),
 					"cleanup quarantine replaces a misleading success result");
-			assertEquals(List.of(), executor.activeRequests(),
+			assertTrue(executor.activeRequest(request.agentId()) == null,
 					"terminally failed cleanup is no longer advertised as a running action");
 			assertThrows(AgentDomainException.class, () -> executor.submitProgramPrimitive(request),
 					"quarantine fences another physical action while cleanup is unsafe");
@@ -608,7 +608,7 @@ public final class ServerActionExecutorVerification {
 		executor.tick();
 		assertEquals(ServerActionExecutor.MAX_CLEANUP_ATTEMPTS + 1, cleanupAttempts.get(),
 				"quarantined cleanup retries the retained physical release until it recovers");
-		assertEquals(List.of(), executor.activeRequests(), "quarantined action leaves the active execution set");
+		assertTrue(executor.activeRequest(request.agentId()) == null, "quarantined action leaves the active execution set");
 		assertDoesNotThrow(() -> executor.submitProgramPrimitive(request),
 				"successful retained cleanup automatically clears the action quarantine");
 	}
