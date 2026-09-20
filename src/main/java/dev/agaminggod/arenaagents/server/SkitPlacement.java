@@ -1,12 +1,22 @@
 package dev.agaminggod.arenaagents.server;
 
 import java.util.Objects;
+import com.mojang.serialization.Codec;
+import com.mojang.serialization.codecs.RecordCodecBuilder;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.util.Mth;
 import net.minecraft.world.phys.Vec3;
 
 /** A persisted camera-ready location for one skit agent. */
 public record SkitPlacement(String dimension, double x, double y, double z, float yaw, float pitch) {
+	public static final Codec<SkitPlacement> CODEC = RecordCodecBuilder.create(instance -> instance.group(
+			Codec.STRING.fieldOf("dimension").forGetter(SkitPlacement::dimension),
+			Codec.DOUBLE.fieldOf("x").forGetter(SkitPlacement::x),
+			Codec.DOUBLE.fieldOf("y").forGetter(SkitPlacement::y),
+			Codec.DOUBLE.fieldOf("z").forGetter(SkitPlacement::z),
+			Codec.FLOAT.fieldOf("yaw").forGetter(SkitPlacement::yaw),
+			Codec.FLOAT.fieldOf("pitch").forGetter(SkitPlacement::pitch)
+	).apply(instance, SkitPlacement::new));
 	private static final double MAX_HORIZONTAL_COORDINATE = 30_000_000.0D;
 	private static final double MIN_Y = -2_048.0D;
 	private static final double MAX_Y = 4_096.0D;

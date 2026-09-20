@@ -19,9 +19,13 @@ public final class AgentIdentityVerification {
 	private AgentIdentityVerification() {
 	}
 
+	public static void main(String[] args) {
+		System.out.println("Agent identity verification passed: " + verify());
+	}
+
 	public static int verify() {
 		AgentId id = new AgentId(UUID.fromString("193a9add-1234-5678-9abc-123456789abc"));
-		for (String brand : List.of("openai", "claude", "deepseek", "gemini", "kimi")) {
+		for (String brand : List.of("openai", "claude", "deepseek", "gemini", "kimi", "cursor")) {
 			for (int variant = 0; variant < AgentVisualIdentity.INDIVIDUAL_VARIANT_COUNT; variant++) {
 				String texturePath = AgentVisualIdentity.brandTexturePath(brand, variant);
 				assertEquals("arenaagents:textures/entity/brand_" + brand + "_agent_" + variant + ".png",
@@ -29,6 +33,8 @@ public final class AgentIdentityVerification {
 				assertRgbaSkin(readTexture(texturePath), texturePath, 512);
 			}
 		}
+		assertBodyColour("gemini", 0x4285F4);
+		assertBodyColour("cursor", 0xEDECEC);
 		expectIllegalArgument(() -> AgentVisualIdentity.brandTexturePath("unknown", 0),
 				"unknown company brand skin is rejected");
 		expectIllegalArgument(() -> AgentVisualIdentity.brandTexturePath("openai", 4),
@@ -177,7 +183,7 @@ public final class AgentIdentityVerification {
 				String expectedBrand = model.provider().equals("codex") ? "openai"
 						: model.provider().equals("kimi") ? "kimi"
 						: model.provider().equals("gemini") && model.family().equals("claude") ? "claude"
-						: model.provider().equals("gemini") ? "gemini" : null;
+						: model.provider().equals("gemini") ? "gemini" : "cursor";
 				if (expectedBrand != null) {
 					assertEquals(AgentVisualIdentity.brandTexturePath(expectedBrand, variant),
 							AgentVisualIdentity.renderTexturePath(resolved),
@@ -197,7 +203,7 @@ public final class AgentIdentityVerification {
 						"recognizable player prefix round-trips without losing its skin");
 				assertTrue(texturePaths.add(resolved.texturePath()), "manifest texture paths are globally unique");
 				byte[] textureBytes = readTexture(resolved.texturePath());
-				assertRgbaSkin(textureBytes, resolved.texturePath(), model.provider().equals("cursor") ? 64 : 512);
+				assertRgbaSkin(textureBytes, resolved.texturePath(), 512);
 				String locatorIcon = "assets/arenaagents/textures/gui/sprites/hud/locator_bar_dot/agent/"
 						+ resolved.transportCode() + ".png";
 				byte[] locatorBytes = readResource(locatorIcon);
@@ -286,6 +292,17 @@ public final class AgentIdentityVerification {
 			return stream.readAllBytes();
 		} catch (IOException exception) {
 			throw new AssertionError("resource could not be read: " + resourcePath, exception);
+		}
+	}
+
+	private static void assertBodyColour(String brand, int expectedRgb) {
+		try {
+			var image = javax.imageio.ImageIO.read(new java.io.ByteArrayInputStream(
+					readTexture(AgentVisualIdentity.brandTexturePath(brand, 0))));
+			assertEquals(expectedRgb, image.getRGB(22 * 8, 22 * 8) & 0xFFFFFF,
+					brand + " uses its intended dominant body colour");
+		} catch (IOException exception) {
+			throw new AssertionError("Could not decode " + brand + " skin", exception);
 		}
 	}
 

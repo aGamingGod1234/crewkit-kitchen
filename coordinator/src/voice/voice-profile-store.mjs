@@ -27,6 +27,24 @@ const VOICE_PROFILES = Object.freeze([
 	profile('piper', '802e3bc2b27e49c2995d23ef70e6ac89', ['energetic', 'clear', 'enthusiastic'], ['slow', 'soft'], 1.06),
 ]);
 
+// Fish Official AI-designed voices. Names, gender and tags verified on their public
+// pages at https://fish.audio/app/m/<voiceId>/ on 2026-09-08.
+const DIRECTOR_VOICE_PROFILES = Object.freeze([
+    directorProfile('laura', 'e3cd384158934cc9a01029cd7d278634', 'Laura - deep and warm, female', ['deep', 'warm', 'clear']),
+    directorProfile('adrian', 'bf322df2096a46f18c579d0baa36f41d', 'Adrian - deep and measured, male', ['deep', 'measured', 'serious']),
+    directorProfile('sarah', '933563129e564b19a115bedd57b7406a', 'Sarah - gentle and sincere, female', ['gentle', 'sincere', 'soft']),
+    directorProfile('ethan', '536d3a5e000945adb7038665781a4aca', 'Ethan - clear and calm, male', ['clear', 'calm', 'professional']),
+    directorProfile('selene', 'b347db033a6549378b48d00acb0d06cd', 'Selene - soft and calm, female', ['soft', 'calm', 'gentle']),
+    directorProfile('jordan', '79d0bd3e4e5444b18f7b6d89b5927bf1', 'Jordan - confident and measured, male', ['confident', 'measured', 'motivational']),
+]);
+
+export function directorVoiceProfiles() { return DIRECTOR_VOICE_PROFILES; }
+
+function directorProfile(name, voiceId, label, anchors) {
+    return Object.freeze({ ...profile(name, voiceId, anchors, [], 1.0), label,
+        provenance: 'fish-official-ai-designed', source: `https://fish.audio/app/m/${voiceId}/` });
+}
+
 export class VoiceProfileStore {
 	#assignments = new Map();
 	#used = new Set();
@@ -73,9 +91,10 @@ export class VoiceProfileStore {
 	resolveRequested(agentId, profileId) {
 		if (profileId === 'voice.auto.v1') return this.resolve(agentId);
 		if (!isUuid(agentId)) throw new TypeError('agentId must be a UUID');
-		const profileIndex = VOICE_PROFILES.findIndex((entry) => entry.profileId === profileId);
-		if (profileIndex < 0) throw new TypeError('voice profile is not in the installed catalog');
-		return VOICE_PROFILES[profileIndex];
+		const requested = DIRECTOR_VOICE_PROFILES.find((entry) => entry.profileId === profileId)
+			?? VOICE_PROFILES.find((entry) => entry.profileId === profileId);
+		if (requested === undefined) throw new TypeError('voice profile is not in the installed catalog');
+		return requested;
 	}
 
 	remove(agentId) {

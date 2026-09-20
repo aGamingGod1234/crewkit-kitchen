@@ -6,19 +6,15 @@ import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentIdentity;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.AgentRegistry;
-import dev.agaminggod.arenaagents.mixin.CachedUserNameToIdResolverAccessor;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
-import net.minecraft.server.players.NameAndId;
-import net.minecraft.server.players.UserNameToIdResolver;
 
 public final class AgentSummonNameVerification {
 	private AgentSummonNameVerification() {}
@@ -27,27 +23,27 @@ public final class AgentSummonNameVerification {
 		Path directory = null;
 		try {
 			directory = Files.createTempDirectory("arena-summon-names-");
-			NoLookupCache cache = new NoLookupCache();
-			assertFalse(CodexAgentManager.isPersistedPlayerNameReserved("CapabilityProbe", directory, cache, ignored -> false),
+			UUID cachedId = UUID.randomUUID();
+			assertFalse(AgentPlayerNameReservations.isReserved(directory, null, "CapabilityProbe"),
 					"uncached offline name is available without resolving or synthesizing a profile");
-			cache.names.put("existingonline", new NameAndId(UUID.randomUUID(), "ExistingOnline"));
-			assertTrue(CodexAgentManager.isPersistedPlayerNameReserved("EXISTINGONLINE", directory, cache, ignored -> false),
-					"cached online names remain reserved case-insensitively without remote lookup");
+			assertFalse(AgentPlayerNameReservations.isReserved(directory, cachedId, "EXISTINGONLINE"),
+					"a global cached name without this world's artifacts does not reserve the name");
 			String savedName = "SavedHuman";
 			UUID savedId = AgentIdentity.offlinePlayerUuid(savedName);
-			Path saved = directory.resolve(savedId + ".dat");
+			Path playerData = Files.createDirectories(directory.resolve("playerdata"));
+			Path saved = playerData.resolve(savedId + ".dat");
 			Files.write(saved, new byte[0]);
-			assertTrue(CodexAgentManager.isPersistedPlayerNameReserved(savedName, directory, cache,
-					ignored -> { throw new AssertionError("Existing save must not be parsed or overwritten"); }),
+			assertTrue(AgentPlayerNameReservations.isReserved(directory, null, savedName),
 					"even unreadable player data reserves its offline identity");
 			Files.delete(saved);
-			Path backup = directory.resolve(savedId + ".dat_old");
+			Path backup = playerData.resolve(savedId + ".dat_old");
 			Files.write(backup, new byte[0]);
-			assertTrue(CodexAgentManager.isPersistedPlayerNameReserved(savedName, directory, cache, ignored -> false),
+			assertTrue(AgentPlayerNameReservations.isReserved(directory, null, savedName),
 					"backup player data also protects a disconnected player's identity");
 			Files.delete(backup);
-			assertTrue(CodexAgentManager.isPersistedPlayerNameReserved(savedName, directory, cache,
-					nameAndId -> nameAndId.id().equals(savedId)), "integrated owner data remains protected");
+			WorldPlayerNames names = new WorldPlayerNames();
+			names.remember(savedName, savedId);
+			assertTrue(names.contains(savedName), "recorded world owner identity remains protected");
 
 			AgentRegistry registry = AgentRegistry.createDefault(() -> {}, ignored -> {});
 			Set<AgentId> pending = new HashSet<>();
@@ -95,22 +91,13 @@ public final class AgentSummonNameVerification {
 		} finally {
 			if (directory != null) {
 				try {
-					Files.deleteIfExists(directory.resolve(AgentIdentity.offlinePlayerUuid("SavedHuman") + ".dat"));
-					Files.deleteIfExists(directory.resolve(AgentIdentity.offlinePlayerUuid("SavedHuman") + ".dat_old"));
+					Files.deleteIfExists(directory.resolve("playerdata").resolve(AgentIdentity.offlinePlayerUuid("SavedHuman") + ".dat"));
+					Files.deleteIfExists(directory.resolve("playerdata").resolve(AgentIdentity.offlinePlayerUuid("SavedHuman") + ".dat_old"));
+					Files.deleteIfExists(directory.resolve("playerdata"));
 					Files.deleteIfExists(directory);
 				} catch (java.io.IOException exception) { throw new AssertionError("summon name fixture cleanup failed", exception); }
 			}
 		}
-	}
-
-	private static final class NoLookupCache implements UserNameToIdResolver, CachedUserNameToIdResolverAccessor {
-		final Map<String, NameAndId> names = new java.util.concurrent.ConcurrentHashMap<>();
-		@Override public Map<String, ?> arenaagents$cachedProfilesByName() { return names; }
-		@Override public Optional<NameAndId> get(String name) { throw new AssertionError("Name reservation attempted resolving lookup"); }
-		@Override public Optional<NameAndId> get(UUID id) { throw new AssertionError("Name reservation attempted profile lookup"); }
-		@Override public void add(NameAndId profile) { throw new AssertionError("Name reservation mutated profile cache"); }
-		@Override public void resolveOfflineUsers(boolean value) { throw new AssertionError("Name reservation changed resolver policy"); }
-		@Override public void save() { throw new AssertionError("Name reservation saved profile cache"); }
 	}
 
 	private static void assertTrue(boolean value, String message) { if (!value) throw new AssertionError(message); }

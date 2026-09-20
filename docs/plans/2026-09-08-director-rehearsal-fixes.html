@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Director rehearsal fixes</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f6f5f1; color: #18282b; font: 16px/1.6 system-ui, sans-serif; }
+    main { max-width: 920px; margin: auto; padding: 48px 24px 64px; }
+    header { padding-bottom: 28px; border-bottom: 1px solid #ccd5ce; }
+    .eyebrow, .status { color: #126b52; font-size: 14px; }
+    h1 { margin: 12px 0 18px; font-size: clamp(34px, 7vw, 54px); line-height: 1.12; letter-spacing: -.035em; }
+    h2 { font-size: 23px; line-height: 1.25; margin: 0 0 10px; }
+    p { margin: 8px 0; max-width: 760px; color: #526166; }
+    section { padding: 26px 0; border-bottom: 1px solid #ccd5ce; }
+    .step { display: grid; grid-template-columns: 42px 1fr; gap: 16px; }
+    .number { font-size: 22px; color: #126b52; }
+    ul { padding-left: 21px; margin: 12px 0 0; color: #526166; }
+    li { margin: 6px 0; }
+    code { font-size: .94em; color: #18282b; overflow-wrap: anywhere; }
+    footer { margin-top: 25px; font-size: 14px; color: #526166; }
+    @media (max-width: 520px) { main { padding: 28px 18px 44px; } .step { grid-template-columns: 24px 1fr; gap: 12px; } h2 { font-size: 21px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div class="eyebrow">Director / 8 September 2026</div>
+      <h1>Make the next rehearsal easier.</h1>
+      <p>Fix the actor identity problems seen in the screenshots, make voices easier to choose, turn action descriptions into scripts, and record camera moves with a physical camera and floor dollies.</p>
+      <p class="status">Status: local implementation and automated checks complete. The mod JAR is built. In-game rehearsal and audible voice checks are still pending.</p>
+    </header>
+
+    <section class="step">
+      <div class="number">01</div>
+      <div>
+        <h2>Show the correct actors</h2>
+        <p>Preserve the exact names entered, including spaces, underscores, dashes, dots and capitalization. Use actor names in voice feedback.</p>
+        <p>Replace Cursor's robot skin with its official branding, check Gemini's darker blue, and show agent logos in the locator bar.</p>
+      </div>
+    </section>
+
+    <section class="step">
+      <div class="number">02</div>
+      <div>
+        <h2>Choose a voice from a dropdown</h2>
+        <p>Show each option as <code>Name - sound description, gender</code>. Give Astra, Fable, Grok, Gemini and Kimi distinct default voices, with a choice of alternatives.</p>
+        <p>Use Fish S2.1 Pro Free for synthesis. Keep voice selection separate from the synthesis model, and preserve saved voice settings.</p>
+      </div>
+    </section>
+
+    <section class="step">
+      <div class="number">03</div>
+      <div>
+        <h2>Describe an action, then review the script</h2>
+        <p>Add an action description field. GPT-5.6 Luna with low reasoning converts the description into a Director script using the selected actor and scene context.</p>
+        <p>Show generation progress and a clear completion message. Validate the result and put it in an editable draft before playback.</p>
+      </div>
+    </section>
+
+    <section class="step">
+      <div class="number">04</div>
+      <div>
+        <h2>Place a camera and roll a dolly</h2>
+        <p>Add a physical camera in the world, floor dolly rails, and a viewfinder. Place the rig, frame the shot, then roll it along the route to record camera motion.</p>
+        <p>Save that motion for a take so the same shot can be replayed alongside the actors. Keep the existing Camera tab as the place to manage recordings.</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>Verification results</h2>
+      <ul>
+        <li>Build passed with 15,039 core assertions, 570 Director assertions and 385 voice add-on assertions.</li>
+        <li>377 focused Node tests passed.</li>
+        <li>Validated 88 textures, nine Minecraft mixin checks and the assets packaged in the built JAR.</li>
+        <li>A live GPT-5.6 Luna request with low reasoning passed.</li>
+        <li>The live Fish request returned HTTP 401 with the configured credential. Refresh the Fish API key before checking playback and listening to the voice choices.</li>
+        <li>No live Minecraft UI rehearsal has run. Actor appearance, dropdown interaction and physical camera controls still need that final check.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Decisions and limits</h2>
+      <p>Keep the selected tab layout and existing saved skits. Public names must not change the actors' internal identities. Voice defaults are character choices, not claims to reproduce an assistant's official voice.</p>
+      <p>Voice playback and script generation depend on the configured services. The automated checks do not establish audible voice quality or how the dolly controls feel in-game. Those checks remain pending after the Fish credential is refreshed.</p>
+    </section>
+    <footer>Local implementation complete. Automated build and checks passed. Live game rehearsal and Fish voice validation remain pending.</footer>
+  </main>
+</body>
+</html>

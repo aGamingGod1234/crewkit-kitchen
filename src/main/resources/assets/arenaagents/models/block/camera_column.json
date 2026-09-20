@@ -1,0 +1,43 @@
+{
+  "textures": {
+    "body": "minecraft:block/black_concrete",
+    "metal": "minecraft:block/polished_deepslate",
+    "lens": "minecraft:block/cyan_concrete",
+    "red": "minecraft:block/red_concrete",
+    "particle": "minecraft:block/black_concrete"
+  },
+  "elements": [
+    {
+      "from": [
+        7.25,
+        0,
+        7.25
+      ],
+      "to": [
+        8.75,
+        16,
+        8.75
+      ],
+      "faces": {
+        "north": {
+          "texture": "#metal"
+        },
+        "south": {
+          "texture": "#metal"
+        },
+        "east": {
+          "texture": "#metal"
+        },
+        "west": {
+          "texture": "#metal"
+        },
+        "up": {
+          "texture": "#metal"
+        },
+        "down": {
+          "texture": "#metal"
+        }
+      }
+    }
+  ]
+}

@@ -19,6 +19,9 @@ import dev.agaminggod.arenaagents.scenario.presentation.ArenaSpectatorSnapshotPa
 import dev.agaminggod.arenaagents.scenario.presentation.ScenarioBuildProgressClearPayload;
 import dev.agaminggod.arenaagents.scenario.presentation.ScenarioBuildProgressPayload;
 import dev.agaminggod.arenaagents.control.AgentControlCatalog;
+import dev.agaminggod.arenaagents.control.DirectorCommandRequestPayload;
+import dev.agaminggod.arenaagents.control.DirectorEditorPayload;
+import dev.agaminggod.arenaagents.control.DirectorCommandResultPayload;
 import dev.agaminggod.arenaagents.control.AgentControlModelOption;
 import dev.agaminggod.arenaagents.control.AgentControlRequestPayload;
 import dev.agaminggod.arenaagents.control.AgentControlSnapshot;
@@ -68,6 +71,7 @@ public final class AgentControlClient {
 	private static Preferences preferences = Preferences.defaults();
 	private static boolean catalogAuthoritative;
 	private static boolean registered;
+	public static java.util.Optional<dev.agaminggod.arenaagents.control.DirectorSnapshotPayload> directorSnapshot() { return DirectorClientState.snapshot(); }
 	private static final Set<String> HIDDEN_AGENT_IDS = new LinkedHashSet<>();
 	private static final Set<String> AUTOMATIC_AGENT_IDS = new LinkedHashSet<>();
 	private static final Set<String> KNOWN_AGENT_IDS = new LinkedHashSet<>();
@@ -83,6 +87,27 @@ public final class AgentControlClient {
 		if (registered) {
 			return;
 		}
+		ClientPlayNetworking.registerGlobalReceiver(dev.agaminggod.arenaagents.control.DirectorSnapshotPayload.TYPE,
+				(payload, context) -> context.client().execute(() -> {
+					if (!DirectorClientState.accept(payload)) return;
+					if (context.client().screen instanceof dev.agaminggod.arenaagents.client.gui.SkitDirectorScreen screen) screen.acceptCatalogUpdate();
+				}));
+		ClientPlayNetworking.registerGlobalReceiver(dev.agaminggod.arenaagents.control.DirectorTakePlaybackPayload.TYPE,
+				(payload, context) -> context.client().execute(() -> dev.agaminggod.arenaagents.client.camera.CameraDirectorClient.acceptTake(payload)));
+		ClientPlayNetworking.registerGlobalReceiver(dev.agaminggod.arenaagents.control.DirectorGenerationPayload.Result.TYPE,
+				(payload, context) -> context.client().execute(() -> {
+					if (DirectorClientState.acceptGeneration(payload) && context.client().gui != null)
+						context.client().gui.setOverlayMessage(net.minecraft.network.chat.Component.literal(payload.message()), false);
+				}));
+		ClientPlayNetworking.registerGlobalReceiver(DirectorEditorPayload.Snapshot.TYPE,
+				(payload, context) -> context.client().execute(() -> {
+					if (context.client().screen instanceof dev.agaminggod.arenaagents.client.gui.SkitDirectorScreen screen) screen.acceptEditorSnapshot(payload);
+				}));
+		if (!ClientPlayNetworking.registerGlobalReceiver(DirectorCommandResultPayload.TYPE,
+				(payload, context) -> context.client().execute(() -> {
+					if (context.client().screen instanceof dev.agaminggod.arenaagents.client.gui.SkitDirectorScreen screen) screen.acceptCommandResult(payload);
+					requestSnapshot();
+				}))) throw new IllegalStateException("Director command result receiver is already registered");
 		boolean receiverRegistered = ClientPlayNetworking.registerGlobalReceiver(
 				AgentControlSnapshotPayload.TYPE,
 				(payload, context) -> context.client().execute(() -> acceptSnapshot(payload.snapshot()))
@@ -207,6 +232,30 @@ public final class AgentControlClient {
 		return sendCommandWithReceipt(command).isPresent();
 	}
 
+	public static boolean sendDirectorGeneration(dev.agaminggod.arenaagents.control.DirectorGenerationPayload.Request request) {
+		if (Minecraft.getInstance().getConnection() == null || !ClientPlayNetworking.canSend(dev.agaminggod.arenaagents.control.DirectorGenerationPayload.Request.TYPE)) return false;
+		ClientPlayNetworking.send(request);
+		return true;
+	}
+
+	public static boolean sendDirectorEditor(DirectorEditorPayload.Request request) {
+		if (Minecraft.getInstance().getConnection() == null || !ClientPlayNetworking.canSend(DirectorEditorPayload.Request.TYPE)) return false;
+		ClientPlayNetworking.send(request);
+		return true;
+	}
+
+	public static boolean sendDirectorCommand(DirectorCommandRequestPayload request) {
+		try {
+			if (!ClientPlayNetworking.canSend(DirectorCommandRequestPayload.TYPE)) return false;
+			ClientPlayNetworking.send(request);
+			SNAPSHOT_ACKNOWLEDGEMENTS.beginMutation();
+			return true;
+		} catch (IllegalStateException exception) {
+			LOGGER.debug("Director command skipped while disconnected");
+			return false;
+		}
+	}
+
 	public static OptionalLong sendCommandWithReceipt(String command) {
 		Minecraft client = Minecraft.getInstance();
 		if (client.getConnection() == null) {
@@ -277,7 +326,8 @@ public final class AgentControlClient {
 			}
 		}
 		boolean connected = client.player != null && client.level != null && client.getConnection() != null;
-		boolean controlsVisible = client.screen instanceof AgentControlScreen
+		boolean controlsVisible = client.screen instanceof dev.agaminggod.arenaagents.client.gui.SkitDirectorScreen
+				|| client.screen instanceof AgentControlScreen
 				|| client.screen instanceof dev.agaminggod.arenaagents.client.gui.scenario.ScenarioSetupScreen;
 		SnapshotRefreshPolicy.Tick refresh = SnapshotRefreshPolicy.advance(
 				refreshCountdown, connected, controlsVisible,
@@ -298,6 +348,9 @@ public final class AgentControlClient {
 			return;
 		}
 		snapshotError = "";
+		boolean importCandidatesChanged = DirectorClientState.setImportCandidates(nextSnapshot.agents());
+		if (importCandidatesChanged
+				&& Minecraft.getInstance().screen instanceof dev.agaminggod.arenaagents.client.gui.SkitDirectorScreen director) director.acceptCatalogUpdate();
 		boolean catalogChanged = !previousCatalog.equals(nextSnapshot.catalog());
 		int nextContentHash = contentHash(nextSnapshot);
 		Minecraft client = Minecraft.getInstance();
@@ -314,8 +367,6 @@ public final class AgentControlClient {
 		if (client.screen instanceof AgentControlScreen screen) {
 			screen.acceptSnapshot(nextSnapshot, acknowledgedMutationId, true);
 		} else if (catalogChanged && client.screen instanceof ScenarioSetupScreen screen) {
-			screen.acceptCatalogUpdate();
-		} else if (catalogChanged && client.screen instanceof dev.agaminggod.arenaagents.client.gui.SkitDirectorScreen screen) {
 			screen.acceptCatalogUpdate();
 		}
 	}
@@ -337,6 +388,7 @@ public final class AgentControlClient {
 	}
 
 	private static void clearConnectionState() {
+		DirectorClientState.clear();
 		SNAPSHOTS.clear();
 		AgentControlCatalog.resetRuntimeCatalog();
 		catalogAuthoritative = false;

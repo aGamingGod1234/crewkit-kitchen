@@ -1,6 +1,8 @@
 package dev.agaminggod.arenaagents.client.mixin;
 
 import dev.agaminggod.arenaagents.client.control.AgentControlClient;
+import dev.agaminggod.arenaagents.client.control.DirectorClientState;
+import dev.agaminggod.arenaagents.control.DirectorSnapshotPayload;
 import dev.agaminggod.arenaagents.agent.AgentIdentity;
 import dev.agaminggod.arenaagents.control.AgentControlAgent;
 import dev.agaminggod.arenaagents.control.AgentWorldNamePolicy;
@@ -25,6 +27,7 @@ abstract class AvatarRendererMixin {
 			cancellable = true
 	)
 	private void arenaagents$showAgentName(Avatar avatar, double distance, CallbackInfoReturnable<Boolean> callback) {
+		if (castActor(avatar).isPresent()) { callback.setReturnValue(true); return; }
 		avatar.getProfile().name().ifPresent(name -> {
 			Optional<AgentControlAgent> snapshotAgent = AgentControlClient.agentForPlayer(name);
 			if (snapshotAgent.isPresent()) {
@@ -48,6 +51,12 @@ abstract class AvatarRendererMixin {
 			float partialTick,
 			CallbackInfo callback
 	) {
+		var actor = castActor(avatar);
+		if (actor.isPresent()) {
+			state.nameTag = state.distanceToCameraSq <= 4096.0D ? Component.literal(actor.orElseThrow().name()) : null;
+			state.nameTagAttachment = state.nameTag == null ? null : avatar.getAttachments().getNullable(EntityAttachment.NAME_TAG, 0, avatar.getYRot());
+			return;
+		}
 		AgentControlAgent agent = avatar.getProfile().name()
 				.flatMap(AgentControlClient::agentForPlayer)
 				.filter(candidate -> hasExpectedOfflineUuid(avatar, candidate))
@@ -72,6 +81,12 @@ abstract class AvatarRendererMixin {
 			state.nameTagAttachment = avatar.getAttachments().getNullable(
 					EntityAttachment.NAME_TAG, 0, avatar.getYRot());
 		});
+	}
+
+	private static Optional<DirectorSnapshotPayload.Actor> castActor(Avatar avatar) {
+		return DirectorClientState.snapshot().stream().flatMap(snapshot -> snapshot.actors().stream())
+				.filter(actor -> avatar.getUUID().equals(AgentIdentity.offlinePlayerUuid(actor.playerName())))
+				.findFirst();
 	}
 
 	private static boolean hasExpectedOfflineUuid(Avatar avatar, AgentControlAgent agent) {

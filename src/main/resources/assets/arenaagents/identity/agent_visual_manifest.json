@@ -2,6 +2,16 @@
   "schemaVersion": 1,
   "brandSkins": [
     {
+      "key": "cursor",
+      "label": "Cursor",
+      "variants": [
+        {"texturePath": "arenaagents:textures/entity/brand_cursor_agent_0.png"},
+        {"texturePath": "arenaagents:textures/entity/brand_cursor_agent_1.png"},
+        {"texturePath": "arenaagents:textures/entity/brand_cursor_agent_2.png"},
+        {"texturePath": "arenaagents:textures/entity/brand_cursor_agent_3.png"}
+      ]
+    },
+    {
       "key": "openai",
       "label": "ChatGPT / OpenAI",
       "variants": [

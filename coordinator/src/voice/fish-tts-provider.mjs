@@ -3,6 +3,9 @@ import { readBoundedResponseBody } from './bounded-response-body.mjs';
 const DEFAULT_ENDPOINT = 'https://api.fish.audio/v1/tts';
 const DEFAULT_MODEL = 's2.1-pro-free';
 const MAX_PCM_BYTES = 44_100 * 2 * 20;
+// S2 uses natural-language bracket cues: https://docs.fish.audio/developer-guide/core-features/emotions
+const TONE_CUES = Object.freeze({ neutral: '', warm: 'warm', excited: 'excited', serious: 'serious',
+	dramatic: 'dramatic', whisper: 'whispering', robotic: 'robotic', angry: 'angry' });
 
 export class FishTtsProvider {
 	#apiKey;
@@ -23,14 +26,15 @@ export class FishTtsProvider {
 	}
 
 	cacheNamespace() {
-		return 'fish/s2.1-pro-free';
+		return 'fish/s2.1-pro-free/delivery-v1';
 	}
 
-	async synthesize({ text, voiceId, speed = 1, signal } = {}) {
+	async synthesize({ text, voiceId, speed = 1, tone = 'neutral', signal } = {}) {
 		requireText(text, 'text');
 		requireText(voiceId, 'voiceId');
 		if ([...text].length > 280) throw new TypeError('text must be at most 280 Unicode code points');
 		if (!Number.isFinite(speed) || speed < 0.5 || speed > 2) throw new TypeError('speed must be between 0.5 and 2');
+		if (!Object.hasOwn(TONE_CUES, tone)) throw new TypeError('Unsupported delivery tone');
 		const timeoutSignal = AbortSignal.timeout(this.#timeoutMs);
 		const responseController = new AbortController();
 		const combinedSignal = AbortSignal.any([responseController.signal, timeoutSignal, ...(signal === undefined ? [] : [signal])]);
@@ -44,7 +48,7 @@ export class FishTtsProvider {
 					model: DEFAULT_MODEL,
 				},
 				body: JSON.stringify({
-					text,
+					text: TONE_CUES[tone] ? `[${TONE_CUES[tone]}] ${text}` : text,
 					reference_id: voiceId,
 					format: 'pcm',
 					sample_rate: 44_100,

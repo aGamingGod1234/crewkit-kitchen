@@ -14,6 +14,7 @@ public final class ArenaAgents implements ModInitializer {
 	@Override
 	public void onInitialize() {
 		CodexAgentEntities.register();
+		dev.agaminggod.arenaagents.camera.CameraDolly.register();
 		AgentModelArgumentType.register();
 		PayloadTypeRegistry.clientboundPlay().register(GoalPayload.TYPE, GoalPayload.CODEC);
 		AgentControlSync.register();

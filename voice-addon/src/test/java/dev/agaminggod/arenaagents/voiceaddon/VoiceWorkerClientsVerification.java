@@ -171,7 +171,14 @@ final class VoiceWorkerClientsVerification {
 					"TTS provider error code");
 			providerUnavailable.assertHealthy();
 		}
-		return 3;
+		for (String code : java.util.List.of("TTS_FISH_NOT_CONFIGURED", "TTS_AUTHENTICATION_FAILED")) {
+			try (WorkerServer fish = new WorkerServer(exchange -> respond(exchange, 503,
+					("{\"code\":\"" + code + "\",\"message\":\"secret must-not-reach-logs\"}").getBytes(StandardCharsets.UTF_8), "application/json"))) {
+				var client = new VoiceWorkerClient(HttpClient.newHttpClient(), fish.uri("/v1/tts"), SECRET);
+				assertWorkerFailure(code, () -> client.synthesize(request()).join(), "Fish setup error reaches the game");
+			}
+		}
+		return 5;
 	}
 
 	private static int verifyTtsCancellationStopsTheHttpExchange() {

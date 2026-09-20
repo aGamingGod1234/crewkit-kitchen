@@ -11,7 +11,6 @@ import dev.agaminggod.arenaagents.agent.AgentProfile;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.AgentRegistry;
 import dev.agaminggod.arenaagents.agent.AgentTransition;
-import dev.agaminggod.arenaagents.mixin.CachedUserNameToIdResolverAccessor;
 import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
 import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
 import dev.agaminggod.arenaagents.server.goal.PendingGoalDraft;
@@ -60,7 +59,6 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
-import net.minecraft.server.players.NameAndId;
 import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.server.level.TicketType;
 import net.minecraft.world.entity.Entity;
@@ -296,21 +294,15 @@ public final class CodexAgentManager {
 		}
 	}
 
-	private boolean isPersistedPlayerNameReserved(String name) {
-		return isPersistedPlayerNameReserved(name, server.getWorldPath(net.minecraft.world.level.storage.LevelResource.PLAYER_DATA_DIR),
-				server.services().nameToIdCache(), identity -> server.getPlayerList().loadPlayerData(identity).isPresent());
+	boolean hasPendingPlayerName(String name) {
+		return cancelledPlayerSpawns.active(System.currentTimeMillis()).stream().anyMatch(entry ->
+				dev.agaminggod.arenaagents.agent.AgentIdentity.playerName(entry.agentId(), entry.profile()).equalsIgnoreCase(name));
 	}
 
-	static boolean isPersistedPlayerNameReserved(String name, java.nio.file.Path playerDataDirectory,
-			net.minecraft.server.players.UserNameToIdResolver cache, Predicate<NameAndId> hasPlayerData) {
-		UUID offlineUuid = AgentIdentity.offlinePlayerUuid(name);
-		if (java.nio.file.Files.exists(playerDataDirectory.resolve(offlineUuid + ".dat"))
-				|| java.nio.file.Files.exists(playerDataDirectory.resolve(offlineUuid + ".dat_old"))
-				|| hasPlayerData.test(new NameAndId(offlineUuid, name))) return true;
-		if (!(cache instanceof CachedUserNameToIdResolverAccessor cached)) {
-			throw new AgentDomainException("PLAYER_NAME_CACHE_UNAVAILABLE", "Player names cannot be checked without a cached-only resolver");
-		}
-		return cached.arenaagents$cachedProfilesByName().containsKey(name.toLowerCase(java.util.Locale.ROOT));
+	private boolean isPersistedPlayerNameReserved(String name) {
+		return hasPendingPlayerName(name) || carpet.patches.EntityPlayerMPFake.isSpawningPlayer(name)
+				|| SkitActors.reservesName(server, name) || AgentPlayerNameReservations.isReserved(
+				server, name);
 	}
 
 	/** Keeps name collision retries local and rolls back every rejected registration. */
@@ -1292,7 +1284,12 @@ public final class CodexAgentManager {
 				WaypointStyleAssets.ROOT_ID,
 				Identifier.fromNamespaceAndPath("arenaagents", stylePath)
 		);
-		player.waypointIcon().style = style;
+		if (!style.equals(player.waypointIcon().style)) {
+			var manager = player.level().getWaypointManager();
+			manager.untrackWaypoint(player);
+			player.waypointIcon().style = style;
+			manager.trackWaypoint(player);
+		}
 	}
 
 	private void removeHiddenWorldName(String playerName) {
@@ -1588,6 +1585,12 @@ public final class CodexAgentManager {
 				findAgentPlayer(record.agentId()).ifPresent(entity -> trackChunkTicket(record.agentId(), entity, now));
 			}
 		}
+	}
+
+	void requireStableDirectorTransfer(AgentId id) {
+		if (pendingPlayerSpawns.containsKey(id) || pendingVerifiedRespawns.containsKey(id)
+				|| cancelledPlayerSpawns.active(System.currentTimeMillis()).stream().anyMatch(value -> value.agentId().equals(id)))
+			throw new AgentDomainException("ACTOR_TRANSFER_PENDING", "Wait for the agent's current spawn or respawn to finish before moving it to the cast");
 	}
 
 	public AgentRecord remove(String selector) {

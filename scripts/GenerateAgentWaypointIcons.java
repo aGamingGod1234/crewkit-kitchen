@@ -40,7 +40,7 @@ public final class GenerateAgentWaypointIcons {
 			int scale = skin.getWidth() / 64;
 			BufferedImage head = new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB);
 			Graphics2D graphics = head.createGraphics();
-			graphics.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
+			graphics.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
 			graphics.drawImage(skin.getSubimage(8 * scale, 8 * scale, 8 * scale, 8 * scale), 0, 0, 16, 16, null);
 			graphics.setComposite(AlphaComposite.SrcOver);
 			graphics.drawImage(skin.getSubimage(40 * scale, 8 * scale, 8 * scale, 8 * scale), 0, 0, 16, 16, null);

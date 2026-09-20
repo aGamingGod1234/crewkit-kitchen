@@ -1,5 +1,9 @@
 package dev.agaminggod.arenaagents.server;
 
+import dev.agaminggod.arenaagents.control.DirectorSnapshotPayload;
+import dev.agaminggod.arenaagents.control.DirectorEditorPayload;
+import dev.agaminggod.arenaagents.control.DirectorCommandRequestPayload;
+import dev.agaminggod.arenaagents.control.DirectorCommandResultPayload;
 import dev.agaminggod.arenaagents.control.AgentControlRequestPayload;
 import dev.agaminggod.arenaagents.control.AgentControlGroup;
 import dev.agaminggod.arenaagents.control.AgentControlSnapshot;
@@ -51,6 +55,28 @@ public final class AgentControlSync {
 		PayloadTypeRegistry.serverboundPlay().register(ScenarioLaunchPayload.TYPE, ScenarioLaunchPayload.CODEC);
 		PayloadTypeRegistry.serverboundPlay().register(ScenarioCancelPayload.TYPE, ScenarioCancelPayload.CODEC);
 		PayloadTypeRegistry.clientboundPlay().register(AgentControlSnapshotPayload.TYPE, AgentControlSnapshotPayload.CODEC);
+		PayloadTypeRegistry.clientboundPlay().register(dev.agaminggod.arenaagents.control.DirectorTakePlaybackPayload.TYPE, dev.agaminggod.arenaagents.control.DirectorTakePlaybackPayload.CODEC);
+        PayloadTypeRegistry.serverboundPlay().register(dev.agaminggod.arenaagents.control.DirectorGenerationPayload.Request.TYPE, dev.agaminggod.arenaagents.control.DirectorGenerationPayload.Request.CODEC);
+        PayloadTypeRegistry.clientboundPlay().register(dev.agaminggod.arenaagents.control.DirectorGenerationPayload.Result.TYPE, dev.agaminggod.arenaagents.control.DirectorGenerationPayload.Result.CODEC);
+        ServerPlayNetworking.registerGlobalReceiver(dev.agaminggod.arenaagents.control.DirectorGenerationPayload.Request.TYPE, (payload, context) -> context.server().execute(() -> DirectorScriptGeneration.request(context.player(), payload)));
+        ServerTickEvents.END_SERVER_TICK.register(DirectorScriptGeneration::tick);
+        net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents.SERVER_STOPPED.register(DirectorScriptGeneration::release);
+		PayloadTypeRegistry.serverboundPlay().register(DirectorEditorPayload.Request.TYPE, DirectorEditorPayload.Request.CODEC);
+		PayloadTypeRegistry.clientboundPlay().register(DirectorEditorPayload.Snapshot.TYPE, DirectorEditorPayload.Snapshot.CODEC);
+		if (!ServerPlayNetworking.registerGlobalReceiver(DirectorEditorPayload.Request.TYPE,
+				(payload, context) -> context.server().execute(() -> {
+					if (ServerPlayNetworking.canSend(context.player(), DirectorEditorPayload.Snapshot.TYPE))
+						ServerPlayNetworking.send(context.player(), DirectorScriptEditor.execute(context.player(), payload));
+				}))) throw new IllegalStateException("Director editor receiver is already registered");
+		PayloadTypeRegistry.clientboundPlay().register(DirectorSnapshotPayload.TYPE, DirectorSnapshotPayload.CODEC);
+		PayloadTypeRegistry.serverboundPlay().register(DirectorCommandRequestPayload.TYPE, DirectorCommandRequestPayload.CODEC);
+		PayloadTypeRegistry.clientboundPlay().register(DirectorCommandResultPayload.TYPE, DirectorCommandResultPayload.CODEC);
+		if (!ServerPlayNetworking.registerGlobalReceiver(DirectorCommandRequestPayload.TYPE,
+				(payload, context) -> context.server().execute(() -> {
+					if (!ServerPlayNetworking.canSend(context.player(), DirectorCommandResultPayload.TYPE)) return;
+					var result = DirectorCommands.execute(payload, context.server().getCommands().getDispatcher(), context.player().createCommandSourceStack());
+					ServerPlayNetworking.send(context.player(), result);
+				}))) throw new IllegalStateException("Director command receiver is already registered");
 		PayloadTypeRegistry.clientboundPlay().register(
 				ArenaSpectatorSnapshotPayload.TYPE,
 				ArenaSpectatorSnapshotPayload.CODEC
@@ -320,6 +346,15 @@ public final class AgentControlSync {
 
 	public static void sendSnapshot(ServerPlayer player) {
 		try {
+			var server = player.level().getServer();
+			if (ServerPlayNetworking.canSend(player, DirectorSnapshotPayload.TYPE)) {
+				var actors = SkitActors.records(server).stream().map(actor -> new DirectorSnapshotPayload.Actor(
+						actor.agentId().toString(), actor.name(), dev.agaminggod.arenaagents.agent.AgentIdentity.playerName(actor.agentId(), actor.profile()),
+						actor.appearance(), actor.dead(), SkitActors.find(server, actor.agentId()).filter(ServerPlayer::isAlive).isPresent(),
+						dev.agaminggod.arenaagents.server.voice.VoiceDirector.status(server, actor.agentId()),
+						dev.agaminggod.arenaagents.server.voice.VoiceDirectorSavedData.get(server).profile(actor.agentId()))).toList();
+				ServerPlayNetworking.send(player, new DirectorSnapshotPayload(SkitModeRuntime.enabled(server), GoalControl.mayControl(player.createCommandSourceStack()), actors));
+			}
 			boolean canControl = GoalControl.mayControl(player.createCommandSourceStack());
 			CodexAgentManager manager = CodexAgentManager.get(player.level().getServer());
 			AgentControlSnapshot snapshot = AgentControlSnapshot.fromRecords(

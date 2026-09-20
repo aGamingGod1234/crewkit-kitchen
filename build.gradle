@@ -403,6 +403,15 @@ tasks.named('test') {
 	failOnNoDiscoveredTests = false
 }
 
+tasks.register('verifyDirector', JavaExec) {
+	group = 'verification'
+	description = 'Checks Director authoring, speech sequencing, camera persistence and command contracts.'
+	dependsOn tasks.named('testClasses')
+	classpath = sourceSets.test.runtimeClasspath
+	mainClass.set('dev.agaminggod.arenaagents.verification.DirectorVerificationMain')
+	jvmArgs '--enable-native-access=ALL-UNNAMED'
+}
+
 tasks.register('verifyCameraMixin', JavaExec) {
 	group = 'verification'
 	description = 'Verifies camera accessor transformation in Fabric without starting client main or a world.'

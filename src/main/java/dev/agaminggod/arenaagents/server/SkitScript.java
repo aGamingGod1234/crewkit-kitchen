@@ -28,6 +28,20 @@ public record SkitScript(String name, String agentSelector, List<SkitStep> steps
 		return new SkitScript(name, agentSelector, next);
 	}
 
+	public SkitScript replace(int index, SkitStep step) {
+		Objects.checkIndex(index, steps.size());
+		var next = new java.util.ArrayList<>(steps);
+		next.set(index, Objects.requireNonNull(step));
+		return new SkitScript(name, agentSelector, next);
+	}
+
+	public SkitScript remove(int index) {
+		Objects.checkIndex(index, steps.size());
+		var next = new java.util.ArrayList<>(steps);
+		next.remove(index);
+		return new SkitScript(name, agentSelector, next);
+	}
+
 	private static String requireName(String value, String field) {
 		Objects.requireNonNull(value, field + " must not be null");
 		String checked = value.strip();

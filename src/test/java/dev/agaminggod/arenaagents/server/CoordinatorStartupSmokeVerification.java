@@ -12,6 +12,7 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
+import java.io.RandomAccessFile;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -57,6 +58,7 @@ public final class CoordinatorStartupSmokeVerification {
 		String oldVoiceRequestTimeout = System.getProperty("arenaagents.voiceRequestTimeoutMs");
 		CoordinatorProcessSupervisor supervisor = null;
 		try {
+			int cleanupAssertions = verifyFixtureCleanup(packageRoot);
 			int trustBoundaryAssertions = verifyPathRejectedBeforeSecretRead(
 					packageRoot.resolve("path-rejection"), oldPackageRoot, oldNodePath
 			);
@@ -117,7 +119,7 @@ public final class CoordinatorStartupSmokeVerification {
 						if (completeHandshakeAndCatalog(socket)) {
 							assertTrue(awaitLoopbackListener(voicePort, 5_000L),
 								"runtime Fish credential starts the loopback voice worker");
-							return 12 + credentialAssertions + trustBoundaryAssertions;
+							return 12 + credentialAssertions + trustBoundaryAssertions + cleanupAssertions;
 						}
 					} catch (java.net.SocketTimeoutException ignored) {
 						// The supervisor's startup grace is intentionally polled without shell state.
@@ -478,13 +480,33 @@ public final class CoordinatorStartupSmokeVerification {
 		}
 	}
 
+	private static int verifyFixtureCleanup(Path root) throws Exception {
+		if (!isWindows()) return 0;
+		Path locked = Files.createTempFile(root, "cleanup-sharing-", ".tmp");
+		try (RandomAccessFile handle = new RandomAccessFile(locked.toFile(), "rw")) {
+			var release = new java.util.concurrent.FutureTask<Void>(() -> {
+				Thread.sleep(150L);
+				handle.close();
+				return null;
+			});
+			Thread.ofPlatform().daemon(true).start(release);
+			try {
+				deleteEventually(locked);
+				assertTrue(!Files.exists(locked), "fixture cleanup waits for Windows sharing locks to release");
+			} finally {
+				release.get(5L, java.util.concurrent.TimeUnit.SECONDS);
+			}
+		}
+		return 1;
+	}
+
 	private static void deleteEventually(Path path) throws IOException {
 		long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(2L);
 		while (true) {
 			try {
 				Files.deleteIfExists(path);
 				return;
-			} catch (java.nio.file.AccessDeniedException exception) {
+			} catch (java.nio.file.FileSystemException exception) {
 				if (System.nanoTime() >= deadline) throw exception;
 				try {
 					Thread.sleep(25L);

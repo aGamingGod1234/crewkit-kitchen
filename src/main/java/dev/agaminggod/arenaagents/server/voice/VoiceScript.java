@@ -25,6 +25,20 @@ public record VoiceScript(String name, String agentSelector, List<VoiceCue> cues
 		return new VoiceScript(name, agentSelector, next);
 	}
 
+	public VoiceScript replace(int index, VoiceCue cue) {
+		Objects.checkIndex(index, cues.size());
+		var next = new ArrayList<>(cues);
+		next.set(index, Objects.requireNonNull(cue));
+		return new VoiceScript(name, agentSelector, next);
+	}
+
+	public VoiceScript remove(int index) {
+		Objects.checkIndex(index, cues.size());
+		var next = new ArrayList<>(cues);
+		next.remove(index);
+		return new VoiceScript(name, agentSelector, next);
+	}
+
 	private static String requireName(String value, String field) {
 		Objects.requireNonNull(value, field + " must not be null");
 		String checked = value.strip();

@@ -1342,3 +1342,17 @@ test('a real native event starts cleanly after a conversation wake supersedes pr
 	assert.deepEqual(await realTurn, { status: 'completed', toolCalls: 1 });
 	assert.deepEqual(executed, [{ kind: 'action', actionType: 'chat', arguments: { message: 'Hi Lucas!', audience: 'public' } }]);
 });
+
+test('Director draft sessions expose no Minecraft tools and use their own instructions', async () => {
+ const transport=new FakeSharedTransport();
+ const service=new CodexService({cwd:'C:\\workspace'},{transport});
+ await service.createAgent(profile('director-draft'),{controlProtocol:'director_script'});
+ const start=transport.calls.find(call=>call.method==='thread/start').params;
+ assert.deepEqual(start.dynamicTools,[]);
+ assert.deepEqual(start.environments,[]);
+ assert.equal(start.sandbox,'read-only');
+ assert.equal(start.allowProviderModelFallback,false);
+ assert.match(start.baseInstructions,/animation draft/);
+ assert.match(start.developerInstructions,/Never call tools/);
+ await service.stop();
+});

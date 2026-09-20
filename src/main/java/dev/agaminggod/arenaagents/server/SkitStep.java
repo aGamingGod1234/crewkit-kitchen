@@ -4,11 +4,15 @@ import java.util.Objects;
 import java.util.List;
 
 /** One absolute pose in a replayable skit timeline. */
-public record SkitStep(int delayTicks, SkitPlacement placement, List<SkitAction> actions) {
+public record SkitStep(int delayTicks, SkitPlacement placement, List<SkitAction> actions, boolean placeBeforeActions) {
 	public static final int MAX_DELAY_TICKS = 20 * 60 * 60;
 
 	public SkitStep(int delayTicks, SkitPlacement placement) {
 		this(delayTicks, placement, List.of());
+	}
+
+	public SkitStep(int delayTicks, SkitPlacement placement, List<SkitAction> actions) {
+		this(delayTicks, placement, actions, true);
 	}
 
 	public SkitStep {

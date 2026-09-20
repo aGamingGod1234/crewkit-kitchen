@@ -22,6 +22,8 @@ final class VoiceWorkerClient {
 	private static final int MAX_SAMPLES = 48_000 * 20;
 	private static final Set<String> TTS_WORKER_ERROR_CODES = Set.of(
 			"TTS_AUDIO_TOO_LONG",
+			"TTS_FISH_NOT_CONFIGURED",
+			"TTS_AUTHENTICATION_FAILED",
 			"TTS_CAPACITY",
 			"TTS_MALFORMED_AUDIO",
 			"TTS_PROVIDER_ERROR",

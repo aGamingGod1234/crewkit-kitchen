@@ -388,6 +388,8 @@ final class VoicePlaybackCoordinator implements AutoCloseable {
 			case "VOICE_WORKER_HTTP" -> boundedKnownReason(
 					failure.getMessage(), "Voice worker request failed", "Voice worker returned HTTP "
 			);
+			case "TTS_FISH_NOT_CONFIGURED" -> "Fish Audio is not configured on the host. Add a valid Fish API key and restart Minecraft.";
+			case "TTS_AUTHENTICATION_FAILED" -> "Fish Audio rejected its API key. Update the Fish key on the host and restart Minecraft.";
 			case "VOICE_WORKER_AUDIO" -> "Voice worker returned invalid audio";
 			case "VOICE_SECRET_UNAVAILABLE" -> "Voice worker authentication is unavailable";
 			default -> "Voice worker request failed";

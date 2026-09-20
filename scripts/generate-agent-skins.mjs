@@ -11,8 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { deflateSync, inflateSync } from 'node:zlib';
 
 // The vanilla humanoid UV layout is authored in 64 logical pixels. Brand agent
-// textures use an 8x raster so the visible 8x8 face can carry a clean logo;
-// ordinary provider skins remain native 64x64 textures.
+// textures use an 8x raster so the visible 8x8 face can carry a clean logo.
 const LOGICAL_SIZE = 64;
 const DEFAULT_TEXTURE_SCALE = 1;
 const BRAND_TEXTURE_SCALE = 8;
@@ -103,10 +102,16 @@ const BRAND_PALETTES = Object.freeze({
 		accent: Object.freeze([87, 134, 254, 255]),
 	}),
 	gemini: Object.freeze({
-		base: Object.freeze([138, 180, 248, 255]),
-		dark: Object.freeze([66, 133, 244, 255]),
+		base: Object.freeze([66, 133, 244, 255]),
+		dark: Object.freeze([37, 83, 160, 255]),
 		light: Object.freeze([235, 242, 255, 255]),
-		accent: Object.freeze([66, 133, 244, 255]),
+		accent: Object.freeze([138, 180, 248, 255]),
+	}),
+	cursor: Object.freeze({
+		base: Object.freeze([237, 236, 236, 255]),
+		dark: Object.freeze([182, 181, 180, 255]),
+		light: Object.freeze([250, 249, 249, 255]),
+		accent: Object.freeze([38, 37, 30, 255]),
 	}),
 	kimi: Object.freeze({
 		base: Object.freeze([0, 0, 0, 255]),
@@ -122,6 +127,7 @@ const BRAND_PALETTES = Object.freeze({
 // square; KIMI uses the supplied complete 64px black-background face tile.
 const BRAND_LOGO_RASTER_SIZE = 56;
 const BRAND_LOGO_RASTERS = Object.freeze({
+	cursor: 'eJzt2k0OgkAMBWCMF3DjFkxEcMkVvIhn8zDu3XobRRPNhATCtH39IbykOzLtRzNhQ1HopDmVr18ptVRJ6hqW9WzcTNkiG+e4IjoprghOCVda57Zy45S2edkl0mXp1HRpOvvzb5a2fzXlFWCzdwF2aW1AOa1nRjqt50QaredDGyn79pJcXyQnZX+RjFyfZyf1/kVxInzfasq7liFn3tznve6S+33w7tT2aTolvu9M43bJPuQuOT2lfQinR5+Uk9tDwbdB2qx97bG6rD7eXKvPly+3RyRfXdf7JfsoPaL4qD1Wn72P02P12fq4PTz7+mceC/exe0ydjzZO+TRsaCPSN9eGdI75tF0op6RPwpXm888Nwpd9TlM9pW2seSZ8ue8M6ZJwDn0eXcNQfd5daRA+S89Y5vqiuYah+Kxnzk3XHXaR7hg1S7alsXK9AdtQMT8=',
 	openai: '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',
 	claude: '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',
 	deepseek: 'eNrtmluIVlUUx6d0Gkvxgo3jpTTUJB8yE1/SUbp4LwcUSwihfMiMwlJRR1AQA9NMTVNBVBQUX7QeqgdRRhRNDURBNE2LKVNLy/GCt7KZn2fBGjhu9vnOPufb3zcjnP+TOHutvf5n773Wf6/9lZRkyJAhQ4YMDw+A0cDrD0GcrYERQDWwAvgMGBljUwZcBGqbQfwtgFLj/x4DxgLbgFs8iHvA/Bif40LjXy4SjxeAucD3wK9AHfC/xlAPXAAOAzuBa0RjqsNci0PjzwC9UsTbBqiIGfMI8CZwFD+4LD4dYtts2N0BVgGdHLk9qTGfyzGmN7APv5C92sYhvu0R9lfj9iswBPhZx9dFjBmuvgqBLUDLmBiX57Cva1xHoB/wZZCvDgHHNCeFsd/ie0yQ6+5SWBwB+ubg91GM/WxgmZ77XFht+JXvcZPi4EZwRqoi+HWPif2e4xxDQj6f0FxVTNRH5VPNw/ngpOFvKU2DBmC6hV9fS+1MgrEhXz2C2vYvTYtPLBwnK/+kWGT4WUPTQ3hMs3CcqPXPBXIuqw37VgWsBWk4zrBwHOnA62vgRYttFc0P68KaVuuxDStVX3V2rKVSG6YBQwNt3Ec15yvB+n4c6JmtwKUicpR6PUxjXGv5+xVHrbY3ZLPTQY++BuxIUIOi9pPow78dxv4QkUdPOPI7H7L5MYE+7xpoyS+A/1LwGxz6XqPknpfCxy7HOG+HbM6nuIc8r984CTYBkwLt2F59VOh+TIKljvE1GPumVQqOjwIzQ/fBOPwm+ws4Czwe4nguAb8JjrGZe7syjztwlaN+nQO8pf9+OmQ/2EEzN9aRLo4xXTC1eZ73/AGBpvzLIb7Gte5q2H/lwO9wgngOGLY1HnoZ/WN6FGEMMmzLjZxgQ3WCWDZYNH03DxyHOZ7H08Azhp6qjaktTyWI4z2Lj1meelJzE/QtpNe2EfgjZuw3CWN4zuJDamKZB35S32o865rKFHH8lKaP5+i7m/ZMfGB3yhjmWXxJXm3nieM7HrjJWR6Ycv6KiPvteo/94R158luR5/yrI+rUaE/8OqhuSYPfXfqmDmt4PaLP1d/BXu5Q83PVFuCllHr8DU/feEqEfzmLz8bYHg/10pc06krLuDnF3JeWfP5txDz/5MrNljvoGdt41eLbHLntN9+mPHBsB5yKmE/62h/a3khEg1h0lWihBfKGZnk/2+3Ab7LLe0wKjt31TEdhj7y/WOx2RYyvMXsksn+B7xw41mr9KvfMsVdwB/0lpve8T9fnA+0J5dKbf8rbhjFHqeN9Ad0bMkdbjxw7AQc966sDmmMqgZ4Bv476dl3vaD/O8zqWao+tgcJBuH0qPWzlb6tTV7SHV1ZSAOi74ckCcJOaP9wyX7mub0/fZy8Hx5ZBPO96emeSnvlC+X1FM/zNh9TJV/W+djHhm5/Uhfd95okicJW3+vHaQ/tc85zU+0V6pt7Wt9MW2S+XMmTIkCFDc8B9qmEgAg==',
@@ -495,8 +501,7 @@ function visualBrandFor(output) {
 	if (output.providerKey === 'codex') return 'openai';
 	if (output.providerKey === 'gemini') return output.familyKey === 'claude' ? 'claude' : 'gemini';
 	if (output.providerKey === 'kimi') return 'kimi';
-	// Cursor is intentionally left on its established art. DeepSeek is available
-	// as a standalone brand skin until a runtime provider key is added for it.
+	// Cursor models share the official cube mark regardless of model family.
 	return 'cursor';
 }
 
@@ -535,7 +540,7 @@ function blendLogoPixel(pixels, x, y, colour, alpha) {
 }
 
 function logoColour(brand, source) {
-	if (brand === 'gemini') return source;
+	if (brand === 'gemini' || brand === 'cursor') return source;
 	if (brand === 'deepseek') return [87, 134, 254, 255];
 	if (brand === 'kimi') return source;
 	return [255, 255, 255, 255];
@@ -577,26 +582,18 @@ function renderBrandSkin(output) {
 }
 
 function renderSkin(output) {
-	const isBrand = output.brandKey || output.providerKey !== 'cursor';
 	const previousScale = TEXTURE_SCALE;
 	const previousWidth = WIDTH;
 	const previousHeight = HEIGHT;
-	TEXTURE_SCALE = isBrand ? BRAND_TEXTURE_SCALE : DEFAULT_TEXTURE_SCALE;
+	TEXTURE_SCALE = BRAND_TEXTURE_SCALE;
 	WIDTH = LOGICAL_SIZE * TEXTURE_SCALE;
 	HEIGHT = LOGICAL_SIZE * TEXTURE_SCALE;
 	try {
-		if (isBrand) return {
+		return {
 			pixels: renderBrandSkin(output),
 			width: WIDTH,
 			height: HEIGHT,
 		};
-		const pixels = createPixels();
-		const palette = PALETTES[output.providerKey];
-		drawBase(pixels, palette);
-		drawProviderChassis(pixels, output.providerKey, palette);
-		drawFamilyMotif(pixels, output.familyIndex, palette);
-		drawIndividualSignature(pixels, output.variantIndex, palette);
-		return { pixels, width: WIDTH, height: HEIGHT };
 	} finally {
 		TEXTURE_SCALE = previousScale;
 		WIDTH = previousWidth;
@@ -680,8 +677,7 @@ function checkOutputs(outputs) {
 			continue;
 		}
 		const actual = readFileSync(outputPath);
-		const expectedScale = output.brandKey || output.providerKey !== 'cursor'
-			? BRAND_TEXTURE_SCALE : DEFAULT_TEXTURE_SCALE;
+		const expectedScale = BRAND_TEXTURE_SCALE;
 		const ihdrError = validateIhdr(actual, LOGICAL_SIZE * expectedScale, LOGICAL_SIZE * expectedScale);
 		if (ihdrError) errors.push(`${output.textureName} ${ihdrError}`);
 		const rendered = renderSkin(output);
@@ -701,7 +697,7 @@ function checkOutputs(outputs) {
 		for (const error of errors) process.stderr.write(`ERROR: ${error}\n`);
 		throw new Error(`Agent skin check failed with ${errors.length} error(s)`);
 	}
-	process.stdout.write(`Validated ${outputs.length} manifest-driven agent textures (${BRAND_TEXTURE_SCALE}x branded, ${DEFAULT_TEXTURE_SCALE}x ordinary).\n`);
+	process.stdout.write(`Validated ${outputs.length} manifest-driven agent textures (${BRAND_TEXTURE_SCALE}x branded).\n`);
 }
 
 function writeOutputs(outputs) {

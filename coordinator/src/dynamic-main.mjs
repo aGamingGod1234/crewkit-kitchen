@@ -1,3 +1,4 @@
+import { generateDirectorScript } from './director-script-generator.mjs';
 import { EventEmitter } from 'node:events';
 import { createHash } from 'node:crypto';
 import { mkdir, readFile } from 'node:fs/promises';
@@ -138,6 +139,7 @@ export class DynamicCoordinator extends EventEmitter {
 	#nativeWorldSignals = new Map();
 	#supervisedObservationRequests = new Map();
 	#conversationWakeTransactions = new Map();
+	#directorRequests = new Set();
 	#goalSpecRequests = new Map();
 	#goalSpecRequestCap;
 	#setGoalSpecTimeout;
@@ -497,6 +499,24 @@ export class DynamicCoordinator extends EventEmitter {
 			} catch (error) { this.#emitRuntimeError(error); }
 			await this.#publishStatus(connectionEpoch);
 		}, connectionEpoch));
+        this.#listen('director_script_request', (message, connectionEpoch) => {
+            const request=message.payload;
+            if(this.#directorRequests.has(request.requestId)) return;
+            this.#run(async () => {
+                let script='', error='';
+                if(this.#directorRequests.has(request.requestId)) return;
+                if(this.#directorRequests.size>=4) error='Luna is busy. Try again shortly.';
+                else {
+                    this.#directorRequests.add(request.requestId);
+                    try {
+                        const value=await this.#scheduler.schedule(`director-${request.requestId}`, ({signal})=>generateDirectorScript(this.#codexService,request,{signal}), {lane:'codex',priority:'ordinary',capacityClass:'auxiliary'});
+                        script=JSON.stringify(value);
+                    } catch(failure) { error=('Luna could not generate this script: '+(failure.message??'Unknown error')).slice(0,400); }
+                    finally { this.#directorRequests.delete(request.requestId); }
+                }
+                if(this.#isConnectionEpochCurrent(connectionEpoch)) await this.#sendForEpoch(connectionEpoch,'director_script_result','server',{requestId:request.requestId,script,error});
+            },connectionEpoch);
+        });
 		this.#listen('goal_spec_request', (message, connectionEpoch) => {
 			const key = this.#goalSpecRequestKey(message.agentId, message.payload.requestId);
 			const fingerprint = JSON.stringify(message.payload);
@@ -875,6 +895,7 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#inspections.cancel(undefined, 'BRIDGE_DISCONNECTED');
 			void this.#playerMemory.markUnknown(undefined, 'BRIDGE_DISCONNECTED').catch((error) => this.#emitRuntimeError(error));
 			this.#connected = false;
+            for(const requestId of this.#directorRequests) this.#scheduler.cancel(`director-${requestId}`, 'Director connection closed');
 			this.#setVerboseEnabled(false);
 			this.#cancelGoalSpecRequests();
 			for (const record of this.#registry.list()) {
@@ -2857,11 +2878,13 @@ export async function startVoiceWorker(config, environment = process.env, depend
 		if (localSpeechProvider === null && fishApiKey === null && deepgramApiKey === null && platform !== 'win32') return null;
 		const voiceSecret = await resolveVoiceSecret(voice, dependencies.readVoiceSecret ?? readFile);
 		throwIfVoiceStartupAborted(signal);
-		const createTtsProvider = dependencies.createTtsProvider ?? ((options) => new FishTtsProvider(options));
+		const createFishTtsProvider = dependencies.createTtsProvider ?? ((options) => new FishTtsProvider(options));
+		let fishTtsProvider;
+		const createTtsProvider = (options) => fishTtsProvider ??= createFishTtsProvider(options);
 		const createWindowsTtsProvider = dependencies.createWindowsTtsProvider ?? ((options) => new WindowsTtsProvider(options));
 		const createSttProvider = dependencies.createSttProvider ?? ((options) => new DeepgramSttProvider(options));
 		const createServer = dependencies.createVoiceServer ?? createVoiceHttpServer;
-		if (typeof createTtsProvider !== 'function') throw new TypeError('createTtsProvider must be a function');
+		if (typeof createFishTtsProvider !== 'function') throw new TypeError('createTtsProvider must be a function');
 		if (typeof createWindowsTtsProvider !== 'function') throw new TypeError('createWindowsTtsProvider must be a function');
 		if (typeof createServer !== 'function') throw new TypeError('createVoiceServer must be a function');
 		const hasTtsProvider = localSpeechProvider !== null || fishApiKey !== null || platform === 'win32';
@@ -2934,6 +2957,7 @@ export async function startVoiceWorker(config, environment = process.env, depend
 			});
 		worker = createServer({
 			provider,
+			fishProvider: fishApiKey === null ? null : createTtsProvider({ apiKey: fishApiKey }),
 			sttProvider,
 			profileStore,
 			secret: voiceSecret,

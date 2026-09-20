@@ -110,10 +110,14 @@ public final class CodexAgentServerRuntime {
 		ServerLifecycleEvents.SERVER_STOPPING.register(CodexAgentServerRuntime::stop);
 		ServerLifecycleEvents.END_DATA_PACK_RELOAD.register((server, resourceManager, success) ->
 				ServerObservationCollector.clearTagCache());
-		ServerPlayConnectionEvents.JOIN.register((handler, sender, server) ->
-				VoiceConsentRegistry.playerConnected(server, handler.getPlayer().getUUID()));
-		ServerPlayConnectionEvents.DISCONNECT.register((handler, server) ->
-				VoiceConsentRegistry.playerDisconnected(server, handler.getPlayer().getUUID()));
+		ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
+			WorldPlayerNames.get(server).remember(handler.getPlayer().getGameProfile().name(), handler.getPlayer().getUUID());
+			VoiceConsentRegistry.playerConnected(server, handler.getPlayer().getUUID());
+		});
+		ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
+			SkitActors.disconnected(handler.getPlayer());
+			VoiceConsentRegistry.playerDisconnected(server, handler.getPlayer().getUUID());
+		});
 		ServerLivingEntityEvents.ALLOW_DEATH.register((entity, source, damageAmount) -> {
 			if (!(entity instanceof net.minecraft.server.level.ServerPlayer player)) return true;
 			return AgentDeathCapture.allowVanillaDeath(
@@ -127,6 +131,7 @@ public final class CodexAgentServerRuntime {
 
 	private static void start(MinecraftServer server) {
 		ServerObservationCollector.clearTagCache();
+		SkitActors.tick(server);
 		CodexAgentManager manager = CodexAgentManager.get(server);
 		CoordinatorProcessSupervisor supervisor = COORDINATORS.get(server);
 		if (supervisor == null) {
@@ -293,6 +298,7 @@ public final class CodexAgentServerRuntime {
 	}
 
 	private static void endTick(MinecraftServer server) {
+		SkitActors.tick(server);
 		CodexAgentManager manager = CodexAgentManager.get(server);
 		CoordinatorProcessSupervisor supervisor = COORDINATORS.get(server);
 		MultiplexedServerBridge bridge = bridge(server);
@@ -321,6 +327,7 @@ public final class CodexAgentServerRuntime {
 			manager.reconcileDeaths();
 			manager.maintainChunkTickets();
 			VoiceSubsystemRuntime.tick(server);
+			DirectorTakeRuntime.tick(server);
 			VoiceDirector.tick(server);
 			maintainPlanningProgress(manager);
 			if (activeBridge != null) activeBridge.endTick();
@@ -552,6 +559,7 @@ public final class CodexAgentServerRuntime {
 		} finally {
 			ScenarioRuntimeService.release(server);
 			SkitModeRuntime.release(server);
+			SkitActors.release(server);
 			if (bridgeSlot != null) bridgeSlot.close();
 			if (supervisor != null) supervisor.close();
 			AgentVerboseState.release(server);
@@ -644,6 +652,11 @@ public final class CodexAgentServerRuntime {
 			return true;
 		}
 	}
+
+    public static boolean requestDirectorScript(MinecraftServer server, com.google.gson.JsonObject request) {
+        MultiplexedServerBridge active = bridge(server);
+        return active != null && active.requestDirectorScript(request);
+    }
 
 	private static MultiplexedServerBridge bridge(MinecraftServer server) {
 		BridgeSlot slot = BRIDGE_SLOTS.get(server);

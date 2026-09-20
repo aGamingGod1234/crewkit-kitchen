@@ -28,7 +28,7 @@ public final class AgentVisualIdentity {
 	private static final String MANIFEST_RESOURCE =
 			"assets/arenaagents/identity/agent_visual_manifest.json";
 	private static final Set<String> REQUIRED_PROVIDERS = Set.of("codex", "gemini", "kimi", "cursor");
-	private static final Set<String> REQUIRED_BRANDS = Set.of("openai", "claude", "deepseek", "gemini", "kimi");
+	private static final Set<String> REQUIRED_BRANDS = Set.of("openai", "claude", "deepseek", "gemini", "kimi", "cursor");
 	private static final Pattern KEY = Pattern.compile("[a-z][a-z0-9_]*");
 	private static final Pattern TRANSPORT_CODE = Pattern.compile("[a-z][a-z0-9]{1,6}");
 	private static final Pattern TEXTURE_PATH = Pattern.compile(
@@ -87,6 +87,7 @@ public final class AgentVisualIdentity {
 			case "codex" -> "openai";
 			case "gemini" -> identity.modelFamilyKey().equals("claude") ? "claude" : "gemini";
 			case "kimi" -> "kimi";
+			case "cursor" -> "cursor";
 			default -> null;
 		};
 		return brand == null ? identity.texturePath() : brandTexturePath(brand, identity.individualVariant());

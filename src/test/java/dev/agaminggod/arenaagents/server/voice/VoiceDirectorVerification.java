@@ -17,7 +17,21 @@ public final class VoiceDirectorVerification {
 		assertThrows(() -> new VoiceProfile("voice", "neutral", 2.1D, 48), "profile speed is bounded");
 		assertThrows(() -> new VoiceCue(0, "line", "", "", 0.2D, 0), "cue speed is bounded");
 		assertThrows(() -> new VoiceCue(0, "line", "", "", -1D, 129), "cue radius is bounded");
-		return 7;
+		assertEquals("voice.laura.v1", VoiceCatalog.defaultFor("GPT 6-Astra", "codex"), "Astra character voice");
+		assertEquals("voice.adrian.v1", VoiceCatalog.defaultFor("Fable 5.1", "claude"), "Fable character voice");
+		assertEquals("voice.jordan.v1", VoiceCatalog.defaultFor("Grok 4.6", "cursor"), "Grok character voice");
+		assertEquals("voice.ethan.v1", VoiceCatalog.defaultFor("Gemini 3.1-Pro", "gemini"), "Gemini character voice");
+		assertEquals("voice.sarah.v1", VoiceCatalog.defaultFor("Kimi K3", "kimi"), "Kimi character voice");
+		assertEquals(true, VoiceCatalog.accepts("voice.moss.v1"), "legacy profiles remain usable");
+		assertEquals(false, VoiceCatalog.selectableIds().contains("voice.moss.v1"), "new selection excludes legacy aliases");
+		VoiceCue preview = VoiceDirector.lineCue("Hello, exactly as typed!", new VoiceProfile("voice.selene.v1", "excited", 1.25, 64), "GPT 6-Astra", "codex");
+		assertEquals("voice.selene.v1", preview.profileId(), "preview uses selected dropdown voice");
+		assertEquals("excited", preview.tone(), "preview captures delivery tone");
+		assertEquals(1.25D, preview.speed(), "preview captures speed");
+		assertEquals(64, preview.radius(), "preview captures radius");
+		assertEquals("Hello, exactly as typed!", preview.text(), "preview preserves line");
+		assertEquals("voice.laura.v1", VoiceDirector.lineCue("Hi", VoiceProfile.defaults(), "GPT 6-Astra", "codex").profileId(), "preview auto resolves character voice");
+		return 20 + DirectorSpeechVerification.verify();
 	}
 
 	private static void assertThrows(Runnable action, String label) {
