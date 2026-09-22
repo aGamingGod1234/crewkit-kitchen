@@ -95,12 +95,11 @@ test('uses one selected-model ArenaScript contract and envelope schema', () => {
 	assert.match(PLANNER_SYSTEM_PROMPT, /watcher example/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /compiler diagnostics.*correct/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /no ambient Math/i);
-	assert.match(PLANNER_SYSTEM_PROMPT, /no bracket.*computed.*optional member access/i);
-	assert.match(PLANNER_SYSTEM_PROMPT, /for \(const candidate of world\.entities\(criteria\)\)/i);
-	assert.match(PLANNER_SYSTEM_PROMPT, /128-iteration and 1024-operation budget/i);
-	assert.match(PLANNER_SYSTEM_PROMPT, /world\.nearest.*selects one observed candidate by distance/i);
-	assert.match(PLANNER_SYSTEM_PROMPT, /string concatenation.*both operands.*strings/i);
-	assert.match(PLANNER_SYSTEM_PROMPT, /do not concatenate numeric candidate fields/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /bracket.*computed.*optional access/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /Iterate observed or literal immutable arrays with for-of/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /128 iterations and 1024 operations per resume/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /world\.nearest\(candidates\) by distance/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /Concatenation accepts strings only/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /coordinate-free player\.respawn\(\)/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /valid only while the authoritative player facts report dead/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /respawnDimensionId.*respawnX.*respawnY.*respawnZ.*respawnYaw.*respawnPitch.*respawnForced.*gameMode/s);

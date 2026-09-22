@@ -126,6 +126,16 @@ public final class CodexAgentServerRuntime {
 			);
 		});
 		ServerLivingEntityEvents.AFTER_DEATH.register(CodexAgentServerRuntime::recordAttributedKill);
+		net.fabricmc.fabric.api.event.lifecycle.v1.ServerEntityEvents.ENTITY_UNLOAD.register((entity, level) -> {
+			if (!(entity instanceof net.minecraft.world.entity.boss.enderdragon.EnderDragon dragon)) return;
+			var reason = dragon.getRemovalReason();
+			if (reason == null || !reason.shouldDestroy()) return;
+			var verifier = GOAL_VERIFIERS.get(level.getServer());
+			if (verifier == null) return;
+			AgentSavedData.get(level.getServer()).finishDragonKill(dragon.getUUID(), level.dimension().identifier().toString(),
+					reason == net.minecraft.world.entity.Entity.RemovalReason.KILLED && dragon.dragonDeathTime >= 200 && dragon.getHealth() <= 0)
+					.ifPresent(agentId -> verifier.recordKill(agentId, "minecraft:ender_dragon"));
+		});
 		registered = true;
 	}
 
@@ -532,12 +542,18 @@ public final class CodexAgentServerRuntime {
 	}
 
 	private static void recordAttributedKill(net.minecraft.world.entity.LivingEntity entity, net.minecraft.world.damagesource.DamageSource source) {
-		if (!(source.getEntity() instanceof ServerPlayer responsible)) return;
+		ServerPlayer responsible = dev.agaminggod.arenaagents.server.runtime.BlockUseAttribution.responsible(source);
+		if (responsible == null || responsible.level() != entity.level()) return;
 		MinecraftServer server = responsible.level().getServer();
 		GoalVerificationRuntime runtime = GOAL_VERIFIERS.get(server);
 		if (runtime == null) return;
 		for (var record : CodexAgentManager.get(server).records()) {
 			if (record.entityUuid().filter(responsible.getUUID()::equals).isEmpty()) continue;
+			if (entity instanceof net.minecraft.world.entity.boss.enderdragon.EnderDragon dragon) {
+				record.currentGoal().ifPresent(goal -> AgentSavedData.get(server).stageDragonKill(new AgentSavedData.PendingDragonKill(
+						dragon.getUUID(), dragon.level().dimension().identifier().toString(), record.agentId(), goal.goalId())));
+				return;
+			}
 			runtime.recordKill(record.agentId(), BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString());
 			return;
 		}

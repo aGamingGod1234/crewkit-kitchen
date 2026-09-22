@@ -5,13 +5,13 @@ description: Control the embodied Minecraft player through factual observations,
 
 # Minecraft player control
 
-Use native tools to act in the world. Plain assistant text has no Minecraft effect. You choose targets, routes, resources, reactions, and retries. The executor applies the inputs you authorize and reports what happened.
+Native tools apply your chosen actions and report what happened. Plain assistant text has no Minecraft effect.
 
 ## Read facts, choose, act, verify
 
-1. Read the current goal, newest event, and last result. Use capabilities for supported fields, runtime availability, and requested versus effective execution settings. Observe repeats the effective settings; a provider mapping does not change your selected identity.
-2. Use observe for a new sample and inspect for details. Check freshness, coverage, world identity, dimension, and revisions before relying on a fact.
-3. Choose a tool or bounded program using observed targets and your own strategy. Sequence only steps whose arguments are already known; inspect results before choosing dependent actions.
+1. Read the current goal, newest event, and last result. Use capabilities when you need unfamiliar fields or runtime settings. Observe repeats the effective settings; a provider mapping does not change your selected identity.
+2. Act from fresh supplied facts. Use observe to refresh a sample or inspect to fill a specific detail; neither is needed when the last result already supplies it. Check freshness, coverage, world identity, dimension, and revisions.
+3. For repeated work, read programReference and author a bounded runProgram routine with a completion condition and attention policy. Use background:true to keep it active while you reason. Choose targets from fresh program facts on each iteration, including new drop UUIDs and menu states. Return to model planning when the routine lacks a valid next step. Use sequence for a fixed batch of known steps and individual tools for isolated actions.
 4. Distinguish accepted input, attempted use, projectile spawn, verified effect, and verified goal. Finish asks the server to check the immutable goal contract. A failed check leaves it active.
 
 ## Observations and memory
@@ -38,11 +38,19 @@ RunProgram executes your ArenaScript using the same interpreter as script mode. 
 
 ## Interaction details
 
-Mining requires an observed, visible, reachable non-air expectedBlockId. A broken block does not prove its drop entered inventory. Melee attempts and bow release do not prove a hit. Use effect evidence, inventory changes, and fresh observations.
+Move to a standing position beside a solid target, with room for both feet and head. Removing a tree's bottom log still leaves the next log at head height. Use the goal's allowed tolerance; a tighter tolerance needlessly excludes safe positions. After NO_STANDABLE_PATH, choose another observed approach with clearance.
+
+Mining requires an observed, reachable non-air expectedBlockId and the exact block under the crosshair. For one known reachable block, prefer a sequence of look_at at its center, then break_block. A broken block does not prove collection. Blocking mining, movement, and pickup return postAction with updated inventory and entities. Use these facts when freshness.fresh is true; otherwise observe before a dependent action.
+
+For a quantity goal, count held matching items and collect reachable matching drops toward the remaining amount before mining more. Drops can enter inventory automatically as you approach. Once inventory meets goalSpec, request finish. Only request pick_up_item while more is needed and the UUID appears in fresh facts, including after ITEM_PICKED_UP. ITEM_NOT_FOUND means the selected entity is unavailable. Reconcile inventory and reacquire remaining drops. Melee attempts and bow release also need effect evidence before claiming a hit.
 
 Menu clicks use the current menuId, containerId, stateId, raw slot, button, clickType, expectedItemId, and expectedCount. Include expectedFingerprint for exact variants. Inspect after a click because cursor, slots, costs, and options can change. Generic clicks preserve a held cursor; close explicitly when appropriate. Provide containerId and stateId together for legacy menu operations. A rejected or partial operation is not automatically safe to repeat.
 
-Block hit offsets are within the block from 0 to 1. Entity hit offsets are relative to the observed entity position. Copy usable hit geometry and choose the hand explicitly. Sign writes compare expectedLines; book edits compare expectedFingerprint. A book title signs it. Beacon effects use observed legal effect IDs or none. Mechanics still depend on current world, menu, and game-mode state.
+The default minecraft:inventory menu with containerId 0 exists even while walking or mining. Its presence does not mean a screen blocks gameplay. Do not close it before ordinary actions. Close an actual external container when finished, using its latest observed identity and state. Inventory and menu state can change when a nearby item is collected, even without a menu click.
+
+For interact_block, choose a reachable face and omit hitX/hitY/hitZ by default. The executor derives the face point from the actual block shape, including inset chests. Supply offsets only when you have observed geometry that requires a specific point. Block hit offsets are within the block from 0 to 1. Entity hit offsets are relative to the observed entity position. Choose the hand explicitly. Sign writes compare expectedLines; book edits compare expectedFingerprint. A book title signs it. Beacon effects use observed legal effect IDs or none. Mechanics still depend on current world, menu, and game-mode state.
+
+After a deposit, inspect the menu to verify the destination stacks and your remaining inventory. AWAITING_OPERATOR_CONFIRMATION means report the result once with say and end the turn until new input arrives; leave the completed deposit alone. COMPLETED or lifecycle cancellation, including CANCELLED with STALE_PLAN, ends this goal turn. A cancelled call with executed:false made no world change. For other failed completion checks, use the returned unmet facts to decide the next action.
 
 ## Tool examples
 
@@ -142,9 +150,43 @@ Run your bounded ArenaScript through the shared interpreter. This example reads 
 {"tool":"runProgram","arguments":{"source":"program.onUnhandledAttention(\"pause_and_notify\"); const self = player.state(); if (self.health > 0) { await player.wait(50); }","maxActions":4,"timeoutMs":5000}}
 ```
 
+Set `background:true` when your authored routine should continue acting or reacting while you reason. It returns a `programId` and `goalRevision`; the routine retains exclusive body control. Observations, inspection, memory, and program status remain available. Choose your own watcher conditions and responses from current facts. Use `capabilities` with `section:"program"` for the language reference.
+
+A program ends on exhaustion, failure, cancellation, its action budget, or its deadline (at most 120 seconds). Watchers and sampling end with it. Background programs never restart themselves and do not survive stop, death, goal replacement, or disconnect. Cancel the program and wait for its result before issuing another body action. An `UNKNOWN` cancellation result requires checking the active action; input release is unconfirmed.
+
+With `continue_and_notify`, unhandled attention requests your decision while the authorised routine continues. With `pause_and_notify`, it cancels the current input and waits for your decision. A foreground call returns a live handle on attention so you can respond too. Program attention and completion arrive as events; use `programStatus` to recover the latest handle when needed. Ordinary progress does not require replanning.
+
+### programStatus
+
+Read a running program or the latest retained terminal result. Supply the exact handle when checking a particular program. A terminal program result does not prove goal completion; use `finish` for that.
+
+```json executor-call
+{"tool":"programStatus","arguments":{"programId":"native-program-session-1"}}
+```
+
+### respondProgram
+
+Copy the pending `decisionId`, `programId`, and `goalRevision` from the event or status. Choose `continue`, `pause`, `replace`, or `finish`. Only `replace` takes new `source`; it releases the previous input before starting the new version and retains the original deadline and action budget. A newer attention event invalidates an older decision. On `STALE_PROGRAM_DECISION`, inspect the current decision and reconsider. Ordinary authorised progress does not invalidate a decision.
+
+`pause` and `finish` end this routine after input release. Resume later with a newly authored program. Program `finish` does not complete the goal; the separate `finish` tool requests Minecraft verification.
+
+Repeated deterministic failures can halt the routine and deliver an `action_failure` decision. `PROGRAM_REPLACEMENT_REQUIRED` means its old continuation cannot resume: use the failure evidence to author a different replacement, or explicitly stop it.
+
+```json executor-call
+{"tool":"respondProgram","arguments":{"programId":"native-program-session-1","goalRevision":3,"decisionId":"native-program-session-1:decision-1","directive":"continue"}}
+```
+
+### cancelProgram
+
+Cancel the exact program, including a pending notebook load, and wait for its result. Copy both fields from the returned handle. Cancellation prevents subsequent program actions; an in-flight body action must acknowledge cancellation before control is released.
+
+```json executor-call
+{"tool":"cancelProgram","arguments":{"programId":"native-program-session-1","goalRevision":3}}
+```
+
 ### lookAround
 
-Turn the player through 2 to 8 short camera steps; call observe afterward to inspect the newly visible landmarks.
+Turn through 2 to 8 camera steps. Returned samples retain sightings from each heading; reacquire a target before acting on a historical sighting.
 
 ```json executor-call
 {"tool":"lookAround","arguments":{"centerYaw":90,"pitch":0,"steps":4,"ticksPerStep":3}}
@@ -208,10 +250,10 @@ Execute one supported advanced player action. Supply exactly the fields required
 
 ### sequence
 
-Prefer sequence for safe 2+ action chains. Execute 2 to 8 exact model-authored actions in order, stopping on the first factual failure; use separate calls when a later step needs fresh facts.
+Execute 2 to 8 known actions in order, stopping on the first factual failure. results contains step receipts. When a step attempted movement, mining, or pickup, postAction samples facts after the last attempted step. This pair aims and mines one observed, reachable block in one call; choose subsequent targets from that fresh result.
 
 ```json executor-call
-{"tool":"sequence","arguments":{"actions":[{"actionType":"navigate_to","arguments":{"x":11,"y":64,"z":10,"tolerance":1,"sprint":true,"timeoutMs":30000}},{"actionType":"break_block","arguments":{"x":11,"y":64,"z":10,"expectedBlockId":"minecraft:oak_log","timeoutMs":15000}}]}}
+{"tool":"sequence","arguments":{"actions":[{"actionType":"look_at","arguments":{"x":11.5,"y":64.5,"z":10.5}},{"actionType":"break_block","arguments":{"x":11,"y":64,"z":10,"expectedBlockId":"minecraft:oak_log","timeoutMs":15000}}]}}
 ```
 
 ### finish
@@ -415,7 +457,7 @@ Fields: `targetId`, `drawDurationMs`, `timeoutMs`.
 Fields: `x`, `y`, `z`, `face`, `hand`, `expectedItemId`, `hitX` optional, `hitY` optional, `hitZ` optional.
 
 ```json executor-call
-{"tool":"act","arguments":{"actionType":"interact_block","arguments":{"x":11,"y":64,"z":10,"face":"up","hand":"main","expectedItemId":"minecraft:bucket","hitX":0.5,"hitY":1,"hitZ":0.5}}}
+{"tool":"act","arguments":{"actionType":"interact_block","arguments":{"x":11,"y":64,"z":10,"face":"up","hand":"main","expectedItemId":"minecraft:bucket"}}}
 ```
 
 ### interact_entity

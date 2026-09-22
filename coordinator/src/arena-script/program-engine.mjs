@@ -37,7 +37,8 @@ export class ArenaScriptEngine {
 	}
 
 	ingestObservation({ observation, eventSequence, attention = false, priority = ORDINARY_PRIORITY, trigger = DEFAULT_ATTENTION_TRIGGER } = {}) {
-		if (!this.#isLive() || !Number.isSafeInteger(eventSequence) || eventSequence < 0 || eventSequence < this.#eventSequence) return this.snapshot();
+		const awaitingDecision = this.#status === 'SUSPENDED' && this.#resumableUnhandled && this.#pendingRequest !== null;
+		if ((!this.#isLive() && !awaitingDecision) || !Number.isSafeInteger(eventSequence) || eventSequence < 0 || eventSequence < this.#eventSequence) return this.snapshot();
 		const mayResume = this.#pendingResult && eventSequence >= this.#pendingResult.eventSequence;
 		if (eventSequence === this.#eventSequence && !mayResume && this.#factsSequence >= eventSequence) return this.snapshot();
 		const previousFacts = this.#facts;
@@ -46,6 +47,12 @@ export class ArenaScriptEngine {
 		this.#factsSequence = eventSequence;
 		this.#eventSequence = Math.max(this.#eventSequence, eventSequence);
 		this.#fencePendingRequest();
+		// Pausing the body must not freeze perception. Resume/replacement decisions
+		// consume these fresh facts, but observations alone cannot restart input.
+		if (awaitingDecision) {
+			if (attention) this.#requestModel(null, { priority, trigger });
+			return this.snapshot();
+		}
 		this.#tryPendingReplacement();
 		const edges = this.#updateWatchers(changedFactDomains);
 		if (this.#pendingResult && !this.#cancelling && eventSequence >= this.#pendingResult.eventSequence) this.#resumeOrRunBoundary();
@@ -155,7 +162,11 @@ export class ArenaScriptEngine {
 			else if (this.#transition?.kind === 'terminal' && this.#transition.reason === 'unhandled_attention') this.#transition = { kind: 'resume' };
 			else if (this.#status === 'SUSPENDED' && (this.#suspendedResult || this.#resumableUnhandled)) {
 				this.#pendingResult = this.#suspendedResult; this.#suspendedResult = null; this.#resumableUnhandled = false; this.#status = 'ACTIVE';
+				// Facts can change while input is paused. Reevaluate authored reactions
+				// before continuing, even if the next observation repeats these facts.
+				this.#updateWatchers();
 				if (this.#pendingResult && this.#factsSequence >= this.#pendingResult.eventSequence) this.#resumeOrRunBoundary();
+				else if (!this.#active && this.#boundary.length > 0) this.#runBoundary();
 			}
 			return this.snapshot();
 		}

@@ -19,25 +19,31 @@ export class NativeProgramExecutor {
 		this.#setTimeout = setTimeoutFn; this.#clearTimeout = clearTimeoutFn; this.#cancellationTimeoutMs = cancellationTimeoutMs;
 	}
 
-	run(record, { source, maxActions = 64, timeoutMs = 30_000, provenance = {} } = {}, context = {}) {
+	run(record, { source, maxActions = 64, timeoutMs = 30_000, planningLeadMs, observationIntervalMs, programId: suppliedProgramId, provenance = {} } = {}, context = {}) {
 		validateRecord(record);
 		integer(maxActions, 'maxActions', 1, 256); integer(timeoutMs, 'timeoutMs', 1, 120_000);
+		if (planningLeadMs !== undefined && planningLeadMs !== null) integer(planningLeadMs, 'planningLeadMs', 0, Number.MAX_SAFE_INTEGER);
+		if (observationIntervalMs !== undefined) {
+			integer(observationIntervalMs, 'observationIntervalMs', 100, 5000);
+			if (typeof context.refreshObservation !== 'function') throw codedError('INSPECTION_UNAVAILABLE', 'Requested sampling requires fresh observations');
+		}
 		if (this.#runs.has(record.agentId)) throw codedError('PROGRAM_BUSY', 'Cancel the active program before starting another');
 		if (typeof context.executeAction !== 'function' || typeof context.cancelAction !== 'function') throw new TypeError('executeAction and cancelAction callbacks are required');
 		integer(context.eventSequence, 'eventSequence', 1, Number.MAX_SAFE_INTEGER);
 		const compiled = parseArenaScript(source);
-		const programId = `native-program-${this.#sessionId}-${++this.#sequence}`;
+		const programId = suppliedProgramId ?? `native-program-${this.#sessionId}-${++this.#sequence}`;
+		if (typeof programId !== 'string' || !/^[A-Za-z0-9._:-]{1,128}$/.test(programId)) throw new TypeError('programId must be a bounded identifier');
 		let resolve;
 		const result = new Promise((done) => { resolve = done; });
-		const run = { record: { ...record }, context, programId, maxActions, actions: 0, receipts: [], resolve, result,
-			settled: false, bodyPending: false, pendingActionId: null, stopping: null, timer: null, cancellationTimer: null,
-			observation: programObservation(context.observation), eventSequence: context.eventSequence, engine: null };
+		const run = { record: { ...record }, context, programId, maxActions, timeoutMs, planningLeadMs: planningLeadMs ?? null, actions: 0, receipts: [], resolve, result,
+			settled: false, bodyPending: false, pendingActionId: null, stopping: null, timer: null, planningDueTimer: null, planningDueNotified: false, planningDueVersion: null, cancellationTimer: null,
+			observation: programObservation(context.observation), eventSequence: context.eventSequence, engine: null,
+			observationIntervalMs, observationTimer: null, refresh: null, decision: null, decisionSequence: 0 };
 		run.engine = new ArenaScriptEngine({
 			dispatch: (command) => { void this.#dispatch(run, command); },
 			cancel: (actionId) => { void this.#cancelBody(run, actionId); },
 			inspect: (request) => { void this.#query(run, request); },
-			requestModel: (request) => this.#return(run, { state: 'YIELDED', reasonCode: request.trigger === 'program_exhausted' ? 'PROGRAM_EXHAUSTED' : 'MODEL_DECISION_REQUIRED',
-				trigger: request.trigger, ...(request.actionFailure === undefined ? {} : { actionFailure: request.actionFailure }) }),
+			requestModel: (request) => this.#requestDecision(run, request),
 		});
 		this.#runs.set(record.agentId, run);
 		run.timer = this.#setTimeout(() => this.#return(run, { state: 'TIMED_OUT', reasonCode: 'PROGRAM_DEADLINE' }, true), timeoutMs);
@@ -46,9 +52,30 @@ export class NativeProgramExecutor {
 			run.engine.install({ agentId: record.agentId, provider: record.provider, modelIdentity: record.model, reasoningEffort: record.reasoningEffort,
 				serviceTier: record.serviceTier ?? 'priority', goalRevision: record.goalRevision, programId, version: 1, compiled,
 				traceId: provenance.traceId ?? programId, observation: run.observation, eventSequence: run.eventSequence });
+			this.#schedulePlanningDue(run);
 			this.#check(run);
+			this.#scheduleObservation(run);
 		} catch (error) { this.#return(run, failure(error, 'PROGRAM_EXECUTION_FAILED'), true); }
 		return result;
+	}
+
+	#refresh(run) {
+		if (run.refresh === null) run.refresh = Promise.resolve().then(() => run.context.refreshObservation?.()).finally(() => { run.refresh = null; });
+		return run.refresh;
+	}
+
+	#scheduleObservation(run) {
+		if (run.settled || run.stopping !== null || run.observationIntervalMs === undefined) return;
+		run.observationTimer = this.#setTimeout(async () => {
+			try {
+				if (run.settled || run.stopping !== null) return;
+				const fresh = await this.#refresh(run);
+				if (!run.settled && run.stopping === null) this.onObservation(run.record, fresh);
+			} catch (error) {
+				if (!run.settled) this.#return(run, failure(error, 'FRESH_OBSERVATION_REQUIRED'), true);
+			} finally { this.#scheduleObservation(run); }
+		}, run.observationIntervalMs);
+		run.observationTimer?.unref?.();
 	}
 
 	onObservation(record, payload = {}) {
@@ -58,10 +85,93 @@ export class NativeProgramExecutor {
 		try {
 			run.observation = programObservation(payload.observation ?? payload);
 			run.eventSequence = payload.eventSequence;
+			const decisionSequence = run.decisionSequence;
 			run.engine.ingestObservation({ ...payload, observation: run.observation });
+			// A new attention event invalidates an older decision. Ordinary progress
+			// refreshes facts without starving a model response on every physics tick.
+			if (payload.attention === true && run.decision !== null && run.decisionSequence === decisionSequence) {
+				this.#requestDecision(run, run.engine.refreshDirectiveRequest(), payload.priority ?? 'ordinary');
+			}
 			this.#check(run);
 			return true;
 		} catch (error) { this.#return(run, failure(error, 'INVALID_OBSERVATION'), true); return false; }
+	}
+
+	#schedulePlanningDue(run) {
+		if (run.settled || run.stopping !== null || run.planningDueNotified || run.planningLeadMs === null
+			|| run.planningLeadMs <= 0 || typeof run.context.onPlanningDue !== 'function') return;
+		const snapshot = run.engine.snapshot();
+		run.planningDueVersion = snapshot.version;
+		const delay = Math.max(0, run.timeoutMs - run.planningLeadMs);
+		run.planningDueTimer = this.#setTimeout(() => {
+			run.planningDueTimer = null;
+			// The advisory belongs to the version for which the deadline timer was
+			// armed. A replacement invalidates the old timer without interrupting
+			// the body or manufacturing a new decision.
+			if (run.settled || run.stopping !== null || run.planningDueNotified) return;
+			run.planningDueNotified = true;
+			const snapshot = run.engine.snapshot();
+			if (run.decision !== null || snapshot.status !== 'ACTIVE' || snapshot.version !== run.planningDueVersion) return;
+			try { run.context.onPlanningDue(this.status(run.record), { planningLeadMs: run.planningLeadMs }); }
+			catch { /* planning-ahead is advisory and cannot interrupt body execution */ }
+		}, delay);
+		run.planningDueTimer?.unref?.();
+	}
+
+	#requestDecision(run, request, notificationPriority = request?.priority) {
+		if (run.settled || run.stopping !== null || request === null) return;
+		if (request.trigger === 'program_exhausted' || typeof run.context.onDecision !== 'function') {
+			this.#return(run, { state: 'YIELDED', reasonCode: request.trigger === 'program_exhausted' ? 'PROGRAM_EXHAUSTED' : 'MODEL_DECISION_REQUIRED',
+				trigger: request.trigger, ...(request.actionFailure === undefined ? {} : { actionFailure: request.actionFailure }) });
+			return;
+		}
+		run.decision = { decisionId: `${run.programId}:decision-${++run.decisionSequence}`, programVersion: request.version,
+			trigger: request.trigger, priority: request.priority, eventSequence: request.eventSequence,
+			...(request.actionFailure === undefined ? {} : { actionFailure: request.actionFailure }) };
+		// The engine must finish applying the authored attention policy first.
+		const decision = run.decision;
+		queueMicrotask(() => {
+			if (run.settled || run.decision !== decision) return;
+			// The pending request retains its highest urgency, but later ordinary
+			// discoveries must not repeatedly interrupt that same reconsideration.
+			try { run.context.onDecision(this.status(run.record), { priority: notificationPriority }); }
+			catch (error) { this.#return(run, failure(error, 'PROGRAM_NOTIFICATION_FAILED'), true); }
+		});
+	}
+
+	status(record) {
+		const run = this.#runs.get(record.agentId);
+		if (!run || run.record.goalRevision !== record.goalRevision || run.settled) return null;
+		const snapshot = run.engine.snapshot();
+		return { programVersion: snapshot.version, engineState: snapshot.status,
+			...(run.decision === null ? {} : { decision: structuredClone(run.decision) }) };
+	}
+
+	respond(record, { programId, decisionId, directive, source }) {
+		const run = this.#runs.get(record.agentId);
+		if (!run || run.record.goalRevision !== record.goalRevision || run.programId !== programId || run.settled || run.stopping !== null
+			|| run.decision?.decisionId !== decisionId) throw codedError('STALE_PROGRAM_DECISION', 'Read the current program decision before responding');
+		if (!['continue', 'pause', 'replace', 'finish'].includes(directive)) throw codedError('INVALID_PROGRAM_DIRECTIVE', 'Unsupported program directive');
+		const compiled = directive === 'replace' ? parseArenaScript(source) : null;
+		const request = run.engine.refreshDirectiveRequest();
+		if (request === null) throw codedError('STALE_PROGRAM_DECISION', 'The program no longer needs this decision');
+		if (directive === 'continue' && request.actionFailure !== undefined) throw codedError('PROGRAM_REPLACEMENT_REQUIRED', 'A halted routine after repeated action failure requires replacement or an explicit stop');
+		run.decision = null;
+		if (directive === 'replace') {
+			// Replacements may wait for the current body action to acknowledge before
+			// installing their next engine version. Fence the old advisory now so a
+			// queued deadline callback cannot notify against obsolete authority.
+			run.planningDueNotified = true;
+			this.#clearPlanningDue(run);
+		}
+		if (directive === 'pause' || directive === 'finish') {
+			this.#return(run, { state: 'YIELDED', reasonCode: directive === 'pause' ? 'MODEL_PAUSED' : 'PROGRAM_FINISH_REQUESTED',
+				...(directive === 'finish' ? { finishRequested: true } : {}) }, true);
+			return run.result;
+		}
+		run.engine.applyDirective({ ...request, directive, ...(compiled === null ? {} : { install: { programId, version: request.version + 1, compiled } }) });
+		this.#check(run);
+		return this.status(record) ?? { state: 'ENDED' };
 	}
 
 	cancel(agentId, reason = 'PROGRAM_CANCELLED') {
@@ -111,7 +221,9 @@ export class NativeProgramExecutor {
 		}
 		let fresh;
 		try {
-			fresh = result.observation !== undefined && Number.isSafeInteger(result.eventSequence) ? result : await run.context.refreshObservation?.();
+			// A sample requested during the action cannot prove its terminal effects.
+			if (run.refresh !== null) await run.refresh;
+			fresh = result.observation !== undefined && Number.isSafeInteger(result.eventSequence) ? result : await this.#refresh(run);
 			if (!fresh || !Number.isSafeInteger(fresh.eventSequence) || fresh.eventSequence <= command.provenance.eventSequence) throw codedError('FRESH_OBSERVATION_REQUIRED', 'Observe action effects before continuing the program');
 			if (run.settled) return;
 			if (fresh.eventSequence > run.eventSequence) this.onObservation(run.record, fresh);
@@ -149,6 +261,7 @@ export class NativeProgramExecutor {
 		if (run.settled) return;
 		run.stopping = run.stopping ?? outcome;
 		if (cancel) run.stopping = outcome;
+		this.#clearPlanningDue(run);
 		if (cancel || !run.bodyPending) run.engine.suspend(run.stopping.reasonCode);
 		if (run.bodyPending && cancel && run.cancellationTimer === null) {
 			run.cancellationTimer = this.#setTimeout(() => this.#finish(run, { state: 'UNKNOWN', reasonCode: 'PROGRAM_CANCEL_ACK_TIMEOUT' }), this.#cancellationTimeoutMs);
@@ -159,6 +272,13 @@ export class NativeProgramExecutor {
 
 	#check(run) {
 		if (run.settled) return;
+		if (run.stopping === null && run.decision !== null) {
+			const request = run.engine.refreshDirectiveRequest();
+			// The shared engine coalesces failures behind an outstanding model request.
+			// Publish that changed decision without treating ordinary progress as one.
+			if (request && (request.trigger !== run.decision.trigger || request.priority !== run.decision.priority
+				|| JSON.stringify(request.actionFailure) !== JSON.stringify(run.decision.actionFailure))) this.#requestDecision(run, request);
+		}
 		const snapshot = run.engine.snapshot();
 		if (run.stopping !== null && !run.bodyPending) this.#finish(run, run.stopping);
 		else if (snapshot.status === 'PAUSED') this.#finish(run, { state: 'YIELDED', reasonCode: 'PROGRAM_CHECKPOINT' });
@@ -172,12 +292,20 @@ export class NativeProgramExecutor {
 		if (run.settled) return;
 		run.settled = true;
 		this.#clearTimeout(run.timer);
+		this.#clearPlanningDue(run);
+		if (run.observationTimer !== null) this.#clearTimeout(run.observationTimer);
 		if (run.cancellationTimer !== null) this.#clearTimeout(run.cancellationTimer);
 		this.#runs.delete(run.record.agentId);
 		const snapshot = run.engine.snapshot();
 		run.engine.dispose();
 		run.resolve({ ...outcome, programId: run.programId, actions: run.actions, receipts: run.receipts, eventSequence: snapshot.eventSequence,
 			observation: run.observation, ...(run.actions > 64 ? { omittedReceipts: run.actions - run.receipts.length } : {}) });
+	}
+
+	#clearPlanningDue(run) {
+		if (run.planningDueTimer === null) return;
+		this.#clearTimeout(run.planningDueTimer);
+		run.planningDueTimer = null;
 	}
 }
 

@@ -577,12 +577,27 @@ test('an action result fences an older request and replacement waits for facts a
 	assert.equal(dispatched.at(-1).action.arguments, 9);
 });
 
-test('idle pause-and-notify suspension remains resumable by its exact later continue directive', () => {
+test('idle pause-and-notify suspension refreshes facts and requires the latest continue directive', () => {
 	const { engine, modelRequests } = engineFor('program.onUnhandledAttention("pause_and_notify");');
 	engine.ingestObservation({ observation: observation(), eventSequence: 2, attention: true });
 	assert.equal(engine.snapshot().status, 'SUSPENDED');
 	engine.applyDirective({ directive: 'continue', ...modelRequests[0] });
+	assert.equal(engine.snapshot().status, 'SUSPENDED');
+	assert.equal(modelRequests[1].eventSequence, 2);
+	engine.applyDirective({ directive: 'continue', ...modelRequests[1] });
 	assert.equal(engine.snapshot().status, 'ACTIVE');
+});
+
+test('resuming a paused body runs newly true watchers before its old continuation', () => {
+	const { engine, dispatched } = engineFor(`program.onUnhandledAttention("pause_and_notify");
+		program.watch(() => player.state().health < 5, { mode: "interrupt" }, async () => { await player.wait(99); });
+		await player.wait(1000); await player.wait(2);`);
+	engine.ingestObservation({ observation: observation(), eventSequence: 2, attention: true });
+	engine.ingestActionResult({ actionId: dispatched[0].actionId, state: 'CANCELLED', reasonCode: 'CANCELLED', eventSequence: 2 });
+	engine.ingestObservation({ observation: observation({ player: { x: 0, y: 64, z: 0, health: 4 } }), eventSequence: 3 });
+	assert.equal(dispatched.length, 1, 'observing danger does not release the paused body');
+	engine.applyDirective({ ...engine.refreshDirectiveRequest(), directive: 'continue' });
+	assert.equal(dispatched[1].action.arguments, 99, 'the authored reaction takes precedence over the old next step');
 });
 
 test('same-version lifecycle input only refreshes an identical immutable compiled program', () => {

@@ -148,11 +148,17 @@ export function validateAction(value) {
 			requireTargetId(action.targetId, 'action.targetId');
 			requireDuration(action.drawDurationMs, 'action.drawDurationMs');
 			requireDuration(action.timeoutMs, 'action.timeoutMs');
+			if (action.trackTarget !== undefined) requireBoolean(action.trackTarget, 'action.trackTarget');
+			if (['aimX', 'aimY', 'aimZ'].some((key) => action[key] !== undefined)) {
+				for (const field of ['aimX', 'aimY', 'aimZ']) requireFiniteRange(action[field], `action.${field}`, -30_000_000, 30_000_000);
+				if (action.trackTarget === true) throw invalid('INVALID_FIELD', 'Fixed aim and target tracking are mutually exclusive');
+			}
 			break;
 		case 'select_item':
 			requireText(action.itemId, 'action.itemId', MAX_IDENTIFIER_LENGTH);
 			break;
 		case 'use_item':
+			if (action.mode !== undefined) requireOneOf(action.mode, 'action.mode', ['once', 'hold']);
 			if (action.hand !== undefined) requireOneOf(action.hand, 'action.hand', ['main', 'off']);
 			if (action.expectedItemId !== undefined) requireText(action.expectedItemId, 'action.expectedItemId', MAX_IDENTIFIER_LENGTH);
 			requireDuration(action.durationMs, 'action.durationMs');

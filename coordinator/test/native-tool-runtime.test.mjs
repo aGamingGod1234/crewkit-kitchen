@@ -4,8 +4,10 @@ import test from 'node:test';
 import { goalSpecFingerprint } from '../src/goal-spec.mjs';
 import { nativeObservationSignature } from '../src/dynamic-main.mjs';
 import { constrainGoalBoundNavigation, NativeToolRuntime } from '../src/native-tool-runtime.mjs';
+import { toolResultContent } from '../src/native-minecraft-tools.mjs';
 import { ModelNotebook } from '../src/model-notebook.mjs';
 import { adaptObservation } from '../src/observation-adapter.mjs';
+import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
 
 function record(overrides = {}) {
 	const fields = {
@@ -269,7 +271,11 @@ test('unchanged actionable heartbeat still refreshes clocks, cooldowns, effects,
 
 test('lookAround turns the real player in bounded steps and preserves the observed hand and slot', async () => {
 	const sent = [];
-	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) } });
+	const samples = [];
+	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) }, requestObservation: async (_record, { afterEventSequence }) => {
+		samples.push(afterEventSequence);
+		return { eventSequence: afterEventSequence + 1, observation: { observedAtEpochMs: samples.length * 10, world: { dimension: 'minecraft:overworld' }, entities: [{ uuid: `seen-${samples.length}`, type: 'minecraft:pig' }] } };
+	} });
 	runtime.updateObservation(record(), {
 		interaction: { input: { selectedSlot: 3, hand: 'off_hand' } },
 	}, { eventSequence: 1 });
@@ -286,10 +292,13 @@ test('lookAround turns the real player in bounded steps and preserves the observ
 		});
 		runtime.onActionResult(record(), { actionId: sent[index][2].actionId, state: 'SUCCEEDED', reasonCode: '' });
 	}
-	assert.deepEqual(await pending, {
-		state: 'SUCCEEDED', completed: 4,
-		results: [0, 1, 2, 3].map((index) => ({ actionType: 'control', state: 'SUCCEEDED', reasonCode: '' })),
-	});
+	const result = await pending;
+	assert.equal(result.state, 'SUCCEEDED');
+	assert.deepEqual(samples, [1, 2, 3, 4]);
+	assert.deepEqual(result.samples.map((sample) => sample.yaw), [90, 180, -90, 0]);
+	assert.deepEqual(result.samples.map((sample) => sample.eventSequence), [2, 3, 4, 5]);
+	assert.deepEqual(result.samples.map((sample) => sample.entities[0].uuid), ['seen-1', 'seen-2', 'seen-3', 'seen-4']);
+	assert.ok(result.samples.every((sample) => sample.historical && sample.dimension === 'minecraft:overworld'));
 });
 
 test('native lifecycle disposal cancels an outstanding body action and rejects the tool', async () => {
@@ -1076,6 +1085,7 @@ test('native programs preserve selected authorship and refresh before a dependen
 	const observation = { world: { worldId: 'world-a' }, player: { x: 0, y: 64, z: 0, health: 20 }, blocks: [], entities: [], items: [], inventory: { items: [], tagCounts: {} } };
 	let runtime;
 	runtime = new NativeToolRuntime({ notebook, bridge: { send: async (...args) => {
+		validateProtocolV2Payload(args[0], args[2]);
 		sent.push(args);
 		if (args[0] === 'action_command') queueMicrotask(() => runtime.onActionResult(record(), { actionId: args[2].actionId, state: 'SUCCEEDED', reasonCode: '', executionStarted: true }));
 	} }, requestObservation: async () => ({ observation, eventSequence: ++sequence }) });
@@ -1088,6 +1098,48 @@ test('native programs preserve selected authorship and refresh before a dependen
 	assert.match(sent[0][2].provenance.programId, /^native-program-/);
 	assert.match(result.receipts[0].bodyActionId, /^native:/);
 	assert.equal((await notebook.query('agent-a', { worldId: 'world-a', kind: 'notes' })).entries[0].provenance.programId, sent[0][2].provenance.programId);
+});
+
+test('saved programs use an exact notebook key in the current world', async () => {
+	const notebook = new ModelNotebook();
+	const runtime = new NativeToolRuntime({ notebook, bridge: { send: async () => {} } });
+	runtime.updateObservation(record(), { world: { worldId: 'world-a' }, player: { health: 20 }, entities: [], blocks: [], items: [], inventory: { items: [] } }, { eventSequence: 1 });
+	await runtime.execute(nativeCall({ kind: 'notebook', key: 'routine-other', text: 'program.onUnhandledAttention("continue_and_notify"); program.finish("wrong");' }), record());
+	await assert.rejects(runtime.execute(nativeCall({ kind: 'run_program', noteKey: 'routine' }), record()), { code: 'PROGRAM_NOTE_NOT_FOUND' });
+	await runtime.execute(nativeCall({ kind: 'notebook', key: 'routine', text: 'program.onUnhandledAttention("continue_and_notify"); program.finish("saved");' }), record());
+	assert.equal((await runtime.execute(nativeCall({ kind: 'run_program', noteKey: 'routine' }), record())).reasonCode, 'PROGRAM_FINISH_REQUESTED');
+	runtime.updateObservation(record(), { world: { worldId: 'world-b' }, player: { health: 20 } }, { eventSequence: 2 });
+	await assert.rejects(runtime.execute(nativeCall({ kind: 'run_program', noteKey: 'routine' }), record()), { code: 'PROGRAM_NOTE_NOT_FOUND' });
+});
+
+test('saved program lookup paginates fuzzy note matches until the exact key is found', async () => {
+	const queries = [];
+	const source = 'program.onUnhandledAttention("continue_and_notify"); program.finish("paged");';
+	const runtime = new NativeToolRuntime({ bridge: { send: async () => {} }, memoryOperation: async (_record, operation) => {
+		queries.push(operation.arguments);
+		if (operation.arguments.offset === 0) return { entries: Array.from({ length: 64 }, (_, index) => ({ key: `routine-${index}`, text: source })), nextOffset: 64 };
+		return { entries: [{ key: 'routine', text: source }], nextOffset: null };
+	} });
+	runtime.updateObservation(record(), { world: { worldId: 'world-a' }, player: { health: 20 }, entities: [], blocks: [], items: [], inventory: { items: [] } }, { eventSequence: 1 });
+	const result = await runtime.execute(nativeCall({ kind: 'run_program', noteKey: 'routine' }), record());
+	assert.equal(result.reasonCode, 'PROGRAM_FINISH_REQUESTED');
+	assert.deepEqual(queries.map(({ kind, text, offset, limit }) => ({ kind, text, offset, limit })), [
+		{ kind: 'notes', text: 'routine', offset: 0, limit: 64 },
+		{ kind: 'notes', text: 'routine', offset: 64, limit: 64 },
+	]);
+});
+
+test('saved program lookup stops paging after its lifecycle is cancelled', async () => {
+	let runtime;
+	let queries = 0;
+	runtime = new NativeToolRuntime({ bridge: { send: async () => {} }, memoryOperation: async () => {
+		queries += 1;
+		await runtime.dispose('agent-a', 'goal_changed');
+		return { entries: [], nextOffset: 64 };
+	} });
+	runtime.updateObservation(record(), { world: { worldId: 'world-a' }, player: { health: 20 }, entities: [], blocks: [], items: [], inventory: { items: [] } }, { eventSequence: 1 });
+	await assert.rejects(runtime.execute(nativeCall({ kind: 'run_program', noteKey: 'routine' }), record()), { code: 'NATIVE_PROGRAM_CANCELLED' });
+	assert.equal(queries, 1, 'cancellation prevents another paginated lookup');
 });
 
 test('native programs inspect a raw page, use its facts in an action, and request finish', async () => {
@@ -1163,4 +1215,218 @@ test('focused inspection binds only the page entries actually delivered after na
 		assert.equal(sent.at(-1)[2].provenance.eventSequence, expected);
 		runtime.onActionResult(record(), { actionId: handle.actionId, state: 'FAILED', reasonCode: 'TARGET_NOT_VISIBLE' });
 	}
+});
+
+test('saved program reserves ownership before asynchronous notebook loading', async () => {
+	let release;
+	const runtime = new NativeToolRuntime({ bridge: { send: async () => {} }, memoryOperation: async () => new Promise((resolve) => { release = resolve; }) });
+	runtime.updateObservation(record(), { world: { worldId: 'world-a' }, player: { health: 20 } }, { eventSequence: 1 });
+	const first = runtime.execute(nativeCall({ kind: 'run_program', noteKey: 'routine' }), record());
+	await new Promise((resolve) => setImmediate(resolve));
+	await assert.rejects(runtime.execute(nativeCall({ kind: 'run_program', source: 'program.finish("other");' }), record()), { code: 'NATIVE_PROGRAM_IN_PROGRESS' });
+	release({ entries: [{ key: 'routine', text: 'program.onUnhandledAttention("continue_and_notify"); program.finish("loaded");' }] });
+	assert.equal((await first).reasonCode, 'PROGRAM_FINISH_REQUESTED');
+	assert.equal((await runtime.execute(nativeCall({ kind: 'run_program', source: 'program.onUnhandledAttention("continue_and_notify"); program.finish("next");' }), record())).reasonCode, 'PROGRAM_FINISH_REQUESTED');
+});
+
+test('lifecycle disposal fences a program still loading from the notebook', async () => {
+	let release;
+	const runtime = new NativeToolRuntime({ bridge: { send: async () => {} }, memoryOperation: async () => new Promise((resolve) => { release = resolve; }) });
+	const loading = runtime.execute(nativeCall({ kind: 'run_program', noteKey: 'routine' }), record());
+	await new Promise((resolve) => setImmediate(resolve));
+	await runtime.disposeAll('shutdown');
+	release({ entries: [{ key: 'routine', text: 'program.finish("obsolete");' }] });
+	await assert.rejects(loading, { code: 'NATIVE_PROGRAM_CANCELLED' });
+});
+
+test('camera sweep stops if a heading cannot obtain fresh facts', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) } });
+	const pending = runtime.execute(nativeCall({ kind: 'lookAround', centerYaw: 0, pitch: 0, steps: 4, ticksPerStep: 1 }), record());
+	await new Promise((resolve) => setImmediate(resolve));
+	runtime.onActionResult(record(), { actionId: sent[0][2].actionId, state: 'SUCCEEDED', reasonCode: '' });
+	await assert.rejects(pending, { code: 'FRESH_OBSERVATION_REQUIRED' });
+	assert.equal(sent.length, 1);
+});
+
+test('sweep waits for each sample, excludes remembered entities, and retains headings under the result budget', async () => {
+	const sent = [];
+	let release;
+	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) }, requestObservation: async (_record, { afterEventSequence }) => new Promise((resolve) => {
+		release = () => resolve({ eventSequence: afterEventSequence + 1, observation: {
+			world: { dimension: 'minecraft:overworld' }, continuity: { rememberedSections: ['entities'] },
+			entities: [{ uuid: 'stale-target' }], blocks: Array.from({ length: 100 }, (_, x) => ({ blockId: 'minecraft:stone', x, y: 64, z: 0 })),
+		} });
+	}) });
+	const pending = runtime.execute(nativeCall({ kind: 'lookAround', centerYaw: 0, pitch: 0, steps: 8, ticksPerStep: 1 }), record());
+	for (let index = 0; index < 8; index += 1) {
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(sent.length, index + 1);
+		runtime.onActionResult(record(), { actionId: sent[index][2].actionId, state: 'SUCCEEDED', reasonCode: '' });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(sent.length, index + 1, 'next turn must wait for its predecessor sample');
+		await assert.rejects(runtime.execute(nativeCall({ kind: 'action', actionType: 'wait', arguments: { durationMs: 1 } }), record()), { code: 'NATIVE_ACTION_IN_PROGRESS' });
+		release();
+	}
+	const result = await pending;
+	assert.ok(result.samples.every((sample) => sample.entities.length === 0 && sample.omitted.blocks > 0));
+	assert.ok(result.samples.every((sample) => Buffer.byteLength(JSON.stringify(sample), 'utf8') <= 1400));
+	assert.ok(result.samples.every((sample) => sample.omitted.blocks === 100 - sample.blocks.length));
+	result.results[0].actionObservation = { detail: 'x'.repeat(20_000) };
+	const text = toolResultContent(result).contentItems[0].text;
+	assert.ok(Buffer.byteLength(text) <= 16_384);
+	assert.equal(JSON.parse(text).samples.length, 8);
+});
+
+test('sweep retains a late distinct sighting ahead of repeated terrain', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({
+		bridge: { send: async (...args) => sent.push(args) },
+		requestObservation: async (_record, { afterEventSequence }) => ({
+			eventSequence: afterEventSequence + 1,
+			observation: {
+				world: { dimension: 'minecraft:overworld' },
+				entities: Array.from({ length: 12 }, (_, index) => ({ stableId: `pig-${index}`, type: 'minecraft:pig', x: index, y: 64, z: 0 })),
+				blocks: [
+					...Array.from({ length: 100 }, (_, x) => ({ blockId: 'minecraft:grass_block', x, y: 64, z: 0 })),
+				],
+				landmarks: [
+					...Array.from({ length: 24 }, (_, index) => ({ stableId: `grass-${index}`, blockId: 'minecraft:grass_block', x: index, y: 64, z: 2 })),
+					{ stableId: 'tree', blockId: 'minecraft:oak_leaves', x: 9, y: 72, z: 2 },
+				],
+			},
+		}),
+	});
+	const pending = runtime.execute(nativeCall({ kind: 'lookAround', centerYaw: 0, pitch: 0, steps: 2, ticksPerStep: 1 }), record());
+	for (let index = 0; index < 2; index += 1) {
+		await new Promise((resolve) => setImmediate(resolve));
+		runtime.onActionResult(record(), { actionId: sent[index][2].actionId, state: 'SUCCEEDED', reasonCode: '' });
+	}
+	const result = await pending;
+	assert.ok(result.samples.every((sample) => sample.entities.some((entity) => entity.type === 'minecraft:pig')));
+	assert.ok(result.samples.every((sample) => sample.blocks.some((block) => block.blockId === 'minecraft:grass_block')));
+	assert.ok(result.samples.every((sample) => sample.landmarks.some((landmark) => landmark.blockId === 'minecraft:oak_leaves')));
+	assert.ok(result.samples.every((sample) => Buffer.byteLength(JSON.stringify(sample), 'utf8') <= 1400));
+	assert.ok(result.samples.every((sample) => sample.omitted.entities === 12 - sample.entities.length));
+	assert.ok(result.samples.every((sample) => sample.omitted.blocks === 100 - sample.blocks.length));
+	assert.ok(result.samples.every((sample) => sample.omitted.landmarks === 25 - sample.landmarks.length));
+});
+
+for (const otherUnmet of [false, true]) {
+ test(`completion distinguishes operator confirmation from unmet gameplay: ${otherUnmet}`, async () => {
+  const sent = [];
+  const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) } });
+  const pending = runtime.execute({ agentId: 'agent-a', goalRevision: 3, turnId: 'turn-1', callId: 'confirm', tool: { kind: 'finish' } }, record());
+  await Promise.resolve();
+  runtime.onCompletionResult(record(), { goalRevision: 3, traceId: sent[0][2].traceId, goalFingerprint: sent[0][2].goalFingerprint, verified: false, reasonCode: 'PREDICATE_FAILED', facts: [
+   { type: 'operator_confirmed', satisfied: false }, { type: 'inventory_contains', satisfied: !otherUnmet },
+  ] });
+  const result = await pending;
+  assert.equal(result.verified, false);
+  assert.equal(result.state, otherUnmet ? 'ACTIVE' : 'AWAITING_OPERATOR_CONFIRMATION');
+  assert.equal(result.reasonCode, 'PREDICATE_FAILED');
+ });
+}
+
+test('pickup result includes a fresh inventory sample and no consumed drop', async () => {
+ const sent = [];
+ let samples = 0;
+ const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) }, requestObservation: async (_record, { afterEventSequence }) => {
+  samples++;
+  return { eventSequence: afterEventSequence + 1, observation: { inventory: { items: [{ itemId: 'minecraft:oak_log', count: 1, slot: 'mainhand' }] }, entities: [], position: { x: 6, y: 201, z: 3 } } };
+ } });
+ const pending = runtime.execute({ agentId: 'agent-a', goalRevision: 3, turnId: 'pickup', callId: 'pickup', tool: { kind: 'action', actionType: 'pick_up_item', arguments: { targetSelector: '00000000-0000-4000-8000-000000000001' } } }, record());
+ await Promise.resolve();
+ runtime.onActionResult(record(), { actionId: sent[0][2].actionId, goalRevision: 3, state: 'SUCCEEDED', reasonCode: 'ITEM_PICKED_UP' });
+ const result = await pending;
+ assert.equal(samples, 1);
+ assert.equal(result.postAction.freshness.fresh, true);
+ assert.equal(result.postAction.observation.inventory.items[0].count, 1);
+ assert.deepEqual(result.postAction.observation.entities, []);
+});
+
+for (const state of ['SUCCEEDED', 'FAILED']) {
+ test(`post-action refresh failure preserves authoritative ${state}`, async () => {
+  const sent = [];
+  const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) }, requestObservation: async () => { throw Object.assign(new Error('offline'), { code: 'OBSERVATION_UNAVAILABLE' }); } });
+  const pending = runtime.execute(nativeCall({ kind: 'action', actionType: 'pick_up_item', arguments: { targetSelector: 'drop' } }), record());
+  await new Promise(resolve => setImmediate(resolve));
+  runtime.onActionResult(record(), { actionId: sent[0][2].actionId, goalRevision: 3, state, reasonCode: state === 'SUCCEEDED' ? 'ITEM_PICKED_UP' : 'ITEM_NOT_FOUND' });
+  const result = await pending;
+  assert.equal(result.state, state);
+  assert.equal(result.postAction.freshness.fresh, false);
+  assert.equal(result.postAction.reasonCode, 'OBSERVATION_UNAVAILABLE');
+ });
+}
+
+test('post-action feedback cannot repopulate a disposed goal', async () => {
+ const sent = [];
+ let sampled;
+ const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) }, requestObservation: () => new Promise(resolve => { sampled = resolve; }) });
+ const pending = runtime.execute(nativeCall({ kind: 'action', actionType: 'pick_up_item', arguments: { targetSelector: 'drop' } }), record());
+ await new Promise(resolve => setImmediate(resolve));
+ runtime.onActionResult(record(), { actionId: sent[0][2].actionId, goalRevision: 3, state: 'SUCCEEDED', reasonCode: 'ITEM_PICKED_UP' });
+ await new Promise(resolve => setImmediate(resolve));
+ await runtime.dispose('agent-a', 'goal_stopped');
+ sampled({ eventSequence: 1, observation: { inventory: { items: [] } } });
+ const result = await pending;
+ assert.equal(result.state, 'SUCCEEDED');
+ assert.equal(result.postAction.reasonCode, 'STALE_NATIVE_TOOL');
+ assert.equal(result.postAction.freshness.fresh, false);
+ assert.equal(runtime.hasCurrent(record()), false);
+});
+
+for (const terminalState of ['SUCCEEDED', 'FAILED']) {
+	test(`native sequence samples once after its last attempted action: ${terminalState}`, async () => {
+		const sent = [];
+		let samples = 0;
+		let runtime;
+		runtime = new NativeToolRuntime({ bridge: { send: async (type, agentId, payload) => {
+			if (type !== 'action_command') return;
+			sent.push(payload);
+			queueMicrotask(() => runtime.onActionResult(record(), { actionId: payload.actionId, state: sent.length === 2 ? terminalState : 'SUCCEEDED', reasonCode: sent.length === 2 && terminalState === 'FAILED' ? 'TARGET_OBSTRUCTED' : 'BLOCK_BROKEN' }));
+		} }, requestObservation: async (_record, { afterEventSequence }) => {
+			samples++;
+			assert.equal(sent.length, 2, 'intermediate sampling cannot guide an already-authored sequence');
+			return { eventSequence: afterEventSequence + 1, observation: { inventory: { items: [{ itemId: 'minecraft:oak_log', count: sent.length }] } } };
+		} });
+		const result = await runtime.execute(nativeCall({ kind: 'sequence', actions: [0, 1, 2].map(x => ({ actionType: 'break_block', arguments: { x, y: 64, z: 0, expectedBlockId: 'minecraft:oak_log', timeoutMs: 1000 } })).slice(0, terminalState === 'FAILED' ? 3 : 2) }), record());
+		assert.equal(result.state, terminalState);
+		assert.equal(result.completed, 2);
+		assert.equal(sent.length, 2);
+		assert.equal(samples, 1);
+		assert.equal(result.postAction.freshness.fresh, true);
+		assert.equal(result.postAction.observation.inventory.items[0].count, 2);
+		assert.equal(result.results.some(step => step.postAction !== undefined), false);
+	});
+}
+
+test('native program samples action effects once before the authored continuation', async () => {
+	let samples = 0;
+	let runtime;
+	const observation = { player: { health: 20 }, inventory: { items: [] } };
+	runtime = new NativeToolRuntime({ bridge: { send: async (type, agentId, payload) => {
+		if (type === 'action_command') queueMicrotask(() => runtime.onActionResult(record(), { actionId: payload.actionId, state: 'SUCCEEDED', reasonCode: 'ARRIVED' }));
+	} }, requestObservation: async (_record, { afterEventSequence }) => {
+		samples++;
+		return { eventSequence: afterEventSequence + 1, observation };
+	} });
+	runtime.updateObservation(record(), observation, { eventSequence: 1 });
+	const result = await runtime.execute(nativeCall({ kind: 'run_program', source: 'program.onUnhandledAttention("continue_and_notify"); await player.navigateTo({ x: 1, y: 64, z: 0, tolerance: 1, sprint: false, timeoutMs: 1000 }); program.finish("Arrived");' }), record());
+	assert.equal(result.reasonCode, 'PROGRAM_FINISH_REQUESTED');
+	assert.equal(result.actions, 1);
+	assert.equal(samples, 1);
+});
+
+test('fresh observation is fenced after asynchronous metadata finishes', async () => {
+	let releaseMetadata;
+	const runtime = new NativeToolRuntime({ bridge: { send: async () => {} },
+		requestObservation: async () => ({ eventSequence: 1, observation: { inventory: { items: [] } } }),
+		executionSettings: () => new Promise(resolve => { releaseMetadata = resolve; }),
+	});
+	const pending = runtime.execute(nativeCall({ kind: 'observe' }), record());
+	await new Promise(resolve => setImmediate(resolve));
+	await runtime.dispose('agent-a', 'goal_stopped');
+	releaseMetadata({});
+	await assert.rejects(pending, { code: 'STALE_NATIVE_TOOL' });
 });

@@ -55,6 +55,7 @@ public final class PlayerKnowledgeInspection {
 			page.addProperty("fixedDisplayAvailable", !displays.isEmpty());
 		} else {
 			List<RecipeHolder<?>> recipes = manager.getRecipes().stream()
+					.filter(holder -> !query.has("outputItemId") || hasDisplayedOutput(holder, context, query.get("outputItemId").getAsString()))
 					.sorted(Comparator.comparing(holder -> holder.id().identifier().toString())).toList();
 			page = ObservationPage.collect(recipes.size(), offset, limit,
 					index -> summary(recipes.get(index), player, context), "installed_recipe_registry");
@@ -63,7 +64,18 @@ public final class PlayerKnowledgeInspection {
 		page.addProperty("craftabilityChecked", false);
 		page.addProperty("stackComponentsAndRemaindersIncluded", false);
 		page.addProperty("displayItemsAreExamples", true);
+		if (query.has("outputItemId")) page.addProperty("filterScope", "bounded_display_output_examples");
 		return page;
+	}
+
+	private static boolean hasDisplayedOutput(RecipeHolder<?> holder, ContextMap context, String itemId) {
+		for (RecipeDisplay display : holder.value().display()) {
+			if (!boundedResolution(display.result(), 0, new int[] {64})) continue;
+			try (var stacks = display.result().resolve(context, STACKS)) {
+				if (stacks.limit(64).anyMatch(stack -> BuiltInRegistries.ITEM.getKey(stack.getItem()).toString().equals(itemId))) return true;
+			}
+		}
+		return false;
 	}
 
 	private static JsonObject summary(RecipeHolder<?> holder, ServerPlayer player, ContextMap context) {

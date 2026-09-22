@@ -51,6 +51,11 @@ public final class ObservationDetails {
 	}
 
 	static void entity(JsonObject target, ServerPlayer player, Entity entity) {
+		target.addProperty("pickable", entity.isPickable());
+		if (entity instanceof net.minecraft.world.entity.boss.enderdragon.EnderDragonPart part) {
+			target.addProperty("parentId", part.parentMob.getUUID().toString());
+			target.addProperty("partName", part.name);
+		}
 		target.add("velocity", vector(entity.getDeltaMovement()));
 		target.addProperty("yaw", entity.getYRot());
 		target.addProperty("pitch", entity.getXRot());

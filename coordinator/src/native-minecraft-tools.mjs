@@ -17,7 +17,7 @@ const MAX_LOOK_AROUND_STEPS = 8;
 const MAX_LOOK_AROUND_TICKS = 20;
 const MAX_PROGRAM_SOURCE_BYTES = 65_536;
 const NATIVE_ACTION_TYPES = Object.freeze(Object.keys(ACTION_FIELDS));
-export const INSPECTION_SECTIONS = Object.freeze(['inventory', 'menu', 'entities', 'blocks', 'landmarks', 'nearby_containers', 'item', 'block', 'events', 'recipes', 'mechanics']);
+export const INSPECTION_SECTIONS = Object.freeze(['observation', 'inventory', 'menu', 'entities', 'blocks', 'landmarks', 'nearby_containers', 'item', 'block', 'events', 'recipes', 'mechanics']);
 
 export function minecraftCapabilities({ section = 'all' } = {}) {
 	if (section === 'program') return { version: 1, section: 'program', engine: 'ArenaScript', reference: ARENA_SCRIPT_API_REFERENCE };
@@ -33,9 +33,9 @@ export function minecraftCapabilities({ section = 'all' } = {}) {
 
 export const NATIVE_AGENT_INSTRUCTIONS = `You control one live Minecraft player and choose every action.
 
-Choose the next step from current observations, the user's goal, and your own reasoning. A death does not change the active goal. Historical inventory and death records describe past evidence.
+Keep provider, model, reasoning effort, and service tier. Choose from current observations and the goal. Death does not change the active goal. Start bounded progress before lengthy reasoning: after a fresh observation, run a small safe background:true program when it fits, then reason while it runs and answer its exact attention decision.
 
-Use capabilities for supported fields, observe for a fresh sample, and inspect for focused pages. Respect freshness and coverage: omitted or unobserved facts are unknown. exploreFrontier returns candidates; you choose a destination and call moveTo. Use control for precise inputs and sequence for safe steps that need no new facts. startAction returns a handle; actionStatus, cancelAction, and replaceAction require its exact identity. Use act with control_sequence for bounded model-authored tick programs. notebook stores your notes; queryMemory retrieves notes and factual receipts. Mine only observed blocks with their exact blockId. goalSpec is the immutable completion contract. finish requests factual verification. Never claim an effect without evidence. conversation_only uses say only. Plain text is not visible. Nearby speech should be brief; speech playback is asynchronous.`;
+Use capabilities for fields, observe fresh samples, and inspect focused pages. Respect freshness: omitted or unobserved facts are unknown. Query notes and receipts with queryMemory (paginate nextOffset) before writing; reuse exact noteKey only if fresh prerequisites/current targets match. Notes are hypotheses; receipts are historical. Save executable source with metadata in comments or a separate note; noteKey executes the entire note as source. exploreFrontier returns candidates; choose one for moveTo. Use control for precise inputs, sequence for safe chains, and act with control_sequence for bounded tick programs. startAction returns a handle; use its exact identity with actionStatus/cancelAction/replaceAction. Mine only observed blocks with exact blockId. goalSpec is immutable; finish requests verification. Never claim effects without evidence. conversation_only uses say. Plain text is invisible; keep nearby speech brief; speech playback is asynchronous.`;
 
 export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 	tool('observe', 'Request a fresh player observation. Read freshness and coverage; an unavailable freshness barrier returns explicitly stale cached facts.', objectSchema({})),
@@ -45,6 +45,8 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 		slot: integerSchema(0, 255), x: integerSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT), y: integerSchema(-2_048, 2_048), z: integerSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT),
 		afterSequence: integerSchema(0, Number.MAX_SAFE_INTEGER),
 		recipeId: { type: 'string', minLength: 1, maxLength: 256, pattern: '^[a-z0-9_.-]+:[a-z0-9_./-]+$' },
+		entityType: { type: 'string', minLength: 1, maxLength: 256, pattern: '^[a-z0-9_.-]+:[a-z0-9_./-]+$' },
+		outputItemId: { type: 'string', minLength: 1, maxLength: 256, pattern: '^[a-z0-9_.-]+:[a-z0-9_./-]+$' },
 	}, ['section'])),
 	tool('actionStatus', 'Inspect the active action or a retained terminal receipt without changing the player.', objectSchema({ actionId: { type: 'string', minLength: 1, maxLength: 128 } })),
 	tool('cancelAction', 'Cancel the exact active handle and wait for its authoritative terminal result. A stale handle cannot cancel another action.', objectSchema({ actionId: { type: 'string', minLength: 1, maxLength: 128 }, goalRevision: integerSchema(0, Number.MAX_SAFE_INTEGER) }, ['actionId', 'goalRevision'])),
@@ -53,10 +55,13 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 		actionType: { type: 'string', enum: NATIVE_ACTION_TYPES }, arguments: { type: 'object' },
 	}, ['actionId', 'goalRevision', 'actionType', 'arguments'])),
 	tool('startAction', 'Start one model-chosen action and return its handle immediately. Poll actionStatus for the factual result or cancel the exact handle.', objectSchema({ actionType: { type: 'string', enum: NATIVE_ACTION_TYPES }, arguments: { type: 'object' } }, ['actionType', 'arguments'])),
-	tool('notebook', 'Save or replace one model-written note of up to 2048 characters in this agent and world. Notes are hypotheses or plans, never authoritative game evidence.', objectSchema({ key: { type: 'string', minLength: 1, maxLength: 128 }, text: { type: 'string', minLength: 1, maxLength: 2048 } }, ['key', 'text'])),
-	tool('queryMemory', 'Read this agent and world\'s saved notes and action receipts, including unresolved dispatches. Continue pages with nextOffset. Historical receipts do not establish current world state.', objectSchema({ kind: { type: 'string', enum: ['all', 'notes', 'receipts', 'unresolved'] }, text: { type: 'string', minLength: 1, maxLength: 256 }, offset: integerSchema(0, Number.MAX_SAFE_INTEGER), limit: integerSchema(1, 64) })),
-	tool('runProgram', 'Run bounded ArenaScript that you author using player actions, observed facts, inspections, memory, and explicit watchers. Returns at completion or attention; no other model chooses its behavior.', objectSchema({ source: { type: 'string', minLength: 1, maxLength: MAX_PROGRAM_SOURCE_BYTES }, maxActions: integerSchema(1, 256), timeoutMs: integerSchema(1, 120_000) }, ['source'])),
-	tool('lookAround', 'Turn the player through 2 to 8 short camera steps; call observe afterward to inspect the newly visible landmarks.', objectSchema({
+	tool('notebook', 'Save or replace one model-written note of up to 2048 characters in this agent and world. Prefer a stable exact key for reusable routines. Keep executable ArenaScript valid; put prerequisites, current targets, outcomes, and failure conditions in comments or a separate note, and only record outcomes supported by evidence. Notes are hypotheses or plans, never authoritative game evidence.', objectSchema({ key: { type: 'string', minLength: 1, maxLength: 128 }, text: { type: 'string', minLength: 1, maxLength: 2048 } }, ['key', 'text'])),
+	tool('queryMemory', 'Read this agent and world\'s saved notes and action receipts, including unresolved dispatches. Start with notes to find reusable routines and receipts to check historical outcomes; continue every page with nextOffset. Historical receipts do not establish current world state.', objectSchema({ kind: { type: 'string', enum: ['all', 'notes', 'receipts', 'unresolved'] }, text: { type: 'string', minLength: 1, maxLength: 256 }, offset: integerSchema(0, Number.MAX_SAFE_INTEGER), limit: integerSchema(1, 64) })),
+	tool('runProgram', 'Run bounded ArenaScript that you author. Supply source or an exact notebook noteKey; noteKey executes the entire note text as ArenaScript, so keep metadata in comments or a separate note. After a fresh observation, prefer a small bounded routine and background:true so useful work starts while the selected model reasons. Reuse noteKey only when fresh facts confirm its recorded prerequisites and current target assumptions; replace only when they no longer fit. Optional observationIntervalMs requests fresh samples. background:true returns a program handle while your routine continues reacting during model reasoning; otherwise wait for its result. One program owns the body until it ends or cancelProgram settles. Programs expire within timeoutMs and never restart themselves.', objectSchema({ source: { type: 'string', minLength: 1, maxLength: MAX_PROGRAM_SOURCE_BYTES }, noteKey: { type: 'string', minLength: 1, maxLength: 128 }, background: { type: 'boolean' }, observationIntervalMs: integerSchema(100, 5000), maxActions: integerSchema(1, 256), timeoutMs: integerSchema(1, 120_000) })),
+	tool('programStatus', 'Read the running program, pending decision, or latest terminal result. Does not wait or change the player. Use it to inspect a background handle or exact attention; ordinary progress needs no polling. Background completion does not mean the goal is complete.', objectSchema({ programId: { type: 'string', minLength: 1, maxLength: 128 } })),
+	tool('respondProgram', 'Answer the exact pending program decision. Continue preserves authored work. Replace installs new source after releasing the old action and retains the original deadline and action budget; use it when fresh facts invalidate prerequisites or current targets. Pause and finish stop the routine; finish still requires separate factual goal verification.', objectSchema({ programId: { type: 'string', minLength: 1, maxLength: 128 }, goalRevision: integerSchema(0, Number.MAX_SAFE_INTEGER), decisionId: { type: 'string', minLength: 1, maxLength: 256 }, directive: { type: 'string', enum: ['continue', 'pause', 'replace', 'finish'] }, source: { type: 'string', minLength: 1, maxLength: MAX_PROGRAM_SOURCE_BYTES } }, ['programId', 'goalRevision', 'decisionId', 'directive'])),
+	tool('cancelProgram', 'Cancel the exact program and wait for its result. New body actions remain blocked while cancellation is unconfirmed. Handles are scoped to this agent and goal revision.', objectSchema({ programId: { type: 'string', minLength: 1, maxLength: 128 }, goalRevision: integerSchema(0, Number.MAX_SAFE_INTEGER) }, ['programId', 'goalRevision'])),
+	tool('lookAround', 'Turn through 2 to 8 camera steps, sampling fresh facts at each heading. Returns bounded historical sightings with timestamps and omitted counts; reacquire targets before acting.', objectSchema({
 		centerYaw: numberSchema(-180, 180),
 		pitch: numberSchema(-90, 90),
 		steps: integerSchema(2, MAX_LOOK_AROUND_STEPS),
@@ -89,7 +94,7 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 		limit: integerSchema(1, 64),
 		blockId: { type: 'string', minLength: 1, maxLength: MAX_IDENTIFIER_LENGTH },
 	})),
-	tool('mine', 'Mine one observed, visible, in-range block coordinate with its exact current blockId.', objectSchema({
+	tool('mine', 'Mine one in-range block with its exact current blockId. First aim at its center using act with look_at; the block must be exactly under the crosshair, not merely visible.', objectSchema({
 		x: integerSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT),
 		y: integerSchema(-2_048, 2_048),
 		z: integerSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT),
@@ -104,17 +109,17 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 	tool('wait', 'Pause briefly and wait for the body result.', objectSchema({
 		durationMs: integerSchema(MIN_DURATION_MS, MAX_DURATION_MS),
 	}, ['durationMs'])),
-	tool('act', 'Execute one supported advanced player action. Supply exactly the fields required by that actionType.', objectSchema({
+	tool('act', 'Execute one supported advanced player action. Supply exactly the required fields. For interact_block omit optional hitX/hitY/hitZ to use the actual block shape. Before pick_up_item check current inventory and use a freshly observed target UUID; nearby drops may already be collected.', objectSchema({
 		actionType: { type: 'string', enum: NATIVE_ACTION_TYPES },
 		arguments: { type: 'object' },
 	}, ['actionType', 'arguments'])),
-	tool('sequence', 'Prefer sequence for safe 2+ action chains. Execute 2 to 8 exact model-authored actions in order, stopping on the first factual failure; use separate calls when a later step needs fresh facts.', objectSchema({
+	tool('sequence', 'Prefer sequence for safe 2+ action chains. Execute 2 to 8 exact model-authored actions in order, stopping on the first factual failure. Movement, mining, or pickup chains return one postAction sample after the last attempted step. Use separate calls when a later step needs fresh facts.', objectSchema({
 		actions: {
 			type: 'array', minItems: 2, maxItems: MAX_SEQUENCE_ACTIONS,
 			items: objectSchema({ actionType: { type: 'string', enum: NATIVE_ACTION_TYPES }, arguments: { type: 'object' } }, ['actionType', 'arguments']),
 		},
 	}, ['actions'])),
-	tool('finish', 'Ask Minecraft to verify the immutable active goal. A failed check keeps the goal active.', objectSchema({
+	tool('finish', 'Ask Minecraft to verify the immutable active goal. Read unmet facts on failure. If AWAITING_OPERATOR_CONFIRMATION, report once with say and end this turn until new input; do not repeat the work or verification.', objectSchema({
 		summary: { type: 'string', minLength: 1, maxLength: 512 },
 	}, ['summary'])),
 ]);
@@ -130,7 +135,7 @@ export function normalizeMinecraftToolCall(name, value) {
 			if (args.section !== undefined && !['all', 'program'].includes(args.section)) invalid('capability section is not supported');
 			return { kind: 'capabilities', ...(args.section === undefined ? {} : { section: args.section }) };
 		case 'inspect': {
-			requireExactKeys(args, ['section', 'offset', 'limit', 'slot', 'x', 'y', 'z', 'afterSequence', 'recipeId']);
+			requireExactKeys(args, ['section', 'offset', 'limit', 'slot', 'x', 'y', 'z', 'afterSequence', 'recipeId', 'entityType', 'outputItemId']);
 			if (!INSPECTION_SECTIONS.includes(args.section)) invalid('section is not supported');
 			const query = { kind: 'inspect', section: args.section, offset: optionalInteger(args.offset, 0, 'offset', 0, 4_096), limit: optionalInteger(args.limit, 32, 'limit', 1, 32) };
 			if (args.section === 'item') query.slot = integer(args.slot, 'slot', 0, 255);
@@ -148,6 +153,12 @@ export function normalizeMinecraftToolCall(name, value) {
 				if (args.section !== 'recipes' || typeof args.recipeId !== 'string' || args.recipeId.length > 256 || !/^[a-z0-9_.-]+:[a-z0-9_./-]+$/.test(args.recipeId)) invalid('recipeId must be a namespaced recipe identifier for recipe inspection');
 				query.recipeId = args.recipeId;
 			}
+			for (const [field, section] of [['entityType', 'entities'], ['outputItemId', 'recipes']]) {
+				if (args[field] === undefined) continue;
+				if (args.section !== section || typeof args[field] !== 'string' || args[field].length > 256 || !/^[a-z0-9_.-]+:[a-z0-9_./-]+$/.test(args[field])) invalid(`${field} requires a namespaced identifier in ${section}`);
+				query[field] = args[field];
+			}
+			if (args.recipeId !== undefined && args.outputItemId !== undefined) invalid('Use recipeId or outputItemId, not both');
 			return query;
 		}
 		case 'actionStatus':
@@ -173,10 +184,25 @@ export function normalizeMinecraftToolCall(name, value) {
 			if (args.kind !== undefined && !['all', 'notes', 'receipts', 'unresolved'].includes(args.kind)) invalid('kind is not supported');
 			return { kind: 'query_memory', memoryKind: args.kind ?? 'all', offset: optionalInteger(args.offset, 0, 'offset', 0, Number.MAX_SAFE_INTEGER), limit: optionalInteger(args.limit, 20, 'limit', 1, 64), ...(args.text === undefined ? {} : { text: boundedText(args.text, 'text', 256) }) };
 		case 'runProgram': {
-			requireExactKeys(args, ['source', 'maxActions', 'timeoutMs']);
-			const source = boundedText(args.source, 'source', MAX_PROGRAM_SOURCE_BYTES);
-			if (Buffer.byteLength(source, 'utf8') > MAX_PROGRAM_SOURCE_BYTES) invalid('source must fit 65536 UTF-8 bytes');
-			return { kind: 'run_program', source, maxActions: optionalInteger(args.maxActions, 64, 'maxActions', 1, 256), timeoutMs: optionalInteger(args.timeoutMs, 30_000, 'timeoutMs', 1, 120_000) };
+			requireExactKeys(args, ['source', 'noteKey', 'background', 'observationIntervalMs', 'maxActions', 'timeoutMs']);
+			if ((args.source === undefined) === (args.noteKey === undefined)) invalid('Supply exactly one of source or noteKey');
+			const source = args.source === undefined ? undefined : boundedText(args.source, 'source', MAX_PROGRAM_SOURCE_BYTES);
+			if (source !== undefined && Buffer.byteLength(source, 'utf8') > MAX_PROGRAM_SOURCE_BYTES) invalid('source must fit 65536 UTF-8 bytes');
+			return { kind: 'run_program', ...(source === undefined ? { noteKey: boundedText(args.noteKey, 'noteKey', 128) } : { source }), ...(args.background === undefined ? {} : { background: optionalBoolean(args.background, false, 'background') }), ...(args.observationIntervalMs === undefined ? {} : { observationIntervalMs: integer(args.observationIntervalMs, 'observationIntervalMs', 100, 5000) }), maxActions: optionalInteger(args.maxActions, 64, 'maxActions', 1, 256), timeoutMs: optionalInteger(args.timeoutMs, 30_000, 'timeoutMs', 1, 120_000) };
+		}
+		case 'programStatus':
+			requireExactKeys(args, ['programId']);
+			return { kind: 'program_status', ...(args.programId === undefined ? {} : { programId: boundedText(args.programId, 'programId', 128) }) };
+		case 'cancelProgram':
+			requireExactKeys(args, ['programId', 'goalRevision']);
+			return { kind: 'cancel_program', programId: boundedText(args.programId, 'programId', 128), goalRevision: integer(args.goalRevision, 'goalRevision', 0, Number.MAX_SAFE_INTEGER) };
+		case 'respondProgram': {
+			requireExactKeys(args, ['programId', 'goalRevision', 'decisionId', 'directive', 'source']);
+			if (!['continue', 'pause', 'replace', 'finish'].includes(args.directive)) invalid('directive is not supported');
+			if ((args.directive === 'replace') !== (args.source !== undefined)) invalid('Only replace requires source');
+			const source = args.source === undefined ? undefined : boundedText(args.source, 'source', MAX_PROGRAM_SOURCE_BYTES);
+			if (source !== undefined && Buffer.byteLength(source, 'utf8') > MAX_PROGRAM_SOURCE_BYTES) invalid('source must fit 65536 UTF-8 bytes');
+			return { kind: 'respond_program', programId: boundedText(args.programId, 'programId', 128), goalRevision: integer(args.goalRevision, 'goalRevision', 0, Number.MAX_SAFE_INTEGER), decisionId: boundedText(args.decisionId, 'decisionId', 256), directive: args.directive, ...(source === undefined ? {} : { source }) };
 		}
 		case 'lookAround':
 			requireExactKeys(args, ['centerYaw', 'pitch', 'steps', 'ticksPerStep']);
@@ -270,7 +296,13 @@ export function normalizeMinecraftToolCall(name, value) {
 				const normalizedArguments = stripActionType(validateAction({ type: args.actionType, ...actionArguments }));
 				return { kind: 'action', actionType: args.actionType, arguments: normalizedArguments };
 			} catch (error) {
-				invalid(error?.message ?? 'invalid action arguments');
+				throw Object.assign(codedError('INVALID_MINECRAFT_TOOL_ARGUMENTS', error?.message ?? 'invalid action arguments'), {
+					actionContract: { actionType: args.actionType,
+						requiredFields: ACTION_FIELDS[args.actionType].filter((field) => !(OPTIONAL_ACTION_FIELDS[args.actionType] ?? []).includes(field)),
+						optionalFields: [...(OPTIONAL_ACTION_FIELDS[args.actionType] ?? [])],
+						...(args.actionType === 'menu_close' ? { hint: 'menuId is the observed namespaced string, not containerId. The default minecraft:inventory menu with containerId 0 does not block gameplay and need not be closed.' } : {}),
+					},
+				});
 			}
 			break;
 		}
@@ -314,6 +346,7 @@ export function toolResultContent(value, success = true) {
 	let text = JSON.stringify(value ?? null);
 	if (Buffer.byteLength(text, 'utf8') > MAX_TOOL_RESULT_BYTES) {
 		const candidates = [
+			...(value?.postAction?.observation === undefined || isSequenceResult(value) ? [] : [compactActionFeedback(value)]),
 			...(Array.isArray(value?.entries) ? [compactInspectionResult(value)] : []),
 			...(isSequenceResult(value) ? [compactSequenceResult(value)] : []),
 			...(Array.isArray(value?.receipts) && typeof value?.programId === 'string' ? [compactProgramResult(value)] : []),
@@ -330,7 +363,44 @@ export function toolResultContent(value, success = true) {
 	return { success, contentItems: [{ type: 'inputText', text }] };
 }
 
-function compactToolResult(value) {
+function compactActionFeedback(value) {
+	const result = {
+		...resultMetadata(value),
+		state: boundedResultField(value.state, 64),
+		reasonCode: boundedResultField(value.reasonCode, 128),
+		...Object.fromEntries(['executionStarted', 'physicalAttempted'].filter(key => typeof value[key] === 'boolean').map(key => [key, value[key]])),
+		...(value.message === undefined ? {} : { message: boundedResultField(value.message, 2_048) }),
+		...(value.recoveryHint === undefined ? {} : { recoveryHint: boundedResultField(value.recoveryHint, 2_048) }),
+		...survivalFacts(value, 8),
+		truncated: true,
+		detail: 'Detailed action observations were omitted. postAction contains the follow-up facts; inspect omitted details.',
+	};
+	result.postAction = compactPostAction(value.postAction, MAX_TOOL_RESULT_BYTES - Buffer.byteLength(JSON.stringify(result), 'utf8') - 64);
+	return result;
+}
+
+function compactPostAction(value, budget) {
+	if (Buffer.byteLength(JSON.stringify(value), 'utf8') <= budget) return value;
+	const compact = compactToolResult(value, budget);
+	if (Buffer.byteLength(JSON.stringify(compact), 'utf8') <= budget) return compact;
+	const items = asToolArray(value.observation?.inventory?.items);
+	const fallback = {
+		truncated: true,
+		detail: 'Goal and observation details exceeded the result limit. Inventory entries below are partial; inspect omitted facts.',
+		eventSequence: safeResultInteger(value.eventSequence),
+		freshness: { fresh: value.freshness?.fresh === true, ...(value.freshness?.reasonCode === undefined ? {} : { reasonCode: boundedResultField(value.freshness.reasonCode, 128) }) },
+		observation: { inventory: { items: [] }, resultCoverage: { inventory: { retained: 0, availableInSnapshot: items.length }, omittedSections: Object.keys(value.observation ?? {}).filter(key => key !== 'inventory') } },
+	};
+	for (const item of items) {
+		const row = Object.fromEntries(['slot', 'itemId', 'count'].filter(key => item[key] !== undefined).map(key => [key, item[key]]));
+		fallback.observation.inventory.items.push(row);
+		if (Buffer.byteLength(JSON.stringify(fallback), 'utf8') > budget - 64) { fallback.observation.inventory.items.pop(); break; }
+	}
+	fallback.observation.resultCoverage.inventory.retained = fallback.observation.inventory.items.length;
+	return fallback;
+}
+
+function compactToolResult(value, budget = MAX_TOOL_RESULT_BYTES) {
 	if (value === null || typeof value !== 'object' || Array.isArray(value)) {
 		return { state: 'TRUNCATED', detail: 'Tool result exceeded the coordinator limit. Call observe for fresh compact facts.' };
 	}
@@ -344,14 +414,15 @@ function compactToolResult(value) {
 	if (!hasMinecraftFacts) {
 		return { state: 'TRUNCATED', detail: 'Tool result exceeded the coordinator limit. Call observe for fresh compact facts.' };
 	}
-	return {
+	const compact = {
 		...resultMetadata(value),
 		truncated: true,
 		detail: 'Observation details were omitted by the result limit. Use inspect for focused pages.',
 		...(value.state === undefined ? {} : { state: value.state }),
 		...(value.reasonCode === undefined ? {} : { reasonCode: value.reasonCode }),
 		...(value.eventSequence === undefined ? {} : { eventSequence: value.eventSequence }),
-		...(value.goal === undefined ? {} : { goal: value.goal }),
+		...(value.goal === undefined && value.goalSpec?.originalRequest === undefined ? {} : { omittedGoalText: true }),
+		...(value.goalSpec === undefined ? {} : { goalSpec: value.goalSpec === null ? null : Object.fromEntries(Object.entries(value.goalSpec).filter(([key]) => key !== 'originalRequest')) }),
 		observation: {
 			...resultMetadata(observation),
 			player: observation.player ?? {},
@@ -360,6 +431,7 @@ function compactToolResult(value) {
 			...(observation.velocity === undefined ? {} : { velocity: observation.velocity }),
 			...(observation.view === undefined ? {} : { view: observation.view }),
 			...(observation.interaction === undefined ? {} : { interaction: compactInteraction(observation.interaction) }),
+			...(observation.perception === undefined ? {} : { perception: observation.perception }),
 			resultCoverage: { inventory: { retained: Math.min(asToolArray(observation.inventory?.items).length, 16), availableInSnapshot: asToolArray(observation.inventory?.items).length }, omittedSections: ['blocks', 'landmarks', 'entities', 'nearbyContainers'].filter((section) => observation[section] !== undefined) },
 			...(observation.death === undefined ? {} : { death: observation.death }),
 			...(observation.recovery === undefined ? {} : { recovery: compactRecovery(observation.recovery, 8) }),
@@ -371,6 +443,24 @@ function compactToolResult(value) {
 		},
 		...survivalFacts(value),
 	};
+	const sections = ['entities', 'blocks', 'landmarks', 'nearbyContainers'];
+	const sources = Object.fromEntries(sections.map((section) => [section, asToolArray(observation[section])]));
+	for (const section of sections) {
+		compact.observation[section] = [];
+		compact.observation.resultCoverage[section] = { retained: 0, availableInSnapshot: sources[section].length, detailsOmitted: true };
+	}
+	// Share the remaining budget across kinds of visible facts before adding more of any one kind.
+	for (let index = 0; index < 32; index++) for (const section of sections) {
+		if (index >= sources[section].length || compact.observation[section].length !== index) continue;
+		const entry = sources[section][index];
+		const fields = ['uuid', 'stableId', 'type', 'name', 'position', 'x', 'y', 'z', 'distance', 'blockId', 'itemId', 'count', 'velocity', 'bounds', 'pickable', 'parentId', 'partName', 'state', 'bearing', 'elevation'];
+		const row = Object.fromEntries(fields.filter((field) => entry[field] !== undefined).map((field) => [field, entry[field]]));
+		compact.observation[section].push(row);
+		if (Buffer.byteLength(JSON.stringify(compact), 'utf8') > budget - 256) compact.observation[section].pop();
+		compact.observation.resultCoverage[section].retained = compact.observation[section].length;
+	}
+	compact.observation.resultCoverage.omittedSections = sections.filter((section) => sources[section].length > 0 && compact.observation[section].length === 0);
+	return compact;
 }
 
 function resultMetadata(value) {
@@ -454,6 +544,13 @@ function isSequenceResult(value) {
 
 function compactProgramResult(value) {
 	const result = { state: boundedResultField(value.state, 64), reasonCode: boundedResultField(value.reasonCode, 128), programId: boundedResultField(value.programId, 256), actions: safeResultInteger(value.actions), eventSequence: safeResultInteger(value.eventSequence), ...(value.finishRequested === true ? { finishRequested: true } : {}), receipts: [], truncated: true, detail: 'Program observations were omitted. Query historical receipts by bodyActionId and observe for current facts.' };
+	if (value.observation) {
+		const compact = compactToolResult({ observation: value.observation }, MAX_TOOL_RESULT_BYTES - 2048);
+		if (Buffer.byteLength(JSON.stringify(compact), 'utf8') < MAX_TOOL_RESULT_BYTES - 2048) {
+			result.observation = compact.observation;
+			result.detail = 'Compact current facts retained. Query historical receipts by bodyActionId; inspect omitted details.';
+		}
+	}
 	for (const receipt of [...value.receipts].reverse()) {
 		const next = Object.fromEntries(['actionId', 'bodyActionId', 'actionType', 'sourceStepId', 'state', 'reasonCode'].filter((field) => receipt[field] !== undefined).map((field) => [field, boundedResultField(receipt[field], field === 'reasonCode' ? 128 : 256)]));
 		for (const flag of ['executionStarted', 'physicalAttempted']) if (typeof receipt[flag] === 'boolean') next[flag] = receipt[flag];
@@ -478,15 +575,25 @@ function compactSequenceResult(value) {
 			...(step?.physicalAttempted === undefined ? {} : { physicalAttempted: step.physicalAttempted === true }),
 		})),
 	};
+	if (Array.isArray(value.samples)) {
+		const samples = value.samples.slice(0, 8);
+		if (Buffer.byteLength(JSON.stringify({ ...result, samples }), 'utf8') <= MAX_TOOL_RESULT_BYTES - 2_048) result.samples = samples;
+		else result.omittedSamples = value.samples.length;
+	}
+	if (value.postAction !== undefined) {
+		result.postAction = compactPostAction(value.postAction, MAX_TOOL_RESULT_BYTES - Buffer.byteLength(JSON.stringify(result), 'utf8') - 512);
+	}
 	let omittedObservations = sourceResults.length !== value.results.length;
 	for (let index = 0; index < sourceResults.length; index += 1) {
 		const observation = sourceResults[index]?.actionObservation;
 		if (observation === undefined) continue;
 		const candidate = { ...result, results: result.results.map((step, stepIndex) => stepIndex === index ? { ...step, actionObservation: observation } : step) };
-		if (Buffer.byteLength(JSON.stringify(candidate), 'utf8') <= MAX_TOOL_RESULT_BYTES) result.results[index] = candidate.results[index];
+		if (Buffer.byteLength(JSON.stringify(candidate), 'utf8') <= MAX_TOOL_RESULT_BYTES - 512) result.results[index] = candidate.results[index];
 		else omittedObservations = true;
 	}
-	if (omittedObservations) result.detail = 'Some per-action observations were omitted by the coordinator result limit; call observe for fresh compact facts.';
+	if (omittedObservations) result.detail = value.postAction === undefined
+		? 'Some per-action observations were omitted by the coordinator result limit; call observe for fresh compact facts.'
+		: 'Some per-action observations were omitted by the coordinator result limit. postAction contains facts after the last attempted step.';
 	return result;
 }
 

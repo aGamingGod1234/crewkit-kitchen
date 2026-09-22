@@ -19,7 +19,7 @@ export const PLAYER_MEMBER_PRIMITIVES = Object.freeze({
 export const EXACT_TARGET_ACTIONS = Object.freeze({
 	attack: Object.freeze(['targetId', 'timeoutMs']),
 	pickUpItem: Object.freeze(['targetSelector']),
-	useRanged: Object.freeze(['targetId', 'drawDurationMs', 'timeoutMs']),
+	useRanged: ACTION_FIELDS.use_ranged,
 	interactEntity: Object.freeze(['targetId', 'hand', 'expectedItemId']),
 });
 

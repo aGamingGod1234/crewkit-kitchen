@@ -8,6 +8,7 @@ import { NativeProgramExecutor } from './native-program-executor.mjs';
 
 const FORGET_REASONS = /agent_removed|server_replaced|coordinator_stopped/;
 const TERMINAL_ACTION_STATES = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT']);
+const POST_ACTION_OBSERVATION_TYPES = new Set(['pick_up_item', 'break_block', 'navigate_to']);
 
 
 export class NativeToolRuntime {
@@ -34,6 +35,10 @@ export class NativeToolRuntime {
 	#memoryOperation;
 	#programExecutor;
 	#programRuns = new Map();
+	#programResults = new Map();
+	#onProgramEvent;
+	#planningLeadTime;
+	#sweeps = new Map();
 	#sessionId;
 	#receipts = new Map();
 	#executionEpochs = new Map();
@@ -51,6 +56,8 @@ export class NativeToolRuntime {
 		executionSettings = null,
 		memoryOperation = null,
 		programExecutor = null,
+		onProgramEvent = () => {},
+		planningLeadTime = () => null,
 		sessionId = randomUUID(),
 		occupancy = new ExplorationOccupancy(),
 	} = {}) {
@@ -83,6 +90,10 @@ export class NativeToolRuntime {
 		this.#executionSettings = executionSettings;
 		this.#memoryOperation = memoryOperation;
 		this.#programExecutor = programExecutor ?? new NativeProgramExecutor({ sessionId });
+		if (typeof onProgramEvent !== 'function') throw new TypeError('onProgramEvent must be a function');
+		this.#onProgramEvent = onProgramEvent;
+		if (typeof planningLeadTime !== 'function') throw new TypeError('planningLeadTime must be a function');
+		this.#planningLeadTime = planningLeadTime;
 		this.#sessionId = sessionId.length <= 36 ? sessionId : createHash('sha256').update(sessionId).digest('hex').slice(0, 32);
 		this.#occupancy = occupancy;
 	}
@@ -119,7 +130,7 @@ export class NativeToolRuntime {
 		return this.#storeObservation(record, observation, options);
 	}
 
-	#storeObservation(record, observation, { eventSequence = 0, conversation = undefined, force = false, attention = false, priority, trigger } = {}, reuseWorldFacts = false) {
+	#storeObservation(record, observation, { eventSequence = 0, conversation = undefined, force = false, attention = false, priority, trigger, changedFacts } = {}, reuseWorldFacts = false) {
 		validateRecord(record);
 		if (!Number.isSafeInteger(eventSequence) || eventSequence < 0) throw new TypeError('eventSequence must be a nonnegative safe integer');
 		if (force !== true && force !== false) throw new TypeError('force must be a boolean');
@@ -152,7 +163,12 @@ export class NativeToolRuntime {
 			observation: storedObservation,
 			...(conversation === undefined ? {} : { conversation: structuredClone(conversation) }),
 		});
-		this.#programExecutor.onObservation(record, { observation: storedObservation, eventSequence: storedSequence, attention, ...(priority === undefined ? {} : { priority }), ...(trigger === undefined ? {} : { trigger }) });
+		// The bridge also wakes the planner after a receipt or an explicit sample.
+		// Those empty deltas must not interrupt the routine that requested them.
+		// Preserve real fact changes, explicit triggers, and urgent notifications.
+		const administrativeWake = Array.isArray(changedFacts) && changedFacts.length === 0
+			&& priority !== 'urgent' && (trigger === undefined || trigger === 'attention');
+		this.#programExecutor.onObservation(record, { observation: storedObservation, eventSequence: storedSequence, attention: attention && !administrativeWake, ...(priority === undefined ? {} : { priority }), ...(trigger === undefined ? {} : { trigger }) });
 		return true;
 	}
 
@@ -174,6 +190,18 @@ export class NativeToolRuntime {
 	snapshotLive(agentId) {
 		const live = this.#lastLive.get(agentId);
 		return live === undefined ? null : structuredClone(live);
+	}
+
+	hasProgram(record, programId) {
+		const run = this.#programRuns.get(record.agentId);
+		return run?.goalRevision === record.goalRevision && (programId === undefined || run.programId === programId);
+	}
+
+	canPrepareProgram(record, programId, programVersion) {
+		if (!this.hasProgram(record, programId)) return false;
+		const status = this.#programStatus(record, programId);
+		return status.state === 'RUNNING' && status.engineState === 'ACTIVE'
+			&& status.programVersion === programVersion && status.decision == null;
 	}
 
 	decorateObservation(record, observation = {}) {
@@ -213,12 +241,22 @@ export class NativeToolRuntime {
 		if (request.tool.kind === 'inspect') return this.#inspect(request.tool, record);
 		if (request.tool.kind === 'capabilities') {
 			if (request.tool.section === 'program') return { ...minecraftCapabilities({ section: 'program' }), ...await this.#executionMetadata(record) };
-			return { ...minecraftCapabilities(), ...await this.#executionMetadata(record), ...await this.#memorySummary(record), runtime: { freshObservations: this.#requestObservation !== null, focusedInspection: this.#inspectObservation !== null, notebook: this.#notebook !== null || this.#memoryOperation !== null, asynchronousActions: true, cancellation: true, reactivePrograms: { available: true, engine: 'ArenaScript', modelAuthored: true, plannerCalls: false } } };
+			return { ...minecraftCapabilities(), ...await this.#executionMetadata(record), ...await this.#memorySummary(record), runtime: { freshObservations: this.#requestObservation !== null, focusedInspection: this.#inspectObservation !== null, notebook: this.#notebook !== null || this.#memoryOperation !== null, asynchronousActions: true, cancellation: true, reactivePrograms: { available: true, background: true, engine: 'ArenaScript', modelAuthored: true, plannerCalls: false } } };
 		}
 		if (request.tool.kind === 'action_status') return this.#actionStatus(record, request.tool.actionId);
+		if (request.tool.kind === 'program_status') return this.#programStatus(record, request.tool.programId);
+		if (request.tool.kind === 'cancel_program') return this.#cancelProgram(record, request.tool);
+		if (request.tool.kind === 'respond_program') {
+			if (request.tool.goalRevision !== record.goalRevision) throw codedError('STALE_PROGRAM_DECISION', 'Decision belongs to an older goal');
+			const run = this.#programRuns.get(record.agentId);
+			await this.#programExecutor.respond(record, request.tool);
+			if (['pause', 'finish'].includes(request.tool.directive)) await run.result;
+			return this.#programStatus(record, request.tool.programId);
+		}
 		if (request.tool.kind === 'cancel_action') return this.#cancelAction(record, request.tool);
 		if (request.tool.kind === 'notebook' || request.tool.kind === 'query_memory') return this.#memory(request, record);
-		if (this.#programRuns.has(record.agentId)) throw codedError('NATIVE_PROGRAM_IN_PROGRESS', 'A model-authored program already owns this player; cancel its exact active action before issuing another body operation');
+		if (this.#sweeps.has(record.agentId)) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'A camera sweep owns this player until sampling completes');
+		if (this.#programRuns.has(record.agentId)) throw codedError('NATIVE_PROGRAM_IN_PROGRESS', 'A model-authored program owns this player; use programStatus and cancelProgram before issuing another body operation');
 		if (request.tool.kind === 'run_program') return this.#runProgram(request, record);
 		if (request.tool.kind === 'replace_action') {
 			const epoch = this.#executionEpoch(record.agentId);
@@ -232,7 +270,12 @@ export class NativeToolRuntime {
 		if (request.tool.kind === 'explore_frontier') return this.#exploreFrontier(request, record);
 		const tool = constrainGoalBoundNavigation(request.tool, record.currentGoalSpec);
 		if (tool.kind === 'sequence') return this.#executeSequence({ ...request, tool }, record, this.#executionEpoch(record.agentId));
-		if (tool.kind === 'lookAround') return this.#executeLookAround(request, record, tool, this.#executionEpoch(record.agentId));
+		if (tool.kind === 'lookAround') {
+			const sweep = {};
+			this.#sweeps.set(record.agentId, sweep);
+			try { return await this.#executeLookAround(request, record, tool, this.#executionEpoch(record.agentId)); }
+			finally { if (this.#sweeps.get(record.agentId) === sweep) this.#sweeps.delete(record.agentId); }
+		}
 		if (tool.kind !== 'action') throw codedError('INVALID_NATIVE_TOOL', 'Native tool did not normalize to an action');
 		return this.#executeAction(request, record, tool);
 	}
@@ -258,7 +301,10 @@ export class NativeToolRuntime {
 			: { eventSequence: 0, goal: record.currentGoal ?? null, goalSpec: record.currentGoalSpec ?? null, observation: {} };
 		delete facts.goalRevision;
 		facts.observation = this.#decorate(record, facts.observation ?? {});
-		return { ...facts, ...await this.#executionMetadata(record), ...await this.#memorySummary(record), freshness: { ...freshness, eventSequence: facts.eventSequence, observedAtEpochMs: facts.observation.observedAtEpochMs ?? null, ...(facts.observation.continuity?.rememberedSections === undefined ? {} : { rememberedSections: [...facts.observation.continuity.rememberedSections] }) } };
+		const metadata = { ...await this.#executionMetadata(record), ...await this.#memorySummary(record) };
+		this.#assertCurrent(record);
+		if (this.#executionEpoch(record.agentId) !== epoch) throw codedError('STALE_NATIVE_TOOL', 'Observation request outlived its lifecycle');
+		return { ...facts, ...metadata, freshness: { ...freshness, eventSequence: facts.eventSequence, observedAtEpochMs: facts.observation.observedAtEpochMs ?? null, ...(facts.observation.continuity?.rememberedSections === undefined ? {} : { rememberedSections: [...facts.observation.continuity.rememberedSections] }) } };
 	}
 
 	async #memorySummary(record) {
@@ -277,35 +323,141 @@ export class NativeToolRuntime {
 	}
 
 	async #runProgram(request, record) {
+		const epoch = this.#executionEpoch(record.agentId);
+		let resolve, reject;
+		const result = new Promise((done, fail) => { resolve = done; reject = fail; });
+		let detach;
+		const attentionResult = new Promise(done => { detach = done; });
+		const run = { epoch, request, goalRevision: record.goalRevision, programId: `native-program-${this.#sessionId}-${++this.#sequence}`,
+			state: 'PREPARING', settled: false, result, resolve, reject, detach, detached: request.tool.background === true, record, deadlineEpochMs: null };
+		this.#programRuns.set(record.agentId, run);
+		// Own the body before any asynchronous notebook lookup. The returned handle
+		// has the same lifetime and cancellation rules as a foreground program.
+		void this.#executeProgram(request, record, run).then(
+			(outcome) => this.#settleProgram(record.agentId, run, outcome),
+			(error) => this.#settleProgram(record.agentId, run, { state: 'FAILED', reasonCode: error?.code ?? 'PROGRAM_EXECUTION_FAILED', message: String(error?.message ?? error).slice(0, 512) }, error),
+		);
+		return request.tool.background === true ? this.#programStatus(record, run.programId) : Promise.race([result, attentionResult]);
+	}
+
+	#settleProgram(agentId, run, outcome, error = null) {
+		if (run.settled) return;
+		run.settled = true;
+		const result = { ...outcome, programId: run.programId, goalRevision: run.goalRevision };
+		if (this.#programRuns.get(agentId) === run) {
+			this.#programRuns.delete(agentId);
+			if (this.#executionEpoch(agentId) === run.epoch) this.#programResults.set(agentId, result);
+		}
+		if (error !== null && run.request.tool.background !== true) run.reject(error);
+		else run.resolve(result);
+		if (run.detached && this.#executionEpoch(agentId) === run.epoch) this.#programEvent(run, { event: 'program_ended', result });
+	}
+
+	#programEvent(run, event) {
+		const latest = this.#observations.get(run.record.agentId);
+		if (this.#executionEpoch(run.record.agentId) !== run.epoch || latest?.goalRevision !== run.goalRevision) return;
+		try {
+			Promise.resolve(this.#onProgramEvent(run.record, { ...event, programId: run.programId, goalRevision: run.goalRevision,
+				observation: structuredClone(latest.observation), eventSequence: latest.eventSequence })).catch(error => this.#trace('program_notification_failed', { code: error?.code ?? 'PROGRAM_NOTIFICATION_FAILED' }));
+		} catch (error) { this.#trace('program_notification_failed', { code: error?.code ?? 'PROGRAM_NOTIFICATION_FAILED' }); }
+	}
+
+	#programStatus(record, programId) {
+		this.#assertCurrent(record);
+		const run = this.#programRuns.get(record.agentId);
+		if (run?.goalRevision === record.goalRevision && (programId === undefined || programId === run.programId)) {
+			return { programId: run.programId, goalRevision: run.goalRevision, state: run.state,
+				deadlineEpochMs: run.deadlineEpochMs, maxActions: run.request.tool.maxActions ?? 64,
+				action: this.#actionStatus(record), ...this.#programExecutor.status?.(record) };
+		}
+		const result = this.#programResults.get(record.agentId);
+		if (result?.goalRevision === record.goalRevision && (programId === undefined || programId === result.programId)) return structuredClone(result);
+		return { state: programId === undefined ? 'IDLE' : 'UNKNOWN_PROGRAM', goalRevision: record.goalRevision, ...(programId === undefined ? {} : { programId }) };
+	}
+
+	async #cancelProgram(record, tool) {
+		this.#assertCurrent(record);
+		const run = this.#programRuns.get(record.agentId);
+		if (tool.goalRevision !== record.goalRevision || run?.goalRevision !== record.goalRevision || run.programId !== tool.programId) throw codedError('STALE_PROGRAM', 'Cancellation handle does not match the active program');
+		const preparing = run.state === 'PREPARING';
+		run.state = 'CANCELLING';
+		if (preparing) this.#settleProgram(record.agentId, run, { state: 'CANCELLED', reasonCode: 'MODEL_CANCELLED' });
+		else await this.#programExecutor.cancel(record.agentId, 'MODEL_CANCELLED');
+		return run.result;
+	}
+
+	async #executeProgram(request, record, run) {
+		const { epoch } = run;
+		let source = request.tool.source;
+		if (request.tool.noteKey !== undefined) {
+			let note;
+			let offset = 0;
+			do {
+				const page = await this.#programMemory(request, record, { operation: 'query', arguments: { kind: 'notes', text: request.tool.noteKey, offset, limit: 64 } });
+				this.#assertCurrent(record);
+				if (epoch !== this.#executionEpoch(record.agentId) || this.#programRuns.get(record.agentId) !== run) throw codedError('NATIVE_PROGRAM_CANCELLED', 'Saved program lookup outlived its execution authority');
+				note = page.entries?.find((entry) => entry.key === request.tool.noteKey);
+				const nextOffset = page.nextOffset;
+				if (note || nextOffset === null || !Number.isSafeInteger(nextOffset) || nextOffset <= offset) break;
+				offset = nextOffset;
+			} while (note === undefined);
+			if (!note) throw codedError('PROGRAM_NOTE_NOT_FOUND', 'No saved program exists at that exact notebook key');
+			source = note.text;
+		}
+		this.#assertCurrent(record);
+		if (epoch !== this.#executionEpoch(record.agentId) || this.#programRuns.get(record.agentId) !== run) throw codedError('NATIVE_PROGRAM_CANCELLED', 'Saved program lookup outlived its execution authority');
 		if (this.#actions.has(record.agentId) || this.#completions.has(record.agentId)) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'An action or completion verification already owns this player');
 		const latest = this.#observations.get(record.agentId);
 		if (latest?.goalRevision !== record.goalRevision) throw codedError('CURRENT_OBSERVATION_REQUIRED', 'A current player observation is required before running a program');
-		const run = { epoch: this.#executionEpoch(record.agentId), request };
-		this.#programRuns.set(record.agentId, run);
+		run.state = 'RUNNING';
+		run.deadlineEpochMs = Date.now() + (request.tool.timeoutMs ?? 30_000);
+		// Missing measurements leave preparation disabled rather than guessing a delay.
+		let planningLeadMs;
 		try {
-			return await this.#programExecutor.run(record, { source: request.tool.source, maxActions: request.tool.maxActions, timeoutMs: request.tool.timeoutMs, provenance: nativeMemoryProvenance(request, record) }, {
-				observation: structuredClone(latest.observation), eventSequence: latest.eventSequence,
-				executeAction: async (command) => {
-					if (this.#programRuns.get(record.agentId) !== run || this.#executionEpoch(record.agentId) !== run.epoch) throw codedError('NATIVE_PROGRAM_CANCELLED', 'Program no longer has execution authority');
-					const result = await this.#executeAction(request, record, { kind: 'action', actionType: command.action.type, arguments: command.action.arguments }, null, true, command);
-					const receipt = this.#receipts.get(record.agentId)?.findLast((entry) => entry.engineActionId === command.actionId);
-					return { ...result, ...(receipt === undefined ? {} : { actionId: receipt.actionId }) };
-				},
-				cancelAction: (commandId) => {
-					const active = this.#actions.get(record.agentId);
-					if (active?.engineActionId !== commandId) return { state: 'NO_MATCHING_ACTION' };
-					if (active.cancelling) return active.result;
-					return this.#cancelAction(record, { actionId: active.actionId, goalRevision: active.goalRevision }, { invalidateProgram: false });
-				},
-				inspect: async (query) => ({ state: 'SUCCEEDED', reasonCode: 'INSPECTED', ...await this.#inspect(normalizeMinecraftToolCall('inspect', query), record) }),
-				refreshObservation: async () => {
-					const facts = await this.#observe(record);
-					if (facts.freshness.fresh !== true) throw codedError('FRESH_OBSERVATION_REQUIRED', 'Program continuation needs a new authoritative player observation');
-					return { observation: facts.observation, eventSequence: facts.eventSequence };
-				},
-				memoryOperation: (operation) => this.#programMemory(request, record, operation),
-			});
-		} finally { if (this.#programRuns.get(record.agentId) === run) this.#programRuns.delete(record.agentId); }
+			const measured = this.#planningLeadTime(record);
+			if (Number.isFinite(measured) && measured > 0) planningLeadMs = Math.ceil(measured);
+		} catch { /* Telemetry must not prevent authorised work. */ }
+		return await this.#programExecutor.run(record, { source, programId: run.programId, maxActions: request.tool.maxActions, timeoutMs: request.tool.timeoutMs, observationIntervalMs: request.tool.observationIntervalMs, planningLeadMs, provenance: nativeMemoryProvenance(request, record) }, {
+			onPlanningDue: (_status, { planningLeadMs } = {}) => {
+				if (this.#programRuns.get(record.agentId) !== run || this.#executionEpoch(record.agentId) !== run.epoch) return;
+				const status = { ...this.#programStatus(record, run.programId), planningLeadMs };
+				if (!this.canPrepareProgram(record, run.programId, status.programVersion)) return;
+				const wasDetached = run.detached;
+				run.detached = true;
+				run.detach({ ...status, advisory: 'program_planning_due' });
+				this.#trace('native_program_planning_due', { agentId: record.agentId, goalRevision: run.goalRevision,
+					programId: run.programId, programVersion: status.programVersion, planningLeadMs });
+				if (wasDetached) this.#programEvent(run, { event: 'program_planning_due', status, priority: 'ordinary' });
+			},
+			onDecision: (_status, { priority } = {}) => {
+				if (this.#programRuns.get(record.agentId) !== run || this.#executionEpoch(record.agentId) !== run.epoch) return;
+				const status = this.#programStatus(record, run.programId);
+				const wasDetached = run.detached;
+				run.detached = true;
+				run.detach(status);
+				if (wasDetached) this.#programEvent(run, { event: 'program_attention', status, priority });
+			},
+			observation: structuredClone(latest.observation), eventSequence: latest.eventSequence,
+			executeAction: async (command) => {
+				if (this.#programRuns.get(record.agentId) !== run || this.#executionEpoch(record.agentId) !== run.epoch) throw codedError('NATIVE_PROGRAM_CANCELLED', 'Program no longer has execution authority');
+				const result = await this.#executeAction(request, record, { kind: 'action', actionType: command.action.type, arguments: command.action.arguments }, null, true, command);
+				const receipt = this.#receipts.get(record.agentId)?.findLast((entry) => entry.engineActionId === command.actionId);
+				return { ...result, ...(receipt === undefined ? {} : { actionId: receipt.actionId }) };
+			},
+			cancelAction: (commandId) => {
+				const active = this.#actions.get(record.agentId);
+				if (active?.engineActionId !== commandId) return { state: 'NO_MATCHING_ACTION' };
+				if (active.cancelling) return active.result;
+				return this.#cancelAction(record, { actionId: active.actionId, goalRevision: active.goalRevision }, { invalidateProgram: false });
+			},
+			inspect: async (query) => ({ state: 'SUCCEEDED', reasonCode: 'INSPECTED', ...await this.#inspect(normalizeMinecraftToolCall('inspect', query), record) }),
+			refreshObservation: async () => {
+				const facts = await this.#observe(record);
+				if (facts.freshness.fresh !== true) throw codedError('FRESH_OBSERVATION_REQUIRED', 'Program continuation needs a new authoritative player observation');
+				return { observation: facts.observation, eventSequence: facts.eventSequence };
+			},
+			memoryOperation: (operation) => this.#programMemory(request, record, operation),
+		});
 	}
 
 	async #programMemory(request, record, operation) {
@@ -444,6 +596,7 @@ export class NativeToolRuntime {
 			? input.selectedSlot : 0;
 		const hand = input.hand === 'off_hand' ? 'off' : 'main';
 		const results = [];
+		const samples = [];
 		for (let index = 0; index < tool.steps; index += 1) {
 			if (this.#executionEpoch(record.agentId) !== executionEpoch) throw codedError('NATIVE_ACTION_CANCELLED', 'Camera sweep cancelled before its next step');
 			const action = {
@@ -458,30 +611,38 @@ export class NativeToolRuntime {
 			};
 			const result = await this.#executeAction(request, record, action, index);
 			results.push({ actionType: action.actionType, ...result });
-			if (result.state !== 'SUCCEEDED') return { state: result.state, completed: results.length, failedAt: index, results };
+			if (result.state !== 'SUCCEEDED') return { state: result.state, completed: results.length, failedAt: index, results, samples };
+			const facts = await this.#observe(record);
+			if (facts.freshness.fresh !== true) throw codedError('FRESH_OBSERVATION_REQUIRED', 'Camera sweep needs a fresh observation at each heading');
+			samples.push(sweepSample(facts, action.arguments));
 		}
-		return { state: 'SUCCEEDED', completed: results.length, results };
+		return { state: 'SUCCEEDED', completed: results.length, results, samples };
 	}
 
 	async #executeSequence(request, record, executionEpoch) {
 		const results = [];
+		let failedAt;
 		for (let index = 0; index < request.tool.actions.length; index += 1) {
 			if (this.#executionEpoch(record.agentId) !== executionEpoch) throw codedError('NATIVE_ACTION_CANCELLED', 'Native sequence cancelled before its next action');
 			const action = request.tool.actions[index];
 			const result = await this.#executeAction(request, record, { kind: 'action', ...action }, index);
 			results.push({ actionType: action.actionType, ...result });
-			if (result.state !== 'SUCCEEDED') return { state: result.state, completed: results.length, failedAt: index, results };
+			if (result.state !== 'SUCCEEDED') { failedAt = index; break; }
 		}
-		return { state: 'SUCCEEDED', completed: results.length, results };
+		const outcome = { state: failedAt === undefined ? 'SUCCEEDED' : results.at(-1).state, completed: results.length, ...(failedAt === undefined ? {} : { failedAt }), results };
+		return results.some(step => POST_ACTION_OBSERVATION_TYPES.has(step.actionType))
+			? this.#withPostAction(record, outcome, executionEpoch) : outcome;
 	}
 
 	async #executeAction(request, record, tool, sequenceIndex = null, waitForCompletion = true, programCommand = null) {
+		const executionEpoch = this.#executionEpoch(record.agentId);
 		if (this.#actions.has(record.agentId)) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'The Minecraft body is already executing an action');
 		if (this.#completions.has(record.agentId)) throw codedError('NATIVE_COMPLETION_IN_PROGRESS', 'Goal completion verification is already running');
 
 		const ordinal = ++this.#sequence;
 		const identity = `${this.#sessionId}:${ordinal}:${safeSegment(record.agentId).slice(0, 32)}:${record.goalRevision}`;
-		const traceId = validateTraceId(`native-${identity.replaceAll(':', '-')}`);
+		// The envelope and authorship must identify the same trace at the wire boundary.
+		const traceId = validateTraceId(programCommand?.provenance.traceId ?? `native-${identity.replaceAll(':', '-')}`);
 		const actionId = `native:${identity}`;
 		const targetId = tool.arguments?.targetId ?? tool.arguments?.targetSelector;
 		const latest = this.#observations.get(record.agentId);
@@ -550,7 +711,23 @@ export class NativeToolRuntime {
 			await Promise.race([publication, result]);
 			if (active.publicationError !== undefined) throw active.publicationError;
 		}
-		return waitForCompletion ? result : this.#actionStatus(record, actionId);
+		if (!waitForCompletion) return this.#actionStatus(record, actionId);
+		const outcome = await result;
+		// Sequences sample after their final step; the program executor samples before each authored continuation.
+		return sequenceIndex === null && programCommand === null && POST_ACTION_OBSERVATION_TYPES.has(tool.actionType)
+			? this.#withPostAction(record, outcome, executionEpoch) : outcome;
+	}
+
+	async #withPostAction(record, outcome, executionEpoch) {
+		if (this.#requestObservation === null) return outcome;
+		try {
+			this.#assertCurrent(record);
+			if (this.#executionEpoch(record.agentId) !== executionEpoch) throw codedError('STALE_NATIVE_TOOL', 'Action lifecycle has ended');
+			return { ...outcome, postAction: await this.#observe(record) };
+		} catch (error) {
+			return { ...outcome, postAction: { freshness: { fresh: false }, reasonCode: error?.code ?? 'OBSERVATION_UNAVAILABLE',
+				message: 'The action result above is authoritative. Fresh follow-up facts are unavailable; observe before choosing a dependent action.' } };
+		}
 	}
 
 	onActionProgress(record, payload = {}) {
@@ -590,6 +767,9 @@ export class NativeToolRuntime {
 		const result = {
 			state,
 			reasonCode,
+			...(reasonCode === 'ITEM_NOT_FOUND' && active.actionType === 'pick_up_item' ? {
+				recoveryHint: 'The selected drop is no longer available. Inspect current inventory before retrying; nearby drops may be collected automatically. If more items are needed, observe and select a fresh UUID. Missing target alone does not prove collection.',
+			} : {}),
 			...(payload.message === undefined ? {} : { message: String(payload.message).slice(0, 2_048) }),
 			...(payload.executionStarted === undefined ? {} : { executionStarted: payload.executionStarted === true }),
 			...(payload.physicalAttempted === undefined ? {} : { physicalAttempted: payload.physicalAttempted === true }),
@@ -627,18 +807,27 @@ export class NativeToolRuntime {
 		if (active === undefined || active.goalRevision !== record.goalRevision) return false;
 		if (payload.traceId !== active.traceId || payload.goalFingerprint !== active.goalFingerprint) return false;
 		this.#completions.delete(record.agentId);
+		const facts = structuredClone(Array.isArray(payload.facts) ? payload.facts : []);
+		const unmet = facts.filter((fact) => fact.satisfied === false);
+		const awaitingConfirmation = payload.verified !== true && payload.reasonCode === 'PREDICATE_FAILED'
+			&& unmet.length > 0 && unmet.every((fact) => fact.type === 'operator_confirmed');
 		active.resolve({
-			state: payload.verified === true ? 'COMPLETED' : 'ACTIVE',
+			state: payload.verified === true ? 'COMPLETED' : awaitingConfirmation ? 'AWAITING_OPERATOR_CONFIRMATION' : 'ACTIVE',
 			verified: payload.verified === true,
 			reasonCode: String(payload.reasonCode ?? '').slice(0, 128),
-			facts: structuredClone(Array.isArray(payload.facts) ? payload.facts : []),
+			facts,
+			...(awaitingConfirmation ? { message: 'The remaining condition requires operator confirmation. Report completion once, then end this turn. Do not repeat the physical work or finish checks while waiting.' } : {}),
 		});
 		return true;
 	}
 
 	async dispose(agentId, reason = 'disposed') {
 		this.#executionEpochs.set(agentId, this.#executionEpoch(agentId) + 1);
+		const program = this.#programRuns.get(agentId);
+		if (program?.state === 'PREPARING') this.#settleProgram(agentId, program, { state: 'CANCELLED', reasonCode: 'NATIVE_PROGRAM_CANCELLED' }, codedError('NATIVE_PROGRAM_CANCELLED', 'Program preparation outlived its lifecycle'));
 		this.#programRuns.delete(agentId);
+		this.#programResults.delete(agentId);
+		this.#sweeps.delete(agentId);
 		Promise.resolve(this.#programExecutor.cancel(agentId, reason)).catch((error) => this.#trace('native_program_cancel_failed', { agentId, reasonCode: error?.code ?? 'PROGRAM_CANCEL_FAILED' }));
 		// Physical authority is released before waiting on persistence below.
 		if (FORGET_REASONS.test(String(reason))) {
@@ -692,6 +881,8 @@ export class NativeToolRuntime {
 			...this.#observations.keys(),
 			...this.#actions.keys(),
 			...this.#completions.keys(),
+			...this.#programRuns.keys(),
+			...this.#sweeps.keys(),
 			...this.#lastLive.keys(),
 		]);
 		await Promise.allSettled([...agentIds].map((agentId) => this.dispose(agentId, reason)));
@@ -866,4 +1057,59 @@ async function withDeadline(promise, timeoutMs, code, message) {
 	} finally {
 		clearTimeout(timer);
 	}
+}
+
+// Historical sightings preserve each heading without presenting earlier targets as current facts.
+function sweepSample(facts, { yaw, pitch }) {
+	const observation = facts.observation;
+	const sample = { historical: true, yaw, pitch, eventSequence: facts.eventSequence,
+		observedAtEpochMs: observation.observedAtEpochMs ?? null, dimension: observation.world?.dimension ?? null,
+		entities: [], blocks: [], items: [], landmarks: [], omitted: {} };
+	const sections = ['entities', 'blocks', 'items', 'landmarks'];
+	const sources = sections.map((section) => observation.continuity?.rememberedSections?.includes(section) ? []
+		: (section === 'landmarks' ? observation.world?.landmarks ?? observation.landmarks : observation[section]) ?? []);
+	const representativeFields = {
+		entities: ['entityType', 'type', 'kind', 'stableId', 'uuid'],
+		blocks: ['blockId', 'type', 'kind', 'stableId', 'uuid'],
+		items: ['itemId', 'type', 'kind', 'stableId', 'uuid'],
+		landmarks: ['blockId', 'itemId', 'type', 'kind', 'stableId', 'uuid'],
+	};
+	// Semantic representatives are interleaved across sections so one dense view cannot crowd out another;
+	// every admission is checked with the final omission counts because those counts consume the same byte budget.
+	// Keep distinct observed types across every section before repeated terrain or mobs
+	// consume the scan budget. These remain historical sightings, not chosen targets.
+	const candidatesByPass = [sections.map(() => []), sections.map(() => [])];
+	for (const [sectionIndex, section] of sections.entries()) {
+		const representatives = [];
+		const duplicates = [];
+		const seen = new Set();
+		for (const [entryIndex, entry] of sources[sectionIndex].entries()) {
+			if (!entry) continue;
+			const compact = Object.fromEntries(['uuid', 'stableId', 'type', 'entityType', 'itemId', 'blockId', 'kind', 'position', 'x', 'y', 'z', 'distance', 'parentId', 'partName']
+				.filter((field) => entry[field] !== undefined).map((field) => [field, entry[field]]));
+			const representativeField = representativeFields[section].find((field) => compact[field] !== undefined);
+			const identity = representativeField === undefined ? `entry:${entryIndex}` : `${representativeField}:${JSON.stringify(compact[representativeField])}`;
+			if (seen.has(identity)) duplicates.push(compact);
+			else { seen.add(identity); representatives.push(compact); }
+		}
+		candidatesByPass[0][sectionIndex] = representatives;
+		candidatesByPass[1][sectionIndex] = duplicates;
+	}
+	const omitted = () => Object.fromEntries(sections.map((section, index) => [section, sources[index].length - sample[section].length]));
+	const fitsBudget = () => {
+		sample.omitted = omitted();
+		return Buffer.byteLength(JSON.stringify(sample), 'utf8') <= 1400;
+	};
+	for (const candidates of candidatesByPass) {
+		for (let index = 0; index < Math.max(...candidates.map((entries) => entries.length)); index += 1) {
+			for (const [sectionIndex, section] of sections.entries()) {
+				const entry = candidates[sectionIndex][index];
+				if (entry === undefined) continue;
+				sample[section].push(entry);
+				if (!fitsBudget()) sample[section].pop();
+			}
+		}
+	}
+	sample.omitted = omitted();
+	return sample;
 }

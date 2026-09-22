@@ -18,6 +18,17 @@ function setup(overrides = {}, options = {}) {
 	return { executor, context, commands, cancels };
 }
 
+test('explicit ranged options survive ArenaScript execution', async () => {
+	const run = setup();
+	const result = await run.executor.run(record, { source: `${prefix}
+		await player.useRanged({ targetId: "11111111-1111-1111-1111-111111111111", drawDurationMs: 1000, timeoutMs: 3000, aimX: 2, aimY: 65, aimZ: 3 });
+		await player.useItem({ durationMs: 1000, mode: "once" });
+	` }, run.context);
+	assert.equal(result.reasonCode, 'PROGRAM_EXHAUSTED');
+	assert.equal(run.commands[0].action.arguments.aimY, 65);
+	assert.equal(run.commands[1].action.arguments.mode, 'once');
+});
+
 test('native programs use the same candidate arithmetic and exact authored commands, returning to their caller at exhaustion', async () => {
 	const run = setup({ observation: { ...observation(), entities: [
 		{ stableId: '11111111-1111-1111-1111-111111111111', type: 'minecraft:pig', x: 2, y: 64, z: 2, velocity: { x: 1, y: 0, z: 0 } },
@@ -138,6 +149,62 @@ test('deadlines cancel exact inputs and unresolved acknowledgements are reported
 	assert.equal(result.state, 'UNKNOWN');
 	assert.equal(result.reasonCode, 'PROGRAM_CANCEL_ACK_TIMEOUT');
 	assert.equal(result.receipts.length, 0);
+});
+
+test('planning-ahead sends one advisory before the deadline without interrupting the body', async () => {
+	const timers = [];
+	const advisories = [];
+	const executor = new NativeProgramExecutor({
+		setTimeoutFn: (callback, ms) => { const timer = { callback, ms }; timers.push(timer); return timer; },
+		clearTimeoutFn: () => {},
+	});
+	const run = setup({ onPlanningDue: (status, details) => advisories.push({ status, details }) });
+	const pending = executor.run(record, {
+		source: `${prefix} await player.wait(1);`, timeoutMs: 100, planningLeadMs: 25,
+	}, { ...run.context, onPlanningDue: (status, details) => advisories.push({ status, details }) });
+	const due = timers.find((timer) => timer.ms === 75);
+	assert.ok(due, 'the advisory is scheduled one measured lead time before the deadline');
+	due.callback();
+	due.callback();
+	assert.equal(advisories.length, 1);
+	assert.equal(advisories[0].status.programVersion, 1);
+	assert.equal(advisories[0].status.engineState, 'ACTIVE');
+	assert.deepEqual(advisories[0].details, { planningLeadMs: 25 });
+	assert.equal(run.cancels.length, 0);
+	assert.equal((await pending).reasonCode, 'PROGRAM_EXHAUSTED');
+});
+
+test('planning-ahead does not replace a real hazard decision and stale version timers are fenced', async () => {
+	const timers = [];
+	const advisories = [];
+	let release;
+	let calls = 0;
+	const executor = new NativeProgramExecutor({
+		setTimeoutFn: (callback, ms) => { const timer = { callback, ms }; timers.push(timer); return timer; },
+		clearTimeoutFn: () => {},
+	});
+	const run = setup({
+		executeAction: () => ++calls === 1
+			? new Promise((resolve) => { release = resolve; })
+			: Promise.resolve({ state: 'SUCCEEDED', reasonCode: 'DONE' }),
+		onDecision: () => {},
+		onPlanningDue: (status, details) => advisories.push({ status, details }),
+	});
+	const pending = executor.run(record, {
+		source: `${prefix} await player.wait(100); await player.wait(2);`, timeoutMs: 100, planningLeadMs: 25, programId: 'planning-ahead-test',
+	}, { ...run.context, onPlanningDue: (status, details) => advisories.push({ status, details }) });
+	const due = timers.find((timer) => timer.ms === 75);
+	executor.onObservation(record, { observation: observation(9), eventSequence: 2, attention: true, priority: 'urgent', trigger: 'health_changed' });
+	await turn();
+	const decision = executor.status(record).decision;
+	assert.equal(decision.trigger, 'health_changed');
+	executor.respond(record, { programId: 'planning-ahead-test', decisionId: decision.decisionId, directive: 'replace', source: `${prefix} await player.wait(3);` });
+	// The timer was armed for version 1. Replaying it after replacement must
+	// not send an advisory carrying stale program-version authority.
+	due.callback();
+	assert.equal(advisories.length, 0);
+	release({ state: 'CANCELLED', reasonCode: 'INPUT_RELEASED' });
+	await pending;
 });
 
 test('cancelled query results cannot release later body actions and finish remains a model request', async () => {

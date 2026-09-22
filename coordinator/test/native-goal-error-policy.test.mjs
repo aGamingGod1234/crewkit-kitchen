@@ -19,6 +19,7 @@ test('classifies local, profile, and configuration native errors as terminal', (
 		'REASONING_EFFORT_UNAVAILABLE',
 		'SERVICE_TIER_UNAVAILABLE',
 		'NATIVE_TOOLS_UNAVAILABLE',
+		'MINECRAFT_WORKSPACE_MISMATCH',
 	]) {
 		assert.equal(classifyNativeGoalError(Object.assign(new Error(code), { code })), 'terminal');
 	}

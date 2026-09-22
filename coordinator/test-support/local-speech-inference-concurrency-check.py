@@ -1,5 +1,6 @@
 import base64
 import contextlib
+import faulthandler
 import importlib.util
 import json
 from pathlib import Path
@@ -240,4 +241,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Preserve the blocked threads if the parent test's ten-second deadline fires.
+    faulthandler.dump_traceback_later(8)
+    try:
+        main()
+    finally:
+        faulthandler.cancel_dump_traceback_later()

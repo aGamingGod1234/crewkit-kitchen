@@ -312,6 +312,7 @@ public final class ProtocolCodec {
 			case SELECT_ITEM -> requireIdentifier(arguments, FIELD_ITEM_ID);
 			case USE_ITEM -> {
 				requireDuration(arguments, FIELD_DURATION_MS);
+				if (arguments.has("mode")) requireOneOf(arguments, "mode", List.of("once", "hold"));
 				if (present(arguments, FIELD_HAND)) requireOneOf(arguments, FIELD_HAND, List.of("main", "off"));
 				if (present(arguments, FIELD_EXPECTED_ITEM_ID)) requireIdentifier(arguments, FIELD_EXPECTED_ITEM_ID);
 			}
@@ -382,7 +383,7 @@ public final class ProtocolCodec {
 		JsonObject validatedArguments = new JsonObject();
 		for (String field : ACTION_FIELDS.get(actionType)) {
 			JsonElement value = arguments.get(field);
-			validatedArguments.add(field, value == null ? JsonNull.INSTANCE : value.deepCopy());
+			if (value != null) validatedArguments.add(field, value.deepCopy());
 		}
 		return validatedArguments;
 	}
@@ -644,6 +645,13 @@ public final class ProtocolCodec {
 		requireUuid(arguments, FIELD_TARGET_ID);
 		requireDuration(arguments, FIELD_DRAW_DURATION_MS);
 		requireDuration(arguments, FIELD_TIMEOUT_MS);
+		if (arguments.has("trackTarget")) requireBoolean(arguments, "trackTarget");
+		if (arguments.has("aimX") || arguments.has("aimY") || arguments.has("aimZ")) {
+			for (String field : List.of("aimX", "aimY", "aimZ")) requireFiniteRange(arguments, field, -30_000_000, 30_000_000);
+			if (arguments.has("trackTarget") && arguments.get("trackTarget").getAsBoolean()) {
+				throw new ProtocolException("INVALID_FIELD", "Fixed aim and target tracking are mutually exclusive");
+			}
+		}
 	}
 
 	private static long requireStackCount(JsonObject arguments) throws ProtocolException {
@@ -937,7 +945,7 @@ public final class ProtocolCodec {
 		fields.put(ActionType.LOOK_AT, List.of(FIELD_X, FIELD_Y, FIELD_Z));
 		fields.put(ActionType.ATTACK, List.of(FIELD_TARGET_ID, FIELD_TIMEOUT_MS));
 		fields.put(ActionType.SELECT_ITEM, List.of(FIELD_ITEM_ID));
-		fields.put(ActionType.USE_ITEM, List.of(FIELD_DURATION_MS, FIELD_HAND, FIELD_EXPECTED_ITEM_ID));
+		fields.put(ActionType.USE_ITEM, List.of(FIELD_DURATION_MS, FIELD_HAND, FIELD_EXPECTED_ITEM_ID, "mode"));
 		fields.put(ActionType.CONTROL_SEQUENCE, List.of("frames", "maxTicks"));
 		fields.put(ActionType.BREAK_BLOCK, List.of(FIELD_X, FIELD_Y, FIELD_Z, FIELD_TIMEOUT_MS, FIELD_EXPECTED_BLOCK_ID));
 		fields.put(ActionType.PLACE_BLOCK, List.of(FIELD_X, FIELD_Y, FIELD_Z, FIELD_FACE, FIELD_ITEM_ID, FIELD_DESIRED_STATE));
@@ -972,7 +980,7 @@ public final class ProtocolCodec {
 				FIELD_SOURCE_SLOT, FIELD_HOTBAR_SLOT, FIELD_EXPECTED_ITEM_ID, FIELD_MIN_REMAINING_DURABILITY
 		));
 		fields.put(ActionType.BLOCK_WITH_SHIELD, List.of(FIELD_DURATION_MS));
-		fields.put(ActionType.USE_RANGED, List.of(FIELD_TARGET_ID, FIELD_DRAW_DURATION_MS, FIELD_TIMEOUT_MS));
+		fields.put(ActionType.USE_RANGED, List.of(FIELD_TARGET_ID, FIELD_DRAW_DURATION_MS, FIELD_TIMEOUT_MS, "aimX", "aimY", "aimZ", "trackTarget"));
 		fields.put(ActionType.INTERACT_BLOCK, List.of(
 				FIELD_X, FIELD_Y, FIELD_Z, FIELD_FACE, FIELD_HAND, FIELD_EXPECTED_ITEM_ID, "hitX", "hitY", "hitZ"
 		));

@@ -6,6 +6,8 @@ import net from 'node:net';
 import { MultiplexedServerBridge, validateProtocolV2Payload } from './protocol-v2.mjs';
 import { HeadlessRconClient } from './headless-rcon.mjs';
 import { JsonlDecoder } from './jsonl.mjs';
+import { NativeToolRuntime } from './native-tool-runtime.mjs';
+import { normalizeMinecraftToolCall } from './native-minecraft-tools.mjs';
 
 const PROFILE = Object.freeze({ provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority' });
 const TERMINAL = new Set(['SUCCEEDED', 'FAILED', 'TIMED_OUT', 'CANCELLED']);
@@ -136,6 +138,7 @@ export async function runPlayerCapabilityProbe(config) {
 	const rcon = new HeadlessRconClient({ host: config.host, port: config.rconPort, password });
 	const inbox = new ProbeInbox(bridge, Math.min(config.timeoutMs, 30000));
 	let record = null, observation = null, ordinal = 0;
+	let predicate = { type: 'survive_duration', ticks: 12000 };
 	let failure = null, stage = 'connect_rcon', rconResponsive = true;
 	const command = async (text) => {
 		const startedAt = Date.now(), operation = /\bcodex (summon|start|stop)\b/.exec(text)?.[0] ?? text.split(' ')[0];
@@ -152,11 +155,15 @@ export async function runPlayerCapabilityProbe(config) {
 	};
 	bridge.on('goal_spec_request', (event) => {
 		if (record?.agentId !== event.agentId) return;
-		const pending = bridge.send('goal_spec_proposal', record.agentId, { requestId: event.payload.requestId, summary: 'Remain alive during the mechanics fixture.', predicate: { type: 'survive_duration', ticks: 12000 } });
+		const pending = bridge.send('goal_spec_proposal', record.agentId, { requestId: event.payload.requestId, summary: 'Verify the declared mechanics fixture predicate.', predicate });
 		event.waitUntil?.(pending); pending.catch((error) => inbox.fail(error));
 	});
 	bridge.on('goal_control', (event) => {
 		if (record?.agentId === event.agentId) record = { ...record, goalRevision: event.payload.goalRevision };
+	});
+	bridge.on('goal_spec_result', (event) => {
+		if (record?.agentId !== event.agentId) return;
+		if (event.payload.status === 'rejected') inbox.fail(new Error(`GOAL_PROPOSAL_${event.payload.reasonCode}`));
 	});
 	bridge.on('observation', (event) => {
 		if (record?.agentId === event.agentId && event.payload.ready) observation = event.payload;
@@ -199,6 +206,17 @@ export async function runPlayerCapabilityProbe(config) {
 	const closeMenu = async () => {
 		const page = await inspect('menu');
 		await action('menu_close', { menuId: page.menu.type, containerId: page.menu.containerId, stateId: page.menu.stateId });
+	};
+	const killGoal = async (entityType) => {
+		await command(`codex stop ${config.agentName}`);
+		predicate = { type: 'entity_killed_by_agent', entityType, afterGoalStart: true };
+		const activated = inbox.wait('goal_control', (event) => event.agentId === record.agentId && ['start', 'replace'].includes(event.payload.operation));
+		report.goalSetupResponse = await command(`codex start ${config.agentName} Kill ${entityType}`);
+		const goal = await activated;
+		assertFact(goal.payload.goal === `Kill ${entityType}` && goal.payload.goalSpec?.predicate?.entityType === entityType, 'NEW_KILL_GOAL_NOT_TRANSMITTED');
+		record.goalRevision = goal.payload.goalRevision;
+		await bridge.send('agent_ready', record.agentId, { goalRevision: record.goalRevision, reconciled: false });
+		return { completed: inbox.wait('goal_control', (event) => event.agentId === record.agentId && event.payload.operation === 'complete') };
 	};
 	try {
 		await rcon.connect();
@@ -262,6 +280,44 @@ export async function runPlayerCapabilityProbe(config) {
 			const after = (await observe()).position;
 			assertFact(after.x - before.x > 0.2, 'CONTROL_DID_NOT_MOVE');
 			return { before, after };
+		});
+		await check('mined overhead drop is collected while falling through vanilla pickup', async () => {
+			await command(`tp ${player} 0.5 64 -2.5 0 -60`);
+			await command(`clear ${player}`);
+			await command('setblock 1 67 -2 minecraft:oak_log');
+			await action('look_at', { x: 1.5, y: 67.5, z: -1.5 });
+			await action('break_block', { x: 1, y: 67, z: -2, expectedBlockId: 'minecraft:oak_log', timeoutMs: 15000 });
+			const drops = await inspect('entities', { entityType: 'minecraft:item' });
+			const drop = drops.entries.find(entry => entry.itemId === 'minecraft:oak_log');
+			assertFact(drop?.uuid && drop.position.y > 65, 'FALLING_DROP_FIXTURE_MISSING');
+			const result = await action('pick_up_item', { targetSelector: drop.uuid });
+			const inventory = await inspect('inventory');
+			assertFact(inventory.entries.some(entry => entry.itemId === 'minecraft:oak_log' && entry.count === 1), 'FALLING_DROP_NOT_COLLECTED');
+			await command(`clear ${player}`);
+			return { dropPosition: drop.position, reasonCode: result.reasonCode, elapsedMs: result.elapsedMs, collectedCount: 1 };
+		});
+		await check('grounded drop under a canopy is collected from a supported adjacent position', async () => {
+			await command(`tp ${player} 0.5 64 -1.5 -90 0`);
+			const before = await inspect('inventory');
+			const beforeCount = before.entries.filter(entry => entry.itemId === 'minecraft:oak_log').reduce((sum, entry) => sum + entry.count, 0);
+			await command('setblock 3 64 -2 minecraft:stone');
+			await command('setblock 3 66 -2 minecraft:stone');
+			await command('summon minecraft:item 3.5 65 -1.5 {Item:{id:"minecraft:oak_log",count:1},PickupDelay:0s,Motion:[0d,0d,0d]}');
+			await action('look_at', { x: 3.5, y: 65.1, z: -1.5 });
+			const drops = await inspect('entities', { entityType: 'minecraft:item' });
+			const drop = drops.entries.find(entry => entry.itemId === 'minecraft:oak_log');
+			assertFact(drop?.uuid, 'CANOPY_DROP_FIXTURE_MISSING');
+			const result = await action('pick_up_item', { targetSelector: drop.uuid });
+			const after = (await inspect('observation')).observation;
+			const inventory = await inspect('inventory');
+			const afterCount = inventory.entries.filter(entry => entry.itemId === 'minecraft:oak_log').reduce((sum, entry) => sum + entry.count, 0);
+			report.canopyPickup = { position: after.position, beforeCount, afterCount };
+			assertFact(afterCount === beforeCount + 1, 'CANOPY_DROP_NOT_COLLECTED');
+			assertFact(after.position.y < 65, 'PICKUP_DID_NOT_USE_ADJACENT_GROUND');
+			await command(`clear ${player}`);
+			await command('setblock 3 64 -2 minecraft:air');
+			await command('setblock 3 66 -2 minecraft:air');
+			return { reasonCode: result.reasonCode, elapsedMs: result.elapsedMs, position: after.position, beforeCount, afterCount, collectedCount: afterCount - beforeCount };
 		});
 		await check('storage menu pickup preserves cursor then deposits exact stack', async () => {
 			await command(`tp ${player} 0.5 64 0.5 -90 0`);
@@ -327,12 +383,268 @@ export async function runPlayerCapabilityProbe(config) {
 			assertFact((await observe()).player.passenger === false, 'BOAT_DISMOUNT_NOT_CONFIRMED');
 			return { boatType: boat.type, mountedVehicle: boat.uuid, before: before.position, after: after.position, horizontalDistance: distance, controlTicks: 20, measurementUsesOperatorCommands: false };
 		});
+		await check('recipe output filters return the requested installed recipe', async () => {
+			const page = await inspect('recipes', { outputItemId: 'minecraft:blaze_powder' });
+			assertFact(page.entries?.some((entry) => entry.recipeId === 'minecraft:blaze_powder'), 'OUTPUT_FILTER_MISSING_RECIPE');
+			return page;
+		});
+		await check('background program reacts through the production bridge after returning its handle', async () => {
+			await command(`tp ${player} 0.5 64 0.5 -90 0`);
+			await command(`effect give ${player} minecraft:instant_health 1 4 true`);
+			const commands = [];
+			const samples = [];
+			const programEvents = [];
+			const runtime = new NativeToolRuntime({ bridge: { send: async (type, agentId, payload) => {
+				if (type === 'action_command' || type === 'action_cancel') commands.push({ type, actionId: payload.actionId, actionType: payload.actionType });
+				return bridge.send(type, agentId, payload);
+			} }, onProgramEvent: (_record, event) => programEvents.push(event), requestObservation: async () => {
+				// Match the coordinator's passive inspection path. request_observation
+				// explicitly wakes the planner and would interrupt its own routine.
+				return inspect('observation');
+			} });
+			const onObservation = event => {
+				if (event.agentId === record.agentId) samples.push({ sequence: event.payload.eventSequence, health: event.payload.player?.health, attention: event.payload.attention, trigger: event.payload.trigger, changedFacts: event.payload.changedFacts });
+				if (event.agentId === record.agentId && event.payload.ready) runtime.updateObservation(record, event.payload, {
+					eventSequence: event.payload.eventSequence, attention: event.payload.attention === true, changedFacts: event.payload.changedFacts,
+				});
+			};
+			const onResult = event => {
+				if (event.agentId !== record.agentId || !commands.some(entry => entry.actionId === event.payload.actionId)) return;
+				runtime.onActionResult(record, event.payload);
+				bridge.send('action_result_ack', record.agentId, { goalRevision: record.goalRevision, actionId: event.payload.actionId }).catch(error => inbox.fail(error));
+			};
+			bridge.on('observation', onObservation);
+			bridge.on('action_result', onResult);
+			let toolOrdinal = 0;
+			const tool = (name, args) => runtime.execute({ agentId: record.agentId, goalRevision: record.goalRevision,
+				turnId: 'background-mechanics', callId: `background-${++toolOrdinal}`, tool: normalizeMinecraftToolCall(name, args) }, record);
+			try {
+				const initial = await inspect('observation');
+				const before = initial.observation;
+				runtime.updateObservation(record, before, { eventSequence: initial.eventSequence });
+				assertFact(before.player.health === 20, 'BACKGROUND_FIXTURE_HEALTH');
+				const handle = await tool('runProgram', { background: true, timeoutMs: 10000, observationIntervalMs: 100,
+					source: `program.onUnhandledAttention("continue_and_notify");
+					program.watch(() => player.state().health < 20, { mode: "interrupt" }, async () => {
+						await player.control(${JSON.stringify(inputFrame({ forward: 1, ticks: 10 }))});
+					}); await player.wait(8000);` });
+				assertFact(handle.state === 'RUNNING', 'BACKGROUND_HANDLE_NOT_RUNNING');
+				// Damage is a declared fixture stimulus, after the native tool already returned.
+				await command(`damage ${player} 2 minecraft:generic`);
+				let result;
+				const deadline = Date.now() + 12000;
+				do {
+					await new Promise(resolve => setTimeout(resolve, 100));
+					result = await tool('programStatus', { programId: handle.programId });
+				} while (['PREPARING', 'RUNNING', 'CANCELLING'].includes(result.state) && Date.now() < deadline);
+				const after = await observe();
+				const distance = Math.hypot(after.position.x - before.position.x, after.position.z - before.position.z);
+				report.backgroundProgram = { handle, state: result.state, reasonCode: result.reasonCode, trigger: result.trigger, actionFailure: result.actionFailure, actions: result.actions, samples,
+					receipts: result.receipts, commands, before: { position: before.position, health: before.player.health },
+					after: { position: after.position, health: after.player.health }, distance };
+				assertFact(result.reasonCode === 'PROGRAM_IDLE' && distance > 0.5, 'BACKGROUND_REACTION_NOT_CONFIRMED');
+				assertFact(commands.some(entry => entry.type === 'action_cancel') && result.receipts?.some(receipt => receipt.actionType === 'control' && receipt.state === 'SUCCEEDED'), 'BACKGROUND_REACTION_RECEIPTS_MISSING');
+				// Hold reconsideration while authorised actions continue, then answer
+				// through the same decision tool available to the selected model.
+				// Use a clear lane; the first movement ends against the storage fixture.
+				await command(`tp ${player} 0.5 64 -2.5 -90 0`);
+				const continuingBefore = (await inspect('observation')).observation;
+				const commandOffset = commands.length;
+				const continuous = await tool('runProgram', { background: true, timeoutMs: 10000, observationIntervalMs: 100,
+					source: `program.onUnhandledAttention("continue_and_notify"); await player.wait(800);
+					await player.control(${JSON.stringify(inputFrame({ forward: 1, ticks: 10 }))});
+					await player.control(${JSON.stringify(inputFrame({ forward: 1, ticks: 10 }))}); await player.wait(8000);` });
+				// Exceed the first hit so vanilla hurt immunity cannot swallow this
+				// stimulus; do not race an instant-heal effect against the damage.
+				await command(`damage ${player} 6 minecraft:generic`);
+				const continuedDeadline = Date.now() + 7000;
+				while (commands.slice(commandOffset).filter(entry => entry.type === 'action_command').length < 4 && Date.now() < continuedDeadline) {
+					await new Promise(resolve => setTimeout(resolve, 50));
+				}
+				const pending = await tool('programStatus', { programId: continuous.programId });
+				report.continuousProgram = { pending, providerUsed: false, decisionDriver: 'declared delayed-response fixture' };
+				assertFact(pending.decision && pending.engineState === 'ACTIVE', 'CONTINUOUS_DECISION_NOT_PENDING');
+				assertFact(commands.slice(commandOffset).filter(entry => entry.type === 'action_command').length === 4, 'CONTINUOUS_PROGRESS_BLOCKED_ON_MODEL');
+				const stopped = await tool('respondProgram', { programId: continuous.programId, goalRevision: continuous.goalRevision,
+					decisionId: pending.decision.decisionId, directive: 'pause' });
+				const continuingAfter = (await inspect('observation')).observation;
+				const continuedDistance = Math.hypot(continuingAfter.position.x - continuingBefore.position.x, continuingAfter.position.z - continuingBefore.position.z);
+				report.continuousProgram = { pending, reasonCode: stopped.reasonCode, distance: continuedDistance, receipts: stopped.receipts,
+					before: continuingBefore.position, after: continuingAfter.position,
+					providerUsed: false, decisionDriver: 'declared delayed-response fixture' };
+				assertFact(stopped.reasonCode === 'MODEL_PAUSED' && continuedDistance > 1, 'CONTINUOUS_PAUSE_OR_MOVEMENT_FAILED');
+				assertFact(programEvents.some(event => event.programId === continuous.programId && event.event === 'program_attention'), 'CONTINUOUS_ATTENTION_NOT_DELIVERED');
+				return { handle, reasonCode: result.reasonCode, distance, receipts: result.receipts, continuation: report.continuousProgram, providerUsed: false };
+			} finally {
+				await runtime.disposeAll();
+				bridge.off('observation', onObservation);
+				bridge.off('action_result', onResult);
+			}
+		});
+		await check('measured planning lead advises once while a real bridge action keeps running', async () => {
+			await command(`tp ${player} 0.5 64 0.5 -90 0`);
+			const events = [], sent = [], actionIds = new Set();
+			const runtime = new NativeToolRuntime({
+				bridge: { send: async (type, agentId, payload) => {
+					if (type === 'action_command' || type === 'action_cancel') {
+						sent.push({ type, actionId: payload.actionId, actionType: payload.actionType });
+						if (type === 'action_command') actionIds.add(payload.actionId);
+					}
+					return bridge.send(type, agentId, payload);
+				} },
+				planningLeadTime: () => 3000,
+				onProgramEvent: (_record, event) => events.push(event),
+				requestObservation: async () => inspect('observation'),
+			});
+			const onObservation = event => {
+				if (event.agentId === record.agentId && event.payload.ready) runtime.updateObservation(record, event.payload, {
+					eventSequence: event.payload.eventSequence, attention: event.payload.attention === true, changedFacts: event.payload.changedFacts,
+				});
+			};
+			const onResult = event => {
+				if (event.agentId !== record.agentId || !actionIds.has(event.payload.actionId)) return;
+				runtime.onActionResult(record, event.payload);
+				bridge.send('action_result_ack', record.agentId, { goalRevision: record.goalRevision, actionId: event.payload.actionId }).catch(error => inbox.fail(error));
+			};
+			bridge.on('observation', onObservation);
+			bridge.on('action_result', onResult);
+			let toolOrdinal = 0;
+			const tool = (name, args) => runtime.execute({ agentId: record.agentId, goalRevision: record.goalRevision,
+				turnId: 'planning-due-mechanics', callId: `planning-due-${++toolOrdinal}`, tool: normalizeMinecraftToolCall(name, args) }, record);
+			try {
+				const initial = await inspect('observation');
+				runtime.updateObservation(record, initial.observation, { eventSequence: initial.eventSequence });
+				const beforePosition = initial.observation.position;
+				const handle = await tool('runProgram', { background: true, timeoutMs: 4000,
+					source: `program.onUnhandledAttention("continue_and_notify");
+					await player.control(${JSON.stringify(inputFrame({ forward: 1, ticks: 120 }))});
+					await player.wait(1000);` });
+				const deadlineEpochMs = handle.deadlineEpochMs;
+				const dueDeadline = Date.now() + 3000;
+				while (!events.some(event => event.programId === handle.programId && event.event === 'program_planning_due') && Date.now() < dueDeadline) {
+					await new Promise(resolve => setTimeout(resolve, 50));
+				}
+				const dueEvents = events.filter(event => event.programId === handle.programId && event.event === 'program_planning_due');
+				assertFact(dueEvents.length === 1, 'PLANNING_DUE_EVENT_NOT_ONCE');
+				const due = dueEvents[0];
+				const status = await tool('programStatus', { programId: handle.programId });
+				assertFact(due.status?.engineState === 'ACTIVE' && due.status?.decision === undefined, 'PLANNING_DUE_SYNTHETIC_DECISION');
+				assertFact(due.status?.planningLeadMs === 3000 && due.status?.deadlineEpochMs === deadlineEpochMs && status.deadlineEpochMs === deadlineEpochMs, 'PLANNING_DUE_DEADLINE_CHANGED');
+				assertFact(due.status?.action?.state === 'RUNNING', 'PLANNING_DUE_BODY_NOT_RUNNING');
+				assertFact(sent.filter(entry => entry.type === 'action_cancel').length === 0, 'PLANNING_DUE_CANCELLED_BODY');
+				await new Promise(resolve => setTimeout(resolve, 200));
+				const afterPosition = (await inspect('observation')).observation.position;
+				const movementDistance = Math.hypot(afterPosition.x - beforePosition.x, afterPosition.z - beforePosition.z);
+				assertFact(movementDistance > 0.2, 'PLANNING_DUE_MOTION_STOPPED');
+				assertFact(events.filter(event => event.programId === handle.programId && event.event === 'program_planning_due').length === 1, 'PLANNING_DUE_REPEATED');
+				const cancelled = await tool('cancelProgram', { programId: handle.programId, goalRevision: record.goalRevision });
+				assertFact(sent.some(entry => entry.type === 'action_cancel' && entry.actionId === sent.find(command => command.type === 'action_command')?.actionId), 'PLANNING_DUE_CANCEL_NOT_BRIDGED');
+				assertFact(cancelled.state === 'CANCELLED' && cancelled.reasonCode === 'MODEL_CANCELLED', 'PLANNING_DUE_CANCEL_NOT_RELEASED');
+				const bodyResult = cancelled.receipts?.find(receipt => receipt.state === 'CANCELLED');
+				assertFact(bodyResult?.state === 'CANCELLED', 'PLANNING_DUE_BODY_RECEIPT_MISSING');
+				return { programId: handle.programId, planningLeadMs: 3000, deadlineEpochMs, dueEvents: dueEvents.length,
+					bodyAction: due.status.action.actionType, bodyActionStateAtAdvisory: due.status.action.state, movementDistance,
+					beforePosition, afterPosition, fixtureFloor: 'known clear y=63 floor at x=-4..40,z=-4..12', cancelledThroughActualBridge: true, providerUsed: false,
+					fixtureLatency: 'declared synthetic planning-lead measurement; physical motion and cancellation used the live bridge' };
+			} finally {
+				await runtime.disposeAll();
+				bridge.off('observation', onObservation);
+				bridge.off('action_result', onResult);
+			}
+		});
+		await check('single-use mode consumes exactly one instantaneous item', async () => {
+			await command(`tp ${player} 0.5 64 0.5 -90 -60`);
+			await command(`clear ${player}`);
+			await command(`item replace entity ${player} hotbar.0 with minecraft:snowball 5`);
+			await action('control', inputFrame({ pitch: -60, ticks: 1 }));
+			const receipt = await action('use_item', { durationMs: 1000, mode: 'once' });
+			const remaining = (await observe()).inventory.items.filter((item) => item.itemId === 'minecraft:snowball').reduce((sum, item) => sum + item.count, 0);
+			assertFact(remaining === 4, 'SINGLE_USE_CONSUMPTION_MISMATCH');
+			return { remaining, receipt };
+		});
+		await check('filtered entities and explicit bow aim work through the production bridge', async () => {
+			await command('summon minecraft:pig 8.5 64 0.5 {NoAI:1b,Tags:["precision_probe"]}');
+			await command(`tp ${player} 0.5 64 0.5 -90 0`);
+			await command(`clear ${player}`);
+			await command(`item replace entity ${player} hotbar.0 with minecraft:bow`);
+			await command(`item replace entity ${player} hotbar.1 with minecraft:arrow 8`);
+			const page = await inspect('entities', { entityType: 'minecraft:pig' });
+			assertFact(page.entries?.length > 0 && page.entries.every((entry) => entry.type === 'minecraft:pig'), 'ENTITY_FILTER_MISMATCH');
+			const targetId = page.entries[0].uuid;
+			const fixed = await action('use_ranged', { targetId, drawDurationMs: 1000, timeoutMs: 3000, aimX: 8.5, aimY: 66, aimZ: 0.5 });
+			const tracked = await action('use_ranged', { targetId, drawDurationMs: 1000, timeoutMs: 3000, trackTarget: true });
+			return { targetId, fixed, tracked };
+		});
+		await check('observed dragon parts resolve to real melee targets', async () => {
+			await command('fill -4 69 -14 20 82 12 minecraft:air');
+			await command('fill 6 68 -11 10 68 -8 minecraft:stone');
+			await command('summon minecraft:ender_dragon 8 70 0 {DragonPhase:7,Tags:["dragon_probe"]}');
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			await command(`tp ${player} 8.5 69 -9.5 0 0`);
+			await command(`effect give ${player} minecraft:resistance 60 4 true`);
+			await command(`item replace entity ${player} hotbar.0 with minecraft:diamond_sword`);
+			await action('control', inputFrame({ yaw: 0, ticks: 1 }));
+			await command('data merge entity @e[tag=dragon_probe,limit=1] {NoAI:1b}');
+			await action('look_at', { x: 8.5, y: 70, z: 0.5 });
+			const dragonObserver = await observe();
+			report.dragonObserver = { position: dragonObserver.position, view: dragonObserver.view,
+				health: dragonObserver.player?.health, suffocating: dragonObserver.player?.suffocating,
+				rayTarget: dragonObserver.interaction?.rayTarget };
+			report.dragonPosition = await command('data get entity @e[tag=dragon_probe,limit=1] Pos');
+			const page = await inspect('entities', { entityType: 'minecraft:ender_dragon' });
+			report.dragonFixture = page;
+			const head = page.entries?.find((entry) => entry.partName === 'head');
+			assertFact(head?.uuid && head?.parentId && head.pickable, 'DRAGON_HEAD_NOT_OBSERVED');
+			const point = head.position;
+			await command(`tp ${player} ${point.x} ${point.y} ${point.z - 2} 0 0`);
+			const before = await command('data get entity @e[tag=dragon_probe,limit=1] Health');
+			const receipt = await action('attack', { targetId: head.uuid, timeoutMs: 3000 });
+			const after = await command('data get entity @e[tag=dragon_probe,limit=1] Health');
+			assertFact(before !== after, 'DRAGON_HEALTH_UNCHANGED');
+			const { completed } = await killGoal('minecraft:ender_dragon');
+			await command('data merge entity @e[tag=dragon_probe,limit=1] {Health:1.0f}');
+			await new Promise((resolve) => setTimeout(resolve, 650));
+			const lethalAt = Date.now();
+			await action('attack', { targetId: head.uuid, timeoutMs: 3000 });
+			const lethalRevision = record.goalRevision;
+			await command(`codex stop ${config.agentName}`);
+			const resumed = inbox.wait('goal_control', (event) => event.agentId === record.agentId && event.payload.operation === 'resume');
+			await command(`codex resume ${config.agentName}`);
+			const resumedGoal = await resumed;
+			record.goalRevision = resumedGoal.payload.goalRevision;
+			assertFact(record.goalRevision > lethalRevision, 'DRAGON_RESUME_DID_NOT_ADVANCE_REVISION');
+			await bridge.send('agent_ready', record.agentId, { goalRevision: record.goalRevision, reconciled: false });
+			await command('save-all flush');
+			await completed;
+			const completionDelayMs = Date.now() - lethalAt;
+			assertFact(completionDelayMs >= 8000, 'DRAGON_CREDIT_WAS_PREMATURE');
+			return { head, before, after, receipt, completionDelayMs, pauseResumeDuringDeath: true, savedDuringDeath: true };
+		});
+		await check('a bed explosion receives causal agent kill credit', async () => {
+			await command('execute in minecraft:the_nether run forceload add 0 0');
+			for (let i = 0; i < 100; i++) {
+				if (/time is \d+/i.test(await command('execute in minecraft:the_nether if loaded 0 200 0 run time query gametime'))) break;
+				await new Promise((resolve) => setTimeout(resolve, 100));
+			}
+			await command('execute in minecraft:the_nether run fill 0 199 0 10 199 10 minecraft:obsidian');
+			await command(`execute in minecraft:the_nether run tp ${player} 2.5 200 4.5 -90 20`);
+			await command(`effect give ${player} minecraft:resistance 60 4 true`);
+			await command(`item replace entity ${player} hotbar.0 with minecraft:air`);
+			await command('execute in minecraft:the_nether run setblock 4 200 4 minecraft:red_bed[facing=east,part=foot]');
+			await command('execute in minecraft:the_nether run setblock 5 200 4 minecraft:red_bed[facing=east,part=head]');
+			await command('execute in minecraft:the_nether run summon minecraft:pig 5.5 200 5.5 {NoAI:1b,Health:1.0f,Tags:["bed_probe"]}');
+			const { completed } = await killGoal('minecraft:pig');
+			await action('interact_block', (fresh) => ({ x: 4, y: 200, z: 4, face: 'west', ...observedHandArguments(fresh) }));
+			await completed;
+			return { completionVerified: true, damageSource: 'bad_respawn_point', fixtureDimension: 'minecraft:the_nether' };
+		});
 		report.status = 'PASSED';
 	} catch (error) { failure = error; report.failure = safeError(error); report.failureMessage = probeFailureMessage(error, secrets); report.failureStage = stage; }
 	finally {
 		stage = 'cleanup_fixture';
 		if (record) { try { if (!rconResponsive) throw new Error('RCON_UNRESPONSIVE'); await command(`codex stop ${config.agentName}`); report.cleanup.agentStopped = true; } catch { report.cleanup.agentStopped = false; } }
 		try { if (!rconResponsive) throw new Error('RCON_UNRESPONSIVE'); await command('forceload remove -16 -16 48 32'); report.cleanup.fixtureChunksReleased = true; } catch { report.cleanup.fixtureChunksReleased = false; }
+		try { if (rconResponsive) await command('execute in minecraft:the_nether run forceload remove 0 0'); } catch { /* Isolated world teardown also releases this fixture. */ }
 		bridge.stop(); inbox.close(); await rcon.close();
 		report.cleanup.bridgeClosed = true; report.cleanup.rconClosed = true;
 		report.elapsedMs = Date.now() - startedAt;

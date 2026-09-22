@@ -475,6 +475,59 @@ test('Codex service gives concurrent thread creation enough time for a full aren
 	await service.stop();
 });
 
+test('stopping during replacement disposal cannot restart the provider', async (t) => {
+	const transport = new FakeSharedTransport();
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	t.after(() => service.stop());
+	const selected = profile('agent-stop-during-replacement');
+	const previous = await service.createAgent(selected);
+	let releaseDisposal;
+	previous.dispose = () => new Promise((resolve) => { releaseDisposal = resolve; });
+	const replacement = service.replaceAgent(selected).then(
+		() => 'created', (error) => error.code,
+	);
+	await new Promise((resolve) => setImmediate(resolve));
+	await service.stop();
+	releaseDisposal();
+	assert.equal(await replacement, 'PROVIDER_STOPPED');
+	assert.equal(service.started, false);
+	assert.equal(service.getAgent(selected.agentId), null);
+	assert.equal(transport.calls.filter(({ method }) => method === '$start').length, 1);
+});
+
+test('removing an agent during replacement also removes the replacement session', async (t) => {
+	const transport = new FakeSharedTransport();
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	t.after(() => service.stop());
+	const selected = profile('agent-remove-during-replacement');
+	const previous = await service.createAgent(selected);
+	let releaseDisposal;
+	previous.dispose = () => new Promise((resolve) => { releaseDisposal = resolve; });
+	const replacement = service.replaceAgent(selected);
+	await new Promise((resolve) => setImmediate(resolve));
+	const removal = service.removeAgent(selected.agentId);
+	releaseDisposal();
+	await replacement;
+	assert.equal(await removal, true);
+	assert.equal(service.getAgent(selected.agentId), null);
+});
+
+test('stopping during workspace preparation prevents a late provider spawn', async (t) => {
+	const transport = new FakeSharedTransport();
+	transport.setEnvironment = () => {};
+	let releasePreparation;
+	const minecraftWorkspace = { prepare: () => new Promise((resolve) => { releasePreparation = () => resolve({ codexHome: 'C:\\isolated', cwd: 'C:\\isolated\\workspace' }); }) };
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport, minecraftWorkspace });
+	t.after(() => service.stop());
+	const startup = service.start().then(() => 'started', (error) => error.code);
+	await new Promise((resolve) => setImmediate(resolve));
+	await service.stop();
+	releasePreparation();
+	assert.equal(await startup, 'STALE_PROVIDER_START');
+	assert.equal(transport.calls.some(({ method }) => method === '$start'), false);
+	assert.equal(service.started, false);
+});
+
 test('Codex service accepts the streamed agent-message contract when no completed message item arrives', async () => {
 	const transport = new FakeSharedTransport();
 	transport.autoComplete = false;
@@ -677,6 +730,7 @@ test('prepares the isolated Minecraft Codex home before transport startup', asyn
 		assert.equal(environment.CODEX_HOME, 'C:\\isolated\\minecraft\\.codex-home');
 		assert.equal(environment.OPENAI_API_KEY, 'openai-key');
 	};
+	transport.setWorkingDirectory = cwd => { assert.equal(cwd, 'C:\\isolated\\minecraft'); order.push('cwd'); };
 	transport.start = async () => { order.push('start'); };
 	const minecraftWorkspace = {
 		async prepare() {
@@ -686,7 +740,7 @@ test('prepares the isolated Minecraft Codex home before transport startup', asyn
 	};
 	const service = new CodexService({ cwd: 'C:\\workspace', environment: { CODEX_HOME: 'C:\\Users\\lucas\\.codex', OPENAI_API_KEY: 'openai-key' } }, { transport, minecraftWorkspace });
 	await service.start();
-	assert.deepEqual(order, ['prepare', 'environment', 'start']);
+	assert.deepEqual(order, ['prepare', 'environment', 'cwd', 'start']);
 	await service.stop();
 });
 
@@ -1356,3 +1410,43 @@ test('Director draft sessions expose no Minecraft tools and use their own instru
  assert.match(start.developerInstructions,/Never call tools/);
  await service.stop();
 });
+test('interruption retires queued native calls and drops late execution failures', async t => {
+ const transport = new FakeSharedTransport(); transport.autoComplete = false;
+ const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+ t.after(() => service.stop());
+ const agent = await service.createAgent(profile('agent-native-retired'), { controlProtocol: 'native_tools' });
+ await agent.setGoalRevision(1);
+ let rejectAction;
+ const gate = new Promise((_, reject) => { rejectAction = reject; });
+ let executions = 0;
+ const turn = agent.act('Collect logs.', { goalRevision: 1, executeTool: async () => { executions++; return gate; } });
+ const rejected = assert.rejects(turn, error => error.code === 'STALE_PLAN');
+ await new Promise(resolve => setImmediate(resolve));
+ for (const id of [901, 902]) transport.emit('serverRequest', { id, method: 'item/tool/call', params: { threadId: 'thread-1', turnId: 'turn-1', callId: String(id), tool: 'wait', arguments: { durationMs: 1 } } });
+ await new Promise(resolve => setImmediate(resolve));
+ await agent.interrupt(); await rejected;
+ rejectAction(Object.assign(new Error('Goal ended'), { code: 'NATIVE_ACTION_CANCELLED' }));
+ await new Promise(resolve => setImmediate(resolve));
+ assert.equal(executions, 1);
+ assert.equal(transport.calls.filter(call => call.method === '$respond' && [901, 902].includes(call.id)).length, 0);
+ assert.equal(transport.calls.filter(call => call.method === 'turn/interrupt').length, 1);
+});
+
+for (const inheritedInstructions of [false, true]) {
+ test(`Minecraft launch attests isolated instructions and permissions: inherited=${inheritedInstructions}`, async t => {
+  const transport = new FakeSharedTransport();
+  const original = transport.request.bind(transport);
+  transport.request = async (method, params) => {
+   const result = await original(method, params);
+   if (method !== 'thread/start') return result;
+   assert.equal(params.permissions, 'minecraft');
+   assert.ok(params.baseInstructions.includes('Do not close the default inventory menu.'));
+   assert.equal(params.sandbox, undefined);
+   return { ...result, cwd: params.cwd, runtimeWorkspaceRoots: [], activePermissionProfile: { id: 'minecraft' }, instructionSources: inheritedInstructions ? [{ path: 'parent/AGENTS.md' }] : [] };
+  };
+  const service = new CodexService({ cwd: 'C:\\unrelated-project' }, { transport, minecraftWorkspace: { prepare: async () => ({ cwd: 'C:\\minecraft\\workspace', permissionProfile: 'minecraft', instructions: 'Only Minecraft instructions', skillInstructions: 'Do not close the default inventory menu.', selectedCapabilityRoots: [] }) } });
+  t.after(() => service.stop());
+  if (inheritedInstructions) await assert.rejects(service.createAgent(profile('isolated')), error => error.code === 'MINECRAFT_WORKSPACE_MISMATCH');
+  else await service.createAgent(profile('isolated'));
+ });
+}

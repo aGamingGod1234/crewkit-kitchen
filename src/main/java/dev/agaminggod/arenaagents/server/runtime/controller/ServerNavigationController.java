@@ -20,6 +20,7 @@ import net.minecraft.resources.ResourceKey;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.AABB;
 
 import java.util.List;
 import java.util.ArrayList;
@@ -39,6 +40,7 @@ public final class ServerNavigationController implements ServerController {
 	private static final double ENDPOINT_STABILITY_DISTANCE = 0.1D;
 
 	private final Vec3 destination;
+	private final AABB arrivalRegion;
 	private final double tolerance;
 	private final boolean sprint;
 	private final long timeoutMs;
@@ -71,7 +73,12 @@ public final class ServerNavigationController implements ServerController {
 			long startedAt,
 			long timeoutMs
 	) {
+		this(destination, tolerance, sprint, startedAt, timeoutMs, null);
+	}
+
+	ServerNavigationController(Vec3 destination, double tolerance, boolean sprint, long startedAt, long timeoutMs, AABB arrivalRegion) {
 		this.destination = Objects.requireNonNull(destination, "destination must not be null");
+		this.arrivalRegion = arrivalRegion;
 		if (!Double.isFinite(tolerance)
 				|| tolerance < ProtocolConstants.MIN_MOVEMENT_TOLERANCE
 				|| tolerance > ProtocolConstants.MAX_MOVEMENT_TOLERANCE
@@ -208,6 +215,9 @@ public final class ServerNavigationController implements ServerController {
 		Objects.requireNonNull(playerPosition, "playerPosition must not be null");
 		if (!Double.isFinite(supportHeight)) return false;
 		Vec3 target = targetFor(waypoint, finalWaypoint, supportHeight);
+		if (finalWaypoint && arrivalRegion != null) {
+			return arrivalRegion.contains(playerPosition) && playerPosition.distanceTo(target) <= tolerance;
+		}
 		return targetsExactDestination(waypoint, finalWaypoint)
 				? satisfiesDestinationTolerance(playerPosition.distanceTo(target), tolerance)
 				: reachedWaypoint(playerPosition, target);
@@ -250,8 +260,7 @@ public final class ServerNavigationController implements ServerController {
 						resolvedEndpointPosition,
 						resolvedEndpointTarget.x,
 						resolvedEndpointTarget.z));
-		boolean withinTolerance = resolvedEndpointTarget != null
-				&& satisfiesDestinationTolerance(position.distanceTo(resolvedEndpointTarget), tolerance);
+		boolean withinTolerance = withinEndpoint(position);
 		boolean noCollision = player.level().noCollision(player.getBoundingBox());
 		boolean physicallyValid = endpointStandable && withinTolerance && noCollision
 				&& !player.isInWall() && player.onGround();
@@ -306,8 +315,7 @@ public final class ServerNavigationController implements ServerController {
 						resolvedEndpointPosition,
 						resolvedEndpointTarget.x,
 						resolvedEndpointTarget.z));
-		boolean withinTolerance = satisfiesDestinationTolerance(
-				player.position().distanceTo(resolvedEndpointTarget), tolerance);
+		boolean withinTolerance = withinEndpoint(player.position());
 		boolean physicallyValid = endpointStandable && withinTolerance
 				&& player.level().noCollision(player.getBoundingBox())
 				&& !player.isInWall() && player.onGround();
@@ -331,6 +339,12 @@ public final class ServerNavigationController implements ServerController {
 		Vec3 target = resolvedEndpointTarget == null ? destination : resolvedEndpointTarget;
 		if (navigationStartPosition == null) navigationStartPosition = position;
 		return progressFromActualDistance(navigationStartPosition, target, position, lastProgressValue);
+	}
+
+	private boolean withinEndpoint(Vec3 position) {
+		return resolvedEndpointTarget != null
+				&& satisfiesDestinationTolerance(position.distanceTo(resolvedEndpointTarget), tolerance)
+				&& (arrivalRegion == null || arrivalRegion.contains(position));
 	}
 
 	static double progressFromActualDistance(Vec3 start, Vec3 endpoint, Vec3 current, double previousProgress) {
@@ -374,7 +388,7 @@ public final class ServerNavigationController implements ServerController {
 	}
 
 	private boolean targetsExactDestination(PathNode waypoint, boolean finalWaypoint) {
-		return finalWaypoint && waypoint.position().equals(grid(destination));
+		return finalWaypoint && arrivalRegion == null && waypoint.position().equals(grid(destination));
 	}
 
 	private TickResult replan(
@@ -396,8 +410,10 @@ public final class ServerNavigationController implements ServerController {
 			GridPosition start = nearestTraversable(world, actualOrigin, 1, 2);
 			if (start == null) return fail(player, "NO_STANDABLE_PATH", "Start has no supported, climbable or surface-water position", currentProgress());
 			boolean destinationIsLocal = center(start).distanceTo(destination) <= MAX_LOCAL_PLANNING_DISTANCE;
-			searchGoals = destinationIsLocal ? Set.copyOf(standableGoalsWithinTolerance(
-					world, destination, tolerance, (int) Math.ceil(tolerance) + 1, (int) Math.ceil(tolerance) + 1)) : Set.of();
+			searchGoals = !destinationIsLocal ? Set.of() : arrivalRegion != null
+					? Set.copyOf(standableGoalsWithinRegion(world, arrivalRegion))
+					: Set.copyOf(standableGoalsWithinTolerance(
+							world, destination, tolerance, (int) Math.ceil(tolerance) + 1, (int) Math.ceil(tolerance) + 1));
 			if (destinationIsLocal && searchGoals.isEmpty() && world.cellAt(grid(destination)) != WalkabilityView.Cell.UNLOADED) {
 				return fail(player, "NO_STANDABLE_PATH", "Destination has no supported position within the requested tolerance", currentProgress());
 			}
@@ -602,6 +618,21 @@ public final class ServerNavigationController implements ServerController {
 
 	static boolean candidateSatisfiesTolerance(GridPosition candidate, Vec3 destination, double tolerance) {
 		return candidate.equals(grid(destination)) || center(candidate).distanceTo(destination) <= tolerance;
+	}
+
+	private static List<GridPosition> standableGoalsWithinRegion(MinecraftNavigationWorld world, AABB region) {
+		ArrayList<GridPosition> candidates = new ArrayList<>();
+		for (int x = (int) Math.floor(region.minX); x <= Math.ceil(region.maxX); x++) {
+			for (int z = (int) Math.floor(region.minZ); z <= Math.ceil(region.maxZ); z++) {
+				for (int y = (int) Math.floor(region.minY); y <= Math.ceil(region.maxY); y++) {
+					GridPosition candidate = new GridPosition(x, y, z);
+					if (!supportedEndpoint(world, candidate)) continue;
+					double support = world.supportHeight(candidate, x + 0.5D, z + 0.5D);
+					if (Double.isFinite(support) && region.contains(x + 0.5D, support, z + 0.5D)) candidates.add(candidate);
+				}
+			}
+		}
+		return candidates;
 	}
 
 	private static boolean supportedEndpoint(MinecraftNavigationWorld world, GridPosition position) {

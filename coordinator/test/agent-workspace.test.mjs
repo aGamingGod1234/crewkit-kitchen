@@ -50,18 +50,21 @@ test('refreshes one shared native Minecraft workspace from bundled templates', a
 	});
 	const first = await workspace.prepare();
 	assert.deepEqual(first, {
-		cwd: path.join(root, 'runtime', 'minecraft-agent'),
+		cwd: path.join(root, 'runtime', 'minecraft-agent', 'workspace'),
 		codexHome: path.join(root, 'runtime', 'minecraft-agent', '.codex-home'),
+		permissionProfile: 'minecraft',
 		instructions: '# verified completion\n',
+		skillInstructions: '# native Minecraft control\n',
 		selectedCapabilityRoots: [{
 			id: 'minecraft-control',
 			location: {
 				type: 'environment',
 				environmentId: 'local',
-				path: path.join(root, 'runtime', 'minecraft-agent', '.codex', 'skills', 'minecraft-control'),
+				path: path.join(root, 'runtime', 'minecraft-agent', 'workspace', '.codex', 'skills', 'minecraft-control'),
 			},
 		}],
 	});
+	assert.ok(path.relative(first.cwd, first.codexHome).startsWith('..'), 'provider credentials must be outside the model workspace');
 	assert.equal(await readFile(path.join(first.cwd, 'AGENTS.md'), 'utf8'), '# verified completion\n');
 	assert.equal(
 		await readFile(path.join(first.cwd, '.codex', 'skills', 'minecraft-control', 'SKILL.md'), 'utf8'),
@@ -96,14 +99,14 @@ test('does not rewrite unchanged shared Minecraft templates', async (t) => {
 		},
 	});
 	await workspace.prepare();
-	assert.equal(writes, 2);
-	await workspace.prepare();
-	assert.equal(writes, 2);
-
-	await writeFile(path.join(workspace.root, 'AGENTS.md'), '# externally changed\n', 'utf8');
+	assert.equal(writes, 3);
 	await workspace.prepare();
 	assert.equal(writes, 3);
-	assert.equal(await readFile(path.join(workspace.root, 'AGENTS.md'), 'utf8'), '# agents\n');
+
+	await writeFile(path.join(workspace.root, 'workspace', 'AGENTS.md'), '# externally changed\n', 'utf8');
+	await workspace.prepare();
+	assert.equal(writes, 4);
+	assert.equal(await readFile(path.join(workspace.root, 'workspace', 'AGENTS.md'), 'utf8'), '# agents\n');
 });
 
 test('synchronizes only auth into the isolated Codex home', async (t) => {
@@ -131,7 +134,8 @@ test('synchronizes only auth into the isolated Codex home', async (t) => {
 	const prepared = await workspace.prepare();
 	assert.equal(await readFile(path.join(prepared.codexHome, 'auth.json'), 'utf8'), '{"tokens":"preserve"}\n');
 	await assert.rejects(() => readFile(path.join(prepared.codexHome, 'AGENTS.md'), 'utf8'), { code: 'ENOENT' });
-	await assert.rejects(() => readFile(path.join(prepared.codexHome, 'config.toml'), 'utf8'), { code: 'ENOENT' });
+	assert.match(await readFile(path.join(prepared.codexHome, 'config.toml'), 'utf8'), /":root" = "deny"/);
+	assert.equal(prepared.permissionProfile, 'minecraft');
 	await assert.rejects(() => readFile(path.join(prepared.codexHome, 'memories', 'old.md'), 'utf8'), { code: 'ENOENT' });
 	await writeFile(path.join(prepared.codexHome, 'state.sqlite'), 'runtime state\n', 'utf8');
 	await workspace.prepare();
@@ -218,4 +222,26 @@ test('uses the platform Codex home for auth when CODEX_HOME is unset', async (t)
 		if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
 		else process.env.CODEX_HOME = previousCodexHome;
 	}
+});
+
+for (const isolatedRefresh of [false, true]) test(`workspace restart preserves independently refreshed auth: ${isolatedRefresh}`, async (t) => {
+	const root = await mkdtemp(path.join(os.tmpdir(), 'minecraft-agent-codex-auth-restart-'));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const sourceCodexHome = path.join(root, 'source');
+	const templateRoot = path.join(root, 'templates');
+	await mkdir(path.join(templateRoot, '.codex', 'skills', 'minecraft-control'), { recursive: true });
+	await mkdir(sourceCodexHome, { recursive: true });
+	await writeFile(path.join(templateRoot, 'AGENTS.md'), '# Minecraft instructions\n');
+	await writeFile(path.join(templateRoot, '.codex', 'skills', 'minecraft-control', 'SKILL.md'), '# Minecraft skill\n');
+	const options = { root: path.join(root, 'runtime'), templateRoot };
+	const sourceAuth = path.join(sourceCodexHome, 'auth.json');
+	await writeFile(sourceAuth, '{"tokens":"original-fixture"}\n');
+	const first = await new MinecraftAgentWorkspace(options, { sourceCodexHome }).prepare();
+	const isolatedAuth = path.join(first.codexHome, 'auth.json');
+	if (isolatedRefresh) await writeFile(isolatedAuth, '{"tokens":"provider-refreshed-fixture"}\n');
+	else await writeFile(sourceAuth, '{"tokens":"new-source-fixture"}\n');
+	const restarted = new MinecraftAgentWorkspace(options, { sourceCodexHome });
+	await restarted.prepare();
+	assert.equal(await readFile(isolatedAuth, 'utf8'), isolatedRefresh ? '{"tokens":"provider-refreshed-fixture"}\n' : '{"tokens":"new-source-fixture"}\n');
+	assert.equal(await readFile(sourceAuth, 'utf8'), isolatedRefresh ? '{"tokens":"original-fixture"}\n' : '{"tokens":"new-source-fixture"}\n');
 });

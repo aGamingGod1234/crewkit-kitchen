@@ -14,6 +14,10 @@ public final class ServerPathPlannerVerification {
 	private ServerPathPlannerVerification() {
 	}
 
+	public static void main(String[] arguments) {
+		System.out.println("Server path planner verification passed: " + verify() + " assertions");
+	}
+
 	public static int verify() {
 		ServerPathPlanner planner = new ServerPathPlanner();
 		Set<GridPosition> blocked = new HashSet<>();
@@ -48,7 +52,30 @@ public final class ServerPathPlannerVerification {
 				"server plan does not cross blocked cells");
 		return 3 + verifyElevationAndHoleSafety() + verifyDeferredPlanningIsRetryable() + verifySharedElapsedBudget()
 				+ verifyRoundRobinAdmissionEventuallyServesAll() + verifyContentionDeferralWindow()
-				+ verifyTickScopeRestoresPreviousBudget() + verifyRetainedSearchUsesSharedTickBudget();
+				+ verifyTickScopeRestoresPreviousBudget() + verifyRetainedSearchUsesSharedTickBudget()
+				+ verifyMinedTrunkHeadroom();
+	}
+
+	private static int verifyMinedTrunkHeadroom() {
+		ServerPathPlanner planner = new ServerPathPlanner();
+		GridPosition trunk = new GridPosition(7, 201, -4);
+		GridPosition start = new GridPosition(7, 201, -2);
+		Set<GridPosition> logs = new HashSet<>(Set.of(trunk.above(), trunk.offset(0, 2, 0), trunk.offset(0, 3, 0)));
+		WalkabilityView view = position -> position.y() == 200 || logs.contains(position)
+				? WalkabilityView.Cell.SAFE_SUPPORT : WalkabilityView.Cell.CLEAR;
+		assertTrue(!view.isStandable(trunk), "removing only a trunk's bottom log leaves blocked head space");
+		assertEquals(PathOutcome.INVALID, planner.planPath(view, start, trunk,
+				new ServerPathPlanner.TickBudget(64, Long.MAX_VALUE, () -> 0L)).plan().outcome(),
+				"the rehearsal target under the remaining log cannot become a standing destination");
+		assertEquals(PathOutcome.FOUND, planner.planPath(view, start, trunk.offset(0, 0, 1),
+				new ServerPathPlanner.TickBudget(64, Long.MAX_VALUE, () -> 0L)).plan().outcome(),
+				"the observed approach beside the trunk remains reachable");
+		logs.remove(trunk.above());
+		assertTrue(view.isStandable(trunk), "mining the second log opens real standing headroom");
+		assertEquals(PathOutcome.FOUND, planner.planPath(view, start, trunk,
+				new ServerPathPlanner.TickBudget(64, Long.MAX_VALUE, () -> 0L)).plan().outcome(),
+				"the same trunk destination becomes reachable after its head space is cleared");
+		return 5;
 	}
 
 	private static int verifyRetainedSearchUsesSharedTickBudget() {

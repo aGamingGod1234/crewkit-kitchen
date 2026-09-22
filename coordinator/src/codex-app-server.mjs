@@ -44,6 +44,7 @@ export function buildCodexArgs(config) {
 		'-c', `service_tier="${serviceTier}"`,
 		'-c', 'features.fast_mode=true',
 		'-c', 'mcp_servers={}',
+		'-c', 'project_doc_max_bytes=0',
 		'-c', 'features.apps=false',
 		'-c', 'features.browser_use=false',
 		'-c', 'features.computer_use=false',
@@ -253,6 +254,12 @@ export class CodexStdioTransport extends EventEmitter {
 		if (this.#child !== null) throw new CodexProtocolError('TRANSPORT_RUNNING', 'Codex environment cannot change after startup');
 		if (environment === null || typeof environment !== 'object' || Array.isArray(environment)) throw new TypeError('Codex launch environment must be an object');
 		this.#config = { ...this.#config, environment: { ...environment } };
+	}
+
+	setWorkingDirectory(cwd) {
+		if (this.#child !== null) throw new CodexProtocolError('TRANSPORT_RUNNING', 'Codex workspace cannot change after startup');
+		if (typeof cwd !== 'string' || cwd.trim() === '') throw new TypeError('Codex workspace must be a nonblank path');
+		this.#config = { ...this.#config, cwd };
 	}
 
 	async start() {

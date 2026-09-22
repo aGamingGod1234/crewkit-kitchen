@@ -74,11 +74,13 @@ export async function applyWindowsOwnerOnlyDacl(target, directory, dependencies 
 	const sid = await getCurrentWindowsSid();
 	try {
 		const output = await runWindowsAcl({ target, directory, sid, script: windowsAclRepairScript() });
-		if (!isOwnerOnlyWindowsAcl(parseWindowsAclReport(output), sid, directory)) {
-			throw new Error('Windows ACL verification failed');
+		const report = parseWindowsAclReport(output);
+		if (!isOwnerOnlyWindowsAcl(report, sid, directory)) {
+			throw new Error(`Windows ACL verification failed: ${JSON.stringify({ protected: report.protected,
+				entries: report.entries.map(({ sid: entrySid, ...entry }) => ({ ...entry, expectedIdentity: entrySid === sid })) })}`);
 		}
-	} catch {
-		throw new Error('Unable to enforce private artifact permissions');
+	} catch (cause) {
+		throw new Error('Unable to enforce private artifact permissions', { cause });
 	}
 }
 
@@ -108,10 +110,11 @@ function parseWindowsAclReport(output) {
 }
 
 async function runWindowsAclRepair({ target, directory, sid, script }) {
-	const encoded = Buffer.from(script, 'utf16le').toString('base64');
+	const argumentsText = [target, sid, directory ? 'directory' : 'file']
+		.map((value) => `'${value.replaceAll("'", "''")}'`).join(' ');
+	const encoded = Buffer.from(`& {\n${script}\n} ${argumentsText}`, 'utf16le').toString('base64');
 	const { stdout } = await execFile('powershell.exe', [
 		'-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded,
-		target, sid, directory ? 'directory' : 'file',
 	], { windowsHide: true, maxBuffer: 32 * 1024 });
 	return stdout;
 }
@@ -122,10 +125,12 @@ function windowsAclRepairScript() {
 		'$ErrorActionPreference = "Stop"',
 		'$section = [System.Security.AccessControl.AccessControlSections]::Access',
 		'$inheritance = if ($Kind -eq "directory") { "OICI" } else { "" }',
-		'$security = Get-Acl -LiteralPath $Target',
+		'$security = if ($Kind -eq "directory") { New-Object System.Security.AccessControl.DirectorySecurity } else { New-Object System.Security.AccessControl.FileSecurity }',
 		'$security.SetSecurityDescriptorSddlForm("D:P(A;$inheritance;FA;;;$Sid)", $section)',
-		'Set-Acl -LiteralPath $Target -AclObject $security',
-		'$verified = Get-Acl -LiteralPath $Target',
+		'if ($Kind -eq "directory") { [System.IO.Directory]::SetAccessControl($Target, $security) } else { [System.IO.File]::SetAccessControl($Target, $security) }',
+		// A pwsh parent can expose modules incompatible with Windows PowerShell.
+		// Read back through the same .NET API family used to write the DACL.
+		'$verified = if ($Kind -eq "directory") { [System.IO.Directory]::GetAccessControl($Target, $section) } else { [System.IO.File]::GetAccessControl($Target, $section) }',
 		'$rules = @($verified.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object {',
 		'  [pscustomobject]@{ sid = $_.IdentityReference.Value; type = $_.AccessControlType.ToString(); rights = [int]$_.FileSystemRights; inherited = $_.IsInherited; inheritance = [int]$_.InheritanceFlags }',
 		'})',

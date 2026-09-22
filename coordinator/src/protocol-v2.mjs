@@ -118,7 +118,7 @@ const TRUSTED_PAYLOAD_TYPES = new WeakMap();
 const PLAYER_DETAIL_FIELDS = ['pose', 'swimming', 'gliding', 'sprinting', 'crouching', 'onClimbable', 'inLava', 'horizontalCollision', 'verticalCollision', 'passenger', 'vehicle'];
 const STACK_DETAIL_FIELDS = ['displayName', 'fingerprint', 'maxStackSize', 'tooltip', 'tooltipTruncated'];
 const MENU_STACK_DETAIL_FIELDS = ['damage', 'maxDamage', ...STACK_DETAIL_FIELDS];
-const ENTITY_DETAIL_FIELDS = ['velocity', 'yaw', 'pitch', 'pose', 'bounds', 'equipment', 'usingItem', 'onFire'];
+const ENTITY_DETAIL_FIELDS = ['velocity', 'yaw', 'pitch', 'pose', 'bounds', 'equipment', 'usingItem', 'onFire', 'pickable', 'parentId', 'partName'];
 const BLOCK_DETAIL_FIELDS = ['state', 'bounds', 'boundsTruncated', 'replaceable', 'fluid'];
 const MENU_DETAIL_FIELDS = ['containerId', 'stateId', 'slotCount', 'offset', 'hasMore', 'details'];
 
@@ -1538,9 +1538,9 @@ function normalizeConversationWake(value) {
 }
 
 export function normalizeInspectionQuery(value) {
-	exactKeys(value, ['section', 'offset', 'limit', 'slot', 'x', 'y', 'z', 'afterSequence', 'recipeId'], ['section'], 'inspection.query');
+	exactKeys(value, ['section', 'offset', 'limit', 'slot', 'x', 'y', 'z', 'afterSequence', 'recipeId', 'entityType', 'outputItemId'], ['section'], 'inspection.query');
 	if (!['observation', 'inventory', 'menu', 'entities', 'blocks', 'item', 'block', 'events', 'landmarks', 'nearby_containers', 'recipes', 'mechanics'].includes(value.section)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Unknown inspection section');
-	const sectionFields = { item: ['slot'], block: ['x', 'y', 'z'], events: ['afterSequence'], recipes: ['recipeId'] };
+	const sectionFields = { item: ['slot'], block: ['x', 'y', 'z'], events: ['afterSequence'], recipes: ['recipeId', 'outputItemId'], entities: ['entityType'] };
 	exactKeys(value, ['section', 'offset', 'limit', ...(sectionFields[value.section] ?? [])], ['section'], 'inspection.query');
 	const result = { section: value.section, offset: nonnegativeInteger(value.offset === undefined ? 0 : value.offset, 'query.offset'), limit: positiveInteger(value.limit === undefined ? 16 : value.limit, 'query.limit') };
 	if (result.offset > 4096 || result.limit > 32) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Inspection page exceeds bounds');
@@ -1555,9 +1555,10 @@ export function normalizeInspectionQuery(value) {
 		result.afterSequence = value.afterSequence === undefined ? -1 : value.afterSequence;
 		if (!Number.isSafeInteger(result.afterSequence) || result.afterSequence < -1) throw new ProtocolV2Error('INVALID_PAYLOAD', 'afterSequence must be -1 or a nonnegative safe integer');
 	}
-	if (value.recipeId !== undefined) {
-		if (typeof value.recipeId !== 'string' || value.recipeId.length > 256 || !/^[a-z0-9_.-]+:[a-z0-9_./-]+$/.test(value.recipeId)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'recipeId must be a namespaced identifier of at most 256 characters');
-		result.recipeId = value.recipeId;
+	if (value.recipeId !== undefined && value.outputItemId !== undefined) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Choose recipeId or outputItemId');
+	for (const field of ['recipeId', 'entityType', 'outputItemId']) if (value[field] !== undefined) {
+		if (typeof value[field] !== 'string' || value[field].length > 256 || !/^[a-z0-9_.-]+:[a-z0-9_./-]+$/.test(value[field])) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be a namespaced identifier of at most 256 characters`);
+		result[field] = value[field];
 	}
 	return result;
 }

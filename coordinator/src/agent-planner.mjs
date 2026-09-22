@@ -6,6 +6,7 @@ import { ProviderHealthRegistry } from './provider-health-registry.mjs';
 import { profileFingerprint } from './provider-session.mjs';
 import { createProviderTurnTelemetry } from './provider-turn-telemetry.mjs';
 import { recordProviderTurn } from './provider-turn-recorder.mjs';
+import { DEFAULT_NATIVE_DECISION_TIMING_WINDOW, NativeDecisionTimingWindow } from './native-decision-timing.mjs';
 import { reportVisibleOutput } from './verbose-output.mjs';
 import { parseGoalSpecRequest } from './goal-spec.mjs';
 import { GoalSpecTranslator } from './goal-spec-translator.mjs';
@@ -41,6 +42,9 @@ export class AgentPlanner {
 	#turnRecorder;
 	#planningLeaseTimeoutMs;
 	#nativeTurnBudgetMs;
+	#nativeDecisionTimingWindowSize;
+	#nativeDecisionTiming = new Map();
+	#nativeTimingSink;
 
 	constructor({
 		registry,
@@ -56,6 +60,8 @@ export class AgentPlanner {
 		turnRecorder = null,
 		planningLeaseTimeoutMs = DEFAULT_PLANNING_LEASE_TIMEOUT_MS,
 		nativeTurnBudgetMs = Math.max(DEFAULT_NATIVE_TURN_BUDGET_MS, planningLeaseTimeoutMs),
+		nativeDecisionTimingWindowSize = DEFAULT_NATIVE_DECISION_TIMING_WINDOW,
+		nativeTimingSink = null,
 	}) {
 		if (registry === null || registry === undefined) throw new TypeError('registry is required');
 		if (scheduler === null || scheduler === undefined) throw new TypeError('scheduler is required');
@@ -72,6 +78,10 @@ export class AgentPlanner {
 		if (turnRecorder !== null && (typeof turnRecorder !== 'object' || typeof turnRecorder.record !== 'function')) throw new TypeError('turnRecorder must provide record or be null');
 		if (!Number.isSafeInteger(planningLeaseTimeoutMs) || planningLeaseTimeoutMs <= 0) throw new TypeError('planningLeaseTimeoutMs must be a positive safe integer');
 		if (!Number.isSafeInteger(nativeTurnBudgetMs) || nativeTurnBudgetMs < planningLeaseTimeoutMs) throw new TypeError('nativeTurnBudgetMs must be a safe integer at least planningLeaseTimeoutMs');
+		if (!Number.isSafeInteger(nativeDecisionTimingWindowSize) || nativeDecisionTimingWindowSize < 1 || nativeDecisionTimingWindowSize > DEFAULT_NATIVE_DECISION_TIMING_WINDOW * 4) {
+			throw new TypeError(`nativeDecisionTimingWindowSize must be a safe integer in [1, ${DEFAULT_NATIVE_DECISION_TIMING_WINDOW * 4}]`);
+		}
+		if (nativeTimingSink !== null && typeof nativeTimingSink !== 'function') throw new TypeError('nativeTimingSink must be a function or null');
 		this.#registry = registry;
 		this.#scheduler = scheduler;
 		this.#codexService = codexService;
@@ -84,6 +94,8 @@ export class AgentPlanner {
 		this.#turnRecorder = turnRecorder;
 		this.#planningLeaseTimeoutMs = planningLeaseTimeoutMs;
 		this.#nativeTurnBudgetMs = nativeTurnBudgetMs;
+		this.#nativeDecisionTimingWindowSize = nativeDecisionTimingWindowSize;
+		this.#nativeTimingSink = nativeTimingSink;
 	}
 
 	get healthRegistry() { return this.#healthRegistry; }
@@ -94,6 +106,21 @@ export class AgentPlanner {
 		if (settings === undefined || settings === null) return null;
 		return { ...structuredClone(settings), limits: { planningLeaseTimeoutMs: this.#planningLeaseTimeoutMs,
 			...(settings.controlProtocol === 'native_tools' ? { nativeTurnBudgetMs: this.#nativeTurnBudgetMs } : {}) } };
+	}
+
+	/**
+	 * Returns recent provider-only native decision timing for one agent.
+	 * Segment percentiles exclude time spent awaiting a tool result. The
+	 * first-tool fields are separate because usable-result elapsed time includes
+	 * tool execution and is not a provider-wait estimate.
+	 */
+	getNativeDecisionTiming(agentId) {
+		const entry = this.#nativeDecisionTiming.get(agentId);
+		if (entry === undefined) return emptyNativeDecisionTiming();
+		const identity = currentNativeTimingIdentity(this.#registry, this.#codexService, agentId);
+		const key = identity === null ? entry.activeKey : nativeTimingIdentityKey(identity);
+		const window = key === null ? null : entry.byIdentity.get(key);
+		return window === undefined ? emptyNativeDecisionTiming(identity) : window.window.snapshot(window.identity);
 	}
 
 	requestGoalSpec({ agentId, request, correctiveFeedback = null }) {
@@ -164,40 +191,95 @@ export class AgentPlanner {
 					return created;
 				}, null, onVerbose);
 				leaseAgent = agent;
+				const timingIdentity = nativeTimingIdentity(record, agent);
+				const timingWindow = this.#nativeTimingWindow(agentId, timingIdentity);
 				let firstToolAt = null;
+				let firstUsableToolRecorded = false;
 				let toolsExecuting = 0;
+				let providerSegmentStartedAt = null;
+				let providerSegmentIndex = 0;
+				let nativeTurnStartedAt = null;
+				const beginProviderSegment = (startMs) => {
+					if (!Number.isFinite(startMs)) return;
+					providerSegmentStartedAt = startMs;
+					providerSegmentIndex += 1;
+				};
+				const finishProviderSegment = (endMs, outcome, boundary) => {
+					if (providerSegmentStartedAt === null || !Number.isFinite(endMs) || endMs < providerSegmentStartedAt) return null;
+					const startedAt = providerSegmentStartedAt;
+					const durationMs = endMs - startedAt;
+					providerSegmentStartedAt = null;
+					timingWindow.window.recordProviderSegment({ durationMs, outcome, sample: outcome === 'completed' && boundary === 'tool_request' });
+					const summary = timingWindow.window.snapshot(timingIdentity);
+					this.#recordNativeTiming(record, 'native_decision_timing', {
+						traceId, segmentIndex: providerSegmentIndex, segmentDurationMs: Math.max(0, durationMs), outcome, boundary,
+						...timingIdentity,
+						timingCount: summary.count, timingLifetimeCount: summary.lifetimeCount, timingP50Ms: summary.p50Ms, timingP95Ms: summary.p95Ms,
+						timingSampleWindowSize: summary.sampleWindowSize, timingLifetimeSegmentCount: summary.lifetimeSegmentCount,
+						failedSegmentCount: summary.failedSegmentCount, cancelledSegmentCount: summary.cancelledSegmentCount,
+					});
+					return durationMs;
+				};
 				renewLease({ phase: 'provider' });
 				const result = await this.#providerAttempt(record, {
 					operation: 'native_turn', attempt: 1, queueWaitMs, retry: false, traceId,
-				}, () => agent.act(input, {
-					goalRevision,
-					signal,
-					onVerbose: (stage, message) => safeVerbose(onVerbose, stage, message),
-					onProgress: () => {
-						if (!acceptsProgress || signal.aborted || !this.#isCurrent(agentId, goalRevision)) return;
-						if (toolsExecuting === 0) renewLease({ phase: 'provider' });
-						try { Promise.resolve(onProgress?.({ phase: 'provider' })).catch(() => {}); } catch { /* reporting cannot fail provider work */ }
-					},
-					executeTool: async (request) => {
-						if (firstToolAt === null) {
-							firstToolAt = this.#now();
-							this.#recordTracePhase(record, traceId, 'provider_first_byte', firstToolAt, firstToolAt, 'completed');
-						}
-						toolsExecuting += 1;
-						renewLease({ phase: 'tool', timeoutMs: nativeToolLeaseMs(request.tool, this.#planningLeaseTimeoutMs) });
-						try {
-							if (signal.aborted) throw signal.reason;
-							return await executeTool(request);
-						}
-						finally {
-							toolsExecuting -= 1;
-							if (toolsExecuting === 0) renewLease({ phase: 'provider' });
-						}
-					},
-				}), agent, onVerbose);
-				const completedAt = this.#now();
-				if (firstToolAt === null) this.#recordTracePhase(record, traceId, 'provider_first_byte', completedAt, completedAt, 'failed', 'NO_TOOL_CALL');
-				this.#recordTracePhase(record, traceId, 'provider_final_byte', completedAt, completedAt, 'completed');
+				}, async () => {
+					nativeTurnStartedAt = this.#now();
+					beginProviderSegment(nativeTurnStartedAt);
+					try {
+						const turnResult = await agent.act(input, {
+							goalRevision,
+							signal,
+							onVerbose: (stage, message) => safeVerbose(onVerbose, stage, message),
+							onProgress: () => {
+								if (!acceptsProgress || signal.aborted || !this.#isCurrent(agentId, goalRevision)) return;
+								if (toolsExecuting === 0) renewLease({ phase: 'provider' });
+								try { Promise.resolve(onProgress?.({ phase: 'provider' })).catch(() => {}); } catch { /* reporting cannot fail provider work */ }
+							},
+							executeTool: async (request) => {
+								const requestedAt = this.#now();
+								const segmentDurationMs = finishProviderSegment(requestedAt, 'completed', 'tool_request');
+								if (firstToolAt === null) {
+									firstToolAt = requestedAt;
+									const elapsedMs = elapsed(nativeTurnStartedAt, requestedAt);
+									timingWindow.window.recordFirstToolRequest(elapsedMs);
+									this.#recordNativeTiming(record, 'native_first_tool_requested', {
+										traceId, elapsedMs, providerOnlyMs: elapsedMs, segmentDurationMs,
+										toolKind: request?.tool?.kind ?? 'unknown', ...timingIdentity,
+									});
+								}
+								toolsExecuting += 1;
+								renewLease({ phase: 'tool', timeoutMs: nativeToolLeaseMs(request.tool, this.#planningLeaseTimeoutMs) });
+								try {
+									if (signal.aborted) throw signal.reason;
+									const toolResult = await executeTool(request);
+									if (!firstUsableToolRecorded && isUsableNativeToolResult(toolResult)) {
+										firstUsableToolRecorded = true;
+										const usableAt = this.#now();
+										const elapsedMs = elapsed(nativeTurnStartedAt, usableAt);
+										timingWindow.window.recordFirstUsableTool(elapsedMs);
+										this.#recordNativeTiming(record, 'native_first_tool_result', {
+											traceId, elapsedMs, elapsedIncludesToolExecution: true,
+											toolKind: request?.tool?.kind ?? 'unknown', ...timingIdentity,
+										});
+									}
+									return toolResult;
+								} finally {
+									toolsExecuting -= 1;
+									if (toolsExecuting === 0) {
+										renewLease({ phase: 'provider' });
+										if (!signal.aborted) beginProviderSegment(this.#now());
+									}
+								}
+							},
+						});
+						finishProviderSegment(this.#now(), 'completed', 'turn_completed');
+						return turnResult;
+					} catch (error) {
+						finishProviderSegment(this.#now(), signal.aborted || isNativeCancellation(error) ? 'cancelled' : 'failed', signal.aborted || isNativeCancellation(error) ? 'cancelled' : 'turn_failed');
+						throw error;
+					}
+				}, agent, onVerbose);
 				this.#record('planner_decision_completed', record, { operation: 'native_turn', attempt: 1, queueWaitMs, directive: 'native_tools', traceId });
 				this.#recordNativeTurn(record, leaseAgent, input, admittedAt, queueWaitMs);
 				safeVerbose(onVerbose, 'decision', 'Native provider turn completed.');
@@ -503,6 +585,39 @@ export class AgentPlanner {
 		try { this.#latencyRegistry?.invalidateTrace?.(traceId); } catch { /* telemetry cannot interrupt planning */ }
 	}
 
+	#nativeTimingWindow(agentId, identity) {
+		let entry = this.#nativeDecisionTiming.get(agentId);
+		if (entry === undefined) {
+			entry = { activeKey: null, byIdentity: new Map() };
+			this.#nativeDecisionTiming.set(agentId, entry);
+		}
+		const key = nativeTimingIdentityKey(identity);
+		let window = entry.byIdentity.get(key);
+		if (window === undefined) {
+			window = { identity: Object.freeze({ ...identity }), window: new NativeDecisionTimingWindow({ windowSize: this.#nativeDecisionTimingWindowSize }) };
+			entry.byIdentity.set(key, window);
+		}
+		entry.activeKey = key;
+		return window;
+	}
+
+	#recordNativeTiming(record, event, fields) {
+		this.#record(event, record, fields);
+		if (this.#nativeTimingSink === null) return;
+		try {
+			const result = this.#nativeTimingSink(event, {
+				agentId: record.agentId,
+				provider: record.provider,
+				model: record.model,
+				reasoningEffort: record.reasoningEffort,
+				serviceTier: record.serviceTier ?? 'priority',
+				goalRevision: record.goalRevision,
+				...fields,
+			});
+			if (result !== null && result !== undefined && typeof result.then === 'function') Promise.resolve(result).catch(() => {});
+		} catch { /* timing diagnostics cannot affect native control */ }
+	}
+
 	#record(stage, record, fields = {}) {
 		if (this.#recorder === null) return;
 		try {
@@ -593,6 +708,49 @@ function currentProviderAgent(service, agentId) {
 	if (typeof service.getAgent !== 'function') return null;
 	try { return service.getAgent(agentId); }
 	catch { return null; }
+}
+
+function nativeTimingIdentity(record, agent) {
+	const settings = agent?.executionSettings;
+	const effective = settings?.effective ?? {};
+	const requested = settings?.requested ?? {};
+	return Object.freeze({
+		provider: firstIdentityValue(effective.provider, requested.provider, record.provider),
+		model: firstIdentityValue(effective.model, requested.model, record.model),
+		reasoningEffort: firstIdentityValue(effective.reasoningEffort, requested.reasoningEffort, record.reasoningEffort),
+		serviceTier: firstIdentityValue(effective.serviceTier, requested.serviceTier, record.serviceTier ?? 'priority'),
+		profileFingerprint: profileFingerprint(record),
+	});
+}
+
+function currentNativeTimingIdentity(registry, service, agentId) {
+	let record = null;
+	try { record = typeof registry.get === 'function' ? registry.get(agentId) : null; } catch { record = null; }
+	const agent = currentProviderAgent(service, agentId);
+	if (record === null || record === undefined) return null;
+	return nativeTimingIdentity(record, agent);
+}
+
+function nativeTimingIdentityKey(identity) {
+	return [identity.provider, identity.model, identity.reasoningEffort, identity.serviceTier, identity.profileFingerprint].map((value) => String(value ?? '')).join('\u001f');
+}
+
+function emptyNativeDecisionTiming(identity = null) {
+	return new NativeDecisionTimingWindow().snapshot(identity);
+}
+
+function firstIdentityValue(...values) {
+	return values.find((value) => typeof value === 'string' && value.trim().length > 0) ?? null;
+}
+
+function isUsableNativeToolResult(result) {
+	if (result === null || result === undefined || typeof result !== 'object') return false;
+	const state = typeof result.state === 'string' ? result.state.toUpperCase() : '';
+	return !['FAILED', 'CANCELLED', 'ERROR'].includes(state);
+}
+
+function isNativeCancellation(error) {
+	return error?.name === 'AbortError' || ['STALE_PLAN', 'PLAN_CANCELLED', 'TURN_INTERRUPTED', 'AGENT_DISPOSED'].includes(error?.code);
 }
 
 function safeRetryReason(value) {

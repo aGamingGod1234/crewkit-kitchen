@@ -3,7 +3,7 @@ import { types as nodeTypes } from 'node:util';
 import { DEFAULT_ARENA_SCRIPT_LIMITS, normalizeArenaScriptLimits } from './limits.mjs';
 import { PLAYER_MEMBER_PRIMITIVES, MATH_METHODS } from './minecraft-api.mjs';
 import { filterObserved, isTrustedInterpreterFacts, markObservedCandidateSet, nearestFromCurrent } from './facts.mjs';
-import { MAX_LINE_BYTES } from '../constants.mjs';
+import { MAX_LINE_BYTES, ACTION_FIELDS } from '../constants.mjs';
 
 const CAPABILITY_NAMES = new Set(['program', 'player', 'world', 'inventory', 'math']);
 const CAPABILITY_MEMBERS = Object.freeze({
@@ -20,6 +20,7 @@ const DETERMINISTIC_FAILURE_CODES = new Set([
 	'INVALID_ACTION',
 	'INVALID_ARENA_SCRIPT_COMMAND',
 	'PATH_LIMIT_REACHED',
+	'NO_STANDABLE_PATH',
 	'RECIPE_NOT_FOUND',
 	'RECIPE_NOT_UNLOCKED',
 ]);
@@ -587,6 +588,9 @@ export class ArenaScriptInterpreter {
 	}
 
 	#trackDeterministicFailure(waiting, result) {
+		// Waiting does not establish a new approach. Keep a failed action's streak
+		// so a wait/retry loop yields to the selected model after another failure.
+		if (waiting.primitive === 'wait' && result.state === 'SUCCEEDED') return null;
 		const deterministic = result.state === 'TIMED_OUT'
 			|| (result.state === 'FAILED' && DETERMINISTIC_FAILURE_CODES.has(result.reasonCode));
 		if (!deterministic) {
@@ -794,7 +798,8 @@ function validateExactTargetArguments(path, args, node, fail) {
 	const target = args[0];
 	const expected = path === 'player.attack' ? ['targetId', 'timeoutMs'] : ['targetId', 'drawDurationMs', 'timeoutMs'];
 	const keys = Object.keys(target);
-	if (keys.length !== expected.length || expected.some((key) => !Object.hasOwn(target, key))) {
+	const allowed = path === 'player.attack' ? ACTION_FIELDS.attack : ACTION_FIELDS.use_ranged;
+	if (keys.some((key) => !allowed.includes(key)) || expected.some((key) => !Object.hasOwn(target, key))) {
 		throw fail('exact target actions require targetId and reject targetSelector');
 	}
 	if (typeof target.targetId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(target.targetId)) {

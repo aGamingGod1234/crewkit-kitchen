@@ -59,6 +59,18 @@ public final class AgentSavedData extends SavedData {
 			AgentConstants.MAX_CONFIGURED_AGENTS * 2, 256 * 1_024, 16 * 1_024 * 1_024,
 			"Persisted goal drafts"
 	);
+	public record PendingDragonKill(UUID dragonId, String dimension, AgentId agentId, UUID goalId) {
+		private static final Codec<PendingDragonKill> CODEC = RecordCodecBuilder.create(instance -> instance.group(
+				Codec.STRING.xmap(UUID::fromString, UUID::toString).fieldOf("dragonId").forGetter(PendingDragonKill::dragonId),
+				Codec.STRING.fieldOf("dimension").forGetter(PendingDragonKill::dimension),
+				Codec.STRING.xmap(AgentId::parse, AgentId::toString).fieldOf("agentId").forGetter(PendingDragonKill::agentId),
+				Codec.STRING.xmap(UUID::fromString, UUID::toString).fieldOf("goalId").forGetter(PendingDragonKill::goalId)
+		).apply(instance, PendingDragonKill::new));
+		boolean matches(AgentRecord record) {
+			return record != null && agentId.equals(record.agentId())
+					&& record.currentGoal().map(goal -> goal.goalId().equals(goalId)).orElse(false);
+		}
+	}
 	private static final Codec<AgentSavedData> CODEC = RecordCodecBuilder.create(instance -> instance.group(
 			ChunkedSavedPayload.legacyCodec().optionalFieldOf(PAYLOAD_FIELD, "").forGetter(data -> ""),
 			ChunkedSavedPayload.chunksCodec().optionalFieldOf(PAYLOAD_CHUNKS_FIELD, List.of()).forGetter(data -> ChunkedSavedPayload.split(data.encodePayload())),
@@ -66,7 +78,8 @@ public final class AgentSavedData extends SavedData {
 			DRAFT_LIST_CODEC.optionalFieldOf(GOAL_DRAFTS_FIELD, List.of()).forGetter(AgentSavedData::encodeGoalDrafts),
 			ChunkedSavedPayload.chunksCodec().optionalFieldOf(KILL_LEDGER_CHUNKS_FIELD, List.of()).forGetter(AgentSavedData::encodeKillLedger),
 			ChunkedSavedPayload.chunksCodec().optionalFieldOf(SURVIVAL_PROGRESS_CHUNKS_FIELD, List.of()).forGetter(AgentSavedData::encodeSurvivalProgress),
-			ChunkedSavedPayload.chunksCodec().optionalFieldOf(OPERATOR_CONFIRMATION_CHUNKS_FIELD, List.of()).forGetter(AgentSavedData::encodeOperatorConfirmations)
+			ChunkedSavedPayload.chunksCodec().optionalFieldOf(OPERATOR_CONFIRMATION_CHUNKS_FIELD, List.of()).forGetter(AgentSavedData::encodeOperatorConfirmations),
+			PendingDragonKill.CODEC.listOf(0, 4096).optionalFieldOf("pending_dragon_kills", List.of()).forGetter(data -> List.copyOf(data.pendingDragonKills.values()))
 	).apply(instance, AgentSavedData::decodePayload));
 	public static final SavedDataType<AgentSavedData> TYPE = new SavedDataType<>(
 			Identifier.fromNamespaceAndPath("arenaagents", "codex_agents"),
@@ -76,6 +89,7 @@ public final class AgentSavedData extends SavedData {
 	);
 
 	private final AgentRegistry registry;
+	private final Map<UUID, PendingDragonKill> pendingDragonKills = new LinkedHashMap<>();
 	private final Map<AgentId, PendingConversationWake> conversationWakes = new LinkedHashMap<>();
 	private final Map<UUID, PendingGoalDraft> goalDrafts = new LinkedHashMap<>();
 	private final AgentKillLedger killLedger;
@@ -94,7 +108,7 @@ public final class AgentSavedData extends SavedData {
 
 	private AgentSavedData(AgentRegistry.Snapshot snapshot) {
 		this(snapshot, List.of(), List.of(), AgentKillLedger.emptySnapshot(), SurvivalProgressLedger.emptySnapshot(),
-				OperatorConfirmationLedger.emptySnapshot());
+				OperatorConfirmationLedger.emptySnapshot(), List.of());
 	}
 
 	private AgentSavedData(
@@ -103,8 +117,10 @@ public final class AgentSavedData extends SavedData {
 			List<PendingGoalDraft> persistedDrafts,
 			AgentKillLedger.Snapshot persistedKillLedger,
 			SurvivalProgressLedger.Snapshot persistedSurvivalProgress,
-			OperatorConfirmationLedger.Snapshot persistedOperatorConfirmations
+			OperatorConfirmationLedger.Snapshot persistedOperatorConfirmations,
+			List<PendingDragonKill> persistedDragonKills
 	) {
+		for (PendingDragonKill pending : persistedDragonKills) pendingDragonKills.putIfAbsent(pending.dragonId(), pending);
 		this.killLedger = new AgentKillLedger(persistedKillLedger, this::setDirty);
 		this.survivalProgress = new SurvivalProgressLedger(persistedSurvivalProgress, this::setDirty);
 		this.operatorConfirmations = new OperatorConfirmationLedger(persistedOperatorConfirmations, this::setDirty);
@@ -169,6 +185,26 @@ public final class AgentSavedData extends SavedData {
 		return killLedger;
 	}
 
+	public void stageDragonKill(PendingDragonKill pending) {
+		pendingDragonKills.values().removeIf(entry -> !entry.matches(registry.records().stream()
+				.filter(record -> record.agentId().equals(entry.agentId())).findFirst().orElse(null)));
+		if (pendingDragonKills.size() >= 4096 && !pendingDragonKills.containsKey(pending.dragonId())) {
+			throw new AgentDomainException("PENDING_KILL_LIMIT", "Too many pending dragon deaths");
+		}
+		pendingDragonKills.putIfAbsent(pending.dragonId(), pending);
+		setDirty();
+	}
+
+	/** Only call for terminal removal; chunk unload and server shutdown retain pending credit. */
+	public Optional<AgentId> finishDragonKill(UUID dragonId, String dimension, boolean completed) {
+		PendingDragonKill pending = pendingDragonKills.get(dragonId);
+		if (pending == null || !pending.dimension().equals(dimension)) return Optional.empty();
+		pendingDragonKills.remove(dragonId);
+		setDirty();
+		AgentRecord record = registry.records().stream().filter(entry -> entry.agentId().equals(pending.agentId())).findFirst().orElse(null);
+		return completed && pending.matches(record) ? Optional.of(pending.agentId()) : Optional.empty();
+	}
+
 	public SurvivalProgressLedger survivalProgress() {
 		return survivalProgress;
 	}
@@ -212,7 +248,8 @@ public final class AgentSavedData extends SavedData {
 			List<String> encodedDrafts,
 			List<String> killLedgerChunks,
 			List<String> survivalProgressChunks,
-			List<String> operatorConfirmationChunks
+			List<String> operatorConfirmationChunks,
+			List<PendingDragonKill> persistedDragonKills
 	) {
 		return new AgentSavedData(
 				SNAPSHOT_CODEC.decode(ChunkedSavedPayload.join(legacyPayload, chunks)),
@@ -226,7 +263,8 @@ public final class AgentSavedData extends SavedData {
 						: SURVIVAL_PROGRESS_CODEC.decode(ChunkedSavedPayload.join("", survivalProgressChunks)),
 				operatorConfirmationChunks.isEmpty()
 						? OperatorConfirmationLedger.emptySnapshot()
-						: OPERATOR_CONFIRMATION_CODEC.decode(ChunkedSavedPayload.join("", operatorConfirmationChunks))
+						: OPERATOR_CONFIRMATION_CODEC.decode(ChunkedSavedPayload.join("", operatorConfirmationChunks)),
+				persistedDragonKills
 		);
 	}
 

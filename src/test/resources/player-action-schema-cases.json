@@ -3627,5 +3627,92 @@
       ],
       "expectedFingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     }
+  },
+  {
+    "name": "single item interaction",
+    "valid": true,
+    "action": {
+      "type": "use_item",
+      "durationMs": 1000,
+      "mode": "once"
+    }
+  },
+  {
+    "name": "invalid item use mode",
+    "valid": false,
+    "action": {
+      "type": "use_item",
+      "durationMs": 1000,
+      "mode": "automatic"
+    }
+  },
+  {
+    "name": "null item use mode",
+    "valid": false,
+    "action": {
+      "type": "use_item",
+      "durationMs": 1000,
+      "mode": null
+    }
+  },
+  {
+    "name": "model fixed bow aim",
+    "valid": true,
+    "action": {
+      "type": "use_ranged",
+      "targetId": "11111111-1111-1111-1111-111111111111",
+      "drawDurationMs": 1000,
+      "timeoutMs": 3000,
+      "aimX": 1,
+      "aimY": 70,
+      "aimZ": 3
+    }
+  },
+  {
+    "name": "model target tracking",
+    "valid": true,
+    "action": {
+      "type": "use_ranged",
+      "targetId": "11111111-1111-1111-1111-111111111111",
+      "drawDurationMs": 1000,
+      "timeoutMs": 3000,
+      "trackTarget": true
+    }
+  },
+  {
+    "name": "incomplete bow aim",
+    "valid": false,
+    "action": {
+      "type": "use_ranged",
+      "targetId": "11111111-1111-1111-1111-111111111111",
+      "drawDurationMs": 1000,
+      "timeoutMs": 3000,
+      "aimX": 1
+    }
+  },
+  {
+    "name": "conflicting bow aim",
+    "valid": false,
+    "action": {
+      "type": "use_ranged",
+      "targetId": "11111111-1111-1111-1111-111111111111",
+      "drawDurationMs": 1000,
+      "timeoutMs": 3000,
+      "aimX": 1,
+      "aimY": 70,
+      "aimZ": 3,
+      "trackTarget": true
+    }
+  },
+  {
+    "name": "null tracking flag",
+    "valid": false,
+    "action": {
+      "type": "use_ranged",
+      "targetId": "11111111-1111-1111-1111-111111111111",
+      "drawDurationMs": 1000,
+      "timeoutMs": 3000,
+      "trackTarget": null
+    }
   }
 ]

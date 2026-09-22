@@ -123,6 +123,7 @@ export class CodexService {
 	}
 
 	async replaceAgent(profileValue, { recoverySummary = null, controlProtocol = 'native_tools', expectedSessionGeneration = null } = {}) {
+		const lifecycleGeneration = this.#lifecycleGeneration;
 		const profile = validateProfile(profileValue, this.#config);
 		const protocol = validateControlProtocol(controlProtocol);
 		const replacing = this.#replacing.get(profile.agentId);
@@ -139,7 +140,7 @@ export class CodexService {
 		const promise = Promise.resolve()
 			.then(() => existing?.dispose())
 			.then(async () => {
-				const lifecycleGeneration = this.#lifecycleGeneration;
+				this.#assertLifecycleCurrent(lifecycleGeneration);
 				await this.start();
 				this.#assertLifecycleCurrent(lifecycleGeneration);
 				return this.#createAgentOnce(profile, recoverySummary, protocol, lifecycleGeneration);
@@ -165,17 +166,27 @@ export class CodexService {
 		let cwd;
 		let selectedCapabilityRoots = [];
 		let minecraftInstructions = '';
-		if (controlProtocol === 'native_tools' && this.#minecraftWorkspace !== null) {
+		let minecraftSkillInstructions = '';
+		let permissionProfile = null;
+		if (this.#minecraftWorkspace !== null) {
 			const prepared = await this.#minecraftWorkspace.prepare({ sourceCodexHome: this.#codexEnvironment().CODEX_HOME });
 			if (prepared === null || typeof prepared !== 'object' || typeof prepared.cwd !== 'string' || !Array.isArray(prepared.selectedCapabilityRoots)) {
 				throw new TypeError('minecraftWorkspace.prepare() must return cwd and selectedCapabilityRoots');
 			}
 			cwd = prepared.cwd;
-			selectedCapabilityRoots = [...prepared.selectedCapabilityRoots];
+			selectedCapabilityRoots = controlProtocol === 'native_tools' ? [...prepared.selectedCapabilityRoots] : [];
+			if (prepared.permissionProfile !== undefined && prepared.permissionProfile !== 'minecraft') {
+				throw new TypeError('Minecraft workspace must use the minecraft permission profile');
+			}
+			permissionProfile = prepared.permissionProfile ?? null;
 			if (prepared.instructions !== undefined && typeof prepared.instructions !== 'string') {
 				throw new TypeError('minecraftWorkspace.prepare().instructions must be a string when provided');
 			}
 			minecraftInstructions = prepared.instructions?.trim() ?? '';
+			if (prepared.skillInstructions !== undefined && typeof prepared.skillInstructions !== 'string') {
+				throw new TypeError('Minecraft workspace skillInstructions must be a string');
+			}
+			minecraftSkillInstructions = prepared.skillInstructions?.trim() ?? '';
 		} else {
 			cwd = this.#workspaceManager === null
 				? this.#config.cwd
@@ -190,18 +201,23 @@ export class CodexService {
 			runtimeWorkspaceRoots: [cwd],
 			selectedCapabilityRoots,
 			approvalPolicy: 'never',
-			sandbox: 'read-only',
+			...(permissionProfile === null ? { sandbox: 'read-only' } : { permissions: permissionProfile }),
 			dynamicTools: controlProtocol === 'native_tools' ? MINECRAFT_DYNAMIC_TOOLS : [],
 			environments: [],
 			ephemeral: true,
 			baseInstructions: controlProtocol === 'native_tools'
-				? nativeInstructions(minecraftInstructions)
+				? nativeInstructions(minecraftInstructions, minecraftSkillInstructions)
 				: controlProtocol === 'director_script' ? 'Translate creative direction into a bounded Minecraft animation draft. Never call tools, inspect files, run commands or execute actions. Return only the supplied JSON schema.' : controlProtocol === 'goal_spec' ? goalSpecInstructions() : PLANNER_SYSTEM_PROMPT,
 			developerInstructions: controlProtocol === 'native_tools'
 				? nativeRecoveryInstructions(recoverySummary)
 				: ['goal_spec', 'director_script'].includes(controlProtocol) ? 'Return only one JSON value matching the supplied output schema. Never call tools.' : recoveryInstructions(recoverySummary),
 		}, { timeoutMs: THREAD_START_TIMEOUT_MS });
 		const threadId = requireNestedId(response, 'thread', 'thread/start');
+		if (permissionProfile !== null && (response.activePermissionProfile?.id !== permissionProfile
+				|| response.cwd !== cwd || !Array.isArray(response.runtimeWorkspaceRoots) || response.runtimeWorkspaceRoots.some((root) => root !== cwd)
+				|| !Array.isArray(response.instructionSources) || response.instructionSources.length !== 0)) {
+			throw new CodexProtocolError('MINECRAFT_WORKSPACE_MISMATCH', 'Provider did not confirm the dedicated workspace, permission profile, and isolated instruction sources');
+		}
 		if (transportGeneration !== this.#transportGeneration) throw new CodexProtocolError('SESSION_INVALIDATED', 'Codex transport generation was replaced');
 	const sessionGeneration = (this.#sessionGenerations.get(profile.agentId) ?? 0) + 1;
 		this.#sessionGenerations.set(profile.agentId, sessionGeneration);
@@ -231,6 +247,10 @@ export class CodexService {
 		const creating = this.#creating.get(agentId);
 		if (creating !== undefined) {
 			try { await creating.promise; } catch { /* failed creation has no runtime to remove */ }
+		}
+		const replacing = this.#replacing.get(agentId);
+		if (replacing !== undefined) {
+			try { await replacing.promise; } catch { /* failed replacement has no runtime to remove */ }
 		}
 		const agent = this.#agents.get(agentId);
 		if (agent === undefined) return false;
@@ -291,6 +311,7 @@ export class CodexService {
 
 	async #startOnce(attempt) {
 		await this.#prepareMinecraftLaunch();
+		this.#assertStartupCurrent(attempt);
 		const transportStart = Promise.resolve().then(() => this.#transport.start({ signal: attempt.controller.signal }));
 		try {
 			await withStartupDeadline(transportStart, this.#config.startupTimeoutMs, this.#startupSchedule, this.#startupCancelSchedule, attempt.controller);
@@ -326,6 +347,7 @@ export class CodexService {
 		}
 		const baseEnvironment = this.#codexEnvironment();
 		this.#transport.setEnvironment({ ...baseEnvironment, CODEX_HOME: prepared.codexHome });
+		this.#transport.setWorkingDirectory?.(prepared.cwd);
 	}
 
 	#codexEnvironment() {
@@ -352,9 +374,9 @@ export class CodexService {
 	}
 }
 
-function nativeInstructions(minecraftInstructions) {
+function nativeInstructions(minecraftInstructions, skillInstructions = '') {
 	if (minecraftInstructions === '') return NATIVE_AGENT_INSTRUCTIONS;
-	return `${NATIVE_AGENT_INSTRUCTIONS}\n\nWorkspace instructions for this Minecraft body (authoritative):\n${minecraftInstructions}`;
+	return `${NATIVE_AGENT_INSTRUCTIONS}\n\nWorkspace instructions for this Minecraft body (authoritative):\n${minecraftInstructions}${skillInstructions === '' ? '' : `\n\nBundled minecraft-control skill (already loaded; no filesystem read needed):\n${skillInstructions}`}`;
 }
 
 export class SharedCodexAgent {
@@ -908,12 +930,14 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 					callId: params.callId,
 					tool,
 				});
-				transport.respond(id, toolResultContent(result));
+				if (!settled) transport.respond(id, toolResultContent(result));
 			} catch (error) {
+				if (settled) return;
 				transport.respond(id, toolResultContent({
 					state: 'FAILED',
 					reasonCode: String(error?.code ?? 'TOOL_EXECUTION_FAILED').slice(0, 128),
 					message: String(error?.message ?? error).slice(0, 512),
+					...(error?.actionContract === undefined ? {} : { actionContract: error.actionContract }),
 				}, false));
 			} finally {
 				if (executionStarted) onToolExecutionEnd();

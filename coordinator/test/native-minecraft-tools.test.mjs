@@ -11,10 +11,11 @@ import {
 } from '../src/native-minecraft-tools.mjs';
 import { ACTION_FIELDS } from '../src/constants.mjs';
 import { parseArenaScript } from '../src/arena-script/parser.mjs';
+import { goalSpecFingerprint, parseGoalSpec } from '../src/goal-spec.mjs';
 
 test('capabilities reflect the shared action contract without inventing fields', () => {
 	assert.deepEqual(minecraftCapabilities().actions.map(({ actionType, fields }) => ({ actionType, fields })), Object.entries(ACTION_FIELDS).map(([actionType, fields]) => ({ actionType, fields: [...fields] })));
-	assert.deepEqual(minecraftCapabilities().actions.find(({ actionType }) => actionType === 'use_item').optionalFields, ['hand', 'expectedItemId']);
+	assert.deepEqual(minecraftCapabilities().actions.find(({ actionType }) => actionType === 'use_item').optionalFields, ['hand', 'expectedItemId', 'mode']);
 	const copy = minecraftCapabilities();
 	copy.actions[0].fields.push('invented');
 	assert.ok(!minecraftCapabilities().actions[0].fields.includes('invented'));
@@ -61,7 +62,9 @@ test('oversized observations retain input identity, freshness and explicit omiss
 	assert.equal(result.observation.interaction.menu.stateRevision, 3);
 	assert.equal(result.observation.interaction.input.hand, 'off_hand');
 	assert.deepEqual(result.observation.coverage, raw.observation.coverage);
-	assert.ok(result.observation.resultCoverage.omittedSections.includes('entities'));
+	assert.ok(result.observation.entities.length > 0);
+	assert.ok(result.observation.entities.length < raw.observation.entities.length);
+	assert.equal(result.observation.resultCoverage.entities.retained, result.observation.entities.length);
 });
 
 test('oversized inspection pages keep whole entries and a truthful continuation offset', () => {
@@ -141,7 +144,7 @@ test('oversized program results preserve factual status, body receipt references
 
 test('native Minecraft tools expose the common fast path plus one validated advanced body operation', () => {
 	assert.deepEqual(MINECRAFT_DYNAMIC_TOOLS.map((tool) => tool.name), [
-		'observe', 'capabilities', 'inspect', 'actionStatus', 'cancelAction', 'replaceAction', 'startAction', 'notebook', 'queryMemory', 'runProgram', 'lookAround', 'control', 'moveTo', 'exploreFrontier', 'mine', 'say', 'wait', 'act', 'sequence', 'finish',
+		'observe', 'capabilities', 'inspect', 'actionStatus', 'cancelAction', 'replaceAction', 'startAction', 'notebook', 'queryMemory', 'runProgram', 'programStatus', 'respondProgram', 'cancelProgram', 'lookAround', 'control', 'moveTo', 'exploreFrontier', 'mine', 'say', 'wait', 'act', 'sequence', 'finish',
 	]);
 	assert.ok(MINECRAFT_DYNAMIC_TOOLS.every((tool) => tool.type === 'function'));
 	assert.ok(NATIVE_AGENT_INSTRUCTIONS.length < 1_500);
@@ -151,6 +154,12 @@ test('native Minecraft tools expose the common fast path plus one validated adva
 	assert.match(NATIVE_AGENT_INSTRUCTIONS, /exploreFrontier/);
 	assert.match(NATIVE_AGENT_INSTRUCTIONS, /death does not change the active goal/i);
 	assert.match(NATIVE_AGENT_INSTRUCTIONS, /omitted or unobserved facts are unknown/i);
+	assert.match(NATIVE_AGENT_INSTRUCTIONS, /background:true/);
+	assert.match(NATIVE_AGENT_INSTRUCTIONS, /queryMemory/);
+	assert.match(NATIVE_AGENT_INSTRUCTIONS, /reuse exact noteKey/);
+	assert.match(NATIVE_AGENT_INSTRUCTIONS, /prerequisites\/current targets/);
+	assert.match(NATIVE_AGENT_INSTRUCTIONS, /noteKey executes the entire note as source/);
+	assert.match(MINECRAFT_DYNAMIC_TOOLS.find((tool) => tool.name === 'runProgram').description, /noteKey executes the entire note text as ArenaScript/);
 });
 
 test('advertised native actions exactly match Java model-authored dispatch', async () => {
@@ -345,4 +354,119 @@ test('oversized sequence results retain every authoritative step status', () => 
 	assert.equal(result.state, 'SUCCEEDED');
 	assert.equal(result.results.length, 8);
 	assert.deepEqual(result.results.map(({ state, reasonCode }) => ({ state, reasonCode })), Array.from({ length: 8 }, (_, index) => ({ state: 'SUCCEEDED', reasonCode: `STEP_${index + 1}` })));
+});
+
+test('invalid advanced action returns its full field contract for one-step correction', () => {
+ assert.throws(() => normalizeMinecraftToolCall('act', { actionType: 'menu_close', arguments: {} }), error => {
+  assert.equal(error.code, 'INVALID_MINECRAFT_TOOL_ARGUMENTS');
+  assert.deepEqual(error.actionContract.requiredFields, ['menuId', 'containerId', 'stateId']);
+  assert.deepEqual(error.actionContract.optionalFields, []);
+  assert.match(error.actionContract.hint, /namespaced string/);
+  return true;
+ });
+});
+
+test('oversized action feedback retains its receipt and fresh inventory', () => {
+ const result = toolResultContent({ state: 'SUCCEEDED', reasonCode: 'ITEM_PICKED_UP', actionId: 'pickup-1', postAction: {
+  freshness: { fresh: true }, eventSequence: 42,
+  observation: { inventory: { items: [{ itemId: 'minecraft:oak_log', count: 4 }] }, entities: [], blocks: Array.from({ length: 800 }, (_, x) => ({ x, y: 64, z: 0, blockId: 'minecraft:stone' })) }
+ }});
+ const text = result.contentItems[0].text;
+ assert.ok(Buffer.byteLength(text, 'utf8') <= 16_384);
+ const decoded = JSON.parse(text);
+ assert.equal(decoded.state, 'SUCCEEDED');
+ assert.equal(decoded.reasonCode, 'ITEM_PICKED_UP');
+ assert.equal(decoded.actionId, 'pickup-1');
+ assert.equal(decoded.postAction.freshness.fresh, true);
+ assert.equal(decoded.postAction.eventSequence, 42);
+ assert.equal(decoded.postAction.observation.inventory.items[0].count, 4);
+ assert.equal(decoded.postAction.truncated, true);
+});
+
+test('oversized action observation cannot crowd out fresh post-action inventory', () => {
+	const text = toolResultContent({ state: 'FAILED', reasonCode: 'ITEM_NOT_FOUND', physicalAttempted: false,
+		actionObservation: { detail: 'x'.repeat(40_000) }, recoveryHint: 'Check current inventory.',
+		postAction: { eventSequence: 42, freshness: { fresh: true }, observation: { inventory: { items: [{ itemId: 'minecraft:oak_log', count: 4 }] } } },
+	}).contentItems[0].text;
+	assert.ok(Buffer.byteLength(text) <= 16_384);
+	const result = JSON.parse(text);
+	assert.equal(result.state, 'FAILED');
+	assert.equal(result.reasonCode, 'ITEM_NOT_FOUND');
+	assert.equal(result.physicalAttempted, false);
+	assert.equal(result.recoveryHint, 'Check current inventory.');
+	assert.equal(result.postAction.observation.inventory.items[0].count, 4);
+	assert.equal(result.postAction.freshness.fresh, true);
+});
+
+test('oversized sequence preserves its final feedback and every factual receipt', () => {
+	const text = toolResultContent({ state: 'FAILED', completed: 2, failedAt: 1,
+		results: [{ actionType: 'break_block', state: 'SUCCEEDED', reasonCode: 'BLOCK_BROKEN', actionObservation: { detail: 'x'.repeat(20_000) } },
+			{ actionType: 'break_block', state: 'FAILED', reasonCode: 'TARGET_OBSTRUCTED', physicalAttempted: false }],
+		postAction: { eventSequence: 42, freshness: { fresh: true }, observation: { inventory: { items: [{ itemId: 'minecraft:oak_log', count: 1 }] } } },
+	}).contentItems[0].text;
+	assert.ok(Buffer.byteLength(text) <= 16_384);
+	const result = JSON.parse(text);
+	assert.equal(result.state, 'FAILED');
+	assert.equal(result.failedAt, 1);
+	assert.deepEqual(result.results.map(step => step.state), ['SUCCEEDED', 'FAILED']);
+	assert.equal(result.results[1].physicalAttempted, false);
+	assert.equal(result.postAction.observation.inventory.items[0].count, 1);
+	assert.equal(result.postAction.eventSequence, 42);
+});
+
+test('maximum multibyte goal text cannot erase sequence receipts or fresh inventory', () => {
+	const originalRequest = '\u6728'.repeat(4096);
+	const fields = { originalRequest, predicate: { type: 'inventory_contains', itemId: 'minecraft:oak_log', count: 4 }, createdAtTick: 1 };
+	const goalSpec = parseGoalSpec({ ...fields, fingerprint: goalSpecFingerprint(fields) });
+	const text = toolResultContent({ state: 'FAILED', completed: 2, failedAt: 1,
+		results: [{ actionType: 'navigate_to', state: 'SUCCEEDED', reasonCode: 'DESTINATION_REACHED' },
+			{ actionType: 'break_block', state: 'FAILED', reasonCode: 'TARGET_OBSTRUCTED', physicalAttempted: false }],
+		postAction: { goal: originalRequest, goalSpec, eventSequence: 42, freshness: { fresh: true }, observation: { inventory: { items: [{ itemId: 'minecraft:oak_log', count: 1, slot: 0 }] } } },
+	}).contentItems[0].text;
+	assert.ok(Buffer.byteLength(text) <= 16_384);
+	const result = JSON.parse(text);
+	assert.equal(result.completed, 2);
+	assert.equal(result.failedAt, 1);
+	assert.deepEqual(result.results.map(step => step.reasonCode), ['DESTINATION_REACHED', 'TARGET_OBSTRUCTED']);
+	assert.equal(result.postAction.observation.inventory.items[0].count, 1);
+	assert.equal(result.postAction.freshness.fresh, true);
+	assert.deepEqual(result.postAction.goalSpec.predicate, goalSpec.predicate);
+	assert.equal(result.postAction.goalSpec.fingerprint, goalSpec.fingerprint);
+});
+
+test('a valid oversized completion predicate leaves receipts and inventory within budget', () => {
+	const fields = { originalRequest: 'Collect these items', createdAtTick: 1,
+		predicate: { type: 'inventory_contains_any', count: 1,
+			itemIds: Array.from({ length: 64 }, (_, index) => `minecraft:item_${index}_${'x'.repeat(238)}`),
+		},
+	};
+	const goalSpec = parseGoalSpec({ ...fields, fingerprint: goalSpecFingerprint(fields) });
+	const text = toolResultContent({ state: 'SUCCEEDED', completed: 2,
+		results: [{ actionType: 'look_at', state: 'SUCCEEDED', reasonCode: 'LOOKED_AT' }, { actionType: 'break_block', state: 'SUCCEEDED', reasonCode: 'BLOCK_BROKEN' }],
+		postAction: { goalSpec, eventSequence: 42, freshness: { fresh: true }, observation: { inventory: { items: [{ itemId: 'minecraft:oak_log', count: 4, slot: 0 }] } } },
+	}).contentItems[0].text;
+	assert.ok(Buffer.byteLength(text) <= 16_384);
+	const result = JSON.parse(text);
+	assert.equal(result.completed, 2);
+	assert.deepEqual(result.results.map(step => step.reasonCode), ['LOOKED_AT', 'BLOCK_BROKEN']);
+	assert.equal(result.postAction.observation.inventory.items[0].count, 4);
+	assert.equal(result.postAction.observation.resultCoverage.inventory.retained, 1);
+	assert.equal(result.postAction.freshness.fresh, true);
+	assert.equal(result.postAction.truncated, true);
+});
+
+test('sequence omission notice cannot push retained receipts over the byte limit', () => {
+	for (let detailBytes = 15_700; detailBytes <= 16_000; detailBytes += 10) {
+		const text = toolResultContent({ state: 'FAILED', completed: 2, failedAt: 1,
+			results: [{ actionType: 'navigate_to', state: 'SUCCEEDED', reasonCode: 'DESTINATION_REACHED', actionObservation: { detail: 'x'.repeat(detailBytes) } },
+				{ actionType: 'break_block', state: 'FAILED', reasonCode: 'TARGET_OBSTRUCTED', physicalAttempted: false, actionObservation: { detail: 'y'.repeat(20_000) } }],
+			postAction: { eventSequence: 42, freshness: { fresh: true }, observation: { inventory: { items: [{ itemId: 'minecraft:oak_log', count: 1, slot: 0 }] } } },
+		}).contentItems[0].text;
+		assert.ok(Buffer.byteLength(text) <= 16_384);
+		const result = JSON.parse(text);
+		assert.equal(result.completed, 2, `retained observation has ${detailBytes} bytes`);
+		assert.equal(result.failedAt, 1);
+		assert.deepEqual(result.results.map(step => step.reasonCode), ['DESTINATION_REACHED', 'TARGET_OBSTRUCTED']);
+		assert.equal(result.postAction.observation.inventory.items[0].count, 1);
+	}
 });

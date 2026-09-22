@@ -1,0 +1,895 @@
+{
+  "benchmark": "native-realtime-comparison",
+  "provenance": {
+    "revisions": {
+      "baseline": {
+        "revision": "47c83ca8",
+        "resolvedRevision": "47c83ca8bed4df8f5e36f2ec70098e021408536e",
+        "sourceKind": "isolated-coordinator-src",
+        "sourceHash": "e5d9ef3b3a68baf3f1d7f371b1fb37c2b3dd73593b746def75204a12f58e8bb9"
+      },
+      "optimized": {
+        "revision": "e4e1c94f",
+        "resolvedRevision": "e4e1c94f84dd6615409b0c2f525eda07aff00e13",
+        "sourceKind": "isolated-coordinator-src",
+        "sourceHash": "c40456cd6a3e1e34b112d20918109cdef5aeb3f4b58a09d5b85900a9b69a2662"
+      }
+    },
+    "config": {
+      "source": "program.onUnhandledAttention(\"continue_and_notify\"); await player.wait(1);",
+      "timeoutMs": 300,
+      "planningLeadMs": 200,
+      "controllerDecisionPrepMs": 100,
+      "successorActionDurationMs": 8,
+      "actionDurationMinMs": 214,
+      "actionDurationMaxMs": 226,
+      "repetitions": 6,
+      "seed": 6221112
+    },
+    "configHash": "48b864a7362f64421531320ee1986f3d86a769a81802c06dbc2f09a8907794e0",
+    "execution": {
+      "node": "v22.23.2",
+      "platform": "win32",
+      "provider": "controlled-synthetic",
+      "bridge": "controlled-synthetic",
+      "modelController": "controlled-synthetic-explicit-successor",
+      "liveProvider": false,
+      "counterbalanced": true
+    },
+    "harness": {
+      "revision": "dc5940f804de91e22fb6c2c415295100017d0f4c",
+      "sha256": "33b7814b8dbc4e350b8c5249d4f7a3bbd4940750a0d3a32558366e2b9f5f98d6"
+    }
+  },
+  "rawSamples": [
+    {
+      "arm": "baseline",
+      "pairingKey": "pair-1",
+      "repetition": 1,
+      "order": 1,
+      "provider": "controlled-synthetic",
+      "liveProvider": false,
+      "controller": "controlled-synthetic-explicit-successor",
+      "status": "passed",
+      "error": null,
+      "configured": {
+        "timeoutMs": 300,
+        "planningLeadMs": 200,
+        "actionDurationMs": 224
+      },
+      "outcome": {
+        "first": {
+          "state": "YIELDED",
+          "reasonCode": "PROGRAM_EXHAUSTED",
+          "actions": 1,
+          "receipts": 1
+        },
+        "successor": {
+          "state": "YIELDED",
+          "reasonCode": "PROGRAM_EXHAUSTED",
+          "actions": 1,
+          "receipts": 1
+        }
+      },
+      "observed": {
+        "nativeEventObserved": false,
+        "planningStatus": null,
+        "planningDetails": null,
+        "controllerFollowed": true,
+        "preparationTrigger": "program_completion",
+        "successorStartedBy": "controlled-synthetic-controller",
+        "bodyActionStarted": true,
+        "bodyActionCompleted": true,
+        "bodyContinuity": false,
+        "bodyActionCount": 2,
+        "successorActionStarted": true,
+        "cancellationCount": 0
+      },
+      "metrics": {
+        "preparationLeadMs": null,
+        "usefulOverlapMs": null,
+        "decisionGapMs": 113.6886000000004,
+        "bodyActionDurationMs": 226.30420000000004
+      },
+      "timing": {
+        "startedAt": 2401.799,
+        "finishedAt": 2766.6444,
+        "durationMs": 364.84540000000015
+      }
+    },
+    {
+      "arm": "optimized",
+      "pairingKey": "pair-1",
+      "repetition": 1,
+      "order": 2,
+      "provider": "controlled-synthetic",
+      "liveProvider": false,
+      "controller": "controlled-synthetic-explicit-successor",
+      "status": "passed",
+      "error": null,
+      "configured": {
+        "timeoutMs": 300,
+        "planningLeadMs": 200,
+        "actionDurationMs": 224
+      },
+      "outcome": {
+        "first": {
+          "state": "YIELDED",
+          "reasonCode": "PROGRAM_EXHAUSTED",
+          "actions": 1,
+          "receipts": 1
+        },
+        "successor": {
+          "state": "YIELDED",
+          "reasonCode": "PROGRAM_EXHAUSTED",
+          "actions": 1,
+          "receipts": 1
+        }
+      },
+      "observed": {
+        "nativeEventObserved": true,
+        "planningStatus": {
+          "programVersion": 1,
+          "engineState": "ACTIVE"
+        },
+        "planningDetails": {
+          "planningLeadMs": 200
+        },
+        "controllerFollowed": true,
+        "preparationTrigger": "native_event",
+        "successorStartedBy": "controlled-synthetic-controller",
+        "bodyActionStarted": true,
+        "bodyActionCompleted": true,
+        "bodyContinuity": true,
+        "bodyActionCount": 2,
+        "successorActionStarted": true,
+        "cancellationCount": 0
+      },
+      "metrics": {
+        "preparationLeadMs": 192.30600000000004,
+        "usefulOverlapMs": 125.21489999999994,
+        "decisionGapMs": 5.469700000000103,
+        "bodyActionDurationMs": 228.39129999999977
+      },
+      "timing": {
+        "startedAt": 2766.7401,
+        "finishedAt": 3019.0551,
+        "durationMs": 252.31500000000005
+      }
+    },
+    {
+      "arm": "optimized",
+      "pairingKey": "pair-2",
+      "repetition": 2,
+      "order": 1,
+      "provider": "controlled-synthetic",
+      "liveProvider": false,
+      "controller": "controlled-synthetic-explicit-successor",
+      "status": "passed",
+      "error": null,
+      "configured": {
+        "timeoutMs": 300,
+        "planningLeadMs": 200,
+        "actionDurationMs": 221
+      },
+      "outcome": {
+        "first": {
+          "state": "YIELDED",
+          "reasonCode": "PROGRAM_EXHAUSTED",
+          "actions": 1,
+          "receipts": 1
+        },
+        "successor": {
+          "state": "YIELDED",
+          "reasonCode": "PROGRAM_EXHAUSTED",
+          "actions": 1,
+          "receipts": 1
+        }
+      },
+      "observed": {
+        "nativeEventObserved": true,
+        "planningStatus": {
+          "programVersion": 1,
+          "engineState": "ACTIVE"
+        },
+        "planningDetails": {
+          "planningLeadMs": 200
+        },
+        "controllerFollowed": true,
+        "preparationTrigger": "native_event",
+        "successorStartedBy": "controlled-synthetic-controller",
+        "bodyActionStarted": true,
+        "bodyActionCompleted": true,
+        "bodyContinuity": true,
+        "bodyActionCount": 2,
+        "successorActionStarted": true,
+        "cancellationCount": 0
+      },
+      "metrics": {
+        "preparationLeadMs": 190.44880000000012,
+        "usefulOverlapMs": 126.31550000000016,
+        "decisionGapMs": 2.042099999999664,
+        "bodyActionDurationMs": 235.15560000000005
+      },
+      "timing": {
+        "startedAt": 3019.1153,
+        "finishedAt": 3271.9722,
+        "durationMs": 252.85690000000022
+      }
+    },
+    {
+      "arm": "baseline",
+      "pairingKey": "pair-2",
+      "repetition": 2,
+      "order": 2,
+      "provider": "controlled-synthetic",
+      "liveProvider": false,
+      "controller": "controlled-synthetic-explicit-successor",
+      "status": "passed",
+      "error": null,
+      "configured": {
+        "timeoutMs": 300,
+        "planningLeadMs": 200,
+        "actionDurationMs": 221
+      },
+      "outcome": {
+        "first": {
+          "state": "YIELDED",
+          "reasonCode": "PROGRAM_EXHAUSTED",
+          "actions": 1,
+          "receipts": 1
+        },
+        "successor": {
+          "state": "YIELDED",
+          "reasonCode": "PROGRAM_EXHAUSTED",
+          "actions": 1,
+          "receipts": 1
+        }
+      },
+      "observed": {
+        "nativeEventObserved": false,
+        "planningStatus": null,
+        "planningDetails": null,
+        "controllerFollowed": true,
+        "preparationTrigger": "program_completion",
+        "successorStartedBy": "controlled-synthetic-controller",
+        "bodyActionStarted": true,
+        "bodyActionCompleted": true,
+        "bodyContinuity": false,
+        "bodyActionCount": 2,
+        "successorActionStarted": true,
+        "cancellationCount": 0
+      },
+      "metrics": {
+        "preparationLeadMs": null,
+        "usefulOverlapMs": null,
+        "decisionGapMs": 111.62930000000006,
+        "bodyActionDurationMs": 233.72580000000016
+      },
+      "timing": {
+        "startedAt": 3272.0289,
+        "finishedAt": 3633.3401,
+        "durationMs": 361.3112000000001
+      }
+    },
+    {
+      "arm": "baseline",
+      "pairingKey": "pair-3",
+      "repetition": 3,
+      "order": 1,
+      "provider": "controlled-synthetic",
+      "liveProvider": false,
+      "controller": "controlled-synthetic-explicit-successor",
+      "status": "passed",
+      "error": null,
+      "configured": {
+        "timeoutMs": 300,
+        "planningLeadMs": 200,
+        "actionDurationMs": 223
+      },
+      "outcome": {
+        "first": {
+          "state": "YIELDED",
+          "reasonCode": "PROGRAM_EXHAUSTED",
+          "actions": 1,
+          "receipts": 1
+        },
+        "successor": {
+          "state": "YIELDED",
+          "reasonCode": "PROGRAM_EXHAUSTED",
+          "actions": 1,
+          "receipts": 1
+        }
+      },
+      "observed": {
+        "nativeEventObserved": false,
+        "planningStatus": null,
+        "planningDetails": null,
+        "controllerFollowed": true,
+        "preparationTrigger": "program_completion",
+        "successorStartedBy": "controlled-synthetic-controller",
+        "bodyActionStarted": true,
+        "bodyActionCompleted": true,
+        "bodyContinuity": false,
+        "bodyActionCount": 2,
+        "successorActionStarted": true,
+        "cancellationCount": 0
+      },
+      "metrics": {
+        "preparationLeadMs": null,
+        "usefulOverlapMs": null,
+        "decisionGapMs": 112.6586000000002,
+        "bodyActionDurationMs": 233.0391999999997
+      },
+      "timing": {
+        "startedAt": 3633.3903,
+        "finishedAt": 3994.3506,
+        "durationMs": 360.9603000000002
+      }
+    },
+    {
+      "arm": "optimized",
+      "pairingKey": "pair-3",
+      "repetition": 3,
+      "order": 2,
+      "provider": "controlled-synthetic",
+      "liveProvider": false,
+      "controller": "controlled-synthetic-explicit-successor",
+      "status": "passed",
+      "error": null,
+      "configured": {
+        "timeoutMs": 300,
+        "planningLeadMs": 200,
+        "actionDurationMs": 223
+      },
+      "outcome": {
+        "first": {
+          "state": "YIELDED",
+          "reasonCode": "PROGRAM_EXHAUSTED",
+          "actions": 1,
+          "receipts": 1
+        },
+        "successor": {
+          "state": "YIELDED",
+          "reasonCode": "PROGRAM_EXHAUSTED",
+          "actions": 1,
+          "receipts": 1
+        }
+      },
+      "observed": {
+        "nativeEventObserved": true,
+        "planningStatus": {
+          "programVersion": 1,
+          "engineState": "ACTIVE"
+        },
+        "planningDetails": {
+          "planningLeadMs": 200
+        },
+        "controllerFollowed": true,
+        "preparationTrigger": "native_event",
+        "successorStartedBy": "controlled-synthetic-controller",
+        "bodyActionStarted": true,
+        "bodyActionCompleted": true,
+        "bodyContinuity": true,
+        "bodyActionCount": 2,
+        "successorActionStarted": true,
+        "cancellationCount": 0
+      },
+      "metrics": {
+        "preparationLeadMs": 190.8125,
+        "usefulOverlapMs": 124.92149999999947,
+        "decisionGapMs": 1.7371000000002823,
+        "bodyActionDurationMs": 233.13409999999976
+      },
+      "timing": {
+        "startedAt": 3994.4462,
+        "finishedAt": 4246.1356,
+        "durationMs": 251.68939999999975
+      }
+    },
+    {
+      "arm": "optimized",
+      "pairingKey": "pair-4",
+      "repetition": 4,
+      "order": 1,
+      "provider": "controlled-synthetic",
+      "liveProvider": false,
+      "controller": "controlled-synthetic-explicit-successor",
+      "status": "passed",
+      "error": null,
+      "configured": {
+        "timeoutMs": 300,
+        "planningLeadMs": 200,
+        "actionDurationMs": 214
+      },
+      "outcome": {
+        "first": {
+          "state": "YIELDED",
+          "reasonCode": "PROGRAM_EXHAUSTED",
+          "actions": 1,
+          "receipts": 1
+        },
+        "successor": {
+          "state": "YIELDED",
+          "reasonCode": "PROGRAM_EXHAUSTED",
+          "actions": 1,
+          "receipts": 1
+        }
+      },
+      "observed": {
+        "nativeEventObserved": true,
+        "planningStatus": {
+          "programVersion": 1,
+          "engineState": "ACTIVE"
+        },
+        "planningDetails": {
+          "planningLeadMs": 200
+        },
+        "controllerFollowed": true,
+        "preparationTrigger": "native_event",
+        "successorStartedBy": "controlled-synthetic-controller",
+        "bodyActionStarted": true,
+        "bodyActionCompleted": true,
+        "bodyContinuity": true,
+        "bodyActionCount": 2,
+        "successorActionStarted": true,
+        "cancellationCount": 0
+      },
+      "metrics": {
+        "preparationLeadMs": 193.0706,
+        "usefulOverlapMs": 110.0621999999994,
+        "decisionGapMs": 1.7402000000001863,
+        "bodyActionDurationMs": 216.46029999999973
+      },
+      "timing": {
+        "startedAt": 4246.1988,
+        "finishedAt": 4480.3185,
+        "durationMs": 234.1197000000002
+      }
+    },
+    {
+      "arm": "baseline",
+      "pairingKey": "pair-4",
+      "repetition": 4,
+      "order": 2,
+      "provider": "controlled-synthetic",
+      "liveProvider": false,
+      "controller": "controlled-synthetic-explicit-successor",
+      "status": "passed",
+      "error": null,
+      "configured": {
+        "timeoutMs": 300,
+        "planningLeadMs": 200,
+        "actionDurationMs": 214
+      },
+      "outcome": {
+        "first": {
+          "state": "YIELDED",
+          "reasonCode": "PROGRAM_EXHAUSTED",
+          "actions": 1,
+          "receipts": 1
+        },
+        "successor": {
+          "state": "YIELDED",
+          "reasonCode": "PROGRAM_EXHAUSTED",
+          "actions": 1,
+          "receipts": 1
+        }
+      },
+      "observed": {
+        "nativeEventObserved": false,
+        "planningStatus": null,
+        "planningDetails": null,
+        "controllerFollowed": true,
+        "preparationTrigger": "program_completion",
+        "successorStartedBy": "controlled-synthetic-controller",
+        "bodyActionStarted": true,
+        "bodyActionCompleted": true,
+        "bodyContinuity": false,
+        "bodyActionCount": 2,
+        "successorActionStarted": true,
+        "cancellationCount": 0
+      },
+      "metrics": {
+        "preparationLeadMs": null,
+        "usefulOverlapMs": null,
+        "decisionGapMs": 112.65650000000005,
+        "bodyActionDurationMs": 218.5019000000002
+      },
+      "timing": {
+        "startedAt": 4480.3648,
+        "finishedAt": 4827.564,
+        "durationMs": 347.1992
+      }
+    },
+    {
+      "arm": "baseline",
+      "pairingKey": "pair-5",
+      "repetition": 5,
+      "order": 1,
+      "provider": "controlled-synthetic",
+      "liveProvider": false,
+      "controller": "controlled-synthetic-explicit-successor",
+      "status": "passed",
+      "error": null,
+      "configured": {
+        "timeoutMs": 300,
+        "planningLeadMs": 200,
+        "actionDurationMs": 223
+      },
+      "outcome": {
+        "first": {
+          "state": "YIELDED",
+          "reasonCode": "PROGRAM_EXHAUSTED",
+          "actions": 1,
+          "receipts": 1
+        },
+        "successor": {
+          "state": "YIELDED",
+          "reasonCode": "PROGRAM_EXHAUSTED",
+          "actions": 1,
+          "receipts": 1
+        }
+      },
+      "observed": {
+        "nativeEventObserved": false,
+        "planningStatus": null,
+        "planningDetails": null,
+        "controllerFollowed": true,
+        "preparationTrigger": "program_completion",
+        "successorStartedBy": "controlled-synthetic-controller",
+        "bodyActionStarted": true,
+        "bodyActionCompleted": true,
+        "bodyContinuity": false,
+        "bodyActionCount": 2,
+        "successorActionStarted": true,
+        "cancellationCount": 0
+      },
+      "metrics": {
+        "preparationLeadMs": null,
+        "usefulOverlapMs": null,
+        "decisionGapMs": 111.35900000000038,
+        "bodyActionDurationMs": 229.07570000000032
+      },
+      "timing": {
+        "startedAt": 4827.6165,
+        "finishedAt": 5184.587,
+        "durationMs": 356.97050000000036
+      }
+    },
+    {
+      "arm": "optimized",
+      "pairingKey": "pair-5",
+      "repetition": 5,
+      "order": 2,
+      "provider": "controlled-synthetic",
+      "liveProvider": false,
+      "controller": "controlled-synthetic-explicit-successor",
+      "status": "passed",
+      "error": null,
+      "configured": {
+        "timeoutMs": 300,
+        "planningLeadMs": 200,
+        "actionDurationMs": 223
+      },
+      "outcome": {
+        "first": {
+          "state": "YIELDED",
+          "reasonCode": "PROGRAM_EXHAUSTED",
+          "actions": 1,
+          "receipts": 1
+        },
+        "successor": {
+          "state": "YIELDED",
+          "reasonCode": "PROGRAM_EXHAUSTED",
+          "actions": 1,
+          "receipts": 1
+        }
+      },
+      "observed": {
+        "nativeEventObserved": true,
+        "planningStatus": {
+          "programVersion": 1,
+          "engineState": "ACTIVE"
+        },
+        "planningDetails": {
+          "planningLeadMs": 200
+        },
+        "controllerFollowed": true,
+        "preparationTrigger": "native_event",
+        "successorStartedBy": "controlled-synthetic-controller",
+        "bodyActionStarted": true,
+        "bodyActionCompleted": true,
+        "bodyContinuity": true,
+        "bodyActionCount": 2,
+        "successorActionStarted": true,
+        "cancellationCount": 0
+      },
+      "metrics": {
+        "preparationLeadMs": 192.01319999999942,
+        "usefulOverlapMs": 124.95869999999923,
+        "decisionGapMs": 1.4625000000005457,
+        "bodyActionDurationMs": 232.29979999999978
+      },
+      "timing": {
+        "startedAt": 5184.8669,
+        "finishedAt": 5435.0817,
+        "durationMs": 250.21479999999974
+      }
+    },
+    {
+      "arm": "optimized",
+      "pairingKey": "pair-6",
+      "repetition": 6,
+      "order": 1,
+      "provider": "controlled-synthetic",
+      "liveProvider": false,
+      "controller": "controlled-synthetic-explicit-successor",
+      "status": "passed",
+      "error": null,
+      "configured": {
+        "timeoutMs": 300,
+        "planningLeadMs": 200,
+        "actionDurationMs": 225
+      },
+      "outcome": {
+        "first": {
+          "state": "YIELDED",
+          "reasonCode": "PROGRAM_EXHAUSTED",
+          "actions": 1,
+          "receipts": 1
+        },
+        "successor": {
+          "state": "YIELDED",
+          "reasonCode": "PROGRAM_EXHAUSTED",
+          "actions": 1,
+          "receipts": 1
+        }
+      },
+      "observed": {
+        "nativeEventObserved": true,
+        "planningStatus": {
+          "programVersion": 1,
+          "engineState": "ACTIVE"
+        },
+        "planningDetails": {
+          "planningLeadMs": 200
+        },
+        "controllerFollowed": true,
+        "preparationTrigger": "native_event",
+        "successorStartedBy": "controlled-synthetic-controller",
+        "bodyActionStarted": true,
+        "bodyActionCompleted": true,
+        "bodyContinuity": true,
+        "bodyActionCount": 2,
+        "successorActionStarted": true,
+        "cancellationCount": 0
+      },
+      "metrics": {
+        "preparationLeadMs": 190.16690000000017,
+        "usefulOverlapMs": 127.22789999999986,
+        "decisionGapMs": 1.3845000000001164,
+        "bodyActionDurationMs": 236.71909999999934
+      },
+      "timing": {
+        "startedAt": 5435.1364,
+        "finishedAt": 5688.8261,
+        "durationMs": 253.6896999999999
+      }
+    },
+    {
+      "arm": "baseline",
+      "pairingKey": "pair-6",
+      "repetition": 6,
+      "order": 2,
+      "provider": "controlled-synthetic",
+      "liveProvider": false,
+      "controller": "controlled-synthetic-explicit-successor",
+      "status": "passed",
+      "error": null,
+      "configured": {
+        "timeoutMs": 300,
+        "planningLeadMs": 200,
+        "actionDurationMs": 225
+      },
+      "outcome": {
+        "first": {
+          "state": "YIELDED",
+          "reasonCode": "PROGRAM_EXHAUSTED",
+          "actions": 1,
+          "receipts": 1
+        },
+        "successor": {
+          "state": "YIELDED",
+          "reasonCode": "PROGRAM_EXHAUSTED",
+          "actions": 1,
+          "receipts": 1
+        }
+      },
+      "observed": {
+        "nativeEventObserved": false,
+        "planningStatus": null,
+        "planningDetails": null,
+        "controllerFollowed": true,
+        "preparationTrigger": "program_completion",
+        "successorStartedBy": "controlled-synthetic-controller",
+        "bodyActionStarted": true,
+        "bodyActionCompleted": true,
+        "bodyContinuity": false,
+        "bodyActionCount": 2,
+        "successorActionStarted": true,
+        "cancellationCount": 0
+      },
+      "metrics": {
+        "preparationLeadMs": null,
+        "usefulOverlapMs": null,
+        "decisionGapMs": 110.17109999999957,
+        "bodyActionDurationMs": 237.26760000000013
+      },
+      "timing": {
+        "startedAt": 5688.868,
+        "finishedAt": 6052.6482,
+        "durationMs": 363.78019999999924
+      }
+    }
+  ],
+  "summary": {
+    "byArm": {
+      "baseline": {
+        "trials": 6,
+        "passed": 6,
+        "nativeEventCount": 0,
+        "bodyContinuityCount": 0,
+        "controllerFollowCount": 6,
+        "metrics": {
+          "preparationLeadMs": {
+            "count": 0,
+            "missing": 6,
+            "min": null,
+            "p50": null,
+            "p95": null,
+            "max": null
+          },
+          "usefulOverlapMs": {
+            "count": 0,
+            "missing": 6,
+            "min": null,
+            "p50": null,
+            "p95": null,
+            "max": null
+          },
+          "decisionGapMs": {
+            "count": 6,
+            "missing": 0,
+            "min": 110.17109999999957,
+            "p50": 111.62930000000006,
+            "p95": 113.6886000000004,
+            "max": 113.6886000000004
+          },
+          "bodyActionDurationMs": {
+            "count": 6,
+            "missing": 0,
+            "min": 218.5019000000002,
+            "p50": 229.07570000000032,
+            "p95": 237.26760000000013,
+            "max": 237.26760000000013
+          }
+        }
+      },
+      "optimized": {
+        "trials": 6,
+        "passed": 6,
+        "nativeEventCount": 6,
+        "bodyContinuityCount": 6,
+        "controllerFollowCount": 6,
+        "metrics": {
+          "preparationLeadMs": {
+            "count": 6,
+            "missing": 0,
+            "min": 190.16690000000017,
+            "p50": 190.8125,
+            "p95": 193.0706,
+            "max": 193.0706
+          },
+          "usefulOverlapMs": {
+            "count": 6,
+            "missing": 0,
+            "min": 110.0621999999994,
+            "p50": 124.95869999999923,
+            "p95": 127.22789999999986,
+            "max": 127.22789999999986
+          },
+          "decisionGapMs": {
+            "count": 6,
+            "missing": 0,
+            "min": 1.3845000000001164,
+            "p50": 1.7371000000002823,
+            "p95": 5.469700000000103,
+            "max": 5.469700000000103
+          },
+          "bodyActionDurationMs": {
+            "count": 6,
+            "missing": 0,
+            "min": 216.46029999999973,
+            "p50": 232.29979999999978,
+            "p95": 236.71909999999934,
+            "max": 236.71909999999934
+          }
+        }
+      }
+    },
+    "pairedTrials": 6,
+    "counterbalancedOrders": [
+      {
+        "pairingKey": "pair-1",
+        "first": "baseline",
+        "second": "optimized"
+      },
+      {
+        "pairingKey": "pair-2",
+        "first": "optimized",
+        "second": "baseline"
+      },
+      {
+        "pairingKey": "pair-3",
+        "first": "baseline",
+        "second": "optimized"
+      },
+      {
+        "pairingKey": "pair-4",
+        "first": "optimized",
+        "second": "baseline"
+      },
+      {
+        "pairingKey": "pair-5",
+        "first": "baseline",
+        "second": "optimized"
+      },
+      {
+        "pairingKey": "pair-6",
+        "first": "optimized",
+        "second": "baseline"
+      }
+    ],
+    "pairedDeltaOptimizedMinusBaselineMs": {
+      "preparationLeadMs": {
+        "count": 0,
+        "missing": 6,
+        "min": null,
+        "p50": null,
+        "p95": null,
+        "max": null
+      },
+      "usefulOverlapMs": {
+        "count": 0,
+        "missing": 6,
+        "min": null,
+        "p50": null,
+        "p95": null,
+        "max": null
+      },
+      "decisionGapMs": {
+        "count": 6,
+        "missing": 0,
+        "min": -110.92149999999992,
+        "p50": -109.89649999999983,
+        "p95": -108.2189000000003,
+        "max": -108.2189000000003
+      },
+      "bodyActionDurationMs": {
+        "count": 6,
+        "missing": 0,
+        "min": -2.0416000000004715,
+        "p50": 0.09490000000005239,
+        "p95": 3.224099999999453,
+        "max": 3.224099999999453
+      }
+    },
+    "factualParity": {
+      "pairedOutcomeParityCount": 6,
+      "baselinePlanningEventAbsentCount": 6,
+      "optimizedPlanningEventObservedCount": 6
+    }
+  },
+  "collectedAt": "2026-09-21T09:49:55.276575+00:00"
+}

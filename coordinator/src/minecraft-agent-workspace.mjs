@@ -1,15 +1,23 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { chmod, mkdir, readFile, readdir, rename, rm, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
 const AGENTS_TEMPLATE = 'AGENTS.md';
 const SKILL_TEMPLATE = path.join('.codex', 'skills', 'minecraft-control', 'SKILL.md');
+const permissionsConfig = (workspaceRoot) => `[permissions.minecraft.filesystem]
+":root" = "deny"
+":minimal" = "read"
+${JSON.stringify(workspaceRoot)} = "read"
+
+[permissions.minecraft.network]
+enabled = false
+`;
 
 export class MinecraftAgentWorkspace {
 	#refresh = Promise.resolve();
 	#codexHomeSanitized = false;
-	#lastSyncedSourceAuth = undefined;
+	#lastSyncedSourceAuthHash = undefined;
 
 	constructor({ root, templateRoot }, dependencies = {}) {
 		if (typeof root !== 'string' || root.trim().length === 0) {
@@ -50,22 +58,29 @@ export class MinecraftAgentWorkspace {
 	}
 
 	async #prepare(sourceCodexHome) {
-		const skillRoot = path.join(this.root, '.codex', 'skills', 'minecraft-control');
+		const workspaceRoot = path.join(this.root, 'workspace');
+		const skillRoot = path.join(workspaceRoot, '.codex', 'skills', 'minecraft-control');
 		await this.fs.mkdir(skillRoot, { recursive: true });
 		await this.fs.mkdir(this.codexHome, { recursive: true });
 		await this.fs.chmod(this.codexHome, 0o700);
 		if (!this.#codexHomeSanitized) {
 			await this.#wipeNonAuthFiles();
+			const savedHash = (await this.#readOptionalAuth(path.join(this.root, '.auth-source.sha256')))?.trim();
+			this.#lastSyncedSourceAuthHash = savedHash === 'missing' ? null : /^[a-f0-9]{64}$/.test(savedHash ?? '') ? savedHash : undefined;
 			this.#codexHomeSanitized = true;
 		}
 		await this.#syncAuth(sourceCodexHome);
+		await this.#replaceContent(permissionsConfig(workspaceRoot), path.join(this.codexHome, 'config.toml'), 0o600);
 		const instructions = await this.#readTemplate(AGENTS_TEMPLATE);
-		await this.#replace(AGENTS_TEMPLATE, path.join(this.root, AGENTS_TEMPLATE), instructions);
-		await this.#replace(SKILL_TEMPLATE, path.join(skillRoot, 'SKILL.md'));
+		const skillInstructions = await this.#readTemplate(SKILL_TEMPLATE);
+		await this.#replace(AGENTS_TEMPLATE, path.join(workspaceRoot, AGENTS_TEMPLATE), instructions);
+		await this.#replace(SKILL_TEMPLATE, path.join(skillRoot, 'SKILL.md'), skillInstructions);
 		return {
-			cwd: this.root,
+			cwd: workspaceRoot,
 			codexHome: this.codexHome,
+			permissionProfile: 'minecraft',
 			instructions,
+			skillInstructions,
 			selectedCapabilityRoots: [{
 				id: 'minecraft-control',
 				location: { type: 'environment', environmentId: 'local', path: skillRoot },
@@ -92,26 +107,37 @@ export class MinecraftAgentWorkspace {
 		const destination = path.join(this.codexHome, 'auth.json');
 		const source = path.resolve(sourceCodexHome);
 		if (source === path.resolve(this.codexHome)) {
-			this.#lastSyncedSourceAuth = await this.#readOptionalAuth(destination);
+			this.#lastSyncedSourceAuthHash = authHash(await this.#readOptionalAuth(destination));
 			return;
 		}
 		const sourceContent = await this.#readOptionalAuth(path.join(source, 'auth.json'));
 		const isolatedContent = await this.#readOptionalAuth(destination);
+		const sourceHash = authHash(sourceContent);
+		const isolatedHash = authHash(isolatedContent);
 		if (isolatedContent == null) {
-			if (sourceContent != null) await this.#replaceContent(sourceContent, destination, 0o600);
-			this.#lastSyncedSourceAuth = sourceContent;
+			if (sourceContent != null) {
+				await this.#replaceContent(sourceContent, destination, 0o600);
+				await this.#rememberSourceAuthHash(sourceHash);
+			}
 			return;
 		}
+		// An older installation has no baseline. Preserve any independently refreshed auth.
+		if (this.#lastSyncedSourceAuthHash === undefined) return this.#rememberSourceAuthHash(sourceHash);
 		if (sourceContent == null) {
-			if (isolatedContent === this.#lastSyncedSourceAuth) await this.fs.rm(destination, { force: true });
-			this.#lastSyncedSourceAuth = null;
+			if (isolatedHash === this.#lastSyncedSourceAuthHash) await this.fs.rm(destination, { force: true });
+			await this.#rememberSourceAuthHash(null);
 			return;
 		}
-		if (sourceContent === this.#lastSyncedSourceAuth) return;
-		if (this.#lastSyncedSourceAuth === undefined || isolatedContent === this.#lastSyncedSourceAuth) {
+		if (sourceHash === this.#lastSyncedSourceAuthHash) return;
+		if (isolatedHash === this.#lastSyncedSourceAuthHash) {
 			await this.#replaceContent(sourceContent, destination, 0o600);
-			this.#lastSyncedSourceAuth = sourceContent;
+			await this.#rememberSourceAuthHash(sourceHash);
 		}
+	}
+
+	async #rememberSourceAuthHash(hash) {
+		await this.#replaceContent(`${hash ?? 'missing'}\n`, path.join(this.root, '.auth-source.sha256'), 0o600);
+		this.#lastSyncedSourceAuthHash = hash;
 	}
 
 	async #readTemplate(template) {
@@ -149,4 +175,8 @@ export class MinecraftAgentWorkspace {
 			if (!replaced) await this.fs.unlink(temporary).catch(() => {});
 		}
 	}
+}
+
+function authHash(content) {
+	return content === null ? null : createHash('sha256').update(content).digest('hex');
 }

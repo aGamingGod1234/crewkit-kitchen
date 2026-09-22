@@ -45,6 +45,7 @@ export function createInterpreterFacts(observation = {}, previousFacts = null) {
 	const previous = INTERPRETER_FACTS.has(previousFacts) ? previousFacts : null;
 	const source = ownDataRecord(observation, 'observation');
 	const playerSource = ownDataRecord(source.player ?? Object.create(null), 'observation.player');
+	if (Object.hasOwn(source, 'velocity')) playerSource.velocity = source.velocity;
 	const frozenPlayer = reuseEqual(previous?.player, copyFactData(playerSource, 'observation.player'));
 	const inventorySource = ownDataRecord(source.inventory ?? Object.create(null), 'observation.inventory');
 	const tagCounts = Object.create(null);
@@ -57,7 +58,7 @@ export function createInterpreterFacts(observation = {}, previousFacts = null) {
 	const inventoryItems = reuseEqual(previous?.inventory.items, copyInventory(inventorySource.items));
 	const inventoryTagCounts = reuseEqual(previous?.inventory.tagCounts, freezeRecord(tagCounts));
 	const worldSource = ownDataRecord(source.world ?? Object.create(null), 'observation.world');
-	for (const key of ['coverage', 'observedAtEpochMs', 'worldTick', 'interaction', 'recipes', 'events', 'perception', 'dimension', 'capabilities']) {
+	for (const key of ['coverage', 'observedAtEpochMs', 'worldTick', 'interaction', 'recipes', 'events', 'perception', 'dimension', 'capabilities', 'landmarks', 'nearbyContainers']) {
 		if (Object.hasOwn(source, key)) worldSource[key] = source[key];
 	}
 	const worldState = reuseEqual(previous?.world.state, copyFactData(worldSource, 'observation.world'));

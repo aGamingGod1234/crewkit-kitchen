@@ -1,0 +1,253 @@
+{
+  "method": "Replay the first eight fresh camera-sweep inspection samples from the recorded live trial through NativeToolRuntime.lookAround. Bridge action completions are simulated; observation data are recorded Minecraft facts. This measures information retention and bytes, not gameplay latency.",
+  "beforeBaseCommit": "62dfb9af18c916058b820409065bc51ad39caaea",
+  "samples": [
+    {
+      "mode": "before",
+      "sourceTrial": "run-1789982891474-68388254",
+      "replay": "actual first eight fresh inspection samples through the runtime camera sweep",
+      "recordedHeadings": [
+        45,
+        90,
+        135,
+        180,
+        -135,
+        -90,
+        -45,
+        0
+      ],
+      "recordedHeading": 135,
+      "recordedAtEpochMs": 1789982934921,
+      "sourceSha256": "178801b51bc676cb5371e8feaba9c780ef611868a961968e586e40655d26faf3",
+      "inputLandmarkCount": 18,
+      "inputTreeIndex": 9,
+      "inputTreeCount": 1,
+      "sample": {
+        "historical": true,
+        "yaw": 135,
+        "pitch": 0,
+        "eventSequence": 3,
+        "observedAtEpochMs": 1789982934921,
+        "dimension": "minecraft:overworld",
+        "entities": [
+          {
+            "stableId": "1c5cedc7-7b3e-4536-a691-c7255c566f61",
+            "type": "minecraft:pig",
+            "x": -85.82941737475821,
+            "y": 86,
+            "z": -11.170420101863076,
+            "distance": 87.20645904541016
+          },
+          {
+            "stableId": "f857c651-3dbd-4a3a-a4b3-6e49940651f9",
+            "type": "minecraft:pig",
+            "x": -91.49927278228819,
+            "y": 86,
+            "z": -7.290515689937723,
+            "distance": 92.41514587402344
+          },
+          {
+            "stableId": "d909a891-5999-4e3b-b355-a2761754ca9c",
+            "type": "minecraft:pig",
+            "x": -93,
+            "y": 86,
+            "z": -7,
+            "distance": 93.88556671142578
+          },
+          {
+            "stableId": "b03c7c64-5f6f-4af5-b044-73d98554733f",
+            "type": "minecraft:pig",
+            "x": -94.21852791911056,
+            "y": 85,
+            "z": -0.7285307984252363,
+            "distance": 94.85836791992188
+          }
+        ],
+        "blocks": [
+          {
+            "stableId": "1,90,0",
+            "blockId": "minecraft:short_grass",
+            "x": 1,
+            "y": 90,
+            "z": 0
+          },
+          {
+            "stableId": "-1,89,0",
+            "blockId": "minecraft:grass_block",
+            "x": -1,
+            "y": 89,
+            "z": 0
+          },
+          {
+            "stableId": "-1,89,-1",
+            "blockId": "minecraft:short_grass",
+            "x": -1,
+            "y": 89,
+            "z": -1
+          },
+          {
+            "stableId": "-1,88,-1",
+            "blockId": "minecraft:grass_block",
+            "x": -1,
+            "y": 88,
+            "z": -1
+          },
+          {
+            "stableId": "0,88,-2",
+            "blockId": "minecraft:grass_block",
+            "x": 0,
+            "y": 88,
+            "z": -2
+          },
+          {
+            "stableId": "-2,88,-1",
+            "blockId": "minecraft:grass_block",
+            "x": -2,
+            "y": 88,
+            "z": -1
+          },
+          {
+            "stableId": "-1,88,-2",
+            "blockId": "minecraft:grass_block",
+            "x": -1,
+            "y": 88,
+            "z": -2
+          }
+        ],
+        "items": [],
+        "landmarks": [],
+        "omitted": {
+          "entities": 0,
+          "blocks": 9,
+          "items": 0,
+          "landmarks": 18
+        }
+      },
+      "retainedTreeCount": 0,
+      "sampleBytes": 1380,
+      "serializedResultBytes": 11791
+    },
+    {
+      "mode": "after",
+      "sourceTrial": "run-1789982891474-68388254",
+      "replay": "actual first eight fresh inspection samples through the runtime camera sweep",
+      "recordedHeadings": [
+        45,
+        90,
+        135,
+        180,
+        -135,
+        -90,
+        -45,
+        0
+      ],
+      "recordedHeading": 135,
+      "recordedAtEpochMs": 1789982934921,
+      "sourceSha256": "b1ddd20d5659148bc61025445307b47de97caa8b5e2848307eabbaebeb72b384",
+      "inputLandmarkCount": 18,
+      "inputTreeIndex": 9,
+      "inputTreeCount": 1,
+      "sample": {
+        "historical": true,
+        "yaw": 135,
+        "pitch": 0,
+        "eventSequence": 3,
+        "observedAtEpochMs": 1789982934921,
+        "dimension": "minecraft:overworld",
+        "entities": [
+          {
+            "stableId": "1c5cedc7-7b3e-4536-a691-c7255c566f61",
+            "type": "minecraft:pig",
+            "x": -85.82941737475821,
+            "y": 86,
+            "z": -11.170420101863076,
+            "distance": 87.20645904541016
+          },
+          {
+            "stableId": "f857c651-3dbd-4a3a-a4b3-6e49940651f9",
+            "type": "minecraft:pig",
+            "x": -91.49927278228819,
+            "y": 86,
+            "z": -7.290515689937723,
+            "distance": 92.41514587402344
+          },
+          {
+            "stableId": "d909a891-5999-4e3b-b355-a2761754ca9c",
+            "type": "minecraft:pig",
+            "x": -93,
+            "y": 86,
+            "z": -7,
+            "distance": 93.88556671142578
+          }
+        ],
+        "blocks": [
+          {
+            "stableId": "1,90,0",
+            "blockId": "minecraft:short_grass",
+            "x": 1,
+            "y": 90,
+            "z": 0
+          },
+          {
+            "stableId": "-1,89,0",
+            "blockId": "minecraft:grass_block",
+            "x": -1,
+            "y": 89,
+            "z": 0
+          },
+          {
+            "stableId": "-1,89,-1",
+            "blockId": "minecraft:short_grass",
+            "x": -1,
+            "y": 89,
+            "z": -1
+          }
+        ],
+        "items": [],
+        "landmarks": [
+          {
+            "stableId": "-9,88,0",
+            "blockId": "minecraft:grass_block",
+            "x": -9,
+            "y": 88,
+            "z": 0,
+            "distance": 9.12414379544733
+          },
+          {
+            "stableId": "-56,101,-43",
+            "blockId": "minecraft:oak_leaves",
+            "x": -56,
+            "y": 101,
+            "z": -43,
+            "distance": 71.53495648981692
+          },
+          {
+            "stableId": "-80,103,-36",
+            "blockId": "minecraft:dirt",
+            "x": -80,
+            "y": 103,
+            "z": -36,
+            "distance": 88.75950653310326
+          },
+          {
+            "stableId": "-10,88,-2",
+            "blockId": "minecraft:grass_block",
+            "x": -10,
+            "y": 88,
+            "z": -2,
+            "distance": 10.307764064044152
+          }
+        ],
+        "omitted": {
+          "entities": 1,
+          "blocks": 13,
+          "items": 0,
+          "landmarks": 14
+        }
+      },
+      "retainedTreeCount": 1,
+      "sampleBytes": 1344,
+      "serializedResultBytes": 11706
+    }
+  ]
+}

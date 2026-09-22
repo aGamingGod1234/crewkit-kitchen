@@ -14,6 +14,15 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 /** Records the authoritative world mutation produced by this player's break handler. */
 @Mixin(ServerPlayerGameMode.class)
 abstract class ServerPlayerGameModeMixin {
+	@com.llamalad7.mixinextras.injector.wrapmethod.WrapMethod(method = "useItemOn")
+	private net.minecraft.world.InteractionResult arenaagents$attributeBlockUse(
+			ServerPlayer actor, net.minecraft.world.level.Level level, net.minecraft.world.item.ItemStack stack,
+			net.minecraft.world.InteractionHand hand, net.minecraft.world.phys.BlockHitResult hit,
+			com.llamalad7.mixinextras.injector.wrapoperation.Operation<net.minecraft.world.InteractionResult> original) {
+		return dev.agaminggod.arenaagents.server.runtime.BlockUseAttribution.during(actor,
+				() -> original.call(actor, level, stack, hand, hit));
+	}
+
 	@Shadow
 	@Final
 	protected ServerPlayer player;

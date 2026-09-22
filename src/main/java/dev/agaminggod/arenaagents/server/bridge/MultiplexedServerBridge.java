@@ -1328,7 +1328,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		if ("item".equals(section)) allowed.add("slot");
 		if ("block".equals(section)) allowed.addAll(Set.of("x", "y", "z"));
 		if ("events".equals(section)) allowed.add("afterSequence");
-		if ("recipes".equals(section)) allowed.add("recipeId");
+		if ("recipes".equals(section)) allowed.addAll(Set.of("recipeId", "outputItemId"));
+		if ("entities".equals(section)) allowed.add("entityType");
 		if (!allowed.containsAll(query.keySet())) throw new AgentDomainException("INVALID_INSPECTION", "Unexpected field for inspection section");
 		JsonObject result = query.deepCopy();
 		if (!result.has("offset")) result.addProperty("offset", 0);
@@ -1342,11 +1343,12 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			inspectionInteger(result, "z", -30_000_000, 30_000_000);
 		}
 		if (result.has("afterSequence")) inspectionInteger(result, "afterSequence", -1, ActionProvenance.MAX_SAFE_INTEGER);
-		if (result.has("recipeId")) {
-			JsonElement recipe = result.get("recipeId");
+		if (result.has("recipeId") && result.has("outputItemId")) throw new AgentDomainException("INVALID_INSPECTION", "Use recipeId or outputItemId, not both");
+		for (String field : List.of("recipeId", "outputItemId", "entityType")) if (result.has(field)) {
+			JsonElement recipe = result.get(field);
 			if (!recipe.isJsonPrimitive() || !recipe.getAsJsonPrimitive().isString() || recipe.getAsString().length() > 256
 					|| !recipe.getAsString().matches("[a-z0-9_.-]+:[a-z0-9_./-]+")) {
-				throw new AgentDomainException("INVALID_INSPECTION", "recipeId must be a namespaced recipe id");
+				throw new AgentDomainException("INVALID_INSPECTION", field + " must be a namespaced identifier");
 			}
 		}
 		return result;
@@ -2816,7 +2818,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		if (transition.after().state() == AgentLifecycleState.DISCONNECTED) return "disconnect";
 		if ((transition.before().state() == AgentLifecycleState.PAUSED
 				|| transition.before().state() == AgentLifecycleState.DISCONNECTED)
-				&& transition.after().state() == AgentLifecycleState.STARTING) return "resume";
+				&& transition.after().state() == AgentLifecycleState.STARTING
+				&& transition.before().currentGoal().isPresent() && transition.after().currentGoal().isPresent()
+				&& transition.before().currentGoal().get().goalId().equals(transition.after().currentGoal().get().goalId())) return "resume";
 		if (transition.after().state() != AgentLifecycleState.STARTING) return null;
 		if (transition.before().currentGoal().isPresent() && transition.after().currentGoal().isPresent()
 				&& transition.before().currentGoal().get().goalId().equals(transition.after().currentGoal().get().goalId())) {

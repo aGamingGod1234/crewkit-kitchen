@@ -9,6 +9,10 @@ const record = {
 	goalRevision: 4,
 };
 
+function payloadOf(input) {
+	return JSON.parse(input.slice(input.indexOf('\n') + 1));
+}
+
 test('native death input keeps last live inventory, recovery, and empty current items', () => {
 	const input = buildNativeEventInput(record, {
 		event: 'player_death',
@@ -30,7 +34,7 @@ test('native death input keeps last live inventory, recovery, and empty current 
 			world: { dimension: 'minecraft:overworld' },
 		},
 	});
-	assert.match(input, /smallest useful tool now/i);
+	assert.match(input, /advance the current goal using fresh facts/i);
 	assert.match(input, /"phase":"dead"/);
 	assert.match(input, /lastLostInventory/);
 	assert.match(input, /minecraft:stone_pickaxe/);
@@ -54,12 +58,50 @@ test('oversized native event input keeps death recovery instead of dropping it',
 			},
 			failureClass: 'recover',
 			world: { dimension: 'minecraft:overworld', extra: 'n'.repeat(20_000) },
-			blocks: Array.from({ length: 200 }, (_, index) => ({ blockId: 'minecraft:stone', x: index, y: 64, z: 0 })),
+			blocks: [...Array.from({ length: 200 }, (_, index) => ({ blockId: 'minecraft:stone', x: index, y: 64, z: 0 })), { blockId: 'minecraft:lava', x: 400, y: 64, z: 0 }],
 			continuity: { sameGoal: true, phase: 'dead' },
 		},
+		conversation: Array.from({ length: 12 }, (_, sequence) => ({ sequence: sequence + 1, text: `event-${sequence + 1}` })),
 	});
+	const payload = payloadOf(input);
 	assert.match(input, /lastDeath/);
 	assert.match(input, /iron_pickaxe/);
 	assert.match(input, /"phase":"dead"/);
+	assert.ok(payload.observation.blocks.some(({ blockId }) => blockId === 'minecraft:lava'));
+	assert.equal(payload.observation.resultCoverage.blocks.availableInSnapshot, 201);
+	assert.equal(payload.observation.resultCoverage.blocks.omitted, 189);
+	assert.equal(payload.observation.resultCoverage.inventory.omitted, 48);
+	assert.equal(payload.conversation.entries.at(-1).sequence, 12);
+	assert.equal(payload.conversation.omittedEntries, 4);
 	assert.ok(Buffer.byteLength(input, 'utf8') <= 20_000);
+});
+
+test('planning due input carries timing and version while keeping the current routine advisory', () => {
+	const input = buildNativeEventInput(record, {
+		event: 'program_planning_due',
+		programId: 'program-1',
+		planningLeadMs: 2_000,
+		status: { state: 'RUNNING', engineState: 'ACTIVE', programVersion: 7, deadlineEpochMs: 9_000 },
+		observation: {
+			observedAtEpochMs: 8_000,
+			coverage: { complete: false, sections: { blocks: { returned: 1, total: 40, omittedByWire: 39 } } },
+			player: { x: 4, y: 65, z: -2 },
+			blocks: [{ blockId: 'minecraft:lava', x: 4, y: 64, z: -2 }],
+			currentAction: { type: 'move_to', state: 'RUNNING' },
+		},
+	});
+	const payload = payloadOf(input);
+	assert.match(input, /prepare the next intention while the current authorised routine keeps running/i);
+	assert.match(input, /does not require a pending decisionId/i);
+	assert.equal(payload.event, 'program_planning_due');
+	assert.equal(payload.trigger, 'program_planning_due');
+	assert.deepEqual(payload.program, {
+		programId: 'program-1', state: 'RUNNING', engineState: 'ACTIVE', programVersion: 7,
+		deadlineEpochMs: 9_000, planningLeadMs: 2_000,
+	});
+	assert.equal(payload.observation.observedAtEpochMs, 8_000);
+	assert.equal(payload.observation.coverage.sections.blocks.omittedByWire, 39);
+	assert.equal(payload.observation.blocks[0].blockId, 'minecraft:lava');
+	assert.equal(payload.observation.currentAction.state, 'RUNNING');
+	assert.equal(Object.hasOwn(payload.program, 'decision'), false);
 });

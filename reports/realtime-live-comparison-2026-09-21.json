@@ -1,0 +1,264 @@
+{
+  "version": 1,
+  "status": "COMPLETED",
+  "startedAt": "2026-09-21T09:21:03.246043+00:00",
+  "order": [
+    "before",
+    "after",
+    "after",
+    "before"
+  ],
+  "matrix": {
+    "version": 1,
+    "scenarios": [
+      {
+        "id": "continuous-routine-development",
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "reasoningEffort": "low",
+        "serviceTier": "priority",
+        "task": "Collect 8 oak logs with a reusable background runProgram routine saved in your notebook. Read programReference before authoring the routine.",
+        "timeoutMs": 360000,
+        "rosterSize": 1,
+        "requireFactualSuccess": true,
+        "world": {
+          "mode": "natural",
+          "seed": "20260920",
+          "difficulty": "normal",
+          "gameMode": "survival"
+        },
+        "assert": [
+          {
+            "type": "lifecycle",
+            "state": "COMPLETED"
+          },
+          {
+            "type": "rcon",
+            "command": "data get entity {agent} Inventory",
+            "match": "minecraft:oak_log"
+          },
+          {
+            "type": "rcon",
+            "command": "data get entity {agent} Inventory",
+            "match": "count: 8"
+          }
+        ]
+      }
+    ]
+  },
+  "matrixSha256": "759cc4c5ba1196d9cb9fc75079175ce38b0ff7144c8ca261d8d9ffeba287d9bc",
+  "measurementSourceSha256": "c3c5f59798c926ee83cf687a9597c403e87a7e9a57c8eb01ea800fd190cbf802",
+  "measurementNotes": "Identical corrected headless-matrix.mjs overlays the baseline measurement runner only; agent runtime and baseline JAR remain at the recorded revision. Gameplay budget unchanged; bounded stopped-agent evidence capture is reported separately.",
+  "arms": {
+    "before": {
+      "commit": "47c83ca8bed4df8f5e36f2ec70098e021408536e",
+      "jarSha256": "7601d90d5af632f8b04b7555efae4a7077f83a034659c33e6831d0923f2eaa09",
+      "runtimeSourceSha256": "868b4cd813d6d14f69c008105fea514c01155dbbcf67e269482877dff9db17a7"
+    },
+    "after": {
+      "commit": "e4e1c94f84dd6615409b0c2f525eda07aff00e13",
+      "jarSha256": "4a01a4912ab901a768b461ba15757f727db6ea7c17d7730f7e727115c374cb24",
+      "runtimeSourceSha256": "05537c5a7e4f1e0a0aa749ac3f08eb8dac2a0486c2a574625e151689348f9107"
+    }
+  },
+  "finishedAt": "2026-09-21T09:47:37.936087+00:00",
+  "trials": [
+    {
+      "index": 1,
+      "arm": "before",
+      "status": "FAILED",
+      "classification": "TIMEOUT",
+      "runIds": [
+        "run-1789982472838-c3cc4f26"
+      ],
+      "scenarioElapsedMs": 360008,
+      "wrapperElapsedMs": 419891,
+      "lifecycleCompleted": false,
+      "finalOakLogs": 0,
+      "inventoryTargetMet": false,
+      "inventoryReads": [
+        "Agent inventory: [{count: 1, Slot: 0b, id: \"minecraft:dirt\"}]"
+      ],
+      "postRunEvidence": {
+        "snapshot": "post_stop",
+        "status": "STOPPED",
+        "delayMs": 12
+      },
+      "cleanupStatus": "CLEAN",
+      "configuredProfileVerified": true,
+      "effectiveProviderSettings": null,
+      "nativeModelWait": null,
+      "tokenUsage": {
+        "input": null,
+        "output": null,
+        "reasoning": null,
+        "cached": null,
+        "cacheWrite": null
+      }
+    },
+    {
+      "index": 2,
+      "arm": "after",
+      "status": "FAILED",
+      "classification": "TIMEOUT",
+      "runIds": [
+        "run-1789982891474-68388254"
+      ],
+      "scenarioElapsedMs": 360011,
+      "wrapperElapsedMs": 393359,
+      "lifecycleCompleted": false,
+      "finalOakLogs": 4,
+      "inventoryTargetMet": false,
+      "inventoryReads": [
+        "Agent inventory: [{count: 3, Slot: 0b, id: \"minecraft:oak_sapling\"}, {count: 4, Slot: 1b, id: \"minecraft:oak_log\"}, {count: 4, Slot: 2b, id: \"minecraft:stick\"}]"
+      ],
+      "postRunEvidence": {
+        "snapshot": "post_stop",
+        "status": "STOPPED",
+        "delayMs": 18
+      },
+      "cleanupStatus": "CLEAN",
+      "configuredProfileVerified": true,
+      "effectiveProviderSettings": null,
+      "nativeModelWait": {
+        "agentId": "33b55ed9-1d00-44e3-8e4f-e899213bd5a2",
+        "profile": {
+          "provider": "codex",
+          "model": "gpt-5.6-sol",
+          "reasoningEffort": "low",
+          "serviceTier": "priority"
+        },
+        "count": 32,
+        "p50": 2819,
+        "p95": 11560,
+        "p99": null,
+        "sampleWindowSize": 64,
+        "lifetimeCount": 32,
+        "lifetimeSegmentCount": 32,
+        "failedSegmentCount": 0,
+        "cancelledSegmentCount": 0
+      },
+      "tokenUsage": {
+        "input": null,
+        "output": null,
+        "reasoning": null,
+        "cached": null,
+        "cacheWrite": null
+      }
+    },
+    {
+      "index": 3,
+      "arm": "after",
+      "status": "FAILED",
+      "classification": "TIMEOUT",
+      "runIds": [
+        "run-1789983284548-b25237a7"
+      ],
+      "scenarioElapsedMs": 360010,
+      "wrapperElapsedMs": 387094,
+      "lifecycleCompleted": false,
+      "finalOakLogs": 0,
+      "inventoryTargetMet": false,
+      "inventoryReads": [
+        "Agent inventory: []"
+      ],
+      "postRunEvidence": {
+        "snapshot": "post_stop",
+        "status": "STOPPED",
+        "delayMs": 14
+      },
+      "cleanupStatus": "CLEAN",
+      "configuredProfileVerified": true,
+      "effectiveProviderSettings": null,
+      "nativeModelWait": {
+        "agentId": "fb37faa0-3ef7-462c-8c26-45afb7a2331f",
+        "profile": {
+          "provider": "codex",
+          "model": "gpt-5.6-sol",
+          "reasoningEffort": "low",
+          "serviceTier": "priority"
+        },
+        "count": 18,
+        "p50": 2761,
+        "p95": 8600,
+        "p99": null,
+        "sampleWindowSize": 64,
+        "lifetimeCount": 18,
+        "lifetimeSegmentCount": 18,
+        "failedSegmentCount": 0,
+        "cancelledSegmentCount": 0
+      },
+      "tokenUsage": {
+        "input": null,
+        "output": null,
+        "reasoning": null,
+        "cached": null,
+        "cacheWrite": null
+      }
+    },
+    {
+      "index": 4,
+      "arm": "before",
+      "status": "FAILED",
+      "classification": "TIMEOUT",
+      "runIds": [
+        "run-1789983671628-eb82d749"
+      ],
+      "scenarioElapsedMs": 360010,
+      "wrapperElapsedMs": 387891,
+      "lifecycleCompleted": false,
+      "finalOakLogs": 2,
+      "inventoryTargetMet": false,
+      "inventoryReads": [
+        "Agent inventory: [{count: 2, Slot: 0b, id: \"minecraft:oak_log\"}]"
+      ],
+      "postRunEvidence": {
+        "snapshot": "post_stop",
+        "status": "STOPPED",
+        "delayMs": 14
+      },
+      "cleanupStatus": "CLEAN",
+      "configuredProfileVerified": true,
+      "effectiveProviderSettings": null,
+      "nativeModelWait": null,
+      "tokenUsage": {
+        "input": null,
+        "output": null,
+        "reasoning": null,
+        "cached": null,
+        "cacheWrite": null
+      }
+    }
+  ],
+  "summary": {
+    "before": {
+      "trials": 2,
+      "lifecycleCompleted": 0,
+      "inventoryTargetMet": 0,
+      "unknownFinalInventory": 0,
+      "finalOakLogs": [
+        0,
+        2
+      ],
+      "timeouts": 2
+    },
+    "after": {
+      "trials": 2,
+      "lifecycleCompleted": 0,
+      "inventoryTargetMet": 0,
+      "unknownFinalInventory": 0,
+      "finalOakLogs": [
+        4,
+        0
+      ],
+      "timeouts": 2
+    }
+  },
+  "limitations": [
+    "Two trials per arm are exploratory, not a reliable population estimate.",
+    "Timeout durations are censored outcomes, not successful completion latency.",
+    "Inventory is a post-stop snapshot; stop delay is reported separately.",
+    "Baseline provider-wait timing was unavailable; whole native-turn duration is not substituted.",
+    "No speed or cost claim follows from the controlled benchmark or these live samples alone."
+  ]
+}

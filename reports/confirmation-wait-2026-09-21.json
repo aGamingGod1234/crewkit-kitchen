@@ -1,0 +1,69 @@
+{
+  "runId": "run-1789995922749-61a53456",
+  "scenario": "operator-confirmation-idle",
+  "scenarioBudgetMs": 60000,
+  "status": "FAILED",
+  "classification": "TIMEOUT",
+  "elapsedMs": 60009,
+  "expectedOutcome": "Remain incomplete awaiting operator confirmation; no automatic model continuation or physical work. Matrix completion assertion therefore intentionally remains unsatisfied.",
+  "completionFacts": [
+    {
+      "type": "operator_confirmed",
+      "satisfied": false,
+      "expectedValue": "operator confirmation",
+      "observedValue": "not confirmed"
+    }
+  ],
+  "completedModelTurns": 1,
+  "zeroToolTurns": 0,
+  "actionTypes": [],
+  "postConfirmationObservedWindowMs": 48396,
+  "cleanupStatus": "CLEAN",
+  "postRunEvidence": {
+    "snapshot": "post_stop",
+    "status": "STOPPED",
+    "delayMs": 12
+  },
+  "configuredProfileVerified": true,
+  "matrix": {
+    "version": 1,
+    "scenarios": [
+      {
+        "id": "operator-confirmation-idle",
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "reasoningEffort": "low",
+        "serviceTier": "priority",
+        "task": "This task requires only operator confirmation. Request finish verification once, report that you are waiting if confirmation is still required, and wait for operator confirmation without taking physical actions.",
+        "timeoutMs": 60000,
+        "rosterSize": 1,
+        "requireFactualSuccess": true,
+        "world": {
+          "mode": "natural",
+          "seed": "20260920",
+          "difficulty": "normal",
+          "gameMode": "survival"
+        },
+        "assert": [
+          {
+            "type": "lifecycle",
+            "state": "COMPLETED"
+          },
+          {
+            "type": "rcon",
+            "command": "data get entity {agent} Inventory",
+            "match": "[]"
+          }
+        ]
+      }
+    ]
+  },
+  "finalJarSha256": "f85791af22caf68755e1d2be03d8e4810c6cf4f11ae6e436880e797e1786bfdb",
+  "coordinatorSourceSha256": "61decb6b3146364125a20e0a937d1811012b11bd553f33159d62137885b2d575",
+  "regression": {
+    "beforeModelTurns": 7,
+    "afterModelTurns": 1,
+    "urgentInputDelivered": true,
+    "newGoalSchedules": true
+  }
+}

@@ -152,6 +152,7 @@ public final class VerificationMain {
 		passedAssertions += GoalDraftAdvancementRevalidationVerification.verify();
 		passedAssertions += QueuedGoalRevalidationVerification.verify();
 		passedAssertions += AgentSavedDataGoalDraftVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.PendingDragonKillVerification.verify();
 		passedAssertions += GoalCompilerVerification.verify();
 		passedAssertions += GoalInventoryCapacityVerification.verify();
 		passedAssertions += AgentConversationRouterVerification.verify();

@@ -3,6 +3,8 @@ package dev.agaminggod.arenaagents.server.runtime.controller;
 import java.util.ArrayList;
 import java.util.List;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
 
 public final class ItemPickupProgressVerification {
 	private ItemPickupProgressVerification() {
@@ -42,7 +44,25 @@ public final class ItemPickupProgressVerification {
 		), "moving-item replanning installs the replacement controller");
 		assertEquals(List.of("released", "created"), lifecycle,
 				"moving-item replanning releases the old navigation lease before replacement");
-		return 10;
+		var unsupported = ServerController.TickResult.failed("NO_STANDABLE_PATH", "No standing position", 0.0D);
+		assertTrue(ServerItemPickupController.awaitingDropLanding(unsupported, false, false, false),
+				"an airborne mining drop can land before its pickup deadline");
+		assertTrue(!ServerItemPickupController.awaitingDropLanding(unsupported, true, false, false),
+				"a grounded unreachable drop remains a real navigation failure");
+		assertTrue(!ServerItemPickupController.awaitingDropLanding(unsupported, false, true, false),
+				"a gravity-free target cannot recover by landing");
+		assertTrue(!ServerItemPickupController.awaitingDropLanding(unsupported, false, false, true),
+				"a floating target must not be treated as falling to ground");
+		assertTrue(!ServerItemPickupController.awaitingDropLanding(
+				ServerController.TickResult.failed("NO_PATH", "Blocked", 0.0D), false, false, false),
+				"other route failures remain visible to the agent");
+		AABB standing = ServerItemPickupController.pickupStandingRegion(
+				new AABB(0.2D, 64.0D, 0.2D, 0.8D, 65.8D, 0.8D), new Vec3(0.5D, 64.0D, 0.5D),
+				new AABB(3.375D, 65.0D, 0.375D, 3.625D, 65.25D, 0.625D));
+		assertTrue(standing.contains(2.5D, 64.0D, 0.5D), "a player beside a drop under a canopy can collect it");
+		assertTrue(!standing.contains(0.5D, 64.0D, 0.5D), "distant feet positions are outside vanilla pickup reach");
+		assertTrue(!standing.contains(3.5D, 61.0D, 0.5D), "horizontal proximity alone does not reach an elevated drop");
+		return 18;
 	}
 
 	private static void assertTrue(boolean condition, String message) {

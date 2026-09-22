@@ -32,6 +32,8 @@ public final class ServerRangedUseController implements ServerTransactionAdapter
 	private final long drawDurationMs;
 	private final long timeoutMs;
 	private final int entityIdBaseline;
+	private final net.minecraft.world.phys.Vec3 aimPoint;
+	private final boolean trackTarget;
 	private final ServerTransactionAdapter.TerminalGate terminal = new ServerTransactionAdapter.TerminalGate();
 	private final ServerTransactionAdapter.ConfirmedUseTimer useTimer = new ServerTransactionAdapter.ConfirmedUseTimer();
 	private UseConfirmation useConfirmation = UseConfirmation.initial();
@@ -64,6 +66,10 @@ public final class ServerRangedUseController implements ServerTransactionAdapter
 		this.drawDurationMs = arguments.get("drawDurationMs").getAsLong();
 		this.timeoutMs = arguments.get("timeoutMs").getAsLong();
 		this.entityIdBaseline = globalEntityIdBaseline(player.level());
+		this.trackTarget = arguments.has("trackTarget") && arguments.get("trackTarget").getAsBoolean();
+		this.aimPoint = arguments.has("aimX") ? new net.minecraft.world.phys.Vec3(
+				arguments.get("aimX").getAsDouble(), arguments.get("aimY").getAsDouble(), arguments.get("aimZ").getAsDouble())
+				: target instanceof net.minecraft.world.entity.boss.enderdragon.EnderDragonPart ? target.getBoundingBox().getCenter() : target.getEyePosition();
 	}
 
 	@Override
@@ -79,8 +85,10 @@ public final class ServerRangedUseController implements ServerTransactionAdapter
 				|| !ObservationVisibility.canSeeEntity(player, target))) {
 			return finish(ServerTransactionAdapter.TickResult.failed("TARGET_UNAVAILABLE", "Ranged target is no longer alive"));
 		}
+		if (!released && (!started || trackTarget)) {
+			player.lookAt(EntityAnchorArgument.Anchor.EYES, trackTarget ? target.getBoundingBox().getCenter() : aimPoint);
+		}
 		if (!started) {
-			player.lookAt(EntityAnchorArgument.Anchor.EYES, target, EntityAnchorArgument.Anchor.EYES);
 			InteractionResult result = player.gameMode.useItem(player, player.level(), bow, hand);
 			if (!result.consumesAction() || !player.isUsingItem() || player.getUsedItemHand() != hand) {
 				return finish(ServerTransactionAdapter.TickResult.failed(
@@ -204,21 +212,6 @@ public final class ServerRangedUseController implements ServerTransactionAdapter
 	}
 
 	private static Entity resolveExactObservedTarget(ServerPlayer player, String targetId) {
-		final UUID uuid;
-		try {
-			uuid = UUID.fromString(targetId);
-		} catch (IllegalArgumentException exception) {
-			throw new AgentDomainException("TARGET_NOT_FOUND", "Target id is not a UUID");
-		}
-		Entity entity = player.level().getEntity(uuid);
-		if (entity == null || entity.level() != player.level()
-				|| !entity.isAlive()
-				|| entity == player) {
-			throw new AgentDomainException("TARGET_UNAVAILABLE", "Observed ranged target is no longer available");
-		}
-		if (!ObservationVisibility.canSeeEntity(player, entity)) {
-			throw new AgentDomainException("TARGET_NOT_VISIBLE", "Observed ranged target is no longer visible");
-		}
-		return entity;
+		return dev.agaminggod.arenaagents.server.runtime.ObservedEntityTarget.resolve(player, targetId);
 	}
 }

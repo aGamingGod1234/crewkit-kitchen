@@ -115,7 +115,7 @@ function entityFacts(value, index) {
 		result.itemId = identifier(source.itemId, `entities[${index}].itemId`);
 		result.count = positiveInteger(source.count, `entities[${index}].count`);
 	}
-	copyExtensions(source, result, ['velocity', 'yaw', 'pitch', 'pose', 'bounds', 'equipment', 'usingItem', 'onFire']);
+	copyExtensions(source, result, ['velocity', 'yaw', 'pitch', 'pose', 'bounds', 'equipment', 'usingItem', 'onFire', 'pickable', 'parentId', 'partName']);
 	return result;
 }
 

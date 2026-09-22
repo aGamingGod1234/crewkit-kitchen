@@ -196,7 +196,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyImmediateHandshakeClosePreservesDisconnect();
 		verifyPendingRegistrationMarkerIsFenced();
 		verifyAtomicPublicationRacesSessionClose();
-		return 294;
+		return 298;
 	}
 
 	@SuppressWarnings("unchecked")
@@ -490,6 +490,15 @@ public final class MultiplexedServerBridgeVerification {
 		registry.queue(idle.agentId(), first, now + 6L);
 		AgentTransition promoted = registry.promoteSatisfied(idle.agentId(), now + 7L);
 		assertEquals("start", invokeGoalOperation(promoted), "queued promotion remains a start operation");
+		registry.stop(idle.agentId(), now + 8L);
+		AgentTransition resumed = registry.resume(idle.agentId(), now + 9L);
+		assertEquals("resume", invokeGoalOperation(resumed), "same logical goal resumes");
+		registry.stop(idle.agentId(), now + 10L);
+		AgentTransition fresh = registry.start(idle.agentId(), replacement, now + 11L);
+		assertEquals("start", invokeGoalOperation(fresh), "new goal after pause starts rather than resumes");
+		JsonObject freshPayload = invokeGoalControlPayload(fresh, invokeGoalOperation(fresh));
+		assertEquals("Get dirt", freshPayload.get("goal").getAsString(), "paused replacement transmits new goal");
+		assertEquals(replacement.fingerprint(), freshPayload.getAsJsonObject("goalSpec").get("fingerprint").getAsString(), "paused replacement transmits its new contract");
 	}
 	private static void verifyEmptyCatalogRequestsLiveDiscovery() {
 		MultiplexedServerBridge bridge = null;

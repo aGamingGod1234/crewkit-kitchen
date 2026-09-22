@@ -397,7 +397,25 @@ test('does not conflate changed action arguments at one source step', () => {
 	assert.equal(stopped.kind, 'command', 'a changed command signature starts a fresh failure streak');
 });
 
-test('a different intervening command resets the deterministic failure streak', () => {
+test('a successful wait cannot hide repeated pickup path failures', () => {
+	for (const recovery of ['await player.wait(50);', 'await player.lookAt({ x: 1, y: 64, z: 0 });']) {
+		const vm = new ArenaScriptInterpreter(parseArenaScript(`
+			program.onUnhandledAttention("continue_and_notify");
+			await program.repeatUntil(() => false, { maxIterations: 8 }, async () => {
+				await tryResult(player.pickUpItem({ targetSelector: "00000000-0000-4000-8000-000000000001" }));
+				${recovery}
+			});
+		`), SCRIPT_BINDINGS);
+		const first = vm.start(facts());
+		const intermediate = vm.resume(actionResult(first, 'FAILED', 'NO_STANDABLE_PATH'), facts());
+		const retry = vm.resume(actionResult(intermediate, 'SUCCEEDED', 'DONE'), facts());
+		const result = vm.resume(actionResult(retry, 'FAILED', 'NO_STANDABLE_PATH'), facts());
+		assert.equal(result.kind, recovery.includes('player.wait') ? 'replan' : 'command');
+		if (result.kind === 'replan') assert.equal(result.failure.reasonCode, 'NO_STANDABLE_PATH');
+	}
+});
+
+test('a different source step remains available to authored recovery', () => {
 	const vm = interpreter(`
 		program.onUnhandledAttention("continue_and_notify");
 		await player.craftInventory({ recipeId: "minecraft:planks", count: 1, timeoutMs: 5000 });

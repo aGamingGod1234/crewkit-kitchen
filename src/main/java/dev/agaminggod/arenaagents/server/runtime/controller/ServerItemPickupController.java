@@ -10,6 +10,7 @@ import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.AABB;
 
 /** Walks a fake player into a dropped entity and trusts only vanilla collision pickup. */
 public final class ServerItemPickupController implements ServerController {
@@ -69,18 +70,30 @@ public final class ServerItemPickupController implements ServerController {
 
 	private TickResult approach(ServerPlayer player, long nowEpochMs, long elapsedMs) {
 		Vec3 currentTarget = item.position();
+		AABB pickupRegion = pickupStandingRegion(player.getBoundingBox(), player.position(), item.getBoundingBox());
+		if (player.getBoundingBox().inflate(1.0D, 0.5D, 1.0D).intersects(item.getBoundingBox())) {
+			stopNavigation(player);
+			return TickResult.running(0.98D);
+		}
 		if (navigation == null || navigationTarget.distanceToSqr(currentTarget) > REPLAN_DISTANCE_SQUARED) {
 			navigation = replaceNavigation(
 					navigation,
 					existing -> existing.cancel(player),
 					() -> new ServerNavigationController(currentTarget, 0.2D, true, nowEpochMs,
-							remainingNavigationTimeout(timeoutMs, elapsedMs))
+							remainingNavigationTimeout(timeoutMs, elapsedMs), pickupRegion)
 			);
 			navigationTarget = currentTarget;
 		}
 		TickResult result = navigation.tick(player, nowEpochMs);
+		if (awaitingDropLanding(result, item.onGround(), item.isNoGravity(), item.isInWater() || item.isInLava())) {
+			// A fresh mining drop has no standing position while airborne. Let vanilla
+			// gravity move it, then plan from its new position within the original deadline.
+			stopNavigation(player);
+			return TickResult.running(0.0D);
+		}
 		if (result.state() == State.SUCCEEDED) {
 			// At collision range, vanilla's ItemEntity#playerTouch owns the inventory mutation.
+			stopNavigation(player);
 			return TickResult.running(0.98D);
 		}
 		return result;
@@ -113,6 +126,20 @@ public final class ServerItemPickupController implements ServerController {
 
 	static boolean remainsInDimension(ResourceKey<Level> startingDimension, ResourceKey<Level> currentDimension) {
 		return ServerNavigationController.remainsInDimension(startingDimension, currentDimension);
+	}
+
+	static boolean awaitingDropLanding(TickResult result, boolean onGround, boolean noGravity, boolean inFluid) {
+		return result.state() == State.FAILED && result.reasonCode().equals("NO_STANDABLE_PATH")
+				&& !onGround && !noGravity && !inFluid;
+	}
+
+	static AABB pickupStandingRegion(AABB playerBounds, Vec3 playerPosition, AABB itemBounds) {
+		// Player#aiStep checks entities against its bounds inflated by (1, 0.5, 1).
+		// Invert that intersection to obtain legal feet positions, including beside
+		// a drop under a canopy. Navigation still requires support and body clearance.
+		AABB relative = playerBounds.move(playerPosition.scale(-1.0D)).inflate(1.0D, 0.5D, 1.0D);
+		return new AABB(Math.nextUp(itemBounds.minX - relative.maxX), Math.nextUp(itemBounds.minY - relative.maxY), Math.nextUp(itemBounds.minZ - relative.maxZ),
+				Math.nextDown(itemBounds.maxX - relative.minX), Math.nextDown(itemBounds.maxY - relative.minY), Math.nextDown(itemBounds.maxZ - relative.minZ));
 	}
 
 	static long remainingNavigationTimeout(long timeoutMs, long elapsedMs) {

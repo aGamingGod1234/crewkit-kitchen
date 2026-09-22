@@ -26,6 +26,57 @@ const jsonl = (rows) => rows.map((row) => JSON.stringify(row)).join('\n') + '\n'
 const GENERATED_NAME_AT_100 = 'ha_runner__0002s';
 const POWERSHELL_TEST_TIMEOUT_MS = 30_000;
 
+function timeoutNaturalScenario() {
+	return normalizeHeadlessScenario({
+		id: 'natural-timeout', provider: 'codex', model: 'fixture', reasoningEffort: 'low', serviceTier: 'priority',
+		task: 'Wait for the bounded timeout', timeoutMs: 100, requireFactualSuccess: true,
+		world: { mode: 'natural', seed: '1' },
+		assert: [{ type: 'lifecycle', state: 'COMPLETED' }, { type: 'rcon', command: 'data get entity {agent} Inventory', match: 'diamond' }],
+	});
+}
+
+function timeoutNaturalManifest(scenarioValue) {
+	return {
+		version: 1, scenarioId: scenarioValue.id, fresh: true, worldId: 'headless-timeout', world: scenarioValue.world,
+		savedSpawn: { source: 'level.dat', dimension: 'minecraft:overworld', x: 10, y: 65, z: -4 },
+		spawnLoading: { operation: 'temporary_spawn_chunk_loading', x: 10, z: -4, ready: true, elapsedMs: 1, terrainModified: false, inventoryModified: false },
+	};
+}
+
+async function runNaturalInventoryTimeout(finalInventory, stopResponse = null) {
+	const scenarioValue = timeoutNaturalScenario();
+	const commands = [];
+	let clock = 0;
+	let started = false;
+	const report = await runHeadlessScenario({
+		scenario: scenarioValue, worldManifest: timeoutNaturalManifest(scenarioValue), runDirectory: 'C:/runs/natural-timeout',
+		now: () => clock, fileSize: async () => 0, readFile: async () => '', writeFile: async () => {},
+		poll: async ({ phase }) => { if (phase === 'status') clock = 200; },
+		rcon: {
+			command: async (command) => {
+				commands.push(command);
+				if (command === 'seed') return { text: 'Seed: [1]' };
+				if (command === 'difficulty') return { text: 'The difficulty is normal' };
+				if (command.startsWith('gamerule ')) return { text: 'The gamerule is true' };
+				if (command.includes(' if loaded ')) return { text: 'The time is 1' };
+				if (command.includes('summon-configured')) return { text: 'Created timeout-agent. It is ready for a task.' };
+				if (command.startsWith('data get entity ') && command.endsWith(' Pos')) return { text: 'timeout-agent has the following entity data: [10.5d, 65.0d, -3.5d]' };
+				if (command.startsWith('data get entity ') && command.endsWith(' Inventory')) {
+					if (started && finalInventory instanceof Error) throw finalInventory;
+					return { text: started ? finalInventory : 'timeout-agent has the following entity data: []' };
+				}
+				if (command.startsWith('codex start ')) { started = true; return { text: 'started' }; }
+				if (command.startsWith('codex status ')) return { text: 'state=RUNNING' };
+				if (command.startsWith('codex stop ')) return { text: stopResponse ?? `Paused ${command.split(' ').at(-1)}.` };
+				if (command.startsWith('codex remove ')) return { text: 'Removed timeout-agent.' };
+				return { text: 'ok' };
+			},
+			close: async () => {},
+		},
+	});
+	return { report, commands };
+}
+
 test('PowerShell wrapper samples a fast-exit tracked runner before completion', () => {
 	const wrapper = path.resolve('../scripts/run-headless-provider-matrix.ps1').replaceAll("'", "''");
 	const script = `
@@ -214,6 +265,42 @@ test('runs a real-provider scenario with exact RCON sequence and injected eviden
 	assert.ok(report.evidence.paths.protocol);
 	assert.deepEqual(report.timings.health, [{ operation: 'decide', count: 2, p50Ms: 321, p95Ms: 654, failureRate: 0, circuit: 'closed' }]);
 	assert.deepEqual(report.timings.control, [{ operation: 'observation_to_plan', count: 1, p50Ms: 700, p95Ms: 700 }]);
+});
+
+test('timeout evidence reads final inventory only after bounded post-stop collection', async () => {
+	const { report, commands } = await runNaturalInventoryTimeout('timeout-agent has the following entity data: [{id:"minecraft:diamond"}]');
+	assert.equal(report.classification, 'TIMEOUT');
+	assert.equal(report.status, 'FAILED');
+	assert.deepEqual(report.postRunEvidence, { snapshot: 'post_stop', status: 'STOPPED', delayMs: 100 });
+	const inventoryReads = commands.reduce((indexes, command, index) => command.endsWith(' Inventory') ? [...indexes, index] : indexes, []);
+	assert.equal(inventoryReads.length, 2);
+	assert.ok(commands.findIndex((command) => command.startsWith('codex stop ')) < inventoryReads.at(-1));
+	const assertion = report.assertions.find((entry) => entry.type === 'rcon');
+	assert.deepEqual(assertion.actual, ['timeout-agent has the following entity data: [{id:"minecraft:diamond"}]']);
+});
+
+test('timeout evidence leaves final inventory unknown when post-stop read is unavailable', async () => {
+	const { report, commands } = await runNaturalInventoryTimeout(new Error('inventory read unavailable'));
+	assert.equal(report.classification, 'TIMEOUT');
+	assert.equal(report.status, 'FAILED');
+	const stopIndex = commands.findIndex((command) => command.startsWith('codex stop '));
+	const inventoryReads = commands.reduce((indexes, command, index) => command.endsWith(' Inventory') ? [...indexes, index] : indexes, []);
+	assert.ok(stopIndex >= 0 && stopIndex < inventoryReads.at(-1));
+	const assertion = report.assertions.find((entry) => entry.type === 'rcon');
+	assert.deepEqual(assertion.actual, []);
+	assert.equal(assertion.passed, false);
+});
+
+test('timeout evidence stays unknown when stop acknowledgement is invalid', async () => {
+	const { report, commands } = await runNaturalInventoryTimeout('timeout-agent has the following entity data: [{id:"minecraft:diamond"}]', 'still running');
+	assert.equal(report.classification, 'TIMEOUT');
+	assert.equal(report.status, 'FAILED');
+	assert.deepEqual(report.postRunEvidence, { snapshot: 'post_stop', status: 'UNAVAILABLE', delayMs: 100 });
+	const inventoryReads = commands.reduce((indexes, command, index) => command.endsWith(' Inventory') ? [...indexes, index] : indexes, []);
+	assert.equal(inventoryReads.length, 1);
+	const assertion = report.assertions.find((entry) => entry.type === 'rcon');
+	assert.deepEqual(assertion.actual, []);
+	assert.equal(assertion.passed, false);
 });
 
 test('summons, starts, and polls an eight-agent exact-profile roster concurrently with isolated evidence', async () => {
@@ -415,6 +502,49 @@ test('reports bounded p50 p95 p99 metrics and null provider-native token categor
 	assert.ok(Buffer.byteLength(JSON.stringify(report.metrics), 'utf8') < 16_384);
 });
 
+test('uses the latest native timing snapshot and keeps native inference unknown', async () => {
+	const agentId = GENERATED_NAME_AT_100;
+	const nativeTiming = (timingCount, timingLifetimeCount, timingP50Ms, timingP95Ms) => ({
+		event: 'native_decision_timing', agentId, provider: 'codex', model: 'gpt-5.6-sol',
+		reasoningEffort: 'high', serviceTier: 'priority', timingCount, timingLifetimeCount,
+		timingP50Ms, timingP95Ms, timingSampleWindowSize: 4, timingLifetimeSegmentCount: timingLifetimeCount + 1,
+		failedSegmentCount: 1, cancelledSegmentCount: 0,
+	});
+	const files = new Map([
+		['protocol.jsonl', jsonl([{ direction: 'server_to_coordinator', envelope: { type: 'agent_snapshot', agentId, payload: {
+			agentId, name: GENERATED_NAME_AT_100, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority',
+		} } }])],
+		['provider.jsonl', jsonl([
+			{ agentId, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', timing: { durationMs: 900, apiDurationMs: null } },
+			{ agentId, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', timing: { durationMs: 1200, apiDurationMs: null } },
+		])],
+		['coordinator.jsonl', jsonl([
+			 nativeTiming(2, 2, 10, 20), nativeTiming(1, 9, 31, 47),
+			{ ...nativeTiming(99, 99, 1, 1), agentId: 'different-agent' },
+			{ ...nativeTiming(88, 88, 2, 2), model: 'other-model' },
+		])],
+	]);
+	const report = await runHeadlessScenario({
+		scenario: scenario({ assert: [{ type: 'lifecycle', state: 'COMPLETED' }] }), runDirectory: 'C:/runs/native-timing',
+		rcon: { command: async (command) => ({ text: command.includes('summon-configured') ? `Created ${GENERATED_NAME_AT_100}. It is ready for a task.` : command.startsWith('codex status') ? 'state=COMPLETED' : 'ok' }), close: async () => {} },
+		now: () => 100, providerTurnsPath: 'C:/provider.jsonl', protocolAudit: 'C:/protocol.jsonl',
+		readFile: async (file) => [...files.entries()].find(([name]) => String(file).endsWith(name))?.[1] ?? '', writeFile: async () => {}, poll: async () => {},
+	});
+	assert.deepEqual(report.metrics.latencyMs.inference, { count: 0, p50: null, p95: null, p99: null });
+	assert.deepEqual(report.metrics.latencyMs.inferenceUnknown, { count: 2, nativeCount: 2 });
+	assert.deepEqual(report.metrics.latencyMs.nativeModelWait, {
+		agentId, profile: { provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority' },
+		count: 1, p50: 31, p95: 47, p99: null, sampleWindowSize: 4,
+		lifetimeCount: 9, lifetimeSegmentCount: 10, failedSegmentCount: 1, cancelledSegmentCount: 0,
+	});
+	assert.deepEqual(report.metrics.nativeDecisionTiming, [{
+		agentId, profile: { provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority' },
+		timingCount: 1, timingLifetimeCount: 9, timingP50Ms: 31, timingP95Ms: 47, timingSampleWindowSize: 4,
+		timingLifetimeSegmentCount: 10, failedSegmentCount: 1, cancelledSegmentCount: 0,
+	}]);
+	assert.equal(report.metrics.tokens.input, null, 'native timing must not invent token counts');
+});
+
 test('accepts the production summon response and binds metrics to the authoritative registration ID', async () => {
 	const generatedName = GENERATED_NAME_AT_100;
 	const files = new Map([
@@ -436,6 +566,46 @@ test('accepts the production summon response and binds metrics to the authoritat
 	});
 	assert.deepEqual(report.metrics.latencyMs.inference, { count: 1, p50: 10, p95: 10, p99: 10 });
 	assert.ok(commands.indexOf('execute in minecraft:overworld run setblock 2 201 0 minecraft:oak_log') < commands.findIndex((command) => command.includes('summon-configured')));
+});
+
+test('keeps concurrent native timing snapshots isolated by agent and exact profile', async () => {
+	const names = [];
+	const timingRow = (agentId, count, p50, p95, model = 'gpt-5.6-sol') => ({
+		event: 'native_decision_timing', agentId, provider: 'codex', model,
+		reasoningEffort: 'high', serviceTier: 'priority', timingCount: count, timingLifetimeCount: count + 8,
+		timingP50Ms: p50, timingP95Ms: p95, timingSampleWindowSize: 4, timingLifetimeSegmentCount: count + 9,
+		failedSegmentCount: 0, cancelledSegmentCount: 0,
+	});
+	const report = await runHeadlessScenario({
+		scenario: scenario({ rosterSize: 8, assert: [{ type: 'lifecycle', state: 'COMPLETED' }] }), runDirectory: 'C:/runs/native-timing-roster',
+		rcon: { command: async (command) => {
+			if (command.includes('summon-configured')) { const name = command.split(' ').at(-1); names.push(name); return { text: `Created ${name}. It is ready for a task.` }; }
+			return { text: command.startsWith('codex status') ? 'state=COMPLETED' : 'ok' };
+		}, close: async () => {} },
+		now: () => 100, providerTurnsPath: 'C:/provider.jsonl', protocolAudit: 'C:/protocol.jsonl',
+		readFile: async (file) => {
+			if (String(file).endsWith('provider.jsonl')) return jsonl(names.map((_name, index) => ({
+				agentId: `timing-agent-${index + 1}`, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', timing: { durationMs: 100 + index, apiDurationMs: null },
+			})));
+			if (String(file).endsWith('protocol.jsonl')) return jsonl(names.map((name, index) => ({ direction: 'server_to_coordinator', envelope: { type: 'agent_snapshot', agentId: `timing-agent-${index + 1}`, payload: {
+				agentId: `timing-agent-${index + 1}`, name, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority',
+			} } })));
+			if (String(file).endsWith('coordinator.jsonl')) return jsonl([
+				timingRow('timing-agent-1', 1, 10, 20), timingRow('timing-agent-1', 3, 30, 50),
+				timingRow('timing-agent-1', 99, 1, 1, 'other-model'),
+				...Array.from({ length: 7 }, (_value, index) => timingRow(`timing-agent-${index + 2}`, index + 1, index + 11, index + 21)),
+			]);
+			return '';
+		}, writeFile: async () => {}, poll: async () => {},
+	});
+	assert.equal(report.metrics.latencyMs.nativeModelWait, null, 'aggregate percentiles must not merge per-agent bounded windows');
+	assert.equal(report.metrics.nativeModelWaitByAgent.length, 8);
+	assert.deepEqual(report.metrics.nativeModelWaitByAgent.find((entry) => entry.agentId === 'timing-agent-1'), {
+		agentId: 'timing-agent-1', profile: { provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority' },
+		count: 3, p50: 30, p95: 50, p99: null, sampleWindowSize: 4, lifetimeCount: 11, lifetimeSegmentCount: 12,
+		failedSegmentCount: 0, cancelledSegmentCount: 0,
+	});
+	assert.deepEqual(new Set(report.agents.map((agent) => agent.metrics.latencyMs.nativeModelWait?.count)), new Set([1, 2, 3, 4, 5, 6, 7]));
 });
 
 test('evaluates single-agent assertions only after exact authoritative identity isolation', async () => {

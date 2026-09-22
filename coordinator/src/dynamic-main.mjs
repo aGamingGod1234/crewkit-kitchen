@@ -137,6 +137,7 @@ export class DynamicCoordinator extends EventEmitter {
 	#nativeConversationRecoveries = new Map();
 	#nativeObservationSignatures = new Map();
 	#nativeWorldSignals = new Map();
+	#nativeConfirmationWaits = new Map();
 	#supervisedObservationRequests = new Map();
 	#conversationWakeTransactions = new Map();
 	#directorRequests = new Set();
@@ -254,6 +255,7 @@ export class DynamicCoordinator extends EventEmitter {
 			notebook: this.#playerMemory.notebook,
 			memoryOperation: (record, operation) => this.#playerMemory.execute(record, operation),
 			executionSettings: (record) => this.#planner.getExecutionSettings?.(record.agentId) ?? null,
+			planningLeadTime: (record) => this.#planner.getNativeDecisionTiming?.(record.agentId)?.p95Ms ?? null,
 			occupancy: new ExplorationOccupancy({ memoryStore: new ObservedMemoryStore({ directory: memoryDirectory }) }),
 			bridge: nativeBridge,
 			registry: this.#registry,
@@ -268,6 +270,17 @@ export class DynamicCoordinator extends EventEmitter {
 					this.#goalSupervisor.terminate(this.#supervisionKey(current, lifecycleGeneration));
 					this.#registry.setState(record.agentId, DynamicAgentState.COMPLETED, { goalRevision: record.goalRevision });
 				}
+			},
+			onProgramEvent: (record, event) => {
+				const connectionEpoch = this.#nativeRuntimeEpochs.get(record.agentId);
+				const lifecycleGeneration = this.#lifecycleGeneration(record.agentId);
+				const current = this.#registry.get(record.agentId);
+				if (this.#stopping || this.#closed || !this.#isConnectionEpochCurrent(connectionEpoch)
+					|| current?.goalRevision !== record.goalRevision || ![DynamicAgentState.PLANNING, DynamicAgentState.ACTING].includes(current.state)) return;
+				this.#scheduleNativeTurn(current, { agentId: current.agentId, goalRevision: current.goalRevision,
+					observation: event.observation, eventSequence: event.eventSequence, preserveState: true,
+					priority: event.priority ?? event.status?.decision?.priority ?? 'ordinary', trigger: event.status?.decision?.trigger ?? event.event,
+					connectionEpoch, lifecycleGeneration, nativeEvent: event });
 			},
 		});
 		this.#setStatusInterval = requireDependency(setStatusInterval, 'setStatusInterval');
@@ -412,6 +425,7 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#nativeConversationRecoveries.clear();
 		this.#nativeObservationSignatures.clear();
 		this.#nativeWorldSignals.clear();
+		this.#nativeConfirmationWaits.clear();
 		this.#supervisedObservationRequests.clear();
 		this.#conversationWakeTransactions.clear();
 		this.#cancelGoalSpecRequests();
@@ -490,6 +504,7 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#nativeConversationRecoveries.delete(message.agentId);
 			this.#nativeObservationSignatures.delete(message.agentId);
 			this.#nativeWorldSignals.delete(message.agentId);
+			this.#nativeConfirmationWaits.delete(message.agentId);
 			this.#supervisedObservationRequests.delete(message.agentId);
 			this.#forgetConversationWakes(message.agentId);
 			this.#cancelGoalSpecRequests(message.agentId);
@@ -759,8 +774,11 @@ export class DynamicCoordinator extends EventEmitter {
 					if (unchangedHeartbeat) {
 						if (this.#nativeRuntime.refreshObservation(record, observation, { eventSequence: message.payload.eventSequence, conversation })) return;
 					}
-					this.#nativeRuntime.updateObservation(record, observation, { eventSequence: message.payload.eventSequence, conversation, attention: attention.attention, priority: attention.priority, trigger: attention.trigger });
+					this.#nativeRuntime.updateObservation(record, observation, { eventSequence: message.payload.eventSequence, conversation, attention: attention.attention, priority: attention.priority, trigger: attention.trigger, changedFacts: message.payload.changedFacts });
 					this.#goalSupervisor.observed(supervisionKey);
+					// The program owns ordinary progress. It explicitly notifies the model
+					// when reconsideration or a new intention is needed.
+					if (this.#nativeRuntime.hasProgram(record) && !forcedContinuation && pendingAttention?.goalRevision !== record.goalRevision) return;
 					this.#scheduleNativeTurn(record, {
 						agentId: record.agentId,
 						goalRevision: record.goalRevision,
@@ -1153,9 +1171,14 @@ export class DynamicCoordinator extends EventEmitter {
 			state.resources.add(candidate);
 		}
 		while (state.resources.size > MAX_NATIVE_RESOURCE_MEMORY) state.resources.delete(state.resources.values().next().value);
+		const looping = detectMovementLoop(state.positions);
+		const movementLoop = looping && state.movementLoopActive !== true;
+		// Repeated samples of the same unresolved loop are not new decisions.
+		// Moving out of it rearms attention without an arbitrary cooldown.
+		state.movementLoopActive = looping;
 		this.#nativeWorldSignals.set(record.agentId, state);
 		return {
-			movementLoop: detectMovementLoop(state.positions),
+			movementLoop,
 			resourceDiscovery,
 		};
 	}
@@ -1200,9 +1223,19 @@ export class DynamicCoordinator extends EventEmitter {
 		});
 	}
 
+	#awaitingNativeConfirmation(record, lifecycleGeneration = this.#lifecycleGeneration(record.agentId)) {
+		return sameSupervisionKey(this.#nativeConfirmationWaits.get(record.agentId), this.#supervisionKey(record, lifecycleGeneration));
+	}
+
+	#confirmationBlocksRequest(record, request) {
+		return this.#awaitingNativeConfirmation(record, request.lifecycleGeneration)
+			&& (request.priority !== 'urgent' || request.trigger === 'stuck' || request.nativeEvent?.trigger === 'continuation');
+	}
+
 	#scheduleNativeTurn(record, request) {
 		if (!this.#isConnectionEpochCurrent(request.connectionEpoch)
 				|| !this.#isLifecycleGenerationCurrent(record.agentId, request.lifecycleGeneration)) return;
+		if (!this.#nativePreparationIsCurrent(record, request) || this.#confirmationBlocksRequest(record, request)) return;
 		request = this.#afterProviderProbeDeadline(record, request);
 		if (request === null) return;
 		const existing = this.#providerWork.get(record.agentId);
@@ -1212,9 +1245,10 @@ export class DynamicCoordinator extends EventEmitter {
 				&& existing.goalRevision === request.goalRevision
 				&& existing.lifecycleGeneration === request.lifecycleGeneration
 				&& existing.connectionEpoch === request.connectionEpoch
-				&& request.priority === 'urgent'
+				&& (request.priority === 'urgent' || request.nativeEvent?.event === 'program_planning_due')
 			) {
-				this.#queueNativeSteer(existing, request);
+				if (request.nativeEvent?.event === 'program_planning_due') this.#queueNativePreparation(existing, request);
+				else this.#queueNativeSteer(existing, request);
 				return existing.promise;
 			}
 			existing.pending = mergePlannerRequest(existing.pending, request);
@@ -1233,6 +1267,7 @@ export class DynamicCoordinator extends EventEmitter {
 			pending: null,
 			steerQueued: null,
 			steerPromise: null,
+			preparationPromise: null,
 			traceId: planningTraceId(record.agentId, record.goalRevision, request.lifecycleGeneration, 'native'),
 			promise: null,
 			supervisionKey,
@@ -1273,6 +1308,12 @@ export class DynamicCoordinator extends EventEmitter {
 		return work.promise;
 	}
 
+	#nativePreparationIsCurrent(record, request) {
+		const event = request?.nativeEvent;
+		return event?.event !== 'program_planning_due'
+			|| this.#nativeRuntime.canPrepareProgram(record, event.programId, event.status?.programVersion);
+	}
+
 	#queueNativeSteer(work, request) {
 		work.steerQueued = mergePlannerRequest(work.steerQueued, request);
 		if (work.steerPromise !== null) return;
@@ -1283,6 +1324,57 @@ export class DynamicCoordinator extends EventEmitter {
 		work.steerPromise = tracked;
 	}
 
+	#queueNativePreparation(work, request) {
+		// Planning is a one-shot advisory. It must never delay or replace an
+		// urgent steering request, and its eventual failure must not become a
+		// replayable pending turn.
+		if (work.preparationPromise !== null
+				|| work.request?.priority === 'urgent'
+				|| work.steerQueued?.priority === 'urgent'
+				|| work.pending?.priority === 'urgent'
+				|| work.steerPromise !== null) return;
+		const preparation = this.#deliverNativePreparation(work, request);
+		const tracked = preparation.finally(() => {
+			if (work.preparationPromise === tracked) work.preparationPromise = null;
+		});
+		work.preparationPromise = tracked;
+	}
+
+	async #deliverNativePreparation(work, request) {
+		try {
+			const record = this.#registry.get(work.agentId);
+			if (record === null || record.goalRevision !== work.goalRevision
+					|| work.expired === true
+					|| this.#providerWork.get(work.agentId) !== work
+					|| !this.#isConnectionEpochCurrent(work.connectionEpoch)
+					|| !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)
+					|| !this.#nativePreparationIsCurrent(record, request)
+					|| work.steerQueued?.priority === 'urgent'
+					|| work.pending?.priority === 'urgent'
+					|| work.steerPromise !== null) return;
+			await this.#planner.steerNativeTurn({
+				agentId: work.agentId,
+				goalRevision: work.goalRevision,
+				input: this.#nativeTurnInput(record, request, { deliverConversation: false }),
+			});
+			this.#writeTrace('native_turn_prepared', {
+				agentId: work.agentId,
+				goalRevision: work.goalRevision,
+				traceId: work.traceId,
+				trigger: request.trigger,
+			});
+		} catch (error) {
+			// Advisory delivery has no turn ownership. Do not restore conversation
+			// state or queue a stale reminder after the body turn has moved on.
+			this.#writeTrace('native_turn_preparation_skipped', {
+				agentId: work.agentId,
+				goalRevision: work.goalRevision,
+				traceId: work.traceId,
+				errorCode: String(error?.code ?? 'PREPARATION_FAILED').slice(0, 128),
+			});
+		}
+	}
+
 	async #drainNativeSteering(work) {
 		while (work.steerQueued !== null) {
 			const request = work.steerQueued;
@@ -1290,6 +1382,7 @@ export class DynamicCoordinator extends EventEmitter {
 			try {
 				const record = this.#registry.get(work.agentId);
 				if (record === null || record.goalRevision !== work.goalRevision) throw Object.assign(new Error('Native steering belongs to an obsolete goal'), { code: 'STALE_PLAN' });
+				if (!this.#nativePreparationIsCurrent(record, request)) continue;
 				await this.#planner.steerNativeTurn({
 					agentId: work.agentId,
 					goalRevision: work.goalRevision,
@@ -1326,7 +1419,9 @@ export class DynamicCoordinator extends EventEmitter {
 		if (work.expired === true || record === null || record.goalRevision !== work.goalRevision
 				|| !this.#isConnectionEpochCurrent(work.connectionEpoch)
 				|| !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) {
-			throw Object.assign(new Error('Native tool belongs to an obsolete goal'), { code: 'STALE_PLAN' });
+			return { state: 'CANCELLED', reasonCode: 'STALE_PLAN', executed: false,
+				goalRevision: work.goalRevision, currentGoalRevision: record?.goalRevision ?? null,
+				message: 'This goal turn has ended or been superseded. No action was dispatched. End this turn and await the next goal event.' };
 		}
 		if (work.request.conversationOnly === true
 				&& toolRequest.tool.kind !== 'observe'
@@ -1337,6 +1432,7 @@ export class DynamicCoordinator extends EventEmitter {
 			|| toolRequest.tool.kind === 'sequence'
 			|| toolRequest.tool.kind === 'lookAround'
 			|| toolRequest.tool.kind === 'run_program'
+			|| toolRequest.tool.kind === 'respond_program'
 			|| toolRequest.tool.kind === 'start_action'
 			|| toolRequest.tool.kind === 'replace_action';
 		const supervisionKind = executesBody ? 'action' : toolRequest.tool.kind === 'finish' ? 'completion' : null;
@@ -1350,6 +1446,20 @@ export class DynamicCoordinator extends EventEmitter {
 			work.toolSupervisionToken = supervisionToken;
 			this.#goalSupervisor.progress(work.supervisionToken);
 			result = await this.#nativeRuntime.execute(toolRequest, record, { lifecycleGeneration: work.lifecycleGeneration });
+			const current = this.#registry.get(work.agentId);
+			if (current?.goalRevision === work.goalRevision
+				&& this.#isConnectionEpochCurrent(work.connectionEpoch)
+				&& this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) {
+				if (result?.state === 'AWAITING_OPERATOR_CONFIRMATION') {
+					// Waiting belongs to this goal lifecycle, not just the provider turn that
+					// requested verification. Ordinary queued sightings cannot resume it.
+					this.#nativeConfirmationWaits.set(record.agentId, work.supervisionKey);
+					this.#goalSupervisor.terminate(work.supervisionKey);
+				} else if (toolRequest.tool.kind === 'finish' || (executesBody
+					&& !['chat', 'wait'].includes(toolRequest.tool.actionType))) {
+					this.#nativeConfirmationWaits.delete(record.agentId);
+				}
+			}
 			return result;
 		} finally {
 			if (supervisionToken !== null) {
@@ -1393,8 +1503,10 @@ export class DynamicCoordinator extends EventEmitter {
 			});
 			return result;
 		}
+		const awaitingConfirmation = record !== null && this.#awaitingNativeConfirmation(record, work.lifecycleGeneration);
+		if (awaitingConfirmation) this.#goalSupervisor.terminate(work.supervisionKey);
 		const rescheduled = this.#reschedulePendingNativeTurn(pending);
-		if (!rescheduled && this.#isActiveNativeGoal(work)) {
+		if (!rescheduled && !awaitingConfirmation && this.#isActiveNativeGoal(work)) {
 			this.#goalSupervisor.ensure(work.supervisionKey, (result?.toolCalls ?? 0) === 0 ? 'zero_tool_turn' : 'turn_completed');
 		}
 		return result;
@@ -1403,6 +1515,8 @@ export class DynamicCoordinator extends EventEmitter {
 	async #failNativeTurn(work, error) {
 		let recovery = classifyRecoveryFailure(error);
 		let classification = recovery.retryable ? 'recoverable' : classifyNativeGoalError(error);
+		this.#writeTrace('native_turn_failed', { agentId: work.agentId, goalRevision: work.goalRevision,
+			errorCode: sanitizeDiagnosticErrorCode(error, { fallback: 'NATIVE_TURN_FAILED' }), classification });
 		try {
 			await this.#settleNativeSteering(work);
 		} catch (steeringError) {
@@ -1465,6 +1579,7 @@ export class DynamicCoordinator extends EventEmitter {
 				|| !this.#isConnectionEpochCurrent(request.connectionEpoch)
 				|| !this.#isLifecycleGenerationCurrent(record.agentId, request.lifecycleGeneration)) return false;
 		if (!this.#usesNativeTools(record) || ![DynamicAgentState.STARTING, DynamicAgentState.PLANNING, DynamicAgentState.ACTING, DynamicAgentState.DEAD].includes(record.state)) return false;
+		if (!this.#nativePreparationIsCurrent(record, request) || this.#confirmationBlocksRequest(record, request)) return false;
 		this.#scheduleNativeTurn(record, request);
 		return true;
 	}
@@ -1473,6 +1588,7 @@ export class DynamicCoordinator extends EventEmitter {
 		if (this.#stopping || this.#closed) return false;
 		const record = this.#registry.get(work.agentId);
 		return record !== null
+			&& !this.#awaitingNativeConfirmation(record, work.lifecycleGeneration)
 			&& record.goalRevision === work.goalRevision
 			&& this.#isConnectionEpochCurrent(work.connectionEpoch)
 			&& this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)
@@ -1775,6 +1891,7 @@ export class DynamicCoordinator extends EventEmitter {
 		if (['stop', 'disconnect', 'dead'].includes(message.payload.operation)) reason = `Goal ${message.payload.operation}`;
 		if (message.payload.operation === 'steer') reason = 'Goal steered';
 		if (message.payload.operation === 'replace') reason = 'Goal replaced';
+		if (message.payload.operation === 'complete') reason = 'Goal completed';
 		if (reason === null) return;
 		try {
 			Promise.resolve(this.#planner.interrupt(message.agentId, reason)).catch((error) => this.#reportAgentError(message.agentId, error, connectionEpoch));
@@ -1843,6 +1960,7 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#providerProbeDeadlines.delete(agentId);
 		this.#deferredProviderRecovery.delete(agentId);
 		this.#nativeWorldSignals.delete(agentId);
+		this.#nativeConfirmationWaits.delete(agentId);
 		this.#advanceLifecycleGeneration(agentId);
 	}
 
@@ -2298,6 +2416,7 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#nativeConversationRecoveries.clear();
 		this.#nativeObservationSignatures.clear();
 		this.#nativeWorldSignals.clear();
+		this.#nativeConfirmationWaits.clear();
 		this.#supervisedObservationRequests.clear();
 		this.#conversationWakeTransactions.clear();
 		this.#providerWork.clear();
@@ -2403,17 +2522,24 @@ export class DynamicCoordinator extends EventEmitter {
 		return memory;
 	}
 
-	#nativeTurnInput(record, request) {
+	#nativeTurnInput(record, request, { deliverConversation = true } = {}) {
 		if (request.nativeEvent === undefined) return request.input;
 		const memory = this.#conversationMemory(record.agentId);
 		const afterSequence = this.#nativeConversationSequences.get(record.agentId) ?? -1;
 		const conversation = memory.unread(afterSequence);
-		request.nativeConversationDelivery = { afterSequence, nextSequence: conversation.nextSequence };
-		this.#nativeConversationSequences.set(record.agentId, conversation.nextSequence);
+		const deliveredConversation = deliverConversation ? conversation : {
+			...conversation,
+			entries: [],
+			nextSequence: afterSequence,
+		};
+		if (deliverConversation) {
+			request.nativeConversationDelivery = { afterSequence, nextSequence: conversation.nextSequence };
+			this.#nativeConversationSequences.set(record.agentId, conversation.nextSequence);
+		}
 		const input = buildNativeEventInput(record, {
 			...request.nativeEvent,
 			observation: this.#nativeRuntime.decorateObservation(record, request.nativeEvent.observation ?? {}),
-			conversation,
+			conversation: deliveredConversation,
 		});
 		return request.retryInstruction === undefined ? input : `${input}\n${request.retryInstruction}`;
 	}
@@ -2504,6 +2630,7 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		latencyRegistry,
 		now: dependencies.plannerNow ?? dependencies.now,
 		telemetrySink: dependencies.telemetrySink,
+		nativeTimingSink: (event, fields) => dependencies.traceWriter?.write(event, fields),
 		benchmarkRecorder: dependencies.benchmarkRecorder,
 		turnRecorder: providerTurnRecorder,
 	});
@@ -3704,7 +3831,7 @@ export function classifyObservationTrigger(payload, observation, signals = null)
 	if (joinedFacts.includes('fall')) return { attention: true, priority: 'urgent', trigger: 'fall' };
 	if (Array.isArray(observation?.blocks) && observation.blocks.some((block) => typeof block?.blockId === 'string' && block.blockId.toLowerCase().includes('lava'))) return { attention: true, priority: 'urgent', trigger: 'lava' };
 	if (signals?.movementLoop === true) return { attention: true, priority: 'urgent', trigger: 'movement_loop' };
-	if (signals?.resourceDiscovery === true) return { attention: true, priority: 'urgent', trigger: 'resource_discovery' };
+	if (signals?.resourceDiscovery === true) return { attention: true, priority: 'ordinary', trigger: 'resource_discovery' };
 	if (!attention) return { attention: false, priority: 'ordinary', trigger: 'observation' };
 	return { attention: true, priority: 'ordinary', trigger: 'attention' };
 }
@@ -3786,75 +3913,227 @@ function sameSupervisionKey(left, right) {
 		&& left?.profileFingerprint === right?.profileFingerprint;
 }
 
-export function buildNativeEventInput(record, { event, trigger, observation = {}, conversation = { mode: 'unread', baseSequence: -1, nextSequence: -1, entries: [] }, conversationOnly = false } = {}) {
+export function buildNativeEventInput(record, { event, trigger, programId, status, result, planningLeadMs, eventSequence, observation = {}, conversation = { mode: 'unread', baseSequence: -1, nextSequence: -1, entries: [] }, conversationOnly = false } = {}) {
+	const eventName = typeof event === 'string' && event.length > 0 ? event : event?.event;
+	const normalizedEvent = typeof eventName === 'string' && eventName.length > 0 ? eventName : 'observation';
+	const eventPlanningLeadMs = status?.planningLeadMs ?? planningLeadMs ?? event?.planningLeadMs;
+	const inventorySource = asArray(observation.inventory?.items);
+	const itemSource = asArray(observation.items);
+	const entitySource = asArray(observation.entities).filter((entity) => entity?.type !== 'minecraft:item');
+	const blockSource = asArray(observation.blocks);
+	const landmarkSource = Array.isArray(observation.landmarks) ? observation.landmarks : null;
+	const nearbyContainerSource = Array.isArray(observation.nearbyContainers) ? observation.nearbyContainers : null;
+	const optionSource = Array.isArray(observation.options) ? observation.options : null;
+	const inventoryRows = boundedEventArray(inventorySource, 32);
+	const itemRows = boundedEventArray(itemSource, 16);
+	const entityRows = boundedEventArray(entitySource, 16);
+	const blockRows = boundedEventArray(blockSource, 32, isHazardousEventFact);
+	const landmarkRows = landmarkSource === null ? null : boundedEventArray(landmarkSource, 32);
+	const nearbyContainerRows = nearbyContainerSource === null ? null : boundedEventArray(nearbyContainerSource, 16);
+	const optionRows = optionSource === null ? null : boundedEventArray(optionSource, 4);
 	const compactObservation = {
+		...(observation.observedAtEpochMs === undefined ? {} : { observedAtEpochMs: observation.observedAtEpochMs }),
+		...(observation.eventSequence === undefined ? {} : { eventSequence: observation.eventSequence }),
+		...(observation.freshness === undefined ? {} : { freshness: observation.freshness }),
+		...(observation.coverage === undefined ? {} : { coverage: compactCoverageForEvent(observation.coverage) }),
+		...(observation.perception === undefined ? {} : { perception: compactPerceptionForEvent(observation.perception) }),
 		...(observation.ready === undefined ? {} : { ready: observation.ready }),
 		...(observation.status === undefined ? {} : { status: observation.status }),
 		...(observation.velocity === undefined ? {} : { velocity: observation.velocity }),
 		player: observation.player ?? {},
 		inventory: {
-			items: asArray(observation.inventory?.items).slice(0, 32),
+			items: inventoryRows.values,
 			...(observation.inventory?.selectedItem === undefined ? {} : { selectedItem: observation.inventory.selectedItem }),
 			...(observation.inventory?.tagCounts === undefined ? {} : { tagCounts: observation.inventory.tagCounts }),
 		},
-		items: asArray(observation.items).slice(0, 16),
-		entities: asArray(observation.entities).filter((entity) => entity?.type !== 'minecraft:item').slice(0, 16),
-		blocks: asArray(observation.blocks).slice(0, 32),
-		...(Array.isArray(observation.landmarks) ? { landmarks: observation.landmarks.slice(0, 32) } : {}),
-		...(Array.isArray(observation.nearbyContainers) ? { nearbyContainers: observation.nearbyContainers.slice(0, 16) } : {}),
+		items: itemRows.values,
+		entities: entityRows.values,
+		blocks: blockRows.values,
+		...(landmarkRows === null ? {} : { landmarks: landmarkRows.values }),
+		...(nearbyContainerRows === null ? {} : { nearbyContainers: nearbyContainerRows.values }),
 		...(observation.world === undefined ? {} : { world: observation.world }),
 		...(observation.currentAction === undefined ? {} : { currentAction: observation.currentAction }),
 		...(observation.lastResult === undefined ? {} : { lastResult: observation.lastResult }),
 		...(observation.interaction === undefined ? {} : { interaction: observation.interaction }),
 		...(observation.death === undefined ? {} : { death: observation.death }),
 		...(observation.recovery === undefined ? {} : { recovery: observation.recovery }),
-		...(Array.isArray(observation.options) ? { options: observation.options.slice(0, 4) } : {}),
+		...(optionRows === null ? {} : { options: optionRows.values }),
 		...(observation.failureClass === undefined ? {} : { failureClass: observation.failureClass }),
 		...(observation.continuity === undefined ? {} : { continuity: observation.continuity }),
 		...(observation.lastLiveInventory === undefined ? {} : { lastLiveInventory: observation.lastLiveInventory }),
+		resultCoverage: {
+			inventory: eventArrayCoverage(inventorySource, inventoryRows.values),
+			items: eventArrayCoverage(itemSource, itemRows.values),
+			entities: eventArrayCoverage(entitySource, entityRows.values),
+			blocks: eventArrayCoverage(blockSource, blockRows.values),
+			...(landmarkRows === null ? {} : { landmarks: eventArrayCoverage(landmarkSource, landmarkRows.values) }),
+			...(nearbyContainerRows === null ? {} : { nearbyContainers: eventArrayCoverage(nearbyContainerSource, nearbyContainerRows.values) }),
+			...(optionRows === null ? {} : { options: eventArrayCoverage(optionSource, optionRows.values) }),
+		},
 	};
+	const conversationEntries = Array.isArray(conversation) ? conversation : (Array.isArray(conversation?.entries) ? conversation.entries : []);
+	const unreadEntries = boundedEventArray(conversationEntries, Number.POSITIVE_INFINITY).values;
 	const unreadConversation = Array.isArray(conversation)
-		? { mode: 'unread', baseSequence: null, nextSequence: conversation.at(-1)?.sequence ?? -1, entries: conversation }
+		? { mode: 'unread', baseSequence: null, nextSequence: conversation.at(-1)?.sequence ?? -1, entries: unreadEntries, omittedEntries: 0 }
 		: {
 			mode: 'unread',
 			baseSequence: conversation?.baseSequence ?? null,
 			nextSequence: conversation?.nextSequence ?? -1,
-			entries: Array.isArray(conversation?.entries) ? conversation.entries : [],
+			entries: unreadEntries,
+			omittedEntries: 0,
 		};
+	const isPlanningDue = normalizedEvent === 'program_planning_due';
 	const payload = {
-		event: typeof event === 'string' && event.length > 0 ? event : 'observation',
-		trigger: typeof trigger === 'string' && trigger.length > 0 ? trigger : 'observation',
+		event: normalizedEvent,
+		trigger: typeof trigger === 'string' && trigger.length > 0 ? trigger : (isPlanningDue ? normalizedEvent : 'observation'),
 		mode: conversationOnly === true ? 'conversation_only' : 'goal',
 		goal: record?.currentGoal ?? null,
 		goalSpec: record?.currentGoalSpec ?? null,
 		goalRevision: record?.goalRevision ?? 0,
-		observation: compactObservation,
+		...(eventSequence === undefined ? {} : { eventSequence }),
+		observation: isPlanningDue ? compactPlanningDueObservation(compactObservation) : compactObservation,
 		conversation: unreadConversation,
+		...(programId === undefined ? {} : { program: { programId,
+			...(status === undefined ? {} : { state: status.state, engineState: status.engineState, programVersion: status.programVersion, deadlineEpochMs: status.deadlineEpochMs, planningLeadMs: status.planningLeadMs ?? eventPlanningLeadMs, decision: status.decision }),
+			...(result === undefined ? {} : { result: { state: result.state, reasonCode: result.reasonCode, actions: result.actions, receipts: result.receipts?.slice(-8), omittedReceipts: Math.max(0, (result.receipts?.length ?? 0) - 8) + (result.omittedReceipts ?? 0) } }) } }),
 	};
 	let json = JSON.stringify(payload);
 	if (Buffer.byteLength(json, 'utf8') > 16_384) {
+		const overflowObservation = compactEventObservationForBudget(compactObservation);
+		const overflowConversation = { ...unreadConversation, entries: unreadConversation.entries.slice(-8), omittedEntries: Math.max(0, unreadConversation.entries.length - 8) };
 		json = JSON.stringify({
 			...payload,
-			observation: {
-				player: compactObservation.player,
-				inventory: { items: compactObservation.inventory.items.slice(0, 16) },
-				items: [],
-				entities: [],
-				blocks: compactObservation.blocks.slice(0, 12),
-				...(Array.isArray(compactObservation.landmarks) ? { landmarks: compactObservation.landmarks.slice(0, 12) } : {}),
-				...(compactObservation.world === undefined ? {} : { world: compactWorldForEvent(compactObservation.world) }),
-				...(compactObservation.lastResult === undefined ? {} : { lastResult: compactLastResultForEvent(compactObservation.lastResult) }),
-				...(compactObservation.recovery === undefined ? {} : { recovery: compactRecoveryForEvent(compactObservation.recovery) }),
-				...(Array.isArray(compactObservation.options) ? { options: compactObservation.options.slice(0, 2) } : {}),
-				...(compactObservation.failureClass === undefined ? {} : { failureClass: compactObservation.failureClass }),
-				...(compactObservation.death === undefined ? {} : { death: compactObservation.death }),
-				...(compactObservation.continuity === undefined ? {} : { continuity: compactObservation.continuity }),
-				...(compactObservation.lastLiveInventory === undefined ? {} : { lastLiveInventory: compactObservation.lastLiveInventory }),
-			},
-			conversation: { ...unreadConversation, entries: unreadConversation.entries.slice(-8) },
+			observation: isPlanningDue ? compactPlanningDueObservation(overflowObservation) : overflowObservation,
+			conversation: overflowConversation,
 		});
 	}
-	return `Live Minecraft event. Choose and call the smallest useful tool now.\n${json}`;
+	const instruction = isPlanningDue
+		? 'Live Minecraft event. Program planning is due soon: prepare the next intention while the current authorised routine keeps running. This is advisory and does not require a pending decisionId; use the current programVersion and timing context, and do not blindly renew or cancel the current program.'
+		: 'Live Minecraft event. Advance the current goal using fresh facts. Keep authorised routines running while you reason; respond explicitly to pending program decisions.';
+	return `${instruction}\n${json}`;
+}
+
+function boundedEventArray(value, limit, preserve = null) {
+	const source = asArray(value);
+	const retained = source.slice(0, limit);
+	if (retained.length >= source.length || typeof preserve !== 'function') return { values: retained, omitted: source.length - retained.length };
+	let replacement = retained.length - 1;
+	for (let index = retained.length; index < source.length && replacement >= 0; index++) {
+		if (!preserve(source[index])) continue;
+		while (replacement >= 0 && preserve(retained[replacement])) replacement -= 1;
+		if (replacement < 0) break;
+		retained[replacement] = source[index];
+		replacement -= 1;
+	}
+	return { values: retained, omitted: source.length - retained.length };
+}
+
+function eventArrayCoverage(source, retained) {
+	return { retained: retained.length, availableInSnapshot: source.length, omitted: Math.max(0, source.length - retained.length) };
+}
+
+function compactEventObservationForBudget(observation) {
+	const inventoryRows = boundedEventArray(compactEventRows(observation.inventory?.items), 16, isHazardousEventFact);
+	const itemRows = boundedEventArray(compactEventRows(observation.items), 8, isHazardousEventFact);
+	const entityRows = boundedEventArray(compactEventRows(observation.entities), 8, isHazardousEventFact);
+	const blockRows = boundedEventArray(compactEventRows(observation.blocks), 12, isHazardousEventFact);
+	const landmarkRows = Array.isArray(observation.landmarks)
+		? boundedEventArray(compactEventRows(observation.landmarks), 12, isHazardousEventFact)
+		: null;
+	const nearbyContainerRows = Array.isArray(observation.nearbyContainers)
+		? boundedEventArray(compactEventRows(observation.nearbyContainers), 8, isHazardousEventFact)
+		: null;
+	const optionRows = Array.isArray(observation.options)
+		? boundedEventArray(compactEventRows(observation.options), 2)
+		: null;
+	const resultCoverage = retainedEventCoverage(observation.resultCoverage, {
+		inventory: inventoryRows.values.length,
+		items: itemRows.values.length,
+		entities: entityRows.values.length,
+		blocks: blockRows.values.length,
+		...(landmarkRows === null ? {} : { landmarks: landmarkRows.values.length }),
+		...(nearbyContainerRows === null ? {} : { nearbyContainers: nearbyContainerRows.values.length }),
+		...(optionRows === null ? {} : { options: optionRows.values.length }),
+	});
+	return {
+		...observation,
+		inventory: { ...observation.inventory, items: inventoryRows.values },
+		items: itemRows.values,
+		entities: entityRows.values,
+		blocks: blockRows.values,
+		...(landmarkRows === null ? {} : { landmarks: landmarkRows.values }),
+		...(nearbyContainerRows === null ? {} : { nearbyContainers: nearbyContainerRows.values }),
+		...(optionRows === null ? {} : { options: optionRows.values }),
+		...(observation.world === undefined ? {} : { world: compactWorldForEvent(observation.world) }),
+		...(observation.lastResult === undefined ? {} : { lastResult: compactLastResultForEvent(observation.lastResult) }),
+		...(observation.recovery === undefined ? {} : { recovery: compactRecoveryForEvent(observation.recovery) }),
+		...(observation.coverage === undefined ? {} : { coverage: compactCoverageForEvent(observation.coverage) }),
+		...(observation.perception === undefined ? {} : { perception: compactPerceptionForEvent(observation.perception) }),
+		resultCoverage,
+	};
+}
+
+function compactPlanningDueObservation(observation) {
+	const inventoryRows = boundedEventArray(compactEventRows(observation.inventory?.items), 8, isHazardousEventFact);
+	const itemRows = boundedEventArray(compactEventRows(observation.items), 4, isHazardousEventFact);
+	const entityRows = boundedEventArray(compactEventRows(observation.entities), 4, isHazardousEventFact);
+	const blockRows = boundedEventArray(compactEventRows(observation.blocks), 8, isHazardousEventFact);
+	const resultCoverage = retainedEventCoverage(observation.resultCoverage, {
+		inventory: inventoryRows.values.length,
+		items: itemRows.values.length,
+		entities: entityRows.values.length,
+		blocks: blockRows.values.length,
+		landmarks: 0,
+		nearbyContainers: 0,
+		options: 0,
+	});
+	const metadata = Object.fromEntries(['observedAtEpochMs', 'eventSequence', 'freshness', 'coverage', 'ready', 'status', 'velocity', 'perception']
+		.filter((field) => observation[field] !== undefined)
+		.map((field) => [field, observation[field]]));
+	return {
+		...metadata,
+		player: observation.player ?? {},
+		inventory: { ...observation.inventory, items: inventoryRows.values },
+		items: itemRows.values,
+		entities: entityRows.values,
+		blocks: blockRows.values,
+		...(observation.world === undefined ? {} : { world: compactWorldForEvent(observation.world) }),
+		...(observation.currentAction === undefined ? {} : { currentAction: observation.currentAction }),
+		...(observation.lastResult === undefined ? {} : { lastResult: compactLastResultForEvent(observation.lastResult) }),
+		...(observation.interaction === undefined ? {} : { interaction: observation.interaction }),
+		...(observation.death === undefined ? {} : { death: observation.death }),
+		...(observation.recovery === undefined ? {} : { recovery: compactRecoveryForEvent(observation.recovery) }),
+		...(observation.failureClass === undefined ? {} : { failureClass: observation.failureClass }),
+		...(observation.continuity === undefined ? {} : { continuity: observation.continuity }),
+		...(observation.lastLiveInventory === undefined ? {} : { lastLiveInventory: observation.lastLiveInventory }),
+		resultCoverage,
+	};
+}
+
+function retainedEventCoverage(coverage, retainedCounts) {
+	if (coverage === null || typeof coverage !== 'object' || Array.isArray(coverage)) return coverage;
+	return Object.fromEntries(Object.entries(coverage).map(([section, detail]) => {
+		if (detail === null || typeof detail !== 'object' || retainedCounts[section] === undefined) return [section, detail];
+		const available = Number.isSafeInteger(detail.availableInSnapshot) ? detail.availableInSnapshot : detail.retained;
+		const retained = retainedCounts[section];
+		return [section, { ...detail, retained, omitted: Math.max(0, available - retained) }];
+	}));
+}
+
+const COMPACT_EVENT_ROW_FIELDS = ['uuid', 'stableId', 'type', 'name', 'position', 'x', 'y', 'z', 'distance', 'blockId', 'itemId', 'count', 'slot', 'tags', 'velocity', 'bounds', 'pickable', 'parentId', 'partName', 'state', 'bearing', 'elevation', 'id', 'feasible', 'moveTo', 'reason', 'cause', 'hazard'];
+
+function compactEventRows(value) {
+	return asArray(value).map((entry) => {
+		if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return entry;
+		const compact = Object.fromEntries(COMPACT_EVENT_ROW_FIELDS.filter((field) => entry[field] !== undefined).map((field) => [field, entry[field]]));
+		return Object.keys(compact).length === 0 ? entry : compact;
+	});
+}
+
+function isHazardousEventFact(value) {
+	if (value === null || typeof value !== 'object') return false;
+	const text = ['blockId', 'itemId', 'type', 'name', 'reason', 'cause', 'hazard'].map((field) => value[field]).filter((field) => typeof field === 'string').join(' ');
+	return /lava|fire|magma|cactus|campfire|tnt|creeper|ghast|blaze|wither|warden|dragon|hostile/i.test(text);
 }
 
 function compactRecoveryForEvent(recovery) {
@@ -3881,6 +4160,28 @@ function compactWorldForEvent(world) {
 	return {
 		...(world.dimension === undefined ? {} : { dimension: world.dimension }),
 		...(world.dimensionId === undefined ? {} : { dimensionId: world.dimensionId }),
+	};
+}
+
+function compactCoverageForEvent(coverage) {
+	if (coverage === null || typeof coverage !== 'object' || Array.isArray(coverage)) return coverage;
+	return {
+		...coverage,
+		...(coverage.sections === null || typeof coverage.sections !== 'object' || Array.isArray(coverage.sections)
+			? {}
+			: { sections: Object.fromEntries(Object.entries(coverage.sections).map(([section, detail]) => [section,
+				detail === null || typeof detail !== 'object' || Array.isArray(detail) ? detail : Object.fromEntries(
+					['returned', 'total', 'omittedByWire', 'complete', 'hasMore', 'nextOffset'].filter((field) => detail[field] !== undefined).map((field) => [field, detail[field]]),
+				)])) }),
+	};
+}
+
+function compactPerceptionForEvent(perception) {
+	if (perception === null || typeof perception !== 'object' || Array.isArray(perception)) return perception;
+	return {
+		...perception,
+		...(Array.isArray(perception.events) ? { events: perception.events.slice(-8), omittedEvents: Math.max(0, perception.events.length - 8) } : {}),
+		...(Array.isArray(perception.bossBars) ? { bossBars: perception.bossBars.slice(-16), omittedBossBars: Math.max(0, perception.bossBars.length - 16) } : {}),
 	};
 }
 

@@ -13,6 +13,7 @@ const MAX_TEXT = 4096;
 const MAX_ASSERTION_ARGS = 8192;
 const MAX_EVIDENCE_BYTES = 16_384;
 const MAX_EVIDENCE_TAIL_BYTES = 262_144;
+const POST_RUN_EVIDENCE_TIMEOUT_MS = 10_000;
 const MAX_SCENARIOS = 24;
 const MAX_MATRIX_REPORT_BYTES = 262_144;
 const POLL_INTERVAL_MS = 50;
@@ -268,13 +269,13 @@ export async function runHeadlessScenario({
 	let naturalWorld = null;
 	let spawnPosition = null;
 	let spawnTicket = null;
-	const command = async (value, { readOnly = false, deadlineMs = deadline, attempt = 0 } = {}) => {
+	const command = async (value, { readOnly = false, deadlineMs = deadline, attempt = 0, recordEvidence = true } = {}) => {
 		const commandText = String(value);
 		if (readOnly && !isReadOnlyRcon(commandText)) throw new Error(`RCON assertion command is not read-only: ${commandText}`);
 		commands.push(commandText);
 		const result = await withDeadline(() => rcon.command(commandText), deadlineMs, () => logicalNow(now, startedAt, attempt), 'HEADLESS_TIMEOUT');
 		const textValue = boundedText(result?.text ?? result, MAX_EVIDENCE_BYTES);
-		if (readOnly) rconEvidence.push({ command: commandText, text: textValue });
+		if (readOnly && recordEvidence) rconEvidence.push({ command: commandText, text: textValue });
 		return { result, text: textValue };
 	};
 	const releaseSpawnTicket = async () => {
@@ -298,13 +299,13 @@ export async function runHeadlessScenario({
 				|| loading.terrainModified !== false || loading.inventoryModified !== false || !Number.isFinite(loading.elapsedMs) || loading.elapsedMs < 0 || loading.elapsedMs > 120_000) throw new Error('NATURAL_SPAWN_EVIDENCE: launcher must verify temporary spawn chunk loading');
 			spawnTicket = { operation: loading.operation, x: loading.x, z: loading.z, ready: true, elapsedMs: loading.elapsedMs, terrainModified: false, inventoryModified: false, released: false };
 			naturalWorld = { ...naturalWorld, savedSpawn: { source: saved.source, dimension: saved.dimension, x: saved.x, y: saved.y, z: saved.z }, setupInterventions: [spawnTicket] };
-			const actualSeed = parseServerSeed((await command('seed', { readOnly: true })).text);
+			const actualSeed = parseServerSeed((await command('seed', { readOnly: true, recordEvidence: false })).text);
 			if (actualSeed !== scenario.world.seed) throw new Error('NATURAL_WORLD_IDENTITY: actual server seed does not match the fresh-world manifest');
-			const difficulty = (await command('difficulty', { readOnly: true })).text;
+			const difficulty = (await command('difficulty', { readOnly: true, recordEvidence: false })).text;
 			if (!new RegExp(`\\b${scenario.world.difficulty}\\b`, 'i').test(difficulty)) throw new Error('NATURAL_WORLD_IDENTITY: actual server difficulty does not match the scenario');
 			for (const [rule, value] of Object.entries(scenario.world.rules)) {
 				if (isFailedResponse((await command(`gamerule ${rule} ${value}`)).text)) throw new Error(`NATURAL_WORLD_RULE: server rejected gamerule ${rule}`);
-				if (!new RegExp(`\\b${value}\\b`).test((await command(`gamerule ${rule}`, { readOnly: true })).text)) throw new Error(`NATURAL_WORLD_RULE: server did not verify gamerule ${rule}`);
+				if (!new RegExp(`\\b${value}\\b`).test((await command(`gamerule ${rule}`, { readOnly: true, recordEvidence: false })).text)) throw new Error(`NATURAL_WORLD_RULE: server did not verify gamerule ${rule}`);
 			}
 			const loaded = await command(`execute in minecraft:overworld if loaded ${origin.x} 0 ${origin.z} run time query gametime`);
 			if (!/\btime is \d+\b/i.test(loaded.text)) throw new Error('NATURAL_SPAWN_LOADING: spawn chunk is no longer loaded');
@@ -342,8 +343,8 @@ export async function runHeadlessScenario({
 				await waitForAgentReady({ generatedName, command, poll, deadline, now, startedAt });
 			}
 			if (naturalWorld !== null) {
-				spawnPosition = parsePlayerPosition((await command(`data get entity ${generatedName} Pos`, { readOnly: true })).text);
-				if (!/entity data:\s*\[\s*\]\s*$/i.test((await command(`data get entity ${generatedName} Inventory`, { readOnly: true })).text)) throw new Error('NATURAL_INVENTORY: newly spawned evaluation player must have an empty inventory');
+				spawnPosition = parsePlayerPosition((await command(`data get entity ${generatedName} Pos`, { readOnly: true, recordEvidence: false })).text);
+				if (!/entity data:\s*\[\s*\]\s*$/i.test((await command(`data get entity ${generatedName} Inventory`, { readOnly: true, recordEvidence: false })).text)) throw new Error('NATURAL_INVENTORY: newly spawned evaluation player must have an empty inventory');
 				await releaseSpawnTicket();
 			}
 			const start = await command(`codex start ${generatedName} ${scenario.task}`, { attempt: 0 });
@@ -379,10 +380,25 @@ export async function runHeadlessScenario({
 		if (classification === null && terminalState === 'DEAD') classification = 'DEAD';
 		if (classification === null && terminalState === null) classification = 'TIMEOUT';
 		try { minecraftMspt = parseMinecraftMspt((await command('tick query', { attempt: 0 })).text); } catch { /* optional server metric */ }
+		const taskElapsedMs = Math.max(0, Number(now()) - startedAt);
+		const postRunStartedAt = Number(now());
+		const postRunDeadline = classification === 'TIMEOUT' ? Math.max(deadline, postRunStartedAt + POST_RUN_EVIDENCE_TIMEOUT_MS) : deadline;
+		let postRunEvidence = null;
+		if (classification === 'TIMEOUT' && summoned) {
+			try {
+				const stop = await command(`codex stop ${generatedName}`, { deadlineMs: postRunDeadline });
+				if (!isStopAcknowledged(stop.text, generatedName)) throw new Error('Could not confirm stop of the timed-out headless scenario agent');
+				postRunEvidence = { snapshot: 'post_stop', status: 'STOPPED', delayMs: Math.max(0, Number(now()) - deadline) };
+			} catch {
+				postRunEvidence = { snapshot: 'post_stop', status: 'UNAVAILABLE', delayMs: Math.max(0, Number(now()) - deadline) };
+			}
+		}
 		const evidenceResult = await collectHeadlessEvidence({
 			directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets, protocolAuditOffset, assertions, terminalState, rconEvidence,
-			readOnlyCommand: (value) => command(value, { readOnly: true, attempt: 0 }),
-			deadline, now, startedAt, poll, scenario, generatedName, spawnPosition, waitForEvidence: classification === null,
+			readOnlyCommand: (value, readDeadline = deadline) => command(value, { readOnly: true, deadlineMs: readDeadline, attempt: 0 }),
+			deadline, postRunDeadline: postRunEvidence?.status === 'STOPPED' ? postRunDeadline : deadline,
+			allowRconReads: classification !== 'TIMEOUT' || postRunEvidence?.status === 'STOPPED',
+			now, startedAt, poll, scenario, generatedName, spawnPosition, waitForEvidence: classification === null,
 		});
 		const { scopedEvidence, scopedAudit, identity, assertionResult } = evidenceResult;
 		const attestation = summarizeProviderAttestation([...(scopedEvidence.providerTurnSummaries ?? []), ...(scopedEvidence.traceRows ?? [])].map((row) => ({ executionSettings: safeExecutionSettings(row.executionSettings) })), profile);
@@ -406,12 +422,12 @@ export async function runHeadlessScenario({
 		if (classification === null && scenario.requireFactualSuccess && !factualSuccess) classification = 'FAILED_USER_OBJECTIVE';
 		if (classification === null) classification = 'PASSED';
 		const status = classification === 'PASSED' ? 'PASSED' : classification === 'SKIPPED_PROFILE' ? 'SKIPPED' : 'FAILED';
-		const elapsedMs = Math.max(0, Number(now()) - startedAt);
 		const report = scenarioReport(status, scenario, {
-			classification, generatedName, lifecycle: terminalState, elapsedMs,
+			classification, generatedName, lifecycle: terminalState, elapsedMs: taskElapsedMs,
 			...(naturalWorld === null ? {} : { world: { ...naturalWorld, spawnPosition }, settings: { requested: { ...profile }, configured: identity.effectiveProfile ?? null, configuredVerified: identity.authoritative, effective: attestation.effective, evidence: attestation.evidence }, budget: { wallClockMs: timeoutMs }, observationMode: 'text_only' }),
 			commands, assertions: assertionResult.results, factualSuccess, evidence: evidenceSummary(directory, scopedEvidence, scopedAudit),
-			timings: timingSummary(profile, scopedEvidence, scopedAudit, elapsedMs),
+			...(postRunEvidence === null ? {} : { postRunEvidence }),
+			timings: timingSummary(profile, scopedEvidence, scopedAudit, taskElapsedMs),
 			metrics: performanceMetrics(profile, scopedEvidence, scopedAudit, resolvedAgentId, { minecraftMspt }),
 			diagnostics,
 			cleanup: { status: 'PENDING' },
@@ -879,12 +895,18 @@ function makeEvidence({ terminalState, protocolAudit, protocolRows = [], traceRo
 	return { lifecycle: terminalState, terminalState, chats, actions, program, rcon };
 }
 
-async function collectHeadlessEvidence({ directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets, protocolAuditOffset, assertions, terminalState, rconEvidence, readOnlyCommand, deadline, now, startedAt, poll, scenario, generatedName, spawnPosition = null, waitForEvidence = true }) {
+async function collectHeadlessEvidence({ directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets, protocolAuditOffset, assertions, terminalState, rconEvidence, readOnlyCommand, deadline, postRunDeadline = deadline, allowRconReads = true, now, startedAt, poll, scenario, generatedName, spawnPosition = null, waitForEvidence = true }) {
 	const resolvedAssertions = resolveAgentAssertions(assertions, generatedName, spawnPosition);
+	const finalReadDeadline = Math.max(deadline, postRunDeadline);
 	for (const assertion of resolvedAssertions) {
-		if (assertion.type !== 'rcon' || logicalNow(now, startedAt, 0) >= deadline) continue;
-		try { await withDeadline(() => readOnlyCommand(assertion.command), deadline, () => logicalNow(now, startedAt, 0), 'HEADLESS_TIMEOUT'); }
-		catch (error) { if (error?.code !== 'HEADLESS_TIMEOUT') throw error; }
+		if (!allowRconReads || assertion.type !== 'rcon' || logicalNow(now, startedAt, 0) >= finalReadDeadline) continue;
+		try { await withDeadline(() => readOnlyCommand(assertion.command, finalReadDeadline), finalReadDeadline, () => logicalNow(now, startedAt, 0), 'HEADLESS_TIMEOUT'); }
+		catch (error) {
+			// A post-run fact that cannot be read is unknown. The gameplay deadline
+			// has already decided the run, so do not turn a bounded evidence miss
+			// into a different classification or reuse an earlier preflight read.
+			if (error?.code !== 'HEADLESS_TIMEOUT' && finalReadDeadline === deadline) throw error;
+		}
 	}
 	let attempt = 0;
 	const currentAudit = () => auditRows(protocolAudit).slice(protocolAuditOffset);
@@ -1219,7 +1241,13 @@ function performanceMetrics(profile, fileEvidence, protocolAudit, agentId = null
 	const rawRows = [...(fileEvidence.protocolRows ?? []), ...auditRows(protocolAudit)];
 	const envelopes = rawRows.map(unwrapAuditRow).filter(Boolean);
 	const queue = turns.map((turn) => turn.queueWaitMs).filter(Number.isFinite);
-	const inference = turns.map((turn) => Number.isFinite(turn.apiDurationMs) ? turn.apiDurationMs : turn.durationMs).filter(Number.isFinite);
+	// Native turn duration includes tool execution. Only an explicitly reported
+	// provider/API duration is inference; a missing value stays unknown.
+	const inference = turns.map((turn) => turn.apiDurationMs).filter(Number.isFinite);
+	const nativeTiming = latestNativeDecisionTiming(profile, fileEvidence, protocolAudit, agentId);
+	const unknownInference = turns.filter((turn) => !Number.isFinite(turn.apiDurationMs));
+	const nativeUnknownInference = unknownInference.filter((turn) => turn.operation === 'native_turn'
+		|| nativeTiming.summaries.some((summary) => nativeTimingMatchesTurn(summary, turn))).length;
 	const observation = envelopes.flatMap((row) => {
 		const value = row.type === 'observation' ? row.payload?.metrics?.collectionMs ?? row.payload?.metrics?.observationMs : null;
 		return Number.isFinite(value) && value >= 0 ? [value] : [];
@@ -1230,17 +1258,113 @@ function performanceMetrics(profile, fileEvidence, protocolAudit, agentId = null
 		return Number.isFinite(value) && value >= 0 ? [value] : [];
 	});
 	const tokenRows = turns.map((turn) => turn.tokens ?? null);
+	const modelWait = nativeTiming.summaries.length === 1 ? nativeModelWaitMetric(nativeTiming.summaries[0]) : null;
 	return {
 		latencyMs: {
 			queue: latencyPercentiles(queue), inference: latencyPercentiles(inference),
+			inferenceUnknown: { count: unknownInference.length, nativeCount: nativeUnknownInference },
+			nativeModelWait: modelWait,
 			observation: latencyPercentiles(observation), result: latencyPercentiles(result),
 		},
+		// A roster aggregate cannot combine percentiles from separate bounded
+		// windows. Preserve each latest per-agent/profile snapshot instead.
+		...(agentIds === null || nativeTiming.summaries.length === 0 ? {} : { nativeModelWaitByAgent: nativeTiming.summaries.map(nativeModelWaitMetric) }),
+		...(nativeTiming.summaries.length === 0 ? {} : { nativeDecisionTiming: nativeTiming.summaries }),
 		tokens: Object.fromEntries(['input', 'output', 'reasoning', 'cached', 'cacheWrite'].map((category) => [category, completeTokenTotal(tokenRows, category)])),
 		retries: turns.filter((turn) => turn.retry).length,
 		rateLimits: turns.filter((turn) => turn.rateLimited || /RATE.?LIMIT|\b429\b/i.test(turn.error?.code ?? '')).length,
 		compactions: turns.filter((turn) => turn.compaction).length,
 		resources: { ...resourceMetrics(envelopes),
 			...(Number.isFinite(runtimeResources.minecraftMspt) && runtimeResources.minecraftMspt >= 0 ? { minecraftMspt: finiteMetric(runtimeResources.minecraftMspt) } : {}) },
+	};
+}
+
+/**
+ * Read the latest bounded native timing snapshot for each exact agent/profile.
+ * The snapshot's retained count is intentionally kept separate from its
+ * lifetime count; diagnostic rotation cannot reconstruct missing samples.
+ */
+function latestNativeDecisionTiming(profile, fileEvidence, protocolAudit, agentId = null) {
+	const agentIds = Array.isArray(agentId) ? new Set(agentId) : null;
+	const latest = new Map();
+	const rows = [
+		...(fileEvidence.traceRows ?? []),
+		...auditRows(protocolAudit),
+	].map(unwrapAuditRow).filter(Boolean);
+	for (let index = 0; index < rows.length; index += 1) {
+		const summary = nativeDecisionTimingSummary(rows[index]);
+		if (summary === null || !nativeTimingProfileMatches(summary, profile)) continue;
+		if (agentIds !== null) {
+			if (summary.agentId === null || !agentIds.has(summary.agentId)) continue;
+		} else if (agentId === null ? summary.agentId !== null : summary.agentId !== agentId) continue;
+		const key = nativeTimingIdentityKey(summary);
+		latest.set(key, summary);
+	}
+	return { summaries: [...latest.values()] };
+}
+
+function nativeDecisionTimingSummary(row) {
+	if (!row || typeof row !== 'object' || Array.isArray(row)) return null;
+	const event = row.event ?? row.type ?? row.stage ?? row.payload?.event ?? row.payload?.type;
+	if (event !== 'native_decision_timing') return null;
+	const source = row.payload && typeof row.payload === 'object' && !Array.isArray(row.payload) ? row.payload : row;
+	const identity = source.identity && typeof source.identity === 'object' && !Array.isArray(source.identity) ? source.identity : {};
+	const agentId = boundedAgentId(row.agentId ?? source.agentId ?? identity.agentId);
+	const provider = boundedScalar(row.provider ?? source.provider ?? identity.provider);
+	const model = boundedScalar(row.model ?? source.model ?? identity.model);
+	const reasoningEffort = boundedScalar(row.reasoningEffort ?? source.reasoningEffort ?? identity.reasoningEffort);
+	const serviceTier = boundedScalar(row.serviceTier ?? source.serviceTier ?? identity.serviceTier);
+	const profileFingerprint = boundedScalar(row.profileFingerprint ?? source.profileFingerprint ?? identity.profileFingerprint);
+	const metric = (value) => Number.isFinite(value) && value >= 0 ? Math.round(value * 1000) / 1000 : null;
+	const count = (value) => Number.isSafeInteger(value) && value >= 0 ? value : null;
+	const timingCount = count(row.timingCount ?? source.timingCount);
+	const timingLifetimeCount = count(row.timingLifetimeCount ?? source.timingLifetimeCount);
+	const timingP50Ms = metric(row.timingP50Ms ?? source.timingP50Ms);
+	const timingP95Ms = metric(row.timingP95Ms ?? source.timingP95Ms);
+	const timingSampleWindowSize = count(row.timingSampleWindowSize ?? source.timingSampleWindowSize);
+	const timingLifetimeSegmentCount = count(row.timingLifetimeSegmentCount ?? source.timingLifetimeSegmentCount);
+	const failedSegmentCount = count(row.failedSegmentCount ?? source.failedSegmentCount);
+	const cancelledSegmentCount = count(row.cancelledSegmentCount ?? source.cancelledSegmentCount);
+	if ([timingCount, timingLifetimeCount, timingP50Ms, timingP95Ms, timingSampleWindowSize, timingLifetimeSegmentCount, failedSegmentCount, cancelledSegmentCount].every((value) => value === null)) return null;
+	return {
+		agentId, profile: { provider, model, reasoningEffort, serviceTier },
+		...(profileFingerprint === null ? {} : { profileFingerprint }),
+		timingCount, timingLifetimeCount, timingP50Ms, timingP95Ms, timingSampleWindowSize,
+		timingLifetimeSegmentCount, failedSegmentCount, cancelledSegmentCount,
+	};
+}
+
+function nativeTimingProfileMatches(summary, profile) {
+	return ['provider', 'model', 'reasoningEffort', 'serviceTier'].every((field) => summary.profile[field] === profile[field]);
+}
+
+function nativeTimingIdentityKey(value) {
+	const profile = value?.profile ?? value;
+	return [value?.agentId ?? null, profile?.provider ?? null, profile?.model ?? null,
+		profile?.reasoningEffort ?? null, profile?.serviceTier ?? null, value?.profileFingerprint ?? null].join('\u0000');
+}
+
+function nativeTimingMatchesTurn(summary, turn) {
+	if (summary.agentId !== null && summary.agentId !== turn.agentId) return false;
+	return ['provider', 'model', 'reasoningEffort', 'serviceTier'].every((field) => {
+		const expected = summary.profile[field];
+		return expected === null || turn[field] === undefined || turn[field] === null || expected === turn[field];
+	});
+}
+
+function nativeModelWaitMetric(summary) {
+	return {
+		agentId: summary.agentId,
+		profile: { ...summary.profile },
+		count: summary.timingCount,
+		p50: summary.timingP50Ms,
+		p95: summary.timingP95Ms,
+		p99: null,
+		sampleWindowSize: summary.timingSampleWindowSize,
+		lifetimeCount: summary.timingLifetimeCount,
+		lifetimeSegmentCount: summary.timingLifetimeSegmentCount,
+		failedSegmentCount: summary.failedSegmentCount,
+		cancelledSegmentCount: summary.cancelledSegmentCount,
 	};
 }
 
@@ -1311,6 +1435,7 @@ function providerTurnSummary(row) {
 	if (!row || typeof row !== 'object' || Array.isArray(row)) return null;
 	const summary = {
 		provider: boundedScalar(row.provider), model: boundedScalar(row.model), reasoningEffort: boundedScalar(row.reasoningEffort),
+		...(row.operation === undefined ? {} : { operation: boundedScalar(row.operation) }),
 		attempt: Number.isSafeInteger(row.attempt) ? row.attempt : null, retry: row.retry === true,
 		timestamp: Number.isFinite(row.timestamp) ? Math.round(row.timestamp) : null, outcome: boundedScalar(row.outcome),
 	};
@@ -1416,6 +1541,12 @@ function resolveAgentAssertions(assertions, generatedName, spawnPosition = null)
 			return String(spawnPosition[axis.toLowerCase()]);
 		}) }
 		: assertion);
+}
+
+function isStopAcknowledged(value, generatedName) {
+	const response = String(value ?? '').trim();
+	const escapedName = String(generatedName).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+	return new RegExp(`^(?:Paused|Stopped)\\s+${escapedName}\\.?$`, 'i').test(response);
 }
 
 function rosterPosition(index) {

@@ -90,6 +90,7 @@ test('builds an isolated app-server process command with exact model profile', (
 		'-c', 'service_tier="fast"',
 		'-c', 'features.fast_mode=true',
 		'-c', 'mcp_servers={}',
+		'-c', 'project_doc_max_bytes=0',
 		'-c', 'features.apps=false',
 		'-c', 'features.browser_use=false',
 		'-c', 'features.computer_use=false',

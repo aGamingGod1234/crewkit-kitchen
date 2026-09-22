@@ -578,7 +578,7 @@ public final class ServerActionExecutor {
 					() -> selectItem(player, string(arguments, "itemId")));
 			case USE_ITEM -> ActiveAction.use(request, player, integer(arguments, "durationMs"),
 					nullableString(arguments, "hand") != null ? hand(arguments) : InteractionHand.MAIN_HAND,
-					nullableString(arguments, "expectedItemId"));
+					nullableString(arguments, "expectedItemId"), "once".equals(nullableString(arguments, "mode")));
 			case INTERACT_BLOCK -> ActiveAction.immediate(request, player, () -> interactBlock(
 					player,
 					blockPosition(arguments),
@@ -985,10 +985,12 @@ public final class ServerActionExecutor {
 		if (!player.isWithinAttackRange(player.getMainHandItem(), target.getBoundingBox(), 0.0D)) {
 			throw new AgentDomainException("TARGET_TOO_FAR", "Attack target is out of reach");
 		}
-		player.lookAt(net.minecraft.commands.arguments.EntityAnchorArgument.Anchor.EYES, target.getEyePosition());
+		Vec3 aimPoint = target instanceof net.minecraft.world.entity.boss.enderdragon.EnderDragonPart
+				? target.getBoundingBox().getCenter() : target.getEyePosition();
+		player.lookAt(net.minecraft.commands.arguments.EntityAnchorArgument.Anchor.EYES, aimPoint);
 		HitResult hit = Tracer.rayTrace(player, 1.0F,
-				Math.max(player.entityInteractionRange(), player.getEyePosition().distanceTo(target.getEyePosition()) + 0.1D), false);
-		if (!(hit instanceof EntityHitResult entityHit) || entityHit.getEntity() != target) {
+				Math.max(player.entityInteractionRange(), player.getEyePosition().distanceTo(aimPoint) + 0.1D), false);
+		if (!(hit instanceof EntityHitResult entityHit) || !ObservedEntityTarget.matchesHit(target, entityHit)) {
 			throw new AgentDomainException("TARGET_OBSTRUCTED", "Attack target is not under the requested aim ray");
 		}
 		player.attack(target);
@@ -997,20 +999,7 @@ public final class ServerActionExecutor {
 
 	/** Resolves only the exact UUID supplied from the agent's retained observation. */
 	static Entity resolveExactObservedTarget(ServerPlayer player, String targetId) {
-		final UUID uuid;
-		try {
-			uuid = UUID.fromString(targetId);
-		} catch (IllegalArgumentException exception) {
-			throw new AgentDomainException("TARGET_NOT_FOUND", "Target id is not a UUID");
-		}
-		Entity target = player.level().getEntity(uuid);
-		if (target == null || target.level() != player.level() || !target.isAlive() || target == player) {
-			throw new AgentDomainException("TARGET_UNAVAILABLE", "Observed target is no longer available");
-		}
-		if (!ObservationVisibility.canSeeEntity(player, target)) {
-			throw new AgentDomainException("TARGET_NOT_VISIBLE", "Observed target is no longer visible");
-		}
-		return target;
+		return ObservedEntityTarget.resolve(player, targetId);
 	}
 
 	private static void selectItem(ServerPlayer player, String itemId) {
@@ -1617,6 +1606,7 @@ public final class ServerActionExecutor {
 		private int useDurationTicks;
 		private int useElapsedTicks;
 		private long useAcceptedBaseline;
+		private boolean useOnce;
 		private boolean useStartObserved;
 
 		private ActiveAction(
@@ -1688,9 +1678,10 @@ public final class ServerActionExecutor {
 		}
 
 		static ActiveAction use(ServerActionRequest request, ServerPlayer player, long durationMs,
-				InteractionHand hand, String expectedItemId) {
+				InteractionHand hand, String expectedItemId, boolean once) {
 			if (expectedItemId != null) requireHeldItem(player.getItemInHand(hand), expectedItemId);
 			ActiveAction action = new ActiveAction(request, player, Mode.USE, durationMs, null, null, 0.0D, false, null);
+			action.useOnce = once;
 			action.useHand = hand;
 			action.useDurationTicks = Math.toIntExact(Math.max(1L, (durationMs + 49L) / 50L));
 			return action;
@@ -1847,8 +1838,8 @@ public final class ServerActionExecutor {
 			if (mode == Mode.USE) {
 				useElapsedTicks++;
 				useStartObserved |= player.isUsingItem() && player.getUsedItemHand() == useHand;
-				if (useElapsedTicks >= useDurationTicks) {
-					long accepted = Math.max(0L, AgentInputRuntime.controller(player).acceptedUses(request.agentId()) - useAcceptedBaseline);
+				long accepted = Math.max(0L, AgentInputRuntime.controller(player).acceptedUses(request.agentId()) - useAcceptedBaseline);
+				if (useElapsedTicks >= useDurationTicks || useOnce && accepted > 0) {
 					releaseInput();
 					return accepted > 0
 							? result(ServerActionState.SUCCEEDED, "USE_INPUT_CONFIRMED",
@@ -2009,7 +2000,11 @@ public final class ServerActionExecutor {
 		}
 
 		ServerActionProgress progress(long now) {
-			double bounded = Math.max(0.0D, Math.min(lastObservation == null ? 0.99D : 1.0D, lastProgress));
+			// Navigation can replan between its tick result and authoritative snapshot.
+			// Publish the snapshot's fraction with that snapshot, not the prior endpoint's.
+			double bounded = lastObservation != null && lastObservation.progress() != null
+					? lastObservation.progress().value()
+					: Math.max(0.0D, Math.min(lastObservation == null ? 0.99D : 1.0D, lastProgress));
 			if (!progressEmission.shouldEmit(bounded, now)) return null;
 			return new ServerActionProgress(
 					request.agentId(),

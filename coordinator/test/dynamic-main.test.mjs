@@ -1564,7 +1564,7 @@ test('native Codex control dispatches and returns a real body result inside one 
 		const command = run.bridge.sent.find((message) => message.type === 'action_command');
 		assert.equal(command.payload.actionType, 'chat');
 		assert.equal(command.payload.provenance.model, 'gpt-5.6-sol');
-		assert.match(planner.requests[0].input, /smallest useful tool now/i);
+		assert.match(planner.requests[0].input, /advance the current goal using fresh facts/i);
 		run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: command.payload.actionId, state: 'SUCCEEDED', reasonCode: '', executionStarted: true, eventSequence: 2 } });
 		for (let index = 0; index < 20; index += 1) await new Promise((resolve) => setImmediate(resolve));
 		assert.deepEqual(runtimeErrors, [], runtimeErrors[0]?.stack ?? runtimeErrors[0]?.message);
@@ -2220,6 +2220,7 @@ test('native model-authored sequence keeps lifecycle acting until its final body
 	const registry = new AgentRegistry();
 	const planner = new FakePlanner(registry);
 	planner.requestNativeTurn = async (request) => {
+		if (planner.requests.length > 0) return { status: 'completed', toolCalls: 0 };
 		planner.requests.push(request);
 		await request.executeTool({
 			agentId: request.agentId,
@@ -2254,7 +2255,7 @@ test('native model-authored sequence keeps lifecycle acting until its final body
 		await eventually(() => run.bridge.sent.filter((message) => message.type === 'action_command').length === 2);
 		assert.equal(run.registry.get('agent-a').state, DynamicAgentState.ACTING);
 		const second = run.bridge.sent.filter((message) => message.type === 'action_command')[1];
-		run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: second.payload.actionId, state: 'SUCCEEDED', reasonCode: '', executionStarted: true, eventSequence: 3 } });
+		run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: second.payload.actionId, state: 'SUCCEEDED', reasonCode: '', executionStarted: true, eventSequence: run.bridge.latestSequences.get('agent-a') + 1 } });
 		await eventually(() => run.registry.get('agent-a').state === DynamicAgentState.PLANNING);
 	} finally {
 		await run.coordinator.stop();
@@ -2273,7 +2274,10 @@ test('native lookAround holds an action lease and acting state across its camera
 		return token;
 	};
 	goalSupervisor.end = (token) => released.push(token);
+	let swept = false;
 	planner.requestNativeTurn = async (request) => {
+		if (swept) return { status: 'completed', toolCalls: 0 };
+		swept = true;
 		planner.requests.push(request);
 		await request.executeTool({
 			agentId: request.agentId, goalRevision: request.goalRevision,
@@ -2298,7 +2302,7 @@ test('native lookAround holds an action lease and acting state across its camera
 			assert.equal(run.registry.get('agent-a').state, DynamicAgentState.ACTING);
 			assert.equal(released.includes(actionLease), false);
 			assert.equal(commands()[index].payload.actionType, 'control');
-			run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: commands()[index].payload.actionId, state: 'SUCCEEDED', reasonCode: '', executionStarted: true, eventSequence: index + 2 } });
+			run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: commands()[index].payload.actionId, state: 'SUCCEEDED', reasonCode: '', executionStarted: true, eventSequence: index * 2 + 2 } });
 		}
 		await eventually(() => run.registry.get('agent-a').state === DynamicAgentState.PLANNING);
 		assert.equal(released.filter((token) => token === actionLease).length, 1);
@@ -2419,6 +2423,100 @@ test('a pre-disconnect native completion cannot complete the replacement lifecyc
 		await new Promise((resolve) => setImmediate(resolve));
 		assert.equal(run.registry.get('agent-a').state, DynamicAgentState.DISCONNECTED);
 	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('operator confirmation wait drops ordinary continuation but admits urgent input and a new goal', async () => {
+	const bridge = new DeferredCompletionBridge();
+	const registry = new AgentRegistry();
+	const timers = new ManualTimerQueue();
+	const planner = new FakePlanner(registry);
+	let releaseFirstTurn;
+	const firstTurn = new Promise((resolve) => { releaseFirstTurn = resolve; });
+	let settleFirstTurn;
+	const firstTurnSettled = new Promise((resolve) => { settleFirstTurn = resolve; });
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		const firstRequest = planner.requests.length === 1;
+		if (firstRequest) {
+			const result = await request.executeTool({
+				agentId: request.agentId,
+				goalRevision: request.goalRevision,
+				turnId: 'turn-awaiting-confirmation',
+				callId: 'finish-awaiting-confirmation',
+				tool: { kind: 'finish', summary: 'The logs are collected.' },
+			});
+			assert.equal(result.state, 'AWAITING_OPERATOR_CONFIRMATION');
+			await firstTurn;
+		}
+		if (firstRequest) settleFirstTurn();
+		return { status: 'completed', toolCalls: firstRequest ? 1 : 0 };
+	};
+	const run = await start({
+		bridge,
+		registry,
+		planner,
+		goalSchedule: timers.schedule,
+		cancelGoalSchedule: timers.cancel,
+		config: {
+			bridge: { port: 25570, secret: 's'.repeat(32) },
+			codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
+		},
+	});
+	const observation = (eventSequence, x = 0) => ({
+		agentId: 'agent-a',
+		payload: {
+			goalRevision: 1,
+			eventSequence,
+			attention: false,
+			observation: { player: { x, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+		},
+	});
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: {
+			operation: 'start', goalRevision: 1, goal: 'Collect 8 oak logs.', goalSpec: immutableGoalSpec('Collect 8 oak logs.'),
+		} });
+		run.bridge.emit('observation', observation(1));
+		await eventually(() => planner.requests.length === 1 && bridge.sent.some(({ type }) => type === 'goal_completed'));
+		const completion = bridge.sent.find(({ type }) => type === 'goal_completed');
+		// Queue ordinary work before the server answers the completion request.
+		run.bridge.emit('observation', observation(2, 1));
+		await new Promise((resolve) => setImmediate(resolve));
+		bridge.emit('goal_completion_result', { agentId: 'agent-a', payload: {
+			goalRevision: 1,
+			traceId: completion.payload.traceId,
+			goalFingerprint: completion.payload.goalFingerprint,
+			verified: false,
+			reasonCode: 'PREDICATE_FAILED',
+			facts: [{ type: 'operator_confirmed', satisfied: false }],
+		} });
+		releaseFirstTurn();
+		await firstTurnSettled;
+		for (let sequence = 3; sequence <= 8; sequence += 1) {
+			run.bridge.emit('observation', observation(sequence, sequence));
+			await new Promise((resolve) => setImmediate(resolve));
+		}
+		assert.equal(planner.requests.length, 1, 'ordinary observations cannot restart a confirmation-waiting goal');
+		assert.equal(timers.pendingCount, 0, 'confirmation wait terminates supervision instead of arming recovery');
+
+		run.bridge.emit('conversation_event', { agentId: 'agent-a', payload: {
+			sequence: 1, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
+			text: 'Please answer me.', goalRevision: 1, observedAtEpochMs: 1_787_184_000_000,
+		} });
+		await eventually(() => planner.requests.length === 2);
+		assert.equal(planner.requests[1].priority, 'urgent');
+		for (let index = 0; index < 5; index += 1) await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(planner.requests.length, 2, 'urgent operator input remains deliverable without rearming ordinary work');
+
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: {
+			operation: 'steer', goalRevision: 2, goal: 'Wait for the next instruction.',
+		} });
+		run.bridge.emit('observation', { ...observation(9), payload: { ...observation(9).payload, goalRevision: 2 } });
+		await eventually(() => planner.requests.length === 3);
+		assert.equal(planner.requests[2].goalRevision, 2, 'a new goal revision clears the confirmation wait gate');
+	} finally {
+		releaseFirstTurn();
 		await run.coordinator.stop();
 	}
 });
@@ -2857,6 +2955,64 @@ test('urgent native conversation steers the active model turn while its body act
 	} finally {
 		await run.coordinator.stop();
 	}
+});
+
+test('a detected movement loop steers once until movement escapes and a new loop begins', async () => {
+	let release;
+	const gate = new Promise(resolve => { release = resolve; });
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	const steers = [];
+	planner.requestNativeTurn = async request => { planner.requests.push(request); await gate; return { status: 'completed', toolCalls: 0 }; };
+	planner.steerNativeTurn = async request => { steers.push(request); return { turnId: 'thinking' }; };
+	const run = await start({ registry, planner, config: {
+		bridge: { port: 25570, secret: 's'.repeat(32) },
+		codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
+	} });
+	let sequence = 0;
+	const observe = async x => {
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: ++sequence, attention: false,
+			observation: { player: { x, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await new Promise(resolve => setImmediate(resolve));
+	};
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Find a tree.' } });
+		await observe(0);
+		await eventually(() => planner.requests.length === 1);
+		for (const x of [1, 0, 1, 0, 1, 1, 1, 1]) await observe(x);
+		assert.equal(steers.length, 1, 'one unresolved loop must not flood the thinking model');
+		assert.match(steers[0].input, /movement_loop/);
+		for (const x of [2, 3, 4, 5, 6, 5, 6, 5, 6]) await observe(x);
+		assert.equal(steers.length, 2, 'escaping the first loop rearms detection for a different loop');
+	} finally { release(); await run.coordinator.stop(); }
+});
+
+test('new resource observations coalesce behind an active model turn without interrupting it', async () => {
+	let release;
+	const gate = new Promise(resolve => { release = resolve; });
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	const steers = [];
+	planner.requestNativeTurn = async request => { planner.requests.push(request); await gate; return { status: 'completed', toolCalls: 0 }; };
+	planner.steerNativeTurn = async request => { steers.push(request); };
+	const run = await start({ registry, planner, config: {
+		bridge: { port: 25570, secret: 's'.repeat(32) },
+		codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
+	} });
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Find a tree.' } });
+		for (let index = 0; index <= 6; index++) {
+			run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: index + 1, attention: false,
+				observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], inventory: { items: [], tagCounts: {} },
+					blocks: index === 0 ? [] : [{ stableId: `tree-${index}`, x: index, y: 64, z: 0, blockId: 'minecraft:oak_log' }] } } });
+			await new Promise(resolve => setImmediate(resolve));
+		}
+		assert.equal(planner.requests.length, 1);
+		assert.equal(steers.length, 0, 'resource discoveries must not continually restart reconsideration');
+		release();
+		await eventually(() => planner.requests.length === 2);
+		assert.equal(JSON.parse(planner.requests[1].input.split('\n').slice(1).join('\n')).observation.blocks[0].x, 6);
+	} finally { release(); await run.coordinator.stop(); }
 });
 
 test('failed urgent native steering retains one pending turn with the newest event', async () => {
@@ -4884,4 +5040,220 @@ test('Director generation handles cast-only requests once and never sends world 
   assert.equal(JSON.parse(replies[0].payload.script).steps[0].action,'jump');
   assert.equal(run.bridge.sent.filter(message=>message.type==='action_command').length,0);
  }finally{await run.coordinator.stop();}
+});
+
+test('accepted completion interrupts the old turn and fences its subsequent calls', async () => {
+ let release;
+ const gate = new Promise(resolve => { release = resolve; });
+ const registry = new AgentRegistry();
+ const planner = new FakePlanner(registry);
+ planner.requestNativeTurn = async request => { planner.requests.push(request); await gate; return { status: 'completed', toolCalls: 0 }; };
+ const run = await start({ registry, planner, config: {
+  bridge: { port: 25570, secret: 's'.repeat(32) },
+  codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
+ } });
+ try {
+  run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Collect logs.' } });
+  run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+  await eventually(() => planner.requests.length === 1);
+  run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'complete', goalRevision: 2 } });
+  await eventually(() => registry.get('agent-a').state === DynamicAgentState.COMPLETED);
+  assert.ok(planner.interruptions.includes('agent-a'));
+  const before = run.bridge.sent.filter(message => message.type === 'action_command').length;
+  const result = await planner.requests[0].executeTool({ agentId: 'agent-a', goalRevision: 1, tool: { kind: 'action', actionType: 'wait', arguments: { durationMs: 1 } } });
+  assert.equal(result.state, 'CANCELLED');
+  assert.equal(result.executed, false);
+  assert.equal(result.reasonCode, 'STALE_PLAN');
+  assert.equal(run.bridge.sent.filter(message => message.type === 'action_command').length, before);
+ } finally { release(); await run.coordinator.stop(); }
+});
+
+test('a background native routine continues during delayed reconsideration and stops with the goal', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	let handle, returned = false, releaseDecision;
+	const delayedDecision = new Promise(resolve => { releaseDecision = resolve; });
+	planner.requestNativeTurn = async request => {
+		planner.requests.push(request);
+		if (planner.requests.length === 2) await delayedDecision;
+		if (!handle) {
+			handle = await request.executeTool({ agentId: request.agentId, goalRevision: request.goalRevision,
+				turnId: 'background-turn', callId: 'background-call', tool: { kind: 'run_program', background: true,
+					source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2); await player.wait(3);' } });
+		}
+		returned = true;
+		return { status: 'completed', toolCalls: 1 };
+	};
+	const run = await start({ registry, planner, goalSupervisor: new RecordingGoalSupervisor(),
+		config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } } });
+	const commands = () => run.bridge.sent.filter(message => message.type === 'action_command');
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait in a routine.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1,
+			observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => returned && commands().length === 1);
+		assert.equal(handle.state, 'RUNNING');
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { ...run.bridge.latestObservations.get('agent-a'), eventSequence: 2, attention: true, changedFacts: [] } });
+		run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: commands()[0].payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 2 } });
+		await eventually(() => commands().length === 2);
+		assert.equal(commands()[1].payload.arguments.durationMs, 2);
+		assert.equal(commands()[1].payload.provenance.programId, handle.programId);
+		const previous = run.bridge.latestObservations.get('agent-a');
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { ...previous, eventSequence: run.bridge.latestSequences.get('agent-a') + 1,
+			player: { ...previous.player, health: 18 }, attention: true, changedFacts: ['player.health'] } });
+		await eventually(() => planner.requests.length === 2);
+		assert.match(planner.requests[1].input, /program_attention/);
+		assert.match(planner.requests[1].input, /"decisionId":/);
+		run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: commands()[1].payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: run.bridge.latestSequences.get('agent-a') + 1 } });
+		await eventually(() => commands().length === 3);
+		assert.equal(commands()[2].payload.arguments.durationMs, 3, 'body progresses while the second model turn is unresolved');
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'stop', goalRevision: 2 } });
+		await eventually(() => run.bridge.sent.some(message => message.type === 'action_cancel' && message.payload.actionId === commands()[2].payload.actionId));
+		run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: commands()[2].payload.actionId, state: 'SUCCEEDED', reasonCode: 'LATE_RESULT', eventSequence: run.bridge.latestSequences.get('agent-a') + 1 } });
+		releaseDecision();
+		await new Promise(resolve => setImmediate(resolve));
+		assert.equal(commands().length, 3, 'late model completion and receipts cannot restart the stopped routine');
+	} finally { releaseDecision(); await run.coordinator.stop(); }
+});
+
+
+test('measured planning lead steers the same native turn once while its routine keeps executing', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	const steers = [];
+	let handle, releaseTurn;
+	const thinking = new Promise(resolve => { releaseTurn = resolve; });
+	planner.getNativeDecisionTiming = () => ({ count: 4, p50Ms: 4000, p95Ms: 5000 });
+	planner.steerNativeTurn = async request => { steers.push(request); };
+	planner.requestNativeTurn = async request => {
+		planner.requests.push(request);
+		handle = await request.executeTool({ agentId: request.agentId, goalRevision: request.goalRevision,
+			turnId: 'prepare-turn', callId: 'prepare-call', tool: { kind: 'run_program', background: true,
+				timeoutMs: 5000, source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2);' } });
+		await thinking;
+		return { status: 'completed', toolCalls: 1 };
+	};
+	const run = await start({ registry, planner, goalSupervisor: new RecordingGoalSupervisor(),
+		config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } } });
+	const commands = () => run.bridge.sent.filter(message => message.type === 'action_command');
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Keep working while preparing.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1,
+			observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => handle && commands().length === 1);
+		// The planning deadline timer is clamped to the next timer turn. Let that
+		// turn run before asserting the advisory, rather than relying on a finite
+		// number of setImmediate iterations.
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		await eventually(() => steers.length === 1);
+		assert.match(steers[0].input, /program_planning_due/);
+		assert.match(steers[0].input, /"planningLeadMs":5000/);
+		assert.match(steers[0].input, /"deadlineEpochMs":/);
+		assert.equal(planner.requests.length, 1, 'preparation must use the existing selected-model turn');
+		assert.equal(run.bridge.sent.some(message => message.type === 'action_cancel'), false);
+		run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: commands()[0].payload.actionId,
+			state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 2 } });
+		await eventually(() => commands().length === 2);
+		assert.equal(commands()[1].payload.arguments.durationMs, 2);
+		assert.equal(steers.length, 1, 'ordinary progress must not repeat the preparation reminder');
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'stop', goalRevision: 2 } });
+		await eventually(() => run.bridge.sent.some(message => message.type === 'action_cancel'));
+		releaseTurn();
+		await new Promise(resolve => setImmediate(resolve));
+		assert.equal(commands().length, 2);
+	} finally { releaseTurn(); await run.coordinator.stop(); }
+});
+
+test('a slow planning advisory does not block urgent steering or consume conversation', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	const steers = [];
+	let releasePreparation;
+	const preparationGate = new Promise((resolve) => { releasePreparation = resolve; });
+	let handle, releaseTurn;
+	const turnGate = new Promise((resolve) => { releaseTurn = resolve; });
+	planner.getNativeDecisionTiming = () => ({ count: 4, p50Ms: 4000, p95Ms: 5000 });
+	planner.steerNativeTurn = async (request) => {
+		steers.push(request);
+		if (steers.length === 1) await preparationGate;
+	};
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		handle = await request.executeTool({ agentId: request.agentId, goalRevision: request.goalRevision,
+			turnId: 'prepare-turn', callId: 'prepare-call', tool: { kind: 'run_program', background: true,
+				timeoutMs: 5000, source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2);' } });
+		await turnGate;
+		return { status: 'completed', toolCalls: 1 };
+	};
+	const run = await start({ registry, planner, goalSupervisor: new RecordingGoalSupervisor(),
+		config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } } });
+	const commands = () => run.bridge.sent.filter((message) => message.type === 'action_command');
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Keep working while preparing.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1,
+			observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => handle && commands().length === 1);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		await eventually(() => steers.length === 1);
+		const advisory = JSON.parse(steers[0].input.split('\n').at(-1));
+		assert.deepEqual(advisory.conversation.entries, [], 'advisory must not consume unread conversation');
+
+		run.bridge.emit('conversation_event', { agentId: 'agent-a', payload: {
+			sequence: 1, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
+			text: 'Please answer while the routine continues.', goalRevision: 1, observedAtEpochMs: 1_787_184_000_001,
+		} });
+		await eventually(() => steers.length === 2);
+		const urgent = JSON.parse(steers[1].input.split('\n').at(-1));
+		assert.deepEqual(urgent.conversation.entries.map(({ sequence }) => sequence), [1]);
+		assert.equal(planner.requests.length, 1, 'urgent steering stays on the existing model turn');
+		assert.equal(run.bridge.sent.some((message) => message.type === 'action_cancel'), false, 'advisory must not cancel the body');
+
+		releasePreparation();
+		releaseTurn();
+		await new Promise((resolve) => setImmediate(resolve));
+	} finally {
+		releasePreparation();
+		releaseTurn();
+		await run.coordinator.stop();
+	}
+});
+
+test('stopping a native routine suppresses its pending planning reminder', async (t) => {
+	// Keep the one-millisecond reminder pending until the stop is delivered.
+	// A real timer can legitimately fire while eventually() yields on a busy host.
+	t.mock.timers.enable({ apis: ['setTimeout'] });
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	const steers = [];
+	let handle, releaseTurn;
+	const turnGate = new Promise((resolve) => { releaseTurn = resolve; });
+	planner.getNativeDecisionTiming = () => ({ count: 4, p50Ms: 4000, p95Ms: 4999 });
+	planner.steerNativeTurn = async (request) => { steers.push(request); };
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		handle = await request.executeTool({ agentId: request.agentId, goalRevision: request.goalRevision,
+			turnId: 'prepare-turn', callId: 'prepare-call', tool: { kind: 'run_program', background: true,
+			timeoutMs: 5000, source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2);' } });
+		await turnGate;
+		return { status: 'completed', toolCalls: 1 };
+	};
+	const run = await start({ registry, planner, goalSupervisor: new RecordingGoalSupervisor(),
+		config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } } });
+	const commands = () => run.bridge.sent.filter((message) => message.type === 'action_command');
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Stop before preparing.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1,
+			observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => handle && commands().length === 1);
+		assert.equal(steers.length, 0, 'the reminder has not fired before the stop');
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'stop', goalRevision: 2 } });
+		await eventually(() => run.bridge.sent.some((message) => message.type === 'action_cancel'));
+		t.mock.timers.tick(1);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(steers.length, 0, 'a stopped program cannot deliver its queued reminder');
+		assert.equal(planner.requests.length, 1, 'stopping the body cannot create a successor model turn');
+	} finally {
+		releaseTurn();
+		await run.coordinator.stop();
+	}
 });

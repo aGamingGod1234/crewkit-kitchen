@@ -248,6 +248,7 @@ public final class ServerActionExecutorVerification {
 				"action observations reject executor timer progress bases");
 		ServerActionRequest cancellationTarget = new ServerActionRequest(
 				progressAgent, 7L, "action-7", ActionType.WAIT, new JsonObject(), provenance);
+		verifyProgressUsesObservedSnapshot(cancellationTarget, observation);
 		assertThrows(NullPointerException.class, () -> new ServerActionRequest(
 				progressAgent, 7L, "action-7", ActionType.WAIT, new JsonObject(), null
 		), "requests reject absent provenance");
@@ -337,9 +338,31 @@ public final class ServerActionExecutorVerification {
 			admitted[start] = true;
 		}
 		verifyModelOnlyControlBoundary();
-		return 112 + dev.agaminggod.arenaagents.protocol.PlayerActionSchemaVerification.verify()
+		return 114 + dev.agaminggod.arenaagents.protocol.PlayerActionSchemaVerification.verify()
 				+ dev.agaminggod.arenaagents.server.perception.PlayerKnowledgeInspectionVerification.verify()
-				+ verifyInteractionOutlineHit();
+				+ verifyInteractionOutlineHit() + verifyMultipartHitTies();
+	}
+
+	private static int verifyMultipartHitTies() {
+		try {
+			Field field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+			field.setAccessible(true);
+			sun.misc.Unsafe unsafe = (sun.misc.Unsafe) field.get(null);
+			var dragon = (net.minecraft.world.entity.boss.enderdragon.EnderDragon) unsafe.allocateInstance(net.minecraft.world.entity.boss.enderdragon.EnderDragon.class);
+			var head = (net.minecraft.world.entity.boss.enderdragon.EnderDragonPart) unsafe.allocateInstance(net.minecraft.world.entity.boss.enderdragon.EnderDragonPart.class);
+			var neck = (net.minecraft.world.entity.boss.enderdragon.EnderDragonPart) unsafe.allocateInstance(net.minecraft.world.entity.boss.enderdragon.EnderDragonPart.class);
+			Field parent = head.getClass().getDeclaredField("parentMob");
+			unsafe.putObject(head, unsafe.objectFieldOffset(parent), dragon);
+			unsafe.putObject(neck, unsafe.objectFieldOffset(parent), dragon);
+			head.setBoundingBox(new net.minecraft.world.phys.AABB(8, 69, -6.5, 9, 70, -5.5));
+			var shared = new net.minecraft.world.phys.EntityHitResult(neck, new Vec3(8.5, 69.8, -6.5));
+			assertTrue(ObservedEntityTarget.matchesHit(head, shared), "shared head/neck intersection retains requested part");
+			assertFalse(ObservedEntityTarget.matchesHit(head, new net.minecraft.world.phys.EntityHitResult(neck, new Vec3(8.5, 71, -6.5))), "nearer neck outside head remains obstructive");
+			unsafe.putObject(neck, unsafe.objectFieldOffset(parent), unsafe.allocateInstance(dragon.getClass()));
+			assertFalse(ObservedEntityTarget.matchesHit(head, shared), "another dragon remains obstructive even at the same point");
+			assertTrue(ObservedEntityTarget.matchesHit(head, new net.minecraft.world.phys.EntityHitResult(head, new Vec3(8.5, 69.8, -6.5))), "exact part identity remains valid");
+			return 4;
+		} catch (ReflectiveOperationException exception) { throw new AssertionError("could not allocate multipart geometry fixture", exception); }
 	}
 
 	private static int verifyInteractionOutlineHit() {
@@ -624,6 +647,31 @@ public final class ServerActionExecutorVerification {
 			return manager;
 		} catch (ReflectiveOperationException exception) {
 			throw new AssertionError("could not allocate setup-failure manager", exception);
+		}
+	}
+
+	private static void verifyProgressUsesObservedSnapshot(ServerActionRequest request, ServerActionObservation observation) {
+		try {
+			Class<?> actionClass = Class.forName(ServerActionExecutor.class.getName() + "$ActiveAction");
+			var waitFor = actionClass.getDeclaredMethod(
+					"waitFor", ServerActionRequest.class, net.minecraft.server.level.ServerPlayer.class, long.class);
+			waitFor.setAccessible(true);
+			Object action = waitFor.invoke(null, request, null, 1000L);
+			// Replanning can change the endpoint after tick() returns its fraction;
+			// authoritativeState() then observes a different, valid distance fraction.
+			Field priorProgress = actionClass.getDeclaredField("lastProgress");
+			priorProgress.setAccessible(true);
+			priorProgress.setDouble(action, 0.5D);
+			Field snapshot = actionClass.getDeclaredField("lastObservation");
+			snapshot.setAccessible(true);
+			snapshot.set(action, observation);
+			var publish = actionClass.getDeclaredMethod("progress", long.class);
+			publish.setAccessible(true);
+			ServerActionProgress event = (ServerActionProgress) publish.invoke(action, System.currentTimeMillis());
+			assertEquals(observation.progress().value(), event.progress(), "progress uses the same physical snapshot as its evidence");
+			assertEquals(observation, event.actionObservation(), "progress preserves the authoritative observation");
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("could not publish replanned navigation progress", exception);
 		}
 	}
 

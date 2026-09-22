@@ -44,3 +44,13 @@ The remaining production hooks are:
 The instrumentation comparison runs two counterbalanced rounds: disabled/enabled, then enabled/disabled, or the inverse when requested. Disabled runs turn off the latency tracker, benchmark recorder, control-latency registry, and system sampler. The check uses nearest-rank p95 of paired enabled/disabled full-path duration ratios. It also requires nonblank matching action-command and scenario-outcome hashes, so missing behavior evidence cannot pass as null parity.
 
 Run the final claim gate through `scripts/run-performance-reliability-verification.ps1 -ClaimTwoX` with baseline, optimized, instrumentation, and policy files. Missing live credentials, warm evidence, exact workload pairing, required spans, factual parity, sample counts, or instrumentation comparison makes the command fail.
+
+## Continuous native execution
+
+Native turns may contain many tool calls and remain open while the player acts. Their full duration includes tool execution and must not be reported as pure model inference. Native decision telemetry separates provider waiting between tool calls from tool execution. First tool request, first successful result, and first physical effect are different boundaries; none establishes first-token latency.
+
+Planning ahead uses measured successful decision segments for the same agent and execution profile. A bounded rolling p95 supplies the lead time before a program's original deadline. With no measurements, no speculative timer is armed. Each program can issue one preparation advisory. It continues its authorised work, preserves pending hazard decisions, and retains its original deadline and action budget. Foreground calls can return the advisory to their caller; background calls notify or steer the same selected model. Obsolete program versions and stopped goals cannot use a queued advisory to restart work.
+
+The advisory asks the model to prepare a next intention, including saving a routine for a short `noteKey` invocation. It does not automatically queue or execute a successor. A program that ends earlier than its deadline can still require a new decision at completion. Adaptive observation cadence remains model-selected through `observationIntervalMs`; server-tick control branches are a separate, faster path for reactions already authored by the model.
+
+Evaluate these changes using matched tasks and model settings, reporting success alongside latency and token use where available. A bounded timing window and lifetime counters survive diagnostic file rotation in subsequent snapshots, but they do not reconstruct missing per-event traces. Missing timing or usage stays unknown. These measurements alone do not establish an end-to-end speed or cost improvement.

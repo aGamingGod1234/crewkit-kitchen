@@ -26,6 +26,8 @@ test('native program reference shares the actual language, action contract and e
 	assert.match(ARENA_SCRIPT_API_REFERENCE, /Watcher example/);
 	assert.match(ARENA_SCRIPT_API_REFERENCE, /world\.queryMemory/);
 	assert.match(ARENA_SCRIPT_API_REFERENCE, /runtime never requests another model/);
+	assert.match(ARENA_SCRIPT_API_REFERENCE, /bounded background(?::true)? work/);
+	assert.match(ARENA_SCRIPT_API_REFERENCE, /reuse exact noteKey if fresh prerequisites\/targets match/);
 	assert.doesNotMatch(ARENA_SCRIPT_API_REFERENCE, /Return exactly one JSON object/);
 });
 
@@ -69,12 +71,34 @@ test('every shipped planner example compiles and executes its intended branch wi
 			assert.equal(yielded.call.primitive, 'wait');
 			validateAction({ type: 'wait', durationMs: yielded.call.arguments });
 		} else {
-			assert.deepEqual(dispatched, ['break_block', 'pick_up_item']);
+			assert.deepEqual(dispatched, ['look_at', 'break_block', 'pick_up_item']);
 			assert.equal(yielded.kind, 'finish');
 		}
 		results.push(yielded.kind);
 	}
 	assert.deepEqual(results, ['finish', 'command']);
+});
+
+test('collection example yields for missing targets or failed aim and verifies inventory after mining', () => {
+	const source = /Multi-tree collection example:\n([\s\S]*?)\n\nWatcher example/.exec(PLANNER_SYSTEM_PROMPT)[1];
+	const observation = { player: { x: 0, y: 64, z: 0, health: 20 },
+		blocks: [{ stableId: 'block-1', blockId: 'minecraft:oak_log', x: 1, y: 64, z: 0, tags: ['#minecraft:logs'] }],
+		items: [], entities: [], inventory: { items: [], tagCounts: { '#minecraft:logs': 0 } } };
+	const missing = new ArenaScriptInterpreter(parseArenaScript(source), SCRIPT_BINDINGS);
+	assert.equal(missing.start(createInterpreterFacts({ ...observation, blocks: [] })).kind, 'checkpoint');
+	const failedAim = new ArenaScriptInterpreter(parseArenaScript(source), SCRIPT_BINDINGS);
+	let step = failedAim.start(createInterpreterFacts(observation));
+	assert.equal(step.call.primitive, 'look_at');
+	assert.deepEqual({ ...step.call.arguments }, { x: 1.5, y: 64.5, z: 0.5 });
+	step = failedAim.resume({ stateToken: step.stateToken, state: 'FAILED', reasonCode: 'TARGET_UNAVAILABLE' }, createInterpreterFacts(observation));
+	assert.equal(step.kind, 'checkpoint', 'a failed aim never dispatches mining');
+	const collected = new ArenaScriptInterpreter(parseArenaScript(source), SCRIPT_BINDINGS);
+	step = collected.start(createInterpreterFacts(observation));
+	step = collected.resume({ stateToken: step.stateToken, state: 'SUCCEEDED', reasonCode: 'DONE' }, createInterpreterFacts(observation));
+	assert.equal(step.call.primitive, 'break_block');
+	const inventory = { items: [{ itemId: 'minecraft:oak_log', count: 8, slot: 0 }], tagCounts: { '#minecraft:logs': 8 } };
+	step = collected.resume({ stateToken: step.stateToken, state: 'SUCCEEDED', reasonCode: 'BLOCK_BROKEN' }, createInterpreterFacts({ ...observation, blocks: [], inventory }));
+	assert.equal(step.kind, 'finish', 'automatic collection ends the loop without targeting a vanished drop');
 });
 
 test('planner input always carries complete authoritative state with explicitly labeled empty supplemental deltas', () => {
@@ -99,6 +123,16 @@ test('planner tells agents to collect observed drops and never pause for routine
 	assert.match(PLANNER_SYSTEM_PROMPT, /player\.control\(\{ forward, strafe, jump, sneak, sprint, attack, use, yaw, pitch, selectedSlot, hand, ticks \}\)/);
 	assert.match(PLANNER_SYSTEM_PROMPT, /Await the frame before the next body action/);
 	assert.match(PLANNER_SYSTEM_PROMPT, /player\.equipItem\(\{ sourceSlot, targetSlot, expectedItemId \}\)/);
+	assert.match(PLANNER_SYSTEM_PROMPT, /start bounded background:true runProgram/);
+	assert.match(PLANNER_SYSTEM_PROMPT, /paginate nextOffset/);
+	assert.match(PLANNER_SYSTEM_PROMPT, /reuse exact noteKey/);
+	assert.match(PLANNER_SYSTEM_PROMPT, /prerequisites\/targets/);
+	assert.match(PLANNER_SYSTEM_PROMPT, /ArenaScript can't call it/);
+	assert.match(PLANNER_SYSTEM_PROMPT, /inspect owns entityType\/recipe filters/);
+	assert.match(PLANNER_SYSTEM_PROMPT, /noteKey executes the whole note as source/);
+	assert.match(PLANNER_SYSTEM_PROMPT, /player\.state\(\)\.velocity and world\.state\(\)\.landmarks/);
+	assert.match(PLANNER_SYSTEM_PROMPT, /observationIntervalMs:100\.\.5000/);
+	assert.doesNotMatch(PLANNER_SYSTEM_PROMPT, /runProgram accepts noteKey[^\n]*entityType/);
 });
 
 test('supplemental context sends changed entries and forces full baselines on stale bindings', () => {

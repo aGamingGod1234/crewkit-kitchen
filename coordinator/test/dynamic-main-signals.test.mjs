@@ -24,7 +24,7 @@ test('new observed resource is promoted without misclassifying ordinary heartbea
 		{ attention: false },
 		observation,
 		{ resourceDiscovery: true },
-	), { attention: true, priority: 'urgent', trigger: 'resource_discovery' });
+	), { attention: true, priority: 'ordinary', trigger: 'resource_discovery' });
 	assert.deepEqual(classifyObservationTrigger({ attention: false }, observation), {
 		attention: false,
 		priority: 'ordinary',

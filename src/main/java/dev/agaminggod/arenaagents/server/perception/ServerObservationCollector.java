@@ -300,6 +300,7 @@ public final class ServerObservationCollector {
 				ObservationVisibility.Frame visibility = ObservationVisibility.frame(agent.level(), agent);
 				List<Entity> visible = agent.level().getEntities(agent, agent.getBoundingBox().inflate(ENTITY_SIGHT_DISTANCE), Entity::isAlive)
 						.stream().filter(entity -> agent.distanceToSqr(entity) <= (double) ENTITY_SIGHT_DISTANCE * ENTITY_SIGHT_DISTANCE)
+						.filter(entity -> !query.has("entityType") || BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString().equals(query.get("entityType").getAsString()))
 						.filter(visibility::canSeeEntity).sorted(Comparator.comparingDouble(agent::distanceToSqr)).toList();
 				result = ObservationPage.collect(visible.size(), offset, limit, index -> entityDetails(agent, visible.get(index)), "current_visible_entities_within_128_blocks");
 			}

@@ -1884,6 +1884,16 @@ function currentCollectorObservation() {
 	return payload;
 }
 
+test('multipart identities survive wire validation and adaptation', () => {
+	const observation = currentCollectorObservation();
+	observation.entities = [{ uuid: '11111111-1111-1111-1111-111111111111', type: 'minecraft:ender_dragon', name: 'Head', distance: 2, position: { x: 2, y: 64, z: 0 }, pickable: true, parentId: '22222222-2222-2222-2222-222222222222', partName: 'head' }];
+	const wire = validateProtocolV2Payload('observation', observation);
+	const adapted = adaptObservation(wire);
+	assert.equal(adapted.entities[0].parentId, observation.entities[0].parentId);
+	assert.equal(adapted.entities[0].partName, 'head');
+	assert.equal(adapted.entities[0].pickable, true);
+});
+
 test('accepts the exact rich ready observation emitted by ServerObservationCollector', () => {
 	const payload = currentCollectorObservation();
 	const normalized = validateProtocolV2Payload('observation', payload);

@@ -1,0 +1,269 @@
+{
+  "status": "COMPLETED",
+  "startedAt": "2026-09-21T12:44:21.939359+00:00",
+  "finishedAt": "2026-09-21T12:57:24.502111+00:00",
+  "baseCommit": "62dfb9af18c916058b820409065bc51ad39caaea",
+  "matrix": {
+    "version": 1,
+    "scenarios": [
+      {
+        "id": "continuous-routine-development",
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "reasoningEffort": "low",
+        "serviceTier": "priority",
+        "task": "Collect 8 oak logs with a reusable background runProgram routine saved in your notebook. Read programReference before authoring the routine.",
+        "timeoutMs": 360000,
+        "rosterSize": 1,
+        "requireFactualSuccess": true,
+        "world": {
+          "mode": "natural",
+          "seed": "20260920",
+          "difficulty": "normal",
+          "gameMode": "survival"
+        },
+        "assert": [
+          {
+            "type": "lifecycle",
+            "state": "COMPLETED"
+          },
+          {
+            "type": "rcon",
+            "command": "data get entity {agent} Inventory",
+            "match": "minecraft:oak_log"
+          },
+          {
+            "type": "rcon",
+            "command": "data get entity {agent} Inventory",
+            "match": "count: 8"
+          }
+        ]
+      }
+    ]
+  },
+  "matrixSha256": "759cc4c5ba1196d9cb9fc75079175ce38b0ff7144c8ca261d8d9ffeba287d9bc",
+  "sourceSha256": "b1ddd20d5659148bc61025445307b47de97caa8b5e2848307eabbaebeb72b384",
+  "jarSha256": "e8482ce2fd15af545b9ff45d3087efad2ed244926f8577fa7ef4c55a8ddc3fc3",
+  "beforeTrials": [
+    {
+      "index": 2,
+      "arm": "after",
+      "status": "FAILED",
+      "classification": "TIMEOUT",
+      "runIds": [
+        "run-1789982891474-68388254"
+      ],
+      "scenarioElapsedMs": 360011,
+      "wrapperElapsedMs": 393359,
+      "lifecycleCompleted": false,
+      "finalOakLogs": 4,
+      "inventoryTargetMet": false,
+      "inventoryReads": [
+        "Agent inventory: [{count: 3, Slot: 0b, id: \"minecraft:oak_sapling\"}, {count: 4, Slot: 1b, id: \"minecraft:oak_log\"}, {count: 4, Slot: 2b, id: \"minecraft:stick\"}]"
+      ],
+      "postRunEvidence": {
+        "snapshot": "post_stop",
+        "status": "STOPPED",
+        "delayMs": 18
+      },
+      "cleanupStatus": "CLEAN",
+      "configuredProfileVerified": true,
+      "effectiveProviderSettings": null,
+      "nativeModelWait": {
+        "agentId": "33b55ed9-1d00-44e3-8e4f-e899213bd5a2",
+        "profile": {
+          "provider": "codex",
+          "model": "gpt-5.6-sol",
+          "reasoningEffort": "low",
+          "serviceTier": "priority"
+        },
+        "count": 32,
+        "p50": 2819,
+        "p95": 11560,
+        "p99": null,
+        "sampleWindowSize": 64,
+        "lifetimeCount": 32,
+        "lifetimeSegmentCount": 32,
+        "failedSegmentCount": 0,
+        "cancelledSegmentCount": 0
+      },
+      "tokenUsage": {
+        "input": null,
+        "output": null,
+        "reasoning": null,
+        "cached": null,
+        "cacheWrite": null
+      }
+    },
+    {
+      "index": 3,
+      "arm": "after",
+      "status": "FAILED",
+      "classification": "TIMEOUT",
+      "runIds": [
+        "run-1789983284548-b25237a7"
+      ],
+      "scenarioElapsedMs": 360010,
+      "wrapperElapsedMs": 387094,
+      "lifecycleCompleted": false,
+      "finalOakLogs": 0,
+      "inventoryTargetMet": false,
+      "inventoryReads": [
+        "Agent inventory: []"
+      ],
+      "postRunEvidence": {
+        "snapshot": "post_stop",
+        "status": "STOPPED",
+        "delayMs": 14
+      },
+      "cleanupStatus": "CLEAN",
+      "configuredProfileVerified": true,
+      "effectiveProviderSettings": null,
+      "nativeModelWait": {
+        "agentId": "fb37faa0-3ef7-462c-8c26-45afb7a2331f",
+        "profile": {
+          "provider": "codex",
+          "model": "gpt-5.6-sol",
+          "reasoningEffort": "low",
+          "serviceTier": "priority"
+        },
+        "count": 18,
+        "p50": 2761,
+        "p95": 8600,
+        "p99": null,
+        "sampleWindowSize": 64,
+        "lifetimeCount": 18,
+        "lifetimeSegmentCount": 18,
+        "failedSegmentCount": 0,
+        "cancelledSegmentCount": 0
+      },
+      "tokenUsage": {
+        "input": null,
+        "output": null,
+        "reasoning": null,
+        "cached": null,
+        "cacheWrite": null
+      }
+    }
+  ],
+  "afterTrials": [
+    {
+      "index": 1,
+      "runIds": [
+        "run-1789994662837-75e86057"
+      ],
+      "status": "FAILED",
+      "classification": "TIMEOUT",
+      "elapsedMs": 360003,
+      "finalOakLogs": 8,
+      "inventoryTargetMet": true,
+      "firstEightLogsObservedAfterGoalStartMs": 182541,
+      "lifecycleCompleted": false,
+      "goalPredicate": {
+        "type": "all_of",
+        "predicates": [
+          {
+            "type": "inventory_contains",
+            "itemId": "minecraft:oak_log",
+            "count": 8
+          },
+          {
+            "type": "operator_confirmed"
+          }
+        ]
+      },
+      "completionChecks": [
+        {
+          "verified": false,
+          "reasonCode": "PREDICATE_FAILED",
+          "facts": [
+            {
+              "type": "inventory_contains",
+              "satisfied": true,
+              "expectedValue": "minecraft:oak_log x8",
+              "observedValue": "minecraft:oak_log x8"
+            },
+            {
+              "type": "operator_confirmed",
+              "satisfied": false,
+              "expectedValue": "operator confirmation",
+              "observedValue": "not confirmed"
+            }
+          ]
+        }
+      ],
+      "postRunEvidence": {
+        "snapshot": "post_stop",
+        "status": "STOPPED",
+        "delayMs": 5
+      },
+      "cleanupStatus": "CLEAN",
+      "configuredProfileVerified": true,
+      "inventoryReads": [
+        "Agent inventory: [{count: 8, Slot: 0b, id: \"minecraft:oak_log\"}]"
+      ]
+    },
+    {
+      "index": 2,
+      "runIds": [
+        "run-1789995056487-2b5492a1"
+      ],
+      "status": "FAILED",
+      "classification": "TIMEOUT",
+      "elapsedMs": 360014,
+      "finalOakLogs": 8,
+      "inventoryTargetMet": true,
+      "firstEightLogsObservedAfterGoalStartMs": 222087,
+      "lifecycleCompleted": false,
+      "goalPredicate": {
+        "type": "all_of",
+        "predicates": [
+          {
+            "type": "inventory_contains",
+            "itemId": "minecraft:oak_log",
+            "count": 8
+          },
+          {
+            "type": "operator_confirmed"
+          }
+        ]
+      },
+      "completionChecks": [
+        {
+          "verified": false,
+          "reasonCode": "PREDICATE_FAILED",
+          "facts": [
+            {
+              "type": "inventory_contains",
+              "satisfied": true,
+              "expectedValue": "minecraft:oak_log x8",
+              "observedValue": "minecraft:oak_log x8"
+            },
+            {
+              "type": "operator_confirmed",
+              "satisfied": false,
+              "expectedValue": "operator confirmation",
+              "observedValue": "not confirmed"
+            }
+          ]
+        }
+      ],
+      "postRunEvidence": {
+        "snapshot": "post_stop",
+        "status": "STOPPED",
+        "delayMs": 16
+      },
+      "cleanupStatus": "CLEAN",
+      "configuredProfileVerified": true,
+      "inventoryReads": [
+        "Agent inventory: [{count: 8, Slot: 0b, id: \"minecraft:oak_log\"}]"
+      ]
+    }
+  ],
+  "limitations": [
+    "Before trials are the two retained pre-fix realtime-build trials; after trials ran later on the same Mini PC. This is not counterbalanced and model decisions vary.",
+    "Same freeform request and matrix; generated completion predicates can differ. Inventory target is reported independently from lifecycle and operator confirmation.",
+    "Post-stop inventory is not an exact deadline snapshot.",
+    "Two trials per build do not establish a reliable population success rate."
+  ]
+}
