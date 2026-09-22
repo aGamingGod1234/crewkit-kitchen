@@ -137,10 +137,14 @@ export class ObservedMemoryStore {
 		for (const block of observedBlocks(observation)) {
 			const key = `${block.x},${block.y},${block.z}`;
 			const previous = scope.blocks.get(key);
-			const changed = previous !== undefined && (previous.blockId !== block.blockId || previous.blockState !== block.blockState);
+			const sameBlock = previous?.blockId === block.blockId;
+			// Landmark/container summaries can omit properties; absence is not a state change.
+			const blockState = block.blockState ?? (sameBlock ? previous.blockState : undefined);
+			const blockStateObservedTick = block.blockState !== undefined ? tick : previous?.blockStateObservedTick ?? previous?.lastSeenTick;
+			const changed = previous !== undefined && (!sameBlock || previous.blockState !== undefined && block.blockState !== undefined && previous.blockState !== block.blockState);
 			this.#cell(scope, block, { seen: true, changed });
 			scope.blocks.delete(key);
-			scope.blocks.set(key, { key, x: block.x, y: block.y, z: block.z, blockId: block.blockId, ...(block.blockState ? { blockState: block.blockState } : {}), firstSeenTick: previous?.firstSeenTick ?? tick, lastSeenTick: tick });
+			scope.blocks.set(key, { key, x: block.x, y: block.y, z: block.z, blockId: block.blockId, ...(blockState ? { blockState, blockStateObservedTick } : {}), firstSeenTick: previous?.firstSeenTick ?? tick, lastSeenTick: tick });
 		}
 		trim(scope.blocks, this.#maximumBlocks);
 		this.#bound(agent);
@@ -166,7 +170,12 @@ export class ObservedMemoryStore {
 		const scope = agent?.scopes.get(scopeKey(worldId, dimension));
 		const tick = nowTick ?? scope?.tick ?? 0;
 		const cells = scope ? [...scope.cells.values()].map((cell) => ({ ...cell, blocked: (cell.blockedUntilTick ?? -1) > tick, stale: tick - cell.lastObservedTick > this.#staleAfterTicks })) : [];
-		const blocks = scope && limit > 0 ? [...scope.blocks.values()].filter((block) => blockId === null || block.blockId === blockId).slice(-Math.min(limit, this.#maximumBlocks)).map((block) => ({ ...block, stale: tick - block.lastSeenTick > this.#staleAfterTicks })) : [];
+		const blocks = scope && limit > 0 ? [...scope.blocks.values()].filter((block) => blockId === null || block.blockId === blockId).slice(-Math.min(limit, this.#maximumBlocks)).map((block) => {
+			const value = { ...block, stale: tick - block.lastSeenTick > this.#staleAfterTicks };
+			// Identity-only sightings cannot make old door/container properties current again.
+			if (tick - (block.blockStateObservedTick ?? block.lastSeenTick) > this.#staleAfterTicks) delete value.blockState;
+			return value;
+		}) : [];
 		return { worldId, dimension, tick, position: scope?.position ? { ...scope.position } : null, cells, blocks, knownCells: cells.length, seenCells: cells.filter((cell) => cell.seen).length, visitedCells: cells.filter((cell) => cell.visited).length, blockedCells: cells.filter((cell) => cell.blocked).length };
 	}
 	clear(agentId) {
@@ -208,10 +217,21 @@ export function observedBlocks(observation) {
 		for (const block of Array.isArray(list) ? list : []) {
 			const position = block?.position ?? block;
 			if (!position || ![position.x, position.y, position.z].every(Number.isFinite) || typeof block.blockId !== 'string' || block.blockId.length > 256 || block.visible === false) continue;
-			result.set(`${position.x},${position.y},${position.z}`, { x: position.x, y: position.y, z: position.z, blockId: block.blockId, ...(typeof block.blockState === 'string' ? { blockState: block.blockState.slice(0, 1024) } : {}) });
+			const key = `${position.x},${position.y},${position.z}`;
+			const previous = result.get(key);
+			const blockState = observedBlockState(block) ?? (previous?.blockId === block.blockId ? previous.blockState : undefined);
+			result.set(key, { x: position.x, y: position.y, z: position.z, blockId: block.blockId, ...(blockState ? { blockState } : {}) });
 		}
 	}
 	return [...result.values()];
+}
+
+function observedBlockState(block) {
+	// The wire carries a property map; sort it so serialization order cannot clear failures.
+	if (block.state && typeof block.state === 'object' && !Array.isArray(block.state) && Object.values(block.state).every((value) => typeof value === 'string')) {
+		return JSON.stringify(Object.fromEntries(Object.entries(block.state).sort(([left], [right]) => left.localeCompare(right)))).slice(0, 1024);
+	}
+	return typeof block.blockState === 'string' ? block.blockState.slice(0, 1024) : undefined;
 }
 
 function scopeKey(worldId, dimension) { return JSON.stringify([worldId, dimension]); }
@@ -222,5 +242,5 @@ function projectCell(cell) {
 	return Object.fromEntries(['key', 'seen', 'visited', 'firstObservedTick', 'lastObservedTick', 'lastSeenTick', 'lastVisitedTick', 'blockedAtTick', 'blockedUntilTick', 'reasonCode'].filter((field) => cell[field] !== undefined).map((field) => [field, cell[field]]));
 }
 function projectBlock(block) {
-	return { key: block.key, x: block.x, y: block.y, z: block.z, blockId: block.blockId, ...(typeof block.blockState === 'string' ? { blockState: block.blockState.slice(0, 1024) } : {}), firstSeenTick: block.firstSeenTick, lastSeenTick: block.lastSeenTick };
+	return { key: block.key, x: block.x, y: block.y, z: block.z, blockId: block.blockId, ...(typeof block.blockState === 'string' ? { blockState: block.blockState.slice(0, 1024), blockStateObservedTick: Number.isSafeInteger(block.blockStateObservedTick) && block.blockStateObservedTick >= 0 && block.blockStateObservedTick <= block.lastSeenTick ? block.blockStateObservedTick : block.lastSeenTick } : {}), firstSeenTick: block.firstSeenTick, lastSeenTick: block.lastSeenTick };
 }

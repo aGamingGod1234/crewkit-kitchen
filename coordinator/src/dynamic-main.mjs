@@ -327,6 +327,7 @@ export class DynamicCoordinator extends EventEmitter {
 				&& work.lifecycleGeneration === key.lifecycleGeneration
 				&& work.supervisionToken?.operationId === lease.operationId) {
 				work.expired = true;
+				this.#restoreNativeConversation(work.steerRequest);
 				this.#restoreNativeConversation(work.request);
 				if (work.request.conversationOnly === true) {
 					this.#nativeConversationRecoveries.set(work.agentId, {
@@ -918,7 +919,10 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#cancelGoalSpecRequests();
 			for (const record of this.#registry.list()) {
 				const work = this.#providerWork.get(record.agentId);
-				if (work?.kind === 'native') this.#restoreNativeConversation(work.request);
+				if (work?.kind === 'native') {
+					this.#restoreNativeConversation(work.steerRequest);
+					this.#restoreNativeConversation(work.request);
+				}
 				this.#nativeConversationRecoveries.delete(record.agentId);
 				this.#goalSupervisor.suspend(this.#supervisionKey(record));
 				this.#advanceLifecycleGeneration(record.agentId);
@@ -1266,6 +1270,7 @@ export class DynamicCoordinator extends EventEmitter {
 			request,
 			pending: null,
 			steerQueued: null,
+			steerRequest: null,
 			steerPromise: null,
 			preparationPromise: null,
 			traceId: planningTraceId(record.agentId, record.goalRevision, request.lifecycleGeneration, 'native'),
@@ -1376,9 +1381,18 @@ export class DynamicCoordinator extends EventEmitter {
 	}
 
 	async #drainNativeSteering(work) {
+		const isCurrent = () => work.expired !== true
+			&& this.#providerWork.get(work.agentId) === work
+			&& this.#registry.get(work.agentId)?.goalRevision === work.goalRevision
+			&& this.#isConnectionEpochCurrent(work.connectionEpoch)
+			&& this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration);
 		while (work.steerQueued !== null) {
+			// Death and reconnect can replace a lifecycle without changing the goal
+			// revision. Never deliver its queued events into the replacement turn.
+			if (!isCurrent()) { work.steerQueued = null; return; }
 			const request = work.steerQueued;
 			work.steerQueued = null;
+			work.steerRequest = request;
 			try {
 				const record = this.#registry.get(work.agentId);
 				if (record === null || record.goalRevision !== work.goalRevision) throw Object.assign(new Error('Native steering belongs to an obsolete goal'), { code: 'STALE_PLAN' });
@@ -1388,6 +1402,7 @@ export class DynamicCoordinator extends EventEmitter {
 					goalRevision: work.goalRevision,
 					input: this.#nativeTurnInput(record, request),
 				});
+				if (!isCurrent()) { work.steerQueued = null; return; }
 				this.#writeTrace('native_turn_steered', {
 					agentId: work.agentId,
 					goalRevision: work.goalRevision,
@@ -1395,6 +1410,9 @@ export class DynamicCoordinator extends EventEmitter {
 					trigger: request.trigger,
 				});
 			} catch (error) {
+				// A late rejection has no authority to rewind current conversation
+				// delivery or add recovery work after its lifecycle has ended.
+				if (!isCurrent()) { work.steerQueued = null; return; }
 				this.#restoreNativeConversation(request);
 				work.pending = mergePlannerRequest(work.pending, request);
 				if (work.steerQueued !== null) work.pending = mergePlannerRequest(work.pending, work.steerQueued);
@@ -1406,6 +1424,8 @@ export class DynamicCoordinator extends EventEmitter {
 					errorCode: String(error?.code ?? 'TURN_STEER_FAILED').slice(0, 128),
 				});
 				return;
+			} finally {
+				work.steerRequest = null;
 			}
 		}
 	}
@@ -1936,6 +1956,10 @@ export class DynamicCoordinator extends EventEmitter {
 	}
 
 	#advanceLifecycleGeneration(agentId) {
+		// Reclaim unacknowledged steering before a replacement can consume it.
+		// Late callbacks then have no delivery cursor left to rewind.
+		const work = this.#providerWork.get(agentId);
+		if (work?.kind === 'native') this.#restoreNativeConversation(work.steerRequest);
 		this.#inspections.cancel(agentId);
 		this.#memorySummaries.delete(agentId);
 		const next = this.#lifecycleGeneration(agentId) + 1;

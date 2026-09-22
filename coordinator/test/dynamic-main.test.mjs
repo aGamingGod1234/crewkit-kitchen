@@ -3015,6 +3015,119 @@ test('new resource observations coalesce behind an active model turn without int
 	} finally { release(); await run.coordinator.stop(); }
 });
 
+for (const steerOutcome of ['resolved', 'rejected']) {
+test(`queued native steering cannot cross a same-revision death lifecycle (${steerOutcome})`, async () => {
+	let releaseTurn;
+	let releaseSteer;
+	const turnGate = new Promise(resolve => { releaseTurn = resolve; });
+	const steerGate = new Promise((resolve, reject) => {
+		releaseSteer = () => steerOutcome === 'resolved' ? resolve() : reject(Object.assign(new Error('old turn ended'), { code: 'TURN_NOT_ACTIVE' }));
+	});
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	const steers = [];
+	const traceEvents = [];
+	planner.requestNativeTurn = async request => {
+		planner.requests.push(request);
+		await turnGate;
+		return { status: 'completed', toolCalls: 0 };
+	};
+	planner.steerNativeTurn = async request => {
+		steers.push(request);
+		if (steers.length === 1) await steerGate;
+	};
+	const run = await start({ registry, planner, traceWriter: { write(event) { traceEvents.push(event); } }, config: {
+		bridge: { port: 25570, secret: 's'.repeat(32) },
+		codex: { controlProtocol: 'native_tools' },
+	} });
+	const say = sequence => run.bridge.emit('conversation_event', { agentId: 'agent-a', payload: {
+		sequence, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
+		text: `Pre-death instruction ${sequence}.`, goalRevision: 1, observedAtEpochMs: 1_787_184_000_000 + sequence,
+	} });
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Explore.', updatedAtEpochMs: 1 } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1,
+			observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+		} });
+		await eventually(() => planner.requests.length === 1);
+		say(1);
+		await eventually(() => steers.length === 1);
+		say(2);
+		for (let index = 0; index < 5; index++) await new Promise(resolve => setImmediate(resolve));
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'dead', goalRevision: 1, updatedAtEpochMs: 2, death: DEATH } });
+		await eventually(() => run.registry.get('agent-a').state === DynamicAgentState.DEAD);
+		releaseSteer();
+		for (let index = 0; index < 10; index++) await new Promise(resolve => setImmediate(resolve));
+		assert.equal(steers.length, 1, 'the old turn must not deliver queued instructions after death');
+		assert.equal(traceEvents.includes('native_turn_steer_deferred'), false, 'obsolete failures cannot restore delivery or queue recovery');
+		releaseTurn();
+		await eventually(() => planner.requests.length === 2);
+		assert.match(planner.requests[1].input, /Pre-death instruction 1\./, 'replacement turn must receive unacknowledged steering conversation');
+		assert.match(planner.requests[1].input, /Pre-death instruction 2\./, 'replacement turn must receive queued conversation');
+	} finally {
+		releaseSteer();
+		releaseTurn();
+		await run.coordinator.stop();
+	}
+});
+}
+
+test('reconnect replays unacknowledged steering before replacement delivery and fences a late rejection', async () => {
+	let releaseTurn;
+	let rejectSteer;
+	const turnGate = new Promise(resolve => { releaseTurn = resolve; });
+	const steerGate = new Promise((resolve, reject) => { rejectSteer = reject; });
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	const steers = [];
+	planner.requestNativeTurn = async request => {
+		planner.requests.push(request);
+		await turnGate;
+		return { status: 'completed', toolCalls: 1 };
+	};
+	planner.steerNativeTurn = async request => {
+		steers.push(request);
+		if (steers.length === 1) await steerGate;
+	};
+	const run = await start({ registry, planner, config: {
+		bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' },
+	} });
+	const observe = () => run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+		goalRevision: 1, eventSequence: 1,
+		observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+	} });
+	const say = sequence => run.bridge.emit('conversation_event', { agentId: 'agent-a', payload: {
+		sequence, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
+		text: `Reconnect instruction ${sequence}.`, goalRevision: 1, observedAtEpochMs: 1_787_184_000_000 + sequence,
+	} });
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Explore.', updatedAtEpochMs: 1 } });
+		observe();
+		await eventually(() => planner.requests.length === 1);
+		say(1);
+		await eventually(() => steers.length === 1);
+		run.bridge.emit('disconnected');
+		await eventually(() => run.registry.get('agent-a').state === DynamicAgentState.DISCONNECTED);
+		run.bridge.emit('ready', { serverInstanceId: 'test', registry: [
+			{ ...record(), state: DynamicAgentState.STARTING, currentGoal: 'Explore.', goalRevision: 1 },
+		] });
+		await eventually(() => run.bridge.sent.some(message => message.type === 'agent_ready' && message.payload?.reconciled === true));
+		observe();
+		await eventually(() => planner.requests.length === 2);
+		assert.match(planner.requests[1].input, /Reconnect instruction 1\./);
+		rejectSteer(Object.assign(new Error('old turn ended'), { code: 'TURN_NOT_ACTIVE' }));
+		for (let index = 0; index < 5; index++) await new Promise(resolve => setImmediate(resolve));
+		say(2);
+		await eventually(() => steers.length === 2);
+		assert.match(steers[1].input, /Reconnect instruction 2\./);
+		assert.doesNotMatch(steers[1].input, /Reconnect instruction 1\./, 'late failure must not rewind replacement delivery');
+	} finally {
+		rejectSteer(Object.assign(new Error('old turn ended'), { code: 'TURN_NOT_ACTIVE' }));
+		releaseTurn();
+		await run.coordinator.stop();
+	}
+});
+
 test('failed urgent native steering retains one pending turn with the newest event', async () => {
 	let releaseFirst;
 	const firstGate = new Promise((resolve) => { releaseFirst = resolve; });

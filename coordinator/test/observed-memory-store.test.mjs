@@ -33,6 +33,21 @@ test('blocked evidence expires and changed observed blocks clear prior failure w
 	assert.equal(memory.query('a').blocks[0].blockId, 'minecraft:air');
 });
 
+test('observed door state changes clear blocked evidence, while reordered and partial sightings do not', () => {
+	const memory = new ObservedMemoryStore();
+	const door = { blockId: 'minecraft:oak_door', x: 12, y: 64, z: 0 };
+	const ingest = (tick, block) => memory.ingest('a', view('one', 'minecraft:overworld', tick, 0, [block]));
+	ingest(10, { ...door, state: { open: 'false', facing: 'north' } });
+	memory.markBlocked('a', { worldId: 'one', dimension: 'minecraft:overworld', ...door });
+	ingest(11, { ...door, state: { facing: 'north', open: 'false' } });
+	assert.equal(memory.query('a').blockedCells, 1, 'property order is not a world change');
+	ingest(12, door);
+	assert.equal(memory.query('a').blockedCells, 1, 'missing state is not a world change');
+	ingest(13, { ...door, state: { facing: 'north', open: 'true' } });
+	assert.equal(memory.query('a').blockedCells, 0, 'opening the same door invalidates its old obstruction');
+	assert.deepEqual(JSON.parse(memory.query('a').blocks[0].blockState), { facing: 'north', open: 'true' });
+});
+
 test('time rollback invalidates only that dimension and remembered records remain bounded', () => {
 	const memory = new ObservedMemoryStore({ maximumCells: 2, maximumBlocks: 2 });
 	memory.ingest('a', view('one', 'minecraft:the_nether', 1, 8, [stone]));
@@ -44,15 +59,56 @@ test('time rollback invalidates only that dimension and remembered records remai
 	assert.equal(memory.query('a', { worldId: 'one', dimension: 'minecraft:the_nether' }).blocks.length, 0, 'old dimension records are evicted by the total per-agent budget');
 });
 
+test('partial sightings refresh block identity without refreshing remembered property age', () => {
+	const memory = new ObservedMemoryStore({ staleAfterTicks: 30 });
+	const door = { ...stone, blockId: 'minecraft:oak_door' };
+	const ingest = (tick, block) => memory.ingest('a', view('one', 'minecraft:overworld', tick, 0, [block]));
+	ingest(10, { ...door, state: { open: 'false' } });
+	for (const tick of [20, 30, 40]) ingest(tick, door);
+	assert.equal(memory.query('a').blocks[0].blockState, '{"open":"false"}');
+	ingest(41, door);
+	assert.equal(memory.query('a').blocks[0].stale, false, 'identity was just observed');
+	assert.equal(memory.query('a').blocks[0].blockState, undefined, 'expired properties are not current facts');
+	ingest(42, { ...door, state: { open: 'true' } });
+	assert.equal(memory.query('a').blocks[0].blockState, '{"open":"true"}');
+	ingest(43, stone);
+	assert.equal(memory.query('a').blocks[0].blockState, undefined, 'replacement does not inherit properties');
+});
+
+test('durable property age survives partial sightings and legacy records use lastSeenTick', async (t) => {
+	const directory = await mkdtemp(join(tmpdir(), 'property-age-'));
+	t.after(() => rm(directory, { recursive: true, force: true }));
+	const memory = new ObservedMemoryStore({ directory, staleAfterTicks: 30 });
+	const door = { ...stone, blockId: 'minecraft:oak_door' };
+	memory.ingest('a', view('one', 'minecraft:overworld', 10, 0, [{ ...door, state: { open: 'false' } }]));
+	memory.ingest('a', view('one', 'minecraft:overworld', 40, 0, [door]));
+	await memory.flush('a');
+	const restored = new ObservedMemoryStore({ directory, staleAfterTicks: 30 });
+	await restored.load('a');
+	const scope = { worldId: 'one', dimension: 'minecraft:overworld' };
+	assert.equal(restored.query('a', { ...scope, nowTick: 40 }).blocks[0].blockState, '{"open":"false"}');
+	assert.equal(restored.query('a', { ...scope, nowTick: 41 }).blocks[0].blockState, undefined);
+	await new AtomicAgentStore({ directory, namespace: 'observed' }).write('legacy', { version: 1, scopes: [{
+		...scope, tick: 10, position: null, cells: [], blocks: [{ ...door, key: '12,80,0', firstSeenTick: 10, lastSeenTick: 10, blockState: '{"open":"false"}' }],
+	}] });
+	await restored.load('legacy');
+	assert.equal(restored.query('legacy', { ...scope, nowTick: 40 }).blocks[0].blockState, '{"open":"false"}');
+	restored.ingest('legacy', view('one', 'minecraft:overworld', 41, 0, [door]));
+	assert.equal(restored.query('legacy').blocks[0].blockState, undefined);
+});
+
 test('atomic observed-memory save survives a new instance and excludes arbitrary world fields', async (t) => {
 	const directory = await mkdtemp(join(tmpdir(), 'observed-memory-'));
 	t.after(() => rm(directory, { recursive: true, force: true }));
 	const memory = new ObservedMemoryStore({ directory });
-	memory.ingest('../agent', { ...view('one', 'minecraft:overworld', 10, 0, [stone]), secret: 'do-not-copy', world: { worldId: 'one', dimension: 'minecraft:overworld', gameTime: 10, seed: 'hidden-seed' } });
+	const door = { ...stone, blockId: 'minecraft:oak_door', state: { open: 'true', facing: 'north' } };
+	memory.ingest('../agent', { ...view('one', 'minecraft:overworld', 10, 0, [door]), secret: 'do-not-copy', world: { worldId: 'one', dimension: 'minecraft:overworld', gameTime: 10, seed: 'hidden-seed' } });
 	await memory.flush('../agent');
 	const restored = new ObservedMemoryStore({ directory });
 	await restored.load('../agent');
-	assert.equal(restored.query('../agent', { worldId: 'one', dimension: 'minecraft:overworld' }).blocks[0].blockId, 'minecraft:stone');
+	const savedDoor = restored.query('../agent', { worldId: 'one', dimension: 'minecraft:overworld' }).blocks[0];
+	assert.equal(savedDoor.blockId, 'minecraft:oak_door');
+	assert.deepEqual(JSON.parse(savedDoor.blockState), { facing: 'north', open: 'true' });
 	const files = await readdir(directory);
 	assert.equal(files.length, 1);
 	assert.doesNotMatch(await readFile(join(directory, files[0]), 'utf8'), /hidden-seed|do-not-copy/);

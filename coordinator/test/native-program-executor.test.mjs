@@ -151,6 +151,57 @@ test('deadlines cancel exact inputs and unresolved acknowledgements are reported
 	assert.equal(result.receipts.length, 0);
 });
 
+test('a late cancellation failure cannot stop the interrupt handler after the old action acknowledges', async () => {
+	const commands = [], releases = [];
+	let rejectCancel;
+	let sequence = 2;
+	const run = setup({
+		executeAction: (command) => {
+			commands.push(command);
+			return new Promise((resolve) => { releases.push(resolve); });
+		},
+		cancelAction: () => new Promise((resolve, reject) => { rejectCancel = reject; }),
+		refreshObservation: async () => ({ observation: observation(4), eventSequence: ++sequence }),
+	});
+	const pending = run.executor.run(record, { source: `${prefix}
+		program.watch(() => player.state().health < 10, { mode: "interrupt" }, async () => { await player.wait(9); });
+		await player.wait(100);
+	` }, run.context);
+	run.executor.onObservation(record, { observation: observation(4), eventSequence: 2, attention: true, priority: 'urgent', trigger: 'health_changed' });
+	releases[0]({ state: 'CANCELLED', reasonCode: 'INPUT_RELEASED' });
+	await turn();
+	assert.deepEqual(commands.map((command) => command.action.arguments.durationMs), [100, 9]);
+	rejectCancel(Object.assign(new Error('late cancellation transport failure'), { code: 'BRIDGE_DISCONNECTED' }));
+	await turn();
+	assert.notEqual(run.executor.status(record), null, 'the acknowledged cancellation must not invalidate the running handler');
+	releases[1]({ state: 'SUCCEEDED', reasonCode: 'DONE' });
+	const result = await pending;
+	assert.equal(result.reasonCode, 'PROGRAM_IDLE');
+	assert.deepEqual(result.receipts.map((receipt) => receipt.state), ['CANCELLED', 'SUCCEEDED']);
+});
+
+test('a cancellation transport failure remains unknown while its original action is still pending', async () => {
+	const commands = [], cancelled = [];
+	const run = setup({
+		executeAction: (command) => { commands.push(command); return new Promise(() => {}); },
+		cancelAction: async (actionId) => {
+			cancelled.push(actionId);
+			throw Object.assign(new Error('cancellation transport failed'), { code: 'BRIDGE_DISCONNECTED' });
+		},
+	});
+	const pending = run.executor.run(record, { source: `${prefix}
+		program.watch(() => player.state().health < 10, { mode: "interrupt" }, async () => { await player.wait(9); });
+		await player.wait(100);
+	` }, run.context);
+	run.executor.onObservation(record, { observation: observation(4), eventSequence: 2, attention: true, priority: 'urgent', trigger: 'health_changed' });
+	const result = await pending;
+	assert.equal(result.state, 'UNKNOWN');
+	assert.equal(result.reasonCode, 'BRIDGE_DISCONNECTED');
+	assert.deepEqual(cancelled, [commands[0].actionId]);
+	assert.equal(commands.length, 1, 'the handler must not dispatch without cancellation acknowledgement');
+	assert.deepEqual(result.receipts, []);
+});
+
 test('planning-ahead sends one advisory before the deadline without interrupting the body', async () => {
 	const timers = [];
 	const advisories = [];

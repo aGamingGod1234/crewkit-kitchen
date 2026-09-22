@@ -1,6 +1,7 @@
 ﻿import assert from 'node:assert/strict';
 import test from 'node:test';
 import { ExplorationOccupancy, cellKey, extractPosition } from '../src/explore-frontier.mjs';
+import { adaptObservation } from '../src/observation-adapter.mjs';
 
 function observation({ x = 0, y = 64, z = 0, blocks = [], landmarks = [], dimension = 'minecraft:overworld', gameTime = 20, worldId = 'world-a' } = {}) {
 	return { position: { x, y, z }, world: { dimension, worldId, gameTime }, blocks, landmarks };
@@ -73,4 +74,44 @@ test('position adapters accept current wire and nested player shapes', () => {
 	assert.deepEqual(extractPosition({ position: { x: 1, y: 2, z: 3 } }), { x: 1, y: 2, z: 3 });
 	assert.deepEqual(extractPosition({ player: { position: { x: 1, y: 2, z: 3 } } }), { x: 1, y: 2, z: 3 });
 	assert.equal(extractPosition({ player: { health: 20 } }), null);
+});
+
+test('adapted door properties survive duplicate landmark summaries and reach exploration candidates', () => {
+	const occupancy = new ExplorationOccupancy();
+	const door = { blockId: 'minecraft:oak_door', x: 12, y: 64, z: 0 };
+	const adapted = (gameTime, open) => adaptObservation({
+		...observation({ gameTime, blocks: [{ ...door, state: { open, facing: 'north' } }],
+			landmarks: [{ ...door, distance: 12, bearing: 90, elevation: 0 }] }),
+		ready: true, view: { yaw: 0, pitch: 0 }, player: {}, entities: [], inventory: { items: [] },
+		world: { worldId: 'world-a', dimension: 'minecraft:overworld', gameTime, dayTime: gameTime, raining: false, thundering: false },
+	});
+	occupancy.ingest('a', adapted(20, 'false'));
+	occupancy.markBlocked('a', 'minecraft:overworld', door.x, door.z, { y: door.y });
+	const opened = adapted(21, 'true');
+	occupancy.ingest('a', opened);
+	const candidate = occupancy.candidates('a', opened, { blockId: door.blockId }).candidates[0];
+	assert.deepEqual(JSON.parse(candidate.blockState), { facing: 'north', open: 'true' });
+	assert.equal(candidate.blocked, false);
+	assert.equal(candidate.visited, false);
+	assert.equal(candidate.reachability, 'unknown');
+	assert.equal(occupancy.candidates('a', observation({ gameTime: 22 }), { blockId: door.blockId }).candidates[0].blockState, candidate.blockState);
+});
+
+test('partial-only candidate sightings retain fresh same-block properties and discard replaced or stale ones', () => {
+	const occupancy = new ExplorationOccupancy();
+	const door = { blockId: 'minecraft:oak_door', x: 12, y: 64, z: 0 };
+	occupancy.ingest('a', observation({ gameTime: 20, blocks: [{ ...door, state: { open: 'false' } }] }));
+	const partial = observation({ gameTime: 21, landmarks: [door] });
+	occupancy.ingest('a', partial);
+	assert.equal(occupancy.candidates('a', partial, { blockId: door.blockId }).candidates[0].blockState, '{"open":"false"}');
+	const updated = observation({ gameTime: 22, blocks: [{ ...door, state: { open: 'true' } }] });
+	assert.equal(occupancy.candidates('a', updated, { blockId: door.blockId }).candidates[0].blockState, '{"open":"true"}');
+	const replaced = observation({ gameTime: 22, landmarks: [{ ...door, blockId: 'minecraft:stone' }] });
+	assert.equal(occupancy.candidates('a', replaced, { blockId: 'minecraft:stone' }).candidates[0].blockState, undefined);
+	const stale = observation({ gameTime: 1222, landmarks: [door] });
+	occupancy.ingest('a', stale);
+	assert.equal(occupancy.candidates('a', stale, { blockId: door.blockId }).candidates[0].blockState, undefined);
+	const fresh = observation({ gameTime: 1223, blocks: [{ ...door, state: { open: 'true' } }] });
+	occupancy.ingest('a', fresh);
+	assert.equal(occupancy.candidates('a', fresh, { blockId: door.blockId }).candidates[0].blockState, '{"open":"true"}');
 });

@@ -254,7 +254,12 @@ export class NativeProgramExecutor {
 	async #cancelBody(run, actionId) {
 		if (run.settled || !run.bodyPending || run.pendingActionId !== actionId) return;
 		try { await run.context.cancelAction(actionId, run.stopping?.reasonCode ?? 'MODEL_AUTHORED_INTERRUPT'); }
-		catch (error) { this.#finish(run, { state: 'UNKNOWN', reasonCode: boundedReason(error?.code, 'PROGRAM_CANCEL_UNCERTAIN') }); }
+		catch (error) {
+			// The terminal action receipt can arrive before the cancel transport fails.
+			// Once acknowledged, that old failure cannot invalidate a newer body action.
+			if (run.settled || !run.bodyPending || run.pendingActionId !== actionId) return;
+			this.#finish(run, { state: 'UNKNOWN', reasonCode: boundedReason(error?.code, 'PROGRAM_CANCEL_UNCERTAIN') });
+		}
 	}
 
 	#return(run, outcome, cancel = false) {

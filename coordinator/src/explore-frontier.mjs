@@ -37,7 +37,11 @@ export class ExplorationOccupancy {
 		cells.set(spatialCellKey(position.x, position.y, position.z), { ...(cells.get(spatialCellKey(position.x, position.y, position.z)) ?? {}), visited: true });
 		const blocks = new Map(known.blocks.map((block) => [block.key, block]));
 		for (const block of observedBlocks(observation)) {
-			blocks.set(`${block.x},${block.y},${block.z}`, { ...block, stale: false });
+			const blockKey = `${block.x},${block.y},${block.z}`;
+			const previous = blocks.get(blockKey);
+			// A sparse current sighting does not erase remembered properties of the same block.
+			const blockState = block.blockState ?? (previous?.blockId === block.blockId && !previous.stale ? previous.blockState : undefined);
+			blocks.set(blockKey, { ...block, ...(blockState ? { blockState } : {}), stale: false });
 			const key = spatialCellKey(block.x, block.y, block.z);
 			cells.set(key, { ...cells.get(key), seen: true });
 		}
