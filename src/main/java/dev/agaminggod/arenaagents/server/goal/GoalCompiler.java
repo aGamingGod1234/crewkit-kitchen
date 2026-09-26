@@ -23,6 +23,7 @@ import net.minecraft.resources.Identifier;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.Item;
 
 public final class GoalCompiler {
@@ -53,6 +54,7 @@ public final class GoalCompiler {
 	);
 	private static final Pattern ITEM = Pattern.compile("^(get|obtain|collect|bring|gather|acquire|fetch|craft|make) (?:me )?(?:(?:at least )?(" + COUNT + ") )?(?:(?:a|an|some) )?(.+?)(?: for me)?$");
 	private static final Pattern ITEM_ALTERNATIVE_COUNT = Pattern.compile("^(?:at least\\s+)?(" + COUNT + ")\\s+(.+)$");
+	private static final Pattern ITEM_BLOCK_OF = Pattern.compile("^blocks? of (.+)$");
 	private static final Pattern REFERENCED_ITEM_CLAUSE = Pattern.compile("^(?:keep|retain|hold|carry)\\s+(?:it|them|these|those)(?:\\s.*)?$");
 	private static final Pattern BLOCK = Pattern.compile("^(build|construct|place|put|set|mine|break|destroy) (?:with |using |from )?(?:(?:a|an|some|the) )?(.+?)(?: for me)?$");
 	private static final Pattern BLOCK_LOCATION_SUFFIX = Pattern.compile(
@@ -788,6 +790,8 @@ public final class GoalCompiler {
 	}
 
 	private static List<String> matchItems(String target, RegistryAccess registries) {
+		List<String> blockItems = namedBlockItems(target, registries);
+		if (!blockItems.isEmpty()) return blockItems;
 		String wanted = normalizedTarget(target);
 		Set<String> forms = singularForms(wanted);
 		ArrayList<String> matches = new ArrayList<>();
@@ -806,6 +810,8 @@ public final class GoalCompiler {
 	private static List<String> relatedItems(String target, RegistryAccess registries) {
 		String wanted = catalogTarget(target);
 		if (wanted.isEmpty()) return List.of();
+		List<String> blockItems = namedBlockItems(wanted, registries);
+		if (!blockItems.isEmpty()) return blockItems;
 		Set<String> forms = singularForms(wanted);
 		Registry<Item> itemRegistry = registries.lookup(Registries.ITEM).orElse(BuiltInRegistries.ITEM);
 		boolean tools = wanted.endsWith(" tool") || wanted.endsWith(" tools");
@@ -821,7 +827,25 @@ public final class GoalCompiler {
 							|| path.endsWith(" " + form) || description.endsWith(" " + form))
 							|| tools && path.startsWith(material + " ") && toolKinds.contains(path.substring(material.length() + 1));
 				})
+			.map(Identifier::toString).distinct().sorted().toList();
+	}
+
+	/** A spoken "block of dirt" names the dirt block item; "block of iron" names iron_block. */
+	private static List<String> namedBlockItems(String target, RegistryAccess registries) {
+		Matcher phrase = ITEM_BLOCK_OF.matcher(normalizedTarget(target).toLowerCase(Locale.ROOT));
+		if (!phrase.matches()) return List.of();
+		Registry<Item> items = registries.lookup(Registries.ITEM).orElse(BuiltInRegistries.ITEM);
+		for (String name : List.of(phrase.group(1) + " block", phrase.group(1))) {
+			Set<String> forms = singularForms(name);
+			List<String> matches = items.keySet().stream()
+				.filter(id -> items.getValue(id) instanceof BlockItem
+					&& forms.stream().anyMatch(form -> id.toString().equals(form)
+						|| pathName(id).equals(form)
+						|| descriptionName(items.getValue(id).getDescriptionId()).equals(form)))
 				.map(Identifier::toString).distinct().sorted().toList();
+			if (!matches.isEmpty()) return matches;
+		}
+		return List.of();
 	}
 
 	private static List<String> relatedBlocks(String target, RegistryAccess registries) {

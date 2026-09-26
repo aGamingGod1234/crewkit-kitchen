@@ -30,6 +30,7 @@ public final class GoalCompilerVerification {
 		bindItemStackSize(Items.APPLE, 64);
 		bindItemStackSize(Items.COBBLESTONE, 64);
 		bindItemStackSize(Items.DIRT, 64);
+		bindItemStackSize(Items.IRON_BLOCK, 64);
 		bindItemStackSize(Items.DIAMOND_PICKAXE, 1);
 		bindItemStackSize(Items.DIAMOND_SWORD, 1);
 		bindItemStackSize(Items.IRON_AXE, 1);
@@ -74,6 +75,21 @@ public final class GoalCompilerVerification {
 				exact.acceptedSpec().orElseThrow().completion(),
 				"exact item request freezes the iron pickaxe predicate"
 		);
+		GoalCompilation dirt = compiler.compile("Could you get a block of dirt?", RegistryAccess.EMPTY, 1_200L);
+		assertEquals(GoalCompilation.Kind.ACCEPTED, dirt.kind(), "a spoken block of dirt is an exact item goal");
+		assertEquals(new GoalPredicate.InventoryContains("minecraft:dirt", 1),
+				dirt.acceptedSpec().orElseThrow().completion(), "dirt possession is the completion fact");
+		assertEquals(new GoalPredicate.InventoryContains("minecraft:dirt", 2),
+				compiler.compile("Get two blocks of dirt", RegistryAccess.EMPTY, 1_200L)
+					.acceptedSpec().orElseThrow().completion(), "plural block wording preserves the count");
+		assertEquals(new GoalPredicate.InventoryContains("minecraft:iron_block", 1),
+				compiler.compile("Get a block of iron", RegistryAccess.EMPTY, 1_200L)
+					.acceptedSpec().orElseThrow().completion(), "a material block does not become an ingot");
+		assertEquals(List.of("minecraft:dirt"), compiler.candidateIdsFor("Get a block of dirt from nearby", RegistryAccess.EMPTY),
+				"translation offers the same block item when the request has a source qualifier");
+		assertSucceeds(() -> compiler.translationConstraintFor("Get a block of dirt from nearby", RegistryAccess.EMPTY)
+				.validate(new GoalPredicate.InventoryContains("minecraft:dirt", 1)),
+				"the translated goal accepts the requested inventory fact");
 		assertEquals(
 				GoalCompilation.Kind.NEEDS_TRANSLATION,
 				compiler.compile("Get a good pickaxe", RegistryAccess.EMPTY, 1_200L).kind(),
@@ -108,7 +124,7 @@ public final class GoalCompilerVerification {
 		GoalCompilation make = compiler.compile("Make an iron pickaxe", RegistryAccess.EMPTY, 1_200L);
 		assertEquals(GoalCompilation.Kind.NEEDS_TRANSLATION, make.kind(),
 				"make wording cannot be reduced to already-held inventory");
-		return 17;
+		return 22;
 	}
 
 	private static int verifyInventoryCapacity() {
