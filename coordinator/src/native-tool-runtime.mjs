@@ -42,6 +42,8 @@ export class NativeToolRuntime {
 	#sessionId;
 	#receipts = new Map();
 	#executionEpochs = new Map();
+	#postResultSamples = new Map();
+	#sequenceFinishReservations = new Map();
 	#sequence = 0;
 
 	constructor({
@@ -127,7 +129,21 @@ export class NativeToolRuntime {
 	}
 
 	updateObservation(record, observation, options = {}) {
-		return this.#storeObservation(record, observation, options);
+		const stored = this.#storeObservation(record, observation, options);
+		if (stored) this.#notePublishedSample(record);
+		return stored;
+	}
+
+	/**
+	 * The server publishes an attention observation after every action result, in
+	 * the same tick and after physics. Only pushes delivered in wire order after the
+	 * result count, so a requested sample taken before the result cannot satisfy it.
+	 */
+	#notePublishedSample(record) {
+		const pending = this.#postResultSamples.get(record.agentId);
+		if (pending === undefined || pending.goalRevision !== record.goalRevision || pending.published) return;
+		pending.published = true;
+		pending.wake?.();
 	}
 
 	#storeObservation(record, observation, { eventSequence = 0, conversation = undefined, force = false, attention = false, priority, trigger, changedFacts } = {}, reuseWorldFacts = false) {
@@ -181,10 +197,12 @@ export class NativeToolRuntime {
 		if (!Number.isSafeInteger(eventSequence) || eventSequence < 0) throw new TypeError('eventSequence must be a nonnegative safe integer');
 		const latest = this.#observations.get(record.agentId);
 		if (latest === undefined || latest.goalRevision !== record.goalRevision || eventSequence <= latest.eventSequence) return false;
-		return this.#storeObservation(record, observation, {
+		const stored = this.#storeObservation(record, observation, {
 			eventSequence,
 			conversation: conversation ?? latest.conversation,
 		}, true);
+		if (stored) this.#notePublishedSample(record);
+		return stored;
 	}
 
 	snapshotLive(agentId) {
@@ -255,6 +273,7 @@ export class NativeToolRuntime {
 		}
 		if (request.tool.kind === 'cancel_action') return this.#cancelAction(record, request.tool);
 		if (request.tool.kind === 'notebook' || request.tool.kind === 'query_memory') return this.#memory(request, record);
+		if (this.#sequenceFinishReservations.has(record.agentId)) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'A finishing native sequence owns the player until its fresh sample and goal verification settle');
 		if (this.#sweeps.has(record.agentId)) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'A camera sweep owns this player until sampling completes');
 		if (this.#programRuns.has(record.agentId)) throw codedError('NATIVE_PROGRAM_IN_PROGRESS', 'A model-authored program owns this player; use programStatus and cancelProgram before issuing another body operation');
 		if (request.tool.kind === 'run_program') return this.#runProgram(request, record);
@@ -269,7 +288,7 @@ export class NativeToolRuntime {
 		if (request.tool.kind === 'finish') return this.#finish(request, record, lifecycleGeneration);
 		if (request.tool.kind === 'explore_frontier') return this.#exploreFrontier(request, record);
 		const tool = constrainGoalBoundNavigation(request.tool, record.currentGoalSpec);
-		if (tool.kind === 'sequence') return this.#executeSequence({ ...request, tool }, record, this.#executionEpoch(record.agentId));
+		if (tool.kind === 'sequence') return this.#executeSequence({ ...request, tool }, record, this.#executionEpoch(record.agentId), lifecycleGeneration);
 		if (tool.kind === 'lookAround') {
 			const sweep = {};
 			this.#sweeps.set(record.agentId, sweep);
@@ -280,7 +299,7 @@ export class NativeToolRuntime {
 		return this.#executeAction(request, record, tool);
 	}
 
-	async #observe(record) {
+	async #observe(record, { includeMetadata = true, afterResult = null } = {}) {
 		const epoch = this.#executionEpoch(record.agentId);
 		await this.initializeMemory(record.agentId);
 		if (this.#executionEpoch(record.agentId) !== epoch) throw codedError('STALE_NATIVE_TOOL', 'Observation request outlived its lifecycle');
@@ -288,12 +307,16 @@ export class NativeToolRuntime {
 		const afterEventSequence = previous?.goalRevision === record.goalRevision ? previous.eventSequence : 0;
 		let freshness = { fresh: false, reasonCode: 'FRESH_OBSERVATION_UNAVAILABLE' };
 		if (this.#requestObservation !== null) {
-			const sampled = await this.#requestObservation(record, { afterEventSequence });
+			const pending = afterResult === null ? undefined : this.#postResultSamples.get(record.agentId);
+			if (pending?.result === afterResult && pending.goalRevision === record.goalRevision) {
+				await this.#awaitPostResultSample(record, epoch, afterEventSequence, pending);
+				freshness = { fresh: true, afterEventSequence: pending.eventSequence };
+			} else {
+				await this.#requestSample(record, epoch, afterEventSequence);
+				freshness = { fresh: true, afterEventSequence };
+			}
 			this.#assertCurrent(record);
 			if (this.#executionEpoch(record.agentId) !== epoch) throw codedError('STALE_NATIVE_TOOL', 'Observation request outlived its lifecycle');
-			if (!Number.isSafeInteger(sampled?.eventSequence) || sampled.eventSequence <= afterEventSequence || sampled.observation === null || typeof sampled.observation !== 'object' || Array.isArray(sampled.observation)) throw codedError('FRESH_OBSERVATION_REQUIRED', 'Observation callback did not return a newer server sample');
-			this.updateObservation(record, sampled.observation, { eventSequence: sampled.eventSequence, conversation: sampled.conversation });
-			freshness = { fresh: true, afterEventSequence };
 		}
 		const latest = this.#observations.get(record.agentId);
 		const facts = latest?.goalRevision === record.goalRevision
@@ -301,10 +324,45 @@ export class NativeToolRuntime {
 			: { eventSequence: 0, goal: record.currentGoal ?? null, goalSpec: record.currentGoalSpec ?? null, observation: {} };
 		delete facts.goalRevision;
 		facts.observation = this.#decorate(record, facts.observation ?? {});
-		const metadata = { ...await this.#executionMetadata(record), ...await this.#memorySummary(record) };
+		// Internal continuations need fresh world facts, not model-facing metadata.
+		const metadata = includeMetadata ? { ...await this.#executionMetadata(record), ...await this.#memorySummary(record) } : {};
 		this.#assertCurrent(record);
 		if (this.#executionEpoch(record.agentId) !== epoch) throw codedError('STALE_NATIVE_TOOL', 'Observation request outlived its lifecycle');
 		return { ...facts, ...metadata, freshness: { ...freshness, eventSequence: facts.eventSequence, observedAtEpochMs: facts.observation.observedAtEpochMs ?? null, ...(facts.observation.continuity?.rememberedSections === undefined ? {} : { rememberedSections: [...facts.observation.continuity.rememberedSections] }) } };
+	}
+
+	async #requestSample(record, epoch, afterEventSequence) {
+		const sampled = await this.#requestObservation(record, { afterEventSequence });
+		this.#assertCurrent(record);
+		if (this.#executionEpoch(record.agentId) !== epoch) throw codedError('STALE_NATIVE_TOOL', 'Observation request outlived its lifecycle');
+		if (!Number.isSafeInteger(sampled?.eventSequence) || sampled.eventSequence <= afterEventSequence || sampled.observation === null || typeof sampled.observation !== 'object' || Array.isArray(sampled.observation)) throw codedError('FRESH_OBSERVATION_REQUIRED', 'Observation callback did not return a newer server sample');
+		this.#storeObservation(record, sampled.observation, { eventSequence: sampled.eventSequence, conversation: sampled.conversation });
+	}
+
+	/**
+	 * Uses the server's post-result publication when it is already here or arrives
+	 * first. The explicit request remains the guarantee; answering it costs the
+	 * server one more tick, which previously delayed every authored continuation.
+	 */
+	async #awaitPostResultSample(record, epoch, afterEventSequence, pending) {
+		if (pending.published) return;
+		const published = new Promise((resolve) => { pending.wake = resolve; });
+		const requested = this.#requestSample(record, epoch, afterEventSequence);
+		// A superseded request still stores its newer sample under the same lifecycle checks.
+		requested.catch(() => {});
+		try {
+			try { await Promise.race([published, requested]); }
+			catch (error) {
+				// An observation already on the wire may still be queued behind the
+				// action-result handler. Give that queued publication one event-loop
+				// turn to arrive before treating an inspection error as authoritative.
+				if (!pending.published) {
+					await new Promise((resolve) => setImmediate(resolve));
+				}
+				if (!pending.published) throw error;
+			}
+		}
+		finally { pending.wake = null; }
 	}
 
 	async #memorySummary(record) {
@@ -417,6 +475,9 @@ export class NativeToolRuntime {
 			const measured = this.#planningLeadTime(record);
 			if (Number.isFinite(measured) && measured > 0) planningLeadMs = Math.ceil(measured);
 		} catch { /* Telemetry must not prevent authorised work. */ }
+		// The executor samples right after each action returns; that one sample may use
+		// the server's post-result publication. Later interval samples still request.
+		let lastActionResult = null;
 		return await this.#programExecutor.run(record, { source, programId: run.programId, maxActions: request.tool.maxActions, timeoutMs: request.tool.timeoutMs, observationIntervalMs: request.tool.observationIntervalMs, planningLeadMs, provenance: nativeMemoryProvenance(request, record) }, {
 			onPlanningDue: (_status, { planningLeadMs } = {}) => {
 				if (this.#programRuns.get(record.agentId) !== run || this.#executionEpoch(record.agentId) !== run.epoch) return;
@@ -441,6 +502,7 @@ export class NativeToolRuntime {
 			executeAction: async (command) => {
 				if (this.#programRuns.get(record.agentId) !== run || this.#executionEpoch(record.agentId) !== run.epoch) throw codedError('NATIVE_PROGRAM_CANCELLED', 'Program no longer has execution authority');
 				const result = await this.#executeAction(request, record, { kind: 'action', actionType: command.action.type, arguments: command.action.arguments }, null, true, command);
+				lastActionResult = result;
 				const receipt = this.#receipts.get(record.agentId)?.findLast((entry) => entry.engineActionId === command.actionId);
 				return { ...result, ...(receipt === undefined ? {} : { actionId: receipt.actionId }) };
 			},
@@ -452,7 +514,9 @@ export class NativeToolRuntime {
 			},
 			inspect: async (query) => ({ state: 'SUCCEEDED', reasonCode: 'INSPECTED', ...await this.#inspect(normalizeMinecraftToolCall('inspect', query), record) }),
 			refreshObservation: async () => {
-				const facts = await this.#observe(record);
+				const afterResult = lastActionResult;
+				lastActionResult = null;
+				const facts = await this.#observe(record, { includeMetadata: false, afterResult });
 				if (facts.freshness.fresh !== true) throw codedError('FRESH_OBSERVATION_REQUIRED', 'Program continuation needs a new authoritative player observation');
 				return { observation: facts.observation, eventSequence: facts.eventSequence };
 			},
@@ -584,7 +648,7 @@ export class NativeToolRuntime {
 	}
 
 	async #exploreFrontier(request, record) {
-		const facts = await this.#observe(record);
+		const facts = await this.#observe(record, { includeMetadata: false });
 		await this.#flushSpatial(record.agentId);
 		return { ...this.#occupancy.candidates(record.agentId, facts.observation, request.tool.arguments ?? {}), freshness: facts.freshness };
 	}
@@ -612,29 +676,64 @@ export class NativeToolRuntime {
 			const result = await this.#executeAction(request, record, action, index);
 			results.push({ actionType: action.actionType, ...result });
 			if (result.state !== 'SUCCEEDED') return { state: result.state, completed: results.length, failedAt: index, results, samples };
-			const facts = await this.#observe(record);
+			const facts = await this.#observe(record, { includeMetadata: false, afterResult: result });
 			if (facts.freshness.fresh !== true) throw codedError('FRESH_OBSERVATION_REQUIRED', 'Camera sweep needs a fresh observation at each heading');
 			samples.push(sweepSample(facts, action.arguments));
 		}
 		return { state: 'SUCCEEDED', completed: results.length, results, samples };
 	}
 
-	async #executeSequence(request, record, executionEpoch) {
-		const results = [];
-		let failedAt;
-		for (let index = 0; index < request.tool.actions.length; index += 1) {
-			if (this.#executionEpoch(record.agentId) !== executionEpoch) throw codedError('NATIVE_ACTION_CANCELLED', 'Native sequence cancelled before its next action');
-			const action = request.tool.actions[index];
-			const result = await this.#executeAction(request, record, { kind: 'action', ...action }, index);
-			results.push({ actionType: action.actionType, ...result });
-			if (result.state !== 'SUCCEEDED') { failedAt = index; break; }
+	async #executeSequence(request, record, executionEpoch, lifecycleGeneration = null) {
+		const finishToken = request.tool.finish === undefined ? null : {};
+		if (finishToken !== null) {
+			if (this.#sequenceFinishReservations.has(record.agentId)) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'A finishing native sequence already owns this player');
+			this.#sequenceFinishReservations.set(record.agentId, finishToken);
 		}
-		const outcome = { state: failedAt === undefined ? 'SUCCEEDED' : results.at(-1).state, completed: results.length, ...(failedAt === undefined ? {} : { failedAt }), results };
-		return results.some(step => POST_ACTION_OBSERVATION_TYPES.has(step.actionType))
-			? this.#withPostAction(record, outcome, executionEpoch) : outcome;
+		try {
+			const startingEventSequence = this.#observations.get(record.agentId)?.goalRevision === record.goalRevision
+				? this.#observations.get(record.agentId).eventSequence : 0;
+			const results = [];
+			let failedAt;
+			let lastResult = null;
+			for (let index = 0; index < request.tool.actions.length; index += 1) {
+				if (this.#executionEpoch(record.agentId) !== executionEpoch) throw codedError('NATIVE_ACTION_CANCELLED', 'Native sequence cancelled before its next action');
+				const action = request.tool.actions[index];
+				lastResult = await this.#executeAction(request, record, { kind: 'action', ...action }, index, true, null, finishToken);
+				results.push({ actionType: action.actionType, ...lastResult });
+				if (lastResult.state !== 'SUCCEEDED') { failedAt = index; break; }
+			}
+			const outcome = { state: failedAt === undefined ? 'SUCCEEDED' : results.at(-1).state, completed: results.length, ...(failedAt === undefined ? {} : { failedAt }), results };
+			const hasPostActionFacts = results.some(step => POST_ACTION_OBSERVATION_TYPES.has(step.actionType));
+			if (finishToken === null) return hasPostActionFacts
+				? this.#withPostAction(record, outcome, executionEpoch, lastResult) : outcome;
+
+			if (failedAt !== undefined) {
+				const withFacts = hasPostActionFacts ? await this.#withPostAction(record, outcome, executionEpoch, lastResult) : outcome;
+				return { ...withFacts, finish: { state: 'SKIPPED', reasonCode: 'ACTION_FAILED' } };
+			}
+
+			const withFreshFacts = await this.#withPostAction(record, outcome, executionEpoch, lastResult);
+			const facts = withFreshFacts.postAction;
+			if (facts?.freshness?.fresh !== true || !Number.isSafeInteger(facts.eventSequence) || facts.eventSequence <= startingEventSequence) {
+				return { ...withFreshFacts, finish: { state: 'SKIPPED', reasonCode: 'FRESH_OBSERVATION_REQUIRED' } };
+			}
+			try {
+				this.#assertCurrent(record);
+				if (this.#executionEpoch(record.agentId) !== executionEpoch) throw codedError('STALE_NATIVE_TOOL', 'Sequence lifecycle changed before goal verification');
+			} catch (error) {
+				return { ...withFreshFacts, finish: { state: 'SKIPPED', reasonCode: error?.code ?? 'STALE_NATIVE_TOOL' } };
+			}
+			const finishRequest = { ...request, tool: { kind: 'finish', summary: request.tool.finish.summary } };
+			const finish = await this.#finish(finishRequest, record, lifecycleGeneration, finishToken);
+			return { ...withFreshFacts, finish };
+		} finally {
+			if (finishToken !== null && this.#sequenceFinishReservations.get(record.agentId) === finishToken) this.#sequenceFinishReservations.delete(record.agentId);
+		}
 	}
 
-	async #executeAction(request, record, tool, sequenceIndex = null, waitForCompletion = true, programCommand = null) {
+	async #executeAction(request, record, tool, sequenceIndex = null, waitForCompletion = true, programCommand = null, sequenceFinishToken = null) {
+		const finishReservation = this.#sequenceFinishReservations.get(record.agentId);
+		if (finishReservation !== undefined && finishReservation !== sequenceFinishToken) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'A finishing native sequence owns the player');
 		const executionEpoch = this.#executionEpoch(record.agentId);
 		if (this.#actions.has(record.agentId)) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'The Minecraft body is already executing an action');
 		if (this.#completions.has(record.agentId)) throw codedError('NATIVE_COMPLETION_IN_PROGRESS', 'Goal completion verification is already running');
@@ -715,15 +814,15 @@ export class NativeToolRuntime {
 		const outcome = await result;
 		// Sequences sample after their final step; the program executor samples before each authored continuation.
 		return sequenceIndex === null && programCommand === null && POST_ACTION_OBSERVATION_TYPES.has(tool.actionType)
-			? this.#withPostAction(record, outcome, executionEpoch) : outcome;
+			? this.#withPostAction(record, outcome, executionEpoch, outcome) : outcome;
 	}
 
-	async #withPostAction(record, outcome, executionEpoch) {
+	async #withPostAction(record, outcome, executionEpoch, afterResult = null) {
 		if (this.#requestObservation === null) return outcome;
 		try {
 			this.#assertCurrent(record);
 			if (this.#executionEpoch(record.agentId) !== executionEpoch) throw codedError('STALE_NATIVE_TOOL', 'Action lifecycle has ended');
-			return { ...outcome, postAction: await this.#observe(record) };
+			return { ...outcome, postAction: await this.#observe(record, { afterResult }) };
 		} catch (error) {
 			return { ...outcome, postAction: { freshness: { fresh: false }, reasonCode: error?.code ?? 'OBSERVATION_UNAVAILABLE',
 				message: 'The action result above is authoritative. Fresh follow-up facts are unavailable; observe before choosing a dependent action.' } };
@@ -785,6 +884,9 @@ export class NativeToolRuntime {
 		}
 		this.#flushSpatial(record.agentId).catch((error) => this.#trace('native_spatial_memory_failed', { agentId: record.agentId, reasonCode: error?.code ?? 'MEMORY_WRITE_FAILED' }));
 		this.#trace('native_tool_action_completed', { agentId: record.agentId, goalRevision: record.goalRevision, actionId: active.actionId, ...result });
+		const latest = this.#observations.get(record.agentId);
+		this.#postResultSamples.set(record.agentId, { result, goalRevision: record.goalRevision, published: false, wake: null,
+			eventSequence: latest?.goalRevision === record.goalRevision ? latest.eventSequence : 0 });
 		active.resolve(result);
 		return true;
 	}
@@ -837,6 +939,7 @@ export class NativeToolRuntime {
 		}
 		this.#observations.delete(agentId);
 		this.#inspectedTargets.delete(agentId);
+		this.#postResultSamples.delete(agentId);
 		const active = this.#actions.get(agentId);
 		const completion = this.#completions.get(agentId);
 		if (completion !== undefined) {
@@ -889,7 +992,9 @@ export class NativeToolRuntime {
 		if (FORGET_REASONS.test(String(reason))) this.#recovery.clear();
 	}
 
-	async #finish(request, record, lifecycleGeneration) {
+	async #finish(request, record, lifecycleGeneration, sequenceFinishToken = null) {
+		const finishReservation = this.#sequenceFinishReservations.get(record.agentId);
+		if (finishReservation !== undefined && finishReservation !== sequenceFinishToken) throw codedError('NATIVE_COMPLETION_IN_PROGRESS', 'A finishing native sequence owns the player');
 		if (this.#actions.has(record.agentId)) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'The Minecraft body is already executing an action');
 		if (this.#completions.has(record.agentId)) throw codedError('NATIVE_COMPLETION_IN_PROGRESS', 'Goal completion verification is already running');
 		const goalFingerprint = record.currentGoalSpec?.fingerprint;

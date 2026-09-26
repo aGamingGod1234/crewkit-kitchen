@@ -599,6 +599,81 @@ test('native sequence stops before later actions after the first factual failure
 	assert.equal(sent.length, 1);
 });
 
+test('native sequence verifies a model-authored finish only after successful actions and a newer observation', async () => {
+	let runtime;
+	let publishFreshFacts;
+	const events = [];
+	const finished = [];
+	runtime = new NativeToolRuntime({
+		bridge: { send: async (type, agentId, payload) => {
+			events.push(type);
+			if (type === 'action_command') queueMicrotask(() => runtime.onActionResult(record(), {
+				actionId: payload.actionId, goalRevision: payload.goalRevision, state: 'SUCCEEDED', reasonCode: 'WAIT_COMPLETED',
+			}));
+			if (type === 'goal_completed') queueMicrotask(() => runtime.onCompletionResult(record(), {
+				goalRevision: payload.goalRevision, traceId: payload.traceId, goalFingerprint: payload.goalFingerprint,
+				verified: true, reasonCode: 'COMPLETION_VERIFIED', facts: [],
+			}));
+		} },
+		requestObservation: async (_record, { afterEventSequence }) => {
+			events.push('fresh_observation');
+			return new Promise((resolve) => { publishFreshFacts = () => resolve({
+				 eventSequence: afterEventSequence + 1,
+				 observation: { inventory: { items: [{ itemId: 'minecraft:stone', count: 1 }] } },
+			}); });
+		},
+		onFinish: async (request) => finished.push(request),
+	});
+	runtime.updateObservation(record(), { inventory: { items: [] } }, { eventSequence: 4 });
+	const pending = runtime.execute(nativeCall({
+		kind: 'sequence',
+		actions: [1, 2].map((durationMs) => ({ actionType: 'wait', arguments: { durationMs } })),
+		finish: { summary: 'The stone is ready.' },
+	}), record(), { lifecycleGeneration: 7 });
+	for (let attempt = 0; publishFreshFacts === undefined && attempt < 20; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(typeof publishFreshFacts, 'function', 'fresh facts are requested after all authored actions settle');
+	assert.deepEqual(events, ['action_command', 'action_command', 'fresh_observation']);
+	await assert.rejects(runtime.execute(nativeCall({ kind: 'finish', summary: 'Duplicate finish.' }), record()), { code: 'NATIVE_ACTION_IN_PROGRESS' });
+	publishFreshFacts();
+	const result = await pending;
+	assert.deepEqual(events, ['action_command', 'action_command', 'fresh_observation', 'goal_completed']);
+	assert.deepEqual(result.finish, { state: 'COMPLETED', verified: true, reasonCode: 'COMPLETION_VERIFIED', facts: [] });
+	assert.equal(result.postAction.freshness.fresh, true);
+	assert.equal(result.postAction.eventSequence, 5);
+	assert.equal(finished.length, 1);
+	assert.equal(finished[0].lifecycleGeneration, 7);
+});
+
+test('native sequence suppresses its authored finish after a failed action or unavailable fresh facts', async () => {
+	for (const scenario of ['failed_action', 'stale_facts']) {
+		const sent = [];
+		let runtime;
+		runtime = new NativeToolRuntime({
+			bridge: { send: async (type, agentId, payload) => {
+				sent.push([type, payload]);
+				if (type === 'action_command') queueMicrotask(() => runtime.onActionResult(record(), {
+					actionId: payload.actionId, goalRevision: payload.goalRevision,
+					state: scenario === 'failed_action' ? 'FAILED' : 'SUCCEEDED',
+					reasonCode: scenario === 'failed_action' ? 'INPUT_REJECTED' : 'WAIT_COMPLETED',
+				}));
+			} },
+			requestObservation: scenario === 'failed_action' ? undefined : async () => {
+				throw Object.assign(new Error('fresh sample unavailable'), { code: 'INSPECTION_UNAVAILABLE' });
+			},
+		});
+		const result = await runtime.execute(nativeCall({
+			kind: 'sequence',
+			actions: [1, 2].map((durationMs) => ({ actionType: 'wait', arguments: { durationMs } })),
+			finish: { summary: 'Finish only when verified.' },
+		}), record());
+		assert.deepEqual(result.finish, {
+			state: 'SKIPPED', reasonCode: scenario === 'failed_action' ? 'ACTION_FAILED' : 'FRESH_OBSERVATION_REQUIRED',
+		});
+		assert.equal(sent.some(([type]) => type === 'goal_completed'), false);
+		assert.equal(sent.filter(([type]) => type === 'action_command').length, scenario === 'failed_action' ? 1 : 2);
+	}
+});
+
 test('exploreFrontier returns observed candidates without choosing or executing a route', async () => {
 	const sent = [];
 	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) } });
@@ -1418,6 +1493,46 @@ test('native program samples action effects once before the authored continuatio
 	assert.equal(samples, 1);
 });
 
+test('program continuations keep fresh facts without rereading model-facing metadata', async () => {
+	let samples = 0;
+	let settingsReads = 0;
+	let unresolvedReads = 0;
+	let runtime;
+	const observation = { world: { worldId: 'metadata-test' }, player: { health: 20 }, inventory: { items: [] } };
+	runtime = new NativeToolRuntime({
+		bridge: { send: async (type, _agentId, payload) => {
+			if (type === 'action_command') queueMicrotask(() => runtime.onActionResult(record(), {
+				actionId: payload.actionId, state: 'SUCCEEDED', reasonCode: 'WAIT_COMPLETED',
+			}));
+		} },
+		requestObservation: async (_record, { afterEventSequence }) => {
+			samples++;
+			return { eventSequence: afterEventSequence + 1, observation };
+		},
+		executionSettings: async () => { settingsReads++; return { effective: { model: 'test' } }; },
+		notebook: {
+			writeNote: async () => {},
+			query: async () => ({ entries: [] }),
+			recordReceipt: async () => {},
+			listUnresolved: async () => { unresolvedReads++; return { total: 0, entries: [], nextOffset: null }; },
+		},
+	});
+	runtime.updateObservation(record(), observation, { eventSequence: 1 });
+	const result = await runtime.execute(nativeCall({ kind: 'run_program', source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2);' }), record());
+	assert.equal(result.reasonCode, 'PROGRAM_EXHAUSTED');
+	assert.equal(result.actions, 2);
+	assert.equal(samples, 2, 'each authored step still receives a fresh server sample');
+	assert.equal(settingsReads, 0);
+	assert.equal(unresolvedReads, 0);
+	const publicFacts = await runtime.execute(nativeCall({ kind: 'observe', callId: 'public-observe' }), record());
+	assert.equal(publicFacts.freshness.fresh, true);
+	assert.equal(publicFacts.executionSettings.effective.model, 'test');
+	assert.equal(publicFacts.unresolvedActions.total, 0);
+	assert.equal(settingsReads, 1);
+	assert.equal(unresolvedReads, 1);
+	await runtime.disposeAll();
+});
+
 test('fresh observation is fenced after asynchronous metadata finishes', async () => {
 	let releaseMetadata;
 	const runtime = new NativeToolRuntime({ bridge: { send: async () => {} },
@@ -1429,4 +1544,132 @@ test('fresh observation is fenced after asynchronous metadata finishes', async (
 	await runtime.dispose('agent-a', 'goal_stopped');
 	releaseMetadata({});
 	await assert.rejects(pending, { code: 'STALE_NATIVE_TOOL' });
+});
+
+// A server-shaped runtime: each request stays pending until the test answers it,
+// like an inspection that the server serves on its next tick.
+function postResultRuntime({ registry = null } = {}) {
+	const sent = [];
+	const requests = [];
+	const runtime = new NativeToolRuntime({
+		registry,
+		bridge: { send: async (...args) => { sent.push(args); } },
+		requestObservation: (_record, { afterEventSequence }) => new Promise((resolve, reject) => { requests.push({ afterEventSequence, resolve, reject }); }),
+	});
+	return { runtime, sent, requests };
+}
+
+const turn = () => new Promise((resolve) => setImmediate(resolve));
+
+test('lookAround continues on the server post-result publication without waiting a tick for its request', async () => {
+	const { runtime, sent, requests } = postResultRuntime();
+	runtime.updateObservation(record(), { entities: [] }, { eventSequence: 1 });
+	const pending = runtime.execute(nativeCall({ kind: 'lookAround', centerYaw: 0, pitch: 0, steps: 2, ticksPerStep: 2 }), record());
+	await turn();
+	runtime.onActionResult(record(), { actionId: sent[0][2].actionId, state: 'SUCCEEDED', reasonCode: 'CONTROL_SEGMENT_COMPLETED' });
+	await turn();
+	assert.equal(requests.length, 1, 'the explicit request remains the guarantee');
+	runtime.updateObservation(record(), { observedAtEpochMs: 20, entities: [{ uuid: 'pushed-1', type: 'minecraft:pig' }] }, { eventSequence: 2 });
+	await turn();
+	assert.equal(sent.length, 2, 'the next authored heading starts before the request is answered');
+	assert.equal(sent[1][2].arguments.yaw, 0);
+	// The superseded request still stores its newer sample under the same checks.
+	requests[0].resolve({ eventSequence: 3, observation: { observedAtEpochMs: 30, entities: [{ uuid: 'requested-1', type: 'minecraft:cow' }] } });
+	await turn();
+	runtime.onActionResult(record(), { actionId: sent[1][2].actionId, state: 'SUCCEEDED', reasonCode: 'CONTROL_SEGMENT_COMPLETED' });
+	runtime.updateObservation(record(), { observedAtEpochMs: 40, entities: [{ uuid: 'pushed-2', type: 'minecraft:pig' }] }, { eventSequence: 4 });
+	const result = await pending;
+	assert.equal(result.state, 'SUCCEEDED');
+	assert.equal(requests.length, 1, 'a publication that arrived before sampling needs no request');
+	assert.deepEqual(result.samples.map((sample) => [sample.yaw, sample.eventSequence, sample.entities[0].uuid]), [[180, 2, 'pushed-1'], [0, 4, 'pushed-2']]);
+});
+
+test('only a publication after the result satisfies the post-action fence', async () => {
+	const { runtime, sent, requests } = postResultRuntime();
+	runtime.updateObservation(record(), { entities: [] }, { eventSequence: 5 });
+	const pending = runtime.execute(nativeCall({ kind: 'action', actionType: 'navigate_to', arguments: { x: 1, y: 64, z: 0, tolerance: 1, sprint: false, timeoutMs: 1000 } }), record());
+	await turn();
+	runtime.onActionResult(record(), { actionId: sent[0][2].actionId, state: 'SUCCEEDED', reasonCode: 'DESTINATION_REACHED' });
+	await turn();
+	assert.equal(runtime.updateObservation(record(), { stale: true }, { eventSequence: 5 }), false, 'a repeated sequence is not a new sample');
+	assert.equal(runtime.updateObservation(record({ goalRevision: 2 }), { stale: true }, { eventSequence: 9 }), true);
+	await turn();
+	let settled = false;
+	void pending.then(() => { settled = true; });
+	await turn();
+	assert.equal(settled, false, 'older sequences and other goals do not prove post-action facts');
+	runtime.updateObservation(record(), { pushed: true }, { eventSequence: 6 });
+	const result = await pending;
+	assert.equal(result.postAction.freshness.fresh, true);
+	assert.equal(result.postAction.freshness.afterEventSequence, 5, 'freshness is fenced at the action result');
+	assert.equal(result.postAction.eventSequence, 6);
+	assert.equal(result.postAction.observation.pushed, true);
+	requests[0].reject(Object.assign(new Error('late'), { code: 'INSPECTION_TIMEOUT' }));
+	await turn();
+});
+
+test('a post-result request failure still fails the sample when no publication arrives', async () => {
+	const { runtime, sent, requests } = postResultRuntime();
+	runtime.updateObservation(record(), { entities: [] }, { eventSequence: 1 });
+	const pending = runtime.execute(nativeCall({ kind: 'lookAround', centerYaw: 0, pitch: 0, steps: 2, ticksPerStep: 1 }), record());
+	await turn();
+	runtime.onActionResult(record(), { actionId: sent[0][2].actionId, state: 'SUCCEEDED', reasonCode: 'CONTROL_SEGMENT_COMPLETED' });
+	await turn();
+	requests[0].reject(Object.assign(new Error('timed out'), { code: 'INSPECTION_TIMEOUT' }));
+	await assert.rejects(pending, { code: 'INSPECTION_TIMEOUT' });
+	assert.equal(sent.length, 1, 'no heading is authored past an unobserved result');
+});
+
+test('a queued post-result publication survives an inspection failure', async () => {
+	let runtime;
+	const sent = [];
+	runtime = new NativeToolRuntime({
+		bridge: { send: async (...args) => { sent.push(args); } },
+		requestObservation: () => {
+			setImmediate(() => runtime.updateObservation(record(), { pushed: true }, { eventSequence: 2 }));
+			return Promise.reject(Object.assign(new Error('inspection unavailable'), { code: 'INSPECTION_UNAVAILABLE' }));
+		},
+	});
+	runtime.updateObservation(record(), { entities: [] }, { eventSequence: 1 });
+	const pending = runtime.execute(nativeCall({ kind: 'action', actionType: 'navigate_to', arguments: { x: 1, y: 64, z: 0, tolerance: 1, sprint: false, timeoutMs: 1000 } }), record());
+	await turn();
+	runtime.onActionResult(record(), { actionId: sent[0][2].actionId, state: 'SUCCEEDED', reasonCode: 'DESTINATION_REACHED' });
+
+	const result = await pending;
+	assert.equal(result.postAction.freshness.fresh, true);
+	assert.equal(result.postAction.eventSequence, 2);
+	assert.equal(result.postAction.observation.pushed, true);
+});
+
+test('a superseded post-result request cannot repopulate a disposed goal', async () => {
+	let current = record();
+	const { runtime, sent, requests } = postResultRuntime({ registry: { get: () => current } });
+	runtime.updateObservation(record(), { entities: [] }, { eventSequence: 1 });
+	const pending = runtime.execute(nativeCall({ kind: 'action', actionType: 'break_block', arguments: { x: 1, y: 64, z: 0 } }), record());
+	await turn();
+	runtime.onActionResult(record(), { actionId: sent[0][2].actionId, state: 'SUCCEEDED', reasonCode: 'BLOCK_BROKEN' });
+	await turn();
+	runtime.updateObservation(record(), { pushed: true }, { eventSequence: 2 });
+	assert.equal((await pending).postAction.eventSequence, 2);
+	current = record({ goalRevision: 4 });
+	await runtime.dispose('agent-a', 'goal_steered');
+	requests[0].resolve({ eventSequence: 3, observation: { late: true } });
+	await turn();
+	assert.equal(runtime.hasCurrent(record()), false, 'the late answer is dropped by its lifecycle checks');
+});
+
+test('program continuations use post-result publications that arrive before sampling', async () => {
+	const { runtime, sent, requests } = postResultRuntime();
+	const observation = { player: { health: 20 }, inventory: { items: [] } };
+	runtime.updateObservation(record(), observation, { eventSequence: 1 });
+	const pending = runtime.execute(nativeCall({ kind: 'run_program', source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2);' }), record());
+	for (const [index, sequence] of [2, 3].entries()) {
+		while (sent.length <= index) await turn();
+		runtime.onActionResult(record(), { actionId: sent[index][2].actionId, state: 'SUCCEEDED', reasonCode: 'WAIT_COMPLETED' });
+		runtime.updateObservation(record(), observation, { eventSequence: sequence });
+	}
+	const result = await pending;
+	assert.equal(result.reasonCode, 'PROGRAM_EXHAUSTED');
+	assert.equal(result.actions, 2);
+	assert.equal(requests.length, 0, 'both continuations used publications that arrived before sampling');
 });

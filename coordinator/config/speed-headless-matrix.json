@@ -1,0 +1,46 @@
+{
+    "version":  1,
+    "scenarios":  [
+                      {
+                          "id":  "controlled-reach-log",
+                          "provider":  "codex",
+                          "model":  "gpt-6-sol",
+                          "reasoningEffort":  "low",
+                          "serviceTier":  "priority",
+                          "rosterSize":  1,
+                          "repetitions":  1,
+                          "planningTimeoutMs":  120000,
+                          "requireFactualSuccess":  true,
+                          "task":  "Get 1 oak log",
+                          "timeoutMs":  300000,
+                          "scenarioTimeoutMs":  300000,
+                          "world":  {
+                                        "mode":  "arena"
+                                    },
+                          "setupBlocks":  [
+                                              {
+                                                  "x":  7,
+                                                  "y":  201,
+                                                  "z":  0,
+                                                  "blockId":  "minecraft:oak_log"
+                                              }
+                                          ],
+                          "assert":  [
+                                         {
+                                             "type":  "lifecycle",
+                                             "state":  "COMPLETED"
+                                         },
+                                         {
+                                             "type":  "rcon",
+                                             "command":  "execute if block 7 201 0 minecraft:air run data get entity {agent} Pos",
+                                             "match":  "has the following entity data"
+                                         },
+                                         {
+                                             "type":  "rcon",
+                                             "command":  "data get entity {agent} Inventory",
+                                             "match":  "minecraft:oak_log"
+                                         }
+                                     ]
+                      }
+                  ]
+}

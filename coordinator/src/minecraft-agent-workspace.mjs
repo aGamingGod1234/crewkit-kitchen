@@ -5,7 +5,9 @@ import path from 'node:path';
 
 const AGENTS_TEMPLATE = 'AGENTS.md';
 const SKILL_TEMPLATE = path.join('.codex', 'skills', 'minecraft-control', 'SKILL.md');
-const permissionsConfig = (workspaceRoot) => `[permissions.minecraft.filesystem]
+const permissionsConfig = (workspaceRoot) => `default_permissions = "minecraft"
+
+[permissions.minecraft.filesystem]
 ":root" = "deny"
 ":minimal" = "read"
 ${JSON.stringify(workspaceRoot)} = "read"

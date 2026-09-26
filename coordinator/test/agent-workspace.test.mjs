@@ -65,6 +65,7 @@ test('refreshes one shared native Minecraft workspace from bundled templates', a
 		}],
 	});
 	assert.ok(path.relative(first.cwd, first.codexHome).startsWith('..'), 'provider credentials must be outside the model workspace');
+	assert.match(await readFile(path.join(first.codexHome, 'config.toml'), 'utf8'), /^default_permissions = "minecraft"\n\n\[permissions\.minecraft\.filesystem\]/);
 	assert.equal(await readFile(path.join(first.cwd, 'AGENTS.md'), 'utf8'), '# verified completion\n');
 	assert.equal(
 		await readFile(path.join(first.cwd, '.codex', 'skills', 'minecraft-control', 'SKILL.md'), 'utf8'),

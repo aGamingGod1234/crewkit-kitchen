@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Human-speed agent actions: codebase audit and plan</title>
+  <style>
+    :root { color-scheme: dark; font: 16px/1.55 system-ui, sans-serif; background:#0d1117; color:#ecf2f8; }
+    * { box-sizing: border-box; }
+    body { margin:0; }
+    main { width:min(920px,100%); margin:auto; padding:32px 20px 72px; }
+    h1 { font-size:clamp(2rem,7vw,3.7rem); line-height:1.08; letter-spacing:-.045em; margin:.2em 0; }
+    h2 { font-size:1.35rem; margin:0 0 .6rem; }
+    p { margin:.5rem 0 1rem; }
+    .eyebrow { color:#80dbb1; font-size:.8rem; text-transform:uppercase; letter-spacing:.12em; font-weight:700; }
+    .muted { color:#a7b5c4; }
+    .lead { font-size:1.2rem; max-width:760px; }
+    section { padding:26px 0; border-top:1px solid #2c3846; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; }
+    .card { border:1px solid #334252; background:#151d27; border-radius:12px; padding:16px; }
+    .card strong { display:block; color:#80dbb1; font-size:1.15rem; }
+    ol, ul { padding-left:1.3rem; }
+    li { margin:.55rem 0; }
+    code { overflow-wrap:anywhere; color:#b9eacb; }
+    .tag { display:inline-block; background:#203547; color:#bce3ff; border-radius:20px; padding:3px 10px; font-size:.82rem; }
+    .risk { color:#ffd59b; }
+  </style>
+</head>
+<body>
+<main>
+  <p class="eyebrow">Codebase audit · 25 September 2026</p>
+  <h1>Make agent actions feel continuous</h1>
+  <p class="lead">The selected AI agent remains the only author of gameplay decisions. Minecraft executes its bounded, preauthorized controls at tick speed and returns new facts when another decision is needed.</p>
+  <p><span class="tag">Audit complete</span> <span class="tag">Local handoff verified</span> <span class="tag">Live gameplay gain unproven</span></p>
+
+  <section>
+    <h2>Goal and scope</h2>
+    <p>Reduce avoidable idle time between movement, gathering, combat, and interaction steps. Preserve the selected model, goal revision, action provenance, factual observation barriers, and user stop/steer controls. The first change is in an isolated worktree based on merged main. The user's unrelated working-tree edits remain untouched. Nothing was installed or pushed.</p>
+  </section>
+
+  <section>
+    <h2>What the code already provides</h2>
+    <div class="grid">
+      <div class="card"><strong>Tick-speed controls</strong><p><code>control_sequence</code> runs up to 64 agent-authored frames and observed-condition branches on the server, within a 2,000-tick budget. Source: <code>ControlSequence.java:13–29,64–99</code>.</p></div>
+      <div class="card"><strong>Known action chains</strong><p><code>sequence</code> runs 2–8 exact actions in order, stops on failure, and returns one final post-action sample. Source: <code>native-minecraft-tools.mjs:113–118</code>; <code>native-tool-runtime.mjs:491–503</code>.</p></div>
+      <div class="card"><strong>Reactive routines</strong><p><code>runProgram</code> executes bounded agent-authored ArenaScript. It waits for each physical result and a fresh observation before dependent continuation. Source: <code>native-program-executor.mjs:99–149</code>.</p></div>
+      <div class="card"><strong>Warm sessions</strong><p>Native agent sessions prewarm and a real event can adopt the active prewarm turn. The bridge admits action commands at the start of a server tick. Source: <code>codex-service.mjs:569–619</code>; <code>MultiplexedServerBridge.java:424–467</code>.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Evidence and limits</h2>
+    <p>A historical 16-agent provider probe with simulated action bodies measured move-then-mine medians of roughly 4.8–5.2 seconds through separate calls versus 3.26–3.36 seconds through one sequence at low reasoning. It shows a model-call saving, not a current live Minecraft speedup (<code>reports/native-tool-loop-three-runs-2026-08-22.json</code>).</p>
+    <p>A September headless rehearsal recorded 18 physical actions totaling 23.3 seconds, while six provider turns totaled 104.6 seconds across an overlapping 107.2-second phase. Provider turns include tool waits, and API-only timing was absent, so these totals cannot isolate model inference (<code>output/fast-pass-live-2-audit.json</code>). Existing historical baseline comparisons also mix startup, provider, and gameplay; there is no defensible current human-speed baseline.</p>
+  </section>
+
+  <section>
+    <h2>First implementation and measured result</h2>
+    <p>Internal program continuation now gets a fresh observation without rereading execution settings and unresolved notebook entries that only the model-facing observe result uses. The same agent-authored eight-action stream ran 120 paired programs per version after warmup. The action hash and 960 fresh samples per arm matched.</p>
+    <div class="grid">
+      <div class="card"><strong>4.11 → 1.31 ms</strong><p>Median completion-to-next-dispatch gap, 840 samples per version, 68.2% lower. All 120 paired programs improved on this gap.</p></div>
+      <div class="card"><strong>67.14 → 66.10 ms</strong><p>Median whole eight-action program time, 1.5% lower. The overall gain is modest.</p></div>
+      <div class="card"><strong>110 + 1,772 tests</strong><p>Focused native tests passed; full coordinator suite passed with three skips. Both Java 25 builds assembled successfully.</p></div>
+    </div>
+    <p>The Codex workspace needed a required default permission profile. With the same compatibility fix in both builds, a real fixed-arena oak-log task passed in 21.675 seconds on the baseline and 27.211 seconds on the optimized build. This one optimized trial was slower; its model made more decisions, and neither trial used <code>runProgram</code>, the optimized path. No gameplay speedup or human-speed claim follows from that pair. The matched handoff benchmark uses a synthetic immediate bridge, not Minecraft physics or model inference.</p>
+  </section>
+
+  <section>
+    <h2>Recommended steps</h2>
+    <ol>
+      <li><strong>Measure the gaps first.</strong> Record event-to-model request, model request-to-first tool, validation-to-bridge acceptance, acceptance-to-first physical progress, and completion-to-next authorized action. Label every idle interval. Use a fixed seed/profile and paired real Fabric runs; keep failures and cancellations.</li>
+      <li><strong>Make agent-authored continuation the normal path.</strong> Use <code>sequence</code> for known steps whose next target does not depend on a new fact; use <code>runProgram</code> for observed branches and repeated tasks; use <code>control_sequence</code> for precise tick-by-tick movement. Reuse saved agent-authored programs only after they read fresh facts. Avoid rapid <code>startAction</code>/<code>actionStatus</code> polling, which adds provider calls.</li>
+      <li><strong>Reduce observation work where measured.</strong> The server currently collects a full snapshot before computing a change delta. Test a versioned small-delta lane for routine updates and addressed events, retaining full snapshots for startup, recovery, and explicit inspections. A fact-only trigger may wake or steer the same selected model; it may never select an action.</li>
+      <li><strong>Profile navigation before tuning it.</strong> Complex routes can defer walking while bounded path search proceeds over ticks. Reuse terrain data only with proven chunk and mutation invalidation; do not alter motor acceleration or queue ordering on speculation.</li>
+      <li><strong>Test authority and gameplay together.</strong> Delay/fail the provider during a running routine: only already authorized steps may continue. Reject stale successor output after a goal change. Compare completed tasks, action errors, p50/p95 idle gaps, first movement, and server tick p95 across matched worlds, including 1, 8, and 16 agents. Aim for at least 30 paired samples per primary cell before treating p95 as stable.</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>Decisions and risks</h2>
+    <p><strong>Decision:</strong> keep one selected model as the sole source of target choices, branches, retries, pause/resume policy, and successor programs. Remove measured local overhead while preserving fresh facts and lifecycle fences. Future live comparisons need matched runs that actually exercise model-authored <code>runProgram</code> and separate model wait from local action handoff.</p>
+    <p class="risk"><strong>Risk:</strong> long open-loop movement can act on stale terrain or miss new danger. Bound each routine, specify agent-authored stop conditions, and return to the model when a choice needs new evidence. A newly encountered situation still incurs selected-model latency; continuous execution cannot make a fresh model decision instantaneous.</p>
+  </section>
+</main>
+</body>
+</html>

@@ -1,0 +1,42 @@
+{
+  "date": "2026-09-25",
+  "machine": "MiniPC",
+  "scenario": "controlled-reach-log",
+  "scenarioConfigSha256": "2E667752D55BE9FCAD29B35F1B3FD381534DE5D9EAF297FCBA580C2E1B54AE89",
+  "profile": {
+    "provider": "codex",
+    "model": "gpt-6-sol",
+    "reasoningEffort": "low",
+    "serviceTier": "priority"
+  },
+  "sharedCompatibilityChange": "Set default_permissions = minecraft in the isolated Codex workspace",
+  "runs": [
+    {
+      "arm": "baseline",
+      "runId": "run-1790300540067-b4633dc2",
+      "status": "PASSED",
+      "lifecycle": "COMPLETED",
+      "elapsedMs": 21675,
+      "completedActions": 11,
+      "modelDecisionSegments": 6,
+      "modelSegmentDurationMsTotal": 10036.8646,
+      "nativeProgramEvents": 0,
+      "cleanup": "CLEAN",
+      "jarSha256": "98EDB728B05298050CA179960DCBC6718D838DD306443703BC2FDB5C9129F17A"
+    },
+    {
+      "arm": "optimized",
+      "runId": "run-1790300602195-44e56af5",
+      "status": "PASSED",
+      "lifecycle": "COMPLETED",
+      "elapsedMs": 27211,
+      "completedActions": 12,
+      "modelDecisionSegments": 8,
+      "modelSegmentDurationMsTotal": 16580.9526,
+      "nativeProgramEvents": 0,
+      "cleanup": "CLEAN",
+      "jarSha256": "B86F0F67A8AEDDF558899D0460D238809ABBBDA92DEF84CF794FE285301C0AF5"
+    }
+  ],
+  "interpretation": "Both completed, but neither used runProgram, so this pair does not measure the optimized continuation path."
+}

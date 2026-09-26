@@ -16,6 +16,7 @@ const MAX_SEQUENCE_ACTIONS = 8;
 const MAX_LOOK_AROUND_STEPS = 8;
 const MAX_LOOK_AROUND_TICKS = 20;
 const MAX_PROGRAM_SOURCE_BYTES = 65_536;
+const MAX_SEQUENCE_FINISH_BYTES = 4_096;
 const NATIVE_ACTION_TYPES = Object.freeze(Object.keys(ACTION_FIELDS));
 export const INSPECTION_SECTIONS = Object.freeze(['observation', 'inventory', 'menu', 'entities', 'blocks', 'landmarks', 'nearby_containers', 'item', 'block', 'events', 'recipes', 'mechanics']);
 
@@ -33,9 +34,9 @@ export function minecraftCapabilities({ section = 'all' } = {}) {
 
 export const NATIVE_AGENT_INSTRUCTIONS = `You control one live Minecraft player and choose every action.
 
-Keep provider, model, reasoning effort, and service tier. Choose from current observations and the goal. Death does not change the active goal. Start bounded progress before lengthy reasoning: after a fresh observation, run a small safe background:true program when it fits, then reason while it runs and answer its exact attention decision.
+Keep provider/model/effort/tier. Choose from fresh observations and the goal; death does not change the active goal. Use sequence for safe linear chains needing no new facts; optional finish:{summary} verifies after success. Use ArenaScript for conditional/repeated work; for longer work, background:true may send one measured-p95 advisory near timeout so you can prepare during its run. It never chooses or dispatches an action. Use startAction to reason while one chosen action runs; handle it exactly with actionStatus/cancelAction/replaceAction, and require fresh facts before dependent actions. Answer exact program attention decisions.
 
-Use capabilities for fields, observe fresh samples, and inspect focused pages. Respect freshness: omitted or unobserved facts are unknown. Query notes and receipts with queryMemory (paginate nextOffset) before writing; reuse exact noteKey only if fresh prerequisites/current targets match. Notes are hypotheses; receipts are historical. Save executable source with metadata in comments or a separate note; noteKey executes the entire note as source. exploreFrontier returns candidates; choose one for moveTo. Use control for precise inputs, sequence for safe chains, and act with control_sequence for bounded tick programs. startAction returns a handle; use its exact identity with actionStatus/cancelAction/replaceAction. Mine only observed blocks with exact blockId. goalSpec is immutable; finish requests verification. Never claim effects without evidence. conversation_only uses say. Plain text is invisible; keep nearby speech brief; speech playback is asynchronous.`;
+Use capabilities for fields, fresh observations, and focused inspections. Omitted or unobserved facts are unknown. Query notes and receipts with queryMemory (paginate nextOffset); reuse exact noteKey only when fresh prerequisites/current targets match. Notes are hypotheses; receipts historical. Keep source metadata in comments/separate notes; noteKey executes the entire note as source. exploreFrontier returns candidates; choose a moveTo target. Use control for precise inputs and act with control_sequence for bounded tick programs. Mine observed blocks with exact blockId. goalSpec is immutable; finish requests verification. Never claim effects without evidence. conversation_only uses say. Plain text is invisible; keep speech brief; speech playback is asynchronous.`;
 
 export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 	tool('observe', 'Request a fresh player observation. Read freshness and coverage; an unavailable freshness barrier returns explicitly stale cached facts.', objectSchema({})),
@@ -54,10 +55,10 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 		actionId: { type: 'string', minLength: 1, maxLength: 128 }, goalRevision: integerSchema(0, Number.MAX_SAFE_INTEGER),
 		actionType: { type: 'string', enum: NATIVE_ACTION_TYPES }, arguments: { type: 'object' },
 	}, ['actionId', 'goalRevision', 'actionType', 'arguments'])),
-	tool('startAction', 'Start one model-chosen action and return its handle immediately. Poll actionStatus for the factual result or cancel the exact handle.', objectSchema({ actionType: { type: 'string', enum: NATIVE_ACTION_TYPES }, arguments: { type: 'object' } }, ['actionType', 'arguments'])),
+	tool('startAction', 'Start one action you have already chosen and return its handle immediately so you can reason while it runs. Poll actionStatus for the factual result or cancel the exact handle. This does not authorize a dependent action without fresh facts.', objectSchema({ actionType: { type: 'string', enum: NATIVE_ACTION_TYPES }, arguments: { type: 'object' } }, ['actionType', 'arguments'])),
 	tool('notebook', 'Save or replace one model-written note of up to 2048 characters in this agent and world. Prefer a stable exact key for reusable routines. Keep executable ArenaScript valid; put prerequisites, current targets, outcomes, and failure conditions in comments or a separate note, and only record outcomes supported by evidence. Notes are hypotheses or plans, never authoritative game evidence.', objectSchema({ key: { type: 'string', minLength: 1, maxLength: 128 }, text: { type: 'string', minLength: 1, maxLength: 2048 } }, ['key', 'text'])),
 	tool('queryMemory', 'Read this agent and world\'s saved notes and action receipts, including unresolved dispatches. Start with notes to find reusable routines and receipts to check historical outcomes; continue every page with nextOffset. Historical receipts do not establish current world state.', objectSchema({ kind: { type: 'string', enum: ['all', 'notes', 'receipts', 'unresolved'] }, text: { type: 'string', minLength: 1, maxLength: 256 }, offset: integerSchema(0, Number.MAX_SAFE_INTEGER), limit: integerSchema(1, 64) })),
-	tool('runProgram', 'Run bounded ArenaScript that you author. Supply source or an exact notebook noteKey; noteKey executes the entire note text as ArenaScript, so keep metadata in comments or a separate note. After a fresh observation, prefer a small bounded routine and background:true so useful work starts while the selected model reasons. Reuse noteKey only when fresh facts confirm its recorded prerequisites and current target assumptions; replace only when they no longer fit. Optional observationIntervalMs requests fresh samples. background:true returns a program handle while your routine continues reacting during model reasoning; otherwise wait for its result. One program owns the body until it ends or cancelProgram settles. Programs expire within timeoutMs and never restart themselves.', objectSchema({ source: { type: 'string', minLength: 1, maxLength: MAX_PROGRAM_SOURCE_BYTES }, noteKey: { type: 'string', minLength: 1, maxLength: 128 }, background: { type: 'boolean' }, observationIntervalMs: integerSchema(100, 5000), maxActions: integerSchema(1, 256), timeoutMs: integerSchema(1, 120_000) })),
+	tool('runProgram', 'Run bounded ArenaScript that you author. Supply source or an exact notebook noteKey; noteKey executes the entire note text as ArenaScript, so keep metadata in comments or a separate note. After a fresh observation, use a small safe background:true routine for conditional or repeated work that can run while you reason. One recent-p95 advisory may arrive near timeout so you can prepare the next intention; it never chooses or dispatches actions or waives fresh-fact requirements. Reuse noteKey only when fresh facts confirm its recorded prerequisites and current target assumptions; replace only when they no longer fit. Optional observationIntervalMs requests fresh samples. background:true returns a program handle while your routine continues reacting during model reasoning; otherwise wait for its result. One program owns the body until it ends or cancelProgram settles. Programs expire within timeoutMs and never restart themselves.', objectSchema({ source: { type: 'string', minLength: 1, maxLength: MAX_PROGRAM_SOURCE_BYTES }, noteKey: { type: 'string', minLength: 1, maxLength: 128 }, background: { type: 'boolean' }, observationIntervalMs: integerSchema(100, 5000), maxActions: integerSchema(1, 256), timeoutMs: integerSchema(1, 120_000) })),
 	tool('programStatus', 'Read the running program, pending decision, or latest terminal result. Does not wait or change the player. Use it to inspect a background handle or exact attention; ordinary progress needs no polling. Background completion does not mean the goal is complete.', objectSchema({ programId: { type: 'string', minLength: 1, maxLength: 128 } })),
 	tool('respondProgram', 'Answer the exact pending program decision. Continue preserves authored work. Replace installs new source after releasing the old action and retains the original deadline and action budget; use it when fresh facts invalidate prerequisites or current targets. Pause and finish stop the routine; finish still requires separate factual goal verification.', objectSchema({ programId: { type: 'string', minLength: 1, maxLength: 128 }, goalRevision: integerSchema(0, Number.MAX_SAFE_INTEGER), decisionId: { type: 'string', minLength: 1, maxLength: 256 }, directive: { type: 'string', enum: ['continue', 'pause', 'replace', 'finish'] }, source: { type: 'string', minLength: 1, maxLength: MAX_PROGRAM_SOURCE_BYTES } }, ['programId', 'goalRevision', 'decisionId', 'directive'])),
 	tool('cancelProgram', 'Cancel the exact program and wait for its result. New body actions remain blocked while cancellation is unconfirmed. Handles are scoped to this agent and goal revision.', objectSchema({ programId: { type: 'string', minLength: 1, maxLength: 128 }, goalRevision: integerSchema(0, Number.MAX_SAFE_INTEGER) }, ['programId', 'goalRevision'])),
@@ -113,11 +114,12 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 		actionType: { type: 'string', enum: NATIVE_ACTION_TYPES },
 		arguments: { type: 'object' },
 	}, ['actionType', 'arguments'])),
-	tool('sequence', 'Prefer sequence for safe 2+ action chains. Execute 2 to 8 exact model-authored actions in order, stopping on the first factual failure. Movement, mining, or pickup chains return one postAction sample after the last attempted step. Use separate calls when a later step needs fresh facts.', objectSchema({
+	tool('sequence', 'Prefer sequence for safe 2+ action chains. Execute 2 to 8 exact model-authored actions in order, stopping on the first factual failure. Optionally supply finish:{summary} to request goal verification after every action succeeds and a fresh final sample is available; failure never runs finish. Movement, mining, or pickup chains return one postAction sample after the last attempted step. Use separate calls when a later step needs fresh facts.', objectSchema({
 		actions: {
 			type: 'array', minItems: 2, maxItems: MAX_SEQUENCE_ACTIONS,
 			items: objectSchema({ actionType: { type: 'string', enum: NATIVE_ACTION_TYPES }, arguments: { type: 'object' } }, ['actionType', 'arguments']),
 		},
+		finish: objectSchema({ summary: { type: 'string', minLength: 1, maxLength: 512 } }, ['summary']),
 	}, ['actions'])),
 	tool('finish', 'Ask Minecraft to verify the immutable active goal. Read unmet facts on failure. If AWAITING_OPERATOR_CONFIRMATION, report once with say and end this turn until new input; do not repeat the work or verification.', objectSchema({
 		summary: { type: 'string', minLength: 1, maxLength: 512 },
@@ -307,13 +309,15 @@ export function normalizeMinecraftToolCall(name, value) {
 			break;
 		}
 		case 'sequence': {
-			requireExactKeys(args, ['actions']);
+			requireExactKeys(args, ['actions', 'finish']);
 			if (!Array.isArray(args.actions) || args.actions.length < 2 || args.actions.length > MAX_SEQUENCE_ACTIONS) {
 				invalid(`actions must contain 2 to ${MAX_SEQUENCE_ACTIONS} entries`);
 			}
+			const finish = args.finish === undefined ? undefined : normalizeMinecraftToolCall('finish', args.finish);
 			return {
 				kind: 'sequence',
 				actions: args.actions.map(normalizeSequenceAction),
+				...(finish === undefined ? {} : { finish: { summary: finish.summary } }),
 			};
 		}
 		case 'finish':
@@ -575,6 +579,7 @@ function compactSequenceResult(value) {
 			...(step?.physicalAttempted === undefined ? {} : { physicalAttempted: step.physicalAttempted === true }),
 		})),
 	};
+	if (value.finish !== undefined) result.finish = compactSequenceFinish(value.finish);
 	if (Array.isArray(value.samples)) {
 		const samples = value.samples.slice(0, 8);
 		if (Buffer.byteLength(JSON.stringify({ ...result, samples }), 'utf8') <= MAX_TOOL_RESULT_BYTES - 2_048) result.samples = samples;
@@ -595,6 +600,34 @@ function compactSequenceResult(value) {
 		? 'Some per-action observations were omitted by the coordinator result limit; call observe for fresh compact facts.'
 		: 'Some per-action observations were omitted by the coordinator result limit. postAction contains facts after the last attempted step.';
 	return result;
+}
+
+function compactSequenceFinish(value) {
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) return { state: 'UNKNOWN', reasonCode: 'INVALID_FINISH_RESULT' };
+	const finish = {
+		...(typeof value.state === 'string' ? { state: boundedResultField(value.state, 64) } : {}),
+		...(typeof value.verified === 'boolean' ? { verified: value.verified } : {}),
+		...(typeof value.reasonCode === 'string' ? { reasonCode: boundedResultField(value.reasonCode, 128) } : {}),
+		...(typeof value.message === 'string' ? { message: boundedResultField(value.message, 512) } : {}),
+	};
+	if (!Array.isArray(value.facts)) return finish;
+	const facts = value.facts.map((fact) => ({
+		...(typeof fact?.type === 'string' ? { type: boundedResultField(fact.type, 128) } : {}),
+		...(typeof fact?.satisfied === 'boolean' ? { satisfied: fact.satisfied } : {}),
+		...(typeof fact?.expectedValue === 'string' ? { expectedValue: boundedResultField(fact.expectedValue, 512) } : {}),
+		...(typeof fact?.observedValue === 'string' ? { observedValue: boundedResultField(fact.observedValue, 512) } : {}),
+	}));
+	const allFacts = { ...finish, facts };
+	if (Buffer.byteLength(JSON.stringify(allFacts), 'utf8') <= MAX_SEQUENCE_FINISH_BYTES) return allFacts;
+	const ordered = [...facts.filter((fact) => fact.satisfied === false), ...facts.filter((fact) => fact.satisfied !== false)];
+	const retained = [];
+	for (const fact of ordered) {
+		const omittedFacts = facts.length - retained.length - 1;
+		const candidate = { ...finish, facts: [...retained, fact], ...(omittedFacts > 0 ? { omittedFacts, factsTruncated: true } : {}) };
+		if (Buffer.byteLength(JSON.stringify(candidate), 'utf8') > MAX_SEQUENCE_FINISH_BYTES - 64) break;
+		retained.push(fact);
+	}
+	return { ...finish, facts: retained, omittedFacts: facts.length - retained.length, factsTruncated: true };
 }
 
 function boundedResultField(value, maximum) { return String(value ?? '').slice(0, maximum); }

@@ -1,0 +1,34 @@
+{
+  "benchmark": "native-observation-handoff",
+  "date": "2026-09-25",
+  "machine": "MiniPC",
+  "baselineBaseCommit": "f1fdeffe",
+  "baselineCompatibilityCommit": "655de573",
+  "optimizedSpeedCommit": "fc79a776",
+  "repetitionsPerArm": 120,
+  "warmupProgramsPerArm": 10,
+  "authoredActionsPerProgram": 8,
+  "authoredActionsPerArm": 960,
+  "controller": "immediate fake bridge; real NativeToolRuntime, ArenaScript, and disk-backed ModelNotebook",
+  "alternation": "baseline-optimized, optimized-baseline",
+  "results": {
+    "baseline": {
+      "program": { "n": 120, "p50Ms": 59.1449, "p95Ms": 76.6986, "meanMs": 60.964197499999976 },
+      "handoff": { "n": 840, "p50Ms": 3.7202, "p95Ms": 5.7296, "meanMs": 3.899290952380938 },
+      "requestedObservations": 960,
+      "unresolvedQueries": 960,
+      "executionSettingsReads": 960,
+      "actionShapeHash": "818b3a2e29903dd525d15836326aafc897b505905d056c535917ce3013b1e108"
+    },
+    "optimized": {
+      "program": { "n": 120, "p50Ms": 58.4173, "p95Ms": 79.4517, "meanMs": 61.27475333333333 },
+      "handoff": { "n": 840, "p50Ms": 1.1347, "p95Ms": 1.8231, "meanMs": 1.1931589285714175 },
+      "requestedObservations": 960,
+      "unresolvedQueries": 0,
+      "executionSettingsReads": 0,
+      "actionShapeHash": "818b3a2e29903dd525d15836326aafc897b505905d056c535917ce3013b1e108"
+    }
+  },
+  "pairWins": { "program": 67, "handoff": 120 },
+  "result": "PASSED"
+}
