@@ -44,7 +44,7 @@ import org.slf4j.LoggerFactory;
 
 public final class CodexAgentCommands {
 	private static final Logger LOGGER = LoggerFactory.getLogger(CodexAgentCommands.class);
-	private static final String DEFAULT_MODEL = "gpt-5.6-luna";
+	private static final String DEFAULT_MODEL = "gpt-6-luna";
 	private static final String DEFAULT_REASONING = "xhigh";
 	private static final String DEFAULT_CODEX_SERVICE_TIER = "fast";
 	private static final String PROVIDER_CODEX = "codex";

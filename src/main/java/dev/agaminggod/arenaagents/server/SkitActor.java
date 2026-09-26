@@ -20,7 +20,7 @@ public record SkitActor(AgentId agentId, String name, String appearance, boolean
 					case "gemini" -> "gemini-3.1-pro";
 					case "kimi" -> "kimi-code/k3";
 					case "cursor" -> "composer-2.5";
-					default -> "gpt-5.6-luna";
+					default -> "gpt-6-luna";
 				}, "medium", Optional.of(name), 0);
 	}
 	public SkitActor withDead(boolean value) { return new SkitActor(agentId, name, appearance, value); }

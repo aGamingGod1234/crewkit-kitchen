@@ -31,7 +31,7 @@ test('Director generation is isolated Luna low and returns only a bounded draft'
 		description: 'Fly here',
 		actorName: 'Astra',
 	});
-	assert.equal(profile.model, 'gpt-5.6-luna');
+	assert.equal(profile.model, 'gpt-6-luna');
 	assert.equal(profile.reasoningEffort, 'low');
 	assert.equal(protocol, 'director_script');
 	assert.equal(result.steps.length, 1);

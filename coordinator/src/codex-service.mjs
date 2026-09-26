@@ -431,7 +431,10 @@ export class SharedCodexAgent {
 		for (const field of turnStarted ? ['model', 'serviceTier', 'reasoningEffort'] : ['model', 'serviceTier']) {
 			const value = response?.[field] ?? response?.turn?.[field];
 			if (typeof value !== 'string' || value.length === 0 || value.length > 256) continue;
-			if (value !== this.#profile[field]) throw new CodexProtocolError('PROVIDER_SETTINGS_MISMATCH', `Codex did not confirm the selected ${field}`);
+			// Codex reports the Fast service tier as "priority" even when it was requested as "fast".
+			if (field === 'serviceTier' ? !sameCodexServiceTier(value, this.#profile[field]) : value !== this.#profile[field]) {
+				throw new CodexProtocolError('PROVIDER_SETTINGS_MISMATCH', `Codex did not confirm the selected ${field}`);
+			}
 			this.#executionSettings.effective[field] = value;
 			this.#executionSettings.evidence[field] = 'provider_reported';
 		}
@@ -1146,6 +1149,11 @@ function exactLaunchProfileCatalog(profile) {
 		supportedReasoningEfforts: [profile.reasoningEffort],
 		serviceTiers: [profile.serviceTier],
 	}];
+}
+
+function sameCodexServiceTier(reported, requested) {
+	return reported === requested || (reported === 'priority' && requested === 'fast')
+		|| (reported === 'fast' && requested === 'priority');
 }
 
 function assertReconciliationActive(signal) {

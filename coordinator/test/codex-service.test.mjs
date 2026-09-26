@@ -104,6 +104,33 @@ test('Codex distinguishes submitted settings from provider-confirmed values', as
 	await service.stop();
 });
 
+test('Codex accepts the provider priority name for requested Fast mode', async () => {
+	const transport = new FakeSharedTransport();
+	const request = transport.request.bind(transport);
+	transport.request = async (method, params, options) => {
+		const result = await request(method, params, options);
+		return method === 'thread/start' ? { ...result, model: params.model, serviceTier: 'priority' } : result;
+	};
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	const agent = await service.createAgent(profile('fast-alias'));
+	assert.equal(agent.executionSettings.requested.serviceTier, 'fast');
+	assert.equal(agent.executionSettings.effective.serviceTier, 'priority');
+	assert.equal(agent.executionSettings.evidence.serviceTier, 'provider_reported');
+	await service.stop();
+});
+
+test('Codex still rejects a genuinely different service tier', async () => {
+	const transport = new FakeSharedTransport();
+	const request = transport.request.bind(transport);
+	transport.request = async (method, params, options) => {
+		const result = await request(method, params, options);
+		return method === 'thread/start' ? { ...result, model: params.model, serviceTier: 'flex' } : result;
+	};
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	await assert.rejects(service.createAgent(profile('wrong-tier')), (error) => error.code === 'PROVIDER_SETTINGS_MISMATCH');
+	await service.stop();
+});
+
 test('Codex rejects a confirmed different model before installing a session', async () => {
 	const transport = new FakeSharedTransport();
 	const request = transport.request.bind(transport);

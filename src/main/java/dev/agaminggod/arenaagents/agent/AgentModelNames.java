@@ -7,6 +7,9 @@ import java.util.Objects;
 /** Canonical operator-facing names for every model in the bundled provider catalog. */
 public final class AgentModelNames {
 	private static final Map<ModelKey, Names> NAMES = Map.ofEntries(
+			entry("codex", "gpt-6-astra", "GPT 6 Astra", "Astra"),
+			entry("codex", "gpt-6-sol", "GPT 6 Sol", "Sol"),
+			entry("codex", "gpt-6-luna", "GPT 6 Luna", "Luna"),
 			entry("codex", "gpt-5.6-sol", "GPT 5.6 Sol", "Sol"),
 			entry("codex", "gpt-5.6-sol-wm", "GPT 5.6 Sol WM", "Sol WM"),
 			entry("codex", "gpt-5.6-terra", "GPT 5.6 Terra", "Terra"),
@@ -51,6 +54,9 @@ public final class AgentModelNames {
 		ModelKey key = key(provider, slug);
 		if (key.provider().equals("codex")) {
 			return switch (key.slug()) {
+				case "gpt-6-astra" -> "GPT 6-Astra";
+				case "gpt-6-sol" -> "GPT 6-Sol";
+				case "gpt-6-luna" -> "GPT 6-Luna";
 				case "gpt-5.6-sol" -> "GPT 5.6-Sol";
 				case "gpt-5.6-sol-wm" -> "GPT 5.6-Sol WM";
 				case "gpt-5.6-terra" -> "GPT 5.6-Terra";

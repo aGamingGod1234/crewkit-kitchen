@@ -5139,7 +5139,7 @@ test('coalesces a burst of two hundred quiet wire observations without losing th
 test('Director generation handles cast-only requests once and never sends world actions', async () => {
  const provider=new FakeProvider(); let creations=0;
  provider.createAgent=async(profile,options)=>{
-  creations++; assert.equal(profile.model,'gpt-5.6-luna'); assert.equal(profile.reasoningEffort,'low'); assert.equal(options.controlProtocol,'director_script');
+  creations++; assert.equal(profile.model,'gpt-6-luna'); assert.equal(profile.reasoningEffort,'low'); assert.equal(options.controlProtocol,'director_script');
   return {setGoalRevision:async()=>{},decide:async(prompt,options)=>options.parseOutput(JSON.stringify({steps:[{action:'jump',arguments:'',destination:'start',right:0,up:0,forward:0}]}))};
  };
  provider.removeAgent=async()=>{};

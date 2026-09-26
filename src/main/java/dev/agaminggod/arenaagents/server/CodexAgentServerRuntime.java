@@ -411,7 +411,8 @@ public final class CodexAgentServerRuntime {
 
 	public static List<AgentControlModelOption> modelCatalog(MinecraftServer server) {
 		MultiplexedServerBridge bridge = bridge(server);
-		return bridge == null ? AgentControlCatalog.fallbackOptions() : bridge.catalogModels();
+		return bridge == null ? AgentControlCatalog.fallbackOptions()
+				: AgentControlCatalog.selectableOptions(bridge.catalogModels());
 	}
 
 	public static void requireAutomation(MinecraftServer server) {

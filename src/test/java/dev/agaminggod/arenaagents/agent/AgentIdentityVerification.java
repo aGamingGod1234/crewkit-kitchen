@@ -142,6 +142,12 @@ public final class AgentIdentityVerification {
 
 		assertEquals("GPT 5.6 Sol WM", AgentModelNames.displayName("codex", "gpt-5.6-sol-wm"),
 				"Codex display name is canonical");
+		assertEquals("GPT 6 Astra", AgentModelNames.displayName("codex", "gpt-6-astra"),
+				"GPT-6 Astra keeps its operator-facing name");
+		assertEquals("Sol", AgentModelNames.shortLabel("codex", "gpt-6-sol"),
+				"GPT-6 Sol keeps its compact label");
+		assertEquals("GPT 6-Luna", AgentModelNames.tagName("codex", "gpt-6-luna"),
+				"GPT-6 Luna keeps its in-world tag name");
 		assertEquals("Sol WM", AgentModelNames.shortLabel("codex", "gpt-5.6-sol-wm"),
 				"Codex short label is canonical");
 		assertEquals("Gemini 3.1 Pro", AgentModelNames.displayName("gemini", "gemini-3.1-pro"),
@@ -277,7 +283,7 @@ public final class AgentIdentityVerification {
 				.getAsJsonArray("families").get(0).getAsJsonObject().getAsJsonArray("variants").get(0)
 				.getAsJsonObject().addProperty("texturePath", "minecraft:textures/entity/stolen.png")),
 				"project-owned codex entity texture", "non-project manifest texture rejected");
-		return 1150;
+		return 1153;
 	}
 
 	private static byte[] readTexture(String texturePath) {
