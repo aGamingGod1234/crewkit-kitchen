@@ -149,7 +149,7 @@ pre-render audio or promise frame-exact dialogue against camera movement.
 /codex skit summon codex ChatGPT
 /codex skit summon claude Claude
 /codex skit summon kimi Kimi
-/codex skit summon codex model gpt-6-sol "GPT 6-Sol"
+/codex skit summon codex model gpt-6.1-sol "GPT 6.1-Sol"
 /codex skit place ChatGPT here
 /codex skit place Claude at 12 72 -4 180 0
 /codex skit place Claude relative 2 0 4

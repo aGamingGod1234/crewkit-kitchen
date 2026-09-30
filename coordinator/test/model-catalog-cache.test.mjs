@@ -94,13 +94,13 @@ test('catalog exposes a stable operator sequence and omits hidden provider model
 	assert.equal(cache.find('gpt-reserve'), null);
 });
 
-test('catalog puts GPT-6 Astra, Sol, and Luna ahead of legacy models', async () => {
-	const models = ['gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-astra', 'gpt-6-sol'].map((id) => ({
+test('catalog puts Astra, GPT-6.1 Sol, and Luna ahead of legacy models', async () => {
+	const models = ['gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6-astra', 'gpt-6.1-sol'].map((id) => ({
 		id, supportedReasoningEfforts: ['low'], serviceTiers: ['priority'],
 	}));
 	const cache = new ModelCatalogCache(async () => models);
 	assert.deepEqual((await cache.refresh()).models.map(({ id }) => id),
-		['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol']);
+		['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-5.6-sol']);
 });
 
 test('malformed refresh retains the previous valid catalog as last_valid', async () => {
