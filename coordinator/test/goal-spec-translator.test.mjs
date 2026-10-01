@@ -1,12 +1,21 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { GoalSpecTranslator, buildGoalSpecTranslatorPrompt } from '../src/goal-spec-translator.mjs';
+import { GoalSpecTranslator, buildGoalSpecTranslatorPrompt, fallbackCompiledDragonGoal } from '../src/goal-spec-translator.mjs';
 
 const REQUEST = Object.freeze({
 	requestId: '00000000-0000-4000-8000-000000000001',
 	originalRequest: 'Get a good pickaxe',
 	candidateIds: ['minecraft:iron_pickaxe', 'minecraft:diamond_pickaxe'],
+});
+
+test('only an exact dragon command has a factual fallback when Luna is unavailable', () => {
+	const dragon = { requestId: REQUEST.requestId, originalRequest: 'Could you beat the game?', candidateIds: ['minecraft:ender_dragon'] };
+	assert.deepEqual(fallbackCompiledDragonGoal(dragon)?.predicate,
+		{ type: 'entity_killed_by_agent', entityType: 'minecraft:ender_dragon', afterGoalStart: true });
+	assert.equal(fallbackCompiledDragonGoal({ ...dragon, originalRequest: 'Kill two Ender Dragons' }), null);
+	assert.equal(fallbackCompiledDragonGoal({ ...dragon, originalRequest: 'Get a good pickaxe' }), null);
+	assert.equal(fallbackCompiledDragonGoal({ ...dragon, candidateIds: ['minecraft:zombie'] }), null);
 });
 
 test('translator prompt contains only the request, candidates, and allowlisted schema', () => {

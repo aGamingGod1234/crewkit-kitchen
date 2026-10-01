@@ -371,6 +371,33 @@ test('goal translation request retention has an independent hard cap', async () 
 	}
 });
 
+test('a compiled dragon goal starts through the constrained fallback when optional Luna advice fails', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	let calls = 0;
+	planner.requestGoalSpec = async () => {
+		calls += 1;
+		throw Object.assign(new Error('Luna unavailable'), { code: 'PROVIDER_UNAVAILABLE' });
+	};
+	const run = await start({ registry, planner });
+	const requestId = '00000000-0000-4000-8000-000000000199';
+	try {
+		run.bridge.emit('goal_spec_request', {
+			agentId: 'agent-a',
+			payload: { requestId, originalRequest: 'Beat the game', candidateIds: ['minecraft:ender_dragon'] },
+		});
+		await eventually(() => run.bridge.sent.some(({ type, payload }) => type === 'goal_spec_proposal' && payload.requestId === requestId));
+		assert.equal(calls, 1);
+		assert.deepEqual(run.bridge.sent.find(({ type, payload }) => type === 'goal_spec_proposal' && payload.requestId === requestId).payload.predicate,
+			{ type: 'entity_killed_by_agent', entityType: 'minecraft:ender_dragon', afterGoalStart: true });
+		run.bridge.emit('goal_spec_result', {
+			agentId: 'agent-a', payload: { requestId, status: 'accepted', reasonCode: 'PROPOSAL_ACTIVATED' },
+		});
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
 test('goal translation retries provider failure and retransmits until Minecraft acknowledges it', async () => {
 	const timers = new ManualTimerQueue();
 	const registry = new AgentRegistry();

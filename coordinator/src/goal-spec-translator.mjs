@@ -9,6 +9,21 @@ import {
 
 export const MAX_GOAL_SPEC_CORRECTION_ATTEMPTS = 3;
 
+/** A compiled dragon goal can start without its optional advisory plan if Luna fails. */
+export function fallbackCompiledDragonGoal(requestValue) {
+	const request = parseGoalSpecRequest(requestValue);
+	if (request.candidateIds.length !== 1 || request.candidateIds[0] !== 'minecraft:ender_dragon') return null;
+	const command = request.originalRequest.trim().toLowerCase()
+		.replace(/[.!?]+$/, '')
+		.replace(/^(?:(?:hey[, ]*|please\s+|can you\s+|could you\s+|would you\s+))+/, '');
+	if (!/^(?:beat (?:the )?game|(?:kill|slay|defeat) (?:(?:the|a|an) )?ender dragon)$/.test(command)) return null;
+	return parseGoalSpecProposal({
+		requestId: request.requestId,
+		summary: 'Defeat the Ender Dragon; choose and revise prerequisites from live world evidence.',
+		predicate: { type: 'entity_killed_by_agent', entityType: 'minecraft:ender_dragon', afterGoalStart: true },
+	});
+}
+
 export class GoalSpecTranslator {
 	#generate;
 
@@ -81,7 +96,7 @@ export function buildGoalSpecTranslatorPrompt(requestValue, { correctiveFeedback
 	const request = parseGoalSpecRequest(requestValue);
 	const correction = normalizeCorrectiveFeedback(correctiveFeedback, request.requestId);
 	return [
-		'Translate one Minecraft request into one factual, server-verifiable predicate.',
+		'Translate one Minecraft request into one server-checked completion predicate.',
 		'Use only the predicate schema and candidate identifiers below. Do not invent identifiers.',
 		'Preserve compound factual requests: use all_of when every requested result is required. Use any_of for explicit alternatives, including "or", "either", or any eligible member of a requested category.',
 		'A factual category request can accept several relevant candidate identifiers without naming one subtype. Preserve those accepted item variants with inventory_contains_any { itemIds, count } rather than arbitrarily requiring one subtype. itemIds contains 1 to 64 unique candidate identifiers; count is the minimum SUM of inventory counts across matching variants and stacks, not a separate requirement for every variant. This is one factual leaf, so a category with more than 16 identifiers does not need an oversized any_of. Category ambiguity alone is not a subjective outcome and must not become operator_confirmed.',

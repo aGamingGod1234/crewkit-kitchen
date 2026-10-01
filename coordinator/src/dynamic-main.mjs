@@ -42,7 +42,7 @@ import { classifyRecoveryFailure } from './recovery-policy.mjs';
 import { ReportingTransitionDeduper } from './reporting-transition-deduper.mjs';
 import { NativeToolRuntime } from './native-tool-runtime.mjs';
 import { classifyNativeGoalError } from './native-goal-error-policy.mjs';
-import { MAX_GOAL_SPEC_CORRECTION_ATTEMPTS } from './goal-spec-translator.mjs';
+import { MAX_GOAL_SPEC_CORRECTION_ATTEMPTS, fallbackCompiledDragonGoal } from './goal-spec-translator.mjs';
 import { ProgramRuntimeManager } from './program-runtime-manager.mjs';
 import { createProviderChildEnvironment } from './provider-environment.mjs';
 import { PROVIDER_IDS } from './provider-identity.mjs';
@@ -2498,11 +2498,18 @@ export class DynamicCoordinator extends EventEmitter {
 			entry.attempts = 0;
 		} catch (error) {
 			if (this.#goalSpecRequests.get(key) !== entry) return;
-			entry.attempts += 1;
 			this.#emitRuntimeError(error);
-			const delay = Math.min(GOAL_SPEC_RETRY_MAX_MS, GOAL_SPEC_RETRY_BASE_MS * (2 ** Math.min(entry.attempts - 1, 5)));
-			this.#scheduleGoalSpecRequest(key, entry, delay);
-			return;
+			// Only an exact, server-constrained dragon goal may proceed when its
+			// optional Luna advice is unavailable. Other translations keep retrying.
+			if (entry.correctiveFeedback === null) {
+				entry.proposal = fallbackCompiledDragonGoal(entry.request);
+			}
+			if (entry.proposal === null) {
+				entry.attempts += 1;
+				const delay = Math.min(GOAL_SPEC_RETRY_MAX_MS, GOAL_SPEC_RETRY_BASE_MS * (2 ** Math.min(entry.attempts - 1, 5)));
+				this.#scheduleGoalSpecRequest(key, entry, delay);
+				return;
+			}
 		} finally {
 			entry.translating = false;
 		}
