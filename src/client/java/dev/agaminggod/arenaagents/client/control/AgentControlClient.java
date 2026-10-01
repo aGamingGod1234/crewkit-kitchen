@@ -64,7 +64,7 @@ public final class AgentControlClient {
 			GLFW.GLFW_KEY_H,
 			KEY_CATEGORY
 	));
-	private static final AgentControlSnapshotStore SNAPSHOTS = new AgentControlSnapshotStore();
+	private static final AgentControlSnapshotStore SNAPSHOTS = AgentClientRoster.snapshots();
 	private static final ArenaSpectatorState SPECTATOR_STATE = new ArenaSpectatorState();
 	private static final ScenarioBuildProgressState BUILD_PROGRESS_STATE = new ScenarioBuildProgressState();
 	private static final SpectatorCameraAssistant CAMERA_ASSISTANT = new SpectatorCameraAssistant();
@@ -166,7 +166,7 @@ public final class AgentControlClient {
 	}
 
 	public static Optional<dev.agaminggod.arenaagents.control.AgentControlAgent> agentForPlayer(String profileName) {
-		return SNAPSHOTS.current().flatMap(snapshot -> AgentPlayerIdentity.find(snapshot, profileName));
+		return AgentClientRoster.agentForPlayer(profileName);
 	}
 
 	public static boolean isAgentPlayer(String profileName) {

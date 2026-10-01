@@ -6,6 +6,7 @@ import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
 import dev.agaminggod.arenaagents.agent.AgentProfile;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
+import dev.agaminggod.arenaagents.agent.AgentRegistry;
 import dev.agaminggod.arenaagents.agent.RespawnPolicy;
 import java.util.List;
 import java.util.Optional;
@@ -65,11 +66,17 @@ public final class AgentControlVerification {
 		assertEquals(snapshot, decoded, "snapshot JSON round trip");
 		assertEquals(AGENT_UUID, agent.agentId(), "snapshot carries stable full agent ID");
 		assertEquals("Builder", agent.displayName(), "snapshot carries optional user name");
-		AgentRecord sol = AgentRecord.create(new AgentId(UUID.randomUUID()),
-				new AgentProfile("codex", "gpt-6.1-sol", "medium", Optional.empty(), 0), NOW_EPOCH_MS);
+		AgentRegistry registry = AgentRegistry.createDefault(() -> { }, transition -> { });
+		AgentRecord sol = registry.create("codex", "gpt-6.1-sol", "medium", Optional.empty(), NOW_EPOCH_MS);
 		AgentControlAgent solView = AgentControlSnapshot.fromRecords(true, NOW_EPOCH_MS, List.of(sol)).agents().getFirst();
 		assertEquals("GPT-6.1 Sol", solView.displayName(), "world label uses the readable model name");
 		assertEquals("GPT_6_1_Sol", solView.playerName(), "Minecraft keeps its safe technical username");
+		assertEquals(Optional.of("GPT-6.1 Sol"), AgentWorldNamePolicy.tag(solView),
+				"the actual allocated profile reaches the renderer with punctuation intact");
+		AgentRecord secondSol = registry.create("codex", "gpt-6.1-sol", "medium", Optional.empty(), NOW_EPOCH_MS);
+		AgentControlAgent secondView = AgentControlSnapshot.fromRecords(true, NOW_EPOCH_MS, List.of(secondSol)).agents().getFirst();
+		assertEquals("GPT-6.1 Sol 2", secondView.displayName(), "allocated collisions remain distinct readable labels");
+		assertEquals("GPT_6_1_Sol2", secondView.playerName(), "allocated collisions keep their existing command handle");
 		assertEquals(Optional.of("Builder"), AgentWorldNamePolicy.tag(agent),
 				"world tags use the exact public name without a provider glyph or model suffix");
 		assertEquals(Optional.empty(), AgentWorldNamePolicy.tag(agent(AGENT_UUID, "   ")),
@@ -108,7 +115,7 @@ public final class AgentControlVerification {
 				() -> new AgentControlSnapshot(true, NOW_EPOCH_MS, java.util.Collections.nCopies(17, agent)),
 				"snapshot agent bound"
 		);
-		return 20;
+		return 23;
 	}
 
 	private static int verifyProviderPresets() {

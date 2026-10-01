@@ -126,6 +126,15 @@ public final class CodexAgentManager {
 		);
 	}
 
+	/** A name read must not initialize a manager while players are joining or leaving. */
+	public static synchronized Optional<String> playerDisplayName(ServerPlayer player) {
+		CodexAgentManager manager = INSTANCES.get(player.level().getServer());
+		if (manager == null) return Optional.empty();
+		return manager.records().stream()
+				.filter(record -> OfflineAgentPlayers.isManagedFakePlayer(player, record.agentId(), record.profile()))
+				.map(record -> AgentIdentity.displayNameTag(record.profile())).findFirst();
+	}
+
 	public static synchronized void release(MinecraftServer server) {
 		CodexAgentManager manager = INSTANCES.remove(server);
 		if (manager != null) {

@@ -6,8 +6,11 @@
     "AbstractClientPlayerMixin",
     "AvatarRendererMixin",
     "CameraEyeHeightAccessor",
+    "ClientPlayerDisplayNameMixin",
     "FontManagerAccessor",
-    "MinecraftFontManagerAccessor"
+    "MinecraftFontManagerAccessor",
+    "PlayerInfoMixin",
+    "SkinManagerMixin"
   ],
   "injectors": {
     "defaultRequire": 1
