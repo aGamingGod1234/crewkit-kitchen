@@ -17,6 +17,8 @@ import java.util.UUID;
 import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.component.DataComponentMap;
 import net.minecraft.core.component.DataComponents;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.Items;
 
@@ -35,8 +37,15 @@ public final class GoalCompilerVerification {
 		bindItemStackSize(Items.DIAMOND_SWORD, 1);
 		bindItemStackSize(Items.IRON_AXE, 1);
 		bindItemStackSize(Items.IRON_PICKAXE, 1);
+		BuiltInRegistries.ITEM.keySet().stream()
+				.filter(id -> id.getPath().endsWith("_log") || id.getPath().endsWith("_wood")
+						|| id.getPath().endsWith("_stem") || id.getPath().endsWith("_hyphae"))
+				.map(BuiltInRegistries.ITEM::getValue)
+				.filter(BlockItem.class::isInstance)
+				.forEach(item -> bindItemStackSize(item, 64));
 		int assertions = 0;
 		assertions += verifyExactItemAndAmbiguity();
+		assertions += verifyGenericWoodGoal();
 		assertions += verifyInventoryCapacity();
 		assertions += verifyExactPositionEntityAndAdvancement();
 		assertions += verifyManagerSubmissionFlow();
@@ -125,6 +134,34 @@ public final class GoalCompilerVerification {
 		assertEquals(GoalCompilation.Kind.NEEDS_TRANSLATION, make.kind(),
 				"make wording cannot be reduced to already-held inventory");
 		return 22;
+	}
+
+	private static int verifyGenericWoodGoal() {
+		GoalCompiler compiler = new GoalCompiler();
+		GoalCompilation spoken = compiler.compile("Could you get a block of wood?", RegistryAccess.EMPTY, 1_200L);
+		assertEquals(GoalCompilation.Kind.ACCEPTED, spoken.kind(), "ordinary wood request starts without clarification");
+		GoalPredicate.InventoryContainsAny wood = (GoalPredicate.InventoryContainsAny) spoken.acceptedSpec().orElseThrow().completion();
+		assertEquals(1, wood.count(), "a block of wood requires one held wood item");
+		assertTrue(wood.itemIds().contains("minecraft:oak_log"), "oak logs are valid wood");
+		assertTrue(wood.itemIds().contains("minecraft:spruce_log"), "the goal does not choose a tree species in advance");
+		assertTrue(wood.itemIds().contains("minecraft:oak_wood"), "bark-sided wood blocks are valid wood");
+		assertTrue(wood.itemIds().contains("minecraft:crimson_stem"), "Nether stems are valid wood sources");
+		assertEquals(false, wood.itemIds().contains("minecraft:wooden_pickaxe"), "crafted wooden tools are not raw wood");
+		assertEquals(false, wood.itemIds().contains("minecraft:oak_planks"), "planks do not substitute for a wood source");
+		assertEquals(wood, compiler.compile("Get wood", RegistryAccess.EMPTY, 1_200L)
+				.acceptedSpec().orElseThrow().completion(), "short wood request uses the same open category");
+		GoalPredicate.InventoryContainsAny counted = (GoalPredicate.InventoryContainsAny) compiler
+				.compile("Get three wood", RegistryAccess.EMPTY, 1_200L).acceptedSpec().orElseThrow().completion();
+		assertEquals(3, counted.count(), "the category preserves a requested quantity");
+		assertEquals(wood.itemIds(), counted.itemIds(), "quantity does not narrow the valid wood types");
+		assertEquals(new GoalPredicate.InventoryContains("minecraft:oak_log", 1),
+				compiler.compile("Get an oak log", RegistryAccess.EMPTY, 1_200L).acceptedSpec().orElseThrow().completion(),
+				"an explicit tree species remains an exact item goal");
+		assertEquals(wood.itemIds(), compiler.candidateIdsFor("Get wood from nearby", RegistryAccess.EMPTY),
+				"qualified wood requests expose the full category to translation");
+		assertSucceeds(() -> compiler.translationConstraintFor("Get wood from nearby", RegistryAccess.EMPTY)
+				.validate(wood), "qualified wood translation can keep the open category");
+		return 14;
 	}
 
 	private static int verifyInventoryCapacity() {

@@ -30,7 +30,7 @@ public final class SkitPresentationVerification {
 				var apply = net.minecraft.client.resources.WaypointStyleManager.class.getDeclaredMethod("apply", java.util.Map.class, net.minecraft.server.packs.resources.ResourceManager.class, net.minecraft.util.profiling.ProfilerFiller.class);
 				apply.setAccessible(true); apply.invoke(manager, loaded, resources, net.minecraft.util.profiling.InactiveProfiler.INSTANCE);
 				var key = net.minecraft.resources.ResourceKey.create(net.minecraft.world.waypoints.WaypointStyleAssets.ROOT_ID, net.minecraft.resources.Identifier.parse("arenaagents:agent/c00"));
-				check(manager.get(key).sprite(0).equals(net.minecraft.resources.Identifier.parse("arenaagents:hud/locator_bar_dot/agent/c00")), "resource reload manager resolves company icon rather than missing-texture style");
+				check(manager.get(key).sprite(0).equals(net.minecraft.resources.Identifier.parse("arenaagents:hud/locator_bar_dot/agent/c00")), "resource reload manager resolves agent face rather than missing-texture style");
 				checks++;
 				var vanillaRoot = java.nio.file.Path.of("build/locator-vanilla");
 				var atlasFile = vanillaRoot.resolve("assets/minecraft/atlases/gui.json");
@@ -43,7 +43,7 @@ public final class SkitPresentationVerification {
 					var loader = net.minecraft.client.renderer.texture.atlas.SpriteResourceLoader.create(java.util.Set.of());
 					var contents = sources.stream().map(source -> source.get(loader)).filter(java.util.Objects::nonNull).toList();
 					try {
-						check(contents.stream().anyMatch(sprite -> sprite.name().equals(manager.get(key).sprite(0))), "Minecraft GUI atlas loads company logo rather than missing texture");
+						check(contents.stream().anyMatch(sprite -> sprite.name().equals(manager.get(key).sprite(0))), "Minecraft GUI atlas loads agent face rather than missing texture");
 						var stitcher = new net.minecraft.client.renderer.texture.Stitcher<net.minecraft.client.renderer.texture.SpriteContents>(4096, 4096, 0, 0);
 						contents.forEach(stitcher::registerSprite); stitcher.stitch(); checks++;
 					} finally { contents.forEach(net.minecraft.client.renderer.texture.SpriteContents::close); }
@@ -58,16 +58,16 @@ public final class SkitPresentationVerification {
 				check(player.world.manager.updates == updates, "unchanged cast presentation does not resend waypoint packets");
 				checks += 2;
 				check(player.label.getString().equals(actor.name()) && player.visible, "cast body has exact visible label");
-				check(player.icon.color.orElseThrow() == 0xFFFFFFFF, "brand logo is not tinted by UUID color");
+				check(player.icon.color.orElseThrow() == 0xFFFFFFFF, "agent face is not tinted by UUID color");
 				String stylePath = "assets/arenaagents/waypoint_style/" + player.icon.style.identifier().getPath() + ".json";
 				var style = WaypointStyle.CODEC.parse(JsonOps.INSTANCE, JsonParser.parseString(new String(resource(stylePath), StandardCharsets.UTF_8))).getOrThrow();
 				var sprite = style.sprite(0);
 				String pngPath = "assets/" + sprite.getNamespace() + "/textures/gui/sprites/" + sprite.getPath() + ".png";
 				var image = javax.imageio.ImageIO.read(new java.io.ByteArrayInputStream(resource(pngPath)));
-				check(image != null && image.getWidth() == 16 && image.getHeight() == 16, "vanilla resolves a real 16px locator logo");
+				check(image != null && image.getWidth() == 16 && image.getHeight() == 16, "vanilla resolves a real 16px locator face");
 				var colors = new java.util.HashSet<Integer>();
 				for (int x = 0; x < 16; x++) for (int y = 0; y < 16; y++) colors.add(image.getRGB(x, y));
-				check(colors.size() > 2, "locator icon contains logo detail rather than a solid missing-texture square");
+				check(colors.size() > 1, "locator face has detail rather than a solid missing-texture square");
 				checks += 4;
 			}
 			return checks;

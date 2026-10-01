@@ -1265,7 +1265,7 @@ public final class CodexAgentCommands {
 
 	private static String formatStatus(AgentRecord record) {
 		String currentGoal = record.currentGoal().map(goal -> goal.prompt()).orElse("none");
-		return dev.agaminggod.arenaagents.agent.AgentIdentity.displayName(record.agentId(), record.profile())
+		return dev.agaminggod.arenaagents.agent.AgentIdentity.displayNameTag(record.profile())
 				+ " | " + dev.agaminggod.arenaagents.control.AgentControlPresentation.stateLabel(record.state().name())
 				+ ". Current task: " + currentGoal
 				+ ". Queued tasks: " + record.queuedGoals().size() + ".";

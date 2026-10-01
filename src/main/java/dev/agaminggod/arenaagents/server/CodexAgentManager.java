@@ -1284,10 +1284,13 @@ public final class CodexAgentManager {
 				WaypointStyleAssets.ROOT_ID,
 				Identifier.fromNamespaceAndPath("arenaagents", stylePath)
 		);
-		if (!style.equals(player.waypointIcon().style)) {
+		var icon = player.waypointIcon();
+		var untintedColor = Optional.of(0xFFFFFFFF);
+		if (!style.equals(icon.style) || !untintedColor.equals(icon.color)) {
 			var manager = player.level().getWaypointManager();
 			manager.untrackWaypoint(player);
-			player.waypointIcon().style = style;
+			icon.style = style;
+			icon.color = untintedColor;
 			manager.trackWaypoint(player);
 		}
 	}
@@ -1670,7 +1673,7 @@ public final class CodexAgentManager {
 
 	public String displayName(AgentRecord target) {
 		Objects.requireNonNull(target, "target must not be null");
-		return AgentIdentity.displayName(target.agentId(), target.profile());
+		return AgentIdentity.displayNameTag(target.profile());
 	}
 
 	public AgentRecord resolve(String selector) {

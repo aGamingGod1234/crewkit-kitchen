@@ -110,7 +110,7 @@ public final class AgentControlCatalog {
 	private static List<AgentControlModelOption> buildFallbackOptions() {
 		ArrayList<AgentControlModelOption> values = new ArrayList<>();
 		add(values, CODEX, "gpt-6-astra", "GPT 6 Astra", List.of("low", "medium", "high", "xhigh", "max", "ultra"), true);
-		add(values, CODEX, "gpt-6.1-sol", "GPT 6.1 Sol", List.of("low", "medium", "high", "xhigh", "max", "ultra"), true);
+		add(values, CODEX, "gpt-6.1-sol", "GPT-6.1 Sol", List.of("low", "medium", "high", "xhigh", "max", "ultra"), true);
 		add(values, CODEX, "gpt-6-luna", "GPT 6 Luna", List.of("low", "medium", "high", "xhigh", "max"), true);
 		add(values, "gemini", "gemini-3.1-pro", "Gemini 3.1 Pro", List.of("high", "low"), false);
 		for (String model : List.of("gemini-3.6-flash", "gemini-3.5-flash")) {

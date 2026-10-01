@@ -8,7 +8,7 @@ import java.util.Objects;
 public final class AgentModelNames {
 	private static final Map<ModelKey, Names> NAMES = Map.ofEntries(
 			entry("codex", "gpt-6-astra", "GPT 6 Astra", "Astra"),
-			entry("codex", "gpt-6.1-sol", "GPT 6.1 Sol", "Sol"),
+			entry("codex", "gpt-6.1-sol", "GPT-6.1 Sol", "Sol"),
 			entry("codex", "gpt-6-sol", "GPT 6 Sol", "Sol"),
 			entry("codex", "gpt-6-luna", "GPT 6 Luna", "Luna"),
 			entry("codex", "gpt-5.6-sol", "GPT 5.6 Sol", "Sol"),
@@ -56,7 +56,7 @@ public final class AgentModelNames {
 		if (key.provider().equals("codex")) {
 			return switch (key.slug()) {
 				case "gpt-6-astra" -> "GPT 6-Astra";
-				case "gpt-6.1-sol" -> "GPT 6.1-Sol";
+				case "gpt-6.1-sol" -> "GPT-6.1 Sol";
 				case "gpt-6-sol" -> "GPT 6-Sol";
 				case "gpt-6-luna" -> "GPT 6-Luna";
 				case "gpt-5.6-sol" -> "GPT 5.6-Sol";

@@ -146,8 +146,14 @@ public final class AgentIdentityVerification {
 				"GPT-6 Astra keeps its operator-facing name");
 		assertEquals("Sol", AgentModelNames.shortLabel("codex", "gpt-6.1-sol"),
 				"GPT-6.1 Sol keeps its compact label");
-		assertEquals("GPT 6.1-Sol", AgentModelNames.tagName("codex", "gpt-6.1-sol"),
+		assertEquals("GPT-6.1 Sol", AgentModelNames.tagName("codex", "gpt-6.1-sol"),
 				"GPT-6.1 Sol tag shows the current version");
+		assertEquals("sol", AgentVisualIdentity.resolve("codex", "gpt-6.1-sol", 0).modelFamilyKey(),
+				"GPT-6.1 Sol uses the Sol face and skin");
+		assertEquals("terra", AgentVisualIdentity.resolve("codex", "gpt-6-astra", 0).modelFamilyKey(),
+				"GPT-6 Astra uses its Astra family skin");
+		assertEquals("luna", AgentVisualIdentity.resolve("codex", "gpt-6-luna", 0).modelFamilyKey(),
+				"GPT-6 Luna uses its Luna family skin");
 		assertEquals("GPT 6-Luna", AgentModelNames.tagName("codex", "gpt-6-luna"),
 				"GPT-6 Luna keeps its in-world tag name");
 		assertEquals("Sol WM", AgentModelNames.shortLabel("codex", "gpt-5.6-sol-wm"),
@@ -285,7 +291,7 @@ public final class AgentIdentityVerification {
 				.getAsJsonArray("families").get(0).getAsJsonObject().getAsJsonArray("variants").get(0)
 				.getAsJsonObject().addProperty("texturePath", "minecraft:textures/entity/stolen.png")),
 				"project-owned codex entity texture", "non-project manifest texture rejected");
-		return 1154;
+		return 1157;
 	}
 
 	private static byte[] readTexture(String texturePath) {

@@ -175,6 +175,16 @@ public final class GoalCompiler {
 				return GoalCompilation.rejected("The requested item count is outside the supported range.");
 			}
 			if (count <= 0) return GoalCompilation.rejected("The requested item count must be positive.");
+			if (isGenericWoodTarget(item.group(3))) {
+				List<String> woodItems = woodItemIds(registries);
+				if (woodItems.isEmpty()) return GoalCompilation.rejected("No wood items are registered on this server.");
+				if (woodItems.size() > GoalPredicate.MAX_INVENTORY_ITEM_IDS) {
+					return GoalCompilation.needsTranslation("The wood category is too broad; name a wood type.");
+				}
+				GoalPredicate predicate = new GoalPredicate.InventoryContainsAny(woodItems, count);
+				if (GoalInventoryCapacity.exceeds(predicate, registries)) return unrepresentableItemCount();
+				return accepted(original, predicate, createdAtTick, "Goal set: obtain wood x" + count + ".");
+			}
 			List<String> matches = matchItems(item.group(3), registries);
 			if (matches.size() == 1) {
 				String itemId = matches.getFirst();
@@ -810,6 +820,7 @@ public final class GoalCompiler {
 	private static List<String> relatedItems(String target, RegistryAccess registries) {
 		String wanted = catalogTarget(target);
 		if (wanted.isEmpty()) return List.of();
+		if (isGenericWoodTarget(wanted)) return woodItemIds(registries);
 		List<String> blockItems = namedBlockItems(wanted, registries);
 		if (!blockItems.isEmpty()) return blockItems;
 		Set<String> forms = singularForms(wanted);
@@ -828,6 +839,25 @@ public final class GoalCompiler {
 							|| tools && path.startsWith(material + " ") && toolKinds.contains(path.substring(material.length() + 1));
 				})
 			.map(Identifier::toString).distinct().sorted().toList();
+	}
+
+	private static boolean isGenericWoodTarget(String target) {
+		return switch (normalizedTarget(target).toLowerCase(Locale.ROOT)) {
+			case "wood", "block of wood", "blocks of wood", "wood block", "wood blocks" -> true;
+			default -> false;
+		};
+	}
+
+	private static List<String> woodItemIds(RegistryAccess registries) {
+		Registry<Item> items = registries.lookup(Registries.ITEM).orElse(BuiltInRegistries.ITEM);
+		return items.keySet().stream()
+				.filter(id -> items.getValue(id) instanceof BlockItem)
+				.filter(id -> {
+					String name = id.getPath();
+					return name.endsWith("_log") || name.endsWith("_wood")
+							|| name.endsWith("_stem") || name.endsWith("_hyphae");
+				})
+				.map(Identifier::toString).sorted().toList();
 	}
 
 	/** A spoken "block of dirt" names the dirt block item; "block of iron" names iron_block. */

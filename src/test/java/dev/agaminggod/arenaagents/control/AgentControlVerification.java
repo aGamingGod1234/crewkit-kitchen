@@ -65,6 +65,11 @@ public final class AgentControlVerification {
 		assertEquals(snapshot, decoded, "snapshot JSON round trip");
 		assertEquals(AGENT_UUID, agent.agentId(), "snapshot carries stable full agent ID");
 		assertEquals("Builder", agent.displayName(), "snapshot carries optional user name");
+		AgentRecord sol = AgentRecord.create(new AgentId(UUID.randomUUID()),
+				new AgentProfile("codex", "gpt-6.1-sol", "medium", Optional.empty(), 0), NOW_EPOCH_MS);
+		AgentControlAgent solView = AgentControlSnapshot.fromRecords(true, NOW_EPOCH_MS, List.of(sol)).agents().getFirst();
+		assertEquals("GPT-6.1 Sol", solView.displayName(), "world label uses the readable model name");
+		assertEquals("GPT_6_1_Sol", solView.playerName(), "Minecraft keeps its safe technical username");
 		assertEquals(Optional.of("Builder"), AgentWorldNamePolicy.tag(agent),
 				"world tags use the exact public name without a provider glyph or model suffix");
 		assertEquals(Optional.empty(), AgentWorldNamePolicy.tag(agent(AGENT_UUID, "   ")),
@@ -103,7 +108,7 @@ public final class AgentControlVerification {
 				() -> new AgentControlSnapshot(true, NOW_EPOCH_MS, java.util.Collections.nCopies(17, agent)),
 				"snapshot agent bound"
 		);
-		return 18;
+		return 20;
 	}
 
 	private static int verifyProviderPresets() {
@@ -238,7 +243,7 @@ public final class AgentControlVerification {
 	private static int verifyRuntimeCatalogBecomesAuthoritative() {
 		List<AgentControlModelOption> live = List.of(
 				new AgentControlModelOption(
-						"codex", "gpt-6.1-sol", "GPT 6.1 Sol", List.of("medium", "ultra"), List.of("priority", "fast")
+						"codex", "gpt-6.1-sol", "GPT-6.1 Sol", List.of("medium", "ultra"), List.of("priority", "fast")
 				),
 				new AgentControlModelOption(
 						"codex", "gpt-6-sol", "GPT 6 Sol", List.of("high"), List.of("fast")
@@ -256,7 +261,7 @@ public final class AgentControlVerification {
 					"runtime catalog controls provider order");
 			assertEquals(List.of("gpt-6.1-sol"), AgentControlCatalog.models("codex"),
 					"runtime catalog offers only the selected Codex roster");
-			assertEquals("GPT 6.1 Sol", AgentControlCatalog.displayName("codex", "gpt-6.1-sol"),
+			assertEquals("GPT-6.1 Sol", AgentControlCatalog.displayName("codex", "gpt-6.1-sol"),
 					"runtime catalog preserves provider display names");
 			assertEquals(List.of("medium", "ultra"), AgentControlCatalog.reasoningEfforts("codex", "gpt-6.1-sol"),
 					"runtime catalog controls reasoning choices");
