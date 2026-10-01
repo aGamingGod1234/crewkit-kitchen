@@ -39,6 +39,7 @@ public final class GoalVerificationRuntime {
 	private final OperatorConfirmationLedger operatorConfirmations;
 	private final Consumer<GoalSpec> queuedGoalValidator;
 	private final Map<AgentId, VerificationFault> faults = new LinkedHashMap<>();
+	private final Map<AgentId, UUID> confirmationRequests = new HashMap<>();
 
 	public GoalVerificationRuntime(
 			AgentRegistry registry,
@@ -149,6 +150,7 @@ public final class GoalVerificationRuntime {
 		}
 		faults.entrySet().removeIf(entry -> !Objects.equals(
 				currentGoalRevisions.get(entry.getKey()), entry.getValue().goalRevision()));
+		confirmationRequests.entrySet().removeIf(entry -> !currentGoals.contains(entry.getValue()));
 		return List.copyOf(transitions);
 	}
 
@@ -201,7 +203,12 @@ public final class GoalVerificationRuntime {
 		if (!goal.spec().fingerprint().equals(Objects.requireNonNull(goalFingerprint, "goalFingerprint must not be null"))) {
 			throw new AgentDomainException("STALE_GOAL_FINGERPRINT", "Completion request does not match the immutable current goal");
 		}
-		if (record.goalRevision() == requestedRevision) return evaluate(agentId);
+		if (record.goalRevision() == requestedRevision) {
+			var result = evaluate(agentId);
+			if (result.awaitingOperatorConfirmation()) confirmationRequests.put(agentId, goal.goalId());
+			else confirmationRequests.remove(agentId);
+			return result;
+		}
 		if (record.goalRevision() > 0L && record.goalRevision() - 1L == requestedRevision && goal.status() == GoalStatus.SATISFIED) {
 			var evidence = goal.evidence().orElseThrow();
 			return new GoalCompletionVerifier.VerificationResult(
@@ -247,6 +254,17 @@ public final class GoalVerificationRuntime {
 			throw new AgentDomainException("STALE_GOAL_CONFIRMATION", "Operator confirmation targets a stale goal");
 		}
 		operatorConfirmations.confirm(goalId);
+	}
+
+	/** Short replies confirm only an already requested check for this exact goal, with fresh facts. */
+	public boolean confirmFromSpeech(AgentId agentId) {
+		AgentRecord record = registry.require(agentId);
+		UUID requestedGoal = confirmationRequests.get(agentId);
+		if (requestedGoal == null || !record.currentGoal().map(goal -> goal.goalId().equals(requestedGoal)).orElse(false)) return false;
+		if (!evaluate(agentId).awaitingOperatorConfirmation()) return false;
+		confirm(agentId, requestedGoal);
+		confirmationRequests.remove(agentId);
+		return true;
 	}
 
 	public AgentKillLedger killLedger() {

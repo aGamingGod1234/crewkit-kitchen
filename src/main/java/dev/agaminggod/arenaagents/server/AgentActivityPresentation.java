@@ -1,6 +1,8 @@
 package dev.agaminggod.arenaagents.server;
 
 import dev.agaminggod.arenaagents.protocol.ActionType;
+import dev.agaminggod.arenaagents.server.runtime.ServerActionProgress;
+import dev.agaminggod.arenaagents.server.runtime.ServerActionObservation;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionResult;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionState;
 import java.util.Locale;
@@ -14,7 +16,7 @@ public final class AgentActivityPresentation {
 
 	public static String action(ActionType type) {
 		return switch (Objects.requireNonNull(type, "type must not be null")) {
-			case CONTROL, CONTROL_SEQUENCE -> "Controlling player inputs";
+			case CONTROL, CONTROL_SEQUENCE -> "Carrying out the next step";
 			case MOVE_TO, NAVIGATE_TO -> "Moving to the next position";
 			case LOOK_AT -> "Looking around";
 			case ATTACK, FIGHT_TARGET -> "Engaging a target";
@@ -71,6 +73,39 @@ public final class AgentActivityPresentation {
 		return milestone + (type == ActionType.MOVE_TO || type == ActionType.NAVIGATE_TO ? "% there." : "% complete.");
 	}
 
+	public static String goalNotComplete(java.util.List<dev.agaminggod.arenaagents.agent.goal.GoalEvidence.Fact> facts) {
+		var unmet = facts.stream().filter(fact -> !fact.satisfied()).toList();
+		if (!unmet.isEmpty() && unmet.stream().allMatch(fact -> fact.type().equals("operator_confirmed"))) {
+			return "Finished the work. Waiting for your confirmation.";
+		}
+		var fact = unmet.isEmpty() ? null : unmet.getFirst();
+		if (fact != null && fact.type().equals("inventory_contains")) {
+			return "Still need " + readableIdentifier(fact.expectedValue()) + ". I'll keep working.";
+		}
+		return "The goal is not complete yet. I'll keep working.";
+	}
+
+	/** Chat describes the action; its detailed evidence remains in the protocol observation. */
+	public static String progress(ServerActionProgress progress, int milestone) {
+		Objects.requireNonNull(progress, "progress must not be null");
+		String message = progress(progress.actionType(), milestone);
+		ServerActionObservation observation = progress.actionObservation();
+		if (observation == null) return message;
+		if (progress.actionType() == ActionType.BREAK_BLOCK) {
+			String block = observation.target() == null ? null : observation.target().expectedId();
+			if (block == null && observation.lookedAt() != null && observation.lookedAt().type().equals("block")) {
+				block = observation.lookedAt().id();
+			}
+			if (block != null) return "Mining " + readableIdentifier(block) + ": " + message;
+		}
+		if ((progress.actionType() == ActionType.MOVE_TO || progress.actionType() == ActionType.NAVIGATE_TO)
+				&& observation.target() != null && observation.target().distanceRemaining() != null) {
+			return message + " " + String.format(Locale.ROOT, "%.1f", observation.target().distanceRemaining())
+					+ " blocks to go.";
+		}
+		return message;
+	}
+
 	public static String verboseResultStage(ServerActionResult result) {
 		Objects.requireNonNull(result, "result must not be null");
 		if (result.state() == ServerActionState.SUCCEEDED || result.state() == ServerActionState.CANCELLED) {
@@ -90,13 +125,43 @@ public final class AgentActivityPresentation {
 			return timeoutSubject(result.actionType()) + " was cancelled.";
 		}
 		if ("retry".equals(verboseResultStage(result))) return recoveryMessage(result.reasonCode());
-		String detail = compactResultMessage(result.message());
 		if (result.state() == ServerActionState.SUCCEEDED) {
-			return detail.isBlank() ? sentence(action(result.actionType()) + " completed") : sentence(detail);
+			return successfulResult(result.actionType());
 		}
+		String detail = compactResultMessage(result.message());
 		return detail.isBlank()
 				? sentence(timeoutSubject(result.actionType()) + " failed")
 				: timeoutSubject(result.actionType()) + " failed: " + sentence(detail);
+	}
+
+	private static String successfulResult(ActionType type) {
+		return switch (type) {
+			case CONTROL, CONTROL_SEQUENCE -> "Step complete.";
+			case MOVE_TO, NAVIGATE_TO -> "Destination reached.";
+			case LOOK_AT -> "Finished looking around.";
+			case BREAK_BLOCK -> "Block broken.";
+			case PLACE_BLOCK -> "Block placed.";
+			case BUILD_SEQUENCE -> "Building steps complete.";
+			case PICK_UP_ITEM -> "Picked up the item.";
+			case CRAFT_INVENTORY, CRAFT_TABLE -> "Crafted the item.";
+			case SELECT_ITEM, SELECT_TOOL -> "Selected the item.";
+			case TRANSFER_CONTAINER, MENU_TRANSFER -> "Moved the items.";
+			case CHAT -> "Message sent.";
+			case DROP_ITEM -> "Dropped the item.";
+			case EQUIP_ITEM -> "Equipped the item.";
+			case MENU_CLOSE -> "Closed the menu.";
+			case ANVIL_RENAME -> "Renamed the item.";
+			case WRITE_SIGN -> "Updated the sign.";
+			case EDIT_BOOK -> "Updated the book.";
+			case RESPAWN -> "Respawned.";
+			case COMPLETE_GOAL -> "Task complete.";
+			default -> "Step complete.";
+		};
+	}
+
+	private static String readableIdentifier(String id) {
+		int separator = id.indexOf(':');
+		return id.substring(separator + 1).replace('_', ' ').replace('/', ' ');
 	}
 
 	public static Optional<String> result(ServerActionResult result) {

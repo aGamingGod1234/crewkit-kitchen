@@ -429,6 +429,12 @@ public final class GoalCompletionVerifier {
 			return new GoalEvidence(verifiedAtTick, reasonCode, facts);
 		}
 
+		public boolean awaitingOperatorConfirmation() {
+			if (verified || !reasonCode.equals("PREDICATE_FAILED")) return false;
+			List<GoalEvidence.Fact> unmet = facts.stream().filter(fact -> !fact.satisfied()).toList();
+			return !unmet.isEmpty() && unmet.stream().allMatch(fact -> fact.type().equals("operator_confirmed"));
+		}
+
 		public JsonObject toJson() {
 			JsonObject result = new JsonObject();
 			result.addProperty("verified", verified);

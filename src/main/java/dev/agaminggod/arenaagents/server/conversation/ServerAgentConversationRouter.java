@@ -314,9 +314,19 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 			throw new AgentDomainException("GOAL_SOURCE_DIMENSION_CHANGED",
 					"The requester's live dimension changed before the goal could be compiled");
 		}
-		// Replace/queue is an explicit /agent goal choice, not inferred from live speech.
+		ServerPlayer requester = manager.server().getPlayerList().getPlayer(requestingPlayerId(event));
+		boolean operator = requester != null && GoalControl.mayControl(requester.createCommandSourceStack());
+		if (operator && event.audience() == ConversationAudience.DIRECT
+				&& ConversationWakePolicy.isCompletionConfirmation(event.text())
+				&& dev.agaminggod.arenaagents.server.CodexAgentServerRuntime.confirmCurrentGoalFromSpeech(manager.server(), target.agentId())) {
+			notifyRequester(requester.getUUID(), "Confirmed. Minecraft will finish this goal after checking its requirements.");
+			return GoalRoute.CONSUMED;
+		}
+		boolean replaceRequested = ConversationWakePolicy.mayReplaceGoalFromSpeech(
+				target.state(), event.kind(), event.audience(), operator);
+		if (GoalCompiler.isLiveSteeringRequest(event.text())) return GoalRoute.EVENT_ONLY;
 		if (!GoalCompiler.consumePlayerSpeechAsGoal(
-				!ConversationWakePolicy.mayInstallNewGoalFromSpeech(target.state()), event.text(), false)) {
+				!ConversationWakePolicy.mayInstallNewGoalFromSpeech(target.state()), event.text(), replaceRequested)) {
 			return GoalRoute.EVENT_ONLY;
 		}
 
@@ -327,9 +337,9 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 		);
 
 		return routeCompiledSpeechGoal(
-				target.state(), event.kind(), GoalCompiler.withAdvisoryPlan(compilation),
+				target.state(), event.kind(), GoalCompiler.withAdvisoryPlan(compilation), replaceRequested,
 				() -> {
-					DraftIntent intent = DraftIntent.TRANSLATE_START;
+					DraftIntent intent = replaceRequested ? DraftIntent.TRANSLATE_REPLACE : DraftIntent.TRANSLATE_START;
 					PendingGoalDraft draft = draft(
 							target, event, sourceLevel, Optional.empty(), intent);
 					manager.stageGoalDraft(draft);
@@ -347,10 +357,18 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 			Runnable stageTranslation,
 			Consumer<String> reportRejection
 	) {
+		return routeCompiledSpeechGoal(state, kind, compilation, false, stageTranslation, reportRejection);
+	}
+
+	static GoalRoute routeCompiledSpeechGoal(
+			dev.agaminggod.arenaagents.agent.AgentLifecycleState state, ConversationKind kind,
+			GoalCompilation compilation, boolean replaceRequested,
+			Runnable stageTranslation, Consumer<String> reportRejection
+	) {
 		Objects.requireNonNull(compilation, "compilation must not be null");
 		Objects.requireNonNull(stageTranslation, "stageTranslation must not be null");
 		Objects.requireNonNull(reportRejection, "reportRejection must not be null");
-		if (!ConversationWakePolicy.shouldStartGoal(state, kind)) return GoalRoute.EVENT_ONLY;
+		if (!replaceRequested && !ConversationWakePolicy.shouldStartGoal(state, kind)) return GoalRoute.EVENT_ONLY;
 		return switch (compilation.kind()) {
 			case ACCEPTED -> new GoalRoute(true, compilation.acceptedSpec());
 			case NEEDS_TRANSLATION -> {

@@ -37,6 +37,8 @@ public final class GoalCompilerVerification {
 		bindItemStackSize(Items.DIAMOND_SWORD, 1);
 		bindItemStackSize(Items.IRON_AXE, 1);
 		bindItemStackSize(Items.IRON_PICKAXE, 1);
+		bindItemStackSize(Items.STONE_PICKAXE, 1);
+		bindItemStackSize(Items.STONE_AXE, 1);
 		BuiltInRegistries.ITEM.keySet().stream()
 				.filter(id -> id.getPath().endsWith("_log") || id.getPath().endsWith("_wood")
 						|| id.getPath().endsWith("_stem") || id.getPath().endsWith("_hyphae"))
@@ -45,6 +47,7 @@ public final class GoalCompilerVerification {
 				.forEach(item -> bindItemStackSize(item, 64));
 		int assertions = 0;
 		assertions += verifyExactItemAndAmbiguity();
+		assertions += verifySpokenToolSets();
 		assertions += verifyGenericWoodGoal();
 		assertions += verifyGenericBlockGoal();
 		assertions += verifyInventoryCapacity();
@@ -135,6 +138,24 @@ public final class GoalCompilerVerification {
 		assertEquals(GoalCompilation.Kind.NEEDS_TRANSLATION, make.kind(),
 				"make wording cannot be reduced to already-held inventory");
 		return 22;
+	}
+
+	private static int verifySpokenToolSets() {
+		GoalCompiler compiler = new GoalCompiler();
+		GoalPredicate tools = new GoalPredicate.AllOf(List.of(
+				new GoalPredicate.InventoryContains("minecraft:stone_pickaxe", 1),
+				new GoalPredicate.InventoryContains("minecraft:stone_axe", 1)));
+		GoalCompilation spoken = compiler.compile("go and get stone tools, a pickaxe and an axe", RegistryAccess.EMPTY, 1_200L);
+		assertEquals(GoalCompilation.Kind.ACCEPTED, spoken.kind(), "the reported stone-tools request has factual completion");
+		assertEquals(tools, spoken.acceptedSpec().orElseThrow().completion(), "both explicitly named stone tools are required");
+		assertEquals(false, compiler.translationRequiresOperatorConfirmation("go and get stone tools, a pickaxe and an axe", RegistryAccess.EMPTY),
+				"a named tool set is objectively verifiable");
+		assertEquals(tools, compiler.normalizeTranslatedPredicate("Get stone tools, a pickaxe and an axe",
+				new GoalPredicate.AllOf(List.of(tools, new GoalPredicate.OperatorConfirmed()))),
+				"Luna cannot add a manual completion gate to a factual tool set");
+		assertEquals(true, GoalCompiler.looksLikeGoalRequest("nice, can you get some iron tools now?"),
+				"the reported next-task request is recognized through its conversational prefix");
+		return 5;
 	}
 
 	private static int verifyGenericBlockGoal() {
@@ -623,7 +644,15 @@ public final class GoalCompilerVerification {
 		assertEquals(GoalDraftResolution.Operation.QUEUE,
 				GoalDraftResolution.authorize(queued, queued.requestingPlayerId(), false, GoalDraftChoice.CONFIRM),
 				"a translated Manager queue request preserves its requested operation");
-		return 6;
+		PendingGoalDraft replacement = new PendingGoalDraft(
+				UUID.randomUUID(), idle.agentId(), draft.requestingPlayerId(), request,
+				List.of("minecraft:ender_dragon"), validated.proposedPredicate(), DraftIntent.TRANSLATE_REPLACE,
+				1_200L, 1L, Optional.of(UUID.randomUUID())
+		);
+		assertEquals(GoalDraftResolution.Operation.REPLACE,
+				GoalDraftResolution.authorize(replacement, replacement.requestingPlayerId(), false, GoalDraftChoice.CONFIRM),
+				"a validated translated replacement preserves the player's requested operation");
+		return 7;
 	}
 
 	private static int verifyExplicitAlternativeCandidates() {

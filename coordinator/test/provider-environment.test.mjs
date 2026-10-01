@@ -65,4 +65,15 @@ test('provider environment rejects unknown providers and non-object sources', ()
 	assert.throws(() => createProviderChildEnvironment('unknown', {}), /provider must be one of/);
 	assert.throws(() => createProviderChildEnvironment('codex', null), /must be an object/);
 	assert.throws(() => createProviderChildEnvironment('codex', {}, null, { forwardProxyEnvironment: 'yes' }), /must be a boolean/);
+	assert.throws(() => createProviderChildEnvironment('codex', {}, null, { speechApiKeyEnvironmentVariable: '' }), /environment variable name/);
+});
+
+test('an explicitly configured speech key does not switch the Codex gameplay process to API authentication', () => {
+	const parent = { OPENAI_API_KEY: 'speech-only-key', CODEX_HOME: 'saved-codex-login', PATH: 'node-path' };
+	const environment = createProviderChildEnvironment('codex', parent, null, { speechApiKeyEnvironmentVariable: 'openai_api_key' });
+	assert.equal(environment.OPENAI_API_KEY, undefined);
+	assert.equal(environment.CODEX_HOME, parent.CODEX_HOME);
+	assert.equal(environment.PATH, parent.PATH);
+	assert.equal(parent.OPENAI_API_KEY, 'speech-only-key', 'the voice worker still receives the original environment');
+	assert.equal(createProviderChildEnvironment('codex', parent).OPENAI_API_KEY, 'speech-only-key', 'API-auth gameplay remains available when speech is not explicitly configured');
 });

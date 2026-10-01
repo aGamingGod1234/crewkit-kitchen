@@ -1584,9 +1584,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			return new VerboseEvent(goalRevision, "result",
 					fact == null ? "Goal verified." : "Goal verified: " + fact.expectedValue() + ".");
 		}
-		return new VerboseEvent(goalRevision, "retry", fact == null
-				? "Goal not complete. Continuing."
-				: "Goal not complete: expected " + fact.expectedValue() + ", observed " + fact.observedValue() + ". Continuing.");
+		return new VerboseEvent(goalRevision, verification.awaitingOperatorConfirmation() ? "result" : "retry",
+				AgentActivityPresentation.goalNotComplete(verification.facts()));
 	}
 
 	static JsonObject completionResultPayload(long goalRevision, String traceId, String goalFingerprint, GoalCompletionVerifier.VerificationResult verification) {
@@ -2215,6 +2214,14 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 							}
 						}
 				);
+				if (transition.cancelAction()) actionExecutor.cancel(event.agentId(), "Task changed by direct player request");
+				registryPublicationRevision.incrementAndGet();
+				actionExecutor.actionSuccessLedger().retainRevision(event.agentId(), transition.after().goalRevision());
+				programActions.beginGoal(event.agentId(), transition.after().goalRevision());
+				terminalResults.beginGoal(event.agentId(), transition.after().goalRevision(), logicalGoalId(transition.after()));
+				actionJournal.retainGoal(event.agentId(), logicalGoalId(transition.after()));
+				observationPublication.markAttention(event.agentId());
+				queueUrgentObservation(event.agentId());
 				publishConversationWakeScenarioState(transition);
 			}
 		} catch (BridgeProtocolException exception) {
@@ -2294,7 +2301,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		payload.addProperty("transactionId", wake.transactionId().toString());
 		payload.add("event", conversationEventPayload(wake.event()));
 		JsonObject control = new JsonObject();
-		control.addProperty("operation", "start");
+		// A direct new request after the first task replaces work; it never promotes the queued head.
+		control.addProperty("operation", wake.event().goalRevision() == 0L ? "start" : "replace");
 		control.addProperty("goalRevision", wake.goalRevision());
 		control.addProperty("updatedAtEpochMs", wake.updatedAtEpochMs());
 		control.addProperty("goal", plannerGoal(wake.goal()));
@@ -2481,9 +2489,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		if (progress.actionObservation() == null || progress.actionObservation().progress() == null
 				|| progress.actionObservation().progress().verified()) {
 			verboseState.progressMilestone(progress).ifPresent(milestone -> {
-				String message = progress.actionObservation() == null
-						? AgentActivityPresentation.progress(progress.actionType(), milestone)
-						: actionObservationProgressMessage(progress.actionObservation(), milestone);
+				String message = AgentActivityPresentation.progress(progress, milestone);
 				reportVerbose(progress.agentId(), "progress", message);
 			});
 		}
@@ -2556,40 +2562,6 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		value.addProperty("y", position.y());
 		value.addProperty("z", position.z());
 		parent.add(name, value);
-	}
-
-	private static String actionObservationProgressMessage(ServerActionObservation observation, int milestone) {
-		StringBuilder message = new StringBuilder("Verified ").append(milestone).append("% progress");
-		if (observation.progress() != null) message.append(" (basis=").append(observation.progress().basis()).append(')');
-		if (observation.lookedAt() != null && observation.lookedAt().id() != null) {
-			message.append("; looking at ").append(observation.lookedAt().id());
-		}
-		if (observation.reach() != null) {
-			message.append("; reach=").append(formatDecimal(observation.reach().distance()))
-					.append('/').append(formatDecimal(observation.reach().max()));
-		}
-		if (observation.target() != null) {
-			ServerActionObservation.Target target = observation.target();
-			if (target.kind().equals("block") && target.position() != null) {
-				message.append("; target=").append(formatPosition(target.position()));
-			}
-			if (target.distanceRemaining() != null) {
-				message.append("; remaining=").append(formatDecimal(target.distanceRemaining()));
-			}
-			if (target.tolerance() != null) message.append("; tolerance=").append(formatDecimal(target.tolerance()));
-		}
-		if (observation.collision() != null && (observation.collision().horizontal() || observation.collision().inWall())) {
-			message.append("; collision=true");
-		}
-		return message.toString();
-	}
-
-	private static String formatPosition(ServerActionObservation.Position position) {
-		return '(' + formatDecimal(position.x()) + ',' + formatDecimal(position.y()) + ',' + formatDecimal(position.z()) + ')';
-	}
-
-	private static String formatDecimal(double value) {
-		return String.format(java.util.Locale.ROOT, "%.2f", value);
 	}
 
 	private void reportVerbose(AgentId agentId, String stage, String message) {

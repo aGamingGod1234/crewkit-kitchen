@@ -3,6 +3,7 @@ package dev.agaminggod.arenaagents.server.conversation;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
+import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
 import dev.agaminggod.arenaagents.server.goal.GoalCompilation;
 import dev.agaminggod.arenaagents.server.goal.GoalCompiler;
 import java.util.List;
@@ -105,6 +106,20 @@ public final class AgentConversationRouterVerification {
 	}
 
 	private static int verifySpeechGoalCompilationRouting() {
+		assertEquals(true, ConversationWakePolicy.mayReplaceGoalFromSpeech(AgentLifecycleState.PLANNING,
+				ConversationKind.PLAYER_MESSAGE, ConversationAudience.DIRECT, true), "direct operator task changes replace an active goal");
+		assertEquals(false, ConversationWakePolicy.mayReplaceGoalFromSpeech(AgentLifecycleState.PLANNING,
+				ConversationKind.PROXIMITY_SPEECH, ConversationAudience.PROXIMITY, true), "overheard speech does not replace active work");
+		assertEquals(false, ConversationWakePolicy.mayReplaceGoalFromSpeech(AgentLifecycleState.PLANNING,
+				ConversationKind.PLAYER_MESSAGE, ConversationAudience.DIRECT, false), "another player's chat cannot replace operator-controlled work");
+		assertEquals(true, ConversationWakePolicy.isCompletionConfirmation("yep!"), "the reported short confirmation is recognized");
+		assertEquals(false, ConversationWakePolicy.isCompletionConfirmation("yes, get iron tools"), "a new task is not treated as completion evidence");
+		var replacement = ServerAgentConversationRouter.routeCompiledSpeechGoal(AgentLifecycleState.PLANNING,
+				ConversationKind.PLAYER_MESSAGE, new GoalCompiler().compile("Get iron pickaxe now", RegistryAccess.EMPTY, 1_200L), true,
+				() -> { throw new AssertionError("exact replacement must not translate"); }, message -> { throw new AssertionError(message); });
+		assertEquals(true, replacement.publish(), "a task switch publishes a durable conversation wake while active");
+		assertEquals(new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 1), replacement.wakeSpec().orElseThrow().completion(),
+				"a replacement freezes the newly requested factual result");
 		GoalCompilation dragon = new GoalCompiler().compile("Beat the game", RegistryAccess.EMPTY, 1_200L);
 		assertEquals(GoalCompilation.Kind.NEEDS_TRANSLATION,
 				GoalCompiler.withAdvisoryPlan(dragon).kind(),
@@ -146,7 +161,7 @@ public final class AgentConversationRouterVerification {
 		);
 		assertEquals(false, translation.publish(), "translation speech is consumed while its draft is staged");
 		assertEquals(1, translationDrafts.get(), "only NEEDS_TRANSLATION stages one coordinator draft");
-		return 13;
+		return 20;
 	}
 
 	private static int verifyDirectDeliveryAndOperatorMirror() {

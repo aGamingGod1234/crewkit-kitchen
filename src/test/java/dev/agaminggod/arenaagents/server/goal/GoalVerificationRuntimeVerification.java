@@ -60,6 +60,7 @@ public final class GoalVerificationRuntimeVerification {
 		assertions += verifyQueuedPromotionAfterEvidence();
 		assertions += verifyQueuedKillActivationBoundary();
 		assertions += verifyRequestedCompletionLifecycle();
+		assertions += verifySpokenCompletionConfirmation();
 		assertions += verifyActionCompletionPrecedesFactualCompletion();
 		return assertions;
 	}
@@ -991,6 +992,23 @@ public final class GoalVerificationRuntimeVerification {
 			assertEquals("STALE_GOAL_FINGERPRINT", expected.code(), "stale finish fingerprint is rejected explicitly");
 		}
 		return 9;
+	}
+
+	private static int verifySpokenCompletionConfirmation() {
+		Fixture fixture = fixture(new GoalPredicate.AllOf(List.of(new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 1),
+				new GoalPredicate.OperatorConfirmed())), 850L);
+		AgentRecord active = fixture.registry.require(fixture.agentId);
+		assertEquals(false, fixture.runtime.confirmFromSpeech(fixture.agentId), "casual yes cannot complete a goal before finish requests confirmation");
+		fixture.facts.items.put("minecraft:iron_pickaxe", 1);
+		var result = fixture.runtime.evaluateRequest(fixture.agentId, active.goalRevision(), active.currentGoal().orElseThrow().spec().fingerprint());
+		assertEquals(true, result.awaitingOperatorConfirmation(), "only the operator condition remains");
+		fixture.facts.items.clear();
+		assertEquals(false, fixture.runtime.confirmFromSpeech(fixture.agentId), "confirmation rechecks inventory instead of trusting the model's earlier claim");
+		fixture.facts.items.put("minecraft:iron_pickaxe", 1);
+		assertEquals(true, fixture.runtime.confirmFromSpeech(fixture.agentId), "an explicit waiting goal accepts short confirmation");
+		assertEquals(1, fixture.runtime.tick().size(), "confirmation finishes exactly once through server verification");
+		assertEquals(false, fixture.runtime.confirmFromSpeech(fixture.agentId), "a repeated yes does not confirm another task");
+		return 6;
 	}
 
 	private static Fixture fixture(GoalPredicate predicate, long createdAtTick) {

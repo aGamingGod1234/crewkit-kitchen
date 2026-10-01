@@ -25,4 +25,18 @@ public final class ConversationWakePolicy {
 			case AGENT_MESSAGE, PLAYER_STEER -> false;
 		};
 	}
+
+	/** A direct instruction from an operator can change the task without a separate goal-panel visit. */
+	public static boolean mayReplaceGoalFromSpeech(AgentLifecycleState state, ConversationKind kind,
+			ConversationAudience audience, boolean operator) {
+		return operator && kind == ConversationKind.PLAYER_MESSAGE && audience == ConversationAudience.DIRECT
+				&& (state.isActive() || state == AgentLifecycleState.PAUSED);
+	}
+
+	public static boolean isCompletionConfirmation(String text) {
+		return switch (text.strip().toLowerCase(java.util.Locale.ROOT).replaceFirst("[.!]+$", "").strip()) {
+			case "yes", "yep", "yeah", "confirmed", "i confirm", "yes, confirmed", "that's right", "thats right" -> true;
+			default -> false;
+		};
+	}
 }

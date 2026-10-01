@@ -4189,6 +4189,42 @@ test('acknowledges and idempotently replays one composite conversation wake', as
 	} finally { await run.coordinator.stop(); }
 });
 
+test('a direct new task wakes the native agent from an active goal and retires the prior revision', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestNativeTurn = async request => {
+		planner.requests.push(request);
+		return { status: 'completed', toolCalls: 1 };
+	};
+	const run = await start({ registry, planner, config: {
+		bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' },
+	} });
+	const errors = [];
+	run.coordinator.on('runtimeError', error => errors.push(error));
+	const observe = (goalRevision, eventSequence) => run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+		goalRevision, eventSequence,
+		observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+	} });
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Get stone tools.' } });
+		observe(1, 1);
+		await eventually(() => planner.requests.length === 1);
+		run.bridge.emit('conversation_wake', { agentId: 'agent-a', payload: {
+			transactionId: 'replace-stone-with-iron',
+			event: { sequence: 1, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
+				text: 'Nice, can you get some iron tools now?', goalRevision: 1, observedAtEpochMs: 1_787_184_000_002 },
+			control: { operation: 'replace', goalRevision: 2, goal: 'Get iron tools.', updatedAtEpochMs: Date.now(),
+				goalSpec: immutableGoalSpec('Get iron tools.', { type: 'inventory_contains', itemId: 'minecraft:iron_pickaxe', count: 1 }) },
+		} });
+		await eventually(() => run.bridge.sent.some(message => message.type === 'conversation_wake_ack' && message.payload.goalRevision === 2));
+		observe(2, 2);
+		await eventually(() => planner.requests.some(request => request.goalRevision === 2));
+		assert.equal(registry.get('agent-a').currentGoal, 'Get iron tools.');
+		assert.match(planner.requests.find(request => request.goalRevision === 2).input, /Nice, can you get some iron tools now\?/);
+		assert.deepEqual(errors, []);
+	} finally { await run.coordinator.stop(); }
+});
+
 test('replayed conversation wake restores memory and the same revision after coordinator restart', async () => {
 	const wakeGoal = 'Respond to the player.';
 	const run = await start({

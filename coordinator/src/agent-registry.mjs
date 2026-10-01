@@ -118,8 +118,8 @@ export class AgentRegistry {
 		const id = requireIdentifier(agentId, 'agentId');
 		const current = this.#agents.get(id);
 		if (current === undefined) throw new AgentRegistryError('UNKNOWN_AGENT', `Unknown agent '${id}'`);
-		if (!isPlainObject(value) || value.operation !== 'start') {
-			throw new AgentRegistryError('INVALID_GOAL_OPERATION', 'Conversation wake requires a start control');
+		if (!isPlainObject(value) || !['start', 'replace'].includes(value.operation)) {
+			throw new AgentRegistryError('INVALID_GOAL_OPERATION', 'Conversation wake requires a start or replace control');
 		}
 		const revision = nonnegativeInteger(value.goalRevision, 'goalRevision');
 		if (revision > current.goalRevision) {

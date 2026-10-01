@@ -36,6 +36,12 @@ public final class GoalDraftResolution {
 			}
 			return Operation.QUEUE;
 		}
+		if (draft.intent() == DraftIntent.TRANSLATE_REPLACE) {
+			if (choice != GoalDraftChoice.CONFIRM || draft.expectedGoalId().isEmpty()) {
+				throw new AgentDomainException("GOAL_DRAFT_CHOICE_INVALID", "Confirm or cancel this requested replacement");
+			}
+			return Operation.REPLACE;
+		}
 		boolean replacesExistingGoal = draft.expectedGoalId().isPresent();
 		return switch (choice) {
 			case CONFIRM -> {

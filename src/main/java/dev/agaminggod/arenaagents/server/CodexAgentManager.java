@@ -373,18 +373,21 @@ public final class CodexAgentManager {
 		Objects.requireNonNull(publicationBarrier, "publicationBarrier must not be null");
 		SkitModeRuntime.requireNormalControlAllowed(server, event.agentId());
 		PendingConversationWake[] staged = { null };
+		PendingConversationWake[] previousWake = { null };
 		try {
-			return savedData.registry().startAtomically(
-					event.agentId(), spec, System.currentTimeMillis(),
-					(transition, commit) -> {
+			BiConsumer<AgentTransition, Runnable> barrier = (transition, commit) -> {
 						PendingConversationWake wake = PendingConversationWake.create(event, transition);
-						savedData.stageConversationWake(wake);
+						previousWake[0] = savedData.stageConversationWakeReplacingPrior(wake).orElse(null);
 						staged[0] = wake;
 						publicationBarrier.accept(wake, commit);
-					}
-			);
+					};
+			AgentRecord current = savedData.registry().require(event.agentId());
+			return current.state().isActive() || current.state() == dev.agaminggod.arenaagents.agent.AgentLifecycleState.PAUSED
+					? savedData.registry().replaceAtomically(event.agentId(), spec, System.currentTimeMillis(), barrier)
+					: savedData.registry().startAtomically(event.agentId(), spec, System.currentTimeMillis(), barrier);
 		} catch (RuntimeException exception) {
 			if (staged[0] != null) savedData.rollbackConversationWake(staged[0].transactionId());
+			if (previousWake[0] != null) savedData.stageConversationWake(previousWake[0]);
 			throw exception;
 		}
 	}
@@ -479,7 +482,8 @@ public final class CodexAgentManager {
 
 	public Optional<GoalDraftResult> activateTranslatedManagerDraft(PendingGoalDraft draft, String advisoryRoute) {
 		Objects.requireNonNull(draft, "draft must not be null");
-		if (draft.intent() != DraftIntent.TRANSLATE_START && draft.intent() != DraftIntent.TRANSLATE_QUEUE) {
+		if (draft.intent() != DraftIntent.TRANSLATE_START && draft.intent() != DraftIntent.TRANSLATE_QUEUE
+				&& draft.intent() != DraftIntent.TRANSLATE_REPLACE) {
 			return Optional.empty();
 		}
 		return resolveGoalDraft(
@@ -493,7 +497,8 @@ public final class CodexAgentManager {
 		RegistryAccess registries = server == null ? RegistryAccess.EMPTY : server.registryAccess();
 		GoalCompiler compiler = goalCompiler == null ? new GoalCompiler() : goalCompiler;
 		compiler.supportedTranslationConstraintFor(draft.originalRequest(), registries).validate(predicate);
-		if ((draft.intent() == DraftIntent.TRANSLATE_START || draft.intent() == DraftIntent.TRANSLATE_QUEUE)
+		if ((draft.intent() == DraftIntent.TRANSLATE_START || draft.intent() == DraftIntent.TRANSLATE_QUEUE
+				|| draft.intent() == DraftIntent.TRANSLATE_REPLACE)
 				&& compiler.translationRequiresOperatorConfirmation(draft.originalRequest(), registries)
 				&& !GoalCompiler.requiresConfirmationOnEveryPath(predicate)) {
 			throw new AgentDomainException("GOAL_TRANSLATION_REQUIRES_CONFIRMATION",
@@ -505,7 +510,8 @@ public final class CodexAgentManager {
 		Objects.requireNonNull(draft, "draft must not be null");
 		Objects.requireNonNull(predicate, "predicate must not be null");
 		GoalCompiler compiler = goalCompiler == null ? new GoalCompiler() : goalCompiler;
-		return compiler.normalizeTranslatedPredicate(draft.originalRequest(), predicate);
+		return compiler.normalizeTranslatedPredicate(draft.originalRequest(), predicate,
+				server == null ? RegistryAccess.EMPTY : server.registryAccess());
 	}
 
 	static void validateGoalDraftPredicate(

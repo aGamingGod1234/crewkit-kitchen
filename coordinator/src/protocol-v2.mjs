@@ -1524,8 +1524,8 @@ function normalizeConversationWake(value) {
 	exactKeys(value, ['transactionId', 'event', 'control'], ['transactionId', 'event', 'control'], 'conversation_wake');
 	const event = normalizeConversationEvent(value.event);
 	const control = normalizeGoalControl(value.control);
-	if (control.operation !== 'start') {
-		throw new ProtocolV2Error('INVALID_PAYLOAD', 'conversation_wake control must be start');
+	if (!['start', 'replace'].includes(control.operation)) {
+		throw new ProtocolV2Error('INVALID_PAYLOAD', 'conversation_wake control must be start or replace');
 	}
 	if (event.goalRevision === Number.MAX_SAFE_INTEGER || control.goalRevision !== event.goalRevision + 1) {
 		throw new ProtocolV2Error('INVALID_PAYLOAD', 'conversation_wake control revision must immediately follow the event revision');

@@ -52,17 +52,17 @@ public final class AgentChatReporter {
 	}
 
 	public static void goalVerified(CodexAgentManager manager, AgentRecord record, java.util.List<GoalEvidence.Fact> facts) {
+		AgentVerboseState verbose = verboseState(manager);
+		if (verbose != null && !verbose.standardActivityEnabled()) return;
 		GoalEvidence.Fact fact = firstFact(facts, true);
 		String detail = fact == null ? "server-observed requirements satisfied" : fact.expectedValue();
 		report(manager, record, "Goal verified: " + detail + ".", ChatFormatting.GREEN);
 	}
 
 	public static void goalNotComplete(CodexAgentManager manager, AgentRecord record, java.util.List<GoalEvidence.Fact> facts) {
-		GoalEvidence.Fact fact = firstFact(facts, false);
-		String detail = fact == null
-				? "requirements are not yet satisfied"
-				: "expected " + fact.expectedValue() + ", observed " + fact.observedValue();
-		report(manager, record, "Goal not complete: " + detail + ". Continuing.", ChatFormatting.YELLOW);
+		AgentVerboseState verbose = verboseState(manager);
+		if (verbose != null && !verbose.standardActivityEnabled()) return;
+		report(manager, record, AgentActivityPresentation.goalNotComplete(facts), ChatFormatting.YELLOW);
 	}
 
 	private static GoalEvidence.Fact firstFact(java.util.List<GoalEvidence.Fact> facts, boolean fallbackToFirst) {

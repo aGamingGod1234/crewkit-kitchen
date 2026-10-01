@@ -8,6 +8,10 @@
 		"maxReconnectDelayMs": 5000
 	},
 	"voice": {
+		"provider": "openai",
+		"openaiApiKeyEnvironmentVariable": "OPENAI_API_KEY",
+		"openaiTtsModel": "gpt-4o-mini-tts",
+		"openaiSttModel": "gpt-transcribe",
 		"port": 8766,
 		"maxConcurrent": 5,
 		"profileAssignmentsPath": "runtime/voice-profile-assignments.json",

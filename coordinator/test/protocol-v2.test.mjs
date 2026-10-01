@@ -302,6 +302,9 @@ test('protocol v2 carries one acknowledged conversation wake transaction', () =>
 	const control = { operation: 'start', goalRevision: 4, updatedAtEpochMs: 21, goal: 'Respond to the player.' };
 	const payload = { transactionId: 'wake-00000001', event, control };
 	assert.deepEqual(validateProtocolV2Payload('conversation_wake', payload), payload);
+	const replacement = { ...payload, control: { ...control, operation: 'replace' } };
+	assert.deepEqual(validateProtocolV2Payload('conversation_wake', replacement), replacement,
+		'a direct replacement keeps its operation while retaining the consecutive revision guard');
 	assert.deepEqual(
 		validateProtocolV2Payload('conversation_wake_ack', { transactionId: payload.transactionId, goalRevision: 4 }),
 		{ transactionId: payload.transactionId, goalRevision: 4 },

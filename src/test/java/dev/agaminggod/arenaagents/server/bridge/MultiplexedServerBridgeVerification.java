@@ -196,7 +196,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyImmediateHandshakeClosePreservesDisconnect();
 		verifyPendingRegistrationMarkerIsFenced();
 		verifyAtomicPublicationRacesSessionClose();
-		return 298;
+		return 307;
 	}
 
 	@SuppressWarnings("unchecked")
@@ -2371,7 +2371,7 @@ public final class MultiplexedServerBridgeVerification {
 		MultiplexedServerBridge.VerboseEvent rejected = invokeCompletionVerboseEvent(7L, verification);
 		assertEquals(7L, rejected.goalRevision(), "rejected completion feedback retains the guarded revision");
 		assertEquals("retry", rejected.stage(), "rejected completion feedback uses the Problem stage exactly once");
-		assertEquals("Goal not complete: expected minecraft:iron_pickaxe x1, observed minecraft:iron_pickaxe x0. Continuing.", rejected.message(),
+		assertEquals("Still need iron pickaxe x1. I'll keep working.", rejected.message(),
 				"rejected completion feedback explains that work will continue");
 		GoalCompletionVerifier.VerificationResult verified = new GoalCompletionVerifier.VerificationResult(
 				true, 7L, "VERIFIED", List.of()
@@ -2380,6 +2380,14 @@ public final class MultiplexedServerBridgeVerification {
 		assertEquals(7L, completed.goalRevision(), "successful completion feedback retains the guarded revision");
 		assertEquals("result", completed.stage(), "successful completion feedback uses Result instead of Lifecycle");
 		assertEquals("Goal verified.", completed.message(), "successful completion feedback is concise");
+		GoalCompletionVerifier.VerificationResult waiting = new GoalCompletionVerifier.VerificationResult(
+				false, 7L, "PREDICATE_FAILED",
+				List.of(new GoalEvidence.Fact("operator_confirmed", false, "operator confirmation", "not confirmed"))
+		);
+		MultiplexedServerBridge.VerboseEvent awaitingConfirmation = invokeCompletionVerboseEvent(7L, waiting);
+		assertEquals("result", awaitingConfirmation.stage(), "manual confirmation is a waiting state rather than an action problem");
+		assertEquals("Finished the work. Waiting for your confirmation.", awaitingConfirmation.message(),
+				"manual confirmation feedback does not falsely claim the agent is continuing");
 	}
 
 	private static void verifyTraceWireValidation() {
@@ -2571,9 +2579,42 @@ public final class MultiplexedServerBridgeVerification {
 				}, "matching coordinator acknowledgement is persisted");
 				assertEquals(1, manager.pendingConversationWakes().size(),
 						"acknowledgement retains replay context until the wake goal is terminal");
+				JsonObject replayReady = new JsonObject();
+				replayReady.addProperty("goalRevision", 1L);
+				writeEnvelope(socket, codec, new BridgeEnvelope(
+						2, helloAck.serverInstanceId(), idle.agentId().toString(), "agent_ready", "ready-after-replay", replayReady));
+				awaitCondition(() -> {
+					activeBridgeAfterAck.tick();
+					return activeBridgeAfterAck.coordinatorReadyForVerification(idle.agentId());
+				}, "coordinator is ready to receive the next direct task after reconnect");
+				AgentRecord priorRecord = manager.registry().require(idle.agentId());
+				var priorWake = manager.pendingConversationWakes().getFirst();
+				ConversationEvent nextTask = new ConversationEvent(
+						idle.agentId(), event.sourceId(), idle.agentId().toString(),
+						ConversationAudience.DIRECT, ConversationKind.PLAYER_MESSAGE, "Get an iron pickaxe now.",
+						1L, 1_003L, 2L, "minecraft:overworld"
+				);
+				try {
+					manager.startConversationWakeAtomically(nextTask, testGoal("Get an iron pickaxe."),
+							(stagedWake, commit) -> { throw new IllegalStateException("publication failed"); });
+					throw new AssertionError("failed replacement publication was accepted");
+				} catch (IllegalStateException expected) {
+					assertEquals("publication failed", expected.getMessage(), "replacement returns the publication failure");
+				}
+				assertEquals(priorRecord, manager.registry().require(idle.agentId()), "failed replacement keeps the prior active goal");
+				assertEquals(List.of(priorWake), manager.pendingConversationWakes(), "failed replacement restores the prior durable message");
+				bridge.publishConversationEvent(nextTask, Optional.of(testGoal("Get an iron pickaxe.")));
+				BridgeEnvelope replacement = pollBridgeResponseOfType(bridge, socket, reader, codec, "conversation_wake", null);
+				assertEquals(2L, replacement.payload().getAsJsonObject("control").get("goalRevision").getAsLong(),
+						"direct new task advances the revision once while the old task is active");
+				assertEquals("replace", replacement.payload().getAsJsonObject("control").get("operation").getAsString(),
+						"direct new task cannot be mistaken for promotion of a queued goal by the coordinator");
+				assertEquals("Get an iron pickaxe.", manager.registry().require(idle.agentId()).currentGoal().orElseThrow().prompt(),
+						"direct new task replaces the old server goal");
+				assertEquals(1, manager.pendingConversationWakes().size(), "new task replaces the old durable message instead of rejecting it");
 				manager.registry().satisfyGoal(
 						idle.agentId(),
-						1L,
+						2L,
 						new GoalEvidence(System.currentTimeMillis(), "operator_confirmed", List.of()),
 						System.currentTimeMillis()
 				);

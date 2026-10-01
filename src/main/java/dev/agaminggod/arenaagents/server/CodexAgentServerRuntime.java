@@ -85,6 +85,11 @@ public final class CodexAgentServerRuntime {
 		runtime.confirm(agentId, goal.goalId());
 	}
 
+	public static boolean confirmCurrentGoalFromSpeech(MinecraftServer server, AgentId agentId) {
+		GoalVerificationRuntime runtime = GOAL_VERIFIERS.get(server);
+		return runtime != null && runtime.confirmFromSpeech(agentId);
+	}
+
 	private static boolean containsOperatorConfirmation(dev.agaminggod.arenaagents.agent.goal.GoalPredicate predicate) {
 		if (predicate instanceof dev.agaminggod.arenaagents.agent.goal.GoalPredicate.OperatorConfirmed) return true;
 		if (predicate instanceof dev.agaminggod.arenaagents.agent.goal.GoalPredicate.AllOf all) {

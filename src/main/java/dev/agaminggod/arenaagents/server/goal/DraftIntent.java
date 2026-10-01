@@ -5,9 +5,10 @@ public enum DraftIntent {
 	REPLACE_OR_QUEUE,
 	CONFIRM_TRANSLATION,
 	TRANSLATE_START,
-	TRANSLATE_QUEUE;
+	TRANSLATE_QUEUE,
+	TRANSLATE_REPLACE;
 
 	public boolean acceptsCoordinatorProposal() {
-		return this == CONFIRM_TRANSLATION || this == TRANSLATE_START || this == TRANSLATE_QUEUE;
+		return this == CONFIRM_TRANSLATION || this == TRANSLATE_START || this == TRANSLATE_QUEUE || this == TRANSLATE_REPLACE;
 	}
 }

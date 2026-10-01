@@ -53,6 +53,7 @@ import { BestEffortDiagnosticQueue } from './best-effort-diagnostic-queue.mjs';
 import { RotatingJsonlSink } from './rotating-jsonl-sink.mjs';
 import { sanitizeDiagnosticCode, sanitizeDiagnosticErrorCode, sanitizeDiagnosticErrorMessage, sanitizeDiagnosticText, sanitizeDiagnosticValue } from './diagnostic-sanitizer.mjs';
 import { FishTtsProvider } from './voice/fish-tts-provider.mjs';
+import { OpenAiTtsProvider, OpenAiSttProvider, DEFAULT_OPENAI_TTS_MODEL, DEFAULT_OPENAI_STT_MODEL } from './voice/openai-speech-provider.mjs';
 import { DeepgramSttProvider, NoSttProvider } from './voice/deepgram-stt-provider.mjs';
 import { LocalSpeechProvider } from './voice/local-speech-provider.mjs';
 import { providerCacheNamespace, tagSynthesisCacheNamespace } from './voice/tts-cache-identity.mjs';
@@ -697,9 +698,9 @@ export class DynamicCoordinator extends EventEmitter {
 					throw error;
 				}
 				if (previous !== null && record.goalRevision > previous.goalRevision) {
-					this.#retireGoalSupervision(previous, 'start');
+					this.#retireGoalSupervision(previous, message.payload.control.operation);
 					this.#invalidateAcceptedLifecycle(message.agentId);
-					this.#programRuntime.onGoalControl(previous, 'start');
+					this.#programRuntime.onGoalControl(previous, message.payload.control.operation);
 					await this.#nativeRuntime.dispose(previous.agentId, 'conversation_wake');
 					if (!this.#isConnectionEpochCurrent(connectionEpoch)) return;
 				}
@@ -2612,7 +2613,8 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 	const config = normalizeDynamicConfig(configValue, coordinatorEnvironment);
 	const providerEnvironments = Object.fromEntries(PROVIDER_IDS.map((provider) => [
 		provider,
-		createProviderChildEnvironment(provider, coordinatorEnvironment, config.bridge.secretEnvironmentVariable),
+		createProviderChildEnvironment(provider, coordinatorEnvironment, config.bridge.secretEnvironmentVariable,
+			config.voice.provider === 'openai' ? { speechApiKeyEnvironmentVariable: config.voice.openaiApiKeyEnvironmentVariable } : {}),
 	]));
 	const registry = dependencies.registry ?? new AgentRegistry({
 		agentCap: config.limits.agentCap,
@@ -2766,7 +2768,7 @@ export function normalizeDynamicConfig(value, environment = process.env) {
 	assertOptionalConfigObject(value.kimi, 'kimi');
 	assertOptionalConfigObject(value.cursor, 'cursor');
 	assertKnownConfigKeys(value.bridge, ['host', 'port', 'secret', 'secretEnvironmentVariable', 'reconnectDelayMs', 'maxReconnectDelayMs', 'connectionQueueCap', 'agentQueueCap', 'inboundConnectionQueueCap', 'inboundAgentQueueCap', 'inboundDispatchBatch', 'trackedTerminalActionIdCap', 'handshakeTimeoutMs', 'heartbeatIntervalMs', 'heartbeatTimeoutMs', 'serverInstanceId', 'launchId'], 'bridge');
-	assertKnownConfigKeys(value.voice ?? {}, ['port', 'maxConcurrent', 'profileAssignmentsPath', 'fishApiKeyEnvironmentVariable', 'deepgramApiKeyEnvironmentVariable', 'localSpeechTimeoutMs', 'localSpeechPythonPath', 'secret', 'secretFile'], 'voice');
+	assertKnownConfigKeys(value.voice ?? {}, ['port', 'maxConcurrent', 'profileAssignmentsPath', 'provider', 'openaiApiKeyEnvironmentVariable', 'openaiTtsModel', 'openaiSttModel', 'fishApiKeyEnvironmentVariable', 'deepgramApiKeyEnvironmentVariable', 'localSpeechTimeoutMs', 'localSpeechPythonPath', 'secret', 'secretFile'], 'voice');
 	assertKnownConfigKeys(value.codex, ['cwd', 'controlProtocol', 'planningTimeoutMs', 'maxDecisionBytes', 'catalogTtlMs', 'startupTimeoutMs', 'serviceTier', 'launchProfile'], 'codex');
 	if (value.codex.launchProfile !== undefined) {
 		assertOptionalConfigObject(value.codex.launchProfile, 'codex.launchProfile');
@@ -3015,6 +3017,11 @@ export async function startVoiceWorker(config, environment = process.env, depend
 		environment[voice.deepgramApiKeyEnvironmentVariable ?? DEFAULT_DEEPGRAM_API_KEY_ENVIRONMENT_VARIABLE],
 	);
 	const platform = dependencies.platform ?? process.platform;
+	const openaiApiKey = firstNonBlank(environment[voice.openaiApiKeyEnvironmentVariable ?? 'OPENAI_API_KEY']);
+	if (voice.provider === 'openai') {
+		if (openaiApiKey === null) throw codedRuntimeError('VOICE_OPENAI_KEY_MISSING', 'Set OPENAI_API_KEY on the host and restart Minecraft to enable OpenAI speech');
+		return startOpenAiVoiceWorker(voice, openaiApiKey, dependencies, { signal, reportVoiceDiagnostic, localSpeechTimeoutMs });
+	}
 	const createLocalSpeechProvider = dependencies.createLocalSpeechProvider
 		?? ((options) => LocalSpeechProvider.createIfAvailable(options));
 	if (typeof createLocalSpeechProvider !== 'function') throw new TypeError('createLocalSpeechProvider must be a function');
@@ -3140,6 +3147,37 @@ export async function startVoiceWorker(config, environment = process.env, depend
 			],
 			dependencies.cleanupTimeoutMs ?? 1_000,
 		);
+		throw error;
+	}
+}
+
+async function startOpenAiVoiceWorker(voice, apiKey, dependencies, { signal, reportVoiceDiagnostic, localSpeechTimeoutMs }) {
+	let profiles = null;
+	let profileStore = null;
+	let worker = null;
+	try {
+		const secret = await resolveVoiceSecret(voice, dependencies.readVoiceSecret ?? readFile);
+		throwIfVoiceStartupAborted(signal);
+		const loadProfiles = dependencies.loadProfileStore ?? loadPersistentVoiceProfileStore;
+		profiles = await loadProfiles(dependencies.profilePath ?? voice.profileAssignmentsPath
+			?? path.resolve(PROJECT_DIRECTORY, DEFAULT_VOICE_PROFILE_ASSIGNMENTS_PATH), { ...(dependencies.voiceProfileIo ?? {}), signal });
+		throwIfVoiceStartupAborted(signal);
+		profileStore = voiceProfileStoreWithLifecycle(profiles);
+		const provider = (dependencies.createOpenAiTtsProvider ?? (options => new OpenAiTtsProvider(options)))({ apiKey, model: voice.openaiTtsModel ?? DEFAULT_OPENAI_TTS_MODEL });
+		const sttProvider = (dependencies.createOpenAiSttProvider ?? (options => new OpenAiSttProvider(options)))({ apiKey, model: voice.openaiSttModel ?? DEFAULT_OPENAI_STT_MODEL });
+		worker = (dependencies.createVoiceServer ?? createVoiceHttpServer)({
+			provider, sttProvider, profileStore, secret, port: voice.port ?? DEFAULT_VOICE_PORT,
+			maxConcurrent: voice.maxConcurrent ?? DEFAULT_VOICE_MAX_CONCURRENT, requestTimeoutMs: localSpeechTimeoutMs,
+			directorUsesPrimaryProvider: true, onDiagnostic: reportVoiceDiagnostic,
+		});
+		await worker.start({ signal });
+		throwIfVoiceStartupAborted(signal);
+		emitVoiceDiagnostic(reportVoiceDiagnostic, { code: 'VOICE_OPENAI_CONFIGURED', effectiveProvider: provider.cacheNamespace(), reason: 'openai_credential_configured' });
+		return worker;
+	} catch (error) {
+		await settleVoiceBootstrapCleanup([
+			() => worker?.close(), () => profileStore === null ? closeLoadedVoiceProfiles(profiles) : profileStore.close(),
+		], dependencies.cleanupTimeoutMs ?? 1_000);
 		throw error;
 	}
 }
@@ -3629,9 +3667,18 @@ function normalizeVoiceConfig(value, environment) {
 		maxConcurrent,
 		profileAssignmentsPath,
 		localSpeechTimeoutMs,
+		provider: requireSpeechProvider(source.provider ?? 'legacy'),
+		openaiApiKeyEnvironmentVariable: requireEnvironmentVariableName(source.openaiApiKeyEnvironmentVariable ?? 'OPENAI_API_KEY', 'voice.openaiApiKeyEnvironmentVariable'),
+		openaiTtsModel: source.openaiTtsModel ?? DEFAULT_OPENAI_TTS_MODEL,
+		openaiSttModel: source.openaiSttModel ?? DEFAULT_OPENAI_STT_MODEL,
 		fishApiKeyEnvironmentVariable: requireEnvironmentVariableName(source.fishApiKeyEnvironmentVariable ?? DEFAULT_FISH_API_KEY_ENVIRONMENT_VARIABLE, 'voice.fishApiKeyEnvironmentVariable'),
 		deepgramApiKeyEnvironmentVariable: requireEnvironmentVariableName(source.deepgramApiKeyEnvironmentVariable ?? DEFAULT_DEEPGRAM_API_KEY_ENVIRONMENT_VARIABLE, 'voice.deepgramApiKeyEnvironmentVariable'),
 	};
+}
+
+function requireSpeechProvider(value) {
+	if (!['openai', 'legacy'].includes(value)) throw new TypeError('voice.provider must be openai or legacy');
+	return value;
 }
 
 async function resolveVoiceSecret(voice, readSecretFile) {

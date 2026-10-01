@@ -296,6 +296,12 @@ public final class AgentRegistry {
 		return apply(AgentLifecycleReducer.replace(require(id), spec, advisoryRoute, nowEpochMs));
 	}
 
+	public synchronized AgentTransition replaceAtomically(AgentId id, GoalSpec spec, long nowEpochMs,
+			BiConsumer<AgentTransition, Runnable> barrier) {
+		Objects.requireNonNull(barrier, "barrier must not be null");
+		return applyAtomically(AgentLifecycleReducer.replace(require(id), spec, nowEpochMs), barrier, "replace");
+	}
+
 	/** Commits a prepared start only after its publication barrier succeeds. */
 	public synchronized AgentTransition startAtomically(
 			AgentId id,

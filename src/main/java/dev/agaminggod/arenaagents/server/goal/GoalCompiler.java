@@ -55,6 +55,7 @@ public final class GoalCompiler {
 	private static final Pattern ITEM = Pattern.compile("^(get|obtain|collect|bring|gather|acquire|fetch|craft|make) (?:me )?(?:(?:at least )?(" + COUNT + ") )?(?:(?:a|an|some) )?(.+?)(?: for me)?$");
 	private static final Pattern ITEM_ALTERNATIVE_COUNT = Pattern.compile("^(?:at least\\s+)?(" + COUNT + ")\\s+(.+)$");
 	private static final Pattern ITEM_BLOCK_OF = Pattern.compile("^blocks? of (.+)$");
+	private static final Pattern NAMED_TOOL_SET = Pattern.compile("^([a-z]+) tools?\\s*[:,]\\s*(.+)$");
 	private static final Pattern REFERENCED_ITEM_CLAUSE = Pattern.compile("^(?:keep|retain|hold|carry)\\s+(?:it|them|these|those)(?:\\s.*)?$");
 	private static final Pattern BLOCK = Pattern.compile("^(build|construct|place|put|set|mine|break|destroy) (?:with |using |from )?(?:(?:a|an|some|the) )?(.+?)(?: for me)?$");
 	private static final Pattern BLOCK_LOCATION_SUFFIX = Pattern.compile(
@@ -119,7 +120,7 @@ public final class GoalCompiler {
 		Objects.requireNonNull(advancementExists, "advancementExists must not be null");
 		Objects.requireNonNull(dimensionId, "dimensionId must not be null");
 		String original = AgentValidators.normalizePrompt(request);
-		String command = stripTrailingPunctuation(stripPoliteness(original.toLowerCase(Locale.ROOT)));
+		String command = normalizedCommand(original);
 		TranslationLeafBudget translationBudget = candidateTranslationBudget(command, compoundClauses(command));
 		if (!translationBudget.valid()) return GoalCompilation.rejected(translationBudget.rejection());
 		if (SUBJECTIVE.matcher(command).find()) {
@@ -175,6 +176,12 @@ public final class GoalCompiler {
 				return GoalCompilation.rejected("The requested item count is outside the supported range.");
 			}
 			if (count <= 0) return GoalCompilation.rejected("The requested item count must be positive.");
+			List<String> namedTools = namedToolSetItems(item.group(3), registries);
+			if (!namedTools.isEmpty()) {
+				GoalPredicate predicate = toolSetPredicate(namedTools, count);
+				if (GoalInventoryCapacity.exceeds(predicate, registries)) return unrepresentableItemCount();
+				return accepted(original, predicate, createdAtTick, "Goal set: obtain the requested tools.");
+			}
 			if (isGenericBlockTarget(item.group(3))) {
 				GoalPredicate predicate = new GoalPredicate.InventoryContainsBlock(count);
 				if (GoalInventoryCapacity.exceeds(predicate, registries)) return unrepresentableItemCount();
@@ -261,8 +268,8 @@ public final class GoalCompiler {
 	}
 
 	/**
-	 * Speech is only consumed as a goal change when the agent is idle, or the player already
-	 * opted into replace/queue through {@code /agent goal}. Busy agents keep working and still hear the line.
+	 * Speech changes the goal when the agent is idle or the caller has authorized replacement.
+	 * The live router grants replacement to direct task requests from an operator.
 	 */
 	public static boolean consumePlayerSpeechAsGoal(boolean hasActiveGoal, String text, boolean replaceOrQueueOptIn) {
 		if (replaceOrQueueOptIn) return looksLikeGoalRequest(text) || isLiveSteeringRequest(text);
@@ -272,7 +279,8 @@ public final class GoalCompiler {
 	}
 
 	private static String normalizedCommand(String request) {
-		return stripTrailingPunctuation(stripPoliteness(AgentValidators.normalizePrompt(request).toLowerCase(Locale.ROOT)));
+		return stripTrailingPunctuation(stripPoliteness(AgentValidators.normalizePrompt(request).toLowerCase(Locale.ROOT)))
+				.replaceFirst("\\s+now$", "");
 	}
 
 	public List<String> candidateIdsFor(String request, RegistryAccess registries) {
@@ -281,8 +289,17 @@ public final class GoalCompiler {
 
 	public GoalTranslationConstraint translationConstraintFor(String request, RegistryAccess registries) {
 		Objects.requireNonNull(registries, "registries must not be null");
-		String command = stripTrailingPunctuation(stripPoliteness(
-				AgentValidators.normalizePrompt(request).toLowerCase(Locale.ROOT)));
+		String command = normalizedCommand(request);
+		Matcher namedItems = ITEM.matcher(command);
+		if (namedItems.matches()) {
+			List<String> tools = namedToolSetItems(namedItems.group(3), registries);
+			if (!tools.isEmpty()) {
+				int count = namedItems.group(2) == null ? 1 : parseCount(namedItems.group(2));
+				return new GoalTranslationConstraint(List.of(), tools.stream().map(id ->
+						new GoalTranslationConstraint.ItemClause(List.of(
+								new GoalTranslationConstraint.ItemAlternative(List.of(id), count)))).toList());
+			}
+		}
 		List<GoalClause> clauses = compoundClauses(command);
 		TranslationLeafBudget budget = candidateTranslationBudget(command, clauses);
 		if (!budget.valid()) {
@@ -374,12 +391,18 @@ public final class GoalCompiler {
 				|| exception.code().equals("GOAL_TRANSLATION_CATALOG_TOO_BROAD");
 	}
 
-	/** Removes redundant subjective confirmation from Minecraft's objective beat-the-game terminal result. */
+	/** Factual acquisition and kill goals do not need an extra human completion gate. */
 	public GoalPredicate normalizeTranslatedPredicate(String request, GoalPredicate predicate) {
+		return normalizeTranslatedPredicate(request, predicate, RegistryAccess.EMPTY);
+	}
+
+	public GoalPredicate normalizeTranslatedPredicate(String request, GoalPredicate predicate, RegistryAccess registries) {
 		Objects.requireNonNull(predicate, "predicate must not be null");
-		String command = stripTrailingPunctuation(stripPoliteness(
-				AgentValidators.normalizePrompt(request).toLowerCase(Locale.ROOT)));
-		if (!BEAT_GAME_TRANSLATION.matcher(command).matches()) return predicate;
+		String command = normalizedCommand(request);
+		GoalTranslationConstraint constraint = supportedTranslationConstraintFor(request, registries);
+		boolean factualRequest = !constraint.killClauses().isEmpty() || !constraint.itemClauses().isEmpty();
+		if (!BEAT_GAME_TRANSLATION.matcher(command).matches()
+				&& (!factualRequest || translationRequiresOperatorConfirmation(request, registries))) return predicate;
 		GoalPredicate normalized = withoutOperatorConfirmation(predicate);
 		return normalized == null ? predicate : normalized;
 	}
@@ -410,8 +433,12 @@ public final class GoalCompiler {
 	) {
 		Objects.requireNonNull(registries, "registries must not be null");
 		Objects.requireNonNull(liveAdvancementTitles, "liveAdvancementTitles must not be null");
-		String command = stripTrailingPunctuation(stripPoliteness(
-				AgentValidators.normalizePrompt(request).toLowerCase(Locale.ROOT)));
+		String command = normalizedCommand(request);
+		Matcher namedItems = ITEM.matcher(command);
+		if (namedItems.matches()) {
+			List<String> tools = namedToolSetItems(namedItems.group(3), registries);
+			if (!tools.isEmpty()) return tools.stream().sorted().toList();
+		}
 		List<GoalClause> clauses = compoundClauses(command);
 		if (!candidateTranslationBudget(command, clauses).valid()) return List.of();
 		if (clauses.size() > 1) {
@@ -855,6 +882,27 @@ public final class GoalCompiler {
 		return GoalCompilation.accepted(GoalSpec.create(original, predicate, createdAtTick), message);
 	}
 
+	private static List<String> namedToolSetItems(String target, RegistryAccess registries) {
+		Matcher set = NAMED_TOOL_SET.matcher(target);
+		if (!set.matches()) return List.of();
+		List<String> names = List.of(set.group(2).split("\\s*(?:,\\s*(?:and\\s+)?|\\s+and\\s+)\\s*", -1));
+		if (names.size() > MAX_COMPOUND_LEAVES) return List.of();
+		ArrayList<String> tools = new ArrayList<>();
+		for (String name : names) {
+			String kind = name.replaceFirst("^(?:a|an|the)\\s+", "").strip();
+			if (!Set.of("axe", "hoe", "pickaxe", "shovel", "sword").contains(kind)) return List.of();
+			List<String> matches = matchItems(set.group(1) + " " + kind, registries);
+			if (matches.size() != 1 || tools.contains(matches.getFirst())) return List.of();
+			tools.add(matches.getFirst());
+		}
+		return List.copyOf(tools);
+	}
+
+	private static GoalPredicate toolSetPredicate(List<String> tools, int count) {
+		List<GoalPredicate> predicates = tools.stream().<GoalPredicate>map(id -> new GoalPredicate.InventoryContains(id, count)).toList();
+		return predicates.size() == 1 ? predicates.getFirst() : new GoalPredicate.AllOf(predicates);
+	}
+
 	private static List<String> matchItems(String target, RegistryAccess registries) {
 		List<String> blockItems = namedBlockItems(target, registries);
 		if (!blockItems.isEmpty()) return blockItems;
@@ -1057,7 +1105,7 @@ public final class GoalCompiler {
 
 	private static String stripPoliteness(String request) {
 		String result = request;
-		for (String prefix : List.of("hey, ", "hey ", "please ", "can you ", "could you ", "would you ", "go and ")) {
+		for (String prefix : List.of("hey, ", "hey ", "nice, ", "okay, ", "ok, ", "alright, ", "please ", "can you ", "could you ", "would you ", "go ahead and ", "go and ")) {
 			if (result.startsWith(prefix)) {
 				result = result.substring(prefix.length()).strip();
 				return stripPoliteness(result);
