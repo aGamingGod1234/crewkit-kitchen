@@ -930,6 +930,9 @@ public final class MultiplexedServerBridgeVerification {
 						"the verified Manager proposal starts the agent");
 				assertEquals(dragonKill, started.currentGoal().orElseThrow().spec().completion(),
 						"the bridge removes redundant manual confirmation from the objective terminal result");
+				assertTrue(started.currentGoal().orElseThrow().steeringInstructions().getFirst()
+						.startsWith("Suggested subgoals from Luna (advisory; revise or reorder based on live evidence): "),
+						"the advisory route reaches the main agent without owning its decisions");
 				assertTrue(manager.goalDraft(managerStartId).isEmpty(),
 						"activation consumes the durable Manager draft");
 

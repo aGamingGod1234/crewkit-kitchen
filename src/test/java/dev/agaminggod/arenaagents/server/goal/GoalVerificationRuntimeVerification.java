@@ -33,6 +33,7 @@ public final class GoalVerificationRuntimeVerification {
 		int assertions = 0;
 		assertions += verifyExactInventoryAndIdempotence();
 		assertions += verifyInventoryCategorySum();
+		assertions += verifyGenericBlockInventory();
 		assertions += verifyFailedNonKillLeafMemoization();
 		assertions += verifyStablePositionAndReset();
 		assertions += verifyDimensionBinding();
@@ -118,6 +119,17 @@ public final class GoalVerificationRuntimeVerification {
 		assertEquals(2147483649L, fixture.facts.inventoryCountAny(accepted), "category count accumulation cannot overflow a signed integer");
 		assertEquals(1, fixture.runtime.tick().size(), "satisfied category emits one authoritative completion");
 		return 9;
+	}
+
+	private static int verifyGenericBlockInventory() {
+		Fixture fixture = fixture(new GoalPredicate.InventoryContainsBlock(2), 140L);
+		fixture.facts.blockCount = 1;
+		assertEquals(false, fixture.runtime.evaluate(fixture.agentId).verified(), "one held block does not satisfy two blocks");
+		fixture.facts.blockCount = 2;
+		assertEquals(true, fixture.runtime.evaluate(fixture.agentId).verified(), "any two placeable blocks satisfy the goal");
+		assertEquals("inventory_contains_block", fixture.runtime.evaluate(fixture.agentId).facts().getFirst().type(),
+				"generic block completion produces factual evidence");
+		return 3;
 	}
 
 	private static int verifyFailedNonKillLeafMemoization() {
@@ -1042,6 +1054,7 @@ public final class GoalVerificationRuntimeVerification {
 
 	private static class FakeFacts implements GoalCompletionVerifier.FactSource {
 		private final Map<String, Integer> items = new HashMap<>();
+		private long blockCount;
 		private final Map<String, GoalCompletionVerifier.BlockFact> blocks = new HashMap<>();
 		private final Map<String, Boolean> advancements = new HashMap<>();
 		private GoalCompletionVerifier.Position position = new GoalCompletionVerifier.Position(0.0, 64.0, 0.0);
@@ -1054,6 +1067,7 @@ public final class GoalVerificationRuntimeVerification {
 			inventoryReads++;
 			return items.getOrDefault(itemId, 0);
 		}
+		@Override public long inventoryBlockCount() { return blockCount; }
 		@Override public GoalCompletionVerifier.Position position() { return position; }
 		@Override public GoalCompletionVerifier.BlockFact blockAt(int x, int y, int z) {
 			blockReads++;

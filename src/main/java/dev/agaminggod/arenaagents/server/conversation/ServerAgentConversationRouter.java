@@ -327,20 +327,14 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 		);
 
 		return routeCompiledSpeechGoal(
-				target.state(), event.kind(), compilation,
+				target.state(), event.kind(), GoalCompiler.withAdvisoryPlan(compilation),
 				() -> {
-					DraftIntent intent = GoalCompiler.isDeterministicTranslation(event.text())
-							? DraftIntent.TRANSLATE_START : DraftIntent.CONFIRM_TRANSLATION;
+					DraftIntent intent = DraftIntent.TRANSLATE_START;
 					PendingGoalDraft draft = draft(
 							target, event, sourceLevel, Optional.empty(), intent);
 					manager.stageGoalDraft(draft);
 					goalSpecRequestSink.publish(draft);
-					if (intent == DraftIntent.TRANSLATE_START) {
-						notifyRequester(draft, "I understood the goal and will start it after validation.");
-					} else {
-						notifyRequester(draft, compilation.playerMessage()
-								+ " Draft " + draft.draftId() + " is waiting for clarification.");
-					}
+					notifyRequester(draft, "I understood the goal and will start it after validation.");
 				},
 				message -> notifyRequester(requestingPlayerId(event), message)
 		);
@@ -382,7 +376,7 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 				UUID.randomUUID(), target.agentId(), playerId, event.text(),
 				sourceLevel.dimension().identifier().toString(),
 				goalCompiler.candidateIdsFor(event.text(), manager.server().registryAccess(), liveAdvancementTitles()),
-				goalCompiler.translationConstraintFor(event.text(), manager.server().registryAccess()), proposed, intent,
+				goalCompiler.supportedTranslationConstraintFor(event.text(), manager.server().registryAccess()), proposed, intent,
 				manager.server().getTickCount(), target.goalRevision(), PendingGoalDraft.expectedGoalIdFor(target)
 		);
 	}

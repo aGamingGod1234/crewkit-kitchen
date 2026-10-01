@@ -169,6 +169,10 @@ public final class GoalSpecCodec {
 				json.add("item_ids", items);
 				json.addProperty("count", inventory.count());
 			}
+			case GoalPredicate.InventoryContainsBlock inventory -> {
+				json.addProperty("type", "inventory_contains_block");
+				json.addProperty("count", inventory.count());
+			}
 			case GoalPredicate.PositionWithin position -> {
 				json.addProperty("type", "position_within");
 				if (includeDimensions) json.addProperty("dimension_id", position.dimensionId());
@@ -251,6 +255,10 @@ public final class GoalSpecCodec {
 					identifiers.add(item.getAsString());
 				}
 				yield new GoalPredicate.InventoryContainsAny(identifiers, exactInt(json, "count"));
+			}
+			case "inventory_contains_block" -> {
+				requireExactKeys(json, Set.of("type", "count"));
+				yield new GoalPredicate.InventoryContainsBlock(exactInt(json, "count"));
 			}
 			case "position_within" -> {
 				boolean legacy = !json.has("dimension_id");

@@ -108,7 +108,12 @@ test('goal spec translation uses an isolated structured provider session without
 	});
 	assert.equal(proposal.requestId, '00000000-0000-4000-8000-000000000001');
 	assert.equal(calls.find(call => call.type === 'create').options.controlProtocol, 'goal_spec');
-	assert.notEqual(calls.find(call => call.type === 'create').profile.agentId, AGENT_ID);
+	const translatorProfile = calls.find(call => call.type === 'create').profile;
+	assert.notEqual(translatorProfile.agentId, AGENT_ID);
+	assert.equal(translatorProfile.provider, 'codex');
+	assert.equal(translatorProfile.model, 'gpt-6-luna');
+	assert.equal(translatorProfile.reasoningEffort, 'medium');
+	assert.equal(translatorProfile.serviceTier, 'fast');
 	assert.equal(typeof calls.find(call => call.type === 'decide').decisionOptions.parseOutput, 'function');
 	assert.equal(calls.find(call => call.type === 'decide').decisionOptions.turnRecorder, turnRecorder);
 	assert.equal(calls.find(call => call.type === 'decide').decisionOptions.attempt, 1);

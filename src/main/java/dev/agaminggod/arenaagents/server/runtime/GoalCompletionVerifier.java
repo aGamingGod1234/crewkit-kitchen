@@ -24,6 +24,7 @@ import net.minecraft.resources.Identifier;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.level.block.state.BlockState;
 
 /** Evaluates only the immutable goal stored by Minecraft against live server facts. */
@@ -116,6 +117,15 @@ public final class GoalCompletionVerifier {
 				return count;
 			}
 
+			@Override public long inventoryBlockCount() {
+				long count = 0;
+				for (int index = 0; index < player.getInventory().getContainerSize(); index++) {
+					ItemStack stack = player.getInventory().getItem(index);
+					if (!stack.isEmpty() && stack.getItem() instanceof BlockItem) count += stack.getCount();
+				}
+				return count;
+			}
+
 			@Override public Position position() {
 				return new Position(player.getX(), player.getY(), player.getZ());
 			}
@@ -202,6 +212,13 @@ public final class GoalCompletionVerifier {
 			evaluated = leaf("inventory_contains_any", observed >= inventory.count(),
 					"combined count across " + inventory.itemIds().size() + " accepted item IDs >= " + inventory.count(),
 					"combined count " + observed);
+			evaluatedLeaves.put(key, evaluated);
+			return evaluated;
+		}
+		if (predicate instanceof GoalPredicate.InventoryContainsBlock inventory) {
+			long observed = source.inventoryBlockCount();
+			evaluated = leaf("inventory_contains_block", observed >= inventory.count(),
+					"placeable blocks x" + inventory.count(), "placeable blocks x" + observed);
 			evaluatedLeaves.put(key, evaluated);
 			return evaluated;
 		}
@@ -373,6 +390,7 @@ public final class GoalCompletionVerifier {
 
 	public interface FactSource {
 		int inventoryCount(String itemId);
+		default long inventoryBlockCount() { return 0; }
 		default long inventoryCountAny(List<String> itemIds) {
 			long count = 0;
 			for (String itemId : itemIds) count += inventoryCount(itemId);

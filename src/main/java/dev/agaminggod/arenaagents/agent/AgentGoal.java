@@ -69,6 +69,14 @@ public record AgentGoal(
 				GoalStatus.ACTIVE, Optional.empty(), nowEpochMs, nowEpochMs);
 	}
 
+	public static AgentGoal create(String prompt, GoalSpec spec, String advisoryRoute, long nowEpochMs) {
+		String route = Objects.requireNonNull(advisoryRoute, "advisoryRoute must not be null").strip();
+		List<String> guidance = route.isEmpty() ? List.of() : List.of(
+				"Suggested subgoals from Luna (advisory; revise or reorder based on live evidence): " + route);
+		return new AgentGoal(UUID.randomUUID(), AgentValidators.normalizePrompt(prompt), guidance, spec,
+				GoalStatus.ACTIVE, Optional.empty(), nowEpochMs, nowEpochMs);
+	}
+
 	public AgentGoal steer(String instruction, long nowEpochMs) {
 		if (status == GoalStatus.SATISFIED || status == GoalStatus.CANCELLED) {
 			throw new AgentDomainException("TERMINAL_GOAL", "A terminal goal cannot be steered back into active work");

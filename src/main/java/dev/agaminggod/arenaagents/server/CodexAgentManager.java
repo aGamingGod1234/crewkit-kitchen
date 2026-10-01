@@ -422,7 +422,18 @@ public final class CodexAgentManager {
 			boolean operator,
 			GoalDraftChoice choice
 	) {
+		return resolveGoalDraft(draftId, actorId, operator, choice, "");
+	}
+
+	public Optional<GoalDraftResult> resolveGoalDraft(
+			UUID draftId,
+			UUID actorId,
+			boolean operator,
+			GoalDraftChoice choice,
+			String advisoryRoute
+	) {
 		Objects.requireNonNull(draftId, "draftId must not be null");
+		Objects.requireNonNull(advisoryRoute, "advisoryRoute must not be null");
 		PendingGoalDraft draft = savedData.goalDraft(draftId).orElse(null);
 		if (draft == null) return Optional.empty();
 		GoalDraftResolution.Operation operation = GoalDraftResolution.authorize(draft, actorId, operator, choice);
@@ -444,9 +455,9 @@ public final class CodexAgentManager {
 		validateGoalForActivation(spec);
 		long now = System.currentTimeMillis();
 		AgentTransition transition = switch (operation) {
-			case START -> savedData.registry().start(draft.agentId(), spec, now);
-			case REPLACE -> savedData.registry().replace(draft.agentId(), spec, now);
-			case QUEUE -> savedData.registry().queue(draft.agentId(), spec, now);
+			case START -> savedData.registry().start(draft.agentId(), spec, advisoryRoute, now);
+			case REPLACE -> savedData.registry().replace(draft.agentId(), spec, advisoryRoute, now);
+			case QUEUE -> savedData.registry().queue(draft.agentId(), spec, advisoryRoute, now);
 			case CANCEL -> throw new AssertionError("cancel handled above");
 		};
 		savedData.removeGoalDraft(draftId);
@@ -454,12 +465,16 @@ public final class CodexAgentManager {
 	}
 
 	public Optional<GoalDraftResult> activateTranslatedManagerDraft(PendingGoalDraft draft) {
+		return activateTranslatedManagerDraft(draft, "");
+	}
+
+	public Optional<GoalDraftResult> activateTranslatedManagerDraft(PendingGoalDraft draft, String advisoryRoute) {
 		Objects.requireNonNull(draft, "draft must not be null");
 		if (draft.intent() != DraftIntent.TRANSLATE_START && draft.intent() != DraftIntent.TRANSLATE_QUEUE) {
 			return Optional.empty();
 		}
 		return resolveGoalDraft(
-				draft.draftId(), draft.requestingPlayerId(), false, GoalDraftChoice.CONFIRM);
+				draft.draftId(), draft.requestingPlayerId(), false, GoalDraftChoice.CONFIRM, advisoryRoute);
 	}
 
 	public void validateGoalDraftTranslation(PendingGoalDraft draft, GoalPredicate predicate) {
@@ -468,7 +483,13 @@ public final class CodexAgentManager {
 		draft.translationConstraint().validate(predicate);
 		RegistryAccess registries = server == null ? RegistryAccess.EMPTY : server.registryAccess();
 		GoalCompiler compiler = goalCompiler == null ? new GoalCompiler() : goalCompiler;
-		compiler.translationConstraintFor(draft.originalRequest(), registries).validate(predicate);
+		compiler.supportedTranslationConstraintFor(draft.originalRequest(), registries).validate(predicate);
+		if ((draft.intent() == DraftIntent.TRANSLATE_START || draft.intent() == DraftIntent.TRANSLATE_QUEUE)
+				&& compiler.translationRequiresOperatorConfirmation(draft.originalRequest(), registries)
+				&& !GoalCompiler.requiresConfirmationOnEveryPath(predicate)) {
+			throw new AgentDomainException("GOAL_TRANSLATION_REQUIRES_CONFIRMATION",
+					"This open or subjective task needs operator confirmation before it can be marked complete");
+		}
 	}
 
 	public GoalPredicate normalizeGoalDraftTranslation(PendingGoalDraft draft, GoalPredicate predicate) {
@@ -610,7 +631,7 @@ public final class CodexAgentManager {
 		Objects.requireNonNull(requestSink, "requestSink must not be null");
 		GoalCompilation compilation = compileGoalResult(prompt, sourceLevel);
 		return GoalSubmissionFlow.route(
-				compilation,
+				GoalCompiler.withAdvisoryPlan(compilation),
 				spec -> switch (operation) {
 					case START -> savedData.registry().start(record.agentId(), spec, System.currentTimeMillis());
 					case QUEUE -> savedData.registry().queue(record.agentId(), spec, System.currentTimeMillis());
@@ -630,7 +651,7 @@ public final class CodexAgentManager {
 	) {
 		UUID requester = PendingGoalDraft.requesterId(requestingPlayerId);
 		List<String> candidateIds = goalCompiler.candidateIdsFor(prompt, server.registryAccess(), liveAdvancementTitles());
-		var constraint = goalCompiler.translationConstraintFor(prompt, server.registryAccess());
+		var constraint = goalCompiler.supportedTranslationConstraintFor(prompt, server.registryAccess());
 		constraint.requireCatalog(candidateIds);
 		return new PendingGoalDraft(
 				UUID.randomUUID(), record.agentId(), requester, prompt,

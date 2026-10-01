@@ -46,6 +46,7 @@ public final class GoalCompilerVerification {
 		int assertions = 0;
 		assertions += verifyExactItemAndAmbiguity();
 		assertions += verifyGenericWoodGoal();
+		assertions += verifyGenericBlockGoal();
 		assertions += verifyInventoryCapacity();
 		assertions += verifyExactPositionEntityAndAdvancement();
 		assertions += verifyManagerSubmissionFlow();
@@ -134,6 +135,19 @@ public final class GoalCompilerVerification {
 		assertEquals(GoalCompilation.Kind.NEEDS_TRANSLATION, make.kind(),
 				"make wording cannot be reduced to already-held inventory");
 		return 22;
+	}
+
+	private static int verifyGenericBlockGoal() {
+		GoalCompiler compiler = new GoalCompiler();
+		GoalCompilation any = compiler.compile("Get one block", RegistryAccess.EMPTY, 1_200L);
+		assertEquals(GoalCompilation.Kind.ACCEPTED, any.kind(), "generic block request starts immediately");
+		assertEquals(new GoalPredicate.InventoryContainsBlock(1), any.acceptedSpec().orElseThrow().completion(),
+				"generic block lets the agent choose any placeable block");
+		assertEquals(new GoalPredicate.InventoryContainsBlock(10), compiler.compile("Get 10 blocks", RegistryAccess.EMPTY, 1_200L)
+				.acceptedSpec().orElseThrow().completion(), "generic block quantity is retained");
+		assertEquals(GoalCompilation.Kind.REJECTED, compiler.compile("Get 99999 blocks", RegistryAccess.EMPTY, 1_200L).kind(),
+				"unrepresentable block quantities are rejected");
+		return 4;
 	}
 
 	private static int verifyGenericWoodGoal() {
@@ -316,6 +330,17 @@ public final class GoalCompilerVerification {
 		assertSucceeds(
 				() -> dragonConstraint.validate(new GoalPredicate.EntityKilledByAgent("minecraft:ender_dragon", true)),
 				"the server constraint accepts the inferred Ender Dragon terminal result");
+		assertSucceeds(() -> compiler.translationConstraintFor("Beat the game", RegistryAccess.EMPTY)
+				.validate(new GoalPredicate.EntityKilledByAgent("minecraft:ender_dragon", true)),
+				"Luna's advisory plan cannot weaken the direct beat-game dragon completion fact");
+		assertEquals(true, compiler.translationRequiresOperatorConfirmation("Explore this mountain", RegistryAccess.EMPTY),
+				"open requests need an operator to confirm completion");
+		assertEquals(true, GoalCompiler.requiresConfirmationOnEveryPath(new GoalPredicate.AllOf(List.of(
+				new GoalPredicate.OperatorConfirmed(), new GoalPredicate.SurviveDuration(20)))),
+				"operator confirmation may accompany factual progress");
+		assertEquals(false, GoalCompiler.requiresConfirmationOnEveryPath(new GoalPredicate.AnyOf(List.of(
+				new GoalPredicate.OperatorConfirmed(), new GoalPredicate.SurviveDuration(20)))),
+				"an unconfirmed alternative cannot bypass the operator boundary");
 		assertEquals(
 				new GoalPredicate.EntityKilledByAgent("minecraft:ender_dragon", true),
 				compiler.normalizeTranslatedPredicate(
@@ -456,7 +481,7 @@ public final class GoalCompilerVerification {
 				compiler.candidateIdsFor("Earn the Stone Age advancement", RegistryAccess.EMPTY, manyLiveAdvancements).size(),
 				"natural advancement candidates remain bounded"
 		);
-		return 35;
+		return 39;
 	}
 
 	private static int verifyCompoundItemsAndKills() {

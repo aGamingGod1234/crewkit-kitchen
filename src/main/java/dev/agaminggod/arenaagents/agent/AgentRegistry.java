@@ -284,8 +284,16 @@ public final class AgentRegistry {
 		return apply(AgentLifecycleReducer.start(require(id), spec, nowEpochMs));
 	}
 
+	public synchronized AgentTransition start(AgentId id, GoalSpec spec, String advisoryRoute, long nowEpochMs) {
+		return apply(AgentLifecycleReducer.start(require(id), spec, advisoryRoute, nowEpochMs));
+	}
+
 	public synchronized AgentTransition replace(AgentId id, GoalSpec spec, long nowEpochMs) {
 		return apply(AgentLifecycleReducer.replace(require(id), spec, nowEpochMs));
+	}
+
+	public synchronized AgentTransition replace(AgentId id, GoalSpec spec, String advisoryRoute, long nowEpochMs) {
+		return apply(AgentLifecycleReducer.replace(require(id), spec, advisoryRoute, nowEpochMs));
 	}
 
 	/** Commits a prepared start only after its publication barrier succeeds. */
@@ -317,6 +325,10 @@ public final class AgentRegistry {
 
 	public synchronized AgentTransition queue(AgentId id, GoalSpec spec, long nowEpochMs) {
 		return apply(AgentLifecycleReducer.queue(require(id), spec, queueLimit, nowEpochMs));
+	}
+
+	public synchronized AgentTransition queue(AgentId id, GoalSpec spec, String advisoryRoute, long nowEpochMs) {
+		return apply(AgentLifecycleReducer.queue(require(id), spec, advisoryRoute, queueLimit, nowEpochMs));
 	}
 
 	public synchronized AgentTransition stop(AgentId id, long nowEpochMs) {

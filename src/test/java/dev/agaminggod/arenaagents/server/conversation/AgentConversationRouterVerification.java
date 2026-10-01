@@ -105,6 +105,14 @@ public final class AgentConversationRouterVerification {
 	}
 
 	private static int verifySpeechGoalCompilationRouting() {
+		GoalCompilation dragon = new GoalCompiler().compile("Beat the game", RegistryAccess.EMPTY, 1_200L);
+		assertEquals(GoalCompilation.Kind.NEEDS_TRANSLATION,
+				GoalCompiler.withAdvisoryPlan(dragon).kind(),
+				"dragon goal requests Luna's advisory subgoals before activation");
+		assertEquals(GoalCompilation.Kind.ACCEPTED,
+				GoalCompiler.withAdvisoryPlan(
+						new GoalCompiler().compile("Get dirt", RegistryAccess.EMPTY, 1_200L)).kind(),
+				"easy factual goals keep the direct fast path");
 		String rejectionMessage = "That advancement ID does not exist on this server.";
 		GoalCompilation rejected = new GoalCompiler().compile(
 				"Earn advancement mod:removed", RegistryAccess.EMPTY, 1_200L, ignored -> false
@@ -138,7 +146,7 @@ public final class AgentConversationRouterVerification {
 		);
 		assertEquals(false, translation.publish(), "translation speech is consumed while its draft is staged");
 		assertEquals(1, translationDrafts.get(), "only NEEDS_TRANSLATION stages one coordinator draft");
-		return 11;
+		return 13;
 	}
 
 	private static int verifyDirectDeliveryAndOperatorMirror() {

@@ -128,17 +128,22 @@ export class AgentPlanner {
 		if (record === null || record === undefined) throw codedError('UNKNOWN_AGENT', `Agent '${agentId}' is not registered`);
 		const checkedRequest = parseGoalSpecRequest(request);
 		const translatorId = goalSpecTranslatorId(agentId, checkedRequest.requestId);
+		// Goal translation is an auxiliary advisory session. The registered agent
+		// keeps its own provider, model, context, and sole control of game actions.
+		const translatorProfile = {
+			...record, agentId: translatorId, provider: 'codex', model: 'gpt-6-luna',
+			reasoningEffort: 'medium', serviceTier: 'fast',
+		};
 		const translator = new GoalSpecTranslator({
 			generate: ({ prompt, schema }) => this.#scheduler.schedule(translatorId, async ({ signal }) => {
 				const queuedAt = this.#now();
-				const profile = { ...record, agentId: translatorId };
 				let agent = null;
 				try {
-					agent = await this.#providerAttempt(record, {
+					agent = await this.#providerAttempt(translatorProfile, {
 						operation: 'goal_spec_create', attempt: 1, queueWaitMs: 0, retry: false, traceId: checkedRequest.requestId,
-					}, () => this.#codexService.createAgent(profile, { recoverySummary: null, controlProtocol: 'goal_spec' }));
+					}, () => this.#codexService.createAgent(translatorProfile, { recoverySummary: null, controlProtocol: 'goal_spec' }));
 					await agent.setGoalRevision(0);
-					return await this.#providerAttempt(record, {
+					return await this.#providerAttempt(translatorProfile, {
 						operation: 'goal_spec', attempt: 1, queueWaitMs: elapsed(queuedAt, this.#now()), retry: false, traceId: checkedRequest.requestId,
 					}, () => agent.decide(prompt, {
 						goalRevision: 0,
@@ -153,7 +158,7 @@ export class AgentPlanner {
 				} finally {
 					try { await this.#codexService.removeAgent(translatorId); } catch { /* transient cleanup is best effort */ }
 				}
-			}, { lane: record.provider, priority: 'ordinary', capacityClass: 'auxiliary' }),
+			}, { lane: 'codex', priority: 'ordinary', capacityClass: 'auxiliary' }),
 		});
 		return translator.translate(checkedRequest, { correctiveFeedback });
 	}

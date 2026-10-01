@@ -175,6 +175,11 @@ public final class GoalCompiler {
 				return GoalCompilation.rejected("The requested item count is outside the supported range.");
 			}
 			if (count <= 0) return GoalCompilation.rejected("The requested item count must be positive.");
+			if (isGenericBlockTarget(item.group(3))) {
+				GoalPredicate predicate = new GoalPredicate.InventoryContainsBlock(count);
+				if (GoalInventoryCapacity.exceeds(predicate, registries)) return unrepresentableItemCount();
+				return accepted(original, predicate, createdAtTick, "Goal set: obtain any placeable block x" + count + ".");
+			}
 			if (isGenericWoodTarget(item.group(3))) {
 				List<String> woodItems = woodItemIds(registries);
 				if (woodItems.isEmpty()) return GoalCompilation.rejected("No wood items are registered on this server.");
@@ -283,7 +288,7 @@ public final class GoalCompiler {
 		if (!budget.valid()) {
 			throw new AgentDomainException("GOAL_TRANSLATION_CONSTRAINT_MISMATCH", budget.rejection());
 		}
-		if (BEAT_GAME_TRANSLATION.matcher(command).matches() && !BEAT_GAME.matcher(command).matches()) {
+		if (BEAT_GAME_TRANSLATION.matcher(command).matches()) {
 			return new GoalTranslationConstraint(
 					List.of(new GoalTranslationConstraint.KillClause(List.of(
 							new GoalTranslationConstraint.KillAlternative(List.of("minecraft:ender_dragon"), 1)
@@ -318,12 +323,63 @@ public final class GoalCompiler {
 				: new GoalTranslationConstraint(killClauses, itemClauses);
 	}
 
+	/** Expensive dragon goals get an advisory plan before the objective kill goal starts. */
+	public static GoalCompilation withAdvisoryPlan(GoalCompilation compilation) {
+		Objects.requireNonNull(compilation, "compilation must not be null");
+		if (compilation.acceptedSpec().isPresent()
+				&& compilation.acceptedSpec().orElseThrow().completion()
+						instanceof GoalPredicate.EntityKilledByAgent kill
+				&& kill.entityType().equals("minecraft:ender_dragon")) {
+			return GoalCompilation.needsTranslation("Preparing advisory subgoals for the dragon goal.");
+		}
+		return compilation;
+	}
+
+	/** Unknown registry nouns may still start as open tasks, but require human completion evidence. */
+	public GoalTranslationConstraint supportedTranslationConstraintFor(String request, RegistryAccess registries) {
+		try {
+			return translationConstraintFor(request, registries);
+		} catch (AgentDomainException exception) {
+			if (!isUnsupportedTranslationCatalog(exception)) throw exception;
+			return GoalTranslationConstraint.none();
+		}
+	}
+
+	public boolean translationRequiresOperatorConfirmation(String request, RegistryAccess registries) {
+		String command = normalizedCommand(request);
+		if (SUBJECTIVE.matcher(command).find() || BLOCK.matcher(command).matches()) return true;
+		Matcher item = ITEM.matcher(command);
+		if (item.matches() && isCraftingVerb(item.group(1))) return true;
+		try {
+			translationConstraintFor(request, registries);
+		} catch (AgentDomainException exception) {
+			if (!isUnsupportedTranslationCatalog(exception)) throw exception;
+			return true;
+		}
+		return candidateIdsFor(request, registries).isEmpty()
+				&& !SURVIVE.matcher(command).matches();
+	}
+
+	public static boolean requiresConfirmationOnEveryPath(GoalPredicate predicate) {
+		return switch (predicate) {
+			case GoalPredicate.OperatorConfirmed ignored -> true;
+			case GoalPredicate.AllOf all -> all.predicates().stream().anyMatch(GoalCompiler::requiresConfirmationOnEveryPath);
+			case GoalPredicate.AnyOf any -> any.predicates().stream().allMatch(GoalCompiler::requiresConfirmationOnEveryPath);
+			default -> false;
+		};
+	}
+
+	private static boolean isUnsupportedTranslationCatalog(AgentDomainException exception) {
+		return exception.code().equals("GOAL_TRANSLATION_CANDIDATES_UNAVAILABLE")
+				|| exception.code().equals("GOAL_TRANSLATION_CATALOG_TOO_BROAD");
+	}
+
 	/** Removes redundant subjective confirmation from Minecraft's objective beat-the-game terminal result. */
 	public GoalPredicate normalizeTranslatedPredicate(String request, GoalPredicate predicate) {
 		Objects.requireNonNull(predicate, "predicate must not be null");
 		String command = stripTrailingPunctuation(stripPoliteness(
 				AgentValidators.normalizePrompt(request).toLowerCase(Locale.ROOT)));
-		if (!BEAT_GAME_TRANSLATION.matcher(command).matches() || BEAT_GAME.matcher(command).matches()) return predicate;
+		if (!BEAT_GAME_TRANSLATION.matcher(command).matches()) return predicate;
 		GoalPredicate normalized = withoutOperatorConfirmation(predicate);
 		return normalized == null ? predicate : normalized;
 	}
@@ -844,6 +900,13 @@ public final class GoalCompiler {
 	private static boolean isGenericWoodTarget(String target) {
 		return switch (normalizedTarget(target).toLowerCase(Locale.ROOT)) {
 			case "wood", "block of wood", "blocks of wood", "wood block", "wood blocks" -> true;
+			default -> false;
+		};
+	}
+
+	private static boolean isGenericBlockTarget(String target) {
+		return switch (normalizedTarget(target).toLowerCase(Locale.ROOT)) {
+			case "block", "blocks" -> true;
 			default -> false;
 		};
 	}

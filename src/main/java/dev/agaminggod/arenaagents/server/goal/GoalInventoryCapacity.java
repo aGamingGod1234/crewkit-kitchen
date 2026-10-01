@@ -35,6 +35,10 @@ public final class GoalInventoryCapacity {
 	public static boolean exceeds(GoalPredicate predicate, RegistryAccess registries) {
 		Objects.requireNonNull(predicate, "predicate must not be null");
 		Objects.requireNonNull(registries, "registries must not be null");
+		if (predicate instanceof GoalPredicate.InventoryContainsBlock block) {
+			// A block item stacks to at most 64; include the offhand as an optimistic extra slot.
+			return (long) block.count() > ((long) Inventory.INVENTORY_SIZE + 1L) * 64L;
+		}
 		List<Requirements> alternatives = requirementAlternatives(predicate);
 		Map<String, ItemCapacity> capacities = resolveCapacities(alternatives, registries);
 		return alternatives.stream().noneMatch(requirements -> possiblyFits(requirements, capacities));

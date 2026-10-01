@@ -1169,7 +1169,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			boolean duplicate = draft.proposedPredicate().isPresent();
 			PendingGoalDraft updated = manager.updateGoalDraftProposal(requestId, agentId, predicate);
 			ServerPlayer player = manager.server() == null ? null : manager.server().getPlayerList().getPlayer(updated.requestingPlayerId());
-			Optional<CodexAgentManager.GoalDraftResult> activatedResult = manager.activateTranslatedManagerDraft(updated);
+			Optional<CodexAgentManager.GoalDraftResult> activatedResult = manager.activateTranslatedManagerDraft(updated, summary);
 			if (activatedResult.isPresent()) {
 				recordActivatedGoalSpecRequest(requestId, agentId, decodedPredicate);
 				if (player != null) {
@@ -2843,8 +2843,11 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		if (goal.steeringInstructions().isEmpty()) {
 			return goal.prompt();
 		}
-		String steering = "\n\nSteering instruction: "
-				+ goal.steeringInstructions().get(goal.steeringInstructions().size() - 1);
+		String first = goal.steeringInstructions().getFirst();
+		String latest = goal.steeringInstructions().getLast();
+		String advisory = first.startsWith("Suggested subgoals from Luna (") ? "\n\n" + first : "";
+		String steering = advisory + (latest.equals(first) && !advisory.isEmpty()
+				? "" : "\n\nSteering instruction: " + latest);
 		if (steering.length() >= AgentConstants.MAX_PROMPT_LENGTH) {
 			return steering.substring(steering.length() - AgentConstants.MAX_PROMPT_LENGTH);
 		}
