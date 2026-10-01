@@ -155,7 +155,20 @@ public final class GoalCompilerVerification {
 				"Luna cannot add a manual completion gate to a factual tool set");
 		assertEquals(true, GoalCompiler.looksLikeGoalRequest("nice, can you get some iron tools now?"),
 				"the reported next-task request is recognized through its conversational prefix");
-		return 5;
+		String exactSpeech = "hey, can you go and get stone tools and pickaxe and and axe";
+		assertEquals(tools, compiler.compile(exactSpeech, RegistryAccess.EMPTY, 1_200L).acceptedSpec().orElseThrow().completion(),
+				"the exact spoken request keeps the shared stone material and both tools despite a repeated conjunction");
+		assertEquals(false, compiler.translationRequiresOperatorConfirmation(exactSpeech, RegistryAccess.EMPTY),
+				"speech disfluency does not turn an inventory goal into manual confirmation");
+		assertEquals(List.of("minecraft:stone_axe", "minecraft:stone_pickaxe"), compiler.candidateIdsFor(exactSpeech, RegistryAccess.EMPTY),
+				"the noisy spoken request offers only the two requested stone tools");
+		expectCode("GOAL_TRANSLATION_CONSTRAINT_MISMATCH", () -> compiler.translationConstraintFor(exactSpeech, RegistryAccess.EMPTY)
+				.validate(new GoalPredicate.InventoryContains("minecraft:stone_pickaxe", 1)),
+				"the axe requirement cannot disappear from noisy spoken goal translation");
+		assertEquals(GoalCompilation.Kind.NEEDS_TRANSLATION,
+				compiler.compile("Get stone tools and a pickaxe and an iron axe", RegistryAccess.EMPTY, 1_200L).kind(),
+				"a different material in the list is not silently replaced with stone");
+		return 10;
 	}
 
 	private static int verifyGenericBlockGoal() {

@@ -2214,7 +2214,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 							}
 						}
 				);
-				if (transition.cancelAction()) actionExecutor.cancel(event.agentId(), "Task changed by direct player request");
+				if (transition.cancelAction()) actionExecutor.cancel(event.agentId(), "Task changed by player request");
 				registryPublicationRevision.incrementAndGet();
 				actionExecutor.actionSuccessLedger().retainRevision(event.agentId(), transition.after().goalRevision());
 				programActions.beginGoal(event.agentId(), transition.after().goalRevision());

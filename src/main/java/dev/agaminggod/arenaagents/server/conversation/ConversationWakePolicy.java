@@ -26,10 +26,15 @@ public final class ConversationWakePolicy {
 		};
 	}
 
-	/** A direct instruction from an operator can change the task without a separate goal-panel visit. */
+	public static boolean isPlayerGoalChannel(ConversationKind kind, ConversationAudience audience) {
+		return kind == ConversationKind.PLAYER_MESSAGE && audience == ConversationAudience.DIRECT
+				|| kind == ConversationKind.PROXIMITY_SPEECH && audience == ConversationAudience.PROXIMITY;
+	}
+
+	/** An operator's typed or spoken instruction can change the task without a goal-panel visit. */
 	public static boolean mayReplaceGoalFromSpeech(AgentLifecycleState state, ConversationKind kind,
 			ConversationAudience audience, boolean operator) {
-		return operator && kind == ConversationKind.PLAYER_MESSAGE && audience == ConversationAudience.DIRECT
+		return operator && isPlayerGoalChannel(kind, audience)
 				&& (state.isActive() || state == AgentLifecycleState.PAUSED);
 	}
 

@@ -316,7 +316,7 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 		}
 		ServerPlayer requester = manager.server().getPlayerList().getPlayer(requestingPlayerId(event));
 		boolean operator = requester != null && GoalControl.mayControl(requester.createCommandSourceStack());
-		if (operator && event.audience() == ConversationAudience.DIRECT
+		if (operator && ConversationWakePolicy.isPlayerGoalChannel(event.kind(), event.audience())
 				&& ConversationWakePolicy.isCompletionConfirmation(event.text())
 				&& dev.agaminggod.arenaagents.server.CodexAgentServerRuntime.confirmCurrentGoalFromSpeech(manager.server(), target.agentId())) {
 			notifyRequester(requester.getUUID(), "Confirmed. Minecraft will finish this goal after checking its requirements.");

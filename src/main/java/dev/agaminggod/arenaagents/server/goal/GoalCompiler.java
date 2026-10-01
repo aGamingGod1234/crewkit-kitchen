@@ -55,7 +55,7 @@ public final class GoalCompiler {
 	private static final Pattern ITEM = Pattern.compile("^(get|obtain|collect|bring|gather|acquire|fetch|craft|make) (?:me )?(?:(?:at least )?(" + COUNT + ") )?(?:(?:a|an|some) )?(.+?)(?: for me)?$");
 	private static final Pattern ITEM_ALTERNATIVE_COUNT = Pattern.compile("^(?:at least\\s+)?(" + COUNT + ")\\s+(.+)$");
 	private static final Pattern ITEM_BLOCK_OF = Pattern.compile("^blocks? of (.+)$");
-	private static final Pattern NAMED_TOOL_SET = Pattern.compile("^([a-z]+) tools?\\s*[:,]\\s*(.+)$");
+	private static final Pattern NAMED_TOOL_SET = Pattern.compile("^([a-z]+) tools?\\s*(?:[:,]|\\band\\b)\\s*(.+)$");
 	private static final Pattern REFERENCED_ITEM_CLAUSE = Pattern.compile("^(?:keep|retain|hold|carry)\\s+(?:it|them|these|those)(?:\\s.*)?$");
 	private static final Pattern BLOCK = Pattern.compile("^(build|construct|place|put|set|mine|break|destroy) (?:with |using |from )?(?:(?:a|an|some|the) )?(.+?)(?: for me)?$");
 	private static final Pattern BLOCK_LOCATION_SUFFIX = Pattern.compile(
@@ -269,7 +269,7 @@ public final class GoalCompiler {
 
 	/**
 	 * Speech changes the goal when the agent is idle or the caller has authorized replacement.
-	 * The live router grants replacement to direct task requests from an operator.
+	 * The live router grants replacement to typed or spoken task requests from an operator.
 	 */
 	public static boolean consumePlayerSpeechAsGoal(boolean hasActiveGoal, String text, boolean replaceOrQueueOptIn) {
 		if (replaceOrQueueOptIn) return looksLikeGoalRequest(text) || isLiveSteeringRequest(text);
@@ -885,7 +885,8 @@ public final class GoalCompiler {
 	private static List<String> namedToolSetItems(String target, RegistryAccess registries) {
 		Matcher set = NAMED_TOOL_SET.matcher(target);
 		if (!set.matches()) return List.of();
-		List<String> names = List.of(set.group(2).split("\\s*(?:,\\s*(?:and\\s+)?|\\s+and\\s+)\\s*", -1));
+		// Speech may omit the list's comma and repeat a conjunction while naming tools.
+		List<String> names = List.of(set.group(2).split("\\s*(?:,\\s*(?:and\\s+)?|\\s+(?:and\\s+)+)\\s*", -1));
 		if (names.size() > MAX_COMPOUND_LEAVES) return List.of();
 		ArrayList<String> tools = new ArrayList<>();
 		for (String name : names) {
@@ -1105,7 +1106,9 @@ public final class GoalCompiler {
 
 	private static String stripPoliteness(String request) {
 		String result = request;
-		for (String prefix : List.of("hey, ", "hey ", "nice, ", "okay, ", "ok, ", "alright, ", "please ", "can you ", "could you ", "would you ", "go ahead and ", "go and ")) {
+		for (String prefix : List.of("hey, ", "hey ", "nice, ", "okay, ", "ok, ", "alright, ", "please ", "can you ", "could you ", "would you ",
+				"i want you to ", "i need you to ", "i'd like you to ", "i’d like you to ",
+				"your goal is to ", "your task is to ", "your objective is to ", "go ahead and ", "go and ")) {
 			if (result.startsWith(prefix)) {
 				result = result.substring(prefix.length()).strip();
 				return stripPoliteness(result);
