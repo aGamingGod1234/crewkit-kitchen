@@ -123,13 +123,21 @@ export class MinecraftAgentWorkspace {
 			}
 			return;
 		}
-		// An older installation has no baseline. Preserve any independently refreshed auth.
-		if (this.#lastSyncedSourceAuthHash === undefined) return this.#rememberSourceAuthHash(sourceHash);
 		if (sourceContent == null) {
-			if (isolatedHash === this.#lastSyncedSourceAuthHash) await this.fs.rm(destination, { force: true });
+			if (this.#lastSyncedSourceAuthHash !== undefined && isolatedHash === this.#lastSyncedSourceAuthHash) await this.fs.rm(destination, { force: true });
 			await this.#rememberSourceAuthHash(null);
 			return;
 		}
+		// Both homes may refresh the same login independently. Prefer the more recent
+		// refresh even when the source file itself has not changed since the last sync.
+		if (hasNewerSourceAuth(sourceContent, isolatedContent)) {
+			await this.#replaceContent(sourceContent, destination, 0o600);
+			await this.#rememberSourceAuthHash(sourceHash);
+			return;
+		}
+		// With no baseline, keep independently refreshed auth unless the source is
+		// demonstrably newer for the same account.
+		if (this.#lastSyncedSourceAuthHash === undefined) return this.#rememberSourceAuthHash(sourceHash);
 		if (sourceHash === this.#lastSyncedSourceAuthHash) return;
 		if (isolatedHash === this.#lastSyncedSourceAuthHash) {
 			await this.#replaceContent(sourceContent, destination, 0o600);
@@ -181,4 +189,20 @@ export class MinecraftAgentWorkspace {
 
 function authHash(content) {
 	return content === null ? null : createHash('sha256').update(content).digest('hex');
+}
+
+function hasNewerSourceAuth(sourceContent, isolatedContent) {
+	try {
+		const source = JSON.parse(sourceContent);
+		const isolated = JSON.parse(isolatedContent);
+		const sourceAccount = source?.tokens?.account_id;
+		const isolatedAccount = isolated?.tokens?.account_id;
+		if (typeof sourceAccount !== 'string' || !sourceAccount || sourceAccount !== isolatedAccount
+			|| source?.auth_mode !== isolated?.auth_mode) return false;
+		const sourceRefresh = Date.parse(source.last_refresh);
+		const isolatedRefresh = Date.parse(isolated.last_refresh);
+		return Number.isFinite(sourceRefresh) && Number.isFinite(isolatedRefresh) && sourceRefresh > isolatedRefresh;
+	} catch {
+		return false;
+	}
 }

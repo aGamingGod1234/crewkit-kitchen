@@ -200,6 +200,42 @@ test('re-syncs Codex auth when isolated credentials are missing or source rotate
 	);
 });
 
+test('uses a newer refresh of the same Codex login without replacing newer or different-account auth', async (t) => {
+	const root = await mkdtemp(path.join(os.tmpdir(), 'minecraft-agent-codex-auth-refresh-'));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const sourceCodexHome = path.join(root, 'source');
+	const templateRoot = path.join(root, 'templates');
+	await mkdir(path.join(templateRoot, '.codex', 'skills', 'minecraft-control'), { recursive: true });
+	await mkdir(sourceCodexHome, { recursive: true });
+	await writeFile(path.join(templateRoot, 'AGENTS.md'), '# Minecraft instructions\n');
+	await writeFile(path.join(templateRoot, '.codex', 'skills', 'minecraft-control', 'SKILL.md'), '# Minecraft skill\n');
+	const auth = (accountId, lastRefresh) => `${JSON.stringify({
+		auth_mode: 'chatgpt', last_refresh: lastRefresh, tokens: { account_id: accountId, access_token: 'fixture' },
+	})}\n`;
+	const sourceAuth = path.join(sourceCodexHome, 'auth.json');
+	const sourceContent = auth('same-account', '2026-09-25T00:00:00Z');
+	await writeFile(sourceAuth, sourceContent);
+	const workspace = new MinecraftAgentWorkspace({ root: path.join(root, 'runtime'), templateRoot }, { sourceCodexHome });
+	const prepared = await workspace.prepare();
+	const isolatedAuth = path.join(prepared.codexHome, 'auth.json');
+	await writeFile(isolatedAuth, auth('same-account', '2026-09-05T00:00:00Z'));
+	await workspace.prepare();
+	assert.equal(await readFile(isolatedAuth, 'utf8'), sourceContent, 'unchanged source beats stale isolated refresh');
+	await writeFile(isolatedAuth, auth('same-account', '2026-09-05T00:00:00Z'));
+	await rm(path.join(root, 'runtime', '.auth-source.sha256'));
+	await new MinecraftAgentWorkspace({ root: path.join(root, 'runtime'), templateRoot }, { sourceCodexHome }).prepare();
+	assert.equal(await readFile(isolatedAuth, 'utf8'), sourceContent, 'legacy install with no baseline also recovers stale auth');
+
+	const newerIsolated = auth('same-account', '2026-09-26T00:00:00Z');
+	await writeFile(isolatedAuth, newerIsolated);
+	await workspace.prepare();
+	assert.equal(await readFile(isolatedAuth, 'utf8'), newerIsolated, 'newer isolated refresh remains usable');
+
+	await writeFile(sourceAuth, auth('other-account', '2026-09-27T00:00:00Z'));
+	await workspace.prepare();
+	assert.equal(await readFile(isolatedAuth, 'utf8'), newerIsolated, 'another account cannot replace independent auth');
+});
+
 test('uses the platform Codex home for auth when CODEX_HOME is unset', async (t) => {
 	const root = await mkdtemp(path.join(os.tmpdir(), 'minecraft-agent-default-codex-home-'));
 	t.after(() => rm(root, { recursive: true, force: true }));
