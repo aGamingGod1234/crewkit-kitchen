@@ -155,6 +155,20 @@ test('Codex still rejects a genuinely different service tier', async () => {
 	await service.stop();
 });
 
+test('Codex rejects a reported Fast tier when Priority was requested', async () => {
+	const transport = new FakeSharedTransport();
+	const request = transport.request.bind(transport);
+	transport.request = async (method, params, options) => {
+		const result = await request(method, params, options);
+		return method === 'thread/start' ? { ...result, model: params.model, serviceTier: 'fast' } : result;
+	};
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	try {
+		await assert.rejects(service.createAgent({ ...profile('reverse-alias'), serviceTier: 'priority' }),
+			(error) => error.code === 'PROVIDER_SETTINGS_MISMATCH');
+	} finally { await service.stop(); }
+});
+
 test('Codex rejects a confirmed different model before installing a session', async () => {
 	const transport = new FakeSharedTransport();
 	const request = transport.request.bind(transport);

@@ -259,8 +259,13 @@ export class ArenaScriptEngine {
 		// This opt-in guard also protects installation at already unsafe facts.
 		// Legacy watchers retain their rising-edge registration semantics.
 		if (initialGuard !== null && ['command', 'query', 'idle'].includes(first.kind)) {
-			if (first.kind !== 'idle') this.#vm.abortPendingCommand(first.stateToken);
-			this.#handleYield(this.#vm.runWatcherHandler(initialGuard.watcherId, this.#facts), watcherExecution(initialGuard));
+			if (first.kind === 'idle') this.#handleYield(this.#vm.runWatcherHandler(initialGuard.watcherId, this.#facts), watcherExecution(initialGuard));
+			else {
+				// This work has never been dispatched. Hold its exact yield and VM
+				// continuation until the agent chooses to continue after its defense.
+				this.#deferredBase = Object.freeze({ undispatched: first });
+				this.#handleYield(this.#vm.runWatcherHandlerBeforeResume(initialGuard.watcherId, this.#facts), watcherExecution(initialGuard));
+			}
 		} else this.#handleYield(first, 'step');
 		return this.snapshot();
 	}
@@ -488,7 +493,10 @@ export class ArenaScriptEngine {
 		if (yielded.kind === 'idle' && this.#deferredBase) {
 			if (this.#boundary.length > 0) return this.#runBoundary();
 			const deferred = this.#deferredBase; this.#deferredBase = null;
-			this.#handleYield(this.#vm.resumeDeferredCommand(deferred.result, this.#facts), 'step');
+			if (deferred.undispatched) {
+				this.#vm.restoreDeferredCommand(this.#facts);
+				this.#handleYield(deferred.undispatched, 'step');
+			} else this.#handleYield(this.#vm.resumeDeferredCommand(deferred.result, this.#facts), 'step');
 			return;
 		}
 		if (yielded.kind === 'idle' && source === 'step') {

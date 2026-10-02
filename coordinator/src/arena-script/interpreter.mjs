@@ -158,6 +158,23 @@ export class ArenaScriptInterpreter {
 		return this.resume(result, facts);
 	}
 
+	/** Restores an undispatched command without inventing a receipt for it. */
+	restoreDeferredCommand(facts) {
+		if (this.#deferredCommand === null) throw executionError('NOT_WAITING', 'ArenaScript NOT_WAITING: no deferred command is available');
+		if (this.#waiting !== null || this.#awaitingWatcherDecision) throw executionError('NOT_IDLE', 'ArenaScript NOT_IDLE: the authored handler and decision must finish before restoring a command');
+		const normalizedFacts = freezeFacts(facts);
+		const deferred = this.#deferredCommand;
+		this.#deferredCommand = null;
+		this.#frames = deferred.frames;
+		this.#values = deferred.values;
+		this.#waiting = deferred.waiting;
+		this.#context.facts = normalizedFacts;
+		this.#terminal = false;
+		this.#watcherExecution = false;
+		this.#yield = null;
+		this.#beginSlice();
+	}
+
 	discardDeferredCommand() { this.#deferredCommand = null; }
 
 	evaluateWatcher(watcherId, facts) {

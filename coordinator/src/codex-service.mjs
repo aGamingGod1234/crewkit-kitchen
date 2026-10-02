@@ -1200,8 +1200,7 @@ function exactLaunchProfileCatalog(profile) {
 }
 
 function sameCodexServiceTier(reported, requested) {
-	return reported === requested || (reported === 'priority' && requested === 'fast')
-		|| (reported === 'fast' && requested === 'priority');
+	return reported === requested || (reported === 'priority' && requested === 'fast');
 }
 
 function assertReconciliationActive(signal) {

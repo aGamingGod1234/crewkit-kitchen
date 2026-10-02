@@ -30,7 +30,46 @@ public final class GoalInventoryCapacityVerification {
 			bind(originals, Items.IRON_HELMET, 1, EquipmentSlot.HEAD);
 			bind(originals, Items.DIAMOND_HELMET, 1, EquipmentSlot.HEAD);
 			bind(originals, Items.IRON_BOOTS, 1, EquipmentSlot.FEET);
+			bind(originals, Items.CARVED_PUMPKIN, 64, EquipmentSlot.HEAD);
 			int assertions = 0;
+			assertions += assertCapacity(true, new GoalPredicate.AllOf(List.of(
+					new GoalPredicate.InventoryContainsBlock(Integer.MAX_VALUE), new GoalPredicate.OperatorConfirmed())),
+					"nested generic block requirements reject their own capacity overflow");
+			assertions += assertCapacity(true, new GoalPredicate.AnyOf(List.of(
+					new GoalPredicate.InventoryContainsBlock(Integer.MAX_VALUE - 1), new GoalPredicate.InventoryContainsBlock(Integer.MAX_VALUE))),
+					"any-of rejects when every generic block alternative exceeds capacity");
+			assertions += assertCapacity(false, new GoalPredicate.AnyOf(List.of(
+					new GoalPredicate.InventoryContainsBlock(Integer.MAX_VALUE), new GoalPredicate.InventoryContains("minecraft:apple", 1))),
+					"one feasible non-block alternative survives an impossible generic block branch");
+			assertions += assertCapacity(false, new GoalPredicate.AllOf(List.of(
+					new GoalPredicate.InventoryContainsBlock(2_368), new GoalPredicate.InventoryContains("minecraft:dirt", 2_368))),
+					"generic and fixed block predicates may reuse the same factual block inventory");
+			assertions += assertCapacity(false, new GoalPredicate.AllOf(List.of(
+					new GoalPredicate.InventoryContainsBlock(2_368), category(2_368, "apple", "dirt"))),
+					"generic blocks overlap a category that can use block items");
+			assertions += assertCapacity(false, new GoalPredicate.AllOf(List.of(
+					new GoalPredicate.InventoryContainsBlock(2_368), new GoalPredicate.InventoryContainsBlock(2_368))),
+					"repeated generic block facts reuse inventory instead of adding their counts");
+			assertions += assertCapacity(true, new GoalPredicate.AllOf(List.of(
+					new GoalPredicate.InventoryContainsBlock(2), new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 37))),
+					"generic blocks share finite carrying space with a full unstackable inventory");
+			assertions += assertCapacity(false, new GoalPredicate.AllOf(List.of(
+					new GoalPredicate.InventoryContainsBlock(1), new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 36))),
+					"generic blocks can use the single offhand beside thirty-six unstackable items");
+			assertions += assertCapacity(true, new GoalPredicate.AllOf(List.of(
+					new GoalPredicate.InventoryContainsBlock(2_368), new GoalPredicate.InventoryContains("minecraft:apple", 1))),
+					"disjoint block and item groups cannot each claim a separate offhand");
+			assertions += assertCapacity(true, new GoalPredicate.AllOf(List.of(
+					new GoalPredicate.InventoryContainsBlock(2), category(37, "iron_pickaxe", "diamond_pickaxe"))),
+					"generic blocks share the single offhand with disjoint inventory categories");
+			assertions += assertCapacity(false, new GoalPredicate.InventoryContainsBlock(2_369),
+					"generic blocks include an actual wearable block in the head slot");
+			assertions += assertCapacity(false, new GoalPredicate.AllOf(List.of(
+					new GoalPredicate.InventoryContainsBlock(1), new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 37))),
+					"a wearable generic block can coexist with a full ordinary inventory");
+			assertions += assertCapacity(false, new GoalPredicate.AllOf(List.of(
+					new GoalPredicate.InventoryContainsBlock(2_305), new GoalPredicate.InventoryContains("minecraft:apple", 1))),
+					"worn block capacity stays available when another item occupies the offhand");
 			assertions += assertCapacity(false, category(37, "iron_pickaxe"), "one-member categories preserve unstackable capacity");
 			assertions += assertCapacity(true, category(38, "iron_pickaxe"), "one-member categories reject capacity overflow");
 			assertions += assertCapacity(false, category(2_368, "iron_pickaxe", "apple"), "a category may use its stackable member for the summed count");

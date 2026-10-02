@@ -7,6 +7,7 @@ import { LiveTaskViews, validateTaskPlan } from '../src/live-task-view.mjs';
 import { normalizeMinecraftToolCall } from '../src/native-minecraft-tools.mjs';
 import { NativeToolRuntime } from '../src/native-tool-runtime.mjs';
 import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
+import { goalSpecFingerprint, parseGoalSpec } from '../src/goal-spec.mjs';
 
 const record={agentId:'agent-a',currentGoal:'Defeat the dragon',goalRevision:1,provider:'codex',model:'gpt-6.1-sol',reasoningEffort:'medium'};
 const evidence={itemIds:[],count:1,dimension:null,x:null,y:null,z:null,blockId:null};
@@ -164,4 +165,32 @@ test('observation dates persist even when the known structure stays complete',as
  const views=new LiveTaskViews({directory});await views.observe(record,observation());await views.operate(record,{operation:'replace',plan:plan()});
  const newer=observation();newer.observedAtEpochMs=5000;await views.observe(record,newer);await views.flush();
  const restarted=new LiveTaskViews({directory});const far=observation();far.blocks=[];await restarted.observe(record,far);assert.equal(restarted.snapshot(record).lastObserved.portal,5000);await restarted.flush();
+});
+
+test('steering retains the immutable task plan and persisted scope despite changed planner text',async t=>{
+ const directory=await mkdtemp(path.join(os.tmpdir(),'arena-plan-steer-'));t.after(()=>rm(directory,{recursive:true,force:true}));
+ const fields={originalRequest:record.currentGoal,predicate:{type:'operator_confirmed'},createdAtTick:1};
+ const goalSpec=parseGoalSpec({...fields,fingerprint:goalSpecFingerprint(fields)});
+ const original={...record,currentGoalSpec:goalSpec};
+ const views=new LiveTaskViews({directory});await views.observe(original,observation());await views.operate(original,{operation:'replace',plan:plan()});
+ views.event(original,'live_tool','Existing route and work');await views.flush();
+ const steered={...original,goalRevision:2,currentGoal:record.currentGoal+'\nLatest steering: use the existing portal.'};views.begin(steered,{fresh:false});
+ assert.equal(views.snapshot(steered).goal,record.currentGoal);
+ assert.deepEqual(views.snapshot(steered).plan.steps.map(s=>s.status),['complete','complete','complete']);
+ assert.equal(views.snapshot(steered).events[0].message,'Existing route and work');
+ const far=observation([]);far.blocks=[];await views.observe(steered,far);await views.flush();
+ const restarted=new LiveTaskViews({directory});await restarted.observe(steered,far);
+ assert.deepEqual(restarted.snapshot(steered).plan.steps.map(s=>s.status),['lost','complete','complete']);await restarted.flush();
+ const replacementFields={...fields,createdAtTick:2};
+ const replacement={...steered,goalRevision:3,currentGoalSpec:parseGoalSpec({...replacementFields,fingerprint:goalSpecFingerprint(replacementFields)})};
+ assert.equal(views.snapshot(replacement).plan,null,'a distinct immutable goal never inherits the in-memory plan');
+});
+
+test('explicit steering preserves a legacy task while a fresh replacement still resets it',async()=>{
+ const views=new LiveTaskViews();await views.observe(record,observation());await views.operate(record,{operation:'replace',plan:plan()});
+ views.event(record,'live_tool','Existing legacy task');
+ const steered={...record,goalRevision:2,currentGoal:record.currentGoal+'\nLatest steering: take a safer route.'};views.begin(steered,{fresh:false});
+ assert.equal(views.snapshot(steered).plan.steps[1].status,'complete');
+ assert.equal(views.snapshot(steered).events[0].message,'Existing legacy task');
+ views.begin({...steered,goalRevision:3},{fresh:true});assert.equal(views.snapshot({...steered,goalRevision:3}).plan,null);
 });

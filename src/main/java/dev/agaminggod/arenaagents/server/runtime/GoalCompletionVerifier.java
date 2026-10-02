@@ -68,6 +68,23 @@ public final class GoalCompletionVerifier {
 			);
 			if (recovered.isPresent()) evaluation = new Evaluation(true, recovered.orElseThrow());
 		}
+		if (!evaluation.satisfied() && !operatorConfirmed
+				&& evaluatedLeaves.values().stream().anyMatch(leaf -> leaf.facts().getFirst().type().equals("operator_confirmed"))) {
+			// Readiness is a counterfactual branch search, not completion. Reuse this check's live
+			// facts and kill allocations so alternate branches cannot advance time or reuse a kill.
+			Map<PredicateKey, Evaluation> confirmationLeaves = new HashMap<>(evaluatedLeaves);
+			confirmationLeaves.entrySet().removeIf(entry -> entry.getValue().facts().getFirst().type().equals("operator_confirmed"));
+			Optional<List<GoalEvidence.Fact>> confirmationReady = satisfyWithBacktracking(
+					goal.goalId(), goal.spec().completion(), "root", facts, kills,
+					record, serverTick, true, new KillAllocation(), confirmationLeaves, ignored -> Optional.of(List.of()));
+			if (confirmationReady.isPresent()) {
+				List<GoalEvidence.Fact> actualFacts = confirmationReady.orElseThrow().stream()
+						.map(fact -> fact.type().equals("operator_confirmed")
+								? new GoalEvidence.Fact(fact.type(), false, fact.expectedValue(), "not confirmed") : fact)
+						.toList();
+				evaluation = new Evaluation(false, actualFacts);
+			}
+		}
 		return new VerificationResult(
 				evaluation.satisfied(), record.goalRevision(),
 				evaluation.satisfied() ? "COMPLETION_VERIFIED" : "PREDICATE_FAILED",

@@ -65,9 +65,9 @@ export class LiveTaskViews {
  }
  suggest(agentId, goal, plan) { const checked=validateTaskPlan(plan); for(const step of checked.steps) step.status='pending'; this.#advice.set(`${agentId}:${goal}`, checked); }
  #state(record) {
-  const goal = record.currentGoal ?? '';
+  const identity = taskIdentity(record);
   let state = this.#states.get(record.agentId);
-  if (!state || goal && state.goal !== goal) {
+  if (!state || identity !== null && state.taskIdentity !== identity) {
    state = this.#newState(record);
    this.#states.set(record.agentId, state);
   }
@@ -76,7 +76,8 @@ export class LiveTaskViews {
   return state;
  }
  #newState(record, fresh = false) {
-  return { goal: record.currentGoal ?? '', goalRevision: record.goalRevision, plan: null, revision: 0, events: [], sequence: 0, usage: null, usageSample: null, allowance: null, worldId: null, observation: null, scope: null, loading: null, lastObserved: {}, verified: false, fresh };
+  // Steering changes the planner prompt, not the immutable task or its saved scope.
+  return { taskIdentity: taskIdentity(record), goal: record.currentGoalSpec?.originalRequest ?? record.currentGoal ?? '', goalRevision: record.goalRevision, plan: null, revision: 0, events: [], sequence: 0, usage: null, usageSample: null, allowance: null, worldId: null, observation: null, scope: null, loading: null, lastObserved: {}, verified: false, fresh };
  }
  async #load(record, state) {
   if (!state.worldId) return;
@@ -185,9 +186,19 @@ export class LiveTaskViews {
     this.#save(state); state.scope = null;
    }
   }
-  else this.#state(record).verified=false;
+  else {
+   const previous = this.#states.get(record.agentId);
+   // Legacy records lack an immutable spec. Explicit steer/resume retains their
+   // existing task, while start/replace always takes the fresh branch above.
+   if (previous?.taskIdentity?.startsWith('prompt:') && !record.currentGoalSpec?.fingerprint) previous.taskIdentity = taskIdentity(record);
+   this.#state(record).verified=false;
+  }
  }
  async flush() { await this.#writes; }
+}
+function taskIdentity(record) {
+ if (record.currentGoalSpec?.fingerprint) return `spec:${record.currentGoalSpec.fingerprint}`;
+ return record.currentGoal ? `prompt:${record.currentGoal}` : null;
 }
 function numericUsage(value) {
  const out = {}; for (const key of ['inputTokens', 'cachedInputTokens', 'outputTokens', 'reasoningOutputTokens', 'totalTokens']) if (Number.isSafeInteger(value?.[key]) && value[key] >= 0) out[key] = value[key];

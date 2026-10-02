@@ -61,6 +61,7 @@ public final class GoalVerificationRuntimeVerification {
 		assertions += verifyQueuedKillActivationBoundary();
 		assertions += verifyRequestedCompletionLifecycle();
 		assertions += verifySpokenCompletionConfirmation();
+		assertions += verifyAlternativeCompletionConfirmation();
 		assertions += verifyActionCompletionPrecedesFactualCompletion();
 		return assertions;
 	}
@@ -1009,6 +1010,81 @@ public final class GoalVerificationRuntimeVerification {
 		assertEquals(1, fixture.runtime.tick().size(), "confirmation finishes exactly once through server verification");
 		assertEquals(false, fixture.runtime.confirmFromSpeech(fixture.agentId), "a repeated yes does not confirm another task");
 		return 6;
+	}
+
+	private static int verifyAlternativeCompletionConfirmation() {
+		GoalPredicate alternative = new GoalPredicate.AnyOf(List.of(
+				new GoalPredicate.AllOf(List.of(new GoalPredicate.InventoryContains("minecraft:apple", 1),
+						new GoalPredicate.OperatorConfirmed())),
+				new GoalPredicate.InventoryContains("minecraft:dirt", 1)));
+		Fixture fixture = fixture(alternative, 860L);
+		fixture.facts.items.put("minecraft:apple", 1);
+		AgentRecord active = fixture.record();
+		var waiting = fixture.runtime.evaluateRequest(fixture.agentId, active.goalRevision(),
+				active.currentGoal().orElseThrow().spec().fingerprint());
+		assertEquals(true, waiting.awaitingOperatorConfirmation(),
+				"one factual any-of branch may wait for confirmation despite an unrelated failed alternative");
+		assertEquals(false, waiting.verified(), "confirmation-ready evidence never claims factual completion");
+		assertEquals(List.of("inventory_contains", "operator_confirmed"),
+				waiting.facts().stream().map(fact -> fact.type()).toList(),
+				"confirmation-ready evidence selects the feasible branch");
+		assertEquals(false, waiting.facts().getLast().satisfied(),
+				"selected branch retains the genuinely unconfirmed operator fact");
+		assertEquals(2, fixture.facts.inventoryReads,
+				"confirmation readiness reuses this verification's exact live inventory facts");
+		fixture.facts.items.clear();
+		assertEquals(false, fixture.runtime.confirmFromSpeech(fixture.agentId),
+				"alternative speech confirmation rechecks lost factual possessions");
+		fixture.facts.items.put("minecraft:apple", 1);
+		assertEquals(true, fixture.runtime.confirmFromSpeech(fixture.agentId),
+				"a short spoken reply confirms the ready alternative goal");
+		assertEquals(1, fixture.runtime.tick().size(), "alternative confirmation completes through authoritative verification");
+		assertEquals(false, fixture.runtime.confirmFromSpeech(fixture.agentId),
+				"alternative completion does not leave a reusable speech confirmation request");
+
+		Fixture unfinished = fixture(alternative, 861L);
+		assertEquals(false, unfinished.runtime.evaluate(unfinished.agentId).awaitingOperatorConfirmation(),
+				"an any-of without a factually complete branch cannot wait for confirmation");
+
+		GoalPredicate allocated = new GoalPredicate.AllOf(List.of(
+				new GoalPredicate.AnyOf(List.of(
+						new GoalPredicate.AllOf(List.of(new GoalPredicate.EntityKilledByAgent("minecraft:zombie", true),
+								new GoalPredicate.OperatorConfirmed())),
+						new GoalPredicate.AllOf(List.of(new GoalPredicate.EntityKilledByAgent("minecraft:skeleton", true),
+								new GoalPredicate.OperatorConfirmed())))),
+				new GoalPredicate.EntityKilledByAgent("minecraft:zombie", true)));
+		Fixture kills = fixture(allocated, 862L);
+		kills.runtime.recordKill(kills.agentId, "minecraft:zombie");
+		kills.runtime.recordKill(kills.agentId, "minecraft:skeleton");
+		var killWaiting = kills.runtime.evaluate(kills.agentId);
+		assertEquals(true, killWaiting.awaitingOperatorConfirmation(),
+				"confirmation readiness backtracks to preserve a kill for an enclosing repeated requirement");
+		assertEquals("minecraft:skeleton x1", killWaiting.facts().getFirst().expectedValue(),
+				"confirmation evidence uses the globally feasible kill alternative");
+		assertEquals("minecraft:zombie x1", killWaiting.facts().getLast().expectedValue(),
+				"confirmation evidence includes the enclosing allocated kill");
+		Fixture insufficient = fixture(allocated, 863L);
+		insufficient.runtime.recordKill(insufficient.agentId, "minecraft:zombie");
+		AgentRecord insufficientActive = insufficient.record();
+		var insufficientResult = insufficient.runtime.evaluateRequest(insufficient.agentId, insufficientActive.goalRevision(),
+				insufficientActive.currentGoal().orElseThrow().spec().fingerprint());
+		assertEquals(false, insufficientResult.awaitingOperatorConfirmation(),
+				"a locally ready kill alternative cannot reuse one event across a conjunction");
+		assertEquals(false, insufficient.runtime.confirmFromSpeech(insufficient.agentId),
+				"insufficient global kill evidence cannot register speech confirmation");
+
+		GoalPredicate stable = new GoalPredicate.AnyOf(List.of(
+				new GoalPredicate.AllOf(List.of(new GoalPredicate.SurviveDuration(2), new GoalPredicate.OperatorConfirmed())),
+				new GoalPredicate.InventoryContains("minecraft:dirt", 1)));
+		Fixture survival = fixture(stable, 864L);
+		assertEquals(false, survival.runtime.evaluate(survival.agentId).awaitingOperatorConfirmation(),
+				"counterfactual readiness cannot advance survival observations in its first tick");
+		assertEquals(false, survival.runtime.evaluate(survival.agentId).awaitingOperatorConfirmation(),
+				"repeated readiness checks in one tick cannot fake survival progress");
+		survival.advance();
+		assertEquals(true, survival.runtime.evaluate(survival.agentId).awaitingOperatorConfirmation(),
+				"the survival alternative waits for confirmation after real server ticks elapse");
+		return 18;
 	}
 
 	private static Fixture fixture(GoalPredicate predicate, long createdAtTick) {

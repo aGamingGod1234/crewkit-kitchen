@@ -39,6 +39,114 @@ test('an already true reconsider interrupt guard runs its authored defense befor
 	assert.equal(run.dispatched[0].provenance.source, 'watcher:watcher-0'); assert.deepEqual(run.cancelled, []);
 });
 
+function initialDefenseSource(body) {
+	return `program.onUnhandledAttention("continue_and_notify");
+	program.watch(() => player.state().health < 19, {mode:"interrupt", after:"reconsider"}, async () => {
+		await player.wait(9);
+	}); ${body}`;
+}
+
+function finishInitialDefense(run) {
+	run.engine.ingestObservation({ observation: observation(), eventSequence: 2 });
+	run.engine.ingestActionResult({ actionId: run.dispatched[0].actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 2 });
+	assert.equal(run.engine.snapshot().status, 'SUSPENDED');
+	assert.equal(run.modelRequests.at(-1).trigger, 'defensive_handler_completed');
+}
+
+test('initial defense holds the undispatched command and its real result until an explicit continue, exactly once', () => {
+	const run = engineFor(initialDefenseSource('const receipt = await tryResult(player.wait(1000)); await player.wait(receipt.succeeded ? 2000 : 3000);'),
+		{ initialObservation: observation({ player: { health: 17 } }) });
+	assert.deepEqual(run.dispatched.map(command => command.action.arguments), [9]);
+	finishInitialDefense(run);
+	run.engine.ingestObservation({ observation: observation(), eventSequence: 3 });
+	assert.equal(run.dispatched.length, 1, 'safe facts alone cannot authorize the body');
+	const directive = { ...run.engine.refreshDirectiveRequest(), directive: 'continue' };
+	run.engine.applyDirective(directive);
+	assert.deepEqual(run.dispatched.map(command => command.action.arguments), [9, 1000]);
+	assert.equal(run.dispatched[1].provenance.source, 'step');
+	assert.equal(run.dispatched[1].provenance.watcherId, null);
+	assert.equal(run.dispatched[1].provenance.executionFactsSequence, 3);
+	run.engine.applyDirective(directive);
+	assert.equal(run.dispatched.length, 2, 'duplicate continue must not replay the held command');
+	run.engine.ingestActionResult({ actionId: run.dispatched[1].actionId, state: 'FAILED', reasonCode: 'BODY_FAILED', eventSequence: 3 });
+	assert.equal(run.dispatched[2].action.arguments, 3000, 'body consumes its own factual receipt, not the successful defense receipt');
+	run.engine.ingestActionResult({ actionId: run.dispatched[1].actionId, state: 'FAILED', reasonCode: 'BODY_FAILED', eventSequence: 3 });
+	assert.equal(run.dispatched.length, 3);
+});
+
+test('initial defense holds the undispatched inspection and uses its real result after explicit continue, exactly once', () => {
+	const queries = [];
+	const run = engineFor(initialDefenseSource('const page = await world.inspect({section:"inventory",offset:0,limit:16}); await player.wait(page.entries.length);'),
+		{ initialObservation: observation({ player: { health: 17 } }), inspect: query => queries.push(query) });
+	assert.equal(queries.length, 0, 'the body query must not run before the authored defense');
+	finishInitialDefense(run);
+	const directive = { ...run.engine.refreshDirectiveRequest(), directive: 'continue' };
+	run.engine.applyDirective(directive);
+	assert.equal(queries.length, 1);
+	assert.equal(run.dispatched.length, 1, 'inspection must not fabricate a physical body action');
+	assert.equal(queries[0].authorship.sourceStepId.startsWith('step-'), true);
+	run.engine.applyDirective(directive);
+	assert.equal(queries.length, 1);
+	const result = { queryId: queries[0].queryId, value: { state: 'SUCCEEDED', reasonCode: 'INSPECTED', entries: [1, 2, 3] } };
+	run.engine.ingestQueryResult(result);
+	assert.equal(run.dispatched[1].action.arguments, 3);
+	assert.equal(run.dispatched[1].provenance.source, 'step');
+	run.engine.ingestQueryResult(result);
+	assert.equal(run.dispatched.length, 2);
+});
+
+test('initial idle defense asks the agent before ordinary exhaustion and never invents body work', () => {
+	const run = engineFor(initialDefenseSource(''), { initialObservation: observation({ player: { health: 17 } }) });
+	finishInitialDefense(run);
+	const directive = { ...run.engine.refreshDirectiveRequest(), directive: 'continue' };
+	run.engine.applyDirective(directive);
+	assert.deepEqual(run.dispatched.map(command => command.action.arguments), [9]);
+	assert.equal(run.modelRequests.at(-1).trigger, 'program_exhausted');
+	const count = run.modelRequests.length;
+	run.engine.applyDirective(directive);
+	assert.equal(run.modelRequests.length, count);
+});
+
+test('an initial defensive inspection cannot consume or replace the held body inspection', () => {
+	const queries = [];
+	const run = engineFor(`program.onUnhandledAttention("continue_and_notify");
+		program.watch(() => player.state().health < 19, {mode:"interrupt",after:"reconsider"}, async () => {
+			const page = await world.inspect({section:"inventory",offset:0,limit:16}); await player.wait(page.entries.length);
+		}); const bodyPage = await world.inspect({section:"inventory",offset:16,limit:16}); await player.wait(bodyPage.entries.length);`,
+		{ initialObservation: observation({player:{health:17}}), inspect: query => queries.push(query) });
+	assert.equal(queries.length, 1); assert.equal(queries[0].query.offset, 0); assert.equal(run.dispatched.length, 0);
+	run.engine.ingestQueryResult({queryId:queries[0].queryId,value:{state:'SUCCEEDED',reasonCode:'INSPECTED',entries:[1,2]}});
+	assert.equal(run.dispatched[0].action.arguments, 2); assert.equal(run.dispatched[0].provenance.source, 'watcher:watcher-0');
+	finishInitialDefense(run);
+	assert.equal(queries.length, 1);
+	run.engine.applyDirective({...run.engine.refreshDirectiveRequest(),directive:'continue'});
+	assert.equal(queries.length, 2); assert.equal(queries[1].query.offset, 16);
+	run.engine.ingestQueryResult({queryId:queries[0].queryId,value:{state:'SUCCEEDED',reasonCode:'INSPECTED',entries:[]}});
+	assert.equal(run.dispatched.length, 1, 'late defense inspection cannot settle the body inspection');
+	run.engine.ingestQueryResult({queryId:queries[1].queryId,value:{state:'SUCCEEDED',reasonCode:'INSPECTED',entries:[1,2,3,4]}});
+	assert.equal(run.dispatched[1].action.arguments, 4); assert.equal(run.dispatched[1].provenance.source, 'step');
+});
+
+test('initial held commands and queries stay fenced after pause, finish or replacement decisions', () => {
+	for (const body of ['await player.wait(1000);', 'await world.inspect({section:"inventory",offset:0,limit:16}); await player.wait(1000);']) {
+		for (const choice of ['pause', 'finish', 'replace']) {
+			const queries = [];
+			const run = engineFor(initialDefenseSource(body), { initialObservation: observation({ player: { health: 17 } }), inspect: query => queries.push(query) });
+			finishInitialDefense(run);
+			const request = run.engine.refreshDirectiveRequest();
+			const directive = { ...request, directive: choice };
+			if (choice === 'replace') directive.install = { programId: 'next-program', version: 2,
+				compiled: parseArenaScript('program.onUnhandledAttention("continue_and_notify"); await player.wait(4);') };
+			run.engine.applyDirective(directive);
+			run.engine.applyDirective({ ...request, directive: 'continue' });
+			run.engine.ingestObservation({ observation: observation(), eventSequence: 3 });
+			assert.equal(queries.length, 0, choice);
+			assert.deepEqual(run.dispatched.map(command => command.action.arguments), choice === 'replace' ? [9, 4] : [9], choice);
+			assert.deepEqual(run.cancelled, [], 'undispatched work requires no Minecraft cancellation');
+		}
+	}
+});
+
 test('ordinary conversations preserve work; an explicit survival continue policy remains the agents choice', () => {
 	const run = engineFor('program.onUnhandledAttention("continue_and_notify", {survival:"continue_and_notify"}); await player.wait(1000);');
 	run.engine.ingestObservation({ observation: observation(), eventSequence: 2, attention: true, trigger: 'conversation' });
