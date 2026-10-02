@@ -2,6 +2,7 @@ import { ArenaScriptInterpreter, freezeQueryResult } from './interpreter.mjs';
 import { changedInterpreterFactDomains, createInterpreterFacts } from './facts.mjs';
 import { ALL_FACT_DOMAINS } from './fact-domains.mjs';
 import { SCRIPT_BINDINGS } from './minecraft-api.mjs';
+import { validateProgramParameters } from '../program-parameters.mjs';
 
 const ORDINARY_PRIORITY = 'ordinary';
 const URGENT_PRIORITY = 'urgent';
@@ -233,11 +234,11 @@ export class ArenaScriptEngine {
 		const latestSequence = Math.max(this.#eventSequence, target.eventSequence);
 		this.#clear(false);
 		this.#generation += 1;
-		this.#program = freezeRecord({ agentId: target.agentId, provider: target.provider, modelIdentity: target.modelIdentity, reasoningEffort: target.reasoningEffort, serviceTier: target.serviceTier, traceId: target.traceId, goalRevision: target.goalRevision, programId: target.programId, version: target.version, compiled: target.compiled, eventSequence: target.eventSequence, factsSequence: target.factsSequence });
+		this.#program = freezeRecord({ agentId: target.agentId, provider: target.provider, modelIdentity: target.modelIdentity, reasoningEffort: target.reasoningEffort, serviceTier: target.serviceTier, traceId: target.traceId, goalRevision: target.goalRevision, programId: target.programId, version: target.version, compiled: target.compiled, parameters: target.parameters, eventSequence: target.eventSequence, factsSequence: target.factsSequence });
 		this.#facts = latestFacts;
 		this.#factsSequence = latestFactsSequence;
 		this.#eventSequence = latestSequence;
-		this.#vm = new ArenaScriptInterpreter(target.compiled, SCRIPT_BINDINGS);
+		this.#vm = new ArenaScriptInterpreter(target.compiled, SCRIPT_BINDINGS, { parameters: target.parameters });
 		this.#watcherMetadata = watcherMetadata(target.compiled);
 		this.#status = 'ACTIVE';
 		this.#handleYield(this.#vm.start(this.#facts), 'step');
@@ -479,16 +480,16 @@ function normalizeInstall(input, previousFacts = null) {
 	for (const [field, value] of [['agentId', agentId], ['provider', input.provider ?? 'unknown-provider'], ['modelIdentity', modelIdentity], ['reasoningEffort', input.reasoningEffort ?? 'unknown-reasoning'], ['serviceTier', input.serviceTier ?? 'unknown-tier'], ['traceId', input.traceId ?? defaultTraceId(agentId, goalRevision, input.version)], ['programId', input.programId]]) if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError(`ArenaScriptEngine ${field} must be a nonempty string`);
 	for (const [field, value] of [['goalRevision', goalRevision], ['version', input.version], ['eventSequence', input.eventSequence]]) if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`ArenaScriptEngine ${field} must be a nonnegative safe integer`);
 	const facts = createInterpreterFacts(input.observation, previousFacts);
-	return freezeRecord({ agentId: agentId.trim(), provider: (input.provider ?? 'unknown-provider').trim(), goalRevision, modelIdentity: modelIdentity.trim(), reasoningEffort: (input.reasoningEffort ?? 'unknown-reasoning').trim(), serviceTier: (input.serviceTier ?? 'unknown-tier').trim(), traceId: normalizeTraceId(input.traceId ?? defaultTraceId(agentId, goalRevision, input.version)), programId: input.programId.trim(), version: input.version, compiled: input.compiled, facts, factsSequence: input.eventSequence, eventSequence: input.eventSequence });
+	return freezeRecord({ agentId: agentId.trim(), provider: (input.provider ?? 'unknown-provider').trim(), goalRevision, modelIdentity: modelIdentity.trim(), reasoningEffort: (input.reasoningEffort ?? 'unknown-reasoning').trim(), serviceTier: (input.serviceTier ?? 'unknown-tier').trim(), traceId: normalizeTraceId(input.traceId ?? defaultTraceId(agentId, goalRevision, input.version)), programId: input.programId.trim(), version: input.version, compiled: input.compiled, parameters: validateProgramParameters(input.parameters), facts, factsSequence: input.eventSequence, eventSequence: input.eventSequence });
 }
 function normalizeDirectiveReplacement(input, current, requestedTraceId = undefined) {
 	if (!current || !input || typeof input !== 'object') throw new TypeError('ArenaScriptEngine replacement requires an active authenticated program');
-	for (const field of ['agentId', 'goalRevision', 'modelIdentity', 'observation', 'eventSequence']) if (Object.hasOwn(input, field)) throw new TypeError(`ArenaScriptEngine directive install may not supply ${field}`);
+	for (const field of ['agentId', 'goalRevision', 'modelIdentity', 'observation', 'eventSequence', 'parameters']) if (Object.hasOwn(input, field)) throw new TypeError(`ArenaScriptEngine directive install may not supply ${field}`);
 	if (!input.compiled?.ast || !Object.isFrozen(input.compiled)) throw new TypeError('ArenaScriptEngine requires a frozen compiled program');
 	for (const [field, value] of [['programId', input.programId]]) if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError(`ArenaScriptEngine ${field} must be a nonempty string`);
 	if (!Number.isSafeInteger(input.version) || input.version < 0) throw new TypeError('ArenaScriptEngine version must be a nonnegative safe integer');
 	const traceId = requestedTraceId === undefined ? current.traceId : normalizeTraceId(requestedTraceId);
-	return freezeRecord({ agentId: current.agentId, provider: current.provider, goalRevision: current.goalRevision, modelIdentity: current.modelIdentity, reasoningEffort: current.reasoningEffort, serviceTier: current.serviceTier, traceId, programId: input.programId.trim(), version: input.version, compiled: input.compiled });
+	return freezeRecord({ agentId: current.agentId, provider: current.provider, goalRevision: current.goalRevision, modelIdentity: current.modelIdentity, reasoningEffort: current.reasoningEffort, serviceTier: current.serviceTier, traceId, programId: input.programId.trim(), version: input.version, compiled: input.compiled, parameters: current.parameters });
 }
 function isNewer(next, current) { return next.goalRevision > current.goalRevision || (next.goalRevision === current.goalRevision && next.version > current.version); }
 function installationRelation(next, current) {
@@ -497,7 +498,7 @@ function installationRelation(next, current) {
 	if (!sameImmutableProgram(next, current)) return -1;
 	return next.eventSequence > current.eventSequence ? 0 : -1;
 }
-function sameImmutableProgram(next, current) { return next.agentId === current.agentId && next.modelIdentity === current.modelIdentity && next.programId === current.programId && next.compiled === current.compiled && next.compiled.source === current.compiled.source; }
+function sameImmutableProgram(next, current) { return next.agentId === current.agentId && next.modelIdentity === current.modelIdentity && next.programId === current.programId && next.compiled === current.compiled && next.compiled.source === current.compiled.source && JSON.stringify(next.parameters) === JSON.stringify(current.parameters); }
 function defaultTraceId(agentId, goalRevision, version) { return `trace-${String(agentId).replace(/[^A-Za-z0-9._:-]/g, '_')}-${goalRevision}-${version}`.slice(0, 128); }
 function normalizeTraceId(value) {
 	if (typeof value !== 'string' || value.trim().length === 0 || Buffer.byteLength(value, 'utf8') > 128 || [...value].some((character) => /[\u0000-\u001f\u007f]/u.test(character))) throw new TypeError('ArenaScriptEngine traceId must be a bounded string');

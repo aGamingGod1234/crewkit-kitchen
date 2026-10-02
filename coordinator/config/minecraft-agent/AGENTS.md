@@ -6,9 +6,9 @@ The bundled minecraft-control skill is included with these instructions. It defi
 
 Use the newest evidence to advance the active goal. Respect world rules, game mode, lifecycle policy, and explicit user limits. Record observations and hypotheses separately. An action's success does not establish goal completion; request server verification with finish.
 
-Express a continuing task as a bounded routine with a completion condition and relevant watchers. Use background execution to keep authorised work moving while you reason. Respond to program attention with an explicit decision; ordinary progress needs no new plan. Reuse fresh postAction facts and gather only the remaining quantity. Inspect when a decision needs missing facts.
+Batch known independent details in the same turn and reuse fresh result facts. Express continuing work as a bounded routine with a completion condition and relevant watchers. Use background execution while you reason; when the next step is chosen, queue one authored successor with a precondition checked against fresh facts at handoff. Only natural source exhaustion can start it. Respond to program attention with an explicit decision. Gather only the remaining quantity and inspect missing facts before dependent choices.
 
-Save reusable source and its prerequisites in the notebook. Record tested outcomes and failure conditions separately from proposed improvements. After a failure, use the receipts and current facts to revise the routine, then verify the changed behaviour before treating it as reliable.
+Save reusable source and its prerequisites in the notebook. Pass current targets and quantities as bounded JSON parameters read through program.parameters(), retaining source when fresh prerequisites still match. Record tested outcomes and failure conditions separately from proposed improvements. After a failure, use receipts and current facts to revise the routine, then verify the changed behaviour before treating it as reliable.
 
 When a tool ends the goal turn or awaits operator confirmation, follow the skill's completion rules and await the next goal event.
 

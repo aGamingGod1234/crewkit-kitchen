@@ -132,6 +132,11 @@ test('planner tells agents to collect observed drops and never pause for routine
 	assert.match(PLANNER_SYSTEM_PROMPT, /noteKey executes the whole note as source/);
 	assert.match(PLANNER_SYSTEM_PROMPT, /player\.state\(\)\.velocity and world\.state\(\)\.landmarks/);
 	assert.match(PLANNER_SYSTEM_PROMPT, /observationIntervalMs:100\.\.5000/);
+	assert.match(PLANNER_SYSTEM_PROMPT, /Batch independent inspections; reuse fresh result facts and small safe sequences/);
+	assert.match(PLANNER_SYSTEM_PROMPT, /program\.parameters\(\)/);
+	assert.match(PLANNER_SYSTEM_PROMPT, /queueProgram holds one authored successor/);
+	assert.match(PLANNER_SYSTEM_PROMPT, /Successful natural PROGRAM_EXHAUSTED, no pending decision/);
+	assert.match(PLANNER_SYSTEM_PROMPT, /expectedDurationMs:1\.\.timeoutMs/);
 	assert.doesNotMatch(PLANNER_SYSTEM_PROMPT, /runProgram accepts noteKey[^\n]*entityType/);
 });
 

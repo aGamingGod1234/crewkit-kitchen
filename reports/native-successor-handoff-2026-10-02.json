@@ -1,0 +1,4071 @@
+{
+  "benchmark": "native-successor-handoff",
+  "result": "PASSED",
+  "measuredAt": "2026-10-02T04:07:24.307Z",
+  "baseline": {
+    "commit": "267f1a3de226a55046a0f97c903f39a7bf5a898c",
+    "files": {
+      "coordinator/src/arena-script/errors.mjs": "b3045f7d335cba9739f93d098db7e8ecc60df785aea1989ad9acc1f89ff6607e",
+      "coordinator/src/arena-script/fact-domains.mjs": "306060ff9b4d562eaadeefd1488997019ed0d00a42a3efcae8274ed9aabb1ca3",
+      "coordinator/src/arena-script/facts.mjs": "52bf1e11efaa14a6d0f8a9d43ff929901d6c9cd2b98c6daa6ef76ba1f298bf02",
+      "coordinator/src/arena-script/interpreter.mjs": "399c7ec87947ac8d02ac5ef766ff6d4572bb2ab2910c71d2b3927b1b9c231343",
+      "coordinator/src/arena-script/limits.mjs": "ee1083941b0ef35a3e3281eb6002df64a2a266a2cb394a0d96110c4044daed8e",
+      "coordinator/src/arena-script/minecraft-api.mjs": "0860e506d40c5a64420c03e0b5f3aa50dfd233b119aaea47da25be29f84bc8be",
+      "coordinator/src/arena-script/parser.mjs": "52483f0a1492597ca4af294683d33922614522a79ae48155e7a525865deae7d3",
+      "coordinator/src/arena-script/program-engine.mjs": "3ca5a2b76b7632926d04792535a6480b228e834dcb662221b7f7469cdb832b74",
+      "coordinator/src/constants.mjs": "9cf96dddbcf2996f4702948a59556caf5c09829bdaf9beaf45b02340c9a05537",
+      "coordinator/src/control-latency-registry.mjs": "4f0b9f8c7d36dde8687384b1eb7762a37e358b9c61919c899a6d3873a6195186",
+      "coordinator/src/explore-frontier.mjs": "9ecaa6be1bf7f29cca9d481c87eba6021062797689390b7fe45d4f3eb88d8436",
+      "coordinator/src/native-minecraft-tools.mjs": "9168fe354e920120efb5af12d84d49ded12126216ad010d247d787425c246ad0",
+      "coordinator/src/native-program-executor.mjs": "d4c877bbb456df15b7c1b780ab211dbd1e40f455257b39805fc5e32822d1e726",
+      "coordinator/src/native-tool-runtime.mjs": "a7c522f4d933ebba2e55552314732a05dc71a8f1ebb655af6abda6305939d4be",
+      "coordinator/src/observation-adapter.mjs": "16ecaf924e00cab7421761428bc341e8de4b08b71d3f45bd2bb9b836444cf41a",
+      "coordinator/src/observed-memory-store.mjs": "49b96f4d4b73c4677edf262b93c5878735beb90ee72968bb9da1a8eae416f0ba",
+      "coordinator/src/prompts.mjs": "194a0d4714d672df4605f854c768665326b1d1249682c5c873e9e8c79f0d8ced",
+      "coordinator/src/provider-session.mjs": "70b594b3a4c1bf5bc09516438979ace1bf3b0a8cf749b46480b90876d1dfaafb",
+      "coordinator/src/recovery-progress-wrap.mjs": "e65ecd8f066c38f1d7835811c0554a209cebbfd9f226843dc9e6618bd197da41",
+      "coordinator/src/schema.mjs": "7aa0caa5486a9a10670d5c926f440b1ae7414cc284ec4cbc5ef02c4ae13515a1",
+      "coordinator/src/two-call-llm-wrap.mjs": "e18840a0161b2f5c0eb7472f04c9654cbaa60ae4d22c92639aaca6f7a12dd725"
+    }
+  },
+  "optimized": {
+    "head": "267f1a3de226a55046a0f97c903f39a7bf5a898c",
+    "files": {
+      "coordinator/src/arena-script/errors.mjs": "bfc98ed5764d6305dfbe67e0fd71b7986f9d1d10ed0a18ee8590603075dcece4",
+      "coordinator/src/arena-script/fact-domains.mjs": "3956b97535b095016da78543ef687cb71fc39721ab4eb906aa5f731f3179099d",
+      "coordinator/src/arena-script/facts.mjs": "0cf3173557ad31f41e9f5f3d75558b679137000e85a0992c779dfec6508612e7",
+      "coordinator/src/arena-script/interpreter.mjs": "c819d1d77ae89d2528436cafa31d1ddd423c0df6c44ee7ae8f69c1186f8bf7ec",
+      "coordinator/src/arena-script/limits.mjs": "41063c2206359ad2b2e8e3347800fd8fb2ef989093b37cccd284198995ff9362",
+      "coordinator/src/arena-script/minecraft-api.mjs": "d71c2b976b2935054357b3142f8f30e58bc3f3cc00355e697bbf1aab625f3205",
+      "coordinator/src/arena-script/parser.mjs": "987da9c8c4f1c3c3f9f84999848eecaf76ece21a8209f950f6db059a67def681",
+      "coordinator/src/arena-script/program-engine.mjs": "19d241366799bb6d459ed0cf9673710d0c0a460829f0fc18286fe5cc240998b4",
+      "coordinator/src/constants.mjs": "9910f6e19052eacef8f69a388b03960e274344667d2c122d39ffefc59d080091",
+      "coordinator/src/control-latency-registry.mjs": "33f60d31a58524f8750e63fc77f30a0786d9dc8b067a28b257f5229cdc605b22",
+      "coordinator/src/explore-frontier.mjs": "5cf554222148e5509338ccec6938a97670ed7f345214f17960bcfd619f570308",
+      "coordinator/src/native-minecraft-tools.mjs": "f167902151e38540dde70229fb03e3b00c6960929d298058f9cd43b7e284512a",
+      "coordinator/src/native-program-executor.mjs": "69c15591e751331473954d4c4fc59bd66519ca34e77755aef118bdac7053d0d9",
+      "coordinator/src/native-tool-runtime.mjs": "104ef4298c0e5b1cd20b1fe393f647210fd1a474b435da75bdf078c7f1ebdcc9",
+      "coordinator/src/observation-adapter.mjs": "4bcdb4808170fcfe876e03c0e2c156993eb4e578ebb9647faa4160fd91c82e15",
+      "coordinator/src/observed-memory-store.mjs": "52c6385a3d5794e4d3a4a22fdc972fa3ffa03c12578304574d4736d340b6da71",
+      "coordinator/src/program-parameters.mjs": "f4791f6bcd12faee425254105da66b171c712eee412450637a908cac1175ab9a",
+      "coordinator/src/program-precondition.mjs": "7ebcd47a28f486c57cb5a7240ff2a65d7138d5cdd723e5c59a0de89d87a7734c",
+      "coordinator/src/prompts.mjs": "c709aecee673c262f68fb1d551e6795038b8603a4e04985a3ef33781f5019208",
+      "coordinator/src/provider-session.mjs": "c0c84d1c82586ff79ff49ce7a1663a555643472e6646d73810b15d53987b03d8",
+      "coordinator/src/recovery-progress-wrap.mjs": "524f43fa6e84d333f36f6f64ab8e4afec51732b3f4d49e53757d5dcc19e0030e",
+      "coordinator/src/schema.mjs": "bd209f191e5e476161b31f001381c2423091a70b655bd5ac9d29de3c2a88b038",
+      "coordinator/src/two-call-llm-wrap.mjs": "c3450fd6f5731f552029681f9d846c49db7cd28e19849441771296e29a9036c4"
+    }
+  },
+  "environment": {
+    "node": "v24.14.0",
+    "platform": "win32",
+    "arch": "x64"
+  },
+  "settings": {
+    "repetitions": 20,
+    "warmups": 2,
+    "modelDelayMs": 100,
+    "predecessorMs": 150,
+    "successorMs": 40,
+    "observationMs": 10
+  },
+  "controller": "timer-controlled fake bridge; real NativeToolRuntime and ArenaScript; no model/provider inference or Minecraft server",
+  "authorship": "Explicit fixture source and guard stand in for selected-model tool output. Decision time is a separately injected assumption.",
+  "sources": {
+    "predecessor": "program.onUnhandledAttention(\"continue_and_notify\"); await player.wait(150);",
+    "successor": "program.onUnhandledAttention(\"continue_and_notify\"); if (player.state().health >= 10) { await player.wait(40); }",
+    "conditional": "program.onUnhandledAttention(\"continue_and_notify\"); await player.wait(150); if (player.state().health >= 10) { await player.wait(40); }",
+    "precondition": "player.state().health >= 10"
+  },
+  "comparisons": {
+    "individual_to_conditional": {
+      "beforeScenario": "individual",
+      "afterScenario": "conditional",
+      "before": {
+        "dispatchGap": {
+          "n": 20,
+          "p50Ms": 126.092,
+          "p95Ms": 127.307,
+          "meanMs": 126.072
+        },
+        "observationBarrier": {
+          "n": 20,
+          "p50Ms": 15.706,
+          "p95Ms": 15.927,
+          "meanMs": 15.621
+        },
+        "modelDelayAfterCompletion": {
+          "n": 20,
+          "p50Ms": 110.007,
+          "p95Ms": 111.116,
+          "meanMs": 109.817
+        },
+        "otherHandoff": {
+          "n": 20,
+          "p50Ms": 0.598,
+          "p95Ms": 0.754,
+          "meanMs": 0.634
+        },
+        "modelDelayMeasured": {
+          "n": 20,
+          "p50Ms": 110.007,
+          "p95Ms": 111.116,
+          "meanMs": 109.817
+        },
+        "duration": {
+          "n": 20,
+          "p50Ms": 346.167,
+          "p95Ms": 347.248,
+          "meanMs": 346.005
+        },
+        "actions": 40,
+        "requestedObservations": 40,
+        "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+        "preparedBeforeCompletion": 0
+      },
+      "after": {
+        "dispatchGap": {
+          "n": 20,
+          "p50Ms": 16.61,
+          "p95Ms": 17.111,
+          "meanMs": 16.576
+        },
+        "observationBarrier": {
+          "n": 20,
+          "p50Ms": 15.474,
+          "p95Ms": 16.114,
+          "meanMs": 15.526
+        },
+        "modelDelayAfterCompletion": {
+          "n": 20,
+          "p50Ms": 0,
+          "p95Ms": 0,
+          "meanMs": 0
+        },
+        "otherHandoff": {
+          "n": 20,
+          "p50Ms": 0.968,
+          "p95Ms": 1.513,
+          "meanMs": 1.05
+        },
+        "modelDelayMeasured": {
+          "n": 20,
+          "p50Ms": 0,
+          "p95Ms": 0,
+          "meanMs": 0
+        },
+        "duration": {
+          "n": 20,
+          "p50Ms": 236.009,
+          "p95Ms": 237.227,
+          "meanMs": 235.759
+        },
+        "actions": 40,
+        "requestedObservations": 40,
+        "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+        "preparedBeforeCompletion": 0
+      },
+      "pairedGapWins": 20,
+      "rows": {
+        "before": [
+          {
+            "durationMs": 346.4146999999998,
+            "dispatchGapMs": 124.95510000000013,
+            "observationWaitMs": 15.913900000000012,
+            "modelDelayAfterCompletionMs": 108.30359999999973,
+            "otherHandoffMs": 0.7376000000003842,
+            "modelDelayMeasuredMs": 108.30359999999973,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 347.24829999999974,
+            "dispatchGapMs": 126.75520000000006,
+            "observationWaitMs": 15.405299999999897,
+            "modelDelayAfterCompletionMs": 110.4409999999998,
+            "otherHandoffMs": 0.908900000000358,
+            "modelDelayMeasuredMs": 110.4409999999998,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 346.82209999999986,
+            "dispatchGapMs": 127.41080000000011,
+            "observationWaitMs": 15.754500000000007,
+            "modelDelayAfterCompletionMs": 110.9019000000003,
+            "otherHandoffMs": 0.754399999999805,
+            "modelDelayMeasuredMs": 110.9019000000003,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 344.5145000000002,
+            "dispatchGapMs": 126.10490000000027,
+            "observationWaitMs": 15.889099999999416,
+            "modelDelayAfterCompletionMs": 109.625,
+            "otherHandoffMs": 0.5908000000008542,
+            "modelDelayMeasuredMs": 109.625,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 345.1107999999995,
+            "dispatchGapMs": 127.21389999999974,
+            "observationWaitMs": 15.888899999999921,
+            "modelDelayAfterCompletionMs": 110.7448000000004,
+            "otherHandoffMs": 0.5801999999994223,
+            "modelDelayMeasuredMs": 110.7448000000004,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 346.3171000000002,
+            "dispatchGapMs": 127.1216000000004,
+            "observationWaitMs": 15.453700000000026,
+            "modelDelayAfterCompletionMs": 111.11580000000049,
+            "otherHandoffMs": 0.5520999999998821,
+            "modelDelayMeasuredMs": 111.11580000000049,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 342.9398000000001,
+            "dispatchGapMs": 123.71330000000034,
+            "observationWaitMs": 15.133899999999812,
+            "modelDelayAfterCompletionMs": 107.91240000000016,
+            "otherHandoffMs": 0.6670000000003711,
+            "modelDelayMeasuredMs": 107.91240000000016,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 345.0785999999998,
+            "dispatchGapMs": 125.84910000000036,
+            "observationWaitMs": 15.117500000000291,
+            "modelDelayAfterCompletionMs": 110.14090000000033,
+            "otherHandoffMs": 0.5906999999997424,
+            "modelDelayMeasuredMs": 110.14090000000033,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 346.5715,
+            "dispatchGapMs": 126.59550000000036,
+            "observationWaitMs": 15.3145999999997,
+            "modelDelayAfterCompletionMs": 110.65779999999995,
+            "otherHandoffMs": 0.6231000000007043,
+            "modelDelayMeasuredMs": 110.65779999999995,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 345,
+            "dispatchGapMs": 125.60000000000036,
+            "observationWaitMs": 15.706299999999828,
+            "modelDelayAfterCompletionMs": 109.24299999999948,
+            "otherHandoffMs": 0.6507000000010521,
+            "modelDelayMeasuredMs": 109.24299999999948,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 345.91859999999906,
+            "dispatchGapMs": 126.49189999999908,
+            "observationWaitMs": 15.886900000001333,
+            "modelDelayAfterCompletionMs": 110.0069999999996,
+            "otherHandoffMs": 0.5979999999981374,
+            "modelDelayMeasuredMs": 110.0069999999996,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 346.53300000000127,
+            "dispatchGapMs": 127.20750000000044,
+            "observationWaitMs": 15.155699999999342,
+            "modelDelayAfterCompletionMs": 111.31970000000001,
+            "otherHandoffMs": 0.7321000000010827,
+            "modelDelayMeasuredMs": 111.31970000000001,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 346.3302999999996,
+            "dispatchGapMs": 126.58120000000054,
+            "observationWaitMs": 15.881799999999203,
+            "modelDelayAfterCompletionMs": 110.11180000000058,
+            "otherHandoffMs": 0.587600000000748,
+            "modelDelayMeasuredMs": 110.11180000000058,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 346.09990000000107,
+            "dispatchGapMs": 124.98499999999876,
+            "observationWaitMs": 15.489299999999275,
+            "modelDelayAfterCompletionMs": 108.86590000000069,
+            "otherHandoffMs": 0.6297999999987951,
+            "modelDelayMeasuredMs": 108.86590000000069,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 346.46769999999924,
+            "dispatchGapMs": 125.45310000000063,
+            "observationWaitMs": 15.999499999999898,
+            "modelDelayAfterCompletionMs": 108.8627000000015,
+            "otherHandoffMs": 0.5908999999992375,
+            "modelDelayMeasuredMs": 108.8627000000015,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 346.16679999999906,
+            "dispatchGapMs": 127.30739999999969,
+            "observationWaitMs": 15.875599999999395,
+            "modelDelayAfterCompletionMs": 110.8081000000002,
+            "otherHandoffMs": 0.623700000000099,
+            "modelDelayMeasuredMs": 110.8081000000002,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 348.6370999999999,
+            "dispatchGapMs": 125.32709999999861,
+            "observationWaitMs": 15.34059999999954,
+            "modelDelayAfterCompletionMs": 109.36779999999999,
+            "otherHandoffMs": 0.6186999999990803,
+            "modelDelayMeasuredMs": 109.36779999999999,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 345.7526999999991,
+            "dispatchGapMs": 125.62409999999909,
+            "observationWaitMs": 15.909299999999348,
+            "modelDelayAfterCompletionMs": 109.16219999999885,
+            "otherHandoffMs": 0.5526000000008935,
+            "modelDelayMeasuredMs": 109.16219999999885,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 345.1190999999999,
+            "dispatchGapMs": 125.04860000000008,
+            "observationWaitMs": 15.926699999999983,
+            "modelDelayAfterCompletionMs": 108.56840000000011,
+            "otherHandoffMs": 0.5534999999999854,
+            "modelDelayMeasuredMs": 108.56840000000011,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 347.0632999999998,
+            "dispatchGapMs": 126.09230000000025,
+            "observationWaitMs": 15.374599999999191,
+            "modelDelayAfterCompletionMs": 110.17380000000048,
+            "otherHandoffMs": 0.5439000000005763,
+            "modelDelayMeasuredMs": 110.17380000000048,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          }
+        ],
+        "after": [
+          {
+            "durationMs": 233.0706,
+            "dispatchGapMs": 16.506500000000415,
+            "observationWaitMs": 15.292100000000119,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 1.2144000000002961,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 236.2792999999997,
+            "dispatchGapMs": 17.997800000000097,
+            "observationWaitMs": 16.347699999999804,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 1.6501000000002932,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 237.22680000000037,
+            "dispatchGapMs": 16.750600000000304,
+            "observationWaitMs": 15.23739999999998,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 1.5132000000003245,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 234.41579999999976,
+            "dispatchGapMs": 16.79950000000008,
+            "observationWaitMs": 15.563000000000102,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 1.2364999999999782,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 236.73259999999937,
+            "dispatchGapMs": 16.43199999999979,
+            "observationWaitMs": 15.301499999999578,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 1.130500000000211,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 237.05009999999947,
+            "dispatchGapMs": 16.171800000000076,
+            "observationWaitMs": 15.249400000000605,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.9223999999994703,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 236.85579999999936,
+            "dispatchGapMs": 15.764400000000023,
+            "observationWaitMs": 14.599500000000262,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 1.1648999999997613,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 235.53960000000006,
+            "dispatchGapMs": 16.47030000000086,
+            "observationWaitMs": 15.473500000000058,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.9968000000008033,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 237.01869999999963,
+            "dispatchGapMs": 16.80619999999999,
+            "observationWaitMs": 15.880799999999908,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.9254000000000815,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 234.2510000000002,
+            "dispatchGapMs": 16.634000000000015,
+            "observationWaitMs": 15.785699999999451,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.8483000000005632,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 237.78000000000065,
+            "dispatchGapMs": 17.110999999998967,
+            "observationWaitMs": 16.11409999999887,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.996900000000096,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 236.70249999999942,
+            "dispatchGapMs": 16.739700000000084,
+            "observationWaitMs": 15.679700000000594,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 1.0599999999994907,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 233.6306999999997,
+            "dispatchGapMs": 16.771500000000742,
+            "observationWaitMs": 15.78610000000117,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.9853999999995722,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 236.8842999999997,
+            "dispatchGapMs": 16.610200000000987,
+            "observationWaitMs": 15.821099999999205,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.7891000000017812,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 235.30249999999978,
+            "dispatchGapMs": 16.366299999999683,
+            "observationWaitMs": 15.452699999999822,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.9135999999998603,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 233.84229999999843,
+            "dispatchGapMs": 16.295000000000073,
+            "observationWaitMs": 15.34349999999904,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.9515000000010332,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 236.00900000000001,
+            "dispatchGapMs": 16.723700000000463,
+            "observationWaitMs": 15.756199999999808,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.9675000000006548,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 236.1183000000001,
+            "dispatchGapMs": 16.174800000000687,
+            "observationWaitMs": 15.229400000000169,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.945400000000518,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 234.7030999999988,
+            "dispatchGapMs": 16.650400000000445,
+            "observationWaitMs": 15.710499999999229,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.9399000000012165,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 235.76550000000134,
+            "dispatchGapMs": 15.736800000000585,
+            "observationWaitMs": 14.887100000001737,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.8496999999988475,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          }
+        ]
+      }
+    },
+    "foreground_to_queued": {
+      "beforeScenario": "foreground",
+      "afterScenario": "queued",
+      "before": {
+        "dispatchGap": {
+          "n": 20,
+          "p50Ms": 127.706,
+          "p95Ms": 128.989,
+          "meanMs": 127.491
+        },
+        "observationBarrier": {
+          "n": 20,
+          "p50Ms": 15.653,
+          "p95Ms": 15.943,
+          "meanMs": 15.543
+        },
+        "modelDelayAfterCompletion": {
+          "n": 20,
+          "p50Ms": 109.716,
+          "p95Ms": 110.741,
+          "meanMs": 109.585
+        },
+        "otherHandoff": {
+          "n": 20,
+          "p50Ms": 2.271,
+          "p95Ms": 2.94,
+          "meanMs": 2.364
+        },
+        "modelDelayMeasured": {
+          "n": 20,
+          "p50Ms": 109.716,
+          "p95Ms": 110.741,
+          "meanMs": 109.585
+        },
+        "duration": {
+          "n": 20,
+          "p50Ms": 346.597,
+          "p95Ms": 348.807,
+          "meanMs": 346.431
+        },
+        "actions": 40,
+        "requestedObservations": 40,
+        "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+        "preparedBeforeCompletion": 0
+      },
+      "after": {
+        "dispatchGap": {
+          "n": 20,
+          "p50Ms": 33.328,
+          "p95Ms": 33.769,
+          "meanMs": 33.293
+        },
+        "observationBarrier": {
+          "n": 20,
+          "p50Ms": 30.673,
+          "p95Ms": 31.14,
+          "meanMs": 30.564
+        },
+        "modelDelayAfterCompletion": {
+          "n": 20,
+          "p50Ms": 0,
+          "p95Ms": 0,
+          "meanMs": 0
+        },
+        "otherHandoff": {
+          "n": 20,
+          "p50Ms": 2.75,
+          "p95Ms": 3.137,
+          "meanMs": 2.73
+        },
+        "modelDelayMeasured": {
+          "n": 20,
+          "p50Ms": 108.175,
+          "p95Ms": 109.425,
+          "meanMs": 108.216
+        },
+        "duration": {
+          "n": 20,
+          "p50Ms": 251.784,
+          "p95Ms": 253.409,
+          "meanMs": 251.825
+        },
+        "actions": 40,
+        "requestedObservations": 60,
+        "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+        "preparedBeforeCompletion": 20
+      },
+      "pairedGapWins": 20,
+      "rows": {
+        "before": [
+          {
+            "durationMs": 347.0151999999998,
+            "dispatchGapMs": 127.70600000000013,
+            "observationWaitMs": 15.46810000000005,
+            "modelDelayAfterCompletionMs": 109.54069999999956,
+            "otherHandoffMs": 2.697200000000521,
+            "modelDelayMeasuredMs": 109.54069999999956,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 347.0680999999986,
+            "dispatchGapMs": 128.9366000000009,
+            "observationWaitMs": 15.800999999999476,
+            "modelDelayAfterCompletionMs": 109.86549999999988,
+            "otherHandoffMs": 3.2701000000015483,
+            "modelDelayMeasuredMs": 109.86549999999988,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 347.1983,
+            "dispatchGapMs": 127.71410000000105,
+            "observationWaitMs": 14.601399999999558,
+            "modelDelayAfterCompletionMs": 110.1727000000028,
+            "otherHandoffMs": 2.9399999999986903,
+            "modelDelayMeasuredMs": 110.1727000000028,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 347.89470000000074,
+            "dispatchGapMs": 128.9894000000022,
+            "observationWaitMs": 15.738600000000588,
+            "modelDelayAfterCompletionMs": 110.46380000000136,
+            "otherHandoffMs": 2.787000000000262,
+            "modelDelayMeasuredMs": 110.46380000000136,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 344.6632000000027,
+            "dispatchGapMs": 126.03080000000045,
+            "observationWaitMs": 15.953000000001339,
+            "modelDelayAfterCompletionMs": 107.96340000000055,
+            "otherHandoffMs": 2.114399999998568,
+            "modelDelayMeasuredMs": 107.96340000000055,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 344.6222999999991,
+            "dispatchGapMs": 126.48110000000088,
+            "observationWaitMs": 15.268499999998312,
+            "modelDelayAfterCompletionMs": 108.60169999999925,
+            "otherHandoffMs": 2.610900000003312,
+            "modelDelayMeasuredMs": 108.60169999999925,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 346.59709999999905,
+            "dispatchGapMs": 128.22079999999914,
+            "observationWaitMs": 15.868700000002718,
+            "modelDelayAfterCompletionMs": 109.84850000000006,
+            "otherHandoffMs": 2.503599999996368,
+            "modelDelayMeasuredMs": 109.84850000000006,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 341.3093000000008,
+            "dispatchGapMs": 124.24720000000161,
+            "observationWaitMs": 15.191500000000815,
+            "modelDelayAfterCompletionMs": 107.0096999999987,
+            "otherHandoffMs": 2.0460000000020955,
+            "modelDelayMeasuredMs": 107.0096999999987,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 347.3539000000019,
+            "dispatchGapMs": 128.39380000000165,
+            "observationWaitMs": 15.81630000000223,
+            "modelDelayAfterCompletionMs": 110.44759999999951,
+            "otherHandoffMs": 2.129899999999907,
+            "modelDelayMeasuredMs": 110.44759999999951,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 344.1214,
+            "dispatchGapMs": 126.82709999999861,
+            "observationWaitMs": 15.795399999999063,
+            "modelDelayAfterCompletionMs": 108.68289999999979,
+            "otherHandoffMs": 2.3487999999997555,
+            "modelDelayMeasuredMs": 108.68289999999979,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 345.78429999999935,
+            "dispatchGapMs": 126.73020000000179,
+            "observationWaitMs": 15.345399999998335,
+            "modelDelayAfterCompletionMs": 109.1140000000014,
+            "otherHandoffMs": 2.2708000000020547,
+            "modelDelayMeasuredMs": 109.1140000000014,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 344.34449999999924,
+            "dispatchGapMs": 127.52460000000065,
+            "observationWaitMs": 15.942699999999604,
+            "modelDelayAfterCompletionMs": 109.49880000000121,
+            "otherHandoffMs": 2.083099999999831,
+            "modelDelayMeasuredMs": 109.49880000000121,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 348.59029999999984,
+            "dispatchGapMs": 128.41589999999997,
+            "observationWaitMs": 15.781199999997625,
+            "modelDelayAfterCompletionMs": 110.57310000000143,
+            "otherHandoffMs": 2.061600000000908,
+            "modelDelayMeasuredMs": 110.57310000000143,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 349.0036,
+            "dispatchGapMs": 127.94210000000021,
+            "observationWaitMs": 15.69800000000032,
+            "modelDelayAfterCompletionMs": 109.71589999999924,
+            "otherHandoffMs": 2.528200000000652,
+            "modelDelayMeasuredMs": 109.71589999999924,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 346.0020000000004,
+            "dispatchGapMs": 125.95780000000013,
+            "observationWaitMs": 15.44680000000153,
+            "modelDelayAfterCompletionMs": 108.45820000000094,
+            "otherHandoffMs": 2.05279999999766,
+            "modelDelayMeasuredMs": 108.45820000000094,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 348.806700000001,
+            "dispatchGapMs": 127.8135000000002,
+            "observationWaitMs": 14.944800000001123,
+            "modelDelayAfterCompletionMs": 110.74079999999958,
+            "otherHandoffMs": 2.1278999999994994,
+            "modelDelayMeasuredMs": 110.74079999999958,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 346.1805999999997,
+            "dispatchGapMs": 126.92770000000019,
+            "observationWaitMs": 15.378499999998894,
+            "modelDelayAfterCompletionMs": 109.22360000000117,
+            "otherHandoffMs": 2.3256000000001222,
+            "modelDelayMeasuredMs": 109.22360000000117,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 347.8888999999981,
+            "dispatchGapMs": 129.30059999999867,
+            "observationWaitMs": 15.65309999999954,
+            "modelDelayAfterCompletionMs": 111.6215000000011,
+            "otherHandoffMs": 2.025999999998021,
+            "modelDelayMeasuredMs": 111.6215000000011,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 347.96680000000197,
+            "dispatchGapMs": 127.5002999999997,
+            "observationWaitMs": 15.277200000000448,
+            "modelDelayAfterCompletionMs": 110.21289999999863,
+            "otherHandoffMs": 2.010200000000623,
+            "modelDelayMeasuredMs": 110.21289999999863,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 346.2075999999979,
+            "dispatchGapMs": 128.1677000000018,
+            "observationWaitMs": 15.880700000001525,
+            "modelDelayAfterCompletionMs": 109.9416999999994,
+            "otherHandoffMs": 2.3453000000008615,
+            "modelDelayMeasuredMs": 109.9416999999994,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          }
+        ],
+        "after": [
+          {
+            "durationMs": 253.04119999999966,
+            "dispatchGapMs": 33.67690000000039,
+            "observationWaitMs": 30.596400000002177,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 3.08049999999821,
+            "modelDelayMeasuredMs": 108.15689999999995,
+            "preparedBeforeCompletion": true,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 3,
+            "queueResult": {
+              "state": "QUEUED",
+              "programId": "native-program-native-successor-benchmark-1",
+              "goalRevision": 1,
+              "pendingSuccessor": {
+                "queueId": "native-queue-native-successor-benchmark-3",
+                "afterProgramId": "native-program-native-successor-benchmark-1",
+                "goalRevision": 1,
+                "programVersion": 1,
+                "state": "QUEUED",
+                "maxActions": 1,
+                "timeoutMs": 10000,
+                "sourceOrigin": "source"
+              }
+            },
+            "eventNames": [
+              "program_handoff_started",
+              "program_ended"
+            ]
+          },
+          {
+            "durationMs": 252.20379999999932,
+            "dispatchGapMs": 32.71639999999934,
+            "observationWaitMs": 29.90859999999884,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 2.8078000000004977,
+            "modelDelayMeasuredMs": 108.66059999999925,
+            "preparedBeforeCompletion": true,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 3,
+            "queueResult": {
+              "state": "QUEUED",
+              "programId": "native-program-native-successor-benchmark-1",
+              "goalRevision": 1,
+              "pendingSuccessor": {
+                "queueId": "native-queue-native-successor-benchmark-3",
+                "afterProgramId": "native-program-native-successor-benchmark-1",
+                "goalRevision": 1,
+                "programVersion": 1,
+                "state": "QUEUED",
+                "maxActions": 1,
+                "timeoutMs": 10000,
+                "sourceOrigin": "source"
+              }
+            },
+            "eventNames": [
+              "program_handoff_started",
+              "program_ended"
+            ]
+          },
+          {
+            "durationMs": 249.33740000000034,
+            "dispatchGapMs": 32.573599999999715,
+            "observationWaitMs": 29.823300000000017,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 2.7502999999996973,
+            "modelDelayMeasuredMs": 105.89819999999963,
+            "preparedBeforeCompletion": true,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 3,
+            "queueResult": {
+              "state": "QUEUED",
+              "programId": "native-program-native-successor-benchmark-1",
+              "goalRevision": 1,
+              "pendingSuccessor": {
+                "queueId": "native-queue-native-successor-benchmark-3",
+                "afterProgramId": "native-program-native-successor-benchmark-1",
+                "goalRevision": 1,
+                "programVersion": 1,
+                "state": "QUEUED",
+                "maxActions": 1,
+                "timeoutMs": 10000,
+                "sourceOrigin": "source"
+              }
+            },
+            "eventNames": [
+              "program_handoff_started",
+              "program_ended"
+            ]
+          },
+          {
+            "durationMs": 252.4399999999987,
+            "dispatchGapMs": 33.56029999999737,
+            "observationWaitMs": 30.684100000002218,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 2.8761999999951513,
+            "modelDelayMeasuredMs": 108.13260000000082,
+            "preparedBeforeCompletion": true,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 3,
+            "queueResult": {
+              "state": "QUEUED",
+              "programId": "native-program-native-successor-benchmark-1",
+              "goalRevision": 1,
+              "pendingSuccessor": {
+                "queueId": "native-queue-native-successor-benchmark-3",
+                "afterProgramId": "native-program-native-successor-benchmark-1",
+                "goalRevision": 1,
+                "programVersion": 1,
+                "state": "QUEUED",
+                "maxActions": 1,
+                "timeoutMs": 10000,
+                "sourceOrigin": "source"
+              }
+            },
+            "eventNames": [
+              "program_handoff_started",
+              "program_ended"
+            ]
+          },
+          {
+            "durationMs": 251.80909999999858,
+            "dispatchGapMs": 33.32790000000023,
+            "observationWaitMs": 30.605900000002293,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 2.7219999999979336,
+            "modelDelayMeasuredMs": 109.13660000000164,
+            "preparedBeforeCompletion": true,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 3,
+            "queueResult": {
+              "state": "QUEUED",
+              "programId": "native-program-native-successor-benchmark-1",
+              "goalRevision": 1,
+              "pendingSuccessor": {
+                "queueId": "native-queue-native-successor-benchmark-3",
+                "afterProgramId": "native-program-native-successor-benchmark-1",
+                "goalRevision": 1,
+                "programVersion": 1,
+                "state": "QUEUED",
+                "maxActions": 1,
+                "timeoutMs": 10000,
+                "sourceOrigin": "source"
+              }
+            },
+            "eventNames": [
+              "program_handoff_started",
+              "program_ended"
+            ]
+          },
+          {
+            "durationMs": 249.40620000000126,
+            "dispatchGapMs": 33.18609999999899,
+            "observationWaitMs": 29.67819999999847,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 3.507900000000518,
+            "modelDelayMeasuredMs": 107.49129999999786,
+            "preparedBeforeCompletion": true,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 3,
+            "queueResult": {
+              "state": "QUEUED",
+              "programId": "native-program-native-successor-benchmark-1",
+              "goalRevision": 1,
+              "pendingSuccessor": {
+                "queueId": "native-queue-native-successor-benchmark-3",
+                "afterProgramId": "native-program-native-successor-benchmark-1",
+                "goalRevision": 1,
+                "programVersion": 1,
+                "state": "QUEUED",
+                "maxActions": 1,
+                "timeoutMs": 10000,
+                "sourceOrigin": "source"
+              }
+            },
+            "eventNames": [
+              "program_handoff_started",
+              "program_ended"
+            ]
+          },
+          {
+            "durationMs": 251.5036,
+            "dispatchGapMs": 33.94060000000172,
+            "observationWaitMs": 30.803499999998166,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 3.1371000000035565,
+            "modelDelayMeasuredMs": 107.01610000000073,
+            "preparedBeforeCompletion": true,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 3,
+            "queueResult": {
+              "state": "QUEUED",
+              "programId": "native-program-native-successor-benchmark-1",
+              "goalRevision": 1,
+              "pendingSuccessor": {
+                "queueId": "native-queue-native-successor-benchmark-3",
+                "afterProgramId": "native-program-native-successor-benchmark-1",
+                "goalRevision": 1,
+                "programVersion": 1,
+                "state": "QUEUED",
+                "maxActions": 1,
+                "timeoutMs": 10000,
+                "sourceOrigin": "source"
+              }
+            },
+            "eventNames": [
+              "program_handoff_started",
+              "program_ended"
+            ]
+          },
+          {
+            "durationMs": 254.98760000000038,
+            "dispatchGapMs": 33.59909999999945,
+            "observationWaitMs": 31.139500000001135,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 2.459599999998318,
+            "modelDelayMeasuredMs": 109.21630000000005,
+            "preparedBeforeCompletion": true,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 3,
+            "queueResult": {
+              "state": "QUEUED",
+              "programId": "native-program-native-successor-benchmark-1",
+              "goalRevision": 1,
+              "pendingSuccessor": {
+                "queueId": "native-queue-native-successor-benchmark-3",
+                "afterProgramId": "native-program-native-successor-benchmark-1",
+                "goalRevision": 1,
+                "programVersion": 1,
+                "state": "QUEUED",
+                "maxActions": 1,
+                "timeoutMs": 10000,
+                "sourceOrigin": "source"
+              }
+            },
+            "eventNames": [
+              "program_handoff_started",
+              "program_ended"
+            ]
+          },
+          {
+            "durationMs": 252.98349999999846,
+            "dispatchGapMs": 33.758099999999104,
+            "observationWaitMs": 30.931899999999587,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 2.826199999999517,
+            "modelDelayMeasuredMs": 108.51469999999972,
+            "preparedBeforeCompletion": true,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 3,
+            "queueResult": {
+              "state": "QUEUED",
+              "programId": "native-program-native-successor-benchmark-1",
+              "goalRevision": 1,
+              "pendingSuccessor": {
+                "queueId": "native-queue-native-successor-benchmark-3",
+                "afterProgramId": "native-program-native-successor-benchmark-1",
+                "goalRevision": 1,
+                "programVersion": 1,
+                "state": "QUEUED",
+                "maxActions": 1,
+                "timeoutMs": 10000,
+                "sourceOrigin": "source"
+              }
+            },
+            "eventNames": [
+              "program_handoff_started",
+              "program_ended"
+            ]
+          },
+          {
+            "durationMs": 250.39310000000114,
+            "dispatchGapMs": 33.229699999999866,
+            "observationWaitMs": 30.940199999997276,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 2.2895000000025902,
+            "modelDelayMeasuredMs": 106.59660000000076,
+            "preparedBeforeCompletion": true,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 3,
+            "queueResult": {
+              "state": "QUEUED",
+              "programId": "native-program-native-successor-benchmark-1",
+              "goalRevision": 1,
+              "pendingSuccessor": {
+                "queueId": "native-queue-native-successor-benchmark-3",
+                "afterProgramId": "native-program-native-successor-benchmark-1",
+                "goalRevision": 1,
+                "programVersion": 1,
+                "state": "QUEUED",
+                "maxActions": 1,
+                "timeoutMs": 10000,
+                "sourceOrigin": "source"
+              }
+            },
+            "eventNames": [
+              "program_handoff_started",
+              "program_ended"
+            ]
+          },
+          {
+            "durationMs": 250.84509999999864,
+            "dispatchGapMs": 33.521600000000035,
+            "observationWaitMs": 31.051100000000588,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 2.470499999999447,
+            "modelDelayMeasuredMs": 109.42499999999927,
+            "preparedBeforeCompletion": true,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 3,
+            "queueResult": {
+              "state": "QUEUED",
+              "programId": "native-program-native-successor-benchmark-1",
+              "goalRevision": 1,
+              "pendingSuccessor": {
+                "queueId": "native-queue-native-successor-benchmark-3",
+                "afterProgramId": "native-program-native-successor-benchmark-1",
+                "goalRevision": 1,
+                "programVersion": 1,
+                "state": "QUEUED",
+                "maxActions": 1,
+                "timeoutMs": 10000,
+                "sourceOrigin": "source"
+              }
+            },
+            "eventNames": [
+              "program_handoff_started",
+              "program_ended"
+            ]
+          },
+          {
+            "durationMs": 252.96020000000135,
+            "dispatchGapMs": 33.35969999999725,
+            "observationWaitMs": 30.672699999999168,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 2.686999999998079,
+            "modelDelayMeasuredMs": 109.07869999999821,
+            "preparedBeforeCompletion": true,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 3,
+            "queueResult": {
+              "state": "QUEUED",
+              "programId": "native-program-native-successor-benchmark-1",
+              "goalRevision": 1,
+              "pendingSuccessor": {
+                "queueId": "native-queue-native-successor-benchmark-3",
+                "afterProgramId": "native-program-native-successor-benchmark-1",
+                "goalRevision": 1,
+                "programVersion": 1,
+                "state": "QUEUED",
+                "maxActions": 1,
+                "timeoutMs": 10000,
+                "sourceOrigin": "source"
+              }
+            },
+            "eventNames": [
+              "program_handoff_started",
+              "program_ended"
+            ]
+          },
+          {
+            "durationMs": 250.68689999999697,
+            "dispatchGapMs": 33.21180000000095,
+            "observationWaitMs": 30.25590000000011,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 2.955900000000838,
+            "modelDelayMeasuredMs": 107.43600000000151,
+            "preparedBeforeCompletion": true,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 3,
+            "queueResult": {
+              "state": "QUEUED",
+              "programId": "native-program-native-successor-benchmark-1",
+              "goalRevision": 1,
+              "pendingSuccessor": {
+                "queueId": "native-queue-native-successor-benchmark-3",
+                "afterProgramId": "native-program-native-successor-benchmark-1",
+                "goalRevision": 1,
+                "programVersion": 1,
+                "state": "QUEUED",
+                "maxActions": 1,
+                "timeoutMs": 10000,
+                "sourceOrigin": "source"
+              }
+            },
+            "eventNames": [
+              "program_handoff_started",
+              "program_ended"
+            ]
+          },
+          {
+            "durationMs": 250.45829999999842,
+            "dispatchGapMs": 32.27639999999883,
+            "observationWaitMs": 29.32879999999932,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 2.947599999999511,
+            "modelDelayMeasuredMs": 108.17510000000038,
+            "preparedBeforeCompletion": true,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 3,
+            "queueResult": {
+              "state": "QUEUED",
+              "programId": "native-program-native-successor-benchmark-1",
+              "goalRevision": 1,
+              "pendingSuccessor": {
+                "queueId": "native-queue-native-successor-benchmark-3",
+                "afterProgramId": "native-program-native-successor-benchmark-1",
+                "goalRevision": 1,
+                "programVersion": 1,
+                "state": "QUEUED",
+                "maxActions": 1,
+                "timeoutMs": 10000,
+                "sourceOrigin": "source"
+              }
+            },
+            "eventNames": [
+              "program_handoff_started",
+              "program_ended"
+            ]
+          },
+          {
+            "durationMs": 251.78359999999884,
+            "dispatchGapMs": 33.17829999999958,
+            "observationWaitMs": 30.41270000000077,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 2.7655999999988126,
+            "modelDelayMeasuredMs": 108.89450000000215,
+            "preparedBeforeCompletion": true,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 3,
+            "queueResult": {
+              "state": "QUEUED",
+              "programId": "native-program-native-successor-benchmark-1",
+              "goalRevision": 1,
+              "pendingSuccessor": {
+                "queueId": "native-queue-native-successor-benchmark-3",
+                "afterProgramId": "native-program-native-successor-benchmark-1",
+                "goalRevision": 1,
+                "programVersion": 1,
+                "state": "QUEUED",
+                "maxActions": 1,
+                "timeoutMs": 10000,
+                "sourceOrigin": "source"
+              }
+            },
+            "eventNames": [
+              "program_handoff_started",
+              "program_ended"
+            ]
+          },
+          {
+            "durationMs": 252.7489999999998,
+            "dispatchGapMs": 32.67669999999998,
+            "observationWaitMs": 30.195400000000518,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 2.4812999999994645,
+            "modelDelayMeasuredMs": 110.0606000000007,
+            "preparedBeforeCompletion": true,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 3,
+            "queueResult": {
+              "state": "QUEUED",
+              "programId": "native-program-native-successor-benchmark-1",
+              "goalRevision": 1,
+              "pendingSuccessor": {
+                "queueId": "native-queue-native-successor-benchmark-3",
+                "afterProgramId": "native-program-native-successor-benchmark-1",
+                "goalRevision": 1,
+                "programVersion": 1,
+                "state": "QUEUED",
+                "maxActions": 1,
+                "timeoutMs": 10000,
+                "sourceOrigin": "source"
+              }
+            },
+            "eventNames": [
+              "program_handoff_started",
+              "program_ended"
+            ]
+          },
+          {
+            "durationMs": 251.70800000000236,
+            "dispatchGapMs": 33.271099999998114,
+            "observationWaitMs": 31.046900000001187,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 2.2241999999969266,
+            "modelDelayMeasuredMs": 107.73899999999776,
+            "preparedBeforeCompletion": true,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 3,
+            "queueResult": {
+              "state": "QUEUED",
+              "programId": "native-program-native-successor-benchmark-1",
+              "goalRevision": 1,
+              "pendingSuccessor": {
+                "queueId": "native-queue-native-successor-benchmark-3",
+                "afterProgramId": "native-program-native-successor-benchmark-1",
+                "goalRevision": 1,
+                "programVersion": 1,
+                "state": "QUEUED",
+                "maxActions": 1,
+                "timeoutMs": 10000,
+                "sourceOrigin": "source"
+              }
+            },
+            "eventNames": [
+              "program_handoff_started",
+              "program_ended"
+            ]
+          },
+          {
+            "durationMs": 253.40850000000137,
+            "dispatchGapMs": 33.64749999999913,
+            "observationWaitMs": 31.160600000002887,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 2.48689999999624,
+            "modelDelayMeasuredMs": 107.72720000000118,
+            "preparedBeforeCompletion": true,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 3,
+            "queueResult": {
+              "state": "QUEUED",
+              "programId": "native-program-native-successor-benchmark-1",
+              "goalRevision": 1,
+              "pendingSuccessor": {
+                "queueId": "native-queue-native-successor-benchmark-3",
+                "afterProgramId": "native-program-native-successor-benchmark-1",
+                "goalRevision": 1,
+                "programVersion": 1,
+                "state": "QUEUED",
+                "maxActions": 1,
+                "timeoutMs": 10000,
+                "sourceOrigin": "source"
+              }
+            },
+            "eventNames": [
+              "program_handoff_started",
+              "program_ended"
+            ]
+          },
+          {
+            "durationMs": 250.95130000000063,
+            "dispatchGapMs": 33.38829999999871,
+            "observationWaitMs": 31.03099999999904,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 2.357299999999668,
+            "modelDelayMeasuredMs": 108.1942999999992,
+            "preparedBeforeCompletion": true,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 3,
+            "queueResult": {
+              "state": "QUEUED",
+              "programId": "native-program-native-successor-benchmark-1",
+              "goalRevision": 1,
+              "pendingSuccessor": {
+                "queueId": "native-queue-native-successor-benchmark-3",
+                "afterProgramId": "native-program-native-successor-benchmark-1",
+                "goalRevision": 1,
+                "programVersion": 1,
+                "state": "QUEUED",
+                "maxActions": 1,
+                "timeoutMs": 10000,
+                "sourceOrigin": "source"
+              }
+            },
+            "eventNames": [
+              "program_handoff_started",
+              "program_ended"
+            ]
+          },
+          {
+            "durationMs": 252.84079999999813,
+            "dispatchGapMs": 33.76919999999882,
+            "observationWaitMs": 31.0083999999988,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 2.7608000000000175,
+            "modelDelayMeasuredMs": 108.76759999999922,
+            "preparedBeforeCompletion": true,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 3,
+            "queueResult": {
+              "state": "QUEUED",
+              "programId": "native-program-native-successor-benchmark-1",
+              "goalRevision": 1,
+              "pendingSuccessor": {
+                "queueId": "native-queue-native-successor-benchmark-3",
+                "afterProgramId": "native-program-native-successor-benchmark-1",
+                "goalRevision": 1,
+                "programVersion": 1,
+                "state": "QUEUED",
+                "maxActions": 1,
+                "timeoutMs": 10000,
+                "sourceOrigin": "source"
+              }
+            },
+            "eventNames": [
+              "program_handoff_started",
+              "program_ended"
+            ]
+          }
+        ]
+      }
+    },
+    "conditional_runtime_control": {
+      "beforeScenario": "conditional",
+      "afterScenario": "conditional",
+      "before": {
+        "dispatchGap": {
+          "n": 20,
+          "p50Ms": 16.648,
+          "p95Ms": 16.791,
+          "meanMs": 16.492
+        },
+        "observationBarrier": {
+          "n": 20,
+          "p50Ms": 15.789,
+          "p95Ms": 15.944,
+          "meanMs": 15.626
+        },
+        "modelDelayAfterCompletion": {
+          "n": 20,
+          "p50Ms": 0,
+          "p95Ms": 0,
+          "meanMs": 0
+        },
+        "otherHandoff": {
+          "n": 20,
+          "p50Ms": 0.853,
+          "p95Ms": 0.985,
+          "meanMs": 0.867
+        },
+        "modelDelayMeasured": {
+          "n": 20,
+          "p50Ms": 0,
+          "p95Ms": 0,
+          "meanMs": 0
+        },
+        "duration": {
+          "n": 20,
+          "p50Ms": 236.055,
+          "p95Ms": 237.472,
+          "meanMs": 235.968
+        },
+        "actions": 40,
+        "requestedObservations": 40,
+        "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+        "preparedBeforeCompletion": 0
+      },
+      "after": {
+        "dispatchGap": {
+          "n": 20,
+          "p50Ms": 16.223,
+          "p95Ms": 16.999,
+          "meanMs": 16.372
+        },
+        "observationBarrier": {
+          "n": 20,
+          "p50Ms": 15.429,
+          "p95Ms": 16.107,
+          "meanMs": 15.539
+        },
+        "modelDelayAfterCompletion": {
+          "n": 20,
+          "p50Ms": 0,
+          "p95Ms": 0,
+          "meanMs": 0
+        },
+        "otherHandoff": {
+          "n": 20,
+          "p50Ms": 0.813,
+          "p95Ms": 0.954,
+          "meanMs": 0.833
+        },
+        "modelDelayMeasured": {
+          "n": 20,
+          "p50Ms": 0,
+          "p95Ms": 0,
+          "meanMs": 0
+        },
+        "duration": {
+          "n": 20,
+          "p50Ms": 235.689,
+          "p95Ms": 237.471,
+          "meanMs": 235.674
+        },
+        "actions": 40,
+        "requestedObservations": 40,
+        "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+        "preparedBeforeCompletion": 0
+      },
+      "pairedGapWins": 11,
+      "rows": {
+        "before": [
+          {
+            "durationMs": 236.77690000000075,
+            "dispatchGapMs": 15.965199999998731,
+            "observationWaitMs": 14.926100000000588,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 1.0390999999981432,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 234.57560000000012,
+            "dispatchGapMs": 16.33480000000054,
+            "observationWaitMs": 15.374400000000605,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.960399999999936,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 232.98149999999805,
+            "dispatchGapMs": 15.606599999999162,
+            "observationWaitMs": 14.776699999998527,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.8299000000006345,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 236.66289999999935,
+            "dispatchGapMs": 16.50500000000102,
+            "observationWaitMs": 15.522500000002765,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.9824999999982538,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 232.86349999999948,
+            "dispatchGapMs": 16.33169999999882,
+            "observationWaitMs": 15.46179999999731,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.8699000000015076,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 237.1952999999994,
+            "dispatchGapMs": 16.766199999998207,
+            "observationWaitMs": 15.811900000000605,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.9542999999976018,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 236.19380000000092,
+            "dispatchGapMs": 16.791300000000774,
+            "observationWaitMs": 15.871499999997468,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.9198000000033062,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 234.66389999999956,
+            "dispatchGapMs": 15.563500000000204,
+            "observationWaitMs": 14.832699999999022,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.7308000000011816,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 235.9274000000005,
+            "dispatchGapMs": 16.657400000000052,
+            "observationWaitMs": 15.875400000000809,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.7819999999992433,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 237.34400000000096,
+            "dispatchGapMs": 16.647799999998824,
+            "observationWaitMs": 15.769999999996799,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.8778000000020256,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 236.90329999999813,
+            "dispatchGapMs": 16.669700000005832,
+            "observationWaitMs": 15.8521999999939,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.8175000000119326,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 235.59670000000187,
+            "dispatchGapMs": 16.69670000000042,
+            "observationWaitMs": 15.820200000001932,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.8764999999984866,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 235.80219999999827,
+            "dispatchGapMs": 16.749900000002526,
+            "observationWaitMs": 15.94419999999809,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.8057000000044354,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 238.39809999999852,
+            "dispatchGapMs": 16.84939999999915,
+            "observationWaitMs": 15.996400000003632,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.852999999995518,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 235.6035999999949,
+            "dispatchGapMs": 16.62399999999616,
+            "observationWaitMs": 15.865899999997055,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.7580999999991036,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 237.472299999994,
+            "dispatchGapMs": 16.70850000000064,
+            "observationWaitMs": 15.837899999998626,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.870600000002014,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 235.75620000000345,
+            "dispatchGapMs": 16.672500000000582,
+            "observationWaitMs": 15.856700000003912,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.8157999999966705,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 236.50880000000325,
+            "dispatchGapMs": 16.682200000002922,
+            "observationWaitMs": 15.69720000000234,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.9850000000005821,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 236.05490000000282,
+            "dispatchGapMs": 16.568899999998393,
+            "observationWaitMs": 15.788899999999558,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.7799999999988358,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 236.08690000000206,
+            "dispatchGapMs": 16.454799999999523,
+            "observationWaitMs": 15.630800000006275,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.8239999999932479,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          }
+        ],
+        "after": [
+          {
+            "durationMs": 236.85930000000008,
+            "dispatchGapMs": 16.806800000002113,
+            "observationWaitMs": 15.852999999999156,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.953800000002957,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 235.68860000000132,
+            "dispatchGapMs": 16.660900000002584,
+            "observationWaitMs": 15.847499999999854,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.8134000000027299,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 235.08039999999892,
+            "dispatchGapMs": 16.13430000000153,
+            "observationWaitMs": 15.42949999999837,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.7048000000031607,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 237.4989999999998,
+            "dispatchGapMs": 15.83469999999943,
+            "observationWaitMs": 14.921000000002095,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.9136999999973341,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 235.56500000000233,
+            "dispatchGapMs": 16.70930000000226,
+            "observationWaitMs": 15.974999999998545,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.7343000000037136,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 237.23309999999765,
+            "dispatchGapMs": 15.671399999999267,
+            "observationWaitMs": 14.866300000001502,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.8050999999977648,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 235.32990000000063,
+            "dispatchGapMs": 16.999100000000908,
+            "observationWaitMs": 16.106599999999162,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.8925000000017462,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 237.47139999999854,
+            "dispatchGapMs": 16.682300000000396,
+            "observationWaitMs": 15.772100000001956,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.91019999999844,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 234.58819999999832,
+            "dispatchGapMs": 16.62709999999788,
+            "observationWaitMs": 15.928800000001502,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.6982999999963795,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 236.02300000000105,
+            "dispatchGapMs": 16.799999999999272,
+            "observationWaitMs": 15.869200000001001,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.9307999999982712,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 236.40660000000207,
+            "dispatchGapMs": 15.621200000001409,
+            "observationWaitMs": 14.720500000003085,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.9006999999983236,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 234.66049999999814,
+            "dispatchGapMs": 16.223100000002887,
+            "observationWaitMs": 15.348700000002282,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.8744000000006054,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 235.8324999999968,
+            "dispatchGapMs": 16.061500000003434,
+            "observationWaitMs": 15.416300000004412,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.6451999999990221,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 235.9216000000015,
+            "dispatchGapMs": 15.770000000004075,
+            "observationWaitMs": 14.900999999998021,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.8690000000060536,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 232.86239999999816,
+            "dispatchGapMs": 16.598400000002584,
+            "observationWaitMs": 15.823800000005576,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.7745999999970081,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 234.3231999999989,
+            "dispatchGapMs": 15.950700000001234,
+            "observationWaitMs": 15.139100000000326,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.811600000000908,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 236.2641999999978,
+            "dispatchGapMs": 17.271600000000035,
+            "observationWaitMs": 16.390100000004168,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.8814999999958673,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 237.45960000000196,
+            "dispatchGapMs": 16.75669999999809,
+            "observationWaitMs": 15.79189999999653,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.96480000000156,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 234.06139999999868,
+            "dispatchGapMs": 16.064900000004855,
+            "observationWaitMs": 15.259399999995367,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.8055000000094878,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          },
+          {
+            "durationMs": 234.35510000000068,
+            "dispatchGapMs": 16.20130000000063,
+            "observationWaitMs": 15.429100000001199,
+            "modelDelayAfterCompletionMs": 0,
+            "otherHandoffMs": 0.7721999999994296,
+            "modelDelayMeasuredMs": 0,
+            "preparedBeforeCompletion": null,
+            "actions": [
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 150
+                }
+              },
+              {
+                "actionType": "wait",
+                "arguments": {
+                  "durationMs": 40
+                }
+              }
+            ],
+            "actionShapeHash": "00c7a57c3a4e5ef6d4d401d80a481c974f6fc3e9cdc7c63ed8ecb8253a88606d",
+            "requestedObservations": 2,
+            "queueResult": null,
+            "eventNames": []
+          }
+        ]
+      }
+    }
+  },
+  "behaviorCases": {
+    "ready": {
+      "result": "PASSED",
+      "actions": 2,
+      "requestedObservations": 3,
+      "queued": {
+        "state": "QUEUED",
+        "programId": "native-program-native-successor-benchmark-1",
+        "goalRevision": 1,
+        "pendingSuccessor": {
+          "queueId": "native-queue-native-successor-benchmark-3",
+          "afterProgramId": "native-program-native-successor-benchmark-1",
+          "goalRevision": 1,
+          "programVersion": 1,
+          "state": "QUEUED",
+          "maxActions": 1,
+          "timeoutMs": 5000,
+          "sourceOrigin": "source"
+        }
+      },
+      "rejection": null,
+      "events": [
+        {
+          "event": "program_handoff_started"
+        },
+        {
+          "event": "program_ended",
+          "outcomeReasonCode": "PROGRAM_EXHAUSTED"
+        }
+      ]
+    },
+    "guard_false": {
+      "result": "PASSED",
+      "actions": 1,
+      "requestedObservations": 2,
+      "queued": {
+        "state": "QUEUED",
+        "programId": "native-program-native-successor-benchmark-1",
+        "goalRevision": 1,
+        "pendingSuccessor": {
+          "queueId": "native-queue-native-successor-benchmark-3",
+          "afterProgramId": "native-program-native-successor-benchmark-1",
+          "goalRevision": 1,
+          "programVersion": 1,
+          "state": "QUEUED",
+          "maxActions": 1,
+          "timeoutMs": 5000,
+          "sourceOrigin": "source"
+        }
+      },
+      "rejection": null,
+      "events": [
+        {
+          "event": "program_handoff_rejected",
+          "outcomeReasonCode": "SUCCESSOR_PRECONDITION_FALSE"
+        }
+      ]
+    },
+    "changed_goal": {
+      "result": "PASSED",
+      "actions": 1,
+      "requestedObservations": 0,
+      "queued": {
+        "state": "QUEUED",
+        "programId": "native-program-native-successor-benchmark-1",
+        "goalRevision": 1,
+        "pendingSuccessor": {
+          "queueId": "native-queue-native-successor-benchmark-3",
+          "afterProgramId": "native-program-native-successor-benchmark-1",
+          "goalRevision": 1,
+          "programVersion": 1,
+          "state": "QUEUED",
+          "maxActions": 1,
+          "timeoutMs": 5000,
+          "sourceOrigin": "source"
+        }
+      },
+      "rejection": null,
+      "events": []
+    },
+    "predecessor_failure": {
+      "result": "PASSED",
+      "actions": 1,
+      "requestedObservations": 1,
+      "queued": {
+        "state": "QUEUED",
+        "programId": "native-program-native-successor-benchmark-1",
+        "goalRevision": 1,
+        "pendingSuccessor": {
+          "queueId": "native-queue-native-successor-benchmark-3",
+          "afterProgramId": "native-program-native-successor-benchmark-1",
+          "goalRevision": 1,
+          "programVersion": 1,
+          "state": "QUEUED",
+          "maxActions": 1,
+          "timeoutMs": 5000,
+          "sourceOrigin": "source"
+        }
+      },
+      "rejection": null,
+      "events": [
+        {
+          "event": "program_ended",
+          "outcomeReasonCode": "PROGRAM_EXHAUSTED"
+        }
+      ]
+    },
+    "late_queue_not_ready": {
+      "result": "PASSED",
+      "actions": 2,
+      "requestedObservations": 2,
+      "queued": null,
+      "rejection": {
+        "code": "STALE_PROGRAM",
+        "message": "Successor needs the exact running program version with no pending decision"
+      },
+      "events": [
+        {
+          "event": "program_ended",
+          "outcomeReasonCode": "PROGRAM_EXHAUSTED"
+        }
+      ]
+    }
+  }
+}

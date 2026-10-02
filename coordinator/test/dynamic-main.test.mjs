@@ -5394,6 +5394,97 @@ test('a slow planning advisory does not block urgent steering or consume convers
 	}
 });
 
+for (const providerEnd of ['failure', 'expiry']) {
+	for (const startsSuccessor of [false, true]) {
+		const body = startsSuccessor ? 'a started successor' : 'the original routine';
+		test(`native preparation ${providerEnd} preserves ${body} after advisory steering`, async (t) => {
+			t.mock.timers.enable({ apis: ['setTimeout'] });
+			const registry = new AgentRegistry();
+			const planner = new FakePlanner(registry);
+			const supervisor = new RecordingGoalSupervisor();
+			const providerLeases = [];
+			const begin = supervisor.begin.bind(supervisor);
+			supervisor.begin = (key, kind) => {
+				const token = begin(key, kind);
+				if (kind === 'provider') providerLeases.push({ key, lease: { kind, operationId: token.operationId } });
+				return token;
+			};
+			const steers = [];
+			let handle, releaseTurn;
+			const turnGate = new Promise(resolve => { releaseTurn = resolve; });
+			planner.getNativeDecisionTiming = () => ({ count: 4, p50Ms: 500, p95Ms: 999 });
+			planner.steerNativeTurn = async request => { steers.push(request); };
+			planner.requestNativeTurn = async request => {
+				planner.requests.push(request);
+				if (planner.requests.length > 1) return { status: 'completed', toolCalls: 0 };
+				handle = await request.executeTool({ agentId: request.agentId, goalRevision: request.goalRevision,
+					turnId: 'steered-preparation', callId: 'initial-program', tool: { kind: 'run_program', background: true,
+						timeoutMs: 30_000, expectedDurationMs: 1000, maxActions: 2,
+						source: `program.onUnhandledAttention("continue_and_notify"); await player.wait(1);${startsSuccessor ? '' : ' await player.wait(2);'}` } });
+				await turnGate;
+				if (providerEnd === 'failure') throw Object.assign(new Error('Prepared provider turn failed'), { code: 'TEST_PREPARATION_FAILED' });
+				return { status: 'completed', toolCalls: startsSuccessor ? 2 : 1 };
+			};
+			const run = await start({ registry, planner, goalSupervisor: supervisor,
+				config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } } });
+			const commands = () => run.bridge.sent.filter(message => message.type === 'action_command');
+			const finish = command => run.bridge.emit('action_result', { agentId: 'agent-a', payload: {
+				goalRevision: 1, actionId: command.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE',
+				eventSequence: run.bridge.latestSequences.get('agent-a') + 1,
+			} });
+			try {
+				run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Keep the authorised routine moving.' } });
+				const wire = factToWireObservation({ player: { x: 0, y: 64, z: 0, health: 20 } }, 1, 1, false, 1);
+				wire.world.worldId = 'prepared-handoff-test-world';
+				run.bridge.emit('observation', { agentId: 'agent-a', payload: wire });
+				await eventually(() => handle && commands().length === 1);
+				t.mock.timers.tick(1);
+				await eventually(() => steers.length === 1);
+				assert.match(steers[0].input, /program_planning_due/);
+				assert.equal(planner.requests.length, 1, 'the advisory belongs to the original selected-agent turn');
+
+				let continuingProgramId = handle.programId;
+				if (startsSuccessor) {
+					const queued = await planner.requests[0].executeTool({ agentId: 'agent-a', goalRevision: 1,
+						turnId: 'steered-preparation', callId: 'prepared-successor', tool: { kind: 'queue_program',
+							afterProgramId: handle.programId, goalRevision: 1, programVersion: handle.programVersion,
+							source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(7); await player.wait(8);',
+							precondition: 'player.state().health === 20', maxActions: 2, timeoutMs: 30_000 } });
+					assert.equal(queued.state, 'QUEUED');
+					finish(commands()[0]);
+					await eventually(() => commands().length === 2);
+					continuingProgramId = commands()[1].payload.provenance.programId;
+					assert.notEqual(continuingProgramId, handle.programId);
+					assert.equal(commands()[1].payload.arguments.durationMs, 7);
+					assert.equal(planner.requests.length, 1, 'handoff must not start a duplicate planner turn');
+				}
+
+				if (providerEnd === 'expiry') {
+					assert.equal(providerLeases.length, 1);
+					run.coordinator.handleLeaseExpired(providerLeases[0]);
+					await eventually(() => planner.interruptions.includes('agent-a'));
+					releaseTurn();
+				} else {
+					releaseTurn();
+					await eventually(() => run.bridge.sent.some(message => message.type === 'agent_error' && message.payload.code === 'TEST_PREPARATION_FAILED'));
+				}
+				await new Promise(resolve => setImmediate(resolve));
+				assert.equal(run.bridge.sent.some(message => message.type === 'action_cancel'), false, 'provider preparation cannot cancel authorised body work');
+				assert.notEqual(registry.get('agent-a').state, DynamicAgentState.ERROR);
+				const before = commands().length;
+				finish(commands().at(-1));
+				await eventually(() => commands().length === before + 1);
+				assert.equal(commands().at(-1).payload.provenance.programId, continuingProgramId);
+				assert.equal(commands().at(-1).payload.arguments.durationMs, startsSuccessor ? 8 : 2);
+				assert.equal(planner.requests.length, 1, 'ordinary progress and a handoff must not replay a pending planner turn');
+			} finally {
+				releaseTurn();
+				await run.coordinator.stop();
+			}
+		});
+	}
+}
+
 test('stopping a native routine suppresses its pending planning reminder', async (t) => {
 	// Keep the one-millisecond reminder pending until the stop is delivered.
 	// A real timer can legitimately fire while eventually() yields on a busy host.

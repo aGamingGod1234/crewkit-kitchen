@@ -4,10 +4,11 @@ import { DEFAULT_ARENA_SCRIPT_LIMITS, normalizeArenaScriptLimits } from './limit
 import { PLAYER_MEMBER_PRIMITIVES, MATH_METHODS } from './minecraft-api.mjs';
 import { filterObserved, isTrustedInterpreterFacts, markObservedCandidateSet, nearestFromCurrent } from './facts.mjs';
 import { MAX_LINE_BYTES, ACTION_FIELDS } from '../constants.mjs';
+import { validateProgramParameters } from '../program-parameters.mjs';
 
 const CAPABILITY_NAMES = new Set(['program', 'player', 'world', 'inventory', 'math']);
 const CAPABILITY_MEMBERS = Object.freeze({
-	program: new Set(['onUnhandledAttention', 'repeatUntil', 'watch', 'checkpoint', 'finish']),
+	program: new Set(['onUnhandledAttention', 'repeatUntil', 'watch', 'checkpoint', 'finish', 'parameters']),
 	player: new Set([...Object.keys(PLAYER_MEMBER_PRIMITIVES), 'state']),
 	world: new Set(['items', 'entities', 'blocks', 'nearest', 'state', 'menu', 'inspect', 'remember', 'queryMemory']),
 	inventory: new Set(['count', 'countTag', 'slots', 'state']),
@@ -35,6 +36,7 @@ export class ArenaScriptInterpreter {
 	#compiled;
 	#bindings;
 	#limits;
+	#parameters;
 	#frames = [];
 	#values = [];
 	#waiting = null;
@@ -53,13 +55,14 @@ export class ArenaScriptInterpreter {
 	#deferredCommand = null;
 	#deterministicFailure = null;
 
-	constructor(compiled, bindings, { limits = DEFAULT_ARENA_SCRIPT_LIMITS } = {}) {
+	constructor(compiled, bindings, { limits = DEFAULT_ARENA_SCRIPT_LIMITS, parameters } = {}) {
 		if (!compiled?.ast || compiled.ast.type !== 'Program') throw executionError('INVALID_PROGRAM', 'ArenaScript INVALID_PROGRAM: compiled program is required');
 		if (!Object.isFrozen(compiled)) throw executionError('INVALID_PROGRAM', 'ArenaScript INVALID_PROGRAM: compiled program must be frozen');
 		const normalizedBindings = normalizeBindings(bindings);
 		this.#compiled = compiled;
 		this.#bindings = normalizedBindings;
 		this.#limits = normalizeArenaScriptLimits(limits);
+		this.#parameters = validateProgramParameters(parameters);
 	}
 
 	start(facts) {
@@ -493,6 +496,9 @@ export class ArenaScriptInterpreter {
 			return this.#values.push(result);
 		}
 		switch (callPath) {
+			case 'program.parameters':
+				if (args.length !== 0) throw this.#error('INVALID_ARGUMENT', 'program.parameters requires no arguments', node);
+				return this.#values.push(this.#parameters);
 			case 'program.onUnhandledAttention': return this.#values.push(undefined);
 			case 'program.watch': return this.#registerWatcher(node, args);
 			case 'program.checkpoint': return this.#terminalYield('checkpoint', node, terminalText(args[0], 'checkpoint', node));

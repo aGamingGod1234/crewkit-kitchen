@@ -273,6 +273,12 @@ export class DynamicCoordinator extends EventEmitter {
 				}
 			},
 			onProgramEvent: (record, event) => {
+				// Already-authorized successor work owns the body; no planner wake is needed.
+				if (event.event === 'program_handoff_started') {
+					this.#writeTrace('native_program_handoff_started', { agentId: record.agentId, goalRevision: record.goalRevision,
+						programId: event.programId, predecessorProgramId: event.predecessorProgramId, queueId: event.queueId });
+					return;
+				}
 				const connectionEpoch = this.#nativeRuntimeEpochs.get(record.agentId);
 				const lifecycleGeneration = this.#lifecycleGeneration(record.agentId);
 				const current = this.#registry.get(record.agentId);
@@ -322,11 +328,13 @@ export class DynamicCoordinator extends EventEmitter {
 		if (key.sessionEpoch !== connectionEpoch || key.profileFingerprint !== profileFingerprint(record)) return;
 		this.#writeTrace('work_lease_expired', { ...key, kind: lease.kind, operationId: lease.operationId });
 		this.#publishVerbose(key.agentId, key.goalRevision, 'retry', `${lease.kind} work timed out; recovering automatically.`);
+		let preserveProgram = false;
 		if (lease.kind === 'provider') {
 			const work = this.#providerWork.get(key.agentId);
 			if (work?.kind === 'native' && work.goalRevision === key.goalRevision
 				&& work.lifecycleGeneration === key.lifecycleGeneration
 				&& work.supervisionToken?.operationId === lease.operationId) {
+				preserveProgram = this.#preparationHasRunningProgram(work, record);
 				work.expired = true;
 				this.#restoreNativeConversation(work.steerRequest);
 				this.#restoreNativeConversation(work.request);
@@ -345,7 +353,7 @@ export class DynamicCoordinator extends EventEmitter {
 				void this.#reportAgentError(key.agentId, error, connectionEpoch);
 			}
 		}
-		if (['provider', 'action', 'completion'].includes(lease.kind)) {
+		if (['provider', 'action', 'completion'].includes(lease.kind) && !preserveProgram) {
 			this.#nativeObservationSignatures.delete(key.agentId);
 			void this.#nativeRuntime.dispose(key.agentId, `${lease.kind}_lease_expired`)
 				.catch((error) => this.#reportAgentError(key.agentId, error, connectionEpoch));
@@ -1320,6 +1328,11 @@ export class DynamicCoordinator extends EventEmitter {
 			|| this.#nativeRuntime.canPrepareProgram(record, event.programId, event.status?.programVersion);
 	}
 
+	#preparationHasRunningProgram(work, record) {
+		return (work.request?.nativeEvent?.event === 'program_planning_due' || work.preparingProgram != null)
+			&& this.#nativeRuntime.hasProgram(record);
+	}
+
 	#queueNativeSteer(work, request) {
 		work.steerQueued = mergePlannerRequest(work.steerQueued, request);
 		if (work.steerPromise !== null) return;
@@ -1358,6 +1371,7 @@ export class DynamicCoordinator extends EventEmitter {
 					|| work.steerQueued?.priority === 'urgent'
 					|| work.pending?.priority === 'urgent'
 					|| work.steerPromise !== null) return;
+			work.preparingProgram = { programId: request.nativeEvent.programId, programVersion: request.nativeEvent.status?.programVersion };
 			await this.#planner.steerNativeTurn({
 				agentId: work.agentId,
 				goalRevision: work.goalRevision,
@@ -1467,6 +1481,7 @@ export class DynamicCoordinator extends EventEmitter {
 			work.toolSupervisionToken = supervisionToken;
 			this.#goalSupervisor.progress(work.supervisionToken);
 			result = await this.#nativeRuntime.execute(toolRequest, record, { lifecycleGeneration: work.lifecycleGeneration });
+			if (result?.advisory === 'program_planning_due') work.preparingProgram = { programId: result.programId, programVersion: result.programVersion };
 			const current = this.#registry.get(work.agentId);
 			if (current?.goalRevision === work.goalRevision
 				&& this.#isConnectionEpochCurrent(work.connectionEpoch)
@@ -1562,6 +1577,14 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#restoreNativeConversation(work.request);
 		if (classification === 'stale') {
 			if (work.request.conversationOnly === true) this.#goalSupervisor.terminate(work.supervisionKey);
+			this.#reschedulePendingNativeTurn(pending);
+			return null;
+		}
+		if (this.#preparationHasRunningProgram(work, record)) {
+			this.#writeTrace('native_preparation_failed_current_program_preserved', { agentId: work.agentId, goalRevision: work.goalRevision,
+				errorCode: sanitizeDiagnosticErrorCode(error, { fallback: 'NATIVE_TURN_FAILED' }) });
+			this.#goalSupervisor.ensure(work.supervisionKey, 'program_preparation_failed');
+			await this.#reportAgentError(work.agentId, error, work.connectionEpoch);
 			this.#reschedulePendingNativeTurn(pending);
 			return null;
 		}
@@ -4072,8 +4095,8 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 		observation: isPlanningDue ? compactPlanningDueObservation(compactObservation) : compactObservation,
 		conversation: unreadConversation,
 		...(programId === undefined ? {} : { program: { programId,
-			...(status === undefined ? {} : { state: status.state, engineState: status.engineState, programVersion: status.programVersion, deadlineEpochMs: status.deadlineEpochMs, planningLeadMs: status.planningLeadMs ?? eventPlanningLeadMs, decision: status.decision }),
-			...(result === undefined ? {} : { result: { state: result.state, reasonCode: result.reasonCode, actions: result.actions, receipts: result.receipts?.slice(-8), omittedReceipts: Math.max(0, (result.receipts?.length ?? 0) - 8) + (result.omittedReceipts ?? 0) } }) } }),
+			...(status === undefined ? {} : { state: status.state, engineState: status.engineState, programVersion: status.programVersion, deadlineEpochMs: status.deadlineEpochMs, planningLeadMs: status.planningLeadMs ?? eventPlanningLeadMs, decision: status.decision, pendingSuccessor: status.pendingSuccessor }),
+			...(result === undefined ? {} : { result: { state: result.state, reasonCode: result.reasonCode, actions: result.actions, actionsSucceeded: result.actionsSucceeded, actionsFailed: result.actionsFailed, programVersion: result.programVersion, queueId: result.queueId, predecessorProgramId: result.predecessorProgramId, discardedSuccessor: result.discardedSuccessor, receipts: result.receipts?.slice(-8), omittedReceipts: Math.max(0, (result.receipts?.length ?? 0) - 8) + (result.omittedReceipts ?? 0) } }) } }),
 	};
 	let json = JSON.stringify(payload);
 	if (Buffer.byteLength(json, 'utf8') > 16_384) {

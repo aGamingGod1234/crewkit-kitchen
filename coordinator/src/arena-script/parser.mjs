@@ -42,6 +42,7 @@ const SPECIAL_PROGRAM_MEMBER_PATHS = [
 	['program', 'watch'],
 	['program', 'checkpoint'],
 	['program', 'finish'],
+	['program', 'parameters'],
 ];
 const APPROVED_API_CALL_PATHS = new Set([
 	'program.onUnhandledAttention',
@@ -123,6 +124,32 @@ export function parseArenaScript(source, { limits = DEFAULT_ARENA_SCRIPT_LIMITS 
 
 	validateAstShape(ast, normalizedLimits);
 	const analysis = validateProgram(ast, normalizedLimits);
+	return deepFreeze({ source, ast, ...analysis });
+}
+
+/** Compile an authored expression as a no-action watcher using the same pure API checks. */
+export function parseArenaScriptPrecondition(source) {
+	if (typeof source !== 'string' || source.trim().length === 0 || Buffer.byteLength(source, 'utf8') > 4096) {
+		throw arenaError('UNSUPPORTED_SYNTAX', 'precondition must be a nonblank expression within 4096 UTF-8 bytes');
+	}
+	const options = { ecmaVersion: 2024, sourceType: 'script', locations: true };
+	let expression;
+	try { expression = parseAcorn(source, options); }
+	catch (error) { throw new ArenaScriptError('SYNTAX_ERROR', `ArenaScript syntax error: ${error.message}`, parseErrorLocation(error), { cause: error }); }
+	if (expression.body.length !== 1 || expression.body[0].type !== 'ExpressionStatement') {
+		throw arenaError('UNSUPPORTED_SYNTAX', 'precondition must contain exactly one expression');
+	}
+	// Source data is never interpolated into executable text. Only the expression
+	// AST enters this fixed, effect-free program before normal static validation.
+	const ast = parseAcorn('program.onUnhandledAttention("continue_and_notify"); program.watch(() => true, { mode: "boundary" }, async () => {});', options);
+	const authored = expression.body[0].expression;
+	const condition = ast.body[1].expression.arguments[0];
+	// Queue authorization requires the exact boolean true. The ordinary watcher
+	// evaluator still uses its existing truthiness rules for authored watchers.
+	condition.body = { type: 'BinaryExpression', operator: '===', left: authored, right: condition.body,
+		start: authored.start, end: authored.end, loc: authored.loc };
+	validateAstShape(ast, DEFAULT_ARENA_SCRIPT_LIMITS);
+	const analysis = validateProgram(ast, DEFAULT_ARENA_SCRIPT_LIMITS);
 	return deepFreeze({ source, ast, ...analysis });
 }
 
@@ -444,6 +471,9 @@ function validateCallExpression(node, state, context) {
 	if (pathEqual(path, ['program', 'repeatUntil'])) {
 		validateRepeatUntil(node, state, context);
 	}
+	if (pathEqual(path, ['program', 'parameters']) && node.arguments.length !== 0) {
+		throw arenaError('UNSUPPORTED_SYNTAX', 'program.parameters requires no arguments', node);
+	}
 	if (pathEqual(path, ['program', 'watch'])) {
 		validateWatcher(node, state, context);
 	}
@@ -628,6 +658,7 @@ function watcherFactDependencyMask(condition) {
 				case 'world.state': mask |= FACT_DOMAIN.worldState; break;
 				case 'world.menu': mask |= FACT_DOMAIN.menu; break;
 				case 'world.nearest': mask |= FACT_DOMAIN.player; break;
+				case 'program.parameters': break;
 				default: if (!path?.startsWith('math.')) { dependsOnRuntimeState = true; return; }
 			}
 			visit(node.arguments);

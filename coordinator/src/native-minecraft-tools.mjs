@@ -9,6 +9,7 @@ import {
 } from './constants.mjs';
 import { MAX_ACTION_ARGUMENT_BYTES, validateAction } from './schema.mjs';
 import { ARENA_SCRIPT_API_REFERENCE } from './prompts.mjs';
+import { validateProgramParameters, MAX_PROGRAM_PARAMETER_BYTES } from './program-parameters.mjs';
 
 const MAX_TOOL_RESULT_BYTES = 16_384;
 const COORDINATE_LIMIT = 30_000_000;
@@ -16,6 +17,7 @@ const MAX_SEQUENCE_ACTIONS = 8;
 const MAX_LOOK_AROUND_STEPS = 8;
 const MAX_LOOK_AROUND_TICKS = 20;
 const MAX_PROGRAM_SOURCE_BYTES = 65_536;
+const MAX_PROGRAM_PRECONDITION_BYTES = 4_096;
 const MAX_SEQUENCE_FINISH_BYTES = 4_096;
 const NATIVE_ACTION_TYPES = Object.freeze(Object.keys(ACTION_FIELDS));
 export const INSPECTION_SECTIONS = Object.freeze(['observation', 'inventory', 'menu', 'entities', 'blocks', 'landmarks', 'nearby_containers', 'item', 'block', 'events', 'recipes', 'mechanics']);
@@ -28,15 +30,15 @@ export function minecraftCapabilities({ section = 'all' } = {}) {
 		controlConditions: { ...CONTROL_BRANCH_CONDITIONS },
 		inspectionSections: [...INSPECTION_SECTIONS],
 		programReference: { tool: 'capabilities', arguments: { section: 'program' } },
-		limits: { sequenceActions: MAX_SEQUENCE_ACTIONS, inspectionPage: 32, resultBytes: MAX_TOOL_RESULT_BYTES, actionArgumentBytes: MAX_ACTION_ARGUMENT_BYTES, programSourceBytes: MAX_PROGRAM_SOURCE_BYTES, programActions: 256, programTimeoutMs: 120_000 },
+		limits: { sequenceActions: MAX_SEQUENCE_ACTIONS, inspectionPage: 32, resultBytes: MAX_TOOL_RESULT_BYTES, actionArgumentBytes: MAX_ACTION_ARGUMENT_BYTES, programSourceBytes: MAX_PROGRAM_SOURCE_BYTES, programParameterBytes: MAX_PROGRAM_PARAMETER_BYTES, programPreconditionBytes: MAX_PROGRAM_PRECONDITION_BYTES, pendingProgramSuccessors: 1, programActions: 256, programTimeoutMs: 120_000 },
 	};
 }
 
 export const NATIVE_AGENT_INSTRUCTIONS = `You control one live Minecraft player and choose every action.
 
-Keep provider/model/effort/tier. Choose from fresh observations and the goal; death does not change the active goal. Use sequence for safe linear chains needing no new facts; optional finish:{summary} verifies after success. Use ArenaScript for conditional/repeated work; for longer work, background:true may send one measured-p95 advisory near timeout so you can prepare during its run. It never chooses or dispatches an action. Use startAction to reason while one chosen action runs; handle it exactly with actionStatus/cancelAction/replaceAction, and require fresh facts before dependent actions. Answer exact program attention decisions.
+Keep provider/model/effort/tier; death does not change the active goal. Batch known independent reads and reuse fresh result facts. Use sequence for safe linear chains; optional finish:{summary} verifies success. Use ArenaScript for conditional/repeated work with bounded background:true. Supply expectedDurationMs for preparation timing; it never extends timeout. Use queueProgram to author one successor while current work runs, with a fresh-fact precondition. Only natural exhaustion can start it; inspect/cancel its exact queue. Use startAction to reason while one chosen action runs; settle its exact handle and answer exact program attention.
 
-Use capabilities for fields, fresh observations, and focused inspections. Omitted or unobserved facts are unknown. Query notes and receipts with queryMemory (paginate nextOffset); reuse exact noteKey only when fresh prerequisites/current targets match. Notes are hypotheses; receipts historical. Keep source metadata in comments/separate notes; noteKey executes the entire note as source. exploreFrontier returns candidates; choose a moveTo target. Use control for precise inputs and act with control_sequence for bounded tick programs. Mine observed blocks with exact blockId. goalSpec is immutable; finish requests verification. Never claim effects without evidence. conversation_only uses say. Plain text is invisible; keep speech brief; speech playback is asynchronous.`;
+Use capabilities and focused inspections; omitted or unobserved facts are unknown. Query notes/receipts with queryMemory (paginate nextOffset); reuse exact noteKey when fresh prerequisites/current targets match, with parameters via program.parameters(). Notes are hypotheses; receipts historical. Metadata belongs in comments/separate notes; noteKey executes the entire note as source. exploreFrontier returns candidates; choose a moveTo target. Use control/control_sequence for bounded inputs. Mine observed blocks with exact blockId. goalSpec is immutable; finish verifies it. Claim effects from evidence. conversation_only uses say; plain text is invisible; speech playback is asynchronous.`;
 
 export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 	tool('observe', 'Request a fresh player observation. Read freshness and coverage; an unavailable freshness barrier returns explicitly stale cached facts.', objectSchema({})),
@@ -58,8 +60,10 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 	tool('startAction', 'Start one action you have already chosen and return its handle immediately so you can reason while it runs. Poll actionStatus for the factual result or cancel the exact handle. This does not authorize a dependent action without fresh facts.', objectSchema({ actionType: { type: 'string', enum: NATIVE_ACTION_TYPES }, arguments: { type: 'object' } }, ['actionType', 'arguments'])),
 	tool('notebook', 'Save or replace one model-written note of up to 2048 characters in this agent and world. Prefer a stable exact key for reusable routines. Keep executable ArenaScript valid; put prerequisites, current targets, outcomes, and failure conditions in comments or a separate note, and only record outcomes supported by evidence. Notes are hypotheses or plans, never authoritative game evidence.', objectSchema({ key: { type: 'string', minLength: 1, maxLength: 128 }, text: { type: 'string', minLength: 1, maxLength: 2048 } }, ['key', 'text'])),
 	tool('queryMemory', 'Read this agent and world\'s saved notes and action receipts, including unresolved dispatches. Start with notes to find reusable routines and receipts to check historical outcomes; continue every page with nextOffset. Historical receipts do not establish current world state.', objectSchema({ kind: { type: 'string', enum: ['all', 'notes', 'receipts', 'unresolved'] }, text: { type: 'string', minLength: 1, maxLength: 256 }, offset: integerSchema(0, Number.MAX_SAFE_INTEGER), limit: integerSchema(1, 64) })),
-	tool('runProgram', 'Run bounded ArenaScript that you author. Supply source or an exact notebook noteKey; noteKey executes the entire note text as ArenaScript, so keep metadata in comments or a separate note. After a fresh observation, use a small safe background:true routine for conditional or repeated work that can run while you reason. One recent-p95 advisory may arrive near timeout so you can prepare the next intention; it never chooses or dispatches actions or waives fresh-fact requirements. Reuse noteKey only when fresh facts confirm its recorded prerequisites and current target assumptions; replace only when they no longer fit. Optional observationIntervalMs requests fresh samples. background:true returns a program handle while your routine continues reacting during model reasoning; otherwise wait for its result. One program owns the body until it ends or cancelProgram settles. Programs expire within timeoutMs and never restart themselves.', objectSchema({ source: { type: 'string', minLength: 1, maxLength: MAX_PROGRAM_SOURCE_BYTES }, noteKey: { type: 'string', minLength: 1, maxLength: 128 }, background: { type: 'boolean' }, observationIntervalMs: integerSchema(100, 5000), maxActions: integerSchema(1, 256), timeoutMs: integerSchema(1, 120_000) })),
-	tool('programStatus', 'Read the running program, pending decision, or latest terminal result. Does not wait or change the player. Use it to inspect a background handle or exact attention; ordinary progress needs no polling. Background completion does not mean the goal is complete.', objectSchema({ programId: { type: 'string', minLength: 1, maxLength: 128 } })),
+	tool('runProgram', 'Run bounded ArenaScript that you author. Supply source or an exact notebook noteKey; noteKey executes the entire note text as ArenaScript, so keep metadata in comments or a separate note. Reuse matching authored routines with parameters, a pure JSON object up to 4096 UTF-8 bytes read by program.parameters(). After fresh facts, use a safe background:true routine while you reason. One recent-p95 advisory may arrive near timeout or your optional expectedDurationMs so you can author the next intention; it never chooses or dispatches actions or waives fresh-fact requirements. expectedDurationMs must not exceed timeoutMs and does not extend it. Reuse noteKey when fresh prerequisites and targets match. Optional observationIntervalMs requests fresh samples. background:true returns a handle; otherwise wait for the result. One program owns the body until it ends or cancellation settles. Each run expires within timeoutMs.', objectSchema({ source: { type: 'string', minLength: 1, maxLength: MAX_PROGRAM_SOURCE_BYTES }, noteKey: { type: 'string', minLength: 1, maxLength: 128 }, parameters: { type: 'object', description: 'Pure JSON data, at most 4096 UTF-8 bytes, depth 16 and 256 total entries.' }, background: { type: 'boolean' }, observationIntervalMs: integerSchema(100, 5000), maxActions: integerSchema(1, 256), timeoutMs: integerSchema(1, 120_000), expectedDurationMs: integerSchema(1, 120_000) })),
+	tool('queueProgram', 'Choose and queue exactly one authored successor for the exact running afterProgramId, goalRevision and programVersion. Supply source XOR noteKey and a required side-effect-free ArenaScript precondition expression evaluated against an authoritative fresh sample at handoff. Optional parameters are pure JSON data read by program.parameters(). This call replaces any pending successor for that predecessor; the runtime chooses no gameplay. Start requires successful natural PROGRAM_EXHAUSTED, no pending decision, valid lifecycle and the same world/dimension, with precondition exactly true. Failure, death, cancellation, manual finish and deadlines discard it. Its timeout starts at handoff and never extends the predecessor. Optional expectedDurationMs must fit its timeout. programStatus shows the pending successor; cancelQueuedProgram withdraws only that exact queue.', objectSchema({ afterProgramId: { type: 'string', minLength: 1, maxLength: 128 }, goalRevision: integerSchema(0, Number.MAX_SAFE_INTEGER), programVersion: integerSchema(1, Number.MAX_SAFE_INTEGER), source: { type: 'string', minLength: 1, maxLength: MAX_PROGRAM_SOURCE_BYTES }, noteKey: { type: 'string', minLength: 1, maxLength: 128 }, precondition: { type: 'string', minLength: 1, maxLength: MAX_PROGRAM_PRECONDITION_BYTES }, parameters: { type: 'object', description: 'Pure JSON data, at most 4096 UTF-8 bytes, depth 16 and 256 total entries.' }, observationIntervalMs: integerSchema(100, 5000), maxActions: integerSchema(1, 256), timeoutMs: integerSchema(1, 120_000), expectedDurationMs: integerSchema(1, 120_000) }, ['afterProgramId', 'goalRevision', 'programVersion', 'precondition'])),
+	tool('cancelQueuedProgram', 'Withdraw the exact pending successor using afterProgramId, goalRevision and queueId. Leaves the predecessor running; a stale queue handle cannot cancel its replacement.', objectSchema({ afterProgramId: { type: 'string', minLength: 1, maxLength: 128 }, goalRevision: integerSchema(0, Number.MAX_SAFE_INTEGER), queueId: { type: 'string', minLength: 1, maxLength: 128 } }, ['afterProgramId', 'goalRevision', 'queueId'])),
+	tool('programStatus', 'Read the running program, pending decision, pendingSuccessor summary, or latest terminal result. Does not wait or change the player. Use it to inspect a background handle or exact attention; ordinary progress needs no polling. Background completion does not mean the goal is complete.', objectSchema({ programId: { type: 'string', minLength: 1, maxLength: 128 } })),
 	tool('respondProgram', 'Answer the exact pending program decision. Continue preserves authored work. Replace installs new source after releasing the old action and retains the original deadline and action budget; use it when fresh facts invalidate prerequisites or current targets. Pause and finish stop the routine; finish still requires separate factual goal verification.', objectSchema({ programId: { type: 'string', minLength: 1, maxLength: 128 }, goalRevision: integerSchema(0, Number.MAX_SAFE_INTEGER), decisionId: { type: 'string', minLength: 1, maxLength: 256 }, directive: { type: 'string', enum: ['continue', 'pause', 'replace', 'finish'] }, source: { type: 'string', minLength: 1, maxLength: MAX_PROGRAM_SOURCE_BYTES } }, ['programId', 'goalRevision', 'decisionId', 'directive'])),
 	tool('cancelProgram', 'Cancel the exact program and wait for its result. New body actions remain blocked while cancellation is unconfirmed. Handles are scoped to this agent and goal revision.', objectSchema({ programId: { type: 'string', minLength: 1, maxLength: 128 }, goalRevision: integerSchema(0, Number.MAX_SAFE_INTEGER) }, ['programId', 'goalRevision'])),
 	tool('lookAround', 'Turn through 2 to 8 camera steps, sampling fresh facts at each heading. Returns bounded historical sightings with timestamps and omitted counts; reacquire targets before acting.', objectSchema({
@@ -95,12 +99,13 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 		limit: integerSchema(1, 64),
 		blockId: { type: 'string', minLength: 1, maxLength: MAX_IDENTIFIER_LENGTH },
 	})),
-	tool('mine', 'Mine one in-range block with its exact current blockId. First aim at its center using act with look_at; the block must be exactly under the crosshair, not merely visible.', objectSchema({
+	tool('mine', 'Mine one chosen in-range block with its exact current blockId. First aim at its center using act with look_at, or opt into autoAim:true to execute that same center aim followed by mining as a two-step sequence. Failure stops the sequence; no alternate target is chosen. Default mining requires the exact block under the crosshair.', objectSchema({
 		x: integerSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT),
 		y: integerSchema(-2_048, 2_048),
 		z: integerSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT),
 		expectedBlockId: { type: 'string', minLength: 1, maxLength: MAX_IDENTIFIER_LENGTH },
 		timeoutMs: integerSchema(1, 120_000),
+		autoAim: { type: 'boolean' },
 	}, ['x', 'y', 'z', 'expectedBlockId'])),
 	tool('say', 'Send public chat, a private message, or nearby proximity speech.', objectSchema({
 		message: { type: 'string', minLength: 1, maxLength: MAX_CHAT_LENGTH },
@@ -186,12 +191,16 @@ export function normalizeMinecraftToolCall(name, value) {
 			if (args.kind !== undefined && !['all', 'notes', 'receipts', 'unresolved'].includes(args.kind)) invalid('kind is not supported');
 			return { kind: 'query_memory', memoryKind: args.kind ?? 'all', offset: optionalInteger(args.offset, 0, 'offset', 0, Number.MAX_SAFE_INTEGER), limit: optionalInteger(args.limit, 20, 'limit', 1, 64), ...(args.text === undefined ? {} : { text: boundedText(args.text, 'text', 256) }) };
 		case 'runProgram': {
-			requireExactKeys(args, ['source', 'noteKey', 'background', 'observationIntervalMs', 'maxActions', 'timeoutMs']);
-			if ((args.source === undefined) === (args.noteKey === undefined)) invalid('Supply exactly one of source or noteKey');
-			const source = args.source === undefined ? undefined : boundedText(args.source, 'source', MAX_PROGRAM_SOURCE_BYTES);
-			if (source !== undefined && Buffer.byteLength(source, 'utf8') > MAX_PROGRAM_SOURCE_BYTES) invalid('source must fit 65536 UTF-8 bytes');
-			return { kind: 'run_program', ...(source === undefined ? { noteKey: boundedText(args.noteKey, 'noteKey', 128) } : { source }), ...(args.background === undefined ? {} : { background: optionalBoolean(args.background, false, 'background') }), ...(args.observationIntervalMs === undefined ? {} : { observationIntervalMs: integer(args.observationIntervalMs, 'observationIntervalMs', 100, 5000) }), maxActions: optionalInteger(args.maxActions, 64, 'maxActions', 1, 256), timeoutMs: optionalInteger(args.timeoutMs, 30_000, 'timeoutMs', 1, 120_000) };
+			requireExactKeys(args, ['source', 'noteKey', 'parameters', 'background', 'observationIntervalMs', 'maxActions', 'timeoutMs', 'expectedDurationMs']);
+			return { kind: 'run_program', ...normalizeProgramArguments(args), ...(args.background === undefined ? {} : { background: optionalBoolean(args.background, false, 'background') }) };
 		}
+		case 'queueProgram': {
+			requireExactKeys(args, ['afterProgramId', 'goalRevision', 'programVersion', 'source', 'noteKey', 'parameters', 'precondition', 'observationIntervalMs', 'maxActions', 'timeoutMs', 'expectedDurationMs']);
+			return { kind: 'queue_program', afterProgramId: boundedText(args.afterProgramId, 'afterProgramId', 128), goalRevision: integer(args.goalRevision, 'goalRevision', 0, Number.MAX_SAFE_INTEGER), programVersion: integer(args.programVersion, 'programVersion', 1, Number.MAX_SAFE_INTEGER), precondition: boundedUtf8Text(args.precondition, 'precondition', MAX_PROGRAM_PRECONDITION_BYTES), ...normalizeProgramArguments(args) };
+		}
+		case 'cancelQueuedProgram':
+			requireExactKeys(args, ['afterProgramId', 'goalRevision', 'queueId']);
+			return { kind: 'cancel_queued_program', afterProgramId: boundedText(args.afterProgramId, 'afterProgramId', 128), goalRevision: integer(args.goalRevision, 'goalRevision', 0, Number.MAX_SAFE_INTEGER), queueId: boundedText(args.queueId, 'queueId', 128) };
 		case 'programStatus':
 			requireExactKeys(args, ['programId']);
 			return { kind: 'program_status', ...(args.programId === undefined ? {} : { programId: boundedText(args.programId, 'programId', 128) }) };
@@ -253,8 +262,9 @@ export function normalizeMinecraftToolCall(name, value) {
 			};
 		}
 		case 'mine':
-			requireExactKeys(args, ['x', 'y', 'z', 'expectedBlockId', 'timeoutMs']);
+			requireExactKeys(args, ['x', 'y', 'z', 'expectedBlockId', 'timeoutMs', 'autoAim']);
 			try {
+				const autoAim = optionalBoolean(args.autoAim, false, 'autoAim');
 				const action = validateAction({
 					type: 'break_block',
 					x: integer(args.x, 'x', -COORDINATE_LIMIT, COORDINATE_LIMIT),
@@ -263,6 +273,11 @@ export function normalizeMinecraftToolCall(name, value) {
 					expectedBlockId: boundedText(args.expectedBlockId, 'expectedBlockId', MAX_IDENTIFIER_LENGTH),
 					timeoutMs: optionalInteger(args.timeoutMs, 15_000, 'timeoutMs', 1, 120_000),
 				});
+				if (autoAim) {
+					// Expand only the caller's chosen target; the sequence executor stops on failed aim.
+					const aim = validateAction({ type: 'look_at', x: action.x + 0.5, y: action.y + 0.5, z: action.z + 0.5 });
+					return { kind: 'sequence', actions: [{ actionType: aim.type, arguments: stripActionType(aim) }, { actionType: action.type, arguments: stripActionType(action) }] };
+				}
 				return { kind: 'action', actionType: action.type, arguments: stripActionType(action) };
 			} catch (error) {
 				invalid(error?.message ?? 'invalid mining arguments');
@@ -291,6 +306,7 @@ export function normalizeMinecraftToolCall(name, value) {
 			const actionArguments = requireObject(args.arguments);
 			if (Object.hasOwn(actionArguments, 'type')) invalid('arguments.type is reserved; use actionType');
 			if (args.actionType === 'break_block') {
+				requireExactKeys(actionArguments, ACTION_FIELDS.break_block);
 				const normalized = normalizeMinecraftToolCall('mine', actionArguments);
 				return { kind: 'action', actionType: normalized.actionType, arguments: normalized.arguments };
 			}
@@ -336,10 +352,6 @@ function normalizeSequenceAction(value) {
 	requireExactKeys(action, ['actionType', 'arguments']);
 	if (action.actionType === 'navigate_to') {
 		const normalized = normalizeMinecraftToolCall('moveTo', action.arguments);
-		return { actionType: normalized.actionType, arguments: normalized.arguments };
-	}
-	if (action.actionType === 'break_block') {
-		const normalized = normalizeMinecraftToolCall('mine', action.arguments);
 		return { actionType: normalized.actionType, arguments: normalized.arguments };
 	}
 	const normalized = normalizeMinecraftToolCall('act', action);
@@ -469,7 +481,20 @@ function compactToolResult(value, budget = MAX_TOOL_RESULT_BYTES) {
 
 function resultMetadata(value) {
 	if (value === null || typeof value !== 'object') return {};
-	return Object.fromEntries(['actionId', 'goalRevision', 'eventSequence', 'freshness', 'coverage', 'revision', 'sectionRevisions', 'observedAtEpochMs', 'executionSettings', 'unresolvedActions'].filter((key) => value[key] !== undefined).map((key) => [key, value[key]]));
+	return {
+		...Object.fromEntries(['actionId', 'programId', 'programVersion', 'queueId', 'afterProgramId', 'goalRevision', 'eventSequence', 'freshness', 'coverage', 'revision', 'sectionRevisions', 'observedAtEpochMs', 'executionSettings', 'unresolvedActions'].filter((key) => value[key] !== undefined).map((key) => [key, value[key]])),
+		...Object.fromEntries(['actionsSucceeded', 'actionsFailed'].filter((key) => value[key] !== undefined).map((key) => [key, Number.isSafeInteger(value[key]) && value[key] >= 0 ? value[key] : null])),
+		...(typeof value.successorProgramId === 'string' ? { successorProgramId: boundedResultField(value.successorProgramId, 128) } : {}),
+		...Object.fromEntries(['pendingSuccessor', 'discardedSuccessor'].filter((key) => value[key] !== undefined).map((key) => [key, compactSuccessorSummary(value[key])])),
+	};
+}
+
+function compactSuccessorSummary(value) {
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+	return {
+		...Object.fromEntries(['queueId', 'afterProgramId', 'state', 'sourceOrigin', 'reasonCode'].filter((key) => typeof value[key] === 'string').map((key) => [key, boundedResultField(value[key], key === 'state' || key === 'sourceOrigin' ? 64 : 128)])),
+		...Object.fromEntries(['goalRevision', 'programVersion', 'maxActions', 'timeoutMs'].filter((key) => value[key] !== undefined).map((key) => [key, Number.isSafeInteger(value[key]) && value[key] >= 0 ? value[key] : null])),
+	};
 }
 
 function compactInteraction(interaction) {
@@ -547,7 +572,7 @@ function isSequenceResult(value) {
 }
 
 function compactProgramResult(value) {
-	const result = { state: boundedResultField(value.state, 64), reasonCode: boundedResultField(value.reasonCode, 128), programId: boundedResultField(value.programId, 256), actions: safeResultInteger(value.actions), eventSequence: safeResultInteger(value.eventSequence), ...(value.finishRequested === true ? { finishRequested: true } : {}), receipts: [], truncated: true, detail: 'Program observations were omitted. Query historical receipts by bodyActionId and observe for current facts.' };
+	const result = { ...resultMetadata(value), state: boundedResultField(value.state, 64), reasonCode: boundedResultField(value.reasonCode, 128), programId: boundedResultField(value.programId, 256), actions: safeResultInteger(value.actions), eventSequence: safeResultInteger(value.eventSequence), ...(value.finishRequested === true ? { finishRequested: true } : {}), receipts: [], truncated: true, detail: 'Program observations were omitted. Query historical receipts by bodyActionId and observe for current facts.' };
 	if (value.observation) {
 		const compact = compactToolResult({ observation: value.observation }, MAX_TOOL_RESULT_BYTES - 2048);
 		if (Buffer.byteLength(JSON.stringify(compact), 'utf8') < MAX_TOOL_RESULT_BYTES - 2048) {
@@ -657,6 +682,30 @@ function requireExactKeys(value, allowed) {
 function boundedText(value, field, maximum) {
 	if (typeof value !== 'string' || value.trim().length === 0 || value.length > maximum) invalid(`${field} must be 1 to ${maximum} characters`);
 	return value;
+}
+
+function boundedUtf8Text(value, field, maximum) {
+	boundedText(value, field, maximum);
+	if (Buffer.byteLength(value, 'utf8') > maximum) invalid(`${field} must fit ${maximum} UTF-8 bytes`);
+	return value;
+}
+
+function normalizeProgramArguments(args) {
+	if ((args.source === undefined) === (args.noteKey === undefined)) invalid('Supply exactly one of source or noteKey');
+	const timeoutMs = optionalInteger(args.timeoutMs, 30_000, 'timeoutMs', 1, 120_000);
+	let parameters;
+	if (args.parameters !== undefined) {
+		try { parameters = validateProgramParameters(args.parameters); }
+		catch (error) { invalid(error?.message ?? 'parameters must be bounded pure JSON data'); }
+	}
+	return {
+		...(args.source === undefined ? { noteKey: boundedText(args.noteKey, 'noteKey', 128) } : { source: boundedUtf8Text(args.source, 'source', MAX_PROGRAM_SOURCE_BYTES) }),
+		...(parameters === undefined ? {} : { parameters }),
+		...(args.observationIntervalMs === undefined ? {} : { observationIntervalMs: integer(args.observationIntervalMs, 'observationIntervalMs', 100, 5000) }),
+		maxActions: optionalInteger(args.maxActions, 64, 'maxActions', 1, 256),
+		timeoutMs,
+		...(args.expectedDurationMs === undefined ? {} : { expectedDurationMs: integer(args.expectedDurationMs, 'expectedDurationMs', 1, timeoutMs) }),
+	};
 }
 
 function finiteNumber(value, field, minimum, maximum) {

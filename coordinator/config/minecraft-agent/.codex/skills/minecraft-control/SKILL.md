@@ -10,8 +10,8 @@ Native tools apply your chosen actions and report what happened. Plain assistant
 ## Read facts, choose, act, verify
 
 1. Read the current goal, newest event, and last result. Use capabilities when you need unfamiliar fields or runtime settings. Observe repeats the effective settings; a provider mapping does not change your selected identity.
-2. Act from fresh supplied facts. Use observe to refresh a sample or inspect to fill a specific detail; neither is needed when the last result already supplies it. Check freshness, coverage, world identity, dimension, and revisions.
-3. For repeated work, read programReference and author a bounded runProgram routine with a completion condition and attention policy. Use background:true to keep it active while you reason. Choose targets from fresh program facts on each iteration, including new drop UUIDs and menu states. Return to model planning when the routine lacks a valid next step. Use sequence for a fixed batch of known steps and individual tools for isolated actions.
+2. Act from fresh supplied facts. Reuse fresh result facts and request only missing details. Batch known independent inspections in the same turn; choose dependent actions after their results. Check freshness, coverage, world identity, dimension, and revisions.
+3. For repeated work, read programReference and author a bounded runProgram routine with a completion condition and attention policy. Use background:true while you reason. Reuse matching notebook source with current parameters. Choose targets from fresh program facts on each iteration, including new drop UUIDs and menu states. Queue one chosen successor while current work runs, with a precondition checked from fresh facts at handoff. Return to model planning when the routine lacks a valid next step. Use sequence for a small fixed batch of known safe steps and individual tools for isolated actions.
 4. Distinguish accepted input, attempted use, projectile spawn, verified effect, and verified goal. Finish asks the server to check the immutable goal contract. A failed check leaves it active.
 
 ## Observations and memory
@@ -36,11 +36,13 @@ StartAction returns a handle immediately. ActionStatus reads its state or termin
 
 RunProgram executes your ArenaScript using the same interpreter as script mode. Source is at most 65536 UTF-8 bytes; maxActions defaults to 64 and caps at 256; timeoutMs defaults to 30000 and caps at 120000. Author an explicit program.onUnhandledAttention mode: continue_and_notify completes the current action before yielding; pause_and_notify cancels it before yielding. Watchers, branches, selected targets, and reactions come from your source. No other model plans its steps. Player calls await correlated physical results and new observation barriers; world.inspect and world.queryMemory are bounded reads, world.remember writes your notes. A deadline or lifecycle change stops further steps and requests release of its physical action; unknown acknowledgement remains uncertain. Program completion or program.finish yields to you; use the separate finish tool for factual goal verification.
 
+Optional parameters is a pure JSON object, at most 4096 serialized UTF-8 bytes, depth 16 and 256 total object properties/array entries. Its detached, immutable data is available through program.parameters(). Supply observed coordinates, exact identities and quantities without rewriting tested source. Match current prerequisites before reuse; parameters supply data, never extra commands. Optional expectedDurationMs is your estimated duration from 1 to timeoutMs. It can bring the measured planning advisory before source completion; it does not extend the deadline or guarantee preparation finishes in time.
+
 ## Interaction details
 
 Move to a standing position beside a solid target, with room for both feet and head. Removing a tree's bottom log still leaves the next log at head height. Use the goal's allowed tolerance; a tighter tolerance needlessly excludes safe positions. After NO_STANDABLE_PATH, choose another observed approach with clearance.
 
-Mining requires an observed, reachable non-air expectedBlockId and the exact block under the crosshair. For one known reachable block, prefer a sequence of look_at at its center, then break_block. A broken block does not prove collection. Blocking mining, movement, and pickup return postAction with updated inventory and entities. Use these facts when freshness.fresh is true; otherwise observe before a dependent action.
+Mining requires an observed, reachable non-air expectedBlockId and the exact block under the crosshair. For one known reachable block, use mine with autoAim:true or a sequence of look_at at its center, then break_block. AutoAim expands to those two actions at the same chosen coordinates and expectedBlockId, stopping if aim fails. Omitted or false autoAim preserves the single mining action. It selects no alternate target. A broken block does not prove collection. Blocking mining, movement, and pickup return postAction with updated inventory and entities. Use these facts when freshness.fresh is true; otherwise observe before a dependent action.
 
 For a resource goal with multiple accepted item types, compare fresh visible sources and choose the nearest reachable one. Reassess when its route or collection fails. For a quantity goal, count held matching items and collect reachable matching drops toward the remaining amount before mining more. Drops can enter inventory automatically as you approach. Once inventory meets goalSpec, request finish. Only request pick_up_item while more is needed and the UUID appears in fresh facts, including after ITEM_PICKED_UP. ITEM_NOT_FOUND means the selected entity is unavailable. Reconcile inventory and reacquire remaining drops. Melee attempts and bow release also need effect evidence before claiming a hit.
 
@@ -150,15 +152,43 @@ Run your bounded ArenaScript through the shared interpreter. This example reads 
 {"tool":"runProgram","arguments":{"source":"program.onUnhandledAttention(\"pause_and_notify\"); const self = player.state(); if (self.health > 0) { await player.wait(50); }","maxActions":4,"timeoutMs":5000}}
 ```
 
+Save valid source under an exact notebook key; keep its prerequisites in comments or a separate note. Parameters let the same authored source use new data. This illustration waits only after checking the current player state.
+
+```json executor-call
+{"tool":"notebook","arguments":{"key":"bounded-wait","text":"// Prerequisite: alive player; durationMs is a chosen bounded wait.\nprogram.onUnhandledAttention(\"pause_and_notify\"); const p = program.parameters(); if (player.state().health > 0) { await player.wait(p.durationMs); }"}}
+```
+
+```json executor-call
+{"tool":"runProgram","arguments":{"noteKey":"bounded-wait","parameters":{"durationMs":50},"background":true,"maxActions":1,"timeoutMs":5000,"expectedDurationMs":50}}
+```
+
 Set `background:true` when your authored routine should continue acting or reacting while you reason. It returns a `programId` and `goalRevision`; the routine retains exclusive body control. Observations, inspection, memory, and program status remain available. Choose your own watcher conditions and responses from current facts. Use `capabilities` with `section:"program"` for the language reference.
 
 A program ends on exhaustion, failure, cancellation, its action budget, or its deadline (at most 120 seconds). Watchers and sampling end with it. Background programs never restart themselves and do not survive stop, death, goal replacement, or disconnect. Cancel the program and wait for its result before issuing another body action. An `UNKNOWN` cancellation result requires checking the active action; input release is unconfirmed.
 
 With `continue_and_notify`, unhandled attention requests your decision while the authorised routine continues. With `pause_and_notify`, it cancels the current input and waits for your decision. A foreground call returns a live handle on attention so you can respond too. Program attention and completion arrive as events; use `programStatus` to recover the latest handle when needed. Ordinary progress does not require replanning.
 
+### queueProgram
+
+While a background routine runs, choose its next bounded work and queue exactly one successor. Copy `afterProgramId`, `goalRevision`, and `programVersion` from the current handle/status. Supply source or an exact noteKey, optional parameters and bounds, and a required `precondition`: one side-effect-free ArenaScript expression, at most 4096 UTF-8 bytes. The expression reads fresh facts and successor parameters. It must evaluate to exactly true; an unknown or changed prerequisite drops the queue.
+
+```json executor-call
+{"tool":"queueProgram","arguments":{"afterProgramId":"native-program-session-1","goalRevision":3,"programVersion":1,"source":"program.onUnhandledAttention(\"pause_and_notify\"); await player.wait(program.parameters().durationMs);","parameters":{"durationMs":50},"precondition":"player.state().health > 0 && !player.state().dead","maxActions":1,"timeoutMs":5000,"expectedDurationMs":50}}
+```
+
+Invoking queueProgram again explicitly replaces the pending successor for that predecessor and returns a new queueId. The runtime performs no strategy selection. Handoff requires successful natural `PROGRAM_EXHAUSTED`, no pending program decision, a valid lifecycle, the same world/dimension, and an authoritative fresh observation after the predecessor ends. Failure, death, cancellation, manual finish, checkpoint, action budget, or deadline cannot start it. Each successor gets its own timeout from handoff; the predecessor's deadline stays fixed. A successor can also have one explicitly authored next queue while it runs.
+
+### cancelQueuedProgram
+
+Withdraw only the exact pending queue. Copy its queueId and predecessor identity from programStatus. The current routine keeps running, and a stale handle cannot cancel a newer replacement queue.
+
+```json executor-call
+{"tool":"cancelQueuedProgram","arguments":{"afterProgramId":"native-program-session-1","goalRevision":3,"queueId":"native-queue-session-1"}}
+```
+
 ### programStatus
 
-Read a running program or the latest retained terminal result. Supply the exact handle when checking a particular program. A terminal program result does not prove goal completion; use `finish` for that.
+Read a running program, pending decision, pendingSuccessor summary, or the latest retained terminal result. The summary carries the exact queue identity and execution bounds. Supply the exact handle when checking a particular program. A terminal program result does not prove goal completion; use `finish` for that.
 
 ```json executor-call
 {"tool":"programStatus","arguments":{"programId":"native-program-session-1"}}
@@ -222,6 +252,10 @@ Mine one observed, visible, in-range block coordinate with its exact current blo
 
 ```json executor-call
 {"tool":"mine","arguments":{"x":11,"y":64,"z":10,"expectedBlockId":"minecraft:oak_log","timeoutMs":15000}}
+```
+
+```json executor-call
+{"tool":"mine","arguments":{"x":11,"y":64,"z":10,"expectedBlockId":"minecraft:oak_log","timeoutMs":15000,"autoAim":true}}
 ```
 
 ### say
@@ -574,6 +608,12 @@ No arguments.
 
 ## Dependent calls and rejected inputs
 
+Read independent missing details together when their arguments are already known. Keep batches small enough to review their coverage and freshness.
+
+```json executor-calls
+{"calls":[{"tool":"inspect","arguments":{"section":"inventory","offset":0,"limit":16}},{"tool":"inspect","arguments":{"section":"mechanics","offset":0,"limit":16}}]}
+```
+
 A combined turn can use a known look coordinate and then read its observation. Wait for the observation before choosing an unseen target.
 
 ```json executor-calls
@@ -620,4 +660,16 @@ These inputs fail the tool boundary. A valid call can still fail current world c
 
 ```json executor-bad-call
 {"tool":"say","arguments":{"message":"Hello","audience":"direct"}}
+```
+
+```json executor-bad-call
+{"tool":"queueProgram","arguments":{"afterProgramId":"native-program-session-1","goalRevision":3,"programVersion":1,"source":"program.onUnhandledAttention(\"pause_and_notify\"); await player.wait(50);"}}
+```
+
+```json executor-bad-call
+{"tool":"cancelQueuedProgram","arguments":{"afterProgramId":"native-program-session-1","goalRevision":3}}
+```
+
+```json executor-bad-call
+{"tool":"runProgram","arguments":{"noteKey":"bounded-wait","parameters":[],"timeoutMs":5000}}
 ```

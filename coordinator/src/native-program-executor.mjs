@@ -5,6 +5,7 @@ import { freezeQueryResult } from './arena-script/interpreter.mjs';
 import { adaptObservation } from './observation-adapter.mjs';
 import { normalizeMinecraftToolCall } from './native-minecraft-tools.mjs';
 import { validateAction } from './schema.mjs';
+import { validateProgramParameters } from './program-parameters.mjs';
 
 const TERMINAL = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT']);
 
@@ -19,9 +20,11 @@ export class NativeProgramExecutor {
 		this.#setTimeout = setTimeoutFn; this.#clearTimeout = clearTimeoutFn; this.#cancellationTimeoutMs = cancellationTimeoutMs;
 	}
 
-	run(record, { source, maxActions = 64, timeoutMs = 30_000, planningLeadMs, observationIntervalMs, programId: suppliedProgramId, provenance = {} } = {}, context = {}) {
+	run(record, { source, parameters, maxActions = 64, timeoutMs = 30_000, expectedDurationMs, planningLeadMs, observationIntervalMs, programId: suppliedProgramId, provenance = {} } = {}, context = {}) {
 		validateRecord(record);
 		integer(maxActions, 'maxActions', 1, 256); integer(timeoutMs, 'timeoutMs', 1, 120_000);
+		if (expectedDurationMs !== undefined) integer(expectedDurationMs, 'expectedDurationMs', 1, timeoutMs);
+		parameters = validateProgramParameters(parameters);
 		if (planningLeadMs !== undefined && planningLeadMs !== null) integer(planningLeadMs, 'planningLeadMs', 0, Number.MAX_SAFE_INTEGER);
 		if (observationIntervalMs !== undefined) {
 			integer(observationIntervalMs, 'observationIntervalMs', 100, 5000);
@@ -35,7 +38,7 @@ export class NativeProgramExecutor {
 		if (typeof programId !== 'string' || !/^[A-Za-z0-9._:-]{1,128}$/.test(programId)) throw new TypeError('programId must be a bounded identifier');
 		let resolve;
 		const result = new Promise((done) => { resolve = done; });
-		const run = { record: { ...record }, context, programId, maxActions, timeoutMs, planningLeadMs: planningLeadMs ?? null, actions: 0, receipts: [], resolve, result,
+		const run = { record: { ...record }, context, programId, maxActions, timeoutMs, expectedDurationMs, planningLeadMs: planningLeadMs ?? null, actions: 0, actionsSucceeded: 0, actionsFailed: 0, receipts: [], resolve, result,
 			settled: false, bodyPending: false, pendingActionId: null, stopping: null, timer: null, planningDueTimer: null, planningDueNotified: false, planningDueVersion: null, cancellationTimer: null,
 			observation: programObservation(context.observation), eventSequence: context.eventSequence, engine: null,
 			observationIntervalMs, observationTimer: null, refresh: null, decision: null, decisionSequence: 0 };
@@ -51,7 +54,7 @@ export class NativeProgramExecutor {
 		try {
 			run.engine.install({ agentId: record.agentId, provider: record.provider, modelIdentity: record.model, reasoningEffort: record.reasoningEffort,
 				serviceTier: record.serviceTier ?? 'priority', goalRevision: record.goalRevision, programId, version: 1, compiled,
-				traceId: provenance.traceId ?? programId, observation: run.observation, eventSequence: run.eventSequence });
+				traceId: provenance.traceId ?? programId, parameters, observation: run.observation, eventSequence: run.eventSequence });
 			this.#schedulePlanningDue(run);
 			this.#check(run);
 			this.#scheduleObservation(run);
@@ -102,7 +105,7 @@ export class NativeProgramExecutor {
 			|| run.planningLeadMs <= 0 || typeof run.context.onPlanningDue !== 'function') return;
 		const snapshot = run.engine.snapshot();
 		run.planningDueVersion = snapshot.version;
-		const delay = Math.max(0, run.timeoutMs - run.planningLeadMs);
+		const delay = Math.max(0, (run.expectedDurationMs ?? run.timeoutMs) - run.planningLeadMs);
 		run.planningDueTimer = this.#setTimeout(() => {
 			run.planningDueTimer = null;
 			// The advisory belongs to the version for which the deadline timer was
@@ -208,6 +211,8 @@ export class NativeProgramExecutor {
 			void Promise.resolve().then(() => run.context.cancelAction(command.actionId, 'INVALID_ACTION_RESULT')).catch(() => {});
 			this.#return(run, { state: 'UNKNOWN', reasonCode: 'INVALID_ACTION_RESULT' }, true); return;
 		}
+		if (result.state === 'SUCCEEDED') run.actionsSucceeded++;
+		else run.actionsFailed++;
 		run.receipts.push({ actionId: command.actionId, actionType: command.action.type, sourceStepId: command.provenance.stepId,
 			state: result.state, reasonCode: result.reasonCode,
 			...(typeof result.actionId === 'string' ? { bodyActionId: result.actionId } : {}),
@@ -303,8 +308,8 @@ export class NativeProgramExecutor {
 		this.#runs.delete(run.record.agentId);
 		const snapshot = run.engine.snapshot();
 		run.engine.dispose();
-		run.resolve({ ...outcome, programId: run.programId, actions: run.actions, receipts: run.receipts, eventSequence: snapshot.eventSequence,
-			observation: run.observation, ...(run.actions > 64 ? { omittedReceipts: run.actions - run.receipts.length } : {}) });
+		run.resolve({ ...outcome, programId: run.programId, programVersion: snapshot.version, actions: run.actions, actionsSucceeded: run.actionsSucceeded, actionsFailed: run.actionsFailed, receipts: run.receipts, eventSequence: snapshot.eventSequence,
+			observation: run.observation, ...(run.decision === null ? {} : { decision: structuredClone(run.decision) }), ...(run.actions > 64 ? { omittedReceipts: run.actions - run.receipts.length } : {}) });
 	}
 
 	#clearPlanningDue(run) {
