@@ -1,0 +1,217 @@
+{
+    "status":  "PASSED",
+    "installedJar":  {
+                         "name":  "arena-agents-0.2.0.jar",
+                         "sha256":  "0d3a542a8c41dad92dfadfde2884b04bd1a56fbe4154ab1f58cda58a08b3df34"
+                     },
+    "providerUsed":  false,
+    "aiPerformanceMeasured":  false,
+    "fixtureAuthorship":  "deterministic test script with declared selected-agent profile provenance",
+    "entryPoint":  "normalizeMinecraftToolCall -\u003e NativeToolRuntime -\u003e authenticated MultiplexedServerBridge -\u003e installed Fabric mod",
+    "observationEntryPoint":  "passive inspection_request(section:observation), plus production observation/action_progress/action_result callbacks",
+    "fixtureSetupUsesOperatorCommands":  true,
+    "checks":  [
+                   {
+                       "name":  "vanilla infinite Haste survives real observation ingress and subsequent actions",
+                       "status":  "PASSED",
+                       "elapsedMs":  565,
+                       "evidence":  {
+                                        "duration":  -1,
+                                        "actionState":  "SUCCEEDED",
+                                        "gameTimeBefore":  56,
+                                        "gameTimeAfter":  60,
+                                        "providerCalls":  0
+                                    }
+                   },
+                   {
+                       "name":  "parameterized routine and ready queued successor execute real independent programs",
+                       "status":  "PASSED",
+                       "elapsedMs":  2931,
+                       "evidence":  {
+                                        "predecessorProgramId":  "native-program-native-successor-live-2",
+                                        "successorProgramId":  "native-program-native-successor-live-6",
+                                        "sameSourceSha256":  "6e2ef2c55fd2e587ad5e5d183994776a8809194f5627129f2811663d529a7158",
+                                        "authoredSourceUnchanged":  true,
+                                        "expectedActionSha256":  "d33e16599b815415cdcbaff15ba23dba8238782de7376c505ff9640ae8a0406a",
+                                        "actualActionSha256":  "d33e16599b815415cdcbaff15ba23dba8238782de7376c505ff9640ae8a0406a",
+                                        "selectedProfilePreserved":  true,
+                                        "actions":  [
+                                                        {
+                                                            "actionType":  "wait",
+                                                            "arguments":  {
+                                                                              "durationMs":  1200
+                                                                          }
+                                                        },
+                                                        {
+                                                            "actionType":  "look_at",
+                                                            "arguments":  {
+                                                                              "x":  2.5,
+                                                                              "y":  65.5,
+                                                                              "z":  0.5
+                                                                          }
+                                                        },
+                                                        {
+                                                            "actionType":  "wait",
+                                                            "arguments":  {
+                                                                              "durationMs":  100
+                                                                          }
+                                                        },
+                                                        {
+                                                            "actionType":  "look_at",
+                                                            "arguments":  {
+                                                                              "x":  0.5,
+                                                                              "y":  65.5,
+                                                                              "z":  3.5
+                                                                          }
+                                                        }
+                                                    ],
+                                        "successorMaxActions":  2,
+                                        "successorTimeoutMs":  3000,
+                                        "predecessorMaxActions":  2,
+                                        "predecessorTimeoutMs":  5000,
+                                        "handoffGapMs":  87.93379999999979,
+                                        "physicalLookResults":  [
+                                                                    {
+                                                                        "state":  "SUCCEEDED",
+                                                                        "reasonCode":  "ACTION_COMPLETED",
+                                                                        "physicalAttempted":  true
+                                                                    },
+                                                                    {
+                                                                        "state":  "SUCCEEDED",
+                                                                        "reasonCode":  "ACTION_COMPLETED",
+                                                                        "physicalAttempted":  true
+                                                                    }
+                                                                ],
+                                        "finalView":  {
+                                                          "yaw":  -0.00000762939453125,
+                                                          "pitch":  2.2905499935150146
+                                                      }
+                                    }
+                   },
+                   {
+                       "name":  "fresh world tick makes an initially true queued precondition false",
+                       "status":  "PASSED",
+                       "elapsedMs":  1346,
+                       "evidence":  {
+                                        "queueId":  "native-queue-native-successor-live-11",
+                                        "initiallyTrueGameTime":  119,
+                                        "maxTick":  124,
+                                        "freshGameTime":  163,
+                                        "rejectedReason":  "SUCCESSOR_PRECONDITION_FALSE",
+                                        "successorDispatched":  false,
+                                        "guardObservationReady":  true
+                                    }
+                   },
+                   {
+                       "name":  "truthy nonboolean precondition cannot authorize a successor",
+                       "status":  "PASSED",
+                       "elapsedMs":  852,
+                       "evidence":  {
+                                        "healthValue":  20,
+                                        "rejectedReason":  "SUCCESSOR_PRECONDITION_FALSE",
+                                        "successorDispatched":  false
+                                    }
+                   },
+                   {
+                       "name":  "optional mine autoAim preserves exact block coordinates and block identity",
+                       "status":  "PASSED",
+                       "elapsedMs":  3961,
+                       "evidence":  {
+                                        "target":  {
+                                                       "x":  1,
+                                                       "y":  64,
+                                                       "z":  0,
+                                                       "expectedBlockId":  "minecraft:oak_log",
+                                                       "timeoutMs":  10000
+                                                   },
+                                        "defaultMineReasonCode":  "TARGET_NOT_VISIBLE",
+                                        "actualActions":  [
+                                                              {
+                                                                  "actionType":  "look_at",
+                                                                  "arguments":  {
+                                                                                    "x":  1.5,
+                                                                                    "y":  64.5,
+                                                                                    "z":  0.5
+                                                                                }
+                                                              },
+                                                              {
+                                                                  "actionType":  "break_block",
+                                                                  "arguments":  {
+                                                                                    "x":  1,
+                                                                                    "y":  64,
+                                                                                    "z":  0,
+                                                                                    "expectedBlockId":  "minecraft:oak_log",
+                                                                                    "timeoutMs":  10000
+                                                                                }
+                                                              }
+                                                          ],
+                                        "expectedActionSha256":  "c1673993cfd3b37fd4609517a3c36cdd6c19b74e010da3c3ad5f8ee34efb4d77",
+                                        "actualActionSha256":  "c1673993cfd3b37fd4609517a3c36cdd6c19b74e010da3c3ad5f8ee34efb4d77",
+                                        "exactTargetBecameAir":  true,
+                                        "adjacentDecoyUnchanged":  true,
+                                        "inventoryVerifiedBy":  [
+                                                                    "fresh live observation",
+                                                                    "RCON entity Inventory"
+                                                                ],
+                                        "inventory":  [
+                                                          {
+                                                              "itemId":  "minecraft:oak_log",
+                                                              "count":  1,
+                                                              "slot":  "mainhand",
+                                                              "tags":  [
+                                                                           "#c:natural_logs",
+                                                                           "#c:natural_logs/overworld",
+                                                                           "#minecraft:completes_find_tree_tutorial",
+                                                                           "#minecraft:logs",
+                                                                           "#minecraft:logs_that_burn",
+                                                                           "#minecraft:oak_logs"
+                                                                       ],
+                                                              "damage":  0,
+                                                              "maxDamage":  0,
+                                                              "displayName":  "Oak Log",
+                                                              "fingerprint":  "fa6051282077d07257ac82526d3e18dd28e4c1b7038d941c2841e846b838e86d",
+                                                              "maxStackSize":  64
+                                                          }
+                                                      ],
+                                        "operatorCommandsUsedForMiningOrPickup":  false
+                                    }
+                   },
+                   {
+                       "name":  "live injury interrupts mining, executes only authored retreat and waits for reconsideration",
+                       "status":  "PASSED",
+                       "elapsedMs":  1795,
+                       "evidence":  {
+                                        "injurySetup":  "Two RCON damage 2 minecraft:generic hits, with healing between them, during real mining and authored retreat",
+                                        "actionTypes":  [
+                                                            "break_block",
+                                                            "navigate_to"
+                                                        ],
+                                        "damageCommands":  2,
+                                        "rearmedAtHealth":  20,
+                                        "miningState":  "CANCELLED",
+                                        "retreatState":  "SUCCEEDED",
+                                        "autoResumedMining":  false,
+                                        "injuryCommandToRetreatDispatchMs":  86.52199999999903,
+                                        "healthAfter":  20,
+                                        "providerCalls":  0,
+                                        "tacticAuthor":  "deterministic fixture",
+                                        "rememberedPlace":  "fixture-floor"
+                                    }
+                   }
+               ],
+    "cleanup":  {
+                    "runtime":  "CLEAN",
+                    "taskMemory":  "FLUSHED",
+                    "agent":  "REMOVED"
+                },
+    "harnessCleanup":  "CLEAN",
+    "registeredProfile":  {
+                              "provider":  "codex",
+                              "model":  "gpt-6.1-sol",
+                              "reasoningEffort":  "medium",
+                              "serviceTier":  "fast"
+                          },
+    "elapsedMs":  14292,
+    "sourceSha256":  "6e2ef2c55fd2e587ad5e5d183994776a8809194f5627129f2811663d529a7158",
+    "runtimeSha256":  "15f229679b42ed0118370091c673186f8631c4c2f4e7306ec526ed0de303ca13"
+}

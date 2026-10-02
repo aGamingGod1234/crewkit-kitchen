@@ -7,12 +7,14 @@ import { validateProgramParameters } from '../program-parameters.mjs';
 const ORDINARY_PRIORITY = 'ordinary';
 const URGENT_PRIORITY = 'urgent';
 const DEFAULT_ATTENTION_TRIGGER = 'attention';
+const SURVIVAL_TRIGGERS = new Set(['damage', 'lava', 'fire', 'suffocation', 'fall']);
 
 /** Runs one provenanced ArenaScript program without adding gameplay decisions. */
 export class ArenaScriptEngine {
 	#callbacks; #vm = null; #program = null; #facts = null; #eventSequence = -1; #factsSequence = -1; #generation = 0; #lifecycleEpoch = 0; #continuationEpoch = 0;
 	#active = null; #pendingResult = null; #boundary = []; #boundaryByWatcher = new Map(); #watcherTruth = new Map(); #cancelling = null;
 	#watcherMetadata = [];
+	#watcherDecision = false;
 	#transition = null; #pendingRequest = null; #coalescedRequest = null; #pendingReplacement = null; #suspendedResult = null; #resumableUnhandled = false; #requestUpdate = null; #completed = new Map(); #deferredBase = null; #continuationRequired = false; #status = 'IDLE';
 
 	constructor({ dispatch, cancel, requestModel, inspect = null, trace = () => {} } = {}) {
@@ -58,7 +60,9 @@ export class ArenaScriptEngine {
 		const edges = this.#updateWatchers(changedFactDomains);
 		if (this.#pendingResult && !this.#cancelling && eventSequence >= this.#pendingResult.eventSequence) this.#resumeOrRunBoundary();
 		else if (!this.#active && !this.#cancelling && this.#boundary.length > 0) this.#runBoundary();
-		if (attention && edges === 0) this.#requestModel(null, { priority, trigger });
+		// The agent can waive repeated ordinary perception during a chosen leg.
+		// All fresh facts and watcher edges above remain live; urgency bypasses it.
+		if (attention && edges === 0 && (priority === URGENT_PRIORITY || this.#vm.shouldReassess(this.#facts))) this.#requestModel(null, { priority, trigger });
 		this.#requestExhaustedContinuation();
 		return this.snapshot();
 	}
@@ -159,7 +163,10 @@ export class ArenaScriptEngine {
 		this.#coalescedRequest = null;
 		this.#requestUpdate = null;
 		if (directive.directive === 'continue') {
-			if (request.decisionContext === 'completion_verification_failed') this.#status = 'FINISHED';
+			if (this.#watcherDecision) {
+				this.#watcherDecision = false; this.#resumableUnhandled = false; this.#status = 'ACTIVE';
+				this.#handleYield(this.#vm.resumeWatcherDecision(this.#facts), 'step');
+			} else if (request.decisionContext === 'completion_verification_failed') this.#status = 'FINISHED';
 			else if (this.#transition?.kind === 'terminal' && this.#transition.reason === 'unhandled_attention') this.#transition = { kind: 'resume' };
 			else if (this.#status === 'SUSPENDED' && (this.#suspendedResult || this.#resumableUnhandled)) {
 				this.#pendingResult = this.#suspendedResult; this.#suspendedResult = null; this.#resumableUnhandled = false; this.#status = 'ACTIVE';
@@ -241,15 +248,25 @@ export class ArenaScriptEngine {
 		this.#vm = new ArenaScriptInterpreter(target.compiled, SCRIPT_BINDINGS, { parameters: target.parameters });
 		this.#watcherMetadata = watcherMetadata(target.compiled);
 		this.#status = 'ACTIVE';
-		this.#handleYield(this.#vm.start(this.#facts), 'step');
+		const first = this.#vm.start(this.#facts);
+		let initialGuard = null;
 		for (let index = 0; index < target.compiled.watcherCount && this.#isLive(); index += 1) {
-			const watcherId = this.#watcherMetadata[index].id;
-			this.#watcherTruth.set(watcherId, this.#vm.evaluateWatcher(watcherId, this.#facts));
+			const metadata = this.#watcherMetadata[index], watcherId = metadata.id;
+			const truth = this.#vm.evaluateWatcher(watcherId, this.#facts);
+			this.#watcherTruth.set(watcherId, truth);
+			if (initialGuard === null && truth && metadata.mode === 'interrupt' && metadata.after === 'reconsider') initialGuard = { watcherId, mode: metadata.mode, eventSequence: this.#eventSequence, generation: this.#generation, facts: this.#facts };
 		}
+		// This opt-in guard also protects installation at already unsafe facts.
+		// Legacy watchers retain their rising-edge registration semantics.
+		if (initialGuard !== null && ['command', 'query', 'idle'].includes(first.kind)) {
+			if (first.kind !== 'idle') this.#vm.abortPendingCommand(first.stateToken);
+			this.#handleYield(this.#vm.runWatcherHandler(initialGuard.watcherId, this.#facts), watcherExecution(initialGuard));
+		} else this.#handleYield(first, 'step');
 		return this.snapshot();
 	}
 
 	#clear(resetGeneration = true) {
+		this.#watcherDecision = false;
 		this.#vm = null; this.#program = null; this.#facts = null; this.#eventSequence = -1; this.#factsSequence = -1; this.#active = null; this.#pendingResult = null; this.#watcherMetadata = [];
 		this.#boundary = []; this.#boundaryByWatcher.clear(); this.#watcherTruth.clear(); this.#cancelling = null; this.#transition = null; this.#pendingRequest = null; this.#coalescedRequest = null; this.#pendingReplacement = null; this.#suspendedResult = null; this.#resumableUnhandled = false; this.#requestUpdate = null; this.#completed.clear(); this.#deferredBase = null; this.#continuationRequired = false; this.#status = 'IDLE';
 		if (resetGeneration) this.#generation += 1;
@@ -288,6 +305,10 @@ export class ArenaScriptEngine {
 			this.#watcherTruth.set(watcherId, trueNow);
 			if (!trueNow || wasTrue) continue;
 			edges += 1;
+			// Rearming after healing must not recursively cancel the same authored
+			// response. Other watchers may still escalate with their own reactions.
+			if (metadata.after === 'reconsider' && (this.#active?.authority?.watcherId === watcherId || this.#pendingResult?.authority?.watcherId === watcherId
+				|| this.#cancelling?.latch?.watcherId === watcherId)) continue;
 			const latch = freezeRecord({ watcherId, mode: metadata.mode, eventSequence: this.#eventSequence, generation: this.#generation, facts: this.#facts });
 			this.#emitTrace('watcher_fired', { watcherId, mode: latch.mode, eventSequence: this.#eventSequence, generation: this.#generation });
 			if (latch.mode === 'interrupt' && this.#active && !this.#cancelling) {
@@ -343,6 +364,11 @@ export class ArenaScriptEngine {
 
 	#requestModel(actionFailure = null, { priority = ORDINARY_PRIORITY, trigger = DEFAULT_ATTENTION_TRIGGER, decisionContext = null } = {}) {
 		const context = requestContext(this.#program, this.#generation, this.#lifecycleEpoch, this.#continuationEpoch, this.#activeActionId(), this.#eventSequence, this.#factsSequence, this.#facts, actionFailure, { priority, trigger, decisionContext });
+		const survival = priority === URGENT_PRIORITY && SURVIVAL_TRIGGERS.has(trigger);
+		// Release unrelated input on danger, including escalation of an older request.
+		// An authored defensive handler retains its action; the runtime invents none.
+		const policy = survival ? this.#program.compiled.survivalPolicy ?? 'pause_and_notify' : this.#program.compiled.unhandledPolicy;
+		if (policy === 'pause_and_notify' && !this.#watcherDecision && !(survival && this.#active?.authority)) this.#suspendUnhandledAttention();
 		if (this.#pendingRequest) {
 			this.#coalescedRequest = mergeRequestContexts(this.#coalescedRequest ?? this.#pendingRequest, context);
 			return;
@@ -352,11 +378,11 @@ export class ArenaScriptEngine {
 		if (actionFailure === null) this.#emitTrace('attention_unhandled', { eventSequence: this.#eventSequence, factsSequence: this.#factsSequence, programId: this.#program.programId, version: this.#program.version });
 		else this.#emitTrace('program_action_failure', { eventSequence: this.#eventSequence, factsSequence: this.#factsSequence, programId: this.#program.programId, version: this.#program.version, actionFailure });
 		this.#callbacks.requestModel(context);
-		if (this.#program.compiled.unhandledPolicy === 'pause_and_notify') this.#suspendUnhandledAttention();
 	}
 
 	#invalidateLifecycleRequests() { this.#lifecycleEpoch += 1; this.#pendingRequest = null; this.#coalescedRequest = null; this.#pendingReplacement = null; this.#suspendedResult = null; this.#resumableUnhandled = false; }
 	#suspendUnhandledAttention() {
+		if (this.#status === 'SUSPENDED' && this.#resumableUnhandled || this.#transition?.reason === 'unhandled_attention') return;
 		this.#transition = { kind: 'terminal', status: 'SUSPENDED', reason: 'unhandled_attention' };
 		if (this.#active) this.#cancelActive('unhandled_attention'); else this.#completeTransition();
 	}
@@ -404,6 +430,13 @@ export class ArenaScriptEngine {
 	}
 
 	#handleYield(yielded, source) {
+		if (yielded.kind === 'watcher_decision') {
+			this.#watcherDecision = true;
+			this.#status = 'SUSPENDED';
+			this.#resumableUnhandled = true;
+			this.#requestModel(null, { priority: URGENT_PRIORITY, trigger: 'defensive_handler_completed' });
+			return;
+		}
 		if (yielded.kind === 'query') {
 			const queryId = `${this.#program.programId}:${this.#program.version}:${this.#generation}:${yielded.stateToken}`;
 			const authority = source?.authority ?? null;

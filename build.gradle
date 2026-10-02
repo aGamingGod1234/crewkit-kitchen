@@ -440,6 +440,19 @@ tasks.register('verifyCameraMixin', JavaExec) {
 	}
 }
 
+// Each mode needs a fresh JVM because AWT caches its first headless decision.
+['true', 'false', 'auto'].each { mode ->
+	tasks.register("verifyClientAwt${mode.capitalize()}", JavaExec) {
+		group = 'verification'
+		description = "Verifies desktop AWT initialization after Minecraft Main forces headless (${mode})."
+		dependsOn tasks.named('testClasses')
+		classpath = sourceSets.test.runtimeClasspath
+		mainClass.set('dev.agaminggod.arenaagents.control.ClientAwtInitializationVerification')
+		setArgs([mode, '--minecraft-main'])
+		if (mode != 'auto') systemProperty 'java.awt.headless', mode
+	}
+}
+
 def mapBlockStateCatalog = layout.projectDirectory.file('maps/registries/minecraft-26.1.2-block-states.json')
 def mapCatalogExporterClasses = layout.buildDirectory.dir('classes/java/mapCatalogExporter')
 def mapStructureDataFixerClasses = layout.buildDirectory.dir('classes/java/mapStructureDataFixer')
@@ -509,6 +522,7 @@ tasks.register('upgradeMapStructure', JavaExec) {
 
 tasks.named('check') {
 	dependsOn tasks.named('verifyCore'), tasks.named('verifyCameraMixin'), tasks.named('verifyEntrypoints'), tasks.named('verifyMapBlockStateCatalog'), tasks.named('verifyMapStructureDataFixer'), ':voice-addon:check'
+	dependsOn tasks.named('verifyClientAwtTrue'), tasks.named('verifyClientAwtFalse'), tasks.named('verifyClientAwtAuto')
 }
 
 publishing {

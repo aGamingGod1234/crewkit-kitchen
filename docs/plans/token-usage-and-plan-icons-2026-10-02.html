@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Minecraft agent input usage and plan icons</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#101719;color:#e8efee;line-height:1.55}body{max-width:880px;margin:auto;padding:32px 20px 64px}h1{font-size:clamp(27px,5vw,42px);line-height:1.15;margin:8px 0 16px}h2{margin-top:32px;font-size:21px}p,li{max-width:76ch;color:#c9d6d3}a{color:#94d7c1}.label{color:#94d7c1;font-size:13px;font-weight:650}table{width:100%;border-collapse:collapse;font-size:15px}th,td{text-align:left;padding:12px 10px;border-bottom:1px solid #344443}th{color:#94d7c1}.scroll{overflow-x:auto}strong{color:#fff}.note{padding:14px 18px;border-left:3px solid #cbb773;background:#192426}li{margin-bottom:12px}footer{margin-top:38px;font-size:13px;color:#aabbb6}
+</style>
+</head>
+<body>
+<div class="label">2 October 2026 · Implemented locally · Version 2</div>
+<h1>Reduce repeated input. Use Minecraft item icons.</h1>
+<p><strong>Goal:</strong> lower input usage and decision latency while preserving game facts, durable memory, survival checks, and the selected agent's authority over every gameplay decision. Keep the chosen connected branch map.</p>
+<p><strong>Status:</strong> local implementation and JAR build complete. Offline replay preserves every previously delivered fact. Four short GPT-6.1 Sol subscription checks passed. Desktop's running task and installed mod are unchanged. Installed icon appearance and a full gameplay comparison remain unverified.</p>
+<h2>What the live counter means</h2>
+<p>The counter reports cumulative input across model responses in the same thread. Cached input is included in input. Reusing a long conversation can add hundreds of thousands of cached input tokens during a few decisions.</p>
+<div class="scroll"><table>
+<thead><tr><th>Measured interval</th><th>Tokens</th></tr></thead>
+<tbody>
+<tr><td>Duration</td><td>60.43 seconds</td></tr>
+<tr><td>Total input added</td><td>511,811</td></tr>
+<tr><td>Cached input added</td><td>506,496</td></tr>
+<tr><td>Uncached input added</td><td>5,315</td></tr>
+<tr><td>Output added</td><td>1,645</td></tr>
+<tr><td>Usage updates</td><td>3</td></tr>
+</tbody></table></div>
+<p>At the end of that interval, the thread had 9,955,166 input tokens, including 9,766,400 cached: 188,766 uncached, with 19,694 output tokens. The most recent response used 172,262 input tokens. Caching is functioning; the expanding context and repeated fresh observations remain opportunities.</p>
+<p>The live window now distinguishes cumulative input, cached input, uncached input, the latest provider-reported model response, and rates measured between timed usage updates. Counter and thread resets start a new measurement baseline. Duplicate cumulative updates are never added together.</p>
+<h2>Implemented before and after results</h2>
+<div class="scroll"><table>
+<thead><tr><th>Measured material</th><th>Before tokens</th><th>After tokens</th><th>Reduction</th><th>Verification</th></tr></thead>
+<tbody>
+<tr><td>Instructions and tool definitions</td><td>16,067</td><td>8,767</td><td>45.4%</td><td>Complete reference remains available</td></tr>
+<tr><td>148 captured tool replies</td><td>193,694</td><td>174,084</td><td>10.1%</td><td>148 / 148 exact</td></tr>
+<tr><td>30 generated native decision events</td><td>126,623</td><td>114,228</td><td>9.8%</td><td>30 / 30 exact</td></tr>
+</tbody></table></div>
+<p class="note">Token estimates use the o200k_base tokenizer as a proxy. Static components are tokenized separately and exclude hidden provider instructions and message envelopes. Native events are generated through the production builder from captured facts, rather than captured provider event strings. These separate percentages cannot be added and do not establish weekly allowance or game-task speed improvements.</p>
+<p>None of the 148 replayed replies grew in estimated tokens. Their serialized size fell from 588,237 to 512,146 bytes. An optional changes view also preserved all five sampled observations, but is separate from the default complete format. The earlier read-only leaf-diff experiment was not shipped.</p>
+<h2>Scope and completed steps</h2>
+<ol>
+<li><strong>Complete: make usage understandable.</strong> Separate cached and uncached input, label the latest model response accurately, and calculate usage rates from counter differences and elapsed time. Handle duplicates and lifecycle resets.</li>
+<li><strong>Complete locally: replace placeholder icons.</strong> Plan evidence selects registered Minecraft item or block models. Render real GUI item artwork using the active resource pack, cache completed images, and display them with nearest-neighbor scaling in the existing connected branch map. Resource reloads, closed plans, stale callbacks and capture failures are covered.</li>
+<li><strong>Complete: encode facts without removing them.</strong> Repeated rows share column names and repeated values share a dictionary within each reply. Default replies are complete and self-contained. Unknown, null, false, missing, deleted and bounded-coverage facts retain their original meaning.</li>
+<li><strong>Complete: allow explicit changes views.</strong> The agent may request changes only against a matching delivered snapshot. Whole changed sections and explicit removals reconstruct the observation. Missing baselines, stale facts, context compaction, reconnect, goal replacement, death and dimension changes force a complete snapshot. Failed delivery never commits a baseline.</li>
+<li><strong>Complete: move examples into a searchable reference.</strong> The always-loaded skill is 70.2% smaller in bytes. The complete original reference is preserved verbatim and accessible through capability queries. Essential control, survival, recovery, precision and verification rules stay loaded.</li>
+<li><strong>Complete: verify local delivery and comprehension.</strong> The full coordinator suite passed 1,917 tests with three skips; 19 further delivery and encoding regressions passed. Gradle check and build passed, including 15,890 core and 387 voice assertions. All 112 packaged coordinator manifest entries match current source and JAR bytes.</li>
+<li><strong>Pending: installed appearance and full gameplay comparison.</strong> The local JAR is ready for the next update. Verify native icons in the installed client and compare task progress, survival and action latency through Minecraft before claiming unchanged whole-task performance.</li>
+</ol>
+<h2>Small real-model check</h2>
+<p>GPT-6.1 Sol was given two fixed factual scenarios before and after the representation change. All four runs used valid native observe and say calls and correctly returned exact coordinates, identifiers, counts, urgent health facts and unknown values. Both after runs received the compact format.</p>
+<p>Reported uncached input across the two scenarios fell from 33,193 to 24,476 tokens, a 26.3% reduction in this small controlled sample. Across all four runs, reported input was 298,949, including 241,280 cached, with 374 output tokens. These checks used the existing subscription and changed no Minecraft state. Two pairs cannot establish general task quality, latency, or weekly usage savings.</p>
+<h2>Decisions and limits</h2>
+<p>The runtime keeps its authoritative observations and existing game executor. Formatting does not select targets, batch actions, suppress danger or control the player. The agent remains the decision maker. Default replies do not depend on previous replies for decoding. Context summaries, fact dropping and arbitrary observation caps are outside this implementation.</p>
+<p>The existing cache hit rate is already high. The compact prefix and replies address repeated input while preserving the stable thread and tool order. A growing conversation can still produce large cumulative cached totals; these changes do not promise a fixed reduction in the weekly allowance.</p>
+<p>The icon bridge and pinned Minecraft APIs passed local checks, including 30 bridge checks. Actual GPU output, resource-pack appearance and installed Desktop behavior remain unverified. Audible speech was not tested.</p>
+<p>Official references: <a href="https://developers.openai.com/api/docs/guides/prompt-caching">prompt caching</a> explains stable prefixes; <a href="https://learn.chatgpt.com/docs/pricing">Codex pricing</a> distinguishes cached usage and subscription accounting. API prices alone do not determine the weekly subscription percentage.</p>
+<footer>Scope: local implementation and controlled verification. No raw conversations, reasoning, credentials, device paths, or agent identifiers are published.</footer>
+</body>
+</html>

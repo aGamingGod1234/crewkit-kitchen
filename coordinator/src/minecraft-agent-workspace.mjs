@@ -5,6 +5,7 @@ import path from 'node:path';
 
 const AGENTS_TEMPLATE = 'AGENTS.md';
 const SKILL_TEMPLATE = path.join('.codex', 'skills', 'minecraft-control', 'SKILL.md');
+const CONTROL_REFERENCE_TEMPLATE = path.join('.codex', 'skills', 'minecraft-control', 'references', 'control-reference.md');
 const permissionsConfig = (workspaceRoot) => `default_permissions = "minecraft"
 
 [permissions.minecraft.filesystem]
@@ -77,6 +78,13 @@ export class MinecraftAgentWorkspace {
 		const skillInstructions = await this.#readTemplate(SKILL_TEMPLATE);
 		await this.#replace(AGENTS_TEMPLATE, path.join(workspaceRoot, AGENTS_TEMPLATE), instructions);
 		await this.#replace(SKILL_TEMPLATE, path.join(skillRoot, 'SKILL.md'), skillInstructions);
+		// References remain readable within the same dedicated capability root,
+		// without joining the always-loaded instructions or widening permissions.
+		const controlReference = await this.#readOptionalTemplate(CONTROL_REFERENCE_TEMPLATE);
+		if (controlReference !== null) {
+			await this.fs.mkdir(path.join(skillRoot, 'references'), { recursive: true });
+			await this.#replace(CONTROL_REFERENCE_TEMPLATE, path.join(skillRoot, 'references', 'control-reference.md'), controlReference);
+		}
 		return {
 			cwd: workspaceRoot,
 			codexHome: this.codexHome,
@@ -152,6 +160,15 @@ export class MinecraftAgentWorkspace {
 
 	async #readTemplate(template) {
 		return this.fs.readFile(path.join(this.templateRoot, template), 'utf8');
+	}
+
+	async #readOptionalTemplate(template) {
+		try {
+			return await this.#readTemplate(template);
+		} catch (error) {
+			if (error?.code !== 'ENOENT') throw error;
+			return null;
+		}
 	}
 
 	async #replace(template, destination, content = undefined) {

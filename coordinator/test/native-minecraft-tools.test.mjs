@@ -80,7 +80,7 @@ test('oversized inspection pages keep whole entries and a truthful continuation 
 });
 
 test('Minecraft control guidance examples are valid executor tool calls', async () => {
-	const skill = await readFile(new URL('../config/minecraft-agent/.codex/skills/minecraft-control/SKILL.md', import.meta.url), 'utf8');
+	const skill = await readFile(new URL('../config/minecraft-agent/.codex/skills/minecraft-control/references/control-reference.md', import.meta.url), 'utf8');
 	const turns = [...skill.matchAll(/```json executor-calls\s+([\s\S]*?)```/g)]
 		.map((match) => JSON.parse(match[1]));
 	const calls = [...skill.matchAll(/```json executor-call\s+([\s\S]*?)```/g)]
@@ -100,7 +100,7 @@ test('Minecraft control guidance examples are valid executor tool calls', async 
 });
 
 test('Minecraft control reference covers every executor tool and action with accepted and rejected examples', async () => {
-	const skill = await readFile(new URL('../config/minecraft-agent/.codex/skills/minecraft-control/SKILL.md', import.meta.url), 'utf8');
+	const skill = await readFile(new URL('../config/minecraft-agent/.codex/skills/minecraft-control/references/control-reference.md', import.meta.url), 'utf8');
 	const parseExamples = (label) => [...skill.matchAll(new RegExp('```json ' + label + '\\s+([\\s\\S]*?)```', 'g'))]
 		.map((match) => JSON.parse(match[1]));
 	const goodCalls = parseExamples('executor-call');
@@ -230,7 +230,7 @@ test('generic oversized terminal metadata bounds successor summaries without los
 
 test('native Minecraft tools expose the common fast path plus one validated advanced body operation', () => {
 	assert.deepEqual(MINECRAFT_DYNAMIC_TOOLS.map((tool) => tool.name), [
-		'observe', 'capabilities', 'inspect', 'actionStatus', 'cancelAction', 'replaceAction', 'startAction', 'notebook', 'queryMemory', 'runProgram', 'queueProgram', 'cancelQueuedProgram', 'programStatus', 'respondProgram', 'cancelProgram', 'lookAround', 'control', 'moveTo', 'exploreFrontier', 'mine', 'say', 'wait', 'act', 'sequence', 'finish',
+		'taskMemory', 'observe', 'capabilities', 'inspect', 'actionStatus', 'cancelAction', 'replaceAction', 'startAction', 'notebook', 'queryMemory', 'runProgram', 'queueProgram', 'cancelQueuedProgram', 'programStatus', 'respondProgram', 'cancelProgram', 'lookAround', 'control', 'moveTo', 'exploreFrontier', 'mine', 'say', 'wait', 'act', 'sequence', 'taskPlan', 'finish',
 	]);
 	assert.ok(MINECRAFT_DYNAMIC_TOOLS.every((tool) => tool.type === 'function'));
 	assert.ok(NATIVE_AGENT_INSTRUCTIONS.length < 1_500);

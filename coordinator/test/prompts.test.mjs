@@ -49,7 +49,7 @@ test('every shipped planner example compiles and executes its intended branch wi
 		items: [], entities: [], inventory: { items: [], tagCounts: { '#minecraft:logs': 0 } } };
 	const results = [];
 	for (const [index, source] of examples.entries()) {
-		const vm = new ArenaScriptInterpreter(parseArenaScript(source), SCRIPT_BINDINGS);
+		const vm = new ArenaScriptInterpreter(parseArenaScript(source), SCRIPT_BINDINGS, { parameters: { threatId: '00000000-0000-0000-0000-000000000002' } });
 		let observation = structuredClone(base);
 		let yielded = vm.start(createInterpreterFacts(observation));
 		const dispatched = [];
@@ -68,15 +68,33 @@ test('every shipped planner example compiles and executes its intended branch wi
 		}
 		if (index === 1) {
 			yielded = vm.runWatcher('watcher-0', createInterpreterFacts({ ...observation, player: { ...observation.player, health: 8 } }));
-			assert.equal(yielded.call.primitive, 'wait');
-			validateAction({ type: 'wait', durationMs: yielded.call.arguments });
+			assert.equal(yielded.call.primitive, 'block_with_shield');
+			validateAction({ type: yielded.call.primitive, ...yielded.call.arguments });
+			yielded = vm.resume({ stateToken: yielded.stateToken, state: 'SUCCEEDED', reasonCode: 'DONE' }, createInterpreterFacts(observation));
+			assert.equal(yielded.kind, 'watcher_decision', 'defense requests reassessment before unrelated work');
 		} else {
 			assert.deepEqual(dispatched, ['look_at', 'break_block', 'pick_up_item']);
 			assert.equal(yielded.kind, 'finish');
 		}
 		results.push(yielded.kind);
 	}
-	assert.deepEqual(results, ['finish', 'command']);
+	assert.deepEqual(results, ['finish', 'watcher_decision']);
+});
+
+test('shipped defensive watcher reacts to the agent-chosen visible threat before damage and ignores other entities', () => {
+	const source = /Watcher example[^\n]*\n([\s\S]*?)\n\nCompiler diagnostics/.exec(PLANNER_SYSTEM_PROMPT)[1];
+	const threatId = '00000000-0000-0000-0000-000000000002';
+	const vm = new ArenaScriptInterpreter(parseArenaScript(source), SCRIPT_BINDINGS, { parameters: { threatId } });
+	const observation = { player: { x: 0, y: 64, z: 0, health: 20 }, blocks: [], items: [], entities: [], inventory: { items: [], tagCounts: {} } };
+	let step = vm.start(createInterpreterFacts(observation));
+	step = vm.resume({ stateToken: step.stateToken, state: 'SUCCEEDED', reasonCode: 'DONE' }, createInterpreterFacts(observation));
+	assert.equal(step.kind, 'idle');
+	const entity = { stableId: '00000000-0000-0000-0000-000000000003', type: 'minecraft:skeleton', x: 2, y: 64, z: 0 };
+	assert.equal(vm.runWatcher('watcher-0', createInterpreterFacts({ ...observation, entities: [entity] })).kind, 'idle');
+	step = vm.runWatcher('watcher-0', createInterpreterFacts({ ...observation, entities: [{ ...entity, stableId: threatId }] }));
+	assert.equal(step.call.primitive, 'block_with_shield');
+	validateAction({ type: step.call.primitive, ...step.call.arguments });
+	assert.deepEqual({ ...step.call.arguments }, { durationMs: 750 });
 });
 
 test('collection example yields for missing targets or failed aim and verifies inventory after mining', () => {
@@ -132,9 +150,9 @@ test('planner tells agents to collect observed drops and never pause for routine
 	assert.match(PLANNER_SYSTEM_PROMPT, /noteKey executes the whole note as source/);
 	assert.match(PLANNER_SYSTEM_PROMPT, /player\.state\(\)\.velocity and world\.state\(\)\.landmarks/);
 	assert.match(PLANNER_SYSTEM_PROMPT, /observationIntervalMs:100\.\.5000/);
-	assert.match(PLANNER_SYSTEM_PROMPT, /Batch independent inspections; reuse fresh result facts and small safe sequences/);
+	assert.match(PLANNER_SYSTEM_PROMPT, /Batch independent inspections; reuse fresh facts and safe sequences/);
 	assert.match(PLANNER_SYSTEM_PROMPT, /program\.parameters\(\)/);
-	assert.match(PLANNER_SYSTEM_PROMPT, /queueProgram holds one authored successor/);
+	assert.match(PLANNER_SYSTEM_PROMPT, /queueProgram binds one authored successor/);
 	assert.match(PLANNER_SYSTEM_PROMPT, /Successful natural PROGRAM_EXHAUSTED, no pending decision/);
 	assert.match(PLANNER_SYSTEM_PROMPT, /expectedDurationMs:1\.\.timeoutMs/);
 	assert.doesNotMatch(PLANNER_SYSTEM_PROMPT, /runProgram accepts noteKey[^\n]*entityType/);

@@ -41,7 +41,7 @@ export const SCRIPT_API_CALL_PATHS = Object.freeze(new Set([
 	...Object.keys(PLAYER_MEMBER_PRIMITIVES).map((name) => `player.${name}`),
 	...PURE_API_PATHS,
 	'world.inspect',
-	'world.remember', 'world.queryMemory',
+	'world.remember', 'world.queryMemory', 'world.taskMemory',
 ]));
 
 export const SCRIPT_BINDINGS = freezeRecord({

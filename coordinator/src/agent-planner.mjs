@@ -803,6 +803,10 @@ function buildCorrectiveRetryInput(input, error, retryCount) {
 
 function safeVerbose(callback, stage, message) {
 	if (typeof callback !== 'function') return;
+	if (stage.startsWith('live_')) {
+		try { Promise.resolve(callback(stage, String(message ?? '').slice(0, 2048))).catch(() => {}); } catch { /* view output cannot affect planning */ }
+		return;
+	}
 	if (stage === 'output') {
 		reportVisibleOutput(callback, String(message ?? ''));
 		return;

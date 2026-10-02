@@ -3530,6 +3530,63 @@ class ManualTimerQueue {
 	}
 }
 
+test('live task view polling uses the bridge without starting planner work and rejects stale revisions', async () => {
+	const run = await start();
+	try {
+		const current = run.registry.get('agent-a');
+		const before = run.planner.requests.length;
+		run.bridge.emit('task_view_request', { agentId: current.agentId, payload: { goalRevision: current.goalRevision } });
+		await eventually(() => run.bridge.sent.some((message) => message.type === 'task_view'));
+		const view = run.bridge.sent.find((message) => message.type === 'task_view');
+		validateProtocolV2Payload('task_view', view.payload);
+		assert.equal(view.payload.goalRevision, current.goalRevision);
+		assert.equal(run.planner.requests.length, before);
+		const replies = run.bridge.sent.filter((message) => message.type === 'task_view').length;
+		run.bridge.emit('task_view_request', { agentId: current.agentId, payload: { goalRevision: current.goalRevision + 1 } });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(run.bridge.sent.filter((message) => message.type === 'task_view').length, replies);
+	} finally { await run.coordinator.stop(); }
+});
+
+test('live task view start and replacement clear prior plans and output while resume retains the task', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	let releaseTurn, published = false;
+	const turnGate = new Promise((resolve) => { releaseTurn = resolve; });
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		if (request.goalRevision === 1) {
+			await request.executeTool({ agentId: request.agentId, goalRevision: 1, turnId: 'plan-window-turn', callId: 'plan-window-call', tool: { kind: 'task_plan', operation: 'replace', plan: { steps: [
+				{ id: 'past', label: 'Previous milestone', kind: 'milestone', status: 'complete', dependsOn: [], detail: 'Previous task only', evidence: null },
+			] } } });
+			request.onVerbose('live_tool', 'Previous task output');published = true;
+		}
+		await turnGate;return { status: 'completed', toolCalls: 1 };
+	};
+	const run = await start({ registry, planner, config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } } });
+	const poll = async () => {
+		const current = registry.get('agent-a'), before = run.bridge.sent.filter(message => message.type === 'task_view').length;
+		run.bridge.emit('task_view_request', { agentId: 'agent-a', payload: { goalRevision: current.goalRevision } });
+		await eventually(() => run.bridge.sent.filter(message => message.type === 'task_view').length > before);
+		return run.bridge.sent.filter(message => message.type === 'task_view').at(-1).payload;
+	};
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Repeat the same task.' } });
+		const observation = factToWireObservation({ player: { x: 0, y: 64, z: 0, health: 20 } }, 1, 1, false, 1);observation.world.worldId = 'plan-window-test-world';
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: observation });await eventually(() => published);
+		assert.equal((await poll()).plan.steps[0].status, 'complete');
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'stop', goalRevision: 2 } });await eventually(() => registry.get('agent-a').goalRevision === 2);
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'resume', goalRevision: 3 } });await eventually(() => registry.get('agent-a').goalRevision === 3);
+		assert.equal((await poll()).plan.steps[0].status, 'complete');
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'replace', goalRevision: 4, goal: 'Repeat the same task.' } });await eventually(() => registry.get('agent-a').goalRevision === 4);
+		let view = await poll();assert.equal(view.plan, null);assert.equal(view.events.some(event => event.message === 'Previous task output'), false);
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'complete', goalRevision: 5 } });await eventually(() => registry.get('agent-a').goalRevision === 5);
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 6, goal: 'Repeat the same task.' } });await eventually(() => registry.get('agent-a').goalRevision === 6);
+		view = await poll();assert.equal(view.plan, null);assert.equal(view.events.some(event => event.message === 'Previous task output'), false);
+		const before = planner.requests.length;for(let i=0;i<3;i++)await poll();assert.equal(planner.requests.length,before,'display polling cannot start any model turn');
+	} finally { releaseTurn();await run.coordinator.stop(); }
+});
+
 async function start(dependencies = {}) {
 	const bridge = dependencies.bridge ?? new FakeBridge();
 	const registry = dependencies.registry ?? new AgentRegistry();
@@ -5255,7 +5312,7 @@ test('a background native routine continues during delayed reconsideration and s
 		if (!handle) {
 			handle = await request.executeTool({ agentId: request.agentId, goalRevision: request.goalRevision,
 				turnId: 'background-turn', callId: 'background-call', tool: { kind: 'run_program', background: true,
-					source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2); await player.wait(3);' } });
+					source: 'program.onUnhandledAttention("continue_and_notify", {survival:"continue_and_notify"}); await player.wait(1); await player.wait(2); await player.wait(3);' } });
 		}
 		returned = true;
 		return { status: 'completed', toolCalls: 1 };
@@ -5292,6 +5349,50 @@ test('a background native routine continues during delayed reconsideration and s
 	} finally { releaseDecision(); await run.coordinator.stop(); }
 });
 
+
+test('native coordinator keeps chosen cave legs moving until authored missing-geometry reassessment', async () => {
+	const registry = new AgentRegistry(), planner = new FakePlanner(registry);
+	let handle, releaseDecision;
+	const decisionGate = new Promise(resolve => { releaseDecision = resolve; });
+	planner.requestNativeTurn = async request => {
+		planner.requests.push(request);
+		if (planner.requests.length > 1) await decisionGate;
+		else handle = await request.executeTool({ agentId:request.agentId, goalRevision:request.goalRevision, turnId:'cave-route', callId:'chosen-legs', tool:{kind:'run_program',background:true,
+			source:`program.onUnhandledAttention("pause_and_notify", {reassessWhen:() => world.blocks({x:6,y:63,z:2,blockId:"minecraft:stone"}).length !== 1 || world.entities().length > 0});
+				for (const leg of program.parameters().legs) {
+					const moved = await player.navigateTo({x:leg.x,y:leg.y,z:leg.z,tolerance:0.4,sprint:false,timeoutMs:5000});
+					if (!moved.succeeded) program.checkpoint(moved.reason);
+				}`,
+			parameters:{legs:[{x:3,y:64,z:0},{x:6,y:64,z:2},{x:8,y:65,z:2}]},timeoutMs:30000,
+		} });
+		return {status:'completed',toolCalls:1};
+	};
+	const run = await start({registry,planner,goalSupervisor:new RecordingGoalSupervisor(),config:{bridge:{port:25570,secret:'s'.repeat(32)},codex:{controlProtocol:'native_tools'}}});
+	const commands = () => run.bridge.sent.filter(message => message.type === 'action_command');
+	const push = (changes) => {
+		const previous = run.bridge.latestObservations.get('agent-a');
+		run.bridge.emit('observation',{agentId:'agent-a',payload:{...previous,eventSequence:run.bridge.latestSequences.get('agent-a')+1,attention:true,changedFacts:['position','blocks'],...changes}});
+	};
+	try {
+		run.bridge.emit('goal_control',{agentId:'agent-a',payload:{operation:'start',goalRevision:1,goal:'Traverse the observed cave route.'}});
+		run.bridge.emit('observation',{agentId:'agent-a',payload:{goalRevision:1,eventSequence:1,observation:{player:{x:0,y:64,z:0,health:20},items:[],entities:[],blocks:[{blockId:'minecraft:stone',x:6,y:63,z:2}],inventory:{items:[],tagCounts:{}}}}});
+		await eventually(() => handle && commands().length === 1);
+		for (const x of [1,2]) { push({position:{x,y:64,z:0}}); await new Promise(resolve => setImmediate(resolve)); }
+		assert.equal(planner.requests.length,1,'fresh known-route progress does not request another model turn');
+		assert.equal(run.bridge.sent.some(message => message.type === 'action_cancel'),false);
+		run.bridge.emit('action_result',{agentId:'agent-a',payload:{goalRevision:1,actionId:commands()[0].payload.actionId,state:'SUCCEEDED',reasonCode:'DESTINATION_REACHED',eventSequence:run.bridge.latestSequences.get('agent-a')+1}});
+		await eventually(() => commands().length === 2);
+		assert.deepEqual(commands().map(message => message.payload.arguments.x),[3,6]);
+		assert.equal(commands()[1].payload.provenance.programId,handle.programId);
+		assert.ok(run.bridge.sent.filter(message => message.type === 'inspection_request').every(message => message.payload.query.section === 'observation'),'continuation samples facts without reading broad block pages');
+		push({blocks:[]});
+		await eventually(() => planner.requests.length === 2 && run.bridge.sent.some(message => message.type === 'action_cancel' && message.payload.actionId === commands()[1].payload.actionId));
+		assert.match(planner.requests[1].input,/program_attention/);
+		run.bridge.emit('action_result',{agentId:'agent-a',payload:{goalRevision:1,actionId:commands()[1].payload.actionId,state:'CANCELLED',reasonCode:'INPUT_RELEASED',eventSequence:run.bridge.latestSequences.get('agent-a')+1}});
+		await new Promise(resolve => setImmediate(resolve));
+		assert.equal(commands().length,2,'the next leg waits for the sole main agent after missing geometry');
+	} finally {releaseDecision();await run.coordinator.stop();}
+});
 
 test('measured planning lead steers the same native turn once while its routine keeps executing', async () => {
 	const registry = new AgentRegistry();
@@ -5519,6 +5620,44 @@ test('stopping a native routine suppresses its pending planning reminder', async
 		await new Promise((resolve) => setImmediate(resolve));
 		assert.equal(steers.length, 0, 'a stopped program cannot deliver its queued reminder');
 		assert.equal(planner.requests.length, 1, 'stopping the body cannot create a successor model turn');
+	} finally {
+		releaseTurn();
+		await run.coordinator.stop();
+	}
+});
+
+test('native coordinator ingress preserves infinite effects through planning and fresh observe', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	let observed, releaseTurn;
+	const turnGate = new Promise((resolve) => { releaseTurn = resolve; });
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		observed = await request.executeTool({ agentId: request.agentId, goalRevision: request.goalRevision,
+			turnId: 'infinite-effect-turn', callId: 'observe-effects', tool: { kind: 'observe' } });
+		await turnGate;
+		return { status: 'completed', toolCalls: 1 };
+	};
+	const run = await start({ registry, planner,
+		config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } } });
+	const runtimeErrors = [];
+	run.coordinator.on('runtimeError', (error) => runtimeErrors.push(error));
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Observe my active effects.' } });
+		const payload = factToWireObservation({ player: { x: 0, y: 64, z: 0, health: 20 } }, 1, 1, false, 1);
+		payload.player.effects = [
+			{ effectId: 'minecraft:speed', amplifier: 0, duration: 120 },
+			{ effectId: 'minecraft:haste', amplifier: 1, duration: -1 },
+		];
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: validateProtocolV2Payload('observation', payload) });
+		await eventually(() => observed !== undefined);
+		assert.equal(planner.requests.length, 1);
+		assert.equal(observed.freshness.fresh, true);
+		assert.ok(observed.eventSequence > payload.eventSequence, 'native observe completes with a newer server sample');
+		assert.deepEqual(observed.observation.player.effects, payload.player.effects);
+		assert.deepEqual(runtimeErrors, []);
+		assert.equal(run.bridge.sent.some((message) => message.type === 'agent_error'), false);
+		assert.equal(run.bridge.connected, true);
 	} finally {
 		releaseTurn();
 		await run.coordinator.stop();

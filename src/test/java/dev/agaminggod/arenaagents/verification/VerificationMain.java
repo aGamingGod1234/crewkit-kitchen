@@ -188,6 +188,9 @@ public final class VerificationMain {
 		passedAssertions += GoalSpecVerification.verify();
 		passedAssertions += AgentIdentityVerification.verify();
 		passedAssertions += AgentControlVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.control.LiveTaskViewVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.control.PlanItemIconsVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.control.LiveTaskUsageVerification.verify();
 		passedAssertions += AgentClientPresentationVerification.verify();
 		passedAssertions += AgentControlSelectionStateVerification.verify();
 		passedAssertions += AgentRosterViewStateVerification.verify();

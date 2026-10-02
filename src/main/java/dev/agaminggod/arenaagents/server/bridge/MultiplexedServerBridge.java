@@ -138,7 +138,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			"AI agent coordinator is offline; check logs/arena-agents-coordinator-error.log for the startup cause";
 	private static final Logger LOGGER = LoggerFactory.getLogger(MultiplexedServerBridge.class);
 	private static final Set<String> INBOUND_TYPES = Set.of(
-			"auth_challenge", "hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "conversation_wake_ack", "goal_spec_proposal", "director_script_result", "request_observation", "inspection_request", "action_command", "action_cancel", "action_result_ack", "agent_error", "verbose_event", "heartbeat"
+			"auth_challenge", "hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "conversation_wake_ack", "goal_spec_proposal", "director_script_result", "request_observation", "inspection_request", "action_command", "action_cancel", "action_result_ack", "agent_error", "verbose_event", "task_view", "heartbeat"
 	);
 
 	private final CodexAgentManager manager;
@@ -1082,6 +1082,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	private void routeAuthenticated(BridgeEnvelope envelope) {
 		switch (envelope.type()) {
+			case "task_view" -> dev.agaminggod.arenaagents.server.LiveTaskViewSync.accept(manager.server(), AgentId.parse(envelope.agentId()), envelope.payload());
 			case "catalog_snapshot" -> acceptCatalog(envelope.payload());
 			case "coordinator_status" -> acceptCoordinatorStatus(envelope.payload());
 			case "agent_ready", "planning_state" -> plannerReady(envelope);
@@ -1512,6 +1513,14 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		AgentRecord record = manager.registry().require(agentId);
 		if (event.goalRevision() != record.goalRevision()) return;
 		AgentVerboseChat.report(manager, verboseState, record, event.stage(), event.message());
+	}
+
+	public boolean requestTaskView(AgentId agentId) {
+		if (!authenticated()) return false;
+		JsonObject payload = new JsonObject();
+		payload.addProperty("goalRevision", manager.registry().require(agentId).goalRevision());
+		send("task_view_request", agentId.toString(), payload);
+		return true;
 	}
 
 	static VerboseEvent decodeVerboseEvent(JsonObject payload) {

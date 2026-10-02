@@ -6,6 +6,7 @@ import {
 	parseGoalSpecProposal,
 	parseGoalSpecRequest,
 } from './goal-spec.mjs';
+import { TASK_PLAN_SCHEMA, validateTaskPlan } from './live-task-view.mjs';
 
 export const MAX_GOAL_SPEC_CORRECTION_ATTEMPTS = 3;
 
@@ -39,7 +40,7 @@ export class GoalSpecTranslator {
 		const output = await this.#generate({
 			request,
 			prompt: buildGoalSpecTranslatorPrompt(request, { correctiveFeedback: correction }),
-			schema: GOAL_SPEC_PROPOSAL_SCHEMA,
+			schema: { ...GOAL_SPEC_PROPOSAL_SCHEMA, required: [...GOAL_SPEC_PROPOSAL_SCHEMA.required, 'plan'], properties: { ...GOAL_SPEC_PROPOSAL_SCHEMA.properties, plan: TASK_PLAN_SCHEMA } },
 			signal,
 		});
 		let value = output;
@@ -47,7 +48,11 @@ export class GoalSpecTranslator {
 			try { value = JSON.parse(output); }
 			catch (error) { throw codedError('MALFORMED_GOAL_SPEC_PROPOSAL', 'Translator output must be one JSON object', error); }
 		}
-		const proposal = parseGoalSpecProposal(normalizeStructuredProposal(value));
+		const normalized = normalizeStructuredProposal(value);
+		const { plan, ...goalProposal } = normalized ?? {};
+		const proposal = { ...parseGoalSpecProposal(goalProposal) };
+		// Optional display advice cannot reject an otherwise valid completion goal.
+		if (plan !== undefined) { try { proposal.plan = validateTaskPlan(plan); } catch { /* the main agent may publish its own plan */ } }
 		if (proposal.requestId !== request.requestId) {
 			throw codedError('GOAL_SPEC_REQUEST_MISMATCH', 'Translator proposal does not match the outstanding request');
 		}
@@ -107,6 +112,7 @@ export function buildGoalSpecTranslatorPrompt(requestValue, { correctiveFeedback
 		'If no listed candidate identifies the requested object, do not invent one or substitute an unrelated position or survival result. Use operator_confirmed so the agent may act and the operator can verify completion.',
 		'For crafting, building, subjective, or other results not provable by the offered factual predicates, include operator_confirmed on every completion path.',
 		'Write summary as a concise advisory route with concrete subgoals and prerequisites, separated by semicolons. The Minecraft agent chooses and may reorder or replace these steps from live evidence. You do not control actions or choose its final route. Keep summary within 512 characters.',
+		'Also return plan:{steps:[...]} as an advisory dependency DAG with stable short IDs, readable labels, dependsOn IDs, detail, kind, status and evidence. Use pending for every unobserved step. The main agent owns all action decisions and may revise this plan. Include useful prerequisite branches, not each mouse/key action. Inventory evidence names eligible itemIds and count; world evidence needs an exact OBSERVED dimension/block position. Unknown locations must be manual steps with evidence:null. Milestones are historical achievements, manual steps are agent-reported intentions, inventory steps are present possessions, and world steps are persistent observed structures. evidence is null or {itemIds:[],count:1,dimension:null,x:null,y:null,z:null,blockId:null} with the required fields filled. Do not claim any resource, location or structure is observed. Planning prerequisite item IDs may use ordinary Minecraft identifiers beyond the final-predicate candidate list; only the completion predicate is restricted to that list.',
 		'Return exactly one JSON object matching the supplied schema and nothing else.',
 		`Request: ${JSON.stringify(request.originalRequest)}`,
 		`Candidate identifiers: ${JSON.stringify(request.candidateIds)}`,

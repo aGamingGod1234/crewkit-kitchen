@@ -1,0 +1,316 @@
+{
+  "benchmark": "native-input-model-comprehension",
+  "generatedAt": "2026-10-02T13:04:52.302Z",
+  "settings": {
+    "model": "gpt-6.1-sol",
+    "reasoningEffort": "medium",
+    "serviceTier": "fast"
+  },
+  "limits": {
+    "maxTurns": 4,
+    "maxUncachedInputTokens": 60000,
+    "maxToolCallsPerTurn": 5,
+    "turnDeadlineMs": 90000
+  },
+  "billing": "existing ChatGPT subscription; inherited OpenAI API environment omitted; ChatGPT account type verified before any model turn",
+  "paidApiCalls": 0,
+  "installedGameplay": false,
+  "status": "PASSED",
+  "turns": [
+    {
+      "scenario": "precise_mining_target_and_inventory",
+      "arm": "before",
+      "status": "PASSED",
+      "factsMatch": true,
+      "nativeCallsValid": true,
+      "calls": [
+        "observe",
+        "say"
+      ],
+      "answers": [
+        {
+          "blockId": "minecraft:deepslate_diamond_ore",
+          "x": 9,
+          "y": -54,
+          "z": -23,
+          "dc": 5,
+          "pc": 0
+        }
+      ],
+      "elapsedMs": 10403.679,
+      "usage": {
+        "inputTokens": 81188,
+        "cachedInputTokens": 52736,
+        "outputTokens": 78,
+        "uncachedInputTokens": 28452
+      },
+      "presentedReplies": [
+        {
+          "packed": false,
+          "bytes": 7794
+        },
+        {
+          "packed": false,
+          "bytes": 57
+        }
+      ],
+      "executionSettings": {
+        "requested": {
+          "provider": "codex",
+          "model": "gpt-6.1-sol",
+          "reasoningEffort": "medium",
+          "serviceTier": "fast"
+        },
+        "effective": {
+          "provider": "codex",
+          "model": "gpt-6.1-sol",
+          "reasoningEffort": null,
+          "serviceTier": "priority",
+          "thinkingMode": null
+        },
+        "transport": "codex_app_server",
+        "controlProtocol": "native_tools",
+        "modelSelector": "gpt-6.1-sol",
+        "evidence": {
+          "model": "provider_reported",
+          "reasoningEffort": "submitted",
+          "serviceTier": "provider_reported"
+        },
+        "limitations": []
+      }
+    },
+    {
+      "scenario": "precise_mining_target_and_inventory",
+      "arm": "after",
+      "status": "PASSED",
+      "factsMatch": true,
+      "nativeCallsValid": true,
+      "calls": [
+        "observe",
+        "say"
+      ],
+      "answers": [
+        {
+          "blockId": "minecraft:deepslate_diamond_ore",
+          "x": 9,
+          "y": -54,
+          "z": -23,
+          "dc": 5,
+          "pc": 0
+        }
+      ],
+      "elapsedMs": 9622.942,
+      "usage": {
+        "inputTokens": 58010,
+        "cachedInputTokens": 37504,
+        "outputTokens": 78,
+        "uncachedInputTokens": 20506
+      },
+      "presentedReplies": [
+        {
+          "packed": true,
+          "bytes": 6075
+        },
+        {
+          "packed": false,
+          "bytes": 57
+        }
+      ],
+      "executionSettings": {
+        "requested": {
+          "provider": "codex",
+          "model": "gpt-6.1-sol",
+          "reasoningEffort": "medium",
+          "serviceTier": "fast"
+        },
+        "effective": {
+          "provider": "codex",
+          "model": "gpt-6.1-sol",
+          "reasoningEffort": null,
+          "serviceTier": "priority",
+          "thinkingMode": null
+        },
+        "transport": "codex_app_server",
+        "controlProtocol": "native_tools",
+        "modelSelector": "gpt-6.1-sol",
+        "evidence": {
+          "model": "provider_reported",
+          "reasoningEffort": "submitted",
+          "serviceTier": "provider_reported"
+        },
+        "limitations": []
+      }
+    },
+    {
+      "scenario": "urgent_health_identity_death_and_unknowns",
+      "arm": "after",
+      "status": "PASSED",
+      "factsMatch": true,
+      "nativeCallsValid": true,
+      "calls": [
+        "observe",
+        "say"
+      ],
+      "answers": [
+        {
+          "h": 4,
+          "d": false,
+          "u": "12345678-1234-4123-8123-123456789abc",
+          "t": "minecraft:zombie",
+          "w": "bench",
+          "dim": "minecraft:overworld",
+          "ld": "minecraft:the_nether",
+          "lx": 17.25,
+          "bc": null,
+          "ec": false,
+          "air": false
+        }
+      ],
+      "elapsedMs": 7417.312,
+      "usage": {
+        "inputTokens": 67202,
+        "cachedInputTokens": 63232,
+        "outputTokens": 109,
+        "uncachedInputTokens": 3970
+      },
+      "presentedReplies": [
+        {
+          "packed": true,
+          "bytes": 7721
+        },
+        {
+          "packed": false,
+          "bytes": 57
+        }
+      ],
+      "executionSettings": {
+        "requested": {
+          "provider": "codex",
+          "model": "gpt-6.1-sol",
+          "reasoningEffort": "medium",
+          "serviceTier": "fast"
+        },
+        "effective": {
+          "provider": "codex",
+          "model": "gpt-6.1-sol",
+          "reasoningEffort": null,
+          "serviceTier": "priority",
+          "thinkingMode": null
+        },
+        "transport": "codex_app_server",
+        "controlProtocol": "native_tools",
+        "modelSelector": "gpt-6.1-sol",
+        "evidence": {
+          "model": "provider_reported",
+          "reasoningEffort": "submitted",
+          "serviceTier": "provider_reported"
+        },
+        "limitations": []
+      }
+    },
+    {
+      "scenario": "urgent_health_identity_death_and_unknowns",
+      "arm": "before",
+      "status": "PASSED",
+      "factsMatch": true,
+      "nativeCallsValid": true,
+      "calls": [
+        "observe",
+        "say"
+      ],
+      "answers": [
+        {
+          "h": 4,
+          "d": false,
+          "u": "12345678-1234-4123-8123-123456789abc",
+          "t": "minecraft:zombie",
+          "w": "bench",
+          "dim": "minecraft:overworld",
+          "ld": "minecraft:the_nether",
+          "lx": 17.25,
+          "bc": null,
+          "ec": false,
+          "air": false
+        }
+      ],
+      "elapsedMs": 9551.874,
+      "usage": {
+        "inputTokens": 92549,
+        "cachedInputTokens": 87808,
+        "outputTokens": 109,
+        "uncachedInputTokens": 4741
+      },
+      "presentedReplies": [
+        {
+          "packed": false,
+          "bytes": 10114
+        },
+        {
+          "packed": false,
+          "bytes": 57
+        }
+      ],
+      "executionSettings": {
+        "requested": {
+          "provider": "codex",
+          "model": "gpt-6.1-sol",
+          "reasoningEffort": "medium",
+          "serviceTier": "fast"
+        },
+        "effective": {
+          "provider": "codex",
+          "model": "gpt-6.1-sol",
+          "reasoningEffort": null,
+          "serviceTier": "priority",
+          "thinkingMode": null
+        },
+        "transport": "codex_app_server",
+        "controlProtocol": "native_tools",
+        "modelSelector": "gpt-6.1-sol",
+        "evidence": {
+          "model": "provider_reported",
+          "reasoningEffort": "submitted",
+          "serviceTier": "provider_reported"
+        },
+        "limitations": []
+      }
+    }
+  ],
+  "prefixSha256": {
+    "before": "c19ec1846af95d0e3fdb12e60d900dee62123bcf258dfa1ec39e02cf4f7ffe52",
+    "after": "746823821812263e0d27e0d64258c4a9ad2decc4638b77365f24256bc4f98677"
+  },
+  "limitations": [
+    "Two factual scenarios, one before/after response each; this is a comprehension check, not a statistical behavior or speed benchmark.",
+    "Only a fake read-only observation and captured say answers are used. No Minecraft commands execute.",
+    "Elapsed times include provider scheduling and tool round trips. Raw reasoning is not retained.",
+    "Actual reported tokens are shown separately from offline proxy counts; subscription allowance cost is not inferred."
+  ],
+  "totalUsage": {
+    "inputTokens": 298949,
+    "cachedInputTokens": 241280,
+    "outputTokens": 374,
+    "uncachedInputTokens": 57669
+  },
+  "byArm": {
+    "before": {
+      "turns": 2,
+      "factualPasses": 2,
+      "nativeCallPasses": 2,
+      "inputTokens": 173737,
+      "cachedInputTokens": 140544,
+      "uncachedInputTokens": 33193,
+      "outputTokens": 187
+    },
+    "after": {
+      "turns": 2,
+      "factualPasses": 2,
+      "nativeCallPasses": 2,
+      "inputTokens": 125212,
+      "cachedInputTokens": 100736,
+      "uncachedInputTokens": 24476,
+      "outputTokens": 187
+    }
+  },
+  "subscriptionVerified": true
+}

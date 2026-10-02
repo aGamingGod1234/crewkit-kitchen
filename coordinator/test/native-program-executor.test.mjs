@@ -18,6 +18,14 @@ function setup(overrides = {}, options = {}) {
 	return { executor, context, commands, cancels };
 }
 
+test('ArenaScript taskMemory reaches the same validated durable memory operation without a body action', async () => {
+	const requests = [];
+	const run = setup({ memoryOperation: async (operation) => { requests.push(operation); return { state: 'SUCCEEDED', reasonCode: 'TASK_MEMORY_WRITTEN' }; } });
+	const result = await run.executor.run(record, { source: `${prefix} await world.taskMemory({operation:"remember",entry:{kind:"place",key:"base",label:"Base",summary:"Observed entrance",position:{x:0,y:64,z:0}}});` }, run.context);
+	assert.equal(requests.length, 1); assert.equal(requests[0].operation, 'task'); assert.equal(requests[0].arguments.entry.key, 'base');
+	assert.equal(requests[0].provenance.model, record.model); assert.equal(run.commands.length, 0); assert.equal(result.reasonCode, 'PROGRAM_EXHAUSTED');
+});
+
 test('explicit ranged options survive ArenaScript execution', async () => {
 	const run = setup();
 	const result = await run.executor.run(record, { source: `${prefix}
@@ -69,6 +77,64 @@ test('executor rejects invalid parameter data before installing timers or dispat
 	assert.equal(timers.length, 0);
 	assert.equal(run.commands.length, 0);
 	assert.equal(run.executor.status(record), null);
+});
+
+test('an authored known cave leg consumes fresh progress without another decision or broad inspection', async () => {
+	let sequence = 1, release, current = { ...observation(), blocks: [{stableId:'landing',blockId:'minecraft:stone',x:6,y:63,z:2}] };
+	const decisions = [], inspections = [], commands = [];
+	const run = setup({ observation: current,
+		executeAction: (command) => { commands.push(command); return new Promise(resolve => { release = resolve; }); },
+		onDecision: (status) => decisions.push(status), inspect: (query) => { inspections.push(query); },
+		refreshObservation: async () => ({observation:current,eventSequence:++sequence}),
+	});
+	const pending = run.executor.run(record, { source: `program.onUnhandledAttention("pause_and_notify", {reassessWhen:() => world.blocks({stableId:"landing",blockId:"minecraft:stone"}).length !== 1 || world.entities().length > 0});
+		for (const leg of program.parameters().legs) {
+			const moved = await player.navigateTo({x:leg.x,y:leg.y,z:leg.z,tolerance:0.4,sprint:false,timeoutMs:5000});
+			if (!moved.succeeded) program.checkpoint(moved.reason);
+		}`,
+		parameters: {legs:[{x:3,y:64,z:0},{x:6,y:64,z:2}]},
+	}, run.context);
+	for (const [index, point] of [{x:3,y:64,z:0},{x:6,y:64,z:2}].entries()) {
+		for (let update = 0; update < 3; update++) {
+			current = {...current,player:{...current.player,...point}};
+			run.executor.onObservation(record,{observation:current,eventSequence:++sequence,attention:true,trigger:'attention'});
+		}
+		assert.equal(run.executor.status(record).decision, undefined);
+		release({state:'SUCCEEDED',reasonCode:'DESTINATION_REACHED'});
+		await turn();
+		assert.equal(commands.length, Math.min(2,index+2));
+	}
+	const result = await pending;
+	assert.deepEqual(commands.map(command => command.action.arguments.x), [3,6]);
+	assert.equal(result.reasonCode,'PROGRAM_EXHAUSTED'); assert.equal(result.actionsSucceeded,2);
+	assert.deepEqual(decisions,[]); assert.deepEqual(inspections,[]); assert.deepEqual(run.cancels,[]);
+});
+
+test('a missing observed landing yields before the next cave leg and cancels only the selected action', async () => {
+	let sequence = 1, release, current = {...observation(),blocks:[{stableId:'landing',blockId:'minecraft:stone',x:6,y:63,z:2}]};
+	const commands = [], cancelled = [];
+	const run = setup({observation:current,
+		executeAction: command => {commands.push(command); return new Promise(resolve => {release = resolve;});},
+		cancelAction: async actionId => {cancelled.push(actionId); release({state:'CANCELLED',reasonCode:'INPUT_RELEASED'});},
+		refreshObservation: async () => ({observation:current,eventSequence:++sequence}),
+	});
+	const pending = run.executor.run(record,{source:`program.onUnhandledAttention("pause_and_notify", {reassessWhen:() => world.blocks({stableId:"landing",blockId:"minecraft:stone"}).length !== 1}); await player.navigateTo({x:3,y:64,z:0,tolerance:0.4,sprint:false,timeoutMs:5000}); await player.navigateTo({x:6,y:64,z:2,tolerance:0.4,sprint:false,timeoutMs:5000});`},run.context);
+	current = {...current,blocks:[]};
+	run.executor.onObservation(record,{observation:current,eventSequence:++sequence,attention:true,trigger:'attention'});
+	const result = await pending;
+	assert.equal(result.reasonCode,'MODEL_DECISION_REQUIRED'); assert.equal(commands.length,1);
+	assert.deepEqual(cancelled,[commands[0].actionId]); assert.equal(result.actionsFailed,1);
+});
+
+test('an authored blocked-leg checkpoint stops on its first receipt despite a false ordinary reassessment condition', async () => {
+	const run = setup({executeAction:async command => {run.commands.push(command);return {state:'FAILED',reasonCode:'NO_STANDABLE_PATH'};}});
+	const result = await run.executor.run(record,{source:`program.onUnhandledAttention("pause_and_notify",{reassessWhen:() => false});
+		for (const leg of program.parameters().legs) {
+			const moved = await player.navigateTo({x:leg.x,y:leg.y,z:leg.z,tolerance:0.4,sprint:false,timeoutMs:5000});
+			if (!moved.succeeded) program.checkpoint(moved.reason);
+		}`,parameters:{legs:[{x:3,y:64,z:0},{x:6,y:64,z:2}]},},run.context);
+	assert.equal(result.reasonCode,'PROGRAM_CHECKPOINT'); assert.equal(result.actionsFailed,1);
+	assert.equal(run.commands.length,1); assert.equal(result.receipts[0].reasonCode,'NO_STANDABLE_PATH');
 });
 
 test('full-run terminal action counts preserve handled failures outside the receipt ring', async () => {

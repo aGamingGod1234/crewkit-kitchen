@@ -75,6 +75,18 @@ test('preserves every protocol-v2 fact needed by native observe and action tools
 	assert.equal(adapted.interaction.rayTarget.blockId, 'minecraft:chest');
 });
 
+test('status-effect duration adaptation preserves infinite and finite effects and rejects other negatives', () => {
+	for (const duration of [-1, 0, 40, Number.MAX_SAFE_INTEGER]) {
+		const effects = [{ effectId: 'minecraft:haste', amplifier: 1, duration }];
+		assert.deepEqual(adaptObservation(wireObservation({ player: { effects } })).player.effects, effects);
+	}
+	for (const duration of [-2, -40, -1.5, 0.5, Number.NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, '-1', null]) {
+		assert.throws(() => adaptObservation(wireObservation({
+			player: { effects: [{ effectId: 'minecraft:haste', amplifier: 1, duration }] },
+		})), /effects\[0\]\.duration/);
+	}
+});
+
 test('preserves the authoritative last attacker for damage watchers', () => {
 	const adapted = adaptObservation(wireObservation({
 		player: {

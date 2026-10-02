@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Continuous cave travel, recovery and live task windows</title>
+  <style>
+    :root{color-scheme:light}*{box-sizing:border-box}body{max-width:860px;margin:24px auto;padding:18px;font:17px/1.55 system-ui,sans-serif;color:#202b36;background:#eef2f5}h1{font-size:30px;line-height:1.2}h2{font-size:21px}article{background:#fff;border-radius:12px;padding:24px;margin:18px 0}li{margin:10px 0}.status{color:#43556a}table{width:100%;border-collapse:collapse;font-size:16px}td,th{text-align:left;vertical-align:top;padding:10px 6px;border-bottom:1px solid #ddd}p{overflow-wrap:anywhere}code{overflow-wrap:anywhere}@media(max-width:600px){body{margin:8px auto;padding:12px}article{padding:16px}h1{font-size:26px}td,th{padding:8px 4px;font-size:14px}}
+  </style>
+</head>
+<body>
+  <h1>Continuous cave travel, recovery and live task windows</h1>
+  <p class="status">Updated 2 October 2026. Implementation, focused verification and the requested Desktop installation are complete. The real Minecraft client, native windows, live Fabric checks and physical route comparison pass. Seven GPT-6.1 Sol subagents implemented and checked the remaining work. Desktop now has the exact tested JAR; selected model settings are unchanged.</p>
+  <article>
+    <h2>Goal and scope</h2>
+    <p>Keep the selected Minecraft agent in charge of routes, supplies, equipment, recovery and reactions. Reduce unnecessary pauses along an already chosen route, improve whole-trip preparation, fix the diagnosed coordinator and shutdown defects, and complete the approved B plan map and independent Codex terminal. Development and verification used an isolated Desktop installation. The subsequent requested update installed the tested JAR in Desktop's main mods folder. No GitHub publication is included.</p>
+  </article>
+  <article>
+    <h2>Implementation steps and status</h2>
+    <ol>
+      <li><strong>Complete:</strong> inspect the original run's receipts, routine, resources, death memory and coordinator failure. The old completion gaps were 0.50–0.80 seconds within movement pairs and 5.70–12.25 seconds between pairs. These included observation, planning and movement; they were not pure inference timings.</li>
+      <li><strong>Complete:</strong> replace immediate-craft gathering guidance with whole-trip planning. The agent considers food, durability, replacement tools, fuel, reusable tables and furnaces, useful nearby resources and remembered possessions. It chooses reserves, records its intent in progress memory and respects explicit user quantity limits.</li>
+      <li><strong>Complete:</strong> support an optional agent-authored <code>reassessWhen</code> condition on ordinary attention. Exact false lets an already chosen leg continue; missing facts, errors or other values return control. Urgent danger bypasses the condition. Existing fresh observations, watchers, receipt checks, checkpoints, repeated-failure recovery and local physical navigation remain active.</li>
+      <li><strong>Complete:</strong> teach meaningful verified waypoints and reusable background routines instead of broad inspection after every block. The agent checks movement receipts and reassesses at unknown ground, changed geometry, opportunities, threats or a failed leg. Runtime never selects a cave branch or unseen destination.</li>
+      <li><strong>Complete:</strong> teach the agent to choose held equipment and anticipate threats. The example uses an agent-selected shield response when a verified shield is available, then returns for a decision rather than resuming unrelated mining automatically. Runtime executes only the authored response.</li>
+      <li><strong>Complete:</strong> accept vanilla infinite effect duration <code>-1</code> consistently in both protocol validation and observation adaptation, preserving finite durations and rejecting other invalid values. A live Fabric observation with infinite Haste remained connected and completed another action.</li>
+      <li><strong>Complete:</strong> persist only the location of the matching, committed, living fake-player body at shutdown. Detached bodies, pending respawns and dead records retain recovery facts. Eight new lifecycle assertions cover the original error and relevant boundaries.</li>
+      <li><strong>Complete; B approved:</strong> provide independent plan-window and Codex-terminal toggles in Manage agent. The native branch map has zoom, scrolling, step selection and evidence details. Closing a viewer leaves the task running; preferences persist locally. Fix stale data, agent switching, task replacement, detail reading position and Minecraft's forced Java headless flag. <a href="https://pvw7x69urlmk.postplan.dev">Approved layout preview</a>.</li>
+      <li><strong>Complete:</strong> retain an advisory dependency plan from the existing Luna goal-planning request. The main agent can replace, reorder or skip its steps with <code>taskPlan</code>. Final goal verification remains independent. Explicit task replacement clears prior plan/output, including a new task with identical wording.</li>
+      <li><strong>Complete:</strong> retain task and recovery memory across death and restart, separating current inventory, historical milestones, known infrastructure and location. Display provider-emitted messages, available summaries, tools, results and status from the existing Codex process. Capture cumulative thread usage and shared allowance without extra display inference.</li>
+      <li><strong>Complete:</strong> verify the real Minecraft Manage screen and matched physical route using the built artifact. Unit, integration, headless rendering, native lifecycle and live Fabric checks passed. The physical comparison uses controlled response delays; it does not measure end-to-end model gameplay.</li>
+    </ol>
+  </article>
+  <article>
+    <h2>Measured before and after</h2>
+    <p>The controlled native-runtime comparison uses a frozen before-source import graph, matched six-action routes, fresh result observations, 60 ms action timers and a declared 100 ms decision-response delay. Each route has twelve paired measured repetitions. These are bridge-fixture timings, not Minecraft physics, provider token speed, FPS or whole-goal completion.</p>
+    <table>
+      <tr><th>Supplied route</th><th>Route p50 before → after</th><th>Idle p50 before → after</th></tr>
+      <tr><td>Turns</td><td>938.720 → 388.247 ms</td><td>553.507 → 6.807 ms</td></tr>
+      <tr><td>Slopes</td><td>938.196 → 386.946 ms</td><td>551.631 → 6.725 ms</td></tr>
+      <tr><td>Ledges</td><td>940.707 → 387.954 ms</td><td>554.125 → 6.414 ms</td></tr>
+    </table>
+    <p>Ordinary reconsideration responses fell from six to zero along the supplied known route. All 36 predicate pairs were faster and all 144 measured arms, including legacy controls, succeeded with matched actions. Legacy programs still reconsidered six times and showed no interpreter speedup. Nine boundary cases covered changed support, new geometry/resources, hostiles, urgent damage, dimension changes, a failed leg and repeated failure.</p>
+    <p>The physical comparison uses the same current JAR for both attention policies, an isolated stone route with a turn, one-block ascent and raised ledge, and a declared 100 ms response fixture. Three pairs alternated arm order; all 36 real navigation actions succeeded with full health, matched control shapes, fresh support facts and independently checked final positions.</p>
+    <table>
+      <tr><th>Physical policy comparison</th><th>Legacy pause → authored condition</th></tr>
+      <tr><td>Route completion p50</td><td>4,449.900 → 3,930.665 ms</td></tr>
+      <tr><td>Receipt-to-next-dispatch p50</td><td>106.497 → 3.360 ms</td></tr>
+      <tr><td>Summed inter-action idle proxy p50</td><td>535.034 → 18.316 ms</td></tr>
+      <tr><td>Ordinary reconsideration responses</td><td>6 → 0 per route</td></tr>
+    </table>
+    <p>All three paired routes were faster, about 11.7% at the median. Route timing includes five inter-leg gaps; the sixth legacy response happens after the final receipt and is outside that clock. This measures actual collision/pathfinding with controlled attention, not old/new JARs, provider inference, a natural cave or an autonomous long task. No model call was used.</p>
+    <p>Four real text-only Codex responses compared before/after guidance with the same submitted GPT-6.1 Sol medium/fast configuration. In the preparation case the model chose three of six iron blocks and one spare pick before, versus all six blocks and two spares after; both chose food and workstation reuse. Both route responses already chose all six verified waypoints, so no increase in model route batch length was demonstrated. This is one response per case and arm, not a reliable survival or efficiency estimate.</p>
+    <p>Retained usage for those four requests: 80,494 input tokens, including 32,384 cached input, and 1,316 output tokens. No account-percentage or dollar attribution is available. Timing, Fabric and window checks used no provider calls. The viewers start no extra planner request.</p>
+  </article>
+  <article>
+    <h2>Verification</h2>
+    <p>Full coordinator suite: 1,882 passed, three skipped, zero failures. Java core: 15,842 assertions. Voice addon: 387 assertions. Camera/presentation: 19 checks. Build succeeded. Headless tests rendered the real graph and checked step selection, inventory loss, detail position and task reset.</p>
+    <p>Desktop standalone native-window test: 18 checks passed using the packaged implementation, covering independent toggles, close/reopen, saved preferences, selection, task revision, stale cached packets, offline/reconnect and deletion. This test does not launch the Minecraft management screen.</p>
+    <p>Desktop live Fabric capability test: all six passed using the current server artifact. Infinite Haste stayed connected; chosen queued controls kept their provenance; fresh false and nonboolean guards rejected successors; exact mining left an adjacent decoy intact and verified pickup; injected injury cancelled mining, executed only the authored retreat and waited for reconsideration. Shutdown completed without the location exception. The injury was injected into a prepared test world, not an autonomous combat trial.</p>
+    <p id="client-verification">Real initialized Minecraft 26.1.2 client: 18 checks passed through actual Manage-screen mouse input and native frames using normal desktop detection. Both toggles, native-close label updates, reopen, selection, late old packets, offline/reconnect, permission-disabled controls and disconnect cleanup passed. Roster and live packets were synthetic; this was not a user-world or provider session. The test exposed and then verified the fix for Minecraft's forced Java headless flag. Three fresh-JVM true/false/automatic regressions now run in regular Gradle checks.</p>
+    <p id="physical-route-verification">Physical irregular-route comparison passed all six route arms and eight evidence checks. Runtime/agent cleanup and server shutdown were clean. Full raw observations and progress are retained separately; the bounded scenario exporter preserves its original byte limit using compact JSON formatting.</p>
+  </article>
+  <article>
+    <h2>Plan persistence and death</h2>
+    <table>
+      <tr><th>Step meaning</th><th>After death</th></tr>
+      <tr><td>Carry a usable iron pickaxe</td><td>Re-evaluate inventory; mark lost or pending if absent. The main agent chooses recovery or replacement.</td></tr>
+      <tr><td>Crafted a first tool; entered the Nether</td><td>Retain agent-reported history. Current equipment and dimension remain separate.</td></tr>
+      <tr><td>Established portal; recorded staircase</td><td>Retain known infrastructure and routes with last-observed information. Recheck when relying on it and invalidate on contrary evidence.</td></tr>
+      <tr><td>Current location or carried rods</td><td>Re-evaluate against current respawn observations.</td></tr>
+    </table>
+    <p>The map shows an older task without a structured plan as unavailable rather than inventing steps. Remembered green infrastructure is known history, not current visual confirmation. The read-only terminal presents the existing process's emitted content and available summaries; it does not create another Codex thinker or expose unavailable private reasoning.</p>
+  </article>
+  <article>
+    <h2>Decisions and limits</h2>
+    <p>The main agent remains the sole strategic decision maker. It authors route legs, supplies, equipment and reactions; deterministic machinery validates facts and executes those choices. Existing collision checks and safe local detours are retained. Preparation guidance is not an enforced shopping list, and extra gathering must justify its marginal time and risk.</p>
+    <p>No whole diamond-pickaxe run, random-seed completion rate, autonomous hostile-survival rate or end-to-end model speedup is established by these focused checks. Unknown cave geometry and spectator-visible diamonds remain unavailable to the agent until observed. Guidance can improve one response and still fail in another; longer gameplay remains the next measurement after this local implementation.</p>
+    <p>Desktop's main mod was updated on 2 October at 12:04 UTC, after Minecraft was confirmed closed. The installed SHA-256 matches the tested artifact, only one core mod JAR is present and the prior JAR is backed up. The selected model and speed mode are unchanged. Verification used an isolated QA installation; the updated main installation will load on the next Minecraft launch. No commit, push, PR or merge has been performed.</p>
+  </article>
+</body>
+</html>

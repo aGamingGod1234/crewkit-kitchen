@@ -52,6 +52,10 @@ public final class AgentControlSync {
 			return;
 		}
 		PayloadTypeRegistry.serverboundPlay().register(AgentControlRequestPayload.TYPE, AgentControlRequestPayload.CODEC);
+		PayloadTypeRegistry.serverboundPlay().register(dev.agaminggod.arenaagents.control.LiveTaskViewPayload.Request.TYPE, dev.agaminggod.arenaagents.control.LiveTaskViewPayload.Request.CODEC);
+		PayloadTypeRegistry.clientboundPlay().register(dev.agaminggod.arenaagents.control.LiveTaskViewPayload.Snapshot.TYPE, dev.agaminggod.arenaagents.control.LiveTaskViewPayload.Snapshot.CODEC);
+		ServerPlayNetworking.registerGlobalReceiver(dev.agaminggod.arenaagents.control.LiveTaskViewPayload.Request.TYPE,
+				(payload, context) -> context.server().execute(() -> LiveTaskViewSync.request(context.player(), payload.agentId())));
 		PayloadTypeRegistry.serverboundPlay().register(ScenarioLaunchPayload.TYPE, ScenarioLaunchPayload.CODEC);
 		PayloadTypeRegistry.serverboundPlay().register(ScenarioCancelPayload.TYPE, ScenarioCancelPayload.CODEC);
 		PayloadTypeRegistry.clientboundPlay().register(AgentControlSnapshotPayload.TYPE, AgentControlSnapshotPayload.CODEC);

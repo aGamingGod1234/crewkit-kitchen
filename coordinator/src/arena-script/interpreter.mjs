@@ -10,7 +10,7 @@ const CAPABILITY_NAMES = new Set(['program', 'player', 'world', 'inventory', 'ma
 const CAPABILITY_MEMBERS = Object.freeze({
 	program: new Set(['onUnhandledAttention', 'repeatUntil', 'watch', 'checkpoint', 'finish', 'parameters']),
 	player: new Set([...Object.keys(PLAYER_MEMBER_PRIMITIVES), 'state']),
-	world: new Set(['items', 'entities', 'blocks', 'nearest', 'state', 'menu', 'inspect', 'remember', 'queryMemory']),
+	world: new Set(['items', 'entities', 'blocks', 'nearest', 'state', 'menu', 'inspect', 'remember', 'queryMemory', 'taskMemory']),
 	inventory: new Set(['count', 'countTag', 'slots', 'state']),
 	math: new Set(Object.keys(MATH_METHODS)),
 });
@@ -51,8 +51,10 @@ export class ArenaScriptInterpreter {
 	#lifecycle = 'READY';
 	#loopIterations = 0;
 	#watcherEvaluation = false;
+	#reassessmentCondition = null;
 	#watcherExecution = false;
 	#deferredCommand = null;
+	#awaitingWatcherDecision = false;
 	#deterministicFailure = null;
 
 	constructor(compiled, bindings, { limits = DEFAULT_ARENA_SCRIPT_LIMITS, parameters } = {}) {
@@ -92,6 +94,14 @@ export class ArenaScriptInterpreter {
 		return this.#run();
 	}
 
+	resumeWatcherDecision(facts) {
+		if (!this.#awaitingWatcherDecision || this.#waiting !== null) throw executionError('NOT_WAITING', 'No authored watcher decision is awaiting resumption');
+		this.#awaitingWatcherDecision = false;
+		this.#context.facts = freezeFacts(facts);
+		this.#beginSlice();
+		return this.#run();
+	}
+
 	runWatcher(watcherId, facts) {
 		if (!this.#started) throw executionError('NOT_STARTED', 'ArenaScript NOT_STARTED: start the program before running watchers');
 		validateWatcherId(watcherId);
@@ -115,7 +125,7 @@ export class ArenaScriptInterpreter {
 	runWatcherHandler(watcherId, facts) {
 		const watcher = this.#watcherForHandler(watcherId, facts);
 		this.#watcherExecution = true;
-		this.#frames.push({ type: 'watcher-after-handler' });
+		this.#frames.push({ type: 'watcher-after-handler', watcher });
 		this.#invokeFunction(watcher.handler, []);
 		return this.#run();
 	}
@@ -133,7 +143,7 @@ export class ArenaScriptInterpreter {
 		this.#terminal = false;
 		this.#watcherExecution = true;
 		this.#beginSlice();
-		this.#frames.push({ type: 'watcher-after-handler' });
+		this.#frames.push({ type: 'watcher-after-handler', watcher });
 		this.#invokeFunction(watcher.handler, []);
 		return this.#run();
 	}
@@ -156,7 +166,18 @@ export class ArenaScriptInterpreter {
 		if (this.#lifecycle !== 'ACTIVE') throw executionError('INACTIVE_LIFECYCLE', `ArenaScript INACTIVE_LIFECYCLE: program is ${this.#lifecycle}`);
 		const watcher = this.#watchers.get(watcherId);
 		if (!watcher) throw executionError('UNKNOWN_WATCHER', `ArenaScript UNKNOWN_WATCHER: ${watcherId}`);
-		const saved = { frames: this.#frames, values: this.#values, waiting: this.#waiting, terminal: this.#terminal, yield: this.#yield, lifecycle: this.#lifecycle };
+		return Boolean(this.#evaluateCondition(watcher.condition, facts));
+	}
+
+	/** Only an authored, exact false can waive an ordinary attention notification. */
+	shouldReassess(facts) {
+		if (this.#reassessmentCondition === null) return true;
+		try { return this.#evaluateCondition(this.#reassessmentCondition, facts) !== false; }
+		catch { return true; } // Unknown facts and invalid conditions return control to the agent.
+	}
+
+	#evaluateCondition(condition, facts) {
+		const saved = { frames: this.#frames, values: this.#values, waiting: this.#waiting, terminal: this.#terminal, yield: this.#yield, lifecycle: this.#lifecycle, watcherExecution: this.#watcherExecution };
 		this.#context.facts = freezeFacts(facts);
 		this.#frames = [];
 		this.#values = [];
@@ -166,8 +187,8 @@ export class ArenaScriptInterpreter {
 		this.#watcherEvaluation = false;
 		this.#beginSlice();
 		this.#frames.push({ type: 'watcher-evaluate' });
-		this.#invokeFunction(watcher.condition, []);
 		try {
+			this.#invokeFunction(condition, []);
 			this.#run();
 			return this.#watcherEvaluation;
 		} finally {
@@ -177,6 +198,7 @@ export class ArenaScriptInterpreter {
 			this.#terminal = saved.terminal;
 			this.#yield = saved.yield;
 			this.#lifecycle = saved.lifecycle;
+			this.#watcherExecution = saved.watcherExecution;
 		}
 	}
 
@@ -290,8 +312,15 @@ export class ArenaScriptInterpreter {
 			case 'repeat-after-condition': return this.#repeatAfterCondition(frame);
 			case 'repeat-after-body': return this.#repeatAfterBody(frame);
 			case 'watcher-after-condition': return this.#watcherAfterCondition(frame);
-			case 'watcher-after-handler': this.#values.pop(); return;
-			case 'watcher-evaluate': this.#watcherEvaluation = Boolean(this.#values.pop()); return;
+			case 'watcher-after-handler':
+				this.#values.pop();
+				this.#watcherExecution = false;
+				if (frame.watcher.after === 'reconsider') {
+					this.#awaitingWatcherDecision = true;
+					this.#yield = frozenRecord({ kind: 'watcher_decision', watcherId: frame.watcher.id });
+				}
+				return;
+			case 'watcher-evaluate': this.#watcherEvaluation = this.#values.pop(); return;
 			default: throw executionError('INVALID_FRAME', `ArenaScript INVALID_FRAME: ${frame.type}`);
 		}
 	}
@@ -499,7 +528,9 @@ export class ArenaScriptInterpreter {
 			case 'program.parameters':
 				if (args.length !== 0) throw this.#error('INVALID_ARGUMENT', 'program.parameters requires no arguments', node);
 				return this.#values.push(this.#parameters);
-			case 'program.onUnhandledAttention': return this.#values.push(undefined);
+			case 'program.onUnhandledAttention':
+				this.#reassessmentCondition = args[1]?.reassessWhen ?? null;
+				return this.#values.push(undefined);
 			case 'program.watch': return this.#registerWatcher(node, args);
 			case 'program.checkpoint': return this.#terminalYield('checkpoint', node, terminalText(args[0], 'checkpoint', node));
 			case 'program.finish': return this.#terminalYield('finish', node, terminalText(args[0], 'finished', node));
@@ -510,6 +541,7 @@ export class ArenaScriptInterpreter {
 			case 'world.inspect': return this.#yieldQuery('inspect', args, node, environment);
 			case 'world.remember': return this.#yieldQuery('remember', args, node, environment);
 			case 'world.queryMemory': return this.#yieldQuery('queryMemory', args, node, environment);
+			case 'world.taskMemory': return this.#yieldQuery('taskMemory', args, node, environment);
 			case 'inventory.state': return this.#values.push(this.#context.facts.inventory.state);
 			case 'inventory.slots': return this.#values.push(filterObserved(this.#context.facts.inventory.items, args[0]));
 			case 'world.items': return this.#values.push(filterObserved(this.#context.facts.world.items, args[0]));
@@ -622,7 +654,7 @@ export class ArenaScriptInterpreter {
 	#registerWatcher(node, args) {
 		if (!isArenaFunction(args[0]) || !isArenaFunction(args[2])) throw this.#error('INVALID_WATCHER', 'ArenaScript INVALID_WATCHER: watcher functions are required', node);
 		const id = `watcher-${this.#watchers.size}`;
-		this.#watchers.set(id, Object.freeze({ id, condition: args[0], handler: args[2], mode: args[1]?.mode }));
+		this.#watchers.set(id, Object.freeze({ id, condition: args[0], handler: args[2], mode: args[1]?.mode, after: args[1]?.after }));
 		this.#values.push(undefined);
 	}
 
@@ -654,7 +686,7 @@ export class ArenaScriptInterpreter {
 
 	#watcherAfterCondition({ watcher }) {
 		if (!this.#values.pop()) return;
-		this.#frames.push({ type: 'watcher-after-handler' });
+		this.#frames.push({ type: 'watcher-after-handler', watcher });
 		this.#invokeFunction(watcher.handler, []);
 	}
 

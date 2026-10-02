@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { types as nodeTypes } from 'node:util';
 import { ModelNotebook } from './model-notebook.mjs';
+import { TaskMemoryStore } from './task-memory-store.mjs';
 import { normalizeMinecraftToolCall } from './native-minecraft-tools.mjs';
 import { validateAction } from './schema.mjs';
 
@@ -11,11 +12,14 @@ const AUTHOR_IDS = ['programId', 'sourceStepId', 'turnId', 'callId'];
 /** Shares scoped model notes and factual action receipts across execution modes. */
 export class RuntimeMemoryContext {
 	#notebook; #sessionId; #contexts = new Map(); #dispatches = new Map();
-	constructor({ notebook = new ModelNotebook(), sessionId = randomUUID() } = {}) {
+	#tasks; #taskPending = new Map(); #taskContexts = new Map();
+	constructor({ notebook = new ModelNotebook(), taskMemory = new TaskMemoryStore(), sessionId = randomUUID() } = {}) {
 		for (const method of ['writeNote', 'query', 'recordDispatch', 'recordUnknown', 'recordReceipt', 'findReceipt']) {
 			if (typeof notebook?.[method] !== 'function') throw new TypeError(`notebook.${method} is required`);
 		}
 		this.#notebook = notebook;
+		for (const method of ['observe', 'summary', 'query', 'remember', 'flush']) if (typeof taskMemory?.[method] !== 'function') throw new TypeError(`taskMemory.${method} is required`);
+		this.#tasks = taskMemory;
 		this.#sessionId = boundedText(sessionId, 'sessionId', 128);
 	}
 	get notebook() { return this.#notebook; }
@@ -28,22 +32,45 @@ export class RuntimeMemoryContext {
 		const previous = this.#contexts.get(agentId);
 		const suppliedWorld = world.worldId ?? source.worldId;
 		const worldId = suppliedWorld === undefined
-			? previous?.goalRevision === goalRevision ? previous.worldId : `session:${this.#sessionId}`
+			? previous?.worldId ?? `session:${this.#sessionId}`
 			: boundedText(suppliedWorld, 'worldId', 256);
-		const dimension = world.dimension ?? world.dimensionId ?? source.dimension;
+		const dimension = world.dimension ?? world.dimensionId ?? source.dimension ?? source.death?.dimensionId ?? (previous?.worldId === worldId ? previous.dimension : undefined);
 		const context = { goalRevision, worldId,
 			...(typeof dimension === 'string' ? { dimension: boundedText(dimension, 'dimension', 128) } : {}),
 			...(Number.isSafeInteger(source.worldTick) && source.worldTick >= 0 ? { tick: source.worldTick } : {}),
 		};
 		this.#contexts.set(agentId, context);
+		if (!worldId.startsWith('session:') && context.dimension !== undefined) {
+			const scope = { agentId, ...context };
+			const snapshot = structuredClone(pick(source, ['world', 'worldTick', 'observedAtEpochMs', 'position', 'player', 'ready', 'death', 'inventory', 'lastLiveInventory', 'blocks', 'landmarks', 'nearbyContainers']));
+			const pending = Promise.resolve(this.#taskPending.get(agentId)).catch(() => {}).then(async () => {
+				await this.#tasks.observe(scope, snapshot);
+				this.#taskContexts.set(agentId, await this.#tasks.summary(scope));
+			});
+			this.#taskPending.set(agentId, pending);
+			pending.catch(() => {}); // taskContext/flush surface failures; observation delivery stays synchronous.
+		}
 		return { ...context };
 	}
+	peekTaskContext(record) {
+		const context = this.#contexts.get(record.agentId), summary = this.#taskContexts.get(record.agentId);
+		return summary?.worldId === context?.worldId && summary?.dimension === context?.dimension ? structuredClone(summary) : null;
+	}
+	async taskContext(record) {
+		await this.#taskPending.get(record.agentId);
+		const context = this.#contexts.get(record.agentId);
+		if (context?.goalRevision !== record.goalRevision || !context?.dimension || context.worldId.startsWith('session:')) return null;
+		const summary = await this.#tasks.summary({ agentId: record.agentId, ...context });
+		this.#taskContexts.set(record.agentId, summary);
+		return summary;
+	}
+	async flush() { await Promise.all(this.#taskPending.values()); await this.#tasks.flush(); }
 	worldId(record) {
 		const { agentId, goalRevision } = recordIdentity(record);
 		const context = this.#contexts.get(agentId);
 		return context?.goalRevision === goalRevision ? context.worldId : null;
 	}
-	forget(agentId) { this.#contexts.delete(boundedText(agentId, 'agentId', 256)); }
+	forget(agentId) { this.#contexts.delete(boundedText(agentId, 'agentId', 256)); this.#taskContexts.delete(agentId); }
 	unresolved(record, page = {}) { return this.execute(record, { operation: 'query', arguments: { ...ownRecord(page, 'memory page'), kind: 'unresolved' } }); }
 
 	async execute(record, request) {
@@ -51,6 +78,17 @@ export class RuntimeMemoryContext {
 		const worldId = this.worldId(record);
 		if (worldId === null) throw codedError('WORLD_ID_REQUIRED', 'Observe the current agent world before accessing memory');
 		const source = ownRecord(request, 'memory request');
+		if (source.operation === 'task') {
+			await this.#taskPending.get(agentId);
+			const scope = { agentId, ...this.#contexts.get(agentId) };
+			if (scope.goalRevision !== goalRevision || scope.worldId !== worldId) throw codedError('STALE_GOAL', 'Task memory request belongs to an obsolete goal or world');
+			if (!scope.dimension || worldId.startsWith('session:')) throw codedError('WORLD_ID_REQUIRED', 'Task memory requires an observed persistent world and dimension');
+			const tool = normalizeMinecraftToolCall('taskMemory', source.arguments);
+			if (tool.operation === 'query') return { state: 'SUCCEEDED', reasonCode: 'TASK_MEMORY_QUERIED', ...await this.#tasks.query(scope, tool.query) };
+			const entry = await this.#tasks.remember(scope, tool.entry);
+			await this.taskContext(record);
+			return { state: 'SUCCEEDED', reasonCode: 'TASK_MEMORY_WRITTEN', entry };
+		}
 		if (!['write', 'query'].includes(source.operation)) throw codedError('INVALID_MEMORY_OPERATION', 'Memory operation must be write or query');
 		const normalized = normalizeMinecraftToolCall(source.operation === 'write' ? 'notebook' : 'queryMemory', source.arguments);
 		if (source.operation === 'write') {

@@ -10,6 +10,9 @@ import { NativeToolRuntime } from '../native-tool-runtime.mjs';
 import { normalizeMinecraftToolCall } from '../native-minecraft-tools.mjs';
 import { parseArenaScript } from '../arena-script/parser.mjs';
 import { adaptObservation } from '../observation-adapter.mjs';
+import { classifyObservationTrigger } from '../dynamic-main.mjs';
+import { RuntimeMemoryContext } from '../runtime-memory-context.mjs';
+import { TaskMemoryStore } from '../task-memory-store.mjs';
 import { parseProbeArguments, probeFailureMessage } from '../player-capability-probe.mjs';
 
 const PROFILE = Object.freeze({ provider: 'codex', model: 'gpt-6.1-sol', reasoningEffort: 'medium', serviceTier: 'fast' });
@@ -34,6 +37,7 @@ export async function runNativeSuccessorLive(config) {
   const bridge = new MultiplexedServerBridge({ port: config.bridgePort, secret });
   const rcon = new HeadlessRconClient({ host: config.host, port: config.rconPort, password });
   const messages = [], commands = [], results = [], samples = [], events = [];
+  const memory = new RuntimeMemoryContext({ taskMemory: new TaskMemoryStore({ directory: join(config.runDirectory, 'task-memory') }) });
   let record, runtime, callOrdinal = 0, failure = null;
   const now = () => performance.now();
   const command = async text => (await rcon.command(text)).text;
@@ -123,12 +127,14 @@ export async function runNativeSuccessorLive(config) {
         if (type === 'action_command') commands.push({ ...structuredClone(payload), dispatchedAt: now() });
         return bridge.send(type, agentId, payload);
       } }, requestObservation: passiveObservation,
+      memoryObservation: (r, o) => memory.observe(r, o), taskContext: (r) => memory.taskContext(r),
+      memoryOperation: (r, operation) => memory.execute(r, operation),
       onProgramEvent: (_record, event) => events.push({ ...event, at: now() }) });
     bridge.on('observation', event => {
       if (event.agentId !== record.agentId || event.payload.goalRevision !== record.goalRevision) return;
-      runtime.updateObservation(record, adaptObservation(event.payload.observation ?? event.payload), { eventSequence: event.payload.eventSequence,
-        attention: event.payload.attention === true, priority: event.payload.priority,
-        trigger: event.payload.trigger, changedFacts: event.payload.changedFacts });
+      const raw = event.payload.observation ?? event.payload;
+      runtime.updateObservation(record, adaptObservation(raw), { eventSequence: event.payload.eventSequence,
+        ...classifyObservationTrigger(event.payload, raw), changedFacts: event.payload.changedFacts });
     });
     bridge.on('action_progress', event => {
       if (event.agentId === record.agentId) runtime.onActionProgress(record, event.payload);
@@ -142,6 +148,21 @@ export async function runNativeSuccessorLive(config) {
     const initial = await passiveObservation();
     runtime.updateObservation(record, initial.observation, { eventSequence: initial.eventSequence });
     report.world = { ready: initial.observation.ready, ...initial.observation.world };
+    await check('vanilla infinite Haste survives real observation ingress and subsequent actions', async () => {
+      const offset = messages.length;
+      await command(`effect give ${player} minecraft:haste infinite 0 true`);
+      const sample = await passiveObservation();
+      const effect = sample.observation.player.effects.find(effect => effect.effectId === 'minecraft:haste');
+      assert.equal(effect?.duration, -1, 'vanilla infinite duration retained in adapted facts');
+      const action = await call('wait', { durationMs: 50 });
+      assert.equal(action.state, 'SUCCEEDED');
+      const following = await passiveObservation();
+      assert.equal(following.observation.player.effects.find(effect => effect.effectId === 'minecraft:haste')?.duration, -1);
+      assert.ok(messages.slice(offset).some(event => event.type === 'observation'), 'ordinary observation stream remains live');
+      await command(`effect clear ${player} minecraft:haste`);
+      return { duration: -1, actionState: action.state, gameTimeBefore: sample.observation.world.gameTime,
+        gameTimeAfter: following.observation.world.gameTime, providerCalls: 0 };
+    });
     await check('parameterized routine and ready queued successor execute real independent programs', async () => {
       const offset = commands.length;
       const first = { delay: 1200, target: { x: 2.5, y: 65.5, z: 0.5 } };
@@ -255,6 +276,52 @@ export async function runNativeSuccessorLive(config) {
         adjacentDecoyUnchanged: true, inventoryVerifiedBy: ['fresh live observation', 'RCON entity Inventory'],
         inventory: after.inventory.items, operatorCommandsUsedForMiningOrPickup: false };
     });
+    await check('live injury interrupts mining, executes only authored retreat and waits for reconsideration', async () => {
+      await command(`tp ${player} 0.5 64 0.5`);
+      await command(`effect give ${player} minecraft:instant_health 1 5 true`);
+      await command('setblock 1 64 0 minecraft:obsidian');
+      await call('act', { actionType: 'look_at', arguments: { x: 1.5, y: 64.5, z: 0.5 } });
+      const fresh = await passiveObservation(); runtime.updateObservation(record, fresh.observation, { eventSequence: fresh.eventSequence });
+      assert.equal(fresh.observation.player.health, 20);
+      await call('taskMemory', { operation: 'remember', entry: { kind: 'place', key: 'fixture-floor', label: 'Known retreat floor', summary: 'Observed cleared floor; chosen by deterministic fixture, not a runtime strategy.', position: { x: -3.5, y: 64, z: 0.5 } } });
+      const source = `${prefix} const p = program.parameters();
+        program.watch(() => player.state().health < p.health, {mode:"interrupt", after:"reconsider"}, async () => {
+          await player.navigateTo({x:p.escape.x,y:p.escape.y,z:p.escape.z,tolerance:0.4,sprint:true,timeoutMs:5000});
+        });
+        await player.breakBlock({x:1,y:64,z:0,expectedBlockId:"minecraft:obsidian",timeoutMs:10000});
+        await player.wait(1);`;
+      const offset = commands.length;
+      const handle = await call('runProgram', { source, parameters: { health: 20, escape: { x: -3.5, y: 64, z: 0.5 } }, background: true, observationIntervalMs: 100, timeoutMs: 12000, maxActions: 3 });
+      await until(() => commands.slice(offset).some(a => a.actionType === 'break_block'), 'active mining');
+      const injectedAt = now();
+      await command(`damage ${player} 2 minecraft:generic`);
+      await until(() => commands.slice(offset).some(a => a.actionType === 'navigate_to'), 'authored defensive retreat');
+      await command(`effect give ${player} minecraft:instant_health 1 5 true`);
+      await sleep(60); // Let the fixture's explicit heal apply on a server tick.
+      const rearmed = await passiveObservation(); runtime.updateObservation(record, rearmed.observation, { eventSequence: rearmed.eventSequence });
+      assert.equal(rearmed.observation.player.health, 20, 'fixture healing rearms the defensive condition');
+      assert.equal(results.some(r => r.actionId === commands[offset + 1].actionId && terminal.has(r.state)), false, 'retreat remains in progress before the second hit');
+      await command(`damage ${player} 2 minecraft:generic`);
+      await until(() => events.some(e => e.programId === handle.programId && e.status?.decision?.trigger === 'defensive_handler_completed'), 'defensive reconsideration');
+      const status = await call('programStatus', { programId: handle.programId });
+      assert.equal(status.engineState, 'SUSPENDED');
+      const actions = commands.slice(offset);
+      assert.deepEqual(actions.map(a => a.actionType), ['break_block', 'navigate_to']);
+      assert.equal(results.find(r => r.actionId === actions[0].actionId)?.state, 'CANCELLED');
+      assert.equal(results.find(r => r.actionId === actions[1].actionId)?.state, 'SUCCEEDED');
+      const after = await passiveObservation();
+      assert.ok(Math.abs(after.observation.player.x + 3.5) <= 0.5);
+      await sleep(350);
+      assert.equal(commands.length - offset, 2, 'mining cannot silently resume');
+      const recalled = await call('taskMemory', { operation: 'query', query: { kind: 'place' } });
+      assert.equal(recalled.entries[0].key, 'fixture-floor');
+      await call('respondProgram', { programId: handle.programId, goalRevision: record.goalRevision, decisionId: status.decision.decisionId, directive: 'pause' });
+      return { injurySetup: 'Two RCON damage 2 minecraft:generic hits, with healing between them, during real mining and authored retreat', actionTypes: actions.map(a => a.actionType),
+        damageCommands: 2, rearmedAtHealth: rearmed.observation.player.health,
+        miningState: 'CANCELLED', retreatState: 'SUCCEEDED', autoResumedMining: false,
+        injuryCommandToRetreatDispatchMs: actions[1].dispatchedAt - injectedAt, healthAfter: after.observation.player.health,
+        providerCalls: 0, tacticAuthor: 'deterministic fixture', rememberedPlace: recalled.entries[0].key };
+    });
     report.status = 'PASSED';
   } catch (error) {
     report.failure = probeFailureMessage(error, [secret, password]);
@@ -262,6 +329,7 @@ export async function runNativeSuccessorLive(config) {
     report.recentGoalEvents = messages.filter(event => ['goal_control', 'goal_spec_request', 'goal_spec_result', 'conversation_wake'].includes(event.type)).slice(-4).map(({ type, payload }) => ({ type, payload }));
   } finally {
     try { await runtime?.disposeAll(); report.cleanup.runtime = 'CLEAN'; } catch { report.cleanup.runtime = 'FAILED'; }
+    try { await memory.flush(); report.cleanup.taskMemory = 'FLUSHED'; } catch { report.cleanup.taskMemory = 'FAILED'; }
     try { if (record) await command(`codex remove ${config.agentName}`); report.cleanup.agent = 'REMOVED'; } catch { report.cleanup.agent = 'FAILED'; }
     bridge.stop(); await rcon.close();
     report.actions = commands.map(action => {

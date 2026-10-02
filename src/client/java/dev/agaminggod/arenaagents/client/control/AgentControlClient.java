@@ -87,6 +87,8 @@ public final class AgentControlClient {
 		if (registered) {
 			return;
 		}
+		ClientPlayNetworking.registerGlobalReceiver(dev.agaminggod.arenaagents.control.LiveTaskViewPayload.Snapshot.TYPE,
+				(payload, context) -> context.client().execute(() -> LiveAgentWindows.accept(payload)));
 		ClientPlayNetworking.registerGlobalReceiver(dev.agaminggod.arenaagents.control.DirectorSnapshotPayload.TYPE,
 				(payload, context) -> context.client().execute(() -> {
 					if (!DirectorClientState.accept(payload)) return;
@@ -304,6 +306,7 @@ public final class AgentControlClient {
 	}
 
 	private static void tick(Minecraft client) {
+		LiveAgentWindows.tick(client);
 		while (OPEN_CONTROL.consumeClick()) {
 			if (client.player != null && client.level != null && client.screen == null) {
 				client.setScreen(new AgentControlScreen());
@@ -388,6 +391,7 @@ public final class AgentControlClient {
 	}
 
 	private static void clearConnectionState() {
+		LiveAgentWindows.disconnect();
 		DirectorClientState.clear();
 		SNAPSHOTS.clear();
 		AgentControlCatalog.resetRuntimeCatalog();

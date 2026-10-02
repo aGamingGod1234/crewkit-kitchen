@@ -160,6 +160,8 @@ function validateProgram(ast, limits) {
 		stepLocations: new Map(),
 		policyCount: 0,
 		unhandledPolicy: null,
+		survivalPolicy: 'pause_and_notify',
+		hasReassessmentCondition: false,
 		watcherCount: 0,
 		watchers: [],
 		primitiveCalls: new Set(),
@@ -185,6 +187,8 @@ function validateProgram(ast, limits) {
 		nodeCount: state.nodeCount,
 		stepLocations: createFrozenMap(state.stepLocations),
 		unhandledPolicy: state.unhandledPolicy,
+		survivalPolicy: state.survivalPolicy,
+		hasReassessmentCondition: state.hasReassessmentCondition,
 		watcherCount: state.watcherCount,
 		watchers: state.watchers,
 		primitiveCalls: Object.freeze([...state.primitiveCalls].sort()),
@@ -199,6 +203,9 @@ function validateWatcherPrologue(ast) {
 			? staticMemberPath(statement.expression.callee)?.join('.') : null;
 		if (path === 'program.onUnhandledAttention' || path === 'program.watch') {
 			if (!prologue && path === 'program.watch') throw arenaError('UNSUPPORTED_SYNTAX', 'program.watch declarations must precede top-level execution', statement);
+			if (!prologue && path === 'program.onUnhandledAttention' && statement.expression.arguments[1]?.properties?.some((property) => (property.key?.name ?? property.key?.value) === 'reassessWhen')) {
+				throw arenaError('UNSUPPORTED_SYNTAX', 'reassessWhen declarations must precede top-level execution', statement);
+			}
 			continue;
 		}
 		if (statementHasTopLevelEffect(statement)) prologue = false;
@@ -462,10 +469,29 @@ function validateCallExpression(node, state, context) {
 		if (state.policyCount > 1) {
 			throw arenaError('UNSUPPORTED_SYNTAX', 'exactly one top-level onUnhandledAttention policy is required', node);
 		}
-		if (node.arguments.length !== 1 || node.arguments[0]?.type !== 'Literal' || typeof node.arguments[0].value !== 'string' || !UNHANDLED_POLICIES.has(node.arguments[0].value)) {
+		if (![1, 2].includes(node.arguments.length) || node.arguments[0]?.type !== 'Literal' || typeof node.arguments[0].value !== 'string' || !UNHANDLED_POLICIES.has(node.arguments[0].value)) {
 			throw arenaError('UNSUPPORTED_SYNTAX', 'onUnhandledAttention requires one supported literal policy', node);
 		}
 		state.unhandledPolicy = node.arguments[0].value;
+		if (node.arguments[1] !== undefined) {
+			const options = node.arguments[1];
+			if (options.type !== 'ObjectExpression' || options.properties.length === 0) throw arenaError('UNSUPPORTED_SYNTAX', 'attention options require survival or reassessWhen', options);
+			const names = new Set();
+			for (const property of options.properties) {
+				const name = property.type === 'Property' ? propertyName(property.key) : null;
+				if (!['survival', 'reassessWhen'].includes(name) || property.computed || property.method || property.kind !== 'init' || names.has(name)) throw arenaError('UNSUPPORTED_SYNTAX', 'attention options allow only unique survival and reassessWhen properties', property);
+				names.add(name);
+				if (name === 'survival') {
+					if (property.value.type !== 'Literal' || !UNHANDLED_POLICIES.has(property.value.value)) throw arenaError('UNSUPPORTED_SYNTAX', 'survival requires a supported literal policy', property);
+					state.survivalPolicy = property.value.value;
+				} else {
+					if (!isFunctionNode(property.value)) throw arenaError('UNSUPPORTED_SYNTAX', 'reassessWhen requires a factual condition function', property);
+					validatePureCondition(property.value);
+					recordCallbackCalls(state, state.watcherActivationNode, context, property.value);
+					state.hasReassessmentCondition = true;
+				}
+			}
+		}
 	}
 
 	if (pathEqual(path, ['program', 'repeatUntil'])) {
@@ -617,7 +643,14 @@ function validateWatcher(node, state, context) {
 		throw arenaError('UNSUPPORTED_SYNTAX', 'program.watch requires condition, options, and handler functions', node);
 	}
 	recordCallbackCalls(state, state.watcherActivationNode, context, node.arguments[0], node.arguments[2]);
-	const mode = literalObjectProperty(node.arguments[1], 'mode', 'UNSUPPORTED_SYNTAX');
+	const options = node.arguments[1];
+	if (options?.type !== 'ObjectExpression' || options.properties.some((p) => p.type !== 'Property' || p.computed || p.kind !== 'init' || p.value.type !== 'Literal'
+		|| !['mode', 'after'].includes(p.key.name ?? p.key.value)) || new Set(options.properties.map((p) => p.key.name ?? p.key.value)).size !== options.properties.length) {
+		throw arenaError('UNSUPPORTED_SYNTAX', 'watch options are literal mode and optional after properties', options);
+	}
+	const mode = options.properties.find((p) => (p.key.name ?? p.key.value) === 'mode')?.value.value;
+	const after = options.properties.find((p) => (p.key.name ?? p.key.value) === 'after')?.value.value;
+	if (after !== undefined && !['resume', 'reconsider'].includes(after)) throw arenaError('UNSUPPORTED_SYNTAX', 'watch after must be resume or reconsider', options);
 	if (!['boundary', 'interrupt'].includes(mode)) {
 		throw arenaError('UNSUPPORTED_SYNTAX', 'watcher mode must be the boundary or interrupt literal', node.arguments[1]);
 	}
@@ -626,6 +659,7 @@ function validateWatcher(node, state, context) {
 	state.watchers.push(Object.freeze({
 		id: `watcher-${state.watcherCount - 1}`,
 		mode,
+		...(after === undefined ? {} : { after }),
 		factDependencyMask: watcherFactDependencyMask(node.arguments[0]),
 	}));
 }

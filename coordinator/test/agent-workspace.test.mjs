@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import { AgentWorkspaceManager } from '../src/agent-workspace.mjs';
 import { MinecraftAgentWorkspace } from '../src/minecraft-agent-workspace.mjs';
@@ -198,6 +199,26 @@ test('re-syncs Codex auth when isolated credentials are missing or source rotate
 		await readFile(path.join(prepared.codexHome, 'auth.json'), 'utf8'),
 		'{"tokens":"isolated-refresh"}\n',
 	);
+});
+
+test('bundled control references stay within the dedicated read-only skill root and outside base instructions', async (t) => {
+	const root = await mkdtemp(path.join(os.tmpdir(), 'minecraft-agent-references-'));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const workspace = new MinecraftAgentWorkspace({
+		root: path.join(root, 'runtime'),
+		templateRoot: fileURLToPath(new URL('../config/minecraft-agent', import.meta.url)),
+	}, { sourceCodexHome: path.join(root, 'missing-auth') });
+	const prepared = await workspace.prepare();
+	const reference = await readFile(new URL('../config/minecraft-agent/.codex/skills/minecraft-control/references/control-reference.md', import.meta.url), 'utf8');
+	const copied = await readFile(path.join(prepared.cwd, '.codex', 'skills', 'minecraft-control', 'references', 'control-reference.md'), 'utf8');
+	assert.equal(copied, reference);
+	assert.ok(!prepared.skillInstructions.includes('```json executor-bad-call'));
+	assert.match(prepared.skillInstructions, /capabilities\(\{section:"control"\}\)/);
+	assert.ok(prepared.selectedCapabilityRoots[0].location.path.startsWith(prepared.cwd));
+	const permissions = await readFile(path.join(prepared.codexHome, 'config.toml'), 'utf8');
+	assert.match(permissions, /":root" = "deny"/);
+	assert.match(permissions, /enabled = false/);
+	assert.match(permissions, /" = "read"/);
 });
 
 test('uses a newer refresh of the same Codex login without replacing newer or different-account auth', async (t) => {

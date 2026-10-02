@@ -35,6 +35,8 @@ export class NativeToolRuntime {
 	#notebook;
 	#executionSettings;
 	#memoryOperation;
+	#taskContext; #memoryObservation;
+	#taskPlan;
 	#programExecutor;
 	#programRuns = new Map();
 	#programResults = new Map();
@@ -59,6 +61,9 @@ export class NativeToolRuntime {
 		notebook = null,
 		executionSettings = null,
 		memoryOperation = null,
+		taskContext = null,
+		taskPlan = null,
+		memoryObservation = null,
 		programExecutor = null,
 		onProgramEvent = () => {},
 		planningLeadTime = () => null,
@@ -75,6 +80,8 @@ export class NativeToolRuntime {
 		if (notebook !== null && ['writeNote', 'query', 'recordReceipt'].some((method) => typeof notebook[method] !== 'function')) throw new TypeError('notebook must support writeNote, query, and recordReceipt');
 		if (executionSettings !== null && typeof executionSettings !== 'function') throw new TypeError('executionSettings must be a function');
 		if (memoryOperation !== null && typeof memoryOperation !== 'function') throw new TypeError('memoryOperation must be a function');
+		if (taskContext !== null && typeof taskContext !== 'function') throw new TypeError('taskContext must be a function');
+		if (memoryObservation !== null && typeof memoryObservation !== 'function') throw new TypeError('memoryObservation must be a function');
 		if (programExecutor !== null && ['run', 'onObservation', 'cancel'].some((method) => typeof programExecutor?.[method] !== 'function')) throw new TypeError('programExecutor must support run, onObservation, and cancel');
 		if (typeof sessionId !== 'string' || !/^[a-zA-Z0-9._-]{1,128}$/.test(sessionId)) throw new TypeError('sessionId must be 1..128 safe identifier characters');
 		if (['ingest', 'candidates', 'load', 'flush', 'clear'].some((method) => typeof occupancy?.[method] !== 'function')) throw new TypeError('occupancy must support observed-memory lifecycle and candidate queries');
@@ -93,6 +100,9 @@ export class NativeToolRuntime {
 		this.#notebook = notebook;
 		this.#executionSettings = executionSettings;
 		this.#memoryOperation = memoryOperation;
+		this.#taskContext = taskContext;
+		this.#taskPlan = taskPlan;
+		this.#memoryObservation = memoryObservation;
 		this.#programExecutor = programExecutor ?? new NativeProgramExecutor({ sessionId });
 		if (typeof onProgramEvent !== 'function') throw new TypeError('onProgramEvent must be a function');
 		this.#onProgramEvent = onProgramEvent;
@@ -162,6 +172,7 @@ export class NativeToolRuntime {
 		// methods still clone at their boundaries, so sharing here does not expose
 		// mutable coordinator state while avoiding a duplicate deep copy per update.
 		const storedObservation = structuredClone(raw);
+		this.#memoryObservation?.(record, storedObservation);
 		const program = this.#programRuns.get(record.agentId);
 		const successor = program?.pendingSuccessor ?? program?.handoff;
 		const queueWorld = successor?.world ?? program?.queueWorld;
@@ -268,9 +279,13 @@ export class NativeToolRuntime {
 		validateRequest(request, record);
 		if (lifecycleGeneration !== null && (!Number.isSafeInteger(lifecycleGeneration) || lifecycleGeneration < 0)) throw new TypeError('lifecycleGeneration must be a nonnegative safe integer or null');
 		if (request.tool.kind === 'observe') return this.#observe(record);
+		if (request.tool.kind === 'task_plan') {
+			if (this.#taskPlan === null) throw codedError('PLAN_UNAVAILABLE', 'Task planning view is unavailable');
+			return this.#taskPlan(record, request.tool);
+		}
 		if (request.tool.kind === 'inspect') return this.#inspect(request.tool, record);
 		if (request.tool.kind === 'capabilities') {
-			if (request.tool.section === 'program') return { ...minecraftCapabilities({ section: 'program' }), ...await this.#executionMetadata(record) };
+			if (request.tool.section === 'program' || request.tool.section === 'control') return { ...minecraftCapabilities(request.tool), ...await this.#executionMetadata(record) };
 			return { ...minecraftCapabilities(), ...await this.#executionMetadata(record), ...await this.#memorySummary(record), runtime: { freshObservations: this.#requestObservation !== null, focusedInspection: this.#inspectObservation !== null, notebook: this.#notebook !== null || this.#memoryOperation !== null, asynchronousActions: true, cancellation: true, reactivePrograms: { available: true, background: true, engine: 'ArenaScript', modelAuthored: true, plannerCalls: false } } };
 		}
 		if (request.tool.kind === 'action_status') return this.#actionStatus(record, request.tool.actionId);
@@ -287,7 +302,7 @@ export class NativeToolRuntime {
 			return this.#programStatus(record, request.tool.programId);
 		}
 		if (request.tool.kind === 'cancel_action') return this.#cancelAction(record, request.tool);
-		if (request.tool.kind === 'notebook' || request.tool.kind === 'query_memory') return this.#memory(request, record);
+		if (request.tool.kind === 'notebook' || request.tool.kind === 'query_memory' || request.tool.kind === 'task_memory') return this.#memory(request, record);
 		if (this.#sequenceFinishReservations.has(record.agentId)) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'A finishing native sequence owns the player until its fresh sample and goal verification settle');
 		if (this.#sweeps.has(record.agentId)) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'A camera sweep owns this player until sampling completes');
 		if (this.#programRuns.has(record.agentId)) throw codedError('NATIVE_PROGRAM_IN_PROGRESS', 'A model-authored program owns this player; use programStatus and cancelProgram before issuing another body operation');
@@ -381,11 +396,12 @@ export class NativeToolRuntime {
 	}
 
 	async #memorySummary(record) {
+		const taskMemory = await this.#taskContext?.(record);
 		const worldId = this.#worldId(record);
-		if (worldId === null || typeof this.#notebook?.listUnresolved !== 'function') return {};
+		if (worldId === null || typeof this.#notebook?.listUnresolved !== 'function') return taskMemory == null ? {} : { taskMemory };
 		const page = await this.#notebook.listUnresolved(record.agentId, { worldId, offset: 0, limit: 4 });
 		this.#assertCurrent(record);
-		return { unresolvedActions: { worldId, total: page.total, nextOffset: page.nextOffset, ...(page.evictedReceipts === undefined ? {} : { evictedReceipts: page.evictedReceipts }), entries: (page.entries ?? []).map(({ actionId, actionType, goalRevision, state, reasonCode }) => ({ actionId, actionType, goalRevision, state, reasonCode })), historical: true, query: { kind: 'unresolved', offset: 0, limit: 20 } } };
+		return { ...(taskMemory == null ? {} : { taskMemory }), unresolvedActions: { worldId, total: page.total, nextOffset: page.nextOffset, ...(page.evictedReceipts === undefined ? {} : { evictedReceipts: page.evictedReceipts }), entries: (page.entries ?? []).map(({ actionId, actionType, goalRevision, state, reasonCode }) => ({ actionId, actionType, goalRevision, state, reasonCode })), historical: true, query: { kind: 'unresolved', offset: 0, limit: 20 } } };
 	}
 
 	async #executionMetadata(record) {
@@ -749,6 +765,11 @@ export class NativeToolRuntime {
 	}
 
 	async #memory(request, record) {
+		if (request.tool.kind === 'task_memory') {
+			if (this.#memoryOperation === null) throw codedError('MEMORY_UNAVAILABLE', 'Task memory is unavailable');
+			const { kind, ...argumentsValue } = request.tool;
+			return this.#memoryOperation(record, { operation: 'task', arguments: argumentsValue });
+		}
 		const tool = request.tool;
 		if (this.#memoryOperation !== null) {
 			const operation = tool.kind === 'notebook' ? 'write' : 'query';

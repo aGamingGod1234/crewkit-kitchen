@@ -24,6 +24,9 @@ public final class CameraMixinVerification {
 		}
 		target.loadClass("net.minecraft.client.renderer.entity.player.AvatarRenderer");
 		target.loadClass("net.minecraft.client.gui.contextualbar.LocatorBarRenderer");
+		Class<?> gameRenderer = target.loadClass("net.minecraft.client.renderer.GameRenderer");
+		if (java.util.Arrays.stream(gameRenderer.getDeclaredMethods()).noneMatch(method -> method.getName().contains("arenaagents$planItemIcons")))
+			throw new AssertionError("Fabric did not apply the render-thread plan icon hook");
 		verifyProfileSkinLookup(target);
         Class<?> cartType = target.loadClass("net.minecraft.world.entity.vehicle.minecart.Minecart");
         for (String method : new String[]{"arenaagents$cameraDrop", "arenaagents$cameraPick"}) {
@@ -45,7 +48,7 @@ public final class CameraMixinVerification {
 		setOldHeight.invoke(camera, 0.0F);
 		assertHeight(cameraType, camera, "eyeHeight", 0.0F);
 		assertHeight(cameraType, camera, "eyeHeightOld", 0.0F);
-		System.out.println("Camera and agent presentation mixin verification passed (19 checks); Minecraft client main was not invoked.");
+		System.out.println("Camera, plan icon and agent presentation mixin verification passed (20 checks); Minecraft client main was not invoked.");
 	}
 
 	private static void verifyProfileSkinLookup(ClassLoader target) throws Exception {

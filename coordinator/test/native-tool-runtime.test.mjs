@@ -1040,6 +1040,22 @@ test('capabilities and observe disclose effective settings without rewriting the
 	}
 });
 
+test('control reference capabilities preserve topic pagination and perform no player dispatch', async () => {
+	const sent = [];
+	const settings = { requested: { reasoningEffort: 'medium' }, effective: { reasoningEffort: 'medium' } };
+	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) }, executionSettings: () => settings });
+	const first = await runtime.execute(nativeCall({ kind: 'capabilities', section: 'control', topic: 'all', offset: 0 }), record());
+	assert.equal(first.section, 'control');
+	assert.equal(first.topic, 'all');
+	assert.ok(first.nextOffset > 0);
+	assert.deepEqual(first.executionSettings, settings);
+	assert.equal(JSON.parse(toolResultContent(first).contentItems[0].text).reference, first.reference);
+	const second = await runtime.execute(nativeCall({ kind: 'capabilities', section: 'control', topic: 'all', offset: first.nextOffset }), record());
+	assert.equal(second.offset, first.nextOffset);
+	assert.notEqual(second.reference, first.reference);
+	assert.deepEqual(sent, []);
+});
+
 test('native memory operations share the program helper contract and model provenance', async () => {
 	const calls = [];
 	const runtime = new NativeToolRuntime({ bridge: { send: async () => {} }, memoryOperation: async (current, operation) => { calls.push({ current, operation }); return { state: 'SUCCEEDED', reasonCode: 'MEMORY_QUERIED' }; } });

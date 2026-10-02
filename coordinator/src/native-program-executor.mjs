@@ -243,6 +243,10 @@ export class NativeProgramExecutor {
 		let value;
 		try {
 			if (operation === 'inspect') value = await run.context.inspect?.(query) ?? { state: 'FAILED', reasonCode: 'INSPECTION_UNAVAILABLE' };
+			else if (operation === 'taskMemory') {
+				const { kind, ...args } = normalizeMinecraftToolCall('taskMemory', query);
+				value = await run.context.memoryOperation?.({ operation: 'task', arguments: args, provenance: authorship }) ?? { state: 'FAILED', reasonCode: 'MEMORY_UNAVAILABLE' };
+			}
 			else {
 				const normalized = normalizeMinecraftToolCall(operation === 'remember' ? 'notebook' : 'queryMemory', query);
 				const args = operation === 'remember' ? { key: normalized.key, text: normalized.text }

@@ -1,0 +1,405 @@
+{
+  "benchmark": "native-input-lossless-fact-encoding",
+  "generatedAt": "2026-10-02T13:10:40.036Z",
+  "node": "v24.14.0",
+  "providerUsed": false,
+  "paidModelCalls": 0,
+  "minecraftServerUsed": false,
+  "installedClientVerified": false,
+  "scope": "offline replay of captured dynamic-tool responses plus adversarial JSON fact fixtures",
+  "inputSha256": "cfe54b4d10efe34da783c653afdb7851660236752443db508cee47e2adc7ce98",
+  "manifest": {
+    "benchmarkSha256": "ffc8fce37201dab0637b5bfe5334dcd0cdc6ef72f7a9b43e1390d55a47bfda99",
+    "encoderSha256": "f8b05799c365982044684c5650e7ec111c9d58a93de9369ea41adee3b2a3cda3",
+    "nativeEventBuilderSourceSha256": "3a534eefc55f88d448fd3af35d78a44d5e600cb177236103a03bb3a812dfe250"
+  },
+  "tokenizer": {
+    "encoding": "o200k_base",
+    "kind": "offline proxy",
+    "verifiedModelTokenizer": false,
+    "includesMessageEnvelope": false
+  },
+  "replay": {
+    "total": {
+      "replies": 148,
+      "changedReplies": 43,
+      "exactReconstructions": 148,
+      "beforeBytes": 588237,
+      "afterBytes": 512146,
+      "beforeProxyTokens": 193694,
+      "afterProxyTokens": 174084,
+      "proxyTokenRegressionReplies": 0,
+      "proxyTokenRegressionTokens": 0,
+      "byteReductionPercent": 12.935,
+      "proxyTokenReductionPercent": 10.124
+    },
+    "byTool": {
+      "action_receipt": {
+        "replies": 21,
+        "changedReplies": 5,
+        "exactReconstructions": 21,
+        "beforeBytes": 80369,
+        "afterBytes": 69196,
+        "beforeProxyTokens": 25568,
+        "afterProxyTokens": 22702,
+        "proxyTokenRegressionReplies": 0,
+        "proxyTokenRegressionTokens": 0,
+        "byteReductionPercent": 13.902,
+        "proxyTokenReductionPercent": 11.209
+      },
+      "capabilities": {
+        "replies": 1,
+        "changedReplies": 0,
+        "exactReconstructions": 1,
+        "beforeBytes": 13653,
+        "afterBytes": 13653,
+        "beforeProxyTokens": 3138,
+        "afterProxyTokens": 3138,
+        "proxyTokenRegressionReplies": 0,
+        "proxyTokenRegressionTokens": 0,
+        "byteReductionPercent": 0,
+        "proxyTokenReductionPercent": 0
+      },
+      "inspection:blocks": {
+        "replies": 11,
+        "changedReplies": 11,
+        "exactReconstructions": 11,
+        "beforeBytes": 32115,
+        "afterBytes": 23012,
+        "beforeProxyTokens": 12273,
+        "afterProxyTokens": 9294,
+        "proxyTokenRegressionReplies": 0,
+        "proxyTokenRegressionTokens": 0,
+        "byteReductionPercent": 28.345,
+        "proxyTokenReductionPercent": 24.273
+      },
+      "inspection:entities": {
+        "replies": 1,
+        "changedReplies": 0,
+        "exactReconstructions": 1,
+        "beforeBytes": 386,
+        "afterBytes": 386,
+        "beforeProxyTokens": 122,
+        "afterProxyTokens": 122,
+        "proxyTokenRegressionReplies": 0,
+        "proxyTokenRegressionTokens": 0,
+        "byteReductionPercent": 0,
+        "proxyTokenReductionPercent": 0
+      },
+      "inspection:inventory": {
+        "replies": 5,
+        "changedReplies": 0,
+        "exactReconstructions": 5,
+        "beforeBytes": 18480,
+        "afterBytes": 18480,
+        "beforeProxyTokens": 6267,
+        "afterProxyTokens": 6267,
+        "proxyTokenRegressionReplies": 0,
+        "proxyTokenRegressionTokens": 0,
+        "byteReductionPercent": 0,
+        "proxyTokenReductionPercent": 0
+      },
+      "inspection:item": {
+        "replies": 2,
+        "changedReplies": 0,
+        "exactReconstructions": 2,
+        "beforeBytes": 1519,
+        "afterBytes": 1519,
+        "beforeProxyTokens": 494,
+        "afterProxyTokens": 494,
+        "proxyTokenRegressionReplies": 0,
+        "proxyTokenRegressionTokens": 0,
+        "byteReductionPercent": 0,
+        "proxyTokenReductionPercent": 0
+      },
+      "inspection:menu": {
+        "replies": 8,
+        "changedReplies": 1,
+        "exactReconstructions": 8,
+        "beforeBytes": 10889,
+        "afterBytes": 10599,
+        "beforeProxyTokens": 3600,
+        "afterProxyTokens": 3529,
+        "proxyTokenRegressionReplies": 0,
+        "proxyTokenRegressionTokens": 0,
+        "byteReductionPercent": 2.663,
+        "proxyTokenReductionPercent": 1.972
+      },
+      "inspection:recipes": {
+        "replies": 1,
+        "changedReplies": 0,
+        "exactReconstructions": 1,
+        "beforeBytes": 966,
+        "afterBytes": 966,
+        "beforeProxyTokens": 256,
+        "afterProxyTokens": 256,
+        "proxyTokenRegressionReplies": 0,
+        "proxyTokenRegressionTokens": 0,
+        "byteReductionPercent": 0,
+        "proxyTokenReductionPercent": 0
+      },
+      "memory_or_inspection": {
+        "replies": 16,
+        "changedReplies": 0,
+        "exactReconstructions": 16,
+        "beforeBytes": 8689,
+        "afterBytes": 8689,
+        "beforeProxyTokens": 2885,
+        "afterProxyTokens": 2885,
+        "proxyTokenRegressionReplies": 0,
+        "proxyTokenRegressionTokens": 0,
+        "byteReductionPercent": 0,
+        "proxyTokenReductionPercent": 0
+      },
+      "observation": {
+        "replies": 5,
+        "changedReplies": 5,
+        "exactReconstructions": 5,
+        "beforeBytes": 71214,
+        "afterBytes": 61536,
+        "beforeProxyTokens": 22662,
+        "afterProxyTokens": 20278,
+        "proxyTokenRegressionReplies": 0,
+        "proxyTokenRegressionTokens": 0,
+        "byteReductionPercent": 13.59,
+        "proxyTokenReductionPercent": 10.52
+      },
+      "other": {
+        "replies": 22,
+        "changedReplies": 0,
+        "exactReconstructions": 22,
+        "beforeBytes": 19317,
+        "afterBytes": 19317,
+        "beforeProxyTokens": 5934,
+        "afterProxyTokens": 5934,
+        "proxyTokenRegressionReplies": 0,
+        "proxyTokenRegressionTokens": 0,
+        "byteReductionPercent": 0,
+        "proxyTokenReductionPercent": 0
+      },
+      "plan": {
+        "replies": 3,
+        "changedReplies": 0,
+        "exactReconstructions": 3,
+        "beforeBytes": 3891,
+        "afterBytes": 3891,
+        "beforeProxyTokens": 1008,
+        "afterProxyTokens": 1008,
+        "proxyTokenRegressionReplies": 0,
+        "proxyTokenRegressionTokens": 0,
+        "byteReductionPercent": 0,
+        "proxyTokenReductionPercent": 0
+      },
+      "program": {
+        "replies": 37,
+        "changedReplies": 14,
+        "exactReconstructions": 37,
+        "beforeBytes": 226781,
+        "afterBytes": 193895,
+        "beforeProxyTokens": 78131,
+        "afterProxyTokens": 69958,
+        "proxyTokenRegressionReplies": 0,
+        "proxyTokenRegressionTokens": 0,
+        "byteReductionPercent": 14.501,
+        "proxyTokenReductionPercent": 10.461
+      },
+      "sequence": {
+        "replies": 15,
+        "changedReplies": 7,
+        "exactReconstructions": 15,
+        "beforeBytes": 99968,
+        "afterBytes": 87007,
+        "beforeProxyTokens": 31356,
+        "afterProxyTokens": 28219,
+        "proxyTokenRegressionReplies": 0,
+        "proxyTokenRegressionTokens": 0,
+        "byteReductionPercent": 12.965,
+        "proxyTokenReductionPercent": 10.004
+      }
+    }
+  },
+  "rowShapeChecks": {
+    "replies": 80,
+    "changedReplies": 51,
+    "exactReconstructions": 80,
+    "beforeBytes": 440158,
+    "afterBytes": 251328,
+    "beforeProxyTokens": 134324,
+    "afterProxyTokens": 76383,
+    "proxyTokenRegressionReplies": 0,
+    "proxyTokenRegressionTokens": 0,
+    "byteReductionPercent": 42.901,
+    "proxyTokenReductionPercent": 43.135
+  },
+  "nativeEventInputs": {
+    "scope": "production-builder replay with captured observation facts and a neutral task; not captured actual event texts",
+    "originalProducer": "buildNativeEventInput",
+    "presentation": "encodeNativeEventInput",
+    "headingAndRetryTextUnchanged": true,
+    "total": {
+      "replies": 30,
+      "changedReplies": 30,
+      "exactReconstructions": 30,
+      "beforeBytes": 387130,
+      "afterBytes": 338281,
+      "beforeProxyTokens": 126623,
+      "afterProxyTokens": 114228,
+      "proxyTokenRegressionReplies": 0,
+      "proxyTokenRegressionTokens": 0,
+      "byteReductionPercent": 12.618,
+      "proxyTokenReductionPercent": 9.789
+    },
+    "byTool": {
+      "observation": {
+        "replies": 19,
+        "changedReplies": 19,
+        "exactReconstructions": 19,
+        "beforeBytes": 239443,
+        "afterBytes": 208481,
+        "beforeProxyTokens": 78554,
+        "afterProxyTokens": 70685,
+        "proxyTokenRegressionReplies": 0,
+        "proxyTokenRegressionTokens": 0,
+        "byteReductionPercent": 12.931,
+        "proxyTokenReductionPercent": 10.017
+      },
+      "postAction.observation": {
+        "replies": 11,
+        "changedReplies": 11,
+        "exactReconstructions": 11,
+        "beforeBytes": 147687,
+        "afterBytes": 129800,
+        "beforeProxyTokens": 48069,
+        "afterProxyTokens": 43543,
+        "proxyTokenRegressionReplies": 0,
+        "proxyTokenRegressionTokens": 0,
+        "byteReductionPercent": 12.111,
+        "proxyTokenReductionPercent": 9.416
+      }
+    }
+  },
+  "optionalObservationChanges": {
+    "scope": "observe only; explicitly requested exact-baseline changes, measured separately",
+    "fullReplies": 1,
+    "changeReplies": 4,
+    "rawBeforeVsRawChanges": {
+      "replies": 5,
+      "changedReplies": 5,
+      "exactReconstructions": 5,
+      "beforeBytes": 71214,
+      "afterBytes": 59318,
+      "beforeProxyTokens": 22662,
+      "afterProxyTokens": 18824,
+      "proxyTokenRegressionReplies": 1,
+      "proxyTokenRegressionTokens": 15,
+      "byteReductionPercent": 16.705,
+      "proxyTokenReductionPercent": 16.936
+    },
+    "defaultCompactBeforeVsCompactChanges": {
+      "replies": 5,
+      "changedReplies": 5,
+      "exactReconstructions": 5,
+      "beforeBytes": 61536,
+      "afterBytes": 52074,
+      "beforeProxyTokens": 20278,
+      "afterProxyTokens": 17030,
+      "proxyTokenRegressionReplies": 1,
+      "proxyTokenRegressionTokens": 16,
+      "byteReductionPercent": 15.376,
+      "proxyTokenReductionPercent": 16.017
+    }
+  },
+  "semanticChecks": [
+    {
+      "name": "movement_coordinates_and_collision",
+      "result": "PASSED",
+      "beforeBytes": 7488,
+      "afterBytes": 5803
+    },
+    {
+      "name": "urgent_damage_and_hostile_identity",
+      "result": "PASSED",
+      "beforeBytes": 2048,
+      "afterBytes": 1525
+    },
+    {
+      "name": "death_recovery_and_retained_route",
+      "result": "PASSED",
+      "beforeBytes": 1093,
+      "afterBytes": 899
+    },
+    {
+      "name": "dimension_identity_is_not_coordinates",
+      "result": "PASSED",
+      "beforeBytes": 7540,
+      "afterBytes": 5855
+    },
+    {
+      "name": "unknown_stale_null_and_false_are_distinct",
+      "result": "PASSED",
+      "beforeBytes": 312,
+      "afterBytes": 312
+    },
+    {
+      "name": "action_receipt_and_nested_observation",
+      "result": "PASSED",
+      "beforeBytes": 7611,
+      "afterBytes": 5926
+    },
+    {
+      "name": "mixed_records_and_reserved_looking_keys",
+      "result": "PASSED",
+      "beforeBytes": 347,
+      "afterBytes": 347
+    }
+  ],
+  "staticContext": [
+    {
+      "name": "baseInstructions",
+      "beforeBytes": 49647,
+      "afterBytes": 18278,
+      "byteReductionPercent": 63.184,
+      "beforeSha256": "c19ec1846af95d0e3fdb12e60d900dee62123bcf258dfa1ec39e02cf4f7ffe52",
+      "afterSha256": "746823821812263e0d27e0d64258c4a9ad2decc4638b77365f24256bc4f98677",
+      "beforeProxyTokens": 10803,
+      "afterProxyTokens": 3252,
+      "proxyTokenReductionPercent": 69.897
+    },
+    {
+      "name": "dynamicTools",
+      "beforeBytes": 22894,
+      "afterBytes": 24083,
+      "byteReductionPercent": -5.194,
+      "beforeSha256": "4aa6ccf30bd792699083a7cb6bad4498c109155ebe9cdce811dfa73b7c947e35",
+      "afterSha256": "c99dbd4381544da1a657732b3901a0a71a059477007803a9f926f17aa240d54f",
+      "beforeProxyTokens": 5264,
+      "afterProxyTokens": 5515,
+      "proxyTokenReductionPercent": -4.768
+    }
+  ],
+  "staticContextTotal": {
+    "scope": "sum of measured static components; hidden provider instructions and message envelopes excluded",
+    "beforeBytes": 72541,
+    "afterBytes": 42361,
+    "byteReductionPercent": 41.604,
+    "beforeProxyTokens": 16067,
+    "afterProxyTokens": 8767,
+    "proxyTokenReductionPercent": 45.435
+  },
+  "encoderCpu": {
+    "scope": "in-process encoder and decoder only; no model, server, network, or rendering",
+    "iterations": 20,
+    "repliesPerIteration": 148,
+    "encodeMedianBatchMs": 37.601,
+    "decodeMedianBatchMs": 3.161,
+    "encodeMedianPerReplyMs": 0.254
+  },
+  "limitations": [
+    "Exact JSON reconstruction proves retained facts; it does not prove model comprehension or unchanged gameplay decisions.",
+    "Token counts use o200k_base as a proxy; actual Codex tokenizer, cached usage, subscription cost and latency were not measured.",
+    "Static context and per-tool payload savings are separate; their percentages must not be added.",
+    "Replay categories without recorded tool names are inferred from response shape, not a tool-call execution trace.",
+    "Native event inputs are generated by the current production builder from reused captured facts; they are not captured actual provider event strings. Existing producer bounds are unchanged.",
+    "No raw tool payloads, private reasoning, credentials or device paths are included in this report."
+  ]
+}

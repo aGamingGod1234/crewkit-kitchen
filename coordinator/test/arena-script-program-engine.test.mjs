@@ -30,6 +30,141 @@ function engineFor(source, callbacks = {}) {
 	return { engine, dispatched, cancelled, modelRequests };
 }
 
+test('an already true reconsider interrupt guard runs its authored defense before ordinary work is dispatched', () => {
+	const run = engineFor(`program.onUnhandledAttention("continue_and_notify");
+	program.watch(() => player.state().health < 19, {mode:"interrupt", after:"reconsider"}, async () => {
+		await player.navigateTo({x:-3,y:64,z:0,tolerance:1,sprint:true,timeoutMs:3000});
+	}); await player.wait(1000);`, { initialObservation: observation({ player: { x: 0, y: 64, z: 0, health: 17 } }) });
+	assert.equal(run.dispatched.length, 1); assert.equal(run.dispatched[0].action.type, 'navigate_to');
+	assert.equal(run.dispatched[0].provenance.source, 'watcher:watcher-0'); assert.deepEqual(run.cancelled, []);
+});
+
+test('ordinary conversations preserve work; an explicit survival continue policy remains the agents choice', () => {
+	const run = engineFor('program.onUnhandledAttention("continue_and_notify", {survival:"continue_and_notify"}); await player.wait(1000);');
+	run.engine.ingestObservation({ observation: observation(), eventSequence: 2, attention: true, trigger: 'conversation' });
+	run.engine.ingestObservation({ observation: observation( { player: { health: 18 } }), eventSequence: 3, attention: true, priority: 'urgent', trigger: 'damage' });
+	assert.deepEqual(run.cancelled, []); assert.equal(run.dispatched.length, 1);
+});
+
+test('authored reassessment skips known route progress and stops for changed geometry, unknown coverage, discoveries or threats', () => {
+	const source = `program.onUnhandledAttention("pause_and_notify", {reassessWhen: () =>
+		world.state().coverage.complete !== true || world.blocks({stableId:"support", blockId:"minecraft:stone"}).length !== 1 ||
+		world.blocks({blockId:"minecraft:iron_ore"}).length > 0 || world.entities().length > 0});
+		await player.navigateTo({x:8,y:64,z:3,tolerance:0.4,sprint:false,timeoutMs:5000}); await player.wait(1);`;
+	const known = observation({ coverage: { complete: true }, blocks: [{stableId:'support',blockId:'minecraft:stone',x:8,y:63,z:3}] });
+	for (const change of [
+		{ blocks: [{stableId:'support',blockId:'minecraft:lava',x:8,y:63,z:3}] },
+		{ coverage: { complete: false } },
+		{ blocks: [...known.blocks, {stableId:'ore',blockId:'minecraft:iron_ore',x:7,y:64,z:3}] },
+		{ entities: [{stableId:'hostile',type:'minecraft:zombie',x:7,y:64,z:3}] },
+	]) {
+		const run = engineFor(source, {initialObservation:known});
+		run.engine.ingestObservation({observation:{...known,player:{x:2,y:64,z:0,health:20}},eventSequence:2,attention:true,trigger:'attention'});
+		assert.equal(run.modelRequests.length, 0); assert.deepEqual(run.cancelled, []);
+		run.engine.ingestObservation({observation:{...known,...change},eventSequence:3,attention:true,trigger:'attention'});
+		assert.equal(run.modelRequests.length, 1); assert.equal(run.modelRequests[0].factsSequence, 3);
+		assert.deepEqual(run.cancelled, [run.dispatched[0].actionId]);
+		run.engine.ingestActionResult({actionId:run.dispatched[0].actionId,state:'CANCELLED',reasonCode:'INPUT_RELEASED',eventSequence:3});
+		assert.equal(run.dispatched.length, 1, 'unknown or changed terrain cannot start the next chosen leg');
+	}
+});
+
+test('ordinary reassessment requires exact false and predicate errors preserve the body continuation', () => {
+	for (const condition of ['undefined', 'null', '0', 'player.state().missing.health']) {
+		const run = engineFor(`program.onUnhandledAttention("continue_and_notify", {reassessWhen:() => ${condition}}); await player.wait(1); await player.wait(2);`);
+		run.engine.ingestObservation({observation:observation(),eventSequence:2,attention:true});
+		assert.equal(run.modelRequests.length, 1, condition);
+		run.engine.applyDirective({...run.engine.refreshDirectiveRequest(),directive:'continue'});
+		acknowledge(run.engine,run.dispatched,observation(),3);
+		assert.equal(run.dispatched[1].action.arguments, 2, 'a failed condition cannot corrupt the waiting program');
+	}
+});
+
+test('urgent events, authored watcher reactions, failed actions and natural exhaustion bypass reassessment filtering', () => {
+	const prefix = 'program.onUnhandledAttention("continue_and_notify", {reassessWhen:() => false});';
+	const urgent = engineFor(`${prefix} await player.wait(100);`);
+	urgent.engine.ingestObservation({observation:observation({player:{health:17}}),eventSequence:2,attention:true,priority:'urgent',trigger:'damage'});
+	assert.equal(urgent.modelRequests.length, 1); assert.deepEqual(urgent.cancelled, [urgent.dispatched[0].actionId]);
+	const watched = engineFor(`${prefix} program.watch(() => player.state().health < 20, {mode:"interrupt",after:"reconsider"}, async () => {await player.wait(9);}); await player.wait(100);`);
+	watched.engine.ingestObservation({observation:observation({player:{health:17}}),eventSequence:2,attention:true});
+	watched.engine.ingestActionResult({actionId:watched.dispatched[0].actionId,state:'CANCELLED',reasonCode:'INPUT_RELEASED',eventSequence:2});
+	assert.equal(watched.dispatched[1].action.arguments, 9);
+	watched.engine.ingestActionResult({actionId:watched.dispatched[1].actionId,state:'SUCCEEDED',reasonCode:'DONE',eventSequence:2});
+	assert.equal(watched.modelRequests.length, 1); assert.equal(watched.engine.snapshot().status, 'SUSPENDED');
+	const exhausted = engineFor(`${prefix} await player.wait(1);`);
+	acknowledge(exhausted.engine,exhausted.dispatched,observation(),2);
+	assert.equal(exhausted.modelRequests[0].trigger, 'program_exhausted');
+	const failed = engineFor(`${prefix} for (let i=0;i<3;i++) await tryResult(player.navigateTo({x:8,y:64,z:3,tolerance:0.4,sprint:false,timeoutMs:5000}));`);
+	for (const eventSequence of [2,3]) {
+		failed.engine.ingestObservation({observation:observation(),eventSequence});
+		failed.engine.ingestActionResult({actionId:failed.dispatched.at(-1).actionId,state:'FAILED',reasonCode:'NO_STANDABLE_PATH',eventSequence});
+	}
+	assert.equal(failed.modelRequests.length, 1); assert.equal(failed.modelRequests[0].trigger, 'action_failure');
+	assert.equal(failed.dispatched.length, 2, 'the filter cannot invent a retry after failure');
+});
+
+test('healing followed by another hit does not make a defensive watcher cancel its own ongoing retreat', () => {
+	const run = engineFor(`program.onUnhandledAttention("continue_and_notify");
+	program.watch(() => player.state().health < 20, {mode:"interrupt", after:"reconsider"}, async () => { await player.navigateTo({x:-3,y:64,z:0,tolerance:1,sprint:true,timeoutMs:3000}); }); await player.wait(1000);`);
+	const update = (health, eventSequence, attention = true) => run.engine.ingestObservation({ observation: observation({ player: { health } }), eventSequence, attention, priority: 'urgent', trigger: 'damage' });
+	update(17, 2);
+	run.engine.ingestActionResult({ actionId: run.dispatched[0].actionId, state: 'CANCELLED', reasonCode: 'INPUT_RELEASED', eventSequence: 2 });
+	update(20, 3, false); update(18, 4);
+	assert.deepEqual(run.cancelled, [run.dispatched[0].actionId]);
+	assert.equal(run.dispatched.length, 2); assert.equal(run.dispatched[1].action.type, 'navigate_to');
+});
+
+test('a boundary defensive handler holds its old continuation until the agent explicitly continues', () => {
+	const run = engineFor(`program.onUnhandledAttention("continue_and_notify");
+	program.watch(() => player.state().health < 20, {mode:"boundary", after:"reconsider"}, async () => { await player.wait(1); });
+	await player.wait(100); await player.wait(200);`);
+	run.engine.ingestObservation({ observation: observation({ player: { health: 18 } }), eventSequence: 2 });
+	run.engine.ingestActionResult({ actionId: run.dispatched[0].actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 2 });
+	run.engine.ingestActionResult({ actionId: run.dispatched[1].actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 2 });
+	assert.equal(run.dispatched.length, 2); assert.equal(run.engine.snapshot().status, 'SUSPENDED');
+	run.engine.applyDirective({ ...run.engine.refreshDirectiveRequest(), directive: 'continue' });
+	assert.equal(run.dispatched[2].action.arguments, 200);
+});
+
+test('defensive watcher and survival options reject unknown values and extra properties', () => {
+	for (const options of ['{mode:"interrupt", after:"auto"}', '{mode:"interrupt", after:"reconsider", selectTarget:true}']) assert.throws(() => parseArenaScript(`program.onUnhandledAttention("continue_and_notify"); program.watch(() => true, ${options}, async () => {});`));
+	assert.throws(() => parseArenaScript('program.onUnhandledAttention("continue_and_notify", {survival:"fight"});'));
+});
+
+test('unhandled survival attention releases unrelated work even behind a pending ordinary decision', () => {
+	const run = engineFor('program.onUnhandledAttention("continue_and_notify"); await player.wait(1000); await player.wait(2);');
+	run.engine.ingestObservation({ observation: observation(), eventSequence: 2, attention: true, trigger: 'sound' });
+	run.engine.ingestObservation({ observation: observation({ player: { x: 0, y: 64, z: 0, health: 17 } }), eventSequence: 3, attention: true, priority: 'urgent', trigger: 'damage' });
+	assert.deepEqual(run.cancelled, [run.dispatched[0].actionId]);
+	assert.equal(run.engine.snapshot().status, 'SUSPENDING');
+	run.engine.ingestActionResult({ actionId: run.dispatched[0].actionId, state: 'CANCELLED', reasonCode: 'INTERRUPTED', eventSequence: 3 });
+	assert.equal(run.dispatched.length, 1);
+	assert.equal(run.engine.snapshot().status, 'SUSPENDED');
+});
+
+test('authored defensive handler completes before asking the brain to resume or replace work', () => {
+	const run = engineFor(`program.onUnhandledAttention("continue_and_notify");
+		program.watch(() => player.state().health < 20, { mode: "interrupt", after: "reconsider" }, async () => {
+			await player.navigateTo({ x: -3, y: 64, z: 0, tolerance: 0.4, sprint: true, timeoutMs: 3000 });
+		});
+		await player.wait(1000); await player.wait(2);`);
+	run.engine.ingestObservation({ observation: observation({ player: { x: 0, y: 64, z: 0, health: 17 } }), eventSequence: 2, attention: true, priority: 'urgent', trigger: 'damage' });
+	run.engine.ingestActionResult({ actionId: run.dispatched[0].actionId, state: 'CANCELLED', reasonCode: 'INTERRUPTED', eventSequence: 2 });
+	assert.equal(run.dispatched[1].action.type, 'navigate_to');
+	assert.equal(run.dispatched[1].action.arguments.x, -3);
+	assert.equal(run.dispatched[1].provenance.watcherId, 'watcher-0');
+	run.engine.ingestObservation({ observation: observation({ player: { x: -3, y: 64, z: 0, health: 15 } }), eventSequence: 3, attention: true, priority: 'urgent', trigger: 'damage' });
+	assert.equal(run.cancelled.length, 1, 'repeat damage does not cancel the authored retreat');
+	run.engine.ingestActionResult({ actionId: run.dispatched[1].actionId, state: 'SUCCEEDED', reasonCode: 'ARRIVED', eventSequence: 3 });
+	assert.equal(run.dispatched.length, 2);
+	assert.equal(run.engine.snapshot().status, 'SUSPENDED');
+	assert.ok(run.modelRequests.length > 0);
+	const decision = run.engine.refreshDirectiveRequest();
+	run.engine.applyDirective({ ...decision, directive: 'replace', install: {
+		programId: 'defense-next', version: 2, compiled: parseArenaScript('program.onUnhandledAttention("continue_and_notify"); await player.wait(4);') } });
+	assert.equal(run.dispatched[2].action.arguments, 4, 'only the selected brain authors the next action');
+});
+
 function acknowledge(engine, dispatched, observationValue, eventSequence) {
 	const command = dispatched.at(-1);
 	engine.ingestActionResult({ actionId: command.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence });

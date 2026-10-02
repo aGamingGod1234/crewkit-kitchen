@@ -1892,8 +1892,15 @@ public final class CodexAgentManager {
 	private void persistLiveAgentLocations() {
 		long now = System.currentTimeMillis();
 		for (AgentRecord record : records()) {
-			findAgentPlayer(record.agentId()).ifPresent(player ->
-					persistEntityLocation(record.agentId(), player, now, true));
+			// Carpet may retain a dead body or finish a recovery spawn before its registry commit.
+			// Shutdown only flushes the committed living body; it cannot attach or respawn one.
+			if (record.state() == dev.agaminggod.arenaagents.agent.AgentLifecycleState.DEAD
+					|| record.entityUuid().isEmpty()) continue;
+			findAgentPlayer(record.agentId())
+					.filter(ServerPlayer::isAlive)
+					.filter(player -> record.entityUuid().orElseThrow().equals(player.getUUID()))
+					.ifPresent(player ->
+							persistEntityLocation(record.agentId(), player, now, true));
 		}
 	}
 

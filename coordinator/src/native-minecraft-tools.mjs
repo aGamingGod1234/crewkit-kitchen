@@ -10,8 +10,12 @@ import {
 import { MAX_ACTION_ARGUMENT_BYTES, validateAction } from './schema.mjs';
 import { ARENA_SCRIPT_API_REFERENCE } from './prompts.mjs';
 import { validateProgramParameters, MAX_PROGRAM_PARAMETER_BYTES } from './program-parameters.mjs';
+import { validateTaskEntry } from './task-memory-store.mjs';
+import { TASK_PLAN_SCHEMA, validateTaskPlan } from './live-task-view.mjs';
+import { MODEL_FACT_INSTRUCTIONS } from './model-fact-encoding.mjs';
+import { CONTROL_REFERENCE_TOPICS, minecraftControlReference } from './minecraft-control-reference.mjs';
 
-const MAX_TOOL_RESULT_BYTES = 16_384;
+export const MAX_TOOL_RESULT_BYTES = 16_384;
 const COORDINATE_LIMIT = 30_000_000;
 const MAX_SEQUENCE_ACTIONS = 8;
 const MAX_LOOK_AROUND_STEPS = 8;
@@ -22,27 +26,42 @@ const MAX_SEQUENCE_FINISH_BYTES = 4_096;
 const NATIVE_ACTION_TYPES = Object.freeze(Object.keys(ACTION_FIELDS));
 export const INSPECTION_SECTIONS = Object.freeze(['observation', 'inventory', 'menu', 'entities', 'blocks', 'landmarks', 'nearby_containers', 'item', 'block', 'events', 'recipes', 'mechanics']);
 
-export function minecraftCapabilities({ section = 'all' } = {}) {
+export function minecraftCapabilities({ section = 'all', topic, offset } = {}) {
 	if (section === 'program') return { version: 1, section: 'program', engine: 'ArenaScript', reference: ARENA_SCRIPT_API_REFERENCE };
+	if (section === 'control') return minecraftControlReference({ topic, offset });
 	return {
 		version: 1,
 		actions: Object.entries(ACTION_FIELDS).map(([actionType, fields]) => ({ actionType, fields: [...fields], requiredFields: fields.filter((field) => !(OPTIONAL_ACTION_FIELDS[actionType] ?? []).includes(field)), optionalFields: [...(OPTIONAL_ACTION_FIELDS[actionType] ?? [])] })),
 		controlConditions: { ...CONTROL_BRANCH_CONDITIONS },
 		inspectionSections: [...INSPECTION_SECTIONS],
 		programReference: { tool: 'capabilities', arguments: { section: 'program' } },
+		controlReference: { tool: 'capabilities', arguments: { section: 'control' } },
 		limits: { sequenceActions: MAX_SEQUENCE_ACTIONS, inspectionPage: 32, resultBytes: MAX_TOOL_RESULT_BYTES, actionArgumentBytes: MAX_ACTION_ARGUMENT_BYTES, programSourceBytes: MAX_PROGRAM_SOURCE_BYTES, programParameterBytes: MAX_PROGRAM_PARAMETER_BYTES, programPreconditionBytes: MAX_PROGRAM_PRECONDITION_BYTES, pendingProgramSuccessors: 1, programActions: 256, programTimeoutMs: 120_000 },
 	};
 }
 
 export const NATIVE_AGENT_INSTRUCTIONS = `You control one live Minecraft player and choose every action.
 
-Keep provider/model/effort/tier; death does not change the active goal. Batch known independent reads and reuse fresh result facts. Use sequence for safe linear chains; optional finish:{summary} verifies success. Use ArenaScript for conditional/repeated work with bounded background:true. Supply expectedDurationMs for preparation timing; it never extends timeout. Use queueProgram to author one successor while current work runs, with a fresh-fact precondition. Only natural exhaustion can start it; inspect/cancel its exact queue. Use startAction to reason while one chosen action runs; settle its exact handle and answer exact program attention.
+Read taskPlan at task start; replace it at meaningful revisions. Stable IDs retain history. You own the plan.
 
-Use capabilities and focused inspections; omitted or unobserved facts are unknown. Query notes/receipts with queryMemory (paginate nextOffset); reuse exact noteKey when fresh prerequisites/current targets match, with parameters via program.parameters(). Notes are hypotheses; receipts historical. Metadata belongs in comments/separate notes; noteKey executes the entire note as source. exploreFrontier returns candidates; choose a moveTo target. Use control/control_sequence for bounded inputs. Mine observed blocks with exact blockId. goalSpec is immutable; finish verifies it. Claim effects from evidence. conversation_only uses say; plain text is invisible; speech playback is asynchronous.`;
+Keep provider/model/effort/tier; death does not change the active goal. Batch known independent reads and reuse fresh result facts. Use sequence for safe linear chains; use ArenaScript for conditional/repeated work with bounded background:true. finish verifies goalSpec. queueProgram requires a fresh precondition; only natural exhaustion starts it. expectedDurationMs never extends timeout. Use startAction to reason while one chosen action runs; settle exact handles and program decisions.
+
+Survival is part of the goal. Author real defensive interrupts with after:"reconsider"; reassess before resuming. Unhandled danger pauses unrelated work. taskMemory retains earlier deaths, routes, assets, progress and lessons. Reobserve; shared:true shares selected notes. You choose defense and recovery.
+
+Use capabilities/focused inspections; omitted or unobserved facts are unknown. queryMemory paginates nextOffset; reuse exact noteKey with fresh prerequisites/current targets and program.parameters(). Notes are hypotheses; receipts historical. Keep metadata separate; noteKey executes the entire note as source. exploreFrontier returns candidates; choose moveTo. Mine exact observed blockId. Claim effects from evidence. conversation_only uses say; plain text is invisible; speech playback is asynchronous.`;
 
 export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
-	tool('observe', 'Request a fresh player observation. Read freshness and coverage; an unavailable freshness barrier returns explicitly stale cached facts.', objectSchema({})),
-	tool('capabilities', 'List action fields, query sections, limits, and runtime support. Request section program for the shared ArenaScript language and API reference before writing a program.', objectSchema({ section: { type: 'string', enum: ['all', 'program'] } })),
+	tool('taskMemory', 'Remember places, connected routes, task progress and lessons across deaths. Death sites, outbound trails and workstations are recorded automatically. Entries are model-authored historical notes, never current world truth. shared:true explicitly shares an entry with agents in this world and dimension. Query route waypoints and earlier deaths with pagination; reobserve before recovery. Routes use from/to place keys and 2..64 waypoints. Choose recovery or rebuilding yourself.', objectSchema({
+		operation: { type: 'string', enum: ['remember', 'query'] },
+		entry: objectSchema({ kind: { type: 'string', enum: ['place', 'route', 'progress', 'lesson'] }, key: { type: 'string', minLength: 1, maxLength: 128 }, label: { type: 'string', minLength: 1, maxLength: 128 }, summary: { type: 'string', minLength: 1, maxLength: 1024 },
+			position: objectSchema({ x: numberSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT), y: numberSchema(-2048, 2048), z: numberSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT) }, ['x', 'y', 'z']),
+			from: { type: 'string', minLength: 1, maxLength: 128 }, to: { type: 'string', minLength: 1, maxLength: 128 },
+			waypoints: { type: 'array', minItems: 2, maxItems: 64, items: objectSchema({ x: numberSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT), y: numberSchema(-2048, 2048), z: numberSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT) }, ['x', 'y', 'z']) },
+			status: { type: 'string', enum: ['active', 'retired'] }, shared: { type: 'boolean' } }, ['kind', 'key', 'label', 'summary']),
+		query: objectSchema({ kind: { type: 'string', enum: ['all', 'place', 'route', 'progress', 'lesson', 'deaths', 'assets', 'trail'] }, dimension: { type: 'string', minLength: 1, maxLength: 128 }, text: { type: 'string', maxLength: 256 }, offset: integerSchema(0, Number.MAX_SAFE_INTEGER), limit: integerSchema(1, 64) }),
+	}, ['operation'])),
+	tool('observe', `${MODEL_FACT_INSTRUCTIONS} Request fresh player facts; read coverage/freshness. An unavailable freshness barrier returns explicitly stale cached facts.`, objectSchema({ view: { type: 'string', enum: ['full', 'changes'] }, afterObservationId: { type: 'string', minLength: 1, maxLength: 128 } })),
+	tool('capabilities', 'List action fields, query sections, limits and runtime support. Read section program before writing ArenaScript. Section control lists unchanged control-reference topics; read topic tool:<name> or action:<actionType> before unfamiliar calls. Follow nextOffset to finish a topic; topic all retrieves the complete reference. These queries perform no gameplay.', objectSchema({ section: { type: 'string', enum: ['all', 'program', 'control'] }, topic: { type: 'string', minLength: 1, maxLength: 128 }, offset: integerSchema(0, Number.MAX_SAFE_INTEGER) })),
 	tool('inspect', 'Request a focused page of player-accessible facts. Item queries need a slot; block queries need visible x/y/z coordinates. Read coverage and freshness.', objectSchema({
 		section: { type: 'string', enum: INSPECTION_SECTIONS }, offset: integerSchema(0, 4_096), limit: integerSchema(1, 32),
 		slot: integerSchema(0, 255), x: integerSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT), y: integerSchema(-2_048, 2_048), z: integerSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT),
@@ -86,7 +105,7 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 		hand: { type: 'string', enum: ['main', 'off'] },
 		ticks: integerSchema(1, 200),
 	}, ['forward', 'strafe', 'jump', 'sneak', 'sprint', 'attack', 'use', 'yaw', 'pitch', 'selectedSlot', 'hand', 'ticks'])),
-	tool('moveTo', 'Navigate toward one short, confirmed waypoint through bounded loaded safe waypoints; use control for ordinary exploration.', objectSchema({
+	tool('moveTo', 'Navigate to one agent-chosen endpoint of an observed safe route leg through bounded loaded waypoints. Choose useful corners, landings or branches instead of every block; unknown ground still needs observation and a new route decision.', objectSchema({
 		x: numberSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT),
 		y: numberSchema(-2_048, 2_048),
 		z: numberSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT),
@@ -126,6 +145,7 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 		},
 		finish: objectSchema({ summary: { type: 'string', minLength: 1, maxLength: 512 } }, ['summary']),
 	}, ['actions'])),
+	tool('taskPlan', 'Read or replace your advisory dependency plan. This does not change the immutable goal or issue game actions. Inventory/world completion is reconciled with fresh game evidence; milestones/manual completion is agent reported. For replace include the complete plan, stable IDs and dependency references. Use read at task start and replace at meaningful revisions.', objectSchema({ operation: { type: 'string', enum: ['read', 'replace'] }, plan: TASK_PLAN_SCHEMA }, ['operation'])),
 	tool('finish', 'Ask Minecraft to verify the immutable active goal. Read unmet facts on failure. If AWAITING_OPERATOR_CONFIRMATION, report once with say and end this turn until new input; do not repeat the work or verification.', objectSchema({
 		summary: { type: 'string', minLength: 1, maxLength: 512 },
 	}, ['summary'])),
@@ -134,13 +154,24 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 export function normalizeMinecraftToolCall(name, value) {
 	const args = requireObject(value);
 	switch (name) {
+		case 'taskPlan':
+			requireExactKeys(args, ['operation', 'plan']);
+			if (args.operation === 'read' && args.plan === undefined) return { kind: 'task_plan', operation: 'read' };
+			if (args.operation !== 'replace') invalid('taskPlan requires read or replace with plan');
+			try { return { kind: 'task_plan', operation: 'replace', plan: validateTaskPlan(args.plan) }; }
+			catch (error) { invalid(error.message); }
 		case 'observe':
-			requireExactKeys(args, []);
-			return { kind: 'observe' };
+			requireExactKeys(args, ['view', 'afterObservationId']);
+			if (args.view !== undefined && !['full', 'changes'].includes(args.view)) invalid('observation view is not supported');
+			if (args.afterObservationId !== undefined && args.view !== 'changes') invalid('afterObservationId requires changes view');
+			return { kind: 'observe', ...(args.view === undefined ? {} : { view: args.view }), ...(args.afterObservationId === undefined ? {} : { afterObservationId: boundedText(args.afterObservationId, 'afterObservationId', 128) }) };
 		case 'capabilities':
-			requireExactKeys(args, ['section']);
-			if (args.section !== undefined && !['all', 'program'].includes(args.section)) invalid('capability section is not supported');
-			return { kind: 'capabilities', ...(args.section === undefined ? {} : { section: args.section }) };
+			requireExactKeys(args, ['section', 'topic', 'offset']);
+			if (args.section !== undefined && !['all', 'program', 'control'].includes(args.section)) invalid('capability section is not supported');
+			if ((args.topic !== undefined || args.offset !== undefined) && args.section !== 'control') invalid('topic and offset require the control reference section');
+			if (args.topic !== undefined && !CONTROL_REFERENCE_TOPICS.includes(args.topic)) invalid('control reference topic is not supported');
+			if (args.offset !== undefined && args.topic === undefined) invalid('control reference offset requires a topic');
+			return { kind: 'capabilities', ...(args.section === undefined ? {} : { section: args.section }), ...(args.topic === undefined ? {} : { topic: args.topic }), ...(args.offset === undefined ? {} : { offset: integer(args.offset, 'offset', 0, Number.MAX_SAFE_INTEGER) }) };
 		case 'inspect': {
 			requireExactKeys(args, ['section', 'offset', 'limit', 'slot', 'x', 'y', 'z', 'afterSequence', 'recipeId', 'entityType', 'outputItemId']);
 			if (!INSPECTION_SECTIONS.includes(args.section)) invalid('section is not supported');
@@ -182,6 +213,18 @@ export function normalizeMinecraftToolCall(name, value) {
 		case 'startAction': {
 			const action = normalizeMinecraftToolCall('act', args);
 			return { ...action, kind: 'start_action' };
+		}
+		case 'taskMemory': {
+			requireExactKeys(args, ['operation', 'entry', 'query']);
+			if (args.operation === 'remember' && args.query === undefined) {
+				try { return { kind: 'task_memory', operation: 'remember', entry: validateTaskEntry(args.entry) }; }
+				catch (error) { invalid(error.message); }
+			}
+			if (args.operation !== 'query' || args.entry !== undefined) invalid('taskMemory requires remember/entry or query/query');
+			const query = args.query === undefined ? {} : requireObject(args.query);
+			requireExactKeys(query, ['kind', 'text', 'offset', 'limit', 'dimension']);
+			if (query.kind !== undefined && !['all', 'place', 'route', 'progress', 'lesson', 'deaths', 'assets', 'trail'].includes(query.kind)) invalid('Unknown task memory kind');
+			return { kind: 'task_memory', operation: 'query', query: { kind: query.kind ?? 'all', offset: optionalInteger(query.offset, 0, 'offset', 0, Number.MAX_SAFE_INTEGER), limit: optionalInteger(query.limit, 20, 'limit', 1, 64), ...(query.dimension === undefined ? {} : { dimension: boundedText(query.dimension, 'dimension', 128) }), ...(query.text === undefined || query.text === '' ? {} : { text: boundedText(query.text, 'text', 256) }) } };
 		}
 		case 'notebook':
 			requireExactKeys(args, ['key', 'text']);

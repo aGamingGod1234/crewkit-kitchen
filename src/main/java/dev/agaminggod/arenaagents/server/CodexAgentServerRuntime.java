@@ -680,6 +680,11 @@ public final class CodexAgentServerRuntime {
         return active != null && active.requestDirectorScript(request);
     }
 
+	public static boolean requestTaskView(MinecraftServer server, dev.agaminggod.arenaagents.agent.AgentId agentId) {
+		MultiplexedServerBridge active = bridge(server);
+		return active != null && active.requestTaskView(agentId);
+	}
+
 	private static MultiplexedServerBridge bridge(MinecraftServer server) {
 		BridgeSlot slot = BRIDGE_SLOTS.get(server);
 		return slot == null ? null : slot.bridge();
