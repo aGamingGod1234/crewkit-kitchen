@@ -4,10 +4,12 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.Set;
 
 /** Runtime provider catalog with a deterministic offline fallback. */
 public final class AgentControlCatalog {
 	private static final String CODEX = "codex";
+	private static final Set<String> SELECTABLE_CODEX_MODELS = Set.of("gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna");
 	private static final List<AgentControlModelOption> FALLBACK = buildFallbackOptions();
 	private static volatile List<AgentControlModelOption> options = FALLBACK;
 
@@ -26,14 +28,14 @@ public final class AgentControlCatalog {
 
 	public static String defaultModel(String provider) {
 		String checked = requireProvider(provider);
-		String preferred = checked.equals(CODEX) ? "gpt-5.6-luna" : null;
+		String preferred = checked.equals(CODEX) ? "gpt-6-luna" : null;
 		List<String> available = models(checked);
 		return preferred != null && available.contains(preferred) ? preferred : available.getFirst();
 	}
 
 	public static String defaultReasoning(String provider, String model) {
 		List<String> efforts = reasoningEfforts(provider, model);
-		if (CODEX.equals(provider) && "gpt-5.6-luna".equals(model) && efforts.contains("xhigh")) return "xhigh";
+		if (CODEX.equals(provider) && "gpt-6-luna".equals(model) && efforts.contains("xhigh")) return "xhigh";
 		return efforts.contains("high") ? "high" : efforts.getFirst();
 	}
 
@@ -76,6 +78,13 @@ public final class AgentControlCatalog {
 		options = checked;
 	}
 
+	/** Legacy Codex profiles remain readable in saved agents but are not offered for new summons. */
+	public static List<AgentControlModelOption> selectableOptions(List<AgentControlModelOption> runtimeOptions) {
+		return List.copyOf(runtimeOptions.stream()
+				.filter(option -> !CODEX.equals(option.provider()) || SELECTABLE_CODEX_MODELS.contains(option.model()))
+				.toList());
+	}
+
 	public static void resetRuntimeCatalog() {
 		options = FALLBACK;
 	}
@@ -100,16 +109,9 @@ public final class AgentControlCatalog {
 
 	private static List<AgentControlModelOption> buildFallbackOptions() {
 		ArrayList<AgentControlModelOption> values = new ArrayList<>();
-		add(values, CODEX, "gpt-5.6-luna", "GPT 5.6 Luna", List.of("low", "medium", "high", "xhigh", "max"), true);
-		add(values, CODEX, "gpt-5.6-terra", "GPT 5.6 Terra", List.of("low", "medium", "high", "xhigh", "max", "ultra"), true);
-		add(values, CODEX, "gpt-5.6-sol", "GPT 5.6 Sol", List.of("low", "medium", "high", "xhigh", "max", "ultra"), true);
-		add(values, CODEX, "gpt-5.6-sol-wm", "GPT 5.6 Sol WM", List.of("low", "medium", "high", "xhigh", "max", "ultra"), true);
-		for (String model : List.of("gpt-5.5", "gpt-5.4")) {
-			add(values, CODEX, model, readable(model), List.of("low", "medium", "high", "xhigh"), true);
-		}
-		for (String model : List.of("gpt-5.4-mini", "gpt-5.3-codex-spark")) {
-			add(values, CODEX, model, readable(model), List.of("low", "medium", "high", "xhigh"), false);
-		}
+		add(values, CODEX, "gpt-6-astra", "GPT 6 Astra", List.of("low", "medium", "high", "xhigh", "max", "ultra"), true);
+		add(values, CODEX, "gpt-6.1-sol", "GPT-6.1 Sol", List.of("low", "medium", "high", "xhigh", "max", "ultra"), true);
+		add(values, CODEX, "gpt-6-luna", "GPT 6 Luna", List.of("low", "medium", "high", "xhigh", "max"), true);
 		add(values, "gemini", "gemini-3.1-pro", "Gemini 3.1 Pro", List.of("high", "low"), false);
 		for (String model : List.of("gemini-3.6-flash", "gemini-3.5-flash")) {
 			add(values, "gemini", model, readable(model), List.of("high", "medium", "low"), false);

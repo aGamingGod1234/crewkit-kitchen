@@ -1,0 +1,151 @@
+{
+  "installedJarSha256": "1cc6dbda2c338c70563c977b27a33ca6bce2c2efd53aefacb40f609e58f4f4eb",
+  "allProductionGraphFilesIdentical": true,
+  "files": {
+    "coordinator/src/arena-script/errors.mjs": {
+      "worktreeSha256": "bfc98ed5764d6305dfbe67e0fd71b7986f9d1d10ed0a18ee8590603075dcece4",
+      "installedJarBundledSha256": "bfc98ed5764d6305dfbe67e0fd71b7986f9d1d10ed0a18ee8590603075dcece4",
+      "identical": true
+    },
+    "coordinator/src/arena-script/fact-domains.mjs": {
+      "worktreeSha256": "3956b97535b095016da78543ef687cb71fc39721ab4eb906aa5f731f3179099d",
+      "installedJarBundledSha256": "3956b97535b095016da78543ef687cb71fc39721ab4eb906aa5f731f3179099d",
+      "identical": true
+    },
+    "coordinator/src/arena-script/facts.mjs": {
+      "worktreeSha256": "0cf3173557ad31f41e9f5f3d75558b679137000e85a0992c779dfec6508612e7",
+      "installedJarBundledSha256": "0cf3173557ad31f41e9f5f3d75558b679137000e85a0992c779dfec6508612e7",
+      "identical": true
+    },
+    "coordinator/src/arena-script/interpreter.mjs": {
+      "worktreeSha256": "c819d1d77ae89d2528436cafa31d1ddd423c0df6c44ee7ae8f69c1186f8bf7ec",
+      "installedJarBundledSha256": "c819d1d77ae89d2528436cafa31d1ddd423c0df6c44ee7ae8f69c1186f8bf7ec",
+      "identical": true
+    },
+    "coordinator/src/arena-script/limits.mjs": {
+      "worktreeSha256": "41063c2206359ad2b2e8e3347800fd8fb2ef989093b37cccd284198995ff9362",
+      "installedJarBundledSha256": "41063c2206359ad2b2e8e3347800fd8fb2ef989093b37cccd284198995ff9362",
+      "identical": true
+    },
+    "coordinator/src/arena-script/minecraft-api.mjs": {
+      "worktreeSha256": "d71c2b976b2935054357b3142f8f30e58bc3f3cc00355e697bbf1aab625f3205",
+      "installedJarBundledSha256": "d71c2b976b2935054357b3142f8f30e58bc3f3cc00355e697bbf1aab625f3205",
+      "identical": true
+    },
+    "coordinator/src/arena-script/parser.mjs": {
+      "worktreeSha256": "987da9c8c4f1c3c3f9f84999848eecaf76ece21a8209f950f6db059a67def681",
+      "installedJarBundledSha256": "987da9c8c4f1c3c3f9f84999848eecaf76ece21a8209f950f6db059a67def681",
+      "identical": true
+    },
+    "coordinator/src/arena-script/program-engine.mjs": {
+      "worktreeSha256": "19d241366799bb6d459ed0cf9673710d0c0a460829f0fc18286fe5cc240998b4",
+      "installedJarBundledSha256": "19d241366799bb6d459ed0cf9673710d0c0a460829f0fc18286fe5cc240998b4",
+      "identical": true
+    },
+    "coordinator/src/constants.mjs": {
+      "worktreeSha256": "9910f6e19052eacef8f69a388b03960e274344667d2c122d39ffefc59d080091",
+      "installedJarBundledSha256": "9910f6e19052eacef8f69a388b03960e274344667d2c122d39ffefc59d080091",
+      "identical": true
+    },
+    "coordinator/src/control-latency-registry.mjs": {
+      "worktreeSha256": "33f60d31a58524f8750e63fc77f30a0786d9dc8b067a28b257f5229cdc605b22",
+      "installedJarBundledSha256": "33f60d31a58524f8750e63fc77f30a0786d9dc8b067a28b257f5229cdc605b22",
+      "identical": true
+    },
+    "coordinator/src/explore-frontier.mjs": {
+      "worktreeSha256": "5cf554222148e5509338ccec6938a97670ed7f345214f17960bcfd619f570308",
+      "installedJarBundledSha256": "5cf554222148e5509338ccec6938a97670ed7f345214f17960bcfd619f570308",
+      "identical": true
+    },
+    "coordinator/src/goal-spec.mjs": {
+      "worktreeSha256": "614af0e17dfe65336f7349875498648db96fedc4e5734969f3ecddccd4f6ccdd",
+      "installedJarBundledSha256": "614af0e17dfe65336f7349875498648db96fedc4e5734969f3ecddccd4f6ccdd",
+      "identical": true
+    },
+    "coordinator/src/jsonl.mjs": {
+      "worktreeSha256": "3e5154d40fd468ea695940af830cca2fd7417044ca6e73d0d4b766da009d7c2e",
+      "installedJarBundledSha256": "3e5154d40fd468ea695940af830cca2fd7417044ca6e73d0d4b766da009d7c2e",
+      "identical": true
+    },
+    "coordinator/src/message-id.mjs": {
+      "worktreeSha256": "96f7a07f23c27de1de90f6ebb19ff9751ab048f0ed0c09756a822bd0c3930b4e",
+      "installedJarBundledSha256": "96f7a07f23c27de1de90f6ebb19ff9751ab048f0ed0c09756a822bd0c3930b4e",
+      "identical": true
+    },
+    "coordinator/src/native-minecraft-tools.mjs": {
+      "worktreeSha256": "f167902151e38540dde70229fb03e3b00c6960929d298058f9cd43b7e284512a",
+      "installedJarBundledSha256": "f167902151e38540dde70229fb03e3b00c6960929d298058f9cd43b7e284512a",
+      "identical": true
+    },
+    "coordinator/src/native-program-executor.mjs": {
+      "worktreeSha256": "69c15591e751331473954d4c4fc59bd66519ca34e77755aef118bdac7053d0d9",
+      "installedJarBundledSha256": "69c15591e751331473954d4c4fc59bd66519ca34e77755aef118bdac7053d0d9",
+      "identical": true
+    },
+    "coordinator/src/native-tool-runtime.mjs": {
+      "worktreeSha256": "104ef4298c0e5b1cd20b1fe393f647210fd1a474b435da75bdf078c7f1ebdcc9",
+      "installedJarBundledSha256": "104ef4298c0e5b1cd20b1fe393f647210fd1a474b435da75bdf078c7f1ebdcc9",
+      "identical": true
+    },
+    "coordinator/src/observation-adapter.mjs": {
+      "worktreeSha256": "4bcdb4808170fcfe876e03c0e2c156993eb4e578ebb9647faa4160fd91c82e15",
+      "installedJarBundledSha256": "4bcdb4808170fcfe876e03c0e2c156993eb4e578ebb9647faa4160fd91c82e15",
+      "identical": true
+    },
+    "coordinator/src/observed-memory-store.mjs": {
+      "worktreeSha256": "52c6385a3d5794e4d3a4a22fdc972fa3ffa03c12578304574d4736d340b6da71",
+      "installedJarBundledSha256": "52c6385a3d5794e4d3a4a22fdc972fa3ffa03c12578304574d4736d340b6da71",
+      "identical": true
+    },
+    "coordinator/src/program-parameters.mjs": {
+      "worktreeSha256": "f4791f6bcd12faee425254105da66b171c712eee412450637a908cac1175ab9a",
+      "installedJarBundledSha256": "f4791f6bcd12faee425254105da66b171c712eee412450637a908cac1175ab9a",
+      "identical": true
+    },
+    "coordinator/src/program-precondition.mjs": {
+      "worktreeSha256": "7ebcd47a28f486c57cb5a7240ff2a65d7138d5cdd723e5c59a0de89d87a7734c",
+      "installedJarBundledSha256": "7ebcd47a28f486c57cb5a7240ff2a65d7138d5cdd723e5c59a0de89d87a7734c",
+      "identical": true
+    },
+    "coordinator/src/prompts.mjs": {
+      "worktreeSha256": "c709aecee673c262f68fb1d551e6795038b8603a4e04985a3ef33781f5019208",
+      "installedJarBundledSha256": "c709aecee673c262f68fb1d551e6795038b8603a4e04985a3ef33781f5019208",
+      "identical": true
+    },
+    "coordinator/src/protocol-v2.mjs": {
+      "worktreeSha256": "8f582de6a25652e68b5c6965df406f4117669379dc34385e328be31ec197d04d",
+      "installedJarBundledSha256": "8f582de6a25652e68b5c6965df406f4117669379dc34385e328be31ec197d04d",
+      "identical": true
+    },
+    "coordinator/src/provider-identity.mjs": {
+      "worktreeSha256": "e2203f8eb459573a3e0e279268ae782aa101849f3514a91c194d29dc3727e1d7",
+      "installedJarBundledSha256": "e2203f8eb459573a3e0e279268ae782aa101849f3514a91c194d29dc3727e1d7",
+      "identical": true
+    },
+    "coordinator/src/provider-session.mjs": {
+      "worktreeSha256": "c0c84d1c82586ff79ff49ce7a1663a555643472e6646d73810b15d53987b03d8",
+      "installedJarBundledSha256": "c0c84d1c82586ff79ff49ce7a1663a555643472e6646d73810b15d53987b03d8",
+      "identical": true
+    },
+    "coordinator/src/recovery-progress-wrap.mjs": {
+      "worktreeSha256": "524f43fa6e84d333f36f6f64ab8e4afec51732b3f4d49e53757d5dcc19e0030e",
+      "installedJarBundledSha256": "524f43fa6e84d333f36f6f64ab8e4afec51732b3f4d49e53757d5dcc19e0030e",
+      "identical": true
+    },
+    "coordinator/src/registered-agent-contract.mjs": {
+      "worktreeSha256": "80ac7cec87d8accb6a640eaaff48f8b0c9000e1fba208417e84d1f0c75569c05",
+      "installedJarBundledSha256": "80ac7cec87d8accb6a640eaaff48f8b0c9000e1fba208417e84d1f0c75569c05",
+      "identical": true
+    },
+    "coordinator/src/schema.mjs": {
+      "worktreeSha256": "bd209f191e5e476161b31f001381c2423091a70b655bd5ac9d29de3c2a88b038",
+      "installedJarBundledSha256": "bd209f191e5e476161b31f001381c2423091a70b655bd5ac9d29de3c2a88b038",
+      "identical": true
+    },
+    "coordinator/src/two-call-llm-wrap.mjs": {
+      "worktreeSha256": "c3450fd6f5731f552029681f9d846c49db7cd28e19849441771296e29a9036c4",
+      "installedJarBundledSha256": "c3450fd6f5731f552029681f9d846c49db7cd28e19849441771296e29a9036c4",
+      "identical": true
+    }
+  }
+}

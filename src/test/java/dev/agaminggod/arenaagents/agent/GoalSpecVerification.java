@@ -20,6 +20,7 @@ public final class GoalSpecVerification {
 		int assertions = 0;
 		assertions += verifyCanonicalRoundTrip();
 		assertions += verifyInventoryCategory();
+		assertions += verifyGenericBlockRoundTrip();
 		assertions += verifyClosedSchema();
 		assertions += verifyComplexityBounds();
 		assertions += verifyAgentGoalPersistence();
@@ -45,6 +46,17 @@ public final class GoalSpecVerification {
 		assertEquals(spec, decoded, "goal spec round-trip");
 		assertEquals(encoded, codec.encode(decoded), "goal spec canonical bytes");
 		assertEquals(64, spec.fingerprint().length(), "goal spec SHA-256 fingerprint length");
+		return 3;
+	}
+
+	private static int verifyGenericBlockRoundTrip() {
+		GoalPredicate predicate = new GoalPredicate.InventoryContainsBlock(2);
+		GoalSpec spec = GoalSpec.create("Get two blocks", predicate, 1_200L);
+		GoalSpecCodec persisted = new GoalSpecCodec();
+		GoalSpecWireCodec wire = new GoalSpecWireCodec();
+		assertEquals(spec, persisted.decode(persisted.encode(spec)), "generic block predicate persists with its fingerprint");
+		assertEquals(predicate, wire.decodePredicate(wire.encodePredicate(predicate)), "generic block predicate crosses the wire");
+		assertEquals(List.of(), wire.identifiers(predicate), "generic block requires no preselected block ID");
 		return 3;
 	}
 

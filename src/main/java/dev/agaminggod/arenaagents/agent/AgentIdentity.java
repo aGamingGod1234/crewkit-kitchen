@@ -45,7 +45,22 @@ public final class AgentIdentity {
 	/** Returns the readable tag shown above a spawned player, without changing its safe technical name. */
 	public static String displayNameTag(AgentProfile profile) {
 		Objects.requireNonNull(profile, "profile must not be null");
-		return profile.userName().orElseGet(() -> AgentModelNames.tagName(profile.provider(), profile.model()));
+		String modelLabel = AgentModelNames.tagName(profile.provider(), profile.model());
+		if (profile.userName().isEmpty()) return modelLabel;
+		String storedName = profile.userName().orElseThrow();
+		String base = defaultPublicName(profile.provider(), profile.model());
+		if (sameIdentity(storedName, base)) return modelLabel;
+		// Registry-created profiles persist an allocated technical name in userName,
+		// including collision suffixes. Recover the label without renaming the player.
+		int suffixStart = storedName.length();
+		while (suffixStart > 0 && Character.isDigit(storedName.charAt(suffixStart - 1))) suffixStart--;
+		String suffix = storedName.substring(suffixStart);
+		if (suffixStart > 0 && !suffix.isEmpty() && suffix.length() < PLAYER_NAME_LIMIT
+				&& suffix.charAt(0) != '0' && !suffix.equals("1")) {
+			String allocatedBase = base.substring(0, Math.min(base.length(), PLAYER_NAME_LIMIT - suffix.length()));
+			if (sameIdentity(storedName.substring(0, suffixStart), allocatedBase)) return modelLabel + " " + suffix;
+		}
+		return storedName;
 	}
 
 	static String canonicalIdentityKey(String value) {

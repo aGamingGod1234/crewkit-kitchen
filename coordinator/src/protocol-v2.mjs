@@ -32,6 +32,7 @@ import { ValidationError, validateAction, validateActionCommandPayload } from '.
 import { parseGoalSpec, parseGoalSpecProposal, parseGoalSpecRequest } from './goal-spec.mjs';
 import { assertProviderServiceTier, normalizeProviderId } from './provider-identity.mjs';
 import { validateRegisteredAgentContract } from './registered-agent-contract.mjs';
+import { validateTaskPlan } from './live-task-view.mjs';
 
 const MAX_COORDINATOR_CIRCUITS = 32;
 
@@ -53,6 +54,7 @@ export const COORDINATOR_TO_SERVER_TYPES = Object.freeze([
 	'action_result_ack',
 	'agent_error',
 	'verbose_event',
+	'task_view',
 	'heartbeat',
 ]);
 
@@ -74,6 +76,7 @@ export const SERVER_TO_COORDINATOR_TYPES = Object.freeze([
 	'goal_spec_request',
 	'goal_spec_result',
 	'verbose_control',
+	'task_view_request',
 	'heartbeat',
 	'shutdown',
 ]);
@@ -330,6 +333,20 @@ function normalizeProtocolV2Payload(type, value) {
 				code: boundedText(value.code, 'code', MAX_REASON_CODE_LENGTH),
 				message: boundedText(value.message, 'message', MAX_RESULT_MESSAGE_LENGTH),
 			};
+		case 'task_view_request':
+			exactKeys(value, ['goalRevision'], ['goalRevision'], type);
+			return { goalRevision: revision(value.goalRevision, 'goalRevision') };
+		case 'task_view': {
+			exactKeys(value, ['goalRevision', 'goal', 'active', 'verified', 'revision', 'plan', 'lastObserved', 'events', 'usage', 'allowance', 'generatedAt'], ['goalRevision', 'goal', 'active', 'verified', 'revision', 'plan', 'lastObserved', 'events', 'usage', 'allowance', 'generatedAt'], type);
+			boolean(value.active, 'active'); boolean(value.verified, 'verified');
+			if (Buffer.byteLength(JSON.stringify(value)) > 28_672) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Task view exceeds the wire budget');
+			revision(value.goalRevision, 'goalRevision'); revision(value.revision, 'revision'); nonnegativeInteger(value.generatedAt, 'generatedAt');
+			boundedText(value.goal, 'goal', 512, 0);
+			if (value.plan !== null) validateTaskPlan(value.plan);
+			if (!Array.isArray(value.events) || value.events.length > 256) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Invalid task events');
+			for (const event of value.events) { boundedText(event.message, 'event.message', 2048); boundedText(event.stage, 'event.stage', 40); nonnegativeInteger(event.sequence, 'event.sequence'); nonnegativeInteger(event.at, 'event.at'); }
+			return structuredClone(value);
+		}
 		case 'verbose_control':
 			exactKeys(value, ['enabled'], ['enabled'], type);
 			return { enabled: boolean(value.enabled, 'enabled') };
@@ -1524,8 +1541,8 @@ function normalizeConversationWake(value) {
 	exactKeys(value, ['transactionId', 'event', 'control'], ['transactionId', 'event', 'control'], 'conversation_wake');
 	const event = normalizeConversationEvent(value.event);
 	const control = normalizeGoalControl(value.control);
-	if (control.operation !== 'start') {
-		throw new ProtocolV2Error('INVALID_PAYLOAD', 'conversation_wake control must be start');
+	if (!['start', 'replace'].includes(control.operation)) {
+		throw new ProtocolV2Error('INVALID_PAYLOAD', 'conversation_wake control must be start or replace');
 	}
 	if (event.goalRevision === Number.MAX_SAFE_INTEGER || control.goalRevision !== event.goalRevision + 1) {
 		throw new ProtocolV2Error('INVALID_PAYLOAD', 'conversation_wake control revision must immediately follow the event revision');
@@ -1993,7 +2010,7 @@ function playerObservation(value) {
 			return {
 				effectId: requireIdentifier(effect.effectId, `effects[${index}].effectId`),
 				amplifier: nonnegativeInteger(effect.amplifier, `effects[${index}].amplifier`),
-				duration: nonnegativeInteger(effect.duration, `effects[${index}].duration`),
+				duration: effectDuration(effect.duration, `effects[${index}].duration`),
 			};
 		}),
 	};
@@ -2268,6 +2285,11 @@ function integer(value, field) {
 function nonnegativeInteger(value, field) {
 	if (!Number.isSafeInteger(value) || value < 0) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be a nonnegative safe integer`);
 	return value;
+}
+
+function effectDuration(value, field) {
+	// Vanilla MobEffectInstance uses -1 for infinite effects; finite durations remain ticks.
+	return value === -1 ? -1 : nonnegativeInteger(value, field);
 }
 
 function nonnegativeFiniteNumber(value, field) {

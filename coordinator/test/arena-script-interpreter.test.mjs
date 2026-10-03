@@ -107,6 +107,36 @@ test('inspection yields a read request and resumes with the full immutable resul
 	assert.equal(next.call.arguments, 7);
 });
 
+test('restoring an undispatched command or query preserves its token, local scope and real receipt after the watcher decision', () => {
+	for (const kind of ['command', 'query']) {
+		const body = kind === 'command'
+			? 'const receipt = await tryResult(player.wait(1000)); await player.wait(before + player.state().health + (receipt.succeeded ? 1 : 2));'
+			: 'const page = await world.inspect({section:"inventory",offset:0,limit:16}); await player.wait(before + player.state().health + page.entries.length);';
+		const vm = interpreter(`program.onUnhandledAttention("continue_and_notify");
+			program.watch(() => player.state().health < 19, {mode:"interrupt",after:"reconsider"}, async () => {await player.wait(9);});
+			const before = player.state().health; ${body}`);
+		const unsafe = facts({player:{health:17}}), safe = facts();
+		const original = vm.start(unsafe);
+		assert.equal(original.kind, kind);
+		const defense = vm.runWatcherHandlerBeforeResume('watcher-0', unsafe);
+		assert.equal(defense.call.arguments, 9);
+		assert.throws(() => vm.restoreDeferredCommand(safe), error => error.code === 'NOT_IDLE');
+		assert.equal(vm.resume(actionResult(defense), safe).kind, 'watcher_decision');
+		assert.throws(() => vm.restoreDeferredCommand(safe), error => error.code === 'NOT_IDLE', 'defense completion is not permission to resume');
+		assert.equal(vm.resumeWatcherDecision(safe).kind, 'idle');
+		assert.throws(() => vm.restoreDeferredCommand({player:{health:NaN}}), error => error.code === 'INVALID_FACTS');
+		vm.restoreDeferredCommand(safe);
+		assert.throws(() => vm.restoreDeferredCommand(safe), error => error.code === 'NOT_WAITING');
+		const staleReceipt = kind === 'command' ? actionResult(defense)
+			: {...actionResult(defense), value:{state:'SUCCEEDED',reasonCode:'INSPECTED',entries:[]}};
+		assert.throws(() => vm.resume(staleReceipt, safe), error => error.code === 'STALE_STATE_TOKEN', 'the defense receipt cannot settle the held body');
+		const result = kind === 'command' ? actionResult(original, 'FAILED', 'BODY_FAILED')
+			: {...actionResult(original), value:{state:'SUCCEEDED',reasonCode:'INSPECTED',entries:[1,2,3]}};
+		const next = vm.resume(result, safe);
+		assert.equal(next.call.arguments, kind === 'command' ? 39 : 40);
+	}
+});
+
 function boundedCounterSource() {
 	return `
 		program.onUnhandledAttention("continue_and_notify");

@@ -302,6 +302,9 @@ test('protocol v2 carries one acknowledged conversation wake transaction', () =>
 	const control = { operation: 'start', goalRevision: 4, updatedAtEpochMs: 21, goal: 'Respond to the player.' };
 	const payload = { transactionId: 'wake-00000001', event, control };
 	assert.deepEqual(validateProtocolV2Payload('conversation_wake', payload), payload);
+	const replacement = { ...payload, control: { ...control, operation: 'replace' } };
+	assert.deepEqual(validateProtocolV2Payload('conversation_wake', replacement), replacement,
+		'a direct replacement keeps its operation while retaining the consecutive revision guard');
 	assert.deepEqual(
 		validateProtocolV2Payload('conversation_wake_ack', { transactionId: payload.transactionId, goalRevision: 4 }),
 		{ transactionId: payload.transactionId, goalRevision: 4 },
@@ -1929,6 +1932,27 @@ test('accepts the exact rich ready observation emitted by ServerObservationColle
 	assert.equal(adapted.world.worldId, payload.world.worldId);
 });
 
+test('status-effect durations preserve finite ticks and the vanilla infinite sentinel', () => {
+	const payload = currentCollectorObservation();
+	for (const duration of [120, -1, 0, Number.MAX_SAFE_INTEGER]) {
+		payload.player.effects = [{ effectId: 'minecraft:haste', amplifier: 1, duration }];
+		const normalized = validateProtocolV2Payload('observation', payload);
+		assert.deepEqual(normalized.player.effects, payload.player.effects);
+		assert.deepEqual(adaptObservation(normalized).player.effects, payload.player.effects);
+	}
+});
+
+test('status-effect durations reject invalid negatives and noninteger values', () => {
+	const payload = currentCollectorObservation();
+	for (const duration of [-2, -120, -1.5, 0.5, Number.NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, '-1', null]) {
+		payload.player.effects[0].duration = duration;
+		assert.throws(() => validateProtocolV2Payload('observation', payload), (error) =>
+			error.code === 'INVALID_PAYLOAD' && /effects\[0\]\.duration/.test(error.message));
+	}
+	payload.player.effects[0] = { effectId: 'minecraft:haste', amplifier: -1, duration: -1 };
+	assert.throws(() => validateProtocolV2Payload('observation', payload), /amplifier/);
+});
+
 test('menu cursor durability stays typed and dimension changes remain factual', () => {
 	const payload = currentCollectorObservation();
 	payload.interaction.menu.cursor = { itemId: 'minecraft:iron_sword', count: 1, damage: 12, maxDamage: 250 };
@@ -1968,7 +1992,7 @@ test('ready observation accepts bounded factual aggregate paths at maximum entit
 	);
 });
 
-test('delivers the rich server observation without tearing down the authenticated bridge', async () => {
+test('delivers rich observations with finite and infinite effects without tearing down the authenticated bridge', async (t) => {
 	const socket = new FakeSocket();
 	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
 		socketFactory: () => socket,
@@ -1976,6 +2000,7 @@ test('delivers the rich server observation without tearing down the authenticate
 		cancelSchedule: () => {},
 		currentRevision: () => 4,
 	});
+	t.after(() => bridge.stop());
 	bridge.start();
 	socket.emit('connect');
 	const hello = JSON.parse(socket.writes[0]);
@@ -1986,17 +2011,16 @@ test('delivers the rich server observation without tearing down the authenticate
 		registry: [registeredRecord()],
 	}))}\n`);
 	await ready;
-	const delivered = once(bridge, 'observation');
-	socket.emit('data', `${JSON.stringify(serverEnvelope(
-		'observation',
-		'agent-a',
-		'server-observation-1',
-		currentCollectorObservation(),
-	))}\n`);
-	const [message] = await delivered;
-	assert.equal(message.payload.player.foodLevel, 14);
-	assert.equal(socket.destroyed, false);
-	bridge.stop();
+	for (const [index, duration] of [120, -1, 119].entries()) {
+		const payload = currentCollectorObservation();
+		payload.player.effects = [{ effectId: 'minecraft:haste', amplifier: 1, duration }];
+		const delivered = once(bridge, 'observation');
+		socket.emit('data', `${JSON.stringify(serverEnvelope('observation', 'agent-a', `server-observation-${index + 1}`, payload))}\n`);
+		assert.equal(socket.destroyed, false, `duration ${duration} must not disconnect the bridge`);
+		const [message] = await delivered;
+		assert.equal(message.payload.player.foodLevel, 14);
+		assert.deepEqual(adaptObservation(message.payload).player.effects, payload.player.effects);
+	}
 });
 
 test('valid agent_removed is delivered before its identity is removed from the bridge registry', async () => {

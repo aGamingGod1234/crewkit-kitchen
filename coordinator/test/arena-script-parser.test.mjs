@@ -38,6 +38,18 @@ test('admits the exact Task 2 direct action and terminal API calls', () => {
 	}
 });
 
+test('attention reassessment accepts only a prologue factual predicate and preserves survival defaults', () => {
+	const compiled = parseArenaScript(`program.onUnhandledAttention("pause_and_notify", { reassessWhen: () => world.blocks({blockId:"minecraft:iron_ore"}).length > 0 }); await player.wait(1);`);
+	assert.equal(compiled.hasReassessmentCondition, true);
+	assert.equal(compiled.survivalPolicy, 'pause_and_notify');
+	assert.equal(parseArenaScript('program.onUnhandledAttention("continue_and_notify");').hasReassessmentCondition, false);
+	for (const option of ['{reassessWhen:false}', '{reassessWhen:async () => false}', '{reassessWhen:() => player.wait(1)}', '{reassessWhen:() => world.inspect({section:"blocks"})}', '{reassessWhen:() => { let changed = false; changed = true; return changed; }}', '{reassessWhen:() => false,reassessWhen:() => true}', '{reassessWhen:() => false,ignoreThreats:true}', '{}']) {
+		assert.throws(() => parseArenaScript(`program.onUnhandledAttention("continue_and_notify", ${option}); await player.wait(1);`), (error) => error.code === 'UNSUPPORTED_SYNTAX');
+	}
+	assert.throws(() => parseArenaScript('await player.wait(1); program.onUnhandledAttention("continue_and_notify", {reassessWhen:() => false});'), (error) => error.code === 'UNSUPPORTED_SYNTAX');
+	assert.throws(() => parseArenaScript('program.onUnhandledAttention("continue_and_notify", {reassessWhen:() => later}); await player.wait(1); const later = false;'), (error) => error.code === 'UNSAFE_MEMBER_ACCESS');
+});
+
 test('requires exact observed target ids for attack and ranged use', () => {
 	assert.doesNotThrow(() => parseArenaScript(`
 		program.onUnhandledAttention("continue_and_notify");

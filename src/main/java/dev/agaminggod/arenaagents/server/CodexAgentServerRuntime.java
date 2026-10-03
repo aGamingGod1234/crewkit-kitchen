@@ -85,6 +85,11 @@ public final class CodexAgentServerRuntime {
 		runtime.confirm(agentId, goal.goalId());
 	}
 
+	public static boolean confirmCurrentGoalFromSpeech(MinecraftServer server, AgentId agentId) {
+		GoalVerificationRuntime runtime = GOAL_VERIFIERS.get(server);
+		return runtime != null && runtime.confirmFromSpeech(agentId);
+	}
+
 	private static boolean containsOperatorConfirmation(dev.agaminggod.arenaagents.agent.goal.GoalPredicate predicate) {
 		if (predicate instanceof dev.agaminggod.arenaagents.agent.goal.GoalPredicate.OperatorConfirmed) return true;
 		if (predicate instanceof dev.agaminggod.arenaagents.agent.goal.GoalPredicate.AllOf all) {
@@ -411,7 +416,8 @@ public final class CodexAgentServerRuntime {
 
 	public static List<AgentControlModelOption> modelCatalog(MinecraftServer server) {
 		MultiplexedServerBridge bridge = bridge(server);
-		return bridge == null ? AgentControlCatalog.fallbackOptions() : bridge.catalogModels();
+		return bridge == null ? AgentControlCatalog.fallbackOptions()
+				: AgentControlCatalog.selectableOptions(bridge.catalogModels());
 	}
 
 	public static void requireAutomation(MinecraftServer server) {
@@ -673,6 +679,11 @@ public final class CodexAgentServerRuntime {
         MultiplexedServerBridge active = bridge(server);
         return active != null && active.requestDirectorScript(request);
     }
+
+	public static boolean requestTaskView(MinecraftServer server, dev.agaminggod.arenaagents.agent.AgentId agentId) {
+		MultiplexedServerBridge active = bridge(server);
+		return active != null && active.requestTaskView(agentId);
+	}
 
 	private static MultiplexedServerBridge bridge(MinecraftServer server) {
 		BridgeSlot slot = BRIDGE_SLOTS.get(server);

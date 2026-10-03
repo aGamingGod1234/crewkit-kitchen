@@ -18,8 +18,12 @@ public final class AgentLifecycleReducer {
 	}
 
 	public static AgentTransition start(AgentRecord current, GoalSpec spec, long nowEpochMs) {
+		return start(current, spec, "", nowEpochMs);
+	}
+
+	public static AgentTransition start(AgentRecord current, GoalSpec spec, String advisoryRoute, long nowEpochMs) {
 		Objects.requireNonNull(spec, "spec must not be null");
-		return start(current, AgentGoal.create(spec.originalRequest(), spec, nowEpochMs), nowEpochMs);
+		return start(current, AgentGoal.create(spec.originalRequest(), spec, advisoryRoute, nowEpochMs), nowEpochMs);
 	}
 
 	private static AgentTransition start(AgentRecord current, AgentGoal goal, long nowEpochMs) {
@@ -41,6 +45,10 @@ public final class AgentLifecycleReducer {
 	}
 
 	public static AgentTransition replace(AgentRecord current, GoalSpec spec, long nowEpochMs) {
+		return replace(current, spec, "", nowEpochMs);
+	}
+
+	public static AgentTransition replace(AgentRecord current, GoalSpec spec, String advisoryRoute, long nowEpochMs) {
 		Objects.requireNonNull(spec, "spec must not be null");
 		if (current.currentGoal().isEmpty()) {
 			throw new AgentDomainException("NO_CURRENT_GOAL", "Agent has no current goal to replace");
@@ -50,7 +58,7 @@ public final class AgentLifecycleReducer {
 				AgentLifecycleState.ERROR, AgentLifecycleState.DISCONNECTED);
 		AgentRecord revised = current.withLifecycle(
 				AgentLifecycleState.STARTING,
-				Optional.of(AgentGoal.create(spec.originalRequest(), spec, nowEpochMs)),
+				Optional.of(AgentGoal.create(spec.originalRequest(), spec, advisoryRoute, nowEpochMs)),
 				nextRevision(current),
 				current.queuedGoals(),
 				nowEpochMs,
@@ -60,8 +68,12 @@ public final class AgentLifecycleReducer {
 	}
 
 	public static AgentTransition queue(AgentRecord current, GoalSpec spec, int queueLimit, long nowEpochMs) {
+		return queue(current, spec, "", queueLimit, nowEpochMs);
+	}
+
+	public static AgentTransition queue(AgentRecord current, GoalSpec spec, String advisoryRoute, int queueLimit, long nowEpochMs) {
 		Objects.requireNonNull(spec, "spec must not be null");
-		return queue(current, AgentGoal.create(spec.originalRequest(), spec, nowEpochMs), queueLimit, nowEpochMs);
+		return queue(current, AgentGoal.create(spec.originalRequest(), spec, advisoryRoute, nowEpochMs), queueLimit, nowEpochMs);
 	}
 
 	private static AgentTransition queue(AgentRecord current, AgentGoal goal, int queueLimit, long nowEpochMs) {

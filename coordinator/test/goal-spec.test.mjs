@@ -13,6 +13,19 @@ import {
 
 const REQUEST_ID = '00000000-0000-4000-8000-000000000001';
 
+test('a generic block goal has no preselected item and preserves the Java fingerprint shape', () => {
+	const predicate = { type: 'inventory_contains_block', count: 2 };
+	const proposal = { requestId: REQUEST_ID, summary: 'Collect two nearby placeable blocks', predicate };
+	assert.deepEqual(parseGoalSpecProposal(proposal), proposal);
+	assert.deepEqual(goalPredicateIdentifiers(predicate), []);
+	const fields = { originalRequest: 'Get two blocks', predicate, createdAtTick: 1200 };
+	const fingerprint = goalSpecFingerprint(fields);
+	assert.deepEqual(parseGoalSpec({ ...fields, fingerprint }), { ...fields, fingerprint });
+	for (const count of [0, -1, 1.5, 2_147_483_648]) {
+		assert.throws(() => parseGoalSpecProposal({ ...proposal, predicate: { ...predicate, count } }));
+	}
+});
+
 test('compact inventory categories preserve a bounded unique identifier set and count as one factual leaf', () => {
 	const itemIds = Array.from({ length: 64 }, (_unused, index) => `minecraft:category_member_${index}`);
 	const predicate = { type: 'inventory_contains_any', itemIds, count: 3 };

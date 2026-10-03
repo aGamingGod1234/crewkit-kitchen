@@ -71,7 +71,7 @@
       "families": [
         {
           "key": "sol",
-          "models": ["gpt-5.6-sol", "gpt-5.6-sol-wm"],
+          "models": ["gpt-6.1-sol", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.6-sol-wm"],
           "shortLabel": "Sol",
           "variants": [
             {"texturePath": "arenaagents:textures/entity/codex_sol_agent_0.png", "transportCode": "c00"},
@@ -82,7 +82,7 @@
         },
         {
           "key": "terra",
-          "models": ["gpt-5.6-terra", "gpt-5.5", "gpt-5.4"],
+          "models": ["gpt-6-astra", "gpt-5.6-terra", "gpt-5.5", "gpt-5.4"],
           "shortLabel": "Terra",
           "variants": [
             {"texturePath": "arenaagents:textures/entity/codex_terra_agent_0.png", "transportCode": "c10"},
@@ -93,7 +93,7 @@
         },
         {
           "key": "luna",
-          "models": ["gpt-5.6-luna", "gpt-5.4-mini"],
+          "models": ["gpt-6-luna", "gpt-5.6-luna", "gpt-5.4-mini"],
           "shortLabel": "Luna",
           "variants": [
             {"texturePath": "arenaagents:textures/entity/codex_luna_agent_0.png", "transportCode": "c20"},

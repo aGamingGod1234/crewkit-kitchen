@@ -30,6 +30,10 @@ jobs:
       - name: Install locked coordinator dependencies
         working-directory: coordinator
         run: npm ci --ignore-scripts --omit=dev
+      - name: Fetch pinned successor benchmark baseline
+        if: runner.os == 'Windows'
+        # The benchmark reads historical source from Git, including after a squash merge.
+        run: git fetch --no-tags --depth=1 origin 267f1a3de226a55046a0f97c903f39a7bf5a898c
       - name: Test coordinator
         working-directory: coordinator
         run: npm run ${{ matrix.test-script }}

@@ -23,6 +23,7 @@ const DEFAULT_STT_PLAYER_MIN_INTERVAL_MS = 1_000;
 export function createVoiceHttpServer({
 	provider,
 	fishProvider = null,
+	directorUsesPrimaryProvider = false,
 	sttProvider = null,
 	profileStore,
 	secret,
@@ -242,7 +243,7 @@ export function createVoiceHttpServer({
 			}
 			requireJsonContentType(request.headers['content-type']);
 			const payload = validateRequest(parseJson(requestBody));
-			const requiresFish = FISH_DIRECTOR_PROFILES.has(payload.profileId);
+			const requiresFish = !directorUsesPrimaryProvider && FISH_DIRECTOR_PROFILES.has(payload.profileId);
 			const requestProvider = requiresFish ? fishProvider : provider;
 			if (requiresFish && requestProvider === null) {
 				const error = typedError('TTS_FISH_NOT_CONFIGURED', 'Fish Audio needs a valid API key on the host. Configure Fish and restart Minecraft; this voice cannot use local speech.');

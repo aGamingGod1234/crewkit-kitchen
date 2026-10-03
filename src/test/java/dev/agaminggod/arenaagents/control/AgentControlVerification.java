@@ -6,6 +6,7 @@ import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
 import dev.agaminggod.arenaagents.agent.AgentProfile;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
+import dev.agaminggod.arenaagents.agent.AgentRegistry;
 import dev.agaminggod.arenaagents.agent.RespawnPolicy;
 import java.util.List;
 import java.util.Optional;
@@ -65,6 +66,17 @@ public final class AgentControlVerification {
 		assertEquals(snapshot, decoded, "snapshot JSON round trip");
 		assertEquals(AGENT_UUID, agent.agentId(), "snapshot carries stable full agent ID");
 		assertEquals("Builder", agent.displayName(), "snapshot carries optional user name");
+		AgentRegistry registry = AgentRegistry.createDefault(() -> { }, transition -> { });
+		AgentRecord sol = registry.create("codex", "gpt-6.1-sol", "medium", Optional.empty(), NOW_EPOCH_MS);
+		AgentControlAgent solView = AgentControlSnapshot.fromRecords(true, NOW_EPOCH_MS, List.of(sol)).agents().getFirst();
+		assertEquals("GPT-6.1 Sol", solView.displayName(), "world label uses the readable model name");
+		assertEquals("GPT_6_1_Sol", solView.playerName(), "Minecraft keeps its safe technical username");
+		assertEquals(Optional.of("GPT-6.1 Sol"), AgentWorldNamePolicy.tag(solView),
+				"the actual allocated profile reaches the renderer with punctuation intact");
+		AgentRecord secondSol = registry.create("codex", "gpt-6.1-sol", "medium", Optional.empty(), NOW_EPOCH_MS);
+		AgentControlAgent secondView = AgentControlSnapshot.fromRecords(true, NOW_EPOCH_MS, List.of(secondSol)).agents().getFirst();
+		assertEquals("GPT-6.1 Sol 2", secondView.displayName(), "allocated collisions remain distinct readable labels");
+		assertEquals("GPT_6_1_Sol2", secondView.playerName(), "allocated collisions keep their existing command handle");
 		assertEquals(Optional.of("Builder"), AgentWorldNamePolicy.tag(agent),
 				"world tags use the exact public name without a provider glyph or model suffix");
 		assertEquals(Optional.empty(), AgentWorldNamePolicy.tag(agent(AGENT_UUID, "   ")),
@@ -103,14 +115,14 @@ public final class AgentControlVerification {
 				() -> new AgentControlSnapshot(true, NOW_EPOCH_MS, java.util.Collections.nCopies(17, agent)),
 				"snapshot agent bound"
 		);
-		return 18;
+		return 23;
 	}
 
 	private static int verifyProviderPresets() {
 		assertEquals(List.of("codex", "gemini", "kimi", "cursor"), AgentControlCatalog.providers(), "provider order");
-		assertEquals("gpt-5.6-luna", AgentControlCatalog.defaultModel("codex"), "Codex model default");
-		assertEquals("xhigh", AgentControlCatalog.defaultReasoning("codex", "gpt-5.6-luna"), "Codex reasoning default");
-		assertEquals("fast", AgentControlCatalog.defaultServiceTier("codex", "gpt-5.6-luna"), "Codex speed default");
+		assertEquals("gpt-6-luna", AgentControlCatalog.defaultModel("codex"), "Codex model default");
+		assertEquals("xhigh", AgentControlCatalog.defaultReasoning("codex", "gpt-6-luna"), "Codex reasoning default");
+		assertEquals("fast", AgentControlCatalog.defaultServiceTier("codex", "gpt-6-luna"), "Codex speed default");
 		assertEquals("gemini-3.1-pro", AgentControlCatalog.defaultModel("gemini"), "Gemini model default");
 		assertEquals("thinking", AgentControlCatalog.defaultReasoning("gemini", "claude-sonnet-4-6"),
 				"Claude actors use the Gemini catalog's model-specific reasoning");
@@ -135,21 +147,23 @@ public final class AgentControlVerification {
 				AgentControlCatalog.displayName("kimi", "kimi-code/kimi-for-coding-highspeed"),
 				"Kimi aliases use the installed CLI display name instead of a guessed label");
 		assertEquals(List.of("low", "medium", "high", "xhigh", "max", "ultra"),
-				AgentControlCatalog.reasoningEfforts("codex", "gpt-5.6-sol"), "Codex effort choices");
-		assertEquals(List.of("priority", "fast"), AgentControlCatalog.serviceTiers("codex", "gpt-5.6-sol"),
+				AgentControlCatalog.reasoningEfforts("codex", "gpt-6.1-sol"), "Codex effort choices");
+		assertEquals(List.of("priority", "fast"), AgentControlCatalog.serviceTiers("codex", "gpt-6.1-sol"),
 				"Codex speed choices");
-		assertTrue(AgentControlCatalog.hasSpeedMode("codex", "gpt-5.6-sol"),
+		assertTrue(AgentControlCatalog.hasSpeedMode("codex", "gpt-6.1-sol"),
 				"Codex exposes speed mode only when the live profile advertises it");
+		assertEquals(List.of("gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"), AgentControlCatalog.models("codex"),
+				"only the selected GPT-6 Codex models are offered for new agents");
 		assertTrue(!AgentControlCatalog.hasSpeedMode("gemini", "gemini-3.1-pro"),
 				"providers without a speed capability do not show a fake speed choice");
 		expectFailure(() -> AgentControlCatalog.defaultModel("unknown"), "unknown provider");
-		return 20;
+		return 21;
 	}
 
 	private static int verifyCommandConstruction() {
 		assertEquals(
-				"codex summon-configured codex gpt-5.6-sol high fast survival \"Builder One\"",
-				AgentControlCommandBuilder.summon("codex", "gpt-5.6-sol", "high", "Builder One"),
+				"codex summon-configured codex gpt-6.1-sol high fast survival \"Builder One\"",
+				AgentControlCommandBuilder.summon("codex", "gpt-6.1-sol", "high", "Builder One"),
 				"Codex summon command"
 		);
 		assertEquals(
@@ -158,9 +172,9 @@ public final class AgentControlVerification {
 				"Kimi summon command"
 		);
 		assertEquals(
-				"codex summon-configured codex gpt-5.6-sol ultra fast survival Speedy",
+				"codex summon-configured codex gpt-6.1-sol ultra fast survival Speedy",
 				AgentControlCommandBuilder.summon(
-						"codex", "gpt-5.6-sol", "ultra", "fast", "Speedy", AgentGameMode.SURVIVAL),
+						"codex", "gpt-6.1-sol", "ultra", "fast", "Speedy", AgentGameMode.SURVIVAL),
 				"Codex fast-mode command"
 		);
 		assertEquals(
@@ -236,24 +250,32 @@ public final class AgentControlVerification {
 	private static int verifyRuntimeCatalogBecomesAuthoritative() {
 		List<AgentControlModelOption> live = List.of(
 				new AgentControlModelOption(
-						"codex", "gpt-future", "GPT Future", List.of("medium", "ultra"), List.of("priority", "fast")
+						"codex", "gpt-6.1-sol", "GPT-6.1 Sol", List.of("medium", "ultra"), List.of("priority", "fast")
+				),
+				new AgentControlModelOption(
+						"codex", "gpt-6-sol", "GPT 6 Sol", List.of("high"), List.of("fast")
+				),
+				new AgentControlModelOption(
+						"codex", "gpt-5.6-sol", "GPT 5.6 Sol", List.of("high"), List.of("fast")
 				),
 				new AgentControlModelOption(
 						"kimi", "kimi-code/live", "Kimi Live", List.of("high"), List.of()
 				)
 		);
 		try {
-			AgentControlCatalog.installRuntimeCatalog(live);
+			AgentControlCatalog.installRuntimeCatalog(AgentControlCatalog.selectableOptions(live));
 			assertEquals(List.of("codex", "kimi"), AgentControlCatalog.providers(),
 					"runtime catalog controls provider order");
-			assertEquals(List.of("gpt-future"), AgentControlCatalog.models("codex"),
-					"runtime catalog controls model choices");
-			assertEquals("GPT Future", AgentControlCatalog.displayName("codex", "gpt-future"),
+			assertEquals(List.of("gpt-6.1-sol"), AgentControlCatalog.models("codex"),
+					"runtime catalog offers only the selected Codex roster");
+			assertEquals("GPT-6.1 Sol", AgentControlCatalog.displayName("codex", "gpt-6.1-sol"),
 					"runtime catalog preserves provider display names");
-			assertEquals(List.of("medium", "ultra"), AgentControlCatalog.reasoningEfforts("codex", "gpt-future"),
+			assertEquals(List.of("medium", "ultra"), AgentControlCatalog.reasoningEfforts("codex", "gpt-6.1-sol"),
 					"runtime catalog controls reasoning choices");
-			assertEquals(List.of("priority", "fast"), AgentControlCatalog.serviceTiers("codex", "gpt-future"),
+			assertEquals(List.of("priority", "fast"), AgentControlCatalog.serviceTiers("codex", "gpt-6.1-sol"),
 					"runtime catalog controls speed choices");
+			assertEquals(2, AgentControlCatalog.selectableOptions(live).size(),
+					"server snapshots omit old Codex models while retaining other providers");
 			AgentControlSnapshot snapshot = new AgentControlSnapshot(
 					AgentControlSnapshot.SCHEMA_VERSION, true, true, "Automation ready", NOW_EPOCH_MS, List.of(), live
 			);
@@ -262,14 +284,14 @@ public final class AgentControlVerification {
 		} finally {
 			AgentControlCatalog.resetRuntimeCatalog();
 		}
-		assertEquals("gpt-5.6-luna", AgentControlCatalog.defaultModel("codex"),
+		assertEquals("gpt-6-luna", AgentControlCatalog.defaultModel("codex"),
 				"disconnect reset restores the safe fallback catalog");
-		assertEquals(List.of("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-sol-wm"),
-				AgentControlCatalog.models("codex").subList(0, 4),
-				"fallback model sequence remains Luna, Terra, Sol, Sol WM");
+		assertEquals(List.of("gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"),
+				AgentControlCatalog.models("codex"),
+				"fallback model sequence contains the selected GPT-6 roster");
 		assertTrue(!AgentControlCatalog.models("codex").contains("codex-auto-review"),
 				"fallback model sequence omits provider-internal hidden models");
-		return 9;
+		return 10;
 	}
 
 	private static int verifyActionSafety() {

@@ -5,6 +5,7 @@ import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.protocol.ActionType;
 import dev.agaminggod.arenaagents.server.runtime.ActionProvenance;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionProgress;
+import dev.agaminggod.arenaagents.server.runtime.ServerActionObservation;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionRequest;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionResult;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionState;
@@ -26,7 +27,8 @@ public final class AgentVerbosePresentationVerification {
 		verifyProgressMilestones();
 		verifyRespawnActionStart();
 		verifyReadablePhysicalEvents();
-		return 70;
+		verifyObservedProgressIsReadable();
+		return 78;
 	}
 
 	private static void verifyCuratedLabels() {
@@ -178,6 +180,45 @@ public final class AgentVerbosePresentationVerification {
 
 	private static String rendered(String stage, String message) {
 		return AgentVerboseChat.line("Sol", "codex", stage, message).getString();
+	}
+
+	private static void verifyObservedProgressIsReadable() {
+		var position = new ServerActionObservation.Position(11, 88, 1);
+		var mining = new ServerActionObservation(null, 2_000L, position, null, 0, 0,
+				new ServerActionObservation.Collision(true, false, false),
+				new ServerActionObservation.RayTarget("block", position, "minecraft:oak_leaves", "north", 2.92),
+				new ServerActionObservation.Reach(2.92, 4.5, true),
+				new ServerActionObservation.Target("block", position, "minecraft:oak_leaves", "minecraft:oak_leaves",
+						null, null, false, 0.0, null, null),
+				new ServerActionObservation.Progress(0.25, "block_damage", true));
+		var progress = new ServerActionProgress(AGENT_ID, 1L, "mine", ActionType.BREAK_BLOCK, null,
+				0.25, 1_000L, 2_000L, mining);
+		assertEquals("Mining oak leaves: 25% complete.", AgentActivityPresentation.progress(progress, 25),
+				"the screenshot's structured mining evidence is presented as ordinary prose");
+		assertEquals("[Sol] Progress: Mining oak leaves: 25% complete.",
+				rendered("progress", AgentVerboseChat.sanitizeMessage(AgentActivityPresentation.progress(progress, 25))),
+				"the final chat line contains no registry ID or diagnostic key/value fields");
+		var movement = new ServerActionObservation(null, 2_000L, position, null, 0, 0,
+				null, null, null,
+				new ServerActionObservation.Target("position", position, null, null, null, null, null, 2.42, 1.0, true),
+				new ServerActionObservation.Progress(0.5, "world_position", true));
+		var move = new ServerActionProgress(AGENT_ID, 1L, "move", ActionType.NAVIGATE_TO, null,
+				0.5, 1_000L, 2_000L, movement);
+		assertEquals("50% there. 2.4 blocks to go.", AgentActivityPresentation.progress(move, 50),
+				"remaining movement distance is readable without internal tolerance or basis fields");
+		assertEquals("25% complete.", AgentActivityPresentation.progress(progress(request("basic", ActionType.BREAK_BLOCK), 0.25), 25),
+				"actions without optional observations still have readable progress");
+		assertEquals("Crafted the item.", verboseResult(result(request("craft", ActionType.CRAFT_TABLE),
+				ServerActionState.SUCCEEDED, "CRAFT_CONFIRMED", "One vanilla recipe transaction completed with remainder handling", 1)),
+				"successful crafting hides implementation details");
+		assertEquals("Picked up the item.", verboseResult(result(request("pickup", ActionType.PICK_UP_ITEM),
+				ServerActionState.SUCCEEDED, "ITEM_PICKED_UP", "Vanilla collision pickup was observed in the player's inventory", 1)),
+				"successful pickup is described plainly");
+		assertEquals("Step complete.", verboseResult(result(request("control", ActionType.CONTROL),
+				ServerActionState.SUCCEEDED, "CONTROL_SEGMENT_COMPLETED", "Control segment completed", 1)),
+				"input segments read as completed steps");
+		assertEquals("Carrying out the next step.", AgentActivityPresentation.actionStart(ActionType.CONTROL),
+				"input-control plumbing is not an action label");
 	}
 
 	private static ServerActionRequest request(String actionId, ActionType type) {

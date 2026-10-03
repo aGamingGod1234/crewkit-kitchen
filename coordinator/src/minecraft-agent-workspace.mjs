@@ -5,6 +5,7 @@ import path from 'node:path';
 
 const AGENTS_TEMPLATE = 'AGENTS.md';
 const SKILL_TEMPLATE = path.join('.codex', 'skills', 'minecraft-control', 'SKILL.md');
+const CONTROL_REFERENCE_TEMPLATE = path.join('.codex', 'skills', 'minecraft-control', 'references', 'control-reference.md');
 const permissionsConfig = (workspaceRoot) => `default_permissions = "minecraft"
 
 [permissions.minecraft.filesystem]
@@ -77,6 +78,13 @@ export class MinecraftAgentWorkspace {
 		const skillInstructions = await this.#readTemplate(SKILL_TEMPLATE);
 		await this.#replace(AGENTS_TEMPLATE, path.join(workspaceRoot, AGENTS_TEMPLATE), instructions);
 		await this.#replace(SKILL_TEMPLATE, path.join(skillRoot, 'SKILL.md'), skillInstructions);
+		// References remain readable within the same dedicated capability root,
+		// without joining the always-loaded instructions or widening permissions.
+		const controlReference = await this.#readOptionalTemplate(CONTROL_REFERENCE_TEMPLATE);
+		if (controlReference !== null) {
+			await this.fs.mkdir(path.join(skillRoot, 'references'), { recursive: true });
+			await this.#replace(CONTROL_REFERENCE_TEMPLATE, path.join(skillRoot, 'references', 'control-reference.md'), controlReference);
+		}
 		return {
 			cwd: workspaceRoot,
 			codexHome: this.codexHome,
@@ -123,13 +131,21 @@ export class MinecraftAgentWorkspace {
 			}
 			return;
 		}
-		// An older installation has no baseline. Preserve any independently refreshed auth.
-		if (this.#lastSyncedSourceAuthHash === undefined) return this.#rememberSourceAuthHash(sourceHash);
 		if (sourceContent == null) {
-			if (isolatedHash === this.#lastSyncedSourceAuthHash) await this.fs.rm(destination, { force: true });
+			if (this.#lastSyncedSourceAuthHash !== undefined && isolatedHash === this.#lastSyncedSourceAuthHash) await this.fs.rm(destination, { force: true });
 			await this.#rememberSourceAuthHash(null);
 			return;
 		}
+		// Both homes may refresh the same login independently. Prefer the more recent
+		// refresh even when the source file itself has not changed since the last sync.
+		if (hasNewerSourceAuth(sourceContent, isolatedContent)) {
+			await this.#replaceContent(sourceContent, destination, 0o600);
+			await this.#rememberSourceAuthHash(sourceHash);
+			return;
+		}
+		// With no baseline, keep independently refreshed auth unless the source is
+		// demonstrably newer for the same account.
+		if (this.#lastSyncedSourceAuthHash === undefined) return this.#rememberSourceAuthHash(sourceHash);
 		if (sourceHash === this.#lastSyncedSourceAuthHash) return;
 		if (isolatedHash === this.#lastSyncedSourceAuthHash) {
 			await this.#replaceContent(sourceContent, destination, 0o600);
@@ -144,6 +160,15 @@ export class MinecraftAgentWorkspace {
 
 	async #readTemplate(template) {
 		return this.fs.readFile(path.join(this.templateRoot, template), 'utf8');
+	}
+
+	async #readOptionalTemplate(template) {
+		try {
+			return await this.#readTemplate(template);
+		} catch (error) {
+			if (error?.code !== 'ENOENT') throw error;
+			return null;
+		}
 	}
 
 	async #replace(template, destination, content = undefined) {
@@ -181,4 +206,20 @@ export class MinecraftAgentWorkspace {
 
 function authHash(content) {
 	return content === null ? null : createHash('sha256').update(content).digest('hex');
+}
+
+function hasNewerSourceAuth(sourceContent, isolatedContent) {
+	try {
+		const source = JSON.parse(sourceContent);
+		const isolated = JSON.parse(isolatedContent);
+		const sourceAccount = source?.tokens?.account_id;
+		const isolatedAccount = isolated?.tokens?.account_id;
+		if (typeof sourceAccount !== 'string' || !sourceAccount || sourceAccount !== isolatedAccount
+			|| source?.auth_mode !== isolated?.auth_mode) return false;
+		const sourceRefresh = Date.parse(source.last_refresh);
+		const isolatedRefresh = Date.parse(isolated.last_refresh);
+		return Number.isFinite(sourceRefresh) && Number.isFinite(isolatedRefresh) && sourceRefresh > isolatedRefresh;
+	} catch {
+		return false;
+	}
 }

@@ -138,7 +138,7 @@ public record AgentControlSnapshot(
 
 	private static AgentControlAgent fromRecord(AgentRecord record) {
 		Objects.requireNonNull(record, "records must not contain null");
-		String displayName = AgentIdentity.displayName(record.agentId(), record.profile());
+		String displayName = AgentIdentity.displayNameTag(record.profile());
 		String currentGoal = record.currentGoal().map(goal -> goal.prompt()).orElse("");
 		return new AgentControlAgent(
 				record.agentId().toString(),

@@ -64,7 +64,7 @@ public final class AgentControlClient {
 			GLFW.GLFW_KEY_H,
 			KEY_CATEGORY
 	));
-	private static final AgentControlSnapshotStore SNAPSHOTS = new AgentControlSnapshotStore();
+	private static final AgentControlSnapshotStore SNAPSHOTS = AgentClientRoster.snapshots();
 	private static final ArenaSpectatorState SPECTATOR_STATE = new ArenaSpectatorState();
 	private static final ScenarioBuildProgressState BUILD_PROGRESS_STATE = new ScenarioBuildProgressState();
 	private static final SpectatorCameraAssistant CAMERA_ASSISTANT = new SpectatorCameraAssistant();
@@ -87,6 +87,8 @@ public final class AgentControlClient {
 		if (registered) {
 			return;
 		}
+		ClientPlayNetworking.registerGlobalReceiver(dev.agaminggod.arenaagents.control.LiveTaskViewPayload.Snapshot.TYPE,
+				(payload, context) -> context.client().execute(() -> LiveAgentWindows.accept(payload)));
 		ClientPlayNetworking.registerGlobalReceiver(dev.agaminggod.arenaagents.control.DirectorSnapshotPayload.TYPE,
 				(payload, context) -> context.client().execute(() -> {
 					if (!DirectorClientState.accept(payload)) return;
@@ -166,7 +168,7 @@ public final class AgentControlClient {
 	}
 
 	public static Optional<dev.agaminggod.arenaagents.control.AgentControlAgent> agentForPlayer(String profileName) {
-		return SNAPSHOTS.current().flatMap(snapshot -> AgentPlayerIdentity.find(snapshot, profileName));
+		return AgentClientRoster.agentForPlayer(profileName);
 	}
 
 	public static boolean isAgentPlayer(String profileName) {
@@ -304,6 +306,7 @@ public final class AgentControlClient {
 	}
 
 	private static void tick(Minecraft client) {
+		LiveAgentWindows.tick(client);
 		while (OPEN_CONTROL.consumeClick()) {
 			if (client.player != null && client.level != null && client.screen == null) {
 				client.setScreen(new AgentControlScreen());
@@ -388,6 +391,7 @@ public final class AgentControlClient {
 	}
 
 	private static void clearConnectionState() {
+		LiveAgentWindows.disconnect();
 		DirectorClientState.clear();
 		SNAPSHOTS.clear();
 		AgentControlCatalog.resetRuntimeCatalog();

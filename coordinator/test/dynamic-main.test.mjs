@@ -371,6 +371,33 @@ test('goal translation request retention has an independent hard cap', async () 
 	}
 });
 
+test('a compiled dragon goal starts through the constrained fallback when optional Luna advice fails', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	let calls = 0;
+	planner.requestGoalSpec = async () => {
+		calls += 1;
+		throw Object.assign(new Error('Luna unavailable'), { code: 'PROVIDER_UNAVAILABLE' });
+	};
+	const run = await start({ registry, planner });
+	const requestId = '00000000-0000-4000-8000-000000000199';
+	try {
+		run.bridge.emit('goal_spec_request', {
+			agentId: 'agent-a',
+			payload: { requestId, originalRequest: 'Beat the game', candidateIds: ['minecraft:ender_dragon'] },
+		});
+		await eventually(() => run.bridge.sent.some(({ type, payload }) => type === 'goal_spec_proposal' && payload.requestId === requestId));
+		assert.equal(calls, 1);
+		assert.deepEqual(run.bridge.sent.find(({ type, payload }) => type === 'goal_spec_proposal' && payload.requestId === requestId).payload.predicate,
+			{ type: 'entity_killed_by_agent', entityType: 'minecraft:ender_dragon', afterGoalStart: true });
+		run.bridge.emit('goal_spec_result', {
+			agentId: 'agent-a', payload: { requestId, status: 'accepted', reasonCode: 'PROPOSAL_ACTIVATED' },
+		});
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
 test('goal translation retries provider failure and retransmits until Minecraft acknowledges it', async () => {
 	const timers = new ManualTimerQueue();
 	const registry = new AgentRegistry();
@@ -3503,6 +3530,63 @@ class ManualTimerQueue {
 	}
 }
 
+test('live task view polling uses the bridge without starting planner work and rejects stale revisions', async () => {
+	const run = await start();
+	try {
+		const current = run.registry.get('agent-a');
+		const before = run.planner.requests.length;
+		run.bridge.emit('task_view_request', { agentId: current.agentId, payload: { goalRevision: current.goalRevision } });
+		await eventually(() => run.bridge.sent.some((message) => message.type === 'task_view'));
+		const view = run.bridge.sent.find((message) => message.type === 'task_view');
+		validateProtocolV2Payload('task_view', view.payload);
+		assert.equal(view.payload.goalRevision, current.goalRevision);
+		assert.equal(run.planner.requests.length, before);
+		const replies = run.bridge.sent.filter((message) => message.type === 'task_view').length;
+		run.bridge.emit('task_view_request', { agentId: current.agentId, payload: { goalRevision: current.goalRevision + 1 } });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(run.bridge.sent.filter((message) => message.type === 'task_view').length, replies);
+	} finally { await run.coordinator.stop(); }
+});
+
+test('live task view start and replacement clear prior plans and output while resume retains the task', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	let releaseTurn, published = false;
+	const turnGate = new Promise((resolve) => { releaseTurn = resolve; });
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		if (request.goalRevision === 1) {
+			await request.executeTool({ agentId: request.agentId, goalRevision: 1, turnId: 'plan-window-turn', callId: 'plan-window-call', tool: { kind: 'task_plan', operation: 'replace', plan: { steps: [
+				{ id: 'past', label: 'Previous milestone', kind: 'milestone', status: 'complete', dependsOn: [], detail: 'Previous task only', evidence: null },
+			] } } });
+			request.onVerbose('live_tool', 'Previous task output');published = true;
+		}
+		await turnGate;return { status: 'completed', toolCalls: 1 };
+	};
+	const run = await start({ registry, planner, config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } } });
+	const poll = async () => {
+		const current = registry.get('agent-a'), before = run.bridge.sent.filter(message => message.type === 'task_view').length;
+		run.bridge.emit('task_view_request', { agentId: 'agent-a', payload: { goalRevision: current.goalRevision } });
+		await eventually(() => run.bridge.sent.filter(message => message.type === 'task_view').length > before);
+		return run.bridge.sent.filter(message => message.type === 'task_view').at(-1).payload;
+	};
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Repeat the same task.' } });
+		const observation = factToWireObservation({ player: { x: 0, y: 64, z: 0, health: 20 } }, 1, 1, false, 1);observation.world.worldId = 'plan-window-test-world';
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: observation });await eventually(() => published);
+		assert.equal((await poll()).plan.steps[0].status, 'complete');
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'stop', goalRevision: 2 } });await eventually(() => registry.get('agent-a').goalRevision === 2);
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'resume', goalRevision: 3 } });await eventually(() => registry.get('agent-a').goalRevision === 3);
+		assert.equal((await poll()).plan.steps[0].status, 'complete');
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'replace', goalRevision: 4, goal: 'Repeat the same task.' } });await eventually(() => registry.get('agent-a').goalRevision === 4);
+		let view = await poll();assert.equal(view.plan, null);assert.equal(view.events.some(event => event.message === 'Previous task output'), false);
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'complete', goalRevision: 5 } });await eventually(() => registry.get('agent-a').goalRevision === 5);
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 6, goal: 'Repeat the same task.' } });await eventually(() => registry.get('agent-a').goalRevision === 6);
+		view = await poll();assert.equal(view.plan, null);assert.equal(view.events.some(event => event.message === 'Previous task output'), false);
+		const before = planner.requests.length;for(let i=0;i<3;i++)await poll();assert.equal(planner.requests.length,before,'display polling cannot start any model turn');
+	} finally { releaseTurn();await run.coordinator.stop(); }
+});
+
 async function start(dependencies = {}) {
 	const bridge = dependencies.bridge ?? new FakeBridge();
 	const registry = dependencies.registry ?? new AgentRegistry();
@@ -4159,6 +4243,42 @@ test('acknowledges and idempotently replays one composite conversation wake', as
 		assert.equal(run.planner.requests[0].input.split('Can you respond?').length - 1, 1,
 			'replay keeps exactly one copy of the conversation in planner memory');
 		assert.deepEqual(runtimeErrors, []);
+	} finally { await run.coordinator.stop(); }
+});
+
+test('a direct new task wakes the native agent from an active goal and retires the prior revision', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestNativeTurn = async request => {
+		planner.requests.push(request);
+		return { status: 'completed', toolCalls: 1 };
+	};
+	const run = await start({ registry, planner, config: {
+		bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' },
+	} });
+	const errors = [];
+	run.coordinator.on('runtimeError', error => errors.push(error));
+	const observe = (goalRevision, eventSequence) => run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+		goalRevision, eventSequence,
+		observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+	} });
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Get stone tools.' } });
+		observe(1, 1);
+		await eventually(() => planner.requests.length === 1);
+		run.bridge.emit('conversation_wake', { agentId: 'agent-a', payload: {
+			transactionId: 'replace-stone-with-iron',
+			event: { sequence: 1, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
+				text: 'Nice, can you get some iron tools now?', goalRevision: 1, observedAtEpochMs: 1_787_184_000_002 },
+			control: { operation: 'replace', goalRevision: 2, goal: 'Get iron tools.', updatedAtEpochMs: Date.now(),
+				goalSpec: immutableGoalSpec('Get iron tools.', { type: 'inventory_contains', itemId: 'minecraft:iron_pickaxe', count: 1 }) },
+		} });
+		await eventually(() => run.bridge.sent.some(message => message.type === 'conversation_wake_ack' && message.payload.goalRevision === 2));
+		observe(2, 2);
+		await eventually(() => planner.requests.some(request => request.goalRevision === 2));
+		assert.equal(registry.get('agent-a').currentGoal, 'Get iron tools.');
+		assert.match(planner.requests.find(request => request.goalRevision === 2).input, /Nice, can you get some iron tools now\?/);
+		assert.deepEqual(errors, []);
 	} finally { await run.coordinator.stop(); }
 });
 
@@ -5139,7 +5259,7 @@ test('coalesces a burst of two hundred quiet wire observations without losing th
 test('Director generation handles cast-only requests once and never sends world actions', async () => {
  const provider=new FakeProvider(); let creations=0;
  provider.createAgent=async(profile,options)=>{
-  creations++; assert.equal(profile.model,'gpt-5.6-luna'); assert.equal(profile.reasoningEffort,'low'); assert.equal(options.controlProtocol,'director_script');
+  creations++; assert.equal(profile.model,'gpt-6-luna'); assert.equal(profile.reasoningEffort,'low'); assert.equal(options.controlProtocol,'director_script');
   return {setGoalRevision:async()=>{},decide:async(prompt,options)=>options.parseOutput(JSON.stringify({steps:[{action:'jump',arguments:'',destination:'start',right:0,up:0,forward:0}]}))};
  };
  provider.removeAgent=async()=>{};
@@ -5192,7 +5312,7 @@ test('a background native routine continues during delayed reconsideration and s
 		if (!handle) {
 			handle = await request.executeTool({ agentId: request.agentId, goalRevision: request.goalRevision,
 				turnId: 'background-turn', callId: 'background-call', tool: { kind: 'run_program', background: true,
-					source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2); await player.wait(3);' } });
+					source: 'program.onUnhandledAttention("continue_and_notify", {survival:"continue_and_notify"}); await player.wait(1); await player.wait(2); await player.wait(3);' } });
 		}
 		returned = true;
 		return { status: 'completed', toolCalls: 1 };
@@ -5229,6 +5349,50 @@ test('a background native routine continues during delayed reconsideration and s
 	} finally { releaseDecision(); await run.coordinator.stop(); }
 });
 
+
+test('native coordinator keeps chosen cave legs moving until authored missing-geometry reassessment', async () => {
+	const registry = new AgentRegistry(), planner = new FakePlanner(registry);
+	let handle, releaseDecision;
+	const decisionGate = new Promise(resolve => { releaseDecision = resolve; });
+	planner.requestNativeTurn = async request => {
+		planner.requests.push(request);
+		if (planner.requests.length > 1) await decisionGate;
+		else handle = await request.executeTool({ agentId:request.agentId, goalRevision:request.goalRevision, turnId:'cave-route', callId:'chosen-legs', tool:{kind:'run_program',background:true,
+			source:`program.onUnhandledAttention("pause_and_notify", {reassessWhen:() => world.blocks({x:6,y:63,z:2,blockId:"minecraft:stone"}).length !== 1 || world.entities().length > 0});
+				for (const leg of program.parameters().legs) {
+					const moved = await player.navigateTo({x:leg.x,y:leg.y,z:leg.z,tolerance:0.4,sprint:false,timeoutMs:5000});
+					if (!moved.succeeded) program.checkpoint(moved.reason);
+				}`,
+			parameters:{legs:[{x:3,y:64,z:0},{x:6,y:64,z:2},{x:8,y:65,z:2}]},timeoutMs:30000,
+		} });
+		return {status:'completed',toolCalls:1};
+	};
+	const run = await start({registry,planner,goalSupervisor:new RecordingGoalSupervisor(),config:{bridge:{port:25570,secret:'s'.repeat(32)},codex:{controlProtocol:'native_tools'}}});
+	const commands = () => run.bridge.sent.filter(message => message.type === 'action_command');
+	const push = (changes) => {
+		const previous = run.bridge.latestObservations.get('agent-a');
+		run.bridge.emit('observation',{agentId:'agent-a',payload:{...previous,eventSequence:run.bridge.latestSequences.get('agent-a')+1,attention:true,changedFacts:['position','blocks'],...changes}});
+	};
+	try {
+		run.bridge.emit('goal_control',{agentId:'agent-a',payload:{operation:'start',goalRevision:1,goal:'Traverse the observed cave route.'}});
+		run.bridge.emit('observation',{agentId:'agent-a',payload:{goalRevision:1,eventSequence:1,observation:{player:{x:0,y:64,z:0,health:20},items:[],entities:[],blocks:[{blockId:'minecraft:stone',x:6,y:63,z:2}],inventory:{items:[],tagCounts:{}}}}});
+		await eventually(() => handle && commands().length === 1);
+		for (const x of [1,2]) { push({position:{x,y:64,z:0}}); await new Promise(resolve => setImmediate(resolve)); }
+		assert.equal(planner.requests.length,1,'fresh known-route progress does not request another model turn');
+		assert.equal(run.bridge.sent.some(message => message.type === 'action_cancel'),false);
+		run.bridge.emit('action_result',{agentId:'agent-a',payload:{goalRevision:1,actionId:commands()[0].payload.actionId,state:'SUCCEEDED',reasonCode:'DESTINATION_REACHED',eventSequence:run.bridge.latestSequences.get('agent-a')+1}});
+		await eventually(() => commands().length === 2);
+		assert.deepEqual(commands().map(message => message.payload.arguments.x),[3,6]);
+		assert.equal(commands()[1].payload.provenance.programId,handle.programId);
+		assert.ok(run.bridge.sent.filter(message => message.type === 'inspection_request').every(message => message.payload.query.section === 'observation'),'continuation samples facts without reading broad block pages');
+		push({blocks:[]});
+		await eventually(() => planner.requests.length === 2 && run.bridge.sent.some(message => message.type === 'action_cancel' && message.payload.actionId === commands()[1].payload.actionId));
+		assert.match(planner.requests[1].input,/program_attention/);
+		run.bridge.emit('action_result',{agentId:'agent-a',payload:{goalRevision:1,actionId:commands()[1].payload.actionId,state:'CANCELLED',reasonCode:'INPUT_RELEASED',eventSequence:run.bridge.latestSequences.get('agent-a')+1}});
+		await new Promise(resolve => setImmediate(resolve));
+		assert.equal(commands().length,2,'the next leg waits for the sole main agent after missing geometry');
+	} finally {releaseDecision();await run.coordinator.stop();}
+});
 
 test('measured planning lead steers the same native turn once while its routine keeps executing', async () => {
 	const registry = new AgentRegistry();
@@ -5331,6 +5495,97 @@ test('a slow planning advisory does not block urgent steering or consume convers
 	}
 });
 
+for (const providerEnd of ['failure', 'expiry']) {
+	for (const startsSuccessor of [false, true]) {
+		const body = startsSuccessor ? 'a started successor' : 'the original routine';
+		test(`native preparation ${providerEnd} preserves ${body} after advisory steering`, async (t) => {
+			t.mock.timers.enable({ apis: ['setTimeout'] });
+			const registry = new AgentRegistry();
+			const planner = new FakePlanner(registry);
+			const supervisor = new RecordingGoalSupervisor();
+			const providerLeases = [];
+			const begin = supervisor.begin.bind(supervisor);
+			supervisor.begin = (key, kind) => {
+				const token = begin(key, kind);
+				if (kind === 'provider') providerLeases.push({ key, lease: { kind, operationId: token.operationId } });
+				return token;
+			};
+			const steers = [];
+			let handle, releaseTurn;
+			const turnGate = new Promise(resolve => { releaseTurn = resolve; });
+			planner.getNativeDecisionTiming = () => ({ count: 4, p50Ms: 500, p95Ms: 999 });
+			planner.steerNativeTurn = async request => { steers.push(request); };
+			planner.requestNativeTurn = async request => {
+				planner.requests.push(request);
+				if (planner.requests.length > 1) return { status: 'completed', toolCalls: 0 };
+				handle = await request.executeTool({ agentId: request.agentId, goalRevision: request.goalRevision,
+					turnId: 'steered-preparation', callId: 'initial-program', tool: { kind: 'run_program', background: true,
+						timeoutMs: 30_000, expectedDurationMs: 1000, maxActions: 2,
+						source: `program.onUnhandledAttention("continue_and_notify"); await player.wait(1);${startsSuccessor ? '' : ' await player.wait(2);'}` } });
+				await turnGate;
+				if (providerEnd === 'failure') throw Object.assign(new Error('Prepared provider turn failed'), { code: 'TEST_PREPARATION_FAILED' });
+				return { status: 'completed', toolCalls: startsSuccessor ? 2 : 1 };
+			};
+			const run = await start({ registry, planner, goalSupervisor: supervisor,
+				config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } } });
+			const commands = () => run.bridge.sent.filter(message => message.type === 'action_command');
+			const finish = command => run.bridge.emit('action_result', { agentId: 'agent-a', payload: {
+				goalRevision: 1, actionId: command.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE',
+				eventSequence: run.bridge.latestSequences.get('agent-a') + 1,
+			} });
+			try {
+				run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Keep the authorised routine moving.' } });
+				const wire = factToWireObservation({ player: { x: 0, y: 64, z: 0, health: 20 } }, 1, 1, false, 1);
+				wire.world.worldId = 'prepared-handoff-test-world';
+				run.bridge.emit('observation', { agentId: 'agent-a', payload: wire });
+				await eventually(() => handle && commands().length === 1);
+				t.mock.timers.tick(1);
+				await eventually(() => steers.length === 1);
+				assert.match(steers[0].input, /program_planning_due/);
+				assert.equal(planner.requests.length, 1, 'the advisory belongs to the original selected-agent turn');
+
+				let continuingProgramId = handle.programId;
+				if (startsSuccessor) {
+					const queued = await planner.requests[0].executeTool({ agentId: 'agent-a', goalRevision: 1,
+						turnId: 'steered-preparation', callId: 'prepared-successor', tool: { kind: 'queue_program',
+							afterProgramId: handle.programId, goalRevision: 1, programVersion: handle.programVersion,
+							source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(7); await player.wait(8);',
+							precondition: 'player.state().health === 20', maxActions: 2, timeoutMs: 30_000 } });
+					assert.equal(queued.state, 'QUEUED');
+					finish(commands()[0]);
+					await eventually(() => commands().length === 2);
+					continuingProgramId = commands()[1].payload.provenance.programId;
+					assert.notEqual(continuingProgramId, handle.programId);
+					assert.equal(commands()[1].payload.arguments.durationMs, 7);
+					assert.equal(planner.requests.length, 1, 'handoff must not start a duplicate planner turn');
+				}
+
+				if (providerEnd === 'expiry') {
+					assert.equal(providerLeases.length, 1);
+					run.coordinator.handleLeaseExpired(providerLeases[0]);
+					await eventually(() => planner.interruptions.includes('agent-a'));
+					releaseTurn();
+				} else {
+					releaseTurn();
+					await eventually(() => run.bridge.sent.some(message => message.type === 'agent_error' && message.payload.code === 'TEST_PREPARATION_FAILED'));
+				}
+				await new Promise(resolve => setImmediate(resolve));
+				assert.equal(run.bridge.sent.some(message => message.type === 'action_cancel'), false, 'provider preparation cannot cancel authorised body work');
+				assert.notEqual(registry.get('agent-a').state, DynamicAgentState.ERROR);
+				const before = commands().length;
+				finish(commands().at(-1));
+				await eventually(() => commands().length === before + 1);
+				assert.equal(commands().at(-1).payload.provenance.programId, continuingProgramId);
+				assert.equal(commands().at(-1).payload.arguments.durationMs, startsSuccessor ? 8 : 2);
+				assert.equal(planner.requests.length, 1, 'ordinary progress and a handoff must not replay a pending planner turn');
+			} finally {
+				releaseTurn();
+				await run.coordinator.stop();
+			}
+		});
+	}
+}
+
 test('stopping a native routine suppresses its pending planning reminder', async (t) => {
 	// Keep the one-millisecond reminder pending until the stop is delivered.
 	// A real timer can legitimately fire while eventually() yields on a busy host.
@@ -5365,6 +5620,44 @@ test('stopping a native routine suppresses its pending planning reminder', async
 		await new Promise((resolve) => setImmediate(resolve));
 		assert.equal(steers.length, 0, 'a stopped program cannot deliver its queued reminder');
 		assert.equal(planner.requests.length, 1, 'stopping the body cannot create a successor model turn');
+	} finally {
+		releaseTurn();
+		await run.coordinator.stop();
+	}
+});
+
+test('native coordinator ingress preserves infinite effects through planning and fresh observe', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	let observed, releaseTurn;
+	const turnGate = new Promise((resolve) => { releaseTurn = resolve; });
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		observed = await request.executeTool({ agentId: request.agentId, goalRevision: request.goalRevision,
+			turnId: 'infinite-effect-turn', callId: 'observe-effects', tool: { kind: 'observe' } });
+		await turnGate;
+		return { status: 'completed', toolCalls: 1 };
+	};
+	const run = await start({ registry, planner,
+		config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } } });
+	const runtimeErrors = [];
+	run.coordinator.on('runtimeError', (error) => runtimeErrors.push(error));
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Observe my active effects.' } });
+		const payload = factToWireObservation({ player: { x: 0, y: 64, z: 0, health: 20 } }, 1, 1, false, 1);
+		payload.player.effects = [
+			{ effectId: 'minecraft:speed', amplifier: 0, duration: 120 },
+			{ effectId: 'minecraft:haste', amplifier: 1, duration: -1 },
+		];
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: validateProtocolV2Payload('observation', payload) });
+		await eventually(() => observed !== undefined);
+		assert.equal(planner.requests.length, 1);
+		assert.equal(observed.freshness.fresh, true);
+		assert.ok(observed.eventSequence > payload.eventSequence, 'native observe completes with a newer server sample');
+		assert.deepEqual(observed.observation.player.effects, payload.player.effects);
+		assert.deepEqual(runtimeErrors, []);
+		assert.equal(run.bridge.sent.some((message) => message.type === 'agent_error'), false);
+		assert.equal(run.bridge.connected, true);
 	} finally {
 		releaseTurn();
 		await run.coordinator.stop();

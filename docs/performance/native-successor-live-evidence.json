@@ -1,0 +1,1050 @@
+{
+  "schemaVersion": 1,
+  "scenarioId": "native-successor-live",
+  "status": "PASSED",
+  "kind": "production_bridge_mechanics",
+  "providerUsed": false,
+  "aiPerformanceMeasured": false,
+  "fixtureAuthorship": "deterministic test script with declared selected-agent profile provenance",
+  "entryPoint": "normalizeMinecraftToolCall -> NativeToolRuntime -> authenticated MultiplexedServerBridge -> installed Fabric mod",
+  "observationEntryPoint": "passive inspection_request(section:observation), plus production observation/action_progress/action_result callbacks",
+  "fixtureSetupUsesOperatorCommands": true,
+  "checks": [
+    {
+      "name": "parameterized routine and ready queued successor execute real independent programs",
+      "status": "PASSED",
+      "elapsedMs": 1822,
+      "evidence": {
+        "predecessorProgramId": "native-program-native-successor-live-1",
+        "successorProgramId": "native-program-native-successor-live-5",
+        "sameSourceSha256": "6e2ef2c55fd2e587ad5e5d183994776a8809194f5627129f2811663d529a7158",
+        "authoredSourceUnchanged": true,
+        "expectedActionSha256": "d33e16599b815415cdcbaff15ba23dba8238782de7376c505ff9640ae8a0406a",
+        "actualActionSha256": "d33e16599b815415cdcbaff15ba23dba8238782de7376c505ff9640ae8a0406a",
+        "selectedProfilePreserved": true,
+        "actions": [
+          {
+            "actionType": "wait",
+            "arguments": {
+              "durationMs": 1200
+            }
+          },
+          {
+            "actionType": "look_at",
+            "arguments": {
+              "x": 2.5,
+              "y": 65.5,
+              "z": 0.5
+            }
+          },
+          {
+            "actionType": "wait",
+            "arguments": {
+              "durationMs": 100
+            }
+          },
+          {
+            "actionType": "look_at",
+            "arguments": {
+              "x": 0.5,
+              "y": 65.5,
+              "z": 3.5
+            }
+          }
+        ],
+        "successorMaxActions": 2,
+        "successorTimeoutMs": 3000,
+        "predecessorMaxActions": 2,
+        "predecessorTimeoutMs": 5000,
+        "handoffGapMs": 77.4349000000002,
+        "physicalLookResults": [
+          {
+            "state": "SUCCEEDED",
+            "reasonCode": "ACTION_COMPLETED",
+            "physicalAttempted": true
+          },
+          {
+            "state": "SUCCEEDED",
+            "reasonCode": "ACTION_COMPLETED",
+            "physicalAttempted": true
+          }
+        ],
+        "finalView": {
+          "yaw": -7.62939453125e-06,
+          "pitch": 2.2905499935150146
+        }
+      }
+    },
+    {
+      "name": "fresh world tick makes an initially true queued precondition false",
+      "status": "PASSED",
+      "elapsedMs": 1409,
+      "evidence": {
+        "queueId": "native-queue-native-successor-live-10",
+        "initiallyTrueGameTime": 87,
+        "maxTick": 92,
+        "freshGameTime": 114,
+        "rejectedReason": "SUCCESSOR_PRECONDITION_FALSE",
+        "successorDispatched": false,
+        "guardObservationReady": true
+      }
+    },
+    {
+      "name": "truthy nonboolean precondition cannot authorize a successor",
+      "status": "PASSED",
+      "elapsedMs": 846,
+      "evidence": {
+        "healthValue": 20,
+        "rejectedReason": "SUCCESSOR_PRECONDITION_FALSE",
+        "successorDispatched": false
+      }
+    },
+    {
+      "name": "optional mine autoAim preserves exact block coordinates and block identity",
+      "status": "PASSED",
+      "elapsedMs": 3964,
+      "evidence": {
+        "target": {
+          "x": 1,
+          "y": 64,
+          "z": 0,
+          "expectedBlockId": "minecraft:oak_log",
+          "timeoutMs": 10000
+        },
+        "defaultMineReasonCode": "TARGET_NOT_VISIBLE",
+        "actualActions": [
+          {
+            "actionType": "look_at",
+            "arguments": {
+              "x": 1.5,
+              "y": 64.5,
+              "z": 0.5
+            }
+          },
+          {
+            "actionType": "break_block",
+            "arguments": {
+              "x": 1,
+              "y": 64,
+              "z": 0,
+              "expectedBlockId": "minecraft:oak_log",
+              "timeoutMs": 10000
+            }
+          }
+        ],
+        "expectedActionSha256": "c1673993cfd3b37fd4609517a3c36cdd6c19b74e010da3c3ad5f8ee34efb4d77",
+        "actualActionSha256": "c1673993cfd3b37fd4609517a3c36cdd6c19b74e010da3c3ad5f8ee34efb4d77",
+        "exactTargetBecameAir": true,
+        "adjacentDecoyUnchanged": true,
+        "inventoryVerifiedBy": [
+          "fresh live observation",
+          "RCON entity Inventory"
+        ],
+        "inventory": [
+          {
+            "itemId": "minecraft:oak_log",
+            "count": 1,
+            "slot": "mainhand",
+            "tags": [
+              "#c:natural_logs",
+              "#c:natural_logs/overworld",
+              "#minecraft:completes_find_tree_tutorial",
+              "#minecraft:logs",
+              "#minecraft:logs_that_burn",
+              "#minecraft:oak_logs"
+            ],
+            "damage": 0,
+            "maxDamage": 0,
+            "displayName": "Oak Log",
+            "fingerprint": "fa6051282077d07257ac82526d3e18dd28e4c1b7038d941c2841e846b838e86d",
+            "maxStackSize": 64
+          }
+        ],
+        "operatorCommandsUsedForMiningOrPickup": false
+      }
+    }
+  ],
+  "actions": [
+    {
+      "traceId": "native-program-native-successor-live-1",
+      "goalRevision": 1,
+      "actionId": "native:native-successor-live:2:c930e9f2-dc13-4fff-a472-c2fd4bbd:1",
+      "actionType": "wait",
+      "arguments": {
+        "durationMs": 1200
+      },
+      "provenance": {
+        "provider": "codex",
+        "model": "gpt-6.1-sol",
+        "reasoningEffort": "medium",
+        "serviceTier": "fast",
+        "traceId": "native-program-native-successor-live-1",
+        "programId": "native-program-native-successor-live-1",
+        "programVersion": 1,
+        "sourceStepId": "step-94-117",
+        "eventSequence": 4
+      },
+      "dispatchedAt": 3877.6511,
+      "result": {
+        "state": "SUCCEEDED",
+        "reasonCode": "ACTION_COMPLETED",
+        "elapsedMs": 1207,
+        "receivedAt": 5167.1979,
+        "executionStarted": true,
+        "physicalAttempted": false
+      }
+    },
+    {
+      "traceId": "native-program-native-successor-live-1",
+      "goalRevision": 1,
+      "actionId": "native:native-successor-live:4:c930e9f2-dc13-4fff-a472-c2fd4bbd:1",
+      "actionType": "look_at",
+      "arguments": {
+        "x": 2.5,
+        "y": 65.5,
+        "z": 0.5
+      },
+      "provenance": {
+        "provider": "codex",
+        "model": "gpt-6.1-sol",
+        "reasoningEffort": "medium",
+        "serviceTier": "fast",
+        "traceId": "native-program-native-successor-live-1",
+        "programId": "native-program-native-successor-live-1",
+        "programVersion": 1,
+        "sourceStepId": "step-125-151",
+        "eventSequence": 19
+      },
+      "dispatchedAt": 5236.1216,
+      "result": {
+        "state": "SUCCEEDED",
+        "reasonCode": "ACTION_COMPLETED",
+        "elapsedMs": 0,
+        "receivedAt": 5260.9227,
+        "executionStarted": true,
+        "physicalAttempted": true
+      }
+    },
+    {
+      "traceId": "native-program-native-successor-live-5",
+      "goalRevision": 1,
+      "actionId": "native:native-successor-live:6:c930e9f2-dc13-4fff-a472-c2fd4bbd:1",
+      "actionType": "wait",
+      "arguments": {
+        "durationMs": 100
+      },
+      "provenance": {
+        "provider": "codex",
+        "model": "gpt-6.1-sol",
+        "reasoningEffort": "medium",
+        "serviceTier": "fast",
+        "traceId": "native-program-native-successor-live-5",
+        "programId": "native-program-native-successor-live-5",
+        "programVersion": 1,
+        "sourceStepId": "step-94-117",
+        "eventSequence": 23
+      },
+      "dispatchedAt": 5338.3576,
+      "result": {
+        "state": "SUCCEEDED",
+        "reasonCode": "ACTION_COMPLETED",
+        "elapsedMs": 156,
+        "receivedAt": 5516.2884,
+        "executionStarted": true,
+        "physicalAttempted": false
+      }
+    },
+    {
+      "traceId": "native-program-native-successor-live-5",
+      "goalRevision": 1,
+      "actionId": "native:native-successor-live:7:c930e9f2-dc13-4fff-a472-c2fd4bbd:1",
+      "actionType": "look_at",
+      "arguments": {
+        "x": 0.5,
+        "y": 65.5,
+        "z": 3.5
+      },
+      "provenance": {
+        "provider": "codex",
+        "model": "gpt-6.1-sol",
+        "reasoningEffort": "medium",
+        "serviceTier": "fast",
+        "traceId": "native-program-native-successor-live-5",
+        "programId": "native-program-native-successor-live-5",
+        "programVersion": 1,
+        "sourceStepId": "step-125-151",
+        "eventSequence": 27
+      },
+      "dispatchedAt": 5531.8494,
+      "result": {
+        "state": "SUCCEEDED",
+        "reasonCode": "ACTION_COMPLETED",
+        "elapsedMs": 5,
+        "receivedAt": 5569.0473,
+        "executionStarted": true,
+        "physicalAttempted": true
+      }
+    },
+    {
+      "traceId": "native-program-native-successor-live-8",
+      "goalRevision": 1,
+      "actionId": "native:native-successor-live:9:c930e9f2-dc13-4fff-a472-c2fd4bbd:1",
+      "actionType": "wait",
+      "arguments": {
+        "durationMs": 1200
+      },
+      "provenance": {
+        "provider": "codex",
+        "model": "gpt-6.1-sol",
+        "reasoningEffort": "medium",
+        "serviceTier": "fast",
+        "traceId": "native-program-native-successor-live-8",
+        "programId": "native-program-native-successor-live-8",
+        "programVersion": 1,
+        "sourceStepId": "step-59-98",
+        "eventSequence": 32
+      },
+      "dispatchedAt": 5662.8184,
+      "result": {
+        "state": "SUCCEEDED",
+        "reasonCode": "ACTION_COMPLETED",
+        "elapsedMs": 1245,
+        "receivedAt": 6943.8578,
+        "executionStarted": true,
+        "physicalAttempted": false
+      }
+    },
+    {
+      "traceId": "native-program-native-successor-live-12",
+      "goalRevision": 1,
+      "actionId": "native:native-successor-live:13:c930e9f2-dc13-4fff-a472-c2fd4bbd:1",
+      "actionType": "wait",
+      "arguments": {
+        "durationMs": 700
+      },
+      "provenance": {
+        "provider": "codex",
+        "model": "gpt-6.1-sol",
+        "reasoningEffort": "medium",
+        "serviceTier": "fast",
+        "traceId": "native-program-native-successor-live-12",
+        "programId": "native-program-native-successor-live-12",
+        "programVersion": 1,
+        "sourceStepId": "step-59-98",
+        "eventSequence": 49
+      },
+      "dispatchedAt": 7034.0613,
+      "result": {
+        "state": "SUCCEEDED",
+        "reasonCode": "ACTION_COMPLETED",
+        "elapsedMs": 740,
+        "receivedAt": 7797.3268,
+        "executionStarted": true,
+        "physicalAttempted": false
+      }
+    },
+    {
+      "traceId": "native-native-successor-live-16-c930e9f2-dc13-4fff-a472-c2fd4bbd-1",
+      "goalRevision": 1,
+      "actionId": "native:native-successor-live:16:c930e9f2-dc13-4fff-a472-c2fd4bbd:1",
+      "actionType": "break_block",
+      "arguments": {
+        "x": 1,
+        "y": 64,
+        "z": 0,
+        "expectedBlockId": "minecraft:oak_log",
+        "timeoutMs": 10000
+      },
+      "provenance": {
+        "provider": "codex",
+        "model": "gpt-6.1-sol",
+        "reasoningEffort": "medium",
+        "serviceTier": "fast",
+        "traceId": "native-native-successor-live-16-c930e9f2-dc13-4fff-a472-c2fd4bbd-1",
+        "programId": "native-deterministic-selected-agent-fixture",
+        "programVersion": 1,
+        "sourceStepId": "live-fixture-10",
+        "eventSequence": 68
+      },
+      "dispatchedAt": 7912.3422,
+      "result": {
+        "state": "FAILED",
+        "reasonCode": "TARGET_NOT_VISIBLE",
+        "elapsedMs": 0,
+        "receivedAt": 7968.0281,
+        "executionStarted": false,
+        "physicalAttempted": false,
+        "actionObservation": {
+          "observedAtEpochMs": 1790914666244,
+          "worldTick": 133,
+          "position": {
+            "x": 0.5,
+            "y": 64,
+            "z": 0.5
+          },
+          "velocity": {
+            "x": 0,
+            "y": -0.0784000015258789,
+            "z": 0
+          },
+          "yaw": 90,
+          "pitch": 0,
+          "collision": {
+            "horizontal": false,
+            "vertical": true,
+            "inWall": false
+          },
+          "lookedAt": {
+            "type": "block",
+            "hitDistance": 4.5,
+            "position": {
+              "x": -4,
+              "y": 65,
+              "z": 0
+            },
+            "id": "minecraft:air",
+            "face": "east"
+          },
+          "reach": {
+            "distance": 1.118033988749895,
+            "max": 4.5,
+            "within": true
+          },
+          "target": {
+            "kind": "block",
+            "position": {
+              "x": 1,
+              "y": 64,
+              "z": 0
+            },
+            "expectedId": "minecraft:oak_log",
+            "currentId": "minecraft:oak_log",
+            "beforeId": "minecraft:oak_log",
+            "afterId": "minecraft:oak_log",
+            "worldChanged": false,
+            "distanceRemaining": 0
+          },
+          "progress": {
+            "value": 0,
+            "basis": "none",
+            "verified": true
+          }
+        }
+      }
+    },
+    {
+      "traceId": "native-native-successor-live-17-c930e9f2-dc13-4fff-a472-c2fd4bbd-1",
+      "goalRevision": 1,
+      "actionId": "native:native-successor-live:17:c930e9f2-dc13-4fff-a472-c2fd4bbd:1",
+      "actionType": "look_at",
+      "arguments": {
+        "x": 1.5,
+        "y": 64.5,
+        "z": 0.5
+      },
+      "provenance": {
+        "provider": "codex",
+        "model": "gpt-6.1-sol",
+        "reasoningEffort": "medium",
+        "serviceTier": "fast",
+        "traceId": "native-native-successor-live-17-c930e9f2-dc13-4fff-a472-c2fd4bbd-1",
+        "programId": "native-deterministic-selected-agent-fixture",
+        "programVersion": 1,
+        "sourceStepId": "live-fixture-11:1",
+        "eventSequence": 71
+      },
+      "dispatchedAt": 8022.9292,
+      "result": {
+        "state": "SUCCEEDED",
+        "reasonCode": "ACTION_COMPLETED",
+        "elapsedMs": 0,
+        "receivedAt": 8048.8983,
+        "executionStarted": true,
+        "physicalAttempted": true
+      }
+    },
+    {
+      "traceId": "native-native-successor-live-18-c930e9f2-dc13-4fff-a472-c2fd4bbd-1",
+      "goalRevision": 1,
+      "actionId": "native:native-successor-live:18:c930e9f2-dc13-4fff-a472-c2fd4bbd:1",
+      "actionType": "break_block",
+      "arguments": {
+        "x": 1,
+        "y": 64,
+        "z": 0,
+        "expectedBlockId": "minecraft:oak_log",
+        "timeoutMs": 10000
+      },
+      "provenance": {
+        "provider": "codex",
+        "model": "gpt-6.1-sol",
+        "reasoningEffort": "medium",
+        "serviceTier": "fast",
+        "traceId": "native-native-successor-live-18-c930e9f2-dc13-4fff-a472-c2fd4bbd-1",
+        "programId": "native-deterministic-selected-agent-fixture",
+        "programVersion": 1,
+        "sourceStepId": "live-fixture-11:2",
+        "eventSequence": 71
+      },
+      "dispatchedAt": 8049.347,
+      "result": {
+        "state": "SUCCEEDED",
+        "reasonCode": "BLOCK_BROKEN",
+        "elapsedMs": 3092,
+        "receivedAt": 11205.9951,
+        "executionStarted": true,
+        "physicalAttempted": true,
+        "actionObservation": {
+          "observedAtEpochMs": 1790914669486,
+          "worldTick": 198,
+          "position": {
+            "x": 0.5,
+            "y": 64,
+            "z": 0.5
+          },
+          "velocity": {
+            "x": 0,
+            "y": -0.0784000015258789,
+            "z": 0
+          },
+          "yaw": -90,
+          "pitch": 48.23970031738281,
+          "collision": {
+            "horizontal": false,
+            "vertical": true,
+            "inWall": false
+          },
+          "lookedAt": {
+            "type": "block",
+            "hitDistance": 2.17190634629519,
+            "position": {
+              "x": 1,
+              "y": 63,
+              "z": 0
+            },
+            "id": "minecraft:stone",
+            "face": "up"
+          },
+          "reach": {
+            "distance": 1.118033988749895,
+            "max": 4.5,
+            "within": true
+          },
+          "target": {
+            "kind": "block",
+            "position": {
+              "x": 1,
+              "y": 64,
+              "z": 0
+            },
+            "expectedId": "minecraft:oak_log",
+            "currentId": "minecraft:air",
+            "beforeId": "minecraft:oak_log",
+            "afterId": "minecraft:air",
+            "worldChanged": true,
+            "distanceRemaining": 0
+          },
+          "progress": {
+            "value": 1,
+            "basis": "world_mutation",
+            "verified": true
+          }
+        }
+      }
+    },
+    {
+      "traceId": "native-native-successor-live-19-c930e9f2-dc13-4fff-a472-c2fd4bbd-1",
+      "goalRevision": 1,
+      "actionId": "native:native-successor-live:19:c930e9f2-dc13-4fff-a472-c2fd4bbd:1",
+      "actionType": "pick_up_item",
+      "arguments": {
+        "targetSelector": "c2be3a8b-639a-49be-b279-03a696873dd5"
+      },
+      "provenance": {
+        "provider": "codex",
+        "model": "gpt-6.1-sol",
+        "reasoningEffort": "medium",
+        "serviceTier": "fast",
+        "traceId": "native-native-successor-live-19-c930e9f2-dc13-4fff-a472-c2fd4bbd-1",
+        "programId": "native-deterministic-selected-agent-fixture",
+        "programVersion": 1,
+        "sourceStepId": "live-fixture-12",
+        "eventSequence": 96
+      },
+      "dispatchedAt": 11255.5096,
+      "result": {
+        "state": "SUCCEEDED",
+        "reasonCode": "ITEM_PICKED_UP",
+        "elapsedMs": 453,
+        "receivedAt": 11772.5857,
+        "executionStarted": true,
+        "physicalAttempted": true
+      }
+    }
+  ],
+  "samples": [
+    {
+      "requestedAt": 3753.0499,
+      "returnedAt": 3796.8473,
+      "eventSequence": 4,
+      "gameTime": 40,
+      "health": 20,
+      "ready": true,
+      "view": {
+        "yaw": 90,
+        "pitch": 0
+      },
+      "world": {
+        "worldId": "e2dded3c-3da4-46d4-a593-7b20a22c9de2",
+        "dimension": "minecraft:overworld"
+      },
+      "inventoryItems": []
+    },
+    {
+      "requestedAt": 5169.8395,
+      "returnedAt": 5257.6256,
+      "eventSequence": 20,
+      "gameTime": 78,
+      "health": 20,
+      "ready": true,
+      "view": {
+        "yaw": 90,
+        "pitch": 0
+      },
+      "world": {
+        "worldId": "e2dded3c-3da4-46d4-a593-7b20a22c9de2",
+        "dimension": "minecraft:overworld"
+      },
+      "inventoryItems": []
+    },
+    {
+      "requestedAt": 5261.653,
+      "returnedAt": 5310.65,
+      "eventSequence": 22,
+      "gameTime": 80,
+      "health": 20,
+      "ready": true,
+      "view": {
+        "yaw": -90,
+        "pitch": 3.4335103034973145
+      },
+      "world": {
+        "worldId": "e2dded3c-3da4-46d4-a593-7b20a22c9de2",
+        "dimension": "minecraft:overworld"
+      },
+      "inventoryItems": []
+    },
+    {
+      "requestedAt": 5284.2852,
+      "returnedAt": 5327.0137,
+      "eventSequence": 23,
+      "gameTime": 80,
+      "health": 20,
+      "ready": true,
+      "view": {
+        "yaw": -90,
+        "pitch": 3.4335103034973145
+      },
+      "world": {
+        "worldId": "e2dded3c-3da4-46d4-a593-7b20a22c9de2",
+        "dimension": "minecraft:overworld"
+      },
+      "inventoryItems": []
+    },
+    {
+      "requestedAt": 5516.7453,
+      "returnedAt": 5572.2287,
+      "eventSequence": 28,
+      "gameTime": 85,
+      "health": 20,
+      "ready": true,
+      "view": {
+        "yaw": -90,
+        "pitch": 3.4335103034973145
+      },
+      "world": {
+        "worldId": "e2dded3c-3da4-46d4-a593-7b20a22c9de2",
+        "dimension": "minecraft:overworld"
+      },
+      "inventoryItems": []
+    },
+    {
+      "requestedAt": 5587.502,
+      "returnedAt": 5619.1496,
+      "eventSequence": 31,
+      "gameTime": 86,
+      "health": 20,
+      "ready": true,
+      "view": {
+        "yaw": -7.62939453125e-06,
+        "pitch": 2.2905499935150146
+      },
+      "world": {
+        "worldId": "e2dded3c-3da4-46d4-a593-7b20a22c9de2",
+        "dimension": "minecraft:overworld"
+      },
+      "inventoryItems": []
+    },
+    {
+      "requestedAt": 5569.5961,
+      "returnedAt": 5621.8417,
+      "eventSequence": 30,
+      "gameTime": 86,
+      "health": 20,
+      "ready": true,
+      "view": {
+        "yaw": -7.62939453125e-06,
+        "pitch": 2.2905499935150146
+      },
+      "world": {
+        "worldId": "e2dded3c-3da4-46d4-a593-7b20a22c9de2",
+        "dimension": "minecraft:overworld"
+      },
+      "inventoryItems": []
+    },
+    {
+      "requestedAt": 5619.711,
+      "returnedAt": 5656.1704,
+      "eventSequence": 32,
+      "gameTime": 87,
+      "health": 20,
+      "ready": true,
+      "view": {
+        "yaw": -7.62939453125e-06,
+        "pitch": 2.2905499935150146
+      },
+      "world": {
+        "worldId": "e2dded3c-3da4-46d4-a593-7b20a22c9de2",
+        "dimension": "minecraft:overworld"
+      },
+      "inventoryItems": []
+    },
+    {
+      "requestedAt": 6954.2324,
+      "returnedAt": 7018.9086,
+      "eventSequence": 49,
+      "gameTime": 114,
+      "health": 20,
+      "ready": true,
+      "view": {
+        "yaw": -7.62939453125e-06,
+        "pitch": 2.2905499935150146
+      },
+      "world": {
+        "worldId": "e2dded3c-3da4-46d4-a593-7b20a22c9de2",
+        "dimension": "minecraft:overworld"
+      },
+      "inventoryItems": []
+    },
+    {
+      "requestedAt": 6944.2303,
+      "returnedAt": 7027.9,
+      "eventSequence": 48,
+      "gameTime": 114,
+      "health": 20,
+      "ready": true,
+      "view": {
+        "yaw": -7.62939453125e-06,
+        "pitch": 2.2905499935150146
+      },
+      "world": {
+        "worldId": "e2dded3c-3da4-46d4-a593-7b20a22c9de2",
+        "dimension": "minecraft:overworld"
+      },
+      "inventoryItems": []
+    },
+    {
+      "requestedAt": 7810.5498,
+      "returnedAt": 7866.4292,
+      "eventSequence": 67,
+      "gameTime": 131,
+      "health": 20,
+      "ready": true,
+      "view": {
+        "yaw": -7.62939453125e-06,
+        "pitch": 2.2905499935150146
+      },
+      "world": {
+        "worldId": "e2dded3c-3da4-46d4-a593-7b20a22c9de2",
+        "dimension": "minecraft:overworld"
+      },
+      "inventoryItems": []
+    },
+    {
+      "requestedAt": 7797.8155,
+      "returnedAt": 7873.71,
+      "eventSequence": 66,
+      "gameTime": 131,
+      "health": 20,
+      "ready": true,
+      "view": {
+        "yaw": -7.62939453125e-06,
+        "pitch": 2.2905499935150146
+      },
+      "world": {
+        "worldId": "e2dded3c-3da4-46d4-a593-7b20a22c9de2",
+        "dimension": "minecraft:overworld"
+      },
+      "inventoryItems": []
+    },
+    {
+      "requestedAt": 7885.0831,
+      "returnedAt": 7911.7605,
+      "eventSequence": 68,
+      "gameTime": 132,
+      "health": 20,
+      "ready": true,
+      "view": {
+        "yaw": 90,
+        "pitch": 0
+      },
+      "world": {
+        "worldId": "e2dded3c-3da4-46d4-a593-7b20a22c9de2",
+        "dimension": "minecraft:overworld"
+      },
+      "inventoryItems": []
+    },
+    {
+      "requestedAt": 7968.4673,
+      "returnedAt": 8000.7029,
+      "eventSequence": 70,
+      "gameTime": 134,
+      "health": 20,
+      "ready": true,
+      "view": {
+        "yaw": 90,
+        "pitch": 0
+      },
+      "world": {
+        "worldId": "e2dded3c-3da4-46d4-a593-7b20a22c9de2",
+        "dimension": "minecraft:overworld"
+      },
+      "inventoryItems": []
+    },
+    {
+      "requestedAt": 7982.3345,
+      "returnedAt": 8021.8985,
+      "eventSequence": 71,
+      "gameTime": 134,
+      "health": 20,
+      "ready": true,
+      "view": {
+        "yaw": 90,
+        "pitch": 0
+      },
+      "world": {
+        "worldId": "e2dded3c-3da4-46d4-a593-7b20a22c9de2",
+        "dimension": "minecraft:overworld"
+      },
+      "inventoryItems": []
+    },
+    {
+      "requestedAt": 11206.5191,
+      "returnedAt": 11253.834,
+      "eventSequence": 95,
+      "gameTime": 199,
+      "health": 20,
+      "ready": true,
+      "view": {
+        "yaw": -90,
+        "pitch": 48.23970031738281
+      },
+      "world": {
+        "worldId": "e2dded3c-3da4-46d4-a593-7b20a22c9de2",
+        "dimension": "minecraft:overworld"
+      },
+      "inventoryItems": []
+    },
+    {
+      "requestedAt": 11214.9343,
+      "returnedAt": 11254.9193,
+      "eventSequence": 96,
+      "gameTime": 199,
+      "health": 20,
+      "ready": true,
+      "view": {
+        "yaw": -90,
+        "pitch": 48.23970031738281
+      },
+      "world": {
+        "worldId": "e2dded3c-3da4-46d4-a593-7b20a22c9de2",
+        "dimension": "minecraft:overworld"
+      },
+      "inventoryItems": []
+    },
+    {
+      "requestedAt": 11773.0908,
+      "returnedAt": 11822.9271,
+      "eventSequence": 100,
+      "gameTime": 210,
+      "health": 20,
+      "ready": true,
+      "view": {
+        "yaw": -90,
+        "pitch": 48.23970031738281
+      },
+      "world": {
+        "worldId": "e2dded3c-3da4-46d4-a593-7b20a22c9de2",
+        "dimension": "minecraft:overworld"
+      },
+      "inventoryItems": [
+        {
+          "itemId": "minecraft:oak_log",
+          "count": 1,
+          "slot": "mainhand",
+          "tags": [
+            "#c:natural_logs",
+            "#c:natural_logs/overworld",
+            "#minecraft:completes_find_tree_tutorial",
+            "#minecraft:logs",
+            "#minecraft:logs_that_burn",
+            "#minecraft:oak_logs"
+          ],
+          "damage": 0,
+          "maxDamage": 0,
+          "displayName": "Oak Log",
+          "fingerprint": "fa6051282077d07257ac82526d3e18dd28e4c1b7038d941c2841e846b838e86d",
+          "maxStackSize": 64
+        }
+      ]
+    },
+    {
+      "requestedAt": 11781.7163,
+      "returnedAt": 11823.9132,
+      "eventSequence": 101,
+      "gameTime": 210,
+      "health": 20,
+      "ready": true,
+      "view": {
+        "yaw": -90,
+        "pitch": 48.23970031738281
+      },
+      "world": {
+        "worldId": "e2dded3c-3da4-46d4-a593-7b20a22c9de2",
+        "dimension": "minecraft:overworld"
+      },
+      "inventoryItems": [
+        {
+          "itemId": "minecraft:oak_log",
+          "count": 1,
+          "slot": "mainhand",
+          "tags": [
+            "#c:natural_logs",
+            "#c:natural_logs/overworld",
+            "#minecraft:completes_find_tree_tutorial",
+            "#minecraft:logs",
+            "#minecraft:logs_that_burn",
+            "#minecraft:oak_logs"
+          ],
+          "damage": 0,
+          "maxDamage": 0,
+          "displayName": "Oak Log",
+          "fingerprint": "fa6051282077d07257ac82526d3e18dd28e4c1b7038d941c2841e846b838e86d",
+          "maxStackSize": 64
+        }
+      ]
+    }
+  ],
+  "programEvents": [
+    {
+      "event": "program_handoff_started",
+      "at": 5339.8491,
+      "programId": "native-program-native-successor-live-5",
+      "predecessorProgramId": "native-program-native-successor-live-1",
+      "queueId": "native-queue-native-successor-live-3",
+      "status": {
+        "state": "RUNNING",
+        "maxActions": 2,
+        "deadlineEpochMs": 1790914666623,
+        "programVersion": 1
+      },
+      "observation": {
+        "ready": true,
+        "gameTime": 80,
+        "health": 20
+      }
+    },
+    {
+      "event": "program_ended",
+      "at": 5583.8033,
+      "programId": "native-program-native-successor-live-5",
+      "reasonCode": "PROGRAM_EXHAUSTED",
+      "state": "YIELDED",
+      "actions": 2,
+      "observation": {
+        "ready": true,
+        "gameTime": 86,
+        "health": 20
+      }
+    },
+    {
+      "event": "program_handoff_rejected",
+      "at": 7026.2741,
+      "programId": "native-program-native-successor-live-11",
+      "reasonCode": "SUCCESSOR_PRECONDITION_FALSE",
+      "state": "YIELDED",
+      "observation": {
+        "ready": true,
+        "gameTime": 114,
+        "health": 20
+      }
+    },
+    {
+      "event": "program_handoff_rejected",
+      "at": 7872.0565,
+      "programId": "native-program-native-successor-live-15",
+      "reasonCode": "SUCCESSOR_PRECONDITION_FALSE",
+      "state": "YIELDED",
+      "observation": {
+        "ready": true,
+        "gameTime": 131,
+        "health": 20
+      }
+    }
+  ],
+  "cleanup": {
+    "status": "CLEAN",
+    "runner": {
+      "runtime": "CLEAN",
+      "agent": "REMOVED"
+    },
+    "diagnostics": null
+  },
+  "installedJar": {
+    "name": "arena-agents-0.2.0.jar",
+    "sha256": "1cc6dbda2c338c70563c977b27a33ca6bce2c2efd53aefacb40f609e58f4f4eb"
+  },
+  "sourceSha256": "6e2ef2c55fd2e587ad5e5d183994776a8809194f5627129f2811663d529a7158",
+  "runtimeSha256": "104ef4298c0e5b1cd20b1fe393f647210fd1a474b435da75bdf078c7f1ebdcc9",
+  "fixtureGoalResponse": "Starting a task for CapabilityProbe...",
+  "registeredProfile": {
+    "provider": "codex",
+    "model": "gpt-6.1-sol",
+    "reasoningEffort": "medium",
+    "serviceTier": "fast"
+  },
+  "world": {
+    "ready": true,
+    "dimension": "minecraft:overworld",
+    "worldId": "e2dded3c-3da4-46d4-a593-7b20a22c9de2",
+    "gameTime": 40,
+    "dayTime": 40,
+    "raining": false,
+    "thundering": false
+  },
+  "elapsedMs": 11777,
+  "metrics": {
+    "resources": {
+      "processCount": 4,
+      "peakRssBytes": 1432248320,
+      "minecraftMspt": null
+    }
+  },
+  "exitCode": 0,
+  "artifactsKept": false,
+  "fixtureRunId": "run-1790914640321-5aa1a0d8",
+  "productionGraphManifest": "native-successor-live-source-manifest.json",
+  "productionGraphFilesIdentical": true,
+  "productionGraphFilesVerified": 29,
+  "probeSha256": "a505984320496529ec27b2b7ae81b50b417d82cdc7fd8e4c690a97bc317825fe"
+}

@@ -1,5 +1,6 @@
 package dev.agaminggod.arenaagents.mixin;
 
+import dev.agaminggod.arenaagents.server.CodexAgentManager;
 import dev.agaminggod.arenaagents.server.SkitActors;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
@@ -15,7 +16,8 @@ abstract class PlayerDisplayNameMixin {
 	@Inject(method = "getName", at = @At("HEAD"), cancellable = true)
 	private void arenaagents$directorLabel(CallbackInfoReturnable<Component> callback) {
 		if ((Object) this instanceof ServerPlayer player) {
-			SkitActors.displayName(player).ifPresent(name -> callback.setReturnValue(Component.literal(name)));
+			SkitActors.displayName(player).or(() -> CodexAgentManager.playerDisplayName(player))
+					.ifPresent(name -> callback.setReturnValue(Component.literal(name)));
 		}
 	}
 }

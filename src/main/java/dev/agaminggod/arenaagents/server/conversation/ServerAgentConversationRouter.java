@@ -314,9 +314,19 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 			throw new AgentDomainException("GOAL_SOURCE_DIMENSION_CHANGED",
 					"The requester's live dimension changed before the goal could be compiled");
 		}
-		// Replace/queue is an explicit /agent goal choice, not inferred from live speech.
+		ServerPlayer requester = manager.server().getPlayerList().getPlayer(requestingPlayerId(event));
+		boolean operator = requester != null && GoalControl.mayControl(requester.createCommandSourceStack());
+		if (operator && ConversationWakePolicy.isPlayerGoalChannel(event.kind(), event.audience())
+				&& ConversationWakePolicy.isCompletionConfirmation(event.text())
+				&& dev.agaminggod.arenaagents.server.CodexAgentServerRuntime.confirmCurrentGoalFromSpeech(manager.server(), target.agentId())) {
+			notifyRequester(requester.getUUID(), "Confirmed. Minecraft will finish this goal after checking its requirements.");
+			return GoalRoute.CONSUMED;
+		}
+		boolean replaceRequested = ConversationWakePolicy.mayReplaceGoalFromSpeech(
+				target.state(), event.kind(), event.audience(), operator);
+		if (GoalCompiler.isLiveSteeringRequest(event.text())) return GoalRoute.EVENT_ONLY;
 		if (!GoalCompiler.consumePlayerSpeechAsGoal(
-				!ConversationWakePolicy.mayInstallNewGoalFromSpeech(target.state()), event.text(), false)) {
+				!ConversationWakePolicy.mayInstallNewGoalFromSpeech(target.state()), event.text(), replaceRequested)) {
 			return GoalRoute.EVENT_ONLY;
 		}
 
@@ -327,20 +337,14 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 		);
 
 		return routeCompiledSpeechGoal(
-				target.state(), event.kind(), compilation,
+				target.state(), event.kind(), GoalCompiler.withAdvisoryPlan(compilation), replaceRequested,
 				() -> {
-					DraftIntent intent = GoalCompiler.isDeterministicTranslation(event.text())
-							? DraftIntent.TRANSLATE_START : DraftIntent.CONFIRM_TRANSLATION;
+					DraftIntent intent = replaceRequested ? DraftIntent.TRANSLATE_REPLACE : DraftIntent.TRANSLATE_START;
 					PendingGoalDraft draft = draft(
 							target, event, sourceLevel, Optional.empty(), intent);
 					manager.stageGoalDraft(draft);
 					goalSpecRequestSink.publish(draft);
-					if (intent == DraftIntent.TRANSLATE_START) {
-						notifyRequester(draft, "I understood the goal and will start it after validation.");
-					} else {
-						notifyRequester(draft, compilation.playerMessage()
-								+ " Draft " + draft.draftId() + " is waiting for clarification.");
-					}
+					notifyRequester(draft, "I understood the goal and will start it after validation.");
 				},
 				message -> notifyRequester(requestingPlayerId(event), message)
 		);
@@ -353,10 +357,18 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 			Runnable stageTranslation,
 			Consumer<String> reportRejection
 	) {
+		return routeCompiledSpeechGoal(state, kind, compilation, false, stageTranslation, reportRejection);
+	}
+
+	static GoalRoute routeCompiledSpeechGoal(
+			dev.agaminggod.arenaagents.agent.AgentLifecycleState state, ConversationKind kind,
+			GoalCompilation compilation, boolean replaceRequested,
+			Runnable stageTranslation, Consumer<String> reportRejection
+	) {
 		Objects.requireNonNull(compilation, "compilation must not be null");
 		Objects.requireNonNull(stageTranslation, "stageTranslation must not be null");
 		Objects.requireNonNull(reportRejection, "reportRejection must not be null");
-		if (!ConversationWakePolicy.shouldStartGoal(state, kind)) return GoalRoute.EVENT_ONLY;
+		if (!replaceRequested && !ConversationWakePolicy.shouldStartGoal(state, kind)) return GoalRoute.EVENT_ONLY;
 		return switch (compilation.kind()) {
 			case ACCEPTED -> new GoalRoute(true, compilation.acceptedSpec());
 			case NEEDS_TRANSLATION -> {
@@ -382,7 +394,7 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 				UUID.randomUUID(), target.agentId(), playerId, event.text(),
 				sourceLevel.dimension().identifier().toString(),
 				goalCompiler.candidateIdsFor(event.text(), manager.server().registryAccess(), liveAdvancementTitles()),
-				goalCompiler.translationConstraintFor(event.text(), manager.server().registryAccess()), proposed, intent,
+				goalCompiler.supportedTranslationConstraintFor(event.text(), manager.server().registryAccess()), proposed, intent,
 				manager.server().getTickCount(), target.goalRevision(), PendingGoalDraft.expectedGoalIdFor(target)
 		);
 	}

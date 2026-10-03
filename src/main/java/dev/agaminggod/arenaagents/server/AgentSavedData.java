@@ -364,6 +364,25 @@ public final class AgentSavedData extends SavedData {
 		setDirty();
 	}
 
+	/** A direct new task supersedes the prior goal's durable message, preserving it for rollback. */
+	public synchronized Optional<PendingConversationWake> stageConversationWakeReplacingPrior(PendingConversationWake wake) {
+		Objects.requireNonNull(wake, "wake must not be null");
+		PendingConversationWake previous = conversationWakes.get(wake.event().agentId());
+		if (previous == null) {
+			stageConversationWake(wake);
+			return Optional.empty();
+		}
+		if (previous.goalRevision() != wake.event().goalRevision()) {
+			throw new AgentDomainException("STALE_REVISION", "Prior conversation wake does not match the task being replaced");
+		}
+		if (conversationWakes.values().stream().anyMatch(value -> value.transactionId().equals(wake.transactionId()))) {
+			throw new AgentDomainException("DUPLICATE_CONVERSATION_WAKE", "Conversation wake transaction already exists");
+		}
+		conversationWakes.put(wake.event().agentId(), wake);
+		setDirty();
+		return Optional.of(previous);
+	}
+
 	public synchronized void rollbackConversationWake(UUID transactionId) {
 		Objects.requireNonNull(transactionId, "transactionId must not be null");
 		AgentId target = conversationWakes.entrySet().stream()

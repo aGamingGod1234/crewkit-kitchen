@@ -2,16 +2,19 @@ import { ArenaScriptInterpreter, freezeQueryResult } from './interpreter.mjs';
 import { changedInterpreterFactDomains, createInterpreterFacts } from './facts.mjs';
 import { ALL_FACT_DOMAINS } from './fact-domains.mjs';
 import { SCRIPT_BINDINGS } from './minecraft-api.mjs';
+import { validateProgramParameters } from '../program-parameters.mjs';
 
 const ORDINARY_PRIORITY = 'ordinary';
 const URGENT_PRIORITY = 'urgent';
 const DEFAULT_ATTENTION_TRIGGER = 'attention';
+const SURVIVAL_TRIGGERS = new Set(['damage', 'lava', 'fire', 'suffocation', 'fall']);
 
 /** Runs one provenanced ArenaScript program without adding gameplay decisions. */
 export class ArenaScriptEngine {
 	#callbacks; #vm = null; #program = null; #facts = null; #eventSequence = -1; #factsSequence = -1; #generation = 0; #lifecycleEpoch = 0; #continuationEpoch = 0;
 	#active = null; #pendingResult = null; #boundary = []; #boundaryByWatcher = new Map(); #watcherTruth = new Map(); #cancelling = null;
 	#watcherMetadata = [];
+	#watcherDecision = false;
 	#transition = null; #pendingRequest = null; #coalescedRequest = null; #pendingReplacement = null; #suspendedResult = null; #resumableUnhandled = false; #requestUpdate = null; #completed = new Map(); #deferredBase = null; #continuationRequired = false; #status = 'IDLE';
 
 	constructor({ dispatch, cancel, requestModel, inspect = null, trace = () => {} } = {}) {
@@ -57,7 +60,9 @@ export class ArenaScriptEngine {
 		const edges = this.#updateWatchers(changedFactDomains);
 		if (this.#pendingResult && !this.#cancelling && eventSequence >= this.#pendingResult.eventSequence) this.#resumeOrRunBoundary();
 		else if (!this.#active && !this.#cancelling && this.#boundary.length > 0) this.#runBoundary();
-		if (attention && edges === 0) this.#requestModel(null, { priority, trigger });
+		// The agent can waive repeated ordinary perception during a chosen leg.
+		// All fresh facts and watcher edges above remain live; urgency bypasses it.
+		if (attention && edges === 0 && (priority === URGENT_PRIORITY || this.#vm.shouldReassess(this.#facts))) this.#requestModel(null, { priority, trigger });
 		this.#requestExhaustedContinuation();
 		return this.snapshot();
 	}
@@ -158,7 +163,10 @@ export class ArenaScriptEngine {
 		this.#coalescedRequest = null;
 		this.#requestUpdate = null;
 		if (directive.directive === 'continue') {
-			if (request.decisionContext === 'completion_verification_failed') this.#status = 'FINISHED';
+			if (this.#watcherDecision) {
+				this.#watcherDecision = false; this.#resumableUnhandled = false; this.#status = 'ACTIVE';
+				this.#handleYield(this.#vm.resumeWatcherDecision(this.#facts), 'step');
+			} else if (request.decisionContext === 'completion_verification_failed') this.#status = 'FINISHED';
 			else if (this.#transition?.kind === 'terminal' && this.#transition.reason === 'unhandled_attention') this.#transition = { kind: 'resume' };
 			else if (this.#status === 'SUSPENDED' && (this.#suspendedResult || this.#resumableUnhandled)) {
 				this.#pendingResult = this.#suspendedResult; this.#suspendedResult = null; this.#resumableUnhandled = false; this.#status = 'ACTIVE';
@@ -233,22 +241,37 @@ export class ArenaScriptEngine {
 		const latestSequence = Math.max(this.#eventSequence, target.eventSequence);
 		this.#clear(false);
 		this.#generation += 1;
-		this.#program = freezeRecord({ agentId: target.agentId, provider: target.provider, modelIdentity: target.modelIdentity, reasoningEffort: target.reasoningEffort, serviceTier: target.serviceTier, traceId: target.traceId, goalRevision: target.goalRevision, programId: target.programId, version: target.version, compiled: target.compiled, eventSequence: target.eventSequence, factsSequence: target.factsSequence });
+		this.#program = freezeRecord({ agentId: target.agentId, provider: target.provider, modelIdentity: target.modelIdentity, reasoningEffort: target.reasoningEffort, serviceTier: target.serviceTier, traceId: target.traceId, goalRevision: target.goalRevision, programId: target.programId, version: target.version, compiled: target.compiled, parameters: target.parameters, eventSequence: target.eventSequence, factsSequence: target.factsSequence });
 		this.#facts = latestFacts;
 		this.#factsSequence = latestFactsSequence;
 		this.#eventSequence = latestSequence;
-		this.#vm = new ArenaScriptInterpreter(target.compiled, SCRIPT_BINDINGS);
+		this.#vm = new ArenaScriptInterpreter(target.compiled, SCRIPT_BINDINGS, { parameters: target.parameters });
 		this.#watcherMetadata = watcherMetadata(target.compiled);
 		this.#status = 'ACTIVE';
-		this.#handleYield(this.#vm.start(this.#facts), 'step');
+		const first = this.#vm.start(this.#facts);
+		let initialGuard = null;
 		for (let index = 0; index < target.compiled.watcherCount && this.#isLive(); index += 1) {
-			const watcherId = this.#watcherMetadata[index].id;
-			this.#watcherTruth.set(watcherId, this.#vm.evaluateWatcher(watcherId, this.#facts));
+			const metadata = this.#watcherMetadata[index], watcherId = metadata.id;
+			const truth = this.#vm.evaluateWatcher(watcherId, this.#facts);
+			this.#watcherTruth.set(watcherId, truth);
+			if (initialGuard === null && truth && metadata.mode === 'interrupt' && metadata.after === 'reconsider') initialGuard = { watcherId, mode: metadata.mode, eventSequence: this.#eventSequence, generation: this.#generation, facts: this.#facts };
 		}
+		// This opt-in guard also protects installation at already unsafe facts.
+		// Legacy watchers retain their rising-edge registration semantics.
+		if (initialGuard !== null && ['command', 'query', 'idle'].includes(first.kind)) {
+			if (first.kind === 'idle') this.#handleYield(this.#vm.runWatcherHandler(initialGuard.watcherId, this.#facts), watcherExecution(initialGuard));
+			else {
+				// This work has never been dispatched. Hold its exact yield and VM
+				// continuation until the agent chooses to continue after its defense.
+				this.#deferredBase = Object.freeze({ undispatched: first });
+				this.#handleYield(this.#vm.runWatcherHandlerBeforeResume(initialGuard.watcherId, this.#facts), watcherExecution(initialGuard));
+			}
+		} else this.#handleYield(first, 'step');
 		return this.snapshot();
 	}
 
 	#clear(resetGeneration = true) {
+		this.#watcherDecision = false;
 		this.#vm = null; this.#program = null; this.#facts = null; this.#eventSequence = -1; this.#factsSequence = -1; this.#active = null; this.#pendingResult = null; this.#watcherMetadata = [];
 		this.#boundary = []; this.#boundaryByWatcher.clear(); this.#watcherTruth.clear(); this.#cancelling = null; this.#transition = null; this.#pendingRequest = null; this.#coalescedRequest = null; this.#pendingReplacement = null; this.#suspendedResult = null; this.#resumableUnhandled = false; this.#requestUpdate = null; this.#completed.clear(); this.#deferredBase = null; this.#continuationRequired = false; this.#status = 'IDLE';
 		if (resetGeneration) this.#generation += 1;
@@ -287,6 +310,10 @@ export class ArenaScriptEngine {
 			this.#watcherTruth.set(watcherId, trueNow);
 			if (!trueNow || wasTrue) continue;
 			edges += 1;
+			// Rearming after healing must not recursively cancel the same authored
+			// response. Other watchers may still escalate with their own reactions.
+			if (metadata.after === 'reconsider' && (this.#active?.authority?.watcherId === watcherId || this.#pendingResult?.authority?.watcherId === watcherId
+				|| this.#cancelling?.latch?.watcherId === watcherId)) continue;
 			const latch = freezeRecord({ watcherId, mode: metadata.mode, eventSequence: this.#eventSequence, generation: this.#generation, facts: this.#facts });
 			this.#emitTrace('watcher_fired', { watcherId, mode: latch.mode, eventSequence: this.#eventSequence, generation: this.#generation });
 			if (latch.mode === 'interrupt' && this.#active && !this.#cancelling) {
@@ -342,6 +369,11 @@ export class ArenaScriptEngine {
 
 	#requestModel(actionFailure = null, { priority = ORDINARY_PRIORITY, trigger = DEFAULT_ATTENTION_TRIGGER, decisionContext = null } = {}) {
 		const context = requestContext(this.#program, this.#generation, this.#lifecycleEpoch, this.#continuationEpoch, this.#activeActionId(), this.#eventSequence, this.#factsSequence, this.#facts, actionFailure, { priority, trigger, decisionContext });
+		const survival = priority === URGENT_PRIORITY && SURVIVAL_TRIGGERS.has(trigger);
+		// Release unrelated input on danger, including escalation of an older request.
+		// An authored defensive handler retains its action; the runtime invents none.
+		const policy = survival ? this.#program.compiled.survivalPolicy ?? 'pause_and_notify' : this.#program.compiled.unhandledPolicy;
+		if (policy === 'pause_and_notify' && !this.#watcherDecision && !(survival && this.#active?.authority)) this.#suspendUnhandledAttention();
 		if (this.#pendingRequest) {
 			this.#coalescedRequest = mergeRequestContexts(this.#coalescedRequest ?? this.#pendingRequest, context);
 			return;
@@ -351,11 +383,11 @@ export class ArenaScriptEngine {
 		if (actionFailure === null) this.#emitTrace('attention_unhandled', { eventSequence: this.#eventSequence, factsSequence: this.#factsSequence, programId: this.#program.programId, version: this.#program.version });
 		else this.#emitTrace('program_action_failure', { eventSequence: this.#eventSequence, factsSequence: this.#factsSequence, programId: this.#program.programId, version: this.#program.version, actionFailure });
 		this.#callbacks.requestModel(context);
-		if (this.#program.compiled.unhandledPolicy === 'pause_and_notify') this.#suspendUnhandledAttention();
 	}
 
 	#invalidateLifecycleRequests() { this.#lifecycleEpoch += 1; this.#pendingRequest = null; this.#coalescedRequest = null; this.#pendingReplacement = null; this.#suspendedResult = null; this.#resumableUnhandled = false; }
 	#suspendUnhandledAttention() {
+		if (this.#status === 'SUSPENDED' && this.#resumableUnhandled || this.#transition?.reason === 'unhandled_attention') return;
 		this.#transition = { kind: 'terminal', status: 'SUSPENDED', reason: 'unhandled_attention' };
 		if (this.#active) this.#cancelActive('unhandled_attention'); else this.#completeTransition();
 	}
@@ -403,6 +435,13 @@ export class ArenaScriptEngine {
 	}
 
 	#handleYield(yielded, source) {
+		if (yielded.kind === 'watcher_decision') {
+			this.#watcherDecision = true;
+			this.#status = 'SUSPENDED';
+			this.#resumableUnhandled = true;
+			this.#requestModel(null, { priority: URGENT_PRIORITY, trigger: 'defensive_handler_completed' });
+			return;
+		}
 		if (yielded.kind === 'query') {
 			const queryId = `${this.#program.programId}:${this.#program.version}:${this.#generation}:${yielded.stateToken}`;
 			const authority = source?.authority ?? null;
@@ -454,7 +493,10 @@ export class ArenaScriptEngine {
 		if (yielded.kind === 'idle' && this.#deferredBase) {
 			if (this.#boundary.length > 0) return this.#runBoundary();
 			const deferred = this.#deferredBase; this.#deferredBase = null;
-			this.#handleYield(this.#vm.resumeDeferredCommand(deferred.result, this.#facts), 'step');
+			if (deferred.undispatched) {
+				this.#vm.restoreDeferredCommand(this.#facts);
+				this.#handleYield(deferred.undispatched, 'step');
+			} else this.#handleYield(this.#vm.resumeDeferredCommand(deferred.result, this.#facts), 'step');
 			return;
 		}
 		if (yielded.kind === 'idle' && source === 'step') {
@@ -479,16 +521,16 @@ function normalizeInstall(input, previousFacts = null) {
 	for (const [field, value] of [['agentId', agentId], ['provider', input.provider ?? 'unknown-provider'], ['modelIdentity', modelIdentity], ['reasoningEffort', input.reasoningEffort ?? 'unknown-reasoning'], ['serviceTier', input.serviceTier ?? 'unknown-tier'], ['traceId', input.traceId ?? defaultTraceId(agentId, goalRevision, input.version)], ['programId', input.programId]]) if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError(`ArenaScriptEngine ${field} must be a nonempty string`);
 	for (const [field, value] of [['goalRevision', goalRevision], ['version', input.version], ['eventSequence', input.eventSequence]]) if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`ArenaScriptEngine ${field} must be a nonnegative safe integer`);
 	const facts = createInterpreterFacts(input.observation, previousFacts);
-	return freezeRecord({ agentId: agentId.trim(), provider: (input.provider ?? 'unknown-provider').trim(), goalRevision, modelIdentity: modelIdentity.trim(), reasoningEffort: (input.reasoningEffort ?? 'unknown-reasoning').trim(), serviceTier: (input.serviceTier ?? 'unknown-tier').trim(), traceId: normalizeTraceId(input.traceId ?? defaultTraceId(agentId, goalRevision, input.version)), programId: input.programId.trim(), version: input.version, compiled: input.compiled, facts, factsSequence: input.eventSequence, eventSequence: input.eventSequence });
+	return freezeRecord({ agentId: agentId.trim(), provider: (input.provider ?? 'unknown-provider').trim(), goalRevision, modelIdentity: modelIdentity.trim(), reasoningEffort: (input.reasoningEffort ?? 'unknown-reasoning').trim(), serviceTier: (input.serviceTier ?? 'unknown-tier').trim(), traceId: normalizeTraceId(input.traceId ?? defaultTraceId(agentId, goalRevision, input.version)), programId: input.programId.trim(), version: input.version, compiled: input.compiled, parameters: validateProgramParameters(input.parameters), facts, factsSequence: input.eventSequence, eventSequence: input.eventSequence });
 }
 function normalizeDirectiveReplacement(input, current, requestedTraceId = undefined) {
 	if (!current || !input || typeof input !== 'object') throw new TypeError('ArenaScriptEngine replacement requires an active authenticated program');
-	for (const field of ['agentId', 'goalRevision', 'modelIdentity', 'observation', 'eventSequence']) if (Object.hasOwn(input, field)) throw new TypeError(`ArenaScriptEngine directive install may not supply ${field}`);
+	for (const field of ['agentId', 'goalRevision', 'modelIdentity', 'observation', 'eventSequence', 'parameters']) if (Object.hasOwn(input, field)) throw new TypeError(`ArenaScriptEngine directive install may not supply ${field}`);
 	if (!input.compiled?.ast || !Object.isFrozen(input.compiled)) throw new TypeError('ArenaScriptEngine requires a frozen compiled program');
 	for (const [field, value] of [['programId', input.programId]]) if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError(`ArenaScriptEngine ${field} must be a nonempty string`);
 	if (!Number.isSafeInteger(input.version) || input.version < 0) throw new TypeError('ArenaScriptEngine version must be a nonnegative safe integer');
 	const traceId = requestedTraceId === undefined ? current.traceId : normalizeTraceId(requestedTraceId);
-	return freezeRecord({ agentId: current.agentId, provider: current.provider, goalRevision: current.goalRevision, modelIdentity: current.modelIdentity, reasoningEffort: current.reasoningEffort, serviceTier: current.serviceTier, traceId, programId: input.programId.trim(), version: input.version, compiled: input.compiled });
+	return freezeRecord({ agentId: current.agentId, provider: current.provider, goalRevision: current.goalRevision, modelIdentity: current.modelIdentity, reasoningEffort: current.reasoningEffort, serviceTier: current.serviceTier, traceId, programId: input.programId.trim(), version: input.version, compiled: input.compiled, parameters: current.parameters });
 }
 function isNewer(next, current) { return next.goalRevision > current.goalRevision || (next.goalRevision === current.goalRevision && next.version > current.version); }
 function installationRelation(next, current) {
@@ -497,7 +539,7 @@ function installationRelation(next, current) {
 	if (!sameImmutableProgram(next, current)) return -1;
 	return next.eventSequence > current.eventSequence ? 0 : -1;
 }
-function sameImmutableProgram(next, current) { return next.agentId === current.agentId && next.modelIdentity === current.modelIdentity && next.programId === current.programId && next.compiled === current.compiled && next.compiled.source === current.compiled.source; }
+function sameImmutableProgram(next, current) { return next.agentId === current.agentId && next.modelIdentity === current.modelIdentity && next.programId === current.programId && next.compiled === current.compiled && next.compiled.source === current.compiled.source && JSON.stringify(next.parameters) === JSON.stringify(current.parameters); }
 function defaultTraceId(agentId, goalRevision, version) { return `trace-${String(agentId).replace(/[^A-Za-z0-9._:-]/g, '_')}-${goalRevision}-${version}`.slice(0, 128); }
 function normalizeTraceId(value) {
 	if (typeof value !== 'string' || value.trim().length === 0 || Buffer.byteLength(value, 'utf8') > 128 || [...value].some((character) => /[\u0000-\u001f\u007f]/u.test(character))) throw new TypeError('ArenaScriptEngine traceId must be a bounded string');

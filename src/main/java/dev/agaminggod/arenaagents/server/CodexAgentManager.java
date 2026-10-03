@@ -126,6 +126,15 @@ public final class CodexAgentManager {
 		);
 	}
 
+	/** A name read must not initialize a manager while players are joining or leaving. */
+	public static synchronized Optional<String> playerDisplayName(ServerPlayer player) {
+		CodexAgentManager manager = INSTANCES.get(player.level().getServer());
+		if (manager == null) return Optional.empty();
+		return manager.records().stream()
+				.filter(record -> OfflineAgentPlayers.isManagedFakePlayer(player, record.agentId(), record.profile()))
+				.map(record -> AgentIdentity.displayNameTag(record.profile())).findFirst();
+	}
+
 	public static synchronized void release(MinecraftServer server) {
 		CodexAgentManager manager = INSTANCES.remove(server);
 		if (manager != null) {
@@ -364,18 +373,21 @@ public final class CodexAgentManager {
 		Objects.requireNonNull(publicationBarrier, "publicationBarrier must not be null");
 		SkitModeRuntime.requireNormalControlAllowed(server, event.agentId());
 		PendingConversationWake[] staged = { null };
+		PendingConversationWake[] previousWake = { null };
 		try {
-			return savedData.registry().startAtomically(
-					event.agentId(), spec, System.currentTimeMillis(),
-					(transition, commit) -> {
+			BiConsumer<AgentTransition, Runnable> barrier = (transition, commit) -> {
 						PendingConversationWake wake = PendingConversationWake.create(event, transition);
-						savedData.stageConversationWake(wake);
+						previousWake[0] = savedData.stageConversationWakeReplacingPrior(wake).orElse(null);
 						staged[0] = wake;
 						publicationBarrier.accept(wake, commit);
-					}
-			);
+					};
+			AgentRecord current = savedData.registry().require(event.agentId());
+			return current.state().isActive() || current.state() == dev.agaminggod.arenaagents.agent.AgentLifecycleState.PAUSED
+					? savedData.registry().replaceAtomically(event.agentId(), spec, System.currentTimeMillis(), barrier)
+					: savedData.registry().startAtomically(event.agentId(), spec, System.currentTimeMillis(), barrier);
 		} catch (RuntimeException exception) {
 			if (staged[0] != null) savedData.rollbackConversationWake(staged[0].transactionId());
+			if (previousWake[0] != null) savedData.stageConversationWake(previousWake[0]);
 			throw exception;
 		}
 	}
@@ -422,7 +434,18 @@ public final class CodexAgentManager {
 			boolean operator,
 			GoalDraftChoice choice
 	) {
+		return resolveGoalDraft(draftId, actorId, operator, choice, "");
+	}
+
+	public Optional<GoalDraftResult> resolveGoalDraft(
+			UUID draftId,
+			UUID actorId,
+			boolean operator,
+			GoalDraftChoice choice,
+			String advisoryRoute
+	) {
 		Objects.requireNonNull(draftId, "draftId must not be null");
+		Objects.requireNonNull(advisoryRoute, "advisoryRoute must not be null");
 		PendingGoalDraft draft = savedData.goalDraft(draftId).orElse(null);
 		if (draft == null) return Optional.empty();
 		GoalDraftResolution.Operation operation = GoalDraftResolution.authorize(draft, actorId, operator, choice);
@@ -444,9 +467,9 @@ public final class CodexAgentManager {
 		validateGoalForActivation(spec);
 		long now = System.currentTimeMillis();
 		AgentTransition transition = switch (operation) {
-			case START -> savedData.registry().start(draft.agentId(), spec, now);
-			case REPLACE -> savedData.registry().replace(draft.agentId(), spec, now);
-			case QUEUE -> savedData.registry().queue(draft.agentId(), spec, now);
+			case START -> savedData.registry().start(draft.agentId(), spec, advisoryRoute, now);
+			case REPLACE -> savedData.registry().replace(draft.agentId(), spec, advisoryRoute, now);
+			case QUEUE -> savedData.registry().queue(draft.agentId(), spec, advisoryRoute, now);
 			case CANCEL -> throw new AssertionError("cancel handled above");
 		};
 		savedData.removeGoalDraft(draftId);
@@ -454,12 +477,17 @@ public final class CodexAgentManager {
 	}
 
 	public Optional<GoalDraftResult> activateTranslatedManagerDraft(PendingGoalDraft draft) {
+		return activateTranslatedManagerDraft(draft, "");
+	}
+
+	public Optional<GoalDraftResult> activateTranslatedManagerDraft(PendingGoalDraft draft, String advisoryRoute) {
 		Objects.requireNonNull(draft, "draft must not be null");
-		if (draft.intent() != DraftIntent.TRANSLATE_START && draft.intent() != DraftIntent.TRANSLATE_QUEUE) {
+		if (draft.intent() != DraftIntent.TRANSLATE_START && draft.intent() != DraftIntent.TRANSLATE_QUEUE
+				&& draft.intent() != DraftIntent.TRANSLATE_REPLACE) {
 			return Optional.empty();
 		}
 		return resolveGoalDraft(
-				draft.draftId(), draft.requestingPlayerId(), false, GoalDraftChoice.CONFIRM);
+				draft.draftId(), draft.requestingPlayerId(), false, GoalDraftChoice.CONFIRM, advisoryRoute);
 	}
 
 	public void validateGoalDraftTranslation(PendingGoalDraft draft, GoalPredicate predicate) {
@@ -468,14 +496,22 @@ public final class CodexAgentManager {
 		draft.translationConstraint().validate(predicate);
 		RegistryAccess registries = server == null ? RegistryAccess.EMPTY : server.registryAccess();
 		GoalCompiler compiler = goalCompiler == null ? new GoalCompiler() : goalCompiler;
-		compiler.translationConstraintFor(draft.originalRequest(), registries).validate(predicate);
+		compiler.supportedTranslationConstraintFor(draft.originalRequest(), registries).validate(predicate);
+		if ((draft.intent() == DraftIntent.TRANSLATE_START || draft.intent() == DraftIntent.TRANSLATE_QUEUE
+				|| draft.intent() == DraftIntent.TRANSLATE_REPLACE)
+				&& compiler.translationRequiresOperatorConfirmation(draft.originalRequest(), registries)
+				&& !GoalCompiler.requiresConfirmationOnEveryPath(predicate)) {
+			throw new AgentDomainException("GOAL_TRANSLATION_REQUIRES_CONFIRMATION",
+					"This open or subjective task needs operator confirmation before it can be marked complete");
+		}
 	}
 
 	public GoalPredicate normalizeGoalDraftTranslation(PendingGoalDraft draft, GoalPredicate predicate) {
 		Objects.requireNonNull(draft, "draft must not be null");
 		Objects.requireNonNull(predicate, "predicate must not be null");
 		GoalCompiler compiler = goalCompiler == null ? new GoalCompiler() : goalCompiler;
-		return compiler.normalizeTranslatedPredicate(draft.originalRequest(), predicate);
+		return compiler.normalizeTranslatedPredicate(draft.originalRequest(), predicate,
+				server == null ? RegistryAccess.EMPTY : server.registryAccess());
 	}
 
 	static void validateGoalDraftPredicate(
@@ -610,7 +646,7 @@ public final class CodexAgentManager {
 		Objects.requireNonNull(requestSink, "requestSink must not be null");
 		GoalCompilation compilation = compileGoalResult(prompt, sourceLevel);
 		return GoalSubmissionFlow.route(
-				compilation,
+				GoalCompiler.withAdvisoryPlan(compilation),
 				spec -> switch (operation) {
 					case START -> savedData.registry().start(record.agentId(), spec, System.currentTimeMillis());
 					case QUEUE -> savedData.registry().queue(record.agentId(), spec, System.currentTimeMillis());
@@ -630,7 +666,7 @@ public final class CodexAgentManager {
 	) {
 		UUID requester = PendingGoalDraft.requesterId(requestingPlayerId);
 		List<String> candidateIds = goalCompiler.candidateIdsFor(prompt, server.registryAccess(), liveAdvancementTitles());
-		var constraint = goalCompiler.translationConstraintFor(prompt, server.registryAccess());
+		var constraint = goalCompiler.supportedTranslationConstraintFor(prompt, server.registryAccess());
 		constraint.requireCatalog(candidateIds);
 		return new PendingGoalDraft(
 				UUID.randomUUID(), record.agentId(), requester, prompt,
@@ -1284,10 +1320,13 @@ public final class CodexAgentManager {
 				WaypointStyleAssets.ROOT_ID,
 				Identifier.fromNamespaceAndPath("arenaagents", stylePath)
 		);
-		if (!style.equals(player.waypointIcon().style)) {
+		var icon = player.waypointIcon();
+		var untintedColor = Optional.of(0xFFFFFFFF);
+		if (!style.equals(icon.style) || !untintedColor.equals(icon.color)) {
 			var manager = player.level().getWaypointManager();
 			manager.untrackWaypoint(player);
-			player.waypointIcon().style = style;
+			icon.style = style;
+			icon.color = untintedColor;
 			manager.trackWaypoint(player);
 		}
 	}
@@ -1670,7 +1709,7 @@ public final class CodexAgentManager {
 
 	public String displayName(AgentRecord target) {
 		Objects.requireNonNull(target, "target must not be null");
-		return AgentIdentity.displayName(target.agentId(), target.profile());
+		return AgentIdentity.displayNameTag(target.profile());
 	}
 
 	public AgentRecord resolve(String selector) {
@@ -1853,8 +1892,15 @@ public final class CodexAgentManager {
 	private void persistLiveAgentLocations() {
 		long now = System.currentTimeMillis();
 		for (AgentRecord record : records()) {
-			findAgentPlayer(record.agentId()).ifPresent(player ->
-					persistEntityLocation(record.agentId(), player, now, true));
+			// Carpet may retain a dead body or finish a recovery spawn before its registry commit.
+			// Shutdown only flushes the committed living body; it cannot attach or respawn one.
+			if (record.state() == dev.agaminggod.arenaagents.agent.AgentLifecycleState.DEAD
+					|| record.entityUuid().isEmpty()) continue;
+			findAgentPlayer(record.agentId())
+					.filter(ServerPlayer::isAlive)
+					.filter(player -> record.entityUuid().orElseThrow().equals(player.getUUID()))
+					.ifPresent(player ->
+							persistEntityLocation(record.agentId(), player, now, true));
 		}
 	}
 

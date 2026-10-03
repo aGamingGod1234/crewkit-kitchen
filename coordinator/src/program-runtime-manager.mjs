@@ -389,6 +389,10 @@ export class ProgramRuntimeManager {
 		let value;
 		try {
 			if (operation === 'inspect') value = await this.#inspectObservation(record, query);
+			else if (operation === 'taskMemory') {
+				const { kind, ...args } = normalizeMinecraftToolCall('taskMemory', query);
+				value = await this.#memoryOperation(record, { operation: 'task', arguments: args, provenance: authorship });
+			}
 			else {
 				const normalized = normalizeMinecraftToolCall(operation === 'remember' ? 'notebook' : 'queryMemory', query);
 				const args = operation === 'remember' ? { key: normalized.key, text: normalized.text }

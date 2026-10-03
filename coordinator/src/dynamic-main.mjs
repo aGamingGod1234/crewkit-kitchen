@@ -22,6 +22,8 @@ import { FactLedger } from './fact-ledger.mjs';
 import { InspectionClient } from './inspection-client.mjs';
 import { ModelNotebook } from './model-notebook.mjs';
 import { RuntimeMemoryContext } from './runtime-memory-context.mjs';
+import { TaskMemoryStore } from './task-memory-store.mjs';
+import { LiveTaskViews } from './live-task-view.mjs';
 import { ObservedMemoryStore } from './observed-memory-store.mjs';
 import { ExplorationOccupancy } from './explore-frontier.mjs';
 import { ProviderService } from './provider-service.mjs';
@@ -42,7 +44,7 @@ import { classifyRecoveryFailure } from './recovery-policy.mjs';
 import { ReportingTransitionDeduper } from './reporting-transition-deduper.mjs';
 import { NativeToolRuntime } from './native-tool-runtime.mjs';
 import { classifyNativeGoalError } from './native-goal-error-policy.mjs';
-import { MAX_GOAL_SPEC_CORRECTION_ATTEMPTS } from './goal-spec-translator.mjs';
+import { MAX_GOAL_SPEC_CORRECTION_ATTEMPTS, fallbackCompiledDragonGoal } from './goal-spec-translator.mjs';
 import { ProgramRuntimeManager } from './program-runtime-manager.mjs';
 import { createProviderChildEnvironment } from './provider-environment.mjs';
 import { PROVIDER_IDS } from './provider-identity.mjs';
@@ -53,6 +55,7 @@ import { BestEffortDiagnosticQueue } from './best-effort-diagnostic-queue.mjs';
 import { RotatingJsonlSink } from './rotating-jsonl-sink.mjs';
 import { sanitizeDiagnosticCode, sanitizeDiagnosticErrorCode, sanitizeDiagnosticErrorMessage, sanitizeDiagnosticText, sanitizeDiagnosticValue } from './diagnostic-sanitizer.mjs';
 import { FishTtsProvider } from './voice/fish-tts-provider.mjs';
+import { OpenAiTtsProvider, OpenAiSttProvider, DEFAULT_OPENAI_TTS_MODEL, DEFAULT_OPENAI_STT_MODEL } from './voice/openai-speech-provider.mjs';
 import { DeepgramSttProvider, NoSttProvider } from './voice/deepgram-stt-provider.mjs';
 import { LocalSpeechProvider } from './voice/local-speech-provider.mjs';
 import { providerCacheNamespace, tagSynthesisCacheNamespace } from './voice/tts-cache-identity.mjs';
@@ -109,6 +112,7 @@ const WINDOWS_TTS_FALLBACK_CODES = new Set([
 
 export class DynamicCoordinator extends EventEmitter {
 	#registry;
+	#taskViews;
 	#scheduler;
 	#codexService;
 	#planner;
@@ -189,7 +193,8 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#planner = requireDependency(planner, 'planner');
 		this.#bridge = requireDependency(bridge, 'bridge');
 		this.#inspections = new InspectionClient({ send: (type, agentId, payload, options) => this.#sendForEpoch(options.connectionEpoch, type, agentId, payload) });
-		this.#playerMemory = new RuntimeMemoryContext({ notebook: new ModelNotebook({ directory: memoryDirectory }), sessionId: runtimeSessionId });
+		this.#playerMemory = new RuntimeMemoryContext({ notebook: new ModelNotebook({ directory: memoryDirectory }), taskMemory: new TaskMemoryStore({ directory: memoryDirectory }), sessionId: runtimeSessionId });
+		this.#taskViews = new LiveTaskViews({ directory: memoryDirectory ? path.join(memoryDirectory, 'plans') : null });
 		this.#healthRegistry = requireDependency(healthRegistry, 'healthRegistry');
 		this.#latencyRegistry = requireDependency(latencyRegistry, 'latencyRegistry');
 		this.#goalSupervisor = requireDependency(goalSupervisor, 'goalSupervisor');
@@ -246,6 +251,7 @@ export class DynamicCoordinator extends EventEmitter {
 			benchmarkRecorder,
 		});
 		this.#nativeRuntime = new NativeToolRuntime({
+			taskPlan: (record, tool) => this.#taskViews.operate(record, tool),
 			sessionId: runtimeSessionId,
 			requestObservation: async (record) => {
 				const result = await this.#inspections.request(record, { section: 'observation' }, { connectionEpoch: this.#connectionEpoch });
@@ -254,6 +260,8 @@ export class DynamicCoordinator extends EventEmitter {
 			inspectObservation: (record, query, authority = {}) => this.#inspections.request(record, query, { ...authority, connectionEpoch: this.#connectionEpoch }),
 			notebook: this.#playerMemory.notebook,
 			memoryOperation: (record, operation) => this.#playerMemory.execute(record, operation),
+			taskContext: (record) => this.#playerMemory.taskContext(record),
+			memoryObservation: (record, observation) => this.#playerMemory.observe(record, observation),
 			executionSettings: (record) => this.#planner.getExecutionSettings?.(record.agentId) ?? null,
 			planningLeadTime: (record) => this.#planner.getNativeDecisionTiming?.(record.agentId)?.p95Ms ?? null,
 			occupancy: new ExplorationOccupancy({ memoryStore: new ObservedMemoryStore({ directory: memoryDirectory }) }),
@@ -272,6 +280,12 @@ export class DynamicCoordinator extends EventEmitter {
 				}
 			},
 			onProgramEvent: (record, event) => {
+				// Already-authorized successor work owns the body; no planner wake is needed.
+				if (event.event === 'program_handoff_started') {
+					this.#writeTrace('native_program_handoff_started', { agentId: record.agentId, goalRevision: record.goalRevision,
+						programId: event.programId, predecessorProgramId: event.predecessorProgramId, queueId: event.queueId });
+					return;
+				}
 				const connectionEpoch = this.#nativeRuntimeEpochs.get(record.agentId);
 				const lifecycleGeneration = this.#lifecycleGeneration(record.agentId);
 				const current = this.#registry.get(record.agentId);
@@ -321,11 +335,13 @@ export class DynamicCoordinator extends EventEmitter {
 		if (key.sessionEpoch !== connectionEpoch || key.profileFingerprint !== profileFingerprint(record)) return;
 		this.#writeTrace('work_lease_expired', { ...key, kind: lease.kind, operationId: lease.operationId });
 		this.#publishVerbose(key.agentId, key.goalRevision, 'retry', `${lease.kind} work timed out; recovering automatically.`);
+		let preserveProgram = false;
 		if (lease.kind === 'provider') {
 			const work = this.#providerWork.get(key.agentId);
 			if (work?.kind === 'native' && work.goalRevision === key.goalRevision
 				&& work.lifecycleGeneration === key.lifecycleGeneration
 				&& work.supervisionToken?.operationId === lease.operationId) {
+				preserveProgram = this.#preparationHasRunningProgram(work, record);
 				work.expired = true;
 				this.#restoreNativeConversation(work.steerRequest);
 				this.#restoreNativeConversation(work.request);
@@ -344,7 +360,7 @@ export class DynamicCoordinator extends EventEmitter {
 				void this.#reportAgentError(key.agentId, error, connectionEpoch);
 			}
 		}
-		if (['provider', 'action', 'completion'].includes(lease.kind)) {
+		if (['provider', 'action', 'completion'].includes(lease.kind) && !preserveProgram) {
 			this.#nativeObservationSignatures.delete(key.agentId);
 			void this.#nativeRuntime.dispose(key.agentId, `${lease.kind}_lease_expired`)
 				.catch((error) => this.#reportAgentError(key.agentId, error, connectionEpoch));
@@ -413,6 +429,8 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#programRuntime.disposeAll();
 		await this.#nativeRuntime.disposeAll();
 		await this.#playerMemory.markUnknown(undefined, 'COORDINATOR_STOPPED').catch((error) => this.#emitRuntimeError(error));
+		await this.#playerMemory.flush().catch((error) => this.#emitRuntimeError(error));
+		await this.#taskViews.flush().catch((error) => this.#emitRuntimeError(error));
 		this.#memorySummaries.clear();
 		this.#providerRetryAfter.clear();
 		this.#providerProbeDeadlines.clear();
@@ -593,6 +611,11 @@ export class DynamicCoordinator extends EventEmitter {
 				`Minecraft rejected ${MAX_GOAL_SPEC_CORRECTION_ATTEMPTS + 1} goal translation proposals; the pending draft requires operator correction or cancellation`,
 			), connectionEpoch);
 		});
+		this.#listen('task_view_request', (message, connectionEpoch) => {
+			const record = this.#registry.get(message.agentId);
+			if (record === null || record.goalRevision !== message.payload.goalRevision) return;
+			return this.#sendForEpoch(connectionEpoch, 'task_view', record.agentId, this.#taskViews.snapshot(record));
+		});
 		this.#listen('goal_control', (message, connectionEpoch) => {
 			let record;
 			let nativeDisposal = Promise.resolve();
@@ -636,6 +659,8 @@ export class DynamicCoordinator extends EventEmitter {
 				onAdmitted: () => {
 					const previous = this.#registry.get(message.agentId);
 					record = this.#registry.applyGoalControl(message.agentId, message.payload);
+					if (['start','replace','steer'].includes(message.payload.operation)) this.#taskViews.begin(record, { fresh: ['start','replace'].includes(message.payload.operation) });
+					if (message.payload.operation === 'dead') void this.#taskViews.observe(record, { ready: false, player: { dead: true } }).catch(() => {});
 					const lifecycleChanged = previous !== null && !['queue', 'dequeue'].includes(message.payload.operation)
 						&& (record.goalRevision > previous.goalRevision
 							|| (record.goalRevision === previous.goalRevision && ['dead', 'respawn'].includes(message.payload.operation)));
@@ -697,9 +722,9 @@ export class DynamicCoordinator extends EventEmitter {
 					throw error;
 				}
 				if (previous !== null && record.goalRevision > previous.goalRevision) {
-					this.#retireGoalSupervision(previous, 'start');
+					this.#retireGoalSupervision(previous, message.payload.control.operation);
 					this.#invalidateAcceptedLifecycle(message.agentId);
-					this.#programRuntime.onGoalControl(previous, 'start');
+					this.#programRuntime.onGoalControl(previous, message.payload.control.operation);
 					await this.#nativeRuntime.dispose(previous.agentId, 'conversation_wake');
 					if (!this.#isConnectionEpochCurrent(connectionEpoch)) return;
 				}
@@ -733,6 +758,7 @@ export class DynamicCoordinator extends EventEmitter {
 				this.#goalSupervisor.factualProgress(supervisionKey, factualProgressSignature(wireObservation), factualProgressDetails(wireObservation));
 				if (this.#usesNativeTools(record)) this.#nativeRuntimeEpochs.set(record.agentId, connectionEpoch);
 				const observation = adaptObservation(wireObservation);
+				void this.#taskViews.observe(record, observation).catch((error) => this.#writeTrace('task_view_observation_error', { code: error?.code ?? 'PLAN_VIEW_ERROR' }));
 				this.#playerMemory.observe(record, observation);
 				const memoryKey = `${record.goalRevision}:${this.#playerMemory.worldId(record)}`;
 				if (this.#memorySummaries.get(record.agentId)?.key !== memoryKey) {
@@ -903,9 +929,10 @@ export class DynamicCoordinator extends EventEmitter {
 			return this.#enqueueAgent(message.agentId, async () => {
 				const current = this.#registry.get(message.agentId);
 				if (current === null || current.goalRevision !== message.payload.goalRevision) return;
-				if (this.#usesNativeTools(current) && this.#nativeRuntime.onCompletionResult(current, message.payload)) return;
+				if (this.#usesNativeTools(current) && this.#nativeRuntime.onCompletionResult(current, message.payload)) { if (message.payload.verified) this.#taskViews.verified(current); return; }
 				const accepted = this.#programRuntime.onCompletionResult(current, message.payload);
 				if (!accepted) throw new ProtocolV2Error('UNEXPECTED_COMPLETION_RESULT', `Agent '${message.agentId}' has no matching completion request`);
+				if (message.payload.verified) this.#taskViews.verified(current);
 			}, { connectionEpoch, transactional: true });
 		});
 		this.#listen('disconnected', (event) => {
@@ -1177,11 +1204,14 @@ export class DynamicCoordinator extends EventEmitter {
 		while (state.resources.size > MAX_NATIVE_RESOURCE_MEMORY) state.resources.delete(state.resources.values().next().value);
 		const looping = detectMovementLoop(state.positions);
 		const movementLoop = looping && state.movementLoopActive !== true;
+		const previousPlayer = state.player;
+		state.player = observation.player;
 		// Repeated samples of the same unresolved loop are not new decisions.
 		// Moving out of it rearms attention without an arbitrary cooldown.
 		state.movementLoopActive = looping;
 		this.#nativeWorldSignals.set(record.agentId, state);
 		return {
+			previousPlayer,
 			movementLoop,
 			resourceDiscovery,
 		};
@@ -1294,10 +1324,10 @@ export class DynamicCoordinator extends EventEmitter {
 		}
 		const verboseReporter = this.#verboseReporter(record.agentId, record.goalRevision, { allowPublicAgentMessage: true, connectionEpoch: request.connectionEpoch });
 		work.promise = Promise.resolve()
-			.then(() => this.#planner.requestNativeTurn({
+			.then(async () => this.#planner.requestNativeTurn({
 				agentId: record.agentId,
 				goalRevision: record.goalRevision,
-				input: this.#nativeTurnInput(record, request),
+				input: await this.#nativeTurnInput(record, request),
 				recoverySummary: record.lastSummary,
 				priority: request.priority,
 				preserveState: request.preserveState === true,
@@ -1317,6 +1347,11 @@ export class DynamicCoordinator extends EventEmitter {
 		const event = request?.nativeEvent;
 		return event?.event !== 'program_planning_due'
 			|| this.#nativeRuntime.canPrepareProgram(record, event.programId, event.status?.programVersion);
+	}
+
+	#preparationHasRunningProgram(work, record) {
+		return (work.request?.nativeEvent?.event === 'program_planning_due' || work.preparingProgram != null)
+			&& this.#nativeRuntime.hasProgram(record);
 	}
 
 	#queueNativeSteer(work, request) {
@@ -1357,10 +1392,11 @@ export class DynamicCoordinator extends EventEmitter {
 					|| work.steerQueued?.priority === 'urgent'
 					|| work.pending?.priority === 'urgent'
 					|| work.steerPromise !== null) return;
+			work.preparingProgram = { programId: request.nativeEvent.programId, programVersion: request.nativeEvent.status?.programVersion };
 			await this.#planner.steerNativeTurn({
 				agentId: work.agentId,
 				goalRevision: work.goalRevision,
-				input: this.#nativeTurnInput(record, request, { deliverConversation: false }),
+				input: await this.#nativeTurnInput(record, request, { deliverConversation: false }),
 			});
 			this.#writeTrace('native_turn_prepared', {
 				agentId: work.agentId,
@@ -1400,7 +1436,7 @@ export class DynamicCoordinator extends EventEmitter {
 				await this.#planner.steerNativeTurn({
 					agentId: work.agentId,
 					goalRevision: work.goalRevision,
-					input: this.#nativeTurnInput(record, request),
+					input: await this.#nativeTurnInput(record, request),
 				});
 				if (!isCurrent()) { work.steerQueued = null; return; }
 				this.#writeTrace('native_turn_steered', {
@@ -1466,6 +1502,7 @@ export class DynamicCoordinator extends EventEmitter {
 			work.toolSupervisionToken = supervisionToken;
 			this.#goalSupervisor.progress(work.supervisionToken);
 			result = await this.#nativeRuntime.execute(toolRequest, record, { lifecycleGeneration: work.lifecycleGeneration });
+			if (result?.advisory === 'program_planning_due') work.preparingProgram = { programId: result.programId, programVersion: result.programVersion };
 			const current = this.#registry.get(work.agentId);
 			if (current?.goalRevision === work.goalRevision
 				&& this.#isConnectionEpochCurrent(work.connectionEpoch)
@@ -1561,6 +1598,14 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#restoreNativeConversation(work.request);
 		if (classification === 'stale') {
 			if (work.request.conversationOnly === true) this.#goalSupervisor.terminate(work.supervisionKey);
+			this.#reschedulePendingNativeTurn(pending);
+			return null;
+		}
+		if (this.#preparationHasRunningProgram(work, record)) {
+			this.#writeTrace('native_preparation_failed_current_program_preserved', { agentId: work.agentId, goalRevision: work.goalRevision,
+				errorCode: sanitizeDiagnosticErrorCode(error, { fallback: 'NATIVE_TURN_FAILED' }) });
+			this.#goalSupervisor.ensure(work.supervisionKey, 'program_preparation_failed');
+			await this.#reportAgentError(work.agentId, error, work.connectionEpoch);
 			this.#reschedulePendingNativeTurn(pending);
 			return null;
 		}
@@ -2217,6 +2262,14 @@ export class DynamicCoordinator extends EventEmitter {
 		let publishedAgentMessage = false;
 		const reporter = (stage, message) => {
 			try {
+				const viewRecord = this.#registry.get(agentId);
+				if (viewRecord !== null && viewRecord.goalRevision === goalRevision && this.#isConnectionEpochCurrent(connectionEpoch)) {
+					this.#taskViews.event(viewRecord, stage, message);
+					if (stage === 'live_usage') {
+						const value = JSON.parse(message), usage = this.#taskViews.snapshot(viewRecord).usage;
+						if (usage !== null) this.#writeTrace('native_token_usage', { agentId, goalRevision, scope: 'thread_total', sessionKey: createHash('sha256').update(String(value.threadId ?? '')).digest('hex'), ...usage });
+					}
+				}
 				if (!this.#verboseEnabled) return;
 				if (allowPublicAgentMessage && stage === 'agent_message') {
 					if (publishedAgentMessage) return;
@@ -2245,6 +2298,8 @@ export class DynamicCoordinator extends EventEmitter {
 
 	#publishVerbose(agentId, goalRevision, stage, message, connectionEpoch = this.#connectionEpoch, transition = {}) {
 		try {
+			const viewRecord = this.#registry.get(agentId);
+			if (viewRecord !== null && viewRecord.goalRevision === goalRevision && this.#isConnectionEpochCurrent(connectionEpoch)) this.#taskViews.event(viewRecord, stage, message);
 			const bounded = sanitizeVerboseMessage(stage, message);
 			if (bounded.length === 0) return;
 			const identity = verboseTransitionIdentity(stage, bounded, transition);
@@ -2365,11 +2420,13 @@ export class DynamicCoordinator extends EventEmitter {
 			return {
 				untrustedFacts: ledger.toPlannerFacts(),
 				conversationContext: memory.toPlannerContext(),
+				taskMemory: record === null ? null : this.#playerMemory.peekTaskContext(record),
 			};
 		}
 		const binding = this.#contextBinding(record);
 		return {
 			factLedger: ledger,
+			taskMemory: this.#playerMemory.peekTaskContext(record),
 			conversationMemory: memory,
 			contextCursor: cursor,
 			contextBinding: binding,
@@ -2495,14 +2552,26 @@ export class DynamicCoordinator extends EventEmitter {
 				request: entry.request,
 				...(entry.correctiveFeedback === null ? {} : { correctiveFeedback: entry.correctiveFeedback }),
 			});
+			if (entry.proposal.plan !== undefined) {
+				this.#taskViews.suggest(entry.agentId, entry.request.originalRequest, entry.proposal.plan);
+				const { plan, ...wireProposal } = entry.proposal;
+				entry.proposal = wireProposal;
+			}
 			entry.attempts = 0;
 		} catch (error) {
 			if (this.#goalSpecRequests.get(key) !== entry) return;
-			entry.attempts += 1;
 			this.#emitRuntimeError(error);
-			const delay = Math.min(GOAL_SPEC_RETRY_MAX_MS, GOAL_SPEC_RETRY_BASE_MS * (2 ** Math.min(entry.attempts - 1, 5)));
-			this.#scheduleGoalSpecRequest(key, entry, delay);
-			return;
+			// Only an exact, server-constrained dragon goal may proceed when its
+			// optional Luna advice is unavailable. Other translations keep retrying.
+			if (entry.correctiveFeedback === null) {
+				entry.proposal = fallbackCompiledDragonGoal(entry.request);
+			}
+			if (entry.proposal === null) {
+				entry.attempts += 1;
+				const delay = Math.min(GOAL_SPEC_RETRY_MAX_MS, GOAL_SPEC_RETRY_BASE_MS * (2 ** Math.min(entry.attempts - 1, 5)));
+				this.#scheduleGoalSpecRequest(key, entry, delay);
+				return;
+			}
 		} finally {
 			entry.translating = false;
 		}
@@ -2546,8 +2615,12 @@ export class DynamicCoordinator extends EventEmitter {
 		return memory;
 	}
 
-	#nativeTurnInput(record, request, { deliverConversation = true } = {}) {
+	async #nativeTurnInput(record, request, { deliverConversation = true } = {}) {
 		if (request.nativeEvent === undefined) return request.input;
+		const taskMemory = request.nativeEvent.event === 'program_planning_due' ? null : await this.#playerMemory.taskContext(record);
+		if (this.#registry.get(record.agentId)?.goalRevision !== record.goalRevision
+			|| !this.#isConnectionEpochCurrent(request.connectionEpoch)
+			|| !this.#isLifecycleGenerationCurrent(record.agentId, request.lifecycleGeneration)) throw Object.assign(new Error('Native input belongs to an obsolete lifecycle'), { code: 'STALE_PLAN' });
 		const memory = this.#conversationMemory(record.agentId);
 		const afterSequence = this.#nativeConversationSequences.get(record.agentId) ?? -1;
 		const conversation = memory.unread(afterSequence);
@@ -2562,6 +2635,7 @@ export class DynamicCoordinator extends EventEmitter {
 		}
 		const input = buildNativeEventInput(record, {
 			...request.nativeEvent,
+			taskMemory,
 			observation: this.#nativeRuntime.decorateObservation(record, request.nativeEvent.observation ?? {}),
 			conversation: deliveredConversation,
 		});
@@ -2605,7 +2679,8 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 	const config = normalizeDynamicConfig(configValue, coordinatorEnvironment);
 	const providerEnvironments = Object.fromEntries(PROVIDER_IDS.map((provider) => [
 		provider,
-		createProviderChildEnvironment(provider, coordinatorEnvironment, config.bridge.secretEnvironmentVariable),
+		createProviderChildEnvironment(provider, coordinatorEnvironment, config.bridge.secretEnvironmentVariable,
+			config.voice.provider === 'openai' ? { speechApiKeyEnvironmentVariable: config.voice.openaiApiKeyEnvironmentVariable } : {}),
 	]));
 	const registry = dependencies.registry ?? new AgentRegistry({
 		agentCap: config.limits.agentCap,
@@ -2759,7 +2834,7 @@ export function normalizeDynamicConfig(value, environment = process.env) {
 	assertOptionalConfigObject(value.kimi, 'kimi');
 	assertOptionalConfigObject(value.cursor, 'cursor');
 	assertKnownConfigKeys(value.bridge, ['host', 'port', 'secret', 'secretEnvironmentVariable', 'reconnectDelayMs', 'maxReconnectDelayMs', 'connectionQueueCap', 'agentQueueCap', 'inboundConnectionQueueCap', 'inboundAgentQueueCap', 'inboundDispatchBatch', 'trackedTerminalActionIdCap', 'handshakeTimeoutMs', 'heartbeatIntervalMs', 'heartbeatTimeoutMs', 'serverInstanceId', 'launchId'], 'bridge');
-	assertKnownConfigKeys(value.voice ?? {}, ['port', 'maxConcurrent', 'profileAssignmentsPath', 'fishApiKeyEnvironmentVariable', 'deepgramApiKeyEnvironmentVariable', 'localSpeechTimeoutMs', 'localSpeechPythonPath', 'secret', 'secretFile'], 'voice');
+	assertKnownConfigKeys(value.voice ?? {}, ['port', 'maxConcurrent', 'profileAssignmentsPath', 'provider', 'openaiApiKeyEnvironmentVariable', 'openaiTtsModel', 'openaiSttModel', 'fishApiKeyEnvironmentVariable', 'deepgramApiKeyEnvironmentVariable', 'localSpeechTimeoutMs', 'localSpeechPythonPath', 'secret', 'secretFile'], 'voice');
 	assertKnownConfigKeys(value.codex, ['cwd', 'controlProtocol', 'planningTimeoutMs', 'maxDecisionBytes', 'catalogTtlMs', 'startupTimeoutMs', 'serviceTier', 'launchProfile'], 'codex');
 	if (value.codex.launchProfile !== undefined) {
 		assertOptionalConfigObject(value.codex.launchProfile, 'codex.launchProfile');
@@ -3008,6 +3083,11 @@ export async function startVoiceWorker(config, environment = process.env, depend
 		environment[voice.deepgramApiKeyEnvironmentVariable ?? DEFAULT_DEEPGRAM_API_KEY_ENVIRONMENT_VARIABLE],
 	);
 	const platform = dependencies.platform ?? process.platform;
+	const openaiApiKey = firstNonBlank(environment[voice.openaiApiKeyEnvironmentVariable ?? 'OPENAI_API_KEY']);
+	if (voice.provider === 'openai') {
+		if (openaiApiKey === null) throw codedRuntimeError('VOICE_OPENAI_KEY_MISSING', 'Set OPENAI_API_KEY on the host and restart Minecraft to enable OpenAI speech');
+		return startOpenAiVoiceWorker(voice, openaiApiKey, dependencies, { signal, reportVoiceDiagnostic, localSpeechTimeoutMs });
+	}
 	const createLocalSpeechProvider = dependencies.createLocalSpeechProvider
 		?? ((options) => LocalSpeechProvider.createIfAvailable(options));
 	if (typeof createLocalSpeechProvider !== 'function') throw new TypeError('createLocalSpeechProvider must be a function');
@@ -3133,6 +3213,37 @@ export async function startVoiceWorker(config, environment = process.env, depend
 			],
 			dependencies.cleanupTimeoutMs ?? 1_000,
 		);
+		throw error;
+	}
+}
+
+async function startOpenAiVoiceWorker(voice, apiKey, dependencies, { signal, reportVoiceDiagnostic, localSpeechTimeoutMs }) {
+	let profiles = null;
+	let profileStore = null;
+	let worker = null;
+	try {
+		const secret = await resolveVoiceSecret(voice, dependencies.readVoiceSecret ?? readFile);
+		throwIfVoiceStartupAborted(signal);
+		const loadProfiles = dependencies.loadProfileStore ?? loadPersistentVoiceProfileStore;
+		profiles = await loadProfiles(dependencies.profilePath ?? voice.profileAssignmentsPath
+			?? path.resolve(PROJECT_DIRECTORY, DEFAULT_VOICE_PROFILE_ASSIGNMENTS_PATH), { ...(dependencies.voiceProfileIo ?? {}), signal });
+		throwIfVoiceStartupAborted(signal);
+		profileStore = voiceProfileStoreWithLifecycle(profiles);
+		const provider = (dependencies.createOpenAiTtsProvider ?? (options => new OpenAiTtsProvider(options)))({ apiKey, model: voice.openaiTtsModel ?? DEFAULT_OPENAI_TTS_MODEL });
+		const sttProvider = (dependencies.createOpenAiSttProvider ?? (options => new OpenAiSttProvider(options)))({ apiKey, model: voice.openaiSttModel ?? DEFAULT_OPENAI_STT_MODEL });
+		worker = (dependencies.createVoiceServer ?? createVoiceHttpServer)({
+			provider, sttProvider, profileStore, secret, port: voice.port ?? DEFAULT_VOICE_PORT,
+			maxConcurrent: voice.maxConcurrent ?? DEFAULT_VOICE_MAX_CONCURRENT, requestTimeoutMs: localSpeechTimeoutMs,
+			directorUsesPrimaryProvider: true, onDiagnostic: reportVoiceDiagnostic,
+		});
+		await worker.start({ signal });
+		throwIfVoiceStartupAborted(signal);
+		emitVoiceDiagnostic(reportVoiceDiagnostic, { code: 'VOICE_OPENAI_CONFIGURED', effectiveProvider: provider.cacheNamespace(), reason: 'openai_credential_configured' });
+		return worker;
+	} catch (error) {
+		await settleVoiceBootstrapCleanup([
+			() => worker?.close(), () => profileStore === null ? closeLoadedVoiceProfiles(profiles) : profileStore.close(),
+		], dependencies.cleanupTimeoutMs ?? 1_000);
 		throw error;
 	}
 }
@@ -3622,9 +3733,18 @@ function normalizeVoiceConfig(value, environment) {
 		maxConcurrent,
 		profileAssignmentsPath,
 		localSpeechTimeoutMs,
+		provider: requireSpeechProvider(source.provider ?? 'legacy'),
+		openaiApiKeyEnvironmentVariable: requireEnvironmentVariableName(source.openaiApiKeyEnvironmentVariable ?? 'OPENAI_API_KEY', 'voice.openaiApiKeyEnvironmentVariable'),
+		openaiTtsModel: source.openaiTtsModel ?? DEFAULT_OPENAI_TTS_MODEL,
+		openaiSttModel: source.openaiSttModel ?? DEFAULT_OPENAI_STT_MODEL,
 		fishApiKeyEnvironmentVariable: requireEnvironmentVariableName(source.fishApiKeyEnvironmentVariable ?? DEFAULT_FISH_API_KEY_ENVIRONMENT_VARIABLE, 'voice.fishApiKeyEnvironmentVariable'),
 		deepgramApiKeyEnvironmentVariable: requireEnvironmentVariableName(source.deepgramApiKeyEnvironmentVariable ?? DEFAULT_DEEPGRAM_API_KEY_ENVIRONMENT_VARIABLE, 'voice.deepgramApiKeyEnvironmentVariable'),
 	};
+}
+
+function requireSpeechProvider(value) {
+	if (!['openai', 'legacy'].includes(value)) throw new TypeError('voice.provider must be openai or legacy');
+	return value;
 }
 
 async function resolveVoiceSecret(voice, readSecretFile) {
@@ -3844,16 +3964,21 @@ function finiteOrNull(value) {
 export function classifyObservationTrigger(payload, observation, signals = null) {
 	const explicitTrigger = typeof payload.trigger === 'string' && payload.trigger.trim().length > 0 ? payload.trigger.trim().slice(0, 128) : null;
 	const attention = payload.attention === true;
-	if (explicitTrigger !== null) return { attention: true, priority: payload.priority === 'urgent' ? 'urgent' : 'ordinary', trigger: explicitTrigger };
+	if (explicitTrigger !== null) return { attention: true, priority: payload.priority === 'urgent' || ['damage', 'lava', 'fire', 'suffocation', 'fall'].includes(explicitTrigger) ? 'urgent' : 'ordinary', trigger: explicitTrigger };
 	const changedFacts = Array.isArray(payload.changedFacts) ? payload.changedFacts : [];
 	const joinedFacts = changedFacts.filter((value) => typeof value === 'string').join('|').toLowerCase();
 	const player = observation?.player ?? {};
-	if (joinedFacts.includes('health') || joinedFacts.includes('attacker') || joinedFacts.includes('damage')) return { attention: true, priority: 'urgent', trigger: 'damage' };
-	if (joinedFacts.includes('lava')) return { attention: true, priority: 'urgent', trigger: 'lava' };
-	if (joinedFacts.includes('fire') || player.fire === true) return { attention: true, priority: 'urgent', trigger: 'fire' };
+	const before = signals?.previousPlayer;
+	const healthDecreased = Number.isFinite(player.health) && Number.isFinite(before?.health) && player.health < before.health;
+	// The server's health delta already means damage. When both samples are
+	// available, also exclude healing from legacy/general-purpose deltas.
+	const healthDelta = joinedFacts.includes('health') && (!Number.isFinite(before?.health) || !Number.isFinite(player.health) || healthDecreased);
+	if (healthDecreased || healthDelta || joinedFacts.includes('attacker') || joinedFacts.includes('damage')) return { attention: true, priority: 'urgent', trigger: 'damage' };
+	if (player.inLava === true || joinedFacts.includes('player.inlava')) return { attention: true, priority: 'urgent', trigger: 'lava' };
+	if (joinedFacts.includes('fire') || player.onFire === true || player.fire === true) return { attention: true, priority: 'urgent', trigger: 'fire' };
 	if (joinedFacts.includes('suffoc') || joinedFacts.includes('air')) return { attention: true, priority: 'urgent', trigger: 'suffocation' };
 	if (joinedFacts.includes('fall')) return { attention: true, priority: 'urgent', trigger: 'fall' };
-	if (Array.isArray(observation?.blocks) && observation.blocks.some((block) => typeof block?.blockId === 'string' && block.blockId.toLowerCase().includes('lava'))) return { attention: true, priority: 'urgent', trigger: 'lava' };
+	// Visible lava is relevant evidence, not proof the player is inside it.
 	if (signals?.movementLoop === true) return { attention: true, priority: 'urgent', trigger: 'movement_loop' };
 	if (signals?.resourceDiscovery === true) return { attention: true, priority: 'ordinary', trigger: 'resource_discovery' };
 	if (!attention) return { attention: false, priority: 'ordinary', trigger: 'observation' };
@@ -3937,7 +4062,7 @@ function sameSupervisionKey(left, right) {
 		&& left?.profileFingerprint === right?.profileFingerprint;
 }
 
-export function buildNativeEventInput(record, { event, trigger, programId, status, result, planningLeadMs, eventSequence, observation = {}, conversation = { mode: 'unread', baseSequence: -1, nextSequence: -1, entries: [] }, conversationOnly = false } = {}) {
+export function buildNativeEventInput(record, { event, trigger, programId, status, result, planningLeadMs, eventSequence, taskMemory = null, observation = {}, conversation = { mode: 'unread', baseSequence: -1, nextSequence: -1, entries: [] }, conversationOnly = false } = {}) {
 	const eventName = typeof event === 'string' && event.length > 0 ? event : event?.event;
 	const normalizedEvent = typeof eventName === 'string' && eventName.length > 0 ? eventName : 'observation';
 	const eventPlanningLeadMs = status?.planningLeadMs ?? planningLeadMs ?? event?.planningLeadMs;
@@ -4014,12 +4139,13 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 		goal: record?.currentGoal ?? null,
 		goalSpec: record?.currentGoalSpec ?? null,
 		goalRevision: record?.goalRevision ?? 0,
+		...(taskMemory === null ? {} : { taskMemory }),
 		...(eventSequence === undefined ? {} : { eventSequence }),
 		observation: isPlanningDue ? compactPlanningDueObservation(compactObservation) : compactObservation,
 		conversation: unreadConversation,
 		...(programId === undefined ? {} : { program: { programId,
-			...(status === undefined ? {} : { state: status.state, engineState: status.engineState, programVersion: status.programVersion, deadlineEpochMs: status.deadlineEpochMs, planningLeadMs: status.planningLeadMs ?? eventPlanningLeadMs, decision: status.decision }),
-			...(result === undefined ? {} : { result: { state: result.state, reasonCode: result.reasonCode, actions: result.actions, receipts: result.receipts?.slice(-8), omittedReceipts: Math.max(0, (result.receipts?.length ?? 0) - 8) + (result.omittedReceipts ?? 0) } }) } }),
+			...(status === undefined ? {} : { state: status.state, engineState: status.engineState, programVersion: status.programVersion, deadlineEpochMs: status.deadlineEpochMs, planningLeadMs: status.planningLeadMs ?? eventPlanningLeadMs, decision: status.decision, pendingSuccessor: status.pendingSuccessor }),
+			...(result === undefined ? {} : { result: { state: result.state, reasonCode: result.reasonCode, actions: result.actions, actionsSucceeded: result.actionsSucceeded, actionsFailed: result.actionsFailed, programVersion: result.programVersion, queueId: result.queueId, predecessorProgramId: result.predecessorProgramId, discardedSuccessor: result.discardedSuccessor, receipts: result.receipts?.slice(-8), omittedReceipts: Math.max(0, (result.receipts?.length ?? 0) - 8) + (result.omittedReceipts ?? 0) } }) } }),
 	};
 	let json = JSON.stringify(payload);
 	if (Buffer.byteLength(json, 'utf8') > 16_384) {

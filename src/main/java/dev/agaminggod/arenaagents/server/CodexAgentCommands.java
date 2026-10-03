@@ -22,6 +22,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.CompletionException;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
@@ -44,7 +45,7 @@ import org.slf4j.LoggerFactory;
 
 public final class CodexAgentCommands {
 	private static final Logger LOGGER = LoggerFactory.getLogger(CodexAgentCommands.class);
-	private static final String DEFAULT_MODEL = "gpt-5.6-luna";
+	private static final String DEFAULT_MODEL = "gpt-6-luna";
 	private static final String DEFAULT_REASONING = "xhigh";
 	private static final String DEFAULT_CODEX_SERVICE_TIER = "fast";
 	private static final String PROVIDER_CODEX = "codex";
@@ -942,34 +943,56 @@ public final class CodexAgentCommands {
 	)
 			throws CommandSyntaxException {
 		try {
-			Vec3 summonPosition = context.getSource().getPosition();
-			if (context.getSource().getEntity() != null) {
-				summonPosition = AgentSpawnPlacement.availableNear(
-						context.getSource().getLevel(),
-						summonPosition,
-						context.getSource().getEntity().getLookAngle()
-				);
+			CommandSourceStack source = context.getSource();
+			if (source.getEntity() == null) {
+				return summonAt(context, source.getPosition(), provider, model, reasoning, serviceTier, userName, gameMode);
 			}
-			CodexAgentManager manager = manager(context);
-			AgentRecord record = manager.summon(
-					context.getSource().getLevel(),
-					summonPosition,
-					provider,
-					model,
-					reasoning,
-					serviceTier,
-					userName,
-					gameMode
-			);
-			context.getSource().sendSuccess(
-					() -> Component.literal("Creating " + manager.displayName(record) + ". It will be ready when its player joins."),
-					false
-			);
+			// Vanilla may load chunks asynchronously. Never wait for that work on the server thread.
+			var placement = AgentSpawnPlacement.availableNear(source.getLevel(), source.getPosition(), source.getEntity().getLookAngle());
+			if (!placement.isDone()) {
+				source.sendSuccess(() -> Component.literal("Finding a player spawn position nearby."), false);
+			}
+			placement.whenCompleteAsync((position, failure) -> {
+				if (failure != null) {
+					reportSummonFailure(source, failure);
+					return;
+				}
+				try {
+					summonAt(context, position, provider, model, reasoning, serviceTier, userName, gameMode);
+				} catch (RuntimeException exception) {
+					reportSummonFailure(source, exception);
+				}
+			}, source.getServer());
 			return 1;
 		} catch (AgentDomainException exception) {
 			throw commandFailure(exception);
 		} catch (RuntimeException exception) {
 			throw unexpectedFailure("summon", exception);
+		}
+	}
+
+	private static int summonAt(
+			CommandContext<CommandSourceStack> context, Vec3 position,
+			String provider, String model, String reasoning, String serviceTier,
+			Optional<String> userName, AgentGameMode gameMode
+	) {
+		CodexAgentManager manager = manager(context);
+		AgentRecord record = manager.summon(context.getSource().getLevel(), position,
+				provider, model, reasoning, serviceTier, userName, gameMode);
+		context.getSource().sendSuccess(
+				() -> Component.literal("Creating " + manager.displayName(record) + ". It will be ready when its player joins."), false);
+		return 1;
+	}
+
+	private static void reportSummonFailure(CommandSourceStack source, Throwable failure) {
+		while (failure instanceof CompletionException && failure.getCause() != null) {
+			failure = failure.getCause();
+		}
+		if (failure instanceof AgentDomainException exception) {
+			source.sendFailure(Component.literal(exception.code() + ": " + exception.getMessage()));
+		} else {
+			LOGGER.error("Unexpected /codex summon failure", failure);
+			source.sendFailure(Component.literal("INTERNAL_ERROR: summon failed; see the server log"));
 		}
 	}
 
@@ -1265,7 +1288,7 @@ public final class CodexAgentCommands {
 
 	private static String formatStatus(AgentRecord record) {
 		String currentGoal = record.currentGoal().map(goal -> goal.prompt()).orElse("none");
-		return dev.agaminggod.arenaagents.agent.AgentIdentity.displayName(record.agentId(), record.profile())
+		return dev.agaminggod.arenaagents.agent.AgentIdentity.displayNameTag(record.profile())
 				+ " | " + dev.agaminggod.arenaagents.control.AgentControlPresentation.stateLabel(record.state().name())
 				+ ". Current task: " + currentGoal
 				+ ". Queued tasks: " + record.queuedGoals().size() + ".";

@@ -19,7 +19,9 @@ export function compileScenarioProgram(manifest, { limits = DEFAULT_ARENA_SCRIPT
 	const normalizedLimits = normalizeArenaScriptLimits(limits);
 	const commands = normalizeManifestCommands(manifest, normalizedLimits);
 	const lines = [
-		'program.onUnhandledAttention("continue_and_notify");',
+		// Fixed timing manifests explicitly retain their prescribed command chain
+		// through hazard attention. Survival-default behavior has separate tests.
+		'program.onUnhandledAttention("continue_and_notify", {survival:"continue_and_notify"});',
 		...commands.map(({ member, arguments: args }) => `await player.${member}(${member === 'respawn' ? '' : stableJson(args)});`),
 		'program.finish("scenario-complete");',
 	];

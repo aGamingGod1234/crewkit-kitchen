@@ -89,6 +89,10 @@ export function createProviderChildEnvironment(provider, environment = process.e
 	if (options.forwardProxyEnvironment !== undefined && typeof options.forwardProxyEnvironment !== 'boolean') {
 		throw new TypeError('forwardProxyEnvironment must be a boolean');
 	}
+	const speechCredential = options.speechApiKeyEnvironmentVariable;
+	if (speechCredential !== undefined && (typeof speechCredential !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(speechCredential))) {
+		throw new TypeError('speechApiKeyEnvironmentVariable must be an environment variable name');
+	}
 	const allowedNames = [
 		...OS_BOOTSTRAP_ENVIRONMENT_VARIABLES,
 		...PROVIDER_ENVIRONMENT_VARIABLES[normalizedProvider],
@@ -103,6 +107,8 @@ export function createProviderChildEnvironment(provider, environment = process.e
 	if (typeof configuredBridgeSecretName === 'string' && configuredBridgeSecretName.trim().length > 0) {
 		delete childEnvironment[configuredBridgeSecretName.trim().toUpperCase()];
 	}
+	// A speech-only OpenAI key must not change the gameplay provider's saved-login billing.
+	if (speechCredential !== undefined) delete childEnvironment[speechCredential.toUpperCase()];
 	return childEnvironment;
 }
 

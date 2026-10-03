@@ -114,7 +114,7 @@ message tells you when the script is saved. Review it before clicking Play.
 Voice choices appear in a dropdown as `Name - sound, gender`. Fish synthesis uses
 `s2.1-pro-free`. Character defaults give Astra, Fable, Grok, Gemini, and Kimi distinct
 original voices. **Say line** uses the currently selected settings; **Set voice**
-saves them for that actor's future dialogue. Named Director voices require Fish and
+saves them for that actor's future dialogue. In legacy speech mode, named Director voices require Fish and
 never fall back to Windows or local synthesis. On the host, configure `FISH_AUDIO_API_KEY`
 or save a valid key in `arena-agents-runtime/runtime/fish-api-key.txt` beneath the game
 directory, then restart Minecraft. Missing or rejected keys produce a setup error.
@@ -149,7 +149,7 @@ pre-render audio or promise frame-exact dialogue against camera movement.
 /codex skit summon codex ChatGPT
 /codex skit summon claude Claude
 /codex skit summon kimi Kimi
-/codex skit summon codex model gpt-5.6-sol "GPT 5.6-Sol"
+/codex skit summon codex model gpt-6.1-sol "GPT 6.1-Sol"
 /codex skit place ChatGPT here
 /codex skit place Claude at 12 72 -4 180 0
 /codex skit place Claude relative 2 0 4
@@ -202,6 +202,20 @@ require the optional Arena Agents Voice add-on and Simple Voice Chat. Missing vo
 support or a failed line gives an error and stops the dialogue, including a take
 that depends on it. Stop also cancels the final audible line. Explicit speed and
 supported delivery tone settings reach the synthesis provider.
+
+The default speech provider is OpenAI: `gpt-4o-mini-tts` reads the selected agent's
+exact reply, and `gpt-transcribe` turns consented microphone audio into text for
+that same agent. Speech models do not decide gameplay or generate replies. Add
+`OPENAI_API_KEY` in Windows **Environment Variables for your account**, then
+restart the launcher and Minecraft. The key is read on the host, never embedded
+in the JAR, and is withheld from gameplay provider processes so Codex keeps its
+existing sign-in. In `arena-agents-runtime/runtime/dynamic-agents.json`, set
+`voice.provider` to `openai`; `openaiTtsModel`, `openaiSttModel`, and
+`openaiApiKeyEnvironmentVariable` select the speech models and key variable.
+Existing external configuration is preserved during mod updates, so older
+installs need this provider setting once. Saved agent and Director profile IDs
+map consistently to OpenAI's built-in voices. Use `legacy` explicitly to retain
+the previous Fish, Deepgram, or local speech routing.
 
 The client-only camera director records the operator's current camera position and
 rotation as keyframes, then replays them with smooth position interpolation and

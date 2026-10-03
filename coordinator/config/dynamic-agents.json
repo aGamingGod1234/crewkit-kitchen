@@ -8,6 +8,10 @@
 		"maxReconnectDelayMs": 5000
 	},
 	"voice": {
+		"provider": "openai",
+		"openaiApiKeyEnvironmentVariable": "OPENAI_API_KEY",
+		"openaiTtsModel": "gpt-4o-mini-tts",
+		"openaiSttModel": "gpt-transcribe",
 		"port": 8766,
 		"maxConcurrent": 5,
 		"profileAssignmentsPath": "runtime/voice-profile-assignments.json",
@@ -20,7 +24,7 @@
 		"catalogTtlMs": 60000,
 		"serviceTier": "priority",
 		"launchProfile": {
-			"model": "gpt-5.6-luna",
+			"model": "gpt-6-luna",
 			"reasoningEffort": "xhigh",
 			"serviceTier": "fast"
 		}

@@ -23,6 +23,7 @@ import net.minecraft.resources.Identifier;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.Item;
 
 public final class GoalCompiler {
@@ -53,6 +54,8 @@ public final class GoalCompiler {
 	);
 	private static final Pattern ITEM = Pattern.compile("^(get|obtain|collect|bring|gather|acquire|fetch|craft|make) (?:me )?(?:(?:at least )?(" + COUNT + ") )?(?:(?:a|an|some) )?(.+?)(?: for me)?$");
 	private static final Pattern ITEM_ALTERNATIVE_COUNT = Pattern.compile("^(?:at least\\s+)?(" + COUNT + ")\\s+(.+)$");
+	private static final Pattern ITEM_BLOCK_OF = Pattern.compile("^blocks? of (.+)$");
+	private static final Pattern NAMED_TOOL_SET = Pattern.compile("^([a-z]+) tools?\\s*(?:[:,]|\\band\\b)\\s*(.+)$");
 	private static final Pattern REFERENCED_ITEM_CLAUSE = Pattern.compile("^(?:keep|retain|hold|carry)\\s+(?:it|them|these|those)(?:\\s.*)?$");
 	private static final Pattern BLOCK = Pattern.compile("^(build|construct|place|put|set|mine|break|destroy) (?:with |using |from )?(?:(?:a|an|some|the) )?(.+?)(?: for me)?$");
 	private static final Pattern BLOCK_LOCATION_SUFFIX = Pattern.compile(
@@ -117,7 +120,7 @@ public final class GoalCompiler {
 		Objects.requireNonNull(advancementExists, "advancementExists must not be null");
 		Objects.requireNonNull(dimensionId, "dimensionId must not be null");
 		String original = AgentValidators.normalizePrompt(request);
-		String command = stripTrailingPunctuation(stripPoliteness(original.toLowerCase(Locale.ROOT)));
+		String command = normalizedCommand(original);
 		TranslationLeafBudget translationBudget = candidateTranslationBudget(command, compoundClauses(command));
 		if (!translationBudget.valid()) return GoalCompilation.rejected(translationBudget.rejection());
 		if (SUBJECTIVE.matcher(command).find()) {
@@ -173,6 +176,27 @@ public final class GoalCompiler {
 				return GoalCompilation.rejected("The requested item count is outside the supported range.");
 			}
 			if (count <= 0) return GoalCompilation.rejected("The requested item count must be positive.");
+			List<String> namedTools = namedToolSetItems(item.group(3), registries);
+			if (!namedTools.isEmpty()) {
+				GoalPredicate predicate = toolSetPredicate(namedTools, count);
+				if (GoalInventoryCapacity.exceeds(predicate, registries)) return unrepresentableItemCount();
+				return accepted(original, predicate, createdAtTick, "Goal set: obtain the requested tools.");
+			}
+			if (isGenericBlockTarget(item.group(3))) {
+				GoalPredicate predicate = new GoalPredicate.InventoryContainsBlock(count);
+				if (GoalInventoryCapacity.exceeds(predicate, registries)) return unrepresentableItemCount();
+				return accepted(original, predicate, createdAtTick, "Goal set: obtain any placeable block x" + count + ".");
+			}
+			if (isGenericWoodTarget(item.group(3))) {
+				List<String> woodItems = woodItemIds(registries);
+				if (woodItems.isEmpty()) return GoalCompilation.rejected("No wood items are registered on this server.");
+				if (woodItems.size() > GoalPredicate.MAX_INVENTORY_ITEM_IDS) {
+					return GoalCompilation.needsTranslation("The wood category is too broad; name a wood type.");
+				}
+				GoalPredicate predicate = new GoalPredicate.InventoryContainsAny(woodItems, count);
+				if (GoalInventoryCapacity.exceeds(predicate, registries)) return unrepresentableItemCount();
+				return accepted(original, predicate, createdAtTick, "Goal set: obtain wood x" + count + ".");
+			}
 			List<String> matches = matchItems(item.group(3), registries);
 			if (matches.size() == 1) {
 				String itemId = matches.getFirst();
@@ -244,8 +268,8 @@ public final class GoalCompiler {
 	}
 
 	/**
-	 * Speech is only consumed as a goal change when the agent is idle, or the player already
-	 * opted into replace/queue through {@code /agent goal}. Busy agents keep working and still hear the line.
+	 * Speech changes the goal when the agent is idle or the caller has authorized replacement.
+	 * The live router grants replacement to typed or spoken task requests from an operator.
 	 */
 	public static boolean consumePlayerSpeechAsGoal(boolean hasActiveGoal, String text, boolean replaceOrQueueOptIn) {
 		if (replaceOrQueueOptIn) return looksLikeGoalRequest(text) || isLiveSteeringRequest(text);
@@ -255,7 +279,8 @@ public final class GoalCompiler {
 	}
 
 	private static String normalizedCommand(String request) {
-		return stripTrailingPunctuation(stripPoliteness(AgentValidators.normalizePrompt(request).toLowerCase(Locale.ROOT)));
+		return stripTrailingPunctuation(stripPoliteness(AgentValidators.normalizePrompt(request).toLowerCase(Locale.ROOT)))
+				.replaceFirst("\\s+now$", "");
 	}
 
 	public List<String> candidateIdsFor(String request, RegistryAccess registries) {
@@ -264,14 +289,23 @@ public final class GoalCompiler {
 
 	public GoalTranslationConstraint translationConstraintFor(String request, RegistryAccess registries) {
 		Objects.requireNonNull(registries, "registries must not be null");
-		String command = stripTrailingPunctuation(stripPoliteness(
-				AgentValidators.normalizePrompt(request).toLowerCase(Locale.ROOT)));
+		String command = normalizedCommand(request);
+		Matcher namedItems = ITEM.matcher(command);
+		if (namedItems.matches()) {
+			List<String> tools = namedToolSetItems(namedItems.group(3), registries);
+			if (!tools.isEmpty()) {
+				int count = namedItems.group(2) == null ? 1 : parseCount(namedItems.group(2));
+				return new GoalTranslationConstraint(List.of(), tools.stream().map(id ->
+						new GoalTranslationConstraint.ItemClause(List.of(
+								new GoalTranslationConstraint.ItemAlternative(List.of(id), count)))).toList());
+			}
+		}
 		List<GoalClause> clauses = compoundClauses(command);
 		TranslationLeafBudget budget = candidateTranslationBudget(command, clauses);
 		if (!budget.valid()) {
 			throw new AgentDomainException("GOAL_TRANSLATION_CONSTRAINT_MISMATCH", budget.rejection());
 		}
-		if (BEAT_GAME_TRANSLATION.matcher(command).matches() && !BEAT_GAME.matcher(command).matches()) {
+		if (BEAT_GAME_TRANSLATION.matcher(command).matches()) {
 			return new GoalTranslationConstraint(
 					List.of(new GoalTranslationConstraint.KillClause(List.of(
 							new GoalTranslationConstraint.KillAlternative(List.of("minecraft:ender_dragon"), 1)
@@ -306,12 +340,69 @@ public final class GoalCompiler {
 				: new GoalTranslationConstraint(killClauses, itemClauses);
 	}
 
-	/** Removes redundant subjective confirmation from Minecraft's objective beat-the-game terminal result. */
+	/** Expensive dragon goals get an advisory plan before the objective kill goal starts. */
+	public static GoalCompilation withAdvisoryPlan(GoalCompilation compilation) {
+		Objects.requireNonNull(compilation, "compilation must not be null");
+		if (compilation.acceptedSpec().isPresent()
+				&& compilation.acceptedSpec().orElseThrow().completion()
+						instanceof GoalPredicate.EntityKilledByAgent kill
+				&& kill.entityType().equals("minecraft:ender_dragon")) {
+			return GoalCompilation.needsTranslation("Preparing advisory subgoals for the dragon goal.");
+		}
+		return compilation;
+	}
+
+	/** Unknown registry nouns may still start as open tasks, but require human completion evidence. */
+	public GoalTranslationConstraint supportedTranslationConstraintFor(String request, RegistryAccess registries) {
+		try {
+			return translationConstraintFor(request, registries);
+		} catch (AgentDomainException exception) {
+			if (!isUnsupportedTranslationCatalog(exception)) throw exception;
+			return GoalTranslationConstraint.none();
+		}
+	}
+
+	public boolean translationRequiresOperatorConfirmation(String request, RegistryAccess registries) {
+		String command = normalizedCommand(request);
+		if (SUBJECTIVE.matcher(command).find() || BLOCK.matcher(command).matches()) return true;
+		Matcher item = ITEM.matcher(command);
+		if (item.matches() && isCraftingVerb(item.group(1))) return true;
+		try {
+			translationConstraintFor(request, registries);
+		} catch (AgentDomainException exception) {
+			if (!isUnsupportedTranslationCatalog(exception)) throw exception;
+			return true;
+		}
+		return candidateIdsFor(request, registries).isEmpty()
+				&& !SURVIVE.matcher(command).matches();
+	}
+
+	public static boolean requiresConfirmationOnEveryPath(GoalPredicate predicate) {
+		return switch (predicate) {
+			case GoalPredicate.OperatorConfirmed ignored -> true;
+			case GoalPredicate.AllOf all -> all.predicates().stream().anyMatch(GoalCompiler::requiresConfirmationOnEveryPath);
+			case GoalPredicate.AnyOf any -> any.predicates().stream().allMatch(GoalCompiler::requiresConfirmationOnEveryPath);
+			default -> false;
+		};
+	}
+
+	private static boolean isUnsupportedTranslationCatalog(AgentDomainException exception) {
+		return exception.code().equals("GOAL_TRANSLATION_CANDIDATES_UNAVAILABLE")
+				|| exception.code().equals("GOAL_TRANSLATION_CATALOG_TOO_BROAD");
+	}
+
+	/** Factual acquisition and kill goals do not need an extra human completion gate. */
 	public GoalPredicate normalizeTranslatedPredicate(String request, GoalPredicate predicate) {
+		return normalizeTranslatedPredicate(request, predicate, RegistryAccess.EMPTY);
+	}
+
+	public GoalPredicate normalizeTranslatedPredicate(String request, GoalPredicate predicate, RegistryAccess registries) {
 		Objects.requireNonNull(predicate, "predicate must not be null");
-		String command = stripTrailingPunctuation(stripPoliteness(
-				AgentValidators.normalizePrompt(request).toLowerCase(Locale.ROOT)));
-		if (!BEAT_GAME_TRANSLATION.matcher(command).matches() || BEAT_GAME.matcher(command).matches()) return predicate;
+		String command = normalizedCommand(request);
+		GoalTranslationConstraint constraint = supportedTranslationConstraintFor(request, registries);
+		boolean factualRequest = !constraint.killClauses().isEmpty() || !constraint.itemClauses().isEmpty();
+		if (!BEAT_GAME_TRANSLATION.matcher(command).matches()
+				&& (!factualRequest || translationRequiresOperatorConfirmation(request, registries))) return predicate;
 		GoalPredicate normalized = withoutOperatorConfirmation(predicate);
 		return normalized == null ? predicate : normalized;
 	}
@@ -342,8 +433,12 @@ public final class GoalCompiler {
 	) {
 		Objects.requireNonNull(registries, "registries must not be null");
 		Objects.requireNonNull(liveAdvancementTitles, "liveAdvancementTitles must not be null");
-		String command = stripTrailingPunctuation(stripPoliteness(
-				AgentValidators.normalizePrompt(request).toLowerCase(Locale.ROOT)));
+		String command = normalizedCommand(request);
+		Matcher namedItems = ITEM.matcher(command);
+		if (namedItems.matches()) {
+			List<String> tools = namedToolSetItems(namedItems.group(3), registries);
+			if (!tools.isEmpty()) return tools.stream().sorted().toList();
+		}
 		List<GoalClause> clauses = compoundClauses(command);
 		if (!candidateTranslationBudget(command, clauses).valid()) return List.of();
 		if (clauses.size() > 1) {
@@ -787,7 +882,31 @@ public final class GoalCompiler {
 		return GoalCompilation.accepted(GoalSpec.create(original, predicate, createdAtTick), message);
 	}
 
+	private static List<String> namedToolSetItems(String target, RegistryAccess registries) {
+		Matcher set = NAMED_TOOL_SET.matcher(target);
+		if (!set.matches()) return List.of();
+		// Speech may omit the list's comma and repeat a conjunction while naming tools.
+		List<String> names = List.of(set.group(2).split("\\s*(?:,\\s*(?:and\\s+)?|\\s+(?:and\\s+)+)\\s*", -1));
+		if (names.size() > MAX_COMPOUND_LEAVES) return List.of();
+		ArrayList<String> tools = new ArrayList<>();
+		for (String name : names) {
+			String kind = name.replaceFirst("^(?:a|an|the)\\s+", "").strip();
+			if (!Set.of("axe", "hoe", "pickaxe", "shovel", "sword").contains(kind)) return List.of();
+			List<String> matches = matchItems(set.group(1) + " " + kind, registries);
+			if (matches.size() != 1 || tools.contains(matches.getFirst())) return List.of();
+			tools.add(matches.getFirst());
+		}
+		return List.copyOf(tools);
+	}
+
+	private static GoalPredicate toolSetPredicate(List<String> tools, int count) {
+		List<GoalPredicate> predicates = tools.stream().<GoalPredicate>map(id -> new GoalPredicate.InventoryContains(id, count)).toList();
+		return predicates.size() == 1 ? predicates.getFirst() : new GoalPredicate.AllOf(predicates);
+	}
+
 	private static List<String> matchItems(String target, RegistryAccess registries) {
+		List<String> blockItems = namedBlockItems(target, registries);
+		if (!blockItems.isEmpty()) return blockItems;
 		String wanted = normalizedTarget(target);
 		Set<String> forms = singularForms(wanted);
 		ArrayList<String> matches = new ArrayList<>();
@@ -806,6 +925,9 @@ public final class GoalCompiler {
 	private static List<String> relatedItems(String target, RegistryAccess registries) {
 		String wanted = catalogTarget(target);
 		if (wanted.isEmpty()) return List.of();
+		if (isGenericWoodTarget(wanted)) return woodItemIds(registries);
+		List<String> blockItems = namedBlockItems(wanted, registries);
+		if (!blockItems.isEmpty()) return blockItems;
 		Set<String> forms = singularForms(wanted);
 		Registry<Item> itemRegistry = registries.lookup(Registries.ITEM).orElse(BuiltInRegistries.ITEM);
 		boolean tools = wanted.endsWith(" tool") || wanted.endsWith(" tools");
@@ -821,7 +943,51 @@ public final class GoalCompiler {
 							|| path.endsWith(" " + form) || description.endsWith(" " + form))
 							|| tools && path.startsWith(material + " ") && toolKinds.contains(path.substring(material.length() + 1));
 				})
+			.map(Identifier::toString).distinct().sorted().toList();
+	}
+
+	private static boolean isGenericWoodTarget(String target) {
+		return switch (normalizedTarget(target).toLowerCase(Locale.ROOT)) {
+			case "wood", "block of wood", "blocks of wood", "wood block", "wood blocks" -> true;
+			default -> false;
+		};
+	}
+
+	private static boolean isGenericBlockTarget(String target) {
+		return switch (normalizedTarget(target).toLowerCase(Locale.ROOT)) {
+			case "block", "blocks" -> true;
+			default -> false;
+		};
+	}
+
+	private static List<String> woodItemIds(RegistryAccess registries) {
+		Registry<Item> items = registries.lookup(Registries.ITEM).orElse(BuiltInRegistries.ITEM);
+		return items.keySet().stream()
+				.filter(id -> items.getValue(id) instanceof BlockItem)
+				.filter(id -> {
+					String name = id.getPath();
+					return name.endsWith("_log") || name.endsWith("_wood")
+							|| name.endsWith("_stem") || name.endsWith("_hyphae");
+				})
+				.map(Identifier::toString).sorted().toList();
+	}
+
+	/** A spoken "block of dirt" names the dirt block item; "block of iron" names iron_block. */
+	private static List<String> namedBlockItems(String target, RegistryAccess registries) {
+		Matcher phrase = ITEM_BLOCK_OF.matcher(normalizedTarget(target).toLowerCase(Locale.ROOT));
+		if (!phrase.matches()) return List.of();
+		Registry<Item> items = registries.lookup(Registries.ITEM).orElse(BuiltInRegistries.ITEM);
+		for (String name : List.of(phrase.group(1) + " block", phrase.group(1))) {
+			Set<String> forms = singularForms(name);
+			List<String> matches = items.keySet().stream()
+				.filter(id -> items.getValue(id) instanceof BlockItem
+					&& forms.stream().anyMatch(form -> id.toString().equals(form)
+						|| pathName(id).equals(form)
+						|| descriptionName(items.getValue(id).getDescriptionId()).equals(form)))
 				.map(Identifier::toString).distinct().sorted().toList();
+			if (!matches.isEmpty()) return matches;
+		}
+		return List.of();
 	}
 
 	private static List<String> relatedBlocks(String target, RegistryAccess registries) {
@@ -940,7 +1106,9 @@ public final class GoalCompiler {
 
 	private static String stripPoliteness(String request) {
 		String result = request;
-		for (String prefix : List.of("hey, ", "hey ", "please ", "can you ", "could you ", "would you ", "go and ")) {
+		for (String prefix : List.of("hey, ", "hey ", "nice, ", "okay, ", "ok, ", "alright, ", "please ", "can you ", "could you ", "would you ",
+				"i want you to ", "i need you to ", "i'd like you to ", "i’d like you to ",
+				"your goal is to ", "your task is to ", "your objective is to ", "go ahead and ", "go and ")) {
 			if (result.startsWith(prefix)) {
 				result = result.substring(prefix.length()).strip();
 				return stripPoliteness(result);

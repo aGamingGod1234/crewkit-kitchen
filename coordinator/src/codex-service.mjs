@@ -2,7 +2,8 @@ import { CodexStdioTransport, CodexProtocolError, listCodexModels } from './code
 import { DEFAULT_AGENT_CAP, DEFAULT_SERVICE_TIER } from './constants.mjs';
 import { parseDecision } from './decision-parser.mjs';
 import { ModelCatalogCache } from './model-catalog-cache.mjs';
-import { MINECRAFT_DYNAMIC_TOOLS, NATIVE_AGENT_INSTRUCTIONS, normalizeMinecraftToolCall, toolResultContent } from './native-minecraft-tools.mjs';
+import { MAX_TOOL_RESULT_BYTES, MINECRAFT_DYNAMIC_TOOLS, NATIVE_AGENT_INSTRUCTIONS, normalizeMinecraftToolCall, toolResultContent } from './native-minecraft-tools.mjs';
+import { encodeModelFacts, encodeNativeEventInput, ModelObservationViews } from './model-fact-encoding.mjs';
 import { PLANNER_OUTPUT_SCHEMA, PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
 import { createSessionMetadata, profileFingerprint } from './provider-session.mjs';
 import { recordProviderTurn } from './provider-turn-recorder.mjs';
@@ -374,9 +375,9 @@ export class CodexService {
 	}
 }
 
-function nativeInstructions(minecraftInstructions, skillInstructions = '') {
-	if (minecraftInstructions === '') return NATIVE_AGENT_INSTRUCTIONS;
-	return `${NATIVE_AGENT_INSTRUCTIONS}\n\nWorkspace instructions for this Minecraft body (authoritative):\n${minecraftInstructions}${skillInstructions === '' ? '' : `\n\nBundled minecraft-control skill (already loaded; no filesystem read needed):\n${skillInstructions}`}`;
+export function nativeInstructions(minecraftInstructions, skillInstructions = '', agentInstructions = NATIVE_AGENT_INSTRUCTIONS) {
+	if (minecraftInstructions === '') return agentInstructions;
+	return `${agentInstructions}\n\nWorkspace instructions for this Minecraft body (authoritative):\n${minecraftInstructions}${skillInstructions === '' ? '' : `\n\nBundled minecraft-control skill (already loaded; no filesystem read needed):\n${skillInstructions}`}`;
 }
 
 export class SharedCodexAgent {
@@ -398,6 +399,7 @@ export class SharedCodexAgent {
 	#prewarmTurnPromise = null;
 	#disposed = false;
 	#invalidationError = null;
+	#observationViews = new ModelObservationViews();
 
 	constructor(profile, threadId, transport, dependencies = {}) {
 		this.#profile = structuredClone(profile);
@@ -431,7 +433,10 @@ export class SharedCodexAgent {
 		for (const field of turnStarted ? ['model', 'serviceTier', 'reasoningEffort'] : ['model', 'serviceTier']) {
 			const value = response?.[field] ?? response?.turn?.[field];
 			if (typeof value !== 'string' || value.length === 0 || value.length > 256) continue;
-			if (value !== this.#profile[field]) throw new CodexProtocolError('PROVIDER_SETTINGS_MISMATCH', `Codex did not confirm the selected ${field}`);
+			// Codex reports the Fast service tier as "priority" even when it was requested as "fast".
+			if (field === 'serviceTier' ? !sameCodexServiceTier(value, this.#profile[field]) : value !== this.#profile[field]) {
+				throw new CodexProtocolError('PROVIDER_SETTINGS_MISMATCH', `Codex did not confirm the selected ${field}`);
+			}
 			this.#executionSettings.effective[field] = value;
 			this.#executionSettings.evidence[field] = 'provider_reported';
 		}
@@ -451,6 +456,7 @@ export class SharedCodexAgent {
 		if (revision < this.#goalRevision) throw new CodexProtocolError('STALE_GOAL_REVISION', `Goal revision ${revision} is older than ${this.#goalRevision}`);
 		if (revision === this.#goalRevision) return;
 		this.#goalRevision = revision;
+		this.#observationViews.reset();
 		if (this.#active !== null && this.#active.goalRevision !== revision) await this.interrupt();
 	}
 
@@ -628,6 +634,7 @@ export class SharedCodexAgent {
 			goalRevision,
 			executeTool,
 			onVerbose,
+			observationViews: this.#observationViews,
 			onProviderActivity: () => {
 				silenceDeadline.restart();
 				if (this.#active?.collector === collector) this.#active.onProgress?.({ phase: 'provider' });
@@ -662,7 +669,7 @@ export class SharedCodexAgent {
 		try {
 			const turnStartPromise = this.#transport.request('turn/start', {
 				threadId: this.#threadId,
-				input: [{ type: 'text', text: input }],
+				input: [{ type: 'text', text: encodeNativeEventInput(input, this.#observationViews) }],
 				model: this.#profile.model,
 				effort: this.#profile.reasoningEffort,
 				serviceTier: this.#profile.serviceTier,
@@ -729,7 +736,7 @@ export class SharedCodexAgent {
 			steerPromise = Promise.resolve().then(() => this.#transport.request('turn/steer', {
 				threadId: this.#threadId,
 				expectedTurnId: turnId,
-				input: [{ type: 'text', text: input }],
+				input: [{ type: 'text', text: encodeNativeEventInput(input, this.#observationViews) }],
 			}));
 			previousExecutor = active.collector.replaceExecuteTool(async (request) => {
 				await steerPromise;
@@ -739,7 +746,7 @@ export class SharedCodexAgent {
 			steerPromise = this.#transport.request('turn/steer', {
 				threadId: this.#threadId,
 				expectedTurnId: turnId,
-				input: [{ type: 'text', text: input }],
+				input: [{ type: 'text', text: encodeNativeEventInput(input, this.#observationViews) }],
 			});
 		}
 		try {
@@ -754,6 +761,7 @@ export class SharedCodexAgent {
 	}
 
 	async interrupt() {
+		this.#observationViews.reset();
 		const active = this.#active;
 		active?.cancel(new CodexProtocolError('STALE_PLAN', 'Codex turn was interrupted'));
 		if (active?.turnId === null || active?.turnId === undefined) return;
@@ -890,7 +898,22 @@ function isRateLimitError(error) {
 		.some((key) => info[key]?.httpStatusCode === 429);
 }
 
-function createNativeTurnCollector({ transport, threadId, agentId, goalRevision, executeTool, onVerbose, onProviderActivity = () => {}, onToolExecutionStart = () => {}, onToolExecutionEnd = () => {} }) {
+export function presentNativeToolResult(value, tool, views = new ModelObservationViews()) {
+	// Keep the existing coverage/truncation contract and compress exactly the
+	// facts it would have delivered. Internal ArenaScript reads stay untouched.
+	const response = toolResultContent(value);
+	const original = JSON.parse(response.contentItems[0].text);
+	const prepared = views.prepare(original, tool);
+	const text = JSON.stringify(encodeModelFacts(prepared.value));
+	if (Buffer.byteLength(text, 'utf8') > MAX_TOOL_RESULT_BYTES) {
+		views.reset();
+		return { response, commit() {} };
+	}
+	return { response: { ...response, contentItems: [{ type: 'inputText', text }] }, commit: prepared.commit };
+}
+
+function createNativeTurnCollector({ transport, threadId, agentId, goalRevision, executeTool, onVerbose, observationViews = new ModelObservationViews(), onProviderActivity = () => {}, onToolExecutionStart = () => {}, onToolExecutionEnd = () => {} }) {
+	const liveMessages = new Map();
 	let expectedTurnId = null;
 	let bufferedRequests = [];
 	let publishedAgentMessage = false;
@@ -920,6 +943,7 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 			let executionStarted = false;
 			try {
 				const tool = normalizeMinecraftToolCall(params.tool, params.arguments);
+				safeVerbose(onVerbose, 'live_tool', `${params.tool} ${JSON.stringify(params.arguments).slice(0, 1200)}`);
 				onToolExecutionStart(tool);
 				executionStarted = true;
 				const result = await executor({
@@ -930,7 +954,12 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 					callId: params.callId,
 					tool,
 				});
-				if (!settled) transport.respond(id, toolResultContent(result));
+				if (!settled) {
+					const presented = presentNativeToolResult(result, tool, observationViews);
+					transport.respond(id, presented.response);
+					presented.commit();
+					safeVerbose(onVerbose, 'live_result', presented.response.contentItems[0].text.slice(0, 1200));
+				}
 			} catch (error) {
 				if (settled) return;
 				transport.respond(id, toolResultContent({
@@ -967,8 +996,26 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 		void respondToTool(request);
 	};
 	const onNotification = ({ method, params }) => {
+		if (params?.threadId === threadId && (method === 'thread/compacted' || ['item/started', 'item/completed'].includes(method) && params?.item?.type === 'contextCompaction')) observationViews.reset();
+		// Usage is a thread notification without a turn ID. Account limits are
+		// shared account state; neither should be discarded by the turn filter.
+		if (method === 'account/rateLimits/updated') {
+			const limits = params?.rateLimits;
+			if (limits) safeVerbose(onVerbose, 'live_allowance', JSON.stringify({ primary: limits.primary, secondary: limits.secondary }));
+			return;
+		}
+		if (method === 'thread/tokenUsage/updated' && params?.threadId === threadId) {
+			safeVerbose(onVerbose, 'live_usage', JSON.stringify({ ...params.tokenUsage?.total, threadId, last: params.tokenUsage?.last, reportedAtEpochMs: Date.now() }));
+			return;
+		}
 		if (params?.threadId !== threadId || expectedTurnId === null || notificationTurnId(params) !== expectedTurnId) return;
 		onProviderActivity();
+		if (['item/agentMessage/delta', 'item/reasoning/summaryTextDelta'].includes(method) && typeof params.delta === 'string') {
+			const key = `${method}:${params.itemId ?? expectedTurnId}`;
+			const text = ((liveMessages.get(key) ?? '') + params.delta).slice(-2048);
+			liveMessages.set(key, text); if (liveMessages.size > 128) liveMessages.delete(liveMessages.keys().next().value);
+			safeVerbose(onVerbose, method === 'item/agentMessage/delta' ? 'live_delta' : 'live_summary', text);
+		}
 		if (method === 'item/completed' && params?.item?.type === 'agentMessage' && typeof params.item.text === 'string') {
 			if (!publishedAgentMessage) {
 				publishedAgentMessage = true;
@@ -1062,6 +1109,10 @@ function createProviderSilenceDeadline(timeoutMs, schedule, cancelSchedule) {
 
 function safeVerbose(callback, stage, message) {
 	if (typeof callback !== 'function') return;
+	if (stage.startsWith('live_')) {
+		try { Promise.resolve(callback(stage, String(message ?? '').slice(0, 2048))).catch(() => {}); } catch { /* read-only view */ }
+		return;
+	}
 	if (stage === 'output') {
 		reportVisibleOutput(callback, String(message ?? ''));
 		return;
@@ -1146,6 +1197,10 @@ function exactLaunchProfileCatalog(profile) {
 		supportedReasoningEfforts: [profile.reasoningEffort],
 		serviceTiers: [profile.serviceTier],
 	}];
+}
+
+function sameCodexServiceTier(reported, requested) {
+	return reported === requested || (reported === 'priority' && requested === 'fast');
 }
 
 function assertReconciliationActive(signal) {

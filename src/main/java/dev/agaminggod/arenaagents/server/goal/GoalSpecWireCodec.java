@@ -35,6 +35,9 @@ public final class GoalSpecWireCodec {
 				JsonArray items = new JsonArray(); value.itemIds().forEach(items::add);
 				json.add("itemIds", items); json.addProperty("count", value.count());
 			}
+			case GoalPredicate.InventoryContainsBlock value -> {
+				json.addProperty("type", "inventory_contains_block"); json.addProperty("count", value.count());
+			}
 			case GoalPredicate.PositionWithin value -> {
 				json.addProperty("type", "position_within"); json.addProperty("dimensionId", value.dimensionId()); json.addProperty("x", value.x()); json.addProperty("y", value.y());
 				json.addProperty("z", value.z()); json.addProperty("radius", value.radius()); json.addProperty("stableTicks", value.stableTicks());
@@ -92,6 +95,7 @@ public final class GoalSpecWireCodec {
 				}
 				yield new GoalPredicate.InventoryContainsAny(identifiers, integer(json, "count"));
 			}
+			case "inventory_contains_block" -> { exact(json, Set.of("type", "count")); leaves.add(); yield new GoalPredicate.InventoryContainsBlock(integer(json, "count")); }
 			case "position_within" -> { boolean legacy = !json.has("dimensionId"); exact(json, legacy ? Set.of("type", "x", "y", "z", "radius", "stableTicks") : Set.of("type", "dimensionId", "x", "y", "z", "radius", "stableTicks")); leaves.add(); yield new GoalPredicate.PositionWithin(legacy ? GoalPredicate.DEFAULT_DIMENSION : string(json, "dimensionId"), number(json, "x"), number(json, "y"), number(json, "z"), number(json, "radius"), integer(json, "stableTicks")); }
 			case "advancement_granted" -> { exact(json, Set.of("type", "advancementId")); leaves.add(); yield new GoalPredicate.AdvancementGranted(string(json, "advancementId")); }
 			case "entity_killed_by_agent" -> { exact(json, Set.of("type", "entityType", "afterGoalStart")); leaves.add(); yield new GoalPredicate.EntityKilledByAgent(string(json, "entityType"), bool(json, "afterGoalStart")); }

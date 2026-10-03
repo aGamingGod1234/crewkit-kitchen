@@ -89,6 +89,7 @@ public final class AgentControlScreen extends Screen {
 	private int liveScroll;
 	private int liveFeedScroll;
 	private boolean compactGroupComposer;
+	private boolean shownPlanWindowEnabled, shownTerminalEnabled;
 	private ConsoleMutationState mutationState = ConsoleMutationState.initial(0L);
 	private Page page = Page.OVERVIEW;
 	private ConsoleEditBox nameInput;
@@ -161,6 +162,7 @@ public final class AgentControlScreen extends Screen {
 		managementSelection.reconcile(checkedSnapshot.agents());
 		rosterState.reconcile(candidateEntries);
 		snapshot = checkedSnapshot;
+		dev.agaminggod.arenaagents.client.control.LiveAgentWindows.select(selectedAgent());
 		rosterEntries = candidateEntries;
 		rosterVisuals = candidateVisuals;
 		String resolvedGroup = AgentControlGroupSelection.resolve(selectedSavedGroupName, snapshot.groups());
@@ -192,6 +194,7 @@ public final class AgentControlScreen extends Screen {
 		rosterState.reconcile(candidateEntries);
 		rosterState.focus(managementSelection.selectedAgentId());
 		snapshot = nextSnapshot;
+		dev.agaminggod.arenaagents.client.control.LiveAgentWindows.select(selectedAgent());
 		mutationState = ConsoleMutationState.initial(nextSnapshot.generatedAtEpochMs());
 		rosterEntries = candidateEntries;
 		rosterVisuals = candidateVisuals;
@@ -215,6 +218,13 @@ public final class AgentControlScreen extends Screen {
 			case MANAGE -> initManage();
 			case REMOVE_CONFIRM -> initRemoveConfirm();
 		}
+	}
+
+	@Override
+	public void tick() {
+		super.tick();
+		if (page == Page.MANAGE && (shownPlanWindowEnabled != dev.agaminggod.arenaagents.client.control.LiveAgentWindows.planEnabled()
+				|| shownTerminalEnabled != dev.agaminggod.arenaagents.client.control.LiveAgentWindows.terminalEnabled())) rebuildWidgets();
 	}
 
 	@Override
@@ -994,6 +1004,8 @@ public final class AgentControlScreen extends Screen {
 			show(Page.OVERVIEW);
 			return;
 		}
+		shownPlanWindowEnabled = dev.agaminggod.arenaagents.client.control.LiveAgentWindows.planEnabled();
+		shownTerminalEnabled = dev.agaminggod.arenaagents.client.control.LiveAgentWindows.terminalEnabled();
 		AgentControlLayout layout = layout();
 		int x = layout.contentLeft();
 		int width = layout.contentWidth();
@@ -1020,6 +1032,24 @@ public final class AgentControlScreen extends Screen {
 				(width - GAP) / 2, ROW_HEIGHT, this::confirmRemove);
 		remove.active = canControl();
 		addRenderableWidget(remove);
+		ConsoleButton planWindow = consoleButton("Plan window: " + (dev.agaminggod.arenaagents.client.control.LiveAgentWindows.planEnabled() ? "On" : "Off"),
+				x, top + 64, (width - GAP) / 2, ROW_HEIGHT,
+				dev.agaminggod.arenaagents.client.control.LiveAgentWindows.planEnabled(), () -> {
+					if (!dev.agaminggod.arenaagents.client.control.LiveAgentWindows.togglePlan(agent)) setFeedback("Desktop windows are unavailable in a headless client", true);
+					rebuildWidgets();
+				});
+		planWindow.active = canControl();
+		planWindow.setTooltip(net.minecraft.client.gui.components.Tooltip.create(Component.literal("Open the selected agent's live dependency map in a separate window. Closing it leaves the task running.")));
+		addRenderableWidget(planWindow);
+		ConsoleButton codexWindow = consoleButton("Codex terminal: " + (dev.agaminggod.arenaagents.client.control.LiveAgentWindows.terminalEnabled() ? "On" : "Off"),
+				x + (width - GAP) / 2 + GAP, top + 64, (width - GAP) / 2, ROW_HEIGHT,
+				dev.agaminggod.arenaagents.client.control.LiveAgentWindows.terminalEnabled(), () -> {
+					if (!dev.agaminggod.arenaagents.client.control.LiveAgentWindows.toggleTerminal(agent)) setFeedback("Desktop windows are unavailable in a headless client", true);
+					rebuildWidgets();
+				});
+		codexWindow.active = canControl();
+		codexWindow.setTooltip(net.minecraft.client.gui.components.Tooltip.create(Component.literal("View the existing Codex process's output, tools and usage. This starts no additional model calls.")));
+		addRenderableWidget(codexWindow);
 		addBackFooter();
 	}
 
@@ -1585,14 +1615,16 @@ public final class AgentControlScreen extends Screen {
 
 	private AgentControlAgent selectedAgent() {
 		if (snapshot == null || managementSelection.selectedAgentId().isBlank()) return null;
-		return snapshot.agents().stream()
+		AgentControlAgent selected = snapshot.agents().stream()
 				.filter(agent -> agent.agentId().equals(managementSelection.selectedAgentId())).findFirst().orElse(null);
+		return selected;
 	}
 
 	private void selectAgent(String agentId) {
 		if (snapshot == null) return;
 		managementSelection.select(agentId, snapshot.agents());
 		rosterState.focus(managementSelection.selectedAgentId());
+		dev.agaminggod.arenaagents.client.control.LiveAgentWindows.select(selectedAgent());
 	}
 
 	private List<AgentControlAgent> selectedGroupAgents() {

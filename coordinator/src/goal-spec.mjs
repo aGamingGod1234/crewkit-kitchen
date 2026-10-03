@@ -26,6 +26,9 @@ const predicateVariants = [
 		itemIds: { type: 'array', minItems: 1, maxItems: MAX_CANDIDATES, items: { type: 'string', pattern: IDENTIFIER.source, minLength: 3, maxLength: 256 } },
 		count: { type: 'integer', minimum: 1, maximum: 2_147_483_647 },
 	}),
+	objectSchema(['type', 'count'], {
+		type: { type: 'string', const: 'inventory_contains_block' }, count: { type: 'integer', minimum: 1, maximum: 2_147_483_647 },
+	}),
 	objectSchema(['type', 'dimensionId', 'x', 'y', 'z', 'radius', 'stableTicks'], {
 		type: { type: 'string', const: 'position_within' }, dimensionId: { type: ['string', 'null'] }, x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
 		radius: { type: 'number', minimum: MIN_MOVEMENT_TOLERANCE }, stableTicks: { type: 'integer', minimum: 1 },
@@ -64,7 +67,7 @@ export const GOAL_SPEC_PROPOSAL_SCHEMA = deepFreeze({
 	$defs: { predicate: { anyOf: predicateVariants } },
 	properties: {
 		requestId: { type: 'string', pattern: UUID.source, minLength: 36, maxLength: 36 },
-		summary: { type: 'string', minLength: 1, maxLength: 256 },
+		summary: { type: 'string', minLength: 1, maxLength: 512 },
 		predicate: { $ref: '#/$defs/predicate' },
 	},
 });
@@ -90,7 +93,7 @@ export function parseGoalSpecProposal(value) {
 	requirePostActivationKills(predicate);
 	return deepFreeze({
 		requestId: requestId(value.requestId),
-		summary: text(value.summary, 'summary', 256),
+		summary: text(value.summary, 'summary', 512),
 		predicate,
 	});
 }
@@ -153,6 +156,11 @@ function parsePredicate(value, depth, budget) {
 			result = { type, itemIds, count };
 			break;
 		}
+		case 'inventory_contains_block':
+			exactKeys(value, ['type', 'count'], type);
+			result = { type, count: positiveInteger(value.count, 'count') };
+			if (result.count > 2_147_483_647) fail('INVALID_GOAL_PREDICATE', 'count exceeds the server integer limit');
+			break;
 		case 'position_within':
 			exactKeys(value, value.dimensionId === undefined
 				? ['type', 'x', 'y', 'z', 'radius', 'stableTicks']
@@ -233,6 +241,8 @@ function canonicalPredicate(predicate) {
 			return `{"type":"inventory_contains","item_id":${JSON.stringify(predicate.itemId)},"count":${predicate.count}}`;
 		case 'inventory_contains_any':
 			return `{"type":"inventory_contains_any","item_ids":${JSON.stringify(predicate.itemIds)},"count":${predicate.count}}`;
+		case 'inventory_contains_block':
+			return `{"type":"inventory_contains_block","count":${predicate.count}}`;
 		case 'position_within':
 			return `{"type":"position_within",${canonicalDimension(predicate)}"x":${javaDouble(predicate.x)},"y":${javaDouble(predicate.y)},"z":${javaDouble(predicate.z)},"radius":${javaDouble(predicate.radius)},"stable_ticks":${predicate.stableTicks}}`;
 		case 'advancement_granted':

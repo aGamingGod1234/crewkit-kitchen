@@ -120,6 +120,15 @@ public final class AgentIdentityVerification {
 				AgentGameMode.SURVIVAL);
 		assertEquals("Rook", AgentIdentity.displayName(id, named), "explicit names remain authoritative");
 		assertEquals("Rook", AgentIdentity.displayNameTag(named), "explicit names remain authoritative in visible tags");
+		assertEquals("GPT-6.1 Sol", AgentIdentity.displayNameTag(new AgentProfile(
+				"codex", "gpt-6.1-sol", "medium", Optional.of("GPT_6_1_Sol"), 0)),
+				"already persisted default usernames regain the readable model label");
+		assertEquals("Abcdefghijklmnopqr 2", AgentIdentity.displayNameTag(new AgentProfile(
+				"codex", "abcdefghijklmnopqr", "medium", Optional.of("Abcdefghijklmno2"), 0)),
+				"long default labels retain the registry suffix even when its technical prefix is truncated");
+		assertEquals("123456789012345678901234", AgentIdentity.displayNameTag(new AgentProfile(
+				"codex", "gpt-6.1-sol", "medium", Optional.of("123456789012345678901234"), 0)),
+				"numeric custom names are not treated as allocated model suffixes");
 		assertEquals("Rook", AgentIdentity.playerName(id, named), "explicit names are exact /msg targets");
 		assertEquals("Rook0_C7CA442D", AgentIdentity.legacyReadablePlayerName(id, named),
 				"the immediately preceding readable/hash handle remains deterministic after canonicalization");
@@ -142,6 +151,20 @@ public final class AgentIdentityVerification {
 
 		assertEquals("GPT 5.6 Sol WM", AgentModelNames.displayName("codex", "gpt-5.6-sol-wm"),
 				"Codex display name is canonical");
+		assertEquals("GPT 6 Astra", AgentModelNames.displayName("codex", "gpt-6-astra"),
+				"GPT-6 Astra keeps its operator-facing name");
+		assertEquals("Sol", AgentModelNames.shortLabel("codex", "gpt-6.1-sol"),
+				"GPT-6.1 Sol keeps its compact label");
+		assertEquals("GPT-6.1 Sol", AgentModelNames.tagName("codex", "gpt-6.1-sol"),
+				"GPT-6.1 Sol tag shows the current version");
+		assertEquals("sol", AgentVisualIdentity.resolve("codex", "gpt-6.1-sol", 0).modelFamilyKey(),
+				"GPT-6.1 Sol uses the Sol face and skin");
+		assertEquals("terra", AgentVisualIdentity.resolve("codex", "gpt-6-astra", 0).modelFamilyKey(),
+				"GPT-6 Astra uses its Astra family skin");
+		assertEquals("luna", AgentVisualIdentity.resolve("codex", "gpt-6-luna", 0).modelFamilyKey(),
+				"GPT-6 Luna uses its Luna family skin");
+		assertEquals("GPT 6-Luna", AgentModelNames.tagName("codex", "gpt-6-luna"),
+				"GPT-6 Luna keeps its in-world tag name");
 		assertEquals("Sol WM", AgentModelNames.shortLabel("codex", "gpt-5.6-sol-wm"),
 				"Codex short label is canonical");
 		assertEquals("Gemini 3.1 Pro", AgentModelNames.displayName("gemini", "gemini-3.1-pro"),
@@ -277,7 +300,7 @@ public final class AgentIdentityVerification {
 				.getAsJsonArray("families").get(0).getAsJsonObject().getAsJsonArray("variants").get(0)
 				.getAsJsonObject().addProperty("texturePath", "minecraft:textures/entity/stolen.png")),
 				"project-owned codex entity texture", "non-project manifest texture rejected");
-		return 1150;
+		return 1160;
 	}
 
 	private static byte[] readTexture(String texturePath) {

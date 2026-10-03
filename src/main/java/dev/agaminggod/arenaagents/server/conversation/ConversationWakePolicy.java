@@ -25,4 +25,23 @@ public final class ConversationWakePolicy {
 			case AGENT_MESSAGE, PLAYER_STEER -> false;
 		};
 	}
+
+	public static boolean isPlayerGoalChannel(ConversationKind kind, ConversationAudience audience) {
+		return kind == ConversationKind.PLAYER_MESSAGE && audience == ConversationAudience.DIRECT
+				|| kind == ConversationKind.PROXIMITY_SPEECH && audience == ConversationAudience.PROXIMITY;
+	}
+
+	/** An operator's typed or spoken instruction can change the task without a goal-panel visit. */
+	public static boolean mayReplaceGoalFromSpeech(AgentLifecycleState state, ConversationKind kind,
+			ConversationAudience audience, boolean operator) {
+		return operator && isPlayerGoalChannel(kind, audience)
+				&& (state.isActive() || state == AgentLifecycleState.PAUSED);
+	}
+
+	public static boolean isCompletionConfirmation(String text) {
+		return switch (text.strip().toLowerCase(java.util.Locale.ROOT).replaceFirst("[.!]+$", "").strip()) {
+			case "yes", "yep", "yeah", "confirmed", "i confirm", "yes, confirmed", "that's right", "thats right" -> true;
+			default -> false;
+		};
+	}
 }

@@ -80,7 +80,7 @@ test('oversized inspection pages keep whole entries and a truthful continuation 
 });
 
 test('Minecraft control guidance examples are valid executor tool calls', async () => {
-	const skill = await readFile(new URL('../config/minecraft-agent/.codex/skills/minecraft-control/SKILL.md', import.meta.url), 'utf8');
+	const skill = await readFile(new URL('../config/minecraft-agent/.codex/skills/minecraft-control/references/control-reference.md', import.meta.url), 'utf8');
 	const turns = [...skill.matchAll(/```json executor-calls\s+([\s\S]*?)```/g)]
 		.map((match) => JSON.parse(match[1]));
 	const calls = [...skill.matchAll(/```json executor-call\s+([\s\S]*?)```/g)]
@@ -100,7 +100,7 @@ test('Minecraft control guidance examples are valid executor tool calls', async 
 });
 
 test('Minecraft control reference covers every executor tool and action with accepted and rejected examples', async () => {
-	const skill = await readFile(new URL('../config/minecraft-agent/.codex/skills/minecraft-control/SKILL.md', import.meta.url), 'utf8');
+	const skill = await readFile(new URL('../config/minecraft-agent/.codex/skills/minecraft-control/references/control-reference.md', import.meta.url), 'utf8');
 	const parseExamples = (label) => [...skill.matchAll(new RegExp('```json ' + label + '\\s+([\\s\\S]*?)```', 'g'))]
 		.map((match) => JSON.parse(match[1]));
 	const goodCalls = parseExamples('executor-call');
@@ -116,7 +116,10 @@ test('Minecraft control reference covers every executor tool and action with acc
 		[...expectedActions].sort(),
 	);
 	for (const { tool, arguments: args } of goodCalls) normalizeMinecraftToolCall(tool, args);
-	for (const { arguments: args } of goodCalls.filter(({ tool }) => tool === 'runProgram')) parseArenaScript(args.source);
+	for (const { arguments: args } of goodCalls.filter(({ tool }) => tool === 'runProgram' || tool === 'queueProgram')) {
+		if (args.source !== undefined) parseArenaScript(args.source);
+	}
+	for (const { arguments: args } of goodCalls.filter(({ tool, arguments: args }) => tool === 'notebook' && args.key === 'bounded-wait')) parseArenaScript(args.text);
 	assert.ok(badCalls.length >= 6, 'examples cover distinct malformed requests');
 	for (const { tool, arguments: args } of badCalls) {
 		assert.throws(() => normalizeMinecraftToolCall(tool, args), (error) => (
@@ -131,10 +134,60 @@ test('program calls bound source bytes, action count and execution time', () => 
 	for (const args of [{ source, maxActions: 257 }, { source, timeoutMs: 120001 }, { source: '😀'.repeat(20000) }, { source, planner: 'another-model' }]) assert.throws(() => normalizeMinecraftToolCall('runProgram', args), { code: 'INVALID_MINECRAFT_TOOL_ARGUMENTS' });
 });
 
+test('program parameters are detached bounded JSON and timing estimates respect the chosen deadline', () => {
+	const source = 'program.onUnhandledAttention("pause_and_notify"); await player.wait(program.parameters().durationMs);';
+	const parameters = { durationMs: 50, target: { x: 1, blockId: 'minecraft:stone' }, choices: [true, null, 2] };
+	const result = normalizeMinecraftToolCall('runProgram', { source, parameters, expectedDurationMs: 50, timeoutMs: 5000 });
+	assert.deepEqual(JSON.parse(JSON.stringify(result.parameters)), parameters);
+	assert.ok(Object.isFrozen(result.parameters) && Object.isFrozen(result.parameters.target));
+	parameters.target.x = 99;
+	assert.equal(result.parameters.target.x, 1);
+	assert.equal(result.expectedDurationMs, 50);
+	assert.equal(result.timeoutMs, 5000);
+	assert.equal(normalizeMinecraftToolCall('runProgram', { noteKey: 'routine', parameters: {}, expectedDurationMs: 30_000 }).expectedDurationMs, 30_000);
+	const cyclic = {}; cyclic.self = cyclic;
+	let nested = {};
+	for (let index = 0; index < 18; index += 1) nested = { child: nested };
+	for (const invalidParameters of [null, [], 1, cyclic, nested, { bad: undefined }, { bad: NaN }, { bad: () => {} }, { large: 'é'.repeat(2048) }, Object.fromEntries(Array.from({ length: 257 }, (_, index) => [`key${index}`, 0]))]) {
+		assert.throws(() => normalizeMinecraftToolCall('runProgram', { source, parameters: invalidParameters }), { code: 'INVALID_MINECRAFT_TOOL_ARGUMENTS' });
+	}
+	for (const expectedDurationMs of [0, 5001, 1.5, '50']) {
+		assert.throws(() => normalizeMinecraftToolCall('runProgram', { source, expectedDurationMs, timeoutMs: 5000 }), { code: 'INVALID_MINECRAFT_TOOL_ARGUMENTS' });
+	}
+});
+
+test('queued programs require exact predecessor identity, source choice and bounded precondition data', () => {
+	const source = 'program.onUnhandledAttention("pause_and_notify"); await player.wait(1);';
+	const base = { afterProgramId: 'program-1', goalRevision: 3, programVersion: 1, source, precondition: 'player.state().health > 0' };
+	assert.deepEqual(normalizeMinecraftToolCall('queueProgram', base), { kind: 'queue_program', ...base, maxActions: 64, timeoutMs: 30_000 });
+	const { source: _source, ...identity } = base;
+	const saved = normalizeMinecraftToolCall('queueProgram', { ...identity, noteKey: 'routine', parameters: { durationMs: 50 }, maxActions: 1, timeoutMs: 5000, observationIntervalMs: 100, expectedDurationMs: 50 });
+	assert.equal(saved.noteKey, 'routine');
+	assert.equal(saved.parameters.durationMs, 50);
+	assert.equal(saved.maxActions, 1);
+	assert.equal(saved.timeoutMs, 5000);
+	assert.equal(saved.observationIntervalMs, 100);
+	assert.equal(saved.expectedDurationMs, 50);
+	for (const field of ['afterProgramId', 'goalRevision', 'programVersion', 'precondition', 'source']) {
+		const incomplete = { ...base }; delete incomplete[field];
+		assert.throws(() => normalizeMinecraftToolCall('queueProgram', incomplete), { code: 'INVALID_MINECRAFT_TOOL_ARGUMENTS' });
+	}
+	for (const override of [{ noteKey: 'also-source' }, { afterProgramId: '' }, { goalRevision: -1 }, { programVersion: 0 }, { programVersion: 1.5 }, { precondition: ' ' }, { precondition: 'é'.repeat(2049) }, { background: true }, { maxActions: 257 }, { timeoutMs: 120001 }, { timeoutMs: 1000, expectedDurationMs: 1001 }, { parameters: [] }]) {
+		assert.throws(() => normalizeMinecraftToolCall('queueProgram', { ...base, ...override }), { code: 'INVALID_MINECRAFT_TOOL_ARGUMENTS' });
+	}
+	assert.deepEqual(normalizeMinecraftToolCall('cancelQueuedProgram', { afterProgramId: 'program-1', goalRevision: 3, queueId: 'queue-1' }), { kind: 'cancel_queued_program', afterProgramId: 'program-1', goalRevision: 3, queueId: 'queue-1' });
+	for (const args of [{ afterProgramId: 'program-1', goalRevision: 3 }, { afterProgramId: 'program-1', goalRevision: 3, queueId: ' ' }, { afterProgramId: 'program-1', goalRevision: 3, queueId: 'queue-1', programId: 'other' }]) {
+		assert.throws(() => normalizeMinecraftToolCall('cancelQueuedProgram', args), { code: 'INVALID_MINECRAFT_TOOL_ARGUMENTS' });
+	}
+});
+
 test('oversized program results preserve factual status, body receipt references and omissions', () => {
-	const raw = { state: 'YIELDED', reasonCode: 'PROGRAM_EXHAUSTED', programId: 'native-program-test', actions: 64, eventSequence: 100, receipts: Array.from({ length: 64 }, (_, index) => ({ actionId: `engine:${index}`, bodyActionId: `native:${index}`, actionType: 'wait', sourceStepId: `step-${index}`, state: index === 63 ? 'FAILED' : 'SUCCEEDED', reasonCode: index === 63 ? 'INPUT_REJECTED' : '', executionStarted: true })), observation: { player: { health: 20 }, detail: 'x'.repeat(30000) } };
+	const raw = { state: 'YIELDED', reasonCode: 'PROGRAM_EXHAUSTED', programId: 'native-program-test', goalRevision: 3, programVersion: 1, pendingSuccessor: { queueId: 'queue-1', afterProgramId: 'native-program-test', goalRevision: 3, programVersion: 1, state: 'QUEUED', maxActions: 2, timeoutMs: 5000, sourceOrigin: 'source' }, actions: 64, eventSequence: 100, receipts: Array.from({ length: 64 }, (_, index) => ({ actionId: `engine:${index}`, bodyActionId: `native:${index}`, actionType: 'wait', sourceStepId: `step-${index}`, state: index === 63 ? 'FAILED' : 'SUCCEEDED', reasonCode: index === 63 ? 'INPUT_REJECTED' : '', executionStarted: true })), observation: { player: { health: 20 }, detail: 'x'.repeat(30000) } };
 	const result = JSON.parse(toolResultContent(raw).contentItems[0].text);
 	assert.equal(result.programId, raw.programId);
+	assert.equal(result.goalRevision, 3);
+	assert.equal(result.programVersion, 1);
+	assert.deepEqual(result.pendingSuccessor, raw.pendingSuccessor);
 	assert.equal(result.state, 'YIELDED');
 	assert.equal(result.receipts.at(-1).bodyActionId, 'native:63');
 	assert.equal(result.receipts.at(-1).state, 'FAILED');
@@ -142,9 +195,42 @@ test('oversized program results preserve factual status, body receipt references
 	assert.ok(Buffer.byteLength(JSON.stringify(result)) <= 16384);
 });
 
+test('oversized terminal programs preserve whole-run counts and the exact handoff outcome beyond the receipt ring', () => {
+	const retainedReceipts = Array.from({ length: 64 }, (_, index) => ({ actionId: `engine:${index + 192}`, bodyActionId: `native:${index + 192}`, actionType: 'wait', sourceStepId: `step-${index + 192}`, state: 'SUCCEEDED', reasonCode: 'DONE' }));
+	const base = { state: 'YIELDED', reasonCode: 'PROGRAM_EXHAUSTED', programId: 'native-program-1', goalRevision: 3, programVersion: 1, actions: 256, actionsSucceeded: 256, actionsFailed: 0, receipts: retainedReceipts, observation: { player: { health: 20 }, detail: 'x'.repeat(30000) } };
+	const handedOff = JSON.parse(toolResultContent({ ...base, successorProgramId: 'native-program-2' }).contentItems[0].text);
+	assert.equal(handedOff.actions, 256);
+	assert.equal(handedOff.actionsSucceeded, 256);
+	assert.equal(handedOff.actionsFailed, 0);
+	assert.equal(handedOff.successorProgramId, 'native-program-2');
+	assert.ok(handedOff.receipts.length <= 64);
+	assert.equal(handedOff.discardedSuccessor, undefined);
+	const discardedSuccessor = { queueId: 'queue-1', afterProgramId: 'native-program-1', goalRevision: 3, programVersion: 1, state: 'QUEUED', maxActions: 2, timeoutMs: 5000, sourceOrigin: 'note', reasonCode: 'PREDECESSOR_NOT_SUCCESSFULLY_EXHAUSTED' };
+	const discarded = JSON.parse(toolResultContent({ ...base, actionsSucceeded: 255, actionsFailed: 1, discardedSuccessor }).contentItems[0].text);
+	assert.equal(discarded.actionsSucceeded, 255);
+	assert.equal(discarded.actionsFailed, 1, 'the historical failure survives after leaving the 64-receipt ring');
+	assert.ok(discarded.receipts.every(({ state }) => state === 'SUCCEEDED'));
+	assert.deepEqual(discarded.discardedSuccessor, discardedSuccessor);
+	assert.equal(discarded.successorProgramId, undefined);
+	for (const result of [handedOff, discarded]) assert.ok(Buffer.byteLength(JSON.stringify(result)) <= 16384);
+});
+
+test('generic oversized terminal metadata bounds successor summaries without losing cancellation facts', () => {
+	const discardedSuccessor = { queueId: 'queue-1', afterProgramId: 'native-program-1', goalRevision: 3, programVersion: 1, state: 'QUEUED', maxActions: 2, timeoutMs: 5000, sourceOrigin: 'source', reasonCode: 'PREDECESSOR_NOT_SUCCESSFULLY_EXHAUSTED' };
+	const raw = { state: 'CANCELLED', reasonCode: 'PROGRAM_CANCELLED', programId: 'native-program-1', actionsSucceeded: 50, actionsFailed: 1, discardedSuccessor: { ...discardedSuccessor, source: 'x'.repeat(30000), parameters: { privateData: 'x'.repeat(30000) } } };
+	const text = toolResultContent(raw).contentItems[0].text;
+	const result = JSON.parse(text);
+	assert.equal(result.state, 'CANCELLED');
+	assert.equal(result.reasonCode, 'PROGRAM_CANCELLED');
+	assert.equal(result.actionsSucceeded, 50);
+	assert.equal(result.actionsFailed, 1);
+	assert.deepEqual(result.discardedSuccessor, discardedSuccessor);
+	assert.ok(Buffer.byteLength(text) <= 16384);
+});
+
 test('native Minecraft tools expose the common fast path plus one validated advanced body operation', () => {
 	assert.deepEqual(MINECRAFT_DYNAMIC_TOOLS.map((tool) => tool.name), [
-		'observe', 'capabilities', 'inspect', 'actionStatus', 'cancelAction', 'replaceAction', 'startAction', 'notebook', 'queryMemory', 'runProgram', 'programStatus', 'respondProgram', 'cancelProgram', 'lookAround', 'control', 'moveTo', 'exploreFrontier', 'mine', 'say', 'wait', 'act', 'sequence', 'finish',
+		'taskMemory', 'observe', 'capabilities', 'inspect', 'actionStatus', 'cancelAction', 'replaceAction', 'startAction', 'notebook', 'queryMemory', 'runProgram', 'queueProgram', 'cancelQueuedProgram', 'programStatus', 'respondProgram', 'cancelProgram', 'lookAround', 'control', 'moveTo', 'exploreFrontier', 'mine', 'say', 'wait', 'act', 'sequence', 'taskPlan', 'finish',
 	]);
 	assert.ok(MINECRAFT_DYNAMIC_TOOLS.every((tool) => tool.type === 'function'));
 	assert.ok(NATIVE_AGENT_INSTRUCTIONS.length < 1_500);
@@ -159,7 +245,30 @@ test('native Minecraft tools expose the common fast path plus one validated adva
 	assert.match(NATIVE_AGENT_INSTRUCTIONS, /reuse exact noteKey/);
 	assert.match(NATIVE_AGENT_INSTRUCTIONS, /prerequisites\/current targets/);
 	assert.match(NATIVE_AGENT_INSTRUCTIONS, /noteKey executes the entire note as source/);
+	assert.match(NATIVE_AGENT_INSTRUCTIONS, /Batch known independent reads and reuse fresh result facts/);
+	assert.match(NATIVE_AGENT_INSTRUCTIONS, /program\.parameters\(\)/);
+	assert.match(NATIVE_AGENT_INSTRUCTIONS, /queueProgram/);
+	assert.match(MINECRAFT_DYNAMIC_TOOLS.find((tool) => tool.name === 'queueProgram').description, /runtime chooses no gameplay/);
 	assert.match(MINECRAFT_DYNAMIC_TOOLS.find((tool) => tool.name === 'runProgram').description, /noteKey executes the entire note text as ArenaScript/);
+});
+
+test('optional mining aim expands only the exact caller-chosen block and preserves the single-action default', () => {
+	const args = { x: 2, y: 63, z: 4, expectedBlockId: 'minecraft:stone', timeoutMs: 5000 };
+	const direct = { kind: 'action', actionType: 'break_block', arguments: args };
+	assert.deepEqual(normalizeMinecraftToolCall('mine', args), direct);
+	assert.deepEqual(normalizeMinecraftToolCall('mine', { ...args, autoAim: false }), direct);
+	assert.deepEqual(normalizeMinecraftToolCall('act', { actionType: 'break_block', arguments: args }), direct);
+	assert.deepEqual(normalizeMinecraftToolCall('mine', { ...args, autoAim: true }), {
+		kind: 'sequence', actions: [
+			{ actionType: 'look_at', arguments: { x: 2.5, y: 63.5, z: 4.5 } },
+			{ actionType: 'break_block', arguments: args },
+		],
+	});
+	for (const override of [{ autoAim: 'true' }, { autoAim: true, expectedBlockId: 'minecraft:air' }, { autoAim: true, targetSelector: 'nearest' }]) {
+		assert.throws(() => normalizeMinecraftToolCall('mine', { ...args, ...override }), { code: 'INVALID_MINECRAFT_TOOL_ARGUMENTS' });
+	}
+	assert.throws(() => normalizeMinecraftToolCall('act', { actionType: 'break_block', arguments: { ...args, autoAim: true } }), { code: 'INVALID_MINECRAFT_TOOL_ARGUMENTS' });
+	assert.throws(() => normalizeMinecraftToolCall('sequence', { actions: [{ actionType: 'wait', arguments: { durationMs: 1 } }, { actionType: 'break_block', arguments: { ...args, autoAim: true } }] }), { code: 'INVALID_MINECRAFT_TOOL_ARGUMENTS' });
 });
 
 test('advertised native actions exactly match Java model-authored dispatch', async () => {

@@ -14,6 +14,30 @@ const MODEL = {
 	serviceTiers: [{ id: 'fast' }, { id: 'priority' }],
 };
 
+test('native live telemetry accepts thread usage without turn IDs and starts no extra requests', async () => {
+	const transport = new FakeSharedTransport(); transport.autoComplete = false;
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	const agent = await service.createAgent(profile('agent-live'), { controlProtocol: 'native_tools' }); await agent.setGoalRevision(1);
+	const events = [];
+	const turn = agent.act('event: continue the task', { goalRevision: 1, executeTool: async () => ({}), onVerbose: (stage, message) => events.push({ stage, message }) });
+	await new Promise(resolve => setImmediate(resolve));
+	transport.emit('notification', { method: 'thread/tokenUsage/updated', params: { threadId: 'thread-1', tokenUsage: { total: { inputTokens: 200, cachedInputTokens: 150, outputTokens: 20, totalTokens: 220 } } } });
+	transport.emit('notification', { method: 'thread/tokenUsage/updated', params: { threadId: 'other-thread', tokenUsage: { total: { totalTokens: 999 } } } });
+	transport.emit('notification', { method: 'account/rateLimits/updated', params: { rateLimits: { secondary: { usedPercent: 89, windowDurationMins: 10080 } } } });
+	transport.emit('notification', { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'msg', delta: 'Hello' } });
+	transport.emit('notification', { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'msg', delta: ' there' } });
+	transport.emit('notification', { method: 'item/reasoning/textDelta', params: { threadId: 'thread-1', turnId: 'turn-1', delta: 'hidden internal reasoning' } });
+	transport.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } } });
+	await turn;
+	assert.equal(JSON.parse(events.find(e => e.stage === 'live_usage').message).totalTokens, 220);
+	assert.equal(events.filter(e => e.stage === 'live_usage').length, 1);
+	assert.equal(JSON.parse(events.find(e => e.stage === 'live_allowance').message).secondary.usedPercent, 89);
+	assert.equal(events.filter(e => e.stage === 'live_delta').at(-1).message, 'Hello there');
+	assert.doesNotMatch(JSON.stringify(events), /hidden internal reasoning/);
+	assert.equal(transport.calls.filter(c => c.method === 'turn/start').length, 1);
+	await service.stop();
+});
+
 class FakeSharedTransport extends EventEmitter {
 	calls = [];
 	threadSequence = 0;
@@ -102,6 +126,47 @@ test('Codex distinguishes submitted settings from provider-confirmed values', as
 	returned.requested.model = 'other';
 	assert.equal(agent.executionSettings.requested.model, 'gpt-5.6-sol');
 	await service.stop();
+});
+
+test('Codex accepts the provider priority name for requested Fast mode', async () => {
+	const transport = new FakeSharedTransport();
+	const request = transport.request.bind(transport);
+	transport.request = async (method, params, options) => {
+		const result = await request(method, params, options);
+		return method === 'thread/start' ? { ...result, model: params.model, serviceTier: 'priority' } : result;
+	};
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	const agent = await service.createAgent(profile('fast-alias'));
+	assert.equal(agent.executionSettings.requested.serviceTier, 'fast');
+	assert.equal(agent.executionSettings.effective.serviceTier, 'priority');
+	assert.equal(agent.executionSettings.evidence.serviceTier, 'provider_reported');
+	await service.stop();
+});
+
+test('Codex still rejects a genuinely different service tier', async () => {
+	const transport = new FakeSharedTransport();
+	const request = transport.request.bind(transport);
+	transport.request = async (method, params, options) => {
+		const result = await request(method, params, options);
+		return method === 'thread/start' ? { ...result, model: params.model, serviceTier: 'flex' } : result;
+	};
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	await assert.rejects(service.createAgent(profile('wrong-tier')), (error) => error.code === 'PROVIDER_SETTINGS_MISMATCH');
+	await service.stop();
+});
+
+test('Codex rejects a reported Fast tier when Priority was requested', async () => {
+	const transport = new FakeSharedTransport();
+	const request = transport.request.bind(transport);
+	transport.request = async (method, params, options) => {
+		const result = await request(method, params, options);
+		return method === 'thread/start' ? { ...result, model: params.model, serviceTier: 'fast' } : result;
+	};
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	try {
+		await assert.rejects(service.createAgent({ ...profile('reverse-alias'), serviceTier: 'priority' }),
+			(error) => error.code === 'PROVIDER_SETTINGS_MISMATCH');
+	} finally { await service.stop(); }
 });
 
 test('Codex rejects a confirmed different model before installing a session', async () => {
@@ -1181,7 +1246,8 @@ test('native Codex exposes one complete public agent-message candidate without s
 		threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' },
 	} });
 	assert.deepEqual(await turn, { status: 'completed', toolCalls: 0 });
-	assert.deepEqual(events, [{ stage: 'agent_message', message: publicMessage }]);
+	assert.deepEqual(events.filter(e => e.stage === 'agent_message'), [{ stage: 'agent_message', message: publicMessage }]);
+	assert.ok(events.some(e => e.stage === 'live_delta' && e.message === publicMessage));
 	assert.doesNotMatch(JSON.stringify(events), /hidden reasoning/);
 	await service.stop();
 });

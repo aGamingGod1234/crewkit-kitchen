@@ -27,7 +27,7 @@ visible name or a normal Minecraft selector such as `@e`.
 ## Actor blocking
 
 ```text
-/codex skit summon codex model gpt-5.6-sol "GPT 5.6-Sol"
+/codex skit summon codex model gpt-6.1-sol "GPT 6.1-Sol"
 /codex skit summon gemini model gemini-3.1-pro Gemini
 /codex skit place ChatGPT here
 /codex skit place Claude at 12 72 -4 180 0
@@ -38,7 +38,7 @@ visible name or a normal Minecraft selector such as `@e`.
 Use `model` when you need an exact model slug. The model argument has tab
 completion from the installed catalog. The technical Minecraft player name stays
 safe and unique, while the visible tag uses the readable model or name, such as
-`GPT 5.6-Sol` or `Gemini`.
+`GPT 6.1-Sol` or `Gemini`.
 
 `relative` uses right, up, and forward offsets from the operator's current view.
 `look_at` keeps the actor at the operator and rotates it toward a world point.

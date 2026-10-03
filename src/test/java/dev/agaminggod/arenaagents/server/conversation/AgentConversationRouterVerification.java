@@ -3,6 +3,7 @@ package dev.agaminggod.arenaagents.server.conversation;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
+import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
 import dev.agaminggod.arenaagents.server.goal.GoalCompilation;
 import dev.agaminggod.arenaagents.server.goal.GoalCompiler;
 import java.util.List;
@@ -31,6 +32,7 @@ public final class AgentConversationRouterVerification {
 		assertions += verifyUnicodeSafeTextBound();
 		assertions += verifyPlayerConversationWakePolicy();
 		assertions += verifySpeechGoalCompilationRouting();
+		assertions += verifySpokenTaskParity();
 		assertions += verifyNativeWhisperPayload();
 		assertions += verifyNativeWhisperContentSelection();
 		return assertions;
@@ -105,6 +107,28 @@ public final class AgentConversationRouterVerification {
 	}
 
 	private static int verifySpeechGoalCompilationRouting() {
+		assertEquals(true, ConversationWakePolicy.mayReplaceGoalFromSpeech(AgentLifecycleState.PLANNING,
+				ConversationKind.PLAYER_MESSAGE, ConversationAudience.DIRECT, true), "direct operator task changes replace an active goal");
+		assertEquals(true, ConversationWakePolicy.mayReplaceGoalFromSpeech(AgentLifecycleState.PLANNING,
+				ConversationKind.PROXIMITY_SPEECH, ConversationAudience.PROXIMITY, true), "an operator's spoken task replaces active work just like a DM");
+		assertEquals(false, ConversationWakePolicy.mayReplaceGoalFromSpeech(AgentLifecycleState.PLANNING,
+				ConversationKind.PLAYER_MESSAGE, ConversationAudience.DIRECT, false), "another player's chat cannot replace operator-controlled work");
+		assertEquals(true, ConversationWakePolicy.isCompletionConfirmation("yep!"), "the reported short confirmation is recognized");
+		assertEquals(false, ConversationWakePolicy.isCompletionConfirmation("yes, get iron tools"), "a new task is not treated as completion evidence");
+		var replacement = ServerAgentConversationRouter.routeCompiledSpeechGoal(AgentLifecycleState.PLANNING,
+				ConversationKind.PLAYER_MESSAGE, new GoalCompiler().compile("Get iron pickaxe now", RegistryAccess.EMPTY, 1_200L), true,
+				() -> { throw new AssertionError("exact replacement must not translate"); }, message -> { throw new AssertionError(message); });
+		assertEquals(true, replacement.publish(), "a task switch publishes a durable conversation wake while active");
+		assertEquals(new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 1), replacement.wakeSpec().orElseThrow().completion(),
+				"a replacement freezes the newly requested factual result");
+		GoalCompilation dragon = new GoalCompiler().compile("Beat the game", RegistryAccess.EMPTY, 1_200L);
+		assertEquals(GoalCompilation.Kind.NEEDS_TRANSLATION,
+				GoalCompiler.withAdvisoryPlan(dragon).kind(),
+				"dragon goal requests Luna's advisory subgoals before activation");
+		assertEquals(GoalCompilation.Kind.ACCEPTED,
+				GoalCompiler.withAdvisoryPlan(
+						new GoalCompiler().compile("Get dirt", RegistryAccess.EMPTY, 1_200L)).kind(),
+				"easy factual goals keep the direct fast path");
 		String rejectionMessage = "That advancement ID does not exist on this server.";
 		GoalCompilation rejected = new GoalCompiler().compile(
 				"Earn advancement mod:removed", RegistryAccess.EMPTY, 1_200L, ignored -> false
@@ -138,7 +162,69 @@ public final class AgentConversationRouterVerification {
 		);
 		assertEquals(false, translation.publish(), "translation speech is consumed while its draft is staged");
 		assertEquals(1, translationDrafts.get(), "only NEEDS_TRANSLATION stages one coordinator draft");
-		return 11;
+		return 20;
+	}
+
+	private static int verifySpokenTaskParity() {
+		int assertions = 0;
+		for (String phrase : List.of("I want you to get a stone pickaxe.", "Your goal is to get a stone pickaxe.",
+				"I'd like you to get a stone pickaxe.", "Your task is to get a stone pickaxe.")) {
+			assertEquals(true, GoalCompiler.looksLikeGoalRequest(phrase), "natural spoken assignment is recognized: " + phrase);
+			assertEquals(new GoalPredicate.InventoryContains("minecraft:stone_pickaxe", 1),
+					new GoalCompiler().compile(phrase, RegistryAccess.EMPTY, 1_200L).acceptedSpec().orElseThrow().completion(),
+					"natural spoken assignment preserves the requested factual result: " + phrase);
+			assertions += 2;
+		}
+		GoalCompilation requested = new GoalCompiler().compile("Can you please get a stone pickaxe?", RegistryAccess.EMPTY, 1_200L);
+		for (AgentLifecycleState state : List.of(AgentLifecycleState.STARTING, AgentLifecycleState.PLANNING,
+				AgentLifecycleState.ACTING, AgentLifecycleState.PAUSED)) {
+			boolean replace = ConversationWakePolicy.mayReplaceGoalFromSpeech(state,
+					ConversationKind.PROXIMITY_SPEECH, ConversationAudience.PROXIMITY, true);
+			assertEquals(true, replace, state + " accepts an operator's spoken task switch");
+			assertEquals(true, GoalCompiler.consumePlayerSpeechAsGoal(true, "Can you please get a stone pickaxe?", replace),
+					state + " spoken task reaches goal compilation instead of conversation-only tools");
+			var route = ServerAgentConversationRouter.routeCompiledSpeechGoal(state, ConversationKind.PROXIMITY_SPEECH,
+					requested, replace, () -> { throw new AssertionError("exact spoken task must not translate"); },
+					message -> { throw new AssertionError(message); });
+			assertEquals(true, route.publish(), state + " publishes the spoken goal wake");
+			assertEquals(new GoalPredicate.InventoryContains("minecraft:stone_pickaxe", 1),
+					route.wakeSpec().orElseThrow().completion(), state + " verifies the stone pickaxe instead of a chat reply");
+			assertions += 4;
+		}
+		assertEquals(false, ConversationWakePolicy.mayReplaceGoalFromSpeech(AgentLifecycleState.ACTING,
+				ConversationKind.PROXIMITY_SPEECH, ConversationAudience.PROXIMITY, false),
+				"a nearby non-operator cannot replace active work");
+		assertEquals(false, ConversationWakePolicy.mayReplaceGoalFromSpeech(AgentLifecycleState.ACTING,
+				ConversationKind.AGENT_MESSAGE, ConversationAudience.PROXIMITY, true),
+				"nearby agent chatter cannot replace active work");
+		assertEquals(false, ConversationWakePolicy.mayReplaceGoalFromSpeech(AgentLifecycleState.ACTING,
+				ConversationKind.PLAYER_MESSAGE, ConversationAudience.PUBLIC, true),
+				"public text chat does not become a task switch");
+		assertEquals(false, GoalCompiler.consumePlayerSpeechAsGoal(true, "Thanks, how are you?", true),
+				"ordinary spoken conversation does not create a goal");
+		assertEquals(true, ConversationWakePolicy.isPlayerGoalChannel(ConversationKind.PROXIMITY_SPEECH, ConversationAudience.PROXIMITY),
+				"spoken completion confirmation uses the same guarded confirmation path as a DM");
+		assertEquals(false, ConversationWakePolicy.isPlayerGoalChannel(ConversationKind.AGENT_MESSAGE, ConversationAudience.PROXIMITY),
+				"agent speech cannot confirm a human's goal");
+		AtomicInteger translated = new AtomicInteger();
+		String originalSpeech = "hey, can you go and get stone tools and pickaxe and and axe";
+		assertEquals(true, GoalCompiler.looksLikeGoalRequest(originalSpeech), "the user's exact noisy transcript is a task request");
+		GoalCompilation originalCompilation = new GoalCompiler().compile(originalSpeech, RegistryAccess.EMPTY, 1_200L);
+		assertEquals(GoalCompilation.Kind.ACCEPTED, originalCompilation.kind(), "the exact spoken tool request has factual completion immediately");
+		var spoken = ServerAgentConversationRouter.routeCompiledSpeechGoal(AgentLifecycleState.ACTING, ConversationKind.PROXIMITY_SPEECH,
+				originalCompilation, true, () -> { throw new AssertionError("named spoken tools need no translation"); },
+				message -> { throw new AssertionError(message); });
+		assertEquals(true, spoken.publish(), "the exact spoken task replaces active work without a DM");
+		assertEquals(new GoalPredicate.AllOf(List.of(new GoalPredicate.InventoryContains("minecraft:stone_pickaxe", 1),
+				new GoalPredicate.InventoryContains("minecraft:stone_axe", 1))), spoken.wakeSpec().orElseThrow().completion(),
+				"the spoken wake carries both stone tool requirements");
+		GoalCompilation translatedCompilation = new GoalCompiler().compile("Get a pickaxe and an axe", RegistryAccess.EMPTY, 1_200L);
+		var draft = ServerAgentConversationRouter.routeCompiledSpeechGoal(AgentLifecycleState.ACTING, ConversationKind.PROXIMITY_SPEECH,
+				translatedCompilation, true, translated::incrementAndGet,
+				message -> { throw new AssertionError(message); });
+		assertEquals(1, translated.get(), "complex spoken task stages translation while another task is active");
+		assertEquals(false, draft.publish(), "complex spoken task awaits validated translation instead of a chat-only reply");
+		return assertions + 12;
 	}
 
 	private static int verifyDirectDeliveryAndOperatorMirror() {

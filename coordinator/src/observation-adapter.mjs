@@ -171,9 +171,14 @@ function effectFacts(value) {
 		return {
 			effectId: identifier(source.effectId, `player.effects[${index}].effectId`),
 			amplifier: nonNegativeInteger(source.amplifier, `player.effects[${index}].amplifier`),
-			duration: nonNegativeInteger(source.duration, `player.effects[${index}].duration`),
+			duration: effectDuration(source.duration, `player.effects[${index}].duration`),
 		};
 	});
+}
+
+function effectDuration(value, field) {
+	// Preserve the vanilla infinite sentinel used by the validated observation protocol.
+	return value === -1 ? -1 : nonNegativeInteger(value, field);
 }
 
 function nearbyContainerFacts(value) {

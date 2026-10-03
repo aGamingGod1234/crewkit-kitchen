@@ -53,7 +53,7 @@ export async function generateDirectorScript(service, request, { signal } = {}) 
 	const agentId = `director-${request.requestId}`;
 	try {
 		const agent = await service.createAgent(
-			{ agentId, provider: 'codex', model: 'gpt-5.6-luna', reasoningEffort: 'low' },
+			{ agentId, provider: 'codex', model: 'gpt-6-luna', reasoningEffort: 'low' },
 			{ controlProtocol: 'director_script' },
 		);
 		await agent.setGoalRevision(0);

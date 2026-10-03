@@ -34,14 +34,14 @@ export const MATH_METHODS = Object.freeze({
 	min: [Math.min, 1, 16], max: [Math.max, 1, 16], hypot: [Math.hypot, 1, 16],
 });
 export const PURE_API_PATHS = Object.freeze(new Set([
-	...FACTUAL_API_PATHS, ...Object.keys(MATH_METHODS).map((name) => `math.${name}`),
+	'program.parameters', ...FACTUAL_API_PATHS, ...Object.keys(MATH_METHODS).map((name) => `math.${name}`),
 ]));
 
 export const SCRIPT_API_CALL_PATHS = Object.freeze(new Set([
 	...Object.keys(PLAYER_MEMBER_PRIMITIVES).map((name) => `player.${name}`),
 	...PURE_API_PATHS,
 	'world.inspect',
-	'world.remember', 'world.queryMemory',
+	'world.remember', 'world.queryMemory', 'world.taskMemory',
 ]));
 
 export const SCRIPT_BINDINGS = freezeRecord({

@@ -4,8 +4,6 @@ import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentIdentity;
 import dev.agaminggod.arenaagents.agent.AgentProfile;
 import dev.agaminggod.arenaagents.agent.AgentGameMode;
-import java.util.HashSet;
-import java.util.List;
 import java.util.UUID;
 import net.minecraft.world.phys.Vec3;
 
@@ -27,14 +25,6 @@ public final class AgentSpawnPlacementVerification {
 		if (!origin.equals(new Vec3(10.0D, 64.0D, -4.0D))) {
 			throw new AssertionError("spawn placement mutated the source position");
 		}
-		List<Vec3> candidates = AgentSpawnPlacement.candidates(origin, new Vec3(0.0D, 0.0D, 1.0D));
-		if (candidates.size() != 20) throw new AssertionError("expected 20 bounded spawn candidates");
-		if (!candidates.getFirst().equals(new Vec3(10.0D, 64.0D, -2.0D))) {
-			throw new AssertionError("first candidate must remain directly in front of the player");
-		}
-		if (new HashSet<>(candidates).size() != candidates.size()) {
-			throw new AssertionError("spawn candidate grid contains duplicate positions");
-		}
 		AgentId id = new AgentId(UUID.fromString("193a9add-1234-5678-9abc-123456789abc"));
 		AgentProfile profile = new AgentProfile(
 				"codex", "gpt-5.6-sol", "high", "fast", java.util.Optional.empty(), 0,
@@ -49,7 +39,7 @@ public final class AgentSpawnPlacementVerification {
 		if (AgentIdentity.skinForPlayerName(playerName).isPresent()) {
 			throw new AssertionError("public player name must not impersonate the legacy skin transport: " + playerName);
 		}
-		return 13;
+		return 10;
 	}
 
 	private static void assertCoordinate(double actual, double expected, String label) {

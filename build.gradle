@@ -417,6 +417,10 @@ tasks.register('verifyCameraMixin', JavaExec) {
 	description = 'Verifies camera accessor transformation in Fabric without starting client main or a world.'
 	dependsOn tasks.named('testClasses'), tasks.named('clientClasses'), tasks.named('processResources'), tasks.named('processClientResources')
 	classpath = sourceSets.test.runtimeClasspath
+	// Optional local compatibility probe against the same Facebar JAR as the installed client.
+	if (project.hasProperty('facebarVerificationJar')) {
+		classpath += files(project.property('facebarVerificationJar'))
+	}
 	mainClass.set('dev.agaminggod.arenaagents.client.camera.CameraMixinVerification')
 	systemProperty 'java.awt.headless', 'true'
 	systemProperty 'fabric.development', 'true'
@@ -433,6 +437,19 @@ tasks.register('verifyCameraMixin', JavaExec) {
 		def gameDirectory = layout.buildDirectory.dir('camera-mixin-verification').get().asFile
 		java.nio.file.Files.createDirectories(gameDirectory.toPath())
 		setArgs(['--gameDir', gameDirectory.absolutePath])
+	}
+}
+
+// Each mode needs a fresh JVM because AWT caches its first headless decision.
+['true', 'false', 'auto'].each { mode ->
+	tasks.register("verifyClientAwt${mode.capitalize()}", JavaExec) {
+		group = 'verification'
+		description = "Verifies desktop AWT initialization after Minecraft Main forces headless (${mode})."
+		dependsOn tasks.named('testClasses')
+		classpath = sourceSets.test.runtimeClasspath
+		mainClass.set('dev.agaminggod.arenaagents.control.ClientAwtInitializationVerification')
+		setArgs([mode, '--minecraft-main'])
+		if (mode != 'auto') systemProperty 'java.awt.headless', mode
 	}
 }
 
@@ -505,6 +522,7 @@ tasks.register('upgradeMapStructure', JavaExec) {
 
 tasks.named('check') {
 	dependsOn tasks.named('verifyCore'), tasks.named('verifyCameraMixin'), tasks.named('verifyEntrypoints'), tasks.named('verifyMapBlockStateCatalog'), tasks.named('verifyMapStructureDataFixer'), ':voice-addon:check'
+	dependsOn tasks.named('verifyClientAwtTrue'), tasks.named('verifyClientAwtFalse'), tasks.named('verifyClientAwtAuto')
 }
 
 publishing {

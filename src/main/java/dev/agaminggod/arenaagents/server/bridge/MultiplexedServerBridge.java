@@ -138,7 +138,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			"AI agent coordinator is offline; check logs/arena-agents-coordinator-error.log for the startup cause";
 	private static final Logger LOGGER = LoggerFactory.getLogger(MultiplexedServerBridge.class);
 	private static final Set<String> INBOUND_TYPES = Set.of(
-			"auth_challenge", "hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "conversation_wake_ack", "goal_spec_proposal", "director_script_result", "request_observation", "inspection_request", "action_command", "action_cancel", "action_result_ack", "agent_error", "verbose_event", "heartbeat"
+			"auth_challenge", "hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "conversation_wake_ack", "goal_spec_proposal", "director_script_result", "request_observation", "inspection_request", "action_command", "action_cancel", "action_result_ack", "agent_error", "verbose_event", "task_view", "heartbeat"
 	);
 
 	private final CodexAgentManager manager;
@@ -1082,6 +1082,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	private void routeAuthenticated(BridgeEnvelope envelope) {
 		switch (envelope.type()) {
+			case "task_view" -> dev.agaminggod.arenaagents.server.LiveTaskViewSync.accept(manager.server(), AgentId.parse(envelope.agentId()), envelope.payload());
 			case "catalog_snapshot" -> acceptCatalog(envelope.payload());
 			case "coordinator_status" -> acceptCoordinatorStatus(envelope.payload());
 			case "agent_ready", "planning_state" -> plannerReady(envelope);
@@ -1169,7 +1170,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			boolean duplicate = draft.proposedPredicate().isPresent();
 			PendingGoalDraft updated = manager.updateGoalDraftProposal(requestId, agentId, predicate);
 			ServerPlayer player = manager.server() == null ? null : manager.server().getPlayerList().getPlayer(updated.requestingPlayerId());
-			Optional<CodexAgentManager.GoalDraftResult> activatedResult = manager.activateTranslatedManagerDraft(updated);
+			Optional<CodexAgentManager.GoalDraftResult> activatedResult = manager.activateTranslatedManagerDraft(updated, summary);
 			if (activatedResult.isPresent()) {
 				recordActivatedGoalSpecRequest(requestId, agentId, decodedPredicate);
 				if (player != null) {
@@ -1514,6 +1515,14 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		AgentVerboseChat.report(manager, verboseState, record, event.stage(), event.message());
 	}
 
+	public boolean requestTaskView(AgentId agentId) {
+		if (!authenticated()) return false;
+		JsonObject payload = new JsonObject();
+		payload.addProperty("goalRevision", manager.registry().require(agentId).goalRevision());
+		send("task_view_request", agentId.toString(), payload);
+		return true;
+	}
+
 	static VerboseEvent decodeVerboseEvent(JsonObject payload) {
 		requireKeys(payload, Set.of("goalRevision", "stage", "message"), "verbose_event");
 		long goalRevision = requiredLong(payload, "goalRevision");
@@ -1584,9 +1593,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			return new VerboseEvent(goalRevision, "result",
 					fact == null ? "Goal verified." : "Goal verified: " + fact.expectedValue() + ".");
 		}
-		return new VerboseEvent(goalRevision, "retry", fact == null
-				? "Goal not complete. Continuing."
-				: "Goal not complete: expected " + fact.expectedValue() + ", observed " + fact.observedValue() + ". Continuing.");
+		return new VerboseEvent(goalRevision, verification.awaitingOperatorConfirmation() ? "result" : "retry",
+				AgentActivityPresentation.goalNotComplete(verification.facts()));
 	}
 
 	static JsonObject completionResultPayload(long goalRevision, String traceId, String goalFingerprint, GoalCompletionVerifier.VerificationResult verification) {
@@ -2215,6 +2223,14 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 							}
 						}
 				);
+				if (transition.cancelAction()) actionExecutor.cancel(event.agentId(), "Task changed by player request");
+				registryPublicationRevision.incrementAndGet();
+				actionExecutor.actionSuccessLedger().retainRevision(event.agentId(), transition.after().goalRevision());
+				programActions.beginGoal(event.agentId(), transition.after().goalRevision());
+				terminalResults.beginGoal(event.agentId(), transition.after().goalRevision(), logicalGoalId(transition.after()));
+				actionJournal.retainGoal(event.agentId(), logicalGoalId(transition.after()));
+				observationPublication.markAttention(event.agentId());
+				queueUrgentObservation(event.agentId());
 				publishConversationWakeScenarioState(transition);
 			}
 		} catch (BridgeProtocolException exception) {
@@ -2294,7 +2310,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		payload.addProperty("transactionId", wake.transactionId().toString());
 		payload.add("event", conversationEventPayload(wake.event()));
 		JsonObject control = new JsonObject();
-		control.addProperty("operation", "start");
+		// A direct new request after the first task replaces work; it never promotes the queued head.
+		control.addProperty("operation", wake.event().goalRevision() == 0L ? "start" : "replace");
 		control.addProperty("goalRevision", wake.goalRevision());
 		control.addProperty("updatedAtEpochMs", wake.updatedAtEpochMs());
 		control.addProperty("goal", plannerGoal(wake.goal()));
@@ -2481,9 +2498,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		if (progress.actionObservation() == null || progress.actionObservation().progress() == null
 				|| progress.actionObservation().progress().verified()) {
 			verboseState.progressMilestone(progress).ifPresent(milestone -> {
-				String message = progress.actionObservation() == null
-						? AgentActivityPresentation.progress(progress.actionType(), milestone)
-						: actionObservationProgressMessage(progress.actionObservation(), milestone);
+				String message = AgentActivityPresentation.progress(progress, milestone);
 				reportVerbose(progress.agentId(), "progress", message);
 			});
 		}
@@ -2556,40 +2571,6 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		value.addProperty("y", position.y());
 		value.addProperty("z", position.z());
 		parent.add(name, value);
-	}
-
-	private static String actionObservationProgressMessage(ServerActionObservation observation, int milestone) {
-		StringBuilder message = new StringBuilder("Verified ").append(milestone).append("% progress");
-		if (observation.progress() != null) message.append(" (basis=").append(observation.progress().basis()).append(')');
-		if (observation.lookedAt() != null && observation.lookedAt().id() != null) {
-			message.append("; looking at ").append(observation.lookedAt().id());
-		}
-		if (observation.reach() != null) {
-			message.append("; reach=").append(formatDecimal(observation.reach().distance()))
-					.append('/').append(formatDecimal(observation.reach().max()));
-		}
-		if (observation.target() != null) {
-			ServerActionObservation.Target target = observation.target();
-			if (target.kind().equals("block") && target.position() != null) {
-				message.append("; target=").append(formatPosition(target.position()));
-			}
-			if (target.distanceRemaining() != null) {
-				message.append("; remaining=").append(formatDecimal(target.distanceRemaining()));
-			}
-			if (target.tolerance() != null) message.append("; tolerance=").append(formatDecimal(target.tolerance()));
-		}
-		if (observation.collision() != null && (observation.collision().horizontal() || observation.collision().inWall())) {
-			message.append("; collision=true");
-		}
-		return message.toString();
-	}
-
-	private static String formatPosition(ServerActionObservation.Position position) {
-		return '(' + formatDecimal(position.x()) + ',' + formatDecimal(position.y()) + ',' + formatDecimal(position.z()) + ')';
-	}
-
-	private static String formatDecimal(double value) {
-		return String.format(java.util.Locale.ROOT, "%.2f", value);
 	}
 
 	private void reportVerbose(AgentId agentId, String stage, String message) {
@@ -2843,8 +2824,11 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		if (goal.steeringInstructions().isEmpty()) {
 			return goal.prompt();
 		}
-		String steering = "\n\nSteering instruction: "
-				+ goal.steeringInstructions().get(goal.steeringInstructions().size() - 1);
+		String first = goal.steeringInstructions().getFirst();
+		String latest = goal.steeringInstructions().getLast();
+		String advisory = first.startsWith("Suggested subgoals from Luna (") ? "\n\n" + first : "";
+		String steering = advisory + (latest.equals(first) && !advisory.isEmpty()
+				? "" : "\n\nSteering instruction: " + latest);
 		if (steering.length() >= AgentConstants.MAX_PROMPT_LENGTH) {
 			return steering.substring(steering.length() - AgentConstants.MAX_PROMPT_LENGTH);
 		}

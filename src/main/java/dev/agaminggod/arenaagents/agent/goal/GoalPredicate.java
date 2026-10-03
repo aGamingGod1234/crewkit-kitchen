@@ -9,6 +9,7 @@ import java.util.Objects;
 public sealed interface GoalPredicate permits
 		GoalPredicate.InventoryContains,
 		GoalPredicate.InventoryContainsAny,
+		GoalPredicate.InventoryContainsBlock,
 		GoalPredicate.PositionWithin,
 		GoalPredicate.AdvancementGranted,
 		GoalPredicate.EntityKilledByAgent,
@@ -36,6 +37,13 @@ public sealed interface GoalPredicate permits
 			itemIds = itemIds.stream().map(value -> identifier(value, "itemIds entry")).toList();
 			if (new java.util.HashSet<>(itemIds).size() != itemIds.size()) throw invalid("Inventory item IDs must be unique");
 			if (count <= 0) throw invalid("Inventory count must be positive");
+		}
+	}
+
+	/** Any held placeable block item qualifies; the agent chooses its source. */
+	record InventoryContainsBlock(int count) implements GoalPredicate {
+		public InventoryContainsBlock {
+			if (count <= 0) throw invalid("Inventory block count must be positive");
 		}
 	}
 

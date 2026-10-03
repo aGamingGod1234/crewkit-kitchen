@@ -17,6 +17,8 @@ import java.util.UUID;
 import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.component.DataComponentMap;
 import net.minecraft.core.component.DataComponents;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.Items;
 
@@ -30,12 +32,24 @@ public final class GoalCompilerVerification {
 		bindItemStackSize(Items.APPLE, 64);
 		bindItemStackSize(Items.COBBLESTONE, 64);
 		bindItemStackSize(Items.DIRT, 64);
+		bindItemStackSize(Items.IRON_BLOCK, 64);
 		bindItemStackSize(Items.DIAMOND_PICKAXE, 1);
 		bindItemStackSize(Items.DIAMOND_SWORD, 1);
 		bindItemStackSize(Items.IRON_AXE, 1);
 		bindItemStackSize(Items.IRON_PICKAXE, 1);
+		bindItemStackSize(Items.STONE_PICKAXE, 1);
+		bindItemStackSize(Items.STONE_AXE, 1);
+		BuiltInRegistries.ITEM.keySet().stream()
+				.filter(id -> id.getPath().endsWith("_log") || id.getPath().endsWith("_wood")
+						|| id.getPath().endsWith("_stem") || id.getPath().endsWith("_hyphae"))
+				.map(BuiltInRegistries.ITEM::getValue)
+				.filter(BlockItem.class::isInstance)
+				.forEach(item -> bindItemStackSize(item, 64));
 		int assertions = 0;
 		assertions += verifyExactItemAndAmbiguity();
+		assertions += verifySpokenToolSets();
+		assertions += verifyGenericWoodGoal();
+		assertions += verifyGenericBlockGoal();
 		assertions += verifyInventoryCapacity();
 		assertions += verifyExactPositionEntityAndAdvancement();
 		assertions += verifyManagerSubmissionFlow();
@@ -74,6 +88,21 @@ public final class GoalCompilerVerification {
 				exact.acceptedSpec().orElseThrow().completion(),
 				"exact item request freezes the iron pickaxe predicate"
 		);
+		GoalCompilation dirt = compiler.compile("Could you get a block of dirt?", RegistryAccess.EMPTY, 1_200L);
+		assertEquals(GoalCompilation.Kind.ACCEPTED, dirt.kind(), "a spoken block of dirt is an exact item goal");
+		assertEquals(new GoalPredicate.InventoryContains("minecraft:dirt", 1),
+				dirt.acceptedSpec().orElseThrow().completion(), "dirt possession is the completion fact");
+		assertEquals(new GoalPredicate.InventoryContains("minecraft:dirt", 2),
+				compiler.compile("Get two blocks of dirt", RegistryAccess.EMPTY, 1_200L)
+					.acceptedSpec().orElseThrow().completion(), "plural block wording preserves the count");
+		assertEquals(new GoalPredicate.InventoryContains("minecraft:iron_block", 1),
+				compiler.compile("Get a block of iron", RegistryAccess.EMPTY, 1_200L)
+					.acceptedSpec().orElseThrow().completion(), "a material block does not become an ingot");
+		assertEquals(List.of("minecraft:dirt"), compiler.candidateIdsFor("Get a block of dirt from nearby", RegistryAccess.EMPTY),
+				"translation offers the same block item when the request has a source qualifier");
+		assertSucceeds(() -> compiler.translationConstraintFor("Get a block of dirt from nearby", RegistryAccess.EMPTY)
+				.validate(new GoalPredicate.InventoryContains("minecraft:dirt", 1)),
+				"the translated goal accepts the requested inventory fact");
 		assertEquals(
 				GoalCompilation.Kind.NEEDS_TRANSLATION,
 				compiler.compile("Get a good pickaxe", RegistryAccess.EMPTY, 1_200L).kind(),
@@ -108,7 +137,79 @@ public final class GoalCompilerVerification {
 		GoalCompilation make = compiler.compile("Make an iron pickaxe", RegistryAccess.EMPTY, 1_200L);
 		assertEquals(GoalCompilation.Kind.NEEDS_TRANSLATION, make.kind(),
 				"make wording cannot be reduced to already-held inventory");
-		return 17;
+		return 22;
+	}
+
+	private static int verifySpokenToolSets() {
+		GoalCompiler compiler = new GoalCompiler();
+		GoalPredicate tools = new GoalPredicate.AllOf(List.of(
+				new GoalPredicate.InventoryContains("minecraft:stone_pickaxe", 1),
+				new GoalPredicate.InventoryContains("minecraft:stone_axe", 1)));
+		GoalCompilation spoken = compiler.compile("go and get stone tools, a pickaxe and an axe", RegistryAccess.EMPTY, 1_200L);
+		assertEquals(GoalCompilation.Kind.ACCEPTED, spoken.kind(), "the reported stone-tools request has factual completion");
+		assertEquals(tools, spoken.acceptedSpec().orElseThrow().completion(), "both explicitly named stone tools are required");
+		assertEquals(false, compiler.translationRequiresOperatorConfirmation("go and get stone tools, a pickaxe and an axe", RegistryAccess.EMPTY),
+				"a named tool set is objectively verifiable");
+		assertEquals(tools, compiler.normalizeTranslatedPredicate("Get stone tools, a pickaxe and an axe",
+				new GoalPredicate.AllOf(List.of(tools, new GoalPredicate.OperatorConfirmed()))),
+				"Luna cannot add a manual completion gate to a factual tool set");
+		assertEquals(true, GoalCompiler.looksLikeGoalRequest("nice, can you get some iron tools now?"),
+				"the reported next-task request is recognized through its conversational prefix");
+		String exactSpeech = "hey, can you go and get stone tools and pickaxe and and axe";
+		assertEquals(tools, compiler.compile(exactSpeech, RegistryAccess.EMPTY, 1_200L).acceptedSpec().orElseThrow().completion(),
+				"the exact spoken request keeps the shared stone material and both tools despite a repeated conjunction");
+		assertEquals(false, compiler.translationRequiresOperatorConfirmation(exactSpeech, RegistryAccess.EMPTY),
+				"speech disfluency does not turn an inventory goal into manual confirmation");
+		assertEquals(List.of("minecraft:stone_axe", "minecraft:stone_pickaxe"), compiler.candidateIdsFor(exactSpeech, RegistryAccess.EMPTY),
+				"the noisy spoken request offers only the two requested stone tools");
+		expectCode("GOAL_TRANSLATION_CONSTRAINT_MISMATCH", () -> compiler.translationConstraintFor(exactSpeech, RegistryAccess.EMPTY)
+				.validate(new GoalPredicate.InventoryContains("minecraft:stone_pickaxe", 1)),
+				"the axe requirement cannot disappear from noisy spoken goal translation");
+		assertEquals(GoalCompilation.Kind.NEEDS_TRANSLATION,
+				compiler.compile("Get stone tools and a pickaxe and an iron axe", RegistryAccess.EMPTY, 1_200L).kind(),
+				"a different material in the list is not silently replaced with stone");
+		return 10;
+	}
+
+	private static int verifyGenericBlockGoal() {
+		GoalCompiler compiler = new GoalCompiler();
+		GoalCompilation any = compiler.compile("Get one block", RegistryAccess.EMPTY, 1_200L);
+		assertEquals(GoalCompilation.Kind.ACCEPTED, any.kind(), "generic block request starts immediately");
+		assertEquals(new GoalPredicate.InventoryContainsBlock(1), any.acceptedSpec().orElseThrow().completion(),
+				"generic block lets the agent choose any placeable block");
+		assertEquals(new GoalPredicate.InventoryContainsBlock(10), compiler.compile("Get 10 blocks", RegistryAccess.EMPTY, 1_200L)
+				.acceptedSpec().orElseThrow().completion(), "generic block quantity is retained");
+		assertEquals(GoalCompilation.Kind.REJECTED, compiler.compile("Get 99999 blocks", RegistryAccess.EMPTY, 1_200L).kind(),
+				"unrepresentable block quantities are rejected");
+		return 4;
+	}
+
+	private static int verifyGenericWoodGoal() {
+		GoalCompiler compiler = new GoalCompiler();
+		GoalCompilation spoken = compiler.compile("Could you get a block of wood?", RegistryAccess.EMPTY, 1_200L);
+		assertEquals(GoalCompilation.Kind.ACCEPTED, spoken.kind(), "ordinary wood request starts without clarification");
+		GoalPredicate.InventoryContainsAny wood = (GoalPredicate.InventoryContainsAny) spoken.acceptedSpec().orElseThrow().completion();
+		assertEquals(1, wood.count(), "a block of wood requires one held wood item");
+		assertTrue(wood.itemIds().contains("minecraft:oak_log"), "oak logs are valid wood");
+		assertTrue(wood.itemIds().contains("minecraft:spruce_log"), "the goal does not choose a tree species in advance");
+		assertTrue(wood.itemIds().contains("minecraft:oak_wood"), "bark-sided wood blocks are valid wood");
+		assertTrue(wood.itemIds().contains("minecraft:crimson_stem"), "Nether stems are valid wood sources");
+		assertEquals(false, wood.itemIds().contains("minecraft:wooden_pickaxe"), "crafted wooden tools are not raw wood");
+		assertEquals(false, wood.itemIds().contains("minecraft:oak_planks"), "planks do not substitute for a wood source");
+		assertEquals(wood, compiler.compile("Get wood", RegistryAccess.EMPTY, 1_200L)
+				.acceptedSpec().orElseThrow().completion(), "short wood request uses the same open category");
+		GoalPredicate.InventoryContainsAny counted = (GoalPredicate.InventoryContainsAny) compiler
+				.compile("Get three wood", RegistryAccess.EMPTY, 1_200L).acceptedSpec().orElseThrow().completion();
+		assertEquals(3, counted.count(), "the category preserves a requested quantity");
+		assertEquals(wood.itemIds(), counted.itemIds(), "quantity does not narrow the valid wood types");
+		assertEquals(new GoalPredicate.InventoryContains("minecraft:oak_log", 1),
+				compiler.compile("Get an oak log", RegistryAccess.EMPTY, 1_200L).acceptedSpec().orElseThrow().completion(),
+				"an explicit tree species remains an exact item goal");
+		assertEquals(wood.itemIds(), compiler.candidateIdsFor("Get wood from nearby", RegistryAccess.EMPTY),
+				"qualified wood requests expose the full category to translation");
+		assertSucceeds(() -> compiler.translationConstraintFor("Get wood from nearby", RegistryAccess.EMPTY)
+				.validate(wood), "qualified wood translation can keep the open category");
+		return 14;
 	}
 
 	private static int verifyInventoryCapacity() {
@@ -263,6 +364,17 @@ public final class GoalCompilerVerification {
 		assertSucceeds(
 				() -> dragonConstraint.validate(new GoalPredicate.EntityKilledByAgent("minecraft:ender_dragon", true)),
 				"the server constraint accepts the inferred Ender Dragon terminal result");
+		assertSucceeds(() -> compiler.translationConstraintFor("Beat the game", RegistryAccess.EMPTY)
+				.validate(new GoalPredicate.EntityKilledByAgent("minecraft:ender_dragon", true)),
+				"Luna's advisory plan cannot weaken the direct beat-game dragon completion fact");
+		assertEquals(true, compiler.translationRequiresOperatorConfirmation("Explore this mountain", RegistryAccess.EMPTY),
+				"open requests need an operator to confirm completion");
+		assertEquals(true, GoalCompiler.requiresConfirmationOnEveryPath(new GoalPredicate.AllOf(List.of(
+				new GoalPredicate.OperatorConfirmed(), new GoalPredicate.SurviveDuration(20)))),
+				"operator confirmation may accompany factual progress");
+		assertEquals(false, GoalCompiler.requiresConfirmationOnEveryPath(new GoalPredicate.AnyOf(List.of(
+				new GoalPredicate.OperatorConfirmed(), new GoalPredicate.SurviveDuration(20)))),
+				"an unconfirmed alternative cannot bypass the operator boundary");
 		assertEquals(
 				new GoalPredicate.EntityKilledByAgent("minecraft:ender_dragon", true),
 				compiler.normalizeTranslatedPredicate(
@@ -403,7 +515,7 @@ public final class GoalCompilerVerification {
 				compiler.candidateIdsFor("Earn the Stone Age advancement", RegistryAccess.EMPTY, manyLiveAdvancements).size(),
 				"natural advancement candidates remain bounded"
 		);
-		return 35;
+		return 39;
 	}
 
 	private static int verifyCompoundItemsAndKills() {
@@ -545,7 +657,15 @@ public final class GoalCompilerVerification {
 		assertEquals(GoalDraftResolution.Operation.QUEUE,
 				GoalDraftResolution.authorize(queued, queued.requestingPlayerId(), false, GoalDraftChoice.CONFIRM),
 				"a translated Manager queue request preserves its requested operation");
-		return 6;
+		PendingGoalDraft replacement = new PendingGoalDraft(
+				UUID.randomUUID(), idle.agentId(), draft.requestingPlayerId(), request,
+				List.of("minecraft:ender_dragon"), validated.proposedPredicate(), DraftIntent.TRANSLATE_REPLACE,
+				1_200L, 1L, Optional.of(UUID.randomUUID())
+		);
+		assertEquals(GoalDraftResolution.Operation.REPLACE,
+				GoalDraftResolution.authorize(replacement, replacement.requestingPlayerId(), false, GoalDraftChoice.CONFIRM),
+				"a validated translated replacement preserves the player's requested operation");
+		return 7;
 	}
 
 	private static int verifyExplicitAlternativeCandidates() {

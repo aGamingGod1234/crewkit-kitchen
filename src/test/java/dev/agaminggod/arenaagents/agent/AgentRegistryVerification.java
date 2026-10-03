@@ -20,6 +20,7 @@ public final class AgentRegistryVerification {
 		int assertions = 0;
 		assertions += verifyLifecycleAndRevisions();
 		assertions += verifyAtomicStartPublication();
+		assertions += verifyAtomicReplacementPublication();
 		assertions += verifyPendingConversationWakeRecovery();
 		assertions += verifyCoordinatorRecoveryRearm();
 		assertions += verifyCoordinatorCompletion();
@@ -34,6 +35,29 @@ public final class AgentRegistryVerification {
 		assertions += verifyEntityRecoveryTarget();
 		assertions += verifyDeathSnapshotPersistenceAndRespawn();
 		return assertions;
+	}
+
+	private static int verifyAtomicReplacementPublication() {
+		AgentRegistry registry = new AgentRegistry(2, 1, () -> { }, transition -> { });
+		AgentRecord idle = registry.create("gpt-6.1-sol", "low", Optional.empty(), START_TIME);
+		AgentRecord old = registry.start(idle.agentId(), "Get stone tools", START_TIME + 1L).after();
+		var spec = dev.agaminggod.arenaagents.agent.goal.GoalSpec.create("Get iron tools",
+				new dev.agaminggod.arenaagents.agent.goal.GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 1), 0L);
+		try {
+			registry.replaceAtomically(old.agentId(), spec, START_TIME + 2L, (transition, commit) -> {
+				commit.run(); throw new AgentDomainException("PUBLICATION_FAILED", "test disconnect");
+			});
+			throw new AssertionError("replacement must fail when delivery fails");
+		} catch (AgentDomainException expected) {
+			assertEquals("PUBLICATION_FAILED", expected.code(), "replacement propagates its publication failure");
+		}
+		assertEquals(old, registry.require(old.agentId()), "a failed replacement preserves the exact old goal");
+		AgentTransition changed = registry.replaceAtomically(old.agentId(), spec, START_TIME + 3L, (transition, commit) -> commit.run());
+		assertEquals(2L, changed.after().goalRevision(), "replacement advances the goal revision exactly once");
+		assertEquals(spec, changed.after().currentGoal().orElseThrow().spec(), "replacement installs the new requested task");
+		assertEquals(true, changed.cancelAction(), "task switch releases the old physical action");
+		assertEquals(true, changed.interruptPlanner(), "task switch interrupts the old model turn");
+		return 6;
 	}
 
 	private static int verifyAtomicStartPublication() {

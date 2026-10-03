@@ -24,6 +24,7 @@ import net.minecraft.resources.Identifier;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.level.block.state.BlockState;
 
 /** Evaluates only the immutable goal stored by Minecraft against live server facts. */
@@ -66,6 +67,23 @@ public final class GoalCompletionVerifier {
 					evaluatedLeaves, ignored -> Optional.of(List.of())
 			);
 			if (recovered.isPresent()) evaluation = new Evaluation(true, recovered.orElseThrow());
+		}
+		if (!evaluation.satisfied() && !operatorConfirmed
+				&& evaluatedLeaves.values().stream().anyMatch(leaf -> leaf.facts().getFirst().type().equals("operator_confirmed"))) {
+			// Readiness is a counterfactual branch search, not completion. Reuse this check's live
+			// facts and kill allocations so alternate branches cannot advance time or reuse a kill.
+			Map<PredicateKey, Evaluation> confirmationLeaves = new HashMap<>(evaluatedLeaves);
+			confirmationLeaves.entrySet().removeIf(entry -> entry.getValue().facts().getFirst().type().equals("operator_confirmed"));
+			Optional<List<GoalEvidence.Fact>> confirmationReady = satisfyWithBacktracking(
+					goal.goalId(), goal.spec().completion(), "root", facts, kills,
+					record, serverTick, true, new KillAllocation(), confirmationLeaves, ignored -> Optional.of(List.of()));
+			if (confirmationReady.isPresent()) {
+				List<GoalEvidence.Fact> actualFacts = confirmationReady.orElseThrow().stream()
+						.map(fact -> fact.type().equals("operator_confirmed")
+								? new GoalEvidence.Fact(fact.type(), false, fact.expectedValue(), "not confirmed") : fact)
+						.toList();
+				evaluation = new Evaluation(false, actualFacts);
+			}
 		}
 		return new VerificationResult(
 				evaluation.satisfied(), record.goalRevision(),
@@ -112,6 +130,15 @@ public final class GoalCompletionVerifier {
 				for (int index = 0; index < player.getInventory().getContainerSize(); index++) {
 					ItemStack stack = player.getInventory().getItem(index);
 					if (!stack.isEmpty() && accepted.contains(BuiltInRegistries.ITEM.getKey(stack.getItem()).toString())) count += stack.getCount();
+				}
+				return count;
+			}
+
+			@Override public long inventoryBlockCount() {
+				long count = 0;
+				for (int index = 0; index < player.getInventory().getContainerSize(); index++) {
+					ItemStack stack = player.getInventory().getItem(index);
+					if (!stack.isEmpty() && stack.getItem() instanceof BlockItem) count += stack.getCount();
 				}
 				return count;
 			}
@@ -202,6 +229,13 @@ public final class GoalCompletionVerifier {
 			evaluated = leaf("inventory_contains_any", observed >= inventory.count(),
 					"combined count across " + inventory.itemIds().size() + " accepted item IDs >= " + inventory.count(),
 					"combined count " + observed);
+			evaluatedLeaves.put(key, evaluated);
+			return evaluated;
+		}
+		if (predicate instanceof GoalPredicate.InventoryContainsBlock inventory) {
+			long observed = source.inventoryBlockCount();
+			evaluated = leaf("inventory_contains_block", observed >= inventory.count(),
+					"placeable blocks x" + inventory.count(), "placeable blocks x" + observed);
 			evaluatedLeaves.put(key, evaluated);
 			return evaluated;
 		}
@@ -373,6 +407,7 @@ public final class GoalCompletionVerifier {
 
 	public interface FactSource {
 		int inventoryCount(String itemId);
+		default long inventoryBlockCount() { return 0; }
 		default long inventoryCountAny(List<String> itemIds) {
 			long count = 0;
 			for (String itemId : itemIds) count += inventoryCount(itemId);
@@ -409,6 +444,12 @@ public final class GoalCompletionVerifier {
 		public GoalEvidence evidence(long verifiedAtTick) {
 			if (!verified) throw new IllegalStateException("Failed verification has no accepted evidence");
 			return new GoalEvidence(verifiedAtTick, reasonCode, facts);
+		}
+
+		public boolean awaitingOperatorConfirmation() {
+			if (verified || !reasonCode.equals("PREDICATE_FAILED")) return false;
+			List<GoalEvidence.Fact> unmet = facts.stream().filter(fact -> !fact.satisfied()).toList();
+			return !unmet.isEmpty() && unmet.stream().allMatch(fact -> fact.type().equals("operator_confirmed"));
 		}
 
 		public JsonObject toJson() {
