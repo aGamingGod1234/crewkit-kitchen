@@ -34,11 +34,12 @@ public final class ScenarioRuntimeVerification {
 		java.io.PrintStream consoleOut = System.out;
 		java.io.PrintStream consoleErr = System.err;
 		Path directory = Files.createTempDirectory("arena-scenario-runtime-");
-		try {
+		try (Cleanup cleanup = () -> Files.delete(directory)) {
 			net.minecraft.SharedConstants.tryDetectVersion();
 			net.minecraft.server.Bootstrap.bootStrap();
 			recovery();
 			launch();
+			cleanup(directory);
 			journal(directory);
 			rollback(directory);
 			hash();
@@ -46,7 +47,6 @@ public final class ScenarioRuntimeVerification {
 		} finally {
 			System.setOut(consoleOut);
 			System.setErr(consoleErr);
-			Files.delete(directory);
 		}
 	}
 
@@ -58,9 +58,11 @@ public final class ScenarioRuntimeVerification {
 		System.setOut(consoleOut);
 		System.setErr(consoleErr);
 		switch (args[0]) {
+			case "all" -> verify();
 			case "recovery" -> recovery();
 			case "launch" -> launch();
 			case "journal" -> journal(Path.of(args[1]));
+			case "cleanup" -> cleanup(Path.of(args[1]));
 			case "rollback" -> rollback(Path.of(args[1]));
 			case "hash" -> hash();
 			default -> throw new IllegalArgumentException("unknown regression");
@@ -148,7 +150,7 @@ public final class ScenarioRuntimeVerification {
 		set(state, "restoreAttempted", true);
 		Map<Object, Object> states = map(SERVICE, "STATES");
 		states.put(null, state);
-		try {
+		try (Cleanup cleanup = journalCleanup(fixture)) {
 			Files.createDirectories(target);
 			Files.writeString(blocker, "owned obstruction");
 			invoke("clearPreparationJournal", new Class<?>[]{STATE}, state);
@@ -174,8 +176,56 @@ public final class ScenarioRuntimeVerification {
 			check(journal.load().orElseThrow().equals(newer) && field(STATE, "preparationSnapshot").get(state) == newer,
 					"stale clear cannot release a changed owner");
 		} finally {
-			states.remove(null); Files.deleteIfExists(blocker); Files.deleteIfExists(target);
-			Files.deleteIfExists(fixture.resolve("runtime")); Files.delete(fixture);
+			states.remove(null);
+		}
+	}
+
+	@FunctionalInterface
+	private interface Cleanup extends AutoCloseable {
+		@Override void close() throws java.io.IOException;
+	}
+
+	private static Cleanup journalCleanup(Path fixture) {
+		return () -> {
+			Path target = fixture.resolve("runtime/scenario-preparation.json");
+			// Unix rejects a child lookup beneath the newer owner's regular-file journal.
+			if (Files.isDirectory(target)) Files.deleteIfExists(target.resolve("blocker"));
+			Files.deleteIfExists(target);
+			Files.deleteIfExists(fixture.resolve("runtime"));
+			Files.delete(fixture);
+		};
+	}
+
+	private static void cleanup(Path directory) throws Exception {
+		for (boolean obstruction : List.of(false, true)) {
+			Path fixture = Files.createTempDirectory(directory, "cleanup-");
+			try (Cleanup cleanup = journalCleanup(fixture)) {
+				Path target = fixture.resolve("runtime/scenario-preparation.json");
+				Files.createDirectories(target.getParent());
+				if (obstruction) {
+					Files.createDirectory(target);
+					Files.writeString(target.resolve("blocker"), "owned obstruction");
+				} else Files.writeString(target, "newer journal owner");
+			}
+			check(!Files.exists(fixture), "cleanup removes both regular-file and directory journal fixtures");
+		}
+		Path outer = Files.createTempDirectory(directory, "cleanup-primary-");
+		Path fixture = Files.createTempDirectory(outer, "journal-");
+		Path unexpected = fixture.resolve("unexpected");
+		AssertionError primary = new AssertionError("original fixture assertion");
+		try {
+			Files.writeString(unexpected, "forces inner and outer cleanup failures");
+			try (Cleanup outerCleanup = () -> Files.delete(outer);
+					Cleanup innerCleanup = journalCleanup(fixture)) {
+				throw primary;
+			} catch (AssertionError observed) {
+				check(observed == primary, "nested cleanup retains the exact primary assertion");
+				check(observed.getSuppressed().length == 2, "both cleanup failures are suppressed");
+				check(Arrays.stream(observed.getSuppressed()).allMatch(DirectoryNotEmptyException.class::isInstance),
+						"unexpected contents remain visible as cleanup failures");
+			}
+		} finally {
+			Files.deleteIfExists(unexpected); Files.deleteIfExists(fixture); Files.deleteIfExists(outer);
 		}
 	}
 
@@ -186,7 +236,7 @@ public final class ScenarioRuntimeVerification {
 		Object state = state();
 		var owner = owner(List.of());
 		set(state, "preparationJournal", journal); set(state, "preparationSnapshot", owner);
-		try {
+		try (Cleanup cleanup = journalCleanup(fixture)) {
 			journal.write(owner);
 			FileTime sentinel = FileTime.fromMillis(1_000L); Files.setLastModifiedTime(target, sentinel);
 			for (int i = 0; i < 40; i++) invoke("resetPreparationAgents", new Class<?>[]{STATE}, state);
@@ -200,9 +250,6 @@ public final class ScenarioRuntimeVerification {
 			try { invoke("resetPreparationAgents", new Class<?>[]{STATE}, state); throw new AssertionError("write must fail"); }
 			catch (InvocationTargetException expected) { check(expected.getCause() instanceof java.io.IOException, "storage failure remains visible"); }
 			check(field(STATE, "preparationSnapshot").get(state) == populated, "failed durable rollback retains memory ledger");
-		} finally {
-			Files.deleteIfExists(target.resolve("blocker")); Files.deleteIfExists(target);
-			Files.deleteIfExists(fixture.resolve("runtime")); Files.delete(fixture);
 		}
 	}
 

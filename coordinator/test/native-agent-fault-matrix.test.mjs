@@ -141,8 +141,10 @@ test('completion results cannot override unsatisfied factual predicates', async 
 	const result = await createNativeGoalHarness({
 		completionResults: [true],
 		turns: [['finish']],
-		timeoutMs: 100,
-	}).run();
+	}).run({
+		stopWhen: (current) => current.sent.some((entry) => entry.type === 'goal_completed')
+			&& current.recoveries.includes('COMPLETION_REJECTED'),
+	});
 	assert.equal(result.finalState, DynamicAgentState.PLANNING);
 	assert.equal(result.sent.filter((entry) => entry.type === 'goal_completed').length, 1);
 	assert.ok(result.recoveries.includes('COMPLETION_REJECTED'));

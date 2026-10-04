@@ -1,3 +1,4 @@
+import { windowsPowerShellEnv } from '../src/benchmark/windows-powershell-env.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
@@ -29,7 +30,7 @@ function Reject($action, $message) {
 ` + body;
   return execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], {
     cwd: repo, encoding: 'utf8', timeout: 90000, windowsHide: true,
-    env: { ...process.env, G27_SOURCE: source, G27_FIXTURE: root, G27_NODE: process.execPath, PATH: `${path.dirname(process.execPath)};${process.env.PATH}` },
+    env: { ...windowsPowerShellEnv(), G27_SOURCE: source, G27_FIXTURE: root, G27_NODE: process.execPath, PATH: `${path.dirname(process.execPath)};${process.env.PATH}` },
   });
 }
 

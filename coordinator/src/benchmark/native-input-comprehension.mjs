@@ -255,9 +255,9 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
 		assert.ok(['--before', '--after', '--output'].includes(process.argv[index]) && process.argv[index + 1], 'usage: [--before context.json --after context.json --output report.json]');
 		options[process.argv[index].slice(2)] = process.argv[index + 1];
 	}
-	const result = await runComprehensionComparison({ beforeContextPath: options.before, afterContextPath: options.after });
-	const destination = options.output ?? path.join(repositoryRoot, 'reports/native-input-comprehension-2026-10-02.json');
+	const destination = path.resolve(options.output ?? path.join(repositoryRoot, 'reports/native-input-comprehension-2026-10-02.json'));
 	assert.ok(destination.endsWith('.json'), '--output must end in .json');
+	const result = await runComprehensionComparison({ beforeContextPath: options.before, afterContextPath: options.after });
 	await mkdir(path.dirname(destination), { recursive: true });
 	await writeFile(destination, `${JSON.stringify(result, null, 2)}\n`);
 	await writeFile(destination.replace(/\.json$/, '.md'), renderComprehensionMarkdown(result));

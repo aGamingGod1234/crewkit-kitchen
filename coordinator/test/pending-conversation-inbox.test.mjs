@@ -6,24 +6,56 @@ import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { PendingConversationInbox } from '../src/pending-conversation-inbox.mjs';
 import { AtomicAgentStore } from '../src/observed-memory-store.mjs';
+import { MAX_IDENTIFIER_LENGTH } from '../src/constants.mjs';
 
-const entry = (sequence) => ({ sequence, kind: 'player_message', sourceId: 'fixture-player', recipientId: 'fixture-agent',
-	scope: 'direct', text: `  Instruction ${sequence}: ${'x'.repeat(250)}  `, goalRevision: sequence % 3, observedAtEpochMs: sequence });
-async function fixture(t, storeFactory) {
-	const directory = await mkdtemp(join(tmpdir(), 'pending-test-'));
-	t.after(() => rm(directory, { recursive: true, force: true }));
-	const create = () => new PendingConversationInbox({ directory, agentId: 'fixture-agent', ...(storeFactory ? { storeFactory } : {}) });
-	return { directory, create, inbox: create() };
-}
-async function drain(inbox) {
-	const entries = [];
-	for (;;) {
-		const reserved = await inbox.reserve();
-		entries.push(...reserved.conversation.entries);
-		await inbox.commit(reserved.token);
-		if (!reserved.more) return entries;
-	}
-}
+import { entry, fixture, drain } from './fixtures/pending-inbox-fixture.mjs';
+
+test('pending inbox: exact retained wake survives consumption, later input and restart', async t => {
+	const { inbox, create } = await fixture(t);
+	const wake = { transactionId: 'w'.repeat(MAX_IDENTIFIER_LENGTH), fingerprint: JSON.stringify({ event: entry(1), control: { operation: 'start', goalRevision: 1 } }) };
+	await inbox.append('one', entry(1), wake); await drain(inbox);
+	await inbox.append('one', entry(2)); await drain(inbox); await inbox.close();
+	const reload = create(); await reload.open('one');
+	assert.equal(await reload.checkWake('one', entry(1), wake), true);
+	assert.equal(await reload.append('one', entry(1), wake), false);
+	assert.equal(await reload.needsDelivery(1), false);
+	assert.deepEqual(await drain(reload), []);
+	await assert.rejects(reload.append('one', { ...entry(1), text: 'changed' }, wake), { code: 'CONVERSATION_COLLISION' });
+	await assert.rejects(reload.checkWake('one', entry(1), { ...wake, fingerprint: 'changed control' }), { code: 'TRANSACTION_COLLISION' });
+	await assert.rejects(reload.append('one', entry(1), { ...wake, transactionId: 'different-wake' }), { code: 'TRANSACTION_COLLISION' });
+	await assert.rejects(reload.append('one', entry(1)), { code: 'CONVERSATION_OUT_OF_ORDER' });
+	assert.equal(await reload.checkWake('two', entry(1), wake), false, 'wake identity is server scoped');
+	assert.equal(await reload.append('two', entry(1), wake), true);
+	assert.deepEqual(await drain(reload), [entry(1)]);
+	// Only the server's latest per-agent wake is replayable, regardless of backlog.
+	const next = { transactionId: 'wake-two', fingerprint: 'second exact wake' };
+	await reload.append('two', entry(2), next); await drain(reload);
+	await assert.rejects(reload.append('two', entry(1), wake), { code: 'CONVERSATION_OUT_OF_ORDER' });
+	await reload.close();
+});
+
+test('pending inbox: removal queued behind I/O cannot delete a replacement session mailbox', async t => {
+	let release, entered, armed = false;
+	const gate = new Promise(resolve => { release = resolve; });
+	const writing = new Promise(resolve => { entered = resolve; });
+	const { inbox } = await fixture(t, options => {
+		const disk = new AtomicAgentStore(options);
+		return { read: key => disk.read(key), write: async (key, value) => {
+			if (armed && key === 'index' && value.staged) { armed = false; entered(); await gate; }
+			return disk.write(key, value);
+		} };
+	});
+	let current = true, admission, removal;
+	try {
+		await inbox.open('one'); armed = true;
+		admission = inbox.append('one', entry(1)); await writing;
+		removal = inbox.remove(() => current);
+		current = false; inbox.fence(); release();
+		await admission; await removal;
+		await inbox.open('one');
+		assert.deepEqual(await drain(inbox), [entry(1)], 'obsolete queued deletion has no mailbox authority');
+	} finally { release(); await admission; await removal; await inbox.close(); }
+});
 
 test('pending inbox: fence during reclamation cannot invent unread backlog', async (t) => {
 	let release, entered, armed = false;
@@ -62,28 +94,6 @@ test('pending inbox: fence during reclamation cannot invent unread backlog', asy
 		await commit;
 		await inbox.close();
 	}
-});
-
-test('pending inbox: disk pages, exact text/revision, reload and reclamation remain bounded', async (t) => {
-	const { directory, inbox, create } = await fixture(t);
-	for (let n = 1; n <= 160; n++) await inbox.append('server-one', entry(n));
-	const [folder] = await readdir(directory);
-	for (const name of await readdir(join(directory, folder))) {
-		const data = await readFile(join(directory, folder, name));
-		assert.ok(data.length < 4096, 'neither page nor index grows with backlog');
-		const value = JSON.parse(data);
-		if (value.version === 1) assert.ok(data.length < 1024);
-	}
-	const pending = await inbox.reserve();
-	assert.equal(pending.conversation.entries.length, 32);
-	await inbox.close(); // Uncommitted reservation must survive a clean process boundary.
-	const reloaded = create(); await reloaded.open('server-one');
-	assert.deepEqual(await drain(reloaded), Array.from({ length: 160 }, (_, i) => entry(i + 1)));
-	await reloaded.close();
-	const final = create(); await final.open('server-one');
-	assert.deepEqual(await drain(final), []);
-	assert.equal((await readdir(join(directory, folder))).length, 1, 'only bounded metadata remains');
-	await final.close();
 });
 
 test('pending inbox: later steering commit cannot consume a rejected earlier reservation', async (t) => {

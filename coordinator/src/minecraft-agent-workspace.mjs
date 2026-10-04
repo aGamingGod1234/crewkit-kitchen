@@ -147,31 +147,46 @@ export class MinecraftAgentWorkspace {
 		const isolatedHash = authHash(isolatedContent);
 		if (isolatedContent == null) {
 			if (sourceContent != null) {
-				await this.#replaceContent(sourceContent, destination, 0o600);
-				await this.#rememberSourceAuthHash(sourceHash);
+				await this.#commitSourceAuthHash(sourceHash, () => this.#replaceContent(sourceContent, destination, 0o600));
 			}
 			return;
 		}
 		if (sourceContent == null) {
-			if (this.#lastSyncedSourceAuthHash !== undefined && isolatedHash === this.#lastSyncedSourceAuthHash) await this.#operation('rm', destination, { force: true });
-			await this.#rememberSourceAuthHash(null);
+			await this.#commitSourceAuthHash(null, async () => {
+				if (this.#lastSyncedSourceAuthHash !== undefined && isolatedHash === this.#lastSyncedSourceAuthHash) await this.#operation('rm', destination, { force: true });
+			});
 			return;
 		}
 		// Both homes may refresh the same login independently. Prefer the more recent
 		// refresh even when the source file itself has not changed since the last sync.
 		if (hasNewerSourceAuth(sourceContent, isolatedContent)) {
-			await this.#replaceContent(sourceContent, destination, 0o600);
-			await this.#rememberSourceAuthHash(sourceHash);
+			await this.#commitSourceAuthHash(sourceHash, () => this.#replaceContent(sourceContent, destination, 0o600));
 			return;
 		}
 		// With no baseline, keep independently refreshed auth unless the source is
 		// demonstrably newer for the same account.
-		if (this.#lastSyncedSourceAuthHash === undefined) return this.#rememberSourceAuthHash(sourceHash);
+		if (this.#lastSyncedSourceAuthHash === undefined) return this.#commitSourceAuthHash(sourceHash);
 		if (sourceHash === this.#lastSyncedSourceAuthHash) return;
 		if (isolatedHash === this.#lastSyncedSourceAuthHash) {
-			await this.#replaceContent(sourceContent, destination, 0o600);
-			await this.#rememberSourceAuthHash(sourceHash);
+			await this.#commitSourceAuthHash(sourceHash, () => this.#replaceContent(sourceContent, destination, 0o600));
 		}
+	}
+
+	async #commitSourceAuthHash(hash, mutate = async () => {}) {
+		const signal = this.#preparationSignal;
+		signal?.throwIfAborted();
+		// prepare's queue owns this bounded auth/ownership commit. Once it starts,
+		// finish both durable and in-memory bookkeeping before surfacing cancellation;
+		// otherwise a successful auth rename looks like an independent login on retry.
+		this.#preparationSignal = null;
+		try {
+			await mutate();
+			await this.#rememberSourceAuthHash(hash);
+		} finally {
+			this.#preparationSignal = signal;
+		}
+		// I/O errors propagate directly; cancellation is deferred only on success.
+		signal?.throwIfAborted();
 	}
 
 	async #rememberSourceAuthHash(hash) {

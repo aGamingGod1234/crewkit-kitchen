@@ -10,6 +10,8 @@ import { createInterface } from 'node:readline';
 import { createBudgetClock, preparePairedPilot, runPairedPilot, headlessTrialOutcome } from './paired-pilot.mjs';
 import { normalizeHeadlessMatrix } from '../headless-matrix.mjs';
 import { summarizeProviderAttestation } from '../headless-world.mjs';
+import { pairedSystemNow } from './paired-runner-channel.mjs';
+import { windowsPowerShellEnv } from './windows-powershell-env.mjs';
 
 const profileKeys = ['provider', 'model', 'reasoningEffort', 'serviceTier'];
 
@@ -68,8 +70,8 @@ export async function verifyArm(arm) {
  * waits for the root exit, and records UNKNOWN for descendants after force-stop.
  * taskkill is containment recovery, not proof that every descendant was known.
  */
-export function phaseWorker(command, args, { cwd, onResource = () => {}, onEvent = () => {} } = {}) {
-	const child = spawn(command, args, { cwd, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+export function phaseWorker(command, args, { cwd, env = process.env, onResource = () => {}, onEvent = () => {} } = {}) {
+	const child = spawn(command, args, { cwd, env: windowsPowerShellEnv(command, env), windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
 	let exited = false, exitCode = null, failed = false, pending = null, killing = null;
 	let startupError = null, handoffTimer = null, awaitingTrialAcknowledgement = false;
 	const queued = [];
@@ -137,7 +139,10 @@ export function phaseWorker(command, args, { cwd, onResource = () => {}, onEvent
 			else if (remaining() <= 0) expire();
 			if (!reason && !deadlineReached && !failed && !exited) {
 				if (name === 'trial') awaitingTrialAcknowledgement = true;
-				child.stdin.write(JSON.stringify({ phase: name, remainingMs: remaining() }) + '\n');
+				// Sample the shared clock before remaining(): publication/relay delay
+				// spends this fixed cutoff, including the already reserved cleanup.
+				const sharedNow = pairedSystemNow();
+				child.stdin.write(JSON.stringify({ phase: name, clock: 'system-monotonic-ms', cutoffMs: sharedNow + remaining() }) + '\n');
 			}
 			for (;;) {
 				if (reason || failed) { await terminate(); throw Object.assign(new Error('Paired worker stopped; teardown unknown'), { code: reason ?? 'WORKER_FAILED', name: reason === 'ABORTED' ? 'AbortError' : 'Error' }); }
@@ -296,25 +301,24 @@ export async function runPairedCli(config, { launcher, entryElapsedMs = 0, now =
 	// A missing/failed completion receipt must never authorize a complete run.
 	report.persistence ??= 'REQUIRES_COMPLETION_RECEIPT';
 	await persist(path.join(config.outputDirectory, 'report.json'), report);
-	// The durable completion receipt follows final report persistence. If it is
-	// missing, callers must treat persistence/budget completion as unknown.
-	const completedAtMs = accountPersistence();
-	const receipt = { sampledBeforeWriteMs: completedAtMs, deadlineMs, overrunMs: Math.max(0, completedAtMs - deadlineMs), status: report.status };
-	if (completedAtMs > deadlineMs) receipt.status = report.status = 'INCOMPLETE';
-	await persist(path.join(config.outputDirectory, 'completion.json'), receipt);
-	const persistedAtMs = accountPersistence();
-	// Validate the terminal accounting observation too. No unchecked sample may
-	// follow a successful decision; a late decision permits only corrections.
-	const finalObservedAtMs = accountPersistence();
-	if (finalObservedAtMs > deadlineMs) {
-		report.status = 'INCOMPLETE';
-		// Keep the commonly consumed report consistent with the receipt. These
-		// corrective writes are stop-only accounting, never another runtime grant.
+	const receiptPath = path.join(config.outputDirectory, 'completion.json');
+	// Fail closed even when a required report/receipt replacement fails. This
+	// first durable receipt never certifies the pre-write observation.
+	await persist(receiptPath, { version: 2, status: 'UNCONFIRMED', deadlineMs });
+	accountPersistence();
+	let finalObservedAtMs = accountPersistence();
+	if (report.status === 'INCOMPLETE') {
 		await persist(path.join(config.outputDirectory, 'report.json'), report);
-		await persist(path.join(config.outputDirectory, 'completion.json'), { ...receipt, status: 'INCOMPLETE', observedAfterWriteMs: persistedAtMs, finalObservedAtMs, overrunMs: finalObservedAtMs - deadlineMs });
-		// Charge all corrective IO once, without another persistence/measurement loop.
-		accountPersistence();
+		finalObservedAtMs = accountPersistence();
 	}
+	// Explicit terminal accounting boundary: all lifecycle, journal, report and
+	// provisional receipt IO (including required corrections) is charged above.
+	// The certification commit below only records that observation; its own IO
+	// is outside the runtime allowance. No clock read, work, or revocation follows.
+	// If this commit fails, the durable receipt remains UNCONFIRMED.
+	await persist(receiptPath, { version: 2, status: report.status, deadlineMs,
+		finalObservedAtMs, overrunMs: report.authorization.overrunMs,
+		accountingBoundary: 'BEFORE_CERTIFICATION_COMMIT', certificationWriteCharged: false });
 	return report;
 }
 

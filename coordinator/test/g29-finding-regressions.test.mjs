@@ -1,3 +1,4 @@
+import { windowsPowerShellEnv } from '../src/benchmark/windows-powershell-env.mjs';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readdirSync, rmdirSync, unlinkSync } from 'node:fs';
@@ -100,7 +101,7 @@ if (Test-Path -LiteralPath (Join-Path $fixture 'runtime/bridge-secret.txt')) { t
   try {
     const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], {
       cwd: repository,
-      env: { ...process.env, G29_REPOSITORY: repository, G29_FIXTURE: fixture },
+      env: { ...windowsPowerShellEnv(), G29_REPOSITORY: repository, G29_FIXTURE: fixture },
       encoding: 'utf8',
     });
     assert.ifError(result.error);

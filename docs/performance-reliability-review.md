@@ -12,7 +12,9 @@ This change combines the performance, token-efficiency and long-goal reliability
 
 ## Verification boundary
 
-The final integrated Windows Node 22.23.2 suite passed **2,386 tests with zero failures and three skips** after the recovery-metadata and test-portability corrections. The focused service/planner checks passed 95/95; the four portability test files passed 267/267; five affected cases also passed in an isolated fixture without the audit-output directory. These focused counts overlap the full suite.
+The subsequent [19-finding review follow-up](performance-reliability-followup.md) records the current fixes and validation. The results below describe the earlier implementation checkpoint; they do not certify later changes.
+
+At that earlier checkpoint, the integrated Windows Node 22.23.2 suite passed **2,386 tests with zero failures and three skips** after the recovery-metadata and test-portability corrections. The focused service/planner checks passed 95/95; the four portability test files passed 267/267; five affected cases also passed in an isolated fixture without the audit-output directory. These focused counts overlap the full suite.
 
 Fresh offline Java verification passed core, Director, voice, camera-mixin and map checks. Both JARs built, and the main JAR was rebuilt after the final metadata correction. Embedded coordinator verification compared all 114 runtime files against source and extraction, parsed 91 packaged modules and exercised the packaged entrypoint, fact encoding, queue and persisted inbox. Those are backend, controlled-fixture and build checks, not an installed-game result.
 

@@ -19,13 +19,50 @@ $updater = Join-Path $root 'scripts\install-normal-profile-update.ps1'
 & $updater -ProjectRoot $root -GameDirectory $env:TEMP -TestProcessClassification
 
 function Get-FileSnapshot([string] $Path) {
-    return @(Get-ChildItem -LiteralPath $Path -Recurse -File | Sort-Object FullName | ForEach-Object {
-        $_.FullName.Substring($Path.Length + 1) + ':' + (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+    return @(Get-ChildItem -LiteralPath $Path -Recurse -File -Force | Sort-Object FullName | ForEach-Object {
+        $_.FullName.Substring($Path.Length + 1).Replace('\', '/') + ':' + (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
     })
 }
 
 function Assert-SameSnapshot([string[]] $Before, [string[]] $After, [string] $Message) {
     if (@(Compare-Object $Before $After).Count -ne 0) { throw $Message }
+}
+
+function Assert-RuntimeRollbackSnapshot([string[]] $Before, [string[]] $After, [bool] $RuntimeTransactionStarted, [string] $Message) {
+    $state = @($Before | Where-Object { $_ -cmatch '^runtime/coordinator-generation\.properties:[A-F0-9]{64}$' })
+    if (-not $RuntimeTransactionStarted -or $state.Count -eq 0) {
+        Assert-SameSnapshot $Before $After $Message
+        return
+    }
+    # Recovery retains just this transaction's state copy. Every prior file,
+    # including older recovery backups, must still exist with identical bytes.
+    $added = @($After | Where-Object { $_ -cnotin $Before })
+    if ($added.Count -ne 1 -or $added[0] -cnotmatch '^generation-state-backups/state-[a-f0-9]{32}\.properties:[A-F0-9]{64}$') { throw $Message }
+    if ($added[0].Split(':')[1] -cne $state[0].Split(':')[1]) { throw "$Message Retained state backup differs from the prior state." }
+    Assert-SameSnapshot $Before @($After | Where-Object { $_ -cne $added[0] }) $Message
+}
+
+function Assert-RuntimeTransactionCleanup([string] $Path) {
+    foreach ($entry in Get-ChildItem -LiteralPath $Path -Recurse -Force) {
+        $relative = $entry.FullName.Substring($Path.Length + 1).Replace('\', '/')
+        if ($relative -cmatch '^\.arena-runtime-transaction\.json(\.tmp)?$|^(coordinator|coordinator\.last-known-good|runtime/toolchains/node|runtime/coordinator-generation\.properties)\.staging-') {
+            throw "Runtime transaction artifact remains: $relative"
+        }
+    }
+}
+
+function Assert-GenerationStateBackupPruning([string[]] $Before, [string[]] $After) {
+    $state = @($Before | Where-Object { $_ -cmatch '^runtime/coordinator-generation\.properties:[A-F0-9]{64}$' })
+    $backups = @($After | Where-Object { $_ -clike 'generation-state-backups/*' })
+    if ($state.Count -eq 0) {
+        if ($backups.Count -ne 0) { throw 'Successful update retained an obsolete generation state backup.' }
+        return
+    }
+    if ($backups.Count -ne 1 -or $backups[0] -cnotmatch '^generation-state-backups/state-[a-f0-9]{32}\.properties:[A-F0-9]{64}$' -or $backups[0].Split(':')[1] -cne $state[0].Split(':')[1]) {
+        throw 'Successful update did not retain exactly its byte-identical prior generation state backup.'
+    }
+    $oldPaths = @($Before | Where-Object { $_ -clike 'generation-state-backups/*' } | ForEach-Object { $_.Split(':')[0] })
+    if ($backups[0].Split(':')[0] -cin $oldPaths) { throw 'Successful update did not prune an obsolete generation state backup.' }
 }
 
 function Invoke-WithFileLockRetry([scriptblock] $Action) {
@@ -58,7 +95,9 @@ function Assert-CurrentUserRuntimeAccess([string] $Path, [switch] $RequireInheri
     }).Count -eq 0) { throw 'Updater did not make current-user runtime access inheritable.' }
 }
 
-$target = Join-Path $env:TEMP ('arena normal profile test ' + [guid]::NewGuid().ToString('N'))
+# Keep the space-in-path control without making nested coordinator backup paths
+# exceed Windows PowerShell 5.1's legacy path limit under a normal user TEMP.
+$target = Join-Path $env:TEMP ('arena up ' + [guid]::NewGuid().ToString('N'))
 $mods = Join-Path $target 'mods'
 $installedRoot = Join-Path $target 'arena-agents-runtime'
 $runtimeCoordinator = Join-Path $installedRoot 'coordinator'
@@ -80,6 +119,9 @@ try {
     Set-Content -LiteralPath (Join-Path $runtimeCoordinator 'stale.log') -Value 'remove'
     Set-Content -LiteralPath $secretPath -Value ('a' * 32)
     Set-Content -LiteralPath $journalPath -Value 'phase=ready'
+    $existingStateBackup = Join-Path $installedRoot ('generation-state-backups/state-' + ('0' * 32) + '.properties')
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $existingStateBackup) | Out-Null
+    Set-Content -LiteralPath $existingStateBackup -Value 'older recovery state'
     Set-Content -LiteralPath $externalConfigPath -Value '{"provider":"preserve-me"}'
     New-Item -ItemType File -Force -Path (Join-Path $installedRoot '.arena-runtime-install.lock') | Out-Null
 
@@ -98,9 +140,13 @@ try {
     }
     if (Test-Path -LiteralPath $installedNode) { throw 'Fresh-target rollback left a Node.js runtime behind.' }
     Assert-SameSnapshot $modsBefore (Get-FileSnapshot $mods) 'Fresh-target rollback did not restore the prior mod state.'
-    Assert-SameSnapshot $runtimeBefore (Get-FileSnapshot $installedRoot) 'Fresh-target rollback did not restore the prior runtime state.'
+    Assert-RuntimeRollbackSnapshot $runtimeBefore (Get-FileSnapshot $installedRoot) $true 'Fresh-target rollback did not restore the prior runtime state.'
+    Assert-RuntimeTransactionCleanup $installedRoot
 
+    $beforeSuccess = Get-FileSnapshot $installedRoot
     & $updater -ProjectRoot $root -GameDirectory $target
+    Assert-GenerationStateBackupPruning $beforeSuccess (Get-FileSnapshot $installedRoot)
+    Assert-RuntimeTransactionCleanup $installedRoot
     if (-not (Test-Path -LiteralPath (Join-Path $mods $modJarName))) { throw 'Updated jar missing.' }
     if (-not (Test-Path -LiteralPath (Join-Path $mods $voiceJarName))) { throw 'Updated voice-addon jar missing.' }
     if (Test-Path -LiteralPath (Join-Path $mods 'arena-agents-old-unparseable.jar')) { throw 'Stale Arena jar remains.' }
@@ -172,13 +218,18 @@ try {
         try { & $updater -ProjectRoot $root -GameDirectory $target -FailurePoint $failurePoint; throw "Failure injection did not occur: $failurePoint" } catch { if ($_.Exception.Message -notmatch 'Injected failure') { throw } }
         if (@(Get-ChildItem -LiteralPath $target -Directory -Filter '.arena-agents-backup-*').Count -eq 0) { throw "No preserved backup after failure: $failurePoint" }
         Assert-SameSnapshot $before (Get-FileSnapshot $mods) "Forced failure did not restore prior mod state: $failurePoint"
-        Assert-SameSnapshot $runtimeBefore (Get-FileSnapshot $installedRoot) "Forced failure did not restore runtime state: $failurePoint"
+        $runtimeTransactionStarted = $failurePoint -in @('AfterCoordinatorSwap', 'AfterNodeSwap', 'AfterGenerationStateSwap')
+        Assert-RuntimeRollbackSnapshot $runtimeBefore (Get-FileSnapshot $installedRoot) $runtimeTransactionStarted "Forced failure did not restore runtime state: $failurePoint"
+        Assert-RuntimeTransactionCleanup $installedRoot
         if ((Get-FileHash $installedNode -Algorithm SHA256).Hash -ne $oldNodeHash) { throw "Forced failure did not restore the prior Node runtime: $failurePoint" }
         if ((Get-FileHash $secretPath -Algorithm SHA256).Hash -ne $secretHash) { throw "Secret changed after failure: $failurePoint" }
         if ((Get-FileHash $externalConfigPath -Algorithm SHA256).Hash -ne $externalConfigHash) { throw "External config changed after failure: $failurePoint" }
         if (-not (Test-Path -LiteralPath (Join-Path $runtimeCoordinator 'src\dynamic-main.mjs'))) { throw "Forced failure did not restore coordinator state: $failurePoint" }
     }
+    $beforeSuccess = Get-FileSnapshot $installedRoot
     & $updater -ProjectRoot $root -GameDirectory $target
+    Assert-GenerationStateBackupPruning $beforeSuccess (Get-FileSnapshot $installedRoot)
+    Assert-RuntimeTransactionCleanup $installedRoot
     if ((Get-FileHash $installedNode -Algorithm SHA256).Hash -ne (Get-FileHash $sourceNode -Algorithm SHA256).Hash) {
         throw 'A subsequent successful update did not replace the old Node runtime.'
     }

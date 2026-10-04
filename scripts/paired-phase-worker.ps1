@@ -10,25 +10,28 @@ function Send-PairedEvent([string] $Kind, $Value) {
 	[Console]::Out.Flush()
 }
 function Get-PairedRemaining {
-	return [Math]::Max(0, [Math]::Floor($script:PairedState.remainingMs - $script:PairedState.clock.Elapsed.TotalMilliseconds))
+	return [Math]::Max(0, [Math]::Floor($script:PairedState.cutoffMs - (Get-PairedSystemNow)))
+}
+function Get-PairedSystemNow {
+	# QPC is shared with Node/libuv hrtime on this Windows host, in milliseconds.
+	return [Diagnostics.Stopwatch]::GetTimestamp() * (1000.0 / [Diagnostics.Stopwatch]::Frequency)
 }
 function Receive-PairedPhase([string] $Expected) {
 	$line = [Console]::In.ReadLine()
 	if ($null -eq $line) { throw 'Paired supervisor disconnected' }
 	$message = $line | ConvertFrom-Json
-	if ($message.phase -ne $Expected -or $message.remainingMs -lt 0) { throw 'Invalid paired phase transition' }
+	if ($message.phase -ne $Expected -or $message.clock -ne 'system-monotonic-ms' -or [double]::IsNaN([double]$message.cutoffMs) -or [double]::IsInfinity([double]$message.cutoffMs) -or $message.cutoffMs -lt 0) { throw 'Invalid paired phase transition' }
 	$script:PairedState.phase = $Expected
-	$script:PairedState.remainingMs = [double] $message.remainingMs
-	$script:PairedState.clock.Restart()
+	$script:PairedState.cutoffMs = [double] $message.cutoffMs
 }
 function Write-PairedRunnerRequest([string] $Name) {
 	$destination = Join-Path $script:PairedState.channel "$Name.json"
-	[IO.File]::WriteAllText("$destination.tmp", (@{ remainingMs = (Get-PairedRemaining) } | ConvertTo-Json -Compress))
+	[IO.File]::WriteAllText("$destination.tmp", (@{ clock = 'system-monotonic-ms'; cutoffMs = $script:PairedState.cutoffMs } | ConvertTo-Json -Compress))
 	Move-Item -LiteralPath "$destination.tmp" -Destination $destination
 }
 
 $script:PairedState = @{
-	phase = 'startup'; remainingMs = 0; clock = [Diagnostics.Stopwatch]::StartNew()
+	phase = 'startup'; cutoffMs = 0
 	channel = $request.channel; artifactSha256 = $request.arm.artifactSha256
 	resources = [System.Collections.Generic.List[object]]::new(); drainFailed = $false
 }

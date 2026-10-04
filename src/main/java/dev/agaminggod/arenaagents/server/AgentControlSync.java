@@ -6,7 +6,10 @@ import dev.agaminggod.arenaagents.control.DirectorCommandRequestPayload;
 import dev.agaminggod.arenaagents.control.DirectorCommandResultPayload;
 import dev.agaminggod.arenaagents.control.AgentControlRequestPayload;
 import dev.agaminggod.arenaagents.control.AgentControlGroup;
+import dev.agaminggod.arenaagents.control.AgentControlModelOption;
 import dev.agaminggod.arenaagents.control.AgentControlSnapshot;
+import dev.agaminggod.arenaagents.agent.AgentId;
+import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.control.AgentControlSnapshotPayload;
 import dev.agaminggod.arenaagents.scenario.ScenarioLaunchPayload;
 import dev.agaminggod.arenaagents.scenario.ScenarioCancelPayload;
@@ -29,6 +32,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.WeakHashMap;
+import java.util.function.Function;
 import net.minecraft.core.BlockPos;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
@@ -361,7 +365,7 @@ public final class AgentControlSync {
 			}
 			boolean canControl = GoalControl.mayControl(player.createCommandSourceStack());
 			CodexAgentManager manager = CodexAgentManager.get(player.level().getServer());
-			AgentControlSnapshot snapshot = AgentControlSnapshot.fromRecords(
+			AgentControlSnapshot snapshot = controlSnapshot(
 					canControl,
 					CodexAgentServerRuntime.automationAvailable(player.level().getServer()),
 					CodexAgentServerRuntime.automationStatus(player.level().getServer()),
@@ -373,7 +377,8 @@ public final class AgentControlSync {
 									group.memberIds().stream().map(Object::toString).toList()
 							))
 							.toList(),
-					CodexAgentServerRuntime.modelCatalog(player.level().getServer())
+					CodexAgentServerRuntime.modelCatalog(player.level().getServer()),
+					manager::findAgentPlayer
 			);
 			if (ServerPlayNetworking.canSend(player, AgentControlSnapshotPayload.TYPE)) {
 				ServerPlayNetworking.send(player, AgentControlSnapshotPayload.fromSnapshot(snapshot));
@@ -381,6 +386,15 @@ public final class AgentControlSync {
 		} catch (RuntimeException exception) {
 			LOGGER.warn("Could not send Arena Agents control snapshot to {}", player.getScoreboardName(), exception);
 		}
+	}
+
+	static AgentControlSnapshot controlSnapshot(
+			boolean canControl, boolean automationAvailable, String automationStatus, long revision,
+			List<AgentRecord> records, List<AgentControlGroup> groups, List<AgentControlModelOption> catalog,
+			Function<AgentId, Optional<ServerPlayer>> findPlayer
+	) {
+		return AgentControlSnapshot.fromRecords(canControl, automationAvailable, automationStatus, revision,
+				records, groups, catalog, id -> findPlayer.apply(id).filter(ServerPlayer::isAlive).isPresent());
 	}
 
 	private static synchronized long nextControlRevision(MinecraftServer server) {

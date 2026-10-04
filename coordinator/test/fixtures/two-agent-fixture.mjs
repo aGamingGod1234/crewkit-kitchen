@@ -13,10 +13,10 @@ const PROFILES = Object.freeze([
 ]);
 const SOURCE = 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(1); program.finish("done");';
 
-export async function startTwoAgentFixture({ malformedFirstAgent = null } = {}) {
+export async function startTwoAgentFixture({ malformedFirstAgent = null, transformDelivery = (_agentId, input) => input } = {}) {
 	const bridge = new FakeBridge();
 	const registry = new AgentRegistry({ agentCap: 2 });
-	const provider = new FixtureProvider({ malformedFirstAgent });
+	const provider = new FixtureProvider({ malformedFirstAgent, transformDelivery });
 	const expectedGoals = new Map();
 	const trace = { rows: [], privateRows: [], async write(event, fields) { this.rows.push({ event, ...fields }); }, async writeDiagnostic(event, fields) { this.privateRows.push({ event, ...fields }); } };
 	const coordinator = createDynamicCoordinator(
@@ -135,12 +135,16 @@ function fixtureGoalSpec(originalRequest) {
 class FixtureProvider {
 	catalog = { stale: false, refresh: async () => ({ models: [] }), assertSupported() {} };
 	#malformedFirstAgent;
+	#transformDelivery;
 	attempts = new Map();
 	sessions = new Map();
 	inputs = [];
 	interruptions = [];
 
-	constructor({ malformedFirstAgent }) { this.#malformedFirstAgent = malformedFirstAgent; }
+	constructor({ malformedFirstAgent, transformDelivery }) {
+		this.#malformedFirstAgent = malformedFirstAgent;
+		this.#transformDelivery = transformDelivery;
+	}
 	async start() {}
 	async stop() {}
 	async reconcile(records) { return { valid: records, invalid: [], catalog: { refreshedAtEpochMs: 1, models: [] } }; }
@@ -153,6 +157,8 @@ class FixtureProvider {
 		return {
 			setGoalRevision: async (goalRevision) => { session.goalRevision = goalRevision; },
 			decide: async (input) => {
+				// Corrupt only what reaches the fake provider, after the real planner builds it.
+				input = this.#transformDelivery(record.agentId, input);
 				this.inputs.push({ agentId: record.agentId, provider: record.provider, model: record.model, reasoningEffort: record.reasoningEffort, sessionId: session.sessionId, input });
 				this.attempts.set(record.agentId, (this.attempts.get(record.agentId) ?? 0) + 1);
 				if (record.agentId === this.#malformedFirstAgent && session.turns === 0 && !session.malformed) {

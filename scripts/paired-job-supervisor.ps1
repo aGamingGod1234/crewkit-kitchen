@@ -57,6 +57,8 @@ try {
 	$info.FileName = (Join-Path $PSHOME 'powershell.exe')
 	$info.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + (Join-Path $PSScriptRoot 'paired-phase-worker.ps1') + '" -RequestPath "' + $RequestPath.Replace('"', '\"') + '"'
 	$info.UseShellExecute = $false; $info.CreateNoWindow = $true
+	# Initialize Windows PowerShell's own compatible module search path.
+	$info.EnvironmentVariables.Remove('PSModulePath')
 	$info.RedirectStandardInput = $true; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
 	$worker = [Diagnostics.Process]::Start($info)
 	if (-not $native::AssignProcessToJobObject($job, $worker.Handle)) { throw 'Cannot contain phase worker; startup refused' }

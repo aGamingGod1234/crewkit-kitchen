@@ -184,6 +184,14 @@ export class NativeProgramExecutor {
 		return run.result;
 	}
 
+	expire(record, programId) {
+		const run = this.#runs.get(record.agentId);
+		if (!run || run.record.goalRevision !== record.goalRevision || run.programId !== programId) return Promise.resolve(null);
+		// Do not overwrite cancellation or a deadline already being acknowledged.
+		if (run.stopping === null) this.#return(run, { state: 'TIMED_OUT', reasonCode: 'PROGRAM_DEADLINE' }, true);
+		return run.result;
+	}
+
 	async #dispatch(run, suppliedCommand) {
 		if (run.settled) return;
 		if (run.stopping !== null || run.actions >= run.maxActions) {

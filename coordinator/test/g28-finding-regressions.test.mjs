@@ -1,3 +1,4 @@
+import { windowsPowerShellEnv } from '../src/benchmark/windows-powershell-env.mjs';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -9,7 +10,8 @@ test('packaging checks installed metadata, artifact parity and retained map attr
 	const project = fileURLToPath(new URL('../../', import.meta.url));
 	const result = spawnSync('powershell.exe', ['-NoProfile', '-File', 'scripts/test-coordinator-packaging.ps1'], {
 		cwd: project,
-		encoding: 'utf8',
+		env: windowsPowerShellEnv(),
+    encoding: 'utf8',
 		windowsHide: true,
 	});
 	assert.ifError(result.error);

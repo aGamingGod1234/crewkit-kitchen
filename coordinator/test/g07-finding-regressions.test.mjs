@@ -307,6 +307,7 @@ test('native A/B accepts required work only and excludes invalid arms from paire
         if(mode==='missing-mine')actions=actions.filter(action=>action!=='break_block');
         for(const actionType of actions){
           const args=actionType==='chat'?{message:'hello'}:actionType==='craft_inventory'?{recipeId:'minecraft:oak_planks',count:4,timeoutMs:15000}:{x:2,y:64,z:1};
+          if(actionType==='break_block')args.expectedBlockId='minecraft:stone';
           if(mode==='wrong-args'){args.count=1;args.x=99;args.message='';}
           await context.executeTool({tool:{kind:'action',actionType,arguments:args}});
         }

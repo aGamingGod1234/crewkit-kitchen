@@ -199,7 +199,7 @@ export class NativeGoalHarness {
 	get provider() { return this.#provider; }
 	get coordinator() { return this.#coordinator; }
 
-	async run({ stopAfter = null } = {}) {
+	async run({ stopAfter = null, stopWhen = null } = {}) {
 		await this.#coordinator.start();
 		this.#sampleListeners();
 		this.#bridge.start();
@@ -218,6 +218,9 @@ export class NativeGoalHarness {
 				&& !this.#goalSupervisor.hasInFlightWork()) this.#goalScheduler.runNext();
 			const record = this.#registry.get(AGENT_ID);
 			if (record?.state !== undefined) this.#observedStates.push(record.state);
+			// Scenario completion is an observed event, not a short wall-clock delay.
+			// The existing deadline remains a watchdog for a missing event.
+			if (stopWhen?.(this.#result())) break;
 			if (stopAfter === 'first-turn' && this.#provider.turns >= 1) break;
 			if ([DynamicAgentState.COMPLETED, DynamicAgentState.PAUSED, DynamicAgentState.ERROR].includes(record?.state)) break;
 			if (this.#provider.turns >= this.#scenario.turns.length && this.#scenario.stopWhenScriptExhausted) break;

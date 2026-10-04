@@ -889,11 +889,11 @@ function normalizeInventory(value) {
 		return { itemId: identifier(entry.itemId ?? 'minecraft:air', 'inventory.itemId'), count: nonnegativeInteger(entry.count ?? 0, 'inventory.count'), damage: nonnegativeInteger(entry.damage ?? 0, 'inventory.damage'), maxDamage: nonnegativeInteger(entry.maxDamage ?? 0, 'inventory.maxDamage'), slot, ...(entry.tags === undefined ? {} : { tags: normalizeTags(entry.tags, `inventory.items[${index}].tags`) }) };
 	});
 	const inventory = { items, selectedItem: identifier(source.selectedItem ?? items[0]?.itemId ?? 'minecraft:air', 'inventory.selectedItem'), tagCounts: normalizeTagCounts(source.tagCounts) };
-	const supplied = inventory.tagCounts;
-	refreshInventoryTags(inventory);
-	for (const [tag, count] of Object.entries(supplied)) {
-		if (inventory.tagCounts[tag] !== count) throw new TypeError('simulator inventory.tagCounts must match explicit item tags');
+	const counts = aggregateInventoryTags(inventory);
+	for (const [tag, count] of Object.entries(inventory.tagCounts)) {
+		if (counts[tag] !== count) throw new TypeError('simulator inventory.tagCounts must match explicit item tags');
 	}
+	refreshInventoryTags(inventory, counts);
 	return inventory;
 }
 function normalizeEffects(value) {
@@ -1027,10 +1027,19 @@ function withinBlockReach(player, block) {
 	const nearest = Object.fromEntries(['x', 'y', 'z'].map(axis => [axis, Math.max(block[axis], Math.min(eye[axis], block[axis] + 1))]));
 	return distance(eye, nearest) <= (player.gameMode === 'creative' ? 5 : 4.5);
 }
-function refreshInventoryTags(inventory) {
+function aggregateInventoryTags(inventory) {
 	const counts = Object.fromEntries(Object.keys(inventory.tagCounts).map(tag => [tag, 0]));
 	for (const item of inventory.items) for (const tag of item.tags ?? []) counts[tag] = (counts[tag] ?? 0) + item.count;
-	inventory.tagCounts = counts;
+	return counts;
+}
+function refreshInventoryTags(inventory, counts = aggregateInventoryTags(inventory)) {
+	// Publish current positive facts before known-zero history, using code-unit tag
+	// order within each group. Omitted keys stay unknown; inventory items stay intact.
+	const tags = Object.keys(counts);
+	const positive = tags.filter(tag => counts[tag] > 0).sort();
+	const zero = tags.filter(tag => counts[tag] === 0).sort();
+	inventory.tagCounts = Object.fromEntries([...positive, ...zero]
+		.slice(0, MAX_TAG_COUNT_ENTRIES).map(tag => [tag, counts[tag]]));
 }
 function isSolid(blockId) { return typeof blockId === 'string' && !SOLID_EXCEPTIONS.has(blockId); }
 function playerIntersectsBlock(position, block) {

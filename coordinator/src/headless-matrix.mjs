@@ -226,7 +226,7 @@ export async function runHeadlessScenario({
 	providerTurnsPath = null,
 	providerTurnRecorder = null,
 	worldManifest = null,
-	trialDeadlineMs = null, onCleanup = null,
+	trialDeadlineMs = null, onCleanup = null, cleanupRconFactory = null,
 	poll = defaultPoll,
 } = {}) {
 	if (!scenario || typeof scenario !== 'object') throw new TypeError('scenario must be an object');
@@ -286,14 +286,33 @@ export async function runHeadlessScenario({
 	let naturalWorld = null;
 	let spawnPosition = null;
 	let spawnTicket = null;
+	let trialTransportRetired = false;
+	let cleanupRcon = null;
+	let cleanupConnectionAttempted = false;
+	let cleanupConnectionError = null;
 	const withinDeadline = onCleanup === null ? withDeadline : settledOperation;
 	const command = async (value, { readOnly = false, deadlineMs = deadline, attempt = 0, recordEvidence = true } = {}) => {
 		const commandText = String(value);
 		if (readOnly && !isReadOnlyRcon(commandText)) throw new Error(`RCON assertion command is not read-only: ${commandText}`);
 		commands.push(commandText);
+		if (cleanupBoundary !== null && trialTransportRetired && !cleanupConnectionAttempted) {
+			cleanupConnectionAttempted = true;
+			try {
+				if (now() >= cleanupBoundary) throw headlessTimeout();
+				if (typeof cleanupRconFactory !== 'function') throw new Error('Cleanup requires a fresh RCON connection');
+				// Never reuse the expired stream: late status packets have no safe
+				// command boundary. Authentication spends the existing cleanup budget.
+				cleanupRcon = cleanupRconFactory();
+				if (!cleanupRcon || cleanupRcon === rcon || typeof cleanupRcon.connect !== 'function' || typeof cleanupRcon.command !== 'function' || typeof cleanupRcon.close !== 'function') throw new TypeError('cleanupRconFactory must return a fresh RCON client');
+				await settledRconOperation(cleanupRcon, () => cleanupRcon.connect(), cleanupBoundary, now);
+			} catch (error) { cleanupConnectionError = error; }
+		}
+		if (cleanupConnectionError !== null) throw cleanupConnectionError;
 		const result = onCleanup === null
 			? await withDeadline(() => rcon.command(commandText), deadlineMs, () => logicalNow(now, startedAt, attempt), 'HEADLESS_TIMEOUT')
-			: await settledRconCommand(rcon, commandText, deadlineMs, now);
+			: await settledRconOperation(cleanupRcon ?? rcon, () => (cleanupRcon ?? rcon).command(commandText), deadlineMs, now, () => {
+				if (cleanupBoundary === null) trialTransportRetired = true;
+			});
 		const rawText = String(result?.text ?? result);
 		if (result?.complete === false || result?.truncated === true || Buffer.byteLength(rawText, 'utf8') > MAX_EVIDENCE_BYTES) {
 			throw Object.assign(new Error('RCON response evidence is incomplete'), { code: 'RCON_INCOMPLETE' });
@@ -409,12 +428,14 @@ export async function runHeadlessScenario({
 		const postRunStartedAt = Number(now());
 		const postRunDeadline = onCleanup !== null ? cleanupBoundary : classification === 'TIMEOUT' ? Math.max(deadline, postRunStartedAt + POST_RUN_EVIDENCE_TIMEOUT_MS) : deadline;
 		let postRunEvidence = null;
+		let cleanupStopError = null;
 		if (classification === 'TIMEOUT' && summoned) {
 			try {
 				const stop = await command(`codex stop ${generatedName}`, { deadlineMs: postRunDeadline });
 				if (!isStopAcknowledged(stop.text, generatedName)) throw new Error('Could not confirm stop of the timed-out headless scenario agent');
 				postRunEvidence = { snapshot: 'post_stop', status: 'STOPPED', delayMs: Math.max(0, Number(now()) - deadline) };
-			} catch {
+			} catch (error) {
+				if (onCleanup !== null) cleanupStopError = error;
 				postRunEvidence = { snapshot: 'post_stop', status: 'UNAVAILABLE', delayMs: Math.max(0, Number(now()) - deadline) };
 			}
 		}
@@ -460,6 +481,7 @@ export async function runHeadlessScenario({
 			diagnostics,
 			cleanup: { status: 'PENDING' },
 		});
+		let cleanupError = cleanupStopError;
 		try {
 			await releaseSpawnTicket();
 			if (summoned) {
@@ -468,11 +490,10 @@ export async function runHeadlessScenario({
 				if (isFailedResponse(removal.text)) throw new Error('Could not remove the headless scenario agent');
 				summoned = false;
 			}
-			await closeResources(rcon, providerTurnRecorder);
-			closed = true;
-		} catch (error) {
-			return await finishReport(scenario, report, directory, writeFile, 'CLEANUP_FAILURE', error);
-		}
+		} catch (error) { cleanupError = error; }
+		try { await closeResources(rcon, providerTurnRecorder, cleanupRcon); closed = true; }
+		catch (error) { cleanupError ??= error; }
+		if (cleanupError !== null) return await finishReport(scenario, report, directory, writeFile, 'CLEANUP_FAILURE', cleanupError);
 		const finished = scenarioReport(report.status, scenario, { ...report, cleanup: { status: closed ? 'CLEAN' : 'FAILED' } });
 		return await persistReportOrFailure(scenario, finished, directory, writeFile);
 	} catch (error) {
@@ -488,7 +509,7 @@ export async function runHeadlessScenario({
 				summoned = false;
 			} catch (errorDuringRemoval) { cleanupError = errorDuringRemoval; }
 		}
-		try { await closeResources(rcon, providerTurnRecorder); }
+		try { await closeResources(rcon, providerTurnRecorder, cleanupRcon); }
 		catch (errorDuringCleanup) { if (cleanupError === null) cleanupError = errorDuringCleanup; }
 		const failureClassification = cleanupError !== null ? 'CLEANUP_FAILURE' : classification ?? (error?.code === 'HEADLESS_TIMEOUT' ? 'TIMEOUT' : 'ERROR');
 		const status = failureClassification === 'SKIPPED_PROFILE' ? 'SKIPPED' : 'FAILED';
@@ -824,7 +845,10 @@ export async function runHeadlessMatrix({
 				protocolAudit: protocolAuditPath,
 				providerTurnsPath,
 				worldManifest, trialDeadlineMs,
-				...(phaseChannel === null ? {} : { now: phaseChannel.now, onCleanup: value => phaseChannel.cleanup(value) }),
+				...(phaseChannel === null ? {} : {
+					now: phaseChannel.now, onCleanup: value => phaseChannel.cleanup(value),
+					cleanupRconFactory: () => rconFactory({ host: rconHost, port: rconPort, password }),
+				}),
 			});
 			scenarioReports.push(scenario.repetitions === 1 ? report : { ...report, repetition });
 		} catch (error) {
@@ -871,9 +895,9 @@ async function persistReportOrFailure(scenario, report, directory, writeFile) {
 	}
 }
 
-async function closeResources(rcon, providerTurnRecorder) {
+async function closeResources(rcon, providerTurnRecorder, cleanupRcon = null) {
 	let failure = null;
-	for (const resource of [rcon, providerTurnRecorder]) {
+	for (const resource of [rcon, cleanupRcon, providerTurnRecorder]) {
 		if (!resource || typeof resource.close !== 'function') continue;
 		try { await resource.close(); } catch (error) { failure ??= error; }
 	}
@@ -1802,7 +1826,9 @@ function normalizeRunDirectory(value) {
 
 function generatedAgentName(scenario, timestamp, rosterIndex = null) {
 	const rosterSuffix = rosterIndex === null ? '' : `_${String(rosterIndex + 1).padStart(2, '0')}`;
-	const clockSuffix = Math.abs(Number(timestamp) || 0).toString(36).slice(-5).padStart(5, '0');
+	// Identity must survive the server's player-name canonicalization. Keep
+	// fractional monotonic time everywhere else, including phase deadlines.
+	const clockSuffix = Math.floor(Math.abs(Number(timestamp) || 0)).toString(36).slice(-5).padStart(5, '0');
 	const idBudget = Math.max(1, 16 - 3 - 1 - clockSuffix.length - rosterSuffix.length);
 	const id = String(scenario.id ?? 'scenario').replace(/[^A-Za-z0-9_]/g, '_').slice(0, idBudget) || 's';
 	return `ha_${id}_${clockSuffix}${rosterSuffix}`;
@@ -1977,11 +2003,11 @@ if (process.argv[1] !== undefined && path.resolve(process.argv[1]) === fileURLTo
 
 // Closing RCON cancels its pending transport work. Await the operation itself
 // before returning; the launcher still owns server/provider process teardown.
-async function settledRconCommand(rcon, value, deadline, now) {
+async function settledRconOperation(rcon, operation, deadline, now, onExpiry = () => {}) {
  if (now() >= deadline) throw Object.assign(new Error('Phase deadline expired'), { code: 'HEADLESS_TIMEOUT' });
  let expired = false;
- const timer = setTimeout(() => { expired = true; void Promise.resolve(rcon.close()).catch(() => {}); }, Math.max(0, deadline - now()));
- try { const result = await rcon.command(value); if (expired) throw Object.assign(new Error('Phase deadline expired'), { code: 'HEADLESS_TIMEOUT' }); return result; }
+ const timer = setTimeout(() => { expired = true; onExpiry(); void Promise.resolve(rcon.close()).catch(() => {}); }, Math.max(0, deadline - now()));
+ try { const result = await operation(); if (expired) throw Object.assign(new Error('Phase deadline expired'), { code: 'HEADLESS_TIMEOUT' }); return result; }
  catch (error) { if (expired) throw Object.assign(new Error('Phase deadline expired'), { code: 'HEADLESS_TIMEOUT' }); throw error; }
  finally { clearTimeout(timer); }
 }

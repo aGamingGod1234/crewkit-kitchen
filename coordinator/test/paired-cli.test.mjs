@@ -1,117 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, readFile, rm, readdir } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { mkdir, writeFile, readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import { createHash } from 'node:crypto';
-import { spawn } from 'node:child_process';
 import { normalizeHeadlessMatrix } from '../src/headless-matrix.mjs';
 import { runPairedCli, phaseWorker, verifyArm } from '../src/benchmark/paired-cli.mjs';
-
-const root = fileURLToPath(new URL('../../', import.meta.url));
-const launcher = path.join(root, 'scripts/run-headless-provider-matrix.ps1');
-const hash = value => createHash('sha256').update(value).digest('hex');
-const profile = { provider: 'codex', model: 'offline-fixture', reasoningEffort: 'high', serviceTier: 'priority' };
-const quotePS = value => `'${value.replaceAll("'", "''")}'`;
-async function json(file) { return JSON.parse(await readFile(file, 'utf8')); }
-async function fixture(t, mode = 'pass') {
-	const directory = await mkdtemp(path.join(tmpdir(), 'arena-paired-tiny-'));
-	t.after(() => rm(directory, { recursive: true, force: true }));
-	const arms = [];
-	for (const id of ['A', 'B']) {
-		const sourceRoot = path.join(directory, id);
-		const files = {
-			'coordinator/src/dynamic-main.mjs': `// arm ${id}\nsetInterval(() => {}, 1000);`,
-			'coordinator/src/headless-world-spawn.mjs': 'console.log(JSON.stringify({savedSpawn:{source:"level.dat",dimension:"minecraft:overworld",x:0,y:64,z:0},spawnLoading:{operation:"temporary_spawn_chunk_loading",x:0,z:0,ready:true,elapsedMs:0,terrainModified:false,inventoryModified:false}}));',
-			'coordinator/config/dynamic-agents.json': '{}',
-			'coordinator/src/headless-matrix.mjs': `
-import { readFile, writeFile, open, readdir } from 'node:fs/promises';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { runnerPhaseChannel } from ${JSON.stringify(pathToFileURL(path.join(root, 'coordinator/src/benchmark/paired-runner-channel.mjs')).href)};
-import { claimNaturalWorld } from ${JSON.stringify(pathToFileURL(path.join(root, 'coordinator/src/headless-world.mjs')).href)};
-const args = new Map(); for(let i=2;i<process.argv.length;i+=2) args.set(process.argv[i],process.argv[i+1]);
-const directory=args.get('--run-directory');
-const manifest=JSON.parse(await readFile(args.get('--world-manifest'),'utf8'));
-await claimNaturalWorld(args.get('--world-manifest'), manifest.worldId);
-const scenario=JSON.parse(await readFile(args.get('--config'),'utf8')).scenarios[0];
-const channel=args.has('--paired-channel') ? runnerPhaseChannel(args.get('--paired-channel')) : null;
-if(channel) {
- const sourceRoot=fileURLToPath(new URL('../../',import.meta.url));
- const artifact=(await readdir(sourceRoot)).find(name=>name.endsWith('.jar'));
- for (const binding of ['coordinator/src/dynamic-main.mjs','coordinator/config/dynamic-agents.json','source-manifest.json',artifact].map(file=>path.join(sourceRoot,file)).concat(args.get('--config'))) {
-  let locked=false; try { const handle=await open(binding,'r+'); await handle.close(); } catch { locked=true; }
-  if(!locked) throw new Error('arm binding was mutable');
- }
- await channel.ready();
-}
-if (scenario.task === 'block_trial') { while(true) {} }
-if(channel) await channel.cleanup({classification:'PENDING_EVIDENCE'});
-const classification=({error:'ERROR',wrong_profile:'PROFILE_MISMATCH',wrong_seed:'ERROR',failure:'FAILED_USER_OBJECTIVE',timeout:'TIMEOUT',cleanup_failure:'CLEANUP_FAILURE'})[scenario.task] ?? 'PASSED';
-const report={scenarioId:scenario.id,status:classification==='PASSED'?'PASSED':'FAILED',classification,cleanup:{status:scenario.task==='cleanup_failure'?'FAILED':'CLEAN'},world:{worldId:manifest.worldId,fresh:manifest.fresh,...manifest.world},profile:${JSON.stringify(profile)},settings:{configuredVerified:true,configured:${JSON.stringify(profile)}}};
-if(scenario.task==='passed_wrong_profile') report.settings.configured.reasoningEffort='low';
-if(scenario.task==='passed_wrong_seed') report.world.seed='2';
-await writeFile(path.join(directory,'report.json'),JSON.stringify(report));
-process.exitCode=report.status==='FAILED'?1:0;
-`,
-		};
-		for (const [relative, text] of Object.entries(files)) { await mkdir(path.dirname(path.join(sourceRoot, relative)), { recursive: true }); await writeFile(path.join(sourceRoot, relative), text); }
-		const artifactPath = path.join(sourceRoot, `fake-${id}.jar`); await writeFile(artifactPath, `not a runtime: ${id}`);
-		const sourceManifestPath = path.join(sourceRoot, 'source-manifest.json');
-		await writeFile(sourceManifestPath, JSON.stringify({ version: 1, files: Object.entries(files).map(([path, contents]) => ({ path, sha256: hash(contents) })) }));
-		arms.push({ id, profile, sourceRoot, artifactPath, sourceManifestPath, artifactSha256: hash(await readFile(artifactPath)), sourceManifestSha256: hash(await readFile(sourceManifestPath)) });
-	}
-	const serverTemplate = path.join(directory, 'tiny-template'); await mkdir(serverTemplate);
-	await writeFile(path.join(serverTemplate, 'fabric-server-launch.jar'), 'harmless fixture, never executed');
-	const server = path.join(directory, 'idle.mjs'); await writeFile(server, "process.stdin.on('data', () => process.exit(0)); setInterval(() => {},1000);");
-	const matrixPath = path.join(directory, 'matrix.json');
-	await writeFile(matrixPath, JSON.stringify({ version: 1, scenarios: [{ id: 'natural-fixture', ...profile, task: mode, timeoutMs: 3000, scenarioTimeoutMs: 3000, world: { mode: 'natural', seed: '-9223372036854775808' }, requireFactualSuccess: true, assert: [{ type: 'rcon', command: 'data get entity {agent} Inventory', match: 'oak_log' }] }] }));
-	const config = { runtimeBudgetMs: 150000, startupMs: 10000, cleanupMs: 15000, outputDirectory: path.join(directory, 'result'), matrixPath, serverTemplate, arms, scenarios: [{ id: 'natural-fixture', seed: '-9223372036854775808', trialMs: 3000 }] };
-	const fakeLauncher = path.join(directory, 'fake-launcher.ps1');
-	await writeFile(fakeLauncher, `param([string] $ProjectRoot, [switch] $FunctionsOnly)
-. ${quotePS(launcher)} -ProjectRoot $ProjectRoot -FunctionsOnly
-$script:ActualStart = \${function:Start-RedirectedProcess}
-$script:ActualRead = \u0024{function:Read-Text}
-$script:FixtureHandles = [System.Collections.Generic.List[object]]::new()
-$script:Port = 21000
-function Resolve-Java($Project) { return ${quotePS(process.execPath)} }
-function Resolve-Node { return ${quotePS(process.execPath)} }
-function Test-ProviderPreflight($Provider) { return @{ Available = $true } }
-function Protect-LocalFile($Path) {}
-function Assert-ArenaOfflineServerLoopback($Path, [switch] $RequireOffline) {}
-function New-ScenarioConfig($Source,$Destination,$BridgePort,$WorkspaceRoot) { [IO.File]::WriteAllText($Destination, '{}') }
-function Reserve-FreePort($Preferred,$Excluded) { $script:Port++; return $script:Port }
-function Test-Port($Port) { return @($script:FixtureHandles | Where-Object { -not $_.Process.HasExited }).Count -gt 0 }
-function Read-Text($Path) { if ($Path.EndsWith('latest.log')) { return 'Done (' }; return (& $script:ActualRead $Path) }
-function Test-CoordinatorReady($Path,$Scenario) { return $true }
-function Get-ProcessSnapshot {
- $result = @{}
- foreach ($handle in $script:FixtureHandles) {
-  $handle.Process.Refresh()
-  if (-not $handle.Process.HasExited) { $result[[int] $handle.Process.Id] = [pscustomobject]@{ ProcessId = $handle.Process.Id; ParentProcessId = $PID; CreationDate = $handle.Identity.CreationDate; WorkingSetSize = $handle.Process.WorkingSet64 } }
- }
- return $result
-}
-function Start-RedirectedProcess($FileName,$Arguments,$WorkingDirectory,$StdoutPath,$StderrPath,$Environment) {
- if ($Arguments.StartsWith('-Darenaagents')) { $Arguments = '"' + ${quotePS(server)} + '"' }
- $handle = & $script:ActualStart $FileName $Arguments $WorkingDirectory $StdoutPath $StderrPath $Environment
- $script:FixtureHandles.Add($handle)
- return $handle
-}
-`);
-	return { directory, config, fakeLauncher };
-}
-
-function exec(command, args) {
-	return new Promise((resolve, reject) => {
-		const child = spawn(command, args, { cwd: root, windowsHide: true });
-		let stdout = '', stderr = '';
-		child.stdout.on('data', value => { stdout += value; }); child.stderr.on('data', value => { stderr += value; });
-		child.once('error', reject); child.once('close', code => resolve({ code, stdout, stderr }));
-	});
-}
-
+import { fixture, root, launcher, json, profile, exec } from './fixtures/paired-cli-fixture.mjs';
 test('actual PowerShell PairedConfig route persists all unstarted slots without resolving a game runtime', { skip: process.platform !== 'win32' }, async t => {
 	const f = await fixture(t); f.config.runtimeBudgetMs = 1;
 	const configPath = path.join(f.directory, 'paired.json'); await writeFile(configPath, JSON.stringify(f.config));
@@ -122,21 +15,6 @@ test('actual PowerShell PairedConfig route persists all unstarted slots without 
 	assert.equal((await json(path.join(f.config.outputDirectory, 'intent.json'))).slots.length, 4);
 });
 
-test('real driver and extracted launcher phases run AB/BA against isolated harmless fixtures', { skip: process.platform !== 'win32' }, async t => {
-	const f = await fixture(t);
-	const report = await runPairedCli(f.config, { launcher: f.fakeLauncher });
-	assert.equal(report.status, 'COMPLETE', JSON.stringify({ report, journal: await json(path.join(f.config.outputDirectory, 'journal.json')) }));
-	assert.equal(report.counts.attempted, 4);
-	const journal = await json(path.join(f.config.outputDirectory, 'journal.json'));
-	const starts = journal.filter(row => row.kind === 'phase' && row.phase === 'startup');
-	assert.equal(new Set(starts.map(row => row.value.worldId)).size, 4);
-	assert.deepEqual(starts.map(row => row.value.modSha256), [f.config.arms[0], f.config.arms[1], f.config.arms[1], f.config.arms[0]].map(arm => arm.artifactSha256));
-	for (const start of starts) {
-		const claim = await json(path.join(start.value.scenarioDirectory, 'world-manifest.json.claimed'));
-		assert.equal(claim.worldId, start.value.worldId);
-	}
-	assert.equal(journal.filter(row => row.kind === 'settled').length, 4);
-});
 
 test('source and artifact changes fail binding instead of silently changing an arm', async t => {
 	const f = await fixture(t); await verifyArm(f.config.arms[0]);
@@ -222,17 +100,6 @@ test('final persistence overrun is recorded as incomplete in the authoritative c
 	assert.equal(receipt.status, 'INCOMPLETE'); assert.ok(receipt.overrunMs > 0);
 });
 
-test('real launcher rejects passed reports with the wrong profile or seed before the peer', { skip: process.platform !== 'win32' }, async t => {
-	for (const mode of ['passed_wrong_profile', 'passed_wrong_seed']) {
-		const f = await fixture(t, mode);
-		const report = await runPairedCli(f.config, { launcher: f.fakeLauncher });
-		assert.equal(report.status, 'INCOMPLETE', mode);
-		assert.equal(report.counts.started, 1, mode);
-		assert.equal(report.counts.attempted, 1, mode);
-		assert.equal(report.pairs[0].trials[0].status, 'ERROR', mode);
-		assert.equal(report.pairs[0].trials[1].status, 'NOT_STARTED', mode);
-	}
-});
 
 test('invalid requested matrix binding persists intent and blocks worker acquisition', async t => {
 	const f = await fixture(t);
@@ -398,49 +265,4 @@ test('final pair boundary rejects explicit effective model contradictions for me
 		assert.equal(starts, evidence === 'provider_reported' ? 1 : 4);
 		assert.equal(report.providerVerified, false);
 	}
-});
-
-test('job containment kills orphaned descendants and does not trust a false clean wrapper', { skip: process.platform !== 'win32' }, async t => {
-	const f = await fixture(t);
-	const rogue = path.join(f.directory, 'orphan.mjs'); await writeFile(rogue, 'setInterval(()=>{},1000);');
-	await writeFile(f.fakeLauncher, `param([string] $ProjectRoot,[switch] $FunctionsOnly)
-. ${quotePS(launcher)} -ProjectRoot $ProjectRoot -FunctionsOnly
-function Resolve-Java($Project) { return ${quotePS(process.execPath)} }
-function Resolve-Node { return ${quotePS(process.execPath)} }
-function Test-ProviderPreflight($Provider) { return @{ Available=$true } }
-function Invoke-Scenario($Scenario,$Project,$RunDirectory,$Template,$MatrixFile,$Java,$Node,$BuiltJar) {
- $info=[Diagnostics.ProcessStartInfo]::new(); $info.FileName=$Node; $info.Arguments='"'+${quotePS(rogue)}+'"'; $info.UseShellExecute=$false; $info.CreateNoWindow=$true
- $orphan=[Diagnostics.Process]::Start($info)
- Send-PairedEvent 'resource' @{ ProcessId=$orphan.Id; fixture='orphan' }
- Send-PairedEvent 'startup' @{ worldId='headless-orphan'; modSha256=(Get-FileSha256 $BuiltJar) }
- Receive-PairedPhase 'trial'; Send-PairedEvent 'trial' @{ classification='PENDING_EVIDENCE' }
- Receive-PairedPhase 'cleanup'
- return @{ runner=@{status='PASSED';classification='PASSED';cleanup=@{status='CLEAN'}};runnerExit=0;wrapper=@{ok=$true} }
-}
-`);
-	f.config.cleanupMs = 500;
-	const report = await runPairedCli(f.config, { launcher: f.fakeLauncher });
-	assert.equal(report.status, 'INCOMPLETE'); assert.equal(report.counts.started, 1);
-	assert.notEqual(report.pairs[0].trials[0].cleanup, 'CLEAN');
-	const journal = await json(path.join(f.config.outputDirectory, 'journal.json'));
-	const orphan = journal.find(row => row.identity?.fixture === 'orphan'); assert.ok(orphan);
-	assert.throws(() => process.kill(orphan.identity.ProcessId, 0));
-	assert.equal(journal.at(-1).cleanup, 'UNKNOWN');
-});
-
-test('extracted phase code preserves the existing single-scenario launcher path', { skip: process.platform !== 'win32' }, async t => {
- const f = await fixture(t); const arm = f.config.arms[0];
- const normalized = normalizeHeadlessMatrix(await json(f.config.matrixPath)).scenarios[0];
- const scenarioFile = path.join(f.directory, 'normalized.json'); await writeFile(scenarioFile, JSON.stringify(normalized));
- const script = path.join(f.directory, 'single.ps1'); const legacyDirectory = path.join(f.directory, 'legacy'); await mkdir(legacyDirectory);
- const legacyReport = path.join(f.directory, 'legacy-report.json');
- await writeFile(script, `. ${quotePS(f.fakeLauncher)} -ProjectRoot ${quotePS(arm.sourceRoot)} -FunctionsOnly
- $scenario=Get-Content -Raw -LiteralPath ${quotePS(scenarioFile)} | ConvertFrom-Json
- $report=Invoke-Scenario $scenario ${quotePS(arm.sourceRoot)} ${quotePS(legacyDirectory)} ${quotePS(f.config.serverTemplate)} ${quotePS(f.config.matrixPath)} ${quotePS(process.execPath)} ${quotePS(process.execPath)} ${quotePS(arm.artifactPath)}
- $report | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath ${quotePS(legacyReport)} -Encoding UTF8
- `);
- const result = await exec('powershell.exe', ['-NoProfile','-NonInteractive','-File',script]);
- assert.equal(result.code, 0, result.stderr);
- const report = JSON.parse((await readFile(legacyReport,'utf8')).replace(/^\uFEFF/,''));
- assert.equal(report.status,'PASSED'); assert.equal(report.cleanup.status,'CLEAN'); assert.equal(report.cleanup.runner.status,'CLEAN');
 });

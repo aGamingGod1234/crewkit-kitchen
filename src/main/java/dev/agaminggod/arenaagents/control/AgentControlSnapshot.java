@@ -2,10 +2,12 @@ package dev.agaminggod.arenaagents.control;
 
 import dev.agaminggod.arenaagents.agent.AgentConstants;
 import dev.agaminggod.arenaagents.agent.AgentIdentity;
+import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
+import java.util.function.Predicate;
 
 public record AgentControlSnapshot(
 		int schemaVersion,
@@ -84,10 +86,30 @@ public record AgentControlSnapshot(
 			long generatedAtEpochMs,
 			List<AgentRecord> records
 	) {
+		return projectRecords(canControl, generatedAtEpochMs, records, record -> record.entityUuid().isPresent());
+	}
+
+	/** Live publishers must supply observed presence; a durable attachment can outlive its body. */
+	public static AgentControlSnapshot fromRecords(
+			boolean canControl,
+			long generatedAtEpochMs,
+			List<AgentRecord> records,
+			Predicate<AgentId> entityPresent
+	) {
+		Objects.requireNonNull(entityPresent, "entityPresent must not be null");
+		return projectRecords(canControl, generatedAtEpochMs, records, record -> entityPresent.test(record.agentId()));
+	}
+
+	private static AgentControlSnapshot projectRecords(
+			boolean canControl,
+			long generatedAtEpochMs,
+			List<AgentRecord> records,
+			Predicate<AgentRecord> entityPresent
+	) {
 		Objects.requireNonNull(records, "records must not be null");
 		List<AgentControlAgent> agents = records.stream()
 				.sorted(Comparator.comparingLong(AgentRecord::createdAtEpochMs).thenComparing(record -> record.agentId().toString()))
-				.map(AgentControlSnapshot::fromRecord)
+				.map(record -> fromRecord(record, entityPresent.test(record)))
 				.toList();
 		return new AgentControlSnapshot(canControl, generatedAtEpochMs, agents);
 	}
@@ -136,7 +158,24 @@ public record AgentControlSnapshot(
 		);
 	}
 
-	private static AgentControlAgent fromRecord(AgentRecord record) {
+	public static AgentControlSnapshot fromRecords(
+			boolean canControl,
+			boolean automationAvailable,
+			String automationStatus,
+			long generatedAtEpochMs,
+			List<AgentRecord> records,
+			List<AgentControlGroup> groups,
+			List<AgentControlModelOption> catalog,
+			Predicate<AgentId> entityPresent
+	) {
+		AgentControlSnapshot ready = fromRecords(canControl, generatedAtEpochMs, records, entityPresent);
+		return new AgentControlSnapshot(
+				SCHEMA_VERSION, canControl, automationAvailable, automationStatus,
+				generatedAtEpochMs, ready.agents(), groups, catalog
+		);
+	}
+
+	private static AgentControlAgent fromRecord(AgentRecord record, boolean entityPresent) {
 		Objects.requireNonNull(record, "records must not contain null");
 		String displayName = AgentIdentity.displayNameTag(record.profile());
 		String currentGoal = record.currentGoal().map(goal -> goal.prompt()).orElse("");
@@ -156,7 +195,7 @@ public record AgentControlSnapshot(
 				AgentControlAgent.truncate(record.lastSummary(), AgentControlAgent.MAX_LAST_SUMMARY_LENGTH),
 				AgentControlAgent.truncate(record.lastError(), AgentControlAgent.MAX_LAST_ERROR_LENGTH),
 				record.automaticProgress(),
-				record.entityUuid().isPresent()
+				entityPresent
 		);
 	}
 }

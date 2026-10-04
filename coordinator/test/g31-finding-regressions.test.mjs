@@ -1,11 +1,10 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { registerHooks } from 'node:module';
 import test from 'node:test';
+import { startTwoAgentFixture } from './fixtures/two-agent-fixture.mjs';
 
 let fault = null;
 const inputs = new Map();
-globalThis.__g31Delivery = (agentId, input) => {
+const transformDelivery = (agentId, input) => {
 	inputs.set(agentId, input);
 	if (agentId !== 'agent-56' || fault === null) return input;
 	if (fault === 'missing-state') return 'Corrupt fixture delivery without planner state';
@@ -24,27 +23,11 @@ globalThis.__g31Delivery = (agentId, input) => {
 	lines[1] = JSON.stringify(state);
 	return lines.join('\n');
 };
-registerHooks({
-	load(url, context, nextLoad) {
-		const loaded = nextLoad(url, context);
-		if (process.env.G31_BASELINE_FIXTURE && url.endsWith('/test/fixtures/two-agent-fixture.mjs')) {
-			return { ...loaded, source: readFileSync(process.env.G31_BASELINE_FIXTURE, 'utf8').replace(
-				'{ bridge, registry, codexService: provider, traceWriter: trace }',
-				'{ bridge, registry, codexService: provider, traceWriter: trace, memoryDirectory: null }') };
-		}
-		if (!url.endsWith('/src/agent-planner.mjs')) return loaded;
-		const source = String(loaded.source);
-		const edge = 'agent.decide(plannerInput, {';
-		assert.equal(source.split(edge).length - 1, 1, 'fault injection must intercept the actual provider call');
-		return { ...loaded, source: source.replace(edge, 'agent.decide(globalThis.__g31Delivery(record.agentId, plannerInput), {') };
-	},
-});
-const { startTwoAgentFixture } = await import('./fixtures/two-agent-fixture.mjs');
 
 test('delivered shared contract and per-agent private context survive concurrent completion and retry', async () => {
 	fault = null;
 	inputs.clear();
-	const run = await startTwoAgentFixture({ malformedFirstAgent: 'agent-55' });
+	const run = await startTwoAgentFixture({ malformedFirstAgent: 'agent-55', transformDelivery });
 	try {
 		await run.goalBoth('enter the arena', { 'agent-55': 'private goal for agent-55', 'agent-56': 'private goal for agent-56' });
 		await run.untilBothComplete();
@@ -64,7 +47,7 @@ for (const corruption of ['missing-state', 'swapped-input', 'wrong-model', 'priv
 	test(`delivered prompt oracle rejects ${corruption} even when scripted agents finish`, async () => {
 		fault = corruption;
 		inputs.clear();
-		const run = await startTwoAgentFixture();
+		const run = await startTwoAgentFixture({ transformDelivery });
 		try {
 			await run.goalBoth('enter the arena', { 'agent-55': 'private goal for agent-55', 'agent-56': 'private goal for agent-56' });
 			await run.untilBothComplete();

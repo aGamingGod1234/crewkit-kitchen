@@ -1,3 +1,4 @@
+import { windowsPowerShellEnv } from '../src/benchmark/windows-powershell-env.mjs';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -8,6 +9,8 @@ test('Java property comment and escape semantics preserve launcher policy', {
 }, () => {
   const script = fileURLToPath(new URL('../../scripts/test-offline-server-policy.ps1', import.meta.url));
   const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-File', script], {
+    cwd: fileURLToPath(new URL('../../', import.meta.url)),
+    env: windowsPowerShellEnv(),
     encoding: 'utf8',
     windowsHide: true,
   });

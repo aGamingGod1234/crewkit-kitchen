@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { AtomicAgentStore } from './observed-memory-store.mjs';
 import { canonicalConversationEntry } from './conversation-memory.mjs';
+import { MAX_IDENTIFIER_LENGTH } from './constants.mjs';
 
 const PREFIX_ENTRIES = 32;
 const hash = (value) => createHash('sha256').update(value).digest('hex');
@@ -16,6 +17,9 @@ function validIndex(saved) {
 	return saved?.version === 1 && range(saved)
 		&& (saved.scope === null || typeof saved.scope === 'string')
 		&& (saved.tail === 0 ? saved.last === null : saved.last && position(saved.last.sequence) && digest(saved.last.digest))
+		&& (saved.wake == null || typeof saved.wake.transactionId === 'string' && saved.wake.transactionId.length > 0
+			&& saved.wake.transactionId.length <= MAX_IDENTIFIER_LENGTH && position(saved.wake.sequence) && digest(saved.wake.digest)
+			&& digest(saved.wake.eventDigest) && saved.last && saved.wake.sequence <= saved.last.sequence)
 		&& (saved.staged == null || position(saved.staged.position) && saved.staged.position === saved.tail
 			&& position(saved.staged.sequence) && (!saved.last || saved.staged.sequence > saved.last.sequence))
 		&& (saved.garbage === null || range(saved.garbage)
@@ -107,12 +111,28 @@ export class PendingConversationInbox {
 		await this.#garbage();
 	}
 	open(scope) { return this.#run(() => this.#scope(scope)); }
-	append(scope, value) {
+	#matchWake(entry, wake) {
+		const retained = this.#index.wake;
+		if (!wake || !retained || (retained.transactionId !== wake.transactionId && retained.sequence !== entry.sequence)) return false;
+		if (retained.eventDigest !== hash(JSON.stringify(entry))) throw failure('CONVERSATION_COLLISION');
+		if (retained.transactionId !== wake.transactionId || retained.digest !== hash(wake.fingerprint)) throw failure('TRANSACTION_COLLISION');
+		return true;
+	}
+	checkWake(scope, value, wake) {
+		const entry = { ...canonicalConversationEntry(value), text: value.text };
+		return this.#run(async () => { await this.#scope(scope); return this.#matchWake(entry, wake); });
+	}
+	append(scope, value, wake = null) {
 		// Validate before queuing; retain admitted text exactly, including whitespace.
 		const entry = { ...canonicalConversationEntry(value), text: value.text };
 		const digest = hash(JSON.stringify(entry));
+		// Java retains one replayable wake per agent. Keep its exact transaction
+		// independently of page reclamation, bounded by that same ownership rule.
+		const wakeReceipt = wake === null ? null : { transactionId: wake.transactionId, sequence: entry.sequence,
+			digest: hash(wake.fingerprint), eventDigest: digest };
 		return this.#run(async () => {
 			await this.#scope(scope);
+			if (this.#matchWake(entry, wake)) return false;
 			const last = this.#index.last;
 			if (last && entry.sequence <= last.sequence) {
 				if (entry.sequence === last.sequence && digest === last.digest) return false;
@@ -129,7 +149,8 @@ export class PendingConversationInbox {
 			await this.#save({ ...this.#index, staged: { position: this.#index.tail, sequence: entry.sequence } });
 			await this.#disk.write(this.#key(this.#index.tail), { entry, delivered: false });
 			await this.#disk.write(`${this.#index.generation}:sequence:${entry.sequence}`, { position: this.#index.tail, digest });
-			await this.#save({ ...this.#index, tail: this.#index.tail + 1, staged: null, last: { sequence: entry.sequence, digest } });
+			await this.#save({ ...this.#index, tail: this.#index.tail + 1, staged: null, last: { sequence: entry.sequence, digest },
+				...(wakeReceipt === null ? {} : { wake: wakeReceipt }) });
 			return true;
 		});
 	}
@@ -219,9 +240,13 @@ export class PendingConversationInbox {
 			await this.#garbage();
 		}
 	}
-	remove() {
+	remove(isCurrent = () => true) {
 		this.fence();
-		return this.#run(async () => { await this.#load(); if (this.#index) await this.#scope(null); });
+		return this.#run(async () => {
+			if (!isCurrent()) return;
+			await this.#load();
+			if (isCurrent() && this.#index) await this.#scope(null);
+		});
 	}
 	async close() {
 		this.fence();

@@ -134,6 +134,7 @@ export class DynamicCoordinator extends EventEmitter {
 	#deferredProviderRecovery = new Map();
 	#programRuntimeEpochs = new Map();
 	#nativeRuntimeEpochs = new Map();
+	#nativeProgramLeases = new Map();
 	#verboseReporters = new Set();
 	#factLedgers = new Map();
 	#conversationMemories = new Map();
@@ -287,10 +288,13 @@ export class DynamicCoordinator extends EventEmitter {
 				const key = this.#supervisionKey(record);
 				this.#goalSupervisor.activate(key);
 				const token = this.#goalSupervisor.begin(key, kind, options);
+				const programLease = kind === 'program' ? { token, programId: options.programId } : null;
+				if (programLease !== null) this.#nativeProgramLeases.set(record.agentId, programLease);
 				let released = false;
 				return () => {
 					if (released) return;
 					released = true;
+					if (this.#nativeProgramLeases.get(record.agentId) === programLease) this.#nativeProgramLeases.delete(record.agentId);
 					this.#goalSupervisor.end(token);
 				};
 			},
@@ -359,6 +363,16 @@ export class DynamicCoordinator extends EventEmitter {
 		if (key.sessionEpoch !== connectionEpoch || key.profileFingerprint !== profileFingerprint(record)) return;
 		this.#writeTrace('work_lease_expired', { ...key, kind: lease.kind, operationId: lease.operationId });
 		this.#publishVerbose(key.agentId, key.goalRevision, 'retry', `${lease.kind} work timed out; recovering automatically.`);
+		if (lease.kind === 'program') {
+			const owned = this.#nativeProgramLeases.get(key.agentId);
+			if (owned?.token.operationId === lease.operationId) {
+				// The executor deadline and outer lease can fire in either order.
+				// Settle only this program, retaining its physical cancellation fence.
+				void this.#nativeRuntime.expireProgram(record, owned.programId)
+					.catch((error) => this.#reportAgentError(key.agentId, error, connectionEpoch));
+			}
+			return;
+		}
 		let preserveProgram = false;
 		if (lease.kind === 'provider') {
 			const work = this.#providerWork.get(key.agentId);
@@ -384,7 +398,7 @@ export class DynamicCoordinator extends EventEmitter {
 				void this.#reportAgentError(key.agentId, error, connectionEpoch);
 			}
 		}
-		if (['provider', 'action', 'program', 'completion'].includes(lease.kind) && !preserveProgram) {
+		if (['provider', 'action', 'completion'].includes(lease.kind) && !preserveProgram) {
 			this.#nativeObservationSignatures.delete(key.agentId);
 			void this.#nativeRuntime.dispose(key.agentId, `${lease.kind}_lease_expired`)
 				.catch((error) => this.#reportAgentError(key.agentId, error, connectionEpoch));
@@ -508,14 +522,37 @@ export class DynamicCoordinator extends EventEmitter {
 			await this.#publishCatalog(catalog, connectionEpoch);
 		}, connectionEpoch));
 		this.#listen('agent_registered', (message, connectionEpoch) => this.#enqueueAgent(message.agentId, async () => {
+			const previous = this.#registry.get(message.agentId);
 			const record = this.#registry.register(message.payload.record === undefined
 				? { ...message.payload, agentId: message.agentId }
 				: { ...message.payload.record, agentId: message.agentId });
 			this.#codexService.catalog.assertSupported(record.provider, record.model, record.reasoningEffort, record.serviceTier ?? DEFAULT_SERVICE_TIER);
+			const replacesDeath = previous?.state === DynamicAgentState.DEAD && record.state === DynamicAgentState.DEAD
+				&& record.goalRevision > previous.goalRevision;
+			let lifecycleGeneration = this.#lifecycleGeneration(record.agentId);
+			const isCurrent = () => this.#isConnectionEpochCurrent(connectionEpoch)
+				&& this.#isLifecycleGenerationCurrent(record.agentId, lifecycleGeneration)
+				&& this.#registry.get(record.agentId)?.goalRevision === record.goalRevision;
+			if (replacesDeath) {
+				this.#cancelGoalSpecRequests(record.agentId);
+				this.#retireGoalSupervision(previous, 'replace');
+				this.#invalidateAcceptedLifecycle(record.agentId);
+				lifecycleGeneration = this.#lifecycleGeneration(record.agentId);
+				this.#beginGoalControlInterruption({ agentId: record.agentId, payload: { operation: 'steer' } }, connectionEpoch);
+				this.#programRuntime.onGoalControl(previous, 'steer');
+				await this.#nativeRuntime.dispose(record.agentId, 'dead_registration_replaced');
+				if (!isCurrent()) return;
+			}
 			await this.#sendForEpoch(connectionEpoch, 'agent_ready', record.agentId, { goalRevision: record.goalRevision, reconciled: false });
+			if (!isCurrent()) return;
 			this.#supportedAgentIds.add(record.agentId);
 			this.#publishVerbose(record.agentId, record.goalRevision, 'lifecycle', 'Agent registered and ready.', connectionEpoch);
 			this.#prewarmNativeAgent(record);
+			if (replacesDeath) {
+				const recovery = this.#installDeadStatePlan(record, record.death, connectionEpoch);
+				if (this.#usesNativeTools(record)) void recovery.catch((error) => this.#reportAgentError(record.agentId, error, connectionEpoch));
+				else await recovery;
+			}
 			await this.#publishStatus(connectionEpoch);
 		}, { connectionEpoch, transactional: true }));
 		this.#listen('agent_removed', (message, connectionEpoch) => this.#run(async () => {
@@ -547,7 +584,8 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#playerMemory.forget(message.agentId);
 			this.#conversationMemories.delete(message.agentId);
 			this.#contextCursors.delete(message.agentId);
-			await inbox.remove();
+			await inbox.remove(() => this.#isConnectionEpochCurrent(connectionEpoch));
+			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return;
 			this.#nativeConversationRecoveries.delete(message.agentId);
 			this.#nativeObservationSignatures.delete(message.agentId);
 			this.#nativeWorldSignals.delete(message.agentId);
@@ -747,6 +785,11 @@ export class DynamicCoordinator extends EventEmitter {
 					return;
 				}
 				const previous = this.#registry.get(message.agentId);
+				if (this.#usesNativeTools(previous)) {
+					await this.#pendingConversationInbox(message.agentId).checkWake(this.#serverInstanceId, message.payload.event,
+						{ transactionId: message.payload.transactionId, fingerprint });
+					if (!this.#isConnectionEpochCurrent(connectionEpoch)) return;
+				}
 				let record;
 				try {
 					record = this.#registry.applyConversationWake(message.agentId, message.payload.control);
@@ -761,7 +804,8 @@ export class DynamicCoordinator extends EventEmitter {
 					await this.#nativeRuntime.dispose(previous.agentId, 'conversation_wake');
 					if (!this.#isConnectionEpochCurrent(connectionEpoch)) return;
 				}
-				await this.#admitConversation(message.agentId, message.payload.event, connectionEpoch);
+				await this.#admitConversation(message.agentId, message.payload.event, connectionEpoch,
+					{ transactionId: message.payload.transactionId, fingerprint });
 				this.#goalSupervisor.activate(this.#supervisionKey(record));
 				this.#providerRetryAfter.delete(message.agentId);
 				this.#rememberPendingAttention(record.agentId, record.goalRevision, { priority: 'urgent', trigger: 'conversation_wake' });
@@ -1051,6 +1095,7 @@ export class DynamicCoordinator extends EventEmitter {
 				if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
 				const record = this.#registry.get(profile.agentId);
 				if (record === null) throw new ProtocolV2Error('UNKNOWN_AGENT', `Reconciled provider profile references unknown agent '${profile.agentId}'`);
+				const lifecycleGeneration = this.#lifecycleGeneration(record.agentId);
 				if (this.#supportedAgentIds.has(profile.agentId)) continue;
 				if (record.state === DynamicAgentState.STARTING && record.currentGoal !== null) {
 					this.#goalSupervisor.activate(this.#supervisionKey(record));
@@ -1059,6 +1104,9 @@ export class DynamicCoordinator extends EventEmitter {
 				this.#supportedAgentIds.add(profile.agentId);
 				this.#publishVerbose(record.agentId, record.goalRevision, 'lifecycle', 'Agent reconciled and ready.', connectionEpoch);
 				this.#prewarmNativeAgent(record);
+				if (this.#usesNativeTools(record) && [DynamicAgentState.IDLE, DynamicAgentState.PAUSED, DynamicAgentState.COMPLETED].includes(record.state)) {
+					await this.#resumeUnreadNativeConversation(record, connectionEpoch, lifecycleGeneration);
+				}
 				if (record.state === DynamicAgentState.DEAD) {
 					const recovery = this.#installDeadStatePlan(record, record.death, connectionEpoch);
 					// Native recovery is already supervised. Its body may need receipts
@@ -1306,14 +1354,22 @@ export class DynamicCoordinator extends EventEmitter {
 
 	async #resumeUnreadNativeConversation(record, connectionEpoch, lifecycleGeneration) {
 		if (!this.#usesNativeTools(record)) return;
-		const inbox = this.#pendingConversationInboxes.get(record.agentId);
-		if (inbox === undefined) return;
+		const isCurrent = () => this.#isConnectionEpochCurrent(connectionEpoch)
+			&& this.#isLifecycleGenerationCurrent(record.agentId, lifecycleGeneration)
+			&& this.#registry.get(record.agentId)?.goalRevision === record.goalRevision;
+		const hasCurrentWork = () => {
+			const work = this.#providerWork.get(record.agentId);
+			return work?.kind === 'native' && work.goalRevision === record.goalRevision
+				&& work.connectionEpoch === connectionEpoch && work.lifecycleGeneration === lifecycleGeneration;
+		};
+		if (!isCurrent() || hasCurrentWork()) return;
+		const inbox = this.#pendingConversationInbox(record.agentId);
+		await inbox.open(this.#serverInstanceId);
+		if (!isCurrent() || hasCurrentWork()) return;
 		const reservation = await inbox.reserve();
 		inbox.rollback(reservation.token);
 		if (reservation.conversation.entries.length === 0 && !reservation.more) return;
-		if (!this.#isConnectionEpochCurrent(connectionEpoch)
-			|| !this.#isLifecycleGenerationCurrent(record.agentId, lifecycleGeneration)
-			|| this.#registry.get(record.agentId)?.goalRevision !== record.goalRevision) return;
+		if (!isCurrent() || hasCurrentWork()) return;
 		// Derive authority from the new lifecycle, never replay the old goal request.
 		this.#scheduleNativeConversation(record, null, 'conversation');
 	}
@@ -1610,16 +1666,18 @@ export class DynamicCoordinator extends EventEmitter {
 	}
 
 	async #completeNativeTurn(work, result) {
-		try {
-			await this.#settleNativeSteering(work);
-		} finally {
-			this.#goalSupervisor.end(work.supervisionToken, { progress: (result?.toolCalls ?? 0) > 0 });
-			if (work.request.conversationOnly === true && this.#providerWork.get(work.agentId) === work) this.#goalSupervisor.terminate(work.supervisionKey);
+		await this.#settleNativeSteering(work);
+		if (this.#providerWork.get(work.agentId) !== work) {
+			this.#goalSupervisor.end(work.supervisionToken, { scheduleRecovery: false });
+			return null;
 		}
-		if (this.#providerWork.get(work.agentId) !== work) return null;
 		if (this.#isConnectionEpochCurrent(work.connectionEpoch)
 			&& this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) await this.#commitNativeConversation(work.request);
 		else this.#restoreNativeConversation(work.request);
+		// Persistence is part of delivery. A failed commit still owns the exact
+		// supervision entry, so failNativeTurn can arrange autonomous recovery.
+		this.#goalSupervisor.end(work.supervisionToken, { progress: (result?.toolCalls ?? 0) > 0 });
+		if (work.request.conversationOnly === true && this.#providerWork.get(work.agentId) === work) this.#goalSupervisor.terminate(work.supervisionKey);
 		// Disk completion can race replacement work just like provider completion.
 		if (this.#providerWork.get(work.agentId) !== work) return null;
 		this.#providerWork.delete(work.agentId);
@@ -2745,10 +2803,10 @@ export class DynamicCoordinator extends EventEmitter {
 		return inbox;
 	}
 
-	async #admitConversation(agentId, event, connectionEpoch) {
+	async #admitConversation(agentId, event, connectionEpoch, wake = null) {
 		const record = this.#registry.get(agentId);
 		const ingested = this.#usesNativeTools(record)
-			? await this.#pendingConversationInbox(agentId).append(this.#serverInstanceId, event)
+			? await this.#pendingConversationInbox(agentId).append(this.#serverInstanceId, event, wake)
 			: true;
 		// A retry can find a durable append whose original caller saw an I/O failure.
 		const retryPending = this.#usesNativeTools(record) && !ingested

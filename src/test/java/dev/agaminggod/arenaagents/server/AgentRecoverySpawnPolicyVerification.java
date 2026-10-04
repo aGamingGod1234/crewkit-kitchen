@@ -6,6 +6,8 @@ import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.AgentRegistry;
+import dev.agaminggod.arenaagents.control.AgentControlActions;
+import dev.agaminggod.arenaagents.control.AgentControlCatalog;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
@@ -115,6 +117,12 @@ public final class AgentRecoverySpawnPolicyVerification {
 		AtomicInteger releasedTickets = new AtomicInteger();
 		for (AgentId id : List.of(first.agentId(), second.agentId())) {
 			assertEquals(true, registry.require(id).entityUuid().isPresent(), "missing body retains its saved attachment");
+			var control = AgentControlSync.controlSnapshot(true, true, "Automation ready", 104L,
+					List.of(registry.require(id)), List.of(), AgentControlCatalog.currentOptions(), ignored -> Optional.empty())
+					.agents().getFirst();
+			assertEquals(false, control.entityPresent(), "failed and deferred recovery do not project the retained UUID as a body");
+			assertEquals(false, AgentControlActions.supports(control, "start"), "missing recovered agent cannot Start");
+			assertEquals(false, AgentControlActions.supports(control, "resume"), "missing recovered agent cannot Resume");
 			CodexAgentManager.maintainPresentBodyTicket(Optional.empty(), ignored -> trackedTickets.incrementAndGet(),
 					releasedTickets::incrementAndGet);
 		}
@@ -127,12 +135,15 @@ public final class AgentRecoverySpawnPolicyVerification {
 		// A later retry uses the persisted record, not a transient copy from the failed tick.
 		AgentRecord retry = CodexAgentManager.prepareMissingPlayer(registry, registry.require(first.agentId()), true, pending, 105L);
 		assertEquals(Optional.of(nether), retry.entityLocation(), "retry reads the durable original location");
+		var retriedControl = AgentControlSync.controlSnapshot(true, true, "Automation ready", 105L,
+				List.of(retry), List.of(), AgentControlCatalog.currentOptions(), ignored -> Optional.empty()).agents().getFirst();
+		assertEquals(false, retriedControl.entityPresent(), "retry still requires an observed living body");
 		CodexAgentManager.RecoveryAttemptGate nextTick = new CodexAgentManager.RecoveryAttemptGate();
 		assertEquals(true, nextTick.tryClaim(), "the deferred agent can claim the next tick while the first backs off");
 		AgentEntityLocation replacement = AgentEntityLocation.exact("minecraft:the_end", 12, 8, 201, 71, 131, 180, 0);
 		registry.attachEntity(second.agentId(), registry.require(second.agentId()).entityUuid().orElseThrow(), replacement, 106L);
 		assertEquals(Optional.of(replacement), registry.require(second.agentId()).entityLocation(), "a verified replacement supersedes the saved recovery location");
-		return 14;
+		return 21;
 	}
 
 	private static void expectIllegalArgument(Runnable action, String message) {

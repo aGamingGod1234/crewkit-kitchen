@@ -426,7 +426,7 @@ export class NativeToolRuntime {
 			state: 'PREPARING', settled: false, result, resolve, reject, detach, detached: request.tool.background === true, record, deadlineEpochMs: null };
 		// The runtime owns this lease even after a background handle or advisory
 		// returns to the provider. Preparation and handoff sampling are bounded too.
-		run.releaseWork = this.#onWorkStarted(record, 'program', { timeoutMs: request.tool.timeoutMs ?? 30_000 });
+		run.releaseWork = this.#onWorkStarted(record, 'program', { timeoutMs: request.tool.timeoutMs ?? 30_000, programId: run.programId });
 		return { run, attentionResult };
 	}
 
@@ -587,6 +587,21 @@ export class NativeToolRuntime {
 		const result = this.#programResults.get(record.agentId);
 		if (result?.goalRevision === record.goalRevision && (programId === undefined || programId === result.programId)) return structuredClone(result);
 		return { state: programId === undefined ? 'IDLE' : 'UNKNOWN_PROGRAM', goalRevision: record.goalRevision, ...(programId === undefined ? {} : { programId }) };
+	}
+
+	async expireProgram(record, programId) {
+		const run = this.#programRuns.get(record.agentId);
+		if (run?.goalRevision !== record.goalRevision || run.programId !== programId || run.epoch !== this.#executionEpoch(record.agentId)) return null;
+		run.pendingSuccessor = null;
+		run.queueAdmission = (run.queueAdmission ?? 0) + 1;
+		if (run.state === 'PREPARING') {
+			this.#settleProgram(record.agentId, run, { state: 'TIMED_OUT', reasonCode: 'PROGRAM_DEADLINE' });
+		} else if (typeof this.#programExecutor.expire === 'function') {
+			await this.#programExecutor.expire(record, programId);
+		} else {
+			await this.#programExecutor.cancel(record.agentId, 'PROGRAM_DEADLINE');
+		}
+		return run.result;
 	}
 
 	async #cancelProgram(record, tool) {

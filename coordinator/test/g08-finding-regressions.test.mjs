@@ -66,11 +66,11 @@ for await (const line of createInterface({ input: process.stdin })) {
     await readPhaseMessage(directory, 'runner-ready');
     emit('startup', { modSha256: requestConfig.arm.artifactSha256, worldId: worldManifest.worldId });
   } else if (request.phase === 'trial') {
-    await writePhaseMessage(directory, 'runner-trial', { remainingMs: request.remainingMs });
+    await writePhaseMessage(directory, 'runner-trial', { clock: request.clock, cutoffMs: request.cutoffMs });
     emit('trial', await readPhaseMessage(directory, 'runner-trial-ended'));
   } else if (request.phase === 'cleanup') {
     if (mode === 'blocked-cleanup') { await writeFile(path.join(directory, 'blocked-cleanup.json'), JSON.stringify({ entered: true })); await new Promise(() => {}); }
-    await writePhaseMessage(directory, 'runner-cleanup', { remainingMs: request.remainingMs });
+    await writePhaseMessage(directory, 'runner-cleanup', { clock: request.clock, cutoffMs: request.cutoffMs });
     const report = await scenarioPromise;
     await writeFile(path.join(directory, 'finished-report.json'), JSON.stringify(report));
     emit('cleanup', { wrapper: { ok: true }, runnerExit: report.status === 'FAILED' ? 1 : 0, runner: report });

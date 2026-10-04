@@ -306,3 +306,45 @@ test('unconfirmed background cancellation cannot release the body for a new acti
 	await tick();
 	assert.equal((await run.call('actionStatus')).state, 'IDLE');
 });
+
+test('exact program lease expiry bounds hung preparation and fences its late lookup', async t => {
+	let release;
+	const leases = [];
+	const run = setup(t, { memoryOperation: async () => new Promise(resolve => { release = resolve; }),
+		onWorkStarted: (_record, kind, options) => {
+			const lease = { kind, ...options, released: false }; leases.push(lease);
+			return () => { lease.released = true; };
+		} });
+	const handle = await run.call('runProgram', { background: true, noteKey: 'guard', timeoutMs: 250 });
+	assert.equal(handle.state, 'PREPARING');
+	assert.equal(leases[0].programId, handle.programId);
+	assert.equal(await run.runtime.expireProgram({ ...record, goalRevision: 2 }, handle.programId), null);
+	assert.equal(await run.runtime.expireProgram(record, 'obsolete-program'), null);
+	assert.equal(leases[0].released, false, 'foreign expiry cannot release preparation');
+	const result = await run.runtime.expireProgram(record, handle.programId);
+	assert.equal(result.state, 'TIMED_OUT');
+	assert.equal(result.reasonCode, 'PROGRAM_DEADLINE');
+	assert.equal(leases[0].released, true);
+	release({ entries: [{ key: 'guard', text: `${prefix} await player.wait(1);` }] }); await tick();
+	assert.equal(run.commands().length, 0, 'late preparation lost dispatch authority');
+	assert.deepEqual(await run.call('programStatus', { programId: handle.programId }), result);
+});
+
+test('program expiry keeps uncertain input fenced and cannot cancel a successor', async t => {
+	const timers = new Map(); let timerId = 0;
+	const executor = new NativeProgramExecutor({ setTimeoutFn: (fn, ms) => { timers.set(++timerId, { fn, ms }); return timerId; }, clearTimeoutFn: id => timers.delete(id) });
+	const run = setup(t, { programExecutor: executor });
+	const handle = await run.call('runProgram', { background: true, timeoutMs: 250, source: `${prefix} await player.wait(1000);` }); await tick();
+	const pending = run.runtime.expireProgram(record, handle.programId); await tick();
+	assert.equal(run.sent.filter(entry => entry.type === 'action_cancel').length, 1);
+	[...timers.values()].find(timer => timer.ms === 5000).fn();
+	assert.equal((await pending).reasonCode, 'PROGRAM_CANCEL_ACK_TIMEOUT');
+	assert.equal((await run.call('programStatus', { programId: handle.programId })).state, 'UNKNOWN');
+	await assert.rejects(run.call('wait', { durationMs: 1 }), { code: 'NATIVE_ACTION_IN_PROGRESS' });
+	assert.equal(run.commands().length, 1);
+	run.finish(run.commands()[0], 'CANCELLED'); await tick();
+	const successor = await run.call('runProgram', { background: true, source: `${prefix} await player.wait(1000);` }); await tick();
+	assert.equal(await run.runtime.expireProgram(record, handle.programId), null);
+	assert.equal((await run.call('programStatus', { programId: successor.programId })).state, 'RUNNING');
+	assert.equal(run.sent.filter(entry => entry.type === 'action_cancel').length, 1);
+});

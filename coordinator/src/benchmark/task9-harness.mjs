@@ -102,7 +102,8 @@ export function createFairAbRows({ trials, sourceCommits, sourceHashes = {}, fix
 			for (const arm of ['baseline', 'optimized']) rows.push(freeze({
 				cellId, trialId: trial.id, repetition, arm, seed: trial.seed, agentLoad: trial.agentLoad,
 				scenarioId: trial.scenarioId, providerProfile: trial.providerProfile, sourceCommit: sourceCommits[arm], sourceHash: sourceHashes[arm] ?? null,
-				scheduler: { mode: 'fixed', fixedConcurrency: concurrency, maxPending: Math.max(0, trial.agentLoad - Math.min(trial.agentLoad, concurrency)), urgentReserve: 1 },
+				// These rows budget capacity for ordinary work only, including the single-agent cell.
+				scheduler: { mode: 'fixed', fixedConcurrency: concurrency, maxPending: Math.max(0, trial.agentLoad - Math.min(trial.agentLoad, concurrency)), urgentReserve: 0 },
 			}));
 		}
 	}
@@ -118,7 +119,7 @@ export function createSchedulerSweepRows({ trials, sourceCommit, sourceHash = nu
 				cellId: `${trial.id}/seed-${trial.seed}/load-${trial.agentLoad}/rep-${repetition}/fixed-${fixedConcurrency}`,
 				trialId: trial.id, repetition, seed: trial.seed, agentLoad: trial.agentLoad, scenarioId: trial.scenarioId,
 				arm: 'optimized', sourceCommit, sourceHash, providerProfile: trial.providerProfile,
-				scheduler: { mode: 'fixed', fixedConcurrency, maxPending: Math.max(0, trial.agentLoad - Math.min(trial.agentLoad, fixedConcurrency)), urgentReserve: 1 },
+				scheduler: { mode: 'fixed', fixedConcurrency, maxPending: Math.max(0, trial.agentLoad - Math.min(trial.agentLoad, fixedConcurrency)), urgentReserve: 0 },
 			}));
 			rows.push(freeze({
 				cellId: `${trial.id}/seed-${trial.seed}/load-${trial.agentLoad}/rep-${repetition}/adaptive-v1`,
