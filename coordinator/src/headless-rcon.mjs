@@ -17,7 +17,8 @@ function boundedUtf8(value, maxBytes) {
   const text = String(value ?? '');
   const bytes = Buffer.from(text, 'utf8');
   if (bytes.length <= maxBytes) return text;
-  return bytes.subarray(0, maxBytes).toString('utf8');
+  // Do not produce a replacement character (and extra bytes) at a UTF-8 cut.
+  return new TextDecoder().decode(bytes.subarray(0, maxBytes), { stream: true });
 }
 
 function frame(id, type, text) {
@@ -53,6 +54,7 @@ export class HeadlessRconClient {
     this.buffer = Buffer.alloc(0);
     this.connectPromise = null;
     this.connectReject = null;
+    this.commandQueue = Promise.resolve();
   }
 
   async connect() {
@@ -131,8 +133,18 @@ export class HeadlessRconClient {
   }
 
   command(text) {
+    if (this.state === 'closed') return Promise.reject(new RconError('RCON_CLOSED', 'RCON client is closed'));
     if (this.state !== 'authenticated') return Promise.reject(new RconError('RCON_NOT_AUTHENTICATED', 'RCON client is not authenticated'));
-    return this._request(2, text).then(response => ({ id: response.id, type: response.type, text: response.text }));
+    const deadline = Date.now() + this.commandTimeoutMs;
+    // Minecraft consumes one request per socket read. Serialize commands and
+    // send the completion marker only after the first response, not pipelined.
+    const result = this.commandQueue.then(() => {
+      if (this.state !== 'authenticated') throw new RconError('RCON_CLOSED', 'RCON client is closed');
+      if (Date.now() >= deadline) throw new RconError('RCON_TIMEOUT', 'RCON command timed out');
+      return this._request(2, text, deadline - Date.now());
+    });
+    this.commandQueue = result.catch(() => {});
+    return result;
   }
 
   async close() {
@@ -144,14 +156,18 @@ export class HeadlessRconClient {
     this._shutdownSocket();
   }
 
-  _request(type, text) {
+  _request(type, text, timeoutMs = this.commandTimeoutMs) {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.pending.delete(id);
+        const pending = this.pending.get(id);
+        this.pending.delete(id); this.pending.delete(pending?.markerId);
         reject(new RconError('RCON_TIMEOUT', 'RCON command timed out'));
-      }, this.commandTimeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
+        // A timed-out server command may still be emitting packets. Do not
+        // issue a new request on a stream whose command boundary is unknown.
+        void this.close();
+      }, timeoutMs);
+      this.pending.set(id, { id, requestType: type, resolve, reject, timer, chunks: [], bytes: 0, truncated: false, markerId: null });
       try { this.socket.write(frame(id, type, text)); } catch (error) {
         clearTimeout(timer); this.pending.delete(id); reject(error);
       }
@@ -177,14 +193,36 @@ export class HeadlessRconClient {
         this.close();
         return;
       }
-      const text = boundedUtf8(payload.subarray(8, payload.length - 2).toString('utf8'), this.maxResponseBytes);
+      const body = payload.subarray(8, payload.length - 2);
+      const text = boundedUtf8(body.toString('utf8'), this.maxResponseBytes);
       const pending = this.pending.get(id) ?? (id === -1 && this.pending.size === 1 ? this.pending.values().next().value : null);
       if (pending) {
+        if (pending.requestType === 2 && id === pending.id) {
+          if (type !== 0) { this._rejectAll(new RconError('RCON_PROTOCOL', 'Unexpected command response type')); void this.close(); return; }
+          const remaining = Math.max(0, this.maxResponseBytes - pending.bytes);
+          if (remaining > 0) pending.chunks.push(Buffer.from(body.subarray(0, remaining)));
+          pending.bytes += body.length;
+          pending.truncated ||= pending.bytes > this.maxResponseBytes;
+          if (pending.markerId === null) {
+            // The target server answers unsupported type 0 after completing
+            // sendCmdResponse, including every same-ID multipart packet.
+            pending.markerId = this.nextId++;
+            this.pending.set(pending.markerId, pending);
+            try { this.socket.write(frame(pending.markerId, 0, '')); }
+            catch (error) { this._rejectAll(error); void this.close(); }
+          }
+          continue;
+        }
+        if (pending.requestType === 2 && type !== 0) {
+          this._rejectAll(new RconError('RCON_PROTOCOL', 'Unexpected completion response type')); void this.close(); return;
+        }
         for (const [pendingId, value] of this.pending) {
           if (value === pending) this.pending.delete(pendingId);
         }
         clearTimeout(pending.timer);
-        pending.resolve({ id, type, text });
+        pending.resolve(pending.requestType === 2
+          ? { id: pending.id, type: 0, text: new TextDecoder().decode(Buffer.concat(pending.chunks), { stream: pending.truncated }), complete: !pending.truncated, truncated: pending.truncated }
+          : { id, type, text });
       }
     }
   }

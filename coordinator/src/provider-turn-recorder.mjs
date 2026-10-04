@@ -5,6 +5,7 @@ import { BestEffortDiagnosticQueue } from './best-effort-diagnostic-queue.mjs';
 import { sanitizeDiagnosticText, truncateDiagnosticUtf8 } from './diagnostic-sanitizer.mjs';
 import { preparePrivateArtifact } from './private-artifact-permissions.mjs';
 import { RotatingJsonlSink } from './rotating-jsonl-sink.mjs';
+import { normalizeToolResponseSummary } from './tool-response-summary.mjs';
 
 const MAX_PRIVATE_TEXT_BYTES = 65_536;
 const MAX_PUBLIC_EXCERPT_BYTES = 512;
@@ -39,9 +40,13 @@ export class ProviderTurnRecorder {
 			appendFile, now, inspect: appendFile === defaultAppendFile || Object.keys(rotation).length > 0, ...rotation,
 		});
 		this.#preparePrivateArtifact = prepareArtifact ?? (appendFile === defaultAppendFile ? preparePrivateArtifact : async () => {});
-		this.#ready = this.#privatePath === null ? Promise.resolve(true) : this.#preparePrivateArtifact(this.#privatePath).then(() => true, () => false);
 		this.#now = now;
-		this.#queue = new BestEffortDiagnosticQueue(queueOptions);
+		this.#ready = this.#privatePath === null ? Promise.resolve(true)
+			: Promise.resolve().then(() => this.#preparePrivateArtifact(this.#privatePath)).then(() => true, () => {
+				this.#queue.reportFailure();
+				return false;
+			});
+		this.#queue = new BestEffortDiagnosticQueue({ ...queueOptions, ready: this.#ready });
 	}
 
 	record(fields = {}) {
@@ -49,23 +54,28 @@ export class ProviderTurnRecorder {
 		try {
 			const row = normalizeRecord(fields, this.#runId, this.#scenarioId, this.#now());
 			const privateRow = privateRecord(row);
-			const publicRow = publicRecord(row);
+			const publicRow = this.#publicSink === null ? null : publicRecord(row);
 			const encoded = `${JSON.stringify(privateRow)}\n`;
 			this.#queue.submit(async () => {
 				const writes = [];
 				if (this.#publicSink !== null) {
-					try { writes.push(this.#publicSink(publicRow)); } catch { /* observational */ }
+					writes.push(Promise.resolve().then(() => this.#publicSink(publicRow)));
 				}
 				if (this.#privatePath !== null) {
-					try {
-						if (!await this.#ready) return Promise.allSettled(writes);
-						writes.push(this.#sink.append(encoded, { encoding: 'utf8', flag: 'a', mode: 0o600 }));
-					}
-					catch { /* observational */ }
+					writes.push((async () => {
+						if (!await this.#ready) throw new Error('provider audit artifact is unavailable');
+						await this.#sink.append(encoded, { encoding: 'utf8', flag: 'a', mode: 0o600 });
+					})());
 				}
-				return Promise.allSettled(writes);
+				// Attempt both sinks, but do not turn missing evidence into queue success.
+				const results = await Promise.allSettled(writes);
+				if (results.some((result) => result.status === 'rejected')) throw new Error('provider audit write failed');
 			});
-		} catch { /* invalid or hostile diagnostics are dropped */ }
+		} catch {
+			// Normalization lost a record too. Do not inspect the hostile input/error
+			// again while reporting that capture is incomplete.
+			this.#queue.reportFailure();
+		}
 		return Promise.resolve();
 	}
 
@@ -83,7 +93,7 @@ export class ProviderTurnRecorder {
 
 export function recordProviderTurn(recorder, fields) {
 	if (recorder === null || recorder === undefined) return;
-	try { void recorder.record(fields); }
+	try { void Promise.resolve(recorder.record(fields)).catch(() => {}); }
 	catch { /* provider capture is observational and cannot affect control flow */ }
 }
 
@@ -97,6 +107,7 @@ function normalizeRecord(fields, runId, scenarioId, timestamp) {
 		model: boundedMeta(fields.model),
 		reasoningEffort: boundedMeta(fields.reasoningEffort),
 		...(fields.executionSettings == null ? {} : { executionSettings: normalizeExecutionSettings(fields.executionSettings) }),
+		...normalizeNativeTurnEvidence(fields),
 		goalRevision: boundedInteger(fields.goalRevision),
 		attempt: boundedInteger(fields.attempt),
 		retry: fields.retry === true,
@@ -128,6 +139,7 @@ function publicRecord(row) {
 		model: row.model,
 		reasoningEffort: row.reasoningEffort,
 		...(row.executionSettings === undefined ? {} : { executionSettings: row.executionSettings }),
+		...normalizeNativeTurnEvidence(row),
 		goalRevision: row.goalRevision,
 		attempt: row.attempt,
 		retry: row.retry,
@@ -168,6 +180,31 @@ function normalizeTiming(value) {
 }
 
 const TOKEN_CATEGORIES = ['input', 'output', 'reasoning', 'cached', 'cacheWrite'];
+
+function normalizeNativeTurnEvidence(fields) {
+	const result = {};
+	if (fields.toolResponses !== undefined) result.toolResponses = normalizeToolResponseSummary(fields.toolResponses);
+	for (const key of ['traceId', 'threadId', 'turnId']) {
+		if (fields[key] !== undefined) result[key] = boundedMeta(fields[key]);
+	}
+	for (const key of ['sessionGeneration', 'toolCalls', 'toolResultBytes', 'inputBytes', 'inputCount']) {
+		if (fields[key] !== undefined) result[key] = Number.isSafeInteger(fields[key]) && fields[key] >= 0 ? fields[key] : null;
+	}
+	if (fields.usage != null) {
+		const usage = fields.usage;
+		result.usage = {
+			scope: usage.scope === 'observed_thread_counter_delta' ? usage.scope : null,
+			status: ['available', 'missing', 'baseline_unknown', 'counter_reset'].includes(usage.status) ? usage.status : null,
+			start: usage.start == null ? null : normalizeTokens(usage.start),
+			end: usage.end == null ? null : normalizeTokens(usage.end),
+			gapBefore: usage.gapBefore == null ? null : normalizeTokens(usage.gapBefore),
+			attributionComplete: typeof usage.attributionComplete === 'boolean' ? usage.attributionComplete : null,
+			updates: Number.isSafeInteger(usage.updates) && usage.updates >= 0 ? usage.updates : null,
+			counterReset: usage.counterReset === true,
+		};
+	}
+	return result;
+}
 
 function normalizeTokens(value) {
 	if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('provider turn tokens must be an object');

@@ -81,7 +81,7 @@ export class ModelNotebook {
 			: entry.kind === normalizedKind);
 		const searchText = search.toLowerCase();
 		const entries = [...state.notes, ...state.receipts].filter((entry) => entry.worldId === worldId && matchesKind(entry) && JSON.stringify(entry).toLowerCase().includes(searchText)).sort((left, right) => right.revision - left.revision);
-		return { worldId, revision: state.revision, total: entries.length, entries: structuredClone(entries.slice(offset, offset + limit)), nextOffset: offset + limit < entries.length ? offset + limit : null, evictedReceipts: state.evictedReceipts, evictedNotes: state.evictedNotes };
+		return { worldId, revision: state.revision, offset, total: entries.length, entries: structuredClone(entries.slice(offset, offset + limit)), nextOffset: offset + limit < entries.length ? offset + limit : null, evictedReceipts: state.evictedReceipts, evictedNotes: state.evictedNotes };
 	}
 	clear(agentId, { worldId, key } = {}) {
 		worldId = text(worldId, 'worldId', 256);
@@ -97,8 +97,12 @@ export class ModelNotebook {
 	#mutate(agentId, operation) {
 		const previous = this.#pending.get(agentId) ?? Promise.resolve();
 		const pending = previous.catch(() => {}).then(async () => {
-			const state = structuredClone(await this.#load(agentId));
+			const committed = await this.#load(agentId);
+			const state = structuredClone(committed);
 			const result = operation(state);
+			// Every accepted mutation advances the revision. Retry-only operations
+			// must still run in this queue, but need no bounding or durable rewrite.
+			if (state.revision === committed.revision) return structuredClone(result);
 			this.#bound(state, result);
 			await this.#disk.write(agentId, { ...state, notes: state.notes.filter(persistentWorld), receipts: state.receipts.filter(persistentWorld) });
 			this.#agents.set(agentId, state);

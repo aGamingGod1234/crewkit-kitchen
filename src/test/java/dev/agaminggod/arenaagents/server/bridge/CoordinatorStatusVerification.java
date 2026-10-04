@@ -78,7 +78,51 @@ public final class CoordinatorStatusVerification {
 				"catalog speed tiers preserved");
 		catalog.addProperty("privatePrompt", "must never cross this seam");
 		assertThrows(() -> MultiplexedServerBridge.decodeCatalog(catalog), "unknown catalog field rejected");
-		return 20;
+		return 20 + verifyCaptureStatus();
+	}
+
+	private static int verifyCaptureStatus() {
+		CoordinatorStatusSnapshot.ComponentRecovery legacy = MultiplexedServerBridge.decodeCoordinatorStatus(
+				extendedRecoveryPayload(), 1_000L).components().getFirst();
+		assertTrue(legacy.failedOperationCount() == null && legacy.droppedCount() == null && legacy.incompleteCapture() == null,
+				"legacy capture completeness remains unknown");
+		CoordinatorStatusSnapshot.ComponentRecovery legacyConstructor = new CoordinatorStatusSnapshot.ComponentRecovery(
+				"diagnostics", "ready", null, null, null, 0, null, 0L, null);
+		assertTrue(legacyConstructor.incompleteCapture() == null, "legacy constructor preserves unknown completeness");
+		JsonObject capture = extendedRecoveryPayload();
+		JsonObject component = capture.getAsJsonArray("components").get(0).getAsJsonObject();
+		component.addProperty("component", "provider_audit");
+		component.addProperty("state", "ready");
+		component.add("fallbackMode", com.google.gson.JsonNull.INSTANCE);
+		component.add("boundary", com.google.gson.JsonNull.INSTANCE);
+		component.add("failureCode", com.google.gson.JsonNull.INSTANCE);
+		component.addProperty("consecutiveFailureCount", 0);
+		component.addProperty("failedOperationCount", 1L);
+		component.addProperty("droppedCount", 2L);
+		component.addProperty("incompleteCapture", true);
+		CoordinatorStatusSnapshot.ComponentRecovery decoded = MultiplexedServerBridge.decodeCoordinatorStatus(
+				com.google.gson.JsonParser.parseString(capture.toString()).getAsJsonObject(), 1_000L).components().getFirst();
+		assertTrue(decoded.state().equals("ready") && decoded.consecutiveFailureCount() == 0, "current recovery stays ready");
+		assertTrue(decoded.failedOperationCount() == 1L && decoded.droppedCount() == 2L && Boolean.TRUE.equals(decoded.incompleteCapture()),
+				"cumulative loss remains visible after recovery and JSON roundtrip");
+		component.addProperty("failedOperationCount", 9_007_199_254_740_991L);
+		assertTrue(MultiplexedServerBridge.decodeCoordinatorStatus(capture, 1_000L).components().getFirst().failedOperationCount()
+				== 9_007_199_254_740_991L, "maximum safe capture counter accepted");
+		component.addProperty("failedOperationCount", 9_007_199_254_740_992L);
+		assertThrows(() -> MultiplexedServerBridge.decodeCoordinatorStatus(capture, 1_000L), "unsafe capture counter rejected");
+		component.addProperty("failedOperationCount", -1L);
+		assertThrows(() -> MultiplexedServerBridge.decodeCoordinatorStatus(capture, 1_000L), "negative capture counter rejected");
+		component.add("failedOperationCount", com.google.gson.JsonNull.INSTANCE);
+		assertThrows(() -> MultiplexedServerBridge.decodeCoordinatorStatus(capture, 1_000L), "null capture counter rejected");
+		component.addProperty("failedOperationCount", 1L);
+		component.addProperty("droppedCount", 0.5D);
+		assertThrows(() -> MultiplexedServerBridge.decodeCoordinatorStatus(capture, 1_000L), "fractional drop counter rejected");
+		component.addProperty("droppedCount", 0L);
+		component.addProperty("incompleteCapture", "false");
+		assertThrows(() -> MultiplexedServerBridge.decodeCoordinatorStatus(capture, 1_000L), "string capture completeness rejected");
+		component.add("incompleteCapture", com.google.gson.JsonNull.INSTANCE);
+		assertThrows(() -> MultiplexedServerBridge.decodeCoordinatorStatus(capture, 1_000L), "null capture completeness rejected");
+		return 11;
 	}
 
 	private static JsonObject extendedRecoveryPayload() {

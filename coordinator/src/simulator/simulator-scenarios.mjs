@@ -7,11 +7,11 @@ const scenarioList = [
 		title: 'Gather stone and craft tools',
 		agentId: 'stone-agent',
 		goal: 'Gather stone and craft a stone pickaxe.',
-		world: baseWorld({ agentId: 'stone-agent', inventory: [{ itemId: 'minecraft:stick', count: 2, slot: 0 }, { itemId: 'minecraft:cobblestone', count: 3, slot: 1 }], blocks: [{ x: 0, y: 0, z: 0, blockId: 'minecraft:stone' }, { x: 1, y: 0, z: 0, blockId: 'minecraft:stone' }, { x: 1, y: 1, z: 0, blockId: 'minecraft:stone' }] }),
+		world: baseWorld({ agentId: 'stone-agent', inventory: [{ itemId: 'minecraft:stick', count: 2, slot: 0 }, { itemId: 'minecraft:cobblestone', count: 3, slot: 1 }], blocks: [{ x: 0, y: 0, z: 0, blockId: 'minecraft:stone' }, { x: 1, y: 0, z: 0, blockId: 'minecraft:stone' }, { x: 1, y: 1, z: 0, blockId: 'minecraft:stone' }, { x: 2, y: 1, z: 0, blockId: 'minecraft:crafting_table' }] }),
 		commands: [
 			{ actionId: 'stone-navigate', actionType: 'navigate_to', arguments: { x: 0, y: 1, z: 1, tolerance: 0.2, sprint: true, timeoutMs: 1_000 } },
 			{ actionId: 'stone-mine', actionType: 'break_block', arguments: { x: 1, y: 1, z: 0, expectedBlockId: 'minecraft:stone', timeoutMs: 1_000 } },
-			{ actionId: 'stone-craft', actionType: 'craft_inventory', arguments: { recipeId: 'minecraft:stone_pickaxe', count: 1, timeoutMs: 1_000 } },
+			{ actionId: 'stone-craft', actionType: 'craft_table', arguments: { recipeId: 'minecraft:stone_pickaxe', x: 2, y: 1, z: 0, count: 1, timeoutMs: 1_000 } },
 		],
 		events: [],
 		expected: { actionIds: ['stone-navigate', 'stone-mine', 'stone-craft'], toolItemId: 'minecraft:stone_pickaxe', dropItemId: 'minecraft:cobblestone' },
@@ -53,14 +53,15 @@ const scenarioList = [
 		goal: 'Craft planks in inventory, craft a table, place it, then craft sticks at the table.',
 		world: baseWorld({ agentId: 'craft-agent', inventory: [{ itemId: 'minecraft:oak_log', count: 2, slot: 0 }] }),
 		commands: [
-			{ actionId: 'craft-planks', actionType: 'craft_inventory', arguments: { recipeId: 'minecraft:planks', count: 8, timeoutMs: 1_000 } },
+			{ actionId: 'craft-planks', actionType: 'craft_inventory', arguments: { recipeId: 'minecraft:planks', count: 4, timeoutMs: 1_000 } },
+			{ actionId: 'craft-planks-second', actionType: 'craft_inventory', arguments: { recipeId: 'minecraft:planks', count: 4, timeoutMs: 1_000 } },
 			{ actionId: 'craft-table', actionType: 'craft_inventory', arguments: { recipeId: 'minecraft:crafting_table', count: 1, timeoutMs: 1_000 } },
 			{ actionId: 'place-table', actionType: 'place_block', arguments: { x: 1, y: 1, z: 0, face: 'up', itemId: 'minecraft:crafting_table', desiredState: null } },
 			{ actionId: 'craft-sticks-at-table', actionType: 'craft_table', arguments: { recipeId: 'minecraft:sticks', x: 1, y: 1, z: 0, count: 1, timeoutMs: 1_000 } },
 		],
 		events: [],
-		expected: { actionIds: ['craft-planks', 'craft-table', 'place-table', 'craft-sticks-at-table'], outputItemId: 'minecraft:oak_planks', outputCount: 8, consumedItemId: 'minecraft:oak_log', consumedCount: 2, tableBlock: { x: 1, y: 1, z: 0, blockId: 'minecraft:crafting_table' }, stickItemId: 'minecraft:stick', stickCount: 1, finalPlanks: 2 },
-		success: (state) => resultsSucceeded(state, ['craft-planks', 'craft-table', 'place-table', 'craft-sticks-at-table']) && exactInventoryDelta(state, 'minecraft:oak_log', -2) && exactInventoryDelta(state, 'minecraft:oak_planks', 2) && exactInventoryDelta(state, 'minecraft:stick', 1) && state.state?.block?.x === 1 && state.state.block.y === 1 && state.state.block.z === 0 && state.state.block.blockId === 'minecraft:crafting_table',
+		expected: { actionIds: ['craft-planks', 'craft-planks-second', 'craft-table', 'place-table', 'craft-sticks-at-table'], outputItemId: 'minecraft:oak_planks', outputCount: 8, consumedItemId: 'minecraft:oak_log', consumedCount: 2, tableBlock: { x: 1, y: 1, z: 0, blockId: 'minecraft:crafting_table' }, stickItemId: 'minecraft:stick', stickCount: 4, finalPlanks: 2 },
+		success: (state) => resultsSucceeded(state, ['craft-planks', 'craft-planks-second', 'craft-table', 'place-table', 'craft-sticks-at-table']) && exactInventoryDelta(state, 'minecraft:oak_log', -2) && exactInventoryDelta(state, 'minecraft:oak_planks', 2) && exactInventoryDelta(state, 'minecraft:stick', 4) && state.state?.block?.x === 1 && state.state.block.y === 1 && state.state.block.z === 0 && state.state.block.blockId === 'minecraft:crafting_table',
 	},
 	{
 		id: 'block-placement',
@@ -111,7 +112,9 @@ const scenarioList = [
 	},
 	{
 		id: 'direct-message-wake',
-		title: 'Wake an idle agent through a direct message',
+		title: 'Verify recipient wake and processing after a direct message',
+		// Sender-only simulation cannot meet this contract. A recipient runtime must
+		// supply independent matching acknowledgement/processing evidence.
 		agentId: 'message-agent',
 		goal: 'Send a direct message and process the recipient wake acknowledgement.',
 		world: baseWorld({ agentId: 'message-agent', agents: { 'message-agent': { position: { x: 0, y: 1, z: 0 }, onGround: true }, [DM_RECIPIENT_ID]: { position: { x: 1, y: 1, z: 0 }, onGround: true } } }),

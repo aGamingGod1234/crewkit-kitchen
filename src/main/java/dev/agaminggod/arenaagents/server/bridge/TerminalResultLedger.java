@@ -146,18 +146,7 @@ final class TerminalResultLedger {
 	private static String fingerprint(ServerActionResult result) {
 		try {
 			MessageDigest digest = MessageDigest.getInstance("SHA-256");
-			update(digest, result.agentId().toString());
-			update(digest, Long.toString(result.goalRevision()));
-			update(digest, result.actionId());
-			update(digest, result.actionType().wireName());
-			update(digest, result.traceId());
-			update(digest, result.state().name());
-			update(digest, result.reasonCode());
-			update(digest, result.message());
-			update(digest, Long.toString(result.elapsedMs()));
-			update(digest, Long.toString(result.observedAtEpochMs()));
-			update(digest, Boolean.toString(result.executionStarted()));
-			update(digest, Boolean.toString(result.physicalAttempted()));
+			update(digest, DurableActionJournal.encodeResult(result).toString());
 			return HexFormat.of().formatHex(digest.digest());
 		} catch (NoSuchAlgorithmException exception) {
 			throw new IllegalStateException("SHA-256 is unavailable", exception);

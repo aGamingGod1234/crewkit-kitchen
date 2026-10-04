@@ -17,6 +17,7 @@ import {
 	runTask9SimulatorMatrix,
 	validateTask9TrialReport,
 } from '../src/benchmark/task9-harness.mjs';
+import { compileScenarioDecision } from '../src/benchmark/scenario-program.mjs';
 
 const profile = { provider: 'replay', model: 'controlled-v1', reasoningEffort: 'fixed', serviceTier: 'synthetic-delayed' };
 const trial = (overrides = {}) => ({ id: 'stone', mode: 'replay', scenarioId: 'stone-tool-gathering', seed: 20260821, agentLoad: 4, repetitions: 5, providerProfile: profile, turnBudgetMs: 100, trialBudgetMs: 500, turnCap: 8, ...overrides });
@@ -36,13 +37,69 @@ test('creates fair A/B rows with identical cells and a separately versioned sche
 	for (let index = 0; index < fair.length; index += 2) {
 		assert.equal(fair[index].cellId, fair[index + 1].cellId);
 		assert.equal(fair[index].scheduler.fixedConcurrency, 16);
+		assert.equal(fair[index].scheduler.urgentReserve, 0);
+		assert.equal(fair[index + 1].scheduler.urgentReserve, 0);
 		assert.equal(fair[index].seed, fair[index + 1].seed);
 		assert.equal(fair[index].agentLoad, fair[index + 1].agentLoad);
 	}
 	const sweep = createSchedulerSweepRows({ trials: matrix(), sourceCommit: 'tip' });
 	assert.deepEqual(sweep.slice(0, TASK9_FIXED_CONCURRENCIES.length).map((row) => row.scheduler.fixedConcurrency), [...TASK9_FIXED_CONCURRENCIES]);
+	assert.ok(sweep.filter(row => row.scheduler.mode === 'fixed').every(row => row.scheduler.urgentReserve === 0));
 	assert.equal(sweep.at(-1).scheduler.mode, 'adaptive');
 	assert.deepEqual(sweep.at(-1).scheduler.controller, TASK9_ADAPTIVE_CONTROLLER_V1);
+});
+
+test('generated fixed rows admit the complete ordinary workload through the real runner', async (context) => {
+	for (const load of [1, 4]) await context.test(`load ${load}`, async (loadContext) => {
+		const input = matrix({ id: `stone-${load}`, agentLoad: load, repetitions: 1, turnBudgetMs: 1000, trialBudgetMs: 1800 });
+		const fair = createFairAbRows({ trials: input, sourceCommits: { baseline: 'base', optimized: 'head' }, fixedConcurrency: 4 });
+		const sweep = createSchedulerSweepRows({ trials: input, sourceCommit: 'head' }).find(row => row.scheduler.fixedConcurrency === 4);
+		const cases = [...fair.map(row => [row.arm, row.scheduler]), ['sweep', sweep.scheduler],
+			// Retain the original defect as a negative control, without altering global scheduler defaults.
+			['reserved-slot', { ...sweep.scheduler, urgentReserve: 1 }]];
+		for (const [name, scheduler] of cases) await loadContext.test(name, async () => {
+			const providerTurns = [];
+			const provider = (_profile, runnerContext) => ({
+				available: true, synthetic: true, ...profile, providerProfile: profile,
+				async start() {}, async stop() {},
+				async createAgent(record) {
+					// Compile the runner's translated manifest for each actual agent, not a shared origin fixture.
+					const decision = compileScenarioDecision(runnerContext.loadScenario.agentManifests[record.agentId]);
+					let initialized = false;
+					return {
+						async setGoalRevision() {},
+						async decide() {
+							providerTurns.push(record.agentId);
+							await new Promise(resolve => setTimeout(resolve, 20));
+							if (initialized) return { directive: 'continue', summary: 'continue' };
+							initialized = true;
+							return decision;
+						},
+					};
+				},
+			});
+			const report = await runTask9SimulatorMatrix({ matrix: input, scheduler, providerFactories: { replay: provider }, artifactDirectory: null });
+			const result = report.trials[0];
+			assert.deepEqual(result.scheduler, { mode: 'fixed', maxConcurrent: load, maxPending: 0, urgentReserve: scheduler.urgentReserve });
+			assert.equal(report.runManifest.scheduler.urgentReserve, scheduler.urgentReserve);
+			assert.equal(result.cleanup.ok, true);
+			assert.equal(result.cleanup.processTreeClean, true);
+			assert.equal(result.cleanup.listenersClosed, true);
+			if (name === 'reserved-slot') {
+				assert.equal(report.status, 'FAILED');
+				assert.equal(result.status, 'TIMED_OUT');
+				assert.equal(result.correctness.factualSuccess, false);
+				assert.equal(providerTurns.length, load - 1);
+			} else {
+				assert.equal(report.status, 'PASSED');
+				assert.equal(result.status, 'PASSED');
+				assert.equal(result.correctness.factualSuccess, true);
+				assert.deepEqual(result.missingPhases, []);
+				assert.equal(providerTurns.length, load);
+				assert.equal(new Set(providerTurns).size, load);
+			}
+		});
+	});
 });
 
 test('does not call live providers and keeps factual/cleanup evidence separate from latency', () => {
@@ -70,7 +127,7 @@ test('adapts deterministic runner output into raw evidence artifacts', async () 
 			assert.equal(options.matrix.trials[0].providerAvailabilityRequired, true);
 			return {
 				status: 'PASSED', rawEvents: phases.map((event) => ({ ...event, trialId: 'stone', repetition: 1 })),
-				trials: [{ trialId: 'stone', repetition: 1, status: 'PASSED', scenarioId: 'stone-tool-gathering', seed: 20260821, agentLoad: 4, providerProfile: profile, metrics: { raw: { ticks: [{ wallDurationMs: 2 }] } }, systemSummary: { rawSamples: [{ cpu: { totalMs: 10 }, memory: { rssBytes: 2 } }, { cpu: { totalMs: 14 }, memory: { rssBytes: 3 } }] }, debug: { scenarioPassed: true }, cleanup: { ok: true, activeActions: 0, listeners: 0, relays: 0 } }],
+				trials: [{ trialId: 'stone', repetition: 1, status: 'PASSED', scheduler: { mode: 'fixed', maxConcurrent: 4, maxPending: 0, urgentReserve: 0 }, scenarioId: 'stone-tool-gathering', seed: 20260821, agentLoad: 4, providerProfile: profile, metrics: { raw: { ticks: [{ wallDurationMs: 2 }] } }, systemSummary: { rawSamples: [{ cpu: { totalMs: 10 }, memory: { rssBytes: 2 } }, { cpu: { totalMs: 14 }, memory: { rssBytes: 3 } }] }, debug: { scenarioPassed: true }, cleanup: { ok: true, activeActions: 0, listeners: 0, relays: 0 } }],
 			};
 		},
 	});

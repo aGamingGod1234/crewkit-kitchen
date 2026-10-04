@@ -41,14 +41,17 @@ export function evaluateLatencyAcceptance({ baseline, optimized, policy = {}, in
 			const optimizedCellTrials = optimizedTrials.filter((trial) => trial.sessionState === sessionState && trial.agentLoad === agentLoad);
 			const pairing = compareCellPairing(baseTrials, optimizedCellTrials, baselineByKey, optimizedByKey);
 			checks.push(check('WORKLOAD_PAIRING', id, pairing.missingBaseline.length === 0 && pairing.missingOptimized.length === 0 && pairing.mismatched.length === 0, pairing));
+			const metricPairing = compareCellPairing(baseTrials.filter((trial) => trial.status === 'PASSED'), optimizedCellTrials.filter((trial) => trial.status === 'PASSED'), baselineByKey, optimizedByKey);
+			checks.push(check('METRIC_PAIRING', id, metricPairing.missingBaseline.length === 0 && metricPairing.missingOptimized.length === 0 && metricPairing.mismatched.length === 0, metricPairing));
 			const baseCell = summarizeCell(baseTrials);
 			const optimizedCell = summarizeCell(optimizedCellTrials);
 			checks.push(check('SAMPLE_COUNT', id, baseCell.sampleCount >= normalizedPolicy.minimumSamplesPerCell && optimizedCell.sampleCount >= normalizedPolicy.minimumSamplesPerCell, { baseline: baseCell.sampleCount, optimized: optimizedCell.sampleCount, requiredPerArm: normalizedPolicy.minimumSamplesPerCell }));
 			checks.push(check('REQUIRED_SPAN_EVIDENCE', id,
-				baseCell.tickSampleCount === baseCell.sampleCount && optimizedCell.tickSampleCount === optimizedCell.sampleCount
-				&& baseCell.spanSampleCounts.action === baseCell.sampleCount && optimizedCell.spanSampleCounts.action === optimizedCell.sampleCount
-				&& baseCell.spanSampleCounts.voice === baseCell.sampleCount && optimizedCell.spanSampleCounts.voice === optimizedCell.sampleCount,
-				{ baseline: { samples: baseCell.sampleCount, tick: baseCell.tickSampleCount, action: baseCell.spanSampleCounts.action, voice: baseCell.spanSampleCounts.voice }, optimized: { samples: optimizedCell.sampleCount, tick: optimizedCell.tickSampleCount, action: optimizedCell.spanSampleCounts.action, voice: optimizedCell.spanSampleCounts.voice } }));
+				baseCell.sampleCount === baseCell.successfulCount && optimizedCell.sampleCount === optimizedCell.successfulCount
+				&& baseCell.tickSampleCount === baseCell.successfulCount && optimizedCell.tickSampleCount === optimizedCell.successfulCount
+				&& baseCell.spanSampleCounts.action === baseCell.successfulCount && optimizedCell.spanSampleCounts.action === optimizedCell.successfulCount
+				&& baseCell.spanSampleCounts.voice === baseCell.successfulCount && optimizedCell.spanSampleCounts.voice === optimizedCell.successfulCount,
+				{ baseline: { successful: baseCell.successfulCount, samples: baseCell.sampleCount, tick: baseCell.tickSampleCount, action: baseCell.spanSampleCounts.action, voice: baseCell.spanSampleCounts.voice }, optimized: { successful: optimizedCell.successfulCount, samples: optimizedCell.sampleCount, tick: optimizedCell.tickSampleCount, action: optimizedCell.spanSampleCounts.action, voice: optimizedCell.spanSampleCounts.voice } }));
 			const p95Ratio = ratio(optimizedCell.latencyP95Ms, baseCell.latencyP95Ms);
 			checks.push(check('P95_SPEEDUP', id, p95Ratio !== null && p95Ratio <= normalizedPolicy.maximumP95Ratio, { baselineP95Ms: baseCell.latencyP95Ms, optimizedP95Ms: optimizedCell.latencyP95Ms, observedRatio: p95Ratio, maximumRatio: normalizedPolicy.maximumP95Ratio }));
 			const factualParity = optimizedCell.factualSuccessRate !== null && baseCell.factualSuccessRate !== null && optimizedCell.factualSuccessRate >= baseCell.factualSuccessRate && optimizedCell.factualSuccessRate >= normalizedPolicy.minimumFactualSuccessRate;
@@ -69,7 +72,9 @@ export function evaluateLatencyAcceptance({ baseline, optimized, policy = {}, in
 		const overhead = comparisonChecks.find((entry) => entry?.code === 'INSTRUMENTATION_P95_OVERHEAD');
 		const parity = comparisonChecks.find((entry) => entry?.code === 'INSTRUMENTATION_BEHAVIOR_PARITY');
 		const samples = comparisonChecks.find((entry) => entry?.code === 'INSTRUMENTATION_SAMPLE_COUNT');
-		checks.push(check('INSTRUMENTATION_COMPARISON', 'all', instrumentationComparison?.status === 'PASSED' && overhead?.status === 'PASSED' && Number.isFinite(overhead?.observedRatio) && overhead.observedRatio <= normalizedPolicy.maximumInstrumentationP95Ratio && parity?.status === 'PASSED' && samples?.status === 'PASSED', { status: instrumentationComparison?.status ?? null, observedP95Ratio: overhead?.observedRatio ?? null, maximumP95Ratio: normalizedPolicy.maximumInstrumentationP95Ratio }));
+		const pairs = instrumentationComparison?.pairs;
+		const completeTiming = Array.isArray(pairs) && pairs.length > 0 && pairs.every((pair) => pair.successful === true && Number.isFinite(pair.enabledDurationMs) && pair.enabledDurationMs >= 0 && Number.isFinite(pair.disabledDurationMs) && pair.disabledDurationMs > 0 && Number.isFinite(pair.durationRatio) && pair.durationRatio === pair.enabledDurationMs / pair.disabledDurationMs);
+		checks.push(check('INSTRUMENTATION_COMPARISON', 'all', completeTiming && instrumentationComparison?.status === 'PASSED' && overhead?.status === 'PASSED' && Number.isFinite(overhead?.observedRatio) && overhead.observedRatio <= normalizedPolicy.maximumInstrumentationP95Ratio && parity?.status === 'PASSED' && samples?.status === 'PASSED', { status: instrumentationComparison?.status ?? null, observedP95Ratio: overhead?.observedRatio ?? null, maximumP95Ratio: normalizedPolicy.maximumInstrumentationP95Ratio }));
 	}
 	const failed = checks.filter((entry) => entry.status === 'FAILED');
 	return Object.freeze({ schemaVersion: 1, status: failed.length === 0 ? 'PASSED' : 'FAILED', claimCertified: failed.length === 0, claim: { minimumSpeedup: normalizedPolicy.minimumSpeedup }, policy: normalizedPolicy, summary: { checkCount: checks.length, failedCount: failed.length }, checks: checks.map(Object.freeze) });
@@ -105,7 +110,9 @@ function normalizeEvidenceTrial(value, label) {
 	const tickP95Ms = finite(value.tickP95Ms ?? value.metrics?.result?.tick?.p95Ms ?? value.resources?.minecraftTick?.p95);
 	const actionMs = finite(value.spans?.actionMs ?? value.actionSpanMs ?? value.metrics?.result?.firstActionCommandAcceptanceGoalWallLatencyMs);
 	const voiceMs = finite(value.spans?.voiceMs ?? value.voiceFirstAudioMs ?? value.metrics?.latencyMs?.voiceFirstAudio?.p95);
-	const synthetic = typeof value.synthetic === 'boolean' ? value.synthetic : value.providerIdentity?.synthetic;
+	// A declared live mode or top-level label cannot override a synthetic adapter.
+	const synthetic = value.synthetic === true || value.providerIdentity?.synthetic === true
+		? true : typeof value.synthetic === 'boolean' ? value.synthetic : value.providerIdentity?.synthetic;
 	return { trialId, repetition, scenarioId, seed, agentLoad, sessionState, mode, providerProfile, evidenceSource, workloadConfigHash, sourceHash, status, factualSuccess, latencyMs, tickP95Ms, spanMs: { action: actionMs, voice: voiceMs }, synthetic };
 }
 
@@ -133,10 +140,12 @@ function workloadFingerprint(trial) {
 }
 
 function summarizeCell(trials) {
-	const completed = trials.filter((trial) => trial.status === 'PASSED' && trial.latencyMs !== null);
+	// Count completeness before discarding missing metrics; failures still count in factual parity.
+	const completed = trials.filter((trial) => trial.status === 'PASSED');
 	return {
-		sampleCount: completed.length,
-		latencyP95Ms: percentile(completed.map((trial) => trial.latencyMs)),
+		successfulCount: completed.length,
+		sampleCount: completed.filter((trial) => trial.latencyMs !== null).length,
+		latencyP95Ms: percentile(completed.map((trial) => trial.latencyMs).filter(Number.isFinite)),
 		factualSuccessRate: trials.length === 0 ? null : trials.filter((trial) => trial.status === 'PASSED' && trial.factualSuccess).length / trials.length,
 		tickSampleCount: completed.filter((trial) => trial.tickP95Ms !== null).length,
 		tickP95Ms: percentile(completed.map((trial) => trial.tickP95Ms).filter(Number.isFinite)),

@@ -26,3 +26,4 @@ const result = await runTask9SimulatorMatrix({
 	replayRecordings, replayPrompt,
 });
 process.stdout.write(`${JSON.stringify(result)}\n`);
+process.exitCode = result.status === 'PASSED' ? 0 : 1;

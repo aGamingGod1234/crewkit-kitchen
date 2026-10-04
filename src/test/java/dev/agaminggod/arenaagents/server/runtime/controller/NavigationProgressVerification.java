@@ -140,7 +140,7 @@ public final class NavigationProgressVerification {
 		assertTrue(ServerNavigationController.hasAirReserve(true, 61), "surface traversal retains a breathing reserve");
 		assertTrue(!ServerNavigationController.hasAirReserve(true, 60), "the exact air reserve ends water traversal");
 		assertTrue(ServerNavigationController.hasAirReserve(false, 0), "air reserve does not prevent grounded movement");
-		return 44;
+		return 44 + NavigationPreparationVerification.verify();
 	}
 
 	private static void assertBounded(double value) {

@@ -1,8 +1,7 @@
-import { extractDimension } from './explore-frontier.mjs';
+import { extractDimension, observationWorldId } from './explore-frontier.mjs';
 
 const MAX_PLACED = 16;
 const MAX_DROPPED = 16;
-const MAX_INVENTORY = 32;
 export const MAX_EVER_POSSESSED = 128;
 const WORKSTATION_BLOCKS = new Set([
 	'minecraft:crafting_table',
@@ -93,12 +92,12 @@ function ingestObservation(record, observation) {
 		const nextDeath = normalizeDeath(observation.death);
 		const lost = lostInventoryAtDeath(record, observation);
 		const isNewDeath = record.lastDeath === null || !sameDeath(record.lastDeath, nextDeath);
-		if (isNewDeath || record.inventory.length > 0) {
+		if (isNewDeath) {
 			record.lastLostInventory = lost;
+			record.inventory = [];
 		}
 		record.lastDeath = nextDeath;
 		record.everPossessed = uniqueIds([...record.everPossessed, ...lost.map((item) => item.itemId), ...record.lastLostInventory.map((item) => item.itemId)]);
-		record.inventory = [];
 		return;
 	}
 	const inventory = inventoryItems(observation);
@@ -108,13 +107,17 @@ function ingestObservation(record, observation) {
 	if (inventory.length > 0) {
 		record.everPossessed = uniqueIds([...record.everPossessed, ...inventory.map((item) => item.itemId)]);
 	}
-	if (alive) {
-		record.inventory = inventory;
+	if (alive && hasCurrentSection(observation, 'inventory')) {
 		if (inventory.length > 0 && record.lastLostInventory.length > 0) {
-			record.lastLostInventory = subtractRecovered(record.lastLostInventory, inventory);
+			// Only newly acquired counts reconcile a loss. Decoration and repeated
+			// observations of held stacks must not recover the same items twice.
+			const acquired = subtractRecovered(inventory, record.inventory);
+			record.lastLostInventory = subtractRecovered(record.lastLostInventory, acquired);
 		}
+		record.inventory = inventory;
 	}
 	if (dropped.length > 0) record.dropped = dropped;
+	record.placed = uncontradictedPlaced(record.placed, observation);
 	if (placed.length > 0) {
 		mergePlaced(record, placed);
 		record.everPossessed = uniqueIds([...record.everPossessed, ...placed.map((item) => item.blockId)]);
@@ -122,7 +125,7 @@ function ingestObservation(record, observation) {
 }
 
 function deriveRecovery(record, observation) {
-	const currentInventory = observation?.inventory !== undefined
+	const currentInventory = hasCurrentSection(observation, 'inventory')
 		? inventoryItems(observation)
 		: [...(record?.inventory ?? [])];
 	const currentDropped = droppedItems(observation);
@@ -131,9 +134,9 @@ function deriveRecovery(record, observation) {
 		? normalizeDeath(observation.death)
 		: record?.lastDeath ?? null;
 	const lastLostInventory = record?.lastLostInventory ?? [];
-	const rememberedPlaced = record?.placed ?? [];
+	const rememberedPlaced = uncontradictedPlaced(record?.placed ?? [], observation);
 	const alreadyHaveFacts = compactAlreadyHave([
-		...currentInventory.map((item) => ({ kind: 'inventory', ...item })),
+		...currentInventory.map((item) => ({ kind: 'inventory', ...item, ...(hasCurrentSection(observation, 'inventory') ? {} : { remembered: true }) })),
 		...currentDropped.map((item) => ({ kind: 'dropped', ...item })),
 		...currentPlaced.map((item) => ({ kind: 'placed', ...item })),
 		...rememberedPlaced
@@ -161,22 +164,24 @@ function attachRecovery(observation, recovery) {
 function inventoryItems(observation) {
 	const raw = observation?.inventory;
 	const items = Array.isArray(raw) ? raw : Array.isArray(raw?.items) ? raw.items : [];
-	return items.map(summarizeStack).filter(Boolean).slice(0, MAX_INVENTORY);
+	// Aggregate before accounting so slot moves and split stacks do not change
+	// recovery counts, and a full inventory does not silently lose its final slots.
+	const counts = new Map();
+	for (const item of items.map(summarizeStack).filter(Boolean)) counts.set(item.itemId, (counts.get(item.itemId) ?? 0) + item.count);
+	return [...counts].map(([itemId, count]) => Object.freeze({ itemId, count }));
 }
 
 function droppedItems(observation) {
-	const items = Array.isArray(observation?.items) ? observation.items : [];
-	const fromEntities = Array.isArray(observation?.entities)
+	const items = hasCurrentSection(observation, 'items') && Array.isArray(observation?.items) ? observation.items : [];
+	const fromEntities = hasCurrentSection(observation, 'entities') && Array.isArray(observation?.entities)
 		? observation.entities.filter((entity) => entity?.type === 'minecraft:item')
 		: [];
 	return [...items, ...fromEntities].map(summarizeDrop).filter(Boolean).slice(0, MAX_DROPPED);
 }
 
 function placedAssets(observation) {
-	const blocks = Array.isArray(observation?.blocks) ? observation.blocks : [];
-	const containers = Array.isArray(observation?.nearbyContainers) ? observation.nearbyContainers : [];
 	const placed = [];
-	for (const block of [...blocks, ...containers]) {
+	for (const block of currentBlocks(observation)) {
 		const blockId = typeof block?.blockId === 'string' ? block.blockId : null;
 		if (blockId === null || !WORKSTATION_BLOCKS.has(blockId)) continue;
 		if (!Number.isFinite(block.x) || !Number.isFinite(block.y) || !Number.isFinite(block.z)) continue;
@@ -186,9 +191,25 @@ function placedAssets(observation) {
 			y: block.y,
 			z: block.z,
 			dimension: extractDimension(observation),
+			worldId: observationWorldId(observation),
 		}));
 	}
 	return uniquePlaced(placed).slice(0, MAX_PLACED);
+}
+
+function hasCurrentSection(observation, section) {
+	return observation?.[section] !== undefined && !observation?.continuity?.rememberedSections?.includes(section);
+}
+
+function currentBlocks(observation) {
+	return ['blocks', 'nearbyContainers'].flatMap((section) => hasCurrentSection(observation, section) && Array.isArray(observation[section]) ? observation[section] : []);
+}
+
+function uncontradictedPlaced(placed, observation) {
+	const blocks = currentBlocks(observation);
+	return placed.filter((item) => !blocks.some((block) => typeof block?.blockId === 'string'
+		&& block.blockId !== item.blockId && block.x === item.x && block.y === item.y && block.z === item.z
+		&& item.dimension === extractDimension(observation) && item.worldId === observationWorldId(observation)));
 }
 
 function mergePlaced(record, placed) {
@@ -198,7 +219,8 @@ function mergePlaced(record, placed) {
 function summarizeStack(value) {
 	const itemId = typeof value?.itemId === 'string' && value.itemId.length > 0 ? value.itemId : null;
 	if (itemId === null || itemId === 'minecraft:air') return null;
-	const count = Number.isSafeInteger(value.count) && value.count > 0 ? value.count : 1;
+	if (value.count !== undefined && (!Number.isSafeInteger(value.count) || value.count <= 0)) return null;
+	const count = value.count ?? 1;
 	return Object.freeze({ itemId, count });
 }
 
@@ -234,11 +256,10 @@ function compactAlreadyHave(entries) {
 	const seen = new Set();
 	const result = [];
 	for (const entry of entries) {
-		const key = `${entry.kind}:${entry.itemId ?? entry.blockId}:${entry.dimension ?? ''}:${entry.x ?? ''}:${entry.y ?? ''}:${entry.z ?? ''}`;
+		const key = `${entry.kind}:${entry.itemId ?? entry.blockId}:${entry.worldId ?? ''}:${entry.dimension ?? ''}:${entry.x ?? ''}:${entry.y ?? ''}:${entry.z ?? ''}`;
 		if (seen.has(key)) continue;
 		seen.add(key);
 		result.push(Object.freeze({ ...entry }));
-		if (result.length >= MAX_INVENTORY + MAX_DROPPED + MAX_PLACED) break;
 	}
 	return Object.freeze(result);
 }
@@ -247,7 +268,7 @@ function uniquePlaced(entries) {
 	const seen = new Set();
 	const result = [];
 	for (const entry of entries) {
-		const key = `${entry.blockId}:${entry.dimension ?? ''}:${entry.x}:${entry.y}:${entry.z}`;
+		const key = `${entry.blockId}:${entry.worldId ?? ''}:${entry.dimension ?? ''}:${entry.x}:${entry.y}:${entry.z}`;
 		if (seen.has(key)) continue;
 		seen.add(key);
 		result.push(entry);
@@ -257,11 +278,13 @@ function uniquePlaced(entries) {
 
 function samePlaced(left, right) {
 	return left.blockId === right.blockId
+		&& left.worldId === right.worldId
 		&& left.x === right.x && left.y === right.y && left.z === right.z
 		&& (left.dimension ?? 'minecraft:overworld') === (right.dimension ?? 'minecraft:overworld');
 }
 
 function placedInCurrentDimension(item, observation) {
+	if ((observation?.world?.worldId !== undefined || observation?.worldId !== undefined) && item.worldId !== observationWorldId(observation)) return false;
 	if (!observationHasDimension(observation)) return true;
 	return (item.dimension ?? 'minecraft:overworld') === extractDimension(observation);
 }
@@ -275,7 +298,7 @@ function lostInventoryAtDeath(record, observation) {
 	if (observation.lastLiveInventory !== undefined) {
 		return inventoryItems({ inventory: observation.lastLiveInventory });
 	}
-	return record.inventory.slice(0, MAX_INVENTORY);
+	return record.inventory.slice();
 }
 
 function sameDeath(left, right) {
@@ -316,7 +339,7 @@ function subtractRecovered(lost, recovered) {
 			leftover -= take;
 		}
 	}
-	return remaining.filter((item) => item.count > 0).slice(0, MAX_INVENTORY).map((item) => Object.freeze(item));
+	return remaining.filter((item) => item.count > 0).map((item) => Object.freeze(item));
 }
 
 function emptyRecord(goalRevision, lastDeath = null) {

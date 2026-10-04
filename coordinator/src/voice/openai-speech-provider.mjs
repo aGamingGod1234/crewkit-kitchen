@@ -22,6 +22,7 @@ export class OpenAiTtsProvider {
 		this.#model = requireModel(model);
 	}
 	cacheNamespace() { return `openai/${this.#model}/profiles-v1`; }
+	supportsTone(tone) { return Object.hasOwn(TONES, tone); }
 
 	async synthesize({ text, voiceId, speed = 1, tone = 'neutral', signal } = {}) {
 		if (typeof text !== 'string' || text.trim() === '' || [...text].length > 280) throw new TypeError('text must contain 1 to 280 Unicode code points');

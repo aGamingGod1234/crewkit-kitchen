@@ -1,5 +1,7 @@
 package dev.agaminggod.arenaagents.server.bridge;
 
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
@@ -9,6 +11,7 @@ import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.protocol.ActionType;
 import dev.agaminggod.arenaagents.protocol.ProtocolCodec;
 import dev.agaminggod.arenaagents.server.runtime.ActionProvenance;
+import dev.agaminggod.arenaagents.server.runtime.ServerActionObservation;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionRequest;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionResult;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionState;
@@ -33,6 +36,7 @@ import java.util.zip.CRC32C;
 final class DurableActionJournal implements AutoCloseable {
 	static final int MAX_ENTRIES = 4_096;
 	private static final int SCHEMA_VERSION = 1;
+	private static final Gson OBSERVATION_CODEC = new GsonBuilder().serializeNulls().create();
 	private static final byte[] LOG_HEADER = "AAAJNL2\n".getBytes(StandardCharsets.US_ASCII);
 	private static final int FRAME_HEADER_BYTES = Integer.BYTES * 2;
 	private static final int MAX_FRAME_BYTES = 64 * 1024 * 1024;
@@ -622,7 +626,8 @@ final class DurableActionJournal implements AutoCloseable {
 		);
 	}
 
-	private static JsonObject encodeResult(ServerActionResult result) {
+	/** One canonical representation for durable replay and retired-result identity. */
+	static JsonObject encodeResult(ServerActionResult result) {
 		JsonObject encoded = new JsonObject();
 		encoded.addProperty("agentId", result.agentId().toString());
 		encoded.addProperty("goalRevision", result.goalRevision());
@@ -636,6 +641,9 @@ final class DurableActionJournal implements AutoCloseable {
 		encoded.addProperty("observedAtEpochMs", result.observedAtEpochMs());
 		encoded.addProperty("executionStarted", result.executionStarted());
 		encoded.addProperty("physicalAttempted", result.physicalAttempted());
+		if (result.actionObservation() != null) {
+			encoded.add("actionObservation", OBSERVATION_CODEC.toJsonTree(result.actionObservation()));
+		}
 		return encoded;
 	}
 
@@ -649,8 +657,19 @@ final class DurableActionJournal implements AutoCloseable {
 				ServerActionState.valueOf(requiredString(encoded, "state")), requiredString(encoded, "reasonCode"),
 				requiredString(encoded, "message"), requiredLong(encoded, "elapsedMs"),
 				requiredLong(encoded, "observedAtEpochMs"), requiredBoolean(encoded, "executionStarted"),
-				requiredBoolean(encoded, "physicalAttempted")
+				requiredBoolean(encoded, "physicalAttempted"),
+				encoded.has("actionObservation") ? decodeObservation(requiredObject(encoded, "actionObservation")) : null
 		);
+	}
+
+	private static ServerActionObservation decodeObservation(JsonObject encoded) {
+		ServerActionObservation observation = OBSERVATION_CODEC.fromJson(encoded, ServerActionObservation.class);
+		// Gson invokes the record constructors for semantic validation. Re-encoding also
+		// rejects missing fields, primitive defaults, and type coercion in a damaged snapshot.
+		if (!OBSERVATION_CODEC.toJsonTree(observation).equals(encoded)) {
+			throw corrupt("actionObservation must contain a complete, correctly typed snapshot");
+		}
+		return observation;
 	}
 
 	private static void verifyResult(ServerActionRequest request, ServerActionResult result) {

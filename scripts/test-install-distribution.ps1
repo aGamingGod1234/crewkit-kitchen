@@ -12,7 +12,49 @@ function File-Snapshot([string] $Root) {
 	return @(Get-ChildItem -LiteralPath $Root -File -Recurse -Force |
 		Where-Object { $_.Name -notlike '*.lock' -and $_.FullName -notmatch '[\\/]distribution-backups[\\/]' } |
 		Sort-Object FullName |
-		ForEach-Object { $_.FullName.Substring($Root.Length + 1) + ':' + (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash })
+		ForEach-Object { $_.FullName.Substring($Root.Length + 1).Replace('\', '/') + ':' + (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash })
+}
+
+function Assert-GenerationStateBackupRotation([string[]] $Before, [string[]] $After, [string] $Message) {
+	$state = @($Before | Where-Object { $_ -cmatch '^runtime/coordinator-generation\.properties:[A-F0-9]{64}$' })
+	$oldBackups = @($Before | Where-Object { $_ -clike 'generation-state-backups/*' })
+	$backups = @($After | Where-Object { $_ -clike 'generation-state-backups/*' })
+	foreach ($backup in $oldBackups) {
+		if ($backup -cnotmatch '^generation-state-backups/state-[a-f0-9]{32}\.properties:[A-F0-9]{64}$') { throw "$Message Unexpected prior state backup: $backup" }
+	}
+	if ($state.Count -eq 0) {
+		if ($backups.Count -ne 0) { throw "$Message An obsolete generation state backup remains." }
+		return
+	}
+	if ($state.Count -ne 1 -or $backups.Count -ne 1 -or
+		$backups[0] -cnotmatch '^generation-state-backups/state-[a-f0-9]{32}\.properties:[A-F0-9]{64}$' -or
+		$backups[0].Split(':')[1] -cne $state[0].Split(':')[1]) {
+		throw "$Message Expected exactly one byte-identical prior generation state backup."
+	}
+	$oldPaths = @($oldBackups | ForEach-Object { $_.Split(':')[0] })
+	if ($backups[0].Split(':')[0] -cin $oldPaths) { throw "$Message An obsolete generation state backup was retained." }
+}
+
+function Assert-RuntimeRollbackSnapshot([string[]] $Before, [string[]] $After, [string] $Message) {
+	# The inner runtime install commits before the outer installer can fail. It
+	# rotates old state backups, and outer rollback retains only this transaction's
+	# byte-identical state copy for retries. All other original files must match.
+	Assert-GenerationStateBackupRotation $Before $After $Message
+	$oldBackups = @($Before | Where-Object { $_ -clike 'generation-state-backups/*' })
+	$newBackups = @($After | Where-Object { $_ -clike 'generation-state-backups/*' })
+	if (@(Compare-Object @($Before | Where-Object { $_ -cnotin $oldBackups }) @($After | Where-Object { $_ -cnotin $newBackups })).Count -ne 0) { throw $Message }
+}
+
+function Assert-TransactionCleanup([string] $Root, [string] $Profiles) {
+	foreach ($entry in Get-ChildItem -LiteralPath $Root -Recurse -Force) {
+		$relative = $entry.FullName.Substring($Root.Length + 1).Replace('\', '/')
+		if ($relative -cmatch '^\.arena-runtime-transaction\.json(\.tmp)?$|^\.distribution-staging-|^(coordinator|coordinator\.last-known-good|runtime/toolchains/node|runtime/coordinator-generation\.properties)\.staging-') {
+			throw "Installation transaction artifact remains: $relative"
+		}
+	}
+	if (@(Get-ChildItem -LiteralPath (Split-Path -Parent $Profiles) -File -Filter ((Split-Path -Leaf $Profiles) + '.arena-agents-*.tmp')).Count -ne 0) {
+		throw 'Launcher profile staging file remains.'
+	}
 }
 
 $package = (Resolve-Path -LiteralPath $PackageRoot).Path
@@ -22,7 +64,9 @@ foreach ($line in Get-Content -LiteralPath (Join-Path $package 'distribution.pro
 	$separator = $line.IndexOf('=')
 	if ($separator -gt 0) { $metadata[$line.Substring(0, $separator)] = $line.Substring($separator + 1) }
 }
-$testRoot = Join-Path ([IO.Path]::GetTempPath()) ("arena-package-install-test-" + [Guid]::NewGuid().ToString('N'))
+# Keep nested backup paths below Windows PowerShell 5.1's legacy path limit.
+# Expand a CI TEMP 8.3 alias before deriving file-snapshot prefixes.
+$testRoot = [IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetTempPath()) ("pkg-" + [Guid]::NewGuid().ToString('N'))))
 $appData = Join-Path $testRoot 'appdata'
 $game = Join-Path $testRoot 'game'
 $launcherProfiles = Join-Path $appData '.minecraft\launcher_profiles.json'
@@ -80,8 +124,9 @@ try {
 		catch { if ($_.Exception.Message -notmatch 'Injected failure') { throw }; $failed = $true }
 		if (-not $failed) { throw "Failure injection did not occur: $failurePoint" }
 		if (@(Compare-Object $modsBefore (File-Snapshot $mods)).Count -ne 0) { throw "Mod rollback failed at $failurePoint." }
-		if (@(Compare-Object $runtimeBefore (File-Snapshot $installedRoot)).Count -ne 0) { throw "Runtime rollback failed at $failurePoint." }
+		Assert-RuntimeRollbackSnapshot $runtimeBefore (File-Snapshot $installedRoot) "Runtime rollback failed at $failurePoint."
 		if ((Get-FileHash -LiteralPath $launcherProfiles -Algorithm SHA256).Hash -ne $profilesBefore) { throw "Profile changed at $failurePoint." }
+		Assert-TransactionCleanup $installedRoot $launcherProfiles
 	}
 
 	$profileDocument = Get-Content -LiteralPath $launcherProfiles -Raw | ConvertFrom-Json
@@ -95,10 +140,18 @@ try {
 	catch { if ($_.Exception.Message -notmatch 'Injected failure') { throw }; $failed = $true }
 	if (-not $failed) { throw 'Failure injection did not occur: AfterProfilePromotion' }
 	if (@(Compare-Object $modsBefore (File-Snapshot $mods)).Count -ne 0) { throw 'Mod rollback failed after profile promotion.' }
-	if (@(Compare-Object $runtimeBefore (File-Snapshot $installedRoot)).Count -ne 0) { throw 'Runtime rollback failed after profile promotion.' }
+	Assert-RuntimeRollbackSnapshot $runtimeBefore (File-Snapshot $installedRoot) 'Runtime rollback failed after profile promotion.'
 	if ((Get-FileHash -LiteralPath $launcherProfiles -Algorithm SHA256).Hash -ne $profilesBefore) { throw 'Profile rollback failed after profile promotion.' }
+	Assert-TransactionCleanup $installedRoot $launcherProfiles
 
-	Write-Host 'PASS: packaged install removes stale core and voice JARs, and rolls back runtime, mods, and launcher profile together'
+	$runtimeBefore = File-Snapshot $installedRoot
+	& $installer -JavaPath $JavaPath -LauncherProfiles $launcherProfiles -GameDirectory $game
+	Assert-GenerationStateBackupRotation $runtimeBefore (File-Snapshot $installedRoot) 'Successful retry failed to prune obsolete generation state backups.'
+	Assert-TransactionCleanup $installedRoot $launcherProfiles
+	$profileDocument = Get-Content -LiteralPath $launcherProfiles -Raw | ConvertFrom-Json
+	if ($profileDocument.profiles.'arena-agents-modpack'.javaArgs -match '-Dstale=true') { throw 'Successful retry did not update the launcher profile.' }
+
+	Write-Host 'PASS: packaged install removes stale core and voice JARs, rolls back runtime, mods, and launcher profile together, and prunes retry state backups'
 } finally {
 	$env:APPDATA = $previousAppData
 	if (Test-Path -LiteralPath $testRoot) { Remove-Item -LiteralPath $testRoot -Recurse -Force }

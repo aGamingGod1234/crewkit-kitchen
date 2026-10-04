@@ -41,6 +41,7 @@ export class NativeToolRuntime {
 	#programRuns = new Map();
 	#programResults = new Map();
 	#onProgramEvent;
+	#onWorkStarted;
 	#planningLeadTime;
 	#sweeps = new Map();
 	#sessionId;
@@ -66,6 +67,7 @@ export class NativeToolRuntime {
 		memoryObservation = null,
 		programExecutor = null,
 		onProgramEvent = () => {},
+		onWorkStarted = () => () => {},
 		planningLeadTime = () => null,
 		sessionId = randomUUID(),
 		occupancy = new ExplorationOccupancy(),
@@ -106,6 +108,8 @@ export class NativeToolRuntime {
 		this.#programExecutor = programExecutor ?? new NativeProgramExecutor({ sessionId });
 		if (typeof onProgramEvent !== 'function') throw new TypeError('onProgramEvent must be a function');
 		this.#onProgramEvent = onProgramEvent;
+		if (typeof onWorkStarted !== 'function') throw new TypeError('onWorkStarted must be a function');
+		this.#onWorkStarted = onWorkStarted;
 		if (typeof planningLeadTime !== 'function') throw new TypeError('planningLeadTime must be a function');
 		this.#planningLeadTime = planningLeadTime;
 		this.#sessionId = sessionId.length <= 36 ? sessionId : createHash('sha256').update(sessionId).digest('hex').slice(0, 32);
@@ -117,7 +121,7 @@ export class NativeToolRuntime {
 		let pending = this.#memoryLoads.get(agentId);
 		if (pending === undefined) {
 			pending = Promise.resolve().then(() => this.#occupancy.load(agentId)).then(() => {
-				for (const observation of this.#pendingSpatial.get(agentId) ?? []) this.#occupancy.ingest(agentId, observation);
+				for (const observation of this.#pendingSpatial.get(agentId) ?? []) this.#occupancy.ingest(agentId, observation, { snapshot: false });
 				this.#pendingSpatial.delete(agentId);
 				this.#memoryReady.add(agentId);
 			});
@@ -128,7 +132,7 @@ export class NativeToolRuntime {
 	}
 
 	#rememberSpatial(agentId, observation) {
-		if (this.#memoryReady.has(agentId)) { this.#occupancy.ingest(agentId, observation); return; }
+		if (this.#memoryReady.has(agentId)) { this.#occupancy.ingest(agentId, observation, { snapshot: false }); return; }
 		const queued = this.#pendingSpatial.get(agentId) ?? [];
 		queued.push(observation);
 		this.#pendingSpatial.set(agentId, queued.slice(-32));
@@ -190,10 +194,10 @@ export class NativeToolRuntime {
 				goalRevision: record.goalRevision,
 			});
 		}
-		if (!reuseWorldFacts) {
-			this.#recovery.remember(record.agentId, record.goalRevision, raw);
-			this.#rememberSpatial(record.agentId, storedObservation);
-		}
+		if (!reuseWorldFacts) this.#recovery.remember(record.agentId, record.goalRevision, raw);
+		// A quiet heartbeat is a new sighting. Ingest only its supplied spatial
+		// facts (without a snapshot), so absent identities/properties keep their age.
+		this.#rememberSpatial(record.agentId, storedObservation);
 		this.#observations.set(record.agentId, {
 			goalRevision: record.goalRevision,
 			eventSequence: storedSequence,
@@ -257,9 +261,10 @@ export class NativeToolRuntime {
 		const ownedSource = source === cached || source === live || isSparseDeathObservation(observation)
 			? structuredClone(source)
 			: source;
-		if (hasDurableObservationFacts(observation) && !isSparseDeathObservation(observation)) {
-			this.#recovery.remember(record.agentId, record.goalRevision, observation);
-		} else if (isSparseDeathObservation(observation) && hasDurableObservationFacts(source)) {
+		// Model input can await memory while newer observations arrive. Rendering
+		// that older view must not rewind the gain-accounting inventory baseline.
+		// Direct sparse death notifications still capture the last live inventory.
+		if (isSparseDeathObservation(observation) && hasDurableObservationFacts(source)) {
 			this.#recovery.remember(record.agentId, record.goalRevision, source);
 		}
 		return composeTwoCallView(ownedSource, this.#recovery.snapshot(record.agentId, ownedSource), {
@@ -419,6 +424,9 @@ export class NativeToolRuntime {
 		const attentionResult = new Promise(done => { detach = done; });
 		const run = { epoch, request, goalRevision: record.goalRevision, programId: `native-program-${this.#sessionId}-${++this.#sequence}`,
 			state: 'PREPARING', settled: false, result, resolve, reject, detach, detached: request.tool.background === true, record, deadlineEpochMs: null };
+		// The runtime owns this lease even after a background handle or advisory
+		// returns to the provider. Preparation and handoff sampling are bounded too.
+		run.releaseWork = this.#onWorkStarted(record, 'program', { timeoutMs: request.tool.timeoutMs ?? 30_000, programId: run.programId });
 		return { run, attentionResult };
 	}
 
@@ -519,6 +527,8 @@ export class NativeToolRuntime {
 			this.#programRuns.delete(agentId);
 			if (this.#executionEpoch(agentId) === run.epoch) this.#programResults.set(agentId, result);
 		}
+		// Acquire successor ownership above before releasing the predecessor.
+		run.releaseWork();
 		if (error !== null && run.request.tool.background !== true) run.reject(error);
 		else run.resolve(result);
 		if (!handoff && run.detached && this.#executionEpoch(agentId) === run.epoch) this.#programEvent(run, { event: 'program_ended', result });
@@ -577,6 +587,21 @@ export class NativeToolRuntime {
 		const result = this.#programResults.get(record.agentId);
 		if (result?.goalRevision === record.goalRevision && (programId === undefined || programId === result.programId)) return structuredClone(result);
 		return { state: programId === undefined ? 'IDLE' : 'UNKNOWN_PROGRAM', goalRevision: record.goalRevision, ...(programId === undefined ? {} : { programId }) };
+	}
+
+	async expireProgram(record, programId) {
+		const run = this.#programRuns.get(record.agentId);
+		if (run?.goalRevision !== record.goalRevision || run.programId !== programId || run.epoch !== this.#executionEpoch(record.agentId)) return null;
+		run.pendingSuccessor = null;
+		run.queueAdmission = (run.queueAdmission ?? 0) + 1;
+		if (run.state === 'PREPARING') {
+			this.#settleProgram(record.agentId, run, { state: 'TIMED_OUT', reasonCode: 'PROGRAM_DEADLINE' });
+		} else if (typeof this.#programExecutor.expire === 'function') {
+			await this.#programExecutor.expire(record, programId);
+		} else {
+			await this.#programExecutor.cancel(record.agentId, 'PROGRAM_DEADLINE');
+		}
+		return run.result;
 	}
 
 	async #cancelProgram(record, tool) {
@@ -884,6 +909,8 @@ export class NativeToolRuntime {
 	}
 
 	async #executeAction(request, record, tool, sequenceIndex = null, waitForCompletion = true, programCommand = null, sequenceFinishToken = null) {
+		// All native routes, including replacement and authored programs, meet here.
+		tool = constrainNavigationAction(tool, record.currentGoalSpec);
 		const finishReservation = this.#sequenceFinishReservations.get(record.agentId);
 		if (finishReservation !== undefined && finishReservation !== sequenceFinishToken) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'A finishing native sequence owns the player');
 		const executionEpoch = this.#executionEpoch(record.agentId);
@@ -929,6 +956,10 @@ export class NativeToolRuntime {
 		const result = new Promise((resolve, reject) => { resolveAction = resolve; rejectAction = reject; });
 		result.catch(() => {});
 		const active = { actionId, goalRevision: record.goalRevision, actionType: tool.actionType, arguments: structuredClone(tool.arguments), worldId: this.#worldId(record), result, resolve: resolveAction, reject: rejectAction, dispatched: false, ...(programCommand === null ? {} : { engineActionId: programCommand.actionId }) };
+		if (!waitForCompletion) {
+			const releaseWork = this.#onWorkStarted(record, 'action');
+			void result.then(releaseWork, releaseWork);
+		}
 		this.#actions.set(record.agentId, active);
 		const failPublication = async (error) => {
 			if (this.#actions.get(record.agentId) === active) this.#actions.delete(record.agentId);
@@ -1078,6 +1109,7 @@ export class NativeToolRuntime {
 	async dispose(agentId, reason = 'disposed') {
 		this.#executionEpochs.set(agentId, this.#executionEpoch(agentId) + 1);
 		const program = this.#programRuns.get(agentId);
+		program?.releaseWork();
 		if (program?.state === 'PREPARING') this.#settleProgram(agentId, program, { state: 'CANCELLED', reasonCode: 'NATIVE_PROGRAM_CANCELLED' }, codedError('NATIVE_PROGRAM_CANCELLED', 'Program preparation outlived its lifecycle'));
 		this.#programRuns.delete(agentId);
 		this.#programResults.delete(agentId);

@@ -79,6 +79,14 @@ public record AgentRecord(
 		return copy(AgentLifecycleState.DEAD, currentGoal, goalRevision, queuedGoals, entityUuid, entityLocation, lastSummary, inventorySnapshot, automaticProgress, respawnPolicy, Optional.of(Objects.requireNonNull(snapshot, "snapshot must not be null")), nowEpochMs, lastError);
 	}
 
+	/** Changes goal intent without claiming that physical respawn has happened. */
+	public AgentRecord withRespawnContinuation(boolean resume, long nowEpochMs) {
+		if (state != AgentLifecycleState.DEAD) {
+			throw new AgentDomainException("INVALID_AGENT_STATE", "Respawn continuation requires a dead agent");
+		}
+		return copy(state, resume, currentGoal, goalRevision, queuedGoals, entityUuid, entityLocation, lastSummary, inventorySnapshot, automaticProgress, respawnPolicy, deathSnapshot, nowEpochMs, lastError);
+	}
+
 	public AgentRecord withRecovery(String revisedSummary, String revisedInventorySnapshot, long nowEpochMs) {
 		return copy(state, currentGoal, goalRevision, queuedGoals, entityUuid, entityLocation, revisedSummary, revisedInventorySnapshot, automaticProgress, respawnPolicy, deathSnapshot, nowEpochMs, lastError);
 	}

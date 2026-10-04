@@ -2,6 +2,7 @@ package dev.agaminggod.arenaagents.server.voice;
 
 import java.util.Locale;
 import java.util.Objects;
+import java.util.Set;
 
 /** Persistent voice settings for one skit agent. */
 public record VoiceProfile(String profileId, String tone, double speed, int radius) {
@@ -9,6 +10,8 @@ public record VoiceProfile(String profileId, String tone, double speed, int radi
 	public static final String DEFAULT_TONE = "neutral";
 	public static final double DEFAULT_SPEED = 1.0D;
 	public static final int DEFAULT_RADIUS = 48;
+	private static final Set<String> SUPPORTED_TONES = Set.of(
+			"neutral", "warm", "excited", "serious", "dramatic", "whisper", "robotic", "angry");
 
 	public VoiceProfile(String profileId) {
 		this(profileId, DEFAULT_TONE, DEFAULT_SPEED, DEFAULT_RADIUS);
@@ -16,6 +19,13 @@ public record VoiceProfile(String profileId, String tone, double speed, int radi
 
 	public static VoiceProfile defaults() {
 		return new VoiceProfile(DEFAULT_PROFILE_ID, DEFAULT_TONE, DEFAULT_SPEED, DEFAULT_RADIUS);
+	}
+
+	/** Validate new authoring without making older persisted profile records unreadable. */
+	public static String requireSupportedTone(String tone) {
+		String normalized = requireToken(tone, "tone", 32).toLowerCase(Locale.ROOT);
+		if (!SUPPORTED_TONES.contains(normalized)) throw new IllegalArgumentException("Unsupported delivery tone: " + normalized);
+		return normalized;
 	}
 
 	public VoiceProfile {

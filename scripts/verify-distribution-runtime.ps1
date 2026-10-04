@@ -4,6 +4,8 @@ param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+& (Join-Path $PSScriptRoot 'verify-installer-transactions.ps1')
+
 $helperPath = Join-Path $PSScriptRoot 'distribution-runtime.ps1'
 if (-not (Test-Path -LiteralPath $helperPath -PathType Leaf)) {
 	throw "Missing coordinator runtime deployment helper: $helperPath"

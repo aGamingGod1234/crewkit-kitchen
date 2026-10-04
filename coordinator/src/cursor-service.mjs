@@ -503,6 +503,7 @@ function runChild(launch, { spawn, terminate, planningTimeoutMs, stdoutLimitByte
 	}
 	let cancellationError = null;
 	let termination = null;
+	let settled = false;
 	let timer;
 	let settle;
 	const stdout = [];
@@ -510,26 +511,38 @@ function runChild(launch, { spawn, terminate, planningTimeoutMs, stdoutLimitByte
 	let stdoutBytes = 0;
 	let stderrBytes = 0;
 	const promise = new Promise((resolve, reject) => {
-		let settled = false;
 		settle = (error, value) => {
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
+			child.stdout?.off('data', onStdout);
+			child.stderr?.off('data', onStderr);
 			if (error === null) resolve(value); else reject(error);
 		};
 		const overflow = (stream, limit) => { void cancel(new AcpProtocolError('OUTPUT_LIMIT_EXCEEDED', `Cursor ${stream} exceeded ${limit} bytes`)); };
-		child.stdout?.on('data', (chunkValue) => {
+		const onStdout = (chunkValue) => {
 			const chunk = Buffer.from(chunkValue); stdoutBytes += chunk.length;
 			if (stdoutBytes > stdoutLimitBytes) { overflow('stdout', stdoutLimitBytes); return; }
 			stdout.push(chunk);
-		});
-		child.stderr?.on('data', (chunkValue) => {
+		};
+		const onStderr = (chunkValue) => {
 			const chunk = Buffer.from(chunkValue); stderrBytes += chunk.length;
 			if (stderrBytes > stderrLimitBytes) { overflow('stderr', stderrLimitBytes); return; }
 			stderr.push(chunk);
-		});
-		child.once('error', (error) => settle(new AcpProtocolError('SPAWN_FAILED', `Could not start Cursor CLI: ${error.message}`, { cause: error })));
+		};
+		const onError = (error) => settle(new AcpProtocolError('SPAWN_FAILED', `Could not start Cursor CLI: ${error.message}`, { cause: error }));
+		const onStdinError = (error) => {
+			void cancel(new AcpProtocolError('PROVIDER_UNAVAILABLE', `Could not write to Cursor CLI stdin: ${error.message}`, { cause: error }));
+		};
+		child.stdout?.on('data', onStdout);
+		child.stderr?.on('data', onStderr);
+		child.on('error', onError);
+		// A buffered write can fail during cancellation. Keep the error handlers until
+		// child close, when Node has also closed its stdio streams.
+		child.stdin?.on('error', onStdinError);
 		child.once('close', (exitCode, signalCode) => {
+			child.off('error', onError);
+			child.stdin?.off('error', onStdinError);
 			if (cancellationError !== null) { settle(cancellationError); return; }
 			if (exitCode !== 0) {
 				settle(new AcpProtocolError('PROVIDER_UNAVAILABLE', `Cursor CLI exited with code ${String(exitCode)} and signal ${String(signalCode)} [stderr=${excerpt(Buffer.concat(stderr).toString('utf8'))}]`));
@@ -538,14 +551,18 @@ function runChild(launch, { spawn, terminate, planningTimeoutMs, stdoutLimitByte
 			settle(null, Buffer.concat(stdout).toString('utf8'));
 		});
 		timer = setTimeout(() => { void cancel(new AcpProtocolError('PLANNING_TIMEOUT', `Cursor planning timed out after ${planningTimeoutMs} ms`)); }, planningTimeoutMs);
-		if (stdinText === null) child.stdin?.end?.();
-		else child.stdin?.end?.(stdinText, 'utf8');
+		try {
+			if (stdinText === null) child.stdin?.end?.();
+			else child.stdin?.end?.(stdinText, 'utf8');
+		} catch (error) { onStdinError(error); }
 	});
 
 	async function cancel(error) {
+		if (settled) return termination;
 		if (cancellationError === null) cancellationError = error;
 		if (termination === null) {
-			termination = Promise.resolve(terminate(child)).catch((terminationError) => {
+			// Install the shared promise before termination can synchronously emit events.
+			termination = Promise.resolve().then(() => terminate(child)).catch((terminationError) => {
 				settle(new AcpProtocolError('PROCESS_TERMINATION_FAILED', `Could not terminate Cursor CLI: ${terminationError.message}`, { cause: terminationError }));
 			});
 		}

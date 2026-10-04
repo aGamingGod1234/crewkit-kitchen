@@ -8,6 +8,10 @@ import de.maxhenkel.voicechat.api.opus.OpusEncoder;
 import de.maxhenkel.voicechat.api.ServerPlayer;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Field;
+import java.util.concurrent.CompletableFuture;
+import dev.agaminggod.arenaagents.server.voice.VoiceReceipt;
+import dev.agaminggod.arenaagents.server.voice.VoiceRequest;
 import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.IdentityHashMap;
@@ -31,6 +35,7 @@ final class SyntheticPlayerVoiceTransportVerification {
 
 	static int verify() throws Exception {
 		int assertions = 0;
+		assertions += ActiveRebindRegression.verify();
 		assertions += verifyConnectedSpeakingAndSilentLifecycle();
 		assertions += verifyRespawnRebindsExactlyOneSender();
 		assertions += verifyVoiceServerRestartRebindsTheSamePlayer();
@@ -416,4 +421,193 @@ final class SyntheticPlayerVoiceTransportVerification {
 			throw new AssertionError(label + ": expected=" + expected + " actual=" + actual);
 		}
 	}
+
+	// Gate the second encode so rebind wins before a worker can report failure.
+	private static final class ActiveRebindRegression {
+		static final AgentId AGENT = new AgentId(UUID.fromString("00000000-0000-0000-0000-000000000102"));
+		static final UUID ENTITY = UUID.fromString("00000000-0000-0000-0000-000000001102");
+
+		static int verify() throws Exception {
+			run("api-swap", true);
+			run("sender-invalid", true);
+			run("unchanged-refresh", false);
+			run("packet-rejection", false);
+			run("intentional-stop", false);
+			run("identity-change", false);
+			return 6;
+		}
+
+		static void run(String scenario, boolean expectDegraded) throws Exception {
+			FakeApi first = new FakeApi();
+			FakeApi replacement = new FakeApi();
+			AtomicReference<VoicechatServerApi> current = new AtomicReference<>(first.api);
+			SyntheticPlayerVoiceTransport transport = new SyntheticPlayerVoiceTransport(current::get);
+			VoicePlaybackCoordinator coordinator = new VoicePlaybackCoordinator(
+					ignored -> CompletableFuture.completedFuture(new short[2880]), Runnable::run,
+					transport, ignored -> {}, ignored -> {});
+			ReceiptWatch watch = new ReceiptWatch();
+			Thread worker = null;
+			try {
+				coordinator.registerAgent(AGENT, ENTITY);
+				transport.registerAgent(AGENT, ENTITY);
+				CompletableFuture<VoiceReceipt> result = coordinator.speak(request(1)).toCompletableFuture();
+				watch.observe(result);
+				Encoder encoder = first.encoders.getFirst();
+				require(encoder.secondEncode.await(2, TimeUnit.SECONDS), scenario + ": second frame reached");
+				require(first.senders.getFirst().packets.get() == 1, "one frame already accepted");
+				Object playback = map(coordinator, "players").get(AGENT);
+				worker = (Thread) field(playback, "worker");
+
+				switch (scenario) {
+					case "api-swap" -> {
+						current.set(replacement.api);
+						transport.registerAgent(AGENT, ENTITY); // SimpleVoiceChatSubsystem.refreshAgent body
+					}
+					case "sender-invalid" -> {
+						first.senders.getFirst().canSend = false;
+						transport.registerAgent(AGENT, ENTITY);
+					}
+					case "unchanged-refresh" -> transport.registerAgent(AGENT, ENTITY);
+					case "packet-rejection" -> first.senders.getFirst().acceptPackets = false;
+					case "intentional-stop" -> coordinator.stop(AGENT);
+					case "identity-change" -> {
+						UUID changed = UUID.fromString("00000000-0000-0000-0000-000000001103");
+						coordinator.registerAgent(AGENT, changed);
+						transport.registerAgent(AGENT, changed);
+					}
+					default -> throw new AssertionError(scenario);
+				}
+				encoder.release.countDown();
+				worker.join(2000);
+				require(!worker.isAlive(), scenario + ": worker ended");
+				require(encoder.closed, scenario + ": encoder closed");
+
+				if (expectDegraded) {
+					VoiceReceipt receipt = result.get(2, TimeUnit.SECONDS);
+					require(receipt.status() == VoiceReceipt.Status.DEGRADED_TO_TEXT, scenario + ": interrupted receipt degrades");
+					require(watch.completed.get() == 1 && watch.fallback.get() == 1, "one fallback callback");
+					require(map(coordinator, "pending").isEmpty() && map(coordinator, "players").isEmpty(), "failed playback releases ownership");
+					require(first.senders.getFirst().packets.get() == 1, "old utterance truncated after first frame");
+					require(!first.senders.getFirst().registered, "old sender unregistered");
+					FakeApi active = scenario.equals("api-swap") ? replacement : first;
+					active.gateNewEncoders = false;
+					VoiceReceipt next = coordinator.speak(request(2)).toCompletableFuture().get(2, TimeUnit.SECONDS);
+					require(next.status() == VoiceReceipt.Status.PLAYED, "subsequent speech works");
+					require(result.join() == receipt, "later speech preserves settled failure");
+					require(watch.completed.get() == 1 && watch.fallback.get() == 1, "fallback remains exactly once");
+					require(map(coordinator, "pending").isEmpty() && map(coordinator, "players").isEmpty(), "success releases ownership");
+				} else {
+					VoiceReceipt receipt = result.get(2, TimeUnit.SECONDS);
+					VoiceReceipt.Status expected = switch (scenario) {
+						case "unchanged-refresh" -> VoiceReceipt.Status.PLAYED;
+						case "packet-rejection" -> VoiceReceipt.Status.DEGRADED_TO_TEXT;
+						default -> VoiceReceipt.Status.CANCELLED;
+					};
+					require(receipt.status() == expected, scenario + ": expected " + expected);
+					require(watch.completed.get() == 1, "control settles exactly once");
+					int fallbackExpected = scenario.equals("packet-rejection") ? 1 : 0;
+					require(watch.fallback.get() == fallbackExpected, "control fallback contract");
+					require(map(coordinator, "pending").isEmpty() && map(coordinator, "players").isEmpty(), "control clears ownership");
+					System.out.println(scenario + ": receipt=" + receipt.status() + "; callbacks=1; fallback=" + watch.fallback.get() + "; pending=0; players=0");
+				}
+			} finally {
+				first.encoders.forEach(e -> e.release.countDown());
+				replacement.encoders.forEach(e -> e.release.countDown());
+				coordinator.close();
+				transport.close();
+				if (worker != null) { worker.join(2000); require(!worker.isAlive(), "cleanup worker ended"); }
+				for (Sender sender : first.senders) require(!sender.registered, "first API sender released");
+				for (Sender sender : replacement.senders) require(!sender.registered, "replacement API sender released");
+			}
+		}
+
+		static VoiceRequest request(long sequence) { return new VoiceRequest(AGENT, "fixture", "voice.auto.v1", 48, sequence); }
+		static class ReceiptWatch {
+			final AtomicInteger completed = new AtomicInteger();
+			final AtomicInteger fallback = new AtomicInteger();
+			void observe(CompletableFuture<VoiceReceipt> future) {
+				future.whenComplete((receipt, failure) -> {
+					completed.incrementAndGet();
+					// Same predicate as ServerActionExecutor, using the real receipt method.
+					// This observes eligibility; no Minecraft player delivery is executed.
+					if (failure != null || receipt == null || receipt.requiresTextFallback()) fallback.incrementAndGet();
+				});
+			}
+		}
+		static class FakeApi {
+			final List<Sender> senders = new ArrayList<>();
+			final List<Encoder> encoders = new ArrayList<>();
+			boolean gateNewEncoders = true;
+			final VoicechatConnection connection = proxy(VoicechatConnection.class, (self, method, args) -> switch (method.getName()) {
+				case "isInstalled" -> false;
+				case "setDisabled", "setConnected" -> null;
+				default -> defaults(self, method.getName(), method.getReturnType(), args);
+			});
+			final VoicechatServerApi api = proxy(VoicechatServerApi.class, (self, method, args) -> switch (method.getName()) {
+				case "getConnectionOf" -> connection;
+				case "createAudioSender" -> { Sender sender = new Sender(); senders.add(sender); yield sender.api; }
+				case "registerAudioSender" -> { find(args[0]).registered = true; yield true; }
+				case "unregisterAudioSender" -> { find(args[0]).registered = false; yield true; }
+				case "createEncoder" -> { Encoder encoder = new Encoder(gateNewEncoders); encoders.add(encoder); yield encoder.api; }
+				default -> defaults(self, method.getName(), method.getReturnType(), args);
+			});
+			Sender find(Object api) { return senders.stream().filter(s -> s.api == api).findFirst().orElseThrow(); }
+		}
+		static class Sender {
+			volatile boolean registered;
+			volatile boolean canSend = true;
+			volatile boolean acceptPackets = true;
+			final AtomicInteger packets = new AtomicInteger();
+			final AudioSender api = proxy(AudioSender.class, (self, method, args) -> switch (method.getName()) {
+				case "canSend" -> registered && canSend;
+				case "send" -> { if (!registered || !canSend || !acceptPackets) yield false; packets.incrementAndGet(); yield true; }
+				case "reset" -> registered;
+				case "whispering", "sequenceNumber" -> self;
+				default -> defaults(self, method.getName(), method.getReturnType(), args);
+			});
+		}
+		static class Encoder {
+			final CountDownLatch secondEncode = new CountDownLatch(1);
+			final CountDownLatch release = new CountDownLatch(1);
+			boolean gate;
+			volatile boolean closed;
+			int calls;
+			Encoder(boolean gate) { this.gate = gate; }
+			final OpusEncoder api = proxy(OpusEncoder.class, (self, method, args) -> switch (method.getName()) {
+				case "encode" -> {
+					if (++calls == 2 && gate) {
+						secondEncode.countDown();
+						long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+						boolean released = false;
+						while (!released && System.nanoTime() < deadline) {
+							try { released = release.await(Math.max(1, deadline - System.nanoTime()), TimeUnit.NANOSECONDS); }
+							catch (InterruptedException ignored) { /* retain the gate through cancellation */ }
+						}
+						require(released, "fixture gate timed out");
+					}
+					yield new byte[] { (byte) calls };
+				}
+				case "isClosed" -> closed;
+				case "close" -> { closed = true; yield null; }
+				default -> defaults(self, method.getName(), method.getReturnType(), args);
+			});
+		}
+		static <T> T proxy(Class<T> type, InvocationHandler handler) {
+			return type.cast(Proxy.newProxyInstance(type.getClassLoader(), new Class<?>[]{type}, handler));
+		}
+		static Object defaults(Object self, String name, Class<?> type, Object[] args) {
+			if (name.equals("hashCode")) return System.identityHashCode(self);
+			if (name.equals("equals")) return self == args[0];
+			if (name.equals("toString")) return "active-rebind recording proxy";
+			if (type == boolean.class) return false;
+			if (type == void.class || !type.isPrimitive()) return null;
+			throw new AssertionError("Unexpected primitive boundary: " + name);
+		}
+		static Object field(Object target, String name) throws Exception {
+			Field field = target.getClass().getDeclaredField(name); field.setAccessible(true); return field.get(target);
+		}
+		static Map<?,?> map(Object target, String name) throws Exception { return (Map<?,?>) field(target, name); }
+		static void require(boolean condition, String message) { if (!condition) throw new AssertionError(message); }
+	}
+
 }

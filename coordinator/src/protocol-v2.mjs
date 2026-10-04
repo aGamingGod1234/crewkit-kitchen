@@ -16,6 +16,7 @@ import {
 	MAX_EFFECTS,
 	MAX_ENTITIES,
 	MAX_GOAL_LENGTH,
+	MAX_PLANNER_GOAL_LENGTH,
 	MAX_IDENTIFIER_LENGTH,
 	MAX_INVENTORY_SUMMARIES,
 	MAX_OBSERVATION_TAGS,
@@ -61,6 +62,9 @@ export const COORDINATOR_TO_SERVER_TYPES = Object.freeze([
 export const SERVER_TO_COORDINATOR_TYPES = Object.freeze([
 	'auth_response',
 	'hello_ack',
+	'registry_entry',
+	'registry_complete',
+	'registry_fragment',
 	'catalog_request',
 	'agent_registered',
 	'agent_removed',
@@ -96,6 +100,11 @@ const PENDING_SERVER_INSTANCE_ID = 'pending';
 const MAX_CATALOG_MODELS = 512;
 const MAX_MODEL_CAPABILITIES = 32;
 const MAX_REGISTRY_SNAPSHOT_AGENTS = 1_024;
+// Covers 256 queued goals, each with escaped request text, 64 item identifiers and
+// 16 predicate leaves with 16 properties of 64+128 chars, plus the current goal and record metadata. No goal is truncated.
+const MAX_REGISTRY_ENTRY_BYTES = 128 * 1024 * 1024;
+const REGISTRY_FRAGMENT_BYTES = 24 * 1024;
+const FRAGMENTED_TYPES = new Set(['registry_entry', 'agent_registered', 'goal_control', 'conversation_wake']);
 const MAX_NEARBY_TRANSACTION_TARGETS = 16;
 const MAX_COMPLETION_FACTS = 16;
 const MAX_CHANGED_FACTS = 256;
@@ -173,7 +182,7 @@ export function validateProtocolV2Envelope(value, { direction } = {}) {
 	const messageId = requireText(value.messageId, 'messageId', MAX_COMMAND_ID_LENGTH);
 	if (!isPlainObject(value.payload)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Protocol v2 payload must be an object');
 	validateDirection(type, direction);
-	if ((type === 'auth_challenge' || type === 'auth_response' || type === 'hello' || type === 'hello_ack' || type === 'catalog_request' || type === 'catalog_snapshot' || type === 'coordinator_status' || type === 'verbose_control' || type === 'heartbeat' || type === 'shutdown') && agentId !== 'server') {
+	if ((type === 'auth_challenge' || type === 'auth_response' || type === 'hello' || type === 'hello_ack' || type === 'registry_complete' || type === 'catalog_request' || type === 'catalog_snapshot' || type === 'coordinator_status' || type === 'verbose_control' || type === 'heartbeat' || type === 'shutdown') && agentId !== 'server') {
 		throw new ProtocolV2Error('INVALID_AGENT_SCOPE', `Message type '${type}' must use agentId 'server'`);
 	}
 	if ((type === 'verbose_event' || type === 'action_result_ack') && agentId === 'server') {
@@ -213,23 +222,39 @@ function normalizeProtocolV2Payload(type, value) {
 				proof: authenticationToken(value.proof, 'proof'),
 			};
 		case 'hello':
-			exactKeys(value, ['replyTo', 'clientNonce', 'serverNonce', 'proof', 'launchId'], ['replyTo', 'clientNonce', 'serverNonce', 'proof'], type);
+			exactKeys(value, ['replyTo', 'clientNonce', 'serverNonce', 'proof', 'launchId', 'registryFragments'], ['replyTo', 'clientNonce', 'serverNonce', 'proof'], type);
 			return {
 				replyTo: boundedText(value.replyTo, 'replyTo', MAX_COMMAND_ID_LENGTH),
 				clientNonce: authenticationToken(value.clientNonce, 'clientNonce'),
 				serverNonce: authenticationToken(value.serverNonce, 'serverNonce'),
 				proof: authenticationToken(value.proof, 'proof'),
+				...(value.registryFragments === undefined ? {} : { registryFragments: boolean(value.registryFragments, 'registryFragments') }),
 				...(value.launchId === undefined ? {} : { launchId: launchIdentity(value.launchId) }),
 			};
 		case 'hello_ack':
-			exactKeys(value, ['replyTo', 'authenticated', 'registry', 'launchId'], ['replyTo', 'authenticated', 'registry'], type);
+			exactKeys(value, ['replyTo', 'authenticated', 'registry', 'launchId', 'registryCount'], ['replyTo', 'authenticated', 'registry'], type);
 			if (value.authenticated !== true) throw new ProtocolV2Error('INVALID_PAYLOAD', 'hello_ack authenticated must be true');
 			return {
 				replyTo: boundedText(value.replyTo, 'replyTo', MAX_COMMAND_ID_LENGTH),
 				authenticated: true,
 				registry: boundedArray(value.registry, 'registry', MAX_REGISTRY_SNAPSHOT_AGENTS).map((entry) => normalizeRegisteredAgent(entry, 'registry entry')),
+				...(value.registryCount === undefined ? {} : { registryCount: nonnegativeInteger(value.registryCount, 'registryCount') }),
 				...(value.launchId === undefined ? {} : { launchId: launchIdentity(value.launchId) }),
 			};
+		case 'registry_fragment': {
+			exactKeys(value, ['messageId', 'type', 'index', 'totalBytes', 'data'], ['messageId', 'type', 'index', 'totalBytes', 'data'], type);
+			if (!FRAGMENTED_TYPES.has(value.type)) throw new ProtocolV2Error('INVALID_FRAGMENT', 'Unsupported fragmented type');
+			const totalBytes = nonnegativeInteger(value.totalBytes, 'totalBytes');
+			if (totalBytes < 1 || totalBytes > MAX_REGISTRY_ENTRY_BYTES) throw new ProtocolV2Error('INVALID_FRAGMENT', 'Fragmented entry exceeds the schema-derived byte bound');
+			const data = boundedText(value.data, 'data', REGISTRY_FRAGMENT_BYTES * 4 / 3);
+			if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(data)) throw new ProtocolV2Error('INVALID_FRAGMENT', 'Fragment data must be canonical base64');
+			return { messageId: boundedText(value.messageId, 'messageId', MAX_COMMAND_ID_LENGTH), type: value.type, index: nonnegativeInteger(value.index, 'index'), totalBytes, data };
+		}
+		case 'registry_complete':
+			exactKeys(value, ['replyTo', 'count'], ['replyTo', 'count'], type);
+			return { replyTo: boundedText(value.replyTo, 'replyTo', MAX_COMMAND_ID_LENGTH), count: nonnegativeInteger(value.count, 'count') };
+		case 'registry_entry':
+			return normalizeRegisteredAgent(value, type);
 		case 'catalog_request':
 			exactKeys(value, [], [], type);
 			return {};
@@ -419,6 +444,8 @@ export class MultiplexedServerBridge extends EventEmitter {
 	#scheduleInbound;
 	#socket = null;
 	#decoder = null;
+	#registryTransfer = null;
+	#registryFragment = null;
 	#running = false;
 	#ready = false;
 	#recovering = false;
@@ -586,7 +613,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 		}
 	}
 
-	#onData(socket, connectionEpoch, chunk) {
+	async #onData(socket, connectionEpoch, chunk) {
 		if (!this.#isCurrentConnection(socket, connectionEpoch)) return;
 		let messages;
 		try {
@@ -595,10 +622,24 @@ export class MultiplexedServerBridge extends EventEmitter {
 			this.#fail(error, socket, connectionEpoch);
 			return;
 		}
-		this.#receivingData = true;
+		this.#receivingData = connectionEpoch;
 		try {
 			for (const value of messages) {
 				try {
+					if (!this.#isCurrentConnection(socket, connectionEpoch)) return;
+					if (this.#inboundEntries.size >= this.#inboundConnectionQueueCap
+							|| (this.#inboundQueuedByAgent.get(value?.agentId) ?? 0) >= this.#inboundAgentQueueCap) {
+						this.#drainInbound();
+						if (this.#inboundEntries.size >= this.#inboundConnectionQueueCap
+								|| (this.#inboundQueuedByAgent.get(value?.agentId) ?? 0) >= this.#inboundAgentQueueCap) {
+							// A TCP chunk is not a work batch. Let already-resolved waitUntil
+							// work finish while reads are paused before applying the hard cap.
+							socket.pause?.();
+							this.#inboundReadPaused = true;
+							await new Promise((resolve) => setImmediate(resolve));
+							if (!this.#isCurrentConnection(socket, connectionEpoch)) return;
+						}
+					}
 					this.#accept(value, socket, connectionEpoch);
 				} catch (error) {
 					this.#fail(withInboundEnvelopeContext(error, value), socket, connectionEpoch);
@@ -606,9 +647,10 @@ export class MultiplexedServerBridge extends EventEmitter {
 				}
 			}
 		} finally {
-			this.#receivingData = false;
+			if (this.#receivingData === connectionEpoch) this.#receivingData = false;
 		}
 		if (this.#inboundQueue.length > 0) this.#drainInbound();
+		this.#resumeInboundReads(socket, connectionEpoch);
 	}
 
 	#accept(value, socket, connectionEpoch) {
@@ -618,6 +660,17 @@ export class MultiplexedServerBridge extends EventEmitter {
 			: envelope);
 		if (this.#inboundMessageIds.has(envelope.messageId)) throw new ProtocolV2Error('DUPLICATE_MESSAGE', `Duplicate message ID '${envelope.messageId}'`);
 		rememberBounded(this.#inboundMessageIds, envelope.messageId, MAX_TRACKED_MESSAGE_IDS);
+		if (this.#serverNonce !== null && envelope.serverInstanceId !== this.#serverInstanceId) throw new ProtocolV2Error('SERVER_INSTANCE_MISMATCH', 'Server instance changed during authentication or registry delivery');
+		if (envelope.type === 'registry_fragment') {
+			this.#acceptRegistryFragment(envelope, socket, connectionEpoch);
+			return;
+		}
+		if (this.#registryFragment !== null) throw new ProtocolV2Error('INVALID_FRAGMENT', 'Fragmented message was interrupted');
+		if (this.#registryTransfer !== null) {
+			this.#acceptRegistryEntry(envelope, socket, connectionEpoch);
+			return;
+		}
+		if (envelope.type === 'registry_entry' || envelope.type === 'registry_complete') throw new ProtocolV2Error('INVALID_REGISTRY_SNAPSHOT', 'Registry transfer has not started');
 		if (!this.#ready) {
 			if (this.#serverNonce === null) this.#acceptAuthResponse(envelope, socket, connectionEpoch);
 			else this.#acceptHelloAck(envelope, socket, connectionEpoch);
@@ -657,6 +710,52 @@ export class MultiplexedServerBridge extends EventEmitter {
 		this.#enqueueInbound(event, socket, connectionEpoch);
 	}
 
+	#acceptRegistryFragment(envelope, socket, connectionEpoch) {
+		const part = envelope.payload;
+		if (this.#serverNonce === null || (!this.#ready && this.#registryTransfer === null)
+				|| (part.type === 'registry_entry') !== (this.#registryTransfer !== null)) {
+			throw new ProtocolV2Error('INVALID_FRAGMENT', 'Fragment is outside its authenticated delivery phase');
+		}
+		let pending = this.#registryFragment;
+		if (pending === null) {
+			if (part.index !== 0) throw new ProtocolV2Error('INVALID_FRAGMENT', 'Fragment sequence must start at zero');
+			pending = this.#registryFragment = { messageId: part.messageId, type: part.type, agentId: envelope.agentId, totalBytes: part.totalBytes, index: 0, bytes: 0, chunks: [] };
+		}
+		if (part.index !== pending.index || part.messageId !== pending.messageId || part.type !== pending.type
+				|| envelope.agentId !== pending.agentId || part.totalBytes !== pending.totalBytes) throw new ProtocolV2Error('INVALID_FRAGMENT', 'Fragment identity or sequence changed');
+		const bytes = Buffer.from(part.data, 'base64');
+		const remaining = pending.totalBytes - pending.bytes;
+		if (bytes.toString('base64') !== part.data || bytes.length !== Math.min(REGISTRY_FRAGMENT_BYTES, remaining)) throw new ProtocolV2Error('INVALID_FRAGMENT', 'Fragment length does not match the declared message');
+		pending.chunks.push(bytes);
+		pending.bytes += bytes.length;
+		pending.index++;
+		if (pending.bytes !== pending.totalBytes) return;
+		this.#registryFragment = null;
+		// Use the real strict JSONL parser: duplicate fields and invalid UTF-8 stay errors.
+		const decoder = new JsonlDecoder({ maxBytes: MAX_REGISTRY_ENTRY_BYTES });
+		const messages = decoder.push(Buffer.concat([...pending.chunks, Buffer.from('\n')]));
+		if (messages.length !== 1) throw new ProtocolV2Error('INVALID_FRAGMENT', 'Fragmented payload must contain exactly one object');
+		const [payload] = messages;
+		decoder.finish();
+		this.#accept({ protocolVersion: 2, serverInstanceId: envelope.serverInstanceId, agentId: pending.agentId, type: pending.type, messageId: pending.messageId, payload }, socket, connectionEpoch);
+	}
+
+	#acceptRegistryEntry(envelope, socket, connectionEpoch) {
+		const transfer = this.#registryTransfer;
+		if (envelope.type === 'registry_entry') {
+			if (transfer.entries.length >= transfer.ack.payload.registryCount || envelope.agentId !== envelope.payload.agentId
+					|| transfer.ids.has(envelope.agentId)) throw new ProtocolV2Error('INVALID_REGISTRY_SNAPSHOT', 'Registry entry count or identity is invalid');
+			transfer.ids.add(envelope.agentId);
+			transfer.entries.push(envelope.payload);
+			return;
+		}
+		if (envelope.type !== 'registry_complete' || envelope.payload.replyTo !== transfer.ack.messageId
+				|| envelope.payload.count !== transfer.entries.length || transfer.entries.length !== transfer.ack.payload.registryCount) throw new ProtocolV2Error('INVALID_REGISTRY_SNAPSHOT', 'Registry completion does not match its snapshot');
+		this.#registryTransfer = null;
+		const { registryCount, ...payload } = transfer.ack.payload;
+		this.#acceptHelloAck({ ...transfer.ack, payload: { ...payload, registry: transfer.entries } }, socket, connectionEpoch);
+	}
+
 	#acceptAuthResponse(envelope, socket, connectionEpoch) {
 		if (envelope.type !== 'auth_response' || envelope.agentId !== 'server') {
 			throw new ProtocolV2Error('HANDSHAKE_REQUIRED', 'auth_response must be the first server message');
@@ -694,6 +793,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 					serverInstanceId: this.#serverInstanceId,
 					launchId: this.#launchId,
 				}),
+				registryFragments: true,
 				...(this.#launchId === null ? {} : { launchId: this.#launchId }),
 			},
 		});
@@ -713,6 +813,11 @@ export class MultiplexedServerBridge extends EventEmitter {
 			throw new ProtocolV2Error('LAUNCH_ID_MISMATCH', 'Server acknowledgement does not match this coordinator launch');
 		}
 		if (this.#expectedServerInstanceId !== null && envelope.serverInstanceId !== this.#expectedServerInstanceId) throw new ProtocolV2Error('SERVER_INSTANCE_MISMATCH', 'Connected server instance does not match configuration');
+		if (envelope.payload.registryCount !== undefined) {
+			if (envelope.payload.registry.length !== 0 || envelope.payload.registryCount > MAX_REGISTRY_SNAPSHOT_AGENTS) throw new ProtocolV2Error('INVALID_REGISTRY_SNAPSHOT', 'Registry begin must declare a bounded, empty snapshot');
+			this.#registryTransfer = { ack: envelope, entries: [], ids: new Set() };
+			return;
+		}
 		const registry = envelope.payload.registry ?? [];
 		if (!Array.isArray(registry)) throw new ProtocolV2Error('INVALID_REGISTRY_SNAPSHOT', 'hello_ack registry must be an array');
 		this.#serverInstanceId = envelope.serverInstanceId;
@@ -742,15 +847,25 @@ export class MultiplexedServerBridge extends EventEmitter {
 	}
 
 	#enqueueInbound(event, socket, connectionEpoch) {
-		if (event.type === 'observation') {
-			const queued = this.#inboundQueue.findLast((entry) => !entry.dispatched
-				&& entry.event.type === 'observation'
-				&& entry.event.agentId === event.agentId
-				&& entry.event.payload.goalRevision === event.payload.goalRevision);
-			if (queued !== undefined) {
-				queued.event = mergeQueuedObservation(queued.event, event);
+		if (event.type === 'observation' && event.payload.ready === true) {
+			// Only replace an adjacent quiet snapshot. Attention and unavailable
+			// observations carry evidence that a later snapshot cannot reconstruct;
+			// intervening results/lifecycle events must keep their wire position.
+			const queued = this.#inboundQueue.at(-1);
+			if (queued !== undefined && !queued.dispatched
+				&& queued.event.type === 'observation'
+				&& queued.event.payload.ready === true
+				&& queued.event.payload.attention === false
+				&& queued.event.agentId === event.agentId
+				&& queued.event.payload.goalRevision === event.payload.goalRevision) {
+				queued.event = event;
 				return;
 			}
+		}
+		if (this.#inboundEntries.size >= this.#inboundConnectionQueueCap
+				|| (this.#inboundQueuedByAgent.get(event.agentId) ?? 0) >= this.#inboundAgentQueueCap) {
+			this.#drainInbound();
+			if (!this.#isCurrentConnection(socket, connectionEpoch)) return;
 		}
 		if (this.#inboundEntries.size >= this.#inboundConnectionQueueCap) {
 			throw new ProtocolV2Error('CONNECTION_INBOUND_BACKPRESSURE', 'Connection inbound work queue is full');
@@ -808,15 +923,21 @@ export class MultiplexedServerBridge extends EventEmitter {
 		const count = this.#inboundQueuedByAgent.get(entry.event.agentId) ?? 0;
 		if (count <= 1) this.#inboundQueuedByAgent.delete(entry.event.agentId);
 		else this.#inboundQueuedByAgent.set(entry.event.agentId, count - 1);
-		if (this.#inboundReadPaused
-				&& this.#isCurrentConnection(entry.socket, entry.connectionEpoch)
+		this.#resumeInboundReads(entry.socket, entry.connectionEpoch);
+	}
+
+	#resumeInboundReads(socket, connectionEpoch) {
+		if (this.#inboundReadPaused && !this.#receivingData
+				&& this.#isCurrentConnection(socket, connectionEpoch)
 				&& this.#inboundEntries.size <= Math.floor(this.#inboundConnectionQueueCap * 0.5)) {
-			entry.socket.resume?.();
 			this.#inboundReadPaused = false;
+			socket.resume?.();
 		}
 	}
 
 	#clearInboundQueue() {
+		this.#registryTransfer = null;
+		this.#registryFragment = null;
 		for (const entry of this.#inboundEntries) entry.released = true;
 		this.#inboundQueue = [];
 		this.#inboundEntries.clear();
@@ -1360,7 +1481,7 @@ function normalizeCoordinatorStatus(value) {
 	const components = boundedArray(value.components, 'coordinator_status.components', 32).map((component, index) => {
 		const field = `coordinator_status.components[${index}]`;
 		const keys = ['component', 'state', 'fallbackMode', 'boundary', 'failureCode', 'consecutiveFailureCount', 'nextProbeAtEpochMs', 'generation', 'lastRecoveryAtEpochMs'];
-		exactKeys(component, keys, keys, field);
+		exactKeys(component, [...keys, 'failedOperationCount', 'droppedCount', 'incompleteCapture'], keys, field);
 		const state = requireIdentifier(component.state, `${field}.state`);
 		if (!['ready', 'degraded', 'backoff', 'blocked_retryable', 'unknown'].includes(state)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}.state is invalid`);
 		return {
@@ -1373,6 +1494,9 @@ function normalizeCoordinatorStatus(value) {
 			nextProbeAtEpochMs: nullableNonnegativeInteger(component.nextProbeAtEpochMs, `${field}.nextProbeAtEpochMs`),
 			generation: nonnegativeInteger(component.generation, `${field}.generation`),
 			lastRecoveryAtEpochMs: nullableNonnegativeInteger(component.lastRecoveryAtEpochMs, `${field}.lastRecoveryAtEpochMs`),
+			...(Object.hasOwn(component, 'failedOperationCount') ? { failedOperationCount: nonnegativeInteger(component.failedOperationCount, `${field}.failedOperationCount`) } : {}),
+			...(Object.hasOwn(component, 'droppedCount') ? { droppedCount: nonnegativeInteger(component.droppedCount, `${field}.droppedCount`) } : {}),
+			...(Object.hasOwn(component, 'incompleteCapture') ? { incompleteCapture: boolean(component.incompleteCapture, `${field}.incompleteCapture`) } : {}),
 		};
 	});
 	if (new Set(components.map((component) => component.component)).size !== components.length) throw new ProtocolV2Error('INVALID_PAYLOAD', 'coordinator_status component identities must be unique');
@@ -1421,7 +1545,7 @@ function normalizeRegisteredAgent(value, field) {
 		gameMode: requireIdentifier(value.gameMode ?? 'survival', `${field}.gameMode`),
 		skinVariant: requireIdentifier(value.skinVariant, `${field}.skinVariant`),
 		state,
-		currentGoal: value.currentGoal === undefined ? null : boundedText(value.currentGoal, `${field}.currentGoal`, MAX_GOAL_LENGTH),
+		currentGoal: value.currentGoal === undefined ? null : boundedText(value.currentGoal, `${field}.currentGoal`, MAX_PLANNER_GOAL_LENGTH),
 		currentGoalSpec: value.currentGoalSpec === undefined ? null : parseGoalSpec(value.currentGoalSpec),
 		goalRevision: revision(value.goalRevision, `${field}.goalRevision`),
 		queue: queue.map((goal, index) => ({ goal, goalRevision: index + 1, goalSpec: queueGoalSpecs[index] ?? null })),
@@ -1465,7 +1589,8 @@ function normalizeGoalControl(value) {
 	const operation = boundedText(value.operation, 'operation', MAX_REASON_CODE_LENGTH);
 	if (!['start', 'replace', 'stop', 'queue', 'dequeue', 'steer', 'resume', 'complete', 'fail', 'disconnect', 'dead', 'respawn'].includes(operation)) throw new ProtocolV2Error('INVALID_PAYLOAD', `Unsupported goal operation '${operation}'`);
 	const normalized = { operation, goalRevision: revision(value.goalRevision, 'goalRevision'), updatedAtEpochMs: nonnegativeInteger(value.updatedAtEpochMs, 'updatedAtEpochMs') };
-	if (value.goal !== undefined) normalized.goal = boundedText(value.goal, 'goal', MAX_GOAL_LENGTH);
+	if (value.goal !== undefined) normalized.goal = boundedText(value.goal, 'goal',
+		['start', 'replace', 'steer'].includes(operation) ? MAX_PLANNER_GOAL_LENGTH : MAX_GOAL_LENGTH);
 	if (value.goalSpec !== undefined) normalized.goalSpec = parseGoalSpec(value.goalSpec);
 	if (value.death !== undefined) normalized.death = normalizeDeath(value.death);
 	if (['start', 'replace', 'steer', 'queue', 'dequeue'].includes(operation) && normalized.goal === undefined) throw new ProtocolV2Error('MISSING_FIELD', `goal_control ${operation} requires goal`);
@@ -2378,9 +2503,4 @@ function rememberBounded(set, value, maximum) {
 	const evicted = set.values().next().value;
 	set.delete(evicted);
 	return evicted;
-}
-
-function mergeQueuedObservation(previous, next) {
-	if (previous.payload.attention !== true) return next;
-	return { ...next, payload: { ...next.payload, attention: true } };
 }

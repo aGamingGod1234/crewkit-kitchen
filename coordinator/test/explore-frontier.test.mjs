@@ -2,6 +2,7 @@
 import test from 'node:test';
 import { ExplorationOccupancy, cellKey, extractPosition } from '../src/explore-frontier.mjs';
 import { adaptObservation } from '../src/observation-adapter.mjs';
+import { ObservedMemoryStore } from '../src/observed-memory-store.mjs';
 
 function observation({ x = 0, y = 64, z = 0, blocks = [], landmarks = [], dimension = 'minecraft:overworld', gameTime = 20, worldId = 'world-a' } = {}) {
 	return { position: { x, y, z }, world: { dimension, worldId, gameTime }, blocks, landmarks };
@@ -51,6 +52,52 @@ test('candidate pages are bounded and literal block filters retain no unknown gu
 	const filtered = occupancy.candidates('a', view, { blockId: 'minecraft:chest' });
 	assert.equal(filtered.candidates.length, 1);
 	assert.equal(filtered.candidates[0].blockId, 'minecraft:chest');
+});
+
+test('unknown kind filter retrieves frontiers behind 100 nearby blocks without changing the default page', () => {
+	const occupancy = new ExplorationOccupancy();
+	const floor = [];
+	for (let x = -1; x <= 8; x++) for (let z = -1; z <= 8; z++) floor.push({ x, y: 63, z, blockId: 'minecraft:stone' });
+	for (let offset = 0; offset < floor.length; offset += 8) occupancy.ingest('a', observation({ x: 4, z: 4, gameTime: offset + 1, blocks: floor.slice(offset, offset + 8) }));
+	const view = observation({ x: 4, z: 4, gameTime: 110 });
+	const before = occupancy.snapshot('a');
+	const defaults = occupancy.candidates('a', view, { limit: 64 });
+	assert.equal(defaults.candidates.length, 64);
+	assert.ok(defaults.candidates.every((entry) => entry.kind === 'observed_block'));
+	assert.deepEqual(occupancy.candidates('a', view, { limit: 64, kind: 'all' }), defaults);
+	const unknown = occupancy.candidates('a', view, { limit: 64, kind: 'unknown_cell' });
+	assert.equal(unknown.totalCandidates, 30);
+	assert.equal(unknown.candidates.length, 30);
+	assert.equal(unknown.truncated, false);
+	assert.ok(unknown.candidates.every((entry) => entry.kind === 'unknown_cell' && entry.reachability === 'unknown'));
+	assert.deepEqual(unknown.candidates, [...unknown.candidates].sort((left, right) => left.distance - right.distance || left.id.localeCompare(right.id)));
+	assert.equal(unknown.destination, null);
+	assert.deepEqual(occupancy.candidates('a', view, { kind: 'unknown_cell', limit: 2 }).candidates, unknown.candidates.slice(0, 2));
+	assert.equal(occupancy.candidates('a', view, { kind: 'observed_block', limit: 64 }).totalCandidates, 100);
+	assert.deepEqual(occupancy.candidates('a', view, { kind: 'unknown_cell', blockId: 'minecraft:stone' }).candidates, []);
+	assert.deepEqual(occupancy.snapshot('a'), before);
+});
+
+test('kind filters preserve world and dimension scope and reject unsupported kinds', () => {
+	const occupancy = new ExplorationOccupancy();
+	occupancy.ingest('a', observation({ blocks: [{ blockId: 'minecraft:chest', x: 12, y: 64, z: 0 }] }));
+	for (const view of [observation({ dimension: 'minecraft:the_nether' }), observation({ worldId: 'world-b' })]) {
+		assert.deepEqual(occupancy.candidates('a', view, { kind: 'observed_block' }).candidates, []);
+		assert.deepEqual(occupancy.candidates('a', view, { kind: 'unknown_cell' }), new ExplorationOccupancy().candidates('a', view, { kind: 'unknown_cell' }));
+	}
+	assert.throws(() => occupancy.candidates('a', observation(), { kind: 'nearest' }), /kind must be/);
+});
+
+test('occupancy preserves snapshot returns and forwards snapshot suppression to the real store', (t) => {
+	const memoryStore = new ObservedMemoryStore();
+	const occupancy = new ExplorationOccupancy({ memoryStore });
+	const queries = t.mock.method(memoryStore, 'query');
+	const view = observation({ blocks: [{ blockId: 'minecraft:chest', x: 12, y: 64, z: 0 }] });
+	assert.equal(occupancy.ingest('a', view).blocks[0].blockId, 'minecraft:chest');
+	assert.equal(queries.mock.callCount(), 1);
+	assert.equal(occupancy.ingest('a', { ...view, position: { x: 24, y: 64, z: 0 } }, { snapshot: false }), undefined);
+	assert.equal(queries.mock.callCount(), 1, 'discarded snapshots never query/copy retained records');
+	assert.equal(occupancy.snapshot('a').visitedCells, 2);
 });
 
 test('missing player position returns no destination, including compatibility select', () => {

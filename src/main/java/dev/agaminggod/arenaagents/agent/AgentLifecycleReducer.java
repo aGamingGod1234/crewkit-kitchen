@@ -99,13 +99,14 @@ public final class AgentLifecycleReducer {
 	public static AgentTransition stop(AgentRecord current, long nowEpochMs) {
 		requireUnfinishedGoal(current, "stop");
 		AgentRecord revised = current.withLifecycle(
-				AgentLifecycleState.PAUSED,
+				current.state() == AgentLifecycleState.DEAD ? AgentLifecycleState.DEAD : AgentLifecycleState.PAUSED,
 				current.currentGoal(),
 				nextRevision(current),
 				current.queuedGoals(),
 				nowEpochMs,
 				current.lastError()
 		);
+		if (revised.state() == AgentLifecycleState.DEAD) revised = revised.withRespawnContinuation(false, nowEpochMs);
 		return transition(current, revised, true, true);
 	}
 
@@ -127,13 +128,14 @@ public final class AgentLifecycleReducer {
 		AgentGoal currentGoal = requireUnfinishedGoal(current, "steer");
 		AgentGoal steered = currentGoal.steer(instruction, nowEpochMs);
 		AgentRecord revised = current.withLifecycle(
-				AgentLifecycleState.STARTING,
+				current.state() == AgentLifecycleState.DEAD ? AgentLifecycleState.DEAD : AgentLifecycleState.STARTING,
 				Optional.of(steered),
 				nextRevision(current),
 				current.queuedGoals(),
 				nowEpochMs,
 				""
 		);
+		if (revised.state() == AgentLifecycleState.DEAD) revised = revised.withRespawnContinuation(true, nowEpochMs);
 		return transition(current, revised, true, true);
 	}
 

@@ -510,7 +510,7 @@ function Resolve-RunnerPathForArm {
         return [IO.Path]::GetFullPath((Join-Path $WorktreePath $DefaultRelativePath))
     }
     $candidate = $RequestedPath
-    if (-not [IO.Path]::IsPathRooted($candidate) -and -not (Test-Path -LiteralPath $candidate)) {
+    if (-not [IO.Path]::IsPathRooted($candidate)) {
         $candidate = Join-Path $WorktreePath $candidate
     }
     return [IO.Path]::GetFullPath($candidate)
@@ -647,95 +647,90 @@ function Test-ProcessAlive {
     catch { return $false }
 }
 
-function Get-ProcessParentMap {
+function Get-LatencyProcessSnapshot {
     try {
-        $rows = @(Get-CimInstance Win32_Process -ErrorAction Stop | Select-Object ProcessId, ParentProcessId)
+        $rows = @(Get-CimInstance Win32_Process -ErrorAction Stop)
     }
     catch {
-        try { $rows = @(Get-WmiObject Win32_Process -ErrorAction Stop | Select-Object ProcessId, ParentProcessId) }
+        try { $rows = @(Get-WmiObject Win32_Process -ErrorAction Stop) }
         catch { return @{} }
     }
     $map = @{}
-    foreach ($row in $rows) { $map[[int]$row.ProcessId] = [int]$row.ParentProcessId }
+    foreach ($row in $rows) {
+        try {
+            $created = $row.CreationDate
+            if ($created -isnot [DateTime]) { $created = [Management.ManagementDateTimeConverter]::ToDateTime([string]$created) }
+            $map[[int]$row.ProcessId] = [pscustomobject]@{
+                ProcessId = [int]$row.ProcessId
+                ParentProcessId = [int]$row.ParentProcessId
+                CreationKey = $created.ToUniversalTime().ToString('yyyyMMddHHmmssffffff')
+            }
+        } catch { }
+    }
     return $map
 }
 
-function Test-IsProcessDescendantOf {
-    param(
-        [Parameter(Mandatory = $true)] [int] $ProcessId,
-        [Parameter(Mandatory = $true)] [int] $RootProcessId,
-        [Parameter(Mandatory = $true)] [hashtable] $ParentMap
-    )
-    $seen = New-Object 'System.Collections.Generic.HashSet[int]'
-    $current = $ProcessId
-    for ($depth = 0; $depth -lt 64; $depth++) {
-        if ($current -eq $RootProcessId) { return $true }
-        if (-not $seen.Add($current) -or -not $ParentMap.ContainsKey($current)) { return $false }
-        $current = [int]$ParentMap[$current]
-        if ($current -le 0) { return $false }
+function Open-LatencyProcessIdentity {
+    param([Parameter(Mandatory = $true)] [object] $Process)
+    # Retain the handle so Kill()/HasExited address this process instance even
+    # when its numeric PID is subsequently reused. CIM has microsecond precision.
+    $null = $Process.Handle
+    return [pscustomobject]@{
+        ProcessId = [int]$Process.Id
+        CreationKey = $Process.StartTime.ToUniversalTime().ToString('yyyyMMddHHmmssffffff')
+        Process = $Process
     }
-    return $false
 }
 
-function Get-DescendantProcessIds {
-    param([Parameter(Mandatory = $true)] [int] $RootProcessId)
-    $all = @{}
-    try {
-        $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop | Select-Object ProcessId, ParentProcessId)
-    }
-    catch {
-        try { $processes = @(Get-WmiObject Win32_Process -ErrorAction Stop | Select-Object ProcessId, ParentProcessId) }
-        catch { return @() }
-    }
+function Add-LatencyTrackedProcesses {
+    param([Parameter(Mandatory = $true)] [hashtable] $Tracked)
+    $snapshot = Get-LatencyProcessSnapshot
     $queue = New-Object 'System.Collections.Generic.Queue[int]'
-    $queue.Enqueue($RootProcessId)
+    foreach ($identity in @($Tracked.Values)) {
+        $id = [int]$identity.ProcessId
+        if (-not $identity.Process.HasExited -and $snapshot.ContainsKey($id) -and $snapshot[$id].CreationKey -eq $identity.CreationKey) { $queue.Enqueue($id) }
+    }
+    $visited = New-Object 'System.Collections.Generic.HashSet[int]'
     while ($queue.Count -gt 0) {
-        $parent = $queue.Dequeue()
-        foreach ($process in $processes) {
-            if ([int]$process.ParentProcessId -eq $parent -and [int]$process.ProcessId -ne $RootProcessId -and -not $all.ContainsKey([int]$process.ProcessId)) {
-                $childId = [int]$process.ProcessId
-                $all[$childId] = $true
-                $queue.Enqueue($childId)
-            }
+        $parentId = $queue.Dequeue()
+        if (-not $visited.Add($parentId)) { continue }
+        foreach ($row in @($snapshot.Values)) {
+            $id = [int]$row.ProcessId
+            if ($row.ParentProcessId -ne $parentId -or $Tracked.ContainsKey($id) -or [string]::CompareOrdinal($row.CreationKey, $Tracked[$parentId].CreationKey) -lt 0) { continue }
+            $child = $null
+            try {
+                $child = Get-Process -Id $id -ErrorAction Stop
+                $identity = Open-LatencyProcessIdentity -Process $child
+                # A replacement acquired after the snapshot is not owned.
+                if ($identity.CreationKey -ne $row.CreationKey -or $child.HasExited) { $child.Dispose(); continue }
+                $Tracked[$id] = $identity
+                $queue.Enqueue($id)
+            } catch { if ($null -ne $child) { $child.Dispose() } }
         }
     }
-    return @($all.Keys | ForEach-Object { [int]$_ })
 }
 
 function Stop-TrackedProcessTree {
     param(
         [Parameter(Mandatory = $true)] [int] $RootProcessId,
-        [Parameter(Mandatory = $true)] [int[]] $TrackedProcessIds,
+        [Parameter(Mandatory = $true)] [hashtable] $TrackedProcesses,
         [switch] $ForceRoot
     )
-    $ids = New-Object 'System.Collections.Generic.HashSet[int]'
-    if ($RootProcessId -gt 0) { $ids.Add($RootProcessId) | Out-Null }
-    foreach ($id in $TrackedProcessIds) { if ($id -gt 0) { $ids.Add($id) | Out-Null } }
-    # Once the root has exited its PID can be reused immediately. Do not query a
-    # fresh descendant tree for an exited root, or a later process can be mistaken
-    # for a child and an unrelated process can be terminated.
-    if (Test-ProcessAlive $RootProcessId) {
-        foreach ($id in @(Get-DescendantProcessIds -RootProcessId $RootProcessId)) { $ids.Add($id) | Out-Null }
-    }
-    $rootAlive = Test-ProcessAlive $RootProcessId
-    # Validate every non-root PID against the current parent map. This remains
-    # safe when the runner has just exited and prevents a reused PID from
-    # being treated as part of the tracked tree.
-    $parentMap = Get-ProcessParentMap
-    foreach ($id in @($ids | Sort-Object -Descending)) {
-        if (-not (Test-ProcessAlive $id)) { continue }
-        if ($id -eq $RootProcessId -and -not $ForceRoot) { continue }
-        if (-not $ForceRoot -and $id -ne $RootProcessId -and -not (Test-IsProcessDescendantOf -ProcessId $id -RootProcessId $RootProcessId -ParentMap $parentMap)) { continue }
-        try { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue } catch { }
+    # Historical membership survives an exited intermediate parent. ForceRoot
+    # changes root inclusion only; it never relaxes identity or ownership.
+    Add-LatencyTrackedProcesses -Tracked $TrackedProcesses
+    foreach ($identity in @($TrackedProcesses.Values | Sort-Object ProcessId -Descending)) {
+        if ($identity.ProcessId -eq $RootProcessId -and -not $ForceRoot) { continue }
+        try { if (-not $identity.Process.HasExited) { $identity.Process.Kill() } } catch { }
     }
     $deadline = [DateTime]::UtcNow.AddSeconds(3)
     $remaining = @()
     do {
-        $remaining = @($ids | Where-Object { Test-ProcessAlive ([int]$_) })
+        $remaining = @($TrackedProcesses.Values | Where-Object { -not $_.Process.HasExited } | ForEach-Object { [int]$_.ProcessId })
         if ($remaining.Count -eq 0) { break }
         Start-Sleep -Milliseconds 50
     } while ([DateTime]::UtcNow -lt $deadline)
-    return [pscustomobject]@{ Ok = ($remaining.Count -eq 0); Remaining = @($remaining); Tracked = @($ids) }
+    return [pscustomobject]@{ Ok = ($remaining.Count -eq 0); Remaining = @($remaining); Tracked = @($TrackedProcesses.Keys) }
 }
 
 function Invoke-RunnerProcess {
@@ -765,7 +760,7 @@ function Invoke-RunnerProcess {
     $startInfo.RedirectStandardError = $true
     $process.StartInfo = $startInfo
     $startedAt = [DateTime]::UtcNow
-    $tracked = New-Object 'System.Collections.Generic.List[int]'
+    $tracked = @{}
     $timedOut = $false
     $startError = $null
     $exitCode = $null
@@ -773,7 +768,7 @@ function Invoke-RunnerProcess {
     try {
         try { $null = $process.Start() }
         catch { $startError = $_.Exception.Message; return [pscustomobject]@{ Started = $false; ExitCode = $null; TimedOut = $false; Stdout = ''; Stderr = ''; StdoutOverflow = $false; StderrOverflow = $false; Cleanup = [pscustomobject]@{ Ok = $true; Remaining = @(); Tracked = @() }; Error = $startError; DurationMs = 0 } }
-        $tracked.Add($process.Id) | Out-Null
+        $tracked[$process.Id] = Open-LatencyProcessIdentity -Process $process
         # DataReceived scriptblock delegates are unreliable in Windows
         # PowerShell 5.1 after a short-lived child exits. Poll both asynchronous
         # readers on this runspace so the final JSON line is always drained.
@@ -805,25 +800,29 @@ function Invoke-RunnerProcess {
             if ($state.StdoutOverflow -or $state.StderrOverflow) { break }
             if ($process.HasExited -and $stdoutDone -and $stderrDone) { break }
             if (-not $process.HasExited) {
-                foreach ($childId in @(Get-DescendantProcessIds -RootProcessId $process.Id)) {
-                    if (-not $tracked.Contains($childId)) { $tracked.Add($childId) | Out-Null }
-                }
+                Add-LatencyTrackedProcesses -Tracked $tracked
             }
             if (([DateTime]::UtcNow - $startedAt).TotalSeconds -ge $TimeoutSeconds) { $timedOut = $true; break }
             Start-Sleep -Milliseconds 10
         }
         if ($timedOut -or $state.StdoutOverflow -or $state.StderrOverflow) {
-            $cleanup = Stop-TrackedProcessTree -RootProcessId $process.Id -TrackedProcessIds @($tracked.ToArray()) -ForceRoot
+            $cleanup = Stop-TrackedProcessTree -RootProcessId $process.Id -TrackedProcesses $tracked -ForceRoot
         }
         else {
-            # The loop above records descendants while the root is alive. Avoid
-            # a post-exit tree query because Windows may already have reused its PID.
-            $cleanup = Stop-TrackedProcessTree -RootProcessId $process.Id -TrackedProcessIds @($tracked.ToArray())
+            # Cleanup can extend only still-owned identities, never an exited
+            # root's numeric PID. Previously tracked orphans remain owned.
+            $cleanup = Stop-TrackedProcessTree -RootProcessId $process.Id -TrackedProcesses $tracked
         }
         try { $process.WaitForExit(1000) | Out-Null } catch { }
         if ($process.HasExited) { $exitCode = $process.ExitCode }
     }
     finally {
+        if ($tracked.Count -gt 0 -and $null -eq $cleanup) {
+            $cleanup = Stop-TrackedProcessTree -RootProcessId $process.Id -TrackedProcesses $tracked -ForceRoot
+        }
+        foreach ($identity in @($tracked.Values)) {
+            if ($identity.Process -ne $process) { $identity.Process.Dispose() }
+        }
         $process.Dispose()
     }
     return [pscustomobject]@{
@@ -916,10 +915,13 @@ function Assert-RunnerResult {
     $trials = Get-OptionalProperty $Result 'trials'
     $isAggregate = $null -ne $metadata -or $null -ne $trials
     if ($isAggregate) {
+        if ((Get-OptionalProperty $Result 'trialsTruncated') -eq $true -or (Get-OptionalProperty $Result 'bounded') -eq $true) { throw 'Runner aggregate result is incomplete: public samples were truncated or bounded.' }
         if (-not (Test-PlainObject $metadata)) { throw 'Runner aggregate result metadata object is required.' }
         if ($null -eq $trials -or $trials -is [string]) { throw 'Runner aggregate result trials array is required.' }
         [object[]] $trialItems = @($trials)
-        if ($trialItems.Count -eq 0 -or $trialItems.Count -gt 256) { throw 'Runner aggregate result trials array is outside the bounded range.' }
+        if ($trialItems.Count -eq 0 -or $trialItems.Count -gt 1024) { throw 'Runner aggregate result trials array is outside the bounded range.' }
+        $expectedRepetitions = [int]$Context.ExpectedRepetitions
+        if ($trialItems.Count -ne $expectedRepetitions) { throw "Runner aggregate result is incomplete: expected $expectedRepetitions repetitions, received $($trialItems.Count)." }
         $expectedRunnerId = [string]$Context.RunnerTrialId
         $metadataTrialId = Get-OptionalProperty $metadata 'trialId'
         if ($null -eq $metadataTrialId -or [string]$metadataTrialId -ne $expectedRunnerId) { throw 'Runner result metadata trial identity does not match the invocation.' }
@@ -955,17 +957,18 @@ function Assert-RunnerResult {
             if ($status -eq 'PASSED' -and $trialStatus -notin @('PASSED', 'SKIPPED')) { throw 'Runner aggregate status and matching trial status disagree.' }
             if ($status -eq 'SKIPPED' -and $trialStatus -ne 'SKIPPED') { throw 'Runner aggregate skipped status and matching trial disagree.' }
             $duration = Get-OptionalProperty $trial 'durationMs'
+            if ($trialStatus -eq 'PASSED' -and $null -eq $duration) { throw 'Runner aggregate result is incomplete: passed trial durationMs is required.' }
             if ($null -ne $duration) {
                 if (-not (Test-BoundedLatencyNumber $duration)) { throw 'Runner aggregate trial durationMs is not bounded.' }
                 $durations.Add([double]$duration) | Out-Null
             }
             $repetition = Get-OptionalProperty $trial 'repetition'
-            if ($matching.Count -gt 1) {
-                if ($null -eq $repetition -or [int]$repetition -lt 1 -or -not $repetitions.Add([int]$repetition)) { throw 'Runner aggregate repetitions must be positive and unique.' }
-            }
+            if ($null -eq $repetition -or $repetition -isnot [ValueType] -or [double]$repetition -ne [int]$repetition -or [int]$repetition -lt 1 -or [int]$repetition -gt $expectedRepetitions -or -not $repetitions.Add([int]$repetition)) { throw 'Runner aggregate repetitions must be the complete unique integer set requested by the matrix.' }
         }
         [double] $durationP95 = 0
-        [bool] $hasDuration = $durations.Count -gt 0
+        # Never label a subset of durations as the repetition p95 (for example,
+        # mixed skipped/passed repetitions from a custom runner).
+        [bool] $hasDuration = $durations.Count -eq $expectedRepetitions
         if ($hasDuration) {
             [double[]] $orderedDurations = $durations.ToArray()
             [Array]::Sort($orderedDurations)
@@ -979,6 +982,8 @@ function Assert-RunnerResult {
             arm = [string]$Context.Arm
             seed = [int]$Context.Seed
             status = $status
+            expectedRepetitions = $expectedRepetitions
+            trialsTruncated = $false
             latencyMs = if ($hasDuration) { $durationP95 } else { $null }
             latencyStatistic = if ($hasDuration) { 'durationMsP95' } else { $null }
             cleanup = ConvertTo-RedactedValue $rootCleanup
@@ -1069,6 +1074,9 @@ function Invoke-OneLatencyArm {
         [Parameter(Mandatory = $true)] [int] $ResultLimit
     )
     New-Item -ItemType Directory -Force -Path $ArmRoot | Out-Null
+    $expectedRepetitions = Get-OptionalProperty $Cell.Scenario 'repetitions'
+    if ($null -eq $expectedRepetitions) { $expectedRepetitions = 1 }
+    if ($expectedRepetitions -isnot [ValueType] -or [double]$expectedRepetitions -ne [int]$expectedRepetitions -or [int]$expectedRepetitions -lt 1 -or [int]$expectedRepetitions -gt 1024) { throw 'Matrix repetitions must be an integer from 1 to 1024.' }
     $final = $null
     $attemptRecords = New-Object 'System.Collections.Generic.List[object]'
     for ($attempt = 1; $attempt -le ($Retries + 1); $attempt++) {
@@ -1084,6 +1092,7 @@ function Invoke-OneLatencyArm {
             trialId = [string]$Cell.TrialId
             baseTrialId = [string]$Cell.BaseTrialId
             runnerTrialId = [string]$Cell.BaseTrialId
+            expectedRepetitions = [int]$expectedRepetitions
             arm = $ArmName
             mode = [string]$Cell.Mode
             provider = [string]$Cell.Provider
@@ -1247,6 +1256,11 @@ function Invoke-LatencyAbExperiment {
         throw 'Artifact output must be outside both experiment worktrees.'
     }
     $defaultRunnerRelativePath = 'coordinator\src\benchmark\latency-runner-cli.mjs'
+    # A deliberate common runner keeps its caller-relative path contract;
+    # only per-arm overrides are always relative to their respective arm.
+    if (-not [string]::IsNullOrWhiteSpace($RunnerPath) -and -not [IO.Path]::IsPathRooted($RunnerPath) -and (Test-Path -LiteralPath $RunnerPath -PathType Leaf)) {
+        $RunnerPath = (Resolve-Path -LiteralPath $RunnerPath).ProviderPath
+    }
     $commonResolvedRunner = if ([string]::IsNullOrWhiteSpace($RunnerPath)) { $null } else { Resolve-RunnerPathForArm -RequestedPath $RunnerPath -WorktreePath $resolvedBaseline -DefaultRelativePath $defaultRunnerRelativePath }
     if ($null -ne $commonResolvedRunner -and [IO.Path]::GetExtension($commonResolvedRunner).ToLowerInvariant() -in @('.mjs', '.js') -and [string]::IsNullOrWhiteSpace($BaselineRunnerPath) -and [string]::IsNullOrWhiteSpace($OptimizedRunnerPath) -and -not $NeutralRunner) {
         throw 'A single Node runner cannot be used for both arms unless -NeutralRunner is explicit; provide -BaselineRunnerPath and -OptimizedRunnerPath.'
@@ -1255,6 +1269,9 @@ function Invoke-LatencyAbExperiment {
     if ($null -eq $baselineResolvedRunner) { $baselineResolvedRunner = Resolve-RunnerPathForArm -RequestedPath $null -WorktreePath $resolvedBaseline -DefaultRelativePath $defaultRunnerRelativePath }
     $optimizedResolvedRunner = if ([string]::IsNullOrWhiteSpace($OptimizedRunnerPath)) { $commonResolvedRunner } else { Resolve-RunnerPathForArm -RequestedPath $OptimizedRunnerPath -WorktreePath $resolvedOptimized -DefaultRelativePath $defaultRunnerRelativePath }
     if ($null -eq $optimizedResolvedRunner) { $optimizedResolvedRunner = Resolve-RunnerPathForArm -RequestedPath $null -WorktreePath $resolvedOptimized -DefaultRelativePath $defaultRunnerRelativePath }
+    if (-not $NeutralRunner -and (Test-PathEqual $baselineResolvedRunner $optimizedResolvedRunner) -and [IO.Path]::GetExtension($baselineResolvedRunner).ToLowerInvariant() -in @('.mjs', '.js')) {
+        throw 'A single Node runner cannot be used for both arms unless -NeutralRunner is explicit; provide distinct per-arm runner paths.'
+    }
     $baselineCommandPlan = Get-RunnerCommandPlan $baselineResolvedRunner
     $optimizedCommandPlan = Get-RunnerCommandPlan $optimizedResolvedRunner
     $baselineReplayPath = Resolve-OptionalReplayRecordingsPath -RequestedPath $BaselineReplayRecordingsPath -WorktreePath $resolvedBaseline

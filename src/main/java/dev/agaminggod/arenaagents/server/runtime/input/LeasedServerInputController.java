@@ -82,12 +82,16 @@ public final class LeasedServerInputController implements ServerInputController 
 	public synchronized void clear(AgentId agentId) {
 		Objects.requireNonNull(agentId, "agentId must not be null");
 		LinkedHashMap<InputLease, LeaseState> current = states.get(agentId);
-		if (current == null) return;
-		AgentInputState previous = winningState(current).orElse(null);
-		long nextRevision = Math.incrementExact(mutationRevision);
+		if (current == null && !uncertainPhysicalStates.containsKey(agentId)) return;
+		AgentInputState previous = current == null ? null : winningState(current).orElse(null);
+		// Full revocation (disconnect/stop) is final even when physical cleanup faults.
+		// Keep only the neutralization obligation, never a lease that can replay old input.
+		if (current != null) {
+			long nextRevision = Math.incrementExact(mutationRevision);
+			states.remove(agentId);
+			mutationRevision = nextRevision;
+		}
 		clearPhysical(agentId, uncertainPhysicalStates.getOrDefault(agentId, previous));
-		states.remove(agentId);
-		mutationRevision = nextRevision;
 	}
 
 	@Override
@@ -102,6 +106,15 @@ public final class LeasedServerInputController implements ServerInputController 
 	public synchronized void tick() {
 		currentTick = Math.incrementExact(currentTick);
 		RuntimeException failure = null;
+		for (AgentId agentId : java.util.List.copyOf(uncertainPhysicalStates.keySet())) {
+			if (states.containsKey(agentId)) continue;
+			try {
+				clearPhysical(agentId, uncertainPhysicalStates.get(agentId));
+			} catch (RuntimeException exception) {
+				if (failure == null) failure = exception;
+				else if (failure != exception) failure.addSuppressed(exception);
+			}
+		}
 		var agents = states.entrySet().iterator();
 		while (agents.hasNext()) {
 			Map.Entry<AgentId, LinkedHashMap<InputLease, LeaseState>> entry = agents.next();

@@ -15,12 +15,59 @@ final class HumanSpeechCaptureVerification {
 	private HumanSpeechCaptureVerification() {
 	}
 
-	static int verify() {
+	static int verify() throws Exception {
 		int assertions = verifySpeechTimeAudienceSurvivesTranscription();
 		assertions += verifyNoRecipientIsVisible();
 		assertions += verifyAudienceIsCapturedBeforeReporting();
 		assertions += verifyDeliveryFailureIsVisible();
 		assertions += verifyCanceledContextCannotDeliverIntoReusedSequence();
+		assertions += verifyBackoffTerminatesDiscardedContexts();
+		return assertions;
+	}
+
+	private static int verifyBackoffTerminatesDiscardedContexts() throws Exception {
+		int assertions = 0;
+		UUID other = UUID.fromString("20000000-0000-4000-8000-000000000011");
+		for (String code : List.of("STT_CAPACITY", "STT_RATE_LIMITED", "STT_UNAVAILABLE", "STT_TIMEOUT")) {
+			boolean global = code.equals("STT_RATE_LIMITED") || code.equals("STT_UNAVAILABLE");
+			boolean discards = !code.equals("STT_TIMEOUT");
+			var adapter = adapter(new AtomicReference<>(List.of("listener")),
+					new ArrayList<>(), new ArrayList<>(), new ArrayList<>());
+			List<SpeechCaptureEngine.InputActivity> phases = new ArrayList<>();
+			CompletableFuture<SpeechWorkerClient.Transcript> pending = new CompletableFuture<>();
+			List<Runnable> callbacks = new ArrayList<>();
+			try (SpeechCaptureEngine engine = new SpeechCaptureEngine(
+					(player, sequence, whispering, samples) -> pending,
+					Executors.newSingleThreadScheduledExecutor(), 60_000L, 60_000L, 2, 2,
+					ignored -> { }, activity -> { phases.add(activity); adapter.report(activity); }, () -> 0L
+			)) {
+				SpeechCaptureEngine.TranscriptDeliveryFactory delivery = (player, sequence) ->
+						adapter.begin("server", callbacks::add, player, sequence, false);
+				for (UUID player : List.of(PLAYER, PLAYER, PLAYER, other)) {
+					engine.accept(player, false, new byte[] { 1 }, HumanSpeechCaptureVerification::decoder,
+							callbacks::add, delivery);
+				}
+				var contextsField = HumanSpeechCapture.InputActivityAdapter.class.getDeclaredField("contexts");
+				contextsField.setAccessible(true);
+				var contexts = (java.util.Map<?, ?>) contextsField.get(adapter);
+				assertEquals(3, contexts.size(), "active request and two partials own separate contexts");
+				pending.completeExceptionally(new VoiceWorkerClient.VoiceWorkerException(code, "fixture"));
+				while (!callbacks.isEmpty()) callbacks.removeFirst().run();
+				assertEquals(global ? 0 : discards ? 1 : 2, contexts.size(),
+						"only discarded partials release their contexts during " + code);
+				assertEquals(discards ? 1L : 0L, phases.stream()
+						.filter(p -> p.playerId().equals(PLAYER) && p.utteranceSequence() == 2L)
+						.filter(p -> p.phase() == SpeechCaptureEngine.InputActivity.Phase.FAILED).count(),
+						"same-player partial gets exactly one terminal when discarded by " + code);
+				assertEquals(global ? 1L : 0L, phases.stream()
+						.filter(p -> p.playerId().equals(other))
+						.filter(p -> p.phase() == SpeechCaptureEngine.InputActivity.Phase.FAILED).count(),
+						"other-player partial follows the backoff scope for " + code);
+				assertions += 4;
+			} finally {
+				adapter.clear();
+			}
+		}
 		return assertions;
 	}
 

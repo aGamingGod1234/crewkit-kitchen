@@ -86,7 +86,8 @@ public final class ScenarioRuntimeService {
 				|| state.preparationSnapshot != null) {
 			throw new IllegalStateException("An arena is already being prepared");
 		}
-		if (state.activeRun != null || state.pendingResult != null) {
+		if (state.activeRun != null || state.pendingResult != null || state.recovery != null
+				|| state.cleanup != null || !state.cancelCleanupIds.isEmpty()) {
 			throw new IllegalStateException("A scenario is already running");
 		}
 		CodexAgentManager manager = CodexAgentManager.get(server);
@@ -214,6 +215,7 @@ public final class ScenarioRuntimeService {
 		RuntimeState state = STATES.get(server);
 		if (state == null) return;
 		state.runtimeTick++;
+		retryPreparationJournalClear(state);
 		if (state.pendingConfirmation != null
 				&& state.runtimeTick > state.pendingConfirmation.expiresAtTick) {
 			state.pendingConfirmation = null;
@@ -268,7 +270,8 @@ public final class ScenarioRuntimeService {
 		if (state == null) return Optional.empty();
 		if (state.pendingResult != null) {
 			ScenarioRunSnapshot snapshot = state.pendingResult.snapshot;
-			return Optional.of(publicViewFromSnapshot(server, state, snapshot, true));
+			return Optional.of(publicViewFromSnapshot(server, state, snapshot, true,
+					state.pendingResult.result.canonicalSha256()));
 		}
 		if (state.activeRun != null) {
 			ActiveRun run = state.activeRun;
@@ -302,7 +305,7 @@ public final class ScenarioRuntimeService {
 			));
 		}
 		if (state.recovery != null) {
-			return Optional.of(publicViewFromSnapshot(server, state, state.recovery.snapshot, false));
+			return Optional.of(publicViewFromSnapshot(server, state, state.recovery.snapshot, false, ""));
 		}
 		if (state.activation != null) {
 			ActivationJob activation = state.activation;
@@ -375,7 +378,8 @@ public final class ScenarioRuntimeService {
 			MinecraftServer server,
 			RuntimeState state,
 			ScenarioRunSnapshot snapshot,
-			boolean terminal
+			boolean terminal,
+			String resultHash
 	) {
 		ScenarioPreset preset = ScenarioPresets.require(snapshot.scenarioId());
 		BlockPos origin = new BlockPos(snapshot.origin().x(), snapshot.origin().y(), snapshot.origin().z());
@@ -402,7 +406,7 @@ public final class ScenarioRuntimeService {
 				snapshot.mapVersion(),
 				snapshot.worldSeed(),
 				snapshot.eventSeed(),
-				terminal ? resultFromSnapshot(snapshot).canonicalSha256() : "",
+				resultHash,
 				origin.getX(), origin.getY(), origin.getZ(),
 				publicParticipants(server, participants, snapshot.scores(), bindings, origin, Map.of()),
 				snapshot.publicEvents()
@@ -529,11 +533,9 @@ public final class ScenarioRuntimeService {
 		}
 		if (prepared.isPresent() && saved.isPresent()
 				&& prepared.orElseThrow().sessionId().equals(saved.orElseThrow().sessionId())) {
-			try {
-				preparationJournal.clear();
-			} catch (java.io.IOException exception) {
-				LOGGER.warn("Could not clear superseded scenario preparation journal", exception);
-			}
+			state.preparationJournal = preparationJournal;
+			state.preparationSnapshot = prepared.orElseThrow();
+			clearPreparationJournal(state);
 		}
 		if (saved.isEmpty()) return true;
 		ScenarioRunSnapshot snapshot = saved.orElseThrow();
@@ -1125,16 +1127,33 @@ public final class ScenarioRuntimeService {
 	}
 
 	private static void clearPreparationJournal(RuntimeState state) {
-		if (state.preparationJournal != null) {
+		state.pendingPreparationClear = new PendingPreparationClear(
+				state.preparationJournal, state.preparationSnapshot);
+		retryPreparationJournalClear(state);
+	}
+
+	private static void retryPreparationJournalClear(RuntimeState state) {
+		PendingPreparationClear pending = state.pendingPreparationClear;
+		if (pending == null) return;
+		// Only the completed operation's exact owner may be released. Never delete a later journal.
+		if (state.preparationJournal != pending.journal || state.preparationSnapshot != pending.snapshot) {
+			state.pendingPreparationClear = null;
+			return;
+		}
+		if (pending.journal != null) {
 			try {
-				state.preparationJournal.clear();
+				pending.journal.clear();
 			} catch (java.io.IOException exception) {
-				LOGGER.error("Could not clear completed scenario preparation journal", exception);
+				if (!pending.failureLogged) {
+					LOGGER.error("Could not clear completed scenario preparation journal; deletion will retry", exception);
+					pending.failureLogged = true;
+				}
 				return;
 			}
 		}
 		state.preparationJournal = null;
 		state.preparationSnapshot = null;
+		state.pendingPreparationClear = null;
 	}
 
 	private static ScenarioRunSnapshot persistActiveRun(RuntimeState state) {
@@ -1195,6 +1214,7 @@ public final class ScenarioRuntimeService {
 		);
 		state.pendingResult = new PendingResult(
 				snapshot,
+				result,
 				new ScenarioResultPersistence(
 						result,
 						value -> writer.writeAsync(value, java.util.concurrent.ForkJoinPool.commonPool())
@@ -1356,9 +1376,8 @@ public final class ScenarioRuntimeService {
 			state.cancelCleanupIds = activationCleanupIds(cleanupSucceeded, cleanupIds);
 			if (cleanupSucceeded && ScenarioActivationFailurePolicy.retryWhenCoordinatorReturns(exception)
 					&& state.preparationJournal != null && state.preparationSnapshot != null) {
-				state.preparationSnapshot = preparationWithoutAgents(state.preparationSnapshot);
 				try {
-					state.preparationJournal.write(state.preparationSnapshot);
+					resetPreparationAgents(state);
 				} catch (java.io.IOException journalFailure) {
 					throw new IllegalStateException("PREPARATION_JOURNAL_UNAVAILABLE", journalFailure);
 				}
@@ -1471,10 +1490,19 @@ public final class ScenarioRuntimeService {
 			ScenarioPreparationJournal.Snapshot snapshot
 	) {
 		Objects.requireNonNull(snapshot, "snapshot must not be null");
+		if (snapshot.agentIds().isEmpty()) return snapshot;
 		return new ScenarioPreparationJournal.Snapshot(
 				snapshot.sessionId(), snapshot.operatorId(), snapshot.dimensionId(), snapshot.origin(), snapshot.request(),
 				snapshot.worldSeed(), snapshot.eventSeed(), snapshot.createdAtEpochMs(), List.of(),
 				snapshot.cancellationRequested());
+	}
+
+	private static void resetPreparationAgents(RuntimeState state) throws java.io.IOException {
+		ScenarioPreparationJournal.Snapshot cleared = preparationWithoutAgents(state.preparationSnapshot);
+		// An empty rollback has not changed durable ownership. Do not force the same file every retry tick.
+		if (cleared == state.preparationSnapshot) return;
+		state.preparationJournal.write(cleared);
+		state.preparationSnapshot = cleared;
 	}
 
 	private static boolean retryFailedRecoveryCleanup(RuntimeState state, MinecraftServer server) {
@@ -1533,32 +1561,34 @@ public final class ScenarioRuntimeService {
 
 	private static void populateArenaContainers(BuildJob build) {
 		if (build.config.preset().category() != dev.agaminggod.arenaagents.scenario.ScenarioCategory.PVP) return;
-		for (ScenarioArenaBlueprint.Placement placement :
-				ScenarioArenaResetJob.canonicalize(build.blueprint.placements())) {
-			if (placement.state().getBlock() != Blocks.CHEST && placement.state().getBlock() != Blocks.BARREL) continue;
+		// Final containers were indexed by the budgeted reset, so completion never rescans the arena.
+		for (ScenarioArenaBlueprint.Placement placement : build.reset.canonicalContainerPlacements()) {
 			if (!(build.level.getBlockEntity(placement.position()) instanceof Container container)) {
 				throw new IllegalStateException("MISSING_LOOT_CONTAINER_AT_" + placement.position().toShortString());
 			}
-			ScenarioLootManifest manifest = ScenarioLootManifest.forContainer(
-					build.blueprint.origin(), placement.position(), build.config.worldSeed());
-			Map<Integer, ItemStack> expected = new java.util.HashMap<>();
-			for (ScenarioLootManifest.Entry entry : manifest.entries()) {
-				if (entry.slot() >= container.getContainerSize()) {
-					throw new IllegalStateException("LOOT_SLOT_OUT_OF_RANGE_AT_" + placement.position().toShortString());
-				}
-				expected.put(entry.slot(), lootStack(entry));
+			populateArenaContainer(container, build.blueprint.origin(), placement.position(), build.config.worldSeed());
+		}
+	}
+
+	private static void populateArenaContainer(Container container, BlockPos origin, BlockPos position, long worldSeed) {
+		ScenarioLootManifest manifest = ScenarioLootManifest.forContainer(origin, position, worldSeed);
+		Map<Integer, ItemStack> expected = new java.util.HashMap<>();
+		for (ScenarioLootManifest.Entry entry : manifest.entries()) {
+			if (entry.slot() >= container.getContainerSize()) {
+				throw new IllegalStateException("LOOT_SLOT_OUT_OF_RANGE_AT_" + position.toShortString());
 			}
-			for (int slot = 0; slot < container.getContainerSize(); slot++) {
-				ItemStack wanted = expected.getOrDefault(slot, ItemStack.EMPTY);
-				if (!sameStack(container.getItem(slot), wanted)) container.setItem(slot, wanted.copy());
-			}
-			container.setChanged();
-			for (int slot = 0; slot < container.getContainerSize(); slot++) {
-				ItemStack wanted = expected.getOrDefault(slot, ItemStack.EMPTY);
-				if (!sameStack(container.getItem(slot), wanted)) {
-					throw new IllegalStateException("LOOT_VERIFICATION_FAILED_AT_"
-							+ placement.position().toShortString() + "_SLOT_" + slot);
-				}
+			expected.put(entry.slot(), lootStack(entry));
+		}
+		for (int slot = 0; slot < container.getContainerSize(); slot++) {
+			ItemStack wanted = expected.getOrDefault(slot, ItemStack.EMPTY);
+			if (!sameStack(container.getItem(slot), wanted)) container.setItem(slot, wanted.copy());
+		}
+		container.setChanged();
+		for (int slot = 0; slot < container.getContainerSize(); slot++) {
+			ItemStack wanted = expected.getOrDefault(slot, ItemStack.EMPTY);
+			if (!sameStack(container.getItem(slot), wanted)) {
+				throw new IllegalStateException("LOOT_VERIFICATION_FAILED_AT_"
+						+ position.toShortString() + "_SLOT_" + slot);
 			}
 		}
 	}
@@ -1887,6 +1917,7 @@ public final class ScenarioRuntimeService {
 		private PendingSiteConfirmation pendingConfirmation;
 		private ScenarioPreparationJournal preparationJournal;
 		private ScenarioPreparationJournal.Snapshot preparationSnapshot;
+		private PendingPreparationClear pendingPreparationClear;
 		private BuildJob build;
 		private BuildJob pendingActivation;
 		private ScenarioBuildProgress buildProgress;
@@ -1926,13 +1957,28 @@ public final class ScenarioRuntimeService {
 		}
 	}
 
+	private static final class PendingPreparationClear {
+		private final ScenarioPreparationJournal journal;
+		private final ScenarioPreparationJournal.Snapshot snapshot;
+		private boolean failureLogged;
+
+		private PendingPreparationClear(
+				ScenarioPreparationJournal journal, ScenarioPreparationJournal.Snapshot snapshot
+		) {
+			this.journal = journal;
+			this.snapshot = snapshot;
+		}
+	}
+
 	private static final class PendingResult {
 		private final ScenarioRunSnapshot snapshot;
+		private final MatchResultV1 result;
 		private final ScenarioResultPersistence persistence;
 		private int loggedAttempts;
 
-		private PendingResult(ScenarioRunSnapshot snapshot, ScenarioResultPersistence persistence) {
+		private PendingResult(ScenarioRunSnapshot snapshot, MatchResultV1 result, ScenarioResultPersistence persistence) {
 			this.snapshot = Objects.requireNonNull(snapshot, "snapshot must not be null");
+			this.result = Objects.requireNonNull(result, "result must not be null");
 			this.persistence = Objects.requireNonNull(persistence, "persistence must not be null");
 		}
 	}

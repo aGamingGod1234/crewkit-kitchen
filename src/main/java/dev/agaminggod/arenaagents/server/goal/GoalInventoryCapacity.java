@@ -87,11 +87,8 @@ public final class GoalInventoryCapacity {
 
 	private static Requirements merge(Requirements first, Requirements second) {
 		HashMap<String, Integer> combined = new HashMap<>(first.fixed());
-		try {
-			second.fixed().forEach((itemId, count) -> combined.merge(itemId, count, Math::addExact));
-		} catch (ArithmeticException exception) {
-			throw new AgentDomainException("INVALID_GOAL_PREDICATE", "Combined inventory count is outside the supported range");
-		}
+		// Each factual threshold reads the same inventory; only distinct item IDs consume separate space.
+		second.fixed().forEach((itemId, count) -> combined.merge(itemId, count, Math::max));
 		ArrayList<GoalPredicate.InventoryContainsAny> categories = new ArrayList<>(first.categories());
 		categories.addAll(second.categories());
 		// Repeated generic block facts test the same inventory, just like overlapping item categories.

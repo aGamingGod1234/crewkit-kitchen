@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -6,6 +7,7 @@ import test from 'node:test';
 
 import { runLatencyMatrix, normalizeLatencyMatrix } from '../src/benchmark/latency-runner.mjs';
 import { BenchmarkRecorder } from '../src/benchmark/benchmark-recorder.mjs';
+import { compareInstrumentationRuns } from '../src/benchmark/instrumentation-comparison.mjs';
 import { createReplayProvider, createReplayRecord } from '../src/benchmark/provider-replay.mjs';
 import { getSimulatorScenario } from '../src/simulator/simulator-scenarios.mjs';
 import { compileScenarioDecision } from '../src/benchmark/scenario-program.mjs';
@@ -223,7 +225,7 @@ test('records only declared hazard and direct-message event timing', async () =>
 	assert.equal(lava.metrics.raw.hazardReaction[0].eventId, 'lava-hazard-1');
 	assert.equal(lava.metrics.result.hazardReaction.reactionActionType, 'navigate_to');
 	assert.equal(lava.metrics.raw.hazardReaction[0].reactionWallLatencyMs, 0);
-	assert.equal(message.status, 'PASSED');
+	assert.equal(message.status, 'FAILED');
 	assert.equal(message.metrics.result.directMessageReaction.eventId, 'conversation-1');
 	assert.equal(message.metrics.result.directMessageReaction.reactionWallLatencyMs, null);
 	const respawnScenario = {
@@ -252,15 +254,15 @@ test('does not attribute a sender follow-up action as a direct-message recipient
 	const trial = { ...matrix().trials[0], id: 'sender-only-direct-message', scenarioId: scenario.id, turnCap: 20 };
 	const result = await runLatencyMatrix({ matrix: matrix({ trials: [trial] }), scenarioResolver: () => scenario, artifactDirectory: null });
 	const reaction = result.trials[0].metrics.result.directMessageReaction;
-	assert.equal(result.trials[0].status, 'PASSED');
+	assert.equal(result.trials[0].status, 'FAILED');
 	assert.equal(reaction.eventId, 'conversation-1');
 	assert.equal(reaction.reactionWallLatencyMs, null);
 	assert.equal(reaction.reactionVirtualLatencyMs, null);
 });
 
-test('measurement instrumentation does not change authoritative action command bytes', async () => {
+test('measurement instrumentation does not change comparable action commands', async () => {
 	const run = (measurements) => runLatencyMatrix({
-		matrix: matrix({ trials: [{ ...matrix().trials[0], id: measurements ? 'metrics-on' : 'metrics-off', scenarioId: 'fixture-movement', agentLoad: 1 }] }),
+		matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'metrics-parity', scenarioId: 'fixture-movement', agentLoad: 1 }] }),
 		scenarioResolver: () => movementScenario(),
 		providerFactories: { instant: () => movementProvider() },
 		measurements,
@@ -279,6 +281,107 @@ test('measurement instrumentation does not change authoritative action command b
 	assert.equal(disabled.summary, 0);
 });
 
+test('command parity hashes actual ordered commands for every agent and rejects changed arguments', async () => {
+	const digest = (commands) => `sha256:${createHash('sha256').update(JSON.stringify(commands)).digest('hex')}`;
+	const run = async (durationMs) => {
+		let virtual;
+		const result = await runLatencyMatrix({
+			matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'command-parity', agentLoad: 4, turnBudgetMs: 1_000, trialBudgetMs: 5_000 }] }),
+			scenarioResolver: () => ({ ...fixtureScenario(), success: () => true }),
+			providerFactories: { instant: () => ({ ...instantProvider(), async createAgent() {
+				return { async setGoalRevision() {}, async decide() {
+					return fixtureDecision({ source: `program.onUnhandledAttention("continue_and_notify"); await player.wait(${durationMs}); await player.wait(3); program.finish("done");` });
+				} };
+			} }) },
+			virtualBridgeFactory: (options) => { virtual = new VirtualMinecraftBridge(options); return virtual; },
+			artifactDirectory: null,
+		});
+		assert.equal(result.trials[0].status, 'PASSED');
+		const commands = virtual.sent.filter((event) => event.type === 'action_command').map((event) => ({ ...event.payload, agentId: event.agentId }));
+		assert.equal(commands.length, 8);
+		assert.deepEqual([...new Set(commands.map((command) => command.agentId))].sort(), ['agent-2', 'agent-3', 'agent-4', 'agent-a']);
+		for (const agentId of new Set(commands.map((command) => command.agentId))) {
+			assert.deepEqual(commands.filter((command) => command.agentId === agentId).map((command) => command.arguments.durationMs), [durationMs, 3]);
+		}
+		const comparable = commands.map((command) => ({ ...command, actionId: `program:${command.actionId.split(':').at(-1)}` }));
+		assert.equal(result.trials[0].debug.actionCommandHash, digest(comparable));
+		assert.notEqual(result.trials[0].debug.actionCommandHash, digest([]));
+		assert.notEqual(result.trials[0].debug.actionCommandHash, digest([...comparable].reverse()));
+		assert.notEqual(result.trials[0].debug.actionCommandHash, digest(comparable.map(({ agentId, ...command }) => command)));
+		return result;
+	};
+	const original = await run(1);
+	const changed = await run(2);
+	assert.equal(original.trials[0].debug.scenarioDigest, changed.trials[0].debug.scenarioDigest);
+	assert.notEqual(original.trials[0].debug.actionCommandHash, changed.trials[0].debug.actionCommandHash);
+	const comparison = compareInstrumentationRuns({ enabled: original, disabled: changed, minimumSamples: 1 });
+	assert.equal(comparison.checks.find((check) => check.code === 'INSTRUMENTATION_BEHAVIOR_PARITY').status, 'FAILED');
+});
+
+test('live-session parity ignores only session identity and still rejects changed arguments, agents, and order', async () => {
+	const profile = { provider: 'codex', model: 'fixture-model', reasoningEffort: 'high', serviceTier: 'fast' };
+	const run = async ({ measurements = true, waits = [1, 3], agentId = 'agent-a' } = {}) => {
+		let virtual;
+		const scenario = fixtureScenario();
+		scenario.world.agents = { [agentId]: scenario.world.agents[scenario.agentId] };
+		scenario.agentId = agentId;
+		const result = await runLatencyMatrix({
+			matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'live-command-parity', mode: 'live', providerProfile: profile, agentLoad: 4, turnBudgetMs: 1_000, trialBudgetMs: 5_000 }] }),
+			scenarioResolver: () => ({ ...scenario, success: () => true }),
+			providerFactories: { codex: () => ({ ...profile, synthetic: false, available: true, async createAgent() {
+				return { async setGoalRevision() {}, async decide() {
+					return fixtureDecision({ source: `program.onUnhandledAttention("continue_and_notify"); await player.wait(${waits[0]}); await player.wait(${waits[1]}); program.finish("done");` });
+				} };
+			} }) },
+			virtualBridgeFactory: (options) => { virtual = new VirtualMinecraftBridge(options); return virtual; },
+			measurements,
+			artifactDirectory: null,
+		});
+		assert.equal(result.trials[0].status, 'PASSED');
+		return { result, commands: virtual.sent.filter((event) => event.type === 'action_command') };
+	};
+	const enabled = await run();
+	const disabled = await run({ measurements: false });
+	assert.notEqual(enabled.commands[0].payload.actionId, disabled.commands[0].payload.actionId, 'live dispatch IDs must retain session isolation');
+	const parity = (peer) => compareInstrumentationRuns({ enabled: enabled.result, disabled: peer.result, minimumSamples: 1 }).checks.find((check) => check.code === 'INSTRUMENTATION_BEHAVIOR_PARITY').status;
+	assert.equal(parity(disabled), 'PASSED');
+	for (const changes of [{ waits: [2, 3] }, { waits: [3, 1] }, { agentId: 'different-agent' }]) {
+		assert.equal(parity(await run(changes)), 'FAILED');
+	}
+});
+
+test('live-mode synthetic providers retain synthetic identity in results and events', async () => {
+	const profile = { provider: 'codex', model: 'fixture-model', reasoningEffort: 'high', serviceTier: 'fast' };
+	for (const synthetic of [true, false]) {
+		const result = await runLatencyMatrix({
+			matrix: matrix({ trials: [{ ...matrix().trials[0], mode: 'live', providerProfile: profile }] }),
+			scenarioResolver: () => fixtureScenario(),
+			providerFactories: { codex: () => ({ ...instantProvider(), ...profile, synthetic }) },
+			includeRawEvents: true,
+			artifactDirectory: null,
+		});
+		assert.equal(result.trials[0].status, 'PASSED');
+		assert.equal(result.trials[0].mode, 'live');
+		assert.deepEqual(result.trials[0].providerIdentity, { provider: 'codex', synthetic });
+		assert.ok(result.rawEvents.length > 0);
+		assert.deepEqual(result.rawEvents.filter((event) => event.synthetic !== synthetic), []);
+	}
+});
+
+test('synthetic live-provider failures and skips retain their provenance', async () => {
+	const profile = { provider: 'codex', model: 'fixture-model', reasoningEffort: 'high', serviceTier: 'fast' };
+	for (const available of [true, false]) {
+		const result = await runLatencyMatrix({
+			matrix: matrix({ trials: [{ ...matrix().trials[0], mode: 'live', providerProfile: profile }] }),
+			scenarioResolver: () => fixtureScenario(),
+			providerFactories: { codex: () => ({ ...profile, synthetic: true, available, async start() { throw new Error('fixture startup failure'); } }) },
+			artifactDirectory: null,
+		});
+		assert.equal(result.trials[0].status, available ? 'FAILED' : 'SKIPPED');
+		assert.deepEqual(result.trials[0].providerIdentity, { provider: 'codex', synthetic: true });
+	}
+});
+
 test('polls conversation history only while a declared chat event is pending', async () => {
 	const original = VirtualWorld.prototype.conversationEvents;
 	let calls = 0;
@@ -293,7 +396,7 @@ test('polls conversation history only while a declared chat event is pending', a
 			},
 			artifactDirectory: null,
 		});
-		assert.equal(result.trials[0].status, 'PASSED');
+		assert.equal(result.trials[0].status, 'FAILED');
 		assert.equal(result.trials[0].metrics.raw.directMessageReaction.length, 1);
 		assert.ok(calls > 0);
 		assert.ok(calls < result.trials[0].metrics.raw.ticks.length, `conversation history was read ${calls} times for ${result.trials[0].metrics.raw.ticks.length} ticks`);
@@ -482,6 +585,9 @@ test('provider stop after a timeout is bounded by cleanup policy', async () => {
 	});
 	assert.equal(result.trials[0].status, 'TIMED_OUT');
 	assert.ok(performance.now() - startedAt < 220, 'timeout cleanup must not wait for an unbounded provider stop');
+	assert.equal(result.cleanup.ok, false, 'pending shutdown cannot be certified clean');
+	assert.equal(result.trials[0].cleanup.providerStop, 'pending');
+	assert.equal(result.executionStopped.code, 'CLEANUP_INCOMPLETE');
 });
 
 test('malformed planner/runtime decisions remain typed failures instead of timeout results', async () => {

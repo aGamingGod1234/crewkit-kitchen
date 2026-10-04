@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { EventEmitter } from 'node:events';
+import { CodexService } from '../src/codex-service.mjs';
 
 import { AgentPlanner } from '../src/agent-planner.mjs';
 import { DynamicAgentState } from '../src/agent-registry.mjs';
@@ -850,7 +852,7 @@ test('planning lease expiry tears down only the matching exact provider generati
 	await scheduleOptions.onLeaseExpired();
 	assert.deepEqual(replacements, [{
 		record: RECORD,
-		options: { recoverySummary: 'planning_lease_expired', controlProtocol: 'arena_script', expectedSessionGeneration: 4 },
+		options: { recoverySummary: null, resetReason: 'planning_lease_expired', controlProtocol: 'arena_script', expectedSessionGeneration: 4 },
 	}]);
 });
 
@@ -1174,4 +1176,74 @@ test('preserves attempt and retry metadata through corrective provider retries',
 		{ attempt: 1, retry: false },
 		{ attempt: 2, retry: true },
 	]);
+});
+
+
+test('native planner records the encoded wire input and scoped usage through real service success and failure', async (t) => {
+	class NativeTransport extends EventEmitter {
+		calls = [];
+		turns = 0;
+		async start() {}
+		async stop() {}
+		notify() {}
+		respond() {}
+		async request(method, params) {
+			this.calls.push({ method, params });
+			if (method === 'initialize' || method === 'turn/interrupt') return {};
+			if (method === 'model/list') return { data: [{ id: 'gpt-5.6-sol', model: 'gpt-5.6-sol', supportedReasoningEfforts: [{ reasoningEffort: 'high' }], serviceTiers: [{ id: 'fast' }] }], nextCursor: null };
+			if (method === 'thread/start') return { thread: { id: 'usage-thread' } };
+			if (method === 'turn/start') return { turn: { id: `usage-turn-${++this.turns}` } };
+			if (method === 'turn/steer') return { turnId: params.expectedTurnId };
+			throw new Error(`Unexpected ${method}`);
+		}
+	}
+	const transport = new NativeTransport();
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	const scheduler = new PlanningScheduler({ maxConcurrent: 1, maxPending: 1 });
+	t.after(async () => { scheduler.close(); await service.stop(); });
+	const record = { ...RECORD, provider: 'codex', model: 'gpt-5.6-sol' };
+	const turns = [], telemetry = [], traces = [];
+	const planner = new AgentPlanner({
+		registry: { assertCurrentRevision: () => record, setState() {} }, scheduler, codexService: service,
+		turnRecorder: { record: (row) => turns.push(row) }, telemetrySink: (row) => telemetry.push(row),
+		recorder: { record: (stage, context, fields) => traces.push({ stage, ...fields }) },
+	});
+	const tick = () => new Promise((resolve) => setImmediate(resolve));
+	const usage = (inputTokens, outputTokens) => transport.emit('notification', { method: 'thread/tokenUsage/updated', params: {
+		threadId: 'usage-thread', tokenUsage: { total: { inputTokens, outputTokens }, last: { inputTokens: 9999 } },
+	} });
+	const input = 'Native event\n' + JSON.stringify({ event: 'observation', observation: { entities: Array.from({ length: 40 }, (_, id) => ({ id, name: 'repeated long exact entity name in the native context', type: 'minecraft:zombie', distance: 12 })) } });
+	const start = () => planner.requestNativeTurn({ agentId: AGENT_ID, input, goalRevision: GOAL_REVISION, traceId: 'actual-input-trace', executeTool: async () => ({ state: 'READY' }) });
+	const first = start(); await tick(); usage(100, 10); usage(150, 15);
+	transport.emit('notification', { method: 'turn/completed', params: { threadId: 'usage-thread', turn: { id: 'usage-turn-1', status: 'completed' } } });
+	await first;
+	const wireInput = transport.calls.find(({ method }) => method === 'turn/start').params.input[0].text;
+	assert.notEqual(wireInput, input, 'fixture exercises actual encoding');
+	assert.equal(turns[0].input, wireInput);
+	assert.equal(turns[0].inputBytes, Buffer.byteLength(wireInput));
+	assert.equal(turns[0].tokens.input, null);
+	assert.equal(turns[0].usage.status, 'baseline_unknown');
+	assert.equal(turns[0].sessionGeneration, 1);
+	assert.equal(turns[0].traceId, 'actual-input-trace');
+	assert.equal(turns[0].threadId, 'usage-thread');
+	const second = start(); await tick(); usage(175, 20); usage(200, 25);
+	transport.emit('notification', { method: 'turn/completed', params: { threadId: 'usage-thread', turn: { id: 'usage-turn-2', status: 'failed', error: { message: 'synthetic failure' } } } });
+	await assert.rejects(second, (error) => error.code === 'TURN_FAILED');
+	assert.equal(turns[1].tokens.input, 50);
+	assert.equal(turns[1].tokens.output, 10);
+	assert.equal(turns[1].input, wireInput);
+	assert.equal(turns[1].turnId, 'usage-turn-2');
+	assert.equal(turns[1].error.code, 'TURN_FAILED');
+	const failureTelemetry = telemetry.findLast(({ operation }) => operation === 'native_turn');
+	assert.equal(failureTelemetry.tokens.input, 50);
+	assert.equal(failureTelemetry.usage.scope, 'observed_thread_counter_delta');
+	assert.equal(failureTelemetry.usage.start.input, 150);
+	assert.equal(failureTelemetry.usage.end.input, 200);
+	assert.equal(failureTelemetry.usage.attributionComplete, false);
+	assert.equal(failureTelemetry.usage.gapBefore.input, 0);
+	assert.equal(failureTelemetry.turnId, 'usage-turn-2');
+	assert.equal(Object.hasOwn(failureTelemetry, 'input'), false);
+	const failureTrace = traces.findLast(({ stage }) => stage === 'provider_response_failed');
+	assert.equal(failureTrace.tokens.input, 50);
+	assert.equal(Object.hasOwn(failureTrace, 'input'), false, 'raw encoded input stays out of public trace paths');
 });

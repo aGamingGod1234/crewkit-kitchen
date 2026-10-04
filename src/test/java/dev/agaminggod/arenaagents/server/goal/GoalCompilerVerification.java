@@ -57,6 +57,8 @@ public final class GoalCompilerVerification {
 		assertions += verifyKillCountTranslationBounds();
 		assertions += verifyTranslatedKillConstraints();
 		assertions += verifyTranslatedItemConstraints();
+		assertions += GoalTranslationConstraintVerification.verify();
+		assertions += GoalMixedConstraintVerification.verify();
 		assertions += verifyRegistryCategoryTranslation();
 		assertions += verifyInventoryGroupConstraints();
 		assertions += verifyExplicitAlternativeCandidates();
@@ -67,7 +69,49 @@ public final class GoalCompilerVerification {
 		assertions += verifyDraftAuthorizationAndChoices();
 		assertions += verifySpecAwareLifecycleStart();
 		assertions += verifyRequesterPrincipal();
+		assertions += verifyDestructiveCompoundPreservation();
 		return assertions;
+	}
+
+	private static int verifyDestructiveCompoundPreservation() {
+		GoalCompiler compiler = new GoalCompiler();
+		int assertions = 0;
+		for (String request : List.of(
+				"break dirt at 1 64 1 and place stone at 2 64 2",
+				"break dirt at 1 64 1 then place stone at 2 64 2",
+				"break dirt at 1 64 1 and then place stone at 2 64 2",
+				"break dirt at 1 64 1; place stone at 2 64 2",
+				"break dirt at 1 64 1, place stone at 2 64 2",
+				"break dirt at 1 64 1 and break stone at 2 64 2",
+				"place stone at 2 64 2 and break dirt at 1 64 1")) {
+			GoalCompilation compilation = compiler.compile(request, RegistryAccess.EMPTY, 100L);
+			assertEquals(GoalCompilation.Kind.NEEDS_TRANSLATION, compilation.kind(), "compound block requests preserve every clause for translation");
+			assertEquals(java.util.Optional.empty(), compilation.acceptedSpec(), "no partial or reversed destructive goal is installed");
+			assertTrue(compiler.translationRequiresOperatorConfirmation(request, RegistryAccess.EMPTY), "block translation retains operator confirmation");
+			assertions += 3;
+		}
+		for (String separator : List.of(" and ", " then ", " and then ", "; ", ", ")) {
+			assertEquals(List.of("minecraft:air", "minecraft:stone"), compiler.candidateIdsFor(
+					"break dirt at 1 64 1" + separator + "place stone at 2 64 2", RegistryAccess.EMPTY),
+					"translation retains both the clearing and placement candidates: " + separator);
+			assertions++;
+		}
+		assertEquals(GoalCompilation.Kind.NEEDS_TRANSLATION, compiler.compile(
+				"break dirt at 1 64 1; inspect stone at 2 64 2", RegistryAccess.EMPTY, 100L).kind(),
+				"an unsupported action after a separator cannot clear its final position");
+		assertEquals(GoalCompilation.Kind.NEEDS_TRANSLATION, compiler.compile(
+				"break dirt at 1 64 1 before placing stone at 2 64 2", RegistryAccess.EMPTY, 100L).kind(),
+				"unsupported sequencing cannot bypass compound clarification");
+		assertEquals(new GoalPredicate.BlockMatches("minecraft:overworld", 1, 64, 1, "minecraft:air", Map.of()),
+				compiler.compile("break dirt at 1 64 1", RegistryAccess.EMPTY, 100L).acceptedSpec().orElseThrow().completion(),
+				"a single destructive clause retains its exact position");
+		assertEquals(new GoalPredicate.BlockMatches("minecraft:overworld", 1, 64, 1, "minecraft:air", Map.of()),
+				compiler.compile("break dirt at x=1, y=64, z=1", RegistryAccess.EMPTY, 100L).acceptedSpec().orElseThrow().completion(),
+				"labelled coordinate commas remain part of a single exact destructive clause");
+		assertEquals(new GoalPredicate.BlockMatches("minecraft:overworld", 1, 64, 1, "minecraft:air", Map.of()),
+				compiler.compile("break dirt at 1, 64, 1", RegistryAccess.EMPTY, 100L).acceptedSpec().orElseThrow().completion(),
+				"numeric coordinate commas remain part of a single exact destructive clause");
+		return assertions + 5;
 	}
 
 	private static int verifyRequesterPrincipal() {
@@ -1047,6 +1091,7 @@ public final class GoalCompilerVerification {
 		);
 		var priorJson = JsonParser.parseString(codec.encode(draft)).getAsJsonObject();
 		priorJson.getAsJsonObject("translation_constraint").remove("item_clauses");
+		priorJson.getAsJsonObject("translation_constraint").remove("factual_predicates");
 		assertEquals(new GoalTranslationConstraint(constraint.killClauses()),
 				codec.decode(priorJson.toString()).translationConstraint(),
 				"kill-only translation constraints from prior drafts remain readable");

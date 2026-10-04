@@ -137,6 +137,10 @@ public final class ServerPathPlanner {
 			return searchBudget.exhausted();
 		}
 
+		public boolean tryPrepare() { return searchBudget.tryPrepare(); }
+
+		public int preparationWork() { return searchBudget.preparationWork(); }
+
 		private PlanningResult plan(
 				LocalPathfinder pathfinder,
 				WalkabilityView view,

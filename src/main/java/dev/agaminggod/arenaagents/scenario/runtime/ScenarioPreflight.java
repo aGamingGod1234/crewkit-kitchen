@@ -35,7 +35,13 @@ public final class ScenarioPreflight {
 		if (status.scheduler().availableCapacity() < rosterSize) return Verdict.waiting("SCHEDULER_HEADROOM");
 		Set<String> requiredHealth = new HashSet<>();
 		for (RequiredProfile profile : input.requiredProfiles()) {
-			for (String operation : List.of("create_agent", "decide")) {
+			// Native coordinators publish their actual turn operation. Older and
+			// classic coordinators continue to publish decide.
+			String turnOperation = status.circuits().stream().anyMatch(candidate ->
+					candidate.provider().equals(profile.provider())
+							&& candidate.model().equals(profile.model())
+							&& candidate.operation().equals("native_turn")) ? "native_turn" : "decide";
+			for (String operation : List.of("create_agent", turnOperation)) {
 				String identity = profile.provider() + "\u0000" + profile.model() + "\u0000" + operation;
 				if (!requiredHealth.add(identity)) continue;
 				CoordinatorStatusSnapshot.CircuitHealth health = status.circuits().stream()

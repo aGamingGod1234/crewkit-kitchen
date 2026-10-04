@@ -417,7 +417,11 @@ export class CodexStdioTransport extends EventEmitter {
 		this.#rejectPending(error);
 		this.emit('exit', error);
 		void terminateChildProcess(child, { timeoutMs: this.#stopTimeoutMs })
-			.catch((stopError) => this.emit('protocolError', stopError));
+			.catch((stopError) => {
+				// The exit above already retired this child. Cleanup diagnostics must
+				// remain visible without reporting a failure of a healthy successor.
+				try { this.emit('diagnostic', `Retired Codex process cleanup failed: ${sanitizeDiagnosticErrorMessage(stopError)}`); } catch { /* diagnostics cannot interrupt provider IO */ }
+			});
 	}
 
 	#write(message) {

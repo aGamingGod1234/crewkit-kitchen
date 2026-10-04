@@ -35,6 +35,44 @@ function actionCommands(messages) {
 	return messages.filter((message) => message.type === 'action_command');
 }
 
+test('rejected initial finish requests a correction with verification facts and installs its replacement', async () => {
+	const registry = new AgentRegistry(); registry.register(record());
+	const completions = [], requests = [], sent = [];
+	const manager = new ProgramRuntimeManager({registry,
+		bridge:{send:async (type, agentId, payload) => sent.push({type,agentId,payload})},
+		planner:{requestPlan:async request => { requests.push(request); return {directive:'replace',source:'program.onUnhandledAttention("continue_and_notify"); await player.wait(7);'}; }},
+		onCompletionRequested:request => completions.push(request),
+	});
+	await manager.installDecision(registry.get('agent-a'),{directive:'finish'}, {observation:observation(),eventSequence:1});
+	assert.equal(completions.length,1);
+	assert.equal(manager.onCompletionResult(registry.get('agent-a'),{goalRevision:1,traceId:completions[0].traceId,goalFingerprint:completions[0].goalFingerprint,verified:false,reasonCode:'MISSING',facts:[{itemId:'minecraft:oak_log',count:0}]}),true);
+	await new Promise(resolve => setImmediate(resolve));
+	assert.equal(requests.length,1);
+	assert.match(JSON.stringify(requests[0].input),/completion_verification_failed/);
+	assert.match(JSON.stringify(requests[0].input),/MISSING/);
+	assert.equal(actionCommands(sent).length,1);
+	manager.disposeAll();
+});
+
+test('a delayed replacement survives repeated quiet identical heartbeats', async () => {
+	const registry = new AgentRegistry(); registry.register(record());
+	const sent = [], requests = [];
+	let release;
+	const manager = new ProgramRuntimeManager({registry,
+		bridge:{send:async (type,agentId,payload) => sent.push({type,agentId,payload})},
+		planner:{requestPlan:request => {requests.push(request); return new Promise(resolve => {release=resolve;});}},
+	});
+	await manager.installDecision(registry.get('agent-a'),{directive:'replace',source:'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);'}, {observation:observation(),eventSequence:1});
+	await manager.onActionResult(registry.get('agent-a'),{actionId:actionCommands(sent)[0].payload.actionId,state:'SUCCEEDED',reasonCode:'DONE'});
+	for (let eventSequence=2; eventSequence<=6; eventSequence++) await manager.onObservation(registry.get('agent-a'),{observation:observation(),eventSequence});
+	release({directive:'replace',source:'program.onUnhandledAttention("continue_and_notify"); await player.wait(7);'});
+	await new Promise(resolve => setImmediate(resolve));
+	assert.equal(requests.length,1);
+	assert.equal(actionCommands(sent).length,2);
+	assert.equal(actionCommands(sent)[1].payload.provenance.eventSequence,6);
+	manager.disposeAll();
+});
+
 function harness(options = {}) {
 	const registry = new AgentRegistry();
 	registry.register(record());

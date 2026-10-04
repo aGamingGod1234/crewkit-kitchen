@@ -20,12 +20,14 @@ export class BestEffortDiagnosticQueue {
 	#closePromise = null;
 	#idleWaiters = new Set();
 	#droppedCount = 0;
+	#failedOperationCount = 0;
 	#state = 'ready';
 	#failureCode = null;
 	#consecutiveFailureCount = 0;
 	#generation = 0;
 	#lastRecoveryAtEpochMs = null;
 	#detachedOperations = 0;
+	#waitingForReady = false;
 
 	constructor({
 		maxPending = DEFAULT_MAX_PENDING,
@@ -36,6 +38,7 @@ export class BestEffortDiagnosticQueue {
 		cancel = clearTimeout,
 		dispatch = setImmediate,
 		now = Date.now,
+		ready = null,
 	} = {}) {
 		if (!Number.isSafeInteger(maxPending) || maxPending < 1 || maxPending > 1_024) throw new TypeError('maxPending must be in [1, 1024]');
 		if (!Number.isSafeInteger(operationTimeoutMs) || operationTimeoutMs < 1) throw new TypeError('operationTimeoutMs must be positive');
@@ -50,9 +53,26 @@ export class BestEffortDiagnosticQueue {
 		this.#cancel = cancel;
 		this.#dispatch = dispatch;
 		this.#now = now;
+		// Setup owns no row slot or operation deadline. Admitted work remains in
+		// this bounded queue, and close still bounds an unresolved setup barrier.
+		if (ready !== null) {
+			this.#waitingForReady = true;
+			Promise.resolve(ready).then(() => this.#finishSetup(), () => {
+				this.reportFailure();
+				this.#finishSetup();
+			});
+		}
+	}
+
+	#finishSetup() {
+		this.#waitingForReady = false;
+		this.#pump();
 	}
 
 	get droppedCount() { return this.#droppedCount; }
+
+	/** Report initialization failure without consuming a row's admission slot. */
+	reportFailure() { this.#recordFailure('DIAGNOSTIC_SINK_FAILED'); }
 
 	submit(operation) {
 		if (typeof operation !== 'function') throw new TypeError('diagnostic operation must be a function');
@@ -78,6 +98,8 @@ export class BestEffortDiagnosticQueue {
 			nextProbeAtEpochMs: null,
 			generation: this.#generation,
 			lastRecoveryAtEpochMs: this.#lastRecoveryAtEpochMs,
+			failedOperationCount: this.#failedOperationCount,
+			incompleteCapture: this.#failedOperationCount > 0 || this.#droppedCount > 0,
 		});
 	}
 
@@ -89,7 +111,7 @@ export class BestEffortDiagnosticQueue {
 	}
 
 	#pump() {
-		if (this.#active || this.#pumpScheduled || this.#pending.length === 0) {
+		if (this.#waitingForReady || this.#active || this.#pumpScheduled || this.#pending.length === 0) {
 			this.#notifyIdle();
 			return;
 		}
@@ -191,7 +213,7 @@ export class BestEffortDiagnosticQueue {
 	}
 
 	#waitForIdle(timeoutMs) {
-		if (!this.#active && !this.#pumpScheduled && this.#pending.length === 0) return Promise.resolve();
+		if (!this.#waitingForReady && !this.#active && !this.#pumpScheduled && this.#pending.length === 0) return Promise.resolve();
 		return new Promise((resolve) => {
 			let settled = false;
 			let handle;
@@ -199,12 +221,16 @@ export class BestEffortDiagnosticQueue {
 				if (settled) return;
 				settled = true;
 				this.#idleWaiters.delete(onIdle);
+				if (this.#waitingForReady || this.#active || this.#pending.length > 0) {
+					this.#droppedCount = Math.min(Number.MAX_SAFE_INTEGER, this.#droppedCount + this.#pending.length);
+					this.#recordFailure('DIAGNOSTIC_CLOSE_TIMEOUT');
+				}
 				this.#pending.length = 0;
 				try { this.#cancel(handle); } catch { /* timer cleanup is observational */ }
 				resolve();
 			};
 			const onIdle = () => {
-				if (!this.#active && !this.#pumpScheduled && this.#pending.length === 0) finish();
+				if (!this.#waitingForReady && !this.#active && !this.#pumpScheduled && this.#pending.length === 0) finish();
 			};
 			this.#idleWaiters.add(onIdle);
 			try { handle = this.#schedule(finish, timeoutMs); }
@@ -214,11 +240,12 @@ export class BestEffortDiagnosticQueue {
 	}
 
 	#notifyIdle() {
-		if (this.#active || this.#pumpScheduled || this.#pending.length > 0) return;
+		if (this.#waitingForReady || this.#active || this.#pumpScheduled || this.#pending.length > 0) return;
 		for (const waiter of [...this.#idleWaiters]) waiter();
 	}
 
 	#recordFailure(code) {
+		if (code !== 'DIAGNOSTIC_BACKPRESSURE') this.#failedOperationCount = Math.min(Number.MAX_SAFE_INTEGER, this.#failedOperationCount + 1);
 		if (this.#state === 'ready') this.#generation += 1;
 		this.#state = 'degraded';
 		this.#failureCode = code;

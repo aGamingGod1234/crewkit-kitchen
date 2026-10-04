@@ -1,6 +1,7 @@
 export const LEASE_TIMEOUTS_MS = Object.freeze({
 	provider: 45_000,
 	action: 125_000,
+	program: 30_000,
 	wait: 10_000,
 	recovery: 15_000,
 	scheduled: 2_000,

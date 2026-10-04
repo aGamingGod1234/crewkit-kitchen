@@ -52,6 +52,7 @@ public final class GoalCompletionVerifier {
 		if (facts == null) return failure(record.goalRevision(), "NO_PLAYER");
 		if (serverTick < 0L) throw new IllegalArgumentException("serverTick must be nonnegative");
 		AgentGoal goal = record.currentGoal().orElseThrow();
+		facts = facts.forVerification();
 		AgentKillLedger kills = killLedger == null ? new AgentKillLedger() : killLedger;
 		Map<PredicateKey, Evaluation> evaluatedLeaves = new HashMap<>();
 		Evaluation evaluation = evaluate(
@@ -100,7 +101,33 @@ public final class GoalCompletionVerifier {
 
 	public static FactSource minecraftFacts(ServerPlayer player) {
 		Objects.requireNonNull(player, "player must not be null");
+		return minecraftFacts(player, false);
+	}
+
+	private static FactSource minecraftFacts(ServerPlayer player, boolean shareInventory) {
 		return new FactSource() {
+			private InventorySummary inventory;
+
+			@Override public FactSource forVerification() {
+				// Even a caller reusing this adapter gets a fresh snapshot for every evaluation.
+				return minecraftFacts(player, true);
+			}
+
+			private InventorySummary inventory() {
+				if (shareInventory && inventory != null) return inventory;
+				HashMap<String, Long> counts = new HashMap<>();
+				long blocks = 0;
+				var container = player.getInventory();
+				for (int index = 0; index < container.getContainerSize(); index++) {
+					ItemStack stack = container.getItem(index);
+					if (stack.isEmpty()) continue;
+					counts.merge(BuiltInRegistries.ITEM.getKey(stack.getItem()).toString(), (long) stack.getCount(), Long::sum);
+					if (stack.getItem() instanceof BlockItem) blocks += stack.getCount();
+				}
+				InventorySummary result = new InventorySummary(counts, blocks);
+				if (shareInventory) inventory = result;
+				return result;
+			}
 			@Override public String dimensionId() {
 				return player.level().dimension().identifier().toString();
 			}
@@ -116,31 +143,18 @@ public final class GoalCompletionVerifier {
 			}
 
 			@Override public int inventoryCount(String itemId) {
-				int count = 0;
-				for (int index = 0; index < player.getInventory().getContainerSize(); index++) {
-					ItemStack stack = player.getInventory().getItem(index);
-					if (!stack.isEmpty() && BuiltInRegistries.ITEM.getKey(stack.getItem()).toString().equals(itemId)) count += stack.getCount();
-				}
-				return count;
+				return inventory().counts().getOrDefault(itemId, 0L).intValue();
 			}
 
 			@Override public long inventoryCountAny(List<String> itemIds) {
-				Set<String> accepted = Set.copyOf(itemIds);
+				InventorySummary summary = inventory();
 				long count = 0;
-				for (int index = 0; index < player.getInventory().getContainerSize(); index++) {
-					ItemStack stack = player.getInventory().getItem(index);
-					if (!stack.isEmpty() && accepted.contains(BuiltInRegistries.ITEM.getKey(stack.getItem()).toString())) count += stack.getCount();
-				}
+				for (String id : Set.copyOf(itemIds)) count += summary.counts().getOrDefault(id, 0L);
 				return count;
 			}
 
 			@Override public long inventoryBlockCount() {
-				long count = 0;
-				for (int index = 0; index < player.getInventory().getContainerSize(); index++) {
-					ItemStack stack = player.getInventory().getItem(index);
-					if (!stack.isEmpty() && stack.getItem() instanceof BlockItem) count += stack.getCount();
-				}
-				return count;
+				return inventory().blocks();
 			}
 
 			@Override public Position position() {
@@ -148,7 +162,10 @@ public final class GoalCompletionVerifier {
 			}
 
 			@Override public BlockFact blockAt(int x, int y, int z) {
-				BlockState state = player.level().getBlockState(new BlockPos(x, y, z));
+				// Passive verification must never load or generate a remote chunk on the server tick.
+				var chunk = player.level().getChunkSource().getChunkNow(x >> 4, z >> 4);
+				if (chunk == null) return BlockFact.unavailable();
+				BlockState state = chunk.getBlockState(new BlockPos(x, y, z));
 				LinkedHashMap<String, String> properties = new LinkedHashMap<>();
 				state.getValues()
 						.sorted(java.util.Comparator.comparing(entry -> entry.property().getName()))
@@ -167,6 +184,8 @@ public final class GoalCompletionVerifier {
 			}
 		};
 	}
+
+	private record InventorySummary(Map<String, Long> counts, long blocks) {}
 
 	private Evaluation evaluate(
 			UUID goalId,
@@ -290,6 +309,11 @@ public final class GoalCompletionVerifier {
 				return evaluated;
 			}
 			BlockFact observed = source.blockAt(block.x(), block.y(), block.z());
+			if (!observed.available()) {
+				evaluated = leaf("block_unavailable", false, block.blockId() + sortedProperties(block.properties()), "chunk not loaded");
+				evaluatedLeaves.put(key, evaluated);
+				return evaluated;
+			}
 			boolean satisfied = observed.blockId().equals(block.blockId())
 					&& block.properties().entrySet().stream().allMatch(entry -> entry.getValue().equals(observed.properties().get(entry.getKey())));
 			evaluated = leaf("block_matches", satisfied, block.blockId() + sortedProperties(block.properties()), observed.blockId() + sortedProperties(observed.properties()));
@@ -406,6 +430,8 @@ public final class GoalCompletionVerifier {
 	}
 
 	public interface FactSource {
+		/** A view scoped to one evaluation, including its backtracking passes. */
+		default FactSource forVerification() { return this; }
 		int inventoryCount(String itemId);
 		default long inventoryBlockCount() { return 0; }
 		default long inventoryCountAny(List<String> itemIds) {
@@ -428,7 +454,15 @@ public final class GoalCompletionVerifier {
 
 	public record Position(double x, double y, double z) { }
 
-	public record BlockFact(String blockId, Map<String, String> properties) {
+	public record BlockFact(String blockId, Map<String, String> properties, boolean available) {
+		public BlockFact(String blockId, Map<String, String> properties) {
+			this(blockId, properties, true);
+		}
+
+		public static BlockFact unavailable() {
+			return new BlockFact("", Map.of(), false);
+		}
+
 		public BlockFact {
 			blockId = Objects.requireNonNull(blockId, "blockId must not be null");
 			properties = Map.copyOf(Objects.requireNonNull(properties, "properties must not be null"));

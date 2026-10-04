@@ -49,8 +49,10 @@ public final class ScenarioRecoveryGate {
 				.map(AgentStatus::agentId)
 				.sorted()
 				.toList();
+		// Completed contestants remain in a mixed roster until the scenario finishes; never restart their goals.
 		boolean ready = resume.isEmpty() && copied.stream()
-				.allMatch(agent -> agent.playerReady() && agent.state().isActive());
+				.allMatch(agent -> agent.playerReady()
+						&& (agent.state().isActive() || agent.state() == AgentLifecycleState.COMPLETED));
 		return new Decision(ready, resume, ready ? "" : "AGENTS_NOT_ACTIVE");
 	}
 

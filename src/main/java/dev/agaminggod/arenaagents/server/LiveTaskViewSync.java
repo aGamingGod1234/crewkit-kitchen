@@ -18,10 +18,12 @@ import net.minecraft.server.level.ServerPlayer;
 public final class LiveTaskViewSync {
  private static final Map<MinecraftServer, State> STATES=new WeakHashMap<>();
  private static final class State {
-  final Map<UUID,JsonObject> cached=new HashMap<>();
+  final Map<UUID,CachedView> cached=new HashMap<>();
   final Map<UUID,Set<UUID>> waiting=new HashMap<>();
   final Map<UUID,Integer> requested=new HashMap<>();
  }
+ // Serialize once per accepted response, shared by all immediate replay recipients.
+ private record CachedView(long goalRevision,String json) { }
  private LiveTaskViewSync() { }
  public static void request(ServerPlayer player,UUID id) {
   var server=player.level().getServer();
@@ -30,9 +32,9 @@ public final class LiveTaskViewSync {
   if(record.isEmpty()) { send(player,id,false,"Agent is no longer available","{}"); return; }
   var state=STATES.computeIfAbsent(server,s->new State());
   boolean online=CodexAgentServerRuntime.automationAvailable(server);
-  JsonObject cached=state.cached.get(id);
-  if(cached!=null && cached.get("goalRevision").getAsLong()!=record.get().goalRevision()) { state.cached.remove(id); cached=null; }
-  send(player,id,online,online?(cached==null?"Waiting for live task data":"Connected"):"Coordinator offline; displayed data may be stale",cached==null?"{}":cached.toString());
+  CachedView cached=state.cached.get(id);
+  if(cached!=null && cached.goalRevision()!=record.get().goalRevision()) { state.cached.remove(id); cached=null; }
+  send(player,id,online,online?(cached==null?"Waiting for live task data":"Connected"):"Coordinator offline; displayed data may be stale",cached==null?"{}":cached.json());
   if(!online) { state.waiting.remove(id); return; }
   state.waiting.computeIfAbsent(id,k->new HashSet<>()).add(player.getUUID());
   if(server.getTickCount()-state.requested.getOrDefault(id,-100)>=10) {
@@ -40,16 +42,16 @@ public final class LiveTaskViewSync {
   }
  }
  public static void accept(MinecraftServer server,AgentId id,JsonObject payload) {
-  JsonObject checked;
-  try { checked=LiveTaskViewData.parse(payload.toString()); } catch(RuntimeException invalid) { return; }
+  JsonObject checked; String encoded;
+  try { encoded=payload.toString(); checked=LiveTaskViewData.parse(encoded); } catch(RuntimeException invalid) { return; }
   if(checked.size()==0) return;
   var record=CodexAgentManager.get(server).records().stream().filter(r->r.agentId().equals(id)).findFirst();
   if(record.isEmpty() || checked.get("goalRevision").getAsLong()!=record.get().goalRevision()) return;
   var state=STATES.computeIfAbsent(server,s->new State()); UUID uuid=UUID.fromString(id.toString());
-  state.cached.put(uuid,checked);
+  state.cached.put(uuid,new CachedView(checked.get("goalRevision").getAsLong(),encoded));
   for(UUID playerId:state.waiting.getOrDefault(uuid,Set.of())) {
    var player=server.getPlayerList().getPlayer(playerId);
-   if(player!=null && GoalControl.mayControl(player.createCommandSourceStack())) send(player,uuid,true,"Connected",checked.toString());
+   if(player!=null && GoalControl.mayControl(player.createCommandSourceStack())) send(player,uuid,true,"Connected",encoded);
   }
   state.waiting.remove(uuid);
   Set<UUID> present=new HashSet<>(); for(var agent:CodexAgentManager.get(server).records()) present.add(UUID.fromString(agent.agentId().toString()));

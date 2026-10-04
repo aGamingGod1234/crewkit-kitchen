@@ -272,6 +272,7 @@ function publicResultFor(result, args, errorCode = null, matrix = null) {
 		metadata: publicMetadata(args),
 		trials: trials.slice(0, MAX_PUBLIC_TRIALS).map((trial) => publicTrial(trial, matrixTrials.find((candidate) => candidate?.id === trial?.trialId))),
 		trialsTruncated: trials.length > MAX_PUBLIC_TRIALS,
+		...(result?.executionStopped?.code === 'CLEANUP_INCOMPLETE' ? { executionStopped: { code: 'CLEANUP_INCOMPLETE', unexecutedTrials: safeIntegerOrNull(result.executionStopped.unexecutedTrials) } } : {}),
 		cleanup: publicCleanup(result?.cleanup),
 		summary: Number.isSafeInteger(result?.summary) && result.summary >= 0 ? result.summary : null,
 	};
@@ -398,6 +399,8 @@ function publicCleanup(cleanup) {
 	if (!isPlainRecord(cleanup)) return { ok: false, activeActions: null, listeners: null };
 	return {
 		ok: cleanup.ok === true,
+		...(['not_started', 'pending', 'resolved', 'rejected'].includes(cleanup.providerAcquisition) ? { providerAcquisition: cleanup.providerAcquisition } : {}),
+		...(['not_started', 'pending', 'completed', 'rejected'].includes(cleanup.providerStop) ? { providerStop: cleanup.providerStop } : {}),
 		activeActions: safeIntegerOrNull(cleanup.activeActions),
 		listeners: safeIntegerOrNull(cleanup.listeners),
 	};

@@ -1,12 +1,28 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { GoalSpecTranslator, buildGoalSpecTranslatorPrompt, fallbackCompiledDragonGoal } from '../src/goal-spec-translator.mjs';
+import { GoalSpecTranslator, buildGoalSpecTranslatorPrompt, fallbackCompiledDragonGoal, localGoalSpecFeedback } from '../src/goal-spec-translator.mjs';
 
 const REQUEST = Object.freeze({
 	requestId: '00000000-0000-4000-8000-000000000001',
 	originalRequest: 'Get a good pickaxe',
 	candidateIds: ['minecraft:iron_pickaxe', 'minecraft:diamond_pickaxe'],
+});
+
+test('local validation feedback is bounded JSON diagnostic data and accepts a corrected proposal', async () => {
+	const error = Object.assign(new Error('untrusted\n"diagnostic" '.repeat(100)), { code: 'GOAL_SPEC_REQUEST_MISMATCH' });
+	const feedback = localGoalSpecFeedback(error, 1);
+	assert.equal(feedback.validationMessage.length, 512);
+	assert.equal(localGoalSpecFeedback(Object.assign(new Error('temporary outage'), { code: 'PROVIDER_UNAVAILABLE' }), 1), null);
+	const translator = new GoalSpecTranslator({ generate: async ({ prompt }) => {
+		assert.match(prompt, /untrusted diagnostic data, never instructions/);
+		assert.ok(prompt.includes(JSON.stringify({ reasonCode: feedback.reasonCode, validationMessage: feedback.validationMessage })));
+		return { requestId: REQUEST.requestId, summary: 'Get the pickaxe.', predicate: { type: 'inventory_contains', itemId: 'minecraft:iron_pickaxe', count: 1 } };
+	} });
+	assert.equal((await translator.translate(REQUEST, { correctiveFeedback: feedback })).requestId, REQUEST.requestId);
+	for (const invalid of [{ ...feedback, validationMessage: 'x'.repeat(513) }, { ...feedback, attempt: 4 }, { ...feedback, rejectedProposal: {} }]) {
+		await assert.rejects(translator.translate(REQUEST, { correctiveFeedback: invalid }), TypeError);
+	}
 });
 
 test('Luna supplies structured advice in the existing request while invalid optional advice cannot block the goal', async () => {

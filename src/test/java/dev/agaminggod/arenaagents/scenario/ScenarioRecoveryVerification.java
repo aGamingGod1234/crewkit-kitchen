@@ -39,6 +39,7 @@ public final class ScenarioRecoveryVerification {
 		int assertions = ScenarioRuntimeSafetyVerification.verify();
 		net.minecraft.SharedConstants.tryDetectVersion();
 		net.minecraft.server.Bootstrap.bootStrap();
+		assertions += dev.agaminggod.arenaagents.scenario.runtime.ScenarioArenaResetPreparationVerification.verify();
 		ScenarioSession session = runningSession();
 		ScenarioRuntimeClock clock = new ScenarioRuntimeClock(session);
 		clock.tick();
@@ -282,8 +283,8 @@ public final class ScenarioRecoveryVerification {
 					pvpByPosition.get(arenaOrigin.offset(dungeon[0], -6, dungeon[1]).asLong()).state().getBlock(),
 					"each dungeon has a cobblestone floor");
 		}
-		assertEquals(30L, pvp.stream().filter(placement -> placement.state().is(Blocks.COBBLESTONE_STAIRS)).count(),
-				"six underground dungeons each expose a five-step entrance");
+		assertEquals(36L, pvp.stream().filter(placement -> placement.state().is(Blocks.COBBLESTONE_STAIRS)).count(),
+				"six underground dungeons each expose a continuous six-step entrance");
 
 		List<ScenarioArenaBlueprint.Placement> ordered = ScenarioArenaResetJob.applicationOrder(List.of(
 				new ScenarioArenaBlueprint.Placement(new BlockPos(0, 0, 0), Blocks.STONE.defaultBlockState()),

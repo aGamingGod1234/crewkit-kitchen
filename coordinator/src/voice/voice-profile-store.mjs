@@ -64,7 +64,8 @@ export class VoiceProfileStore {
 		this.#release = release;
 		for (const [agentId, profileId] of Object.entries(assignments)) {
 			const profileIndex = VOICE_PROFILES.findIndex((entry) => entry.profileId === profileId);
-			if (!isUuid(agentId) || profileIndex < 0 || this.#used.has(profileIndex)) continue;
+			// Allocation shares profiles after catalog exhaustion; reload must retain those owners too.
+			if (!isUuid(agentId) || profileIndex < 0) continue;
 			this.#assignments.set(agentId, profileIndex);
 			this.#used.add(profileIndex);
 		}

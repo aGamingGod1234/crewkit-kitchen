@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
 
 import { DynamicAgentState } from '../src/agent-registry.mjs';
 import {
@@ -36,7 +37,9 @@ const scenarios = [
 	}],
 	['completion rejected then accepted', {
 		completionResults: [false, true],
-		turns: [['finish'], ['craft_inventory'], ['finish']],
+		initialInventory: { 'minecraft:oak_planks': 3, 'minecraft:stick': 2 },
+		initialBlocks: { '1,64,1': 'minecraft:crafting_table' },
+		turns: [['finish'], ['craft_table'], ['finish']],
 		expectedCompleted: true,
 	}],
 	['disconnect during action', {
@@ -70,6 +73,9 @@ test('explicit pause remains paused and does not dispatch a recovery turn', asyn
 		turns: [['observe']],
 	}).run();
 	assert.equal(result.finalState, DynamicAgentState.PAUSED);
+	assert.deepEqual(result.pauseBoundary, { providerTurns: 1, recoveryDispatches: 0 }, 'no expiry during input preparation');
+	assert.equal(result.postPauseRecoveryDispatches, 0, 'pause cancels recovery before coordinator shutdown');
+	assert.equal(result.providerTurns, 1, 'pause cannot start another provider turn');
 	assert.equal(result.recoveryDispatches, 0);
 });
 
@@ -136,15 +142,17 @@ test('completion results cannot override unsatisfied factual predicates', async 
 	const result = await createNativeGoalHarness({
 		completionResults: [true],
 		turns: [['finish']],
-		timeoutMs: 100,
-	}).run();
+	}).run({
+		stopWhen: (current) => current.sent.some((entry) => entry.type === 'goal_completed')
+			&& current.recoveries.includes('COMPLETION_REJECTED'),
+	});
 	assert.equal(result.finalState, DynamicAgentState.PLANNING);
 	assert.equal(result.sent.filter((entry) => entry.type === 'goal_completed').length, 1);
 	assert.ok(result.recoveries.includes('COMPLETION_REJECTED'));
 });
 
 test('completion verifies the immutable compound position and block predicates', async () => {
-	const result = await createNativeGoalHarness({
+	const harness = createNativeGoalHarness({
 		goalPredicate: {
 			type: 'all_of',
 			predicates: [
@@ -157,9 +165,24 @@ test('completion verifies the immutable compound position and block predicates',
 			[{ kind: 'finish', summary: 'Factual world predicates are present.' }],
 		],
 		timeoutMs: 100,
-	}).run();
+	});
+	const createAgent = harness.provider.createAgent.bind(harness.provider);
+	let delayed = false;
+	harness.provider.createAgent = async (record) => {
+		// Cross the former observation window before the first goal turn starts.
+		if (!delayed && record.goalRevision === 1) { delayed = true; await delay(200); }
+		return createAgent(record);
+	};
+	const result = await harness.run({ stopAfter: 'completion' });
+	assert.equal(delayed, true);
 	assert.equal(result.finalState, DynamicAgentState.COMPLETED);
 	assert.equal(result.recoveries.includes('COMPLETION_REJECTED'), false);
+	assert.equal(result.completionEvaluations.length, 1);
+	assert.equal(result.completionEvaluations[0].goalFingerprint, result.goalSpec.fingerprint);
+	assert.deepEqual(result.completionEvaluations[0].facts.map(({ type, satisfied }) => ({ type, satisfied })), [
+		{ type: 'position_within', satisfied: true },
+		{ type: 'block_matches', satisfied: true },
+	]);
 });
 
 test('failed actions do not mutate simulated world facts', async () => {

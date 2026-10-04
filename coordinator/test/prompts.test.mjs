@@ -103,13 +103,13 @@ test('collection example yields for missing targets or failed aim and verifies i
 		blocks: [{ stableId: 'block-1', blockId: 'minecraft:oak_log', x: 1, y: 64, z: 0, tags: ['#minecraft:logs'] }],
 		items: [], entities: [], inventory: { items: [], tagCounts: { '#minecraft:logs': 0 } } };
 	const missing = new ArenaScriptInterpreter(parseArenaScript(source), SCRIPT_BINDINGS);
-	assert.equal(missing.start(createInterpreterFacts({ ...observation, blocks: [] })).kind, 'checkpoint');
+	assert.equal(missing.start(createInterpreterFacts({ ...observation, blocks: [] })).kind, 'idle');
 	const failedAim = new ArenaScriptInterpreter(parseArenaScript(source), SCRIPT_BINDINGS);
 	let step = failedAim.start(createInterpreterFacts(observation));
 	assert.equal(step.call.primitive, 'look_at');
 	assert.deepEqual({ ...step.call.arguments }, { x: 1.5, y: 64.5, z: 0.5 });
 	step = failedAim.resume({ stateToken: step.stateToken, state: 'FAILED', reasonCode: 'TARGET_UNAVAILABLE' }, createInterpreterFacts(observation));
-	assert.equal(step.kind, 'checkpoint', 'a failed aim never dispatches mining');
+	assert.equal(step.kind, 'idle', 'a failed aim requests reassessment without dispatching mining');
 	const collected = new ArenaScriptInterpreter(parseArenaScript(source), SCRIPT_BINDINGS);
 	step = collected.start(createInterpreterFacts(observation));
 	step = collected.resume({ stateToken: step.stateToken, state: 'SUCCEEDED', reasonCode: 'DONE' }, createInterpreterFacts(observation));

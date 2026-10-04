@@ -13,7 +13,7 @@ const NEIGHBORS = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 
 export class ExplorationOccupancy {
 	#memory;
 	constructor({ memoryStore = new ObservedMemoryStore() } = {}) { this.#memory = memoryStore; }
-	ingest(agentId, observation) { return this.#memory.ingest(agentId, observation); }
+	ingest(agentId, observation, options = {}) { return this.#memory.ingest(agentId, observation, options); }
 	load(agentId) { return this.#memory.load(agentId); }
 	flush(agentId) { return this.#memory.flush(agentId); }
 	markBlocked(agentId, dimension, x, z, options = {}) {
@@ -25,14 +25,15 @@ export class ExplorationOccupancy {
 		const value = this.#memory.query(agentId, { ...(dimension === null ? {} : { dimension }), worldId });
 		return { worldId: value.worldId, dimension: value.dimension, knownCells: value.knownCells, seenCells: value.seenCells, visitedCells: value.visitedCells, blockedCells: value.blockedCells };
 	}
-	candidates(agentId, observation, { radius = DEFAULT_RADIUS, limit = 32, blockId = null } = {}) {
+	candidates(agentId, observation, { radius = DEFAULT_RADIUS, limit = 32, blockId = null, kind = 'all' } = {}) {
 		if (!Number.isFinite(radius) || radius < MIN_RADIUS || radius > MAX_RADIUS) throw new TypeError('radius must be 8..32');
 		if (!Number.isSafeInteger(limit) || limit < 1 || limit > 64) throw new TypeError('limit must be 1..64');
 		if (blockId !== null && (typeof blockId !== 'string' || blockId.length > 256)) throw new TypeError('blockId must be bounded text');
+		if (!['all', 'observed_block', 'unknown_cell'].includes(kind)) throw new TypeError('kind must be all, observed_block, or unknown_cell');
 		const position = extractPosition(observation), dimension = extractDimension(observation), worldId = observationWorldId(observation);
 		const base = { worldId, dimension, radius, destination: null, cue: null };
 		if (position === null) return { ...base, kind: 'no_observation', candidates: [], reason: 'No observed player position.' };
-		const known = this.#memory.query(agentId, { worldId, dimension, nowTick: observation?.world?.gameTime });
+		const known = this.#memory.query(agentId, { worldId, dimension, nowTick: observation?.world?.gameTime, ...(kind === 'unknown_cell' ? { limit: 0 } : {}) });
 		const cells = new Map(known.cells.map((cell) => [cell.key, cell]));
 		cells.set(spatialCellKey(position.x, position.y, position.z), { ...(cells.get(spatialCellKey(position.x, position.y, position.z)) ?? {}), visited: true });
 		const blocks = new Map(known.blocks.map((block) => [block.key, block]));
@@ -46,7 +47,7 @@ export class ExplorationOccupancy {
 			cells.set(key, { ...cells.get(key), seen: true });
 		}
 		const entries = new Map();
-		for (const block of blocks.values()) {
+		if (kind !== 'unknown_cell') for (const block of blocks.values()) {
 			if (block.blockId === 'minecraft:air' || blockId !== null && block.blockId !== blockId) continue;
 			const target = { x: block.x + 0.5, y: block.y + 0.5, z: block.z + 0.5 };
 			const distance = distanceTo(position, target);
@@ -55,7 +56,7 @@ export class ExplorationOccupancy {
 			const id = `block:${block.x},${block.y},${block.z}`;
 			entries.set(id, { id, kind: 'observed_block', position: target, blockId: block.blockId, ...(block.blockState ? { blockState: block.blockState } : {}), distance, seen: true, visited: cell?.visited === true, blocked: cell?.blocked === true, stale: block.stale === true, reachability: 'unknown' });
 		}
-		if (blockId === null) for (const [key, cell] of cells) {
+		if (kind !== 'observed_block' && blockId === null) for (const [key, cell] of cells) {
 			if (cell.blocked || cell.stale) continue;
 			const [cx, cy, cz] = key.split(',').map(Number);
 			for (const [dx, dy, dz] of NEIGHBORS) {

@@ -95,6 +95,7 @@ public final class AgentControlScreen extends Screen {
 	private ConsoleEditBox nameInput;
 	private ConsoleEditBox groupNameInput;
 	private MultiLineEditBox promptInput;
+	private boolean widgetRefreshPending;
 
 	public AgentControlScreen() {
 		this(null);
@@ -151,7 +152,7 @@ public final class AgentControlScreen extends Screen {
 			snapshot = checkedSnapshot;
 			if (mutationWasPending && !mutationState.mutationPending()) {
 				if (!feedbackError) feedback = "";
-				if (minecraft != null && !textEditorFocused()) rebuildWidgets();
+				requestWidgetRefresh();
 			}
 			return;
 		}
@@ -180,6 +181,12 @@ public final class AgentControlScreen extends Screen {
 			page = Page.OVERVIEW;
 			compactGroupComposer = false;
 		}
+		requestWidgetRefresh();
+	}
+
+	private void requestWidgetRefresh() {
+		// Accept model updates immediately, but retain the live editor until focus leaves it.
+		widgetRefreshPending = true;
 		if (minecraft != null && !textEditorFocused()) rebuildWidgets();
 	}
 
@@ -203,6 +210,7 @@ public final class AgentControlScreen extends Screen {
 
 	@Override
 	protected void init() {
+		widgetRefreshPending = false;
 		nameInput = null;
 		groupNameInput = null;
 		promptInput = null;
@@ -223,6 +231,7 @@ public final class AgentControlScreen extends Screen {
 	@Override
 	public void tick() {
 		super.tick();
+		if (widgetRefreshPending && minecraft != null && !textEditorFocused()) rebuildWidgets();
 		if (page == Page.MANAGE && (shownPlanWindowEnabled != dev.agaminggod.arenaagents.client.control.LiveAgentWindows.planEnabled()
 				|| shownTerminalEnabled != dev.agaminggod.arenaagents.client.control.LiveAgentWindows.terminalEnabled())) rebuildWidgets();
 	}

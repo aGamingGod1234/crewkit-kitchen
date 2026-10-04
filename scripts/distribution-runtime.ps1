@@ -78,7 +78,9 @@ function Restore-ArenaRuntimeTransaction {
 			$stagingState = Assert-ArenaRuntimeChildPath $InstalledRoot ([string] $state.Staging)
 			try {
 				if (Test-Path -LiteralPath $backupState -PathType Leaf) {
-					Move-Item -LiteralPath $backupState -Destination $activeState -Force -ErrorAction Stop
+					# Keep the backup for retries if another component or journal removal fails.
+					# A later successful install prunes these retained state backups.
+					Copy-Item -LiteralPath $backupState -Destination $activeState -Force -ErrorAction Stop
 				} elseif (-not [bool] $state.HadActive -and (Test-Path -LiteralPath $activeState)) {
 					Remove-Item -LiteralPath $activeState -Force -ErrorAction Stop
 				} elseif ([bool] $state.HadActive) {
@@ -440,6 +442,7 @@ function Install-ArenaCoordinatorRuntime {
 		}
 
 		return [PSCustomObject]@{
+			RecoveryJournal = $journal
 			ActivePath = $activeCoordinator
 			BackupPath = $(if ($hadCoordinator) { $backupPath } else { $null })
 			HadCoordinator = $hadCoordinator
@@ -484,65 +487,31 @@ function Undo-ArenaCoordinatorRuntimeInstall {
 		} catch {
 			throw "Another Arena Agents runtime installation is already in progress: $($_.Exception.Message)"
 		}
-		$runtimes = @(
-			[pscustomobject]@{ Active = $activeCoordinator; Backup = $backupCoordinator; HadActive = [bool] $Deployment.HadCoordinator; Label = 'coordinator' },
-			[pscustomobject]@{ Active = $activeNodeDirectory; Backup = $backupNode; HadActive = [bool] $Deployment.HadNode; Label = 'Node.js' }
-		)
-		foreach ($runtime in $runtimes) {
-			if ($runtime.HadActive -and ($null -eq $runtime.Backup -or -not (Test-Path -LiteralPath $runtime.Backup -PathType Container))) {
-				throw "Cannot restore the previous $($runtime.Label) runtime because its backup is missing."
+		$journalPath = Join-Path $resolvedInstalledRoot '.arena-runtime-transaction.json'
+		$journalTempPath = "$journalPath.tmp"
+		$journal = $Deployment.RecoveryJournal
+		if (Test-Path -LiteralPath $journalPath -PathType Leaf) {
+			$pending = Get-Content -LiteralPath $journalPath -Raw | ConvertFrom-Json -ErrorAction Stop
+			if ([string] $pending.TransactionId -cne [string] $journal.TransactionId) {
+				throw 'Cannot undo this deployment while another runtime transaction requires recovery.'
 			}
-		}
-		foreach ($runtime in $runtimes) {
-			if (Test-Path -LiteralPath $runtime.Active) {
-				Remove-Item -LiteralPath $runtime.Active -Recurse -Force -ErrorAction Stop
-			}
-			if ($null -ne $runtime.Backup) {
-				New-Item -ItemType Directory -Force -Path (Split-Path -Parent $runtime.Active) | Out-Null
-				Move-Item -LiteralPath $runtime.Backup -Destination $runtime.Active -ErrorAction Stop
-			}
-		}
-
-		$generationStatePath = if ([string]::IsNullOrWhiteSpace([string] $Deployment.GenerationStatePath)) {
-			Join-Path $resolvedInstalledRoot 'runtime\coordinator-generation.properties'
 		} else {
-			Assert-ArenaRuntimeChildPath $resolvedInstalledRoot ([string] $Deployment.GenerationStatePath)
-		}
-		$generationStateBackup = if ([string]::IsNullOrWhiteSpace([string] $Deployment.GenerationStateBackupPath)) {
-			$null
-		} else {
-			Assert-ArenaRuntimeChildPath $resolvedInstalledRoot ([string] $Deployment.GenerationStateBackupPath)
-		}
-		if (-not [string]::IsNullOrWhiteSpace([string] $generationStateBackup) -and (Test-Path -LiteralPath $generationStateBackup -PathType Leaf)) {
-			New-Item -ItemType Directory -Force -Path (Split-Path -Parent $generationStatePath) | Out-Null
-			Move-Item -LiteralPath $generationStateBackup -Destination $generationStatePath -Force -ErrorAction Stop
-		} elseif (-not [bool] $Deployment.HadGenerationState -and (Test-Path -LiteralPath $generationStatePath -PathType Leaf)) {
-			Remove-Item -LiteralPath $generationStatePath -Force -ErrorAction Stop
-		} elseif ([bool] $Deployment.HadGenerationState) {
-			throw 'Cannot restore the previous coordinator generation state because its backup is missing.'
-		}
-
-		if ([bool] $Deployment.LastKnownGoodChanged) {
-			$activeLastKnownGood = if ([string]::IsNullOrWhiteSpace([string] $Deployment.LastKnownGoodPath)) {
-				Join-Path $resolvedInstalledRoot 'coordinator.last-known-good'
-			} else {
-				Assert-ArenaRuntimeChildPath $resolvedInstalledRoot ([string] $Deployment.LastKnownGoodPath)
+			# Check all required backups before publishing rollback intent or consuming any.
+			$components = @('Coordinator', 'Node', 'GenerationState')
+			if ([bool] $Deployment.LastKnownGoodChanged) { $components += 'LastKnownGood' }
+			foreach ($name in $components) {
+				$component = $journal.$name
+				$backup = Assert-ArenaRuntimeChildPath $resolvedInstalledRoot ([string] $component.Backup)
+				if ([bool] $component.HadActive -and -not (Test-Path -LiteralPath $backup)) {
+					throw "Cannot restore the previous $name runtime because its backup is missing."
+				}
 			}
-			$lastKnownGoodBackup = if ([string]::IsNullOrWhiteSpace([string] $Deployment.LastKnownGoodBackupPath)) {
-				$null
-			} else {
-				Assert-ArenaRuntimeChildPath $resolvedInstalledRoot ([string] $Deployment.LastKnownGoodBackupPath)
-			}
-			if (Test-Path -LiteralPath $activeLastKnownGood) {
-				Remove-Item -LiteralPath $activeLastKnownGood -Recurse -Force -ErrorAction Stop
-			}
-			if (-not [string]::IsNullOrWhiteSpace([string] $lastKnownGoodBackup) -and (Test-Path -LiteralPath $lastKnownGoodBackup)) {
-				New-Item -ItemType Directory -Force -Path (Split-Path -Parent $activeLastKnownGood) | Out-Null
-				Move-Item -LiteralPath $lastKnownGoodBackup -Destination $activeLastKnownGood -ErrorAction Stop
-			} elseif ([bool] $Deployment.HadLastKnownGood) {
-				throw 'Cannot restore the previous last-known-good coordinator because its backup is missing.'
-			}
+			# Reuse the install recovery format, including its retry-safe state backup.
+			# The journal survives partial restoration and is also readable on fresh launch.
+			[IO.File]::WriteAllText($journalTempPath, ($journal | ConvertTo-Json -Depth 4 -Compress))
+			Move-Item -LiteralPath $journalTempPath -Destination $journalPath -Force -ErrorAction Stop
 		}
+		Restore-ArenaRuntimeTransaction -InstalledRoot $resolvedInstalledRoot -JournalPath $journalPath
 	} finally {
 		if ($null -ne $lock) { $lock.Dispose() }
 	}

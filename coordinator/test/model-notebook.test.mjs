@@ -4,6 +4,49 @@ import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ModelNotebook } from '../src/model-notebook.mjs';
+import { AtomicAgentStore } from '../src/observed-memory-store.mjs';
+
+test('unchanged notebook retries skip storage while new evidence stays serialized and durable', async (t) => {
+	const directory = await mkdtemp(join(tmpdir(), 'notebook-idempotent-storage-'));
+	t.after(() => rm(directory, { recursive: true, force: true }));
+	const originalWrite = AtomicAgentStore.prototype.write;
+	const writes = t.mock.method(AtomicAgentStore.prototype, 'write', function (...args) { return originalWrite.apply(this, args); });
+	const notebook = new ModelNotebook({ directory });
+	const note = { worldId: 'one', key: 'routine', text: 'Look before moving.' };
+	const receipt = { worldId: 'one', actionId: 'a', actionType: 'wait', state: 'SUCCEEDED', reasonCode: '' };
+	const [firstNote, firstReceipt] = await Promise.all([notebook.writeNote('a', note), notebook.recordReceipt('a', receipt)]);
+	assert.equal(writes.mock.callCount(), 2);
+	await Promise.all([notebook.writeNote('a', note), notebook.recordReceipt('a', receipt), notebook.recordReceipt('a', receipt), notebook.clear('a', { worldId: 'one', key: 'missing' })]);
+	assert.equal(writes.mock.callCount(), 2, 'retry-only operations must never reach the atomic writer');
+	const enhanced = await notebook.recordReceipt('a', { ...receipt, executionStarted: true, physicalAttempted: false, actionObservation: { worldTick: 4 } });
+	assert.equal(writes.mock.callCount(), 3, 'new receipt evidence is persisted');
+	assert.ok(enhanced.revision > firstReceipt.revision);
+	const restored = new ModelNotebook({ directory });
+	assert.deepEqual(await restored.findReceipt('a', { actionId: 'a' }), enhanced);
+	assert.deepEqual((await restored.query('a', { worldId: 'one', kind: 'notes' })).entries, [firstNote]);
+	await restored.recordReceipt('a', receipt);
+	assert.equal(writes.mock.callCount(), 3, 'a retry after disk reload is also unchanged');
+});
+
+test('failed notebook persistence is not mistaken for a committed retry', async (t) => {
+	const directory = await mkdtemp(join(tmpdir(), 'notebook-failed-storage-'));
+	t.after(() => rm(directory, { recursive: true, force: true }));
+	const originalWrite = AtomicAgentStore.prototype.write;
+	let failNext = false;
+	t.mock.method(AtomicAgentStore.prototype, 'write', function (...args) {
+		if (failNext) { failNext = false; return Promise.reject(new Error('storage unavailable')); }
+		return originalWrite.apply(this, args);
+	});
+	const notebook = new ModelNotebook({ directory });
+	const note = { worldId: 'one', key: 'routine', text: 'First version.' };
+	await notebook.writeNote('a', note);
+	failNext = true;
+	await assert.rejects(notebook.writeNote('a', { ...note, text: 'New version.' }), /storage unavailable/);
+	assert.equal((await notebook.query('a', { worldId: 'one' })).entries[0].text, note.text);
+	assert.equal((await new ModelNotebook({ directory }).query('a', { worldId: 'one' })).entries[0].text, note.text);
+	const updated = await notebook.writeNote('a', { ...note, text: 'New version.' });
+	assert.deepEqual((await new ModelNotebook({ directory }).query('a', { worldId: 'one' })).entries[0], updated);
+});
 
 test('notebook keeps model claims separate from immutable server receipts and retries are idempotent', async () => {
 	const notebook = new ModelNotebook();

@@ -19,6 +19,7 @@ public final class LocalPathfinderVerification {
 		assertions += verifyFlatPath();
 		assertions += verifyOneBlockJump();
 		assertions += verifySingleBlockGapJump();
+		assertions += verifyDropBesideGapJump();
 		assertions += verifySafeThreeBlockDrop();
 		assertions += verifyWallHasNoPath();
 		assertions += verifyUnsafeDropHasNoPath();
@@ -169,6 +170,24 @@ public final class LocalPathfinderVerification {
 		assertEquals(PathOutcome.FOUND, plan.outcome(), "single-block gap jump outcome");
 		assertEquals(2, plan.nodes().size(), "single-block gap jump node count");
 		assertEquals("JUMP_GAP", plan.nodes().getLast().traversal().name(), "single-block gap traversal");
+		return 3;
+	}
+
+	private static int verifyDropBesideGapJump() {
+		GridPosition start = position(0, 64, 0);
+		GridPosition trench = position(1, 63, 0);
+		GridPosition rim = position(2, 64, 0);
+		TestWorld world = new TestWorld().standable(start).standable(trench).standable(rim);
+		world.cell(position(1, 65, 0), WalkabilityView.Cell.CLEAR);
+		world.cell(position(0, 66, 0), WalkabilityView.Cell.CLEAR);
+		world.cell(position(2, 66, 0), WalkabilityView.Cell.CLEAR);
+		LocalPathfinder.Search search = new LocalPathfinder().beginSearch(start, Set.of(trench), trench, 32, Set.of());
+		PathPlan drop = search.advance(world, new LocalPathfinder.SearchBudget(128, TEST_TIME_BUDGET_NANOS, () -> 0L));
+		assertEquals(PathOutcome.FOUND, drop.outcome(), "jumpable opposite rim does not hide legal trench descent");
+		assertEquals(List.of(new PathNode(start, TraversalType.START), new PathNode(trench, TraversalType.DROP_DOWN)),
+				drop.nodes(), "trench descent retains the direct drop edge");
+		PathPlan jump = find(world, start, rim);
+		assertEquals(TraversalType.JUMP_GAP, jump.nodes().getLast().traversal(), "opposite-rim route keeps its cheaper gap jump");
 		return 3;
 	}
 

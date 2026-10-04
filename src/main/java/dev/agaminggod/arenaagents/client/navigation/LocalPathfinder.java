@@ -218,6 +218,11 @@ public final class LocalPathfinder implements PathPlanner {
 			Neighbor neighbor = resolveNeighbor(view, current, sameLevel);
 			if (neighbor != null) {
 				neighbors.add(neighbor);
+				// A jump over a trench and a drop into it are independent legal edges.
+				if (neighbor.traversal() == TraversalType.JUMP_GAP) {
+					Neighbor drop = resolveDrop(view, current, sameLevel);
+					if (drop != null) neighbors.add(drop);
+				}
 			}
 		}
 		return neighbors;
@@ -258,6 +263,10 @@ public final class LocalPathfinder implements PathPlanner {
 			return new Neighbor(gapLanding, TraversalType.JUMP_GAP, JUMP_GAP_COST);
 		}
 
+		return resolveDrop(view, current, sameLevel);
+	}
+
+	private static Neighbor resolveDrop(WalkabilityView view, GridPosition current, GridPosition sameLevel) {
 		for (int drop = 1; drop <= MAX_DROP_BLOCKS; drop++) {
 			GridPosition landing;
 			try {
@@ -388,6 +397,7 @@ public final class LocalPathfinder implements PathPlanner {
 		private final LongSupplier monotonicClock;
 		private final long startedAtNanos;
 		private int expandedNodes;
+		private int preparationWork;
 		private boolean exhausted;
 		private PathOutcome exhaustionOutcome;
 
@@ -417,6 +427,15 @@ public final class LocalPathfinder implements PathPlanner {
 			return exhausted;
 		}
 
+		/** Claims one preparation candidate against the same aggregate limits as expansion. */
+		public boolean tryPrepare() {
+			if (!tryClaimWork()) return false;
+			preparationWork++;
+			return true;
+		}
+
+		public int preparationWork() { return preparationWork; }
+
 		public PathOutcome exhaustionOutcome() {
 			if (!exhausted || exhaustionOutcome == null) {
 				throw new IllegalStateException("path search budget is not exhausted");
@@ -433,13 +452,18 @@ public final class LocalPathfinder implements PathPlanner {
 		}
 
 		private boolean tryExpand() {
-			if (timeExceeded()) return false;
-			if (expandedNodes >= maximumExpandedNodes) {
+			if (!tryClaimWork()) return false;
+			expandedNodes++;
+			return true;
+		}
+
+		private boolean tryClaimWork() {
+			if (exhausted || timeExceeded()) return false;
+			if ((long) expandedNodes + preparationWork >= maximumExpandedNodes) {
 				exhausted = true;
 				exhaustionOutcome = PathOutcome.NODE_LIMIT;
 				return false;
 			}
-			expandedNodes++;
 			return true;
 		}
 	}

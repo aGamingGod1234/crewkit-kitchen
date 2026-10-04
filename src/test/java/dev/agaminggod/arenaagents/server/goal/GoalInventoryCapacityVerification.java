@@ -32,6 +32,22 @@ public final class GoalInventoryCapacityVerification {
 			bind(originals, Items.IRON_BOOTS, 1, EquipmentSlot.FEET);
 			bind(originals, Items.CARVED_PUMPKIN, 64, EquipmentSlot.HEAD);
 			int assertions = 0;
+			GoalPredicate twentyPickaxes = new GoalPredicate.InventoryContains("minecraft:diamond_pickaxe", 20);
+			assertions += assertCapacity(false, new GoalPredicate.AllOf(List.of(twentyPickaxes, twentyPickaxes)),
+					"duplicate fixed-item thresholds reuse the same twenty inventory slots");
+			assertions += assertCapacity(false, new GoalPredicate.AllOf(List.of(twentyPickaxes,
+					new GoalPredicate.AllOf(List.of(twentyPickaxes, new GoalPredicate.InventoryContains("minecraft:diamond_pickaxe", 37))))),
+					"nested repeated fixed-item thresholds take the maximum rather than their sum");
+			assertions += assertCapacity(false, new GoalPredicate.AnyOf(List.of(
+					new GoalPredicate.InventoryContains("minecraft:diamond_pickaxe", 38),
+					new GoalPredicate.AllOf(List.of(twentyPickaxes, twentyPickaxes)))),
+					"a feasible duplicate-threshold alternative survives an impossible branch");
+			assertions += assertCapacity(true, new GoalPredicate.AllOf(List.of(twentyPickaxes,
+					new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 20))),
+					"different fixed items still consume separate inventory slots");
+			assertions += assertCapacity(true, new GoalPredicate.AllOf(List.of(twentyPickaxes,
+					new GoalPredicate.InventoryContains("minecraft:diamond_pickaxe", 38))),
+					"an impossible maximum threshold still fails capacity validation");
 			assertions += assertCapacity(true, new GoalPredicate.AllOf(List.of(
 					new GoalPredicate.InventoryContainsBlock(Integer.MAX_VALUE), new GoalPredicate.OperatorConfirmed())),
 					"nested generic block requirements reject their own capacity overflow");

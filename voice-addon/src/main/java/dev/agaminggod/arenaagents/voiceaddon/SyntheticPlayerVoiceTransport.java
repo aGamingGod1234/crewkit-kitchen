@@ -217,7 +217,7 @@ final class SyntheticPlayerVoiceTransport implements VoicePlaybackCoordinator.Tr
 		private boolean start(SyntheticPlayback playback, byte[] firstFrame) {
 			if (closed || !sender.canSend()) return false;
 			SyntheticPlayback previous = active.getAndSet(playback);
-			if (previous != null && previous != playback) previous.cancelFromBinding();
+			if (previous != null && previous != playback) previous.failFromBinding();
 			try {
 				sender.reset();
 				if (closed || active.get() != playback || !sender.send(firstFrame)) {
@@ -265,7 +265,7 @@ final class SyntheticPlayerVoiceTransport implements VoicePlaybackCoordinator.Tr
 			closed = true;
 			forgetPlaybackDistance(active.get());
 			SyntheticPlayback current = active.getAndSet(null);
-			if (current != null) current.cancelFromBinding();
+			if (current != null) current.failFromBinding();
 			RuntimeException firstFailure = null;
 			try {
 				sender.reset();
@@ -295,7 +295,7 @@ final class SyntheticPlayerVoiceTransport implements VoicePlaybackCoordinator.Tr
 		private final short[] samples;
 		private final Runnable onStopped;
 		private final Runnable onFailed;
-		private final AtomicBoolean cancelled = new AtomicBoolean();
+		private final AtomicReference<Completion> interruption = new AtomicReference<>();
 		private final AtomicBoolean finished = new AtomicBoolean();
 		private volatile Thread worker;
 		private volatile boolean started;
@@ -319,7 +319,7 @@ final class SyntheticPlayerVoiceTransport implements VoicePlaybackCoordinator.Tr
 		@Override
 		public synchronized void start() {
 			if (started) throw new IllegalStateException("Synthetic voice playback already started");
-			if (cancelled.get()) throw unavailable("Synthetic voice playback was cancelled before start");
+			if (interruption.get() != null) throw unavailable("Synthetic voice playback was interrupted before start");
 			byte[] firstFrame = encoder.encode(frameAt(0));
 			if (!binding.start(this, firstFrame)) {
 				closeEncoder();
@@ -337,23 +337,23 @@ final class SyntheticPlayerVoiceTransport implements VoicePlaybackCoordinator.Tr
 			int sentFrames = 1;
 			boolean completed = false;
 			try {
-				while (!cancelled.get() && offset < samples.length) {
+				while (interruption.get() == null && offset < samples.length) {
 					waitUntil(startedNanos + sentFrames * FRAME_NANOS);
-					if (cancelled.get()) break;
+					if (interruption.get() != null) break;
 					byte[] encoded = encoder.encode(frameAt(offset));
 					if (!binding.send(this, encoded)) return;
 					offset += SAMPLES_PER_FRAME;
 					sentFrames++;
 				}
-				if (!cancelled.get()) {
+				if (interruption.get() == null) {
 					waitUntil(startedNanos + sentFrames * FRAME_NANOS);
-					completed = !cancelled.get();
+					completed = interruption.get() == null;
 				}
 			} catch (RuntimeException failure) {
 				LOGGER.warn("Agent microphone stream failed for {}", agentId, failure);
 			} finally {
-				finish(completed ? Completion.STOPPED
-						: cancelled.get() ? Completion.CANCELLED : Completion.FAILED);
+				Completion interrupted = interruption.get();
+				finish(interrupted != null ? interrupted : completed ? Completion.STOPPED : Completion.FAILED);
 			}
 		}
 
@@ -363,25 +363,26 @@ final class SyntheticPlayerVoiceTransport implements VoicePlaybackCoordinator.Tr
 		}
 
 		private void waitUntil(long deadlineNanos) {
-			while (!cancelled.get()) {
+			while (interruption.get() == null) {
 				long remaining = deadlineNanos - System.nanoTime();
 				if (remaining <= 0L) return;
 				LockSupport.parkNanos(remaining);
-				if (Thread.interrupted() && cancelled.get()) return;
+				if (Thread.interrupted() && interruption.get() != null) return;
 			}
 		}
 
 		@Override
 		public synchronized void stop() {
-			cancelled.set(true);
+			interruption.compareAndSet(null, Completion.CANCELLED);
 			Thread current = worker;
 			if (current != null) current.interrupt();
 			binding.finish(this);
 			if (!started) finish(Completion.CANCELLED);
 		}
 
-		private void cancelFromBinding() {
-			cancelled.set(true);
+		private void failFromBinding() {
+			// Binding loss is involuntary. Coordinator stop settles intentional cancellation first.
+			interruption.compareAndSet(null, Completion.FAILED);
 			Thread current = worker;
 			if (current != null) current.interrupt();
 		}

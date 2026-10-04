@@ -6,9 +6,11 @@ import java.io.Writer;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.AclEntry;
@@ -16,6 +18,7 @@ import java.nio.file.attribute.AclEntryFlag;
 import java.nio.file.attribute.AclEntryPermission;
 import java.nio.file.attribute.AclEntryType;
 import java.nio.file.attribute.AclFileAttributeView;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.FileAttribute;
 import java.nio.file.attribute.PosixFileAttributeView;
 import java.nio.file.attribute.PosixFilePermission;
@@ -789,25 +792,37 @@ final class BundledCoordinatorInstaller {
 
 	private static void assertNoLinkedTree(Path root) throws IOException {
 		if (!Files.exists(root, LinkOption.NOFOLLOW_LINKS)) return;
-		try (var paths = Files.walk(root)) {
-			for (Path path : paths.toList()) {
-				if (linked(path)) throw new IOException("Coordinator mutation tree contains a link or reparse point: " + path);
+		Files.walkFileTree(root, new SimpleFileVisitor<>() {
+			@Override
+			public FileVisitResult preVisitDirectory(Path directory, BasicFileAttributes attributes) throws IOException {
+				// Windows junctions are directories to the walker. Reject them before visiting their children.
+				return check(directory, attributes);
 			}
-		}
+
+			@Override
+			public FileVisitResult visitFile(Path file, BasicFileAttributes attributes) throws IOException {
+				return check(file, attributes);
+			}
+
+			private FileVisitResult check(Path path, BasicFileAttributes attributes) throws IOException {
+				if (attributes.isSymbolicLink() || attributes.isOther()) {
+					throw new IOException("Coordinator mutation tree contains a link or reparse point: " + path);
+				}
+				return FileVisitResult.CONTINUE;
+			}
+		});
 	}
 
 	private static boolean linked(Path path) throws IOException {
-		if (Files.isSymbolicLink(path)) return true;
-		try {
-			Object value = Files.getAttribute(path, "dos:reparsePoint", LinkOption.NOFOLLOW_LINKS);
-			return Boolean.TRUE.equals(value);
-		} catch (UnsupportedOperationException | IllegalArgumentException ignored) {
-			return false;
-		}
+		// The Windows provider exposes non-symlink reparse points (including junctions) as isOther.
+		// Basic attributes are supported on every provider; failures must propagate, never imply safety.
+		BasicFileAttributes attributes = Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+		return attributes.isSymbolicLink() || attributes.isOther();
 	}
 
 	private static void deleteTree(Path root, Path target) throws IOException {
 		assertContained(root, target);
+		assertNoLinkedAncestors(root, target);
 		if (!Files.exists(target, LinkOption.NOFOLLOW_LINKS)) return;
 		assertNoLinkedTree(target);
 		try (var paths = Files.walk(target)) {

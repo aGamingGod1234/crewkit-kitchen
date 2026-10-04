@@ -111,6 +111,11 @@ export class ProviderHealthRegistry {
 		this.#operations.clear();
 	}
 
+	forget(identityValue) {
+		const identity = requireIdentity(identityValue);
+		return this.#operations.delete(JSON.stringify([identity.profileFingerprint ?? `legacy:${identity.provider}:${identity.model}`, identity.operation]));
+	}
+
 	#state(identityValue) {
 		const identity = requireIdentity(identityValue);
 		const key = JSON.stringify([identity.profileFingerprint ?? `legacy:${identity.provider}:${identity.model}`, identity.operation]);

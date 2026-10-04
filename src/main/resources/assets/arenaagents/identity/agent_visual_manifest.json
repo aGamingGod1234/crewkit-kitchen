@@ -134,7 +134,7 @@
         },
         {
           "key": "flash",
-          "models": ["gemini-3.6-flash", "gemini-3.5-flash"],
+          "models": ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"],
           "shortLabel": "Flash",
           "variants": [
             {"texturePath": "arenaagents:textures/entity/gemini_flash_agent_0.png", "transportCode": "g10"},

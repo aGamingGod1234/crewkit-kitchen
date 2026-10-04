@@ -16,6 +16,7 @@ export class RotatingJsonlSink {
 	#now;
 	#inspect;
 	#activeSince = null;
+	#appending = false;
 
 	constructor(filePath, dependencies = {}) {
 		if (typeof filePath !== 'string' || filePath.trim() === '') throw new TypeError('rotating JSONL file path must be nonblank');
@@ -35,6 +36,15 @@ export class RotatingJsonlSink {
 	}
 
 	async append(encoded, options) {
+		// Queue timeouts cannot cancel filesystem I/O. Keep ownership until it really
+		// settles; later rows are best-effort failures instead of racing rotation.
+		if (this.#appending) throw new Error('JSONL sink append is still in progress');
+		this.#appending = true;
+		try { await this.#appendExclusive(encoded, options); }
+		finally { this.#appending = false; }
+	}
+
+	async #appendExclusive(encoded, options) {
 		if (!this.#inspect) {
 			await this.#append(this.#filePath, encoded, options);
 			return;

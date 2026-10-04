@@ -150,7 +150,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private final BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
 	private static final GoalSpecWireCodec GOAL_SPEC_WIRE_CODEC = new GoalSpecWireCodec();
 	private final String serverInstanceId = UUID.randomUUID().toString();
+	private final Object publicationLock = new Object();
 	private final ObservationPublication observationPublication = new ObservationPublication(
+			publicationLock,
 			AgentConstants.DEFAULT_AGENT_LIMIT,
 			OBSERVATIONS_PER_TICK,
 			configuredHeartbeatMinimumIntervalTicks(),
@@ -180,7 +182,6 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private final ProgramActionLedger programActions = new ProgramActionLedger();
 	private final TerminalResultLedger terminalResults = new TerminalResultLedger();
 	private final DurableActionJournal actionJournal;
-	private final Object publicationLock = new Object();
 	private final Object verboseControlLock = new Object();
 	private final Set<AgentId> protocolKnownAgentIds = new HashSet<>();
 	private final Set<AgentId> coordinatorReadyAgentIds = new HashSet<>();
@@ -189,6 +190,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private final Map<AgentId, RecoveryObservationIdentity> recoveryObservationIdentities = new HashMap<>();
 	private final Map<UUID, ActivatedGoalSpecRequest> activatedGoalSpecRequests = new LinkedHashMap<>();
 	private volatile Runnable handshakeSnapshotHook = () -> { };
+	private volatile Runnable observationEnqueueHook = () -> { };
 	private volatile java.util.function.Consumer<AutoCloseable> handshakeCommittedHook = ignored -> { };
 	private boolean disconnectInProgress;
 	private long coordinatorLifecycleGeneration;
@@ -441,10 +443,17 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		List<AgentRecord> visibleRecords = manager.coordinatorVisibleRecords();
 		List<AgentId> observationAgents = registeredObservationIds(visibleRecords);
 		Set<AgentId> observationAgentSet = Set.copyOf(observationAgents);
-		for (AgentId agentId : observations.changedActiveAgents(visibleRecords)) {
+		for (var change : observations.changedActiveAgentSamples(visibleRecords)) {
+			AgentId agentId = change.agentId();
 			if (!observationAgentSet.contains(agentId)) continue;
-			observationPublication.markAttention(agentId);
-			queueUrgentObservation(agentId);
+			if (change.forceAttention()) {
+				observationPublication.markAttention(agentId);
+				queueUrgentObservation(agentId);
+			} else {
+				// Keep quiet samples on the normal queue so safe-air churn cannot
+				// continually displace a due heartbeat.
+				queueObservation(agentId);
+			}
 		}
 		observationPublication.scheduleIdleHeartbeat(observationAgents);
 		observationPublication.drain(this::sendObservation);
@@ -699,10 +708,16 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			if (protocolKnownAgentIds.contains(record.agentId())) return true;
 			Session active = session;
 			if (active == null || !active.open.get() || !active.authenticated.get()) return false;
-			active.enqueue(new BridgeEnvelope(
-					2, serverInstanceId, record.agentId().toString(), "agent_registered",
-					"server-" + messageIds.incrementAndGet(), registeredPayload(record)
-			));
+			try {
+				active.enqueue(new BridgeEnvelope(
+						2, serverInstanceId, record.agentId().toString(), "agent_registered",
+						"server-" + messageIds.incrementAndGet(), registeredPayload(record)
+				));
+			} catch (RuntimeException exception) {
+				// A committed registry update must be reconciled if publication cannot fit.
+				active.close();
+				throw exception;
+			}
 			protocolKnownAgentIds.add(record.agentId());
 			return true;
 		}
@@ -741,6 +756,14 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			if (!protocolKnownAgentIds.contains(transition.after().agentId())) return null;
 			observationPublication.markAttention(transition.after().agentId());
 			queueUrgentObservation(transition.after().agentId());
+			if (transition.before().state() == AgentLifecycleState.DEAD
+					&& transition.after().state() == AgentLifecycleState.DEAD
+					&& transition.after().goalRevision() > transition.before().goalRevision()) {
+				// Stop/steer changed intent, not physical life. Publish the authoritative
+				// revised DEAD record; a goal_control stop/steer would falsely revive it.
+				send("agent_registered", transition.after().agentId().toString(), registeredPayload(transition.after()));
+				return null;
+			}
 			String operation = operation(transition);
 			if (operation == null) return null;
 			send("goal_control", transition.after().agentId().toString(), goalControlPayload(transition, operation));
@@ -751,6 +774,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	void setHandshakeSnapshotHookForVerification(Runnable hook) {
 		handshakeSnapshotHook = Objects.requireNonNull(hook, "handshake snapshot hook must not be null");
+	}
+
+	void setObservationEnqueueHookForVerification(Runnable hook) {
+		observationEnqueueHook = Objects.requireNonNull(hook, "observation enqueue hook must not be null");
 	}
 
 	void setHandshakeCommittedHookForVerification(java.util.function.Consumer<AutoCloseable> hook) {
@@ -972,6 +999,12 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		if (!MessageDigest.isEqual(expectedProof.getBytes(StandardCharsets.UTF_8), suppliedProof.getBytes(StandardCharsets.UTF_8))) {
 			throw new BridgeProtocolException("AUTHENTICATION_FAILED", "Coordinator did not prove possession of the bridge secret");
 		}
+		if (envelope.payload().has("registryFragments")) {
+			JsonElement capability = envelope.payload().get("registryFragments");
+			if (!capability.isJsonPrimitive() || !capability.getAsJsonPrimitive().isBoolean()) throw new BridgeProtocolException("INVALID_FIELD", "registryFragments must be a boolean");
+			source.registryFragments = capability.getAsBoolean();
+		}
+
 		while (true) {
 			ensureHandshakeTimeRemaining(source);
 			awaitDisconnectPublication(source);
@@ -985,8 +1018,18 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			if (suppliedLaunchId != null) payload.addProperty("launchId", suppliedLaunchId);
 			JsonArray registry = new JsonArray();
 			Set<AgentId> handshakeKnownAgentIds = new HashSet<>();
+			// Preflight one immutable record at a time before committing the session. The
+			// negotiated writer retains record references, never a cloned whole JSON registry.
+			long legacyRegistryBytes = 0;
 			for (AgentRecord record : visibleRecords) {
-				registry.add(registeredPayload(record));
+				JsonObject entry = registeredPayload(record);
+				codec.preflightRegistryEntry(serverInstanceId, entry);
+				if (!source.registryFragments) {
+					legacyRegistryBytes += entry.toString().getBytes(StandardCharsets.UTF_8).length;
+					if (legacyRegistryBytes > BridgeEnvelopeCodec.MAX_LINE_BYTES) throw new BridgeProtocolException(
+							"REGISTRY_FRAGMENT_CAPABILITY_REQUIRED", "Coordinator must negotiate registryFragments for this registry");
+					registry.add(entry);
+				}
 				handshakeKnownAgentIds.add(record.agentId());
 			}
 			payload.add("registry", registry);
@@ -1052,7 +1095,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				}
 				try {
 					for (AgentRecord record : visibleRecords) programActions.beginGoal(record.agentId(), record.goalRevision());
-					source.completeHandshake(handshake, suppliedLaunchId, sessionGenerations.incrementAndGet());
+					source.completeHandshake(handshake, suppliedLaunchId, sessionGenerations.incrementAndGet(), source.registryFragments ? visibleRecords : null);
 					handshakeCommittedHook.accept(source);
 					coordinatorLifecycleGeneration++;
 					markVerboseControlPublished(verboseControl);
@@ -1115,7 +1158,6 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private void acceptGoalSpecProposal(BridgeEnvelope envelope) {
 		AgentId agentId = AgentId.parse(envelope.agentId());
 		JsonObject payload = envelope.payload();
-		requireKeys(payload, Set.of("requestId", "summary", "predicate"), "goal_spec_proposal");
 		String requestIdValue = requiredString(payload, "requestId");
 		UUID requestId;
 		try {
@@ -1124,12 +1166,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			sendGoalSpecResult(agentId, requestIdValue, "rejected", "INVALID_GOAL_SPEC_REQUEST_ID");
 			return;
 		}
-		String summary = requiredString(payload, "summary").strip();
-		if (summary.isEmpty() || summary.length() > 512) {
-			sendGoalSpecResult(agentId, requestIdValue, "rejected", "INVALID_GOAL_SPEC_SUMMARY");
-			return;
-		}
 		try {
+			requireKeys(payload, Set.of("requestId", "summary", "predicate"), "goal_spec_proposal");
+			String summary = goalSpecSummary(payload);
 			JsonElement predicateElement = payload.get("predicate");
 			if (predicateElement == null || !predicateElement.isJsonObject()) {
 				throw new BridgeProtocolException("INVALID_GOAL_PREDICATE", "goal_spec_proposal.predicate must be an object");
@@ -1190,6 +1229,15 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		} catch (AgentDomainException | BridgeProtocolException exception) {
 			String code = exception instanceof AgentDomainException domain ? domain.code() : ((BridgeProtocolException) exception).code();
 			sendGoalSpecResult(agentId, requestIdValue, "rejected", code);
+		}
+	}
+
+	static String goalSpecSummary(JsonObject payload) {
+		try {
+			// The producer contract counts UTF-16 code units, as String.length does.
+			return requiredString(payload, "summary", 512).strip();
+		} catch (BridgeProtocolException exception) {
+			throw new BridgeProtocolException("INVALID_GOAL_SPEC_SUMMARY", "Goal summary must be a nonblank string of at most 512 characters");
 		}
 	}
 
@@ -1464,16 +1512,24 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			for (var element : componentValues) {
 				if (!element.isJsonObject()) throw new BridgeProtocolException("INVALID_COORDINATOR_STATUS", "component must be an object");
 				JsonObject component = element.getAsJsonObject();
-				requireKeys(component, Set.of(
+				Set<String> requiredComponentKeys = Set.of(
 						"component", "state", "fallbackMode", "boundary", "failureCode", "consecutiveFailureCount",
 						"nextProbeAtEpochMs", "generation", "lastRecoveryAtEpochMs"
-				), "component");
+				);
+				Set<String> allowedComponentKeys = new java.util.HashSet<>(requiredComponentKeys);
+				allowedComponentKeys.addAll(Set.of("failedOperationCount", "droppedCount", "incompleteCapture"));
+				if (!component.keySet().containsAll(requiredComponentKeys) || !allowedComponentKeys.containsAll(component.keySet())) {
+					throw new BridgeProtocolException("INVALID_FIELD", "component");
+				}
 				components.add(new CoordinatorStatusSnapshot.ComponentRecovery(
 						requiredStatusString(component, "component"), requiredStatusString(component, "state"),
 						requiredNullableStatusString(component, "fallbackMode"), requiredNullableStatusString(component, "boundary"),
 						requiredNullableStatusString(component, "failureCode"), requiredInt(component, "consecutiveFailureCount"),
 						requiredNullableStatusLong(component, "nextProbeAtEpochMs"), requiredLong(component, "generation"),
-						requiredNullableStatusLong(component, "lastRecoveryAtEpochMs")
+						requiredNullableStatusLong(component, "lastRecoveryAtEpochMs"),
+						component.has("failedOperationCount") ? requiredLong(component, "failedOperationCount") : null,
+						component.has("droppedCount") ? requiredLong(component, "droppedCount") : null,
+						component.has("incompleteCapture") ? requiredBoolean(component, "incompleteCapture") : null
 				));
 			}
 		}
@@ -2702,12 +2758,20 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		if (active == null || !active.authenticated.get()) {
 			return;
 		}
-		active.enqueue(new BridgeEnvelope(2, serverInstanceId, agentId, type,
-				"server-" + messageIds.incrementAndGet(), payload));
+		try {
+			active.enqueue(new BridgeEnvelope(2, serverInstanceId, agentId, type,
+					"server-" + messageIds.incrementAndGet(), payload));
+		} catch (RuntimeException exception) {
+			// Registry transitions commit before their sink runs. Reconnect makes the
+			// authoritative snapshot visible instead of leaving a live stale coordinator.
+			if ("goal_control".equals(type)) active.close();
+			throw exception;
+		}
 	}
 
 	private boolean sendObservationEnvelope(Session source, AgentId agentId, JsonObject payload) {
 		if (session != source || !source.open.get() || !source.authenticated.get()) return false;
+		observationEnqueueHook.run();
 		BridgeEnvelope envelope = new BridgeEnvelope(2, serverInstanceId, agentId.toString(), "observation",
 				"server-" + messageIds.incrementAndGet(), payload);
 		if (codec.encodedLineBytes(envelope) > BridgeEnvelopeCodec.MAX_LINE_BYTES) {
@@ -2821,20 +2885,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	private static String plannerGoal(AgentGoal goal) {
-		if (goal.steeringInstructions().isEmpty()) {
-			return goal.prompt();
-		}
-		String first = goal.steeringInstructions().getFirst();
-		String latest = goal.steeringInstructions().getLast();
-		String advisory = first.startsWith("Suggested subgoals from Luna (") ? "\n\n" + first : "";
-		String steering = advisory + (latest.equals(first) && !advisory.isEmpty()
-				? "" : "\n\nSteering instruction: " + latest);
-		if (steering.length() >= AgentConstants.MAX_PROMPT_LENGTH) {
-			return steering.substring(steering.length() - AgentConstants.MAX_PROMPT_LENGTH);
-		}
-		int promptLimit = AgentConstants.MAX_PROMPT_LENGTH - steering.length();
-		String prompt = goal.prompt().length() <= promptLimit ? goal.prompt() : goal.prompt().substring(0, promptLimit);
-		return prompt + steering;
+		return goal.plannerPrompt();
 	}
 
 	private static GoalVerificationRuntime defaultGoalVerificationRuntime(CodexAgentManager manager) {
@@ -3131,7 +3182,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			boolean send(AgentId agentId, JsonObject payload);
 		}
 
-		private final Object lifecycleLock = new Object();
+		private final Object lifecycleLock;
 		private final ObservationDispatchQueue<AgentId> queue;
 		private final PublishedObservationState published;
 		private final int queueCapacity;
@@ -3170,6 +3221,19 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				int heartbeatMinimumIntervalTicks,
 				java.util.function.BiFunction<AgentId, JsonObject, ServerObservationWireBudget.Fitted> fitter
 		) {
+			this(new Object(), queueCapacity, perTickLimit, heartbeatMinimumIntervalTicks, fitter);
+		}
+
+		private ObservationPublication(
+				Object lifecycleLock,
+				int queueCapacity,
+				int perTickLimit,
+				int heartbeatMinimumIntervalTicks,
+				java.util.function.BiFunction<AgentId, JsonObject, ServerObservationWireBudget.Fitted> fitter
+		) {
+			// Production shares the session publication monitor: enqueue and baseline commit
+			// must finish together before teardown can clear either session's observation state.
+			this.lifecycleLock = Objects.requireNonNull(lifecycleLock, "lifecycle lock must not be null");
 			if (heartbeatMinimumIntervalTicks < 1) {
 				throw new IllegalArgumentException("heartbeat minimum interval must be positive");
 			}
@@ -3669,11 +3733,16 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		private final Socket socket;
 		private final ArrayBlockingQueue<BridgeEnvelope> outbound = new ArrayBlockingQueue<>(CONNECTION_QUEUE_CAP);
 		private final Map<String, Integer> queuedByAgent = new HashMap<>();
+		private final Map<BridgeEnvelope, Long> queuedBytesByEnvelope = new java.util.IdentityHashMap<>();
+		private long queuedBytes;
+		private final Map<BridgeEnvelope, List<AgentRecord>> registrySnapshots = new java.util.IdentityHashMap<>();
+		private static final long MAX_QUEUED_BYTES = (long) CONNECTION_QUEUE_CAP * BridgeEnvelopeCodec.MAX_LINE_BYTES;
 		private final Set<String> inboundIds = new java.util.LinkedHashSet<>();
 		private final AtomicBoolean open = new AtomicBoolean(true);
 		private final AtomicBoolean authenticated = new AtomicBoolean();
 		private final long handshakeStartedNanos;
 		private final long handshakeTimeoutNanos = TimeUnit.MILLISECONDS.toNanos(HANDSHAKE_TIMEOUT_MS);
+		private volatile boolean registryFragments;
 		private volatile String clientNonce;
 		private volatile String serverNonce;
 		private volatile String authResponseMessageId;
@@ -3693,6 +3762,20 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			return handshakeTimeoutNanos - (System.nanoTime() - handshakeStartedNanos);
 		}
 
+		private void checkQueuedBytes(long addition) { checkQueuedBytes(addition, false); }
+
+		private void checkQueuedBytes(long addition, boolean singleEntry) {
+			// A legal large entry can travel alone; subsequent publications backpressure
+			// until it drains, rather than multiplying its size by the queue count.
+			if (singleEntry && queuedBytes == 0 && addition <= BridgeEnvelopeCodec.MAX_REGISTRY_ENTRY_BYTES + BridgeEnvelopeCodec.MAX_LINE_BYTES) return;
+			if (addition > MAX_QUEUED_BYTES - queuedBytes) throw new BridgeProtocolException("CONNECTION_BACKPRESSURE", "Outbound byte capacity exceeded");
+		}
+
+		private void retainQueuedBytes(BridgeEnvelope envelope, long bytes) {
+			queuedBytesByEnvelope.put(envelope, bytes);
+			queuedBytes += bytes;
+		}
+
 		void start() {
 			readerThread = Thread.ofPlatform().daemon().name("arenaagents-v2-reader").start(this::readLoop);
 			writerThread = Thread.ofPlatform().daemon().name("arenaagents-v2-writer").start(this::writeLoop);
@@ -3706,18 +3789,32 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			this.clientNonce = clientNonce;
 			this.serverNonce = serverNonce;
 			this.authResponseMessageId = response.messageId();
+			long responseBytes = codec.publicationBytes(response, false);
+			checkQueuedBytes(responseBytes);
 			if (!outbound.offer(response)) throw new BridgeProtocolException("CONNECTION_BACKPRESSURE", "Could not publish server authentication response");
 			queuedByAgent.merge(response.agentId(), 1, Integer::sum);
+			retainQueuedBytes(response, responseBytes);
 		}
 
 		synchronized void completeHandshake(List<BridgeEnvelope> envelopes, String launchId, long sessionGeneration) {
+			completeHandshake(envelopes, launchId, sessionGeneration, null);
+		}
+
+		synchronized void completeHandshake(List<BridgeEnvelope> envelopes, String launchId, long sessionGeneration, List<AgentRecord> records) {
 			if (!open.get()) throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Bridge session closed during authentication");
 			if (authenticated.get()) throw new BridgeProtocolException("DUPLICATE_HANDSHAKE", "Bridge session is already authenticated");
 			List<BridgeEnvelope> ordered = List.copyOf(Objects.requireNonNull(envelopes, "envelopes must not be null"));
 			if (ordered.isEmpty() || !"hello_ack".equals(ordered.getFirst().type())) {
 				throw new IllegalArgumentException("handshake must begin with hello_ack");
 			}
-			ordered.forEach(codec::encodeFrame);
+			Map<BridgeEnvelope, Long> bytesByEnvelope = new java.util.IdentityHashMap<>();
+			long totalBytes = 0;
+			for (BridgeEnvelope envelope : ordered) {
+				long bytes = codec.publicationBytes(envelope, registryFragments);
+				bytesByEnvelope.put(envelope, bytes);
+				totalBytes += bytes;
+			}
+			checkQueuedBytes(totalBytes);
 			if (outbound.remainingCapacity() < ordered.size()) {
 				throw new BridgeProtocolException("CONNECTION_BACKPRESSURE", "Outbound queue cannot publish handshake replay batch");
 			}
@@ -3728,37 +3825,45 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 					throw new BridgeProtocolException("AGENT_BACKPRESSURE", envelope.agentId());
 				}
 			}
+			if (records != null) {
+				if (records.size() > BridgeEnvelopeCodec.MAX_REGISTRY_AGENTS) throw new BridgeProtocolException("REGISTRY_CAP_EXCEEDED", "Registry exceeds configured protocol capacity");
+				registrySnapshots.put(ordered.getFirst(), List.copyOf(records));
+			}
 			authenticatedLaunchId = launchId;
 			authenticatedSessionGeneration = sessionGeneration;
 			authenticated.set(true);
 			for (BridgeEnvelope envelope : ordered) {
 				if (!outbound.offer(envelope)) throw new IllegalStateException("preflighted handshake queue rejected an envelope");
 				queuedByAgent.merge(envelope.agentId(), 1, Integer::sum);
+				retainQueuedBytes(envelope, bytesByEnvelope.get(envelope));
 			}
 		}
 
 		void enqueue(BridgeEnvelope envelope) {
-			codec.encodeFrame(envelope);
+			long bytes = codec.publicationBytes(envelope, registryFragments);
 			synchronized (publicationLock) {
 				synchronized (this) {
 					if (!open.get() || !authenticated.get()) {
 						throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Bridge session closed before publication");
 					}
+					checkQueuedBytes(bytes, true);
 					int agentQueued = queuedByAgent.getOrDefault(envelope.agentId(), 0);
 					if (agentQueued >= AGENT_QUEUE_CAP) throw new BridgeProtocolException("AGENT_BACKPRESSURE", envelope.agentId());
 					if (!outbound.offer(envelope)) throw new BridgeProtocolException("CONNECTION_BACKPRESSURE", "Outbound queue is full");
 					queuedByAgent.put(envelope.agentId(), agentQueued + 1);
+					retainQueuedBytes(envelope, bytes);
 				}
 			}
 		}
 
 		void enqueuePair(BridgeEnvelope first, BridgeEnvelope second, Runnable beforeEnqueue) {
-			codec.encodeFrame(first);
-			codec.encodeFrame(second);
+			long firstBytes = codec.publicationBytes(first, registryFragments);
+			long secondBytes = codec.publicationBytes(second, registryFragments);
 			synchronized (publicationLock) {
 				synchronized (this) {
 					if (!open.get() || !authenticated.get()) throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Bridge session closed before paired publication");
 					if (!first.agentId().equals(second.agentId())) throw new IllegalArgumentException("paired envelopes must belong to one agent");
+					checkQueuedBytes(firstBytes + secondBytes);
 					int agentQueued = queuedByAgent.getOrDefault(first.agentId(), 0);
 					if (agentQueued > AGENT_QUEUE_CAP - 2) throw new BridgeProtocolException("AGENT_BACKPRESSURE", first.agentId());
 					if (outbound.remainingCapacity() < 2) throw new BridgeProtocolException("CONNECTION_BACKPRESSURE", "Outbound queue cannot atomically publish paired messages");
@@ -3769,15 +3874,18 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 						throw new IllegalStateException("preflighted paired publication queue rejected an envelope");
 					}
 					queuedByAgent.put(first.agentId(), agentQueued + 2);
+					retainQueuedBytes(first, firstBytes);
+					retainQueuedBytes(second, secondBytes);
 				}
 			}
 		}
 
 		void enqueueAtomically(BridgeEnvelope envelope, Runnable beforeEnqueue) {
-			codec.encodeFrame(envelope);
+			long bytes = codec.publicationBytes(envelope, registryFragments);
 			synchronized (publicationLock) {
 				synchronized (this) {
 					if (!open.get() || !authenticated.get()) throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Bridge session closed before atomic publication");
+					checkQueuedBytes(bytes, true);
 					int agentQueued = queuedByAgent.getOrDefault(envelope.agentId(), 0);
 					if (agentQueued >= AGENT_QUEUE_CAP) throw new BridgeProtocolException("AGENT_BACKPRESSURE", envelope.agentId());
 					if (outbound.remainingCapacity() < 1) throw new BridgeProtocolException("CONNECTION_BACKPRESSURE", "Outbound queue cannot publish transaction");
@@ -3789,6 +3897,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 						throw new BridgeProtocolException("CONNECTION_BACKPRESSURE", "Atomic publication failed");
 					}
 					queuedByAgent.put(envelope.agentId(), agentQueued + 1);
+					retainQueuedBytes(envelope, bytes);
 				}
 			}
 		}
@@ -3836,16 +3945,25 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			try (BufferedOutputStream output = new BufferedOutputStream(socket.getOutputStream())) {
 				while (open.get()) {
 					BridgeEnvelope envelope = outbound.take();
-					BridgeEnvelopeCodec.EncodedFrame frame = codec.encodeFrame(envelope);
-					output.write(frame.bytesView());
+					List<AgentRecord> records;
+					synchronized (this) {
+						if (!open.get()) return;
+						records = registrySnapshots.remove(envelope);
+					}
+					if (records == null) codec.writePublication(envelope, registryFragments, () -> "server-" + messageIds.incrementAndGet(), output);
+					else codec.writeRegistrySnapshot(envelope, records.size(),
+							() -> records.stream().map(MultiplexedServerBridge::registeredPayload).iterator(),
+							() -> "server-" + messageIds.incrementAndGet(), output);
 					output.flush();
 					synchronized (this) {
 						queuedByAgent.computeIfPresent(envelope.agentId(), (id, count) -> count <= 1 ? null : count - 1);
+						Long bytes = queuedBytesByEnvelope.remove(envelope);
+						if (bytes != null) queuedBytes -= bytes;
 					}
 				}
 			} catch (InterruptedException exception) {
 				Thread.currentThread().interrupt();
-			} catch (IOException exception) {
+			} catch (RuntimeException | IOException exception) {
 				if (open.get()) LOGGER.warn("Codex bridge writer failed: {}", exception.getMessage());
 			} finally {
 				close();
@@ -3859,6 +3977,11 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				synchronized (this) {
 					if (!open.compareAndSet(true, false)) return;
 					wasAuthenticated = authenticated.get();
+					outbound.clear();
+					queuedByAgent.clear();
+					queuedBytesByEnvelope.clear();
+					registrySnapshots.clear();
+					queuedBytes = 0;
 				}
 				terminalResults.sessionClosed(this);
 				preauthSessions.remove(this);

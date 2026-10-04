@@ -235,7 +235,8 @@ export async function runNativeRealtimeTrial(Executor, { arm, repetition, action
 			// Measured from this run's wall clock; null means the event did not
 			// occur or the condition needed to interpret it was not observed.
 			preparationLeadMs: eventObserved ? deadlineAt - planningDueAt : null,
-			usefulOverlapMs: bodyContinuity ? firstAction.finishedAt - planningDueAt : null,
+			usefulOverlapMs: bodyContinuity && preparationFinishedAt !== null
+				? Math.max(0, Math.min(firstAction.finishedAt, preparationFinishedAt) - Math.max(firstAction.startedAt, preparationStartedAt)) : null,
 			decisionGapMs: controllerFollowed ? successorAction.startedAt - firstAction.finishedAt : null,
 			bodyActionDurationMs: firstAction !== null && firstAction.startedAt !== null && firstAction.finishedAt !== null
 				? firstAction.finishedAt - firstAction.startedAt : null,

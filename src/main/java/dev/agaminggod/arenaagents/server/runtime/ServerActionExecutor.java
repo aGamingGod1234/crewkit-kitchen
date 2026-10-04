@@ -27,7 +27,6 @@ import dev.agaminggod.arenaagents.server.runtime.input.InputLease;
 import dev.agaminggod.arenaagents.server.runtime.input.InputOwner;
 import dev.agaminggod.arenaagents.server.runtime.input.LeasedServerInputController;
 import dev.agaminggod.arenaagents.mixin.EntityPlayerActionPackAccessor;
-import dev.agaminggod.arenaagents.mixin.ServerPlayerGameModeBreakAccessor;
 import dev.agaminggod.arenaagents.server.voice.VoiceReceipt;
 import dev.agaminggod.arenaagents.server.voice.VoiceRequest;
 import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemRuntime;
@@ -63,6 +62,21 @@ import net.minecraft.world.phys.shapes.CollisionContext;
 import net.minecraft.world.phys.shapes.VoxelShape;
 
 public final class ServerActionExecutor {
+	/** The mixin issues a new receipt only for an actual successful removeBlock mutation. */
+	public interface BlockBreakReceiptAccess {
+		BlockBreakReceipt arenaagents$getBlockBreakReceipt();
+	}
+
+	public record BlockBreakReceipt(BlockPos position, BlockState before, BlockState after) {
+		public BlockBreakReceipt {
+			position = position.immutable();
+		}
+
+		boolean confirms(BlockBreakReceipt baseline, BlockPos target, String expectedBlockId, BlockState current) {
+			return this != baseline && position.equals(target) && expectedBlockId.equals(blockId(before))
+					&& before != after && after == before.getFluidState().createLegacyBlock() && current == after;
+		}
+	}
 	private static final Set<ActionType> ARENA_SCRIPT_PRIMITIVES = Set.of(
 			ActionType.MOVE_TO, ActionType.NAVIGATE_TO, ActionType.CONTROL, ActionType.CONTROL_SEQUENCE, ActionType.LOOK_AT, ActionType.ATTACK,
 			ActionType.SELECT_ITEM, ActionType.USE_ITEM, ActionType.BREAK_BLOCK, ActionType.PLACE_BLOCK,
@@ -1591,7 +1605,7 @@ public final class ServerActionExecutor {
 		private int placementAttempts;
 		private boolean breakInputIssued;
 		private boolean breakObservedInCarpet;
-		private final long breakStartGameTime;
+		private BlockBreakReceipt breakReceiptBaseline;
 		private int breakTicks;
 		private ServerActionObservation lastObservation;
 		private boolean executionStarted;
@@ -1632,7 +1646,6 @@ public final class ServerActionExecutor {
 			this.tolerance = tolerance;
 			this.sprint = sprint;
 			this.block = block;
-			this.breakStartGameTime = player == null ? -1L : player.level().getGameTime();
 			this.progress = mode == Mode.MOVE
 					? new ActionProgressTracker(player.position().distanceTo(destination), startedAt, MOVEMENT_STALL_TIMEOUT_MS)
 					: null;
@@ -1814,6 +1827,7 @@ public final class ServerActionExecutor {
 					}
 					case BREAK -> {
 						validateBreakTarget(player, block, expectedBlockId);
+						breakReceiptBaseline = ((BlockBreakReceiptAccess) (Object) player.gameMode).arenaagents$getBlockBreakReceipt();
 						physicalAttempted = true;
 						applyLookingInput(InputOwner.INTERACTION, 300, Vec3.atCenterOf(block), 0.0F, false, true, false);
 						breakInputIssued = true;
@@ -1886,19 +1900,20 @@ public final class ServerActionExecutor {
 				String currentBlockId = blockId(currentState);
 				HitResult hit = breakRayTarget(player);
 				boolean exactRayTarget = hit instanceof BlockHitResult blockHit && block.equals(blockHit.getBlockPos());
+				BlockBreakReceipt receipt = ((BlockBreakReceiptAccess) (Object) player.gameMode).arenaagents$getBlockBreakReceipt();
+				boolean ownedTransition = breakInputIssued && receipt != null
+						&& receipt.confirms(breakReceiptBaseline, block, expectedBlockId, currentState);
+				if (ownedTransition) {
+					lastObservation = breakObservation(now, hit, currentBlockId, 1.0D, true);
+					return result(ServerActionState.SUCCEEDED, "BLOCK_BROKEN", "Block broken", now);
+				}
 				if (!currentState.isAir() && !expectedBlockId.equals(currentBlockId)) {
 					lastObservation = breakObservation(now, hit, currentBlockId, 0.0D, false);
 					return result(ServerActionState.FAILED, "TARGET_CHANGED", "The observed block changed before it was broken", now);
 				}
 				if (currentState.isAir()) {
-					ServerPlayerGameModeBreakAccessor gameMode = (ServerPlayerGameModeBreakAccessor) (Object) player.gameMode;
-					boolean ownedTransition = breakInputIssued
-							&& block.equals(gameMode.arenaagents$getLastDestroyedBlock())
-							&& gameMode.arenaagents$getLastDestroyedGameTime() >= breakStartGameTime;
-					lastObservation = breakObservation(now, hit, currentBlockId, 1.0D, ownedTransition);
-					return ownedTransition
-							? result(ServerActionState.SUCCEEDED, "BLOCK_BROKEN", "Block broken", now)
-							: result(ServerActionState.FAILED, "TARGET_CHANGED", "The target disappeared before this action started mining", now);
+					lastObservation = breakObservation(now, hit, currentBlockId, 0.0D, false);
+					return result(ServerActionState.FAILED, "TARGET_CHANGED", "The target disappeared without this action's removal receipt", now);
 				}
 				if (!exactRayTarget) {
 					lastObservation = breakObservation(now, hit, currentBlockId, lastProgress, false);

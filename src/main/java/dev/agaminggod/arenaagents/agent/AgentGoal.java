@@ -20,6 +20,11 @@ public record AgentGoal(
 		long createdAtEpochMs,
 		long updatedAtEpochMs
 ) {
+	// Derived from the persisted schema: one original prompt and at most 64
+	// individually bounded instructions. Wire consumers use this distinct bound.
+	public static final int MAX_PLANNER_PROMPT_LENGTH = AgentConstants.MAX_PROMPT_LENGTH + 128
+			+ AgentConstants.MAX_STEERING_INSTRUCTIONS * (AgentConstants.MAX_PROMPT_LENGTH + 8);
+
 	public AgentGoal {
 		Objects.requireNonNull(goalId, "goalId must not be null");
 		prompt = AgentValidators.normalizePrompt(prompt);
@@ -90,6 +95,17 @@ public record AgentGoal(
 		}
 		revised.add(AgentValidators.normalizePrompt(instruction));
 		return new AgentGoal(goalId, prompt, revised, spec, status, evidence, createdAtEpochMs, nowEpochMs);
+	}
+
+	/** Authoritative guidance for fresh coordinator context, independent of provider history. */
+	public String plannerPrompt() {
+		if (steeringInstructions.isEmpty()) return prompt;
+		StringBuilder result = new StringBuilder(prompt);
+		result.append("\n\nSteering instructions (oldest first; later instructions supersede conflicting earlier instructions):");
+		for (int index = 0; index < steeringInstructions.size(); index++) {
+			result.append("\n").append(index + 1).append(". ").append(steeringInstructions.get(index));
+		}
+		return result.toString();
 	}
 
 	public AgentGoal withStatus(GoalStatus revisedStatus, Optional<GoalEvidence> revisedEvidence, long nowEpochMs) {

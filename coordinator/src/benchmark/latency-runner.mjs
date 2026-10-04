@@ -99,13 +99,18 @@ export async function runLatencyMatrix(options = {}) {
 	const recorder = measurementsEnabled ? options.recorder ?? new BenchmarkRecorder({ maxEvents: options.maxEvents ?? 10_000, baseContext: measurementContext, clock: options.recorderClock ?? wallClock }) : DISABLED_BENCHMARK_RECORDER;
 	const results = [];
 	let requiredFailure = null;
+	let executionStopped = null;
 	const cleanups = [];
 	try {
-		for (const trial of matrix.trials) {
+		matrixLoop: for (const trial of matrix.trials) {
 			for (let repetition = 1; repetition <= trial.repetitions; repetition += 1) {
 				const result = await runTrial({ ...options, matrix, trial, repetition, scenarioResolver, providerFactories, virtualBridgeFactory, recorder, measurementContext, wallClock, wallClockBasis, measurementsEnabled });
 				results.push(result);
 				if (result.status === 'FAILED' && result.error?.code === 'PROVIDER_UNAVAILABLE' && trial.providerAvailabilityRequired) requiredFailure = result.error;
+				if (result.cleanup?.ok === false) {
+					executionStopped = { code: 'CLEANUP_INCOMPLETE', afterTrialId: trial.id, afterRepetition: repetition, unexecutedTrials: matrix.trials.reduce((sum, item) => sum + item.repetitions, 0) - results.length };
+					break matrixLoop;
+				}
 			}
 		}
 	} finally {
@@ -117,6 +122,7 @@ export async function runLatencyMatrix(options = {}) {
 		...(Object.keys(measurementContext).length > 0 ? { context: measurementContext } : {}),
 		matrix: { version: matrix.version, benchmarkVersion: matrix.benchmarkVersion, protocolVersion: matrix.protocolVersion },
 		trials: results,
+		...(executionStopped ? { executionStopped } : {}),
 		cleanup: { ok: results.every((trial) => trial.cleanup?.ok !== false), activeActions: results.reduce((sum, trial) => sum + (trial.cleanup?.activeActions ?? 0), 0), listeners: results.reduce((sum, trial) => sum + (trial.cleanup?.listeners ?? 0), 0) },
 		summary: recorder.snapshot ? recorder.snapshot().length : 0,
 		benchmarkSummary: summarizeBenchmark(recorder.snapshot ? recorder.snapshot() : []),
@@ -134,6 +140,7 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 	let measurementStartedAt = null;
 	const setupSpansMs = { providerStart: null, coordinatorStart: null };
 	let provider = null;
+	let providerIdentity = { provider: trial.providerProfile.provider, synthetic: trial.mode !== 'live' };
 	let coordinator = null;
 	let bridge = null;
 	let world = null;
@@ -144,8 +151,32 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 	const cleanup = [];
 	const cleanupErrors = [];
 	let turnCount = 0;
-	let providerStopped = false;
-	let providerCleanupRegistered = false;
+	const acquisitionController = new AbortController();
+	let acquisitionState = 'not_started';
+	let providerStopState = 'not_started';
+	let providerStopPromise = null;
+	let providerStopError = null;
+	let retired = false;
+	let backgroundStop = false;
+	const stopProvider = () => {
+		if (providerStopPromise !== null) return providerStopPromise;
+		providerStopState = 'pending';
+		providerStopPromise = Promise.resolve().then(() => provider?.stop?.()).then(() => {
+			providerStopState = 'completed';
+		}, (error) => {
+			providerStopState = 'rejected';
+			providerStopError = error;
+			throw error;
+		});
+		// Keep ownership even when the caller must return at its deadline.
+		void providerStopPromise.catch(() => {});
+		return providerStopPromise;
+	};
+	const stopProviderAfterTimeout = () => {
+		backgroundStop = true;
+		void stopProvider();
+		return Promise.resolve();
+	};
 	let trialRecorder = null;
 	let scheduler = null;
 	let records = [];
@@ -165,31 +196,30 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 			?? (trial.mode === 'replay' ? defaultReplayFactory : null)
 			?? defaultLiveFactory;
 		if (factory === null && trial.mode !== 'live') throw coded('PROVIDER_UNAVAILABLE', `No factory is configured for ${trial.providerProfile.provider}`);
-		if (factory !== null) provider = await runWithDeadline(() => factory(trial.providerProfile, { trial, repetition, mode: trial.mode, options, matrix, scenario: rawScenario, loadScenario: scenario, deadline }), deadline);
-		const stopProvider = async () => {
-			if (providerStopped) return;
-			providerStopped = true;
-			await provider?.stop?.();
-		};
-		const stopProviderAfterTimeout = () => {
-			void withTimeout(Promise.resolve().then(stopProvider), cleanupTimeoutMs, 'CLEANUP_TIMEOUT').catch(() => {});
-			return Promise.resolve();
-		};
-		const registerProviderCleanup = () => {
-			if (!providerCleanupRegistered && provider && typeof provider.stop === 'function') {
-				providerCleanupRegistered = true;
-				cleanup.push(stopProvider);
-			}
-		};
-		registerProviderCleanup();
+		if (factory !== null) {
+			// Register ownership before racing acquisition against the trial deadline.
+			cleanup.push(async () => {
+				if (acquisitionState === 'pending' || backgroundStop) return;
+				if (provider !== null && provider !== undefined) await stopProvider();
+			});
+			provider = await runWithDeadline(() => {
+				acquisitionState = 'pending';
+				return Promise.resolve().then(() => factory(trial.providerProfile, { trial, repetition, mode: trial.mode, options, matrix, scenario: rawScenario, loadScenario: scenario, deadline, signal: acquisitionController.signal })).then((acquired) => {
+					provider = acquired;
+					acquisitionState = 'resolved';
+					if (retired && acquired !== null && acquired !== undefined) void stopProvider();
+					return acquired;
+				}, (error) => { acquisitionState = 'rejected'; throw error; });
+			}, deadline);
+		}
+		providerIdentity.synthetic ||= provider?.synthetic === true;
 		if (provider === null || provider === undefined || provider.available === false) {
 			const error = coded('PROVIDER_UNAVAILABLE', boundedError(provider?.reason ?? 'provider is unavailable'));
-			result = trialResult(trial, repetition, trial.providerAvailabilityRequired ? 'FAILED' : 'SKIPPED', error, startedAt, null, null, measurementContext, { measurementStartedAt, setupSpansMs });
+			result = trialResult(trial, repetition, trial.providerAvailabilityRequired ? 'FAILED' : 'SKIPPED', error, startedAt, null, null, measurementContext, { measurementStartedAt, setupSpansMs }, providerIdentity);
 			return result;
 		}
 		if (trial.mode === 'replay' && !provider.createAgent) provider = createReplayProvider({ ...options, ...trial.replay, recordings: options.replayRecordings, trialId: trial.id, providerProfile: trial.providerProfile, scenario: rawScenario, prompt: trial.prompt ?? options.replayPrompt ?? 'latency-replay-prompt', protocolVersion: matrix.protocolVersion });
-		registerProviderCleanup();
-		validateProviderIdentity(provider, trial);
+		providerIdentity = validateProviderIdentity(provider, trial);
 		if (typeof provider.start === 'function') {
 			const providerStartedAt = performance.now();
 			try { await runWithDeadline(() => provider.start(), deadline); }
@@ -215,10 +245,10 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 		metrics?.attachBridgeAdapter(bridge);
 		if (metrics) cleanup.push(() => metrics.close());
 		cleanup.push(() => bridge?.stop());
-		trialRecorder = createTrialRecorder(recorder, { trial, repetition, measurementContext, metrics, enabled: measurementsEnabled });
+		trialRecorder = createTrialRecorder(recorder, { trial, repetition, providerIdentity, measurementContext, metrics, enabled: measurementsEnabled });
 		scheduler = createTrialScheduler(trial, trialRecorder, options);
 		cleanup.push(() => scheduler?.close?.('latency trial cleanup'));
-		const providerService = factory !== null ? createInjectedProviderService(provider, trial, turnBudget(trial), deadline, () => ++turnCount, stopProvider, stopProviderAfterTimeout) : null;
+		const providerService = factory !== null ? createInjectedProviderService(provider, trial, turnBudget(trial), deadline, () => ++turnCount, () => backgroundStop ? stopProviderAfterTimeout() : stopProvider(), stopProviderAfterTimeout) : null;
 		const config = benchmarkCoordinatorConfig(trial.agentLoad, options.planningConcurrency ?? trial.agentLoad);
 		coordinator = createDynamicCoordinator(config, {
 			memoryDirectory: null,
@@ -275,9 +305,9 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 		const error = runtimeError ? coded(runtimeError.code, runtimeError.message) : status === 'TIMED_OUT' ? coded('TURN_CAP', `trial exceeded the ${trial.turnCap}-turn cap`) : !scenarioPassed ? coded('SCENARIO_ASSERTION_FAILED', 'authoritative scenario outcome did not satisfy its success predicate') : null;
 		metrics?.markTaskCompletion({ status, agentIds: scenario.agentIds });
 		const outcomeHash = hash({ trialId: trial.id, repetition, status, scenarioId: trial.scenarioId, seed: trial.seed, agentLoad: trial.agentLoad, providerProfile: trial.providerProfile, statuses, turnCount, scenarioDigest });
-		result = trialResult(trial, repetition, status, error, startedAt, outcomeHash, cleanupSnapshot(bridge, sampler), measurementContext, { measurementStartedAt, setupSpansMs });
+		result = trialResult(trial, repetition, status, error, startedAt, outcomeHash, cleanupSnapshot(bridge, sampler), measurementContext, { measurementStartedAt, setupSpansMs }, providerIdentity);
 		result.benchmark = { eventCount: trialRecorder?.count ?? 0, traces: latencyRegistry.traceSnapshot() };
-		result.debug = { statuses, turnCount, runtimeErrors, scenarioPassed, scenarioDigest, scenarioEvidence: scenarioEvidence(virtual, scenario.agentIds), actionCommandHash: hash(authoritativeCommands(virtual)) };
+		result.debug = { statuses, turnCount, runtimeErrors, scenarioPassed, scenarioDigest, scenarioEvidence: scenarioEvidence(virtual, scenario.agentIds), actionCommandHash: hash(authoritativeCommands(virtual).map(comparableCommand)) };
 	} catch (error) {
 		if (error?.code === 'TRIAL_TIMEOUT') await new Promise((resolve) => setImmediate(resolve));
 		let typed = normalizeTrialError(error);
@@ -286,7 +316,7 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 			const runtimeError = providerError ?? runtimeErrors.find((entry) => entry.code && !['TRIAL_TIMEOUT'].includes(entry.code));
 			if (runtimeError) typed = coded(runtimeError.code, runtimeError.message);
 		}
-		result = trialResult(trial, repetition, isTimeoutErrorCode(typed.code) ? 'TIMED_OUT' : 'FAILED', typed, startedAt, null, cleanupSnapshot(bridge, sampler), measurementContext, { measurementStartedAt, setupSpansMs });
+		result = trialResult(trial, repetition, isTimeoutErrorCode(typed.code) ? 'TIMED_OUT' : 'FAILED', typed, startedAt, null, cleanupSnapshot(bridge, sampler), measurementContext, { measurementStartedAt, setupSpansMs }, providerIdentity);
 		result.benchmark = { eventCount: trialRecorder?.count ?? 0, traces: latencyRegistry.traceSnapshot() };
 		result.debug = {
 			runtimeErrors,
@@ -295,6 +325,8 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 			actionCommandHash: null,
 		};
 	} finally {
+		retired = true;
+		acquisitionController.abort();
 		try { sampler?.sample?.(); } catch {}
 		for (const close of cleanup.reverse()) {
 			try { await withTimeout(Promise.resolve().then(() => close?.()), cleanupTimeoutMs, 'CLEANUP_TIMEOUT'); }
@@ -302,12 +334,16 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 		}
 		if (result !== null) {
 			try { systemSummary = summarizeTrialSystem(sampler); } catch { systemSummary = null; }
-			result.cleanup = cleanupSnapshot(bridge, sampler, cleanupErrors);
+			if (acquisitionState === 'pending' || providerStopState === 'pending' || providerStopState === 'rejected') {
+				cleanupErrors.push({ code: 'PROVIDER_CLEANUP_INCOMPLETE', message: providerStopError ? boundedError(providerStopError) : 'provider acquisition or shutdown is still pending' });
+			}
+			result.cleanup = { ...cleanupSnapshot(bridge, sampler, cleanupErrors), providerAcquisition: acquisitionState, providerStop: providerStopState };
+			result.scheduler = scheduler ? { mode: scheduler.mode ?? null, maxConcurrent: scheduler.maxConcurrent ?? null, maxPending: scheduler.maxPending ?? null, urgentReserve: scheduler.urgentReserve ?? null } : null;
 			result.systemSummary = systemSummary;
 			result.metrics = metrics?.finalize({ world, agentIds: world?.agentIds ?? [] }) ?? null;
 			if (!result.cleanup.ok) {
-				result.status = 'FAILED';
-				result.error = { code: 'CLEANUP_FAILED', message: 'trial cleanup left resources or reported an error' };
+				if (result.status === 'PASSED' || result.status === 'SKIPPED') result.status = 'FAILED';
+				result.error ??= { code: 'CLEANUP_FAILED', message: 'trial cleanup left resources or reported an error' };
 			}
 		}
 	}
@@ -412,7 +448,7 @@ class VirtualMinecraftBridgeAdapter extends EventEmitter {
 		for (const [event, type] of [['observation', 'observation'], ['progress', 'action_progress'], ['result', 'action_result']]) {
 			const relay = (entry) => {
 				const message = { agentId: entry.envelope.agentId, payload: entry.envelope.payload };
-				if (type === 'observation' && entry.envelope.payload.lastResult?.present === true) {
+				if (type === 'observation' && entry.envelope.payload.lastResult?.present === true && entry.envelope.payload.currentAction?.active !== true) {
 					this.#pendingObservations.set(message.agentId, message);
 					return;
 				}
@@ -1130,12 +1166,12 @@ function runWithDeadline(task, deadline, code = 'TRIAL_TIMEOUT') {
 	if (remaining <= 0) return Promise.reject(coded(code, 'trial deadline elapsed'));
 	return withTimeout(Promise.resolve().then(task), remaining, code);
 }
-function createTrialRecorder(recorder, { trial, repetition, measurementContext = {}, metrics = null, enabled = true }) {
+function createTrialRecorder(recorder, { trial, repetition, providerIdentity, measurementContext = {}, metrics = null, enabled = true }) {
 	if (!enabled) return DISABLED_BENCHMARK_RECORDER;
 	let count = 0;
 	return {
 		record(stage, context = {}, fields = {}) {
-			const eventContext = { ...measurementContext, trialId: trial.id, repetition, scenarioId: trial.scenarioId, seed: trial.seed, agentLoad: trial.agentLoad, mode: trial.mode, synthetic: trial.mode !== 'live', provider: trial.providerProfile.provider, model: trial.providerProfile.model, reasoningEffort: trial.providerProfile.reasoningEffort, serviceTier: trial.providerProfile.serviceTier, ...context };
+			const eventContext = { ...measurementContext, trialId: trial.id, repetition, scenarioId: trial.scenarioId, seed: trial.seed, agentLoad: trial.agentLoad, mode: trial.mode, provider: trial.providerProfile.provider, model: trial.providerProfile.model, reasoningEffort: trial.providerProfile.reasoningEffort, serviceTier: trial.providerProfile.serviceTier, ...context, synthetic: providerIdentity.synthetic };
 			metrics?.observeRecorderStage(stage, eventContext, fields);
 			const row = recorder.record(stage, eventContext, fields);
 			if (row !== null) count += 1;
@@ -1149,7 +1185,7 @@ function createTrialScheduler(trial, recorder, options) {
 	if (typeof options.planningSchedulerFactory === 'function') return options.planningSchedulerFactory({ trial, recorder });
 	const configuredConcurrency = options.planningConcurrency ?? trial.agentLoad;
 	const maxConcurrent = Math.max(1, Math.min(trial.agentLoad, configuredConcurrency));
-	return new PlanningScheduler({ maxConcurrent, maxPending: Math.max(0, trial.agentLoad - maxConcurrent), benchmarkRecorder: recorder });
+	return new PlanningScheduler({ maxConcurrent, maxPending: options.planningMaxPending ?? Math.max(0, trial.agentLoad - maxConcurrent), urgentReserve: options.planningUrgentReserve, benchmarkRecorder: recorder });
 }
 function schedulerSnapshot(scheduler) { return { active: scheduler?.activeCount ?? null, pending: scheduler?.pendingCount ?? null }; }
 function summarizeTrialSystem(sampler) {
@@ -1210,12 +1246,23 @@ function validateProviderIdentity(provider, trial) {
 			if (provider.providerProfile[field] !== expected[field]) throw coded('PROVIDER_MISMATCH', `Live provider profile ${field} does not match selected profile`);
 		}
 	}
-	return { provider: expected.provider, synthetic: false };
+	return { provider: expected.provider, synthetic: provider.synthetic === true };
 }
 function isTimeoutErrorCode(code) { return typeof code === 'string' && (code === 'TURN_CAP' || code.includes('TIMEOUT')); }
 function internalProvider(provider) { return PROVIDERS.has(provider) && ['codex', 'gemini', 'kimi'].includes(provider) ? provider : 'codex'; }
 function manualScheduler() { const handles = new Set(); return { setInterval(callback) { const handle = { callback }; handles.add(handle); return handle; }, clearInterval(handle) { handles.delete(handle); } }; }
-function authoritativeCommands(virtual, agentId) { return (virtual?.sent ?? []).filter((event) => event?.type === 'action_command' && event.agentId === agentId).map((event) => ({ ...event.payload, agentId })); }
+function authoritativeCommands(virtual, agentId) {
+	// Whole-trial parity must retain inter-agent dispatch order and each command's owner.
+	return (virtual?.sent ?? []).filter((event) => event?.type === 'action_command' && (agentId === undefined || event.agentId === agentId)).map((event) => ({ ...event.payload, agentId: event.agentId }));
+}
+function comparableCommand(command) {
+	// ProgramRuntimeManager prefixes its semantic action digest with a session UUID
+	// (or our fixture ID). Compare sessions without weakening the live replay fence:
+	// retain the digest of agent/revision/lifecycle/sequence/internal action identity,
+	// all other payload fields, and any action ID outside these known formats.
+	const match = /^program:(?:[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}|fixture-[a-f0-9]{28}):([a-f0-9]{64})$/.exec(command.actionId);
+	return match ? { ...command, actionId: `program:${match[1]}` } : command;
+}
 function authoritativeResults(virtual, agentId) { return (virtual?.events ?? []).filter((event) => event?.type === 'result' && event.envelope?.agentId === agentId).map((event) => ({ ...event.envelope.payload, agentId })); }
 function scenarioEvidence(virtual, agentIds) {
 	const counts = new Map(agentIds.map((agentId) => [agentId, { actionResults: 0, succeeded: 0, failed: 0, cancelled: 0 }]));
@@ -1263,14 +1310,14 @@ function cleanupSnapshot(bridge, sampler, cleanupErrors = []) {
 	const samplerErrors = sampler?.errors?.length ?? 0;
 	return { ok: activeActions === 0 && listeners === 0 && relays === 0 && pendingObservations === 0 && !samplerActive && cleanupErrors.length === 0, activeActions, listeners, relays, pendingObservations, samplerActive, samplerErrors, errors: cleanupErrors.slice(0, 16) };
 }
-function trialResult(trial, repetition, status, error, startedAt, outcomeHash, cleanup, context = {}, timing = {}) {
+function trialResult(trial, repetition, status, error, startedAt, outcomeHash, cleanup, context = {}, timing = {}, providerIdentity) {
 	const endedAt = performance.now();
 	const measurementStartedAt = Number.isFinite(timing.measurementStartedAt) ? timing.measurementStartedAt : null;
 	const setupSpansMs = isRecord(timing.setupSpansMs) ? timing.setupSpansMs : {};
 	return {
 		...context,
 		trialId: trial.id, repetition, status, scenarioId: trial.scenarioId, seed: trial.seed, agentLoad: trial.agentLoad, mode: trial.mode,
-		providerProfile: trial.providerProfile, providerIdentity: { provider: trial.providerProfile.provider, synthetic: trial.mode !== 'live' },
+		providerProfile: trial.providerProfile, providerIdentity,
 		...(outcomeHash ? { outcomeHash } : {}),
 		...(error ? { error: { code: sanitizeDiagnosticErrorCode(error, { fallback: 'TRIAL_FAILED' }), message: boundedError(error) } } : {}),
 		cleanup: cleanup ?? { ok: true, activeActions: 0, listeners: 0 },

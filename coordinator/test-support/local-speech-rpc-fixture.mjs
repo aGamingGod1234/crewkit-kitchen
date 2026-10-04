@@ -12,6 +12,7 @@ for await (const line of lines) {
 	if (request.op === 'tts') {
 		if (request.text === 'block-worker') {
 			inferenceBlocked = true;
+			process.stderr.write('ARENA_FIXTURE_INFERENCE_BLOCKED\n');
 			continue;
 		}
 		const pcmBase64 = request.text === 'malformed'

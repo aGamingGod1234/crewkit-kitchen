@@ -324,7 +324,7 @@ export class ArenaScriptInterpreter {
 			case 'for-each-start': return this.#forEachStart(frame);
 			case 'for-each-next': return this.#forEachNext(frame);
 			case 'for-each-after-body': return this.#forEachAfterBody(frame);
-			case 'function-after-body': return this.#functionAfterBody();
+			case 'function-after-body': return this.#functionAfterBody(frame);
 			case 'repeat-check': return this.#repeatCheck(frame);
 			case 'repeat-after-condition': return this.#repeatAfterCondition(frame);
 			case 'repeat-after-body': return this.#repeatAfterBody(frame);
@@ -485,6 +485,12 @@ export class ArenaScriptInterpreter {
 
 	#assignment(node, environment) {
 		if (node.left.type !== 'Identifier') throw this.#error('UNSAFE_MEMBER_ACCESS', 'ArenaScript UNSAFE_MEMBER_ACCESS: only local variables may be assigned', node);
+		if (['&&=', '||=', '??='].includes(node.operator)) {
+			const left = environment.get(node.left.name, node.left);
+			if (node.operator === '&&=' && !left || node.operator === '||=' && left || node.operator === '??=' && left !== null && left !== undefined) return this.#values.push(left);
+			this.#frames.push({ type: 'assignment-set', environment, name: node.left.name, node });
+			return this.#frames.push({ type: 'expression', node: node.right, environment });
+		}
 		if (node.operator === '=') this.#frames.push({ type: 'assignment-set', environment, name: node.left.name });
 		else this.#frames.push({ type: 'assignment-set', environment, name: node.left.name, operator: node.operator.slice(0, -1), left: environment.get(node.left.name, node.left), node });
 		return this.#frames.push({ type: 'expression', node: node.right, environment });
@@ -696,8 +702,8 @@ export class ArenaScriptInterpreter {
 	}
 
 	#repeatAfterBody({ frame }) {
-		const completion = this.#values.pop();
-		if (completion?.kind && completion.kind !== 'normal') return this.#values.push(completion);
+		// Function invocation already unwraps internal completions. Return data is ignored.
+		this.#values.pop();
 		this.#frames.push({ type: 'repeat-check', ...frame });
 	}
 
@@ -712,14 +718,16 @@ export class ArenaScriptInterpreter {
 		if (args.length !== fn.node.params.length) throw this.#error('ARGUMENT_COUNT', 'ArenaScript ARGUMENT_COUNT: argument count does not match function parameters', fn.node);
 		const environment = new Environment(fn.environment, this.#context);
 		for (let index = 0; index < args.length; index += 1) environment.define(fn.node.params[index].name, args[index], 'let');
-		if (fn.node.id?.name) environment.define(fn.node.id.name, fn, 'const');
-		this.#frames.push({ type: 'function-after-body' });
+		// Formal parameters shadow a named function's self binding.
+		if (fn.node.id?.name && !environment.hasOwn(fn.node.id.name)) environment.define(fn.node.id.name, fn, 'const');
+		this.#frames.push({ type: 'function-after-body', expression: fn.node.body.type !== 'BlockStatement' });
 		if (fn.node.body.type === 'BlockStatement') this.#frames.push(statementListFrame(fn.node.body.body, environment));
 		else this.#frames.push({ type: 'expression', node: fn.node.body, environment });
 	}
 
-	#functionAfterBody() {
+	#functionAfterBody({ expression }) {
 		const completion = this.#values.pop();
+		if (expression) return this.#values.push(completion);
 		if (completion?.kind === 'return') return this.#values.push(completion.value);
 		if (completion?.kind === 'break' || completion?.kind === 'continue') throw executionError('INVALID_CONTROL_FLOW', 'ArenaScript INVALID_CONTROL_FLOW: loop control escaped a function');
 		this.#values.push(completion?.kind === 'normal' ? undefined : completion);
@@ -1077,7 +1085,7 @@ function isSafePrimitive(value) {
 }
 
 function canonicalize(value, { errorCode, invalidCode, label, maxBytes, requireNullPrototype = false }) {
-	const state = { nodes: 0, keys: 0, bytes: 0, seen: new Set(), containers: [] };
+	const state = { nodes: 0, keys: 0, bytes: 0, containers: [] };
 	const root = createCanonicalNode(value, null, label, 0, state, { errorCode, invalidCode, maxBytes, requireNullPrototype });
 	if (!root.container) return root.value;
 	const stack = [root];
@@ -1125,8 +1133,10 @@ function createCanonicalNode(value, parent, key, depth, state, options) {
 		if (isSafePrimitive(value)) return { value, container: false };
 		throw executionError(options.invalidCode, `ArenaScript ${options.invalidCode}: ${nodeLabel(parent, key)} must be a safe data value`);
 	}
-	if (nodeTypes.isProxy(value) || state.seen.has(value)) throw executionError(options.invalidCode, `ArenaScript ${options.invalidCode}: cyclic or proxy ${nodeLabel(parent, key)}`);
-	state.seen.add(value);
+	// Sharing between siblings is safe; only a reference to an ancestor is cyclic.
+	let ancestor = parent;
+	while (ancestor !== null && ancestor.source !== value) ancestor = ancestor.parent;
+	if (nodeTypes.isProxy(value) || ancestor !== null) throw executionError(options.invalidCode, `ArenaScript ${options.invalidCode}: cyclic or proxy ${nodeLabel(parent, key)}`);
 	state.nodes += 1;
 	if (state.nodes > CANONICAL_LIMITS.nodes || depth > CANONICAL_LIMITS.depth) throw limitError(options.errorCode, 'nodes');
 	if (Array.isArray(value)) {

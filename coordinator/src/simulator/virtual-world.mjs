@@ -41,6 +41,7 @@ export class VirtualWorld extends EventEmitter {
 	#blocks = new Map();
 	#entities = new Map();
 	#items = new Map();
+	#itemTags = new Map();
 	#inputs = new Map();
 	#observationSequences = new Map();
 	#conversationEvents = [];
@@ -240,6 +241,18 @@ export class VirtualWorld extends EventEmitter {
 		return clone(player);
 	}
 
+	attentionState(agentId) {
+		const player = this.#requirePlayer(agentId);
+		// Active hazard checks need no inventory, entity scan, or observation sequence.
+		return {
+			player: {
+				health: player.health, maxHealth: player.maxHealth, gameMode: player.gameMode,
+				onFire: player.onFire, suffocating: player.suffocating, lastAttacker: clone(player.lastAttacker),
+			},
+			world: { dimension: this.#dimension, raining: this.#raining, thundering: this.#thundering },
+		};
+	}
+
 	blockAt(x, y, z) {
 		const block = this.#blocks.get(blockKey(Math.trunc(x), Math.trunc(y), Math.trunc(z)));
 		return block === undefined ? null : clone(block);
@@ -288,6 +301,7 @@ export class VirtualWorld extends EventEmitter {
 			remaining -= used;
 		}
 		player.inventory.items = player.inventory.items.filter((item) => item.count > 0);
+		refreshInventoryTags(player.inventory);
 		return remaining === 0;
 	}
 
@@ -299,8 +313,9 @@ export class VirtualWorld extends EventEmitter {
 		if (existing) existing.count += quantity;
 		else {
 			if (player.inventory.items.length >= MAX_PLAYER_INVENTORY_ITEMS) throw capacityError('inventory items', MAX_PLAYER_INVENTORY_ITEMS);
-			player.inventory.items.push({ itemId: id, count: quantity, damage: 0, maxDamage: 0, slot: nextInventorySlot(player.inventory.items) });
+			player.inventory.items.push({ itemId: id, count: quantity, damage: 0, maxDamage: 0, slot: nextInventorySlot(player.inventory.items), ...(this.#itemTags.has(id) ? { tags: [...this.#itemTags.get(id)] } : {}) });
 		}
+		refreshInventoryTags(player.inventory);
 		return this.countInventoryItem(agentId, id);
 	}
 
@@ -327,8 +342,9 @@ export class VirtualWorld extends EventEmitter {
 			senderId: sender,
 			recipientId: recipient,
 			message: text,
-			wakeAcknowledged: true,
-			processed: true,
+			// Sending alone is not evidence that another coordinator woke or processed it.
+			wakeAcknowledged: false,
+			processed: false,
 		});
 		this.#conversationEvents.push(event);
 		return event;
@@ -480,6 +496,8 @@ export class VirtualWorld extends EventEmitter {
 				const key = blockKey(args.x, args.y, args.z);
 				const block = this.#blocks.get(key);
 				if (!block) return { done: true, state: 'FAILED', reasonCode: 'BLOCK_NOT_FOUND', changed: false };
+				if (block.blockId !== args.expectedBlockId) return { done: true, state: 'FAILED', reasonCode: 'TARGET_CHANGED', changed: false };
+				if (!withinBlockReach(player, args)) return { done: true, state: 'FAILED', reasonCode: 'TARGET_TOO_FAR', changed: false };
 				if (elapsedTicks + 1 < miningDurationTicks(block.blockId)) return { done: false, changed: false };
 				const inventoryBefore = clone(player.inventory);
 				try {
@@ -524,8 +542,10 @@ export class VirtualWorld extends EventEmitter {
 				if (normalized.type === 'craft_table' && this.#blocks.get(blockKey(args.x, args.y, args.z))?.blockId !== 'minecraft:crafting_table') {
 					return { done: true, state: 'FAILED', reasonCode: 'CRAFTING_TABLE_NOT_FOUND', changed: false };
 				}
-				const recipe = craftRecipe(args.recipeId, args.count);
+				const recipe = simulatorCraftRecipe(args.recipeId);
 				if (!recipe) return { done: true, state: 'FAILED', reasonCode: 'RECIPE_NOT_FOUND', changed: false };
+				if (normalized.type === 'craft_inventory' && recipe.table) return { done: true, state: 'FAILED', reasonCode: 'RECIPE_GRID_MISMATCH', changed: false };
+				if (args.count > recipe.count) return { done: true, state: 'FAILED', reasonCode: 'CRAFT_COUNT_UNSUPPORTED', changed: false };
 				for (const [itemId, count] of Object.entries(recipe.inputs)) {
 					if (this.countInventoryItem(agentId, itemId) < count) return { done: true, state: 'FAILED', reasonCode: 'INGREDIENTS_MISSING', changed: false };
 				}
@@ -533,7 +553,7 @@ export class VirtualWorld extends EventEmitter {
 				const inventoryBefore = clone(player.inventory);
 				try {
 					for (const [itemId, count] of Object.entries(recipe.inputs)) this.removeInventoryItem(agentId, itemId, count);
-					this.addInventoryItem(agentId, recipe.output, args.count);
+					this.addInventoryItem(agentId, recipe.output, recipe.count);
 				} catch (error) {
 					player.inventory = inventoryBefore;
 					if (error.code === 'WORLD_CAPACITY_EXCEEDED') return { done: true, state: 'FAILED', reasonCode: error.code, changed: false };
@@ -542,7 +562,10 @@ export class VirtualWorld extends EventEmitter {
 				return { done: true, state: 'SUCCEEDED', reasonCode: 'CRAFTED', changed: true };
 			}
 			case 'chat': {
-				if ((args.audience ?? 'public') === 'direct') this.recordDirectMessage(agentId, args.recipientId, args.message);
+				if ((args.audience ?? 'public') === 'direct') {
+					if (!this.#players.has(args.recipientId)) return { done: true, state: 'FAILED', reasonCode: 'RECIPIENT_NOT_FOUND', changed: false };
+					this.recordDirectMessage(agentId, args.recipientId, args.message);
+				}
 				return { done: true, state: 'SUCCEEDED', reasonCode: 'MESSAGE_SENT', changed: true };
 			}
 			case 'drop_item': {
@@ -553,6 +576,7 @@ export class VirtualWorld extends EventEmitter {
 				if (held.count === 0) player.inventory.items = player.inventory.items.filter((item) => item !== held);
 				const id = `drop-${agentId}-${this.#tickCount}-${this.#items.size + 1}`;
 				this.#insertItem({ id, itemId: held.itemId, count: args.count, position: clone(player.position) });
+				refreshInventoryTags(player.inventory);
 				return { done: true, state: 'SUCCEEDED', reasonCode: 'DROPPED', changed: true };
 			}
 			default:
@@ -585,6 +609,7 @@ export class VirtualWorld extends EventEmitter {
 		const position = vector(source.position ?? source, 'agent.position', { x: 0, y: 64, z: 0 });
 		const maxHealth = finitePositive(source.maxHealth ?? 20, 'agent.maxHealth');
 		const inventory = normalizeInventory(source.inventory);
+		for (const item of inventory.items) if (item.tags) this.#itemTags.set(item.itemId, [...item.tags]);
 		this.#players.set(id, {
 			id,
 			goalRevision: nonnegativeInteger(source.goalRevision ?? 1, 'agent.goalRevision'),
@@ -726,12 +751,15 @@ export class VirtualWorld extends EventEmitter {
 		for (const [id, item] of this.#items) {
 			if (distance(player.position, item.position) > this.#pickupRadius) continue;
 			const existing = player.inventory.items.find((entry) => entry.itemId === item.itemId);
-			if (existing) existing.count += item.count;
-			else {
+			if (existing) {
+				existing.count += item.count;
+				if (this.#itemTags.has(item.itemId)) existing.tags = [...this.#itemTags.get(item.itemId)];
+			} else {
 				if (player.inventory.items.length >= MAX_PLAYER_INVENTORY_ITEMS) continue;
-				player.inventory.items.push({ itemId: item.itemId, count: item.count, damage: 0, maxDamage: 0, slot: nextInventorySlot(player.inventory.items) });
+				player.inventory.items.push({ itemId: item.itemId, count: item.count, damage: 0, maxDamage: 0, slot: nextInventorySlot(player.inventory.items), ...(this.#itemTags.has(item.itemId) ? { tags: [...this.#itemTags.get(item.itemId)] } : {}) });
 			}
 			this.#items.delete(id);
+			refreshInventoryTags(player.inventory);
 		}
 	}
 
@@ -751,6 +779,7 @@ export class VirtualWorld extends EventEmitter {
 
 	#insertItem(item) {
 		if (!this.#items.has(item.id) && this.#items.size >= MAX_WORLD_ITEMS) throw capacityError('items', MAX_WORLD_ITEMS);
+		if (item.tags) this.#itemTags.set(item.itemId, [...new Set([...(this.#itemTags.get(item.itemId) ?? []), ...item.tags])]);
 		this.#items.set(item.id, item);
 	}
 
@@ -845,7 +874,7 @@ function normalizeEntities(value) { return normalizeArray(value, 'entities').map
 function normalizeItem(value, index) {
 	if (!isRecord(value)) throw new TypeError('item must be an object');
 	const source = value;
-	return { id: identifier(source.id ?? source.uuid ?? source.stableId ?? `item-${index}`, 'item.id'), itemId: identifier(source.itemId ?? 'minecraft:stone', 'item.itemId'), count: positiveInteger(source.count ?? 1, 'item.count'), position: parsePosition(source) };
+	return { id: identifier(source.id ?? source.uuid ?? source.stableId ?? `item-${index}`, 'item.id'), itemId: identifier(source.itemId ?? 'minecraft:stone', 'item.itemId'), count: positiveInteger(source.count ?? 1, 'item.count'), position: parsePosition(source), ...(source.tags === undefined ? {} : { tags: normalizeTags(source.tags, 'item.tags') }) };
 }
 function normalizeItems(value) { return normalizeArray(value, 'items').map((item, index) => normalizeItem(item, index + 1)); }
 function normalizeInventory(value) {
@@ -859,7 +888,13 @@ function normalizeInventory(value) {
 		const slot = entry.slot === undefined ? index : nonnegativeInteger(entry.slot, `inventory.items[${index}].slot`);
 		return { itemId: identifier(entry.itemId ?? 'minecraft:air', 'inventory.itemId'), count: nonnegativeInteger(entry.count ?? 0, 'inventory.count'), damage: nonnegativeInteger(entry.damage ?? 0, 'inventory.damage'), maxDamage: nonnegativeInteger(entry.maxDamage ?? 0, 'inventory.maxDamage'), slot, ...(entry.tags === undefined ? {} : { tags: normalizeTags(entry.tags, `inventory.items[${index}].tags`) }) };
 	});
-	return { items, selectedItem: identifier(source.selectedItem ?? items[0]?.itemId ?? 'minecraft:air', 'inventory.selectedItem'), tagCounts: normalizeTagCounts(source.tagCounts) };
+	const inventory = { items, selectedItem: identifier(source.selectedItem ?? items[0]?.itemId ?? 'minecraft:air', 'inventory.selectedItem'), tagCounts: normalizeTagCounts(source.tagCounts) };
+	const counts = aggregateInventoryTags(inventory);
+	for (const [tag, count] of Object.entries(inventory.tagCounts)) {
+		if (counts[tag] !== count) throw new TypeError('simulator inventory.tagCounts must match explicit item tags');
+	}
+	refreshInventoryTags(inventory, counts);
+	return inventory;
 }
 function normalizeEffects(value) {
 	const effects = normalizeArray(value, 'effects');
@@ -968,17 +1003,43 @@ function conversationText(value) {
 	if ([...value].length > MAX_CONVERSATION_LENGTH) throw Object.assign(new RangeError(`MESSAGE_TOO_LARGE: message exceeds ${MAX_CONVERSATION_LENGTH} code points`), { code: 'MESSAGE_TOO_LARGE' });
 	return value;
 }
-function craftRecipe(recipeId, count) {
+// Only the fixture recipes are modeled. count requests a minimum from one full batch,
+// matching the production crafting transaction; it never scales a recipe.
+export function simulatorCraftRecipe(recipeId) {
 	const recipes = {
-		'minecraft:planks': { output: 'minecraft:oak_planks', inputs: { 'minecraft:oak_log': Math.ceil(count / 4) } },
-		'minecraft:oak_planks': { output: 'minecraft:oak_planks', inputs: { 'minecraft:oak_log': Math.ceil(count / 4) } },
-		'minecraft:sticks': { output: 'minecraft:stick', inputs: { 'minecraft:oak_planks': Math.ceil(count / 4) * 2 } },
-		'minecraft:crafting_table': { output: 'minecraft:crafting_table', inputs: { 'minecraft:oak_planks': count * 4 } },
-		'minecraft:stone_pickaxe': { output: 'minecraft:stone_pickaxe', inputs: { 'minecraft:cobblestone': count * 3, 'minecraft:stick': count * 2 } },
-		'minecraft:stone_axe': { output: 'minecraft:stone_axe', inputs: { 'minecraft:cobblestone': count * 3, 'minecraft:stick': count * 2 } },
-		'minecraft:stone_sword': { output: 'minecraft:stone_sword', inputs: { 'minecraft:cobblestone': count * 2, 'minecraft:stick': count } },
+		'minecraft:planks': { output: 'minecraft:oak_planks', count: 4, inputs: { 'minecraft:oak_log': 1 } },
+		'minecraft:oak_planks': { output: 'minecraft:oak_planks', count: 4, inputs: { 'minecraft:oak_log': 1 } },
+		'minecraft:sticks': { output: 'minecraft:stick', count: 4, inputs: { 'minecraft:oak_planks': 2 } },
+		'minecraft:stick': { output: 'minecraft:stick', count: 4, inputs: { 'minecraft:oak_planks': 2 } },
+		'minecraft:crafting_table': { output: 'minecraft:crafting_table', count: 1, inputs: { 'minecraft:oak_planks': 4 } },
+		'minecraft:wooden_pickaxe': { output: 'minecraft:wooden_pickaxe', count: 1, table: true, inputs: { 'minecraft:oak_planks': 3, 'minecraft:stick': 2 } },
+		'minecraft:iron_pickaxe': { output: 'minecraft:iron_pickaxe', count: 1, table: true, inputs: { 'minecraft:iron_ingot': 3, 'minecraft:stick': 2 } },
+		'minecraft:stone_pickaxe': { output: 'minecraft:stone_pickaxe', count: 1, table: true, inputs: { 'minecraft:cobblestone': 3, 'minecraft:stick': 2 } },
+		'minecraft:stone_axe': { output: 'minecraft:stone_axe', count: 1, table: true, inputs: { 'minecraft:cobblestone': 3, 'minecraft:stick': 2 } },
+		'minecraft:stone_sword': { output: 'minecraft:stone_sword', count: 1, table: true, inputs: { 'minecraft:cobblestone': 2, 'minecraft:stick': 1 } },
 	};
-	return recipes[recipeId] ?? null;
+	return Object.hasOwn(recipes, recipeId) ? recipes[recipeId] : null;
+}
+function withinBlockReach(player, block) {
+	// Standing eye position and vanilla default block reach; custom attributes/poses
+	// are outside this small simulator's model.
+	const eye = { x: player.position.x, y: player.position.y + 1.62, z: player.position.z };
+	const nearest = Object.fromEntries(['x', 'y', 'z'].map(axis => [axis, Math.max(block[axis], Math.min(eye[axis], block[axis] + 1))]));
+	return distance(eye, nearest) <= (player.gameMode === 'creative' ? 5 : 4.5);
+}
+function aggregateInventoryTags(inventory) {
+	const counts = Object.fromEntries(Object.keys(inventory.tagCounts).map(tag => [tag, 0]));
+	for (const item of inventory.items) for (const tag of item.tags ?? []) counts[tag] = (counts[tag] ?? 0) + item.count;
+	return counts;
+}
+function refreshInventoryTags(inventory, counts = aggregateInventoryTags(inventory)) {
+	// Publish current positive facts before known-zero history, using code-unit tag
+	// order within each group. Omitted keys stay unknown; inventory items stay intact.
+	const tags = Object.keys(counts);
+	const positive = tags.filter(tag => counts[tag] > 0).sort();
+	const zero = tags.filter(tag => counts[tag] === 0).sort();
+	inventory.tagCounts = Object.fromEntries([...positive, ...zero]
+		.slice(0, MAX_TAG_COUNT_ENTRIES).map(tag => [tag, counts[tag]]));
 }
 function isSolid(blockId) { return typeof blockId === 'string' && !SOLID_EXCEPTIONS.has(blockId); }
 function playerIntersectsBlock(position, block) {

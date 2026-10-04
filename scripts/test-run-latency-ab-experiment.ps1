@@ -63,10 +63,10 @@ try {
 {
   "version": 1,
   "scenarios": [
-    { "id": "pair-a", "agents": 1, "seed": 11 },
-    { "id": "pair-b", "agents": 4, "seed": 22 },
-    { "id": "pair-c", "agents": 8, "seed": 33 },
-    { "id": "pair-d", "agents": 16, "seed": 44 }
+    { "id": "pair-a", "agents": 1, "seed": 11, "repetitions": 2 },
+    { "id": "pair-b", "agents": 4, "seed": 22, "repetitions": 2 },
+    { "id": "pair-c", "agents": 8, "seed": 33, "repetitions": 2 },
+    { "id": "pair-d", "agents": 16, "seed": 44, "repetitions": 2 }
   ]
 }
 '@) -NoNewline
@@ -140,9 +140,9 @@ try {
 {
   "version": 1,
   "scenarios": [
-    { "id": "instant-only", "mode": "instant", "agents": 1 },
-    { "id": "replay-only", "mode": "replay", "agents": 4 },
-    { "id": "live-only", "mode": "live", "agents": 8, "providerProfile": { "provider": "fixture-live" } }
+    { "id": "instant-only", "mode": "instant", "agents": 1, "repetitions": 2 },
+    { "id": "replay-only", "mode": "replay", "agents": 4, "repetitions": 2 },
+    { "id": "live-only", "mode": "live", "agents": 8, "repetitions": 2, "providerProfile": { "provider": "fixture-live" } }
   ]
 }
 '@
@@ -241,6 +241,8 @@ catch {
 }
 finally {
     foreach ($path in $pathsToRemove) {
-        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue }
+        $resolved = [IO.Path]::GetFullPath($path)
+        if ($resolved -ne [IO.Path]::GetFullPath($fixtureRoot) -or -not $resolved.StartsWith([IO.Path]::GetFullPath([IO.Path]::GetTempPath()), [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe fixture cleanup path' }
+        if (Test-Path -LiteralPath $resolved) { Remove-Item -LiteralPath $resolved -Recurse -Force -ErrorAction SilentlyContinue }
     }
 }

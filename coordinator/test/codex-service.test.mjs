@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import test from 'node:test';
 
-import { CodexService } from '../src/codex-service.mjs';
+import { CodexService, SharedCodexAgent } from '../src/codex-service.mjs';
+import { CodexStdioTransport } from '../src/codex-app-server.mjs';
 import { profileFingerprint } from '../src/provider-session.mjs';
 import { MINECRAFT_DYNAMIC_TOOLS } from '../src/native-minecraft-tools.mjs';
 import { finishDecisionJson } from './provider-decision-fixtures.mjs';
@@ -510,6 +511,44 @@ test('Codex session replacement increments generation and reports a reset reason
 	assert.equal(replacement.profileFingerprint, first.profileFingerprint);
 	assert.equal(replacement.sessionMetadata().resetReason, 'session_replaced');
 	await service.stop();
+});
+
+test('Codex replacement preserves its reason separately from factual recovery and defaults on later replacement', async (t) => {
+	const transport = new FakeSharedTransport();
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	t.after(() => service.stop());
+	const selected = profile('agent-recovery-reason');
+	const first = await service.createAgent(selected);
+	assert.equal(first.sessionMetadata().resetReason, null);
+	const replacement = await service.replaceAgent(selected, {
+		expectedSessionGeneration: first.sessionGeneration,
+		recoverySummary: 'Three iron ingots remain in inventory.',
+		resetReason: 'planning_lease_expired',
+	});
+	assert.equal(replacement.sessionMetadata().resetReason, 'planning_lease_expired');
+	assert.equal(replacement.sessionGeneration, 2);
+	assert.equal(replacement.profileFingerprint, first.profileFingerprint);
+	const instructions = transport.calls.filter(({ method }) => method === 'thread/start').at(-1).params.developerInstructions;
+	assert.match(instructions, /Three iron ingots remain in inventory/);
+	assert.doesNotMatch(instructions, /planning_lease_expired/);
+	await assert.rejects(service.replaceAgent(selected, { expectedSessionGeneration: 1, resetReason: 'stale' }), { code: 'STALE_SESSION_GENERATION' });
+	assert.equal(service.getAgent(selected.agentId), replacement);
+	const next = await service.replaceAgent(selected, { expectedSessionGeneration: 2 });
+	assert.equal(next.sessionGeneration, 3);
+	assert.equal(next.sessionMetadata().resetReason, 'session_replaced');
+});
+
+test('invalid Codex replacement diagnostics cannot retire the current session', async (t) => {
+	const transport = new FakeSharedTransport();
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	t.after(() => service.stop());
+	const selected = profile('agent-invalid-recovery-reason');
+	const agent = await service.createAgent(selected);
+	for (const resetReason of [7, 'x'.repeat(129)]) {
+		await assert.rejects(service.replaceAgent(selected, { resetReason }), /resetReason must be null or bounded text/);
+		assert.equal(service.getAgent(selected.agentId), agent);
+	}
+	assert.equal(transport.calls.filter(({ method }) => method === 'thread/start').length, 1);
 });
 
 test('Codex transport loss fences the owning threads and coalesces one exact replacement generation', async () => {
@@ -1039,7 +1078,7 @@ test('native Codex turn executes a Minecraft tool and returns its result before 
 	assert.equal(transport.calls.some((call) => call.method === 'turn/interrupt'), false);
 
 	transport.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } } });
-	assert.deepEqual(await turn, { status: 'completed', toolCalls: 1 });
+	assert.partialDeepStrictEqual(await turn, { status: 'completed', toolCalls: 1 });
 	const turnStart = transport.calls.find((call) => call.method === 'turn/start').params;
 	assert.equal(Object.hasOwn(turnStart, 'outputSchema'), false);
 	await service.stop();
@@ -1077,7 +1116,7 @@ test('native Codex drains an in-flight tool before completing its turn', async (
 	]), 'pending');
 	assert.equal(started, 1);
 	release();
-	assert.deepEqual(await turn, { status: 'completed', toolCalls: 1 });
+	assert.partialDeepStrictEqual(await turn, { status: 'completed', toolCalls: 1 });
 	assert.equal(transport.calls.some((call) => call.method === '$respond' && call.id === 101), true);
 	await service.stop();
 });
@@ -1117,7 +1156,7 @@ test('native Codex pauses the provider-silence deadline while Minecraft owns an 
 	for (const timer of timers.filter(({ timeoutMs }) => timeoutMs === 25)) timer.callback();
 	assert.equal(await Promise.race([turn.then(() => 'settled', () => 'settled'), new Promise((resolve) => setImmediate(() => resolve('pending')))]), 'pending');
 	releaseTool();
-	assert.deepEqual(await turn, { status: 'completed', toolCalls: 1 });
+	assert.partialDeepStrictEqual(await turn, { status: 'completed', toolCalls: 1 });
 });
 
 test('native Codex serializes two tool calls within one turn', async (t) => {
@@ -1162,7 +1201,7 @@ test('native Codex serializes two tool calls within one turn', async (t) => {
 	assert.deepEqual(started, ['serial-first', 'serial-second']);
 	assert.equal(maxActive, 1);
 	transport.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } } });
-	assert.deepEqual(await turn, { status: 'completed', toolCalls: 2 });
+	assert.partialDeepStrictEqual(await turn, { status: 'completed', toolCalls: 2 });
 	const responses = transport.calls
 		.filter((call) => call.method === '$respond')
 		.map((call) => ({ id: call.id, callId: JSON.parse(call.result.contentItems[0].text).callId }));
@@ -1245,7 +1284,7 @@ test('native Codex exposes one complete public agent-message candidate without s
 	transport.emit('notification', { method: 'turn/completed', params: {
 		threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' },
 	} });
-	assert.deepEqual(await turn, { status: 'completed', toolCalls: 0 });
+	assert.partialDeepStrictEqual(await turn, { status: 'completed', toolCalls: 0 });
 	assert.deepEqual(events.filter(e => e.stage === 'agent_message'), [{ stage: 'agent_message', message: publicMessage }]);
 	assert.ok(events.some(e => e.stage === 'live_delta' && e.message === publicMessage));
 	assert.doesNotMatch(JSON.stringify(events), /hidden reasoning/);
@@ -1272,7 +1311,7 @@ test('native Codex bounds the raw completed agent message before public preproce
 	transport.emit('notification', { method: 'turn/completed', params: {
 		threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' },
 	} });
-	assert.deepEqual(await turn, { status: 'completed', toolCalls: 0 });
+	assert.partialDeepStrictEqual(await turn, { status: 'completed', toolCalls: 0 });
 	assert.deepEqual(events, [{ stage: 'agent_message', message: publicMessage.slice(0, 1_280) }]);
 	await service.stop();
 });
@@ -1304,7 +1343,7 @@ test('urgent input steers an active native turn without replacing its turn or to
 	});
 	await new Promise((resolve) => setImmediate(resolve));
 	transport.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } } });
-	assert.deepEqual(await turn, { status: 'completed', toolCalls: 1 });
+	assert.partialDeepStrictEqual(await turn, { status: 'completed', toolCalls: 1 });
 	assert.equal(transport.calls.filter((call) => call.method === 'turn/start').length, 1);
 	assert.deepEqual(executed, [{ kind: 'action', actionType: 'chat', arguments: { message: 'Stopping now.', audience: 'public' } }]);
 });
@@ -1347,7 +1386,7 @@ test('native Codex buffers a tool call that arrives before turn/start resolves',
 	assert.equal(executions, 1);
 	assert.equal(transport.calls.some((call) => call.method === '$respond' && call.id === 99), true);
 	transport.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-buffered', status: 'completed' } } });
-	assert.deepEqual(await turn, { status: 'completed', toolCalls: 1 });
+	assert.partialDeepStrictEqual(await turn, { status: 'completed', toolCalls: 1 });
 	await service.stop();
 });
 
@@ -1382,9 +1421,11 @@ test('a real native event takes over in-flight prewarm without waiting or starti
 	const warming = service.prewarmAgent(profile('agent-prewarm-race'), { goalRevision: 0 });
 	await new Promise((resolve) => setImmediate(resolve));
 	const agent = await service.createAgent(profile('agent-prewarm-race'), { controlProtocol: 'native_tools' });
+	const events = [];
 	const executed = [];
 	const realTurn = agent.act('event: DM from Lucas: hi', {
 		goalRevision: 0,
+		onVerbose: (stage, message) => events.push({ stage, message }),
 		executeTool: async (request) => { executed.push(request.tool); return { state: 'SUCCEEDED', delivered: true }; },
 	});
 	void realTurn.catch(() => {});
@@ -1399,11 +1440,18 @@ test('a real native event takes over in-flight prewarm without waiting or starti
 		method: 'item/tool/call',
 		params: { threadId: 'thread-1', turnId: 'turn-1', callId: 'real-say', tool: 'say', arguments: { message: 'Hi Lucas!' } },
 	});
+	transport.emit('notification', { method: 'thread/tokenUsage/updated', params: { threadId: 'thread-1', tokenUsage: { total: { inputTokens: 20 } } } });
+	transport.emit('notification', { method: 'item/completed', params: { threadId: 'thread-1', turnId: 'turn-1', item: { type: 'agentMessage', text: 'Hello from the adopted turn.' } } });
 	await new Promise((resolve) => setImmediate(resolve));
 	transport.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } } });
-	assert.deepEqual(await realTurn, { status: 'completed', toolCalls: 1 });
+	assert.partialDeepStrictEqual(await realTurn, { status: 'completed', toolCalls: 1 });
 	await warming;
 	assert.deepEqual(executed, [{ kind: 'action', actionType: 'chat', arguments: { message: 'Hi Lucas!', audience: 'public' } }]);
+	assert.ok(events.some(({ stage }) => stage === 'live_tool'));
+	assert.ok(events.some(({ stage }) => stage === 'live_result'));
+	assert.ok(events.some(({ stage }) => stage === 'live_usage'));
+	assert.ok(events.some(({ stage }) => stage === 'agent_message'));
+	assert.equal((await realTurn).nativeTurn.inputCount, 2);
 	assert.equal(transport.calls.filter((call) => call.method === 'turn/start').length, 1);
 	assert.equal(transport.calls.filter((call) => call.method === 'thread/start').length, 1);
 });
@@ -1459,7 +1507,7 @@ test('a real native event starts cleanly after a conversation wake supersedes pr
 	});
 	await new Promise((resolve) => setImmediate(resolve));
 	transport.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-2', status: 'completed' } } });
-	assert.deepEqual(await realTurn, { status: 'completed', toolCalls: 1 });
+	assert.partialDeepStrictEqual(await realTurn, { status: 'completed', toolCalls: 1 });
 	assert.deepEqual(executed, [{ kind: 'action', actionType: 'chat', arguments: { message: 'Hi Lucas!', audience: 'public' } }]);
 });
 
@@ -1516,3 +1564,244 @@ for (const inheritedInstructions of [false, true]) {
   else await service.createAgent(profile('isolated'));
  });
 }
+
+
+test('native usage snapshots distinguish observed deltas, missing baselines, counter resets and failures', async (t) => {
+	const transport = new FakeSharedTransport();
+	transport.autoComplete = false;
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	t.after(() => service.stop());
+	const agent = await service.createAgent(profile('native-accounting'), { controlProtocol: 'native_tools' });
+	const tick = () => new Promise((resolve) => setImmediate(resolve));
+	const usage = (inputTokens, outputTokens, extra = {}) => transport.emit('notification', {
+		method: 'thread/tokenUsage/updated', params: { threadId: 'thread-1', tokenUsage: {
+			total: { inputTokens, outputTokens, ...extra }, last: { inputTokens: 999999, outputTokens: 999999 },
+		} },
+	});
+	const start = (input = 'observe') => agent.act(input, { goalRevision: 0, executeTool: async () => {
+		usage(180, 18); // Real counters can arrive while the physical tool is pending.
+		return { state: 'SUCCEEDED', text: 'encoded response' };
+	} });
+	const first = start(); await tick();
+	usage(100, 10); usage(150, 15);
+	transport.complete('thread-1', 'turn-1');
+	const firstEvidence = (await first).nativeTurn;
+	assert.equal(firstEvidence.usage.status, 'baseline_unknown');
+	assert.deepEqual(firstEvidence.tokens, { input: null, output: null, reasoning: null, cached: null, cacheWrite: null });
+	assert.equal(firstEvidence.usage.end.input, 150, 'cumulative samples replace rather than sum');
+
+	const second = start('observe again'); await tick();
+	await agent.steer('new facts', { goalRevision: 0 });
+	transport.emit('serverRequest', { id: 301, method: 'item/tool/call', params: {
+		threadId: 'thread-1', turnId: 'turn-2', callId: 'usage-tool', tool: 'observe', arguments: {},
+	} });
+	await tick();
+	usage(180, 18); usage(210, 21);
+	transport.complete('thread-1', 'turn-2');
+	const secondEvidence = (await second).nativeTurn;
+	assert.equal(secondEvidence.usage.status, 'available');
+	assert.deepEqual(secondEvidence.tokens, { input: 60, output: 6, reasoning: null, cached: null, cacheWrite: null });
+	assert.equal(secondEvidence.usage.updates, 3);
+	assert.equal(secondEvidence.turnId, 'turn-2');
+	assert.equal(secondEvidence.toolCalls, 1);
+	assert.equal(secondEvidence.toolResultBytes, Buffer.byteLength(JSON.stringify(transport.calls.find((call) => call.id === 301).result)));
+	assert.deepEqual(JSON.parse(secondEvidence.input), [{ method: 'turn/start', input: 'observe again' }, { method: 'turn/steer', input: 'new facts' }]);
+	assert.equal(secondEvidence.inputBytes, Buffer.byteLength('observe againnew facts'));
+
+	const missing = start(); await tick(); transport.complete('thread-1', 'turn-3');
+	assert.equal((await missing).nativeTurn.usage.status, 'missing');
+	assert.equal((await missing).nativeTurn.tokens.input, null);
+	const reset = start(); await tick(); usage(20, 4); usage(1, 1); usage(15, 3);
+	transport.complete('thread-1', 'turn-4');
+	assert.equal((await reset).nativeTurn.usage.status, 'counter_reset');
+	assert.equal((await reset).nativeTurn.usage.start, null, 'a missing prior turn invalidates the older baseline');
+	assert.equal((await reset).nativeTurn.tokens.input, null);
+	const failed = start('actual failed input'); await tick(); usage(30, 6);
+	transport.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-5', status: 'failed', error: { message: 'provider failed' } } } });
+	await assert.rejects(failed, (error) => {
+		assert.equal(error.nativeTurn.tokens.input, 15);
+		assert.equal(error.nativeTurn.input, 'actual failed input');
+		assert.equal(error.nativeTurn.turnId, 'turn-5');
+		assert.doesNotMatch(JSON.stringify(error), /actual failed input/);
+		return error.code === 'TURN_FAILED';
+	});
+});
+
+test('native start rejection retains submitted encoded input without inventing usage', async (t) => {
+	const transport = new FakeSharedTransport();
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	t.after(() => service.stop());
+	const agent = await service.createAgent(profile('native-start-failure'), { controlProtocol: 'native_tools' });
+	const request = transport.request.bind(transport);
+	transport.request = async (method, params, options) => {
+		if (method === 'turn/start') throw Object.assign(new Error('failed to send'), { code: 'RPC_ERROR' });
+		return request(method, params, options);
+	};
+	await assert.rejects(agent.act('submitted input', { goalRevision: 0, executeTool: async () => ({}) }), (error) => {
+		assert.equal(error.nativeTurn.input, 'submitted input');
+		assert.equal(error.nativeTurn.turnId, null);
+		assert.equal(error.nativeTurn.usage.status, 'missing');
+		return error.code === 'RPC_ERROR';
+	});
+});
+
+
+test('a shared native transport failure preserves separate private attribution for each agent', async (t) => {
+	const transport = new FakeSharedTransport(); transport.autoComplete = false;
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	t.after(() => service.stop());
+	const first = await service.createAgent(profile('transport-first'), { controlProtocol: 'native_tools' });
+	const second = await service.createAgent(profile('transport-second'), { controlProtocol: 'native_tools' });
+	const firstTurn = first.act('private first input', { goalRevision: 0, executeTool: async () => ({}) });
+	const secondTurn = second.act('private second input', { goalRevision: 0, executeTool: async () => ({}) });
+	const settled = Promise.allSettled([firstTurn, secondTurn]);
+	await new Promise((resolve) => setImmediate(resolve));
+	transport.emit('exit', Object.assign(new Error('shared transport exited'), { code: 'TRANSPORT_CLOSED' }));
+	const failures = (await settled).map((entry) => entry.reason);
+	assert.notEqual(failures[0], failures[1]);
+	assert.equal(failures[0].nativeTurn.input, 'private first input');
+	assert.equal(failures[0].nativeTurn.threadId, 'thread-1');
+	assert.equal(failures[1].nativeTurn.input, 'private second input');
+	assert.equal(failures[1].nativeTurn.threadId, 'thread-2');
+	assert.doesNotMatch(JSON.stringify(failures), /private (first|second) input/);
+	assert.equal(transport.listenerCount('notification'), 0);
+});
+
+
+test('a failed native steer retains its attempted wire input and leaves the active turn usable', async (t) => {
+	const transport = new FakeSharedTransport(); transport.autoComplete = false;
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	t.after(() => service.stop());
+	const agent = await service.createAgent(profile('steer-evidence'), { controlProtocol: 'native_tools' });
+	const run = agent.act('initial input', { goalRevision: 0, executeTool: async () => ({}) });
+	await new Promise((resolve) => setImmediate(resolve));
+	const request = transport.request.bind(transport);
+	transport.request = async (method, params, options) => {
+		if (method === 'turn/steer') throw Object.assign(new Error('steering rejected'), { code: 'RPC_ERROR' });
+		return request(method, params, options);
+	};
+	await assert.rejects(agent.steer('attempted steer'), (error) => {
+		assert.deepEqual(JSON.parse(error.nativeTurn.input), [{ method: 'turn/start', input: 'initial input' }, { method: 'turn/steer', input: 'attempted steer' }]);
+		assert.equal(error.nativeTurn.turnId, 'turn-1');
+		return error.code === 'RPC_ERROR';
+	});
+	transport.complete('thread-1', 'turn-1');
+	assert.equal((await run).nativeTurn.inputCount, 2);
+});
+
+
+test('native stdio batches replay early success, failure and tool completion in wire order', async (t) => {
+	for (const variant of ['completed', 'failed', 'tool', 'stale-usage', 'overflow']) {
+		await t.test(variant, async () => {
+			const child = new EventEmitter();
+			child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.stdin = new EventEmitter();
+			child.exitCode = null; child.signalCode = null;
+			const writes = [];
+			child.stdin.write = (line) => {
+				const message = JSON.parse(String(line)); writes.push(message);
+				if (message.method === 'turn/interrupt') child.stdout.emit('data', JSON.stringify({ id: message.id, result: {} }) + '\n');
+				return true;
+			};
+			child.kill = () => { child.exitCode = 0; child.emit('exit', 0, null); return true; };
+			const transport = new CodexStdioTransport({ ...profile('stdio-order'), cwd: 'C:\\workspace', environment: {} }, { spawn: () => child, stopTimeoutMs: 1 });
+			const starting = transport.start(); child.emit('spawn'); await starting;
+			const timers = new Set();
+			const agent = new SharedCodexAgent(profile('stdio-order'), 'stdio-thread', transport, {
+				controlProtocol: 'native_tools', planningTimeoutMs: 45_000,
+				schedule(callback) { timers.add(callback); return callback; }, cancelSchedule(callback) { timers.delete(callback); },
+			});
+			try {
+				const usage = (turnId, count) => ({ method: 'thread/tokenUsage/updated', params: { threadId: 'stdio-thread', turnId, tokenUsage: { total: { inputTokens: count } } } });
+				child.stdout.emit('data', JSON.stringify(usage('prior-turn', 100)) + '\n');
+				const executed = [], verbose = [];
+				const running = agent.act('batch input', { goalRevision: 0, executeTool: async (request) => { executed.push(request.callId); return { state: 'READY' }; }, onVerbose: (stage) => verbose.push(stage) });
+				const outcome = running.then((value) => ({ value }), (error) => ({ error }));
+				const start = writes.find(({ method }) => method === 'turn/start');
+				const completed = (id, status) => ({ method: 'turn/completed', params: { threadId: 'stdio-thread', turn: { id, status, error: status === 'failed' ? { message: 'original provider failure' } : null } } });
+				const tool = (id, turnId) => ({ id, method: 'item/tool/call', params: { threadId: 'stdio-thread', turnId, callId: String(id), tool: 'observe', arguments: {} } });
+				const messages = variant === 'overflow' ? [
+					{ id: start.id, result: { turn: { id: 'current-turn' } } },
+					...Array.from({ length: 4097 }, () => ({ method: 'item/agentMessage/delta', params: { threadId: 'stdio-thread', turnId: 'current-turn', delta: 'x' } })),
+				] : [
+					{ id: start.id, result: { turn: { id: 'current-turn' } } },
+					usage('prior-turn', 130), tool(801, 'prior-turn'), completed('prior-turn', 'failed'),
+					...(variant === 'stale-usage' ? [] : [usage('current-turn', 150)]),
+					...(variant === 'tool' ? [tool(802, 'current-turn')] : []),
+					{ method: 'item/completed', params: { threadId: 'stdio-thread', turnId: 'current-turn', item: { type: 'agentMessage', text: 'current message' } } },
+					completed('current-turn', variant === 'failed' ? 'failed' : 'completed'),
+				];
+				// Exercise the actual transport decoder: all lines share one stdout chunk.
+				child.stdout.emit('data', messages.map((message) => JSON.stringify(message)).join('\n') + '\n');
+				const result = await Promise.race([outcome, new Promise((resolve) => setImmediate(() => resolve('pending')))]);
+				if (result === 'pending') { for (const callback of [...timers]) callback(); await outcome; }
+				assert.notEqual(result, 'pending', 'the batch must settle without waiting for the 45-second silence timeout');
+				if (variant === 'overflow') assert.equal(result.error.code, 'TURN_NOTIFICATION_OVERFLOW');
+				else if (variant === 'failed') {
+					assert.equal(result.error.code, 'TURN_FAILED');
+					assert.equal(result.error.message, 'original provider failure');
+				} else assert.equal(result.value.status, 'completed');
+				const evidence = result.value?.nativeTurn ?? result.error.nativeTurn;
+				assert.equal(evidence.turnId, 'current-turn');
+				assert.equal(evidence.tokens.input, ['stale-usage', 'overflow'].includes(variant) ? null : 50);
+				assert.equal(evidence.usage.updates, ['stale-usage', 'overflow'].includes(variant) ? 0 : 1);
+				assert.deepEqual(executed, variant === 'tool' ? ['802'] : []);
+				assert.equal(writes.some(({ id, result }) => id === 801 && result), false);
+				assert.equal(writes.some(({ id, result }) => id === 802 && result), variant === 'tool');
+				assert.equal(verbose.filter((stage) => stage === 'agent_message').length, variant === 'overflow' ? 0 : 1);
+				const interrupts = writes.filter(({ method }) => method === 'turn/interrupt');
+				assert.equal(interrupts.length, variant === 'overflow' ? 1 : 0);
+				if (variant === 'overflow') {
+					assert.equal(interrupts[0].params.turnId, 'current-turn');
+					const successor = agent.act('successor input', { goalRevision: 0, executeTool: async () => ({}) });
+					const successorStart = writes.findLast(({ method }) => method === 'turn/start');
+					child.stdout.emit('data', [{ id: successorStart.id, result: { turn: { id: 'successor-turn' } } }, completed('successor-turn', 'completed')].map((message) => JSON.stringify(message)).join('\n') + '\n');
+					assert.equal((await successor).status, 'completed');
+					assert.equal(writes.filter(({ method }) => method === 'turn/interrupt').length, 1, 'retired overflow cleanup cannot interrupt a successor');
+				}
+				assert.equal(timers.size, 0);
+			} finally { await agent.dispose(); await transport.stop(); }
+		});
+	}
+});
+
+test('native pre-start mixed event buffering is bounded and rejects before a held start response', async (t) => {
+	const transport = new FakeSharedTransport(); transport.holdTurnStart = true;
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	t.after(() => service.stop());
+	const agent = await service.createAgent(profile('native-overflow'), { controlProtocol: 'native_tools' });
+	const running = agent.act('overflow input', { goalRevision: 0, executeTool: async () => ({}) });
+	const rejected = assert.rejects(running, (error) => error.code === 'TURN_NOTIFICATION_OVERFLOW');
+	for (let index = 0; index < 4097; index += 1) transport.emit('notification', {
+		method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', delta: 'x' },
+	});
+	await rejected;
+	assert.equal(transport.listenerCount('serverRequest'), 0);
+	transport.holdTurnStart = false; transport.autoComplete = false;
+	const successor = agent.act('successor input', { goalRevision: 0, executeTool: async () => ({}) });
+	transport.turnStartResolvers[0]({ turn: { id: 'retired-turn' } });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(transport.calls.filter(({ method }) => method === 'turn/interrupt').map(({ params }) => params.turnId), ['retired-turn']);
+	transport.complete('thread-1', 'turn-1');
+	assert.equal((await successor).status, 'completed');
+});
+
+test('native late counter updates expose unrecorded interval gaps without claiming complete billing', async (t) => {
+	const transport = new FakeSharedTransport(); transport.autoComplete = false;
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	t.after(() => service.stop());
+	const agent = await service.createAgent(profile('native-gap'), { controlProtocol: 'native_tools' });
+	const usage = (turnId, inputTokens) => transport.emit('notification', { method: 'thread/tokenUsage/updated', params: { threadId: 'thread-1', turnId, tokenUsage: { total: { inputTokens } } } });
+	const tick = () => new Promise((resolve) => setImmediate(resolve));
+	usage('previous', 100);
+	const first = agent.act('first', { goalRevision: 0, executeTool: async () => ({}) });
+	await tick(); usage('turn-1', 120); transport.complete('thread-1', 'turn-1');
+	const firstEvidence = (await first).nativeTurn;
+	usage('turn-1', 150);
+	const second = agent.act('second', { goalRevision: 0, executeTool: async () => ({}) });
+	await tick(); usage('turn-2', 180); transport.complete('thread-1', 'turn-2');
+	const secondEvidence = (await second).nativeTurn;
+	assert.equal(firstEvidence.tokens.input + secondEvidence.tokens.input, 50);
+	assert.equal(secondEvidence.usage.gapBefore.input, 30);
+	assert.equal(firstEvidence.usage.attributionComplete, false);
+	assert.equal(secondEvidence.usage.attributionComplete, false);
+});

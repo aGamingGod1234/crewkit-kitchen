@@ -199,14 +199,19 @@ $eulaPath = Join-Path $Server 'eula.txt'
 if (-not (Test-Path -LiteralPath $eulaPath)) { [IO.File]::WriteAllText($eulaPath, "eula=true`n", $Utf8NoBom) }
 $propertiesPath = Join-Path $Server 'server.properties'
 if (-not (Test-Path -LiteralPath $propertiesPath)) {
-    [IO.File]::WriteAllText($propertiesPath, "online-mode=false`nserver-ip=127.0.0.1`nserver-port=25565`nlevel-name=world`nenable-command-block=false`npause-when-empty-seconds=-1`n", $Utf8NoBom)
+    [IO.File]::WriteAllText($propertiesPath, "online-mode=true`nserver-ip=127.0.0.1`nserver-port=25565`nlevel-name=world`nenable-command-block=false`npause-when-empty-seconds=-1`n", $Utf8NoBom)
 } else {
-    $properties = Get-Content -LiteralPath $propertiesPath -Raw
-    foreach ($requiredSetting in @('online-mode=false','server-ip=127.0.0.1','server-port=25565','level-name=world')) {
-        if ($properties -notmatch "(?m)^$([regex]::Escape($requiredSetting))\r?$") {
-            throw "Existing server.properties must contain $requiredSetting"
+    # Match the default launcher's authenticated mode without silently converting
+    # an existing offline world. Parse effective keys so duplicates cannot hide
+    # a public listener or a conflicting authentication setting.
+    foreach ($requiredSetting in @('online-mode=true','server-ip=127.0.0.1','server-port=25565','level-name=world')) {
+        $name, $expected = $requiredSetting.Split('=', 2)
+        $values = @(Get-ArenaServerPropertyValues $propertiesPath $name)
+        if ($values.Count -ne 1 -or $values[0] -cne $expected) {
+            throw "Existing server.properties must contain exactly one effective $requiredSetting setting. Review existing settings before preparing again: $propertiesPath"
         }
     }
+    $properties = Get-Content -LiteralPath $propertiesPath -Raw
     if ($properties -match '(?m)^pause-when-empty-seconds=.*\r?$') {
         $properties = [regex]::Replace($properties, '(?m)^pause-when-empty-seconds=.*\r?$', 'pause-when-empty-seconds=-1')
     } else {
@@ -214,7 +219,7 @@ if (-not (Test-Path -LiteralPath $propertiesPath)) {
     }
     [IO.File]::WriteAllText($propertiesPath, $properties, $Utf8NoBom)
 }
-Assert-ArenaOfflineServerLoopback $propertiesPath -RequireOffline
+Assert-ArenaServerMode $propertiesPath 'true'
 
 $buildEvidence = [ordered]@{
     commit = (& git -C $Project rev-parse HEAD).Trim()

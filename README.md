@@ -48,11 +48,11 @@ powershell -ExecutionPolicy Bypass -File .\scripts\prepare-runtime.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\install-launcher-profiles.ps1
 ```
 
-Preparation verifies the copied world before it reuses it. See [runtime/README.md](runtime/README.md) for this development-only layout.
+Preparation verifies the copied world before it reuses it. It creates `runtime/server` with `online-mode=true` on `127.0.0.1:25565`, matching the default server launcher. Joining players need an authenticated Minecraft account. Existing offline settings are rejected without conversion; see [runtime/README.md](runtime/README.md) for this development-only layout and migration boundary.
 
 ## Install the Windows release ZIP
 
-The Reliability workflow publishes `arena-agents-modpack-<version>.zip`. Build it with `.\gradlew.bat packageWindowsDistribution`. Extract the complete ZIP and follow its `README.md`. The shipped command is `.\scripts\install-distribution.ps1`; source-only preparation and launcher-profile scripts are deliberately absent. The installer creates `%APPDATA%\.minecraft-arena-agents`, installs the exact Arena Agents, Fabric API, and Fabric Carpet JARs, removes older package-owned JARs, and installs the matching coordinator and Node.js runtime. It preserves unrelated mods and restores the previous package files if an update fails.
+The Reliability workflow publishes `arena-agents-modpack-<version>.zip`. Build it with `.\gradlew.bat packageWindowsDistribution`. Extract the complete ZIP and follow its `README.md`. The shipped command is `.\scripts\install-distribution.ps1`; source-only preparation and launcher-profile scripts are deliberately absent. The installer creates `%APPDATA%\.minecraft-arena-agents`, installs the exact Arena Agents, Arena Agents Voice, Fabric API, Fabric Carpet, and Simple Voice Chat JARs, removes older package-owned JARs, and installs the matching coordinator and Node.js runtime. It preserves unrelated mods and restores the previous package files if an update fails.
 
 ## Run summonable NPC mode
 
@@ -234,7 +234,7 @@ Every NPC receives a stable directory beneath `runtime/agent-workspaces/<provide
 
 Invalid ArenaScript source receives bounded compiler diagnostics and a corrective turn from the same selected provider/model/session. Repeated physical-action failures remain bounded factual evidence for the next model decision; they never make the runtime choose to abandon the goal. Kimi reads the existing `~/.kimi-code` OAuth state and receives its effort through an isolated process environment. Missing authentication, unavailable models, timeouts, and bounded-output failures stop only the affected NPC.
 
-Spatial voice is optional. The base distribution does not include the Arena Agents Voice add-on or Simple Voice Chat. Without them, `/codex voice-consent` reports `VOICE_UNAVAILABLE` and leaves consent unchanged. With the add-on and its compatible Simple Voice Chat dependency active, the command changes the player's transcription consent state. Text control and ArenaScript do not require voice.
+Spatial voice is optional to use. The Windows release ZIP includes the Arena Agents Voice add-on and Simple Voice Chat. In a separate main-mod installation without them, `/codex voice-consent` reports `VOICE_UNAVAILABLE` and leaves consent unchanged. With the add-on and its compatible Simple Voice Chat dependency active, the command changes the player's transcription consent state. Text control and ArenaScript do not require voice.
 
 Press the configured Agent Controls key (`G` by default) in a world to open the custom Field Console. Agent creation, one-at-a-time configuration, individual tasks, saved groups, lifecycle controls, arena construction, and live match telemetry use separate workspaces behind persistent `Agents`, `Group`, `Live`, and `Build` navigation. The Group workspace saves an ordered roster of stable agent identities, so spawning it restores the same characters without duplicating agents that are already present. Direct messages stay in Minecraft's native `/msg`, `/tell`, and `/w` flow; the mod routes messages addressed to online agents into their private conversation memory and mirrors them to operators. The console renders its own flat controls, text fields, confirmation surface, selection rows, no-shadow labels, and mod-local Roboto typography instead of exposing Minecraft's default button grid or pixel type. Full-row selection, explicit `SELECTED` / `IN GROUP` labels, keyboard focus outlines, scroll-safe 320x240 layouts, and plain status copy keep the current target unmistakable.
 
@@ -242,7 +242,7 @@ Arena setup defaults to building 80 blocks in front of the operator so construct
 
 ## Visual release validation
 
-The release gate starts a temporary offline Fabric server with the exact three JARs from the Windows ZIP. It waits for Minecraft's `Done` marker, runs `codex status`, checks for mixin and crash failures, sends `stop`, and requires a clean exit. Live launcher gameplay and provider-latency acceptance remain separate manual checks.
+The release gate starts a temporary offline Fabric server with the exact five JARs from the Windows ZIP: Arena Agents, Arena Agents Voice, Fabric API, Fabric Carpet, and Simple Voice Chat. It waits for Minecraft's `Done` marker, runs `codex status`, checks for mixin and crash failures, sends `stop`, and requires a clean exit. Live launcher gameplay and provider-latency acceptance remain separate manual checks.
 
 ## Current action surface
 

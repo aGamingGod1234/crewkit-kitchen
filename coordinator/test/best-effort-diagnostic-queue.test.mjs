@@ -46,6 +46,25 @@ test('diagnostic queue observes sync throws and async rejection then drains late
 
 	await queue.close();
 	assert.deepEqual(completed, ['healthy']);
+	assert.equal(queue.statusSnapshot().state, 'ready');
+	assert.equal(queue.statusSnapshot().failedOperationCount, 2);
+	assert.equal(queue.statusSnapshot().incompleteCapture, true);
+});
+
+test('close timeout accounts for abandoned pending work before an active operation timeout', async () => {
+	let release;
+	const queue = new BestEffortDiagnosticQueue({ operationTimeoutMs: 1_000, closeTimeoutMs: 10 });
+	queue.submit(() => new Promise((resolve) => { release = resolve; }));
+	queue.submit(() => assert.fail('close must abandon this pending row'));
+	await new Promise(setImmediate);
+	await queue.close();
+	assert.equal(queue.statusSnapshot().state, 'degraded');
+	assert.equal(queue.statusSnapshot().failureCode, 'DIAGNOSTIC_CLOSE_TIMEOUT');
+	assert.equal(queue.droppedCount, 1);
+	assert.equal(queue.statusSnapshot().incompleteCapture, true);
+	release();
+	await new Promise(setImmediate);
+	assert.equal(queue.statusSnapshot().incompleteCapture, true, 'a late successful append cannot erase abandoned evidence');
 });
 
 test('diagnostic queue contains hostile then getters and continues draining', async () => {
@@ -101,4 +120,55 @@ test('timed-out sink ownership stays bounded while later healthy work can recove
 	await Promise.resolve();
 	assert.ok(queue.droppedCount > 0);
 	await queue.close();
+});
+
+test('setup barrier keeps admission bounded and starts operation timers only after readiness', async () => {
+	let release;
+	const ready = new Promise(resolve => { release = resolve; });
+	const timers = new Set(), completed = [];
+	const queue = new BestEffortDiagnosticQueue({ ready, maxPending: 2, dispatch: queueMicrotask,
+		schedule(callback, delay) { const timer = { callback, delay }; timers.add(timer); return timer; },
+		cancel(timer) { timers.delete(timer); } });
+	assert.equal(queue.submit(async () => { completed.push(1); }), true);
+	assert.equal(queue.submit(async () => { completed.push(2); }), true);
+	assert.equal(queue.submit(() => assert.fail('overflow')), false);
+	await new Promise(setImmediate);
+	assert.equal(timers.size, 0);
+	assert.deepEqual(completed, []);
+	const closing = queue.close();
+	assert.deepEqual([...timers].map(timer => timer.delay), [1_000]);
+	release();
+	await closing;
+	assert.deepEqual(completed, [1, 2]);
+	assert.equal(queue.droppedCount, 1);
+	assert.equal(queue.statusSnapshot().failedOperationCount, 0);
+	assert.equal(queue.statusSnapshot().incompleteCapture, true);
+	assert.equal(timers.size, 0);
+});
+
+test('rejected setup is observed and lets operations choose independent sink outcomes', async () => {
+	let reject;
+	const ready = new Promise((_resolve, no) => { reject = no; });
+	const completed = [];
+	const queue = new BestEffortDiagnosticQueue({ ready });
+	queue.submit(() => completed.push('other sink'));
+	reject(new Error('setup failed'));
+	await queue.close();
+	assert.deepEqual(completed, ['other sink']);
+	assert.equal(queue.statusSnapshot().failedOperationCount, 1);
+	assert.equal(queue.statusSnapshot().incompleteCapture, true);
+});
+
+test('setup cannot resurrect pending rows after close timer creation fails', async () => {
+	let release;
+	const ready = new Promise(resolve => { release = resolve; });
+	const queue = new BestEffortDiagnosticQueue({ ready,
+		schedule() { throw new Error('timer unavailable'); } });
+	queue.submit(() => assert.fail('abandoned operation'));
+	await queue.close();
+	assert.equal(queue.droppedCount, 1);
+	assert.equal(queue.statusSnapshot().failureCode, 'DIAGNOSTIC_CLOSE_TIMEOUT');
+	release();
+	await new Promise(setImmediate);
+	assert.equal(queue.submit(() => {}), false);
 });

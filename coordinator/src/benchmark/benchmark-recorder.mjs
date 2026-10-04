@@ -3,6 +3,7 @@ import { access, mkdir, rename, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { redact } from '../trace-writer.mjs';
+import { isOperationalTokenMetric } from '../diagnostic-sanitizer.mjs';
 import { classifyBenchmarkError, normalizeBenchmarkErrorCode, summarizeBenchmark } from './benchmark-report.mjs';
 
 const DEFAULT_MAX_EVENTS = 100_000;
@@ -190,7 +191,7 @@ function normalizeValue(value, identityLimit, fieldStringLimit) {
 
 function boundTree(value, identityLimit, fieldStringLimit, key = null, depth = 0) {
 	if (depth > 8) return '[BOUNDED]';
-	if (key !== null && isSensitiveKey(key)) return REDACTED;
+	if (key !== null && isSensitiveKey(key) && !isOperationalTokenMetric(key, value)) return REDACTED;
 	if (typeof value === 'string') {
 		const limit = key !== null && isIdentityKey(key) ? identityLimit : fieldStringLimit;
 		return sanitizeCredentialText(value).slice(0, limit);

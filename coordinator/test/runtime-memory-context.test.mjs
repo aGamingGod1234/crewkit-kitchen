@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ModelNotebook } from '../src/model-notebook.mjs';
 import { RuntimeMemoryContext } from '../src/runtime-memory-context.mjs';
+import { TaskMemoryStore } from '../src/task-memory-store.mjs';
+import { AtomicAgentStore } from '../src/observed-memory-store.mjs';
 
 const record = { agentId: 'agent-a', goalRevision: 1, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority' };
 const provenance = { provider: record.provider, model: record.model, reasoningEffort: record.reasoningEffort, serviceTier: record.serviceTier,
@@ -161,3 +163,216 @@ test('a terminal result arriving during unknown persistence remains authoritativ
 	assert.deepEqual(await memory.markUnknown(record.agentId), []);
 	assert.equal((await notebook.findReceipt(record.agentId, { actionId: dispatch.actionId })).source, 'server_action_result');
 });
+
+const taskEntry = (key) => ({ kind: 'lesson', key, label: key, summary: 'Recheck clearance before reusing the route.' });
+const taskRequest = (key) => ({ operation: 'task', arguments: { operation: 'remember', entry: taskEntry(key) } });
+const taskScope = { agentId: record.agentId, goalRevision: record.goalRevision, ...observation.world };
+
+test('task remember acknowledges only after the note can be reloaded from disk', async (t) => {
+	const directory = await mkdtemp(join(tmpdir(), 'runtime-task-ack-'));
+	const memory = new RuntimeMemoryContext({ taskMemory: new TaskMemoryStore({ directory }) });
+	const started = Promise.withResolvers(), release = Promise.withResolvers();
+	const originalWrite = AtomicAgentStore.prototype.write;
+	t.mock.method(AtomicAgentStore.prototype, 'write', async function (key, value) {
+		const snapshot = structuredClone(value);
+		started.resolve();
+		await release.promise;
+		return originalWrite.call(this, key, snapshot);
+	});
+	memory.observe(record, observation);
+	let acknowledged = false;
+	const remembering = memory.execute(record, taskRequest('durable-note')).then((result) => { acknowledged = true; return result; });
+	try {
+		await started.promise;
+		assert.equal(acknowledged, false, 'pending disk I/O must not produce TASK_MEMORY_WRITTEN');
+		release.resolve();
+		const result = await remembering;
+		assert.equal(result.state, 'SUCCEEDED');
+		assert.equal(result.reasonCode, 'TASK_MEMORY_WRITTEN');
+		const restored = new TaskMemoryStore({ directory });
+		assert.deepEqual((await restored.query(taskScope)).entries, [result.entry]);
+	} finally {
+		release.resolve();
+		await remembering;
+		await memory.flush();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test('task remember rejects failed persistence and an explicit retry becomes reloadable', async (t) => {
+	const directory = await mkdtemp(join(tmpdir(), 'runtime-task-failure-'));
+	const memory = new RuntimeMemoryContext({ taskMemory: new TaskMemoryStore({ directory }) });
+	const originalWrite = AtomicAgentStore.prototype.write;
+	let fail = true;
+	t.mock.method(AtomicAgentStore.prototype, 'write', function (...args) {
+		return fail ? Promise.reject(new Error('storage unavailable')) : originalWrite.apply(this, args);
+	});
+	memory.observe(record, observation);
+	try {
+		await assert.rejects(memory.execute(record, taskRequest('retry-note')), /TASK_MEMORY_WRITE_FAILED.*storage unavailable/);
+		assert.equal((await new TaskMemoryStore({ directory }).query(taskScope)).total, 0);
+		fail = false;
+		const result = await memory.execute(record, taskRequest('retry-note'));
+		assert.equal(result.reasonCode, 'TASK_MEMORY_WRITTEN');
+		assert.deepEqual((await new TaskMemoryStore({ directory }).query(taskScope)).entries, [result.entry]);
+	} finally {
+		fail = false;
+		await memory.flush().catch(() => {});
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+// Snapshot fences are exercised through the real runtime entry point.
+{
+const scope = { agentId: 'review-a', goalRevision: 1, worldId: 'review-world', dimension: 'minecraft:overworld' };
+const record = { agentId: scope.agentId, goalRevision: 1 };
+const other = { agentId: 'review-b', goalRevision: 1 };
+const entry = (summary = 'authored note') => ({ kind: 'lesson', key: 'review-note', label: 'Review note', summary });
+const request = (summary) => ({ operation: 'task', arguments: { operation: 'remember', entry: entry(summary) } });
+const observation = (x) => ({ world: { worldId: scope.worldId, dimension: scope.dimension }, ...(x === undefined ? { ready: false } : { position: { x, y: 64, z: 0 } }) });
+const turn = () => new Promise(setImmediate);
+
+// A finite snapshot gate preserves AtomicAgentStore's snapshot-at-call contract.
+// Every successful write still uses its real file.sync + rename implementation.
+function gates(t, count, failedWrite = -1) {
+  const slots = Array.from({ length: count }, () => ({ started: Promise.withResolvers(), release: Promise.withResolvers(), finished: Promise.withResolvers() }));
+  const snapshots = [];
+  const original = AtomicAgentStore.prototype.write;
+  t.mock.method(AtomicAgentStore.prototype, 'write', async function (key, value) {
+    const index = snapshots.length;
+    const snapshot = structuredClone(value);
+    snapshots.push(snapshot);
+    assert.ok(index < count, 'unexpected extra write exceeds finite probe schedule');
+    const slot = slots[index];
+    slot.started.resolve(snapshot);
+    await slot.release.promise;
+    if (index === failedWrite) {
+      slot.finished.resolve({ failed: true });
+      throw new Error(`review injected write ${index} failure`);
+    }
+    await original.call(this, key, snapshot);
+    slot.finished.resolve({ durable: true });
+  });
+  return { slots, snapshots, releaseAll() { for (const s of slots) s.release.resolve(); } };
+}
+function track(promise) {
+  const result = { settled: false };
+  result.done = promise.then(value => { result.settled = true; return { value }; }, error => { result.settled = true; return { error: error.message }; });
+  return result;
+}
+async function setup(t, label) {
+  const directory = await mkdtemp(join(tmpdir(), `runtime-memory-fence-${label}-`));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = new TaskMemoryStore({ directory });
+  const memory = new RuntimeMemoryContext({ taskMemory: store });
+  memory.observe(record, observation());
+  await memory.taskContext(record);
+  return { directory, store, memory };
+}
+async function diskEntries(directory) { return (await new TaskMemoryStore({ directory }).query(scope, { kind: 'lesson' })).entries; }
+
+test('a note must finish after its required follow-up snapshot despite continued observations', async t => {
+  const { directory, memory } = await setup(t, 'continuous');
+  const gate = gates(t, 5);
+  memory.observe(record, observation(0));
+  await gate.slots[0].started.promise;
+  const note = track(memory.execute(record, request()));
+  const durableButPending = [];
+  try {
+    await turn();
+    assert.equal(note.settled, false);
+    gate.slots[0].release.resolve();
+    await gate.slots[1].started.promise;
+    assert.equal((await diskEntries(directory)).length, 0, 'initial observation snapshot cannot persist the later note');
+    assert.equal(note.settled, false, 'required follow-up remains blocked');
+    for (let i = 1; i <= 3; i++) {
+      const observedRecord = i === 2 ? record : other;
+      memory.observe(observedRecord, observation(i * 4 - 2));
+      memory.observe(observedRecord, observation(i * 4));
+      await memory.taskContext(observedRecord);
+      assert.equal(gate.snapshots.length, i + 1, 'ingestion finishes during blocked disk I/O');
+      gate.slots[i].release.resolve();
+      await gate.slots[i + 1].started.promise;
+      const saved = await diskEntries(directory);
+      assert.equal(saved[0]?.summary, entry().summary, 'authored note is already durable');
+      durableButPending.push({ completedSnapshot: i, pendingSnapshot: i + 1, settled: note.settled, observedAgent: observedRecord.agentId });
+    }
+    gate.slots[4].release.resolve();
+    const outcome = await note.done;
+    assert.equal(outcome.value?.reasonCode, 'TASK_MEMORY_WRITTEN');
+    await memory.flush();
+    assert.equal(gate.snapshots.length, 5, 'six overlapping observations form only three follow-up snapshots');
+    const loaded = new TaskMemoryStore({ directory });
+    assert.deepEqual((await loaded.query(scope, { kind: 'trail' })).entries[0].waypoints.map(p => p.x), [0, 6, 8]);
+    assert.deepEqual((await loaded.query({ ...scope, agentId: other.agentId }, { kind: 'trail' })).entries[0].waypoints.map(p => p.x), [2, 4, 10, 12]);
+    assert.ok(durableButPending.every(v => v.settled), 'note waited for unrelated later snapshots after its required snapshot was durable');
+  } finally {
+    gate.releaseAll();
+    await note.done;
+    await memory.flush().catch(() => {});
+  }
+});
+
+test('each TASK_MEMORY_WRITTEN must correspond to an authored version that was persisted', async t => {
+  const { directory, memory } = await setup(t, 'same-key');
+  const gate = gates(t, 2);
+  const first = track(memory.execute(record, request('first authored version')));
+  const second = track(memory.execute(record, request('second authored version')));
+  try {
+    await gate.slots[0].started.promise;
+    assert.equal(first.settled, false);
+    assert.equal(second.settled, false);
+    gate.slots[0].release.resolve();
+    const firstOutcome = await first.done;
+    assert.equal(firstOutcome.value?.reasonCode, 'TASK_MEMORY_WRITTEN');
+    assert.deepEqual(await diskEntries(directory), [firstOutcome.value.entry], 'first acknowledged version must really reach disk');
+    await gate.slots[1].started.promise;
+    assert.equal(second.settled, false, 'second version needs its own successful snapshot');
+    gate.slots[1].release.resolve();
+    const outcomes = await Promise.all([first.done, second.done]);
+    await memory.flush();
+    assert.ok(outcomes.every(o => o.value?.reasonCode === 'TASK_MEMORY_WRITTEN'));
+    const saved = await diskEntries(directory);
+    const persistedVersions = gate.snapshots.flatMap(s => s.entries.map(e => e.summary));
+    assert.equal(saved[0]?.summary, 'second authored version');
+    assert.ok(persistedVersions.includes('first authored version'), 'first call reports TASK_MEMORY_WRITTEN although its authored version was never in a disk snapshot');
+  } finally {
+    gate.releaseAll();
+    await Promise.all([first.done, second.done]);
+    await memory.flush().catch(() => {});
+  }
+});
+
+test('an unrelated later observation failure must not reject an already persisted note', async t => {
+  const { directory, memory } = await setup(t, 'later-failure');
+  const gate = gates(t, 3, 1);
+  const note = track(memory.execute(record, request()));
+  try {
+    await gate.slots[0].started.promise;
+    memory.observe(other, observation(8));
+    await memory.taskContext(other);
+    gate.slots[0].release.resolve();
+    await gate.slots[1].started.promise;
+    const savedBeforeFailure = await diskEntries(directory);
+    assert.equal(savedBeforeFailure[0]?.summary, entry().summary);
+    const settledAfterDurability = note.settled;
+    gate.slots[1].release.resolve();
+    const outcome = await note.done;
+    const savedAfterFailure = await diskEntries(directory);
+    assert.deepEqual(savedAfterFailure, savedBeforeFailure);
+    await assert.rejects(memory.flush(), /TASK_MEMORY_WRITE_FAILED.*write 1 failure/);
+    const retry = track(memory.execute(record, request()));
+    await gate.slots[2].started.promise;
+    gate.slots[2].release.resolve();
+    const retryOutcome = await retry.done;
+    assert.equal(retryOutcome.value?.reasonCode, 'TASK_MEMORY_WRITTEN');
+    await memory.flush();
+    assert.deepEqual(await diskEntries(directory), [retryOutcome.value.entry]);
+    assert.equal(outcome.value?.reasonCode, 'TASK_MEMORY_WRITTEN', 'later observation failure was attributed to the already durable authored note');
+  } finally {
+    gate.releaseAll();
+    await note.done;
+    await memory.flush().catch(() => {});
+  }
+});
+}

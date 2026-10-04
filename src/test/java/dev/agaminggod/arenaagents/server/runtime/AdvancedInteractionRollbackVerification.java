@@ -36,6 +36,20 @@ import net.minecraft.world.SimpleContainer;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import net.minecraft.world.item.crafting.CraftingBookCategory;
+import net.minecraft.world.item.crafting.CraftingRecipe;
+import net.minecraft.world.item.crafting.Ingredient;
+import net.minecraft.world.item.crafting.Recipe;
+import net.minecraft.world.item.crafting.RecipeHolder;
+import net.minecraft.world.item.crafting.RecipeManager;
+import net.minecraft.world.item.crafting.RecipeMap;
+import net.minecraft.world.item.crafting.ShapedRecipe;
+import net.minecraft.world.item.crafting.ShapedRecipePattern;
+import net.minecraft.world.item.crafting.ShapelessRecipe;
+import net.minecraft.world.item.ItemStackTemplate;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.resources.ResourceKey;
 
 public final class AdvancedInteractionRollbackVerification {
 	private AdvancedInteractionRollbackVerification() {
@@ -71,9 +85,143 @@ public final class AdvancedInteractionRollbackVerification {
 			verifyStackIdentity(components);
 			verifyBeaconEffects(components);
 			verifyPartialMenuInput(components);
+			verifyNativeCraftTransaction(components);
+			verifyNativePickaxeTransaction(components);
 			if (failure != null) throw failure;
 		}
-		return 53;
+		return 76;
+	}
+
+	private static void verifyNativeCraftTransaction(ComponentBindings components) {
+		// Real RecipeManager, InventoryMenu, placement and quickMoveStack; only player/world effects are fixtures.
+		components.stack(Items.OAK_PLANKS, 1, 0);
+		Fixture fixture = craftFixture();
+		fixture.inventory().setItem(0, components.stack(Items.OAK_LOG, 2, 0));
+		var args = json("recipeId", "minecraft:oak_planks", "count", 4, "timeoutMs", 5000);
+		var transaction = service().begin(fixture.player(), request(ActionType.CRAFT_INVENTORY, args), args);
+		var result = transaction.tick(System.currentTimeMillis());
+		assertEquals("CRAFT_CONFIRMED", result.reasonCode(), "native log recipe reaches commit: " + result.message());
+		transaction.cleanup();
+		assertEquals(1, count(fixture, Items.OAK_LOG), "one native craft consumes one log");
+		assertEquals(4, count(fixture, Items.OAK_PLANKS), "one native craft owns four planks");
+		assertTrue(fixture.player().inventoryMenu.getInputGridSlots().stream().allMatch(slot -> !slot.hasItem()), "native grid cleaned");
+		assertTrue(fixture.player().inventoryMenu.getCarried().isEmpty(), "native cursor cleaned");
+		assertEquals(result, transaction.tick(System.currentTimeMillis()), "terminal craft retry is stable");
+		transaction.cleanup();
+		assertEquals(4, count(fixture, Items.OAK_PLANKS), "terminal retry and cleanup cannot duplicate output");
+
+		Fixture failed = craftFixture();
+		failed.inventory().setItem(0, components.stack(Items.OAK_LOG, 2, 0));
+		int[] commits = {0};
+		AdvancedInteractionService faulting = new AdvancedInteractionService(
+				ServerProtectionPolicy.TRUSTED_LOCAL_OPERATOR, new ResourceLeaseManager(), (menu, player, slot) -> {
+					ItemStack moved = menu.quickMoveStack(player, slot);
+					assertEquals(4, moved.getCount(), "fault happens after actual native result movement");
+					commits[0]++;
+					throw new IllegalStateException("owned postcommit craft fault");
+				});
+		var fault = faulting.begin(failed.player(), request(ActionType.CRAFT_INVENTORY, args), args);
+		var rejected = fault.tick(System.currentTimeMillis());
+		assertEquals("CRAFT_POSTCOMMIT_EXCEPTION", rejected.reasonCode(), "postcommit exception restores native transaction: " + rejected.message());
+		fault.cleanup();
+		assertEquals(2, count(failed, Items.OAK_LOG), "postcommit rollback restores original logs");
+		assertEquals(0, count(failed, Items.OAK_PLANKS), "postcommit rollback removes crafted output");
+		assertEquals(rejected, fault.tick(System.currentTimeMillis()), "failed terminal retry is stable");
+		assertEquals(1, commits[0], "failed transaction cannot recommit");
+		var retry = service().begin(failed.player(), request(ActionType.CRAFT_INVENTORY, args), args);
+		assertEquals("CRAFT_CONFIRMED", retry.tick(System.currentTimeMillis()).reasonCode(), "new craft succeeds after rollback");
+		retry.cleanup();
+		assertEquals(1, count(failed, Items.OAK_LOG), "retry consumes only one original log");
+		assertEquals(4, count(failed, Items.OAK_PLANKS), "retry produces only one native result");
+	}
+
+	private static int count(Fixture fixture, Item item) {
+		int count = 0;
+		for (int slot = 0; slot < fixture.inventory().getContainerSize(); slot++) {
+			ItemStack stack = fixture.inventory().getItem(slot);
+			if (stack.is(item)) count += stack.getCount();
+		}
+		return count;
+	}
+
+	private static void verifyNativePickaxeTransaction(ComponentBindings components) {
+		components.stack(Items.STICK, 1, 0);
+		components.stack(Items.WOODEN_PICKAXE, 1, 59);
+		Fixture fixture = craftFixture();
+		fixture.inventory().setItem(0, components.stack(Items.OAK_PLANKS, 3, 0));
+		fixture.inventory().setItem(1, components.stack(Items.STICK, 2, 0));
+		var args = json("recipeId", "minecraft:wooden_pickaxe", "count", 1, "timeoutMs", 5000, "x", 0, "y", 64, "z", 0);
+		var transaction = service().begin(fixture.player(), request(ActionType.CRAFT_TABLE, args), args);
+		var result = transaction.tick(System.currentTimeMillis());
+		assertEquals("CRAFT_CONFIRMED", result.reasonCode(), "native pickaxe table recipe commits: " + result.message());
+		assertEquals(net.minecraft.world.inventory.CraftingMenu.class, fixture.player().containerMenu.getClass(), "native crafting table menu used");
+		transaction.cleanup();
+		assertEquals(0, count(fixture, Items.OAK_PLANKS), "pickaxe consumes three planks");
+		assertEquals(0, count(fixture, Items.STICK), "pickaxe consumes two sticks");
+		assertEquals(1, count(fixture, Items.WOODEN_PICKAXE), "pickaxe ownership is exact");
+		assertTrue(fixture.player().containerMenu == fixture.player().inventoryMenu, "table menu cleanup returns to inventory");
+		transaction.cleanup(); transaction.tick(System.currentTimeMillis());
+		assertEquals(1, count(fixture, Items.WOODEN_PICKAXE), "table terminal retries cannot duplicate pickaxe");
+	}
+
+	private static Fixture craftFixture() {
+		Fixture fixture = fixture();
+		fixture.player().fixtureLevel.recipes = new FixtureRecipes();
+		fixture.player().fixtureLevel.rules = new net.minecraft.world.level.gamerules.GameRules(net.minecraft.world.flag.FeatureFlags.DEFAULT_FLAGS);
+		try {
+			Field field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); field.setAccessible(true);
+			sun.misc.Unsafe unsafe = (sun.misc.Unsafe) field.get(null);
+			fixture.player().connection = (FixtureConnection) unsafe.allocateInstance(FixtureConnection.class);
+			FixtureServer server = (FixtureServer) unsafe.allocateInstance(FixtureServer.class);
+			server.recipes = fixture.player().fixtureLevel.recipes;
+			fixture.player().fixtureLevel.server = server;
+			setField(unsafe, fixture.player().fixtureLevel, net.minecraft.world.level.Level.class, "dimension", net.minecraft.world.level.Level.OVERWORLD);
+			setField(unsafe, fixture.player(), ServerPlayer.class, "gameMode", new FixtureGameMode(fixture.player()));
+			setField(unsafe, fixture.player(), net.minecraft.world.entity.Entity.class, "position", new net.minecraft.world.phys.Vec3(0, 64, 1));
+			fixture.player().setBoundingBox(new net.minecraft.world.phys.AABB(-0.3, 64, 0.7, 0.3, 65.8, 1.3));
+			InventoryMenu menu = new InventoryMenu(fixture.inventory(), true, fixture.player());
+			setField(unsafe, fixture.player(), Player.class, "inventoryMenu", menu);
+			fixture.player().containerMenu = menu;
+			return fixture;
+		} catch (ReflectiveOperationException exception) { throw new AssertionError(exception); }
+	}
+
+	private static final class FixtureRecipes extends RecipeManager {
+		FixtureRecipes() {
+			super(RegistryAccess.fromRegistryOfRegistries(BuiltInRegistries.REGISTRY));
+			var recipe = new ShapelessRecipe(new Recipe.CommonInfo(false),
+					new CraftingRecipe.CraftingBookInfo(CraftingBookCategory.BUILDING, "planks"),
+					new ItemStackTemplate(Items.OAK_PLANKS, 4), java.util.List.of(Ingredient.of(Items.OAK_LOG)));
+			var holder = new RecipeHolder<>(ResourceKey.create(Registries.RECIPE, Identifier.parse("minecraft:oak_planks")), recipe);
+			var pickaxe = new ShapedRecipe(new Recipe.CommonInfo(false),
+					new CraftingRecipe.CraftingBookInfo(CraftingBookCategory.EQUIPMENT, ""),
+					ShapedRecipePattern.of(Map.of('P', Ingredient.of(Items.OAK_PLANKS), 'S', Ingredient.of(Items.STICK)), "PPP", " S ", " S "),
+					new ItemStackTemplate(Items.WOODEN_PICKAXE));
+			var pickaxeHolder = new RecipeHolder<>(ResourceKey.create(Registries.RECIPE, Identifier.parse("minecraft:wooden_pickaxe")), pickaxe);
+			apply(RecipeMap.create(java.util.List.of(holder, pickaxeHolder)), null, net.minecraft.util.profiling.InactiveProfiler.INSTANCE);
+		}
+	}
+
+	private static final class FixtureConnection extends net.minecraft.server.network.ServerGamePacketListenerImpl {
+		private FixtureConnection() { super(null, null, null, null); }
+		@Override public void send(net.minecraft.network.protocol.Packet<?> packet) { }
+	}
+
+	private static final class FixtureGameMode extends net.minecraft.server.level.ServerPlayerGameMode {
+		private FixtureGameMode(ServerPlayer player) { super(player); }
+		@Override public net.minecraft.world.InteractionResult useItemOn(ServerPlayer player, net.minecraft.world.level.Level level,
+				ItemStack stack, net.minecraft.world.InteractionHand hand, net.minecraft.world.phys.BlockHitResult hit) {
+			player.containerMenu = new net.minecraft.world.inventory.CraftingMenu(1, player.getInventory(),
+					net.minecraft.world.inventory.ContainerLevelAccess.create(level, hit.getBlockPos()));
+			return net.minecraft.world.InteractionResult.SUCCESS;
+		}
+	}
+
+	/** Allocated without running a server constructor or starting any threads. */
+	private static final class FixtureServer extends net.minecraft.server.dedicated.DedicatedServer {
+		private RecipeManager recipes;
+		private FixtureServer() { super(null, null, null, null, java.util.Optional.empty(), null, null, null); }
+		@Override public RecipeManager getRecipeManager() { return recipes; }
 	}
 
 	private static void verifyPartialMenuInput(ComponentBindings components) {
@@ -419,6 +567,20 @@ public final class AdvancedInteractionRollbackVerification {
 		@Override
 		public boolean isUsingItem() { return false; }
 
+		@Override public boolean isCreative() { return false; }
+		@Override public net.minecraft.stats.ServerRecipeBook getRecipeBook() {
+			return new net.minecraft.stats.ServerRecipeBook((key, output) -> { });
+		}
+		@Override public void awardStat(net.minecraft.stats.Stat<?> stat, int amount) { }
+		@Override public int awardRecipes(java.util.Collection<RecipeHolder<?>> recipes) { return 0; }
+		@Override public void triggerRecipeCrafted(RecipeHolder<?> recipe, java.util.List<ItemStack> ingredients) { }
+		@Override public boolean isWithinBlockInteractionRange(net.minecraft.core.BlockPos position, double padding) { return true; }
+		@Override public boolean isDescending() { return false; }
+		@Override public void closeContainer() {
+			containerMenu.removed(this);
+			containerMenu = inventoryMenu;
+		}
+
 		@Override
 		public void updateTutorialInventoryAction(ItemStack carried, ItemStack target, ClickAction action) {
 		}
@@ -436,6 +598,9 @@ public final class AdvancedInteractionRollbackVerification {
 	}
 
 	private static final class MenuFixtureLevel extends ServerLevel {
+		private RecipeManager recipes;
+		private MinecraftServer server;
+		private net.minecraft.world.level.gamerules.GameRules rules;
 		private MenuFixtureLevel() {
 			super(null, Runnable::run, null, null, net.minecraft.world.level.Level.OVERWORLD, null, false, 0L, java.util.List.of(), false);
 		}
@@ -443,6 +608,17 @@ public final class AdvancedInteractionRollbackVerification {
 		@Override
 		public net.minecraft.world.flag.FeatureFlagSet enabledFeatures() {
 			return net.minecraft.world.flag.FeatureFlags.DEFAULT_FLAGS;
+		}
+		@Override public RecipeManager recipeAccess() { return recipes; }
+		@Override public MinecraftServer getServer() { return server; }
+		@Override public net.minecraft.world.level.gamerules.GameRules getGameRules() { return rules; }
+		@Override public boolean hasChunkAt(net.minecraft.core.BlockPos position) { return true; }
+		@Override public net.minecraft.world.level.block.state.BlockState getBlockState(net.minecraft.core.BlockPos position) {
+			return net.minecraft.world.level.block.Blocks.CRAFTING_TABLE.defaultBlockState();
+		}
+		@Override public net.minecraft.world.phys.BlockHitResult clip(net.minecraft.world.level.ClipContext context) {
+			return new net.minecraft.world.phys.BlockHitResult(new net.minecraft.world.phys.Vec3(0.5, 64.5, 0.5),
+					net.minecraft.core.Direction.SOUTH, new net.minecraft.core.BlockPos(0, 64, 0), false);
 		}
 	}
 }

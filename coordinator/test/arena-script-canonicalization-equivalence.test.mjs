@@ -173,7 +173,8 @@ const ACCEPTED = {
 	'forbidden-prototype-key': invalid('forbidden facts.player key'),
 	'bad-prototype': invalid('facts.world.entities.0 has an unsafe prototype'),
 	'cycle': invalid('cyclic or proxy facts.world.entities.0.self'),
-	'shared-node': invalid('cyclic or proxy facts.world.entities.1'),
+	// Repeated acyclic records expand as data; only ancestor references are cycles.
+	'shared-node': accepted,
 	'proxy-record': invalid('cyclic or proxy facts.world.entities.0'),
 	'proxy-array': invalid('cyclic or proxy facts.world.entities'),
 	'bigint-value': invalid('facts.player.big must be a safe data value'),

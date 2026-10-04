@@ -18,10 +18,10 @@ test('compiles the stone-tool manifest into bounded deterministic ArenaScript', 
 	const manifest = getSimulatorScenario('stone-tool-gathering');
 	const compiled = compileScenarioProgram(manifest);
 	assert.equal(compiled.commands.length, manifest.commands.length);
-	assert.equal(compiled.commands.map((command) => command.actionType).join(','), 'navigate_to,break_block,craft_inventory');
+	assert.equal(compiled.commands.map((command) => command.actionType).join(','), 'navigate_to,break_block,craft_table');
 	assert.match(compiled.source, /player\.navigateTo\(\{[^}]*\"x\":0/);
 	assert.match(compiled.source, /player\.mine\(\{[^}]*\"x\":1/);
-	assert.match(compiled.source, /player\.craftInventory\(\{[^}]*\"recipeId\":\"minecraft:stone_pickaxe\"/);
+	assert.match(compiled.source, /player\.craftTable\(\{[^}]*\"recipeId\":\"minecraft:stone_pickaxe\"/);
 	assert.match(compiled.source, /program\.finish\("scenario-complete"\);/);
 	assert.doesNotThrow(() => parseArenaScript(compiled.source));
 	assert.deepEqual(compileScenarioDecision(manifest), compiled.decision);
@@ -121,7 +121,8 @@ test('supports every command-bearing manifest through physical outcome derivatio
 		if (manifest.commands.length === 0) continue;
 		assert.doesNotThrow(() => compileScenarioProgram(manifest), `${id} must compile for the simulator`);
 		const execution = await executeManifest(manifest);
-		assert.equal(runAuthoritativeScenarioSuccess({ manifest, ...execution }), true, `${id} must pass from simulator state`);
+		assert.equal(runAuthoritativeScenarioSuccess({ manifest, ...execution }), id !== 'direct-message-wake', `${id}: sender-only chat must not certify recipient work`);
+		execution.bridge.stop(); await execution.bridge.flush();
 	}
 
 	const correction = getSimulatorScenario('invalid-decision-correction');

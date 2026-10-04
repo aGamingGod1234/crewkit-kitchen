@@ -8,6 +8,35 @@ import { AtomicAgentStore, ObservedMemoryStore } from '../src/observed-memory-st
 const view = (worldId, dimension, gameTime, x = 0, blocks = []) => ({ world: { worldId, dimension, gameTime }, position: { x, y: 64, z: 0 }, blocks });
 const stone = { blockId: 'minecraft:stone', x: 12, y: 80, z: 0 };
 
+test('snapshot-free ingestion retains identical scoped state and durable facts while default returns stay compatible', async (t) => {
+	const directory = await mkdtemp(join(tmpdir(), 'memory-no-snapshot-'));
+	t.after(() => rm(directory, { recursive: true, force: true }));
+	const normal = new ObservedMemoryStore();
+	const efficient = new ObservedMemoryStore({ directory });
+	const queries = t.mock.method(efficient, 'query');
+	for (const observation of [
+		view('one', 'minecraft:overworld', 10, 0, [stone]),
+		view('one', 'minecraft:the_nether', 11, 40),
+		view('one', 'minecraft:overworld', 12, 16, [{ ...stone, blockId: 'minecraft:air' }]),
+		view('two', 'minecraft:overworld', 13, 80),
+	]) {
+		const snapshot = normal.ingest('a', observation);
+		assert.deepEqual(snapshot, normal.query('a'), 'default ingestion still returns a complete snapshot');
+		const previousQueries = queries.mock.callCount();
+		assert.equal(efficient.ingest('a', observation, { snapshot: false }), undefined);
+		assert.equal(queries.mock.callCount(), previousQueries, 'snapshot suppression skips query entirely');
+		assert.deepEqual(efficient.query('a'), snapshot);
+	}
+	await efficient.flush('a');
+	const restored = new ObservedMemoryStore({ directory });
+	await restored.load('a');
+	for (const scope of [
+		{ worldId: 'one', dimension: 'minecraft:overworld' },
+		{ worldId: 'one', dimension: 'minecraft:the_nether' },
+		{ worldId: 'two', dimension: 'minecraft:overworld' },
+	]) assert.deepEqual(restored.query('a', scope), normal.query('a', scope));
+});
+
 test('dimension round trips retain independent memory and another world shares no coordinates', () => {
 	const memory = new ObservedMemoryStore();
 	memory.ingest('a', view('one', 'minecraft:overworld', 10, 0, [stone]));

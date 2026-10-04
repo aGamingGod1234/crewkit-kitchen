@@ -54,6 +54,7 @@ public final class ServerObservationCollector {
 	public static final int MAX_ENTITIES = 64;
 	public static final int MAX_BLOCKS = 128;
 	public static final int BLOCK_RADIUS = 6;
+	static final int BLOCK_VERTICAL_RADIUS = 3;
 	public static final int MAX_BLOCKS_PER_TYPE = 8;
 	/** Sparse first-surface hits let the agent see structures and resources at player-like distances. */
 	public static final int MAX_LANDMARKS = 32;
@@ -386,8 +387,13 @@ public final class ServerObservationCollector {
 	 * roster it already computed for observation scheduling.
 	 */
 	public List<AgentId> changedActiveAgents(List<AgentRecord> records) {
+		return changedActiveAgentSamples(records).stream().map(RawPlayerChange::agentId).toList();
+	}
+
+	/** Raw freshness and forced attention are separate: safe air alone needs only a fresh sample. */
+	public List<RawPlayerChange> changedActiveAgentSamples(List<AgentRecord> records) {
 		Objects.requireNonNull(records, "records must not be null");
-		List<AgentId> changed = new ArrayList<>();
+		List<RawPlayerChange> changed = new ArrayList<>();
 		if (manager.server() == null) {
 			synchronized (lastRawStates) {
 				lastRawStates.clear();
@@ -411,7 +417,9 @@ public final class ServerObservationCollector {
 			synchronized (lastRawStates) {
 				RawPlayerState previous = lastRawStates.put(agentId, current);
 				boolean inventoryChanged = updateInventory(agentId, agent);
-				if (previous != null && (!current.equals(previous) || inventoryChanged)) changed.add(agentId);
+				if (previous != null && (!current.equals(previous) || inventoryChanged)) {
+					changed.add(new RawPlayerChange(agentId, current.requiresForcedAttention(previous, inventoryChanged)));
+				}
 			}
 		}
 		synchronized (lastRawStates) {
@@ -419,6 +427,9 @@ public final class ServerObservationCollector {
 			lastInventories.keySet().removeIf(agentId -> !tracked.contains(agentId));
 		}
 		return List.copyOf(changed);
+	}
+
+	public record RawPlayerChange(AgentId agentId, boolean forceAttention) {
 	}
 
 	private JsonObject spatialObservation(
@@ -762,7 +773,7 @@ public final class ServerObservationCollector {
 		ArrayList<BlockObservationOrdering.Candidate> candidates = new ArrayList<>();
 		ArrayList<RawSpatialObservation.ContainerCandidate> containers = new ArrayList<>();
 		BlockPos.MutableBlockPos position = new BlockPos.MutableBlockPos();
-		for (int y = -3; y <= 3; y++) {
+		for (int y = -BLOCK_VERTICAL_RADIUS; y <= BLOCK_VERTICAL_RADIUS; y++) {
 			for (int x = -BLOCK_RADIUS; x <= BLOCK_RADIUS; x++) {
 				for (int z = -BLOCK_RADIUS; z <= BLOCK_RADIUS; z++) {
 					position.set(center.getX() + x, center.getY() + y, center.getZ() + z);
@@ -921,7 +932,10 @@ public final class ServerObservationCollector {
 						position.getY() + 0.5D,
 						position.getZ() + 0.5D
 				);
-				if (distanceSquared <= (double) BLOCK_RADIUS * BLOCK_RADIUS) continue;
+				// Suppress nearby duplicates only where the local scan actually reaches.
+				// Keep the existing farther/corner samples: local visibility is itself budgeted.
+				if (distanceSquared <= (double) BLOCK_RADIUS * BLOCK_RADIUS
+						&& withinLocalBlockScan(center, position)) continue;
 				String blockId = BuiltInRegistries.BLOCK.getKey(level.getBlockState(position).getBlock()).toString();
 				candidates.putIfAbsent(position.asLong(), new VisibleSurfaceCandidate(
 						position.getX() - center.getX(),
@@ -939,6 +953,12 @@ public final class ServerObservationCollector {
 				.thenComparingInt(VisibleSurfaceCandidate::x)
 				.thenComparingInt(VisibleSurfaceCandidate::z));
 		return List.copyOf(ordered);
+	}
+
+	static boolean withinLocalBlockScan(BlockPos center, BlockPos position) {
+		return Math.abs((long) position.getX() - center.getX()) <= BLOCK_RADIUS
+				&& Math.abs((long) position.getY() - center.getY()) <= BLOCK_VERTICAL_RADIUS
+				&& Math.abs((long) position.getZ() - center.getZ()) <= BLOCK_RADIUS;
 	}
 
 	/** Keep clipping inside the contiguous loaded view instead of making long rays load chunks. */
@@ -1157,7 +1177,7 @@ public final class ServerObservationCollector {
 		return previous.matchesAndUpdate(agent);
 	}
 
-	private record RawPlayerState(
+	record RawPlayerState(
 		double health,
 		int foodLevel,
 		double saturation,
@@ -1170,6 +1190,14 @@ public final class ServerObservationCollector {
 		java.util.UUID lastAttacker,
 		long perceptionSequence
 	) {
+		boolean requiresForcedAttention(RawPlayerState previous, boolean inventoryChanged) {
+			// Narrow exception: preserve menu/components, events, hazards and every other raw wake.
+			return inventoryChanged || !AttentionSignalPolicy.safeAir(air) || !AttentionSignalPolicy.safeAir(previous.air)
+					|| health != previous.health || foodLevel != previous.foodLevel || saturation != previous.saturation
+					|| onFire != previous.onFire || inWater != previous.inWater || suffocating != previous.suffocating
+					|| onGround != previous.onGround || fallDistance != previous.fallDistance
+					|| !Objects.equals(lastAttacker, previous.lastAttacker) || perceptionSequence != previous.perceptionSequence;
+		}
 	}
 
 	private record EntityCandidate(Entity entity, double distanceSquared) {

@@ -60,10 +60,14 @@ export class CodexService {
   return {
    async setGoalRevision() {},
    async act(input, context) {
-    const call = async (actionType) => context.executeTool({ tool: { kind: 'action', actionType, ...(actionType === 'break_block' ? { arguments: { x: 2, y: 64, z: 1, expectedBlockId: 'minecraft:stone', timeoutMs: 15_000 } } : {}) } });
-    if (input.includes('mine the known')) { await call('navigate_to'); await call('break_block'); return ${resultExpression}; }
-    if (input.includes('craft_inventory')) { await call('craft_inventory'); return ${resultExpression}; }
-    await call('chat'); return ${resultExpression};
+    const call = async (actionType) => context.executeTool({ tool: { kind: 'action', actionType, arguments:
+      actionType === 'chat' ? { message: 'Hello' } :
+      actionType === 'craft_inventory' ? { recipeId: 'minecraft:oak_planks', count: 4, timeoutMs: 15_000 } :
+      { x: 2, y: 64, z: 1, expectedBlockId: 'minecraft:stone', timeoutMs: 15_000 }
+    } });
+    if (input.includes('mine the known')) { await call('navigate_to'); await call('break_block'); return { status: 'completed', ...${resultExpression} }; }
+    if (input.includes('craft_inventory')) { await call('craft_inventory'); return { status: 'completed', ...${resultExpression} }; }
+    await call('chat'); return { status: 'completed', ...${resultExpression} };
    },
   };
  }
@@ -76,6 +80,38 @@ test('native A/B trial contains missing service-module failures at the CLI root'
 	const second = await runCli('native-tool-ab-trial.mjs', [privateMissingModule, 'baseline', '1']);
 	assertBoundedSanitizedFailure(first, 'ERR_MODULE_NOT_FOUND');
 	assertBoundedSanitizedFailure(second, 'ERR_MODULE_NOT_FOUND');
+});
+
+test('native A/B trial accepts documented normalized move/mine forms and rejects unrelated work', async (context) => {
+	const root = await mkdtemp(path.join(os.tmpdir(), 'native-ab-normalization-'));
+	const fixture = path.join(coordinatorRoot, 'test/fixtures/native-benchmark-service.mjs');
+	try {
+		const accepted = ['exact', 'autoAim', 'adjacent', 'adjacent-autoAim', 'fractional-near', 'boundary'];
+		const rejected = ['outside', 'diagonal', 'wrong-height', 'wrong-target', 'wrong-block', 'reversed',
+			'missing-mine', 'missing-move', 'extra', 'wrong-aim', 'reversed-aim', 'extra-sequence', 'finish-sequence'];
+		for (const variant of [...accepted, ...rejected]) await context.test(variant, async () => {
+			const result = await runCli('native-tool-ab-trial.mjs', [fixture, variant, '1'], {
+				env: { NATIVE_BENCHMARK_CASE: variant, TEMP: root, TMP: root, TMPDIR: root },
+			});
+			assert.equal(result.signal, null);
+			assert.equal(result.stderr, '');
+			const report = JSON.parse(result.stdout);
+			const passed = accepted.includes(variant);
+			assert.equal(result.code, passed ? 0 : 1, result.stdout);
+			assert.equal(report.status, passed ? 'PASSED' : 'FAILED');
+			assert.equal(report.moveMine.valid, passed);
+			assert.equal(report.moveMine.result.status, 'completed');
+			assert.ok([report.coldDm, report.warmDm, report.craft].every(turn => turn.valid));
+			if (variant === 'autoAim') {
+				assert.equal(report.moveMine.result.toolCalls, 2);
+				assert.equal(report.moveMine.requests[1].kind, 'sequence');
+				assert.deepEqual(report.moveMine.requests[1].actions.map(action => action.actionType), ['look_at', 'break_block']);
+				assert.deepEqual(report.moveMine.requests[1].actions[0].arguments, { x: 2.5, y: 64.5, z: 1.5 });
+			}
+		});
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
 });
 
 test('native A/B runner contains child module failures at the CLI root', async () => {

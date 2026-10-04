@@ -41,7 +41,31 @@ public final class AttentionHazardVerification {
 		assertTrue(lava.changedFacts().contains("blocks.0,64,0"), "lava is delivered as an observed block fact");
 		assertFalse(lava.changedFacts().stream().anyMatch(AttentionHazardVerification::isTacticalLabel),
 				"lava attention does not choose flee, jump, or another movement");
-		return 11;
+		return 11 + verifyRawAirSampling();
+	}
+
+	private static int verifyRawAirSampling() {
+		var before = rawState(299, 20, true, 0, 0);
+		var after = rawState(298, 20, true, 0, 0);
+		assertFalse(before.equals(after), "safe air still changes the raw sample");
+		assertFalse(after.requiresForcedAttention(before, false), "safe air alone does not force attention");
+		assertFalse(before.requiresForcedAttention(after, false), "safe air recovery does not force attention");
+		assertTrue(after.requiresForcedAttention(before, true), "inventory/menu/component freshness still forces delivery");
+		assertTrue(rawState(60, 20, true, 0, 0).requiresForcedAttention(rawState(61, 20, true, 0, 0), false),
+				"crossing the air hazard threshold remains forced");
+		assertTrue(rawState(59, 20, true, 0, 0).requiresForcedAttention(rawState(60, 20, true, 0, 0), false),
+				"continuing critical air remains forced");
+		assertTrue(rawState(298, 19, true, 0, 0).requiresForcedAttention(before, false), "damage plus safe air remains forced");
+		assertTrue(rawState(298, 20, false, 0, 0).requiresForcedAttention(before, false), "other raw transitions remain forced");
+		assertTrue(rawState(298, 20, true, 6, 0).requiresForcedAttention(before, false), "hazardous falling remains forced");
+		assertTrue(rawState(298, 20, true, 0, 1).requiresForcedAttention(before, false), "perception events remain forced");
+		return 10;
+	}
+
+	private static ServerObservationCollector.RawPlayerState rawState(int air, double health, boolean onGround,
+			double fallDistance, long perceptionSequence) {
+		return new ServerObservationCollector.RawPlayerState(health, 20, 5, false, true, air, false,
+				onGround, fallDistance, null, perceptionSequence);
 	}
 
 	private static JsonObject observation(String actionType) {

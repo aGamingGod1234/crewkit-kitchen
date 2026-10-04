@@ -4,6 +4,14 @@ import test from 'node:test';
 import { parseArenaScript } from '../src/arena-script/parser.mjs';
 import { FACT_DOMAIN } from '../src/arena-script/fact-domains.mjs';
 
+test('repeat callbacks participate in recursion and closure initialization checks', () => {
+	const prefix = 'program.onUnhandledAttention("continue_and_notify");';
+	assert.throws(() => parseArenaScript(`${prefix} async function again() { await program.repeatUntil(() => false,{maxIterations:1},async () => {await player.wait(1); await again();}); } await again();`), error => error.code === 'RECURSION_FORBIDDEN');
+	const helper = 'async function use() {await program.repeatUntil(() => false,{maxIterations:1},async () => {await player.wait(later);});}';
+	assert.throws(() => parseArenaScript(`${prefix} ${helper} await use(); const later = 1;`), error => error.code === 'UNSAFE_MEMBER_ACCESS');
+	assert.doesNotThrow(() => parseArenaScript(`${prefix} ${helper} const later = 1; await use();`));
+});
+
 test('compiles a bounded program and records its model-owned policy', () => {
 	const compiled = parseArenaScript(`
 		program.onUnhandledAttention("continue_and_notify");

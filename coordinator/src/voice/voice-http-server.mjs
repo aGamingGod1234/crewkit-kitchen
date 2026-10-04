@@ -256,6 +256,9 @@ export function createVoiceHttpServer({
 				error.httpStatus = 503;
 				throw error;
 			}
+			if (typeof requestProvider.supportsTone === 'function' && !requestProvider.supportsTone(payload.tone)) {
+				throw typedError('INVALID_REQUEST', 'Unsupported delivery tone for the selected speech provider');
+			}
 			const selectedProfile = typeof profileStore.resolveRequested === 'function'
 				? profileStore.resolveRequested(payload.agentId, payload.profileId)
 				: profileStore.resolve(payload.agentId);
@@ -578,6 +581,7 @@ class VoiceChannelLifecycle {
 	#failureCode = null;
 	#failures = 0;
 	#nextProbeAt = null;
+	#retryNotBefore = 0;
 	#generation = 1;
 	#lastRecoveryAt = null;
 	#epoch = 0;
@@ -621,6 +625,14 @@ class VoiceChannelLifecycle {
 		this.#failureCode = voiceFailureCode(error);
 		this.#failures = Math.min(1_000_000, this.#failures + 1);
 		this.#generation += 1;
+		const retryAfter = retryAfterHeaders(error)['Retry-After'];
+		if (retryAfter !== undefined) {
+			this.#retryNotBefore = Math.max(this.#retryNotBefore, this.#now() + Number(retryAfter) * 1000);
+			if (this.#timer !== null && this.#nextProbeAt < this.#retryNotBefore) {
+				this.#cancelSchedule(this.#timer);
+				this.#timer = null;
+			}
+		}
 		if (this.#retryEnabled && this.#timer === null && this.#probeToken === null) this.#scheduleRetry();
 	}
 
@@ -662,6 +674,7 @@ class VoiceChannelLifecycle {
 		this.#failureCode = null;
 		this.#failures = 0;
 		this.#nextProbeAt = null;
+		this.#retryNotBefore = 0;
 		if (recovered) {
 			this.#lastRecoveryAt = this.#now();
 			this.#generation += 1;
@@ -693,7 +706,8 @@ class VoiceChannelLifecycle {
 	}
 
 	#scheduleRetry() {
-		const delay = Math.min(this.#maxRetryMs, this.#initialRetryMs * 2 ** Math.min(20, this.#failures - 1));
+		const backoff = Math.min(this.#maxRetryMs, this.#initialRetryMs * 2 ** Math.min(20, this.#failures - 1));
+		const delay = Math.max(backoff, this.#retryNotBefore - this.#now());
 		this.#nextProbeAt = this.#now() + delay;
 		const epoch = ++this.#epoch;
 		this.#timer = this.#schedule(() => {
@@ -713,9 +727,15 @@ class VoiceChannelLifecycle {
 			if (this.#closed || this.#probeToken !== token || token.epoch !== this.#epoch) return;
 			token.timeout = null;
 			token.timedOut = true;
-			this.#markStalled();
 			const error = typedError(`${this.#component === 'voice:stt' ? 'STT' : 'TTS'}_TIMEOUT`, 'Voice health probe timed out');
 			error.name = 'TimeoutError';
+			token.failure = error;
+			// Retain the physical probe until cancellation settles. Reuse the normal recovery
+			// delay as the acknowledgement window; a stuck operation still cannot overlap a retry.
+			token.timeout = this.#schedule(() => {
+				token.timeout = null;
+				if (!this.#closed && this.#probeToken === token && token.epoch === this.#epoch) this.#markStalled();
+			}, this.#initialRetryMs);
 			controller.abort(error);
 		}, this.#probeTimeoutMs);
 		raw.then(
@@ -735,7 +755,7 @@ class VoiceChannelLifecycle {
 			return;
 		}
 		if (token.timedOut) {
-			if (this.#state === 'degraded' && this.#timer === null) this.#scheduleRetry();
+			this.recordFailure(token.failure);
 			return;
 		}
 		if (failure === null) this.recordReady();

@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
+import { spawn as nodeSpawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import test from 'node:test';
+import { terminateChildProcess } from '../src/child-process-lifecycle.mjs';
 
 import {
 	CursorProviderService,
@@ -346,5 +348,127 @@ test('Cursor process death invalidates only its owning generation and exact repl
 	const second = service.replaceAgent(selected, { expectedSessionGeneration: 1 });
 	assert.equal(await first, await second);
 	assert.equal((await first).sessionGeneration, 2);
+	await service.stop();
+});
+
+for (const exitsEarly of [true, false]) {
+	test(`Cursor real ${exitsEarly ? 'early-exit' : 'live child with injected'} stdin failure is handled while another agent completes`, async (t) => {
+		const children = [];
+		const closed = [];
+		const terminated = [];
+		const envelope = JSON.stringify({
+			type: 'result', subtype: 'success', is_error: false, result: DECISION,
+			session_id: 'healthy-session', duration_ms: 1, duration_api_ms: 1,
+		});
+		const service = new CursorProviderService(config({ cwd: process.cwd(), planningTimeoutMs: 10_000 }), {
+			discoverCatalog: async () => parseCursorModelList(MODELS_OUTPUT),
+			spawn: () => {
+				// Only local Node fixtures: no Cursor executable, inherited credentials, or files.
+				const failure = exitsEarly ? 'process.exit(1)' : 'setInterval(() => {}, 1000);';
+				const source = children.length === 0 ? failure :
+					`process.stdin.resume(); process.stdin.on('end', () => process.stdout.write(${JSON.stringify(envelope)}));`;
+				const child = nodeSpawn(process.execPath, ['-e', source], {
+					stdio: ['pipe', 'pipe', 'pipe'], env: {}, windowsHide: true,
+				});
+				if (!exitsEarly && children.length === 0) {
+					// Force a real Writable failure while the target is alive, so cleanup
+					// must terminate it rather than rely on the early-exit fixture.
+					setImmediate(() => child.stdin.destroy(Object.assign(new Error('broken pipe'), { code: 'EPIPE' })));
+				}
+				children.push(child);
+				closed.push(new Promise((resolve) => child.once('close', resolve)));
+				return child;
+			},
+			terminate: async (child) => {
+				terminated.push(child);
+				await terminateChildProcess(child);
+			},
+		});
+		t.after(async () => {
+			await service.stop();
+			await Promise.all(children.filter((child) => child.exitCode === null && child.signalCode === null).map((child) => terminateChildProcess(child)));
+		});
+		const failed = await service.createAgent(profile());
+		const healthy = await service.createAgent(profile({ agentId: 'cursor-healthy' }));
+		const rejected = assert.rejects(failed.decide('x'.repeat(1024 * 1024), { goalRevision: 0 }), (error) => {
+			assert.equal(error.code, 'PROVIDER_UNAVAILABLE');
+			assert.match(error.message, /stdin/);
+			return true;
+		});
+		const decision = await healthy.decide('small healthy input', { goalRevision: 0 });
+		await rejected;
+		await Promise.all(closed);
+		assert.equal(decision.directive, 'replace');
+		assert.equal(service.getAgent(failed.agentId), null);
+		assert.equal(service.getAgent(healthy.agentId), healthy);
+		assert.equal(healthy.sessionMetadata().sessionState, 'warm');
+		assert.deepEqual(terminated, [children[0]]);
+		for (const child of children) {
+			assert.equal(child.stdin.listenerCount('error'), 0);
+			assert.equal(child.listenerCount('error'), 0);
+			assert.equal(child.stdout.listenerCount('data'), 0);
+			assert.equal(child.stderr.listenerCount('data'), 0);
+		}
+	});
+}
+
+for (const failureFirst of [true, false]) {
+	test(`Cursor stdin error and interruption settle once (${failureFirst ? 'error' : 'cancel'} first)`, async () => {
+		const child = new FakeChild();
+		let terminateCount = 0;
+		let finishTermination;
+		const termination = new Promise((resolve) => { finishTermination = resolve; });
+		const service = new CursorProviderService(config(), {
+			spawn: () => child,
+			discoverCatalog: async () => parseCursorModelList(MODELS_OUTPUT),
+			terminate: () => { terminateCount += 1; return termination; },
+		});
+		const agent = await service.createAgent(profile());
+		const turn = agent.decide('state', { goalRevision: 0 });
+		const rejected = assert.rejects(turn, (error) => error.code === (failureFirst ? 'PROVIDER_UNAVAILABLE' : 'PLAN_CANCELLED'));
+		const pipeError = Object.assign(new Error('broken pipe'), { code: 'EPIPE' });
+		if (failureFirst) child.stdin.emit('error', pipeError);
+		const interrupted = agent.interrupt();
+		child.stdin.emit('error', pipeError);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(terminateCount, 1);
+		child.exitCode = 1;
+		child.emit('close', 1, null);
+		await rejected;
+		finishTermination();
+		await interrupted;
+		await agent.interrupt();
+		child.emit('close', 1, null);
+		assert.equal(terminateCount, 1);
+		assert.equal(child.stdin.listenerCount('error'), 0);
+		assert.equal(child.listenerCount('error'), 0);
+		assert.equal(child.stdout.listenerCount('data'), 0);
+		assert.equal(child.stderr.listenerCount('data'), 0);
+		await service.stop();
+	});
+}
+
+test('Cursor synchronous stdin and termination errors reject without leaking late stream errors', async () => {
+	const child = new FakeChild();
+	child.stdin.end = () => { throw new Error('stdin is closed'); };
+	let terminateCount = 0;
+	const service = new CursorProviderService(config(), {
+		spawn: () => child,
+		discoverCatalog: async () => parseCursorModelList(MODELS_OUTPUT),
+		terminate: () => { terminateCount += 1; throw new Error('termination failed'); },
+	});
+	const agent = await service.createAgent(profile());
+	await assert.rejects(agent.decide('state', { goalRevision: 0 }), (error) => error.code === 'PROCESS_TERMINATION_FAILED');
+	assert.equal(service.getAgent(agent.agentId), null);
+	assert.equal(child.stdout.listenerCount('data'), 0);
+	assert.equal(child.stderr.listenerCount('data'), 0);
+	child.stdin.emit('error', new Error('late write failure'));
+	child.emit('error', new Error('late process failure'));
+	await agent.interrupt();
+	assert.equal(terminateCount, 1);
+	child.exitCode = 1;
+	child.emit('close', 1, null);
+	assert.equal(child.stdin.listenerCount('error'), 0);
+	assert.equal(child.listenerCount('error'), 0);
 	await service.stop();
 });

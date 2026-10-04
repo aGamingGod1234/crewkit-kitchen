@@ -95,8 +95,24 @@ function Initialize-PrivateSecret([string] $Path, [string] $Label) {
     $value
 }
 
+# Keep this policy aligned with install-normal-profile-update.ps1. javaw is
+# deliberately conservative because GUI Java processes may hide their command line.
+function Test-UnsafeJavaProcess([string] $Name, [string] $CommandLine) {
+    if ($Name -ieq 'javaw.exe') { return $true }
+    if ($Name -ine 'java.exe') { return $false }
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) { return $true }
+    return $CommandLine -match '(?i)(net\.minecraft\.client\.main\.Main|net\.minecraft\.server\.Main|KnotClient|KnotServer|fabric-server-launch|minecraft_server)'
+}
+
 if (Get-Process -Name MinecraftLauncher,Minecraft -ErrorAction SilentlyContinue) {
     throw 'Close Minecraft and Minecraft Launcher before installing Arena Agents.'
+}
+try { $javaProcesses = @(Get-CimInstance Win32_Process -Filter "Name = 'java.exe' OR Name = 'javaw.exe'" -ErrorAction Stop) }
+catch { throw "Unable to inspect Java process command lines; refusing to install: $($_.Exception.Message)" }
+foreach ($process in $javaProcesses) {
+    if (Test-UnsafeJavaProcess ([string] $process.Name) ([string] $process.CommandLine)) {
+        throw "A Minecraft/Fabric Java process is active (PID $($process.ProcessId)); close it before installing Arena Agents."
+    }
 }
 if ([string]::IsNullOrWhiteSpace($JavaPath)) {
     if (-not [string]::IsNullOrWhiteSpace($env:JAVA_HOME)) {

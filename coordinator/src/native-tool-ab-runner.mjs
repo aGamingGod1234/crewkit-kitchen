@@ -45,7 +45,7 @@ const paired = Object.fromEntries(Object.entries(metrics).map(([name, pick]) => 
 	for (let trial = 1; trial <= repetitions; trial += 1) {
 		const baseline = passed.find((row) => row.variant === 'baseline' && row.trial === trial);
 		const current = passed.find((row) => row.variant === 'current' && row.trial === trial);
-		if (baseline && current) deltas.push(pick(current) - pick(baseline));
+		if (baseline && current && Number.isFinite(pick(current)) && Number.isFinite(pick(baseline))) deltas.push(pick(current) - pick(baseline));
 	}
 	return [name, summarize(deltas)];
 }));

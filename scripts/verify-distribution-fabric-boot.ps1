@@ -1,3 +1,10 @@
+<#
+.SYNOPSIS
+Verifies Fabric boot, Java command handling, coordinator process launch and clean shutdown.
+.DESCRIPTION
+This smoke check does not establish coordinator authentication, fresh status or reconciliation.
+Its child-start marker is emitted before those readiness conditions are satisfied.
+#>
 [CmdletBinding()]
 param(
 	[Parameter(Mandatory)] [string] $PackageRoot,
@@ -204,6 +211,7 @@ try {
 		throw 'Fabric server log contains a fatal mixin or crash marker.'
 	}
 	Write-Host "PASS: exact staged mod set reached Done, answered codex status, started its coordinator, and stopped cleanly ($($packageMods.Name -join ', '))"
+	Write-Host 'Evidence boundary: boot and process launch only; authenticated, fresh, reconciled coordinator readiness was not verified.'
 } catch {
 	$failure = $_
 	$tail = @($lines.ToArray() | Select-Object -Last 160) -join "`n"

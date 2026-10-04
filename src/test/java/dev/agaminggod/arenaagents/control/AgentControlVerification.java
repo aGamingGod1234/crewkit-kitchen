@@ -22,6 +22,7 @@ public final class AgentControlVerification {
 	public static int verify() {
 		int assertions = 0;
 		assertions += verifySnapshotRoundTripAndBounds();
+		assertions += verifyAggregateCapacity();
 		assertions += verifyProviderPresets();
 		assertions += verifyRuntimeCatalogBecomesAuthoritative();
 		assertions += verifyCommandConstruction();
@@ -57,10 +58,14 @@ public final class AgentControlVerification {
 		assertTrue(outboundPayload.snapshot() == snapshot, "trusted outbound snapshots skip a JSON parse");
 		AgentControlSnapshotPayload inboundPayload = new AgentControlSnapshotPayload(outboundPayload.encodedSnapshot());
 		assertTrue(inboundPayload.snapshot() == inboundPayload.snapshot(), "validated inbound snapshots are parsed once");
-		expectFailure(
-				() -> AgentControlSnapshotCodec.decode("🙂".repeat(AgentControlSnapshotCodec.MAX_ENCODED_BYTES / 2)),
-				"snapshot wire limit counts UTF-8 bytes"
-		);
+		// Valid multibyte JSON on both sides: only the final whitespace byte differs.
+		String valid = outboundPayload.encodedSnapshot();
+		String multibyte = valid.substring(0, valid.length() - 1) + ",\"padding\":\"" + "\u00e9".repeat(100) + "\"}";
+		String atLimit = multibyte + " ".repeat(AgentControlSnapshotCodec.MAX_ENCODED_BYTES
+				- multibyte.getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
+		assertEquals(snapshot, AgentControlSnapshotCodec.decode(atLimit), "exact UTF-8 byte boundary accepts valid JSON");
+		assertTrue(atLimit.length() < AgentControlSnapshotCodec.MAX_ENCODED_BYTES, "byte and character lengths differ");
+		expectFailure(() -> AgentControlSnapshotCodec.decode(atLimit + " "), "otherwise-valid JSON exceeds byte limit");
 		AgentControlAgent agent = decoded.agents().getFirst();
 
 		assertEquals(snapshot, decoded, "snapshot JSON round trip");
@@ -115,7 +120,39 @@ public final class AgentControlVerification {
 				() -> new AgentControlSnapshot(true, NOW_EPOCH_MS, java.util.Collections.nCopies(17, agent)),
 				"snapshot agent bound"
 		);
-		return 23;
+		return 25;
+	}
+
+	private static int verifyAggregateCapacity() {
+		var agents = new java.util.ArrayList<AgentControlAgent>();
+		for (int i = 0; i < 16; i++) {
+			String id = new UUID(0, i + 1).toString();
+			agents.add(new AgentControlAgent(id, id.substring(0, 8), "<".repeat(160), "<".repeat(32),
+					"<".repeat(64), "<".repeat(128), "<".repeat(64), "<".repeat(16), 0,
+					"<".repeat(32), "<".repeat(512), 32, "<".repeat(512), "<".repeat(256), true, true));
+		}
+		var groups = new java.util.ArrayList<AgentControlGroup>();
+		for (int i = 0; i < 32; i++) groups.add(new AgentControlGroup("<".repeat(30) + String.format("%02d", i),
+				agents.stream().map(AgentControlAgent::agentId).toList()));
+		var efforts = java.util.stream.IntStream.range(0, 12).mapToObj(i -> "<".repeat(30) + String.format("%02d", i)).toList();
+		var tiers = java.util.stream.IntStream.range(0, 8).mapToObj(i -> "<".repeat(22) + String.format("%02d", i)).toList();
+		var option = new AgentControlModelOption("cursor", "<".repeat(128), "<".repeat(96), efforts, tiers);
+		var saturated = new AgentControlSnapshot(AgentControlSnapshot.SCHEMA_VERSION, true, true, "<".repeat(160),
+				Long.MAX_VALUE, agents, groups, java.util.Collections.nCopies(128, option));
+		String encoded = AgentControlSnapshotCodec.encode(saturated);
+		assertEquals(saturated, AgentControlSnapshotCodec.decode(encoded), "maximum aggregate keeps every field and identity");
+		assertTrue(encoded.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 32767,
+				"aggregate regression exceeds the original cap");
+		assertTrue(AgentControlSnapshotCodec.MAX_ENCODED_BYTES + 256 < 1_048_576,
+				"aggregate bound plus packet framing stays within clientbound transport budget");
+		var buffer = new net.minecraft.network.RegistryFriendlyByteBuf(io.netty.buffer.Unpooled.buffer(),
+				net.minecraft.core.RegistryAccess.EMPTY);
+		try {
+			AgentControlSnapshotPayload.CODEC.encode(buffer, AgentControlSnapshotPayload.fromSnapshot(saturated));
+			assertEquals(saturated, AgentControlSnapshotPayload.CODEC.decode(buffer).snapshot(),
+					"maximum aggregate round trips through the actual packet string codec");
+		} finally { buffer.release(); }
+		return 4;
 	}
 
 	private static int verifyProviderPresets() {

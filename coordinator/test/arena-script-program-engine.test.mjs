@@ -30,6 +30,84 @@ function engineFor(source, callbacks = {}) {
 	return { engine, dispatched, cancelled, modelRequests };
 }
 
+test('initial terminal slices with watchers process finish and checkpoint without evaluating inactive guards', () => {
+	for (const [method, status] of [['finish', 'FINISHED'], ['checkpoint', 'PAUSED']]) {
+		const run = engineFor(`program.onUnhandledAttention("continue_and_notify"); program.watch(() => false,{mode:"boundary"},async () => {await player.wait(9);}); program.${method}("done");`);
+		assert.equal(run.engine.snapshot().status, status);
+		assert.equal(run.dispatched.length, 0);
+	}
+});
+
+test('completion correction preserves identity across fresh facts under pause policy', () => {
+	const run = engineFor('program.onUnhandledAttention("pause_and_notify"); program.finish("done");');
+	run.engine.requestCorrection({actionFailure: {state:'FAILED',reasonCode:'MISSING'}});
+	run.engine.ingestObservation({observation: observation({player:{health:19}}),eventSequence:2});
+	const request = run.engine.refreshDirectiveRequest();
+	assert.equal(request.decisionContext, 'completion_verification_failed');
+	run.engine.applyDirective({...request,directive:'continue'});
+	assert.equal(run.engine.snapshot().status, 'FINISHED');
+});
+
+test('all installed and newly true reconsider guards run before a held ordinary command', () => {
+	for (const initialHealth of [17, 4]) {
+		const run = engineFor(`program.onUnhandledAttention("continue_and_notify");
+		program.watch(() => player.state().health < 19,{mode:"interrupt",after:"reconsider"},async () => {await player.wait(9);});
+		program.watch(() => player.state().health < 5,{mode:"interrupt",after:"reconsider"},async () => {await player.wait(99);}); await player.wait(1000);`, {initialObservation:observation({player:{health:initialHealth}})});
+		run.engine.ingestActionResult({actionId:run.dispatched[0].actionId,state:'SUCCEEDED',reasonCode:'DONE',eventSequence:1});
+		run.engine.ingestObservation({observation:observation({player:{health:4}}),eventSequence:2});
+		run.engine.applyDirective({...run.engine.refreshDirectiveRequest(),directive:'continue'});
+		assert.deepEqual(run.dispatched.map(command => command.action.arguments),[9,99]);
+		run.engine.ingestActionResult({actionId:run.dispatched[1].actionId,state:'SUCCEEDED',reasonCode:'DONE',eventSequence:2});
+		run.engine.applyDirective({...run.engine.refreshDirectiveRequest(),directive:'continue'});
+		assert.deepEqual(run.dispatched.map(command => command.action.arguments),[9,99,1000]);
+		run.engine.ingestObservation({observation:observation({player:{health:4}}),eventSequence:3});
+		assert.equal(run.cancelled.length,0);
+	}
+});
+
+test('quiet identical publications preserve decisions while changed facts and urgent attention fence them', () => {
+	for (const change of ['quiet','facts','urgent']) {
+		const run = engineFor('program.onUnhandledAttention("continue_and_notify");');
+		const request = run.modelRequests[0];
+		run.engine.ingestObservation({observation:observation(),eventSequence:2});
+		run.engine.ingestObservation({observation:change === 'facts' ? observation({player:{health:19}}) : observation(),eventSequence:3,attention:change === 'urgent',priority:'urgent',trigger:'damage'});
+		assert.equal(run.engine.isCurrentDirectiveRequest(request),change === 'quiet');
+		run.engine.applyDirective({...request,directive:'replace',install:{programId:'next',version:2,compiled:parseArenaScript('program.onUnhandledAttention("continue_and_notify"); await player.wait(7);')}});
+		assert.equal(run.dispatched.length,change === 'quiet' ? 1 : 0);
+		if (change === 'quiet') assert.equal(run.dispatched[0].provenance.eventSequence,3);
+	}
+});
+
+test('receipt sample time does not stale planning but remains visible to guards and worldTick stays material', () => {
+	const source = 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);';
+	const run = engineFor(source,{initialObservation:observation({observedAtEpochMs:10,worldTick:1})});
+	run.engine.notifyAttention();
+	const request = run.modelRequests[0];
+	run.engine.ingestObservation({observation:observation({observedAtEpochMs:20,worldTick:1}),eventSequence:2});
+	assert.equal(run.engine.isCurrentDirectiveRequest(request),true);
+	run.engine.ingestObservation({observation:observation({observedAtEpochMs:30,worldTick:2}),eventSequence:3});
+	assert.equal(run.engine.isCurrentDirectiveRequest(request),false);
+	const guarded = engineFor('program.onUnhandledAttention("continue_and_notify"); program.watch(() => world.state().observedAtEpochMs > 10,{mode:"interrupt"},async () => {await player.wait(9);}); await player.wait(1000);', {initialObservation:observation({observedAtEpochMs:10})});
+	guarded.engine.ingestObservation({observation:observation({observedAtEpochMs:20}),eventSequence:2});
+	assert.equal(guarded.cancelled.length,1,'authored sample-time predicates still receive the new facts');
+	guarded.engine.ingestActionResult({actionId:guarded.dispatched[0].actionId,state:'CANCELLED',reasonCode:'CANCELLED',eventSequence:2});
+	assert.deepEqual(guarded.dispatched.map(command => command.action.arguments),[1000,9]);
+});
+
+test('a receipt-only watcher edge fences a pending replacement before cancellation acknowledgement', () => {
+	for (const mode of ['interrupt','boundary']) {
+		const run = engineFor(`program.onUnhandledAttention("continue_and_notify"); program.watch(() => world.state().observedAtEpochMs > 10,{mode:"${mode}",after:"reconsider"},async () => {await player.wait(9);}); await player.wait(1000);`, {initialObservation:observation({observedAtEpochMs:10})});
+		run.engine.notifyAttention({priority:'ordinary'});
+		const request = run.modelRequests[0];
+		run.engine.ingestObservation({observation:observation({observedAtEpochMs:20}),eventSequence:2});
+		assert.equal(run.engine.isCurrentDirectiveRequest(request),false);
+		run.engine.applyDirective({...request,directive:'replace',install:{programId:'next',version:2,compiled:parseArenaScript('program.onUnhandledAttention("continue_and_notify"); await player.wait(7);')}});
+		run.engine.ingestActionResult({actionId:run.dispatched[0].actionId,state:mode === 'interrupt' ? 'CANCELLED' : 'SUCCEEDED',reasonCode:'DONE',eventSequence:2});
+		assert.deepEqual(run.dispatched.map(command => command.action.arguments),[1000,9]);
+		assert.equal(run.engine.snapshot().programId,'program-a');
+	}
+});
+
 test('an already true reconsider interrupt guard runs its authored defense before ordinary work is dispatched', () => {
 	const run = engineFor(`program.onUnhandledAttention("continue_and_notify");
 	program.watch(() => player.state().health < 19, {mode:"interrupt", after:"reconsider"}, async () => {
@@ -946,10 +1024,59 @@ test('identical same-version facts refresh preserves the selected-model turn and
 	engine.ingestObservation({ observation: observation(), eventSequence: 2, attention: true });
 	engine.install({ agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'program-a', version: 1, compiled, observation: observation(), eventSequence: 3 });
 	engine.applyDirective({ directive: 'continue', ...requests[0] });
-	assert.equal(requests.length, 2);
-	assert.equal(requests[1].factsSequence, 3);
+	assert.equal(requests.length, 1);
+	assert.equal(engine.snapshot().factsSequence, 3);
 	engine.install({ agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'program-a', version: 1, compiled, observation: observation(), eventSequence: 2 });
-	assert.equal(requests.length, 2);
+	assert.equal(requests.length, 1);
+	assert.equal(engine.snapshot().factsSequence, 3);
+});
+
+test('same-version refresh retains a quiet replacement but fences material changes and receipt-driven guards', () => {
+	for (const change of ['quiet', 'sample-time', 'health', 'world-tick', 'watcher']) {
+		const compiled = parseArenaScript(`program.onUnhandledAttention("continue_and_notify");
+			${change === 'watcher' ? 'program.watch(() => world.state().observedAtEpochMs > 10, {mode:"boundary"}, async () => {await player.wait(9);});' : ''}`);
+		const requests = [], dispatched = [];
+		const engine = new ArenaScriptEngine({ dispatch: command => dispatched.push(command), cancel() {}, requestModel: request => requests.push(request) });
+		const identity = { agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'program-a', version: 1, compiled };
+		const initial = observation({ observedAtEpochMs: 10, worldTick: 1 });
+		engine.install({ ...identity, observation: initial, eventSequence: 1 });
+		const request = requests[0];
+		engine.install({ ...identity, observation: initial, eventSequence: 2 });
+		engine.install({ ...identity, eventSequence: 3, observation: observation({
+			observedAtEpochMs: change === 'quiet' ? 10 : 20,
+			worldTick: change === 'world-tick' ? 2 : 1,
+			...(change === 'health' ? { player: { x: 0, y: 64, z: 0, health: 19 } } : {}),
+		}) });
+		const quiet = ['quiet', 'sample-time'].includes(change);
+		assert.equal(engine.isCurrentDirectiveRequest(request), quiet, change);
+		engine.applyDirective({ ...request, directive: 'replace', install: {
+			programId: 'next', version: 2,
+			compiled: parseArenaScript('program.onUnhandledAttention("continue_and_notify"); await player.wait(7);'),
+		} });
+		assert.equal(dispatched.some(command => command.action.arguments === 7), quiet, change);
+		if (quiet) {
+			assert.equal(requests.length, 1);
+			assert.equal(dispatched[0].provenance.eventSequence, 3);
+		}
+		if (change === 'watcher') assert.deepEqual(dispatched.map(command => command.action.arguments), [9]);
+	}
+});
+
+test('same-version refresh releases an action receipt barrier while fencing its older model request', () => {
+	const compiled = parseArenaScript('program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2);');
+	const dispatched = [], requests = [];
+	const engine = new ArenaScriptEngine({ dispatch: command => dispatched.push(command), cancel() {}, requestModel: request => requests.push(request) });
+	const identity = { agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'program-a', version: 1, compiled };
+	engine.install({ ...identity, observation: observation(), eventSequence: 1 });
+	engine.notifyAttention();
+	const request = requests[0];
+	engine.ingestActionResult({ actionId: dispatched[0].actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 3 });
+	engine.install({ ...identity, observation: observation(), eventSequence: 2 });
+	assert.equal(dispatched.length, 1, 'refresh before the receipt barrier cannot resume');
+	engine.install({ ...identity, observation: observation(), eventSequence: 3 });
+	assert.deepEqual(dispatched.map(command => command.action.arguments), [1, 2]);
+	assert.equal(dispatched[1].provenance.eventSequence, 3);
+	assert.equal(engine.isCurrentDirectiveRequest(request), false);
 });
 
 test('an exact interrupt cancellation acknowledgement may arrive after a newer observation', () => {
@@ -1010,4 +1137,86 @@ test('an exact failed request promotes only its newer coalesced attention', () =
 	assert.equal(modelRequests[1].eventSequence, 3);
 	engine.failDirectiveRequest(modelRequests[0]);
 	assert.equal(modelRequests.length, 2);
+});
+
+test('same-version refresh fences timed, damage, and death watcher decisions before cancellation callbacks', () => {
+	for (const mode of ['interrupt', 'boundary']) {
+		for (const [name, predicate, changed] of [
+			['time', 'world.state().observedAtEpochMs > 10', observation({ observedAtEpochMs: 20 })],
+			['damage', 'player.state().health < 20', observation({ observedAtEpochMs: 10, player: { x: 0, y: 64, z: 0, health: 19 } })],
+			['death', 'player.state().health <= 0', observation({ observedAtEpochMs: 10, player: { x: 0, y: 64, z: 0, health: 0 } })],
+		]) {
+			const compiled = parseArenaScript(`program.onUnhandledAttention("continue_and_notify");
+				program.watch(() => ${predicate}, {mode:"${mode}", after:"reconsider"}, async () => {await player.wait(9);});
+				await player.wait(1000); await player.wait(2);`);
+			const requests = [], dispatched = [], cancelled = [];
+			let pending;
+			const engine = new ArenaScriptEngine({
+				dispatch: command => dispatched.push(command), requestModel: request => requests.push(request),
+				cancel: actionId => {
+					cancelled.push(actionId);
+					assert.equal(engine.isCurrentDirectiveRequest(pending), false, `${name}: fenced before cancel callback`);
+					engine.applyDirective({ ...pending, directive: 'replace', install: {
+						programId: 'stale', version: 2, compiled: parseArenaScript('program.onUnhandledAttention("continue_and_notify"); await player.wait(7);'),
+					} });
+				},
+			});
+			const identity = { agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'program-a', version: 1, compiled };
+			engine.install({ ...identity, observation: observation({ observedAtEpochMs: 10 }), eventSequence: 1 });
+			engine.notifyAttention({ priority: 'ordinary' });
+			pending = requests[0];
+			engine.install({ ...identity, observation: changed, eventSequence: 2 });
+			assert.equal(engine.isCurrentDirectiveRequest(pending), false, `${mode}/${name}`);
+			assert.deepEqual(cancelled, mode === 'interrupt' ? [dispatched[0].actionId] : []);
+			// Another identical publication cannot undo the already-established fence.
+			engine.install({ ...identity, observation: changed, eventSequence: 3 });
+			engine.applyDirective({ ...pending, directive: 'finish' });
+			assert.equal(engine.snapshot().programId, 'program-a');
+			engine.ingestActionResult({ actionId: dispatched[0].actionId, state: mode === 'interrupt' ? 'CANCELLED' : 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 2 });
+			assert.deepEqual(dispatched.map(command => command.action.arguments), [1000, 9], `${mode}/${name}: authored handler wins`);
+		}
+	}
+});
+
+test('same-version refresh cannot revive a request across trusted cancellation or replacement', () => {
+	for (const operation of ['suspend', 'dispose', 'replace']) {
+		const compiled = parseArenaScript('program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2);');
+		const requests = [], dispatched = [], cancelled = [];
+		const engine = new ArenaScriptEngine({ dispatch: command => dispatched.push(command), cancel: actionId => cancelled.push(actionId), requestModel: request => requests.push(request) });
+		const identity = { agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'program-a', version: 1, compiled };
+		engine.install({ ...identity, observation: observation(), eventSequence: 1 });
+		engine.notifyAttention({ priority: 'ordinary' });
+		const request = requests[0];
+		if (operation === 'replace') engine.install({ ...identity, programId: 'trusted', version: 2, compiled: parseArenaScript('program.onUnhandledAttention("continue_and_notify"); await player.wait(9);'), observation: observation(), eventSequence: 2 });
+		else if (operation === 'dispose') engine.dispose();
+		else engine.suspend('operator');
+		engine.install({ ...identity, observation: observation(), eventSequence: 3 });
+		assert.equal(engine.isCurrentDirectiveRequest(request), false, operation);
+		engine.applyDirective({ ...request, directive: 'continue' });
+		assert.deepEqual(cancelled, [dispatched[0].actionId]);
+		engine.ingestActionResult({ actionId: dispatched[0].actionId, state: 'CANCELLED', reasonCode: 'STOPPED', eventSequence: 3 });
+		assert.deepEqual(dispatched.map(command => command.action.arguments), operation === 'replace' ? [1, 9] : [1], operation);
+		assert.equal(engine.snapshot().status, operation === 'replace' ? 'ACTIVE' : operation === 'dispose' ? 'IDLE' : 'SUSPENDED');
+	}
+});
+
+test('same-version receipt release fences a post-result decision even without a successor dispatch', () => {
+	const compiled = parseArenaScript('program.onUnhandledAttention("continue_and_notify"); await player.wait(1); program.checkpoint("hold");');
+	const requests = [], dispatched = [];
+	const engine = new ArenaScriptEngine({ dispatch: command => dispatched.push(command), cancel() {}, requestModel: request => requests.push(request) });
+	const identity = { agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'program-a', version: 1, compiled };
+	engine.install({ ...identity, observation: observation(), eventSequence: 1 });
+	engine.notifyAttention({ priority: 'ordinary' });
+	engine.ingestActionResult({ actionId: dispatched[0].actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 3 });
+	const postResultRequest = engine.refreshDirectiveRequest();
+	assert.equal(postResultRequest.eventSequence, 3);
+	assert.equal(postResultRequest.factsSequence, 1);
+	assert.equal(engine.isCurrentDirectiveRequest(postResultRequest), true);
+	engine.install({ ...identity, observation: observation(), eventSequence: 3 });
+	assert.equal(engine.snapshot().status, 'PAUSED');
+	assert.equal(dispatched.length, 1);
+	assert.equal(engine.isCurrentDirectiveRequest(postResultRequest), false);
+	engine.applyDirective({ ...postResultRequest, directive: 'finish' });
+	assert.equal(engine.snapshot().status, 'PAUSED', 'a pre-barrier decision cannot finish the checkpoint');
+	assert.equal(requests.at(-1).factsSequence, 3);
 });

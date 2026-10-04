@@ -24,6 +24,11 @@ const MAX_PROGRAM_SOURCE_BYTES = 65_536;
 const MAX_PROGRAM_PRECONDITION_BYTES = 4_096;
 const MAX_SEQUENCE_FINISH_BYTES = 4_096;
 const NATIVE_ACTION_TYPES = Object.freeze(Object.keys(ACTION_FIELDS));
+const POST_ACTION_VIEW_TOOLS = new Set(['moveTo', 'mine', 'act', 'sequence']);
+const OBSERVATION_VIEW_PROPERTIES = {
+	view: { type: 'string', enum: ['full', 'changes'] },
+	afterObservationId: { type: 'string', minLength: 1, maxLength: 128 },
+};
 export const INSPECTION_SECTIONS = Object.freeze(['observation', 'inventory', 'menu', 'entities', 'blocks', 'landmarks', 'nearby_containers', 'item', 'block', 'events', 'recipes', 'mechanics']);
 
 export function minecraftCapabilities({ section = 'all', topic, offset } = {}) {
@@ -114,6 +119,7 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 		timeoutMs: integerSchema(1, 120_000),
 	}, ['x', 'y', 'z'])),
 	tool('exploreFrontier', 'List factual observed or unknown adjacent-space candidates. This tool never chooses or executes a destination; choose explicitly with moveTo.', objectSchema({
+		kind: { type: 'string', enum: ['all', 'observed_block', 'unknown_cell'] },
 		radius: integerSchema(8, 32),
 		limit: integerSchema(1, 64),
 		blockId: { type: 'string', minLength: 1, maxLength: MAX_IDENTIFIER_LENGTH },
@@ -152,6 +158,19 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 ]);
 
 export function normalizeMinecraftToolCall(name, value) {
+	if (POST_ACTION_VIEW_TOOLS.has(name)) {
+		const { view, afterObservationId, ...action } = requireObject(value);
+		// Presentation options belong to the tool call, never the body command.
+		const { kind: _kind, ...presentation } = normalizeMinecraftToolCall('observe', {
+			...(view === undefined ? {} : { view }),
+			...(afterObservationId === undefined ? {} : { afterObservationId }),
+		});
+		return { ...normalizeMinecraftToolArguments(name, action), ...presentation };
+	}
+	return normalizeMinecraftToolArguments(name, value);
+}
+
+function normalizeMinecraftToolArguments(name, value) {
 	const args = requireObject(value);
 	switch (name) {
 		case 'taskPlan':
@@ -211,7 +230,7 @@ export function normalizeMinecraftToolCall(name, value) {
 			return { ...action, kind: 'replace_action', actionId: boundedText(args.actionId, 'actionId', 128), goalRevision: integer(args.goalRevision, 'goalRevision', 0, Number.MAX_SAFE_INTEGER) };
 		}
 		case 'startAction': {
-			const action = normalizeMinecraftToolCall('act', args);
+			const action = normalizeMinecraftToolArguments('act', args);
 			return { ...action, kind: 'start_action' };
 		}
 		case 'taskMemory': {
@@ -294,10 +313,12 @@ export function normalizeMinecraftToolCall(name, value) {
 				},
 			};
 		case 'exploreFrontier': {
-			requireExactKeys(args, ['radius', 'limit', 'blockId']);
+			requireExactKeys(args, ['radius', 'limit', 'blockId', 'kind']);
+			if (args.kind !== undefined && !['all', 'observed_block', 'unknown_cell'].includes(args.kind)) invalid('Unknown frontier candidate kind');
 			return {
 				kind: 'explore_frontier',
 				arguments: {
+					...(args.kind === undefined ? {} : { kind: args.kind }),
 					radius: optionalInteger(args.radius, 24, 'radius', 8, 32),
 					limit: optionalInteger(args.limit, 32, 'limit', 1, 64),
 					...(args.blockId === undefined ? {} : { blockId: boundedText(args.blockId, 'blockId', MAX_IDENTIFIER_LENGTH) }),
@@ -394,7 +415,7 @@ function normalizeSequenceAction(value) {
 	const action = requireObject(value);
 	requireExactKeys(action, ['actionType', 'arguments']);
 	if (action.actionType === 'navigate_to') {
-		const normalized = normalizeMinecraftToolCall('moveTo', action.arguments);
+		const normalized = normalizeMinecraftToolArguments('moveTo', action.arguments);
 		return { actionType: normalized.actionType, arguments: normalized.arguments };
 	}
 	const normalized = normalizeMinecraftToolCall('act', action);
@@ -404,18 +425,20 @@ function normalizeSequenceAction(value) {
 export function toolResultContent(value, success = true) {
 	let text = JSON.stringify(value ?? null);
 	if (Buffer.byteLength(text, 'utf8') > MAX_TOOL_RESULT_BYTES) {
+		// Keep fallback order stable, but construct only candidates actually needed.
 		const candidates = [
-			...(value?.postAction?.observation === undefined || isSequenceResult(value) ? [] : [compactActionFeedback(value)]),
-			...(Array.isArray(value?.entries) ? [compactInspectionResult(value)] : []),
-			...(isSequenceResult(value) ? [compactSequenceResult(value)] : []),
-			...(Array.isArray(value?.receipts) && typeof value?.programId === 'string' ? [compactProgramResult(value)] : []),
-			compactToolResult(value),
-			{ state: 'TRUNCATED', ...resultMetadata(value), ...survivalFacts(value, 8), detail: 'Details exceeded the result limit. Use inspect for focused pages.' },
-			{ state: 'TRUNCATED', ...resultMetadata(value), ...survivalFacts(value, 2), detail: 'Details exceeded the result limit. Use inspect for focused pages.' },
-			{ state: 'TRUNCATED', detail: 'Tool result exceeded the coordinator limit. Use inspect for focused facts; omitted data is unknown.' },
+			...(value?.postAction?.observation === undefined || isSequenceResult(value) ? [] : [() => compactActionFeedback(value)]),
+			...(Array.isArray(value?.entries) ? [() => compactInspectionResult(value), () => compactInspectionResult(value, true)] : []),
+			...(value?.section === 'item' && ['pages', 'tooltipPage'].some((key) => Array.isArray(value[key]?.entries)) ? [() => compactItemInspection(value)] : []),
+			...(isSequenceResult(value) ? [() => compactSequenceResult(value)] : []),
+			...(Array.isArray(value?.receipts) && typeof value?.programId === 'string' ? [() => compactProgramResult(value)] : []),
+			() => compactToolResult(value),
+			() => ({ state: 'TRUNCATED', ...resultMetadata(value), ...survivalFacts(value, 8), detail: 'Details exceeded the result limit. Use inspect for focused pages.' }),
+			() => ({ state: 'TRUNCATED', ...resultMetadata(value), ...survivalFacts(value, 2), detail: 'Details exceeded the result limit. Use inspect for focused pages.' }),
+			() => ({ state: 'TRUNCATED', detail: 'Tool result exceeded the coordinator limit. Use inspect for focused facts; omitted data is unknown.' }),
 		];
 		for (const candidate of candidates) {
-			text = JSON.stringify(candidate);
+			text = JSON.stringify(candidate());
 			if (Buffer.byteLength(text, 'utf8') <= MAX_TOOL_RESULT_BYTES) break;
 		}
 	}
@@ -546,25 +569,63 @@ function compactInteraction(interaction) {
 	return { ...interaction, ...(menu == null ? {} : { menu: { ...menu, ...(Array.isArray(menu.slots) ? { slots: menu.slots.slice(0, 8), resultCoverage: { retained: Math.min(menu.slots.length, 8), availableInSnapshot: menu.slots.length } } : {}) } }) };
 }
 
-function compactInspectionResult(value) {
-	const result = { ...value, entries: [], truncated: true, detail: 'Inspection entries exceeded the result limit; continue at nextOffset.', coverage: { ...value.coverage, resultTruncated: true } };
-	for (const entry of value.entries) {
+function compactInspectionResult(value, trimMetadata = false) {
+	const result = { ...(trimMetadata ? compactInspectionMetadata(value) : value), entries: [], truncated: true, detail: 'Inspection entries exceeded the result limit; continue at nextOffset.', coverage: { ...value.coverage, resultTruncated: true } };
+	for (let entry of value.entries) {
 		const candidate = { ...result, entries: [...result.entries, entry] };
-		if (Buffer.byteLength(JSON.stringify(candidate), 'utf8') > MAX_TOOL_RESULT_BYTES - 128) break;
+		if (Buffer.byteLength(JSON.stringify(candidate), 'utf8') > MAX_TOOL_RESULT_BYTES - 128) {
+			// Preserve whole rows when they can fit on the next page. An individually
+			// oversized receipt still needs a factual identity and a way past it.
+			if (result.entries.length > 0 || entry?.kind !== 'receipt') break;
+			entry = compactMemoryReceipt(entry);
+			if (Buffer.byteLength(JSON.stringify({ ...result, entries: [entry] }), 'utf8') > MAX_TOOL_RESULT_BYTES - 128) break;
+			result.coverage.complete = false;
+		}
 		result.entries.push(entry);
 	}
 	const offset = Number.isSafeInteger(value.offset) ? value.offset : Number.isSafeInteger(value.coverage?.offset) ? value.coverage.offset : 0;
-	result.nextOffset = offset + result.entries.length;
+	const removedEntries = result.entries.length < value.entries.length;
+	// Server pages can deliberately contain no rows while advancing over one
+	// explicitly omitted entry. Preserve that coverage rather than restarting it.
+	result.nextOffset = removedEntries ? offset + result.entries.length : Object.hasOwn(value, 'nextOffset') ? value.nextOffset : value.coverage?.nextOffset;
 	result.coverage.returned = result.entries.length;
 	result.coverage.nextOffset = result.nextOffset;
-	result.coverage.complete = false;
-	if (result.entries.length === 0) {
+	if (removedEntries) {
+		result.coverage.complete = false;
+		if (Object.hasOwn(result.coverage, 'hasMore')) result.coverage.hasMore = true;
+	}
+	if (value.entries.length === 0) result.detail = 'Inspection metadata exceeded the result limit. Entry coverage and continuation are preserved; omitted content remains unknown.';
+	if (removedEntries && result.entries.length === 0) {
 		result.reasonCode = 'ENTRY_EXCEEDS_RESULT_LIMIT';
 		result.detail = 'One inspection entry exceeds the result limit. Its contents remain unknown.';
 		result.nextOffset = null;
 		result.coverage.nextOffset = null;
 	}
 	return result;
+}
+
+function compactMemoryReceipt(entry) {
+	const fields = ['kind', 'source', 'worldId', 'actionId', 'actionType', 'state', 'reasonCode', 'dimension', 'goalRevision', 'tick', 'revision', 'executionStarted', 'physicalAttempted'];
+	const summary = Object.fromEntries(fields.filter((key) => entry[key] !== undefined).map((key) => [key, entry[key]]));
+	return { ...summary, truncated: true, omittedFields: Object.keys(entry).filter((key) => !fields.includes(key)), detail: 'Historical receipt summary; omitted arguments and evidence remain unknown.' };
+}
+
+function compactInspectionMetadata(value) {
+	const result = { ...resultMetadata(value), ...Object.fromEntries(['section', 'worldId', 'dimension', 'gameTime', 'offset', 'total', 'nextOffset'].filter((key) => value[key] !== undefined).map((key) => [key, value[key]])) };
+	for (const key of ['item', 'menu']) if (value[key] && typeof value[key] === 'object') {
+		// Keep concrete slot/menu identity for the follow-up query, not bulky details.
+		result[key] = Object.fromEntries(Object.entries(value[key]).filter(([, field]) => typeof field === 'number' || typeof field === 'boolean' || typeof field === 'string' && field.length <= 256));
+	}
+	const omittedFields = Object.keys(value).filter((key) => !Object.hasOwn(result, key) && !['entries', 'coverage', 'pages', 'tooltipPage'].includes(key));
+	return { ...result, ...(omittedFields.length === 0 ? {} : { omittedFields }) };
+}
+
+function compactItemInspection(value) {
+	return {
+		...compactInspectionMetadata(value), truncated: true,
+		detail: 'Item details exceeded the result limit. Paged coverage and continuation are preserved; omitted content remains unknown.',
+		...Object.fromEntries(['pages', 'tooltipPage'].filter((key) => Array.isArray(value[key]?.entries)).map((key) => [key, value[key]])),
+	};
 }
 
 function asToolArray(value) {
@@ -589,6 +650,8 @@ function compactRecovery(recovery, maxStacks = 16) {
 		...(recovery.lastDeath === undefined ? {} : { lastDeath: recovery.lastDeath }),
 		...(Array.isArray(recovery.lastLostInventory) ? { lastLostInventory: recovery.lastLostInventory.slice(0, lostCap) } : {}),
 		...(Array.isArray(recovery.alreadyHave) ? { alreadyHave: recovery.alreadyHave.slice(-haveCap) } : {}),
+		...(Array.isArray(recovery.alreadyHaveFacts) ? { alreadyHaveFacts: recovery.alreadyHaveFacts.slice(-haveCap) } : {}),
+		...(Array.isArray(recovery.alreadyHaveFacts) && recovery.alreadyHaveFacts.length > haveCap ? { omittedAlreadyHaveFacts: recovery.alreadyHaveFacts.length - haveCap } : {}),
 		...(typeof recovery.facts === 'string' ? { facts: recovery.facts.slice(0, maxStacks <= 2 ? 160 : 512) } : {}),
 	};
 }
@@ -702,6 +765,10 @@ function boundedResultField(value, maximum) { return String(value ?? '').slice(0
 function safeResultInteger(value) { return Number.isSafeInteger(value) ? value : null; }
 
 function tool(name, description, inputSchema) {
+	if (POST_ACTION_VIEW_TOOLS.has(name)) {
+		inputSchema = { ...inputSchema, properties: { ...inputSchema.properties, ...OBSERVATION_VIEW_PROPERTIES } };
+		description += ' When postAction is available, it defaults to full facts with postAction.observationView.id. Optional view:"changes" and afterObservationId use that exact delivered observation baseline; unknown baselines return full. Receipt and history fields keep their existing coverage and omission markers. Use view:"full" if unsure.';
+	}
 	return Object.freeze({ type: 'function', name, description, inputSchema: Object.freeze(inputSchema) });
 }
 

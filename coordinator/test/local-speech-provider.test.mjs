@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
+import childProcess from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
@@ -8,6 +10,37 @@ import test from 'node:test';
 import { builtInVoiceProfiles } from '../src/voice/voice-profile-store.mjs';
 
 const execFileAsync = promisify(execFile);
+
+// Observe the real fixture's blocked-state boundary in each spawned generation.
+// This stays in the test harness; production RPC need not expose test diagnostics.
+function observeBlockedWorkers(context) {
+	const originalSpawn = childProcess.spawn;
+	const generations = [];
+	const mocked = context.mock.method(childProcess, 'spawn', (...args) => {
+		const child = originalSpawn(...args);
+		let acknowledge, fail, stderr = '';
+		const blocked = new Promise((resolve, reject) => { acknowledge = resolve; fail = reject; });
+		blocked.catch(() => {});
+		child.stderr.on('data', chunk => {
+			stderr += chunk.toString();
+			if (stderr.includes('ARENA_FIXTURE_INFERENCE_BLOCKED')) acknowledge();
+		});
+		child.once('close', () => fail(new Error('Fixture exited before acknowledging blocked inference')));
+		generations.push(blocked);
+		return child;
+	});
+	syncBuiltinESMExports();
+	context.after(() => { mocked.mock.restore(); syncBuiltinESMExports(); });
+	return async (generation) => {
+		assert.ok(generations[generation - 1], `worker generation ${generation} was spawned`);
+		let timer;
+		try {
+			await Promise.race([generations[generation - 1], new Promise((_, reject) => {
+				timer = setTimeout(() => reject(new Error('Fixture did not acknowledge blocked inference')), 2500);
+			})]);
+		} finally { clearTimeout(timer); }
+	};
+}
 
 test('local speech RPC responses use the original stdout outside global redirects', async () => {
 	const source = await readFile(fileURLToPath(new URL('../src/voice/local-speech-worker.py', import.meta.url)), 'utf8');
@@ -125,7 +158,8 @@ test('local speech provider rejects malformed worker audio instead of forwarding
 	}
 });
 
-test('aborting inference restarts the serial worker so replacement speech is not delayed', async () => {
+test('aborting inference restarts the serial worker so replacement speech is not delayed', async (context) => {
+	const blockedAt = observeBlockedWorkers(context);
 	const { LocalSpeechProvider } = await import('../src/voice/local-speech-provider.mjs');
 	const provider = new LocalSpeechProvider({
 		executable: process.execPath,
@@ -135,7 +169,8 @@ test('aborting inference restarts the serial worker so replacement speech is not
 	const controller = new AbortController();
 	try {
 		const blocked = provider.synthesize({ text: 'block-worker', voiceId: 'ignored', speed: 1, signal: controller.signal });
-		await new Promise((resolve) => setTimeout(resolve, 50));
+		blocked.catch(() => {}); // Keep an acknowledgement failure from leaving an unobserved request rejection.
+		await blockedAt(1);
 		controller.abort();
 		await assert.rejects(blocked, (error) => error?.name === 'AbortError');
 		const replacement = await provider.synthesize({ text: 'replacement', voiceId: 'ignored', speed: 1 });
@@ -167,7 +202,8 @@ test('local speech subprocess receives only the local runtime environment', asyn
 	assert.equal(localVoiceId('local.chatterbox.v1.deadbeef'), 'local.chatterbox.v1.deadbeef');
 });
 
-test('aborting one inference preserves unrelated pending speech work', async () => {
+test('aborting one inference preserves unrelated pending speech work', async (context) => {
+	const blockedAt = observeBlockedWorkers(context);
 	const { LocalSpeechProvider } = await import('../src/voice/local-speech-provider.mjs');
 	const provider = new LocalSpeechProvider({
 		executable: process.execPath,
@@ -178,7 +214,9 @@ test('aborting one inference preserves unrelated pending speech work', async () 
 	try {
 		const blocked = provider.synthesize({ text: 'block-worker', signal: controller.signal });
 		const pending = provider.transcribe({ pcm: Buffer.alloc(1_920, 1) });
-		await new Promise((resolve) => setTimeout(resolve, 50));
+		blocked.catch(() => {});
+		pending.catch(() => {});
+		await blockedAt(1);
 		controller.abort();
 		await assert.rejects(blocked, (error) => error?.name === 'AbortError');
 		assert.deepEqual(await pending, { transcript: 'I can hear you.', confidence: 0.87 });
@@ -187,7 +225,8 @@ test('aborting one inference preserves unrelated pending speech work', async () 
 	}
 });
 
-test('aborting replayed inference stops its current worker before replacement work', async () => {
+test('aborting replayed inference stops its current worker before replacement work', async (context) => {
+	const blockedAt = observeBlockedWorkers(context);
 	const { LocalSpeechProvider } = await import('../src/voice/local-speech-provider.mjs');
 	const provider = new LocalSpeechProvider({
 		executable: process.execPath,
@@ -199,10 +238,12 @@ test('aborting replayed inference stops its current worker before replacement wo
 	try {
 		const first = provider.synthesize({ text: 'block-worker', signal: firstController.signal });
 		const replayed = provider.synthesize({ text: 'block-worker', signal: replayedController.signal });
-		await new Promise((resolve) => setTimeout(resolve, 50));
+		first.catch(() => {});
+		replayed.catch(() => {});
+		await blockedAt(1);
 		firstController.abort();
 		await assert.rejects(first, (error) => error?.name === 'AbortError');
-		await new Promise((resolve) => setTimeout(resolve, 50));
+		await blockedAt(2);
 		replayedController.abort();
 		await assert.rejects(replayed, (error) => error?.name === 'AbortError');
 
@@ -216,6 +257,38 @@ test('aborting replayed inference stops its current worker before replacement wo
 	} finally {
 		await provider.close();
 	}
+});
+
+test('cancellation before worker startup remains a separate case', async () => {
+	const { LocalSpeechProvider } = await import('../src/voice/local-speech-provider.mjs');
+	const provider = new LocalSpeechProvider({ executable: process.execPath,
+		scriptPath: fileURLToPath(new URL('../test-support/local-speech-rpc-fixture.mjs', import.meta.url)), timeoutMs: 5000 });
+	const controller = new AbortController();
+	controller.abort();
+	try {
+		await assert.rejects(provider.synthesize({ text: 'block-worker', signal: controller.signal }), { name: 'AbortError' });
+		assert.equal((await provider.synthesize({ text: 'replacement' })).pcm.length, 4);
+	} finally { await provider.close(); }
+});
+
+test('acknowledged blocked inference keeps pending work blocked until cancellation', async (context) => {
+	const blockedAt = observeBlockedWorkers(context);
+	const { LocalSpeechProvider } = await import('../src/voice/local-speech-provider.mjs');
+	const provider = new LocalSpeechProvider({ executable: process.execPath,
+		scriptPath: fileURLToPath(new URL('../test-support/local-speech-rpc-fixture.mjs', import.meta.url)), timeoutMs: 5000 });
+	const controller = new AbortController();
+	const blocked = provider.synthesize({ text: 'block-worker', signal: controller.signal });
+	const rejected = assert.rejects(blocked, { name: 'AbortError' });
+	try {
+		await blockedAt(1);
+		const pending = provider.transcribe({ pcm: Buffer.alloc(1920) });
+		let settled = false;
+		pending.then(() => { settled = true; });
+		await new Promise(resolve => setTimeout(resolve, 50));
+		assert.equal(settled, false, 'acknowledged work is still blocked before abort');
+		controller.abort(); await rejected;
+		assert.equal((await pending).transcript, 'I can hear you.');
+	} finally { controller.abort(); await provider.close(); await rejected; }
 });
 
 test('default provider discovery aborts promptly through its production access seam', async () => {

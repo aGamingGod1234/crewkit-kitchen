@@ -36,6 +36,8 @@ class DeterministicGoalScheduler {
 		else if (handle?.id !== undefined) this.#pending.delete(handle.id);
 	}
 
+	get queuedCount() { return this.#pending.size + this.#ready.length; }
+
 	runNext() {
 		const ready = this.#ready.shift();
 		if (ready !== undefined) {
@@ -71,18 +73,20 @@ export function codedError(code, message = code) {
 }
 
 export function woodenPickaxeFaultScenario() {
+	const craft = (recipeId) => ({ kind: 'action', actionType: 'craft_inventory', arguments: { recipeId, count: 1, timeoutMs: 1_000 } });
+	const mine = (x) => ({ kind: 'action', actionType: 'break_block', arguments: { x, y: 64, z: 0, expectedBlockId: 'minecraft:oak_log', timeoutMs: 1_000 } });
 	return {
 		goal: DEFAULT_GOAL,
+		initialBlocks: { '0,64,0': 'minecraft:oak_log', '1,64,0': 'minecraft:oak_log', '2,64,0': 'minecraft:oak_log', '1,63,1': 'minecraft:stone' },
 		turns: [
-			['mine'],
-			codedError('PLANNING_TIMEOUT'),
-			['observe'],
-			['move_to'],
-			['pick_up_item'],
-			['craft_inventory'],
-			['finish'],
+			['mine'], codedError('PLANNING_TIMEOUT'), ['observe'], ['move_to'], ['pick_up_item'],
+			[mine(1), 'pick_up_item'], [mine(2), 'pick_up_item'],
+			[craft('minecraft:oak_planks'), craft('minecraft:oak_planks'), craft('minecraft:oak_planks')],
+			[craft('minecraft:crafting_table')],
+			[{ kind: 'action', actionType: 'place_block', arguments: { x: 1, y: 64, z: 1, face: 'up', itemId: 'minecraft:crafting_table' } }],
+			[craft('minecraft:stick')], ['craft_table'], ['finish'],
 		],
-		actionResults: ['SUCCEEDED', 'PATH_BLOCKED', 'SUCCEEDED', 'SUCCEEDED', 'SUCCEEDED'],
+		actionResults: ['SUCCEEDED', 'PATH_BLOCKED', 'SUCCEEDED'],
 		moveDropBeforePickup: true,
 		disconnectAtAction: 3,
 		completionResults: [true],
@@ -94,6 +98,18 @@ export function createNativeGoalHarness(scenario = {}) {
 	const registry = new AgentRegistry({ agentCap: 1, queueCap: 4 });
 	const provider = new ScriptedNativeProvider(normalized);
 	const bridge = new FaultInjectingMinecraftBridge(normalized);
+	// Honor the same asynchronous admission boundary as the real bridge. A
+	// setImmediate turn does not mean a queued filesystem operation has finished.
+	const pendingIngress = new Set();
+	const emit = bridge.emit.bind(bridge);
+	bridge.emit = (event, message) => emit(event, message && typeof message === 'object' ? {
+		...message,
+		waitUntil(pending) {
+			message.waitUntil?.(pending);
+			pendingIngress.add(pending);
+			Promise.resolve(pending).then(() => pendingIngress.delete(pending), () => pendingIngress.delete(pending));
+		},
+	} : message);
 	const goalScheduler = new DeterministicGoalScheduler();
 	const stuckScheduler = new DeterministicGoalScheduler();
 	const goalSupervisor = new TrackingGoalSupervisor({
@@ -104,8 +120,12 @@ export function createNativeGoalHarness(scenario = {}) {
 		stuckSchedule: stuckScheduler.schedule.bind(stuckScheduler),
 		cancelStuckSchedule: stuckScheduler.cancel.bind(stuckScheduler),
 	});
+	let pauseBoundary = null;
 	provider.onTurnEnd = (turn) => {
-		if (normalized.pauseAfterTurn === turn) bridge.pause();
+		if (normalized.pauseAfterTurn === turn) {
+			pauseBoundary = { providerTurns: turn, recoveryDispatches: bridge.recoveryDispatches };
+			bridge.pause();
+		}
 	};
 	const coordinator = createDynamicCoordinator(nativeConfig(), {
 		memoryDirectory: null,
@@ -135,7 +155,7 @@ export function createNativeGoalHarness(scenario = {}) {
 	const runtimeErrorListener = (error) => bridge.recoveries.push(error?.code ?? 'RUNTIME_ERROR');
 	coordinator.on('actionResult', acceptedActionResultListener);
 	coordinator.on('runtimeError', runtimeErrorListener);
-	return new NativeGoalHarness({ coordinator, registry, bridge, provider, scenario: normalized, goalScheduler, stuckScheduler, goalSupervisor, acceptedActionResults, acceptedActionResultListener, runtimeErrorListener });
+	return new NativeGoalHarness({ coordinator, registry, bridge, provider, scenario: normalized, goalScheduler, stuckScheduler, goalSupervisor, acceptedActionResults, acceptedActionResultListener, runtimeErrorListener, pendingIngress, pauseBoundary: () => pauseBoundary });
 }
 
 export class NativeGoalHarness {
@@ -153,8 +173,10 @@ export class NativeGoalHarness {
 	#maxListenerCount;
 	#currentListenerCount = 0;
 	#observedStates = [];
+	#pendingIngress;
+	#pauseBoundary;
 
-	constructor({ coordinator, registry, bridge, provider, scenario, goalScheduler, stuckScheduler, goalSupervisor, acceptedActionResults, acceptedActionResultListener, runtimeErrorListener }) {
+	constructor({ coordinator, registry, bridge, provider, scenario, goalScheduler, stuckScheduler, goalSupervisor, acceptedActionResults, acceptedActionResultListener, runtimeErrorListener, pendingIngress, pauseBoundary }) {
 		this.#coordinator = coordinator;
 		this.#registry = registry;
 		this.#bridge = bridge;
@@ -166,6 +188,8 @@ export class NativeGoalHarness {
 		this.#acceptedActionResults = acceptedActionResults;
 		this.#acceptedActionResultListener = acceptedActionResultListener;
 		this.#runtimeErrorListener = runtimeErrorListener;
+		this.#pendingIngress = pendingIngress;
+		this.#pauseBoundary = pauseBoundary;
 		this.#maxListenerCount = 0;
 		this.#sampleListeners();
 	}
@@ -175,7 +199,7 @@ export class NativeGoalHarness {
 	get provider() { return this.#provider; }
 	get coordinator() { return this.#coordinator; }
 
-	async run({ stopAfter = null } = {}) {
+	async run({ stopAfter = null, stopWhen = null } = {}) {
 		await this.#coordinator.start();
 		this.#sampleListeners();
 		this.#bridge.start();
@@ -184,16 +208,34 @@ export class NativeGoalHarness {
 		await eventually(() => this.#bridge.sent.some((entry) => entry.type === 'agent_ready'));
 		await this.#bridge.startGoal(this.#scenario.goal, 1);
 		this.#sampleListeners();
-		const deadline = Date.now() + (this.#scenario.timeoutMs ?? 2_000);
+		// Completion assertions follow the lifecycle event, not an observation
+		// window. The test runner's existing file deadline bounds a missing event.
+		const waitForCompletion = stopAfter === 'completion';
+		const deadline = waitForCompletion ? Infinity : Date.now() + (this.#scenario.timeoutMs ?? 2_000);
 		while (Date.now() < deadline) {
 			await tick();
 			this.#sampleListeners();
-			if (this.#provider.activeWork === 0) this.#goalScheduler.runNext();
+			// Provider inactivity excludes neither input preparation nor queued
+			// ingress. Advance synthetic recovery time only after both settle.
+			if (this.#provider.activeWork === 0 && this.#pendingIngress.size === 0
+				&& !this.#goalSupervisor.hasInFlightWork()) this.#goalScheduler.runNext();
 			const record = this.#registry.get(AGENT_ID);
 			if (record?.state !== undefined) this.#observedStates.push(record.state);
+			// Scenario completion is an observed event, not a short wall-clock delay.
+			// The existing deadline remains a watchdog for a missing event.
+			if (stopWhen?.(this.#result())) break;
 			if (stopAfter === 'first-turn' && this.#provider.turns >= 1) break;
 			if ([DynamicAgentState.COMPLETED, DynamicAgentState.PAUSED, DynamicAgentState.ERROR].includes(record?.state)) break;
-			if (this.#provider.turns >= this.#scenario.turns.length && this.#scenario.stopWhenScriptExhausted) break;
+			if (!waitForCompletion && this.#provider.turns >= this.#scenario.turns.length && this.#scenario.stopWhenScriptExhausted) break;
+		}
+		if (this.#registry.get(AGENT_ID)?.state === DynamicAgentState.PAUSED) {
+			// Deliver any already-queued timer callbacks after pause, before stop
+			// can hide them by closing the supervisor.
+			while (this.#pendingIngress.size > 0) await Promise.allSettled([...this.#pendingIngress]);
+			while (this.#goalScheduler.queuedCount > 0) {
+				this.#goalScheduler.runNext();
+				await tick();
+			}
 		}
 		await this.#coordinator.stop();
 		this.#coordinator.off('actionResult', this.#acceptedActionResultListener);
@@ -219,6 +261,9 @@ export class NativeGoalHarness {
 			goalScheduler: this.#goalScheduler.snapshot(),
 			stuckScheduler: this.#stuckScheduler.snapshot(),
 			maxRecoveryHandles: this.#bridge.maxRecoveryHandles,
+			pauseBoundary: this.#pauseBoundary(),
+			postPauseRecoveryDispatches: this.#pauseBoundary() === null ? null
+				: this.#bridge.recoveryDispatches - this.#pauseBoundary().recoveryDispatches,
 			recoveryDispatches: this.#bridge.recoveryDispatches,
 			staleDispatches: this.#acceptedActionResults.filter(({ actionId }) => replayedActionIds.has(actionId)).length,
 			actionDispatches: this.#bridge.actionDispatches,
@@ -357,6 +402,10 @@ class TrackingGoalSupervisor {
 	terminate(key) { const result = this.#supervisor.terminate(key); this.#keys.delete(key.agentId); return result; }
 	snapshot(key) { return this.#supervisor.snapshot(key); }
 	close() { this.#supervisor.close(); this.#keys.clear(); }
+	hasInFlightWork() {
+		return [...this.#keys.values()].some(key => this.#supervisor.snapshot(key)?.leases
+			.some(lease => !['scheduled', 'recovery'].includes(lease.kind)));
+	}
 	stats() {
 		const current = [...this.#keys.values()].map((key) => this.#supervisor.snapshot(key)).filter(Boolean);
 		return Object.freeze({
@@ -398,9 +447,10 @@ function nativeRequest(record, goalRevision, turn, call, action) {
 function actionTool(action, goalRevision = 1) {
 	switch (action) {
 		case 'observe': return { kind: 'observe' };
-		case 'mine': return { kind: 'action', actionType: 'break_block', arguments: { x: 0, y: 64, z: 0, expectedBlockId: 'minecraft:stone', timeoutMs: 1_000 } };
+		case 'mine': return { kind: 'action', actionType: 'break_block', arguments: { x: 0, y: 64, z: 0, expectedBlockId: 'minecraft:oak_log', timeoutMs: 1_000 } };
 		case 'move_to': return { kind: 'action', actionType: 'navigate_to', arguments: { x: 1, y: 64, z: 0, tolerance: 1, sprint: false, timeoutMs: 1_000 } };
 		case 'pick_up_item': return { kind: 'action', actionType: 'pick_up_item', arguments: { targetSelector: '00000000-0000-4000-8000-000000000001' } };
+		case 'craft_table': return { kind: 'action', actionType: 'craft_table', arguments: { recipeId: 'minecraft:wooden_pickaxe', x: 1, y: 64, z: 1, count: 1, timeoutMs: 1_000 } };
 		case 'craft_inventory': return { kind: 'action', actionType: 'craft_inventory', arguments: { recipeId: 'minecraft:wooden_pickaxe', count: 1, timeoutMs: 1_000 } };
 		case 'respawn': return { kind: 'action', actionType: 'respawn', arguments: {} };
 		case 'finish': return { kind: 'finish', summary: 'Factual inventory evidence is present.' };

@@ -66,6 +66,7 @@ public final class SkitDirectorScreen extends Screen {
 	private String selectedAction = "move";
 	private String voice = VOICES.getFirst();
 	private ConsoleDropdown<String> voiceDropdown;
+	private ConsoleCycleButton<String> savedScriptSelector;
 	private String tone = "neutral";
 	private String speed = "1.0";
 	private String radius = "48";
@@ -140,6 +141,7 @@ public final class SkitDirectorScreen extends Screen {
 		clearFields();
 		fieldLabels.clear();
 		voiceDropdown = null;
+		savedScriptSelector = null;
 		scrollRows = Math.min(scrollRows, maxScrollRows());
 		int left = panelLeft();
 		int top = panelTop();
@@ -413,13 +415,9 @@ public final class SkitDirectorScreen extends Screen {
 		if (!library.names().isEmpty()) {
 			String name = library.names().contains(editorName()) ? editorName() : "";
 			List<String> choices = new java.util.ArrayList<>(); choices.add(""); choices.addAll(library.names());
-			addRenderableWidget(new ConsoleCycleButton<>(font, c[0], y, c[2], ROW, Component.literal("Saved"), choices, name,
-					value -> Component.literal(value.isEmpty() ? "Choose a script" : value), value -> {
-						if (value.isEmpty()) return;
-						editorNameField().setValue(value);
-						selectedRow = -1;
-						requestEditor("read", 0);
-					})).visible = contentVisible(y, ROW);
+			savedScriptSelector = addRenderableWidget(new ConsoleCycleButton<>(font, c[0], y, c[2], ROW, Component.literal("Saved"), choices, name,
+					value -> Component.literal(value.isEmpty() ? "Choose a script" : value), this::selectSavedScript));
+			savedScriptSelector.visible = contentVisible(y, ROW);
 		}
 		addRenderableWidget(button("Load / refresh script", c[1], y, c[2], ROW, false, () -> { selectedRow = -1; requestEditor("read", 0); }));
 		y += ROW + GAP;
@@ -475,12 +473,31 @@ public final class SkitDirectorScreen extends Screen {
 		if (!Double.isFinite(value) || value < 0 || value > 3600) throw new DirectorInputException("Duration must be between 0 and 3600 seconds");
 		return Long.toString(Math.round(value * 20));
 	}
+	private void selectSavedScript(String value) {
+		if (value.isEmpty()) return;
+		String previous = editorName();
+		runAction(() -> {
+			// Commit the draft name and row only after the read is accepted for sending.
+			requestEditor("read", 0, value, -1);
+			editorNameField().setValue(value);
+			selectedRow = -1;
+		});
+		if (!editorName().equals(value)) {
+			var names = libraries.getOrDefault(editorKind(), emptyLibrary()).names();
+			savedScriptSelector.setValue(names.contains(previous) ? previous : "");
+		}
+	}
+
 	private void requestEditor(String operation, int offset) {
+		requestEditor(operation, offset, editorName(), selectedRow);
+	}
+
+	private void requestEditor(String operation, int offset, String requestName, int requestRow) {
 		if (tab == Tab.CAMERA) return;
 		if (minecraft == null || minecraft.getConnection() == null) throw new DirectorInputException("Connect to a world to load saved scripts");
 		if (pendingEditor != null) throw new DirectorInputException("Wait for the current edit to finish");
 		var library = libraries.getOrDefault(editorKind(), emptyLibrary());
-		if (!operation.equals("read") && (!library.name().equals(editorName()) || library.revision().isEmpty()))
+		if (!operation.equals("read") && (!library.name().equals(requestName) || library.revision().isEmpty()))
 			throw new DirectorInputException("Load the saved script before editing");
 		String action = "", args = "";
 		if (operation.equals("append") || operation.equals("replace")) {
@@ -492,7 +509,7 @@ public final class SkitDirectorScreen extends Screen {
 				args = switch (action) { case "equip" -> extra; case "jump", "swing" -> ""; case "walk", "emote" -> ticks(number(actionDuration, "2")) + " " + extra; default -> ticks(number(actionDuration, "2")); };
 			} else { action = ticks(number(voiceDelay, "0")); args = voiceText.getValue(); }
 		}
-		var request = new DirectorEditorPayload.Request(java.util.UUID.randomUUID(), editorKind(), editorName(), operation, library.revision(), selectedRow, offset, action, args);
+		var request = new DirectorEditorPayload.Request(java.util.UUID.randomUUID(), editorKind(), requestName, operation, library.revision(), requestRow, offset, action, args);
 		if (!AgentControlClient.sendDirectorEditor(request)) throw new DirectorInputException("Script editing needs a connected server with editor support");
 		pendingEditor = request.requestId();
 		editorDeadline = System.nanoTime() + 15_000_000_000L;

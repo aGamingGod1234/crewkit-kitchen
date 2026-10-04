@@ -53,7 +53,7 @@ public final class ScenarioArenaModuleVerification {
 		verifyCompositionConflictsAndHash();
 		verifySafetyCapsAndContent();
 		verifySpawnReachabilityAndSpectators();
-		return 81;
+		return 82;
 	}
 
 	private static void verifyTransformsAndComposition() {
@@ -319,15 +319,23 @@ public final class ScenarioArenaModuleVerification {
 		ClassLoader original = Thread.currentThread().getContextClassLoader();
 		try {
 			Thread.currentThread().setContextClassLoader(resourceLoader(
-					RESOURCE_PREFIX + "fixtures/mismatch-v2.json", FIXTURE.getBytes(StandardCharsets.UTF_8)));
+					RESOURCE_PREFIX + "fixtures/tiny-owned-room-v2.json", FIXTURE.getBytes(StandardCharsets.UTF_8)));
 			assertThrows(IllegalArgumentException.class,
-					() -> ScenarioArenaModuleLoader.load("fixtures/mismatch-v2.json"),
+					() -> ScenarioArenaModuleLoader.load("fixtures/tiny-owned-room-v2.json"),
 					"filename version must match module version");
+			// Both sides contain the same valid module and matching filename. Only
+			// legal JSON whitespace crosses the byte boundary in the negative case.
+			String atLimit = FIXTURE + " ".repeat(8 * 1024 * 1024 - FIXTURE.getBytes(StandardCharsets.UTF_8).length);
 			Thread.currentThread().setContextClassLoader(resourceLoader(
-					RESOURCE_PREFIX + "fixtures/oversized-v1.json", new byte[8 * 1024 * 1024 + 1]));
+					RESOURCE_PREFIX + "fixtures/tiny-owned-room-v1.json", atLimit.getBytes(StandardCharsets.UTF_8)));
+			assertEquals(ScenarioArenaModuleCodec.decode(FIXTURE),
+					ScenarioArenaModuleLoader.load("fixtures/tiny-owned-room-v1.json"),
+					"matching filename and exact resource byte limit are accepted");
+			Thread.currentThread().setContextClassLoader(resourceLoader(
+					RESOURCE_PREFIX + "fixtures/tiny-owned-room-v1.json", (atLimit + " ").getBytes(StandardCharsets.UTF_8)));
 			assertThrows(IllegalArgumentException.class,
-					() -> ScenarioArenaModuleLoader.load("fixtures/oversized-v1.json"),
-					"loader rejects oversized resource");
+					() -> ScenarioArenaModuleLoader.load("fixtures/tiny-owned-room-v1.json"),
+					"loader rejects otherwise-valid oversized resource");
 		} finally {
 			Thread.currentThread().setContextClassLoader(original);
 		}

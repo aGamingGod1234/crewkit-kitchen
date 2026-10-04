@@ -154,6 +154,7 @@ public final class VerificationMain {
 		passedAssertions += AgentSavedDataGoalDraftVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.PendingDragonKillVerification.verify();
 		passedAssertions += GoalCompilerVerification.verify();
+		dev.agaminggod.arenaagents.server.voice.VoiceProfileVerification.main(new String[0]);
 		passedAssertions += GoalInventoryCapacityVerification.verify();
 		passedAssertions += AgentConversationRouterVerification.verify();
 		passedAssertions += NativeAgentWhisperTargetsVerification.verify();
@@ -185,8 +186,12 @@ public final class VerificationMain {
 		passedAssertions += OfflineAgentPlayersVerification.verify();
 		passedAssertions += PendingSpawnCancellationLedgerVerification.verify();
 		passedAssertions += AgentRegistryVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.scenario.ScenarioRuntimeVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.agent.AgentLifecycleVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.agent.AgentGoalVerification.verify();
 		passedAssertions += GoalSpecVerification.verify();
 		passedAssertions += AgentIdentityVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.agent.AgentVisualIdentityVerification.verify();
 		passedAssertions += AgentControlVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.control.LiveTaskViewVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.control.PlanItemIconsVerification.verify();
@@ -257,6 +262,7 @@ public final class VerificationMain {
 		passedAssertions += AgentRecoverySpawnPolicyVerification.verify();
 		passedAssertions += AgentRespawnSpawnPolicyVerification.verify();
 		passedAssertions += MultiplexedServerBridgeVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.bridge.BridgeIntegrationFindingsVerification.verify();
 		passedAssertions += AgentVerboseVerification.verify();
 		passedAssertions += SingleBrainBoundaryVerification.verify();
 		verifyJsonLineFraming(codec);

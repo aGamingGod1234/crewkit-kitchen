@@ -24,10 +24,11 @@ import net.minecraft.world.phys.AABB;
 
 import java.util.List;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.Objects;
 import java.util.Set;
 import java.util.LinkedHashSet;
+import java.util.function.BooleanSupplier;
+import java.util.function.ToDoubleFunction;
 
 public final class ServerNavigationController implements ServerController {
 	public static final int DEFAULT_MAX_PATH_LENGTH = 256;
@@ -47,6 +48,7 @@ public final class ServerNavigationController implements ServerController {
 	private final ElapsedTimeAccumulator elapsedTime;
 	private final ServerPathPlanner planner = new ServerPathPlanner();
 	private LocalPathfinder.Search search;
+	private Preparation preparation;
 	private MinecraftNavigationWorld searchWorld;
 	private GridPosition searchOrigin;
 	private Set<GridPosition> searchGoals = Set.of();
@@ -165,6 +167,27 @@ public final class ServerNavigationController implements ServerController {
 
 	@Override
 	public void cancel(ServerPlayer player) {
+		discardPlanning();
+		releaseInput();
+	}
+
+	private void discardPlanning() {
+		search = null;
+		preparation = null;
+		searchWorld = null;
+		searchOrigin = null;
+		searchGoals = Set.of();
+	}
+
+	void invalidatePlanning(GridPosition actualOrigin, boolean terrainCurrent) {
+		if (!terrainCurrent) {
+			discardPlanning();
+			previousFrontiers.clear();
+		}
+		if (searchOrigin != null && !actualOrigin.equals(searchOrigin)) discardPlanning();
+	}
+
+	private void releaseInput() {
 		if (inputLease == null) {
 			motorState = null;
 			return;
@@ -215,6 +238,9 @@ public final class ServerNavigationController implements ServerController {
 		Objects.requireNonNull(playerPosition, "playerPosition must not be null");
 		if (!Double.isFinite(supportHeight)) return false;
 		Vec3 target = targetFor(waypoint, finalWaypoint, supportHeight);
+		if (finalWaypoint && waypoint.position().equals(resolvedEndpointPosition)) {
+			return withinEndpoint(playerPosition);
+		}
 		if (finalWaypoint && arrivalRegion != null) {
 			return arrivalRegion.contains(playerPosition) && playerPosition.distanceTo(target) <= tolerance;
 		}
@@ -224,6 +250,9 @@ public final class ServerNavigationController implements ServerController {
 	}
 
 	private Vec3 targetFor(MinecraftNavigationWorld world, PathNode waypoint, boolean finalWaypoint) {
+		if (finalWaypoint && waypoint.position().equals(resolvedEndpointPosition) && resolvedEndpointTarget != null) {
+			return resolvedEndpointTarget;
+		}
 		if (!supportedEndpoint(world, waypoint.position())) {
 			if (waypoint.traversal() == TraversalType.SWIM) return center(waypoint.position()).add(0.0D, 0.4D, 0.0D);
 			if (waypoint.traversal() == TraversalType.CLIMB) return center(waypoint.position());
@@ -341,10 +370,18 @@ public final class ServerNavigationController implements ServerController {
 		return progressFromActualDistance(navigationStartPosition, target, position, lastProgressValue);
 	}
 
-	private boolean withinEndpoint(Vec3 position) {
+	boolean withinEndpoint(Vec3 position) {
 		return resolvedEndpointTarget != null
 				&& satisfiesDestinationTolerance(position.distanceTo(resolvedEndpointTarget), tolerance)
-				&& (arrivalRegion == null || arrivalRegion.contains(position));
+				&& (arrivalRegion != null ? arrivalRegion.contains(position)
+						: satisfiesRequestedEndpoint(position, resolvedEndpointPosition, resolvedEndpointTarget));
+	}
+
+	boolean satisfiesRequestedEndpoint(Vec3 position, GridPosition endpoint, Vec3 endpointTarget) {
+		// Exact-cell partial support deliberately resolves requested Y to its collision surface.
+		// A relocated endpoint must also satisfy the original radius, rather than granting it twice.
+		Vec3 requestedTarget = endpoint.equals(grid(destination)) ? endpointTarget : destination;
+		return satisfiesDestinationTolerance(position.distanceTo(requestedTarget), tolerance);
 	}
 
 	static double progressFromActualDistance(Vec3 start, Vec3 endpoint, Vec3 current, double previousProgress) {
@@ -398,28 +435,34 @@ public final class ServerNavigationController implements ServerController {
 			long elapsedMs,
 			boolean recovery
 	) {
-		GridPosition actualOrigin = grid(player.position());
-		if (searchWorld != null && !searchWorld.isCurrent()) {
-			search = null;
-			previousFrontiers.clear();
-		}
-		if (search != null && !actualOrigin.equals(searchOrigin)) search = null;
-		if (search == null) {
-			cancel(player);
-			plan = null;
-			GridPosition start = nearestTraversable(world, actualOrigin, 1, 2);
-			if (start == null) return fail(player, "NO_STANDABLE_PATH", "Start has no supported, climbable or surface-water position", currentProgress());
-			boolean destinationIsLocal = center(start).distanceTo(destination) <= MAX_LOCAL_PLANNING_DISTANCE;
-			searchGoals = !destinationIsLocal ? Set.of() : arrivalRegion != null
-					? Set.copyOf(standableGoalsWithinRegion(world, arrivalRegion))
-					: Set.copyOf(standableGoalsWithinTolerance(
-							world, destination, tolerance, (int) Math.ceil(tolerance) + 1, (int) Math.ceil(tolerance) + 1));
-			if (destinationIsLocal && searchGoals.isEmpty() && world.cellAt(grid(destination)) != WalkabilityView.Cell.UNLOADED) {
-				return fail(player, "NO_STANDABLE_PATH", "Destination has no supported position within the requested tolerance", currentProgress());
+		if (ServerPathPlanner.currentBudget() == null) {
+			try (ServerPathPlanner.TickScope ignored = ServerPathPlanner.beginServerTick()) {
+				return replan(player, world, nowEpochMs, elapsedMs, recovery);
 			}
-			searchWorld = world;
-			searchOrigin = actualOrigin;
-			searchRecovery = recovery;
+		}
+		GridPosition actualOrigin = grid(player.position());
+		invalidatePlanning(actualOrigin, searchWorld == null || searchWorld.isCurrent());
+		if (search == null) {
+			if (preparation == null) {
+				releaseInput();
+				plan = null;
+				searchWorld = world;
+				searchOrigin = actualOrigin;
+				searchRecovery = recovery;
+				preparation = new Preparation(actualOrigin, destination, tolerance, arrivalRegion, player.position());
+			}
+			ServerPathPlanner.TickBudget budget = ServerPathPlanner.currentBudget();
+			if (!preparation.advance(searchWorld, position -> searchWorld.supportHeight(
+					position, position.x() + 0.5D, position.z() + 0.5D), budget::tryPrepare)) {
+				return TickResult.running(currentProgress());
+			}
+			GridPosition start = preparation.start;
+			if (start == null) return fail(player, "NO_STANDABLE_PATH", "Start has no supported, climbable or surface-water position", currentProgress());
+			searchGoals = Set.copyOf(preparation.goals);
+			if (preparation.destinationHasNoSupport) {
+				return fail(player, "NO_STANDABLE_PATH", "Destination has no supported arrival region that can be approached within the requested tolerance", currentProgress());
+			}
+			preparation = null;
 			search = planner.beginSearch(start, searchGoals, grid(destination), (int) MAX_LOCAL_PLANNING_DISTANCE, previousFrontiers);
 		}
 		ServerPathPlanner.PlanningResult planning = planner.resume(search, searchWorld);
@@ -442,8 +485,13 @@ public final class ServerNavigationController implements ServerController {
 		plan = candidate;
 		if (finalSegment) {
 			PathNode finalNode = candidate.nodes().get(candidate.nodes().size() - 1);
+			resolvedEndpointTarget = null;
 			resolvedEndpointPosition = finalNode.position();
 			resolvedEndpointTarget = targetFor(world, finalNode, true);
+			if (arrivalRegion == null && !targetsExactDestination(finalNode, true)) {
+				Vec3 inward = world.inwardStandingTarget(finalNode.position(), destination, player.getBoundingBox());
+				if (inward != null && inward.distanceTo(destination) < tolerance) resolvedEndpointTarget = inward;
+			}
 			endpointStabilityPosition = null;
 			endpointStabilityConfirmed = false;
 		} else {
@@ -561,81 +609,119 @@ public final class ServerNavigationController implements ServerController {
 		);
 	}
 
-	private static GridPosition nearestTraversable(
-			MinecraftNavigationWorld world,
-			GridPosition origin,
-			int horizontalRadius,
-			int verticalRadius
-	) {
-		for (int radius = 0; radius <= horizontalRadius; radius++) {
-			for (int dx = -radius; dx <= radius; dx++) {
-				for (int dz = -radius; dz <= radius; dz++) {
-					if (Math.max(Math.abs(dx), Math.abs(dz)) != radius) continue;
-					for (int vertical = 0; vertical <= verticalRadius; vertical++) {
-						GridPosition above = new GridPosition(
-								origin.x() + dx,
-								origin.y() + vertical,
-								origin.z() + dz
-						);
-						if (world.isTraversable(above)) return above;
-						if (vertical > 0) {
-							GridPosition below = new GridPosition(
-									origin.x() + dx,
-									origin.y() - vertical,
-									origin.z() + dz
-							);
-							if (world.isTraversable(below)) return below;
+	/** Retains enumeration order and terrain facts across server-tick budget boundaries. */
+	static final class Preparation {
+		private final Vec3 destination;
+		private final double tolerance;
+		private final AABB region;
+		private final Vec3 actualStart;
+		private final List<GridPosition> starts = new ArrayList<>();
+		final List<GridPosition> goals = new ArrayList<>();
+		GridPosition start;
+		boolean destinationHasNoSupport;
+		private int startIndex;
+		private int x, y, z, minY, minZ, maxX, maxY, maxZ;
+		private boolean initializedGoals;
+		private boolean enumerated;
+		private boolean complete;
+
+		Preparation(GridPosition origin, Vec3 destination, double tolerance, AABB region) {
+			this(origin, destination, tolerance, region, center(origin));
+		}
+
+		Preparation(GridPosition origin, Vec3 destination, double tolerance, AABB region, Vec3 actualStart) {
+			this.actualStart = actualStart;
+			this.destination = destination;
+			this.tolerance = tolerance;
+			this.region = region;
+			for (int radius = 0; radius <= 1; radius++) {
+				for (int dx = -radius; dx <= radius; dx++) {
+					for (int dz = -radius; dz <= radius; dz++) {
+						if (Math.max(Math.abs(dx), Math.abs(dz)) != radius) continue;
+						for (int vertical = 0; vertical <= 2; vertical++) {
+							starts.add(origin.offset(dx, vertical, dz));
+							if (vertical > 0) starts.add(origin.offset(dx, -vertical, dz));
 						}
 					}
 				}
 			}
 		}
-		return null;
-	}
 
-	private static List<GridPosition> standableGoalsWithinTolerance(
-			MinecraftNavigationWorld world,
-			Vec3 destination,
-			double tolerance,
-			int horizontalRadius,
-			int verticalRadius
-	) {
-		GridPosition origin = grid(destination);
-		ArrayList<GridPosition> candidates = new ArrayList<>();
-		for (int dx = -horizontalRadius; dx <= horizontalRadius; dx++) {
-			for (int dz = -horizontalRadius; dz <= horizontalRadius; dz++) {
-				for (int dy = -verticalRadius; dy <= verticalRadius; dy++) {
-					GridPosition candidate = new GridPosition(origin.x() + dx, origin.y() + dy, origin.z() + dz);
-					if (supportedEndpoint(world, candidate) && candidateSatisfiesTolerance(candidate, destination, tolerance)) {
-						candidates.add(candidate);
+		boolean advance(WalkabilityView world, ToDoubleFunction<GridPosition> supportHeight, BooleanSupplier claimWork) {
+			if (complete) return true;
+			while (start == null && startIndex < starts.size()) {
+				if (!claimWork.getAsBoolean()) return false;
+				GridPosition candidate = starts.get(startIndex++);
+				if (world.isTraversable(candidate)) start = candidate;
+			}
+			if (start == null || center(start).distanceTo(destination) > MAX_LOCAL_PLANNING_DISTANCE) {
+				complete = true;
+				return true;
+			}
+			if (!initializedGoals) {
+				GridPosition origin = grid(destination);
+				int radius = (int) Math.ceil(tolerance) + 1;
+				x = region == null ? origin.x() - radius : (int) Math.floor(region.minX);
+				y = minY = region == null ? origin.y() - radius : (int) Math.floor(region.minY);
+				z = minZ = region == null ? origin.z() - radius : (int) Math.floor(region.minZ);
+				maxX = region == null ? origin.x() + radius : (int) Math.ceil(region.maxX);
+				maxY = region == null ? origin.y() + radius : (int) Math.ceil(region.maxY);
+				maxZ = region == null ? origin.z() + radius : (int) Math.ceil(region.maxZ);
+				initializedGoals = true;
+			}
+			while (!enumerated) {
+				if (!claimWork.getAsBoolean()) return false;
+				GridPosition candidate = new GridPosition(x, y, z);
+				// Point pruning uses the possible support interval, then checks the actual collision height.
+				// Region Y also requires that actual surface, so only its X/Z can be pruned.
+				boolean geometryMatches = region == null ? candidateSatisfiesTolerance(candidate, destination, tolerance)
+						: x + 0.5D >= region.minX && x + 0.5D < region.maxX
+						&& z + 0.5D >= region.minZ && z + 0.5D < region.maxZ;
+				if (geometryMatches && supportedEndpoint(world, candidate)) {
+					if (region == null) {
+						if (approachableEndpoint(candidate, destination, tolerance,
+								supportHeight.applyAsDouble(candidate), actualStart)) goals.add(candidate);
+					} else {
+						double support = supportHeight.applyAsDouble(candidate);
+						if (Double.isFinite(support) && region.contains(x + 0.5D, support, z + 0.5D)) goals.add(candidate);
 					}
 				}
+				if (++y > maxY) {
+					y = minY;
+					if (++z > maxZ) { z = minZ; if (++x > maxX) enumerated = true; }
+				}
 			}
+			if (goals.isEmpty()) {
+				if (!claimWork.getAsBoolean()) return false;
+				destinationHasNoSupport = world.cellAt(grid(destination)) != WalkabilityView.Cell.UNLOADED;
+			}
+			// The planner consumes goal membership, not list order; retain enumeration order.
+			complete = true;
+			return true;
 		}
-		candidates.sort(Comparator.comparingDouble(value -> center(value).distanceToSqr(destination)));
-		return List.copyOf(candidates);
+	}
+
+	static boolean approachableEndpoint(GridPosition candidate, Vec3 destination, double tolerance,
+			double supportHeight, Vec3 actualPosition) {
+		if (!Double.isFinite(supportHeight)) return false;
+		if (candidate.equals(grid(destination))) return true;
+		Vec3 surface = new Vec3(candidate.x() + 0.5D, supportHeight, candidate.z() + 0.5D);
+		if (surface.distanceTo(destination) > tolerance) return false;
+		// A sphere tangent to the standing plane has no horizontal arrival area to steer into.
+		// Preserve an already satisfied boundary instead of weakening the requested radius.
+		return Math.abs(supportHeight - destination.y) < tolerance
+				|| (actualPosition.distanceTo(destination) <= tolerance
+						&& actualPosition.distanceTo(surface) <= tolerance);
 	}
 
 	static boolean candidateSatisfiesTolerance(GridPosition candidate, Vec3 destination, double tolerance) {
-		return candidate.equals(grid(destination)) || center(candidate).distanceTo(destination) <= tolerance;
+		if (candidate.equals(grid(destination))) return true;
+		// Safe support lies in the block below the feet cell, and may be fractional (slabs/stairs).
+		double closestY = Math.max(candidate.y() - 1D, Math.min(candidate.y(), destination.y));
+		return new Vec3(candidate.x() + 0.5D, closestY, candidate.z() + 0.5D).distanceTo(destination) <= tolerance;
 	}
 
-	private static List<GridPosition> standableGoalsWithinRegion(MinecraftNavigationWorld world, AABB region) {
-		ArrayList<GridPosition> candidates = new ArrayList<>();
-		for (int x = (int) Math.floor(region.minX); x <= Math.ceil(region.maxX); x++) {
-			for (int z = (int) Math.floor(region.minZ); z <= Math.ceil(region.maxZ); z++) {
-				for (int y = (int) Math.floor(region.minY); y <= Math.ceil(region.maxY); y++) {
-					GridPosition candidate = new GridPosition(x, y, z);
-					if (!supportedEndpoint(world, candidate)) continue;
-					double support = world.supportHeight(candidate, x + 0.5D, z + 0.5D);
-					if (Double.isFinite(support) && region.contains(x + 0.5D, support, z + 0.5D)) candidates.add(candidate);
-				}
-			}
-		}
-		return candidates;
-	}
-
-	private static boolean supportedEndpoint(MinecraftNavigationWorld world, GridPosition position) {
+	private static boolean supportedEndpoint(WalkabilityView world, GridPosition position) {
 		TraversalType traversal = world.traversalAt(position);
 		return traversal == TraversalType.WALK || traversal == TraversalType.CROUCH;
 	}

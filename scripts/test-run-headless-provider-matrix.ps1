@@ -25,12 +25,13 @@ if ($wrapperSource -notmatch 'Test-CoordinatorReady\s+\$protocolAudit\s+\$Scenar
 function Assert-Fails([scriptblock] $Action, [string] $Pattern) {
 	try {
 		& $Action 2>&1 | Out-Null
-		throw "Expected failure matching '$Pattern'"
 	} catch {
 		if ($_.Exception.Message -notmatch $Pattern) {
 			throw "Failure did not match '$Pattern': $($_.Exception.Message)"
 		}
+		return
 	}
+	throw "Expected failure matching '$Pattern'"
 }
 
 function Set-TestEnvironment([string] $Name, [string] $Value) {
@@ -336,11 +337,10 @@ function Import-WrapperFunction([string] $Name) {
 }
 
 function Test-FastExitResourceSampling([string] $WorkingDirectory) {
-	foreach ($name in @('ConvertTo-ProcessCreationKey', 'Get-ProcessSnapshot', 'Test-ProcessIdentityMatch', 'Test-ChildCreationAfterParent', 'Add-ProcessTreeSnapshot', 'Add-TrackedProcessIdentity', 'Get-TrackedResourceSnapshot', 'Measure-RunnerResourcesUntilExit', 'Stop-TrackedProcessIds', 'Assert-TrackedProcessIdsGone', 'Start-RedirectedProcess')) {
-		Import-WrapperFunction $name
-	}
-	$script:PollMilliseconds = 10
-	$script:CleanupTimeoutSeconds = 30
+	# Initialize functions and their required script state through the supported entry.
+	. $scriptPath -ProjectRoot $WorkingDirectory -FunctionsOnly
+	$PollMilliseconds = 10
+	$CleanupTimeoutSeconds = 30
 	$stdout = Join-Path $WorkingDirectory 'fast-runner.stdout.log'
 	$stderr = Join-Path $WorkingDirectory 'fast-runner.stderr.log'
 	$handle = Start-RedirectedProcess powershell.exe '-NoProfile -Command "Start-Sleep -Milliseconds 150"' $WorkingDirectory $stdout $stderr @{}

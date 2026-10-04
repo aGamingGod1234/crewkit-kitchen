@@ -607,7 +607,7 @@ public final class CodexAgentCommands {
 			if (!VoiceCatalog.accepts(profileId)) {
 				throw new AgentDomainException("VOICE_PROFILE_UNKNOWN", "Unknown voice profile. Use /codex skit voice profiles");
 			}
-			String tone = getOptionalString(context, "tone", VoiceProfile.DEFAULT_TONE);
+			String tone = requireVoiceTone(getOptionalString(context, "tone", VoiceProfile.DEFAULT_TONE));
 			double speed = getOptionalDouble(context, "speed", VoiceProfile.DEFAULT_SPEED);
 			int radius = getOptionalInt(context, "radius", VoiceProfile.DEFAULT_RADIUS);
 			SkitActor actor = SkitActors.resolve(context.getSource().getServer(), selector);
@@ -638,7 +638,7 @@ public final class CodexAgentCommands {
 		try {
 			AgentId agentId = SkitActors.resolve(context.getSource().getServer(), StringArgumentType.getString(context, ARGUMENT_AGENT)).agentId();
 			VoiceProfile settings = new VoiceProfile(StringArgumentType.getString(context, "profile"),
-					StringArgumentType.getString(context, "tone"), DoubleArgumentType.getDouble(context, "speed"),
+					requireVoiceTone(StringArgumentType.getString(context, "tone")), DoubleArgumentType.getDouble(context, "speed"),
 					IntegerArgumentType.getInteger(context, "radius"));
 			VoiceDirector.say(context.getSource().getServer(), agentId, StringArgumentType.getString(context, "text"), settings);
 			return 1;
@@ -646,6 +646,14 @@ public final class CodexAgentCommands {
 			throw commandFailure(exception);
 		} catch (RuntimeException exception) {
 			throw unexpectedFailure("skit voice say with settings", exception);
+		}
+	}
+
+	private static String requireVoiceTone(String tone) {
+		try {
+			return VoiceProfile.requireSupportedTone(tone);
+		} catch (IllegalArgumentException exception) {
+			throw new AgentDomainException("VOICE_TONE_INVALID", exception.getMessage());
 		}
 	}
 

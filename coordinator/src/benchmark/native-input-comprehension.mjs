@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -89,9 +89,26 @@ function deltaUsage(before, after) {
 	return output;
 }
 
-export async function runComprehensionComparison() {
-	const before = JSON.parse(await readFile(path.join(repositoryRoot, 'runtime/input-usage-audit/before-context.json'), 'utf8'));
-	const after = JSON.parse(await readFile(path.join(repositoryRoot, 'runtime/input-usage-audit/after-context.json'), 'utf8'));
+export async function runComprehensionComparison({
+	beforeContextPath = path.join(repositoryRoot, 'runtime/input-usage-audit/before-context.json'),
+	afterContextPath = path.join(repositoryRoot, 'runtime/input-usage-audit/after-context.json'),
+} = {}) {
+	let before, after;
+	try {
+		[before, after] = await Promise.all([beforeContextPath, afterContextPath].map(async inputPath => {
+			const context = JSON.parse(await readFile(inputPath, 'utf8'));
+			assert.ok(['minecraftInstructions', 'skillInstructions', 'nativeInstructions'].every(key => typeof context[key] === 'string')
+				&& Array.isArray(context.tools) && context.tools.length > 0, 'invalid archived context');
+			return context;
+		}));
+	} catch (error) {
+		// Archived inputs are optional local artifacts, not tracked prerequisites. Fail before provider startup.
+		return { benchmark: 'native-input-model-comprehension', status: 'UNAVAILABLE', settings, limits,
+			providerUsed: false, paidApiCalls: 0, installedGameplay: false, subscriptionVerified: false,
+			failure: 'CONTEXT_INPUT_UNAVAILABLE', cause: error.code ?? error.name, turns: [], totalUsage: {}, byArm: {},
+			limitations: ['Supply valid archived contexts using --before and --after, each containing minecraftInstructions, skillInstructions, nativeInstructions and tools.',
+				'For reproducible current-source prose experiments, run native-context-experiments.mjs --output <directory>. No model comprehension has been measured.'] };
+	}
 	const directory = await mkdtemp(path.join(os.tmpdir(), 'arena-native-fact-check-'));
 	const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.toUpperCase().startsWith('OPENAI_')));
 	const transport = new ComparisonTransport({ ...settings, cwd: directory, environment: env }, before);
@@ -225,15 +242,24 @@ export function renderComprehensionMarkdown(report) {
 	const packedReplies = afterTurns.filter(row => row.presentedReplies.some(reply => reply.packed)).length;
 	lines.push('', `The checks cover literal block identifiers, target coordinates, item counts, hostile UUID/type, health, current death flag, world/dimension identity, previous-death coordinates, missing fields, and null versus false. Compact production minecraft-facts-v1 observations reached the model in ${packedReplies}/${afterTurns.length} after turns. Exact factual passes: ${report.turns.filter(row => row.factsMatch).length}/${report.turns.length}.`, '',
 		`Total uncached input: ${report.totalUsage.uncachedInputTokens ?? 0}; cap: ${report.limits.maxUncachedInputTokens}. Turns: ${report.turns.length}; cap: ${report.limits.maxTurns}.`, '',
-		'The provider confirmed the exact model and reported Fast as its priority alias. Medium effort was submitted; it was not independently echoed in the effective settings.', '',
+		...(report.turns.length === 0 ? ['No model turns ran; provider/model confirmation and comprehension are unavailable.', '']
+			: ['Effective execution settings are recorded per turn. Submitted effort is not independently confirmed unless echoed by the provider.', '']),
 		'Limits:', '', ...report.limitations.map(value => `- ${value}`), '',
 		'No statistical latency improvement, unchanged long-task behavior, weekly allowance savings, or installed-gameplay success is claimed from these four turns.', '');
 	return lines.join('\n');
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-	const result = await runComprehensionComparison();
-	await writeFile(path.join(repositoryRoot, 'reports/native-input-comprehension-2026-10-02.json'), `${JSON.stringify(result, null, 2)}\n`);
-	await writeFile(path.join(repositoryRoot, 'reports/native-input-comprehension-2026-10-02.md'), renderComprehensionMarkdown(result));
+	const options = {};
+	for (let index = 2; index < process.argv.length; index += 2) {
+		assert.ok(['--before', '--after', '--output'].includes(process.argv[index]) && process.argv[index + 1], 'usage: [--before context.json --after context.json --output report.json]');
+		options[process.argv[index].slice(2)] = process.argv[index + 1];
+	}
+	const destination = path.resolve(options.output ?? path.join(repositoryRoot, 'reports/native-input-comprehension-2026-10-02.json'));
+	assert.ok(destination.endsWith('.json'), '--output must end in .json');
+	const result = await runComprehensionComparison({ beforeContextPath: options.before, afterContextPath: options.after });
+	await mkdir(path.dirname(destination), { recursive: true });
+	await writeFile(destination, `${JSON.stringify(result, null, 2)}\n`);
+	await writeFile(destination.replace(/\.json$/, '.md'), renderComprehensionMarkdown(result));
 	process.stdout.write(`${JSON.stringify({ status: result.status, turns: result.turns.length, totalUsage: result.totalUsage, failure: result.failure })}\n`);
 }

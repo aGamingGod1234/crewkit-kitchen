@@ -5,11 +5,9 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $project = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $wrapper = Join-Path $PSScriptRoot 'run-headless-provider-matrix.ps1'
-$tokens = $null; $errors = $null
-$ast = [System.Management.Automation.Language.Parser]::ParseFile($wrapper, [ref] $tokens, [ref] $errors)
-if ($errors.Count -gt 0) { throw $errors[0].Message }
-foreach ($definition in @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))) { Invoke-Expression $definition.Extent.Text }
-. (Join-Path $PSScriptRoot 'offline-server-policy.ps1')
+# Import the supported function-only entry point so launcher script state and
+# helper initialization match a real invocation without starting the launcher.
+. $wrapper -ProjectRoot $project -FunctionsOnly
 
 $CapabilityProbe = $false; $RequireAll = $true
 $MaxManifestBytes = 65536; $MaxMatrixReportBytes = 262144; $MaxDiagnosticText = 4096

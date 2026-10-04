@@ -13,15 +13,16 @@ const IRON_PICKAXE = Object.freeze({
 
 const CRAFT_IRON_PICKAXE = Object.freeze({
 	kind: 'action',
-	actionType: 'craft_inventory',
-	arguments: { recipeId: 'minecraft:iron_pickaxe', count: 1, timeoutMs: 1_000 },
+	actionType: 'craft_table',
+	arguments: { recipeId: 'minecraft:iron_pickaxe', x: 1, y: 64, z: 1, count: 1, timeoutMs: 1_000 },
 });
 
 test('authoritative goal rejects a stone pickaxe, recovers, and completes only with an iron pickaxe', async () => {
 	const result = await createNativeGoalHarness({
 		goal: 'Get an iron pickaxe',
 		goalPredicate: IRON_PICKAXE,
-		initialInventory: { 'minecraft:stone_pickaxe': 1 },
+		initialInventory: { 'minecraft:stone_pickaxe': 1, 'minecraft:iron_ingot': 3, 'minecraft:stick': 2 },
+		initialBlocks: { '0,64,0': 'minecraft:oak_log', '1,64,1': 'minecraft:crafting_table' },
 		turns: [['finish'], [CRAFT_IRON_PICKAXE, 'finish']],
 		timeoutMs: 500,
 	}).run();
@@ -48,7 +49,8 @@ test('death and respawn preserve the exact authoritative goal binding until fact
 	const result = await createNativeGoalHarness({
 		goal: 'Get an iron pickaxe',
 		goalPredicate: IRON_PICKAXE,
-		initialInventory: { 'minecraft:stone_pickaxe': 1 },
+		initialInventory: { 'minecraft:stone_pickaxe': 1, 'minecraft:iron_ingot': 3, 'minecraft:stick': 2 },
+		initialBlocks: { '0,64,0': 'minecraft:oak_log', '1,64,1': 'minecraft:crafting_table' },
 		dieAtAction: 1,
 		turns: [['finish'], ['mine'], ['respawn'], [CRAFT_IRON_PICKAXE], ['finish']],
 		timeoutMs: 500,

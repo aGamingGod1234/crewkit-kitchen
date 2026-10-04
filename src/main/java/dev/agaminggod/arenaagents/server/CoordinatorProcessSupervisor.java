@@ -40,6 +40,9 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private static final long DEPENDENCY_MONITOR_INTERVAL_MS = 1_000L;
 	private static final long AUTHENTICATION_TIMEOUT_MS = 15_000L;
 	private static final long RECONNECT_TIMEOUT_MS = 10_000L;
+	// Status arrives every second and production already allows 2.5 seconds of age.
+	// Once stale, allow the same recovery grace as a disconnected bridge.
+	private static final long STATUS_RECOVERY_TIMEOUT_MS = RECONNECT_TIMEOUT_MS;
 	private static final long STABILITY_INTERVAL_MS = 30_000L;
 	private static final long TERMINATION_RETRY_MS = 1_000L;
 	private static final long SHUTDOWN_WAIT_MS = 10_000L;
@@ -83,6 +86,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private long processStartedEpochMs;
 	private long authenticationDeadlineEpochMs;
 	private long reconnectDeadlineEpochMs;
+	private long statusRecoveryDeadlineEpochMs;
 	private long authenticatedSinceEpochMs;
 	private long authenticatedSessionGeneration;
 	private String launchId;
@@ -614,7 +618,8 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			long sessionGeneration,
 			boolean coordinatorReady
 	) {
-		tickInternal(bridgeAuthenticated, authenticatedLaunchId, sessionGeneration, coordinatorReady, true, false);
+		tickInternal(bridgeAuthenticated, authenticatedLaunchId, sessionGeneration,
+				coordinatorReady, coordinatorReady, true, false);
 	}
 
 	/**
@@ -629,11 +634,25 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			boolean coordinatorReady,
 			boolean bridgeListenerAvailable
 	) {
+		tickWithBridgeListener(bridgeAuthenticated, authenticatedLaunchId, sessionGeneration,
+				coordinatorReady, coordinatorReady, bridgeListenerAvailable);
+	}
+
+	/** Liveness is independent of reconciliation, provider progress, and candidate promotion. */
+	synchronized void tickWithBridgeListener(
+			boolean bridgeAuthenticated,
+			String authenticatedLaunchId,
+			long sessionGeneration,
+			boolean coordinatorReady,
+			boolean coordinatorStatusFresh,
+			boolean bridgeListenerAvailable
+	) {
 		tickInternal(
 				bridgeAuthenticated,
 				authenticatedLaunchId,
 				sessionGeneration,
 				coordinatorReady,
+				coordinatorStatusFresh,
 				bridgeListenerAvailable,
 				true
 		);
@@ -644,6 +663,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			String authenticatedLaunchId,
 			long sessionGeneration,
 			boolean coordinatorReady,
+			boolean coordinatorStatusFresh,
 			boolean bridgeListenerAvailable,
 			boolean requireInitialBridgeListener
 	) {
@@ -657,7 +677,8 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		}
 
 		if (child != null) {
-			observeOwnedChild(now, bridgeAuthenticated, authenticatedLaunchId, sessionGeneration, coordinatorReady);
+			observeOwnedChild(now, bridgeAuthenticated, authenticatedLaunchId, sessionGeneration,
+					coordinatorReady, coordinatorStatusFresh);
 			if (child != null) submitDependencyMaintenance(now, false, false);
 		}
 		if (pendingTermination != null) {
@@ -734,13 +755,37 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			boolean bridgeAuthenticated,
 			String authenticatedLaunchId,
 			long sessionGeneration,
-			boolean coordinatorReady
+			boolean coordinatorReady,
+			boolean coordinatorStatusFresh
 	) {
 		boolean matchingAuthentication = bridgeAuthenticated
 				&& launchId != null
 				&& launchId.equals(authenticatedLaunchId)
 				&& sessionGeneration > 0L;
 		if (matchingAuthentication) {
+			authenticationDeadlineEpochMs = 0L;
+			reconnectDeadlineEpochMs = 0L;
+			nextRetryEpochMs = 0L;
+			if (!coordinatorStatusFresh) {
+				// Authentication (including a new session for this child) cannot renew
+				// this deadline. Only an actual fresh status proves ongoing liveness.
+				if (statusRecoveryDeadlineEpochMs == 0L) {
+					statusRecoveryDeadlineEpochMs = now + STATUS_RECOVERY_TIMEOUT_MS;
+				}
+				state = CoordinatorRecoveryState.DEGRADED;
+				coordinatorReconciled = false;
+				authenticatedSinceEpochMs = 0L;
+				stabilityCredited = false;
+				setDiagnostic("COORDINATOR_STATUS_STALE",
+						"Authenticated coordinator status is missing or stale; waiting for fresh status", "coordinator_status");
+				if (now >= statusRecoveryDeadlineEpochMs) {
+					queueTermination(detachChild());
+					recordFailure(now, "COORDINATOR_STATUS_TIMEOUT",
+							"Coordinator stayed authenticated but did not refresh its status", "coordinator_status");
+				}
+				return;
+			}
+			statusRecoveryDeadlineEpochMs = 0L;
 			if (state != CoordinatorRecoveryState.HEALTHY
 					|| authenticatedSessionGeneration != sessionGeneration) {
 				state = CoordinatorRecoveryState.HEALTHY;
@@ -761,9 +806,6 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			}
 			failingBoundary = null;
 			clearDiagnostic();
-			authenticationDeadlineEpochMs = 0L;
-			reconnectDeadlineEpochMs = 0L;
-			nextRetryEpochMs = 0L;
 			if (!stabilityCredited && coordinatorReconciled
 					&& now - authenticatedSinceEpochMs >= STABILITY_INTERVAL_MS) {
 				if (runtime != null && runtime.candidate()) {
@@ -776,7 +818,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		}
 
 		if (state == CoordinatorRecoveryState.HEALTHY || state == CoordinatorRecoveryState.DEGRADED) {
-			if (state == CoordinatorRecoveryState.HEALTHY) {
+			if (reconnectDeadlineEpochMs == 0L) {
 				state = CoordinatorRecoveryState.DEGRADED;
 				coordinatorReconciled = false;
 				reconnectDeadlineEpochMs = now + RECONNECT_TIMEOUT_MS;
@@ -884,15 +926,9 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 
 	private void submitDependencyMaintenance(long requestedAt, boolean force, boolean initial) {
 		if (maintenancePending || stopped) return;
-		// Honor the deadline before touching dependency files. A no-op completion keeps
-		// the maintenance queue's ordering deterministic without calling safeFingerprint.
+		// No work needs ordering before the deadline. Wake notifications are drained
+		// by tickInternal and move the deadline to zero, including in-flight changes.
 		if (!force && orphanCleanupComplete && now() < nextDependencyCheckEpochMs) {
-			maintenancePending = true;
-			String observedFingerprint = dependencyFingerprint;
-			long submittedWakeGeneration = dependencyWakeGeneration.get();
-			submitMaintenance(() -> publishMaintenanceResult(new DependencyMaintenanceResult(
-					observedFingerprint, null, false, false, false, List.of(), submittedWakeGeneration
-			)));
 			return;
 		}
 		List<Path> cleanupRoots = orphanRuntimeRoots();
@@ -1096,6 +1132,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				processStartedEpochMs = launch.startedAtEpochMs();
 				authenticationDeadlineEpochMs = launch.startedAtEpochMs() + AUTHENTICATION_TIMEOUT_MS;
 				reconnectDeadlineEpochMs = 0L;
+				statusRecoveryDeadlineEpochMs = 0L;
 				authenticatedSinceEpochMs = 0L;
 				coordinatorReconciled = false;
 				stabilityCredited = false;
@@ -1277,6 +1314,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		processStartedEpochMs = 0L;
 		authenticationDeadlineEpochMs = 0L;
 		reconnectDeadlineEpochMs = 0L;
+		statusRecoveryDeadlineEpochMs = 0L;
 		authenticatedSinceEpochMs = 0L;
 		coordinatorReconciled = false;
 		stabilityCredited = false;
@@ -1285,7 +1323,8 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 
 	private static boolean candidateRuntimeFailure(String code) {
 		return "COORDINATOR_EXITED".equals(code)
-				|| "COORDINATOR_RECONNECT_TIMEOUT".equals(code);
+				|| "COORDINATOR_RECONNECT_TIMEOUT".equals(code)
+				|| "COORDINATOR_STATUS_TIMEOUT".equals(code);
 	}
 
 	private void setDiagnostic(String code, String message, String boundary) {
@@ -1315,6 +1354,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		processStartedEpochMs = 0L;
 		authenticationDeadlineEpochMs = 0L;
 		reconnectDeadlineEpochMs = 0L;
+		statusRecoveryDeadlineEpochMs = 0L;
 		return owned;
 	}
 
@@ -1468,16 +1508,20 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	}
 
 	private void configureDerivedVoiceRequestTimeout(Path configPath) {
-		if (ownsVoiceRequestTimeout) return;
 		String configured = System.getProperty(VOICE_REQUEST_TIMEOUT_PROPERTY);
-		if (configured != null && !configured.isBlank()) return;
+		// A later explicit override supersedes our publication just as an initial one does.
+		if (ownsVoiceRequestTimeout) {
+			if (!Objects.equals(configured, derivedVoiceRequestTimeout)) return;
+		} else if (configured != null && !configured.isBlank()) return;
+		String nextTimeout;
 		try {
-			derivedVoiceRequestTimeout = Integer.toString(CoordinatorVoiceEndpoint.requestTimeoutMs(configPath));
+			nextTimeout = Integer.toString(CoordinatorVoiceEndpoint.requestTimeoutMs(configPath));
 		} catch (IOException | RuntimeException invalidVoiceConfiguration) {
 			LOGGER.warn("Ignoring unavailable optional voice request timeout", invalidVoiceConfiguration);
 			return;
 		}
-		previousVoiceRequestTimeout = configured;
+		if (!ownsVoiceRequestTimeout) previousVoiceRequestTimeout = configured;
+		derivedVoiceRequestTimeout = nextTimeout;
 		System.setProperty(VOICE_REQUEST_TIMEOUT_PROPERTY, derivedVoiceRequestTimeout);
 		ownsVoiceRequestTimeout = true;
 	}

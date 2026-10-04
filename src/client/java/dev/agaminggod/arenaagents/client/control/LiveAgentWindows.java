@@ -63,6 +63,8 @@ public final class LiveAgentWindows {
  private static JsonObject latest=new JsonObject(); // EDT only
  private static String lastTerminal="";
  private static LiveTaskViewPayload.Snapshot lastSnapshot;
+ private record ParsedView(String json,JsonObject value) { }
+ private static volatile ParsedView parsedView;
  private static volatile String waitingStatus="Waiting for live task data";
  private static Path settingsPath;
  private static Timer refreshTimer;
@@ -100,7 +102,7 @@ public final class LiveAgentWindows {
  private static void clearView(String status) {
   PlanItemIcons.clear();
   waitingStatus=status; receivedAt=0;
-  SwingUtilities.invokeLater(()->{ latest=new JsonObject(); lastSnapshot=null; lastTerminal=""; refresh(); });
+  SwingUtilities.invokeLater(()->{ latest=new JsonObject(); lastSnapshot=null; parsedView=null; lastTerminal=""; refresh(); });
  }
  public static boolean togglePlan(AgentControlAgent agent) { select(agent); planEnabled=!planEnabled; return applySettings(); }
  public static boolean toggleTerminal(AgentControlAgent agent) { select(agent); terminalEnabled=!terminalEnabled; return applySettings(); }
@@ -125,8 +127,15 @@ public final class LiveAgentWindows {
  }
  public static void accept(LiveTaskViewPayload.Snapshot packet) {
   if(!packet.agentId().toString().equals(selected)) return;
+  // Cached replay still carries immediate online/offline status. Reuse only an
+  // identical, previously validated full body; events/usage/freshness are included.
+  // Keep validation of changed bodies off the Swing event thread.
+  ParsedView cached=parsedView;
   final JsonObject parsed;
-  try { parsed=LiveTaskViewData.parse(packet.json()); } catch(RuntimeException e) { LOGGER.warn("Rejected invalid live task display data",e); return; }
+  if(cached!=null && packet.json().equals(cached.json())) parsed=cached.value();
+  else try {
+   parsed=LiveTaskViewData.parse(packet.json()); parsedView=new ParsedView(packet.json(),parsed);
+  } catch(RuntimeException e) { LOGGER.warn("Rejected invalid live task display data",e); return; }
   SwingUtilities.invokeLater(()->{
    if(!packet.agentId().toString().equals(selected)) return;
    if(parsed.size()>0 && latest.size()>0) {
@@ -143,7 +152,7 @@ public final class LiveAgentWindows {
   PlanItemIcons.clear();
   wasConnected=false; receivedAt=0; pollTicks=0;
   waitingStatus="Disconnected from Minecraft";
-  SwingUtilities.invokeLater(()->{ latest=new JsonObject(); lastSnapshot=null; lastTerminal=""; disposeFrames(); });
+  SwingUtilities.invokeLater(()->{ latest=new JsonObject(); lastSnapshot=null; parsedView=null; lastTerminal=""; disposeFrames(); });
  }
  private static void disposeFrames() {
   if(planFrame!=null) planFrame.dispose(); if(terminalFrame!=null) terminalFrame.dispose();

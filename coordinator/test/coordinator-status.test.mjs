@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { buildCoordinatorStatus } from '../src/coordinator-status.mjs';
+import { ProviderTurnRecorder } from '../src/provider-turn-recorder.mjs';
+import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
 
 const pressure = {
 	active: 0, pending: 0, maxConcurrent: 4, maxPending: 12, warning: false,
@@ -11,6 +13,54 @@ const pressure = {
 	lastChangeReason: 'initial', healthyCompletions: 0, ordinaryReservationRejections: 0,
 	urgentReservationRejections: 0,
 };
+
+test('recorder recovery preserves cumulative capture loss through the public status wire', async () => {
+	let failSink = true;
+	let sinkCalls = 0;
+	const recorder = new ProviderTurnRecorder({
+		runId: 'capture-status', scenarioId: 'recovery', privatePath: null,
+		publicSink: () => { sinkCalls += 1; if (failSink) throw new Error('sink unavailable'); },
+	});
+	const waitFor = async (predicate) => {
+		for (let attempt = 0; attempt < 100; attempt += 1) {
+			if (predicate()) return;
+			await new Promise(setImmediate);
+		}
+		assert.fail('recorder did not settle');
+	};
+	const snapshot = () => buildCoordinatorStatus({
+		reconciled: true, records: [], supportedAgentIds: new Set(), readyStates: new Set(), pressure,
+		healthSnapshots: [], latencies: [], bridgeSessionEpoch: 1, runtimeGeneration: null,
+		components: [recorder.statusSnapshot()],
+	});
+	try {
+		await recorder.record({});
+		await waitFor(() => recorder.statusSnapshot().failedOperationCount === 1);
+		assert.equal(snapshot().components.find(({ component }) => component === 'provider_audit').state, 'degraded');
+		failSink = false;
+		await recorder.record({});
+		await waitFor(() => sinkCalls === 2 && recorder.statusSnapshot().state === 'ready');
+		const payload = JSON.parse(JSON.stringify(snapshot()));
+		const wire = validateProtocolV2Payload('coordinator_status', payload);
+		assert.deepEqual(wire, payload);
+		const audit = wire.components.find(({ component }) => component === 'provider_audit');
+		assert.equal(audit.state, 'ready');
+		assert.equal(audit.consecutiveFailureCount, 0);
+		assert.equal(audit.failedOperationCount, 1);
+		assert.equal(audit.droppedCount, 0);
+		assert.equal(audit.incompleteCapture, true);
+		for (const [field, invalid] of [
+			['failedOperationCount', -1], ['failedOperationCount', null], ['failedOperationCount', Number.MAX_SAFE_INTEGER + 1],
+			['droppedCount', 0.5], ['droppedCount', '1'], ['incompleteCapture', null], ['incompleteCapture', 'false'],
+		]) {
+			assert.throws(() => validateProtocolV2Payload('coordinator_status', {
+				...payload, components: [{ ...audit, [field]: invalid }],
+			}));
+		}
+		const { failedOperationCount, droppedCount, incompleteCapture, ...legacy } = audit;
+		assert.deepEqual(validateProtocolV2Payload('coordinator_status', { ...payload, components: [legacy] }).components, [legacy]);
+	} finally { await recorder.close(); }
+});
 
 test('coordinator status publishes exact profiles, epochs, runtime generation, and independent recovery components', () => {
 	const generation = 'a'.repeat(64);

@@ -54,7 +54,7 @@ public final class CameraPathVerification {
 				new CameraKeyframe(0, 1.0D, 0.0D, 0.0D, 0.0F, 0.0F))), "duplicate frame times are rejected");
 		try {
 			return 6 + verifyTripodCapture() + verifyDollyCapture() + verifyDelayedStart() + verifyUnboundedYaw() + verifyReplacement()
-					+ verifyRestart() + verifySaveFailure() + verifyDeleteAndClearFailure()
+					+ verifyRestart() + verifySaveFailure() + verifyCapacitySaveRetry() + verifyDeleteAndClearFailure()
 					+ verifyMalformedStorage() + verifyRecordingLevelChange() + verifyRecordingClockCorrection()
 					+ verifyPlaybackLevelChange() + verifyPlaybackRespawn() + verifyWriterFailure() + verifyAnchorAndPerspective() + verifyRenderedEyeHeight();
 		} catch (Exception exception) {
@@ -428,6 +428,61 @@ public final class CameraPathVerification {
 		Field field = CameraDirectorClient.class.getDeclaredField(name);
 		field.setAccessible(true);
 		return field.get(null);
+	}
+
+	/** Manual and automatic saves retain a bounded take across failed IO and later sample ticks. */
+	public static int verifyCapacitySaveRetry() throws Exception {
+		int checks = 0;
+		for (String mode : List.of("manual-failure", "manual-success", "automatic-failure", "command-failure")) {
+			try (Fixture fixture = new Fixture()) {
+				Path temporaryRoot = Path.of(System.getProperty("java.io.tmpdir")).toAbsolutePath().normalize();
+				assertTrue(fixture.directory.toAbsolutePath().normalize().startsWith(temporaryRoot), "fixture owns its temporary storage");
+				CameraDirectorClient.startRecordingFromGui("prior", false);
+				CameraDirectorClient.stopRecordingFromGui();
+				String prior = Files.readString(fixture.storage());
+				CameraDirectorClient.startDollyRecordingFromGui("capacity", false);
+				var cart = allocate(net.minecraft.world.entity.vehicle.minecart.Minecart.class);
+				setField(cart, Entity.class, "level", fixture.level);
+				setField(cart, Entity.class, "position", new Vec3(10, 64, 20));
+				setField(cart, Entity.class, "uuid", java.util.UUID.randomUUID());
+				invoke("enterDolly", new Class<?>[]{Minecraft.class, Entity.class}, fixture.client, cart);
+				setField(fixture.client.options, Options.class, "keyShift", allocate(net.minecraft.client.KeyMapping.class));
+				long start = fixture.level.gameTime;
+				for (int elapsed = 4; elapsed <= 2040; elapsed += 4) {
+					fixture.level.gameTime = start + elapsed;
+					invoke("tick", new Class<?>[]{Minecraft.class}, fixture.client);
+				}
+				boolean failing = !mode.equals("manual-success");
+				Path blocker = fixture.storage().resolveSibling("camera-paths.json.tmp");
+				if (failing) Files.createDirectory(blocker);
+				fixture.level.gameTime = start + (mode.equals("automatic-failure") ? 2044 : 2041);
+				if (mode.equals("automatic-failure")) invoke("tick", new Class<?>[]{Minecraft.class}, fixture.client);
+				else if (mode.equals("command-failure")) fixture.command("stopRecording");
+				else CameraDirectorClient.stopRecordingFromGui();
+				if (failing) {
+					assertTrue(CameraDirectorClient.isRecording(), "failed save retains the take: " + mode);
+					assertTrue(!(boolean) state("dollyRecording"), "failed finalization freezes sampling: " + mode);
+					Object take = state("recording");
+					Method frames = take.getClass().getDeclaredMethod("frames");
+					frames.setAccessible(true);
+					List<?> retained = List.copyOf((List<?>) frames.invoke(take));
+					assertEquals(CameraPath.MAX_KEYFRAMES, retained.size(), "full retained take remains valid");
+					fixture.level.gameTime = start + 2048;
+					invoke("tick", new Class<?>[]{Minecraft.class}, fixture.client);
+					assertTrue(retained.equals(frames.invoke(take)), "later tick preserves every retained frame");
+					assertTrue(Files.readString(fixture.storage()).equals(prior), "failed save preserves existing storage");
+					assertTrue(blocker.toAbsolutePath().normalize().startsWith(fixture.directory.toAbsolutePath().normalize()), "blocker belongs to fixture");
+					Files.delete(blocker);
+					CameraDirectorClient.stopRecordingFromGui();
+					assertTrue(fixture.paths.get("capacity").keyframes().equals(retained), "retry saves precisely the retained frames");
+					checks += 7;
+				}
+				assertTrue(!CameraDirectorClient.isRecording(), "successful save ends recording: " + mode);
+				assertEquals(CameraPath.MAX_KEYFRAMES, fixture.paths.get("capacity").keyframes().size(), "saved take is bounded: " + mode);
+				checks += 3;
+			}
+		}
+		return checks;
 	}
 
 	private static Object invoke(String name, Class<?>[] parameters, Object... arguments) throws Exception {

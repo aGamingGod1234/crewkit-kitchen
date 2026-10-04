@@ -63,7 +63,158 @@ public final class GoalVerificationRuntimeVerification {
 		assertions += verifySpokenCompletionConfirmation();
 		assertions += verifyAlternativeCompletionConfirmation();
 		assertions += verifyActionCompletionPrecedesFactualCompletion();
+		assertions += verifySurvivalWhileActing();
+		assertions += verifyUnloadedBlockFacts();
+		assertions += verifyMinecraftBlockAdapter();
+		assertions += verifyMinecraftInventoryAdapter();
 		return assertions;
+	}
+
+	private static int verifySurvivalWhileActing() {
+		Fixture fixture = fixture(new GoalPredicate.SurviveDuration(120), 850L);
+		long revision = fixture.record().goalRevision();
+		fixture.registry.beginAction(fixture.agentId, revision, fixture.now);
+		for (int tick = 0; tick < 120; tick++) {
+			if (!fixture.runtime.tick().isEmpty()) throw new AssertionError("survival cannot complete an in-flight action");
+			fixture.runtime.tick(); // Repeated checks in the same tick must not double count.
+			if (tick == 59) assertEquals("60 ticks", fixture.runtime.evaluate(fixture.agentId).facts().getFirst().observedValue(),
+					"same-tick action observations do not accelerate survival progress");
+			fixture.advance();
+		}
+		assertEquals(AgentLifecycleState.ACTING, fixture.record().state(), "full survival duration leaves action ownership intact");
+		assertEquals("120 ticks", fixture.runtime.evaluate(fixture.agentId).facts().getFirst().observedValue(), "survival includes all action ticks and deduplicates same-tick checks");
+		fixture.registry.actionFinished(fixture.agentId, revision, fixture.now);
+		assertEquals(1, fixture.runtime.tick().size(), "survival completes when the action result is committed");
+		assertEquals(GoalStatus.SATISFIED, fixture.goalStatus(), "action duration produces authoritative survival evidence");
+		return 5;
+	}
+
+	private static int verifyUnloadedBlockFacts() {
+		Fixture fixture = fixture(new GoalPredicate.BlockMatches(100000, 64, 100000, "minecraft:air", Map.of()), 975L);
+		fixture.facts.blocks.put("100000,64,100000", GoalCompletionVerifier.BlockFact.unavailable());
+		GoalCompletionVerifier.VerificationResult unavailable = fixture.runtime.evaluate(fixture.agentId);
+		assertEquals(false, unavailable.verified(), "unloaded remote block cannot satisfy an air goal");
+		assertEquals("block_unavailable", unavailable.facts().getFirst().type(), "unknown blocks have explicit unavailable evidence");
+		assertEquals("chunk not loaded", unavailable.facts().getFirst().observedValue(), "unknown blocks are not represented as observed air");
+		assertEquals(1, fixture.facts.blockReads, "unavailable facts are memoized within a verification");
+		fixture.advance();
+		fixture.facts.blocks.put("100000,64,100000", new GoalCompletionVerifier.BlockFact("minecraft:air", Map.of()));
+		assertEquals(1, fixture.runtime.tick().size(), "a later loaded block can satisfy the pending goal");
+		return 5;
+	}
+
+
+	/** Calls the real adapter; the fixture rejects all loading APIs before they can reach a world. */
+	private static int verifyMinecraftBlockAdapter() {
+		net.minecraft.SharedConstants.tryDetectVersion();
+		net.minecraft.server.Bootstrap.bootStrap();
+		AdapterPlayer player = allocateAdapterFixture(AdapterPlayer.class);
+		player.world = allocateAdapterFixture(AdapterLevel.class);
+		player.world.chunks = allocateAdapterFixture(AdapterChunks.class);
+		var facts = GoalCompletionVerifier.minecraftFacts(player);
+		assertEquals(false, facts.blockAt(-100001, 64, 100000).available(), "real adapter reports unloaded target unavailable");
+		assertEquals(-6251, player.world.chunks.x, "negative block coordinate maps to containing chunk");
+		assertEquals(6250, player.world.chunks.z, "positive block coordinate maps to containing chunk");
+		assertEquals(1, player.world.chunks.reads, "one non-loading chunk request");
+		player.world.chunks.loaded = allocateAdapterFixture(AdapterChunk.class);
+		assertEquals("minecraft:air", facts.blockAt(-100001, 64, 100000).blockId(), "same adapter sees newly available chunk");
+		assertEquals(2, player.world.chunks.reads, "loaded state checked afresh");
+		assertEquals(new net.minecraft.core.BlockPos(-100001, 64, 100000), player.world.chunks.loaded.position, "block read is local to returned chunk");
+		return 7;
+	}
+
+	private static int verifyMinecraftInventoryAdapter() {
+		net.minecraft.SharedConstants.tryDetectVersion();
+		net.minecraft.server.Bootstrap.bootStrap();
+		for (var item : List.of(net.minecraft.world.item.Items.DIRT, net.minecraft.world.item.Items.DIAMOND_PICKAXE)) {
+			item.builtInRegistryHolder().bindComponents(net.minecraft.core.component.DataComponentMap.builder()
+					.set(net.minecraft.core.component.DataComponents.MAX_STACK_SIZE, item == net.minecraft.world.item.Items.DIRT ? 64 : 1).build());
+		}
+		AdapterPlayer player = allocateAdapterFixture(AdapterPlayer.class);
+		player.inventory = allocateAdapterFixture(AdapterInventory.class);
+		player.inventory.stacks = new net.minecraft.world.item.ItemStack[] {
+				new net.minecraft.world.item.ItemStack(net.minecraft.world.item.Items.DIRT, 2),
+				new net.minecraft.world.item.ItemStack(net.minecraft.world.item.Items.DIAMOND_PICKAXE, 1),
+				net.minecraft.world.item.ItemStack.EMPTY
+		};
+		GoalPredicate item = new GoalPredicate.InventoryContains("minecraft:dirt", 2);
+		Fixture fixture = fixture(new GoalPredicate.AllOf(List.of(item, item,
+				new GoalPredicate.InventoryContainsAny(List.of("minecraft:dirt", "minecraft:diamond_pickaxe"), 3),
+				new GoalPredicate.InventoryContainsBlock(2))), 990L);
+		var verifier = new GoalCompletionVerifier();
+		var facts = GoalCompletionVerifier.minecraftFacts(player);
+		var first = verifier.verify(fixture.record(), facts, new AgentKillLedger(), 990L, false);
+		assertEquals(true, first.verified(), "real inventory adapter satisfies mixed leaves");
+		assertEquals(List.of("minecraft:dirt x2", "minecraft:dirt x2", "combined count 3", "placeable blocks x2"),
+				first.facts().stream().map(fact -> fact.observedValue()).toList(), "summary preserves per-leaf evidence counts");
+		assertEquals(3, player.inventory.reads, "mixed and duplicate leaves share one inventory traversal");
+		player.inventory.stacks[0] = net.minecraft.world.item.ItemStack.EMPTY;
+		assertEquals(false, verifier.verify(fixture.record(), facts, new AgentKillLedger(), 990L, false).verified(), "reused adapter sees same-tick mutation");
+		assertEquals(6, player.inventory.reads, "new verification creates a fresh inventory summary");
+		player.inventory.stacks[0] = new net.minecraft.world.item.ItemStack(net.minecraft.world.item.Items.DIRT, 2);
+		assertEquals(true, verifier.verify(fixture.record(), facts, new AgentKillLedger(), 991L, false).verified(), "next tick observes restored inventory");
+		assertEquals(9, player.inventory.reads, "next tick performs one fresh traversal");
+		assertEquals(2, facts.inventoryCount("minecraft:dirt"), "direct adapter queries remain live");
+		player.inventory.stacks[0] = net.minecraft.world.item.ItemStack.EMPTY;
+		assertEquals(0, facts.inventoryCount("minecraft:dirt"), "direct adapter query cannot retain a stale summary");
+		Fixture confirmation = fixture(new GoalPredicate.OperatorConfirmed(), 990L);
+		int before = player.inventory.reads;
+		verifier.verify(confirmation.record(), facts, new AgentKillLedger(), 991L, false);
+		assertEquals(before, player.inventory.reads, "non-inventory verification does not scan slots");
+		return 10;
+	}
+
+	// Constructors are never invoked: allocating inert subclasses avoids server/world I/O.
+	// Only the overridden methods below are reachable by the two adapter tests.
+	private static <T> T allocateAdapterFixture(Class<T> type) {
+		try {
+			Field field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+			field.setAccessible(true);
+			return type.cast(((sun.misc.Unsafe) field.get(null)).allocateInstance(type));
+		} catch (ReflectiveOperationException exception) { throw new AssertionError(exception); }
+	}
+
+	private static final class AdapterPlayer extends net.minecraft.server.level.ServerPlayer {
+		AdapterLevel world;
+		AdapterInventory inventory;
+		private AdapterPlayer() { super(null, null, null, null); }
+		@Override public net.minecraft.server.level.ServerLevel level() { return world; }
+		@Override public net.minecraft.world.entity.player.Inventory getInventory() { return inventory; }
+	}
+
+	private static final class AdapterLevel extends net.minecraft.server.level.ServerLevel {
+		AdapterChunks chunks;
+		private AdapterLevel() { super(null, null, null, null, null, null, false, 0L, List.of(), false); }
+		@Override public net.minecraft.server.level.ServerChunkCache getChunkSource() { return chunks; }
+		@Override public net.minecraft.world.level.block.state.BlockState getBlockState(net.minecraft.core.BlockPos position) {
+			throw new AssertionError("passive adapter invoked a loading level lookup");
+		}
+	}
+
+	private static final class AdapterChunks extends net.minecraft.server.level.ServerChunkCache {
+		AdapterChunk loaded;
+		int reads, x, z;
+		private AdapterChunks() { super(null, null, null, null, null, null, 0, 0, false, null, null); }
+		@Override public net.minecraft.world.level.chunk.LevelChunk getChunkNow(int x, int z) { reads++; this.x = x; this.z = z; return loaded; }
+		@Override public net.minecraft.world.level.chunk.ChunkAccess getChunk(int x, int z, net.minecraft.world.level.chunk.status.ChunkStatus status, boolean load) {
+			throw new AssertionError("passive adapter requested a loading chunk API");
+		}
+	}
+
+	private static final class AdapterChunk extends net.minecraft.world.level.chunk.LevelChunk {
+		net.minecraft.core.BlockPos position;
+		private AdapterChunk() { super((net.minecraft.world.level.Level) null, (net.minecraft.world.level.ChunkPos) null); }
+		@Override public net.minecraft.world.level.block.state.BlockState getBlockState(net.minecraft.core.BlockPos position) {
+			this.position = position; return net.minecraft.world.level.block.Blocks.AIR.defaultBlockState();
+		}
+	}
+
+	private static final class AdapterInventory extends net.minecraft.world.entity.player.Inventory {
+		net.minecraft.world.item.ItemStack[] stacks;
+		int reads;
+		private AdapterInventory() { super(null, null); }
+		@Override public int getContainerSize() { return stacks.length; }
+		@Override public net.minecraft.world.item.ItemStack getItem(int index) { reads++; return stacks[index]; }
 	}
 
 	private static int verifyActionCompletionPrecedesFactualCompletion() {

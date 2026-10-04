@@ -203,10 +203,23 @@ public final class AgentIdentity {
 	public static List<String> legacyPlayerNames(AgentId id, AgentProfile profile) {
 		Objects.requireNonNull(id, "id must not be null");
 		Objects.requireNonNull(profile, "profile must not be null");
-		return List.of(
+		List<String> names = new java.util.ArrayList<>(List.of(
 				legacyReadablePlayerName(id, profile),
 				profile.visualIdentity().transportCode() + "_" + id.shortValue().toUpperCase(Locale.ROOT)
-		).stream().distinct().toList();
+		));
+		// Gemini 3.7 Flash was previously missing from the manifest and used OSS handles.
+		// Keep both deployed handles so metadata correction does not orphan playerdata.
+		if (profile.provider().strip().equalsIgnoreCase("gemini")
+				&& profile.model().strip().equalsIgnoreCase("gemini-3.7-flash")) {
+			AgentVisualIdentity.Resolved oldVisual = AgentVisualIdentity.resolveFamily(
+					"gemini", "oss", AgentVisualIdentity.normalizedVariant(profile.skinVariant()));
+			String oldReadable = profile.userName()
+					.map(name -> recognizablePlayerCode(name, oldVisual.individualVariant()))
+					.orElseGet(() -> recognizablePlayerCode(oldVisual.shortModelLabel(), oldVisual.individualVariant()));
+			names.add(oldReadable + "_" + String.format(Locale.ROOT, "%08X", id.value().hashCode()));
+			names.add(oldVisual.transportCode() + "_" + id.shortValue().toUpperCase(Locale.ROOT));
+		}
+		return names.stream().distinct().toList();
 	}
 
 	private static Optional<SkinIdentity> legacySkin(
