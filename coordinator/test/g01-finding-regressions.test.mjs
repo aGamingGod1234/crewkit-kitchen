@@ -727,7 +727,11 @@ try {
 
 });
 
-test("g01 f055 bounded reply correction requires successful chat receipt in PAUSED COMPLETED and IDLE", { timeout: 15000 }, async () => {
+// Each lifecycle/mode scenario retains its own deadline instead of sharing one
+// aggregate budget across 21 real coordinator start/stop cycles.
+for (const state of ['PAUSED', 'COMPLETED', 'IDLE']) {
+  for (const mode of ['no-tool', 'no-tool-then-say', 'read-only', 'invalid-say', 'failed-say', 'valid-say', 'observe-then-say']) {
+test(`g01 f055 bounded reply correction requires successful chat receipt: ${state}/${mode}`, { timeout: 15000 }, async () => {
 const { EventEmitter } = await import('node:events');
 const { mkdir, rm, writeFile } = await import('node:fs/promises');
 const { default: path } = await import('node:path');
@@ -828,8 +832,6 @@ class Bridge extends EventEmitter {
   }
 }
 const results = [];
-for (const state of ['PAUSED', 'COMPLETED', 'IDLE']) {
-  for (const mode of ['no-tool', 'no-tool-then-say', 'read-only', 'invalid-say', 'failed-say', 'valid-say', 'observe-then-say']) {
     const fixture = path.resolve(directory, `fixture-${state}-${mode}`);
     assert.equal(path.dirname(fixture), directory);
 
@@ -902,13 +904,9 @@ for (const state of ['PAUSED', 'COMPLETED', 'IDLE']) {
       assert.equal(path.dirname(path.resolve(fixture)), directory);
 
     }
+});
   }
 }
-const evidence = { provenance: 'Adapted audited a27 probe with new three-state matrix, receipt failure and successful-retry/multi-tool controls', config: 'native_tools and verbosity defaults; in-process RPC/Minecraft fixtures', results, cleanup: '21 owned fixture directories removed; all coordinators, transports, bridge fixtures and captured goal timers stopped; no processes spawned.' };
-
-
-
-});
 
 test("g01 f019 completed lifecycle automatically recovers rejected steering with conversation-only authority", { timeout: 15000 }, async () => {
 const { EventEmitter } = await import('node:events');
