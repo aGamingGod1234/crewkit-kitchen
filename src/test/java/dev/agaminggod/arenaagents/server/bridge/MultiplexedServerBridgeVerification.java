@@ -2564,7 +2564,9 @@ public final class MultiplexedServerBridgeVerification {
 						2, helloAck.serverInstanceId(), idle.agentId().toString(), "agent_ready", "ready-before-atomic-wake", ready
 				));
 				awaitCondition(() -> {
-					activeBridge.tick();
+					// Await inbound readiness without manufacturing publication ticks in
+					// this spin loop; heartbeat output can otherwise fill the agent queue.
+					activeBridge.startTick();
 					return activeBridge.coordinatorReadyForVerification(idle.agentId());
 				}, "conversation fixture acknowledges coordinator readiness before publishing a wake");
 
@@ -2643,7 +2645,7 @@ public final class MultiplexedServerBridgeVerification {
 				socket.getOutputStream().flush();
 				MultiplexedServerBridge activeBridgeAfterAck = bridge;
 				awaitCondition(() -> {
-					activeBridgeAfterAck.tick();
+					activeBridgeAfterAck.startTick();
 					return manager.pendingConversationWakes().getFirst().acknowledged();
 				}, "matching coordinator acknowledgement is persisted");
 				assertEquals(1, manager.pendingConversationWakes().size(),
@@ -2653,7 +2655,7 @@ public final class MultiplexedServerBridgeVerification {
 				writeEnvelope(socket, codec, new BridgeEnvelope(
 						2, helloAck.serverInstanceId(), idle.agentId().toString(), "agent_ready", "ready-after-replay", replayReady));
 				awaitCondition(() -> {
-					activeBridgeAfterAck.tick();
+					activeBridgeAfterAck.startTick();
 					return activeBridgeAfterAck.coordinatorReadyForVerification(idle.agentId());
 				}, "coordinator is ready to receive the next direct task after reconnect");
 				AgentRecord priorRecord = manager.registry().require(idle.agentId());

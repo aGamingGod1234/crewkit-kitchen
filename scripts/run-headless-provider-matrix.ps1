@@ -942,7 +942,9 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 		$peakProcessCount = [int] $resourcePeak.processCount
 		$peakRssBytes = [long] $resourcePeak.peakRssBytes
 		$runnerExit = $runnerHandle.Process.ExitCode
-		Complete-RedirectedProcess $runnerHandle
+		# Drain all redirected streams in cleanup after stopping the other writers.
+		# Framework pipe readers can occupy the small worker pool on CI; waiting
+		# here can time out an exited runner behind still-live sibling pipe reads.
 		if ($CapabilityProbe) {
 			$runnerReport = Read-BoundedJson (Join-Path $scenarioDirectory 'player-capability-report.json') $MaxMatrixReportBytes 'player capability probe report'
 			if (@('PASSED', 'FAILED') -notcontains [string] $runnerReport.status) { throw 'Player capability probe returned an invalid status' }

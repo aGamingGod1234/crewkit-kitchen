@@ -32,15 +32,17 @@ Additional reproduced CI corrections isolate Windows PowerShell's child module s
 
 The full updater regression also exposed a test-only path-length failure in nested backup hashing under Windows PowerShell 5.1. Its temporary-directory prefix is shorter while retaining spaces, a unique identifier and every assertion. This is not a claim of unrestricted production long-path support.
 
+The first CI run of the follow-up exposed two further integration issues. The paired launcher drained an exited runner before stopping sibling processes whose .NET Framework pipe readers could occupy a small worker pool. Draining now occurs once, after those writers stop. A two-thread fixture reproduces the old failure and passes after the correction; existing cleanup deadlines and containment checks remain. Separately, the Java atomic-wake fixture busy-waited by advancing both bridge phases, generating heartbeat traffic until the bounded outbound agent queue filled. Its acknowledgement waits now advance inbound admission only. Production backpressure and publication behavior are unchanged.
+
 ## Integrated verification
 
-- Windows Node **22.23.2**: **2,517 passed, 0 failed, 3 skipped**, using `node --test --test-concurrency=4 --test-timeout=60000`. The skips are two POSIX-specific checks and opt-in Windows speech integration. The initial integration run exposed two fixture-discovery failures; both were corrected before this complete rerun.
+- Windows Node **22.23.2**: **2,518 passed, 0 failed, 3 skipped**, using `node --test --test-concurrency=4 --test-timeout=60000`, after the output-drain correction and its new regression. The skips are two POSIX-specific checks and opt-in Windows speech integration. The initial integration run exposed two fixture-discovery failures; both were corrected before the earlier 2,517-pass complete rerun.
 - Fresh offline Java 25 verification passed `verifyEntrypoints verifyCore verifyDirector verifyCameraMixin verifyMapBlockStateCatalog verifyMapStructureDataFixer :voice-addon:verifyVoiceAddon`. Both JARs built from the integrated source, using existing cached dependencies and fresh output directories.
 - All **114** embedded coordinator files match current source and extracted JAR bytes. The packaged smoke check parsed **91** reachable modules and exercised the packaged entrypoint, fact roundtrip, diagnostic queue and inbox reload/consume paths.
 - The complete normal-profile updater regression passed against those current JARs and the bundled Node runtime in an isolated temporary fixture: fresh rollback, all six failure points, strict existing-file parity, allowed backup retention, pruning and a subsequent successful update. No existing game installation was changed.
 - Focused Java scenario, control-sync, recovery and legacy-control checks passed on Windows and Ubuntu WSL Java 25. Focused compatibility checks passed on Node **22.0.0** and **22.23.2**, including all corruption controls. These focused checks overlap integrated coverage.
 
-GitHub's Reliability workflow still has to validate the new PR commit on its own Windows and Ubuntu runners. Old-head results are not evidence for this update.
+GitHub's Ubuntu job passed its coordinator, POSIX process and Java `verifyCore` checks at `8ef118b3` (run `37220217376`). Its Windows failures prompted the output-drain and atomic-wake fixture corrections above. The complete Reliability workflow must pass again on the new commit. Old-head results are not evidence for this update.
 
 ## Scope and limits
 
