@@ -208,7 +208,10 @@ export class NativeGoalHarness {
 		await eventually(() => this.#bridge.sent.some((entry) => entry.type === 'agent_ready'));
 		await this.#bridge.startGoal(this.#scenario.goal, 1);
 		this.#sampleListeners();
-		const deadline = Date.now() + (this.#scenario.timeoutMs ?? 2_000);
+		// Completion assertions follow the lifecycle event, not an observation
+		// window. The test runner's existing file deadline bounds a missing event.
+		const waitForCompletion = stopAfter === 'completion';
+		const deadline = waitForCompletion ? Infinity : Date.now() + (this.#scenario.timeoutMs ?? 2_000);
 		while (Date.now() < deadline) {
 			await tick();
 			this.#sampleListeners();
@@ -223,7 +226,7 @@ export class NativeGoalHarness {
 			if (stopWhen?.(this.#result())) break;
 			if (stopAfter === 'first-turn' && this.#provider.turns >= 1) break;
 			if ([DynamicAgentState.COMPLETED, DynamicAgentState.PAUSED, DynamicAgentState.ERROR].includes(record?.state)) break;
-			if (this.#provider.turns >= this.#scenario.turns.length && this.#scenario.stopWhenScriptExhausted) break;
+			if (!waitForCompletion && this.#provider.turns >= this.#scenario.turns.length && this.#scenario.stopWhenScriptExhausted) break;
 		}
 		if (this.#registry.get(AGENT_ID)?.state === DynamicAgentState.PAUSED) {
 			// Deliver any already-queued timer callbacks after pause, before stop

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
 
 import { DynamicAgentState } from '../src/agent-registry.mjs';
 import {
@@ -151,7 +152,7 @@ test('completion results cannot override unsatisfied factual predicates', async 
 });
 
 test('completion verifies the immutable compound position and block predicates', async () => {
-	const result = await createNativeGoalHarness({
+	const harness = createNativeGoalHarness({
 		goalPredicate: {
 			type: 'all_of',
 			predicates: [
@@ -164,9 +165,24 @@ test('completion verifies the immutable compound position and block predicates',
 			[{ kind: 'finish', summary: 'Factual world predicates are present.' }],
 		],
 		timeoutMs: 100,
-	}).run();
+	});
+	const createAgent = harness.provider.createAgent.bind(harness.provider);
+	let delayed = false;
+	harness.provider.createAgent = async (record) => {
+		// Cross the former observation window before the first goal turn starts.
+		if (!delayed && record.goalRevision === 1) { delayed = true; await delay(200); }
+		return createAgent(record);
+	};
+	const result = await harness.run({ stopAfter: 'completion' });
+	assert.equal(delayed, true);
 	assert.equal(result.finalState, DynamicAgentState.COMPLETED);
 	assert.equal(result.recoveries.includes('COMPLETION_REJECTED'), false);
+	assert.equal(result.completionEvaluations.length, 1);
+	assert.equal(result.completionEvaluations[0].goalFingerprint, result.goalSpec.fingerprint);
+	assert.deepEqual(result.completionEvaluations[0].facts.map(({ type, satisfied }) => ({ type, satisfied })), [
+		{ type: 'position_within', satisfied: true },
+		{ type: 'block_matches', satisfied: true },
+	]);
 });
 
 test('failed actions do not mutate simulated world facts', async () => {
