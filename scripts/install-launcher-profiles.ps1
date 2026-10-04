@@ -37,7 +37,7 @@ if (-not (Test-Path -LiteralPath $SecretPath -PathType Leaf)) {
     $bytes = New-Object byte[] $BridgeSecretBytes
     $random = [Security.Cryptography.RandomNumberGenerator]::Create()
     try { $random.GetBytes($bytes) } finally { $random.Dispose() }
-    $generatedSecret = [Convert]::ToHexString($bytes).ToLowerInvariant()
+    $generatedSecret = (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
     try {
         $stream = [IO.File]::Open($SecretPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
         try {

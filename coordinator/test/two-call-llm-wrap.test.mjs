@@ -53,3 +53,32 @@ test('death recovery facts continue across later observations', () => {
 	assert.equal(result.recovery.lastLostInventory[0].itemId, 'minecraft:stone_pickaxe');
 	assert.equal(result.options, undefined);
 });
+
+test('remembered stations and inventory remain qualified through summary and compatibility wrapper', () => {
+	const wrap = new TwoCallLlmWrap();
+	const station = { blockId: 'minecraft:crafting_table', x: 1, y: 64, z: 1 };
+	const world = { worldId: 'one', dimension: 'minecraft:overworld' };
+	const live = { world, inventory: { items: [{ itemId: 'minecraft:diamond', count: 1 }] }, blocks: [station] };
+	wrap.ingest('a', live);
+	const current = wrap.decorate('a', live);
+	assert.match(current.recovery.facts, /Currently evidenced: minecraft:diamond, minecraft:crafting_table/);
+	const remembered = wrap.ingestAndDecorate('a', { world, blocks: [] });
+	assert.doesNotMatch(remembered.recovery.facts, /Currently evidenced|Current inventory is empty/);
+	assert.match(remembered.recovery.facts, /Remembered \(not currently verified\): minecraft:diamond, minecraft:crafting_table/);
+	assert.equal(remembered.recovery.alreadyHaveFacts.every((entry) => entry.remembered), true);
+	const compat = wrapTwoCallObservation({ world }, remembered.recovery);
+	assert.equal(compat.recovery.facts, remembered.recovery.facts);
+	assert.deepEqual(compat.recovery.alreadyHaveFacts, remembered.recovery.alreadyHaveFacts);
+	const contradicted = wrap.ingestAndDecorate('a', { world, inventory: { items: [] }, blocks: [{ ...station, blockId: 'minecraft:stone' }] });
+	assert.equal(contradicted.recovery, undefined);
+});
+
+test('merged death sections retain historical provenance instead of claiming current evidence', () => {
+	const wrap = new TwoCallLlmWrap();
+	const blocks = [{ blockId: 'minecraft:crafting_table', x: 1, y: 64, z: 1 }];
+	wrap.ingest('a', { blocks, inventory: { items: [] } });
+	const dead = wrap.ingestAndDecorate('a', { death, blocks, inventory: { items: [] }, continuity: { rememberedSections: ['blocks'] } });
+	assert.match(dead.recovery.facts, /Remembered \(not currently verified\): minecraft:crafting_table/);
+	assert.doesNotMatch(dead.recovery.facts, /Currently evidenced/);
+	assert.equal(dead.recovery.alreadyHaveFacts[0].remembered, true);
+});

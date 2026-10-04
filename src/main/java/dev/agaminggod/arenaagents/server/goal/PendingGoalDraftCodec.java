@@ -91,7 +91,7 @@ public final class PendingGoalDraftCodec {
 		}
 	}
 
-	private static JsonObject encodeConstraint(GoalTranslationConstraint constraint) {
+	private JsonObject encodeConstraint(GoalTranslationConstraint constraint) {
 		JsonObject json = new JsonObject();
 		JsonArray clauses = new JsonArray();
 		for (GoalTranslationConstraint.KillClause clause : constraint.killClauses()) {
@@ -121,12 +121,16 @@ public final class PendingGoalDraftCodec {
 			itemClauses.add(clauseJson);
 		}
 		json.add("item_clauses", itemClauses);
+		JsonArray facts = new JsonArray();
+		constraint.factualPredicates().forEach(fact -> facts.add(goalCodec.encodePredicateObject(fact)));
+		json.add("factual_predicates", facts);
 		return json;
 	}
 
-	private static GoalTranslationConstraint decodeConstraint(JsonObject json) {
+	private GoalTranslationConstraint decodeConstraint(JsonObject json) {
 		boolean legacyItemConstraints = json.keySet().equals(Set.of("kill_clauses"));
-		if (!legacyItemConstraints && !json.keySet().equals(Set.of("kill_clauses", "item_clauses"))) {
+		if (!legacyItemConstraints && !json.keySet().equals(Set.of("kill_clauses", "item_clauses"))
+				&& !json.keySet().equals(Set.of("kill_clauses", "item_clauses", "factual_predicates"))) {
 			throw failure("UNKNOWN_GOAL_DRAFT_FIELD", "Translation constraint fields differ from the closed schema");
 		}
 		JsonElement clausesValue = field(json, "kill_clauses");
@@ -157,9 +161,15 @@ public final class PendingGoalDraftCodec {
 		ArrayList<GoalTranslationConstraint.ItemClause> itemClauses = legacyItemConstraints
 				? new ArrayList<>()
 				: decodeItemClauses(json);
-		return clauses.isEmpty() && itemClauses.isEmpty()
-				? GoalTranslationConstraint.none()
-				: new GoalTranslationConstraint(clauses, itemClauses);
+		ArrayList<GoalPredicate> facts = new ArrayList<>();
+		if (json.has("factual_predicates")) {
+			JsonElement values = field(json, "factual_predicates");
+			if (!values.isJsonArray()) throw failure("INVALID_GOAL_DRAFT", "factual_predicates must be an array");
+			for (JsonElement value : values.getAsJsonArray()) {
+				facts.add(goalCodec.decodePredicateObject(object(value, "factual_predicate")));
+			}
+		}
+		return new GoalTranslationConstraint(clauses, itemClauses, facts);
 	}
 
 	private static ArrayList<GoalTranslationConstraint.ItemClause> decodeItemClauses(JsonObject json) {

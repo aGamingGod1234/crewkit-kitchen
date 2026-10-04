@@ -676,7 +676,7 @@ final class SpeechCaptureEngineVerification {
 		return 3;
 	}
 
-	private static int verifyPendingUtteranceCoalescesToLatest() {
+	private static int verifyPendingUtteranceCoalescesToLatest() throws Exception {
 		ControlledTranscriber transcriber = new ControlledTranscriber();
 		SpeechCaptureEngine engine = new SpeechCaptureEngine(transcriber, scheduler(), 5_000L, 1);
 		List<Delivered> delivered = new ArrayList<>();
@@ -687,6 +687,16 @@ final class SpeechCaptureEngineVerification {
 		engine.accept(PLAYER, false, new byte[] { 3 }, RecordingDecoder::new, Runnable::run, delivery);
 
 		assertEquals(1, transcriber.pending.size(), "only the active STT reaches the worker");
+		var queuesField = SpeechCaptureEngine.class.getDeclaredField("transcriptQueues");
+		queuesField.setAccessible(true);
+		Object queue = ((Map<?, ?>) queuesField.get(engine)).get(PLAYER);
+		var completedField = queue.getClass().getDeclaredField("completed");
+		completedField.setAccessible(true);
+		Object skipped = ((Map<?, ?>) completedField.get(queue)).get(2L);
+		var utteranceField = skipped.getClass().getDeclaredField("utterance");
+		utteranceField.setAccessible(true);
+		assertEquals(null, utteranceField.get(skipped),
+				"discarded ordering marker retains neither PCM nor its captured delivery context");
 		transcriber.complete(1L, "first");
 		assertEquals(false, transcriber.pending.containsKey(2L), "superseded pending speech never reaches STT");
 		assertEquals(true, transcriber.pending.containsKey(3L), "latest bounded pending speech reaches STT");
@@ -697,7 +707,7 @@ final class SpeechCaptureEngineVerification {
 				"coalescing retains one latest utterance without blocking transcript order"
 		);
 		engine.close();
-		return 4;
+		return 5;
 	}
 
 	private static int verifyUnavailableSttRecoversAfterBackoff() {

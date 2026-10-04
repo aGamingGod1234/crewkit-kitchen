@@ -6,7 +6,7 @@ import { parseArenaScript } from './arena-script/parser.mjs';
 import { ArenaScriptEngine } from './arena-script/program-engine.mjs';
 import { freezeQueryResult } from './arena-script/interpreter.mjs';
 import { normalizeRetryReason, validateTraceId } from './control-latency-registry.mjs';
-import { buildPlannerInput } from './prompts.mjs';
+import { buildPlannerInput, buildPlannerRequest } from './prompts.mjs';
 import { classifyRecoveryFailure } from './recovery-policy.mjs';
 import { normalizeMinecraftToolCall } from './native-minecraft-tools.mjs';
 
@@ -27,6 +27,7 @@ export class ProgramRuntimeManager {
 	#onCompleted;
 	#onCompletionRequested;
 	#plannerContext;
+	#onContextAccepted;
 	#recorder;
 	#completionRetryDelayMs;
 	#completionRetryLimit;
@@ -38,7 +39,7 @@ export class ProgramRuntimeManager {
 	#memoryOperation;
 	#sessionId;
 
-	constructor({ registry, bridge, planner, reportError = () => {}, trace = () => {}, onCompleted = () => {}, onCompletionRequested = () => {}, requestRecovery = () => {}, plannerContext = () => ({}), inspectObservation = async () => ({ state: 'FAILED', reasonCode: 'INSPECTION_UNAVAILABLE' }), memoryOperation = async () => ({ state: 'FAILED', reasonCode: 'MEMORY_UNAVAILABLE' }), compilerCorrectionLimit = 1, latencyRegistry = null, clock = performance.now.bind(performance), recorder = null, benchmarkRecorder = null, completionRetryDelayMs = 1_000, completionRetryLimit = 5, cancellationAckTimeoutMs = 5_000, setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout, sessionId = randomUUID() } = {}) {
+	constructor({ registry, bridge, planner, reportError = () => {}, trace = () => {}, onCompleted = () => {}, onCompletionRequested = () => {}, requestRecovery = () => {}, plannerContext = () => ({}), onContextAccepted = () => {}, inspectObservation = async () => ({ state: 'FAILED', reasonCode: 'INSPECTION_UNAVAILABLE' }), memoryOperation = async () => ({ state: 'FAILED', reasonCode: 'MEMORY_UNAVAILABLE' }), compilerCorrectionLimit = 1, latencyRegistry = null, clock = performance.now.bind(performance), recorder = null, benchmarkRecorder = null, completionRetryDelayMs = 1_000, completionRetryLimit = 5, cancellationAckTimeoutMs = 5_000, setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout, sessionId = randomUUID() } = {}) {
 		if (!registry || !bridge || !planner) throw new TypeError('registry, bridge, and planner are required');
 		if (typeof bridge.send !== 'function' || typeof planner.requestPlan !== 'function') throw new TypeError('bridge.send and planner.requestPlan are required');
 		if (typeof reportError !== 'function') throw new TypeError('reportError must be a function');
@@ -46,6 +47,7 @@ export class ProgramRuntimeManager {
 		if (typeof onCompleted !== 'function') throw new TypeError('onCompleted must be a function');
 		if (typeof onCompletionRequested !== 'function') throw new TypeError('onCompletionRequested must be a function');
 		if (typeof requestRecovery !== 'function') throw new TypeError('requestRecovery must be a function');
+		if (typeof onContextAccepted !== 'function') throw new TypeError('onContextAccepted must be a function');
 		if (typeof plannerContext !== 'function') throw new TypeError('plannerContext must be a function');
 		if (typeof inspectObservation !== 'function') throw new TypeError('inspectObservation must be a function');
 		if (typeof memoryOperation !== 'function') throw new TypeError('memoryOperation must be a function');
@@ -60,6 +62,7 @@ export class ProgramRuntimeManager {
 		this.#onCompletionRequested = onCompletionRequested;
 		this.#requestRecovery = requestRecovery;
 		this.#plannerContext = plannerContext;
+		this.#onContextAccepted = onContextAccepted;
 		this.#inspectObservation = inspectObservation;
 		this.#memoryOperation = memoryOperation;
 		if (!Number.isSafeInteger(compilerCorrectionLimit) || compilerCorrectionLimit < 0) throw new TypeError('compilerCorrectionLimit must be a non-negative safe integer');
@@ -88,8 +91,8 @@ export class ProgramRuntimeManager {
 		}
 		const state = this.#state(record, observation, eventSequence, traceId ?? decision?.traceId);
 		if (decision?.directive === 'finish') {
-			this.#requestCompletion(record, state);
-			return state.engine?.snapshot() ?? null;
+			// Lower the explicit terminal directive into a correction-capable lifecycle.
+			return this.#installSource(state, record, 'program.onUnhandledAttention("pause_and_notify"); program.finish("Planner requested completion");', observation, eventSequence);
 		}
 		if (decision?.directive !== 'replace' || typeof decision.source !== 'string') {
 			throw codedError('INVALID_PLANNER_DIRECTIVE', 'Initial model decision must replace with ArenaScript source');
@@ -503,7 +506,7 @@ export class ProgramRuntimeManager {
 				if (installed !== null) state.corrections.delete(correctionKey);
 				return installed;
 			}
-			if (!sameEngineRequest(state.engine.snapshot(), context)) {
+			if (!state.engine.isCurrentDirectiveRequest(context)) {
 				state.engine.failDirectiveRequest(context);
 				this.#traceState(state, 'program_replacement_rejected', {
 					programId: context.programId,
@@ -593,7 +596,7 @@ export class ProgramRuntimeManager {
 				agentId: record.agentId,
 				goalRevision: record.goalRevision,
 				preserveState: true,
-				input: buildPlannerInput({
+				...buildPlannerRequest({
 					agent: { agentId: record.agentId, provider: record.provider, model: record.model, reasoningEffort: record.reasoningEffort, serviceTier: record.serviceTier ?? state.serviceTier },
 					goal: record.currentGoal,
 					goalRevision: record.goalRevision,
@@ -612,9 +615,10 @@ export class ProgramRuntimeManager {
 				priority: context.priority,
 			});
 			if (state.disposed || this.#registry.get(record.agentId)?.goalRevision !== record.goalRevision) return;
+			const contextAccepted = state.engine.isCurrentDirectiveRequest(context);
 			if (decision?.traceId !== undefined) this.#setTrace(state, decision.traceId);
 			if (decision?.directive === 'replace') {
-				if (!sameEngineRequest(state.engine.snapshot(), context)) {
+				if (!state.engine.isCurrentDirectiveRequest(context)) {
 					state.engine.failDirectiveRequest(context);
 					this.#traceState(state, 'program_replacement_rejected', {
 						programId: context.programId,
@@ -647,7 +651,7 @@ export class ProgramRuntimeManager {
 				state.engine.applyDirective({ ...context, traceId: decision.traceId ?? state.traceId, directive: 'replace', install: { programId: `program-${record.goalRevision}-${version}`, version, compiled } });
 				this.#traceProgramInstall(state, record, decision.source, version, context.eventSequence);
 			} else {
-				const accepted = sameEngineRequest(state.engine.snapshot(), context);
+				const accepted = state.engine.isCurrentDirectiveRequest(context);
 				state.explicitPause = decision?.directive === 'pause';
 				state.engine.applyDirective({ ...context, directive: decision?.directive, status: decision?.status });
 				if (accepted && decision?.directive === 'finish') {
@@ -655,8 +659,11 @@ export class ProgramRuntimeManager {
 				}
 				else if (accepted && ['continue', 'replace'].includes(decision?.directive)) state.terminalStatus = null;
 			}
+			if (contextAccepted && decision?.contextReceipt != null) this.#onContextAccepted(record, decision.contextReceipt);
 			this.#syncState(record, state);
 		} catch (error) {
+			// A disposed request must never report a failure against its successor.
+			if (state.disposed || this.#registry.get(record.agentId)?.goalRevision !== state.goalRevision) return;
 			if (error?.code === 'PLAN_CANCELLED' && state.reactivePreemptionRequested && context.priority !== 'urgent') {
 				state.engine.failDirectiveRequest(context);
 				return;
@@ -1250,18 +1257,6 @@ function actionArguments(type, value) {
 	throw codedError('INVALID_ARENA_SCRIPT_COMMAND', `ArenaScript primitive '${type}' requires an object argument`);
 }
 function requestKey(context) { return [context.programId, context.version, context.generation, context.lifecycleEpoch, context.continuationEpoch, context.activeActionId, context.eventSequence, context.factsSequence].join('\u0000'); }
-function sameEngineRequest(snapshot, context) {
-	return snapshot.programId === context.programId
-		&& snapshot.version === context.version
-		&& snapshot.generation === context.generation
-		&& snapshot.lifecycleEpoch === context.lifecycleEpoch
-		&& snapshot.continuationEpoch === context.continuationEpoch
-		&& snapshot.activeActionId === context.activeActionId
-		&& snapshot.eventSequence === context.eventSequence
-		&& snapshot.factsSequence === context.factsSequence
-		&& snapshot.pendingRequestPriority === context.priority
-		&& snapshot.pendingRequestTrigger === context.trigger;
-}
 function mergeReactiveRequest(previous, next) {
 	if (previous === null || previous === undefined) return next;
 	const priority = previous.priority === 'urgent' || next.priority === 'urgent' ? 'urgent' : 'ordinary';

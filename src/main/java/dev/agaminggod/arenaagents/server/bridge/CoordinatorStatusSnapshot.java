@@ -114,8 +114,18 @@ public record CoordinatorStatusSnapshot(
 			int consecutiveFailureCount,
 			Long nextProbeAtEpochMs,
 			long generation,
-			Long lastRecoveryAtEpochMs
+			Long lastRecoveryAtEpochMs,
+			Long failedOperationCount,
+			Long droppedCount,
+			Boolean incompleteCapture
 	) {
+		public ComponentRecovery(String component, String state, String fallbackMode, String boundary, String failureCode,
+				int consecutiveFailureCount, Long nextProbeAtEpochMs, long generation, Long lastRecoveryAtEpochMs) {
+			// Older snapshots do not establish whether the diagnostic capture is complete.
+			this(component, state, fallbackMode, boundary, failureCode, consecutiveFailureCount, nextProbeAtEpochMs,
+					generation, lastRecoveryAtEpochMs, null, null, null);
+		}
+
 		public ComponentRecovery {
 			component = nonblank(component, "component");
 			state = nonblank(state, "state");
@@ -125,6 +135,10 @@ public record CoordinatorStatusSnapshot(
 			failureCode = nullableBounded(failureCode, "failureCode");
 			if (consecutiveFailureCount < 0 || generation < 0L || nextProbeAtEpochMs != null && nextProbeAtEpochMs < 0L
 					|| lastRecoveryAtEpochMs != null && lastRecoveryAtEpochMs < 0L) throw new IllegalArgumentException("invalid component recovery counters");
+			if (failedOperationCount != null && (failedOperationCount < 0L || failedOperationCount > 9_007_199_254_740_991L)
+					|| droppedCount != null && (droppedCount < 0L || droppedCount > 9_007_199_254_740_991L)) {
+				throw new IllegalArgumentException("invalid component capture counters");
+			}
 		}
 	}
 

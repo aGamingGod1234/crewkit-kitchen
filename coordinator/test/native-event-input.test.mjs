@@ -71,8 +71,9 @@ test('oversized native event input keeps death recovery instead of dropping it',
 	assert.equal(payload.observation.resultCoverage.blocks.availableInSnapshot, 201);
 	assert.equal(payload.observation.resultCoverage.blocks.omitted, 189);
 	assert.equal(payload.observation.resultCoverage.inventory.omitted, 48);
-	assert.equal(payload.conversation.entries.at(-1).sequence, 12);
-	assert.equal(payload.conversation.omittedEntries, 4);
+	assert.deepEqual(payload.conversation.entries.map(entry => entry.sequence), Array.from({ length: 12 }, (_, index) => index + 1));
+	assert.equal(payload.conversation.nextSequence, 12);
+	assert.equal(payload.conversation.omittedEntries, 0, 'optional world compaction makes room for the entire unread conversation');
 	assert.ok(Buffer.byteLength(input, 'utf8') <= 20_000);
 });
 

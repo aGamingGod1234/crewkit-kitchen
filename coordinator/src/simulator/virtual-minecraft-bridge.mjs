@@ -155,6 +155,15 @@ export class VirtualMinecraftBridge extends EventEmitter {
 			this.#world.setActiveAction(result.agentId, null);
 			this.#complete(active, result);
 		}
+		// Hazards can interrupt multi-tick actions. Routine movement/inventory changes
+		// still wait for completion and do not generate per-tick observations.
+		for (const active of this.#active.values()) {
+			const current = this.#world.attentionState?.(active.agentId) ?? this.#world.observation(active.agentId);
+			const changedFacts = completionAttentionFacts(active.baselineObservation, current);
+			if (changedFacts.length === 0) continue;
+			active.baselineObservation = current;
+			this.#publishObservation(active.record, { attention: true, changedFacts });
+		}
 	}
 
 	#cancel(record, payload) {

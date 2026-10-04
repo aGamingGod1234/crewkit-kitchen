@@ -190,8 +190,18 @@ export async function runTask9SimulatorMatrix({ matrix, runMatrix = runLatencyMa
 	if (typeof runMatrix !== 'function') throw new TypeError('runMatrix must be a function');
 	const liveTrial = normalized.trials.find((trial) => trial.mode === 'live');
 	if (liveTrial) throw new Error(`Task 9 deterministic harness rejects live trial '${liveTrial.id}'; use the isolated Desktop gate separately`);
-	const run = await runMatrix({ ...options, matrix: { version: 1, benchmarkVersion: normalized.benchmarkVersion, protocolVersion: normalized.protocolVersion, fixedSeeds: normalized.fixedSeeds, agentLoads: normalized.agentLoads, trials: normalized.trials.map((trial) => ({ ...trial, providerAvailabilityRequired: true })) }, includeRawEvents: true });
+	const customScheduler = options.planningScheduler !== undefined || typeof options.planningSchedulerFactory === 'function';
+	const scheduler = normalizeScheduler(options.scheduler ?? { mode: 'fixed', fixedConcurrency: options.planningConcurrency ?? 16, urgentReserve: 0 });
+	if (scheduler.mode === 'adaptive' && !customScheduler && runMatrix === runLatencyMatrix) throw new TypeError('adaptive scheduler requires an explicit planning scheduler or factory');
+	if (scheduler.mode === 'fixed' && options.planningConcurrency !== undefined && options.planningConcurrency !== scheduler.fixedConcurrency) throw new TypeError('scheduler fixedConcurrency conflicts with planningConcurrency');
+	const executionOptions = scheduler.mode === 'fixed' && !customScheduler ? { ...options, planningConcurrency: scheduler.fixedConcurrency, planningMaxPending: scheduler.maxPending ?? undefined, planningUrgentReserve: scheduler.urgentReserve } : options;
+	const run = await runMatrix({ ...executionOptions, matrix: { version: 1, benchmarkVersion: normalized.benchmarkVersion, protocolVersion: normalized.protocolVersion, fixedSeeds: normalized.fixedSeeds, agentLoads: normalized.agentLoads, trials: normalized.trials.map((trial) => ({ ...trial, providerAvailabilityRequired: true })) }, includeRawEvents: true });
 	const trials = (run?.trials ?? []).map((trial) => {
+		// A custom executor must supply its effective scheduler evidence as well.
+		if (trial.status === 'PASSED') {
+			const actual = trial.scheduler;
+			if (!actual || actual.mode !== scheduler.mode || (scheduler.mode === 'fixed' && (actual.maxConcurrent !== Math.min(trial.agentLoad, scheduler.fixedConcurrency) || actual.urgentReserve !== scheduler.urgentReserve || (scheduler.maxPending !== null && actual.maxPending !== scheduler.maxPending)))) throw new Error('Task 9 scheduler descriptor does not match executed scheduler evidence');
+		}
 		const raw = trial.metrics?.raw ?? {};
 		const samples = trial.systemSummary?.rawSamples ?? [];
 		const events = (trial.rawEvents ?? run?.rawEvents ?? [])
@@ -200,11 +210,11 @@ export async function runTask9SimulatorMatrix({ matrix, runMatrix = runLatencyMa
 		const identity = {
 			runId: options.runId ?? 'task9-run', trialId: trial.trialId, repetition: trial.repetition, arm: options.arm ?? null,
 			cellId: `${trial.trialId}/rep-${trial.repetition}`, scenarioId: trial.scenarioId, seed: trial.seed, agentLoad: trial.agentLoad,
-			providerProfile: trial.providerProfile, sourceHash: options.sourceHash ?? null, configHash: options.configHash ?? null,
+			providerProfile: trial.providerProfile, sourceHash: options.sourceHash ?? null, configHash: options.configHash ?? null, scheduler: trial.scheduler ?? null,
 		};
 		return buildTask9TrialReport({ identity, status: trial.status, events, cpuSamples: processCpuIntervalDeltas(samples), rssSamples: samples.map((sample) => sample.memory?.rssBytes).filter(Number.isFinite), tickSamples: raw.ticks?.map((sample) => sample.wallDurationMs).filter(Number.isFinite) ?? [], factualSuccess: trial.debug?.scenarioPassed === true, fairness: trial.fairness, cleanup: normalizeTask9Cleanup(trial.cleanup), correctness: { authoritative: trial.debug?.scenarioEvidence ?? null }, retries: trial.retries ?? {} });
 	});
-	const output = { schemaVersion: TASK9_SCHEMA_VERSION, status: trials.some((trial) => trial.status === 'FAILED' || trial.status === 'TIMED_OUT') ? 'FAILED' : run?.status ?? 'FAILED', runManifest: createTask9RunManifest({ runId: options.runId ?? 'task9-run', arm: options.arm ?? null, sourceCommit: options.sourceCommit ?? 'unknown', sourceHash: options.sourceHash ?? 'unknown', matrixHash: hashJson(normalized), configHash: options.configHash ?? hashJson(normalized), pairingKey: options.pairingKey ?? 'task9', providerProfile: normalized.trials[0]?.providerProfile ?? { provider: 'replay', model: 'unknown', reasoningEffort: 'fixed', serviceTier: 'synthetic-delayed' }, scheduler: options.scheduler ?? { mode: 'fixed', fixedConcurrency: options.planningConcurrency ?? 16 }, order: trials.map((trial) => `${trial.cellId}/${trial.arm ?? 'unknown'}`) }), trials };
+	const output = { schemaVersion: TASK9_SCHEMA_VERSION, status: trials.some((trial) => trial.status === 'FAILED' || trial.status === 'TIMED_OUT') ? 'FAILED' : run?.status ?? 'FAILED', runManifest: createTask9RunManifest({ runId: options.runId ?? 'task9-run', arm: options.arm ?? null, sourceCommit: options.sourceCommit ?? 'unknown', sourceHash: options.sourceHash ?? 'unknown', matrixHash: hashJson(normalized), configHash: options.configHash ?? hashJson(normalized), pairingKey: options.pairingKey ?? 'task9', providerProfile: normalized.trials[0]?.providerProfile ?? { provider: 'replay', model: 'unknown', reasoningEffort: 'fixed', serviceTier: 'synthetic-delayed' }, scheduler, order: trials.map((trial) => `${trial.cellId}/${trial.arm ?? 'unknown'}`) }), trials };
 	for (const trial of trials) validateTask9TrialReport(trial);
 	if (artifactDirectory) await writeTask9Artifacts(artifactDirectory, output, run?.rawEvents ?? []);
 	return freeze(output);
@@ -224,7 +234,7 @@ function normalizeScheduler(value) {
 	if (value.mode === 'fixed') {
 		const fixedConcurrency = requireInt(value.fixedConcurrency, 'scheduler.fixedConcurrency');
 		if (fixedConcurrency < 1 || fixedConcurrency > 16) throw new RangeError('scheduler.fixedConcurrency must be in 1..16');
-		return { mode: 'fixed', fixedConcurrency, maxPending: value.maxPending === undefined ? null : requireNonNegativeInt(value.maxPending, 'scheduler.maxPending'), urgentReserve: value.urgentReserve === undefined ? 1 : requireNonNegativeInt(value.urgentReserve, 'scheduler.urgentReserve') };
+		return { mode: 'fixed', fixedConcurrency, maxPending: value.maxPending == null ? null : requireNonNegativeInt(value.maxPending, 'scheduler.maxPending'), urgentReserve: value.urgentReserve === undefined ? 0 : requireNonNegativeInt(value.urgentReserve, 'scheduler.urgentReserve') };
 	}
 	return { mode: 'adaptive', controller: structuredClone(value.controller ?? TASK9_ADAPTIVE_CONTROLLER_V1) };
 }

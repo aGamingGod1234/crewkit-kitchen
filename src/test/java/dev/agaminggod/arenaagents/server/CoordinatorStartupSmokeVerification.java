@@ -45,6 +45,7 @@ public final class CoordinatorStartupSmokeVerification {
 	}
 
 	public static int verify() throws Exception {
+		verifyCatalogPredicate();
 		Path sourceCoordinator = Path.of("coordinator").toAbsolutePath().normalize();
 		if (!Files.isRegularFile(sourceCoordinator.resolve("src/dynamic-main.mjs"))) {
 			throw new AssertionError("startup smoke requires the coordinator source package");
@@ -119,7 +120,7 @@ public final class CoordinatorStartupSmokeVerification {
 						if (completeHandshakeAndCatalog(socket)) {
 							assertTrue(awaitLoopbackListener(voicePort, 5_000L),
 								"runtime Fish credential starts the loopback voice worker");
-							return 12 + credentialAssertions + trustBoundaryAssertions + cleanupAssertions;
+							return 16 + credentialAssertions + trustBoundaryAssertions + cleanupAssertions;
 						}
 					} catch (java.net.SocketTimeoutException ignored) {
 						// The supervisor's startup grace is intentionally polled without shell state.
@@ -222,7 +223,7 @@ public final class CoordinatorStartupSmokeVerification {
 				JsonObject message = JsonParser.parseString(line).getAsJsonObject();
 				if (!"catalog_snapshot".equals(message.get("type").getAsString())) continue;
 				JsonArray models = message.getAsJsonObject("payload").getAsJsonArray("models");
-				if (models.toString().contains("gpt-5.6-luna")) {
+				if (containsStagedModel(models)) {
 					stagedModelReady = true;
 					break;
 				}
@@ -238,9 +239,32 @@ public final class CoordinatorStartupSmokeVerification {
 				)));
 				writer.flush();
 			}
-			assertTrue(stagedModelReady, "catalog-ready boundary contains the staged Codex model");
+			assertTrue(stagedModelReady, "catalog-ready boundary contains the unique fake discovery result");
 			return true;
 		}
+	}
+
+	static boolean containsStagedModel(JsonArray models) {
+		if (models == null) return false;
+		for (var element : models) {
+			if (!element.isJsonObject()) continue;
+			JsonObject model = element.getAsJsonObject();
+			if (new com.google.gson.JsonPrimitive("codex").equals(model.get("provider"))
+					&& new com.google.gson.JsonPrimitive("gpt-5.6-luna").equals(model.get("id"))
+					&& new com.google.gson.JsonPrimitive("Smoke model").equals(model.get("displayName"))) return true;
+		}
+		return false;
+	}
+
+	static void verifyCatalogPredicate() {
+		JsonArray models = JsonParser.parseString("[{\"provider\":\"codex\",\"id\":\"gpt-5.6-luna\",\"displayName\":\"gpt-5.6-luna\"}]").getAsJsonArray();
+		assertTrue(!containsStagedModel(models), "builtin fallback cannot satisfy discovery smoke");
+		models.get(0).getAsJsonObject().addProperty("displayName", "Smoke model");
+		assertTrue(containsStagedModel(models), "fake live discovery satisfies smoke");
+		models.get(0).getAsJsonObject().addProperty("provider", "other");
+		assertTrue(!containsStagedModel(models), "another provider cannot satisfy discovery smoke");
+		assertTrue(!containsStagedModel(JsonParser.parseString("[null,{},\"gpt-5.6-luna Smoke model\"]").getAsJsonArray()),
+				"malformed rows and serialized substrings cannot satisfy discovery smoke");
 	}
 
 	private static int verifyPathRejectedBeforeSecretRead(

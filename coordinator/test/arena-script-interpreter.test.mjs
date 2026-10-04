@@ -33,6 +33,45 @@ function actionResult(command, state = 'SUCCEEDED', reasonCode = 'DONE') {
 	return { stateToken: command.stateToken, state, reasonCode };
 }
 
+test('logical assignments short circuit and preserve required assignments across a yielded action', () => {
+	for (const [operator, skipped, assigned] of [['||=', 'true', 'false'], ['&&=', 'false', 'true'], ['??=', '5', 'null']]) {
+		const prefix = 'program.onUnhandledAttention("continue_and_notify");';
+		assert.equal(interpreter(`${prefix} let value = ${skipped}; value ${operator} await player.wait(1); program.finish("done");`).start(facts()).kind, 'finish');
+		const plain = interpreter(`${prefix} let value = ${assigned}; value ${operator} 7; await player.wait(value);`).start(facts());
+		assert.equal(plain.call.arguments, 7);
+		const vm = interpreter(`${prefix} let value = ${assigned}; value ${operator} await player.wait(1); await player.wait(value.succeeded ? 7 : 8);`);
+		const first = vm.start(facts());
+		assert.equal(first.call.arguments, 1);
+		assert.equal(vm.resume(actionResult(first), facts()).call.arguments, 7);
+	}
+});
+
+test('callback records remain data for expression arrows and repeatUntil bodies', () => {
+	for (const kind of ['normal', 'return', 'break', 'continue', 'success']) {
+		const command = interpreter(`program.onUnhandledAttention("continue_and_notify"); const record = () => ({kind:"${kind}",value:7}); await player.wait(record().value);`).start(facts());
+		assert.equal(command.call.arguments, 7);
+	}
+	const vm = interpreter('program.onUnhandledAttention("continue_and_notify"); await program.repeatUntil(() => false, {maxIterations:3}, async () => {await player.wait(1); return {kind:"success"};}); program.finish("done");');
+	let yielded = vm.start(facts());
+	for (let count = 0; count < 3; count += 1) {
+		assert.equal(yielded.kind, 'command');
+		yielded = vm.resume(actionResult(yielded), facts());
+	}
+	assert.equal(yielded.kind, 'checkpoint');
+	assert.equal(yielded.reason, 'repeat_until_exhausted');
+});
+
+test('shared immutable control frames serialize as independent bounded records', () => {
+	const frame = '{forward:1,strafe:0,jump:false,sneak:false,sprint:false,attack:false,use:false,yaw:0,pitch:0,selectedSlot:0,hand:"main",ticks:2}';
+	const vm = new ArenaScriptInterpreter(parseArenaScript(`program.onUnhandledAttention("continue_and_notify"); const frame = ${frame}; await player.controlSequence({frames:[frame,frame],maxTicks:4});`), SCRIPT_BINDINGS);
+	const command = vm.start(facts());
+	assert.equal(validateAction({type: command.call.primitive, ...command.call.arguments}).frames.length, 2);
+	assert.deepEqual(command.call.arguments.frames[0], command.call.arguments.frames[1]);
+	assert.notEqual(command.call.arguments.frames[0], command.call.arguments.frames[1]);
+	const cyclic = facts(); cyclic.player.self = cyclic.player;
+	assert.throws(() => interpreter('program.onUnhandledAttention("continue_and_notify"); await player.wait(1);').start(cyclic), error => error.code === 'INVALID_FACTS');
+});
+
 test('all 64 authored control frames fit the bounded compound payload without raising ordinary output limits', () => {
 	const frame = { forward: 1, strafe: 0, jump: false, sneak: false, sprint: false, attack: false, use: false, yaw: 0, pitch: 0, selectedSlot: 0, hand: 'main', ticks: 2 };
 	const args = { frames: Array.from({ length: 64 }, () => ({ ...frame })), maxTicks: 128 };

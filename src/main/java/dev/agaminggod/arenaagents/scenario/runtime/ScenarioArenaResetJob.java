@@ -4,16 +4,19 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.level.ServerLevel;
@@ -39,12 +42,28 @@ public final class ScenarioArenaResetJob {
 	private final List<ScenarioArenaBlueprint.Placement> source;
 	private final ScenarioArenaBlueprint.SiteBounds siteBounds;
 	private final TreeMap<Long, ScenarioArenaBlueprint.Placement> canonicalByPosition = new TreeMap<>();
-	private final ArrayList<ScenarioArenaBlueprint.Placement> canonicalBuilder = new ArrayList<>();
+	private final ArrayList<ScenarioArenaBlueprint.Placement> canonicalBuilder;
 	private List<ScenarioArenaBlueprint.Placement> canonical = List.of();
-	private List<ScenarioArenaBlueprint.Placement> applicationOrder = List.of();
+	private final List<ScenarioArenaBlueprint.Placement> containerBuilder = new LinkedList<>();
+	private List<ScenarioArenaBlueprint.Placement> canonicalContainers = List.of();
+	private TreeSet<ScenarioArenaBlueprint.Placement> applicationOrder;
+	private Iterator<ScenarioArenaBlueprint.Placement> applicationIterator;
+	private ScenarioArenaBlueprint.Placement pendingApplication;
+	private final TreeSet<ChunkPos> chunksByPosition = new TreeSet<>(
+			Comparator.comparingInt(ChunkPos::x).thenComparingInt(ChunkPos::z));
+	private final ArrayList<ChunkPos> managedChunkBuilder;
+	private Iterator<ChunkPos> chunkIterator;
 	private List<ChunkPos> managedChunks = List.of();
 	private final Set<ChunkPos> retainedChunks = new LinkedHashSet<>();
 	private Iterator<ScenarioArenaBlueprint.Placement> canonicalIterator;
+	private PreparationStage preparationStage = PreparationStage.INDEX;
+	private int canonicalCollected;
+	private int orderedPlacements;
+	private int minimumX = Integer.MAX_VALUE;
+	private int maximumX = Integer.MIN_VALUE;
+	private int minimumZ = Integer.MAX_VALUE;
+	private int maximumZ = Integer.MIN_VALUE;
+	private final int siteChunkCount;
 	private MessageDigest blueprintHasher;
 	private Phase phase = Phase.CANONICALIZE;
 	private int sourceIndex;
@@ -83,6 +102,12 @@ public final class ScenarioArenaResetJob {
 	) {
 		this.source = List.copyOf(Objects.requireNonNull(placements, "placements must not be null"));
 		this.siteBounds = siteBounds;
+		// Reserve once during construction, not during a budgeted step's growing-list copy.
+		this.canonicalBuilder = new ArrayList<>(source.size());
+		this.siteChunkCount = siteBounds == null ? 0 : Math.multiplyExact(
+				(siteBounds.maximumX() >> 4) - (siteBounds.minimumX() >> 4) + 1,
+				(siteBounds.maximumZ() >> 4) - (siteBounds.minimumZ() >> 4) + 1);
+		this.managedChunkBuilder = new ArrayList<>(siteBounds == null ? source.size() : siteChunkCount);
 		for (ScenarioArenaBlueprint.Placement placement : source) {
 			Objects.requireNonNull(placement, "placements must not contain null");
 		}
@@ -119,23 +144,47 @@ public final class ScenarioArenaResetJob {
 	}
 
 	private boolean canonicalizeOne() {
+		return switch (preparationStage) {
+			case INDEX -> indexOne();
+			case COLLECT -> collectCanonicalOne();
+			case ORDER -> orderOne();
+			case CHUNKS -> prepareChunkOne();
+		};
+	}
+
+	private boolean indexOne() {
 		if (sourceIndex < source.size()) {
 			ScenarioArenaBlueprint.Placement placement = source.get(sourceIndex++);
 			canonicalByPosition.put(placement.position().asLong(), placement);
 			if (sourceIndex == source.size()) beginCanonicalFinalization();
 			return true;
 		}
-		if (canonicalIterator == null) beginCanonicalFinalization();
+		beginCanonicalFinalization();
+		return false;
+	}
+
+	private boolean collectCanonicalOne() {
 		if (!canonicalIterator.hasNext()) {
-			finishCanonicalization();
+			beginOrdering();
 			return false;
 		}
 		ScenarioArenaBlueprint.Placement canonicalPlacement = canonicalIterator.next();
+		canonicalCollected++;
 		if (siteBounds == null || !canonicalPlacement.state().isAir()) {
 			canonicalBuilder.add(canonicalPlacement);
+			if (canonicalPlacement.state().is(Blocks.CHEST) || canonicalPlacement.state().is(Blocks.BARREL)) {
+				// A linked builder avoids a growing-array copy even for a container-heavy blueprint.
+				containerBuilder.add(canonicalPlacement);
+			}
 			updateHash(blueprintHasher, canonicalPlacement.position(), canonicalPlacement.state());
+			BlockPos position = canonicalPlacement.position();
+			minimumX = Math.min(minimumX, position.getX());
+			maximumX = Math.max(maximumX, position.getX());
+			minimumZ = Math.min(minimumZ, position.getZ());
+			maximumZ = Math.max(maximumZ, position.getZ());
+			if (siteBounds == null) chunksByPosition.add(new ChunkPos(position.getX() >> 4, position.getZ() >> 4));
 		}
-		if (!canonicalIterator.hasNext()) finishCanonicalization();
+		if (!canonicalIterator.hasNext()) beginOrdering();
 		return true;
 	}
 
@@ -143,13 +192,59 @@ public final class ScenarioArenaResetJob {
 		if (canonicalIterator != null) return;
 		canonicalIterator = canonicalByPosition.values().iterator();
 		blueprintHasher = sha256();
+		preparationStage = PreparationStage.COLLECT;
+	}
+
+	private void beginOrdering() {
+		// The builder is never mutated after publication, so no full-list copy is needed.
+		canonical = Collections.unmodifiableList(canonicalBuilder);
+		canonicalContainers = Collections.unmodifiableList(containerBuilder);
+		applicationOrder = new TreeSet<>(applicationComparator(
+				(long) minimumX + maximumX, (long) minimumZ + maximumZ));
+		blueprintHash = HexFormat.of().formatHex(blueprintHasher.digest());
+		preparationStage = PreparationStage.ORDER;
+	}
+
+	private boolean orderOne() {
+		if (orderedPlacements < canonical.size()) {
+			// One balanced-tree insertion replaces the uninterruptible whole-arena sort.
+			applicationOrder.add(canonical.get(orderedPlacements++));
+			if (orderedPlacements < canonical.size()) return true;
+		} else {
+			beginChunkPreparation();
+			return false;
+		}
+		beginChunkPreparation();
+		return true;
+	}
+
+	private void beginChunkPreparation() {
+		applicationIterator = applicationOrder.iterator();
+		chunkIterator = chunksByPosition.iterator();
+		preparationStage = PreparationStage.CHUNKS;
+	}
+
+	private boolean prepareChunkOne() {
+		int total = siteBounds == null ? chunksByPosition.size() : siteChunkCount;
+		if (managedChunkBuilder.size() >= total) {
+			finishCanonicalization();
+			return false;
+		}
+		if (siteBounds == null) {
+			managedChunkBuilder.add(chunkIterator.next());
+		} else {
+			int depth = (siteBounds.maximumZ() >> 4) - (siteBounds.minimumZ() >> 4) + 1;
+			int index = managedChunkBuilder.size();
+			managedChunkBuilder.add(new ChunkPos(
+					(siteBounds.minimumX() >> 4) + index / depth,
+					(siteBounds.minimumZ() >> 4) + index % depth));
+		}
+		if (managedChunkBuilder.size() == total) finishCanonicalization();
+		return true;
 	}
 
 	private void finishCanonicalization() {
-		canonical = List.copyOf(canonicalBuilder);
-		applicationOrder = applicationOrder(canonical);
-		managedChunks = siteBounds == null ? managedChunks(canonical) : managedChunks(siteBounds);
-		blueprintHash = HexFormat.of().formatHex(blueprintHasher.digest());
+		managedChunks = Collections.unmodifiableList(managedChunkBuilder);
 		phase = managedChunks.isEmpty() ? (siteBounds == null ? Phase.APPLY : Phase.CLEAR) : Phase.LOAD_CHUNKS;
 		phaseIndex = 0;
 	}
@@ -237,7 +332,9 @@ public final class ScenarioArenaResetJob {
 			managedHasher = sha256();
 			return false;
 		}
-		ScenarioArenaBlueprint.Placement placement = applicationOrder.get(phaseIndex);
+		// Keep the entry on an exception, just as the previous indexed list did.
+		if (pendingApplication == null) pendingApplication = applicationIterator.next();
+		ScenarioArenaBlueprint.Placement placement = pendingApplication;
 		if (!level.hasChunkAt(placement.position())) {
 			fail(level, "UNLOADED_MANAGED_CHUNK");
 			return false;
@@ -248,6 +345,7 @@ public final class ScenarioArenaResetJob {
 		}
 		phaseIndex++;
 		applied++;
+		pendingApplication = null;
 		if (phaseIndex == applicationOrder.size()) {
 			phase = Phase.VERIFY;
 			phaseIndex = 0;
@@ -369,8 +467,8 @@ public final class ScenarioArenaResetJob {
 
 	private int currentTotalPlacements() {
 		return switch (phase) {
-			case CANONICALIZE -> source.size()
-					+ (canonicalIterator == null ? source.size() : canonicalByPosition.size());
+			case CANONICALIZE -> source.size() + canonicalByPosition.size() + canonicalBuilder.size()
+					+ (siteBounds == null ? chunksByPosition.size() : siteChunkCount);
 			case LOAD_CHUNKS -> managedChunks.size();
 			case CLEAR -> clearTotal;
 			case APPLY, VERIFY, COMPLETE, FAILED -> canonical.size();
@@ -385,7 +483,7 @@ public final class ScenarioArenaResetJob {
 
 	private int currentCompletedWork() {
 		return switch (phase) {
-			case CANONICALIZE -> sourceIndex + canonicalBuilder.size();
+			case CANONICALIZE -> sourceIndex + canonicalCollected + orderedPlacements + managedChunkBuilder.size();
 			case LOAD_CHUNKS -> loadedChunks;
 			case CLEAR -> phaseIndex;
 			case APPLY -> applied;
@@ -432,6 +530,11 @@ public final class ScenarioArenaResetJob {
 
 	public List<ScenarioArenaBlueprint.Placement> canonicalPlacements() {
 		return canonical;
+	}
+
+	/** Final chests/barrels in canonical order, prepared incrementally alongside the reset hash. */
+	public List<ScenarioArenaBlueprint.Placement> canonicalContainerPlacements() {
+		return canonicalContainers;
 	}
 
 	private Tick snapshotTick(int worked) {
@@ -502,6 +605,24 @@ public final class ScenarioArenaResetJob {
 		long dx2 = 2L * position.getX() - centerX2;
 		long dz2 = 2L * position.getZ() - centerZ2;
 		return dx2 * dx2 + dz2 * dz2;
+	}
+
+	private static Comparator<ScenarioArenaBlueprint.Placement> applicationComparator(long centerX2, long centerZ2) {
+		Comparator<ScenarioArenaBlueprint.Placement> spatial = Comparator
+				.comparingInt((ScenarioArenaBlueprint.Placement placement) -> placement.position().getY())
+				.thenComparingLong(placement -> horizontalDistanceSquaredTimesFour(placement.position(), centerX2, centerZ2))
+				.thenComparingInt(placement -> placement.position().getX())
+				.thenComparingInt(placement -> placement.position().getZ());
+		return (first, second) -> {
+			int firstGroup = applicationGroup(first);
+			int secondGroup = applicationGroup(second);
+			if (firstGroup != secondGroup) return Integer.compare(firstGroup, secondGroup);
+			return firstGroup == 0 ? spatial.compare(second, first) : spatial.compare(first, second);
+		};
+	}
+
+	private static int applicationGroup(ScenarioArenaBlueprint.Placement placement) {
+		return placement.state().isAir() ? 0 : placement.state().getFluidState().isEmpty() ? 1 : 2;
 	}
 
 	public static String hash(List<ScenarioArenaBlueprint.Placement> placements) {
@@ -627,6 +748,9 @@ public final class ScenarioArenaResetJob {
 			return displayName;
 		}
 	}
+
+	/** Substages keep preparation resumable without changing the public progress/cancellation contract. */
+	private enum PreparationStage { INDEX, COLLECT, ORDER, CHUNKS }
 
 	public enum VerificationDecision {
 		COMPLETE,

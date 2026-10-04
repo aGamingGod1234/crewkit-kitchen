@@ -23,6 +23,7 @@ public final class VoiceAddonVerificationMain {
 		assertions += SpeechCaptureEngineVerification.verify();
 		assertions += HumanSpeechCaptureVerification.verify();
 		assertions += VoiceWorkerClientsVerification.verify();
+		assertions += VoiceWorkerClientVerification.verify();
 		assertions += NodeVoiceWorkerIntegrationVerification.verify();
 		System.out.println("PASS: " + assertions + " voice-addon assertions");
 	}

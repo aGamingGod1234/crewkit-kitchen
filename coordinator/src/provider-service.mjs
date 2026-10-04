@@ -901,6 +901,7 @@ function assertSameProfile(existing, requested) {
 }
 
 class CombinedProviderCatalog {
+	#refreshes = new Map();
 	constructor(services, { execute, recordOutcome, recovery, availability, now }) {
 		this.services = services;
 		this.execute = execute;
@@ -922,18 +923,7 @@ class CombinedProviderCatalog {
 			}
 			try {
 				const providerRecords = profileRecords?.filter((record) => normalizeProvider(record.provider) === provider);
-				const load = providerRecords !== undefined && typeof service.bootstrapCatalog === 'function'
-					? () => service.bootstrapCatalog(providerRecords)
-					: () => service.catalog.refresh(options);
-				const raw = await this.execute(provider, async () => validateCatalogSnapshot(await load(), provider));
-				const source = catalogSource(raw.source, service.catalog.stale, this.lastValid.has(provider));
-				this.recordOutcome(provider, source, raw.recovery);
-				if (source === 'live') this.lastValid.set(provider, raw);
-				if (source === 'last_valid') {
-					if (!this.lastValid.has(provider)) this.lastValid.set(provider, raw);
-					return { provider, ...structuredClone(this.lastValid.get(provider)), source };
-				}
-				return { provider, ...raw, source };
+				return await this.#refreshProvider(provider, service, providerRecords, options);
 			} catch {
 				const retained = this.lastValid.get(provider);
 				return retained === undefined ? null : { provider, ...structuredClone(retained), source: 'last_valid' };
@@ -948,6 +938,31 @@ class CombinedProviderCatalog {
 			recovery: this.recovery(),
 			availability: this.availability(),
 		};
+	}
+	#refreshProvider(provider, service, records, options) {
+		const bootstrap = records !== undefined && typeof service.bootstrapCatalog === 'function';
+		const request = { records: bootstrap ? JSON.stringify(records) : null, options: bootstrap ? {} : options };
+		const current = this.#refreshes.get(provider);
+		// Equivalent subscribers own one outcome. Different reads still supersede
+		// the previous outcome, and execute retains timeout/stop generation fences.
+		if (current && current.records === request.records
+			&& Object.keys(current.options).length === Object.keys(request.options).length
+			&& Object.entries(request.options).every(([key, value]) => Object.hasOwn(current.options, key) && Object.is(current.options[key], value))) {
+			return current.promise;
+		}
+		const load = bootstrap ? () => service.bootstrapCatalog(records) : () => service.catalog.refresh(options);
+		request.promise = this.execute(provider, async () => validateCatalogSnapshot(await load(), provider)).then(raw => {
+			const source = catalogSource(raw.source, service.catalog.stale, this.lastValid.has(provider));
+			this.recordOutcome(provider, source, raw.recovery);
+			if (source === 'live') this.lastValid.set(provider, raw);
+			if (source === 'last_valid') {
+				if (!this.lastValid.has(provider)) this.lastValid.set(provider, raw);
+				return { provider, ...structuredClone(this.lastValid.get(provider)), source };
+			}
+			return { provider, ...raw, source };
+		}).finally(() => { if (this.#refreshes.get(provider) === request) this.#refreshes.delete(provider); });
+		this.#refreshes.set(provider, request);
+		return request.promise;
 	}
 	assertSupported(provider, model, reasoningEffort, serviceTier) {
 		const normalized = normalizeProvider(provider);

@@ -101,6 +101,10 @@ function safeComponent(value) {
 		nextProbeAtEpochMs: nullableNonnegativeInteger(own.nextProbeAtEpochMs),
 		generation: nonnegativeIntegerOrZero(own.generation),
 		lastRecoveryAtEpochMs: nullableNonnegativeInteger(own.lastRecoveryAtEpochMs),
+		// Recovery describes the current sink; cumulative loss still makes this capture incomplete.
+		...(Number.isSafeInteger(own.failedOperationCount) && own.failedOperationCount >= 0 ? { failedOperationCount: own.failedOperationCount } : {}),
+		...(Number.isSafeInteger(own.droppedCount) && own.droppedCount >= 0 ? { droppedCount: own.droppedCount } : {}),
+		...(typeof own.incompleteCapture === 'boolean' ? { incompleteCapture: own.incompleteCapture } : {}),
 	};
 }
 

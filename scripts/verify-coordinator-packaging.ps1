@@ -109,7 +109,20 @@ try {
 
     if (-not [string]::IsNullOrWhiteSpace($StagingPath)) {
         $resolvedStaging = (Resolve-Path -LiteralPath $StagingPath).Path
-        $staged = @(Get-ChildItem -LiteralPath $resolvedStaging -Recurse -File |
+        # Installed generations add metadata; raw runtime extractions remain supported.
+        # Only the exact embedded manifest is recognized, including when it is hidden.
+        $installedManifest = Join-Path $resolvedStaging '.arena-agents-bundle-manifest'
+        if (Test-Path -LiteralPath $installedManifest -PathType Leaf) {
+            $sha = [Security.Cryptography.SHA256]::Create()
+            $stream = $manifestEntry.Open()
+            try { $embeddedManifestHash = (($sha.ComputeHash($stream) | ForEach-Object { $_.ToString('x2') }) -join '') }
+            finally { $stream.Dispose(); $sha.Dispose() }
+            if ((Get-FileHash -LiteralPath $installedManifest -Algorithm SHA256).Hash -ne $embeddedManifestHash) {
+                throw 'Installed coordinator manifest differs from embedded manifest.'
+            }
+        }
+        $staged = @(Get-ChildItem -LiteralPath $resolvedStaging -Recurse -File -Force |
+            Where-Object { $_.FullName -ne $installedManifest } |
             ForEach-Object { $_.FullName.Substring($resolvedStaging.Length + 1).Replace('\', '/') } |
             Sort-Object)
         if (@(Compare-Object -ReferenceObject $expected -DifferenceObject $staged).Count -ne 0) {
@@ -117,11 +130,33 @@ try {
         }
         if ([string]::IsNullOrWhiteSpace($SourceCoordinatorPath)) { throw 'SourceCoordinatorPath is required for hash-based staging parity.' }
         $resolvedSource = (Resolve-Path -LiteralPath $SourceCoordinatorPath).Path
-        foreach ($relative in $expected) {
+        foreach ($record in $manifestRecords) {
+            $relative = $record.Path
             $sourceHash = (Get-FileHash -LiteralPath (Join-Path $resolvedSource ($relative.Replace('/', '\'))) -Algorithm SHA256).Hash
             $stagedHash = (Get-FileHash -LiteralPath (Join-Path $resolvedStaging ($relative.Replace('/', '\'))) -Algorithm SHA256).Hash
-            if ($sourceHash -ne $stagedHash) { throw "Installed coordinator hash differs from source: $relative" }
+            if ($sourceHash -ne $record.Hash) { throw "Source coordinator hash differs from embedded resource: $relative" }
+            if ($stagedHash -ne $record.Hash) { throw "Installed coordinator hash differs from embedded resource: $relative" }
         }
+    }
+
+    # Verify attribution against the retained source text whenever derived geometry ships.
+    $derivedModules = @($archive.Entries | Where-Object {
+        $_.FullName.StartsWith('data/arenaagents/arena_modules/') -and $_.FullName.EndsWith('.json')
+    })
+    foreach ($module in $derivedModules) {
+        $reader = [IO.StreamReader]::new($module.Open())
+        try { $metadata = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
+        if ($metadata.sourceKey -ne 're-structured') { continue }
+        $notice = $archive.GetEntry('META-INF/licenses/re-structured-MIT.txt')
+        if ($null -eq $notice) { throw 'Retained map notice is missing for re-structured modules.' }
+        $retainedPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'maps/licenses/re-structured-MIT.txt'
+        $retainedHash = (Get-FileHash -LiteralPath $retainedPath -Algorithm SHA256).Hash
+        $sha = [Security.Cryptography.SHA256]::Create()
+        $stream = $notice.Open()
+        try { $noticeHash = (($sha.ComputeHash($stream) | ForEach-Object { $_.ToString('x2') }) -join '') }
+        finally { $stream.Dispose(); $sha.Dispose() }
+        if ($noticeHash -ne $retainedHash) { throw 'Retained map notice hash differs from source for re-structured modules.' }
+        break
     }
 
     Write-Host "Coordinator packaging verified: $($expected.Count) files; jar=$resolvedJar"

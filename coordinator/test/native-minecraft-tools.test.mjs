@@ -12,6 +12,63 @@ import {
 import { ACTION_FIELDS } from '../src/constants.mjs';
 import { parseArenaScript } from '../src/arena-script/parser.mjs';
 import { goalSpecFingerprint, parseGoalSpec } from '../src/goal-spec.mjs';
+import { ModelNotebook } from '../src/model-notebook.mjs';
+import { TaskMemoryStore } from '../src/task-memory-store.mjs';
+
+test('oversized real memory query pages round-trip every entry with advancing absolute offsets', async () => {
+	const notebook = new ModelNotebook();
+	const taskMemory = new TaskMemoryStore();
+	const scope = { worldId: 'one', agentId: 'a', dimension: 'minecraft:overworld', goalRevision: 1 };
+	for (let index = 0; index < 40; index++) {
+		await notebook.writeNote('a', { worldId: 'one', key: `note-${index}`, text: 'x'.repeat(2048) });
+		await taskMemory.remember(scope, { kind: 'lesson', key: `lesson-${index}`, label: `Lesson ${index}`, summary: 'x'.repeat(1024) });
+	}
+	for (const query of [
+		(offset) => notebook.query('a', { worldId: 'one', offset, limit: 20 }),
+		(offset) => taskMemory.query(scope, { kind: 'lesson', offset, limit: 20 }),
+	]) {
+		let offset = 0;
+		let pageCount = 0;
+		const entries = [];
+		do {
+			const page = await query(offset);
+			const encoded = toolResultContent(page).contentItems[0].text;
+			assert.ok(Buffer.byteLength(encoded) <= 16_384);
+			const result = JSON.parse(encoded);
+			assert.equal(result.offset, offset);
+			assert.deepEqual(result.entries, page.entries.slice(0, result.entries.length));
+			entries.push(...result.entries);
+			assert.ok(result.nextOffset === null || result.nextOffset === offset + result.entries.length);
+			assert.ok(result.nextOffset === null || result.nextOffset > offset);
+			offset = result.nextOffset;
+			assert.ok(++pageCount <= 40);
+		} while (offset !== null);
+		assert.ok(pageCount >= 3);
+		assert.equal(entries.length, 40);
+		assert.equal(new Set(entries.map(({ key }) => key)).size, 40);
+	}
+	await taskMemory.flush();
+});
+
+test('frontier kind filters are advertised and preserve the query discriminant', () => {
+	assert.deepEqual(MINECRAFT_DYNAMIC_TOOLS.find(({ name }) => name === 'exploreFrontier').inputSchema.properties.kind.enum, ['all', 'observed_block', 'unknown_cell']);
+	for (const kind of ['all', 'observed_block', 'unknown_cell']) {
+		assert.deepEqual(normalizeMinecraftToolCall('exploreFrontier', { kind }), { kind: 'explore_frontier', arguments: { kind, radius: 24, limit: 32 } });
+	}
+	assert.throws(() => normalizeMinecraftToolCall('exploreFrontier', { kind: 'destination' }), { code: 'INVALID_MINECRAFT_TOOL_ARGUMENTS' });
+});
+
+test('oversized recovery compaction retains remembered provenance and reports omitted facts', () => {
+	const remembered = { kind: 'placed', blockId: 'minecraft:crafting_table', x: 1, y: 64, z: 2, dimension: 'minecraft:overworld', worldId: 'one', remembered: true };
+	const raw = { observation: { player: { health: 20 }, detail: 'x'.repeat(40_000), recovery: { alreadyHave: ['minecraft:crafting_table'], alreadyHaveFacts: Array.from({ length: 40 }, (_, index) => ({ ...remembered, x: index })), facts: 'Remembered (not currently verified): minecraft:crafting_table.' } } };
+	const result = JSON.parse(toolResultContent(raw).contentItems[0].text);
+	for (const recovery of [result.recovery, result.observation.recovery]) {
+		assert.ok(recovery.alreadyHaveFacts.length > 0);
+		assert.equal(recovery.alreadyHaveFacts.length + recovery.omittedAlreadyHaveFacts, 40);
+		for (const fact of recovery.alreadyHaveFacts) assert.deepEqual(fact, { ...remembered, x: fact.x });
+		assert.match(recovery.facts, /not currently verified/);
+	}
+});
 
 test('capabilities reflect the shared action contract without inventing fields', () => {
 	assert.deepEqual(minecraftCapabilities().actions.map(({ actionType, fields }) => ({ actionType, fields })), Object.entries(ACTION_FIELDS).map(([actionType, fields]) => ({ actionType, fields: [...fields] })));
@@ -77,6 +134,31 @@ test('oversized inspection pages keep whole entries and a truthful continuation 
 	assert.equal(result.nextOffset, 10 + result.entries.length);
 	assert.equal(result.revision, 7);
 	assert.equal(result.coverage.resultTruncated, true);
+});
+
+test('forced inspection compaction preserves explicit empty omissions and terminal coverage', () => {
+	for (const [offset, total] of [[0, 2], [64, 90], [0, 1]]) {
+		// ObservationPage emits a deliberate empty page for one unrepresentable row.
+		const coverage = { offset, limit: 1, total, returned: 0, hasMore: offset + 1 < total, nextOffset: offset + 1, complete: false, byteLimited: true, source: 'held_book', omittedEntry: { offset, reason: 'entry_exceeds_page_budget', utf8Bytes: 8230 } };
+		const raw = { section: 'item', revision: 7, entries: [], coverage, outerDetails: 'x'.repeat(20_000) };
+		const encoded = toolResultContent(raw).contentItems[0].text;
+		const result = JSON.parse(encoded);
+		assert.ok(Buffer.byteLength(encoded) <= 16_384);
+		assert.deepEqual(result.entries, []);
+		assert.deepEqual(result.coverage, { ...coverage, resultTruncated: true });
+		assert.equal(result.nextOffset, offset + 1);
+		assert.equal(result.reasonCode, undefined);
+		assert.equal(result.section, 'item');
+		assert.equal(result.revision, 7);
+		assert.ok(result.omittedFields.includes('outerDetails'));
+		const nested = JSON.parse(toolResultContent({ section: 'item', revision: 7, item: { slot: 0, itemId: 'minecraft:written_book', count: 1, details: 'x'.repeat(20_000) }, pages: { entries: [], coverage } }).contentItems[0].text);
+		assert.deepEqual(nested.pages, { entries: [], coverage });
+		assert.deepEqual(nested.item, { slot: 0, itemId: 'minecraft:written_book', count: 1 });
+	}
+	const complete = JSON.parse(toolResultContent({ entries: [], coverage: { returned: 0, hasMore: false, nextOffset: 0, complete: true }, detail: 'x'.repeat(20_000) }).contentItems[0].text);
+	assert.equal(complete.coverage.complete, true);
+	assert.equal(complete.coverage.hasMore, false);
+	assert.equal(complete.nextOffset, 0);
 });
 
 test('Minecraft control guidance examples are valid executor tool calls', async () => {

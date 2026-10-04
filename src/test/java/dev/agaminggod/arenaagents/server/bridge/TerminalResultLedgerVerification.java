@@ -68,7 +68,34 @@ public final class TerminalResultLedgerVerification {
 		ledger.remove(agent);
 		ledger.remove(otherAgent);
 		assertEquals(0, ledger.pendingCount(), "agent removal clears retained terminal results");
-		return 4_121;
+		verifyObservationIdentity(agent);
+		return 4_135;
+	}
+
+	private static void verifyObservationIdentity(AgentId agent) {
+		TerminalResultLedger ledger = new TerminalResultLedger();
+		ServerActionResult original = DurableActionJournalVerification.withObservation(result(agent, 15L, "evidence"),
+				DurableActionJournalVerification.observation(0.0D));
+		ServerActionResult equal = DurableActionJournalVerification.withObservation(result(agent, 15L, "evidence"),
+				DurableActionJournalVerification.observation(0.0D));
+		ServerActionResult changed = DurableActionJournalVerification.withObservation(original,
+				DurableActionJournalVerification.observation(-0.0D));
+		ServerActionResult absent = DurableActionJournalVerification.withObservation(original, null);
+		assertEquals(original, equal, "independent observation records have equal identity");
+		assertFalse(original.equals(changed), "signed zero is distinct under observation record equality");
+		assertTrue(ledger.retain(original), "observed terminal result is retained");
+		assertTrue(ledger.retain(equal), "equal evidence is idempotent while pending");
+		expectFailure(() -> ledger.retain(changed), "changed evidence conflicts while pending");
+		expectFailure(() -> ledger.retain(absent), "omitted evidence conflicts while pending");
+		for (int index = 0; index < 4_096; index++) ledger.retain(result(agent, 15L, "evict-evidence-" + index));
+		expectFailure(() -> ledger.retain(changed), "changed evidence conflicts after FIFO retirement");
+		assertTrue(ledger.retain(equal), "equal evidence restores an unacknowledged retired payload");
+		assertEquals(4_096, ledger.pendingCount(), "observed payload restoration preserves the retention cap");
+		assertTrue(ledger.acknowledge(agent, 15L, "evidence"), "observed payload is acknowledged");
+		assertFalse(ledger.retain(equal), "equal acknowledged evidence stays retired");
+		expectFailure(() -> ledger.retain(changed), "changed evidence conflicts after acknowledgement");
+		expectFailure(() -> ledger.retain(absent), "omitted evidence conflicts after acknowledgement");
+		assertTrue(ledger.acknowledge(agent, 15L, "evidence"), "duplicate observed acknowledgement is idempotent");
 	}
 
 	private static ServerActionResult result(AgentId agent, long goalRevision, String actionId) {

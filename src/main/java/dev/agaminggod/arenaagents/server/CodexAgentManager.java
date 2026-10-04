@@ -493,10 +493,10 @@ public final class CodexAgentManager {
 	public void validateGoalDraftTranslation(PendingGoalDraft draft, GoalPredicate predicate) {
 		Objects.requireNonNull(draft, "draft must not be null");
 		Objects.requireNonNull(predicate, "predicate must not be null");
-		draft.translationConstraint().validate(predicate);
+		draft.translationConstraint().validate(predicate, draft.dimensionId());
 		RegistryAccess registries = server == null ? RegistryAccess.EMPTY : server.registryAccess();
 		GoalCompiler compiler = goalCompiler == null ? new GoalCompiler() : goalCompiler;
-		compiler.supportedTranslationConstraintFor(draft.originalRequest(), registries).validate(predicate);
+		compiler.supportedTranslationConstraintFor(draft.originalRequest(), registries).validate(predicate, draft.dimensionId());
 		if ((draft.intent() == DraftIntent.TRANSLATE_START || draft.intent() == DraftIntent.TRANSLATE_QUEUE
 				|| draft.intent() == DraftIntent.TRANSLATE_REPLACE)
 				&& compiler.translationRequiresOperatorConfirmation(draft.originalRequest(), registries)
@@ -1039,22 +1039,29 @@ public final class CodexAgentManager {
 			} else {
 				long deadline = pendingPlayerSpawns.getOrDefault(record.agentId(), 0L);
 				if (deadline > now) continue;
-				AgentRecord recoveryTarget = record;
-				AgentRecord recoveryRecord = record;
 				if (record.entityUuid().isPresent()) {
 					releaseChunkTicket(record.agentId());
 					AgentInputRuntime.clear(server, record.agentId());
-					recoveryRecord = savedData.registry().detachEntity(record.agentId(), now);
 				}
-				if (seenPlayers.contains(record.agentId()) && recoveryRecord.state().isActive()) {
-					AgentTransition disconnected = savedData.registry().disconnect(record.agentId(), now);
-					pendingEntityRecoveries.add(record.agentId());
-					recoveryRecord = disconnected.after();
-				}
+				AgentRecord recoveryTarget = prepareMissingPlayer(savedData.registry(), record,
+						seenPlayers.contains(record.agentId()), pendingEntityRecoveries, now);
 				if (!recoveryAttempts.tryClaim()) continue;
 				recoverOfflinePlayer(recoveryTarget, now);
 			}
 		}
+	}
+
+	static AgentRecord prepareMissingPlayer(AgentRegistry registry, AgentRecord record,
+			boolean seenPlayer, Set<AgentId> pendingRecoveries, long now) {
+		// Keep the last attachment durable until a replacement is observed. Detaching clears
+		// its dimension and position, losing them both for deferred attempts and failed retries.
+		// Presence is established through the player lookup, never this saved UUID alone.
+		if (seenPlayer && record.state().isActive()) {
+			AgentTransition disconnected = registry.disconnect(record.agentId(), now);
+			pendingRecoveries.add(record.agentId());
+			return disconnected.after();
+		}
+		return record;
 	}
 
 	static final class RecoveryAttemptGate {
@@ -1430,7 +1437,8 @@ public final class CodexAgentManager {
 		if (location.hasExactPosition()) level.getChunk(location.chunkX(), location.chunkZ());
 		Optional<ExactRecoveryCoordinates> exact = exactRecoveryCoordinates(
 				location,
-				(x, y, z) -> recoveryColumnAt(level, x, y, z).safe()
+				(x, y, z) -> recoveryColumnAt(level, (int) Math.floor(x), (int) Math.floor(y), (int) Math.floor(z)).safe()
+						&& recoveryBodySafe(level, x, y, z)
 		);
 		if (exact.isPresent()) {
 			ExactRecoveryCoordinates coordinates = exact.orElseThrow();
@@ -1469,7 +1477,7 @@ public final class CodexAgentManager {
 
 	static Optional<ExactRecoveryCoordinates> exactRecoveryCoordinates(
 			AgentEntityLocation location,
-			RecoveryColumnSafety safety
+			RecoveryPositionSafety safety
 	) {
 		Objects.requireNonNull(location, "location must not be null");
 		Objects.requireNonNull(safety, "safety must not be null");
@@ -1477,7 +1485,7 @@ public final class CodexAgentManager {
 		double x = location.exactX().orElseThrow();
 		double y = location.exactY().orElseThrow();
 		double z = location.exactZ().orElseThrow();
-		if (!safety.safe((int) Math.floor(x), (int) Math.floor(y), (int) Math.floor(z))) {
+		if (!safety.safe(x, y, z)) {
 			return Optional.empty();
 		}
 		return Optional.of(new ExactRecoveryCoordinates(
@@ -1560,19 +1568,57 @@ public final class CodexAgentManager {
 	) {
 		if (preferredY.isEmpty()) {
 			BlockPos surface = level.getHeightmapPos(Heightmap.Types.WORLD_SURFACE, new BlockPos(x, 0, z));
-			return recoveryColumnAt(level, x, surface.getY(), z);
+			return recoveryCenteredColumnAt(level, x, surface.getY(), z);
 		}
+		// Reuse only the successful sample within this synchronous search. A chunk
+		// acquisition between the local and expanded searches can run world tasks,
+		// so failed columns from the earlier search must still be reconsidered.
+		AgentRecoverySpawnPolicy.Column[] sampled = new AgentRecoverySpawnPolicy.Column[1];
 		java.util.OptionalInt selected = AgentRecoverySpawnPolicy.selectNearestSafeY(
 				preferredY.getAsInt(),
 				level.getMinY() + 1,
 				level.getMaxY() - 2,
-				y -> recoveryColumnAt(level, x, y, z).safe()
+				y -> {
+					sampled[0] = recoveryCenteredColumnAt(level, x, y, z);
+					return sampled[0].safe();
+				}
 		);
 		if (selected.isEmpty()) {
 			return new AgentRecoverySpawnPolicy.Column(
 					preferredY.getAsInt(), false, false, false, false, false, false, false);
 		}
-		return recoveryColumnAt(level, x, selected.getAsInt(), z);
+		return sampled[0];
+	}
+
+	private AgentRecoverySpawnPolicy.Column recoveryCenteredColumnAt(ServerLevel level, int x, int y, int z) {
+		AgentRecoverySpawnPolicy.Column column = recoveryColumnAt(level, x, y, z);
+		if (!column.safe() || recoveryBodySafe(level, x + 0.5D, y, z + 0.5D)) return column;
+		return new AgentRecoverySpawnPolicy.Column(y, false, false, false, false, false, false, false);
+	}
+
+	static boolean recoveryBodySafe(ServerLevel level, double x, double y, double z) {
+		var body = EntityType.PLAYER.getDimensions().makeBoundingBox(x, y, z);
+		var border = level.getWorldBorder();
+		if (body.minY < level.getMinY() || body.maxY > level.getMaxY()
+				|| body.minX < border.getMinX() || body.maxX > border.getMaxX()
+				|| body.minZ < border.getMinZ() || body.maxZ > border.getMaxZ()) return false;
+		// Vanilla's collision iterator includes a one-block halo for protruding
+		// shapes. hasChunk only proves ticket eligibility, not completed loading;
+		// getChunkNow proves every queried chunk is resident without scheduling work.
+		var halo = body.inflate(1.000001D);
+		for (int chunkX = ((int) Math.floor(halo.minX)) >> 4; chunkX <= ((int) Math.floor(halo.maxX)) >> 4; chunkX++) {
+			for (int chunkZ = ((int) Math.floor(halo.minZ)) >> 4; chunkZ <= ((int) Math.floor(halo.maxZ)) >> 4; chunkZ++) {
+				if (level.getChunkSource().getChunkNow(chunkX, chunkZ) == null) return false;
+			}
+		}
+		if (!level.noBlockCollision(null, body)) return false;
+		for (BlockPos position : BlockPos.betweenClosed(
+				BlockPos.containing(body.minX, body.minY, body.minZ),
+				BlockPos.containing(Math.nextDown(body.maxX), Math.nextDown(body.maxY), Math.nextDown(body.maxZ)))) {
+			var state = level.getBlockState(position);
+			if (state.is(Blocks.FIRE) || state.is(Blocks.SOUL_FIRE) || !state.getFluidState().isEmpty()) return false;
+		}
+		return true;
 	}
 
 	private AgentRecoverySpawnPolicy.Column recoveryColumnAt(ServerLevel level, int x, int y, int z) {
@@ -1580,6 +1626,8 @@ public final class CodexAgentManager {
 		BlockPos floor = feet.below();
 		BlockPos head = feet.above();
 		var floorState = level.getBlockState(floor);
+		var feetState = level.getBlockState(feet);
+		var headState = level.getBlockState(head);
 		BlockPos floorSupport = floor.below();
 		boolean safeFloor = floorState.isFaceSturdy(level, floor, Direction.UP)
 				&& !floorState.is(Blocks.CACTUS)
@@ -1594,9 +1642,11 @@ public final class CodexAgentManager {
 				safeFloor,
 				stableFloor,
 				level.getFluidState(floor).isEmpty(),
-				level.getBlockState(feet).getCollisionShape(level, feet).isEmpty(),
+				feetState.getCollisionShape(level, feet).isEmpty()
+						&& !feetState.is(Blocks.FIRE) && !feetState.is(Blocks.SOUL_FIRE),
 				level.getFluidState(feet).isEmpty(),
-				level.getBlockState(head).getCollisionShape(level, head).isEmpty(),
+				headState.getCollisionShape(level, head).isEmpty()
+						&& !headState.is(Blocks.FIRE) && !headState.is(Blocks.SOUL_FIRE),
 				level.getFluidState(head).isEmpty()
 		);
 	}
@@ -1608,8 +1658,8 @@ public final class CodexAgentManager {
 	}
 
 	@FunctionalInterface
-	interface RecoveryColumnSafety {
-		boolean safe(int x, int y, int z);
+	interface RecoveryPositionSafety {
+		boolean safe(double x, double y, double z);
 	}
 
 	public void maintainChunkTickets() {
@@ -1619,11 +1669,18 @@ public final class CodexAgentManager {
 				releaseChunkTicket(record.agentId());
 				continue;
 			}
-			restoreChunkTicket(record);
-			if (record.entityUuid().isPresent()) {
-				findAgentPlayer(record.agentId()).ifPresent(entity -> trackChunkTicket(record.agentId(), entity, now));
-			}
+			// Saved recovery coordinates are not proof of a present body. Restoring their
+			// ticket here would undo reconciliation's release, even for deferred retries.
+			maintainPresentBodyTicket(
+					findAgentPlayer(record.agentId()).filter(ServerPlayer::isAlive)
+							.filter(player -> record.entityUuid().filter(player.getUUID()::equals).isPresent()),
+					player -> trackChunkTicket(record.agentId(), player, now),
+					() -> releaseChunkTicket(record.agentId()));
 		}
+	}
+
+	static <T> void maintainPresentBodyTicket(Optional<T> liveBody, java.util.function.Consumer<T> track, Runnable release) {
+		liveBody.ifPresentOrElse(track, release);
 	}
 
 	void requireStableDirectorTransfer(AgentId id) {
@@ -1657,16 +1714,13 @@ public final class CodexAgentManager {
 						() -> {
 							VanillaRespawnAttempt pendingRespawn = pendingVerifiedRespawns.remove(record.agentId());
 							runCleanupSteps(
+									// Claim delayed callbacks before rollback consumes their pending entry.
+									() -> cancelPendingPlayerSpawn(record, pendingPlayerSpawns,
+											cancelledPlayerSpawns, System.currentTimeMillis()),
 									() -> {
 										if (pendingRespawn != null) rollbackVanillaRespawn(pendingRespawn);
 									},
 									() -> releaseChunkTicket(record.agentId()),
-									() -> {
-										if (pendingPlayerSpawns.remove(record.agentId()) != null) {
-											cancelledPlayerSpawns.record(
-													record.agentId(), record.profile(), System.currentTimeMillis());
-										}
-									},
 									() -> pendingAgentRegistrations.remove(record.agentId()),
 									() -> pendingEntityRecoveries.remove(record.agentId()),
 									() -> pendingLegacyMigrations().remove(record.agentId()),
@@ -1689,6 +1743,13 @@ public final class CodexAgentManager {
 				() -> OfflineAgentPlayers.invalidateIdentity(record.agentId())
 		);
 		return removed;
+	}
+
+	static void cancelPendingPlayerSpawn(AgentRecord record, Map<AgentId, Long> pending,
+			PendingSpawnCancellationLedger cancellations, long now) {
+		if (pending.remove(record.agentId()) != null) {
+			cancellations.record(record.agentId(), record.profile(), now);
+		}
 	}
 
 	static <T> T deleteAfterRequiredCleanup(Runnable requiredCleanup, Supplier<T> durableDelete) {

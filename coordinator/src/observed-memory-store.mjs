@@ -27,14 +27,23 @@ export function spatialCellKey(x, y, z) {
 
 /** One coordinator instance owns each agent file; writes replace complete bounded records. */
 export class AtomicAgentStore {
-	#directory; #namespace; #writes = new Map();
-	constructor({ directory = null, namespace }) {
+	#directory; #namespace; #writes = new Map(); #partition; #persistedParts = new Map();
+	constructor({ directory = null, namespace, partition = null }) {
 		this.#directory = directory === null ? null : resolve(directory);
 		this.#namespace = namespace;
+		this.#partition = partition;
 	}
 	async read(agentId) {
 		if (this.#directory === null) return null;
 		await this.#writes.get(agentId);
+		const saved = await this.#readRecord(agentId);
+		const keys = saved === null ? null : this.#partition?.keys(saved);
+		if (keys == null) return saved;
+		const parts = new Map();
+		for (const key of keys) parts.set(key, await this.#readRecord(this.#partitionKey(agentId, key)));
+		return this.#partition.join(saved, parts);
+	}
+	async #readRecord(agentId) {
 		try {
 			const bytes = await readFile(this.#path(agentId));
 			if (bytes.length > MAX_FILE_BYTES) throw new Error('MEMORY_FILE_TOO_LARGE');
@@ -43,21 +52,36 @@ export class AtomicAgentStore {
 	}
 	write(agentId, value) {
 		if (this.#directory === null) return Promise.resolve();
-		const encoded = JSON.stringify(value);
-		if (Buffer.byteLength(encoded) > MAX_FILE_BYTES) return Promise.reject(new Error('MEMORY_FILE_TOO_LARGE'));
+		// Capture every owner record before yielding, preserving snapshot/ACK fences.
+		const split = this.#partition?.split(value);
+		const encoded = JSON.stringify(split?.manifest ?? value);
+		const parts = split ? [...split.parts].map(([key, part]) => [this.#partitionKey(agentId, key), JSON.stringify(part)]) : [];
+		if ([encoded, ...parts.map(([, bytes]) => bytes)].some(bytes => Buffer.byteLength(bytes) > MAX_FILE_BYTES)) return Promise.reject(new Error('MEMORY_FILE_TOO_LARGE'));
 		const previous = this.#writes.get(agentId) ?? Promise.resolve();
 		const pending = previous.catch(() => {}).then(async () => {
 			await mkdir(this.#directory, { recursive: true });
-			const target = this.#path(agentId);
-			const temporary = `${target}.${randomUUID()}.tmp`;
-			try {
-				const file = await open(temporary, 'wx', 0o600);
-				try { await file.writeFile(encoded, 'utf8'); await file.sync(); } finally { await file.close(); }
-				await rename(temporary, target);
-			} finally { await unlink(temporary).catch((error) => { if (error.code !== 'ENOENT') throw error; }); }
+			for (const [key, bytes] of parts) {
+				const fingerprint = createHash('sha256').update(bytes).digest('hex');
+				if (this.#persistedParts.get(key) === fingerprint) continue;
+				await this.#writeRecord(key, bytes);
+				this.#persistedParts.set(key, fingerprint);
+			}
+			// Publish new owners only after their files. Legacy manifests remain intact
+			// on migration failure; existing owners are independently atomic records.
+			await this.#writeRecord(agentId, encoded);
 		});
 		this.#writes.set(agentId, pending);
 		return pending.finally(() => { if (this.#writes.get(agentId) === pending) this.#writes.delete(agentId); });
+	}
+	#partitionKey(agentId, key) { return `part:${createHash('sha256').update(JSON.stringify([agentId, key])).digest('hex')}`; }
+	async #writeRecord(agentId, encoded) {
+		const target = this.#path(agentId);
+		const temporary = `${target}.${randomUUID()}.tmp`;
+		try {
+			const file = await open(temporary, 'wx', 0o600);
+			try { await file.writeFile(encoded, 'utf8'); await file.sync(); } finally { await file.close(); }
+			await rename(temporary, target);
+		} finally { await unlink(temporary).catch((error) => { if (error.code !== 'ENOENT') throw error; }); }
 	}
 	#path(agentId) {
 		if (typeof agentId !== 'string' || agentId.length === 0 || agentId.length > 256) throw new TypeError('agentId must be bounded text');
@@ -118,7 +142,7 @@ export class ObservedMemoryStore {
 		const agent = this.#agents.get(agentId);
 		return this.#disk.write(agentId, { version: 1, scopes: agent ? [...agent.scopes.values()].filter((scope) => !scope.worldId.startsWith('session:')).map((scope) => ({ ...scope, cells: [...scope.cells.values()], blocks: [...scope.blocks.values()] })) : [] });
 	}
-	ingest(agentId, observation) {
+	ingest(agentId, observation, { snapshot = true } = {}) {
 		const worldId = observationWorldId(observation), dimension = observationDimension(observation);
 		const agent = this.#agent(agentId);
 		const key = scopeKey(worldId, dimension);
@@ -148,7 +172,8 @@ export class ObservedMemoryStore {
 		}
 		trim(scope.blocks, this.#maximumBlocks);
 		this.#bound(agent);
-		return this.query(agentId, { worldId, dimension });
+		// Observation-only callers can skip copying every retained cell and block.
+		if (snapshot) return this.query(agentId, { worldId, dimension });
 	}
 	markBlocked(agentId, { worldId, dimension, x, y, z, tick, reasonCode = 'PATH_BLOCKED' }) {
 		const agent = this.#agents.get(agentId);

@@ -1,5 +1,6 @@
 import path from 'node:path';
-import { mkdir as defaultMkdir, open as defaultOpen, readFile as defaultReadFile, writeFile as defaultWriteFile } from 'node:fs/promises';
+import { runnerPhaseChannel } from './benchmark/paired-runner-channel.mjs';
+import { mkdir as defaultMkdir, open as defaultOpen, readFile as defaultReadFile, writeFile as defaultWriteFile, readdir, stat } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { HeadlessRconClient } from './headless-rcon.mjs';
 import { sanitizeDiagnosticErrorStack, sanitizeDiagnosticText, sanitizeDiagnosticValue } from './diagnostic-sanitizer.mjs';
@@ -13,6 +14,9 @@ const MAX_TEXT = 4096;
 const MAX_ASSERTION_ARGS = 8192;
 const MAX_EVIDENCE_BYTES = 16_384;
 const MAX_EVIDENCE_TAIL_BYTES = 262_144;
+// ProviderTurnRecorder bounds a JSONL record to 262143 bytes; protocol records
+// are smaller. An oversized/corrupt line is a coverage gap, never a silent tail.
+const MAX_EVIDENCE_RECORD_BYTES = 262_144;
 const POST_RUN_EVIDENCE_TIMEOUT_MS = 10_000;
 const MAX_SCENARIOS = 24;
 const MAX_MATRIX_REPORT_BYTES = 262_144;
@@ -222,6 +226,7 @@ export async function runHeadlessScenario({
 	providerTurnsPath = null,
 	providerTurnRecorder = null,
 	worldManifest = null,
+	trialDeadlineMs = null, onCleanup = null,
 	poll = defaultPoll,
 } = {}) {
 	if (!scenario || typeof scenario !== 'object') throw new TypeError('scenario must be an object');
@@ -230,6 +235,7 @@ export async function runHeadlessScenario({
 	const directory = normalizeRunDirectory(runDirectory);
 	const assertions = scenario.assertions ?? scenario.assert ?? [];
 	validateRunnerScenario(scenario, assertions);
+	if (onCleanup !== null && (scenario.world?.mode !== 'natural' || (scenario.rosterSize ?? 1) !== 1)) throw new Error('Paired phases require one natural-world agent');
 	if ((scenario.rosterSize ?? 1) > 1) {
 		return runConcurrentHeadlessScenario({
 			scenario, directory, rcon, now, readFile, readTail, fileSize, writeFile, protocolAudit,
@@ -253,12 +259,23 @@ export async function runHeadlessScenario({
 	if (!Number.isFinite(startedAt)) throw new TypeError('now must return a finite number');
 	const generatedName = generatedAgentName(scenario, startedAt);
 	const timeoutMs = Math.min(scenario.timeoutMs, scenario.scenarioTimeoutMs ?? scenario.timeoutMs);
-	const deadline = startedAt + timeoutMs;
+	const deadline = trialDeadlineMs ?? startedAt + timeoutMs;
+	if (!Number.isFinite(deadline)) throw new TypeError('invalid trial deadline');
+	let cleanupBoundary = null;
+	const enterCleanup = async value => {
+		if (onCleanup !== null && cleanupBoundary === null) {
+			cleanupBoundary = await onCleanup(value);
+			if (!Number.isFinite(cleanupBoundary)) throw new TypeError('invalid cleanup deadline');
+		}
+	};
+	const cleanupDeadline = () => onCleanup === null ? Math.max(deadline, Number(now()) + 10_000) : cleanupBoundary ?? deadline;
 	const tailReader = readTail ?? (readFile === defaultReadFile
 		? defaultReadTail
 		: async (file, limit, offset = 0) => boundedTailText(Buffer.from(await readFile(file, 'utf8')).subarray(offset), limit));
 	const evidencePaths = resolveEvidencePaths(directory, protocolAudit, providerTurnsPath);
 	const evidenceOffsets = await captureEvidenceOffsets(evidencePaths, fileSize);
+	evidenceOffsets.scope = { scenario, names: [generatedName] };
+	if (readTail) evidenceOffsets.readRows = (file) => readTail(file, Number.MAX_SAFE_INTEGER, 0);
 	const protocolAuditOffset = auditRows(protocolAudit).length;
 	let terminalState = null;
 	let classification = null;
@@ -269,18 +286,25 @@ export async function runHeadlessScenario({
 	let naturalWorld = null;
 	let spawnPosition = null;
 	let spawnTicket = null;
+	const withinDeadline = onCleanup === null ? withDeadline : settledOperation;
 	const command = async (value, { readOnly = false, deadlineMs = deadline, attempt = 0, recordEvidence = true } = {}) => {
 		const commandText = String(value);
 		if (readOnly && !isReadOnlyRcon(commandText)) throw new Error(`RCON assertion command is not read-only: ${commandText}`);
 		commands.push(commandText);
-		const result = await withDeadline(() => rcon.command(commandText), deadlineMs, () => logicalNow(now, startedAt, attempt), 'HEADLESS_TIMEOUT');
-		const textValue = boundedText(result?.text ?? result, MAX_EVIDENCE_BYTES);
+		const result = onCleanup === null
+			? await withDeadline(() => rcon.command(commandText), deadlineMs, () => logicalNow(now, startedAt, attempt), 'HEADLESS_TIMEOUT')
+			: await settledRconCommand(rcon, commandText, deadlineMs, now);
+		const rawText = String(result?.text ?? result);
+		if (result?.complete === false || result?.truncated === true || Buffer.byteLength(rawText, 'utf8') > MAX_EVIDENCE_BYTES) {
+			throw Object.assign(new Error('RCON response evidence is incomplete'), { code: 'RCON_INCOMPLETE' });
+		}
+		const textValue = boundedText(rawText, MAX_EVIDENCE_BYTES);
 		if (readOnly && recordEvidence) rconEvidence.push({ command: commandText, text: textValue });
 		return { result, text: textValue };
 	};
 	const releaseSpawnTicket = async () => {
 		if (spawnTicket === null) return;
-		const result = await command(`execute in minecraft:overworld run forceload remove ${spawnTicket.x} ${spawnTicket.z}`, { deadlineMs: Math.max(deadline, Number(now()) + 10_000) });
+		const result = await command(`execute in minecraft:overworld run forceload remove ${spawnTicket.x} ${spawnTicket.z}`, { deadlineMs: cleanupDeadline() });
 		if (isFailedResponse(result.text)) throw new Error('NATURAL_SPAWN_CLEANUP: could not release the spawn chunk ticket');
 		spawnTicket.released = true;
 		spawnTicket = null;
@@ -324,8 +348,8 @@ export async function runHeadlessScenario({
 			}
 			summon = await command(`execute in minecraft:overworld positioned 0.5 201 0.5 run codex summon-configured ${scenario.provider} ${scenario.model} ${scenario.reasoningEffort} ${scenario.serviceTier ?? 'priority'} survival ${generatedName}`);
 		} finally {
-			const cleanupDeadline = Math.max(deadline, Number(now()) + 10_000);
-			await command('execute in minecraft:overworld run forceload remove 0 0', { deadlineMs: cleanupDeadline });
+			const removalDeadline = cleanupDeadline();
+			await command('execute in minecraft:overworld run forceload remove 0 0', { deadlineMs: removalDeadline });
 		}
 		}
 		if (isSkippedResponse(summon.text)) classification = 'SKIPPED_PROFILE';
@@ -367,7 +391,7 @@ export async function runHeadlessScenario({
 				terminalState = LIFECYCLE_STATES.has(parsedState) ? parsedState : null;
 				if (terminalState !== null) break;
 				try {
-					await withDeadline(() => poll({ phase: 'status', attempt: attempts, deadline, status: status.text, readStatus: () => command(`codex status ${generatedName}`, { attempt: attempts }), now }), deadline, () => logicalNow(now, startedAt, attempts), 'HEADLESS_TIMEOUT');
+					await withinDeadline(() => poll({ phase: 'status', attempt: attempts, deadline, status: status.text, readStatus: () => command(`codex status ${generatedName}`, { attempt: attempts }), now }), deadline, () => logicalNow(now, startedAt, attempts), 'HEADLESS_TIMEOUT');
 				} catch (error) {
 					if (error?.code === 'HEADLESS_TIMEOUT') { classification = 'TIMEOUT'; break; }
 					throw error;
@@ -381,8 +405,9 @@ export async function runHeadlessScenario({
 		if (classification === null && terminalState === null) classification = 'TIMEOUT';
 		try { minecraftMspt = parseMinecraftMspt((await command('tick query', { attempt: 0 })).text); } catch { /* optional server metric */ }
 		const taskElapsedMs = Math.max(0, Number(now()) - startedAt);
+		await enterCleanup({ classification: classification ?? 'PENDING_EVIDENCE', taskElapsedMs });
 		const postRunStartedAt = Number(now());
-		const postRunDeadline = classification === 'TIMEOUT' ? Math.max(deadline, postRunStartedAt + POST_RUN_EVIDENCE_TIMEOUT_MS) : deadline;
+		const postRunDeadline = onCleanup !== null ? cleanupBoundary : classification === 'TIMEOUT' ? Math.max(deadline, postRunStartedAt + POST_RUN_EVIDENCE_TIMEOUT_MS) : deadline;
 		let postRunEvidence = null;
 		if (classification === 'TIMEOUT' && summoned) {
 			try {
@@ -396,12 +421,12 @@ export async function runHeadlessScenario({
 		const evidenceResult = await collectHeadlessEvidence({
 			directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets, protocolAuditOffset, assertions, terminalState, rconEvidence,
 			readOnlyCommand: (value, readDeadline = deadline) => command(value, { readOnly: true, deadlineMs: readDeadline, attempt: 0 }),
-			deadline, postRunDeadline: postRunEvidence?.status === 'STOPPED' ? postRunDeadline : deadline,
+			deadline: onCleanup !== null ? cleanupBoundary : deadline, postRunDeadline: onCleanup !== null || postRunEvidence?.status === 'STOPPED' ? postRunDeadline : deadline,
 			allowRconReads: classification !== 'TIMEOUT' || postRunEvidence?.status === 'STOPPED',
-			now, startedAt, poll, scenario, generatedName, spawnPosition, waitForEvidence: classification === null,
+			now, startedAt, poll, scenario, generatedName, spawnPosition, withinDeadline, waitForEvidence: classification === null,
 		});
 		const { scopedEvidence, scopedAudit, identity, assertionResult } = evidenceResult;
-		const attestation = summarizeProviderAttestation([...(scopedEvidence.providerTurnSummaries ?? []), ...(scopedEvidence.traceRows ?? [])].map((row) => ({ executionSettings: safeExecutionSettings(row.executionSettings) })), profile);
+		const attestation = summarizeProviderAttestation([...(scopedEvidence.usage ?? []).flatMap((row) => row.attestations), ...(scopedEvidence.providerTurnSummaries ?? []), ...(scopedEvidence.traceRows ?? [])].map((row) => ({ executionSettings: safeExecutionSettings(row.executionSettings) })), profile);
 		const factualAssertions = assertions.filter((assertion) => assertion.type === 'rcon');
 		const factualSuccess = factualAssertions.length > 0
 			&& assertionResult.results.filter((result) => result.type === 'rcon').every((result) => result.passed);
@@ -414,16 +439,19 @@ export async function runHeadlessScenario({
 			classification = 'PROFILE_MISMATCH';
 			diagnostics = 'Natural evaluation requires an authoritative snapshot with the exact requested model settings';
 		}
-		if (naturalWorld !== null && attestation.mismatches.length > 0 && classification === null) {
-			classification = 'PROFILE_MISMATCH';
-			diagnostics = `Provider response reported different ${attestation.mismatches.join(', ')} settings`;
-		}
+		// Preserve the measured gameplay result even when explicit provider evidence
+		// makes this execution ineligible for the requested-profile comparison.
 		if (classification === null && !assertionResult.passed) classification = 'ASSERTION_MISMATCH';
 		if (classification === null && scenario.requireFactualSuccess && !factualSuccess) classification = 'FAILED_USER_OBJECTIVE';
 		if (classification === null) classification = 'PASSED';
+		const gameplayClassification = classification;
+		if (naturalWorld !== null && attestation.mismatches.length > 0) {
+			classification = 'PROFILE_MISMATCH';
+			diagnostics = `Provider response reported different ${attestation.mismatches.join(', ')} settings`;
+		}
 		const status = classification === 'PASSED' ? 'PASSED' : classification === 'SKIPPED_PROFILE' ? 'SKIPPED' : 'FAILED';
 		const report = scenarioReport(status, scenario, {
-			classification, generatedName, lifecycle: terminalState, elapsedMs: taskElapsedMs,
+			classification, gameplayClassification, generatedName, lifecycle: terminalState, elapsedMs: taskElapsedMs,
 			...(naturalWorld === null ? {} : { world: { ...naturalWorld, spawnPosition }, settings: { requested: { ...profile }, configured: identity.effectiveProfile ?? null, configuredVerified: identity.authoritative, effective: attestation.effective, evidence: attestation.evidence }, budget: { wallClockMs: timeoutMs }, observationMode: 'text_only' }),
 			commands, assertions: assertionResult.results, factualSuccess, evidence: evidenceSummary(directory, scopedEvidence, scopedAudit),
 			...(postRunEvidence === null ? {} : { postRunEvidence }),
@@ -435,8 +463,8 @@ export async function runHeadlessScenario({
 		try {
 			await releaseSpawnTicket();
 			if (summoned) {
-				const cleanupDeadline = Math.max(deadline, Number(now()) + 10_000);
-				const removal = await command(`codex remove ${generatedName}`, { deadlineMs: cleanupDeadline });
+				const removalDeadline = cleanupDeadline();
+				const removal = await command(`codex remove ${generatedName}`, { deadlineMs: removalDeadline });
 				if (isFailedResponse(removal.text)) throw new Error('Could not remove the headless scenario agent');
 				summoned = false;
 			}
@@ -448,13 +476,14 @@ export async function runHeadlessScenario({
 		const finished = scenarioReport(report.status, scenario, { ...report, cleanup: { status: closed ? 'CLEAN' : 'FAILED' } });
 		return await persistReportOrFailure(scenario, finished, directory, writeFile);
 	} catch (error) {
+		await enterCleanup({ classification: classification ?? (error?.code === 'HEADLESS_TIMEOUT' ? 'TIMEOUT' : 'ERROR') });
 		diagnostics = boundedText(error?.message ?? error, MAX_DIAGNOSTICS);
 		let cleanupError = null;
 		try { await releaseSpawnTicket(); } catch (errorDuringRelease) { cleanupError = errorDuringRelease; }
 		if (summoned) {
 			try {
-				const cleanupDeadline = Math.max(deadline, Number(now()) + 10_000);
-				const removal = await command(`codex remove ${generatedName}`, { deadlineMs: cleanupDeadline });
+				const removalDeadline = cleanupDeadline();
+				const removal = await command(`codex remove ${generatedName}`, { deadlineMs: removalDeadline });
 				if (isFailedResponse(removal.text)) throw new Error('Could not remove the headless scenario agent');
 				summoned = false;
 			} catch (errorDuringRemoval) { cleanupError = errorDuringRemoval; }
@@ -508,13 +537,19 @@ async function runConcurrentHeadlessScenario({
 		started: false,
 		summoned: false,
 	}));
+	evidenceOffsets.scope = { scenario, names: members.map((member) => member.generatedName) };
+	if (readTail) evidenceOffsets.readRows = (file) => readTail(file, Number.MAX_SAFE_INTEGER, 0);
 	const commands = [];
 	const command = async (value, { readOnly = false, deadlineMs = deadline, attempt = 0 } = {}) => {
 		const commandText = String(value);
 		if (readOnly && !isReadOnlyRcon(commandText)) throw new Error(`RCON assertion command is not read-only: ${commandText}`);
 		commands.push(commandText);
 		const result = await withDeadline(() => rcon.command(commandText), deadlineMs, () => logicalNow(now, startedAt, attempt), 'HEADLESS_TIMEOUT');
-		const textValue = boundedText(result?.text ?? result, MAX_EVIDENCE_BYTES);
+		const rawText = String(result?.text ?? result);
+		if (result?.complete === false || result?.truncated === true || Buffer.byteLength(rawText, 'utf8') > MAX_EVIDENCE_BYTES) {
+			throw Object.assign(new Error('RCON response evidence is incomplete'), { code: 'RCON_INCOMPLETE' });
+		}
+		const textValue = boundedText(rawText, MAX_EVIDENCE_BYTES);
 		return { result, text: textValue };
 	};
 	try {
@@ -616,7 +651,7 @@ async function runConcurrentHeadlessScenario({
 		const exactAgentIds = members.map((member) => member.agentId).filter(Boolean);
 		const aggregateEvidence = isolateRosterFileEvidence(evidenceResult.fileEvidence, members);
 		const aggregateAudit = auditRows(protocolAudit).slice(protocolAuditOffset)
-			.filter((row) => exactAgentIds.some((agentId) => rowMatchesAgent(row, agentId))).slice(-256 * Math.max(1, exactAgentIds.length));
+			.filter((row) => exactAgentIds.some((agentId) => rowMatchesAgent(row, agentId)));
 		for (const member of members) {
 			const isolated = evidenceResult.byAgent.get(member.agentId);
 			if (member.classification === null && isolated !== undefined && !isolated.assertionResult.passed) member.classification = 'ASSERTION_MISMATCH';
@@ -624,7 +659,7 @@ async function runConcurrentHeadlessScenario({
 		}
 		const agentReports = members.map((member) => {
 			const isolated = evidenceResult.byAgent.get(member.agentId);
-			const isolatedAudit = auditRows(protocolAudit).slice(protocolAuditOffset).filter((row) => rowMatchesAgent(row, member.agentId)).slice(-256);
+			const isolatedAudit = auditRows(protocolAudit).slice(protocolAuditOffset).filter((row) => rowMatchesAgent(row, member.agentId));
 			return boundReportValue({
 				agentId: member.agentId,
 				generatedName: member.generatedName,
@@ -701,7 +736,7 @@ export async function writeHeadlessReport(runDirectory, report, writeFile = defa
 	await writeFile(path.join(directory, 'report.json'), `${JSON.stringify(bounded, null, 2)}\n`, { encoding: 'utf8' });
 }
 
-const HEADLESS_CLI_USAGE = 'Usage: node src/headless-matrix.mjs --config <absolute-path> --run-directory <absolute-path> --rcon-host <host> --rcon-port <port> --rcon-password-file <absolute-path> [--scenario <id>] [--protocol-audit <absolute-path>] [--provider-turns <absolute-path>] [--world-manifest <absolute-path>] [--require-all]';
+const HEADLESS_CLI_USAGE = 'Usage: node src/headless-matrix.mjs --config <absolute-path> --run-directory <absolute-path> --rcon-host <host> --rcon-port <port> --rcon-password-file <absolute-path> [--scenario <id>] [--protocol-audit <absolute-path>] [--provider-turns <absolute-path>] [--world-manifest <absolute-path>] [--paired-channel <absolute-path>] [--require-all]';
 
 export function parseHeadlessCliArguments(args) {
 	if (!Array.isArray(args)) throw new TypeError('CLI arguments must be an array');
@@ -710,7 +745,7 @@ export function parseHeadlessCliArguments(args) {
 		['--config', 'configPath'], ['--scenario', 'scenarioId'], ['--run-directory', 'runDirectory'],
 		['--rcon-host', 'rconHost'], ['--rcon-port', 'rconPort'], ['--rcon-password-file', 'rconPasswordFile'],
 		['--protocol-audit', 'protocolAuditPath'], ['--provider-turns', 'providerTurnsPath'],
-		['--world-manifest', 'worldManifestPath'],
+		['--world-manifest', 'worldManifestPath'], ['--paired-channel', 'pairedChannelPath'],
 	]);
 	for (let index = 0; index < args.length; index += 1) {
 		const flag = args[index];
@@ -724,6 +759,7 @@ export function parseHeadlessCliArguments(args) {
 	for (const key of ['configPath', 'runDirectory', 'rconPasswordFile']) {
 		if (typeof result[key] !== 'string' || !path.isAbsolute(result[key])) throw new Error(`${key} must be an absolute path\n${HEADLESS_CLI_USAGE}`);
 	}
+	if (result.pairedChannelPath !== undefined && !path.isAbsolute(result.pairedChannelPath)) throw new Error('pairedChannelPath must be absolute');
 	for (const key of ['protocolAuditPath', 'providerTurnsPath', 'worldManifestPath']) {
 		if (result[key] !== null && !path.isAbsolute(result[key])) throw new Error(`${key} must be an absolute path`);
 	}
@@ -746,6 +782,7 @@ export function formatHeadlessCliOutput(report) {
 export async function runHeadlessMatrix({
 	configPath, scenarioId = null, runDirectory, rconHost = '127.0.0.1', rconPort, rconPasswordFile,
 	protocolAuditPath = null, providerTurnsPath = null, worldManifestPath = null, requireAll = false,
+	pairedChannelPath = null, phaseChannel = pairedChannelPath === null ? null : runnerPhaseChannel(pairedChannelPath),
 	readFile = defaultReadFile, writeFile = defaultWriteFile, mkdir = defaultMkdir,
 	readTail = null, fileSize = defaultFileSize,
 	rconFactory = (options) => new HeadlessRconClient(options),
@@ -754,6 +791,7 @@ export async function runHeadlessMatrix({
 	const matrix = normalizeHeadlessMatrix(JSON.parse(await readFile(configPath, 'utf8')));
 	const scenarios = selectHeadlessScenarios(matrix, scenarioId);
 	if (scenarios.length > MAX_SCENARIOS) throw new RangeError(`selected scenario count exceeds bounded maximum of ${MAX_SCENARIOS}`);
+	if (phaseChannel !== null && (scenarios.length !== 1 || scenarios[0].repetitions !== 1 || scenarios[0].rosterSize !== 1 || scenarios[0].world.mode !== 'natural')) throw new Error('Paired phases require one natural scenario, one agent, one repetition');
 	let worldManifest = null;
 	if (scenarios.some((scenario) => scenario.world.mode === 'natural')) {
 		if (scenarios.length !== 1 || worldManifestPath === null) throw new Error('Natural evaluations require one scenario per isolated server and --world-manifest from the launcher');
@@ -774,6 +812,7 @@ export async function runHeadlessMatrix({
 			rcon = rconFactory({ host: rconHost, port: rconPort, password });
 			if (!rcon || typeof rcon.connect !== 'function' || typeof rcon.command !== 'function') throw new TypeError('rconFactory must return a HeadlessRconClient-compatible object');
 			await rcon.connect();
+			const trialDeadlineMs = phaseChannel === null ? null : await phaseChannel.ready();
 			const report = await runHeadlessScenario({
 				scenario,
 				runDirectory: scenarioDirectory,
@@ -784,7 +823,8 @@ export async function runHeadlessMatrix({
 				writeFile,
 				protocolAudit: protocolAuditPath,
 				providerTurnsPath,
-				worldManifest,
+				worldManifest, trialDeadlineMs,
+				...(phaseChannel === null ? {} : { now: phaseChannel.now, onCleanup: value => phaseChannel.cleanup(value) }),
 			});
 			scenarioReports.push(scenario.repetitions === 1 ? report : { ...report, repetition });
 		} catch (error) {
@@ -895,12 +935,12 @@ function makeEvidence({ terminalState, protocolAudit, protocolRows = [], traceRo
 	return { lifecycle: terminalState, terminalState, chats, actions, program, rcon };
 }
 
-async function collectHeadlessEvidence({ directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets, protocolAuditOffset, assertions, terminalState, rconEvidence, readOnlyCommand, deadline, postRunDeadline = deadline, allowRconReads = true, now, startedAt, poll, scenario, generatedName, spawnPosition = null, waitForEvidence = true }) {
+async function collectHeadlessEvidence({ directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets, protocolAuditOffset, assertions, terminalState, rconEvidence, readOnlyCommand, deadline, postRunDeadline = deadline, allowRconReads = true, now, startedAt, poll, scenario, generatedName, spawnPosition = null, waitForEvidence = true, withinDeadline = withDeadline }) {
 	const resolvedAssertions = resolveAgentAssertions(assertions, generatedName, spawnPosition);
 	const finalReadDeadline = Math.max(deadline, postRunDeadline);
 	for (const assertion of resolvedAssertions) {
 		if (!allowRconReads || assertion.type !== 'rcon' || logicalNow(now, startedAt, 0) >= finalReadDeadline) continue;
-		try { await withDeadline(() => readOnlyCommand(assertion.command, finalReadDeadline), finalReadDeadline, () => logicalNow(now, startedAt, 0), 'HEADLESS_TIMEOUT'); }
+		try { await withinDeadline(() => readOnlyCommand(assertion.command, finalReadDeadline), finalReadDeadline, () => logicalNow(now, startedAt, 0), 'HEADLESS_TIMEOUT'); }
 		catch (error) {
 			// A post-run fact that cannot be read is unknown. The gameplay deadline
 			// has already decided the run, so do not turn a bounded evidence miss
@@ -917,14 +957,14 @@ async function collectHeadlessEvidence({ directory, readFile, tailReader, protoc
 	let evidence;
 	let assertionResult;
 	const evaluate = async () => {
-		fileEvidence = await readEvidence(directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets);
+		fileEvidence = await readEvidence(directory, readFile, tailReader, protocolAudit, providerTurnsPath, { ...evidenceOffsets, shouldStop: () => Number(now()) >= finalReadDeadline });
 		identity = resolveExactSnapshotAgentId(fileEvidence, currentAudit(), scenario, generatedName);
 		if (identity.authoritative) {
 			scopedEvidence = isolateFileEvidence(fileEvidence, identity.agentId, generatedName);
-			scopedAudit = currentAudit().filter((row) => rowMatchesAgent(row, identity.agentId)).slice(-256);
+			scopedAudit = currentAudit().filter((row) => rowMatchesAgent(row, identity.agentId));
 		} else if (identity.legacy) {
 			scopedEvidence = isolateLegacyFileEvidence(fileEvidence);
-			scopedAudit = currentAudit().filter((row) => !rowHasAgentIdentity(row)).slice(-256);
+			scopedAudit = currentAudit().filter((row) => !rowHasAgentIdentity(row));
 		} else {
 			scopedEvidence = emptyFileEvidence(fileEvidence);
 			scopedAudit = [];
@@ -936,7 +976,7 @@ async function collectHeadlessEvidence({ directory, readFile, tailReader, protoc
 	const waitsForFiles = assertions.some((assertion) => assertion.type !== 'lifecycle' && assertion.type !== 'rcon');
 	while (waitForEvidence && !assertionResult.passed && waitsForFiles && logicalNow(now, startedAt, attempt) < deadline) {
 		try {
-			await withDeadline(() => poll({ phase: 'evidence', attempt, deadline, evidence, now }), deadline, () => logicalNow(now, startedAt, attempt), 'HEADLESS_TIMEOUT');
+			await withinDeadline(() => poll({ phase: 'evidence', attempt, deadline, evidence, now }), deadline, () => logicalNow(now, startedAt, attempt), 'HEADLESS_TIMEOUT');
 		} catch (error) { if (error?.code === 'HEADLESS_TIMEOUT') break; throw error; }
 		attempt += 1;
 		await evaluate();
@@ -1048,7 +1088,7 @@ async function collectConcurrentHeadlessEvidence({ members, directory, readFile,
 	let fileEvidence;
 	let byAgent;
 	const evaluate = async () => {
-		fileEvidence = await readEvidence(directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets);
+		fileEvidence = await readEvidence(directory, readFile, tailReader, protocolAudit, providerTurnsPath, { ...evidenceOffsets, shouldStop: () => Number(now()) >= deadline });
 		byAgent = new Map();
 		for (const member of members.filter((entry) => entry.agentId !== null)) {
 			const isolated = isolateFileEvidence(fileEvidence, member.agentId, member.generatedName);
@@ -1076,7 +1116,8 @@ function isolateFileEvidence(fileEvidence, agentId, generatedName) {
 		protocolRows: (fileEvidence.protocolRows ?? []).filter((row) => rowMatchesAgent(row, agentId)),
 		traceRows: (fileEvidence.traceRows ?? []).filter((row) => rowMatchesAgent(row, agentId)).slice(-256),
 		serverLog: lines.join('\n'), paths: fileEvidence.paths,
-		providerTurnsRows: providerTurnSummaries.length, providerTurnSummaries,
+		providerTurnsRows: (fileEvidence.usage ?? []).filter((row) => row.agentId === agentId).reduce((sum, row) => sum + row.count, 0), providerTurnSummaries,
+		usage: (fileEvidence.usage ?? []).filter((row) => row.agentId === agentId), coverage: fileEvidence.coverage,
 	};
 }
 
@@ -1091,22 +1132,24 @@ function isolateRosterFileEvidence(fileEvidence, members) {
 		protocolRows: (fileEvidence.protocolRows ?? []).filter(matches),
 		traceRows: (fileEvidence.traceRows ?? []).filter(matches).slice(-limit),
 		serverLog: lines.join('\n'), paths: fileEvidence.paths,
-		providerTurnsRows: providerTurnSummaries.length, providerTurnSummaries,
+		providerTurnsRows: (fileEvidence.usage ?? []).filter((row) => ids.has(row.agentId)).reduce((sum, row) => sum + row.count, 0), providerTurnSummaries,
+		usage: (fileEvidence.usage ?? []).filter((row) => ids.has(row.agentId)), coverage: fileEvidence.coverage,
 	};
 }
 
 function isolateLegacyFileEvidence(fileEvidence) {
 	const providerTurnSummaries = (fileEvidence.providerTurnSummaries ?? []).filter((row) => !rowHasAgentIdentity(row)).slice(-256);
 	return {
-		protocolRows: (fileEvidence.protocolRows ?? []).filter((row) => !rowHasAgentIdentity(row)).slice(-256),
+		protocolRows: (fileEvidence.protocolRows ?? []).filter((row) => !rowHasAgentIdentity(row)),
 		traceRows: (fileEvidence.traceRows ?? []).filter((row) => !rowHasAgentIdentity(row)).slice(-256),
 		serverLog: fileEvidence.serverLog, paths: fileEvidence.paths,
-		providerTurnsRows: providerTurnSummaries.length, providerTurnSummaries,
+		providerTurnsRows: (fileEvidence.usage ?? []).filter((row) => row.agentId === null).reduce((sum, row) => sum + row.count, 0), providerTurnSummaries,
+		usage: (fileEvidence.usage ?? []).filter((row) => row.agentId === null), coverage: fileEvidence.coverage,
 	};
 }
 
 function emptyFileEvidence(fileEvidence) {
-	return { protocolRows: [], traceRows: [], serverLog: '', paths: fileEvidence.paths, providerTurnsRows: 0, providerTurnSummaries: [] };
+	return { protocolRows: [], traceRows: [], serverLog: '', paths: fileEvidence.paths, providerTurnsRows: 0, providerTurnSummaries: [], usage: [], coverage: fileEvidence.coverage };
 }
 
 function rowMatchesAgent(row, agentId) {
@@ -1124,62 +1167,279 @@ function isAuthoritativeAgentIdentityRow(row) {
 }
 
 async function readEvidence(directory, readFile, tailReader, protocolAudit, providerTurnsPath = null, offsets = {}) {
+	readFile = offsets.readRows ?? readFile;
 	const { protocol: protocolPath, coordinator: coordinatorPath, server: serverPath, providerTurns } = resolveEvidencePaths(directory, protocolAudit, providerTurnsPath);
-	const [protocolRows, coordinatorText, serverLog, providerTurnsText] = await Promise.all([
-		readProtocolEvidence(protocolPath, offsets.protocol, tailReader), readBoundedTail(tailReader, coordinatorPath, offsets.coordinator), readBoundedTail(tailReader, serverPath, offsets.server),
-		providerTurns === null ? '' : readBoundedTail(tailReader, providerTurns, offsets.providerTurns),
+	const protocol = createProtocolEvidenceCollector(offsets.scope);
+	const protocolCoverage = await scanEvidenceFile(protocolPath, offsets.protocol, readFile, protocol.accept, offsets.shouldStop);
+	await protocol.recover(async (accept) => {
+		const coverage = await scanEvidenceFile(protocolPath, offsets.protocol, readFile, accept, offsets.shouldStop);
+		protocolCoverage.complete &&= coverage.complete;
+		protocolCoverage.reasons = [...new Set([...protocolCoverage.reasons, ...coverage.reasons])];
+	});
+	const protocolRows = protocol.rows();
+	const identities = [...protocolRows, ...auditRows(protocolAudit)].map(unwrapAuditRow).filter(isAuthoritativeAgentIdentityRow);
+	const ids = new Set(identities.filter((row) => offsets.scope?.names.includes(row.payload?.name)).map(authoritativeAgentId).filter(Boolean));
+	const runIds = new Set([...protocolRows, ...auditRows(protocolAudit)].filter((row) => offsets.scope?.names.includes(unwrapAuditRow(row)?.payload?.name)).map((row) => row.runId).filter((value) => typeof value === 'string'));
+	const providerTurnSummaries = [];
+	const usageByAgent = new Map();
+	const scenario = offsets.scope?.scenario;
+	const acceptTurn = (row) => {
+		if (row?.scenarioId != null && scenario && row.scenarioId !== scenario.id) return;
+		if (row?.runId != null && runIds.size > 0 && !runIds.has(row.runId)) return;
+		const summary = providerTurnSummary(row);
+		if (!summary) return;
+		if (ids.size > 0 && !ids.has(summary.agentId)) return;
+		if (ids.size === 0 && summary.agentId !== undefined) {
+			// Preserve labelled-evidence detection without accumulating unrelated agents.
+			if (providerTurnSummaries.length === 0) providerTurnSummaries.push(summary);
+			return;
+		}
+		if (scenario && !providerProfileMatches(summary, scenario)) return;
+		const key = summary.agentId ?? null;
+		let usage = usageByAgent.get(key);
+		if (!usage) { usage = { agentId: key, count: 0, tokens: Object.fromEntries(TOKEN_CATEGORIES.map((key) => [key, 0])), retries: 0, rateLimits: 0, compactions: 0, attestations: [], observedCounterDelta: false, usageStatuses: {} }; usageByAgent.set(key, usage); }
+		usage.observedCounterDelta ||= summary.usage?.scope === 'observed_thread_counter_delta';
+		if (summary.usage) usage.usageStatuses[summary.usage.status] = (usage.usageStatuses[summary.usage.status] ?? 0) + 1;
+		if (summary.executionSettings) {
+			const mismatch = summarizeProviderAttestation([summary], scenario).mismatches.length > 0;
+			if (mismatch && !usage.attestations[0]) usage.attestations[0] = summary;
+			usage.attestations[1] = summary;
+		}
+		usage.count += 1;
+		for (const category of TOKEN_CATEGORIES) {
+			const value = summary.tokens?.[category];
+			const total = usage.tokens[category] + value;
+			usage.tokens[category] = usage.tokens[category] !== null && Number.isSafeInteger(value) && value >= 0 && Number.isSafeInteger(total) ? total : null;
+		}
+		usage.retries += Number(summary.retry);
+		usage.rateLimits += Number(summary.rateLimited || /RATE.?LIMIT|\b429\b/i.test(summary.error?.code ?? ''));
+		usage.compactions += Number(summary.compaction === true);
+		// The diagnostic/latency window is separate from run-wide usage counters.
+		retainBounded(providerTurnSummaries, summary, 256 * Math.max(1, ids.size));
+	};
+	const [coordinatorText, serverLog, providerCoverage] = await Promise.all([
+		readBoundedTail(tailReader, coordinatorPath, evidenceOffset(offsets.coordinator)), readBoundedTail(tailReader, serverPath, evidenceOffset(offsets.server)),
+		providerTurns === null ? { complete: false, reasons: ['not_configured'] } : scanEvidenceFile(providerTurns, offsets.providerTurns, readFile, acceptTurn, offsets.shouldStop),
 	]);
-	const providerTurnRows = providerTurns === null ? [] : parseJsonl(providerTurnsText);
+	if (protocol.captureIncomplete) { providerCoverage.complete = false; providerCoverage.reasons.push('provider_capture_incomplete'); }
+	providerCoverage.captureComplete = protocol.captureIncomplete ? false : null;
 	return {
 		protocolRows, traceRows: parseJsonl(coordinatorText), serverLog,
 		paths: { protocol: protocolPath, coordinator: coordinatorPath, server: serverPath, ...(providerTurns === null ? {} : { providerTurns }) },
-		providerTurnsRows: providerTurnRows.length,
-		providerTurnSummaries: providerTurnRows.map(providerTurnSummary).filter(Boolean),
+		providerTurnsRows: [...usageByAgent.values()].reduce((sum, usage) => sum + usage.count, 0),
+		providerTurnSummaries, usage: [...usageByAgent.values()], coverage: { protocol: protocolCoverage, provider: providerCoverage },
 	};
 }
 
-async function readProtocolEvidence(file, offset = 0, tailReader = defaultReadTail) {
-	let handle;
-	try {
-		handle = await defaultOpen(file, 'r');
-		const size = Number((await handle.stat()).size);
-		// Real protocol audits are identity-scoped below, so retain durable rows from the
-		// whole file even when high-frequency observations have advanced past the capture offset.
-		let position = 0;
-		let carry = '';
-		const decoder = new TextDecoder('utf-8');
-		const durable = [];
-		const observations = [];
-		const telemetry = [];
-		const buffer = Buffer.allocUnsafe(64 * 1024);
-		const retain = (row) => {
-			const type = unwrapAuditRow(row)?.type;
-			if (type === 'observation') retainBounded(observations, row, 256);
-			else if (['heartbeat', 'coordinator_status', 'catalog_snapshot', 'catalog_request'].includes(type)) retainBounded(telemetry, row, 128);
-			else retainBounded(durable, row, 4096);
-		};
-		while (position < size) {
-			const length = Math.min(buffer.length, size - position);
-			const { bytesRead } = await handle.read(buffer, 0, length, position);
-			if (bytesRead <= 0) break;
-			position += bytesRead;
-			const text = carry + decoder.decode(buffer.subarray(0, bytesRead), { stream: position < size });
-			const lines = text.split(/\r?\n/);
-			carry = lines.pop() ?? '';
-			for (const line of lines) {
-				if (line.trim() === '') continue;
-				try { retain(JSON.parse(line)); } catch { /* a concurrently appended partial record is retried later */ }
-			}
-		}
-		if (carry.trim() !== '') {
-			try { retain(JSON.parse(carry)); } catch { /* ignore an incomplete final record */ }
-		}
-		return [...durable, ...telemetry, ...observations];
-	} catch {
-		return parseJsonl(await readBoundedTail(tailReader, file, offset));
-	} finally {
-		await handle?.close?.().catch(() => {});
+const TOKEN_CATEGORIES = ['input', 'output', 'reasoning', 'cached', 'cacheWrite'];
+
+function providerProfileMatches(turn, profile) {
+	return turn.provider === profile.provider && turn.model === profile.model
+		&& (turn.reasoningEffort == null || turn.reasoningEffort === profile.reasoningEffort)
+		&& (turn.serviceTier == null || turn.serviceTier === profile.serviceTier);
+}
+
+function evidenceOffset(value) { return typeof value === 'object' ? value?.size ?? 0 : value ?? 0; }
+function fileIdentity(metadata) { return `${metadata.dev}:${metadata.ino}:${metadata.birthtimeMs}`; }
+
+// Scan each retained generation oldest-first, starting at the exact pre-run inode
+// and offset. Never treat an unreadable/missing prefix as a complete usage total.
+async function scanEvidenceFile(file, baseline, readFile, accept, shouldStop = () => false) {
+	const reasons = new Set();
+	const expired = () => {
+		if (!shouldStop()) return false;
+		reasons.add('evidence_deadline_exceeded'); return true;
+	};
+	if (expired()) return { complete: false, reasons: [...reasons] };
+	const consume = async (line) => {
+		if (!line.trim()) return;
+		if (Buffer.byteLength(line, 'utf8') > MAX_EVIDENCE_RECORD_BYTES) { reasons.add('oversized_record'); return; }
+		try { await accept(JSON.parse(line)); } catch { reasons.add('invalid_or_partial_record'); }
+	};
+	if (readFile !== defaultReadFile) {
+		try { for (const line of Buffer.from(await readFile(file, 'utf8')).subarray(evidenceOffset(baseline)).toString('utf8').split(/\r?\n/)) { if (expired()) break; await consume(line); } }
+		catch { reasons.add('unreadable_file'); }
+		return { complete: reasons.size === 0, reasons: [...reasons] };
 	}
+	let entries;
+	try { entries = await readdir(path.dirname(file)); } catch { return { complete: false, reasons: ['unreadable_directory'] }; }
+	const base = path.basename(file);
+	const candidates = entries.flatMap((name) => name === base ? [{ file: path.join(path.dirname(file), name), generation: 0 }]
+		: name.startsWith(`${base}.`) && /^[1-9]\d*$/.test(name.slice(base.length + 1)) ? [{ file: path.join(path.dirname(file), name), generation: Number(name.slice(base.length + 1)) }] : [])
+		.sort((left, right) => right.generation - left.generation);
+	for (const candidate of candidates) {
+		try { candidate.identity = fileIdentity(await stat(candidate.file)); } catch { reasons.add('unreadable_or_rotated_file'); }
+	}
+	const baselineRetained = candidates.some((candidate) => candidate.identity === baseline?.identity);
+	if (baseline?.identity != null && !baselineRetained) reasons.add('run_start_not_retained');
+	let started = baseline?.identity == null || !baselineRetained;
+	if (started && candidates.some((entry) => entry.generation > 0)) reasons.add('rotation_start_unverified');
+	if (candidates.length === 0) reasons.add('missing_file');
+	let previousGeneration = null;
+	for (const candidate of candidates) {
+		if (expired()) break;
+		let handle;
+		try {
+			handle = await defaultOpen(candidate.file, 'r');
+			const metadata = await handle.stat();
+			if (candidate.identity !== fileIdentity(metadata)) { reasons.add('unreadable_or_rotated_file'); continue; }
+			const atBaseline = fileIdentity(metadata) === baseline?.identity;
+			if (!started && !atBaseline) continue;
+			started = true;
+			if (previousGeneration !== null && candidate.generation !== previousGeneration - 1) reasons.add('missing_rotation_generation');
+			previousGeneration = candidate.generation;
+			let position = atBaseline || (baseline?.identity == null && candidate.generation === 0) ? evidenceOffset(baseline) : 0;
+			if (position > metadata.size) { reasons.add('truncated_file'); position = 0; }
+			const buffer = Buffer.allocUnsafe(64 * 1024);
+			const decoder = new TextDecoder();
+			let carry = '';
+			let skippingOversized = false;
+			while (position < metadata.size) {
+				if (expired()) break;
+				const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, metadata.size - position), position);
+				if (bytesRead === 0) { reasons.add('truncated_file'); break; }
+				position += bytesRead;
+				if (expired()) break;
+				const lines = (carry + decoder.decode(buffer.subarray(0, bytesRead), { stream: position < metadata.size })).split(/\r?\n/);
+				carry = lines.pop() ?? '';
+				for (const line of lines) {
+					if (expired()) break;
+					if (skippingOversized) skippingOversized = false;
+					else await consume(line);
+				}
+				if (skippingOversized || Buffer.byteLength(carry, 'utf8') > MAX_EVIDENCE_RECORD_BYTES) {
+					reasons.add('oversized_record'); carry = ''; skippingOversized = true;
+				}
+			}
+			if (!expired() && carry.trim()) await consume(carry);
+		} catch { reasons.add('unreadable_or_rotated_file'); }
+		finally { await handle?.close().catch(() => {}); }
+	}
+	return { complete: reasons.size === 0, reasons: [...reasons] };
+}
+
+function createProtocolEvidenceCollector(scope) {
+	const identities = new Map();
+	const relevantIds = new Set();
+	const recent = [];
+	const witnesses = new Map();
+	const pending = new Map();
+	let rescanActions = false;
+	let successfulResult = false;
+	const assertions = scope?.scenario.assertions ?? scope?.scenario.assert ?? [];
+	let captureIncomplete = false;
+	return {
+		get captureIncomplete() { return captureIncomplete; },
+		accept(raw) {
+			const row = unwrapAuditRow(raw);
+			if (!row) return;
+			if (row.type === 'coordinator_status' && Array.isArray(row.payload?.components)) {
+				captureIncomplete ||= row.payload.components.some((component) => component.component === 'provider_audit'
+					&& (component.incompleteCapture === true || component.droppedCount > 0 || component.failedOperationCount > 0));
+			}
+			if (isAuthoritativeAgentIdentityRow(row)) {
+				// Keep profile transitions and ambiguous identities, independently of
+				// event volume. One unrelated row preserves fail-closed legacy detection.
+				const name = row.payload?.name;
+				const relevant = scope?.names.includes(name);
+				if (!relevant) identities.set('unrelated', raw);
+				else {
+					const exact = ['provider', 'model', 'reasoningEffort', 'serviceTier'].every((field) => row.payload?.[field] === scope.scenario[field]);
+					const id = authoritativeAgentId(row);
+					if (id !== null && exact) {
+						const first = identities.get(`${name}:first`);
+						if (!first) { identities.set(`${name}:first`, raw); relevantIds.add(id); }
+						else if (authoritativeAgentId(unwrapAuditRow(first)) !== id) identities.set(`${name}:ambiguous`, raw);
+					} else if (!exact) identities.set(`${name}:mismatch`, raw);
+					identities.delete(`${name}:latest`);
+					identities.set(`${name}:latest`, raw);
+				}
+				return;
+			}
+			retainBounded(recent, raw, 4096);
+			const agentId = row.agentId ?? row.payload?.agentId ?? '';
+			if (agentId && !relevantIds.has(agentId)) return;
+			for (const [index, assertion] of assertions.entries()) {
+				const key = `${agentId}:${index}`;
+				if (witnesses.has(key)) continue;
+				if (assertion.type === 'action' && row.type === 'action_command') {
+					const action = row.payload ?? row;
+					if (action.actionType !== assertion.actionType || (assertion.args !== undefined && !objectSubset(assertion.args, action.arguments ?? action.args ?? {}))) continue;
+					if (!assertion.resultState) witnesses.set(key, [raw]);
+					else if (!rescanActions) {
+						pending.set(`${agentId}:${action.actionId}:${index}`, raw);
+						// Bound the join working set, not evidence coverage. Missing result
+						// records can accumulate indefinitely; recover exact pairs by scans.
+						if (pending.size > 256) { pending.clear(); rescanActions = true; }
+					}
+				} else if (assertion.type === 'action' && row.type === 'action_result') {
+					successfulResult ||= row.payload?.state === assertion.resultState;
+					const actionKey = `${agentId}:${row.payload?.actionId}:${index}`;
+					const command = pending.get(actionKey);
+					if (command && row.payload?.state === assertion.resultState) witnesses.set(key, [command, raw]);
+					pending.delete(actionKey);
+				} else if (evaluateHeadlessAssertions([assertion], makeEvidence({ protocolRows: [raw] })).passed) witnesses.set(key, [raw]);
+			}
+		},
+		async recover(scan) {
+			if (!rescanActions || !successfulResult) return;
+			const matchCommand = (raw, add) => {
+				const row = unwrapAuditRow(raw);
+				if (row?.type !== 'action_command') return;
+				const agentId = row.agentId ?? row.payload?.agentId ?? '';
+				if (agentId && !relevantIds.has(agentId)) return;
+				const action = row.payload ?? row;
+				for (const [index, assertion] of assertions.entries()) {
+					const key = `${agentId}:${index}`;
+					if (witnesses.has(key) || assertion.type !== 'action' || !assertion.resultState || action.actionType !== assertion.actionType
+						|| (assertion.args !== undefined && !objectSubset(assertion.args, action.arguments ?? action.args ?? {}))) continue;
+					add(`${agentId}:${action.actionId}:${index}`, { raw, key, state: assertion.resultState });
+				}
+			};
+			const matchResult = (raw, batch) => {
+				const row = unwrapAuditRow(raw);
+				if (row?.type !== 'action_result') return;
+				const agentId = row.agentId ?? row.payload?.agentId ?? '';
+				for (const [index] of assertions.entries()) {
+					const candidate = batch.get(`${agentId}:${row.payload?.actionId}:${index}`);
+					if (candidate && row.payload?.state === candidate.state) witnesses.set(candidate.key, [candidate.raw, raw]);
+				}
+			};
+			// Most overflows still fit in the existing diagnostic window. Join it
+			// first without rereading files; older evidence remains recoverable.
+			const window = new Map();
+			for (const raw of recent) matchCommand(raw, (key, value) => window.set(key, value));
+			for (const raw of recent) matchResult(raw, window);
+			// Bounded batches preserve complete rotated history while replacing
+			// one full result scan per candidate with one scan per 256 candidates.
+			const batch = new Map();
+			const flush = async () => {
+				if (!batch.size) return;
+				await scan((raw) => matchResult(raw, batch));
+				batch.clear();
+			};
+			// A complete recent window needs no recovery scan for witnessed keys.
+			const witnessedAll = [...relevantIds].every((id) => assertions.every((assertion, index) => assertion.type !== 'action' || !assertion.resultState || witnesses.has(`${id}:${index}`)));
+			if (witnessedAll && relevantIds.size > 0) return;
+			await scan(async (raw) => {
+				const matches = [];
+				matchCommand(raw, (key, value) => matches.push([key, value]));
+				for (const [key, value] of matches) {
+					if (witnesses.has(value.key)) continue;
+					batch.set(key, value);
+					if (batch.size >= 256) await flush();
+				}
+			});
+			await flush();
+		},
+		rows() {
+			const retained = [...new Set([...identities.values(), ...recent])];
+			for (const witness of [...witnesses.values()].flat()) {
+				if (!retained.includes(witness) && !retained.some((row) => JSON.stringify(row) === JSON.stringify(witness))) retained.push(witness);
+			}
+			return retained;
+		},
+	};
 }
 
 function retainBounded(rows, row, limit) {
@@ -1200,8 +1460,9 @@ async function captureEvidenceOffsets(paths, fileSize) {
 	const entries = await Promise.all(Object.entries(paths).map(async ([key, file]) => {
 		if (file === null) return [key, 0];
 		try {
-			const size = Number(await fileSize(file));
-			return [key, Number.isSafeInteger(size) && size >= 0 ? size : 0];
+			const metadata = fileSize === defaultFileSize ? await stat(file) : null;
+			const size = Number(metadata?.size ?? await fileSize(file));
+			return [key, { size: Number.isSafeInteger(size) && size >= 0 ? size : 0, identity: metadata === null ? null : fileIdentity(metadata) }];
 		} catch { return [key, 0]; }
 	}));
 	return Object.fromEntries(entries);
@@ -1209,7 +1470,7 @@ async function captureEvidenceOffsets(paths, fileSize) {
 
 function evidenceSummary(directory, fileEvidence, protocolAudit) {
 	const paths = fileEvidence.paths ?? { protocol: path.join(directory, 'protocol.jsonl'), coordinator: path.join(directory, 'coordinator.jsonl'), server: path.join(directory, 'server.log') };
-	return { paths, excerpts: { server: boundedText(fileEvidence.serverLog ?? '', 1024) }, auditRows: fileEvidence.protocolRows?.length ?? auditRows(protocolAudit).length, providerTurnsRows: fileEvidence.providerTurnsRows ?? 0 };
+	return { paths, excerpts: { server: boundedText(fileEvidence.serverLog ?? '', 1024) }, auditRows: fileEvidence.protocolRows?.length ?? auditRows(protocolAudit).length, providerTurnsRows: fileEvidence.providerTurnsRows ?? 0, coverage: fileEvidence.coverage };
 }
 
 function timingSummary(profile, fileEvidence, protocolAudit, scenarioElapsedMs) {
@@ -1236,7 +1497,7 @@ function timingSummary(profile, fileEvidence, protocolAudit, scenarioElapsedMs) 
 
 function performanceMetrics(profile, fileEvidence, protocolAudit, agentId = null, runtimeResources = {}) {
 	const agentIds = Array.isArray(agentId) ? new Set(agentId) : null;
-	const turns = (fileEvidence.providerTurnSummaries ?? []).filter((turn) => turn.provider === profile.provider && turn.model === profile.model
+	const turns = (fileEvidence.providerTurnSummaries ?? []).filter((turn) => providerProfileMatches(turn, profile)
 		&& (agentIds === null ? (agentId === null ? turn.agentId === undefined : turn.agentId === agentId) : agentIds.has(turn.agentId)));
 	const rawRows = [...(fileEvidence.protocolRows ?? []), ...auditRows(protocolAudit)];
 	const envelopes = rawRows.map(unwrapAuditRow).filter(Boolean);
@@ -1257,7 +1518,12 @@ function performanceMetrics(profile, fileEvidence, protocolAudit, agentId = null
 		const value = row?.event === 'program_step' && row?.result !== null ? row?.timing?.bridgeSendToCompletionMs : null;
 		return Number.isFinite(value) && value >= 0 ? [value] : [];
 	});
-	const tokenRows = turns.map((turn) => turn.tokens ?? null);
+	const usageRows = fileEvidence.usage ?? [];
+	const completeUsage = fileEvidence.coverage?.provider?.complete === true;
+	const usageCount = usageRows.reduce((sum, row) => sum + row.count, 0);
+	const observedCounterDelta = usageRows.some((row) => row.observedCounterDelta);
+	const tokenStatuses = Object.fromEntries(['available', 'missing', 'baseline_unknown', 'counter_reset'].map((status) => [status, usageRows.reduce((sum, row) => sum + (row.usageStatuses[status] ?? 0), 0)]));
+	const recordedTokens = Object.fromEntries(TOKEN_CATEGORIES.map((category) => [category, completeUsage ? completeTokenTotal(usageRows.map((row) => row.tokens), category) : null]));
 	const modelWait = nativeTiming.summaries.length === 1 ? nativeModelWaitMetric(nativeTiming.summaries[0]) : null;
 	return {
 		latencyMs: {
@@ -1270,10 +1536,15 @@ function performanceMetrics(profile, fileEvidence, protocolAudit, agentId = null
 		// windows. Preserve each latest per-agent/profile snapshot instead.
 		...(agentIds === null || nativeTiming.summaries.length === 0 ? {} : { nativeModelWaitByAgent: nativeTiming.summaries.map(nativeModelWaitMetric) }),
 		...(nativeTiming.summaries.length === 0 ? {} : { nativeDecisionTiming: nativeTiming.summaries }),
-		tokens: Object.fromEntries(['input', 'output', 'reasoning', 'cached', 'cacheWrite'].map((category) => [category, completeTokenTotal(tokenRows, category)])),
-		retries: turns.filter((turn) => turn.retry).length,
-		rateLimits: turns.filter((turn) => turn.rateLimited || /RATE.?LIMIT|\b429\b/i.test(turn.error?.code ?? '')).length,
-		compactions: turns.filter((turn) => turn.compaction).length,
+		tokens: observedCounterDelta ? Object.fromEntries(TOKEN_CATEGORIES.map((category) => [category, null])) : recordedTokens,
+		...(observedCounterDelta ? { observedTokens: recordedTokens } : {}),
+		retries: completeUsage ? usageRows.reduce((sum, row) => sum + row.retries, 0) : null,
+		rateLimits: completeUsage ? usageRows.reduce((sum, row) => sum + row.rateLimits, 0) : null,
+		compactions: completeUsage ? usageRows.reduce((sum, row) => sum + row.compactions, 0) : null,
+		usageEvidence: { scope: 'recorded_turns_since_run_start', complete: completeUsage, captureComplete: fileEvidence.coverage?.provider?.captureComplete ?? null,
+			billingComplete: null, measurementScope: observedCounterDelta ? 'observed_thread_counter_delta' : 'recorded_turn_usage',
+			...(observedCounterDelta ? { attributionComplete: false, measurementStatuses: tokenStatuses } : {}),
+			recordedTurns: usageCount, reasons: fileEvidence.coverage?.provider?.reasons ?? ['unavailable'], latencySampleCount: turns.length },
 		resources: { ...resourceMetrics(envelopes),
 			...(Number.isFinite(runtimeResources.minecraftMspt) && runtimeResources.minecraftMspt >= 0 ? { minecraftMspt: finiteMetric(runtimeResources.minecraftMspt) } : {}) },
 	};
@@ -1435,6 +1706,7 @@ function providerTurnSummary(row) {
 	if (!row || typeof row !== 'object' || Array.isArray(row)) return null;
 	const summary = {
 		provider: boundedScalar(row.provider), model: boundedScalar(row.model), reasoningEffort: boundedScalar(row.reasoningEffort),
+		...(row.serviceTier == null && row.executionSettings?.requested?.serviceTier == null ? {} : { serviceTier: boundedScalar(row.serviceTier ?? row.executionSettings?.requested?.serviceTier) }),
 		...(row.operation === undefined ? {} : { operation: boundedScalar(row.operation) }),
 		attempt: Number.isSafeInteger(row.attempt) ? row.attempt : null, retry: row.retry === true,
 		timestamp: Number.isFinite(row.timestamp) ? Math.round(row.timestamp) : null, outcome: boundedScalar(row.outcome),
@@ -1454,6 +1726,8 @@ function providerTurnSummary(row) {
 	if (row.compaction !== undefined) summary.compaction = row.compaction === true;
 	if (row.error && typeof row.error === 'object' && !Array.isArray(row.error)) summary.error = safeProviderError(row.error);
 	if (row.executionSettings !== undefined) summary.executionSettings = safeExecutionSettings(row.executionSettings);
+	if (row.usage?.scope === 'observed_thread_counter_delta') summary.usage = { scope: row.usage.scope,
+		status: ['available', 'missing', 'baseline_unknown', 'counter_reset'].includes(row.usage.status) ? row.usage.status : 'missing', attributionComplete: false };
 	return summary;
 }
 
@@ -1699,4 +1973,22 @@ if (process.argv[1] !== undefined && path.resolve(process.argv[1]) === fileURLTo
 		writeHeadlessCliFailure(error);
 		process.exitCode = 1;
 	});
+}
+
+// Closing RCON cancels its pending transport work. Await the operation itself
+// before returning; the launcher still owns server/provider process teardown.
+async function settledRconCommand(rcon, value, deadline, now) {
+ if (now() >= deadline) throw Object.assign(new Error('Phase deadline expired'), { code: 'HEADLESS_TIMEOUT' });
+ let expired = false;
+ const timer = setTimeout(() => { expired = true; void Promise.resolve(rcon.close()).catch(() => {}); }, Math.max(0, deadline - now()));
+ try { const result = await rcon.command(value); if (expired) throw Object.assign(new Error('Phase deadline expired'), { code: 'HEADLESS_TIMEOUT' }); return result; }
+ catch (error) { if (expired) throw Object.assign(new Error('Phase deadline expired'), { code: 'HEADLESS_TIMEOUT' }); throw error; }
+ finally { clearTimeout(timer); }
+}
+
+async function settledOperation(operation, deadline, now, code = 'HEADLESS_TIMEOUT') {
+ if (now() >= deadline) throw Object.assign(new Error('Phase deadline expired'), { code });
+ const value = await operation();
+ if (now() > deadline) throw Object.assign(new Error('Phase deadline expired'), { code });
+ return value;
 }

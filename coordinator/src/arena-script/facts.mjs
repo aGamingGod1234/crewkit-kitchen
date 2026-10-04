@@ -8,7 +8,11 @@ const OBSERVED_SETS = new WeakSet();
 const CANDIDATE_ORIGINS = new WeakMap();
 const INTERPRETER_FACTS = new WeakSet();
 const FACT_STATS = new WeakMap();
-const TRUST_LIMITS = Object.freeze({ depth: 256, nodes: 4_096, keys: 4_096, stringBytes: 16_384, factBytes: MAX_LINE_BYTES * 2, arrayLength: 256 });
+// Observation facts include geometry and derived position/menu aliases. Their
+// structural allowance follows the existing bounded fact-byte envelope, rather
+// than the smaller limits for arbitrary script-authored values. Only this
+// module's validated, immutable trees receive the unforgeable fast-path brand.
+const TRUST_LIMITS = Object.freeze({ depth: 256, nodes: MAX_LINE_BYTES * 2, keys: MAX_LINE_BYTES * 2, stringBytes: 16_384, factBytes: MAX_LINE_BYTES * 2, arrayLength: 256 });
 const EMPTY_FACT_STATS = Object.freeze({ nodes: 0, keys: 0, bytes: 0, depth: -1 });
 
 /** Builds an immutable, observation-only fact view. */

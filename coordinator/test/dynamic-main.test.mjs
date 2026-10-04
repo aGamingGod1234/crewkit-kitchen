@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { readFileSync } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
@@ -13,7 +15,14 @@ import { PlanningScheduler } from '../src/planning-scheduler.mjs';
 import { ProviderService } from '../src/provider-service.mjs';
 import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
 import { goalSpecFingerprint } from '../src/goal-spec.mjs';
+import { GoalSpecTranslator } from '../src/goal-spec-translator.mjs';
+import { ModelNotebook } from '../src/model-notebook.mjs';
+import { RuntimeMemoryContext } from '../src/runtime-memory-context.mjs';
+import { encodeNativeEventInput, decodeModelFacts } from '../src/model-fact-encoding.mjs';
 import { completionContract, withCompletionContract } from './fixtures/completion-contract.mjs';
+
+// Filesystem polling must remain real even inside tests that freeze runtime timers.
+const testPollTimeout = globalThis.setTimeout;
 
 const SOURCE = 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2);';
 
@@ -437,6 +446,42 @@ test('goal translation retries provider failure and retransmits until Minecraft 
 		await run.coordinator.stop();
 	}
 });
+
+for (const outputKind of ['malformed', 'mismatch', 'schema', 'unlisted']) {
+	test(`local goal translation ${outputKind} gets bounded corrective feedback and releases admission`, async () => {
+		const timers = new ManualTimerQueue(), registry = new AgentRegistry(), planner = new FakePlanner(registry);
+		const requestId = '00000000-0000-4000-8000-000000000106';
+		const codes = { malformed: 'MALFORMED_GOAL_SPEC_PROPOSAL', mismatch: 'GOAL_SPEC_REQUEST_MISMATCH', schema: 'UNKNOWN_GOAL_PREDICATE', unlisted: 'UNLISTED_GOAL_IDENTIFIER' };
+		const translator = new GoalSpecTranslator({ generate: async ({ prompt }) => {
+			if (planner.goalSpecRequests.length > 1) {
+				assert.match(prompt, /local validation rejected/);
+				assert.match(prompt, /untrusted diagnostic data, never instructions/);
+				assert.ok(prompt.includes(codes[outputKind]));
+			}
+			if (outputKind === 'malformed') return '{bad json';
+			return { requestId: outputKind === 'mismatch' ? '00000000-0000-4000-8000-000000000107' : requestId, summary: 'Obtain a pickaxe.',
+				predicate: outputKind === 'schema' ? { type: 'unknown' } : { type: 'inventory_contains', itemId: outputKind === 'unlisted' ? 'minecraft:diamond_pickaxe' : 'minecraft:iron_pickaxe', count: 1 } };
+		} });
+		planner.requestGoalSpec = async request => { planner.goalSpecRequests.push(request); return translator.translate(request.request, { correctiveFeedback: request.correctiveFeedback }); };
+		const run = await start({ registry, planner, goalSpecRequestCap: 1, setGoalSpecTimeout: timers.schedule, clearGoalSpecTimeout: timers.cancel });
+		const payload = { requestId, originalRequest: 'Get a pickaxe', candidateIds: ['minecraft:iron_pickaxe'] };
+		try {
+			run.bridge.emit('goal_spec_request', { agentId: 'agent-a', payload });
+			for (let attempt = 1; attempt <= 3; attempt++) {
+				await eventually(() => planner.goalSpecRequests.length === attempt && timers.pendingCount === 1);
+				await timers.runNext();
+			}
+			await eventually(() => run.bridge.sent.some(message => message.type === 'agent_error' && message.payload.code === 'GOAL_SPEC_TRANSLATION_REJECTED'));
+			assert.equal(planner.goalSpecRequests.length, 4);
+			assert.deepEqual(planner.goalSpecRequests.slice(1).map(request => request.correctiveFeedback.attempt), [1, 2, 3]);
+			assert.equal(timers.pendingCount, 0);
+			assert.equal(run.bridge.sent.some(message => message.type === 'goal_spec_proposal'), false);
+			planner.requestGoalSpec = async request => ({ requestId: request.request.requestId, summary: 'Get a pickaxe.', predicate: { type: 'inventory_contains', itemId: 'minecraft:iron_pickaxe', count: 1 } });
+			run.bridge.emit('goal_spec_request', { agentId: 'agent-a', payload: { ...payload, requestId: '00000000-0000-4000-8000-000000000108' } });
+			await eventually(() => run.bridge.sent.some(message => message.type === 'goal_spec_proposal'));
+		} finally { await run.coordinator.stop(); }
+	});
+}
 
 test('Minecraft rejection keeps a current goal draft alive and retries with bounded corrective feedback', async () => {
 	const timers = new ManualTimerQueue();
@@ -2179,7 +2224,9 @@ test('agent removal terminates ArenaScript supervision for the removed goal', as
 		await eventually(() => run.registry.get('agent-a')?.goalRevision === 1);
 		goalSupervisor.terminations.length = 0;
 
-		run.bridge.emit('agent_removed', { agentId: 'agent-a', payload: { goalRevision: 1 } });
+		const removal = [];
+		run.bridge.emit('agent_removed', { agentId: 'agent-a', payload: { goalRevision: 1 }, waitUntil: pending => removal.push(pending) });
+		await Promise.all(removal);
 		await eventually(() => run.registry.get('agent-a') === null);
 
 		assert.equal(goalSupervisor.terminations.length, 1);
@@ -2367,7 +2414,7 @@ test('native programs and asynchronous action tools acquire body leases while fr
 		}
 		if (type === 'inspection_request' && currentTool === 'explore_frontier') {
 			assert.equal(registry.get(agentId).state, DynamicAgentState.PLANNING);
-			assert.equal(leases.filter(({ kind }) => kind === 'action').length, 3);
+			assert.equal(leases.filter(({ kind }) => kind === 'action').length, 4);
 		}
 	};
 	planner.requestNativeTurn = async (request) => {
@@ -2401,7 +2448,9 @@ test('native programs and asynchronous action tools acquire body leases while fr
 		assert.deepEqual(errors, []);
 		assert.deepEqual(dispatched, ['start_action', 'replace_action', 'run_program']);
 		const actionLeases = leases.filter(({ kind }) => kind === 'action');
-		assert.equal(actionLeases.length, 3);
+		assert.equal(actionLeases.length, 4, 'detached action ownership survives its tool-call lease');
+		assert.equal(leases.filter(({ kind }) => kind === 'program').length, 1);
+		assert.equal(released.includes(leases.find(({ kind }) => kind === 'program')), true);
 		for (const lease of actionLeases) assert.equal(released.filter((token) => token === lease).length, 1);
 	} finally { await run.coordinator.stop(); }
 });
@@ -2700,7 +2749,7 @@ test('native scheduling drops unchanged quiet heartbeats but accepts the supervi
 		const scheduledLeaseCount = timers.history.length;
 		const scheduledLeaseHandle = timers.history.at(-1).handle.id;
 		for (let sequence = 2; sequence <= 20; sequence += 1) {
-			run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: sequence, attention: false, observation } });
+			run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: sequence, observedAtEpochMs: sequence * 1000, attention: false, observation } });
 			await new Promise((resolve) => setImmediate(resolve));
 		}
 		assert.equal(planner.requests.length, 1);
@@ -2784,6 +2833,102 @@ test('native scheduling ignores clock-only heartbeats but replans for actionable
 		} });
 		await eventually(() => planner.requests.length === 2);
 		assert.match(planner.requests[1].input, /\"raining\":true/);
+	} finally { await run.coordinator.stop(); }
+});
+
+for (const failFirstChunk of [false, true]) {
+	test(`oversized native conversation delivers contiguous prefixes with failure rollback ${failFirstChunk}`, async t => {
+		let now = 1000, contextSize = 0;
+		t.mock.method(RuntimeMemoryContext.prototype, 'taskContext', async () => ({ summary: 'x'.repeat(contextSize) }));
+		const registry = new AgentRegistry(), planner = new FakePlanner(registry);
+		const delivered = [];
+		planner.requestNativeTurn = async request => {
+			planner.requests.push(request);
+			const encoded = encodeNativeEventInput(request.input);
+			const event = decodeModelFacts(JSON.parse(encoded.split('\n')[1]));
+			assert.deepEqual(event.conversation, JSON.parse(request.input.split('\n')[1]).conversation, 'provider encoding preserves the acknowledged prefix');
+			if (planner.requests.length === 1 || (failFirstChunk && planner.requests.length === 2)) throw Object.assign(new Error('cooldown'), { code: 'PROVIDER_CIRCUIT_OPEN', nextProbeAtEpochMs: now + 4000 });
+			delivered.push(...event.conversation.entries.map(entry => entry.sequence));
+			return { toolCalls: 1 };
+		};
+		const run = await start({ registry, planner, epochNow: () => now, goalSupervisor: new RecordingGoalSupervisor(), config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } } });
+		const observation = sequence => run.bridge.emit('observation', { agentId: 'agent-a', payload: factToWireObservation({ player: { health: 20 }, inventory: { items: [] } }, 1, sequence, true, now) });
+		const message = sequence => { const pending = []; run.bridge.emit('conversation_event', { waitUntil: operation => pending.push(operation), agentId: 'agent-a', payload: { sequence, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct', text: `Instruction ${sequence}: ${'y'.repeat(250)}`, goalRevision: 1, observedAtEpochMs: sequence } }); return Promise.all(pending); };
+		try {
+			run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Listen.' } });
+			observation(1); await eventually(() => planner.requests.length === 1);
+			await new Promise(resolve => setImmediate(resolve));
+			contextSize = 14000;
+			for (let sequence = 1; sequence <= 12; sequence++) await message(sequence);
+			await new Promise(resolve => setImmediate(resolve));
+			now = 5000; observation(2);
+			await eventually(() => planner.requests.length >= 2);
+			const first = JSON.parse(planner.requests[1].input.split('\n')[1]).conversation;
+			assert.equal(first.entries[0].sequence, 1);
+			assert.ok(first.omittedEntries > 0);
+			assert.equal(first.nextSequence, first.entries.at(-1).sequence);
+			if (failFirstChunk) {
+				await new Promise(resolve => setImmediate(resolve));
+				await message(13); await new Promise(resolve => setImmediate(resolve));
+				now = 9000; observation(3);
+			}
+			const count = failFirstChunk ? 13 : 12;
+			await eventually(() => delivered.length === count);
+			assert.deepEqual(delivered, Array.from({ length: count }, (_, index) => index + 1));
+			assert.equal(JSON.parse(planner.requests.at(-1).input.split('\n')[1]).conversation.omittedEntries, 0);
+		} finally { await run.coordinator.stop(); }
+	});
+}
+
+for (const failTail of [false, true]) for (const toolCalls of [0, 1]) {
+	test(`truncated steering drains retained messages with tail rejection ${failTail} and ${toolCalls}-tool completion`, async t => {
+		let contextSize = 0, finish, finishSteer, steerCount = 0;
+		const steerGate = new Promise(resolve => { finishSteer = resolve; });
+		const turnGate = new Promise(resolve => { finish = resolve; });
+		t.mock.method(RuntimeMemoryContext.prototype, 'taskContext', async () => ({ summary: 'x'.repeat(contextSize) }));
+		const registry = new AgentRegistry(), planner = new FakePlanner(registry), delivered = [];
+		const collect = input => delivered.push(...JSON.parse(input.split('\n')[1]).conversation.entries.map(entry => entry.sequence));
+		planner.requestNativeTurn = async request => { planner.requests.push(request); collect(request.input); if (planner.requests.length === 1) await turnGate; return { toolCalls }; };
+		planner.steerNativeTurn = async request => {
+			steerCount++;
+			if (failTail && steerCount === 3) throw Object.assign(new Error('turn ended'), { code: 'TURN_NOT_ACTIVE' });
+			collect(request.input);
+			if (steerCount === 1) await steerGate;
+			return {};
+		};
+		const run = await start({ registry, planner, goalSupervisor: new RecordingGoalSupervisor(), config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } } });
+		const message = sequence => { const pending = []; run.bridge.emit('conversation_event', { waitUntil: operation => pending.push(operation), agentId: 'agent-a', payload: { sequence, kind: 'player_message', sourceId: 'player', recipientId: 'agent-a', scope: 'direct', text: `Instruction ${sequence}: ${'y'.repeat(250)}`, goalRevision: 0, observedAtEpochMs: sequence } }); return Promise.all(pending); };
+		try {
+			await message(1); await eventually(() => planner.requests.length === 1);
+			contextSize = 14000;
+			for (let sequence = 2; sequence <= 12; sequence++) await message(sequence);
+			await eventually(() => steerCount === 1);
+			await new Promise(resolve => setImmediate(resolve));
+			finishSteer();
+			await eventually(() => failTail ? steerCount === 3 : delivered.length === 12);
+			finish();
+			await eventually(() => delivered.length === 12);
+			await eventually(() => planner.requests.length === (failTail ? 4 : 2));
+			assert.deepEqual(delivered, Array.from({ length: 12 }, (_, index) => index + 1));
+			assert.equal(planner.requests.length, failTail ? 4 : 2, 'a synthetic tool count does not prove a visible reply; only unread continuations and one reply correction create turns');
+		} finally { finishSteer(); finish(); await run.coordinator.stop(); }
+	});
+}
+
+test('zero-fit native conversation reports actionable failure without advancing unread delivery', async t => {
+	let contextSize = 20000;
+	t.mock.method(RuntimeMemoryContext.prototype, 'taskContext', async () => ({ summary: 'x'.repeat(contextSize) }));
+	const registry = new AgentRegistry(), planner = new FakePlanner(registry);
+	planner.requestNativeTurn = async request => { planner.requests.push(request); return { toolCalls: 1 }; };
+	const run = await start({ registry, planner, config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } } });
+	const message = sequence => run.bridge.emit('conversation_event', { agentId: 'agent-a', payload: { sequence, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct', text: `Important ${sequence}`, goalRevision: 0, observedAtEpochMs: sequence } });
+	try {
+		message(1);
+		await eventually(() => run.bridge.sent.some(message => message.type === 'agent_error' && message.payload.code === 'NATIVE_CONVERSATION_BUDGET_EXCEEDED'));
+		assert.equal(planner.requests.length, 0, 'an empty substitute never reaches the provider');
+		contextSize = 0; message(2);
+		await eventually(() => planner.requests.length === 1);
+		assert.deepEqual(JSON.parse(planner.requests[0].input.split('\n')[1]).conversation.entries.map(entry => entry.sequence), [1, 2]);
 	} finally { await run.coordinator.stop(); }
 });
 
@@ -3033,6 +3178,8 @@ test('new resource observations coalesce behind an active model turn without int
 				observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], inventory: { items: [], tagCounts: {} },
 					blocks: index === 0 ? [] : [{ stableId: `tree-${index}`, x: index, y: 64, z: 0, blockId: 'minecraft:oak_log' }] } } });
 			await new Promise(resolve => setImmediate(resolve));
+			// Resource discoveries must arrive after durable input preparation starts the turn.
+			if (index === 0) await eventually(() => planner.requests.length === 1);
 		}
 		assert.equal(planner.requests.length, 1);
 		assert.equal(steers.length, 0, 'resource discoveries must not continually restart reconsideration');
@@ -3497,9 +3644,10 @@ test('zero-tool native conversation retries visibly under the replacement work e
 });
 
 async function eventually(predicate) {
-	for (let index = 0; index < 100; index += 1) {
+	// Admission now performs real filesystem I/O, including in temporary-store tests.
+	for (let index = 0; index < 1000; index += 1) {
 		if (predicate()) return;
-		await new Promise((resolve) => setImmediate(resolve));
+		await new Promise((resolve) => testPollTimeout(resolve, 5));
 	}
 	throw new Error('condition was not reached');
 }
@@ -4445,13 +4593,22 @@ test('publishes exact profile and recovery identity in extended coordinator stat
 		statusSnapshot: () => ({
 			component: 'diagnostics', state: 'degraded', fallbackMode: 'drop', boundary: 'diagnostic_sink',
 			failureCode: 'DIAGNOSTIC_BACKPRESSURE', consecutiveFailureCount: 1, nextProbeAtEpochMs: null,
-			generation: 1, lastRecoveryAtEpochMs: null,
+			generation: 1, lastRecoveryAtEpochMs: null, failedOperationCount: 0, incompleteCapture: true,
+		}),
+	};
+	const providerAudit = {
+		close() {},
+		statusSnapshot: () => ({
+			component: 'provider_audit', state: 'ready', fallbackMode: null, boundary: null,
+			failureCode: null, consecutiveFailureCount: 0, nextProbeAtEpochMs: null,
+			generation: 1, lastRecoveryAtEpochMs: 5_000, failedOperationCount: 1, droppedCount: 2, incompleteCapture: true,
 		}),
 	};
 	const generation = 'b'.repeat(64);
 	const run = await start({
 		codexService: provider,
 		traceWriter: diagnostics,
+		providerTurnRecorder: providerAudit,
 		runtimeGeneration: generation,
 		setStatusInterval: (callback) => { publishStatus = callback; return 1; },
 		clearStatusInterval: () => {},
@@ -4465,6 +4622,9 @@ test('publishes exact profile and recovery identity in extended coordinator stat
 		assert.equal(status.runtimeGeneration, generation);
 		assert.equal(status.components.find(({ component }) => component === 'provider:codex').boundary, 'create');
 		assert.equal(status.components.find(({ component }) => component === 'diagnostics').failureCode, 'DIAGNOSTIC_BACKPRESSURE');
+		assert.equal(status.components.find(({ component }) => component === 'diagnostics').incompleteCapture, true);
+		assert.deepEqual(status.components.find(({ component }) => component === 'provider_audit'), providerAudit.statusSnapshot());
+		assert.deepEqual(validateProtocolV2Payload('coordinator_status', JSON.parse(JSON.stringify(status))), status);
 	} finally { await run.coordinator.stop(); }
 });
 
@@ -4534,6 +4694,37 @@ test('urgent observation preempts an active ordinary provider turn and installs 
 	} finally {
 		await run.coordinator.stop();
 	}
+});
+
+test('terminal replay preserves three distinct durable receipts and joins exact duplicate waiters', async (t) => {
+	const directory = await mkdtemp(path.join(tmpdir(), 'terminal-replay-receipts-'));
+	t.after(() => rm(directory, { recursive: true, force: true }));
+	const notebook = new ModelNotebook({ directory });
+	const ids = ['retained-1', 'native:retained-2', 'retained-3'];
+	for (const actionId of ids) await notebook.recordDispatch('agent-a', { worldId: 'test-world', goalRevision: 0, actionId, actionType: 'wait', arguments: { durationMs: 1 } });
+	const bridge = new FakeBridge();
+	bridge.acknowledgeActionResult = async (agentId, payload) => {
+		const persisted = await new ModelNotebook({ directory }).findReceipt(agentId, { actionId: payload.actionId });
+		assert.equal(persisted.state, 'SUCCEEDED', 'each ACK follows its own persisted terminal receipt');
+		bridge.sent.push({ type: 'action_result_ack', agentId, payload });
+	};
+	const run = await start({ bridge, memoryDirectory: directory });
+	const completions = [];
+	const receive = actionId => {
+		let completed = false;
+		bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 0, actionId, state: 'SUCCEEDED', reasonCode: 'DONE' },
+			waitUntil(promise) { completions.push(Promise.resolve(promise).then(() => { completed = true; })); } });
+		return () => completed;
+	};
+	try {
+		// Stale revision keeps runtime execution out of replay reconciliation.
+		bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
+		await eventually(() => run.registry.get('agent-a').goalRevision === 1);
+		receive(ids[0]); const duplicateDone = receive(ids[0]); receive(ids[1]); receive(ids[2]);
+		assert.equal(duplicateDone(), false, 'duplicate cannot settle before the shared durable reconciliation');
+		await Promise.all(completions);
+		assert.deepEqual(bridge.sent.filter(message => message.type === 'action_result_ack').map(message => message.payload.actionId), ids);
+	} finally { await run.coordinator.stop(); }
 });
 
 test('per-agent event intake reserves terminal-result capacity under ordinary overflow', async () => {
@@ -5662,4 +5853,495 @@ test('native coordinator ingress preserves infinite effects through planning and
 		releaseTurn();
 		await run.coordinator.stop();
 	}
+});
+
+
+class NativeLifecycleClock {
+	now = 0;
+	sequence = 0;
+	timers = new Map();
+	schedule = (callback, delay) => { const id = ++this.sequence; this.timers.set(id, { callback, due: this.now + delay }); return id; };
+	cancel = id => this.timers.delete(id);
+	async advance(ms) {
+		this.now += ms;
+		for (const [id, timer] of [...this.timers]) if (timer.due <= this.now) { this.timers.delete(id); await timer.callback(); }
+		for (let index = 0; index < 12; index++) await new Promise(resolve => setImmediate(resolve));
+	}
+	dependencies() { return { goalClock: () => this.now, goalSchedule: this.schedule, cancelGoalSchedule: this.cancel, goalStuckSchedule: this.schedule, cancelGoalStuckSchedule: this.cancel }; }
+}
+
+for (const ending of ['settled', 'handoff', 'deadline', 'stuck', 'stopped']) {
+	test(`native background lifetime ${ending} retains bounded ownership through timestamp-only heartbeats`, async () => {
+		const clock = new NativeLifecycleClock(), registry = new AgentRegistry(), planner = new FakePlanner(registry);
+		let completed = false;
+		planner.requestNativeTurn = async request => {
+			planner.requests.push(request);
+			if (planner.requests.length > 1) return new Promise(() => {});
+			const handle = await request.executeTool({ agentId: request.agentId, goalRevision: request.goalRevision, turnId: 'background', callId: 'run',
+				tool: { kind: 'run_program', background: true, timeoutMs: 60000, source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(10000);' } });
+			if (ending === 'handoff') await request.executeTool({ agentId: request.agentId, goalRevision: request.goalRevision, turnId: 'background', callId: 'queue', tool: { kind: 'queue_program', afterProgramId: handle.programId, goalRevision: 1, programVersion: handle.programVersion, source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(7000);', precondition: 'player.state().health === 20', timeoutMs: 60000 } });
+			completed = true;
+			return { toolCalls: 1 };
+		};
+		const run = await start({ registry, planner, ...clock.dependencies(), config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } } });
+		const observations = () => run.bridge.sent.filter(message => message.type === 'request_observation');
+		try {
+			run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
+			const wire = factToWireObservation({ player: { x: 0, y: 64, z: 0, health: 20 }, inventory: { items: [] } }, 1, 1, false, 1);
+			wire.world.worldId = 'lifetime-test-world';
+			run.bridge.emit('observation', { agentId: 'agent-a', payload: wire });
+			await eventually(() => completed && run.bridge.sent.some(message => message.type === 'action_command'));
+			await clock.advance(0);
+			const before = observations().length;
+			for (let i = 1; i <= 3; i++) {
+				await clock.advance(1000);
+				run.bridge.emit('observation', { agentId: 'agent-a', payload: { ...run.bridge.latestObservations.get('agent-a'), eventSequence: run.bridge.latestSequences.get('agent-a') + 1, observedAtEpochMs: i * 1000, attention: false, changedFacts: [] } });
+				await clock.advance(0);
+			}
+			assert.equal(planner.requests.length, 1);
+			assert.equal(observations().length, before, 'no idle recovery while the body owns its program deadline');
+			const command = run.bridge.sent.find(message => message.type === 'action_command');
+			if (ending === 'handoff') {
+				run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: command.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 10 } });
+				await eventually(() => run.bridge.sent.filter(message => message.type === 'action_command').length === 2);
+				await clock.advance(3000);
+				assert.equal(planner.requests.length, 1, 'authorized successor needs no duplicate turn');
+				assert.equal(observations().length, before, 'successor inherits bounded ownership without an idle recovery gap');
+			} else if (ending === 'settled') {
+				run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: command.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 10 } });
+				await eventually(() => planner.requests.length === 2);
+				assert.match(planner.requests[1].input, /program_ended/);
+			} else if (ending === 'stopped') {
+				run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'stop', goalRevision: 2 } });
+				await eventually(() => registry.get('agent-a').goalRevision === 2);
+				await clock.advance(61000);
+				assert.equal(planner.requests.length, 1);
+				assert.equal(observations().length, before);
+			} else {
+				if (ending === 'deadline') {
+					// New factual progress clears the independent stall timer, leaving the body deadline.
+					await clock.advance(25000);
+					const previous = run.bridge.latestObservations.get('agent-a');
+					run.bridge.emit('observation', { agentId: 'agent-a', payload: validateProtocolV2Payload('observation', { ...previous, eventSequence: 10, position: { ...previous.position, x: 1 }, attention: false }) });
+					await clock.advance(0);
+					await clock.advance(25000);
+					const latest = run.bridge.latestObservations.get('agent-a');
+					run.bridge.emit('observation', { agentId: 'agent-a', payload: validateProtocolV2Payload('observation', { ...latest, eventSequence: 11, position: { ...latest.position, x: 2 }, attention: false }) });
+					await clock.advance(0);
+					await clock.advance(7000);
+					assert.ok(run.bridge.sent.some(message => message.type === 'action_cancel'), 'expired program relinquishes physical authority');
+				} else await clock.advance(27000);
+				assert.equal(observations().length, before + 1, 'real stall/deadline still requests recovery');
+				run.bridge.emit('observation', { agentId: 'agent-a', payload: { ...run.bridge.latestObservations.get('agent-a'), eventSequence: 20, observedAtEpochMs: clock.now, attention: false } });
+				await eventually(() => planner.requests.length === 2);
+				assert.match(planner.requests[1].input, /continuation/);
+			}
+		} finally { await run.coordinator.stop(); }
+	});
+}
+
+for (const outcome of ['empty', 'transient', 'circuit']) {
+	test(`native DEAD ${outcome} turn retries death facts through real supervision`, async () => {
+		const clock = new NativeLifecycleClock(), registry = new AgentRegistry(), planner = new FakePlanner(registry);
+		planner.requestNativeTurn = async request => {
+			planner.requests.push(request);
+			if (planner.requests.length > 1) return new Promise(() => {});
+			if (outcome === 'circuit') throw Object.assign(new Error('cooldown'), { code: 'PROVIDER_CIRCUIT_OPEN', nextProbeAtEpochMs: 5000 });
+			if (outcome === 'transient') throw Object.assign(new Error('transport unavailable'), { code: 'ECONNRESET' });
+			return { toolCalls: 0 };
+		};
+		const run = await start({ registry, planner, ...clock.dependencies(), epochNow: () => clock.now, initialRegistry: [{ ...record(), state: DynamicAgentState.DEAD, currentGoal: 'Survive.', goalRevision: 4, death: DEATH }], config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } } });
+		try {
+			await eventually(() => planner.requests.length === 1);
+			await clock.advance(0);
+			await clock.advance(2000);
+			if (outcome === 'circuit') {
+				assert.equal(planner.requests.length, 1, 'death recovery honors the provider probe deadline');
+				await clock.advance(3000);
+			}
+			await eventually(() => planner.requests.length === 2);
+			assert.equal(registry.get('agent-a').state, DynamicAgentState.DEAD);
+			assert.equal(planner.requests[1].goalRevision, 4);
+			assert.equal(planner.requests[1].preserveState, true);
+			assert.match(planner.requests[1].input, /player_death/);
+			assert.equal(run.bridge.sent.some(message => message.type === 'request_observation'), false);
+			run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'stop', goalRevision: 5 } });
+			await eventually(() => registry.get('agent-a').goalRevision === 5);
+			await clock.advance(900001);
+			assert.equal(planner.requests.length, 2, 'old recovery cannot cross goal revision');
+		} finally { await run.coordinator.stop(); }
+	});
+}
+
+for (const toolCalls of [0, 1]) {
+	test(`idle failed steering replays pending conversation after ${toolCalls}-tool completion`, async () => {
+		const registry = new AgentRegistry(), planner = new FakePlanner(registry);
+		let finish, steerAttempts = 0;
+		const gate = new Promise(resolve => { finish = resolve; });
+		planner.requestNativeTurn = async request => { planner.requests.push(request); if (planner.requests.length === 1) await gate; else return new Promise(() => {}); return { toolCalls }; };
+		planner.steerNativeTurn = async () => { steerAttempts++; throw Object.assign(new Error('ended'), { code: 'TURN_NOT_ACTIVE' }); };
+		const run = await start({ registry, planner, config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } } });
+		const message = sequence => run.bridge.emit('conversation_event', { agentId: 'agent-a', payload: { sequence, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct', text: `Question ${sequence}`, goalRevision: 0, observedAtEpochMs: sequence } });
+		try {
+			message(1); await eventually(() => planner.requests.length === 1);
+			message(2); await eventually(() => steerAttempts === 1);
+			finish(); await eventually(() => planner.requests.length === 2);
+			assert.match(planner.requests[1].input, /Question 2/);
+			assert.equal(planner.requests[1].preserveState, true);
+			assert.equal(registry.get('agent-a').state, DynamicAgentState.IDLE);
+		} finally { finish(); await run.coordinator.stop(); }
+	});
+}
+
+
+test('detached native action retains supervision until its actual receipt settles', async () => {
+	const clock = new NativeLifecycleClock(), registry = new AgentRegistry(), planner = new FakePlanner(registry);
+	let handle;
+	planner.requestNativeTurn = async request => {
+		planner.requests.push(request);
+		if (planner.requests.length > 1) return new Promise(() => {});
+		handle = await request.executeTool({ agentId: request.agentId, goalRevision: request.goalRevision, turnId: 'async-action', callId: 'start', tool: { kind: 'start_action', actionType: 'wait', arguments: { durationMs: 10000 } } });
+		return { toolCalls: 1 };
+	};
+	const run = await start({ registry, planner, ...clock.dependencies(), config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } } });
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, inventory: { items: [] } } } });
+		await eventually(() => handle);
+		await clock.advance(0);
+		const before = run.bridge.sent.filter(message => message.type === 'request_observation').length;
+		await clock.advance(3000);
+		assert.equal(run.bridge.sent.filter(message => message.type === 'request_observation').length, before);
+		run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: handle.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 2 } });
+		await clock.advance(0);
+		await clock.advance(2000);
+		assert.equal(run.bridge.sent.filter(message => message.type === 'request_observation').length, before + 1, 'settled action releases ownership to continuation recovery');
+	} finally { await run.coordinator.stop(); }
+});
+
+test('actual wire position progress prevents false factual stall', async () => {
+ const clock = new NativeLifecycleClock(), registry = new AgentRegistry(), planner = new FakePlanner(registry);
+ let started = false;
+ planner.requestNativeTurn = async request => {
+  planner.requests.push(request);
+  if (planner.requests.length > 1) return new Promise(() => {});
+  await request.executeTool({agentId: request.agentId, goalRevision: request.goalRevision, turnId: 'review', callId: 'run', tool: {kind:'run_program',background:true,timeoutMs:60000,source:'program.onUnhandledAttention("continue_and_notify"); await player.wait(10000);'}});
+  started = true; return {toolCalls:1};
+ };
+ const run = await start({registry,planner,...clock.dependencies(),config:{bridge:{port:25570,secret:'s'.repeat(32)},codex:{controlProtocol:'native_tools'}}});
+ try {
+  run.bridge.emit('goal_control',{agentId:'agent-a',payload:{operation:'start',goalRevision:1,goal:'Continue moving.'}});
+  const wire = factToWireObservation({player:{x:0,y:64,z:0,health:20},inventory:{items:[]}},1,1,false,1);
+  wire.world.worldId = 'review-world';
+  run.bridge.emit('observation',{agentId:'agent-a',payload:validateProtocolV2Payload('observation',wire)});
+  await eventually(()=>started && run.bridge.sent.some(m=>m.type==='action_command'));
+  await clock.advance(0);
+  const before = run.bridge.sent.filter(m=>m.type==='request_observation').length;
+  for(let index=1;index<=6;index++) {
+   await clock.advance(4999);
+   const latest = run.bridge.latestObservations.get('agent-a');
+   const next = {...latest,eventSequence:run.bridge.latestSequences.get('agent-a')+1,observedAtEpochMs:clock.now,position:{x:index,y:64,z:0},attention:false,changedFacts:[]};
+   run.bridge.emit('observation',{agentId:'agent-a',payload:validateProtocolV2Payload('observation',next)});
+   await clock.advance(0);
+  }
+  await clock.advance(6);
+  assert.equal(run.bridge.sent.filter(m=>m.type==='request_observation').length,before,'six authoritative forward position changes must reset factual stall timer');
+ } finally {await run.coordinator.stop();}
+});
+
+
+
+test('expired conversation late success preserves successor provider lease', async () => {
+ const clock = new NativeLifecycleClock(), registry = new AgentRegistry(), planner = new FakePlanner(registry);
+ let finishFirst;
+ const gate = new Promise(resolve => { finishFirst = resolve; });
+ planner.getExecutionSettings = () => ({limits:{nativeTurnBudgetMs:100}});
+ planner.requestNativeTurn = async request => { planner.requests.push(request); if(planner.requests.length===1) return gate; return new Promise(()=>{}); };
+ const run = await start({registry,planner,...clock.dependencies(),config:{bridge:{port:25570,secret:'s'.repeat(32)},codex:{controlProtocol:'native_tools'}}});
+ try {
+  run.bridge.emit('conversation_event',{agentId:'agent-a',payload:{sequence:1,kind:'player_message',sourceId:'player-a',recipientId:'agent-a',scope:'direct',text:'Question one',goalRevision:0,observedAtEpochMs:1}});
+  await eventually(()=>planner.requests.length===1);
+  await clock.advance(100);
+  await eventually(()=>planner.requests.length===2);
+  assert.equal(planner.requests.length,2,'expiry creates replacement conversation turn');
+  finishFirst({toolCalls:1});
+  await clock.advance(0);
+  await clock.advance(100);
+  await eventually(()=>planner.requests.length===3);
+  assert.equal(planner.requests.length,3,'replacement must retain its deadline after obsolete completion');
+ } finally { finishFirst({toolCalls:1}); await run.coordinator.stop(); }
+});
+for (const state of [DynamicAgentState.PAUSED,DynamicAgentState.COMPLETED]) for (const toolCalls of [0,1]) {
+ test(`review pending message ${state} ${toolCalls} tools is replayed once`,async()=>{
+  const registry=new AgentRegistry(),planner=new FakePlanner(registry); let finish;let attempts=0;
+  const traceEvents=[];
+  const gate=new Promise(resolve=>{finish=resolve;});
+  planner.requestNativeTurn=async request=>{planner.requests.push(request);if(planner.requests.length===1)await gate;return {toolCalls};};
+  planner.steerNativeTurn=async()=>{attempts++;throw Object.assign(new Error('turn ended'),{code:'TURN_NOT_ACTIVE'});};
+  const run=await start({registry,planner,traceWriter:{write(event){traceEvents.push(event);}},initialRegistry:[{...record(),state,currentGoal:'Wait.',goalRevision:1}],config:{bridge:{port:25570,secret:'s'.repeat(32)},codex:{controlProtocol:'native_tools'}}});
+  const say=sequence=>run.bridge.emit('conversation_event',{agentId:'agent-a',payload:{sequence,kind:'player_message',sourceId:'player-a',recipientId:'agent-a',scope:'direct',text:`Question ${sequence}`,goalRevision:1,observedAtEpochMs:sequence}});
+  try{
+   say(1);await eventually(()=>planner.requests.length===1);say(2);await eventually(()=>attempts===1);finish();await eventually(()=>planner.requests.length>=2);
+   // Completion follows the durable receipt commit; event-loop turns do not drain disk I/O.
+   await eventually(()=>traceEvents.filter(event=>event==='native_turn_completed').length===3);
+   assert.match(planner.requests[1].input,/Question 2/);
+   assert.equal(planner.requests.length,3,'without a successful chat receipt only one reply correction is allowed');
+   assert.equal(registry.get('agent-a').state,state);
+   assert.equal(run.bridge.sent.filter(m=>m.type==='action_command').length,0);
+  }finally{finish();await run.coordinator.stop();}
+ });
+}
+for (const code of ['STALE_PLAN','ECONNRESET']) test(`expired conversation late ${code} preserves successor provider lease`,async()=>{
+ const clock=new NativeLifecycleClock(),registry=new AgentRegistry(),planner=new FakePlanner(registry);let rejectFirst;
+ const gate=new Promise((resolve,reject)=>{rejectFirst=reject;});
+ planner.getExecutionSettings=()=>({limits:{nativeTurnBudgetMs:100}});
+ planner.requestNativeTurn=async request=>{planner.requests.push(request);if(planner.requests.length===1)return gate;return new Promise(()=>{});};
+ const run=await start({registry,planner,...clock.dependencies(),config:{bridge:{port:25570,secret:'s'.repeat(32)},codex:{controlProtocol:'native_tools'}}});
+ try{
+  run.bridge.emit('conversation_event',{agentId:'agent-a',payload:{sequence:1,kind:'player_message',sourceId:'player-a',recipientId:'agent-a',scope:'direct',text:'Question one',goalRevision:0,observedAtEpochMs:1}});
+  await eventually(()=>planner.requests.length===1);await clock.advance(100);await eventually(()=>planner.requests.length===2);assert.equal(planner.requests.length,2);
+  rejectFirst(Object.assign(new Error('obsolete rejection'),{code}));await clock.advance(0);await clock.advance(100);
+  await eventually(()=>planner.requests.length===3);
+  assert.equal(planner.requests.length,3,'obsolete failure cannot remove successor supervision');
+ }finally{rejectFirst(Object.assign(new Error('cleanup'),{code}));await run.coordinator.stop();}
+});
+test('review completed conversation waiting for failed steer cannot terminate its replacement',async()=>{
+ const clock=new NativeLifecycleClock(),registry=new AgentRegistry(),planner=new FakePlanner(registry);let finishFirst,rejectSteer;let steers=0;
+ const gate=new Promise(resolve=>{finishFirst=resolve;});const steerGate=new Promise((resolve,reject)=>{rejectSteer=reject;});
+ planner.getExecutionSettings=()=>({limits:{nativeTurnBudgetMs:100}});
+ planner.requestNativeTurn=async request=>{planner.requests.push(request);if(planner.requests.length===1)return gate;return new Promise(()=>{});};
+ planner.steerNativeTurn=async()=>{steers++;return steerGate;};
+ const run=await start({registry,planner,...clock.dependencies(),config:{bridge:{port:25570,secret:'s'.repeat(32)},codex:{controlProtocol:'native_tools'}}});
+ const say=sequence=>run.bridge.emit('conversation_event',{agentId:'agent-a',payload:{sequence,kind:'player_message',sourceId:'player-a',recipientId:'agent-a',scope:'direct',text:`Held question ${sequence}`,goalRevision:0,observedAtEpochMs:sequence}});
+ try{
+  say(1);await eventually(()=>planner.requests.length===1);say(2);await eventually(()=>steers===1);finishFirst({toolCalls:1});await clock.advance(0);assert.equal(planner.requests.length,1);
+  await clock.advance(100);await eventually(()=>planner.requests.length===2);assert.equal(planner.requests.length,2);assert.match(planner.requests[1].input,/Held question 2/);
+  rejectSteer(Object.assign(new Error('obsolete steer'),{code:'TURN_NOT_ACTIVE'}));await clock.advance(0);await clock.advance(100);await eventually(()=>planner.requests.length===3);assert.equal(planner.requests.length,3);
+ }finally{finishFirst({toolCalls:1});rejectSteer(new Error('cleanup'));await run.coordinator.stop();}
+});
+for(const outcome of ['empty','transient'])test(`review repeated DEAD ${outcome} retries stay bounded and stop`,async()=>{
+ const clock=new NativeLifecycleClock(),registry=new AgentRegistry(),planner=new FakePlanner(registry);
+ planner.requestNativeTurn=async request=>{planner.requests.push(request);if(outcome==='transient')throw Object.assign(new Error('temporary loss'),{code:'ECONNRESET'});return{toolCalls:0};};
+ const run=await start({registry,planner,...clock.dependencies(),epochNow:()=>clock.now,initialRegistry:[{...record(),state:DynamicAgentState.DEAD,currentGoal:'Survive.',goalRevision:4,death:DEATH}],config:{bridge:{port:25570,secret:'s'.repeat(32)},codex:{controlProtocol:'native_tools'}}});
+ try{
+  await eventually(()=>planner.requests.length===1);await clock.advance(0);
+  for(let attempt=1;attempt<=4;attempt++){await clock.advance(1999);assert.equal(planner.requests.length,attempt);await clock.advance(1);assert.equal(planner.requests.length,attempt+1);}
+  run.bridge.emit('goal_control',{agentId:'agent-a',payload:{operation:'stop',goalRevision:5}});await eventually(()=>registry.get('agent-a').goalRevision===5);await clock.advance(900001);
+  assert.equal(planner.requests.length,5);assert.equal(registry.get('agent-a').state,DynamicAgentState.PAUSED);
+ }finally{await run.coordinator.stop();}
+});
+
+
+// R17: ingress must retain unread work independently of bounded display history.
+test('durable pending conversation survives bursts, rejection and lifecycle changes', async () => {
+async function until(predicate, label) {
+  for (let i = 0; i < 1000; i++) { if (predicate()) return; await new Promise(resolve => setTimeout(resolve, 5)); }
+  throw new Error(`Finite probe failed to reach: ${label}`);
+}
+async function flush() { await new Promise(resolve => setTimeout(resolve, 150)); }
+function gate() { let resolve, reject; const promise = new Promise((a,b) => { resolve=a; reject=b; }); return { promise, resolve, reject }; }
+const record = () => ({ agentId:'agent-a', provider:'codex', model:'gpt-6-astra', reasoningEffort:'high', serviceTier:'priority', state:'IDLE', goalRevision:0, queue:[] });
+const event = (sequence, long = true, revision = 0) => ({ sequence, kind:'player_message', sourceId:'player-a', recipientId:'agent-a', scope:'direct', text: sequence === 3 ? 'USER INSTRUCTION: preserve the oak tree beside the house.' : `Instruction ${sequence}: ${long ? 'x'.repeat(250) : 'hello'}`, goalRevision:revision, observedAtEpochMs:sequence });
+class Bridge extends EventEmitter {
+  ready=false; sent=[];
+  start() { this.ready=true; }
+  stop() { this.ready=false; }
+  async send(type, agentId, payload, options={}) { this.sent.push({type,agentId,payload,connectionEpoch:options.connectionEpoch}); }
+  async deliver(type, payload, connectionEpoch=1) {
+    validateProtocolV2Payload(type, payload);
+    const pending=[];
+    this.emit(type, {agentId:'agent-a',payload,connectionEpoch,waitUntil: p=>pending.push(p)});
+    await Promise.all(pending);
+  }
+}
+class Supervisor {
+  activate(){} terminate(){} begin(key,kind){ return {...key,kind}; } end(){} progress(){} observed(){} recover(){} ensure(){} factualProgress(){} suspend(){} close(){}
+}
+async function fixture(handlers={}) {
+  const registry = new AgentRegistry(), bridge = new Bridge(), calls=[], errors=[], traces=[];
+  function capture(kind,request) {
+    const raw=JSON.parse(request.input.split('\n')[1]);
+    const encoded=decodeModelFacts(JSON.parse(encodeNativeEventInput(request.input).split('\n')[1]));
+    assert.deepEqual(encoded.conversation,raw.conversation);
+    const call={kind,goalRevision:request.goalRevision,conversation:raw.conversation,accepted:false}; calls.push(call); return call;
+  }
+  const planner={
+    async requestPlan(){throw new Error('ArenaScript planning is outside this native probe');},
+    beginReconcile(records,options){ const result=registry.reconcile(records,options); return {registry:result,complete:Promise.resolve({registry:result,providers:{valid:result.records,invalid:[],catalog:{models:[]}}})}; },
+    async requestNativeTurn(request){ const call=capture('start',request); await handlers.start?.(call,calls); call.accepted=true; return {toolCalls:1}; },
+    async steerNativeTurn(request){ const call=capture('steer',request); await handlers.steer?.(call,calls); call.accepted=true; return {}; },
+    async interrupt(){}, async remove(id){return registry.remove(id);},
+  };
+  const provider={catalog:{stale:false,refresh:async()=>({models:[]}),assertSupported(){}},async start(){},async stop(){}};
+  const coordinator=createDynamicCoordinator({bridge:{port:25570,secret:'s'.repeat(32)},codex:{controlProtocol:'native_tools'}},{bridge,registry,planner,codexService:provider,memoryDirectory:handlers.memoryDirectory ?? null,goalSupervisor:new Supervisor(),traceWriter:{write:(event,data)=>traces.push({event,...data})}});
+  coordinator.on('runtimeError', e=>errors.push({code:e.code,message:e.message}));
+  await coordinator.start(); bridge.emit('ready',{serverInstanceId:'r17-server',connectionEpoch:1,registry:[record()]});
+  await until(()=>bridge.sent.some(m=>m.type==='agent_ready'),'ready');
+  return {registry,bridge,coordinator,calls,errors,traces};
+}
+const summary = calls => calls.map(c=>({kind:c.kind,goalRevision:c.goalRevision,accepted:c.accepted,baseSequence:c.conversation.baseSequence,nextSequence:c.conversation.nextSequence,omittedEntries:c.conversation.omittedEntries,sequences:c.conversation.entries.map(e=>e.sequence)}));
+async function burst(count,rejectSteer=false,long=true) {
+  const turn=gate(), steer=gate();
+  const f=await fixture({start:async(c,calls)=>{if(calls.filter(x=>x.kind==='start').length===1)await turn.promise;},steer:async(c,calls)=>{if(calls.filter(x=>x.kind==='steer').length===1)await steer.promise;}});
+  try {
+    await f.bridge.deliver('conversation_event',event(1,long)); await until(()=>f.calls.length===1,'first turn');
+    await f.bridge.deliver('conversation_event',event(2,long)); await until(()=>f.calls.length===2,'blocked steering');
+    for(let seq=3;seq<=count;seq++) await f.bridge.deliver('conversation_event',event(seq,long));
+    assert.equal(f.calls.length,2,'burst is ingested while native steering is unresolved');
+    if(rejectSteer)steer.reject(Object.assign(new Error('offline rejection before native acceptance'),{code:'TURN_NOT_ACTIVE'}));else steer.resolve();
+    await flush(); turn.resolve(); await until(()=>f.calls.filter(c=>c.accepted).flatMap(c=>c.conversation.entries).length >= count,'all successful prefixes'); await flush();
+    const attempted=f.calls.flatMap(c=>c.conversation.entries.map(e=>e.sequence));
+    const accepted=f.calls.filter(c=>c.accepted).flatMap(c=>c.conversation.entries.map(e=>e.sequence));
+    const missed=Array.from({length:count},(_,i)=>i+1).filter(s=>!accepted.includes(s));
+    assert.equal(f.errors.length,0);
+    assert.deepEqual(missed,[],'every admitted message reaches successful native delivery');
+    assert.deepEqual(accepted,Array.from({length:count},(_,i)=>i+1),'successful prefixes preserve order without duplicates');
+    for (const call of f.calls.filter(c=>c.accepted)) for (const entry of call.conversation.entries) assert.deepEqual(entry,event(entry.sequence,long));
+    const out={name:`burst-${count}-${long?'bytes':'entries'}-${rejectSteer?'rejected':'accepted'}-steer`,ingested:count,providerCalls:summary(f.calls),missingAccepted:missed,instruction3EverAttempted:attempted.includes(3),coordinatorErrors:f.errors,wireErrors:f.bridge.sent.filter(m=>m.type==='agent_error'),traces:f.traces.filter(t=>['native_turn_steered','native_turn_steer_deferred','native_turn_completed'].includes(t.event))};
+    if(count>32){const before=f.calls.length;await f.bridge.deliver('conversation_event',event(count+1,long));await until(()=>f.calls.slice(before).filter(call=>call.accepted).length>=2 && f.calls.slice(before).some(call=>call.accepted && call.conversation.entries.some(entry=>entry.sequence===count+1)),'followup delivery and correction accepted');const followup=f.calls.slice(before);assert.deepEqual(followup.flatMap(call=>call.conversation.entries.map(e=>e.sequence)),[count+1]);assert.equal(followup.length,2,'delivery plus one correction because this fixture never sends chat');out.followup=summary(followup);}
+    return out;
+  } finally {steer.resolve();turn.resolve();await f.coordinator.stop();}
+}
+async function readHistory() {
+  const f=await fixture();
+  try { for(let s=1;s<=60;s++){await f.bridge.deliver('conversation_event',event(s));await flush();}
+    const delivered=f.calls.flatMap(c=>c.conversation.entries.map(e=>e.sequence));assert.deepEqual(delivered,Array.from({length:60},(_,i)=>i+1));
+    return {name:'already-read-history-eviction',messages:60,providerCalls:f.calls.length,exactlyOnceAtSuccessfulBoundary:true};
+  } finally {await f.coordinator.stop();}
+}
+async function lifecycle(kind,count) {
+  const turn=gate(),steer=gate();
+  const f=await fixture({start:async(c,calls)=>{if(calls.filter(x=>x.kind==='start').length===1)await turn.promise;},steer:async(c,calls)=>{if(calls.filter(x=>x.kind==='steer').length===1)await steer.promise;}});
+  try {
+    await f.bridge.deliver('conversation_event',event(1));await until(()=>f.calls.length===1,'lifecycle turn');
+    await f.bridge.deliver('conversation_event',event(2));await until(()=>f.calls.length===2,'lifecycle steer');
+    for(let s=3;s<=count;s++)await f.bridge.deliver('conversation_event',event(s));
+    let revision=0,epoch=1;
+    if(kind==='goal-change') {
+      await f.bridge.deliver('goal_control',{operation:'start',goalRevision:1,updatedAtEpochMs:100,goal:'Build a fence.'});revision=1;
+    } else {
+      f.bridge.emit('disconnected',{connectionEpoch:1});await flush();
+      const readyCount=f.bridge.sent.filter(m=>m.type==='agent_ready').length;
+      f.bridge.emit('ready',{serverInstanceId:kind==='new-server'?'r17-new-server':'r17-server',connectionEpoch:2,registry:[record()]});epoch=2;
+      await until(()=>f.bridge.sent.filter(m=>m.type==='agent_ready').length>readyCount,'reconnected');
+    }
+    // Settle obsolete callbacks before triggering current work. They cannot recreate the lost body.
+    steer.resolve();turn.resolve();await flush();const previous=f.calls.length;
+    await f.bridge.deliver('conversation_event',event(kind==='new-server'?1:count+1,true,revision),epoch);await until(()=>f.calls.slice(previous).some(c=>c.accepted && c.conversation.entries.some(e=>e.sequence===(kind==='new-server'?1:count+1))),'lifecycle tail');await flush();
+    const current=f.calls.slice(previous),sequences=current.flatMap(c=>c.conversation.entries.map(e=>e.sequence));
+    assert.ok(current.length>0);
+    if(kind==='new-server')assert.deepEqual(sequences,[1]);else assert.equal(sequences.includes(3),true);
+    assert.deepEqual(f.errors,[]);
+    return {name:`${kind}-${count}`,currentCalls:summary(current),originalInstruction3Carried:sequences.includes(3),entryGoalRevisions:current.flatMap(c=>c.conversation.entries.map(e=>e.goalRevision)),wireErrors:f.bridge.sent.filter(m=>m.type==='agent_error')};
+  } finally {turn.resolve();steer.resolve();await f.coordinator.stop();}
+}
+async function wakeAck() {
+  const turn=gate(),f=await fixture({start:()=>turn.promise});
+  const payload={transactionId:'00000000-0000-0000-0000-000000000017',event:event(1),control:{operation:'start',goalRevision:1,updatedAtEpochMs:2,goal:'Respond to the player.'}};
+  try {
+    await f.bridge.deliver('conversation_wake',payload);await until(()=>f.calls.length===1,'wake native input');
+    assert.equal(f.calls[0].accepted,false);
+    assert.equal(f.bridge.sent.filter(m=>m.type==='conversation_wake_ack').length,1);
+    await f.bridge.deliver('conversation_wake',structuredClone(payload));
+    assert.equal(f.bridge.sent.filter(m=>m.type==='conversation_wake_ack').length,2);
+    assert.equal(f.calls.length,1);
+    return {name:'wake-ack-is-ingestion-not-model-acceptance',acks:2,nativeCalls:1,nativeAcceptedAtAck:false,revision:f.registry.get('agent-a').goalRevision};
+  } finally {turn.resolve();await flush();await f.coordinator.stop();}
+}
+async function durableCoordinatorReload() {
+  const {mkdtemp,rm}=await import('node:fs/promises');
+  const {tmpdir}=await import('node:os'); const {join}=await import('node:path');
+  const directory=await mkdtemp(join(tmpdir(),'inbox-coordinator-reload-'));
+  const turn=gate(),steer=gate(); let first,second;
+  try {
+    first=await fixture({memoryDirectory:directory,start:()=>turn.promise,steer:()=>steer.promise});
+    await first.bridge.deliver('conversation_event',event(1)); await until(()=>first.calls.length===1,'durable first start');
+    await first.bridge.deliver('conversation_event',event(2)); await until(()=>first.calls.length===2,'durable held steer');
+    for(let n=3;n<=60;n++) await first.bridge.deliver('conversation_event',event(n));
+    await first.coordinator.stop();
+    second=await fixture({memoryDirectory:directory});
+    await second.bridge.deliver('conversation_event',event(61));
+    await until(()=>second.calls.filter(c=>c.accepted).flatMap(c=>c.conversation.entries).length===61,'reloaded durable backlog');
+    assert.deepEqual(second.calls.filter(c=>c.accepted).flatMap(c=>c.conversation.entries),Array.from({length:61},(_,i)=>event(i+1)));
+    turn.resolve();steer.resolve();await flush();
+    return {name:'coordinator-reload-preserves-60-pending',passed:true};
+  } finally {turn.resolve();steer.resolve();await first?.coordinator.stop();await second?.coordinator.stop();await rm(directory,{recursive:true,force:true});}
+}
+async function removedUnopenedInbox() {
+  const {mkdtemp,rm}=await import('node:fs/promises');
+  const {tmpdir}=await import('node:os'); const {join}=await import('node:path');
+  const directory=await mkdtemp(join(tmpdir(),'inbox-removed-unopened-'));
+  const turn=gate(); let first,second;
+  try {
+    first=await fixture({memoryDirectory:directory,start:()=>turn.promise});
+    await first.bridge.deliver('conversation_event',event(1)); await until(()=>first.calls.length===1,'old pending turn');
+    await first.coordinator.stop();
+    second=await fixture({memoryDirectory:directory});
+    await second.bridge.deliver('agent_removed',{goalRevision:0});
+    await second.bridge.deliver('agent_registered',{...record(),schemaVersion:1,skinVariant:'classic',createdAtEpochMs:1,updatedAtEpochMs:1});
+    turn.resolve(); await flush();
+    await second.bridge.deliver('conversation_event',event(2));
+    await until(()=>second.calls.some(c=>c.accepted),'replacement turn'); await flush();
+    assert.deepEqual(second.calls.filter(c=>c.accepted).flatMap(c=>c.conversation.entries),[event(2)]);
+    assert.deepEqual(second.errors,[]);
+  } finally {turn.resolve();await first?.coordinator.stop();await second?.coordinator.stop();await rm(directory,{recursive:true,force:true});}
+}
+async function missingPendingReceipt(damage) {
+  const {mkdtemp,rm,readFile,writeFile,unlink}=await import('node:fs/promises');
+  const {createHash}=await import('node:crypto');
+  const {tmpdir}=await import('node:os'); const {join}=await import('node:path');
+  const directory=await mkdtemp(join(tmpdir(),'inbox-retry-receipt-'));
+  const hash=value=>createHash('sha256').update(value).digest('hex');
+  const file=key=>join(directory,`pending-${hash('agent-a')}`,`pending-${hash(key)}.json`);
+  const turn=gate(); let first,second;
+  try {
+    first=await fixture({memoryDirectory:directory,start:()=>turn.promise});
+    await first.bridge.deliver('conversation_event',event(1));await until(()=>first.calls.length===1,'pending retry turn');
+    await first.coordinator.stop();
+    const saved=JSON.parse(await readFile(file('index'),'utf8'));
+    const receipt=file(`${saved.generation}:sequence:1`);
+    if(damage==='missing')await unlink(receipt);else await writeFile(receipt,'null');
+    second=await fixture({memoryDirectory:directory});
+    await assert.rejects(second.bridge.deliver('conversation_event',event(1)),{code:'CONVERSATION_STORAGE_FAILED'});
+    assert.equal(second.calls.length,0);
+    assert.ok(second.bridge.sent.some(m=>m.type==='agent_error'&&m.payload.code==='CONVERSATION_STORAGE_FAILED'));
+    assert.deepEqual(JSON.parse(await readFile(file(`${saved.generation}:0`),'utf8')).entry,event(1));
+  } finally {turn.resolve();await first?.coordinator.stop();await second?.coordinator.stop();await rm(directory,{recursive:true,force:true});}
+}
+async function failedAdmission() {
+  const {mkdtemp,writeFile,rm}=await import('node:fs/promises');
+  const {tmpdir}=await import('node:os'); const {join}=await import('node:path');
+  const directory=await mkdtemp(join(tmpdir(),'inbox-admission-fault-'));
+  const blocked=join(directory,'blocked'); await writeFile(blocked,'fixture');
+  let f;
+  try {
+    f=await fixture({memoryDirectory:blocked});
+    await assert.rejects(f.bridge.deliver('conversation_event',event(1)),{code:'CONVERSATION_STORAGE_FAILED'});
+    await assert.rejects(f.bridge.deliver('conversation_wake',{transactionId:'00000000-0000-0000-0000-000000000024',event:event(2),control:{operation:'start',goalRevision:1,updatedAtEpochMs:2,goal:'Respond.'}}),{code:'CONVERSATION_STORAGE_FAILED'});
+    assert.equal(f.calls.length,0,'failed admission never starts the model');
+    assert.equal(f.bridge.sent.filter(m=>m.type==='conversation_wake_ack').length,0,'failed admission cannot ACK a wake');
+    assert.ok(f.bridge.sent.some(m=>m.type==='agent_error' && m.payload.code==='CONVERSATION_STORAGE_FAILED'),'failure is visible without private path data');
+    return {name:'failed-admission-no-wake-ack',passed:true};
+  } finally {await f?.coordinator.stop().catch(()=>{});await rm(directory,{recursive:true,force:true});}
+}
+async function rejectedStart() {
+  const turn=gate(), steer=gate();
+  const f=await fixture({start:async(c,calls)=>{if(calls.filter(x=>x.kind==='start').length===1)await turn.promise;},steer:async(c,calls)=>{if(calls.filter(x=>x.kind==='steer').length===1)await steer.promise;}});
+  try {
+    await f.bridge.deliver('conversation_event',event(1)); await until(()=>f.calls.length===1,'held start');
+    await f.bridge.deliver('conversation_event',event(2)); await until(()=>f.calls.length===2,'held steer');
+    for(let s=3;s<=60;s++) await f.bridge.deliver('conversation_event',event(s));
+    steer.resolve(); await until(()=>f.calls.filter(c=>c.accepted).flatMap(c=>c.conversation.entries).length===59,'successful steering tail');
+    turn.reject(Object.assign(new Error('synthetic start failure'),{code:'CODEX_RPC_FAILED'})); await flush();
+    await f.bridge.deliver('conversation_event',event(61));
+    await until(()=>f.calls.filter(c=>c.accepted).flatMap(c=>c.conversation.entries).length===61,'replacement after start failure');
+    assert.deepEqual(f.calls.filter(c=>c.accepted).flatMap(c=>c.conversation.entries.map(e=>e.sequence)).sort((a,b)=>a-b),Array.from({length:61},(_,i)=>i+1));
+    return {name:'rejected-start-after-successful-steering',passed:true};
+  } finally {turn.resolve();steer.resolve();await f.coordinator.stop();}
+}
+
+await burst(60,false); await burst(60,true); await burst(40,false,false); await burst(40,true,false);
+await rejectedStart(); await readHistory(); await durableCoordinatorReload(); await failedAdmission();
+await removedUnopenedInbox(); await missingPendingReceipt('missing'); await missingPendingReceipt('null');
+await lifecycle('same-server',60); await lifecycle('goal-change',60); await lifecycle('new-server',12); await wakeAck();
 });

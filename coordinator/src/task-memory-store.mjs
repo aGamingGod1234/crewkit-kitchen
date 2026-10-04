@@ -6,18 +6,63 @@ const KINDS = new Set(['place', 'route', 'progress', 'lesson']);
 const MAX_ENTRIES = 256;
 const MAX_TRAIL = 128;
 
+// A world retains shared lookup semantics, but an agent's recovery history and
+// authored capacity belong in its own atomic record. Stable partition keys avoid
+// snapshot garbage; the small manifest publishes new owners after their writes.
+const taskPartitions = {
+	split(state) {
+		const parts = new Map();
+		const owner = (agentId) => {
+			if (!parts.has(agentId)) parts.set(agentId, { version: 1, worldId: state.worldId, dimension: state.dimension, agentId,
+				agent: state.agents[agentId] ?? null, entries: [] });
+			return parts.get(agentId);
+		};
+		for (const agentId of Object.keys(state.agents)) owner(agentId);
+		for (const entry of state.entries) owner(entry.agentId).entries.push(entry);
+		return { manifest: { version: 2, worldId: state.worldId, dimension: state.dimension, revision: state.revision,
+			owners: [...parts.keys()], assets: state.assets }, parts };
+	},
+	keys(manifest) {
+		if (manifest.version !== 2) return null; // Read legacy files without rewriting on load.
+		if (!Array.isArray(manifest.owners) || new Set(manifest.owners).size !== manifest.owners.length) throw new Error('INVALID_TASK_MEMORY');
+		for (const agentId of manifest.owners) requireAgent({ agentId });
+		return manifest.owners;
+	},
+	join(manifest, parts) {
+		const state = { version: 1, worldId: manifest.worldId, dimension: manifest.dimension, revision: manifest.revision,
+			agents: {}, entries: [], assets: manifest.assets };
+		for (const [agentId, part] of parts) {
+			if (!part || part.version !== 1 || part.worldId !== state.worldId || part.dimension !== state.dimension || part.agentId !== agentId
+				|| !Array.isArray(part.entries) || part.entries.some(entry => entry.agentId !== agentId || !Number.isSafeInteger(entry.order) || !Number.isSafeInteger(entry.updatedRevision))) throw new Error('INVALID_TASK_MEMORY');
+			if (part.agent !== null) state.agents[agentId] = part.agent;
+			state.entries.push(...part.entries);
+		}
+		state.entries.sort((a, b) => a.order - b.order);
+		// An interrupted manifest replacement may leave an existing owner's newer
+		// atomic file. Keep update ordering monotonic when that record is recovered.
+		state.revision = state.entries.reduce((revision, entry) => Math.max(revision, entry.updatedRevision), state.revision);
+		return state;
+	},
+};
+
 /** Durable task evidence. It describes options; it never selects or executes gameplay. */
 export class TaskMemoryStore {
-	#disk; #worlds = new Map(); #loads = new Map(); #writes = new Map(); #errors = new Map(); #dirty = new Set();
-	constructor({ directory = null } = {}) { this.#disk = new AtomicAgentStore({ directory, namespace: 'task-world' }); }
+	#disk; #worlds = new Map(); #loads = new Map(); #writes = new Map(); #errors = new Map(); #dirty = new Set(); #authored = new Map();
+	constructor({ directory = null } = {}) { this.#disk = new AtomicAgentStore({ directory, namespace: 'task-world', partition: taskPartitions }); }
 	async #world(scope) {
 		const key = scopeKey(scope);
 		if (this.#worlds.has(key)) return this.#worlds.get(key);
-		if (!this.#loads.has(key)) this.#loads.set(key, this.#disk.read(key).then((saved) => {
-			if (saved !== null) validateSavedState(saved, scope);
-			const state = saved ?? { version: 1, revision: 0, worldId: scope.worldId, dimension: scope.dimension, agents: {}, entries: [], assets: [] };
-			this.#worlds.set(key, state); return state;
-		}));
+		if (!this.#loads.has(key)) {
+			const pending = this.#disk.read(key).then((saved) => {
+				if (saved !== null) validateSavedState(saved, scope);
+				const state = saved ?? { version: 1, revision: 0, worldId: scope.worldId, dimension: scope.dimension, agents: {}, entries: [], assets: [] };
+				// Legacy records used insertion order. Preserve it for pagination while
+				// giving replacements a separate durable summary-selection revision.
+				state.entries.forEach((entry, index) => { entry.order ??= index; entry.updatedRevision ??= 0; });
+				this.#worlds.set(key, state); return state;
+			}).finally(() => { if (this.#loads.get(key) === pending) this.#loads.delete(key); });
+			this.#loads.set(key, pending);
+		}
 		return this.#loads.get(key);
 	}
 	#save(scope, state) {
@@ -26,11 +71,20 @@ export class TaskMemoryStore {
 		this.#dirty.add(key);
 		// Coalesce discoveries from one observation batch without delaying actions on disk I/O.
 		if (!this.#writes.has(key)) {
-			const write = new Promise((resolve) => setImmediate(resolve)).then(() => {
+			const write = new Promise((resolve) => setImmediate(resolve)).then(async () => {
 				this.#dirty.delete(key);
-				return this.#disk.write(key, state);
-			}).then(() => this.#errors.delete(key))
-				.catch((error) => { this.#errors.set(key, error.message); })
+				// AtomicAgentStore captures state synchronously at write(). Only these
+				// exact authored values depend on this snapshot's outcome.
+				const authored = state.entries.filter((value) => this.#authored.has(value));
+				let failure;
+				try { await this.#disk.write(key, state); this.#errors.delete(key); }
+				catch (error) { this.#errors.set(key, error.message); failure = new Error(`TASK_MEMORY_WRITE_FAILED: ${error.message}`); }
+				for (const value of authored) {
+					const pending = this.#authored.get(value);
+					this.#authored.delete(value);
+					if (failure) pending.reject(failure); else pending.resolve();
+				}
+			})
 				.finally(() => {
 					this.#writes.delete(key);
 					// Mutations arriving after the disk snapshot must persist without
@@ -100,16 +154,28 @@ export class TaskMemoryStore {
 		requireAgent(scope);
 		entry = validateTaskEntry(entry);
 		const state = await this.#world(scope);
-		const index = state.entries.findIndex((e) => e.agentId === scope.agentId && e.key === entry.key);
-		if (index < 0 && state.entries.length >= MAX_ENTRIES) {
-			const retired = state.entries.findIndex((e) => e.agentId === scope.agentId && e.status === 'retired');
-			if (retired < 0) throw new Error('TASK_MEMORY_FULL: replace or retire an existing entry');
-			state.entries.splice(retired, 1);
-		}
 		const value = { ...entry, agentId: scope.agentId, goalRevision: scope.goalRevision, source: 'model_authored', historical: true };
-		if (index < 0) state.entries.push(value); else state.entries[index] = value;
+		for (;;) {
+			const index = state.entries.findIndex((e) => e.agentId === scope.agentId && e.key === entry.key);
+			const full = state.entries.filter((e) => e.agentId === scope.agentId).length >= MAX_ENTRIES;
+			const retired = index < 0 && full
+				? state.entries.findIndex((e) => e.agentId === scope.agentId && e.status === 'retired') : -1;
+			if (index < 0 && full && retired < 0) throw new Error('TASK_MEMORY_FULL: replace or retire an existing entry');
+			// Do not overwrite (or evict) an authored version before its snapshot
+			// settles. Recheck after waiting: another same-key caller may go first.
+			const previous = this.#authored.get(state.entries[index < 0 ? retired : index]);
+			if (previous) { await previous.promise.catch(() => {}); continue; }
+			value.order = index < 0 ? state.entries.reduce((maximum, entry) => Math.max(maximum, entry.order), -1) + 1 : state.entries[index].order;
+			value.updatedRevision = state.revision + 1;
+			if (retired >= 0) state.entries.splice(retired, 1);
+			if (index < 0) state.entries.push(value); else state.entries[index] = value;
+			break;
+		}
+		const pending = Promise.withResolvers();
+		this.#authored.set(value, pending);
 		this.#save(scope, state);
-		return structuredClone(value);
+		await pending.promise;
+		return structuredClone(publicEntry(value));
 	}
 	async query(scope, { kind = 'all', text = '', offset = 0, limit = 20, dimension = scope.dimension } = {}) {
 		requireAgent(scope);
@@ -119,18 +185,19 @@ export class TaskMemoryStore {
 		if (!['all', 'deaths', 'assets', 'trail', ...KINDS].includes(kind) || typeof text !== 'string' || text.length > 256 || !Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 64) throw new TypeError('Invalid task memory query');
 		const state = await this.#world(scope);
 		const own = state.agents[scope.agentId];
-		const records = [...state.entries.filter((e) => e.agentId === scope.agentId || e.shared === true),
+		const records = [...state.entries.filter((e) => e.agentId === scope.agentId || e.shared === true).map(publicEntry),
 			...state.assets.filter((a) => a.seenBy.includes(scope.agentId)).map((a) => ({ kind: 'assets', ...a })),
 			...(own?.deaths ?? []).map((d) => ({ kind: 'deaths', ...d })),
 			...(kind === 'trail' ? [{ kind: 'trail', waypoints: own?.trail ?? [], omittedWaypoints: own?.omittedWaypoints ?? 0, reverseVerified: false, source: 'observed_positions' }] : [])]
 			.filter((e) => (kind === 'all' || e.kind === kind) && JSON.stringify(e).toLowerCase().includes(text.toLowerCase()));
-		return { worldId: scope.worldId, dimension: scope.dimension, historical: true, entries: structuredClone(records.slice(offset, offset + limit)), total: records.length, nextOffset: offset + limit < records.length ? offset + limit : null };
+		return { worldId: scope.worldId, dimension: scope.dimension, historical: true, offset, entries: structuredClone(records.slice(offset, offset + limit)), total: records.length, nextOffset: offset + limit < records.length ? offset + limit : null };
 	}
 	async summary(scope) {
 		requireAgent(scope);
 		const state = await this.#world(scope);
 		const own = state.agents[scope.agentId];
-		const entries = state.entries.filter((e) => (e.agentId === scope.agentId || e.shared === true) && e.status !== 'retired');
+		const entries = state.entries.filter((e) => (e.agentId === scope.agentId || e.shared === true) && e.status !== 'retired')
+			.sort((a, b) => a.updatedRevision - b.updatedRevision || a.order - b.order);
 		const deaths = own?.deaths ?? [];
 		// Keep earlier equipment losses alongside the latest death, rather than
 		// letting repeated empty-handed deaths hide the first useful recovery site.
@@ -181,10 +248,18 @@ function scopeKey(scope) {
 function vector(p) { return p && ['x', 'y', 'z'].every((k) => typeof p[k] === 'number' && Number.isFinite(p[k]) && Math.abs(p[k]) <= (k === 'y' ? 2048 : 30_000_000)) ? { x: p.x, y: p.y, z: p.z } : null; }
 function stacks(inventory) { return (Array.isArray(inventory) ? inventory : inventory?.items ?? []).filter((i) => typeof i?.itemId === 'string' && i.itemId.length <= 256 && Number.isSafeInteger(i.count) && i.count > 0).slice(0, 64).map(({ itemId, count }) => ({ itemId, count })); }
 function requireAgent(scope) { if (typeof scope?.agentId !== 'string' || !scope.agentId || scope.agentId.length > 256 || ['__proto__', 'constructor', 'prototype'].includes(scope.agentId)) throw new TypeError('Task memory requires an agent identity'); }
-function compactEntry({ waypoints, summary, ...entry }) { return { ...entry, summary: summary.slice(0, 256), ...(waypoints ? { waypointCount: waypoints.length } : {}) }; }
+function publicEntry({ order, updatedRevision, ...entry }) { return entry; }
+function compactEntry({ waypoints, summary, order, updatedRevision, ...entry }) { return { ...entry, summary: summary.slice(0, 256), ...(waypoints ? { waypointCount: waypoints.length } : {}) }; }
 function validateSavedState(saved, scope) {
-	if (saved.version !== 1 || saved.worldId !== scope.worldId || saved.dimension !== scope.dimension || !Number.isSafeInteger(saved.revision) || saved.revision < 0 || !Array.isArray(saved.entries) || saved.entries.length > MAX_ENTRIES || !Array.isArray(saved.assets) || saved.assets.length > 128 || !saved.agents || typeof saved.agents !== 'object' || Array.isArray(saved.agents)) throw new Error('INVALID_TASK_MEMORY');
-	for (const e of saved.entries) { const { agentId, goalRevision, source, historical, ...entry } = e; requireAgent({ agentId }); validateTaskEntry(entry); }
+	if (saved.version !== 1 || saved.worldId !== scope.worldId || saved.dimension !== scope.dimension || !Number.isSafeInteger(saved.revision) || saved.revision < 0 || !Array.isArray(saved.entries) || !Array.isArray(saved.assets) || saved.assets.length > 128 || !saved.agents || typeof saved.agents !== 'object' || Array.isArray(saved.agents)) throw new Error('INVALID_TASK_MEMORY');
+	const counts = new Map();
+	for (const e of saved.entries) {
+		const { agentId, goalRevision, source, historical, order, updatedRevision, ...entry } = e;
+		requireAgent({ agentId }); validateTaskEntry(entry);
+		if ([order, updatedRevision].some(value => value !== undefined && (!Number.isSafeInteger(value) || value < 0))) throw new Error('INVALID_TASK_MEMORY');
+		counts.set(agentId, (counts.get(agentId) ?? 0) + 1);
+		if (counts.get(agentId) > MAX_ENTRIES) throw new Error('INVALID_TASK_MEMORY');
+	}
 	for (const a of saved.assets) if (!vector(a.position) || typeof a.blockId !== 'string' || !Array.isArray(a.seenBy) || a.seenBy.some((agentId) => { try { requireAgent({ agentId }); return false; } catch { return true; } })) throw new Error('INVALID_TASK_MEMORY');
 	for (const [agentId, agent] of Object.entries(saved.agents)) {
 		requireAgent({ agentId });

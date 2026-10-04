@@ -19,6 +19,7 @@ public final class InputStateVerification {
 		assertions += verifyNavigationReplacementDoesNotRestoreReleasedInput();
 		assertions += verifyOwnedReleasePreservesSystemLease();
 		assertions += verifyClearReleasesEveryPressedInput();
+		assertions += verifyFailedClearRevokesDisconnectedInput();
 		assertions += verifyFailedApplyRemainsRetryable();
 		assertions += verifyPartialApplyCleanup();
 		assertions += verifyPartialTransitionsRestoreLeaseOwner();
@@ -33,7 +34,32 @@ public final class InputStateVerification {
 		assertions += verifyBoundedMotor();
 		assertions += ControlSequenceVerification.verify();
 		assertions += verifyMotorWorldHeading();
+		assertions += CarpetInputStateVerification.verify();
 		return assertions;
+	}
+
+	private static int verifyFailedClearRevokesDisconnectedInput() {
+		FailingSink sink = new FailingSink();
+		LeasedServerInputController controller = new LeasedServerInputController(sink);
+		InputLease lease = controller.acquire(AGENT, InputOwner.DIRECT_CONTROL, 250);
+		controller.apply(lease, state(1.0F, true, true));
+		sink.failNextClear();
+		assertThrows(() -> controller.release(lease), "disconnect release fault is reported");
+		long revision = controller.mutationRevision();
+		sink.failNextClear();
+		assertThrows(() -> controller.clear(AGENT), "disconnect fallback fault is reported");
+		assertTrue(controller.currentState(AGENT).isEmpty(), "full clear revokes input despite physical failure");
+		assertEquals(revision + 1L, controller.mutationRevision(), "logical revocation advances revision once");
+		assertThrows(() -> controller.apply(lease, state(1.0F, true, true)), "revoked lease cannot renew");
+		sink.failNextClear();
+		assertThrows(() -> controller.clear(AGENT), "repeated clear retries orphaned physical cleanup");
+		controller.tick();
+		assertEquals(1, sink.applyAttempts, "recovered next tick never replays disconnected movement, attack or use");
+		assertEquals(4, sink.clearAttempts, "next tick retries neutral cleanup after three faults");
+		assertEquals(revision + 1L, controller.mutationRevision(), "cleanup retry does not invent a logical mutation");
+		controller.clear(AGENT);
+		assertEquals(4, sink.clearAttempts, "successful cleanup removes the retry obligation");
+		return 10;
 	}
 
 	private static int verifyRuntimeAllowsFailedCleanupRetry() {

@@ -45,6 +45,7 @@ export class AgentPlanner {
 	#nativeDecisionTimingWindowSize;
 	#nativeDecisionTiming = new Map();
 	#nativeTimingSink;
+	#goalSpecHealth = new Map();
 
 	constructor({
 		registry,
@@ -134,17 +135,26 @@ export class AgentPlanner {
 			...record, agentId: translatorId, provider: 'codex', model: 'gpt-6-luna',
 			reasoningEffort: 'medium', serviceTier: 'fast',
 		};
+		let health = this.#goalSpecHealth.get(translatorId);
+		if (health === undefined) {
+			health = { profiles: new Map(), inFlight: 0, executing: 0, retired: false };
+			this.#goalSpecHealth.set(translatorId, health);
+		}
+		health.profiles.set(profileFingerprint(translatorProfile), translatorProfile);
+		health.inFlight += 1;
+		const queuedAt = this.#now();
 		const translator = new GoalSpecTranslator({
 			generate: ({ prompt, schema }) => this.#scheduler.schedule(translatorId, async ({ signal }) => {
-				const queuedAt = this.#now();
+				const queueWaitMs = elapsed(queuedAt, this.#now());
+				health.executing += 1;
 				let agent = null;
 				try {
 					agent = await this.#providerAttempt(translatorProfile, {
-						operation: 'goal_spec_create', attempt: 1, queueWaitMs: 0, retry: false, traceId: checkedRequest.requestId,
+						operation: 'goal_spec_create', attempt: 1, queueWaitMs, retry: false, traceId: checkedRequest.requestId,
 					}, () => this.#codexService.createAgent(translatorProfile, { recoverySummary: null, controlProtocol: 'goal_spec' }));
 					await agent.setGoalRevision(0);
 					return await this.#providerAttempt(translatorProfile, {
-						operation: 'goal_spec', attempt: 1, queueWaitMs: elapsed(queuedAt, this.#now()), retry: false, traceId: checkedRequest.requestId,
+						operation: 'goal_spec', attempt: 1, queueWaitMs, retry: false, traceId: checkedRequest.requestId,
 					}, () => agent.decide(prompt, {
 						goalRevision: 0,
 						signal,
@@ -153,18 +163,42 @@ export class AgentPlanner {
 						systemPrompt: '',
 						...(this.#turnRecorder === null ? {} : { turnRecorder: this.#turnRecorder,
 							attempt: (correctiveFeedback?.attempt ?? 0) + 1, retry: correctiveFeedback !== null,
-							queueWaitMs: elapsed(queuedAt, this.#now()) }),
+							queueWaitMs }),
 					}));
 				} finally {
 					try { await this.#codexService.removeAgent(translatorId); } catch { /* transient cleanup is best effort */ }
+					health.executing -= 1;
+					this.#releaseGoalSpecHealth(translatorId, health);
 				}
 			}, { lane: 'codex', priority: 'ordinary', capacityClass: 'auxiliary' }),
 		});
-		return translator.translate(checkedRequest, { correctiveFeedback });
+		return translator.translate(checkedRequest, { correctiveFeedback }).then((result) => {
+			health.retired = true;
+			return result;
+		}).finally(() => {
+			health.inFlight -= 1;
+			this.#releaseGoalSpecHealth(translatorId, health);
+		});
 	}
 
 	cancelGoalSpec(agentId, requestId) {
-		return this.#scheduler.cancel(goalSpecTranslatorId(agentId, requestId), 'Goal translation was cancelled');
+		const translatorId = goalSpecTranslatorId(agentId, requestId);
+		const health = this.#goalSpecHealth.get(translatorId);
+		if (health !== undefined) health.retired = true;
+		try { return this.#scheduler.cancel(translatorId, 'Goal translation was cancelled'); }
+		finally { if (health !== undefined) this.#releaseGoalSpecHealth(translatorId, health); }
+	}
+
+	#releaseGoalSpecHealth(translatorId, health) {
+		// Failed attempts retain their circuit until success or explicit request
+		// retirement. Wait for settlement so late telemetry cannot recreate it.
+		if (!health.retired || health.inFlight !== 0 || health.executing !== 0) return;
+		for (const [fingerprint, profile] of health.profiles) {
+			for (const operation of ['goal_spec_create', 'goal_spec']) {
+				this.#healthRegistry.forget?.({ provider: profile.provider, model: profile.model, profileFingerprint: fingerprint, operation });
+			}
+		}
+		if (this.#goalSpecHealth.get(translatorId) === health) this.#goalSpecHealth.delete(translatorId);
 	}
 
 	requestNativeTurn({ agentId, input, goalRevision, executeTool, recoverySummary = null, preserveState = false, priority = 'ordinary', traceId: requestedTraceId = null, onVerbose = null, onProgress = null }) {
@@ -286,11 +320,11 @@ export class AgentPlanner {
 					}
 				}, agent, onVerbose);
 				this.#record('planner_decision_completed', record, { operation: 'native_turn', attempt: 1, queueWaitMs, directive: 'native_tools', traceId });
-				this.#recordNativeTurn(record, leaseAgent, input, admittedAt, queueWaitMs);
+				this.#recordNativeTurn(record, leaseAgent, admittedAt, queueWaitMs, traceId, result?.nativeTurn);
 				safeVerbose(onVerbose, 'decision', 'Native provider turn completed.');
 				return result;
 			} catch (error) {
-				this.#recordNativeTurn(record, leaseAgent, input, admittedAt, queueWaitMs, error);
+				this.#recordNativeTurn(record, leaseAgent, admittedAt, queueWaitMs, traceId, error?.nativeTurn, error);
 				this.#record('planner_failed', record, { operation: 'native_turn', errorCode: error?.code ?? 'NATIVE_TURN_FAILED', retry: false, traceId });
 				safeVerbose(onVerbose, 'error', verboseErrorMessage('Native turn failed', error));
 				throw error;
@@ -306,10 +340,15 @@ export class AgentPlanner {
 		});
 	}
 
-	#recordNativeTurn(record, agent, input, startedAt, queueWaitMs, error = null) {
+	#recordNativeTurn(record, agent, startedAt, queueWaitMs, traceId, nativeTurn = null, error = null) {
 		recordProviderTurn(this.#turnRecorder, {
 			agentId: record.agentId, provider: record.provider, model: record.model, reasoningEffort: record.reasoningEffort,
-			goalRevision: record.goalRevision, attempt: 1, retry: false, input, output: '', error,
+			goalRevision: record.goalRevision, attempt: 1, retry: false, traceId, output: '', error,
+			...readSessionFields(agent), ...nativeTurnEvidence(nativeTurn ?? {
+				threadId: null, turnId: null,
+				tokens: { input: null, output: null, reasoning: null, cached: null, cacheWrite: null },
+				usage: { scope: 'observed_thread_counter_delta', status: 'missing', start: null, end: null, updates: 0, counterReset: false, attributionComplete: false, gapBefore: null },
+			}), input: nativeTurn?.input ?? '',
 			...readExecutionSettings(agent), timing: { durationMs: elapsed(startedAt, this.#now()), apiDurationMs: null, queueWaitMs },
 		});
 	}
@@ -323,7 +362,7 @@ export class AgentPlanner {
 		return agent.steer(input, { goalRevision });
 	}
 
-	requestPlan({ agentId, input, goalRevision, recoverySummary = null, preserveState = false, priority = null, planningPriority = null, traceId: requestedTraceId = null, onVerbose = null }) {
+	requestPlan({ agentId, input, prepareInput = null, goalRevision, recoverySummary = null, preserveState = false, priority = null, planningPriority = null, traceId: requestedTraceId = null, onVerbose = null }) {
 		const record = this.#registry.assertCurrentRevision(agentId, goalRevision);
 		const traceIdProvided = requestedTraceId !== null;
 		const traceId = traceIdProvided ? validateTraceId(requestedTraceId) : defaultTraceId(agentId, goalRevision);
@@ -385,7 +424,8 @@ export class AgentPlanner {
 
 				let retryCount = 0;
 				let providerRetryCount = 0;
-				let plannerInput = input;
+				let prepared = prepareInput === null ? { input, contextReceipt: null } : prepareInput(agent);
+				let plannerInput = prepared.input;
 				while (true) {
 					try {
 						const attempt = retryCount + providerRetryCount + 1;
@@ -408,7 +448,7 @@ export class AgentPlanner {
 						}
 						this.#record('planner_decision_completed', record, { operation: 'decide', attempt, queueWaitMs, directive: decision?.directive ?? null, traceId });
 						safeVerbose(onVerbose, 'decision', `Planner decision accepted with directive '${decision?.directive ?? 'unknown'}'.`);
-						return { ...decision, goalRevision, ...(traceIdProvided ? { traceId } : {}) };
+						return { ...decision, goalRevision, ...(prepared.contextReceipt === null ? {} : { contextReceipt: prepared.contextReceipt }), ...(traceIdProvided ? { traceId } : {}) };
 					} catch (error) {
 						const recovery = classifyRecoveryFailure(error);
 						if (
@@ -420,7 +460,7 @@ export class AgentPlanner {
 							retryCount += 1;
 							trace.retryReason = normalizeRetryReason(error?.code ?? 'INVALID_DECISION');
 							safeVerbose(onVerbose, 'retry', verboseErrorMessage(`Corrective decision retry ${retryCount}`, error));
-							plannerInput = buildCorrectiveRetryInput(input, error, retryCount);
+							plannerInput = buildCorrectiveRetryInput(prepared.input, error, retryCount);
 							continue;
 						}
 						if (
@@ -437,7 +477,8 @@ export class AgentPlanner {
 								leaseAgent = replacement;
 								await replacement.setGoalRevision(goalRevision);
 							}
-							plannerInput = input;
+							prepared = prepareInput === null ? { input, contextReceipt: null } : prepareInput(agent);
+							plannerInput = prepared.input;
 							continue;
 						}
 						throw error;
@@ -486,15 +527,16 @@ export class AgentPlanner {
 		safeVerbose(onVerbose, 'provider', `Provider ${fields.operation} request started (attempt ${fields.attempt}).`);
 		try {
 			const result = await operation();
-			const sessionFields = readSessionFields(sessionAgent ?? result);
+			const sessionFields = { profileFingerprint: healthIdentity.profileFingerprint, ...readSessionFields(sessionAgent ?? result) };
 			const durationMs = elapsed(startedAt, this.#now());
-			this.#record('provider_response_completed', record, { ...fields, ...sessionFields, ...readExecutionSettings(sessionAgent ?? result), operation: fields.operation, durationMs, errorCode: null });
+			this.#record('provider_response_completed', record, { ...fields, ...sessionFields, ...nativeTurnEvidence(result?.nativeTurn), ...readExecutionSettings(sessionAgent ?? result), operation: fields.operation, durationMs, errorCode: null });
 			safeVerbose(onVerbose, 'provider', `Provider ${fields.operation} request completed.`);
 			this.#publishTelemetry(createProviderTurnTelemetry({
 				provider: record.provider,
 				model: record.model,
 				...fields,
 				...sessionFields,
+				...nativeTurnEvidence(result?.nativeTurn),
 				durationMs,
 				errorCode: null,
 				retryReason: fields.retryReason,
@@ -505,13 +547,14 @@ export class AgentPlanner {
 		} catch (error) {
 			const sessionFields = { ...readSessionFields(sessionAgent), profileFingerprint: healthIdentity.profileFingerprint };
 			const durationMs = elapsed(startedAt, this.#now());
-			this.#record('provider_response_failed', record, { ...fields, ...sessionFields, ...readExecutionSettings(sessionAgent), operation: fields.operation, durationMs, errorCode: error?.code ?? 'ERROR' });
+			this.#record('provider_response_failed', record, { ...fields, ...sessionFields, ...nativeTurnEvidence(error?.nativeTurn), ...readExecutionSettings(sessionAgent), operation: fields.operation, durationMs, errorCode: error?.code ?? 'ERROR' });
 			safeVerbose(onVerbose, 'provider', verboseErrorMessage(`Provider ${fields.operation} request failed`, error));
 			this.#publishTelemetry(createProviderTurnTelemetry({
 				provider: record.provider,
 				model: record.model,
 				...fields,
 				...sessionFields,
+				...nativeTurnEvidence(error?.nativeTurn),
 				durationMs,
 				error,
 				retryReason: safeRetryReason(error?.code),
@@ -522,7 +565,7 @@ export class AgentPlanner {
 		}
 	}
 
-	async #replaceExactSession(record, expectedAgent, controlProtocol, recoverySummary) {
+	async #replaceExactSession(record, expectedAgent, controlProtocol, resetReason) {
 		if (typeof this.#codexService.replaceAgent !== 'function') return null;
 		const capturedFingerprint = profileFingerprint(record);
 		const latestRecord = this.#registry.assertCurrentRevision(record.agentId, record.goalRevision);
@@ -543,7 +586,8 @@ export class AgentPlanner {
 		}
 		const owned = expectedAgent ?? current;
 		return this.#codexService.replaceAgent(record, {
-			recoverySummary,
+			recoverySummary: latestRecord.lastSummary ?? null,
+			resetReason,
 			controlProtocol,
 			...(Number.isSafeInteger(owned?.sessionGeneration) ? { expectedSessionGeneration: owned.sessionGeneration } : {}),
 		});
@@ -673,6 +717,15 @@ export class AgentPlanner {
 			throw error;
 		}
 	}
+}
+
+// Only metadata crosses public trace/health boundaries; encoded input belongs
+// exclusively to the provider recorder's existing private/redacted text path.
+function nativeTurnEvidence(value) {
+	if (value === null || value === undefined) return {};
+	const { threadId, turnId, tokens, usage, toolCalls, toolResultBytes, toolResponses, inputBytes, inputCount, compaction } = value;
+	return { threadId, turnId, tokens, usage, toolCalls, toolResultBytes, inputBytes, inputCount, compaction,
+		...(toolResponses === undefined ? {} : { toolResponses }) };
 }
 
 function readExecutionSettings(agent) {

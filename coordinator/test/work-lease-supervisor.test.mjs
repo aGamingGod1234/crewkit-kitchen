@@ -212,3 +212,25 @@ test('recovery lease identity fences stale session epochs and exact-profile muta
 	assert.equal(supervisor.snapshot(nextSession)?.key.profileFingerprint, key.profileFingerprint);
 	assert.equal(supervisor.activate({ ...nextSession, profileFingerprint: `sha256:${'b'.repeat(64)}` }), false, 'same-generation profile mutation is not newer work');
 });
+
+
+test('program handoff transfers the bounded lease before releasing predecessor ownership', async () => {
+ const { clock, observations, expirations, supervisor } = fixture();
+ supervisor.activate(key);
+ const predecessor = supervisor.acquire(key, 'program', { timeoutMs: 10000 });
+ clock.advance(5000);
+ await clock.runDue();
+ assert.equal(observations.length, 0);
+ const successor = supervisor.acquire(key, 'program', { timeoutMs: 10000 });
+ supervisor.release(predecessor);
+ assert.deepEqual(supervisor.snapshot(key).leases.map(lease => lease.kind), ['program']);
+ clock.advance(5001);
+ supervisor.observed(key);
+ await clock.runDue();
+ assert.equal(expirations.length, 0, 'old deadline cannot expire its successor');
+ clock.advance(4999);
+ await clock.runDue();
+ assert.equal(expirations.length, 1);
+ assert.equal(expirations[0].lease.operationId, successor.operationId);
+ assert.equal(observations[0].reason, 'program_lease_expired');
+});

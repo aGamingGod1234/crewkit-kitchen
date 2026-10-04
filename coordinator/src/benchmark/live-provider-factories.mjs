@@ -9,7 +9,7 @@ import { sanitizeDiagnosticErrorCode, sanitizeDiagnosticErrorMessage, sanitizeDi
 const PROVIDERS = new Set(['codex', 'kimi']);
 const DEFAULT_BRIDGE_SECRET_ENVIRONMENT_VARIABLE = 'ARENA_AGENT_BRIDGE_SECRET';
 const DEFAULT_PREFLIGHT_TIMEOUT_MS = 15_000;
-const PREFLIGHT_AGENT_ID = '__latency_preflight__';
+const PREFLIGHT_AGENT_ID = 'latency-preflight';
 
 /**
  * Build an exact-provider factory for a live latency trial.

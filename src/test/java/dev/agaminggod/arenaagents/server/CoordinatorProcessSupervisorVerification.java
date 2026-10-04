@@ -45,6 +45,7 @@ public final class CoordinatorProcessSupervisorVerification {
 	private static final long STARTUP_GRACE_MS = 3_000L;
 	private static final long AUTHENTICATION_TIMEOUT_MS = 15_000L;
 	private static final long RECONNECT_TIMEOUT_MS = 10_000L;
+	private static final long STATUS_RECOVERY_TIMEOUT_MS = RECONNECT_TIMEOUT_MS;
 	private static final long STABILITY_INTERVAL_MS = 30_000L;
 	private static final String GENERATION_A = "a".repeat(64);
 	private static final String GENERATION_B = "b".repeat(64);
@@ -58,6 +59,10 @@ public final class CoordinatorProcessSupervisorVerification {
 
 	/** Replays every injected Java supervisor failure as one deterministic recovery matrix. */
 	public static int verifyFaultMatrix() {
+		verifyQualifiedStatusTimeoutRollback();
+		verifyManagedVoiceTimeoutReload();
+		verifyHealthyMaintenanceStaysIdle();
+		verifyManualVoiceSnapshotRotation();
 		verifyRecoveryContract();
 		verifyBridgeBindFailureRecovery();
 		verifyOccupiedBridgePortRecoversAndAuthenticates();
@@ -67,6 +72,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyStaleLaunchAuthenticationIsRejected();
 		verifyStaleLaunchCannotSuppressReplacement();
 		verifyReconnectRecoveryAndExpiry();
+		verifyStatusLiveness();
 		verifyAutoStartOwnsLaunchDespiteExternalAuthentication();
 		verifySlowPreparationStillOwnsLaunch();
 		verifyContinuousStabilityResetsFailures();
@@ -116,7 +122,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyCloseWaitsForInflightOwnedLaunchCleanup();
 		verifyCloseTerminatesChildBehindBlockedMaintenance();
 		verifyCloseIsIdempotent();
-		return isWindows() ? 374 : 364;
+		return isWindows() ? 481 : 471;
 	}
 
 	private static void verifyConfiguredRuntimeRootOwnsBundledRefresh() {
@@ -823,8 +829,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		supervisor.tick(true, launchId, 1L);
 		worker.runNext();
 		supervisor.tick(true, launchId, 1L);
-		worker.runNext();
-		supervisor.tick(true, launchId, 1L);
+		assertEquals(1, generations.promotions, "promotion and due dependency work complete without an idle task");
 
 		assertEquals(launchId, supervisor.snapshot().launchId(),
 				"promotion-owned generation journal writes preserve the authenticated child");
@@ -1107,6 +1112,16 @@ public final class CoordinatorProcessSupervisorVerification {
 	}
 
 	public static void main(String[] arguments) {
+		if (arguments.length == 1 && "--status-liveness".equals(arguments[0])) {
+			verifyStatusLiveness();
+			verifyHungAuthenticationIsReplaced();
+			verifyStaleLaunchAuthenticationIsRejected();
+			verifyReconnectRecoveryAndExpiry();
+			verifyCandidateReadinessGapRestartsStabilityWindow();
+			verifyCandidateReadinessRequiresFreshReconciledStatus();
+			System.out.println("PASS: coordinator status liveness and adjacent recovery assertions");
+			return;
+		}
 		verifyCandidatePromotionUsesMaintenanceWorker();
 		verifyExternalAuthenticationFailuresRecoverWithoutQuarantine();
 		verifyTemporaryProcessStartFailuresRecoverWithoutQuarantine();
@@ -1124,6 +1139,307 @@ public final class CoordinatorProcessSupervisorVerification {
 				states,
 				"coordinator recovery exposes every non-terminal recovery state"
 		);
+	}
+
+	private static void verifyQualifiedStatusTimeoutRollback() {
+		for (int scenario = 0; scenario < 3; scenario++) {
+			boolean qualified = scenario != 1;
+			boolean knownGood = scenario != 2;
+			FakeClock clock = new FakeClock();
+			FakeLauncher launcher = new FakeLauncher();
+			FakeGenerationController generations = new FakeGenerationController();
+			generations.beforeRollback = () -> assertTrue(launcher.children.stream()
+					.allMatch(child -> !child.alive && child.terminations == 1), "rollback waits for exact-child cleanup");
+			try (CoordinatorProcessSupervisor supervisor = new CoordinatorProcessSupervisor(
+					Path.of("build", "status-rollback-fixture"), Map.of(), clock,
+					MutableDependencies.candidate(knownGood), launcher, new SequentialLaunchIds(1600),
+					Runnable::run, root -> 0, task -> { }, generations)) {
+				for (int attempt = 0; attempt < 3; attempt++) {
+					clock.now = Math.max(clock.now + STARTUP_GRACE_MS, supervisor.snapshot().nextRetryEpochMs());
+					supervisor.tickWithBridgeListener(false, null, 0L, false, false, true);
+					String launch = supervisor.snapshot().launchId();
+					supervisor.tickWithBridgeListener(true, launch, attempt + 1L, qualified, true, true);
+					supervisor.tickWithBridgeListener(true, launch, attempt + 1L, false, false, true);
+					clock.advance(STATUS_RECOVERY_TIMEOUT_MS - 1L);
+					supervisor.tickWithBridgeListener(true, launch, attempt + 1L, false, false, true);
+					assertTrue(launcher.latest().alive, "status grace is preserved");
+					if (attempt == 2 && qualified && knownGood) launcher.latest().terminationFailuresRemaining = 1;
+					clock.advance(1L);
+					supervisor.tickWithBridgeListener(true, launch, attempt + 1L, false, false, true);
+					assertEquals(0, generations.rollbacks, "threshold and cleanup fence prevent early rollback");
+					if (attempt == 2 && qualified && knownGood) {
+						assertTrue(launcher.latest().alive, "refused cleanup still owns the live child");
+						clock.advance(1_000L);
+						supervisor.tickWithBridgeListener(false, null, 0L, false, false, true);
+						assertEquals(1, generations.rollbacks, "three qualified status timeouts select fallback after cleanup");
+						assertEquals(GENERATION_A, supervisor.runtimeGenerationId(), "last-known-good generation selected");
+					}
+				}
+				assertEquals(qualified && knownGood ? 1 : 0, generations.rollbacks,
+						"unqualified or sole candidate never rolls back");
+			}
+			assertTrue(launcher.children.stream().noneMatch(child -> child.alive), "fixture closes every owned child");
+		}
+	}
+
+	private static void verifyHealthyMaintenanceStaysIdle() {
+		FakeClock clock = new FakeClock();
+		MutableDependencies dependencies = MutableDependencies.ready();
+		FakeLauncher launcher = new FakeLauncher();
+		QueuedMaintenanceWorker worker = new QueuedMaintenanceWorker();
+		ManualDependencyMonitorScheduler monitor = new ManualDependencyMonitorScheduler();
+		try (CoordinatorProcessSupervisor supervisor = new CoordinatorProcessSupervisor(
+				Path.of("build", "idle-maintenance-fixture"), Map.of(), clock, dependencies, launcher,
+				new SequentialLaunchIds(1700), worker, root -> 0, monitor)) {
+			worker.runNext();
+			clock.advance(STARTUP_GRACE_MS);
+			supervisor.tickWithBridgeListener(false, null, 0L, false, false, true);
+			worker.runNext();
+			String launch = supervisor.snapshot().launchId();
+			int submitted = worker.submissions;
+			for (int tick = 0; tick < 100; tick++) {
+				supervisor.tickWithBridgeListener(true, launch, 1L, true, true, true);
+				// Complete any submitted work so coalescing cannot hide a repeated no-op.
+				while (!worker.tasks.isEmpty()) worker.runNext();
+			}
+			assertEquals(submitted, worker.submissions, "healthy predeadline ticks submit no work");
+			assertEquals(1, dependencies.resolveCalls, "healthy ticks do not reread dependencies");
+			clock.advance(5_000L);
+			supervisor.tickWithBridgeListener(true, launch, 1L, true, true, true);
+			assertEquals(submitted + 1, worker.submissions, "deadline queues real work");
+			for (int tick = 0; tick < 100; tick++) supervisor.tickWithBridgeListener(true, launch, 1L, true, true, true);
+			assertEquals(submitted + 1, worker.submissions, "pending real work is coalesced");
+			worker.runNext();
+			supervisor.tickWithBridgeListener(true, launch, 1L, true, true, true);
+			assertEquals(2, dependencies.resolveCalls, "due work resolves dependencies");
+			dependencies.fingerprint = "changed-before-deadline";
+			monitor.poll();
+			supervisor.tickWithBridgeListener(true, launch, 1L, true, true, true);
+			worker.runNext();
+			assertEquals(3, dependencies.resolveCalls, "monitor wake bypasses future deadline");
+		}
+	}
+
+	private static void verifyManagedVoiceTimeoutReload() {
+		String property = "arenaagents.voiceRequestTimeoutMs";
+		String previous = System.getProperty(property);
+		String oldEndpoint = System.getProperty("arenaagents.voiceUrl");
+		String oldBridgeSecret = System.getProperty("arenaagents.bridgeSecretFile");
+		String oldVoiceSecret = System.getProperty("arenaagents.voiceSecretFile");
+		Path config = null;
+		try {
+			config = Files.createTempFile("arena-timeout-reload-", ".json");
+			Files.writeString(config, "{\"voice\":{\"port\":18766,\"localSpeechTimeoutMs\":120000}}");
+			System.clearProperty(property);
+			System.clearProperty("arenaagents.voiceUrl");
+			FakeClock clock = new FakeClock();
+			MutableDependencies dependencies = MutableDependencies.ready();
+			FakeLauncher launcher = new FakeLauncher();
+			var runtime = dependencies.runtime;
+			dependencies.runtime = new CoordinatorProcessSupervisor.PreparedRuntime(runtime.root(), runtime.coordinatorRoot(),
+					runtime.main(), config, runtime.secret(), runtime.voiceSecretPath(), runtime.nodeExecutable(),
+					runtime.bridgeSecret(), runtime.voiceSecret(), runtime.bridgePort(), runtime.generationId(), false, true);
+			dependencies.result = CoordinatorProcessSupervisor.DependencyResolution.ready(dependencies.runtime);
+			try (CoordinatorProcessSupervisor supervisor = new CoordinatorProcessSupervisor(
+					Path.of("build", "timeout-reload-fixture"), Map.of(), clock, dependencies, launcher,
+					new SequentialLaunchIds(1800), Runnable::run, root -> 0, task -> { })) {
+				assertEquals("120000", System.getProperty(property), "initial timeout derived");
+				AtomicInteger starts = new AtomicInteger();
+				var gate = new CodexAgentServerRuntime.VoiceInitializationGate(starts::incrementAndGet, () -> { });
+				gate.reconcile(true, CodexAgentServerRuntime.voiceConfigurationRevision(supervisor));
+				Files.writeString(config, "{\"voice\":{\"port\":18766,\"localSpeechTimeoutMs\":240000}}");
+				dependencies.fingerprint = "timeout-only";
+				supervisor.publishDependencyFingerprintChange();
+				supervisor.tickWithBridgeListener(false, null, 0L, false, false, false);
+				assertEquals("240000", System.getProperty(property), "same supervisor reloads owned timeout");
+				gate.reconcile(true, CodexAgentServerRuntime.voiceConfigurationRevision(supervisor));
+				assertEquals(2, starts.get(), "timeout-only edit recreates clients");
+				supervisor.configureSharedVoiceEndpoint(config);
+				gate.reconcile(true, CodexAgentServerRuntime.voiceConfigurationRevision(supervisor));
+				assertEquals(2, starts.get(), "unchanged timeout leaves clients intact");
+				System.setProperty(property, "77777");
+				supervisor.configureSharedVoiceEndpoint(config);
+				assertEquals("77777", System.getProperty(property), "later explicit override preserved");
+				gate.reconcile(true, CodexAgentServerRuntime.voiceConfigurationRevision(supervisor));
+				assertEquals(3, starts.get(), "explicit override also refreshes client revision");
+			}
+			assertEquals("77777", System.getProperty(property), "close preserves explicit override");
+			System.clearProperty(property);
+			try (CoordinatorProcessSupervisor supervisor = new CoordinatorProcessSupervisor(
+					Path.of("build", "timeout-release-fixture"), Map.of(), clock, dependencies, launcher,
+					new SequentialLaunchIds(1900), Runnable::run, root -> 0, task -> { })) {
+				assertEquals("240000", System.getProperty(property), "fresh lifecycle derives latest timeout");
+			}
+			assertEquals(null, System.getProperty(property), "close releases the latest managed publication");
+		} catch (IOException failure) {
+			throw new AssertionError("voice reload fixture", failure);
+		} finally {
+			restoreProperty(property, previous);
+			restoreProperty("arenaagents.voiceUrl", oldEndpoint);
+			restoreProperty("arenaagents.bridgeSecretFile", oldBridgeSecret);
+			restoreProperty("arenaagents.voiceSecretFile", oldVoiceSecret);
+			if (config != null) try { Files.deleteIfExists(config); } catch (IOException failure) { throw new AssertionError(failure); }
+		}
+	}
+
+	private static void verifyManualVoiceSnapshotRotation() {
+		String oldAutoStart = System.getProperty("arenaagents.coordinatorAutoStart");
+		String oldSecret = System.getProperty("arenaagents.voiceSecretFile");
+		Path secret = null;
+		try {
+			secret = Files.createTempFile("arena-secret-snapshot-", ".txt");
+			Files.writeString(secret, "v".repeat(32));
+			System.setProperty("arenaagents.coordinatorAutoStart", "false");
+			System.setProperty("arenaagents.voiceSecretFile", secret.toString());
+			try (CoordinatorProcessSupervisor supervisor = new CoordinatorProcessSupervisor(
+					Path.of("build", "manual-snapshot-fixture"), Map.of(), new FakeClock(), MutableDependencies.ready(),
+					request -> { throw new AssertionError("manual mode cannot launch"); }, new SequentialLaunchIds(2000),
+					Runnable::run, root -> 0, task -> { })) {
+				var initial = CodexAgentServerRuntime.voiceConfigurationSnapshot(supervisor);
+				assertTrue(initial.prepared(), "accepted manual secret is ready");
+				assertEquals(initial, CodexAgentServerRuntime.voiceConfigurationSnapshot(supervisor), "unchanged content keeps revision");
+				FileTime timestamp = Files.getLastModifiedTime(secret);
+				Files.writeString(secret, "w".repeat(32));
+				Files.setLastModifiedTime(secret, timestamp);
+				var rotated = CodexAgentServerRuntime.voiceConfigurationSnapshot(supervisor);
+				assertTrue(rotated.prepared() && rotated.revision() != initial.revision(), "same-size/same-time rotation detected next observation");
+				Files.writeString(secret, "short");
+				assertTrue(!CodexAgentServerRuntime.voiceConfigurationSnapshot(supervisor).prepared(), "invalid secret fences voice");
+			}
+		} catch (IOException failure) {
+			throw new AssertionError("manual secret fixture", failure);
+		} finally {
+			restoreProperty("arenaagents.coordinatorAutoStart", oldAutoStart);
+			restoreProperty("arenaagents.voiceSecretFile", oldSecret);
+			if (secret != null) try { Files.deleteIfExists(secret); } catch (IOException failure) { throw new AssertionError(failure); }
+		}
+	}
+
+	private static void verifyStatusLiveness() {
+		verifyMissingStatusReplacesOwnedGeneration();
+		verifyFreshStatusClearsRecoveryWithoutReconciliation();
+		verifyStatusGapThenDisconnectUsesReconnectGrace();
+		verifyStatusTimeoutWaitsForOwnedTermination();
+	}
+
+	private static void verifyMissingStatusReplacesOwnedGeneration() {
+		Fixture fixture = Fixture.ready();
+		try {
+			fixture.startFirstProcess();
+			String firstLaunch = fixture.supervisor.snapshot().launchId();
+			FakeChild first = fixture.launcher.latest();
+			fixture.supervisor.tickWithBridgeListener(true, firstLaunch, 1L, true, true, true);
+			fixture.supervisor.tickWithBridgeListener(true, firstLaunch, 1L, false, false, true);
+			assertEquals(CoordinatorRecoveryState.DEGRADED, fixture.supervisor.snapshot().state(),
+					"authenticated stale status exposes degraded liveness");
+			fixture.clock.advance(STATUS_RECOVERY_TIMEOUT_MS - 1L);
+			fixture.supervisor.tickWithBridgeListener(true, firstLaunch, 2L, false, false, true);
+			assertEquals(0, first.terminations, "status gap receives a full reconnect-sized grace");
+			fixture.clock.advance(1L);
+			fixture.supervisor.tickWithBridgeListener(true, firstLaunch, 2L, false, false, true);
+			assertEquals(CoordinatorRecoveryState.BACKOFF, fixture.supervisor.snapshot().state(),
+					"session changes cannot renew missing-status liveness indefinitely");
+			assertEquals("COORDINATOR_STATUS_TIMEOUT", fixture.supervisor.snapshot().failureCode(),
+					"status timeout reports its independent boundary");
+			assertEquals(1, first.terminations, "stalled owned process is terminated once");
+			assertEquals(fixture.clock.now + 1_000L, fixture.supervisor.snapshot().nextRetryEpochMs(),
+					"status timeout uses the existing first-failure backoff");
+			fixture.clock.advance(1_000L);
+			fixture.supervisor.tickWithBridgeListener(true, firstLaunch, 2L, true, true, true);
+			String replacementLaunch = fixture.supervisor.snapshot().launchId();
+			assertFalse(firstLaunch.equals(replacementLaunch), "replacement owns a new launch identity");
+			fixture.supervisor.tickWithBridgeListener(true, firstLaunch, 2L, true, true, true);
+			assertEquals(CoordinatorRecoveryState.AUTHENTICATING, fixture.supervisor.snapshot().state(),
+					"old launch status cannot make a replacement healthy");
+			fixture.supervisor.tickWithBridgeListener(true, replacementLaunch, 3L, false, false, true);
+			FakeChild replacement = fixture.launcher.latest();
+			fixture.clock.advance(STATUS_RECOVERY_TIMEOUT_MS - 1L);
+			fixture.supervisor.tickWithBridgeListener(true, replacementLaunch, 3L, false, false, true);
+			assertEquals(0, replacement.terminations, "new launch receives its own missing-status window");
+			fixture.clock.advance(1L);
+			fixture.supervisor.tickWithBridgeListener(true, replacementLaunch, 3L, false, false, true);
+			assertEquals(1, replacement.terminations, "missing first status also has a bounded lifetime");
+		} finally {
+			fixture.supervisor.close();
+		}
+	}
+
+	private static void verifyFreshStatusClearsRecoveryWithoutReconciliation() {
+		Fixture fixture = Fixture.ready();
+		try {
+			fixture.startFirstProcess();
+			String launch = fixture.supervisor.snapshot().launchId();
+			fixture.supervisor.tickWithBridgeListener(true, launch, 1L, false, false, true);
+			fixture.clock.advance(STATUS_RECOVERY_TIMEOUT_MS - 1L);
+			CoordinatorStatusSnapshot reconciling = coordinatorStatus(false, fixture.clock.now);
+			fixture.supervisor.tickWithBridgeListener(true, launch, 1L,
+					CodexAgentServerRuntime.coordinatorStatusReady(reconciling, fixture.clock.now),
+					CodexAgentServerRuntime.coordinatorStatusFresh(reconciling, fixture.clock.now), true);
+			assertEquals(CoordinatorRecoveryState.HEALTHY, fixture.supervisor.snapshot().state(),
+					"fresh unreconciled status restores liveness without claiming candidate readiness");
+			assertEquals(null, fixture.supervisor.snapshot().failureCode(), "fresh status clears stale diagnostic");
+			fixture.clock.advance(1L);
+			fixture.supervisor.tickWithBridgeListener(true, launch, 1L, false, false, true);
+			fixture.clock.advance(STATUS_RECOVERY_TIMEOUT_MS - 1L);
+			fixture.supervisor.tickWithBridgeListener(true, launch, 1L, false, false, true);
+			assertEquals(0, fixture.launcher.latest().terminations,
+					"a later gap does not inherit the recovered gap's deadline");
+			fixture.supervisor.tickWithBridgeListener(true, launch, 1L, false, true, true);
+			fixture.clock.advance(STABILITY_INTERVAL_MS * 2L);
+			fixture.supervisor.tickWithBridgeListener(true, launch, 1L, false, true, true);
+			assertEquals(0, fixture.launcher.latest().terminations,
+					"provider or reconciliation delay with fresh status never expires coordinator liveness");
+			assertEquals(0L, fixture.supervisor.snapshot().lastStableEpochMs(),
+					"liveness alone never earns reconciled stability credit");
+		} finally {
+			fixture.supervisor.close();
+		}
+	}
+
+	private static void verifyStatusGapThenDisconnectUsesReconnectGrace() {
+		Fixture fixture = Fixture.ready();
+		try {
+			fixture.startFirstProcess();
+			String launch = fixture.supervisor.snapshot().launchId();
+			fixture.supervisor.tickWithBridgeListener(true, launch, 1L, false, false, true);
+			fixture.supervisor.tickWithBridgeListener(false, null, 0L, false, false, true);
+			assertEquals(fixture.clock.now + RECONNECT_TIMEOUT_MS,
+					fixture.supervisor.snapshot().reconnectDeadlineEpochMs(),
+					"disconnect after a status gap still starts the normal reconnect window");
+			assertEquals(0, fixture.launcher.latest().terminations,
+					"status-degraded state cannot cause immediate disconnect termination");
+			fixture.clock.advance(RECONNECT_TIMEOUT_MS - 1L);
+			fixture.supervisor.tickWithBridgeListener(true, launch, 2L, true, true, true);
+			assertEquals(CoordinatorRecoveryState.HEALTHY, fixture.supervisor.snapshot().state(),
+					"fresh status on reconnect restores the same child");
+		} finally {
+			fixture.supervisor.close();
+		}
+	}
+
+	private static void verifyStatusTimeoutWaitsForOwnedTermination() {
+		Fixture fixture = Fixture.ready();
+		try {
+			fixture.startFirstProcess();
+			String launch = fixture.supervisor.snapshot().launchId();
+			FakeChild child = fixture.launcher.latest();
+			child.terminationFailuresRemaining = 2;
+			fixture.supervisor.tickWithBridgeListener(true, launch, 1L, false, false, true);
+			fixture.clock.advance(STATUS_RECOVERY_TIMEOUT_MS);
+			fixture.supervisor.tickWithBridgeListener(true, launch, 1L, false, false, true);
+			assertEquals(CoordinatorRecoveryState.BLOCKED_RETRYABLE, fixture.supervisor.snapshot().state(),
+					"failed stale-child termination uses existing retryable cleanup");
+			assertTrue(child.alive && child.ownershipPresent, "failed termination retains live-child ownership");
+			fixture.clock.advance(1_000L);
+			fixture.supervisor.tickWithBridgeListener(true, launch, 1L, true, true, true);
+			assertEquals(1, fixture.launcher.launches.size(), "replacement cannot overlap failed owned termination");
+			fixture.clock.advance(1_000L);
+			fixture.supervisor.tickWithBridgeListener(true, launch, 1L, true, true, true);
+			assertEquals(1, child.terminations, "owned cleanup succeeds once before replacement");
+			assertEquals(2, fixture.launcher.launches.size(), "confirmed cleanup releases the scheduled replacement");
+		} finally {
+			fixture.supervisor.close();
+		}
 	}
 
 	private static void verifyBridgeBindFailureRecovery() {
@@ -1537,8 +1853,6 @@ public final class CoordinatorProcessSupervisorVerification {
 		supervisor.tick(false, null, 0L);
 		assertEquals(CoordinatorRecoveryState.BACKOFF, supervisor.snapshot().state(),
 				"authentication timeout enters backoff before slow termination finishes");
-		worker.runNext();
-		supervisor.tick(false, null, 0L);
 		Thread terminator = worker.startNext("blocking-child-termination");
 		await(launcher.child.terminationStarted, "blocking child termination started on maintenance worker");
 		int submissionsBeforeTicks = worker.submissions;
@@ -1982,6 +2296,14 @@ public final class CoordinatorProcessSupervisorVerification {
 				"candidate promotion rejects a status that stopped refreshing");
 		assertFalse(CodexAgentServerRuntime.coordinatorStatusReady(coordinatorStatus(false, now), now),
 				"candidate promotion still requires coordinator reconciliation");
+		assertTrue(CodexAgentServerRuntime.coordinatorStatusFresh(fresh, now),
+				"liveness accepts the existing freshness boundary");
+		assertFalse(CodexAgentServerRuntime.coordinatorStatusFresh(stale, now),
+				"liveness rejects stale status independently of reconciliation");
+		assertTrue(CodexAgentServerRuntime.coordinatorStatusFresh(coordinatorStatus(false, now), now),
+				"fresh unreconciled status proves liveness");
+		assertFalse(CodexAgentServerRuntime.coordinatorStatusFresh(null, now),
+				"missing status does not prove liveness");
 	}
 
 	private static CoordinatorStatusSnapshot coordinatorStatus(boolean reconciled, long receivedAtEpochMs) {
@@ -2165,7 +2487,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		worker.runNext();
 		supervisor.tick(false, null, 0L);
 		FakeChild child = launcher.latest();
-		worker.runNext();
+		assertTrue(worker.tasks.isEmpty(), "healthy predeadline child leaves the worker idle");
 
 		CountDownLatch maintenanceStarted = new CountDownLatch(1);
 		CountDownLatch releaseMaintenance = new CountDownLatch(1);

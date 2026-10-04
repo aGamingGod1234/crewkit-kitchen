@@ -29,15 +29,22 @@ export class FactLedger {
 
 	add(value) {
 		if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('fact must be an object');
-		if (!ALLOWED_SOURCES.has(value.source)) throw new TypeError('fact source is not trusted');
+		// Retain the values we validate. A getter must not substitute mutable data
+		// between validation and storage in an otherwise immutable fact record.
+		const source = value.source;
+		if (!ALLOWED_SOURCES.has(source)) throw new TypeError('fact source is not trusted');
 		const fact = boundedText(value.fact, 'fact', MAXIMUM_FACT_CODE_POINTS);
 		const dimension = boundedText(value.dimension, 'dimension', 128);
-		if (!Number.isSafeInteger(value.tick) || value.tick < 0) throw new TypeError('fact tick must be a non-negative safe integer');
-		if (!Number.isSafeInteger(value.expiresAtTick) || value.expiresAtTick <= value.tick) throw new TypeError('expiresAtTick must be after tick');
-		if (!Number.isFinite(value.confidence) || value.confidence < 0 || value.confidence > 1) throw new TypeError('confidence must be in [0, 1]');
-		this.#purgeExpired(value.tick);
-		const key = typeof value.key === 'string' && value.key.length > 0 ? value.key : `fact:${++this.#sequence}`;
-		const next = Object.freeze({ key, fact, source: value.source, tick: value.tick, dimension, expiresAtTick: value.expiresAtTick, confidence: value.confidence });
+		const tick = value.tick;
+		if (!Number.isSafeInteger(tick) || tick < 0) throw new TypeError('fact tick must be a non-negative safe integer');
+		const expiresAtTick = value.expiresAtTick;
+		if (!Number.isSafeInteger(expiresAtTick) || expiresAtTick <= tick) throw new TypeError('expiresAtTick must be after tick');
+		const confidence = value.confidence;
+		if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) throw new TypeError('confidence must be in [0, 1]');
+		this.#purgeExpired(tick);
+		const suppliedKey = value.key;
+		const key = typeof suppliedKey === 'string' && suppliedKey.length > 0 ? suppliedKey : `fact:${++this.#sequence}`;
+		const next = Object.freeze({ key, fact, source, tick, dimension, expiresAtTick, confidence });
 		const previous = this.#entries.find((entry) => entry.key === key);
 		if (previous !== undefined && sameFact(previous, next)) {
 			this.#entries = ordered(this.#entries.map((entry) => entry.key === key ? next : entry));
@@ -55,7 +62,7 @@ export class FactLedger {
 		if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) return;
 		if (source === 'observation') {
 			const world = objectValue(payload.world);
-			let tick = safeTick(world.gameTime, this.#lastTick + 1);
+			const tick = safeTick(world.gameTime, this.#lastTick);
 			const dimension = safeText(world.dimension ?? world.dimensionId, this.#lastDimension, 128);
 			const worldId = observationWorldId(payload);
 			if (this.#worldId !== null && (worldId !== this.#worldId || dimension !== this.#lastDimension)) {
@@ -76,7 +83,9 @@ export class FactLedger {
 			return;
 		}
 
-		const tick = ++this.#lastTick;
+		// Only observations move the world-clock watermark used for rollback.
+		// Results/events are ordered by ledger revisions, not invented game ticks.
+		const tick = safeTick(payload.actionObservation?.worldTick, this.#lastTick);
 		const fact = source === 'action_result'
 			? compactObject(payload, ['state', 'reasonCode', 'actionId', 'commandId', 'actionType'])
 			: compactObject(payload, ['type', 'event', 'eventType', 'reasonCode', 'entityId', 'entityType', 'damage', 'health']);
@@ -95,7 +104,18 @@ export class FactLedger {
 		const inventory = objectValue(payload.inventory);
 		const inventoryFact = compactObject(inventory, ['selectedItem', 'selectedSlot', 'selectedItemId', 'selectedItemCount']);
 		if (Array.isArray(inventory.items)) {
-			inventoryFact.items = inventory.items.slice(0, 16).map((item) => compactObject(objectValue(item), ['itemId', 'count'])).filter((item) => Object.keys(item).length > 0);
+			const totals = new Map();
+			for (const item of inventory.items) {
+				if (typeof item?.itemId !== 'string' || !Number.isSafeInteger(item.count) || item.count < 0) continue;
+				const count = (totals.get(item.itemId) ?? 0) + item.count;
+				if (Number.isSafeInteger(count)) totals.set(item.itemId, count);
+			}
+			inventoryFact.items = [...totals].map(([itemId, count]) => ({ itemId, count }));
+			// Trim complete rows, never JSON text; counts aggregate repeated stacks.
+			while ([...JSON.stringify({ inventory: inventoryFact })].length > MAXIMUM_FACT_CODE_POINTS && inventoryFact.items.length > 0) {
+				inventoryFact.items.pop();
+				inventoryFact.omittedItems = (inventoryFact.omittedItems ?? 0) + 1;
+			}
 		}
 		if (Object.keys(inventoryFact).length > 0) this.#addStructured('observation:inventory', { inventory: inventoryFact }, 'observation', tick, dimension, 200, 0.95);
 
@@ -130,7 +150,7 @@ export class FactLedger {
 	}
 
 	#addStructured(key, value, source, tick, dimension, lifetime, confidence) {
-		this.add({ key, fact: JSON.stringify(value), source, tick, dimension, expiresAtTick: tick + lifetime, confidence });
+		this.add({ key, fact: boundedStructuredText(value), source, tick, dimension, expiresAtTick: tick + lifetime, confidence });
 	}
 
 	snapshot(nowTick = this.#lastTick) {
@@ -142,11 +162,16 @@ export class FactLedger {
 	toPlannerFacts(nowTick = this.#lastTick) {
 		const entries = this.snapshot(nowTick);
 		const selected = [];
+		let bytes = Buffer.byteLength(PREFIX, 'utf8') + 2; // JSON array brackets.
 		for (const entry of entries) {
-			const candidate = `${PREFIX}${JSON.stringify([...selected, entry])}`;
-			if (Buffer.byteLength(candidate, 'utf8') <= this.#maximumBytes) selected.push(entry);
+			const serialized = JSON.stringify(entry);
+			const addedBytes = Buffer.byteLength(serialized, 'utf8') + (selected.length > 0 ? 1 : 0);
+			if (bytes + addedBytes <= this.#maximumBytes) {
+				selected.push(serialized);
+				bytes += addedBytes;
+			}
 		}
-		return `${PREFIX}${JSON.stringify(selected)}`;
+		return `${PREFIX}[${selected.join(',')}]`;
 	}
 
 	/** Return a bounded keyed revision projection, falling back to a full baseline when needed. */
@@ -258,6 +283,19 @@ function boundedText(value, field, maximumCodePoints) {
 	const normalized = value.trim();
 	if (normalized.length === 0) throw new TypeError(`${field} must be nonblank`);
 	return [...normalized].slice(0, maximumCodePoints).join('');
+}
+
+function boundedStructuredText(value) {
+	const result = { ...value };
+	const omittedFields = [];
+	// Keep included fields intact even for unusually long identifiers/escaped text.
+	for (const key of Object.keys(result).reverse()) {
+		if ([...JSON.stringify(result)].length <= MAXIMUM_FACT_CODE_POINTS) break;
+		delete result[key];
+		omittedFields.push(key);
+		result.omittedFields = omittedFields;
+	}
+	return JSON.stringify(result);
 }
 
 function objectValue(value) {

@@ -15,6 +15,9 @@ import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.shapes.Shapes;
+import net.minecraft.world.phys.shapes.BooleanOp;
 import net.minecraft.world.phys.shapes.VoxelShape;
 
 import java.util.HashMap;
@@ -166,6 +169,39 @@ public final class MinecraftNavigationWorld implements WalkabilityView {
 	}
 
 	record CacheMetrics(long hits, long misses, int cachedCells) { }
+
+	/** A steering point inside this cell, with the whole player footprint supported and body clear. */
+	Vec3 inwardStandingTarget(GridPosition position, Vec3 requested, AABB playerBox) {
+		double halfX = playerBox.getXsize() / 2.0D;
+		double halfZ = playerBox.getZsize() / 2.0D;
+		if (halfX >= 0.5D || halfZ >= 0.5D) return null;
+		double x = inwardCoordinate(position.x(), requested.x, halfX);
+		double z = inwardCoordinate(position.z(), requested.z, halfZ);
+		double y = supportHeight(position, x, z);
+		if (!Double.isFinite(y)) return null;
+		BlockPos below = new BlockPos(position.x(), position.y() - 1, position.z());
+		VoxelShape support = stateAt(below).getCollisionShape(level, below);
+		AABB footprint = new AABB(x - halfX - position.x(), 0.0D, z - halfZ - position.z(),
+				x + halfX - position.x(), 1.0D, z + halfZ - position.z());
+		if (!supportsFootprintAt(support, footprint, y - below.getY())) return null;
+		AABB standingBox = new AABB(x - halfX, y, z - halfZ, x + halfX, y + playerBox.getYsize(), z + halfZ);
+		return level.noCollision(standingBox) ? new Vec3(x, y, z) : null;
+	}
+
+	static double inwardCoordinate(int cell, double requested, double halfWidth) {
+		double nearest = Math.max(cell + halfWidth, Math.min(cell + 1.0D - halfWidth, requested));
+		// Stay inside the safe cell, away from its exact edge, without changing arrival tolerance.
+		return (cell + 0.5D + nearest) / 2.0D;
+	}
+
+	static boolean supportsFootprintAt(VoxelShape support, AABB footprint, double height) {
+		VoxelShape surface = Shapes.empty();
+		for (AABB box : support.toAabbs()) {
+			if (box.maxY == height) surface = Shapes.or(surface,
+					Shapes.box(box.minX, 0.0D, box.minZ, box.maxX, 1.0D, box.maxZ));
+		}
+		return !Shapes.joinIsNotEmpty(Shapes.create(footprint), surface, BooleanOp.ONLY_FIRST);
+	}
 
 	double supportHeight(GridPosition feetPosition, double worldX, double worldZ) {
 		Objects.requireNonNull(feetPosition, "feetPosition must not be null");

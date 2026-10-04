@@ -13,7 +13,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 /** Records the authoritative world mutation produced by this player's break handler. */
 @Mixin(ServerPlayerGameMode.class)
-abstract class ServerPlayerGameModeMixin {
+abstract class ServerPlayerGameModeMixin implements dev.agaminggod.arenaagents.server.runtime.ServerActionExecutor.BlockBreakReceiptAccess {
 	@com.llamalad7.mixinextras.injector.wrapmethod.WrapMethod(method = "useItemOn")
 	private net.minecraft.world.InteractionResult arenaagents$attributeBlockUse(
 			ServerPlayer actor, net.minecraft.world.level.Level level, net.minecraft.world.item.ItemStack stack,
@@ -32,6 +32,27 @@ abstract class ServerPlayerGameModeMixin {
 
 	@Unique
 	private long arenaagents$lastDestroyedGameTime = -1L;
+
+	@Unique
+	private dev.agaminggod.arenaagents.server.runtime.ServerActionExecutor.BlockBreakReceipt arenaagents$blockBreakReceipt;
+
+	@Override
+	public dev.agaminggod.arenaagents.server.runtime.ServerActionExecutor.BlockBreakReceipt arenaagents$getBlockBreakReceipt() {
+		return arenaagents$blockBreakReceipt;
+	}
+
+	@com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation(method = "destroyBlock", at = @At(
+			value = "INVOKE", target = "Lnet/minecraft/server/level/ServerLevel;removeBlock(Lnet/minecraft/core/BlockPos;Z)Z"))
+	private boolean arenaagents$recordRemoval(net.minecraft.server.level.ServerLevel level, BlockPos position,
+			boolean moving, com.llamalad7.mixinextras.injector.wrapoperation.Operation<Boolean> original) {
+		net.minecraft.world.level.block.state.BlockState before = level.getBlockState(position);
+		boolean removed = original.call(level, position, moving);
+		if (removed) {
+			arenaagents$blockBreakReceipt = new dev.agaminggod.arenaagents.server.runtime.ServerActionExecutor.BlockBreakReceipt(
+					position, before, level.getBlockState(position));
+		}
+		return removed;
+	}
 
 	@Inject(method = "destroyBlock", at = @At("RETURN"))
 	private void arenaagents$recordDestroyedBlock(BlockPos position, CallbackInfoReturnable<Boolean> callback) {

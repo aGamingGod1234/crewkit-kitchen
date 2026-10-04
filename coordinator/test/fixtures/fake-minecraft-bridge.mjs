@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events';
 import { createProtocolV2Envelope, validateProtocolV2Envelope, validateProtocolV2Payload } from '../../src/protocol-v2.mjs';
 import { adaptObservation } from '../../src/observation-adapter.mjs';
 import { goalSpecFingerprint } from '../../src/goal-spec.mjs';
+import { simulatorCraftRecipe } from '../../src/simulator/virtual-world.mjs';
 
 export const SELECTED_PROFILE = Object.freeze({
 	agentId: 'task10-agent',
@@ -296,7 +297,7 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 			dead: false,
 			health: 20,
 			inventory: new Map(Object.entries(scenario.initialInventory ?? {})),
-			blocks: new Map([['0,64,0', 'minecraft:oak_log']]),
+			blocks: new Map(Object.entries(scenario.initialBlocks ?? { '0,64,0': 'minecraft:oak_log' })),
 			entities: new Map(),
 			drop: { stableId: '00000000-0000-4000-8000-000000000001', itemId: 'minecraft:oak_log', count: 1, x: 1, y: 64, z: 0 },
 		};
@@ -467,14 +468,17 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 	async #executeAction(command, connectionEpoch) {
 		if (!this.#connected || this.#stopped) return;
 		this.#actionNumber += 1;
-		const actionFault = this.#scenario.actionResults?.[this.#actionNumber - 1] ?? 'SUCCEEDED';
+		const injectedFault = this.#scenario.actionResults?.[this.#actionNumber - 1] ?? 'SUCCEEDED';
+		const actionFault = injectedFault === 'SUCCEEDED' ? (this.#actionFailure(command) ?? 'SUCCEEDED') : injectedFault;
 		const actionType = command.actionType;
 		const succeeded = actionFault === 'SUCCEEDED';
 		const disconnectOutstanding = this.#scenario.disconnectWhileActionOutstandingAtAction === this.#actionNumber;
+		// A rejected target is still an attempted dispatch, but never a world effect.
+		if (injectedFault === 'SUCCEEDED') this.actionAttempts.push({ actionId: command.actionId, actionType, goalRevision: command.goalRevision, connectionEpoch });
 		if (succeeded) {
 			this.#activePhysicalActions += 1;
 			this.maxConcurrentPhysicalActions = Math.max(this.maxConcurrentPhysicalActions, this.#activePhysicalActions);
-			this.actionAttempts.push({ actionId: command.actionId, actionType, goalRevision: command.goalRevision, connectionEpoch });
+
 			try { this.#applySuccessfulAction(command, connectionEpoch); }
 			finally { this.#activePhysicalActions -= 1; }
 		}
@@ -566,20 +570,43 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 		});
 	}
 
+	#actionFailure(command) {
+		const { actionType, arguments: args = {} } = command;
+		if (!['break_block', 'mine', 'navigate_to', 'pick_up_item', 'craft_inventory', 'craft_table', 'place_block', 'respawn'].includes(actionType)) return 'SIMULATOR_UNSUPPORTED_ACTION';
+		if (this.#world.dead && actionType !== 'respawn') return 'PLAYER_DEAD';
+		if (actionType === 'break_block' || actionType === 'mine') {
+			const block = this.#world.blocks.get(`${args.x},${args.y},${args.z}`);
+			if (!block) return 'BLOCK_NOT_FOUND';
+			if (block !== args.expectedBlockId) return 'TARGET_CHANGED';
+			if (Math.hypot(args.x - this.#world.position.x, args.y - this.#world.position.y, args.z - this.#world.position.z) > 4.5) return 'TARGET_TOO_FAR';
+		}
+		if (actionType === 'craft_inventory' || actionType === 'craft_table') {
+			const recipe = simulatorCraftRecipe(args.recipeId);
+			if (!recipe) return 'RECIPE_NOT_FOUND';
+			if (actionType === 'craft_inventory' && recipe.table) return 'RECIPE_GRID_MISMATCH';
+			if (actionType === 'craft_table' && this.#world.blocks.get(`${args.x},${args.y},${args.z}`) !== 'minecraft:crafting_table') return 'CRAFTING_TABLE_NOT_FOUND';
+			if (args.count > recipe.count) return 'CRAFT_COUNT_UNSUPPORTED';
+			if (Object.entries(recipe.inputs).some(([id, count]) => (this.#world.inventory.get(id) ?? 0) < count)) return 'INGREDIENTS_MISSING';
+		}
+		if (actionType === 'place_block') {
+			if (this.#world.blocks.has(`${args.x},${args.y},${args.z}`)) return 'BLOCK_OCCUPIED';
+			if ((this.#world.inventory.get(args.itemId) ?? 0) < 1) return 'ITEM_NOT_FOUND';
+			// Only upward placement on the explicit fixture support is modeled.
+			if (args.face !== 'up' || !this.#world.blocks.has(`${args.x},${args.y - 1},${args.z}`)) return 'PLACEMENT_UNSUPPORTED';
+		}
+		if (actionType === 'pick_up_item' && (!this.#world.drop || this.#world.drop.stableId !== args.targetSelector)) return 'ITEM_NOT_FOUND';
+		return null;
+	}
+
 	#applySuccessfulAction(command, connectionEpoch) {
 		const actionType = command.actionType;
 		const args = command.arguments ?? {};
 		let changed = false;
 		if (actionType === 'break_block' || actionType === 'mine') {
-			changed = this.#world.blocks.delete(`${args.x},${args.y},${args.z}`);
-			if (this.#world.drop !== null) {
-				const nextX = this.#scenario.moveDropBeforePickup ? 3 : this.#world.drop.x;
-				changed ||= nextX !== this.#world.drop.x;
-				this.#world.drop = {
-					...this.#world.drop,
-					x: nextX,
-				};
-			}
+			const key = `${args.x},${args.y},${args.z}`;
+			const block = this.#world.blocks.get(key);
+			changed = this.#world.blocks.delete(key);
+			this.#world.drop = { stableId: '00000000-0000-4000-8000-000000000001', itemId: block === 'minecraft:stone' ? 'minecraft:cobblestone' : block, count: 1, x: this.#scenario.moveDropBeforePickup ? 3 : args.x, y: args.y, z: args.z };
 		}
 		if (actionType === 'navigate_to') {
 			changed = this.#world.position.x !== args.x || this.#world.position.y !== args.y || this.#world.position.z !== args.z;
@@ -593,10 +620,20 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 				this.#world.drop = null;
 			}
 		}
-		if (actionType === 'craft_inventory') {
+		if (actionType === 'craft_inventory' || actionType === 'craft_table') {
+			const recipe = simulatorCraftRecipe(args.recipeId);
+			for (const [id, count] of Object.entries(recipe.inputs)) {
+				const remaining = this.#world.inventory.get(id) - count;
+				if (remaining === 0) this.#world.inventory.delete(id); else this.#world.inventory.set(id, remaining);
+			}
+			this.#world.inventory.set(recipe.output, (this.#world.inventory.get(recipe.output) ?? 0) + recipe.count);
 			changed = true;
-			const itemId = args.recipeId ?? 'minecraft:wooden_pickaxe';
-			this.#world.inventory.set(itemId, (this.#world.inventory.get(itemId) ?? 0) + (args.count ?? 1));
+		}
+		if (actionType === 'place_block') {
+			const remaining = this.#world.inventory.get(args.itemId) - 1;
+			if (remaining === 0) this.#world.inventory.delete(args.itemId); else this.#world.inventory.set(args.itemId, remaining);
+			this.#world.blocks.set(`${args.x},${args.y},${args.z}`, args.itemId);
+			changed = true;
 		}
 		if (actionType === 'respawn') {
 			changed = this.#world.dead || this.#world.health !== 20;

@@ -36,7 +36,9 @@ const scenarios = [
 	}],
 	['completion rejected then accepted', {
 		completionResults: [false, true],
-		turns: [['finish'], ['craft_inventory'], ['finish']],
+		initialInventory: { 'minecraft:oak_planks': 3, 'minecraft:stick': 2 },
+		initialBlocks: { '1,64,1': 'minecraft:crafting_table' },
+		turns: [['finish'], ['craft_table'], ['finish']],
 		expectedCompleted: true,
 	}],
 	['disconnect during action', {
@@ -70,6 +72,9 @@ test('explicit pause remains paused and does not dispatch a recovery turn', asyn
 		turns: [['observe']],
 	}).run();
 	assert.equal(result.finalState, DynamicAgentState.PAUSED);
+	assert.deepEqual(result.pauseBoundary, { providerTurns: 1, recoveryDispatches: 0 }, 'no expiry during input preparation');
+	assert.equal(result.postPauseRecoveryDispatches, 0, 'pause cancels recovery before coordinator shutdown');
+	assert.equal(result.providerTurns, 1, 'pause cannot start another provider turn');
 	assert.equal(result.recoveryDispatches, 0);
 });
 

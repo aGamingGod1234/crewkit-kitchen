@@ -324,13 +324,7 @@ public final class AgentVerboseVerification {
 			BufferedReader reader,
 			BridgeEnvelopeCodec codec
 	) throws Exception {
-		long deadline = System.nanoTime() + 2_000_000_000L;
-		while (System.nanoTime() < deadline) {
-			bridge.tick();
-			if (socket.getInputStream().available() > 0) return codec.decode(reader.readLine());
-			Thread.sleep(5L);
-		}
-		throw new AssertionError("bridge did not publish a response");
+		return MultiplexedServerBridgeVerification.pollBridgeResponse(bridge, socket, reader, codec);
 	}
 
 	private static void assertEquals(Object expected, Object actual, String label) {

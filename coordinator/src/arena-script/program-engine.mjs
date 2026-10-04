@@ -1,6 +1,7 @@
+import { isDeepStrictEqual } from 'node:util';
 import { ArenaScriptInterpreter, freezeQueryResult } from './interpreter.mjs';
 import { changedInterpreterFactDomains, createInterpreterFacts } from './facts.mjs';
-import { ALL_FACT_DOMAINS } from './fact-domains.mjs';
+import { ALL_FACT_DOMAINS, FACT_DOMAIN } from './fact-domains.mjs';
 import { SCRIPT_BINDINGS } from './minecraft-api.mjs';
 import { validateProgramParameters } from '../program-parameters.mjs';
 
@@ -49,7 +50,9 @@ export class ArenaScriptEngine {
 		const changedFactDomains = changedInterpreterFactDomains(previousFacts, this.#facts);
 		this.#factsSequence = eventSequence;
 		this.#eventSequence = Math.max(this.#eventSequence, eventSequence);
-		this.#fencePendingRequest();
+		// Publication identity advances for receipt barriers. Only new facts invalidate
+		// a pending decision; an identical quiet heartbeat cannot starve the planner.
+		if (planningFactsChanged(previousFacts, this.#facts, changedFactDomains) || attention || mayResume) this.#fencePendingRequest();
 		// Pausing the body must not freeze perception. Resume/replacement decisions
 		// consume these fresh facts, but observations alone cannot restart input.
 		if (awaitingDecision) {
@@ -165,6 +168,7 @@ export class ArenaScriptEngine {
 		if (directive.directive === 'continue') {
 			if (this.#watcherDecision) {
 				this.#watcherDecision = false; this.#resumableUnhandled = false; this.#status = 'ACTIVE';
+				this.#updateWatchers();
 				this.#handleYield(this.#vm.resumeWatcherDecision(this.#facts), 'step');
 			} else if (request.decisionContext === 'completion_verification_failed') this.#status = 'FINISHED';
 			else if (this.#transition?.kind === 'terminal' && this.#transition.reason === 'unhandled_attention') this.#transition = { kind: 'resume' };
@@ -233,6 +237,11 @@ export class ArenaScriptEngine {
 		return latest;
 	}
 
+	/** Checks decision identity independently of harmless publication advances. */
+	isCurrentDirectiveRequest(request) {
+		return this.#pendingRequest !== null && sameRequest(request, this.#coalescedRequest ?? this.#pendingRequest);
+	}
+
 	snapshot() { const pending = this.#coalescedRequest ?? this.#pendingRequest; return Object.freeze({ status: this.#status, eventSequence: this.#eventSequence, factsSequence: this.#factsSequence, generation: this.#generation, lifecycleEpoch: this.#lifecycleEpoch, continuationEpoch: this.#continuationEpoch, activeActionId: this.#activeActionId(), activeQueryId: this.#active?.kind === 'query' ? this.#active.actionId : null, programId: this.#program?.programId ?? null, version: this.#program?.version ?? null, pendingRequestPriority: pending?.priority ?? null, pendingRequestTrigger: pending?.trigger ?? null }); }
 
 	#activate(target) {
@@ -249,12 +258,20 @@ export class ArenaScriptEngine {
 		this.#watcherMetadata = watcherMetadata(target.compiled);
 		this.#status = 'ACTIVE';
 		const first = this.#vm.start(this.#facts);
+		if (first.kind === 'finish' || first.kind === 'checkpoint') {
+			this.#handleYield(first, 'step');
+			return this.snapshot();
+		}
 		let initialGuard = null;
 		for (let index = 0; index < target.compiled.watcherCount && this.#isLive(); index += 1) {
 			const metadata = this.#watcherMetadata[index], watcherId = metadata.id;
 			const truth = this.#vm.evaluateWatcher(watcherId, this.#facts);
 			this.#watcherTruth.set(watcherId, truth);
-			if (initialGuard === null && truth && metadata.mode === 'interrupt' && metadata.after === 'reconsider') initialGuard = { watcherId, mode: metadata.mode, eventSequence: this.#eventSequence, generation: this.#generation, facts: this.#facts };
+			if (truth && metadata.mode === 'interrupt' && metadata.after === 'reconsider') {
+				const latch = freezeRecord({ watcherId, mode: metadata.mode, eventSequence: this.#eventSequence, generation: this.#generation, facts: this.#facts });
+				if (initialGuard === null) initialGuard = latch;
+				else this.#queueBoundary(latch);
+			}
 		}
 		// This opt-in guard also protects installation at already unsafe facts.
 		// Legacy watchers retain their rising-edge registration semantics.
@@ -314,6 +331,9 @@ export class ArenaScriptEngine {
 			// response. Other watchers may still escalate with their own reactions.
 			if (metadata.after === 'reconsider' && (this.#active?.authority?.watcherId === watcherId || this.#pendingResult?.authority?.watcherId === watcherId
 				|| this.#cancelling?.latch?.watcherId === watcherId)) continue;
+			// A receipt-only update can still trigger an authored time predicate.
+			// Fence its old decision before cancellation callbacks can accept a reply.
+			this.#fencePendingRequest();
 			const latch = freezeRecord({ watcherId, mode: metadata.mode, eventSequence: this.#eventSequence, generation: this.#generation, facts: this.#facts });
 			this.#emitTrace('watcher_fired', { watcherId, mode: latch.mode, eventSequence: this.#eventSequence, generation: this.#generation });
 			if (latch.mode === 'interrupt' && this.#active && !this.#cancelling) {
@@ -404,16 +424,20 @@ export class ArenaScriptEngine {
 			this.#factsSequence,
 			this.#facts,
 			pending.actionFailure ?? null,
-			{ priority: pending.priority, trigger: pending.trigger },
+			{ priority: pending.priority, trigger: pending.trigger, decisionContext: pending.decisionContext },
 		);
 	}
 	#refreshInstalledFacts(target) {
 		if (target.eventSequence < this.#eventSequence || target.factsSequence < this.#factsSequence) return this.snapshot();
-		const changedFactDomains = changedInterpreterFactDomains(this.#facts, target.facts);
+		const previousFacts = this.#facts;
+		const changedFactDomains = changedInterpreterFactDomains(previousFacts, target.facts);
+		const mayResume = this.#pendingResult && target.factsSequence >= this.#pendingResult.eventSequence;
 		this.#facts = target.facts; this.#factsSequence = target.factsSequence;
 		this.#eventSequence = target.eventSequence;
 		this.#program = freezeRecord({ ...this.#program, eventSequence: target.eventSequence, factsSequence: target.factsSequence });
-		this.#fencePendingRequest();
+		// Identity-preserving refreshes obey the same receipt/fact distinction as
+		// ordinary publications; quiet replay must not demand another model turn.
+		if (planningFactsChanged(previousFacts, target.facts, changedFactDomains) || mayResume) this.#fencePendingRequest();
 		if (!this.#isLive()) return this.snapshot();
 		this.#tryPendingReplacement();
 		this.#updateWatchers(changedFactDomains);
@@ -604,3 +628,13 @@ function watcherMetadata(compiled) {
 function freezeRecord(values) { return Object.freeze(Object.assign(Object.create(null), values)); }
 function normalizePriority(value) { return value === URGENT_PRIORITY ? URGENT_PRIORITY : ORDINARY_PRIORITY; }
 function normalizeTrigger(value) { return typeof value === 'string' && value.trim().length > 0 ? value.trim().slice(0, 128) : DEFAULT_ATTENTION_TRIGGER; }
+
+function planningFactsChanged(previous, next, changedDomains) {
+	if (changedDomains === 0) return false;
+	if (changedDomains !== FACT_DOMAIN.worldState) return true;
+	// Like the native observation signature, receipt sample time is not a world
+	// change. Keep it in facts and watcher evaluation; worldTick remains material.
+	const { observedAtEpochMs: previousReceipt, ...previousState } = previous.world.state;
+	const { observedAtEpochMs: nextReceipt, ...nextState } = next.world.state;
+	return !isDeepStrictEqual(previousState, nextState);
+}

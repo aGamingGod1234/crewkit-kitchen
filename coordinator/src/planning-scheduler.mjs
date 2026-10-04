@@ -95,8 +95,10 @@ export class AdaptiveAdmissionController {
 		if (this.#mode !== 'adaptive' || value === null || typeof value !== 'object') return this.snapshot();
 		const operation = typeof value.operation === 'string' ? value.operation : '';
 		const errorCode = normalizeErrorCode(value.errorCode ?? value.error?.code ?? null);
-		const pressureReason = PRESSURE_REASONS.get(errorCode);
-		if (operation !== 'decide') return this.snapshot();
+		const pressureReason = value.rateLimited === true ? 'provider_rate_limit' : PRESSURE_REASONS.get(errorCode);
+		// Native turns include game/tool waits. Admission uses outcomes and queued
+		// demand only, never their elapsed duration as provider latency.
+		if (operation !== 'decide' && operation !== 'native_turn') return this.snapshot();
 		if (pressureReason !== undefined) {
 			this.#healthyCompletions = 0;
 			this.#tickPressureSamples = 0;

@@ -927,7 +927,7 @@ function createParameterScope(parent, node, functionBinding) {
 	}
 	if (node.id?.type === 'Identifier' && functionBinding) {
 		rejectReservedBinding(node.id.name, node.id);
-		scope.bindings.set(node.id.name, functionBinding);
+		if (!scope.bindings.has(node.id.name)) scope.bindings.set(node.id.name, functionBinding);
 	}
 	return scope;
 }
@@ -960,6 +960,11 @@ function recordCallbackCalls(state, callNode, context, ...callbacks) {
 	for (const callback of callbacks) {
 		const binding = callbackBinding(state, callback, context.scope, context.functionNode);
 		state.functionCalls.push(Object.freeze({ binding, node: callNode, ownerFunctionNode: context.functionNode }));
+		if (context.functionBinding) {
+			let edges = state.functionEdges.get(context.functionBinding);
+			if (!edges) state.functionEdges.set(context.functionBinding, edges = new Map());
+			edges.set(binding, callNode);
+		}
 	}
 }
 

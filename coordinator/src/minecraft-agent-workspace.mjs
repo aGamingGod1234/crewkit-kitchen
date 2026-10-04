@@ -19,6 +19,7 @@ enabled = false
 
 export class MinecraftAgentWorkspace {
 	#refresh = Promise.resolve();
+	#preparationSignal = null;
 	#codexHomeSanitized = false;
 	#lastSyncedSourceAuthHash = undefined;
 
@@ -51,21 +52,41 @@ export class MinecraftAgentWorkspace {
 		};
 	}
 
-	prepare({ sourceCodexHome } = {}) {
+	prepare({ sourceCodexHome, signal } = {}) {
 		if (sourceCodexHome !== undefined && (typeof sourceCodexHome !== 'string' || sourceCodexHome.trim() === '')) {
 			throw new TypeError('sourceCodexHome must be a nonblank path when provided');
 		}
-		const refresh = this.#refresh.then(() => this.#prepare(sourceCodexHome));
+		const refresh = this.#refresh.then(async () => {
+			this.#preparationSignal = signal;
+			try {
+				signal?.throwIfAborted();
+				return await this.#prepare(sourceCodexHome);
+			} finally { this.#preparationSignal = null; }
+		});
 		this.#refresh = refresh.catch(() => {});
 		return refresh;
+	}
+
+	async #operation(method, ...args) {
+		const signal = this.#preparationSignal;
+		signal?.throwIfAborted();
+		const pending = this.fs[method](...args);
+		// Reads and recursive creation of these fixed directories can finish late
+		// without overwriting a successor. Keep file mutations serialized until
+		// the OS operation settles; aborting a Promise does not cancel a rename.
+		const result = signal && ['readFile', 'readdir', 'mkdir'].includes(method)
+			? await abandonablePreparationRead(pending, signal)
+			: await pending;
+		signal?.throwIfAborted();
+		return result;
 	}
 
 	async #prepare(sourceCodexHome) {
 		const workspaceRoot = path.join(this.root, 'workspace');
 		const skillRoot = path.join(workspaceRoot, '.codex', 'skills', 'minecraft-control');
-		await this.fs.mkdir(skillRoot, { recursive: true });
-		await this.fs.mkdir(this.codexHome, { recursive: true });
-		await this.fs.chmod(this.codexHome, 0o700);
+		await this.#operation('mkdir', skillRoot, { recursive: true });
+		await this.#operation('mkdir', this.codexHome, { recursive: true });
+		await this.#operation('chmod', this.codexHome, 0o700);
 		if (!this.#codexHomeSanitized) {
 			await this.#wipeNonAuthFiles();
 			const savedHash = (await this.#readOptionalAuth(path.join(this.root, '.auth-source.sha256')))?.trim();
@@ -82,7 +103,7 @@ export class MinecraftAgentWorkspace {
 		// without joining the always-loaded instructions or widening permissions.
 		const controlReference = await this.#readOptionalTemplate(CONTROL_REFERENCE_TEMPLATE);
 		if (controlReference !== null) {
-			await this.fs.mkdir(path.join(skillRoot, 'references'), { recursive: true });
+			await this.#operation('mkdir', path.join(skillRoot, 'references'), { recursive: true });
 			await this.#replace(CONTROL_REFERENCE_TEMPLATE, path.join(skillRoot, 'references', 'control-reference.md'), controlReference);
 		}
 		return {
@@ -99,14 +120,14 @@ export class MinecraftAgentWorkspace {
 	}
 
 	async #wipeNonAuthFiles() {
-		for (const entry of await this.fs.readdir(this.codexHome, { withFileTypes: true })) {
-			if (entry.name !== 'auth.json') await this.fs.rm(path.join(this.codexHome, entry.name), { recursive: true, force: true });
+		for (const entry of await this.#operation('readdir', this.codexHome, { withFileTypes: true })) {
+			if (entry.name !== 'auth.json') await this.#operation('rm', path.join(this.codexHome, entry.name), { recursive: true, force: true });
 		}
 	}
 
 	async #readOptionalAuth(authPath) {
 		try {
-			return await this.fs.readFile(authPath, 'utf8');
+			return await this.#operation('readFile', authPath, 'utf8');
 		} catch (error) {
 			if (error?.code !== 'ENOENT') throw error;
 			return null;
@@ -132,7 +153,7 @@ export class MinecraftAgentWorkspace {
 			return;
 		}
 		if (sourceContent == null) {
-			if (this.#lastSyncedSourceAuthHash !== undefined && isolatedHash === this.#lastSyncedSourceAuthHash) await this.fs.rm(destination, { force: true });
+			if (this.#lastSyncedSourceAuthHash !== undefined && isolatedHash === this.#lastSyncedSourceAuthHash) await this.#operation('rm', destination, { force: true });
 			await this.#rememberSourceAuthHash(null);
 			return;
 		}
@@ -159,7 +180,7 @@ export class MinecraftAgentWorkspace {
 	}
 
 	async #readTemplate(template) {
-		return this.fs.readFile(path.join(this.templateRoot, template), 'utf8');
+		return this.#operation('readFile', path.join(this.templateRoot, template), 'utf8');
 	}
 
 	async #readOptionalTemplate(template) {
@@ -178,7 +199,7 @@ export class MinecraftAgentWorkspace {
 
 	async #replaceContent(content, destination, mode) {
 		try {
-			if (await this.fs.readFile(destination, 'utf8') === content) return;
+			if (await this.#operation('readFile', destination, 'utf8') === content) return;
 		} catch (error) {
 			if (error?.code !== 'ENOENT') throw error;
 		}
@@ -188,20 +209,31 @@ export class MinecraftAgentWorkspace {
 		);
 		let replaced = false;
 		try {
-			await this.fs.writeFile(temporary, content, 'utf8');
-			await this.fs.chmod(temporary, mode);
+			await this.#operation('writeFile', temporary, content, 'utf8');
+			await this.#operation('chmod', temporary, mode);
 			try {
-				await this.fs.rename(temporary, destination);
+				await this.#operation('rename', temporary, destination);
 			} catch (error) {
 				if (!['EEXIST', 'EPERM'].includes(error?.code)) throw error;
-				await this.fs.rm(destination, { force: true });
-				await this.fs.rename(temporary, destination);
+				await this.#operation('rm', destination, { force: true });
+				await this.#operation('rename', temporary, destination);
 			}
 			replaced = true;
 		} finally {
 			if (!replaced) await this.fs.unlink(temporary).catch(() => {});
 		}
 	}
+}
+
+function abandonablePreparationRead(pending, signal) {
+	let abort;
+	return new Promise((resolve, reject) => {
+		abort = () => reject(signal.reason);
+		signal.addEventListener('abort', abort, { once: true });
+		// Observe eventual rejection even if the operating-system read outlives us.
+		Promise.resolve(pending).then(resolve, reject);
+		if (signal.aborted) abort();
+	}).finally(() => signal.removeEventListener('abort', abort));
 }
 
 function authHash(content) {

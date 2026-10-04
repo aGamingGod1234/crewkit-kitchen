@@ -531,6 +531,62 @@ class FetchMapSourceTests(unittest.TestCase):
             check=False,
         )
 
+    @unittest.skipUnless(os.name == "nt", "durable file identity uses Windows handles")
+    def test_interrupted_transport_recovers_only_original_partial(self) -> None:
+        payload = b"offline complete archive"
+        with isolated_fetch_repository("https://approved.invalid/archive", payload) as (repository, script):
+            wrapper = repository / "offline.ps1"
+            wrapper.write_text(r'''param([string]$Mode, [string]$Destination)
+$global:MapFixtureMode = $Mode
+function Invoke-WebRequest {
+    param([switch]$UseBasicParsing, [int]$MaximumRedirection, [uri]$Uri, [string]$OutFile)
+    if ($global:MapFixtureMode -eq 'sentinel') { throw 'TRANSPORT_UNEXPECTED' }
+    if ($global:MapFixtureMode -eq 'empty-kill') { [Diagnostics.Process]::GetCurrentProcess().Kill() }
+    $bytes = [Text.Encoding]::UTF8.GetBytes('offline complete archive')
+    if ($global:MapFixtureMode -eq 'kill') { $bytes = $bytes[0..6] }
+    [IO.File]::WriteAllBytes($OutFile, $bytes)
+    if ($global:MapFixtureMode -eq 'kill') { [Diagnostics.Process]::GetCurrentProcess().Kill() }
+    if ($global:MapFixtureMode -eq 'error') { throw 'EXPECTED_TRANSPORT_ERROR' }
+}
+& (Join-Path $PSScriptRoot 'scripts/maps/fetch_map_source.ps1') -SourceKey local-test -Destination $Destination | ConvertTo-Json
+''', encoding="utf-8")
+            def run(mode, destination):
+                return subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-File", str(wrapper),
+                                       "-Mode", mode, "-Destination", str(destination)],
+                                      cwd=repository, capture_output=True, text=True, timeout=20,
+                                      creationflags=subprocess.CREATE_NO_WINDOW)
+            for mode in ("kill", "empty-kill", "error"):
+                destination = repository / "runtime/map-research" / mode
+                stopped = run(mode, destination)
+                self.assertNotEqual(0, stopped.returncode)
+                if mode != "error":
+                    state = json.loads((destination / ".arenaagents-acquisition.journal.json").read_text())
+                    self.assertIsNone(state["archive"]["sha256"])
+                    self.assertRegex(state["archive"]["identity"], r"^[0-9a-f]{8}:[0-9a-f]{16}$")
+                    self.assertEqual(7 if mode == "kill" else 0,
+                                     (destination / state["archive"]["partial"]).stat().st_size)
+                recovered = run("success", destination)
+                self.assertEqual(0, recovered.returncode, recovered.stderr)
+                self.assertEqual(payload, (destination / "fixture.zip").read_bytes())
+                self.assertFalse((destination / ".arenaagents-acquisition.journal.json").exists())
+                reused = run("sentinel", destination)
+                self.assertEqual(0, reused.returncode, reused.stderr)
+                self.assertTrue(json.loads(reused.stdout)["reused"])
+            destination = repository / "runtime/map-research/replaced"
+            self.assertNotEqual(0, run("kill", destination).returncode)
+            journal_path = destination / ".arenaagents-acquisition.journal.json"
+            journal_bytes = journal_path.read_bytes()
+            journal = json.loads(journal_bytes.decode("utf-8-sig"))
+            partial = destination / journal["archive"]["partial"]
+            interrupted_bytes = partial.read_bytes()
+            partial.rename(destination / "retained-original.bin")
+            partial.write_bytes(interrupted_bytes)  # Same contents, different file identity.
+            rejected = run("sentinel", destination)
+            self.assertNotEqual(0, rejected.returncode)
+            self.assertNotIn("TRANSPORT_UNEXPECTED", rejected.stderr)
+            self.assertEqual(interrupted_bytes, partial.read_bytes())
+            self.assertEqual(journal_bytes, journal_path.read_bytes())
+
     def test_local_acquisition_publishes_pair_and_reuses_it(self) -> None:
         payload = b"local map archive"
         with LocalHttpSource(payload) as source:
@@ -1253,6 +1309,59 @@ class MapConversionTests(unittest.TestCase):
             catalog_path=self.catalog,
             ledger_path=self.ledger,
         )
+
+    def test_parent_output_paths_preserve_source_and_outside_target(self) -> None:
+        from scripts.maps.convert_map_module import convert_selection
+        payload = nbt_structure()
+        selection, output = self.write_case(payload)
+        sentinel = self.root / "outside.json"
+        sentinel.write_bytes(b"preserve")
+        for target, base in (
+            (self.output_root / ".." / "source" / "room.nbt", self.output_root),
+            (self.output_root / ".." / "source" / "room.nbt", self.output_root / ".." / "source"),
+            (self.output_root / ".." / "outside.json", self.output_root),
+        ):
+            with self.subTest(target=target, base=base):
+                with self.assertRaises(ValueError):
+                    convert_selection(selection, self.source, target, repository_root=self.root,
+                                      output_root=base, catalog_path=self.catalog, ledger_path=self.ledger)
+                self.assertEqual(payload, (self.source / "room.nbt").read_bytes())
+                self.assertEqual(b"preserve", sentinel.read_bytes())
+        self.convert(selection, output)
+        self.assertEqual(payload, (self.source / "room.nbt").read_bytes())
+
+    def test_inspector_bounds_initial_read_and_hashes_exact_bytes(self) -> None:
+        from scripts.maps.inspect_map_source import inspect_structure
+        from scripts.maps.nbt_reader import NbtLimits, NbtError
+        target = self.source / "oversize.nbt"
+        limit = NbtLimits().max_compressed_bytes
+        with target.open("wb") as stream:
+            stream.truncate(limit + 1024)
+        real_open = Path.open
+        reads = []
+        class Recorder:
+            def __init__(self, handle):
+                self.handle = handle
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                self.handle.close()
+            def read(self, size=-1):
+                data = self.handle.read(size)
+                reads.append((size, len(data)))
+                return data
+        def traced_open(path, *args, **kwargs):
+            handle = real_open(path, *args, **kwargs)
+            return Recorder(handle) if path == target else handle
+        with mock.patch.object(Path, "open", traced_open):
+            with self.assertRaises(NbtError):
+                inspect_structure(target)
+        self.assertEqual([(limit + 1, limit + 1)], reads)
+        for payload in (nbt_structure(), gzip.compress(nbt_structure(), mtime=0)):
+            target.write_bytes(payload)
+            result = inspect_structure(target)
+            self.assertEqual(hashlib.sha256(payload).hexdigest(), result["sha256"])
+            self.assertEqual(1, result["blockCount"])
 
     def test_converts_to_canonical_block_only_json_and_verifies_hash(self) -> None:
         payload = nbt_structure(

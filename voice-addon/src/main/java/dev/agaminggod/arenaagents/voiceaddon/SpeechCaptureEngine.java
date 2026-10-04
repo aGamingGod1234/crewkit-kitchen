@@ -464,6 +464,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 			Throwable failure
 	) {
 		Map<UUID, List<TranscriptOutcome>> readyByPlayer = new LinkedHashMap<>();
+		List<CompletedUtterance> discarded = new ArrayList<>();
 		InputActivity.Phase terminalPhase = failure != null
 				? InputActivity.Phase.FAILED
 				: transcript == null || transcript.text().isBlank()
@@ -479,18 +480,11 @@ final class SpeechCaptureEngine implements AutoCloseable {
 				sttRetryAfterNanos = Math.max(sttRetryAfterNanos, retryAfterNanos);
 				playerSttRetryAfterNanos.clear();
 				recordOutcomeLocked(utterance, null, readyByPlayer);
-				for (Utterance active : utterances.values()) {
-					if (active.timeout != null) active.timeout.cancel(false);
-					try {
-						active.decoder.close();
-					} catch (RuntimeException ignored) {
-					}
-					recordOutcomeLocked(new CompletedUtterance(
-							active.playerId, active.sequence, active.whispering, active.playerGeneration, new short[0],
-							active.deliveryExecutor, active.delivery, active.lastPacketNanos, monotonicNanos.getAsLong()
-					), null, readyByPlayer);
+				for (Utterance active : List.copyOf(utterances.values())) {
+					CompletedUtterance dropped = discardLocked(active.playerId, active);
+					discarded.add(dropped);
+					recordOutcomeLocked(dropped, null, readyByPlayer);
 				}
-				utterances.clear();
 			} else if (retryBackoffNanos > 0L) {
 				long now = monotonicNanos.getAsLong();
 				long retryAfter = now > Long.MAX_VALUE - retryBackoffNanos
@@ -498,12 +492,18 @@ final class SpeechCaptureEngine implements AutoCloseable {
 				playerSttRetryAfterNanos.put(utterance.playerId, retryAfter);
 				recordOutcomeLocked(utterance, null, readyByPlayer);
 				Utterance active = utterances.get(utterance.playerId);
-				if (active != null) recordOutcomeLocked(discardLocked(active.playerId, active), null, readyByPlayer);
+				if (active != null) {
+					CompletedUtterance dropped = discardLocked(active.playerId, active);
+					discarded.add(dropped);
+					recordOutcomeLocked(dropped, null, readyByPlayer);
+				}
 			} else {
 				recordOutcomeLocked(utterance, failure == null ? transcript : null, readyByPlayer);
 			}
 		}
 		reportActivity(utterance, terminalPhase);
+		// Each discarded sequence owns an adapter context, even though it never reached STT.
+		for (CompletedUtterance dropped : discarded) reportActivity(dropped, InputActivity.Phase.FAILED);
 		for (List<TranscriptOutcome> ready : readyByPlayer.values()) {
 			try {
 				ready.getFirst().utterance.deliveryExecutor.execute(() -> {
@@ -543,7 +543,9 @@ final class SpeechCaptureEngine implements AutoCloseable {
 			Map<UUID, List<TranscriptOutcome>> readyByPlayer
 	) {
 		TranscriptQueue queue = transcriptQueues.computeIfAbsent(utterance.playerId, ignored -> new TranscriptQueue());
-		queue.completed.put(utterance.sequence, new TranscriptOutcome(utterance, transcript));
+		// Skipped sequences advance ordering, but must not retain discarded PCM or delivery context.
+		boolean deliverable = transcript != null && !transcript.text().isBlank();
+		queue.completed.put(utterance.sequence, new TranscriptOutcome(deliverable ? utterance : null, transcript));
 		while (true) {
 			TranscriptOutcome outcome = queue.completed.remove(queue.nextSequence);
 			if (outcome == null) break;

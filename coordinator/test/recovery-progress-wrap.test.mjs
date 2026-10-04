@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { RecoveryProgressStore } from '../src/recovery-progress-wrap.mjs';
+import { NativeToolRuntime } from '../src/native-tool-runtime.mjs';
 
 const DEATH = {
 	cause: 'Lucas fell from a high place',
@@ -307,4 +308,71 @@ test('empty conversation placeholders do not wipe live inventory memory', () => 
 		{ itemId: 'minecraft:cobblestone', count: 12 },
 	]);
 	assert.ok(dead.alreadyHave.includes('minecraft:crafting_table'));
+});
+
+const diamonds = (count) => ({ player: { dead: false }, inventory: { items: count ? [{ itemId: 'minecraft:diamond', count }] : [] } });
+
+test('repeated snapshots reconcile only new inventory gains, including gains after spending items', () => {
+	const store = new RecoveryProgressStore();
+	store.remember('a', 1, diamonds(6));
+	store.remember('a', 1, { death: DEATH });
+	for (const [held, lost] of [[2, 4], [2, 4], [3, 3], [1, 3], [2, 2], [2, 2]]) {
+		const snapshot = store.remember('a', 1, diamonds(held));
+		assert.deepEqual(snapshot.lastLostInventory, [{ itemId: 'minecraft:diamond', count: lost }]);
+		assert.deepEqual(store.wrap('a', 1, diamonds(held)).recovery.lastLostInventory, snapshot.lastLostInventory);
+	}
+	store.remember('a', 1, { player: { x: 7 } });
+	assert.deepEqual(store.remember('a', 1, diamonds(2)).lastLostInventory, [{ itemId: 'minecraft:diamond', count: 2 }]);
+	store.remember('a', 1, { death: DEATH, lastLiveInventory: diamonds(6).inventory });
+	assert.deepEqual(store.remember('a', 1, diamonds(2)).lastLostInventory, [{ itemId: 'minecraft:diamond', count: 2 }], 'duplicate death delivery cannot reset recovery');
+	const second = store.remember('a', 1, { death: { ...DEATH, dimensionId: 'minecraft:the_nether', diedAtEpochMs: DEATH.diedAtEpochMs + 1 } });
+	assert.deepEqual(second.lastLostInventory, [{ itemId: 'minecraft:diamond', count: 2 }]);
+	assert.equal(second.lastDeath.dimensionId, 'minecraft:the_nether');
+	assert.equal(store.remember('a', 1, diamonds(2)).lastLostInventory, undefined);
+});
+
+test('native update and repeated decoration cannot recover the same held diamond twice', async () => {
+	const runtime = new NativeToolRuntime({ bridge: { send() { throw new Error('No bridge commands expected'); } } });
+	const record = { agentId: 'a', goalRevision: 1, provider: 'fixture', model: 'fixture', reasoningEffort: 'high' };
+	try {
+		runtime.updateObservation(record, diamonds(3), { eventSequence: 1 });
+		runtime.updateObservation(record, { death: DEATH }, { eventSequence: 2 });
+		runtime.updateObservation(record, diamonds(1), { eventSequence: 3 });
+		for (let index = 0; index < 3; index += 1) {
+			const decorated = runtime.decorateObservation(record, diamonds(1));
+			assert.deepEqual(decorated.recovery.lastLostInventory, [{ itemId: 'minecraft:diamond', count: 2 }]);
+		}
+	} finally { await runtime.dispose('a', 'agent_removed'); }
+});
+
+test('all inventory slots and duplicate stack counts survive death and slot rearrangement', () => {
+	const store = new RecoveryProgressStore();
+	const filler = Array.from({ length: 35 }, (_, index) => ({ itemId: `fixture:item_${index}`, count: 1 }));
+	store.remember('a', 1, { inventory: { items: [...filler, { itemId: 'minecraft:diamond', count: 4 }, { itemId: 'minecraft:diamond', count: 3 }, { itemId: 'minecraft:air', count: 1 }, { itemId: 'minecraft:stone', count: 0 }] } });
+	const dead = store.remember('a', 1, { death: DEATH });
+	assert.equal(dead.lastLostInventory.length, 36);
+	assert.deepEqual(dead.lastLostInventory.at(-1), { itemId: 'minecraft:diamond', count: 7 });
+	store.remember('a', 1, { inventory: { items: [{ itemId: 'minecraft:diamond', count: 1 }, { itemId: 'minecraft:diamond', count: 2 }] } });
+	const rearranged = store.remember('a', 1, diamonds(3));
+	assert.deepEqual(rearranged.lastLostInventory.at(-1), { itemId: 'minecraft:diamond', count: 4 });
+	assert.deepEqual(rearranged.alreadyHaveFacts.find((entry) => entry.itemId === 'minecraft:diamond'), { kind: 'inventory', itemId: 'minecraft:diamond', count: 3 });
+});
+
+test('only explicit contradictory blocks in the same world and dimension invalidate stations', () => {
+	const store = new RecoveryProgressStore();
+	const station = { blockId: 'minecraft:crafting_table', x: 4, y: 64, z: 4 };
+	const observe = (worldId, dimension, blocks) => ({ world: { worldId, dimension }, blocks });
+	store.remember('a', 1, observe('one', 'minecraft:overworld', [station]));
+	const absent = store.remember('a', 1, observe('one', 'minecraft:overworld', []));
+	assert.equal(absent.alreadyHaveFacts[0].remembered, true);
+	const replacement = { ...station, blockId: 'minecraft:stone' };
+	assert.equal(store.remember('a', 1, observe('two', 'minecraft:overworld', [replacement])), null);
+	assert.equal(store.remember('a', 1, observe('one', 'minecraft:the_nether', [replacement])), null);
+	assert.equal(store.snapshot('a', observe('one', 'minecraft:overworld', [])).alreadyHaveFacts[0].worldId, 'one');
+	assert.equal(store.remember('a', 1, { ...observe('one', 'minecraft:overworld', [replacement]), continuity: { rememberedSections: ['blocks'] } }).alreadyHaveFacts[0].remembered, true);
+	assert.equal(store.remember('a', 1, observe('one', 'minecraft:overworld', [replacement])), null);
+	assert.equal(store.snapshot('a', observe('one', 'minecraft:overworld', [])), null);
+	store.remember('a', 1, observe('one', 'minecraft:overworld', [station]));
+	const changed = store.remember('a', 1, observe('one', 'minecraft:overworld', [{ ...station, blockId: 'minecraft:furnace' }]));
+	assert.deepEqual(changed.alreadyHave, ['minecraft:furnace']);
 });

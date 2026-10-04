@@ -84,6 +84,18 @@ public final class MultiplexedServerBridgeVerification {
 	public static void main(String[] args) {
 		net.minecraft.SharedConstants.tryDetectVersion();
 		net.minecraft.server.Bootstrap.bootStrap();
+		if (args.length == 1 && "registry-framing-local".equals(args[0])) {
+			verifyRegistryFramingLocal();
+			verifyObservationWriterRacesSessionClose();
+			System.out.println("MultiplexedServerBridgeVerification registry-framing-local passed");
+			return;
+		}
+		if (args.length == 1 && "observation-close-local".equals(args[0])) {
+			verifyObservationWriterRacesSessionClose();
+			verifyObservationPublicationLifecycle(AgentId.parse("00000000-0000-0000-0000-000000000001"));
+			System.out.println("MultiplexedServerBridgeVerification observation-close-local passed");
+			return;
+		}
 		if (args.length == 1 && "preauth-overflow".equals(args[0])) {
 			verifyPreauthOverflowPreservesIncumbentHandshake();
 			System.out.println("MultiplexedServerBridgeVerification preauth-overflow assertions=14");
@@ -93,6 +105,8 @@ public final class MultiplexedServerBridgeVerification {
 	}
 
 	public static int verify() {
+		verifyBufferedResponsePolling();
+		verifyGoalSummaryWireBoundaries();
 		verifyPendingRegistrationBoundary();
 		verifyRemovalBackpressureForcesReconciliation();
 		verifyHandshakeWaitsForPendingMarker();
@@ -178,6 +192,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyInspectionPublication(registered.getFirst().agentId());
 		verifyInspectionWireBudget(registered.getFirst().agentId());
 		verifyEmptyCatalogRequestsLiveDiscovery();
+		verifyRegistryFramingLocal();
 		verifyRealBridgeSessionLifecycle();
 		verifyPreauthOverflowPreservesIncumbentHandshake();
 		verifyAtomicConversationWakePublication();
@@ -196,7 +211,8 @@ public final class MultiplexedServerBridgeVerification {
 		verifyImmediateHandshakeClosePreservesDisconnect();
 		verifyPendingRegistrationMarkerIsFenced();
 		verifyAtomicPublicationRacesSessionClose();
-		return 307;
+		verifyObservationWriterRacesSessionClose();
+		return 368;
 	}
 
 	@SuppressWarnings("unchecked")
@@ -674,6 +690,59 @@ public final class MultiplexedServerBridgeVerification {
 		}
 	}
 
+	private static void verifyGoalSummaryWireBoundaries() {
+		CodexAgentManager manager = uninitializedManager();
+		AgentRecord idle = manager.registry().create("gpt-5.6-sol", "high", Optional.of("Summary"), 1_000L);
+		UUID requestId = UUID.fromString("00000000-0000-0000-0000-000000000331");
+		manager.stageGoalDraft(new PendingGoalDraft(requestId, idle.agentId(), UUID.randomUUID(),
+				"Explore until I confirm", List.of(), Optional.empty(), DraftIntent.CONFIRM_TRANSLATION,
+				1_001L, idle.goalRevision(), Optional.empty()));
+		String secret = "0123456789abcdef0123456789abcdef";
+		try (MultiplexedServerBridge bridge = MultiplexedServerBridge.withPreparedSecret(manager, 0, secret)) {
+			bridge.start();
+			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+					BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+				socket.setSoTimeout(2_000);
+				BridgeEnvelope hello = authenticate(socket, reader, codec, secret, "hello-summary-boundary");
+				assertEquals("goal_spec_request", pollBridgeResponse(bridge, socket, reader, codec).type(), "pending draft is replayed");
+				// Correlation must survive invalid summaries after a usable request ID is read.
+				for (int invalidCase = 0; invalidCase < 6; invalidCase++) {
+					JsonObject invalid = goalSpecProposal(requestId, new GoalPredicate.OperatorConfirmed());
+					switch (invalidCase) {
+						case 0 -> invalid.addProperty("summary", " ");
+						case 1 -> invalid.addProperty("summary", "x".repeat(513));
+						case 2 -> invalid.addProperty("summary", true);
+						case 3 -> invalid.add("summary", com.google.gson.JsonNull.INSTANCE);
+						case 4 -> invalid.remove("summary");
+						case 5 -> invalid.addProperty("unexpected", "field");
+					}
+					writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
+							"goal_spec_proposal", "invalid-summary-" + invalidCase, invalid));
+					BridgeEnvelope result = pollBridgeResponseOfType(bridge, socket, reader, codec, "goal_spec_result", null);
+					assertEquals(requestId.toString(), result.payload().get("requestId").getAsString(), "invalid summary rejection retains request correlation");
+					assertEquals("rejected", result.payload().get("status").getAsString(), "invalid summary is rejected");
+					assertEquals(invalidCase < 4 ? "INVALID_GOAL_SPEC_SUMMARY" : "INVALID_FIELD",
+							result.payload().get("reasonCode").getAsString(), "invalid summary reason is actionable");
+					assertTrue(manager.goalDraft(requestId).orElseThrow().proposedPredicate().isEmpty(), "invalid summaries cannot stage a predicate");
+				}
+
+				for (int summaryLength : List.of(256, 257, 300, 512)) {
+					JsonObject boundary = goalSpecProposal(requestId, new GoalPredicate.OperatorConfirmed());
+					boundary.addProperty("summary", "x".repeat(summaryLength));
+					writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
+							"goal_spec_proposal", "summary-boundary-" + summaryLength, boundary));
+					BridgeEnvelope result = pollBridgeResponseOfType(bridge, socket, reader, codec, "goal_spec_result", null);
+					assertEquals(requestId.toString(), result.payload().get("requestId").getAsString(), "valid summary retains request correlation");
+					assertEquals("accepted", result.payload().get("status").getAsString(), "summary wire boundary " + summaryLength + " is accepted");
+				}
+
+			}
+		} catch (Exception exception) {
+			throw new AssertionError("goal summary wire boundary regression", exception);
+		}
+	}
+
 	private static void verifyGoalSpecProposalLifecycle() {
 		MultiplexedServerBridge bridge = null;
 		Path secretFile = null;
@@ -734,14 +803,14 @@ public final class MultiplexedServerBridgeVerification {
 
 				GoalPredicate compoundOverflow = new GoalPredicate.AllOf(List.of(
 						new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 20),
-						new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 18)
+						new GoalPredicate.InventoryContains("minecraft:diamond_pickaxe", 18)
 				));
 				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
 						"goal_spec_proposal", "proposal-compound-overflow", goalSpecProposal(requestId, compoundOverflow)));
 				BridgeEnvelope compoundRejected = pollBridgeResponseOfType(
 						bridge, socket, reader, codec, "goal_spec_result", null);
 				assertEquals("rejected", compoundRejected.payload().get("status").getAsString(),
-						"translated duplicate inventory requirements are summed before validation");
+						"translated distinct inventory requirements share the finite carrying capacity");
 				assertEquals("INVALID_GOAL_PREDICATE", compoundRejected.payload().get("reasonCode").getAsString(),
 						"compound translated capacity overflow reports a correctable predicate error");
 				assertTrue(manager.goalDraft(requestId).orElseThrow().proposedPredicate().isEmpty(),
@@ -2635,6 +2704,159 @@ public final class MultiplexedServerBridgeVerification {
 		}
 	}
 
+	/** Real domain records, handshake queue and writer, using only an in-memory unconnected socket. */
+	private static void verifyRegistryFramingLocal() {
+		try {
+			var registry = dev.agaminggod.arenaagents.agent.AgentRegistry.createDefault(() -> { }, ignored -> { });
+			AgentRecord idle = registry.create("codex", "gpt-5.6-sol", "high", "priority", Optional.of("Framing"),
+					dev.agaminggod.arenaagents.agent.AgentGameMode.SURVIVAL, 1L);
+			String prompt = "\u63a1\u96c6\ud83e\udeb5".repeat(1024);
+			GoalSpec goal = GoalSpec.create(prompt, new GoalPredicate.InventoryContains("minecraft:oak_log", 1), 1L);
+			registry.start(idle.agentId(), goal, 2L);
+			for (int index = 0; index < 32; index++) registry.queue(idle.agentId(), goal, index + 3L);
+			var registered = MultiplexedServerBridge.class.getDeclaredMethod("registeredPayload", AgentRecord.class);
+			registered.setAccessible(true);
+			JsonObject record = (JsonObject) registered.invoke(null, registry.require(idle.agentId()));
+			JsonObject payload = new JsonObject();
+			payload.addProperty("replyTo", "coordinator-hello");
+			payload.addProperty("authenticated", true);
+			JsonArray entries = new JsonArray(); entries.add(record); payload.add("registry", entries);
+			BridgeEnvelope ack = new BridgeEnvelope(2, "server-framing", "server", "hello_ack", "snapshot-1", payload);
+			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+			assertThrowsBridgeCode(() -> codec.publicationBytes(ack, false), "REGISTRY_FRAGMENT_CAPABILITY_REQUIRED", "legacy oversized snapshot fails with a capability error");
+			assertTrue(codec.publicationBytes(ack, true) > BridgeEnvelopeCodec.MAX_LINE_BYTES, "legal default goal queue exceeds a single line");
+			assertTrue(ack.encodedFrame() == null, "preflight does not allocate or cache the entire oversized registry wire frame");
+			Object[] holder = new Object[1];
+			java.io.ByteArrayOutputStream wire = new java.io.ByteArrayOutputStream() {
+				@Override public void flush() {
+					try { ((AutoCloseable) holder[0]).close(); } catch (Exception exception) { throw new AssertionError(exception); }
+				}
+			};
+			Socket socket = new Socket() {
+				@Override public java.io.OutputStream getOutputStream() { return wire; }
+			};
+			MultiplexedServerBridge bridge = MultiplexedServerBridge.withPreparedSecret(uninitializedManager(), 0, "0123456789abcdef0123456789abcdef");
+			Class<?> sessionClass = Class.forName(MultiplexedServerBridge.class.getName() + "$Session");
+			var constructor = sessionClass.getDeclaredConstructor(MultiplexedServerBridge.class, Socket.class);
+			constructor.setAccessible(true);
+			Object session = constructor.newInstance(bridge, socket); holder[0] = session;
+			Field capability = sessionClass.getDeclaredField("registryFragments"); capability.setAccessible(true); capability.set(session, true);
+			JsonObject headerPayload = payload.deepCopy(); headerPayload.add("registry", new JsonArray());
+			BridgeEnvelope header = new BridgeEnvelope(2, "server-framing", "server", "hello_ack", ack.messageId(), headerPayload);
+			Method complete = sessionClass.getDeclaredMethod("completeHandshake", List.class, String.class, long.class, List.class); complete.setAccessible(true);
+			complete.invoke(session, List.of(header), null, 1L, List.of(registry.require(idle.agentId())));
+			assertTrue((long) readPrivateField(session, "queuedBytes") < BridgeEnvelopeCodec.MAX_LINE_BYTES, "lazy snapshot charges only the small header and retains immutable record references");
+			Method writer = sessionClass.getDeclaredMethod("writeLoop"); writer.setAccessible(true); writer.invoke(session);
+			String[] lines = wire.toString(StandardCharsets.UTF_8).strip().split("\n");
+			BridgeEnvelope begin = codec.decode(lines[0]);
+			assertEquals(1, begin.payload().get("registryCount").getAsInt(), "oversized registry begins with its exact bounded count");
+			assertEquals(0, begin.payload().getAsJsonArray("registry").size(), "begin cannot expose a partial registry");
+			java.io.ByteArrayOutputStream assembled = new java.io.ByteArrayOutputStream();
+			for (int index = 1; index < lines.length - 1; index++) {
+				assertTrue(lines[index].getBytes(StandardCharsets.UTF_8).length <= BridgeEnvelopeCodec.MAX_LINE_BYTES, "every fragment remains inside the existing line bound");
+				BridgeEnvelope fragment = codec.decode(lines[index]);
+				assertEquals("registry_fragment", fragment.type(), "large per-agent entry is itself fragmented");
+				assertEquals(index - 1, fragment.payload().get("index").getAsInt(), "fragment indices are contiguous");
+				assembled.write(Base64.getDecoder().decode(fragment.payload().get("data").getAsString()));
+			}
+			JsonObject rebuilt = com.google.gson.JsonParser.parseString(assembled.toString(StandardCharsets.UTF_8)).getAsJsonObject();
+			assertEquals(record, rebuilt, "production registered payload survives the production writer exactly");
+			BridgeEnvelope end = codec.decode(lines[lines.length - 1]);
+			assertEquals("registry_complete", end.type(), "explicit completion follows all entry bytes");
+			assertEquals(ack.messageId(), end.payload().get("replyTo").getAsString(), "completion binds the exact snapshot");
+			assertTrue(ack.encodedFrame() == null, "streaming does not cache a giant hello frame");
+			assertEquals(0L, readPrivateField(session, "queuedBytes"), "teardown releases the logical byte charge");
+			@SuppressWarnings("unchecked") var queue = (java.util.concurrent.ArrayBlockingQueue<BridgeEnvelope>) readPrivateField(session, "outbound");
+			assertTrue(queue.isEmpty(), "teardown releases unsent logical publications");
+			// The same delivery mechanism covers creation/update, not only reconnect hello.
+			java.io.ByteArrayOutputStream live = new java.io.ByteArrayOutputStream();
+			java.util.concurrent.atomic.AtomicLong ids = new java.util.concurrent.atomic.AtomicLong();
+			codec.writePublication(new BridgeEnvelope(2, "server-framing", idle.agentId().toString(), "agent_registered", "live-1", record),
+					true, () -> "live-part-" + ids.incrementAndGet(), live);
+			assertTrue(live.toString(StandardCharsets.UTF_8).contains("registry_fragment"), "large live registration uses the same bounded writer");
+			JsonObject small = new JsonObject(); small.addProperty("replyTo", "hello"); small.addProperty("authenticated", true); small.add("registry", new JsonArray());
+			BridgeEnvelope legacy = new BridgeEnvelope(2, "server-framing", "server", "hello_ack", "small-1", small);
+			java.io.ByteArrayOutputStream legacyWire = new java.io.ByteArrayOutputStream();
+			codec.writePublication(legacy, true, () -> "unused", legacyWire);
+			assertEquals(codec.encode(legacy), legacyWire.toString(StandardCharsets.UTF_8), "small negotiated hello remains byte-compatible");
+			bridge.close();
+		} catch (Exception exception) {
+			throw new AssertionError("local registry framing verification failed", exception);
+		}
+	}
+
+	/** Exercises the production writer without opening a listener or connecting a socket. */
+	private static void verifyObservationWriterRacesSessionClose() {
+		CountDownLatch writerCheckedSession = new CountDownLatch(1);
+		CountDownLatch releaseWriter = new CountDownLatch(1);
+		try {
+			MultiplexedServerBridge bridge = MultiplexedServerBridge.withPreparedSecret(
+					uninitializedManager(), 0, "0123456789abcdef0123456789abcdef");
+			Class<?> sessionClass = Class.forName(MultiplexedServerBridge.class.getName() + "$Session");
+			var constructor = sessionClass.getDeclaredConstructor(MultiplexedServerBridge.class, Socket.class);
+			constructor.setAccessible(true);
+			ShutdownRaceSocket socket = new ShutdownRaceSocket();
+			Object session = constructor.newInstance(bridge, socket);
+			((AtomicBoolean) readPrivateField(session, "authenticated")).set(true);
+			Field sessionField = MultiplexedServerBridge.class.getDeclaredField("session");
+			sessionField.setAccessible(true);
+			sessionField.set(bridge, session);
+			var publication = bridge.observationPublicationForVerification();
+			MultiplexedServerBridge.onSessionAccepted(publication, session);
+			Method writer = MultiplexedServerBridge.class.getDeclaredMethod(
+					"sendObservationEnvelope", sessionClass, AgentId.class, JsonObject.class);
+			writer.setAccessible(true);
+			bridge.setObservationEnqueueHookForVerification(() -> {
+				writerCheckedSession.countDown();
+				awaitLatch(releaseWriter, "release observation writer after session check");
+			});
+			AgentId agent = AgentId.parse("00000000-0000-0000-0000-000000000001");
+			var failure = new java.util.concurrent.atomic.AtomicReference<Throwable>();
+			var result = new java.util.concurrent.atomic.AtomicReference<MultiplexedServerBridge.ObservationPublication.Result>();
+			Thread publisher = Thread.ofPlatform().daemon().name("observation-close-local-publisher").start(() -> {
+				try {
+					result.set(publication.publish(agent, session, observation(agent.toString(), 1_000L), (id, payload) -> {
+						try {
+							boolean accepted = (boolean) writer.invoke(bridge, session, id, payload);
+							@SuppressWarnings("unchecked") var pending = (java.util.concurrent.ArrayBlockingQueue<BridgeEnvelope>) readPrivateField(session, "outbound");
+							assertEquals(1, pending.size(), "actual writer enqueues exactly one observation before close");
+							assertEquals("observation", pending.peek().type(), "queued frame is the production observation envelope");
+							return accepted;
+						} catch (ReflectiveOperationException exception) {
+							throw new AssertionError("production observation writer failed", exception);
+						}
+					}));
+				} catch (Throwable exception) {
+					failure.set(exception);
+				}
+			});
+			awaitLatch(writerCheckedSession, "production writer passed the session/open check");
+			Thread closer = Thread.ofPlatform().daemon().name("observation-close-local-closer")
+					.start(() -> sessionClose(session, failure));
+			// A blocked closer proves teardown is contending inside the writer's critical window.
+			awaitCondition(() -> closer.getState() == Thread.State.BLOCKED, "close contends with the in-flight writer");
+			releaseWriter.countDown();
+			publisher.join(2_000L);
+			closer.join(2_000L);
+			assertTrue(!publisher.isAlive() && !closer.isAlive(), "observation writer and close finish without lock inversion");
+			if (failure.get() != null) throw new AssertionError("observation/close worker failed", failure.get());
+			assertEquals(MultiplexedServerBridge.ObservationPublication.Result.COMMITTED, result.get(),
+					"in-flight observation commits before close can clear its baseline");
+			@SuppressWarnings("unchecked")
+			var outbound = (java.util.concurrent.ArrayBlockingQueue<BridgeEnvelope>) readPrivateField(session, "outbound");
+			assertEquals(0, outbound.size(), "close releases queued publications after the actual writer commits");
+			assertEquals(0L, readPrivateField(session, "queuedBytes"), "close releases queued publication byte accounting");
+			assertEquals(0, publication.retainedCount(), "close clears the committed baseline without a late resurrection");
+			assertTrue(!publication.hasActiveSession() && socket.isClosed(), "close clears session ownership and releases transport");
+			assertTrue(bridge.coordinatorDisconnectPendingForVerification(), "close schedules authenticated disconnect recovery");
+			bridge.close();
+		} catch (Exception exception) {
+			throw new AssertionError("local observation writer/session close verification failed", exception);
+		} finally {
+			releaseWriter.countDown();
+		}
+	}
+
 	private static void verifyAtomicPublicationRacesSessionClose() {
 		MultiplexedServerBridge bridge = null;
 		Path secretFile = null;
@@ -3380,19 +3602,86 @@ public final class MultiplexedServerBridgeVerification {
 				.count();
 	}
 
-	private static BridgeEnvelope pollBridgeResponse(
+	/** Both helper entrypoints must consume complete lines already held by the reader. */
+	static void verifyBufferedResponsePolling() {
+		try (MultiplexedServerBridge bridge = MultiplexedServerBridge.withPreparedSecret(
+				uninitializedManager(), 0, "0123456789abcdef0123456789abcdef")) {
+			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+			String first = codec.encode(new BridgeEnvelope(2, "fixture", "server", "heartbeat", "first", new JsonObject()));
+			String second = codec.encode(new BridgeEnvelope(2, "fixture", "server", "heartbeat", "second", new JsonObject()));
+			for (Class<?> owner : List.of(MultiplexedServerBridgeVerification.class, AgentVerboseVerification.class)) {
+				Method helper = owner.getDeclaredMethod("pollBridgeResponse", MultiplexedServerBridge.class,
+						Socket.class, BufferedReader.class, BridgeEnvelopeCodec.class);
+				helper.setAccessible(true);
+				var raw = new java.io.ByteArrayInputStream((first + second).getBytes(StandardCharsets.UTF_8));
+				try (Socket socket = new Socket() {
+					@Override public java.io.InputStream getInputStream() { return raw; }
+				}) {
+					socket.setSoTimeout(1234);
+					try (BufferedReader reader = new BufferedReader(new InputStreamReader(raw, StandardCharsets.UTF_8))) {
+						assertEquals("first", ((BridgeEnvelope) helper.invoke(null, bridge, socket, reader, codec)).messageId(), "first coalesced frame");
+						assertEquals(0, raw.available(), "raw input drained by reader prefetch");
+						assertTrue(reader.ready(), "complete second frame is reader-buffered");
+						assertEquals("second", ((BridgeEnvelope) helper.invoke(null, bridge, socket, reader, codec)).messageId(), "buffered frame needs no further traffic");
+						assertEquals(1234, socket.getSoTimeout(), "helper preserves caller socket timeout");
+					}
+					try (BufferedReader reader = new BufferedReader(new java.io.StringReader(second))) {
+						assertEquals("second", ((BridgeEnvelope) helper.invoke(null, bridge, socket, reader, codec)).messageId(), "separate frame control");
+					}
+				}
+			}
+			for (String incomplete : List.of("", first.substring(0, first.length() - 1))) {
+				try (Socket socket = new Socket(); BufferedReader reader = new BufferedReader(new InputStreamReader(new java.io.ByteArrayInputStream(incomplete.getBytes(StandardCharsets.UTF_8)), StandardCharsets.UTF_8))) {
+					socket.setSoTimeout(1234);
+					long started = System.nanoTime();
+					assertThrows(AssertionError.class, () -> {
+						try { pollBridgeResponse(bridge, socket, reader, codec, started + TimeUnit.MILLISECONDS.toNanos(30)); }
+						catch (Exception exception) { throw new RuntimeException(exception); }
+					}, "absent or unterminated frame cannot be decoded as complete");
+					assertTrue(System.nanoTime() - started >= TimeUnit.MILLISECONDS.toNanos(25)
+							&& System.nanoTime() - started < TimeUnit.SECONDS.toNanos(1), "partial-frame wait respects overall deadline");
+					assertEquals(1234, socket.getSoTimeout(), "timeout path restores caller socket timeout");
+				}
+			}
+		} catch (Exception exception) {
+			throw new AssertionError("buffered response polling regression", exception);
+		}
+	}
+
+	static BridgeEnvelope pollBridgeResponse(
 			MultiplexedServerBridge bridge,
 			Socket socket,
 			BufferedReader reader,
 			BridgeEnvelopeCodec codec
 	) throws Exception {
-		long deadline = System.nanoTime() + 2_000_000_000L;
-		while (System.nanoTime() < deadline) {
-			bridge.tick();
-			if (socket.getInputStream().available() > 0) return codec.decode(reader.readLine());
-			Thread.sleep(5L);
+		return pollBridgeResponse(bridge, socket, reader, codec, System.nanoTime() + 2_000_000_000L);
+	}
+
+	private static BridgeEnvelope pollBridgeResponse(
+			MultiplexedServerBridge bridge, Socket socket, BufferedReader reader,
+			BridgeEnvelopeCodec codec, long deadline
+	) throws Exception {
+		StringBuilder line = new StringBuilder();
+		int previousTimeout = socket.getSoTimeout();
+		try {
+			while (System.nanoTime() < deadline) {
+				bridge.tick();
+				// ready() and read() share the same buffer. readLine() could still block
+				// on a partial frame, so accumulate ready characters under one deadline.
+				while (System.nanoTime() < deadline && reader.ready()) {
+					long remaining = Math.max(1L, TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime()));
+					socket.setSoTimeout((int) Math.min(remaining, previousTimeout > 0 ? previousTimeout : Integer.MAX_VALUE));
+					int character = reader.read();
+					if (character < 0) throw new AssertionError("bridge closed before publishing a complete response");
+					if (character == '\n') return codec.decode(line.toString());
+					line.append((char) character);
+				}
+				Thread.sleep(5L);
+			}
+			throw new AssertionError("bridge did not publish a response");
+		} finally {
+			socket.setSoTimeout(previousTimeout);
 		}
-		throw new AssertionError("bridge did not publish a response");
 	}
 
 	private static BridgeEnvelope pollBridgeResponseOfType(
@@ -3405,7 +3694,7 @@ public final class MultiplexedServerBridgeVerification {
 	) throws Exception {
 		long deadline = System.nanoTime() + 2_000_000_000L;
 		while (System.nanoTime() < deadline) {
-			BridgeEnvelope response = pollBridgeResponse(bridge, socket, reader, codec);
+			BridgeEnvelope response = pollBridgeResponse(bridge, socket, reader, codec, deadline);
 			if (expectedType.equals(response.type())) return response;
 			if ((excludedAgent != null && excludedAgent.toString().equals(response.agentId()))
 					|| "conversation_event".equals(response.type())

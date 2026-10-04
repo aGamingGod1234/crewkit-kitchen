@@ -393,18 +393,18 @@ test('legacy registry snapshots migrate to the Codex provider while explicit pro
 	assert.throws(() => normalizeAgentRecord(record('bad', { provider: 'unknown' })), /provider/i);
 });
 
-test('registry goal text uses the shared 4096 UTF-16 code-unit contract', () => {
-	const boundary = '\u{1f642}'.repeat(2_048);
+test('registry planner text uses the Java-derived UTF-16 code-unit contract', () => {
+	const boundary = '\u{1f642}'.repeat(133_440);
 	assert.equal(normalizeAgentRecord(record('agent-a', {
 		state: DynamicAgentState.PAUSED,
 		currentGoal: boundary,
 		goalRevision: 1,
-	})).currentGoal.length, 4_096);
+	})).currentGoal.length, 266_880);
 	assert.throws(() => normalizeAgentRecord(record('agent-a', {
 		state: DynamicAgentState.PAUSED,
 		currentGoal: `${boundary}\u{1f642}`,
 		goalRevision: 1,
-	})), /4096/);
+	})), /266880/);
 });
 
 test('registered agent normalization enforces the shared Java state and identity contract', () => {

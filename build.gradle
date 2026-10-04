@@ -263,6 +263,8 @@ jar {
 		rename { "${it}_${archiveName}" }
 	}
 	from("NOTICE-FONTS.md")
+	// Keep the retained source attribution byte-for-byte with the derived arena modules.
+	from('maps/licenses/re-structured-MIT.txt') { into 'META-INF/licenses' }
 	from("coordinator") {
 		into "arena-agents/coordinator"
 		coordinatorRuntimeIncludes.each { include it }

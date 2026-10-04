@@ -7,6 +7,9 @@ export const MAX_CONVERSATION_LENGTH = 512;
 export const MAX_VOICE_TEXT_LENGTH = 280;
 export const MAX_SUMMARY_LENGTH = 2_048;
 export const MAX_GOAL_LENGTH = 4_096;
+// Matches AgentGoal.MAX_PLANNER_PROMPT_LENGTH: original request, heading,
+// and the persisted maximum of 64 individually bounded steering instructions.
+export const MAX_PLANNER_GOAL_LENGTH = MAX_GOAL_LENGTH + 128 + 64 * (MAX_GOAL_LENGTH + 8);
 export const MAX_IDENTIFIER_LENGTH = 256;
 export const MAX_PROVENANCE_TEXT_LENGTH = 256;
 export const MAX_DESIRED_STATE_LENGTH = 512;

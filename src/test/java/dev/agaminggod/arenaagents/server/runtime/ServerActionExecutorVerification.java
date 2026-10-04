@@ -46,6 +46,7 @@ public final class ServerActionExecutorVerification {
 	}
 
 	public static int verify() {
+		verifyRemovalReceipts();
 		ServerTransactionAdapter.TerminalGate gate = new ServerTransactionAdapter.TerminalGate();
 		ServerTransactionAdapter.TickResult success = ServerTransactionAdapter.TickResult.succeeded(
 				"TRANSFER_CONFIRMED", "Transfer confirmed");
@@ -338,9 +339,26 @@ public final class ServerActionExecutorVerification {
 			admitted[start] = true;
 		}
 		verifyModelOnlyControlBoundary();
-		return 114 + dev.agaminggod.arenaagents.protocol.PlayerActionSchemaVerification.verify()
+		return 122 + dev.agaminggod.arenaagents.protocol.PlayerActionSchemaVerification.verify()
 				+ dev.agaminggod.arenaagents.server.perception.PlayerKnowledgeInspectionVerification.verify()
 				+ verifyInteractionOutlineHit() + verifyMultipartHitTies();
+	}
+
+	private static void verifyRemovalReceipts() {
+		BlockPos target = new BlockPos(3, 64, 4);
+		var slab = Blocks.OAK_SLAB.defaultBlockState().setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.WATERLOGGED, true);
+		var water = slab.getFluidState().createLegacyBlock();
+		var wet = new ServerActionExecutor.BlockBreakReceipt(target, slab, water);
+		assertTrue(wet.confirms(null, target, "minecraft:oak_slab", water), "owned waterlogged removal accepts vanilla residual water");
+		assertFalse(wet.confirms(wet, target, "minecraft:oak_slab", water), "same-position stale receipt cannot satisfy a new action");
+		assertFalse(wet.confirms(null, target, "minecraft:oak_slab", Blocks.STONE.defaultBlockState()), "foreign solid replacement is rejected");
+		assertFalse(wet.confirms(null, target, "minecraft:oak_slab", Blocks.AIR.defaultBlockState()), "foreign change after fluid removal is rejected");
+		assertFalse(wet.confirms(null, target.above(), "minecraft:oak_slab", water), "different position receipt is rejected");
+		assertFalse(wet.confirms(null, target, "minecraft:oak_log", water), "different original block receipt is rejected");
+		var dry = new ServerActionExecutor.BlockBreakReceipt(target, Blocks.STONE.defaultBlockState(), Blocks.AIR.defaultBlockState());
+		assertTrue(dry.confirms(null, target, "minecraft:stone", Blocks.AIR.defaultBlockState()), "owned dry removal still succeeds");
+		var unchanged = new ServerActionExecutor.BlockBreakReceipt(target, slab, slab);
+		assertFalse(unchanged.confirms(null, target, "minecraft:oak_slab", slab), "true handler return without removal is not success");
 	}
 
 	private static int verifyMultipartHitTies() {

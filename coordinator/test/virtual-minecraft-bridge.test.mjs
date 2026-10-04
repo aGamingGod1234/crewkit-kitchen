@@ -84,7 +84,7 @@ test('routine completion keeps its authoritative observation non-attentive befor
 	assert.deepEqual(manager.events.map((event) => event.type), ['progress', 'observation', 'result']);
 });
 
-test('completion retains attention for health, fire, and attacker hazard facts only', async () => {
+test('active and completion observations publish new health, fire, and attacker hazards', async () => {
 	const world = VirtualWorld.fromScenario({
 		agents: { alice: { position: { x: 0, y: 1, z: 1 }, onGround: true } },
 		blocks: [{ x: 0, y: 0, z: 0, blockId: 'minecraft:stone' }, { x: 0, y: 0, z: 1, blockId: 'minecraft:lava' }],
@@ -96,10 +96,13 @@ test('completion retains attention for health, fire, and attacker hazard facts o
 	world.stepTicks(1);
 	await bridge.flush();
 
-	const observation = bridge.events.find((event) => event.type === 'observation');
-	assert.equal(observation.envelope.payload.attention, true);
-	assert.deepEqual(observation.envelope.payload.changedFacts, ['player.health', 'player.lastAttacker', 'player.onFire']);
-	assert.equal(observation.envelope.payload.currentAction.active, false);
+	const observations = bridge.events.filter((event) => event.type === 'observation');
+	assert.equal(observations.length, 2);
+	assert.equal(observations[0].envelope.payload.currentAction.active, true);
+	assert.deepEqual(observations[0].envelope.payload.changedFacts, ['player.health', 'player.onFire']);
+	assert.equal(observations[1].envelope.payload.attention, true);
+	assert.deepEqual(observations[1].envelope.payload.changedFacts, ['player.health', 'player.lastAttacker']);
+	assert.equal(observations[1].envelope.payload.currentAction.active, false);
 });
 
 test('explicit publish preserves valid non-active attention facts', async () => {
@@ -233,7 +236,7 @@ test('bridge routes a protocol-valid missing recipe through the complete runtime
 	const bridge = new VirtualMinecraftBridge({ world, agentRecords: { alice: { agentId: 'alice', goalRevision: 1 } } });
 	const manager = managerEvents();
 	bridge.attach(manager);
-	await bridge.send('action_command', 'alice', command('craft-1', 'craft_inventory', { recipeId: 'minecraft:stick', count: 1, timeoutMs: 1_000 }));
+	await bridge.send('action_command', 'alice', command('craft-1', 'craft_inventory', { recipeId: 'minecraft:unknown_fixture', count: 1, timeoutMs: 1_000 }));
 	world.stepTicks(1);
 	await bridge.flush();
 	const result = manager.events.find((event) => event.type === 'result');

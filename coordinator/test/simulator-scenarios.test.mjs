@@ -82,7 +82,7 @@ test('scenario success predicates require authoritative postconditions, not prov
 		results: craft.expected.actionIds.map((actionId) => ({ actionId, state: 'SUCCEEDED' })),
 		state: {
 			inventoryBefore: [{ itemId: 'minecraft:oak_log', count: 2 }],
-			inventoryAfter: [{ itemId: 'minecraft:oak_planks', count: 2 }, { itemId: 'minecraft:stick', count: 1 }],
+			inventoryAfter: [{ itemId: 'minecraft:oak_planks', count: 2 }, { itemId: 'minecraft:stick', count: 4 }],
 			block: { x: 1, y: 1, z: 0, blockId: 'minecraft:crafting_table' },
 		},
 	}), true);

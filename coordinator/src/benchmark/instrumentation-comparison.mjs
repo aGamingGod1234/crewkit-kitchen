@@ -70,6 +70,7 @@ export function compareInstrumentationRuns({ enabled, disabled, maxP95Ratio = 1.
 	const p95Ratio = percentile(durationRatios, 0.95);
 	const checks = [
 		{ code: 'INSTRUMENTATION_SAMPLE_COUNT', status: successfulPairs.length >= minimumSamples && durationRatios.length >= minimumSamples ? 'PASSED' : 'FAILED', observed: { pairs: pairs.length, successfulPairs: successfulPairs.length, pairedRatios: durationRatios.length }, required: minimumSamples },
+		{ code: 'INSTRUMENTATION_TIMING_COMPLETE', status: successfulPairs.length > 0 && successfulPairs.every((pair) => Number.isFinite(pair.durationRatio)) ? 'PASSED' : 'FAILED', missing: successfulPairs.filter((pair) => !Number.isFinite(pair.durationRatio)).map((pair) => pair.key) },
 		{ code: 'INSTRUMENTATION_BEHAVIOR_PARITY', status: pairs.length > 0 && pairs.every((pair) => pair.behaviorParity) ? 'PASSED' : 'FAILED', mismatches: pairs.filter((pair) => !pair.behaviorParity).map((pair) => pair.key) },
 		{ code: 'INSTRUMENTATION_P95_OVERHEAD', status: p95Ratio !== null && p95Ratio <= maxP95Ratio ? 'PASSED' : 'FAILED', observedRatio: p95Ratio, maximumRatio: maxP95Ratio, enabledP95Ms, disabledP95Ms, basis: 'nearest-rank p95 of paired enabled/disabled full-path duration ratios' },
 	];

@@ -399,6 +399,9 @@ public final class CameraDirectorClient {
             if (elapsed > recording.frames().getLast().tick() && elapsed <= CameraPath.MAX_DURATION_TICKS)
                 recording.frames().add(dollyFrame(client, (int) elapsed));
         }
+        // Finalization owns the last sample. Freeze it even if persistence fails, so retry
+        // retains the same valid take rather than sampling beyond the keyframe limit.
+        dollyRecording = false;
         CameraPath saved = new CameraPath(recording.name(), recording.frames());
 		Map<String, CameraPath> next = new LinkedHashMap<>(PATHS);
 		next.put(saved.name(), saved);

@@ -8,25 +8,25 @@ function ConvertFrom-ArenaJavaPropertyEscapes([string] $Value) {
 			$null = $builder.Append($character)
 			continue
 		}
-		if ($index + 1 -ge $Value.Length) { throw 'Malformed trailing escape in server.properties key' }
+		if ($index + 1 -ge $Value.Length) { throw 'Malformed trailing escape in server.properties' }
 		$index += 1
 		$escaped = $Value[$index]
-		if ($escaped -eq 'u') {
-			if ($index + 4 -ge $Value.Length) { throw 'Malformed Unicode escape in server.properties key' }
+		if ($escaped -ceq 'u') {
+			if ($index + 4 -ge $Value.Length) { throw 'Malformed Unicode escape in server.properties' }
 			$hex = $Value.Substring($index + 1, 4)
-			[uint32] $codePoint = 0
-			if (-not [uint32]::TryParse($hex, [Globalization.NumberStyles]::HexNumber, [Globalization.CultureInfo]::InvariantCulture, [ref] $codePoint)) {
-				throw 'Malformed Unicode escape in server.properties key'
+			if ($hex -cnotmatch '\A[0-9a-fA-F]{4}\z') {
+				throw 'Malformed Unicode escape in server.properties'
 			}
+			$codePoint = [Convert]::ToUInt32($hex, 16)
 			$null = $builder.Append([char] $codePoint)
 			$index += 4
 			continue
 		}
-		$decoded = switch ($escaped) {
+		$decoded = switch -CaseSensitive ($escaped) {
 			't' { "`t" }
 			'n' { "`n" }
 			'r' { "`r" }
-			'f' { "`f" }
+			'f' { [string][char]12 }
 			default { [string] $escaped }
 		}
 		$null = $builder.Append($decoded)
@@ -36,7 +36,7 @@ function ConvertFrom-ArenaJavaPropertyEscapes([string] $Value) {
 
 function ConvertTo-ArenaServerPropertyEntry([string] $Line) {
 	$start = 0
-	while ($start -lt $Line.Length -and [char]::IsWhiteSpace($Line[$start])) { $start += 1 }
+	while ($start -lt $Line.Length -and $Line[$start] -in @(' ', "`t", [char]12)) { $start += 1 }
 	if ($start -ge $Line.Length -or $Line[$start] -eq '#' -or $Line[$start] -eq '!') { return $null }
 
 	$escaped = $false
@@ -47,14 +47,14 @@ function ConvertTo-ArenaServerPropertyEntry([string] $Line) {
 		if ($escaped) { $escaped = $false; continue }
 		if ($character -eq '\') { $escaped = $true; continue }
 		if ($character -eq '=' -or $character -eq ':') { $separator = $index; break }
-		if ([char]::IsWhiteSpace($character)) { $separator = $index; $separatorIsWhitespace = $true; break }
+		if ($character -in @(' ', "`t", [char]12)) { $separator = $index; $separatorIsWhitespace = $true; break }
 	}
 	$rawKey = $Line.Substring($start, $separator - $start)
 	$valueStart = $separator
-	while ($valueStart -lt $Line.Length -and [char]::IsWhiteSpace($Line[$valueStart])) { $valueStart += 1 }
+	while ($valueStart -lt $Line.Length -and $Line[$valueStart] -in @(' ', "`t", [char]12)) { $valueStart += 1 }
 	if ($separatorIsWhitespace -and $valueStart -lt $Line.Length -and ($Line[$valueStart] -eq '=' -or $Line[$valueStart] -eq ':')) { $valueStart += 1 }
 	if (-not $separatorIsWhitespace -and $valueStart -lt $Line.Length -and ($Line[$valueStart] -eq '=' -or $Line[$valueStart] -eq ':')) { $valueStart += 1 }
-	while ($valueStart -lt $Line.Length -and [char]::IsWhiteSpace($Line[$valueStart])) { $valueStart += 1 }
+	while ($valueStart -lt $Line.Length -and $Line[$valueStart] -in @(' ', "`t", [char]12)) { $valueStart += 1 }
 	return [pscustomobject]@{
 		Key = ConvertFrom-ArenaJavaPropertyEscapes $rawKey
 		Value = if ($valueStart -lt $Line.Length) { $Line.Substring($valueStart) } else { '' }
@@ -64,8 +64,18 @@ function ConvertTo-ArenaServerPropertyEntry([string] $Line) {
 function Get-ArenaServerPropertyLogicalLines([string] $Path) {
 	$logicalLines = [Collections.Generic.List[string]]::new()
 	$pending = $null
-	foreach ($physicalLine in @(Get-Content -LiteralPath $Path)) {
-		$line = if ($null -eq $pending) { $physicalLine } else { $pending + $physicalLine.TrimStart() }
+	# Properties.load(Reader) uses only space, tab and form feed as whitespace.
+	# Decode UTF-8 explicitly, preserving a BOM as a character like Java's reader.
+	$text = [Text.UTF8Encoding]::new($false, $true).GetString([IO.File]::ReadAllBytes($Path))
+	foreach ($physicalLine in [regex]::Split($text, "\r\n|\r|\n")) {
+		$trimmed = $physicalLine.TrimStart([char[]]@(' ', "`t", [char]12))
+		# A comment is a physical line, even when it ends with an odd backslash.
+		# Once a property has content, however, # and ! belong to its continuation.
+		if ([string]::IsNullOrEmpty($pending) -and ($trimmed.StartsWith('#') -or $trimmed.StartsWith('!'))) {
+			$pending = $null
+			continue
+		}
+		$line = if ($null -eq $pending) { $trimmed } else { $pending + $trimmed }
 		$trailingBackslashes = 0
 		for ($index = $line.Length - 1; $index -ge 0 -and $line[$index] -eq '\'; $index -= 1) { $trailingBackslashes += 1 }
 		if (($trailingBackslashes % 2) -eq 1) {
@@ -86,7 +96,12 @@ function Get-ArenaServerPropertyValues([string] $Path, [string] $Name) {
 	$values = [Collections.Generic.List[string]]::new()
 	foreach ($line in @(Get-ArenaServerPropertyLogicalLines $Path)) {
 		$entry = ConvertTo-ArenaServerPropertyEntry $line
-		if ($null -ne $entry -and $entry.Key -ceq $Name) { $values.Add($entry.Value) }
+		if ($null -ne $entry) {
+			# Keep the entry helper's raw value contract for physical-line rewriters;
+			# guards must inspect the decoded value consumed by Java.
+			$value = ConvertFrom-ArenaJavaPropertyEscapes $entry.Value
+			if ($entry.Key -ceq $Name) { $values.Add($value) }
+		}
 	}
 	return @($values)
 }

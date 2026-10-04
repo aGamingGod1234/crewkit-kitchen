@@ -133,6 +133,9 @@ def _reject_linked_path(path: Path, stop: Path) -> None:
 
 
 def _within(path: Path, root: Path, description: str) -> Path:
+    # absolute() preserves '..', unlike the destination used by replacement.
+    if ".." in path.parts or ".." in root.parts:
+        raise ValueError(f"{description} must not contain parent components")
     absolute = path.absolute()
     root_absolute = root.absolute()
     try:

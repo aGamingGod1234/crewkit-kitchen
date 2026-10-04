@@ -208,7 +208,58 @@ public final class BlockObservationLazyVisibilityVerification {
 				"cached candidates omit a block that became air");
 		assertions += 3;
 
-		return assertions;
+		return assertions + verifyMixedOcclusionBudgets();
+	}
+
+	/** Unlimited equivalence is not the heartbeat contract: rejected LOS checks consume its budget. */
+	private static int verifyMixedOcclusionBudgets() {
+		ArrayList<BlockObservationOrdering.Candidate> grid = new ArrayList<>();
+		for (int x = 1; x <= 5; x++) {
+			for (int y = 0; y <= 1; y++) {
+				for (int z = -2; z <= 2; z++) {
+					grid.add(new BlockObservationOrdering.Candidate(x, y, z, "minecraft:coal_ore"));
+				}
+			}
+		}
+		int budget = ServerObservationCollector.MAX_BLOCK_VISIBILITY_CHECKS_PER_TYPE;
+		List<BlockObservationOrdering.Candidate> ordered = BlockObservationOrdering.ordered(grid).subList(0, budget + 1);
+		var late = ordered.get(budget);
+		var boundary = ordered.get(budget - 1);
+		List<BlockObservationOrdering.Candidate> eager = BlockObservationOrdering.select(
+				ordered.stream().filter(late::equals).toList(), ServerObservationCollector.MAX_BLOCKS,
+				ServerObservationCollector.MAX_BLOCKS_PER_TYPE);
+		assertEquals(List.of(late), eager, "eager visible reference includes the resource beyond the budget");
+		AtomicInteger checks = new AtomicInteger();
+		List<BlockObservationOrdering.Candidate> bounded = budgeted(ordered, candidate -> true, late::equals, checks);
+		assertEquals(List.of(), bounded, "bounded mixed occlusion explicitly omits the late resource");
+		assertEquals(budget, checks.get(), "failed LOS consumes the production per-type budget");
+		assertEquals(bounded, budgeted(ordered, candidate -> true, late::equals, new AtomicInteger()),
+				"an identical heartbeat does not promise recovery");
+		assertEquals(List.of(boundary), budgeted(ordered, candidate -> true, boundary::equals, new AtomicInteger()),
+				"visible resource at the budget boundary survives");
+		checks.set(0);
+		assertEquals(eager, budgeted(ordered, late::equals, late::equals, checks),
+				"cheap loading/state/cone rejection preserves the later resource's LOS budget");
+		assertEquals(1, checks.get(), "only the eligible resource uses LOS");
+		ArrayList<BlockObservationOrdering.Candidate> mixed = new ArrayList<>(ordered);
+		var log = new BlockObservationOrdering.Candidate(late.x(), late.y(), late.z(), "minecraft:oak_log");
+		mixed.set(budget, log);
+		assertEquals(List.of(log), budgeted(BlockObservationOrdering.ordered(mixed), candidate -> true,
+				log::equals, new AtomicInteger()), "occluded ore does not exhaust another resource type");
+		var coverage = ObservationPage.coverage(new com.google.gson.JsonObject());
+		assertEquals(false, coverage.getAsJsonObject("sections").getAsJsonObject("blocks").get("complete").getAsBoolean(),
+				"bounded sampling never claims observed absence of omitted resources");
+		return 9;
+	}
+
+	private static List<BlockObservationOrdering.Candidate> budgeted(List<BlockObservationOrdering.Candidate> ordered,
+			Predicate<BlockObservationOrdering.Candidate> eligible, Predicate<BlockObservationOrdering.Candidate> visible,
+			AtomicInteger checks) {
+		return BlockObservationOrdering.selectOrderedWithVisibilityBudget(ordered,
+				ServerObservationCollector.MAX_BLOCKS, ServerObservationCollector.MAX_BLOCKS_PER_TYPE,
+				ServerObservationCollector.MAX_BLOCK_VISIBILITY_CHECKS,
+				ServerObservationCollector.MAX_BLOCK_VISIBILITY_CHECKS_PER_TYPE, eligible,
+				candidate -> { checks.incrementAndGet(); return visible.test(candidate); });
 	}
 
 	private static List<BlockObservationOrdering.Candidate> crowdedBlocks() {

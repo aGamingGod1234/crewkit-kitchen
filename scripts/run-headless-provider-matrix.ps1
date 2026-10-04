@@ -6,14 +6,18 @@ param(
 	[string] $ServerTemplate,
 	[switch] $CapabilityProbe,
 	[switch] $RequireAll,
-	[switch] $KeepArtifacts
+	[switch] $KeepArtifacts,
+	[string] $PairedConfig,
+	[switch] $FunctionsOnly
 )
 
+$pairedEntryClock = [Diagnostics.Stopwatch]::StartNew()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'offline-server-policy.ps1')
 . (Join-Path $PSScriptRoot 'project-metadata.ps1')
 
+$script:PairedState = $null
 $PollMilliseconds = 250
 $StartupTimeoutSeconds = 120
 $CleanupTimeoutSeconds = 30
@@ -129,6 +133,10 @@ function Write-PrivateText([string] $Path, [string] $Value) {
 }
 
 function Wait-Condition([scriptblock] $Condition, [int] $TimeoutSeconds, [string] $FailureMessage) {
+	if ($null -ne $script:PairedState) {
+		while ((Get-PairedRemaining) -gt 0) { if (& $Condition) { return }; Start-Sleep -Milliseconds ([Math]::Min(20, [Math]::Max(1, (Get-PairedRemaining)))) }
+		throw $FailureMessage
+	}
 	$deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
 	while ([DateTime]::UtcNow -lt $deadline) {
 		if (& $Condition) { return }
@@ -223,18 +231,20 @@ function Test-ChildCreationAfterParent($Parent, $Child) {
 	return $childTicks -ge $parentTicks
 }
 
-function Add-ProcessTreeSnapshot([System.Collections.Generic.List[object]] $ProcessIdentities, $ProcessIdentity, $Processes = $null) {
+function Add-ProcessTreeSnapshot([System.Collections.Generic.List[object]] $ProcessIdentities, $ProcessIdentity, $Processes = $null, $ChildrenByParent = $null) {
 	$processes = if ($null -eq $Processes) { Get-ProcessSnapshot } else { $Processes }
 	$rootId = if ($ProcessIdentity -is [int]) { [int] $ProcessIdentity } else { [int] $ProcessIdentity.ProcessId }
 	if ($rootId -le 0) { return }
 	$expectedRoot = if ($ProcessIdentity -is [int]) { $null } else { $ProcessIdentity }
 	$existingRoot = @($ProcessIdentities.ToArray() | Where-Object { [int] $_.ProcessId -eq $rootId } | Select-Object -First 1)
 
-	$childrenByParent = @{}
-	foreach ($process in $processes.Values) {
-		$parentId = [int] $process.ParentProcessId
-		if (-not $childrenByParent.ContainsKey($parentId)) { $childrenByParent[$parentId] = [System.Collections.Generic.List[object]]::new() }
-		$childrenByParent[$parentId].Add($process)
+	if ($null -eq $ChildrenByParent) {
+		$childrenByParent = @{}
+		foreach ($process in $processes.Values) {
+			$parentId = [int] $process.ParentProcessId
+			if (-not $childrenByParent.ContainsKey($parentId)) { $childrenByParent[$parentId] = [System.Collections.Generic.List[object]]::new() }
+			$childrenByParent[$parentId].Add($process)
+		}
 	}
 	$pending = [System.Collections.Generic.Queue[object]]::new()
 	$visited = [System.Collections.Generic.HashSet[int]]::new()
@@ -298,7 +308,9 @@ function Measure-RunnerResourcesUntilExit(
 	$RunnerHandle,
 	[object[]] $TrackedHandles,
 	[System.Collections.Generic.List[object]] $ProcessIdentities,
-	[DateTime] $Deadline
+	[DateTime] $Deadline,
+	[scriptblock] $StopCondition = $null,
+	$PriorPeak = $null
 ) {
 	$initialRoots = [System.Collections.Generic.HashSet[int]]::new()
 	[long] $initialRssBytes = 0
@@ -312,7 +324,13 @@ function Measure-RunnerResourcesUntilExit(
 	}
 	$peakProcessCount = $initialRoots.Count
 	[long] $peakRssBytes = $initialRssBytes
+	if ($null -ne $PriorPeak) {
+		$peakProcessCount = [Math]::Max($peakProcessCount, [int] $PriorPeak.processCount)
+		$peakRssBytes = [Math]::Max($peakRssBytes, [long] $PriorPeak.peakRssBytes)
+	}
 	while ($true) {
+		# A phase boundary returns accumulated peaks without granting more trial time.
+		if ($null -ne $StopCondition -and (& $StopCondition)) { break }
 		$directProcessCount = 0
 		[long] $directRssBytes = 0
 		foreach ($handle in $TrackedHandles) {
@@ -336,7 +354,9 @@ function Measure-RunnerResourcesUntilExit(
 		$peakProcessCount = [Math]::Max($peakProcessCount, [int] $sample.processCount)
 		$peakRssBytes = [Math]::Max($peakRssBytes, [long] $sample.rssBytes)
 		$runnerExited = $runnerExitedBeforeSample
-		if (-not $runnerExited) { $runnerExited = $RunnerHandle.Process.WaitForExit($PollMilliseconds) }
+		if ($null -ne $StopCondition -and (& $StopCondition)) { break }
+		$waitMilliseconds = if ($null -ne $script:PairedState) { [Math]::Min($PollMilliseconds, (Get-PairedRemaining)) } else { $PollMilliseconds }
+		if (-not $runnerExited) { $runnerExited = $RunnerHandle.Process.WaitForExit([int] $waitMilliseconds) }
 		if ($runnerExited) {
 			if (-not $runnerExitedBeforeSample) {
 				$finalProcesses = Get-ProcessSnapshot
@@ -349,7 +369,8 @@ function Measure-RunnerResourcesUntilExit(
 			}
 			break
 		}
-		if ([DateTime]::UtcNow -ge $Deadline) { throw 'Scenario runner timed out' }
+		if ($null -ne $StopCondition -and (& $StopCondition)) { break }
+		if (($null -ne $script:PairedState -and (Get-PairedRemaining) -le 0) -or ($null -eq $script:PairedState -and [DateTime]::UtcNow -ge $Deadline)) { throw 'Scenario runner timed out' }
 	}
 	return [pscustomobject]@{ processCount = $peakProcessCount; peakRssBytes = $peakRssBytes }
 }
@@ -358,7 +379,16 @@ function Stop-TrackedProcessIds([System.Collections.Generic.List[object]] $Proce
 	$deadline = [DateTime]::UtcNow.AddSeconds($CleanupTimeoutSeconds)
 	$remaining = @()
 	do {
-		foreach ($root in @($ProcessIdentities.ToArray())) { Add-ProcessTreeSnapshot $ProcessIdentities $root }
+		# Discovery shares one table and index, including retained exited roots.
+		$discovered = Get-ProcessSnapshot
+		$childrenByParent = @{}
+		foreach ($process in $discovered.Values) {
+			$parentId = [int] $process.ParentProcessId
+			if (-not $childrenByParent.ContainsKey($parentId)) { $childrenByParent[$parentId] = [System.Collections.Generic.List[object]]::new() }
+			$childrenByParent[$parentId].Add($process)
+		}
+		foreach ($root in @($ProcessIdentities.ToArray())) { Add-ProcessTreeSnapshot $ProcessIdentities $root $discovered $childrenByParent }
+		# Revalidate identities against a fresh table before attempting any stops.
 		$processes = Get-ProcessSnapshot
 		foreach ($identity in @($ProcessIdentities.ToArray() | Sort-Object ProcessId -Descending)) {
 			$id = [int] $identity.ProcessId
@@ -372,7 +402,7 @@ function Stop-TrackedProcessIds([System.Collections.Generic.List[object]] $Proce
 		$current = Get-ProcessSnapshot
 		$remaining = @($ProcessIdentities.ToArray() | Where-Object { $current.ContainsKey([int] $_.ProcessId) -and (Test-ProcessIdentityMatch $_ $current[[int] $_.ProcessId]) })
 		if ($remaining.Count -eq 0) { return }
-	} while ([DateTime]::UtcNow -lt $deadline)
+	} while ($(if ($null -eq $script:PairedState) { [DateTime]::UtcNow -lt $deadline } else { (Get-PairedRemaining) -gt 0 }))
 	throw "Tracked process cleanup left live PIDs: $(@($remaining | ForEach-Object { $_.ProcessId }) -join ',')"
 }
 
@@ -410,12 +440,17 @@ function Start-RedirectedProcess(
 	}
 	$process = [Diagnostics.Process]::new()
 	$process.StartInfo = $startInfo
+	if ($null -ne $script:PairedState -and (Get-PairedRemaining) -le 0) { throw 'Paired phase expired before process launch' }
 	if (-not $process.Start()) { throw "Could not start process: $FileName" }
 	$process.Refresh()
 	$identity = [pscustomobject]@{
 		ProcessId = [int] $process.Id
 		ParentProcessId = [int] $PID
 		CreationDate = ConvertTo-ProcessCreationKey $process.StartTime
+	}
+	if ($null -ne $script:PairedState) {
+		$script:PairedState.resources.Add($identity)
+		Send-PairedEvent 'resource' $identity
 	}
 	$initialRssBytes = [long] $process.WorkingSet64
 	$stdoutTask = $process.StandardOutput.ReadToEndAsync()
@@ -436,12 +471,14 @@ function Complete-RedirectedProcess($Handle) {
 	if (-not $Handle.Process.HasExited) { return }
 	foreach ($stream in @(@{ Task = $Handle.StdoutTask; Path = $Handle.StdoutPath }, @{ Task = $Handle.StderrTask; Path = $Handle.StderrPath })) {
 		try {
-			if ($stream.Task.Wait($OutputDrainTimeoutMilliseconds)) {
+			if ($stream.Task.Wait($(if ($null -eq $script:PairedState) { $OutputDrainTimeoutMilliseconds } else { [Math]::Max(0, [Math]::Min($OutputDrainTimeoutMilliseconds, (Get-PairedRemaining))) }))) {
 				[IO.File]::WriteAllText($stream.Path, [string] $stream.Task.Result)
 			} else {
+				if ($null -ne $script:PairedState) { $script:PairedState.drainFailed = $true }
 				[IO.File]::WriteAllText($stream.Path, '[output drain timed out]')
 			}
 		} catch {
+			if ($null -ne $script:PairedState) { $script:PairedState.drainFailed = $true }
 			try { [IO.File]::WriteAllText($stream.Path, '[output drain failed]') } catch {}
 		}
 	}
@@ -517,10 +554,10 @@ function Remove-ScenarioArtifacts([string] $ScenarioDirectory) {
 			} catch {
 				$lastError = $_
 				if (-not (Test-Path -LiteralPath $target)) { $lastError = $null; break }
-				if ([DateTime]::UtcNow -ge $deadline) { throw "Could not remove generated artifact '$target': $($_.Exception.Message)" }
+				if (($null -ne $script:PairedState -and (Get-PairedRemaining) -le 0) -or ($null -eq $script:PairedState -and [DateTime]::UtcNow -ge $deadline)) { throw "Could not remove generated artifact '$target': $($_.Exception.Message)" }
 				Start-Sleep -Milliseconds 100
 			}
-		} while ([DateTime]::UtcNow -lt $deadline)
+		} while ($(if ($null -eq $script:PairedState) { [DateTime]::UtcNow -lt $deadline } else { (Get-PairedRemaining) -gt 0 }))
 		if ($null -ne $lastError -and (Test-Path -LiteralPath $target)) { throw "Could not remove generated artifact '$target': $($lastError.Exception.Message)" }
 		if (Test-Path -LiteralPath $target) { throw "Artifact cleanup left '$target' behind" }
 	}
@@ -655,6 +692,7 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 	$modsDirectory = Join-Path $serverDirectory 'mods'
 	New-Item -ItemType Directory -Path $modsDirectory -Force | Out-Null
 	Copy-Item -LiteralPath $BuiltJar -Destination (Join-Path $modsDirectory ([IO.Path]::GetFileName($BuiltJar))) -Force
+	if ($null -ne $script:PairedState -and (Get-FileSha256 (Join-Path $modsDirectory ([IO.Path]::GetFileName($BuiltJar)))) -ne $script:PairedState.artifactSha256) { throw 'Paired installed artifact mismatch' }
 	$worldName = "headless-$([IO.Path]::GetFileName($RunDirectory))-$scenarioId-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
 	$bridgePort = Reserve-FreePort (Get-ConfiguredPort 'ARENA_HEADLESS_BRIDGE_PORT')
 	$rconPort = Reserve-FreePort (Get-ConfiguredPort 'ARENA_HEADLESS_RCON_PORT') @($bridgePort)
@@ -753,7 +791,8 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 	$processIds = [System.Collections.Generic.List[object]]::new()
 	$peakProcessCount = 0
 	[long] $peakRssBytes = 0
-	try {
+	$trialResourcePeak = $null
+	$setupPhase = {
 		$serverStdoutPath = Join-Path $logsDirectory 'fabric.stdout.log'
 		$serverStderrPath = Join-Path $logsDirectory 'fabric.stderr.log'
 		$serverAttempt = 0
@@ -840,7 +879,7 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 			$runnerArgs = "$(Quote-Argument (Join-Path $Project 'coordinator\src\player-capability-probe.mjs')) --run-directory $(Quote-Argument $scenarioDirectory) --rcon-host 127.0.0.1 --rcon-port $rconPort --rcon-password-file $(Quote-Argument $secretPath) --bridge-port $bridgePort --bridge-secret-file $(Quote-Argument $secretPath) --timeout-ms $([int64] $Scenario.timeoutMs)"
 		} else {
 			if ($naturalWorld) {
-				$spawnArgs = @((Join-Path $Project 'coordinator\src\headless-world-spawn.mjs'), (Join-Path (Join-Path $serverDirectory $worldName) 'level.dat'), '--rcon-port', [string] $rconPort, '--password-file', $secretPath, '--timeout-ms', [string] ([Math]::Min(120000, $StartupTimeoutSeconds * 1000)))
+				$spawnArgs = @((Join-Path $Project 'coordinator\src\headless-world-spawn.mjs'), (Join-Path (Join-Path $serverDirectory $worldName) 'level.dat'), '--rcon-port', [string] $rconPort, '--password-file', $secretPath, '--timeout-ms', [string] $(if ($null -eq $script:PairedState) { [Math]::Min(120000, $StartupTimeoutSeconds * 1000) } else { [Math]::Max(1, (Get-PairedRemaining)) }))
 				if ($Scenario.world.spawn.policy -eq 'surface') { $spawnArgs += @('--surface-x', [string] $Scenario.world.spawn.x, '--surface-z', [string] $Scenario.world.spawn.z) }
 				$spawnEvidenceText = & $Node @spawnArgs
 				if ($LASTEXITCODE -ne 0) { throw 'Natural spawn metadata or chunk readiness failed before agent evaluation' }
@@ -857,14 +896,45 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 			ARENA_HEADLESS_RUN_ID = [IO.Path]::GetFileName($RunDirectory); ARENA_HEADLESS_SCENARIO_ID = $scenarioId
 			ARENA_PROTOCOL_AUDIT_PATH = $protocolAudit; ARENA_PROVIDER_TURNS_PATH = $providerTurns
 		}
+		if ($null -ne $script:PairedState) { $runnerArgs += " --paired-channel $(Quote-Argument $script:PairedState.channel)" }
 		$runnerHandle = Start-RedirectedProcess $Node $runnerArgs (Join-Path $Project 'coordinator') (Join-Path $traceDirectory 'runner.stdout.log') (Join-Path $traceDirectory 'runner.stderr.log') $runnerEnvironment
 		Add-ProcessTreeSnapshot $processIds $serverHandle.Identity
 		if ($null -ne $coordinatorHandle) { Add-ProcessTreeSnapshot $processIds $coordinatorHandle.Identity }
 		Add-ProcessTreeSnapshot $processIds $runnerHandle.Identity
+		if ($null -ne $script:PairedState) {
+			Wait-Condition { Test-Path -LiteralPath (Join-Path $script:PairedState.channel 'runner-ready.json') } 0 'Paired runner did not become ready'
+			Send-PairedEvent 'startup' @{ scenarioDirectory = $scenarioDirectory; worldId = $worldName; modSha256 = (Get-FileSha256 (Join-Path $modsDirectory ([IO.Path]::GetFileName($BuiltJar)))) }
+		}
+	}
+	$trialPhase = {
+		if ($null -ne $script:PairedState) {
+			Receive-PairedPhase 'trial'
+			Write-PairedRunnerRequest 'runner-trial'
+		}
+		if ($null -ne $script:PairedState) {
+			# Trial expiry requests stop-only cleanup within the parent's existing reserve.
+			$trialBoundary = Join-Path $script:PairedState.channel 'runner-trial-ended.json'
+			$trialResourcePeak = Measure-RunnerResourcesUntilExit $runnerHandle @($serverHandle, $coordinatorHandle, $runnerHandle) $processIds ([DateTime]::MaxValue) {
+				(Get-PairedRemaining) -le 0 -or (Test-Path -LiteralPath $trialBoundary)
+			}
+			if (Test-Path -LiteralPath $trialBoundary) {
+				Send-PairedEvent 'trial' (Read-BoundedJson $trialBoundary $MaxMatrixReportBytes 'trial boundary')
+			} elseif ((Get-PairedRemaining) -le 0) {
+				Send-PairedEvent 'trial' @{ classification = 'PENDING_TIMEOUT' }
+			} else {
+				throw 'Paired runner exited before its trial boundary'
+			}
+		}
+	}
+	$runnerFinishPhase = {
+		if ($null -ne $script:PairedState) {
+			Receive-PairedPhase 'cleanup'
+			Write-PairedRunnerRequest 'runner-cleanup'
+		}
 		$repetitions = if ($null -ne $Scenario.PSObject.Properties['repetitions']) { [Math]::Max(1, [int] $Scenario.repetitions) } else { 1 }
 		$runnerDeadline = [DateTime]::UtcNow.AddMilliseconds(([int64] $Scenario.timeoutMs * $repetitions) + ($RunnerGraceSeconds * 1000))
 		try {
-			$resourcePeak = Measure-RunnerResourcesUntilExit $runnerHandle @($serverHandle, $coordinatorHandle, $runnerHandle) $processIds $runnerDeadline
+			$resourcePeak = Measure-RunnerResourcesUntilExit $runnerHandle @($serverHandle, $coordinatorHandle, $runnerHandle) $processIds $runnerDeadline -PriorPeak $trialResourcePeak
 		} catch {
 			if ($_.Exception.Message -eq 'Scenario runner timed out') { throw "Scenario '$scenarioId' timed out" }
 			throw
@@ -888,10 +958,9 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 				throw "Runner repetition report for '$scenarioId' is invalid"
 			}
 		}
-		if ($runnerExit -ne 0) { throw "Scenario '$scenarioId' failed with runner exit code $runnerExit" }
-	} catch {
-		$failure = $_
-	} finally {
+		if ($runnerExit -ne 0 -and $null -eq $script:PairedState) { throw "Scenario '$scenarioId' failed with runner exit code $runnerExit" }
+	}
+	$cleanupPhase = {
 		foreach ($handle in @($runnerHandle, $coordinatorHandle, $serverHandle)) {
 			if ($null -ne $handle -and $null -ne $handle.Process) { Add-ProcessTreeSnapshot $processIds $handle.Identity }
 		}
@@ -900,7 +969,7 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 				if (-not $serverHandle.Process.HasExited) {
 					$serverHandle.Process.StandardInput.WriteLine('stop')
 					$serverHandle.Process.StandardInput.Flush()
-					$null = $serverHandle.Process.WaitForExit($GracefulStopTimeoutMilliseconds)
+					$null = $serverHandle.Process.WaitForExit($(if ($null -eq $script:PairedState) { $GracefulStopTimeoutMilliseconds } else { [Math]::Max(0, [Math]::Min($GracefulStopTimeoutMilliseconds, (Get-PairedRemaining))) }))
 				}
 			} catch {}
 		}
@@ -909,8 +978,22 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 		try { Wait-Condition { -not (Test-Port $serverPort) -and -not (Test-Port $rconPort) -and -not (Test-Port $bridgePort) } $CleanupTimeoutSeconds 'Scenario cleanup left an allocated listener running' } catch { $cleanupFailure = $_; if ($null -eq $failure) { $failure = $_ } }
 		foreach ($handle in @($runnerHandle, $coordinatorHandle, $serverHandle)) { Complete-RedirectedProcess $handle }
 	}
-	if (-not $Keep) {
-		try { Remove-ScenarioArtifacts $scenarioDirectory } catch { $cleanupFailure = $_; if ($null -eq $failure) { $failure = $_ } }
+	try {
+		. $setupPhase
+		. $trialPhase
+		. $runnerFinishPhase
+	} catch { $failure = $_ } finally {
+		if ($null -ne $script:PairedState -and $script:PairedState.phase -ne 'cleanup') {
+			Send-PairedEvent 'failure' @{ status = 'ERROR' }
+			Receive-PairedPhase 'cleanup'
+		}
+		. $cleanupPhase
+		if (-not $Keep) {
+			try { Remove-ScenarioArtifacts $scenarioDirectory } catch { $cleanupFailure = $_; if ($null -eq $failure) { $failure = $_ } }
+		}
+	}
+	if ($null -ne $script:PairedState) {
+		return [pscustomobject]@{ runner = $runnerReport; runnerExit = $runnerExit; wrapper = @{ ok = ($null -eq $failure -and $null -eq $cleanupFailure -and -not $script:PairedState.drainFailed); resources = @($processIds.ToArray()); metrics = @{ processCount = $peakProcessCount; peakRssBytes = $peakRssBytes } }; scenarioDirectory = $scenarioDirectory }
 	}
 	$status = if ($null -ne $failure) { 'FAILED' } elseif ($null -ne $runnerReport) { [string] $runnerReport.status } else { 'FAILED' }
 	$cleanupStatus = if ($null -eq $cleanupFailure) { 'CLEAN' } else { 'FAILED' }
@@ -950,6 +1033,15 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 	$report = [pscustomobject] $reportFields
 	Write-BoundedJson (Join-Path $scenarioDirectory 'report.json') $report $MaxMatrixReportBytes 'scenario report'
 	return $report
+}
+
+if ($FunctionsOnly) { return }
+if (-not [string]::IsNullOrWhiteSpace($PairedConfig)) {
+	if ($CapabilityProbe -or $RequireAll -or $KeepArtifacts -or $MatrixPath -or $ScenarioId -or $ServerTemplate) { throw 'PairedConfig contains all paired options; single-mode overrides are not accepted' }
+	$pairedNode = Resolve-Node
+	& $pairedNode (Join-Path $PSScriptRoot '..\coordinator\src\benchmark\paired-cli.mjs') --config ([IO.Path]::GetFullPath($PairedConfig)) --launcher ([IO.Path]::GetFullPath($PSCommandPath)) --entry-elapsed-ms ([string] $pairedEntryClock.Elapsed.TotalMilliseconds)
+	if ($LASTEXITCODE -ne 0) { throw "Paired run incomplete (exit $LASTEXITCODE)" }
+	return
 }
 
 $root = [IO.Path]::GetFullPath($ProjectRoot)

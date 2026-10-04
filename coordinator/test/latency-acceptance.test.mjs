@@ -8,9 +8,9 @@ import { evaluateLatencyAcceptance, normalizeLatencyAcceptancePolicy } from '../
 import { compareInstrumentationRuns, runInstrumentationComparison } from '../src/benchmark/instrumentation-comparison.mjs';
 import { main as acceptanceMain } from '../src/benchmark/latency-acceptance-cli.mjs';
 
-function evidence(latencyScale = 1, overrides = {}) {
+function evidence(latencyScale = 1, overrides = {}, repetitions = 5) {
 	const trials = [];
-	for (const sessionState of ['cold', 'warm']) for (const agentLoad of [1, 8, 16]) for (let repetition = 1; repetition <= 5; repetition += 1) trials.push({
+	for (const sessionState of ['cold', 'warm']) for (const agentLoad of [1, 8, 16]) for (let repetition = 1; repetition <= repetitions; repetition += 1) trials.push({
 		trialId: `${sessionState}-${agentLoad}`, repetition, scenarioId: `scenario-${agentLoad}`, seed: 41 + repetition, agentLoad, sessionState,
 		mode: 'live', timingScope: 'full_path', evidenceSource: 'fabric-headless', workloadConfigHash: 'workload-v1', sourceHash: 'implementation-v1',
 		providerProfile: { provider: 'codex', model: 'gpt-5', reasoningEffort: 'high', serviceTier: 'priority' },
@@ -22,7 +22,7 @@ function evidence(latencyScale = 1, overrides = {}) {
 }
 
 function instrumentation(status = 'PASSED') {
-	return { status, checks: [
+	return { status, pairs: Array.from({ length: 5 }, () => ({ successful: true, enabledDurationMs: 102, disabledDurationMs: 100, durationRatio: 1.02 })), checks: [
 		{ code: 'INSTRUMENTATION_SAMPLE_COUNT', status },
 		{ code: 'INSTRUMENTATION_BEHAVIOR_PARITY', status },
 		{ code: 'INSTRUMENTATION_P95_OVERHEAD', status, observedRatio: 1.02 },
@@ -55,6 +55,67 @@ test('fails when a span exists in only one arm instead of hiding lost instrument
 	assert.equal(result.status, 'FAILED');
 	assert.equal(result.checks.filter((check) => check.code === 'ACTION_SPAN').every((check) => check.status === 'FAILED'), true);
 	assert.equal(result.checks.filter((check) => check.code === 'REQUIRED_SPAN_EVIDENCE').every((check) => check.status === 'FAILED'), true);
+});
+
+test('rejects incomplete successful metrics even with five other samples in every paired cell', () => {
+	for (const arm of ['baseline', 'optimized']) for (const metric of ['latencyMs', 'tickP95Ms', 'actionMs', 'voiceMs']) for (const invalid of [undefined, null, NaN, Infinity, -Infinity, -1]) {
+		const inputs = { baseline: evidence(1, {}, 6), optimized: evidence(0.5, {}, 6), instrumentationComparison: instrumentation() };
+		for (const trial of inputs[arm].trials.filter((trial) => trial.repetition === 6)) {
+			if (metric === 'actionMs' || metric === 'voiceMs') trial.spans[metric] = invalid;
+			else trial[metric] = invalid;
+		}
+		const result = evaluateLatencyAcceptance(inputs);
+		assert.equal(result.claimCertified, false, `${arm}/${metric}/${invalid}`);
+		assert.equal(result.checks.filter((check) => check.code === 'WORKLOAD_PAIRING').every((check) => check.status === 'PASSED'), true);
+		assert.equal(result.checks.filter((check) => check.code === 'SAMPLE_COUNT').every((check) => check.status === 'PASSED'), true);
+		const completeness = result.checks.filter((check) => check.code === 'REQUIRED_SPAN_EVIDENCE');
+		assert.equal(completeness.length, 6);
+		assert.equal(completeness.every((check) => check.status === 'FAILED' && check.evidence[arm].successful === 6), true);
+		if (metric === 'latencyMs') assert.equal(completeness.every((check) => check.evidence[arm].samples === 5), true);
+	}
+});
+
+test('requires the same successful pairs even when failure rates and sample counts match', () => {
+	const baseline = evidence(1, {}, 7);
+	const optimized = evidence(0.5, {}, 7);
+	for (const trial of baseline.trials) if (trial.repetition === 6) trial.status = 'FAILED';
+	for (const trial of optimized.trials) if (trial.repetition === 7) trial.status = 'TIMED_OUT';
+	const result = evaluateLatencyAcceptance({ baseline, optimized, policy: { minimumFactualSuccessRate: 0.8 }, instrumentationComparison: instrumentation() });
+	assert.equal(result.claimCertified, false);
+	assert.equal(result.checks.filter((check) => check.code === 'FACTUAL_SUCCESS_PARITY').every((check) => check.status === 'PASSED'), true);
+	assert.equal(result.checks.filter((check) => check.code === 'METRIC_PAIRING').every((check) => check.status === 'FAILED'), true);
+});
+
+test('retains failed trials in factual rates while allowing explicitly configured matched failures', () => {
+	for (const status of ['FAILED', 'TIMED_OUT']) {
+		const baseline = evidence(1, {}, 6);
+		const optimized = evidence(0.5, {}, 6);
+		for (const trial of [...baseline.trials, ...optimized.trials]) if (trial.repetition === 6) {
+			Object.assign(trial, { status, latencyMs: null, tickP95Ms: null, spans: {} });
+		}
+		const inputs = { baseline, optimized, instrumentationComparison: instrumentation() };
+		const result = evaluateLatencyAcceptance(inputs);
+		assert.equal(result.claimCertified, false);
+		const factual = result.checks.filter((check) => check.code === 'FACTUAL_SUCCESS_PARITY');
+		assert.equal(factual.every((check) => check.status === 'FAILED' && check.evidence.baselineRate === 5 / 6 && check.evidence.optimizedRate === 5 / 6), true);
+		assert.equal(result.checks.filter((check) => check.code === 'REQUIRED_SPAN_EVIDENCE').every((check) => check.status === 'PASSED'), true);
+		assert.equal(evaluateLatencyAcceptance({ ...inputs, policy: { minimumFactualSuccessRate: 0.8 } }).claimCertified, true);
+	}
+});
+
+test('synthetic provider identity cannot be overridden by a top-level live label', () => {
+	for (const labels of [
+		{ synthetic: false, providerIdentity: { provider: 'codex', synthetic: true } },
+		{ synthetic: undefined, providerIdentity: { provider: 'codex', synthetic: true } },
+		{ synthetic: true, providerIdentity: { provider: 'codex', synthetic: false } },
+	]) {
+		const result = evaluateLatencyAcceptance({ baseline: evidence(1), optimized: evidence(0.5, labels), instrumentationComparison: instrumentation() });
+		assert.equal(result.claimCertified, false);
+		const live = result.checks.find((check) => check.code === 'LIVE_PROVIDER_EVIDENCE');
+		assert.equal(live.status, 'FAILED');
+		assert.equal(live.evidence.nonLiveCount, 30);
+	}
+	assert.equal(evaluateLatencyAcceptance({ baseline: evidence(1), optimized: evidence(0.5, { synthetic: undefined, providerIdentity: { provider: 'codex', synthetic: false } }), instrumentationComparison: instrumentation() }).claimCertified, true);
 });
 
 test('rejects duplicate repetitions before percentiles can count copied samples', () => {
@@ -171,4 +232,15 @@ test('shipped latency matrices do not default any cell to one sample', async () 
 		const matrix = JSON.parse(await readFile(new URL(`../config/${name}`, import.meta.url), 'utf8'));
 		assert.equal(matrix.trials.every((trial) => trial.repetitions >= 5), true, name);
 	}
+});
+
+
+test('rejects a supplied PASSED instrumentation artifact with incomplete successful pair timings', () => {
+  for (const arm of ['enabledDurationMs', 'disabledDurationMs']) {
+    const comparison = instrumentation();
+    comparison.pairs.push({ successful: true, enabledDurationMs: 102, disabledDurationMs: 100, durationRatio: 1.02, [arm]: null });
+    const result = evaluateLatencyAcceptance({ baseline: evidence(1), optimized: evidence(0.5), instrumentationComparison: comparison });
+    assert.equal(result.claimCertified, false);
+    assert.equal(result.checks.find((check) => check.code === 'INSTRUMENTATION_COMPARISON').status, 'FAILED');
+  }
 });

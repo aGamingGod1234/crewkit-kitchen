@@ -9,7 +9,7 @@ This layout belongs to a source checkout. The Windows release ZIP uses its own
 
 - `server-template/`: reproducible runnable Fabric server generated from the tracked `server-template/` skeleton by `scripts/prepare-headless-server-template.ps1`; binaries, EULA state, and generated libraries stay ignored.
 - `headless-runs/`: isolated per-run server copies, bounded reports, and optionally retained private diagnostics from the real-provider matrix.
-- `server/`: legacy interactive Fabric server state.
+- `server/`: legacy interactive Fabric server state, prepared with authenticated `online-mode=true` and a loopback listener at `127.0.0.1:25565`.
 - `server-offline-smoke/`: optional, clearly labeled offline smoke server; never authenticated evidence.
 - `downloads/`: cached SHA-256-verified Fabric installer and Fabric API downloads used by the materializer.
 - `evidence/`: world-copy, build, log, screenshot, and live-test summaries with credentials excluded.
@@ -22,11 +22,15 @@ The isolated client directories are outside the project:
 - `%APPDATA%\.minecraft-agent-55`
 - `%APPDATA%\.minecraft-agent-56`
 
-Only Fabric API and the final Arena Agents JAR are copied into their `mods` directories.
+Fabric API, Fabric Carpet, and the final Arena Agents JAR are copied into their `mods` directories.
 
 ## Official launcher installations
 
 `prepare-runtime.ps1` accepts only `%APPDATA%\.minecraft\saves\New World (76)` as its source world. It requires the project-local Java 25 runtime and an existing Fabric API JAR, installs `fabric-loader-0.19.3-26.1.2`, and copies the world into `runtime/server`. After it completes, create two installations through the official launcher UI:
+
+Preparation and the default `start-test-server.ps1` command both require `online-mode=true`. Joining players need an authenticated Minecraft account. Repeated preparation validates the existing mode and loopback listener before updating properties. An older offline `runtime/server` is rejected without changing its settings. With the server stopped, review the copied world's player-data migration before deliberately changing its single `online-mode` setting to `true`: authenticated player UUIDs differ from offline UUIDs. Preparation does not migrate player data.
+
+Offline smoke remains a separate, explicitly prepared `runtime/server-offline-smoke` directory with `online-mode=false` and `server-ip=127.0.0.1`, launched using `start-test-server.ps1 -OfflineSmoke`. That switch does not use or prepare `runtime/server`, and smoke results are not authenticated-player evidence.
 
 ### Arena Agent 55 (GPT-5.5 xhigh Fast)
 

@@ -28,11 +28,12 @@ const service = new CodexService({
 	workspaceManager: new AgentWorkspaceManager(path.join(probeRoot, 'workspaces')),
 });
 
-const runTurn = async (agent, input) => {
+const runTurn = async (agent, input, expected) => {
 	const turnStartedAt = performance.now();
 	let firstToolAt = null;
 	let lastToolAt = null;
 	const calls = [];
+	const requests = [];
 	const result = await agent.act(input, {
 		goalRevision: 1,
 		executeTool: async (request) => {
@@ -40,10 +41,14 @@ const runTurn = async (agent, input) => {
 			firstToolAt ??= now;
 			lastToolAt = now;
 			calls.push(request.tool.actionType ?? request.tool.kind);
+			requests.push(structuredClone(request.tool));
 			return { state: 'SUCCEEDED', reasonCode: '', executionStarted: true, delivered: true };
 		},
 	});
+	const valid = result?.status === 'completed' && requests.length === expected.length && requests.every((request, index) => validRequest(request, expected[index]));
 	return {
+		valid,
+		requests,
 		firstToolMs: firstToolAt === null ? null : Math.round(firstToolAt - turnStartedAt),
 		lastToolMs: lastToolAt === null ? null : Math.round(lastToolAt - turnStartedAt),
 		totalMs: Math.round(performance.now() - turnStartedAt),
@@ -57,12 +62,12 @@ try {
 	const agent = await service.createAgent(profile, { controlProtocol: 'native_tools' });
 	await agent.setGoalRevision(1);
 	const readyAt = performance.now();
-	const coldDm = await runTurn(agent, 'event: Lucas sent a DM saying "hi". Call say exactly once with a short friendly reply, then end this turn.');
-	const warmDm = await runTurn(agent, 'event: Lucas sent a DM saying "how are you?". Call say exactly once with a short friendly reply, then end this turn.');
-	const moveMine = await runTurn(agent, 'event: active goal is to mine the known stone block at x=2,y=64,z=1. You are at x=0,y=64,z=0. Call moveTo near it, use the successful result, then call mine on that exact block. Do not finish this goal in this probe.');
-	const craft = await runTurn(agent, 'event: probe only. Call act exactly once with actionType craft_inventory and arguments recipeId minecraft:oak_planks, count 4, timeoutMs 15000. End this turn after the successful result.');
+	const coldDm = await runTurn(agent, 'event: Lucas sent a DM saying "hi". Call say exactly once with a short friendly reply, then end this turn.', ['chat']);
+	const warmDm = await runTurn(agent, 'event: Lucas sent a DM saying "how are you?". Call say exactly once with a short friendly reply, then end this turn.', ['chat']);
+	const moveMine = await runTurn(agent, 'event: active goal is to mine the known stone block at x=2,y=64,z=1. You are at x=0,y=64,z=0. Call moveTo near it, use the successful result, then call mine on that exact block. Do not finish this goal in this probe.', ['navigate_to', 'break_block']);
+	const craft = await runTurn(agent, 'event: probe only. Call act exactly once with actionType craft_inventory and arguments recipeId minecraft:oak_planks, count 4, timeoutMs 15000. End this turn after the successful result.', ['craft_inventory']);
 	return {
-		status: 'PASSED', variant, trial, profile: { model, reasoningEffort, serviceTier },
+		status: [coldDm, warmDm, moveMine, craft].every((turn) => turn.valid) ? 'PASSED' : 'FAILED', variant, trial, profile: { model, reasoningEffort, serviceTier },
 		initializationMs: Math.round(readyAt - startedAt),
 		totalMs: Math.round(performance.now() - startedAt),
 		coldDm, warmDm, moveMine, craft,
@@ -70,6 +75,17 @@ try {
 } finally {
 	await service.stop();
 }
+}
+
+function validRequest(tool, actionType) {
+	if (tool?.kind !== 'action' || tool.actionType !== actionType) return false;
+	const args = tool.arguments;
+	if (!args || typeof args !== 'object') return false;
+	if (actionType === 'chat') return typeof args.message === 'string' && args.message.trim().length > 0;
+	if (actionType === 'craft_inventory') return args.recipeId === 'minecraft:oak_planks' && args.count === 4 && args.timeoutMs === 15000;
+	if (actionType === 'break_block') return args.x === 2 && args.y === 64 && args.z === 1;
+	// moveTo identifies the known block; its tolerance controls how near to stand.
+	return args.x === 2 && args.y === 64 && args.z === 1;
 }
 
 process.exitCode = await runNativeToolCli(main);

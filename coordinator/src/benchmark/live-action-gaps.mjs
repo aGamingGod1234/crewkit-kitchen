@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -12,12 +12,19 @@ function parseJsonl(text) {
 }
 
 async function readOptionalJsonl(file) {
-	try {
-		return parseJsonl(await readFile(file, 'utf8'));
-	} catch (error) {
-		if (error?.code === 'ENOENT') return [];
-		throw error;
+	const base = path.basename(file);
+	const entries = await readdir(path.dirname(file));
+	const generations = entries.flatMap((name) => name === base ? [{ name, generation: 0 }]
+		: name.startsWith(`${base}.`) && /^[1-9]\d*$/.test(name.slice(base.length + 1))
+			? [{ name, generation: Number(name.slice(base.length + 1)) }] : [])
+		.sort((left, right) => right.generation - left.generation);
+	const rows = [];
+	// Read oldest first and one file at a time, retaining the original strict JSONL
+	// parsing. A missing/corrupt retained generation must not silently become zero.
+	for (const { name } of generations) {
+		for (const row of parseJsonl(await readFile(path.join(path.dirname(file), name), 'utf8'))) rows.push(row);
 	}
+	return rows;
 }
 
 function eventName(row) {
@@ -185,6 +192,15 @@ export async function summarize(directory) {
 		modelDecisionSegments: decisions.length,
 		modelSegmentMsTotal: decisions.length === 0 || knownDecisionDurations.length === 0 ? null : round(knownDecisionDurations.reduce((sum, duration) => sum + duration, 0)),
 		modelDecisionTimingAvailable: knownDecisionDurations.length > 0,
+		// These artifacts contain no capture-start/end receipt for this report's
+		// run window. Even contiguous lifetime counters cannot prove a missing tail
+		// or exclude earlier runs. Keep observed evidence without claiming a total.
+		modelDecisionTimingComplete: false,
+		modelDecisionTimingEvidence: {
+			scope: 'retained_segments',
+			complete: false,
+			reasons: [knownDecisionDurations.length === 0 ? 'missing_timing' : 'run_window_capture_unverified'],
+		},
 		modelDecisionDurationCount: knownDecisionDurations.length,
 		inspectionRequests: inspections,
 		observations,
@@ -201,7 +217,7 @@ export async function summarize(directory) {
 function aggregateRuns(runs) {
 	const sweepGaps = runs.flatMap((run) => run.sweepGapsMs);
 	const sweepDurations = runs.flatMap((run) => run.sweeps.filter((sweep) => sweep.steps >= 2).map((sweep) => sweep.durationMs / sweep.steps));
-	const modelTimedRuns = runs.filter((run) => run.modelDecisionTimingAvailable);
+	const modelTimedRuns = runs.filter((run) => run.modelDecisionTimingComplete);
 	const phaseValues = (phase) => runs.map((run) => run.phaseAttribution[phase]?.durationMs).filter((value) => Number.isFinite(value) && value >= 0);
 	return {
 		runs,
@@ -210,9 +226,10 @@ function aggregateRuns(runs) {
 		sweepGapP95Ms: percentile(sweepGaps, 0.95),
 		sweepMsPerStepP50: percentile(sweepDurations, 0.5),
 		elapsedMsP50: percentile(runs.map((run) => run.elapsedMs).filter(Number.isFinite), 0.5),
+		modelDecisionTimingAvailableRuns: runs.filter((run) => run.modelDecisionTimingAvailable).length,
 		modelDecisionTimingRuns: modelTimedRuns.length,
 		modelDecisionTimingCoverage: runs.length === 0 ? null : modelTimedRuns.length / runs.length,
-		// Only report a non-model remainder when every run has direct decision timing.
+		// Availability of retained timing is not proof of full-run coverage.
 		nonModelMsP50: modelTimedRuns.length === runs.length && runs.length > 0
 			? percentile(runs.map((run) => run.elapsedMs - run.modelSegmentMsTotal), 0.5)
 			: null,

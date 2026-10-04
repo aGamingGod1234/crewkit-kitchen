@@ -55,7 +55,12 @@ export class TraceWriter {
 			inspect: dependencies.appendFile === undefined || dependencies.stat !== undefined
 				|| dependencies.maxFileBytes !== undefined || dependencies.maxFileAgeMs !== undefined,
 		})]));
+		const directories = [path.dirname(this.#filePath), this.#diagnosticFilePath === null ? null : path.dirname(this.#diagnosticFilePath)].filter(Boolean);
+		this.#ready = Promise.all([...new Set(directories)].map((directory) => this.#mkdir(directory, { recursive: true, mode: 0o700 })))
+			.then(() => Promise.all([this.#filePath, this.#diagnosticFilePath].filter(Boolean).map((filePath) => this.#preparePrivateArtifact(filePath))))
+			.then(() => true, () => false);
 		this.#queue = new BestEffortDiagnosticQueue({
+			ready: this.#ready,
 			maxPending: dependencies.maxPending,
 			operationTimeoutMs: dependencies.operationTimeoutMs,
 			closeTimeoutMs: dependencies.closeTimeoutMs,
@@ -64,10 +69,7 @@ export class TraceWriter {
 			dispatch: dependencies.dispatch,
 			now: dependencies.now,
 		});
-		const directories = [path.dirname(this.#filePath), this.#diagnosticFilePath === null ? null : path.dirname(this.#diagnosticFilePath)].filter(Boolean);
-		this.#ready = Promise.all([...new Set(directories)].map((directory) => this.#mkdir(directory, { recursive: true, mode: 0o700 })))
-			.then(() => Promise.all([this.#filePath, this.#diagnosticFilePath].filter(Boolean).map((filePath) => this.#preparePrivateArtifact(filePath))))
-			.then(() => true, () => false);
+
 	}
 
 	write(eventOrRow, fields = {}) {

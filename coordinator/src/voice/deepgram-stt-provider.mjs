@@ -48,6 +48,9 @@ export class DeepgramSttProvider {
 				`Deepgram STT failed with HTTP ${response.status}`,
 			);
 			if (response.status === 429) error.retryAfter = response.headers?.get?.('retry-after');
+			// Cancellation may itself remain pending; the typed HTTP error still owns this boundary.
+			try { Promise.resolve(response.body?.cancel?.()).catch(() => {}); } catch { /* preserve the HTTP error */ }
+			responseController.abort(error);
 			throw error;
 		}
 		const body = await readBoundedResponseBody(

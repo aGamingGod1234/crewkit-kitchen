@@ -285,7 +285,8 @@ public final class AgentControlClient {
 							agent.model(),
 							agent.reasoning(),
 							agent.serviceTier(),
-							Optional.of(agent.team()).filter(value -> !value.isBlank()),
+							// Solo is the setup UI's unteamed choice, not a shared team name.
+							Optional.of(agent.team()).filter(value -> !value.isBlank() && !value.equals("Solo")),
 							agent.gameMode()
 					)).toList(),
 					plan.confirmationToken()

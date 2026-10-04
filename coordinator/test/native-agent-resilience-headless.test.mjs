@@ -10,6 +10,11 @@ test('wooden pickaxe goal survives injected faults across native turns and verif
 	const result = await createNativeGoalHarness(woodenPickaxeFaultScenario()).run();
 	assert.equal(result.finalState, 'COMPLETED');
 	assert.equal(result.inventory.get('minecraft:wooden_pickaxe'), 1);
+	assert.equal(result.inventory.get('minecraft:oak_log') ?? 0, 0);
+	assert.equal(result.inventory.get('minecraft:oak_planks'), 3);
+	assert.equal(result.inventory.get('minecraft:stick'), 2);
+	assert.equal(result.world.blocks.get('1,64,1'), 'minecraft:crafting_table');
+	assert.ok(result.actionDispatches.some(({ payload }) => payload.actionType === 'craft_table'));
 	assert.ok(result.providerTurns >= 5);
 	assert.ok(result.recoveries.includes('PATH_BLOCKED'));
 	assert.ok(result.recoveries.includes('PLANNING_TIMEOUT'));

@@ -133,10 +133,12 @@ public final class GoalVerificationRuntime {
 				continue;
 			}
 			if (!record.state().isActive() || record.currentGoal().isEmpty()) continue;
-			if (record.state() == dev.agaminggod.arenaagents.agent.AgentLifecycleState.ACTING) continue;
 			GoalStatus status = record.currentGoal().orElseThrow().status();
 			if (status != GoalStatus.ACTIVE && status != GoalStatus.RECOVERING) continue;
 			GoalCompletionVerifier.VerificationResult result = verifySafely(record, tick);
+			// Observe temporal predicates on every active tick, but let the action publish
+			// its authoritative result before a terminal goal transition can cancel it.
+			if (record.state() == AgentLifecycleState.ACTING) continue;
 			if (!result.verified()) continue;
 			transitions.add(registry.satisfyGoal(record.agentId(), record.goalRevision(), result.evidence(tick), now));
 		}

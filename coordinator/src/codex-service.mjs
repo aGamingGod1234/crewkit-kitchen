@@ -10,6 +10,7 @@ import { recordProviderTurn } from './provider-turn-recorder.mjs';
 import { reportVisibleOutput } from './verbose-output.mjs';
 import { sanitizeDiagnosticText } from './diagnostic-sanitizer.mjs';
 import { createExecutionSettings } from './provider-identity.mjs';
+import { ToolResponseSummary } from './tool-response-summary.mjs';
 
 const DEFAULT_PLANNING_TIMEOUT_MS = 45_000;
 const DEFAULT_STARTUP_TIMEOUT_MS = 15_000;
@@ -55,7 +56,7 @@ export class CodexService {
 			this.#transport.on('protocolError', (error) => this.#handleTransportLoss(error));
 		}
 		if (typeof this.#transport.getMaxListeners === 'function' && typeof this.#transport.setMaxListeners === 'function') {
-			this.#transport.setMaxListeners(Math.max(this.#transport.getMaxListeners(), DEFAULT_AGENT_CAP + 4));
+			this.#transport.setMaxListeners(Math.max(this.#transport.getMaxListeners(), DEFAULT_AGENT_CAP * 2 + 4));
 		}
 		this.#workspaceManager = dependencies.workspaceManager ?? null;
 		if (this.#workspaceManager !== null && typeof this.#workspaceManager.prepare !== 'function') {
@@ -123,10 +124,12 @@ export class CodexService {
 		try { return await promise; } finally { this.#creating.delete(profile.agentId); }
 	}
 
-	async replaceAgent(profileValue, { recoverySummary = null, controlProtocol = 'native_tools', expectedSessionGeneration = null } = {}) {
+	async replaceAgent(profileValue, { recoverySummary = null, controlProtocol = 'native_tools', expectedSessionGeneration = null, resetReason = null } = {}) {
 		const lifecycleGeneration = this.#lifecycleGeneration;
 		const profile = validateProfile(profileValue, this.#config);
 		const protocol = validateControlProtocol(controlProtocol);
+		// Validate diagnostics before retiring the current session; never put them in factual recovery input.
+		if (resetReason !== null && (typeof resetReason !== 'string' || resetReason.length > 128)) throw new TypeError('resetReason must be null or bounded text');
 		const replacing = this.#replacing.get(profile.agentId);
 		if (replacing !== undefined) {
 			if (!profilesMatch(replacing.profile, profile) || replacing.controlProtocol !== protocol) throw new CodexProtocolError('AGENT_PROFILE_CONFLICT', PROFILE_CONFLICT_MESSAGE);
@@ -144,7 +147,7 @@ export class CodexService {
 				this.#assertLifecycleCurrent(lifecycleGeneration);
 				await this.start();
 				this.#assertLifecycleCurrent(lifecycleGeneration);
-				return this.#createAgentOnce(profile, recoverySummary, protocol, lifecycleGeneration);
+				return this.#createAgentOnce(profile, recoverySummary, protocol, lifecycleGeneration, resetReason);
 			});
 		const entry = { profile, controlProtocol: protocol, promise };
 		this.#replacing.set(profile.agentId, entry);
@@ -159,7 +162,7 @@ export class CodexService {
 		return agent;
 	}
 
-	async #createAgentOnce(profile, recoverySummary, controlProtocol, lifecycleGeneration) {
+	async #createAgentOnce(profile, recoverySummary, controlProtocol, lifecycleGeneration, resetReason = null) {
 		const transportGeneration = this.#transportGeneration;
 		if (this.#catalog.stale && !profilesMatch(this.#exactLaunchProfile, profile)) await this.#catalog.refresh();
 		this.#assertLifecycleCurrent(lifecycleGeneration);
@@ -228,7 +231,7 @@ export class CodexService {
 			schedule: this.#config.schedule,
 			cancelSchedule: this.#config.cancelSchedule,
 			sessionGeneration,
-			resetReason: sessionGeneration > 1 ? 'session_replaced' : null,
+			resetReason: resetReason ?? (sessionGeneration > 1 ? 'session_replaced' : null),
 			controlProtocol,
 			reportedSettings: response,
 		});
@@ -311,9 +314,13 @@ export class CodexService {
 	}
 
 	async #startOnce(attempt) {
-		await this.#prepareMinecraftLaunch();
-		this.#assertStartupCurrent(attempt);
-		const transportStart = Promise.resolve().then(() => this.#transport.start({ signal: attempt.controller.signal }));
+		// Preparation belongs to the same bounded attempt as transport startup.
+		// Its late continuation must not rewrite a successor's launch environment.
+		const transportStart = Promise.resolve().then(async () => {
+			await this.#prepareMinecraftLaunch(attempt);
+			this.#assertStartupCurrent(attempt);
+			return this.#transport.start({ signal: attempt.controller.signal });
+		});
 		try {
 			await withStartupDeadline(transportStart, this.#config.startupTimeoutMs, this.#startupSchedule, this.#startupCancelSchedule, attempt.controller);
 			this.#assertStartupCurrent(attempt);
@@ -338,9 +345,10 @@ export class CodexService {
 		}
 	}
 
-	async #prepareMinecraftLaunch() {
+	async #prepareMinecraftLaunch(attempt) {
 		if (this.#minecraftWorkspace === null || typeof this.#transport.setEnvironment !== 'function') return;
-		const prepared = await this.#minecraftWorkspace.prepare({ sourceCodexHome: this.#codexEnvironment().CODEX_HOME });
+		const prepared = await this.#minecraftWorkspace.prepare({ sourceCodexHome: this.#codexEnvironment().CODEX_HOME, signal: attempt.controller.signal });
+		this.#assertStartupCurrent(attempt);
 		if (prepared === null || typeof prepared !== 'object') return;
 		if (prepared.codexHome === undefined) return;
 		if (typeof prepared.codexHome !== 'string' || prepared.codexHome.trim().length === 0) {
@@ -400,6 +408,9 @@ export class SharedCodexAgent {
 	#disposed = false;
 	#invalidationError = null;
 	#observationViews = new ModelObservationViews();
+	#nativeUsageTotal = null;
+	#nativeUsagePreviousEnd = null;
+	#onNativeNotification = null;
 
 	constructor(profile, threadId, transport, dependencies = {}) {
 		this.#profile = structuredClone(profile);
@@ -418,6 +429,19 @@ export class SharedCodexAgent {
 			evidence: { model: 'submitted', serviceTier: 'submitted' },
 		});
 		this.#recordEffectiveSettings(dependencies.reportedSettings, false);
+		if (this.#controlProtocol === 'native_tools') {
+			// Keep the latest observed counter even between turns. An absent baseline
+			// stays unknown; a newly attached session does not imply a zero bill.
+			this.#onNativeNotification = ({ method, params }) => {
+				// Context may compact while no turn collector is attached. Fence pending
+				// deliveries immediately for the entire thread lifetime.
+				if (params?.threadId === this.#threadId && isContextCompaction(method, params)) this.#observationViews.reset();
+				if (this.#active === null && method === 'thread/tokenUsage/updated' && params?.threadId === this.#threadId) {
+					this.#nativeUsageTotal = codexTokenUsage(params?.tokenUsage?.total);
+				}
+			};
+			this.#transport.on('notification', this.#onNativeNotification);
+		}
 	}
 
 	get agentId() { return this.#profile.agentId; }
@@ -613,10 +637,13 @@ export class SharedCodexAgent {
 			const adoptedTurn = this.#prewarmTurnPromise;
 			const abortAdopted = () => { if (this.#active === adopted) void this.interrupt().catch(() => {}); };
 			adopted.onProgress = onProgress;
+			adopted.collector.replaceOnVerbose(onVerbose);
 			signal?.addEventListener('abort', abortAdopted, { once: true });
 			try {
 				await this.#steerActiveNativeTurn(input, { goalRevision, executeTool });
 				return await adoptedTurn;
+			} catch (error) {
+				throw withNativeTurn(error, adopted.collector.snapshot());
 			} finally {
 				signal?.removeEventListener('abort', abortAdopted);
 			}
@@ -627,6 +654,7 @@ export class SharedCodexAgent {
 		if (this.#active !== null) throw new CodexProtocolError('TURN_IN_PROGRESS', `Codex agent '${this.agentId}' already has an active turn`);
 
 		const silenceDeadline = createProviderSilenceDeadline(this.#planningTimeoutMs, this.#schedule, this.#cancelSchedule);
+		let receivedUsageTotal = false;
 		const collector = createNativeTurnCollector({
 			transport: this.#transport,
 			threadId: this.#threadId,
@@ -635,6 +663,12 @@ export class SharedCodexAgent {
 			executeTool,
 			onVerbose,
 			observationViews: this.#observationViews,
+			usageStart: this.#nativeUsageTotal,
+			usagePreviousEnd: this.#nativeUsagePreviousEnd,
+			onUsageTotal: (total) => {
+				this.#nativeUsageTotal = total;
+				if (total !== null) receivedUsageTotal = true;
+			},
 			onProviderActivity: () => {
 				silenceDeadline.restart();
 				if (this.#active?.collector === collector) this.#active.onProgress?.({ phase: 'provider' });
@@ -667,9 +701,11 @@ export class SharedCodexAgent {
 		};
 		signal?.addEventListener('abort', abort, { once: true });
 		try {
+			const encodedInput = encodeNativeEventInput(input, this.#observationViews);
+			collector.recordInput('turn/start', encodedInput);
 			const turnStartPromise = this.#transport.request('turn/start', {
 				threadId: this.#threadId,
-				input: [{ type: 'text', text: encodeNativeEventInput(input, this.#observationViews) }],
+				input: [{ type: 'text', text: encodedInput }],
 				model: this.#profile.model,
 				effort: this.#profile.reasoningEffort,
 				serviceTier: this.#profile.serviceTier,
@@ -687,7 +723,7 @@ export class SharedCodexAgent {
 				}
 				void this.#transport.request('turn/interrupt', { threadId: this.#threadId, turnId }).catch(() => {});
 			}, () => {});
-			const response = await withTimeout(Promise.race([turnStartPromise, lifecyclePromise]), this.#planningTimeoutMs, this.#schedule, this.#cancelSchedule);
+			const response = await withTimeout(Promise.race([turnStartPromise, lifecyclePromise, collector.promise]), this.#planningTimeoutMs, this.#schedule, this.#cancelSchedule);
 			active.turnId = requireNestedId(response, 'turn', 'turn/start');
 			this.#recordEffectiveSettings(response);
 			collector.setTurnId(active.turnId);
@@ -701,13 +737,22 @@ export class SharedCodexAgent {
 			this.#sessionState = 'warm';
 			return result;
 		} catch (error) {
-			if (['PLANNING_TIMEOUT', 'PROVIDER_SETTINGS_MISMATCH'].includes(error?.code)) {
+			if (['PLANNING_TIMEOUT', 'PROVIDER_SETTINGS_MISMATCH', 'TURN_NOTIFICATION_OVERFLOW', 'TOOL_RESPONSE_DELIVERY_FAILED'].includes(error?.code)) {
+				// Overflow abandons collection, not the provider turn. Retire its
+				// accepted ID (or fence the late start) before releasing ownership.
 				try { await this.interrupt(); } catch {}
 			}
-			throw error;
+			throw withNativeTurn(error, collector.snapshot());
 		} finally {
 			signal?.removeEventListener('abort', abort);
 			silenceDeadline.dispose();
+			// A turn with no counter evidence creates a gap. Do not charge its
+			// unobserved usage to the next turn by retaining an older baseline.
+			const evidence = collector.snapshot();
+			// A counter after collector settlement cannot repair this turn's missing
+			// attribution, but it is a valid baseline for the next observed interval.
+			if (evidence.usage.status === 'missing' && !receivedUsageTotal) this.#nativeUsageTotal = null;
+			this.#nativeUsagePreviousEnd = evidence.usage.end;
 			collector.dispose();
 			if (this.#active === active) this.#active = null;
 		}
@@ -732,22 +777,22 @@ export class SharedCodexAgent {
 		if (this.#active !== active || this.#goalRevision !== goalRevision) throw new CodexProtocolError('STALE_PLAN', 'Codex native turn ended before steering');
 		let previousExecutor = null;
 		let steerPromise;
+		const encodedInput = encodeNativeEventInput(input, this.#observationViews);
+		const submitSteer = () => {
+			active.collector.recordInput('turn/steer', encodedInput);
+			return this.#transport.request('turn/steer', {
+				threadId: this.#threadId, expectedTurnId: turnId,
+				input: [{ type: 'text', text: encodedInput }],
+			});
+		};
 		if (executeTool !== null) {
-			steerPromise = Promise.resolve().then(() => this.#transport.request('turn/steer', {
-				threadId: this.#threadId,
-				expectedTurnId: turnId,
-				input: [{ type: 'text', text: encodeNativeEventInput(input, this.#observationViews) }],
-			}));
+			steerPromise = Promise.resolve().then(submitSteer);
 			previousExecutor = active.collector.replaceExecuteTool(async (request) => {
 				await steerPromise;
 				return executeTool(request);
 			});
 		} else {
-			steerPromise = this.#transport.request('turn/steer', {
-				threadId: this.#threadId,
-				expectedTurnId: turnId,
-				input: [{ type: 'text', text: encodeNativeEventInput(input, this.#observationViews) }],
-			});
+			steerPromise = submitSteer();
 		}
 		try {
 			const response = await steerPromise;
@@ -756,7 +801,7 @@ export class SharedCodexAgent {
 			return response;
 		} catch (error) {
 			if (previousExecutor !== null && this.#active === active) active.collector.replaceExecuteTool(previousExecutor);
-			throw error;
+			throw withNativeTurn(error, active.collector.snapshot());
 		}
 	}
 
@@ -775,6 +820,7 @@ export class SharedCodexAgent {
 	async dispose() {
 		if (this.#disposed) return;
 		this.#disposed = true;
+		if (this.#onNativeNotification !== null) this.#transport.off('notification', this.#onNativeNotification);
 		const active = this.#active;
 		active?.cancel(new CodexProtocolError('AGENT_DISPOSED', `Codex agent '${this.agentId}' is disposed`));
 		try { await this.interrupt(); } finally {
@@ -787,6 +833,7 @@ export class SharedCodexAgent {
 		if (this.#disposed) return;
 		this.#invalidationError = error;
 		this.#disposed = true;
+		if (this.#onNativeNotification !== null) this.#transport.off('notification', this.#onNativeNotification);
 		this.#threadId = null;
 		const active = this.#active;
 		active?.cancel(error);
@@ -898,6 +945,10 @@ function isRateLimitError(error) {
 		.some((key) => info[key]?.httpStatusCode === 429);
 }
 
+function isContextCompaction(method, params) {
+	return method === 'thread/compacted' || ['item/started', 'item/completed'].includes(method) && params?.item?.type === 'contextCompaction';
+}
+
 export function presentNativeToolResult(value, tool, views = new ModelObservationViews()) {
 	// Keep the existing coverage/truncation contract and compress exactly the
 	// facts it would have delivered. Internal ArenaScript reads stay untouched.
@@ -906,19 +957,65 @@ export function presentNativeToolResult(value, tool, views = new ModelObservatio
 	const prepared = views.prepare(original, tool);
 	const text = JSON.stringify(encodeModelFacts(prepared.value));
 	if (Buffer.byteLength(text, 'utf8') > MAX_TOOL_RESULT_BYTES) {
-		views.reset();
-		return { response, commit() {} };
+		// Even a metadata-overflow fallback changes delivery state only on success.
+		return { response, commit: prepared.commitWithoutView ?? prepared.commit };
 	}
 	return { response: { ...response, contentItems: [{ type: 'inputText', text }] }, commit: prepared.commit };
 }
 
-function createNativeTurnCollector({ transport, threadId, agentId, goalRevision, executeTool, onVerbose, observationViews = new ModelObservationViews(), onProviderActivity = () => {}, onToolExecutionStart = () => {}, onToolExecutionEnd = () => {} }) {
+function createNativeTurnCollector({ transport, threadId, agentId, goalRevision, executeTool, onVerbose, usageStart = null, usagePreviousEnd = null, onUsageTotal = () => {}, observationViews = new ModelObservationViews(), onProviderActivity = () => {}, onToolExecutionStart = () => {}, onToolExecutionEnd = () => {} }) {
 	const liveMessages = new Map();
 	let expectedTurnId = null;
-	let bufferedRequests = [];
+	let bufferedEvents = [];
 	let publishedAgentMessage = false;
 	let settled = false;
 	let toolCalls = 0;
+	let toolResultBytes = 0;
+	const toolResponses = new ToolResponseSummary();
+	let inputBytes = 0;
+	const inputs = [];
+	let usageEnd = null;
+	let previousUsage = usageStart;
+	let usageUpdates = 0;
+	let counterReset = false;
+	let compaction = false;
+	const snapshot = () => {
+		const status = usageUpdates === 0 || usageEnd === null ? 'missing'
+			: counterReset ? 'counter_reset' : usageStart === null ? 'baseline_unknown' : 'available';
+		const tokens = Object.fromEntries(['input', 'output', 'reasoning', 'cached', 'cacheWrite'].map((key) => [key,
+			status === 'available' && usageStart[key] !== null && usageEnd[key] !== null ? usageEnd[key] - usageStart[key] : null]));
+		return { threadId, turnId: expectedTurnId, tokens,
+			usage: { scope: 'observed_thread_counter_delta', status, start: usageStart, end: usageEnd, updates: usageUpdates, counterReset,
+				attributionComplete: false, gapBefore: counterDelta(usagePreviousEnd, usageStart) },
+			input: inputs.length === 1 ? inputs[0].input : inputs.length === 0 ? '' : JSON.stringify(inputs),
+			inputBytes, inputCount: inputs.length, toolCalls, toolResultBytes, toolResponses: toolResponses.snapshot(), compaction };
+	};
+	const respond = async (id, response, metadata) => {
+		let measurement = null;
+		// Capture the exact presented response, excluding its RPC envelope. A lost
+		// diagnostic must never be mistaken for a rejected transport delivery.
+		if (metadata !== null) {
+			try {
+				measurement = toolResponses.begin({ ...metadata, success: response.success, serializedResponse: JSON.stringify(response) });
+			} catch { toolResponses.captureFailure(); }
+		}
+		const respondStartedAt = performance.now();
+		try {
+			await transport.respond(id, response);
+		} catch {
+			measurement?.finish(false, performance.now() - respondStartedAt);
+			// A failed write has uncertain delivery. Do not retry the same response ID
+			// with an error payload or retain context-dependent baselines.
+			observationViews.reset();
+			const error = new CodexProtocolError('TOOL_RESPONSE_DELIVERY_FAILED', 'Native tool response transport failed');
+			settled = true;
+			rejectPromise(error);
+			throw error;
+		}
+		// Acceptance is only local respond fulfillment, not downstream model ACK.
+		measurement?.finish(true, performance.now() - respondStartedAt);
+		if (measurement !== null) toolResultBytes += measurement.bytes;
+	};
 	let toolExecutor = executeTool;
 	let completionStatus = null;
 	let executionTail = Promise.resolve();
@@ -930,7 +1027,7 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 		if (settled || completionStatus === null || pendingTools.size > 0) return;
 		settled = true;
 		if (completionStatus.status === 'failed') rejectPromise(completionStatus.error);
-		else resolvePromise({ status: 'completed', toolCalls });
+		else resolvePromise({ status: 'completed', toolCalls, nativeTurn: snapshot() });
 	};
 	const respondToTool = (request) => {
 		if (settled || completionStatus !== null) return;
@@ -941,33 +1038,43 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 		const execute = async () => {
 			if (settled || completionStatus?.status === 'failed') return;
 			let executionStarted = false;
+			let tool;
+			let executionMs;
+			const measurementMetadata = (result) => {
+				try { return { name: params.tool, kind: tool?.kind, hasPostAction: result?.postAction != null, executionMs }; }
+				catch { toolResponses.captureFailure(); return null; }
+			};
 			try {
-				const tool = normalizeMinecraftToolCall(params.tool, params.arguments);
+				tool = normalizeMinecraftToolCall(params.tool, params.arguments);
 				safeVerbose(onVerbose, 'live_tool', `${params.tool} ${JSON.stringify(params.arguments).slice(0, 1200)}`);
 				onToolExecutionStart(tool);
 				executionStarted = true;
-				const result = await executor({
+				const executionRequest = {
 					agentId,
 					goalRevision,
 					threadId,
 					turnId: expectedTurnId,
 					callId: params.callId,
 					tool,
-				});
+				};
+				let result;
+				const executionStartedAt = performance.now();
+				try { result = await executor(executionRequest); }
+				finally { executionMs = performance.now() - executionStartedAt; }
 				if (!settled) {
 					const presented = presentNativeToolResult(result, tool, observationViews);
-					transport.respond(id, presented.response);
-					presented.commit();
+					await respond(id, presented.response, measurementMetadata(result));
+					if (!settled) presented.commit();
 					safeVerbose(onVerbose, 'live_result', presented.response.contentItems[0].text.slice(0, 1200));
 				}
 			} catch (error) {
 				if (settled) return;
-				transport.respond(id, toolResultContent({
+				await respond(id, toolResultContent({
 					state: 'FAILED',
 					reasonCode: String(error?.code ?? 'TOOL_EXECUTION_FAILED').slice(0, 128),
 					message: String(error?.message ?? error).slice(0, 512),
 					...(error?.actionContract === undefined ? {} : { actionContract: error.actionContract }),
-				}, false));
+				}, false), measurementMetadata(null));
 			} finally {
 				if (executionStarted) onToolExecutionEnd();
 			}
@@ -980,23 +1087,37 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 			settleCompletedTurn();
 		}).catch(() => {});
 	};
+	const bufferEvent = (kind, value) => {
+		if (settled) return;
+		if (bufferedEvents.length >= MAX_BUFFERED_TURN_NOTIFICATIONS) {
+			settled = true;
+			bufferedEvents = [];
+			rejectPromise(new CodexProtocolError('TURN_NOTIFICATION_OVERFLOW', 'Too many Codex events arrived before turn/start completed'));
+			return;
+		}
+		bufferedEvents.push({ kind, value });
+	};
 	const onServerRequest = (request) => {
 		if (request?.method !== 'item/tool/call' || request.params?.threadId !== threadId) return;
 		if (expectedTurnId !== null && request.params?.turnId !== expectedTurnId) return;
+		if (expectedTurnId === null) { bufferEvent('request', request); return; }
 		onProviderActivity();
-		if (expectedTurnId === null) {
-			if (bufferedRequests.length >= MAX_BUFFERED_TURN_NOTIFICATIONS) {
-				settled = true;
-				rejectPromise(new CodexProtocolError('TURN_NOTIFICATION_OVERFLOW', 'Too many Codex tool calls arrived before turn/start completed'));
-				return;
-			}
-			bufferedRequests.push(request);
-			return;
-		}
 		void respondToTool(request);
 	};
-	const onNotification = ({ method, params }) => {
-		if (params?.threadId === threadId && (method === 'thread/compacted' || ['item/started', 'item/completed'].includes(method) && params?.item?.type === 'contextCompaction')) observationViews.reset();
+	const onNotification = (notification) => {
+		const { method, params } = notification;
+		if (params?.threadId === threadId) {
+			// The stdio decoder emits every line in one chunk synchronously, before
+			// turn/start's awaiting continuation can install its ID. Keep requests
+			// and notifications together so completion cannot overtake an earlier tool.
+			if (expectedTurnId === null) { bufferEvent('notification', notification); return; }
+			// Compaction invalidates thread context, including views established by
+			// earlier turns. Its optional turn ID must not narrow that invalidation.
+			if (isContextCompaction(method, params)) {
+				compaction = true;
+			}
+			if (notificationTurnId(params) !== null && notificationTurnId(params) !== expectedTurnId) return;
+		}
 		// Usage is a thread notification without a turn ID. Account limits are
 		// shared account state; neither should be discarded by the turn filter.
 		if (method === 'account/rateLimits/updated') {
@@ -1005,6 +1126,13 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 			return;
 		}
 		if (method === 'thread/tokenUsage/updated' && params?.threadId === threadId) {
+			const total = codexTokenUsage(params?.tokenUsage?.total);
+			onUsageTotal(total);
+			if (settled) return;
+			usageEnd = total;
+			usageUpdates += 1;
+			if (previousUsage !== null && usageEnd !== null && Object.keys(usageEnd).some((key) => previousUsage[key] !== null && usageEnd[key] !== null && usageEnd[key] < previousUsage[key])) counterReset = true;
+			previousUsage = usageEnd === null ? previousUsage : Object.fromEntries(Object.keys(usageEnd).map((key) => [key, usageEnd[key] ?? previousUsage?.[key] ?? null]));
 			safeVerbose(onVerbose, 'live_usage', JSON.stringify({ ...params.tokenUsage?.total, threadId, last: params.tokenUsage?.last, reportedAtEpochMs: Date.now() }));
 			return;
 		}
@@ -1038,10 +1166,16 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 		promise,
 		setTurnId(value) {
 			expectedTurnId = value;
-			const buffered = bufferedRequests;
-			bufferedRequests = [];
-			for (const request of buffered) void respondToTool(request);
+			const buffered = bufferedEvents;
+			bufferedEvents = [];
+			for (const { kind, value } of buffered) {
+				if (kind === 'request') onServerRequest(value);
+				else onNotification(value);
+			}
 		},
+		snapshot,
+		recordInput(method, input) { inputs.push({ method, input }); inputBytes += Buffer.byteLength(input, 'utf8'); },
+		replaceOnVerbose(next) { onVerbose = next; },
 		replaceExecuteTool(next) {
 			if (typeof next !== 'function') throw new TypeError('native tool executor must be a function');
 			const previous = toolExecutor;
@@ -1050,11 +1184,29 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 		},
 		dispose() {
 			settled = true;
-			bufferedRequests = [];
+			bufferedEvents = [];
 			transport.off('serverRequest', onServerRequest);
 			transport.off('notification', onNotification);
 		},
 	};
+}
+
+function counterDelta(start, end) {
+	if (start === null || end === null) return null;
+	return Object.fromEntries(Object.keys(end).map((key) => [key,
+		start[key] !== null && end[key] !== null && end[key] >= start[key] ? end[key] - start[key] : null]));
+}
+
+function withNativeTurn(error, snapshot) {
+	// Transport failures can reject several agents with the same Error. Preserve
+	// its type/code while giving each attempt its own private, non-enumerable evidence.
+	const annotated = new Error(error?.message ?? String(error), { cause: error });
+	if (error instanceof Error) {
+		Object.setPrototypeOf(annotated, Object.getPrototypeOf(error));
+		Object.defineProperties(annotated, Object.fromEntries(Object.entries(Object.getOwnPropertyDescriptors(error)).filter(([key]) => key !== 'nativeTurn')));
+	}
+	Object.defineProperty(annotated, 'nativeTurn', { value: snapshot });
+	return annotated;
 }
 
 function notificationTurnId(params) {

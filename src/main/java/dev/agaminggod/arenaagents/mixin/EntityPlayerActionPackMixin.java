@@ -2,6 +2,7 @@ package dev.agaminggod.arenaagents.mixin;
 
 import carpet.helpers.EntityPlayerActionPack;
 import dev.agaminggod.arenaagents.server.runtime.input.CarpetActionArbitration;
+import dev.agaminggod.arenaagents.server.runtime.input.CarpetInputStateSink;
 import dev.agaminggod.arenaagents.server.runtime.input.ModelPlayerInputBridge;
 import java.util.function.Supplier;
 import net.minecraft.server.level.ServerPlayer;
@@ -15,6 +16,13 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(value = EntityPlayerActionPack.class, remap = false)
 abstract class EntityPlayerActionPackMixin {
+	@Inject(method = "getTarget", at = @At("HEAD"), cancellable = true)
+	private static void arenaagents$reuseAttackTarget(ServerPlayer player,
+			org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable<net.minecraft.world.phys.HitResult> callback) {
+		net.minecraft.world.phys.HitResult target = CarpetInputStateSink.takeAttackTarget(player);
+		if (target != null) callback.setReturnValue(target);
+	}
+
 	@Shadow
 	@Final
 	private ServerPlayer player;
@@ -40,6 +48,7 @@ abstract class EntityPlayerActionPackMixin {
 				.arenaagents$invokeTick(actionPack, actionType);
 		if (actionType != EntityPlayerActionPack.ActionType.ATTACK) return original.get();
 		// Null is Carpet's skipped-Action.tick result; onUpdate retains continuous actions until Action.done is true.
-		return CarpetActionArbitration.arbitrate(player, original);
+		return CarpetActionArbitration.arbitrate(player,
+				() -> CarpetInputStateSink.tickAttack(player, action, original));
 	}
 }

@@ -35,6 +35,54 @@ public final class AgentConversationRouterVerification {
 		assertions += verifySpokenTaskParity();
 		assertions += verifyNativeWhisperPayload();
 		assertions += verifyNativeWhisperContentSelection();
+		assertions += verifyRestoredSequenceContinuity();
+		assertions += verifyPausedResumeNormalization();
+		return assertions;
+	}
+
+	private static int verifyRestoredSequenceContinuity() {
+		ConversationEvent original = new ConversationEvent(AGENT_ID, "player", AGENT_ID.toString(),
+				ConversationAudience.DIRECT, ConversationKind.PLAYER_MESSAGE, "get dirt", 0L, 1_000L, 7L,
+				"minecraft:overworld");
+		PendingConversationWake wake = new PendingConversationWake(UUID.randomUUID(), original,
+				dev.agaminggod.arenaagents.agent.AgentGoal.create("get dirt", 1_000L), 1L, 1_000L, true);
+		PendingConversationWakeCodec codec = new PendingConversationWakeCodec();
+		PendingConversationWake restored = codec.decode(codec.encode(wake));
+		java.util.Map<AgentId, Long> sequences = new java.util.LinkedHashMap<>();
+		ServerAgentConversationRouter.restoreSequences(sequences, List.of(restored));
+		assertEquals(8L, ServerAgentConversationRouter.nextSequence(sequences, AGENT_ID, 0L),
+				"first message follows the restored acknowledged wake even after wake cleanup");
+		assertEquals(9L, ServerAgentConversationRouter.nextSequence(sequences, AGENT_ID, 7L),
+				"an older retained wake cannot reset a live conversation counter");
+		assertEquals(21L, ServerAgentConversationRouter.nextSequence(sequences, AGENT_ID, 20L),
+				"a newer durable wake advances the baseline before routing");
+		ServerAgentConversationRouter.restoreSequences(sequences, List.of(restored));
+		assertEquals(22L, ServerAgentConversationRouter.nextSequence(sequences, AGENT_ID, 0L),
+				"restoring an older wake preserves the higher in-memory sequence");
+		assertEquals(1L, ServerAgentConversationRouter.nextSequence(sequences, new AgentId(UUID.randomUUID()), 0L),
+				"fresh agents keep their independent first sequence");
+		return 5;
+	}
+
+	private static int verifyPausedResumeNormalization() {
+		int assertions = 0;
+		for (String text : List.of("continue", "Continue.", "Resume!", "Please resume", "Could you keep going?", "Hey, please retry now!")) {
+			assertEquals(true, GoalCompiler.isLiveSteeringRequest(text), "continuation remains live steering: " + text);
+			for (ConversationKind kind : List.of(ConversationKind.PLAYER_MESSAGE, ConversationKind.PROXIMITY_SPEECH)) {
+				assertEquals(true, ServerAgentConversationRouter.shouldResume(AgentLifecycleState.PAUSED, kind, text),
+						"paused player route resumes normalized continuation: " + text);
+			}
+			assertEquals(false, ServerAgentConversationRouter.shouldResume(AgentLifecycleState.ACTING, ConversationKind.PLAYER_MESSAGE, text),
+					"running goals are not resumed again");
+			assertEquals(false, ServerAgentConversationRouter.shouldResume(AgentLifecycleState.PAUSED, ConversationKind.AGENT_MESSAGE, text),
+					"agent messages do not resume paused goals");
+			assertions += 5;
+		}
+		for (String text : List.of("Stop!", "Please wait.", "Hold on.", "Come here!", "get dirt")) {
+			assertEquals(false, ServerAgentConversationRouter.shouldResume(AgentLifecycleState.PAUSED, ConversationKind.PLAYER_MESSAGE, text),
+					"other instructions do not authorize resuming: " + text);
+			assertions++;
+		}
 		return assertions;
 	}
 

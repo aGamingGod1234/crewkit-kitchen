@@ -103,6 +103,14 @@ namespace ArenaAgents.Maps {
             }
         }
 
+        public static SafeFileHandle PinFile(string path) {
+            SafeFileHandle handle = CreateFile(
+                path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero,
+                OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
+            if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+            return handle;
+        }
+
         public static string GetFileIdentity(string path) {
             SafeFileHandle handle = CreateFile(
                 path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero,
@@ -264,17 +272,21 @@ function Remove-JournalOwnedPath(
     [string]$DestinationPath,
     [string]$Filename,
     [object]$ExpectedSha256,
-    [object]$ExpectedIdentity
+    [object]$ExpectedIdentity,
+    [bool]$AllowInProgress = $false
 ) {
     $path = Join-Path $DestinationPath $Filename
     if (-not (Test-Path -LiteralPath $path)) {
         return
     }
     Assert-SafeRegularFile -Path $path -Description 'Journal-owned path'
-    if ($null -eq $ExpectedSha256 -or [string]::IsNullOrWhiteSpace([string]$ExpectedSha256)) {
+    $identityMatches = $env:OS -eq 'Windows_NT' -and $null -ne $ExpectedIdentity -and
+        (Get-FileIdentity -Path $path) -eq [string]$ExpectedIdentity
+    $ownedInProgress = $AllowInProgress -and $identityMatches -and $null -eq $ExpectedSha256
+    if (-not $ownedInProgress -and ($null -eq $ExpectedSha256 -or [string]::IsNullOrWhiteSpace([string]$ExpectedSha256))) {
         throw "Journal-owned path has no recorded digest and was preserved: $path"
     }
-    if ((Get-Sha256 -Path $path) -ne ([string]$ExpectedSha256).ToLowerInvariant()) {
+    if (-not $ownedInProgress -and (Get-Sha256 -Path $path) -ne ([string]$ExpectedSha256).ToLowerInvariant()) {
         throw "Journal-owned path content changed and was preserved: $path"
     }
     if ($env:OS -eq 'Windows_NT' -and
@@ -295,7 +307,12 @@ function Remove-OwnedTransaction([string]$DestinationPath, [string]$JournalPath,
             $path = Join-Path $DestinationPath $filename
             if (Test-Path -LiteralPath $path) {
                 Assert-SafeRegularFile -Path $path -Description 'Journal-owned path'
-                if ($null -eq $record.sha256 -or (Get-Sha256 -Path $path) -ne ([string]$record.sha256).ToLowerInvariant()) {
+                # A partial may have changing bytes only when its durable OS
+                # identity still matches. Completed files retain digest checks.
+                $ownedInProgress = $filename -eq [string]$record.partial -and
+                    $null -eq $record.sha256 -and $env:OS -eq 'Windows_NT' -and
+                    $null -ne $record.identity -and (Get-FileIdentity -Path $path) -eq [string]$record.identity
+                if (-not $ownedInProgress -and ($null -eq $record.sha256 -or (Get-Sha256 -Path $path) -ne ([string]$record.sha256).ToLowerInvariant())) {
                     throw "Journal-owned path content changed and was preserved: $path"
                 }
                 if ($env:OS -eq 'Windows_NT' -and
@@ -307,7 +324,7 @@ function Remove-OwnedTransaction([string]$DestinationPath, [string]$JournalPath,
     }
     foreach ($record in @($Journal.evidence, $Journal.archive)) {
         Remove-JournalOwnedPath -DestinationPath $DestinationPath -Filename ([string]$record.final) -ExpectedSha256 $record.sha256 -ExpectedIdentity $record.identity
-        Remove-JournalOwnedPath -DestinationPath $DestinationPath -Filename ([string]$record.partial) -ExpectedSha256 $record.sha256 -ExpectedIdentity $record.identity
+        Remove-JournalOwnedPath -DestinationPath $DestinationPath -Filename ([string]$record.partial) -ExpectedSha256 $record.sha256 -ExpectedIdentity $record.identity -AllowInProgress $true
     }
     Remove-Item -LiteralPath $JournalPath -Force
 }
@@ -487,7 +504,17 @@ Write-AcquisitionJournal -JournalPath $journalPath -Journal $activeJournal
 $archivePublishedByThisRun = $false
 $evidencePublishedByThisRun = $false
 $publishSucceeded = $false
+$partialPin = $null
 try {
+    # Record file ownership before transport can be interrupted. A zero-access
+    # Windows pin permits transport writes while preventing file replacement.
+    $emptyPartial = [System.IO.File]::Open($partialPath, [System.IO.FileMode]::CreateNew)
+    $emptyPartial.Dispose()
+    if ($env:OS -eq 'Windows_NT') {
+        $partialPin = [ArenaAgents.Maps.PinnedDirectory]::PinFile($partialPath)
+    }
+    $activeJournal.archive.identity = Get-FileIdentity -Path $partialPath
+    Write-AcquisitionJournal -JournalPath $journalPath -Journal $activeJournal
     Invoke-WebRequest -UseBasicParsing -MaximumRedirection 0 -Uri $approvedUri.AbsoluteUri -OutFile $partialPath
     $downloadedFile = Get-Item -LiteralPath $partialPath
     if ($null -ne $source.archive.size -and $downloadedFile.Length -ne [long]$source.archive.size) {
@@ -499,8 +526,10 @@ try {
     if ($null -ne $lockedSha256 -and $downloadedSha256 -ne $lockedSha256) {
         throw "Checksum drift detected while acquiring '$SourceKey'."
     }
+    if ($env:OS -eq 'Windows_NT' -and (Get-FileIdentity -Path $partialPath) -ne $activeJournal.archive.identity) {
+        throw "Download partial identity changed and was preserved."
+    }
     $activeJournal.archive.sha256 = $downloadedSha256
-    $activeJournal.archive.identity = Get-FileIdentity -Path $partialPath
     Write-AcquisitionJournal -JournalPath $journalPath -Journal $activeJournal
 
     $evidence = [ordered]@{
@@ -517,6 +546,7 @@ try {
     $activeJournal.evidence.sha256 = Get-Sha256 -Path $partialEvidencePath
     $activeJournal.evidence.identity = Get-FileIdentity -Path $partialEvidencePath
     Write-AcquisitionJournal -JournalPath $journalPath -Journal $activeJournal
+    if ($null -ne $partialPin) { $partialPin.Dispose(); $partialPin = $null }
     Publish-OwnedFile -PartialPath $partialPath -FinalPath $archivePath -Owned ([ref]$archivePublishedByThisRun)
     Publish-OwnedFile -PartialPath $partialEvidencePath -FinalPath $evidencePath -Owned ([ref]$evidencePublishedByThisRun)
     if ((Get-Sha256 -Path $archivePath) -ne $activeJournal.archive.sha256 -or
@@ -534,10 +564,14 @@ try {
         reused = $false
     }
 } finally {
+    if ($null -ne $partialPin) { $partialPin.Dispose() }
     if (-not $publishSucceeded) {
         if ($null -eq $activeJournal.archive.sha256 -and (Test-Path -LiteralPath $partialPath)) {
+            if ($env:OS -eq 'Windows_NT' -and
+                ($null -eq $activeJournal.archive.identity -or (Get-FileIdentity -Path $partialPath) -ne $activeJournal.archive.identity)) {
+                throw "Download partial identity changed and was preserved."
+            }
             $activeJournal.archive.sha256 = Get-Sha256 -Path $partialPath
-            $activeJournal.archive.identity = Get-FileIdentity -Path $partialPath
             Write-AcquisitionJournal -JournalPath $journalPath -Journal $activeJournal
         }
         if ($null -eq $activeJournal.evidence.sha256 -and (Test-Path -LiteralPath $partialEvidencePath)) {

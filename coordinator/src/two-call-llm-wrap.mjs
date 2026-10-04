@@ -59,7 +59,7 @@ export class TwoCallLlmWrap {
 
 	ingest(agentId, observation = {}, { goalRevision = 0 } = {}) {
 		this.#recovery.remember(agentId, goalRevision, observation);
-		this.#occupancy.ingest(agentId, observation);
+		this.#occupancy.ingest(agentId, observation, { snapshot: false });
 		return this.#recovery.snapshot(agentId, observation);
 	}
 
@@ -141,11 +141,14 @@ function recoveryFacts({ recovery, lastDeath, observation }) {
 		parts.push(`Last death: ${lastDeath.cause ?? 'unknown'} at x=${lastDeath.x},y=${lastDeath.y},z=${lastDeath.z}.`);
 	}
 	const held = inventoryItemIds(observation ?? {});
-	if (lastDeath !== null) {
+	if (lastDeath !== null && observation.inventory !== undefined && !observation.continuity?.rememberedSections?.includes('inventory')) {
 		parts.push(held.length === 0 ? 'Current inventory is empty.' : `Current inventory: ${unique(held).join(', ')}.`);
 	}
-	const have = itemIds(recovery);
+	const entries = Array.isArray(recovery?.alreadyHaveFacts) ? recovery.alreadyHaveFacts : null;
+	const have = entries === null ? itemIds(recovery) : entries.filter((entry) => entry.remembered !== true).map((entry) => entry.itemId ?? entry.blockId);
 	if (have.length > 0) parts.push(`Currently evidenced: ${unique(have).join(', ')}.`);
+	const remembered = entries?.filter((entry) => entry.remembered === true).map((entry) => entry.itemId ?? entry.blockId) ?? [];
+	if (remembered.length > 0) parts.push(`Remembered (not currently verified): ${unique(remembered).join(', ')}.`);
 	const lost = Array.isArray(recovery?.lastLostInventory)
 		? recovery.lastLostInventory.map((entry) => entry?.itemId).filter(Boolean)
 		: [];
@@ -196,6 +199,7 @@ function recoveryFromState(observation, recoveryState = {}) {
 	return {
 		...(lastDeath === null ? {} : { lastDeath }),
 		alreadyHave,
+		...(Array.isArray(recoveryState.alreadyHaveFacts) ? { alreadyHaveFacts: recoveryState.alreadyHaveFacts } : {}),
 		doNotRedo,
 		...(lastLostInventory.length === 0 ? {} : { lastLostInventory }),
 	};

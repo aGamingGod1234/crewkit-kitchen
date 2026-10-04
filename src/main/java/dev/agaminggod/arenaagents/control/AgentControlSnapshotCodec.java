@@ -4,12 +4,26 @@ import com.google.gson.Gson;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import dev.agaminggod.arenaagents.agent.AgentConstants;
 import java.nio.charset.StandardCharsets;
 import java.util.Objects;
 
 public final class AgentControlSnapshotCodec {
 	private static final Gson GSON = new Gson();
-	public static final int MAX_ENCODED_BYTES = 32_767;
+	// A complete schema-7 aggregate must fit, including Gson's worst-case six-byte
+	// JSON escapes per UTF-16 unit. Fixed allowances cover keys, punctuation and
+	// numeric/boolean fields. This is below the clientbound custom payload's 1 MiB.
+	private static final int AGENT_TEXT_UNITS = 36 + AgentConstants.SHORT_ID_LENGTH
+			+ AgentControlAgent.MAX_DISPLAY_NAME_LENGTH + AgentConstants.MAX_USER_NAME_LENGTH
+			+ 2 * AgentConstants.MAX_REASONING_LENGTH + AgentConstants.MAX_MODEL_LENGTH + 16
+			+ AgentControlAgent.MAX_STATE_LENGTH + AgentControlAgent.MAX_CURRENT_GOAL_LENGTH
+			+ AgentControlAgent.MAX_LAST_SUMMARY_LENGTH + AgentControlAgent.MAX_LAST_ERROR_LENGTH;
+	private static final int MODEL_TEXT_UNITS = 24 + 128 + 96 + 12 * 32 + 8 * 24;
+	public static final int MAX_ENCODED_BYTES = 1_024 + 6 * 160
+			+ AgentControlSnapshot.MAX_AGENTS * (512 + 6 * AGENT_TEXT_UNITS)
+			+ AgentControlGroup.MAX_GROUPS * (64 + 12 * AgentControlGroup.MAX_NAME_CODE_POINTS
+					+ 39 * AgentControlGroup.MAX_MEMBERS)
+			+ AgentControlModelOption.MAX_OPTIONS * (256 + 6 * MODEL_TEXT_UNITS);
 	@Deprecated(forRemoval = false)
 	public static final int MAX_ENCODED_LENGTH = MAX_ENCODED_BYTES;
 

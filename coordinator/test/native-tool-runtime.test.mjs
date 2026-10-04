@@ -251,6 +251,8 @@ test('unchanged actionable heartbeat still refreshes clocks, cooldowns, effects,
 		interaction: { attackCooldown: 0.1, useRemainingTicks: 20 },
 	};
 	const latest = structuredClone(initial);
+	initial.observedAtEpochMs = 100;
+	latest.observedAtEpochMs = 200;
 	latest.player.effects[0].duration = 90;
 	latest.world = { gameTime: 110, dayTime: 110 };
 	latest.interaction = { attackCooldown: 0.9, useRemainingTicks: 10 };
@@ -261,6 +263,8 @@ test('unchanged actionable heartbeat still refreshes clocks, cooldowns, effects,
 		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-refresh', callId: 'observe-refresh', tool: { kind: 'observe' },
 	}, current);
 	assert.equal(result.eventSequence, 2);
+	assert.equal(result.observation.observedAtEpochMs, 200);
+	assert.equal(result.freshness.observedAtEpochMs, 200);
 	assert.deepEqual(result.observation.world, latest.world);
 	assert.deepEqual(result.observation.interaction, latest.interaction);
 	assert.deepEqual(result.observation.player.effects, latest.player.effects);

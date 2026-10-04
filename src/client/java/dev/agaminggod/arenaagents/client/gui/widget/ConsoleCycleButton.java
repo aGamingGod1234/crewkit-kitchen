@@ -135,6 +135,14 @@ public final class ConsoleCycleButton<T> extends AbstractWidget implements Conso
 		onValueChanged.accept(values.get(index));
 	}
 
+	/** Restore an externally rejected selection without dispatching another input event. */
+	public void setValue(T value) {
+		int nextIndex = values.indexOf(Objects.requireNonNull(value, "value must not be null"));
+		if (nextIndex < 0) throw new IllegalArgumentException("value must be present in values");
+		index = nextIndex;
+		updateMessage();
+	}
+
 	private void updateMessage() {
 		setMessage(Component.literal(label.getString() + ": " + formatter.apply(values.get(index)).getString()));
 	}

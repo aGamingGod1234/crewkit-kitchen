@@ -234,20 +234,26 @@ public final class CodexAgentServerRuntime {
 	}
 
 	private static long explicitSecretFileRevision(String configuredPath, Path fallbackPath) {
+		return explicitSecretObservation(configuredPath, fallbackPath).revision();
+	}
+
+	private record ExplicitSecretObservation(boolean accepted, long revision) { }
+
+	private static ExplicitSecretObservation explicitSecretObservation(String configuredPath, Path fallbackPath) {
 		try {
 			Path path = configuredPath == null || configuredPath.isBlank()
 					? fallbackPath
 					: Path.of(configuredPath);
 			Path normalized = path.toAbsolutePath().normalize();
-			return java.util.Objects.hash(
+			return new ExplicitSecretObservation(true, java.util.Objects.hash(
 					normalized, Files.size(normalized), Files.getLastModifiedTime(normalized).toMillis(),
 					explicitSecretContentFingerprint(normalized)
-			);
+			));
 		} catch (java.io.IOException | RuntimeException unavailable) {
-			return java.util.Objects.hash(
+			return new ExplicitSecretObservation(false, java.util.Objects.hash(
 					configuredPath == null || configuredPath.isBlank() ? fallbackPath.toString() : configuredPath,
 					unavailable.getClass().getName()
-			);
+			));
 		}
 	}
 
@@ -320,19 +326,24 @@ public final class CodexAgentServerRuntime {
 		if (supervisor != null) {
 			tryStartBridge(server, manager, supervisor);
 			bridge = bridge(server);
-			boolean coordinatorReady = bridge != null && bridge.authenticated()
-					&& CoordinatorStatusStore.latest(server)
-							.map(status -> coordinatorStatusReady(status, System.currentTimeMillis()))
-							.orElse(false);
+			CoordinatorStatusSnapshot status = CoordinatorStatusStore.latest(server).orElse(null);
+			boolean coordinatorStatusFresh = bridge != null && bridge.authenticated()
+					&& coordinatorStatusFresh(status, System.currentTimeMillis());
+			boolean coordinatorReady = coordinatorStatusFresh && status.reconciled();
 			supervisor.tickWithBridgeListener(
 					bridge != null && bridge.authenticated(),
 					bridge == null ? null : bridge.authenticatedLaunchId(),
 					bridge == null ? 0L : bridge.authenticatedSessionGeneration(),
 					coordinatorReady,
+					coordinatorStatusFresh,
 					bridge != null
 			);
-			tryStartBridge(server, manager, supervisor);
-			bridge = bridge(server);
+			// A stopped/manual supervisor cannot publish new prepared paths in its tick.
+			// Its explicit secret was read above and is observed again next server tick.
+			if (supervisor.snapshot().state() != CoordinatorRecoveryState.STOPPED) {
+				tryStartBridge(server, manager, supervisor);
+				bridge = bridge(server);
+			}
 			reconcileVoice(server, supervisor);
 		}
 		MultiplexedServerBridge activeBridge = bridge;
@@ -591,7 +602,8 @@ public final class CodexAgentServerRuntime {
 	/** Keeps voice fenced unless the effective secret and configuration are prepared. */
 	private static void reconcileVoice(MinecraftServer server, CoordinatorProcessSupervisor supervisor) {
 		if (supervisor == null) return;
-		boolean prepared = voiceConfigurationPrepared(supervisor);
+		VoiceConfigurationSnapshot configuration = voiceConfigurationSnapshot(supervisor);
+		boolean prepared = configuration.prepared();
 		VoiceInitializationGate gate = VOICE_GATES.get(server);
 		if (gate == null) {
 			if (!prepared) return;
@@ -603,46 +615,47 @@ public final class CodexAgentServerRuntime {
 			);
 		}
 		try {
-			gate.reconcile(prepared, prepared ? voiceConfigurationRevision(supervisor) : 0L);
+			gate.reconcile(prepared, configuration.revision());
 		} catch (RuntimeException failure) {
 			LOGGER.warn("Voice subsystem reconciliation will retry after coordinator paths are prepared", failure);
 		}
 	}
 
 	static boolean coordinatorStatusReady(CoordinatorStatusSnapshot status, long nowEpochMs) {
-		return status != null && status.reconciled()
-				&& status.fresh(nowEpochMs, COORDINATOR_STATUS_MAXIMUM_AGE_MS);
+		return coordinatorStatusFresh(status, nowEpochMs) && status.reconciled();
+	}
+
+	static boolean coordinatorStatusFresh(CoordinatorStatusSnapshot status, long nowEpochMs) {
+		return status != null && status.fresh(nowEpochMs, COORDINATOR_STATUS_MAXIMUM_AGE_MS);
 	}
 
 	static boolean voiceConfigurationPrepared(CoordinatorProcessSupervisor supervisor) {
-		if (supervisor == null) return false;
-		if (supervisor.configured()) return true;
-		return supervisor.snapshot().state() == CoordinatorRecoveryState.STOPPED
-				&& acceptedSecretFile(configuredVoiceSecretFile(), Path.of("runtime", "voice-secret.txt"));
+		return voiceConfigurationSnapshot(supervisor).prepared();
 	}
 
 	static long voiceConfigurationRevision(CoordinatorProcessSupervisor supervisor) {
-		long explicitSecretRevision = supervisor.snapshot().state() == CoordinatorRecoveryState.STOPPED
-				? explicitSecretFileRevision(configuredVoiceSecretFile(), Path.of("runtime", "voice-secret.txt"))
-				: 0L;
-		return java.util.Objects.hash(
+		return voiceConfigurationSnapshot(supervisor).revision();
+	}
+
+	static record VoiceConfigurationSnapshot(boolean prepared, long revision) { }
+
+	/** One content read per reconciliation; never cache by size or modification time. */
+	static VoiceConfigurationSnapshot voiceConfigurationSnapshot(CoordinatorProcessSupervisor supervisor) {
+		if (supervisor == null) return new VoiceConfigurationSnapshot(false, 0L);
+		ExplicitSecretObservation explicit = supervisor.snapshot().state() == CoordinatorRecoveryState.STOPPED
+				? explicitSecretObservation(configuredVoiceSecretFile(), Path.of("runtime", "voice-secret.txt"))
+				: new ExplicitSecretObservation(false, 0L);
+		boolean prepared = supervisor.configured() || (!configuredVoiceSecretFile().isBlank() && explicit.accepted());
+		long revision = java.util.Objects.hash(
 				supervisor.voiceConfigurationRevision(), supervisor.sharedSecretRevision(), supervisor.secretPath(),
-				configuredVoiceSecretFile(), explicitSecretRevision, System.getProperty("arenaagents.voiceUrl")
+				configuredVoiceSecretFile(), explicit.revision(), System.getProperty("arenaagents.voiceUrl"),
+				System.getProperty("arenaagents.voiceRequestTimeoutMs")
 		);
+		return new VoiceConfigurationSnapshot(prepared, revision);
 	}
 
 	private static String configuredVoiceSecretFile() {
 		return System.getProperty("arenaagents.voiceSecretFile", "runtime/voice-secret.txt");
-	}
-
-	private static boolean acceptedSecretFile(String configuredPath, Path fallbackPath) {
-		try {
-			Path path = configuredPath == null ? fallbackPath : Path.of(configuredPath);
-			readAcceptedExplicitSecret(path);
-			return true;
-		} catch (IOException | RuntimeException unavailable) {
-			return false;
-		}
 	}
 
 	/** Small lifecycle seam that keeps unprepared startup from permanently selecting NoVoice. */

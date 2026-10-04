@@ -800,16 +800,16 @@ test('hello acknowledgement retains death facts for restart reconciliation', () 
 	);
 });
 
-test('goal lifecycle wire text uses Java-compatible UTF-16 code-unit limits', () => {
-	for (const accepted of ['x'.repeat(4_096), '\u{1f642}'.repeat(2_048)]) {
+test('projected goal lifecycle text uses Java-derived UTF-16 code-unit limits', () => {
+	for (const accepted of ['x'.repeat(266_880), '\u{1f642}'.repeat(133_440)]) {
 		assert.equal(validateProtocolV2Payload('goal_control', {
 			operation: 'start', goalRevision: 1, updatedAtEpochMs: 2, goal: accepted,
-		}).goal.length, 4_096);
+		}).goal.length, 266_880);
 	}
-	for (const rejected of ['x'.repeat(4_097), '\u{1f642}'.repeat(2_049)]) {
+	for (const rejected of ['x'.repeat(266_881), '\u{1f642}'.repeat(133_441)]) {
 		assert.throws(() => validateProtocolV2Payload('goal_control', {
 			operation: 'start', goalRevision: 1, updatedAtEpochMs: 2, goal: rejected,
-		}), /4096/);
+		}), /266880/);
 	}
 });
 
@@ -2180,4 +2180,113 @@ test('catalog snapshots carry Cursor Composer and Grok profiles', () => {
 		validateProtocolV2Payload('catalog_snapshot', { refreshedAtEpochMs: 1, models: [model] }).models,
 		[model],
 	);
+});
+
+function registryFragments(type, agentId, messageId, payload, raw = Buffer.from(JSON.stringify(payload))) {
+	const frames = [];
+	for (let offset = 0, index = 0; offset < raw.length; offset += 24 * 1024, index++) {
+		frames.push(serverEnvelope('registry_fragment', agentId, `${messageId}-part-${index}`, {
+			messageId, type, index, totalBytes: raw.length,
+			data: raw.subarray(offset, offset + 24 * 1024).toString('base64'),
+		}));
+	}
+	return frames;
+}
+
+function framingFixture(t, ready = false) {
+	const socket = new FakeSocket();
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
+		socketFactory: () => socket, schedule: () => 1, cancelSchedule: () => {},
+	});
+	t.after(() => bridge.stop());
+	bridge.start(); socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	const emit = (frames) => socket.emit('data', Buffer.from(frames.map((frame) => JSON.stringify(frame)).join('\n') + '\n'));
+	if (ready) emit([serverEnvelope('hello_ack', 'server', 'framing-ready', { replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()] })]);
+	return { socket, bridge, hello, emit };
+}
+
+function largeQueuedRecord() {
+	const prompt = '????'.repeat(600).slice(0, 2400) + 'a'.repeat(1696);
+	const fields = { originalRequest: prompt, predicate: { type: 'inventory_contains', itemId: 'minecraft:oak_log', count: 1 }, createdAtTick: 1 };
+	const spec = { ...fields, fingerprint: goalSpecFingerprint(fields) };
+	return { ...registeredRecord(), queue: Array(32).fill(prompt), queueGoalSpecs: Array(32).fill(spec) };
+}
+
+test('fragmented registry waits for completion and preserves every long UTF-8 queued goal', async (t) => {
+	const { bridge, socket, hello, emit } = framingFixture(t);
+	assert.equal(hello.payload.registryFragments, true);
+	const record = largeQueuedRecord();
+	assert.ok(Buffer.byteLength(JSON.stringify(record)) > 65_536);
+	const completed = once(bridge, 'ready');
+	emit([serverEnvelope('hello_ack', 'server', 'registry-begin', { replyTo: hello.messageId, authenticated: true, registry: [], registryCount: 1 })]);
+	const parts = registryFragments('registry_entry', 'agent-a', 'large-entry', record);
+	for (const part of parts) {
+		const wire = Buffer.from(JSON.stringify(part) + '\n');
+		assert.ok(wire.length <= 65_537);
+		// Exercise the actual decoder across arbitrary TCP/UTF-8 boundaries.
+		for (let offset = 0; offset < wire.length; offset += 811) socket.emit('data', wire.subarray(offset, offset + 811));
+		assert.equal(bridge.ready, false);
+		assert.deepEqual(bridge.knownAgentIds, []);
+	}
+	emit([serverEnvelope('registry_complete', 'server', 'registry-end', { replyTo: 'registry-begin', count: 1 })]);
+	const [connection] = await completed;
+	assert.equal(connection.registry[0].queue.length, 32);
+	assert.equal(connection.registry[0].queue[31].goal, record.queue[31]);
+	assert.deepEqual(connection.registry[0].queue[31].goalSpec, record.queueGoalSpecs[31]);
+	assert.equal(socket.destroyed, false);
+});
+
+test('live fragmented registration is applied once only after full validation', (t) => {
+	const { bridge, emit } = framingFixture(t, true);
+	const received = [];
+	bridge.on('agent_registered', (event) => received.push(event));
+	const record = { ...largeQueuedRecord(), agentId: 'agent-b' };
+	const parts = registryFragments('agent_registered', 'agent-b', 'large-live-entry', record);
+	emit(parts.slice(0, -1));
+	assert.equal(received.length, 0);
+	assert.deepEqual(bridge.knownAgentIds, ['agent-a']);
+	emit(parts.slice(-1));
+	assert.equal(received.length, 1);
+	assert.equal(received[0].payload.queue[31].goal, record.queue[31]);
+	assert.deepEqual(bridge.knownAgentIds, ['agent-a', 'agent-b']);
+});
+
+test('registry fragments reject duplicate sequence, identity changes, invalid UTF-8 and multiple JSON objects', async (t) => {
+	const cases = [
+		(parts) => [parts[0], { ...parts[0], messageId: 'repeated-part' }],
+		(parts) => [parts[0], { ...parts[1], agentId: 'changed-agent' }],
+		() => registryFragments('agent_registered', 'agent-b', 'invalid-utf8', {}, Buffer.from([123, 34, 120, 34, 58, 34, 255, 34, 125])),
+		() => registryFragments('agent_registered', 'agent-b', 'multiple-objects', {}, Buffer.from('{}\n{}')),
+	];
+	for (const transform of cases) {
+		await t.test(String(cases.indexOf(transform)), async (t) => {
+			const { bridge, socket, emit } = framingFixture(t, true);
+			const rejected = once(bridge, 'protocolError');
+			emit(transform(registryFragments('agent_registered', 'agent-b', 'bad-entry', largeQueuedRecord())));
+			await rejected;
+			assert.equal(socket.destroyed, true);
+			assert.equal(bridge.knownAgentIds.includes('agent-b'), false);
+		});
+	}
+});
+
+test('33 progress messages have identical delivery in one TCP chunk or separate chunks for fast consumers', async (t) => {
+	for (const wait of [false, true]) for (const combined of [false, true]) {
+		const { bridge, socket, emit } = framingFixture(t, true);
+		const received = [];
+		bridge.on('action_progress', (event) => {
+			received.push(event.messageId);
+			if (wait) event.waitUntil(Promise.resolve());
+		});
+		const frames = Array.from({ length: 33 }, (_, index) => serverEnvelope('action_progress', 'agent-a', `fast-${index}`, {
+			traceId: TRACE_ID, goalRevision: 0, actionId: `action-${index}`, state: 'RUNNING', progress: 0.5,
+		}));
+		if (combined) emit(frames);
+		else for (const frame of frames) { emit([frame]); await new Promise(setImmediate); }
+		await new Promise(setImmediate);
+		assert.deepEqual(received, frames.map((frame) => frame.messageId), `combined=${combined}, wait=${wait}`);
+		assert.equal(socket.destroyed, false);
+		assert.equal(socket.paused, false);
+	}
 });

@@ -10,6 +10,9 @@ import com.google.gson.JsonPrimitive;
 import com.google.gson.stream.JsonReader;
 import com.google.gson.stream.JsonToken;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.util.Base64;
+import java.util.function.Supplier;
 import java.io.StringReader;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
@@ -20,6 +23,12 @@ import java.util.Set;
 
 public final class BridgeEnvelopeCodec {
 	public static final int MAX_LINE_BYTES = 65_536;
+	// 256 queued specs: escaped 4096-character requests, 64 identifiers (256 chars),
+	// 16 predicate leaves with 16 properties of 64+128 chars, plus current goal and metadata fit below this bound.
+	static final int MAX_REGISTRY_ENTRY_BYTES = 128 * 1024 * 1024;
+	static final int REGISTRY_FRAGMENT_BYTES = 24 * 1024;
+	static final int MAX_REGISTRY_AGENTS = 1024;
+	private static final Set<String> FRAGMENTED_TYPES = Set.of("registry_entry", "agent_registered", "goal_control", "conversation_wake");
 	private static final Set<String> FIELDS = Set.of(
 			"protocolVersion", "serverInstanceId", "agentId", "type", "messageId", "payload"
 	);
@@ -162,6 +171,126 @@ public final class BridgeEnvelopeCodec {
 		Objects.requireNonNull(payload, "payload must not be null");
 		return serialize(protocolVersion, serverInstanceId, agentId, type, messageId, payload)
 				.getBytes(StandardCharsets.UTF_8).length;
+	}
+
+	/** Preflight logical publication before lifecycle commit; fragments consume one queue slot. */
+	long publicationBytes(BridgeEnvelope envelope, boolean registryFragments) {
+		if ("hello_ack".equals(envelope.type())) {
+			JsonArray registry = envelope.payloadView().getAsJsonArray("registry");
+			if (registry.size() > MAX_REGISTRY_AGENTS) throw new BridgeProtocolException("REGISTRY_CAP_EXCEEDED", "Registry exceeds configured protocol capacity");
+			JsonObject header = registryHeader(envelope);
+			long bytes = encodeFrame(new BridgeEnvelope(2, envelope.serverInstanceId(), "server", "hello_ack", envelope.messageId(), header)).byteLength();
+			for (JsonElement entry : registry) {
+				// Validate generated entry metadata before any snapshot frame becomes visible.
+				JsonObject record = entry.getAsJsonObject();
+				new BridgeEnvelope(2, envelope.serverInstanceId(), record.get("agentId").getAsString(), "registry_entry", "server-entry", new JsonObject());
+				bytes += registryEntryBytes(entry).length;
+			}
+			bytes += Math.max(0, registry.size() - 1);
+			if (!registryFragments && bytes - 1 > MAX_LINE_BYTES) throw capabilityRequired();
+			if (registryFragments && bytes - 1 > MAX_LINE_BYTES) {
+				header.addProperty("registryCount", registry.size());
+				encodeFrame(new BridgeEnvelope(2, envelope.serverInstanceId(), "server", "hello_ack", envelope.messageId(), header));
+			}
+			return bytes;
+		}
+		if (FRAGMENTED_TYPES.contains(envelope.type())) {
+			long bytes = registryEntryBytes(envelope.payloadView()).length
+					+ encodeFrame(new BridgeEnvelope(2, envelope.serverInstanceId(), envelope.agentId(), envelope.type(), envelope.messageId(), new JsonObject())).byteLength() - 2L;
+			if (!registryFragments && bytes - 1 > MAX_LINE_BYTES) throw capabilityRequired();
+			return bytes;
+		}
+		return encodeFrame(envelope).byteLength();
+	}
+
+	void preflightRegistryEntry(String serverInstanceId, JsonObject payload) {
+		new BridgeEnvelope(2, serverInstanceId, payload.get("agentId").getAsString(), "registry_entry", "server-entry", new JsonObject());
+		registryEntryBytes(payload);
+	}
+
+	/** Keeps only a small legacy-hello candidate and one current registry entry in serialized form. */
+	void writeRegistrySnapshot(BridgeEnvelope header, int count, Iterable<JsonObject> records,
+			Supplier<String> nextId, OutputStream output) throws IOException {
+		if (count < 0 || count > MAX_REGISTRY_AGENTS) throw new BridgeProtocolException("REGISTRY_CAP_EXCEEDED", "Registry exceeds configured protocol capacity");
+		JsonArray candidate = new JsonArray();
+		long bytes = encodeFrame(header).byteLength();
+		var remaining = records.iterator();
+		while (remaining.hasNext()) {
+			JsonObject entry = remaining.next();
+			bytes += registryEntryBytes(entry).length + (candidate.isEmpty() ? 0 : 1);
+			candidate.add(entry);
+			if (bytes - 1 > MAX_LINE_BYTES) break;
+		}
+		if (bytes - 1 <= MAX_LINE_BYTES) {
+			JsonObject small = header.payload(); small.add("registry", candidate);
+			output.write(encodeFrame(new BridgeEnvelope(2, header.serverInstanceId(), "server", "hello_ack", header.messageId(), small)).bytesView());
+			return;
+		}
+		JsonObject begin = header.payload(); begin.addProperty("registryCount", count);
+		output.write(encodeFrame(new BridgeEnvelope(2, header.serverInstanceId(), "server", "hello_ack", header.messageId(), begin)).bytesView());
+		for (JsonElement entry : candidate) writeRegistryEntry(header.serverInstanceId(), entry.getAsJsonObject(), nextId, output);
+		candidate = null;
+		while (remaining.hasNext()) writeRegistryEntry(header.serverInstanceId(), remaining.next(), nextId, output);
+		JsonObject complete = new JsonObject(); complete.addProperty("replyTo", header.messageId()); complete.addProperty("count", count);
+		output.write(encodeFrame(new BridgeEnvelope(2, header.serverInstanceId(), "server", "registry_complete", nextId.get(), complete)).bytesView());
+	}
+
+	private void writeRegistryEntry(String serverInstanceId, JsonObject payload, Supplier<String> nextId, OutputStream output) throws IOException {
+		writePublication(new BridgeEnvelope(2, serverInstanceId, payload.get("agentId").getAsString(), "registry_entry", nextId.get(), payload), true, nextId, output);
+	}
+
+	private static BridgeProtocolException capabilityRequired() {
+		return new BridgeProtocolException("REGISTRY_FRAGMENT_CAPABILITY_REQUIRED", "Coordinator must negotiate registryFragments to receive this registry or goal queue");
+	}
+
+	private static JsonObject registryHeader(BridgeEnvelope envelope) {
+		JsonObject header = new JsonObject();
+		for (var entry : envelope.payloadView().entrySet()) {
+			if (!"registry".equals(entry.getKey())) header.add(entry.getKey(), entry.getValue());
+		}
+		header.add("registry", new JsonArray());
+		return header;
+	}
+
+	private static byte[] registryEntryBytes(JsonElement payload) {
+		byte[] bytes = GSON.toJson(payload).getBytes(StandardCharsets.UTF_8);
+		if (bytes.length > MAX_REGISTRY_ENTRY_BYTES) throw new BridgeProtocolException("REGISTRY_ENTRY_TOO_LARGE", "Registry entry exceeds the schema-derived byte bound");
+		return bytes;
+	}
+
+	/** Stream one logical message completely before the writer takes the next publication. */
+	void writePublication(BridgeEnvelope envelope, boolean registryFragments, Supplier<String> nextId, OutputStream output) throws IOException {
+		long publicationBytes = publicationBytes(envelope, registryFragments);
+		if ("hello_ack".equals(envelope.type()) && registryFragments && publicationBytes - 1 > MAX_LINE_BYTES) {
+			JsonObject begin = registryHeader(envelope);
+			JsonArray registry = envelope.payloadView().getAsJsonArray("registry");
+			begin.addProperty("registryCount", registry.size());
+			output.write(encodeFrame(new BridgeEnvelope(2, envelope.serverInstanceId(), "server", "hello_ack", envelope.messageId(), begin)).bytesView());
+			for (JsonElement entry : registry) {
+				JsonObject payload = entry.getAsJsonObject();
+				BridgeEnvelope record = new BridgeEnvelope(2, envelope.serverInstanceId(), payload.get("agentId").getAsString(), "registry_entry", nextId.get(), payload);
+				writePublication(record, true, nextId, output);
+			}
+			JsonObject complete = new JsonObject();
+			complete.addProperty("replyTo", envelope.messageId());
+			complete.addProperty("count", registry.size());
+			output.write(encodeFrame(new BridgeEnvelope(2, envelope.serverInstanceId(), "server", "registry_complete", nextId.get(), complete)).bytesView());
+			return;
+		}
+		if (publicationBytes - 1 <= MAX_LINE_BYTES) {
+			output.write(encodeFrame(envelope).bytesView());
+			return;
+		}
+		byte[] bytes = registryEntryBytes(envelope.payloadView());
+		for (int offset = 0, index = 0; offset < bytes.length; offset += REGISTRY_FRAGMENT_BYTES, index++) {
+			JsonObject part = new JsonObject();
+			part.addProperty("messageId", envelope.messageId());
+			part.addProperty("type", envelope.type());
+			part.addProperty("index", index);
+			part.addProperty("totalBytes", bytes.length);
+			part.addProperty("data", Base64.getEncoder().encodeToString(Arrays.copyOfRange(bytes, offset, Math.min(bytes.length, offset + REGISTRY_FRAGMENT_BYTES))));
+			output.write(encodeFrame(new BridgeEnvelope(2, envelope.serverInstanceId(), envelope.agentId(), "registry_fragment", nextId.get(), part)).bytesView());
+		}
 	}
 
 	public EncodedFrame encodeFrame(BridgeEnvelope envelope) {

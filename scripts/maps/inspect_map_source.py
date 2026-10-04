@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 from pathlib import Path
 
 try:
     from scripts.maps.convert_map_module import _canonical_state, _compound, _compound_list_allow_empty_end, _list, _tag
-    from scripts.maps.nbt_reader import read_bounded
+    from scripts.maps.nbt_reader import NbtError, NbtLimits, read_bounded
 except ModuleNotFoundError:  # Direct execution adds scripts/maps, not the repository root.
     from convert_map_module import _canonical_state, _compound, _compound_list_allow_empty_end, _list, _tag
-    from nbt_reader import read_bounded
+    from nbt_reader import NbtError, NbtLimits, read_bounded
 
 
 def inspect_structure(path: str | Path) -> dict[str, object]:
@@ -21,8 +22,12 @@ def inspect_structure(path: str | Path) -> dict[str, object]:
         raise ValueError("world directories are rejected; inspect one structure-template NBT")
     if source.suffix.casefold() == ".mca":
         raise ValueError("Anvil .mca inspection is deferred")
-    payload = source.read_bytes()
-    root = read_bounded(__import__("io").BytesIO(payload))
+    limits = NbtLimits()
+    with source.open("rb") as stream:
+        payload = stream.read(limits.max_compressed_bytes + 1)
+    if len(payload) > limits.max_compressed_bytes:
+        raise NbtError("compressed input exceeds byte limit")
+    root = read_bounded(io.BytesIO(payload), limits)
     structure = _compound(root.value, "structure root")
     if "palettes" in structure:
         raise ValueError("randomized multi-palette structures are rejected")

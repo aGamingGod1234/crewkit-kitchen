@@ -36,6 +36,8 @@ runtime/map-research/
 logs/
 traces/
 evidence/
+# Local reviews, private provider captures, and generated verification artifacts.
+/output/
 coordinator/.runtime/
 *.pid
 *.port

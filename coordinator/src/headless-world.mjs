@@ -88,7 +88,9 @@ export function summarizeProviderAttestation(rows, requested) {
 	const latest = records.at(-1);
 	const fields = ['model', 'reasoningEffort', 'serviceTier'];
 	const mismatches = [...new Set(records.flatMap((record) => fields.filter((field) => record.evidence[field] === 'provider_reported'
-		&& typeof record.effective[field] === 'string' && record.effective[field] !== requested[field])))];
+		&& typeof record.effective[field] === 'string' && record.effective[field] !== requested[field]
+		// Codex reports its Fast request as priority; the reverse is not an alias.
+		&& !(field === 'serviceTier' && requested.provider === 'codex' && requested.serviceTier === 'fast' && record.effective.serviceTier === 'priority'))))];
 	return { effective: latest ? { ...latest.effective } : null, evidence: latest ? { ...latest.evidence } : null, mismatches };
 }
 import { open } from 'node:fs/promises';

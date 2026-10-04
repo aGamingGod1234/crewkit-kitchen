@@ -29,6 +29,8 @@ export class FishTtsProvider {
 		return 'fish/s2.1-pro-free/delivery-v1';
 	}
 
+	supportsTone(tone) { return Object.hasOwn(TONE_CUES, tone); }
+
 	async synthesize({ text, voiceId, speed = 1, tone = 'neutral', signal } = {}) {
 		requireText(text, 'text');
 		requireText(voiceId, 'voiceId');
@@ -69,6 +71,9 @@ export class FishTtsProvider {
 				? 'TTS_AUTHENTICATION_FAILED'
 				: response.status === 429 ? 'TTS_RATE_LIMITED' : 'TTS_PROVIDER_ERROR';
 			error.retryAfter = retryAfter;
+			// No caller receives this response. Release it without waiting for a remote body drain.
+			try { Promise.resolve(response.body?.cancel?.()).catch(() => {}); } catch { /* preserve the HTTP error */ }
+			responseController.abort(error);
 			throw error;
 		}
 		const pcm = await readBoundedResponseBody(

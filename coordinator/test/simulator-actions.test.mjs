@@ -120,19 +120,19 @@ test('mining takes simulated time, then removes the block and creates the declar
 	assert.equal(simulationWorld.observation(PLAYER).inventory.items.find((item) => item.itemId === 'minecraft:cobblestone')?.count, 1);
 });
 
-test('crafting consumes exact ingredients and emits exact requested output count', () => {
+test('crafting consumes one recipe and emits its full batch', () => {
 	const simulationWorld = world({ agents: { [PLAYER]: {
 		position: { x: 0, y: 1, z: 0 },
 		onGround: true,
 		inventory: { items: [{ itemId: 'minecraft:oak_log', count: 2, slot: 0 }] },
 	} } });
 	const runtime = new ActionRuntime();
-	runtime.accept(command('craft', 'craft_inventory', { recipeId: 'minecraft:planks', count: 8, timeoutMs: 1_000 }));
+	runtime.accept(command('craft', 'craft_inventory', { recipeId: 'minecraft:planks', count: 1, timeoutMs: 1_000 }));
 	const result = run(runtime, simulationWorld, 'craft');
 	assert.equal(result.state, 'SUCCEEDED');
 	const items = simulationWorld.observation(PLAYER).inventory.items;
-	assert.equal(items.find((item) => item.itemId === 'minecraft:oak_log')?.count ?? 0, 0);
-	assert.equal(items.find((item) => item.itemId === 'minecraft:oak_planks')?.count, 8);
+	assert.equal(items.find((item) => item.itemId === 'minecraft:oak_log')?.count ?? 0, 1);
+	assert.equal(items.find((item) => item.itemId === 'minecraft:oak_planks')?.count, 4);
 });
 
 test('placement consumes the item and verifies the final block postcondition', () => {

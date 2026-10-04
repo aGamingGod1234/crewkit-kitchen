@@ -1,11 +1,14 @@
 import { isDeepStrictEqual } from 'node:util';
+import { randomUUID } from 'node:crypto';
 
 export const MODEL_FACT_FORMAT = 'minecraft-facts-v1';
-export const MODEL_FACT_INSTRUCTIONS = `Compact factual replies use format:"minecraft-facts-v1": data is the original JSON, {$rows:{columns,rows}} represents an array of records in column order, and {$ref:N} is the exact value at values[N] in this reply. {$object:[[key,value],...]} preserves literal objects with reserved keys. Null, missing fields, coverage and freshness keep their meanings. Complete replies need no previous reply. observe defaults to a complete snapshot with observationView.id; view:"changes" plus afterObservationId requests changed whole sections against that exact ID. Apply observationView.replace and remove to that baseline; retain unchanged sections. Missing, stale or different-world baselines return full. Request view:"full" whenever the baseline is uncertain.`;
+export const MODEL_FACT_INSTRUCTIONS = `Compact factual replies use format:"minecraft-facts-v1": data is the original JSON, {$rows:{columns,rows}} represents an array of records in column order, and {$ref:N} is the exact value at values[N] in this reply. {$object:[[key,value],...]} preserves literal objects with reserved keys. Null, missing fields, coverage and freshness keep their meanings. Complete replies need no previous reply. observe and available action/sequence postAction samples default to complete snapshots with observationView.id alongside observation. view:"changes" plus afterObservationId requests changed whole sections against that exact delivered ID, including across observe and postAction. Apply observationView.replace and remove to that baseline; retain unchanged sections. Action receipts and per-step history are unchanged. Missing, stale or different-world baselines return full. Request view:"full" whenever the baseline is uncertain.`;
 const MARKERS = new Set(['$ref', '$rows', '$object']);
 const bytes = value => Buffer.byteLength(JSON.stringify(value), 'utf8');
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const marked = value => record(value) && Object.keys(value).length === 1 && MARKERS.has(Object.keys(value)[0]);
+const observationIdentity = observation => typeof observation?.world?.worldId === 'string' && typeof observation?.world?.dimension === 'string'
+ ? JSON.stringify([observation.world.worldId, observation.world.dimension, observation.player?.dead === true, observation.continuity?.phase ?? null]) : null;
 
 /** Provider presentation only. Each reply is complete; no dictionary survives a reply. */
 export function encodeModelFacts(value) {
@@ -103,31 +106,50 @@ export function decodeModelFacts(value) {
 
 /** Changes are opt-in, apply to whole named sections, and require the exact view. */
 export class ModelObservationViews {
+ #session = randomUUID();
  #baseline = null;
  #sequence = 0;
+ #committedSequence = 0;
  #generation = 0;
  reset() { this.#baseline = null; this.#generation++; }
+ observeEvent(observation) {
+  const identity = observationIdentity(observation);
+  if (identity === null || identity !== this.#baseline?.identity || observation.player?.dead === true || observation.continuity?.phase === 'dead') this.reset();
+ }
 
  prepare(value, tool) {
-  if (tool.kind !== 'observe' || !record(value.observation)) return { value, commit() {} };
-  const observation = value.observation;
-  const id = `observation-${++this.#sequence}`;
-  const world = observation.world;
-  const identity = typeof world?.worldId === 'string' && typeof world?.dimension === 'string' ? JSON.stringify([world.worldId, world.dimension, observation.player?.dead === true, observation.continuity?.phase ?? null]) : null;
-  const eligible = identity !== null && value.freshness?.fresh === true && observation.player?.dead !== true;
+  // Only the final fresh sample is a view. Per-step observations remain
+  // historical receipts, even when a sequence stopped on a failed action.
+  const nested = (tool.kind === 'action' || tool.kind === 'sequence') && record(value?.postAction);
+  const sample = nested ? value.postAction : tool.kind === 'observe' ? value : null;
+  if (!record(sample?.observation)) return { value, commit() {} };
+  const owned = structuredClone(value);
+  const snapshot = nested ? owned.postAction : owned;
+  const observation = snapshot.observation;
+  const sequence = ++this.#sequence;
+  const id = `observation-${this.#session}-${sequence}`;
+  const identity = observationIdentity(observation);
+  const eligible = identity !== null && snapshot.freshness?.fresh === true && observation.player?.dead !== true && observation.continuity?.phase !== 'dead';
   const next = { id, identity, observation: structuredClone(observation) };
-  const full = { ...value, observationView: { id, mode: 'full' } };
+  const full = { ...snapshot, observationView: { id, mode: 'full' } };
   let presented = full;
   const previous = this.#baseline;
-  if (eligible && tool.view === 'changes' && previous?.id === tool.afterObservationId && previous.identity === identity) {
+  if (eligible && tool.view === 'changes' && previous !== null && previous.id === tool.afterObservationId && previous.identity === identity) {
    const replace = Object.fromEntries(Object.entries(observation).filter(([key, current]) => !Object.hasOwn(previous.observation, key) || !isDeepStrictEqual(previous.observation[key], current)));
    const remove = Object.keys(previous.observation).filter(key => !Object.hasOwn(observation, key));
-   const { observation: _full, ...metadata } = value;
+   const { observation: _full, ...metadata } = snapshot;
    const changes = { ...metadata, observationView: { id, mode: 'changes', baseId: previous.id, replace, remove } };
    if (bytes(changes) < bytes(full)) presented = changes;
   }
   const generation = this.#generation;
-  return { value: presented, commit: () => { if (generation === this.#generation) this.#baseline = eligible ? next : null; } };
+  const commit = baseline => {
+   // A repeated or delayed callback cannot resurrect an older delivered view.
+   if (generation !== this.#generation || sequence <= this.#committedSequence) return;
+   this.#committedSequence = sequence;
+   this.#baseline = baseline;
+  };
+  return { value: nested ? { ...owned, postAction: presented } : presented,
+   commit: () => commit(eligible ? next : null), commitWithoutView: () => commit(null) };
  }
 }
 
@@ -141,6 +163,7 @@ export function encodeNativeEventInput(input, views = null) {
   const value = JSON.parse(input.slice(separator + 1, end));
   if (!record(value) || typeof value.event !== 'string' || !record(value.observation)) return input;
   if (value.event === 'player_death' || value.observation.player?.dead === true || value.observation.continuity?.phase === 'dead') views?.reset();
+  else views?.observeEvent(value.observation);
   const encoded = encodeModelFacts(value);
   return encoded === value ? input : `${input.slice(0, separator + 1)}${JSON.stringify(encoded)}${input.slice(end)}`;
  } catch { return input; }

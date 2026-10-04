@@ -36,6 +36,7 @@ public final class BundledCoordinatorInstallerVerification {
 	public static int verify() throws Exception {
 		int assertions = 0;
 		assertions += verifyPrivateAclUsesInteractiveUser();
+		assertions += verifyLinkedMutationTargetsAreRejected();
 		assertions += verifyWindowsRuntimeAclReachesStateFile();
 		assertions += verifyConfiguredSecretPathUsesPreparedRuntime();
 		assertions += verifyVerifiedGenerationCanRollbackCandidate();
@@ -51,6 +52,84 @@ public final class BundledCoordinatorInstallerVerification {
 		assertions += verifyInterruptedSwapRecoversPreviousCoordinator();
 		assertions += verifyTransientDirectoryLockIsRetried();
 		return assertions;
+	}
+
+	private static int verifyLinkedMutationTargetsAreRejected() throws Exception {
+		Path fixture = Files.createTempDirectory("arena-coordinator-links").toAbsolutePath().normalize();
+		Path outside = Files.createDirectory(fixture.resolve("outside-package"));
+		Path sentinel = outside.resolve("sentinel.txt");
+		Files.writeString(sentinel, "must survive coordinator preparation and deletion");
+		byte[] original = Files.readAllBytes(sentinel);
+		var modified = Files.getLastModifiedTime(sentinel);
+		boolean windows = System.getProperty("os.name").startsWith("Windows");
+		int assertions = 0;
+		boolean safeToClean = true;
+		try {
+			for (String relative : List.of("", "coordinator", "coordinator.last-known-good", "runtime",
+					"coordinator.staging-junction", "coordinator.staging-nested/child")) {
+				Path root = fixture.resolve("package-" + assertions);
+				Path link = relative.isEmpty() ? root : root.resolve(relative);
+				Files.createDirectories(link.getParent());
+				assertTrue(link.startsWith(fixture) && outside.startsWith(fixture) && !outside.startsWith(root),
+						"every link and its external target stay inside the disposable fixture");
+				safeToClean = false;
+				createDirectoryLink(link, outside, windows);
+				try {
+					assertEquals(outside.toRealPath(), link.toRealPath(), "fixture link resolves only to its exact sentinel directory");
+					if (windows) {
+						assertFalse(Files.isSymbolicLink(link), "Windows regression exercises a junction, not a symbolic link");
+						assertTrue(Files.readAttributes(link, java.nio.file.attribute.BasicFileAttributes.class,
+								java.nio.file.LinkOption.NOFOLLOW_LINKS).isOther(), "supported basic attributes identify the junction");
+					}
+					try {
+						BundledCoordinatorInstaller.prepare(root);
+						throw new AssertionError("preparation must reject a linked mutation target: " + relative);
+					} catch (IOException expected) {
+						assertTrue(expected.getMessage().contains("link") || expected.getMessage().contains("reparse"),
+								"preparation fails at the link boundary");
+					}
+					Path deletionTarget = relative.endsWith("/child") ? link.getParent() : link;
+					assertDeletionRejectsLink(root, deletionTarget);
+					// Exercise an ordinary-looking descendant whose parent is a junction as well.
+					assertDeletionRejectsLink(root, link.resolve("sentinel.txt"));
+					assertTrue(java.util.Arrays.equals(original, Files.readAllBytes(sentinel)), "outside sentinel bytes survive");
+					assertEquals(modified, Files.getLastModifiedTime(sentinel), "outside sentinel modification time survives");
+					assertTrue(Files.exists(link, java.nio.file.LinkOption.NOFOLLOW_LINKS), "rejected link remains untouched");
+					assertions += windows ? 10 : 8;
+				} finally {
+					// Unlink only this exact fixture entry. Never recursively clean up a live junction.
+					Files.deleteIfExists(link);
+					safeToClean = true;
+				}
+			}
+			return assertions;
+		} finally {
+			if (safeToClean) deleteTree(fixture);
+		}
+	}
+
+	private static void createDirectoryLink(Path link, Path target, boolean windows) throws Exception {
+		if (!windows) {
+			Files.createSymbolicLink(link, target);
+			return;
+		}
+		String command = "$ErrorActionPreference = 'Stop'; New-Item -ItemType Junction -Path '"
+				+ link.toString().replace("'", "''") + "' -Target '" + target.toString().replace("'", "''") + "' | Out-Null";
+		Process process = new ProcessBuilder("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command)
+				.redirectErrorStream(true).start();
+		String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+		assertEquals(0, process.waitFor(), "Windows junction creation: " + output);
+	}
+
+	private static void assertDeletionRejectsLink(Path root, Path target) throws Exception {
+		var delete = BundledCoordinatorInstaller.class.getDeclaredMethod("deleteTree", Path.class, Path.class);
+		delete.setAccessible(true);
+		try {
+			delete.invoke(null, root, target);
+			throw new AssertionError("deletion must reject a linked tree or ancestor");
+		} catch (java.lang.reflect.InvocationTargetException wrapped) {
+			assertTrue(wrapped.getCause() instanceof IOException, "mutation boundary fails closed with IOException");
+		}
 	}
 
 	private static int verifyWindowsRuntimeAclReachesStateFile() throws Exception {

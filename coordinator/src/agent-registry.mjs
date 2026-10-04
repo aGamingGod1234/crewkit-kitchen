@@ -2,6 +2,7 @@ import {
 	DEFAULT_AGENT_CAP,
 	DEFAULT_GOAL_QUEUE_CAP,
 	MAX_GOAL_LENGTH,
+	MAX_PLANNER_GOAL_LENGTH,
 	MAX_IDENTIFIER_LENGTH,
 	MAX_REASON_CODE_LENGTH,
 	MAX_RESULT_MESSAGE_LENGTH,
@@ -130,7 +131,7 @@ export class AgentRegistry {
 		if (revision < current.goalRevision) {
 			throw new AgentRegistryError('STALE_GOAL_REVISION', `Conversation wake revision ${revision} is older than ${current.goalRevision}`);
 		}
-		const goal = requireGoal(value.goal);
+		const goal = requirePlannerGoal(value.goal);
 		if (current.currentGoal !== goal) {
 			throw new AgentRegistryError('GOAL_REVISION_COLLISION', 'Conversation wake revision belongs to a different goal');
 		}
@@ -289,7 +290,7 @@ export function reduceGoalControl(recordValue, controlValue, { queueCap = DEFAUL
 	const now = nonnegativeInteger(controlValue.updatedAtEpochMs ?? Date.now(), 'updatedAtEpochMs');
 	const next = { ...record, goalRevision: revision, updatedAtEpochMs: now, lastError: null };
 	if (operation === 'start' || operation === 'replace' || operation === 'steer') {
-		const nextGoal = requireGoal(controlValue.goal);
+		const nextGoal = requirePlannerGoal(controlValue.goal);
 		const promotesQueuedGoal = PROMOTION_SOURCE_STATES.has(record.state)
 			|| (record.state === DynamicAgentState.COMPLETED && record.queue.length > 0);
 		if (operation === 'start' && promotesQueuedGoal) {
@@ -439,7 +440,11 @@ function normalizeDeath(value, state) {
 }
 
 function optionalGoal(value) {
-	return value === null || value === undefined ? null : requireGoal(value);
+	return value === null || value === undefined ? null : requirePlannerGoal(value);
+}
+
+function requirePlannerGoal(value) {
+	return requireText(value, 'goal', MAX_PLANNER_GOAL_LENGTH);
 }
 
 function requireGoal(value) {

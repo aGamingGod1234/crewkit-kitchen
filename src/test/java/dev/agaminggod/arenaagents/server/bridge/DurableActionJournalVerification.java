@@ -1,10 +1,12 @@
 package dev.agaminggod.arenaagents.server.bridge;
 
+import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.protocol.ActionType;
 import dev.agaminggod.arenaagents.server.runtime.ActionProvenance;
+import dev.agaminggod.arenaagents.server.runtime.ServerActionObservation;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionRequest;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionResult;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionState;
@@ -163,6 +165,8 @@ public final class DurableActionJournalVerification {
 		assertEntry(detached, DurableActionJournal.Phase.TERMINAL, detachedRequest, detachedResult);
 		detached.close();
 
+		verifyObservationPersistence(directory, agentId, goalId);
+		verifyFailedAppendPreservesPhase(directory, agentId, goalId);
 		try (var files = Files.list(directory)) {
 			if (files.anyMatch(file -> file.getFileName().toString().contains(".tmp-"))) {
 				throw new AssertionError("Journal left a temporary file after atomic replacement");
@@ -170,7 +174,155 @@ public final class DurableActionJournalVerification {
 		} catch (IOException exception) {
 			throw new AssertionError(exception);
 		}
-		return 26;
+		return 46;
+	}
+
+	private static void verifyFailedAppendPreservesPhase(Path directory, AgentId agentId, UUID goalId) {
+		Path path = directory.resolve("failed-observed-append.journal");
+		ServerActionRequest request = request(agentId, 16L, "failed-observed-append", "failed-observed-step", 11L);
+		ServerActionResult result = withObservation(result(request, "DONE"), observation(1.0D));
+		try (DurableActionJournal journal = DurableActionJournal.open(path)) {
+			journal.accept(request, goalId);
+		}
+		try (DurableActionJournal journal = DurableActionJournal.open(path)) {
+			appendIncompleteTail(path);
+			expectFailure(() -> journal.terminal(result), "ACTION_JOURNAL_IO");
+			assertEntry(journal, DurableActionJournal.Phase.ACCEPTED, request, null);
+		}
+		try (DurableActionJournal journal = DurableActionJournal.open(path)) {
+			assertEntry(journal, DurableActionJournal.Phase.ACCEPTED, request, null);
+			journal.terminal(result);
+		}
+		try (DurableActionJournal journal = DurableActionJournal.open(path)) {
+			appendIncompleteTail(path);
+			expectFailure(() -> journal.acknowledge(agentId, request.goalRevision(), request.actionId()), "ACTION_JOURNAL_IO");
+			assertEntry(journal, DurableActionJournal.Phase.TERMINAL, request, result);
+		}
+		try (DurableActionJournal journal = DurableActionJournal.open(path)) {
+			assertEntry(journal, DurableActionJournal.Phase.TERMINAL, request, result);
+		}
+	}
+
+	private static void appendIncompleteTail(Path path) {
+		try {
+			Files.write(path, new byte[] {0x01}, StandardOpenOption.APPEND);
+		} catch (IOException exception) {
+			throw new AssertionError(exception);
+		}
+	}
+
+	private static void verifyObservationPersistence(Path directory, AgentId agentId, UUID goalId) {
+		ServerActionRequest request = request(agentId, 14L, "observed", "observed-step", 10L);
+		ServerActionResult result = withObservation(result(request, "DONE"), observation(0.0D));
+		ServerActionResult changed = withObservation(result, observation(-0.0D));
+		Path path = directory.resolve("observed.journal");
+		try (DurableActionJournal journal = DurableActionJournal.open(path, 4, 2)) {
+			journal.accept(request, goalId);
+			journal.terminal(result);
+			// JSON callers and request snapshots must not mutate the stored evidence or request.
+			DurableActionJournal.encodeResult(result).getAsJsonObject("actionObservation").addProperty("yaw", 99.0D);
+			journal.snapshot().get(0).request().arguments().addProperty("durationMs", 99L);
+			assertEntry(journal, DurableActionJournal.Phase.TERMINAL, request, result);
+		}
+		try (DurableActionJournal journal = DurableActionJournal.open(path, 4, 2)) {
+			assertEntry(journal, DurableActionJournal.Phase.TERMINAL, request, result);
+			int beforeRetry = journal.persistedEventCountForVerification();
+			journal.terminal(result);
+			if (beforeRetry != journal.persistedEventCountForVerification()) throw new AssertionError("Identical retry appended again");
+			expectFailure(() -> journal.terminal(changed), "ACTION_RESULT_REPLAY_CONFLICT");
+			journal.acknowledge(agentId, request.goalRevision(), request.actionId());
+			if (journal.performanceSnapshotForVerification().compactionCount() != 1L) {
+				throw new AssertionError("Observed terminal result was not compacted before acknowledgement");
+			}
+		}
+		try (DurableActionJournal journal = DurableActionJournal.open(path, 4, 2)) {
+			assertEntry(journal, DurableActionJournal.Phase.ACKNOWLEDGED, request, result);
+			journal.terminal(result);
+			expectFailure(() -> journal.terminal(changed), "ACTION_RESULT_REPLAY_CONFLICT");
+		}
+
+		JsonObject legacy = legacySnapshot(request, result(request, "DONE"));
+		Path legacyPath = directory.resolve("legacy-observation-absent.json");
+		writeJson(legacyPath, legacy);
+		try (DurableActionJournal journal = DurableActionJournal.open(legacyPath)) {
+			assertEntry(journal, DurableActionJournal.Phase.TERMINAL, request, result(request, "DONE"));
+			journal.terminal(result(request, "DONE"));
+		}
+		try (DurableActionJournal journal = DurableActionJournal.open(legacyPath)) {
+			assertEntry(journal, DurableActionJournal.Phase.TERMINAL, request, result(request, "DONE"));
+		}
+
+		ServerActionObservation sparse = new ServerActionObservation(null, 1L, null, null, -0.0D, 0.0D, null, null, null, null, null);
+		Path sparsePath = directory.resolve("sparse-observation.json");
+		ServerActionResult sparseResult = withObservation(result, sparse);
+		writeJson(sparsePath, legacySnapshot(request, sparseResult));
+		try (DurableActionJournal journal = DurableActionJournal.open(sparsePath)) {
+			assertEntry(journal, DurableActionJournal.Phase.TERMINAL, request, sparseResult);
+		}
+
+		JsonObject malformed = legacySnapshot(request, result);
+		malformed.getAsJsonArray("entries").get(0).getAsJsonObject().getAsJsonObject("result")
+				.getAsJsonObject("actionObservation").remove("yaw");
+		Path malformedPath = directory.resolve("malformed-observation.json");
+		writeJson(malformedPath, malformed);
+		expectFailure(() -> DurableActionJournal.open(malformedPath), "ACTION_JOURNAL_CORRUPT");
+	}
+
+	static ServerActionObservation observation(double yaw) {
+		return new ServerActionObservation(
+				42L, 1_750_000_000_001L,
+				new ServerActionObservation.Position(1.25D, 64.0D, -2.5D),
+				new ServerActionObservation.Position(-0.0D, 0.25D, 0.0D), yaw, -12.5D,
+				new ServerActionObservation.Collision(true, false, true),
+				new ServerActionObservation.RayTarget("block", new ServerActionObservation.Position(2.0D, 64.0D, -2.0D), "minecraft:stone", "up", 1.5D),
+				new ServerActionObservation.Reach(1.5D, 4.5D, true),
+				new ServerActionObservation.Target("block", new ServerActionObservation.Position(2.0D, 64.0D, -2.0D),
+						"minecraft:stone", "minecraft:air", "minecraft:stone", "minecraft:air", true, 0.5D, 0.75D, false),
+				new ServerActionObservation.Progress(1.0D, "world_mutation", true)
+		);
+	}
+
+	static ServerActionResult withObservation(ServerActionResult result, ServerActionObservation observation) {
+		return new ServerActionResult(result.agentId(), result.goalRevision(), result.actionId(), result.actionType(),
+				result.traceId(), result.state(), result.reasonCode(), result.message(), result.elapsedMs(),
+				result.observedAtEpochMs(), result.executionStarted(), result.physicalAttempted(), observation);
+	}
+
+	private static JsonObject legacySnapshot(ServerActionRequest request, ServerActionResult result) {
+		JsonObject provenance = new JsonObject();
+		provenance.addProperty("provider", "codex");
+		provenance.addProperty("model", "gpt-5.6-sol");
+		provenance.addProperty("reasoningEffort", "high");
+		provenance.addProperty("serviceTier", "priority");
+		provenance.addProperty("programId", "program");
+		provenance.addProperty("programVersion", 1L);
+		provenance.addProperty("sourceStepId", request.provenance().sourceStepId());
+		provenance.addProperty("eventSequence", request.provenance().eventSequence());
+		JsonObject encodedRequest = new JsonObject();
+		encodedRequest.addProperty("agentId", request.agentId().toString());
+		encodedRequest.addProperty("goalRevision", request.goalRevision());
+		encodedRequest.addProperty("actionId", request.actionId());
+		encodedRequest.addProperty("actionType", request.type().wireName());
+		encodedRequest.add("arguments", request.arguments());
+		encodedRequest.add("provenance", provenance);
+		JsonObject entry = new JsonObject();
+		entry.addProperty("phase", "TERMINAL");
+		entry.add("request", encodedRequest);
+		entry.add("result", DurableActionJournal.encodeResult(result));
+		JsonArray entries = new JsonArray();
+		entries.add(entry);
+		JsonObject snapshot = new JsonObject();
+		snapshot.addProperty("schemaVersion", 1);
+		snapshot.add("entries", entries);
+		return snapshot;
+	}
+
+	private static void writeJson(Path path, JsonObject json) {
+		try {
+			Files.writeString(path, json.toString());
+		} catch (IOException exception) {
+			throw new AssertionError(exception);
+		}
 	}
 
 	private static FileChannel persistentChannel(DurableActionJournal journal) {

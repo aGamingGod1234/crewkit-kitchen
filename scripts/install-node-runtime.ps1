@@ -52,19 +52,22 @@ try {
 	New-Item -ItemType Directory -Path $staging -ErrorAction Stop | Out-Null
 	Move-Item -LiteralPath $downloadedNode -Destination (Join-Path $staging 'node.exe') -ErrorAction Stop
 	$backedUp = $false
+	$promoted = $false
 	try {
 		if (Test-Path -LiteralPath $runtime) {
 			Move-Item -LiteralPath $runtime -Destination $backup -ErrorAction Stop
 			$backedUp = $true
 		}
 		Move-Item -LiteralPath $staging -Destination $runtime -ErrorAction Stop
+		$promoted = $true
 		if (-not (Test-PinnedNodeRuntime $node)) {
 			throw "Bundled Node.js v$nodeVersion failed verification after installation."
 		}
 	} catch {
 		$failure = $_
 		try {
-			if (Test-Path -LiteralPath $runtime) { Remove-Item -LiteralPath $runtime -Recurse -Force -ErrorAction Stop }
+			# A failed backup move must never delete the original active runtime.
+			if ($promoted -and (Test-Path -LiteralPath $runtime)) { Remove-Item -LiteralPath $runtime -Recurse -Force -ErrorAction Stop }
 			if ($backedUp -and (Test-Path -LiteralPath $backup)) {
 				Move-Item -LiteralPath $backup -Destination $runtime -ErrorAction Stop
 			}

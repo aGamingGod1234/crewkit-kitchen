@@ -28,6 +28,8 @@ import net.minecraft.world.item.Item;
 
 public final class GoalCompiler {
 	private static final int MAX_COMPOUND_LEAVES = 16;
+	private static final double POSITION_RADIUS = 1.0D;
+	private static final int POSITION_STABLE_TICKS = 20;
 	private static final int MAX_TRANSLATION_CANDIDATES = 64;
 	private static final List<String> SMALL_COUNTS = List.of("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen");
 	private static final List<String> TENS = List.of("twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety");
@@ -58,6 +60,10 @@ public final class GoalCompiler {
 	private static final Pattern NAMED_TOOL_SET = Pattern.compile("^([a-z]+) tools?\\s*(?:[:,]|\\band\\b)\\s*(.+)$");
 	private static final Pattern REFERENCED_ITEM_CLAUSE = Pattern.compile("^(?:keep|retain|hold|carry)\\s+(?:it|them|these|those)(?:\\s.*)?$");
 	private static final Pattern BLOCK = Pattern.compile("^(build|construct|place|put|set|mine|break|destroy) (?:with |using |from )?(?:(?:a|an|some|the) )?(.+?)(?: for me)?$");
+	private static final Pattern COMPOUND_SEPARATOR = Pattern.compile(
+			"\\s+(?:and(?:\\s+then)?|then)\\s+|\\s*[;,]\\s*(?=(?:build|construct|place|put|set|mine|break|destroy|go|move|travel|get|obtain|collect|bring|gather|acquire|fetch|craft|make|kill|slay|defeat|complete|earn|survive)\\b)"
+	);
+	private static final Pattern AMBIGUOUS_BLOCK_TARGET = Pattern.compile("\\b(?:and|then|before|after|while)\\b|[;,]");
 	private static final Pattern BLOCK_LOCATION_SUFFIX = Pattern.compile(
 			"\\s+(?:at|on)(?: coordinates?)?\\s+"
 					+ "(?:x\\s*=\\s*)?(-?\\d+)\\s*,?\\s*"
@@ -65,6 +71,7 @@ public final class GoalCompiler {
 					+ "(?:z\\s*=\\s*)?(-?\\d+)$"
 	);
 	private static final Pattern SURVIVE = Pattern.compile("^survive\\b.*$");
+	private static final Pattern SURVIVAL_DURATION = Pattern.compile("^survive(?: for)? (" + COUNT + ") (ticks?|seconds?|minutes?)$");
 	private static final Pattern SUBJECTIVE = Pattern.compile("\\b(?:good|better|best|strong|stronger|useful|decent|nice|appropriate|some kind of)\\b");
 	private static final Pattern GOAL_LEAD = Pattern.compile("^(?:get|obtain|collect|bring|craft|make|go|move|travel|come|kill|slay|defeat|build|mine|find|gather|chop|break|place|beat|survive|explore|follow|protect|farm|smelt|cook|trade|complete|earn)\\b");
 	private static final Pattern LIVE_STEERING = Pattern.compile(
@@ -133,7 +140,7 @@ public final class GoalCompiler {
 				GoalPredicate predicate = new GoalPredicate.PositionWithin(
 						dimensionId,
 						Integer.parseInt(position.group(1)), Integer.parseInt(position.group(2)), Integer.parseInt(position.group(3)),
-						1.0D, 20
+						POSITION_RADIUS, POSITION_STABLE_TICKS
 				);
 				return accepted(original, predicate, createdAtTick, "Goal set: reach the requested coordinates.");
 			} catch (NumberFormatException | AgentDomainException exception) {
@@ -205,10 +212,18 @@ public final class GoalCompiler {
 						"Goal set: obtain " + itemId + " x" + count + ".");
 			}
 		}
+		// Resolve compound requests before a broad block matcher can consume their final coordinates.
+		GoalCompilation compound = compileCompound(original, command, registries, createdAtTick);
+		if (compound != null) return compound;
 		Matcher block = BLOCK.matcher(command);
 		if (block.matches()) {
-			Matcher location = BLOCK_LOCATION_SUFFIX.matcher(normalizedTarget(block.group(2)));
+			String blockTarget = normalizedTarget(block.group(2));
+			Matcher location = BLOCK_LOCATION_SUFFIX.matcher(blockTarget);
 			if (isDestructiveBlockVerb(block.group(1)) && location.find()) {
+				// Separators inside the target are not coordinate commas: the coordinate suffix starts later.
+				if (AMBIGUOUS_BLOCK_TARGET.matcher(blockTarget.substring(0, location.start())).find()) {
+					return GoalCompilation.needsTranslation("Confirm every action and block position in this request before starting.");
+				}
 				try {
 					GoalPredicate predicate = new GoalPredicate.BlockMatches(
 							dimensionId,
@@ -229,8 +244,6 @@ public final class GoalCompiler {
 			}
 		}
 
-		GoalCompilation compound = compileCompound(original, command, registries, createdAtTick);
-		if (compound != null) return compound;
 		if (kill.matches()) {
 			List<String> matches = matchEntities(kill.group(1), registries);
 			return GoalCompilation.needsTranslation(matches.isEmpty()
@@ -256,6 +269,14 @@ public final class GoalCompiler {
 	/** Live steering such as "come here" / "follow me" must reach the coordinator, not start a new goal. */
 	public static boolean isLiveSteeringRequest(String request) {
 		return LIVE_STEERING.matcher(normalizedCommand(request)).matches();
+	}
+
+	/** Only the existing continuation subset resumes paused work; stop and wait remain steering. */
+	public static boolean isResumeRequest(String request) {
+		return switch (normalizedCommand(request)) {
+			case "continue", "keep going", "watch out", "try another route", "retry", "resume" -> true;
+			default -> false;
+		};
 	}
 
 	/**
@@ -315,9 +336,12 @@ public final class GoalCompiler {
 		}
 		ArrayList<GoalTranslationConstraint.KillClause> killClauses = new ArrayList<>();
 		ArrayList<GoalTranslationConstraint.ItemClause> itemClauses = new ArrayList<>();
+		ArrayList<GoalPredicate> factualPredicates = new ArrayList<>();
 		Set<String> catalog = Set.copyOf(candidateIdsFor(request, registries));
 		if (clauses.size() > 1) {
 			for (GoalClause clause : clauses) {
+				GoalPredicate fact = factualRequirement(clause);
+				if (fact != null) factualPredicates.add(fact);
 				if (clause.kind() == ClauseKind.KILL) {
 					killClauses.add(killConstraintFor(clause.target(), registries, catalog));
 				} else if (clause.kind() == ClauseKind.ITEM) {
@@ -325,19 +349,22 @@ public final class GoalCompiler {
 				}
 			}
 		} else {
+			GoalClause clause = parseClause(command, null);
+			GoalPredicate fact = clause == null ? null : factualRequirement(clause);
+			if (fact != null) factualPredicates.add(fact);
 			Matcher kill = KILL.matcher(command);
 			if (kill.matches() && !BEAT_GAME.matcher(command).matches()) {
 				killClauses.add(killConstraintFor(kill.group(1), registries, catalog));
 			}
 			Matcher item = ITEM.matcher(command);
-			if (item.matches()) {
+			if (item.matches() && fact == null) {
 				itemClauses.add(itemConstraintFor(
 						item.group(3), item.group(2) == null ? 1 : parseCount(item.group(2)), registries, catalog));
 			}
 		}
-		return killClauses.isEmpty() && itemClauses.isEmpty()
+		return killClauses.isEmpty() && itemClauses.isEmpty() && factualPredicates.isEmpty()
 				? GoalTranslationConstraint.none()
-				: new GoalTranslationConstraint(killClauses, itemClauses);
+				: new GoalTranslationConstraint(killClauses, itemClauses, factualPredicates);
 	}
 
 	/** Expensive dragon goals get an advisory plan before the objective kill goal starts. */
@@ -358,23 +385,37 @@ public final class GoalCompiler {
 			return translationConstraintFor(request, registries);
 		} catch (AgentDomainException exception) {
 			if (!isUnsupportedTranslationCatalog(exception)) throw exception;
-			return GoalTranslationConstraint.none();
+			// An unresolved registry noun must not discard a recognized destination or duration.
+			String command = normalizedCommand(request);
+			List<GoalClause> clauses = compoundClauses(command);
+			if (clauses.isEmpty()) {
+				GoalClause clause = parseClause(command, null);
+				clauses = clause == null ? List.of() : List.of(clause);
+			}
+			return new GoalTranslationConstraint(List.of(), List.of(), clauses.stream()
+					.map(GoalCompiler::factualRequirement).filter(Objects::nonNull).toList());
 		}
 	}
 
 	public boolean translationRequiresOperatorConfirmation(String request, RegistryAccess registries) {
 		String command = normalizedCommand(request);
 		if (SUBJECTIVE.matcher(command).find() || BLOCK.matcher(command).matches()) return true;
+		// Factual constraints prove recognized position and duration clauses as well as items/kills.
+		// Creation and unresolved clauses still need an explicit completion witness.
+		if (compoundClauses(command).stream().anyMatch(clause -> clause.requiresCreation()
+				|| (clause.kind() != ClauseKind.ITEM && clause.kind() != ClauseKind.KILL
+						&& factualRequirement(clause) == null))) return true;
 		Matcher item = ITEM.matcher(command);
 		if (item.matches() && isCraftingVerb(item.group(1))) return true;
+		GoalTranslationConstraint constraint;
 		try {
-			translationConstraintFor(request, registries);
+			constraint = translationConstraintFor(request, registries);
 		} catch (AgentDomainException exception) {
 			if (!isUnsupportedTranslationCatalog(exception)) throw exception;
 			return true;
 		}
-		return candidateIdsFor(request, registries).isEmpty()
-				&& !SURVIVE.matcher(command).matches();
+		return constraint.factualPredicates().isEmpty() && candidateIdsFor(request, registries).isEmpty()
+				&& !SURVIVE.matcher(command).matches() && !POSITION.matcher(command).matches();
 	}
 
 	public static boolean requiresConfirmationOnEveryPath(GoalPredicate predicate) {
@@ -400,7 +441,8 @@ public final class GoalCompiler {
 		Objects.requireNonNull(predicate, "predicate must not be null");
 		String command = normalizedCommand(request);
 		GoalTranslationConstraint constraint = supportedTranslationConstraintFor(request, registries);
-		boolean factualRequest = !constraint.killClauses().isEmpty() || !constraint.itemClauses().isEmpty();
+		boolean factualRequest = !constraint.killClauses().isEmpty() || !constraint.itemClauses().isEmpty()
+				|| !constraint.factualPredicates().isEmpty();
 		if (!BEAT_GAME_TRANSLATION.matcher(command).matches()
 				&& (!factualRequest || translationRequiresOperatorConfirmation(request, registries))) return predicate;
 		GoalPredicate normalized = withoutOperatorConfirmation(predicate);
@@ -563,7 +605,9 @@ public final class GoalCompiler {
 	}
 
 	private static List<GoalClause> compoundClauses(String command) {
-		String[] parts = command.split("\\s+and\\s+");
+		// Additional block-request separators must not broaden the item/kill grammar or discard ordering.
+		String[] parts = BLOCK.matcher(command).matches()
+				? COMPOUND_SEPARATOR.split(command) : command.split("\\s+and\\s+(?!stop(?:\\s+there)?$)");
 		if (parts.length < 2) return List.of();
 		ArrayList<GoalClause> clauses = new ArrayList<>();
 		GoalClause inherited = null;
@@ -579,6 +623,7 @@ public final class GoalCompiler {
 	private static GoalClause parseClause(String value, GoalClause inherited) {
 		Matcher kill = KILL.matcher(value);
 		if (kill.matches()) return new GoalClause(ClauseKind.KILL, kill.group(1), 1, false, false);
+		if (POSITION.matcher(value).matches()) return new GoalClause(ClauseKind.POSITION, value, 1, false, false);
 		Matcher item = ITEM.matcher(value);
 		if (item.matches()) {
 			try {
@@ -593,7 +638,6 @@ public final class GoalCompiler {
 		}
 		String advancement = advancementName(value);
 		if (advancement != null) return new GoalClause(ClauseKind.ADVANCEMENT, advancement, 1, false, false);
-		if (POSITION.matcher(value).matches()) return new GoalClause(ClauseKind.POSITION, value, 1, false, false);
 		if (SURVIVE.matcher(value).matches()) return new GoalClause(ClauseKind.SURVIVE, value, 1, false, false);
 		if (SUBJECTIVE.matcher(value).find()) return new GoalClause(ClauseKind.OPERATOR, value, 1, false, false);
 		if (inherited == null) return null;
@@ -615,6 +659,27 @@ public final class GoalCompiler {
 		} catch (NumberFormatException exception) {
 			return new GoalClause(ClauseKind.ITEM, counted.group(2), -1, inherited.requiresCreation(), false);
 		}
+	}
+
+	private static GoalPredicate factualRequirement(GoalClause clause) {
+		try {
+			if (clause.kind() == ClauseKind.POSITION) {
+				Matcher position = POSITION.matcher(clause.target());
+				if (position.matches()) return new GoalPredicate.PositionWithin(
+						Integer.parseInt(position.group(1)), Integer.parseInt(position.group(2)), Integer.parseInt(position.group(3)), POSITION_RADIUS, POSITION_STABLE_TICKS);
+			}
+			if (clause.kind() == ClauseKind.SURVIVE) {
+				Matcher duration = SURVIVAL_DURATION.matcher(clause.target());
+				if (duration.matches()) {
+					long count = duration.group(1).matches("[+-]?\\d+") ? Long.parseLong(duration.group(1)) : parseCount(duration.group(1));
+					long multiplier = duration.group(2).startsWith("minute") ? 1200L : duration.group(2).startsWith("second") ? 20L : 1L;
+					return new GoalPredicate.SurviveDuration(Math.multiplyExact(count, multiplier));
+				}
+			}
+		} catch (NumberFormatException | ArithmeticException exception) {
+			throw new AgentDomainException("GOAL_TRANSLATION_CONSTRAINT_MISMATCH", "Requested position or survival duration is outside the supported range");
+		}
+		return null;
 	}
 
 	private enum ClauseKind { ITEM, KILL, BLOCK, ADVANCEMENT, POSITION, SURVIVE, OPERATOR }

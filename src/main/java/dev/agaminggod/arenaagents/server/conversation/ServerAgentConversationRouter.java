@@ -43,6 +43,7 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 		this.manager = Objects.requireNonNull(manager, "manager must not be null");
 		this.eventSink = Objects.requireNonNull(eventSink, "eventSink must not be null");
 		this.goalSpecRequestSink = Objects.requireNonNull(goalSpecRequestSink, "goalSpecRequestSink must not be null");
+		restoreSequences(sequences, manager.pendingConversationWakes());
 	}
 
 	public DeliveryReceipt deliverAgentMessage(
@@ -284,12 +285,12 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 	}
 
 	private void publishToAgent(AgentRecord target, ConversationEvent source, ServerLevel sourceLevel) {
-		if ((source.kind() == ConversationKind.PLAYER_MESSAGE || source.kind() == ConversationKind.PROXIMITY_SPEECH)
-				&& target.state() == dev.agaminggod.arenaagents.agent.AgentLifecycleState.PAUSED
-				&& isSteeringPhrase(source.text())) {
+		// Capture the durable baseline before resume or routing can replace/clear its wake.
+		long sequence = nextSequence(sequences, target.agentId(), manager.pendingConversationWake(target.agentId())
+				.map(wake -> wake.event().sequence()).orElse(0L));
+		if (shouldResume(target.state(), source.kind(), source.text())) {
 			target = manager.resume(target.agentId().toString()).after();
 		}
-		long sequence = sequences.merge(target.agentId(), 1L, Long::sum);
 		ConversationEvent delivered = new ConversationEvent(
 				target.agentId(),
 				source.sourceId(),
@@ -427,14 +428,23 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 		if (player != null) player.sendSystemMessage(Component.literal(message));
 	}
 
-	private static boolean isSteeringPhrase(String text) {
-		String normalized = text.strip().toLowerCase(java.util.Locale.ROOT).replaceAll("\\s+", " ");
-		return normalized.equals("continue")
-				|| normalized.equals("keep going")
-				|| normalized.equals("watch out")
-				|| normalized.equals("try another route")
-				|| normalized.equals("retry")
-				|| normalized.equals("resume");
+	static void restoreSequences(Map<AgentId, Long> sequences, List<PendingConversationWake> wakes) {
+		// Acknowledged wakes can still be replayed after reconnect; retain their baseline too.
+		for (PendingConversationWake wake : wakes) {
+			sequences.merge(wake.event().agentId(), wake.event().sequence(), Math::max);
+		}
+	}
+
+	static boolean shouldResume(dev.agaminggod.arenaagents.agent.AgentLifecycleState state, ConversationKind kind, String text) {
+		return state == dev.agaminggod.arenaagents.agent.AgentLifecycleState.PAUSED
+				&& (kind == ConversationKind.PLAYER_MESSAGE || kind == ConversationKind.PROXIMITY_SPEECH)
+				&& GoalCompiler.isResumeRequest(text);
+	}
+
+	static long nextSequence(Map<AgentId, Long> sequences, AgentId agentId, long durableSequence) {
+		long sequence = Math.incrementExact(Math.max(sequences.getOrDefault(agentId, 0L), durableSequence));
+		sequences.put(agentId, sequence);
+		return sequence;
 	}
 
 	static record GoalRoute(boolean publish, Optional<GoalSpec> wakeSpec) {

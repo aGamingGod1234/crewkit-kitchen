@@ -1,4 +1,5 @@
 import { normalizeRetryReason, validateTraceId } from './control-latency-registry.mjs';
+import { normalizeToolResponseSummary } from './tool-response-summary.mjs';
 
 const MAX_IDENTITY_LENGTH = 128;
 
@@ -28,9 +29,29 @@ export function createProviderTurnTelemetry(value) {
 			? {}
 			: { retryReason: normalizeRetryReason(input.retryReason) }),
 		...(tokens === null ? {} : { tokens }),
+		...(input.usage == null ? {} : { usage: normalizeNativeUsage(input.usage) }),
+		...(input.toolResponses === undefined ? {} : { toolResponses: normalizeToolResponseSummary(input.toolResponses) }),
+		...Object.fromEntries(['threadId', 'turnId'].filter((key) => input[key] !== undefined).map((key) => [key, input[key] === null ? null : requireIdentity(input[key], key)])),
+		...Object.fromEntries(['toolCalls', 'toolResultBytes', 'inputBytes', 'inputCount'].filter((key) => input[key] !== undefined).map((key) => [key, requireCounter(input[key], key)])),
 		...(input.rateLimited === undefined ? {} : { rateLimited: Boolean(input.rateLimited) }),
 		...(input.compaction === undefined ? {} : { compaction: Boolean(input.compaction) }),
 	});
+}
+
+function requireCounter(value, field) {
+	if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${field} must be a nonnegative safe integer`);
+	return value;
+}
+
+function normalizeNativeUsage(value) {
+	const usage = requireObject(value, 'usage');
+	if (usage.scope !== 'observed_thread_counter_delta') throw new TypeError('unsupported native usage scope');
+	if (!['available', 'missing', 'baseline_unknown', 'counter_reset'].includes(usage.status)) throw new TypeError('unsupported native usage status');
+	return Object.freeze({ scope: usage.scope, status: usage.status,
+		start: usage.start == null ? null : normalizeTokens(usage.start),
+		end: usage.end == null ? null : normalizeTokens(usage.end),
+		updates: requireCounter(usage.updates, 'usage.updates'), counterReset: usage.counterReset === true,
+		attributionComplete: false, gapBefore: usage.gapBefore == null ? null : normalizeTokens(usage.gapBefore) });
 }
 
 function normalizeTokens(value) {

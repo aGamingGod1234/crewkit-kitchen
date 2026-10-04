@@ -172,7 +172,7 @@ export class LiveTaskViews {
  }
  snapshot(record) {
   const s = this.#state(record);
-  return { goalRevision: record.goalRevision, goal: s.goal, active: Boolean(record.currentGoal), verified: s.verified, revision: s.revision, plan: structuredClone(s.plan), lastObserved: { ...s.lastObserved }, events: [...s.events], usage: s.usage, allowance: s.allowance, generatedAt: this.#now() };
+  return { goalRevision: record.goalRevision, goal: displayGoal(s.goal), active: Boolean(record.currentGoal), verified: s.verified, revision: s.revision, plan: structuredClone(s.plan), lastObserved: { ...s.lastObserved }, events: [...s.events], usage: s.usage, allowance: s.allowance, generatedAt: this.#now() };
  }
  verified(record) { this.#state(record).verified=true; }
  begin(record, { fresh = false } = {}) {
@@ -246,3 +246,10 @@ function allowance(value) {
 function identifier(v) { return typeof v === 'string' && v.length <= 128 && /^[a-z0-9_.-]+:[a-z0-9_./-]+$/.test(v); }
 function text(v, max, empty) { if (typeof v !== 'string' || v.length > max || (!empty && !v.trim()) || /[\x00-\x1f\x7f]/.test(v)) throw new TypeError('Invalid plan text'); return v; }
 function exact(v, keys) { if (!v || typeof v !== 'object' || Array.isArray(v) || Object.keys(v).some(k => !keys.includes(k)) || keys.some(k => !Object.hasOwn(v, k))) throw new TypeError('Invalid plan fields'); }
+
+// This is a display projection only: saved scope, task identity and tool reads
+// retain the complete immutable request. Keep UTF-16 bounds without splitting a pair.
+function displayGoal(goal) {
+ if (goal.length <= 512) return goal;
+ return goal.slice(0, 511).replace(/[\uD800-\uDBFF]$/, '') + '\u2026';
+}

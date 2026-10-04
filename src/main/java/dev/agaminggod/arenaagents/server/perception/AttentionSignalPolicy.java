@@ -18,6 +18,10 @@ public final class AttentionSignalPolicy {
 	private AttentionSignalPolicy() {
 	}
 
+	static boolean safeAir(int air) {
+		return air > CRITICAL_AIR;
+	}
+
 	public static List<String> changedFacts(JsonObject previous, JsonObject current) {
 		Objects.requireNonNull(current, "current must not be null");
 		if (previous == null) return List.of();

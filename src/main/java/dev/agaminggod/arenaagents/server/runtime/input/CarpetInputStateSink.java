@@ -5,7 +5,10 @@ import carpet.script.utils.Tracer;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.server.CodexAgentManager;
 import dev.agaminggod.arenaagents.server.OfflineAgentPlayers;
+import java.util.Map;
 import java.util.Objects;
+import java.util.WeakHashMap;
+import java.util.function.Supplier;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.server.level.ServerLevel;
@@ -22,6 +25,9 @@ import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 
 public final class CarpetInputStateSink implements InputStateSink {
+	private static final Map<EntityPlayerActionPack.Action, Boolean> ATTACK_PRESSES = new WeakHashMap<>();
+	private static final ThreadLocal<AttackTarget> ATTACK_TARGET = new ThreadLocal<>();
+	private record AttackTarget(ServerPlayer player, HitResult hit) { }
 	private final CodexAgentManager manager;
 	private final ExactHandUseDriver useDriver = new ExactHandUseDriver();
 
@@ -40,35 +46,89 @@ public final class CarpetInputStateSink implements InputStateSink {
 		}
 		ModelPlayerInputBridge.bind(player, agentId, state);
 		EntityPlayerActionPack actions = OfflineAgentPlayers.actions(player);
-		boolean resetActions = previous != null && (
-				(previous.jump() && !state.jump())
-						|| (previous.attack() && !state.attack())
-		);
-		if (resetActions) actions.stopAll();
 		MinecraftPlayerUseAccess useAccess = new MinecraftPlayerUseAccess(player);
 		if (previous != null && previous.use() && (!state.use() || previous.hand() != state.hand())) {
 			useDriver.stop(agentId, useAccess);
 		}
-		actions.look(state.yaw(), state.pitch())
-				.setForward(state.forward())
-				.setStrafing(state.strafe())
-				.setSneaking(state.sneak())
-				.setSprinting(state.sprint());
-		actions.setSlot(state.selectedSlot() + 1);
-		player.setLastClientInput(new Input(state.forward() > 0, state.forward() < 0,
-				state.strafe() > 0, state.strafe() < 0, state.jump(), state.sneak(), state.sprint()));
-		if (state.jump() && (resetActions || previous == null || !previous.jump())) {
-			actions.start(EntityPlayerActionPack.ActionType.JUMP, EntityPlayerActionPack.Action.continuous());
-		}
-		if (state.attack() && (resetActions || previous == null || !previous.attack())) {
-			actions.start(EntityPlayerActionPack.ActionType.ATTACK, EntityPlayerActionPack.Action.continuous());
-		}
+		applyMovement(actions, player, state);
+		applyHeldActions(actions, previous, state);
 		if (state.use()) useDriver.start(agentId, state.hand(), useAccess);
 		if (state.use() && state.attack()) {
 			CarpetActionArbitration.bind(player, agentId, state.hand(), useDriver);
 		} else {
 			CarpetActionArbitration.unbind(agentId);
 		}
+	}
+
+	static void applyMovement(EntityPlayerActionPack actions, ServerPlayer player, AgentInputState state) {
+		// Carpet's sprint setter releases sneak. Resolve the held-key pair before either physical write.
+		boolean sprint = state.sprint() && !state.sneak();
+		actions.look(state.yaw(), state.pitch())
+				.setForward(state.forward())
+				.setStrafing(state.strafe())
+				.setSneaking(state.sneak())
+				.setSprinting(sprint);
+		actions.setSlot(state.selectedSlot() + 1);
+		player.setLastClientInput(new Input(state.forward() > 0, state.forward() < 0,
+				state.strafe() > 0, state.strafe() < 0, state.jump(), state.sneak(), sprint));
+	}
+
+	static void applyHeldActions(EntityPlayerActionPack actions, AgentInputState previous, AgentInputState state) {
+		// stopAll also aborts block damage, so release only the key whose state changed.
+		if (previous != null && previous.jump() && !state.jump()) actions.start(EntityPlayerActionPack.ActionType.JUMP, null);
+		if (previous != null && previous.attack() && !state.attack()) actions.start(EntityPlayerActionPack.ActionType.ATTACK, null);
+		if (state.jump() && (previous == null || !previous.jump())) {
+			actions.start(EntityPlayerActionPack.ActionType.JUMP, EntityPlayerActionPack.Action.continuous());
+		}
+		if (state.attack() && (previous == null || !previous.attack())) {
+			EntityPlayerActionPack.Action attack = EntityPlayerActionPack.Action.continuous();
+			synchronized (ATTACK_PRESSES) { ATTACK_PRESSES.put(attack, true); }
+			actions.start(EntityPlayerActionPack.ActionType.ATTACK, attack);
+		}
+	}
+
+	/** Called inside exact-hand use arbitration, so consuming use still suppresses attacks. */
+	public static Boolean tickAttack(ServerPlayer player, EntityPlayerActionPack.Action action, Supplier<Boolean> original) {
+		return tickAttack(player, action, original, () -> Tracer.rayTrace(
+				player, 1.0F, player.gameMode.isCreative() ? 5.0D : 4.5D, false));
+	}
+
+	static Boolean tickAttack(ServerPlayer player, EntityPlayerActionPack.Action action,
+			Supplier<Boolean> original, Supplier<HitResult> target) {
+		Boolean press;
+		synchronized (ATTACK_PRESSES) {
+			press = ATTACK_PRESSES.get(action);
+			if (press != null) ATTACK_PRESSES.put(action, false);
+		}
+		if (press == null) return original.get();
+		if (player.isSpectator()) return original.get();
+		HitResult hit = target.get();
+		if (!(hit instanceof EntityHitResult entityHit)) {
+			AttackTarget previous = ATTACK_TARGET.get();
+			ATTACK_TARGET.set(new AttackTarget(player, hit));
+			try {
+				return original.get();
+			} finally {
+				if (previous == null) ATTACK_TARGET.remove();
+				else ATTACK_TARGET.set(previous);
+			}
+		}
+		// Continuous Carpet attacks omit entity hits but reset attack strength every tick.
+		// A held key mines continuously; melee requires a press (release/repress repeats it).
+		if (!press || !player.isWithinEntityInteractionRange(entityHit.getEntity(), 0.0D)) return false;
+		player.attack(entityHit.getEntity());
+		player.swing(InteractionHand.MAIN_HAND);
+		player.resetAttackStrengthTicker();
+		player.resetLastActionTime();
+		return true;
+	}
+
+	/** One-shot handoff to Carpet's getTarget, scoped to this original ATTACK invocation. */
+	public static HitResult takeAttackTarget(ServerPlayer player) {
+		AttackTarget target = ATTACK_TARGET.get();
+		if (target == null || target.player() != player) return null;
+		ATTACK_TARGET.remove();
+		return target.hit();
 	}
 
 	@Override

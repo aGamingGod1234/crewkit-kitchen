@@ -178,9 +178,6 @@ public final class ScenarioArenaBlueprint {
 		b.set(0, 2, 0, Blocks.BARREL);
 
 		// Outer loot circuits: underground dungeons, watchtowers, woodland cover and mining outcrops.
-		for (int[] dungeon : new int[][]{{-42, -35}, {43, -31}, {-39, 40}, {41, 38}, {0, -49}, {0, 49}}) {
-			b.dungeon(dungeon[0], dungeon[1]);
-		}
 		for (int[] tower : new int[][]{{-radius + 9, -radius + 9}, {radius - 9, -radius + 9},
 				{-radius + 9, radius - 9}, {radius - 9, radius - 9}}) {
 			b.tower(tower[0], tower[1], 7, 14);
@@ -194,6 +191,10 @@ public final class ScenarioArenaBlueprint {
 		}
 		for (int[] cache : new int[][]{{-27, -18}, {28, -17}, {-25, 21}, {26, 20}, {-8, 35}, {10, -36}}) {
 			b.house(cache[0], cache[1]);
+		}
+		// Carve after surface cover so a tree cannot refill an entrance's headroom.
+		for (int[] dungeon : new int[][]{{-42, -35}, {43, -31}, {-39, 40}, {41, 38}, {0, -49}, {0, 49}}) {
+			b.dungeon(dungeon[0], dungeon[1]);
 		}
 		b.ring(0, 0, radius - 5, 1, Blocks.RED_NETHER_BRICKS);
 	}
@@ -447,6 +448,8 @@ public final class ScenarioArenaBlueprint {
 			fill(centerX - 3, centerX + 3, -6, -6, centerZ - 3, centerZ + 3, Blocks.COBBLESTONE);
 			for (int y = -5; y <= -2; y++) ring(centerX, centerZ, 3, y, Blocks.COBBLESTONE);
 			fill(centerX - 3, centerX + 3, -1, -1, centerZ - 3, centerZ + 3, Blocks.COBBLESTONE);
+			// Base terrain fills this volume; walls alone do not create a usable room.
+			fill(centerX - 2, centerX + 2, -5, -2, centerZ - 2, centerZ + 2, Blocks.AIR);
 			set(centerX, -5, centerZ, Blocks.CHEST);
 			Direction towardCenter;
 			if (Math.abs(centerX) >= Math.abs(centerZ) && centerX != 0) {
@@ -456,8 +459,9 @@ public final class ScenarioArenaBlueprint {
 			}
 			BlockState stairs = Blocks.COBBLESTONE_STAIRS.defaultBlockState()
 					.setValue(BlockStateProperties.HORIZONTAL_FACING, towardCenter);
-			for (int step = 0; step < 5; step++) {
-				int distance = 5 - step;
+			// Six rises join the room floor at -5 to the surface at +1 without a jump gap.
+			for (int step = 0; step < 6; step++) {
+				int distance = 6 - step;
 				int x = centerX + towardCenter.getStepX() * distance;
 				int z = centerZ + towardCenter.getStepZ() * distance;
 				int y = -step;
@@ -465,6 +469,9 @@ public final class ScenarioArenaBlueprint {
 				set(x, y + 1, z, Blocks.AIR);
 				set(x, y + 2, z, Blocks.AIR);
 			}
+			int approachX = centerX + towardCenter.getStepX() * 7;
+			int approachZ = centerZ + towardCenter.getStepZ() * 7;
+			fill(approachX, approachX, 1, 2, approachZ, approachZ, Blocks.AIR);
 		}
 
 		private void plot(int centerX, int centerZ, int size) {

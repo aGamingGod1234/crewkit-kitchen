@@ -7,6 +7,7 @@ import dev.agaminggod.arenaagents.client.navigation.PathPlan;
 import dev.agaminggod.arenaagents.client.navigation.WalkabilityView;
 
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -53,7 +54,38 @@ public final class ServerPathPlannerVerification {
 		return 3 + verifyElevationAndHoleSafety() + verifyDeferredPlanningIsRetryable() + verifySharedElapsedBudget()
 				+ verifyRoundRobinAdmissionEventuallyServesAll() + verifyContentionDeferralWindow()
 				+ verifyTickScopeRestoresPreviousBudget() + verifyRetainedSearchUsesSharedTickBudget()
-				+ verifyMinedTrunkHeadroom();
+				+ verifyMinedTrunkHeadroom() + verifyGoalMembershipOrder();
+	}
+
+	private static int verifyGoalMembershipOrder() {
+		GridPosition first = new GridPosition(4, 64, 1);
+		GridPosition second = new GridPosition(4, 64, -1);
+		PathPlan wide = goalOrderPlan(List.of(first, second), 8192);
+		PathPlan reversed = goalOrderPlan(List.of(second, first), 8192);
+		PathPlan sliced = goalOrderPlan(List.of(first, second), 1);
+		PathPlan slicedReverse = goalOrderPlan(List.of(second, first), 1);
+		assertEquals(PathOutcome.FOUND, wide.outcome(), "tied goals yield an actual route");
+		assertEquals(wide.nodes(), reversed.nodes(), "goal enumeration order does not prioritize ties");
+		assertEquals(wide.nodes(), sliced.nodes(), "slicing preserves the route");
+		assertEquals(wide.nodes(), slicedReverse.nodes(), "reversed goals preserve resumed routes");
+		GridPosition chosen = wide.nodes().getLast().position();
+		PathPlan changed = goalOrderPlan(List.of(chosen.equals(first) ? second : first), 1);
+		assertTrue(!chosen.equals(changed.nodes().getLast().position()), "changing membership changes the endpoint");
+		return 5;
+	}
+
+	private static PathPlan goalOrderPlan(List<GridPosition> goals, int work) {
+		ServerPathPlanner planner = new ServerPathPlanner();
+		WalkabilityView floor = p -> p.y() == 63 ? WalkabilityView.Cell.SAFE_SUPPORT : WalkabilityView.Cell.CLEAR;
+		LocalPathfinder.Search search = planner.beginSearch(new GridPosition(0, 64, 0), Set.copyOf(goals),
+				new GridPosition(5, 64, 0), 8, Set.of());
+		for (int i = 0; i < 512; i++) {
+			try (ServerPathPlanner.TickScope scope = ServerPathPlanner.beginServerTick(work, 1_000_000L, () -> 0L)) {
+				ServerPathPlanner.PlanningResult result = planner.resume(search, floor);
+				if (!result.deferred()) return result.plan();
+			}
+		}
+		throw new AssertionError("small fixture search failed to finish");
 	}
 
 	private static int verifyMinedTrunkHeadroom() {

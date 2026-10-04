@@ -2,29 +2,35 @@ package dev.agaminggod.arenaagents.world;
 
 import java.util.LinkedHashMap;
 
-/** Bounded revisions for observed 512-block regions; unrelated world activity stays cheap. */
+/** Bounded revisions at chunk resolution for local queries and region resolution for wide queries. */
 public final class WorldMutationRevisions {
 	private static final int REGION_SHIFT = 9;
+	private static final int CHUNK_SHIFT = 4;
 	private static final int CAPACITY = 256;
 	private final LinkedHashMap<Long, Long> regions = new LinkedHashMap<>(16, 0.75F, true);
+	private final LinkedHashMap<Long, Long> chunks = new LinkedHashMap<>(16, 0.75F, true);
 	private long sequence;
 
 	public synchronized long revision(int centerX, int centerZ, int radius) {
 		if (radius < 0 || radius >= 1 << REGION_SHIFT) throw new IllegalArgumentException("invalid observation radius");
-		int minimumX = (int) (((long) centerX - radius) >> REGION_SHIFT);
-		int maximumX = (int) (((long) centerX + radius) >> REGION_SHIFT);
-		int minimumZ = (int) (((long) centerZ - radius) >> REGION_SHIFT);
-		int maximumZ = (int) (((long) centerZ + radius) >> REGION_SHIFT);
+		// Navigation samples a chunk plus neighboring collision reach (radius 9).
+		// Keep wide perception queries coarse without invalidating local searches for distant writes.
+		int shift = radius < (1 << CHUNK_SHIFT) ? CHUNK_SHIFT : REGION_SHIFT;
+		LinkedHashMap<Long, Long> index = shift == CHUNK_SHIFT ? chunks : regions;
+		int minimumX = (int) (((long) centerX - radius) >> shift);
+		int maximumX = (int) (((long) centerX + radius) >> shift);
+		int minimumZ = (int) (((long) centerZ - radius) >> shift);
+		int maximumZ = (int) (((long) centerZ + radius) >> shift);
 		long revision = 0L;
 		for (int x = minimumX; x <= maximumX; x++) {
 			for (int z = minimumZ; z <= maximumZ; z++) {
 				long key = key(x, z);
-				Long stamp = regions.get(key);
+				Long stamp = index.get(key);
 				if (stamp == null) {
 					// Recreated regions must never revive a cache key from before eviction.
 					stamp = ++sequence;
-					regions.put(key, stamp);
-					if (regions.size() > CAPACITY) regions.pollFirstEntry();
+					index.put(key, stamp);
+					if (index.size() > CAPACITY) index.pollFirstEntry();
 				}
 				revision = Math.max(revision, stamp);
 			}
@@ -33,9 +39,12 @@ public final class WorldMutationRevisions {
 	}
 
 	public synchronized void recordMutation(int blockX, int blockZ) {
-		if (regions.isEmpty()) return;
-		long key = key(blockX >> REGION_SHIFT, blockZ >> REGION_SHIFT);
-		if (regions.get(key) != null) regions.put(key, ++sequence);
+		recordMutation(regions, key(blockX >> REGION_SHIFT, blockZ >> REGION_SHIFT));
+		recordMutation(chunks, key(blockX >> CHUNK_SHIFT, blockZ >> CHUNK_SHIFT));
+	}
+
+	private void recordMutation(LinkedHashMap<Long, Long> index, long key) {
+		if (index.get(key) != null) index.put(key, ++sequence);
 	}
 
 	synchronized int retainedRegions() {

@@ -64,18 +64,24 @@ final class VoiceHttpAuthentication {
 		Objects.requireNonNull(deadline, "deadline must not be null");
 		Objects.requireNonNull(abortExchange, "abortExchange must not be null");
 		if (deadline.isZero() || deadline.isNegative()) throw new IllegalArgumentException("deadline must be positive");
-		String contentLength = response.headers().firstValue("Content-Length").orElse(null);
-		if (contentLength != null) {
-			try {
-				long declared = Long.parseLong(contentLength);
-				if (declared < 0L || declared > maximumBytes) throw oversizedResponse();
-			} catch (NumberFormatException exception) {
-				throw new VoiceWorkerClient.VoiceWorkerException(
-						"VOICE_WORKER_RESPONSE", "Voice worker returned an invalid Content-Length", exception
-				);
-			}
-		}
 		InputStream input = response.body();
+		try {
+			String contentLength = response.headers().firstValue("Content-Length").orElse(null);
+			if (contentLength != null) {
+				try {
+					long declared = Long.parseLong(contentLength);
+					if (declared < 0L || declared > maximumBytes) throw oversizedResponse();
+				} catch (NumberFormatException exception) {
+					throw new VoiceWorkerClient.VoiceWorkerException(
+							"VOICE_WORKER_RESPONSE", "Voice worker returned an invalid Content-Length", exception
+					);
+				}
+			}
+		} catch (RuntimeException failure) {
+			// Header rejection still owns the delivered stream; never block the caller on close.
+			abortAndClose(abortExchange, input);
+			return CompletableFuture.failedFuture(failure);
+		}
 		CompletableFuture<byte[]> reading = CompletableFuture.supplyAsync(() -> readBounded(input, maximumBytes),
 				command -> Thread.startVirtualThread(command));
 		reading.orTimeout(deadline.toMillis(), TimeUnit.MILLISECONDS);

@@ -20,16 +20,7 @@ export class ConversationMemory {
 		if (!Number.isSafeInteger(value.sequence) || value.sequence < 0) throw new TypeError('conversation sequence must be a non-negative safe integer');
 		if (value.sequence === this.#lastSequence) return false;
 		if (value.sequence < this.#lastSequence) throw new TypeError('conversation sequence must be monotonic');
-		const entry = Object.freeze({
-			sequence: value.sequence,
-			kind: boundedText(value.kind, 'kind', 128),
-			sourceId: boundedText(value.sourceId, 'sourceId', 256),
-			recipientId: boundedText(value.recipientId, 'recipientId', 256),
-			scope: boundedText(value.scope, 'scope', 32),
-			text: boundedText(value.text, 'text', 512),
-			goalRevision: nonnegativeInteger(value.goalRevision, 'goalRevision'),
-			observedAtEpochMs: nonnegativeInteger(value.observedAtEpochMs, 'observedAtEpochMs'),
-		});
+		const entry = canonicalConversationEntry(value);
 		this.#lastSequence = value.sequence;
 		this.#entries.push(entry);
 		this.#entries = this.#entries.slice(-this.#maximumEntries);
@@ -117,4 +108,20 @@ function boundedText(value, field, maximumCodePoints) {
 function nonnegativeInteger(value, field) {
 	if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${field} must be a non-negative safe integer`);
 	return value;
+}
+
+/** Shared validation for bounded display history and durable admission. */
+export function canonicalConversationEntry(value) {
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('conversation event must be an object');
+	if (!Number.isSafeInteger(value.sequence) || value.sequence < 0) throw new TypeError('conversation sequence must be a non-negative safe integer');
+	return Object.freeze({
+		sequence: value.sequence,
+		kind: boundedText(value.kind, 'kind', 128),
+		sourceId: boundedText(value.sourceId, 'sourceId', 256),
+		recipientId: boundedText(value.recipientId, 'recipientId', 256),
+		scope: boundedText(value.scope, 'scope', 32),
+		text: boundedText(value.text, 'text', 512),
+		goalRevision: nonnegativeInteger(value.goalRevision, 'goalRevision'),
+		observedAtEpochMs: nonnegativeInteger(value.observedAtEpochMs, 'observedAtEpochMs'),
+	});
 }
