@@ -1,16 +1,26 @@
 import assert from 'node:assert/strict';
 import { fixture, gate, event, record, until, flush } from './runtime-inbox-fixture.mjs';
 const summary = calls => calls.map(c=>({kind:c.kind,goalRevision:c.goalRevision,accepted:c.accepted,baseSequence:c.conversation.baseSequence,nextSequence:c.conversation.nextSequence,omittedEntries:c.conversation.omittedEntries,sequences:c.conversation.entries.map(e=>e.sequence)}));
-async function burst(count,rejectSteer=false,long=true) {
+async function burst(count,rejectSteer=false,long=true,onFixture=()=>{}) {
   const turn=gate(), steer=gate();
   const f=await fixture({start:async(c,calls)=>{if(calls.filter(x=>x.kind==='start').length===1)await turn.promise;},steer:async(c,calls)=>{if(calls.filter(x=>x.kind==='steer').length===1)await steer.promise;}});
   try {
+    onFixture(f);
     await f.bridge.deliver('conversation_event',event(1,long)); await until(()=>f.calls.length===1,'first turn');
     await f.bridge.deliver('conversation_event',event(2,long)); await until(()=>f.calls.length===2,'blocked steering');
     for(let seq=3;seq<=count;seq++) await f.bridge.deliver('conversation_event',event(seq,long));
     assert.equal(f.calls.length,2,'burst is ingested while native steering is unresolved');
     if(rejectSteer)steer.reject(Object.assign(new Error('offline rejection before native acceptance'),{code:'TURN_NOT_ACTIVE'}));else steer.resolve();
-    await flush(); turn.resolve(); await until(()=>f.calls.filter(c=>c.accepted).flatMap(c=>c.conversation.entries).length >= count,'all successful prefixes'); await flush();
+    await f.waitForTrace(traces=>traces.some(t=>t.event===(rejectSteer?'native_turn_steer_deferred':'native_turn_steered')));
+    turn.resolve();
+    // Provider acceptance precedes durable commit. A followup sent during the
+    // prior visible-reply correction is steering, not a fresh two-turn exchange.
+    await f.waitForTrace(traces=>{
+      const starts=f.calls.filter(c=>c.kind==='start');
+      return starts.length>=2 && starts.at(-1).accepted && starts.at(-1).conversation.entries.length===0
+        && f.calls.filter(c=>c.accepted).flatMap(c=>c.conversation.entries).length>=count
+        && traces.filter(t=>t.event==='native_turn_completed').length===starts.length;
+    });
     const attempted=f.calls.flatMap(c=>c.conversation.entries.map(e=>e.sequence));
     const accepted=f.calls.filter(c=>c.accepted).flatMap(c=>c.conversation.entries.map(e=>e.sequence));
     const missed=Array.from({length:count},(_,i)=>i+1).filter(s=>!accepted.includes(s));
@@ -19,7 +29,16 @@ async function burst(count,rejectSteer=false,long=true) {
     assert.deepEqual(accepted,Array.from({length:count},(_,i)=>i+1),'successful prefixes preserve order without duplicates');
     for (const call of f.calls.filter(c=>c.accepted)) for (const entry of call.conversation.entries) assert.deepEqual(entry,event(entry.sequence,long));
     const out={name:`burst-${count}-${long?'bytes':'entries'}-${rejectSteer?'rejected':'accepted'}-steer`,ingested:count,providerCalls:summary(f.calls),missingAccepted:missed,instruction3EverAttempted:attempted.includes(3),coordinatorErrors:f.errors,wireErrors:f.bridge.sent.filter(m=>m.type==='agent_error'),traces:f.traces.filter(t=>['native_turn_steered','native_turn_steer_deferred','native_turn_completed'].includes(t.event))};
-    if(count>32){const before=f.calls.length;await f.bridge.deliver('conversation_event',event(count+1,long));await until(()=>f.calls.slice(before).filter(call=>call.accepted).length>=2 && f.calls.slice(before).some(call=>call.accepted && call.conversation.entries.some(entry=>entry.sequence===count+1)),'followup delivery and correction accepted');const followup=f.calls.slice(before);assert.deepEqual(followup.flatMap(call=>call.conversation.entries.map(e=>e.sequence)),[count+1]);assert.equal(followup.length,2,'delivery plus one correction because this fixture never sends chat');out.followup=summary(followup);}
+    if(count>32){
+      const before=f.calls.length,completed=f.traces.filter(t=>t.event==='native_turn_completed').length;
+      await f.bridge.deliver('conversation_event',event(count+1,long));
+      await f.waitForTrace(traces=>traces.filter(t=>t.event==='native_turn_completed').length>=completed+2);
+      const followup=f.calls.slice(before);
+      assert.deepEqual(followup.flatMap(call=>call.conversation.entries.map(e=>e.sequence)),[count+1]);
+      assert.equal(followup.length,2,'delivery plus one correction because this fixture never sends chat');
+      assert.ok(followup.every(call=>call.kind==='start' && call.accepted),'followup starts after the prior correction committed');
+      out.followup=summary(followup);
+    }
     return out;
   } finally {steer.resolve();turn.resolve();await f.coordinator.stop();}
 }

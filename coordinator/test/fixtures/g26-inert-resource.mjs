@@ -43,8 +43,10 @@ if (role === 'child') {
     const active = { ...memory, runnerPid: process.pid, role,
       observedAt: new Date().toISOString(), phase: 'trial', childExitedBeforeTrialEnd: false };
     await writeFile(path.join(directory, 'active-resource.json'), JSON.stringify(active));
+    // Keep the trial open until CIM observes the allocation. In particular, a
+    // persistent child must not publish its trial boundary before that sample.
+    if (channel) await waitForSample();
     if (role === 'paired-transient') {
-      await waitForSample();
       child.stdin.end('exit\n');
       const [exit] = await childExit;
       if (exit !== 0) throw new Error(`Fixture child exit ${exit}`);
@@ -54,7 +56,7 @@ if (role === 'child') {
     if (channel) await channel.cleanup({ scenarioId: 'fixture', status: 'PASSED' });
     else await writeFile(path.join(directory, 'runner-ready.json'), '{}');
     if (role !== 'paired-transient') {
-      await waitForSample();
+      if (!channel) await waitForSample();
       child.stdin.end('exit\n');
       const [exit] = await childExit;
       if (exit !== 0) throw new Error(`Fixture child exit ${exit}`);

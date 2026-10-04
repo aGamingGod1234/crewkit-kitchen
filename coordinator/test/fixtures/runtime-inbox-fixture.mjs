@@ -29,6 +29,18 @@ class Supervisor {
 }
 async function fixture(handlers={}) {
   const registry = new AgentRegistry(), bridge = new Bridge(), calls=[], errors=[], traces=[]; let statusTick;
+  const traceEvents = new EventEmitter();
+  // Use actual completion evidence for disk-backed work. The test runner's
+  // existing file deadline bounds a missing event without a guessed sleep.
+  function waitForTrace(predicate) {
+    if (predicate(traces)) return Promise.resolve();
+    return new Promise(resolve => {
+      const check = () => {
+        if (predicate(traces)) { traceEvents.off('trace', check); resolve(); }
+      };
+      traceEvents.on('trace', check);
+    });
+  }
   function capture(kind,request) {
     const raw=JSON.parse(request.input.split('\n')[1]);
     const encoded=decodeModelFacts(JSON.parse(encodeNativeEventInput(request.input).split('\n')[1]));
@@ -43,12 +55,12 @@ async function fixture(handlers={}) {
     async interrupt(){}, async remove(id){return registry.remove(id);},
   };
   const provider={catalog:{stale:false,refresh:async()=>({models:[]}),assertSupported(){}},async start(){},async stop(){}};
-  const coordinator=createProductionCoordinator({bridge:{port:25570,secret:'s'.repeat(32)},codex:{controlProtocol:'native_tools'}},{bridge,registry,planner,codexService:provider,memoryDirectory:handlers.memoryDirectory ?? null,runtimeHooks:handlers.runtimeHooks,setStatusInterval:cb=>{statusTick=cb;return null;},clearStatusInterval:()=>{},goalSupervisor:handlers.supervisor ?? new Supervisor(),traceWriter:{write:(event,data)=>traces.push({event,...data})}});
+  const coordinator=createProductionCoordinator({bridge:{port:25570,secret:'s'.repeat(32)},codex:{controlProtocol:'native_tools'}},{bridge,registry,planner,codexService:provider,memoryDirectory:handlers.memoryDirectory ?? null,runtimeHooks:handlers.runtimeHooks,setStatusInterval:cb=>{statusTick=cb;return null;},clearStatusInterval:()=>{},goalSupervisor:handlers.supervisor ?? new Supervisor(),traceWriter:{write:(event,data)=>{traces.push({event,...data});traceEvents.emit('trace');}}});
   coordinator.on('runtimeError', e=>errors.push({code:e.code,message:e.message}));
   await coordinator.start(); bridge.emit('ready',{serverInstanceId:'r17-server',connectionEpoch:1,registry:[handlers.record ?? record()]});
   await until(()=>bridge.sent.some(m=>m.type==='agent_ready'),'ready');
   if (handlers.waitForReconciliation !== false) await until(()=>bridge.sent.some(m=>m.type==='coordinator_status'&&m.payload.reconciled)||errors.length>0,'reconciliation finished');
-  return {registry,bridge,coordinator,calls,errors,traces,planner,statusTick:()=>statusTick()};
+  return {registry,bridge,coordinator,calls,errors,traces,planner,waitForTrace,statusTick:()=>statusTick()};
 }
 
 export {fixture,gate,event,record,until,flush};

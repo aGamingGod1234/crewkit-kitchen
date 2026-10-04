@@ -39,9 +39,9 @@ function Get-ProcessSnapshot {
     $active = if (Test-Path -LiteralPath $activePath) { Get-Content -Raw -LiteralPath $activePath | ConvertFrom-Json } else { $null }
     $childPresent = $null -ne $active -and $snapshot.ContainsKey([int]$active.pid)
     $script:trace.Add([ordered]@{ event='sample'; phase=$phase; childPresent=$childPresent })
-    # CIM enumeration can start before the child commits its allocation. Release
-    # the fixture only after this same snapshot contains the allocated memory.
-    if ($childPresent -and [long]$snapshot[[int]$active.pid].WorkingSetSize -ge [long]$active.allocatedBytes) {
+    # Release paired fixtures only after an actual trial snapshot contains the
+    # allocation; startup or cleanup samples cannot acknowledge the trial.
+    if (($phase -eq 'trial' -or $phase -eq 'single-active') -and $childPresent -and [long]$snapshot[[int]$active.pid].WorkingSetSize -ge [long]$active.allocatedBytes) {
         [IO.File]::WriteAllText((Join-Path $script:caseDirectory 'sample-observed.json'), '{}')
     }
     return $snapshot
