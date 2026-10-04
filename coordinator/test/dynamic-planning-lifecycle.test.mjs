@@ -405,31 +405,52 @@ test('old conversation wake awaiting native disposal cannot repopulate replaceme
 test('zero-tool native conversation retries visibly under the replacement work epoch', async () => {
 	const registry = new AgentRegistry();
 	const planner = new FakePlanner(registry);
+	const traces = [], errors = [], steers = [];
 	let releaseOldTurn;
 	const oldTurn = new Promise((resolve) => { releaseOldTurn = resolve; });
+	let releaseReplacementTurn, recoveredTurnStarted, steeringDeferred;
+	const replacementTurn = new Promise((resolve) => { releaseReplacementTurn = resolve; });
+	const recoveredTurn = new Promise((resolve) => { recoveredTurnStarted = resolve; });
+	const deferredSteering = new Promise((resolve) => { steeringDeferred = resolve; });
+	let chatResult;
 	planner.requestPlan = async () => assert.fail('native control must not use ArenaScript planning');
+	planner.steerNativeTurn = async (request) => {
+		steers.push(request);
+		throw Object.assign(new Error('replacement turn no longer accepts steering'), { code: 'TURN_NOT_ACTIVE' });
+	};
 	planner.requestNativeTurn = async (request) => {
 		planner.requests.push(request);
+		assert.ok(planner.requests.length <= 4, 'only the old, recovered, pending and correction turns are expected');
 		if (planner.requests.length === 1) {
 			await oldTurn;
 			return { status: 'completed', toolCalls: 0 };
 		}
-		if (planner.requests.length === 2) return { status: 'completed', toolCalls: 0 };
-		const result = await request.executeTool({
+		if (planner.requests.length === 2) {
+			recoveredTurnStarted();
+			await replacementTurn;
+			return { status: 'completed', toolCalls: 0 };
+		}
+		if (!request.input.includes('previous turn made no visible reply')) return { status: 'completed', toolCalls: 0 };
+		chatResult = await request.executeTool({
 			agentId: request.agentId,
 			goalRevision: request.goalRevision,
 			turnId: 'turn-visible-retry',
 			callId: 'call-visible-retry',
 			tool: { kind: 'action', actionType: 'chat', arguments: { message: 'Visible reply.', audience: 'direct', recipientId: 'player-a' } },
 		});
-		assert.equal(result.state, 'SUCCEEDED');
+		assert.equal(chatResult.state, 'SUCCEEDED');
 		return { status: 'completed', toolCalls: 1 };
 	};
 	const run = await start({
 		registry,
 		planner,
+		traceWriter: { write(event, fields) {
+			traces.push({ event, ...fields });
+			if (event === 'native_turn_steer_deferred') steeringDeferred();
+		} },
 		config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } },
 	});
+	run.coordinator.on('runtimeError', (error) => errors.push(error));
 	try {
 		run.bridge.emit('conversation_event', { connectionEpoch: 1, agentId: 'agent-a', payload: {
 			sequence: 1, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
@@ -440,24 +461,41 @@ test('zero-tool native conversation retries visibly under the replacement work e
 		await eventually(() => planner.interruptions.includes('agent-a'));
 		run.bridge.emit('ready', { connectionEpoch: 2, serverInstanceId: 'test', registry: [record()] });
 		await eventually(() => run.bridge.sent.some((message) => message.type === 'agent_ready' && message.connectionEpoch === 2));
+		// Reconciliation now resumes unread input without another player message.
+		// Hold that real replacement turn so new input deterministically becomes
+		// deferred work before its zero-tool completion requests a visible reply.
+		await recoveredTurn;
+		assert.match(planner.requests[1].input, /Old pending turn/);
+		assert.doesNotMatch(planner.requests[1].input, /Reply in the replacement session/);
 		releaseOldTurn();
-		for (let index = 0; index < 3; index += 1) await new Promise((resolve) => setImmediate(resolve));
 
 		run.bridge.emit('conversation_event', { connectionEpoch: 2, agentId: 'agent-a', payload: {
 			sequence: 2, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
 			text: 'Reply in the replacement session.', goalRevision: 0, observedAtEpochMs: 20,
 		} });
-		await eventually(() => planner.requests.length === 3);
-		assert.match(planner.requests[2].input, /previous turn made no visible reply/);
+		await deferredSteering;
+		assert.equal(steers.length, 1);
+		assert.match(steers[0].input, /Reply in the replacement session/);
+		releaseReplacementTurn();
+		await eventually(() => planner.requests.length === 4);
+		assert.match(planner.requests[2].input, /Reply in the replacement session/);
+		assert.doesNotMatch(planner.requests[2].input, /previous turn made no visible reply/);
+		assert.match(planner.requests[3].input, /previous turn made no visible reply/);
+		assert.equal(planner.requests.filter(request => request.input.includes('previous turn made no visible reply')).length, 1);
 		await eventually(() => run.bridge.sent.some((message) => message.payload?.actionType === 'chat' && message.connectionEpoch === 2));
 		const command = run.bridge.sent.find((message) => message.payload?.actionType === 'chat' && message.connectionEpoch === 2);
 		run.bridge.emit('action_result', { connectionEpoch: 2, agentId: 'agent-a', payload: {
 			goalRevision: 0, actionId: command.payload.actionId, actionType: 'chat', state: 'SUCCEEDED',
 			reasonCode: 'CHAT_SENT', executionStarted: true, eventSequence: 2,
 		} });
-		await eventually(() => registry.get('agent-a')?.state === DynamicAgentState.IDLE);
+		await eventually(() => traces.filter(trace => trace.event === 'native_turn_completed').length === 3);
+		assert.equal(chatResult.state, 'SUCCEEDED');
+		assert.equal(registry.get('agent-a')?.state, DynamicAgentState.IDLE);
+		assert.deepEqual(errors, []);
+		assert.equal(run.bridge.sent.filter(message => message.payload?.actionType === 'chat').length, 1);
 	} finally {
 		releaseOldTurn?.();
+		releaseReplacementTurn?.();
 		await run.coordinator.stop();
 	}
 });

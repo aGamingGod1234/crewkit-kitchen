@@ -72,7 +72,7 @@ export async function verifyArm(arm) {
  */
 export function phaseWorker(command, args, { cwd, env = process.env, onResource = () => {}, onEvent = () => {} } = {}) {
 	const child = spawn(command, args, { cwd, env: windowsPowerShellEnv(command, env), windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
-	let exited = false, exitCode = null, failed = false, pending = null, killing = null;
+	let exited = false, exitCode = null, outputClosed = false, failed = false, pending = null, killing = null;
 	let startupError = null, handoffTimer = null, awaitingTrialAcknowledgement = false;
 	const queued = [];
 	const exit = new Promise(resolve => {
@@ -83,6 +83,7 @@ export function phaseWorker(command, args, { cwd, env = process.env, onResource 
 	// Do not retain private child stderr in paired public reports.
 	child.stderr.resume();
 	const lines = createInterface({ input: child.stdout });
+	lines.once('close', () => { outputClosed = true; wake(); });
 	lines.on('line', line => {
 		if (!line.startsWith('PAIR_EVENT ')) return;
 		try {
@@ -161,7 +162,11 @@ export function phaseWorker(command, args, { cwd, env = process.env, onResource 
 					if (reason || remaining() <= 0) { await terminate(); throw Object.assign(new Error('Late phase completion'), { code: 'HEADLESS_TIMEOUT' }); }
 					return event.value;
 				}
-				if (exited) throw startupError ?? new Error('Worker exited before its phase acknowledgement');
+				if (startupError) throw startupError;
+				// Process exit can precede the final stdout data/EOF. Keep the current
+				// phase deadline armed while draining its acknowledgement; an inherited
+				// pipe that never closes still fails closed through the existing timer.
+				if (exited && outputClosed) throw new Error('Worker exited before its phase acknowledgement');
 				await new Promise(resolve => { pending = resolve; });
 			}
 		} finally { clearTimeout(timer); context.signal?.removeEventListener('abort', abort); }
