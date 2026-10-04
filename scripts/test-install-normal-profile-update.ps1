@@ -97,7 +97,9 @@ function Assert-CurrentUserRuntimeAccess([string] $Path, [switch] $RequireInheri
 
 # Keep the space-in-path control without making nested coordinator backup paths
 # exceed Windows PowerShell 5.1's legacy path limit under a normal user TEMP.
-$target = Join-Path $env:TEMP ('arena up ' + [guid]::NewGuid().ToString('N'))
+# CI can supply TEMP using an 8.3 alias. Resolve it before deriving snapshot
+# prefixes, since file enumeration and the updater use the expanded path.
+$target = [IO.Path]::GetFullPath((Join-Path $env:TEMP ('arena up ' + [guid]::NewGuid().ToString('N'))))
 $mods = Join-Path $target 'mods'
 $installedRoot = Join-Path $target 'arena-agents-runtime'
 $runtimeCoordinator = Join-Path $installedRoot 'coordinator'
