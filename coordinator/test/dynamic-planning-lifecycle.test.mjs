@@ -352,7 +352,7 @@ test('old conversation wake awaiting native disposal cannot repopulate replaceme
 			goalRevision: request.goalRevision,
 			turnId: 'turn-before-wake',
 			callId: 'call-before-wake',
-			tool: { kind: 'action', actionType: 'chat', arguments: { message: 'Waiting.', audience: 'direct', recipientId: 'player-a' } },
+			tool: { kind: 'action', actionType: 'chat', arguments: { message: 'Waiting.', audience: 'direct', recipientId: '11111111-1111-4111-8111-111111111111' } },
 		});
 	};
 	const run = await start({
@@ -436,7 +436,7 @@ test('zero-tool native conversation retries visibly under the replacement work e
 			goalRevision: request.goalRevision,
 			turnId: 'turn-visible-retry',
 			callId: 'call-visible-retry',
-			tool: { kind: 'action', actionType: 'chat', arguments: { message: 'Visible reply.', audience: 'direct', recipientId: 'player-a' } },
+			tool: { kind: 'action', actionType: 'chat', arguments: { message: 'Visible reply.', audience: 'direct', recipientId: '11111111-1111-4111-8111-111111111111' } },
 		});
 		assert.equal(chatResult.state, 'SUCCEEDED');
 		return { status: 'completed', toolCalls: 1 };

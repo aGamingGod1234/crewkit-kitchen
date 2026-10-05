@@ -31,6 +31,8 @@ Native tools apply your chosen actions and report what happened. Plain assistant
 
 Observe reports freshness.fresh for the sample barrier. False identifies cached facts. rememberedSections identifies older sections retained during death. A missing entity, block, or slot may be omitted by coverage limits rather than absent. Images and hidden server state are outside this interface.
 
+Compact observations keep resultCoverage row counts separate from omittedFields. Field paths such as inventory.extra or entities[].equipment identify omitted or shortened fields; [] means at least one retained row. All rows retained does not mean all fields retained. Existing server coverage still applies; omitted facts remain unknown.
+
 Inspect supports inventory, menu, entities, blocks, landmarks, nearby_containers, item, block, events, recipes, and mechanics. Pages use offset 0..4096 and limit 1..32. Item detail requires slot; block detail requires visible x/y/z. Events accept afterSequence for newly delivered player-accessible events. Recipes lists installed rules; an exact recipeId retrieves its ingredient, result, and workstation display details with explicit coverage. Mechanics reports installed version and current native player attributes and abilities. Recipe rules do not reveal hidden resources or positions. Copy returned stack fingerprints, containerId, stateId, raw slot indexes, target identities, and hit geometry. Continue a shortened page using nextOffset; unreturned details remain unknown.
 
 ExploreFrontier lists observed positions and unknown neighboring cells. It never chooses or travels to a destination. Reachability remains unknown until checked by the body. Choose coordinates explicitly with moveTo or input frames. Stored places are scoped to world and dimension and can become stale.
@@ -299,6 +301,8 @@ Hold one complete player input frame for 1 to 200 server ticks. Use for precise 
 
 Navigate toward one short, confirmed waypoint through bounded loaded safe waypoints; use control for ordinary exploration.
 
+Native moveTo maps to navigate_to, with tolerance:1, sprint:true and timeoutMs:30000 defaults. Its timeout accepts 1..600000ms, matching act and sequence. In ArenaScript, player.moveTo accepts x/y/z, tolerance and sprint only; player.navigateTo additionally requires timeoutMs. Program deadlines still apply.
+
 ```json executor-call
 {"tool":"moveTo","arguments":{"x":12,"y":64,"z":12,"tolerance":1,"sprint":true,"timeoutMs":30000}}
 ```
@@ -315,6 +319,8 @@ List factual observed or unknown adjacent-space candidates. This tool never choo
 
 Mine one observed, visible, in-range block coordinate with its exact current blockId.
 
+timeoutMs defaults to 15000 and accepts 1..600000ms, matching act and sequence break_block. Program deadlines still apply.
+
 ```json executor-call
 {"tool":"mine","arguments":{"x":11,"y":64,"z":10,"expectedBlockId":"minecraft:oak_log","timeoutMs":15000}}
 ```
@@ -325,7 +331,7 @@ Mine one observed, visible, in-range block coordinate with its exact current blo
 
 ### say
 
-Send public chat, a private message, or nearby proximity speech.
+Send public chat, a private message, or nearby proximity speech. say accepts up to 256 Unicode code points. Direct speech requires an observed player UUID in recipientId; supplying only recipientId defaults audience to direct. Other audiences cannot use recipientId.
 
 ```json executor-call
 {"tool":"say","arguments":{"message":"I found the marked chest.","audience":"proximity"}}
@@ -353,6 +359,12 @@ Execute 2 to 8 known actions in order, stopping on the first factual failure. re
 
 ```json executor-call
 {"tool":"sequence","arguments":{"actions":[{"actionType":"look_at","arguments":{"x":11.5,"y":64.5,"z":10.5}},{"actionType":"break_block","arguments":{"x":11,"y":64,"z":10,"expectedBlockId":"minecraft:oak_log","timeoutMs":15000}}]}}
+```
+
+Optional finish:{summary} requests verification of the immutable active goal after every step succeeds and fresh final facts are available. A failed step skips finish; action success alone does not prove the goal. Read the returned finish verification facts. If AWAITING_OPERATOR_CONFIRMATION, report once with say and end the turn until new input.
+
+```json executor-call
+{"tool":"sequence","arguments":{"actions":[{"actionType":"craft_inventory","arguments":{"recipeId":"minecraft:oak_planks","count":4,"timeoutMs":15000}},{"actionType":"craft_inventory","arguments":{"recipeId":"minecraft:stick","count":4,"timeoutMs":15000}}],"finish":{"summary":"Crafted the requested sticks; verify current inventory."}}}
 ```
 
 ### finish

@@ -93,6 +93,13 @@ const TERMINAL_ACTION_STATES = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIM
 const MAX_TRACKED_MESSAGE_IDS = 4_096;
 const MAX_TRACKED_TERMINAL_ACTION_IDS = 4_096;
 const DEFAULT_INBOUND_DISPATCH_BATCH = 32;
+const INSPECTION_OUTBOUND_TYPES = new Set(['inspection_request', 'request_observation']);
+const RESERVED_OUTBOUND_TYPES = new Set(['agent_ready', 'goal_completed', 'conversation_wake_ack', 'action_command', 'action_cancel', 'action_result_ack', 'agent_error', 'heartbeat']);
+// Keep the existing ordinary capacity, plus bounded room for readiness, command,
+// cancellation and acknowledgement even when inspections occupy every ordinary slot.
+const AGENT_CONTROL_RESERVE = 4;
+const CONNECTION_CONTROL_RESERVE = 64;
+const OUTBOUND_CONTROL_BURST = 4;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 5_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 5_000;
 const DEFAULT_HEARTBEAT_TIMEOUT_MS = 15_000;
@@ -462,6 +469,8 @@ export class MultiplexedServerBridge extends EventEmitter {
 	#heartbeatProbeToken = 0;
 	#connectionEpoch = 0;
 	#outboundQueue = [];
+	#outboundAgentOrder = [[], []];
+	#outboundControlBurst = 0;
 	#queuedByAgent = new Map();
 	#writeBlocked = false;
 	#blockedWriteEntry = null;
@@ -996,6 +1005,8 @@ export class MultiplexedServerBridge extends EventEmitter {
 			));
 		}
 		this.#outboundQueue = retained;
+		this.#outboundAgentOrder = this.#outboundAgentOrder.map((agents, lane) =>
+			agents.filter((id) => retained.some((entry) => entry.lane === lane && entry.envelope.agentId === id)));
 	}
 
 	#trackedRevision(agentId) {
@@ -1126,15 +1137,37 @@ export class MultiplexedServerBridge extends EventEmitter {
 	}
 
 	#enqueue(envelope) {
-		if (this.#outboundQueue.length >= this.#connectionQueueCap) return Promise.reject(new ProtocolV2Error('CONNECTION_BACKPRESSURE', 'Connection outbound queue is full'));
+		const reserved = RESERVED_OUTBOUND_TYPES.has(envelope.type);
+		const connectionLimit = this.#connectionQueueCap + (reserved ? Math.min(this.#connectionQueueCap, CONNECTION_CONTROL_RESERVE) : 0);
+		const agentLimit = this.#agentQueueCap + (reserved ? Math.min(this.#agentQueueCap, AGENT_CONTROL_RESERVE) : 0);
+		if (this.#outboundQueue.length >= connectionLimit) return Promise.reject(new ProtocolV2Error('CONNECTION_BACKPRESSURE', 'Connection outbound queue is full'));
 		const agentCount = this.#queuedByAgent.get(envelope.agentId) ?? 0;
-		if (agentCount >= this.#agentQueueCap) return Promise.reject(new ProtocolV2Error('AGENT_BACKPRESSURE', `Outbound queue for agent '${envelope.agentId}' is full`));
+		if (agentCount >= agentLimit) return Promise.reject(new ProtocolV2Error('AGENT_BACKPRESSURE', `Outbound queue for agent '${envelope.agentId}' is full`));
 		if (envelope.type === 'action_command') this.#rememberIssuedAction(envelope);
 		return new Promise((resolve, reject) => {
-			this.#outboundQueue.push({ envelope, encoded: encodeJsonLine(envelope), resolve, reject });
+			const lane = INSPECTION_OUTBOUND_TYPES.has(envelope.type) ? 1 : 0;
+			this.#outboundQueue.push({ envelope, encoded: encodeJsonLine(envelope), resolve, reject, lane });
+			if (!this.#outboundAgentOrder[lane].includes(envelope.agentId)) this.#outboundAgentOrder[lane].push(envelope.agentId);
 			this.#queuedByAgent.set(envelope.agentId, agentCount + 1);
 			this.#flush();
 		});
+	}
+
+	#takeNextOutbound() {
+		// Within an agent, only unwritten inspections can be overtaken. Other messages retain
+		// per-agent FIFO order, including readiness, command-before-cancel and ACKs.
+		// Round-robin agents in each lane; yield after a bounded control burst so
+		// fresh inspections also make progress under sustained control traffic.
+		const lane = this.#outboundAgentOrder[1].length > 0
+			&& (this.#outboundAgentOrder[0].length === 0 || this.#outboundControlBurst >= OUTBOUND_CONTROL_BURST) ? 1 : 0;
+		const agents = this.#outboundAgentOrder[lane];
+		const agentId = agents.shift();
+		const index = this.#outboundQueue.findIndex((entry) => entry.lane === lane && entry.envelope.agentId === agentId);
+		const [entry] = this.#outboundQueue.splice(index, 1);
+		if (this.#outboundQueue.some((queued) => queued.lane === lane && queued.envelope.agentId === agentId)) agents.push(agentId);
+		this.#outboundControlBurst = lane === 1 ? 0 : Math.min(this.#outboundControlBurst + 1, OUTBOUND_CONTROL_BURST);
+		if (this.#outboundQueue.length === 0) this.#outboundControlBurst = 0;
+		return entry;
 	}
 
 	#rememberIssuedAction(envelope) {
@@ -1165,7 +1198,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 		const socket = this.#socket;
 		if (!this.#ready || this.#writeBlocked || socket === null || socket.destroyed) return;
 		while (this.#outboundQueue.length > 0) {
-			const entry = this.#outboundQueue.shift();
+			const entry = this.#takeNextOutbound();
 			this.#decrementQueued(entry.envelope.agentId);
 			let writable;
 			try {
@@ -1223,6 +1256,8 @@ export class MultiplexedServerBridge extends EventEmitter {
 		this.#blockedWriteEntry?.reject(error);
 		this.#blockedWriteEntry = null;
 		for (const entry of this.#outboundQueue.splice(0)) entry.reject(error);
+		this.#outboundAgentOrder = [[], []];
+		this.#outboundControlBurst = 0;
 		this.#queuedByAgent.clear();
 	}
 

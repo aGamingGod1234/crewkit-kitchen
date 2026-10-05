@@ -10,13 +10,14 @@ import java.util.function.Consumer;
  * allows a cancellation to overtake the command that established its identity.
  */
 final class BoundedServerTaskQueue {
-	enum Lane { URGENT, CONTROL, BULK }
+	enum Lane { URGENT, CONTROL, BULK, INSPECTION }
 
 	private final int capacity;
 	private final int urgentReserve;
 	private final int controlReserve;
 	private final ArrayDeque<Runnable> urgent = new ArrayDeque<>();
 	private final ArrayDeque<Runnable> control = new ArrayDeque<>();
+	private final ArrayDeque<Runnable> inspection = new ArrayDeque<>();
 	private final ArrayDeque<Runnable> bulk = new ArrayDeque<>();
 	private long offeredUrgent;
 	private long offeredControl;
@@ -50,10 +51,10 @@ final class BoundedServerTaskQueue {
 		Objects.requireNonNull(lane, "lane must not be null");
 		Objects.requireNonNull(task, "task must not be null");
 		int pending = pendingCountUnsafe();
-		int nonUrgent = control.size() + bulk.size();
+		int nonUrgent = control.size() + inspection.size() + bulk.size();
 		int bulkCapacity = capacity - urgentReserve - controlReserve;
 		boolean full = pending >= capacity
-				|| (lane == Lane.CONTROL && nonUrgent >= capacity - urgentReserve)
+				|| ((lane == Lane.CONTROL || lane == Lane.INSPECTION) && nonUrgent >= capacity - urgentReserve)
 				|| (lane == Lane.BULK && (bulk.size() >= bulkCapacity || nonUrgent >= capacity - urgentReserve));
 		if (full) {
 			rejected++;
@@ -72,18 +73,44 @@ final class BoundedServerTaskQueue {
 				bulk.addLast(task);
 				offeredBulk++;
 			}
+			case INSPECTION -> {
+				inspection.addLast(task);
+				offeredControl++;
+			}
 		}
 		return true;
 	}
 
 	int drain(int maximum, Consumer<Runnable> consumer) {
+		return drain(null, maximum, consumer);
+	}
+
+	/** Applies admitted input before vanilla physics; inspections have a separate end-tick budget. */
+	void drainBeforePhysics(int urgentMaximum, int controlMaximum, int bulkMaximum,
+			Consumer<Runnable> consumer, Runnable applyInput) {
+		drain(Lane.URGENT, urgentMaximum, consumer);
+		drain(Lane.CONTROL, controlMaximum, consumer);
+		drain(Lane.BULK, bulkMaximum, consumer);
+		applyInput.run();
+	}
+
+	void drainInspections(int inspectionMaximum, Consumer<Runnable> consumer) {
+		drain(Lane.INSPECTION, inspectionMaximum, consumer);
+	}
+
+	private int drain(Lane lane, int maximum, Consumer<Runnable> consumer) {
 		if (maximum < 0) throw new IllegalArgumentException("maximum must not be negative");
 		Objects.requireNonNull(consumer, "consumer must not be null");
 		int count = 0;
 		while (count < maximum) {
 			Runnable task;
 			synchronized (this) {
-				task = pollNext();
+				task = lane == null ? pollNext() : switch (lane) {
+					case URGENT -> urgent.pollFirst();
+					case CONTROL -> control.pollFirst();
+					case BULK -> bulk.pollFirst();
+					case INSPECTION -> inspection.pollFirst();
+				};
 				if (task == null) break;
 				drained++;
 			}
@@ -97,6 +124,8 @@ final class BoundedServerTaskQueue {
 		Runnable task = urgent.pollFirst();
 		if (task != null) return task;
 		task = control.pollFirst();
+		if (task != null) return task;
+		task = inspection.pollFirst();
 		return task != null ? task : bulk.pollFirst();
 	}
 
@@ -105,14 +134,15 @@ final class BoundedServerTaskQueue {
 	}
 
 	synchronized QueueMetrics metrics() {
+		// Inspections still count as control traffic in the existing public telemetry schema.
 		return new QueueMetrics(
 			offeredUrgent, offeredControl, offeredBulk, rejected, drained,
-			urgent.size(), control.size(), bulk.size()
+			urgent.size(), control.size() + inspection.size(), bulk.size()
 		);
 	}
 
 	private int pendingCountUnsafe() {
-		return urgent.size() + control.size() + bulk.size();
+		return urgent.size() + control.size() + inspection.size() + bulk.size();
 	}
 
 	record QueueMetrics(

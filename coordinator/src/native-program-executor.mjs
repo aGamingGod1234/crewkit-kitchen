@@ -41,7 +41,7 @@ export class NativeProgramExecutor {
 		const run = { record: { ...record }, context, programId, maxActions, timeoutMs, expectedDurationMs, planningLeadMs: planningLeadMs ?? null, actions: 0, actionsSucceeded: 0, actionsFailed: 0, receipts: [], resolve, result,
 			settled: false, bodyPending: false, pendingActionId: null, stopping: null, timer: null, planningDueTimer: null, planningDueNotified: false, planningDueVersion: null, cancellationTimer: null,
 			observation: programObservation(context.observation), eventSequence: context.eventSequence, engine: null,
-			observationIntervalMs, observationTimer: null, refresh: null, decision: null, decisionSequence: 0 };
+			observationIntervalMs, observationTimer: null, refresh: null, refreshGeneration: 0, decision: null, decisionSequence: 0 };
 		run.engine = new ArenaScriptEngine({
 			dispatch: (command) => { void this.#dispatch(run, command); },
 			cancel: (actionId) => { void this.#cancelBody(run, actionId); },
@@ -62,22 +62,31 @@ export class NativeProgramExecutor {
 		return result;
 	}
 
-	#refresh(run) {
-		if (run.refresh === null) run.refresh = Promise.resolve().then(() => run.context.refreshObservation?.()).finally(() => { run.refresh = null; });
+	#refresh(run, purpose = 'interval') {
+		if (run.refresh === null) {
+			const refresh = { generation: ++run.refreshGeneration, purpose, promise: null };
+			run.refresh = refresh;
+			refresh.promise = Promise.resolve().then(() => run.context.refreshObservation?.()).finally(() => {
+				if (run.refresh === refresh) run.refresh = null;
+			});
+		}
 		return run.refresh;
 	}
 
 	#scheduleObservation(run) {
-		if (run.settled || run.stopping !== null || run.observationIntervalMs === undefined) return;
-		run.observationTimer = this.#setTimeout(async () => {
+		if (run.settled || run.stopping !== null || run.observationIntervalMs === undefined || run.observationTimer !== null) return;
+		const timer = this.#setTimeout(async () => {
+			if (run.observationTimer !== timer || run.settled || run.stopping !== null) return;
+			run.observationTimer = null;
+			const refresh = this.#refresh(run);
 			try {
-				if (run.settled || run.stopping !== null) return;
-				const fresh = await this.#refresh(run);
-				if (!run.settled && run.stopping === null) this.onObservation(run.record, fresh);
+				const fresh = await refresh.promise;
+				if (run.refreshGeneration === refresh.generation && !run.settled && run.stopping === null) this.onObservation(run.record, fresh);
 			} catch (error) {
-				if (!run.settled) this.#return(run, failure(error, 'FRESH_OBSERVATION_REQUIRED'), true);
-			} finally { this.#scheduleObservation(run); }
+				if (run.refreshGeneration === refresh.generation && !run.settled && run.stopping === null) this.#return(run, failure(error, 'FRESH_OBSERVATION_REQUIRED'), true);
+			} finally { if (run.refreshGeneration === refresh.generation) this.#scheduleObservation(run); }
 		}, run.observationIntervalMs);
+		run.observationTimer = timer;
 		run.observationTimer?.unref?.();
 	}
 
@@ -88,6 +97,13 @@ export class NativeProgramExecutor {
 		try {
 			run.observation = programObservation(payload.observation ?? payload);
 			run.eventSequence = payload.eventSequence;
+			if (run.refresh?.purpose === 'interval') {
+				// A newer publication replaces background sampling, but cannot replace
+				// the terminal-effect barrier owned by a completed action.
+				run.refreshGeneration++;
+				run.refresh = null;
+				this.#scheduleObservation(run);
+			}
 			const decisionSequence = run.decisionSequence;
 			run.engine.ingestObservation({ ...payload, observation: run.observation });
 			// A new attention event invalidates an older decision. Ordinary progress
@@ -235,8 +251,10 @@ export class NativeProgramExecutor {
 		let fresh;
 		try {
 			// A sample requested during the action cannot prove its terminal effects.
-			if (run.refresh !== null) await run.refresh;
-			fresh = result.observation !== undefined && Number.isSafeInteger(result.eventSequence) ? result : await this.#refresh(run);
+			// Supersede its result, failure and cleanup instead of waiting on it.
+			run.refreshGeneration++;
+			run.refresh = null;
+			fresh = result.observation !== undefined && Number.isSafeInteger(result.eventSequence) ? result : await this.#refresh(run, 'terminal').promise;
 			if (!fresh || !Number.isSafeInteger(fresh.eventSequence) || fresh.eventSequence <= command.provenance.eventSequence) throw codedError('FRESH_OBSERVATION_REQUIRED', 'Observe action effects before continuing the program');
 			if (run.settled) return;
 			if (fresh.eventSequence > run.eventSequence) this.onObservation(run.record, fresh);
@@ -245,6 +263,7 @@ export class NativeProgramExecutor {
 			run.engine.ingestActionResult({ actionId: command.actionId, state: result.state, reasonCode: result.reasonCode, eventSequence: fresh.eventSequence });
 			this.#check(run);
 		} catch (error) { this.#return(run, { state: 'YIELDED', reasonCode: boundedReason(error?.code, 'FRESH_OBSERVATION_REQUIRED') }, true); }
+		finally { this.#scheduleObservation(run); }
 	}
 
 	async #query(run, { queryId, operation, query, authorship }) {

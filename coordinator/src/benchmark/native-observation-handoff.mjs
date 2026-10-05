@@ -51,6 +51,8 @@ async function createArm(root, name) {
     executionSettings: async () => { executionSettingsReads++; return { effective: { model: 'gpt-5.6-sol' } }; },
     bridge: { send: async (type, _agentId, payload) => {
       if (type !== 'action_command') return;
+      // Includes the dispatch journal awaited by NativeToolRuntime.
+      dispatches.push(performance.now());
       actions.push({ actionType: payload.actionType, arguments: payload.arguments });
       queueMicrotask(() => runtime.onActionResult(record, {
         goalRevision: 1, actionId: payload.actionId, state: 'SUCCEEDED',
@@ -62,7 +64,6 @@ async function createArm(root, name) {
       return { observation, eventSequence: ++eventSequence };
     },
     trace: (event) => {
-      if (event === 'native_tool_dispatch_started') dispatches.push(performance.now());
       if (event === 'native_tool_action_completed') completions.push(performance.now());
     },
   });
@@ -141,5 +142,6 @@ const pairWins = {
 process.stdout.write(JSON.stringify({
   benchmark: 'native-observation-handoff', repetitions, actionsPerArm: repetitions * 8,
   controller: 'immediate fake bridge; real NativeToolRuntime, ArenaScript, and disk-backed ModelNotebook',
+  handoffBoundary: 'terminal receipt delivered to runtime -> next bridge.send entry; excludes DynamicCoordinator reconciliation and Minecraft execution',
   result: 'PASSED', results, pairWins,
 }) + '\n');

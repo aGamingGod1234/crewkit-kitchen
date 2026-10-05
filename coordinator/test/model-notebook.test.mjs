@@ -5,27 +5,34 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ModelNotebook } from '../src/model-notebook.mjs';
 import { AtomicAgentStore } from '../src/observed-memory-store.mjs';
+import { NotebookActionJournal } from '../src/notebook-action-journal.mjs';
 
 test('unchanged notebook retries skip storage while new evidence stays serialized and durable', async (t) => {
 	const directory = await mkdtemp(join(tmpdir(), 'notebook-idempotent-storage-'));
 	t.after(() => rm(directory, { recursive: true, force: true }));
 	const originalWrite = AtomicAgentStore.prototype.write;
 	const writes = t.mock.method(AtomicAgentStore.prototype, 'write', function (...args) { return originalWrite.apply(this, args); });
+	const originalAppend = NotebookActionJournal.prototype.append;
+	const appends = t.mock.method(NotebookActionJournal.prototype, 'append', function (...args) { return originalAppend.apply(this, args); });
 	const notebook = new ModelNotebook({ directory });
 	const note = { worldId: 'one', key: 'routine', text: 'Look before moving.' };
 	const receipt = { worldId: 'one', actionId: 'a', actionType: 'wait', state: 'SUCCEEDED', reasonCode: '' };
 	const [firstNote, firstReceipt] = await Promise.all([notebook.writeNote('a', note), notebook.recordReceipt('a', receipt)]);
-	assert.equal(writes.mock.callCount(), 2);
+	assert.equal(writes.mock.callCount(), 1);
+	assert.equal(appends.mock.callCount(), 1);
 	await Promise.all([notebook.writeNote('a', note), notebook.recordReceipt('a', receipt), notebook.recordReceipt('a', receipt), notebook.clear('a', { worldId: 'one', key: 'missing' })]);
-	assert.equal(writes.mock.callCount(), 2, 'retry-only operations must never reach the atomic writer');
+	assert.equal(writes.mock.callCount(), 1, 'retry-only operations must never reach the atomic writer');
+	assert.equal(appends.mock.callCount(), 1, 'retry-only operations must not append');
 	const enhanced = await notebook.recordReceipt('a', { ...receipt, executionStarted: true, physicalAttempted: false, actionObservation: { worldTick: 4 } });
-	assert.equal(writes.mock.callCount(), 3, 'new receipt evidence is persisted');
+	assert.equal(writes.mock.callCount(), 1, 'action evidence must not rewrite the notebook');
+	assert.equal(appends.mock.callCount(), 2, 'new receipt evidence is appended');
 	assert.ok(enhanced.revision > firstReceipt.revision);
 	const restored = new ModelNotebook({ directory });
 	assert.deepEqual(await restored.findReceipt('a', { actionId: 'a' }), enhanced);
 	assert.deepEqual((await restored.query('a', { worldId: 'one', kind: 'notes' })).entries, [firstNote]);
 	await restored.recordReceipt('a', receipt);
-	assert.equal(writes.mock.callCount(), 3, 'a retry after disk reload is also unchanged');
+	assert.equal(writes.mock.callCount(), 1, 'a retry after disk reload is also unchanged');
+	assert.equal(appends.mock.callCount(), 2);
 });
 
 test('failed notebook persistence is not mistaken for a committed retry', async (t) => {
@@ -208,7 +215,7 @@ test('verified receipt evidence can fill omitted fields but cannot be rewritten'
 	await assert.rejects(notebook.recordReceipt('a', { ...identity, actionObservation: { worldTick: 4 } }), /RECEIPT_CONFLICT/);
 });
 
-test('byte retention evicts oldest receipts with visible counters and preserves the accepted record', async (t) => {
+test('byte retention evicts history with visible counters but preserves pending recovery obligations', async (t) => {
 	const directory = await mkdtemp(join(tmpdir(), 'notebook-byte-budget-'));
 	t.after(() => rm(directory, { recursive: true, force: true }));
 	const notebook = new ModelNotebook({ directory, maximumBytes: 65_536 });
@@ -216,13 +223,14 @@ test('byte retention evicts oldest receipts with visible counters and preserves 
 		await notebook.recordDispatch('a', { worldId: 'one', actionId: `book-${index}`, actionType: 'edit_book', arguments: { slot: 0, pages: Array(24).fill('a'.repeat(1024)), expectedFingerprint: `book-${index}` } });
 	}
 	const page = await notebook.listUnresolved('a', { worldId: 'one', limit: 1 });
-	assert.equal(page.total, 2);
+	assert.equal(page.total, 4);
 	assert.equal(page.evictedReceipts, 2);
 	assert.equal(page.entries[0].actionId, 'book-3');
 	assert.equal(page.nextOffset, 1);
 	assert.equal((await notebook.listUnresolved('a', { worldId: 'one', offset: 1 })).entries[0].actionId, 'book-2');
-	const [file] = await readdir(directory);
-	assert.ok((await readFile(join(directory, file))).byteLength <= 65_536);
+	assert.equal((await notebook.query('a', { worldId: 'one', kind: 'receipts' })).total, 2);
+	assert.equal((await notebook.findReceipt('a', { actionId: 'book-0' })).state, 'DISPATCHED');
+	assert.equal((await new ModelNotebook({ directory, maximumBytes: 65_536 }).listUnresolved('a', { worldId: 'one' })).total, 4);
 	assert.equal((await new ModelNotebook({ directory, maximumBytes: 65_536 }).query('a', { worldId: 'one' })).evictedReceipts, 2);
 	const tiny = new ModelNotebook({ maximumBytes: 4096 });
 	await tiny.writeNote('a', { worldId: 'one', key: 'previous', text: 'Existing note survives rejected dispatch.' });

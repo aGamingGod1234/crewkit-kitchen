@@ -65,7 +65,8 @@ export class ArenaScriptEngine {
 		else if (!this.#active && !this.#cancelling && this.#boundary.length > 0) this.#runBoundary();
 		// The agent can waive repeated ordinary perception during a chosen leg.
 		// All fresh facts and watcher edges above remain live; urgency bypasses it.
-		if (attention && edges === 0 && (priority === URGENT_PRIORITY || this.#vm.shouldReassess(this.#facts))) this.#requestModel(null, { priority, trigger });
+		const survival = priority === URGENT_PRIORITY && SURVIVAL_TRIGGERS.has(trigger);
+		if (attention && (edges === 0 || survival) && (priority === URGENT_PRIORITY || this.#vm.shouldReassess(this.#facts))) this.#requestModel(null, { priority, trigger });
 		this.#requestExhaustedContinuation();
 		return this.snapshot();
 	}
@@ -180,6 +181,7 @@ export class ArenaScriptEngine {
 				if (this.#pendingResult && this.#factsSequence >= this.#pendingResult.eventSequence) this.#resumeOrRunBoundary();
 				else if (!this.#active && this.#boundary.length > 0) this.#runBoundary();
 			}
+			if (request.trigger !== 'program_exhausted') this.#requestExhaustedContinuation();
 			return this.snapshot();
 		}
 		if (directive.directive === 'replace') {
@@ -393,7 +395,9 @@ export class ArenaScriptEngine {
 		// Release unrelated input on danger, including escalation of an older request.
 		// An authored defensive handler retains its action; the runtime invents none.
 		const policy = survival ? this.#program.compiled.survivalPolicy ?? 'pause_and_notify' : this.#program.compiled.unhandledPolicy;
-		if (policy === 'pause_and_notify' && !this.#watcherDecision && !(survival && this.#active?.authority)) this.#suspendUnhandledAttention();
+		// An interrupt's exact cancellation may still be awaiting its receipt;
+		// preserve the authored handler that owns that transition as well.
+		if (policy === 'pause_and_notify' && !this.#watcherDecision && !(survival && (this.#active?.authority || this.#cancelling?.kind === 'watcher'))) this.#suspendUnhandledAttention();
 		if (this.#pendingRequest) {
 			this.#coalescedRequest = mergeRequestContexts(this.#coalescedRequest ?? this.#pendingRequest, context);
 			return;
@@ -525,12 +529,15 @@ export class ArenaScriptEngine {
 		}
 		if (yielded.kind === 'idle' && source === 'step') {
 			this.#continuationRequired = true;
-			this.#requestExhaustedContinuation();
 		}
+		// A boundary handler may finish after the main body already exhausted.
+		// Revisit its deferred continuation once all authored work has drained.
+		if (yielded.kind === 'idle') this.#requestExhaustedContinuation();
 	}
 
 	#requestExhaustedContinuation() {
 		if (!this.#continuationRequired || this.#pendingRequest || !this.#isLive() || this.#facts === null) return;
+		if (this.#active || this.#pendingResult || this.#cancelling || this.#transition || this.#deferredBase || this.#watcherDecision || this.#boundary.length > 0) return;
 		this.#requestModel(null, { priority: URGENT_PRIORITY, trigger: 'program_exhausted' });
 	}
 

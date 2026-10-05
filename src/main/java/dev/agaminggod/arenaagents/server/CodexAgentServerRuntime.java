@@ -316,6 +316,9 @@ public final class CodexAgentServerRuntime {
 		if (!RESTORED_SERVERS.contains(server)) return;
 		MultiplexedServerBridge bridge = bridge(server);
 		if (bridge != null) bridge.startTick();
+		// Admission renews/releases leases first. Use-only input must then run before player physics;
+		// combined use/attack still arbitrates in Carpet's player-tick hook, once per server tick.
+		AgentInputRuntime.tick(server);
 	}
 
 	private static void endTick(MinecraftServer server) {
@@ -358,7 +361,6 @@ public final class CodexAgentServerRuntime {
 			maintainPlanningProgress(manager);
 			if (activeBridge != null) activeBridge.endTick();
 			verifyGoals(server, manager);
-			AgentInputRuntime.tick(server);
 			SkitModeRuntime.tick(server);
 			ScenarioRuntimeService.tick(server);
 		});

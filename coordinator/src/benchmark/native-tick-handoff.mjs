@@ -75,6 +75,8 @@ async function createArm(modulePath, name) {
 		sessionId: `tick-${name}`,
 		bridge: { send: async (type, _agentId, payload) => {
 			if (type !== 'action_command') return;
+			// Measure entry to the bridge after dispatch persistence, not preparation.
+			dispatches.push(performance.now());
 			counters.actions += 1;
 			actions.push({ actionType: payload.actionType, arguments: payload.arguments });
 			const ticks = payload.actionType === 'control' ? payload.arguments.ticks
@@ -86,7 +88,6 @@ async function createArm(modulePath, name) {
 			inbound.push(() => { const sample = observation(); const sequence = ++eventSequence; deliver(() => resolve({ observation: sample, eventSequence: sequence })); });
 		}),
 		trace: (event) => {
-			if (event === 'native_tool_dispatch_started') dispatches.push(performance.now());
 			if (event === 'native_tool_action_completed') completions.push(performance.now());
 		},
 	});
@@ -124,7 +125,9 @@ const summarize = (values) => {
 const arms = { before: await createArm(beforeModule, 'before'), after: await createArm(afterModule, 'after') };
 arms.before.start();
 arms.after.start();
-const output = { benchmark: 'native-tick-handoff', tickMs, repetitions, model: 'tick-quantized bridge model; real NativeToolRuntime and ArenaScript', workloads: {} };
+const output = { benchmark: 'native-tick-handoff', tickMs, repetitions, model: 'tick-quantized bridge model; real NativeToolRuntime and ArenaScript',
+	handoffBoundary: 'terminal receipt delivered to runtime -> next bridge.send entry',
+	limitations: ['No production notebook, DynamicCoordinator reconciliation, provider or actual Minecraft input is measured.'], workloads: {} };
 for (const workload of Object.keys(workloads)) {
 	for (let index = 0; index < 3; index += 1) for (const arm of Object.values(arms)) await arm.run(workload);
 	const starts = Object.fromEntries(Object.entries(arms).map(([name, arm]) => [name, arm.counters()]));

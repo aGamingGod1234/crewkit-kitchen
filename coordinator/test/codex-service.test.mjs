@@ -1067,7 +1067,7 @@ test('native Codex turn executes a Minecraft tool and returns its result before 
 	});
 	await new Promise((resolve) => setImmediate(resolve));
 
-	assert.deepEqual(executed, [{
+	assert.partialDeepStrictEqual(executed, [{
 		agentId: 'agent-native', goalRevision: 1, threadId: 'thread-1', turnId: 'turn-1', callId: 'call-1',
 		tool: { kind: 'action', actionType: 'chat', arguments: { message: 'Hi Lucas!', audience: 'public' } },
 	}]);

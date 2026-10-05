@@ -229,6 +229,9 @@ test('injects coordinator latency telemetry into program reaction timing', async
 	try {
 		run.planner.requestPlan = async (request) => {
 			run.planner.requests.push(request);
+			// Damage now independently wakes the model even when the health watcher
+			// rises. Preserve the authored reaction while acknowledging that wake.
+			if (run.planner.requests.length > 1) return { summary: 'Continue the health reaction.', directive: 'continue' };
 			return withCompletionContract({ summary: 'Watch health.', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); program.watch(() => player.state().health < 20, { mode: "boundary" }, async () => { await player.wait(9); }); await player.wait(1);' }, request.goalRevision);
 		};
 		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
@@ -361,7 +364,7 @@ test('urgent observation preempts an active ordinary provider turn and installs 
 	}
 });
 
-test('terminal replay preserves three distinct durable receipts and joins exact duplicate waiters', async (t) => {
+test('terminal replay preserves three distinct durable receipts and shares exact duplicate reconciliation', async (t) => {
 	const directory = await mkdtemp(path.join(tmpdir(), 'terminal-replay-receipts-'));
 	t.after(() => rm(directory, { recursive: true, force: true }));
 	const notebook = new ModelNotebook({ directory });
@@ -386,13 +389,17 @@ test('terminal replay preserves three distinct durable receipts and joins exact 
 		bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
 		await eventually(() => run.registry.get('agent-a').goalRevision === 1);
 		receive(ids[0]); const duplicateDone = receive(ids[0]); receive(ids[1]); receive(ids[2]);
-		assert.equal(duplicateDone(), false, 'duplicate cannot settle before the shared durable reconciliation');
+		assert.equal(duplicateDone(), false, 'duplicate still follows ordered live ingress');
 		await Promise.all(completions);
+		await eventually(() => bridge.sent.filter(message => message.type === 'action_result_ack').length === ids.length);
 		assert.deepEqual(bridge.sent.filter(message => message.type === 'action_result_ack').map(message => message.payload.actionId), ids);
 	} finally { await run.coordinator.stop(); }
 });
 
-test('per-agent event intake reserves terminal-result capacity under ordinary overflow', async () => {
+test('per-agent event intake reserves terminal-result capacity under ordinary overflow', async (t) => {
+	const directory = await mkdtemp(path.join(tmpdir(), 'terminal-capacity-receipts-'));
+	t.after(() => rm(directory, { recursive: true, force: true }));
+	await new ModelNotebook({ directory }).recordDispatch('agent-a', { worldId: 'test-world', goalRevision: 0, actionId: 'stale-terminal-result', actionType: 'wait', arguments: { durationMs: 1 } });
 	const bridge = new FakeBridge();
 	bridge.acknowledgeActionResult = async (agentId, payload) => {
 		bridge.sent.push({ type: 'action_result_ack', agentId, payload });
@@ -410,7 +417,7 @@ test('per-agent event intake reserves terminal-result capacity under ordinary ov
 	};
 	const coordinator = createDynamicCoordinator(
 		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'arena_script' } },
-		{ bridge, registry, planner, codexService: new FakeProvider(), maxPendingAgentOperations: 1 },
+		{ bridge, registry, planner, codexService: new FakeProvider(), maxPendingAgentOperations: 1, memoryDirectory: directory },
 	);
 	const errors = [];
 	coordinator.on('runtimeError', (error) => errors.push(error));

@@ -79,14 +79,26 @@ class ComparisonTransport extends CodexStdioTransport {
 	}
 }
 
-function usageValue(value) {
-	return { inputTokens: value?.inputTokens ?? 0, cachedInputTokens: value?.cachedInputTokens ?? 0,
-		outputTokens: value?.outputTokens ?? 0 };
+const USAGE_COUNTERS = ['inputTokens', 'cachedInputTokens', 'outputTokens'];
+const USAGE_TOTALS = [...USAGE_COUNTERS, 'uncachedInputTokens'];
+export function usageValue(value) {
+	return Object.fromEntries(USAGE_COUNTERS.map(key => [key,
+		Number.isSafeInteger(value?.[key]) && value[key] >= 0 ? value[key] : null]));
 }
-function deltaUsage(before, after) {
-	const output = Object.fromEntries(Object.keys(before).map(key => [key, Math.max(0, after[key] - before[key])]));
-	output.uncachedInputTokens = Math.max(0, output.inputTokens - output.cachedInputTokens);
-	return output;
+export function deltaUsage(before, after, { updated = true } = {}) {
+	const unavailable = status => ({ status, ...Object.fromEntries(USAGE_TOTALS.map(key => [key, null])) });
+	if (!updated || USAGE_COUNTERS.some(key => before?.[key] == null || after?.[key] == null)) return unavailable('missing');
+	if (USAGE_COUNTERS.some(key => after[key] < before[key])) return unavailable('counter_reset');
+	const output = Object.fromEntries(USAGE_COUNTERS.map(key => [key, after[key] - before[key]]));
+	if (output.cachedInputTokens > output.inputTokens) return unavailable('inconsistent');
+	return { status: 'available', ...output, uncachedInputTokens: output.inputTokens - output.cachedInputTokens };
+}
+
+export function summarizeUsage(turns) {
+	const complete = turns.length > 0 && turns.every(row => USAGE_TOTALS.every(key => Number.isSafeInteger(row.usage?.[key]) && row.usage[key] >= 0)
+		&& (row.usage.status === undefined || row.usage.status === 'available'));
+	return { status: complete ? 'available' : 'incomplete', ...Object.fromEntries(USAGE_TOTALS.map(key => [key,
+		complete ? turns.reduce((sum, row) => sum + row.usage[key], 0) : null])) };
 }
 
 export async function runComprehensionComparison({
@@ -112,9 +124,10 @@ export async function runComprehensionComparison({
 	const directory = await mkdtemp(path.join(os.tmpdir(), 'arena-native-fact-check-'));
 	const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.toUpperCase().startsWith('OPENAI_')));
 	const transport = new ComparisonTransport({ ...settings, cwd: directory, environment: env }, before);
-	const agents = new Map(), usage = new Map(), rawNames = new Map();
+	const agents = new Map(), usage = new Map(), usageUpdates = new Map(), rawNames = new Map();
 	let controller = null, limitExceeded = false, budgetExceeded = false;
-	const totalUncached = () => [...usage.values()].reduce((sum, row) => sum + Math.max(0, row.inputTokens - row.cachedInputTokens), 0);
+	// A budget lower bound only; incomplete telemetry is never reported as measured zero.
+	const totalUncached = () => [...usage.values()].reduce((sum, row) => sum + (row.inputTokens == null || row.cachedInputTokens == null ? 0 : Math.max(0, row.inputTokens - row.cachedInputTokens)), 0);
 	const report = { benchmark: 'native-input-model-comprehension', generatedAt: new Date().toISOString(), settings, limits,
 		billing: 'existing ChatGPT subscription required; inherited OpenAI API environment omitted; account checked before any model turn',
 		subscriptionVerified: false,
@@ -128,6 +141,7 @@ export async function runComprehensionComparison({
 	transport.on('notification', ({ method, params }) => {
 		if (method === 'thread/tokenUsage/updated') {
 			usage.set(params.threadId, usageValue(params.tokenUsage?.total));
+			usageUpdates.set(params.threadId, (usageUpdates.get(params.threadId) ?? 0) + 1);
 			if (totalUncached() > limits.maxUncachedInputTokens) { budgetExceeded = true; controller?.abort(); }
 		}
 		if (method === 'account/rateLimits/updated' && [params.rateLimits?.primary, params.rateLimits?.secondary].some(row => row?.usedPercent >= 100)) {
@@ -155,6 +169,8 @@ export async function runComprehensionComparison({
 				developerInstructions: 'This body is a text-only read-only fact check. Only observe, capabilities and say are permitted. No game, filesystem or external actions exist. Follow the fact question and end the turn after say.' });
 			const threadId = response.thread?.id;
 			assert.equal(typeof threadId, 'string');
+			// This freshly created ephemeral thread has run no model turn yet.
+			if (!usage.has(threadId)) usage.set(threadId, usageValue({ inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 }));
 			const agent = new SharedCodexAgent({ ...settings, agentId: `fact-check-${arm}`, provider: 'codex' }, threadId, transport,
 				{ controlProtocol: 'native_tools', planningTimeoutMs: 90_000, reportedSettings: response });
 			await agent.setGoalRevision(1);
@@ -165,6 +181,7 @@ export async function runComprehensionComparison({
 			if (budgetExceeded || limitExceeded || totalUncached() >= limits.maxUncachedInputTokens) break;
 			const scenario = cases[index], { agent, threadId } = agents.get(arm), calls = [], answers = [], presented = [];
 			const previousUsage = usageValue(usage.get(threadId));
+			const previousUsageUpdates = usageUpdates.get(threadId) ?? 0;
 			transport.arm = arm; transport.onPresented = value => presented.push(value);
 			controller = new AbortController();
 			const timer = setTimeout(() => controller.abort(), limits.turnDeadlineMs);
@@ -191,14 +208,14 @@ export async function runComprehensionComparison({
 				&& calls.every(name => ['observe', 'say', 'capabilities'].includes(name));
 			const row = { scenario: scenario.name, arm, status: result && factsMatch && nativeCallsValid ? 'PASSED' : 'FAILED',
 				factsMatch, nativeCallsValid, calls, answers, elapsedMs: Number((performance.now() - at).toFixed(3)),
-				usage: deltaUsage(previousUsage, usageValue(usage.get(threadId))), presentedReplies: presented,
+				usage: deltaUsage(previousUsage, usageValue(usage.get(threadId)), { updated: (usageUpdates.get(threadId) ?? 0) > previousUsageUpdates }), presentedReplies: presented,
 				executionSettings: agent.executionSettings, ...(failure === null ? {} : { failure }) };
 			report.turns.push(row);
 			process.stdout.write(`${JSON.stringify({ scenario: row.scenario, arm, status: row.status, usage: row.usage, elapsedMs: row.elapsedMs })}\n`);
-			if (row.status !== 'PASSED' || budgetExceeded || limitExceeded) break;
+			if (row.status !== 'PASSED' || row.usage.status !== 'available' || budgetExceeded || limitExceeded) break;
 		}
 		report.status = budgetExceeded ? 'BUDGET_STOP' : limitExceeded ? 'USAGE_LIMIT_STOP'
-			: report.turns.length === limits.maxTurns && report.turns.every(row => row.status === 'PASSED') ? 'PASSED' : 'INCOMPLETE';
+			: report.turns.length === limits.maxTurns && report.turns.every(row => row.status === 'PASSED' && row.usage.status === 'available') ? 'PASSED' : 'INCOMPLETE';
 	} catch (error) { report.failure = error.code ?? error.name; }
 	finally {
 		for (const { agent } of agents.values()) { try { await agent.dispose(); } catch { /* Transport stop owns remaining cleanup. */ } }
@@ -207,10 +224,10 @@ export async function runComprehensionComparison({
 		assert.ok(path.basename(directory).startsWith('arena-native-fact-check-'));
 		await rm(directory, { recursive: true, force: true });
 	}
-	report.totalUsage = report.turns.reduce((total, row) => {
-		for (const [key, value] of Object.entries(row.usage)) total[key] = (total[key] ?? 0) + value;
-		return total;
-	}, {});
+	report.totalUsage = summarizeUsage(report.turns);
+	report.tokenEvidence = report.totalUsage.status;
+	report.usageScope = 'observed_thread_counter_delta';
+	report.usageAttributionComplete = false;
 	report.byArm = summarizeArms(report.turns);
 	return report;
 }
@@ -223,8 +240,8 @@ export function summarizeArms(turns) {
 		total.turns += 1;
 		if (row.factsMatch) total.factualPasses += 1;
 		if (row.nativeCallsValid) total.nativeCallPasses += 1;
-		for (const key of ['inputTokens', 'cachedInputTokens', 'uncachedInputTokens', 'outputTokens']) total[key] += row.usage[key];
 	}
+	for (const [arm, total] of Object.entries(totals)) Object.assign(total, summarizeUsage(turns.filter(row => row.arm === arm)));
 	return totals;
 }
 
@@ -241,7 +258,7 @@ export function renderComprehensionMarkdown(report) {
 	const afterTurns = report.turns.filter(row => row.arm === 'after');
 	const packedReplies = afterTurns.filter(row => row.presentedReplies.some(reply => reply.packed)).length;
 	lines.push('', `The checks cover literal block identifiers, target coordinates, item counts, hostile UUID/type, health, current death flag, world/dimension identity, previous-death coordinates, missing fields, and null versus false. Compact production minecraft-facts-v1 observations reached the model in ${packedReplies}/${afterTurns.length} after turns. Exact factual passes: ${report.turns.filter(row => row.factsMatch).length}/${report.turns.length}.`, '',
-		`Total uncached input: ${report.totalUsage.uncachedInputTokens ?? 0}; cap: ${report.limits.maxUncachedInputTokens}. Turns: ${report.turns.length}; cap: ${report.limits.maxTurns}.`, '',
+		`Total uncached input: ${report.totalUsage.uncachedInputTokens ?? 'unknown'}; token evidence: ${report.tokenEvidence ?? report.totalUsage.status ?? 'unknown'}; cap: ${report.limits.maxUncachedInputTokens}. Turns: ${report.turns.length}; cap: ${report.limits.maxTurns}.`, '',
 		...(report.turns.length === 0 ? ['No model turns ran; provider/model confirmation and comprehension are unavailable.', '']
 			: ['Effective execution settings are recorded per turn. Submitted effort is not independently confirmed unless echoed by the provider.', '']),
 		'Limits:', '', ...report.limitations.map(value => `- ${value}`), '',

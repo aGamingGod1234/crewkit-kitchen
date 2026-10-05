@@ -1,18 +1,32 @@
-import { AtomicAgentStore } from './observed-memory-store.mjs';
+import { NotebookActionJournal, emptyNotebook } from './notebook-action-journal.mjs';
 import { normalizeProviderId, assertProviderServiceTier } from './provider-identity.mjs';
 import { MAX_ACTION_ARGUMENT_BYTES, validateAction } from './schema.mjs';
 import { isDeepStrictEqual, types as nodeTypes } from 'node:util';
 const TERMINAL_STATES = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT']);
+const MAX_NOTEBOOK_BYTES = 4_000_000;
+const MAX_ACTION_OBSERVATION_BYTES = 16_384;
+const RECEIPT_TEXT_LIMITS = { worldId: 256, actionId: 256, actionType: 128, dimension: 128, reasonCode: 128 };
+// A serialized string can use six bytes per UTF-16 code unit (JSON escapes).
+// Reserve a COMPLETE terminal, including fields omitted by an older dispatch.
+const MAX_TERMINAL_BYTES = Buffer.byteLength(JSON.stringify({
+	kind: 'receipt', source: 'server_action_result', state: 'TIMED_OUT',
+	...Object.fromEntries(Object.entries(RECEIPT_TEXT_LIMITS).map(([key, size]) => [key, '\0'.repeat(size)])),
+	goalRevision: Number.MAX_SAFE_INTEGER, tick: Number.MAX_SAFE_INTEGER, revision: Number.MAX_SAFE_INTEGER,
+	executionStarted: false, physicalAttempted: false, arguments: {}, actionObservation: {},
+})) + MAX_ACTION_ARGUMENT_BYTES - 2 + MAX_ACTION_OBSERVATION_BYTES - 2;
+// One comma plus growth of revision/eviction counters. This slot stays below
+// AtomicAgentStore's 4 MiB ceiling, including for legacy 4 MB pending snapshots.
+const TERMINAL_RESERVE_BYTES = MAX_TERMINAL_BYTES + 1 + 3 * String(Number.MAX_SAFE_INTEGER).length;
 
 /** Model notes and server receipts remain distinct records; neither can assert current world truth. */
 export class ModelNotebook {
 	#disk; #agents = new Map(); #pending = new Map(); #loads = new Map(); #maximumNotes; #maximumReceipts; #maximumBytes;
 	constructor({ directory = null, maximumNotes = 64, maximumReceipts = 128, maximumBytes = 3_500_000 } = {}) {
 		for (const value of [maximumNotes, maximumReceipts]) if (!Number.isSafeInteger(value) || value < 1 || value > 1024) throw new TypeError('notebook bounds must be 1..1024');
-		if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 4096 || maximumBytes > 4_000_000) throw new TypeError('notebook byte budget must be 4096..4000000');
+		if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 4096 || maximumBytes > MAX_NOTEBOOK_BYTES) throw new TypeError('notebook byte budget must be 4096..4000000');
 		this.#maximumNotes = maximumNotes; this.#maximumReceipts = maximumReceipts;
 		this.#maximumBytes = maximumBytes;
-		this.#disk = new AtomicAgentStore({ directory, namespace: 'notebook' });
+		this.#disk = new NotebookActionJournal({ directory });
 	}
 	writeNote(agentId, note) {
 		const record = { kind: 'note', source: 'model_authored', worldId: text(note.worldId, 'worldId', 256), key: text(note.key, 'key', 128), text: text(note.text, 'text', 2048), ...optionalInteger(note, 'goalRevision'), ...noteProvenance(note) };
@@ -40,15 +54,22 @@ export class ModelNotebook {
 		if (worldId !== undefined) worldId = text(worldId, 'worldId', 256);
 		await this.#pending.get(agentId);
 		const state = await this.#load(agentId);
-		const matches = state.receipts.filter((entry) => entry.actionId === actionId && (worldId === undefined || entry.worldId === worldId));
+		const matches = [...state.receipts, ...state.recovery].filter((entry) => entry.actionId === actionId && (worldId === undefined || entry.worldId === worldId));
 		if (matches.length > 1) throw new Error('RECEIPT_WORLD_REQUIRED');
 		return matches.length === 0 ? null : structuredClone(matches[0]);
+	}
+	async findNote(agentId, { worldId, key } = {}) {
+		worldId = text(worldId, 'worldId', 256); key = text(key, 'key', 128);
+		await this.#pending.get(agentId);
+		const state = await this.#load(agentId);
+		return structuredClone(state.notes.find(entry => entry.worldId === worldId && entry.key === key) ?? null);
 	}
 	listUnresolved(agentId, options) { return this.query(agentId, { ...options, kind: 'unresolved' }); }
 	#recordAction(agentId, record) {
 		return this.#mutate(agentId, (state) => {
 			const index = state.receipts.findIndex((entry) => entry.worldId === record.worldId && entry.actionId === record.actionId);
-			const existing = state.receipts[index];
+			const recoveryIndex = state.recovery.findIndex((entry) => entry.worldId === record.worldId && entry.actionId === record.actionId);
+			const existing = state.receipts[index] ?? state.recovery[recoveryIndex];
 			if (existing) {
 				for (const field of ['actionType', 'goalRevision', 'dimension']) if (existing[field] !== undefined && record[field] !== undefined && existing[field] !== record[field]) throw new Error('RECEIPT_CONFLICT');
 				if (existing.arguments !== undefined && record.arguments !== undefined && !isDeepStrictEqual(existing.arguments, record.arguments)) throw new Error('RECEIPT_CONFLICT');
@@ -64,9 +85,10 @@ export class ModelNotebook {
 			}
 			const next = { ...existing, ...record, revision: ++state.revision };
 			if (index !== -1) state.receipts.splice(index, 1);
+			if (recoveryIndex !== -1) state.recovery.splice(recoveryIndex, 1);
 			state.receipts.push(next);
 			return next;
-		});
+		}, { action: true });
 	}
 	async query(agentId, { worldId, kind = 'all', text: search = '', limit = 20, offset = 0 } = {}) {
 		worldId = text(worldId, 'worldId', 256);
@@ -80,7 +102,7 @@ export class ModelNotebook {
 			? entry.kind === 'receipt' && entry.source !== 'server_action_result'
 			: entry.kind === normalizedKind);
 		const searchText = search.toLowerCase();
-		const entries = [...state.notes, ...state.receipts].filter((entry) => entry.worldId === worldId && matchesKind(entry) && JSON.stringify(entry).toLowerCase().includes(searchText)).sort((left, right) => right.revision - left.revision);
+		const entries = [...state.notes, ...state.receipts, ...(kind === 'unresolved' ? state.recovery : [])].filter((entry) => entry.worldId === worldId && matchesKind(entry) && JSON.stringify(entry).toLowerCase().includes(searchText)).sort((left, right) => right.revision - left.revision);
 		return { worldId, revision: state.revision, offset, total: entries.length, entries: structuredClone(entries.slice(offset, offset + limit)), nextOffset: offset + limit < entries.length ? offset + limit : null, evictedReceipts: state.evictedReceipts, evictedNotes: state.evictedNotes };
 	}
 	clear(agentId, { worldId, key } = {}) {
@@ -94,17 +116,19 @@ export class ModelNotebook {
 			return { removed, revision: state.revision };
 		});
 	}
-	#mutate(agentId, operation) {
+	#mutate(agentId, operation, { action = false } = {}) {
 		const previous = this.#pending.get(agentId) ?? Promise.resolve();
 		const pending = previous.catch(() => {}).then(async () => {
 			const committed = await this.#load(agentId);
-			const state = structuredClone(committed);
+			// Records are immutable; only collection membership and counters change.
+			const state = { ...committed, notes: [...committed.notes], receipts: [...committed.receipts], recovery: [...committed.recovery] };
 			const result = operation(state);
 			// Every accepted mutation advances the revision. Retry-only operations
 			// must still run in this queue, but need no bounding or durable rewrite.
 			if (state.revision === committed.revision) return structuredClone(result);
 			this.#bound(state, result);
-			await this.#disk.write(agentId, { ...state, notes: state.notes.filter(persistentWorld), receipts: state.receipts.filter(persistentWorld) });
+			if (action) await this.#disk.append(agentId, committed, state);
+			else await this.#disk.checkpoint(agentId, state);
 			this.#agents.set(agentId, state);
 			return structuredClone(result);
 		});
@@ -115,9 +139,13 @@ export class ModelNotebook {
 		if (this.#agents.has(agentId)) return this.#agents.get(agentId);
 		let pending = this.#loads.get(agentId);
 		if (!pending) {
-			pending = this.#disk.read(agentId).then((saved) => {
-				const state = saved === null ? { version: 1, revision: 0, notes: [], receipts: [], evictedReceipts: 0, evictedNotes: 0 } : validateSaved(saved);
+			pending = this.#disk.read(agentId).then(async (saved) => {
+				const state = saved === null ? emptyNotebook() : validateSaved(saved);
+				const previousEvictions = state.evictedNotes + state.evictedReceipts;
 				this.#bound(state);
+				// A changed retention setting is a materialized migration, not an
+				// unlogged baseline for subsequent deltas.
+				if (state.evictedNotes + state.evictedReceipts !== previousEvictions) await this.#disk.checkpoint(agentId, state);
 				this.#agents.set(agentId, state);
 				return state;
 			});
@@ -125,22 +153,43 @@ export class ModelNotebook {
 		}
 		try { return await pending; } finally { this.#loads.delete(agentId); }
 	}
-	#bound(state, retained = null) {
+	#bound(state, retained = state.receipts.at(-1)?.source === 'server_action_result' ? state.receipts.at(-1) : null) {
+		const evictReceipt = receipt => {
+			state.receipts.splice(state.receipts.indexOf(receipt), 1); state.evictedReceipts++;
+			// History retention must never erase an obligation to reconcile a send.
+			if (receipt.source !== 'server_action_result') state.recovery.push(receipt);
+		};
 		while (state.notes.length > this.#maximumNotes) { state.notes.shift(); state.evictedNotes++; }
-		while (state.receipts.length > this.#maximumReceipts) { state.receipts.shift(); state.evictedReceipts++; }
-		while (Buffer.byteLength(JSON.stringify(state), 'utf8') > this.#maximumBytes) {
+		while (state.receipts.length > this.#maximumReceipts) evictReceipt(state.receipts[0]);
+		while (Buffer.byteLength(JSON.stringify({ ...state, recovery: [] }), 'utf8') > this.#maximumBytes) {
 			const receipt = state.receipts.find((entry) => entry !== retained);
 			const note = state.notes.find((entry) => entry !== retained);
 			if (receipt && (!note || receipt.revision <= note.revision)) {
-				state.receipts.splice(state.receipts.indexOf(receipt), 1); state.evictedReceipts++;
+				evictReceipt(receipt);
 			} else if (note) {
 				state.notes.splice(state.notes.indexOf(note), 1); state.evictedNotes++;
+			} else if (retained?.source === 'server_action_result') {
+				// An admitted action must remain reconcilable even when its full
+				// terminal evidence exceeds the configured history retention budget.
+				break;
 			} else throw new Error('RECORD_EXCEEDS_NOTEBOOK_BUDGET');
 		}
+		// Admission and notes cannot consume the reconciliation slot. One slot
+		// suffices: mutations are serialized and older terminal history is evictable.
+		// Pending records (including legacy states at exactly 4 MB) are never dropped.
+		const maximumBytes = MAX_NOTEBOOK_BYTES + (retained === null || retained.source === 'server_action_result' ? TERMINAL_RESERVE_BYTES : 0);
+		while (Buffer.byteLength(JSON.stringify(state), 'utf8') > maximumBytes) {
+			const receipt = state.receipts.find(entry => entry !== retained && entry.source === 'server_action_result');
+			const note = state.notes.find(entry => entry !== retained);
+			if (receipt && (!note || receipt.revision <= note.revision)) evictReceipt(receipt);
+			else if (note) { state.notes.splice(state.notes.indexOf(note), 1); state.evictedNotes++; }
+			else throw recoveryLimit();
+		}
+		if (state.recovery.length + state.receipts.filter(entry => entry.source !== 'server_action_result').length > 1024) throw recoveryLimit();
 	}
 }
 
-function persistentWorld(entry) { return !entry.worldId.startsWith('session:'); }
+function recoveryLimit() { return Object.assign(new Error('RECEIPT_RECOVERY_LIMIT'), { code: 'RECEIPT_RECOVERY_LIMIT' }); }
 function samePayload(existing, next) { const { revision: _revision, ...payload } = existing; return isDeepStrictEqual(payload, next); }
 function text(value, field, maximum) {
 	if (typeof value !== 'string' || value.trim().length === 0 || value.length > maximum) throw new TypeError(`${field} must be nonblank text up to ${maximum} characters`);
@@ -154,9 +203,9 @@ function optionalInteger(source, field) {
 }
 function actionRecord(receipt, source, state, reasonCode) {
 	return {
-		kind: 'receipt', source, worldId: text(receipt.worldId, 'worldId', 256),
-		actionId: text(receipt.actionId, 'actionId', 256), state: text(state, 'state', 64), reasonCode: reasonText(reasonCode),
-		...optionalText(receipt, 'actionType', 128), ...optionalText(receipt, 'dimension', 128),
+		kind: 'receipt', source, worldId: text(receipt.worldId, 'worldId', RECEIPT_TEXT_LIMITS.worldId),
+		actionId: text(receipt.actionId, 'actionId', RECEIPT_TEXT_LIMITS.actionId), state: text(state, 'state', 64), reasonCode: reasonText(reasonCode),
+		...optionalText(receipt, 'actionType', RECEIPT_TEXT_LIMITS.actionType), ...optionalText(receipt, 'dimension', RECEIPT_TEXT_LIMITS.dimension),
 		...optionalInteger(receipt, 'goalRevision'), ...optionalInteger(receipt, 'tick'),
 		...actionEvidence(receipt, source),
 	};
@@ -182,7 +231,7 @@ function actionEvidence(receipt, source) {
 	return evidence;
 }
 function actionObservation(value) {
-	const source = boundedOwnJson(value, 16_384);
+	const source = boundedOwnJson(value, MAX_ACTION_OBSERVATION_BYTES);
 	if (source === null || typeof source !== 'object' || Array.isArray(source)) throw new TypeError('Action observation must be an object');
 	const result = {};
 	for (const field of ['worldTick', 'observedAtEpochMs', 'yaw', 'pitch']) if (source[field] !== undefined) {
@@ -228,7 +277,7 @@ function boundedOwnJson(value, maximumBytes) {
 	return JSON.parse(encoded);
 }
 function reasonText(value) {
-	if (typeof value !== 'string' || value.length > 128) throw new TypeError('reasonCode must be text up to 128 characters');
+	if (typeof value !== 'string' || value.length > RECEIPT_TEXT_LIMITS.reasonCode) throw new TypeError('reasonCode must be text up to 128 characters');
 	return value;
 }
 function noteProvenance(note) {
@@ -247,12 +296,16 @@ function noteProvenance(note) {
 function validateSaved(saved) {
 	if (saved.version !== 1 || !Number.isSafeInteger(saved.revision) || saved.revision < 0 || !Array.isArray(saved.notes) || !Array.isArray(saved.receipts)) throw new Error('INVALID_NOTEBOOK');
 	const notes = saved.notes.map((note) => ({ kind: 'note', source: 'model_authored', worldId: text(note.worldId, 'worldId', 256), key: text(note.key, 'key', 128), text: text(note.text, 'text', 2048), ...optionalInteger(note, 'goalRevision'), ...noteProvenance(note), ...optionalInteger(note, 'revision') }));
-	const receipts = saved.receipts.map((receipt) => {
+	const validateReceipt = (receipt) => {
 		const valid = receipt.source === 'server_action_result' && TERMINAL_STATES.has(receipt.state)
 			|| receipt.source === 'coordinator_dispatch' && receipt.state === 'DISPATCHED'
 			|| receipt.source === 'coordinator_uncertain' && receipt.state === 'UNKNOWN';
 		if (!valid) throw new Error('INVALID_NOTEBOOK_RECEIPT');
 		return { ...actionRecord(receipt, receipt.source, receipt.state, receipt.reasonCode), ...optionalInteger(receipt, 'revision') };
-	});
-	return { version: 1, revision: saved.revision, notes, receipts, evictedReceipts: Number.isSafeInteger(saved.evictedReceipts) && saved.evictedReceipts >= 0 ? saved.evictedReceipts : 0, evictedNotes: Number.isSafeInteger(saved.evictedNotes) && saved.evictedNotes >= 0 ? saved.evictedNotes : 0 };
+	};
+	const receipts = saved.receipts.map(validateReceipt);
+	if (saved.recovery !== undefined && !Array.isArray(saved.recovery)) throw new Error('INVALID_NOTEBOOK');
+	const recovery = (saved.recovery ?? []).map(validateReceipt);
+	if (recovery.some(entry => entry.source === 'server_action_result')) throw new Error('INVALID_NOTEBOOK_RECOVERY');
+	return { version: 1, revision: saved.revision, notes, receipts, recovery, evictedReceipts: Number.isSafeInteger(saved.evictedReceipts) && saved.evictedReceipts >= 0 ? saved.evictedReceipts : 0, evictedNotes: Number.isSafeInteger(saved.evictedNotes) && saved.evictedNotes >= 0 ? saved.evictedNotes : 0 };
 }
