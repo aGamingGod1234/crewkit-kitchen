@@ -44,7 +44,7 @@ test('native planner renews healthy tool work without letting provider events sh
 		act(_input, value) { options = value; return new Promise((resolve) => { finishTurn = resolve; }); },
 	};
 	const planner = new AgentPlanner({
-		registry: { assertCurrentRevision: () => record, setState() {} }, scheduler,
+		registry: { assertCurrentRevision: () => record, setState() {} }, scheduler, now: () => now,
 		codexService: { async createAgent() { return agent; }, getAgent() { return agent; } },
 	});
 	const run = planner.requestNativeTurn({ agentId: AGENT_ID, input: 'perform selected action', goalRevision: GOAL_REVISION, executeTool: () => body, onProgress: (event) => reportedProgress.push(event) });
