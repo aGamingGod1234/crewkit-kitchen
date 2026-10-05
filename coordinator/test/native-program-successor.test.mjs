@@ -16,7 +16,7 @@ function setup(t, options = {}) {
 	const sent = [], events = [];
 	let current = { ready: true, player: { x: 0, y: 64, z: 0, health: 20, dead: false },
 		world: { worldId: 'fixture-world', dimension: 'minecraft:overworld' }, inventory: { items: [], tagCounts: {} }, items: [], entities: [], blocks: [] };
-	let samples = 0, callId = 0, record = { ...agent };
+	let samples = 0, callId = 0, programStarts = 0, record = { ...agent };
 	const runtime = new NativeToolRuntime({
 		bridge: { send: async (type, agentId, payload) => {
 			sent.push({ type, agentId, payload });
@@ -24,6 +24,10 @@ function setup(t, options = {}) {
 		} },
 		registry: { get: () => record },
 		onProgramEvent: (_record, event) => events.push(event),
+		onWorkStarted: () => {
+			if (++programStarts === 2) options.beforeHandoff?.({ runtime, record, current });
+			return () => {};
+		},
 		requestObservation: async (_record, { afterEventSequence }) => {
 			const sample = ++samples;
 			await options.beforeSample?.(sample);
@@ -39,7 +43,7 @@ function setup(t, options = {}) {
 	const queue = async (handle, extra = {}) => call('queueProgram', { afterProgramId: handle.programId, goalRevision: record.goalRevision,
 		programVersion: (await call('programStatus', { programId: handle.programId })).programVersion,
 		precondition: 'player.state().health > 0', source: source(2), maxActions: 1, timeoutMs: 5000, ...extra });
-	return { runtime, sent, events, call, commands, finish, queue,
+	return { runtime, sent, events, call, commands, finish, queue, samples: () => samples,
 		setObservation: (patch, publish = true) => {
 			current = { ...current, ...patch };
 			if (publish) runtime.updateObservation(record, current, { eventSequence: 100 + ++samples });
@@ -56,6 +60,7 @@ test('ready successor preserves selected-agent provenance and gets its own bound
 	assert.equal((await run.call('programStatus')).pendingSuccessor.queueId, queued.pendingSuccessor.queueId);
 	run.finish(run.commands()[0]);
 	await until(() => run.commands().length === 2);
+	assert.equal(run.samples(), 1, 'handoff reuses the authoritative sample consumed after the final result');
 	assert.equal(run.events.filter(event => event.event === 'program_ended').length, 0, 'handoff suppresses predecessor planner wake');
 	const successor = await run.call('programStatus');
 	assert.notEqual(successor.programId, handle.programId);
@@ -74,7 +79,8 @@ test('ready successor preserves selected-agent provenance and gets its own bound
 test('body stays reserved during fresh successor prerequisite sampling', async t => {
 	let release;
 	const gate = new Promise(resolve => { release = resolve; });
-	const run = setup(t, { beforeSample: sample => sample === 2 ? gate : undefined });
+	const run = setup(t, { beforeSample: sample => sample === 2 ? gate : undefined,
+		beforeHandoff: ({ runtime, record, current }) => runtime.updateObservation(record, current, { eventSequence: 50 }) });
 	const handle = await run.call('runProgram', { source: source(1), background: true });
 	await until(() => run.commands().length === 1);
 	await run.queue(handle);
@@ -86,10 +92,72 @@ test('body stays reserved during fresh successor prerequisite sampling', async t
 	await until(() => run.commands().length === 2);
 });
 
+test('successor reuses a post-result push without requesting another sample', async t => {
+	const run = setup(t);
+	const handle = await run.call('runProgram', { source: source(1), background: true });
+	await until(() => run.commands().length === 1);
+	await run.queue(handle);
+	run.finish(run.commands()[0]);
+	run.setObservation({ player: { x: 2, y: 64, z: 0, health: 20, dead: false } });
+	await until(() => run.commands().length === 2);
+	assert.equal(run.samples(), 1, 'only the test publication advances the sample counter');
+	assert.equal(run.commands()[1].payload.provenance.eventSequence, 101);
+});
+
+test('a pre-result publication alone cannot authorize successor handoff', async t => {
+	let release;
+	const gate = new Promise(resolve => { release = resolve; });
+	let requested = false;
+	const run = setup(t, { beforeSample: () => { requested = true; return gate; } });
+	const handle = await run.call('runProgram', { source: source(1), background: true });
+	await until(() => run.commands().length === 1);
+	await run.queue(handle);
+	run.setObservation({ player: { x: 2, y: 64, z: 0, health: 20, dead: false } });
+	run.finish(run.commands()[0]);
+	await until(() => requested);
+	assert.equal(run.commands().length, 1);
+	release();
+	await until(() => run.commands().length === 2);
+	assert.equal(run.samples(), 2, 'one pre-result publication and one authoritative post-result request');
+});
+
+test('reused successor facts still reject remembered sections and a false authored prerequisite', async t => {
+	for (const patch of [{ continuity: { rememberedSections: ['inventory'] } }, { player: { x: 0, y: 64, z: 0, health: 8, dead: false } }]) {
+		const run = setup(t);
+		const handle = await run.call('runProgram', { source: source(1), background: true });
+		await until(() => run.commands().length === 1);
+		await run.queue(handle, { precondition: 'player.state().health >= 10' });
+		run.finish(run.commands()[0]);
+		run.setObservation(patch);
+		await until(() => run.events.some(event => event.event === 'program_handoff_rejected'));
+		assert.equal(run.commands().length, 1);
+		assert.equal(run.samples(), 1);
+		assert.equal(run.events.at(-1).result.reasonCode, patch.continuity ? 'FRESH_OBSERVATION_REQUIRED' : 'SUCCESSOR_PRECONDITION_FALSE');
+	}
+});
+
+test('world or lifecycle changes while acquiring handoff ownership cannot reuse predecessor proof', async t => {
+	for (const change of ['world', 'goal', 'lifecycle']) {
+		const run = setup(t, { beforeHandoff: ({ runtime, record, current }) => {
+			if (change === 'lifecycle') void runtime.dispose(record.agentId, 'goal_stopped');
+			else if (change === 'goal') run.setGoal(2);
+			else runtime.updateObservation(record, { ...current, world: { ...current.world, dimension: 'minecraft:the_nether' } }, { eventSequence: 50 });
+		} });
+		const handle = await run.call('runProgram', { source: source(1), background: true });
+		await until(() => run.commands().length === 1);
+		await run.queue(handle);
+		run.finish(run.commands()[0]);
+		await tick(); await tick(); await tick();
+		assert.equal(run.commands().length, 1);
+		assert.equal(run.events.some(event => event.event === 'program_handoff_started'), false);
+	}
+});
+
 test('cancelled handoff sample cannot emit a stale planner wake over replacement work', async t => {
 	let release;
 	const gate = new Promise(resolve => { release = resolve; });
-	const run = setup(t, { beforeSample: sample => sample === 2 ? gate : undefined });
+	const run = setup(t, { beforeSample: sample => sample === 2 ? gate : undefined,
+		beforeHandoff: ({ runtime, record, current }) => runtime.updateObservation(record, current, { eventSequence: 50 }) });
 	const handle = await run.call('runProgram', { source: source(1), background: true });
 	await until(() => run.commands().length === 1);
 	await run.queue(handle);

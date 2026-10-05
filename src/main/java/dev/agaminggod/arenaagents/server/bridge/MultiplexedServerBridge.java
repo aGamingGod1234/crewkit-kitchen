@@ -125,6 +125,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private static final int SERVER_TASK_URGENT_RESERVE = 512;
 	private static final int SERVER_TASK_CONTROL_RESERVE = 512;
 	private static final int SERVER_TASKS_PER_TICK = 256;
+	private static final int SERVER_CONTROL_TASKS_PER_TICK = 16;
+	private static final int SERVER_BULK_TASKS_PER_TICK = 8;
+	private static final int SERVER_INSPECTION_TASKS_PER_TICK = 8;
 	private static final int OBSERVATION_HISTORY_CAPACITY = 4_096;
 	private static final int MAX_TARGET_IDS_PER_OBSERVATION = 64;
 	private static final int MAX_TARGET_IDS_WITH_INSPECTIONS = 320;
@@ -430,12 +433,15 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	public void startTick() {
 		admissionTicks++;
 		drainServerTasks();
-		actionExecutor.tick();
+		flushActionResultAcknowledgements();
 	}
 
 	/** Publishes terminal results and post-physics observations at the end of the tick. */
 	public void endTick() {
 		publicationTicks++;
+		// Native hand-use and vanilla physics run after startTick returns. Keep inspection
+		// collection here so urgent input is physically applied before expensive world reads.
+		serverTasks.drainInspections(SERVER_INSPECTION_TASKS_PER_TICK, this::runServerTask);
 		publishPendingDisconnects();
 		publishPendingVerboseControl();
 		publishCatalogDiscoveryRetry();
@@ -466,13 +472,17 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	private void drainServerTasks() {
-		serverTasks.drain(SERVER_TASKS_PER_TICK, task -> {
-			try {
-				task.run();
-			} catch (RuntimeException exception) {
-				LOGGER.error("Codex bridge server task failed", exception);
-			}
-		});
+		serverTasks.drainBeforePhysics(
+				SERVER_TASKS_PER_TICK - SERVER_CONTROL_TASKS_PER_TICK - SERVER_BULK_TASKS_PER_TICK - SERVER_INSPECTION_TASKS_PER_TICK,
+				SERVER_CONTROL_TASKS_PER_TICK, SERVER_BULK_TASKS_PER_TICK, this::runServerTask, actionExecutor::tick);
+	}
+
+	private void runServerTask(Runnable task) {
+		try {
+			task.run();
+		} catch (RuntimeException exception) {
+			LOGGER.error("Codex bridge server task failed", exception);
+		}
 	}
 
 	static List<AgentId> registeredObservationIds(List<AgentRecord> records) {
@@ -956,7 +966,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			case "agent_ready", "planning_state", "goal_completed", "action_command", "action_cancel",
 					"action_result_ack" -> BoundedServerTaskQueue.Lane.URGENT;
 			case "coordinator_status", "conversation_wake_ack", "goal_spec_proposal",
-					"request_observation", "inspection_request", "heartbeat" -> BoundedServerTaskQueue.Lane.CONTROL;
+					"request_observation", "heartbeat" -> BoundedServerTaskQueue.Lane.CONTROL;
+			case "inspection_request" -> BoundedServerTaskQueue.Lane.INSPECTION;
 			default -> BoundedServerTaskQueue.Lane.BULK;
 		};
 	}
@@ -1151,8 +1162,21 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		requireKeys(payload, Set.of("goalRevision", "actionId"), "action_result_ack");
 		long goalRevision = requiredLong(payload, "goalRevision");
 		String actionId = requiredString(payload, "actionId");
-		actionJournal.acknowledge(agentId, goalRevision, actionId);
-		terminalResults.acknowledge(agentId, goalRevision, actionId);
+		if (!actionJournal.queueAcknowledgement(agentId, goalRevision, actionId)) {
+			// Rejected actions and detached conversation replies have no journal acceptance.
+			terminalResults.acknowledge(agentId, goalRevision, actionId);
+		}
+	}
+
+	private void flushActionResultAcknowledgements() {
+		try {
+			for (DurableActionJournal.ActionKey key : actionJournal.flushAcknowledgements()) {
+				terminalResults.acknowledge(key.agentId(), key.goalRevision(), key.actionId());
+			}
+		} catch (AgentDomainException exception) {
+			// The journal retains the whole group. Retry next tick without requiring reconnect.
+			LOGGER.debug("Terminal acknowledgement group will retry next tick: {}", exception.getMessage());
+		}
 	}
 
 	private void acceptGoalSpecProposal(BridgeEnvelope envelope) {
@@ -2240,7 +2264,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private void sendActionResult(ServerActionResult result) {
 		actionJournal.terminalIfAccepted(result);
 		programActions.terminal(result);
-		observations.invalidate(result.agentId());
+		observations.invalidatePlayerState(result.agentId());
 		ScenarioRuntimeService.onAgentAction(
 				manager.server(),
 				result.agentId().toString(),
@@ -2728,21 +2752,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		synchronized (publicationLock) {
 			Session active = session;
 			if (active == null || !active.open.get() || !active.authenticated.get()) return;
-			for (ServerActionResult result : terminalResults.pending()) {
-				if (!enqueueTerminalResult(active, result)) break;
-			}
-		}
-	}
-
-	private boolean enqueueTerminalResult(Session target, ServerActionResult result) {
-		if (!terminalResults.claim(result, target)) return true;
-		try {
-			target.enqueue(actionResultEnvelope(result, target));
-			return true;
-		} catch (RuntimeException exception) {
-			terminalResults.release(result, target);
-			LOGGER.debug("Terminal action result will retry after coordinator reconnect: {}", exception.getMessage());
-			return false;
+			terminalResults.replay(active, result -> active.enqueue(actionResultEnvelope(result, active)),
+					exception -> LOGGER.debug("Terminal action result enqueue will retry: {}", exception.getMessage()));
 		}
 	}
 

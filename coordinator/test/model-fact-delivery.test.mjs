@@ -105,10 +105,10 @@ test('CodexService delivers full observations for changes without an ID before a
 	await complete(h, turn);
 });
 
-test('provider presentation preserves precisely the old bounded facts and coverage as its delta baseline', () => {
+test('oversized incompressible presentation preserves bounded facts and coverage as its delta baseline', () => {
 	const views = new ModelObservationViews();
 	const value = reply();
-	value.observation.blocks = Array.from({ length: 300 }, (_, x) => ({ x, y: 64, z: 0, blockId: 'minecraft:stone', details: 'outside the legacy result budget'.repeat(30) }));
+	value.observation.blocks = Array.from({ length: 300 }, (_, x) => ({ x, y: 64, z: 0, blockId: 'minecraft:stone', details: 'outside the legacy result budget'.repeat(30) + x }));
 	const old = JSON.parse(toolResultContent(value).contentItems[0].text);
 	assert.equal(old.truncated, true);
 	const presented = presentNativeToolResult(value, { kind: 'observe' }, views);
@@ -387,7 +387,8 @@ for (const name of ['act', 'sequence']) test(`CodexService ${name} uses real run
  const sections = new Map(Object.entries(base.observation));
  for (const key of observationView.remove) sections.delete(key);
  for (const [key, value] of Object.entries(observationView.replace)) sections.set(key, value);
- const reconstructed = { ...result, postAction: { ...facts, observation: Object.fromEntries(sections) } };
+ const retainedMetadata = Object.fromEntries((observationView.retainMetadata ?? []).map(key => [key, base[key]]));
+ const reconstructed = { ...result, postAction: { ...retainedMetadata, ...facts, observation: Object.fromEntries(sections) } };
  assert.deepEqual(reconstructed, JSON.parse(toolResultContent(originals.at(-1)).contentItems[0].text));
  assert.equal(samples, 2, 'one initial sample and one final sample, without extra per-step sampling');
  assert.equal(commands.length, name === 'act' ? 1 : 2);

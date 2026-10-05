@@ -23,8 +23,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -44,8 +47,14 @@ final class DurableActionJournal implements AutoCloseable {
 	private final int maximumEntries;
 	private final int compactionEventLimit;
 	private LinkedHashMap<ActionKey, Entry> entries;
+	// Server-thread ACKs survive failed commits, bounded by the retained journal identities.
+	private final LinkedHashSet<ActionKey> pendingAcknowledgements = new LinkedHashSet<>();
 	private int persistedEventCount;
 	private long persistedBytes;
+	// Hash committed bytes incrementally; only channel recovery/reopening rereads the prefix.
+	private MessageDigest committedPrefix;
+	// Only this instance's failed frame may be discarded during a live retry.
+	private byte[] failedAppendFrame;
 	private FileChannel persistentChannel;
 	private long appendCount;
 	private long compactionCount;
@@ -62,6 +71,7 @@ final class DurableActionJournal implements AutoCloseable {
 		this.entries = loaded.entries();
 		this.persistedEventCount = loaded.eventCount();
 		this.persistedBytes = loaded.persistedBytes();
+		this.committedPrefix = loaded.committedPrefix();
 	}
 
 	static DurableActionJournal open(Path path) {
@@ -80,7 +90,7 @@ final class DurableActionJournal implements AutoCloseable {
 		Loaded loaded = read(normalized, maximumEntries);
 		if (loaded.legacy()) {
 			writeSnapshot(normalized, loaded.entries());
-			loaded = new Loaded(loaded.entries(), loaded.entries().size(), Files.exists(normalized) ? fileSize(normalized) : 0L, false);
+			loaded = read(normalized, maximumEntries);
 		} else if (loaded.persistedBytes() >= 0L && Files.exists(normalized)) {
 			truncateTail(normalized, loaded.persistedBytes());
 		}
@@ -89,7 +99,7 @@ final class DurableActionJournal implements AutoCloseable {
 
 	static DurableActionJournal inMemory() {
 		return new DurableActionJournal(null, MAX_ENTRIES, Integer.MAX_VALUE,
-				new Loaded(new LinkedHashMap<>(), 0, 0L, false));
+				new Loaded(new LinkedHashMap<>(), 0, 0L, false, newDigest()));
 	}
 
 	synchronized void accept(ServerActionRequest request, UUID logicalGoalId) {
@@ -146,6 +156,27 @@ final class DurableActionJournal implements AutoCloseable {
 		return true;
 	}
 
+	/** Stages an authenticated terminal ACK; no durable or replay state changes yet. */
+	synchronized boolean queueAcknowledgement(AgentId agentId, long goalRevision, String actionId) {
+		ActionKey key = new ActionKey(agentId, goalRevision, actionId);
+		Entry entry = entries.get(key);
+		if (entry == null || entry.phase() == Phase.ACCEPTED) return false;
+		pendingAcknowledgements.add(key);
+		return true;
+	}
+
+	/** One durable group per tick. A failed append leaves every identity available for retry. */
+	synchronized List<ActionKey> flushAcknowledgements() {
+		List<ActionKey> completed = List.copyOf(pendingAcknowledgements);
+		List<ActionKey> changed = completed.stream().filter(key -> {
+			Entry entry = entries.get(key);
+			return entry != null && entry.phase() == Phase.TERMINAL;
+		}).toList();
+		if (!changed.isEmpty()) persist(new Mutation(List.of(), List.of(), List.of(), changed));
+		pendingAcknowledgements.clear();
+		return completed;
+	}
+
 	/** Converts crash-stranded acceptances with one durable append and one fsync. */
 	synchronized void terminalizeAccepted(Function<ServerActionRequest, ServerActionResult> resultFactory) {
 		Objects.requireNonNull(resultFactory, "resultFactory must not be null");
@@ -185,6 +216,7 @@ final class DurableActionJournal implements AutoCloseable {
 			if (key.agentId().equals(agentId)) removed.add(key);
 		}
 		if (!removed.isEmpty()) persist(new Mutation(List.copyOf(removed), List.of(), List.of(), List.of()));
+		pendingAcknowledgements.removeIf(key -> key.agentId().equals(agentId));
 	}
 
 	synchronized List<Entry> snapshot() {
@@ -222,6 +254,7 @@ final class DurableActionJournal implements AutoCloseable {
 		if (closed) throw new AgentDomainException("ACTION_JOURNAL_CLOSED", "Durable action journal is closed");
 		if (path != null) {
 			long started = System.nanoTime();
+			if (failedAppendFrame != null) openPersistentChannel();
 			if (persistedEventCount >= compactionEventLimit) compact();
 			byte[] frame = encodeFrame(mutation);
 			appendFrame(frame);
@@ -237,7 +270,7 @@ final class DurableActionJournal implements AutoCloseable {
 	private void compact() {
 		long started = System.nanoTime();
 		closePersistentChannel();
-		writeSnapshot(path, entries);
+		committedPrefix = writeSnapshot(path, entries);
 		persistedEventCount = entries.size();
 		persistedBytes = fileSize(path);
 		openPersistentChannel();
@@ -248,12 +281,12 @@ final class DurableActionJournal implements AutoCloseable {
 	}
 
 	private static Loaded read(Path path, int maximumEntries) {
-		if (!Files.exists(path)) return new Loaded(new LinkedHashMap<>(), 0, 0L, false);
+		if (!Files.exists(path)) return new Loaded(new LinkedHashMap<>(), 0, 0L, false, newDigest());
 		try {
 			byte[] bytes = Files.readAllBytes(path);
-			if (bytes.length == 0) return new Loaded(new LinkedHashMap<>(), 0, 0L, false);
+			if (bytes.length == 0) return new Loaded(new LinkedHashMap<>(), 0, 0L, false, newDigest());
 			if (bytes[0] == '{') {
-				return new Loaded(readLegacy(new String(bytes, StandardCharsets.UTF_8), maximumEntries), 0, bytes.length, true);
+				return new Loaded(readLegacy(new String(bytes, StandardCharsets.UTF_8), maximumEntries), 0, bytes.length, true, newDigest());
 			}
 			if (bytes.length < LOG_HEADER.length) throw corrupt("log header is incomplete");
 			for (int index = 0; index < LOG_HEADER.length; index++) {
@@ -288,7 +321,9 @@ final class DurableActionJournal implements AutoCloseable {
 				offset += payloadLength;
 				eventCount++;
 			}
-			return new Loaded(decoded, eventCount, offset, false);
+			MessageDigest prefix = newDigest();
+			prefix.update(bytes, 0, offset);
+			return new Loaded(decoded, eventCount, offset, false, prefix);
 		} catch (AgentDomainException exception) {
 			throw exception;
 		} catch (RuntimeException | IOException exception) {
@@ -318,22 +353,30 @@ final class DurableActionJournal implements AutoCloseable {
 		}
 	}
 
-	private static void writeSnapshot(Path path, Map<ActionKey, Entry> entries) {
+	private static MessageDigest writeSnapshot(Path path, Map<ActionKey, Entry> entries) {
+		MessageDigest prefix = newDigest();
+		prefix.update(LOG_HEADER);
 		writeLog(path, channel -> {
 			for (Entry entry : entries.values()) {
-				writeFully(channel, ByteBuffer.wrap(encodeFrame(
-						new Mutation(List.of(), List.of(entry), List.of(), List.of()))));
+				byte[] frame = encodeFrame(new Mutation(List.of(), List.of(entry), List.of(), List.of()));
+				writeFully(channel, ByteBuffer.wrap(frame));
+				prefix.update(frame);
 			}
 		});
+		return prefix;
 	}
 
 	private void openPersistentChannel() {
 		if (path == null || persistentChannel != null) return;
 		try {
-			FileChannel opened = FileChannel.open(path, StandardOpenOption.WRITE);
+			FileChannel opened = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE);
 			try {
-				if (opened.size() != persistedBytes) {
+				if (failedAppendFrame != null) {
+					recoverFailedAppend(opened);
+				} else if (opened.size() != persistedBytes) {
 					throw new IOException("action journal changed after it was read");
+				} else {
+					verifyCommittedPrefix(opened);
 				}
 				opened.position(persistedBytes);
 				persistentChannel = opened;
@@ -392,8 +435,13 @@ final class DurableActionJournal implements AutoCloseable {
 
 	private void appendFrame(byte[] frame) {
 		if (persistentChannel == null) {
-			if (!Files.exists(path) || persistedBytes == 0L) {
+			if (persistedBytes == 0L) {
+				if (Files.exists(path) && fileSize(path) != 0L) {
+					throw ioFailure("Could not create action journal", new IOException("action journal changed after it was read"));
+				}
 				writeLog(path, channel -> writeFully(channel, ByteBuffer.wrap(frame)));
+				committedPrefix.update(LOG_HEADER);
+				committedPrefix.update(frame);
 				persistedBytes = fileSize(path);
 				openPersistentChannel();
 				return;
@@ -401,20 +449,83 @@ final class DurableActionJournal implements AutoCloseable {
 			openPersistentChannel();
 		}
 		long originalSize = persistedBytes;
+		boolean appendStarted = false;
 		try {
+			if (persistentChannel.size() != originalSize) throw new IOException("action journal changed after it was read");
 			persistentChannel.position(originalSize);
+			appendStarted = true;
 			writeFully(persistentChannel, ByteBuffer.wrap(frame));
 			persistentChannel.force(true);
 			persistedBytes += frame.length;
+			committedPrefix.update(frame);
 		} catch (IOException exception) {
+			if (appendStarted) {
+				failedAppendFrame = frame;
+				try {
+					recoverFailedAppend(persistentChannel);
+				} catch (IOException suppressed) {
+					exception.addSuppressed(suppressed);
+				}
+			}
+			FileChannel failed = persistentChannel;
+			persistentChannel = null;
 			try {
-				persistentChannel.position(originalSize);
-				persistentChannel.truncate(originalSize);
-				persistentChannel.force(true);
+				failed.close();
 			} catch (IOException suppressed) {
 				exception.addSuppressed(suppressed);
 			}
-			throw new AgentDomainException("ACTION_JOURNAL_IO", "Could not durably append action journal: " + exception.getMessage());
+			throw ioFailure("Could not durably append action journal", exception);
+		}
+	}
+
+	private void recoverFailedAppend(FileChannel channel) throws IOException {
+		long tailBytes = channel.size() - persistedBytes;
+		if (tailBytes < 0L || tailBytes > failedAppendFrame.length) {
+			throw new IOException("action journal changed after the failed append");
+		}
+		verifyCommittedPrefix(channel);
+		ByteBuffer tail = ByteBuffer.allocate((int) tailBytes);
+		channel.position(persistedBytes);
+		while (tail.hasRemaining()) {
+			if (channel.read(tail) < 0) throw new IOException("incomplete failed append tail");
+		}
+		for (int index = 0; index < tailBytes; index++) {
+			if (tail.array()[index] != failedAppendFrame[index]) {
+				throw new IOException("action journal tail does not belong to the failed append");
+			}
+		}
+		channel.truncate(persistedBytes);
+		channel.force(true);
+		failedAppendFrame = null;
+	}
+
+	private void verifyCommittedPrefix(FileChannel channel) throws IOException {
+		MessageDigest actual = newDigest();
+		ByteBuffer buffer = ByteBuffer.allocate(8192);
+		channel.position(0L);
+		long remaining = persistedBytes;
+		while (remaining > 0L) {
+			buffer.clear().limit((int) Math.min(buffer.capacity(), remaining));
+			int count = channel.read(buffer);
+			if (count < 0) throw new IOException("committed action journal prefix is incomplete");
+			remaining -= count;
+			buffer.flip();
+			actual.update(buffer);
+		}
+		try {
+			if (!MessageDigest.isEqual(actual.digest(), ((MessageDigest) committedPrefix.clone()).digest())) {
+				throw new IOException("committed action journal prefix changed after it was read");
+			}
+		} catch (CloneNotSupportedException exception) {
+			throw new IOException("could not verify committed action journal prefix", exception);
+		}
+	}
+
+	private static MessageDigest newDigest() {
+		try {
+			return MessageDigest.getInstance("SHA-256");
+		} catch (NoSuchAlgorithmException exception) {
+			throw new AssertionError(exception);
 		}
 	}
 
@@ -751,7 +862,8 @@ final class DurableActionJournal implements AutoCloseable {
 			LinkedHashMap<ActionKey, Entry> entries,
 			int eventCount,
 			long persistedBytes,
-			boolean legacy
+			boolean legacy,
+			MessageDigest committedPrefix
 	) { }
 
 	record PerformanceSnapshot(
@@ -770,7 +882,7 @@ final class DurableActionJournal implements AutoCloseable {
 		void write(FileChannel channel) throws IOException;
 	}
 
-	private record ActionKey(AgentId agentId, long goalRevision, String actionId) {
+	record ActionKey(AgentId agentId, long goalRevision, String actionId) {
 		private static ActionKey from(ServerActionRequest request) {
 			return new ActionKey(request.agentId(), request.goalRevision(), request.actionId());
 		}

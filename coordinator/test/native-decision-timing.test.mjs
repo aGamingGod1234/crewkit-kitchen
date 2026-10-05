@@ -7,6 +7,31 @@ import { createExecutionSettings } from '../src/provider-identity.mjs';
 
 const AGENT_ID = 'timing-agent';
 
+test('native request timing includes collector arrival and reports execution queue wait separately', async () => {
+	let clock = 0;
+	const record = nativeRecord('model-a');
+	const rows = [];
+	const agent = {
+		executionSettings: createExecutionSettings(record, { transport: 'test', controlProtocol: 'native_tools' }),
+		async setGoalRevision() {},
+		async act(_input, options) {
+			clock = 17;
+			options.onProgress({ phase: 'tool_queued', callId: 'queued-call', toolName: 'observe', requestArrivedAt: clock });
+			clock = 57;
+			await options.executeTool({ callId: 'queued-call', requestArrivedAt: 17, queueWaitMs: 40, tool: { kind: 'observe' } });
+			return { status: 'completed', toolCalls: 1 };
+		},
+	};
+	const planner = new AgentPlanner({ registry: registryFor(() => record), now: () => clock,
+		scheduler: immediateScheduler, nativeTimingSink: (event, fields) => rows.push({ event, fields }),
+		codexService: { async createAgent() { return agent; }, getAgent() { return null; } } });
+	await planner.requestNativeTurn({ agentId: AGENT_ID, input: 'inspect', goalRevision: 1,
+		executeTool: async () => { clock += 3; return { state: 'SUCCEEDED' }; } });
+	assert.equal(planner.getNativeDecisionTiming(AGENT_ID).firstToolRequestP50Ms, 17);
+	assert.equal(rows.find(row => row.event === 'native_tool_queue_timing').fields.queueWaitMs, 40);
+	assert.equal(rows.find(row => row.event === 'native_tool_queue_timing').fields.arrivalObserved, true);
+});
+
 test('native timing windows bound samples and keep failed or cancelled segments out of percentiles', () => {
 	const window = new NativeDecisionTimingWindow({ windowSize: 2 });
 	window.recordProviderSegment({ durationMs: 10, outcome: 'completed', sample: true });

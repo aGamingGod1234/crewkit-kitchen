@@ -234,7 +234,15 @@ export class AgentPlanner {
 				const timingWindow = this.#nativeTimingWindow(agentId, timingIdentity);
 				let firstToolAt = null;
 				let firstUsableToolRecorded = false;
-				let toolsExecuting = 0;
+				const pendingTools = new Set();
+				const renewToolLease = () => {
+					// Concurrent reads/control calls own separate deadlines. Keep the
+					// earliest pending deadline so neither starts nor settlements grant
+					// fresh time to older work, and remove settled tools from the lease.
+					let deadline = Infinity;
+					for (const pending of pendingTools) deadline = Math.min(deadline, pending.deadline);
+					renewLease({ phase: 'tool', timeoutMs: Math.max(1, Math.ceil(deadline - this.#now())) });
+				};
 				let providerSegmentStartedAt = null;
 				let providerSegmentIndex = 0;
 				let nativeTurnStartedAt = null;
@@ -259,6 +267,17 @@ export class AgentPlanner {
 					});
 					return durationMs;
 				};
+				const recordToolRequest = (request, requestedAt) => {
+					const segmentDurationMs = finishProviderSegment(requestedAt, 'completed', 'tool_request');
+					if (firstToolAt !== null) return;
+					firstToolAt = requestedAt;
+					const elapsedMs = elapsed(nativeTurnStartedAt, requestedAt);
+					timingWindow.window.recordFirstToolRequest(elapsedMs);
+					this.#recordNativeTiming(record, 'native_first_tool_requested', {
+						traceId, elapsedMs, providerOnlyMs: elapsedMs, segmentDurationMs,
+						toolKind: request?.tool?.kind ?? request?.toolName ?? 'unknown', ...timingIdentity,
+					});
+				};
 				renewLease({ phase: 'provider' });
 				const result = await this.#providerAttempt(record, {
 					operation: 'native_turn', attempt: 1, queueWaitMs, retry: false, traceId,
@@ -270,25 +289,26 @@ export class AgentPlanner {
 							goalRevision,
 							signal,
 							onVerbose: (stage, message) => safeVerbose(onVerbose, stage, message),
-							onProgress: () => {
+							onProgress: (metadata) => {
 								if (!acceptsProgress || signal.aborted || !this.#isCurrent(agentId, goalRevision)) return;
-								if (toolsExecuting === 0) renewLease({ phase: 'provider' });
+								if (metadata?.phase === 'tool_queued' && Number.isFinite(metadata.requestArrivedAt)) {
+									recordToolRequest(metadata, metadata.requestArrivedAt);
+								}
+								if (pendingTools.size === 0) renewLease({ phase: 'provider' });
 								try { Promise.resolve(onProgress?.({ phase: 'provider' })).catch(() => {}); } catch { /* reporting cannot fail provider work */ }
 							},
 							executeTool: async (request) => {
-								const requestedAt = this.#now();
-								const segmentDurationMs = finishProviderSegment(requestedAt, 'completed', 'tool_request');
-								if (firstToolAt === null) {
-									firstToolAt = requestedAt;
-									const elapsedMs = elapsed(nativeTurnStartedAt, requestedAt);
-									timingWindow.window.recordFirstToolRequest(elapsedMs);
-									this.#recordNativeTiming(record, 'native_first_tool_requested', {
-										traceId, elapsedMs, providerOnlyMs: elapsedMs, segmentDurationMs,
-										toolKind: request?.tool?.kind ?? 'unknown', ...timingIdentity,
-									});
-								}
-								toolsExecuting += 1;
-								renewLease({ phase: 'tool', timeoutMs: nativeToolLeaseMs(request.tool, this.#planningLeaseTimeoutMs) });
+								const executorEnteredAt = this.#now();
+								const hasArrival = Number.isFinite(request?.requestArrivedAt);
+								recordToolRequest(request, hasArrival ? request.requestArrivedAt : executorEnteredAt);
+								this.#recordNativeTiming(record, 'native_tool_queue_timing', {
+									traceId, callId: request?.callId ?? null, toolKind: request?.tool?.kind ?? 'unknown',
+									queueWaitMs: Number.isFinite(request?.queueWaitMs) ? request.queueWaitMs : null,
+									arrivalObserved: hasArrival, ...timingIdentity,
+								});
+								const pending = { deadline: executorEnteredAt + nativeToolLeaseMs(request.tool, this.#planningLeaseTimeoutMs) };
+								pendingTools.add(pending);
+								renewToolLease();
 								try {
 									if (signal.aborted) throw signal.reason;
 									const toolResult = await executeTool(request);
@@ -304,10 +324,12 @@ export class AgentPlanner {
 									}
 									return toolResult;
 								} finally {
-									toolsExecuting -= 1;
-									if (toolsExecuting === 0) {
+									pendingTools.delete(pending);
+									if (pendingTools.size === 0) {
 										renewLease({ phase: 'provider' });
 										if (!signal.aborted) beginProviderSegment(this.#now());
+									} else {
+										renewToolLease();
 									}
 								}
 							},

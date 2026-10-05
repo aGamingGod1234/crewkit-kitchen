@@ -6,12 +6,14 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.function.Consumer;
 
 /**
  * Retains terminal action results until the authenticated coordinator acknowledges them.
@@ -60,6 +62,25 @@ final class TerminalResultLedger {
 
 	synchronized List<ServerActionResult> pending() {
 		return pending.values().stream().map(Entry::result).toList();
+	}
+
+	/** Agent-local pressure must not hold up another agent's retained result. */
+	synchronized void replay(Object session, Consumer<ServerActionResult> enqueue, Consumer<RuntimeException> failed) {
+		var blockedAgents = new HashSet<AgentId>();
+		for (ServerActionResult result : pending()) {
+			if (blockedAgents.contains(result.agentId()) || !claim(result, session)) continue;
+			try {
+				enqueue.accept(result);
+			} catch (RuntimeException exception) {
+				release(result, session);
+				failed.accept(exception);
+				if (exception instanceof BridgeProtocolException protocol && "AGENT_BACKPRESSURE".equals(protocol.code())) {
+					blockedAgents.add(result.agentId());
+				} else {
+					break;
+				}
+			}
+		}
 	}
 
 	/** Claims one enqueue attempt for a session, coalescing repeated server ticks. */

@@ -655,6 +655,7 @@ export class SharedCodexAgent {
 
 		const silenceDeadline = createProviderSilenceDeadline(this.#planningTimeoutMs, this.#schedule, this.#cancelSchedule);
 		let receivedUsageTotal = false;
+		let executingTools = 0;
 		const collector = createNativeTurnCollector({
 			transport: this.#transport,
 			threadId: this.#threadId,
@@ -673,8 +674,11 @@ export class SharedCodexAgent {
 				silenceDeadline.restart();
 				if (this.#active?.collector === collector) this.#active.onProgress?.({ phase: 'provider' });
 			},
-			onToolExecutionStart: () => silenceDeadline.pause(),
-			onToolExecutionEnd: () => silenceDeadline.resume(),
+			onToolTiming: (metadata) => {
+				if (this.#active?.collector === collector) return this.#active.onProgress?.(metadata);
+			},
+			onToolExecutionStart: () => { executingTools++; silenceDeadline.pause(); },
+			onToolExecutionEnd: () => { if (--executingTools === 0) silenceDeadline.resume(); },
 		});
 		void collector.promise.catch(() => {});
 		let lifecycleSettled = false;
@@ -949,21 +953,58 @@ function isContextCompaction(method, params) {
 	return method === 'thread/compacted' || ['item/started', 'item/completed'].includes(method) && params?.item?.type === 'contextCompaction';
 }
 
-export function presentNativeToolResult(value, tool, views = new ModelObservationViews()) {
-	// Keep the existing coverage/truncation contract and compress exactly the
-	// facts it would have delivered. Internal ArenaScript reads stay untouched.
-	const response = toolResultContent(value);
-	const original = JSON.parse(response.contentItems[0].text);
-	const prepared = views.prepare(original, tool);
-	const text = JSON.stringify(encodeModelFacts(prepared.value));
-	if (Buffer.byteLength(text, 'utf8') > MAX_TOOL_RESULT_BYTES) {
-		// Even a metadata-overflow fallback changes delivery state only on success.
-		return { response, commit: prepared.commitWithoutView ?? prepared.commit };
-	}
-	return { response: { ...response, contentItems: [{ type: 'inputText', text }] }, commit: prepared.commit };
+// Bound the extra lossless attempt as well as the final wire representation.
+// Larger/deeper inputs still use the established bounded, coverage-aware fallback.
+const MAX_FACT_CANDIDATE_BYTES = 1024 * 1024;
+function boundedFactCandidate(value, depth = 0, budget = { nodes: 32_768 }) {
+	if (--budget.nodes < 0 || depth > 32) return false;
+	if (value === null || typeof value !== 'object') return true;
+	for (const child of Object.values(value)) if (!boundedFactCandidate(child, depth + 1, budget)) return false;
+	return true;
 }
 
-function createNativeTurnCollector({ transport, threadId, agentId, goalRevision, executeTool, onVerbose, usageStart = null, usagePreviousEnd = null, onUsageTotal = () => {}, observationViews = new ModelObservationViews(), onProviderActivity = () => {}, onToolExecutionStart = () => {}, onToolExecutionEnd = () => {} }) {
+export function presentNativeToolResult(value, tool, views = new ModelObservationViews()) {
+	const originalText = JSON.stringify(value ?? null);
+	const tryPresentation = candidate => {
+		const prepared = views.prepare(candidate, tool);
+		const text = JSON.stringify(encodeModelFacts(prepared.value));
+		return { prepared, text, fits: Buffer.byteLength(text, 'utf8') <= MAX_TOOL_RESULT_BYTES };
+	};
+	// Compute the exact requested full/delta view before throwing facts away.
+	if (Buffer.byteLength(originalText, 'utf8') <= MAX_FACT_CANDIDATE_BYTES && boundedFactCandidate(value)) {
+		const original = JSON.parse(originalText);
+		let candidate = tryPresentation(original);
+		if (!candidate.fits && tool.view === 'changes') {
+			// A smaller raw delta can compress worse than the complete snapshot.
+			const prepared = views.prepare(original, { ...tool, view: 'full' });
+			const text = JSON.stringify(encodeModelFacts(prepared.value));
+			candidate = { prepared, text, fits: Buffer.byteLength(text, 'utf8') <= MAX_TOOL_RESULT_BYTES };
+		}
+		if (candidate.fits) return { response: { success: true, contentItems: [{ type: 'inputText', text: candidate.text }] }, commit: candidate.prepared.commit };
+	}
+	const response = toolResultContent(value);
+	const candidate = tryPresentation(JSON.parse(response.contentItems[0].text));
+	if (!candidate.fits) {
+		// No undelivered candidate (including full facts discarded above) commits.
+		return { response, commit: candidate.prepared.commitWithoutView ?? candidate.prepared.commit };
+	}
+	return { response: { ...response, contentItems: [{ type: 'inputText', text: candidate.text }] }, commit: candidate.prepared.commit };
+}
+
+function nativeToolSchedulingClass(tool) {
+	// Only normalized exact handles bypass ordering. Runtime authority and
+	// cancellation fences still decide whether that handle can affect the body.
+	if (['cancel_action', 'cancel_program', 'cancel_queued_program'].includes(tool?.kind)
+		|| tool?.kind === 'respond_program' && ['continue', 'pause', 'finish'].includes(tool.directive)) return 'control';
+	if (['observe', 'inspect', 'capabilities', 'action_status', 'program_status', 'query_memory'].includes(tool?.kind)
+		|| tool?.kind === 'task_memory' && tool.operation === 'query'
+		|| tool?.kind === 'task_plan' && tool.operation === 'read') return 'read';
+	// Unknown tools, body operations, finishing, replacements and memory writes
+	// remain ordered. New tools must explicitly prove read/control independence.
+	return 'ordered';
+}
+
+function createNativeTurnCollector({ transport, threadId, agentId, goalRevision, executeTool, onVerbose, usageStart = null, usagePreviousEnd = null, onUsageTotal = () => {}, observationViews = new ModelObservationViews(), onProviderActivity = () => {}, onToolExecutionStart = () => {}, onToolExecutionEnd = () => {}, onToolTiming = () => {} }) {
 	const liveMessages = new Map();
 	let expectedTurnId = null;
 	let bufferedEvents = [];
@@ -1018,7 +1059,8 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 	};
 	let toolExecutor = executeTool;
 	let completionStatus = null;
-	let executionTail = Promise.resolve();
+	let orderedTail = Promise.resolve();
+	const requestArrivals = new WeakMap();
 	const pendingTools = new Set();
 	let resolvePromise;
 	let rejectPromise;
@@ -1035,30 +1077,45 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 		if (params?.threadId !== threadId || params?.turnId !== expectedTurnId) return;
 		toolCalls += 1;
 		const executor = toolExecutor;
+		const requestArrivedAt = requestArrivals.get(request) ?? performance.now();
+		let tool;
+		let normalizationError;
+		try { tool = normalizeMinecraftToolCall(params.tool, params.arguments); }
+		catch (error) { normalizationError = error; }
+		const schedulingClass = nativeToolSchedulingClass(tool);
+		const timing = { callId: params.callId, toolName: params.tool, schedulingClass, requestArrivedAt };
+		// Instrumentation is read-only and cannot reject execution or delivery.
+		const reportTiming = metadata => { try { Promise.resolve(onToolTiming({ ...timing, ...metadata })).catch(() => {}); } catch { /* diagnostics only */ } };
+		reportTiming({ phase: 'tool_queued' });
 		const execute = async () => {
 			if (settled || completionStatus?.status === 'failed') return;
 			let executionStarted = false;
-			let tool;
 			let executionMs;
+			const executionStartedAt = performance.now();
+			const queueWaitMs = executionStartedAt - requestArrivedAt;
 			const measurementMetadata = (result) => {
-				try { return { name: params.tool, kind: tool?.kind, hasPostAction: result?.postAction != null, executionMs }; }
+				try { return { name: params.tool, kind: tool?.kind, hasPostAction: result?.postAction != null, executionMs, callId: params.callId, requestArrivedAt, queueWaitMs, schedulingClass }; }
 				catch { toolResponses.captureFailure(); return null; }
 			};
 			try {
-				tool = normalizeMinecraftToolCall(params.tool, params.arguments);
+				if (normalizationError) throw normalizationError;
 				safeVerbose(onVerbose, 'live_tool', `${params.tool} ${JSON.stringify(params.arguments).slice(0, 1200)}`);
 				onToolExecutionStart(tool);
 				executionStarted = true;
+				reportTiming({ phase: 'tool_started', executionStartedAt, queueWaitMs });
 				const executionRequest = {
 					agentId,
 					goalRevision,
 					threadId,
 					turnId: expectedTurnId,
 					callId: params.callId,
+					requestArrivedAt,
+					executionStartedAt,
+					queueWaitMs,
+					schedulingClass,
 					tool,
 				};
 				let result;
-				const executionStartedAt = performance.now();
 				try { result = await executor(executionRequest); }
 				finally { executionMs = performance.now() - executionStartedAt; }
 				if (!settled) {
@@ -1076,12 +1133,20 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 					...(error?.actionContract === undefined ? {} : { actionContract: error.actionContract }),
 				}, false), measurementMetadata(null));
 			} finally {
-				if (executionStarted) onToolExecutionEnd();
+				if (executionStarted) {
+					onToolExecutionEnd();
+					reportTiming({ phase: 'tool_completed', executionStartedAt, queueWaitMs, executionMs });
+				}
 			}
 		};
-		const task = executionTail.then(execute, execute);
+		// Reads share the preceding write barrier, but do not block sibling reads.
+		// Writes/finish wait for all earlier calls, including delivery. Exact control
+		// can interrupt a pending read/body; later writes wait for that control.
+		const barrier = schedulingClass === 'control' ? Promise.resolve()
+			: schedulingClass === 'read' ? orderedTail : Promise.allSettled([...pendingTools]);
+		const task = barrier.then(execute, execute);
 		pendingTools.add(task);
-		executionTail = task.catch(() => {});
+		if (schedulingClass === 'ordered') orderedTail = task.catch(() => {});
 		void task.finally(() => {
 			pendingTools.delete(task);
 			settleCompletedTurn();
@@ -1100,6 +1165,7 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 	const onServerRequest = (request) => {
 		if (request?.method !== 'item/tool/call' || request.params?.threadId !== threadId) return;
 		if (expectedTurnId !== null && request.params?.turnId !== expectedTurnId) return;
+		if (!requestArrivals.has(request)) requestArrivals.set(request, performance.now());
 		if (expectedTurnId === null) { bufferEvent('request', request); return; }
 		onProviderActivity();
 		void respondToTool(request);

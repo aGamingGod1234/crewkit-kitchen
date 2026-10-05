@@ -157,6 +157,8 @@ export class DynamicCoordinator extends EventEmitter {
 	#inspections;
 	#playerMemory;
 	#memorySummaries = new Map();
+	#receiptReconciliations = new Map();
+	#latestActionDispatches = new Map();
 	#goalSupervisor;
 	#codexControlProtocol;
 	#reconciliation = Promise.resolve();
@@ -263,7 +265,13 @@ export class DynamicCoordinator extends EventEmitter {
 				return { ...result, observation: adaptObservation(result.observation) };
 			},
 			inspectObservation: (record, query, authority = {}) => this.#inspections.request(record, query, { ...authority, connectionEpoch: this.#connectionEpoch }),
-			notebook: this.#playerMemory.notebook,
+			// Coordinator ingress owns authoritative terminal persistence/retries.
+			// Avoid the runtime's best-effort duplicate write ahead of live delivery;
+			// dispatch and unknown-receipt durability still use the real notebook.
+			notebook: {
+				...Object.fromEntries(['writeNote', 'query', 'listUnresolved', 'recordDispatch', 'recordUnknown', 'findReceipt'].map((method) => [method, this.#playerMemory.notebook[method].bind(this.#playerMemory.notebook)])),
+				recordReceipt: async () => {},
+			},
 			memoryOperation: (record, operation) => this.#playerMemory.execute(record, operation),
 			taskContext: (record) => this.#playerMemory.taskContext(record),
 			memoryObservation: (record, observation) => this.#playerMemory.observe(record, observation),
@@ -447,6 +455,8 @@ export class DynamicCoordinator extends EventEmitter {
 	async #stopOnce() {
 		if (this.#closed) return;
 		this.#stopping = true;
+		const receipts = [...this.#receiptReconciliations.values()];
+		for (const receipt of receipts) { clearTimeout(receipt.retry); receipt.resolve(); }
 		this.#inspections.cancel();
 		this.#connected = false;
 		this.#setVerboseEnabled(false);
@@ -467,9 +477,29 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#attentionFlushes.clear();
 		this.#lifecycleGenerations.clear();
 		this.#programRuntime.disposeAll();
-		await this.#nativeRuntime.disposeAll();
-		await this.#playerMemory.markUnknown(undefined, 'COORDINATOR_STOPPED').catch((error) => this.#emitRuntimeError(error));
-		await this.#playerMemory.flush().catch((error) => this.#emitRuntimeError(error));
+		// Release native waiters immediately, independently of stalled terminal I/O.
+		const nativeDisposal = this.#nativeRuntime.disposeAll();
+		const closeMemory = async () => {
+			await Promise.all([Promise.allSettled(receipts.map((receipt) => receipt.pending)), nativeDisposal]);
+			await this.#playerMemory.markUnknown(undefined, 'COORDINATOR_STOPPED');
+			await this.#playerMemory.flush();
+		};
+		// A stuck receipt write cannot hold shutdown forever. Unacknowledged
+		// terminals remain in the server journal for replay on the next session.
+		let receiptShutdownTimer;
+		await Promise.race([
+			closeMemory().catch((error) => this.#emitRuntimeError(error)),
+			...(receipts.length === 0 ? [] : [new Promise((resolve) => {
+				receiptShutdownTimer = setTimeout(() => {
+					this.#emitRuntimeError(codedRuntimeError('RECEIPT_SHUTDOWN_PENDING', 'Receipt storage has not settled; server results remain unacknowledged for replay'));
+					resolve();
+				}, 1_000);
+			})]),
+		]);
+		clearTimeout(receiptShutdownTimer);
+		this.#receiptReconciliations.clear();
+		this.#latestActionDispatches.clear();
+		for (const receipt of receipts) receipt.resolve();
 		await this.#taskViews.flush().catch((error) => this.#emitRuntimeError(error));
 		this.#memorySummaries.clear();
 		this.#providerRetryAfter.clear();
@@ -962,7 +992,9 @@ export class DynamicCoordinator extends EventEmitter {
 				const nativeWork = this.#providerWork.get(message.agentId);
 				if (this.#usesNativeTools(record) && nativeWork?.goalRevision === record.goalRevision) {
 					this.#goalSupervisor.progress(nativeWork.supervisionToken);
-					if (nativeWork.toolSupervisionToken !== null) this.#goalSupervisor.progress(nativeWork.toolSupervisionToken);
+					for (const call of nativeWork.toolSupervision.values()) {
+						if (call.token !== null) this.#goalSupervisor.progress(call.token);
+					}
 				}
 				if (this.#usesNativeTools(record) && this.#nativeRuntime.onActionProgress(record, message.payload)) {
 					this.emit('actionProgress', message);
@@ -974,41 +1006,47 @@ export class DynamicCoordinator extends EventEmitter {
 			}, { connectionEpoch });
 		});
 		this.#listen('action_result', (message, connectionEpoch) => {
+			const lifecycleGeneration = this.#lifecycleGeneration(message.agentId);
+			let receipt;
 			return this.#enqueueAgent(message.agentId, async () => {
-				let acknowledge = false;
+				const dispatch = this.#latestActionDispatches.get(message.agentId);
+				if (dispatch?.connectionEpoch === connectionEpoch && dispatch.actionId === message.payload.actionId
+					&& dispatch.goalRevision === message.payload.goalRevision && message.payload.actionType !== undefined
+					&& dispatch.actionType !== message.payload.actionType) {
+					// Invalid receipt evidence must neither enter live facts nor fail valid
+					// gameplay through the agent-error/cancellation path. No disk read here.
+					this.#emitRuntimeError(codedRuntimeError('UNCORRELATED_ACTION_RECEIPT', 'Terminal action type does not match its live dispatch; withholding ACK'));
+					return;
+				}
+				// Live correlation must not wait for disk. The retained server result is
+				// acknowledged separately, only after authoritative storage succeeds.
+				receipt = this.#queueReceiptReconciliation(message, connectionEpoch);
 				try {
-					if (message.payload.actionId.startsWith('native:')) await this.#nativeRuntime.reconcileActionReceipt(message.agentId, message.payload);
-					else await this.#playerMemory.recordResult({ agentId: message.agentId, goalRevision: message.payload.goalRevision }, message.payload);
-					this.#memorySummaries.delete(message.agentId);
 					const current = this.#registry.get(message.agentId);
-					if (current === null || message.payload.goalRevision !== current.goalRevision) {
-						acknowledge = true;
+					if (current === null || message.payload.goalRevision !== current.goalRevision
+						|| !this.#isLifecycleGenerationCurrent(message.agentId, lifecycleGeneration)) {
 						return;
 					}
 					const record = this.#registry.assertCurrentRevision(message.agentId, message.payload.goalRevision);
 					this.#ledger(record.agentId).ingest('action_result', message.payload);
 					if (this.#usesNativeTools(record) && this.#nativeRuntime.onActionResult(record, message.payload)) {
-						acknowledge = true;
 						this.emit('actionResult', message);
 						return;
 					}
 					if (this.#usesNativeTools(record) && this.#nativeRuntime.isActionResultStale(record, message.payload)) {
-						acknowledge = true;
 						return;
 					}
 					if (!await this.#programRuntime.onActionResult(record, message.payload)) {
 						if (this.#programRuntime.isActionResultStale(record, message.payload)) {
-							acknowledge = true;
 							return;
 						}
 						throw new ProtocolV2Error('UNEXPECTED_ACTION_RESULT', `Agent '${message.agentId}' has no outstanding program action`);
 					}
-					acknowledge = true;
 					this.emit('actionResult', message);
 				} finally {
-					if (acknowledge) await this.#acknowledgeActionResult(message, connectionEpoch);
+					this.#reconcileReceipt(receipt);
 				}
-			}, { connectionEpoch, terminal: true, terminalKey: JSON.stringify(message.payload) });
+			}, { connectionEpoch, terminal: true });
 		});
 		this.#listen('goal_completion_result', (message, connectionEpoch) => {
 			return this.#enqueueAgent(message.agentId, async () => {
@@ -1026,6 +1064,7 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#inspections.cancel(undefined, 'BRIDGE_DISCONNECTED');
 			void this.#playerMemory.markUnknown(undefined, 'BRIDGE_DISCONNECTED').catch((error) => this.#emitRuntimeError(error));
 			this.#connected = false;
+			this.#retireReceiptReconciliations();
             for(const requestId of this.#directorRequests) this.#scheduler.cancel(`director-${requestId}`, 'Director connection closed');
 			this.#setVerboseEnabled(false);
 			this.#cancelGoalSpecRequests();
@@ -1202,6 +1241,7 @@ export class DynamicCoordinator extends EventEmitter {
 			connectionEpoch = supplied;
 		}
 		if (connectionEpoch <= this.#connectionEpoch) return null;
+		this.#retireReceiptReconciliations();
 		this.#inspections.cancel(undefined, 'STALE_CONNECTION_EPOCH');
 		this.#memorySummaries.clear();
 		if (this.#connectionEpoch > 0) {
@@ -1424,7 +1464,7 @@ export class DynamicCoordinator extends EventEmitter {
 			promise: null,
 			supervisionKey,
 			supervisionToken: this.#goalSupervisor.begin(supervisionKey, 'provider', { timeoutMs: Math.min(MAX_LEASE_TIMEOUT_MS, this.#planner.getExecutionSettings?.(record.agentId)?.limits?.nativeTurnBudgetMs ?? MAX_LEASE_TIMEOUT_MS) }),
-			toolSupervisionToken: null,
+			toolSupervision: new Map(),
 			successfulChat: false,
 			expired: false,
 		};
@@ -1623,14 +1663,24 @@ export class DynamicCoordinator extends EventEmitter {
 			|| toolRequest.tool.kind === 'start_action'
 			|| toolRequest.tool.kind === 'replace_action';
 		const supervisionKind = executesBody ? 'action' : toolRequest.tool.kind === 'finish' ? 'completion' : null;
+		if (work.toolSupervision.has(toolRequest.callId)) throw codedRuntimeError('DUPLICATE_TOOL_CALL', 'A tool call with this callId is already running');
+		const call = { token: null, executesBody, done: null, resolve: null };
+		call.done = new Promise((resolve) => { call.resolve = resolve; });
+		const finishPredecessors = toolRequest.tool.kind === 'finish' ? [...work.toolSupervision.values()].map((pending) => pending.done) : [];
+		work.toolSupervision.set(toolRequest.callId, call);
 		let supervisionToken = null;
 		let result;
 		try {
+			if (finishPredecessors.length > 0) {
+				await Promise.all(finishPredecessors);
+				if (work.expired || !this.#isConnectionEpochCurrent(work.connectionEpoch)
+					|| !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) return { state: 'CANCELLED', reasonCode: 'STALE_PLAN', executed: false };
+			}
 			if (executesBody && record.state === DynamicAgentState.PLANNING) {
 				this.#registry.setState(record.agentId, DynamicAgentState.ACTING, { goalRevision: record.goalRevision });
 			}
 			supervisionToken = supervisionKind === null ? null : this.#goalSupervisor.begin(work.supervisionKey, supervisionKind);
-			work.toolSupervisionToken = supervisionToken;
+			call.token = supervisionToken;
 			this.#goalSupervisor.progress(work.supervisionToken);
 			result = await this.#nativeRuntime.execute(toolRequest, record, { lifecycleGeneration: work.lifecycleGeneration });
 			if (toolRequest.tool.kind === 'action' && toolRequest.tool.actionType === 'chat' && result?.state === 'SUCCEEDED') work.successfulChat = true;
@@ -1654,10 +1704,12 @@ export class DynamicCoordinator extends EventEmitter {
 			if (supervisionToken !== null) {
 				this.#goalSupervisor.end(supervisionToken, { progress: ['SUCCEEDED', 'COMPLETED'].includes(result?.state) });
 			}
-			if (work.toolSupervisionToken === supervisionToken) work.toolSupervisionToken = null;
+			if (work.toolSupervision.get(toolRequest.callId) === call) work.toolSupervision.delete(toolRequest.callId);
+			call.resolve();
 			this.#goalSupervisor.progress(work.supervisionToken);
 			const latest = this.#registry.get(work.agentId);
 			if (!this.#stopping && !this.#closed && executesBody && latest?.goalRevision === work.goalRevision && latest.state === DynamicAgentState.ACTING
+				&& ![...work.toolSupervision.values()].some((pending) => pending.executesBody)
 				&& this.#isConnectionEpochCurrent(work.connectionEpoch)
 				&& this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) {
 				this.#registry.setState(latest.agentId, DynamicAgentState.PLANNING, { goalRevision: latest.goalRevision });
@@ -1666,6 +1718,7 @@ export class DynamicCoordinator extends EventEmitter {
 	}
 
 	async #completeNativeTurn(work, result) {
+		await Promise.all([...work.toolSupervision.values()].map((call) => call.done));
 		await this.#settleNativeSteering(work);
 		if (this.#providerWork.get(work.agentId) !== work) {
 			this.#goalSupervisor.end(work.supervisionToken, { scheduleRecovery: false });
@@ -2143,6 +2196,7 @@ export class DynamicCoordinator extends EventEmitter {
 	}
 
 	#advanceLifecycleGeneration(agentId) {
+		this.#latestActionDispatches.delete(agentId);
 		// Release unacknowledged reservations before a replacement consumes them.
 		// Late callbacks have no reservation identity left to commit or rewind.
 		const work = this.#providerWork.get(agentId);
@@ -2332,22 +2386,118 @@ export class DynamicCoordinator extends EventEmitter {
 	}
 
 	async #acknowledgeActionResult(message, connectionEpoch) {
-		try {
-			if (typeof this.#bridge.acknowledgeActionResult === 'function') {
-				await this.#bridge.acknowledgeActionResult(message.agentId, message.payload, { connectionEpoch });
-			}
-		} catch {
-			// The retained Minecraft result is replayed after reconnect when this ack is lost.
+		if (typeof this.#bridge.acknowledgeActionResult === 'function') {
+			await this.#bridge.acknowledgeActionResult(message.agentId, message.payload, { connectionEpoch });
 		}
+	}
+
+	#queueReceiptReconciliation(message, connectionEpoch) {
+		const key = JSON.stringify([connectionEpoch, message.agentId, message.payload]);
+		const existing = this.#receiptReconciliations.get(key);
+		if (existing !== undefined) return existing;
+		// Separate capacity from gameplay ingress: a stalled disk must not consume
+		// every observation/control slot. Overflow remains unacknowledged upstream.
+		const agentPending = [...this.#receiptReconciliations.values()].filter((entry) => entry.message.agentId === message.agentId).length;
+		if (this.#receiptReconciliations.size >= this.#connectionOperationCap || agentPending >= this.#agentOperationCap) {
+			this.#emitRuntimeError(codedRuntimeError('RECEIPT_BACKPRESSURE', 'Receipt reconciliation is full; server must retain this unacknowledged result'));
+			return null;
+		}
+		const predecessor = [...this.#receiptReconciliations.values()].findLast((entry) => entry.message.agentId === message.agentId && entry.connectionEpoch === connectionEpoch);
+		const receipt = { key, message: { agentId: message.agentId, payload: structuredClone(message.payload) }, connectionEpoch, pending: null, retry: null, failures: 0, durable: false, done: null, resolve: null, predecessor: predecessor?.done };
+		receipt.done = new Promise((resolve) => { receipt.resolve = resolve; });
+		this.#receiptReconciliations.set(key, receipt);
+		return receipt;
+	}
+
+	#retireReceiptReconciliations() {
+		for (const receipt of this.#receiptReconciliations.values()) {
+			clearTimeout(receipt.retry);
+			receipt.resolve();
+			// In-flight I/O remains tracked for bounded shutdown until it settles.
+			if (receipt.pending === null) this.#receiptReconciliations.delete(receipt.key);
+		}
+	}
+
+	#reconcileReceipt(receipt) {
+		if (receipt === null || receipt.pending !== null || receipt.retry !== null || this.#stopping || this.#closed) return;
+		const { message, connectionEpoch } = receipt;
+		if (!this.#isConnectionEpochCurrent(connectionEpoch)) {
+			this.#receiptReconciliations.delete(receipt.key);
+			receipt.resolve();
+			return;
+		}
+		receipt.pending = Promise.resolve().then(async () => {
+			await receipt.predecessor;
+			if (this.#stopping || this.#closed || !this.#isConnectionEpochCurrent(connectionEpoch)) {
+				this.#receiptReconciliations.delete(receipt.key);
+				receipt.resolve();
+				return;
+			}
+			if (!receipt.durable) {
+				if (message.payload.actionType !== undefined) {
+					const dispatch = await this.#playerMemory.notebook.findReceipt(message.agentId, { actionId: message.payload.actionId });
+					if (dispatch?.actionType !== message.payload.actionType) throw codedRuntimeError('UNCORRELATED_ACTION_RECEIPT', 'Terminal action type does not match its durable dispatch; withholding ACK');
+				}
+				const stored = await this.#playerMemory.recordResult({ agentId: message.agentId, goalRevision: message.payload.goalRevision }, message.payload);
+				if (stored !== true) throw codedRuntimeError('UNCORRELATED_ACTION_RECEIPT', 'No authoritative dispatch matches the terminal receipt; withholding ACK');
+				receipt.durable = true;
+				if (this.#isConnectionEpochCurrent(connectionEpoch)) this.#memorySummaries.delete(message.agentId);
+			}
+			if (!this.#stopping && !this.#closed && this.#isConnectionEpochCurrent(connectionEpoch)) await this.#acknowledgeActionResult(message, connectionEpoch);
+			this.#receiptReconciliations.delete(receipt.key);
+			receipt.resolve();
+		}).catch((error) => {
+			if (error?.code === 'UNCORRELATED_ACTION_RECEIPT' || ['RECEIPT_CONFLICT', 'RECEIPT_WORLD_REQUIRED'].includes(error?.message)) {
+				// Missing or conflicting durable authority cannot be repaired by retrying
+				// this payload. Leave it unacknowledged on the server, but release the
+				// local queue so later, correctly correlated receipts can be persisted.
+				this.#emitRuntimeError(error);
+				this.#receiptReconciliations.delete(receipt.key);
+				receipt.resolve();
+				return;
+			}
+			// Storage errors are operational evidence, not failed gameplay. Keep the
+			// exact receipt and retry without cancelling already-authorized work.
+			receipt.failures++;
+			this.#emitRuntimeError(error);
+			if (!this.#stopping && !this.#closed && this.#isConnectionEpochCurrent(connectionEpoch)) {
+				receipt.retry = setTimeout(() => { receipt.retry = null; this.#reconcileReceipt(receipt); }, Math.min(5_000, 100 * 2 ** Math.min(receipt.failures - 1, 6)));
+				receipt.retry.unref?.();
+			} else { this.#receiptReconciliations.delete(receipt.key); receipt.resolve(); }
+		}).finally(() => { receipt.pending = null; });
 	}
 
 	async #sendRuntimeMessage(kind, type, agentId, payload) {
 		const epochs = kind === 'native' ? this.#nativeRuntimeEpochs : this.#programRuntimeEpochs;
 		const connectionEpoch = epochs.get(agentId);
 		if (type === 'action_cancel' && !this.#isConnectionEpochCurrent(connectionEpoch)) return null;
+		if (type === 'action_command' && this.#isConnectionEpochCurrent(connectionEpoch)) {
+			// Both execution modes pass here. One latest dispatch per agent is enough
+			// for active correlation; historical receipts still use durable authority.
+			this.#latestActionDispatches.set(agentId, { actionId: payload.actionId, goalRevision: payload.goalRevision, actionType: payload.actionType, connectionEpoch });
+		}
 		if (kind === 'program' && type === 'action_command') {
 			if (!this.#isConnectionEpochCurrent(connectionEpoch)) throw Object.assign(new Error('Action belongs to an obsolete connection'), { code: 'STALE_SESSION' });
 			await this.#playerMemory.recordDispatch(this.#registry.assertCurrentRevision(agentId, payload.goalRevision), payload);
+		}
+		if (kind === 'native' && type === 'action_command') {
+			if (!this.#isConnectionEpochCurrent(connectionEpoch)) throw codedRuntimeError('STALE_SESSION', 'Action belongs to an obsolete connection');
+			const record = this.#registry.assertCurrentRevision(agentId, payload.goalRevision);
+			if (!this.#nativeRuntime.hasCurrent(record)) {
+				const lifecycleGeneration = this.#lifecycleGeneration(agentId);
+				// Conversation replies can precede the first world observation. Retain
+				// their exact dispatch in a durable transport-session scope. The
+				// ephemeral "session:" notebook namespace intentionally never reaches
+				// disk; this separate scope is not an observed world or model memory.
+				await this.#playerMemory.notebook.recordDispatch(agentId, {
+					worldId: `dispatch-session:${this.#playerMemory.sessionId}`,
+					actionId: payload.actionId, goalRevision: payload.goalRevision,
+					actionType: payload.actionType, arguments: payload.arguments,
+				});
+				if (!this.#isLifecycleGenerationCurrent(agentId, lifecycleGeneration)
+					|| this.#nativeRuntime.isActionResultStale(record, payload)) throw codedRuntimeError('STALE_PLAN', 'Native action lifecycle ended before bridge send');
+				this.#registry.assertCurrentRevision(agentId, payload.goalRevision);
+			}
 		}
 		return this.#sendForEpoch(connectionEpoch, type, agentId, payload);
 	}
@@ -4515,18 +4665,21 @@ function retainedEventCoverage(coverage, retainedCounts) {
 	}));
 }
 
-const COMPACT_EVENT_ROW_FIELDS = ['uuid', 'stableId', 'type', 'name', 'position', 'x', 'y', 'z', 'distance', 'blockId', 'itemId', 'count', 'slot', 'tags', 'velocity', 'bounds', 'pickable', 'parentId', 'partName', 'state', 'bearing', 'elevation', 'id', 'feasible', 'moveTo', 'reason', 'cause', 'hazard'];
+const COMPACT_EVENT_ROW_FIELDS = ['uuid', 'stableId', 'type', 'name', 'position', 'x', 'y', 'z', 'distance', 'blockId', 'itemId', 'count', 'slot', 'tags', 'velocity', 'bounds', 'pickable', 'parentId', 'partName', 'state', 'bearing', 'elevation', 'id', 'feasible', 'moveTo', 'reason', 'cause', 'hazard', 'damage', 'maxDamage', 'fingerprint', 'hotbar', 'displayName', 'maxStackSize', 'hostile', 'alive', 'health', 'maxHealth', 'withinInteractionRange', 'capabilities'];
 
 function compactEventRows(value) {
 	return asArray(value).map((entry) => {
 		if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return entry;
 		const compact = Object.fromEntries(COMPACT_EVENT_ROW_FIELDS.filter((field) => entry[field] !== undefined).map((field) => [field, entry[field]]));
-		return Object.keys(compact).length === 0 ? entry : compact;
+		if (Object.keys(compact).length === 0) return entry;
+		const omittedFields = [...new Set([...(entry.omittedFields ?? []), ...Object.keys(entry).filter((field) => field !== 'omittedFields' && !COMPACT_EVENT_ROW_FIELDS.includes(field))])];
+		return omittedFields.length === 0 ? compact : { ...compact, omittedFields };
 	});
 }
 
 function isHazardousEventFact(value) {
 	if (value === null || typeof value !== 'object') return false;
+	if (value.hostile === true && value.alive !== false) return true;
 	const text = ['blockId', 'itemId', 'type', 'name', 'reason', 'cause', 'hazard'].map((field) => value[field]).filter((field) => typeof field === 'string').join(' ');
 	return /lava|fire|magma|cactus|campfire|tnt|creeper|ghast|blaze|wither|warden|dragon|hostile/i.test(text);
 }

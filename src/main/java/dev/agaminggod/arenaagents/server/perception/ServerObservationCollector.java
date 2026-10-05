@@ -376,6 +376,12 @@ public final class ServerObservationCollector {
 		spatialKeys.remove(agentId);
 		spatialCache.invalidateMatching(key -> key.agentId().equals(agentId));
 		landmarkCache.invalidateMatching(key -> key.agentId().equals(agentId));
+		invalidatePlayerState(agentId);
+	}
+
+	/** Terrain freshness follows position, view context and world mutations, not action completion. */
+	public void invalidatePlayerState(AgentId agentId) {
+		Objects.requireNonNull(agentId, "agentId must not be null");
 		synchronized (lastRawStates) {
 			lastRawStates.remove(agentId);
 			lastInventories.remove(agentId);

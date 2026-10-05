@@ -396,8 +396,8 @@ test('native Minecraft tool calls normalize to exact existing body actions', () 
 	assert.deepEqual(normalizeMinecraftToolCall('mine', { x: 2, y: 63, z: 4, expectedBlockId: 'minecraft:stone' }), {
 		kind: 'action', actionType: 'break_block', arguments: { x: 2, y: 63, z: 4, expectedBlockId: 'minecraft:stone', timeoutMs: 15_000 },
 	});
-	assert.deepEqual(normalizeMinecraftToolCall('say', { message: 'hi', recipientId: 'agent-b' }), {
-		kind: 'action', actionType: 'chat', arguments: { message: 'hi', audience: 'direct', recipientId: 'agent-b' },
+	assert.deepEqual(normalizeMinecraftToolCall('say', { message: 'hi', recipientId: '550e8400-e29b-41d4-a716-446655440000' }), {
+		kind: 'action', actionType: 'chat', arguments: { message: 'hi', audience: 'direct', recipientId: '550e8400-e29b-41d4-a716-446655440000' },
 	});
 	assert.deepEqual(normalizeMinecraftToolCall('say', { message: 'On it.', audience: 'proximity' }), {
 		kind: 'action', actionType: 'chat', arguments: { message: 'On it.', audience: 'proximity' },

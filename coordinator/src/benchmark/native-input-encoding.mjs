@@ -158,7 +158,7 @@ export function summarizeMeasurements(measured, tokenCounts = null) {
 export function analyzeObservationChanges({ replies, ModelObservationViews, encode, decode }) {
 	const views = new ModelObservationViews();
 	const raw = [], compact = [];
-	let baselineId = null, baselineObservation = null, fullReplies = 0, changeReplies = 0;
+	let baselineId = null, baselineObservation = null, baselineMetadata = null, fullReplies = 0, changeReplies = 0;
 	for (const { index, value } of replies) {
 		if (!Object.hasOwn(value, 'goalSpec') || value.observation === null || typeof value.observation !== 'object') continue;
 		const original = jsonValue(value);
@@ -182,6 +182,10 @@ export function analyzeObservationChanges({ replies, ModelObservationViews, enco
 			}
 		}
 		const { observationView: _view, ...metadata } = presented;
+		for (const name of view.retainMetadata ?? []) {
+			assert.ok(baselineMetadata !== null && Object.hasOwn(baselineMetadata, name), `retained metadata ${name} exists in exact baseline`);
+			metadata[name] = structuredClone(baselineMetadata[name]);
+		}
 		assert.deepEqual({ ...metadata, observation: reconstructedObservation }, original, `optional changes reconstruction at ${index}`);
 		const encoded = encode(presented);
 		assert.deepEqual(decode(encoded), presented, `optional changes encoding at ${index}`);
@@ -194,6 +198,7 @@ export function analyzeObservationChanges({ replies, ModelObservationViews, enco
 		prepared.commit();
 		baselineId = view.id;
 		baselineObservation = reconstructedObservation;
+		baselineMetadata = metadata;
 	}
 	return { raw, compact, fullReplies, changeReplies };
 }

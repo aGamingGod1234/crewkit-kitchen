@@ -13,6 +13,7 @@ const AUTHOR_IDS = ['programId', 'sourceStepId', 'turnId', 'callId'];
 export class RuntimeMemoryContext {
 	#notebook; #sessionId; #contexts = new Map(); #dispatches = new Map();
 	#tasks; #taskPending = new Map(); #taskContexts = new Map();
+	#lookupScopes = new Map();
 	constructor({ notebook = new ModelNotebook(), taskMemory = new TaskMemoryStore(), sessionId = randomUUID() } = {}) {
 		for (const method of ['writeNote', 'query', 'recordDispatch', 'recordUnknown', 'recordReceipt', 'findReceipt']) {
 			if (typeof notebook?.[method] !== 'function') throw new TypeError(`notebook.${method} is required`);
@@ -39,6 +40,7 @@ export class RuntimeMemoryContext {
 			...(typeof dimension === 'string' ? { dimension: boundedText(dimension, 'dimension', 128) } : {}),
 			...(Number.isSafeInteger(source.worldTick) && source.worldTick >= 0 ? { tick: source.worldTick } : {}),
 		};
+		if (previous?.goalRevision !== goalRevision || previous?.worldId !== worldId || previous?.dimension !== context.dimension) this.#lookupScopes.set(agentId, {});
 		this.#contexts.set(agentId, context);
 		if (!worldId.startsWith('session:') && context.dimension !== undefined) {
 			const scope = { agentId, ...context };
@@ -70,7 +72,7 @@ export class RuntimeMemoryContext {
 		const context = this.#contexts.get(agentId);
 		return context?.goalRevision === goalRevision ? context.worldId : null;
 	}
-	forget(agentId) { this.#contexts.delete(boundedText(agentId, 'agentId', 256)); this.#taskContexts.delete(agentId); }
+	forget(agentId) { this.#contexts.delete(boundedText(agentId, 'agentId', 256)); this.#taskContexts.delete(agentId); this.#lookupScopes.delete(agentId); }
 	unresolved(record, page = {}) { return this.execute(record, { operation: 'query', arguments: { ...ownRecord(page, 'memory page'), kind: 'unresolved' } }); }
 
 	async execute(record, request) {
@@ -89,8 +91,33 @@ export class RuntimeMemoryContext {
 			await this.taskContext(record);
 			return { state: 'SUCCEEDED', reasonCode: 'TASK_MEMORY_WRITTEN', entry };
 		}
-		if (!['write', 'query'].includes(source.operation)) throw codedError('INVALID_MEMORY_OPERATION', 'Memory operation must be write or query');
+		if (!['write', 'query', 'find_note'].includes(source.operation)) throw codedError('INVALID_MEMORY_OPERATION', 'Memory operation must be write, query, or find_note');
 		const normalized = normalizeMinecraftToolCall(source.operation === 'write' ? 'notebook' : 'queryMemory', source.arguments);
+		if (source.operation === 'find_note') {
+			// Internal exact lookup uses query-shaped arguments for legacy adapters.
+			// Identity comes only from the observed context, never request arguments.
+			const key = boundedText(normalized.text, 'key', 128);
+			if (normalized.memoryKind !== 'notes') throw codedError('INVALID_MEMORY_OPERATION', 'Exact lookup requires notes');
+			const scope = this.#lookupScopes.get(agentId);
+			const check = () => {
+				if (record.goalRevision !== goalRevision || this.#lookupScopes.get(agentId) !== scope) throw codedError('STALE_GOAL', 'Note lookup belongs to an obsolete goal or world');
+			};
+			let note;
+			if (typeof this.#notebook.findNote === 'function') {
+				note = await this.#notebook.findNote(agentId, { worldId, key });
+				check();
+			} else {
+				let offset = 0;
+				for (;;) {
+					const page = await this.#notebook.query(agentId, { worldId, kind: 'notes', text: key, offset, limit: 64 });
+					check();
+					note = page.entries?.find(entry => entry.key === key && (entry.worldId === undefined || entry.worldId === worldId));
+					if (note || !Number.isSafeInteger(page.nextOffset) || page.nextOffset <= offset) break;
+					offset = page.nextOffset;
+				}
+			}
+			return { state: 'SUCCEEDED', reasonCode: 'NOTE_LOOKED_UP', note: note?.key === key && (note.worldId === undefined || note.worldId === worldId) ? note : null };
+		}
 		if (source.operation === 'write') {
 			const provenance = noteAuthor(record, source.provenance);
 			const note = await this.#notebook.writeNote(agentId, { worldId, goalRevision, key: normalized.key, text: normalized.text, provenance });

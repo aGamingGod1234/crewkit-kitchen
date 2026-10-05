@@ -964,7 +964,7 @@ test('idle native agents answer direct conversation without creating a physical 
 			goalRevision: request.goalRevision,
 			turnId: 'turn-idle-conversation',
 			callId: 'call-idle-conversation',
-			tool: { kind: 'action', actionType: 'chat', arguments: { message: 'Hi!', audience: 'direct', recipientId: 'player-a' } },
+			tool: { kind: 'action', actionType: 'chat', arguments: { message: 'Hi!', audience: 'direct', recipientId: '11111111-1111-4111-8111-111111111111' } },
 		});
 		assert.equal(result.state, 'SUCCEEDED');
 		return { status: 'completed', toolCalls: 1 };
@@ -976,7 +976,7 @@ test('idle native agents answer direct conversation without creating a physical 
 	});
 	try {
 		run.bridge.emit('conversation_event', { agentId: 'agent-a', payload: {
-			sequence: 1, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
+			sequence: 1, kind: 'player_message', sourceId: '11111111-1111-4111-8111-111111111111', recipientId: 'agent-a', scope: 'direct',
 			text: 'Hi', goalRevision: 0, observedAtEpochMs: 10,
 		} });
 		await eventually(() => run.bridge.sent.some((message) => message.payload?.actionType === 'chat'));

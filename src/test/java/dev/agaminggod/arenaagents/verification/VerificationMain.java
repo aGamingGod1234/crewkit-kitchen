@@ -208,6 +208,8 @@ public final class VerificationMain {
 		passedAssertions += ServerObservationInventorySnapshotVerification.verify();
 		passedAssertions += ObservationBudgetVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.world.WorldMutationRevisionsVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.world.LandmarkMutationLocalityVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.perception.TerminalObservationCacheVerification.verify();
 		passedAssertions += ServerObservationRayTargetVerification.verify();
 		passedAssertions += ServerObservationWireBudgetVerification.verify();
 		passedAssertions += ActionProgressTrackerVerification.verify();
@@ -225,6 +227,7 @@ public final class VerificationMain {
 		passedAssertions += dev.agaminggod.arenaagents.server.perception.ObservationPageVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.perception.PlayerObservationEventsVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.runtime.input.RidingJumpInputVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.runtime.input.UseTickPhaseVerification.verify();
 		passedAssertions += ActionSuccessLedgerVerification.verify();
 		passedAssertions += InputStateVerification.verify();
 		passedAssertions += AttentionHazardVerification.verify();
@@ -256,6 +259,10 @@ public final class VerificationMain {
 		passedAssertions += ScenarioSetupLayoutVerification.verify();
 		passedAssertions += BridgeEnvelopeCodecVerification.verify();
 		passedAssertions += BoundedServerTaskQueueVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.bridge.ActionAcknowledgementRetryVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.bridge.BridgeAcknowledgementTickVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.bridge.ServerTaskPhaseVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.bridge.TerminalReplayFairnessVerification.verify();
 		passedAssertions += ProgramActionLedgerVerification.verify();
 		passedAssertions += TerminalResultLedgerVerification.verify();
 		passedAssertions += CoordinatorStatusVerification.verify();

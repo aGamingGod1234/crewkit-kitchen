@@ -93,7 +93,9 @@ async function runCase({ name, hazard = null, combined = true, reassessFalse = f
       else assert.equal(latest.observation.player[field], value);
     }
     assert.equal(latest.eventSequence, 3);
-    const urgentExpected = !!hazard && !watcher;
+    // A default-continue interrupt containing only a wait is not an explicit
+    // defensive reconsideration handler. Its edge cannot hide survival attention.
+    const urgentExpected = !!hazard;
     assert.equal(cancellations, watcher || urgentExpected ? 1 : 0, `${name}: cancellation result`);
     assert.equal(attentionEvents.length, urgentExpected ? 1 : 0, `${name}: program attention notification`);
     if (urgentExpected) {
@@ -123,7 +125,7 @@ for (const hazard of hazards) {
       test(name, () => runCase({ name, hazard, reassessFalse, combined }));
     }
   }
-  test(`${hazard.path}-authored-watcher-control`, () => runCase({ name: hazard.path, hazard, watcher: true }));
+  test(`${hazard.path}-default-continue-watcher-keeps-survival-attention`, () => runCase({ name: hazard.path, hazard, watcher: true }));
 }
 test('air-latest-delta-preserved-control', () => runCase({ name: 'repeated air', hazard: hazards[0], repeatedDelta: true }));
 test('health-comparison-control', () => runCase({ name: 'health', hazard: { path: 'player.health', player: { health: 19 }, trigger: 'damage' } }));

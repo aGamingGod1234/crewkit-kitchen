@@ -178,6 +178,11 @@ export class NativeToolRuntime {
 		const storedObservation = structuredClone(raw);
 		this.#memoryObservation?.(record, storedObservation);
 		const program = this.#programRuns.get(record.agentId);
+		// Remember invalidation even if the player returns before storage resolves.
+		const lookupWorld = program?.noteLookupWorld;
+		if (lookupWorld != null && (record.goalRevision !== program.goalRevision
+			|| observationWorldId(storedObservation) !== lookupWorld.worldId || storedObservation.world?.dimension !== lookupWorld.dimension
+			|| storedObservation.ready === false || storedObservation.death != null || storedObservation.status === 'PLAYER_DEAD' || storedObservation.player?.dead === true)) program.noteLookupInvalidated = true;
 		const successor = program?.pendingSuccessor ?? program?.handoff;
 		const queueWorld = successor?.world ?? program?.queueWorld;
 		if (queueWorld != null && (record.goalRevision !== program.goalRevision
@@ -464,15 +469,10 @@ export class NativeToolRuntime {
 		run.queueWorld = world;
 		let source = tool.source;
 		if (tool.noteKey !== undefined) {
-			let offset = 0;
-			for (;;) {
-				const page = await this.#programMemory(request, record, { operation: 'query', arguments: { kind: 'notes', text: tool.noteKey, offset, limit: 64 } });
-				this.#assertQueueAuthority(record, tool, run);
-				const note = page.entries?.find(entry => entry.key === tool.noteKey);
-				if (note) { source = note.text; break; }
-				if (!Number.isSafeInteger(page.nextOffset) || page.nextOffset <= offset) throw codedError('PROGRAM_NOTE_NOT_FOUND', 'No saved program exists at that exact notebook key');
-				offset = page.nextOffset;
-			}
+			source = (await this.#findProgramNote(request, record, tool.noteKey, () => {
+				const current = this.#assertQueueAuthority(record, tool, run);
+				if (run.queueAdmission !== admission || current.worldId !== world.worldId || current.dimension !== world.dimension) throw codedError('STALE_PROGRAM', 'Successor preparation was superseded or its world changed');
+			})).text;
 		}
 		// Compile before replacing an existing queue, and freeze the resolved source.
 		parseArenaScript(source);
@@ -537,12 +537,21 @@ export class NativeToolRuntime {
 	async #startSuccessor(previous, run, successor) {
 		const record = run.record;
 		try {
+			this.#assertCurrent(record);
+			if (run.settled || this.#programRuns.get(record.agentId) !== run || run.epoch !== this.#executionEpoch(record.agentId)) throw codedError('STALE_PROGRAM', 'Successor lost execution authority');
+			if (previous.handoffInvalidated || !sameProgramWorld(this.#observations.get(record.agentId)?.observation, successor.world)) throw codedError('SUCCESSOR_CONTEXT_CHANGED', 'Successor world or live player changed');
 			const before = this.#observations.get(record.agentId)?.eventSequence ?? 0;
-			const facts = await this.#observe(record, { includeMetadata: false });
+			const proof = previous.postResultSample;
+			// Reuse only the exact raw snapshot consumed after the final action result.
+			// A later observation or action invalidates this proof, even in the same world.
+			const reuse = proof !== undefined && proof.result === previous.lastActionResult
+				&& proof.snapshot === this.#observations.get(record.agentId)
+				&& previous.epoch === run.epoch && proof.snapshot.goalRevision === record.goalRevision;
+			const facts = reuse ? null : await this.#observe(record, { includeMetadata: false });
 			const latest = this.#observations.get(record.agentId);
 			this.#assertCurrent(record);
 			if (run.settled || this.#programRuns.get(record.agentId) !== run || run.epoch !== this.#executionEpoch(record.agentId)) throw codedError('STALE_PROGRAM', 'Successor lost execution authority');
-			if (facts.freshness.fresh !== true || latest?.goalRevision !== record.goalRevision || latest.eventSequence <= before) throw codedError('FRESH_OBSERVATION_REQUIRED', 'Successor needs a new authoritative sample after predecessor completion');
+			if (latest?.goalRevision !== record.goalRevision || (!reuse && (facts.freshness.fresh !== true || latest.eventSequence <= before))) throw codedError('FRESH_OBSERVATION_REQUIRED', 'Successor needs a new authoritative sample after predecessor completion');
 			if (run.handoffInvalidated || !sameProgramWorld(latest.observation, successor.world)) throw codedError('SUCCESSOR_CONTEXT_CHANGED', 'Successor world or live player changed');
 			if ((latest.observation.continuity?.rememberedSections?.length ?? 0) > 0) throw codedError('FRESH_OBSERVATION_REQUIRED', 'Successor prerequisites cannot use remembered sections');
 			// Use the raw authoritative snapshot, never decorated remembered facts.
@@ -620,22 +629,15 @@ export class NativeToolRuntime {
 		const { epoch } = run;
 		let source = request.tool.source;
 		if (request.tool.noteKey !== undefined) {
-			let note;
-			let offset = 0;
-			do {
-				const page = await this.#programMemory(request, record, { operation: 'query', arguments: { kind: 'notes', text: request.tool.noteKey, offset, limit: 64 } });
+			run.noteLookupWorld = { worldId: this.#worldId(record), dimension: this.#observations.get(record.agentId)?.observation.world?.dimension };
+			source = (await this.#findProgramNote(request, record, request.tool.noteKey, () => {
 				this.#assertCurrent(record);
-				if (epoch !== this.#executionEpoch(record.agentId) || this.#programRuns.get(record.agentId) !== run) throw codedError('NATIVE_PROGRAM_CANCELLED', 'Saved program lookup outlived its execution authority');
-				note = page.entries?.find((entry) => entry.key === request.tool.noteKey);
-				const nextOffset = page.nextOffset;
-				if (note || nextOffset === null || !Number.isSafeInteger(nextOffset) || nextOffset <= offset) break;
-				offset = nextOffset;
-			} while (note === undefined);
-			if (!note) throw codedError('PROGRAM_NOTE_NOT_FOUND', 'No saved program exists at that exact notebook key');
-			source = note.text;
+				if (run.settled || run.noteLookupInvalidated || epoch !== this.#executionEpoch(record.agentId) || this.#programRuns.get(record.agentId) !== run) throw codedError('NATIVE_PROGRAM_CANCELLED', 'Saved program lookup outlived its execution authority');
+			})).text;
+			run.noteLookupWorld = null;
 		}
 		this.#assertCurrent(record);
-		if (epoch !== this.#executionEpoch(record.agentId) || this.#programRuns.get(record.agentId) !== run) throw codedError('NATIVE_PROGRAM_CANCELLED', 'Saved program lookup outlived its execution authority');
+		if (run.settled || run.noteLookupInvalidated || epoch !== this.#executionEpoch(record.agentId) || this.#programRuns.get(record.agentId) !== run) throw codedError('NATIVE_PROGRAM_CANCELLED', 'Saved program lookup outlived its execution authority');
 		if (this.#actions.has(record.agentId) || this.#completions.has(record.agentId)) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'An action or completion verification already owns this player');
 		const latest = this.#observations.get(record.agentId);
 		if (latest?.goalRevision !== record.goalRevision) throw codedError('CURRENT_OBSERVATION_REQUIRED', 'A current player observation is required before running a program');
@@ -673,8 +675,11 @@ export class NativeToolRuntime {
 			observation: structuredClone(latest.observation), eventSequence: latest.eventSequence,
 			executeAction: async (command) => {
 				if (this.#programRuns.get(record.agentId) !== run || this.#executionEpoch(record.agentId) !== run.epoch) throw codedError('NATIVE_PROGRAM_CANCELLED', 'Program no longer has execution authority');
+				run.postResultSample = undefined;
+				run.lastActionResult = null;
 				const result = await this.#executeAction(request, record, { kind: 'action', actionType: command.action.type, arguments: command.action.arguments }, null, true, command);
 				lastActionResult = result;
+				run.lastActionResult = result;
 				const receipt = this.#receipts.get(record.agentId)?.findLast((entry) => entry.engineActionId === command.actionId);
 				return { ...result, ...(receipt === undefined ? {} : { actionId: receipt.actionId }) };
 			},
@@ -690,10 +695,50 @@ export class NativeToolRuntime {
 				lastActionResult = null;
 				const facts = await this.#observe(record, { includeMetadata: false, afterResult });
 				if (facts.freshness.fresh !== true) throw codedError('FRESH_OBSERVATION_REQUIRED', 'Program continuation needs a new authoritative player observation');
+				const snapshot = this.#observations.get(record.agentId);
+				const pending = this.#postResultSamples.get(record.agentId);
+				if (afterResult !== null && afterResult === run.lastActionResult && pending?.result === afterResult
+					&& snapshot?.goalRevision === record.goalRevision && snapshot.eventSequence === facts.eventSequence
+					&& snapshot.eventSequence > pending.eventSequence && this.#executionEpoch(record.agentId) === run.epoch
+					&& this.#programRuns.get(record.agentId) === run) run.postResultSample = { result: afterResult, snapshot };
 				return { observation: facts.observation, eventSequence: facts.eventSequence };
 			},
 			memoryOperation: (operation) => this.#programMemory(request, record, operation),
 		});
+	}
+
+	async #findProgramNote(request, record, key, assertAuthority) {
+		const worldId = this.#worldId(record);
+		const check = () => {
+			assertAuthority();
+			if (this.#worldId(record) !== worldId) throw codedError('NATIVE_PROGRAM_CANCELLED', 'Saved program lookup outlived its world');
+		};
+		let page;
+		try {
+			// Query-shaped arguments let older injected memory adapters return their
+			// first page without a second read. find_note treats text as an exact key.
+			page = await this.#programMemory(request, record, { operation: 'find_note', arguments: { kind: 'notes', text: key, offset: 0, limit: 64 } });
+		} catch (error) {
+			check();
+			if (error?.code !== 'INVALID_MEMORY_OPERATION') throw error;
+		}
+		check();
+		const matches = note => note?.key === key && (note.worldId === undefined || note.worldId === worldId);
+		let note;
+		if (page != null && Object.hasOwn(page, 'note')) note = matches(page.note) ? page.note : null;
+		else {
+			let offset = 0;
+			for (;;) {
+				if (page === undefined) page = await this.#programMemory(request, record, { operation: 'query', arguments: { kind: 'notes', text: key, offset, limit: 64 } });
+				check();
+				note = page?.entries?.find(matches);
+				if (note || !Number.isSafeInteger(page?.nextOffset) || page.nextOffset <= offset) break;
+				offset = page.nextOffset;
+				page = undefined;
+			}
+		}
+		if (!note) throw codedError('PROGRAM_NOTE_NOT_FOUND', 'No saved program exists at that exact notebook key');
+		return note;
 	}
 
 	async #programMemory(request, record, operation) {
@@ -701,6 +746,9 @@ export class NativeToolRuntime {
 		if (this.#notebook === null) throw codedError('MEMORY_UNAVAILABLE', 'Durable agent memory is unavailable');
 		const worldId = this.#worldId(record);
 		if (worldId === null) throw codedError('WORLD_ID_REQUIRED', 'A current observed world identity is required for durable memory');
+		if (operation.operation === 'find_note' && typeof this.#notebook.findNote === 'function') {
+			return { state: 'SUCCEEDED', reasonCode: 'NOTE_LOOKED_UP', note: await this.#notebook.findNote(record.agentId, { worldId, key: operation.arguments.text }) };
+		}
 		const tool = normalizeMinecraftToolCall(operation.operation === 'write' ? 'notebook' : 'queryMemory', operation.arguments);
 		if (tool.kind === 'notebook') return { state: 'SUCCEEDED', reasonCode: 'NOTE_WRITTEN', note: await this.#notebook.writeNote(record.agentId, { worldId, key: tool.key, text: tool.text, goalRevision: record.goalRevision, provenance: operation.provenance ?? nativeMemoryProvenance(request, record) }) };
 		return { state: 'SUCCEEDED', reasonCode: 'MEMORY_QUERIED', ...await this.#notebook.query(record.agentId, { worldId, kind: tool.memoryKind, offset: tool.offset, limit: tool.limit, ...(tool.text === undefined ? {} : { text: tool.text }) }) };
@@ -774,14 +822,13 @@ export class NativeToolRuntime {
 			await this.#journal('recordUnknown', record.agentId, active, { reasonCode: 'CANCELLED_BEFORE_DISPATCH' });
 			return result;
 		}
+		let publication;
+		try { publication = Promise.resolve(this.#bridge.send('action_cancel', record.agentId, { goalRevision: active.goalRevision, actionId: active.actionId })); }
+		catch (error) { publication = Promise.reject(error); }
 		try {
-			await this.#bridge.send('action_cancel', record.agentId, { goalRevision: active.goalRevision, actionId: active.actionId });
-		} catch (error) {
-			active.cancelling = false;
-			throw error;
-		}
-		try {
-			return await withDeadline(active.result, 10_000, 'CANCEL_ACK_TIMEOUT', 'Cancellation has no authoritative acknowledgement; the action may still be running');
+			// Socket drain may lag the exact server receipt. Publication success alone
+			// cannot release physical authority; the deadline includes publication too.
+			return await withDeadline(Promise.race([active.result, publication.then(() => active.result)]), 10_000, 'CANCEL_ACK_TIMEOUT', 'Cancellation has no authoritative acknowledgement; the action may still be running');
 		} catch (error) {
 			active.cancelling = false;
 			active.cancellationUncertain = error?.code === 'CANCEL_ACK_TIMEOUT';
@@ -825,9 +872,14 @@ export class NativeToolRuntime {
 	}
 
 	async #exploreFrontier(request, record) {
+		const epoch = this.#executionEpoch(record.agentId);
 		const facts = await this.#observe(record, { includeMetadata: false });
-		await this.#flushSpatial(record.agentId);
-		return { ...this.#occupancy.candidates(record.agentId, facts.observation, request.tool.arguments ?? {}), freshness: facts.freshness };
+		this.#assertCurrent(record);
+		if (this.#executionEpoch(record.agentId) !== epoch) throw codedError('STALE_NATIVE_TOOL', 'Frontier request outlived its lifecycle');
+		// observe hydrates memory and ingests the new sample before candidates run.
+		const result = { ...this.#occupancy.candidates(record.agentId, facts.observation, request.tool.arguments ?? {}), freshness: facts.freshness };
+		this.#flushSpatial(record.agentId).catch((error) => this.#trace('native_spatial_memory_failed', { agentId: record.agentId, reasonCode: error?.code ?? 'MEMORY_WRITE_FAILED' }));
+		return result;
 	}
 
 	async #executeLookAround(request, record, tool, executionEpoch) {
@@ -1108,6 +1160,7 @@ export class NativeToolRuntime {
 
 	async dispose(agentId, reason = 'disposed') {
 		this.#executionEpochs.set(agentId, this.#executionEpoch(agentId) + 1);
+		this.#sequenceFinishReservations.delete(agentId);
 		const program = this.#programRuns.get(agentId);
 		program?.releaseWork();
 		if (program?.state === 'PREPARING') this.#settleProgram(agentId, program, { state: 'CANCELLED', reasonCode: 'NATIVE_PROGRAM_CANCELLED' }, codedError('NATIVE_PROGRAM_CANCELLED', 'Program preparation outlived its lifecycle'));
@@ -1170,6 +1223,7 @@ export class NativeToolRuntime {
 			...this.#completions.keys(),
 			...this.#programRuns.keys(),
 			...this.#sweeps.keys(),
+			...this.#sequenceFinishReservations.keys(),
 			...this.#lastLive.keys(),
 		]);
 		await Promise.allSettled([...agentIds].map((agentId) => this.dispose(agentId, reason)));

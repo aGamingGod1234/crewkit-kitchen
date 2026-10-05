@@ -118,12 +118,12 @@ test('persisted unknown receipts release dispatch capacity and retained receipts
 	}
 	assert.deepEqual(await memory.markUnknown(record.agentId), []);
 	const unresolved = await memory.unresolved(record);
-	assert.equal(unresolved.total, 128);
+	assert.equal(unresolved.total, 300);
 	assert.equal(unresolved.evictedReceipts, 172);
 	assert.equal(await memory.recordResult(record, { actionId: 'lost-action-299', goalRevision: 1,
 		state: 'SUCCEEDED', reasonCode: 'DONE' }), true);
 	assert.equal((await memory.notebook.findReceipt(record.agentId, { actionId: 'lost-action-299' })).source, 'server_action_result');
-	assert.equal((await memory.unresolved(record)).total, 127);
+	assert.equal((await memory.unresolved(record)).total, 299);
 });
 
 test('failed unknown persistence retains the dispatch for a subsequent retry', async () => {

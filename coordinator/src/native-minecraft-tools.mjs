@@ -23,6 +23,8 @@ const MAX_LOOK_AROUND_TICKS = 20;
 const MAX_PROGRAM_SOURCE_BYTES = 65_536;
 const MAX_PROGRAM_PRECONDITION_BYTES = 4_096;
 const MAX_SEQUENCE_FINISH_BYTES = 4_096;
+const INVENTORY_FACT_FIELDS = ['selectedSlot', 'selectedItem', 'selectedItemId', 'selectedItemCount', 'tagCounts'];
+const COMPACT_ROW_FIELDS = ['uuid', 'stableId', 'type', 'typeId', 'name', 'slot', 'position', 'x', 'y', 'z', 'distance', 'distanceSquared', 'blockId', 'itemId', 'count', 'damage', 'maxDamage', 'tags', 'fingerprint', 'hotbar', 'displayName', 'maxStackSize', 'health', 'maxHealth', 'hostile', 'alive', 'withinInteractionRange', 'capabilities', 'velocity', 'bounds', 'pickable', 'parentId', 'partName', 'state', 'bearing', 'elevation', 'omittedFields'];
 const NATIVE_ACTION_TYPES = Object.freeze(Object.keys(ACTION_FIELDS));
 const POST_ACTION_VIEW_TOOLS = new Set(['moveTo', 'mine', 'act', 'sequence']);
 const OBSERVATION_VIEW_PROPERTIES = {
@@ -116,7 +118,7 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 		z: numberSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT),
 		tolerance: numberSchema(0.01, 16),
 		sprint: { type: 'boolean' },
-		timeoutMs: integerSchema(1, 120_000),
+		timeoutMs: integerSchema(MIN_DURATION_MS, MAX_DURATION_MS),
 	}, ['x', 'y', 'z'])),
 	tool('exploreFrontier', 'List factual observed or unknown adjacent-space candidates. This tool never chooses or executes a destination; choose explicitly with moveTo.', objectSchema({
 		kind: { type: 'string', enum: ['all', 'observed_block', 'unknown_cell'] },
@@ -129,13 +131,13 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 		y: integerSchema(-2_048, 2_048),
 		z: integerSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT),
 		expectedBlockId: { type: 'string', minLength: 1, maxLength: MAX_IDENTIFIER_LENGTH },
-		timeoutMs: integerSchema(1, 120_000),
+		timeoutMs: integerSchema(MIN_DURATION_MS, MAX_DURATION_MS),
 		autoAim: { type: 'boolean' },
 	}, ['x', 'y', 'z', 'expectedBlockId'])),
-	tool('say', 'Send public chat, a private message, or nearby proximity speech.', objectSchema({
+	tool('say', 'Send public chat, a private message, or nearby proximity speech. Message limit: 256 Unicode code points. Direct recipients must be observed player UUIDs.', objectSchema({
 		message: { type: 'string', minLength: 1, maxLength: MAX_CHAT_LENGTH },
 		audience: { type: 'string', enum: ['public', 'direct', 'proximity'] },
-		recipientId: { type: 'string', minLength: 1, maxLength: MAX_IDENTIFIER_LENGTH },
+		recipientId: { type: 'string', minLength: 36, maxLength: 36, pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' },
 	}, ['message'])),
 	tool('wait', 'Pause briefly and wait for the body result.', objectSchema({
 		durationMs: integerSchema(MIN_DURATION_MS, MAX_DURATION_MS),
@@ -300,18 +302,7 @@ function normalizeMinecraftToolArguments(name, value) {
 			break;
 		case 'moveTo':
 			requireExactKeys(args, ['x', 'y', 'z', 'tolerance', 'sprint', 'timeoutMs']);
-			return {
-				kind: 'action',
-				actionType: 'navigate_to',
-				arguments: {
-					x: finiteNumber(args.x, 'x', -COORDINATE_LIMIT, COORDINATE_LIMIT),
-					y: finiteNumber(args.y, 'y', -2_048, 2_048),
-					z: finiteNumber(args.z, 'z', -COORDINATE_LIMIT, COORDINATE_LIMIT),
-					tolerance: optionalNumber(args.tolerance, 1, 'tolerance', 0.01, 16),
-					sprint: optionalBoolean(args.sprint, true, 'sprint'),
-					timeoutMs: optionalInteger(args.timeoutMs, 30_000, 'timeoutMs', 1, 120_000),
-				},
-			};
+			return normalizeMinecraftToolArguments('act', { actionType: 'navigate_to', arguments: args });
 		case 'exploreFrontier': {
 			requireExactKeys(args, ['radius', 'limit', 'blockId', 'kind']);
 			if (args.kind !== undefined && !['all', 'observed_block', 'unknown_cell'].includes(args.kind)) invalid('Unknown frontier candidate kind');
@@ -329,14 +320,9 @@ function normalizeMinecraftToolArguments(name, value) {
 			requireExactKeys(args, ['x', 'y', 'z', 'expectedBlockId', 'timeoutMs', 'autoAim']);
 			try {
 				const autoAim = optionalBoolean(args.autoAim, false, 'autoAim');
-				const action = validateAction({
-					type: 'break_block',
-					x: integer(args.x, 'x', -COORDINATE_LIMIT, COORDINATE_LIMIT),
-					y: integer(args.y, 'y', -2_048, 2_048),
-					z: integer(args.z, 'z', -COORDINATE_LIMIT, COORDINATE_LIMIT),
-					expectedBlockId: boundedText(args.expectedBlockId, 'expectedBlockId', MAX_IDENTIFIER_LENGTH),
-					timeoutMs: optionalInteger(args.timeoutMs, 15_000, 'timeoutMs', 1, 120_000),
-				});
+				const { autoAim: _autoAim, ...miningArguments } = args;
+				const normalized = normalizeMinecraftToolArguments('act', { actionType: 'break_block', arguments: miningArguments });
+				const action = { type: normalized.actionType, ...normalized.arguments };
 				if (autoAim) {
 					// Expand only the caller's chosen target; the sequence executor stops on failed aim.
 					const aim = validateAction({ type: 'look_at', x: action.x + 0.5, y: action.y + 0.5, z: action.z + 0.5 });
@@ -349,7 +335,8 @@ function normalizeMinecraftToolArguments(name, value) {
 			break;
 		case 'say': {
 			requireExactKeys(args, ['message', 'audience', 'recipientId']);
-			const message = boundedText(args.message, 'message', MAX_CHAT_LENGTH);
+			if (typeof args.message !== 'string' || [...args.message].length > MAX_CHAT_LENGTH) invalid(`message must be 1 to ${MAX_CHAT_LENGTH} Unicode code points`);
+			const message = args.message;
 			const recipientId = args.recipientId === undefined ? undefined : boundedText(args.recipientId, 'recipientId', MAX_IDENTIFIER_LENGTH);
 			const audience = args.audience === undefined
 				? recipientId === undefined ? 'public' : 'direct'
@@ -357,9 +344,9 @@ function normalizeMinecraftToolArguments(name, value) {
 			if (!['public', 'direct', 'proximity'].includes(audience)) invalid('audience is not supported');
 			if (audience === 'direct' && recipientId === undefined) invalid('direct speech requires recipientId');
 			if (audience !== 'direct' && recipientId !== undefined) invalid(`${audience} speech cannot use recipientId`);
-			return { kind: 'action', actionType: 'chat', arguments: audience === 'direct'
+			return normalizeMinecraftToolArguments('act', { actionType: 'chat', arguments: audience === 'direct'
 				? { message, audience, recipientId }
-				: { message, audience } };
+				: { message, audience } });
 		}
 		case 'wait':
 			requireExactKeys(args, ['durationMs']);
@@ -367,13 +354,11 @@ function normalizeMinecraftToolArguments(name, value) {
 		case 'act': {
 			requireExactKeys(args, ['actionType', 'arguments']);
 			if (typeof args.actionType !== 'string' || !NATIVE_ACTION_TYPES.includes(args.actionType)) invalid('actionType is not supported');
-			const actionArguments = requireObject(args.arguments);
+			let actionArguments = requireObject(args.arguments);
 			if (Object.hasOwn(actionArguments, 'type')) invalid('arguments.type is reserved; use actionType');
-			if (args.actionType === 'break_block') {
-				requireExactKeys(actionArguments, ACTION_FIELDS.break_block);
-				const normalized = normalizeMinecraftToolCall('mine', actionArguments);
-				return { kind: 'action', actionType: normalized.actionType, arguments: normalized.arguments };
-			}
+			// Aliases and sequence steps share defaults, then the canonical action bounds.
+			if (args.actionType === 'navigate_to') actionArguments = { tolerance: 1, sprint: true, timeoutMs: 30_000, ...actionArguments };
+			if (args.actionType === 'break_block') actionArguments = { timeoutMs: 15_000, ...actionArguments };
 			try {
 				const normalizedArguments = stripActionType(validateAction({ type: args.actionType, ...actionArguments }));
 				return { kind: 'action', actionType: args.actionType, arguments: normalizedArguments };
@@ -414,10 +399,6 @@ function normalizeMinecraftToolArguments(name, value) {
 function normalizeSequenceAction(value) {
 	const action = requireObject(value);
 	requireExactKeys(action, ['actionType', 'arguments']);
-	if (action.actionType === 'navigate_to') {
-		const normalized = normalizeMinecraftToolArguments('moveTo', action.arguments);
-		return { actionType: normalized.actionType, arguments: normalized.arguments };
-	}
 	const normalized = normalizeMinecraftToolCall('act', action);
 	return { actionType: normalized.actionType, arguments: normalized.arguments };
 }
@@ -471,14 +452,27 @@ function compactPostAction(value, budget) {
 		detail: 'Goal and observation details exceeded the result limit. Inventory entries below are partial; inspect omitted facts.',
 		eventSequence: safeResultInteger(value.eventSequence),
 		freshness: { fresh: value.freshness?.fresh === true, ...(value.freshness?.reasonCode === undefined ? {} : { reasonCode: boundedResultField(value.freshness.reasonCode, 128) }) },
-		observation: { inventory: { items: [] }, resultCoverage: { inventory: { retained: 0, availableInSnapshot: items.length }, omittedSections: Object.keys(value.observation ?? {}).filter(key => key !== 'inventory') } },
+		observation: { inventory: { items: [] }, resultCoverage: { ...value.observation?.resultCoverage, inventory: { retained: 0, availableInSnapshot: items.length }, omittedSections: [...new Set([
+			...(value.observation?.resultCoverage?.omittedSections ?? []),
+			...Object.keys(value.observation ?? {}).filter(key => key !== 'inventory' && key !== 'resultCoverage'),
+		])] } },
 	};
+	// Metadata is optional too: large tag maps must not displace authoritative
+	// receipts. Keep whole fields when they fit and explicitly mark rejected ones.
+	for (const [key, field] of Object.entries(selectResultFields(value.observation?.inventory, INVENTORY_FACT_FIELDS))) {
+		fallback.observation.inventory[key] = field;
+		updateObservationOmissions(value.observation, fallback.observation);
+		if (Buffer.byteLength(JSON.stringify(fallback), 'utf8') > budget - 64) delete fallback.observation.inventory[key];
+	}
+	updateObservationOmissions(value.observation, fallback.observation);
 	for (const item of items) {
-		const row = Object.fromEntries(['slot', 'itemId', 'count'].filter(key => item[key] !== undefined).map(key => [key, item[key]]));
+		const row = selectResultFields(item, COMPACT_ROW_FIELDS);
 		fallback.observation.inventory.items.push(row);
+		updateObservationOmissions(value.observation, fallback.observation);
 		if (Buffer.byteLength(JSON.stringify(fallback), 'utf8') > budget - 64) { fallback.observation.inventory.items.pop(); break; }
 	}
 	fallback.observation.resultCoverage.inventory.retained = fallback.observation.inventory.items.length;
+	updateObservationOmissions(value.observation, fallback.observation);
 	return fallback;
 }
 
@@ -508,13 +502,13 @@ function compactToolResult(value, budget = MAX_TOOL_RESULT_BYTES) {
 		observation: {
 			...resultMetadata(observation),
 			player: observation.player ?? {},
-			inventory: { items: asToolArray(observation.inventory?.items).slice(0, 16) },
+			inventory: { ...selectResultFields(observation.inventory, INVENTORY_FACT_FIELDS), items: asToolArray(observation.inventory?.items).slice(0, 16) },
 			...(observation.position === undefined ? {} : { position: observation.position }),
 			...(observation.velocity === undefined ? {} : { velocity: observation.velocity }),
 			...(observation.view === undefined ? {} : { view: observation.view }),
 			...(observation.interaction === undefined ? {} : { interaction: compactInteraction(observation.interaction) }),
 			...(observation.perception === undefined ? {} : { perception: observation.perception }),
-			resultCoverage: { inventory: { retained: Math.min(asToolArray(observation.inventory?.items).length, 16), availableInSnapshot: asToolArray(observation.inventory?.items).length }, omittedSections: ['blocks', 'landmarks', 'entities', 'nearbyContainers'].filter((section) => observation[section] !== undefined) },
+			resultCoverage: { ...observation.resultCoverage, inventory: { retained: Math.min(asToolArray(observation.inventory?.items).length, 16), availableInSnapshot: asToolArray(observation.inventory?.items).length }, omittedSections: [] },
 			...(observation.death === undefined ? {} : { death: observation.death }),
 			...(observation.recovery === undefined ? {} : { recovery: compactRecovery(observation.recovery, 8) }),
 			...(observation.failureClass === undefined ? {} : { failureClass: observation.failureClass }),
@@ -525,24 +519,61 @@ function compactToolResult(value, budget = MAX_TOOL_RESULT_BYTES) {
 		},
 		...survivalFacts(value),
 	};
-	const sections = ['entities', 'blocks', 'landmarks', 'nearbyContainers'];
+	const sections = ['entities', 'items', 'blocks', 'landmarks', 'nearbyContainers'].filter(section => section !== 'items' || Array.isArray(observation.items));
 	const sources = Object.fromEntries(sections.map((section) => [section, asToolArray(observation[section])]));
 	for (const section of sections) {
 		compact.observation[section] = [];
 		compact.observation.resultCoverage[section] = { retained: 0, availableInSnapshot: sources[section].length, detailsOmitted: true };
 	}
+	updateObservationOmissions(observation, compact.observation);
 	// Share the remaining budget across kinds of visible facts before adding more of any one kind.
 	for (let index = 0; index < 32; index++) for (const section of sections) {
 		if (index >= sources[section].length || compact.observation[section].length !== index) continue;
 		const entry = sources[section][index];
-		const fields = ['uuid', 'stableId', 'type', 'name', 'position', 'x', 'y', 'z', 'distance', 'blockId', 'itemId', 'count', 'velocity', 'bounds', 'pickable', 'parentId', 'partName', 'state', 'bearing', 'elevation'];
-		const row = Object.fromEntries(fields.filter((field) => entry[field] !== undefined).map((field) => [field, entry[field]]));
+		const row = selectResultFields(entry, COMPACT_ROW_FIELDS);
 		compact.observation[section].push(row);
+		updateObservationOmissions(observation, compact.observation);
 		if (Buffer.byteLength(JSON.stringify(compact), 'utf8') > budget - 256) compact.observation[section].pop();
 		compact.observation.resultCoverage[section].retained = compact.observation[section].length;
 	}
-	compact.observation.resultCoverage.omittedSections = sections.filter((section) => sources[section].length > 0 && compact.observation[section].length === 0);
+	updateObservationOmissions(observation, compact.observation);
+	for (const section of sections) {
+		compact.observation.resultCoverage[section].detailsOmitted = compact.observation[section].length < sources[section].length
+			|| compact.observation.resultCoverage.omittedFields.some(path => path.startsWith(`${section}[]`));
+	}
+	compact.observation.resultCoverage.omittedSections = [...new Set([
+		...(observation.resultCoverage?.omittedSections ?? []),
+		...Object.keys(observation).filter((key) => !Object.hasOwn(compact.observation, key)),
+		...sections.filter((section) => sources[section].length > 0 && compact.observation[section].length === 0),
+	])];
 	return compact;
+}
+
+function selectResultFields(value, fields) {
+	return Object.fromEntries(fields.filter((key) => value?.[key] !== undefined).map((key) => [key, value[key]]));
+}
+
+function updateObservationOmissions(source, retained) {
+	// Row counts describe only retained rows. Paths also identify shortened arrays
+	// without row coverage; [] means at least one retained row lost that field.
+	const omitted = new Set(source?.resultCoverage?.omittedFields ?? []);
+	const visit = (original, compact, path) => {
+		if (original === compact) return;
+		if (Array.isArray(original) && Array.isArray(compact)) {
+			const coverage = retained.resultCoverage[path === 'inventory.items' ? 'inventory' : path];
+			if (original.length > compact.length && !(coverage?.availableInSnapshot === original.length && coverage?.retained === compact.length)) omitted.add(path);
+			for (let index = 0; index < Math.min(original.length, compact.length); index++) visit(original[index], compact[index], `${path}[]`);
+		} else if (original !== null && typeof original === 'object' && compact !== null && typeof compact === 'object') {
+			for (const key of Object.keys(original)) {
+				if (key === 'resultCoverage') continue;
+				const field = path ? `${path}.${key}` : key;
+				if (!Object.hasOwn(compact, key)) omitted.add(field);
+				else visit(original[key], compact[key], field);
+			}
+		} else if (original !== compact) omitted.add(path);
+	};
+	visit(source ?? {}, retained, '');
+	retained.resultCoverage.omittedFields = [...omitted].sort();
 }
 
 function resultMetadata(value) {
@@ -703,6 +734,7 @@ function compactSequenceResult(value) {
 		completed: safeResultInteger(value.completed),
 		...(safeResultInteger(value.failedAt) === null ? {} : { failedAt: safeResultInteger(value.failedAt) }),
 		results: sourceResults.map((step) => ({
+			...Object.fromEntries(['actionId', 'bodyActionId'].filter(field => step?.[field] !== undefined).map(field => [field, boundedResultField(step[field], 256)])),
 			actionType: boundedResultField(step?.actionType, 64),
 			state: boundedResultField(step?.state, 64),
 			reasonCode: boundedResultField(step?.reasonCode, 128),
@@ -767,7 +799,7 @@ function safeResultInteger(value) { return Number.isSafeInteger(value) ? value :
 function tool(name, description, inputSchema) {
 	if (POST_ACTION_VIEW_TOOLS.has(name)) {
 		inputSchema = { ...inputSchema, properties: { ...inputSchema.properties, ...OBSERVATION_VIEW_PROPERTIES } };
-		description += ' When postAction is available, it defaults to full facts with postAction.observationView.id. Optional view:"changes" and afterObservationId use that exact delivered observation baseline; unknown baselines return full. Receipt and history fields keep their existing coverage and omission markers. Use view:"full" if unsure.';
+		description += ' Available postAction facts use the shared observation-view contract described by observe; receipt/history coverage and omission markers are unchanged.';
 	}
 	return Object.freeze({ type: 'function', name, description, inputSchema: Object.freeze(inputSchema) });
 }
@@ -826,10 +858,6 @@ function finiteNumber(value, field, minimum, maximum) {
 function integer(value, field, minimum, maximum) {
 	if (!Number.isSafeInteger(value)) invalid(`${field} must be an integer`);
 	return finiteNumber(value, field, minimum, maximum);
-}
-
-function optionalNumber(value, fallback, field, minimum, maximum) {
-	return value === undefined ? fallback : finiteNumber(value, field, minimum, maximum);
 }
 
 function optionalInteger(value, fallback, field, minimum, maximum) {

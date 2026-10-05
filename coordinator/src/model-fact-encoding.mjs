@@ -2,7 +2,10 @@ import { isDeepStrictEqual } from 'node:util';
 import { randomUUID } from 'node:crypto';
 
 export const MODEL_FACT_FORMAT = 'minecraft-facts-v1';
-export const MODEL_FACT_INSTRUCTIONS = `Compact factual replies use format:"minecraft-facts-v1": data is the original JSON, {$rows:{columns,rows}} represents an array of records in column order, and {$ref:N} is the exact value at values[N] in this reply. {$object:[[key,value],...]} preserves literal objects with reserved keys. Null, missing fields, coverage and freshness keep their meanings. Complete replies need no previous reply. observe and available action/sequence postAction samples default to complete snapshots with observationView.id alongside observation. view:"changes" plus afterObservationId requests changed whole sections against that exact delivered ID, including across observe and postAction. Apply observationView.replace and remove to that baseline; retain unchanged sections. Action receipts and per-step history are unchanged. Missing, stale or different-world baselines return full. Request view:"full" whenever the baseline is uncertain.`;
+export const MODEL_FACT_INSTRUCTIONS = `Compact factual replies use format:"minecraft-facts-v1": data is the original JSON, {$rows:{columns,rows}} represents an array of records in column order, and {$ref:N} is the exact value at values[N] in this reply. {$object:[[key,value],...]} preserves literal objects with reserved keys. Null, missing fields, coverage and freshness keep their meanings. Complete replies need no previous reply. observe and available action/sequence postAction samples default to complete snapshots with observationView.id alongside observation. view:"changes" plus afterObservationId requests changed whole sections against that exact delivered ID, including across observe and postAction. Apply observationView.replace and remove to that baseline; retain unchanged sections. observationView.retainMetadata lists top-level sample fields to copy from that same exact baseline; all other metadata is current, and missing fields are absent. Action receipts and per-step history are unchanged. Missing, stale or different-world baselines return full. Request view:"full" whenever the baseline is uncertain.`;
+const MAX_DELIVERED_VIEWS = 8;
+const MAX_DELIVERED_VIEW_BYTES = 2 * 1024 * 1024;
+const RETAINABLE_METADATA = ['taskMemory', 'goal', 'goalSpec', 'executionSettings'];
 const MARKERS = new Set(['$ref', '$rows', '$object']);
 const bytes = value => Buffer.byteLength(JSON.stringify(value), 'utf8');
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -42,7 +45,13 @@ export function encodeModelFacts(value) {
    if (current.length >= 3 && current.every(record)) {
     const columns = Object.keys(current[0]);
     if (current.every(row => Object.keys(row).length === columns.length && columns.every(column => Object.hasOwn(row, column)))) {
-     const table = { $rows: { columns, rows: current.map(row => columns.map(column => pack(row[column]))) } };
+     // Reuse packed children, including dictionary-backed/literal rows. Packing
+     // those children again doubles recursive work at every nested row level.
+     const table = { $rows: { columns, rows: rows.map(row => {
+      const packed = marked(row) && Object.hasOwn(row, '$ref') ? values[row.$ref] : row;
+      const fields = marked(packed) && Object.hasOwn(packed, '$object') ? Object.fromEntries(packed.$object) : packed;
+      return columns.map(column => fields[column]);
+     }) } };
      if (bytes(table) < bytes(rows)) return table;
     }
    }
@@ -108,10 +117,12 @@ export function decodeModelFacts(value) {
 export class ModelObservationViews {
  #session = randomUUID();
  #baseline = null;
+ #history = new Map();
+ #historyBytes = 0;
  #sequence = 0;
  #committedSequence = 0;
  #generation = 0;
- reset() { this.#baseline = null; this.#generation++; }
+ reset() { this.#baseline = null; this.#history.clear(); this.#historyBytes = 0; this.#generation++; }
  observeEvent(observation) {
   const identity = observationIdentity(observation);
   if (identity === null || identity !== this.#baseline?.identity || observation.player?.dead === true || observation.continuity?.phase === 'dead') this.reset();
@@ -130,23 +141,40 @@ export class ModelObservationViews {
   const id = `observation-${this.#session}-${sequence}`;
   const identity = observationIdentity(observation);
   const eligible = identity !== null && snapshot.freshness?.fresh === true && observation.player?.dead !== true && observation.continuity?.phase !== 'dead';
-  const next = { id, identity, observation: structuredClone(observation) };
+  const next = { id, identity, observation: structuredClone(observation), metadata: Object.fromEntries(RETAINABLE_METADATA.filter(key => Object.hasOwn(snapshot, key)).map(key => [key, structuredClone(snapshot[key])])), goalRevision: snapshot.goalRevision };
+  next.bytes = bytes(next);
   const full = { ...snapshot, observationView: { id, mode: 'full' } };
   let presented = full;
-  const previous = this.#baseline;
-  if (eligible && tool.view === 'changes' && previous !== null && previous.id === tool.afterObservationId && previous.identity === identity) {
+  const previous = this.#history.get(tool.afterObservationId) ?? null;
+  if (eligible && tool.view === 'changes' && previous !== null && previous.id === tool.afterObservationId && previous.identity === identity && previous.goalRevision === snapshot.goalRevision) {
    const replace = Object.fromEntries(Object.entries(observation).filter(([key, current]) => !Object.hasOwn(previous.observation, key) || !isDeepStrictEqual(previous.observation[key], current)));
    const remove = Object.keys(previous.observation).filter(key => !Object.hasOwn(observation, key));
    const { observation: _full, ...metadata } = snapshot;
-   const changes = { ...metadata, observationView: { id, mode: 'changes', baseId: previous.id, replace, remove } };
+   const retainMetadata = RETAINABLE_METADATA.filter(key => Object.hasOwn(metadata, key) && Object.hasOwn(previous.metadata, key) && isDeepStrictEqual(metadata[key], previous.metadata[key]));
+   for (const key of retainMetadata) delete metadata[key];
+   const changes = { ...metadata, observationView: { id, mode: 'changes', baseId: previous.id, replace, remove, ...(retainMetadata.length === 0 ? {} : { retainMetadata }) } };
    if (bytes(changes) < bytes(full)) presented = changes;
   }
   const generation = this.#generation;
+  let committed = false;
   const commit = baseline => {
-   // A repeated or delayed callback cannot resurrect an older delivered view.
-   if (generation !== this.#generation || sequence <= this.#committedSequence) return;
-   this.#committedSequence = sequence;
-   this.#baseline = baseline;
+   if (committed || generation !== this.#generation) return;
+   committed = true;
+   // Sibling replies may finish delivery in either order. Keep each exact
+   // delivered view, but an older callback must not reset newer context.
+   if (sequence > this.#committedSequence) {
+    if (baseline === null || this.#baseline !== null && this.#baseline.identity !== baseline.identity) this.reset();
+    this.#committedSequence = sequence;
+    this.#baseline = baseline === null ? null : { identity: baseline.identity };
+   } else if (baseline === null || baseline.identity !== this.#baseline?.identity) return;
+   if (baseline === null || baseline.bytes > MAX_DELIVERED_VIEW_BYTES) return;
+   this.#history.set(baseline.id, baseline);
+   this.#historyBytes += baseline.bytes;
+   while (this.#history.size > MAX_DELIVERED_VIEWS || this.#historyBytes > MAX_DELIVERED_VIEW_BYTES) {
+    const oldest = this.#history.keys().next().value;
+    this.#historyBytes -= this.#history.get(oldest).bytes;
+    this.#history.delete(oldest);
+   }
   };
   return { value: nested ? { ...owned, postAction: presented } : presented,
    commit: () => commit(eligible ? next : null), commitWithoutView: () => commit(null) };

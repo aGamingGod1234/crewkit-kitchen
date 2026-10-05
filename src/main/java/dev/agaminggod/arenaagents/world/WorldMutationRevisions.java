@@ -4,7 +4,9 @@ import java.util.LinkedHashMap;
 
 /** Bounded revisions at chunk resolution for local queries and region resolution for wide queries. */
 public final class WorldMutationRevisions {
-	private static final int REGION_SHIFT = 9;
+	// A 257-block sight query touches at most sixteen regions; sixteen agents fit the index.
+	private static final int REGION_SHIFT = 8;
+	private static final int MAXIMUM_RADIUS = 512;
 	private static final int CHUNK_SHIFT = 4;
 	private static final int CAPACITY = 256;
 	private final LinkedHashMap<Long, Long> regions = new LinkedHashMap<>(16, 0.75F, true);
@@ -12,7 +14,7 @@ public final class WorldMutationRevisions {
 	private long sequence;
 
 	public synchronized long revision(int centerX, int centerZ, int radius) {
-		if (radius < 0 || radius >= 1 << REGION_SHIFT) throw new IllegalArgumentException("invalid observation radius");
+		if (radius < 0 || radius >= MAXIMUM_RADIUS) throw new IllegalArgumentException("invalid observation radius");
 		// Navigation samples a chunk plus neighboring collision reach (radius 9).
 		// Keep wide perception queries coarse without invalidating local searches for distant writes.
 		int shift = radius < (1 << CHUNK_SHIFT) ? CHUNK_SHIFT : REGION_SHIFT;
