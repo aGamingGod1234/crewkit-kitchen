@@ -81,7 +81,7 @@ public final class CodexAgentCommands {
 
 	static void register(CommandDispatcher<CommandSourceStack> dispatcher) {
 		dispatcher.register(Commands.literal("agent").then(goalDraftCommands()));
-		PovCommands.register(dispatcher, CodexAgentCommands::agentArgument);
+		PovCommands.register(dispatcher, CodexAgentCommands::povAgentArgument);
 		dispatcher.register(
 				Commands.literal("verbose")
 						.requires(GoalControl::mayControl)
@@ -153,8 +153,8 @@ public final class CodexAgentCommands {
 								.requires(GoalControl::mayControl)
 								.then(agentArgument().executes(CodexAgentCommands::toggleAutomatic)))
 						.then(skitCommands())
-						.then(PovCommands.codexAlias("spectate", PovMode.SPECTATE, CodexAgentCommands::agentArgument))
-						.then(PovCommands.codexAlias("takeover", PovMode.TAKEOVER, CodexAgentCommands::agentArgument))
+						.then(PovCommands.codexAlias("spectate", PovMode.SPECTATE, CodexAgentCommands::povAgentArgument))
+						.then(PovCommands.codexAlias("takeover", PovMode.TAKEOVER, CodexAgentCommands::povAgentArgument))
 						);
 	}
 
@@ -911,6 +911,15 @@ public final class CodexAgentCommands {
 		return Commands.argument(ARGUMENT_AGENT, StringArgumentType.word())
 				.suggests((context, builder) -> SharedSuggestionProvider.suggest(
 						manager(context).selectors(),
+						builder
+				));
+	}
+
+	// /spectate and /takeover suggest one readable name per agent; ids and legacy aliases still resolve.
+	private static com.mojang.brigadier.builder.RequiredArgumentBuilder<CommandSourceStack, String> povAgentArgument() {
+		return Commands.argument(ARGUMENT_AGENT, StringArgumentType.word())
+				.suggests((context, builder) -> SharedSuggestionProvider.suggest(
+						manager(context).preferredSelectors(),
 						builder
 				));
 	}

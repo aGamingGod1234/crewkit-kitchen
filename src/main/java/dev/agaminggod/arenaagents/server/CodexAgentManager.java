@@ -1823,6 +1823,10 @@ public final class CodexAgentManager {
 		return savedData.registry().selectors();
 	}
 
+	public List<String> preferredSelectors() {
+		return savedData.registry().preferredSelectors();
+	}
+
 	public AgentRegistry registry() {
 		return savedData.registry();
 	}
