@@ -5,6 +5,7 @@
   "mixins": [
     "CameraDollyMinecartMixin",
     "CachedUserNameToIdResolverAccessor",
+    "CommandNodeAccessor",
     "CachedProfileInfoAccessor",
     "CarpetBoatInputMixin",
     "EntityPlayerActionInvoker",

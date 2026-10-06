@@ -84,13 +84,13 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-dynamic-coordinator.ps1
 /codex status [agent]
 /codex list
 /codex remove <agent>
-/spectator <agent>
-/spectator exit
-/takeover <agent>
+/spectate <agent> [start|stop]
+/spectate exit
+/takeover <agent> [start|stop]
 /takeover exit
 ```
 
-`/spectator <agent>` switches your view to the agent's first-person camera and shows its hotbar, hearts, food, armor, air, XP, effects, open container screens and death screen. Your own body stays where it is, so your surroundings stop rendering while you watch. `/takeover <agent>` does the same and routes your movement, mouse look, jump, sneak, sprint, attack, use, hotbar and inventory clicks to the agent's body while its model is paused; the model resumes from whatever state you leave the agent in and receives a short report of what you did. A takeover ends when you run `/takeover exit`, when your own body loses two hearts, dies, changes dimension or disconnects, or when the agent is removed or enters another dimension (run the command again once you are in the same dimension). Both commands need operator permission and the client mod. Vanilla `/spectate` is a different command: it moves your body to the target.
+`/spectate <agent>` switches your view to the agent's first-person camera, one-to-one with what a player in its body would see: its hands, skin, held tools and how it swings, eats, blocks or draws them, plus its hotbar, hearts, food, armor, air, XP, effects, game mode, open container screens and death screen. Nothing else is drawn over the view; a lost signal or a hit on your own body shows briefly on the action bar. `<agent>` is the tab-completed selector (the agent's username or short id, no spaces), not the display name shown in chat. `<agent>` alone means `start`; `/spectate <agent> stop` (or `exit`) ends that agent's view and `/spectate exit` ends whichever view is active. Your own body stays where it is, so your surroundings stop rendering while you watch. `/takeover <agent>` uses the same grammar and routes your movement, mouse look, jump, sneak, sprint, attack, use, hotbar and inventory clicks to the agent's body while its model is paused; the model resumes from whatever state you leave the agent in and receives a short report of what you did. A takeover ends when you run `/takeover exit`, when your own body loses two hearts, dies, changes dimension or disconnects, or when the agent is removed or enters another dimension (run the command again once you are in the same dimension). Both commands need operator permission and the client mod. The mod replaces vanilla `/spectate` (which would move your body to the target) on servers it runs on.
 
 `/codex summon` and the legacy two-argument form use the configured Codex default. The command center asks each installed provider CLI for its current model catalog and uses a bounded built-in catalog when discovery is unavailable. Availability still depends on the installed CLI, its login, and that provider's model access. Player-facing speed choices are `Normal` and `Fast mode`; provider wire values stay internal. A newly summoned NPC remains idle until `/codex start`; `stop` freezes its active work, `queue` preserves later goals, and `steer` interrupts the current plan at a higher revision.
 

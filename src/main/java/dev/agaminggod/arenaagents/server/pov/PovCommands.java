@@ -1,5 +1,6 @@
 package dev.agaminggod.arenaagents.server.pov;
 
+import com.mojang.brigadier.Command;
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
@@ -7,28 +8,33 @@ import com.mojang.brigadier.builder.RequiredArgumentBuilder;
 import com.mojang.brigadier.context.CommandContext;
 import com.mojang.brigadier.exceptions.CommandSyntaxException;
 import com.mojang.brigadier.exceptions.DynamicCommandExceptionType;
+import com.mojang.brigadier.tree.CommandNode;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
+import dev.agaminggod.arenaagents.mixin.CommandNodeAccessor;
 import dev.agaminggod.arenaagents.pov.PovMode;
 import dev.agaminggod.arenaagents.pov.PovStopPayload;
 import dev.agaminggod.arenaagents.server.CodexAgentManager;
 import dev.agaminggod.arenaagents.server.GoalControl;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.commands.CommandSourceStack;
-import net.minecraft.commands.Commands;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * /spectator and /takeover, plus the /codex spectate|takeover aliases. The literal "exit" wins over
- * an agent named "exit" (Brigadier prefers literals); such an agent stays reachable by its id.
+ * /spectate and /takeover, plus the /codex spectate|takeover aliases. Grammar for both:
+ * {@code <agent> [start|stop|exit]} (no word after the agent means start) and {@code exit|stop} for
+ * any session. Literals win over agent names (Brigadier prefers literals); such an agent stays
+ * reachable by its id. Vanilla /spectate (which moves the body) is removed so this one replaces it.
  */
 public final class PovCommands {
+	static final String ARGUMENT_AGENT = "agent";
 	private static final Logger LOGGER = LoggerFactory.getLogger(PovCommands.class);
-	private static final String ARGUMENT_AGENT = "agent";
+	private static final String VANILLA_SPECTATE = "spectate";
 	private static final DynamicCommandExceptionType COMMAND_FAILURE = new DynamicCommandExceptionType(
 			message -> Component.literal(String.valueOf(message))
 	);
@@ -39,7 +45,8 @@ public final class PovCommands {
 	/** {@code agentArgument} must produce the shared {@code agent} selector argument. */
 	public static void register(CommandDispatcher<CommandSourceStack> dispatcher,
 			Supplier<RequiredArgumentBuilder<CommandSourceStack, String>> agentArgument) {
-		dispatcher.register(tree("spectator", PovMode.SPECTATE, agentArgument));
+		removeVanillaSpectate(dispatcher.getRoot());
+		dispatcher.register(tree(VANILLA_SPECTATE, PovMode.SPECTATE, agentArgument));
 		dispatcher.register(tree("takeover", PovMode.TAKEOVER, agentArgument));
 	}
 
@@ -49,12 +56,50 @@ public final class PovCommands {
 		return tree(literal, mode, agentArgument);
 	}
 
+	/** Runs in Fabric's registration callback, which fires after vanilla registered its own /spectate. */
+	private static void removeVanillaSpectate(CommandNode<CommandSourceStack> root) {
+		CommandNodeAccessor accessor = (CommandNodeAccessor) root;
+		accessor.arenaagents$children().remove(VANILLA_SPECTATE);
+		accessor.arenaagents$literals().remove(VANILLA_SPECTATE);
+		accessor.arenaagents$arguments().remove(VANILLA_SPECTATE);
+	}
+
 	private static LiteralArgumentBuilder<CommandSourceStack> tree(String literal, PovMode mode,
 			Supplier<RequiredArgumentBuilder<CommandSourceStack, String>> agentArgument) {
-		return Commands.literal(literal)
-				.requires(GoalControl::mayControl)
-				.then(Commands.literal("exit").executes(PovCommands::exit))
-				.then(agentArgument.get().executes(context -> start(context, mode)));
+		return grammar(literal, agentArgument, GoalControl::mayControl,
+				context -> start(context, mode), context -> exitAgent(context, mode), PovCommands::exit);
+	}
+
+	/**
+	 * The pure command shape, usable with any source type so it can be verified without a server.
+	 * {@code start} runs for {@code <agent>} and {@code <agent> start}, {@code exitAgent} for
+	 * {@code <agent> stop|exit} and {@code exitAny} for a bare {@code stop|exit}.
+	 */
+	static <S> LiteralArgumentBuilder<S> grammar(String literal, Supplier<RequiredArgumentBuilder<S, String>> agentArgument,
+			Predicate<S> permission, Command<S> start, Command<S> exitAgent, Command<S> exitAny) {
+		return LiteralArgumentBuilder.<S>literal(literal)
+				.requires(permission)
+				.then(LiteralArgumentBuilder.<S>literal("exit").executes(exitAny))
+				.then(LiteralArgumentBuilder.<S>literal("stop").executes(exitAny))
+				.then(agentArgument.get()
+						.executes(start)
+						.then(LiteralArgumentBuilder.<S>literal("start").executes(start))
+						.then(LiteralArgumentBuilder.<S>literal("stop").executes(exitAgent))
+						.then(LiteralArgumentBuilder.<S>literal("exit").executes(exitAgent)));
+	}
+
+	static String exitCommand(PovMode mode) {
+		return mode == PovMode.TAKEOVER ? "/takeover exit" : "/spectate exit";
+	}
+
+	static String startMessage(PovMode mode, String agentName, boolean alreadyActive) {
+		String exitCommand = exitCommand(mode);
+		if (alreadyActive) return "You are already in " + agentName + "'s view. Type " + exitCommand + " to return.";
+		if (mode == PovMode.TAKEOVER) {
+			return "You are controlling " + agentName + ". Its model is paused until you type " + exitCommand
+					+ ". Your own body stays here; if it loses 2 hearts the takeover ends.";
+		}
+		return "Viewing " + agentName + ". Type " + exitCommand + " to return.";
 	}
 
 	private static int start(CommandContext<CommandSourceStack> context, PovMode mode) throws CommandSyntaxException {
@@ -71,24 +116,36 @@ public final class PovCommands {
 					.filter(session -> session.agentId().equals(record.agentId()) && session.mode() == mode)
 					.isPresent();
 			PovSession session = PovSessionRuntime.start(operator, record.agentId(), mode, selector);
-			String exitCommand = mode == PovMode.TAKEOVER ? "/takeover exit" : "/spectator exit";
-			String message;
-			if (alreadyActive) {
-				message = "You are already in " + session.agentName() + "'s view. Type " + exitCommand + " to return.";
-			} else if (mode == PovMode.TAKEOVER) {
-				message = "You are controlling " + session.agentName() + ". Its model is paused until you type "
-						+ exitCommand + ". Your own body stays here; if it loses 2 hearts the takeover ends."
-						+ " (This is not vanilla /spectate, which would move your body.)";
-			} else {
-				message = "Viewing " + session.agentName() + " (read-only). Type " + exitCommand
-						+ " to return. (This is not vanilla /spectate, which would move your body.)";
-			}
+			String message = startMessage(mode, session.agentName(), alreadyActive);
 			context.getSource().sendSuccess(() -> Component.literal(message), false);
 			return 1;
 		} catch (AgentDomainException exception) {
 			throw commandFailure(exception);
 		} catch (RuntimeException exception) {
-			throw unexpectedFailure(mode == PovMode.TAKEOVER ? "takeover" : "spectator", exception);
+			throw unexpectedFailure(commandName(mode), exception);
+		}
+	}
+
+	// "<agent> stop": only that agent's session ends, so a typo never drops a different view.
+	private static int exitAgent(CommandContext<CommandSourceStack> context, PovMode mode) throws CommandSyntaxException {
+		ServerPlayer operator = context.getSource().getPlayerOrException();
+		try {
+			String selector = StringArgumentType.getString(context, ARGUMENT_AGENT);
+			CodexAgentManager manager = CodexAgentManager.get(context.getSource().getServer());
+			AgentRecord record = manager.resolve(selector);
+			PovSession session = PovSessionRuntime.session(operator)
+					.filter(current -> current.agentId().equals(record.agentId()))
+					.orElseThrow(() -> new AgentDomainException("POV_NOT_ACTIVE",
+							"You are not viewing or controlling " + manager.displayName(record) + "; type " + exitCommand(mode)
+									+ " to leave your current view"));
+			if (!PovSessionRuntime.exit(operator, PovExitReason.MANUAL)) {
+				throw new AgentDomainException("POV_NOT_ACTIVE", "You are not viewing or controlling " + session.agentName());
+			}
+			return 1;
+		} catch (AgentDomainException exception) {
+			throw commandFailure(exception);
+		} catch (RuntimeException exception) {
+			throw unexpectedFailure(commandName(mode) + " exit", exception);
 		}
 	}
 
@@ -104,6 +161,10 @@ public final class PovCommands {
 		} catch (RuntimeException exception) {
 			throw unexpectedFailure("view exit", exception);
 		}
+	}
+
+	private static String commandName(PovMode mode) {
+		return mode == PovMode.TAKEOVER ? "takeover" : "spectate";
 	}
 
 	private static CommandSyntaxException commandFailure(AgentDomainException exception) {
