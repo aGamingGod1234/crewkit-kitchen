@@ -5,12 +5,71 @@ import dev.agaminggod.arenaagents.server.runtime.ServerActionRequest;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionResult;
 import dev.agaminggod.arenaagents.agent.goal.GoalEvidence;
 import java.util.Locale;
+import java.util.Objects;
+import java.util.Set;
 import net.minecraft.ChatFormatting;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.MutableComponent;
+import net.minecraft.server.MinecraftServer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public final class AgentChatReporter {
+	public static final Set<String> NOTICE_SEVERITIES = Set.of("error", "warning", "info");
+	public static final int MAX_NOTICE_LENGTH = 2_048;
+	private static final Logger LOGGER = LoggerFactory.getLogger(AgentChatReporter.class);
+
 	private AgentChatReporter() {
+	}
+
+	/**
+	 * Operator-facing notice that must always reach chat: it bypasses automatic-progress,
+	 * verbose and reason-code filtering because it tells players why an agent cannot think
+	 * at all (provider CLI missing, broken or signed out). Unknown agents are logged only.
+	 */
+	public static void notice(CodexAgentManager manager, AgentRecord record, String severity, String code, String message) {
+		Objects.requireNonNull(manager, "manager must not be null");
+		String level = NOTICE_SEVERITIES.contains(severity) ? severity : "info";
+		String body = readableNotice(message);
+		if (record == null) {
+			log(level, "[agent notice] " + code + ": " + body);
+			return;
+		}
+		String displayName = manager.displayName(record);
+		log(level, "[" + displayName + "] " + code + ": " + body);
+		MinecraftServer server = manager.server();
+		if (server == null) return;
+		try {
+			server.getPlayerList().broadcastSystemMessage(
+					noticeLine(displayName, record.profile().provider(), level, body), false);
+		} catch (RuntimeException exception) {
+			LOGGER.warn("Could not broadcast agent notice {} for {}", code, record.agentId(), exception);
+		}
+	}
+
+	public static Component noticeLine(String displayName, String provider, String severity, String message) {
+		MutableComponent prefix = Component.literal("[" + displayName + "]").withStyle(familyColor(provider));
+		MutableComponent body = Component.literal(" " + message).withStyle(noticeColor(severity));
+		return prefix.append(body);
+	}
+
+	public static ChatFormatting noticeColor(String severity) {
+		return switch (severity) {
+			case "error" -> ChatFormatting.RED;
+			case "warning" -> ChatFormatting.YELLOW;
+			default -> ChatFormatting.GRAY;
+		};
+	}
+
+	private static void log(String severity, String text) {
+		if ("info".equals(severity)) LOGGER.info(text);
+		else LOGGER.warn(text);
+	}
+
+	private static String readableNotice(String message) {
+		if (message == null || message.isBlank()) return "No details.";
+		String compact = message.replace('\n', ' ').replace('\r', ' ').trim();
+		return compact.length() <= MAX_NOTICE_LENGTH ? compact : compact.substring(0, MAX_NOTICE_LENGTH - 3) + "...";
 	}
 
 	public static void planning(CodexAgentManager manager, AgentRecord record) {

@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { spawn, spawnSync } from 'node:child_process';
+import { execFile as nodeExecFile, spawn, spawnSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync, readdirSync, renameSync, statSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 
@@ -7,7 +7,7 @@ import { DEFAULT_CHILD_STOP_TIMEOUT_MS, terminateChildProcess } from './child-pr
 import { JsonlDecoder, encodeJsonLine } from './jsonl.mjs';
 import { parseDecision } from './decision-parser.mjs';
 import { PLANNER_OUTPUT_SCHEMA, PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
-import { createProviderChildEnvironment } from './provider-environment.mjs';
+import { createProviderChildEnvironment, findNpmEntrypointBesideShim } from './provider-environment.mjs';
 import { sanitizeDiagnosticErrorCode, sanitizeDiagnosticErrorMessage, sanitizeDiagnosticText } from './diagnostic-sanitizer.mjs';
 
 const APP_SERVER_MAX_LINE_BYTES = 4 * 1_024 * 1_024;
@@ -69,10 +69,9 @@ export function resolveCodexLaunch(config, dependencies = {}) {
 	);
 	const nodeExecutable = dependencies.execPath ?? process.execPath;
 	const pathExists = dependencies.existsSync ?? existsSync;
-	const appData = windowsEnvironmentValue(environment, 'APPDATA');
-	if (platform === 'win32' && appData !== null) {
-		const entrypoint = path.join(appData, 'npm', 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
-		if (pathExists(entrypoint)) return { command: nodeExecutable, args: [entrypoint, ...buildCodexArgs(config)], environment };
+	if (platform === 'win32') {
+		const entrypoint = codexNpmEntrypoint(environment, { platform, existsSync: pathExists });
+		if (entrypoint !== null) return { command: nodeExecutable, args: [entrypoint, ...buildCodexArgs(config)], environment };
 	}
 	if (platform === 'win32') {
 		const desktopCli = cacheInstalledCodexDesktopCli(environment, dependencies);
@@ -81,6 +80,44 @@ export function resolveCodexLaunch(config, dependencies = {}) {
 		}
 	}
 	return { command: 'codex', args: buildCodexArgs(config), environment };
+}
+
+const CODEX_NPM_ENTRYPOINT = Object.freeze(['@openai', 'codex', 'bin', 'codex.js']);
+const WINDOWS_PACKAGE_LOCATION_COMMAND = "$package = Get-AppxPackage -Name OpenAI.Codex | Sort-Object Version -Descending | Select-Object -First 1; if ($package) { [Console]::Out.Write($package.InstallLocation) }";
+const WINDOWS_PACKAGE_LOCATION_ARGS = Object.freeze(['-NoProfile', '-NonInteractive', '-Command', WINDOWS_PACKAGE_LOCATION_COMMAND]);
+const WINDOWS_PACKAGE_LOCATION_OPTIONS = Object.freeze({ encoding: 'utf8', maxBuffer: 64 * 1_024, timeout: 5_000, windowsHide: true });
+
+/**
+ * The npm Codex entrypoint that Node can run directly on Windows: the default npm prefix
+ * first, then the package beside a codex.cmd shim on PATH (custom prefixes). Null when absent.
+ */
+export function codexNpmEntrypoint(environment, { platform = process.platform, existsSync: pathExists = existsSync } = {}) {
+	if (platform !== 'win32') return null;
+	const appData = windowsEnvironmentValue(environment, 'APPDATA');
+	if (appData !== null) {
+		const entrypoint = path.join(appData, 'npm', 'node_modules', ...CODEX_NPM_ENTRYPOINT);
+		if (pathExists(entrypoint)) return entrypoint;
+	}
+	return findNpmEntrypointBesideShim('codex', CODEX_NPM_ENTRYPOINT, environment, { platform, existsSync: pathExists });
+}
+
+/**
+ * Asynchronous twin of the PowerShell package lookup used by resolveCodexLaunch, so callers
+ * on the event loop (the CLI health probe) can pass the result as `windowsPackageLocations`
+ * and never block on spawnSync.
+ */
+export function discoverCodexWindowsPackageLocations(environment, { execFile = nodeExecFile } = {}) {
+	return new Promise((resolve) => {
+		try {
+			execFile('powershell.exe', [...WINDOWS_PACKAGE_LOCATION_ARGS], { ...WINDOWS_PACKAGE_LOCATION_OPTIONS, env: environment }, (error, stdout) => {
+				if (error || typeof stdout !== 'string') { resolve([]); return; }
+				const location = stdout.trim();
+				resolve(location.length === 0 ? [] : [location]);
+			});
+		} catch {
+			resolve([]);
+		}
+	});
 }
 
 function cacheInstalledCodexDesktopCli(environment, dependencies = {}) {
@@ -172,15 +209,8 @@ function candidateFromPackageLocation(packageLocation) {
 }
 
 function discoverWindowsPackageLocations(environment, run) {
-	const command = "$package = Get-AppxPackage -Name OpenAI.Codex | Sort-Object Version -Descending | Select-Object -First 1; if ($package) { [Console]::Out.Write($package.InstallLocation) }";
 	try {
-		const result = run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command], {
-			encoding: 'utf8',
-			env: environment,
-			maxBuffer: 64 * 1_024,
-			timeout: 5_000,
-			windowsHide: true,
-		});
+		const result = run('powershell.exe', [...WINDOWS_PACKAGE_LOCATION_ARGS], { ...WINDOWS_PACKAGE_LOCATION_OPTIONS, env: environment });
 		if (result.error || result.status !== 0 || typeof result.stdout !== 'string') return [];
 		const location = result.stdout.trim();
 		return location.length === 0 ? [] : [location];

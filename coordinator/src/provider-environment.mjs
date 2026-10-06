@@ -1,3 +1,10 @@
+import { existsSync as nodeExistsSync } from 'node:fs';
+import path from 'node:path';
+
+const DEFAULT_WINDOWS_PATHEXT = '.COM;.EXE;.BAT;.CMD';
+// Node spawns these directly; .cmd/.bat shims need a shell and fail with EINVAL.
+export const DIRECTLY_SPAWNABLE_WINDOWS_EXTENSIONS = Object.freeze(['.exe', '.com']);
+
 const PROVIDER_ENVIRONMENT_VARIABLES = Object.freeze({
 	codex: Object.freeze([
 		'CODEX_HOME',
@@ -128,6 +135,54 @@ function isUnauthenticatedProxyUrl(value) {
 	} catch {
 		return false;
 	}
+}
+
+/** Reads one variable from an environment object regardless of key casing (Windows PATH vs Path). */
+export function environmentValue(environment, name) {
+	if (environment === null || typeof environment !== 'object') return null;
+	const wanted = name.toUpperCase();
+	for (const [key, value] of Object.entries(environment)) {
+		if (key.toUpperCase() === wanted && typeof value === 'string' && value.trim().length > 0) return value;
+	}
+	return null;
+}
+
+/**
+ * Resolves a command name the way the OS would: an explicit path must exist,
+ * a bare name is searched on PATH with PATHEXT on Windows. Returns null when
+ * nothing matches so callers can report "not installed" instead of spawning.
+ */
+export function findExecutableOnPath(name, environment, { platform = process.platform, existsSync = nodeExistsSync, extensions = null } = {}) {
+	if (typeof name !== 'string' || name.trim().length === 0) return null;
+	const windows = platform === 'win32';
+	if (path.isAbsolute(name) || /[\\/]/.test(name)) return existsSync(name) ? name : null;
+	const searchExtensions = extensions ?? (windows
+		? (environmentValue(environment, 'PATHEXT') ?? DEFAULT_WINDOWS_PATHEXT).split(';').map((entry) => entry.trim().toLowerCase()).filter((entry) => entry.startsWith('.'))
+		: []);
+	const hasKnownExtension = windows && searchExtensions.includes(path.extname(name).toLowerCase());
+	const candidates = hasKnownExtension || !windows ? [''] : [];
+	if (windows && !hasKnownExtension) candidates.push(...searchExtensions);
+	const directories = (environmentValue(environment, 'PATH') ?? '').split(windows ? ';' : ':').map((entry) => entry.trim()).filter((entry) => entry.length > 0);
+	for (const directory of directories) {
+		for (const extension of candidates) {
+			const candidate = path.join(directory, `${name}${extension}`);
+			try { if (existsSync(candidate)) return candidate; } catch { /* unreadable PATH entries are skipped */ }
+		}
+	}
+	return null;
+}
+
+/**
+ * npm on Windows installs `<name>.cmd` shims that Node cannot spawn directly. The package
+ * itself lives beside the shim in `node_modules`, so its JavaScript entrypoint can be run
+ * through this Node instead. Returns the entrypoint path or null.
+ */
+export function findNpmEntrypointBesideShim(name, entrypointSegments, environment, { platform = process.platform, existsSync = nodeExistsSync } = {}) {
+	if (platform !== 'win32' || !Array.isArray(entrypointSegments) || entrypointSegments.length === 0) return null;
+	const shim = findExecutableOnPath(name, environment, { platform, existsSync, extensions: ['.cmd'] });
+	if (shim === null) return null;
+	const entrypoint = path.join(path.dirname(shim), 'node_modules', ...entrypointSegments);
+	try { return existsSync(entrypoint) ? entrypoint : null; } catch { return null; }
 }
 
 function requireProvider(value) {

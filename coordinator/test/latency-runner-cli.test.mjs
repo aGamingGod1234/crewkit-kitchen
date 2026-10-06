@@ -74,6 +74,7 @@ test('loads private matrix, replay, and prompt files and passes bounded metadata
 		assert.deepEqual(seen[0].matrix, JSON.parse(MATRIX));
 		assert.deepEqual(seen[0].replayRecordings, JSON.parse(RECORDINGS));
 		assert.equal(seen[0].replayPrompt, 'private replay prompt');
+		assert.equal(seen[0].providerCliHealth, undefined, 'replay runs never probe provider CLIs');
 		assert.equal(seen[0].artifactDirectory, files.artifacts);
 		assert.equal(seen[0].arm, 'baseline');
 		assert.equal(seen[0].runId, 'run-123');
@@ -255,6 +256,8 @@ test('derives exact live-provider launch configuration without forwarding privat
 				assert.deepEqual(Object.keys(options.liveProviderOptions.config).sort(), ['codex', 'cwd']);
 				assert.equal(options.liveProviderOptions.config.codex.planningTimeoutMs, 100, 'trial budget bounds CLI timeout');
 				assert.equal(options.preflightTimeoutMs, 100);
+				assert.equal(typeof options.providerCliHealth?.check, 'function', 'live runs carry a real provider CLI monitor');
+				assert.equal(options.providerCliHealth.enabled, true);
 				assert.equal(JSON.stringify(options.liveProviderOptions).includes(privatePrompt), false);
 				assert.equal(JSON.stringify(options.liveProviderOptions).includes(privatePairingKey), false);
 				return { status: 'PASSED', trials: [], cleanup: { ok: true } };

@@ -272,6 +272,7 @@ public final class VerificationMain {
 		passedAssertions += MultiplexedServerBridgeVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.bridge.BridgeIntegrationFindingsVerification.verify();
 		passedAssertions += AgentVerboseVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.bridge.AgentNoticeVerification.verify();
 		passedAssertions += SingleBrainBoundaryVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.pov.PovViewRedirectVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.pov.PovStatePublisherVerification.verify();
