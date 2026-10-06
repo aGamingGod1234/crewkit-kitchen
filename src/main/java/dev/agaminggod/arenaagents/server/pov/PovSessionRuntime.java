@@ -369,7 +369,13 @@ public final class PovSessionRuntime {
 				session.publisher().tick(operator, agent, death(record, session.mode()), session.lookResetSeq(),
 						inputSequence(session));
 			} catch (RuntimeException failure) {
-				LOGGER.warn("Could not publish POV session {} for agent {}", session.id(), session.agentId(), failure);
+				// Same policy as a failing session tick: end the session instead of warning every tick.
+				LOGGER.warn("Stopped POV session {} for agent {} after a publish failure", session.id(), session.agentId(), failure);
+				try {
+					end(server, state, session, PovExitReason.FAILED, null, operator);
+				} catch (RuntimeException cleanupFailure) {
+					LOGGER.warn("Could not clean up failed POV session {}", session.id(), cleanupFailure);
+				}
 			}
 		}
 	}
