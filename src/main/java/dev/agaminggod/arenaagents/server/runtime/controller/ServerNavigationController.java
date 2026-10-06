@@ -39,6 +39,20 @@ public final class ServerNavigationController implements ServerController {
 	private static final double INTERMEDIATE_WAYPOINT_HORIZONTAL_TOLERANCE_SQUARED = 0.36D;
 	private static final double INTERMEDIATE_WAYPOINT_VERTICAL_TOLERANCE = 0.25D;
 	private static final double ENDPOINT_STABILITY_DISTANCE = 0.1D;
+	/** Straight-line steering looks this many walk nodes ahead, so cardinal grid paths run as diagonals. */
+	static final int STEERING_LOOKAHEAD_NODES = 8;
+	/** Half the player's 0.6 block width plus a margin, so a smoothed line never clips a corner. */
+	private static final double STEERING_HALF_WIDTH = 0.35D;
+	private static final double STEERING_SAMPLE_SPACING = 0.25D;
+	/** Walking gaze: a little below the horizon, the way a player watches the ground ahead. */
+	static final float WALKING_GAZE_PITCH = 10.0F;
+	private static final double GAZE_MIN_HORIZONTAL = 3.0D;
+	/** A step-up jump is pressed only next to the step; vanilla step height covers 0.6 without one. */
+	static final double JUMP_UP_TRIGGER_DISTANCE = 1.2D;
+	private static final double STEP_HEIGHT = 0.6D;
+	/** Gap jumps take off from the edge cell: between its center (2.0) and the landing's near side (1.0). */
+	static final double GAP_TAKEOFF_MAX_DISTANCE = 2.0D;
+	static final double GAP_TAKEOFF_MIN_DISTANCE = 1.0D;
 
 	private final Vec3 destination;
 	private final AABB arrivalRegion;
@@ -66,6 +80,7 @@ public final class ServerNavigationController implements ServerController {
 	private InputLease inputLease;
 	private LeasedServerInputController inputController;
 	private AgentInputStates.MotorState motorState;
+	private boolean lastSprint;
 	private ResourceKey<Level> startingDimension;
 
 	public ServerNavigationController(
@@ -136,6 +151,15 @@ public final class ServerNavigationController implements ServerController {
 			nodes = plan.nodes();
 			waypoint = nodes.get(waypointIndex);
 		}
+		int occupied = occupiedWalkNode(nodes, waypointIndex, grid(player.position()));
+		if (occupied >= 0 && player.onGround()) {
+			// Corner-cut steering crosses walk cells away from their centers; standing in a later
+			// path cell means every node up to it is behind the player.
+			waypointIndex = occupied + 1;
+			waypoint = nodes.get(waypointIndex);
+			progress.waypointAdvanced(player.position().distanceTo(
+					targetFor(world, waypoint, waypointIndex == nodes.size() - 1)), nowEpochMs);
+		}
 		boolean finalWaypoint = waypointIndex == nodes.size() - 1;
 		Vec3 target = targetFor(world, waypoint, finalWaypoint);
 		boolean reached = reachedTarget(world, player.position(), waypoint, finalWaypoint);
@@ -161,7 +185,12 @@ public final class ServerNavigationController implements ServerController {
 			waypoint = plan.nodes().get(waypointIndex);
 			target = targetFor(world, waypoint, waypointIndex == plan.nodes().size() - 1);
 		}
-		drive(player, world, waypoint, target, nowEpochMs);
+		List<PathNode> active = plan.nodes();
+		int steerIndex = waypoint.traversal() == TraversalType.WALK && player.onGround()
+				? steeringIndex(world, player.position(), active, waypointIndex) : waypointIndex;
+		Vec3 steer = steerIndex == waypointIndex ? target
+				: targetFor(world, active.get(steerIndex), steerIndex == active.size() - 1);
+		drive(player, world, waypoint, target, steer, nowEpochMs);
 		return TickResult.running(lastProgressValue);
 	}
 
@@ -444,7 +473,9 @@ public final class ServerNavigationController implements ServerController {
 		invalidatePlanning(actualOrigin, searchWorld == null || searchWorld.isCurrent());
 		if (search == null) {
 			if (preparation == null) {
-				releaseInput();
+				// Keep the lease and sprint through planning; releasing here made every replan a visible
+				// stop, sprint drop and re-acceleration (the sprint-walk-sprint gait).
+				coast(player);
 				plan = null;
 				searchWorld = world;
 				searchOrigin = actualOrigin;
@@ -454,6 +485,7 @@ public final class ServerNavigationController implements ServerController {
 			ServerPathPlanner.TickBudget budget = ServerPathPlanner.currentBudget();
 			if (!preparation.advance(searchWorld, position -> searchWorld.supportHeight(
 					position, position.x() + 0.5D, position.z() + 0.5D), budget::tryPrepare)) {
+				coast(player);
 				return TickResult.running(currentProgress());
 			}
 			GridPosition start = preparation.start;
@@ -466,7 +498,10 @@ public final class ServerNavigationController implements ServerController {
 			search = planner.beginSearch(start, searchGoals, grid(destination), (int) MAX_LOCAL_PLANNING_DISTANCE, previousFrontiers);
 		}
 		ServerPathPlanner.PlanningResult planning = planner.resume(search, searchWorld);
-		if (planning.deferred()) return TickResult.running(currentProgress());
+		if (planning.deferred()) {
+			coast(player);
+			return TickResult.running(currentProgress());
+		}
 		PathPlan candidate = planning.plan();
 		search = null;
 		if (candidate.outcome() != PathOutcome.FOUND) {
@@ -514,11 +549,22 @@ public final class ServerNavigationController implements ServerController {
 		return null;
 	}
 
+	/** Holds the lease, view and sprint with no movement keys while a route is being planned. */
+	private void coast(ServerPlayer player) {
+		if (inputLease == null || motorState == null) return;
+		inputController.apply(inputLease, new dev.agaminggod.arenaagents.server.runtime.input.AgentInputState(
+				0.0F, 0.0F, false, false, lastSprint && player.getFoodData().getFoodLevel() > 6,
+				false, false, motorState.yaw(), motorState.pitch(),
+				player.getInventory().getSelectedSlot(), InteractionHand.MAIN_HAND
+		));
+	}
+
 	private void drive(
 			ServerPlayer player,
 			MinecraftNavigationWorld world,
 			PathNode waypoint,
 			Vec3 target,
+			Vec3 steer,
 			long nowEpochMs
 	) {
 		boolean gapJump = waypoint.traversal() == TraversalType.JUMP_GAP;
@@ -534,35 +580,120 @@ public final class ServerNavigationController implements ServerController {
 			inputController = AgentInputRuntime.controller(player);
 			inputLease = inputController.acquire(AgentInputRuntime.requireAgentId(player), InputOwner.NAVIGATION, 100);
 		}
-		Vec3 lookTarget = target.add(0.0D, 0.85D, 0.0D);
-		Vec3 delta = lookTarget.subtract(player.getEyePosition());
-		double horizontal = Math.sqrt(delta.x * delta.x + delta.z * delta.z);
-		float targetYaw = net.minecraft.util.Mth.wrapDegrees(
-				(float) Math.toDegrees(Math.atan2(-delta.x, delta.z)));
-		float targetPitch = net.minecraft.util.Mth.clamp(
-				(float) -Math.toDegrees(Math.atan2(delta.y, horizontal)), -90.0F, 90.0F);
+		if (motorState == null) motorState = AgentInputStates.MotorState.initial(player.getYRot(), player.getXRot());
+		double steerDx = steer.x - player.getX();
+		double steerDz = steer.z - player.getZ();
+		double steerHorizontal = Math.sqrt(steerDx * steerDx + steerDz * steerDz);
+		// Directly over the target atan2 has no direction; holding the heading avoids a spurious turn.
+		float targetYaw = steerHorizontal < 0.05D ? motorState.yaw() : net.minecraft.util.Mth.wrapDegrees(
+				(float) Math.toDegrees(Math.atan2(-steerDx, steerDz)));
+		float targetPitch;
+		if (swimming || climbing) {
+			Vec3 delta = target.add(0.0D, 0.85D, 0.0D).subtract(player.getEyePosition());
+			targetPitch = net.minecraft.util.Mth.clamp((float) -Math.toDegrees(
+					Math.atan2(delta.y, Math.sqrt(delta.x * delta.x + delta.z * delta.z))), -90.0F, 90.0F);
+		} else {
+			targetPitch = walkingGazePitch(steer.y - player.getY(), steerHorizontal);
+		}
 		if (climbing && atClimbColumn) {
 			net.minecraft.core.Direction wall = world.climbDirection(waypoint.position());
 			if (wall != null) targetYaw = (float) Math.toDegrees(Math.atan2(-wall.getStepX(), wall.getStepZ()));
 		}
-		if (motorState == null) motorState = AgentInputStates.MotorState.initial(player.getYRot(), player.getXRot());
+		double targetDx = target.x - player.getX();
+		double targetDz = target.z - player.getZ();
+		boolean jump = jumpNeeded(waypoint.traversal(), target.y - player.getY(),
+				Math.sqrt(targetDx * targetDx + targetDz * targetDz))
+				|| shallowWater || swimming || (climbing && target.y > player.getY() + 0.15D);
 		AgentInputStates.MotorStep step = AgentInputStates.stepMotor(
 				motorState,
 				new AgentInputStates.MotorTarget(
 						targetYaw,
 						targetPitch,
 						!descendingClimb,
-						waypoint.traversal() == TraversalType.JUMP_UP || gapJump || shallowWater || swimming || (climbing && target.y > player.getY() + 0.15D),
+						jump,
 						!swimming && !crouching && !climbing && (sprint || gapJump) && player.getFoodData().getFoodLevel() > 6
 				),
 				nowEpochMs
 		);
 		motorState = step.state();
+		lastSprint = step.sprint();
 		inputController.apply(inputLease, new dev.agaminggod.arenaagents.server.runtime.input.AgentInputState(
 				step.forward(), step.strafe(), step.jump(), crouching, step.sprint(),
 				false, false, step.state().yaw(), step.state().pitch(),
 				player.getInventory().getSelectedSlot(), InteractionHand.MAIN_HAND
 		));
+	}
+
+	/**
+	 * Jump only where the terrain needs it: next to a step taller than vanilla's step height, or from the
+	 * take-off cell of a gap. Holding jump for the whole waypoint re-jumped on every landing short of the
+	 * waypoint center, which read as a jump-walk-jump gait.
+	 */
+	static boolean jumpNeeded(TraversalType traversal, double rise, double horizontalDistance) {
+		return switch (traversal) {
+			case JUMP_UP -> rise > STEP_HEIGHT && horizontalDistance <= JUMP_UP_TRIGGER_DISTANCE;
+			case JUMP_GAP -> horizontalDistance > GAP_TAKEOFF_MIN_DISTANCE
+					&& horizontalDistance <= GAP_TAKEOFF_MAX_DISTANCE;
+			default -> false;
+		};
+	}
+
+	/** Steady gaze toward the steering point, tilted by the slope; avoids nodding at each node near the feet. */
+	static float walkingGazePitch(double rise, double horizontalDistance) {
+		double run = Math.max(GAZE_MIN_HORIZONTAL, horizontalDistance);
+		return net.minecraft.util.Mth.clamp(
+				WALKING_GAZE_PITCH - (float) Math.toDegrees(Math.atan2(rise, run)), -60.0F, 60.0F);
+	}
+
+	/**
+	 * Index of the furthest node, up to {@link #STEERING_LOOKAHEAD_NODES} ahead, that the player can walk
+	 * to in a straight line over standable cells at its own level. The planner only links cardinal
+	 * neighbours, so following each node turns a diagonal route into a staircase of 90 degree turns.
+	 */
+	static int steeringIndex(WalkabilityView world, Vec3 position, List<PathNode> nodes, int index) {
+		PathNode first = nodes.get(index);
+		int level = first.position().y();
+		if (first.traversal() != TraversalType.WALK || grid(position).y() != level) return index;
+		int best = index;
+		int last = Math.min(nodes.size() - 1, index + STEERING_LOOKAHEAD_NODES);
+		for (int candidate = index + 1; candidate <= last; candidate++) {
+			PathNode node = nodes.get(candidate);
+			if (node.traversal() != TraversalType.WALK || node.position().y() != level) break;
+			if (!clearWalkLine(world, position, center(node.position()), level)) break;
+			best = candidate;
+		}
+		return best;
+	}
+
+	/** Index of a walk node within the lookahead window whose cell holds the player's feet, or -1. */
+	static int occupiedWalkNode(List<PathNode> nodes, int index, GridPosition feet) {
+		int last = Math.min(nodes.size() - 2, index + STEERING_LOOKAHEAD_NODES);
+		for (int candidate = index; candidate <= last; candidate++) {
+			PathNode node = nodes.get(candidate);
+			if (node.traversal() != TraversalType.WALK) return -1;
+			if (node.position().equals(feet)) return candidate;
+		}
+		return -1;
+	}
+
+	static boolean clearWalkLine(WalkabilityView world, Vec3 from, Vec3 to, int level) {
+		double dx = to.x - from.x;
+		double dz = to.z - from.z;
+		int samples = Math.max(1, (int) Math.ceil(Math.sqrt(dx * dx + dz * dz) / STEERING_SAMPLE_SPACING));
+		Set<GridPosition> checked = new java.util.HashSet<>();
+		for (int sample = 0; sample <= samples; sample++) {
+			double t = (double) sample / samples;
+			double x = from.x + dx * t;
+			double z = from.z + dz * t;
+			for (int corner = 0; corner < 4; corner++) {
+				GridPosition cell = new GridPosition(
+						(int) Math.floor(x + ((corner & 1) == 0 ? -STEERING_HALF_WIDTH : STEERING_HALF_WIDTH)),
+						level,
+						(int) Math.floor(z + ((corner & 2) == 0 ? -STEERING_HALF_WIDTH : STEERING_HALF_WIDTH)));
+				if (checked.add(cell) && world.traversalAt(cell) != TraversalType.WALK) return false;
+			}
+		}
+		return true;
 	}
 
 	private TickResult succeed(ServerPlayer player, String reasonCode, String message) {
