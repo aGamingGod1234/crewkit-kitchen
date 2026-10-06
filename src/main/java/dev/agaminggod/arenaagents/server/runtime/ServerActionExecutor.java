@@ -17,6 +17,7 @@ import dev.agaminggod.arenaagents.server.conversation.ServerAgentConversationRou
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerController;
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerNavigationController;
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerItemPickupController;
+import dev.agaminggod.arenaagents.server.runtime.controller.ServerLookController;
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerPathPlanner;
 import dev.agaminggod.arenaagents.server.runtime.transaction.ServerTransactionAdapter;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
@@ -580,12 +581,12 @@ public final class ServerActionExecutor {
 							arguments.has("timeoutMs") ? integer(arguments, "timeoutMs") : DEFAULT_TIMEOUT_MS
 					)
 				);
-			case LOOK_AT -> ActiveAction.immediate(request, player, () ->
-					OfflineAgentPlayers.actions(player).lookAt(new Vec3(
-							number(arguments, "x"),
-							number(arguments, "y"),
-							number(arguments, "z")
-					)));
+			// Turns over a few ticks like a player instead of snapping; finishes on the exact lookAt rotation.
+			case LOOK_AT -> ActiveAction.controller(request, player, new ServerLookController(new Vec3(
+					number(arguments, "x"),
+					number(arguments, "y"),
+					number(arguments, "z")
+			)));
 			case ATTACK -> ActiveAction.immediate(request, player,
 					() -> attack(player, string(arguments, "targetId")));
 			case SELECT_ITEM -> ActiveAction.immediate(request, player,
