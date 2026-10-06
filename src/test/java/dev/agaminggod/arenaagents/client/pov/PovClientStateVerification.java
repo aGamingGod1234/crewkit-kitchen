@@ -3,7 +3,10 @@ package dev.agaminggod.arenaagents.client.pov;
 import dev.agaminggod.arenaagents.pov.PovMode;
 import java.util.UUID;
 
-/** Dependency-free checks for the POV session state machine, view routing, look math, hand bob and body damage. */
+/**
+ * Dependency-free checks for the POV session state machine, view routing, look math, hand bob, body damage, the
+ * takeover body position stream and the latency probe.
+ */
 public final class PovClientStateVerification {
 	private static final UUID AGENT_A = UUID.fromString("00000000-0000-0000-0000-00000000000a");
 	private static final UUID AGENT_B = UUID.fromString("00000000-0000-0000-0000-00000000000b");
@@ -20,6 +23,8 @@ public final class PovClientStateVerification {
 		verifyView();
 		verifyHands();
 		verifyBodyMonitor();
+		verifyBodyPosition();
+		verifyLatencyProbe();
 		return checks;
 	}
 
@@ -180,6 +185,59 @@ public final class PovClientStateVerification {
 		monitor.reset();
 		check(!monitor.flashing(), "reset clears the flash");
 		check(!monitor.observe(4.0F) && !monitor.flashing(), "the first reading after reset is a baseline, not damage");
+	}
+
+	private static void verifyBodyPosition() {
+		PovBodyPosition stream = new PovBodyPosition();
+		check(stream.next() == null, "no position before the first pose keeps vanilla placement");
+		// One pose per tick (the normal case): each tick shows the newest server tick, nothing is held back.
+		for (int tick = 1; tick <= 5; tick++) {
+			stream.accept(tick, 64.0D, 0.0D);
+			PovBodyPosition.Position shown = stream.next();
+			check(shown != null && shown.x() == tick && stream.pending() == 0, "steady poses are shown the tick they arrive " + tick);
+		}
+		check(stream.next() == null, "a tick without a pose holds the current position");
+		// Arrivals bunching at the tick boundary (0, 2, 0, 2...) still advance one server tick per client tick.
+		stream.reset();
+		stream.accept(1.0D, 64.0D, 0.0D);
+		stream.accept(2.0D, 64.0D, 0.0D);
+		check(stream.next().x() == 1.0D && stream.pending() == 1, "a bunched pair shows the older pose and keeps one in reserve");
+		check(stream.next().x() == 2.0D, "the reserve covers the tick that received nothing");
+		stream.accept(3.0D, 64.0D, 0.0D);
+		stream.accept(4.0D, 64.0D, 0.0D);
+		check(stream.next().x() == 3.0D && stream.next().x() == 4.0D, "bunched poses keep moving one step per tick");
+		// A burst after a hiccup is caught up at once instead of being replayed late.
+		for (int pose = 10; pose < 13; pose++) stream.accept(pose, 64.0D, 0.0D);
+		check(stream.next().x() == 11.0D && stream.pending() == 1, "a burst skips to one behind the newest pose");
+		for (int pose = 20; pose < 30; pose++) stream.accept(pose, 64.0D, 0.0D);
+		check(stream.pending() == PovBodyPosition.MAX_PENDING, "the pending poses are bounded");
+		stream.accept(Double.NaN, 64.0D, 0.0D);
+		stream.accept(1.0D, Double.POSITIVE_INFINITY, 0.0D);
+		check(stream.pending() == PovBodyPosition.MAX_PENDING, "non-finite positions are dropped");
+		stream.reset();
+		check(stream.pending() == 0 && stream.next() == null, "reset forgets every pending pose");
+	}
+
+	private static void verifyLatencyProbe() {
+		java.util.List<String> reports = new java.util.ArrayList<>();
+		PovLatencyProbe probe = new PovLatencyProbe(reports::add);
+		long millis = 1_000_000L;
+		probe.sent(5, 0L);
+		probe.sent(7, 50L * millis);
+		check(probe.acknowledged(5, 80L * millis) == 80L * millis, "the round trip runs from send to the acknowledging pose");
+		check(probe.acknowledged(5, 130L * millis) == -1L, "a repeated acknowledgement is not a new sample");
+		check(probe.acknowledged(0, 130L * millis) == -1L, "sequence zero acknowledges nothing");
+		check(probe.acknowledged(6, 130L * millis) == -1L, "an action sequence that was never a frame is ignored");
+		check(probe.acknowledged(7, 130L * millis) == 80L * millis, "frames are matched by sequence");
+		check(probe.acknowledged(7 + 128, 200L * millis) == -1L, "a ring slot reused by another sequence is not matched");
+		for (int sequence = 1000; sequence < 1000 + PovLatencyProbe.WINDOW; sequence++) {
+			probe.sent(sequence, sequence * millis);
+			probe.acknowledged(sequence, sequence * millis + 60L * millis);
+		}
+		check(reports.size() == 1 && reports.get(0).contains("average 61.0 ms") && reports.get(0).contains("worst 80.0 ms"),
+				"a full window reports the average and worst round trip: " + reports);
+		probe.reset();
+		check(probe.acknowledged(1000, 0L) == -1L, "reset forgets sent frames");
 	}
 
 	private static boolean near(float actual, float expected) {

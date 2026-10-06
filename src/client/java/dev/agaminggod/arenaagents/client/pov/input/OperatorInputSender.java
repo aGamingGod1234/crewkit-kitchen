@@ -2,6 +2,7 @@ package dev.agaminggod.arenaagents.client.pov.input;
 
 import dev.agaminggod.arenaagents.client.pov.PovClient;
 import dev.agaminggod.arenaagents.client.pov.PovClientSession;
+import dev.agaminggod.arenaagents.client.pov.PovHudProxy;
 import dev.agaminggod.arenaagents.client.pov.PovLook;
 import dev.agaminggod.arenaagents.client.pov.screen.PovScreens;
 import dev.agaminggod.arenaagents.pov.OperatorAction;
@@ -48,6 +49,8 @@ public final class OperatorInputSender {
 
 	public static void observeServerSlot(int slot) {
 		CAPTURE.observeServerSlot(slot);
+		// The state payload just wrote the server's slot into the HUD; keep a pending local choice on screen.
+		if (PovClient.isTakeover()) PovHudProxy.showSelectedSlot(CAPTURE.selectedSlot());
 	}
 
 	/** Runs at the head of Minecraft.handleKeybinds so vanilla finds no clicks to act on. */
@@ -104,11 +107,14 @@ public final class OperatorInputSender {
 			return;
 		}
 		PovInputCapture.Frame frame = CAPTURE.nextFrame();
+		PovHudProxy.showSelectedSlot(frame.selectedSlot());
 		float yaw = PovLook.yaw();
 		float pitch = PovLook.pitch();
 		long sessionId = session.sessionId();
-		if (send(client, new OperatorInputPayload(sessionId, nextSequence(), frame.forward(), frame.strafe(),
+		int frameSequence = nextSequence();
+		if (send(client, new OperatorInputPayload(sessionId, frameSequence, frame.forward(), frame.strafe(),
 				yaw, pitch, frame.heldFlags(), frame.selectedSlot()))) {
+			PovClient.inputFrameSent(frameSequence);
 			framesSent = true;
 			frameSessionId = sessionId;
 			lastYaw = yaw;

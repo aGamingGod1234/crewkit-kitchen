@@ -83,9 +83,11 @@ public record PovAgentSnapshot(
 		}
 	}
 
-	public record Pose(float yaw, float pitch, float attackStrength, int flags) {
+	/** Look, flags and the body's post-physics position (feet), which the takeover camera follows. */
+	public record Pose(float yaw, float pitch, float attackStrength, int flags, double x, double y, double z) {
 		public Pose {
-			if (!Float.isFinite(yaw) || !Float.isFinite(pitch) || !Float.isFinite(attackStrength)) {
+			if (!Float.isFinite(yaw) || !Float.isFinite(pitch) || !Float.isFinite(attackStrength)
+					|| !Double.isFinite(x) || !Double.isFinite(y) || !Double.isFinite(z)) {
 				throw new IllegalArgumentException("pose values must be finite");
 			}
 		}
@@ -95,7 +97,7 @@ public record PovAgentSnapshot(
 		}
 
 		public Pose asDead() {
-			return new Pose(yaw, pitch, attackStrength, flags | AgentPovPosePayload.FLAG_DEAD);
+			return new Pose(yaw, pitch, attackStrength, flags | AgentPovPosePayload.FLAG_DEAD, x, y, z);
 		}
 	}
 
@@ -146,7 +148,7 @@ public record PovAgentSnapshot(
 					List.of(),
 					Optional.empty(),
 					Optional.empty(),
-					new Pose(0.0F, 0.0F, 1.0F, AgentPovPosePayload.FLAG_DEAD)
+					new Pose(0.0F, 0.0F, 1.0F, AgentPovPosePayload.FLAG_DEAD, 0.0D, 0.0D, 0.0D)
 			);
 		}
 		PovVitals last = lastKnown.vitals;
@@ -327,7 +329,10 @@ public record PovAgentSnapshot(
 						agent.isUsingItem(),
 						agent.isBlocking(),
 						agent.getHealth() <= 0.0F
-				)
+				),
+				agent.getX(),
+				agent.getY(),
+				agent.getZ()
 		);
 	}
 

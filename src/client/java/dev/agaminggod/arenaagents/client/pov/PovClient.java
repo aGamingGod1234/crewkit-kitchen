@@ -33,9 +33,12 @@ import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.Marker;
 import net.minecraft.world.entity.player.Player;
 import org.lwjgl.glfw.GLFW;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /** Client side of /spectate and /takeover: session state, camera binding, hand source and the exit key. */
 public final class PovClient {
+	private static final Logger LOGGER = LoggerFactory.getLogger(PovClient.class);
 	// Category is a record, so an equal id joins AgentControlClient's registered "Arena Agents" group.
 	private static final KeyMapping EXIT_VIEW = new KeyMapping(
 			"key.arenaagents.exit_agent_view",
@@ -48,6 +51,12 @@ public final class PovClient {
 	private static final PovSessionTracker TRACKER = new PovSessionTracker();
 	private static final PovBodyMonitor BODY = new PovBodyMonitor();
 	private static final PovHands HANDS = new PovHands();
+	private static final PovBodyPosition BODY_POSITION = new PovBodyPosition();
+	private static final PovLatencyProbe LATENCY = new PovLatencyProbe(LOGGER::info);
+	// A teleport or respawn this far is shown as a cut rather than a one-tick streak across the world.
+	private static final double SNAP_DISTANCE_SQR = 8.0D * 8.0D;
+	private static Entity followedBody;
+	private static PovBodyPosition.Position lastFollowed;
 	private static boolean registered;
 	private static AgentPovStatePayload latestState;
 	private static AgentPovMenuPayload latestMenu;
@@ -207,6 +216,8 @@ public final class PovClient {
 		PovView.acceptPose(payload.yaw(), payload.pitch());
 		attackStrength = payload.attackStrength();
 		poseFlags = payload.flags();
+		if (PovLatencyProbe.ENABLED) LATENCY.acknowledged(payload.inputSequence(), System.nanoTime());
+		if (isTakeover() && !payload.hasFlag(AgentPovPosePayload.FLAG_DEAD)) BODY_POSITION.accept(payload.x(), payload.y(), payload.z());
 		if (result == PovSessionTracker.PoseResult.LOOK_RESET) PovLook.reset(payload.yaw(), payload.pitch());
 	}
 
@@ -242,6 +253,7 @@ public final class PovClient {
 		PovView.reset();
 		BODY.reset();
 		HANDS.reset();
+		resetFollow();
 		Player agent = client.level == null ? null : resolveAgent(client, next);
 		// A provisional look until the first pose payload seeds the exact one.
 		PovLook.reset(agent == null ? 0.0F : agent.getYHeadRot(), agent == null ? 0.0F : agent.getXRot());
@@ -262,6 +274,8 @@ public final class PovClient {
 		silentTicks++;
 		PovView.tick();
 		Player agent = bindCamera(client, current);
+		if (current.takeover() && agent != null) followServerPosition(agent);
+		else BODY_POSITION.reset();
 		PovHudProxy.tick(client, agent);
 		// The view rotation is what the camera shows, so the hands chase exactly that; a lost agent forgets
 		// the bob so the hands snap to its look when it reappears instead of swinging in from a stale one.
@@ -270,6 +284,49 @@ public final class PovClient {
 		// The body stays in the world in both modes; only a takeover can end on its damage, so only then is it announced.
 		if (BODY.observe(client.player.getHealth() + client.player.getAbsorptionAmount()) && current.takeover())
 			overlay(client, "Your body took damage");
+	}
+
+	/**
+	 * Puts the taken-over body where the server's latest pose says, once per client tick and after the level ticked
+	 * entities, so vanilla's lerp toward the older tracker position is overwritten. Setting xo to the previous
+	 * stream position makes the camera's partial-tick lerp run between consecutive server ticks, the same way the
+	 * operator's own body renders. Nothing new this tick holds the last position instead of drifting back.
+	 */
+	private static void followServerPosition(Player agent) {
+		if (agent != followedBody) {
+			followedBody = agent;
+			lastFollowed = null;
+		}
+		PovBodyPosition.Position next = BODY_POSITION.next();
+		if (next == null) next = lastFollowed;
+		// Until the first pose arrives, vanilla tracking keeps placing the body.
+		if (next == null) return;
+		PovBodyPosition.Position from = lastFollowed == null || distanceSqr(lastFollowed, next) > SNAP_DISTANCE_SQR
+				? next : lastFollowed;
+		agent.xo = from.x();
+		agent.yo = from.y();
+		agent.zo = from.z();
+		agent.setPos(next.x(), next.y(), next.z());
+		lastFollowed = next;
+	}
+
+	private static double distanceSqr(PovBodyPosition.Position a, PovBodyPosition.Position b) {
+		double dx = a.x() - b.x();
+		double dy = a.y() - b.y();
+		double dz = a.z() - b.z();
+		return dx * dx + dy * dy + dz * dz;
+	}
+
+	private static void resetFollow() {
+		BODY_POSITION.reset();
+		LATENCY.reset();
+		followedBody = null;
+		lastFollowed = null;
+	}
+
+	/** Debug-only: times a sent input frame until a pose produced after it arrives (see {@link PovLatencyProbe}). */
+	public static void inputFrameSent(int sequence) {
+		if (PovLatencyProbe.ENABLED) LATENCY.sent(sequence, System.nanoTime());
 	}
 
 	private static void overlay(Minecraft client, String message) {
@@ -354,6 +411,7 @@ public final class PovClient {
 		hasLastPosition = false;
 		BODY.reset();
 		HANDS.reset();
+		resetFollow();
 		PovView.reset();
 		PovLook.reset(0.0F, 0.0F);
 		PovHudProxy.clear();

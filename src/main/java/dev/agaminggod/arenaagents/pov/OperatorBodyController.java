@@ -26,4 +26,9 @@ public interface OperatorBodyController {
 	void end();
 
 	boolean active();
+
+	/** Sequence of the last input frame applied to the body, 0 before any; echoed in poses for latency checks. */
+	default int lastInputSequence() {
+		return 0;
+	}
 }

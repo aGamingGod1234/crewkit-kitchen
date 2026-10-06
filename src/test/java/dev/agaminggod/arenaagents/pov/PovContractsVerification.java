@@ -161,14 +161,18 @@ public final class PovContractsVerification {
 
 	private static void verifyPoseMenuAndStopBounds() {
 		AgentPovPosePayload pose = new AgentPovPosePayload(1L, 720f, 90f, 1f,
-				AgentPovPosePayload.FLAG_SNEAKING | AgentPovPosePayload.FLAG_DEAD);
+				AgentPovPosePayload.FLAG_SNEAKING | AgentPovPosePayload.FLAG_DEAD, 0.0D, 64.0D, 0.0D, 0);
 		assertTrue(pose.hasFlag(AgentPovPosePayload.FLAG_DEAD) && !pose.hasFlag(AgentPovPosePayload.FLAG_SWIMMING),
 				"pose flags are readable");
-		expectFailure(() -> new AgentPovPosePayload(1L, 0f, 90.5f, 0f, 0), "pose pitch above 90");
-		expectFailure(() -> new AgentPovPosePayload(1L, Float.POSITIVE_INFINITY, 0f, 0f, 0), "infinite pose yaw");
-		expectFailure(() -> new AgentPovPosePayload(1L, 0f, 0f, 1.5f, 0), "attack strength above 1");
-		expectFailure(() -> new AgentPovPosePayload(1L, 0f, 0f, -0.1f, 0), "negative attack strength");
-		expectFailure(() -> new AgentPovPosePayload(1L, 0f, 0f, 0f, 256), "unknown pose flag");
+		expectFailure(() -> new AgentPovPosePayload(1L, 0f, 90.5f, 0f, 0, 0.0D, 0.0D, 0.0D, 0), "pose pitch above 90");
+		expectFailure(() -> new AgentPovPosePayload(1L, Float.POSITIVE_INFINITY, 0f, 0f, 0, 0.0D, 0.0D, 0.0D, 0), "infinite pose yaw");
+		expectFailure(() -> new AgentPovPosePayload(1L, 0f, 0f, 1.5f, 0, 0.0D, 0.0D, 0.0D, 0), "attack strength above 1");
+		expectFailure(() -> new AgentPovPosePayload(1L, 0f, 0f, -0.1f, 0, 0.0D, 0.0D, 0.0D, 0), "negative attack strength");
+		expectFailure(() -> new AgentPovPosePayload(1L, 0f, 0f, 0f, 256, 0.0D, 0.0D, 0.0D, 0), "unknown pose flag");
+		expectFailure(() -> new AgentPovPosePayload(1L, 0f, 0f, 0f, 0, Double.NaN, 0.0D, 0.0D, 0), "non-finite pose position");
+		expectFailure(() -> new AgentPovPosePayload(1L, 0f, 0f, 0f, 0, 0.0D, Double.POSITIVE_INFINITY, 0.0D, 0),
+				"infinite pose position");
+		expectFailure(() -> new AgentPovPosePayload(1L, 0f, 0f, 0f, 0, 0.0D, 0.0D, 0.0D, -1), "negative input sequence");
 
 		assertEquals(256, menuPayload(256, 32).slots().size(), "256 menu slots are accepted");
 		expectFailure(() -> menuPayload(257, 0), "257 menu slots");
@@ -245,7 +249,8 @@ public final class PovContractsVerification {
 		assertEquals(Optional.empty(), decodedScreen.death(), "absent death round trips");
 
 		AgentPovPosePayload pose = new AgentPovPosePayload(-42L, -170.25f, -33.5f, 0.75f,
-				AgentPovPosePayload.FLAG_ON_GROUND | AgentPovPosePayload.FLAG_BLOCKING);
+				AgentPovPosePayload.FLAG_ON_GROUND | AgentPovPosePayload.FLAG_BLOCKING,
+				-1234.567890123D, 71.25D, 98765.4321D, 4096);
 		assertEquals(pose, roundTrip(AgentPovPosePayload.CODEC, pose, registries, "pose"), "pose round trips");
 
 		List<ItemStack> slots = new ArrayList<>(stacks(90));
