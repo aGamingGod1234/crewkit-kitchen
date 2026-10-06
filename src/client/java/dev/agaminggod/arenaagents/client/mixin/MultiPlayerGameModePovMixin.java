@@ -16,9 +16,9 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  * Mirrored screens never reach vanilla container packets; container id 0 would edit the operator's
  * own inventory. During an agent view getPlayerMode reports the agent's mode so third-party HUD gates
  * such as Axiom's creative tool slot follow the viewed agent. Its vanilla callers are cosmetic (HUD,
- * hand gate, block outline, quick-play log, Tutorial.isSurvival, which can only show tutorial toasts)
- * except the F3+F4 switcher, which changes the operator's own body and therefore reads the real field
- * through {@link GameModeSwitcherScreenPovMixin}.
+ * hand gate, block outline, marker particles in ClientLevel, quick-play log, Tutorial.isSurvival, which
+ * can only show tutorial toasts) except the F3+F4 switcher, which changes the operator's own body and
+ * therefore reads the real field through {@link GameModeSwitcherScreenPovMixin}.
  */
 @Mixin(MultiPlayerGameMode.class)
 abstract class MultiPlayerGameModePovMixin {

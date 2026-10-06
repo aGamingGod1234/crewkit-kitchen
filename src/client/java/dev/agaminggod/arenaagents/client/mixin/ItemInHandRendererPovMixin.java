@@ -9,7 +9,6 @@ import dev.agaminggod.arenaagents.client.pov.PovHands;
 import dev.agaminggod.arenaagents.client.pov.PovHudProxy;
 import net.minecraft.client.player.AbstractClientPlayer;
 import net.minecraft.client.player.LocalPlayer;
-import net.minecraft.client.player.RemotePlayer;
 import net.minecraft.client.renderer.ItemInHandRenderer;
 import net.minecraft.client.renderer.SubmitNodeCollector;
 import net.minecraft.client.renderer.entity.EntityRenderDispatcher;
@@ -89,10 +88,12 @@ abstract class ItemInHandRendererPovMixin {
 	}
 
 	// Vanilla lerps the two fields itself, so each field read answers with the bob at its end of the tick.
+	// Before the first seeded tick the agent's own look is the bob, so the operator's value never tilts the hands.
 	private static float arenaagents$bob(float original, float tickEnd, boolean pitch) {
 		AbstractClientPlayer agent = PovClient.agentPlayer();
+		if (agent == null) return original;
 		PovHands hands = PovClient.hands();
-		if (agent == null || !hands.seeded()) return original;
+		if (!hands.seeded()) return pitch ? agent.getViewXRot(1.0F) : agent.getViewYRot(1.0F);
 		return pitch ? hands.xBob(tickEnd) : hands.yBob(tickEnd);
 	}
 
@@ -111,7 +112,7 @@ abstract class ItemInHandRendererPovMixin {
 	}
 
 	// Hand selection (bow, crossbow, charged crossbow, item in use) keeps vanilla's logic on the agent's items.
-	@WrapOperation(method = {"evaluateWhichHandsToRender", "selectionUsingItemWhileHoldingBowLike", "tick"}, at = @At(value = "INVOKE",
+	@WrapOperation(method = {"evaluateWhichHandsToRender", "tick"}, at = @At(value = "INVOKE",
 			target = "Lnet/minecraft/client/player/LocalPlayer;getMainHandItem()Lnet/minecraft/world/item/ItemStack;"))
 	private static ItemStack arenaagents$povMainHandItem(LocalPlayer player, Operation<ItemStack> original) {
 		Player source = arenaagents$heldItemSource();
@@ -155,10 +156,15 @@ abstract class ItemInHandRendererPovMixin {
 				&& (boat.getPaddleState(AbstractBoat.PADDLE_LEFT) || boat.getPaddleState(AbstractBoat.PADDLE_RIGHT));
 	}
 
-	// The post-attack dip of the held item follows the agent's streamed attack strength.
+	// The agent entity's own swap ticker runs client-side like vanilla's (Player.tick advances it and resets
+	// it on an item change). The streamed attack strength is not usable here: ServerPlayer.swing resets it
+	// on every swing, so it would keep the tool lowered for as long as the agent mines. The one-off dip
+	// after a hit is therefore not reproduced; the never-ticked stand-in simply reports a raised hand.
 	@WrapOperation(method = "tick", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/player/LocalPlayer;getItemSwapScale(F)F"))
 	private static float arenaagents$povItemSwapScale(LocalPlayer player, float partialTick, Operation<Float> original) {
-		return PovClient.isActive() ? PovClient.attackStrength() : original.call(player, partialTick);
+		if (!PovClient.isActive()) return original.call(player, partialTick);
+		AbstractClientPlayer agent = PovClient.agentPlayer();
+		return agent == null ? 1.0F : agent.getItemSwapScale(partialTick);
 	}
 
 	// Arm texture, slim or wide model and sleeve layers inside the arm and map helpers.
@@ -206,8 +212,6 @@ abstract class ItemInHandRendererPovMixin {
 	private static Player arenaagents$heldItemSource() {
 		if (!PovClient.isActive()) return null;
 		AbstractClientPlayer agent = PovClient.agentPlayer();
-		if (agent != null) return agent;
-		RemotePlayer proxy = PovHudProxy.current();
-		return proxy;
+		return agent != null ? agent : PovHudProxy.current();
 	}
 }

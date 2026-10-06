@@ -153,8 +153,17 @@ public final class PovClient {
 		if (TRACKER.phase() != PovSessionTracker.Phase.ACTIVE) return null;
 		if (latestState != null && latestState.death().isPresent()) return null;
 		Minecraft client = Minecraft.getInstance();
-		return client.getCameraEntity() instanceof AbstractClientPlayer player && player != client.player && !player.isDeadOrDying()
+		return client.getCameraEntity() instanceof AbstractClientPlayer player && player != client.player
+				&& PovView.isTarget(player) && !player.isRemoved() && !player.isDeadOrDying()
 				? player : null;
+	}
+
+	/**
+	 * Binds that happen outside the tick loop (state payload, respawn) can be followed by frames before
+	 * the next client tick; seeding the bob there keeps the hands level with the agent's look at once.
+	 */
+	private static void seedHands(Player agent) {
+		if (agent != null && !HANDS.seeded()) HANDS.tick(agent.getViewXRot(1.0F), agent.getViewYRot(1.0F));
 	}
 
 	/** Smoothed agent look for the first-person hands; advanced once per client tick. */
@@ -172,7 +181,7 @@ public final class PovClient {
 		}
 		// Vanilla pointed the camera at the new local player; that is now what exit restores.
 		if (cameraCaptured) previousCamera = client.player;
-		bindCamera(client, current);
+		seedHands(bindCamera(client, current));
 	}
 
 	private static void acceptState(Minecraft client, AgentPovStatePayload payload) {
@@ -186,7 +195,9 @@ public final class PovClient {
 		latestState = payload;
 		PovHudProxy.update(client, next, payload);
 		PovScreens.onState(next, payload);
-		if (result != PovSessionTracker.StateResult.UPDATED && client.level != null && client.player != null) bindCamera(client, next);
+		if (result != PovSessionTracker.StateResult.UPDATED && client.level != null && client.player != null) {
+			seedHands(bindCamera(client, next));
+		}
 	}
 
 	private static void acceptPose(AgentPovPosePayload payload) {
@@ -252,8 +263,10 @@ public final class PovClient {
 		PovView.tick();
 		Player agent = bindCamera(client, current);
 		PovHudProxy.tick(client, agent);
-		// The view rotation is what the camera shows, so the hands chase exactly that.
+		// The view rotation is what the camera shows, so the hands chase exactly that; a lost agent forgets
+		// the bob so the hands snap to its look when it reappears instead of swinging in from a stale one.
 		if (agent != null) HANDS.tick(agent.getViewXRot(1.0F), agent.getViewYRot(1.0F));
+		else HANDS.reset();
 		// The body stays in the world in both modes; only a takeover can end on its damage, so only then is it announced.
 		if (BODY.observe(client.player.getHealth() + client.player.getAbsorptionAmount()) && current.takeover())
 			overlay(client, "Your body took damage");
@@ -347,6 +360,13 @@ public final class PovClient {
 		discardAnchor();
 		if (active) PovScreens.closeAll();
 		restoreCamera(client);
+		// LocalPlayer stops chasing its own bob while it is not the camera, so without this the operator's
+		// hands would swing in from where they looked before the view started.
+		LocalPlayer operator = client.player;
+		if (operator != null) {
+			operator.xBob = operator.xBobO = operator.getXRot();
+			operator.yBob = operator.yBobO = operator.getYRot();
+		}
 		sessionLevel = null;
 	}
 
