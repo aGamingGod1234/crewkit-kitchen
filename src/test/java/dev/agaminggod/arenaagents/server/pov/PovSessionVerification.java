@@ -1,16 +1,23 @@
 package dev.agaminggod.arenaagents.server.pov;
 
+import com.mojang.brigadier.Command;
+import com.mojang.brigadier.CommandDispatcher;
+import com.mojang.brigadier.arguments.StringArgumentType;
+import com.mojang.brigadier.builder.RequiredArgumentBuilder;
+import com.mojang.brigadier.exceptions.CommandSyntaxException;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
 import dev.agaminggod.arenaagents.pov.PovMode;
 import dev.agaminggod.arenaagents.server.SkitModeRuntime;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import net.minecraft.server.MinecraftServer;
 
-/** Headless checks for the POV session rules: reservations, exits, body damage and lifecycle. */
+/** Headless checks for the POV session rules: command grammar, reservations, exits, body damage and lifecycle. */
 public final class PovSessionVerification {
 	private static int passed;
 
@@ -19,6 +26,7 @@ public final class PovSessionVerification {
 
 	public static int verify() {
 		passed = 0;
+		verifyCommandGrammar();
 		verifyReservationTable();
 		verifySkitAndTakeoverExclusion();
 		verifyStartDecisions();
@@ -29,6 +37,49 @@ public final class PovSessionVerification {
 		verifyReportBounds();
 		verifyPickupTally();
 		return passed;
+	}
+
+	// The tree is built with a plain source type, so this is the exact Brigadier shape without a server.
+	private static void verifyCommandGrammar() {
+		CommandDispatcher<Object> dispatcher = new CommandDispatcher<>();
+		Object operator = new Object();
+		Object stranger = new Object();
+		List<String> log = new ArrayList<>();
+		Command<Object> start = context -> { log.add("start " + StringArgumentType.getString(context, PovCommands.ARGUMENT_AGENT)); return 1; };
+		Command<Object> exitAgent = context -> { log.add("exit " + StringArgumentType.getString(context, PovCommands.ARGUMENT_AGENT)); return 2; };
+		Command<Object> exitAny = context -> { log.add("exit"); return 3; };
+		dispatcher.register(PovCommands.grammar("spectate",
+				() -> RequiredArgumentBuilder.argument(PovCommands.ARGUMENT_AGENT, StringArgumentType.word()),
+				source -> source == operator, start, exitAgent, exitAny));
+		check(run(dispatcher, "spectate Alex", operator) == 1 && log.getLast().equals("start Alex"), "an agent name alone starts");
+		check(run(dispatcher, "spectate Alex start", operator) == 1 && log.getLast().equals("start Alex"), "'start' after the agent starts");
+		check(run(dispatcher, "spectate Alex stop", operator) == 2 && log.getLast().equals("exit Alex"), "'stop' after the agent ends that agent's session");
+		check(run(dispatcher, "spectate Alex exit", operator) == 2 && log.getLast().equals("exit Alex"), "'exit' after the agent ends that agent's session");
+		check(run(dispatcher, "spectate exit", operator) == 3 && log.getLast().equals("exit"), "a bare 'exit' ends any session");
+		check(run(dispatcher, "spectate stop", operator) == 3 && log.getLast().equals("exit"), "a bare 'stop' ends any session");
+		// Were the word routed to the agent argument, "exit start" would start an agent named exit (code 1).
+		check(run(dispatcher, "spectate exit start", operator) < 0 && log.getLast().equals("exit"),
+				"the exit literal wins over an agent named exit");
+		check(run(dispatcher, "spectate", operator) < 0, "the command needs an agent or exit");
+		check(run(dispatcher, "spectate Alex restart", operator) < 0, "unknown words after the agent are rejected");
+		check(run(dispatcher, "spectate Alex", stranger) < 0, "the permission gate covers the whole tree");
+		check(PovCommands.exitCommand(PovMode.SPECTATE).equals("/spectate exit")
+				&& PovCommands.exitCommand(PovMode.TAKEOVER).equals("/takeover exit"), "exit hints name /spectate and /takeover");
+		check(PovCommands.startMessage(PovMode.SPECTATE, "Alex", false).equals("Viewing Alex. Type /spectate exit to return."),
+				"spectate start message");
+		check(PovCommands.startMessage(PovMode.TAKEOVER, "Alex", false).equals("You are controlling Alex. Its model is paused until you type"
+				+ " /takeover exit. Your own body stays here; if it loses 2 hearts the takeover ends."), "takeover start message");
+		check(PovCommands.startMessage(PovMode.TAKEOVER, "Alex", true).equals("You are already in Alex's view. Type /takeover exit to return."),
+				"repeat start message");
+		check(!PovCommands.startMessage(PovMode.SPECTATE, "Alex", false).contains("vanilla"), "no vanilla disclaimer: /spectate is ours");
+	}
+
+	private static int run(CommandDispatcher<Object> dispatcher, String command, Object source) {
+		try {
+			return dispatcher.execute(command, source);
+		} catch (CommandSyntaxException rejected) {
+			return -1;
+		}
 	}
 
 	private static void verifyReservationTable() {
@@ -125,8 +176,8 @@ public final class PovSessionVerification {
 		check(PovExitReason.agentDimensionMessage("minecraft:the_nether", PovMode.TAKEOVER, "Alex").equals(
 				"Agent moved to minecraft:the_nether. Run /takeover Alex again once you are in the same dimension."),
 				"dimension message names the command to re-run");
-		check(PovExitReason.agentDimensionMessage("minecraft:the_end", PovMode.SPECTATE, "Alex").contains("/spectator Alex"),
-				"spectator hint names /spectator");
+		check(PovExitReason.agentDimensionMessage("minecraft:the_end", PovMode.SPECTATE, "Alex").contains("/spectate Alex"),
+				"spectate hint names /spectate");
 		expectThrows(() -> new PovExitReason.Observation(PovMode.TAKEOVER, true, true, true, false, Double.NaN,
 				true, true, false, false, 0.0D), "observation rejects non-finite movement");
 	}
