@@ -238,6 +238,7 @@ public final class VerificationMain {
 		passedAssertions += ServerPathPlannerVerification.verify();
 		passedAssertions += MinecraftNavigationWorldVerification.verify();
 		passedAssertions += NavigationProgressVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.runtime.controller.NavigationMotionVerification.verify();
 		passedAssertions += SurvivalReflexVerification.verify();
 		passedAssertions += ItemPickupProgressVerification.verify();
 		passedAssertions += ScenarioCoreVerification.verify();
