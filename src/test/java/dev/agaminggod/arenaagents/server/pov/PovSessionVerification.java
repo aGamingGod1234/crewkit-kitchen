@@ -54,12 +54,16 @@ public final class PovSessionVerification {
 		check(run(dispatcher, "spectate Alex", operator) == 1 && log.getLast().equals("start Alex"), "an agent name alone starts");
 		check(run(dispatcher, "spectate Alex start", operator) == 1 && log.getLast().equals("start Alex"), "'start' after the agent starts");
 		check(run(dispatcher, "spectate Alex stop", operator) == 2 && log.getLast().equals("exit Alex"), "'stop' after the agent ends that agent's session");
-		check(run(dispatcher, "spectate Alex exit", operator) == 2 && log.getLast().equals("exit Alex"), "'exit' after the agent ends that agent's session");
+		check(run(dispatcher, "spectate Alex exit", operator) < 0, "only start and stop follow the agent");
 		check(run(dispatcher, "spectate exit", operator) == 3 && log.getLast().equals("exit"), "a bare 'exit' ends any session");
 		check(run(dispatcher, "spectate stop", operator) == 3 && log.getLast().equals("exit"), "a bare 'stop' ends any session");
-		// Were the word routed to the agent argument, "exit start" would start an agent named exit (code 1).
-		check(run(dispatcher, "spectate exit start", operator) < 0 && log.getLast().equals("exit"),
-				"the exit literal wins over an agent named exit");
+		check(run(dispatcher, "spectate STOP", operator) == 3 && log.getLast().equals("exit"), "bare exit words ignore case");
+		List<String> rootSuggestions = dispatcher.getCompletionSuggestions(dispatcher.parse("spectate ", operator)).join()
+				.getList().stream().map(suggestion -> suggestion.getText()).toList();
+		check(rootSuggestions.isEmpty(), "no exit/stop literals compete with agent names in suggestions: " + rootSuggestions);
+		List<String> afterAgent = dispatcher.getCompletionSuggestions(dispatcher.parse("spectate Alex ", operator)).join()
+				.getList().stream().map(suggestion -> suggestion.getText()).toList();
+		check(afterAgent.equals(List.of("start", "stop")), "only start and stop are suggested after the agent: " + afterAgent);
 		check(run(dispatcher, "spectate", operator) < 0, "the command needs an agent or exit");
 		check(run(dispatcher, "spectate Alex restart", operator) < 0, "unknown words after the agent are rejected");
 		check(run(dispatcher, "spectate Alex", stranger) < 0, "the permission gate covers the whole tree");

@@ -295,13 +295,15 @@ public final class AgentRegistryVerification {
 				"blank direct summons materialize a stable model-derived public name");
 		assertEquals("GPT_5_6_Sol2", automatic2.profile().userName().orElseThrow(),
 				"same-model direct summons receive a stable collision suffix");
+		assertEquals(List.of("Scout", "SCOUT2", "GPT_5_6_Sol", "GPT_5_6_Sol2"), registry.preferredSelectors(),
+				"command suggestions offer one player name per agent, without short ids");
 		AgentRegistry liveNameRegistry = AgentRegistry.createDefault(() -> { }, transition -> { });
 		AgentRecord liveNameCollision = liveNameRegistry.create(
 				"codex", "gpt-5.6-sol", "high", "priority", Optional.empty(), AgentGameMode.SURVIVAL,
 				START_TIME + 4L, List.of("HumanPlayer", "gpt_5_6_sol"));
 		assertEquals("GPT_5_6_Sol2", liveNameCollision.profile().userName().orElseThrow(),
 				"live GameProfile names share the same case-insensitive allocation namespace");
-		return 8;
+		return 9;
 	}
 
 	private static int verifyPersistenceRecovery() {

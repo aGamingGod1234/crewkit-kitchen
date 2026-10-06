@@ -27,9 +27,10 @@ import org.slf4j.LoggerFactory;
 
 /**
  * /spectate and /takeover, plus the /codex spectate|takeover aliases. Grammar for both:
- * {@code <agent> [start|stop|exit]} (no word after the agent means start) and {@code exit|stop} for
- * any session. Literals win over agent names (Brigadier prefers literals); such an agent stays
- * reachable by its id. Vanilla /spectate (which moves the body) is removed so this one replaces it.
+ * {@code <agent> [start|stop]} (no word after the agent means start). A bare {@code exit} or {@code stop}
+ * still ends any session, but is read from the agent argument so suggestions list only agent names;
+ * an agent with such a name stays reachable by its id. Vanilla /spectate (which moves the body) is
+ * removed so this one replaces it.
  */
 public final class PovCommands {
 	static final String ARGUMENT_AGENT = "agent";
@@ -73,19 +74,22 @@ public final class PovCommands {
 	/**
 	 * The pure command shape, usable with any source type so it can be verified without a server.
 	 * {@code start} runs for {@code <agent>} and {@code <agent> start}, {@code exitAgent} for
-	 * {@code <agent> stop|exit} and {@code exitAny} for a bare {@code stop|exit}.
+	 * {@code <agent> stop} and {@code exitAny} for a bare {@code stop|exit}.
 	 */
 	static <S> LiteralArgumentBuilder<S> grammar(String literal, Supplier<RequiredArgumentBuilder<S, String>> agentArgument,
 			Predicate<S> permission, Command<S> start, Command<S> exitAgent, Command<S> exitAny) {
+		Command<S> startOrExit = context -> isExitWord(StringArgumentType.getString(context, ARGUMENT_AGENT))
+				? exitAny.run(context) : start.run(context);
 		return LiteralArgumentBuilder.<S>literal(literal)
 				.requires(permission)
-				.then(LiteralArgumentBuilder.<S>literal("exit").executes(exitAny))
-				.then(LiteralArgumentBuilder.<S>literal("stop").executes(exitAny))
 				.then(agentArgument.get()
-						.executes(start)
+						.executes(startOrExit)
 						.then(LiteralArgumentBuilder.<S>literal("start").executes(start))
-						.then(LiteralArgumentBuilder.<S>literal("stop").executes(exitAgent))
-						.then(LiteralArgumentBuilder.<S>literal("exit").executes(exitAgent)));
+						.then(LiteralArgumentBuilder.<S>literal("stop").executes(exitAgent)));
+	}
+
+	private static boolean isExitWord(String selector) {
+		return selector.equalsIgnoreCase("exit") || selector.equalsIgnoreCase("stop");
 	}
 
 	static String exitCommand(PovMode mode) {

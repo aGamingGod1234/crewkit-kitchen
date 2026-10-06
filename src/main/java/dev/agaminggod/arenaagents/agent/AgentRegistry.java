@@ -608,6 +608,13 @@ public final class AgentRegistry {
 		return List.copyOf(selectors);
 	}
 
+	/** One name per agent for command suggestions: its player name, or its short id when it has none. */
+	public synchronized List<String> preferredSelectors() {
+		return records().stream()
+				.map(record -> record.profile().userName().orElse(record.agentId().shortValue()))
+				.toList();
+	}
+
 	public synchronized Snapshot snapshot() {
 		return new Snapshot(AgentConstants.SCHEMA_VERSION, maxAgents, queueLimit, records());
 	}
