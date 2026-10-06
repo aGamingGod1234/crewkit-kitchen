@@ -54,6 +54,7 @@ export const COORDINATOR_TO_SERVER_TYPES = Object.freeze([
 	'action_cancel',
 	'action_result_ack',
 	'agent_error',
+	'agent_notice',
 	'verbose_event',
 	'task_view',
 	'heartbeat',
@@ -120,6 +121,8 @@ const AUTHENTICATION_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const AUTHENTICATION_CONTEXT = 'arena-agents-v2';
 const ACTION_RESULT_REPLAY_CONTEXT = 'arena-agents-v2-action-result-replay';
 export const MAX_VERBOSE_MESSAGE_LENGTH = 256;
+export const AGENT_NOTICE_SEVERITIES = Object.freeze(['error', 'warning', 'info']);
+const AGENT_NOTICE_SEVERITY_SET = new Set(AGENT_NOTICE_SEVERITIES);
 export const VERBOSE_STAGES = Object.freeze([
 	'conversation', 'lifecycle', 'planner', 'provider', 'output', 'decision',
 	'action', 'progress', 'result', 'retry', 'error',
@@ -192,7 +195,7 @@ export function validateProtocolV2Envelope(value, { direction } = {}) {
 	if ((type === 'auth_challenge' || type === 'auth_response' || type === 'hello' || type === 'hello_ack' || type === 'registry_complete' || type === 'catalog_request' || type === 'catalog_snapshot' || type === 'coordinator_status' || type === 'verbose_control' || type === 'heartbeat' || type === 'shutdown') && agentId !== 'server') {
 		throw new ProtocolV2Error('INVALID_AGENT_SCOPE', `Message type '${type}' must use agentId 'server'`);
 	}
-	if ((type === 'verbose_event' || type === 'action_result_ack') && agentId === 'server') {
+	if ((type === 'verbose_event' || type === 'agent_notice' || type === 'action_result_ack') && agentId === 'server') {
 		throw new ProtocolV2Error('INVALID_AGENT_SCOPE', `Message type '${type}' must use an agent ID`);
 	}
 	const payload = validateProtocolV2Payload(type, value.payload);
@@ -365,6 +368,17 @@ function normalizeProtocolV2Payload(type, value) {
 				code: boundedText(value.code, 'code', MAX_REASON_CODE_LENGTH),
 				message: boundedText(value.message, 'message', MAX_RESULT_MESSAGE_LENGTH),
 			};
+		case 'agent_notice': {
+			// Launch-time CLI notices are not revision guarded: an idle agent has no active goal yet.
+			exactKeys(value, ['severity', 'code', 'message'], ['severity', 'code', 'message'], type);
+			const severity = requireIdentifier(value.severity, 'severity');
+			if (!AGENT_NOTICE_SEVERITY_SET.has(severity)) throw new ProtocolV2Error('INVALID_PAYLOAD', `agent_notice severity '${severity}' is not allowed`);
+			return {
+				severity,
+				code: boundedText(value.code, 'code', MAX_REASON_CODE_LENGTH),
+				message: boundedText(value.message, 'message', MAX_RESULT_MESSAGE_LENGTH),
+			};
+		}
 		case 'task_view_request':
 			exactKeys(value, ['goalRevision'], ['goalRevision'], type);
 			return { goalRevision: revision(value.goalRevision, 'goalRevision') };

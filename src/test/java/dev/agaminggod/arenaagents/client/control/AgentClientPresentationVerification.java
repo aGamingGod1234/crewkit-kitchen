@@ -87,20 +87,21 @@ public final class AgentClientPresentationVerification {
 			AgentControlCatalog.installRuntimeCatalog(List.of(new AgentControlModelOption(
 					"codex", "gpt-future", "GPT Future", List.of("medium"), List.of("priority")
 			)));
-			AgentControlClient.Preferences remembered = new AgentControlClient.Preferences(
-					"codex", "gpt-future", "medium", "priority");
+			AgentControlClient.Preferences remembered = new AgentControlClient.Preferences("codex", "gpt-future");
 			AgentControlCatalog.resetRuntimeCatalog();
 			assertEquals(remembered, AgentControlClient.Preferences.reconcile(remembered, false),
 					"temporary fallback catalog preserves a runtime-only preference");
 
 			AgentControlCatalog.installRuntimeCatalog(List.of(new AgentControlModelOption(
-					"codex", "gpt-next", "GPT Next", List.of("high"), List.of("priority")
+					"codex", "gpt-next", "GPT Next", List.of("high", "low"), List.of("fast", "priority")
 			)));
 			AgentControlClient.Preferences repaired = AgentControlClient.Preferences.reconcile(remembered, true);
 			assertEquals("codex", repaired.provider(), "catalog change replaces an unavailable preferred provider");
 			assertEquals("gpt-next", repaired.model(), "authoritative catalog chooses the available model");
-			assertEquals("high", repaired.reasoning(), "authoritative catalog chooses available reasoning");
-			assertEquals("priority", repaired.serviceTier(), "available service tier survives catalog reconciliation");
+			assertEquals("low", AgentControlCatalog.defaultReasoning(repaired.provider(), repaired.model()),
+					"a reopened menu starts at the lowest thinking depth rather than a remembered one");
+			assertEquals("priority", AgentControlCatalog.defaultServiceTier(repaired.provider(), repaired.model()),
+					"a reopened menu starts at Normal speed rather than a remembered tier");
 		} finally {
 			AgentControlCatalog.resetRuntimeCatalog();
 		}

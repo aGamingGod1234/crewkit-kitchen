@@ -47,6 +47,7 @@ import { classifyNativeGoalError } from './native-goal-error-policy.mjs';
 import { MAX_GOAL_SPEC_CORRECTION_ATTEMPTS, fallbackCompiledDragonGoal, localGoalSpecFeedback } from './goal-spec-translator.mjs';
 import { ProgramRuntimeManager } from './program-runtime-manager.mjs';
 import { createProviderChildEnvironment } from './provider-environment.mjs';
+import { PROVIDER_CLI, ProviderCliHealthMonitor, createDisabledProviderCliHealthMonitor } from './provider-cli-health.mjs';
 import { NATIVE_TOOL_PROVIDERS, PROVIDER_IDS } from './provider-identity.mjs';
 import { TraceWriter } from './trace-writer.mjs';
 import { wireRuntimeDiagnostics } from './runtime-diagnostics.mjs';
@@ -188,10 +189,15 @@ export class DynamicCoordinator extends EventEmitter {
 	#maxPendingAgentOperations;
 	#maxPendingAgentTransactions;
 	#runtimeHooks;
+	#providerCliHealth;
+	#providerCliNotices = { connectionEpoch: null, agents: new Set() };
+	#providerCliStartupLogged = false;
 
-	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, goalSupervisor, codexControlProtocol = 'native_tools', memoryDirectory = null, runtimeSessionId, traceWriter = null, providerTurnRecorder = null, runtimeGeneration = null, runtimeHooks = {}, benchmarkRecorder = null, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval, setGoalSpecTimeout = defaultGoalSpecTimeout, clearGoalSpecTimeout = clearTimeout, connectionOperationCap = DEFAULT_CONNECTION_OPERATION_CAP, agentOperationCap = DEFAULT_AGENT_OPERATION_CAP, goalSpecRequestCap = connectionOperationCap, maxPendingAgentOperations = DEFAULT_MAX_PENDING_AGENT_OPERATIONS, maxPendingAgentTransactions = DEFAULT_MAX_PENDING_AGENT_TRANSACTIONS }) {
+	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, goalSupervisor, codexControlProtocol = 'native_tools', memoryDirectory = null, runtimeSessionId, traceWriter = null, providerTurnRecorder = null, runtimeGeneration = null, runtimeHooks = {}, benchmarkRecorder = null, providerCliHealth = null, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval, setGoalSpecTimeout = defaultGoalSpecTimeout, clearGoalSpecTimeout = clearTimeout, connectionOperationCap = DEFAULT_CONNECTION_OPERATION_CAP, agentOperationCap = DEFAULT_AGENT_OPERATION_CAP, goalSpecRequestCap = connectionOperationCap, maxPendingAgentOperations = DEFAULT_MAX_PENDING_AGENT_OPERATIONS, maxPendingAgentTransactions = DEFAULT_MAX_PENDING_AGENT_TRANSACTIONS }) {
 		super();
 		this.#memoryDirectory = memoryDirectory;
+		if (providerCliHealth !== null && typeof providerCliHealth.check !== 'function') throw new TypeError('providerCliHealth.check must be a function');
+		this.#providerCliHealth = providerCliHealth;
 		this.#registry = requireDependency(registry, 'registry');
 		this.#scheduler = requireDependency(scheduler, 'scheduler');
 		this.#codexService = requireDependency(codexService, 'codexService');
@@ -536,6 +542,7 @@ export class DynamicCoordinator extends EventEmitter {
 				this.#invalidateServerInstance(connectionEpoch);
 			}
 			this.#serverInstanceId = serverInstanceId;
+			this.#logProviderCliHealthAtStartup();
 			this.#readyRegistry = structuredClone(registry);
 			this.#reconciledStatus = false;
 			this.#supportedAgentIds.clear();
@@ -577,6 +584,7 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#supportedAgentIds.add(record.agentId);
 			this.#publishVerbose(record.agentId, record.goalRevision, 'lifecycle', 'Agent registered and ready.', connectionEpoch);
 			this.#prewarmNativeAgent(record);
+			this.#checkProviderCli(record, connectionEpoch);
 			if (replacesDeath) {
 				const recovery = this.#installDeadStatePlan(record, record.death, connectionEpoch);
 				if (this.#usesNativeTools(record)) void recovery.catch((error) => this.#reportAgentError(record.agentId, error, connectionEpoch));
@@ -1142,6 +1150,7 @@ export class DynamicCoordinator extends EventEmitter {
 				this.#supportedAgentIds.add(profile.agentId);
 				this.#publishVerbose(record.agentId, record.goalRevision, 'lifecycle', 'Agent reconciled and ready.', connectionEpoch);
 				this.#prewarmNativeAgent(record);
+				this.#checkProviderCli(record, connectionEpoch);
 				if (this.#usesNativeTools(record) && [DynamicAgentState.IDLE, DynamicAgentState.PAUSED, DynamicAgentState.COMPLETED].includes(record.state)) {
 					await this.#resumeUnreadNativeConversation(record, connectionEpoch, lifecycleGeneration);
 				}
@@ -1366,6 +1375,81 @@ export class DynamicCoordinator extends EventEmitter {
 				errorCode: String(error?.code ?? 'PREWARM_FAILED').slice(0, 128),
 			});
 		});
+	}
+
+	/**
+	 * Tells players at launch time when the provider CLI is missing, broken or signed out.
+	 * The probe never blocks registration; agent_notice is used because agent_error is
+	 * dropped by the server for agents without an active goal.
+	 */
+	#checkProviderCli(record, connectionEpoch) {
+		if (this.#providerCliHealth === null) return;
+		// CLI health depends on neither the goal revision nor the lifecycle generation (goal_control
+		// bumps both): a goal started while a broken CLI is probed (tens of seconds) must not
+		// silence the notice. Only a new connection or agent removal makes it stale.
+		const current = () => this.#isConnectionEpochCurrent(connectionEpoch) && this.#registry.get(record.agentId) !== null;
+		const spec = PROVIDER_CLI[record.provider];
+		void Promise.resolve().then(() => this.#providerCliHealth.check(record.provider)).then((health) => {
+			if (!current()) return;
+			const goalRevision = this.#registry.get(record.agentId)?.goalRevision ?? record.goalRevision;
+			if (health.status === 'ok') {
+				this.#publishVerbose(record.agentId, goalRevision, 'provider', `${spec?.display ?? record.provider}${health.version ? ` ${health.version}` : ''} ready.`, connectionEpoch);
+				return;
+			}
+			if (health.code === null || typeof health.message !== 'string' || health.message.length === 0) return;
+			if (!this.#acceptProviderCliNotice(connectionEpoch, record.agentId)) return;
+			this.#writeTrace('provider_cli_unhealthy', {
+				agentId: record.agentId,
+				goalRevision,
+				provider: record.provider,
+				status: health.status,
+				code: health.code,
+				version: health.version,
+				details: sanitizeDiagnosticText(health.details ?? '', { maxBytes: 512 }),
+			});
+			this.#publishVerbose(record.agentId, goalRevision, 'provider', `${spec?.display ?? record.provider} check failed (${health.code}).`, connectionEpoch);
+			void this.#sendForEpoch(connectionEpoch, 'agent_notice', record.agentId, { severity: 'error', code: health.code, message: health.message })
+				.catch((error) => {
+					// A failed send must not consume the one notice this agent gets per connection.
+					this.#forgetProviderCliNotice(connectionEpoch, record.agentId);
+					this.#writeTrace('provider_cli_notice_failed', { agentId: record.agentId, code: sanitizeDiagnosticErrorCode(error, { fallback: 'NOTICE_FAILED' }) });
+				});
+		}).catch((error) => {
+			this.#writeTrace('provider_cli_probe_failed', { agentId: record.agentId, provider: record.provider, code: sanitizeDiagnosticErrorCode(error, { fallback: 'PROBE_FAILED' }) });
+		});
+	}
+
+	/** One notice per agent per connection epoch, so reconnects and re-registrations do not repeat it. */
+	#acceptProviderCliNotice(connectionEpoch, agentId) {
+		if (this.#providerCliNotices.connectionEpoch !== connectionEpoch) {
+			this.#providerCliNotices = { connectionEpoch, agents: new Set() };
+		}
+		if (this.#providerCliNotices.agents.has(agentId)) return false;
+		this.#providerCliNotices.agents.add(agentId);
+		return true;
+	}
+
+	#forgetProviderCliNotice(connectionEpoch, agentId) {
+		if (this.#providerCliNotices.connectionEpoch === connectionEpoch) this.#providerCliNotices.agents.delete(agentId);
+	}
+
+	/**
+	 * One console line per provider, once per coordinator process. Runs after the first bridge
+	 * handshake rather than in start(): a first-time Codex desktop-CLI cache copy is synchronous
+	 * and must not eat into the server's 5 s handshake window.
+	 */
+	#logProviderCliHealthAtStartup() {
+		if (this.#providerCliStartupLogged || this.#providerCliHealth === null || this.#providerCliHealth.enabled !== true) return;
+		this.#providerCliStartupLogged = true;
+		for (const provider of PROVIDER_IDS) {
+			void Promise.resolve().then(() => this.#providerCliHealth.check(provider)).then((health) => {
+				const display = PROVIDER_CLI[provider]?.display ?? provider;
+				const line = health.status === 'ok'
+					? `${display}${health.version ? ` ${health.version}` : ''} ready${health.executable ? ` (${health.executable})` : ''}`
+					: `${health.status}: ${health.message ?? health.details ?? 'no details'}`;
+				try { console.error(`[provider-cli] ${provider}: ${line}`); } catch { /* console output is best effort */ }
+			}).catch(() => {});
+		}
 	}
 
 	#scheduleNativeConversation(record, event, trigger) {
@@ -3063,6 +3147,15 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		root: config.minecraftAgentRoot,
 		templateRoot: config.minecraftAgentTemplateRoot,
 	});
+	// Tests and simulators get a monitor that never spawns; runCli injects the real one.
+	const providerCliHealth = dependencies.providerCliHealth ?? createDisabledProviderCliHealthMonitor();
+	if (typeof providerCliHealth.configure === 'function') {
+		providerCliHealth.configure({
+			codex: { ...config.codex, ...(config.codex.launchProfile ?? {}), environment: providerEnvironments.codex, bridgeSecretEnvironmentVariable: config.bridge.secretEnvironmentVariable },
+			gemini: { ...config.gemini, environment: providerEnvironments.gemini, bridgeSecretEnvironmentVariable: config.bridge.secretEnvironmentVariable },
+			claude: { ...config.claude, environment: providerEnvironments.claude, bridgeSecretEnvironmentVariable: config.bridge.secretEnvironmentVariable },
+		});
+	}
 	const codexService = dependencies.providerService ?? dependencies.codexService ?? new ProviderService({
 		codex: new CodexService({ ...config.codex, environment: providerEnvironments.codex, bridgeSecretEnvironmentVariable: config.bridge.secretEnvironmentVariable }, { transport: dependencies.codexTransport, now: dependencies.now ?? Date.now, workspaceManager, minecraftWorkspace }),
 		gemini: new AntigravityProviderService({ ...config.gemini, environment: providerEnvironments.gemini, bridgeSecretEnvironmentVariable: config.bridge.secretEnvironmentVariable }, {
@@ -3142,6 +3235,7 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		agentOperationCap: dependencies.agentOperationCap,
 		goalSpecRequestCap: dependencies.goalSpecRequestCap,
 		benchmarkRecorder: dependencies.benchmarkRecorder,
+		providerCliHealth,
 	});
 	return coordinator;
 }
@@ -3308,6 +3402,8 @@ async function runCli(reporter = new RuntimeErrorReporter()) {
 	const coordinator = createDynamicCoordinator(config, {
 		traceWriter, protocolAudit, providerTurnRecorder, runtimeGeneration: runtime.runtimeGeneration,
 		runtimeHooks: { onRemoved: (agentId) => voiceSupervisor.removeAgent(agentId) },
+		// Real agents launch real CLIs here, so the probes may spawn them.
+		providerCliHealth: new ProviderCliHealthMonitor(),
 	});
 	const disposeDiagnostics = wireRuntimeDiagnostics(coordinator, reporter);
 	try {

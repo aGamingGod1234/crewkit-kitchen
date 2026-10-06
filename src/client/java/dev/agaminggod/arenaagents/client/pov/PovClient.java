@@ -23,6 +23,7 @@ import net.minecraft.client.CameraType;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.player.AbstractClientPlayer;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
@@ -33,7 +34,7 @@ import net.minecraft.world.entity.Marker;
 import net.minecraft.world.entity.player.Player;
 import org.lwjgl.glfw.GLFW;
 
-/** Client side of /spectator and /takeover: session state, camera binding and the exit key. */
+/** Client side of /spectate and /takeover: session state, camera binding, hand source and the exit key. */
 public final class PovClient {
 	// Category is a record, so an equal id joins AgentControlClient's registered "Arena Agents" group.
 	private static final KeyMapping EXIT_VIEW = new KeyMapping(
@@ -46,6 +47,7 @@ public final class PovClient {
 	private static final int SILENT_SERVER_TICKS = 40;
 	private static final PovSessionTracker TRACKER = new PovSessionTracker();
 	private static final PovBodyMonitor BODY = new PovBodyMonitor();
+	private static final PovHands HANDS = new PovHands();
 	private static boolean registered;
 	private static AgentPovStatePayload latestState;
 	private static AgentPovMenuPayload latestMenu;
@@ -85,7 +87,6 @@ public final class PovClient {
 		ClientLevelEvents.AFTER_CLIENT_LEVEL_CHANGE.register((client, level) -> {
 			if (TRACKER.session().isPresent() && sessionLevel != null && level != sessionLevel) endLocal(client);
 		});
-		PovBadge.register();
 		registered = true;
 	}
 
@@ -106,7 +107,7 @@ public final class PovClient {
 		Minecraft client = Minecraft.getInstance();
 		PovClientSession current = TRACKER.session().orElse(null);
 		if (current == null) return;
-		if (client.getConnection() != null) client.getConnection().sendCommand(current.takeover() ? "takeover exit" : "spectator exit");
+		if (client.getConnection() != null) client.getConnection().sendCommand(current.takeover() ? "takeover exit" : "spectate exit");
 		// With the stream already silent no stop payload will come, so the exit is local only.
 		if (client.getConnection() == null || silentTicks >= SILENT_SERVER_TICKS) endLocal(client);
 	}
@@ -140,17 +141,34 @@ public final class PovClient {
 		return poseFlags;
 	}
 
-	public static boolean hidesHands() {
+	public static boolean isActive() {
 		return TRACKER.session().isPresent();
 	}
 
-	static boolean bodyHighlighted() {
-		return BODY.highlighted();
+	/**
+	 * The agent's in-level client entity while it is what the camera shows. Null without a session,
+	 * while the signal is lost or while the agent is dead, so first-person hands draw nothing then.
+	 */
+	public static AbstractClientPlayer agentPlayer() {
+		if (TRACKER.phase() != PovSessionTracker.Phase.ACTIVE) return null;
+		if (latestState != null && latestState.death().isPresent()) return null;
+		Minecraft client = Minecraft.getInstance();
+		return client.getCameraEntity() instanceof AbstractClientPlayer player && player != client.player
+				&& PovView.isTarget(player) && !player.isRemoved() && !player.isDeadOrDying()
+				? player : null;
 	}
 
-	static String exitHint() {
-		if (!EXIT_VIEW.isUnbound()) return "Exit: " + EXIT_VIEW.getTranslatedKeyMessage().getString();
-		return isTakeover() ? "Exit: /takeover exit" : "Exit: /spectator exit";
+	/**
+	 * Binds that happen outside the tick loop (state payload, respawn) can be followed by frames before
+	 * the next client tick; seeding the bob there keeps the hands level with the agent's look at once.
+	 */
+	private static void seedHands(Player agent) {
+		if (agent != null && !HANDS.seeded()) HANDS.tick(agent.getViewXRot(1.0F), agent.getViewYRot(1.0F));
+	}
+
+	/** Smoothed agent look for the first-person hands; advanced once per client tick. */
+	public static PovHands hands() {
+		return HANDS;
 	}
 
 	/** Called after vanilla rebuilt the local player; keeps the view in the same level, ends it otherwise. */
@@ -163,7 +181,7 @@ public final class PovClient {
 		}
 		// Vanilla pointed the camera at the new local player; that is now what exit restores.
 		if (cameraCaptured) previousCamera = client.player;
-		bindCamera(client, current);
+		seedHands(bindCamera(client, current));
 	}
 
 	private static void acceptState(Minecraft client, AgentPovStatePayload payload) {
@@ -177,7 +195,9 @@ public final class PovClient {
 		latestState = payload;
 		PovHudProxy.update(client, next, payload);
 		PovScreens.onState(next, payload);
-		if (result != PovSessionTracker.StateResult.UPDATED && client.level != null && client.player != null) bindCamera(client, next);
+		if (result != PovSessionTracker.StateResult.UPDATED && client.level != null && client.player != null) {
+			seedHands(bindCamera(client, next));
+		}
 	}
 
 	private static void acceptPose(AgentPovPosePayload payload) {
@@ -221,6 +241,7 @@ public final class PovClient {
 		discardAnchor();
 		PovView.reset();
 		BODY.reset();
+		HANDS.reset();
 		Player agent = client.level == null ? null : resolveAgent(client, next);
 		// A provisional look until the first pose payload seeds the exact one.
 		PovLook.reset(agent == null ? 0.0F : agent.getYHeadRot(), agent == null ? 0.0F : agent.getXRot());
@@ -242,8 +263,17 @@ public final class PovClient {
 		PovView.tick();
 		Player agent = bindCamera(client, current);
 		PovHudProxy.tick(client, agent);
-		// The body stays in the world in both modes, so its health is shown either way.
-		BODY.observe(client.player.getHealth() + client.player.getAbsorptionAmount());
+		// The view rotation is what the camera shows, so the hands chase exactly that; a lost agent forgets
+		// the bob so the hands snap to its look when it reappears instead of swinging in from a stale one.
+		if (agent != null) HANDS.tick(agent.getViewXRot(1.0F), agent.getViewYRot(1.0F));
+		else HANDS.reset();
+		// The body stays in the world in both modes; only a takeover can end on its damage, so only then is it announced.
+		if (BODY.observe(client.player.getHealth() + client.player.getAbsorptionAmount()) && current.takeover())
+			overlay(client, "Your body took damage");
+	}
+
+	private static void overlay(Minecraft client, String message) {
+		if (client.gui != null) client.gui.setOverlayMessage(Component.literal(message), false);
 	}
 
 	private static Player bindCamera(Minecraft client, PovClientSession current) {
@@ -258,7 +288,9 @@ public final class PovClient {
 			lastZ = agent.getZ();
 			target = agent;
 		} else {
-			TRACKER.entityMissing();
+			// A far-away agent is paired only after its chunk arrives, so the first bind of a view is a wait, not a loss.
+			if (TRACKER.entityMissing()) overlay(client, (hasLastPosition ? "Signal lost - waiting for " : "Waiting for ")
+					+ (current.agentName().isBlank() ? "the agent" : current.agentName()));
 			target = anchor(client);
 		}
 		PovView.bind(target, current.takeover());
@@ -321,12 +353,20 @@ public final class PovClient {
 		silentTicks = 0;
 		hasLastPosition = false;
 		BODY.reset();
+		HANDS.reset();
 		PovView.reset();
 		PovLook.reset(0.0F, 0.0F);
 		PovHudProxy.clear();
 		discardAnchor();
 		if (active) PovScreens.closeAll();
 		restoreCamera(client);
+		// LocalPlayer stops chasing its own bob while it is not the camera, so without this the operator's
+		// hands would swing in from where they looked before the view started.
+		LocalPlayer operator = client.player;
+		if (operator != null) {
+			operator.xBob = operator.xBobO = operator.getXRot();
+			operator.yBob = operator.yBobO = operator.getYRot();
+		}
 		sessionLevel = null;
 	}
 

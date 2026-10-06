@@ -3,7 +3,7 @@ package dev.agaminggod.arenaagents.client.pov;
 import dev.agaminggod.arenaagents.pov.PovMode;
 import java.util.UUID;
 
-/** Dependency-free checks for the POV session state machine, view routing, look math and body flash. */
+/** Dependency-free checks for the POV session state machine, view routing, look math, hand bob and body damage. */
 public final class PovClientStateVerification {
 	private static final UUID AGENT_A = UUID.fromString("00000000-0000-0000-0000-00000000000a");
 	private static final UUID AGENT_B = UUID.fromString("00000000-0000-0000-0000-00000000000b");
@@ -18,6 +18,7 @@ public final class PovClientStateVerification {
 		verifyTracker();
 		verifyLook();
 		verifyView();
+		verifyHands();
 		verifyBodyMonitor();
 		return checks;
 	}
@@ -139,27 +140,46 @@ public final class PovClientStateVerification {
 		check(PovView.yaw(agent, 0.5F, 42.0F) == 42.0F && !PovView.isTarget(agent), "reset releases the view");
 	}
 
+	private static void verifyHands() {
+		PovHands hands = new PovHands();
+		check(!hands.seeded(), "hands start unseeded");
+		hands.tick(Float.NaN, 20.0F);
+		check(!hands.seeded(), "a non-finite view never seeds");
+		hands.tick(10.0F, 20.0F);
+		check(hands.seeded() && hands.xBob(0.0F) == 10.0F && hands.xBob(1.0F) == 10.0F && hands.yBob(0.5F) == 20.0F,
+				"the first tick seeds the bob at the view, so hands start where the agent looks");
+		hands.tick(20.0F, 20.0F);
+		check(hands.xBob(0.0F) == 10.0F && hands.xBob(1.0F) == 15.0F && hands.xBob(0.5F) == 12.5F,
+				"pitch chases the view by half the gap per tick, like LocalPlayer.xBob");
+		hands.tick(20.0F, 20.0F);
+		check(hands.xBob(1.0F) == 17.5F && hands.xBob(0.0F) == 15.0F, "the previous tick is kept for interpolation");
+		check(hands.viewYaw(1.0F, 20.0F) == 20.0F, "an aligned yaw is reported unchanged");
+		hands.reset();
+		check(!hands.seeded(), "reset forgets the bob");
+		hands.tick(0.0F, 170.0F);
+		hands.tick(0.0F, -170.0F);
+		check(hands.yBob(1.0F) == 180.0F, "yaw chases the short way across 180");
+		check(hands.viewYaw(1.0F, -170.0F) == 190.0F, "the view yaw is lifted onto the bob's scale, so the offset stays 10 degrees");
+		hands.tick(0.0F, Float.POSITIVE_INFINITY);
+		check(hands.yBob(1.0F) == 180.0F, "a non-finite view is ignored");
+	}
+
 	private static void verifyBodyMonitor() {
 		PovBodyMonitor monitor = new PovBodyMonitor();
-		monitor.observe(20.0F);
-		monitor.observe(20.0F);
-		check(!monitor.flashing(), "steady health does not flash");
-		monitor.observe(18.0F);
-		check(monitor.flashing() && monitor.highlighted(), "damage flashes immediately");
+		check(!monitor.observe(20.0F), "the first reading is a baseline");
+		check(!monitor.observe(20.0F) && !monitor.flashing(), "steady health does not flash");
+		check(monitor.observe(18.0F) && monitor.flashing(), "damage is reported on the tick it lands");
 		int flashingTicks = 1;
 		for (int tick = 0; tick < 20 && monitor.flashing(); tick++) {
 			monitor.observe(18.0F);
 			if (monitor.flashing()) flashingTicks++;
 		}
 		check(flashingTicks == PovBodyMonitor.FLASH_TICKS, "the flash lasts ten ticks");
-		monitor.observe(20.0F);
-		check(!monitor.flashing(), "healing does not flash");
-		monitor.observe(19.5F);
-		check(monitor.flashing(), "absorption or health loss flashes again");
+		check(!monitor.observe(20.0F) && !monitor.flashing(), "healing does not flash");
+		check(monitor.observe(19.5F) && monitor.flashing(), "absorption or health loss is reported again");
 		monitor.reset();
 		check(!monitor.flashing(), "reset clears the flash");
-		monitor.observe(4.0F);
-		check(!monitor.flashing(), "the first reading after reset is a baseline, not damage");
+		check(!monitor.observe(4.0F) && !monitor.flashing(), "the first reading after reset is a baseline, not damage");
 	}
 
 	private static boolean near(float actual, float expected) {

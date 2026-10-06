@@ -115,9 +115,9 @@ public final class AgentControlScreen extends Screen {
 				Component.translatable("screen.arenaagents.controls.title"));
 		this.parent = parent;
 		this.page = initialPage;
+		// Only provider and model are remembered; thinking depth and speed restart at their lowest/Normal defaults.
 		AgentControlClient.Preferences preferences = AgentControlClient.preferences();
-		CreateSelection normalized = normalizeCreateSelection(
-				preferences.provider(), preferences.model(), preferences.reasoning(), preferences.serviceTier());
+		CreateSelection normalized = normalizeCreateSelection(preferences.provider(), preferences.model());
 		provider = normalized.provider();
 		model = normalized.model();
 		reasoning = normalized.reasoning();
@@ -925,20 +925,14 @@ public final class AgentControlScreen extends Screen {
 					rebuildWidgets();
 				}));
 		y += 31;
-		addRenderableWidget(new ConsoleCycleButton<>(font, x, y, half, ROW_HEIGHT,
+		addRenderableWidget(ConsoleCycleButton.ranked(font, x, y, half, ROW_HEIGHT,
 				Component.literal("Thinking depth"), AgentControlCatalog.reasoningEfforts(provider, model), reasoning,
-				value -> Component.literal(capitalize(value)), value -> {
-					reasoning = value;
-					rememberPreferences();
-				}));
+				value -> Component.literal(capitalize(value)), value -> reasoning = value));
 		if (AgentControlCatalog.hasSpeedMode(provider, model)) {
-			addRenderableWidget(new ConsoleCycleButton<>(font, x + half + GAP, y, half, ROW_HEIGHT,
+			addRenderableWidget(ConsoleCycleButton.ranked(font, x + half + GAP, y, half, ROW_HEIGHT,
 					Component.literal("Speed mode"), AgentControlCatalog.serviceTiers(provider, model), serviceTier,
 					value -> Component.literal(AgentControlPresentation.speedLabel(value)),
-					value -> {
-						serviceTier = value;
-						rememberPreferences();
-					}));
+					value -> serviceTier = value));
 		} else {
 			ConsoleButton unavailableSpeed = consoleButton(Component.translatable("screen.arenaagents.speed_unavailable"), x + half + GAP, y,
 					half, ROW_HEIGHT, false, () -> { });
@@ -1588,18 +1582,29 @@ public final class AgentControlScreen extends Screen {
 	}
 
 	private void rememberPreferences() {
-		AgentControlClient.rememberPreferences(provider, model, reasoning, serviceTier);
+		AgentControlClient.rememberPreferences(provider, model);
 	}
 
+	/** Re-validates the current form against the (possibly refreshed) catalog without discarding live choices. */
 	private void normalizeCreateSelection() {
-		AgentControlClient.Preferences remembered = AgentControlClient.preferences();
-		CreateSelection normalized = normalizeCreateSelection(
-				remembered.provider(), remembered.model(), remembered.reasoning(), remembered.serviceTier());
+		CreateSelection normalized = normalizeCreateSelection(provider, model, reasoning, serviceTier);
 		provider = normalized.provider();
 		model = normalized.model();
 		reasoning = normalized.reasoning();
 		serviceTier = normalized.serviceTier();
 		if (AgentControlClient.catalogAuthoritative()) rememberPreferences();
+	}
+
+	/** Fresh menu state: remembered provider/model when still offered, lowest thinking depth, Normal speed. */
+	static CreateSelection normalizeCreateSelection(String provider, String model) {
+		List<String> providers = AgentControlCatalog.providers();
+		String normalizedProvider = providers.contains(provider) ? provider : providers.getFirst();
+		List<String> models = AgentControlCatalog.models(normalizedProvider);
+		String normalizedModel = models.contains(model)
+				? model : AgentControlCatalog.defaultModel(normalizedProvider);
+		return new CreateSelection(normalizedProvider, normalizedModel,
+				AgentControlCatalog.defaultReasoning(normalizedProvider, normalizedModel),
+				AgentControlCatalog.defaultServiceTier(normalizedProvider, normalizedModel));
 	}
 
 	static CreateSelection normalizeCreateSelection(
@@ -1608,18 +1613,12 @@ public final class AgentControlScreen extends Screen {
 			String reasoning,
 			String serviceTier
 	) {
-		List<String> providers = AgentControlCatalog.providers();
-		String normalizedProvider = providers.contains(provider) ? provider : providers.getFirst();
-		List<String> models = AgentControlCatalog.models(normalizedProvider);
-		String normalizedModel = models.contains(model)
-				? model : AgentControlCatalog.defaultModel(normalizedProvider);
-		List<String> efforts = AgentControlCatalog.reasoningEfforts(normalizedProvider, normalizedModel);
-		String normalizedReasoning = efforts.contains(reasoning)
-				? reasoning : AgentControlCatalog.defaultReasoning(normalizedProvider, normalizedModel);
-		List<String> tiers = AgentControlCatalog.serviceTiers(normalizedProvider, normalizedModel);
-		String normalizedTier = tiers.contains(serviceTier) ? serviceTier
-				: tiers.contains("priority") ? "priority" : tiers.getFirst();
-		return new CreateSelection(normalizedProvider, normalizedModel, normalizedReasoning, normalizedTier);
+		CreateSelection defaults = normalizeCreateSelection(provider, model);
+		List<String> efforts = AgentControlCatalog.reasoningEfforts(defaults.provider(), defaults.model());
+		List<String> tiers = AgentControlCatalog.serviceTiers(defaults.provider(), defaults.model());
+		return new CreateSelection(defaults.provider(), defaults.model(),
+				efforts.contains(reasoning) ? reasoning : defaults.reasoning(),
+				tiers.contains(serviceTier) ? serviceTier : defaults.serviceTier());
 	}
 
 	private AgentControlAgent selectedAgent() {

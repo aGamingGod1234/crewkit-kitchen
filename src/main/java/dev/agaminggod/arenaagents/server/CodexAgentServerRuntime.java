@@ -121,6 +121,8 @@ public final class CodexAgentServerRuntime {
 		ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
 			WorldPlayerNames.get(server).remember(handler.getPlayer().getGameProfile().name(), handler.getPlayer().getUUID());
 			VoiceConsentRegistry.playerConnected(server, handler.getPlayer().getUUID());
+			MultiplexedServerBridge bridge = bridge(server);
+			if (bridge != null) bridge.replayAgentNotices(handler.getPlayer());
 		});
 		ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
 			PovSessionRuntime.onPlayerDisconnect(handler.getPlayer());

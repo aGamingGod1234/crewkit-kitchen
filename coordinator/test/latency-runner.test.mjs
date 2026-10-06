@@ -350,6 +350,25 @@ test('live-session parity ignores only session identity and still rejects change
 	}
 });
 
+test('live trials use only the injected provider CLI health monitor; none is built by the runner', async () => {
+	const profile = { provider: 'codex', model: 'fixture-model', reasoningEffort: 'high', serviceTier: 'fast' };
+	const checks = [];
+	const providerCliHealth = {
+		enabled: false,
+		configure() {},
+		async check(provider) { checks.push(provider); return { provider, status: 'ok', code: null, message: null, executable: 'codex', version: '0.160.0', checkedAtEpochMs: 1, details: '' }; },
+	};
+	const result = await runLatencyMatrix({
+		matrix: matrix({ trials: [{ ...matrix().trials[0], mode: 'live', providerProfile: profile }] }),
+		scenarioResolver: () => fixtureScenario(),
+		providerFactories: { codex: () => ({ ...instantProvider(), ...profile, synthetic: false }) },
+		providerCliHealth,
+		artifactDirectory: null,
+	});
+	assert.equal(result.trials[0].status, 'PASSED');
+	assert.ok(checks.includes('codex'), 'the injected monitor probes the launched provider');
+});
+
 test('live-mode synthetic providers retain synthetic identity in results and events', async () => {
 	const profile = { provider: 'codex', model: 'fixture-model', reasoningEffort: 'high', serviceTier: 'fast' };
 	for (const synthetic of [true, false]) {

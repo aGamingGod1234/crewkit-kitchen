@@ -57,6 +57,8 @@ public final class BoundedServerTaskQueueVerification {
 				"action cancellations share the command FIFO");
 		assertEquals(BoundedServerTaskQueue.Lane.CONTROL, MultiplexedServerBridge.inboundLane("heartbeat"),
 				"control traffic is isolated from bulk traffic");
+		assertEquals(BoundedServerTaskQueue.Lane.CONTROL, MultiplexedServerBridge.inboundLane("agent_notice"),
+				"launch-time agent notices ride the control lane");
 		assertEquals(BoundedServerTaskQueue.Lane.BULK, MultiplexedServerBridge.inboundLane("verbose_event"),
 				"verbose telemetry cannot consume reserved action capacity");
 
@@ -76,7 +78,7 @@ public final class BoundedServerTaskQueueVerification {
 		assertTrue(queue.offer(BoundedServerTaskQueue.Lane.CONTROL, () -> { }),
 				"second control reserve remains available after urgent and bulk admission");
 		assertEquals(8, queue.pendingCount(), "reverse-order admission fills the queue without wasting capacity");
-		return 40;
+		return 41;
 	}
 
 	private static void assertTrue(boolean value, String label) {

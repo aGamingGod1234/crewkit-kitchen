@@ -1,10 +1,12 @@
 # Classes targeted by POV mixins; one fully qualified name per line.
 carpet.helpers.EntityPlayerActionPack
+com.mojang.brigadier.tree.CommandNode
 net.minecraft.client.Camera
 net.minecraft.client.Minecraft
 net.minecraft.client.MouseHandler
 net.minecraft.client.gui.Gui
 net.minecraft.client.gui.contextualbar.ExperienceBarRenderer
+net.minecraft.client.gui.screens.debug.GameModeSwitcherScreen
 net.minecraft.client.gui.screens.MenuScreens
 net.minecraft.client.gui.screens.inventory.AbstractContainerScreen
 net.minecraft.client.gui.screens.inventory.InventoryScreen
@@ -13,6 +15,7 @@ net.minecraft.client.multiplayer.MultiPlayerGameMode
 net.minecraft.client.player.KeyboardInput
 net.minecraft.client.player.LocalPlayer
 net.minecraft.client.renderer.GameRenderer
+net.minecraft.client.renderer.ItemInHandRenderer
 net.minecraft.server.level.ChunkMap
 net.minecraft.server.level.ChunkMap$TrackedEntity
 net.minecraft.server.level.ServerLevel

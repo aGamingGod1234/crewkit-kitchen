@@ -141,7 +141,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			"AI agent coordinator is offline; check logs/arena-agents-coordinator-error.log for the startup cause";
 	private static final Logger LOGGER = LoggerFactory.getLogger(MultiplexedServerBridge.class);
 	private static final Set<String> INBOUND_TYPES = Set.of(
-			"auth_challenge", "hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "conversation_wake_ack", "goal_spec_proposal", "director_script_result", "request_observation", "inspection_request", "action_command", "action_cancel", "action_result_ack", "agent_error", "verbose_event", "task_view", "heartbeat"
+			"auth_challenge", "hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "conversation_wake_ack", "goal_spec_proposal", "director_script_result", "request_observation", "inspection_request", "action_command", "action_cancel", "action_result_ack", "agent_error", "agent_notice", "verbose_event", "task_view", "heartbeat"
 	);
 
 	private final CodexAgentManager manager;
@@ -192,6 +192,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private final ArrayDeque<Long> preauthAccepts = new ArrayDeque<>();
 	private final Map<AgentId, RecoveryObservationIdentity> recoveryObservationIdentities = new HashMap<>();
 	private final Map<UUID, ActivatedGoalSpecRequest> activatedGoalSpecRequests = new LinkedHashMap<>();
+	// Latest launch notice per agent, replayed to players who join after it was broadcast.
+	private final Map<AgentId, AgentNotice> latestAgentNotices = new java.util.concurrent.ConcurrentHashMap<>();
+	private volatile java.util.function.Consumer<AcceptedAgentNotice> agentNoticeHook = ignored -> { };
 	private volatile Runnable handshakeSnapshotHook = () -> { };
 	private volatile Runnable observationEnqueueHook = () -> { };
 	private volatile java.util.function.Consumer<AutoCloseable> handshakeCommittedHook = ignored -> { };
@@ -807,6 +810,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		dev.agaminggod.arenaagents.server.voice.VoiceSubsystemRuntime.removeAgent(manager.server(), agentId);
 		programActions.remove(agentId);
 		terminalResults.remove(agentId);
+		latestAgentNotices.remove(agentId);
 		actionJournal.remove(agentId);
 		observationPublication.remove(agentId);
 		activatedGoalSpecRequests.entrySet().removeIf(entry -> entry.getValue().agentId().equals(agentId));
@@ -966,7 +970,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			case "agent_ready", "planning_state", "goal_completed", "action_command", "action_cancel",
 					"action_result_ack" -> BoundedServerTaskQueue.Lane.URGENT;
 			case "coordinator_status", "conversation_wake_ack", "goal_spec_proposal",
-					"request_observation", "heartbeat" -> BoundedServerTaskQueue.Lane.CONTROL;
+					"request_observation", "agent_notice", "heartbeat" -> BoundedServerTaskQueue.Lane.CONTROL;
 			case "inspection_request" -> BoundedServerTaskQueue.Lane.INSPECTION;
 			default -> BoundedServerTaskQueue.Lane.BULK;
 		};
@@ -1108,6 +1112,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 					for (AgentRecord record : visibleRecords) programActions.beginGoal(record.agentId(), record.goalRevision());
 					source.completeHandshake(handshake, suppliedLaunchId, sessionGenerations.incrementAndGet(), source.registryFragments ? visibleRecords : null);
 					handshakeCommittedHook.accept(source);
+					// Every new coordinator session re-probes and re-notifies unhealthy agents.
+					latestAgentNotices.clear();
 					coordinatorLifecycleGeneration++;
 					markVerboseControlPublished(verboseControl);
 				} catch (RuntimeException exception) {
@@ -1150,6 +1156,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			case "action_cancel" -> acceptActionCancel(envelope);
 			case "action_result_ack" -> acceptActionResultAck(envelope);
 			case "agent_error" -> acceptAgentError(envelope);
+			case "agent_notice" -> acceptAgentNotice(envelope);
 			case "verbose_event" -> acceptVerboseEvent(envelope);
 			case "heartbeat" -> send("heartbeat", "server", new JsonObject());
 			default -> throw new BridgeProtocolException("UNKNOWN_MESSAGE_TYPE", envelope.type());
@@ -1586,6 +1593,78 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	static void reportRawAgentError(AgentVerboseState verboseState, Runnable reporter) {
 		if (verboseState.standardActivityEnabled()) reporter.run();
 	}
+
+	/**
+	 * Launch-time notices (for example a missing or signed-out provider CLI) carry no goal
+	 * revision: the agent is usually still idle, so unlike agent_error they are never dropped.
+	 */
+	private void acceptAgentNotice(BridgeEnvelope envelope) {
+		AgentId agentId = AgentId.parse(envelope.agentId());
+		AgentNotice notice = decodeAgentNotice(envelope.payload());
+		AgentRecord record = null;
+		try {
+			if (manager.registry().contains(agentId)) record = manager.registry().require(agentId);
+		} catch (RuntimeException exception) {
+			record = null;
+		}
+		AgentChatReporter.notice(manager, record, notice.severity(), notice.code(), notice.message());
+		if (record != null) latestAgentNotices.put(agentId, notice);
+		agentNoticeHook.accept(new AcceptedAgentNotice(agentId, record != null, notice));
+	}
+
+	/** Replays the latest notice of every still-registered agent to a player who joined after it was broadcast. */
+	public void replayAgentNotices(ServerPlayer player) {
+		Objects.requireNonNull(player, "player must not be null");
+		for (net.minecraft.network.chat.Component line : pendingAgentNoticeLines()) {
+			try {
+				player.sendSystemMessage(line);
+			} catch (RuntimeException exception) {
+				LOGGER.warn("Could not replay an agent notice to {}", player.getGameProfile().name(), exception);
+			}
+		}
+	}
+
+	List<net.minecraft.network.chat.Component> pendingAgentNoticeLines() {
+		List<net.minecraft.network.chat.Component> lines = new java.util.ArrayList<>();
+		for (Map.Entry<AgentId, AgentNotice> entry : latestAgentNotices.entrySet()) {
+			AgentRecord record = null;
+			try {
+				if (manager.registry().contains(entry.getKey())) record = manager.registry().require(entry.getKey());
+			} catch (RuntimeException exception) {
+				record = null;
+			}
+			if (record == null) {
+				latestAgentNotices.remove(entry.getKey());
+				continue;
+			}
+			AgentNotice notice = entry.getValue();
+			lines.add(AgentChatReporter.noticeLine(manager.displayName(record), record.profile().provider(), notice.severity(), notice.message()));
+		}
+		return lines;
+	}
+
+	void setAgentNoticeHookForVerification(java.util.function.Consumer<AcceptedAgentNotice> hook) {
+		agentNoticeHook = Objects.requireNonNull(hook, "agent notice hook must not be null");
+	}
+
+	static AgentNotice decodeAgentNotice(JsonObject payload) {
+		requireKeys(payload, Set.of("severity", "code", "message"), "agent_notice");
+		String severity = requiredString(payload, "severity");
+		if (!AgentChatReporter.NOTICE_SEVERITIES.contains(severity)) {
+			throw new BridgeProtocolException("INVALID_AGENT_NOTICE", "agent_notice.severity is not supported");
+		}
+		String code = requiredString(payload, "code", 128);
+		String message = requiredString(payload, "message", AgentChatReporter.MAX_NOTICE_LENGTH);
+		if (message.codePoints().anyMatch(codePoint -> codePoint < 0x20 || codePoint == 0x7f)) {
+			throw new BridgeProtocolException("INVALID_AGENT_NOTICE", "agent_notice.message must be plain text");
+		}
+		return new AgentNotice(severity, code, message);
+	}
+
+	static record AgentNotice(String severity, String code, String message) { }
+
+	/** What acceptAgentNotice did with one envelope; `known` is false when the agent was logged only. */
+	static record AcceptedAgentNotice(AgentId agentId, boolean known, AgentNotice notice) { }
 
 	private void acceptVerboseEvent(BridgeEnvelope envelope) {
 		AgentId agentId = AgentId.parse(envelope.agentId());

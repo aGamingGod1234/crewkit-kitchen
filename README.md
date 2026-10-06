@@ -54,6 +54,10 @@ Preparation verifies the copied world before it reuses it. It creates `runtime/s
 
 The Reliability workflow publishes `arena-agents-modpack-<version>.zip`. Build it with `.\gradlew.bat packageWindowsDistribution`. Extract the complete ZIP and follow its `README.md`. The shipped command is `.\scripts\install-distribution.ps1`; source-only preparation and launcher-profile scripts are deliberately absent. The installer creates `%APPDATA%\.minecraft-arena-agents`, installs the exact Arena Agents, Arena Agents Voice, Fabric API, Fabric Carpet, and Simple Voice Chat JARs, removes older package-owned JARs, and installs the matching coordinator and Node.js runtime. It preserves unrelated mods and restores the previous package files if an update fails.
 
+### Provider CLI checks
+
+Agents think through a provider CLI installed on the machine that runs the coordinator: `claude` (Claude Code), `codex` (Codex CLI) or `agy` (Antigravity). Each time an agent is launched, or re-registered after a coordinator reconnect, the coordinator probes that CLI with the same executable resolution and environment the agent process uses and reports three failure states to everyone in Minecraft chat: **not installed** (`claude`, `codex` or `agy` was not found on PATH, under `%APPDATA%\npm` or beside an npm `.cmd` shim, in `%USERPROFILE%\.local\bin` or in `%LOCALAPPDATA%\agy\bin`), **broken** (the CLI exists but `--version` fails, cannot start or times out), and **not signed in** (`claude auth status`, `codex login status` or `agy models` reports no login; an `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` or `GEMINI_API_KEY` in the coordinator environment counts as signed in). The chat line names the fix: install the CLI and restart Minecraft, reinstall or update it, or run `claude auth login`, `codex login` or `agy` on the server machine and relaunch the agent. Players who join later see the latest notice for each affected agent. The same three results are logged once per provider with a `[provider-cli]` prefix when the coordinator first connects to the server. A healthy CLI produces no chat message.
+
 ## Run summonable NPC mode
 
 For the source-checkout runtime, start the Fabric server and coordinator in separate terminals:
@@ -84,13 +88,13 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-dynamic-coordinator.ps1
 /codex status [agent]
 /codex list
 /codex remove <agent>
-/spectator <agent>
-/spectator exit
-/takeover <agent>
+/spectate <agent> [start|stop]
+/spectate exit
+/takeover <agent> [start|stop]
 /takeover exit
 ```
 
-`/spectator <agent>` switches your view to the agent's first-person camera and shows its hotbar, hearts, food, armor, air, XP, effects, open container screens and death screen. Your own body stays where it is, so your surroundings stop rendering while you watch. `/takeover <agent>` does the same and routes your movement, mouse look, jump, sneak, sprint, attack, use, hotbar and inventory clicks to the agent's body while its model is paused; the model resumes from whatever state you leave the agent in and receives a short report of what you did. A takeover ends when you run `/takeover exit`, when your own body loses two hearts, dies, changes dimension or disconnects, or when the agent is removed or enters another dimension (run the command again once you are in the same dimension). Both commands need operator permission and the client mod. Vanilla `/spectate` is a different command: it moves your body to the target.
+`/spectate <agent>` switches your view to the agent's first-person camera, one-to-one with what a player in its body would see: its hands, skin, held tools and how it swings, eats, blocks or draws them, plus its hotbar, hearts, food, armor, air, XP, effects, game mode, open container screens and death screen. Nothing else is drawn over the view; a lost signal or a hit on your own body shows briefly on the action bar. `<agent>` is the tab-completed selector (the agent's username or short id, no spaces), not the display name shown in chat. `<agent>` alone means `start`; `/spectate <agent> stop` (or `exit`) ends that agent's view and `/spectate exit` ends whichever view is active. Your own body stays where it is, so your surroundings stop rendering while you watch. `/takeover <agent>` uses the same grammar and routes your movement, mouse look, jump, sneak, sprint, attack, use, hotbar and inventory clicks to the agent's body while its model is paused; the model resumes from whatever state you leave the agent in and receives a short report of what you did. A takeover ends when you run `/takeover exit`, when your own body loses two hearts, dies, changes dimension or disconnects, or when the agent is removed or enters another dimension (run the command again once you are in the same dimension). Both commands need operator permission and the client mod. The mod replaces vanilla `/spectate` (which would move your body to the target) on servers it runs on.
 
 `/codex summon` and the legacy two-argument form use the configured Codex default. The command center asks each installed provider CLI for its current model catalog and uses a bounded built-in catalog when discovery is unavailable. Availability still depends on the installed CLI, its login, and that provider's model access. Player-facing speed choices are `Normal` and `Fast mode`; provider wire values stay internal. A newly summoned NPC remains idle until `/codex start`; `stop` freezes its active work, `queue` preserves later goals, and `steer` interrupts the current plan at a higher revision.
 

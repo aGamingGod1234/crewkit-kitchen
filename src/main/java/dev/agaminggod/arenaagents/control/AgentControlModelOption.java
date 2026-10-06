@@ -1,5 +1,6 @@
 package dev.agaminggod.arenaagents.control;
 
+import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
@@ -15,14 +16,31 @@ public record AgentControlModelOption(
 ) {
 	public static final int MAX_OPTIONS = 128;
 	private static final Set<String> PROVIDERS = Set.of("codex", "gemini", "claude");
+	/** Ascending thinking depth; unknown efforts follow these in their input order. */
+	public static final List<String> REASONING_ORDER =
+			List.of("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra");
+	/** Normal speed first, then fast; unknown tiers follow in their input order. */
+	public static final List<String> SERVICE_TIER_ORDER = List.of("priority", "fast");
 
 	public AgentControlModelOption {
 		provider = identifier(provider, "provider", 24).toLowerCase(Locale.ROOT);
 		if (!PROVIDERS.contains(provider)) throw new IllegalArgumentException("Unsupported provider: " + provider);
 		model = identifier(model, "model", 128);
 		displayName = text(displayName, "displayName", 96);
-		reasoningEfforts = identifiers(reasoningEfforts, "reasoningEfforts", 12, 32, false);
-		serviceTiers = identifiers(serviceTiers, "serviceTiers", 8, 24, true);
+		// Sorting here keeps the fallback catalog and the coordinator's runtime catalog on one scale,
+		// so every selector steps from the lowest value upward regardless of how the list arrived.
+		reasoningEfforts = ordered(identifiers(reasoningEfforts, "reasoningEfforts", 12, 32, false), REASONING_ORDER);
+		serviceTiers = ordered(identifiers(serviceTiers, "serviceTiers", 8, 24, true), SERVICE_TIER_ORDER);
+	}
+
+	/** Stable sort by canonical rank; values missing from the canonical list keep their relative order last. */
+	static List<String> ordered(List<String> values, List<String> canonical) {
+		return values.stream()
+				.sorted(Comparator.comparingInt(value -> {
+					int rank = canonical.indexOf(value);
+					return rank < 0 ? canonical.size() : rank;
+				}))
+				.toList();
 	}
 
 	private static List<String> identifiers(

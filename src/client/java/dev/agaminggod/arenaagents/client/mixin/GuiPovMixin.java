@@ -30,6 +30,7 @@ import org.spongepowered.asm.mixin.injection.At;
 /**
  * While an agent view is active the HUD reads the stand-in player: getCameraPlayer covers hotbar,
  * hearts, food, armor and air; the wraps below cover the reads that go to the operator directly.
+ * getPlayerMode needs no wrap here: MultiPlayerGameModePovMixin answers it for every caller.
  */
 @Mixin(Gui.class)
 abstract class GuiPovMixin {
@@ -41,13 +42,6 @@ abstract class GuiPovMixin {
 	private Player arenaagents$povCameraPlayer(Player original) {
 		RemotePlayer proxy = PovHudProxy.current();
 		return proxy == null ? original : proxy;
-	}
-
-	@WrapOperation(method = {"extractHotbarAndDecorations", "extractCrosshair"}, at = @At(value = "INVOKE",
-			target = "Lnet/minecraft/client/multiplayer/MultiPlayerGameMode;getPlayerMode()Lnet/minecraft/world/level/GameType;"))
-	private GameType arenaagents$povPlayerMode(MultiPlayerGameMode gameMode, Operation<GameType> original) {
-		GameType pov = PovHudProxy.gameMode();
-		return pov == null ? original.call(gameMode) : pov;
 	}
 
 	@WrapOperation(method = {"extractHotbarAndDecorations", "extractSelectedItemName"}, at = @At(value = "INVOKE",

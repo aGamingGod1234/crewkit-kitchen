@@ -48,7 +48,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Server side of /spectator and /takeover. Sessions are keyed by operator; takeovers additionally
+ * Server side of /spectate and /takeover. Sessions are keyed by operator; takeovers additionally
  * hold an {@link AgentControlReservations} entry for the agent. Ticked once per server tick after
  * the bridge and before agent input arbitration, so operator input wins the same tick it arrives.
  */

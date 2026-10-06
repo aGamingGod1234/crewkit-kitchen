@@ -3,6 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { runLatencyMatrix as defaultRunLatencyMatrix } from './latency-runner.mjs';
+import { ProviderCliHealthMonitor } from '../provider-cli-health.mjs';
 
 export const EXIT_CODES = Object.freeze({
 	PASSED: 0,
@@ -126,7 +127,8 @@ export async function runLatencyRunnerCli(argv = process.argv.slice(2), dependen
 			artifactDirectory: args.artifactDirectory,
 			planningConcurrency: args.planningConcurrency,
 			...(publicMetadataContext(args) === null ? {} : { baseContext: publicMetadataContext(args) }),
-			...(liveConfig === null ? {} : { liveProviderOptions: liveConfig.options, preflightTimeoutMs: liveConfig.planningTimeoutMs }),
+			// Live runs launch real provider CLIs, so one shared monitor may probe them (once per TTL across trials).
+			...(liveConfig === null ? {} : { liveProviderOptions: liveConfig.options, preflightTimeoutMs: liveConfig.planningTimeoutMs, providerCliHealth: dependencies.providerCliHealth ?? new ProviderCliHealthMonitor() }),
 			...(replayRecordings === undefined ? {} : { replayRecordings }),
 			...(replayPrompt === null ? {} : { replayPrompt }),
 			...(args.arm === null ? {} : { arm: args.arm }),

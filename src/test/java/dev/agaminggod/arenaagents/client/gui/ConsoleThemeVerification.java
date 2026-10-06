@@ -63,7 +63,21 @@ public final class ConsoleThemeVerification {
 				"the visible left arrow cycles backward");
 		assertTrue(ConsoleCycleButton.clickDirection(150.0D, 100, 120) == 1,
 				"the value and visible right arrow cycle forward");
-		return 33;
+		assertTrue(ConsoleCycleButton.step(1, 1, 3, false) == 2,
+				"ranked selectors move one step higher to the right");
+		assertTrue(ConsoleCycleButton.step(1, -1, 3, false) == 0,
+				"ranked selectors move one step lower to the left");
+		assertTrue(ConsoleCycleButton.step(2, 1, 3, false) == 2,
+				"ranked selectors stop at the highest value instead of wrapping");
+		assertTrue(ConsoleCycleButton.step(0, -1, 3, false) == 0,
+				"ranked selectors stop at the lowest value instead of wrapping");
+		assertTrue(ConsoleCycleButton.step(0, 1, 1, false) == 0,
+				"a single ranked value never moves");
+		assertTrue(ConsoleCycleButton.step(2, 1, 3, true) == 0,
+				"wrapping selectors loop from the last value to the first");
+		assertTrue(ConsoleCycleButton.step(0, -1, 3, true) == 2,
+				"wrapping selectors loop from the first value to the last");
+		return 36;
 	}
 
 	private static void assertTrue(boolean condition, String label) {

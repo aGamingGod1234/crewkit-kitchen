@@ -258,6 +258,8 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 			benchmarkRecorder: trialRecorder,
 			latencyRegistry,
 			...(providerService ? { providerService } : {}),
+			// Only the production CLI injects a real monitor; tests and simulators keep the spawn-free default.
+			...(options.providerCliHealth ? { providerCliHealth: options.providerCliHealth } : {}),
 			setStatusInterval: () => null,
 			clearStatusInterval: () => {},
 			controlNow: () => world.timeMs,

@@ -167,8 +167,8 @@ public final class ScenarioSetupState {
 			List<AgentControlModelOption> options = AgentControlCatalog.currentOptions();
 			if (options.isEmpty()) return false;
 			AgentControlModelOption option = options.getFirst();
-			String reasoning = option.reasoningEfforts().contains("high")
-					? "high" : option.reasoningEfforts().getFirst();
+			// Option lists are sorted ascending, so the first effort is the lowest thinking depth.
+			String reasoning = option.reasoningEfforts().getFirst();
 			String serviceTier = option.serviceTiers().contains("priority") ? "priority"
 					: option.serviceTiers().isEmpty() ? "priority" : option.serviceTiers().getFirst();
 			template = new ScenarioAgentConfig(
@@ -307,7 +307,7 @@ public final class ScenarioSetupState {
 		String model = selectedOption.model();
 		List<String> reasoningEfforts = selectedOption.reasoningEfforts();
 		String reasoning = reasoningEfforts.contains(current.reasoning())
-				? current.reasoning() : reasoningEfforts.contains("high") ? "high" : reasoningEfforts.getFirst();
+				? current.reasoning() : reasoningEfforts.getFirst();
 		List<String> serviceTiers = selectedOption.serviceTiers().isEmpty()
 				? List.of("priority") : selectedOption.serviceTiers();
 		String serviceTier = serviceTiers.contains(current.serviceTier()) ? current.serviceTier()
