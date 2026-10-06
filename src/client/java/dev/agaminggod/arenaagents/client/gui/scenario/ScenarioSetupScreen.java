@@ -96,8 +96,9 @@ public final class ScenarioSetupScreen extends Screen {
 
 	private static ScenarioSetupState safeDefaults(AgentControlClient.Preferences preferences) {
 		try {
-			return ScenarioSetupState.defaults(
-					preferences.provider(), preferences.model(), preferences.reasoning());
+			// Thinking depth is never remembered: every new setup starts at the lowest effort.
+			return ScenarioSetupState.defaults(preferences.provider(), preferences.model(),
+					AgentControlCatalog.defaultReasoning(preferences.provider(), preferences.model()));
 		} catch (IllegalArgumentException | IllegalStateException exception) {
 			return ScenarioSetupState.defaults();
 		}
@@ -604,7 +605,7 @@ public final class ScenarioSetupScreen extends Screen {
 					value -> Component.literal(AgentControlCatalog.displayName(anchor.provider(), value)),
 					value -> applyAndRebuild(() -> state.applyModel(value))));
 			int secondY = editorY + ROW_HEIGHT + 2;
-			addRenderableWidget(new ConsoleCycleButton<>(font, x, secondY, columnWidth, ROW_HEIGHT,
+			addRenderableWidget(ConsoleCycleButton.ranked(font, x, secondY, columnWidth, ROW_HEIGHT,
 					Component.literal("Thinking"), AgentControlCatalog.reasoningEfforts(anchor.provider(), anchor.model()),
 					anchor.reasoning(), Component::literal,
 					value -> applyAndRebuild(() -> state.applyReasoning(value))));
@@ -648,7 +649,7 @@ public final class ScenarioSetupScreen extends Screen {
 				anchor.model(), value -> Component.literal(AgentControlCatalog.displayName(anchor.provider(), value)),
 				value -> applyAndRebuild(() -> state.applyModel(value))));
 		int secondY = compact ? y + 25 : y + 50;
-		addRenderableWidget(new ConsoleCycleButton<>(font, x, secondY, columnWidth, ROW_HEIGHT,
+		addRenderableWidget(ConsoleCycleButton.ranked(font, x, secondY, columnWidth, ROW_HEIGHT,
 				Component.literal("Thinking"), AgentControlCatalog.reasoningEfforts(anchor.provider(), anchor.model()),
 				anchor.reasoning(), Component::literal,
 				value -> applyAndRebuild(() -> state.applyReasoning(value))));
@@ -680,7 +681,7 @@ public final class ScenarioSetupScreen extends Screen {
 
 	private void addSpeedModeControl(ScenarioAgentConfig anchor, int x, int y, int width) {
 		if (AgentControlCatalog.hasSpeedMode(anchor.provider(), anchor.model())) {
-			addRenderableWidget(new ConsoleCycleButton<>(font, x, y, width, ROW_HEIGHT,
+			addRenderableWidget(ConsoleCycleButton.ranked(font, x, y, width, ROW_HEIGHT,
 					Component.literal("Speed mode"), AgentControlCatalog.serviceTiers(anchor.provider(), anchor.model()),
 					anchor.serviceTier(), value -> Component.literal(AgentControlPresentation.speedLabel(value)),
 					value -> applyAndRebuild(() -> state.applyServiceTier(value))));

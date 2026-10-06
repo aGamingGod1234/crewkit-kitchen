@@ -158,8 +158,10 @@ public final class AgentControlVerification {
 	private static int verifyProviderPresets() {
 		assertEquals(List.of("codex", "gemini", "claude"), AgentControlCatalog.providers(), "provider order");
 		assertEquals("gpt-6-luna", AgentControlCatalog.defaultModel("codex"), "Codex model default");
-		assertEquals("xhigh", AgentControlCatalog.defaultReasoning("codex", "gpt-6-luna"), "Codex reasoning default");
-		assertEquals("fast", AgentControlCatalog.defaultServiceTier("codex", "gpt-6-luna"), "Codex speed default");
+		assertEquals("low", AgentControlCatalog.defaultReasoning("codex", "gpt-6-luna"),
+				"Codex thinking depth starts at the lowest effort");
+		assertEquals("priority", AgentControlCatalog.defaultServiceTier("codex", "gpt-6-luna"),
+				"Codex speed starts at Normal even when fast is offered");
 		assertEquals("gemini-3.1-pro", AgentControlCatalog.defaultModel("gemini"), "Gemini model default");
 		assertEquals("thinking", AgentControlCatalog.defaultReasoning("gemini", "claude-sonnet-4-6"),
 				"Claude actors use the Gemini catalog's model-specific reasoning");
@@ -170,12 +172,12 @@ public final class AgentControlVerification {
 		assertEquals("claude-opus-5-5", AgentControlCatalog.defaultModel("claude"), "Claude model default");
 		assertEquals(List.of("claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"), AgentControlCatalog.models("claude"),
 				"Claude model presets");
-		assertEquals("high", AgentControlCatalog.defaultReasoning("claude", "claude-sonnet-5-5"), "Claude reasoning default");
+		assertEquals("low", AgentControlCatalog.defaultReasoning("claude", "claude-sonnet-5-5"), "Claude reasoning default");
 		assertEquals("priority", AgentControlCatalog.defaultServiceTier("claude", "claude-sonnet-5-5"), "Claude has no fast tier");
-		assertEquals(List.of("high", "low"), AgentControlCatalog.reasoningEfforts("gemini", "gemini-3.1-pro"),
-				"Gemini Pro efforts");
-		assertEquals(List.of("high", "medium", "low"),
-				AgentControlCatalog.reasoningEfforts("gemini", "gemini-3.6-flash"), "Gemini Flash efforts");
+		assertEquals(List.of("low", "high"), AgentControlCatalog.reasoningEfforts("gemini", "gemini-3.1-pro"),
+				"Gemini Pro efforts ascend");
+		assertEquals(List.of("low", "medium", "high"),
+				AgentControlCatalog.reasoningEfforts("gemini", "gemini-3.6-flash"), "Gemini Flash efforts ascend");
 		for (String model : List.of("claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1")) {
 			assertEquals(List.of("low", "medium", "high"), AgentControlCatalog.reasoningEfforts("claude", model),
 					"Claude models offer Low through High only");
@@ -200,9 +202,9 @@ public final class AgentControlVerification {
 
 	private static int verifyCommandConstruction() {
 		assertEquals(
-				"codex summon-configured codex gpt-6.1-sol high fast survival \"Builder One\"",
+				"codex summon-configured codex gpt-6.1-sol high priority survival \"Builder One\"",
 				AgentControlCommandBuilder.summon("codex", "gpt-6.1-sol", "high", "Builder One"),
-				"Codex summon command"
+				"Codex summon command defaults to Normal speed"
 		);
 		assertEquals(
 				"codex summon-configured claude claude-opus-5-5 high priority survival Scout",
@@ -288,7 +290,7 @@ public final class AgentControlVerification {
 	private static int verifyRuntimeCatalogBecomesAuthoritative() {
 		List<AgentControlModelOption> live = List.of(
 				new AgentControlModelOption(
-						"codex", "gpt-6.1-sol", "GPT-6.1 Sol", List.of("medium", "ultra"), List.of("priority", "fast")
+						"codex", "gpt-6.1-sol", "GPT-6.1 Sol", List.of("high", "low", "medium"), List.of("fast", "priority")
 				),
 				new AgentControlModelOption(
 						"codex", "gpt-6-sol", "GPT 6 Sol", List.of("high"), List.of("fast")
@@ -297,7 +299,7 @@ public final class AgentControlVerification {
 						"codex", "gpt-5.6-sol", "GPT 5.6 Sol", List.of("high"), List.of("fast")
 				),
 				new AgentControlModelOption(
-						"claude", "claude-live", "Claude Live", List.of("high"), List.of()
+						"claude", "claude-live", "Claude Live", List.of("thinking", "high", "low"), List.of()
 				)
 		);
 		try {
@@ -308,10 +310,16 @@ public final class AgentControlVerification {
 					"runtime catalog offers only the selected Codex roster");
 			assertEquals("GPT-6.1 Sol", AgentControlCatalog.displayName("codex", "gpt-6.1-sol"),
 					"runtime catalog preserves provider display names");
-			assertEquals(List.of("medium", "ultra"), AgentControlCatalog.reasoningEfforts("codex", "gpt-6.1-sol"),
-					"runtime catalog controls reasoning choices");
+			assertEquals(List.of("low", "medium", "high"), AgentControlCatalog.reasoningEfforts("codex", "gpt-6.1-sol"),
+					"unsorted runtime reasoning choices are normalised to ascending depth");
 			assertEquals(List.of("priority", "fast"), AgentControlCatalog.serviceTiers("codex", "gpt-6.1-sol"),
-					"runtime catalog controls speed choices");
+					"unsorted runtime speed choices put Normal before fast");
+			assertEquals("low", AgentControlCatalog.defaultReasoning("codex", "gpt-6.1-sol"),
+					"runtime catalog default is the lowest depth");
+			assertEquals("priority", AgentControlCatalog.defaultServiceTier("codex", "gpt-6.1-sol"),
+					"runtime catalog default speed is Normal");
+			assertEquals(List.of("low", "high", "thinking"), AgentControlCatalog.reasoningEfforts("claude", "claude-live"),
+					"unknown efforts keep their input order after the known scale");
 			assertEquals(2, AgentControlCatalog.selectableOptions(live).size(),
 					"server snapshots omit old Codex models while retaining other providers");
 			AgentControlSnapshot snapshot = new AgentControlSnapshot(
@@ -329,7 +337,7 @@ public final class AgentControlVerification {
 				"fallback model sequence contains the selected GPT-6 roster");
 		assertTrue(!AgentControlCatalog.models("codex").contains("codex-auto-review"),
 				"fallback model sequence omits provider-internal hidden models");
-		return 10;
+		return 13;
 	}
 
 	private static int verifyActionSafety() {

@@ -33,15 +33,15 @@ public final class AgentControlCatalog {
 		return preferred != null && available.contains(preferred) ? preferred : available.getFirst();
 	}
 
+	/** Menus always open on the lowest thinking depth; efforts are sorted ascending by the option itself. */
 	public static String defaultReasoning(String provider, String model) {
-		List<String> efforts = reasoningEfforts(provider, model);
-		if (CODEX.equals(provider) && "gpt-6-luna".equals(model) && efforts.contains("xhigh")) return "xhigh";
-		return efforts.contains("high") ? "high" : efforts.getFirst();
+		return reasoningEfforts(provider, model).getFirst();
 	}
 
+	/** Menus always open on Normal speed (priority) when the model offers it. */
 	public static String defaultServiceTier(String provider, String model) {
 		List<String> tiers = serviceTiers(provider, model);
-		return CODEX.equals(provider) && tiers.contains("fast") ? "fast" : "priority";
+		return tiers.contains("priority") ? "priority" : tiers.getFirst();
 	}
 
 	public static String displayName(String provider, String model) {
@@ -112,9 +112,9 @@ public final class AgentControlCatalog {
 		add(values, CODEX, "gpt-6-astra", "GPT 6 Astra", List.of("low", "medium", "high", "xhigh", "max", "ultra"), true);
 		add(values, CODEX, "gpt-6.1-sol", "GPT-6.1 Sol", List.of("low", "medium", "high", "xhigh", "max", "ultra"), true);
 		add(values, CODEX, "gpt-6-luna", "GPT 6 Luna", List.of("low", "medium", "high", "xhigh", "max"), true);
-		add(values, "gemini", "gemini-3.1-pro", "Gemini 3.1 Pro", List.of("high", "low"), false);
+		add(values, "gemini", "gemini-3.1-pro", "Gemini 3.1 Pro", List.of("low", "high"), false);
 		for (String model : List.of("gemini-3.6-flash", "gemini-3.5-flash")) {
-			add(values, "gemini", model, readable(model), List.of("high", "medium", "low"), false);
+			add(values, "gemini", model, readable(model), List.of("low", "medium", "high"), false);
 		}
 		for (String model : List.of("claude-sonnet-4-6", "claude-opus-4-6")) {
 			add(values, "gemini", model, readable(model), List.of("thinking"), false);

@@ -25,6 +25,7 @@ public final class ConsoleCycleButton<T> extends AbstractWidget implements Conso
 	private final List<T> values;
 	private final Function<T, Component> formatter;
 	private final Consumer<T> onValueChanged;
+	private final boolean wrap;
 	private int index;
 
 	public ConsoleCycleButton(
@@ -39,7 +40,44 @@ public final class ConsoleCycleButton<T> extends AbstractWidget implements Conso
 			Function<T, Component> formatter,
 			Consumer<T> onValueChanged
 	) {
+		this(font, x, y, width, height, label, values, initialValue, formatter, onValueChanged, true);
+	}
+
+	/**
+	 * Ordered selector for ranked values such as thinking depth or speed: right always raises, left always
+	 * lowers, and both ends stop instead of wrapping around.
+	 */
+	public static <T> ConsoleCycleButton<T> ranked(
+			Font font,
+			int x,
+			int y,
+			int width,
+			int height,
+			Component label,
+			List<T> values,
+			T initialValue,
+			Function<T, Component> formatter,
+			Consumer<T> onValueChanged
+	) {
+		return new ConsoleCycleButton<>(font, x, y, width, height, label, values, initialValue, formatter,
+				onValueChanged, false);
+	}
+
+	private ConsoleCycleButton(
+			Font font,
+			int x,
+			int y,
+			int width,
+			int height,
+			Component label,
+			List<T> values,
+			T initialValue,
+			Function<T, Component> formatter,
+			Consumer<T> onValueChanged,
+			boolean wrap
+	) {
 		super(x, y, width, height, Component.empty());
+		this.wrap = wrap;
 		this.font = Objects.requireNonNull(font, "font must not be null");
 		this.label = Objects.requireNonNull(label, "label must not be null");
 		this.values = List.copyOf(Objects.requireNonNull(values, "values must not be null"));
@@ -58,14 +96,17 @@ public final class ConsoleCycleButton<T> extends AbstractWidget implements Conso
 		graphics.fill(getX() + style.inset(), getY() + style.inset(),
 				getRight() - style.inset(), getBottom() - style.inset(), style.fill());
 		int textY = getY() + (getHeight() - 9) / 2;
-		ConsoleText.text(graphics, font, "<", getX() + 7, textY, style.arrow());
+		// Ranked selectors stop at either end, so the dead arrow is muted instead of promising a change.
+		int leftArrow = !wrap && index == 0 ? ConsoleTheme.MUTED : style.arrow();
+		int rightArrow = !wrap && index == values.size() - 1 ? ConsoleTheme.MUTED : style.arrow();
+		ConsoleText.text(graphics, font, "<", getX() + 7, textY, leftArrow);
 		ConsoleText.text(graphics, font, label, getX() + 19, textY, LABEL);
 		Component value = fittedValue();
 		int rightReserve = 20;
 		int valueX = Math.max(getX() + 19 + ConsoleText.width(font, label) + 8,
 				getRight() - rightReserve - ConsoleText.width(font, value));
 		ConsoleText.text(graphics, font, value, valueX, textY, style.text());
-		ConsoleText.text(graphics, font, ">", getRight() - 8, textY, style.arrow());
+		ConsoleText.text(graphics, font, ">", getRight() - 8, textY, rightArrow);
 	}
 
 	public static Presentation presentation(boolean active, boolean focused, boolean hovered) {
@@ -130,9 +171,19 @@ public final class ConsoleCycleButton<T> extends AbstractWidget implements Conso
 	}
 
 	private void cycle(int direction) {
-		index = Math.floorMod(index + direction, values.size());
+		int next = step(index, direction, values.size(), wrap);
+		if (next == index) return;
+		index = next;
 		updateMessage();
 		onValueChanged.accept(values.get(index));
+	}
+
+	/** Next index after moving one step; clamped mode stays put at either end, wrapping mode loops. */
+	public static int step(int index, int direction, int size, boolean wrap) {
+		if (size <= 0) throw new IllegalArgumentException("size must be positive");
+		if (index < 0 || index >= size) throw new IllegalArgumentException("index must be inside the value list");
+		if (wrap) return Math.floorMod(index + direction, size);
+		return Math.clamp(index + direction, 0, size - 1);
 	}
 
 	/** Restore an externally rejected selection without dispatching another input event. */
