@@ -5,6 +5,7 @@ import com.mojang.authlib.GameProfile;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.protocol.ActionType;
 import dev.agaminggod.arenaagents.server.runtime.transaction.ServerTransactionAdapter;
+import dev.agaminggod.arenaagents.server.runtime.menu.AgentInventoryView;
 import dev.agaminggod.arenaagents.server.runtime.menu.MenuInspection;
 import dev.agaminggod.arenaagents.server.runtime.menu.MenuStackIdentity;
 import java.lang.reflect.Field;
@@ -89,24 +90,33 @@ public final class AdvancedInteractionRollbackVerification {
 			verifyNativePickaxeTransaction(components);
 			if (failure != null) throw failure;
 		}
-		return 76;
+		return 100;
 	}
 
 	private static void verifyNativeCraftTransaction(ComponentBindings components) {
-		// Real RecipeManager, InventoryMenu, placement and quickMoveStack; only player/world effects are fixtures.
+		// Real RecipeManager, InventoryMenu, vanilla slot clicks and quickMoveStack; only player/world effects are fixtures.
 		components.stack(Items.OAK_PLANKS, 1, 0);
 		Fixture fixture = craftFixture();
 		fixture.inventory().setItem(0, components.stack(Items.OAK_LOG, 2, 0));
 		var args = json("recipeId", "minecraft:oak_planks", "count", 4, "timeoutMs", 5000);
 		var transaction = service().begin(fixture.player(), request(ActionType.CRAFT_INVENTORY, args), args);
-		var result = transaction.tick(System.currentTimeMillis());
-		assertEquals("CRAFT_CONFIRMED", result.reasonCode(), "native log recipe reaches commit: " + result.message());
+		var first = transaction.tick(System.currentTimeMillis());
+		assertEquals(ServerTransactionAdapter.TickState.RUNNING, first.state(), "inventory craft opens its screen before clicking");
+		assertTrue(AgentInventoryView.isOpen(fixture.player()), "agent inventory screen is mirrored while crafting");
+		assertEquals(0, count(fixture, Items.OAK_PLANKS), "no output appears on the opening tick");
+		assertEquals(2, count(fixture, Items.OAK_LOG), "planning dry run leaves the inventory untouched");
+		CraftTrace trace = tickToEnd(fixture, transaction);
+		assertEquals("CRAFT_CONFIRMED", trace.result().reasonCode(), "native log recipe reaches commit: " + trace.result().message());
+		assertTrue(trace.maxCarried() > 0, "the log is carried on the cursor between slots");
+		assertEquals(1, trace.maxFilledCells(), "the 2x2 grid visibly holds the log before the result is taken");
+		assertTrue(trace.ticks() >= 8, "inventory craft is paced over several ticks, was " + trace.ticks());
 		transaction.cleanup();
+		assertTrue(!AgentInventoryView.isOpen(fixture.player()), "inventory screen closes after crafting");
 		assertEquals(1, count(fixture, Items.OAK_LOG), "one native craft consumes one log");
 		assertEquals(4, count(fixture, Items.OAK_PLANKS), "one native craft owns four planks");
 		assertTrue(fixture.player().inventoryMenu.getInputGridSlots().stream().allMatch(slot -> !slot.hasItem()), "native grid cleaned");
 		assertTrue(fixture.player().inventoryMenu.getCarried().isEmpty(), "native cursor cleaned");
-		assertEquals(result, transaction.tick(System.currentTimeMillis()), "terminal craft retry is stable");
+		assertEquals(trace.result(), transaction.tick(System.currentTimeMillis()), "terminal craft retry is stable");
 		transaction.cleanup();
 		assertEquals(4, count(fixture, Items.OAK_PLANKS), "terminal retry and cleanup cannot duplicate output");
 
@@ -121,7 +131,7 @@ public final class AdvancedInteractionRollbackVerification {
 					throw new IllegalStateException("owned postcommit craft fault");
 				});
 		var fault = faulting.begin(failed.player(), request(ActionType.CRAFT_INVENTORY, args), args);
-		var rejected = fault.tick(System.currentTimeMillis());
+		var rejected = tickToEnd(failed, fault).result();
 		assertEquals("CRAFT_POSTCOMMIT_EXCEPTION", rejected.reasonCode(), "postcommit exception restores native transaction: " + rejected.message());
 		fault.cleanup();
 		assertEquals(2, count(failed, Items.OAK_LOG), "postcommit rollback restores original logs");
@@ -129,10 +139,18 @@ public final class AdvancedInteractionRollbackVerification {
 		assertEquals(rejected, fault.tick(System.currentTimeMillis()), "failed terminal retry is stable");
 		assertEquals(1, commits[0], "failed transaction cannot recommit");
 		var retry = service().begin(failed.player(), request(ActionType.CRAFT_INVENTORY, args), args);
-		assertEquals("CRAFT_CONFIRMED", retry.tick(System.currentTimeMillis()).reasonCode(), "new craft succeeds after rollback");
+		assertEquals("CRAFT_CONFIRMED", tickToEnd(failed, retry).result().reasonCode(), "new craft succeeds after rollback");
 		retry.cleanup();
 		assertEquals(1, count(failed, Items.OAK_LOG), "retry consumes only one original log");
 		assertEquals(4, count(failed, Items.OAK_PLANKS), "retry produces only one native result");
+
+		Fixture missing = craftFixture();
+		var noLogs = service().begin(missing.player(), request(ActionType.CRAFT_INVENTORY, args), args);
+		var unavailable = tickToEnd(missing, noLogs).result();
+		assertEquals(ServerTransactionAdapter.TickState.FAILED, unavailable.state(), "craft without ingredients fails honestly");
+		assertEquals("RECIPE_INPUTS_UNAVAILABLE", unavailable.reasonCode(), "missing ingredients are named: " + unavailable.message());
+		noLogs.cleanup();
+		assertTrue(!AgentInventoryView.isOpen(missing.player()), "failed craft closes the inventory screen");
 	}
 
 	private static int count(Fixture fixture, Item item) {
@@ -144,6 +162,26 @@ public final class AdvancedInteractionRollbackVerification {
 		return count;
 	}
 
+	private record CraftTrace(ServerTransactionAdapter.TickResult result, int ticks, int maxCarried, int maxFilledCells) {
+	}
+
+	/** Ticks a paced craft like the server does, recording what a spectator of the open menu would see. */
+	private static CraftTrace tickToEnd(Fixture fixture, ServerTransactionAdapter.ActiveTransaction transaction) {
+		int maxCarried = 0;
+		int maxFilled = 0;
+		for (int tick = 1; tick <= 200; tick++) {
+			var result = transaction.tick(System.currentTimeMillis());
+			var menu = fixture.player().containerMenu;
+			maxCarried = Math.max(maxCarried, menu.getCarried().getCount());
+			if (menu instanceof net.minecraft.world.inventory.AbstractCraftingMenu crafting) {
+				int filled = (int) crafting.getInputGridSlots().stream().filter(Slot::hasItem).count();
+				maxFilled = Math.max(maxFilled, filled);
+			}
+			if (result.terminal()) return new CraftTrace(result, tick, maxCarried, maxFilled);
+		}
+		throw new AssertionError("craft transaction did not finish within 200 ticks");
+	}
+
 	private static void verifyNativePickaxeTransaction(ComponentBindings components) {
 		components.stack(Items.STICK, 1, 0);
 		components.stack(Items.WOODEN_PICKAXE, 1, 59);
@@ -152,9 +190,16 @@ public final class AdvancedInteractionRollbackVerification {
 		fixture.inventory().setItem(1, components.stack(Items.STICK, 2, 0));
 		var args = json("recipeId", "minecraft:wooden_pickaxe", "count", 1, "timeoutMs", 5000, "x", 0, "y", 64, "z", 0);
 		var transaction = service().begin(fixture.player(), request(ActionType.CRAFT_TABLE, args), args);
-		var result = transaction.tick(System.currentTimeMillis());
-		assertEquals("CRAFT_CONFIRMED", result.reasonCode(), "native pickaxe table recipe commits: " + result.message());
+		assertEquals(ServerTransactionAdapter.TickState.RUNNING, transaction.tick(System.currentTimeMillis()).state(),
+				"table craft opens the table before clicking");
 		assertEquals(net.minecraft.world.inventory.CraftingMenu.class, fixture.player().containerMenu.getClass(), "native crafting table menu used");
+		assertEquals(1, fixture.player().swings, "opening the table swings the arm");
+		assertEquals(0, count(fixture, Items.WOODEN_PICKAXE), "no pickaxe on the opening tick");
+		CraftTrace trace = tickToEnd(fixture, transaction);
+		assertEquals("CRAFT_CONFIRMED", trace.result().reasonCode(), "native pickaxe table recipe commits: " + trace.result().message());
+		assertEquals(5, trace.maxFilledCells(), "all five pickaxe cells are visibly filled before the result is taken");
+		assertEquals(3, trace.maxCarried(), "the plank stack is carried while it is dealt into the grid");
+		assertTrue(trace.ticks() >= 20 && trace.ticks() <= 40, "table craft is watchable but quick, took " + trace.ticks() + " ticks");
 		transaction.cleanup();
 		assertEquals(0, count(fixture, Items.OAK_PLANKS), "pickaxe consumes three planks");
 		assertEquals(0, count(fixture, Items.STICK), "pickaxe consumes two sticks");
@@ -162,6 +207,30 @@ public final class AdvancedInteractionRollbackVerification {
 		assertTrue(fixture.player().containerMenu == fixture.player().inventoryMenu, "table menu cleanup returns to inventory");
 		transaction.cleanup(); transaction.tick(System.currentTimeMillis());
 		assertEquals(1, count(fixture, Items.WOODEN_PICKAXE), "table terminal retries cannot duplicate pickaxe");
+
+		// The menu closing halfway must not strand ingredients in the grid or on the cursor.
+		Fixture interrupted = craftFixture();
+		interrupted.inventory().setItem(0, components.stack(Items.OAK_PLANKS, 3, 0));
+		interrupted.inventory().setItem(1, components.stack(Items.STICK, 2, 0));
+		var halfway = service().begin(interrupted.player(), request(ActionType.CRAFT_TABLE, args), args);
+		var table = (net.minecraft.world.inventory.CraftingMenu) null;
+		for (int tick = 0; tick < 200; tick++) {
+			assertEquals(ServerTransactionAdapter.TickState.RUNNING, halfway.tick(System.currentTimeMillis()).state(), "craft still running");
+			if (interrupted.player().containerMenu instanceof net.minecraft.world.inventory.CraftingMenu crafting
+					&& crafting.getInputGridSlots().stream().filter(Slot::hasItem).count() == 2) {
+				table = crafting;
+				break;
+			}
+		}
+		assertTrue(table != null && !table.getCarried().isEmpty(), "interrupted while planks are in the grid and on the cursor");
+		interrupted.player().closeContainer();
+		var closed = tickToEnd(interrupted, halfway).result();
+		halfway.cleanup();
+		assertEquals("MENU_CLOSED", closed.reasonCode(), "closing the menu fails the craft: " + closed.message());
+		assertTrue(closed.message().contains("ownership was restored"), "failure reports restored ownership: " + closed.message());
+		assertEquals(3, count(interrupted, Items.OAK_PLANKS), "planks return to the inventory");
+		assertEquals(2, count(interrupted, Items.STICK), "sticks stay in the inventory");
+		assertEquals(0, count(interrupted, Items.WOODEN_PICKAXE), "no partial craft output");
 	}
 
 	private static Fixture craftFixture() {
@@ -543,6 +612,7 @@ public final class AdvancedInteractionRollbackVerification {
 		private MenuFixtureLevel fixtureLevel;
 		private boolean failMainHandVerification;
 		private boolean throwOnDrop;
+		private int swings;
 
 		private FaultingServerPlayer(
 				MinecraftServer server,
@@ -576,6 +646,7 @@ public final class AdvancedInteractionRollbackVerification {
 		@Override public void triggerRecipeCrafted(RecipeHolder<?> recipe, java.util.List<ItemStack> ingredients) { }
 		@Override public boolean isWithinBlockInteractionRange(net.minecraft.core.BlockPos position, double padding) { return true; }
 		@Override public boolean isDescending() { return false; }
+		@Override public void swing(net.minecraft.world.InteractionHand hand) { swings++; }
 		@Override public void closeContainer() {
 			containerMenu.removed(this);
 			containerMenu = inventoryMenu;

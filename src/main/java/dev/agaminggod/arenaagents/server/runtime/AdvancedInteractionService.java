@@ -9,12 +9,14 @@ import dev.agaminggod.arenaagents.server.runtime.transaction.ServerTransactionAd
 import dev.agaminggod.arenaagents.server.runtime.transaction.TransactionPostcondition;
 import dev.agaminggod.arenaagents.server.runtime.transaction.TransactionSnapshot;
 import dev.agaminggod.arenaagents.server.runtime.transaction.UseConfirmation;
+import dev.agaminggod.arenaagents.server.runtime.menu.AgentInventoryView;
 import dev.agaminggod.arenaagents.server.runtime.menu.MenuCapabilityRegistry;
 import dev.agaminggod.arenaagents.server.runtime.menu.MenuInspection;
 import dev.agaminggod.arenaagents.server.runtime.menu.MenuStackIdentity;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -771,9 +773,38 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 		return TickResult.failed(failure.reasonCode(), failure.message() + "; prior inventory and selection were restored");
 	}
 
+	/**
+	 * Crafts like a player instead of filling the grid through the recipe book in one tick: opens the inventory
+	 * (2x2) or the crafting table menu (3x3), moves each ingredient into the grid with ordinary slot clicks a few
+	 * ticks apart, shift-clicks the result out and closes the menu. Every step is a vanilla menu click on the
+	 * server, so a spectator mirroring the agent's menu watches the items move. Vanilla recipe placement is only
+	 * used as a same-tick dry run to learn which ingredient goes in which slot, and is undone before any click.
+	 */
 	private final class CraftTransaction extends Transaction {
+		/** Ticks the opened, empty grid is shown before the first click. */
+		static final int OPEN_TICKS = 3;
+		/** Ticks between clicks: quick, but each item movement is readable. */
+		static final int CLICK_TICKS = 2;
+		/** Ticks the menu stays open after the result has been taken. */
+		static final int LINGER_TICKS = 3;
+
+		private enum Phase { START, FILL, LINGER }
+
 		private final boolean table;
 		private boolean placementAttempted;
+		private Phase phase = Phase.START;
+		private int ticks;
+		private int nextActionTick;
+		private AbstractContainerMenu menu;
+		private AbstractCraftingMenu craftingMenu;
+		private List<Slot> gridSlots;
+		private CraftingRecipe craftingRecipe;
+		private ResourceKey<Recipe<?>> recipeKey;
+		private TransactionSnapshot.CraftPlacementGuard placementGuard;
+		/** Menu slot index of each grid cell still to fill, mapped to the one ingredient vanilla chose for it. */
+		private final Map<Integer, ItemStack> pendingGrid = new LinkedHashMap<>();
+		private int carrySourceSlot = -1;
+		private TickResult committed;
 
 		CraftTransaction(ServerPlayer player, ServerActionRequest request, JsonObject arguments, boolean table) {
 			super(player, request, arguments, arguments.get("timeoutMs").getAsLong());
@@ -782,183 +813,298 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 
 		@Override
 		TickResult execute(long nowEpochMs) {
-			if (executed) return TickResult.failed("TRANSACTION_CONFLICT", "Craft transaction executed more than once");
-			executed = true;
-			AbstractContainerMenu menu;
-			if (table) {
-				menu = openBlockMenu(blockPosition(arguments));
-				if (menu.getClass() != CraftingMenu.class) return unsupportedMenu(menu);
-			} else {
-				useInventoryMenu(player);
-				menu = player.inventoryMenu;
-				if (menu.getClass() != InventoryMenu.class) return unsupportedMenu(menu);
+			ticks++;
+			if (phase == Phase.START) {
+				TickResult failure = start();
+				if (failure != null) return failure;
+				phase = Phase.FILL;
+				nextActionTick = ticks + OPEN_TICKS;
+				return TickResult.running();
 			}
+			if (ticks < nextActionTick) return TickResult.running();
+			if (phase == Phase.LINGER) return committed;
+			nextActionTick = ticks + CLICK_TICKS;
+			if (player.containerMenu != menu) {
+				return failureAfterPlacement("MENU_CLOSED", "The crafting menu closed before the craft finished",
+						placementGuard, gridSlots);
+			}
+			try {
+				return fillStep();
+			} catch (RuntimeException clickFailure) {
+				return failureAfterPlacement("CRAFT_CLICK_EXCEPTION",
+						"A crafting click raised an exception: " + safeMessage(clickFailure), placementGuard, gridSlots);
+			}
+		}
+
+		/** Resolves the recipe, opens the menu and plans the clicks. Returns a failure, or null to continue. */
+		private TickResult start() {
 			String requestedRecipeId = canonicalRecipeId(text(arguments, "recipeId"));
 			if (requestedRecipeId.equals("minecraft:planks")) {
 				requestedRecipeId = resolveGenericPlankRecipeId(player.level(), player.getInventory());
 			}
 			String lookupRecipeId = requestedRecipeId;
-			ResourceKey<Recipe<?>> recipeKey = ResourceKey.create(
-					Registries.RECIPE, Identifier.parse(lookupRecipeId));
+			recipeKey = ResourceKey.create(Registries.RECIPE, Identifier.parse(lookupRecipeId));
 			RecipeHolder<?> holder = player.level().recipeAccess().byKey(recipeKey).orElseThrow(() ->
 					new AgentDomainException("RECIPE_NOT_FOUND", "Recipe " + lookupRecipeId + " is not registered"));
-			if (!(holder.value() instanceof CraftingRecipe craftingRecipe)) {
+			if (!(holder.value() instanceof CraftingRecipe recipe)) {
 				return TickResult.failed("RECIPE_TYPE_MISMATCH", "Requested recipe is not a crafting recipe");
 			}
+			craftingRecipe = recipe;
 			if (!recipeAllowed(player.getRecipeBook(), holder.id(), player.level().getGameRules().get(GameRules.LIMITED_CRAFTING))) {
 				return TickResult.failed("RECIPE_LOCKED", "Limited crafting requires an already unlocked recipe");
 			}
-			RecipeBookMenu recipeMenu = (RecipeBookMenu) menu;
-			AbstractCraftingMenu craftingMenu = (AbstractCraftingMenu) menu;
-			List<Slot> gridSlots = craftingMenu.getInputGridSlots();
+			if (table) {
+				menu = openBlockMenu(blockPosition(arguments));
+				player.swing(InteractionHand.MAIN_HAND);
+				if (menu.getClass() != CraftingMenu.class) return unsupportedMenu(menu);
+			} else {
+				useInventoryMenu(player);
+				menu = player.inventoryMenu;
+				if (menu.getClass() != InventoryMenu.class) return unsupportedMenu(menu);
+				AgentInventoryView.open(player);
+			}
+			craftingMenu = (AbstractCraftingMenu) menu;
+			gridSlots = craftingMenu.getInputGridSlots();
 			if (!menu.getCarried().isEmpty()) {
 				return TickResult.failed("TRANSACTION_CONFLICT", "Safe crafting requires an empty carried stack");
 			}
-			CraftMenuSnapshot beforeCraft = CraftMenuSnapshot.capture(menu);
-			TransactionSnapshot.CraftPlacementGuard placementGuard =
-					new TransactionSnapshot.CraftPlacementGuard(ownedStacks(player.getInventory(), gridSlots));
+			placementGuard = new TransactionSnapshot.CraftPlacementGuard(ownedStacks(player.getInventory(), gridSlots));
 			placementAttempted = true;
 			placementGuard.markPlacementAttempted();
+			// Leftovers in the grid go back to the inventory with a shift-click, as a player would clear it.
+			for (Slot slot : gridSlots) {
+				if (slot.hasItem()) click(slot.index, 0, ContainerInput.QUICK_MOVE);
+			}
+			for (Slot slot : gridSlots) {
+				if (slot.hasItem()) {
+					return failureAfterPlacement("CRAFT_GRID_OCCUPIED",
+							"The crafting grid could not be cleared into the inventory", placementGuard, gridSlots);
+				}
+			}
+			return planClicks(holder);
+		}
+
+		/**
+		 * Dry-runs vanilla recipe placement to learn the ingredient layout and validate one craft, then restores the
+		 * exact pre-placement menu in the same tick, before anything is sent or clicked.
+		 */
+		private TickResult planClicks(RecipeHolder<?> holder) {
+			CraftMenuSnapshot beforePlacement = CraftMenuSnapshot.capture(menu);
+			String reasonCode = null;
+			String message = null;
 			try {
 				TransactionSnapshot.CraftPlacementMode placementMode =
 						TransactionSnapshot.CraftPlacementMode.oneCraft(player.isCreative());
-				RecipeBookMenu.PostPlaceAction placement = recipeMenu.handlePlacement(
+				RecipeBookMenu.PostPlaceAction placement = ((RecipeBookMenu) menu).handlePlacement(
 						placementMode.useMaxItems(),
 						placementMode.allowDroppingItemsToClear(),
 						holder,
 						player.level(),
 						player.getInventory()
 				);
-				TransactionPostcondition.Verdict placementVerdict = placementGuard.verifyPlacement(
-						ownedStacks(player.getInventory(), gridSlots));
-				if (placementVerdict instanceof TransactionPostcondition.Verdict.Failed failed) {
-					return failureAfterPlacement(failed.reasonCode(), failed.message(), placementGuard, gridSlots);
-				}
-				if (placement != RecipeBookMenu.PostPlaceAction.NOTHING) {
-					return failureAfterPlacement(
-							craftPlacementFailureReason(placement),
-							"Vanilla recipe placement did not place one craft",
-							placementGuard,
-							gridSlots
-					);
-				}
 				List<ItemStack> gridStacks = gridSlots.stream().map(slot -> slot.getItem().copy()).toList();
-				CraftingInput.Positioned positionedInput = CraftingInput.ofPositioned(
-						craftingMenu.getGridWidth(), craftingMenu.getGridHeight(), gridStacks);
-				CraftingInput input = positionedInput.input();
-				RecipeHolder<CraftingRecipe> exact = player.level().recipeAccess().getRecipeFor(
-						RecipeType.CRAFTING, input, player.level(), recipeKey).orElse(null);
-				if (!craftingRecipe.matches(input, player.level()) || exact == null || !exact.id().equals(recipeKey)) {
-					return failureAfterPlacement(
-							"RECIPE_IDENTITY_MISMATCH",
-							"Placed ingredients do not exactly match the requested recipe",
-							placementGuard,
-							gridSlots
-					);
-				}
-				for (ItemStack ingredient : gridStacks) {
-					if (!ingredient.isEmpty() && ingredient.getCount() != 1) {
-						return failureAfterPlacement(
-								"CRAFT_COUNT_UNSUPPORTED",
-								"Safe crafting requires exactly one item in every occupied input slot",
-								placementGuard,
-								gridSlots
-						);
+				CraftingInput input = CraftingInput.ofPositioned(
+						craftingMenu.getGridWidth(), craftingMenu.getGridHeight(), gridStacks).input();
+				ItemStack output = menu.getSlot(0).getItem().copy();
+				if (placement != RecipeBookMenu.PostPlaceAction.NOTHING) {
+					reasonCode = craftPlacementFailureReason(placement);
+					message = reasonCode.equals("RECIPE_INPUTS_UNAVAILABLE")
+							? "The inventory does not hold the ingredients for one craft" + (table ? "" : " in the 2x2 grid")
+							: "Vanilla recipe placement did not place one craft";
+				} else if (!exactRecipe(input)) {
+					reasonCode = "RECIPE_IDENTITY_MISMATCH";
+					message = "Placed ingredients do not exactly match the requested recipe";
+				} else if (gridStacks.stream().anyMatch(stack -> !stack.isEmpty() && stack.getCount() != 1)) {
+					reasonCode = "CRAFT_COUNT_UNSUPPORTED";
+					message = "Safe crafting requires exactly one item in every occupied input slot";
+				} else if (output.isEmpty() || !craftOutputSatisfiesRequest(output.getCount(), integer(arguments, "count"))) {
+					reasonCode = "CRAFT_COUNT_UNSUPPORTED";
+					message = "One craft of this recipe makes " + output.getCount()
+							+ "; request at most that many and craft again for more";
+				} else if (menuCapacity(menu, playerSlotStart(), playerSlotEnd(), output) < output.getCount()) {
+					reasonCode = "DESTINATION_FULL";
+					message = "Player inventory cannot accept the complete crafting result";
+				} else {
+					// Click order: every cell of one ingredient while it is carried, then the next ingredient.
+					for (Slot slot : gridSlots) {
+						if (!slot.hasItem() || pendingGrid.containsKey(slot.index)) continue;
+						for (Slot same : gridSlots) {
+							if (same.hasItem() && ItemStack.isSameItemSameComponents(same.getItem(), slot.getItem())) {
+								pendingGrid.put(same.index, same.getItem().copyWithCount(1));
+							}
+						}
 					}
-				}
-				List<ItemStack> remainders;
-				try {
-					remainders = TransactionSnapshot.expandCraftingRemainders(
-							craftingRecipe.getRemainingItems(input),
-							gridSlots.size(),
-							craftingMenu.getGridWidth(),
-							input.width(),
-							positionedInput.left(),
-							positionedInput.top(),
-							ItemStack.EMPTY
-					);
-				} catch (IllegalArgumentException invalidRemainders) {
-					return failureAfterPlacement(
-							"CRAFT_REMAINDER_UNSAFE",
-							"Recipe remainder layout could not be aligned with the crafting grid",
-							placementGuard,
-							gridSlots
-					);
-				}
-				Slot resultSlot = menu.getSlot(0);
-				ItemStack output = resultSlot.getItem().copy();
-				int requestedCount = integer(arguments, "count");
-				if (output.isEmpty() || !craftOutputSatisfiesRequest(output.getCount(), requestedCount)) {
-					return failureAfterPlacement(
-							"CRAFT_COUNT_UNSUPPORTED",
-							"One vanilla craft must produce at least the requested count",
-							placementGuard,
-							gridSlots
-					);
-				}
-				int playerStart = table ? 10 : 9;
-				int playerEnd = table ? 45 : 44;
-				if (menuCapacity(menu, playerStart, playerEnd, output) < output.getCount()) {
-					return failureAfterPlacement(
-							"DESTINATION_FULL",
-							"Player inventory cannot accept the complete crafting result",
-							placementGuard,
-							gridSlots
-					);
-				}
-				if (!resultSlot.mayPickup(player)) {
-					return failureAfterPlacement(
-							"CRAFT_RESULT_LOCKED",
-							"Vanilla menu denied taking the crafting result",
-							placementGuard,
-							gridSlots
-					);
-				}
-				List<TransactionSnapshot.OwnedStack> beforeOwned = ownedStacks(player.getInventory(), gridSlots);
-				List<TransactionSnapshot.OwnedStack> consumed = ownedStacks(gridStacks);
-				List<TransactionSnapshot.OwnedStack> remainderOwned = ownedStacks(remainders);
-				TransactionSnapshot.CraftingAccounting accounting;
-				try {
-					accounting = TransactionSnapshot.CraftingAccounting.plan(
-							beforeOwned, consumed, remainderOwned, ownedStack(output));
-				} catch (IllegalArgumentException invalidAccounting) {
-					return failureAfterPlacement(
-							"CRAFT_ACCOUNTING_UNSAFE",
-							safeMessage(invalidAccounting),
-							placementGuard,
-							gridSlots
-					);
-				}
-				try {
-					ItemStack moved = craftCommitter.quickMove(menu, player, 0);
-					menu.broadcastChanges();
-					TransactionPostcondition.Verdict craftVerdict = accounting.verify(
-							ownedStacks(player.getInventory(), gridSlots));
-					if (!moved.isEmpty() && moved.getCount() == output.getCount()
-							&& craftVerdict instanceof TransactionPostcondition.Verdict.Succeeded) {
-						return TickResult.succeeded("CRAFT_CONFIRMED",
-								"One vanilla recipe transaction completed with remainder handling");
-					}
-					return rollbackCommittedCraft(
-							menu, beforeCraft, placementGuard, gridSlots,
-							"CRAFT_POSTCONDITION_FAILED",
-							"Craft result did not satisfy exact ingredient, remainder, and output accounting"
-					);
-				} catch (RuntimeException mutationFailure) {
-					return rollbackCommittedCraft(
-							menu, beforeCraft, placementGuard, gridSlots,
-							"CRAFT_POSTCOMMIT_EXCEPTION",
-							"Craft mutation raised an exception: " + safeMessage(mutationFailure)
-					);
 				}
 			} catch (RuntimeException placementFailure) {
-				return failureAfterPlacement(
-						"CRAFT_PLACEMENT_EXCEPTION",
-						"Recipe placement or precommit validation raised an exception: " + safeMessage(placementFailure),
-						placementGuard,
-						gridSlots
+				reasonCode = "CRAFT_PLACEMENT_EXCEPTION";
+				message = "Recipe placement or precommit validation raised an exception: " + safeMessage(placementFailure);
+			} finally {
+				beforePlacement.restore(menu);
+			}
+			if (!placementGuard.mayReportCleanFailure(ownedStacks(player.getInventory(), gridSlots))) {
+				pendingGrid.clear();
+				return failureAfterPlacement("CRAFT_PLACEMENT_ACCOUNTING_FAILED",
+						"Planning the craft changed inventory ownership", placementGuard, gridSlots);
+			}
+			if (reasonCode != null) return failureAfterPlacement(reasonCode, message, placementGuard, gridSlots);
+			if (pendingGrid.isEmpty()) {
+				return failureAfterPlacement("RECIPE_INPUTS_UNAVAILABLE", "The recipe placed no ingredients",
+						placementGuard, gridSlots);
+			}
+			return null;
+		}
+
+		/** One click: pick up an ingredient, drop one into a grid cell, put the rest back, or take the result. */
+		private TickResult fillStep() {
+			ItemStack carried = menu.getCarried();
+			Map.Entry<Integer, ItemStack> next = pendingGrid.isEmpty() ? null : pendingGrid.entrySet().iterator().next();
+			if (carried.isEmpty()) {
+				if (next == null) return commit();
+				int source = findSource(next.getValue());
+				if (source < 0) {
+					return failureAfterPlacement("RECIPE_INPUTS_UNAVAILABLE",
+							"An ingredient left the inventory while crafting", placementGuard, gridSlots);
+				}
+				click(source, 0, ContainerInput.PICKUP);
+				if (!ItemStack.isSameItemSameComponents(menu.getCarried(), next.getValue())) {
+					return failureAfterPlacement("MENU_INPUT_PARTIAL",
+							"Picking up the ingredient did not carry it", placementGuard, gridSlots);
+				}
+				carrySourceSlot = source;
+				return TickResult.running();
+			}
+			if (next != null && ItemStack.isSameItemSameComponents(carried, next.getValue())) {
+				int carriedBefore = carried.getCount();
+				Slot cell = menu.getSlot(next.getKey());
+				// Right click drops exactly one item into the cell.
+				click(next.getKey(), 1, ContainerInput.PICKUP);
+				if (cell.getItem().getCount() != 1 || !ItemStack.isSameItemSameComponents(cell.getItem(), next.getValue())
+						|| menu.getCarried().getCount() != carriedBefore - 1) {
+					return failureAfterPlacement("CRAFT_INPUT_REJECTED",
+							"The crafting grid did not accept exactly one ingredient", placementGuard, gridSlots);
+				}
+				pendingGrid.remove(next.getKey());
+				return TickResult.running();
+			}
+			// This ingredient is in every cell that needs it: put the rest back where it came from.
+			click(carrySourceSlot, 0, ContainerInput.PICKUP);
+			carrySourceSlot = -1;
+			if (!menu.getCarried().isEmpty()) {
+				return failureAfterPlacement("MENU_INPUT_PARTIAL",
+						"The leftover ingredient could not be put back", placementGuard, gridSlots);
+			}
+			return TickResult.running();
+		}
+
+		/** Shift-clicks the result out of the filled grid with exact ingredient, remainder and output accounting. */
+		private TickResult commit() {
+			List<ItemStack> gridStacks = gridSlots.stream().map(slot -> slot.getItem().copy()).toList();
+			CraftingInput.Positioned positionedInput = CraftingInput.ofPositioned(
+					craftingMenu.getGridWidth(), craftingMenu.getGridHeight(), gridStacks);
+			CraftingInput input = positionedInput.input();
+			if (!exactRecipe(input)) {
+				return failureAfterPlacement("RECIPE_IDENTITY_MISMATCH",
+						"Placed ingredients do not exactly match the requested recipe", placementGuard, gridSlots);
+			}
+			List<ItemStack> remainders;
+			try {
+				remainders = TransactionSnapshot.expandCraftingRemainders(
+						craftingRecipe.getRemainingItems(input),
+						gridSlots.size(),
+						craftingMenu.getGridWidth(),
+						input.width(),
+						positionedInput.left(),
+						positionedInput.top(),
+						ItemStack.EMPTY
+				);
+			} catch (IllegalArgumentException invalidRemainders) {
+				return failureAfterPlacement("CRAFT_REMAINDER_UNSAFE",
+						"Recipe remainder layout could not be aligned with the crafting grid", placementGuard, gridSlots);
+			}
+			Slot resultSlot = menu.getSlot(0);
+			ItemStack output = resultSlot.getItem().copy();
+			if (output.isEmpty() || !craftOutputSatisfiesRequest(output.getCount(), integer(arguments, "count"))) {
+				return failureAfterPlacement("CRAFT_COUNT_UNSUPPORTED",
+						"One vanilla craft must produce at least the requested count", placementGuard, gridSlots);
+			}
+			if (menuCapacity(menu, playerSlotStart(), playerSlotEnd(), output) < output.getCount()) {
+				return failureAfterPlacement("DESTINATION_FULL",
+						"Player inventory cannot accept the complete crafting result", placementGuard, gridSlots);
+			}
+			if (!resultSlot.mayPickup(player)) {
+				return failureAfterPlacement("CRAFT_RESULT_LOCKED",
+						"Vanilla menu denied taking the crafting result", placementGuard, gridSlots);
+			}
+			TransactionSnapshot.CraftingAccounting accounting;
+			try {
+				accounting = TransactionSnapshot.CraftingAccounting.plan(
+						ownedStacks(player.getInventory(), gridSlots), ownedStacks(gridStacks),
+						ownedStacks(remainders), ownedStack(output));
+			} catch (IllegalArgumentException invalidAccounting) {
+				return failureAfterPlacement("CRAFT_ACCOUNTING_UNSAFE", safeMessage(invalidAccounting),
+						placementGuard, gridSlots);
+			}
+			CraftMenuSnapshot beforeCraft = CraftMenuSnapshot.capture(menu);
+			try {
+				menu.incrementStateId();
+				ItemStack moved = craftCommitter.quickMove(menu, player, 0);
+				menu.broadcastChanges();
+				TransactionPostcondition.Verdict craftVerdict = accounting.verify(
+						ownedStacks(player.getInventory(), gridSlots));
+				if (!moved.isEmpty() && moved.getCount() == output.getCount()
+						&& craftVerdict instanceof TransactionPostcondition.Verdict.Succeeded) {
+					committed = TickResult.succeeded("CRAFT_CONFIRMED",
+							"Crafted " + output.getCount() + " " + itemId(output) + " through visible menu clicks");
+					phase = Phase.LINGER;
+					nextActionTick = ticks + LINGER_TICKS;
+					return TickResult.running();
+				}
+				return rollbackCommittedCraft(
+						menu, beforeCraft, placementGuard, gridSlots,
+						"CRAFT_POSTCONDITION_FAILED",
+						"Craft result did not satisfy exact ingredient, remainder, and output accounting"
+				);
+			} catch (RuntimeException mutationFailure) {
+				return rollbackCommittedCraft(
+						menu, beforeCraft, placementGuard, gridSlots,
+						"CRAFT_POSTCOMMIT_EXCEPTION",
+						"Craft mutation raised an exception: " + safeMessage(mutationFailure)
 				);
 			}
+		}
+
+		private boolean exactRecipe(CraftingInput input) {
+			RecipeHolder<CraftingRecipe> exact = player.level().recipeAccess().getRecipeFor(
+					RecipeType.CRAFTING, input, player.level(), recipeKey).orElse(null);
+			return craftingRecipe.matches(input, player.level()) && exact != null && exact.id().equals(recipeKey);
+		}
+
+		/** First player-inventory slot of this menu: after the result and grid (and armor in the inventory). */
+		private int playerSlotStart() {
+			return table ? 10 : 9;
+		}
+
+		/** Last hotbar slot of this menu; the inventory's offhand slot follows it and is never a source. */
+		private int playerSlotEnd() {
+			return table ? 45 : 44;
+		}
+
+		/** A player inventory slot holding the ingredient; the main inventory comes before the hotbar. */
+		private int findSource(ItemStack wanted) {
+			for (int index = playerSlotStart(); index <= playerSlotEnd(); index++) {
+				Slot slot = menu.getSlot(index);
+				if (slot.hasItem() && ItemStack.isSameItemSameComponents(slot.getItem(), wanted) && slot.mayPickup(player)) {
+					return index;
+				}
+			}
+			return -1;
+		}
+
+		/** What a client click does on the server: one vanilla menu click, then the slot changes go out. */
+		private void click(int slotIndex, int button, ContainerInput input) {
+			menu.incrementStateId();
+			menu.clicked(slotIndex, button, input, player);
+			menu.broadcastChanges();
 		}
 
 		private TickResult failureAfterPlacement(
@@ -1015,7 +1161,10 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 
 		@Override
 		void beforeCleanup() {
-			if (!table && placementAttempted) player.inventoryMenu.removed(player);
+			if (table) return;
+			// Closing the inventory screen: vanilla returns the cursor and any grid items to the inventory.
+			AgentInventoryView.close(player);
+			if (placementAttempted) player.inventoryMenu.removed(player);
 		}
 	}
 
