@@ -695,11 +695,17 @@ public final class ServerActionExecutor {
 			));
 			case TRANSFER_CONTAINER, CRAFT_INVENTORY, CRAFT_TABLE, FURNACE_TRANSACTION,
 					EQUIP_ITEM, SELECT_TOOL, BLOCK_WITH_SHIELD, USE_RANGED,
-					MENU_TRANSFER, MENU_BUTTON, ANVIL_RENAME, MENU_CLICK, MENU_CLOSE, BEACON_EFFECTS -> ActiveAction.transaction(
-					request,
-					player,
-					advancedInteractions.begin(player, request, arguments)
-			);
+					MENU_TRANSFER, MENU_BUTTON, ANVIL_RENAME, MENU_CLICK, MENU_CLOSE, BEACON_EFFECTS -> {
+				ActiveAction action = ActiveAction.transaction(
+						request,
+						player,
+						advancedInteractions.begin(player, request, arguments)
+				);
+				if (request.type() == ActionType.CRAFT_TABLE) {
+					action.transactionAimTarget = Vec3.atCenterOf(blockPosition(arguments));
+				}
+				yield action;
+			}
 			case RESPAWN, COMPLETE_GOAL -> throw new IllegalStateException("respawn and complete_goal are handled before action creation");
 			default -> throw new AgentDomainException(
 					"UNSUPPORTED_ACTION",
@@ -1095,14 +1101,20 @@ public final class ServerActionExecutor {
 			throw new AgentDomainException("NO_PLACEMENT_SUPPORT", "No adjacent solid face can support this placement");
 		}
 		ItemStack stack = player.getMainHandItem();
+		float aimPitch = player.getXRot();
 		orientPlayerForDesiredState(player, (BlockItem) stack.getItem(), stack, hit, desiredBlockState);
-		InteractionResult result = player.gameMode.useItemOn(
-				player,
-				player.level(),
-				stack,
-				InteractionHand.MAIN_HAND,
-				hit
-		);
+		InteractionResult result;
+		try {
+			result = player.gameMode.useItemOn(
+					player,
+					player.level(),
+					stack,
+					InteractionHand.MAIN_HAND,
+					hit
+			);
+		} finally {
+			player.setXRot(aimPitch);
+		}
 		if (result.consumesAction()) player.swing(InteractionHand.MAIN_HAND);
 	}
 
@@ -1154,7 +1166,7 @@ public final class ServerActionExecutor {
 		return direction.toYRot();
 	}
 
-	private static void orientPlayerForDesiredState(
+	static void orientPlayerForDesiredState(
 			ServerPlayer player,
 			BlockItem blockItem,
 			ItemStack stack,
@@ -1175,6 +1187,10 @@ public final class ServerActionExecutor {
 			}
 			return;
 		}
+		// Pistons, observers, dispensers and droppers take facing from the nearest look direction, so the downward
+		// aim at the support face would win over the yaw. Look level while choosing; placeBlock restores the pitch.
+		float originalPitch = player.getXRot();
+		player.setXRot(0.0F);
 		for (Direction direction : HORIZONTAL_PLACEMENT_DIRECTIONS) {
 			float yaw = directionalPlacementYaw(direction);
 			player.setYRot(yaw);
@@ -1184,6 +1200,7 @@ public final class ServerActionExecutor {
 		}
 		player.setYRot(originalYaw);
 		player.setYHeadRot(originalHeadYaw);
+		player.setXRot(originalPitch);
 		throw new AgentDomainException(
 				"PLACEMENT_STATE_MISMATCH",
 				"Requested directional state cannot be produced by vanilla placement context"
@@ -1604,6 +1621,9 @@ public final class ServerActionExecutor {
 		private int initialPlacementItemCount;
 		private String resourceLeaseKey;
 		private int placementAttempts;
+		private final AimGate aimGate = new AimGate();
+		private long aimReadyElapsedMs = -1L;
+		private Vec3 transactionAimTarget;
 		private boolean breakInputIssued;
 		private boolean breakObservedInCarpet;
 		private BlockBreakReceipt breakReceiptBaseline;
@@ -1801,7 +1821,16 @@ public final class ServerActionExecutor {
 						"Player changed dimension from " + startingDimension.identifier() + " to " + player.level().dimension().identifier()
 								+ "; this action stopped and its original outcome is unconfirmed", now);
 			}
-			if (!player.isAlive()) return result(ServerActionState.FAILED, "AGENT_DEAD", "Agent player died", now);
+			if (!player.isAlive()) {
+				// A transaction that already committed (a craft whose result was taken) still reports its success.
+				if (mode == Mode.TRANSACTION && executionStarted) {
+					ServerTransactionAdapter.TickResult settled = transaction.tick(now);
+					if (settled.state() == ServerTransactionAdapter.TickState.SUCCEEDED) {
+						return result(ServerActionState.SUCCEEDED, settled.reasonCode(), settled.message(), now);
+					}
+				}
+				return result(ServerActionState.FAILED, "AGENT_DEAD", "Agent player died", now);
+			}
 			long elapsed = elapsedTime.advance(now);
 			if (!executionStarted) {
 				executionStarted = true;
@@ -1961,10 +1990,20 @@ public final class ServerActionExecutor {
 					return result(ServerActionState.TIMED_OUT, "PLACEMENT_NOT_CONFIRMED", placementFailureMessage(
 							"Block placement was not confirmed"), now);
 				}
-				if (BlockPlacementAttemptPolicy.shouldAttempt(elapsed, placementAttempts)) {
-					physicalAttempted = true;
-					immediate.run();
-					placementAttempts += 1;
+				// Look at the support face first, like a player, then place with an arm swing. Retries are timed
+				// from the moment the view settled so a slow turn does not use up the attempt budget.
+				AimGate.State aim = aimAt(placementAimTarget());
+				if (aim == AimGate.State.FAILED) {
+					return result(ServerActionState.FAILED, "AIM_NOT_REACHED",
+							"The agent's view did not settle on the placement face", now);
+				}
+				if (aim == AimGate.State.READY) {
+					if (aimReadyElapsedMs < 0L) aimReadyElapsedMs = elapsed;
+					if (BlockPlacementAttemptPolicy.shouldAttempt(elapsed - aimReadyElapsedMs, placementAttempts)) {
+						physicalAttempted = true;
+						immediate.run();
+						placementAttempts += 1;
+					}
 				}
 			} else if (mode == Mode.WAIT && elapsed >= timeoutMs) {
 				return result(ServerActionState.SUCCEEDED, "ACTION_COMPLETED", "Action completed", now);
@@ -1994,6 +2033,16 @@ public final class ServerActionExecutor {
 				};
 			}
 			if (mode == Mode.TRANSACTION) {
+				if (transactionAimTarget != null) {
+					// Block menus (the crafting table) open only after the agent has turned to face the block; the
+					// look is held while the menu is in use.
+					AimGate.State aim = aimAt(transactionAimTarget);
+					if (aim == AimGate.State.FAILED) {
+						return result(ServerActionState.FAILED, "AIM_NOT_REACHED",
+								"The agent's view did not settle on the target block", now);
+					}
+					if (aim == AimGate.State.AIMING) return null;
+				}
 				physicalAttempted = true;
 				ServerTransactionAdapter.TickResult transactionResult = transaction.tick(now);
 				lastProgress = timedProgress(elapsed);
@@ -2200,6 +2249,25 @@ public final class ServerActionExecutor {
 					sprint && player.getFoodData().getFoodLevel() > 6,
 					attack, use, InteractionHand.MAIN_HAND
 			));
+		}
+
+		/** Drives the view toward the target through the normal input lease and reports whether it has settled. */
+		private AimGate.State aimAt(Vec3 target) {
+			AgentInputState desired = AgentInputStates.lookingAt(
+					player, target, 0.0F, 0.0F, false, false, false, false, false, InteractionHand.MAIN_HAND);
+			// One eased step per tick from the current view, so spectators see a turn rather than a snap.
+			LeasedServerInputController input = AgentInputRuntime.controller(player);
+			if (inputLease == null) inputLease = input.acquire(request.agentId(), InputOwner.INTERACTION, 300);
+			input.apply(inputLease, new AgentInputState(0.0F, 0.0F, false, false, false, false, false,
+					AgentInputStates.turnYaw(player.getYRot(), desired.yaw()),
+					AgentInputStates.turnPitch(player.getXRot(), desired.pitch()),
+					player.getInventory().getSelectedSlot(), InteractionHand.MAIN_HAND));
+			return aimGate.observe(player.getYRot(), player.getXRot(), desired.yaw(), desired.pitch());
+		}
+
+		private Vec3 placementAimTarget() {
+			if (placementRequestedFace == null) return Vec3.atCenterOf(block);
+			return placementLookTarget(block.relative(placementRequestedFace.getOpposite()), placementRequestedFace);
 		}
 
 		private void applyUseInput() {

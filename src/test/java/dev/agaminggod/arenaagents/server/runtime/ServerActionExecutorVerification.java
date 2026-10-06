@@ -341,7 +341,26 @@ public final class ServerActionExecutorVerification {
 		verifyModelOnlyControlBoundary();
 		return 122 + dev.agaminggod.arenaagents.protocol.PlayerActionSchemaVerification.verify()
 				+ dev.agaminggod.arenaagents.server.perception.PlayerKnowledgeInspectionVerification.verify()
-				+ verifyInteractionOutlineHit() + verifyMultipartHitTies();
+				+ verifyInteractionOutlineHit() + verifyMultipartHitTies() + verifyAimGate();
+	}
+
+	/** Placement and table opening wait until the real view has turned onto the target and settled. */
+	private static int verifyAimGate() {
+		AimGate gate = new AimGate();
+		assertEquals(AimGate.State.AIMING, gate.observe(170.0F, 0.0F, -90.0F, 40.0F), "far view keeps aiming");
+		assertEquals(AimGate.State.AIMING, gate.observe(-80.0F, 30.0F, -90.0F, 40.0F), "a turn still in progress does not interact");
+		assertEquals(AimGate.State.AIMING, gate.observe(-89.0F, 39.0F, -90.0F, 40.0F), "first aligned tick only starts settling");
+		assertEquals(AimGate.State.AIMING, gate.observe(-89.5F, 40.0F, -90.0F, 40.0F), "second aligned tick still settling");
+		assertEquals(AimGate.State.READY, gate.observe(-90.0F, 40.0F, -90.0F, 40.0F), "settled view allows the interaction");
+		assertEquals(AimGate.State.READY, gate.observe(0.0F, 0.0F, -90.0F, 40.0F), "readiness is kept for retries");
+		AimGate wrap = new AimGate();
+		for (int tick = 1; tick < AimGate.SETTLE_TICKS; tick++) wrap.observe(179.0F, 0.0F, -179.0F, 0.0F);
+		assertEquals(AimGate.State.READY, wrap.observe(179.0F, 0.0F, -179.0F, 0.0F), "yaw alignment wraps across 180 degrees");
+		AimGate stuck = new AimGate();
+		AimGate.State last = AimGate.State.AIMING;
+		for (int tick = 0; tick < AimGate.MAX_TICKS; tick++) last = stuck.observe(0.0F, 0.0F, 90.0F, 0.0F);
+		assertEquals(AimGate.State.FAILED, last, "a view that never arrives fails instead of interacting blind");
+		return 8;
 	}
 
 	private static void verifyRemovalReceipts() {

@@ -6,6 +6,7 @@ import dev.agaminggod.arenaagents.pov.AgentPovStatePayload;
 import dev.agaminggod.arenaagents.pov.PovDeath;
 import dev.agaminggod.arenaagents.pov.PovIdentity;
 import dev.agaminggod.arenaagents.pov.PovMode;
+import dev.agaminggod.arenaagents.server.runtime.menu.AgentInventoryView;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
@@ -86,7 +87,8 @@ public final class PovStatePublisher {
 			return;
 		}
 		if (inventoryOpen && agent.containerMenu != agent.inventoryMenu) inventoryOpen = false;
-		PovAgentSnapshot current = PovAgentSnapshot.capture(agent, inventoryOpen);
+		// The agent opens its own inventory to craft in the 2x2 grid; spectators see that screen too.
+		PovAgentSnapshot current = PovAgentSnapshot.capture(agent, inventoryOpen || AgentInventoryView.isOpen(agent));
 		lastKnown = current;
 		boolean resync = full || absentPublished;
 		absentPublished = false;

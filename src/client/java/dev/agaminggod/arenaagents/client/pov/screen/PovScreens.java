@@ -85,14 +85,23 @@ public final class PovScreens {
 		}
 		if (client.screen instanceof AgentPovDeathScreen) client.setScreen(null);
 		PovMenu menu = state.menu().orElse(null);
-		MenuType<?> type = menu == null ? null : menu.menuType().orElse(null);
-		if (type == null) {
-			// No container (or only the agent's own inventory, which opens on request through onMenu).
+		if (menu == null) {
+			// The agent has no screen open: close whichever mirror is showing, including its inventory.
 			dismissedContainerId = NONE;
-			if (mirrorType != null) closeMirrorLocally(client);
+			if (mirrorScreen != null) closeMirrorLocally(client);
 			return;
 		}
 		if (menu.containerId() != dismissedContainerId) dismissedContainerId = NONE;
+		MenuType<?> type = menu.menuType().orElse(null);
+		if (type == null) {
+			// The agent's own inventory screen: opened by the takeover operator (E) or by the agent to craft in
+			// its 2x2 grid. Contents arrive through onMenu right after this state.
+			if (mirrorType != null) closeMirrorLocally(client);
+			if (mirrorScreen == null && menu.containerId() != dismissedContainerId && screenFree(client)) {
+				openInventory(client);
+			}
+			return;
+		}
 		if (mirrorScreen != null && mirrorType == type && mirrorContainerId == menu.containerId()) return;
 		// A screen the operator opened (chat, pause) is never replaced; the next state retries.
 		if (menu.containerId() == dismissedContainerId || !screenFree(client)) return;
