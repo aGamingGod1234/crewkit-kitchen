@@ -9,6 +9,11 @@ import { GoalSpecTranslator } from '../src/goal-spec-translator.mjs';
 import { withCompletionContract } from './fixtures/completion-contract.mjs';
 import { SOURCE, createDynamicCoordinator, FakeBridge, FakeProvider, FakePlanner, record, eventually, ManualTimerQueue, start } from './fixtures/dynamic-main-fixture.mjs';
 
+const CODEX_MISSING = "Codex CLI is not installed on the server machine (no 'codex' found on PATH). Install it, sign in with 'codex login', then restart Minecraft and relaunch this agent. This agent cannot think until that is fixed.";
+function missingHealth(provider, message) {
+	return { provider, status: 'missing', code: 'PROVIDER_CLI_MISSING', message, executable: provider, version: null, checkedAtEpochMs: 1, details: '' };
+}
+
 test('coordinator binds the Minecraft bridge without eagerly starting a provider', async () => {
 	const bridge = new FakeBridge();
 	let providerStarts = 0;
@@ -1477,6 +1482,81 @@ test('native reads use correlated fresh samples and focused pages while an actio
 		await eventually(() => results.page !== undefined);
 		assert.deepEqual(results.page, response);
 		assert.equal(bridge.sent.filter(({ type }) => type === 'action_command').length, 1, 'read queries do not dispatch extra body actions');
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('a failed provider CLI probe at launch reaches chat as one agent_notice; a healthy probe sends none', async () => {
+	const checks = [];
+	const MISSING = "Claude Code CLI is not installed on the server machine (no 'claude' found on PATH). Install it, sign in with 'claude auth login', then restart Minecraft and relaunch this agent. This agent cannot think until that is fixed.";
+	const providerCliHealth = {
+		async check(provider) {
+			checks.push(provider);
+			if (provider === 'claude') return { provider, status: 'missing', code: 'PROVIDER_CLI_MISSING', message: MISSING, executable: 'claude', version: null, checkedAtEpochMs: 1, details: '' };
+			return { provider, status: 'ok', code: null, message: null, executable: 'codex', version: '0.160.0', checkedAtEpochMs: 1, details: '' };
+		},
+	};
+	const traces = [];
+	const run = await start({ providerCliHealth, traceWriter: { write: (event, fields) => { traces.push({ event, ...fields }); } } });
+	try {
+		await eventually(() => checks.includes('codex'));
+		const claudeRecord = { ...record('agent-claude'), provider: 'claude', model: 'claude-sonnet-5-5' };
+		run.bridge.emit('agent_registered', { agentId: 'agent-claude', payload: claudeRecord });
+		await eventually(() => run.bridge.sent.some((message) => message.type === 'agent_notice'));
+		const notices = run.bridge.sent.filter((message) => message.type === 'agent_notice');
+		assert.equal(notices.length, 1);
+		assert.equal(notices[0].agentId, 'agent-claude');
+		assert.deepEqual(notices[0].payload, { severity: 'error', code: 'PROVIDER_CLI_MISSING', message: MISSING });
+		assert.ok(run.bridge.sent.findIndex((message) => message.type === 'agent_ready' && message.agentId === 'agent-claude')
+			< run.bridge.sent.indexOf(notices[0]), 'the probe never delays agent readiness');
+		assert.equal(run.bridge.sent.some((message) => message.type === 'agent_notice' && message.agentId === 'agent-a'), false, 'a healthy Codex CLI produces no notice');
+		assert.ok(traces.some((trace) => trace.event === 'provider_cli_unhealthy' && trace.agentId === 'agent-claude' && trace.code === 'PROVIDER_CLI_MISSING'));
+
+		run.bridge.emit('agent_registered', { agentId: 'agent-claude', payload: claudeRecord });
+		await eventually(() => run.bridge.sent.filter((message) => message.type === 'agent_ready' && message.agentId === 'agent-claude').length === 2);
+		for (let index = 0; index < 5; index += 1) await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(run.bridge.sent.filter((message) => message.type === 'agent_notice').length, 1, 'the same agent is told once per connection');
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('a provider CLI notice survives a goal started while the probe was still running', async () => {
+	let release;
+	const settled = new Promise((resolve) => { release = resolve; });
+	const providerCliHealth = { async check(provider) { await settled; return missingHealth(provider, CODEX_MISSING); } };
+	const run = await start({ providerCliHealth });
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
+		await eventually(() => run.registry.get('agent-a').goalRevision === 1);
+		release();
+		await eventually(() => run.bridge.sent.some((message) => message.type === 'agent_notice' && message.agentId === 'agent-a'));
+		const notice = run.bridge.sent.find((message) => message.type === 'agent_notice');
+		assert.deepEqual(notice.payload, { severity: 'error', code: 'PROVIDER_CLI_MISSING', message: CODEX_MISSING });
+	} finally {
+		release();
+		await run.coordinator.stop();
+	}
+});
+
+test('a failed agent_notice send does not consume the one notice an agent gets per connection', async () => {
+	class FlakyBridge extends FakeBridge {
+		failures = 0;
+		async send(type, agentId, payload, options) {
+			if (type === 'agent_notice' && this.failures === 0) { this.failures += 1; throw Object.assign(new Error('socket backpressure'), { code: 'BACKPRESSURE' }); }
+			return super.send(type, agentId, payload, options);
+		}
+	}
+	const providerCliHealth = { async check(provider) { return missingHealth(provider, CODEX_MISSING); } };
+	const traces = [];
+	const run = await start({ bridge: new FlakyBridge(), providerCliHealth, traceWriter: { write: (event, fields) => { traces.push({ event, ...fields }); } } });
+	try {
+		await eventually(() => traces.some((trace) => trace.event === 'provider_cli_notice_failed' && trace.agentId === 'agent-a'));
+		assert.equal(run.bridge.sent.some((message) => message.type === 'agent_notice'), false);
+		run.bridge.emit('agent_registered', { agentId: 'agent-a', payload: record('agent-a') });
+		await eventually(() => run.bridge.sent.some((message) => message.type === 'agent_notice' && message.agentId === 'agent-a'));
+		assert.equal(run.bridge.sent.filter((message) => message.type === 'agent_notice').length, 1);
 	} finally {
 		await run.coordinator.stop();
 	}

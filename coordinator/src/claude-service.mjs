@@ -1,5 +1,6 @@
 import { spawn as nodeSpawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { chmod, mkdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -9,7 +10,7 @@ import { goalSpecInstructions, nativeInstructions, nativeRecoveryInstructions, r
 import { parseDecision } from './decision-parser.mjs';
 import { NATIVE_AGENT_INSTRUCTIONS, normalizeMinecraftToolCall, toolResultContent } from './native-minecraft-tools.mjs';
 import { PLANNER_OUTPUT_SCHEMA, PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
-import { createProviderChildEnvironment } from './provider-environment.mjs';
+import { DIRECTLY_SPAWNABLE_WINDOWS_EXTENSIONS, createProviderChildEnvironment, environmentValue, findExecutableOnPath, findNpmEntrypointBesideShim } from './provider-environment.mjs';
 import { createExecutionSettings } from './provider-identity.mjs';
 import { createSessionMetadata, profileFingerprint } from './provider-session.mjs';
 import { recordProviderTurn } from './provider-turn-recorder.mjs';
@@ -809,8 +810,47 @@ class ClaudeAgent {
 	}
 }
 
+/**
+ * Resolves how the Claude Code CLI is started, mirroring resolveCodexLaunch: an explicit
+ * configured path wins, then a native claude.exe on PATH, then the npm package entrypoint
+ * run through this Node (npm's claude.cmd shim cannot be spawned without a shell), then
+ * the native installer location, and finally the bare name for the OS to resolve.
+ * `args` carries the arguments that must precede the CLI's own arguments.
+ */
+const CLAUDE_NPM_ENTRYPOINT = Object.freeze(['@anthropic-ai', 'claude-code', 'cli.js']);
+
+export function resolveClaudeLaunch(config, dependencies = {}) {
+	const platform = dependencies.platform ?? process.platform;
+	const environment = createProviderChildEnvironment('claude', dependencies.env ?? config.environment ?? process.env, config.bridgeSecretEnvironmentVariable);
+	const pathExists = dependencies.existsSync ?? existsSync;
+	const nodeExecutable = dependencies.execPath ?? process.execPath;
+	const configured = typeof config.executable === 'string' && config.executable.trim().length > 0 ? config.executable.trim() : 'claude';
+	const explicitPath = path.isAbsolute(configured) || /[\\/]/.test(configured);
+	if (explicitPath && pathExists(configured)) return { command: configured, args: [], environment, source: 'configured' };
+	if (platform === 'win32') {
+		const onPath = explicitPath ? null : findExecutableOnPath(configured, environment, { platform, existsSync: pathExists, extensions: DIRECTLY_SPAWNABLE_WINDOWS_EXTENSIONS });
+		if (onPath !== null) return { command: onPath, args: [], environment, source: 'path' };
+		const appData = environmentValue(environment, 'APPDATA');
+		if (appData !== null) {
+			const entrypoint = path.join(appData, 'npm', 'node_modules', ...CLAUDE_NPM_ENTRYPOINT);
+			if (pathExists(entrypoint)) return { command: nodeExecutable, args: [entrypoint], environment, source: 'npm' };
+		}
+		// Custom npm prefixes (nvm-windows and friends) only expose claude.cmd; run the package beside it.
+		const besideShim = explicitPath ? null : findNpmEntrypointBesideShim(configured, CLAUDE_NPM_ENTRYPOINT, environment, { platform, existsSync: pathExists });
+		if (besideShim !== null) return { command: nodeExecutable, args: [besideShim], environment, source: 'npm-shim' };
+		const userProfile = environmentValue(environment, 'USERPROFILE');
+		if (userProfile !== null) {
+			const nativeInstall = path.join(userProfile, '.local', 'bin', 'claude.exe');
+			if (pathExists(nativeInstall)) return { command: nativeInstall, args: [], environment, source: 'native' };
+		}
+	}
+	return { command: configured, args: [], environment, source: 'bare' };
+}
+
 export function buildClaudeLaunch(profile, config, { cwd, systemPromptFile, mcpConfig = null, streaming = true }) {
+	const launch = resolveClaudeLaunch(config);
 	const args = [
+		...launch.args,
 		'--print',
 		...(streaming ? ['--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose'] : ['--output-format', 'json']),
 		'--model', profile.model,
@@ -831,12 +871,12 @@ export function buildClaudeLaunch(profile, config, { cwd, systemPromptFile, mcpC
 		'--no-session-persistence',
 	];
 	return {
-		command: config.executable,
+		command: launch.command,
 		args,
 		options: {
 			cwd,
 			env: {
-				...createProviderChildEnvironment('claude', config.environment ?? process.env, config.bridgeSecretEnvironmentVariable),
+				...launch.environment,
 				CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
 				CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
 				DISABLE_AUTOUPDATER: '1',

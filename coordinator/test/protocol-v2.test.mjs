@@ -204,6 +204,31 @@ test('verbose control and events use strict authenticated scopes, stages, revisi
 	);
 });
 
+test('agent_notice carries a severity, reason code and bounded message without a goal revision', () => {
+	const message = 'Claude Code CLI is not installed on the server machine. This agent cannot think until that is fixed.';
+	for (const severity of ['error', 'warning', 'info']) {
+		assert.deepEqual(validateProtocolV2Payload('agent_notice', { severity, code: 'PROVIDER_CLI_MISSING', message }), { severity, code: 'PROVIDER_CLI_MISSING', message });
+	}
+	assert.deepEqual(
+		validateProtocolV2Envelope(serverEnvelope('agent_notice', 'agent-a', 'notice-1', { severity: 'error', code: 'PROVIDER_CLI_MISSING', message }), { direction: 'coordinator_to_server' }).payload,
+		{ severity: 'error', code: 'PROVIDER_CLI_MISSING', message },
+	);
+	assert.throws(() => validateProtocolV2Payload('agent_notice', { severity: 'fatal', code: 'PROVIDER_CLI_MISSING', message }), /severity/i);
+	assert.throws(() => validateProtocolV2Payload('agent_notice', { severity: 'error', code: 'PROVIDER_CLI_MISSING', message, goalRevision: 1 }), /field/i);
+	assert.throws(() => validateProtocolV2Payload('agent_notice', { severity: 'error', code: 'PROVIDER_CLI_MISSING' }), /message/i);
+	assert.throws(() => validateProtocolV2Payload('agent_notice', { severity: 'error', code: 'x'.repeat(129), message }), /code/i);
+	assert.throws(() => validateProtocolV2Payload('agent_notice', { severity: 'error', code: 'PROVIDER_CLI_MISSING', message: 'x'.repeat(2_049) }), /message/i);
+	assert.throws(() => validateProtocolV2Payload('agent_notice', { severity: 'error', code: 'PROVIDER_CLI_MISSING', message: '' }), /message/i);
+	assert.throws(
+		() => validateProtocolV2Envelope(serverEnvelope('agent_notice', 'server', 'notice-server', { severity: 'error', code: 'PROVIDER_CLI_MISSING', message }), { direction: 'coordinator_to_server' }),
+		/agent id|agent scope/i,
+	);
+	assert.throws(
+		() => validateProtocolV2Envelope(serverEnvelope('agent_notice', 'agent-a', 'notice-inbound', { severity: 'error', code: 'PROVIDER_CLI_MISSING', message }), { direction: 'server_to_coordinator' }),
+		/coordinator|server-to-coordinator/i,
+	);
+});
+
 test('coordinator status is strict, bounded, and excludes private planner data', () => {
 	const payload = {
 		reconciled: true,

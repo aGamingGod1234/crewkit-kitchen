@@ -1,10 +1,12 @@
 import { execFile as nodeExecFile, spawn as nodeSpawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import path from 'node:path';
 
 import { AcpProtocolError } from './acp-transport.mjs';
 import { terminateChildProcess } from './child-process-lifecycle.mjs';
 import { parseDecision } from './decision-parser.mjs';
 import { discoverAntigravityCatalog } from './provider-catalog-discovery.mjs';
-import { createProviderChildEnvironment } from './provider-environment.mjs';
+import { DIRECTLY_SPAWNABLE_WINDOWS_EXTENSIONS, createProviderChildEnvironment, environmentValue, findExecutableOnPath } from './provider-environment.mjs';
 import { PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
 import { createSessionMetadata, profileFingerprint } from './provider-session.mjs';
 import { recordProviderTurn } from './provider-turn-recorder.mjs';
@@ -418,6 +420,30 @@ function providerTiming(durationMs, apiDurationMs, queueWaitMs) {
 	return { durationMs, apiDurationMs, ...(Number.isFinite(queueWaitMs) && queueWaitMs >= 0 ? { queueWaitMs } : {}) };
 }
 
+/**
+ * Resolves the Antigravity CLI the same way resolveCodexLaunch does for Codex: an existing
+ * configured path, then a native agy.exe on PATH, then the installer's %LOCALAPPDATA%\agy\bin
+ * location, otherwise the bare name for the OS to resolve.
+ */
+export function resolveAntigravityLaunch(config = {}, dependencies = {}) {
+	const platform = dependencies.platform ?? process.platform;
+	const environment = createProviderChildEnvironment('gemini', dependencies.env ?? config.environment ?? process.env, config.bridgeSecretEnvironmentVariable);
+	const pathExists = dependencies.existsSync ?? existsSync;
+	const configured = typeof config.executable === 'string' && config.executable.trim().length > 0 ? config.executable.trim() : DEFAULT_EXECUTABLE;
+	const explicitPath = path.isAbsolute(configured) || /[\\/]/.test(configured);
+	if (explicitPath && pathExists(configured)) return { command: configured, args: [], environment, source: 'configured' };
+	if (platform === 'win32') {
+		const onPath = explicitPath ? null : findExecutableOnPath(configured, environment, { platform, existsSync: pathExists, extensions: DIRECTLY_SPAWNABLE_WINDOWS_EXTENSIONS });
+		if (onPath !== null) return { command: onPath, args: [], environment, source: 'path' };
+		const localAppData = environmentValue(environment, 'LOCALAPPDATA');
+		if (localAppData !== null) {
+			const installed = path.join(localAppData, 'agy', 'bin', 'agy.exe');
+			if (pathExists(installed)) return { command: installed, args: [], environment, source: 'installer' };
+		}
+	}
+	return { command: configured, args: [], environment, source: 'bare' };
+}
+
 export function buildAntigravityLaunch(profile, configValue = {}, dependencies = {}) {
 	const config = validateServiceConfig({
 		provider: 'gemini',
@@ -427,9 +453,11 @@ export function buildAntigravityLaunch(profile, configValue = {}, dependencies =
 	const checkedProfile = validateProfile(profile, config);
 	const promptTimeoutSeconds = Math.ceil(config.planningTimeoutMs / 1_000);
 	const continueConversation = dependencies.continueConversation === true;
+	const resolved = resolveAntigravityLaunch(config, { platform: dependencies.platform, env: dependencies.env, existsSync: dependencies.existsSync });
 	return {
-		command: config.executable,
+		command: resolved.command,
 		argsBeforePrompt: [
+			...resolved.args,
 			'--print',
 			...(continueConversation ? ['--continue'] : []),
 		],
@@ -440,11 +468,7 @@ export function buildAntigravityLaunch(profile, configValue = {}, dependencies =
 		],
 		options: {
 			cwd: dependencies.cwd ?? config.cwd,
-		env: createProviderChildEnvironment(
-				'gemini',
-				dependencies.env ?? config.environment ?? process.env,
-				config.bridgeSecretEnvironmentVariable,
-			),
+			env: resolved.environment,
 			stdio: ['ignore', 'pipe', 'pipe'],
 			windowsHide: true,
 		},
@@ -590,7 +614,7 @@ class AntigravityCatalog {
 		if (this.#config.catalogDiscovery === true) {
 			try {
 				models = await this.#dependencies.discoverCatalog({
-					executable: this.#config.executable,
+					executable: resolveAntigravityLaunch(this.#config, { platform: this.#dependencies.platform, env: this.#dependencies.environment }).command,
 					execFile: this.#dependencies.execFile,
 					environment: this.#dependencies.environment,
 					timeoutMs: this.#config.catalogDiscoveryTimeoutMs,
