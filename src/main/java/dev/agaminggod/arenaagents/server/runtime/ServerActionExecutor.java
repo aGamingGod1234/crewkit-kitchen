@@ -1101,14 +1101,20 @@ public final class ServerActionExecutor {
 			throw new AgentDomainException("NO_PLACEMENT_SUPPORT", "No adjacent solid face can support this placement");
 		}
 		ItemStack stack = player.getMainHandItem();
+		float aimPitch = player.getXRot();
 		orientPlayerForDesiredState(player, (BlockItem) stack.getItem(), stack, hit, desiredBlockState);
-		InteractionResult result = player.gameMode.useItemOn(
-				player,
-				player.level(),
-				stack,
-				InteractionHand.MAIN_HAND,
-				hit
-		);
+		InteractionResult result;
+		try {
+			result = player.gameMode.useItemOn(
+					player,
+					player.level(),
+					stack,
+					InteractionHand.MAIN_HAND,
+					hit
+			);
+		} finally {
+			player.setXRot(aimPitch);
+		}
 		if (result.consumesAction()) player.swing(InteractionHand.MAIN_HAND);
 	}
 
@@ -1160,7 +1166,7 @@ public final class ServerActionExecutor {
 		return direction.toYRot();
 	}
 
-	private static void orientPlayerForDesiredState(
+	static void orientPlayerForDesiredState(
 			ServerPlayer player,
 			BlockItem blockItem,
 			ItemStack stack,
@@ -1181,6 +1187,10 @@ public final class ServerActionExecutor {
 			}
 			return;
 		}
+		// Pistons, observers, dispensers and droppers take facing from the nearest look direction, so the downward
+		// aim at the support face would win over the yaw. Look level while choosing; placeBlock restores the pitch.
+		float originalPitch = player.getXRot();
+		player.setXRot(0.0F);
 		for (Direction direction : HORIZONTAL_PLACEMENT_DIRECTIONS) {
 			float yaw = directionalPlacementYaw(direction);
 			player.setYRot(yaw);
@@ -1190,6 +1200,7 @@ public final class ServerActionExecutor {
 		}
 		player.setYRot(originalYaw);
 		player.setYHeadRot(originalHeadYaw);
+		player.setXRot(originalPitch);
 		throw new AgentDomainException(
 				"PLACEMENT_STATE_MISMATCH",
 				"Requested directional state cannot be produced by vanilla placement context"
@@ -1810,7 +1821,16 @@ public final class ServerActionExecutor {
 						"Player changed dimension from " + startingDimension.identifier() + " to " + player.level().dimension().identifier()
 								+ "; this action stopped and its original outcome is unconfirmed", now);
 			}
-			if (!player.isAlive()) return result(ServerActionState.FAILED, "AGENT_DEAD", "Agent player died", now);
+			if (!player.isAlive()) {
+				// A transaction that already committed (a craft whose result was taken) still reports its success.
+				if (mode == Mode.TRANSACTION && executionStarted) {
+					ServerTransactionAdapter.TickResult settled = transaction.tick(now);
+					if (settled.state() == ServerTransactionAdapter.TickState.SUCCEEDED) {
+						return result(ServerActionState.SUCCEEDED, settled.reasonCode(), settled.message(), now);
+					}
+				}
+				return result(ServerActionState.FAILED, "AGENT_DEAD", "Agent player died", now);
+			}
 			long elapsed = elapsedTime.advance(now);
 			if (!executionStarted) {
 				executionStarted = true;
@@ -2233,9 +2253,15 @@ public final class ServerActionExecutor {
 
 		/** Drives the view toward the target through the normal input lease and reports whether it has settled. */
 		private AimGate.State aimAt(Vec3 target) {
-			applyLookingInput(InputOwner.INTERACTION, 300, target, 0.0F, false, false, false);
 			AgentInputState desired = AgentInputStates.lookingAt(
 					player, target, 0.0F, 0.0F, false, false, false, false, false, InteractionHand.MAIN_HAND);
+			// One eased step per tick from the current view, so spectators see a turn rather than a snap.
+			LeasedServerInputController input = AgentInputRuntime.controller(player);
+			if (inputLease == null) inputLease = input.acquire(request.agentId(), InputOwner.INTERACTION, 300);
+			input.apply(inputLease, new AgentInputState(0.0F, 0.0F, false, false, false, false, false,
+					AgentInputStates.turnYaw(player.getYRot(), desired.yaw()),
+					AgentInputStates.turnPitch(player.getXRot(), desired.pitch()),
+					player.getInventory().getSelectedSlot(), InteractionHand.MAIN_HAND));
 			return aimGate.observe(player.getYRot(), player.getXRot(), desired.yaw(), desired.pitch());
 		}
 

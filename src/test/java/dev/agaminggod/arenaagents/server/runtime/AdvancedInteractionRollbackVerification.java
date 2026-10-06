@@ -88,9 +88,82 @@ public final class AdvancedInteractionRollbackVerification {
 			verifyPartialMenuInput(components);
 			verifyNativeCraftTransaction(components);
 			verifyNativePickaxeTransaction(components);
+			verifyCraftDeath(components);
+			verifyHorizontalFacingPlacement(components);
 			if (failure != null) throw failure;
 		}
-		return 100;
+		return 112;
+	}
+
+	/** Tick a table pickaxe craft until both planks cells are filled and one plank is still on the cursor. */
+	private static ServerTransactionAdapter.ActiveTransaction halfFilledPickaxe(ComponentBindings components, Fixture fixture) {
+		fixture.inventory().setItem(0, components.stack(Items.OAK_PLANKS, 3, 0));
+		fixture.inventory().setItem(1, components.stack(Items.STICK, 2, 0));
+		var args = json("recipeId", "minecraft:wooden_pickaxe", "count", 1, "timeoutMs", 5000, "x", 0, "y", 64, "z", 0);
+		var transaction = service().begin(fixture.player(), request(ActionType.CRAFT_TABLE, args), args);
+		for (int tick = 0; tick < 200; tick++) {
+			transaction.tick(System.currentTimeMillis());
+			if (fixture.player().containerMenu instanceof net.minecraft.world.inventory.CraftingMenu crafting
+					&& crafting.getInputGridSlots().stream().filter(Slot::hasItem).count() == 2) {
+				return transaction;
+			}
+		}
+		throw new AssertionError("pickaxe craft never reached a half-filled grid");
+	}
+
+	private static void verifyCraftDeath(ComponentBindings components) {
+		components.stack(Items.STICK, 1, 0);
+		components.stack(Items.WOODEN_PICKAXE, 1, 59);
+		// Death mid-fill: the inventory already dropped as death loot, so the grid and cursor drop at the body.
+		Fixture dying = craftFixture();
+		var transaction = halfFilledPickaxe(components, dying);
+		var menu = dying.player().containerMenu;
+		assertEquals(1, menu.getCarried().getCount(), "one plank is on the cursor when the agent dies");
+		dying.inventory().clearContent();
+		dying.player().dead = true;
+		dying.player().recordDrops = true;
+		var died = tickToEnd(dying, transaction).result();
+		assertEquals("AGENT_DEAD", died.reasonCode(), "death fails an uncommitted craft");
+		transaction.cleanup();
+		int droppedPlanks = dying.player().dropped.stream().filter(stack -> stack.is(Items.OAK_PLANKS)).mapToInt(ItemStack::getCount).sum();
+		assertEquals(3, droppedPlanks, "grid and cursor planks drop at the body instead of vanishing");
+		assertEquals(0, count(dying, Items.OAK_PLANKS), "nothing is put back into the dead player's inventory");
+		assertTrue(menu.getCarried().isEmpty(), "dead agent's cursor is cleared");
+		assertTrue(((net.minecraft.world.inventory.CraftingMenu) menu).getInputGridSlots().stream().noneMatch(Slot::hasItem), "dead agent's grid is cleared");
+
+		// Death after the result was taken: the craft really happened and is reported as a success.
+		Fixture late = craftFixture();
+		var committed = halfFilledPickaxe(components, late);
+		for (int tick = 0; tick < 200 && count(late, Items.WOODEN_PICKAXE) == 0; tick++) {
+			assertEquals(ServerTransactionAdapter.TickState.RUNNING, committed.tick(System.currentTimeMillis()).state(), "craft runs until commit");
+		}
+		assertEquals(1, count(late, Items.WOODEN_PICKAXE), "pickaxe committed before the menu closes");
+		late.player().dead = true;
+		var settled = committed.tick(System.currentTimeMillis());
+		assertEquals("CRAFT_CONFIRMED", settled.reasonCode(), "death while the menu closes keeps the committed success");
+		committed.cleanup();
+	}
+
+	private static void verifyHorizontalFacingPlacement(ComponentBindings components) {
+		Fixture fixture = craftFixture();
+		ItemStack piston = components.stack(Items.PISTON, 1, 0);
+		// Floor placement next to the agent: the aim at the support's top face pitches the view well down.
+		var hit = new net.minecraft.world.phys.BlockHitResult(new net.minecraft.world.phys.Vec3(0.5D, 63.999D, 0.5D),
+				net.minecraft.core.Direction.UP, new net.minecraft.core.BlockPos(0, 63, 0), false);
+		fixture.player().setXRot(58.0F);
+		ServerActionExecutor.orientPlayerForDesiredState(fixture.player(), (net.minecraft.world.item.BlockItem) Items.PISTON,
+				piston, hit, DesiredBlockState.parse("minecraft:piston[facing=north]", "minecraft:piston"));
+		assertEquals(0.0F, fixture.player().getXRot(), "facing blocks are chosen with a level view");
+		fixture.player().setXRot(58.0F);
+		boolean rejected = false;
+		try {
+			ServerActionExecutor.orientPlayerForDesiredState(fixture.player(), (net.minecraft.world.item.BlockItem) Items.PISTON,
+					piston, hit, DesiredBlockState.parse("minecraft:piston[facing=north,extended=true]", "minecraft:piston"));
+		} catch (dev.agaminggod.arenaagents.agent.AgentDomainException expected) {
+			rejected = true;
+		}
+		assertTrue(rejected, "an impossible state is still rejected");
+		assertEquals(58.0F, fixture.player().getXRot(), "a rejected orientation restores the aim pitch");
 	}
 
 	private static void verifyNativeCraftTransaction(ComponentBindings components) {
@@ -613,6 +686,9 @@ public final class AdvancedInteractionRollbackVerification {
 		private boolean failMainHandVerification;
 		private boolean throwOnDrop;
 		private int swings;
+		private boolean dead;
+		private boolean recordDrops;
+		private java.util.List<ItemStack> dropped; // allocated lazily: fixtures skip constructors
 
 		private FaultingServerPlayer(
 				MinecraftServer server,
@@ -625,7 +701,7 @@ public final class AdvancedInteractionRollbackVerification {
 
 		@Override
 		public boolean isAlive() {
-			return true;
+			return !dead;
 		}
 
 		@Override
@@ -665,6 +741,16 @@ public final class AdvancedInteractionRollbackVerification {
 		public ItemEntity drop(ItemStack stack, boolean randomDirection) {
 			if (throwOnDrop) throw new IllegalStateException("injected drop failure after inventory debit");
 			return super.drop(stack, randomDirection);
+		}
+
+		@Override
+		public ItemEntity drop(ItemStack stack, boolean randomly, boolean includeThrower) {
+			if (recordDrops) {
+				if (dropped == null) dropped = new java.util.ArrayList<>();
+				dropped.add(stack.copy());
+				return null;
+			}
+			return super.drop(stack, randomly, includeThrower);
 		}
 	}
 

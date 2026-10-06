@@ -314,6 +314,12 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 		public TickResult tick(long nowEpochMs) {
 			TickResult existing = terminal.terminalResult();
 			if (existing != null) return existing;
+			// Work already committed (a craft whose result was taken) stays a success even if the agent dies or the
+			// deadline passes while the menu is still being closed.
+			TickResult committed = committedResult();
+			if (committed != null && (!player.isAlive() || elapsedTime.advance(nowEpochMs) >= timeoutMs)) {
+				return finish(committed);
+			}
 			if (!player.isAlive()) return finish(TickResult.failed("AGENT_DEAD", "Agent player died"));
 			if (elapsedTime.advance(nowEpochMs) >= timeoutMs) {
 				return finish(TickResult.timedOut("TRANSACTION_TIMED_OUT", "Transaction timed out"));
@@ -329,6 +335,11 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 		}
 
 		abstract TickResult execute(long nowEpochMs);
+
+		/** A success that is already irreversible while the transaction finishes its presentation, else null. */
+		TickResult committedResult() {
+			return null;
+		}
 
 		@Override
 		public void cancel(String reason) {
@@ -1160,7 +1171,31 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 		}
 
 		@Override
+		TickResult committedResult() {
+			return phase == Phase.LINGER ? committed : null;
+		}
+
+		/**
+		 * A dead agent's inventory has already dropped as death loot, and vanilla close handling would put the
+		 * cursor and grid back into that inventory, where respawn discards them. Drop them at the body instead.
+		 */
+		private void dropMenuItemsAtBody() {
+			if (menu == null) return;
+			ItemStack carried = menu.getCarried();
+			menu.setCarried(ItemStack.EMPTY);
+			if (!carried.isEmpty()) player.drop(carried, true, false);
+			if (gridSlots == null) return;
+			for (Slot slot : gridSlots) {
+				ItemStack stack = slot.getItem();
+				if (stack.isEmpty()) continue;
+				slot.set(ItemStack.EMPTY);
+				player.drop(stack, true, false);
+			}
+		}
+
+		@Override
 		void beforeCleanup() {
+			if (!player.isAlive()) dropMenuItemsAtBody();
 			if (table) return;
 			// Closing the inventory screen: vanilla returns the cursor and any grid items to the inventory.
 			AgentInventoryView.close(player);
