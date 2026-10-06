@@ -101,6 +101,21 @@ public final class NavigationMotionVerification {
 				"steering never looks past a jump or level change");
 		assertEquals(1, ServerNavigationController.steeringIndex(open, new Vec3(0.5D, LEVEL + 1, 0.5D), stairs, 1),
 				"steering is only smoothed on the player's own level");
+
+		// Off-center start whose diagonal sweeps the body through cell (1, 0) between samples. The previous
+		// 0.25 spacing with a 0.35 half-width checked neither sample square over that cell.
+		Vec3 offCenter = new Vec3(0.49D, LEVEL, 0.03D);
+		Vec3 diagonalTarget = new Vec3(1.5D, LEVEL, -1.5D);
+		Set<Long> hazardBeside = cells(-3, 4, -4, 3);
+		hazardBeside.remove(key(1, 0));
+		assertTrue(!ServerNavigationController.clearWalkLine(world(hazardBeside), offCenter, diagonalTarget, LEVEL),
+				"a hazard the swept hitbox clips between samples rejects the straight line");
+		assertTrue(ServerNavigationController.clearWalkLine(world(cells(-3, 4, -4, 3)), offCenter, diagonalTarget, LEVEL),
+				"the same line is clear when that cell is standable");
+		assertTrue(ServerNavigationController.STEERING_HALF_WIDTH
+						> 0.3D + ServerNavigationController.STEERING_SAMPLE_SPACING / 2.0D
+						&& ServerNavigationController.STEERING_HALF_WIDTH < 0.5D,
+				"the sample envelope covers the hitbox between samples and stays under one block wide");
 	}
 
 	private static void verifyOccupiedNode() {

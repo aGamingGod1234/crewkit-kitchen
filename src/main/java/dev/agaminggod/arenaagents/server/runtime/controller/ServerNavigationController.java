@@ -41,9 +41,15 @@ public final class ServerNavigationController implements ServerController {
 	private static final double ENDPOINT_STABILITY_DISTANCE = 0.1D;
 	/** Straight-line steering looks this many walk nodes ahead, so cardinal grid paths run as diagonals. */
 	static final int STEERING_LOOKAHEAD_NODES = 8;
-	/** Half the player's 0.6 block width plus a margin, so a smoothed line never clips a corner. */
-	private static final double STEERING_HALF_WIDTH = 0.35D;
-	private static final double STEERING_SAMPLE_SPACING = 0.25D;
+	/**
+	 * Clear-line envelope. Between samples the body is at most half a spacing from the nearest sample on
+	 * each axis, so a sample square of half-width player (0.3) + spacing / 2 + slack covers the swept
+	 * hitbox; the slack also absorbs small drift off the line. The square stays under one block wide, so
+	 * its four corners name every cell it touches.
+	 */
+	private static final double PLAYER_HALF_WIDTH = 0.3D;
+	static final double STEERING_SAMPLE_SPACING = 0.1D;
+	static final double STEERING_HALF_WIDTH = PLAYER_HALF_WIDTH + STEERING_SAMPLE_SPACING / 2.0D + 0.05D;
 	/** Walking gaze: a little below the horizon, the way a player watches the ground ahead. */
 	static final float WALKING_GAZE_PITCH = 10.0F;
 	private static final double GAZE_MIN_HORIZONTAL = 3.0D;
