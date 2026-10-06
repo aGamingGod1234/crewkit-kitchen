@@ -34,7 +34,7 @@ public record ScenarioAgentConfig(
 				provider,
 				model,
 				AgentControlCatalog.defaultReasoning(provider, model),
-				"priority",
+				AgentControlCatalog.defaultServiceTier(provider, model),
 				"",
 				"Solo",
 				gameMode
@@ -47,9 +47,8 @@ public record ScenarioAgentConfig(
 			String reasoning,
 			AgentGameMode gameMode
 	) {
-		String tier = AgentControlCatalog.serviceTiers(provider, model).contains("priority")
-				? "priority" : AgentControlCatalog.serviceTiers(provider, model).getFirst();
-		return new ScenarioAgentConfig(provider, model, reasoning, tier, "", "Solo", gameMode);
+		return new ScenarioAgentConfig(provider, model, reasoning,
+				AgentControlCatalog.defaultServiceTier(provider, model), "", "Solo", gameMode);
 	}
 
 	public ScenarioAgentConfig withProvider(String nextProvider) {
@@ -59,7 +58,7 @@ public record ScenarioAgentConfig(
 				checkedProvider,
 				nextModel,
 				AgentControlCatalog.defaultReasoning(checkedProvider, nextModel),
-				"priority",
+				AgentControlCatalog.defaultServiceTier(checkedProvider, nextModel),
 				name,
 				team,
 				gameMode
@@ -72,7 +71,7 @@ public record ScenarioAgentConfig(
 				provider,
 				checkedModel,
 				AgentControlCatalog.defaultReasoning(provider, checkedModel),
-				AgentControlCatalog.serviceTiers(provider, checkedModel).contains(serviceTier) ? serviceTier : "priority",
+				AgentControlCatalog.defaultServiceTier(provider, checkedModel),
 				name,
 				team,
 				gameMode

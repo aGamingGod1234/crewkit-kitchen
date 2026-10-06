@@ -211,8 +211,8 @@ public final class AgentControlClient {
 		return Optional.of(snapshotError).filter(value -> !value.isBlank());
 	}
 
-	public static void rememberPreferences(String provider, String model, String reasoning, String serviceTier) {
-		preferences = new Preferences(provider, model, reasoning, serviceTier);
+	public static void rememberPreferences(String provider, String model) {
+		preferences = new Preferences(provider, model);
 	}
 
 	public static void requestSnapshot() {
@@ -426,23 +426,19 @@ public final class AgentControlClient {
 		preferences = Preferences.reconcile(preferences, catalogAuthoritative);
 	}
 
-	public record Preferences(String provider, String model, String reasoning, String serviceTier) {
+	/**
+	 * Only provider and model persist between menu openings; thinking depth and speed deliberately restart at
+	 * the catalog defaults (lowest effort, Normal) every time a screen opens.
+	 */
+	public record Preferences(String provider, String model) {
 		public Preferences {
 			provider = AgentControlCatalog.requireProvider(provider);
 			model = Objects.requireNonNull(model, "model must not be null");
-			reasoning = Objects.requireNonNull(reasoning, "reasoning must not be null");
-			serviceTier = Objects.requireNonNull(serviceTier, "serviceTier must not be null");
-		}
-
-		public Preferences(String provider, String model, String reasoning) {
-			this(provider, model, reasoning, AgentControlCatalog.defaultServiceTier(provider, model));
 		}
 
 		private static Preferences defaults() {
 			String provider = AgentControlCatalog.providers().getFirst();
-			String model = AgentControlCatalog.defaultModel(provider);
-			return new Preferences(provider, model, AgentControlCatalog.defaultReasoning(provider, model),
-					AgentControlCatalog.defaultServiceTier(provider, model));
+			return new Preferences(provider, AgentControlCatalog.defaultModel(provider));
 		}
 
 		static Preferences reconcile(Preferences current, boolean authoritative) {
@@ -452,12 +448,7 @@ public final class AgentControlClient {
 					? checked.provider() : AgentControlCatalog.providers().getFirst();
 			String model = AgentControlCatalog.models(provider).contains(checked.model())
 					? checked.model() : AgentControlCatalog.defaultModel(provider);
-			String reasoning = AgentControlCatalog.reasoningEfforts(provider, model).contains(checked.reasoning())
-					? checked.reasoning() : AgentControlCatalog.defaultReasoning(provider, model);
-			List<String> serviceTiers = AgentControlCatalog.serviceTiers(provider, model);
-			String serviceTier = serviceTiers.contains(checked.serviceTier())
-					? checked.serviceTier() : AgentControlCatalog.defaultServiceTier(provider, model);
-			return new Preferences(provider, model, reasoning, serviceTier);
+			return new Preferences(provider, model);
 		}
 	}
 

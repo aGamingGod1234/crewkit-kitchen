@@ -47,10 +47,10 @@ public final class ScenarioSetupStateVerification {
 		assertEquals("codex", state.roster().get(3).provider(), "provider leaves the next agent unchanged");
 		assertEquals("codex", state.roster().get(0).provider(), "provider leaves the previous agent unchanged");
 		assertEquals("gemini-3.1-pro", state.roster().get(1).model(), "provider change selects a valid default model");
-		assertEquals("high", state.roster().get(1).reasoning(), "provider change selects a valid reasoning level");
+		assertEquals("low", state.roster().get(1).reasoning(), "provider change restarts at the lowest reasoning level");
 		state.selectOnly(2);
 		state.applyReasoning("medium");
-		assertEquals("high", state.roster().get(1).reasoning(), "moving next preserves the previous agent config");
+		assertEquals("low", state.roster().get(1).reasoning(), "moving next preserves the previous agent config");
 		assertions += 6;
 
 		state.next();
@@ -126,11 +126,32 @@ public final class ScenarioSetupStateVerification {
 			assertTrue(!blocked.accepted(), "catalog-invalid review is rejected without throwing");
 			assertTrue(blocked.message().contains("unavailable"),
 					"catalog-invalid review explains why launch was blocked");
+
+			AgentControlCatalog.installRuntimeCatalog(List.of(new AgentControlModelOption(
+					"codex", "gpt-future", "GPT Future", List.of("xhigh", "medium"), List.of("priority")
+			)));
+			ScenarioSetupState narrowed = ScenarioSetupState.defaults("codex", "gpt-future", "xhigh");
+			AgentControlCatalog.installRuntimeCatalog(List.of(new AgentControlModelOption(
+					"codex", "gpt-future", "GPT Future", List.of("high", "medium", "low"), List.of("fast", "priority")
+			)));
+			assertTrue(narrowed.unavailableReasonAt(0).contains("xhigh"),
+					"a narrowed catalog flags the retained thinking depth as unavailable");
+			assertTrue(narrowed.addDraftSlot(), "an unsupported focused slot still allows adding a roster slot");
+			assertEquals("low", narrowed.roster().get(1).reasoning(),
+					"a slot added beside an unsupported slot starts at the lowest thinking depth");
+			assertEquals("priority", narrowed.roster().get(1).serviceTier(),
+					"a slot added beside an unsupported slot starts at normal speed");
+			narrowed.selectOnly(0);
+			assertTrue(narrowed.repairFocusedSlot(), "repair accepts the unavailable focused slot");
+			assertEquals("low", narrowed.roster().getFirst().reasoning(),
+					"repair lands on the lowest available thinking depth instead of high");
+			assertEquals("priority", narrowed.roster().getFirst().serviceTier(),
+					"repair keeps the still-offered normal speed");
 		} finally {
 			AgentControlCatalog.resetRuntimeCatalog();
 			ScenarioLaunchRegistry.clear();
 		}
-		assertions += 8;
+		assertions += 15;
 
 		state.previous();
 		assertEquals(ScenarioWizardStep.ROSTER, state.step(), "previous returns to roster");
