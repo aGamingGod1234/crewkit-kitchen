@@ -20,18 +20,12 @@ const PROVIDER_ENVIRONMENT_VARIABLES = Object.freeze({
 		'GOOGLE_GENAI_USE_GCA',
 		'GOOGLE_GENAI_USE_VERTEXAI',
 	]),
-	kimi: Object.freeze([
-		'KIMI_API_KEY',
-		'KIMI_BASE_URL',
-		'KIMI_CONFIG_DIR',
-		'KIMI_HOME',
-		'MOONSHOT_API_KEY',
-		'MOONSHOT_BASE_URL',
-	]),
-	cursor: Object.freeze([
-		'CURSOR_API_KEY',
-		'CURSOR_BASE_URL',
-		'CURSOR_CONFIG_DIR',
+	claude: Object.freeze([
+		'ANTHROPIC_API_KEY',
+		'ANTHROPIC_AUTH_TOKEN',
+		'ANTHROPIC_BASE_URL',
+		'CLAUDE_CODE_OAUTH_TOKEN',
+		'CLAUDE_CONFIG_DIR',
 	]),
 });
 

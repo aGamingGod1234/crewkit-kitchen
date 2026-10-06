@@ -234,7 +234,6 @@ test('derives exact live-provider launch configuration without forwarding privat
 		version: 1, fixedSeeds: [42], agentLoads: [1, 4, 8, 16],
 		trials: [
 			{ id: 'live-codex', mode: 'live', scenarioId: 'fixture', seed: 42, agentLoad: 1, providerProfile: { provider: 'codex', model: 'fixture-codex', reasoningEffort: 'high', serviceTier: 'fast' }, repetitions: 1, turnBudgetMs: 100, trialBudgetMs: 500, turnCap: 2, providerAvailabilityRequired: false },
-			{ id: 'live-kimi', mode: 'live', scenarioId: 'fixture', seed: 42, agentLoad: 1, providerProfile: { provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'max', serviceTier: 'local' }, repetitions: 1, turnBudgetMs: 250, trialBudgetMs: 500, turnCap: 2, providerAvailabilityRequired: false },
 		],
 	};
 	await writeFile(files.matrix, JSON.stringify(liveMatrix), 'utf8');
@@ -253,10 +252,7 @@ test('derives exact live-provider launch configuration without forwarding privat
 				const cwd = process.cwd();
 				assert.deepEqual(options.liveProviderOptions.config.codex.launchProfile, { model: 'fixture-codex', reasoningEffort: 'high', serviceTier: 'fast' });
 				assert.equal(options.liveProviderOptions.config.codex.cwd, cwd);
-				assert.equal(options.liveProviderOptions.config.kimi.cwd, cwd);
-				assert.equal(options.liveProviderOptions.config.kimi.executable, 'kimi');
-				assert.equal(options.liveProviderOptions.config.kimi.catalogDiscovery, true);
-				assert.deepEqual(options.liveProviderOptions.config.kimi.modelReasoningEfforts, { 'kimi-code/k3': ['max'] });
+				assert.deepEqual(Object.keys(options.liveProviderOptions.config).sort(), ['codex', 'cwd']);
 				assert.equal(options.liveProviderOptions.config.codex.planningTimeoutMs, 100, 'trial budget bounds CLI timeout');
 				assert.equal(options.preflightTimeoutMs, 100);
 				assert.equal(JSON.stringify(options.liveProviderOptions).includes(privatePrompt), false);

@@ -1,7 +1,9 @@
-export const PROVIDER_IDS = Object.freeze(['codex', 'gemini', 'kimi', 'cursor']);
+export const PROVIDER_IDS = Object.freeze(['codex', 'gemini', 'claude']);
+/** Providers whose agents drive Minecraft through the native tool loop rather than ArenaScript plans. */
+export const NATIVE_TOOL_PROVIDERS = Object.freeze(['codex', 'claude']);
 
 const PROVIDER_SET = new Set(PROVIDER_IDS);
-const FAST_TIER_PROVIDERS = new Set(['codex', 'cursor']);
+const FAST_TIER_PROVIDERS = new Set(['codex']);
 
 export function createExecutionSettings(profile, { transport, controlProtocol, effective = {}, evidence = {}, limitations = [], modelSelector = null }) {
 	return {
@@ -30,7 +32,7 @@ export function assertProviderServiceTier(providerValue, serviceTier, field = 's
 		throw providerError(options.ErrorType ?? TypeError, options.code ?? null, `${field} must be priority or fast`);
 	}
 	if (serviceTier === 'fast' && !FAST_TIER_PROVIDERS.has(provider)) {
-		throw providerError(options.ErrorType ?? TypeError, options.code ?? null, `${field} fast is available only for codex and cursor`);
+		throw providerError(options.ErrorType ?? TypeError, options.code ?? null, `${field} fast is available only for codex`);
 	}
 	return serviceTier;
 }

@@ -36,7 +36,7 @@ public final class SkitDirectorScreen extends Screen {
 	private static final int ERROR = ConsoleTheme.ERROR;
 	private static final int ROW = 26;
 	private static final int GAP = 6;
-	private static final List<String> PROVIDERS = List.of("codex", "claude", "gemini", "kimi", "cursor");
+	private static final List<String> PROVIDERS = List.of("codex", "claude", "gemini");
 	private static final List<String> ACTIONS = List.of("move", "walk", "wait", "jump", "equip", "use", "swing", "emote");
 	private static final List<String> TONES = List.of("neutral", "warm", "excited", "serious", "dramatic", "whisper", "robotic", "angry");
 	private static final List<String> SPEEDS = List.of("0.75", "1.0", "1.25", "1.5");

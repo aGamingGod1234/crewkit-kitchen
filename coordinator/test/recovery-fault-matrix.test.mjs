@@ -1430,7 +1430,7 @@ function assertBoundedResources(resourcesValue) {
 function valueOf(entry) { return entry.kind === 'observed' ? entry.value : null; }
 
 function providerServices() {
-	return Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => {
+	return Object.fromEntries(['codex', 'gemini', 'claude'].map((provider) => {
 		let current = null;
 		let currentSessions = 0;
 		let maxCurrentSessions = 0;

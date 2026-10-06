@@ -49,7 +49,7 @@ public final class SkitPresentationVerification {
 					} finally { contents.forEach(net.minecraft.client.renderer.texture.SpriteContents::close); }
 				}
 			}
-			for (String appearance : List.of("codex", "claude", "cursor", "gemini", "kimi")) {
+			for (String appearance : List.of("codex", "claude", "gemini")) {
 				var actor = new SkitActor(AgentId.random(), "GPT 6-Astra_v2", appearance, false);
 				SkitActors.applyPresentation(player, actor);
 				check(player.world.manager.sentStyle == player.icon.style, "stationary cast icon is refreshed for connected viewers");

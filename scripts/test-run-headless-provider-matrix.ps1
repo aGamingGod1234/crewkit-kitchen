@@ -12,11 +12,11 @@ if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) {
 	throw 'Expected lifecycle wrapper to exist'
 }
 $wrapperSource = Get-Content -Raw -LiteralPath $scriptPath
-if ($wrapperSource -notmatch "'cursor'\s*\{\s*return") {
-	throw 'Expected lifecycle wrapper to preflight the native Cursor agent'
+if ($wrapperSource -notmatch "'claude'\s*\{\s*return") {
+	throw 'Expected lifecycle wrapper to preflight the Claude Code agent'
 }
 if ($wrapperSource -notmatch '\$MaxSelectedScenarios\s*=\s*24') {
-	throw 'Expected lifecycle wrapper to allow the complete 18-profile provider matrix within a 24-scenario bound'
+	throw 'Expected lifecycle wrapper to allow the complete provider matrix within a 24-scenario bound'
 }
 if ($wrapperSource -notmatch 'Test-CoordinatorReady\s+\$protocolAudit\s+\$Scenario') {
 	throw 'Expected lifecycle runs to wait for the scenario provider catalog before summoning'

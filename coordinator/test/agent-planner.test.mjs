@@ -3,7 +3,7 @@ import test from 'node:test';
 import { EventEmitter } from 'node:events';
 import { CodexService } from '../src/codex-service.mjs';
 
-import { AgentPlanner } from '../src/agent-planner.mjs';
+import { AgentPlanner, goalSpecTranslatorProfile } from '../src/agent-planner.mjs';
 import { DynamicAgentState } from '../src/agent-registry.mjs';
 import { ControlLatencyRegistry } from '../src/control-latency-registry.mjs';
 import { PlanningScheduler } from '../src/planning-scheduler.mjs';
@@ -122,6 +122,15 @@ test('goal spec translation uses an isolated structured provider session without
 	assert.equal(calls.find(call => call.type === 'decide').decisionOptions.retry, false);
 	assert.equal(calls.at(-1).type, 'remove');
 	assert.deepEqual(registry.states, []);
+});
+
+test('goal translation is forced onto Luna or Sonnet 5.5 at medium effort', () => {
+	const codex = goalSpecTranslatorProfile({ ...RECORD, provider: 'codex', model: 'gpt-6.1-sol', reasoningEffort: 'ultra', serviceTier: 'fast' }, 'translator');
+	assert.deepEqual([codex.agentId, codex.provider, codex.model, codex.reasoningEffort, codex.serviceTier], ['translator', 'codex', 'gpt-6-luna', 'medium', 'fast']);
+	const claude = goalSpecTranslatorProfile({ ...RECORD, provider: 'claude', model: 'claude-opus-5-5', reasoningEffort: 'low', serviceTier: 'priority' }, 'translator');
+	assert.deepEqual([claude.provider, claude.model, claude.reasoningEffort, claude.serviceTier], ['claude', 'claude-sonnet-5-5', 'medium', 'priority']);
+	const gemini = goalSpecTranslatorProfile({ ...RECORD, provider: 'gemini', model: 'gemini-3.1-pro', reasoningEffort: 'high' }, 'translator');
+	assert.deepEqual([gemini.provider, gemini.model], ['codex', 'gpt-6-luna']);
 });
 
 test('ArenaScript planning explicitly creates an ArenaScript provider session', async () => {

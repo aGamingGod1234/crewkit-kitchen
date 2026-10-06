@@ -37,12 +37,9 @@ public final class VoiceCatalog {
 		if (lower.contains("fable")) return "voice.adrian.v1";
 		if (lower.contains("grok")) return "voice.jordan.v1";
 		if (lower.contains("gemini")) return "voice.ethan.v1";
-		if (lower.contains("kimi")) return "voice.sarah.v1";
 		return switch (appearance.toLowerCase(Locale.ROOT)) {
 			case "claude" -> "voice.adrian.v1";
-			case "cursor" -> "voice.jordan.v1";
 			case "gemini" -> "voice.ethan.v1";
-			case "kimi" -> "voice.sarah.v1";
 			default -> "voice.laura.v1";
 		};
 	}

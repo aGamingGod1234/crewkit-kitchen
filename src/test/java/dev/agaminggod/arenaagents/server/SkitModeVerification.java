@@ -78,7 +78,7 @@ public final class SkitModeVerification {
 			assertEquals(actor, restored.actors().getFirst(), "dead cast identity persists without an AgentRecord");
 			assertEquals(placement, restored.placement(id.toString()), "manual respawn retains saved stage position");
 			assertEquals(dev.agaminggod.arenaagents.agent.AgentIdentity.playerName(id, actor.profile()), dev.agaminggod.arenaagents.agent.AgentIdentity.playerName(id, actor.withDead(false).profile()), "death and respawn preserve physical identity");
-			for (String appearance : List.of("codex", "claude", "gemini", "kimi", "cursor")) new SkitActor(id, "Stage Actor", appearance, false).profile();
+			for (String appearance : List.of("codex", "claude", "gemini")) new SkitActor(id, "Stage Actor", appearance, false).profile();
 			assertThrows(() -> restored.putActor(new SkitActor(dev.agaminggod.arenaagents.agent.AgentId.random(), "stage actor", "codex", false)), "dead actors reserve cast names case-insensitively");
 			var packet = new dev.agaminggod.arenaagents.control.DirectorSnapshotPayload(true, true, List.of(new dev.agaminggod.arenaagents.control.DirectorSnapshotPayload.Actor(id.toString(), actor.name(), "Stage_Actor", "claude", true, false)));
 			var buf = new net.minecraft.network.RegistryFriendlyByteBuf(io.netty.buffer.Unpooled.buffer(), net.minecraft.core.RegistryAccess.EMPTY);
@@ -169,7 +169,7 @@ public final class SkitModeVerification {
 						"incomplete Director command is rejected before sending: " + command);
 				checks++;
 			}
-			for (String model : List.of("gpt-5.6-luna", "kimi-code/k3", "claude-sonnet-4-6")) {
+			for (String model : List.of("gpt-6-luna", "gemini-3.1-pro", "claude-sonnet-5-5")) {
 				for (String name : List.of("Alex", "GPT 5.6-Sol", "演员 Lucas", "Alex \"The Builder\"")) {
 					String command = "codex skit summon codex model " + StringArgumentType.escapeIfRequired(model) + " " + StringArgumentType.escapeIfRequired(name);
 					var parsed = dispatcher.parse(command, null);

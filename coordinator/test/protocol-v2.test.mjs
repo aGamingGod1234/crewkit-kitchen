@@ -823,7 +823,7 @@ test('wire registry rejects states that cannot round-trip through the Java agent
 		/IDLE agents cannot have a current goal/,
 	);
 	assert.throws(
-		() => validateProtocolV2Payload('agent_registered', { ...registeredRecord(), provider: 'kimi', serviceTier: 'fast' }),
+		() => validateProtocolV2Payload('agent_registered', { ...registeredRecord(), provider: 'claude', serviceTier: 'fast' }),
 		/fast is available only/,
 	);
 	assert.throws(
@@ -2171,10 +2171,10 @@ test('authenticated bridge accepts same-revision conversation wake replay and it
 });
 
 
-test('catalog snapshots carry Cursor Composer and Grok profiles', () => {
+test('catalog snapshots carry Claude profiles', () => {
 	const model = {
-		provider: 'cursor', id: 'cursor:composer-2.5', model: 'composer-2.5', displayName: 'Composer 2.5',
-		reasoningEfforts: ['low', 'high'], serviceTiers: ['priority', 'fast'],
+		provider: 'claude', id: 'claude-opus-5-5', model: 'claude-opus-5-5', displayName: 'Claude Opus 5.5',
+		reasoningEfforts: ['low', 'medium', 'high'], serviceTiers: ['priority'],
 	};
 	assert.deepEqual(
 		validateProtocolV2Payload('catalog_snapshot', { refreshedAtEpochMs: 1, models: [model] }).models,

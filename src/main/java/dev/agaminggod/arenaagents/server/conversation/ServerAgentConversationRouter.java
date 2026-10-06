@@ -11,6 +11,7 @@ import dev.agaminggod.arenaagents.server.goal.GoalCompilation;
 import dev.agaminggod.arenaagents.server.goal.GoalCompiler;
 import dev.agaminggod.arenaagents.server.goal.PendingGoalDraft;
 import dev.agaminggod.arenaagents.server.goal.GoalSpecRequestSink;
+import dev.agaminggod.arenaagents.server.pov.AgentControlReservations;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -288,7 +289,9 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 		// Capture the durable baseline before resume or routing can replace/clear its wake.
 		long sequence = nextSequence(sequences, target.agentId(), manager.pendingConversationWake(target.agentId())
 				.map(wake -> wake.event().sequence()).orElse(0L));
-		if (shouldResume(target.state(), source.kind(), source.text())) {
+		// A taken-over agent hears speech as context only: no auto-resume and no goal wake while possessed.
+		boolean reserved = AgentControlReservations.isReserved(manager.server(), target.agentId());
+		if (!reserved && shouldResume(target.state(), source.kind(), source.text())) {
 			target = manager.resume(target.agentId().toString()).after();
 		}
 		ConversationEvent delivered = new ConversationEvent(
@@ -303,7 +306,7 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 				sequence,
 				source.dimensionId()
 		);
-		GoalRoute route = routePlayerGoal(target, delivered, sourceLevel);
+		GoalRoute route = reserved ? GoalRoute.EVENT_ONLY : routePlayerGoal(target, delivered, sourceLevel);
 		if (route.publish()) eventSink.publish(delivered, route.wakeSpec());
 	}
 

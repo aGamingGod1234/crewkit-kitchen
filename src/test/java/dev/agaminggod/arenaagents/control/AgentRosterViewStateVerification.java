@@ -190,7 +190,7 @@ public final class AgentRosterViewStateVerification {
 		state.toggle("agent-2");
 		AgentRosterPage before = state.page(8);
 		AgentRosterEntry duplicate = new AgentRosterEntry(
-				"agent-1", "Duplicate", "kimi", "K3", "Idle", true, ""
+				"agent-1", "Duplicate", "claude", "Opus 5.5", "Idle", true, ""
 		);
 
 		expectFailure(() -> state.reconcile(List.of(entry(1, false), duplicate)),

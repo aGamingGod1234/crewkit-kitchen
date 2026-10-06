@@ -16,12 +16,11 @@ approximate pixel-art silhouettes:
 - [Cursor official brand guidelines](https://cursor.com/brand) and [source assets](https://ptht05hbb1ssoooe.public.blob.vercel-storage.com/assets/brand/cursor-brand-assets.zip), `General Logos/Cube/PNG/CUBE_2D_LIGHT.png`
 - [Google Brand Resource Center](https://about.google/brand-resource-center/)
 - [Gemini icon source](https://commons.wikimedia.org/wiki/File:Google-gemini.svg)
-- [KIMI Brand Guidelines](https://moonshotai.github.io/Branding-Guide/)
-- [KIMI Brand Guidelines](https://moonshotai.github.io/Branding-Guide/) (the supplied K-with-dot reference is used for the raster)
 
-Most logos get a 56x56 raster inside the 64px face square with a 4px clear margin;
-KIMI uses the supplied complete 64x64 black-background face tile. Every mark is
-placed on the front face only. The dominant body swatches
+Every logo gets a 56x56 raster inside the 64px face square with a 4px clear margin,
+placed on the front face only. Codex agents wear the OpenAI skin, Claude agents
+(and Gemini's Antigravity-hosted Claude models) wear the Claude skin, and the other
+Gemini models wear the Gemini skin. The dominant body swatches
 use these reference anchors, with dark edge shading only for model readability:
 
 These higher-resolution files are consumed by the mod's renderer. They are not
@@ -34,8 +33,6 @@ standard skin layout.
 | Claude | `#D97757` |
 | DeepSeek | white body with `#5786FE` blue |
 | Gemini | Google blue `#4285F4` with darker `#2553A0` shading, purple `#A142F4`, green `#34A853`, and red `#EA4335` |
-| Kimi | black with the supplied white K mark |
-| Cursor | `#EDECEC` with the official `#26251E` cube mark |
 
 These references remain attribution and design-reference links only. No external
 asset is fetched during the build. Use of a company's marks may require permission

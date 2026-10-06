@@ -88,7 +88,7 @@ test('strictly normalizes matrix identity, budgets, loads, and unique trial IDs'
 	assert.throws(() => normalizeLatencyMatrix(matrix({ trials: [{
 		...matrix().trials[0], id: 'disabled-gemini', mode: 'live',
 		providerProfile: { provider: 'gemini', model: 'gemini-3.1-pro', reasoningEffort: 'high', serviceTier: 'priority' },
-	}] })), /Codex or Kimi/);
+	}] })), /Codex provider/);
 });
 
 test('runs deterministic instant full-path trials at every declared load', async () => {

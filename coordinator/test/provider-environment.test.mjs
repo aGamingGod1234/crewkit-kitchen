@@ -9,8 +9,7 @@ test('provider environments retain only OS bootstrap and the selected provider c
 		APPDATA: 'C:\\Users\\lucas\\AppData\\Roaming',
 		OPENAI_API_KEY: 'openai-key',
 		GEMINI_API_KEY: 'gemini-key',
-		KIMI_API_KEY: 'kimi-key',
-		CURSOR_API_KEY: 'cursor-key',
+		ANTHROPIC_API_KEY: 'anthropic-key',
 		FISH_AUDIO_API_KEY: 'voice-key',
 		DEEPGRAM_API_KEY: 'speech-key',
 		AWS_SECRET_ACCESS_KEY: 'cloud-key',
@@ -25,8 +24,7 @@ test('provider environments retain only OS bootstrap and the selected provider c
 	for (const [provider, credential] of [
 		['codex', 'OPENAI_API_KEY'],
 		['gemini', 'GEMINI_API_KEY'],
-		['kimi', 'KIMI_API_KEY'],
-		['cursor', 'CURSOR_API_KEY'],
+		['claude', 'ANTHROPIC_API_KEY'],
 	]) {
 		const environment = createProviderChildEnvironment(provider, parent, 'CUSTOM_BRIDGE_SECRET');
 		assert.equal(environment.PATH, 'C:\\Windows\\System32');
@@ -41,7 +39,7 @@ test('provider environments retain only OS bootstrap and the selected provider c
 		assert.equal(environment.ARENA_AGENT_BRIDGE_SECRET, undefined);
 		assert.equal(environment.ARENA_AGENT_BRIDGE_SECRET_FILE, undefined);
 		assert.equal(environment.CUSTOM_BRIDGE_SECRET, undefined);
-		for (const otherCredential of ['OPENAI_API_KEY', 'GEMINI_API_KEY', 'KIMI_API_KEY', 'CURSOR_API_KEY']) {
+		for (const otherCredential of ['OPENAI_API_KEY', 'GEMINI_API_KEY', 'ANTHROPIC_API_KEY']) {
 			if (otherCredential !== credential) assert.equal(environment[otherCredential], undefined);
 		}
 	}

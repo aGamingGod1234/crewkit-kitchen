@@ -19,7 +19,7 @@ public final class ArenaSpectatorSnapshotVerification {
 			standings.add(ArenaSpectatorSnapshot.Standing.candidate(
 					"agent-" + index,
 					"Agent " + index,
-					index % 3 == 0 ? "codex" : index % 3 == 1 ? "gemini" : "kimi",
+					index % 3 == 0 ? "codex" : index % 3 == 1 ? "gemini" : "claude",
 					index == 14 || index == 15 ? 99.0D : index,
 					Math.max(0, 100 - index * 9),
 					index == 15 ? "eliminated" : "acting"

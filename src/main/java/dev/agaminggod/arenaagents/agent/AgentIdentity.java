@@ -21,10 +21,6 @@ public final class AgentIdentity {
 	private static final String[] CODEX_LEGACY_VARIANTS = {"cyan", "viol", "emer", "ambe"};
 	private static final String[] GEMINI_LEGACY_MODELS = {"gem"};
 	private static final String[] GEMINI_LEGACY_VARIANTS = {"azur", "crim", "sola", "verd"};
-	private static final String[] KIMI_K3_LEGACY_MODELS = {"k3"};
-	private static final String[] KIMI_K3_LEGACY_VARIANTS = {"moon", "ice", "orch", "sunr"};
-	private static final String[] KIMI_LEGACY_MODELS = {"kimi"};
-	private static final String[] KIMI_LEGACY_VARIANTS = {"moo", "ice", "orc", "sun"};
 
 	private AgentIdentity() {
 	}
@@ -49,7 +45,8 @@ public final class AgentIdentity {
 		if (profile.userName().isEmpty()) return modelLabel;
 		String storedName = profile.userName().orElseThrow();
 		String base = defaultPublicName(profile.provider(), profile.model());
-		if (sameIdentity(storedName, base)) return modelLabel;
+		// Names allocated before the trailing-separator trim are stored as e.g. "Claude_Sonnet_4_".
+		if (sameIdentity(canonicalPublicName(storedName), base)) return modelLabel;
 		// Registry-created profiles persist an allocated technical name in userName,
 		// including collision suffixes. Recover the label without renaming the player.
 		int suffixStart = storedName.length();
@@ -102,6 +99,8 @@ public final class AgentIdentity {
 		if (safe.isEmpty()) safe.append("Agent");
 		if (!isAsciiLetter(safe.charAt(0))) safe.insert(0, "Agent_");
 		if (safe.length() > PLAYER_NAME_LIMIT) safe.setLength(PLAYER_NAME_LIMIT);
+		// The cut can land on a separator ("Claude_Sonnet_5_"); a public name never ends on one.
+		while (safe.length() > 1 && safe.charAt(safe.length() - 1) == '_') safe.setLength(safe.length() - 1);
 		return safe.toString();
 	}
 
@@ -146,7 +145,7 @@ public final class AgentIdentity {
 	public static String skinName(String provider, int variant) {
 		String[] names = switch (normalizedProvider(provider)) {
 			case "gemini" -> new String[]{"Azure", "Crimson", "Solar", "Verdant"};
-			case "kimi" -> new String[]{"Moon", "Ice", "Orchid", "Sunrise"};
+			case "claude" -> new String[]{"Clay", "Ember", "Sand", "Ivory"};
 			default -> new String[]{"Cyan", "Violet", "Emerald", "Amber"};
 		};
 		return names[Math.floorMod(variant, names.length)];
@@ -177,9 +176,7 @@ public final class AgentIdentity {
 					value.providerKey(), value.modelFamilyKey(), value.individualVariant()));
 		}
 		return legacySkin(identity, "codex", CODEX_LEGACY_MODELS, CODEX_LEGACY_VARIANTS)
-				.or(() -> legacySkin(identity, "gemini", GEMINI_LEGACY_MODELS, GEMINI_LEGACY_VARIANTS))
-				.or(() -> legacySkin(identity, "kimi", KIMI_K3_LEGACY_MODELS, KIMI_K3_LEGACY_VARIANTS))
-				.or(() -> legacySkin(identity, "kimi", KIMI_LEGACY_MODELS, KIMI_LEGACY_VARIANTS));
+				.or(() -> legacySkin(identity, "gemini", GEMINI_LEGACY_MODELS, GEMINI_LEGACY_VARIANTS));
 	}
 
 	static String recognizablePlayerCode(String label, int variant) {

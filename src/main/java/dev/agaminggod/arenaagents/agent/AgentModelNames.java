@@ -26,13 +26,9 @@ public final class AgentModelNames {
 			entry("gemini", "claude-sonnet-4-6", "Claude Sonnet 4.6", "Sonnet 4.6"),
 			entry("gemini", "claude-opus-4-6", "Claude Opus 4.6", "Opus 4.6"),
 			entry("gemini", "gpt-oss-120b", "GPT OSS 120B", "GPT OSS 120B"),
-			entry("kimi", "kimi-code/k3", "Kimi K3", "K3"),
-			entry("kimi", "kimi-code/k3-256k", "Kimi K3 256K", "K3 256K"),
-			entry("kimi", "kimi-code/kimi-for-coding", "K2.7 Coding", "K2.7 Coding"),
-			entry("kimi", "kimi-code/kimi-for-coding-highspeed", "K2.7 Coding Highspeed", "K2.7 Fast"),
-			entry("cursor", "composer-2.5", "Composer 2.5", "Composer 2.5"),
-			entry("cursor", "grok-4.5", "Grok 4.5", "Grok 4.5"),
-			entry("cursor", "grok-4.6", "Grok 4.6", "Grok 4.6")
+			entry("claude", "claude-opus-5-5", "Claude Opus 5.5", "Opus 5.5"),
+			entry("claude", "claude-sonnet-5-5", "Claude Sonnet 5.5", "Sonnet 5.5"),
+			entry("claude", "claude-fable-5-1", "Claude Fable 5.1", "Fable 5.1")
 	);
 
 	private AgentModelNames() {
@@ -85,9 +81,8 @@ public final class AgentModelNames {
 	}
 
 	private static String readable(String slug) {
-		String value = slug.startsWith("kimi-code/") ? slug.substring("kimi-code/".length()) : slug;
 		StringBuilder result = new StringBuilder();
-		for (String part : value.replace('_', '-').split("-")) {
+		for (String part : slug.replace('_', '-').split("-")) {
 			if (part.isBlank()) continue;
 			if (!result.isEmpty()) result.append(' ');
 			result.append(readablePart(part));

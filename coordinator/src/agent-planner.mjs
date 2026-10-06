@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { AgentRegistryError, DynamicAgentState } from './agent-registry.mjs';
 import { normalizeRetryReason, validateTraceId } from './control-latency-registry.mjs';
 import { ProviderHealthRegistry } from './provider-health-registry.mjs';
+import { NATIVE_TOOL_PROVIDERS } from './provider-identity.mjs';
 import { profileFingerprint } from './provider-session.mjs';
 import { createProviderTurnTelemetry } from './provider-turn-telemetry.mjs';
 import { recordProviderTurn } from './provider-turn-recorder.mjs';
@@ -131,10 +132,7 @@ export class AgentPlanner {
 		const translatorId = goalSpecTranslatorId(agentId, checkedRequest.requestId);
 		// Goal translation is an auxiliary advisory session. The registered agent
 		// keeps its own provider, model, context, and sole control of game actions.
-		const translatorProfile = {
-			...record, agentId: translatorId, provider: 'codex', model: 'gpt-6-luna',
-			reasoningEffort: 'medium', serviceTier: 'fast',
-		};
+		const translatorProfile = goalSpecTranslatorProfile(record, translatorId);
 		let health = this.#goalSpecHealth.get(translatorId);
 		if (health === undefined) {
 			health = { profiles: new Map(), inFlight: 0, executing: 0, retired: false };
@@ -170,7 +168,7 @@ export class AgentPlanner {
 					health.executing -= 1;
 					this.#releaseGoalSpecHealth(translatorId, health);
 				}
-			}, { lane: 'codex', priority: 'ordinary', capacityClass: 'auxiliary' }),
+			}, { lane: translatorProfile.provider, priority: 'ordinary', capacityClass: 'auxiliary' }),
 		});
 		return translator.translate(checkedRequest, { correctiveFeedback }).then((result) => {
 			health.retired = true;
@@ -203,7 +201,7 @@ export class AgentPlanner {
 
 	requestNativeTurn({ agentId, input, goalRevision, executeTool, recoverySummary = null, preserveState = false, priority = 'ordinary', traceId: requestedTraceId = null, onVerbose = null, onProgress = null }) {
 		const record = this.#registry.assertCurrentRevision(agentId, goalRevision);
-		if (record.provider !== 'codex') throw codedError('NATIVE_TOOLS_UNAVAILABLE', 'Native Minecraft tools are currently available for Codex agents only');
+		if (!NATIVE_TOOL_PROVIDERS.includes(record.provider)) throw codedError('NATIVE_TOOLS_UNAVAILABLE', 'Native Minecraft tools are currently available for Codex and Claude agents only');
 		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('native turn input must be nonblank');
 		if (typeof executeTool !== 'function') throw new TypeError('executeTool must be a function');
 		if (onProgress !== null && typeof onProgress !== 'function') throw new TypeError('onProgress must be a function or null');
@@ -377,10 +375,10 @@ export class AgentPlanner {
 
 	async steerNativeTurn({ agentId, input, goalRevision }) {
 		const record = this.#registry.assertCurrentRevision(agentId, goalRevision);
-		if (record.provider !== 'codex') throw codedError('NATIVE_TOOLS_UNAVAILABLE', 'Native Minecraft tools are currently available for Codex agents only');
+		if (!NATIVE_TOOL_PROVIDERS.includes(record.provider)) throw codedError('NATIVE_TOOLS_UNAVAILABLE', 'Native Minecraft tools are currently available for Codex and Claude agents only');
 		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('native steer input must be nonblank');
 		const agent = this.#codexService.getAgent(agentId);
-		if (agent === null) throw codedError('TURN_NOT_ACTIVE', `Agent '${agentId}' has no active Codex turn`);
+		if (agent === null) throw codedError('TURN_NOT_ACTIVE', `Agent '${agentId}' has no active native turn`);
 		return agent.steer(input, { goalRevision });
 	}
 
@@ -836,6 +834,15 @@ function isNativeCancellation(error) {
 function safeRetryReason(value) {
 	try { return normalizeRetryReason(value ?? 'ERROR'); }
 	catch { return 'ERROR'; }
+}
+
+// Goal translation is a small structured task: Claude agents translate on Sonnet 5.5 and every other
+// agent on Luna, both at medium effort regardless of the agent's own model and effort.
+export function goalSpecTranslatorProfile(record, translatorId) {
+	if (record.provider === 'claude') {
+		return { ...record, agentId: translatorId, provider: 'claude', model: 'claude-sonnet-5-5', reasoningEffort: 'medium', serviceTier: 'priority' };
+	}
+	return { ...record, agentId: translatorId, provider: 'codex', model: 'gpt-6-luna', reasoningEffort: 'medium', serviceTier: 'fast' };
 }
 
 function goalSpecTranslatorId(agentId, requestId) {

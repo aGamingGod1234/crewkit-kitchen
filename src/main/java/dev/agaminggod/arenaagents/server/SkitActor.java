@@ -8,18 +8,16 @@ public record SkitActor(AgentId agentId, String name, String appearance, boolean
 	public SkitActor {
 		java.util.Objects.requireNonNull(agentId);
 		name = AgentValidators.requireUserName(name);
-		if (!java.util.List.of("codex", "claude", "gemini", "kimi", "cursor").contains(appearance))
+		if (!java.util.List.of("codex", "claude", "gemini").contains(appearance))
 			throw new AgentDomainException("INVALID_APPEARANCE", "Choose a supported actor appearance");
 	}
 
 	/** The offline-player adapter shares appearance and identity helpers, never an AI runtime. */
 	public AgentProfile profile() {
-		return new AgentProfile(appearance.equals("claude") ? "gemini" : appearance,
+		return new AgentProfile(appearance,
 				switch (appearance) {
-					case "claude" -> "claude-sonnet-4-6";
+					case "claude" -> "claude-sonnet-5-5";
 					case "gemini" -> "gemini-3.1-pro";
-					case "kimi" -> "kimi-code/k3";
-					case "cursor" -> "composer-2.5";
 					default -> "gpt-6-luna";
 				}, "medium", Optional.of(name), 0);
 	}

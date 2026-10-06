@@ -29,26 +29,10 @@
 			"serviceTier": "fast"
 		}
 	},
-	"kimi": {
-		"models": ["kimi-code/k3", "kimi-code/k3-256k", "kimi-code/kimi-for-coding", "kimi-code/kimi-for-coding-highspeed"],
-		"reasoningEfforts": ["low", "high", "max"],
-		"modelReasoningEfforts": {
-			"kimi-code/k3": ["low", "high", "max"],
-			"kimi-code/k3-256k": ["low", "high", "max"],
-			"kimi-code/kimi-for-coding": ["high"],
-			"kimi-code/kimi-for-coding-highspeed": ["high"]
-		},
+	"claude": {
+		"models": ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"],
+		"reasoningEfforts": ["low", "medium", "high"],
 		"planningTimeoutMs": 120000
-	},
-	"cursor": {
-		"models": ["composer-2.5", "grok-4.5", "grok-4.6"],
-		"modelReasoningEfforts": {
-			"composer-2.5": ["high"],
-			"grok-4.5": ["low", "medium", "high"],
-			"grok-4.6": ["low", "medium", "high", "xhigh"]
-		},
-		"planningTimeoutMs": 120000,
-		"catalogDiscovery": true
 	},
 	"limits": {
 		"agentCap": 16,

@@ -24,8 +24,9 @@ public final class ConsoleTheme {
 	public static final int CODEX = 0xFF42D39B;
 	public static final int GEMINI = 0xFF8E86FF;
 	public static final int ROSTER_GEMINI = 0xFF8E88FF;
-	public static final int KIMI = 0xFFFFB45E;
-	public static final int CURSOR = 0xFF70B9F2;
+	public static final int CLAUDE = 0xFFD97757;
+	// Slightly lighter Claude orange so roster text clears 4.5:1 on the selected surface.
+	public static final int ROSTER_CLAUDE = 0xFFE08A6D;
 
 	private ConsoleTheme() {
 	}
@@ -41,8 +42,7 @@ public final class ConsoleTheme {
 		return switch (provider.toLowerCase(Locale.ROOT)) {
 			case "codex" -> CODEX;
 			case "gemini", "antigravity" -> GEMINI;
-			case "kimi" -> KIMI;
-			case "cursor" -> CURSOR;
+			case "claude" -> CLAUDE;
 			default -> TEXT;
 		};
 	}
@@ -51,6 +51,7 @@ public final class ConsoleTheme {
 		if (provider == null) return TEXT;
 		return switch (provider.toLowerCase(Locale.ROOT)) {
 			case "gemini", "antigravity" -> ROSTER_GEMINI;
+			case "claude" -> ROSTER_CLAUDE;
 			default -> providerColor(provider);
 		};
 	}

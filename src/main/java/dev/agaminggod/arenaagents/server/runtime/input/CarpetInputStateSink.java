@@ -5,8 +5,10 @@ import carpet.script.utils.Tracer;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.server.CodexAgentManager;
 import dev.agaminggod.arenaagents.server.OfflineAgentPlayers;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.UUID;
 import java.util.WeakHashMap;
 import java.util.function.Supplier;
 import net.minecraft.core.BlockPos;
@@ -26,6 +28,8 @@ import net.minecraft.world.phys.Vec3;
 
 public final class CarpetInputStateSink implements InputStateSink {
 	private static final Map<EntityPlayerActionPack.Action, Boolean> ATTACK_PRESSES = new WeakHashMap<>();
+	/** Player UUID to agent: bodies whose entity melee arrives only as explicit operator clicks. */
+	private static final Map<UUID, AgentId> CLICK_ONLY_MELEE = new HashMap<>();
 	private static final ThreadLocal<AttackTarget> ATTACK_TARGET = new ThreadLocal<>();
 	private record AttackTarget(ServerPlayer player, HitResult hit) { }
 	private final CodexAgentManager manager;
@@ -115,12 +119,32 @@ public final class CarpetInputStateSink implements InputStateSink {
 		}
 		// Continuous Carpet attacks omit entity hits but reset attack strength every tick.
 		// A held key mines continuously; melee requires a press (release/repress repeats it).
-		if (!press || !player.isWithinEntityInteractionRange(entityHit.getEntity(), 0.0D)) return false;
+		// Operator takeover sends each melee click separately, so its held key never hits entities.
+		if (!press || meleeByClickOnly(player)
+				|| !player.isWithinEntityInteractionRange(entityHit.getEntity(), 0.0D)) return false;
 		player.attack(entityHit.getEntity());
 		player.swing(InteractionHand.MAIN_HAND);
 		player.resetAttackStrengthTicker();
 		player.resetLastActionTime();
 		return true;
+	}
+
+	/**
+	 * Marks a body whose entity melee arrives only as explicit clicks (operator takeover), so a held
+	 * attack press only mines. Any full input clear drops the mark; the operator re-marks on re-acquire.
+	 */
+	public static void setMeleeByClickOnly(AgentId agentId, UUID playerId, boolean enabled) {
+		Objects.requireNonNull(agentId, "agentId must not be null");
+		synchronized (CLICK_ONLY_MELEE) {
+			CLICK_ONLY_MELEE.values().removeIf(agentId::equals);
+			if (enabled) CLICK_ONLY_MELEE.put(Objects.requireNonNull(playerId, "playerId must not be null"), agentId);
+		}
+	}
+
+	static boolean meleeByClickOnly(ServerPlayer player) {
+		synchronized (CLICK_ONLY_MELEE) {
+			return !CLICK_ONLY_MELEE.isEmpty() && CLICK_ONLY_MELEE.containsKey(player.getUUID());
+		}
 	}
 
 	/** One-shot handoff to Carpet's getTarget, scoped to this original ATTACK invocation. */
@@ -161,6 +185,7 @@ public final class CarpetInputStateSink implements InputStateSink {
 
 	@Override
 	public void clear(AgentId agentId, AgentInputState previous) {
+		setMeleeByClickOnly(agentId, null, false);
 		CarpetActionArbitration.unbind(agentId);
 		ModelPlayerInputBridge.unbind(agentId);
 		ServerPlayer player = manager.findAgentPlayer(agentId).orElse(null);

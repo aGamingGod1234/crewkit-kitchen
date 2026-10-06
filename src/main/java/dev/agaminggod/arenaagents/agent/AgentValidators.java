@@ -7,7 +7,7 @@ public final class AgentValidators {
 	private static final String ERROR_EMPTY = "EMPTY_VALUE";
 	private static final String ERROR_TOO_LONG = "VALUE_TOO_LONG";
 	private static final String ERROR_CONTROL_CHARACTER = "CONTROL_CHARACTER";
-	private static final Set<String> PROVIDERS = Set.of("codex", "gemini", "kimi", "cursor");
+	private static final Set<String> PROVIDERS = Set.of("codex", "gemini", "claude");
 	private static final Set<String> SERVICE_TIERS = Set.of("priority", "fast");
 
 	private AgentValidators() {
@@ -24,7 +24,7 @@ public final class AgentValidators {
 	public static String requireProvider(String value) {
 		String provider = requireSingleLine(value, "provider", AgentConstants.MAX_MODEL_LENGTH).toLowerCase(Locale.ROOT);
 		if (!PROVIDERS.contains(provider)) {
-			throw failure("INVALID_PROVIDER", "provider must be codex, gemini, kimi, or cursor");
+			throw failure("INVALID_PROVIDER", "provider must be codex, gemini, or claude");
 		}
 		return provider;
 	}

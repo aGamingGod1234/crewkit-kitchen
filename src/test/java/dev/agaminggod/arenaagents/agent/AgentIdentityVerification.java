@@ -25,7 +25,7 @@ public final class AgentIdentityVerification {
 
 	public static int verify() {
 		AgentId id = new AgentId(UUID.fromString("193a9add-1234-5678-9abc-123456789abc"));
-		for (String brand : List.of("openai", "claude", "deepseek", "gemini", "kimi", "cursor")) {
+		for (String brand : List.of("openai", "claude", "deepseek", "gemini")) {
 			for (int variant = 0; variant < AgentVisualIdentity.INDIVIDUAL_VARIANT_COUNT; variant++) {
 				String texturePath = AgentVisualIdentity.brandTexturePath(brand, variant);
 				assertEquals("arenaagents:textures/entity/brand_" + brand + "_agent_" + variant + ".png",
@@ -34,7 +34,6 @@ public final class AgentIdentityVerification {
 			}
 		}
 		assertBodyColour("gemini", 0x4285F4);
-		assertBodyColour("cursor", 0xEDECEC);
 		expectIllegalArgument(() -> AgentVisualIdentity.brandTexturePath("unknown", 0),
 				"unknown company brand skin is rejected");
 		expectIllegalArgument(() -> AgentVisualIdentity.brandTexturePath("openai", 4),
@@ -74,12 +73,12 @@ public final class AgentIdentityVerification {
 		assertEquals(new AgentIdentity.SkinIdentity("codex", "sol", 2),
 				AgentIdentity.skinForPlayerName("Sol2_193A9ADD").orElseThrow(),
 				"recognizable player names retain the exact family and variant before the first client snapshot");
-		AgentIdentity.SkinIdentity currentTransport = AgentIdentity.skinForPlayerName("r22_193A9ADD").orElseThrow();
+		AgentIdentity.SkinIdentity currentTransport = AgentIdentity.skinForPlayerName("a12_193A9ADD").orElseThrow();
 		AgentVisualIdentity.Resolved currentTransportResolved = AgentVisualIdentity.resolveFamily(
 				currentTransport.provider(), currentTransport.modelFamily(), currentTransport.variant());
-		assertEquals("grok_46", currentTransportResolved.modelFamilyKey(),
+		assertEquals("sonnet", currentTransportResolved.modelFamilyKey(),
 				"current transport identity retains its exact manifest family");
-		assertEquals("arenaagents:textures/entity/cursor_grok_46_agent_2.png",
+		assertEquals("arenaagents:textures/entity/claude_sonnet_agent_2.png",
 				currentTransportResolved.texturePath(),
 				"current transport identity resolves the exact family and individual texture");
 		assertEquals(new AgentIdentity.SkinIdentity("codex", 2),
@@ -94,20 +93,38 @@ public final class AgentIdentityVerification {
 		assertEquals("arenaagents:textures/entity/codex_spark_agent_2.png", legacyFallback.texturePath(),
 				"historical blank-family fallback keeps its individual variant");
 		expectIllegalArgument(
-				() -> AgentVisualIdentity.resolveFamily("cursor", "not_a_family", 2),
+				() -> AgentVisualIdentity.resolveFamily("claude", "not_a_family", 2),
 				"malformed nonblank family is rejected instead of becoming a provider fallback"
 		);
-		assertEquals(new AgentIdentity.SkinIdentity("kimi", 2),
-				AgentIdentity.skinForPlayerName("K3Orch_193A9ADD").orElseThrow(),
-				"known digit-bearing legacy K3 names retain pre-snapshot skin fallback");
+		assertTrue(AgentIdentity.skinForPlayerName("K3Orch_193A9ADD").isEmpty(),
+				"retired Kimi legacy names no longer resolve to a provider skin");
 		assertTrue(AgentIdentity.skinForPlayerName("a1ice_12345678").isEmpty(),
 				"ordinary digit-bearing names with a legacy token suffix are rejected");
 		assertTrue(AgentIdentity.skinForPlayerName("ordinary_player").isEmpty(),
 				"ordinary player names are not mistaken for arena identities");
-		AgentProfile kimiLong = new AgentProfile(
-				"kimi", "kimi-code/k3-256k", "max", "priority", Optional.empty(), 1, AgentGameMode.SURVIVAL);
-		assertEquals("Kimi_K3_256K", AgentIdentity.playerName(id, kimiLong),
-				"digit-bearing model families remain readable and Minecraft-safe");
+		AgentProfile sonnet = new AgentProfile(
+				"claude", "claude-sonnet-5-5", "high", "priority", Optional.empty(), 1, AgentGameMode.SURVIVAL);
+		assertEquals("Claude_Sonnet_5", AgentIdentity.playerName(id, sonnet),
+				"a generated name cut at Minecraft's limit never ends on a separator");
+		assertEquals("Claude Sonnet 5.5", AgentIdentity.displayNameTag(sonnet),
+				"the visible tag keeps the full Claude model name");
+		AgentProfile allocatedCut = new AgentProfile(
+				"gemini", "claude-sonnet-4-6", "thinking", "priority",
+				Optional.of(AgentIdentity.allocatePublicName("Claude Sonnet 4.6", List.of())), 1, AgentGameMode.SURVIVAL);
+		assertEquals("Claude_Sonnet_4", AgentIdentity.playerName(id, allocatedCut),
+				"allocated names never end on a separator");
+		assertEquals("Claude Sonnet 4.6", AgentIdentity.displayNameTag(allocatedCut),
+				"a stored generated name is recognized and shows the model tag");
+		AgentProfile legacyCut = new AgentProfile(
+				"gemini", "claude-sonnet-4-6", "thinking", "priority", Optional.of("Claude_Sonnet_4_"), 1, AgentGameMode.SURVIVAL);
+		assertEquals("Claude_Sonnet_4", AgentIdentity.playerName(id, legacyCut),
+				"names stored with a trailing separator canonicalize to the trimmed form");
+		assertEquals("Claude Sonnet 4.6", AgentIdentity.displayNameTag(legacyCut),
+				"names stored with a trailing separator still show the model tag");
+		assertEquals("Claude_Opus_5_5", AgentIdentity.defaultPublicName("claude", "claude-opus-5-5"),
+				"Claude Opus default name");
+		assertEquals("Claude_Fable_5_1", AgentIdentity.defaultPublicName("claude", "claude-fable-5-1"),
+				"Claude Fable default name");
 		AgentProfile legacyVariant = new AgentProfile(
 				"codex", "gpt-5.6-sol", "high", "priority", Optional.empty(), 6, AgentGameMode.SURVIVAL);
 		assertEquals("GPT_5_6_Sol", AgentIdentity.playerName(id, legacyVariant),
@@ -169,11 +186,12 @@ public final class AgentIdentityVerification {
 				"Codex short label is canonical");
 		assertEquals("Gemini 3.1 Pro", AgentModelNames.displayName("gemini", "gemini-3.1-pro"),
 				"Gemini display name is canonical");
-		assertEquals("K2.7 Coding Highspeed",
-				AgentModelNames.displayName("kimi", "kimi-code/kimi-for-coding-highspeed"),
-				"Kimi display name is canonical");
-		assertEquals("Composer 2.5", AgentModelNames.displayName("cursor", "composer-2.5"),
-				"Cursor display name is canonical");
+		assertEquals("Claude Opus 5.5", AgentModelNames.displayName("claude", "claude-opus-5-5"),
+				"Claude Opus display name is canonical");
+		assertEquals("Claude Sonnet 5.5", AgentModelNames.displayName("claude", "claude-sonnet-5-5"),
+				"Claude Sonnet display name is canonical");
+		assertEquals("Claude Fable 5.1", AgentModelNames.displayName("claude", "claude-fable-5-1"),
+				"Claude Fable display name is canonical");
 
 		List<ModelCase> models = List.of(
 				new ModelCase("codex", "gpt-5.6-sol", "codex", "sol"),
@@ -184,14 +202,10 @@ public final class AgentIdentityVerification {
 				new ModelCase("gemini", "gemini-3.6-flash", "gemini", "flash"),
 				new ModelCase("gemini", "claude-sonnet-4-6", "gemini", "claude"),
 				new ModelCase("gemini", "gpt-oss-120b", "gemini", "oss"),
-				new ModelCase("kimi", "kimi-code/k3", "kimi", "k3"),
-				new ModelCase("kimi", "kimi-code/k3-256k", "kimi", "k3_long"),
-				new ModelCase("kimi", "kimi-code/kimi-for-coding", "kimi", "coding"),
-				new ModelCase("kimi", "kimi-code/kimi-for-coding-highspeed", "kimi", "coding_fast"),
-				new ModelCase("cursor", "composer-2.5", "cursor", "composer"),
-				new ModelCase("cursor", "grok-4.5", "cursor", "grok_45"),
-				new ModelCase("cursor", "grok-4.6", "cursor", "grok_46"),
-				new ModelCase("cursor", "cursor-next", "cursor", "cursor_next")
+				new ModelCase("claude", "claude-opus-5-5", "claude", "opus"),
+				new ModelCase("claude", "claude-sonnet-5-5", "claude", "sonnet"),
+				new ModelCase("claude", "claude-fable-5-1", "claude", "fable"),
+				new ModelCase("claude", "claude-future-9", "claude", "next")
 		);
 		Set<String> transportCodes = new HashSet<>();
 		Set<String> texturePaths = new HashSet<>();
@@ -204,14 +218,11 @@ public final class AgentIdentityVerification {
 				assertEquals(model.family(), resolved.modelFamilyKey(), "model resolves to its named family slot");
 				assertEquals(variant, resolved.individualVariant(), "all four individual variants resolve");
 				String expectedBrand = model.provider().equals("codex") ? "openai"
-						: model.provider().equals("kimi") ? "kimi"
-						: model.provider().equals("gemini") && model.family().equals("claude") ? "claude"
-						: model.provider().equals("gemini") ? "gemini" : "cursor";
-				if (expectedBrand != null) {
-					assertEquals(AgentVisualIdentity.brandTexturePath(expectedBrand, variant),
-							AgentVisualIdentity.renderTexturePath(resolved),
-							"provider render selects the persistent " + expectedBrand + " brand skin");
-				}
+						: model.provider().equals("claude") ? "claude"
+						: model.family().equals("claude") ? "claude" : "gemini";
+				assertEquals(AgentVisualIdentity.brandTexturePath(expectedBrand, variant),
+						AgentVisualIdentity.renderTexturePath(resolved),
+						"provider render selects the persistent " + expectedBrand + " brand skin");
 				assertTrue(resolved.texturePath().startsWith(
 						"arenaagents:textures/entity/" + model.provider() + "_"),
 						"texture stays in the provider's project namespace");
@@ -243,21 +254,15 @@ public final class AgentIdentityVerification {
 						"provider textures are byte-distinct");
 			}
 		}
-		assertEquals(64, texturePaths.size(), "manifest resolves exactly 64 agent texture artifacts");
+		assertEquals(48, texturePaths.size(), "manifest resolves exactly 48 agent texture artifacts");
 
-		AgentVisualIdentity.Resolved kimiK3 = AgentVisualIdentity.resolve("kimi", "kimi-code/k3", 0);
-		AgentVisualIdentity.Resolved kimiK3256 = AgentVisualIdentity.resolve("kimi", "kimi-code/k3-256k", 0);
-		assertEquals("K3", kimiK3.shortModelLabel(), "Kimi digit-bearing K3 label is preserved");
-		assertEquals("K3 256K", kimiK3256.shortModelLabel(), "Kimi digit-bearing K3 256K label is preserved");
-		assertTrue(!kimiK3.transportCode().equals(kimiK3256.transportCode()),
-				"Kimi digit-bearing families keep distinct transport identities");
-
-		AgentVisualIdentity.Resolved cursor = AgentVisualIdentity.resolve("cursor", "composer-1.5", 2);
-		assertEquals("cursor", cursor.providerKey(), "Cursor keeps its provider identity");
-		assertEquals("cursor", cursor.providerChassis(), "Cursor keeps its distinct chassis");
-		assertTrue(cursor.texturePath().contains("cursor_"), "Cursor never uses Codex art");
-		assertEquals(cursor, AgentVisualIdentity.resolveTransportCode(cursor.transportCode()).orElseThrow(),
-				"Cursor transport identity round-trips");
+		AgentVisualIdentity.Resolved claude = AgentVisualIdentity.resolve("claude", "claude-opus-5-5", 2);
+		assertEquals("claude", claude.providerKey(), "Claude keeps its own provider identity");
+		assertEquals("Opus 5.5", claude.shortModelLabel(), "Claude family label is readable");
+		assertEquals("arenaagents:textures/entity/brand_claude_agent_2.png", AgentVisualIdentity.renderTexturePath(claude),
+				"Claude agents render the Claude brand skin");
+		expectIllegalArgument(() -> AgentVisualIdentity.resolve("kimi", "kimi-code/k3", 0), "retired Kimi provider is rejected");
+		expectIllegalArgument(() -> AgentVisualIdentity.resolve("cursor", "composer-2.5", 0), "retired Cursor provider is rejected");
 
 		AgentVisualIdentity.Resolved unknown = AgentVisualIdentity.resolve("codex", "future-research-model-9", 3);
 		assertEquals("spark", unknown.modelFamilyKey(), "unknown model uses the declared provider fallback family");
@@ -275,13 +280,13 @@ public final class AgentIdentityVerification {
 		expectInvalidManifest(manifestWith(root -> root.addProperty("unexpected", true)),
 				"unknown keys [unexpected]", "unknown manifest key rejected");
 		expectInvalidManifest(manifestWith(root -> {
-			JsonObject cursorProvider = root.getAsJsonArray("providers").get(3).getAsJsonObject();
-			cursorProvider.addProperty("key", "codex");
-			cursorProvider.getAsJsonArray("families").forEach(family ->
+			JsonObject claudeProvider = root.getAsJsonArray("providers").get(2).getAsJsonObject();
+			claudeProvider.addProperty("key", "codex");
+			claudeProvider.getAsJsonArray("families").forEach(family ->
 					family.getAsJsonObject().getAsJsonArray("variants").forEach(variant -> {
 						JsonObject value = variant.getAsJsonObject();
 						value.addProperty("texturePath", value.get("texturePath").getAsString()
-								.replace("cursor_", "codex_"));
+								.replace("claude_", "codex_"));
 					}));
 		}), "duplicate provider: codex", "duplicate manifest provider rejected");
 		expectInvalidManifest(manifestWith(root -> root.getAsJsonArray("providers").get(0).getAsJsonObject()

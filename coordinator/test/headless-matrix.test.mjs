@@ -218,32 +218,31 @@ test('normalizes only supported concurrent roster sizes', () => {
 	}
 });
 
-test('accepts Cursor Composer and Grok scenarios through the same matrix schema', () => {
+test('accepts Claude scenarios through the same matrix schema', () => {
 	const matrix = normalizeHeadlessMatrix({ version: 1, scenarios: [
-		validScenario({ id: 'cursor-composer', provider: 'cursor', model: 'composer-2.5', reasoningEffort: 'high', serviceTier: 'priority' }),
-		validScenario({ id: 'cursor-grok', provider: 'cursor', model: 'grok-4.6', reasoningEffort: 'high', serviceTier: 'fast' }),
+		validScenario({ id: 'claude-opus', provider: 'claude', model: 'claude-opus-5-5', reasoningEffort: 'high', serviceTier: 'priority' }),
+		validScenario({ id: 'claude-fable', provider: 'claude', model: 'claude-fable-5-1', reasoningEffort: 'low', serviceTier: 'priority' }),
 	] });
-	assert.deepEqual(matrix.scenarios.map((scenario) => scenario.provider), ['cursor', 'cursor']);
+	assert.deepEqual(matrix.scenarios.map((scenario) => scenario.provider), ['claude', 'claude']);
+	assert.throws(() => normalizeHeadlessScenario(validScenario({ provider: 'cursor' }), 0), /unsupported provider 'cursor'/);
 });
 
-test('checked-in live matrix covers every provider with real model and setting combinations', () => {
+test('checked-in live matrix covers every native provider with real model and setting combinations', () => {
 	const matrix = normalizeHeadlessMatrix(JSON.parse(readFileSync(new URL('../config/headless-provider-matrix.json', import.meta.url), 'utf8')));
-	assert.equal(matrix.scenarios.length, 16);
-	for (const provider of ['codex', 'kimi', 'cursor']) {
-		const scenarios = matrix.scenarios.filter((scenario) => scenario.provider === provider);
-		assert.ok(new Set(scenarios.map((scenario) => scenario.model)).size >= 2, `${provider} needs at least two models`);
-		for (const model of new Set(scenarios.map((scenario) => scenario.model))) {
-			assert.ok(new Set(scenarios.filter((scenario) => scenario.model === model).map((scenario) => `${scenario.reasoningEffort}/${scenario.serviceTier}`)).size >= 2, `${provider}/${model} needs two settings`);
-		}
-		assert.ok(scenarios.every((scenario) => ['codex-luna-xhigh-fast-mine-oak-log', 'codex-luna-xhigh-fast-wooden-pickaxe'].includes(scenario.id)
-			? scenario.requireFactualSuccess && scenario.assertions.some((assertion) => assertion.type === 'rcon')
-			: scenario.id === 'codex-sol-low-priority'
-				? scenario.assertions.some((assertion) => assertion.type === 'action' && assertion.actionType === 'navigate_to')
-			: scenario.provider === 'codex'
-				? ['chat', 'action'].every((type) => scenario.assertions.some((assertion) => assertion.type === type))
-				: ['chat', 'action', 'program'].every((type) => scenario.assertions.some((assertion) => assertion.type === type))));
+	assert.equal(matrix.scenarios.length, 9);
+	const codex = matrix.scenarios.filter((scenario) => scenario.provider === 'codex');
+	for (const model of new Set(codex.map((scenario) => scenario.model))) {
+		assert.ok(new Set(codex.filter((scenario) => scenario.model === model).map((scenario) => `${scenario.reasoningEffort}/${scenario.serviceTier}`)).size >= 2, `codex/${model} needs two settings`);
 	}
-	assert.deepEqual([...new Set(matrix.scenarios.filter((scenario) => scenario.provider === 'cursor').map((scenario) => scenario.model))], ['composer-2.5', 'grok-4.5', 'grok-4.6']);
+	const claude = matrix.scenarios.filter((scenario) => scenario.provider === 'claude');
+	assert.deepEqual(claude.map((scenario) => scenario.model), ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-fable-5-1']);
+	assert.deepEqual(claude.map((scenario) => scenario.reasoningEffort).sort(), ['high', 'low', 'medium']);
+	assert.ok(claude.every((scenario) => scenario.serviceTier === 'priority'));
+	assert.ok(matrix.scenarios.every((scenario) => ['codex-luna-xhigh-fast-mine-oak-log', 'codex-luna-xhigh-fast-wooden-pickaxe'].includes(scenario.id)
+		? scenario.requireFactualSuccess && scenario.assertions.some((assertion) => assertion.type === 'rcon')
+		: scenario.id === 'codex-sol-low-priority'
+			? scenario.assertions.some((assertion) => assertion.type === 'action' && assertion.actionType === 'navigate_to')
+			: ['chat', 'action'].every((type) => scenario.assertions.some((assertion) => assertion.type === type))));
 	assert.deepEqual([...new Set(matrix.scenarios.map((scenario) => scenario.rosterSize))].sort((left, right) => left - right), [1, 8, 16]);
 });
 

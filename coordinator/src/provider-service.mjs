@@ -61,7 +61,7 @@ export class ProviderService extends EventEmitter {
 			if (service === null || service === undefined) throw new TypeError(`${provider} service is required`);
 			return [provider, service];
 		}));
-		for (const provider of ['codex', 'gemini', 'kimi']) if (!this.#services.has(provider)) throw new TypeError(`${provider} service is required`);
+		for (const provider of ['codex', 'gemini', 'claude']) if (!this.#services.has(provider)) throw new TypeError(`${provider} service is required`);
 		this.catalog = new CombinedProviderCatalog(this.#services, {
 			execute: (provider, operation) => this.#execute(provider, operation, 'catalog', { recordSuccess: false }),
 			recordOutcome: (provider, source, recovery) => this.#recordCatalogOutcome(provider, source, recovery),

@@ -17,6 +17,7 @@ import dev.agaminggod.arenaagents.server.voice.VoiceDirector;
 import dev.agaminggod.arenaagents.server.goal.GoalVerificationRuntime;
 import dev.agaminggod.arenaagents.server.goal.GoalSubmission;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationCollector;
+import dev.agaminggod.arenaagents.server.pov.PovSessionRuntime;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
 import dev.agaminggod.arenaagents.scenario.runtime.ScenarioRuntimeService;
 import java.util.Map;
@@ -105,6 +106,8 @@ public final class CodexAgentServerRuntime {
 		if (registered) {
 			return;
 		}
+		// Takeover sessions drive the agent body through Carpet; install the factory before any session can start.
+		dev.agaminggod.arenaagents.server.pov.CarpetOperatorBodyController.register();
 		ServerLifecycleEvents.SERVER_STARTED.register(CodexAgentServerRuntime::start);
 		ServerChunkEvents.CHUNK_LOAD.register((level, chunk, newChunk) ->
 				((WorldMutationRevisionAccess) level).arenaagents$recordWorldMutation(chunk.getPos().getWorldPosition()));
@@ -120,6 +123,7 @@ public final class CodexAgentServerRuntime {
 			VoiceConsentRegistry.playerConnected(server, handler.getPlayer().getUUID());
 		});
 		ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
+			PovSessionRuntime.onPlayerDisconnect(handler.getPlayer());
 			SkitActors.disconnected(handler.getPlayer());
 			VoiceConsentRegistry.playerDisconnected(server, handler.getPlayer().getUUID());
 		});
@@ -131,6 +135,7 @@ public final class CodexAgentServerRuntime {
 			);
 		});
 		ServerLivingEntityEvents.AFTER_DEATH.register(CodexAgentServerRuntime::recordAttributedKill);
+		PovSessionRuntime.registerEvents();
 		net.fabricmc.fabric.api.event.lifecycle.v1.ServerEntityEvents.ENTITY_UNLOAD.register((entity, level) -> {
 			if (!(entity instanceof net.minecraft.world.entity.boss.enderdragon.EnderDragon dragon)) return;
 			var reason = dragon.getRemovalReason();
@@ -316,6 +321,8 @@ public final class CodexAgentServerRuntime {
 		if (!RESTORED_SERVERS.contains(server)) return;
 		MultiplexedServerBridge bridge = bridge(server);
 		if (bridge != null) bridge.startTick();
+		// Operator takeover input lands before input arbitration, so it is applied the tick it arrives.
+		PovSessionRuntime.tick(server);
 		// Admission renews/releases leases first. Use-only input must then run before player physics;
 		// combined use/attack still arbitrates in Carpet's player-tick hook, once per server tick.
 		AgentInputRuntime.tick(server);
@@ -587,6 +594,8 @@ public final class CodexAgentServerRuntime {
 		CoordinatorProcessSupervisor supervisor = COORDINATORS.remove(server);
 		BridgeSlot bridgeSlot = BRIDGE_SLOTS.remove(server);
 		try {
+			// Ends POV sessions while the manager can still resume taken-over agents.
+			PovSessionRuntime.release(server);
 			VoiceDirector.release(server);
 			VoiceSubsystemRuntime.close(server);
 			VoiceConsentRegistry.clear(server);

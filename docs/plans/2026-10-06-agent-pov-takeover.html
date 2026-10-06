@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent POV spectating and takeover: implementation plan</title>
+<style>
+  :root { --ink:#1b1f24; --muted:#5b6672; --line:#d9dee3; --soft:#f4f6f8; --accent:#b4552f; --ok:#2f7a4f; --warn:#9a6b00; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:16px/1.55 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color:var(--ink); background:#fff; }
+  main { max-width:860px; margin:0 auto; padding:24px 18px 64px; }
+  h1 { font-size:1.7rem; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:1.25rem; margin:36px 0 10px; padding-top:14px; border-top:1px solid var(--line); }
+  h3 { font-size:1.02rem; margin:22px 0 6px; }
+  p { margin:8px 0; }
+  ul, ol { padding-left:22px; margin:6px 0; }
+  li { margin:4px 0; }
+  code { font:0.92em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background:var(--soft); padding:1px 5px; border-radius:4px; }
+  pre { background:var(--soft); padding:12px; border-radius:6px; overflow-x:auto; font-size:0.86em; line-height:1.45; }
+  .meta { color:var(--muted); font-size:0.93rem; margin-bottom:18px; }
+  .status { display:inline-block; padding:3px 10px; border-radius:999px; background:#fff3e6; color:var(--accent); font-weight:600; font-size:0.85rem; }
+  .box { border:1px solid var(--line); border-left:4px solid var(--accent); border-radius:6px; padding:10px 14px; margin:12px 0; background:#fff; }
+  .box.ok { border-left-color:var(--ok); }
+  .box.warn { border-left-color:var(--warn); }
+  table { border-collapse:collapse; width:100%; margin:10px 0; font-size:0.93rem; }
+  th, td { text-align:left; vertical-align:top; padding:7px 8px; border-bottom:1px solid var(--line); }
+  th { background:var(--soft); font-weight:600; }
+  .scroll { overflow-x:auto; }
+  .small { color:var(--muted); font-size:0.9rem; }
+  dl { margin:6px 0; }
+  dt { font-weight:600; margin-top:8px; }
+  dd { margin:2px 0 0 0; }
+</style>
+</head>
+<body>
+<main>
+<h1>Agent POV spectating and takeover</h1>
+<div class="meta">Arena Agents (Fabric, Minecraft 26.1.2) · Plan written 2026-10-06 · <span class="status">Implemented on branch codex/agent-pov-and-claude-provider; awaiting live client QA</span></div>
+
+<p>This plan covers two operator features: <code>/spectator &lt;agent&gt;</code> (see exactly what an agent sees, including its HUD, screens and death) and <code>/takeover &lt;agent&gt;</code> (your inputs drive the agent's body while its model is paused). It also records the small goal-system change you asked for. It is based on six parallel investigations of the vanilla 26.1.2 bytecode, Carpet, and the mod's own code; file references are to the current working tree.</p>
+
+<h2>Goal</h2>
+<ul>
+  <li><strong>Spectator:</strong> from an operator's chat, <code>/spectator &lt;agent&gt;</code> switches the view to the agent's first-person camera and shows the agent's hotbar, selected slot, hearts, food, armor, air, XP, effects, crosshair, open container screens and death screen. The operator's own body stays where it is. <code>/spectator exit</code> returns.</li>
+  <li><strong>Takeover:</strong> <code>/takeover &lt;agent&gt;</code> does the same and also routes WASD, mouse look, jump, sneak, sprint, attack, use, hotbar, drop, swap, inventory and container clicks to the agent. The agent's LLM control is paused and resumes on exit. The operator's own body stays in the world and vulnerable; if it loses 2 hearts (4 HP, health plus absorption) during the takeover, the takeover ends at once. <code>/takeover exit</code> ends it manually.</li>
+  <li>Operator permission (vanilla game-master level, the same gate as every other <code>/codex</code> mutation) is required for both.</li>
+</ul>
+
+<h2>What the investigation found</h2>
+<p>These facts shaped the design. Each was checked against bytecode or source, not assumed.</p>
+<ol>
+  <li><strong>Vanilla spectating cannot be reused.</strong> <code>ServerPlayer.setCamera</code> teleports your body to the target and <code>ServerPlayer.tick</code> snaps it there every tick; sneaking exits. That is exactly what you see today, and it breaks "my body stays there". The camera must be switched by our client mod, with the server streaming the agent's state.</li>
+  <li><strong>The vanilla HUD already reads the camera entity</strong> for the hotbar, hearts, armor and air (<code>Gui.getCameraPlayer()</code>), but food, XP, effects, the real selected slot and hotbar slots 1 to 8 are never sent to other clients for a remote player, and several HUD gates check <em>your</em> game mode. So the HUD needs a data feed from the server plus a few targeted client mixins.</li>
+  <li><strong>A vanilla client cannot hold chunks around two places.</strong> Its chunk storage is one square around a single centre. A "union view" (your body plus the agent) is impossible. The workable approach is to move your chunk and entity tracking to the agent while your body's chunk stays loaded by its own server ticket, so the body remains simulated and vulnerable.</li>
+  <li><strong>The agent's body already runs real vanilla server physics.</strong> Carpet applies forward/strafe, look, sneak, sprint, jump and use through the normal <code>LivingEntity.travel</code> path, so walking, water, ladders, edges, mining progress, eating, bows and block placement will feel right. Two gaps matter: the current attack path only breaks blocks (a held attack never hits entities), and the shared input sink resets mining when any other input changes.</li>
+  <li><strong>The mod already has the pieces for input ownership and pausing.</strong> <code>LeasedServerInputController</code> arbitrates input by priority; skit mode has a reservation gate (<code>requireNormalControlAllowed</code>) that blocks normal control; stop/resume already cancels the running LLM turn and in-flight actions on both the Java and coordinator sides.</li>
+  <li><strong>Operator damage can be observed without a mixin</strong> using Fabric's bundled <code>ServerLivingEntityEvents.ALLOW_DAMAGE</code>/<code>AFTER_DAMAGE</code>.</li>
+  <li>No naming collisions: vanilla has <code>/spectate</code> but no <code>/spectator</code> or <code>/takeover</code>; Carpet registers neither. Internally, "spectator" already means the public arena view (<code>ArenaSpectatorState</code> etc.), so new classes use the name <code>Pov</code>.</li>
+</ol>
+
+<h2>Design overview</h2>
+<pre>
+Operator client                     Server                                  Coordinator (Node)
+---------------                     ------                                  ------------------
+/spectator or /takeover ─────────▶ PovSessionRuntime
+                                    ├─ reservation on the agent ──────────▶ stop (takeover only)
+                                    ├─ chunk + entity view follows agent
+                                    ├─ AgentPovStatePayload every tick ──┐
+PovClient                          │                                     │
+  camera = agent RemotePlayer  ◀───┘                                     │
+  HUD proxy player (stand-in)                                            │
+  input capture (takeover) ──────▶ OperatorInputPayload (every tick)      │
+                                    └─ OPERATOR input lease → Carpet body │
+/takeover exit, body damage,        PovSessionRuntime.exit                │
+ disconnect, agent removed ──────▶  ├─ release lease, close screens        │
+                                    ├─ resume ───────────────────────────▶ resume + summary note
+                                    └─ PovStopPayload, body resync
+</pre>
+
+<h2>Commands and behaviour</h2>
+<div class="scroll"><table>
+<tr><th>Command</th><th>Effect</th></tr>
+<tr><td><code>/spectator &lt;agent&gt;</code></td><td>Starts a read-only POV session. Several operators may spectate the same agent.</td></tr>
+<tr><td><code>/spectator exit</code></td><td>Ends your POV session.</td></tr>
+<tr><td><code>/takeover &lt;agent&gt;</code></td><td>Starts a takeover. Exclusive per agent. Pauses the model (if the agent was active), takes an OPERATOR input lease.</td></tr>
+<tr><td><code>/takeover exit</code></td><td>Ends the takeover, releases the body, resumes the model.</td></tr>
+<tr><td><code>/codex spectate|takeover &lt;agent&gt;</code></td><td>Aliases so the in-game console can keep its "codex op" command pattern.</td></tr>
+</table></div>
+<ul>
+  <li>Agents are addressed as everywhere else: name, short id or UUID (<code>agentArgument()</code>). The literal <code>exit</code> wins over an agent literally named "exit"; that agent stays reachable by id.</li>
+  <li>Automatic exits: operator disconnects, dies, is teleported or changes dimension, loses operator permission; agent removed, agent changes dimension; server stops; a skit or scenario claims the agent; another operator takes over the same agent (rejected by default, see decisions).</li>
+  <li>Takeover-only automatic exit: the operator's body loses 4.0 HP or more in total (health plus absorption) since the takeover began, or the body dies.</li>
+  <li>An "Exit agent view" keybind (default unbound, in the existing Arena Agents key category) sends the exit command, so you are never stuck in a screen.</li>
+  <li>Chat still works during both modes so you can type the exit command.</li>
+</ul>
+
+<h2>Server design</h2>
+<h3>Session runtime</h3>
+<ul>
+  <li><code>server/pov/PovSessionRuntime</code>: per-server map like <code>SkitModeRuntime</code>; sessions keyed by operator UUID with an index of agent to takeover owner. Ticked from <code>CodexAgentServerRuntime.endTick</code> after the bridge and before <code>AgentInputRuntime.tick</code>; released on server stop before the manager; hooked to player disconnect.</li>
+  <li><code>PovSession</code>: operator, agent id, mode, state before takeover, resume-on-exit flag, input lease, accumulated body damage, start snapshot for the summary, last published revision.</li>
+  <li>The agent's <code>ServerPlayer</code> is re-resolved every tick by identity (never cached), because connected respawns replace the object.</li>
+</ul>
+
+<h3>Pausing the model (takeover)</h3>
+<p>Reuse stop/resume; do not add a lifecycle state (it would ripple through the coordinator enum, codecs and protocol). Add a transient <code>AgentControlReservations</code> gate that generalises skit mode's exclusivity and is checked by start, steer, resume, queue, skit play/place and the conversation router (which today can auto-resume a paused agent on speech).</p>
+<div class="scroll"><table>
+<tr><th>Agent state at takeover start</th><th>On start</th><th>On exit</th></tr>
+<tr><td>STARTING, PLANNING, ACTING</td><td><code>stop</code> (cancels the running turn and actions on both sides)</td><td><code>resume</code> (same goal continues)</td></tr>
+<tr><td>DISCONNECTED</td><td><code>stop</code> so recovery cannot re-arm it mid-takeover</td><td><code>resume</code></td></tr>
+<tr><td>PAUSED</td><td>nothing</td><td>nothing (respect the earlier pause)</td></tr>
+<tr><td>IDLE, COMPLETED, ERROR</td><td>gate only</td><td>nothing</td></tr>
+<tr><td>DEAD</td><td>remember <code>resumeAfterRespawn</code></td><td>resume if it was set</td></tr>
+</table></div>
+<ul>
+  <li>Backstop: if a reserved agent ever becomes active, the next session tick stops it again.</li>
+  <li>After resume, the model gets one short conversation event (existing <code>PLAYER_STEER</code> kind, max 512 chars): "An operator controlled your body for 42 s: moved 37 blocks, health 20 to 14, +3 oak_log, died once." A dedicated protocol field can replace this later.</li>
+  <li>Conversation-only turns for PAUSED agents are suppressed while reserved, so the agent does not chat while possessed.</li>
+</ul>
+
+<h3>Seeing the agent's surroundings</h3>
+<ul>
+  <li>Two <code>@ModifyExpressionValue</code> mixins in <code>ChunkMap</code>: in <code>updateChunkTracking</code> replace <code>player.chunkPosition()</code> with the agent's, and in <code>TrackedEntity.updatePlayer</code> replace <code>player.position()</code> with the agent's, for operators in a session in the same dimension. Same redirect in <code>PlayerChunkSender.sendNextChunks</code> so nearest chunks arrive first. Vanilla then sends the cache-centre packet and chunk diffs itself.</li>
+  <li>Call <code>chunkSource.move(operator)</code> whenever the agent changes chunk section so entity visibility is re-evaluated immediately.</li>
+  <li>The body's chunk ticket uses the body's real position, so the body's area stays loaded and ticking server-side.</li>
+  <li>Sounds and particles are broadcast around the body's position in vanilla (<code>PlayerList.broadcast</code>, <code>ServerLevel.sendParticles</code>, block cracks). One wrap each uses the agent's position for session operators so you hear what the agent hears.</li>
+  <li>v1 limitation: when the agent changes dimension the session ends with a message. Cross-dimension viewing would need a client level switch.</li>
+</ul>
+
+<h3>Publishing the agent's state</h3>
+<ul>
+  <li>Clientbound <code>AgentPovStatePayload</code>, sectioned with a bitmask and revision, following the FULL/DELTA style of the arena spectator snapshots. Sections: header (session id, mode, agent UUID, entity id hint, dimension), pose (yaw, pitch, every tick), vitals (health, max, absorption, armor, food, saturation, air, XP, attack strength, game mode, flags), inventory (selected slot, 9 hotbar, offhand, 4 armor stacks with heavy components stripped), effects, open menu descriptor, death state and message. Typical 150 to 400 bytes; sent only on change except pose.</li>
+  <li>Clientbound <code>AgentPovMenuPayload</code> for container contents (slots, carried stack, data slots) whenever the agent's menu changes.</li>
+  <li>Item diffing must use <code>ItemStack.matches</code>; stacks have no value equality.</li>
+</ul>
+
+<h3>Applying operator input (takeover)</h3>
+<ul>
+  <li>New <code>InputOwner.OPERATOR</code> at priority 1000 (above INTERACTION 300). The session holds the lease and re-acquires it when any lifecycle event clears leases (death capture, respawn, transitions), the same way <code>ServerActionExecutor</code> handles stale leases.</li>
+  <li>Continuous input (forward, strafe, jump, sneak, sprint, use held, attack held for mining, yaw, pitch, slot) arrives in <code>OperatorInputPayload</code> every client tick and goes through the existing lease controller into <code>AgentInputState</code>. If packets stop, the existing 40-tick deadman neutralises the body.</li>
+  <li>One-shot actions (<code>OperatorActionPayload</code>): attack click, drop, drop stack, swap hands, pick block, container click/button/close, open inventory, respawn. Attack clicks raycast server-side and hit entities once per click with vanilla cooldown; a held attack only mines. Drop/swap/pick relay the matching vanilla handlers on the agent's own connection so vanilla validation runs against the agent.</li>
+  <li>Two bug-level fixes to the shared sink: changing one input must not <code>stopAll()</code> (today releasing jump aborts mining), and sneak must win over sprint. These also improve model control and will be covered by the existing input tests.</li>
+  <li>Known Carpet gotchas to verify at runtime: fake players report <code>hasClientLoaded()</code> false for about 60 ticks after spawn or respawn (call <code>handleAcceptPlayerLoad</code> on session start), and <code>awaitingPositionFromClient</code> may stay set after a teleport and silently block use-on-block (clear it through an accessor).</li>
+</ul>
+
+<h3>Safety and exit</h3>
+<ul>
+  <li>Body damage: <code>ALLOW_DAMAGE</code> records health plus absorption, <code>AFTER_DAMAGE</code> adds the drop to the session total; at 4.0 or more, or on body death, the takeover exits before the next tick.</li>
+  <li>Exit order: release the lease and send one all-released input frame, close the agent's mirrored menu, restore the lifecycle (resume), send the summary note, stop view redirection, send the stop payload, then resync the operator's own client (position re-send so the client copy of the body snaps back to the server position; chunk centre returns to the body automatically).</li>
+  <li>Creative operators never take damage, so the 4 HP rule is inert for them; the session badge says so.</li>
+</ul>
+
+<h2>Client design</h2>
+<ul>
+  <li><code>client/pov/PovClient</code> state machine: NONE, ACTIVE(mode, agent UUID, session id), SIGNAL_LOST. The server owns entry and exit through payloads; client-initiated exits send the exit command so permission checks stay server-side.</li>
+  <li><strong>Camera:</strong> <code>Minecraft.setCameraEntity(agentRemotePlayer)</code> directly, re-bound by UUID every tick (survives respawn and re-tracking), first person forced, eye height seeded through the existing <code>CameraEyeHeightAccessor</code>. Vanilla then hides the agent's own body, aligns the crosshair and block outline with what the agent looks at, and handles sneak and swim eye height. When the agent entity is missing (dead and removed, out of tracking), fall back to the marker-entity technique from <code>CameraDirectorClient</code> at the last pose with a "signal lost" badge. Director playback is stopped on entry and refused while active; <code>SpectatorCameraAssistant</code> already disables itself when the camera is not the local player.</li>
+  <li><strong>Rotation:</strong> a small mixin on the agent's view yaw/pitch returns the exact float from the payload (spectating) or the local predicted look (takeover), so the view is not quantised to packet precision and mouse look has no round-trip lag.</li>
+  <li><strong>HUD:</strong> an unregistered stand-in <code>RemotePlayer</code> (never added to the level) is filled from the payload: inventory, selected slot, food, XP, health, absorption, air, armor attribute, effects. <code>Gui.getCameraPlayer()</code> returns this stand-in, so vanilla draws the agent's hotbar, hearts, food, armor and air unchanged. Small wraps fix the remaining reads of the local player: game-mode gates (<code>getPlayerMode</code>, <code>canHurtPlayer</code>, <code>hasExperience</code>), XP level and bar, effects, the attack indicator and the held-item name. Your own player object is never modified, which is why exit needs no resync of the client HUD.</li>
+  <li><strong>Session badge:</strong> one small element attached after the hotbar via Fabric's <code>HudElementRegistry</code>: agent name, mode, and in takeover your own body's HP against the 4 HP exit threshold, flashing when the body takes damage. This is session-scoped, not a persistent world overlay, so it respects the existing "no persistent HUD" rule.</li>
+  <li><strong>Input capture (both modes keep your body still):</strong> <code>KeyboardInput.tick</code> TAIL copies then zeroes key presses and the move vector (no movement, no input packet); <code>Minecraft.handleKeybinds</code> HEAD drains hotbar, drop, swap, inventory, attack, use and pick clicks; <code>startAttack</code>, <code>continueAttack</code>, <code>startUseItem</code> and <code>pickBlockOrEntity</code> are cancelled while active; <code>MouseHandler.turnPlayer</code> feeds the predicted look instead of your body; hotbar scroll is captured. Spectating discards the captured input; takeover sends it every tick.</li>
+  <li><strong>Screens:</strong> container screens are built from the mirrored menu type and the stand-in's inventory, filled from <code>AgentPovMenuPayload</code>, and never touch <code>LocalPlayer.containerMenu</code> or vanilla container packets (container id 0 would otherwise overwrite your own inventory). Spectating blocks clicks; takeover sends click/button/close actions. The player inventory (E) is a mirrored inventory screen for the agent.</li>
+  <li><strong>Death:</strong> a custom <code>AgentPovDeathScreen</code> with the vanilla look, the death cause, and buttons: Respawn (takeover only, routed through the manager's verified respawn path, never a raw respawn packet) and Leave. Spectators see "Waiting for respawn". It closes when the agent is alive again.</li>
+  <li>v1 hides first-person hands. Rendering the agent's arm and held item is a later polish item.</li>
+</ul>
+
+<h2>Networking summary</h2>
+<div class="scroll"><table>
+<tr><th>Payload</th><th>Direction</th><th>Cadence</th><th>Size</th></tr>
+<tr><td><code>AgentPovStatePayload</code></td><td>server → client</td><td>pose every tick, other sections on change</td><td>150 to 400 B typical, 64 KiB cap</td></tr>
+<tr><td><code>AgentPovMenuPayload</code></td><td>server → client</td><td>on menu change</td><td>0.5 to 2 KB</td></tr>
+<tr><td><code>PovStopPayload</code></td><td>server → client</td><td>once</td><td>tiny</td></tr>
+<tr><td><code>OperatorInputPayload</code></td><td>client → server</td><td>every client tick (takeover)</td><td>about 25 B</td></tr>
+<tr><td><code>OperatorActionPayload</code></td><td>client → server</td><td>on click</td><td>tiny</td></tr>
+</table></div>
+<p class="small">All payloads are bounded records with constructor checks, registered next to <code>AgentControlSync.register()</code>, and the server re-checks operator permission inside every receiver, as the existing scenario payloads do.</p>
+
+<h2>Also queued: goal-translation model forcing</h2>
+<p>Separate from POV and small. When a player's request is translated into a goal (the goal system, <code>AgentPlanner.requestGoalSpec</code>), the translator currently uses the agent's own model. Change: Codex agents always translate with <code>gpt-5.6-luna</code> (effort clamped so <code>ultra</code> becomes <code>max</code>); Claude agents always translate with <code>claude-sonnet-5-5</code>; Gemini unchanged. The agent's own model is still used for everything else. One planner change plus a test; no Java changes.</p>
+
+<h2>Steps and status</h2>
+<div class="box ok"><strong>Status 2026-10-06 (evening):</strong> steps 0 to 5 are implemented and integrated on <code>codex/agent-pov-and-claude-provider</code>. Verified: Java compile (main, client, test), <code>verifyCore</code> 2,526,526 assertions (incl. 400+ new POV checks: reservations, exit rules, 3.9 vs 4.0 HP boundary with absorption, lifecycle table, codec round-trips, input packing, state diffing, summary text), <code>verifyPovMixins</code> (all 26 mixin target classes transform under Fabric Knot), full <code>check build</code>, coordinator suite 2,644 pass. Not yet verified: anything that needs a running client (camera, HUD, screens, input feel, chunk following, sounds). Step 6 remains future polish.</div>
+<div class="scroll"><table>
+<tr><th>#</th><th>Step</th><th>Size</th><th>Deliverable</th><th>Status</th></tr>
+<tr><td>0</td><td>Goal-translation model forcing (planner + test)</td><td>S</td><td>Luna / Sonnet 5.5 at medium effort for goal drafts</td><td>Done, tested</td></tr>
+<tr data-step="1"><td>1</td><td>Server session runtime, commands, reservation gate, payload definitions, chunk/entity view redirect, sound anchor</td><td>L</td><td>Server streams POV state; operator view follows the agent</td><td>Done, built and unit-verified; live QA pending</td></tr>
+<tr data-step="2"><td>2</td><td>Client PovClient: camera binding, HUD stand-in and Gui wraps, input neutralisation, badge, exit/restore</td><td>L</td><td><code>/spectator</code> works with full HUD</td><td>Done, built and unit-verified; live QA pending</td></tr>
+<tr data-step="3"><td>3</td><td>Mirrored container screens (read-only), effects, death screen, signal-lost fallback</td><td>M</td><td><code>/spectator</code> complete</td><td>Done, built and unit-verified; live QA pending</td></tr>
+<tr data-step="4"><td>4</td><td>Takeover input: OPERATOR lease, input/action payloads, click-edge attack, drop/swap/pick, sink fixes, lifecycle stop/resume, body-damage exit, summary note</td><td>L</td><td><code>/takeover</code> without menus</td><td>Done, built and unit-verified; live QA pending</td></tr>
+<tr data-step="5"><td>5</td><td>Takeover menus (click relay, E inventory), respawn from death screen, Carpet runtime gotchas verified</td><td>M</td><td><code>/takeover</code> complete</td><td>Done, built and unit-verified; live QA pending</td></tr>
+<tr><td>6</td><td>Polish: first-person hands, crosshair reach, sprint/hunger rules, console buttons (after A/B/C mockups), persisted reservation marker for crash recovery</td><td>M</td><td>Feature feels native</td><td>Later</td></tr>
+</table></div>
+<p>Steps 1 and 2 are the foundation and land together as the first in-game check. Each step ends with its tests passing and, where it changes what you see, a short live check in the real client with your go-ahead.</p>
+
+<h2>Decisions already made</h2>
+<dl>
+  <dt>Client-side camera switch, not vanilla spectating</dt><dd>Vanilla moves the body; ours cannot.</dd>
+  <dt>Chunk and entity tracking follow the agent; the body stays loaded by its own ticket</dt><dd>A union view is impossible on a vanilla client. Your own surroundings stop rendering while you are in POV; nothing about the body changes server-side.</dd>
+  <dt>HUD from a stand-in player, not by mirroring the agent's packets into your player</dt><dd>Mirroring would fight the server's own health/XP/inventory packets, could corrupt your client inventory (container id 0), and would hide your own body's health. The stand-in makes exit free.</dd>
+  <dt>Reuse stop/resume plus a reservation gate, no new lifecycle state</dt><dd>Keeps the coordinator protocol untouched.</dd>
+  <dt>Operator input rides the existing lease system</dt><dd>Model leases lose arbitration automatically; one-shot actions bypass the sink.</dd>
+  <dt>Internal name <code>Pov</code>, commands <code>/spectator</code> and <code>/takeover</code></dt><dd>"Spectator" is taken internally by the arena view; the commands keep your wording.</dd>
+</dl>
+
+<h2>Decisions needed from you</h2>
+<ol>
+  <li><strong>Second operator takes over an agent already taken over:</strong> reject (recommended) or preempt?</li>
+  <li><strong>Spectator mode and body damage:</strong> leave spectating passive (recommended; the badge still shows your body HP) or also exit at 2 hearts?</li>
+  <li><strong>Agent death during takeover with an automatic respawn policy:</strong> show the death screen and wait for your Respawn click (recommended) or let the policy respawn it on its own?</li>
+  <li><strong>Forced first person, F5 blocked:</strong> fine for v1?</li>
+  <li><strong>Creative operators:</strong> allow takeover with the damage rule inert (recommended) or require survival/adventure?</li>
+  <li><strong>Agent dimension change:</strong> end the session with a message (v1 recommended) or hold a "signal lost" view until it returns?</li>
+  <li><strong>Summary note to the model after a takeover:</strong> yes via a conversation event (recommended), or nothing?</li>
+  <li><strong>Goal-translation forcing:</strong> confirm Luna for Codex and Sonnet 5.5 for Claude, with the agent's own reasoning effort kept where supported.</li>
+</ol>
+
+<h2>Risks</h2>
+<div class="scroll"><table>
+<tr><th>Risk</th><th>Impact</th><th>Mitigation</th></tr>
+<tr><td>Takeover movement lag (server-simulated body, no client prediction)</td><td>Movement feels about one round trip plus interpolation behind; on LAN or localhost roughly 100 to 250 ms</td><td>Look is predicted locally and lag-free; position prediction is a later option if it feels bad</td></tr>
+<tr><td>Mixin fragility on 26.1 (renamed HUD internals)</td><td>Build breaks on Minecraft updates</td><td>Only <code>@WrapOperation</code>/<code>@ModifyExpressionValue</code>, <code>defaultRequire: 1</code>, covered by <code>verifyCameraMixin</code>-style checks</td></tr>
+<tr><td>Carpet fake-player quirks (<code>hasClientLoaded</code>, stuck teleport flag)</td><td>Use-on-block silently ignored after respawn</td><td>Runtime check in step 5; explicit handling if confirmed</td></tr>
+<tr><td>Shared sink fixes change model control</td><td>Existing input tests and behaviour shift</td><td>Treat as bug fixes with tests; keep operator-only behaviour in the operator applier</td></tr>
+<tr><td>Crash during takeover leaves the agent paused</td><td>Needs manual <code>/codex resume</code></td><td>Persisted reservation marker (step 6)</td></tr>
+<tr><td>Sounds and particles anchored to the body</td><td>Silent POV</td><td>Anchor wraps in step 1</td></tr>
+<tr><td>Vanilla <code>/spectate</code> is one letter away</td><td>Operators use the wrong one and get teleported</td><td>Command feedback explains the difference; the GUI buttons avoid typing</td></tr>
+</table></div>
+
+<h2>Verification</h2>
+<ul>
+  <li>Java core verification (dependency-free <code>*Verification</code> classes run by <code>./gradlew verifyCore</code>): command parse probes (exit literal, UUID, short id, permission denial), session state machine (exit on disconnect, level change, agent removed, death), damage threshold boundary (3.9 vs 4.0 HP, absorption counted), reservation gating of start/steer/resume/conversation wake, payload bounds.</li>
+  <li>Coordinator <code>npm test</code>: suppression of conversation-only turns for reserved agents, summary note delivery on resume.</li>
+  <li>Headless smoke (existing <code>run-managed-death-headless-smoke.ps1</code> pattern): takeover start/stop with a real fake player, lease release, respawn path.</li>
+  <li>Live client QA note under <code>docs/live-qa</code> with Pass/Partial per behaviour. The live part needs the real game and your go-ahead each time.</li>
+</ul>
+
+<h2>Out of scope for now</h2>
+<ul>
+  <li>Cross-dimension POV, third-person views, multiple takeovers by one operator, creative inventory, anvil/sign/book text entry while taken over, and recording of takeover sessions.</li>
+</ul>
+</main>
+</body>
+</html>

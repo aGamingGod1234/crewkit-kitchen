@@ -2,6 +2,7 @@
   "entity.arenaagents.codex_agent": "Codex Agent",
   "key.arenaagents.open_controls": "Open Agent Controls",
   "key.arenaagents.toggle_camera_assistant": "Toggle Spectator Camera Assistant",
+  "key.arenaagents.exit_agent_view": "Exit agent view",
   "key.category.arenaagents.controls": "Arena Agents",
   "screen.arenaagents.controls.title": "Arena agent control center",
   "screen.arenaagents.provider": "Provider",

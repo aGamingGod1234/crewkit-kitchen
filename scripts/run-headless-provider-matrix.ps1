@@ -612,8 +612,7 @@ function Get-ProviderCommand([string] $Provider) {
 	switch ($Provider.ToLowerInvariant()) {
 		'codex' { return 'codex' }
 		'gemini' { return 'agy' }
-		'kimi' { return 'kimi' }
-		'cursor' { return (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'cursor-agent\agent.ps1') }
+		'claude' { return 'claude' }
 		default { throw "Unsupported provider '$Provider'" }
 	}
 }

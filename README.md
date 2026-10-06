@@ -1,10 +1,10 @@
 # Arena Agents: summonable AI-controlled players for Minecraft
 
-Arena Agents is a Fabric + Carpet mod pack and local coordinator for Minecraft Java 26.1.2. It adds offline fake players controlled through local provider CLIs. Codex, Kimi, and Cursor use their existing local logins; the mod stores no provider API keys. The Gemini provider ID remains visible for saved-profile compatibility, but production planning fails closed because Antigravity CLI has no enforceable no-tool boundary.
+Arena Agents is a Fabric + Carpet mod pack and local coordinator for Minecraft Java 26.1.2. It adds offline fake players controlled through local provider CLIs. Codex and Claude use their existing local CLI logins (Codex CLI and Claude Code); the mod stores no provider API keys. The Gemini provider ID remains visible for saved-profile compatibility, but production planning fails closed because Antigravity CLI has no enforceable no-tool boundary.
 
 Each agent is a real `ServerPlayer` with vanilla collision, gravity, health, hunger, inventory, and Survival/Creative/Adventure capabilities. It also has its own provider, model, thinking setting, planner session, provider-scoped working directory, goal queue, lifecycle, readable model name, and provider-themed client skin.
 
-The coordinator uses the selected provider's control path for every summonable NPC: Codex defaults to native Minecraft tools, while Kimi and Cursor use model-authored ArenaScript. The former fixed two-client planner is retired and is not a runtime fallback.
+The coordinator uses the selected provider's control path for every summonable NPC: Codex and Claude both drive the body through the same native Minecraft tools, workspace, AGENTS.md, and minecraft-control skill. The former fixed two-client planner is retired and is not a runtime fallback.
 
 ## Safety boundaries
 
@@ -69,8 +69,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-dynamic-coordinator.ps1
 /codex summon
 /codex summon <model> <reasoning> [name]
 /codex summon gemini <model> <thinking> [name]
-/codex summon kimi <model> <thinking> [name]
-/codex summon cursor <model> <thinking> [name]
+/codex summon claude <model> <thinking> [name]
 /codex summon-configured <provider> <model> <thinking> <speed_mode> <game_mode> [name]
 /msg <online-agent-name> <message>
 /codex start <agent> <prompt>
@@ -85,7 +84,13 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-dynamic-coordinator.ps1
 /codex status [agent]
 /codex list
 /codex remove <agent>
+/spectator <agent>
+/spectator exit
+/takeover <agent>
+/takeover exit
 ```
+
+`/spectator <agent>` switches your view to the agent's first-person camera and shows its hotbar, hearts, food, armor, air, XP, effects, open container screens and death screen. Your own body stays where it is, so your surroundings stop rendering while you watch. `/takeover <agent>` does the same and routes your movement, mouse look, jump, sneak, sprint, attack, use, hotbar and inventory clicks to the agent's body while its model is paused; the model resumes from whatever state you leave the agent in and receives a short report of what you did. A takeover ends when you run `/takeover exit`, when your own body loses two hearts, dies, changes dimension or disconnects, or when the agent is removed or enters another dimension (run the command again once you are in the same dimension). Both commands need operator permission and the client mod. Vanilla `/spectate` is a different command: it moves your body to the target.
 
 `/codex summon` and the legacy two-argument form use the configured Codex default. The command center asks each installed provider CLI for its current model catalog and uses a bounded built-in catalog when discovery is unavailable. Availability still depends on the installed CLI, its login, and that provider's model access. Player-facing speed choices are `Normal` and `Fast mode`; provider wire values stay internal. A newly summoned NPC remains idle until `/codex start`; `stop` freezes its active work, `queue` preserves later goals, and `steer` interrupts the current plan at a higher revision.
 
@@ -148,7 +153,6 @@ pre-render audio or promise frame-exact dialogue against camera movement.
 /codex skit on
 /codex skit summon codex ChatGPT
 /codex skit summon claude Claude
-/codex skit summon kimi Kimi
 /codex skit summon codex model gpt-6.1-sol "GPT 6.1-Sol"
 /codex skit place ChatGPT here
 /codex skit place Claude at 12 72 -4 180 0
@@ -221,7 +225,7 @@ The client-only camera director records the operator's current camera position a
 rotation as keyframes, then replays them with smooth position interpolation and
 shortest-turn rotation. Paths are stored locally in
 `config/arenaagents/camera-paths.json`, support looping playback, and can be
-deleted/listed without changing server or agent state. The five brand-forward skin families live in
+deleted/listed without changing server or agent state. The four brand-forward skin families live in
 the main renderer, including the standalone DeepSeek texture family. DeepSeek is
 not a summon provider in this checkout yet, so its skin is available for the
 identity pipeline without pretending that a backend exists.
@@ -230,9 +234,9 @@ layout. That gives each visible 8x8 head face a 64px logo raster, while ordinary
 player and mob textures remain at their native resolutions. These are mod assets,
 not files for the vanilla skin-upload screen.
 
-Every NPC receives a stable directory beneath `runtime/agent-workspaces/<provider>/<agent-id>`. Codex uses an isolated thread per NPC on its shared app server. Kimi keeps one ACP process and session per NPC. Cursor uses the native `agent` launcher and resumes that NPC's session. Gemini records remain recoverable, but attempts to plan return `PROVIDER_UNAVAILABLE`. The coordinator passes only the provider-specific environment allowlist. It does not copy bridge secrets or OAuth state into agent directories.
+Every NPC receives a stable directory beneath `runtime/agent-workspaces/<provider>/<agent-id>`. Codex uses an isolated thread per NPC on its shared app server. Claude runs one Claude Code process per NPC in the same `runtime/minecraft-agent/workspace` directory Codex uses, with the same AGENTS.md and minecraft-control skill as its system prompt and the native Minecraft tools served over a loopback MCP endpoint. Claude models (Opus 5.5, Sonnet 5.5, Fable 5.1) offer Low, Medium, and High reasoning only. Gemini records remain recoverable, but attempts to plan return `PROVIDER_UNAVAILABLE`. The coordinator passes only the provider-specific environment allowlist. It does not copy bridge secrets or OAuth state into agent directories.
 
-Invalid ArenaScript source receives bounded compiler diagnostics and a corrective turn from the same selected provider/model/session. Repeated physical-action failures remain bounded factual evidence for the next model decision; they never make the runtime choose to abandon the goal. Kimi reads the existing `~/.kimi-code` OAuth state and receives its effort through an isolated process environment. Missing authentication, unavailable models, timeouts, and bounded-output failures stop only the affected NPC.
+Invalid ArenaScript source receives bounded compiler diagnostics and a corrective turn from the same selected provider/model/session. Repeated physical-action failures remain bounded factual evidence for the next model decision; they never make the runtime choose to abandon the goal. Claude Code reuses its existing login; user CLAUDE.md files, settings, hooks, plugins, and other MCP servers are not loaded for agents. Missing authentication, unavailable models, timeouts, and bounded-output failures stop only the affected NPC.
 
 Spatial voice is optional to use. The Windows release ZIP includes the Arena Agents Voice add-on and Simple Voice Chat. In a separate main-mod installation without them, `/codex voice-consent` reports `VOICE_UNAVAILABLE` and leaves consent unchanged. With the add-on and its compatible Simple Voice Chat dependency active, the command changes the player's transcription consent state. Text control and ArenaScript do not require voice.
 

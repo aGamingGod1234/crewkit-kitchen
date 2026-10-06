@@ -26,7 +26,6 @@ export function buildAcpLaunch(provider, profile = {}, dependencies = {}) {
 		dependencies.env ?? profile.environment ?? process.env,
 		profile.bridgeSecretEnvironmentVariable,
 	);
-	if (normalizedProvider === 'kimi') environment.KIMI_MODEL_THINKING_EFFORT = requireKimiEffort(profile.reasoningEffort ?? 'high');
 	const options = {
 		cwd: profile.cwd,
 		stdio: ['pipe', 'pipe', 'pipe'],
@@ -34,7 +33,7 @@ export function buildAcpLaunch(provider, profile = {}, dependencies = {}) {
 		env: environment,
 	};
 	if (typeof profile.command === 'string' && profile.command.trim().length > 0) {
-		return { command: profile.command, args: normalizedProvider === 'gemini' ? ['--acp'] : ['acp'], options };
+		return { command: profile.command, args: ['--acp'], options };
 	}
 	if (normalizedProvider === 'gemini' && (dependencies.platform ?? process.platform) === 'win32') {
 		const appData = environment.APPDATA;
@@ -45,16 +44,7 @@ export function buildAcpLaunch(provider, profile = {}, dependencies = {}) {
 			}
 		}
 	}
-	if (normalizedProvider === 'kimi' && (dependencies.platform ?? process.platform) === 'win32') {
-		const appData = environment.APPDATA;
-		if (typeof appData === 'string') {
-			const entrypoint = path.join(appData, 'npm', 'node_modules', '@moonshot-ai', 'kimi-code', 'dist', 'main.mjs');
-			if ((dependencies.existsSync ?? existsSync)(entrypoint)) {
-				return { command: dependencies.execPath ?? process.execPath, args: [entrypoint, 'acp'], options };
-			}
-		}
-	}
-	return { command: normalizedProvider, args: normalizedProvider === 'gemini' ? ['--acp'] : ['acp'], options };
+	return { command: normalizedProvider, args: ['--acp'], options };
 }
 
 export class AcpStdioTransport extends EventEmitter {
@@ -200,12 +190,7 @@ export class AcpStdioTransport extends EventEmitter {
 }
 
 function requireProvider(value) {
-	if (!['gemini', 'kimi'].includes(value)) throw new TypeError(`ACP provider must be gemini or kimi`);
-	return value;
-}
-
-function requireKimiEffort(value) {
-	if (!['low', 'high', 'max'].includes(value)) throw new TypeError(`Kimi reasoning effort must be low, high, or max`);
+	if (value !== 'gemini') throw new TypeError('ACP provider must be gemini');
 	return value;
 }
 

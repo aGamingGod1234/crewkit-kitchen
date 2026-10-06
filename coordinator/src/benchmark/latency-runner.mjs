@@ -22,7 +22,7 @@ import { sanitizeDiagnosticErrorCode, sanitizeDiagnosticErrorMessage, sanitizeDi
 
 const LOADS = Object.freeze([1, 4, 8, 16]);
 const MODES = new Set(['instant', 'replay', 'live']);
-const PROVIDERS = new Set(['codex', 'gemini', 'kimi', 'instant', 'replay']);
+const PROVIDERS = new Set(['codex', 'gemini', 'instant', 'replay']);
 const MAX_TRIALS = 4_096;
 const MAX_REPETITIONS = 1_024;
 const MAX_METRIC_SAMPLES = 4_096;
@@ -68,7 +68,7 @@ export function normalizeLatencyMatrix(value) {
 		if (!LOADS.includes(agentLoad) || !agentLoads.includes(agentLoad)) throw new TypeError(`${id}.agentLoad must be one of 1, 4, 8, 16`);
 		const providerProfile = normalizeProfile(trial.providerProfile, id);
 		if (mode === 'instant' && providerProfile.provider !== 'instant') throw new TypeError(`${id}.instant trials require providerProfile.provider instant`);
-		if (mode === 'live' && !['codex', 'kimi'].includes(providerProfile.provider)) throw new TypeError(`${id}.live trials require a Codex or Kimi provider`);
+		if (mode === 'live' && providerProfile.provider !== 'codex') throw new TypeError(`${id}.live trials require a Codex provider`);
 		const repetitions = positiveInt(trial.repetitions, `${id}.repetitions`);
 		if (repetitions > MAX_REPETITIONS) throw new TypeError(`${id}.repetitions is too large`);
 		return Object.freeze({
@@ -1249,7 +1249,7 @@ function validateProviderIdentity(provider, trial) {
 	return { provider: expected.provider, synthetic: provider.synthetic === true };
 }
 function isTimeoutErrorCode(code) { return typeof code === 'string' && (code === 'TURN_CAP' || code.includes('TIMEOUT')); }
-function internalProvider(provider) { return PROVIDERS.has(provider) && ['codex', 'gemini', 'kimi'].includes(provider) ? provider : 'codex'; }
+function internalProvider(provider) { return PROVIDERS.has(provider) && ['codex', 'gemini'].includes(provider) ? provider : 'codex'; }
 function manualScheduler() { const handles = new Set(); return { setInterval(callback) { const handle = { callback }; handles.add(handle); return handle; }, clearInterval(handle) { handles.delete(handle); } }; }
 function authoritativeCommands(virtual, agentId) {
 	// Whole-trial parity must retain inter-agent dispatch order and each command's owner.

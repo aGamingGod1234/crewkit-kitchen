@@ -58,7 +58,7 @@ public final class ArenaSpectatorStateVerification {
 		assertEquals(0xFF8E86FF, ArenaSpectatorHud.providerColor("gemini"), "Gemini has a stable HUD color");
 		assertEquals(0xFF8E86FF, ArenaSpectatorHud.providerColor("antigravity"),
 				"Antigravity shares the Gemini provider-family color");
-		assertEquals(0xFFFFB45E, ArenaSpectatorHud.providerColor("kimi"), "Kimi has a stable HUD color");
+		assertEquals(0xFFD97757, ArenaSpectatorHud.providerColor("claude"), "Claude has a stable HUD color");
 		assertTrue(!ArenaHudPresentation.worldOverlayEnabled(),
 				"agent state and standings never cover the live world view");
 		ArenaHudPresentation.CompactRoster crowdedRoster = ArenaHudPresentation.compactRoster(8);

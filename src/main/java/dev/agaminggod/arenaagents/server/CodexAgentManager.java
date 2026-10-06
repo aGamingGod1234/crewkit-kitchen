@@ -32,6 +32,9 @@ import dev.agaminggod.arenaagents.server.group.AgentGroupSavedData;
 import dev.agaminggod.arenaagents.server.group.AgentGroupSpawnCoordinator;
 import dev.agaminggod.arenaagents.server.conversation.ConversationEvent;
 import dev.agaminggod.arenaagents.server.conversation.PendingConversationWake;
+import dev.agaminggod.arenaagents.server.pov.AgentControlReservations;
+import dev.agaminggod.arenaagents.server.pov.PovExitReason;
+import dev.agaminggod.arenaagents.server.pov.PovSessionRuntime;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -345,6 +348,8 @@ public final class CodexAgentManager {
 
 	public AgentTransition startSubjective(String selector, String prompt) {
 		AgentRecord record = resolve(selector);
+		// Only scenario activation starts subjective goals; a scenario outranks an operator takeover.
+		PovSessionRuntime.onAgentClaimed(server, record.agentId(), PovExitReason.CLAIMED_BY_SCENARIO);
 		SkitModeRuntime.requireNormalControlAllowed(server, record.agentId());
 		return savedData.registry().start(record.agentId(), prompt, System.currentTimeMillis());
 	}
@@ -708,6 +713,7 @@ public final class CodexAgentManager {
 
 	public AgentTransition steer(String selector, String prompt) {
 		AgentRecord record = resolve(selector);
+		SkitModeRuntime.requireNormalControlAllowed(server, record.agentId());
 		return savedData.registry().steer(record.agentId(), prompt, System.currentTimeMillis());
 	}
 
@@ -950,7 +956,9 @@ public final class CodexAgentManager {
 					retainedDeadPlayers().remove(record.agentId(), retained);
 				}
 				pendingEntityRecoveries.remove(record.agentId());
+				// During a takeover the operator owns every respawn decision.
 				if (record.respawnPolicy() == dev.agaminggod.arenaagents.agent.RespawnPolicy.RESPAWN_AUTOMATICALLY
+						&& !AgentControlReservations.isReserved(server, record.agentId())
 						&& !pendingVerifiedRespawns.containsKey(record.agentId())
 						&& pendingPlayerSpawns.getOrDefault(record.agentId(), 0L) <= now) {
 					try {
@@ -1698,6 +1706,7 @@ public final class CodexAgentManager {
 				: Optional.of(pendingLegacy.legacyPlayer());
 		retainedDeadPlayers().remove(record.agentId());
 		SkitModeRuntime.stop(server, record.agentId());
+		PovSessionRuntime.onAgentRemoved(server, record.agentId());
 		AgentInputRuntime.clear(server, record.agentId());
 		long terminalRevision = record.goalRevision() == Long.MAX_VALUE
 				? Long.MAX_VALUE
