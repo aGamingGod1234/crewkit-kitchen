@@ -17,8 +17,8 @@ public record AgentProfile(
 		model = AgentValidators.requireModel(model);
 		reasoning = AgentValidators.requireReasoning(reasoning);
 		serviceTier = AgentValidators.requireServiceTier(serviceTier);
-		if (!provider.equals("codex") && !provider.equals("cursor") && !serviceTier.equals("priority")) {
-			throw new AgentDomainException("INVALID_SERVICE_TIER", "fast mode is available only for Codex and Cursor models");
+		if (!provider.equals("codex") && !serviceTier.equals("priority")) {
+			throw new AgentDomainException("INVALID_SERVICE_TIER", "fast mode is available only for Codex models");
 		}
 		userName = Objects.requireNonNull(userName, "userName must not be null")
 				.map(AgentValidators::requireUserName);

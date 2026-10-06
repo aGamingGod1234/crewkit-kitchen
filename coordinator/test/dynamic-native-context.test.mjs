@@ -921,7 +921,7 @@ test('coordinator reconnect preserves player pause and schedules one plan for du
 	};
 	const active = {
 		...record('agent-a'), state: DynamicAgentState.ACTING, currentGoal: 'Keep working.', goalRevision: 4,
-		provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'max', serviceTier: 'priority',
+		provider: 'gemini', model: 'gemini-3.1-pro', reasoningEffort: 'low', serviceTier: 'priority',
 	};
 	const paused = { ...record('agent-b'), state: DynamicAgentState.PAUSED, currentGoal: 'Wait for Lucas.', goalRevision: 2 };
 	const run = await start({ registry, planner, initialRegistry: [active, paused] });

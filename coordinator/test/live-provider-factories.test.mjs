@@ -4,13 +4,13 @@ import test from 'node:test';
 import { createLiveProviderFactory } from '../src/benchmark/live-provider-factories.mjs';
 
 const PROFILE = Object.freeze({
-	provider: 'kimi',
-	model: 'kimi-code/k3',
+	provider: 'codex',
+	model: 'gpt-5.6-luna',
 	reasoningEffort: 'high',
 	serviceTier: 'fast',
 });
 
-function fakeService({ provider = 'kimi', catalogStale = false, startError = null, createError = null } = {}) {
+function fakeService({ provider = 'codex', catalogStale = false, startError = null, createError = null } = {}) {
 	const calls = [];
 	const createOptions = [];
 	const agents = new Map();
@@ -63,7 +63,7 @@ test('creates a Codex benchmark session with the ArenaScript control protocol', 
 test('routes an exact provider to only the selected injected service', async () => {
 	let selected;
 	const service = fakeService();
-	const factory = createLiveProviderFactory('kimi', {
+	const factory = createLiveProviderFactory('codex', {
 		serviceFactory(context) { selected = context; return service; },
 		probe: async () => {},
 	});
@@ -76,10 +76,10 @@ test('routes an exact provider to only the selected injected service', async () 
 	assert.equal(provider.reasoningEffort, PROFILE.reasoningEffort);
 	assert.equal(provider.serviceTier, PROFILE.serviceTier);
 	assert.deepEqual(provider.providerProfile, PROFILE);
-	assert.equal(selected.provider, 'kimi');
+	assert.equal(selected.provider, 'codex');
 	assert.equal(selected.environment.ARENA_AGENT_BRIDGE_SECRET, undefined);
 	const createCall = service.calls.find((entry) => Array.isArray(entry) && entry[0] === 'createAgent');
-	assert.equal(createCall[1].provider, 'kimi');
+	assert.equal(createCall[1].provider, 'codex');
 	assert.equal(createCall[1].model, PROFILE.model);
 	assert.equal(createCall[1].reasoningEffort, PROFILE.reasoningEffort);
 	assert.ok(service.calls.some((entry) => Array.isArray(entry) && entry[0] === 'removeAgent'));
@@ -92,13 +92,13 @@ test('rejects a mismatched profile without fallback or service construction', as
 		serviceFactory() { constructed = true; return fakeService({ provider: 'codex' }); },
 	});
 
-	await assert.rejects(() => factory(PROFILE), (error) => error.code === 'PROVIDER_MISMATCH');
+	await assert.rejects(() => factory({ ...PROFILE, provider: 'gemini' }), (error) => error.code === 'PROVIDER_MISMATCH');
 	assert.equal(constructed, false);
 });
 
 test('reports configured catalog fallback separately from a successful live session', async () => {
 	const service = fakeService({ catalogStale: true });
-	const factory = createLiveProviderFactory('kimi', { service, probe: async () => {} });
+	const factory = createLiveProviderFactory('codex', { service, probe: async () => {} });
 
 	const provider = await factory(PROFILE);
 
@@ -113,16 +113,16 @@ test('rejects production-disabled Gemini before constructing a live service', ()
 	let constructed = false;
 	assert.throws(() => createLiveProviderFactory('gemini', {
 		serviceFactory() { constructed = true; return fakeService({ provider: 'gemini' }); },
-	}), /codex, kimi/i);
+	}), /codex/i);
 	assert.equal(constructed, false);
 });
 
 test('classifies startup failures through shared diagnostic redaction and cleans up', async () => {
 	const secret = 'fixture-start-token-123';
 	const service = fakeService({ startError: new Error(`Authorization: Bearer ${secret} at C:\\private\\provider.json`) });
-	const factory = createLiveProviderFactory('kimi', {
+	const factory = createLiveProviderFactory('codex', {
 		service,
-		environment: { KIMI_API_KEY: secret, ARENA_AGENT_BRIDGE_SECRET: 'bridge-secret' },
+		environment: { OPENAI_API_KEY: secret, ARENA_AGENT_BRIDGE_SECRET: 'bridge-secret' },
 	});
 
 	const result = await factory(PROFILE);
@@ -140,7 +140,7 @@ test('classifies startup failures through shared diagnostic redaction and cleans
 
 test('classifies session creation failures and stops the service', async () => {
 	const service = fakeService({ createError: Object.assign(new Error('ACP session/new failed'), { code: 'INVALID_SESSION' }) });
-	const factory = createLiveProviderFactory('kimi', { service, probe: async () => {} });
+	const factory = createLiveProviderFactory('codex', { service, probe: async () => {} });
 
 	const result = await factory(PROFILE);
 
@@ -152,7 +152,7 @@ test('classifies session creation failures and stops the service', async () => {
 
 test('classifies first-turn probe failures and removes the probe agent', async () => {
 	const service = fakeService();
-	const factory = createLiveProviderFactory('kimi', {
+	const factory = createLiveProviderFactory('codex', {
 		service,
 		probe: async () => { throw Object.assign(new Error('provider turn failed'), { code: 'TURN_FAILED' }); },
 	});
@@ -169,7 +169,7 @@ test('classifies first-turn probe failures and removes the probe agent', async (
 test('aborting a bounded probe still removes the session and stops the service', async () => {
 	const service = fakeService();
 	const controller = new AbortController();
-	const factory = createLiveProviderFactory('kimi', {
+	const factory = createLiveProviderFactory('codex', {
 		service,
 		probe: ({ signal }) => new Promise((resolve, reject) => {
 			signal.addEventListener('abort', () => reject(signal.reason), { once: true });

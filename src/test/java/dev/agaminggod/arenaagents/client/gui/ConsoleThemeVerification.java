@@ -23,8 +23,8 @@ public final class ConsoleThemeVerification {
 				"Codex uses the shared provider color");
 		assertTrue(ConsoleTheme.providerColor("gemini") == ConsoleTheme.GEMINI,
 				"Gemini uses the shared provider color");
-		assertTrue(ConsoleTheme.providerColor("kimi") == ConsoleTheme.KIMI,
-				"Kimi uses the shared provider color");
+		assertTrue(ConsoleTheme.providerColor("claude") == ConsoleTheme.CLAUDE,
+				"Claude uses the shared provider color");
 		assertTrue(ConsoleTheme.ROSTER_FOCUS != ConsoleTheme.ACCENT,
 				"roster focus remains visually distinct from amber selection");
 		assertTrue(ConsoleTheme.ROSTER_SELECTED_SURFACE != ConsoleTheme.ROSTER_UNAVAILABLE_SURFACE,
@@ -33,17 +33,12 @@ public final class ConsoleThemeVerification {
 				"selected roster surface preserves normal-text contrast");
 		assertTrue(ConsoleTheme.contrastRatio(ConsoleTheme.TEXT, ConsoleTheme.ROSTER_UNAVAILABLE_SURFACE) >= 4.5D,
 				"unavailable roster surface preserves normal-text contrast");
-		assertTrue(ConsoleTheme.providerColor("cursor") == ConsoleTheme.CURSOR,
-				"Cursor uses the shared provider color");
-		assertTrue(ConsoleTheme.CURSOR != ConsoleTheme.CODEX
-				&& ConsoleTheme.CURSOR != ConsoleTheme.GEMINI
-				&& ConsoleTheme.CURSOR != ConsoleTheme.KIMI,
-				"Cursor provider color is distinct from every other provider");
+		assertTrue(ConsoleTheme.CLAUDE != ConsoleTheme.CODEX && ConsoleTheme.CLAUDE != ConsoleTheme.GEMINI,
+				"Claude provider color is distinct from every other provider");
 		int[] providerColors = {
 				ConsoleTheme.rosterProviderColor("codex"),
 				ConsoleTheme.rosterProviderColor("gemini"),
-				ConsoleTheme.rosterProviderColor("kimi"),
-				ConsoleTheme.rosterProviderColor("cursor")
+				ConsoleTheme.rosterProviderColor("claude")
 		};
 		int[] rosterSurfaces = {
 				ConsoleTheme.SURFACE,

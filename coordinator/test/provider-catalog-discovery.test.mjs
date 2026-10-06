@@ -3,9 +3,7 @@ import test from 'node:test';
 
 import {
 	discoverAntigravityCatalog,
-	discoverKimiCatalog,
 	parseAntigravityModelsOutput,
-	parseKimiProviderCatalog,
 } from '../src/provider-catalog-discovery.mjs';
 
 test('Antigravity parser derives stable slugs and preserves CLI effort order', () => {
@@ -21,19 +19,9 @@ test('Antigravity parser derives stable slugs and preserves CLI effort order', (
 	]);
 });
 
-test('Kimi parser uses local aliases and configured support_efforts without exposing credentials', () => {
-	assert.deepEqual(parseKimiProviderCatalog({ models: {
-		'kimi-code/k3-256k': { displayName: 'K3-256k', supportEfforts: ['low', 'high', 'max'], apiKey: 'secret-must-not-leak' },
-		'kimi-code/kimi-for-coding-highspeed': { displayName: 'K2.7 Coding Highspeed', capabilities: ['thinking', 'always_thinking'] },
-	} }), [
-		{ id: 'kimi-code/k3-256k', model: 'kimi-code/k3-256k', displayName: 'K3-256k', reasoningEfforts: ['low', 'high', 'max'], serviceTiers: [] },
-		{ id: 'kimi-code/kimi-for-coding-highspeed', model: 'kimi-code/kimi-for-coding-highspeed', displayName: 'K2.7 Coding Highspeed', reasoningEfforts: ['high'], serviceTiers: [] },
-	]);
-});
-
-test('CLI discovery adapters pass only the catalog command, explicit environment, and parse stdout', async () => {
+test('CLI discovery adapter passes only the catalog command, explicit environment, and parse stdout', async () => {
 	const calls = [];
-	const environment = { PATH: 'test', KIMI_API_KEY: 'provider-key' };
+	const environment = { PATH: 'test', GEMINI_API_KEY: 'provider-key' };
 	const execFile = (command, args, options, callback) => {
 		calls.push({ command, args, options });
 		callback(null, 'gemini-3.1-pro-low\tGemini 3.1 Pro (Low)\n', '');
@@ -44,11 +32,4 @@ test('CLI discovery adapters pass only the catalog command, explicit environment
 	assert.deepEqual(calls[0].args, ['models']);
 	assert.equal(calls[0].options.env, environment);
 
-	const kimi = await discoverKimiCatalog({ execFile: (command, args, options, callback) => {
-		calls.push({ command, args, options });
-		callback(null, JSON.stringify({ providers: {}, models: { 'kimi-code/k3': { supportEfforts: ['high'] } } }), '');
-	}, environment });
-	assert.equal(kimi[0].id, 'kimi-code/k3');
-	assert.deepEqual(calls.at(-1).args, ['provider', 'list', '--json']);
-	assert.equal(calls.at(-1).options.env, environment);
 });

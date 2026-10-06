@@ -121,7 +121,7 @@ public final class AgentRegistryVerification {
 	private static int verifyCoordinatorRecoveryRearm() {
 		AgentRegistry registry = new AgentRegistry(2, 1, () -> { }, transition -> { });
 		AgentRecord created = registry.create(
-				"kimi", "kimi-code/k3", "max", "priority", Optional.of("Recovery"), AgentGameMode.CREATIVE, START_TIME
+				"claude", "claude-sonnet-5-5", "high", "priority", Optional.of("Recovery"), AgentGameMode.CREATIVE, START_TIME
 		);
 		AgentRecord active = registry.start(created.agentId(), "Keep the exact profile", START_TIME + 1L).after();
 		AgentRecord disconnected = registry.disconnect(created.agentId(), START_TIME + 2L).after();
@@ -341,11 +341,11 @@ public final class AgentRegistryVerification {
 
 	private static int verifyProviderPersistenceAndMigration() {
 		AgentRegistrySnapshotCodec codec = new AgentRegistrySnapshotCodec();
-		AgentProfile kimi = new AgentProfile("kimi", "kimi-code/k3", "max", Optional.empty(), 2);
+		AgentProfile claude = new AgentProfile("claude", "claude-opus-5-5", "high", Optional.empty(), 2);
 		AgentProfile fastCodex = new AgentProfile(
 				"codex", "gpt-5.6-luna", "xhigh", "fast", Optional.of("Fast"), 3, AgentGameMode.SURVIVAL
 		);
-		AgentRecord record = AgentRecord.create(AgentId.random(), kimi, START_TIME);
+		AgentRecord record = AgentRecord.create(AgentId.random(), claude, START_TIME);
 		AgentRecord fastRecord = AgentRecord.create(AgentId.random(), fastCodex, START_TIME + 1L);
 		AgentRegistry.Snapshot snapshot = new AgentRegistry.Snapshot(
 				AgentConstants.SCHEMA_VERSION,
@@ -356,11 +356,14 @@ public final class AgentRegistryVerification {
 		String encoded = codec.encode(snapshot);
 		AgentRegistry.Snapshot roundTrip = codec.decode(encoded);
 		AgentProfile decoded = roundTrip.records().getFirst().profile();
-		assertEquals("kimi", decoded.provider(), "provider round-trip");
-		assertEquals("Kimi K3 Max | Orchid", decoded.nameTag(), "provider and skin aware name tag");
+		assertEquals("claude", decoded.provider(), "provider round-trip");
+		assertEquals("Claude Opus 5.5 High | Sand", decoded.nameTag(), "provider and skin aware name tag");
 		assertEquals("fast", roundTrip.records().get(1).profile().serviceTier(), "fast service tier round-trip");
 
-		String legacyProvider = encoded.replace("\"provider\":\"kimi\",", "");
+		String legacyProvider = encoded.replace("\"provider\":\"claude\",", "");
+		String retiredProvider = encoded.replace("\"provider\":\"claude\",", "\"provider\":\"kimi\",");
+		assertEquals(List.of(fastRecord.agentId()), codec.decode(retiredProvider).records().stream().map(AgentRecord::agentId).toList(),
+				"saved agents of retired providers are dropped instead of failing the world");
 		assertEquals("codex", codec.decode(legacyProvider).records().getFirst().profile().provider(), "legacy provider migration");
 		String legacyTier = encoded.replace(",\"service_tier\":\"fast\"", "");
 		assertEquals("priority", codec.decode(legacyTier).records().get(1).profile().serviceTier(),

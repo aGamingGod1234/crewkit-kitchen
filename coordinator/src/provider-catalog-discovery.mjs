@@ -43,56 +43,6 @@ export async function discoverAntigravityCatalog({ executable = 'agy', execFile 
 	return parseAntigravityModelsOutput(result.stdout);
 }
 
-/**
- * Kimi's JSON provider listing is the authoritative local alias catalog. The
- * parser only returns model metadata; provider credentials are never copied
- * into the returned objects or error messages.
- */
-export function parseKimiProviderCatalog(value) {
-	if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('Kimi provider catalog must be an object');
-	const models = value.models;
-	if (models === null || typeof models !== 'object' || Array.isArray(models)) throw new TypeError('Kimi provider catalog models must be an object');
-	return Object.entries(models).flatMap(([id, entry]) => {
-		if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return [];
-		const efforts = Array.isArray(entry.support_efforts)
-			? entry.support_efforts
-			: Array.isArray(entry.supportEfforts)
-				? entry.supportEfforts
-				: Array.isArray(entry.capabilities) && entry.capabilities.includes('always_thinking')
-					? ['high']
-					: Array.isArray(entry.capabilities) && entry.capabilities.includes('thinking')
-						? ['low', 'high', 'max']
-						: [];
-		const normalizedEfforts = [...new Set(efforts.filter((effort) => typeof effort === 'string' && effort.trim().length > 0).map((effort) => effort.trim()))];
-		if (normalizedEfforts.length === 0) return [];
-		return [{
-			id,
-			model: id,
-			displayName: firstDisplayName(entry.displayName, entry.display_name, id),
-			reasoningEfforts: normalizedEfforts,
-			serviceTiers: [],
-		}];
-	});
-}
-
-function firstDisplayName(camelCase, snakeCase, fallback) {
-	for (const value of [camelCase, snakeCase]) {
-		if (typeof value === 'string' && value.trim().length > 0) return value.trim();
-	}
-	return fallback;
-}
-
-export async function discoverKimiCatalog({ executable = 'kimi', execFile = nodeExecFile, environment, timeoutMs = DEFAULT_DISCOVERY_TIMEOUT_MS } = {}) {
-	const result = await runExecFile(execFile, executable, ['provider', 'list', '--json'], timeoutMs, requireEnvironment(environment));
-	let document;
-	try {
-		document = JSON.parse(result.stdout);
-	} catch {
-		throw new Error('Kimi provider catalog returned invalid JSON');
-	}
-	return parseKimiProviderCatalog(document);
-}
-
 function normalizeEffort(value) {
 	const normalized = value.trim().toLowerCase().replace(/\s+/g, '_');
 	return ['low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'thinking'].includes(normalized) ? normalized : null;

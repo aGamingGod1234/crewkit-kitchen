@@ -11,7 +11,21 @@
     "MinecraftFontManagerAccessor",
     "PlayerInfoMixin",
     "PlanItemIconsRenderMixin",
-    "SkinManagerMixin"
+    "SkinManagerMixin",
+    "ClientPacketListenerPovMixin",
+    "EntityPovRotationMixin",
+    "ExperienceBarRendererPovMixin",
+    "GameRendererPovMixin",
+    "GuiPovMixin",
+    "LivingEntityPovRotationMixin",
+    "KeyboardInputPovMixin",
+    "LocalPlayerPovMixin",
+    "MinecraftPovMixin",
+    "MouseHandlerPovMixin",
+    "MultiPlayerGameModePovMixin",
+    "MenuScreensInvoker",
+    "InventoryScreenPovMixin",
+    "AbstractContainerScreenPovMixin"
   ],
   "injectors": {
     "defaultRequire": 1

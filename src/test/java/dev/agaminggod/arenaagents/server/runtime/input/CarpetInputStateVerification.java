@@ -5,6 +5,7 @@ import carpet.helpers.EntityPlayerActionPack;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import java.lang.reflect.Field;
 import java.util.Map;
+import java.util.UUID;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.server.level.ServerPlayer;
@@ -28,7 +29,8 @@ public final class CarpetInputStateVerification {
 
 	public static int verify() {
 		try {
-			return verifyMovementAndRelease() + verifyAttackPressAndHold() + verifyAttackTargetHandoff();
+			return verifyMovementAndRelease() + verifyAttackPressAndHold() + verifyAttackTargetHandoff()
+					+ verifyOperatorClickOnlyMelee();
 		} catch (ReflectiveOperationException exception) {
 			throw new AssertionError("could not inspect pinned Carpet action state", exception);
 		}
@@ -157,6 +159,32 @@ public final class CarpetInputStateVerification {
 		} catch (IllegalStateException expected) { }
 		check(CarpetInputStateSink.takeAttackTarget(player) == null, "failed original tick releases unconsumed target");
 		return 9;
+	}
+
+	private static int verifyOperatorClickOnlyMelee() throws ReflectiveOperationException {
+		FixturePlayer player = player();
+		player.setUUID(UUID.fromString("00000000-0000-0000-0000-0000000000b1"));
+		AgentId agent = AgentId.random();
+		AgentInputState held = state(false, false, false, true);
+		AgentInputState idle = state(false, false, false, false);
+		HitResult target = new EntityHitResult(player, Vec3.ZERO);
+		CarpetInputStateSink.setMeleeByClickOnly(agent, player.getUUID(), true);
+		try {
+			CarpetInputStateSink.applyHeldActions(player.pack, null, held);
+			EntityPlayerActionPack.Action action = actions(player.pack).get(EntityPlayerActionPack.ActionType.ATTACK);
+			check(Boolean.FALSE.equals(tick(player, action, target)), "an operator's held press is never an entity hit");
+			check(player.hits == 0 && player.swings == 0 && player.strengthResets == 0,
+					"an operator's held attack neither hits nor resets recharge on entities");
+			tick(player, action, new BlockHitResult(Vec3.ZERO, Direction.UP, BlockPos.ZERO, false));
+			check(player.originalTicks == 1, "an operator's held attack still mines blocks through Carpet");
+		} finally {
+			CarpetInputStateSink.setMeleeByClickOnly(agent, null, false);
+		}
+		CarpetInputStateSink.applyHeldActions(player.pack, held, idle);
+		CarpetInputStateSink.applyHeldActions(player.pack, idle, held);
+		tick(player, actions(player.pack).get(EntityPlayerActionPack.ActionType.ATTACK), target);
+		check(player.hits == 1, "clearing the operator mark restores press melee for model control");
+		return 4;
 	}
 
 	private static Boolean tick(FixturePlayer player, EntityPlayerActionPack.Action action, HitResult target) {

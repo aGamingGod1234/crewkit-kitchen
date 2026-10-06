@@ -238,19 +238,6 @@
 			"trialBudgetMs": 180000,
 			"turnCap": 4,
 			"providerAvailabilityRequired": false
-		},
-		{
-			"id": "live-kimi-stone-load-1",
-			"mode": "live",
-			"scenarioId": "stone-tool-gathering",
-			"seed": 20260822,
-			"agentLoad": 1,
-			"providerProfile": { "provider": "kimi", "model": "kimi-code/k3", "reasoningEffort": "high", "serviceTier": "local" },
-			"repetitions": 5,
-			"turnBudgetMs": 120000,
-			"trialBudgetMs": 180000,
-			"turnCap": 4,
-			"providerAvailabilityRequired": false
 		}
 	]
 }

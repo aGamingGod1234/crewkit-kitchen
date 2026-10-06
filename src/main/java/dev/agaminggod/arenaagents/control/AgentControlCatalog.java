@@ -120,14 +120,10 @@ public final class AgentControlCatalog {
 			add(values, "gemini", model, readable(model), List.of("thinking"), false);
 		}
 		add(values, "gemini", "gpt-oss-120b", "GPT OSS 120B", List.of("medium"), false);
-		for (String model : List.of("kimi-code/k3", "kimi-code/k3-256k")) {
-			add(values, "kimi", model, readable(model), List.of("low", "high", "max"), false);
-		}
-		add(values, "kimi", "kimi-code/kimi-for-coding", "K2.7 Coding", List.of("high"), false);
-		add(values, "kimi", "kimi-code/kimi-for-coding-highspeed", "K2.7 Coding Highspeed", List.of("high"), false);
-		add(values, "cursor", "composer-2.5", "Composer 2.5", List.of("high"), true);
-		add(values, "cursor", "grok-4.5", "Grok 4.5", List.of("low", "medium", "high"), true);
-		add(values, "cursor", "grok-4.6", "Grok 4.6", List.of("low", "medium", "high", "xhigh"), true);
+		// Claude agents are offered Low through High reasoning only.
+		add(values, "claude", "claude-opus-5-5", "Claude Opus 5.5", List.of("low", "medium", "high"), false);
+		add(values, "claude", "claude-sonnet-5-5", "Claude Sonnet 5.5", List.of("low", "medium", "high"), false);
+		add(values, "claude", "claude-fable-5-1", "Claude Fable 5.1", List.of("low", "medium", "high"), false);
 		return List.copyOf(values);
 	}
 
@@ -138,9 +134,8 @@ public final class AgentControlCatalog {
 	}
 
 	private static String readable(String model) {
-		String value = model.startsWith("kimi-code/") ? model.substring("kimi-code/".length()) : model;
 		StringBuilder result = new StringBuilder();
-		for (String part : value.replace('_', '-').split("-")) {
+		for (String part : model.replace('_', '-').split("-")) {
 			if (part.isBlank()) continue;
 			if (!result.isEmpty()) result.append(' ');
 			result.append(part.equalsIgnoreCase("gpt") ? "GPT"

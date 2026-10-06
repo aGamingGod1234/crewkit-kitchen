@@ -11,6 +11,7 @@ import com.google.gson.JsonIOException;
 import com.mojang.brigadier.arguments.BoolArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import dev.agaminggod.arenaagents.client.mixin.CameraEyeHeightAccessor;
+import dev.agaminggod.arenaagents.client.pov.PovClient;
 import java.io.IOException;
 import java.io.Reader;
 import java.io.Writer;
@@ -109,6 +110,7 @@ public final class CameraDirectorClient {
 
     private static void enterDolly(Minecraft client, Entity cart) {
         if (client.player == null || client.level == null) return;
+        if (PovClient.session().isPresent()) { guiFeedback("Leave the agent view before using a camera.", true); return; }
         if (dollyRecording && recording != null) {
             guiFeedback("Camera recording is running. Save it before switching cameras.", false);
             return;
@@ -124,6 +126,7 @@ public final class CameraDirectorClient {
     public static String recordingName() { return recording == null ? "" : recording.name(); }
     public static void viewCamera(dev.agaminggod.arenaagents.camera.CameraRig rig) {
         var client = Minecraft.getInstance();
+        if (PovClient.session().isPresent()) { guiFeedback("Leave the agent view before using a camera.", true); return; }
         if (recording != null && dolly != rig) { guiFeedback("Save the current recording before switching cameras.", true); return; }
         if (dolly != rig) enterDolly(client, rig);
         if (client.player != null) { client.player.setYRot(rig.getYRot()); client.player.setXRot(rig.getXRot()); }
@@ -276,6 +279,7 @@ public final class CameraDirectorClient {
 		if (path == null) { guiFeedback("No camera path named '" + name + "'.", true); return; }
 		if (client.level == null || client.player == null) { guiFeedback("You must be in a world to play a camera path.", true); return; }
 		if (path.durationTicks() < MIN_PLAYBACK_TICKS) { guiFeedback("Add a second keyframe so the camera has a duration to play.", true); return; }
+		if (PovClient.session().isPresent()) { guiFeedback("Leave the agent view before playing a camera path.", true); return; }
 		stopPlayback(client);
 		previousCamera = client.getCameraEntity();
 		previousCameraType = client.options.getCameraType();
@@ -289,6 +293,13 @@ public final class CameraDirectorClient {
 		if (playback == null && dolly == null) { guiFeedback("No camera path is playing.", true); return; }
 		stopPlayback(Minecraft.getInstance());
 		guiFeedback("Camera path stopped; camera returned to the player.", false);
+	}
+
+	/** Releases the camera to another owner (the agent view): playback, viewfinder and pending takes end. */
+	public static void stopForExternalCamera(Minecraft client) {
+		scheduledTake = null; takeLevel = null; takeCamera = false; armedDollyName = null;
+		if (dollyRecording && recording != null) stopRecordingFromGui();
+		stopPlayback(client);
 	}
 
 	private static void guiFeedback(String message, boolean error) {
@@ -416,6 +427,7 @@ public final class CameraDirectorClient {
 		Minecraft client = source.getClient();
 		if (client.level == null || client.player == null) return error(source, "You must be in a world to play a camera path.");
 		if (path.durationTicks() < MIN_PLAYBACK_TICKS) return error(source, "Add a second keyframe so the camera has a duration to play.");
+		if (PovClient.session().isPresent()) return error(source, "Leave the agent view before playing a camera path.");
 		stopPlayback(client);
 		previousCamera = client.getCameraEntity();
 		previousCameraType = client.options.getCameraType();

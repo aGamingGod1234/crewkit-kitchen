@@ -204,7 +204,7 @@ function buildLiveProviderOptions(matrix, args, cwd) {
 	for (const trial of matrix?.trials ?? []) {
 		if (trial?.mode !== 'live') continue;
 		const profile = trial.providerProfile;
-		if (!isPlainRecord(profile) || !['codex', 'kimi'].includes(profile.provider)) throw cliUsage('live trial providerProfile is invalid');
+		if (!isPlainRecord(profile) || profile.provider !== 'codex') throw cliUsage('live trial providerProfile is invalid');
 		const normalized = {};
 		for (const field of ['model', 'reasoningEffort', 'serviceTier']) {
 			if (typeof profile[field] !== 'string' || profile[field].trim().length === 0 || Buffer.byteLength(profile[field], 'utf8') > 128) throw cliUsage(`live provider ${field} is invalid`);
@@ -218,22 +218,7 @@ function buildLiveProviderOptions(matrix, args, cwd) {
 	const trialBound = liveTrialPlanningTimeout(matrix);
 	const planningTimeoutMs = Math.max(1, Math.min(args.planningTimeoutMs ?? DEFAULT_PLANNING_TIMEOUT_MS, trialBound));
 	const config = { cwd };
-	for (const [provider, profile] of liveProfiles) {
-		if (provider === 'codex') {
-			config.codex = { cwd, planningTimeoutMs, launchProfile: { ...profile } };
-			continue;
-		}
-		const providerConfig = {
-			cwd,
-			planningTimeoutMs,
-			catalogDiscovery: true,
-			models: [profile.model],
-			reasoningEfforts: [profile.reasoningEffort],
-			modelReasoningEfforts: { [profile.model]: [profile.reasoningEffort] },
-		};
-		if (provider === 'kimi') providerConfig.executable = 'kimi';
-		config[provider] = providerConfig;
-	}
+	for (const [provider, profile] of liveProfiles) config[provider] = { cwd, planningTimeoutMs, launchProfile: { ...profile } };
 	return { planningTimeoutMs, options: { cwd, config, planningTimeoutMs } };
 }
 

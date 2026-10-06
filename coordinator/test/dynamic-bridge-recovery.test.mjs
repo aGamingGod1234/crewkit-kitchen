@@ -973,16 +973,16 @@ test('legacy preserved Codex config defaults to native tools and the shared Mine
 	assert.equal(config.minecraftAgentRoot, path.join(projectDirectory, 'runtime', 'minecraft-agent'));
 });
 
-test('dynamic config exposes the native Cursor model families and genuine settings', () => {
+test('dynamic config gives Claude the shared Minecraft agent root and Claude-only settings', () => {
 	const config = normalizeDynamicConfig({
 		bridge: { port: 25570, secret: 's'.repeat(32) },
 		codex: { launchProfile: { model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
-	}, { LOCALAPPDATA: 'C:\\Users\\tester\\AppData\\Local' });
-	assert.equal(config.cursor.provider, 'cursor');
-	assert.equal(config.cursor.executable, 'C:\\Users\\tester\\AppData\\Local\\cursor-agent\\agent.ps1');
-	assert.deepEqual(config.cursor.models, ['composer-2.5', 'grok-4.5', 'grok-4.6']);
-	assert.deepEqual(config.cursor.modelReasoningEfforts['composer-2.5'], ['high']);
-	assert.deepEqual(config.cursor.modelReasoningEfforts['grok-4.6'], ['low', 'medium', 'high', 'xhigh']);
+		claude: { models: ['claude-sonnet-5-5'], reasoningEfforts: ['low', 'high'] },
+	}, {});
+	assert.equal(config.claude.provider, 'claude');
+	assert.equal(config.claude.runtimeRoot, path.join(config.minecraftAgentRoot, 'claude'));
+	assert.deepEqual(config.claude.models, ['claude-sonnet-5-5']);
+	assert.deepEqual(config.claude.reasoningEfforts, ['low', 'high']);
 });
 
 test('dynamic config rejects an ephemeral voice port that the addon cannot discover', () => {

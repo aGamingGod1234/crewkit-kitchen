@@ -126,7 +126,7 @@ public final class AgentChatReporter {
 		return switch (provider.toLowerCase(Locale.ROOT)) {
 			case "codex" -> ChatFormatting.AQUA;
 			case "gemini", "antigravity" -> ChatFormatting.LIGHT_PURPLE;
-			case "kimi" -> ChatFormatting.GOLD;
+			case "claude" -> ChatFormatting.GOLD;
 			default -> ChatFormatting.WHITE;
 		};
 	}

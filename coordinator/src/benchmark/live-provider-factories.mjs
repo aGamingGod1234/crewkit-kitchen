@@ -1,12 +1,11 @@
 import path from 'node:path';
 
-import { AcpProviderService } from '../acp-service.mjs';
 import { AgentWorkspaceManager } from '../agent-workspace.mjs';
 import { CodexService } from '../codex-service.mjs';
 import { createProviderChildEnvironment } from '../provider-environment.mjs';
 import { sanitizeDiagnosticErrorCode, sanitizeDiagnosticErrorMessage, sanitizeDiagnosticText } from '../diagnostic-sanitizer.mjs';
 
-const PROVIDERS = new Set(['codex', 'kimi']);
+const PROVIDERS = new Set(['codex']);
 const DEFAULT_BRIDGE_SECRET_ENVIRONMENT_VARIABLE = 'ARENA_AGENT_BRIDGE_SECRET';
 const DEFAULT_PREFLIGHT_TIMEOUT_MS = 15_000;
 const PREFLIGHT_AGENT_ID = 'latency-preflight';
@@ -128,23 +127,17 @@ function createAvailableProvider({ provider, profile, service, catalogFallback, 
 
 function createDefaultService(provider, { config, environment, workspaceManager }, options) {
 	const dependencies = { workspaceManager };
-	if (provider === 'codex') {
-		if (options.codexTransport !== undefined) dependencies.transport = options.codexTransport;
-		if (options.now !== undefined) dependencies.now = options.now;
-		const launchProfile = config.launchProfile === undefined
-			? undefined
-			: { ...config.launchProfile, cwd: config.cwd, environment, bridgeSecretEnvironmentVariable: config.bridgeSecretEnvironmentVariable };
-		return new (options.CodexService ?? CodexService)({
-			...config,
-			...(launchProfile === undefined ? {} : { launchProfile }),
-			environment,
-			bridgeSecretEnvironmentVariable: config.bridgeSecretEnvironmentVariable,
-		}, dependencies);
-	}
-	if (options.kimiTransportFactory !== undefined) dependencies.transportFactory = options.kimiTransportFactory;
-	if (options.kimiDiscoverCatalog !== undefined) dependencies.discoverCatalog = options.kimiDiscoverCatalog;
-	if (options.execFile !== undefined) dependencies.execFile = options.execFile;
-	return new (options.AcpProviderService ?? AcpProviderService)({ ...config, provider, environment, bridgeSecretEnvironmentVariable: config.bridgeSecretEnvironmentVariable }, dependencies);
+	if (options.codexTransport !== undefined) dependencies.transport = options.codexTransport;
+	if (options.now !== undefined) dependencies.now = options.now;
+	const launchProfile = config.launchProfile === undefined
+		? undefined
+		: { ...config.launchProfile, cwd: config.cwd, environment, bridgeSecretEnvironmentVariable: config.bridgeSecretEnvironmentVariable };
+	return new (options.CodexService ?? CodexService)({
+		...config,
+		...(launchProfile === undefined ? {} : { launchProfile }),
+		environment,
+		bridgeSecretEnvironmentVariable: config.bridgeSecretEnvironmentVariable,
+	}, dependencies);
 }
 
 function providerConfig(provider, rootValue, options) {

@@ -11,8 +11,14 @@
       "timeoutMs": 240000,
       "rosterSize": 1,
       "assert": [
-        { "type": "lifecycle", "state": "COMPLETED" },
-        { "type": "action", "actionType": "navigate_to" }
+        {
+          "type": "lifecycle",
+          "state": "COMPLETED"
+        },
+        {
+          "type": "action",
+          "actionType": "navigate_to"
+        }
       ]
     },
     {
@@ -25,9 +31,19 @@
       "timeoutMs": 240000,
       "rosterSize": 8,
       "assert": [
-        { "type": "lifecycle", "state": "COMPLETED" },
-        { "type": "chat", "message": "MATRIX_CODEX_SOL_HIGH" },
-        { "type": "action", "actionType": "move_to", "resultState": "SUCCEEDED" }
+        {
+          "type": "lifecycle",
+          "state": "COMPLETED"
+        },
+        {
+          "type": "chat",
+          "message": "MATRIX_CODEX_SOL_HIGH"
+        },
+        {
+          "type": "action",
+          "actionType": "move_to",
+          "resultState": "SUCCEEDED"
+        }
       ]
     },
     {
@@ -40,9 +56,19 @@
       "timeoutMs": 240000,
       "rosterSize": 16,
       "assert": [
-        { "type": "lifecycle", "state": "COMPLETED" },
-        { "type": "chat", "message": "MATRIX_CODEX_LUNA_LOW" },
-        { "type": "action", "actionType": "move_to", "resultState": "SUCCEEDED" }
+        {
+          "type": "lifecycle",
+          "state": "COMPLETED"
+        },
+        {
+          "type": "chat",
+          "message": "MATRIX_CODEX_LUNA_LOW"
+        },
+        {
+          "type": "action",
+          "actionType": "move_to",
+          "resultState": "SUCCEEDED"
+        }
       ]
     },
     {
@@ -55,169 +81,94 @@
       "timeoutMs": 240000,
       "rosterSize": 1,
       "assert": [
-        { "type": "lifecycle", "state": "COMPLETED" },
-        { "type": "chat", "message": "MATRIX_CODEX_LUNA_HIGH" },
-        { "type": "action", "actionType": "move_to", "resultState": "SUCCEEDED" }
+        {
+          "type": "lifecycle",
+          "state": "COMPLETED"
+        },
+        {
+          "type": "chat",
+          "message": "MATRIX_CODEX_LUNA_HIGH"
+        },
+        {
+          "type": "action",
+          "actionType": "move_to",
+          "resultState": "SUCCEEDED"
+        }
       ]
     },
     {
-      "id": "kimi-k3-low",
-      "provider": "kimi",
-      "model": "kimi-code/k3",
-      "reasoningEffort": "low",
+      "id": "claude-opus-high",
+      "provider": "claude",
+      "model": "claude-opus-5-5",
+      "reasoningEffort": "high",
       "serviceTier": "priority",
-      "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_KIMI_K3_LOW, then finish the goal.",
+      "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_CLAUDE_OPUS_HIGH, then finish the goal.",
       "timeoutMs": 240000,
       "rosterSize": 1,
       "assert": [
-        { "type": "lifecycle", "state": "COMPLETED" },
-        { "type": "chat", "message": "MATRIX_KIMI_K3_LOW" },
-        { "type": "action", "actionType": "move_to", "resultState": "SUCCEEDED" },
-        { "type": "program", "event": "program_finished", "status": "FINISHED" }
+        {
+          "type": "lifecycle",
+          "state": "COMPLETED"
+        },
+        {
+          "type": "chat",
+          "message": "MATRIX_CLAUDE_OPUS_HIGH"
+        },
+        {
+          "type": "action",
+          "actionType": "move_to",
+          "resultState": "SUCCEEDED"
+        }
       ]
     },
     {
-      "id": "kimi-k3-high",
-      "provider": "kimi",
-      "model": "kimi-code/k3",
-      "reasoningEffort": "high",
+      "id": "claude-sonnet-medium",
+      "provider": "claude",
+      "model": "claude-sonnet-5-5",
+      "reasoningEffort": "medium",
       "serviceTier": "priority",
-      "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_KIMI_K3_HIGH, then finish the goal.",
-      "timeoutMs": 240000,
-      "rosterSize": 8,
-      "assert": [
-        { "type": "lifecycle", "state": "COMPLETED" },
-        { "type": "chat", "message": "MATRIX_KIMI_K3_HIGH" },
-        { "type": "action", "actionType": "move_to", "resultState": "SUCCEEDED" },
-        { "type": "program", "event": "program_finished", "status": "FINISHED" }
-      ]
-    },
-    {
-      "id": "kimi-k3-256k-low",
-      "provider": "kimi",
-      "model": "kimi-code/k3-256k",
-      "reasoningEffort": "low",
-      "serviceTier": "priority",
-      "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_KIMI_256K_LOW, then finish the goal.",
-      "timeoutMs": 240000,
-      "rosterSize": 16,
-      "assert": [
-        { "type": "lifecycle", "state": "COMPLETED" },
-        { "type": "chat", "message": "MATRIX_KIMI_256K_LOW" },
-        { "type": "action", "actionType": "move_to", "resultState": "SUCCEEDED" },
-        { "type": "program", "event": "program_finished", "status": "FINISHED" }
-      ]
-    },
-    {
-      "id": "kimi-k3-256k-high",
-      "provider": "kimi",
-      "model": "kimi-code/k3-256k",
-      "reasoningEffort": "high",
-      "serviceTier": "priority",
-      "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_KIMI_256K_HIGH, then finish the goal.",
+      "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_CLAUDE_SONNET_MEDIUM, then finish the goal.",
       "timeoutMs": 240000,
       "rosterSize": 1,
       "assert": [
-        { "type": "lifecycle", "state": "COMPLETED" },
-        { "type": "chat", "message": "MATRIX_KIMI_256K_HIGH" },
-        { "type": "action", "actionType": "move_to", "resultState": "SUCCEEDED" },
-        { "type": "program", "event": "program_finished", "status": "FINISHED" }
+        {
+          "type": "lifecycle",
+          "state": "COMPLETED"
+        },
+        {
+          "type": "chat",
+          "message": "MATRIX_CLAUDE_SONNET_MEDIUM"
+        },
+        {
+          "type": "action",
+          "actionType": "move_to",
+          "resultState": "SUCCEEDED"
+        }
       ]
     },
     {
-      "id": "cursor-composer-high-priority",
-      "provider": "cursor",
-      "model": "composer-2.5",
-      "reasoningEffort": "high",
+      "id": "claude-fable-low",
+      "provider": "claude",
+      "model": "claude-fable-5-1",
+      "reasoningEffort": "low",
       "serviceTier": "priority",
-      "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_CURSOR_COMPOSER_LOW, then finish the goal.",
+      "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_CLAUDE_FABLE_LOW, then finish the goal.",
       "timeoutMs": 240000,
       "rosterSize": 1,
       "assert": [
-        { "type": "lifecycle", "state": "COMPLETED" },
-        { "type": "chat", "message": "MATRIX_CURSOR_COMPOSER_LOW" },
-        { "type": "action", "actionType": "move_to", "resultState": "SUCCEEDED" },
-        { "type": "program", "event": "program_finished", "status": "FINISHED" }
-      ]
-    },
-    {
-      "id": "cursor-composer-high-fast",
-      "provider": "cursor",
-      "model": "composer-2.5",
-      "reasoningEffort": "high",
-      "serviceTier": "fast",
-      "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_CURSOR_COMPOSER_HIGH, then finish the goal.",
-      "timeoutMs": 240000,
-      "rosterSize": 8,
-      "assert": [
-        { "type": "lifecycle", "state": "COMPLETED" },
-        { "type": "chat", "message": "MATRIX_CURSOR_COMPOSER_HIGH" },
-        { "type": "action", "actionType": "move_to", "resultState": "SUCCEEDED" },
-        { "type": "program", "event": "program_finished", "status": "FINISHED" }
-      ]
-    },
-    {
-      "id": "cursor-grok-45-low-priority",
-      "provider": "cursor",
-      "model": "grok-4.5",
-      "reasoningEffort": "low",
-      "serviceTier": "priority",
-      "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_CURSOR_GROK45_LOW, then finish the goal.",
-      "timeoutMs": 240000,
-      "rosterSize": 16,
-      "assert": [
-        { "type": "lifecycle", "state": "COMPLETED" },
-        { "type": "chat", "message": "MATRIX_CURSOR_GROK45_LOW" },
-        { "type": "action", "actionType": "move_to", "resultState": "SUCCEEDED" },
-        { "type": "program", "event": "program_finished", "status": "FINISHED" }
-      ]
-    },
-    {
-      "id": "cursor-grok-45-high-fast",
-      "provider": "cursor",
-      "model": "grok-4.5",
-      "reasoningEffort": "high",
-      "serviceTier": "fast",
-      "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_CURSOR_GROK45_HIGH, then finish the goal.",
-      "timeoutMs": 240000,
-      "rosterSize": 1,
-      "assert": [
-        { "type": "lifecycle", "state": "COMPLETED" },
-        { "type": "chat", "message": "MATRIX_CURSOR_GROK45_HIGH" },
-        { "type": "action", "actionType": "move_to", "resultState": "SUCCEEDED" },
-        { "type": "program", "event": "program_finished", "status": "FINISHED" }
-      ]
-    },
-    {
-      "id": "cursor-grok-46-low-priority",
-      "provider": "cursor",
-      "model": "grok-4.6",
-      "reasoningEffort": "low",
-      "serviceTier": "priority",
-      "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_CURSOR_GROK46_LOW, then finish the goal.",
-      "timeoutMs": 240000,
-      "rosterSize": 8,
-      "assert": [
-        { "type": "lifecycle", "state": "COMPLETED" },
-        { "type": "chat", "message": "MATRIX_CURSOR_GROK46_LOW" },
-        { "type": "action", "actionType": "move_to", "resultState": "SUCCEEDED" },
-        { "type": "program", "event": "program_finished", "status": "FINISHED" }
-      ]
-    },
-    {
-      "id": "cursor-grok-46-high-fast",
-      "provider": "cursor",
-      "model": "grok-4.6",
-      "reasoningEffort": "high",
-      "serviceTier": "fast",
-      "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_CURSOR_GROK46_HIGH, then finish the goal.",
-      "timeoutMs": 240000,
-      "rosterSize": 16,
-      "assert": [
-        { "type": "lifecycle", "state": "COMPLETED" },
-        { "type": "chat", "message": "MATRIX_CURSOR_GROK46_HIGH" },
-        { "type": "action", "actionType": "move_to", "resultState": "SUCCEEDED" },
-        { "type": "program", "event": "program_finished", "status": "FINISHED" }
+        {
+          "type": "lifecycle",
+          "state": "COMPLETED"
+        },
+        {
+          "type": "chat",
+          "message": "MATRIX_CLAUDE_FABLE_LOW"
+        },
+        {
+          "type": "action",
+          "actionType": "move_to",
+          "resultState": "SUCCEEDED"
+        }
       ]
     },
     {
@@ -228,7 +179,12 @@
       "serviceTier": "fast",
       "task": "Break the oak log at x=2 y=201 z=0",
       "setupBlocks": [
-        { "x": 2, "y": 201, "z": 0, "blockId": "minecraft:oak_log" }
+        {
+          "x": 2,
+          "y": 201,
+          "z": 0,
+          "blockId": "minecraft:oak_log"
+        }
       ],
       "repetitions": 3,
       "planningTimeoutMs": 120000,
@@ -236,8 +192,15 @@
       "timeoutMs": 240000,
       "requireFactualSuccess": true,
       "assert": [
-        { "type": "lifecycle", "state": "COMPLETED" },
-        { "type": "rcon", "command": "execute if block 2 201 0 minecraft:air run data get entity {agent} Pos", "match": "has the following entity data" }
+        {
+          "type": "lifecycle",
+          "state": "COMPLETED"
+        },
+        {
+          "type": "rcon",
+          "command": "execute if block 2 201 0 minecraft:air run data get entity {agent} Pos",
+          "match": "has the following entity data"
+        }
       ]
     },
     {
@@ -246,20 +209,42 @@
       "model": "gpt-5.6-luna",
       "reasoningEffort": "xhigh",
       "serviceTier": "fast",
-        "task": "Get 1 wooden pickaxe",
-		"setupBlocks": [
-		  { "x": 2, "y": 201, "z": -1, "blockId": "minecraft:oak_log" },
-		  { "x": 2, "y": 201, "z": 0, "blockId": "minecraft:oak_log" },
-		  { "x": 2, "y": 201, "z": 1, "blockId": "minecraft:oak_log" }
-		],
+      "task": "Get 1 wooden pickaxe",
+      "setupBlocks": [
+        {
+          "x": 2,
+          "y": 201,
+          "z": -1,
+          "blockId": "minecraft:oak_log"
+        },
+        {
+          "x": 2,
+          "y": 201,
+          "z": 0,
+          "blockId": "minecraft:oak_log"
+        },
+        {
+          "x": 2,
+          "y": 201,
+          "z": 1,
+          "blockId": "minecraft:oak_log"
+        }
+      ],
       "repetitions": 3,
       "planningTimeoutMs": 120000,
       "scenarioTimeoutMs": 240000,
       "timeoutMs": 240000,
       "requireFactualSuccess": true,
       "assert": [
-        { "type": "lifecycle", "state": "COMPLETED" },
-        { "type": "rcon", "command": "data get entity {agent} Inventory", "match": "minecraft:wooden_pickaxe" }
+        {
+          "type": "lifecycle",
+          "state": "COMPLETED"
+        },
+        {
+          "type": "rcon",
+          "command": "data get entity {agent} Inventory",
+          "match": "minecraft:wooden_pickaxe"
+        }
       ]
     }
   ]

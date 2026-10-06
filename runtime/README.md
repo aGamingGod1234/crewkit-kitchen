@@ -59,7 +59,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-dynamic-coordinator.ps1
 
 Both scripts use `runtime\bridge-secret.txt`. `start-test-server.ps1` starts only the prepared Fabric server. `start-dynamic-coordinator.ps1` starts the manual development coordinator and requires the Codex CLI to be authenticated. The packaged launcher profile uses the bundled coordinator supervisor and must not run this second coordinator. Keep the secret file local and never attach it to evidence.
 
-The Fabric mod must be present on both the server and joining client because the custom NPC entity and renderer are mod-defined. All summoned NPCs share one authenticated server bridge. Each provider uses a stable per-agent directory under `runtime/agent-workspaces`. Codex keeps separate threads, Kimi keeps separate ACP processes and sessions, and Cursor resumes its native agent session. Gemini identities remain readable for saved-profile compatibility, but production planning fails closed because Antigravity cannot enforce the required no-tool boundary. Provider credentials remain in their normal CLI locations.
+The Fabric mod must be present on both the server and joining client because the custom NPC entity and renderer are mod-defined. All summoned NPCs share one authenticated server bridge. Each provider uses a stable per-agent directory under `runtime/agent-workspaces`. Codex keeps separate threads, and Claude keeps one Claude Code process per NPC in the shared Minecraft agent workspace. Gemini identities remain readable for saved-profile compatibility, but production planning fails closed because Antigravity cannot enforce the required no-tool boundary. Provider credentials remain in their normal CLI locations.
 
 ## Evidence classes
 

@@ -14,6 +14,8 @@ import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.AgentTransition;
 import dev.agaminggod.arenaagents.control.AgentControlCatalog;
+import dev.agaminggod.arenaagents.pov.PovMode;
+import dev.agaminggod.arenaagents.server.pov.PovCommands;
 import dev.agaminggod.arenaagents.server.group.AgentGroup;
 import dev.agaminggod.arenaagents.server.group.AgentGroupSpawnCoordinator;
 import dev.agaminggod.arenaagents.server.goal.GoalDraftChoice;
@@ -51,8 +53,6 @@ public final class CodexAgentCommands {
 	private static final String PROVIDER_CODEX = "codex";
 	private static final String PROVIDER_GEMINI = "gemini";
 	private static final String PROVIDER_CLAUDE = "claude";
-	private static final String PROVIDER_KIMI = "kimi";
-	private static final String PROVIDER_CURSOR = "cursor";
 	private static final List<String> VOICE_PROFILE_IDS = VoiceCatalog.selectableIds();
 	private static final List<String> VOICE_TONES = List.of(
 			"neutral", "warm", "excited", "serious", "dramatic", "whisper", "robotic", "angry");
@@ -81,6 +81,7 @@ public final class CodexAgentCommands {
 
 	static void register(CommandDispatcher<CommandSourceStack> dispatcher) {
 		dispatcher.register(Commands.literal("agent").then(goalDraftCommands()));
+		PovCommands.register(dispatcher, CodexAgentCommands::agentArgument);
 		dispatcher.register(
 				Commands.literal("verbose")
 						.requires(GoalControl::mayControl)
@@ -93,8 +94,7 @@ public final class CodexAgentCommands {
 								.requires(GoalControl::mayControl)
 								.executes(context -> summon(context, PROVIDER_CODEX, DEFAULT_MODEL, DEFAULT_REASONING, Optional.empty()))
 								.then(providerSummon(PROVIDER_GEMINI))
-								.then(providerSummon(PROVIDER_KIMI))
-								.then(providerSummon(PROVIDER_CURSOR))
+								.then(providerSummon(PROVIDER_CLAUDE))
 								.then(Commands.argument(ARGUMENT_MODEL, AgentModelArgumentType.model())
 										.then(Commands.argument(ARGUMENT_REASONING, StringArgumentType.word())
 												.executes(context -> summon(
@@ -153,6 +153,8 @@ public final class CodexAgentCommands {
 								.requires(GoalControl::mayControl)
 								.then(agentArgument().executes(CodexAgentCommands::toggleAutomatic)))
 						.then(skitCommands())
+						.then(PovCommands.codexAlias("spectate", PovMode.SPECTATE, CodexAgentCommands::agentArgument))
+						.then(PovCommands.codexAlias("takeover", PovMode.TAKEOVER, CodexAgentCommands::agentArgument))
 						);
 	}
 
@@ -167,7 +169,7 @@ public final class CodexAgentCommands {
 		var summon = Commands.literal("summon");
 		var provider = Commands.argument("provider", StringArgumentType.word())
 				.suggests((context, builder) -> SharedSuggestionProvider.suggest(
-						List.of(PROVIDER_CODEX, PROVIDER_GEMINI, PROVIDER_CLAUDE, PROVIDER_KIMI, PROVIDER_CURSOR), builder));
+						List.of(PROVIDER_CODEX, PROVIDER_GEMINI, PROVIDER_CLAUDE), builder));
 		provider.then(Commands.argument("name", StringArgumentType.string()).executes(CodexAgentCommands::skitSummon));
 		provider.then(Commands.literal("model")
 				.then(Commands.argument(ARGUMENT_MODEL, AgentModelArgumentType.model())
@@ -417,9 +419,7 @@ public final class CodexAgentCommands {
 			String model = explicitModel(context).orElseGet(() -> switch (provider) {
 				case PROVIDER_CODEX -> DEFAULT_MODEL;
 				case PROVIDER_GEMINI -> "gemini-3.1-pro";
-				case PROVIDER_CLAUDE -> "claude-sonnet-4-6";
-				case PROVIDER_KIMI -> "kimi-code/k3";
-				case PROVIDER_CURSOR -> "composer-2.5";
+				case PROVIDER_CLAUDE -> "claude-sonnet-5-5";
 				default -> throw new AgentDomainException("INVALID_PROVIDER", "Unsupported skit provider: " + provider);
 			});
 			SkitActor actor = SkitActors.summon(context.getSource().getLevel(), position, provider, name);
@@ -452,9 +452,8 @@ public final class CodexAgentCommands {
 	}
 
 	private static List<String> skitModels(String provider) {
-		String catalogProvider = PROVIDER_CLAUDE.equals(provider) ? PROVIDER_GEMINI : provider;
 		try {
-			return AgentControlCatalog.models(catalogProvider);
+			return AgentControlCatalog.models(provider);
 		} catch (IllegalArgumentException ignored) {
 			return List.of();
 		}
@@ -825,7 +824,7 @@ public final class CodexAgentCommands {
 		return Commands.literal("summon-configured").requires(GoalControl::mayControl).then(
 				Commands.argument(ARGUMENT_PROVIDER, StringArgumentType.word())
 						.suggests((context, builder) -> SharedSuggestionProvider.suggest(
-								List.of(PROVIDER_CODEX, PROVIDER_GEMINI, PROVIDER_KIMI, PROVIDER_CURSOR), builder))
+								List.of(PROVIDER_CODEX, PROVIDER_GEMINI, PROVIDER_CLAUDE), builder))
 						.then(Commands.argument(ARGUMENT_MODEL, AgentModelArgumentType.model()).then(
 								Commands.argument(ARGUMENT_REASONING, StringArgumentType.word()).then(
 										Commands.argument(ARGUMENT_SERVICE_TIER, StringArgumentType.word())

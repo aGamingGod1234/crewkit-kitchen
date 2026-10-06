@@ -20,7 +20,14 @@
     "ServerGamePacketListenerInvoker",
     "PlayerObservationEventsMixin",
     "ServerPlayerGameModeBreakAccessor",
-    "ServerPlayerGameModeMixin"
+    "ServerPlayerGameModeMixin",
+    "ChunkMapPovViewMixin",
+    "ChunkMapTrackedEntityPovMixin",
+    "PlayerChunkSenderPovMixin",
+    "PlayerListBroadcastPovMixin",
+    "ServerLevelParticlesPovMixin",
+    "AbstractContainerMenuAccessor",
+    "ServerGamePacketListenerImplAccessor"
   ],
   "injectors": {
     "defaultRequire": 1

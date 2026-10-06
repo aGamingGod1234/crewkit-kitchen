@@ -37,7 +37,7 @@ test('provider transports own late stdio EPIPE errors and reject pending work on
 			{ spawn: spawnUncooperativeChild(child), stopTimeoutMs: FAST_STOP_TIMEOUT_MS },
 		)],
 		['ACP', (child) => new AcpStdioTransport(
-			{ provider: 'kimi', cwd: process.cwd() },
+			{ provider: 'gemini', cwd: process.cwd() },
 			{ spawn: spawnUncooperativeChild(child), stopTimeoutMs: FAST_STOP_TIMEOUT_MS },
 		)],
 	]) {
@@ -104,15 +104,6 @@ function transportCases() {
 				);
 			},
 		},
-		{
-			name: 'Kimi ACP',
-			create(child) {
-				return new AcpStdioTransport(
-					{ provider: 'kimi', reasoningEffort: 'high' },
-					{ spawn: spawnUncooperativeChild(child), stopTimeoutMs: FAST_STOP_TIMEOUT_MS },
-				);
-			},
-		},
 	];
 }
 
@@ -124,7 +115,7 @@ function createWithSpawn(entry, child, spawn) {
 		);
 	}
 	return new AcpStdioTransport(
-		{ provider: entry.name === 'Gemini ACP' ? 'gemini' : 'kimi', reasoningEffort: 'high' },
+		{ provider: 'gemini', reasoningEffort: 'high' },
 		{ spawn, stopTimeoutMs: FAST_STOP_TIMEOUT_MS },
 	);
 }

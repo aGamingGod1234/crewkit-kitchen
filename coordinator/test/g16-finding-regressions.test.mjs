@@ -66,7 +66,7 @@ async function runCase(mode) {
     async stop() {},
     catalog: { stale: true, async refresh() { throw new Error('unreachable'); } },
   });
-  const providers = new ProviderService({ codex, gemini: unavailable(), kimi: unavailable() });
+  const providers = new ProviderService({ codex, gemini: unavailable(), claude: unavailable() });
   const bridge = new CaptureBridge();
   const coordinator = createDynamicCoordinator({ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { launchProfile } }, {
     bridge, providerService: providers, memoryDirectory: null, env: {},

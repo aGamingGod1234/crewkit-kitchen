@@ -11,6 +11,10 @@ import dev.agaminggod.arenaagents.control.AgentControlSnapshot;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.control.AgentControlSnapshotPayload;
+import dev.agaminggod.arenaagents.pov.OperatorActionPayload;
+import dev.agaminggod.arenaagents.pov.OperatorInputPayload;
+import dev.agaminggod.arenaagents.pov.PovPayloads;
+import dev.agaminggod.arenaagents.server.pov.PovSessionRuntime;
 import dev.agaminggod.arenaagents.scenario.ScenarioLaunchPayload;
 import dev.agaminggod.arenaagents.scenario.ScenarioCancelPayload;
 import dev.agaminggod.arenaagents.scenario.ScenarioPresets;
@@ -54,6 +58,14 @@ public final class AgentControlSync {
 	public static synchronized void register() {
 		if (registered) {
 			return;
+		}
+		PovPayloads.registerTypes();
+		// Takeover input is routed on the server thread; the runtime re-checks the session and permission.
+		if (!ServerPlayNetworking.registerGlobalReceiver(OperatorInputPayload.TYPE,
+				(payload, context) -> context.server().execute(() -> PovSessionRuntime.handleInput(context.player(), payload)))
+				|| !ServerPlayNetworking.registerGlobalReceiver(OperatorActionPayload.TYPE,
+				(payload, context) -> context.server().execute(() -> PovSessionRuntime.handleAction(context.player(), payload)))) {
+			throw new IllegalStateException("Arena Agents takeover input receivers are already registered");
 		}
 		PayloadTypeRegistry.serverboundPlay().register(AgentControlRequestPayload.TYPE, AgentControlRequestPayload.CODEC);
 		PayloadTypeRegistry.serverboundPlay().register(dev.agaminggod.arenaagents.control.LiveTaskViewPayload.Request.TYPE, dev.agaminggod.arenaagents.control.LiveTaskViewPayload.Request.CODEC);

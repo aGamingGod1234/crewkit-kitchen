@@ -229,7 +229,7 @@ test('reconciliation disconnects in-flight persisted agents, preserves explicit 
 test('recovery reconciliation re-arms active goals without changing revisions or exact profiles', () => {
 	const registry = new AgentRegistry({ now: () => 99 });
 	const snapshot = [
-		record('agent-a', { state: DynamicAgentState.STARTING, currentGoal: 'Start.', goalRevision: 5, provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'max', serviceTier: 'priority' }),
+		record('agent-a', { state: DynamicAgentState.STARTING, currentGoal: 'Start.', goalRevision: 5, provider: 'claude', model: 'claude-sonnet-5-5', reasoningEffort: 'high', serviceTier: 'priority' }),
 		record('agent-b', { state: DynamicAgentState.PLANNING, currentGoal: 'Plan.', goalRevision: 6 }),
 		record('agent-c', { state: DynamicAgentState.ACTING, currentGoal: 'Act.', goalRevision: 7 }),
 		record('agent-d', { state: DynamicAgentState.DISCONNECTED, currentGoal: 'Reconnect.', goalRevision: 8 }),
@@ -246,7 +246,7 @@ test('recovery reconciliation re-arms active goals without changing revisions or
 	]);
 	assert.deepEqual(
 		pickRecoveryIdentity(registry.get('agent-a')),
-		{ currentGoal: 'Start.', goalRevision: 5, provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'max', serviceTier: 'priority' },
+		{ currentGoal: 'Start.', goalRevision: 5, provider: 'claude', model: 'claude-sonnet-5-5', reasoningEffort: 'high', serviceTier: 'priority' },
 	);
 	const first = registry.snapshot();
 	registry.reconcile(first, { recovery: true });
@@ -386,10 +386,8 @@ test('registry persistence codec is deterministic and disconnects active work on
 test('legacy registry snapshots migrate to the Codex provider while explicit providers round-trip', () => {
 	const legacy = JSON.stringify({ schemaVersion: 1, agents: [record('legacy', { provider: undefined })] });
 	assert.equal(decodeAgentRegistrySnapshot(legacy)[0].provider, 'codex');
-	const encoded = encodeAgentRegistrySnapshot([record('kimi', { provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'max' })]);
-	assert.equal(decodeAgentRegistrySnapshot(encoded)[0].provider, 'kimi');
-	const cursor = encodeAgentRegistrySnapshot([record('cursor', { provider: 'cursor', model: 'composer-2.5', reasoningEffort: 'high' })]);
-	assert.equal(decodeAgentRegistrySnapshot(cursor)[0].provider, 'cursor');
+	const encoded = encodeAgentRegistrySnapshot([record('claude', { provider: 'claude', model: 'claude-opus-5-5', reasoningEffort: 'high' })]);
+	assert.equal(decodeAgentRegistrySnapshot(encoded)[0].provider, 'claude');
 	assert.throws(() => normalizeAgentRecord(record('bad', { provider: 'unknown' })), /provider/i);
 });
 

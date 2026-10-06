@@ -38,7 +38,7 @@ public final class AgentControlVerification {
 				new AgentId(UUID.fromString(AGENT_UUID)),
 				Optional.of(UUID.fromString("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")),
 				Optional.empty(),
-				new AgentProfile("kimi", "kimi-code/k3", "max", Optional.of("Builder"), 2),
+				new AgentProfile("claude", "claude-sonnet-5-5", "high", Optional.of("Builder"), 2),
 				AgentLifecycleState.ACTING,
 				Optional.of(AgentGoal.create("Build a safe house", NOW_EPOCH_MS)),
 				3L,
@@ -136,7 +136,7 @@ public final class AgentControlVerification {
 				agents.stream().map(AgentControlAgent::agentId).toList()));
 		var efforts = java.util.stream.IntStream.range(0, 12).mapToObj(i -> "<".repeat(30) + String.format("%02d", i)).toList();
 		var tiers = java.util.stream.IntStream.range(0, 8).mapToObj(i -> "<".repeat(22) + String.format("%02d", i)).toList();
-		var option = new AgentControlModelOption("cursor", "<".repeat(128), "<".repeat(96), efforts, tiers);
+		var option = new AgentControlModelOption("claude", "<".repeat(128), "<".repeat(96), efforts, tiers);
 		var saturated = new AgentControlSnapshot(AgentControlSnapshot.SCHEMA_VERSION, true, true, "<".repeat(160),
 				Long.MAX_VALUE, agents, groups, java.util.Collections.nCopies(128, option));
 		String encoded = AgentControlSnapshotCodec.encode(saturated);
@@ -156,7 +156,7 @@ public final class AgentControlVerification {
 	}
 
 	private static int verifyProviderPresets() {
-		assertEquals(List.of("codex", "gemini", "kimi", "cursor"), AgentControlCatalog.providers(), "provider order");
+		assertEquals(List.of("codex", "gemini", "claude"), AgentControlCatalog.providers(), "provider order");
 		assertEquals("gpt-6-luna", AgentControlCatalog.defaultModel("codex"), "Codex model default");
 		assertEquals("xhigh", AgentControlCatalog.defaultReasoning("codex", "gpt-6-luna"), "Codex reasoning default");
 		assertEquals("fast", AgentControlCatalog.defaultServiceTier("codex", "gpt-6-luna"), "Codex speed default");
@@ -167,22 +167,23 @@ public final class AgentControlVerification {
 				"GPT OSS actors use their supported reasoning default");
 		assertEquals("priority", AgentControlCatalog.defaultServiceTier("gemini", "gemini-3.1-pro"),
 				"non-Codex speed default");
-		assertEquals("kimi-code/k3", AgentControlCatalog.defaultModel("kimi"), "Kimi model default");
+		assertEquals("claude-opus-5-5", AgentControlCatalog.defaultModel("claude"), "Claude model default");
+		assertEquals(List.of("claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"), AgentControlCatalog.models("claude"),
+				"Claude model presets");
+		assertEquals("high", AgentControlCatalog.defaultReasoning("claude", "claude-sonnet-5-5"), "Claude reasoning default");
+		assertEquals("priority", AgentControlCatalog.defaultServiceTier("claude", "claude-sonnet-5-5"), "Claude has no fast tier");
 		assertEquals(List.of("high", "low"), AgentControlCatalog.reasoningEfforts("gemini", "gemini-3.1-pro"),
 				"Gemini Pro efforts");
 		assertEquals(List.of("high", "medium", "low"),
 				AgentControlCatalog.reasoningEfforts("gemini", "gemini-3.6-flash"), "Gemini Flash efforts");
-		assertTrue(AgentControlCatalog.models("kimi").contains("kimi-code/k3-256k"),
-				"Kimi live 256k model preset");
-		assertEquals(List.of("low", "high", "max"), AgentControlCatalog.reasoningEfforts("kimi", "kimi-code/k3-256k"),
-				"Kimi K3-256k efforts");
-		assertEquals(List.of("low", "high", "max"), AgentControlCatalog.reasoningEfforts("kimi", "kimi-code/k3"),
-				"Kimi K3 efforts");
-		assertEquals(List.of("high"), AgentControlCatalog.reasoningEfforts("kimi", "kimi-code/kimi-for-coding"),
-				"Kimi fixed effort");
-		assertEquals("K2.7 Coding Highspeed",
-				AgentControlCatalog.displayName("kimi", "kimi-code/kimi-for-coding-highspeed"),
-				"Kimi aliases use the installed CLI display name instead of a guessed label");
+		for (String model : List.of("claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1")) {
+			assertEquals(List.of("low", "medium", "high"), AgentControlCatalog.reasoningEfforts("claude", model),
+					"Claude models offer Low through High only");
+		}
+		assertEquals("Claude Fable 5.1", AgentControlCatalog.displayName("claude", "claude-fable-5-1"),
+				"Claude display name");
+		expectFailure(() -> AgentControlCatalog.defaultModel("kimi"), "retired Kimi provider");
+		expectFailure(() -> AgentControlCatalog.defaultModel("cursor"), "retired Cursor provider");
 		assertEquals(List.of("low", "medium", "high", "xhigh", "max", "ultra"),
 				AgentControlCatalog.reasoningEfforts("codex", "gpt-6.1-sol"), "Codex effort choices");
 		assertEquals(List.of("priority", "fast"), AgentControlCatalog.serviceTiers("codex", "gpt-6.1-sol"),
@@ -204,9 +205,9 @@ public final class AgentControlVerification {
 				"Codex summon command"
 		);
 		assertEquals(
-				"codex summon-configured kimi \"kimi-code/k3\" max priority survival Scout",
-				AgentControlCommandBuilder.summon("kimi", "kimi-code/k3", "max", "Scout"),
-				"Kimi summon command"
+				"codex summon-configured claude claude-opus-5-5 high priority survival Scout",
+				AgentControlCommandBuilder.summon("claude", "claude-opus-5-5", "high", "Scout"),
+				"Claude summon command"
 		);
 		assertEquals(
 				"codex summon-configured codex gpt-6.1-sol ultra fast survival Speedy",
@@ -296,12 +297,12 @@ public final class AgentControlVerification {
 						"codex", "gpt-5.6-sol", "GPT 5.6 Sol", List.of("high"), List.of("fast")
 				),
 				new AgentControlModelOption(
-						"kimi", "kimi-code/live", "Kimi Live", List.of("high"), List.of()
+						"claude", "claude-live", "Claude Live", List.of("high"), List.of()
 				)
 		);
 		try {
 			AgentControlCatalog.installRuntimeCatalog(AgentControlCatalog.selectableOptions(live));
-			assertEquals(List.of("codex", "kimi"), AgentControlCatalog.providers(),
+			assertEquals(List.of("codex", "claude"), AgentControlCatalog.providers(),
 					"runtime catalog controls provider order");
 			assertEquals(List.of("gpt-6.1-sol"), AgentControlCatalog.models("codex"),
 					"runtime catalog offers only the selected Codex roster");

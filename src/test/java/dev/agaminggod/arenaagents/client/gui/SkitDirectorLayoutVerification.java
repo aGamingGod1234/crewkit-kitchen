@@ -81,7 +81,7 @@ public final class SkitDirectorLayoutVerification {
 			set(screen, SkitDirectorScreen.class, "provider", "claude");
 			screen.acceptCatalogUpdate();
 			AgentControlCatalog.installRuntimeCatalog(List.of(new AgentControlModelOption(
-					"cursor", "replacement-model", "Replacement model", List.of("high"), List.of("priority"))));
+					"gemini", "replacement-model", "Replacement model", List.of("high"), List.of("priority"))));
 			screen.acceptCatalogUpdate();
 			check(get(screen, "provider").equals("claude"), "actor appearance is independent of AI catalog changes");
 			check(edit(screen, "actorName").getValue().equals("Draft actor"), "catalog replacement preserves actor drafts");

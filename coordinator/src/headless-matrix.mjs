@@ -6,7 +6,7 @@ import { HeadlessRconClient } from './headless-rcon.mjs';
 import { sanitizeDiagnosticErrorStack, sanitizeDiagnosticText, sanitizeDiagnosticValue } from './diagnostic-sanitizer.mjs';
 import { claimNaturalWorld, classifyHeadlessFailure, normalizeHeadlessWorld, parsePlayerPosition, parseServerSeed, summarizeProviderAttestation, validateNaturalWorldManifest } from './headless-world.mjs';
 
-const PROVIDERS = new Set(['codex', 'kimi', 'cursor']);
+const PROVIDERS = new Set(['codex', 'claude']);
 const MAX_TIMEOUT_MS = 900_000;
 const MAX_NATURAL_TIMEOUT_MS = 21_600_000;
 const MAX_DIAGNOSTICS = 4096;

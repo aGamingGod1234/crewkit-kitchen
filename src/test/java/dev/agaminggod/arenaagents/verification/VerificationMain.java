@@ -30,6 +30,7 @@ import dev.agaminggod.arenaagents.client.navigation.LocalPathfinderVerification;
 import dev.agaminggod.arenaagents.control.AgentControlVerification;
 import dev.agaminggod.arenaagents.control.AgentControlSelectionStateVerification;
 import dev.agaminggod.arenaagents.control.AgentRosterViewStateVerification;
+import dev.agaminggod.arenaagents.pov.PovContractsVerification;
 import dev.agaminggod.arenaagents.protocol.ActionCommand;
 import dev.agaminggod.arenaagents.protocol.ActionResult;
 import dev.agaminggod.arenaagents.protocol.ActionState;
@@ -272,7 +273,14 @@ public final class VerificationMain {
 		passedAssertions += dev.agaminggod.arenaagents.server.bridge.BridgeIntegrationFindingsVerification.verify();
 		passedAssertions += AgentVerboseVerification.verify();
 		passedAssertions += SingleBrainBoundaryVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.pov.PovViewRedirectVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.pov.PovStatePublisherVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.pov.PovSessionVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.pov.OperatorBodyControlVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.client.pov.PovClientStateVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.client.pov.PovInputCaptureVerification.verify();
 		verifyJsonLineFraming(codec);
+		passedAssertions += PovContractsVerification.verify();
 
 		System.out.printf("PASS: %d protocol and core assertions%n", passedAssertions);
 	}

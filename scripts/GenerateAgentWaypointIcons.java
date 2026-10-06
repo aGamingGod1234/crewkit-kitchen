@@ -49,6 +49,20 @@ public final class GenerateAgentWaypointIcons {
 			Files.writeString(styleRoot.resolve(code + ".json"),
 					"{\n  \"sprites\": [\"arenaagents:agent/" + code + "\"]\n}\n", StandardCharsets.UTF_8);
 		}
-		if (codes.size() != 64) throw new IllegalStateException("Expected 64 variants, found " + codes.size());
+		if (codes.size() != 48) throw new IllegalStateException("Expected 48 variants, found " + codes.size());
+		// Retired providers leave sprites and styles behind; the manifest is the only source of truth.
+		removeStale(spriteRoot, ".png", codes);
+		removeStale(styleRoot, ".json", codes);
+	}
+
+	private static void removeStale(Path root, String extension, Set<String> codes) throws java.io.IOException {
+		try (var files = Files.list(root)) {
+			for (Path file : files.toList()) {
+				String name = file.getFileName().toString();
+				if (name.endsWith(extension) && !codes.contains(name.substring(0, name.length() - extension.length()))) {
+					Files.delete(file);
+				}
+			}
+		}
 	}
 }

@@ -842,3 +842,73 @@
 ### Suggested Next Steps
 - Re-run `scripts/run-antigravity-headless-smoke.ps1` after Antigravity model catalog updates.
 - If Antigravity adds stdin or a structured-output API, replace the Windows prompt-size boundary with that transport.
+
+## 2026-10-06 — Claude provider replaces Kimi and Cursor
+
+### What Was Implemented
+- Added the `claude` provider (`coordinator/src/claude-service.mjs`): one Claude Code CLI process per native agent in stream-json mode, reusing the operator's existing `claude` login. Claude Opus 5.5, Sonnet 5.5, and Fable 5.1 are offered at Low, Medium, and High reasoning only; no fast tier.
+- Claude agents receive exactly what Codex agents receive: the shared `runtime/minecraft-agent/workspace` directory, the same AGENTS.md and minecraft-control skill as the system prompt, and the same native Minecraft tools served through a per-agent loopback MCP endpoint (`coordinator/src/claude-tool-server.mjs`) with a bearer token per body.
+- Claude Code isolation: `--setting-sources ""`, `--strict-mcp-config`, `--restricted`, `--tools Read,Glob,Grep`, `--permission-mode dontAsk`, auto-memory and slash commands disabled, no session persistence. User CLAUDE.md, hooks, plugins, and other MCP servers never reach an agent.
+- Steering during a Claude turn rides along with the next tool result instead of Claude Code's own mid-turn queue (which can spill into a second turn); a steer that never reaches a tool boundary is rejected so the coordinator defers it to the next turn.
+- Account-level refusals from Claude Code (usage credits, access, login) map to non-retryable `MODEL_UNAVAILABLE` / `AUTHENTICATION_REQUIRED` codes.
+- Removed the Kimi and Cursor providers end to end: services, catalog discovery, config sections, environment allowlists, headless/latency matrices, Java catalog, commands, Skit Director entries, colors, skins, locator icons, and tests. Saved worlds that still contain Kimi or Cursor agents drop those agents on load instead of failing; installed configs with `kimi`/`cursor` sections are ignored.
+- Claude agents wear the Claude brand skin; the visual manifest now declares codex, gemini, and claude with new `claude_*` family textures, transport codes `a00`–`a33`, and regenerated locator-bar sprites.
+- Generated default names no longer end on a separator at the 16-character limit (`Claude_Sonnet_5`, not `Claude_Sonnet_5_`).
+
+### Files Modified
+- `coordinator/src/claude-service.mjs`, `coordinator/src/claude-tool-server.mjs`, `coordinator/test/claude-service.test.mjs` — new provider, MCP tool endpoint, and coverage with a fake Claude Code process.
+- `coordinator/src/provider-identity.mjs`, `provider-environment.mjs`, `provider-service.mjs`, `agent-planner.mjs`, `dynamic-main.mjs`, `codex-service.mjs` (exported instruction builders) — provider set, native-tool providers, config, and wiring.
+- `coordinator/src/acp-transport.mjs`, `provider-catalog-discovery.mjs`, `headless-matrix.mjs`, `benchmark/*` — Kimi/Cursor removal; `acp-service.mjs` and `cursor-service.mjs` deleted.
+- `coordinator/config/dynamic-agents.json`, `headless-provider-matrix.json`, `latency-experiment-matrix.json` — Claude catalog and scenarios.
+- `src/main/java/.../agent/*`, `control/*`, `server/CodexAgentCommands.java`, `server/AgentChatReporter.java`, `server/AgentVerboseChat.java`, `src/client/.../gui/ConsoleTheme.java`, `gui/SkitDirectorScreen.java` — provider lists, model names, catalog, commands, colors, retired-provider load handling.
+- `src/main/resources/assets/arenaagents/identity/agent_visual_manifest.json`, `textures/entity/*`, `textures/gui/sprites/hud/locator_bar_dot/agent/*`, `waypoint_style/agent/*` — regenerated identity assets.
+- `scripts/generate-agent-skins.mjs`, `scripts/GenerateAgentWaypointIcons.java`, `scripts/run-headless-provider-matrix.ps1`, `scripts/test-run-headless-provider-matrix.ps1` — generators and preflight.
+- `README.md`, `runtime/README.md`, `docs/agent-logo-skins.md` — operator guidance.
+
+### Assumptions Made (flag these for review)
+- Claude model slugs are `claude-opus-5-5`, `claude-sonnet-5-5`, and `claude-fable-5-1`; Opus and Sonnet were exercised live.
+- `claude` on PATH is the Claude Code CLI (`claude.exe`), the same way `codex` is resolved.
+- The Skit Director and `/codex skit summon claude` now target the Claude provider; Gemini's Antigravity-hosted Claude 4.6 models remain under `gemini`.
+
+### Known Issues / Deferred
+- Fable 5.1 was refused on this account ("requires usage credits"); the agent stops with `MODEL_UNAVAILABLE` until credits are enabled.
+- Claude Code does not report the effective reasoning effort; execution settings record it as a launch argument.
+- No in-game session was run; verification covered the coordinator suite (1669 pass, one pre-existing Windows-SID sandbox failure), the Java core verification (15,318 assertions), the Gradle build, and live Claude turns against a fake world.
+
+### Suggested Next Steps
+- Run `scripts/run-headless-provider-matrix.ps1` with the three Claude scenarios once Fable credits are available.
+- Consider `--include-partial-messages` for verbose streaming parity with Codex.
+
+## 2026-10-06 — Agent POV spectating and takeover
+
+### What Was Implemented
+- `/spectator <agent>` and `/spectator exit`: the operator's camera binds to the agent's first-person view while the operator's own body stays where it is. The server streams the agent's vitals, hotbar, offhand, armor, XP, effects, open container contents and death state (`pov/` payloads); the client feeds them into an unregistered stand-in player that vanilla's HUD renders, mirrors container screens read-only, and shows an agent death screen. Several operators may spectate one agent.
+- `/takeover <agent>` and `/takeover exit`: exclusive per agent. The agent's model is stopped through the existing lifecycle (`stop`/`resume`) behind a transient reservation (`AgentControlReservations`, folded into skit mode's `requireNormalControlAllowed` gate) so start, steer, resume, queue, skit placement and conversation wakes are refused while an operator owns the body. Operator inputs are captured client-side without moving the operator's body (keyboard, mouse look, hotbar, clicks) and applied server-side through an `InputOwner.OPERATOR` lease (priority 1000) on Carpet's action pack; attack clicks hit entities once per click with vanilla cooldown, held attack mines, use runs vanilla's main-then-off-hand loop, drop/swap/pick relay through the agent's own connection, container clicks relay into the agent's menu. Automatic respawn is suspended during a takeover; the operator decides from the death screen. On exit the agent resumes from the state it was left in and receives a takeover report as an operator DM.
+- Exit rules: `/takeover exit`, operator disconnect/death/teleport/dimension change/lost permission, agent removal or dimension change (message tells the operator to re-run the command once in the same dimension), skit or scenario claim, server stop. Takeover only: the operator's body losing 4.0 HP (health plus absorption) or dying, via Fabric entity damage events.
+- Operator view follows the agent: `ChunkMap`, `PlayerChunkSender`, `PlayerList.broadcast`, `ServerLevel.sendParticles`/`destroyBlockProgress`/`explode` read a per-operator anchor (`PovViewAnchors`) so chunks, entities, sounds and particles arrive around the agent while the body's own chunk tickets are untouched.
+- `verifyPovMixins` Gradle task: loads every POV mixin target class through Fabric's Knot (26 classes) so a mis-targeted injector fails in CI instead of at first launch.
+- Also in this branch: the Claude provider work (see the 2026-10-06 Claude entry) rebased onto main, and goal translation now runs on Luna for Codex agents and Sonnet 5.5 for Claude agents at medium effort.
+
+### Files Modified
+- `src/main/java/dev/agaminggod/arenaagents/pov/**` — payload records, codecs, `PovViewAnchors`, `OperatorBodyController` contracts.
+- `src/main/java/dev/agaminggod/arenaagents/server/pov/**` — `PovSessionRuntime`, `PovSession`, `PovCommands`, `AgentControlReservations`, `PovStatePublisher`, `PovAgentSnapshot`, `PovTakeoverSummary`, `PovViewRedirect`, `CarpetOperatorBodyController`, `OperatorActionDispatcher`.
+- `src/main/java/dev/agaminggod/arenaagents/mixin/*Pov*`, `AbstractContainerMenuAccessor`, `ServerGamePacketListenerImplAccessor` — server mixins.
+- `src/client/java/dev/agaminggod/arenaagents/client/pov/**`, `client/mixin/*Pov*`, `MenuScreensInvoker` — client session, camera, HUD proxy, badge, input capture, mirrored screens, death screen.
+- `server/CodexAgentServerRuntime.java`, `CodexAgentCommands.java`, `CodexAgentManager.java`, `SkitModeRuntime.java`, `AgentControlSync.java`, `conversation/ServerAgentConversationRouter.java`, `runtime/input/CarpetInputStateSink.java`, `InputOwner.java`, `client/ArenaAgentsClient.java`, `client/camera/CameraDirectorClient.java` — wiring and gates.
+- `build.gradle`, `src/test/resources/pov-mixin-targets.txt`, `src/test/java/.../pov/*Verification.java` — verification.
+- `README.md`, `docs/plans/2026-10-06-agent-pov-takeover.html` — operator docs and the plan.
+
+### Assumptions Made (flag these for review)
+- A second operator taking over an already taken-over agent is rejected; spectating never exits on body damage; creative operators may take over (the damage rule is inert for them); first person is forced while in POV.
+- Cross-dimension POV is out of scope: the session ends when the agent changes dimension.
+- The takeover report is delivered as an operator DM (existing path); no coordinator protocol change.
+
+### Known Issues / Deferred
+- Not yet run in a real client or server: camera binding, HUD rendering through the stand-in, mirrored screens, death screen, input feel and latency, chunk following, sounds, damage exit, respawn flow, summary delivery. Only dependency-free rules, codec round-trips, and mixin application under Fabric were verified.
+- A paused, taken-over agent can still produce chat replies on the coordinator side (conversation-only turns are not suppressed there).
+- First-person hands are hidden in POV; merchant trade selection, anvil rename and recipe-book placement are not relayed; horse inventories are not mirrored.
+- During the 20 ticks between an agent's death and its body removal, the view anchor drops back to the body until respawn.
+- The reservation is in-memory: a server crash mid-takeover leaves the agent PAUSED until `/codex resume`.
+
+### Suggested Next Steps
+- Live client QA of `/spectator` then `/takeover` (`docs/live-qa`), then tune movement feel (position prediction) and add first-person hands.

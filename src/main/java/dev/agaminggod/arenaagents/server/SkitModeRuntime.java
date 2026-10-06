@@ -3,6 +3,7 @@ package dev.agaminggod.arenaagents.server;
 import carpet.helpers.EntityPlayerActionPack;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.AgentId;
+import dev.agaminggod.arenaagents.server.pov.AgentControlReservations;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -55,6 +56,7 @@ public final class SkitModeRuntime {
 		requireEnabled(manager.server());
 		SkitActor record = SkitActors.resolve(manager.server(), selector);
 		DirectorTakeRuntime.requireUnreserved(manager.server(), record.agentId());
+		AgentControlReservations.requireUnreserved(manager.server(), record.agentId());
 		SkitPlacement placement = new SkitPlacement(level.dimension().identifier().toString(), x, y, z, yaw, pitch);
 		SkitActors.find(manager.server(), record.agentId()).filter(ServerPlayer::isAlive).ifPresentOrElse(
 				player -> {
@@ -132,6 +134,7 @@ public final class SkitModeRuntime {
 		SkitActor record = SkitActors.resolve(manager.server(), selector);
 		AgentId agentId = record.agentId();
 		DirectorTakeRuntime.requireUnreserved(manager.server(), agentId);
+		AgentControlReservations.requireUnreserved(manager.server(), agentId);
 		ServerPlayer actor = SkitActors.find(manager.server(), agentId).filter(player -> player.isAlive() && !player.isRemoved())
 				.orElseThrow(() -> new AgentDomainException("AGENT_NOT_PRESENT", "Agent has not joined the world yet"));
 		validateTimeline(script, actor.level().dimension().identifier().toString(),
@@ -143,13 +146,14 @@ public final class SkitModeRuntime {
 		return script;
 	}
 
-	/** Prevents normal goal execution from racing a server-authoritative skit timeline. */
+	/** Prevents normal goal execution from racing a skit timeline or an operator takeover. */
 	public static void requireNormalControlAllowed(MinecraftServer server, AgentId agentId) {
 		Objects.requireNonNull(agentId, "agentId must not be null");
 		if (server == null) return;
 		if (Optional.ofNullable(PLAYBACK.get(server)).map(runs -> runs.containsKey(agentId)).orElse(false)) {
 			throw new AgentDomainException("SKIT_AGENT_RESERVED", "Agent is reserved by active skit playback");
 		}
+		AgentControlReservations.requireUnreserved(server, agentId);
 	}
 
 	public static boolean deleteScript(MinecraftServer server, String name) {

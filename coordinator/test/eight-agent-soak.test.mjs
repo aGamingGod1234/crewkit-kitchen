@@ -61,7 +61,7 @@ test('eight-agent fake-provider soak preserves capacity, isolation, cancellation
 
 		for (let index = 1; index <= 9; index += 1) {
 			const agentId = `soak-${index}`;
-			const provider = ['codex', 'gemini', 'kimi'][(index - 1) % 3];
+			const provider = ['codex', 'gemini'][(index - 1) % 2];
 			registry.register({ agentId, provider, model: `${provider}-model`, reasoningEffort: 'high', state: DynamicAgentState.IDLE, goalRevision: 0, queue: [] });
 			registry.applyGoalControl(agentId, { operation: 'start', goalRevision: 1, goal: `Goal ${index}` });
 		}

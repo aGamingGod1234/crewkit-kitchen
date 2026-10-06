@@ -6,5 +6,7 @@ public enum InputOwner {
 	COMBAT,
 	INTERACTION,
 	TRANSACTION,
-	SYSTEM
+	SYSTEM,
+	/** A human operator driving the body during a POV takeover; acquired above every model owner. */
+	OPERATOR
 }

@@ -17,6 +17,8 @@ import java.util.UUID;
 public final class AgentRegistrySnapshotCodec {
 	private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().serializeNulls().create();
 	private static final AgentGoalCodec GOAL_CODEC = new AgentGoalCodec();
+	// Kimi and Cursor were removed as providers; their saved agents are dropped instead of failing the whole world.
+	private static final java.util.Set<String> RETIRED_PROVIDERS = java.util.Set.of("kimi", "cursor");
 
 	public String encode(AgentRegistry.Snapshot snapshot) {
 		JsonObject root = new JsonObject();
@@ -40,7 +42,9 @@ public final class AgentRegistrySnapshotCodec {
 			JsonArray agents = requireArray(root, "agents");
 			ArrayList<AgentRecord> records = new ArrayList<>(agents.size());
 			for (JsonElement element : agents) {
-				AgentRecord record = decodeRecord(requireObject(element, "agent"));
+				JsonObject agent = requireObject(element, "agent");
+				if (hasRetiredProvider(agent)) continue;
+				AgentRecord record = decodeRecord(agent);
 				if (record.queuedGoals().size() > queueLimit) {
 					throw failure("PERSISTED_QUEUE_TOO_LARGE", "Persisted queue exceeds configured limit");
 				}
@@ -231,6 +235,14 @@ public final class AgentRegistrySnapshotCodec {
 		json.addProperty("skin_variant", profile.skinVariant());
 		json.addProperty("game_mode", profile.gameMode().wireName());
 		return json;
+	}
+
+	private static boolean hasRetiredProvider(JsonObject agent) {
+		JsonElement profile = agent.get("profile");
+		if (profile == null || !profile.isJsonObject()) return false;
+		JsonElement provider = profile.getAsJsonObject().get("provider");
+		return provider != null && provider.isJsonPrimitive()
+				&& RETIRED_PROVIDERS.contains(provider.getAsString().toLowerCase(java.util.Locale.ROOT));
 	}
 
 	private static AgentProfile decodeProfile(JsonObject json) {

@@ -88,7 +88,6 @@ test('default preflight IDs cross both production workspace boundaries', async (
 const ownedRoot = path.join(os.tmpdir(), 'g07-no-io-workspace');
 const profiles = {
   codex: { provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority' },
-  kimi: { provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'high', serviceTier: 'priority' },
 };
 
 class OfflineTransport extends EventEmitter {
@@ -103,10 +102,6 @@ class OfflineTransport extends EventEmitter {
     if (method === 'initialize') return this.provider === 'codex' ? { userAgent: 'f004-offline' } : { protocolVersion: 1 };
     if (method === 'model/list') return { data: [{ id: profiles.codex.model, model: profiles.codex.model, supportedReasoningEfforts: [{ reasoningEffort: 'high' }], serviceTiers: [{ id: 'priority' }] }], nextCursor: null };
     if (method === 'thread/start') return { thread: { id: 'f004-offline-thread' } };
-    if (method === 'session/new') return { sessionId: 'f004-offline-session', configOptions: [
-      { id: 'model', category: 'model', currentValue: profiles.kimi.model, options: [profiles.kimi.model] },
-      { id: 'thinking', category: 'thought_level', currentValue: 'high', options: ['low', 'high', 'max'] },
-    ] };
     throw new Error(`Unexpected offline method: ${method}`);
   }
 }
@@ -127,15 +122,8 @@ function fixture(provider) {
       assert.ok(relative && !relative.startsWith('..') && !path.isAbsolute(relative));
       mkdirCalls.push({ relative, recursive: opts.recursive });
     } },
-    config: provider === 'codex'
-      ? { codex: { launchProfile: { ...profile } } }
-      : { kimi: { catalogDiscovery: true, models: [profile.model], reasoningEfforts: ['high'], modelReasoningEfforts: { [profile.model]: ['high'] } } },
+    config: { codex: { launchProfile: { ...profile } } },
     codexTransport: transport,
-    kimiTransportFactory: () => { transportCreations++; return transport; },
-    kimiDiscoverCatalog: async () => {
-      discoveryCalls.push('discover');
-      return [{ id: profile.model, model: profile.model, reasoningEfforts: ['high'], serviceTiers: ['priority'] }];
-    },
     execFile: () => { throw new Error('Process execution is forbidden in this fixture'); },
   };
   return { options, transport, mkdirCalls, discoveryCalls, get transportCreations() { return transportCreations; } };

@@ -11,10 +11,9 @@ import { ActiveGoalSupervisor } from './active-goal-supervisor.mjs';
 import { MAX_LEASE_TIMEOUT_MS } from './work-lease-supervisor.mjs';
 import { AgentWorkspaceManager } from './agent-workspace.mjs';
 import { MinecraftAgentWorkspace } from './minecraft-agent-workspace.mjs';
-import { AcpProviderService } from './acp-service.mjs';
 import { AntigravityProviderService } from './antigravity-service.mjs';
+import { ClaudeProviderService } from './claude-service.mjs';
 import { CodexService } from './codex-service.mjs';
-import { CursorProviderService } from './cursor-service.mjs';
 import { ControlLatencyRegistry } from './control-latency-registry.mjs';
 import { buildCoordinatorStatus, providerRecoveryComponents } from './coordinator-status.mjs';
 import { ConversationMemory } from './conversation-memory.mjs';
@@ -48,7 +47,7 @@ import { classifyNativeGoalError } from './native-goal-error-policy.mjs';
 import { MAX_GOAL_SPEC_CORRECTION_ATTEMPTS, fallbackCompiledDragonGoal, localGoalSpecFeedback } from './goal-spec-translator.mjs';
 import { ProgramRuntimeManager } from './program-runtime-manager.mjs';
 import { createProviderChildEnvironment } from './provider-environment.mjs';
-import { PROVIDER_IDS } from './provider-identity.mjs';
+import { NATIVE_TOOL_PROVIDERS, PROVIDER_IDS } from './provider-identity.mjs';
 import { TraceWriter } from './trace-writer.mjs';
 import { wireRuntimeDiagnostics } from './runtime-diagnostics.mjs';
 import { RuntimeErrorReporter } from './runtime-error-reporter.mjs';
@@ -1353,7 +1352,9 @@ export class DynamicCoordinator extends EventEmitter {
 	}
 
 	#usesNativeTools(record) {
-		return this.#codexControlProtocol === 'native_tools' && record?.provider === 'codex';
+		// Claude agents always use the native tool loop; Codex follows its configured control protocol.
+		if (record?.provider === 'codex') return this.#codexControlProtocol === 'native_tools';
+		return NATIVE_TOOL_PROVIDERS.includes(record?.provider);
 	}
 
 	#prewarmNativeAgent(record) {
@@ -3070,12 +3071,12 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 			platform: dependencies.platform,
 			workspaceManager,
 		}),
-		kimi: new AcpProviderService({ ...config.kimi, environment: providerEnvironments.kimi, bridgeSecretEnvironmentVariable: config.bridge.secretEnvironmentVariable }, { transportFactory: dependencies.kimiTransportFactory, workspaceManager }),
-		cursor: new CursorProviderService({ ...config.cursor, environment: providerEnvironments.cursor, bridgeSecretEnvironmentVariable: config.bridge.secretEnvironmentVariable }, {
-			spawn: dependencies.cursorSpawn,
+		claude: new ClaudeProviderService({ ...config.claude, environment: providerEnvironments.claude, bridgeSecretEnvironmentVariable: config.bridge.secretEnvironmentVariable }, {
+			spawn: dependencies.claudeSpawn,
 			terminate: dependencies.terminateProviderProcess,
-			platform: dependencies.platform,
+			toolServer: dependencies.claudeToolServer,
 			workspaceManager,
+			minecraftWorkspace,
 		}),
 	}, { turnRecorder: providerTurnRecorder, now: dependencies.epochNow ?? Date.now });
 	const healthRegistry = dependencies.healthRegistry ?? dependencies.planner?.healthRegistry ?? new ProviderHealthRegistry({ now: dependencies.healthNow ?? Date.now });
@@ -3185,14 +3186,13 @@ export async function loadDynamicConfig(configPath = DEFAULT_DYNAMIC_CONFIG_PATH
 export function normalizeDynamicConfig(value, environment = process.env) {
 	if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('dynamic coordinator config must be an object');
 	value = migrateDynamicConfig(value);
-	assertKnownConfigKeys(value, ['schemaVersion', 'bridge', 'voice', 'codex', 'gemini', 'kimi', 'cursor', 'limits', 'workspaceRoot', 'minecraftAgentRoot', 'minecraftAgentTemplateRoot'], 'config');
+	assertKnownConfigKeys(value, ['schemaVersion', 'bridge', 'voice', 'codex', 'gemini', 'claude', 'limits', 'workspaceRoot', 'minecraftAgentRoot', 'minecraftAgentTemplateRoot'], 'config');
 	if (value.bridge === null || typeof value.bridge !== 'object' || Array.isArray(value.bridge)) throw new TypeError('dynamic coordinator bridge config must be an object');
 	if (value.codex === null || typeof value.codex !== 'object' || Array.isArray(value.codex)) throw new TypeError('dynamic coordinator Codex config must be an object');
 	if (value.voice !== undefined && (value.voice === null || typeof value.voice !== 'object' || Array.isArray(value.voice))) throw new TypeError('dynamic coordinator voice config must be an object');
 	assertOptionalConfigObject(value.limits, 'limits');
 	assertOptionalConfigObject(value.gemini, 'gemini');
-	assertOptionalConfigObject(value.kimi, 'kimi');
-	assertOptionalConfigObject(value.cursor, 'cursor');
+	assertOptionalConfigObject(value.claude, 'claude');
 	assertKnownConfigKeys(value.bridge, ['host', 'port', 'secret', 'secretEnvironmentVariable', 'reconnectDelayMs', 'maxReconnectDelayMs', 'connectionQueueCap', 'agentQueueCap', 'inboundConnectionQueueCap', 'inboundAgentQueueCap', 'inboundDispatchBatch', 'trackedTerminalActionIdCap', 'handshakeTimeoutMs', 'heartbeatIntervalMs', 'heartbeatTimeoutMs', 'serverInstanceId', 'launchId'], 'bridge');
 	assertKnownConfigKeys(value.voice ?? {}, ['port', 'maxConcurrent', 'profileAssignmentsPath', 'provider', 'openaiApiKeyEnvironmentVariable', 'openaiTtsModel', 'openaiSttModel', 'fishApiKeyEnvironmentVariable', 'deepgramApiKeyEnvironmentVariable', 'localSpeechTimeoutMs', 'localSpeechPythonPath', 'secret', 'secretFile'], 'voice');
 	assertKnownConfigKeys(value.codex, ['cwd', 'controlProtocol', 'planningTimeoutMs', 'maxDecisionBytes', 'catalogTtlMs', 'startupTimeoutMs', 'serviceTier', 'launchProfile'], 'codex');
@@ -3201,7 +3201,8 @@ export function normalizeDynamicConfig(value, environment = process.env) {
 		assertKnownConfigKeys(value.codex.launchProfile, ['agentId', 'model', 'reasoningEffort', 'serviceTier', 'planningTimeoutMs', 'maxDecisionBytes', 'cwd'], 'codex.launchProfile');
 	}
 	const providerKeys = ['provider', 'cwd', 'executable', 'models', 'reasoningEfforts', 'modelReasoningEfforts', 'catalogDiscovery', 'catalogDiscoveryTimeoutMs', 'planningTimeoutMs', 'maxDecisionBytes', 'stdoutLimitBytes', 'stderrLimitBytes', 'serviceTier'];
-	for (const provider of ['gemini', 'kimi', 'cursor']) assertKnownConfigKeys(value[provider] ?? {}, providerKeys, provider);
+	assertKnownConfigKeys(value.gemini ?? {}, providerKeys, 'gemini');
+	assertKnownConfigKeys(value.claude ?? {}, ['provider', 'cwd', 'executable', 'models', 'reasoningEfforts', 'planningTimeoutMs', 'startupTimeoutMs', 'interruptTimeoutMs', 'maxDecisionBytes', 'stdoutLimitBytes', 'stderrLimitBytes', 'runtimeRoot'], 'claude');
 	assertKnownConfigKeys(value.limits ?? {}, ['agentCap', 'goalQueueCap', 'planningConcurrency', 'planningMode', 'urgentReserve', 'invalidDecisionRetries'], 'limits');
 	const secret = value.bridge.secret ?? environment[value.bridge.secretEnvironmentVariable ?? 'ARENA_AGENT_BRIDGE_SECRET'];
 	const cwd = value.codex.cwd ?? PROJECT_DIRECTORY;
@@ -3252,28 +3253,12 @@ export function normalizeDynamicConfig(value, environment = process.env) {
 			},
 			...(value.gemini ?? {}),
 		},
-		kimi: {
-			provider: 'kimi',
+		claude: {
+			provider: 'claude',
 			cwd,
-			catalogDiscovery: true,
-			models: ['kimi-code/k3', 'kimi-code/k3-256k', 'kimi-code/kimi-for-coding', 'kimi-code/kimi-for-coding-highspeed'],
-			reasoningEfforts: ['low', 'high', 'max'],
-			...(value.kimi ?? {}),
-		},
-		cursor: {
-			provider: 'cursor',
-			cwd,
-			executable: process.platform === 'win32' && typeof environment.LOCALAPPDATA === 'string' && environment.LOCALAPPDATA.trim() !== ''
-				? path.join(environment.LOCALAPPDATA, 'cursor-agent', 'agent.ps1')
-				: 'agent',
-			catalogDiscovery: true,
-			models: ['composer-2.5', 'grok-4.5', 'grok-4.6'],
-			modelReasoningEfforts: {
-				'composer-2.5': ['high'],
-				'grok-4.5': ['low', 'medium', 'high'],
-				'grok-4.6': ['low', 'medium', 'high', 'xhigh'],
-			},
-			...(value.cursor ?? {}),
+			// Claude agents share Codex's dedicated Minecraft workspace; only their launch prompt files live here.
+			runtimeRoot: path.join(minecraftAgentRoot, 'claude'),
+			...(value.claude ?? {}),
 		},
 		limits: {
 			agentCap,
@@ -3290,11 +3275,9 @@ function migrateDynamicConfig(value) {
 	const schemaVersion = value.schemaVersion ?? 0;
 	if (!Number.isSafeInteger(schemaVersion) || schemaVersion < 0) throw new TypeError('config.schemaVersion must be a nonnegative safe integer');
 	if (schemaVersion > 1) throw new TypeError(`Unsupported dynamic coordinator config schemaVersion ${schemaVersion}`);
-	if (schemaVersion === 1) return value;
-	const cursor = value.cursor === undefined || value.cursor === null || typeof value.cursor !== 'object' || Array.isArray(value.cursor)
-		? value.cursor
-		: Object.fromEntries(Object.entries(value.cursor).filter(([key]) => key !== 'serviceTiers'));
-	return { ...value, schemaVersion: 1, ...(cursor === undefined ? {} : { cursor }) };
+	// Kimi and Cursor were retired as providers; installed configs may still carry their sections.
+	const { kimi: _retiredKimi, cursor: _retiredCursor, ...current } = value;
+	return { ...current, schemaVersion: 1 };
 }
 
 function assertOptionalConfigObject(value, field) {

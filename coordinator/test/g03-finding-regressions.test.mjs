@@ -72,7 +72,7 @@ for (const warm of [false, true]) {
       if (!warm || loads > 1) await gate.promise;
       return [catalogModel(warm && loads === 1 ? 'old' : 'new')];
     });
-    const router = new ProviderService({ codex: { ...inertService(), catalog }, gemini: inertService(), kimi: inertService() });
+    const router = new ProviderService({ codex: { ...inertService(), catalog }, gemini: inertService(), claude: inertService() });
     try {
       if (warm) await router.catalog.refresh({ providers: ['codex'] });
       const one = router.catalog.refresh({ providers: ['codex'], force: warm });
@@ -91,7 +91,7 @@ for (const warm of [false, true]) {
 test('stopping still fences both subscribers of an obsolete catalog load', async () => {
   const gate = deferred();
   const catalog = new ModelCatalogCache(async () => { await gate.promise; return [catalogModel('obsolete')]; });
-  const router = new ProviderService({ codex: { ...inertService(), catalog }, gemini: inertService(), kimi: inertService() });
+  const router = new ProviderService({ codex: { ...inertService(), catalog }, gemini: inertService(), claude: inertService() });
   const one = router.catalog.refresh({ providers: ['codex'] });
   const two = router.catalog.refresh({ providers: ['codex'] });
   await tick();
@@ -111,7 +111,7 @@ test('different catalog reads still fence the superseded physical outcome', asyn
     await (own === 1 ? old.promise : fresh.promise);
     return { models: [{ ...catalogModel(own === 1 ? 'old' : 'new'), reasoningEfforts: ['high'] }], source: 'live' };
   } };
-  const router = new ProviderService({ codex: { ...inertService(), catalog }, gemini: inertService(), kimi: inertService() });
+  const router = new ProviderService({ codex: { ...inertService(), catalog }, gemini: inertService(), claude: inertService() });
   try {
     const one = router.catalog.refresh({ providers: ['codex'] });
     await tick();

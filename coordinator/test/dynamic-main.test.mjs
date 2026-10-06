@@ -70,7 +70,7 @@ test('an empty ready roster does not initialize providers through bootstrap cata
 	const registry = new AgentRegistry();
 	const planner = new FakePlanner(registry);
 	const starts = [];
-	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, {
+	const services = Object.fromEntries(['codex', 'gemini', 'claude'].map((provider) => [provider, {
 		catalog: { stale: false, refresh: async () => ({ refreshedAtEpochMs: 1, models: [] }), assertSupported() {} },
 		async start() { starts.push(provider); },
 		async stop() {},
@@ -426,18 +426,21 @@ test('dynamic config migrates legacy input and rejects unknown or future schema 
 		bridge: { port: 25570, secret: 's'.repeat(32) },
 		codex: {},
 		cursor: { serviceTiers: ['priority', 'fast'] },
+		kimi: { models: ['kimi-code/k3'] },
 	};
 	const migrated = normalizeDynamicConfig(legacy);
 	assert.equal(migrated.schemaVersion, 1);
-	assert.equal(Object.hasOwn(migrated.cursor, 'serviceTiers'), false);
+	assert.equal(Object.hasOwn(migrated, 'cursor'), false, 'retired Cursor config is dropped');
+	assert.equal(Object.hasOwn(migrated, 'kimi'), false, 'retired Kimi config is dropped');
+	assert.equal(Object.hasOwn(normalizeDynamicConfig({ ...legacy, schemaVersion: 1 }), 'cursor'), false);
 	assert.throws(() => normalizeDynamicConfig({ ...legacy, schemaVersion: 2 }), /schemaVersion 2/);
 	assert.throws(() => normalizeDynamicConfig({ ...legacy, misspelledLimit: 1 }), /config\.misspelledLimit/);
 	assert.throws(() => normalizeDynamicConfig({ ...legacy, bridge: { ...legacy.bridge, reconnectDelay: 5 } }), /bridge\.reconnectDelay/);
 	assert.throws(() => normalizeDynamicConfig({
 		...legacy,
 		schemaVersion: 1,
-		cursor: { serviceTiers: ['priority'] },
-	}), /cursor\.serviceTiers/);
+		claude: { serviceTiers: ['priority'] },
+	}), /claude\.serviceTiers/);
 });
 
 test('verbose feed never publishes raw provider chunks', async () => {
