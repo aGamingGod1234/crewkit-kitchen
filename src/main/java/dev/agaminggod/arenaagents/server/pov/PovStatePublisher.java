@@ -46,19 +46,22 @@ public final class PovStatePublisher {
 	}
 
 	/**
-	 * Called every server tick. Sends AgentPovPosePayload every call when the agent is present; sends
+	 * Called at the end of every server tick, after physics, so the pose carries the position that tick produced.
+	 * Sends AgentPovPosePayload every call when the agent is present; sends
 	 * AgentPovStatePayload only when vitals/inventory/effects/menu/death/identity changed (revision increments);
 	 * sends AgentPovMenuPayload when the agent's open menu contents, carried stack or data slots changed. agent may
 	 * be null (dead and removed / not spawned): then a state payload with the last known inventory and a FLAG_DEAD
 	 * pose is sent once (again only if death or lookResetSeq change).
 	 */
-	public void tick(ServerPlayer operator, ServerPlayer agent, Optional<PovDeath> death, int lookResetSeq) {
-		publish(operator, agent, death, lookResetSeq, false);
+	public void tick(ServerPlayer operator, ServerPlayer agent, Optional<PovDeath> death, int lookResetSeq,
+			int inputSequence) {
+		publish(operator, agent, death, lookResetSeq, inputSequence, false);
 	}
 
 	/** Sends the current full state and menu immediately, e.g. on session start. */
-	public void sendFull(ServerPlayer operator, ServerPlayer agent, Optional<PovDeath> death, int lookResetSeq) {
-		publish(operator, agent, death, lookResetSeq, true);
+	public void sendFull(ServerPlayer operator, ServerPlayer agent, Optional<PovDeath> death, int lookResetSeq,
+			int inputSequence) {
+		publish(operator, agent, death, lookResetSeq, inputSequence, true);
 	}
 
 	/**
@@ -78,11 +81,12 @@ public final class PovStatePublisher {
 		return revision;
 	}
 
-	private void publish(ServerPlayer operator, ServerPlayer agent, Optional<PovDeath> death, int lookResetSeq, boolean full) {
+	private void publish(ServerPlayer operator, ServerPlayer agent, Optional<PovDeath> death, int lookResetSeq,
+			int inputSequence, boolean full) {
 		Objects.requireNonNull(operator, "operator must not be null");
 		Objects.requireNonNull(death, "death must not be null");
 		if (agent == null) {
-			publishAbsent(operator, death, lookResetSeq, full);
+			publishAbsent(operator, death, lookResetSeq, inputSequence, full);
 			return;
 		}
 		if (inventoryOpen && agent.containerMenu != agent.inventoryMenu) inventoryOpen = false;
@@ -98,15 +102,16 @@ public final class PovStatePublisher {
 		} else if (resync || current.menuDiffers(lastMenu)) {
 			sendMenu(operator, current);
 		}
-		sendPose(operator, current.pose());
+		sendPose(operator, current.pose(), inputSequence);
 	}
 
-	private void publishAbsent(ServerPlayer operator, Optional<PovDeath> death, int lookResetSeq, boolean full) {
+	private void publishAbsent(ServerPlayer operator, Optional<PovDeath> death, int lookResetSeq, int inputSequence,
+			boolean full) {
 		lastMenu = null;
 		if (!full && absentPublished && death.equals(lastDeath) && lookResetSeq == lastLookResetSeq) return;
 		PovAgentSnapshot absent = PovAgentSnapshot.absent(lastKnown, operator.level().dimension());
 		sendState(operator, absent, death, lookResetSeq);
-		sendPose(operator, absent.pose());
+		sendPose(operator, absent.pose(), inputSequence);
 		absentPublished = true;
 	}
 
@@ -143,9 +148,10 @@ public final class PovStatePublisher {
 		if (sent) lastMenu = snapshot;
 	}
 
-	private void sendPose(ServerPlayer operator, PovAgentSnapshot.Pose pose) {
+	private void sendPose(ServerPlayer operator, PovAgentSnapshot.Pose pose, int inputSequence) {
 		if (!ServerPlayNetworking.canSend(operator, AgentPovPosePayload.TYPE)) return;
-		send(operator, () -> new AgentPovPosePayload(sessionId, pose.yaw(), pose.pitch(), pose.attackStrength(), pose.flags()));
+		send(operator, () -> new AgentPovPosePayload(sessionId, pose.yaw(), pose.pitch(), pose.attackStrength(), pose.flags(),
+				pose.x(), pose.y(), pose.z(), Math.max(0, inputSequence)));
 	}
 
 	private boolean send(ServerPlayer operator, Supplier<? extends CustomPacketPayload> payload) {

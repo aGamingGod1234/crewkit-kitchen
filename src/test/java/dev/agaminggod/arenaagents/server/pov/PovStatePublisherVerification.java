@@ -133,7 +133,7 @@ public final class PovStatePublisherVerification {
 				"a different container id resends descriptor and contents");
 		assertThrows(() -> new PovAgentSnapshot(0, Level.OVERWORLD, vitals(20.0F), PovInventory.empty(), List.of(),
 						Optional.of(new PovMenu(5, 1, Optional.of(MenuType.GENERIC_9x3), Component.literal("Chest"))),
-						Optional.empty(), new PovAgentSnapshot.Pose(0.0F, 0.0F, 1.0F, 0)),
+						Optional.empty(), new PovAgentSnapshot.Pose(0.0F, 0.0F, 1.0F, 0, 0.0D, 0.0D, 0.0D)),
 				"menu descriptor without contents is rejected");
 		assertThrows(() -> new PovAgentSnapshot.MenuContents(1, 1, Collections.nCopies(257, ItemStack.EMPTY),
 						ItemStack.EMPTY, List.of()),
@@ -154,6 +154,12 @@ public final class PovStatePublisherVerification {
 		assertTrue(PovAgentSnapshot.sameInventory(alive.inventory(), gone.inventory()), "absent agent keeps last known inventory");
 		assertTrue(gone.menu().isEmpty() && gone.menuContents().isEmpty(), "absent agent has no open menu");
 		assertTrue(gone.pose().dead(), "absent agent pose is dead");
+		PovAgentSnapshot walking = snapshot(vitals(20.0F), inventory(0, 3), List.of(), Optional.empty(), 0.0F);
+		PovAgentSnapshot.Pose lost = PovAgentSnapshot.absent(walking, Level.NETHER).pose();
+		assertTrue(lost.dead() && lost.x() == 12.5D && lost.y() == 64.0D && lost.z() == -3.25D,
+				"absent agent pose keeps the last known position, flagged dead so the camera ignores it");
+		assertThrows(() -> new PovAgentSnapshot.Pose(0.0F, 0.0F, 1.0F, 0, Double.NaN, 0.0D, 0.0D),
+				"a non-finite pose position is rejected");
 		assertEquals(Level.OVERWORLD, gone.dimension(), "absent agent keeps last known dimension");
 		assertTrue(gone.stateDiffers(alive), "losing the body resends state");
 		PovAgentSnapshot never = PovAgentSnapshot.absent(null, Level.NETHER);
@@ -239,12 +245,12 @@ public final class PovStatePublisherVerification {
 		return new PovAgentSnapshot(42, Level.OVERWORLD, vitals(20.0F), inventory(0, 3), List.of(),
 				Optional.of(new PovMenu(containerId, stateId, Optional.of(MenuType.GENERIC_9x3), Component.literal(title))),
 				Optional.of(new PovAgentSnapshot.MenuContents(containerId, stateId, slots, carried, data)),
-				new PovAgentSnapshot.Pose(0.0F, 0.0F, 1.0F, 0));
+				new PovAgentSnapshot.Pose(0.0F, 0.0F, 1.0F, 0, 0.0D, 0.0D, 0.0D));
 	}
 
 	private static PovAgentSnapshot snapshot(PovVitals vitals, PovInventory inventory, List<MobEffectInstance> effects, Optional<PovMenu> menu, float yaw) {
 		return new PovAgentSnapshot(42, Level.OVERWORLD, vitals, inventory, effects, menu, Optional.empty(),
-				new PovAgentSnapshot.Pose(yaw, 0.0F, 1.0F, AgentPovPosePayload.FLAG_ON_GROUND));
+				new PovAgentSnapshot.Pose(yaw, 0.0F, 1.0F, AgentPovPosePayload.FLAG_ON_GROUND, 12.5D, 64.0D, -3.25D));
 	}
 
 	private static PovVitals vitals(float health) {

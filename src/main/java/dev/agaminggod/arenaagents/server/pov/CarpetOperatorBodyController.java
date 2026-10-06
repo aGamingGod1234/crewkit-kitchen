@@ -47,6 +47,7 @@ public final class CarpetOperatorBodyController implements OperatorBodyControlle
 	private WeakReference<ServerPlayer> boundBody = new WeakReference<>(null);
 	private Frame frame;
 	private boolean active;
+	private int lastInputSequence;
 
 	public static void register() {
 		OperatorBodyControllers.install(CarpetOperatorBodyController::new);
@@ -77,6 +78,7 @@ public final class CarpetOperatorBodyController implements OperatorBodyControlle
 		Frame next = Frame.decode(payload, frame);
 		keys.onFrame(next);
 		frame = next;
+		lastInputSequence = Math.max(0, payload.sequence());
 		guarded("frame", () -> {
 			ServerPlayer agent = bind();
 			if (agent != null) push(agent);
@@ -137,6 +139,11 @@ public final class CarpetOperatorBodyController implements OperatorBodyControlle
 	@Override
 	public boolean active() {
 		return active;
+	}
+
+	@Override
+	public int lastInputSequence() {
+		return lastInputSequence;
 	}
 
 	/** Resolves the living body, preparing a new body (respawn) and dropping input while there is none. */

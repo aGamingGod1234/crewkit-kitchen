@@ -64,6 +64,16 @@ public final class PovHudProxy {
 		if (agent != null) target.snapTo(agent.getX(), agent.getY(), agent.getZ(), agent.getYRot(), agent.getXRot());
 	}
 
+	/**
+	 * Shows a hotbar selection the operator just made without waiting for the server's state echo, the same way
+	 * vanilla moves its own highlight at once. The input capture decides which slot that is, including when the
+	 * server rejected a choice.
+	 */
+	public static void showSelectedSlot(int slot) {
+		RemotePlayer target = current();
+		if (target != null && slot >= 0 && slot < Inventory.SELECTION_SIZE) target.getInventory().setSelectedSlot(slot);
+	}
+
 	static void clear() {
 		session = null;
 		state = null;

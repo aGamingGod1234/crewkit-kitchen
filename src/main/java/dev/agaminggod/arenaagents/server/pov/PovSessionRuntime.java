@@ -51,6 +51,7 @@ import org.slf4j.LoggerFactory;
  * Server side of /spectate and /takeover. Sessions are keyed by operator; takeovers additionally
  * hold an {@link AgentControlReservations} entry for the agent. Ticked once per server tick after
  * the bridge and before agent input arbitration, so operator input wins the same tick it arrives.
+ * The view is published from {@link #endTick}, after physics, so it shows the tick the input produced.
  */
 public final class PovSessionRuntime {
 	private static final Logger LOGGER = LoggerFactory.getLogger(PovSessionRuntime.class);
@@ -174,7 +175,7 @@ public final class PovSessionRuntime {
 			if (session.takeover()) sampleAgent(session, agent);
 			anchor(session, operator, agent);
 		}
-		session.publisher().sendFull(operator, agent, death(record, mode), session.lookResetSeq());
+		session.publisher().sendFull(operator, agent, death(record, mode), session.lookResetSeq(), inputSequence(session));
 		return session;
 	}
 
@@ -346,8 +347,35 @@ public final class PovSessionRuntime {
 			session.unanchor();
 			operator.level().getChunkSource().move(operator);
 		}
-		session.publisher().tick(operator, agent, death(record, session.mode()), session.lookResetSeq());
 		if (session.takeover()) session.controller().tick();
+	}
+
+	/**
+	 * Publishes every session's view after the tick's physics. Publishing at the start of the tick (as the session
+	 * tick used to) showed the operator the previous tick's position, one tick behind its own input.
+	 */
+	public static void endTick(MinecraftServer server) {
+		State state = STATES.get(server);
+		if (state == null || state.sessions.isEmpty()) return;
+		CodexAgentManager manager = CodexAgentManager.get(server);
+		for (PovSession session : List.copyOf(state.sessions.values())) {
+			if (state.sessions.get(session.operatorId()) != session) continue;
+			ServerPlayer operator = server.getPlayerList().getPlayer(session.operatorId());
+			if (operator == null || operator.hasDisconnected()) continue;
+			try {
+				AgentRegistry registry = manager.registry();
+				AgentRecord record = registry.contains(session.agentId()) ? registry.require(session.agentId()) : null;
+				ServerPlayer agent = record == null ? null : findAgent(server, record).orElse(null);
+				session.publisher().tick(operator, agent, death(record, session.mode()), session.lookResetSeq(),
+						inputSequence(session));
+			} catch (RuntimeException failure) {
+				LOGGER.warn("Could not publish POV session {} for agent {}", session.id(), session.agentId(), failure);
+			}
+		}
+	}
+
+	private static int inputSequence(PovSession session) {
+		return session.takeover() ? session.controller().lastInputSequence() : 0;
 	}
 
 	/** Keeps the view anchored on the live agent; chunk tracking is re-evaluated when its section changes. */
@@ -588,7 +616,7 @@ public final class PovSessionRuntime {
 		CodexAgentManager manager = CodexAgentManager.get(server);
 		AgentRecord record = manager.registry().require(session.agentId());
 		session.publisher().sendFull(operator, findAgent(server, record).orElse(null), death(record, session.mode()),
-				session.lookResetSeq());
+				session.lookResetSeq(), inputSequence(session));
 	}
 
 	private static Optional<ServerPlayer> findAgent(MinecraftServer server, AgentRecord record) {

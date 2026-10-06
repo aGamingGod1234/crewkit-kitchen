@@ -71,6 +71,7 @@ public final class PovInputCaptureVerification {
 	private static void verifySlotSelection() {
 		PovInputCapture capture = new PovInputCapture();
 		assertFalse(capture.slotKnown(), "slot is unknown before the first state");
+		assertEquals(-1, capture.selectedSlot(), "no slot is shown before the first state");
 		capture.observeServerSlot(9);
 		assertFalse(capture.slotKnown(), "out-of-range server slots are ignored");
 		capture.observeServerSlot(4);
@@ -79,6 +80,7 @@ public final class PovInputCaptureVerification {
 		capture.selectHotbar(7);
 		assertEquals(7, capture.nextFrame().selectedSlot(), "hotbar key selects locally");
 		capture.observeServerSlot(4);
+		assertEquals(7, capture.selectedSlot(), "the HUD keeps showing a pending choice over a stale server slot");
 		assertEquals(7, capture.nextFrame().selectedSlot(), "a stale server slot does not undo a pending choice");
 		capture.observeServerSlot(7);
 		capture.observeServerSlot(2);

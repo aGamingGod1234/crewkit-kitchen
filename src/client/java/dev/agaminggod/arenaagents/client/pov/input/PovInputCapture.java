@@ -88,6 +88,11 @@ public final class PovInputCapture {
 		}
 	}
 
+	/** The hotbar slot the operator should see selected now, or -1 before the server first reports one. */
+	public int selectedSlot() {
+		return currentSlot();
+	}
+
 	public boolean slotKnown() {
 		return currentSlot() >= 0 || requestedSlot >= 0;
 	}

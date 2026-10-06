@@ -331,6 +331,8 @@ public final class CodexAgentServerRuntime {
 	}
 
 	private static void endTick(MinecraftServer server) {
+		// First, so the operator's view of this tick's physics is not held behind the bridge work below.
+		PovSessionRuntime.endTick(server);
 		SkitActors.tick(server);
 		CodexAgentManager manager = CodexAgentManager.get(server);
 		CoordinatorProcessSupervisor supervisor = COORDINATORS.get(server);
