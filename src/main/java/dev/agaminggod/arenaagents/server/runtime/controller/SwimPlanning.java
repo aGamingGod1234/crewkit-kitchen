@@ -127,6 +127,33 @@ public final class SwimPlanning {
 		return airSecondsLeft(air) >= distance / SURFACING_BLOCKS_PER_SECOND;
 	}
 
+	/** navigate_to keeps this much air (3 s) in reserve; below it the body surfaces instead of continuing a dive. */
+	public static final int AIR_RESERVE_TICKS = 60;
+
+	/**
+	 * Submerged cells the current breath covers at the conservative swim speed, keeping the reserve, capped at the
+	 * planner's full-breath run. This bounds how far a route may stay under water before it reaches air.
+	 */
+	public static int breathNodes(int air) {
+		double seconds = Math.max(0, air - AIR_RESERVE_TICKS) / (double) AIR_TICKS_PER_SECOND;
+		return (int) Math.min(dev.agaminggod.arenaagents.client.navigation.LocalPathfinder.FULL_BREATH_SUBMERGED_NODES,
+				Math.floor(seconds * SURFACING_BLOCKS_PER_SECOND));
+	}
+
+	/** The breath left covers the submerged cells ahead before the route reaches air. */
+	public static boolean breathCovers(int air, int submergedNodesAhead) {
+		return submergedNodesAhead <= breathNodes(air);
+	}
+
+	/**
+	 * navigate_to's jump key in water: held to rise or stay afloat, released when the next waypoint is clearly below
+	 * so the body sinks toward it (diving down a flooded shaft), and released over a submerged-floor endpoint so the
+	 * body settles onto it like a player letting go of space.
+	 */
+	public static boolean navigationJump(boolean swimming, double targetDy, boolean settleOnFloor) {
+		return swimming && !settleOnFloor && targetDy > -0.5D;
+	}
+
 	/** Seconds of breath left before drowning damage starts (Respiration only makes it last longer). */
 	public static double airSecondsLeft(int air) {
 		return Math.max(0, air) / (double) AIR_TICKS_PER_SECOND;

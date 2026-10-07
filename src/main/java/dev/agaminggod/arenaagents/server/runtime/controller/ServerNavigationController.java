@@ -33,7 +33,7 @@ import java.util.function.ToDoubleFunction;
 public final class ServerNavigationController implements ServerController {
 	public static final int DEFAULT_MAX_PATH_LENGTH = 256;
 	public static final double MAX_LOCAL_PLANNING_DISTANCE = 32.0D;
-	private static final int MIN_AIR_RESERVE = 60;
+	private static final int MIN_AIR_RESERVE = SwimPlanning.AIR_RESERVE_TICKS;
 	private static final long STALL_TIMEOUT_MS = 4_000L;
 	private static final int MAX_REPLANS = 3;
 	private static final double INTERMEDIATE_WAYPOINT_HORIZONTAL_TOLERANCE_SQUARED = 0.36D;
@@ -92,6 +92,8 @@ public final class ServerNavigationController implements ServerController {
 	private long surfacingSinceMs = -1L;
 	private long surfacingCheckMs;
 	private double surfacingCheckDistance;
+	/** Set when the route ahead needs more breath than is left, or no route starts under water: rise for air first. */
+	private boolean mustSurface;
 
 	public ServerNavigationController(
 			Vec3 destination,
@@ -138,11 +140,18 @@ public final class ServerNavigationController implements ServerController {
 		if (elapsedMs >= timeoutMs) {
 			return fail(player, "ACTION_TIMEOUT", "Navigation timed out", currentProgress());
 		}
-		// Under water no path can start (routes only use the surface), and with breath running out the route must wait:
-		// rise to the surface first like a player holding space, then plan from there. Stopping the action instead
-		// handed a sinking, drowning body back to the model (the play-test's NO_STANDABLE_PATH / AIR_RESERVE_REACHED).
-		if (SwimPlanning.needsSurfacing(player.isInWater(), player.isUnderWater())
-				&& (plan == null || !hasAirReserve(true, player.getAirSupply()))) {
+		// Routes may swim under water while the breath left covers the submerged stretch ahead (flooded tunnels and
+		// caves). When it does not, or the air reserve is reached, or no route starts from under water, rise to the
+		// surface first like a player holding space, then plan from there. Stopping the action instead handed a sinking,
+		// drowning body back to the model (the play-test's NO_STANDABLE_PATH / AIR_RESERVE_REACHED).
+		boolean eyesUnderWater = SwimPlanning.needsSurfacing(player.isInWater(), player.isUnderWater());
+		if (!eyesUnderWater) mustSurface = false;
+		if (eyesUnderWater && plan != null && !SwimPlanning.breathCovers(player.getAirSupply(),
+				submergedNodesAhead(new MinecraftNavigationWorld(player.level()), plan.nodes(), waypointIndex))) {
+			discardPlanning();
+			mustSurface = true;
+		}
+		if (eyesUnderWater && (mustSurface || !hasAirReserve(true, player.getAirSupply()))) {
 			// Head for the nearest open surface (not the destination): ice, an overhang, a sealed tunnel or a downward
 			// bubble column above means another column, or none, and the model must hear that while it has breath.
 			Vec3 eye = player.getEyePosition();
@@ -212,6 +221,12 @@ public final class ServerNavigationController implements ServerController {
 			waypoint = nodes.get(waypointIndex);
 			progress.waypointAdvanced(player.position().distanceTo(
 					targetFor(world, waypoint, waypointIndex == nodes.size() - 1)), nowEpochMs);
+		}
+		if (!eyesUnderWater && world.isSubmerged(waypoint.position())
+				&& !SwimPlanning.breathCovers(player.getAirSupply(), submergedNodesAhead(world, nodes, waypointIndex))) {
+			// Catch breath before the dive, as a player does: air refills while the eyes are above water.
+			coast(player);
+			return TickResult.running(lastProgressValue);
 		}
 		boolean finalWaypoint = waypointIndex == nodes.size() - 1;
 		Vec3 target = targetFor(world, waypoint, finalWaypoint);
@@ -335,7 +350,7 @@ public final class ServerNavigationController implements ServerController {
 		if (finalWaypoint && waypoint.position().equals(resolvedEndpointPosition) && resolvedEndpointTarget != null) {
 			return resolvedEndpointTarget;
 		}
-		if (!supportedEndpoint(world, waypoint.position())) {
+		if (!supportedEndpoint(world, waypoint.position()) && !(finalWaypoint && submergedFloor(world, waypoint.position()))) {
 			if (waypoint.traversal() == TraversalType.SWIM) return center(waypoint.position()).add(0.0D, 0.4D, 0.0D);
 			if (waypoint.traversal() == TraversalType.CLIMB) return center(waypoint.position());
 		}
@@ -366,7 +381,7 @@ public final class ServerNavigationController implements ServerController {
 		Vec3 position = player.position();
 		lastProgressValue = navigationProgress(position);
 		boolean endpointStandable = resolvedEndpointPosition != null && resolvedEndpointTarget != null
-				&& supportedEndpoint(world, resolvedEndpointPosition)
+				&& goalEndpoint(world, resolvedEndpointPosition)
 				&& Double.isFinite(world.supportHeight(
 						resolvedEndpointPosition,
 						resolvedEndpointTarget.x,
@@ -421,7 +436,7 @@ public final class ServerNavigationController implements ServerController {
 			endpointStabilityConfirmed = false;
 			return null;
 		}
-		boolean endpointStandable = supportedEndpoint(world, resolvedEndpointPosition)
+		boolean endpointStandable = goalEndpoint(world, resolvedEndpointPosition)
 				&& Double.isFinite(world.supportHeight(
 						resolvedEndpointPosition,
 						resolvedEndpointTarget.x,
@@ -487,6 +502,7 @@ public final class ServerNavigationController implements ServerController {
 			boolean finalWaypoint
 	) {
 		if (!supportedEndpoint(world, waypoint.position())
+				&& !(finalWaypoint && submergedFloor(world, waypoint.position()))
 				&& (waypoint.traversal() == TraversalType.SWIM || waypoint.traversal() == TraversalType.CLIMB)) {
 			Vec3 target = targetFor(world, waypoint, finalWaypoint);
 			double dx = playerPosition.x - target.x;
@@ -542,13 +558,14 @@ public final class ServerNavigationController implements ServerController {
 				return TickResult.running(currentProgress());
 			}
 			GridPosition start = preparation.start;
-			if (start == null) return fail(player, "NO_STANDABLE_PATH", "Start has no supported, climbable or surface-water position", currentProgress());
+			if (start == null) return fail(player, "NO_STANDABLE_PATH", "Start has no supported, climbable or swimmable position", currentProgress());
 			searchGoals = Set.copyOf(preparation.goals);
 			if (preparation.destinationHasNoSupport) {
 				return fail(player, "NO_STANDABLE_PATH", "Destination has no supported arrival region that can be approached within the requested tolerance", currentProgress());
 			}
 			preparation = null;
-			search = planner.beginSearch(start, searchGoals, grid(destination), (int) MAX_LOCAL_PLANNING_DISTANCE, previousFrontiers);
+			search = planner.beginSearch(start, searchGoals, grid(destination), (int) MAX_LOCAL_PLANNING_DISTANCE, previousFrontiers,
+					SwimPlanning.breathNodes(player.getAirSupply()));
 		}
 		ServerPathPlanner.PlanningResult planning = planner.resume(search, searchWorld);
 		if (planning.deferred()) {
@@ -558,6 +575,11 @@ public final class ServerNavigationController implements ServerController {
 		PathPlan candidate = planning.plan();
 		search = null;
 		if (candidate.outcome() != PathOutcome.FOUND) {
+			if (SwimPlanning.needsSurfacing(player.isInWater(), player.isUnderWater()) && !mustSurface) {
+				// No route from under water within this breath: surface and plan again from the air.
+				mustSurface = true;
+				return TickResult.running(currentProgress());
+			}
 			return fail(player, candidate.outcome() == PathOutcome.NODE_LIMIT ? "PATH_LIMIT_REACHED" : "NO_PATH",
 					"No reachable local route or unexplored route boundary is available", currentProgress());
 		}
@@ -667,6 +689,8 @@ public final class ServerNavigationController implements ServerController {
 		boolean gapJump = waypoint.traversal() == TraversalType.JUMP_GAP;
 		boolean shallowWater = world.isShallowWater(waypoint.position());
 		boolean swimming = waypoint.traversal() == TraversalType.SWIM || player.isInWater();
+		// Over a submerged-floor endpoint let go of space and sink onto it, as a player does to stand on a flooded floor.
+		boolean settleOnFloor = waypoint.position().equals(resolvedEndpointPosition) && submergedFloor(world, waypoint.position());
 		boolean climbing = waypoint.traversal() == TraversalType.CLIMB;
 		boolean crouching = waypoint.traversal() == TraversalType.CROUCH;
 		double climbDx = player.getX() - target.x;
@@ -700,7 +724,11 @@ public final class ServerNavigationController implements ServerController {
 		double targetDz = target.z - player.getZ();
 		boolean jump = jumpNeeded(waypoint.traversal(), target.y - player.getY(),
 				Math.sqrt(targetDx * targetDx + targetDz * targetDz))
-				|| shallowWater || swimming || (climbing && target.y > player.getY() + 0.15D);
+				|| shallowWater || SwimPlanning.navigationJump(swimming, target.y - player.getY(), settleOnFloor)
+				|| (climbing && target.y > player.getY() + 0.15D);
+		// With sprint requested, sprint-swim while the eyes are under water (faster, steered by the view pitch).
+		boolean sprintSwim = sprint && !settleOnFloor && SwimPlanning.swimSprint(player.isInWater(), player.isUnderWater(),
+				1.0F, player.getFoodData().getFoodLevel());
 		AgentInputStates.MotorStep step = AgentInputStates.stepMotor(
 				motorState,
 				new AgentInputStates.MotorTarget(
@@ -708,7 +736,7 @@ public final class ServerNavigationController implements ServerController {
 						targetPitch,
 						!descendingClimb,
 						jump,
-						!swimming && !crouching && !climbing && (sprint || gapJump) && player.getFoodData().getFoodLevel() > 6
+						sprintSwim || !swimming && !crouching && !climbing && (sprint || gapJump) && player.getFoodData().getFoodLevel() > 6
 				),
 				nowEpochMs
 		);
@@ -905,7 +933,7 @@ public final class ServerNavigationController implements ServerController {
 				boolean geometryMatches = region == null ? candidateSatisfiesTolerance(candidate, destination, tolerance)
 						: x + 0.5D >= region.minX && x + 0.5D < region.maxX
 						&& z + 0.5D >= region.minZ && z + 0.5D < region.maxZ;
-				if (geometryMatches && supportedEndpoint(world, candidate)) {
+				if (geometryMatches && goalEndpoint(world, candidate)) {
 					if (region == null) {
 						if (approachableEndpoint(candidate, destination, tolerance,
 								supportHeight.applyAsDouble(candidate), actualStart)) goals.add(candidate);
@@ -952,6 +980,23 @@ public final class ServerNavigationController implements ServerController {
 	private static boolean supportedEndpoint(WalkabilityView world, GridPosition position) {
 		TraversalType traversal = world.traversalAt(position);
 		return traversal == TraversalType.WALK || traversal == TraversalType.CROUCH;
+	}
+
+	/** The floor of flooded space: a player can stand on it under water (ore in a water cave is mined from here). */
+	static boolean submergedFloor(WalkabilityView world, GridPosition position) {
+		return world.isSubmerged(position) && world.cellAt(position.below()) == WalkabilityView.Cell.SAFE_SUPPORT;
+	}
+
+	/** A navigation may end standing on dry support or on a submerged floor; both are verified on the ground. */
+	static boolean goalEndpoint(WalkabilityView world, GridPosition position) {
+		return supportedEndpoint(world, position) || submergedFloor(world, position);
+	}
+
+	/** Consecutive submerged route cells from {@code index}: the swim the breath must cover before reaching air. */
+	static int submergedNodesAhead(WalkabilityView world, List<PathNode> nodes, int index) {
+		int count = 0;
+		for (int i = Math.max(0, index); i < nodes.size() && world.isSubmerged(nodes.get(i).position()); i++) count++;
+		return count;
 	}
 
 	static boolean hasAirReserve(boolean inWater, int air) {

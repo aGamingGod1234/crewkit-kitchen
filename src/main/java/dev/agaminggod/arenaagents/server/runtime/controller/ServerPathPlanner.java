@@ -86,6 +86,12 @@ public final class ServerPathPlanner {
 		return pathfinder.beginSearch(start, goals, destination, radius, previousFrontiers);
 	}
 
+	/** As above; the start's submerged run is bounded by the swimmer's remaining breath in cells. */
+	public LocalPathfinder.Search beginSearch(GridPosition start, Set<GridPosition> goals,
+			GridPosition destination, int radius, Set<GridPosition> previousFrontiers, int startBreathNodes) {
+		return pathfinder.beginSearch(start, goals, destination, radius, previousFrontiers, startBreathNodes);
+	}
+
 	public PlanningResult resume(LocalPathfinder.Search search, WalkabilityView view) {
 		TickBudget tick = CURRENT_BUDGET.get();
 		LocalPathfinder.SearchBudget budget = tick == null

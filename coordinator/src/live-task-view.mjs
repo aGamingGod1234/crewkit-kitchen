@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { sanitizeDiagnosticText } from './diagnostic-sanitizer.mjs';
+import { strategyHints } from './minecraft-strategy-reference.mjs';
 
 const KINDS = ['inventory', 'world', 'milestone', 'manual'];
 const STATES = ['pending', 'active', 'complete', 'lost'];
@@ -158,7 +159,9 @@ export class LiveTaskViews {
    }
    state.plan = plan; state.lastObserved=Object.fromEntries(Object.entries(state.lastObserved).filter(([id])=>plan.steps.some(s=>s.id===id))); state.revision++; this.#reconcile(state); this.#save(state);
   }
-  return { goal: state.goal, revision: state.revision, plan: structuredClone(state.plan), advisory: true };
+  // Points at on-demand strategy topics relevant to unfinished steps; reading them stays the model's choice.
+  const strategy = strategyHints({ goal: state.goal, plan: state.plan });
+  return { goal: state.goal, revision: state.revision, plan: structuredClone(state.plan), advisory: true, ...(strategy === null ? {} : { strategy }) };
  }
  event(record, stage, value) {
   const state = this.#state(record);

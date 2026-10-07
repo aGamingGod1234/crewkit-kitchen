@@ -8,9 +8,16 @@ public interface WalkabilityView {
 
 	default TraversalType traversalAt(GridPosition position) {
 		if (isStandable(position)) return TraversalType.WALK;
-		if (cellAt(position) == Cell.WATER && isBodyClear(position.above())) return TraversalType.SWIM;
+		// A player swims at the surface (head in air) and fully submerged (head in water); breath bounds the latter.
+		if (cellAt(position) == Cell.WATER
+				&& (isBodyClear(position.above()) || cellAt(position.above()) == Cell.WATER)) return TraversalType.SWIM;
 		if (cellAt(position) == Cell.CLIMBABLE && isBodyClear(position.above())) return TraversalType.CLIMB;
 		return null;
+	}
+
+	/** Feet and head both in water: the eyes are under water and air drains while the body is here. */
+	default boolean isSubmerged(GridPosition position) {
+		return cellAt(position) == Cell.WATER && cellAt(position.above()) == Cell.WATER;
 	}
 
 	default boolean isBodyClear(GridPosition position) {

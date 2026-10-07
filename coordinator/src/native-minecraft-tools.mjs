@@ -14,6 +14,7 @@ import { validateTaskEntry } from './task-memory-store.mjs';
 import { TASK_PLAN_SCHEMA, validateTaskPlan } from './live-task-view.mjs';
 import { MODEL_FACT_INSTRUCTIONS } from './model-fact-encoding.mjs';
 import { CONTROL_REFERENCE_TOPICS, minecraftControlReference } from './minecraft-control-reference.mjs';
+import { STRATEGY_REFERENCE_TOPICS, minecraftStrategyReference } from './minecraft-strategy-reference.mjs';
 
 export const MAX_TOOL_RESULT_BYTES = 16_384;
 const COORDINATE_LIMIT = 30_000_000;
@@ -36,6 +37,7 @@ export const INSPECTION_SECTIONS = Object.freeze(['observation', 'inventory', 'm
 export function minecraftCapabilities({ section = 'all', topic, offset } = {}) {
 	if (section === 'program') return { version: 1, section: 'program', engine: 'ArenaScript', reference: ARENA_SCRIPT_API_REFERENCE };
 	if (section === 'control') return minecraftControlReference({ topic, offset });
+	if (section === 'strategy') return minecraftStrategyReference({ topic });
 	return {
 		version: 1,
 		actions: Object.entries(ACTION_FIELDS).map(([actionType, fields]) => ({ actionType, fields: [...fields], requiredFields: fields.filter((field) => !(OPTIONAL_ACTION_FIELDS[actionType] ?? []).includes(field)), optionalFields: [...(OPTIONAL_ACTION_FIELDS[actionType] ?? [])] })),
@@ -43,6 +45,7 @@ export function minecraftCapabilities({ section = 'all', topic, offset } = {}) {
 		inspectionSections: [...INSPECTION_SECTIONS],
 		programReference: { tool: 'capabilities', arguments: { section: 'program' } },
 		controlReference: { tool: 'capabilities', arguments: { section: 'control' } },
+		strategyReference: { tool: 'capabilities', arguments: { section: 'strategy' } },
 		limits: { sequenceActions: MAX_SEQUENCE_ACTIONS, inspectionPage: 32, resultBytes: MAX_TOOL_RESULT_BYTES, actionArgumentBytes: MAX_ACTION_ARGUMENT_BYTES, programSourceBytes: MAX_PROGRAM_SOURCE_BYTES, programParameterBytes: MAX_PROGRAM_PARAMETER_BYTES, programPreconditionBytes: MAX_PROGRAM_PRECONDITION_BYTES, pendingProgramSuccessors: 1, programActions: 256, programTimeoutMs: 120_000 },
 	};
 }
@@ -68,7 +71,7 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 		query: objectSchema({ kind: { type: 'string', enum: ['all', 'place', 'route', 'progress', 'lesson', 'deaths', 'assets', 'trail'] }, dimension: { type: 'string', minLength: 1, maxLength: 128 }, text: { type: 'string', maxLength: 256 }, offset: integerSchema(0, Number.MAX_SAFE_INTEGER), limit: integerSchema(1, 64) }),
 	}, ['operation'])),
 	tool('observe', `${MODEL_FACT_INSTRUCTIONS} Request fresh player facts; read coverage/freshness. An unavailable freshness barrier returns explicitly stale cached facts.`, objectSchema({ view: { type: 'string', enum: ['full', 'changes'] }, afterObservationId: { type: 'string', minLength: 1, maxLength: 128 } })),
-	tool('capabilities', 'List action fields, query sections, limits and runtime support. Read section program before writing ArenaScript. Section control lists unchanged control-reference topics; read topic tool:<name> or action:<actionType> before unfamiliar calls. Follow nextOffset to finish a topic; topic all retrieves the complete reference. These queries perform no gameplay.', objectSchema({ section: { type: 'string', enum: ['all', 'program', 'control'] }, topic: { type: 'string', minLength: 1, maxLength: 128 }, offset: integerSchema(0, Number.MAX_SAFE_INTEGER) })),
+	tool('capabilities', 'List action fields, query sections, limits and runtime support. Read section program before writing ArenaScript. Section control lists unchanged control-reference topics; read topic tool:<name> or action:<actionType> before unfamiliar calls. Follow nextOffset to finish a topic; topic all retrieves the complete reference. Section strategy holds optional progression knowledge by topic (ores, structures, water, Nether, End, beating the game); taskPlan names relevant topics. These queries perform no gameplay.', objectSchema({ section: { type: 'string', enum: ['all', 'program', 'control', 'strategy'] }, topic: { type: 'string', minLength: 1, maxLength: 128 }, offset: integerSchema(0, Number.MAX_SAFE_INTEGER) })),
 	tool('inspect', 'Request a focused page of player-accessible facts. Item queries need a slot; block queries need visible x/y/z coordinates. Read coverage and freshness.', objectSchema({
 		section: { type: 'string', enum: INSPECTION_SECTIONS }, offset: integerSchema(0, 4_096), limit: integerSchema(1, 32),
 		slot: integerSchema(0, 255), x: integerSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT), y: integerSchema(-2_048, 2_048), z: integerSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT),
@@ -193,9 +196,14 @@ function normalizeMinecraftToolArguments(name, value) {
 			return { kind: 'observe', ...(args.view === undefined ? {} : { view: args.view }), ...(args.afterObservationId === undefined ? {} : { afterObservationId: boundedText(args.afterObservationId, 'afterObservationId', 128) }) };
 		case 'capabilities':
 			requireExactKeys(args, ['section', 'topic', 'offset']);
-			if (args.section !== undefined && !['all', 'program', 'control'].includes(args.section)) invalid('capability section is not supported');
-			if ((args.topic !== undefined || args.offset !== undefined) && args.section !== 'control') invalid('topic and offset require the control reference section');
-			if (args.topic !== undefined && !CONTROL_REFERENCE_TOPICS.includes(args.topic)) invalid('control reference topic is not supported');
+			if (args.section !== undefined && !['all', 'program', 'control', 'strategy'].includes(args.section)) invalid('capability section is not supported');
+			if (args.section === 'strategy') {
+				if (args.offset !== undefined) invalid('strategy topics are returned whole');
+				if (args.topic !== undefined && !STRATEGY_REFERENCE_TOPICS.includes(args.topic)) invalid('strategy topic is not supported');
+			} else {
+				if ((args.topic !== undefined || args.offset !== undefined) && args.section !== 'control') invalid('topic and offset require the control reference section');
+				if (args.topic !== undefined && !CONTROL_REFERENCE_TOPICS.includes(args.topic)) invalid('control reference topic is not supported');
+			}
 			if (args.offset !== undefined && args.topic === undefined) invalid('control reference offset requires a topic');
 			return { kind: 'capabilities', ...(args.section === undefined ? {} : { section: args.section }), ...(args.topic === undefined ? {} : { topic: args.topic }), ...(args.offset === undefined ? {} : { offset: integer(args.offset, 'offset', 0, Number.MAX_SAFE_INTEGER) }) };
 		case 'inspect': {
