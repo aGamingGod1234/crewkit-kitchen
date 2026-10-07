@@ -307,7 +307,11 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 				source.dimensionId()
 		);
 		GoalRoute route = reserved ? GoalRoute.EVENT_ONLY : routePlayerGoal(target, delivered, sourceLevel);
-		if (route.publish()) eventSink.publish(delivered, route.wakeSpec());
+		if (route.publish()) {
+			eventSink.publish(delivered, route.wakeSpec());
+			// The model may later adopt exactly this delivered message as a task (takeTask).
+			manager.spokenRequests().record(delivered);
+		}
 	}
 
 	private GoalRoute routePlayerGoal(AgentRecord target, ConversationEvent event, ServerLevel sourceLevel) {
@@ -320,10 +324,12 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 		}
 		ServerPlayer requester = manager.server().getPlayerList().getPlayer(requestingPlayerId(event));
 		boolean operator = requester != null && GoalControl.mayControl(requester.createCommandSourceStack());
-		if (operator && ConversationWakePolicy.isPlayerGoalChannel(event.kind(), event.audience())
+		// Operators confirm any task; the player who asked for a model-adopted task confirms that one.
+		boolean mayConfirm = operator || manager.mayConfirmAsModelTaskRequester(target.agentId(), requestingPlayerId(event));
+		if (mayConfirm && ConversationWakePolicy.isPlayerGoalChannel(event.kind(), event.audience())
 				&& ConversationWakePolicy.isCompletionConfirmation(event.text())
 				&& dev.agaminggod.arenaagents.server.CodexAgentServerRuntime.confirmCurrentGoalFromSpeech(manager.server(), target.agentId())) {
-			notifyRequester(requester.getUUID(), "Confirmed. Minecraft will finish this goal after checking its requirements.");
+			notifyRequester(requestingPlayerId(event), "Confirmed. Minecraft will finish this goal after checking its requirements.");
 			return GoalRoute.CONSUMED;
 		}
 		boolean replaceRequested = ConversationWakePolicy.mayReplaceGoalFromSpeech(

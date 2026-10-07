@@ -141,7 +141,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			"AI agent coordinator is offline; check logs/arena-agents-coordinator-error.log for the startup cause";
 	private static final Logger LOGGER = LoggerFactory.getLogger(MultiplexedServerBridge.class);
 	private static final Set<String> INBOUND_TYPES = Set.of(
-			"auth_challenge", "hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "conversation_wake_ack", "goal_spec_proposal", "director_script_result", "request_observation", "inspection_request", "action_command", "action_cancel", "action_result_ack", "agent_error", "agent_notice", "verbose_event", "task_view", "heartbeat"
+			"auth_challenge", "hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "conversation_wake_ack", "goal_spec_proposal", "task_request", "director_script_result", "request_observation", "inspection_request", "action_command", "action_cancel", "action_result_ack", "agent_error", "agent_notice", "verbose_event", "task_view", "heartbeat"
 	);
 
 	private final CodexAgentManager manager;
@@ -969,7 +969,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			// an action_cancel can never overtake its preceding action_command.
 			case "agent_ready", "planning_state", "goal_completed", "action_command", "action_cancel",
 					"action_result_ack" -> BoundedServerTaskQueue.Lane.URGENT;
-			case "coordinator_status", "conversation_wake_ack", "goal_spec_proposal",
+			case "coordinator_status", "conversation_wake_ack", "goal_spec_proposal", "task_request",
 					"request_observation", "agent_notice", "heartbeat" -> BoundedServerTaskQueue.Lane.CONTROL;
 			case "inspection_request" -> BoundedServerTaskQueue.Lane.INSPECTION;
 			default -> BoundedServerTaskQueue.Lane.BULK;
@@ -1149,6 +1149,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			case "goal_completed" -> acceptGoalCompleted(envelope);
 			case "conversation_wake_ack" -> acceptConversationWakeAck(envelope);
 			case "goal_spec_proposal" -> acceptGoalSpecProposal(envelope);
+			case "task_request" -> acceptTaskRequest(envelope);
             case "director_script_result" -> dev.agaminggod.arenaagents.server.DirectorScriptGeneration.accept(manager.server(), envelope.payload());
 			case "request_observation" -> acceptObservationRequest(envelope);
 			case "inspection_request" -> acceptInspectionRequest(envelope);
@@ -1261,6 +1262,20 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			String code = exception instanceof AgentDomainException domain ? domain.code() : ((BridgeProtocolException) exception).code();
 			sendGoalSpecResult(agentId, requestIdValue, "rejected", code);
 		}
+	}
+
+	/**
+	 * The model chose takeTask for a player's request. Minecraft applies its normal start or resume
+	 * (publishing goal_control first), stages the usual translation draft, or explains the refusal;
+	 * every identifiable request is answered so the model can tell the player.
+	 */
+	private void acceptTaskRequest(BridgeEnvelope envelope) {
+		AgentId agentId = AgentId.parse(envelope.agentId());
+		ModelTaskRequestHandler.handle(
+				envelope.payload(),
+				request -> manager.adoptModelTask(agentId, request, this::publishGoalSpecRequest),
+				() -> manager.registry().require(agentId).goalRevision()
+		).ifPresent(result -> send("task_request_result", agentId.toString(), result));
 	}
 
 	static String goalSpecSummary(JsonObject payload) {

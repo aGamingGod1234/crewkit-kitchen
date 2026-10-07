@@ -367,6 +367,18 @@ Optional finish:{summary} requests verification of the immutable active goal aft
 {"tool":"sequence","arguments":{"actions":[{"actionType":"craft_inventory","arguments":{"recipeId":"minecraft:oak_planks","count":4,"timeoutMs":15000}},{"actionType":"craft_inventory","arguments":{"recipeId":"minecraft:stick","count":4,"timeoutMs":15000}}],"finish":{"summary":"Crafted the requested sticks; verify current inventory."}}}
 ```
 
+### takeTask
+
+With no active task, a player message in this conversation that asks you to do something is yours to accept. Call takeTask to adopt it: request defaults to that player's latest words, so rewrite it as the concrete task when that is clearer. If you have a paused task and they say "continue", call takeTask with resume:true; only an operator can give a paused agent a different task. On a completed agent, name what to continue in request. Pass requesterId only when several players messaged you. Minecraft starts the task, validates it first (PENDING: it starts by itself), or refuses (taken over, busy, paused, unclear request, requester offline) with a reason to relay using say. takeTask never replaces an active task. After success end the turn; the task turn starts at once with every tool. Plain chat needs only say.
+
+```json executor-call
+{"tool":"takeTask","arguments":{"request":"Craft a stone pickaxe and bring it to me."}}
+```
+
+```json executor-bad-call
+{"tool":"takeTask","arguments":{"requesterId":"Lucas"}}
+```
+
 ### finish
 
 Ask Minecraft to verify the immutable active goal. A failed check keeps the goal active.

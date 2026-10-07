@@ -1140,7 +1140,7 @@ async function disconnectFencesOutstandingActionReplay() {
 	assert.equal(result.providerSessions.created, 1);
 	assert.equal(result.leaseStats.maxByKind.provider, 1);
 	assert.equal(result.leaseStats.maxByKind.action, 1);
-	assert.equal(result.listenerStats.maximum, 23, 'listener gauge includes inspection, Director generation and the task-view reader, and samples registrations across reconnect');
+	assert.equal(result.listenerStats.maximum, 24, 'listener gauge includes inspection, Director generation, the task-view reader and takeTask results, and samples registrations across reconnect');
 	assert.equal(result.listenerStats.current, 0, 'listener gauge samples final cleanup separately from the lifecycle maximum');
 	return evidence({
 		recovery: { healthy: result.connectionEpoch === 2 && replacementDispatches.length === 1, permanentLatch: false, stateBefore: 'bridge_disconnected', stateAfter: result.finalState, nextProbeAtEpochMs: null, attemptTimes: [1, 2], probeDeadlines: [], retryDelays: [], attemptCount: 2 },
