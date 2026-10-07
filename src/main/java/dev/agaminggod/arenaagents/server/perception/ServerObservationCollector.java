@@ -134,6 +134,16 @@ public final class ServerObservationCollector {
 		player.addProperty("onFire", agent.isOnFire());
 		player.addProperty("air", Math.max(0, agent.getAirSupply()));
 		player.addProperty("maxAir", Math.max(1, agent.getMaxAirSupply()));
+		// Eyes under water: air is draining. airSecondsLeft is the time before drowning damage starts.
+		player.addProperty("underWater", agent.isUnderWater());
+		// Only while an operator's /takeover owns the body, so the coordinator never wakes the model to act on it.
+		if (dev.agaminggod.arenaagents.server.pov.AgentControlReservations.isReserved(level.getServer(), agentId)) {
+			player.addProperty("operatorControlled", true);
+		}
+		if (agent.isUnderWater()) {
+			player.addProperty("airSecondsLeft", Math.round(dev.agaminggod.arenaagents.server.runtime.controller.SwimPlanning
+					.airSecondsLeft(agent.getAirSupply()) * 10.0D) / 10.0D);
+		}
 		player.addProperty("suffocating", agent.isInWall());
 		player.addProperty("fallDistance", finite(agent.fallDistance));
 		player.addProperty("pose", agent.getPose().name().toLowerCase(java.util.Locale.ROOT));
@@ -1260,6 +1270,8 @@ public final class ServerObservationCollector {
 		boolean requiresForcedAttention(RawPlayerState previous, boolean inventoryChanged) {
 			// Narrow exception: preserve menu/components, events, hazards and every other raw wake.
 			return inventoryChanged || !AttentionSignalPolicy.safeAir(air) || !AttentionSignalPolicy.safeAir(previous.air)
+					// Crossing the half-air warning must reach the model while there is still time to surface.
+					|| AttentionSignalPolicy.airBand(air) != AttentionSignalPolicy.airBand(previous.air)
 					|| health != previous.health || foodLevel != previous.foodLevel || saturation != previous.saturation
 					|| onFire != previous.onFire || inWater != previous.inWater || suffocating != previous.suffocating
 					|| onGround != previous.onGround || fallDistance != previous.fallDistance

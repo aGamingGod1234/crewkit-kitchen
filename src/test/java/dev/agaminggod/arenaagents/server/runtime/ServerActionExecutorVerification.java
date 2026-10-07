@@ -324,6 +324,7 @@ public final class ServerActionExecutorVerification {
 		verifySetupFailureDoesNotClaimPhysicalExecution();
 		verifySetupFailurePublicationRetries();
 		verifyPermanentCleanupQuarantines();
+		verifyDetachedActionsAreCancellable();
 		assertEquals(0, ServerActionExecutor.roundRobinStart(0L, 16),
 				"round-robin starts with the first active agent");
 		assertEquals(1, ServerActionExecutor.roundRobinStart(1L, 16),
@@ -669,6 +670,71 @@ public final class ServerActionExecutorVerification {
 		assertTrue(executor.activeRequest(request.agentId()) == null, "quarantined action leaves the active execution set");
 		assertDoesNotThrow(() -> executor.submitProgramPrimitive(request),
 				"successful retained cleanup automatically clears the action quarantine");
+	}
+
+	/**
+	 * Review fixes: a detached (no-task) self-preservation action of an idle or completed agent is cancelled by a
+	 * coordinator disconnect, by /stop (without inventing a goal) and by a new goal start, through the real executor.
+	 */
+	@SuppressWarnings("unchecked")
+	private static void verifyDetachedActionsAreCancellable() {
+		CodexAgentManager manager = uninitializedManager();
+		AgentRecord agent = manager.registry().create(
+				"codex", "gpt-5.6-sol", "high", Optional.of("DetachedTarget"), AgentGameMode.SURVIVAL, 4_000L
+		);
+		List<ServerActionResult> results = new ArrayList<>();
+		ServerActionExecutor executor = new ServerActionExecutor(manager, results::add);
+		manager.setRuntimeHooks(new dev.agaminggod.arenaagents.server.AgentRuntimeHooks() {
+			@Override
+			public boolean cancelDetachedAction(AgentId agentId, String reason) {
+				return executor.cancel(agentId, reason);
+			}
+		});
+		ActionProvenance provenance = new ActionProvenance(
+				"codex", "gpt-5.6-sol", "high", "priority", "native-danger", 1L, "step-fight", 1L, "trace-detached"
+		);
+		java.util.function.IntFunction<ServerActionRequest> request = index -> new ServerActionRequest(
+				agent.agentId(), manager.registry().require(agent.agentId()).goalRevision(), "detached-" + index,
+				ActionType.FIGHT_TARGET, new JsonObject(), provenance, "trace-detached");
+		Runnable insert = () -> {
+			try {
+				Class<?> actionClass = Class.forName(ServerActionExecutor.class.getName() + "$ActiveAction");
+				var factory = actionClass.getDeclaredMethod("transaction", ServerActionRequest.class,
+						net.minecraft.server.level.ServerPlayer.class, ServerTransactionAdapter.ActiveTransaction.class);
+				factory.setAccessible(true);
+				Object action = factory.invoke(null, request.apply(results.size()), null, new ServerTransactionAdapter.ActiveTransaction() {
+					@Override public ServerTransactionAdapter.TickResult tick(long nowEpochMs) { return null; }
+					@Override public void cancel(String reason) { }
+					@Override public void cleanup() { }
+				});
+				Field activeField = ServerActionExecutor.class.getDeclaredField("active");
+				activeField.setAccessible(true);
+				((Map<AgentId, Object>) activeField.get(executor)).put(agent.agentId(), action);
+			} catch (ReflectiveOperationException exception) {
+				throw new AssertionError("could not install a detached action", exception);
+			}
+		};
+
+		insert.run();
+		executor.coordinatorDisconnected();
+		assertTrue(executor.activeRequest(agent.agentId()) == null && results.size() == 1
+				&& results.getLast().state() == ServerActionState.CANCELLED,
+				"a coordinator disconnect cancels an idle agent's detached action");
+
+		insert.run();
+		dev.agaminggod.arenaagents.agent.AgentTransition stopped = manager.stop(agent.agentId().toString());
+		assertTrue(stopped.before() == stopped.after() && stopped.cancelAction(),
+				"/stop on an idle agent stops its action without inventing or pausing a goal");
+		assertTrue(executor.activeRequest(agent.agentId()) == null && results.size() == 2
+				&& results.getLast().state() == ServerActionState.CANCELLED, "/stop cancels the detached action");
+
+		insert.run();
+		dev.agaminggod.arenaagents.agent.AgentTransition started = manager.registry().start(agent.agentId(), "Build", 4_100L);
+		assertTrue(started.cancelAction(), "a new goal from idle cancels any detached action (no old-revision inheritance)");
+		// The bridge applies cancelAction on every published transition (MultiplexedServerBridge onTransition).
+		if (started.cancelAction()) executor.cancel(agent.agentId(), "Lifecycle changed to " + started.after().state());
+		assertTrue(executor.activeRequest(agent.agentId()) == null && results.size() == 3,
+				"the started goal does not inherit the detached action");
 	}
 
 	private static CodexAgentManager uninitializedManager() {

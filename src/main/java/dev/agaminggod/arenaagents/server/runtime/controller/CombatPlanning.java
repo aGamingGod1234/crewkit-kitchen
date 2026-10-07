@@ -329,17 +329,75 @@ public final class CombatPlanning {
 	public static Heading fleeHeading(WalkabilityView world, GridPosition feet, float awayYaw, Float previousYaw) {
 		Objects.requireNonNull(world, "world must not be null");
 		Objects.requireNonNull(feet, "feet must not be null");
+		return fleeHeading(world, feet, awayYaw, previousYaw, SwimPlanning.WATER_PENALTY_DEGREES);
+	}
+
+	/**
+	 * As {@link #fleeHeading(WalkabilityView, GridPosition, float, Float)} with deep water costed, not blocked: each
+	 * candidate costs its offset from "away" plus {@code waterPenaltyDegrees} when the next two cells cross deep water,
+	 * so a land escape wins whenever one exists nearby and the flee only swims when water is clearly the best way out.
+	 * Once already swimming every heading is water and the cheapest (straightest, or a shore) wins.
+	 */
+	public static Heading fleeHeading(WalkabilityView world, GridPosition feet, float awayYaw, Float previousYaw,
+			float waterPenaltyDegrees) {
+		Objects.requireNonNull(world, "world must not be null");
+		Objects.requireNonNull(feet, "feet must not be null");
+		Heading best = null;
+		float bestCost = Float.POSITIVE_INFINITY;
 		if (previousYaw != null && Math.abs(wrap(previousYaw - awayYaw)) <= STICKY_HEADING_DEGREES) {
 			Probe sticky = probe(world, feet, previousYaw);
-			if (sticky.passable()) return new Heading(wrap(previousYaw), sticky.jump(), true);
+			if (sticky.passable() && !sticky.water()) return new Heading(wrap(previousYaw), sticky.jump(), true);
+			if (sticky.passable()) {
+				best = new Heading(wrap(previousYaw), sticky.jump(), true);
+				bestCost = waterPenaltyDegrees + 0.5F;
+			}
 		}
 		for (int offset : FLEE_OFFSETS) {
 			float yaw = wrap(awayYaw + offset);
 			Probe probe = probe(world, feet, yaw);
-			if (probe.passable()) return new Heading(yaw, probe.jump(), true);
+			if (!probe.passable()) continue;
+			// Equal cost: land wins over water.
+			float cost = Math.abs(offset) + (probe.water() ? waterPenaltyDegrees + 0.5F : 0.0F);
+			if (cost < bestCost) {
+				best = new Heading(yaw, probe.jump(), true);
+				bestCost = cost;
+			}
 		}
 		// Boxed in (pillar, ledge over lava, dead-end tunnel): report it instead of jumping off; the model decides.
-		return new Heading(wrap(awayYaw), false, false);
+		return best != null ? best : new Heading(wrap(awayYaw), false, false);
+	}
+
+	/** True when the next two cells along {@code yaw} cross deep water (swimming, not walking). */
+	public static boolean headingCrossesWater(WalkabilityView world, GridPosition feet, float yaw) {
+		Probe probe = probe(world, feet, yaw);
+		return probe.passable() && probe.water();
+	}
+
+	/**
+	 * Nearest land a swimmer can climb onto: a standable (walk) cell within {@code radius} columns, at the feet level
+	 * or one to two above (a bank) or one below, nearest horizontally. Null when only water is in reach.
+	 */
+	public static GridPosition nearestShore(WalkabilityView world, GridPosition feet, int radius) {
+		Objects.requireNonNull(world, "world must not be null");
+		Objects.requireNonNull(feet, "feet must not be null");
+		GridPosition best = null;
+		int bestDistance = Integer.MAX_VALUE;
+		int[] levels = {0, 1, -1, 2};
+		for (int dx = -radius; dx <= radius; dx++) {
+			for (int dz = -radius; dz <= radius; dz++) {
+				int distance = dx * dx + dz * dz;
+				if (distance == 0 || distance > radius * radius || distance >= bestDistance) continue;
+				for (int dy : levels) {
+					GridPosition candidate = feet.offset(dx, dy, dz);
+					if (world.traversalAt(candidate) == TraversalType.WALK) {
+						best = candidate;
+						bestDistance = distance;
+						break;
+					}
+				}
+			}
+		}
+		return best;
 	}
 
 	/** True when walking along {@code yaw} keeps safe footing for the next two cells (the flee probe). */
@@ -355,13 +413,29 @@ public final class CombatPlanning {
 		return forward * (float) Math.max(0.0D, Math.cos(Math.toRadians(yawError)));
 	}
 
-	/** Flee and fight only walk, swim or climb; a crouch-only gap would need input they never give. */
+	/**
+	 * Flee and fight only walk, swim or climb; a crouch-only gap would need input they never give. Swimming includes
+	 * submerged water with room above (a player swims through it), not just the surface cells the path planner uses.
+	 */
 	static boolean walkable(WalkabilityView world, GridPosition position) {
 		TraversalType traversal = world.traversalAt(position);
-		return traversal == TraversalType.WALK || traversal == TraversalType.SWIM || traversal == TraversalType.CLIMB;
+		return traversal == TraversalType.WALK || traversal == TraversalType.SWIM || traversal == TraversalType.CLIMB
+				|| swimmable(world, position);
 	}
 
-	record Probe(boolean passable, boolean jump) {
+	static boolean swimmable(WalkabilityView world, GridPosition position) {
+		return world.cellAt(position) == WalkabilityView.Cell.WATER && open(world, position.above());
+	}
+
+	/** Room for the body: clear air or water (swimming through it). */
+	static boolean open(WalkabilityView world, GridPosition position) {
+		return world.isBodyClear(position) || world.cellAt(position) == WalkabilityView.Cell.WATER;
+	}
+
+	record Probe(boolean passable, boolean jump, boolean water) {
+		Probe(boolean passable, boolean jump) {
+			this(passable, jump, false);
+		}
 	}
 
 	static Probe probe(WalkabilityView world, GridPosition feet, float yaw) {
@@ -370,30 +444,33 @@ public final class CombatPlanning {
 		double dz = Math.cos(radians);
 		int y = feet.y();
 		boolean jump = false;
+		boolean water = false;
 		for (int step = 1; step <= 2; step++) {
 			int x = feet.x() + (int) Math.round(dx * step);
 			int z = feet.z() + (int) Math.round(dz * step);
 			if (x == feet.x() && z == feet.z()) continue;
 			GridPosition level = new GridPosition(x, y, z);
-			if (walkable(world, level)) continue;
-			GridPosition up = level.above();
-			if (walkable(world, up) && world.isBodyClear(new GridPosition(feet.x(), y + 2, feet.z()))) {
+			GridPosition reached;
+			if (walkable(world, level)) {
+				reached = level;
+			} else if (walkable(world, level.above()) && open(world, new GridPosition(feet.x(), y + 2, feet.z()))) {
 				if (step == 1) jump = true;
 				y += 1;
-				continue;
-			}
-			if (walkable(world, level.below()) && world.isBodyClear(level) && world.isBodyClear(level.above())) {
+				reached = level.above();
+			} else if (walkable(world, level.below()) && open(world, level) && open(world, level.above())) {
 				y -= 1;
-				continue;
-			}
-			if (walkable(world, level.below(2)) && world.isBodyClear(level) && world.isBodyClear(level.above())
-					&& world.isBodyClear(level.below())) {
+				reached = level.below();
+			} else if (walkable(world, level.below(2)) && open(world, level) && open(world, level.above())
+					&& open(world, level.below())) {
 				y -= 2;
-				continue;
+				reached = level.below(2);
+			} else {
+				return new Probe(false, false);
 			}
-			return new Probe(false, false);
+			// Deep water (not one-deep standing water, which the world reports as clear footing) means swimming.
+			if (world.cellAt(reached) == WalkabilityView.Cell.WATER) water = true;
 		}
-		return new Probe(true, jump);
+		return new Probe(true, jump, water);
 	}
 
 	/** Yaw (Minecraft convention) that faces from {@code fromX,fromZ} toward {@code toX,toZ}. */

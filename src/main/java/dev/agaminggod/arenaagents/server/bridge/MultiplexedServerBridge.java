@@ -1592,6 +1592,11 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 	}
 
+	@Override
+	public boolean cancelDetachedAction(AgentId agentId, String reason) {
+		return actionExecutor.cancel(agentId, reason);
+	}
+
 	private void acceptAgentError(BridgeEnvelope envelope) {
 		AgentId agentId = AgentId.parse(envelope.agentId());
 		long goalRevision = requiredLong(envelope.payload(), "goalRevision");
@@ -2286,6 +2291,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				|| (!respawn && !acceptsActionRevision(record, request))) {
 			throw new AgentDomainException("STALE_REVISION", "Coordinator action revision is stale");
 		}
+		requireDetachedBodyActionAllowed(manager.server(), record, request);
 		ActionProvenance provenance = request.provenance();
 		AgentProfile profile = record.profile();
 		if (!profile.provider().equals(provenance.provider()) || !profile.model().equals(provenance.model())
@@ -2311,9 +2317,33 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		return record;
 	}
 
-	static boolean acceptsActionRevision(AgentRecord record, ServerActionRequest request) {
+	public static boolean acceptsActionRevision(AgentRecord record, ServerActionRequest request) {
 		if (record.acceptsRevision(request.goalRevision())) return true;
-		return isDetachedConversationReply(record, request);
+		return isDetachedConversationReply(record, request) || isDetachedBodyAction(record, request);
+	}
+
+	/**
+	 * With no active task (idle, or its task completed or awaiting nothing more) the model may still use its body at
+	 * the same revision: fight, flee, eat, equip, move. The action changes no goal lifecycle (see
+	 * {@link dev.agaminggod.arenaagents.agent.AgentLifecycleReducer#isDetachedActionState}). Paused and dead agents stay
+	 * blocked: an operator stop or death is not "no task".
+	 */
+	static boolean isDetachedBodyAction(AgentRecord record, ServerActionRequest request) {
+		return request.goalRevision() == record.goalRevision()
+				&& dev.agaminggod.arenaagents.agent.AgentLifecycleReducer.isDetachedActionState(record.state())
+				// Only self-preservation; chat keeps its own detached-reply rule (direct or proximity while idle).
+				&& dev.agaminggod.arenaagents.agent.AgentLifecycleReducer.isSelfPreservationAction(request.type());
+	}
+
+	/**
+	 * A detached action never bypasses a /takeover, skit playback or Director reservation: a takeover of an idle or
+	 * completed agent does not change its revision, so the reservation itself must refuse the model's action.
+	 */
+	public static void requireDetachedBodyActionAllowed(net.minecraft.server.MinecraftServer server, AgentRecord record,
+			ServerActionRequest request) {
+		if (isDetachedBodyAction(record, request)) {
+			dev.agaminggod.arenaagents.server.SkitModeRuntime.requireNormalControlAllowed(server, record.agentId());
+		}
 	}
 
 	static boolean isDetachedConversationReply(AgentRecord record, ServerActionRequest request) {

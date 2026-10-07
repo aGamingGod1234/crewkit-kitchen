@@ -21,6 +21,7 @@ public final class CombatPlanningVerification {
 		verifyFleeSteering();
 		verifyFollowThrough();
 		verifyMultiThreatFlee();
+		verifyWater();
 		return assertions;
 	}
 
@@ -218,6 +219,99 @@ public final class CombatPlanningVerification {
 		check(closing, "a threat gaining ground is closing");
 		tracker.retain(Set.of());
 		check(tracker.observe("zombie", 8.0D), "a threat that left and returned is watched afresh");
+	}
+
+	/** The play-test: a flee into a lake ended afloat, the agent sank and drowned while mobs closed in. */
+	private static void verifyWater() {
+		GridPosition feet = new GridPosition(0, 64, 0);
+		float south = 0.0F;
+		// A lake south of the agent (surface y 63, two deep), solid ground everywhere else.
+		WalkabilityView lake = position -> {
+			boolean inLake = position.z() >= 1 && Math.abs(position.x()) <= 1;
+			if (inLake && (position.y() == 63 || position.y() == 62)) return WalkabilityView.Cell.WATER;
+			if (position.y() <= 63) return WalkabilityView.Cell.SAFE_SUPPORT;
+			return WalkabilityView.Cell.CLEAR;
+		};
+		check(CombatPlanning.headingCrossesWater(lake, feet, south), "the heading straight into the lake is a swim");
+		CombatPlanning.Heading land = CombatPlanning.fleeHeading(lake, feet, south, null);
+		check(land.clear() && !CombatPlanning.headingCrossesWater(lake, feet, land.yaw()) && Math.abs(land.yaw()) <= 90.0F,
+				"with land within 90 degrees of away the flee stays on land instead of walking into the water");
+		check(!CombatPlanning.headingCrossesWater(lake, feet, CombatPlanning.fleeHeading(lake, feet, south, 0.0F).yaw()),
+				"a previous heading into the water is dropped for a land heading");
+		// Water on every side except straight back: costed, not blocked, so the flee still swims away.
+		WalkabilityView shore = position -> {
+			boolean water = position.z() >= 0 && !(position.x() == 0 && position.z() == 0);
+			if (water && (position.y() == 63 || position.y() == 62)) return WalkabilityView.Cell.WATER;
+			if (position.y() <= 63) return WalkabilityView.Cell.SAFE_SUPPORT;
+			return WalkabilityView.Cell.CLEAR;
+		};
+		CombatPlanning.Heading swim = CombatPlanning.fleeHeading(shore, feet, south, null);
+		check(swim.clear() && swim.yaw() == 0.0F, "deep water straight away beats running back toward the threat");
+		CombatPlanning.Heading wary = CombatPlanning.fleeHeading(shore, feet, south, null,
+				SwimPlanning.AQUATIC_THREAT_WATER_PENALTY_DEGREES);
+		check(wary.clear() && !CombatPlanning.headingCrossesWater(shore, feet, wary.yaw()),
+				"with a drowned among the threats any land heading beats the water");
+		// Submerged: every cell around is water. Swimming is passable (no FLEE_BLOCKED, fight can approach).
+		WalkabilityView deep = position -> position.y() <= 70 && position.y() > 55
+				? WalkabilityView.Cell.WATER : position.y() <= 55 ? WalkabilityView.Cell.SAFE_SUPPORT : WalkabilityView.Cell.CLEAR;
+		GridPosition submerged = new GridPosition(0, 60, 0);
+		check(CombatPlanning.fleeHeading(deep, submerged, south, null).clear(), "a submerged agent can still flee by swimming");
+		check(CombatPlanning.canStep(deep, submerged, south) && CombatPlanning.canStep(deep, submerged, 180.0F),
+				"a submerged fight can approach and back off by swimming");
+		// Lava stays a hazard even next to water.
+		WalkabilityView lavaLake = position -> position.y() == 63 && position.z() >= 1
+				? WalkabilityView.Cell.HAZARD : position.y() <= 63 ? WalkabilityView.Cell.SAFE_SUPPORT : WalkabilityView.Cell.CLEAR;
+		check(CombatPlanning.fleeHeading(lavaLake, feet, south, null).yaw() != 0.0F, "water rules never make lava passable");
+
+		// Executed swimming (the model chose the movement; this only makes it work in water).
+		check(SwimPlanning.holdJump(true) && !SwimPlanning.holdJump(false), "in water the movement holds jump like a player");
+		check(SwimPlanning.swimSprint(true, true, 1.0F, 20) && !SwimPlanning.swimSprint(true, false, 1.0F, 20)
+				&& !SwimPlanning.swimSprint(true, true, 0.0F, 20) && !SwimPlanning.swimSprint(true, true, 1.0F, 6),
+				"sprint-swim only while submerged, moving forward and fed");
+		check(SwimPlanning.swimPitch(true, true, 0.0F) < 0.0F && SwimPlanning.swimPitch(true, false, 7.0F) == 7.0F,
+				"a submerged agent looks up to surface; at the surface the requested pitch stays");
+		check(SwimPlanning.fightJump(true, 0.0D) && SwimPlanning.fightJump(true, 2.0D) && !SwimPlanning.fightJump(true, -3.0D)
+				&& !SwimPlanning.fightJump(false, 2.0D), "a water fight stays afloat unless the target is clearly below");
+		check(SwimPlanning.unreachableTicks(true, ServerFightController.UNREACHABLE_TICKS) > ServerFightController.UNREACHABLE_TICKS
+				&& SwimPlanning.unreachableTicks(false, ServerFightController.UNREACHABLE_TICKS) == ServerFightController.UNREACHABLE_TICKS,
+				"TARGET_UNREACHABLE after a fair swim attempt only when the agent itself swims; otherwise 5 s");
+		check(SwimPlanning.floatJump(true, false, false) && SwimPlanning.floatJump(true, true, true)
+				&& !SwimPlanning.floatJump(true, true, false) && !SwimPlanning.floatJump(false, false, false),
+				"jump is held to rise or float, never while standing in one-deep or waterlogged blocks (no hopping)");
+
+		// Surfacing (review): the nearest open column, not the destination; ice or a sealed tunnel is reported.
+		SwimPlanning.ColumnView lakeAbove = (x, y, z) -> y >= 64 ? SwimPlanning.Cell.OPEN : SwimPlanning.Cell.WATER;
+		SwimPlanning.Surface straightUp = SwimPlanning.nearestSurface(lakeAbove, 0, 60, 0);
+		check(straightUp != null && straightUp.x() == 0 && straightUp.z() == 0 && straightUp.openY() == 64,
+				"open water above: rise straight up");
+		SwimPlanning.ColumnView iceSheet = (x, y, z) -> y >= 65 ? SwimPlanning.Cell.OPEN
+				: y == 64 && Math.abs(x) <= 3 ? SwimPlanning.Cell.SOLID : y == 64 ? SwimPlanning.Cell.OPEN : SwimPlanning.Cell.WATER;
+		SwimPlanning.Surface hole = SwimPlanning.nearestSurface(iceSheet, 0, 60, 0);
+		check(hole != null && Math.abs(hole.x()) == 4, "under an ice sheet or overhang it heads for the nearest open column");
+		SwimPlanning.ColumnView sealed = (x, y, z) -> y >= 62 ? SwimPlanning.Cell.SOLID : SwimPlanning.Cell.WATER;
+		check(SwimPlanning.nearestSurface(sealed, 0, 60, 0) == null, "a sealed tunnel has no surface to rise to");
+		check(SwimPlanning.surfacingFeasible(300, 8.0D) && !SwimPlanning.surfacingFeasible(40, 8.0D),
+				"surfacing fails fast when the breath left cannot cover the swim");
+
+		// Flee afloat (review): once clear of threats, steer for the nearest shore, not out across the lake.
+		WalkabilityView bay = position -> {
+			if (position.x() >= 5 && position.y() <= 63) return WalkabilityView.Cell.SAFE_SUPPORT;
+			if (position.y() == 63 || position.y() == 62) return WalkabilityView.Cell.WATER;
+			return position.y() < 62 ? WalkabilityView.Cell.SAFE_SUPPORT : WalkabilityView.Cell.CLEAR;
+		};
+		GridPosition bank = CombatPlanning.nearestShore(bay, new GridPosition(0, 63, 0), 12);
+		check(bank != null && bank.x() == 5 && bank.z() == 0, "the nearest shore is the closest standable bank cell");
+		check(CombatPlanning.nearestShore(deep, submerged, 6) == null, "open water with no bank in reach has no shore");
+		// The play-test flee ended ESCAPED while the agent was in the lake.
+		check(!SwimPlanning.fleeMayEnd(true, true, false), "never escaped while under water");
+		check(!SwimPlanning.fleeMayEnd(true, false, false), "never escaped while afloat in deep water (it sinks once released)");
+		check(SwimPlanning.fleeMayEnd(true, false, true) && SwimPlanning.fleeMayEnd(false, false, true)
+				&& SwimPlanning.fleeMayEnd(false, false, false), "escaped on land, in shallow water, or mid-jump on land");
+		// navigate_to from under water rises first instead of NO_STANDABLE_PATH.
+		check(SwimPlanning.needsSurfacing(true, true) && !SwimPlanning.needsSurfacing(true, false)
+				&& !SwimPlanning.needsSurfacing(false, false), "navigation surfaces first only while the eyes are under water");
+		check(SwimPlanning.airSecondsLeft(150) == 7.5D && SwimPlanning.airSecondsLeft(-20) == 0.0D,
+				"air seconds count down from 15 s and never go negative");
 	}
 
 	private static void check(boolean condition, String message) {

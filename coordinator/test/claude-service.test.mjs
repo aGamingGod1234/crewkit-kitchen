@@ -333,3 +333,32 @@ async function waitFor(predicate, timeoutMs = 2_000) {
 		await new Promise((resolve) => setTimeout(resolve, 5));
 	}
 }
+
+test('danger steers before the first tool call never interrupt the reasoning turn; all arrive at the first tool boundary', async () => {
+	let captured = null;
+	let release;
+	const { service, children, close } = await harness({
+		async onUser(child) {
+			await new Promise((resolve) => { release = resolve; });
+			captured = (await child.rpc('tools/call', { name: 'observe', arguments: {} })).result;
+			child.emitLine({ type: 'result', subtype: 'success', is_error: false, result: 'ok', session_id: 'session-1' });
+		},
+	});
+	try {
+		const agent = await service.createAgent(profile(), { controlProtocol: 'native_tools' });
+		const turn = agent.act('Goal: survive.', { goalRevision: 0, executeTool: async () => ({ state: 'OK' }) });
+		await waitFor(() => release !== undefined);
+		// The play-test: ~30 threat/damage events while the model was still deciding its first action.
+		const steers = ['Threat: zombie targeting.', 'Damage: health 17.', 'Suffocation: air 150 of 300.']
+			.map((text) => agent.steer(text, { goalRevision: 0 }));
+		release();
+		for (const steer of steers) assert.deepEqual(await steer, { turnId: '1:1' });
+		assert.deepEqual(await turn, { status: 'completed', toolCalls: 1 });
+		assert.equal(children[0].lines.filter((line) => line.type === 'control_request' && line.request?.subtype === 'interrupt').length, 0,
+			'a steer never interrupts the model mid-reasoning');
+		assert.equal(children[0].lines.filter((line) => line.type === 'user').length, 1, 'no restarted or extra turn');
+		assert.equal(children.length, 1, 'the warm process and its reasoning are kept');
+		assert.equal(captured.content.length, 2, 'every queued steer rides on the one tool result');
+		assert.match(captured.content[1].text, /zombie targeting[\s\S]*health 17[\s\S]*air 150/);
+	} finally { await close(); }
+});

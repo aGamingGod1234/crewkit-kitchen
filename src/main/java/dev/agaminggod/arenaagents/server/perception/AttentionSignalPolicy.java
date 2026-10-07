@@ -12,6 +12,11 @@ import java.util.TreeSet;
 /** Selects factual changes important enough to request model attention. */
 public final class AttentionSignalPolicy {
 	private static final int CRITICAL_AIR = 60;
+	/**
+	 * Half of the vanilla 300 air: 7.5 s before drowning damage. The model needs several seconds to decide, so the
+	 * 3 s critical edge alone came too late in the play-test. Each edge fires once per dive (air refills on surfacing).
+	 */
+	static final int WARNING_AIR = 150;
 	private static final int CRITICAL_FOOD = 6;
 	private static final double HAZARDOUS_FALL_DISTANCE = 6.0D;
 
@@ -20,6 +25,11 @@ public final class AttentionSignalPolicy {
 
 	static boolean safeAir(int air) {
 		return air > CRITICAL_AIR;
+	}
+
+	/** 0 above the warning, 1 at or below the warning, 2 at or below critical air. */
+	static int airBand(int air) {
+		return air <= CRITICAL_AIR ? 2 : air <= WARNING_AIR ? 1 : 0;
 	}
 
 	public static List<String> changedFacts(JsonObject previous, JsonObject current) {
@@ -35,7 +45,8 @@ public final class AttentionSignalPolicy {
 		if (decreased(beforePlayer, afterPlayer, "health")) facts.add("player.health");
 		if (started(beforePlayer, afterPlayer, "onFire")) facts.add("player.onFire");
 		if (started(beforePlayer, afterPlayer, "suffocating")) facts.add("player.suffocating");
-		if (crossedAtOrBelow(beforePlayer, afterPlayer, "air", CRITICAL_AIR)) facts.add("player.air");
+		if (crossedAtOrBelow(beforePlayer, afterPlayer, "air", CRITICAL_AIR)
+				|| crossedAtOrBelow(beforePlayer, afterPlayer, "air", WARNING_AIR)) facts.add("player.air");
 		if (crossedAtOrBelow(beforePlayer, afterPlayer, "foodLevel", CRITICAL_FOOD)) facts.add("player.foodLevel");
 		if (crossedAtOrAbove(beforePlayer, afterPlayer, "fallDistance", HAZARDOUS_FALL_DISTANCE)) {
 			facts.add("player.fallDistance");

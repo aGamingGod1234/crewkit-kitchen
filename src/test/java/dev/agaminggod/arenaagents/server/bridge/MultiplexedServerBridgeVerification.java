@@ -353,9 +353,15 @@ public final class MultiplexedServerBridgeVerification {
 				"idle conversation cannot publish chat");
 		assertTrue(!MultiplexedServerBridge.isDetachedConversationReply(idle, publicReply),
 				"public chat cannot enter the detached reply executor");
-		assertTrue(!MultiplexedServerBridge.acceptsActionRevision(idle, new ServerActionRequest(
+		ServerActionRequest idleBody = new ServerActionRequest(
 				idle.agentId(), idle.goalRevision(), "idle-wait", ActionType.WAIT, new JsonObject(), provenance
-		)), "idle conversation cannot execute physical actions");
+		);
+		assertTrue(MultiplexedServerBridge.acceptsActionRevision(idle, idleBody)
+				&& MultiplexedServerBridge.isDetachedBodyAction(idle, idleBody),
+				"with no task the model still owns its body: a same-revision physical action runs detached");
+		assertTrue(!MultiplexedServerBridge.acceptsActionRevision(idle, new ServerActionRequest(
+				idle.agentId(), idle.goalRevision() + 1L, "idle-wait-stale", ActionType.WAIT, new JsonObject(), provenance
+		)), "a detached body action cannot cross a lifecycle revision");
 		assertTrue(!MultiplexedServerBridge.acceptsActionRevision(idle, new ServerActionRequest(
 				idle.agentId(), idle.goalRevision() + 1L, "idle-stale", ActionType.CHAT, direct, provenance
 		)), "idle conversation cannot cross a lifecycle revision");

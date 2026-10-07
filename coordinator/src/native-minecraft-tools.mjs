@@ -98,7 +98,7 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 		steps: integerSchema(2, MAX_LOOK_AROUND_STEPS),
 		ticksPerStep: integerSchema(1, MAX_LOOK_AROUND_TICKS),
 	}, ['centerYaw', 'pitch', 'steps', 'ticksPerStep'])),
-	tool('control', 'Hold one complete player input frame for 1 to 200 server ticks. Use for precise movement, jumps, attacks, item use, view, and hotbar control.', objectSchema({
+	tool('control', 'Hold one complete player input frame for 1 to 200 server ticks. Use for precise movement, jumps, attacks, item use, view, and hotbar control. In water jump is a held swim-up key (rise, stay afloat, climb out at a shore); without it the body sinks. Sprint while underWater swims along the view pitch.', objectSchema({
 		forward: numberSchema(-1, 1),
 		strafe: numberSchema(-1, 1),
 		jump: { type: 'boolean' },

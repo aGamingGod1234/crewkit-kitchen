@@ -146,6 +146,8 @@ export class DynamicCoordinator extends EventEmitter {
 	#nativeObservationSignatures = new Map();
 	#nativeWorldSignals = new Map();
 	#nativeConfirmationWaits = new Map();
+	// Agents that started body work while their finished goal awaits confirmation: their follow-up wakes pass.
+	#confirmationActivity = new Set();
 	// takeTask round trips awaiting Minecraft's task_request_result, keyed by requestId.
 	#taskRequests = new Map();
 	#taskRequestTimeoutMs;
@@ -638,6 +640,7 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#nativeObservationSignatures.delete(message.agentId);
 			this.#nativeWorldSignals.delete(message.agentId);
 			this.#nativeConfirmationWaits.delete(message.agentId);
+			this.#confirmationActivity.delete(message.agentId);
 			this.#supervisedObservationRequests.delete(message.agentId);
 			this.#settleTaskRequests(message.agentId, 'AGENT_REMOVED', 'This agent was removed.');
 			this.#forgetConversationWakes(message.agentId);
@@ -878,7 +881,9 @@ export class DynamicCoordinator extends EventEmitter {
 				if (!this.#isConnectionEpochCurrent(connectionEpoch)) return;
 				if (!this.#isLifecycleGenerationCurrent(message.agentId, lifecycleGeneration)) return;
 				const record = this.#registry.assertCurrentRevision(message.agentId, message.payload.goalRevision);
-				if (![DynamicAgentState.STARTING, DynamicAgentState.PLANNING, DynamicAgentState.ACTING].includes(record.state)) return;
+				// Finished or idle native agents still own their body: danger must reach the model (see below).
+				const noTask = this.#usesNativeTools(record) && [DynamicAgentState.IDLE, DynamicAgentState.COMPLETED].includes(record.state);
+				if (!noTask && ![DynamicAgentState.STARTING, DynamicAgentState.PLANNING, DynamicAgentState.ACTING].includes(record.state)) return;
 				const wireObservation = message.payload.observation ?? message.payload;
 				const supervisionKey = this.#supervisionKey(record, lifecycleGeneration);
 				this.#goalSupervisor.factualProgress(supervisionKey, factualProgressSignature(wireObservation), factualProgressDetails(wireObservation));
@@ -904,6 +909,10 @@ export class DynamicCoordinator extends EventEmitter {
 					? mergeAttentionTrigger(classified, pendingAttention)
 					: classified;
 				if (pendingAttention?.goalRevision === record.goalRevision) this.#pendingAttention.delete(record.agentId);
+				if (noTask) {
+					this.#observeWithoutTask(record, observation, message.payload, attention, lifecycleGeneration, connectionEpoch);
+					return;
+				}
 				const ledger = this.#ledger(record.agentId);
 				ledger.ingest('observation', wireObservation);
 				if (this.#usesNativeTools(record)) {
@@ -1477,6 +1486,36 @@ export class DynamicCoordinator extends EventEmitter {
 		}
 	}
 
+	/**
+	 * An agent with no task (finished or idle) still has a body. Its facts stay current for observe/inspect, and urgent
+	 * danger (damage, a threat, fire, lava, drowning, a fall) wakes the model at once in a no-task turn with every body
+	 * tool. Ordinary sightings never wake it, so a finished task is not restarted or redone.
+	 */
+	#observeWithoutTask(record, observation, payload, attention, lifecycleGeneration, connectionEpoch) {
+		const conversation = this.#conversationMemory(record.agentId).history();
+		const accepted = this.#nativeRuntime.updateObservation(record, observation, { eventSequence: payload.eventSequence, conversation,
+			attention: attention.attention, priority: attention.priority, trigger: attention.trigger, changedFacts: payload.changedFacts });
+		if (!accepted) this.#playerMemory.observe(record, observation);
+		if (attention.priority !== 'urgent' || !NO_TASK_WAKE_TRIGGERS.has(attention.trigger)) return;
+		// An operator's /takeover owns the body: Minecraft reports it, and the model is not woken to act on it.
+		if (observation?.player?.operatorControlled === true) return;
+		this.#nativeRuntimeEpochs.set(record.agentId, connectionEpoch);
+		this.#scheduleNativeTurn(record, {
+			agentId: record.agentId,
+			goalRevision: record.goalRevision,
+			observation,
+			eventSequence: payload.eventSequence,
+			priority: 'urgent',
+			trigger: attention.trigger,
+			lifecycleGeneration,
+			connectionEpoch,
+			preserveState: true,
+			conversationOnly: true,
+			dangerWake: true,
+			nativeEvent: { event: 'observation', trigger: attention.trigger, observation, conversationOnly: true, dangerWake: true },
+		});
+	}
+
 	#scheduleNativeConversation(record, event, trigger) {
 		const conversationOnly = [DynamicAgentState.IDLE, DynamicAgentState.COMPLETED, DynamicAgentState.PAUSED].includes(record.state);
 		if (!conversationOnly && ![DynamicAgentState.STARTING, DynamicAgentState.PLANNING, DynamicAgentState.ACTING].includes(record.state)) return;
@@ -1530,6 +1569,7 @@ export class DynamicCoordinator extends EventEmitter {
 
 	#confirmationBlocksRequest(record, request) {
 		return this.#awaitingNativeConfirmation(record, request.lifecycleGeneration)
+			&& !this.#confirmationActivity.has(record.agentId)
 			&& (request.priority !== 'urgent' || request.trigger === 'stuck' || request.nativeEvent?.trigger === 'continuation');
 	}
 
@@ -1630,6 +1670,8 @@ export class DynamicCoordinator extends EventEmitter {
 	}
 
 	#queueNativeSteer(work, request) {
+		// Danger reaching a no-task conversation turn lets it defend the body (self-preservation tools only).
+		if (request.dangerWake === true) work.dangerWoken = true;
 		const decision = work.dangerSteer.offer(request, safeClockRead(this.#controlNow));
 		if (decision.action === 'fold') {
 			this.#writeTrace('native_turn_steer_coalesced', { agentId: work.agentId, goalRevision: work.goalRevision,
@@ -1789,23 +1831,57 @@ export class DynamicCoordinator extends EventEmitter {
 		while (work.steerPromise !== null) await work.steerPromise;
 	}
 
+	/**
+	 * Every model tool call. A call that ends without reaching Minecraft (refused, stale, gated) is traced as
+	 * native_tool_rejected with its kind and reason code only, so an idle body is explainable from the trace.
+	 */
 	async #executeNativeTool(work, toolRequest) {
+		const traceRejection = (reasonCode) => this.#writeTrace('native_tool_rejected', {
+			agentId: work.agentId, goalRevision: work.goalRevision, traceId: work.traceId,
+			callId: typeof toolRequest?.callId === 'string' ? toolRequest.callId.slice(0, 128) : null,
+			toolKind: toolRequest?.tool?.kind ?? 'unknown',
+			...(typeof toolRequest?.tool?.actionType === 'string' ? { actionType: toolRequest.tool.actionType } : {}),
+			reasonCode: String(reasonCode ?? 'UNKNOWN').slice(0, 128),
+		});
+		let result;
+		try {
+			result = await this.#executeNativeToolCall(work, toolRequest);
+		} catch (error) {
+			traceRejection(error?.code ?? 'TOOL_EXECUTION_FAILED');
+			throw error;
+		}
+		if (result?.executed === false) traceRejection(result.reasonCode);
+		return result;
+	}
+
+	async #executeNativeToolCall(work, toolRequest) {
 		const record = this.#registry.get(work.agentId);
 		if (work.expired === true || record === null || record.goalRevision !== work.goalRevision
 				|| !this.#isConnectionEpochCurrent(work.connectionEpoch)
 				|| !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) {
+			const finished = record !== null && [DynamicAgentState.COMPLETED, DynamicAgentState.IDLE].includes(record.state)
+				&& record.goalRevision > work.goalRevision;
 			return { state: 'CANCELLED', reasonCode: 'STALE_PLAN', executed: false,
 				goalRevision: work.goalRevision, currentGoalRevision: record?.goalRevision ?? null,
-				message: work.taskAdopted === true
+				message: work.taskAdopted !== undefined
 					? 'Your task was accepted. Nothing was dispatched from this turn: end it now and the task turn starts with every tool.'
-					: 'This goal turn has ended or been superseded. No action was dispatched. End this turn and await the next goal event.' };
+					: finished
+						? 'Your task is complete, so this turn has ended and nothing was dispatched. End it now: damage and threats wake you again at once to defend yourself (fight, flee, eat, equip, move away).'
+						: 'This goal turn has ended or been superseded. No action was dispatched. End this turn and await the next goal event.' };
 		}
 		if (toolRequest.tool.kind === 'take_task') return this.#takeTask(work, toolRequest.tool);
 		if (work.request.conversationOnly === true
 				&& toolRequest.tool.kind !== 'observe'
 				&& !(toolRequest.tool.kind === 'action' && toolRequest.tool.actionType === 'chat')) {
 			if (work.taskAdopted !== undefined) return { ...work.taskAdopted, executed: false };
-			throw Object.assign(new Error('You have no active task yet. If the player asked you to do something, call takeTask first and end this turn; otherwise reply with say.'), { code: 'CONVERSATION_ONLY' });
+			// Player requests go through takeTask, which binds the requester and Minecraft's permission checks. Only a
+			// turn woken by danger may defend the body without a task, and only with self-preservation tools.
+			const dangerWoken = work.request.dangerWake === true || work.dangerWoken === true;
+			if (!dangerWoken || record.state === DynamicAgentState.PAUSED || !isSelfPreservationTool(toolRequest.tool)) {
+				throw Object.assign(new Error(dangerWoken && record.state !== DynamicAgentState.PAUSED
+					? 'With no task you may only defend yourself: fight_target, flee_from, attack, use_ranged, block_with_shield, use_item (eat, drink, totem), select/equip items, navigate or move away, look, control, wait. Anything else is a player request: call takeTask.'
+					: 'You have no active task yet. If the player asked you to do something, call takeTask first and end this turn; otherwise reply with say.'), { code: 'CONVERSATION_ONLY' });
+			}
 		}
 		const executesBody = toolRequest.tool.kind === 'action'
 			|| toolRequest.tool.kind === 'sequence'
@@ -1831,7 +1907,17 @@ export class DynamicCoordinator extends EventEmitter {
 			if (executesBody && record.state === DynamicAgentState.PLANNING) {
 				this.#registry.setState(record.agentId, DynamicAgentState.ACTING, { goalRevision: record.goalRevision });
 			}
-			supervisionToken = supervisionKind === null ? null : this.#goalSupervisor.begin(work.supervisionKey, supervisionKind);
+			// After finish awaits operator confirmation the goal's work leases are terminated;
+			// the body must still act at once, so it runs unsupervised instead of failing to acquire a lease.
+			const awaitingConfirmation = sameSupervisionKey(this.#nativeConfirmationWaits.get(work.agentId), work.supervisionKey);
+			const supervised = supervisionKind !== null && !awaitingConfirmation;
+			supervisionToken = supervised ? this.#goalSupervisor.begin(work.supervisionKey, supervisionKind) : null;
+			if (awaitingConfirmation && executesBody && !['chat', 'wait'].includes(toolRequest.tool.actionType)) {
+				// Work begun while waiting (defending, a player's extra request) may need follow-up wakes, such as its
+				// own action result; let those through until a turn ends without new body work (see completion).
+				this.#confirmationActivity.add(work.agentId);
+				work.actedWhileAwaiting = true;
+			}
 			call.token = supervisionToken;
 			this.#goalSupervisor.progress(work.supervisionToken);
 			result = await this.#nativeRuntime.execute(toolRequest, record, { lifecycleGeneration: work.lifecycleGeneration });
@@ -1845,10 +1931,14 @@ export class DynamicCoordinator extends EventEmitter {
 					// Waiting belongs to this goal lifecycle, not just the provider turn that
 					// requested verification. Ordinary queued sightings cannot resume it.
 					this.#nativeConfirmationWaits.set(record.agentId, work.supervisionKey);
+					this.#confirmationActivity.delete(record.agentId);
 					this.#goalSupervisor.terminate(work.supervisionKey);
-				} else if (toolRequest.tool.kind === 'finish' || (executesBody
-					&& !['chat', 'wait'].includes(toolRequest.tool.actionType))) {
+				} else if (toolRequest.tool.kind === 'finish') {
+					// Body actions while waiting (defending, eating, a player's extra request) leave the finished goal
+					// awaiting confirmation; only a new finish result changes it. Clearing it restarted goal supervision,
+					// which woke the model to redo the finished work.
 					this.#nativeConfirmationWaits.delete(record.agentId);
+					this.#confirmationActivity.delete(record.agentId);
 				}
 			}
 			return result;
@@ -1967,7 +2057,7 @@ export class DynamicCoordinator extends EventEmitter {
 		if (this.#reschedulePendingNativeTurn(pending)) return result;
 		if (work.request.nativeConversationDelivery?.omittedEntries > 0
 			&& this.#reschedulePendingNativeTurn({ ...work.request, conversationRetry: false })) return result;
-		if (work.request.conversationOnly === true && !work.successfulChat
+		if (work.request.conversationOnly === true && work.request.dangerWake !== true && !work.successfulChat
 				&& work.request.conversationRetry !== true && record !== null) {
 			this.#scheduleNativeTurn(record, {
 				...work.request,
@@ -1979,6 +2069,8 @@ export class DynamicCoordinator extends EventEmitter {
 		}
 		const awaitingConfirmation = record !== null && this.#awaitingNativeConfirmation(record, work.lifecycleGeneration);
 		if (awaitingConfirmation) this.#goalSupervisor.terminate(work.supervisionKey);
+		// A turn that started no body work while waiting returns the goal to plain waiting (no redo wakes).
+		if (awaitingConfirmation && work.actedWhileAwaiting !== true) this.#confirmationActivity.delete(work.agentId);
 		if (!awaitingConfirmation && this.#isActiveNativeGoal(work)) {
 			this.#goalSupervisor.ensure(work.supervisionKey, (result?.toolCalls ?? 0) === 0 ? 'zero_tool_turn' : 'turn_completed');
 		}
@@ -2452,6 +2544,7 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#deferredProviderRecovery.delete(agentId);
 		this.#nativeWorldSignals.delete(agentId);
 		this.#nativeConfirmationWaits.delete(agentId);
+		this.#confirmationActivity.delete(agentId);
 		this.#advanceLifecycleGeneration(agentId);
 	}
 
@@ -4687,7 +4780,7 @@ function sameSupervisionKey(left, right) {
 		&& left?.profileFingerprint === right?.profileFingerprint;
 }
 
-export function buildNativeEventInput(record, { event, trigger, programId, status, result, planningLeadMs, eventSequence, taskMemory = null, dangerSummary = null, observation = {}, conversation = { mode: 'unread', baseSequence: -1, nextSequence: -1, entries: [] }, conversationOnly = false, awaitingConfirmation = false } = {}) {
+export function buildNativeEventInput(record, { event, trigger, programId, status, result, planningLeadMs, eventSequence, taskMemory = null, dangerSummary = null, observation = {}, conversation = { mode: 'unread', baseSequence: -1, nextSequence: -1, entries: [] }, conversationOnly = false, awaitingConfirmation = false, dangerWake = false } = {}) {
 	const eventName = typeof event === 'string' && event.length > 0 ? event : event?.event;
 	const normalizedEvent = typeof eventName === 'string' && eventName.length > 0 ? eventName : 'observation';
 	const eventPlanningLeadMs = status?.planningLeadMs ?? planningLeadMs ?? event?.planningLeadMs;
@@ -4811,7 +4904,9 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 	// A program paused by damage or a threat must not cost a respondProgram/programStatus detour first:
 	// fight_target and flee_from run directly while it is paused (native-tool-runtime keeps its decision).
 	const dangerPaused = !isPlanningDue && status?.engineState === 'SUSPENDED' && DANGER_PAUSE_TRIGGERS.has(status?.decision?.trigger);
-	const instruction = conversationOnly === true
+	const instruction = conversationOnly === true && dangerWake === true
+		? NO_TASK_DANGER_INSTRUCTION
+		: conversationOnly === true
 		? 'Player conversation. You have no active task. If a message asks you to do something, call takeTask (it defaults to the sender\'s words; use resume:true to continue a paused task), then end this turn; your task turn starts at once with every tool. Otherwise reply with say.'
 		: isPlanningDue
 		? 'Live Minecraft event. Program planning is due soon: prepare the next intention while the current authorised routine keeps running. This is advisory and does not require a pending decisionId; use the current programVersion and timing context, and do not blindly renew or cancel the current program.'
@@ -4824,6 +4919,20 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 }
 
 const DANGER_PAUSE_TRIGGERS = new Set(['damage', 'threat']);
+// Urgent facts that wake an agent with no task: the body is still the model's to defend.
+const NO_TASK_WAKE_TRIGGERS = new Set(['damage', 'threat', 'lava', 'fire', 'suffocation', 'fall', 'low_health']);
+// With no task, a danger-woken turn may defend the body only: these mirror Minecraft's own detached-action allowlist
+// (AgentLifecycleReducer.isSelfPreservationAction). Everything else is a player request and needs takeTask.
+const SELF_PRESERVATION_ACTIONS = new Set(['fight_target', 'flee_from', 'attack', 'use_ranged', 'block_with_shield', 'use_item',
+	'select_item', 'select_tool', 'equip_item', 'navigate_to', 'move_to', 'look_at', 'control', 'control_sequence', 'wait', 'dismount', 'wake_up']);
+const SELF_PRESERVATION_READ_TOOLS = new Set(['observe', 'inspect', 'capabilities', 'action_status', 'cancel_action', 'lookAround']);
+export function isSelfPreservationTool(tool) {
+	if (SELF_PRESERVATION_READ_TOOLS.has(tool?.kind)) return true;
+	if (['action', 'start_action', 'replace_action'].includes(tool?.kind)) return SELF_PRESERVATION_ACTIONS.has(tool.actionType);
+	if (tool?.kind === 'sequence') return Array.isArray(tool.actions) && tool.actions.every((action) => SELF_PRESERVATION_ACTIONS.has(action?.actionType));
+	return false;
+}
+export const NO_TASK_DANGER_INSTRUCTION = 'Live Minecraft event: danger. You have no active task; any finished task stays finished, so do not redo it. Defend yourself now: fight_target, flee_from, eat or drink, shield or totem, equip armor and weapons, move away. Other work is a player request and needs takeTask.';
 // Waiting for the operator only means "do not redo the finished work or re-run finish"; it never blocks new requests.
 export const AWAITING_CONFIRMATION_EVENT_INSTRUCTION = 'Live Minecraft event. Your finished goal awaits operator confirmation: do not redo it or re-run finish. Waiting never blocks new requests: act on player messages now with any tool, as part of your task, then call finish again when done.';
 const UUID_TEXT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

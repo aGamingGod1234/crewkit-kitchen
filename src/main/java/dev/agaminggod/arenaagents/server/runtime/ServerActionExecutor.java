@@ -348,6 +348,26 @@ public final class ServerActionExecutor {
 	/** Fences coordinator-owned physical work when the authenticated session disappears. */
 	public synchronized void coordinatorDisconnected() {
 		coordinatorGeneration++;
+		// Disconnect transitions cancel goal actions, but an idle or completed agent's lifecycle does not change,
+		// so its detached action must be fenced here: nobody would hear its result or stop it otherwise.
+		for (ActiveAction action : new ArrayList<>(active.values())) {
+			if (action.isControl()) continue;
+			AgentId agentId = action.request().agentId();
+			boolean detached;
+			try {
+				detached = dev.agaminggod.arenaagents.agent.AgentLifecycleReducer.isDetachedActionState(
+						manager.registry().require(agentId).state());
+			} catch (RuntimeException unknown) {
+				detached = false;
+			}
+			if (detached) {
+				try {
+					cancel(agentId, "Coordinator disconnected");
+				} catch (RuntimeException ignored) {
+					// Best effort, like the control neutralization below.
+				}
+			}
+		}
 		for (ActiveAction action : new ArrayList<>(active.values())) {
 			if (!action.isControl()) continue;
 			try {

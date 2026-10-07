@@ -1292,7 +1292,9 @@ public final class CodexAgentCommands {
 			case "queue" -> "Added a task to " + name + "'s queue.";
 			case "replace" -> "Replacing " + name + "'s current task...";
 			case "steer" -> "Updating " + name + "'s current task...";
-			case "stop" -> "Paused " + name + ".";
+			case "stop" -> transition.before() == transition.after()
+					? "Stopped " + name + "'s current action (no task to pause)."
+					: "Paused " + name + ".";
 			case "resume" -> "Resuming " + name + "...";
 			default -> "Updated " + name + ".";
 		};
