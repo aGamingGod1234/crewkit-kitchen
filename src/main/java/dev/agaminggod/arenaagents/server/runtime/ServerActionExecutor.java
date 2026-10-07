@@ -597,6 +597,7 @@ public final class ServerActionExecutor {
 					combatTarget(player, string(arguments, "targetId")),
 					arguments.has("desiredRange") ? number(arguments, "desiredRange") : null,
 					arguments.has("fleeAtHealth") ? (float) number(arguments, "fleeAtHealth") : null,
+					!arguments.has("continueWithAttackers") || bool(arguments, "continueWithAttackers"),
 					integer(arguments, "timeoutMs"), System.currentTimeMillis()));
 			case FLEE_FROM -> ActiveAction.controller(request, player, new ServerFleeController(
 					resolveCombatTarget(player, string(arguments, "targetId")),

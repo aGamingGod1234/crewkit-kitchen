@@ -65,6 +65,7 @@ public final class ProtocolCodec {
 	private static final String FIELD_DESIRED_RANGE = "desiredRange";
 	private static final String FIELD_DISTANCE = "distance";
 	private static final String FIELD_FLEE_AT_HEALTH = "fleeAtHealth";
+	private static final String FIELD_CONTINUE_WITH_ATTACKERS = "continueWithAttackers";
 	private static final String FIELD_SOURCE_KIND = "sourceKind";
 	private static final String FIELD_SOURCE_SLOT = "sourceSlot";
 	private static final String FIELD_DESTINATION_KIND = "destinationKind";
@@ -516,11 +517,12 @@ public final class ProtocolCodec {
 		requireDuration(command, FIELD_TIMEOUT_MS);
 	}
 
-	/** Exact observed target like attack; desiredRange and the model's own fleeAtHealth bail-out are optional. */
+	/** Exact observed target like attack; desiredRange, fleeAtHealth and continueWithAttackers are optional. */
 	private static void validateFightTarget(JsonObject command) throws ProtocolException {
 		requireUuid(command, FIELD_TARGET_ID);
 		if (present(command, FIELD_DESIRED_RANGE)) requireFiniteRange(command, FIELD_DESIRED_RANGE, 1.0D, 6.0D);
 		if (present(command, FIELD_FLEE_AT_HEALTH)) requireFiniteRange(command, FIELD_FLEE_AT_HEALTH, 0.0D, 2048.0D);
+		if (present(command, FIELD_CONTINUE_WITH_ATTACKERS)) requireBoolean(command, FIELD_CONTINUE_WITH_ATTACKERS);
 		requireDuration(command, FIELD_TIMEOUT_MS);
 	}
 
@@ -964,7 +966,7 @@ public final class ProtocolCodec {
 				FIELD_X, FIELD_Y, FIELD_Z, FIELD_TOLERANCE, FIELD_SPRINT, FIELD_TIMEOUT_MS
 		));
 		fields.put(ActionType.FIGHT_TARGET, List.of(
-				FIELD_TARGET_ID, FIELD_DESIRED_RANGE, FIELD_FLEE_AT_HEALTH, FIELD_TIMEOUT_MS
+				FIELD_TARGET_ID, FIELD_DESIRED_RANGE, FIELD_FLEE_AT_HEALTH, FIELD_CONTINUE_WITH_ATTACKERS, FIELD_TIMEOUT_MS
 		));
 		fields.put(ActionType.FLEE_FROM, List.of(FIELD_TARGET_ID, FIELD_DISTANCE, FIELD_TIMEOUT_MS));
 		fields.put(ActionType.FOLLOW_ENTITY, List.of(FIELD_TARGET_SELECTOR, FIELD_DISTANCE, FIELD_TIMEOUT_MS));

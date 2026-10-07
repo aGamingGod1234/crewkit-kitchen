@@ -382,6 +382,17 @@ public final class VerificationMain {
 		assertDecodedType(codec, "drop_item", "\"slot\":0,\"count\":1", ActionType.DROP_ITEM);
 		assertDecodedType(codec, "navigate_to", "\"x\":10,\"y\":64,\"z\":-5,\"tolerance\":1.25,\"sprint\":true,\"timeoutMs\":30000", ActionType.NAVIGATE_TO);
 		assertDecodedType(codec, "fight_target", "\"targetId\":\"00000000-0000-0000-0000-000000000001\",\"desiredRange\":2.5,\"fleeAtHealth\":6,\"timeoutMs\":15000", ActionType.FIGHT_TARGET);
+		ActionCommand followThrough = codec.decodeCommand(commandJson("fight_target",
+				"\"targetId\":\"00000000-0000-0000-0000-000000000001\",\"continueWithAttackers\":false,\"timeoutMs\":15000"));
+		assertEquals(false, followThrough.arguments().get("continueWithAttackers").getAsBoolean(),
+				"fight_target keeps the model's continueWithAttackers opt-out");
+		expectProtocolException(
+				() -> codec.decodeCommand(commandJson("fight_target",
+						"\"targetId\":\"00000000-0000-0000-0000-000000000001\",\"continueWithAttackers\":\"yes\",\"timeoutMs\":15000")),
+				"INVALID_FIELD",
+				"continueWithAttackers",
+				"fight_target continueWithAttackers must be a boolean"
+		);
 		assertDecodedType(codec, "flee_from", "\"targetId\":\"00000000-0000-0000-0000-000000000001\",\"distance\":16,\"timeoutMs\":10000", ActionType.FLEE_FROM);
 		assertDecodedType(codec, "follow_entity", "\"targetSelector\":\"player:Lucas\",\"distance\":3,\"timeoutMs\":30000", ActionType.FOLLOW_ENTITY);
 		assertDecodedType(codec, "interact_block", "\"x\":1,\"y\":64,\"z\":-2,\"face\":\"north\",\"hand\":\"main\",\"expectedItemId\":\"minecraft:air\"", ActionType.INTERACT_BLOCK);

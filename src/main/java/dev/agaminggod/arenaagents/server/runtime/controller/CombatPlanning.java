@@ -3,8 +3,11 @@ package dev.agaminggod.arenaagents.server.runtime.controller;
 import dev.agaminggod.arenaagents.client.navigation.GridPosition;
 import dev.agaminggod.arenaagents.client.navigation.TraversalType;
 import dev.agaminggod.arenaagents.client.navigation.WalkabilityView;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * Pure decisions behind the model-chosen fight_target and flee_from actions. Nothing here reads the
@@ -96,6 +99,110 @@ public final class CombatPlanning {
 	/** A model-chosen bail-out threshold; absent means fight until the target is dead, gone or time runs out. */
 	public static boolean shouldBailOut(float health, Float fleeAtHealth) {
 		return fleeAtHealth != null && health <= fleeAtHealth;
+	}
+
+	/** Follow-through and multi-threat flee consider hostiles within the threat-sensing range. */
+	public static final double THREAT_RANGE = 16.0D;
+	/** A flee never reports escape while a creeper is this close: its blast reaches about 6 blocks. */
+	public static final double CREEPER_SAFE_DISTANCE = 7.0D;
+
+	/** One hostile near the agent when the chosen fight target dies. */
+	public record AttackerCandidate(double distance, boolean targetingAgent, boolean hurtAgent, boolean creeper) {
+	}
+
+	/**
+	 * The model's fight_target continues (unless it opted out) to the nearest hostile that is targeting or just
+	 * hurt the agent. Only mobs already attacking the agent qualify, so follow-through never starts a new fight.
+	 * Creepers are never chased into melee; they are reported back so the model chooses fight or flee itself.
+	 * Returns the candidate index, or -1 when nobody else is attacking.
+	 */
+	public static int nextAttacker(List<AttackerCandidate> candidates) {
+		Objects.requireNonNull(candidates, "candidates must not be null");
+		int best = -1;
+		for (int index = 0; index < candidates.size(); index++) {
+			AttackerCandidate candidate = candidates.get(index);
+			if (candidate.creeper() || !(candidate.targetingAgent() || candidate.hurtAgent())) continue;
+			if (!(candidate.distance() <= THREAT_RANGE)) continue;
+			if (best < 0 || candidate.distance() < candidates.get(best).distance()) best = index;
+		}
+		return best;
+	}
+
+	/**
+	 * One threat during a flee. dx/dz point from the agent to the threat; closing means it gained ground over
+	 * the last half second (or has not been watched that long yet).
+	 */
+	public record FleeThreat(double dx, double dz, double distance, boolean creeper, boolean swelling, boolean closing) {
+	}
+
+	/** Nearer threats push harder; a creeper weighs three times a zombie and a swelling one six times. */
+	static double fleeWeight(FleeThreat threat) {
+		double type = threat.swelling() ? 6.0D : threat.creeper() ? 3.0D : 1.0D;
+		return type / Math.max(1.0D, threat.distance());
+	}
+
+	/**
+	 * Direction away from every threat at once: the proximity-weighted sum of "away" unit vectors. When the
+	 * pushes cancel out (surrounded evenly) it falls back to straight away from the heaviest threat. Null when
+	 * there is no horizontal "away" at all (every threat directly above or below).
+	 */
+	public static Float fleeAwayYaw(List<FleeThreat> threats) {
+		Objects.requireNonNull(threats, "threats must not be null");
+		double sumX = 0.0D;
+		double sumZ = 0.0D;
+		FleeThreat heaviest = null;
+		for (FleeThreat threat : threats) {
+			double length = Math.sqrt(threat.dx() * threat.dx() + threat.dz() * threat.dz());
+			if (length < 1.0E-2D) continue;
+			double weight = fleeWeight(threat);
+			sumX -= threat.dx() / length * weight;
+			sumZ -= threat.dz() / length * weight;
+			if (heaviest == null || weight > fleeWeight(heaviest)) heaviest = threat;
+		}
+		if (heaviest == null) return null;
+		if (sumX * sumX + sumZ * sumZ < 1.0E-6D) return yawToward(heaviest.dx(), heaviest.dz(), 0.0D, 0.0D);
+		return yawToward(0.0D, 0.0D, sumX, sumZ);
+	}
+
+	/**
+	 * The nearest threat (other than the named one) that still blocks an escape: any creeper within
+	 * {@link #CREEPER_SAFE_DISTANCE}, or a threat inside the requested distance that is still closing in.
+	 * Returns its index, or -1 when the flee may report success.
+	 */
+	public static int escapeBlocker(List<FleeThreat> others, double requestedDistance) {
+		Objects.requireNonNull(others, "others must not be null");
+		int blocker = -1;
+		for (int index = 0; index < others.size(); index++) {
+			FleeThreat threat = others.get(index);
+			boolean blocks = (threat.creeper() && threat.distance() < CREEPER_SAFE_DISTANCE)
+					|| (threat.distance() < requestedDistance && threat.closing());
+			if (blocks && (blocker < 0 || threat.distance() < others.get(blocker).distance())) blocker = index;
+		}
+		return blocker;
+	}
+
+	/** Per-threat "is it closing in" over the same half-second window the named flee target uses. */
+	public static final class ClosingTracker {
+		private final Map<String, double[]> windows = new HashMap<>();
+		private final Map<String, Integer> samples = new HashMap<>();
+
+		/** True while the threat gained ground over the window, or has not been watched for a full window. */
+		public boolean observe(String id, double distance) {
+			Objects.requireNonNull(id, "id must not be null");
+			double[] window = windows.computeIfAbsent(id, ignored -> new double[NOT_CLOSING_WINDOW_TICKS + 1]);
+			int count = samples.getOrDefault(id, 0);
+			double windowStart = window[count % window.length];
+			boolean full = count >= window.length;
+			window[count % window.length] = distance;
+			samples.put(id, count + 1);
+			return !full || distance < windowStart - 0.05D;
+		}
+
+		/** Forgets threats no longer present so a returning mob is watched afresh. */
+		public void retain(Set<String> present) {
+			windows.keySet().retainAll(present);
+			samples.keySet().retainAll(present);
+		}
 	}
 
 	/** Tracks one flee so it ends on safety, not on reaching a waypoint. */

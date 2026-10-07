@@ -11,6 +11,9 @@ import { compileProgramPrecondition, evaluateProgramPrecondition } from './progr
 const FORGET_REASONS = /agent_removed|server_replaced|coordinator_stopped/;
 const TERMINAL_ACTION_STATES = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT']);
 const POST_ACTION_OBSERVATION_TYPES = new Set(['pick_up_item', 'break_block', 'navigate_to']);
+// The model may answer danger with these while its program is paused for a decision, without first
+// settling the program decision; the paused program keeps its decision for a later respondProgram.
+const PAUSED_PROGRAM_DANGER_ACTIONS = new Set(['fight_target', 'flee_from']);
 
 
 export class NativeToolRuntime {
@@ -306,6 +309,10 @@ export class NativeToolRuntime {
 		if (request.tool.kind === 'respond_program') {
 			if (request.tool.goalRevision !== record.goalRevision) throw codedError('STALE_PROGRAM_DECISION', 'Decision belongs to an older goal');
 			const run = this.#programRuns.get(record.agentId);
+			// A program cannot resume while the model's own danger action still owns the body.
+			if (['continue', 'replace'].includes(request.tool.directive) && this.#actions.get(record.agentId)?.pausedProgram === true) {
+				throw codedError('NATIVE_ACTION_IN_PROGRESS', 'Your fight_target/flee_from still owns the body; wait for its result (or cancelAction it), then respond to the program');
+			}
 			await this.#programExecutor.respond(record, request.tool);
 			if (run && ['replace', 'pause', 'finish'].includes(request.tool.directive)) run.pendingSuccessor = null;
 			if (['pause', 'finish'].includes(request.tool.directive)) await run.result;
@@ -315,7 +322,13 @@ export class NativeToolRuntime {
 		if (request.tool.kind === 'notebook' || request.tool.kind === 'query_memory' || request.tool.kind === 'task_memory') return this.#memory(request, record);
 		if (this.#sequenceFinishReservations.has(record.agentId)) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'A finishing native sequence owns the player until its fresh sample and goal verification settle');
 		if (this.#sweeps.has(record.agentId)) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'A camera sweep owns this player until sampling completes');
-		if (this.#programRuns.has(record.agentId)) throw codedError('NATIVE_PROGRAM_IN_PROGRESS', 'A model-authored program owns this player; use programStatus and cancelProgram before issuing another body operation');
+		if (this.#programRuns.has(record.agentId)) {
+			if (this.#dangerActionWhilePaused(request.tool, record)) {
+				const tool = { ...request.tool, kind: 'action' };
+				return this.#executeAction(request, record, tool, null, request.tool.kind !== 'start_action', null, null, { pausedProgram: true });
+			}
+			throw codedError('NATIVE_PROGRAM_IN_PROGRESS', 'A model-authored program owns this player; use programStatus and cancelProgram before issuing another body operation (fight_target/flee_from are allowed while it is paused for your decision)');
+		}
 		if (request.tool.kind === 'run_program') return this.#runProgram(request, record);
 		if (request.tool.kind === 'replace_action') {
 			const epoch = this.#executionEpoch(record.agentId);
@@ -337,6 +350,19 @@ export class NativeToolRuntime {
 		}
 		if (tool.kind !== 'action') throw codedError('INVALID_NATIVE_TOOL', 'Native tool did not normalize to an action');
 		return this.#executeAction(request, record, tool);
+	}
+
+	/**
+	 * True when the model chose fight_target/flee_from while its program is suspended awaiting a decision and owns
+	 * no body action. The program stays paused with its decision intact; respondProgram later resumes, replaces or
+	 * ends it. Nothing here chooses an action: it only removes the respondProgram/programStatus detour under danger.
+	 */
+	#dangerActionWhilePaused(tool, record) {
+		if (!['action', 'start_action'].includes(tool.kind) || !PAUSED_PROGRAM_DANGER_ACTIONS.has(tool.actionType)) return false;
+		const run = this.#programRuns.get(record.agentId);
+		if (run?.goalRevision !== record.goalRevision || run.state !== 'RUNNING' || run.epoch !== this.#executionEpoch(record.agentId)) return false;
+		const status = this.#programExecutor.status?.(record);
+		return status?.decision != null && status.engineState === 'SUSPENDED' && !this.#actions.has(record.agentId);
 	}
 
 	async #observe(record, { includeMetadata = true, afterResult = null } = {}) {
@@ -809,7 +835,8 @@ export class NativeToolRuntime {
 		if (active.cancelling) throw codedError('CANCELLATION_IN_PROGRESS', 'The exact action is already being cancelled');
 		active.cancelling = true;
 		active.cancellationUncertain = false;
-		if (invalidateProgram) {
+		// Cancelling a danger action taken while the program was paused leaves that paused program intact.
+		if (invalidateProgram && active.pausedProgram !== true) {
 			this.#executionEpochs.set(record.agentId, this.#executionEpoch(record.agentId) + 1);
 			if (this.#programRuns.has(record.agentId)) Promise.resolve(this.#programExecutor.cancel(record.agentId, 'MODEL_CANCELLED')).catch((error) => this.#trace('native_program_cancel_failed', { agentId: record.agentId, reasonCode: error?.code ?? 'PROGRAM_CANCEL_FAILED' }));
 		}
@@ -960,7 +987,7 @@ export class NativeToolRuntime {
 		}
 	}
 
-	async #executeAction(request, record, tool, sequenceIndex = null, waitForCompletion = true, programCommand = null, sequenceFinishToken = null) {
+	async #executeAction(request, record, tool, sequenceIndex = null, waitForCompletion = true, programCommand = null, sequenceFinishToken = null, { pausedProgram = false } = {}) {
 		// All native routes, including replacement and authored programs, meet here.
 		tool = constrainNavigationAction(tool, record.currentGoalSpec);
 		const finishReservation = this.#sequenceFinishReservations.get(record.agentId);
@@ -1007,7 +1034,7 @@ export class NativeToolRuntime {
 		let rejectAction;
 		const result = new Promise((resolve, reject) => { resolveAction = resolve; rejectAction = reject; });
 		result.catch(() => {});
-		const active = { actionId, goalRevision: record.goalRevision, actionType: tool.actionType, arguments: structuredClone(tool.arguments), worldId: this.#worldId(record), result, resolve: resolveAction, reject: rejectAction, dispatched: false, ...(programCommand === null ? {} : { engineActionId: programCommand.actionId }) };
+		const active = { actionId, goalRevision: record.goalRevision, actionType: tool.actionType, arguments: structuredClone(tool.arguments), worldId: this.#worldId(record), result, resolve: resolveAction, reject: rejectAction, dispatched: false, ...(programCommand === null ? {} : { engineActionId: programCommand.actionId }), ...(pausedProgram ? { pausedProgram: true } : {}) };
 		if (!waitForCompletion) {
 			const releaseWork = this.#onWorkStarted(record, 'action');
 			void result.then(releaseWork, releaseWork);

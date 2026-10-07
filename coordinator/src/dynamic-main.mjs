@@ -28,6 +28,7 @@ import { ObservedMemoryStore } from './observed-memory-store.mjs';
 import { ExplorationOccupancy } from './explore-frontier.mjs';
 import { ProviderService } from './provider-service.mjs';
 import { ProviderTurnRecorder } from './provider-turn-recorder.mjs';
+import { DangerSteerCoalescer } from './danger-steer-coalescer.mjs';
 import {
 	DEFAULT_AGENT_CAP,
 	DEFAULT_GOAL_QUEUE_CAP,
@@ -170,6 +171,8 @@ export class DynamicCoordinator extends EventEmitter {
 	#latencyRegistry;
 	#controlNow;
 	#epochNow;
+	#setSteerTimeout;
+	#clearSteerTimeout;
 	#disconnectedAt = null;
 	#supportedAgentIds = new Set();
 	#reconciledStatus = false;
@@ -193,7 +196,7 @@ export class DynamicCoordinator extends EventEmitter {
 	#providerCliNotices = { connectionEpoch: null, agents: new Set() };
 	#providerCliStartupLogged = false;
 
-	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, goalSupervisor, codexControlProtocol = 'native_tools', memoryDirectory = null, runtimeSessionId, traceWriter = null, providerTurnRecorder = null, runtimeGeneration = null, runtimeHooks = {}, benchmarkRecorder = null, providerCliHealth = null, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval, setGoalSpecTimeout = defaultGoalSpecTimeout, clearGoalSpecTimeout = clearTimeout, connectionOperationCap = DEFAULT_CONNECTION_OPERATION_CAP, agentOperationCap = DEFAULT_AGENT_OPERATION_CAP, goalSpecRequestCap = connectionOperationCap, maxPendingAgentOperations = DEFAULT_MAX_PENDING_AGENT_OPERATIONS, maxPendingAgentTransactions = DEFAULT_MAX_PENDING_AGENT_TRANSACTIONS }) {
+	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, goalSupervisor, codexControlProtocol = 'native_tools', memoryDirectory = null, runtimeSessionId, traceWriter = null, providerTurnRecorder = null, runtimeGeneration = null, runtimeHooks = {}, benchmarkRecorder = null, providerCliHealth = null, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval, setGoalSpecTimeout = defaultGoalSpecTimeout, clearGoalSpecTimeout = clearTimeout, setSteerTimeout = setTimeout, clearSteerTimeout = clearTimeout, connectionOperationCap = DEFAULT_CONNECTION_OPERATION_CAP, agentOperationCap = DEFAULT_AGENT_OPERATION_CAP, goalSpecRequestCap = connectionOperationCap, maxPendingAgentOperations = DEFAULT_MAX_PENDING_AGENT_OPERATIONS, maxPendingAgentTransactions = DEFAULT_MAX_PENDING_AGENT_TRANSACTIONS }) {
 		super();
 		this.#memoryDirectory = memoryDirectory;
 		if (providerCliHealth !== null && typeof providerCliHealth.check !== 'function') throw new TypeError('providerCliHealth.check must be a function');
@@ -228,6 +231,9 @@ export class DynamicCoordinator extends EventEmitter {
 		if (!Number.isSafeInteger(maxPendingAgentTransactions) || maxPendingAgentTransactions < 1) throw new TypeError('maxPendingAgentTransactions must be a positive safe integer');
 		this.#controlNow = controlNow;
 		this.#epochNow = epochNow;
+		if (typeof setSteerTimeout !== 'function' || typeof clearSteerTimeout !== 'function') throw new TypeError('steer timer callbacks must be functions');
+		this.#setSteerTimeout = setSteerTimeout;
+		this.#clearSteerTimeout = clearSteerTimeout;
 		this.#maxPendingAgentOperations = maxPendingAgentOperations;
 		this.#maxPendingAgentTransactions = maxPendingAgentTransactions;
 		const programBridge = {
@@ -1544,6 +1550,9 @@ export class DynamicCoordinator extends EventEmitter {
 			steerQueued: null,
 			steerRequest: null,
 			steerPromise: null,
+			// Repeated damage/threat steers into this turn fold into one summary (see danger-steer-coalescer.mjs).
+			dangerSteer: new DangerSteerCoalescer(),
+			dangerSteerTimer: null,
 			preparationPromise: null,
 			traceId: planningTraceId(record.agentId, record.goalRevision, request.lifecycleGeneration, 'native'),
 			promise: null,
@@ -1554,6 +1563,7 @@ export class DynamicCoordinator extends EventEmitter {
 			expired: false,
 		};
 		this.#providerWork.set(record.agentId, work);
+		work.dangerSteer.noteDelivered(request, safeClockRead(this.#controlNow));
 		try {
 			if (request.preserveState !== true) {
 				if (record.state === DynamicAgentState.STARTING) this.#registry.setState(record.agentId, DynamicAgentState.PLANNING, { goalRevision: record.goalRevision });
@@ -1601,6 +1611,39 @@ export class DynamicCoordinator extends EventEmitter {
 	}
 
 	#queueNativeSteer(work, request) {
+		const decision = work.dangerSteer.offer(request, safeClockRead(this.#controlNow));
+		if (decision.action === 'fold') {
+			this.#writeTrace('native_turn_steer_coalesced', { agentId: work.agentId, goalRevision: work.goalRevision,
+				traceId: work.traceId, trigger: request.trigger, foldedEvents: decision.folded });
+			if (work.dangerSteerTimer === null) {
+				work.dangerSteerTimer = this.#setSteerTimeout(() => {
+					work.dangerSteerTimer = null;
+					if (this.#providerWork.get(work.agentId) !== work || work.expired === true) return;
+					const folded = work.dangerSteer.flush(safeClockRead(this.#controlNow));
+					if (folded !== null) this.#deliverNativeSteer(work, folded);
+				}, decision.dueInMs);
+				work.dangerSteerTimer?.unref?.();
+			}
+			return;
+		}
+		this.#cancelDangerSteerTimer(work);
+		this.#deliverNativeSteer(work, decision.request);
+	}
+
+	#cancelDangerSteerTimer(work) {
+		if (work.dangerSteerTimer === null || work.dangerSteerTimer === undefined) return;
+		this.#clearSteerTimeout(work.dangerSteerTimer);
+		work.dangerSteerTimer = null;
+	}
+
+	/** Pending work plus any danger summary still folded when the turn ends, so no hit is lost. */
+	#pendingWithFoldedSteer(work) {
+		this.#cancelDangerSteerTimer(work);
+		const folded = work.dangerSteer?.flush(safeClockRead(this.#controlNow)) ?? null;
+		return folded === null ? work.pending : mergePlannerRequest(work.pending, folded);
+	}
+
+	#deliverNativeSteer(work, request) {
 		work.steerQueued = mergePlannerRequest(work.steerQueued, request);
 		if (work.steerPromise !== null) return;
 		const steering = this.#drainNativeSteering(work);
@@ -1820,7 +1863,7 @@ export class DynamicCoordinator extends EventEmitter {
 		if (this.#providerWork.get(work.agentId) !== work) return null;
 		this.#providerWork.delete(work.agentId);
 		this.#providerRetryAfter.delete(work.agentId);
-		const pending = work.pending;
+		const pending = this.#pendingWithFoldedSteer(work);
 		const record = this.#registry.get(work.agentId);
 		if (record !== null && record.goalRevision === work.goalRevision
 				&& this.#isConnectionEpochCurrent(work.connectionEpoch)
@@ -1864,7 +1907,7 @@ export class DynamicCoordinator extends EventEmitter {
 		}
 		if (this.#providerWork.get(work.agentId) !== work) return null;
 		this.#providerWork.delete(work.agentId);
-		const pending = work.pending;
+		const pending = this.#pendingWithFoldedSteer(work);
 		const record = this.#registry.get(work.agentId);
 		const staleLifecycle = record?.goalRevision !== work.goalRevision
 			|| !this.#isConnectionEpochCurrent(work.connectionEpoch)
@@ -3068,7 +3111,7 @@ export class DynamicCoordinator extends EventEmitter {
 		try {
 			if (!isCurrent()) throw Object.assign(new Error('Native input belongs to an obsolete lifecycle'), { code: 'STALE_PLAN' });
 			const input = buildNativeEventInput(record, {
-				...request.nativeEvent, taskMemory,
+				...request.nativeEvent, taskMemory, dangerSummary: request.dangerSummary,
 				observation: this.#nativeRuntime.decorateObservation(record, request.nativeEvent.observation ?? {}),
 				conversation: reservation?.conversation ?? { mode: 'unread', baseSequence: null, nextSequence: -1, entries: [] },
 			});
@@ -3233,6 +3276,8 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		clearStatusInterval: dependencies.clearStatusInterval,
 		setGoalSpecTimeout: dependencies.setGoalSpecTimeout,
 		clearGoalSpecTimeout: dependencies.clearGoalSpecTimeout,
+		setSteerTimeout: dependencies.setSteerTimeout,
+		clearSteerTimeout: dependencies.clearSteerTimeout,
 		maxPendingAgentOperations: dependencies.maxPendingAgentOperations,
 		maxPendingAgentTransactions: dependencies.maxPendingAgentTransactions,
 		connectionOperationCap: dependencies.connectionOperationCap,
@@ -4527,7 +4572,7 @@ function sameSupervisionKey(left, right) {
 		&& left?.profileFingerprint === right?.profileFingerprint;
 }
 
-export function buildNativeEventInput(record, { event, trigger, programId, status, result, planningLeadMs, eventSequence, taskMemory = null, observation = {}, conversation = { mode: 'unread', baseSequence: -1, nextSequence: -1, entries: [] }, conversationOnly = false } = {}) {
+export function buildNativeEventInput(record, { event, trigger, programId, status, result, planningLeadMs, eventSequence, taskMemory = null, dangerSummary = null, observation = {}, conversation = { mode: 'unread', baseSequence: -1, nextSequence: -1, entries: [] }, conversationOnly = false } = {}) {
 	const eventName = typeof event === 'string' && event.length > 0 ? event : event?.event;
 	const normalizedEvent = typeof eventName === 'string' && eventName.length > 0 ? eventName : 'observation';
 	const eventPlanningLeadMs = status?.planningLeadMs ?? planningLeadMs ?? event?.planningLeadMs;
@@ -4607,6 +4652,8 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 		goalRevision: record?.goalRevision ?? 0,
 		...(taskMemory === null ? {} : { taskMemory }),
 		...(eventSequence === undefined ? {} : { eventSequence }),
+		// Repeated hits folded since the last update, so one steer carries what several used to.
+		...(dangerSummary === null || dangerSummary === undefined ? {} : { dangerSinceLastUpdate: dangerSummary }),
 		observation: isPlanningDue ? compactPlanningDueObservation(compactObservation) : compactObservation,
 		conversation: unreadConversation,
 		...(programId === undefined ? {} : { program: { programId,
@@ -4646,12 +4693,18 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 			throw Object.assign(new TypeError(`Native event context leaves no room for unread conversation sequence ${unreadConversation.entries[0].sequence}; messages remain unread. Reduce the event or task context before retrying.`), { code: 'NATIVE_CONVERSATION_BUDGET_EXCEEDED' });
 		}
 	}
+	// A program paused by damage or a threat must not cost a respondProgram/programStatus detour first:
+	// fight_target and flee_from run directly while it is paused (native-tool-runtime keeps its decision).
+	const dangerPaused = !isPlanningDue && status?.engineState === 'SUSPENDED' && DANGER_PAUSE_TRIGGERS.has(status?.decision?.trigger);
 	const instruction = isPlanningDue
 		? 'Live Minecraft event. Program planning is due soon: prepare the next intention while the current authorised routine keeps running. This is advisory and does not require a pending decisionId; use the current programVersion and timing context, and do not blindly renew or cancel the current program.'
-		: 'Live Minecraft event. Advance the current goal using fresh facts. Keep authorised routines running while you reason; respond explicitly to pending program decisions.';
+		: dangerPaused
+			? 'Live Minecraft event. Program paused for danger: call fight_target or flee_from now; respond to the program later.'
+			: 'Live Minecraft event. Advance the current goal using fresh facts. Keep authorised routines running while you reason; respond explicitly to pending program decisions.';
 	return `${instruction}\n${json}`;
 }
 
+const DANGER_PAUSE_TRIGGERS = new Set(['damage', 'threat']);
 const MINIMAL_TASK_MEMORY_BYTES = 2_048;
 const MINIMAL_RECEIPTS = 2;
 const MINIMAL_OBSERVATION_FIELDS = new Set(['observedAtEpochMs', 'eventSequence', 'freshness', 'ready', 'status', 'player', 'inventory', 'currentAction', 'lastResult', 'death', 'recovery', 'failureClass', 'continuity', 'resultCoverage']);

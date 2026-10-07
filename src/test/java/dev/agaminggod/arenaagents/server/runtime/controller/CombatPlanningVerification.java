@@ -19,6 +19,8 @@ public final class CombatPlanningVerification {
 		verifyFightPacing();
 		verifyFleeProgress();
 		verifyFleeSteering();
+		verifyFollowThrough();
+		verifyMultiThreatFlee();
 		return assertions;
 	}
 
@@ -149,6 +151,73 @@ public final class CombatPlanningVerification {
 		check(Math.abs(CombatPlanning.yawToward(0.0D, 0.0D, 0.0D, 5.0D)) < 1.0E-4F
 				&& Math.abs(CombatPlanning.yawToward(0.0D, 0.0D, -5.0D, 0.0D) - 90.0F) < 1.0E-4F,
 				"yaw uses the Minecraft convention (+z is 0, -x is 90)");
+	}
+
+	private static void verifyFollowThrough() {
+		// The live trace: zombie 1 died while zombie 2 was already hitting the agent and a creeper stood nearby.
+		List<CombatPlanning.AttackerCandidate> afterKill = List.of(
+				new CombatPlanning.AttackerCandidate(5.0D, false, false, false),
+				new CombatPlanning.AttackerCandidate(2.0D, true, false, true),
+				new CombatPlanning.AttackerCandidate(3.5D, false, true, false),
+				new CombatPlanning.AttackerCandidate(2.8D, true, false, false));
+		check(CombatPlanning.nextAttacker(afterKill) == 3, "follow-through picks the nearest mob already attacking the agent");
+		check(CombatPlanning.nextAttacker(List.of(new CombatPlanning.AttackerCandidate(3.5D, false, true, false))) == 0,
+				"the mob that just hurt the agent counts as attacking even before it re-targets");
+		check(CombatPlanning.nextAttacker(List.of(new CombatPlanning.AttackerCandidate(4.0D, false, false, false))) < 0,
+				"a hostile that is not attacking is never engaged (follow-through starts no new fight)");
+		check(CombatPlanning.nextAttacker(List.of(new CombatPlanning.AttackerCandidate(2.0D, true, true, true))) < 0,
+				"a creeper is reported back to the model, never chased into melee");
+		check(CombatPlanning.nextAttacker(List.of(new CombatPlanning.AttackerCandidate(CombatPlanning.THREAT_RANGE + 1.0D, true, false, false))) < 0,
+				"an attacker beyond the threat range is left for the model");
+		check(CombatPlanning.nextAttacker(List.of()) < 0, "with no attackers left the fight ends");
+	}
+
+	private static void verifyMultiThreatFlee() {
+		// Zombie 3 blocks along +z (yaw 0), creeper 6 blocks along +x (yaw -90).
+		CombatPlanning.FleeThreat zombie = new CombatPlanning.FleeThreat(0.0D, 3.0D, 3.0D, false, false, true);
+		CombatPlanning.FleeThreat creeper = new CombatPlanning.FleeThreat(6.0D, 0.0D, 6.0D, true, false, true);
+		Float alone = CombatPlanning.fleeAwayYaw(List.of(zombie));
+		check(alone != null && Math.abs(Math.abs(alone) - 180.0F) < 1.0E-3F, "one threat: straight away (unchanged single-target flee)");
+		Float both = CombatPlanning.fleeAwayYaw(List.of(zombie, creeper));
+		// Away from the zombie is yaw 180, away from the creeper is yaw 90; the creeper pushes harder.
+		check(both != null && both > 90.0F && both < 180.0F, "two threats: the flee heads away from both at once");
+		CombatPlanning.FleeThreat swelling = new CombatPlanning.FleeThreat(6.0D, 0.0D, 6.0D, true, true, true);
+		Float fromSwelling = CombatPlanning.fleeAwayYaw(List.of(zombie, swelling));
+		check(fromSwelling != null && both != null && fromSwelling < both, "a swelling creeper pulls the heading further away from it");
+		check(CombatPlanning.fleeWeight(swelling) > CombatPlanning.fleeWeight(creeper)
+				&& CombatPlanning.fleeWeight(creeper) > CombatPlanning.fleeWeight(new CombatPlanning.FleeThreat(6.0D, 0.0D, 6.0D, false, false, true)),
+				"swelling creeper > creeper > zombie at the same distance");
+		Float surrounded = CombatPlanning.fleeAwayYaw(List.of(
+				new CombatPlanning.FleeThreat(0.0D, 3.0D, 3.0D, false, false, true),
+				new CombatPlanning.FleeThreat(0.0D, -3.0D, 3.0D, false, false, true)));
+		check(surrounded != null, "evenly surrounded still yields a heading (away from the heaviest threat)");
+		check(CombatPlanning.fleeAwayYaw(List.of(new CombatPlanning.FleeThreat(0.0D, 0.0D, 2.0D, false, false, true))) == null,
+				"a threat directly overhead gives no horizontal away direction");
+
+		// Escape: the zombie is 16 blocks away and not closing, but the creeper the agent ran into is 5 blocks away.
+		check(CombatPlanning.escapeBlocker(List.of(new CombatPlanning.FleeThreat(5.0D, 0.0D, 5.0D, true, false, false)), 10.0D) == 0,
+				"never escaped while a creeper is within blast range, even a creeper that is not approaching");
+		check(CombatPlanning.escapeBlocker(List.of(new CombatPlanning.FleeThreat(8.0D, 0.0D, 8.0D, true, false, false)), 10.0D) < 0,
+				"a creeper beyond 7 blocks that is not closing does not block the escape");
+		check(CombatPlanning.escapeBlocker(List.of(new CombatPlanning.FleeThreat(8.0D, 0.0D, 8.0D, false, false, true)), 10.0D) == 0,
+				"another hostile inside the requested distance that is still closing blocks the escape");
+		check(CombatPlanning.escapeBlocker(List.of(new CombatPlanning.FleeThreat(12.0D, 0.0D, 12.0D, false, false, true)), 10.0D) < 0,
+				"a closing hostile already beyond the requested distance does not block");
+		check(CombatPlanning.escapeBlocker(List.of(
+				new CombatPlanning.FleeThreat(9.0D, 0.0D, 9.0D, false, false, true),
+				new CombatPlanning.FleeThreat(6.0D, 0.0D, 6.0D, true, true, true)), 10.0D) == 1,
+				"the nearest blocking threat is reported");
+
+		CombatPlanning.ClosingTracker tracker = new CombatPlanning.ClosingTracker();
+		boolean closing = false;
+		for (int tick = 0; tick <= CombatPlanning.NOT_CLOSING_WINDOW_TICKS; tick++) closing = tracker.observe("zombie", 8.0D);
+		check(closing, "a threat is treated as closing until it has been watched for a full window");
+		closing = tracker.observe("zombie", 8.0D);
+		check(!closing, "a threat holding its distance for half a second is not closing");
+		for (int tick = 0; tick <= CombatPlanning.NOT_CLOSING_WINDOW_TICKS; tick++) closing = tracker.observe("zombie", 8.0D - tick * 0.2D);
+		check(closing, "a threat gaining ground is closing");
+		tracker.retain(Set.of());
+		check(tracker.observe("zombie", 8.0D), "a threat that left and returned is watched afresh");
 	}
 
 	private static void check(boolean condition, String message) {
