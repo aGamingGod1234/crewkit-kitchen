@@ -19,6 +19,7 @@ public final class ThreatAttentionVerification {
 		verifyAttentionFacts();
 		verifyForcedDelivery();
 		verifyHeardThreats();
+		verifySignalRules();
 		return assertions;
 	}
 
@@ -72,6 +73,28 @@ public final class ThreatAttentionVerification {
 		check(ServerObservationCollector.hearsThreat(false, true, false), "a hidden mob that just hurt the agent (an arrow in the back) is heard");
 		check(!ServerObservationCollector.hearsThreat(false, false, false), "an unaware hidden mob stays unobserved");
 		check(!ServerObservationCollector.hearsThreat(true, true, true), "a visible hunter is reported by sight, not twice");
+	}
+
+	private static void verifySignalRules() {
+		check(ThreatPerception.signals(true, false, false, false, true, true, 8.0D).isEmpty(),
+				"a calm neutral mob (piglin tolerating gold) raises nothing, even with a crossbow and sight");
+		check(ThreatPerception.signals(true, true, false, false, true, true, 8.0D).equals(java.util.List.of("targeting", "ranged_sight")),
+				"an angry neutral mob is a threat like any other");
+		check(ThreatPerception.signals(false, false, true, false, false, false, 3.0D).isEmpty(),
+				"a close creeper behind a wall that is not hunting the agent is not a threat");
+		check(ThreatPerception.signals(false, false, true, false, false, true, 3.0D).contains("creeper_close"),
+				"a close creeper in sight is");
+		check(ThreatPerception.signals(false, true, false, false, false, true, 18.0D).isEmpty(),
+				"nothing new is raised beyond 16 blocks");
+		ThreatSignalLatch latch = new ThreatSignalLatch();
+		String far = ThreatSignalLatch.key(ZOMBIE, "targeting");
+		latch.update(Set.of(far), Set.of(ZOMBIE), 0L);
+		check(latch.update(Set.of(), Set.of(ZOMBIE), 20L).contains(far),
+				"a latched mob pacing between 16 and 20 blocks (still present) keeps its signal");
+		String creeper = ThreatSignalLatch.key(CREEPER, "swelling");
+		latch.update(Set.of(creeper), Set.of(ZOMBIE, CREEPER), 30L);
+		check(latch.firstSeen(far) == 0L && latch.firstSeen(creeper) == 30L,
+				"latch age orders reported threats so a distance reshuffle is never a new edge");
 	}
 
 	private static ServerObservationCollector.RawPlayerState raw(Set<String> signals) {

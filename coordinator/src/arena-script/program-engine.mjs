@@ -66,10 +66,10 @@ export class ArenaScriptEngine {
 		// The agent can waive repeated ordinary perception during a chosen leg.
 		// All fresh facts and watcher edges above remain live; urgency bypasses it.
 		const survival = priority === URGENT_PRIORITY && SURVIVAL_TRIGGERS.has(trigger);
-		// A threat the program's own watcher just reacted to (fight/flee policy authored in advance) runs at
-		// observation speed without waking the model; an unhandled threat pauses the routine like damage.
-		const handledThreat = trigger === 'threat' && edges > 0;
-		if (attention && !handledThreat && (edges === 0 || survival) && (priority === URGENT_PRIORITY || this.#vm.shouldReassess(this.#facts))) this.#requestModel(null, { priority, trigger });
+		// A threat is treated like damage: the model is always notified, because the server latch raises each
+		// signal once. A watcher that already reacted keeps its handler's fight/flee running (#requestModel never
+		// suspends a watcher-owned action); an unhandled threat pauses the routine.
+		if (attention && (edges === 0 || survival) && (priority === URGENT_PRIORITY || this.#vm.shouldReassess(this.#facts))) this.#requestModel(null, { priority, trigger });
 		this.#requestExhaustedContinuation();
 		return this.snapshot();
 	}

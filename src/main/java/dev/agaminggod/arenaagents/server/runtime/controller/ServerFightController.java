@@ -1,5 +1,6 @@
 package dev.agaminggod.arenaagents.server.runtime.controller;
 
+import dev.agaminggod.arenaagents.client.navigation.GridPosition;
 import dev.agaminggod.arenaagents.server.pov.AgentControlReservations;
 import dev.agaminggod.arenaagents.server.runtime.ElapsedTimeAccumulator;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
@@ -9,6 +10,7 @@ import java.util.Locale;
 import java.util.Objects;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.util.Mth;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.phys.AABB;
@@ -97,8 +99,9 @@ public final class ServerFightController implements ServerController {
 				weaponReady,
 				backoffTicks));
 		backoffTicks = step.backoffTicks();
-		boolean jump = player.isInWater() || (step.forward() > 0.0F && player.onGround() && player.horizontalCollision);
-		input.apply(player, new AgentInputState(step.forward(), 0.0F, jump, false,
+		float forward = safeForward(player, step.forward(), yaw, AgentInputStates.shortestAngleDelta(yaw, goal.yaw()));
+		boolean jump = player.isInWater() || (forward > 0.0F && player.onGround() && player.horizontalCollision);
+		input.apply(player, new AgentInputState(forward, 0.0F, jump, false,
 				step.sprint() && player.getFoodData().getFoodLevel() > 6, false, false,
 				yaw, pitch, weaponSlot, InteractionHand.MAIN_HAND));
 		// The swing is a direct server call, so it must also yield to an operator takeover (whose input lease wins).
@@ -109,6 +112,19 @@ public final class ServerFightController implements ServerController {
 			ticksWithoutProgress = 0;
 		}
 		return TickResult.running(progress());
+	}
+
+	/**
+	 * Approach and step-back only move while facing the target (forward scaled by the remaining turn) and only
+	 * onto safe footing: the same two-cell probe flee uses, so a fight on a ravine edge or beside lava holds
+	 * position instead of walking off or across it.
+	 */
+	private static float safeForward(ServerPlayer player, float forward, float yaw, float yawError) {
+		float aligned = CombatPlanning.alignedForward(forward, yawError);
+		if (aligned == 0.0F) return 0.0F;
+		float moveYaw = aligned > 0.0F ? yaw : yaw + 180.0F;
+		GridPosition feet = new GridPosition(Mth.floor(player.getX()), Mth.floor(player.getY() + 0.2D), Mth.floor(player.getZ()));
+		return CombatPlanning.canStep(new MinecraftNavigationWorld(player.level()), feet, moveYaw) ? aligned : 0.0F;
 	}
 
 	private static boolean operatorControlled(ServerPlayer player) {

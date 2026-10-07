@@ -1,6 +1,7 @@
 package dev.agaminggod.arenaagents.server.runtime.controller;
 
 import dev.agaminggod.arenaagents.client.navigation.GridPosition;
+import dev.agaminggod.arenaagents.client.navigation.TraversalType;
 import dev.agaminggod.arenaagents.client.navigation.WalkabilityView;
 import java.util.List;
 import java.util.Objects;
@@ -150,8 +151,27 @@ public final class CombatPlanning {
 			Probe probe = probe(world, feet, yaw);
 			if (probe.passable()) return new Heading(yaw, probe.jump(), true);
 		}
-		// Boxed in: keep pushing away and jumping; the action's timeout and the model handle a true dead end.
-		return new Heading(wrap(awayYaw), true, false);
+		// Boxed in (pillar, ledge over lava, dead-end tunnel): report it instead of jumping off; the model decides.
+		return new Heading(wrap(awayYaw), false, false);
+	}
+
+	/** True when walking along {@code yaw} keeps safe footing for the next two cells (the flee probe). */
+	public static boolean canStep(WalkabilityView world, GridPosition feet, float yaw) {
+		return probe(world, feet, yaw).passable();
+	}
+
+	/**
+	 * Forward input scaled to how well the body faces its goal: full when aligned, none when 90 degrees or more
+	 * off, so a turn toward a target behind the agent never walks it the wrong way first (as stepMotor does).
+	 */
+	public static float alignedForward(float forward, float yawError) {
+		return forward * (float) Math.max(0.0D, Math.cos(Math.toRadians(yawError)));
+	}
+
+	/** Flee and fight only walk, swim or climb; a crouch-only gap would need input they never give. */
+	static boolean walkable(WalkabilityView world, GridPosition position) {
+		TraversalType traversal = world.traversalAt(position);
+		return traversal == TraversalType.WALK || traversal == TraversalType.SWIM || traversal == TraversalType.CLIMB;
 	}
 
 	record Probe(boolean passable, boolean jump) {
@@ -168,18 +188,18 @@ public final class CombatPlanning {
 			int z = feet.z() + (int) Math.round(dz * step);
 			if (x == feet.x() && z == feet.z()) continue;
 			GridPosition level = new GridPosition(x, y, z);
-			if (world.traversalAt(level) != null) continue;
+			if (walkable(world, level)) continue;
 			GridPosition up = level.above();
-			if (world.traversalAt(up) != null && world.isBodyClear(new GridPosition(feet.x(), y + 2, feet.z()))) {
+			if (walkable(world, up) && world.isBodyClear(new GridPosition(feet.x(), y + 2, feet.z()))) {
 				if (step == 1) jump = true;
 				y += 1;
 				continue;
 			}
-			if (world.traversalAt(level.below()) != null && world.isBodyClear(level) && world.isBodyClear(level.above())) {
+			if (walkable(world, level.below()) && world.isBodyClear(level) && world.isBodyClear(level.above())) {
 				y -= 1;
 				continue;
 			}
-			if (world.traversalAt(level.below(2)) != null && world.isBodyClear(level) && world.isBodyClear(level.above())
+			if (walkable(world, level.below(2)) && world.isBodyClear(level) && world.isBodyClear(level.above())
 					&& world.isBodyClear(level.below())) {
 				y -= 2;
 				continue;

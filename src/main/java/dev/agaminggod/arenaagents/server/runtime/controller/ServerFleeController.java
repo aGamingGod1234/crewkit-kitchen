@@ -67,11 +67,16 @@ public final class ServerFleeController implements ServerController {
 			return finish(TickResult.timedOut("FLEE_TIMED_OUT", String.format(Locale.ROOT,
 					"Still %.1f of %.1f blocks from %s when the flee timed out", current, distance, targetType), fraction));
 		}
-		drive(player, nowEpochMs);
+		if (!drive(player, nowEpochMs)) {
+			return finish(TickResult.failed("FLEE_BLOCKED", String.format(Locale.ROOT,
+					"No safe direction away from %s (%.1f blocks); every heading is walled, hazardous or a deep drop",
+					targetType, current), fraction));
+		}
 		return TickResult.running(fraction);
 	}
 
-	private void drive(ServerPlayer player, long nowEpochMs) {
+	/** Applies one flee tick; false when standing with no safe heading, so the model chooses (fight, pillar, block). */
+	private boolean drive(ServerPlayer player, long nowEpochMs) {
 		if (motor == null) motor = AgentInputStates.MotorState.initial(player.getYRot(), player.getXRot());
 		double dx = player.getX() - target.getX();
 		double dz = player.getZ() - target.getZ();
@@ -81,6 +86,13 @@ public final class ServerFleeController implements ServerController {
 		GridPosition feet = new GridPosition(Mth.floor(player.getX()), Mth.floor(player.getY() + 0.2D), Mth.floor(player.getZ()));
 		CombatPlanning.Heading chosen = CombatPlanning.fleeHeading(
 				new MinecraftNavigationWorld(player.level()), feet, awayYaw, heading);
+		if (!chosen.clear()) {
+			if (player.onGround() || player.isInWater()) return false;
+			// Mid-jump the feet cell is ambiguous; coast without input and judge again on landing.
+			input.apply(player, new AgentInputState(0.0F, 0.0F, false, false, false, false, false,
+					motor.yaw(), motor.pitch(), player.getInventory().getSelectedSlot(), InteractionHand.MAIN_HAND));
+			return true;
+		}
 		heading = chosen.yaw();
 		boolean jump = player.isInWater() || (player.onGround() && (chosen.jump() || player.horizontalCollision));
 		boolean sprint = !player.isInWater() && player.getFoodData().getFoodLevel() > 6;
@@ -89,6 +101,7 @@ public final class ServerFleeController implements ServerController {
 		motor = step.state();
 		input.apply(player, new AgentInputState(step.forward(), step.strafe(), step.jump(), false, step.sprint(),
 				false, false, step.yaw(), step.pitch(), player.getInventory().getSelectedSlot(), InteractionHand.MAIN_HAND));
+		return true;
 	}
 
 	private TickResult finish(TickResult result) {

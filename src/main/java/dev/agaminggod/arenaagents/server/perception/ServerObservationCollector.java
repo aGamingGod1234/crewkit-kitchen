@@ -771,7 +771,7 @@ public final class ServerObservationCollector {
 	private static List<Entity> heardThreats(ServerLevel level, ServerPlayer agent, ObservationVisibility.Frame visibility) {
 		List<Entity> heard = new ArrayList<>();
 		for (net.minecraft.world.entity.Mob mob : level.getEntitiesOfClass(net.minecraft.world.entity.Mob.class,
-				agent.getBoundingBox().inflate(ThreatPerception.RANGE), mob -> mob instanceof net.minecraft.world.entity.monster.Enemy && mob.isAlive())) {
+				agent.getBoundingBox().inflate(ThreatPerception.RANGE), mob -> ThreatPerception.isHostileTo(mob, agent) && mob.isAlive())) {
 			if (agent.distanceTo(mob) > ThreatPerception.RANGE) continue;
 			boolean hurtRecently = agent.getLastHurtByMob() == mob && agent.tickCount - agent.getLastHurtByMobTimestamp() <= 100;
 			if (!hearsThreat(mob.getTarget() == agent, hurtRecently, visibility.isEntityWithinView(mob) && visibility.hasLineOfSight(mob))) continue;

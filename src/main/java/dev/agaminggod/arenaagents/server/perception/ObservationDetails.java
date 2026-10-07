@@ -83,7 +83,9 @@ public final class ObservationDetails {
 	/** Fight-or-flee facts the model needs: hostility, whether it hunts this agent, health and creeper fuse. */
 	static void combat(JsonObject target, ServerPlayer player, LivingEntity living) {
 		target.addProperty("alive", living.isAlive());
-		target.addProperty("hostile", living instanceof net.minecraft.world.entity.monster.Enemy);
+		// A calm neutral mob (enderman, zombified piglin, piglin tolerating gold) is not hostile to this agent.
+		target.addProperty("hostile", living instanceof net.minecraft.world.entity.Mob mob
+				? ThreatPerception.isHostileTo(mob, player) : living instanceof net.minecraft.world.entity.monster.Enemy);
 		target.addProperty("health", Float.isFinite(living.getHealth()) ? living.getHealth() : 0.0F);
 		target.addProperty("maxHealth", Float.isFinite(living.getMaxHealth()) ? living.getMaxHealth() : 0.0F);
 		if (living instanceof net.minecraft.world.entity.Mob mob) target.addProperty("targetingAgent", mob.getTarget() == player);

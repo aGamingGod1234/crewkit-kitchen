@@ -17,6 +17,7 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.NeutralMob;
 import net.minecraft.world.entity.boss.enderdragon.EnderDragon;
 import net.minecraft.world.entity.boss.wither.WitherBoss;
 import net.minecraft.world.entity.monster.Blaze;
@@ -24,6 +25,7 @@ import net.minecraft.world.entity.monster.Creeper;
 import net.minecraft.world.entity.monster.Enemy;
 import net.minecraft.world.entity.monster.Ghast;
 import net.minecraft.world.entity.monster.RangedAttackMob;
+import net.minecraft.world.entity.monster.piglin.AbstractPiglin;
 import net.minecraft.world.entity.monster.zombie.Drowned;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.phys.Vec3;
@@ -36,6 +38,8 @@ import net.minecraft.world.phys.Vec3;
  */
 public final class ThreatPerception {
 	public static final double RANGE = 16.0D;
+	/** A latched threat is kept while it stays alive within this range, so pacing at 16 blocks cannot re-raise it. */
+	public static final double RELEASE_RANGE = 20.0D;
 	public static final double CREEPER_CLOSE = 5.0D;
 	public static final int MAX_ENTRIES = 8;
 	public static final String TARGETING = "targeting";
@@ -78,15 +82,43 @@ public final class ThreatPerception {
 		latest.keySet().retainAll(agents);
 	}
 
-	/** True for an enemy the agent can sense as a threat even outside its view cone (used by fight/flee). */
+	/** True for a hostile the agent can sense as a threat even outside its view cone (used by fight/flee). */
 	public static boolean isSensedThreat(ServerPlayer agent, Entity entity) {
-		if (!(entity instanceof Mob mob) || !(entity instanceof Enemy) || !mob.isAlive()) return false;
+		if (!(entity instanceof Mob mob) || !isHostileTo(mob, agent) || !mob.isAlive()) return false;
 		if (agent.distanceTo(mob) > RANGE) return false;
-		return mob.getTarget() == agent || agent.getLastHurtByMob() == mob || mob.hasLineOfSight(agent);
+		return mob.getTarget() == agent || agent.getLastHurtByMob() == mob || mob.getSensing().hasLineOfSight(agent);
+	}
+
+	/**
+	 * Neutral mobs (endermen, zombified piglins, piglins that tolerate gold armour, wolves, bees...) only count
+	 * as hostile once they target this agent; attacking a calm one would start a fight the model did not want.
+	 */
+	public static boolean isNeutral(Mob mob) {
+		return mob instanceof NeutralMob || mob instanceof AbstractPiglin;
+	}
+
+	public static boolean isHostileTo(Mob mob, ServerPlayer agent) {
+		return mob instanceof Enemy && (!isNeutral(mob) || mob.getTarget() == agent);
+	}
+
+	/**
+	 * The signals one mob raises right now. Pure so the rules verify without a server: neutral mobs signal only
+	 * while targeting the agent, and a close creeper counts only when it can see or is hunting the agent
+	 * (one behind a wall cannot reach it).
+	 */
+	static List<String> signals(boolean neutral, boolean targeting, boolean creeper, boolean swelling, boolean ranged,
+			boolean sight, double distance) {
+		List<String> signals = new ArrayList<>(4);
+		if (distance > RANGE || (neutral && !targeting)) return signals;
+		if (targeting) signals.add(TARGETING);
+		if (swelling) signals.add(SWELLING);
+		if (creeper && distance <= CREEPER_CLOSE && (sight || targeting)) signals.add(CREEPER_CLOSE_SIGNAL);
+		if (ranged && sight) signals.add(RANGED_SIGHT);
+		return signals;
 	}
 
 	private Snapshot scan(AgentId agentId, ServerPlayer agent, long tick) {
-		List<Mob> mobs = agent.level().getEntitiesOfClass(Mob.class, agent.getBoundingBox().inflate(RANGE),
+		List<Mob> mobs = agent.level().getEntitiesOfClass(Mob.class, agent.getBoundingBox().inflate(RELEASE_RANGE),
 				mob -> mob instanceof Enemy && mob.isAlive() && !(mob instanceof EnderDragon) && !(mob instanceof WitherBoss));
 		Set<String> raw = new HashSet<>();
 		Set<String> present = new HashSet<>();
@@ -95,27 +127,29 @@ public final class ThreatPerception {
 		Map<String, boolean[]> flags = new HashMap<>();
 		for (Mob mob : mobs) {
 			double distance = agent.distanceTo(mob);
-			if (distance > RANGE) continue;
+			if (distance > RELEASE_RANGE) continue;
 			String id = mob.getUUID().toString();
 			boolean targeting = mob.getTarget() == agent;
 			boolean creeper = mob instanceof Creeper;
 			boolean swelling = creeper && ((Creeper) mob).getSwellDir() > 0;
 			boolean ranged = isRanged(mob);
-			// Line of sight is a ray cast; only pay for it where a signal depends on it.
-			boolean sight = (targeting || creeper || ranged) && mob.hasLineOfSight(agent);
+			// The mob's own sensing caches line of sight for this tick (its AI asks the same question).
+			boolean sight = distance <= RANGE && (targeting || creeper || ranged) && mob.getSensing().hasLineOfSight(agent);
 			present.add(id);
 			byId.put(id, mob);
 			geometry.put(id, new double[] {distance, bearing(agent, mob)});
 			flags.put(id, new boolean[] {targeting, swelling, sight});
-			if (targeting) raw.add(ThreatSignalLatch.key(id, TARGETING));
-			if (swelling) raw.add(ThreatSignalLatch.key(id, SWELLING));
-			if (creeper && distance <= CREEPER_CLOSE) raw.add(ThreatSignalLatch.key(id, CREEPER_CLOSE_SIGNAL));
-			if (ranged && sight) raw.add(ThreatSignalLatch.key(id, RANGED_SIGHT));
+			for (String signal : signals(isNeutral(mob), targeting, creeper, swelling, ranged, sight, distance)) {
+				raw.add(ThreatSignalLatch.key(id, signal));
+			}
 		}
-		Set<String> latched = latches.computeIfAbsent(agentId, ignored -> new ThreatSignalLatch()).update(raw, present, tick);
+		ThreatSignalLatch latch = latches.computeIfAbsent(agentId, ignored -> new ThreatSignalLatch());
+		Set<String> latched = latch.update(raw, present, tick);
+		Map<String, Long> firstSeen = new HashMap<>();
 		Map<String, List<String>> signals = new HashMap<>();
 		for (String key : latched) {
 			signals.computeIfAbsent(ThreatSignalLatch.threatId(key), ignored -> new ArrayList<>()).add(ThreatSignalLatch.signal(key));
+			firstSeen.merge(ThreatSignalLatch.threatId(key), latch.firstSeen(key), Math::min);
 		}
 		if (signals.isEmpty()) return Snapshot.EMPTY;
 		List<Entry> entries = new ArrayList<>();
@@ -126,13 +160,15 @@ public final class ThreatPerception {
 			entries.add(new Entry(threat.getKey(), BuiltInRegistries.ENTITY_TYPE.getKey(mob.getType()).toString(),
 					round(where[0]), round(where[1]), state[0], state[1], state[2], List.copyOf(threat.getValue())));
 		}
-		entries.sort(Comparator.comparingDouble(Entry::distance));
-		List<Entry> limited = List.copyOf(entries.subList(0, Math.min(MAX_ENTRIES, entries.size())));
-		Set<String> reported = new HashSet<>();
-		for (Entry entry : limited) for (String signal : entry.signals()) reported.add(ThreatSignalLatch.key(entry.uuid(), signal));
+		// With more than 8 threats, report the 8 latched first. A distance cut would reshuffle as mobs move and
+		// every reshuffle would look like a new signal; first-seen order only changes when a threat clears.
+		entries.sort(Comparator.<Entry>comparingLong(entry -> firstSeen.get(entry.uuid())).thenComparing(Entry::uuid));
+		List<Entry> limited = new ArrayList<>(entries.subList(0, Math.min(MAX_ENTRIES, entries.size())));
+		limited.sort(Comparator.comparingDouble(Entry::distance));
 		int weaponSlot = HotbarWeapons.bestSlotOrNone(agent);
 		ItemStack weapon = weaponSlot < 0 ? ItemStack.EMPTY : agent.getInventory().getItem(weaponSlot);
-		return new Snapshot(limited, Set.copyOf(reported), weaponSlot,
+		// signalKeys is the full latched set, so forced delivery tracks real edges, not the output cut.
+		return new Snapshot(List.copyOf(limited), Set.copyOf(latched), weaponSlot,
 				weapon.isEmpty() ? null : BuiltInRegistries.ITEM.getKey(weapon.getItem()).toString());
 	}
 

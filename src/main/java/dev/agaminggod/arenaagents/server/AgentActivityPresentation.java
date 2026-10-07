@@ -196,7 +196,7 @@ public final class AgentActivityPresentation {
 					"SHIELD_USE_INTERRUPTED", "RETRY_SCHEDULED", "PROVIDER_RETRY", "PLANNING_RETRY",
 					"MISSING_AGENT_MESSAGE", "MISSING_FINAL_MESSAGE",
 					// Fight/flee outcomes the model chose or must simply re-decide; not operator errors.
-					"LOW_HEALTH_BAILOUT", "TARGET_ESCAPED", "TARGET_UNREACHABLE", "FIGHT_TIMED_OUT", "FLEE_TIMED_OUT" -> false;
+					"LOW_HEALTH_BAILOUT", "TARGET_ESCAPED", "TARGET_UNREACHABLE", "FIGHT_TIMED_OUT", "FLEE_TIMED_OUT", "FLEE_BLOCKED" -> false;
 			default -> true;
 		};
 	}

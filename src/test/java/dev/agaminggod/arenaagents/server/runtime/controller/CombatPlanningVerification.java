@@ -116,6 +116,36 @@ public final class CombatPlanningVerification {
 			return position.y() == 63 ? WalkabilityView.Cell.SAFE_SUPPORT : WalkabilityView.Cell.CLEAR;
 		};
 		check(CombatPlanning.fleeHeading(lava, feet, south, null).yaw() != 0.0F, "the flee never runs onto hazardous ground");
+		// A one-block pillar over lava: every heading is a hazard, so the flee reports blocked instead of jumping.
+		WalkabilityView pillar = position -> {
+			if (position.x() == 0 && position.z() == 0 && position.y() == 63) return WalkabilityView.Cell.SAFE_SUPPORT;
+			return position.y() <= 63 ? WalkabilityView.Cell.HAZARD : WalkabilityView.Cell.CLEAR;
+		};
+		CombatPlanning.Heading boxed = CombatPlanning.fleeHeading(pillar, feet, south, null);
+		check(!boxed.clear() && !boxed.jump(), "boxed in on a pillar the flee neither moves nor jumps off");
+		check(!CombatPlanning.canStep(pillar, feet, south) && !CombatPlanning.canStep(pillar, feet, 180.0F),
+				"a fight on the pillar cannot approach or step back into the hazard");
+		// A deep ravine directly behind: stepping back is refused, stepping forward on solid ground is fine.
+		WalkabilityView ravine = position -> {
+			if (position.z() < 0) return WalkabilityView.Cell.CLEAR;
+			return position.y() == 63 ? WalkabilityView.Cell.SAFE_SUPPORT : WalkabilityView.Cell.CLEAR;
+		};
+		check(CombatPlanning.canStep(ravine, feet, south) && !CombatPlanning.canStep(ravine, feet, 180.0F),
+				"a step back toward a deep drop is refused while the approach stays allowed");
+		// A crouch-only gap is not walkable for flee/fight, which never crouch.
+		WalkabilityView crouch = new WalkabilityView() {
+			@Override public Cell cellAt(GridPosition position) {
+				return position.y() == 63 ? Cell.SAFE_SUPPORT : Cell.CLEAR;
+			}
+			@Override public dev.agaminggod.arenaagents.client.navigation.TraversalType traversalAt(GridPosition position) {
+				return position.z() >= 1 ? dev.agaminggod.arenaagents.client.navigation.TraversalType.CROUCH
+						: WalkabilityView.super.traversalAt(position);
+			}
+		};
+		check(!CombatPlanning.canStep(crouch, feet, south), "a crouch-only passage is not a flee route");
+		check(CombatPlanning.alignedForward(1.0F, 0.0F) == 1.0F && CombatPlanning.alignedForward(1.0F, 120.0F) == 0.0F
+				&& Math.abs(CombatPlanning.alignedForward(1.0F, 60.0F) - 0.5F) < 1.0E-4F,
+				"movement waits for the turn: none while facing 90+ degrees away from the target");
 		check(Math.abs(CombatPlanning.yawToward(0.0D, 0.0D, 0.0D, 5.0D)) < 1.0E-4F
 				&& Math.abs(CombatPlanning.yawToward(0.0D, 0.0D, -5.0D, 0.0D) - 90.0F) < 1.0E-4F,
 				"yaw uses the Minecraft convention (+z is 0, -x is 90)");

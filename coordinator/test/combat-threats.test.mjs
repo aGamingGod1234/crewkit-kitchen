@@ -42,7 +42,7 @@ function engineFor(source) {
 /** The exact watcher example the model is shown, extracted so the prompt and its behaviour cannot drift apart. */
 function promptWatcherExample() {
 	const start = PLANNER_SYSTEM_PROMPT.indexOf('program.watch(() => player.state().threat !== null');
-	const end = PLANNER_SYSTEM_PROMPT.indexOf('}). Creepers: flee.', start);
+	const end = PLANNER_SYSTEM_PROMPT.indexOf('}). Its guard fires', start);
 	assert.ok(start > 0 && end > start, 'the prompt carries a threat watcher example');
 	return `${PLANNER_SYSTEM_PROMPT.slice(start, end + 2)};`;
 }
@@ -89,7 +89,7 @@ test('an unhandled threat pauses the routine and wakes the model before any dama
 	assert.equal(run.modelRequests.at(-1).trigger, 'threat');
 });
 
-test('the prompt watcher example flees a creeper and fights a zombie at observation speed without waking the model', () => {
+test('the prompt watcher example flees a creeper and fights a zombie at observation speed, and the model is still notified', () => {
 	const example = promptWatcherExample();
 	for (const [uuid, type, signals, primitive, expected] of [
 		[CREEPER, 'minecraft:creeper', ['swelling'], 'flee_from', { targetId: CREEPER, distance: 10, timeoutMs: 8000 }],
@@ -103,7 +103,9 @@ test('the prompt watcher example flees a creeper and fights a zombie at observat
 		const reaction = run.dispatched[1];
 		assert.equal(reaction.action.type ?? reaction.primitive ?? reaction.action.primitive, primitive);
 		assert.deepEqual({ ...reaction.action.arguments }, expected);
-		assert.equal(run.modelRequests.length, 0, 'the authored policy acts first; the model reconsiders after the handler');
+		assert.equal(run.modelRequests.length, 1, 'the threat still reaches the model, like damage');
+		assert.equal(run.modelRequests[0].trigger, 'threat');
+		assert.deepEqual(run.cancelled, [run.dispatched[0].actionId], 'the notification never cancels the handler-owned reaction');
 	}
 });
 
@@ -127,4 +129,15 @@ test('native event projections keep combat entity fields and never trim a huntin
 		assert.equal(input.observation.player.threat.uuid, ZOMBIE, `${event}: threat facts ride on the player record`);
 		assert.equal(input.trigger, 'threat');
 	}
+});
+
+test('an unrelated watcher firing in the same observation cannot hide a threat from the model', () => {
+	const run = engineFor(`program.onUnhandledAttention("continue_and_notify");
+		program.watch(() => player.state().health < 20, { mode: "boundary" }, async () => { await player.wait(5); });
+		await player.wait(1000);`);
+	const hurtAndHunted = factsWith([threatEntry(ZOMBIE, 'minecraft:zombie', 6, ['targeting'])]);
+	hurtAndHunted.player.health = 19;
+	run.engine.ingestObservation({ observation: hurtAndHunted, eventSequence: 2, attention: true, priority: 'urgent', trigger: 'threat' });
+	assert.equal(run.modelRequests.length, 1, 'the latched signal is raised once, so this is the only chance to notify');
+	assert.equal(run.modelRequests[0].trigger, 'threat');
 });
