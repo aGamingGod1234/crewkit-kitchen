@@ -16,6 +16,7 @@ import net.minecraft.network.protocol.game.ServerboundRenameItemPacket;
 import net.minecraft.network.protocol.game.ServerboundSelectBundleItemPacket;
 import net.minecraft.network.protocol.game.ServerboundSelectTradePacket;
 import net.minecraft.network.protocol.game.ServerboundSetBeaconPacket;
+import net.minecraft.network.protocol.game.ServerboundSetCreativeModeSlotPacket;
 import net.minecraft.network.protocol.game.ServerboundSignUpdatePacket;
 
 /**
@@ -48,14 +49,16 @@ public final class PovOutgoingRelay {
 					beacon.primary().map(effect -> BuiltInRegistries.MOB_EFFECT.getId(effect.value())).orElse(-1),
 					beacon.secondary().map(effect -> BuiltInRegistries.MOB_EFFECT.getId(effect.value())).orElse(-1), 0);
 			case ServerboundPlaceRecipePacket place -> OperatorInputSender.sendAction(OperatorAction.PLACE_RECIPE,
-					place.recipe().index(), place.useMaxItems() ? 1 : 0, 0);
+					// RecipeBookComponent names LocalPlayer.containerMenu; the screen the operator clicked is the mirror.
+					place.recipe().index(), place.useMaxItems() ? 1 : 0, PovScreens.mirrorContainerId(place.containerId()));
 			case ServerboundRecipeBookChangeSettingsPacket settings -> OperatorInputSender.sendAction(OperatorAction.RECIPE_BOOK_SETTINGS,
 					settings.getBookType().ordinal(), settings.isOpen() ? 1 : 0, settings.isFiltering() ? 1 : 0);
 			case ServerboundRecipeBookSeenRecipePacket seen -> OperatorInputSender.sendAction(OperatorAction.RECIPE_SEEN, seen.recipe().index(), 0, 0);
 			case ServerboundSelectBundleItemPacket bundle -> OperatorInputSender.sendAction(OperatorAction.SELECT_BUNDLE_ITEM,
 					bundle.slotId(), bundle.selectedItemIndex(), 0);
 			case ServerboundContainerSlotStateChangedPacket crafter -> OperatorInputSender.sendAction(OperatorAction.CRAFTER_SLOT,
-					crafter.slotId(), crafter.newState() ? 1 : 0, 0);
+					crafter.slotId(), crafter.newState() ? 1 : 0, crafter.containerId());
+			case ServerboundSetCreativeModeSlotPacket creative -> OperatorInputSender.sendCreativeSlot(creative.slotNum(), creative.itemStack());
 			default -> {
 				return false;
 			}
@@ -68,7 +71,8 @@ public final class PovOutgoingRelay {
 				|| packet instanceof ServerboundEditBookPacket || packet instanceof ServerboundSelectTradePacket
 				|| packet instanceof ServerboundSetBeaconPacket || packet instanceof ServerboundPlaceRecipePacket
 				|| packet instanceof ServerboundRecipeBookChangeSettingsPacket || packet instanceof ServerboundRecipeBookSeenRecipePacket
-				|| packet instanceof ServerboundSelectBundleItemPacket || packet instanceof ServerboundContainerSlotStateChangedPacket;
+				|| packet instanceof ServerboundSelectBundleItemPacket || packet instanceof ServerboundContainerSlotStateChangedPacket
+				|| packet instanceof ServerboundSetCreativeModeSlotPacket;
 	}
 
 	/** Packets that act on the open menu; a spectator's mirrored screen must not send them for the operator. */

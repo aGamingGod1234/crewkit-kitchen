@@ -35,7 +35,7 @@ public final class PovRelayVerification {
 		System.setOut(out);
 		System.setErr(err);
 		return verifyTextLimits() + verifyTextRoundTrip() + verifyActionContract() + verifyDecoding()
-				+ verifyForwarding() + verifyFlightToggle();
+				+ verifyForwarding() + verifyFlightToggle() + verifyFlightOutcome() + verifyDirectMessageSpy();
 	}
 
 	private static int verifyTextLimits() {
@@ -112,6 +112,31 @@ public final class PovRelayVerification {
 		check(!keys.flightTogglePress(false), "swimming or an unjumpable vehicle blocks the toggle");
 		check(keys.flightTogglePress(true), "the window stays open while blocked, like LocalPlayer");
 		return 6;
+	}
+
+	private static int verifyFlightOutcome() {
+		check(dev.agaminggod.arenaagents.server.runtime.controller.ServerFlightControllerAccess.outcome(true).state()
+				== dev.agaminggod.arenaagents.server.runtime.controller.ServerController.State.SUCCEEDED, "flight that survives a tick succeeds");
+		var ended = dev.agaminggod.arenaagents.server.runtime.controller.ServerFlightControllerAccess.outcome(false);
+		check(ended.state() == dev.agaminggod.arenaagents.server.runtime.controller.ServerController.State.FAILED
+				&& ended.reasonCode().equals("FLIGHT_ENDED_ON_LANDING"), "flight that landing ended is reported");
+		return 2;
+	}
+
+	private static int verifyDirectMessageSpy() {
+		java.util.UUID agent = java.util.UUID.randomUUID();
+		java.util.UUID operator = java.util.UUID.randomUUID();
+		java.util.UUID other = java.util.UUID.randomUUID();
+		try {
+			PovMessageRelay.start(agent, operator, "Luna");
+			check(PovMessageRelay.relaysAnyTo(operator, List.of(other, agent)), "the operator driving a DM'd agent already sees its line");
+			check(!PovMessageRelay.relaysAnyTo(other, List.of(agent)), "other operators keep their spy copy");
+			check(!PovMessageRelay.relaysAnyTo(operator, List.of(other)), "a DM to another agent keeps the spy copy");
+		} finally {
+			PovMessageRelay.stop(agent, operator);
+		}
+		check(!PovMessageRelay.relaysAnyTo(operator, List.of(agent)), "the spy copy returns after the takeover");
+		return 4;
 	}
 
 	private static void rejects(Runnable action, String message) {

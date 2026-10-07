@@ -66,7 +66,9 @@ public final class AgentControlSync {
 				|| !ServerPlayNetworking.registerGlobalReceiver(OperatorActionPayload.TYPE,
 				(payload, context) -> context.server().execute(() -> PovSessionRuntime.handleAction(context.player(), payload)))
 				|| !ServerPlayNetworking.registerGlobalReceiver(dev.agaminggod.arenaagents.pov.OperatorTextPayload.TYPE,
-				(payload, context) -> context.server().execute(() -> PovSessionRuntime.handleText(context.player(), payload)))) {
+				(payload, context) -> context.server().execute(() -> PovSessionRuntime.handleText(context.player(), payload)))
+				|| !ServerPlayNetworking.registerGlobalReceiver(dev.agaminggod.arenaagents.pov.OperatorCreativeSlotPayload.TYPE,
+				(payload, context) -> context.server().execute(() -> PovSessionRuntime.handleCreativeSlot(context.player(), payload)))) {
 			throw new IllegalStateException("Arena Agents takeover input receivers are already registered");
 		}
 		PayloadTypeRegistry.serverboundPlay().register(AgentControlRequestPayload.TYPE, AgentControlRequestPayload.CODEC);

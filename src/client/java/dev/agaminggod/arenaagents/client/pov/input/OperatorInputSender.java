@@ -87,6 +87,13 @@ public final class OperatorInputSender {
 		send(Minecraft.getInstance(), build.apply(session.sessionId(), nextSequence()));
 	}
 
+	/** A creative inventory change for a creative agent (slot -1 drops the stack). */
+	public static void sendCreativeSlot(short slot, net.minecraft.world.item.ItemStack stack) {
+		PovClientSession session = PovClient.session().filter(PovClientSession::takeover).orElse(null);
+		if (session == null) return;
+		send(Minecraft.getInstance(), new dev.agaminggod.arenaagents.pov.OperatorCreativeSlotPayload(session.sessionId(), nextSequence(), slot, stack));
+	}
+
 	private static void tick(Minecraft client) {
 		PovClientSession session = PovClient.session().orElse(null);
 		boolean takeover = session != null && session.takeover();

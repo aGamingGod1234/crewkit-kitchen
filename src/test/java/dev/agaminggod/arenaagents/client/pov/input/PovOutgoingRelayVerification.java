@@ -6,6 +6,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.network.protocol.game.ServerboundEditBookPacket;
 import net.minecraft.network.protocol.game.ServerboundRenameItemPacket;
 import net.minecraft.network.protocol.game.ServerboundSelectTradePacket;
+import net.minecraft.network.protocol.game.ServerboundSetCreativeModeSlotPacket;
 import net.minecraft.network.protocol.game.ServerboundSignUpdatePacket;
 import net.minecraft.network.protocol.game.ServerboundSwingPacket;
 import net.minecraft.world.InteractionHand;
@@ -28,7 +29,10 @@ public final class PovOutgoingRelayVerification {
 		check(PovOutgoingRelay.menuPacket(new ServerboundSelectTradePacket(0))
 				&& !PovOutgoingRelay.menuPacket(new ServerboundSignUpdatePacket(BlockPos.ZERO, true, "", "", "", "")),
 				"only menu packets are dropped for spectators");
-		return 6;
+		check(PovOutgoingRelay.relayable(new ServerboundSetCreativeModeSlotPacket(36, net.minecraft.world.item.ItemStack.EMPTY))
+				&& !PovOutgoingRelay.menuPacket(new ServerboundSetCreativeModeSlotPacket(36, net.minecraft.world.item.ItemStack.EMPTY)),
+				"creative slot changes are relayed");
+		return 7;
 	}
 
 	private static void check(boolean condition, String message) {

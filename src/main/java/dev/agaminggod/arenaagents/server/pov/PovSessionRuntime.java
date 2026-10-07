@@ -13,6 +13,7 @@ import dev.agaminggod.arenaagents.pov.OperatorBodyController;
 import dev.agaminggod.arenaagents.pov.OperatorBodyControllers;
 import dev.agaminggod.arenaagents.pov.OperatorInputPayload;
 import dev.agaminggod.arenaagents.pov.OperatorTextPayload;
+import dev.agaminggod.arenaagents.pov.OperatorCreativeSlotPayload;
 import dev.agaminggod.arenaagents.pov.PovDeath;
 import dev.agaminggod.arenaagents.pov.PovMode;
 import dev.agaminggod.arenaagents.pov.PovStopPayload;
@@ -456,6 +457,7 @@ public final class PovSessionRuntime {
 		}
 		if (online && session.takeover()) {
 			step(session, "restore the operator recipe book", () -> PovUiForwarder.restoreOperatorRecipeBook(operator));
+			step(session, "resync the operator inventory", () -> operator.inventoryMenu.sendAllDataToRemote());
 		}
 		if (online) {
 			step(session, "send the stop payload", () -> {
@@ -567,6 +569,11 @@ public final class PovSessionRuntime {
 		if (session != null) session.controller().applyFrame(frame);
 	}
 
+	public static void handleCreativeSlot(ServerPlayer operator, OperatorCreativeSlotPayload slot) {
+		PovSession session = activeTakeover(operator, slot.sessionId());
+		if (session != null) session.controller().applyCreativeSlot(slot);
+	}
+
 	public static void handleText(ServerPlayer operator, OperatorTextPayload text) {
 		PovSession session = activeTakeover(operator, text.sessionId());
 		if (session != null) session.controller().applyText(text);
@@ -589,7 +596,11 @@ public final class PovSessionRuntime {
 			// The agent's own inventory is always clickable server-side; the publisher mirrors it only while the
 			// operator has the E screen open, so the client receives container-0 contents to fill that screen.
 			if (action.action() == OperatorAction.OPEN_INVENTORY) session.publisher().setInventoryOpen(true);
-			if (action.action() == OperatorAction.CLOSE_MENU) session.publisher().setInventoryOpen(false);
+			if (action.action() == OperatorAction.CLOSE_MENU) {
+				session.publisher().setInventoryOpen(false);
+				// The creative screen edits the operator's own client inventory view; give it back its real contents.
+				operator.inventoryMenu.sendAllDataToRemote();
+			}
 			session.controller().applyAction(operator, action);
 			return;
 		}

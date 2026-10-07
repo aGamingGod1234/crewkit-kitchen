@@ -632,14 +632,17 @@ public final class ServerActionExecutor {
 				player.stopSleepInBed(false, true);
 				if (player.isSleeping()) throw new AgentDomainException("WAKE_NOT_CONFIRMED", "Vanilla wake-up was not observed");
 			});
-			case SET_FLIGHT -> ActiveAction.immediate(request, player, () -> {
+			case SET_FLIGHT -> {
 				boolean enabled = bool(arguments, "enabled");
 				if (enabled && !player.getAbilities().mayfly) throw new AgentDomainException("FLIGHT_NOT_ALLOWED", "Current player abilities do not permit flight");
-				player.getAbilities().flying = enabled;
-				// Vanilla's double-tap jumps when flight starts on the ground; landing would otherwise end it at once.
-				if (enabled && player.onGround()) player.jumpFromGround();
-				player.onUpdateAbilities();
-			});
+				// Enabling is confirmed a tick later: landing ends flight, so a body that cannot rise reports it.
+				yield enabled
+						? ActiveAction.controller(request, player, new dev.agaminggod.arenaagents.server.runtime.controller.ServerFlightController())
+						: ActiveAction.immediate(request, player, () -> {
+							player.getAbilities().flying = false;
+							player.onUpdateAbilities();
+						});
+			}
 			case WRITE_SIGN -> ActiveAction.transaction(request, player, PlayerTextInteraction.writeSign(player, arguments, protection));
 			case EDIT_BOOK -> ActiveAction.transaction(request, player, PlayerTextInteraction.editBook(player, arguments));
 			case BREAK_BLOCK -> {

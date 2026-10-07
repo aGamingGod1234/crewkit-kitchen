@@ -24,7 +24,7 @@ public enum OperatorAction {
 	SELECT_TRADE,
 	/** Beacon confirm: {@code a} / {@code b} = primary / secondary MobEffect registry id, -1 for none. */
 	SET_BEACON,
-	/** Recipe book click: {@code a} = RecipeDisplayId index, {@code b} != 0 to place as many as possible. */
+	/** Recipe book click: {@code a} = RecipeDisplayId index, {@code b} != 0 to place as many as possible, {@code c} = container id. */
 	PLACE_RECIPE,
 	/** Recipe book toggles: {@code a} = RecipeBookType ordinal, {@code b} = open, {@code c} = filtering. */
 	RECIPE_BOOK_SETTINGS,
@@ -32,6 +32,6 @@ public enum OperatorAction {
 	RECIPE_SEEN,
 	/** Bundle scroll in a menu: {@code a} = menu slot, {@code b} = selected item index (-1 for none). */
 	SELECT_BUNDLE_ITEM,
-	/** Crafter slot toggle: {@code a} = menu slot, {@code b} != 0 to enable. */
+	/** Crafter slot toggle: {@code a} = menu slot, {@code b} != 0 to enable, {@code c} = container id. */
 	CRAFTER_SLOT
 }

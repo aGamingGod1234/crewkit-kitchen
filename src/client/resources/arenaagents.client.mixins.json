@@ -16,6 +16,7 @@
     "ClientCommonPacketListenerPovMixin",
     "ClientPacketListenerPovMixin",
     "RecipeBookComponentPovMixin",
+    "PlayerInfiniteMaterialsPovMixin",
     "EntityPovRotationMixin",
     "ExperienceBarRendererPovMixin",
     "GameModeSwitcherScreenPovMixin",

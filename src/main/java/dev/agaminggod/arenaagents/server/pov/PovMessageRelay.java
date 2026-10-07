@@ -54,6 +54,19 @@ public final class PovMessageRelay {
 		TARGETS.computeIfPresent(agentPlayerUuid, (ignored, target) -> target.operatorId().equals(operatorId) ? null : target);
 	}
 
+	/**
+	 * True when {@code operatorId} drives one of these agent bodies, so text addressed to that body reaches the
+	 * operator through this relay and a separate copy for the operator (a DM spy line) would show it twice.
+	 */
+	public static boolean relaysAnyTo(UUID operatorId, java.util.Collection<UUID> agentPlayerUuids) {
+		if (TARGETS.isEmpty() || operatorId == null) return false;
+		for (UUID agent : agentPlayerUuids) {
+			Target target = TARGETS.get(agent);
+			if (target != null && target.operatorId().equals(operatorId)) return true;
+		}
+		return false;
+	}
+
 	/** Called for every packet a server game connection sends; costs one map check while nobody is taken over. */
 	public static void observe(ServerPlayer player, Packet<?> packet) {
 		if (TARGETS.isEmpty() || player == null) return;

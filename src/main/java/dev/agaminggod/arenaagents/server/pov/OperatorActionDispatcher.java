@@ -32,6 +32,7 @@ import net.minecraft.network.protocol.game.ServerboundRenameItemPacket;
 import net.minecraft.network.protocol.game.ServerboundSelectBundleItemPacket;
 import net.minecraft.network.protocol.game.ServerboundSelectTradePacket;
 import net.minecraft.network.protocol.game.ServerboundSetBeaconPacket;
+import net.minecraft.network.protocol.game.ServerboundSetCreativeModeSlotPacket;
 import net.minecraft.network.protocol.game.ServerboundSignUpdatePacket;
 import net.minecraft.core.Holder;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -114,8 +115,9 @@ public final class OperatorActionDispatcher {
 			case SET_BEACON -> beaconEffects(action.a(), action.b())
 					.map(effects -> relay(agent, listener -> listener.handleSetBeaconPacket(effects)))
 					.orElse(Outcome.IGNORED);
+			// The container id is the one the operator's screen showed, so vanilla still refuses a stale screen.
 			case PLACE_RECIPE -> relay(agent, listener -> listener.handlePlaceRecipe(new ServerboundPlaceRecipePacket(
-					agent.containerMenu.containerId, new RecipeDisplayId(action.a()), action.b() != 0)));
+					action.c(), new RecipeDisplayId(action.a()), action.b() != 0)));
 			case RECIPE_BOOK_SETTINGS -> decodeRecipeBookType(action.a())
 					.map(type -> relay(agent, listener -> listener.handleRecipeBookChangeSettingsPacket(
 							new ServerboundRecipeBookChangeSettingsPacket(type, action.b() != 0, action.c() != 0))))
@@ -127,7 +129,7 @@ public final class OperatorActionDispatcher {
 					: relay(agent, listener -> listener.handleBundleItemSelectedPacket(
 							new ServerboundSelectBundleItemPacket(action.a(), action.b())));
 			case CRAFTER_SLOT -> relay(agent, listener -> listener.handleContainerSlotStateChanged(
-					new ServerboundContainerSlotStateChangedPacket(action.a(), agent.containerMenu.containerId, action.b() != 0)));
+					new ServerboundContainerSlotStateChangedPacket(action.a(), action.c(), action.b() != 0)));
 			// The controller handles respawn itself because the body is usually absent then.
 			case RESPAWN -> Outcome.IGNORED;
 		};
@@ -147,6 +149,11 @@ public final class OperatorActionDispatcher {
 			case EDIT_BOOK -> relay(agent, listener -> listener.handleEditBook(
 					new ServerboundEditBookPacket(text.value(), lines, text.title())));
 		};
+	}
+
+	/** ServerboundSetCreativeModeSlotPacket for the agent; vanilla checks infinite materials, features, slot and size. */
+	static Outcome creativeSlot(ServerPlayer agent, short slot, ItemStack stack) {
+		return relay(agent, listener -> listener.handleSetCreativeModeSlot(new ServerboundSetCreativeModeSlotPacket(slot, stack)));
 	}
 
 	/** Beacon effects by registry id as ServerboundSetBeaconPacket carries them; an unknown id is refused like a bad packet. */

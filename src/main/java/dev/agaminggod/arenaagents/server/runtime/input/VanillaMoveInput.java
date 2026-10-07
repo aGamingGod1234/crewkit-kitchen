@@ -13,7 +13,13 @@ import net.minecraft.world.item.component.UseEffects;
  * shorter than one (model control) keep their length.
  */
 public final class VanillaMoveInput {
-	/** LivingEntity.applyInput multiplies by this after the input is set; LocalPlayer replaces that step. */
+	/**
+	 * LivingEntity.applyInput multiplies by this after the input is set. LocalPlayer overrides applyInput and, for the
+	 * body its camera is on, writes modifyInput's result (which already holds the one 0.98) without calling super, so
+	 * a real player moves with a single 0.98. Pre-dividing here leaves the Carpet body with that same single 0.98:
+	 * measured on a headless server, a walking agent settles at 0.11786 blocks/tick of motion and 4.317 m/s, vanilla's
+	 * walking speed; a second 0.98 would give 4.23 m/s.
+	 */
 	static final float INPUT_FRICTION = 0.98F;
 
 	private VanillaMoveInput() {

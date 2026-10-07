@@ -8,6 +8,7 @@ import dev.agaminggod.arenaagents.pov.OperatorBodyController;
 import dev.agaminggod.arenaagents.pov.OperatorBodyControllers;
 import dev.agaminggod.arenaagents.pov.OperatorInputPayload;
 import dev.agaminggod.arenaagents.pov.OperatorTextPayload;
+import dev.agaminggod.arenaagents.pov.OperatorCreativeSlotPayload;
 import dev.agaminggod.arenaagents.server.CodexAgentManager;
 import dev.agaminggod.arenaagents.server.OfflineAgentPlayers;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
@@ -106,6 +107,15 @@ public final class CarpetOperatorBodyController implements OperatorBodyControlle
 			if (agent == null) return;
 			OperatorActionDispatcher.dispatch(agent, action, keys, frameOf(agent));
 			push(agent);
+		});
+	}
+
+	@Override
+	public void applyCreativeSlot(OperatorCreativeSlotPayload slot) {
+		if (!active || slot == null) return;
+		guarded("creative slot", () -> {
+			ServerPlayer agent = bind();
+			if (agent != null) OperatorActionDispatcher.creativeSlot(agent, slot.slot(), slot.stack());
 		});
 	}
 

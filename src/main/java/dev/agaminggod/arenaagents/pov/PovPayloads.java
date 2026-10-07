@@ -32,6 +32,8 @@ public final class PovPayloads {
 		PayloadTypeRegistry.serverboundPlay().registerLarge(OperatorTextPayload.TYPE, OperatorTextPayload.CODEC,
 				OperatorTextPayload.MAX_ENCODED_BYTES);
 		PayloadTypeRegistry.clientboundPlay().register(AgentPovBookPayload.TYPE, AgentPovBookPayload.CODEC);
+		PayloadTypeRegistry.serverboundPlay().registerLarge(OperatorCreativeSlotPayload.TYPE, OperatorCreativeSlotPayload.CODEC,
+				OperatorCreativeSlotPayload.MAX_ENCODED_BYTES);
 		registered = true;
 	}
 

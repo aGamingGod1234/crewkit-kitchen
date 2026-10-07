@@ -20,6 +20,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.gui.screens.inventory.BookEditScreen;
 import net.minecraft.client.gui.screens.inventory.BookViewScreen;
+import net.minecraft.client.gui.screens.inventory.CreativeModeInventoryScreen;
 import net.minecraft.client.gui.screens.inventory.InventoryScreen;
 import net.minecraft.client.gui.screens.recipebook.RecipeUpdateListener;
 import net.minecraft.core.component.DataComponents;
@@ -71,6 +72,7 @@ public final class PovScreens {
 		if (registered) return;
 		registered = true;
 		ScreenEvents.AFTER_INIT.register((client, screen, width, height) -> {
+			adoptCreativeInventory(client, screen);
 			if (screen != mirrorScreen) return;
 			// Spectators look but never click or scroll; in a takeover bundle scrolling is relayed to the agent.
 			ScreenMouseEvents.allowMouseClick(screen).register((target, event) -> PovClient.isTakeover());
@@ -223,6 +225,11 @@ public final class PovScreens {
 		return true;
 	}
 
+	/** The container id of the mirrored screen on display, or {@code fallback} when none is showing. */
+	public static int mirrorContainerId(int fallback) {
+		return mirrorScreen != null && Minecraft.getInstance().screen == mirrorScreen ? mirrorContainerId : fallback;
+	}
+
 	/** The inventory the recipe book counts: the agent's items while a mirrored screen is open. */
 	public static Inventory recipeInventory(Inventory fallback) {
 		if (mirrorScreen == null || Minecraft.getInstance().screen != mirrorScreen) return fallback;
@@ -323,6 +330,20 @@ public final class PovScreens {
 		mirrorMenu = menu;
 		mirrorContainerId = containerId;
 		mirrorType = type;
+	}
+
+	/**
+	 * The mirrored inventory of a creative agent turns into vanilla's creative screen (InventoryScreen.init asks the
+	 * local player, which answers for the agent in a takeover). That screen only works on LocalPlayer.inventoryMenu,
+	 * so it becomes the mirror: the agent's inventory is shown there, its slot changes go to the agent as creative
+	 * slot packets, and closing it makes the server resend the operator's real inventory.
+	 */
+	private static void adoptCreativeInventory(Minecraft client, Screen screen) {
+		if (!(screen instanceof CreativeModeInventoryScreen) || screen == mirrorScreen || client.player == null) return;
+		if (!PovClient.isTakeover() || session == null) return;
+		setMirror(screen, client.player.inventoryMenu, INVENTORY_CONTAINER_ID, null);
+		AgentPovMenuPayload contents = lastMenu;
+		if (contents != null && contents.containerId() == INVENTORY_CONTAINER_ID) PovContainerScreens.fill(mirrorMenu, contents);
 	}
 
 	/** Forget a mirror that something else (a vanilla screen, a server close packet) already replaced. */
