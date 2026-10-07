@@ -1,5 +1,6 @@
 # Classes targeted by POV mixins; one fully qualified name per line.
 carpet.helpers.EntityPlayerActionPack
+carpet.patches.EntityPlayerMPFake
 com.mojang.brigadier.tree.CommandNode
 net.minecraft.client.Camera
 net.minecraft.client.Minecraft
