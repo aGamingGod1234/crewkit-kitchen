@@ -47,6 +47,7 @@ export const COORDINATOR_TO_SERVER_TYPES = Object.freeze([
 	'goal_completed',
 	'director_script_result',
 	'goal_spec_proposal',
+	'task_request',
 	'conversation_wake_ack',
 	'request_observation',
 	'inspection_request',
@@ -80,6 +81,7 @@ export const SERVER_TO_COORDINATOR_TYPES = Object.freeze([
 	'director_script_request',
 	'goal_spec_request',
 	'goal_spec_result',
+	'task_request_result',
 	'verbose_control',
 	'task_view_request',
 	'heartbeat',
@@ -336,6 +338,29 @@ function normalizeProtocolV2Payload(type, value) {
 				requestId: requireIdentifier(value.requestId, 'requestId'),
 				status,
 				reasonCode: requireIdentifier(value.reasonCode, 'reasonCode'),
+			};
+		}
+		case 'task_request':
+			// The model chose to adopt a player's conversational request; Minecraft decides whether it may start.
+			exactKeys(value, ['requestId', 'goalRevision', 'requesterId', 'request', 'resume'], ['requestId', 'goalRevision', 'requesterId', 'request', 'resume'], type);
+			if (typeof value.requesterId !== 'string' || !UUID_PATTERN.test(value.requesterId)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'task_request.requesterId must be a player UUID');
+			return {
+				requestId: requireIdentifier(value.requestId, 'requestId'),
+				goalRevision: revision(value.goalRevision, 'goalRevision'),
+				requesterId: value.requesterId,
+				request: boundedText(value.request, 'request', 512),
+				resume: boolean(value.resume, 'resume'),
+			};
+		case 'task_request_result': {
+			exactKeys(value, ['requestId', 'status', 'reasonCode', 'message', 'goalRevision'], ['requestId', 'status', 'reasonCode', 'message', 'goalRevision'], type);
+			const status = requireIdentifier(value.status, 'status');
+			if (!['accepted', 'rejected'].includes(status)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'task_request_result status must be accepted or rejected');
+			return {
+				requestId: requireIdentifier(value.requestId, 'requestId'),
+				status,
+				reasonCode: boundedText(value.reasonCode, 'reasonCode', MAX_REASON_CODE_LENGTH),
+				message: boundedText(value.message, 'message', MAX_RESULT_MESSAGE_LENGTH),
+				goalRevision: revision(value.goalRevision, 'goalRevision'),
 			};
 		}
 		case 'conversation_wake_ack':

@@ -662,6 +662,36 @@ public final class CodexAgentManager {
 		);
 	}
 
+	/**
+	 * Applies a model's takeTask call through the normal goal lifecycle, crediting the player who
+	 * asked. A request the compiler understands keeps its checkable completion; any other request
+	 * becomes an open task the requester confirms, so the model's own words never need a translation
+	 * round trip before the agent can act.
+	 */
+	public AgentTransition adoptModelTask(AgentId agentId, long expectedGoalRevision, UUID requesterId, String request, boolean resume) {
+		AgentRecord record = savedData.registry().require(Objects.requireNonNull(agentId, "agentId must not be null"));
+		if (record.goalRevision() != expectedGoalRevision) {
+			throw new AgentDomainException("STALE_REVISION", "My task changed before this request arrived; check again.");
+		}
+		ServerPlayer requester = server.getPlayerList().getPlayer(Objects.requireNonNull(requesterId, "requesterId must not be null"));
+		if (requester == null) {
+			throw new AgentDomainException("REQUESTER_OFFLINE", "The player who asked is no longer online.");
+		}
+		var operation = dev.agaminggod.arenaagents.server.conversation.ModelTaskAdoption.operation(
+				record.state(), resume, GoalControl.mayControl(requester.createCommandSourceStack()),
+				AgentControlReservations.isReserved(server, agentId));
+		SkitModeRuntime.requireNormalControlAllowed(server, agentId);
+		long now = System.currentTimeMillis();
+		if (operation == dev.agaminggod.arenaagents.server.conversation.ModelTaskAdoption.Operation.RESUME) {
+			return savedData.registry().resume(agentId, now);
+		}
+		GoalCompilation compilation = compileGoalResult(request, requester.level());
+		GoalSpec spec = compilation.acceptedSpec().orElseGet(() -> dev.agaminggod.arenaagents.agent.AgentGoal.create(request, now).spec());
+		return operation == dev.agaminggod.arenaagents.server.conversation.ModelTaskAdoption.Operation.REPLACE
+				? savedData.registry().replace(agentId, spec, now)
+				: savedData.registry().start(agentId, spec, now);
+	}
+
 	private PendingGoalDraft translatedSubmissionDraft(
 			AgentRecord record,
 			String prompt,

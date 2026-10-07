@@ -141,7 +141,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			"AI agent coordinator is offline; check logs/arena-agents-coordinator-error.log for the startup cause";
 	private static final Logger LOGGER = LoggerFactory.getLogger(MultiplexedServerBridge.class);
 	private static final Set<String> INBOUND_TYPES = Set.of(
-			"auth_challenge", "hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "conversation_wake_ack", "goal_spec_proposal", "director_script_result", "request_observation", "inspection_request", "action_command", "action_cancel", "action_result_ack", "agent_error", "agent_notice", "verbose_event", "task_view", "heartbeat"
+			"auth_challenge", "hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "conversation_wake_ack", "goal_spec_proposal", "task_request", "director_script_result", "request_observation", "inspection_request", "action_command", "action_cancel", "action_result_ack", "agent_error", "agent_notice", "verbose_event", "task_view", "heartbeat"
 	);
 
 	private final CodexAgentManager manager;
@@ -969,7 +969,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			// an action_cancel can never overtake its preceding action_command.
 			case "agent_ready", "planning_state", "goal_completed", "action_command", "action_cancel",
 					"action_result_ack" -> BoundedServerTaskQueue.Lane.URGENT;
-			case "coordinator_status", "conversation_wake_ack", "goal_spec_proposal",
+			case "coordinator_status", "conversation_wake_ack", "goal_spec_proposal", "task_request",
 					"request_observation", "agent_notice", "heartbeat" -> BoundedServerTaskQueue.Lane.CONTROL;
 			case "inspection_request" -> BoundedServerTaskQueue.Lane.INSPECTION;
 			default -> BoundedServerTaskQueue.Lane.BULK;
@@ -1149,6 +1149,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			case "goal_completed" -> acceptGoalCompleted(envelope);
 			case "conversation_wake_ack" -> acceptConversationWakeAck(envelope);
 			case "goal_spec_proposal" -> acceptGoalSpecProposal(envelope);
+			case "task_request" -> acceptTaskRequest(envelope);
             case "director_script_result" -> dev.agaminggod.arenaagents.server.DirectorScriptGeneration.accept(manager.server(), envelope.payload());
 			case "request_observation" -> acceptObservationRequest(envelope);
 			case "inspection_request" -> acceptInspectionRequest(envelope);
@@ -1261,6 +1262,52 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			String code = exception instanceof AgentDomainException domain ? domain.code() : ((BridgeProtocolException) exception).code();
 			sendGoalSpecResult(agentId, requestIdValue, "rejected", code);
 		}
+	}
+
+	/**
+	 * The model chose takeTask for a player's request. Minecraft applies its normal start, resume or
+	 * replace transition (publishing goal_control first) or explains the refusal; every outcome is
+	 * answered so the model can tell the player.
+	 */
+	private void acceptTaskRequest(BridgeEnvelope envelope) {
+		AgentId agentId = AgentId.parse(envelope.agentId());
+		JsonObject payload = envelope.payload();
+		requireKeys(payload, Set.of("requestId", "goalRevision", "requesterId", "request", "resume"), "task_request");
+		String requestId = requiredString(payload, "requestId", 128);
+		long goalRevision = requiredLong(payload, "goalRevision");
+		try {
+			UUID requesterId = parseTaskRequester(requiredString(payload, "requesterId"));
+			// The coordinator bounds 512 code points; allow their UTF-16 width here.
+			String request = requiredString(payload, "request", 1024).strip();
+			if (request.isEmpty()) throw new AgentDomainException("TASK_REQUEST_EMPTY", "The task request was empty.");
+			JsonElement resume = payload.get("resume");
+			if (resume == null || !resume.isJsonPrimitive() || !resume.getAsJsonPrimitive().isBoolean()) {
+				throw new BridgeProtocolException("INVALID_FIELD", "task_request.resume must be a boolean");
+			}
+			AgentTransition transition = manager.adoptModelTask(agentId, goalRevision, requesterId, request, resume.getAsBoolean());
+			sendTaskRequestResult(agentId, requestId, "accepted", "TASK_STARTED", "Started the task.", transition.after().goalRevision());
+		} catch (AgentDomainException exception) {
+			sendTaskRequestResult(agentId, requestId, "rejected", exception.code(), boundedRejectionMessage(exception.getMessage()),
+					manager.registry().require(agentId).goalRevision());
+		}
+	}
+
+	private static UUID parseTaskRequester(String value) {
+		try {
+			return UUID.fromString(value);
+		} catch (IllegalArgumentException exception) {
+			throw new AgentDomainException("INVALID_REQUESTER", "Only a player can ask for a task.");
+		}
+	}
+
+	private void sendTaskRequestResult(AgentId agentId, String requestId, String status, String reasonCode, String message, long goalRevision) {
+		JsonObject result = new JsonObject();
+		result.addProperty("requestId", requestId);
+		result.addProperty("status", status);
+		result.addProperty("reasonCode", reasonCode);
+		result.addProperty("message", message);
+		result.addProperty("goalRevision", goalRevision);
+		send("task_request_result", agentId.toString(), result);
 	}
 
 	static String goalSpecSummary(JsonObject payload) {

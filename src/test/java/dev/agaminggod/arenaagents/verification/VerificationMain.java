@@ -158,6 +158,7 @@ public final class VerificationMain {
 		dev.agaminggod.arenaagents.server.voice.VoiceProfileVerification.main(new String[0]);
 		passedAssertions += GoalInventoryCapacityVerification.verify();
 		passedAssertions += AgentConversationRouterVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.conversation.ModelTaskAdoptionVerification.verify();
 		passedAssertions += NativeAgentWhisperTargetsVerification.verify();
 		passedAssertions += AgentGroupRegistryVerification.verify();
 		passedAssertions += AgentModelArgumentVerification.verify();

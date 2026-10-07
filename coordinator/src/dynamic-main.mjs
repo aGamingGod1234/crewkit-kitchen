@@ -1,6 +1,6 @@
 import { generateDirectorScript } from './director-script-generator.mjs';
 import { EventEmitter } from 'node:events';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -146,6 +146,10 @@ export class DynamicCoordinator extends EventEmitter {
 	#nativeObservationSignatures = new Map();
 	#nativeWorldSignals = new Map();
 	#nativeConfirmationWaits = new Map();
+	// takeTask round trips awaiting Minecraft's task_request_result, keyed by requestId.
+	#taskRequests = new Map();
+	// Latest player messages per agent, so takeTask can name who asked and default to their words.
+	#recentPlayerRequests = new Map();
 	#supervisedObservationRequests = new Map();
 	#conversationWakeTransactions = new Map();
 	#directorRequests = new Set();
@@ -527,6 +531,8 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#nativeConfirmationWaits.clear();
 		this.#supervisedObservationRequests.clear();
 		this.#conversationWakeTransactions.clear();
+		this.#settleTaskRequests(undefined, 'COORDINATOR_STOPPING', 'The coordinator is stopping.');
+		this.#recentPlayerRequests.clear();
 		this.#cancelGoalSpecRequests();
 		if (this.#traceWriter !== null && typeof this.#traceWriter.close === 'function') await this.#traceWriter.close();
 		if (this.#providerTurnRecorder !== null) await Promise.resolve(this.#providerTurnRecorder.close()).catch(() => {});
@@ -634,6 +640,8 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#nativeWorldSignals.delete(message.agentId);
 			this.#nativeConfirmationWaits.delete(message.agentId);
 			this.#supervisedObservationRequests.delete(message.agentId);
+			this.#settleTaskRequests(message.agentId, 'AGENT_REMOVED', 'This agent was removed.');
+			this.#recentPlayerRequests.delete(message.agentId);
 			this.#forgetConversationWakes(message.agentId);
 			this.#cancelGoalSpecRequests(message.agentId);
 			this.#supportedAgentIds.delete(message.agentId);
@@ -1061,6 +1069,13 @@ export class DynamicCoordinator extends EventEmitter {
 				}
 			}, { connectionEpoch, terminal: true });
 		});
+		this.#listen('task_request_result', (message) => {
+			// Settled directly: the agent queue may be busy applying the goal_control this result follows.
+			const pending = this.#taskRequests.get(message.payload.requestId);
+			if (pending === undefined || pending.agentId !== message.agentId) return;
+			this.#taskRequests.delete(message.payload.requestId);
+			pending.resolve(message.payload);
+		});
 		this.#listen('goal_completion_result', (message, connectionEpoch) => {
 			return this.#enqueueAgent(message.agentId, async () => {
 				const current = this.#registry.get(message.agentId);
@@ -1081,6 +1096,7 @@ export class DynamicCoordinator extends EventEmitter {
             for(const requestId of this.#directorRequests) this.#scheduler.cancel(`director-${requestId}`, 'Director connection closed');
 			this.#setVerboseEnabled(false);
 			this.#cancelGoalSpecRequests();
+			this.#settleTaskRequests(undefined, 'BRIDGE_DISCONNECTED', 'Lost the connection to Minecraft before it answered.');
 			for (const record of this.#registry.list()) {
 				const work = this.#providerWork.get(record.agentId);
 				if (work?.kind === 'native') {
@@ -1776,12 +1792,15 @@ export class DynamicCoordinator extends EventEmitter {
 				|| !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) {
 			return { state: 'CANCELLED', reasonCode: 'STALE_PLAN', executed: false,
 				goalRevision: work.goalRevision, currentGoalRevision: record?.goalRevision ?? null,
-				message: 'This goal turn has ended or been superseded. No action was dispatched. End this turn and await the next goal event.' };
+				message: work.taskAdopted === true
+					? 'Your task was accepted. Nothing was dispatched from this turn: end it now and the task turn starts with every tool.'
+					: 'This goal turn has ended or been superseded. No action was dispatched. End this turn and await the next goal event.' };
 		}
+		if (toolRequest.tool.kind === 'take_task') return this.#takeTask(work, record, toolRequest.tool);
 		if (work.request.conversationOnly === true
 				&& toolRequest.tool.kind !== 'observe'
 				&& !(toolRequest.tool.kind === 'action' && toolRequest.tool.actionType === 'chat')) {
-			throw Object.assign(new Error('Idle conversation turns may only observe and reply with chat'), { code: 'CONVERSATION_ONLY' });
+			throw Object.assign(new Error('You have no active task yet. If the player asked you to do something, call takeTask first, then act; otherwise reply with say.'), { code: 'CONVERSATION_ONLY' });
 		}
 		const executesBody = toolRequest.tool.kind === 'action'
 			|| toolRequest.tool.kind === 'sequence'
@@ -1842,6 +1861,58 @@ export class DynamicCoordinator extends EventEmitter {
 				&& this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) {
 				this.#registry.setState(latest.agentId, DynamicAgentState.PLANNING, { goalRevision: latest.goalRevision });
 			}
+		}
+	}
+
+	#rememberPlayerRequest(agentId, event) {
+		if (!['player_message', 'proximity_speech'].includes(event?.kind) || !UUID_TEXT.test(event.sourceId ?? '')) return;
+		const sourceId = event.sourceId.toLowerCase();
+		const recent = (this.#recentPlayerRequests.get(agentId) ?? []).filter((entry) => entry.sourceId !== sourceId);
+		recent.push({ sourceId, text: event.text });
+		this.#recentPlayerRequests.set(agentId, recent.slice(-MAX_RECENT_PLAYER_REQUESTS));
+	}
+
+	/**
+	 * The model chose to adopt a player's request. Minecraft owns the decision: it starts,
+	 * resumes or replaces the goal through its normal lifecycle (goal_control follows), or
+	 * refuses with a reason the model can relay. Nothing here starts work on its own.
+	 */
+	async #takeTask(work, record, tool) {
+		const recent = this.#recentPlayerRequests.get(work.agentId) ?? [];
+		const asked = tool.requesterId === undefined ? recent.at(-1) : recent.find((entry) => entry.sourceId === tool.requesterId);
+		if (asked === undefined) {
+			return { state: 'REJECTED', reasonCode: tool.requesterId === undefined ? 'NO_PLAYER_REQUEST' : 'UNKNOWN_REQUESTER', executed: false,
+				message: tool.requesterId === undefined
+					? 'No player has asked you for anything yet. Only adopt a task a player requested.'
+					: 'That player has not messaged you recently; use the sourceId of the player who asked.' };
+		}
+		const requestId = randomUUID();
+		const outcome = new Promise((resolve) => this.#taskRequests.set(requestId, { agentId: work.agentId, resolve }));
+		try {
+			await this.#sendForEpoch(work.connectionEpoch, 'task_request', work.agentId, {
+				requestId, goalRevision: work.goalRevision, requesterId: asked.sourceId,
+				request: tool.request ?? asked.text, resume: tool.resume === true,
+			});
+		} catch (error) {
+			this.#taskRequests.delete(requestId);
+			throw error;
+		}
+		const result = await outcome;
+		this.#writeTrace('native_task_request', { agentId: work.agentId, goalRevision: work.goalRevision, status: result.status, reasonCode: result.reasonCode });
+		if (result.status !== 'accepted') {
+			return { state: 'REJECTED', reasonCode: result.reasonCode, executed: false,
+				message: `${result.message} Tell the player with say.` };
+		}
+		work.taskAdopted = true;
+		return { state: 'SUCCEEDED', reasonCode: result.reasonCode, goalRevision: result.goalRevision, requesterId: asked.sourceId,
+			message: 'Minecraft accepted this as your task. End this turn now: your task turn starts immediately with every tool.' };
+	}
+
+	#settleTaskRequests(agentId, reasonCode, message) {
+		for (const [requestId, pending] of this.#taskRequests) {
+			if (agentId !== undefined && pending.agentId !== agentId) continue;
+			this.#taskRequests.delete(requestId);
+			pending.resolve({ requestId, status: 'rejected', reasonCode, message, goalRevision: 0 });
 		}
 	}
 
@@ -2930,6 +3001,8 @@ export class DynamicCoordinator extends EventEmitter {
 
 	#invalidateServerInstance(connectionEpoch) {
 		this.#cancelGoalSpecRequests();
+		this.#settleTaskRequests(undefined, 'BRIDGE_DISCONNECTED', 'Minecraft restarted before answering.');
+		this.#recentPlayerRequests.clear();
 		this.#healthRegistry.reset();
 		this.#factLedgers.clear();
 		this.#conversationMemories.clear();
@@ -3091,6 +3164,7 @@ export class DynamicCoordinator extends EventEmitter {
 			? await this.#pendingConversationInbox(agentId).needsDelivery(event.sequence) : false;
 		if (!this.#isConnectionEpochCurrent(connectionEpoch)) throw Object.assign(new Error('Conversation admission belongs to an obsolete connection'), { code: 'STALE_PLAN' });
 		if (this.#usesNativeTools(record) && !ingested) return retryPending;
+		this.#rememberPlayerRequest(agentId, event);
 		const historyIngested = this.#conversationMemory(agentId).ingest(event);
 		return this.#usesNativeTools(record) ? ingested : historyIngested;
 	}
@@ -4696,7 +4770,9 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 	// A program paused by damage or a threat must not cost a respondProgram/programStatus detour first:
 	// fight_target and flee_from run directly while it is paused (native-tool-runtime keeps its decision).
 	const dangerPaused = !isPlanningDue && status?.engineState === 'SUSPENDED' && DANGER_PAUSE_TRIGGERS.has(status?.decision?.trigger);
-	const instruction = isPlanningDue
+	const instruction = conversationOnly === true
+		? 'Player conversation. You have no active task. If a message asks you to do something, call takeTask (it defaults to their words), then end this turn; your task turn starts at once with every tool. Otherwise reply with say.'
+		: isPlanningDue
 		? 'Live Minecraft event. Program planning is due soon: prepare the next intention while the current authorised routine keeps running. This is advisory and does not require a pending decisionId; use the current programVersion and timing context, and do not blindly renew or cancel the current program.'
 		: dangerPaused
 			? 'Live Minecraft event. Program paused for danger: call fight_target or flee_from now; respond to the program later.'
@@ -4705,6 +4781,8 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 }
 
 const DANGER_PAUSE_TRIGGERS = new Set(['damage', 'threat']);
+const UUID_TEXT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const MAX_RECENT_PLAYER_REQUESTS = 8;
 const MINIMAL_TASK_MEMORY_BYTES = 2_048;
 const MINIMAL_RECEIPTS = 2;
 const MINIMAL_OBSERVATION_FIELDS = new Set(['observedAtEpochMs', 'eventSequence', 'freshness', 'ready', 'status', 'player', 'inventory', 'currentAction', 'lastResult', 'death', 'recovery', 'failureClass', 'continuity', 'resultCoverage']);

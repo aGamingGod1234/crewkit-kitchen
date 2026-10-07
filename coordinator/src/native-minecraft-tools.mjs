@@ -49,13 +49,13 @@ export function minecraftCapabilities({ section = 'all', topic, offset } = {}) {
 
 export const NATIVE_AGENT_INSTRUCTIONS = `You control one live Minecraft player and choose every action.
 
-Read taskPlan at task start; replace it at meaningful revisions. Stable IDs retain history. You own the plan.
+Read taskPlan at task start; replace it at meaningful revisions; keep stable IDs. You own the plan.
 
-Keep provider/model/effort/tier; death does not change the active goal. Batch known independent reads and reuse fresh result facts. Use sequence for safe linear chains; use ArenaScript for conditional/repeated work with bounded background:true. finish verifies goalSpec. queueProgram requires a fresh precondition; only natural exhaustion starts it. expectedDurationMs never extends timeout. Use startAction to reason while one chosen action runs; settle exact handles and program decisions.
+Keep provider/model/effort/tier; death does not change the active goal. Batch known independent reads and reuse fresh result facts. Use sequence for safe linear chains; use ArenaScript for conditional/repeated work with bounded background:true. finish verifies goalSpec. queueProgram needs a fresh precondition and natural exhaustion. expectedDurationMs never extends timeout. Use startAction to reason while one chosen action runs; settle exact handles and program decisions.
 
-Survival is part of the goal. Threat attention (player.threat) precedes damage: act fight_target/flee_from, not moveTo; creepers flee; low health flee, eat. Guard mining with a threat watch (after:"reconsider"). A danger-paused program still lets you act; respond later. taskMemory keeps deaths, routes, progress, lessons.
+Survival is part of the goal. Threat attention (player.threat) precedes damage: act fight_target/flee_from, not moveTo; creepers flee; low health flee, eat. Guard mining with a threat watch (after:"reconsider"). A danger-paused program lets you act; respond later. taskMemory keeps deaths, routes, progress, lessons.
 
-Use capabilities/focused inspections; omitted or unobserved facts are unknown. queryMemory paginates nextOffset; reuse exact noteKey with fresh prerequisites/current targets and program.parameters(). Notes are hypotheses; receipts historical. Keep metadata separate; noteKey executes the entire note as source. exploreFrontier returns candidates; choose moveTo. Mine exact observed blockId. Claim effects from evidence. conversation_only uses say; plain text is invisible; speech playback is asynchronous.`;
+Use capabilities/focused inspections; omitted or unobserved facts are unknown. queryMemory paginates nextOffset; reuse exact noteKey with fresh prerequisites/current targets and program.parameters(). Notes are hypotheses; receipts historical. Keep metadata separate; noteKey executes the entire note as source. exploreFrontier returns candidates; choose moveTo. Mine exact observed blockId. Claim effects from evidence. No active task: requests mean takeTask, then act; else say. Plain text is invisible; speech playback is asynchronous.`;
 
 export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 	tool('taskMemory', 'Remember places, connected routes, task progress and lessons across deaths. Death sites, outbound trails and workstations are recorded automatically. Entries are model-authored historical notes, never current world truth. shared:true explicitly shares an entry with agents in this world and dimension. Query route waypoints and earlier deaths with pagination; reobserve before recovery. Routes use from/to place keys and 2..64 waypoints. Choose recovery or rebuilding yourself.', objectSchema({
@@ -154,6 +154,11 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 		finish: objectSchema({ summary: { type: 'string', minLength: 1, maxLength: 512 } }, ['summary']),
 	}, ['actions'])),
 	tool('taskPlan', 'Read or replace your advisory dependency plan. This does not change the immutable goal or issue game actions. Inventory/world completion is reconciled with fresh game evidence; milestones/manual completion is agent reported. For replace include the complete plan, stable IDs and dependency references. Use read at task start and replace at meaningful revisions.', objectSchema({ operation: { type: 'string', enum: ['read', 'replace'] }, plan: TASK_PLAN_SCHEMA }, ['operation'])),
+	tool('takeTask', 'Adopt what a player asked for as your task when they ask you to do something. Minecraft starts it (resume:true continues a paused task); replacing an active task needs an operator. request defaults to their latest words; rewrite it as the concrete task if that is clearer. On success end this turn: your task turn starts at once with every tool. On refusal tell the player why with say.', objectSchema({
+		request: { type: 'string', minLength: 1, maxLength: 512 },
+		resume: { type: 'boolean' },
+		requesterId: { type: 'string', minLength: 36, maxLength: 36, pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' },
+	})),
 	tool('finish', 'Ask Minecraft to verify the immutable active goal. Read unmet facts on failure. If AWAITING_OPERATOR_CONFIRMATION, report once with say and end this turn until new input; do not repeat the work or verification.', objectSchema({
 		summary: { type: 'string', minLength: 1, maxLength: 512 },
 	}, ['summary'])),
@@ -383,6 +388,16 @@ function normalizeMinecraftToolArguments(name, value) {
 				kind: 'sequence',
 				actions: args.actions.map(normalizeSequenceAction),
 				...(finish === undefined ? {} : { finish: { summary: finish.summary } }),
+			};
+		}
+		case 'takeTask': {
+			requireExactKeys(args, ['request', 'resume', 'requesterId']);
+			if (args.requesterId !== undefined && (typeof args.requesterId !== 'string' || !/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(args.requesterId))) invalid('requesterId must be a player UUID');
+			return {
+				kind: 'take_task',
+				...(args.request === undefined ? {} : { request: boundedText(args.request, 'request', 512) }),
+				resume: optionalBoolean(args.resume, false, 'resume'),
+				...(args.requesterId === undefined ? {} : { requesterId: args.requesterId.toLowerCase() }),
 			};
 		}
 		case 'finish':
