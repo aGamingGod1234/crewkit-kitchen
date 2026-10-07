@@ -34,6 +34,7 @@ public final class LocalPathfinderVerification {
 		assertions += verifyThreeDimensionalFrontier();
 		assertions += verifyDetourCanStartAwayFromDestination();
 		assertions += verifySurfaceSwimmingAndBreathingClearance();
+		assertions += verifySubmergedSwimmingIsBoundedByBreath();
 		assertions += verifyClimbingToGroundedExit();
 		return assertions;
 	}
@@ -104,8 +105,59 @@ public final class LocalPathfinderVerification {
 		assertEquals(PathOutcome.FOUND, plan.outcome(), "open surface water can connect supported banks beyond four blocks");
 		assertEquals(8L, plan.nodes().stream().filter(node -> node.traversal() == TraversalType.SWIM).count(), "water transitions are explicit");
 		world.cell(position(4, 65, 0), WalkabilityView.Cell.WATER);
-		assertEquals(PathOutcome.NO_PATH, find(world, position(0, 64, 0), position(9, 64, 0)).outcome(), "surface navigation never silently commits to a submerged passage");
+		PathPlan underArch = find(world, position(0, 64, 0), position(9, 64, 0));
+		assertEquals(PathOutcome.FOUND, underArch.outcome(), "a short submerged stretch is swum like a player instead of refused");
 		return 3;
+	}
+
+	/** Flooded tunnel: water at feet and head, rock above. A player swims it while the breath lasts. */
+	private static TestWorld floodedTunnel(int length) {
+		TestWorld world = new TestWorld().standable(position(0, 64, 0)).standable(position(length + 1, 64, 0));
+		for (int x = 1; x <= length; x++) {
+			world.cell(position(x, 63, 0), WalkabilityView.Cell.SAFE_SUPPORT);
+			world.cell(position(x, 64, 0), WalkabilityView.Cell.WATER);
+			world.cell(position(x, 65, 0), WalkabilityView.Cell.WATER);
+			world.cell(position(x, 66, 0), WalkabilityView.Cell.BLOCKED);
+		}
+		return world;
+	}
+
+	private static int verifySubmergedSwimmingIsBoundedByBreath() {
+		TestWorld tunnel = floodedTunnel(10);
+		PathPlan plan = new LocalPathfinder().findPath(tunnel, position(0, 64, 0), position(11, 64, 0), 4_096, 1_000_000L, () -> 0L);
+		assertEquals(PathOutcome.FOUND, plan.outcome(), "a ten-block flooded tunnel is traversable on one breath");
+		assertEquals(10L, plan.nodes().stream().filter(node -> tunnel.isSubmerged(node.position())).count(),
+				"the route swims through the submerged cells");
+		assertTrue(plan.nodes().stream().filter(node -> tunnel.isSubmerged(node.position()))
+				.allMatch(node -> node.traversal() == TraversalType.SWIM), "submerged cells are explicit swim steps");
+
+		int tooLong = LocalPathfinder.FULL_BREATH_SUBMERGED_NODES + 1;
+		TestWorld longTunnel = floodedTunnel(tooLong);
+		assertEquals(PathOutcome.NO_PATH, new LocalPathfinder().findPath(longTunnel, position(0, 64, 0), position(tooLong + 1, 64, 0),
+				4_096, 1_000_000L, () -> 0L).outcome(), "a flooded passage longer than one breath is not planned as a swim");
+
+		// Already under water with little air: the start's run is bounded by the live breath, not a full one.
+		GridPosition inside = position(5, 64, 0);
+		LocalPathfinder.Search lowAir = new LocalPathfinder().beginSearch(inside, Set.of(position(11, 64, 0)), position(11, 64, 0), 32, Set.of(), 2);
+		assertEquals(PathOutcome.NO_PATH, lowAir.advance(tunnel, new LocalPathfinder.SearchBudget(4_096, 1_000_000L, () -> 0L)).outcome(),
+				"two cells of breath do not cover the five submerged cells to the exit");
+		LocalPathfinder.Search enoughAir = new LocalPathfinder().beginSearch(inside, Set.of(position(11, 64, 0)), position(11, 64, 0), 32, Set.of(), 8);
+		assertEquals(PathOutcome.FOUND, enoughAir.advance(tunnel, new LocalPathfinder.SearchBudget(4_096, 1_000_000L, () -> 0L)).outcome(),
+				"enough breath swims out of the flooded tunnel from inside it");
+
+		// Flooded shaft: dive from a surface pool down to a lit side passage, then walk out.
+		TestWorld shaft = new TestWorld().standable(position(0, 64, 0)).standable(position(2, 58, 0));
+		shaft.cell(position(1, 64, 0), WalkabilityView.Cell.WATER);
+		shaft.cell(position(1, 65, 0), WalkabilityView.Cell.CLEAR);
+		for (int y = 58; y <= 63; y++) shaft.cell(position(1, y, 0), WalkabilityView.Cell.WATER);
+		shaft.cell(position(1, 57, 0), WalkabilityView.Cell.SAFE_SUPPORT);
+		PathPlan dive = new LocalPathfinder().findPath(shaft, position(0, 64, 0), position(2, 58, 0), 4_096, 1_000_000L, () -> 0L);
+		assertEquals(PathOutcome.FOUND, dive.outcome(), "a flooded shaft is swum straight down to the passage below");
+		assertTrue(dive.nodes().stream().anyMatch(node -> node.position().equals(position(1, 59, 0))),
+				"the dive descends through the water column");
+		assertEquals(PathOutcome.FOUND, new LocalPathfinder().findPath(shaft, position(2, 58, 0), position(0, 64, 0),
+				4_096, 1_000_000L, () -> 0L).outcome(), "the same shaft is swum back up to the surface");
+		return 8;
 	}
 
 	private static int verifyClimbingToGroundedExit() {

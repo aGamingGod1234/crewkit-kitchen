@@ -300,7 +300,7 @@ export class NativeToolRuntime {
 		}
 		if (request.tool.kind === 'inspect') return this.#inspect(request.tool, record);
 		if (request.tool.kind === 'capabilities') {
-			if (request.tool.section === 'program' || request.tool.section === 'control') return { ...minecraftCapabilities(request.tool), ...await this.#executionMetadata(record) };
+			if (['program', 'control', 'strategy'].includes(request.tool.section)) return { ...minecraftCapabilities(request.tool), ...await this.#executionMetadata(record) };
 			return { ...minecraftCapabilities(), ...await this.#executionMetadata(record), ...await this.#memorySummary(record), runtime: { freshObservations: this.#requestObservation !== null, focusedInspection: this.#inspectObservation !== null, notebook: this.#notebook !== null || this.#memoryOperation !== null, asynchronousActions: true, cancellation: true, reactivePrograms: { available: true, background: true, engine: 'ArenaScript', modelAuthored: true, plannerCalls: false } } };
 		}
 		if (request.tool.kind === 'action_status') return this.#actionStatus(record, request.tool.actionId);

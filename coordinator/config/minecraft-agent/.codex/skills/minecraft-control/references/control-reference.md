@@ -51,6 +51,8 @@ Choose meaningful observed route legs between corners, landings and branches. Re
 
 Declare `program.onUnhandledAttention(mode, {reassessWhen: () => condition})` before top-level execution to filter routine unhandled attention using a pure condition you author from current facts. Cover the reasons this leg needs your next decision. Only exact false suppresses an ordinary notification; missing, unknown or failing conditions retain notification. Fresh samples, physical collision checks and authored watchers remain active. Urgent attention and existing failure, checkpoint or exhaustion requests bypass this filter. Omitting it keeps normal attention behavior.
 
+Water is traversable terrain, not a hazard: navigateTo swims at the surface and through flooded passages and onto flooded floors while one breath covers the underwater stretch, and rises for air when it does not. Manage air from underWater and airSecondsLeft. Capabilities section strategy, topic water, has swimming and underwater mining details.
+
 Check every movement receipt and stop for a new decision on the first blocked leg. The filter does not turn a single failed action into a model request by itself. After your attention and watcher declarations, use this ArenaScript fragment with the observed leg you chose:
 
 ```javascript

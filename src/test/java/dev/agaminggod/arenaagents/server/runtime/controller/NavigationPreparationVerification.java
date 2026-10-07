@@ -20,7 +20,38 @@ public final class NavigationPreparationVerification {
 		verifyRegionSupport();
 		verifySharedExhaustion();
 		verifyCancellation();
-		return 19 + verifyEndpointConvergence() + verifyFractionalPointSupport() + verifyLocalRevisionScopes();
+		return 19 + verifyEndpointConvergence() + verifyFractionalPointSupport() + verifyLocalRevisionScopes()
+				+ verifySubmergedEndpointsAndBreath();
+	}
+
+	/** Flooded cave: rock floor at y=63, water from y=64 to y=70, open air above. */
+	private static int verifySubmergedEndpointsAndBreath() {
+		WalkabilityView flooded = p -> p.y() <= 63 ? WalkabilityView.Cell.SAFE_SUPPORT
+				: p.y() <= 70 ? WalkabilityView.Cell.WATER : WalkabilityView.Cell.CLEAR;
+		GridPosition floor = new GridPosition(4, 64, 0);
+		check(ServerNavigationController.submergedFloor(flooded, floor)
+				&& ServerNavigationController.goalEndpoint(flooded, floor), "the floor of a flooded cave is a valid arrival");
+		check(!ServerNavigationController.goalEndpoint(flooded, new GridPosition(4, 67, 0)), "open water mid-column is not a standing arrival");
+		Vec3 ore = new Vec3(4.5D, 64.0D, 0.5D);
+		ServerNavigationController.Preparation preparation = new ServerNavigationController.Preparation(
+				new GridPosition(0, 70, 0), ore, 0.5D, null, new Vec3(0.5D, 70.0D, 0.5D));
+		check(preparation.advance(flooded, p -> p.y() - 0D, () -> true), "submerged preparation finishes");
+		check(preparation.start != null && preparation.goals.contains(floor) && !preparation.destinationHasNoSupport,
+				"a navigation into flooded space starts from the water and may end on its floor");
+
+		List<PathNode> route = List.of(new PathNode(new GridPosition(0, 70, 0), TraversalType.START),
+				new PathNode(new GridPosition(1, 69, 0), TraversalType.SWIM), new PathNode(new GridPosition(2, 68, 0), TraversalType.SWIM),
+				new PathNode(new GridPosition(3, 70, 0), TraversalType.SWIM), new PathNode(new GridPosition(4, 64, 0), TraversalType.SWIM));
+		check(ServerNavigationController.submergedNodesAhead(flooded, route, 1) == 2,
+				"the breath check counts only the submerged stretch before the route reaches air");
+		check(SwimPlanning.breathNodes(300) == dev.agaminggod.arenaagents.client.navigation.LocalPathfinder.FULL_BREATH_SUBMERGED_NODES
+				&& SwimPlanning.breathNodes(SwimPlanning.AIR_RESERVE_TICKS) == 0 && SwimPlanning.breathNodes(100) == 4,
+				"breath in route cells keeps the reserve at the conservative swim speed");
+		check(SwimPlanning.breathCovers(300, 24) && !SwimPlanning.breathCovers(100, 5), "a dive is only continued while breath covers it");
+		check(SwimPlanning.navigationJump(true, 0.2D, false) && !SwimPlanning.navigationJump(true, -0.8D, false)
+				&& !SwimPlanning.navigationJump(true, 0.0D, true) && !SwimPlanning.navigationJump(false, 1.0D, false),
+				"jump rises or stays afloat, releases to dive toward a lower waypoint and to settle on a flooded floor");
+		return 8;
 	}
 
 	private static int verifyFractionalPointSupport() {
