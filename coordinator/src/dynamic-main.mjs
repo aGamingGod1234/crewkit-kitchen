@@ -1177,6 +1177,10 @@ export class DynamicCoordinator extends EventEmitter {
 			if (this.#disconnectedAt !== null) this.#disconnectedAt = null;
 			await this.#publishStatus(connectionEpoch);
 			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
+			// The catalogs above only cover providers with saved agents. The bridge treats any
+			// non-empty snapshot as loaded, so publish every provider or the summon menu stays
+			// limited to those providers. Off the readiness path so slow CLIs cannot delay agents.
+			void this.#publishFullCatalog(connectionEpoch);
 			this.emit('reconciled', result);
 			return result;
 		});
@@ -2691,6 +2695,14 @@ export class DynamicCoordinator extends EventEmitter {
 		const current = this.#registry.get(agentId);
 		if (current === null || current.goalRevision !== goalRevision || message.length === 0 || message.length > MAX_VERBOSE_MESSAGE_LENGTH) return;
 		Promise.resolve(this.#sendForEpoch(connectionEpoch, 'verbose_event', agentId, { goalRevision, stage, message })).catch(() => {});
+	}
+
+	async #publishFullCatalog(connectionEpoch) {
+		try {
+			const catalog = await this.#codexService.catalog.refresh();
+			if (!this.#isConnectionEpochCurrent(connectionEpoch) || catalog.models.length === 0) return;
+			await this.#publishCatalog(catalog, connectionEpoch);
+		} catch { /* the bridge keeps its current catalog and still retries discovery when empty */ }
 	}
 
 	async #publishCatalog(snapshot, connectionEpoch = this.#connectionEpoch) {
