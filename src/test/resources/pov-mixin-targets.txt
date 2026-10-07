@@ -16,6 +16,7 @@ net.minecraft.client.player.KeyboardInput
 net.minecraft.client.player.LocalPlayer
 net.minecraft.client.renderer.GameRenderer
 net.minecraft.client.renderer.ItemInHandRenderer
+net.minecraft.client.renderer.ScreenEffectRenderer
 net.minecraft.server.level.ChunkMap
 net.minecraft.server.level.ChunkMap$TrackedEntity
 net.minecraft.server.level.ServerLevel

@@ -133,6 +133,7 @@ public final class CodexAgentServerRuntime {
 			if (!(entity instanceof net.minecraft.server.level.ServerPlayer player)) return true;
 			return AgentDeathCapture.allowVanillaDeath(
 					ScenarioRuntimeService.recoverParkourDeath(player),
+					AgentDeathCapture.totemWillSave(player, source),
 					() -> CodexAgentManager.get(player.level().getServer()).captureDeath(player, source)
 			);
 		});

@@ -55,6 +55,11 @@ public final class AgentDeathCaptureVerification {
 				"unhandled lethal damage continues through the vanilla death screen");
 		assertions++;
 		assertEquals(1, recorded.get(), "vanilla death is recorded exactly once before the player disconnects");
+		assertions++;
+		assertEquals(true, AgentDeathCapture.allowVanillaDeath(false, true, recorded::incrementAndGet),
+				"a totem save lets vanilla pop the totem");
+		assertions++;
+		assertEquals(1, recorded.get(), "a totem save is never recorded as a death, so the agent is not respawned");
 		return assertions + 1;
 	}
 
