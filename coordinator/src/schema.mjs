@@ -105,6 +105,7 @@ export function validateAction(value) {
 			requireTargetId(action.targetId, 'action.targetId');
 			if (action.desiredRange !== undefined) requireFiniteRange(action.desiredRange, 'action.desiredRange', 1, 6);
 			if (action.fleeAtHealth !== undefined) requireFiniteRange(action.fleeAtHealth, 'action.fleeAtHealth', 0, 2048);
+			if (action.continueWithAttackers !== undefined) requireBoolean(action.continueWithAttackers, 'action.continueWithAttackers');
 			requireDuration(action.timeoutMs, 'action.timeoutMs');
 			break;
 		case 'flee_from':

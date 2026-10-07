@@ -51,7 +51,7 @@ export const ACTION_FIELDS = Object.freeze({
 	control_sequence: Object.freeze(['frames', 'maxTicks']),
 	look_at: Object.freeze(['x', 'y', 'z']),
 	attack: Object.freeze(['targetId', 'timeoutMs']),
-	fight_target: Object.freeze(['targetId', 'desiredRange', 'fleeAtHealth', 'timeoutMs']),
+	fight_target: Object.freeze(['targetId', 'desiredRange', 'fleeAtHealth', 'continueWithAttackers', 'timeoutMs']),
 	flee_from: Object.freeze(['targetId', 'distance', 'timeoutMs']),
 	select_item: Object.freeze(['itemId']),
 	use_item: Object.freeze(['durationMs', 'hand', 'expectedItemId', 'mode']),
@@ -89,7 +89,7 @@ export const ACTION_FIELDS = Object.freeze({
 });
 
 export const OPTIONAL_ACTION_FIELDS = Object.freeze({
-	fight_target: Object.freeze(['desiredRange', 'fleeAtHealth']),
+	fight_target: Object.freeze(['desiredRange', 'fleeAtHealth', 'continueWithAttackers']),
 	place_block: Object.freeze(['desiredState']),
 	chat: Object.freeze(['audience', 'recipientId']),
 	use_item: Object.freeze(['hand', 'expectedItemId', 'mode']),

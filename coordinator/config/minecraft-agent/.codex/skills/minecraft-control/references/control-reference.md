@@ -421,7 +421,7 @@ Fields: `targetId`, `timeoutMs`.
 
 ### fight_target
 
-Fields: `targetId`, `timeoutMs`, optional `desiredRange` (1..6, default 2.5) and `fleeAtHealth`. You chose to fight: the body selects the best hotbar weapon (sword > axe > other tool), turns, closes to reach, swings only at a full attack charge and steps back after each hit. Results: `TARGET_KILLED`, `TARGET_GONE`, `LOW_HEALTH_BAILOUT` (your fleeAtHealth reached; decide next), `TARGET_UNREACHABLE`, `TARGET_ESCAPED`, or `FIGHT_TIMED_OUT`. The target may be a `player.threat` uuid behind you.
+Fields: `targetId`, `timeoutMs`, optional `desiredRange` (1..6, default 2.5), `fleeAtHealth` and `continueWithAttackers` (default true). You chose to fight: the body selects the best hotbar weapon (sword > axe > other tool), turns, closes to reach, swings only at a full attack charge and steps back after each hit. When the target dies it continues to the nearest mob already attacking you (never a creeper, never one that is not attacking) until none remain; pass `continueWithAttackers:false` to stop after the named target. Results: `TARGET_KILLED`, `TARGET_GONE`, `LOW_HEALTH_BAILOUT` (your fleeAtHealth reached; decide next), `TARGET_UNREACHABLE`, `TARGET_ESCAPED`, or `FIGHT_TIMED_OUT`; each message lists all kills and any remaining threats (uuid, distance, swelling creepers). The target may be a `player.threat` uuid behind you.
 
 ```json executor-call
 {"tool":"act","arguments":{"actionType":"fight_target","arguments":{"targetId":"550e8400-e29b-41d4-a716-446655440000","timeoutMs":15000,"fleeAtHealth":6}}}
@@ -429,7 +429,7 @@ Fields: `targetId`, `timeoutMs`, optional `desiredRange` (1..6, default 2.5) and
 
 ### flee_from
 
-Fields: `targetId`, `distance` (1..64), `timeoutMs`. Sprints away (jumping steps, steering around walls, hazards and deep drops) until at least `distance` away and the target is not closing (`ESCAPED`), it lost you (`TARGET_LOST`), it is gone (`TARGET_GONE`), or `FLEE_TIMED_OUT`. Use this, not navigation, to escape; navigation stops at its point while the mob keeps chasing.
+Fields: `targetId`, `distance` (1..64), `timeoutMs`. Sprints away from the target and every other hostile threat within 16 blocks (nearer ones and creepers, especially swelling ones, push hardest), jumping steps and steering around walls, hazards and deep drops, until at least `distance` away and the target is not closing (`ESCAPED`), it lost you (`TARGET_LOST`), it is gone (`TARGET_GONE`), or `FLEE_TIMED_OUT`. It never ends while another threat inside `distance` is still closing in or any creeper is within 7 blocks. Use this, not navigation, to escape; navigation stops at its point while the mob keeps chasing.
 
 ```json executor-call
 {"tool":"act","arguments":{"actionType":"flee_from","arguments":{"targetId":"550e8400-e29b-41d4-a716-446655440000","distance":12,"timeoutMs":8000}}}
