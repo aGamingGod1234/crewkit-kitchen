@@ -149,7 +149,7 @@ test('planner tells agents to collect observed drops and never pause for routine
 	assert.match(PLANNER_SYSTEM_PROMPT, /ArenaScript can't call it/);
 	assert.match(PLANNER_SYSTEM_PROMPT, /inspect owns entityType\/recipe filters/);
 	assert.match(PLANNER_SYSTEM_PROMPT, /noteKey executes the whole note as source/);
-	assert.match(PLANNER_SYSTEM_PROMPT, /player\.state\(\)\.velocity and world\.state\(\)\.landmarks/);
+	assert.match(PLANNER_SYSTEM_PROMPT, /player\.state\(\)\.velocity\/\.heard\/\.heardLava and world\.state\(\)\.landmarks/);
 	assert.match(PLANNER_SYSTEM_PROMPT, /observationIntervalMs:100\.\.5000/);
 	assert.match(PLANNER_SYSTEM_PROMPT, /Batch independent inspections; reuse fresh facts and safe sequences/);
 	assert.match(PLANNER_SYSTEM_PROMPT, /program\.parameters\(\)/);

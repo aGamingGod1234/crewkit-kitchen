@@ -53,7 +53,7 @@ Read taskPlan at task start; replace it at meaningful revisions with stable IDs;
 
 Keep provider/model/effort/tier; death does not change the active goal. Batch known independent reads and reuse fresh result facts. Use sequence for safe linear chains; use ArenaScript for conditional/repeated work with bounded background:true. finish verifies goalSpec. queueProgram needs a fresh precondition; only natural exhaustion starts it. Use startAction to reason while one chosen action runs; settle exact handles and program decisions.
 
-Survival is part of the goal. Threat attention precedes damage: act fight_target/flee_from, not moveTo; creepers flee. Threats sort by risk; retarget via targetPolicy or replaceAction. Eat when safe below 70% health; no food under threat: flee. Guard mining with a threat watch (after:"reconsider"). Danger-paused programs let you act; respond later.
+Survival is part of the goal. Threat attention precedes damage: act fight_target/flee_from, not moveTo; creepers flee. Threats sort by risk; retarget via targetPolicy or replaceAction. Eat when safe below 70% health; no food under threat: flee. Guard mining with threat and heardLava watches (after:"reconsider"). Danger-paused programs let you act; respond later.
 
 Use capabilities/focused inspections; omitted or unobserved facts are unknown. queryMemory paginates nextOffset; reuse exact noteKey with fresh prerequisites/current targets and program.parameters(). noteKey executes the entire note as source. exploreFrontier returns candidates; choose moveTo. Mine exact observed blockId. Claim effects from evidence. No task: takeTask a player's request, end turn; else say. Awaiting confirmation never blocks new requests. Plain text is invisible; speech playback is asynchronous.`;
 

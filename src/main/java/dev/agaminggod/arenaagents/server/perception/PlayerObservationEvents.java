@@ -39,12 +39,18 @@ public final class PlayerObservationEvents {
 		long tick = player.level().getGameTime();
 		String dimension = player.level().dimension().identifier().toString();
 		if (packet instanceof ClientboundSoundPacket sound) {
-			sound(player, stream, sound.getSound().value().location().toString(), sound.getX(), sound.getY(), sound.getZ(),
-					sound.getSound().value().getRange(sound.getVolume()), sound.getVolume(), tick, dimension);
+			String id = sound.getSound().value().location().toString();
+			double range = sound.getSound().value().getRange(sound.getVolume());
+			sound(player, stream, id, sound.getX(), sound.getY(), sound.getZ(), range, sound.getVolume(), tick, dimension);
+			HearingPerception.heardPacket(player, id, sound.getSource().getName(), null, sound.getX(), sound.getY(), sound.getZ(), sound.getVolume(), range);
 		} else if (packet instanceof ClientboundSoundEntityPacket sound) {
 			var entity = player.level().getEntity(sound.getId());
-			if (entity != null) sound(player, stream, sound.getSound().value().location().toString(), entity.getX(), entity.getY(), entity.getZ(),
-					sound.getSound().value().getRange(sound.getVolume()), sound.getVolume(), tick, dimension);
+			String id = sound.getSound().value().location().toString();
+			double range = sound.getSound().value().getRange(sound.getVolume());
+			if (entity != null) {
+				sound(player, stream, id, entity.getX(), entity.getY(), entity.getZ(), range, sound.getVolume(), tick, dimension);
+				HearingPerception.heardPacket(player, id, sound.getSource().getName(), entity, entity.getX(), entity.getY(), entity.getZ(), sound.getVolume(), range);
+			}
 		} else if (packet instanceof ClientboundBossEventPacket boss) {
 			boss.dispatch(new ClientboundBossEventPacket.Handler() {
 				@Override public void add(UUID id, Component name, float progress, BossEvent.BossBarColor color,

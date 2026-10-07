@@ -48,6 +48,9 @@ export function adaptObservation(value) {
 	copyExtensions(playerSource, player, ['pose', 'vehicle']);
 	Object.assign(player, threatFacts(source.threats));
 	Object.assign(player, survivalFacts(source.survival));
+	player.heard = heardFacts(source.heard);
+	// Nearest heard lava (pops, rumble, dripping) or null, so a watch condition can guard mining without a loop.
+	player.heardLava = player.heard.filter((entry) => entry.sound.includes('lava')).reduce((best, entry) => best === null || entry.distance < best.distance ? entry : best, null);
 
 	const entities = boundedDataArray(source.entities, 'entities', MAX_ENTITIES)
 		.map((value, index) => entityFacts(value, index));
@@ -125,6 +128,23 @@ function entityFacts(value, index) {
 	copyExtensions(source, result, ['velocity', 'yaw', 'pitch', 'pose', 'bounds', 'equipment', 'usingItem', 'onFire', 'pickable', 'parentId', 'partName',
 		'alive', 'hostile', 'health', 'maxHealth', 'targetingAgent', 'swelling', 'fuse', 'perceivedBy', 'potentialRisk', 'risk', 'expectedHitDamage']);
 	return result;
+}
+
+/** Recent sounds as a player fact: [{ sound, source?, direction, elevation, distance, count?, secondsAgo? }], always present ([] when silent). */
+export function heardFacts(value) {
+	if (value === undefined) return [];
+	return boundedDataArray(value, 'heard', 6).map((entry, index) => {
+		const row = ownDataRecord(entry, `heard[${index}]`);
+		return {
+			sound: boundedText(row.sound, `heard[${index}].sound`, 128),
+			...(row.source === undefined ? {} : { source: identifier(row.source, `heard[${index}].source`) }),
+			direction: identifier(row.direction, `heard[${index}].direction`),
+			elevation: identifier(row.elevation, `heard[${index}].elevation`),
+			distance: nonNegativeInteger(row.distance, `heard[${index}].distance`),
+			...(row.count === undefined ? {} : { count: positiveInteger(row.count, `heard[${index}].count`) }),
+			...(row.secondsAgo === undefined ? {} : { secondsAgo: nonNegativeInteger(row.secondsAgo, `heard[${index}].secondsAgo`) }),
+		};
+	});
 }
 
 const THREAT_URGENCY = Object.freeze({ swelling: 3, creeper_close: 2, attacked: 2, targeting: 1, ranged_sight: 1 });

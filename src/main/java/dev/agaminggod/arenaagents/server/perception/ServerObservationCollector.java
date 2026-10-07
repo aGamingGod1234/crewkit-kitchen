@@ -177,6 +177,9 @@ public final class ServerObservationCollector {
 		if (threat != null) observation.add("threats", threat);
 		JsonObject healing = SurvivalPerception.toJson(survival.sample(agentId, agent, threatSnapshot));
 		if (healing != null) observation.add("survival", healing);
+		// Sounds a player would hear (sent packets plus client-only ambience such as lava), most salient first.
+		JsonArray heard = HearingPerception.observe(agent);
+		if (!heard.isEmpty()) observation.add("heard", heard);
 		observation.add("interaction", interaction(agentId, agent));
 
 		observation.add("inventory", inventory(agent));

@@ -135,7 +135,7 @@ const FACTUAL_PLAYER_FIELDS = new Set([
 	'onFire', 'air', 'maxAir', 'suffocating', 'fallDistance', 'lastAttacker', 'effects',
 ]);
 const FACTUAL_TOP_LEVEL_PATHS = new Set([
-	'ready', 'status', 'position', 'velocity', 'view', 'inventory', 'entities', 'blocks', 'landmarks', 'nearbyContainers', 'world', 'currentAction', 'lastResult', 'perception',
+	'ready', 'status', 'position', 'velocity', 'view', 'inventory', 'entities', 'blocks', 'landmarks', 'nearbyContainers', 'world', 'currentAction', 'lastResult', 'perception', 'heard',
 ]);
 const TRUSTED_ENVELOPES = new WeakSet();
 const TRUSTED_PAYLOAD_TYPES = new WeakMap();
@@ -1800,7 +1800,7 @@ function observedDetails(value, field, depth = 0) {
 }
 
 function normalizeObservation(value) {
-	const allowed = ['goalRevision', 'observedAtEpochMs', 'ready', 'status', 'eventSequence', 'attention', 'changedFacts', 'position', 'velocity', 'view', 'player', 'inventory', 'entities', 'blocks', 'landmarks', 'nearbyContainers', 'world', 'currentAction', 'lastResult', 'interaction', 'coverage', 'perception', 'threats', 'survival'];
+	const allowed = ['goalRevision', 'observedAtEpochMs', 'ready', 'status', 'eventSequence', 'attention', 'changedFacts', 'position', 'velocity', 'view', 'player', 'inventory', 'entities', 'blocks', 'landmarks', 'nearbyContainers', 'world', 'currentAction', 'lastResult', 'interaction', 'coverage', 'perception', 'threats', 'survival', 'heard'];
 	exactKeys(value, allowed, ['goalRevision', 'observedAtEpochMs', 'ready', 'status'], 'observation');
 	const normalized = {
 		goalRevision: revision(value.goalRevision, 'goalRevision'),
@@ -1816,7 +1816,7 @@ function normalizeObservation(value) {
 		if (normalized.attention === false && normalized.changedFacts?.length > 0) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Non-attention observation cannot contain changed facts');
 		return normalized;
 	}
-	for (const key of allowed.slice(4).filter((field) => !['interaction', 'landmarks', 'coverage', 'perception', 'threats', 'survival'].includes(field))) if (!Object.hasOwn(value, key)) throw new ProtocolV2Error('MISSING_FIELD', `observation field '${key}' is required when ready`);
+	for (const key of allowed.slice(4).filter((field) => !['interaction', 'landmarks', 'coverage', 'perception', 'threats', 'survival', 'heard'].includes(field))) if (!Object.hasOwn(value, key)) throw new ProtocolV2Error('MISSING_FIELD', `observation field '${key}' is required when ready`);
 	normalized.eventSequence = positiveInteger(value.eventSequence, 'eventSequence');
 	normalized.attention = boolean(value.attention, 'attention');
 	normalized.changedFacts = changedFactPaths(value.changedFacts);
@@ -1838,7 +1838,31 @@ function normalizeObservation(value) {
 	if (value.perception !== undefined) normalized.perception = perceptionObservation(value.perception);
 	if (value.threats !== undefined) normalized.threats = threatsObservation(value.threats);
 	if (value.survival !== undefined) normalized.survival = survivalObservation(value.survival);
+	if (value.heard !== undefined) normalized.heard = heardObservation(value.heard);
 	return normalized;
+}
+
+const HEARD_DIRECTIONS = new Set(['front', 'front_right', 'right', 'back_right', 'back', 'back_left', 'left', 'front_left', 'here']);
+const HEARD_ELEVATIONS = new Set(['above', 'below', 'level']);
+const MAX_HEARD_ENTRIES = 6;
+
+/** Sounds the player hears (packets plus client-only ambience), most salient first; relative direction only. */
+function heardObservation(value) {
+	return boundedArray(value, 'heard', MAX_HEARD_ENTRIES).map((entry, index) => {
+		const field = `heard[${index}]`;
+		exactKeys(entry, ['sound', 'source', 'direction', 'elevation', 'distance', 'count', 'secondsAgo'], ['sound', 'direction', 'elevation', 'distance'], field);
+		if (!HEARD_DIRECTIONS.has(entry.direction)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}.direction is invalid`);
+		if (!HEARD_ELEVATIONS.has(entry.elevation)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}.elevation is invalid`);
+		return {
+			sound: boundedText(entry.sound, `${field}.sound`, 128),
+			...(entry.source === undefined ? {} : { source: requireIdentifier(entry.source, `${field}.source`) }),
+			direction: entry.direction,
+			elevation: entry.elevation,
+			distance: nonnegativeInteger(entry.distance, `${field}.distance`),
+			...(entry.count === undefined ? {} : { count: positiveInteger(entry.count, `${field}.count`) }),
+			...(entry.secondsAgo === undefined ? {} : { secondsAgo: nonnegativeInteger(entry.secondsAgo, `${field}.secondsAgo`) }),
+		};
+	});
 }
 
 /** Healing facts (present while hurt or signalling): safe, canHealNow, bestFood and debounced signals. */

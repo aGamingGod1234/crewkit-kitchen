@@ -66,6 +66,8 @@ public final class AttentionSignalPolicy {
 		JsonObject afterPerception = object(current, "perception");
 		if (afterPerception != null) addChanged(facts, "perception", beforePerception == null ? null : beforePerception.get("latestSequence"), afterPerception.get("latestSequence"));
 		addLavaChanges(facts, previous, current);
+		// Lava first heard (it stays remembered 30 s, so a pool's intermittent pops raise this once, not per pop).
+		if (heardLava(current) && !heardLava(previous)) facts.add("heard");
 
 		boolean viewpointChanged = !Objects.equals(previous.get("position"), current.get("position"))
 				|| !Objects.equals(previous.get("view"), current.get("view"));
@@ -162,6 +164,16 @@ public final class AttentionSignalPolicy {
 		for (String position : positions) {
 			if (!Objects.equals(before.get(position), after.get(position))) facts.add("blocks." + position);
 		}
+	}
+
+	static boolean heardLava(JsonObject observation) {
+		JsonArray heard = array(observation, "heard");
+		if (heard == null) return false;
+		for (JsonElement value : heard) {
+			String sound = value.isJsonObject() ? primitiveString(value.getAsJsonObject().get("sound")) : null;
+			if (sound != null && HearingPerception.isLava(sound)) return true;
+		}
+		return false;
 	}
 
 	private static java.util.Map<String, String> lavaByPosition(JsonArray blocks) {
