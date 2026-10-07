@@ -16,6 +16,7 @@ public final class PovInputCaptureVerification {
 		verifyFlagPacking();
 		verifyMovement();
 		verifyClickDraining();
+		verifySprintRequests();
 		verifySlotSelection();
 		verifyScrollWrap();
 		verifySpectateDiscard();
@@ -66,6 +67,54 @@ public final class PovInputCaptureVerification {
 		assertEquals(PovInputCapture.MAX_QUEUED_CLICKS, capture.drainClicks().size(), "click queue is bounded");
 		capture.click(null);
 		assertTrue(capture.drainClicks().isEmpty(), "null clicks are ignored");
+	}
+
+	private static void verifySprintRequests() {
+		PovInputCapture capture = known(0);
+		capture.setSprintWindow(PovInputCapture.DEFAULT_SPRINT_WINDOW);
+		assertFalse(sprintRequested(capture, true, false, false), "a first forward press only arms the double-tap");
+		assertFalse(sprintRequested(capture, false, false, false), "letting go requests nothing");
+		assertTrue(sprintRequested(capture, true, false, false), "a second press inside the window requests sprint");
+		assertFalse(sprintRequested(capture, true, false, false), "the double-tap request lasts one frame");
+		sprintRequested(capture, false, false, false);
+		for (int tick = 0; tick < PovInputCapture.DEFAULT_SPRINT_WINDOW; tick++) sprintRequested(capture, false, false, false);
+		assertFalse(sprintRequested(capture, true, false, false), "a press after the window only re-arms it");
+		sprintRequested(capture, false, false, false);
+		for (int tick = 0; tick < PovInputCapture.DEFAULT_SPRINT_WINDOW - 3; tick++) sprintRequested(capture, false, false, false);
+		assertTrue(sprintRequested(capture, true, false, false), "a press on the last tick of the window still counts");
+		PovInputCapture backed = known(0);
+		sprintRequested(backed, true, false, false);
+		sprintRequested(backed, false, false, false);
+		backed.recordMovement(false, true, false, false, false, false, false);
+		backed.nextFrame();
+		assertFalse(sprintRequested(backed, true, false, false), "the back key disarms a pending double-tap");
+		PovInputCapture sneaked = known(0);
+		sprintRequested(sneaked, true, false, false);
+		sprintRequested(sneaked, false, false, false);
+		sprintRequested(sneaked, false, false, true);
+		sprintRequested(sneaked, false, false, false);
+		assertFalse(sprintRequested(sneaked, true, false, false), "sneaking on the previous tick disarms it like vanilla");
+		PovInputCapture crouched = known(0);
+		sprintRequested(crouched, true, false, true);
+		sprintRequested(crouched, false, false, true);
+		assertFalse(sprintRequested(crouched, true, false, true), "presses while sneaking never fire");
+		assertTrue(sprintRequested(capture, true, true, false), "the sprint key requests sprint while held");
+		assertTrue(sprintRequested(capture, false, true, false), "the server decides if a sprint key without forward counts");
+		PovInputCapture disabled = known(0);
+		disabled.setSprintWindow(0);
+		sprintRequested(disabled, true, false, false);
+		sprintRequested(disabled, false, false, false);
+		assertFalse(sprintRequested(disabled, true, false, false), "a zero sprint window turns double-tap off");
+		PovInputCapture interrupted = known(0);
+		sprintRequested(interrupted, true, false, false);
+		sprintRequested(interrupted, false, false, false);
+		interrupted.discard();
+		assertFalse(sprintRequested(interrupted, true, false, false), "spectating forgets a half double-tap");
+	}
+
+	private static boolean sprintRequested(PovInputCapture capture, boolean forward, boolean sprintKey, boolean sneak) {
+		capture.recordMovement(forward, false, false, false, false, sneak, sprintKey);
+		return (capture.nextFrame().heldFlags() & dev.agaminggod.arenaagents.pov.OperatorInputPayload.HELD_SPRINT) != 0;
 	}
 
 	private static void verifySlotSelection() {

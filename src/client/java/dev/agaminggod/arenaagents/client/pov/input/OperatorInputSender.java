@@ -106,6 +106,7 @@ public final class OperatorInputSender {
 			CAPTURE.skipFrame();
 			return;
 		}
+		CAPTURE.setSprintWindow(client.options.sprintWindow().get());
 		PovInputCapture.Frame frame = CAPTURE.nextFrame();
 		PovHudProxy.showSelectedSlot(frame.selectedSlot());
 		float yaw = PovLook.yaw();
