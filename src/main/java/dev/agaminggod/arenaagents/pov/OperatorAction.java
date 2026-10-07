@@ -19,5 +19,19 @@ public enum OperatorAction {
 	MENU_BUTTON,
 	RESPAWN,
 	/** The in-bed screen's Leave Bed button (or Escape): vanilla STOP_SLEEPING for the agent. */
-	LEAVE_BED
+	LEAVE_BED,
+	/** MerchantScreen trade button: {@code a} = offer index (ServerboundSelectTradePacket). */
+	SELECT_TRADE,
+	/** Beacon confirm: {@code a} / {@code b} = primary / secondary MobEffect registry id, -1 for none. */
+	SET_BEACON,
+	/** Recipe book click: {@code a} = RecipeDisplayId index, {@code b} != 0 to place as many as possible. */
+	PLACE_RECIPE,
+	/** Recipe book toggles: {@code a} = RecipeBookType ordinal, {@code b} = open, {@code c} = filtering. */
+	RECIPE_BOOK_SETTINGS,
+	/** A highlighted recipe was looked at: {@code a} = RecipeDisplayId index. */
+	RECIPE_SEEN,
+	/** Bundle scroll in a menu: {@code a} = menu slot, {@code b} = selected item index (-1 for none). */
+	SELECT_BUNDLE_ITEM,
+	/** Crafter slot toggle: {@code a} = menu slot, {@code b} != 0 to enable. */
+	CRAFTER_SLOT
 }

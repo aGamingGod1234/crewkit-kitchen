@@ -91,6 +91,9 @@ public final class PovClient {
 		if (!ClientPlayNetworking.registerGlobalReceiver(PovStopPayload.TYPE,
 				(payload, context) -> context.client().execute(() -> acceptStop(context.client(), payload))))
 			throw new IllegalStateException("Agent POV stop receiver is already registered");
+		if (!ClientPlayNetworking.registerGlobalReceiver(dev.agaminggod.arenaagents.pov.AgentPovBookPayload.TYPE,
+				(payload, context) -> context.client().execute(() -> PovScreens.openBook(TRACKER.session().orElse(null), payload))))
+			throw new IllegalStateException("Agent POV book receiver is already registered");
 		ClientTickEvents.END_CLIENT_TICK.register(PovClient::tick);
 		ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> client.execute(() -> endLocal(client)));
 		ClientLevelEvents.AFTER_CLIENT_LEVEL_CHANGE.register((client, level) -> {

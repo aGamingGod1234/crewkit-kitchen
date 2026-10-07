@@ -636,6 +636,8 @@ public final class ServerActionExecutor {
 				boolean enabled = bool(arguments, "enabled");
 				if (enabled && !player.getAbilities().mayfly) throw new AgentDomainException("FLIGHT_NOT_ALLOWED", "Current player abilities do not permit flight");
 				player.getAbilities().flying = enabled;
+				// Vanilla's double-tap jumps when flight starts on the ground; landing would otherwise end it at once.
+				if (enabled && player.onGround()) player.jumpFromGround();
 				player.onUpdateAbilities();
 			});
 			case WRITE_SIGN -> ActiveAction.transaction(request, player, PlayerTextInteraction.writeSign(player, arguments, protection));

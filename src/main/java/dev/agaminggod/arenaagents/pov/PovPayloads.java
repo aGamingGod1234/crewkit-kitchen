@@ -28,6 +28,10 @@ public final class PovPayloads {
 		PayloadTypeRegistry.clientboundPlay().register(PovStopPayload.TYPE, PovStopPayload.CODEC);
 		PayloadTypeRegistry.serverboundPlay().register(OperatorInputPayload.TYPE, OperatorInputPayload.CODEC);
 		PayloadTypeRegistry.serverboundPlay().register(OperatorActionPayload.TYPE, OperatorActionPayload.CODEC);
+		// A full book is larger than the default serverbound custom payload limit, as vanilla's own packet is.
+		PayloadTypeRegistry.serverboundPlay().registerLarge(OperatorTextPayload.TYPE, OperatorTextPayload.CODEC,
+				OperatorTextPayload.MAX_ENCODED_BYTES);
+		PayloadTypeRegistry.clientboundPlay().register(AgentPovBookPayload.TYPE, AgentPovBookPayload.CODEC);
 		registered = true;
 	}
 

@@ -8,6 +8,7 @@ import dev.agaminggod.arenaagents.client.pov.screen.PovScreens;
 import dev.agaminggod.arenaagents.pov.OperatorAction;
 import dev.agaminggod.arenaagents.pov.OperatorActionPayload;
 import dev.agaminggod.arenaagents.pov.OperatorInputPayload;
+import dev.agaminggod.arenaagents.pov.OperatorTextPayload;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.minecraft.client.Minecraft;
@@ -77,6 +78,13 @@ public final class OperatorInputSender {
 		PovClientSession session = PovClient.session().filter(PovClientSession::takeover).orElse(null);
 		if (session == null) return;
 		send(Minecraft.getInstance(), new OperatorActionPayload(session.sessionId(), nextSequence(), action, a, b, c));
+	}
+
+	/** Text typed into a vanilla screen for the agent (anvil, sign, book); spectators never send anything. */
+	public static void sendText(java.util.function.BiFunction<Long, Integer, OperatorTextPayload> build) {
+		PovClientSession session = PovClient.session().filter(PovClientSession::takeover).orElse(null);
+		if (session == null) return;
+		send(Minecraft.getInstance(), build.apply(session.sessionId(), nextSequence()));
 	}
 
 	private static void tick(Minecraft client) {

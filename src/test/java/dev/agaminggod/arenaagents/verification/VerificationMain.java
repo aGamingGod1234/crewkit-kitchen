@@ -291,6 +291,8 @@ public final class VerificationMain {
 		passedAssertions += dev.agaminggod.arenaagents.client.pov.PovInputCaptureVerification.verify();
 		verifyJsonLineFraming(codec);
 		passedAssertions += PovContractsVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.pov.PovRelayVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.client.pov.input.PovOutgoingRelayVerification.verify();
 
 		System.out.printf("PASS: %d protocol and core assertions%n", passedAssertions);
 	}

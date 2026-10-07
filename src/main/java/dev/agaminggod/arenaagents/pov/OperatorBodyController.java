@@ -19,6 +19,10 @@ public interface OperatorBodyController {
 	/** Performs a one-shot action against the agent immediately. */
 	void applyAction(ServerPlayer operator, OperatorActionPayload action);
 
+	/** Relays text typed into a vanilla screen (anvil name, sign, book) to the agent's body. */
+	default void applyText(OperatorTextPayload text) {
+	}
+
 	/** Called every server tick while active; re-acquires leases that lifecycle events cleared and applies input. */
 	void tick();
 

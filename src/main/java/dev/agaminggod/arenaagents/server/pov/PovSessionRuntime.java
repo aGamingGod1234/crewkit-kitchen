@@ -12,6 +12,7 @@ import dev.agaminggod.arenaagents.pov.OperatorActionPayload;
 import dev.agaminggod.arenaagents.pov.OperatorBodyController;
 import dev.agaminggod.arenaagents.pov.OperatorBodyControllers;
 import dev.agaminggod.arenaagents.pov.OperatorInputPayload;
+import dev.agaminggod.arenaagents.pov.OperatorTextPayload;
 import dev.agaminggod.arenaagents.pov.PovDeath;
 import dev.agaminggod.arenaagents.pov.PovMode;
 import dev.agaminggod.arenaagents.pov.PovStopPayload;
@@ -171,6 +172,7 @@ public final class PovSessionRuntime {
 		if (mode == PovMode.TAKEOVER) beginTakeover(server, manager, state, session, operator, record);
 		state.sessions.put(operator.getUUID(), session);
 		if (mode == PovMode.TAKEOVER) PovMessageRelay.start(agentPlayerUuid, operator.getUUID(), agentName);
+		if (mode == PovMode.TAKEOVER && agent != null) PovUiForwarder.showAgentRecipeBook(operator, agent);
 		if (agent != null) {
 			session.observeAgent(agent, agent.position(), AGENT_LOOK_RESET_JUMP_BLOCKS);
 			if (session.takeover()) sampleAgent(session, agent);
@@ -371,6 +373,7 @@ public final class PovSessionRuntime {
 				ServerPlayer agent = record == null ? null : findAgent(server, record).orElse(null);
 				session.publisher().tick(operator, agent, death(record, session.mode()), session.lookResetSeq(),
 						inputSequence(session));
+				if (agent != null) PovUiForwarder.refreshMerchant(operator, agent, server.getTickCount());
 			} catch (RuntimeException failure) {
 				// Same policy as a failing session tick: end the session instead of warning every tick.
 				LOGGER.warn("Stopped POV session {} for agent {} after a publish failure", session.id(), session.agentId(), failure);
@@ -450,6 +453,9 @@ public final class PovSessionRuntime {
 					step(session, "report the takeover", () -> queueReport(server, state, session, operator));
 				}
 			}
+		}
+		if (online && session.takeover()) {
+			step(session, "restore the operator recipe book", () -> PovUiForwarder.restoreOperatorRecipeBook(operator));
 		}
 		if (online) {
 			step(session, "send the stop payload", () -> {
@@ -559,6 +565,21 @@ public final class PovSessionRuntime {
 	public static void handleInput(ServerPlayer operator, OperatorInputPayload frame) {
 		PovSession session = activeTakeover(operator, frame.sessionId());
 		if (session != null) session.controller().applyFrame(frame);
+	}
+
+	public static void handleText(ServerPlayer operator, OperatorTextPayload text) {
+		PovSession session = activeTakeover(operator, text.sessionId());
+		if (session != null) session.controller().applyText(text);
+	}
+
+	/** The takeover session driving this agent player, if any; used to show it the agent's screens. */
+	static Optional<PovSession> takeoverOf(ServerPlayer agent) {
+		State state = STATES.get(agent.level().getServer());
+		if (state == null) return Optional.empty();
+		for (PovSession session : state.sessions.values()) {
+			if (session.takeover() && session.agentPlayerUuid().equals(agent.getUUID())) return Optional.of(session);
+		}
+		return Optional.empty();
 	}
 
 	public static void handleAction(ServerPlayer operator, OperatorActionPayload action) {
