@@ -1,9 +1,11 @@
 package dev.agaminggod.arenaagents.mixin;
 
 import carpet.helpers.EntityPlayerActionPack;
+import carpet.patches.EntityPlayerMPFake;
 import dev.agaminggod.arenaagents.server.runtime.input.CarpetActionArbitration;
 import dev.agaminggod.arenaagents.server.runtime.input.CarpetInputStateSink;
 import dev.agaminggod.arenaagents.server.runtime.input.ModelPlayerInputBridge;
+import dev.agaminggod.arenaagents.server.runtime.input.VanillaMoveInput;
 import java.util.function.Supplier;
 import net.minecraft.server.level.ServerPlayer;
 import org.spongepowered.asm.mixin.Final;
@@ -27,8 +29,16 @@ abstract class EntityPlayerActionPackMixin {
 	@Final
 	private ServerPlayer player;
 
+	@Shadow
+	private float forward;
+
+	@Shadow
+	private float strafing;
+
 	@Inject(method = "onUpdate", at = @At("TAIL"))
 	private void arenaagents$applyAuthoredVehicleInputs(CallbackInfo callback) {
+		// Replaces Carpet's sneak-only 0.3 with the client's item-use, crouch/crawl and Swift Sneak scaling.
+		if (player instanceof EntityPlayerMPFake) VanillaMoveInput.apply(player, forward, strafing);
 		ModelPlayerInputBridge.tickPlayer(player);
 	}
 

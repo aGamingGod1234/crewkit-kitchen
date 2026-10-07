@@ -231,6 +231,7 @@ public final class VerificationMain {
 		passedAssertions += dev.agaminggod.arenaagents.server.perception.ObservationPageVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.perception.PlayerObservationEventsVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.runtime.input.RidingJumpInputVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.runtime.input.VanillaMoveInputVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.runtime.input.UseTickPhaseVerification.verify();
 		passedAssertions += ActionSuccessLedgerVerification.verify();
 		passedAssertions += InputStateVerification.verify();

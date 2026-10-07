@@ -1108,6 +1108,9 @@ public final class CodexAgentManager {
 						&& attached.state() == dev.agaminggod.arenaagents.agent.AgentLifecycleState.DISCONNECTED) {
 					savedData.registry().resume(record.agentId(), now);
 				}
+			} else if (player.isPresent() && player.get().wonGame) {
+				// Left the End: removed until the credits finish and vanilla respawns it with everything; not a death.
+				continue;
 			} else if (player.isPresent()) {
 				AgentInputRuntime.clear(server, record.agentId());
 				savedData.registry().die(record.agentId(), deathSnapshot(player.get(), now), now);

@@ -13,6 +13,7 @@
     "EntityPlayerActionPackMixin",
     "EntityPlayerMPFakeMixin",
     "FakePlayerCheckFallDamageMixin",
+    "FakePlayerEndCreditsMixin",
     "FakePlayerFallAuthorityMixin",
     "LevelMutationRevisionMixin",
     "LevelChunkMutationRevisionMixin",
