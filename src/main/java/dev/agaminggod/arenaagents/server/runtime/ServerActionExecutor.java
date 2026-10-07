@@ -2007,7 +2007,10 @@ public final class ServerActionExecutor {
 						&& receipt.confirms(breakReceiptBaseline, block, expectedBlockId, currentState);
 				if (ownedTransition) {
 					lastObservation = breakObservation(now, hit, currentBlockId, 1.0D, true);
-					return result(ServerActionState.SUCCEEDED, "BLOCK_BROKEN", "Block broken", now);
+					// A fact, not a refusal: lava the agent hears beside the opened block can now flow in.
+					return result(ServerActionState.SUCCEEDED, "BLOCK_BROKEN",
+							dev.agaminggod.arenaagents.server.perception.HearingPerception.lavaHeardNear(player, block, 2.5D)
+									? "Block broken; lava is heard within 2 blocks of it" : "Block broken", now);
 				}
 				if (!currentState.isAir() && !expectedBlockId.equals(currentBlockId)) {
 					lastObservation = breakObservation(now, hit, currentBlockId, 0.0D, false);

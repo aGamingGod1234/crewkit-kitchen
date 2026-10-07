@@ -2377,3 +2377,25 @@ test('underwater breath facts survive wire validation and adaptation', () => {
 	assert.equal(adapted.player.air, 150);
 	assert.equal(adapted.player.operatorControlled, true, 'a /takeover is reported so danger never wakes the model onto the operator body');
 });
+
+test('heard sounds and the first-heard-lava fact pass wire validation with relative direction only', () => {
+	const observation = readyServerObservation();
+	observation.attention = true;
+	observation.changedFacts = ['heard'];
+	observation.heard = [
+		{ sound: 'block.lava.pop', direction: 'front', elevation: 'below', distance: 3, count: 2 },
+		{ sound: 'block.stone.step', source: 'minecraft:zombie', direction: 'here', elevation: 'above', distance: 2, secondsAgo: 6 },
+	];
+	const normalized = validateProtocolV2Payload('observation', observation);
+	assert.deepEqual(normalized.heard, observation.heard);
+	assert.deepEqual(normalized.changedFacts, ['heard']);
+	for (const [field, value] of [['direction', 'north'], ['elevation', 'up'], ['distance', -2], ['x', 4]]) {
+		const bad = structuredClone(observation);
+		bad.heard[0][field] = value;
+		assert.throws(() => validateProtocolV2Payload('observation', bad), /heard\[0\]|INVALID|unexpected|unknown/i, `${field} is validated`);
+	}
+	const crowded = structuredClone(observation);
+	crowded.heard = Array.from({ length: 7 }, () => observation.heard[0]);
+	assert.throws(() => validateProtocolV2Payload('observation', crowded));
+	assert.equal(Object.hasOwn(validateProtocolV2Payload('observation', readyServerObservation()), 'heard'), false, 'heard stays optional');
+});

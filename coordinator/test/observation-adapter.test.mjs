@@ -21,7 +21,7 @@ function wireObservation(overrides = {}) {
 
 test('adapts protocol entities and blocks into bounded factual candidate records', () => {
 	const adapted = adaptObservation(wireObservation());
-	assert.deepEqual(adapted.player, { x: 0, y: 64, z: 0, yaw: 10, pitch: -2, dead: false, health: 20, hunger: 18, foodLevel: 18, air: 300, fire: false, onFire: false, fallDistance: 0, threats: [], threat: null, highestRiskThreat: null, bestWeapon: null, canHealNow: false, bestFood: null, healOpportunity: false, lowHealthNoFood: false });
+	assert.deepEqual(adapted.player, { x: 0, y: 64, z: 0, yaw: 10, pitch: -2, dead: false, health: 20, hunger: 18, foodLevel: 18, air: 300, fire: false, onFire: false, fallDistance: 0, threats: [], threat: null, highestRiskThreat: null, bestWeapon: null, canHealNow: false, bestFood: null, healOpportunity: false, lowHealthNoFood: false, heard: [], heardLava: null });
 	assert.deepEqual(adapted.items, [{ stableId: '00000000-0000-0000-0000-000000000001', itemId: 'minecraft:oak_log', count: 1, distance: 2, tags: ['#minecraft:item'], x: 2, y: 64, z: 0 }]);
 	assert.deepEqual(adapted.entities, [{ stableId: '00000000-0000-0000-0000-000000000001', type: 'minecraft:item', distance: 2, tags: ['#minecraft:item'], x: 2, y: 64, z: 0, itemId: 'minecraft:oak_log', count: 1 }]);
 	assert.deepEqual(adapted.blocks, [{ stableId: '4,64,0', blockId: 'minecraft:oak_log', tags: ['#minecraft:logs'], x: 4, y: 64, z: 0 }]);
