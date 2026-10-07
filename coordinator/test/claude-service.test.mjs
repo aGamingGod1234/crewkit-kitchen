@@ -362,3 +362,54 @@ test('danger steers before the first tool call never interrupt the reasoning tur
 		assert.match(captured.content[1].text, /zombie targeting[\s\S]*health 17[\s\S]*air 150/);
 	} finally { await close(); }
 });
+
+test('Claude per-call token usage and timing reach live usage, and a large context rotates to a fresh session with a carry-over', async () => {
+	const { service, children, close } = await harness({
+		async onUser(child) {
+			const id = `msg_${child.lines.length}`;
+			child.emitLine({ type: 'stream_event', event: { type: 'message_start', message: { id, usage: { input_tokens: 5, cache_read_input_tokens: 70_000, cache_creation_input_tokens: 200, output_tokens: 1 } } } });
+			child.emitLine({ type: 'stream_event', event: { type: 'message_delta', usage: { output_tokens: 40 } } });
+			child.emitLine({ type: 'stream_event', event: { type: 'message_stop' } });
+			if (children.length === 1) await child.rpc('tools/call', { name: 'observe', arguments: {}, _meta: { 'claudecode/toolUseId': 'toolu_1' } });
+			child.emitLine({ type: 'result', subtype: 'success', is_error: false, result: 'ok', session_id: 'session-1', total_cost_usd: 0.0125 });
+		},
+	});
+	try {
+		const agent = await service.createAgent(profile(), { controlProtocol: 'native_tools' });
+		const verbose = [];
+		const first = await agent.act('Goal: gather wood.', { goalRevision: 0, onVerbose: (stage, message) => verbose.push([stage, message]), executeTool: async () => ({ state: 'SUCCEEDED', reasonCode: 'OBSERVED' }) });
+		assert.deepEqual(first.usage, { calls: 1, input: 5, cacheRead: 70_000, cacheWrite: 200, output: 40, costUsd: 0.0125, contextTokens: 70_205 });
+		const usage = verbose.filter(([stage]) => stage === 'live_usage').map(([, message]) => JSON.parse(message));
+		assert.equal(usage.length, 1);
+		assert.equal(usage[0].cachedInputTokens, 70_000);
+		assert.equal(usage[0].cacheWriteInputTokens, 200);
+		assert.equal(usage[0].last.inputTokens, 70_205);
+		assert.equal(usage[0].call.contextTokens, 70_205);
+		assert.ok(Number.isSafeInteger(usage[0].call.firstEventMs) && Number.isSafeInteger(usage[0].call.totalMs));
+		assert.ok(children[0].args.includes('--include-partial-messages'));
+
+		await agent.act('Goal: gather wood.', { goalRevision: 0, executeTool: async () => ({ state: 'SUCCEEDED' }) });
+		assert.equal(children.length, 2, 'the over-threshold context starts a fresh Claude Code session');
+		assert.notEqual(children[0].exitCode, null);
+		const carried = children[1].lines.find((line) => line.type === 'user').message.content;
+		assert.match(carried, /^Session refreshed to keep context small/);
+		assert.match(carried, /observe \{\} -> SUCCEEDED OBSERVED/);
+		assert.match(carried, /Goal: gather wood\.$/);
+	} finally { await close(); }
+});
+
+test('Claude context rotation can be disabled', async () => {
+	const { service, children, close } = await harness({
+		async onUser(child) {
+			child.emitLine({ type: 'assistant', message: { id: `msg_${child.lines.length}`, content: [], usage: { input_tokens: 1, cache_read_input_tokens: 150_000, output_tokens: 3 } } });
+			child.emitLine({ type: 'result', subtype: 'success', is_error: false, result: 'ok', session_id: 'session-1' });
+		},
+	}, { contextRotationTokens: 0 });
+	try {
+		const agent = await service.createAgent(profile(), { controlProtocol: 'native_tools' });
+		const first = await agent.act('One.', { goalRevision: 0, executeTool: async () => ({}) });
+		assert.equal(first.usage.contextTokens, 150_001);
+		await agent.act('Two.', { goalRevision: 0, executeTool: async () => ({}) });
+		assert.equal(children.length, 1);
+	} finally { await close(); }
+});

@@ -746,6 +746,7 @@ export class SharedCodexAgent {
 				// accepted ID (or fence the late start) before releasing ownership.
 				try { await this.interrupt(); } catch {}
 			}
+			this.#observationViews.forgetEventMetadata();
 			throw withNativeTurn(error, collector.snapshot());
 		} finally {
 			signal?.removeEventListener('abort', abort);

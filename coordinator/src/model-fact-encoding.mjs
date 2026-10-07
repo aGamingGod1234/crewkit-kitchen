@@ -6,6 +6,9 @@ export const MODEL_FACT_INSTRUCTIONS = `Compact factual replies use format:"mine
 const MAX_DELIVERED_VIEWS = 8;
 const MAX_DELIVERED_VIEW_BYTES = 2 * 1024 * 1024;
 const RETAINABLE_METADATA = ['taskMemory', 'goal', 'goalSpec', 'executionSettings'];
+// Event fields that rarely change between wakes; repeating them unchanged in every event only grows the context.
+const EVENT_METADATA = ['goal', 'goalSpec', 'taskMemory'];
+const MIN_RETAINED_EVENT_FIELD_BYTES = 64;
 const MARKERS = new Set(['$ref', '$rows', '$object']);
 const bytes = value => Buffer.byteLength(JSON.stringify(value), 'utf8');
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -122,10 +125,29 @@ export class ModelObservationViews {
  #sequence = 0;
  #committedSequence = 0;
  #generation = 0;
- reset() { this.#baseline = null; this.#history.clear(); this.#historyBytes = 0; this.#generation++; }
+ #eventMetadata = null;
+ reset() { this.#resetObservations(); this.#eventMetadata = null; }
+ #resetObservations() { this.#baseline = null; this.#history.clear(); this.#historyBytes = 0; this.#generation++; }
+ /** A turn that may not have reached the model must not become the baseline for omitted event fields. */
+ forgetEventMetadata() { this.#eventMetadata = null; }
+ /** Omits goal, goalSpec and taskMemory when they equal the previous event delivered in this same provider context. */
+ retainEventMetadata(value) {
+  const identity = observationIdentity(value.observation);
+  const previous = this.#eventMetadata;
+  this.#eventMetadata = identity === null ? null : { identity, fields: Object.fromEntries(EVENT_METADATA.filter(key => Object.hasOwn(value, key)).map(key => [key, structuredClone(value[key])])) };
+  if (previous === null || identity === null || previous.identity !== identity) return value;
+  const same = EVENT_METADATA.filter(key => Object.hasOwn(value, key) && Object.hasOwn(previous.fields, key)
+   && bytes(value[key] ?? null) > MIN_RETAINED_EVENT_FIELD_BYTES && isDeepStrictEqual(value[key], previous.fields[key]));
+  if (same.length === 0) return value;
+  const retained = { ...value };
+  for (const key of same) delete retained[key];
+  retained.sameAsPreviousEvent = same;
+  return retained;
+ }
  observeEvent(observation) {
   const identity = observationIdentity(observation);
-  if (identity === null || identity !== this.#baseline?.identity || observation.player?.dead === true || observation.continuity?.phase === 'dead') this.reset();
+  // Observation baselines are per sample; event metadata is checked against its own world identity below.
+  if (identity === null || identity !== this.#baseline?.identity || observation.player?.dead === true || observation.continuity?.phase === 'dead') this.#resetObservations();
  }
 
  prepare(value, tool) {
@@ -192,7 +214,8 @@ export function encodeNativeEventInput(input, views = null) {
   if (!record(value) || typeof value.event !== 'string' || !record(value.observation)) return input;
   if (value.event === 'player_death' || value.observation.player?.dead === true || value.observation.continuity?.phase === 'dead') views?.reset();
   else views?.observeEvent(value.observation);
-  const encoded = encodeModelFacts(value);
+  const retained = typeof views?.retainEventMetadata === 'function' ? views.retainEventMetadata(value) : value;
+  const encoded = encodeModelFacts(retained);
   return encoded === value ? input : `${input.slice(0, separator + 1)}${JSON.stringify(encoded)}${input.slice(end)}`;
  } catch { return input; }
 }
