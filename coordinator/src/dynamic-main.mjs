@@ -4987,7 +4987,7 @@ function retainedEventCoverage(coverage, retainedCounts) {
 	}));
 }
 
-const COMPACT_EVENT_ROW_FIELDS = ['uuid', 'stableId', 'type', 'name', 'position', 'x', 'y', 'z', 'distance', 'blockId', 'itemId', 'count', 'slot', 'tags', 'velocity', 'bounds', 'pickable', 'parentId', 'partName', 'state', 'bearing', 'elevation', 'id', 'feasible', 'moveTo', 'reason', 'cause', 'hazard', 'damage', 'maxDamage', 'fingerprint', 'hotbar', 'displayName', 'maxStackSize', 'hostile', 'alive', 'health', 'maxHealth', 'targetingAgent', 'swelling', 'fuse', 'perceivedBy', 'withinInteractionRange', 'capabilities'];
+const COMPACT_EVENT_ROW_FIELDS = ['uuid', 'stableId', 'type', 'name', 'position', 'x', 'y', 'z', 'distance', 'blockId', 'itemId', 'count', 'slot', 'tags', 'velocity', 'bounds', 'pickable', 'parentId', 'partName', 'state', 'bearing', 'elevation', 'id', 'feasible', 'moveTo', 'reason', 'cause', 'hazard', 'damage', 'maxDamage', 'fingerprint', 'hotbar', 'displayName', 'maxStackSize', 'hostile', 'alive', 'health', 'maxHealth', 'targetingAgent', 'swelling', 'fuse', 'perceivedBy', 'potentialRisk', 'risk', 'expectedHitDamage', 'withinInteractionRange', 'capabilities'];
 
 function compactEventRows(value) {
 	return asArray(value).map((entry) => {
@@ -5003,6 +5003,8 @@ function isHazardousEventFact(value) {
 	if (value === null || typeof value !== 'object') return false;
 	if (value.hostile === true && value.alive !== false) return true;
 	if (value.targetingAgent === true || value.swelling === true) return true;
+	// An active risk (engaging the agent right now) is kept under budget like a hostile.
+	if (typeof value.risk === 'number') return true;
 	const text = ['blockId', 'itemId', 'type', 'name', 'reason', 'cause', 'hazard'].map((field) => value[field]).filter((field) => typeof field === 'string').join(' ');
 	return /lava|fire|magma|cactus|campfire|tnt|creeper|ghast|blaze|wither|warden|dragon|hostile/i.test(text);
 }

@@ -66,8 +66,15 @@ public final class RiskAssessment {
 		return !ThreatPerception.signals(false, false, creeper, swelling, ranged, sight, distance).isEmpty();
 	}
 
+	/** Creative and spectator players never count as attackers or targets (an operator's stray hit is not a fight). */
 	public static boolean attackedRecently(ServerPlayer agent, LivingEntity entity) {
-		return AggressionLedger.server().attackedRecently(agent.getUUID(), entity.getUUID(), agent.level().getGameTime());
+		return isRiskablePlayer(entity)
+				&& AggressionLedger.server().attackedRecently(agent.getUUID(), entity.getUUID(), agent.level().getGameTime());
+	}
+
+	/** False only for creative or spectator players; every other entity passes. */
+	public static boolean isRiskablePlayer(LivingEntity entity) {
+		return !(entity instanceof Player player) || (!player.isCreative() && !player.isSpectator());
 	}
 
 	/** Cached for one game tick per entity and agent. */
@@ -88,7 +95,8 @@ public final class RiskAssessment {
 		double distance = agent.distanceTo(entity);
 		ThreatDamage.Estimate hit = ThreatDamage.expectedHit(entity, agent);
 		AttributeInstance speed = entity.getAttribute(Attributes.MOVEMENT_SPEED);
-		Vec3 motion = player ? entity.getKnownSpeed() : entity.getDeltaMovement();
+		// Knockback is not the entity's own speed; while it is reeling from a hit only the attribute counts.
+		Vec3 motion = entity.hurtTime > 0 ? Vec3.ZERO : player ? entity.getKnownSpeed() : entity.getDeltaMovement();
 		boolean ranged = entity instanceof Mob mob ? ThreatPerception.isRanged(mob) : holdsRangedWeapon(entity);
 		boolean sight = ranged && distance <= ThreatPerception.RANGE
 				&& (entity instanceof Mob mob ? mob.getSensing().hasLineOfSight(agent) : entity.hasLineOfSight(agent));

@@ -24,7 +24,7 @@ const MAX_PROGRAM_SOURCE_BYTES = 65_536;
 const MAX_PROGRAM_PRECONDITION_BYTES = 4_096;
 const MAX_SEQUENCE_FINISH_BYTES = 4_096;
 const INVENTORY_FACT_FIELDS = ['selectedSlot', 'selectedItem', 'selectedItemId', 'selectedItemCount', 'tagCounts'];
-const COMPACT_ROW_FIELDS = ['uuid', 'stableId', 'type', 'typeId', 'name', 'slot', 'position', 'x', 'y', 'z', 'distance', 'distanceSquared', 'blockId', 'itemId', 'count', 'damage', 'maxDamage', 'tags', 'fingerprint', 'hotbar', 'displayName', 'maxStackSize', 'health', 'maxHealth', 'hostile', 'alive', 'targetingAgent', 'swelling', 'fuse', 'perceivedBy', 'withinInteractionRange', 'capabilities', 'velocity', 'bounds', 'pickable', 'parentId', 'partName', 'state', 'bearing', 'elevation', 'omittedFields'];
+const COMPACT_ROW_FIELDS = ['uuid', 'stableId', 'type', 'typeId', 'name', 'slot', 'position', 'x', 'y', 'z', 'distance', 'distanceSquared', 'blockId', 'itemId', 'count', 'damage', 'maxDamage', 'tags', 'fingerprint', 'hotbar', 'displayName', 'maxStackSize', 'health', 'maxHealth', 'hostile', 'alive', 'targetingAgent', 'swelling', 'fuse', 'perceivedBy', 'potentialRisk', 'risk', 'expectedHitDamage', 'withinInteractionRange', 'capabilities', 'velocity', 'bounds', 'pickable', 'parentId', 'partName', 'state', 'bearing', 'elevation', 'omittedFields'];
 const NATIVE_ACTION_TYPES = Object.freeze(Object.keys(ACTION_FIELDS));
 const POST_ACTION_VIEW_TOOLS = new Set(['moveTo', 'mine', 'act', 'sequence']);
 const OBSERVATION_VIEW_PROPERTIES = {
@@ -142,7 +142,7 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 	tool('wait', 'Pause briefly and wait for the body result.', objectSchema({
 		durationMs: integerSchema(MIN_DURATION_MS, MAX_DURATION_MS),
 	}, ['durationMs'])),
-	tool('act', 'Execute one supported advanced player action. Supply exactly the required fields. For interact_block omit optional hitX/hitY/hitZ to use the actual block shape. Before pick_up_item check current inventory and use a freshly observed target UUID; nearby drops may already be collected. fight_target takes optional targetPolicy: named (default), highest_risk or nearest_attacker (live switching among attackers with hysteresis, never creepers); replaceAction with a new fight_target retargets keeping weapon and swing timing.', objectSchema({
+	tool('act', 'Execute one supported advanced player action. Supply exactly the required fields. For interact_block omit optional hitX/hitY/hitZ to use the actual block shape. Before pick_up_item check current inventory and use a freshly observed target UUID; nearby drops may already be collected. fight_target takes optional targetPolicy: named (default), highest_risk or nearest_attacker (live switching among attacking mobs with hysteresis, never creepers); follow-through and policies skip players unless includePlayers:true; replaceAction with a new fight_target retargets keeping weapon and swing timing.', objectSchema({
 		actionType: { type: 'string', enum: NATIVE_ACTION_TYPES },
 		arguments: { type: 'object' },
 	}, ['actionType', 'arguments'])),

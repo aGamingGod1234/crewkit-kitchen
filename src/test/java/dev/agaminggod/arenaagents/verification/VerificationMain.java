@@ -407,6 +407,16 @@ public final class VerificationMain {
 				"targetPolicy",
 				"fight_target targetPolicy must be a known policy"
 		);
+		ActionCommand optIn = codec.decodeCommand(commandJson("fight_target",
+				"\"targetId\":\"00000000-0000-0000-0000-000000000001\",\"includePlayers\":true,\"timeoutMs\":15000"));
+		assertEquals(true, optIn.arguments().get("includePlayers").getAsBoolean(), "fight_target keeps the model's includePlayers opt-in");
+		expectProtocolException(
+				() -> codec.decodeCommand(commandJson("fight_target",
+						"\"targetId\":\"00000000-0000-0000-0000-000000000001\",\"includePlayers\":\"yes\",\"timeoutMs\":15000")),
+				"INVALID_FIELD",
+				"includePlayers",
+				"fight_target includePlayers must be a boolean"
+		);
 		assertDecodedType(codec, "flee_from", "\"targetId\":\"00000000-0000-0000-0000-000000000001\",\"distance\":16,\"timeoutMs\":10000", ActionType.FLEE_FROM);
 		assertDecodedType(codec, "follow_entity", "\"targetSelector\":\"player:Lucas\",\"distance\":3,\"timeoutMs\":30000", ActionType.FOLLOW_ENTITY);
 		assertDecodedType(codec, "interact_block", "\"x\":1,\"y\":64,\"z\":-2,\"face\":\"north\",\"hand\":\"main\",\"expectedItemId\":\"minecraft:air\"", ActionType.INTERACT_BLOCK);

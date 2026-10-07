@@ -122,6 +122,15 @@ public final class CombatRiskVerification {
 		check(!ledger.attackedRecently(agent, player, 50L), "a world-time rewind never makes a future hit active");
 		ledger.record(agent, player, 2_000L);
 		check(ledger.attackedRecently(agent, player, 2_300L), "another hit renews the active window");
+		check(ledger.hasAttackers(agent, 2_300L) && !ledger.hasAttackers(player, 2_300L), "hasAttackers short-circuits lookups");
+		check(!ledger.attackedRecently(agent, player, 2_000L + AggressionLedger.ACTIVE_TICKS + 1L) && ledger.victims() == 0,
+				"expired entries are pruned on read");
+		ledger.record(agent, player, 3_000L);
+		ledger.forgetEverywhere(player);
+		check(!ledger.attackedRecently(agent, player, 3_001L) && ledger.victims() == 0, "a departed attacker is forgotten");
+		ledger.record(agent, player, 3_000L);
+		ledger.clear();
+		check(ledger.victims() == 0, "server stop clears the ledger");
 	}
 
 	private static void verifyAttackedSignal() {
@@ -131,6 +140,8 @@ public final class CombatRiskVerification {
 				"an armed player who never attacked raises nothing");
 		check(ThreatPerception.signals(true, false, false, false, false, true, 18.0D, true).isEmpty(),
 				"an attacker beyond 16 blocks raises nothing new");
+		check(ThreatPerception.signals(true, true, false, false, false, true, 5.0D, true).equals(List.of("targeting")),
+				"attacked never duplicates another signal for the same creature");
 		JsonObject before = new JsonObject();
 		JsonObject after = new JsonObject();
 		JsonObject threats = new JsonObject();
@@ -189,6 +200,9 @@ public final class CombatRiskVerification {
 		check(CombatPlanning.policyRetarget(TargetPolicy.NEAREST_ATTACKER, new PolicyCandidate(6.0D, 50.0D, true, false),
 				List.of(new PolicyCandidate(5.0D, 10.0D, true, false), new PolicyCandidate(2.0D, 10.0D, true, false)), 100) == 1,
 				"nearest_attacker switches to an attacker clearly nearer");
+		check(!CombatPlanning.switchableKind(true, false) && CombatPlanning.switchableKind(true, true)
+				&& CombatPlanning.switchableKind(false, false),
+				"follow-through and policies never switch to a player unless the model passed includePlayers");
 		check(CombatPlanning.policyRetarget(TargetPolicy.HIGHEST_RISK, null,
 				List.of(new PolicyCandidate(5.0D, 30.0D, true, false), new PolicyCandidate(8.0D, 70.0D, true, false)), 0) == 1,
 				"after a kill, highest_risk follows through to the riskiest attacker at once");
@@ -212,6 +226,10 @@ public final class CombatRiskVerification {
 				"half health, threatened, nothing to eat: urgent low-health signal");
 		check(SurvivalPerception.rawSignals(10.0D, 20.0D, 18, null, false, true).isEmpty(),
 				"no food while safe is not an emergency");
+		check(SurvivalPerception.rawSignals(10.0D, 20.0D, 20, BREAD, true, false).isEmpty(),
+				"at full hunger with food carried there is no low_health_no_food (it is not a reason to flee)");
+		SurvivalPerception.Snapshot full = SurvivalPerception.evaluate(10.0D, 20.0D, 20, BREAD, false, true, new SurvivalPerception.Latch(), 0L);
+		check(full.bestFood() == BREAD && !full.canHealNow(), "bestFood is reported regardless of hunger; canHealNow needs it edible now");
 		SurvivalPerception.Latch latch = new SurvivalPerception.Latch();
 		List<String> heal = List.of(SurvivalPerception.HEAL_OPPORTUNITY);
 		check(latch.update(heal, 0L).contains(SurvivalPerception.HEAL_OPPORTUNITY), "the signal is reported");

@@ -29,7 +29,9 @@ public final class RiskOverlayClient {
 	}
 
 	public static boolean has(int entityId) {
-		return rows.containsKey(entityId);
+		Map<Integer, RiskOverlayPayload.Row> current = rows;
+		// Fast path: nothing to draw (no boxing per rendered entity) unless this player watches an agent.
+		return !current.isEmpty() && current.containsKey(entityId);
 	}
 
 	/** The name tag with the risk label appended (or the label alone), or {@code current} when no row exists. */

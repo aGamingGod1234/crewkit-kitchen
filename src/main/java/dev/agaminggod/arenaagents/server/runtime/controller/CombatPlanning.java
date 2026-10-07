@@ -168,6 +168,11 @@ public final class CombatPlanning {
 	public record PolicyCandidate(double distance, double risk, boolean attacking, boolean creeper) {
 	}
 
+	/** Players (other agents included) are switch candidates only when the model passed includePlayers:true. */
+	public static boolean switchableKind(boolean player, boolean includePlayers) {
+		return !player || includePlayers;
+	}
+
 	static boolean policyEligible(PolicyCandidate candidate) {
 		return candidate.attacking() && !candidate.creeper() && candidate.distance() <= THREAT_RANGE;
 	}

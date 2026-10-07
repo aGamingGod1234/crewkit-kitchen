@@ -1,6 +1,8 @@
 package dev.agaminggod.arenaagents.risk;
 
+import dev.agaminggod.arenaagents.server.perception.ObservationVisibility;
 import dev.agaminggod.arenaagents.server.perception.RiskAssessment;
+import dev.agaminggod.arenaagents.server.perception.ServerObservationCollector;
 import dev.agaminggod.arenaagents.server.pov.PovSession;
 import dev.agaminggod.arenaagents.server.pov.PovSessionRuntime;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
@@ -71,8 +73,11 @@ public final class RiskOverlayPublisher {
 
 	private static RiskOverlayPayload snapshot(ServerPlayer agent) {
 		List<RiskOverlayPayload.Row> rows = new ArrayList<>();
+		// Only what the agent itself perceives, so a takeover or spectator never learns hidden positions via labels.
+		ObservationVisibility.Frame visibility = ObservationVisibility.frame(agent.level(), agent);
 		List<LivingEntity> nearby = agent.level().getEntitiesOfClass(LivingEntity.class, agent.getBoundingBox().inflate(RANGE),
-				entity -> agent.distanceTo(entity) <= RANGE && RiskAssessment.carriesRisk(agent, entity));
+				entity -> agent.distanceTo(entity) <= RANGE && RiskAssessment.carriesRisk(agent, entity)
+						&& ServerObservationCollector.perceives(agent, visibility, entity));
 		nearby.sort(Comparator.comparingDouble(agent::distanceTo));
 		for (LivingEntity entity : nearby) {
 			if (rows.size() >= RiskOverlayPayload.MAX_ROWS) break;

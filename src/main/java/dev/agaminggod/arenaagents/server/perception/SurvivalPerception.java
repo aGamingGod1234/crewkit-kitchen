@@ -63,7 +63,7 @@ public final class SurvivalPerception {
 		boolean threatened = !threats.entries().isEmpty();
 		boolean safe = threats.entries().stream().noneMatch(entry -> entry.distance() <= SAFE_RANGE || entry.targeting());
 		Snapshot snapshot = evaluate(agent.getHealth(), agent.getMaxHealth(), agent.getFoodData().getFoodLevel(),
-				bestFood(agent, agent.getFoodData().getFoodLevel()), threatened, safe,
+				bestFood(agent), threatened, safe,
 				latches.computeIfAbsent(agentId, ignored -> new Latch()), tick);
 		latest.put(agentId, new Tracked(tick, snapshot));
 		return snapshot;
@@ -82,12 +82,14 @@ public final class SurvivalPerception {
 		return food != null && (foodLevel < MAX_FOOD_LEVEL || food.alwaysEdible());
 	}
 
-	/** Raw (undebounced) signals. Pure so the thresholds verify without a server. */
+	/**
+	 * Raw (undebounced) signals. Pure so the thresholds verify without a server. {@code food} is the best food carried
+	 * regardless of hunger: a heal opportunity needs it edible now, while low_health_no_food means truly none carried.
+	 */
 	static List<String> rawSignals(double health, double maxHealth, int foodLevel, Food food, boolean threatened, boolean safe) {
 		List<String> signals = new ArrayList<>(2);
-		boolean edible = canEat(food, foodLevel);
-		if (health < maxHealth && hurt(health, maxHealth) && safe && edible) signals.add(HEAL_OPPORTUNITY);
-		if (health <= maxHealth * LOW_FRACTION && threatened && !edible) signals.add(LOW_HEALTH_NO_FOOD);
+		if (health < maxHealth && hurt(health, maxHealth) && safe && canEat(food, foodLevel)) signals.add(HEAL_OPPORTUNITY);
+		if (health <= maxHealth * LOW_FRACTION && threatened && food == null) signals.add(LOW_HEALTH_NO_FOOD);
 		return signals;
 	}
 
@@ -125,8 +127,8 @@ public final class SurvivalPerception {
 		}
 	}
 
-	/** Best food edible right now (most nutrition plus saturation), skipping harmful foods; null when none. */
-	static Food bestFood(ServerPlayer agent, int foodLevel) {
+	/** Best food carried (most nutrition plus saturation), skipping harmful foods; null when none. Hunger does not matter. */
+	static Food bestFood(ServerPlayer agent) {
 		Food best = null;
 		var inventory = agent.getInventory();
 		for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
@@ -137,7 +139,6 @@ public final class SurvivalPerception {
 			String itemId = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
 			if (HARMFUL_FOODS.contains(itemId)) continue;
 			Food food = new Food(slot, itemId, properties.nutrition(), properties.saturation(), properties.canAlwaysEat());
-			if (!canEat(food, foodLevel)) continue;
 			if (best == null || food.nutrition() + food.saturation() > best.nutrition() + best.saturation()) best = food;
 		}
 		return best;

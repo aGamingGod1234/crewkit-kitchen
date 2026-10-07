@@ -4,7 +4,7 @@ import test from 'node:test';
 import { parseArenaScript } from '../src/arena-script/parser.mjs';
 import { DangerSteerCoalescer } from '../src/danger-steer-coalescer.mjs';
 import { AWAITING_CONFIRMATION_EVENT_INSTRUCTION, buildNativeEventInput, classifyObservationTrigger } from '../src/dynamic-main.mjs';
-import { MINECRAFT_DYNAMIC_TOOLS, NATIVE_AGENT_INSTRUCTIONS } from '../src/native-minecraft-tools.mjs';
+import { MINECRAFT_DYNAMIC_TOOLS, NATIVE_AGENT_INSTRUCTIONS, toolResultContent } from '../src/native-minecraft-tools.mjs';
 import { AWAITING_CONFIRMATION_MESSAGE } from '../src/native-tool-runtime.mjs';
 import { adaptObservation, survivalFacts, threatFacts } from '../src/observation-adapter.mjs';
 import { PLANNER_SYSTEM_PROMPT } from '../src/prompts.mjs';
@@ -93,4 +93,34 @@ test('native guidance stays under the cap and says when to heal and that confirm
 	assert.match(AWAITING_CONFIRMATION_EVENT_INSTRUCTION, /act on player messages now with any tool/);
 	const working = buildNativeEventInput(record, { event: 'conversation', trigger: 'conversation' });
 	assert.match(working.slice(0, working.indexOf('\n')), /^Live Minecraft event\. Advance the current goal/);
+});
+
+test('fight_target includePlayers is an explicit model opt-in, documented with the policy', () => {
+	assert.doesNotThrow(() => validateAction({ type: 'fight_target', targetId: ZOMBIE, includePlayers: true, timeoutMs: 15000 }));
+	assert.throws(() => validateAction({ type: 'fight_target', targetId: ZOMBIE, includePlayers: 'yes', timeoutMs: 15000 }), /includePlayers/);
+	parseArenaScript(`program.onUnhandledAttention("continue_and_notify"); await player.fightTarget({ targetId: "${ZOMBIE}", includePlayers: false, timeoutMs: 15000 });`);
+	assert.match(MINECRAFT_DYNAMIC_TOOLS.find((tool) => tool.name === 'act').description, /skip players unless includePlayers:true/);
+	assert.match(PLANNER_SYSTEM_PROMPT, /players only if includePlayers:true/);
+});
+
+const riskyEntity = (index) => ({ uuid: `00000000-0000-0000-0000-${String(index).padStart(12, '0')}`, stableId: `00000000-0000-0000-0000-${String(index).padStart(12, '0')}`,
+	type: 'minecraft:zombie', name: 'Zombie', distance: 3 + index, x: index, y: 64, z: 0, hostile: true, alive: true,
+	potentialRisk: 45 + index, risk: 56 + index, expectedHitDamage: 3, equipment: Array.from({ length: 40 }, (_, slot) => ({ slot: `slot-${slot}`, itemId: 'minecraft:stone', enchanted: false, note: 'x'.repeat(200) })) });
+
+test('entity risk fields survive event and tool-result compaction', () => {
+	const entities = Array.from({ length: 12 }, (_, index) => riskyEntity(index));
+	const input = buildNativeEventInput({ goalRevision: 1, currentGoal: 'Survive.' }, { event: 'observation', trigger: 'threat',
+		observation: { player: { health: 12 }, entities, inventory: { items: [] }, items: [], blocks: [] } });
+	const event = JSON.parse(input.slice(input.indexOf('\n') + 1));
+	const row = event.observation.entities.find((entity) => entity.risk !== undefined);
+	assert.ok(row, 'an engaging entity keeps its risk in the event');
+	assert.equal(typeof row.potentialRisk, 'number');
+	assert.equal(row.expectedHitDamage, 3);
+	assert.equal(row.equipment, undefined, 'the heavy detail was compacted away, so compaction ran');
+	const tool = JSON.parse(toolResultContent({ state: 'SUCCEEDED', observation: { player: { health: 12 }, entities, inventory: { items: [] }, blocks: [] } }).contentItems[0].text);
+	const compacted = tool.observation.entities[0];
+	assert.equal(compacted.risk, 56);
+	assert.equal(compacted.potentialRisk, 45);
+	assert.equal(compacted.expectedHitDamage, 3);
+	assert.equal(compacted.equipment, undefined, 'the tool result went through row compaction');
 });

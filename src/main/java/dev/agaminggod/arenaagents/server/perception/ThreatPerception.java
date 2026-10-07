@@ -109,6 +109,7 @@ public final class ThreatPerception {
 	 */
 	public static boolean isActiveThreat(ServerPlayer agent, LivingEntity entity) {
 		if (!entity.isAlive() || entity.isDeadOrDying() || entity == agent) return false;
+		if (!RiskAssessment.isRiskablePlayer(entity)) return false;
 		if (entity instanceof Mob mob && isHostileTo(mob, agent)) return true;
 		return RiskAssessment.attackedRecently(agent, entity);
 	}
@@ -140,21 +141,24 @@ public final class ThreatPerception {
 			boolean sight, double distance, boolean attacked) {
 		List<String> signals = new ArrayList<>(5);
 		if (distance > RANGE) return signals;
-		if (attacked) signals.add(ATTACKED);
-		if (neutral && !targeting) return signals;
-		if (targeting) signals.add(TARGETING);
-		if (swelling) signals.add(SWELLING);
-		if (creeper && distance <= CREEPER_CLOSE && (sight || targeting)) signals.add(CREEPER_CLOSE_SIGNAL);
-		if (ranged && sight) signals.add(RANGED_SIGHT);
+		if (!neutral || targeting) {
+			if (targeting) signals.add(TARGETING);
+			if (swelling) signals.add(SWELLING);
+			if (creeper && distance <= CREEPER_CLOSE && (sight || targeting)) signals.add(CREEPER_CLOSE_SIGNAL);
+			if (ranged && sight) signals.add(RANGED_SIGHT);
+		}
+		// attacked never duplicates another signal for the same creature.
+		if (attacked && signals.isEmpty()) signals.add(ATTACKED);
 		return signals;
 	}
 
 	private Snapshot scan(AgentId agentId, ServerPlayer agent, long tick) {
 		// Hostile mobs, plus any creature or player that hurt the agent recently. Players are otherwise only
 		// potential risks (entity rows) and never appear here just for being near or armed.
+		boolean anyAttackers = AggressionLedger.server().hasAttackers(agent.getUUID(), tick);
 		List<LivingEntity> candidates = agent.level().getEntitiesOfClass(LivingEntity.class, agent.getBoundingBox().inflate(RELEASE_RANGE),
 				entity -> entity != agent && entity.isAlive() && !(entity instanceof EnderDragon) && !(entity instanceof WitherBoss)
-						&& (entity instanceof Enemy || RiskAssessment.attackedRecently(agent, entity)));
+						&& (entity instanceof Enemy || (anyAttackers && RiskAssessment.attackedRecently(agent, entity))));
 		Set<String> raw = new HashSet<>();
 		Set<String> present = new HashSet<>();
 		Map<String, LivingEntity> byId = new HashMap<>();
@@ -164,7 +168,7 @@ public final class ThreatPerception {
 			double distance = agent.distanceTo(entity);
 			if (distance > RELEASE_RANGE) continue;
 			String id = entity.getUUID().toString();
-			boolean attacked = RiskAssessment.attackedRecently(agent, entity);
+			boolean attacked = anyAttackers && RiskAssessment.attackedRecently(agent, entity);
 			Mob mob = entity instanceof Mob value ? value : null;
 			boolean targeting = mob != null && mob.getTarget() == agent;
 			boolean creeper = entity instanceof Creeper;
@@ -179,7 +183,8 @@ public final class ThreatPerception {
 			geometry.put(id, new double[] {distance, bearing(agent, entity)});
 			flags.put(id, new boolean[] {targeting, swelling, sight});
 			boolean neutral = mob == null || isNeutral(mob) || !(entity instanceof Enemy);
-			for (String signal : signals(neutral, targeting, creeper, swelling, ranged, sight, distance, attacked)) {
+			// attacked is only for players and neutral or passive creatures; a hostile mob's hit is already damage attention.
+			for (String signal : signals(neutral, targeting, creeper, swelling, ranged, sight, distance, attacked && neutral)) {
 				raw.add(ThreatSignalLatch.key(id, signal));
 			}
 		}
@@ -192,20 +197,21 @@ public final class ThreatPerception {
 			firstSeen.merge(ThreatSignalLatch.threatId(key), latch.firstSeen(key), Math::min);
 		}
 		if (signals.isEmpty()) return Snapshot.EMPTY;
-		List<Entry> entries = new ArrayList<>();
-		for (Map.Entry<String, List<String>> threat : signals.entrySet()) {
-			LivingEntity entity = byId.get(threat.getKey());
-			double[] where = geometry.get(threat.getKey());
-			boolean[] state = flags.get(threat.getKey());
-			RiskAssessment.Assessment assessment = RiskAssessment.assess(agent, entity);
-			entries.add(new Entry(threat.getKey(), BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString(),
-					round(where[0]), round(where[1]), state[0], state[1], state[2], List.copyOf(threat.getValue()),
-					assessment.risk(), assessment.model().factors(), assessment.hit().damage()));
-		}
 		// With more than 8 threats, report the 8 latched first. A distance cut would reshuffle as mobs move and
 		// every reshuffle would look like a new signal; first-seen order only changes when a threat clears.
-		entries.sort(Comparator.<Entry>comparingLong(entry -> firstSeen.get(entry.uuid())).thenComparing(Entry::uuid));
-		List<Entry> limited = new ArrayList<>(entries.subList(0, Math.min(MAX_ENTRIES, entries.size())));
+		// Risk is assessed only for the kept threats, after the cut, to keep the per-tick cost bounded.
+		List<String> kept = new ArrayList<>(signals.keySet());
+		kept.sort(Comparator.<String>comparingLong(firstSeen::get).thenComparing(Comparator.naturalOrder()));
+		List<Entry> limited = new ArrayList<>(Math.min(MAX_ENTRIES, kept.size()));
+		for (String id : kept.subList(0, Math.min(MAX_ENTRIES, kept.size()))) {
+			LivingEntity entity = byId.get(id);
+			double[] where = geometry.get(id);
+			boolean[] state = flags.get(id);
+			RiskAssessment.Assessment assessment = RiskAssessment.assess(agent, entity);
+			limited.add(new Entry(id, BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString(),
+					round(where[0]), round(where[1]), state[0], state[1], state[2], List.copyOf(signals.get(id)),
+					assessment.risk(), assessment.model().factors(), assessment.hit().damage()));
+		}
 		limited.sort(RISK_ORDER);
 		int weaponSlot = HotbarWeapons.bestSlotOrNone(agent);
 		ItemStack weapon = weaponSlot < 0 ? ItemStack.EMPTY : agent.getInventory().getItem(weaponSlot);

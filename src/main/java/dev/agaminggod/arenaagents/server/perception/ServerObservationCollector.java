@@ -790,6 +790,18 @@ public final class ServerObservationCollector {
 		return heard.size() > 8 ? List.copyOf(heard.subList(0, 8)) : heard;
 	}
 
+	/**
+	 * Whether the agent perceives this entity the way its observation does: seen (in view with line of sight), or
+	 * heard as a hostile hunting it within 16 blocks. Used to keep presentation from revealing hidden positions.
+	 */
+	public static boolean perceives(ServerPlayer agent, ObservationVisibility.Frame visibility, Entity entity) {
+		if (visibility.isEntityWithinView(entity) && visibility.hasLineOfSight(entity)) return true;
+		if (!(entity instanceof net.minecraft.world.entity.Mob mob) || !ThreatPerception.isHostileTo(mob, agent)
+				|| agent.distanceTo(mob) > ThreatPerception.RANGE) return false;
+		boolean hurtRecently = agent.getLastHurtByMob() == mob && agent.tickCount - agent.getLastHurtByMobTimestamp() <= 100;
+		return hearsThreat(mob.getTarget() == agent, hurtRecently, false);
+	}
+
 	/** A hunting hostile the agent cannot see is still perceived (by sound); a visible one is reported by sight. */
 	static boolean hearsThreat(boolean targetingAgent, boolean hurtAgentRecently, boolean visible) {
 		return !visible && (targetingAgent || hurtAgentRecently);

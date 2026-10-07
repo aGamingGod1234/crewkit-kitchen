@@ -39,6 +39,10 @@ import net.minecraft.world.phys.Vec3;
  * cancelled fight's weapon slot and swing timing (a short handoff, so the stance carries over), and the optional
  * model-chosen targetPolicy (highest_risk or nearest_attacker) re-evaluates attackers twice a second with
  * hysteresis (see {@link CombatPlanning#policyRetarget}).
+ *
+ * <p>Follow-through and policy switching only consider mobs. Players (other agents included) are only ever switched to
+ * when the model passed includePlayers:true; creative and spectator players never are. A stray sweep, arrow or thorns
+ * hit from another player therefore never starts a player fight the model did not choose.
  */
 public final class ServerFightController implements ServerController {
 	static final double MAX_CHASE_DISTANCE = 32.0D;
@@ -58,6 +62,7 @@ public final class ServerFightController implements ServerController {
 	private final Float fleeAtHealth;
 	private final boolean continueWithAttackers;
 	private final CombatPlanning.TargetPolicy targetPolicy;
+	private final boolean includePlayers;
 	private int ticksOnTarget;
 	private int policyCountdown = CombatPlanning.POLICY_INTERVAL_TICKS;
 	private int policySwitches;
@@ -80,13 +85,14 @@ public final class ServerFightController implements ServerController {
 
 	public ServerFightController(LivingEntity target, Double desiredRange, Float fleeAtHealth, boolean continueWithAttackers,
 			long timeoutMs, long startedAt) {
-		this(target, desiredRange, fleeAtHealth, continueWithAttackers, CombatPlanning.TargetPolicy.NAMED, timeoutMs, startedAt);
+		this(target, desiredRange, fleeAtHealth, continueWithAttackers, CombatPlanning.TargetPolicy.NAMED, false, timeoutMs, startedAt);
 	}
 
 	public ServerFightController(LivingEntity target, Double desiredRange, Float fleeAtHealth, boolean continueWithAttackers,
-			CombatPlanning.TargetPolicy targetPolicy, long timeoutMs, long startedAt) {
+			CombatPlanning.TargetPolicy targetPolicy, boolean includePlayers, long timeoutMs, long startedAt) {
 		this.target = Objects.requireNonNull(target, "target must not be null");
 		this.targetPolicy = Objects.requireNonNull(targetPolicy, "targetPolicy must not be null");
+		this.includePlayers = includePlayers;
 		this.targetType = typeOf(target);
 		this.desiredRange = desiredRange == null ? CombatPlanning.DEFAULT_FIGHT_RANGE : desiredRange;
 		this.fleeAtHealth = fleeAtHealth;
@@ -235,10 +241,19 @@ public final class ServerFightController implements ServerController {
 				|| RiskAssessment.attackedRecently(player, hostile);
 	}
 
-	/** Hostile mobs, plus players or other creatures only while they actively attack the agent. */
+	/**
+	 * Candidates for follow-through and policy switches: hostile mobs and creatures actively attacking the agent.
+	 * Players only when the model opted in with includePlayers (never creative or spectator players).
+	 */
 	private List<LivingEntity> nearbyHostiles(ServerPlayer player) {
 		return player.level().getEntitiesOfClass(LivingEntity.class, player.getBoundingBox().inflate(CombatPlanning.THREAT_RANGE),
-				entity -> entity != target && entity != player && ThreatPerception.isActiveThreat(player, entity));
+				entity -> entity != target && entity != player && switchable(entity, includePlayers)
+						&& ThreatPerception.isActiveThreat(player, entity));
+	}
+
+	/** Pure gate: a player is only a follow-through or policy candidate when the model opted in. */
+	static boolean switchable(LivingEntity entity, boolean includePlayers) {
+		return CombatPlanning.switchableKind(entity instanceof net.minecraft.world.entity.player.Player, includePlayers);
 	}
 
 	/** Takes over the weapon slot and swing timing of a fight the model just replaced (replaceAction retarget). */
@@ -282,7 +297,10 @@ public final class ServerFightController implements ServerController {
 	private String remainingThreats(ServerPlayer player) {
 		String switches = policySwitches == 0 ? "" : "; " + targetPolicy.wireName() + " switched target " + policySwitches + "x";
 		List<LivingEntity> remaining = new ArrayList<>();
-		for (LivingEntity hostile : nearbyHostiles(player)) {
+		// Reported to the model even when they are not switch candidates: it can still choose to fight them.
+		for (LivingEntity hostile : player.level().getEntitiesOfClass(LivingEntity.class,
+				player.getBoundingBox().inflate(CombatPlanning.THREAT_RANGE),
+				entity -> entity != target && entity != player && ThreatPerception.isActiveThreat(player, entity))) {
 			if (ThreatPerception.isSensedThreat(player, hostile)) remaining.add(hostile);
 		}
 		if (remaining.isEmpty()) return switches + (continueWithAttackers ? "; no other attackers" : "");
