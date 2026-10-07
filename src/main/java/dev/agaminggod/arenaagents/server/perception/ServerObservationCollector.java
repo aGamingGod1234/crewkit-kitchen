@@ -136,6 +136,10 @@ public final class ServerObservationCollector {
 		player.addProperty("maxAir", Math.max(1, agent.getMaxAirSupply()));
 		// Eyes under water: air is draining. airSecondsLeft is the time before drowning damage starts.
 		player.addProperty("underWater", agent.isUnderWater());
+		// Only while an operator's /takeover owns the body, so the coordinator never wakes the model to act on it.
+		if (dev.agaminggod.arenaagents.server.pov.AgentControlReservations.isReserved(level.getServer(), agentId)) {
+			player.addProperty("operatorControlled", true);
+		}
 		if (agent.isUnderWater()) {
 			player.addProperty("airSecondsLeft", Math.round(dev.agaminggod.arenaagents.server.runtime.controller.SwimPlanning
 					.airSecondsLeft(agent.getAirSupply()) * 10.0D) / 10.0D);

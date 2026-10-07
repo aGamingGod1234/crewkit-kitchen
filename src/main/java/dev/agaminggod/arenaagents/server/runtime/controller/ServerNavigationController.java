@@ -90,6 +90,8 @@ public final class ServerNavigationController implements ServerController {
 	private ResourceKey<Level> startingDimension;
 	/** Elapsed ms when the current rise to the water surface began, or -1 while not surfacing. */
 	private long surfacingSinceMs = -1L;
+	private long surfacingCheckMs;
+	private double surfacingCheckDistance;
 
 	public ServerNavigationController(
 			Vec3 destination,
@@ -141,15 +143,44 @@ public final class ServerNavigationController implements ServerController {
 		// handed a sinking, drowning body back to the model (the play-test's NO_STANDABLE_PATH / AIR_RESERVE_REACHED).
 		if (SwimPlanning.needsSurfacing(player.isInWater(), player.isUnderWater())
 				&& (plan == null || !hasAirReserve(true, player.getAirSupply()))) {
-			if (surfacingSinceMs < 0L) surfacingSinceMs = elapsedMs;
+			// Head for the nearest open surface (not the destination): ice, an overhang, a sealed tunnel or a downward
+			// bubble column above means another column, or none, and the model must hear that while it has breath.
+			Vec3 eye = player.getEyePosition();
+			SwimPlanning.Surface open = SwimPlanning.nearestSurface(columnView(player.level()),
+					net.minecraft.util.Mth.floor(eye.x), net.minecraft.util.Mth.floor(eye.y), net.minecraft.util.Mth.floor(eye.z));
+			String reasonCode = player.getAirSupply() <= MIN_AIR_RESERVE ? "AIR_RESERVE_REACHED" : "NO_STANDABLE_PATH";
+			double air = SwimPlanning.airSecondsLeft(player.getAirSupply());
+			if (open == null) {
+				return fail(player, reasonCode, String.format(java.util.Locale.ROOT,
+						"No open water surface within %d blocks (ice, overhang or sealed water above); %.1f s of air left",
+						SwimPlanning.SURFACE_SEARCH_RADIUS, air), currentProgress());
+			}
+			double distance = eye.distanceTo(new Vec3(open.x() + 0.5D, open.openY(), open.z() + 0.5D));
+			if (!SwimPlanning.surfacingFeasible(player.getAirSupply(), distance)) {
+				return fail(player, reasonCode, String.format(java.util.Locale.ROOT,
+						"The nearest open surface is %.1f blocks away but only %.1f s of air are left", distance, air), currentProgress());
+			}
+			if (surfacingSinceMs < 0L) {
+				surfacingSinceMs = elapsedMs;
+				surfacingCheckMs = elapsedMs;
+				surfacingCheckDistance = distance;
+			} else if (elapsedMs - surfacingCheckMs >= SwimPlanning.SURFACING_PROGRESS_WINDOW_MS) {
+				if (surfacingCheckDistance - distance < SwimPlanning.SURFACING_MIN_PROGRESS) {
+					return fail(player, reasonCode, String.format(java.util.Locale.ROOT,
+							"Rising to the surface made no progress for 1 s (a current or obstruction); %.1f blocks to go, %.1f s of air left",
+							distance, air), currentProgress());
+				}
+				surfacingCheckMs = elapsedMs;
+				surfacingCheckDistance = distance;
+			}
 			if (elapsedMs - surfacingSinceMs >= SwimPlanning.SURFACING_TIMEOUT_MS) {
-				return fail(player, player.getAirSupply() <= MIN_AIR_RESERVE ? "AIR_RESERVE_REACHED" : "NO_STANDABLE_PATH",
+				return fail(player, reasonCode,
 						String.format(java.util.Locale.ROOT, "Could not rise to the water surface within %d s (%.1f s of air left)",
-								SwimPlanning.SURFACING_TIMEOUT_MS / 1_000L, SwimPlanning.airSecondsLeft(player.getAirSupply())),
+								SwimPlanning.SURFACING_TIMEOUT_MS / 1_000L, air),
 						currentProgress());
 			}
 			plan = null;
-			surface(player, nowEpochMs);
+			surface(player, nowEpochMs, open);
 			return TickResult.running(currentProgress());
 		}
 		surfacingSinceMs = -1L;
@@ -571,23 +602,38 @@ public final class ServerNavigationController implements ServerController {
 		return null;
 	}
 
+	/** How the world above looks to a swimmer: water, open air (the surface) or solid (a downward bubble column too). */
+	static SwimPlanning.ColumnView columnView(net.minecraft.server.level.ServerLevel level) {
+		return (x, y, z) -> {
+			if (level.isOutsideBuildHeight(y) || !level.hasChunk(x >> 4, z >> 4)) return SwimPlanning.Cell.SOLID;
+			net.minecraft.core.BlockPos position = new net.minecraft.core.BlockPos(x, y, z);
+			net.minecraft.world.level.block.state.BlockState state = level.getBlockState(position);
+			if (!state.getCollisionShape(level, position).isEmpty()) return SwimPlanning.Cell.SOLID;
+			if (state.is(net.minecraft.world.level.block.Blocks.BUBBLE_COLUMN)
+					&& state.getValue(net.minecraft.world.level.block.BubbleColumnBlock.DRAG_DOWN)) return SwimPlanning.Cell.SOLID;
+			if (state.getFluidState().is(net.minecraft.tags.FluidTags.WATER)) return SwimPlanning.Cell.WATER;
+			return state.getFluidState().isEmpty() ? SwimPlanning.Cell.OPEN : SwimPlanning.Cell.SOLID;
+		};
+	}
+
 	/**
-	 * One surfacing tick: hold jump, look up and sprint-swim toward the destination, which is how a player gets out
-	 * of deep water; the route is planned once the eyes are above the surface.
+	 * One surfacing tick: hold jump, look up and sprint-swim toward the nearest open surface, which is how a player
+	 * gets out of deep water; the route is planned once the eyes are above the surface.
 	 */
-	private void surface(ServerPlayer player, long nowEpochMs) {
+	private void surface(ServerPlayer player, long nowEpochMs, SwimPlanning.Surface open) {
 		if (inputLease == null) {
 			inputController = AgentInputRuntime.controller(player);
 			inputLease = inputController.acquire(AgentInputRuntime.requireAgentId(player), InputOwner.NAVIGATION, 100);
 		}
 		if (motorState == null) motorState = AgentInputStates.MotorState.initial(player.getYRot(), player.getXRot());
-		double dx = destination.x - player.getX();
-		double dz = destination.z - player.getZ();
-		float yaw = dx * dx + dz * dz < 0.0025D ? motorState.yaw()
+		double dx = open.x() + 0.5D - player.getX();
+		double dz = open.z() + 0.5D - player.getZ();
+		boolean across = dx * dx + dz * dz > 0.16D;
+		float yaw = !across ? motorState.yaw()
 				: net.minecraft.util.Mth.wrapDegrees((float) Math.toDegrees(Math.atan2(-dx, dz)));
-		boolean swimSprint = SwimPlanning.swimSprint(true, true, 1.0F, player.getFoodData().getFoodLevel());
+		boolean swimSprint = across && SwimPlanning.swimSprint(true, true, 1.0F, player.getFoodData().getFoodLevel());
 		AgentInputStates.MotorStep step = AgentInputStates.stepMotor(motorState,
-				new AgentInputStates.MotorTarget(yaw, SwimPlanning.SURFACING_PITCH, true, SwimPlanning.holdJump(true), swimSprint),
+				new AgentInputStates.MotorTarget(yaw, SwimPlanning.SURFACING_PITCH, across, SwimPlanning.holdJump(true), swimSprint),
 				nowEpochMs);
 		motorState = step.state();
 		lastSprint = step.sprint();
@@ -603,7 +649,8 @@ public final class ServerNavigationController implements ServerController {
 		if (inputLease == null || motorState == null) return;
 		// Afloat, keep holding jump while planning; releasing it sank the body back under between plans.
 		inputController.apply(inputLease, new dev.agaminggod.arenaagents.server.runtime.input.AgentInputState(
-				0.0F, 0.0F, SwimPlanning.holdJump(player.isInWater()), false, lastSprint && player.getFoodData().getFoodLevel() > 6,
+				0.0F, 0.0F, SwimPlanning.floatJump(player.isInWater(), player.onGround(), player.isUnderWater()), false,
+				lastSprint && player.getFoodData().getFoodLevel() > 6,
 				false, false, motorState.yaw(), motorState.pitch(),
 				player.getInventory().getSelectedSlot(), InteractionHand.MAIN_HAND
 		));

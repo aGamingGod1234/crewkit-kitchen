@@ -141,7 +141,8 @@ public final class ServerFightController implements ServerController {
 		if (distance < closestDistance - 0.5D) {
 			closestDistance = distance;
 			ticksWithoutProgress = 0;
-		} else if (++ticksWithoutProgress >= SwimPlanning.unreachableTicks(player.isInWater(), target.isInWater(), UNREACHABLE_TICKS)) {
+		} else if (++ticksWithoutProgress >= SwimPlanning.unreachableTicks(
+				SwimPlanning.floatJump(player.isInWater(), player.onGround(), player.isUnderWater()), UNREACHABLE_TICKS)) {
 			// In water the approach is a swim, which is slower and bobs; it gets a fair (10 s) attempt first.
 			return finish(TickResult.failed("TARGET_UNREACHABLE", String.format(Locale.ROOT,
 					"No hit or approach on %s for %d seconds at %.1f blocks%s", targetType, ticksWithoutProgress / 20, distance,
@@ -172,7 +173,8 @@ public final class ServerFightController implements ServerController {
 		int food = player.getFoodData().getFoodLevel();
 		// Swimming approach: stay afloat (or sink toward a target clearly below) and sprint-swim along the aim while
 		// submerged, so the view pitch toward the target steers the swim up or down like a player's.
-		boolean jump = SwimPlanning.fightJump(inWater, target.getY() - player.getY())
+		boolean jump = SwimPlanning.fightJump(SwimPlanning.floatJump(inWater, player.onGround(), player.isUnderWater()),
+				target.getY() - player.getY())
 				|| (forward > 0.0F && player.onGround() && player.horizontalCollision);
 		boolean sprint = (step.sprint() && food > 6) || SwimPlanning.swimSprint(inWater, player.isUnderWater(), forward, food);
 		input.apply(player, new AgentInputState(forward, 0.0F, jump, false, sprint, false, false,

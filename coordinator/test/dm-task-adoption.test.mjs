@@ -16,8 +16,6 @@ const NATIVE_CONFIG = {
 };
 const WAIT = normalizeMinecraftToolCall('wait', { durationMs: 1_000 });
 const TAKE = { kind: 'take_task', resume: false };
-// With no task the body stays usable (like a player); only goal-bound tools such as finish are refused.
-const FINISH = { kind: 'finish', summary: 'Done.' };
 
 const dm = (text, sequence, goalRevision, sourceId = PLAYER) => ({ agentId: 'agent-a', payload: {
 	sequence, kind: 'player_message', sourceId, recipientId: 'agent-a', scope: 'direct',
@@ -88,7 +86,7 @@ test('takeTask is a model-visible tool and the native instructions tell the mode
 test('an idle agent adopts "go get a stone pickaxe" with takeTask, then acts with every tool', async () => {
 	const registry = new AgentRegistry();
 	const planner = scriptedPlanner(registry, [
-		[FINISH, TAKE, TAKE, WAIT],
+		[WAIT, TAKE, TAKE, WAIT],
 		[WAIT],
 	]);
 	const run = await start({ registry, planner, config: NATIVE_CONFIG });
@@ -97,8 +95,8 @@ test('an idle agent adopts "go get a stone pickaxe" with takeTask, then acts wit
 		await eventually(() => taskRequests(run.bridge).length === 1);
 		assert.equal(inputOf(planner.requests[0]).mode, 'conversation_only');
 		assert.match(planner.requests[0].input, /call takeTask/);
-		assert.equal(planner.outcomes[0].error?.code, 'CONVERSATION_ONLY', 'with no task there is nothing to finish');
-		assert.match(planner.outcomes[0].error.message, /takeTask for a player request/);
+		assert.equal(planner.outcomes[0].error?.code, 'CONVERSATION_ONLY', 'body tools still need an adopted task');
+		assert.match(planner.outcomes[0].error.message, /call takeTask first/);
 		// Minecraft starts the goal through its normal lifecycle, then answers the tool.
 		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: {
 			operation: 'start', goalRevision: 1, goal: 'go get a stone pickaxe', goalSpec: immutableGoalSpec('go get a stone pickaxe'),
@@ -216,11 +214,11 @@ test('a request Minecraft must translate first is reported as pending and starts
 	}
 });
 
-test('plain chat stays a chat reply: no task request and nothing to finish', async () => {
+test('plain chat stays a chat-only reply: no task request and no body actions', async () => {
 	const registry = new AgentRegistry();
 	const planner = scriptedPlanner(registry, [[
 		{ kind: 'action', actionType: 'chat', arguments: { message: 'Hi Lucas!', audience: 'direct', recipientId: PLAYER } },
-		FINISH,
+		WAIT,
 	]]);
 	const run = await start({ registry, planner, config: NATIVE_CONFIG });
 	try {

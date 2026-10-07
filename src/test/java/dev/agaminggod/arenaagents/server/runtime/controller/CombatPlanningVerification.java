@@ -272,9 +272,36 @@ public final class CombatPlanningVerification {
 				"a submerged agent looks up to surface; at the surface the requested pitch stays");
 		check(SwimPlanning.fightJump(true, 0.0D) && SwimPlanning.fightJump(true, 2.0D) && !SwimPlanning.fightJump(true, -3.0D)
 				&& !SwimPlanning.fightJump(false, 2.0D), "a water fight stays afloat unless the target is clearly below");
-		check(SwimPlanning.unreachableTicks(true, false, ServerFightController.UNREACHABLE_TICKS) > ServerFightController.UNREACHABLE_TICKS
-				&& SwimPlanning.unreachableTicks(false, false, ServerFightController.UNREACHABLE_TICKS) == ServerFightController.UNREACHABLE_TICKS,
-				"TARGET_UNREACHABLE only after a fair swim attempt; land fights keep 5 s");
+		check(SwimPlanning.unreachableTicks(true, ServerFightController.UNREACHABLE_TICKS) > ServerFightController.UNREACHABLE_TICKS
+				&& SwimPlanning.unreachableTicks(false, ServerFightController.UNREACHABLE_TICKS) == ServerFightController.UNREACHABLE_TICKS,
+				"TARGET_UNREACHABLE after a fair swim attempt only when the agent itself swims; otherwise 5 s");
+		check(SwimPlanning.floatJump(true, false, false) && SwimPlanning.floatJump(true, true, true)
+				&& !SwimPlanning.floatJump(true, true, false) && !SwimPlanning.floatJump(false, false, false),
+				"jump is held to rise or float, never while standing in one-deep or waterlogged blocks (no hopping)");
+
+		// Surfacing (review): the nearest open column, not the destination; ice or a sealed tunnel is reported.
+		SwimPlanning.ColumnView lakeAbove = (x, y, z) -> y >= 64 ? SwimPlanning.Cell.OPEN : SwimPlanning.Cell.WATER;
+		SwimPlanning.Surface straightUp = SwimPlanning.nearestSurface(lakeAbove, 0, 60, 0);
+		check(straightUp != null && straightUp.x() == 0 && straightUp.z() == 0 && straightUp.openY() == 64,
+				"open water above: rise straight up");
+		SwimPlanning.ColumnView iceSheet = (x, y, z) -> y >= 65 ? SwimPlanning.Cell.OPEN
+				: y == 64 && Math.abs(x) <= 3 ? SwimPlanning.Cell.SOLID : y == 64 ? SwimPlanning.Cell.OPEN : SwimPlanning.Cell.WATER;
+		SwimPlanning.Surface hole = SwimPlanning.nearestSurface(iceSheet, 0, 60, 0);
+		check(hole != null && Math.abs(hole.x()) == 4, "under an ice sheet or overhang it heads for the nearest open column");
+		SwimPlanning.ColumnView sealed = (x, y, z) -> y >= 62 ? SwimPlanning.Cell.SOLID : SwimPlanning.Cell.WATER;
+		check(SwimPlanning.nearestSurface(sealed, 0, 60, 0) == null, "a sealed tunnel has no surface to rise to");
+		check(SwimPlanning.surfacingFeasible(300, 8.0D) && !SwimPlanning.surfacingFeasible(40, 8.0D),
+				"surfacing fails fast when the breath left cannot cover the swim");
+
+		// Flee afloat (review): once clear of threats, steer for the nearest shore, not out across the lake.
+		WalkabilityView bay = position -> {
+			if (position.x() >= 5 && position.y() <= 63) return WalkabilityView.Cell.SAFE_SUPPORT;
+			if (position.y() == 63 || position.y() == 62) return WalkabilityView.Cell.WATER;
+			return position.y() < 62 ? WalkabilityView.Cell.SAFE_SUPPORT : WalkabilityView.Cell.CLEAR;
+		};
+		GridPosition bank = CombatPlanning.nearestShore(bay, new GridPosition(0, 63, 0), 12);
+		check(bank != null && bank.x() == 5 && bank.z() == 0, "the nearest shore is the closest standable bank cell");
+		check(CombatPlanning.nearestShore(deep, submerged, 6) == null, "open water with no bank in reach has no shore");
 		// The play-test flee ended ESCAPED while the agent was in the lake.
 		check(!SwimPlanning.fleeMayEnd(true, true, false), "never escaped while under water");
 		check(!SwimPlanning.fleeMayEnd(true, false, false), "never escaped while afloat in deep water (it sinks once released)");

@@ -373,6 +373,33 @@ public final class CombatPlanning {
 		return probe.passable() && probe.water();
 	}
 
+	/**
+	 * Nearest land a swimmer can climb onto: a standable (walk) cell within {@code radius} columns, at the feet level
+	 * or one to two above (a bank) or one below, nearest horizontally. Null when only water is in reach.
+	 */
+	public static GridPosition nearestShore(WalkabilityView world, GridPosition feet, int radius) {
+		Objects.requireNonNull(world, "world must not be null");
+		Objects.requireNonNull(feet, "feet must not be null");
+		GridPosition best = null;
+		int bestDistance = Integer.MAX_VALUE;
+		int[] levels = {0, 1, -1, 2};
+		for (int dx = -radius; dx <= radius; dx++) {
+			for (int dz = -radius; dz <= radius; dz++) {
+				int distance = dx * dx + dz * dz;
+				if (distance == 0 || distance > radius * radius || distance >= bestDistance) continue;
+				for (int dy : levels) {
+					GridPosition candidate = feet.offset(dx, dy, dz);
+					if (world.traversalAt(candidate) == TraversalType.WALK) {
+						best = candidate;
+						bestDistance = distance;
+						break;
+					}
+				}
+			}
+		}
+		return best;
+	}
+
 	/** True when walking along {@code yaw} keeps safe footing for the next two cells (the flee probe). */
 	public static boolean canStep(WalkabilityView world, GridPosition feet, float yaw) {
 		return probe(world, feet, yaw).passable();

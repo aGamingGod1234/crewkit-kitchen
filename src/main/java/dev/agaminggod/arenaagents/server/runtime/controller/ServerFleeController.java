@@ -44,6 +44,8 @@ public final class ServerFleeController implements ServerController {
 	private final CombatInputLease input = new CombatInputLease();
 	private AgentInputStates.MotorState motor;
 	private Float heading;
+	/** Escaped (or the chaser is gone) but still afloat: steer for the nearest shore this tick. */
+	private boolean seekShore;
 
 	public ServerFleeController(Entity target, double distance, long timeoutMs, long startedAt) {
 		this.target = Objects.requireNonNull(target, "target must not be null");
@@ -67,8 +69,10 @@ public final class ServerFleeController implements ServerController {
 		int blocker = CombatPlanning.escapeBlocker(otherThreats, distance);
 		boolean targetPresent = target.isAlive() && !target.isRemoved() && target.level() == player.level();
 		boolean mayEnd = SwimPlanning.fleeMayEnd(player.isInWater(), player.isUnderWater(), player.onGround());
+		seekShore = false;
 		if (!targetPresent) {
 			if (blocker < 0 && mayEnd) return finish(TickResult.succeeded("TARGET_GONE", targetType + " is gone" + clearOf(others)));
+			seekShore = blocker < 0;
 			// The named chaser is gone but others still close in: keep fleeing from them.
 			return drive(player, nowEpochMs, others, false) ? running(elapsed, others, blocker, 0.0D)
 					: blocked(player, others, -1.0D);
@@ -81,6 +85,7 @@ public final class ServerFleeController implements ServerController {
 		CombatPlanning.FleeProgress.Outcome outcome = progress.observe(current, hunting);
 		// A creeper as the named target is held to the same blast margin as any other creeper.
 		boolean creeperTooClose = target instanceof Creeper && current < CombatPlanning.CREEPER_SAFE_DISTANCE;
+		seekShore = blocker < 0 && !creeperTooClose && outcome != CombatPlanning.FleeProgress.Outcome.RUNNING;
 		if (blocker < 0 && !creeperTooClose && mayEnd) {
 			switch (outcome) {
 				case ESCAPED -> {
@@ -158,6 +163,12 @@ public final class ServerFleeController implements ServerController {
 		Float away = CombatPlanning.fleeAwayYaw(threats);
 		float awayYaw = away == null ? motor.yaw() : away;
 		GridPosition feet = new GridPosition(Mth.floor(player.getX()), Mth.floor(player.getY() + 0.2D), Mth.floor(player.getZ()));
+		if (seekShore) {
+			// Far enough from the threats but still afloat: head for the nearest shore instead of out across the water.
+			GridPosition shore = CombatPlanning.nearestShore(new MinecraftNavigationWorld(player.level()), feet,
+					SwimPlanning.SURFACE_SEARCH_RADIUS + 4);
+			if (shore != null) awayYaw = CombatPlanning.yawToward(player.getX(), player.getZ(), shore.x() + 0.5D, shore.z() + 0.5D);
+		}
 		CombatPlanning.Heading chosen = CombatPlanning.fleeHeading(
 				new MinecraftNavigationWorld(player.level()), feet, awayYaw, heading, waterPenalty(includeTarget, others));
 		if (!chosen.clear()) {
@@ -172,7 +183,8 @@ public final class ServerFleeController implements ServerController {
 		boolean eyesInWater = player.isUnderWater();
 		int food = player.getFoodData().getFoodLevel();
 		// In water a player holds space (rise, stay afloat, climb out at the shore) and sprint-swims while submerged.
-		boolean jump = SwimPlanning.holdJump(inWater) || (player.onGround() && (chosen.jump() || player.horizontalCollision));
+		boolean jump = SwimPlanning.floatJump(inWater, player.onGround(), eyesInWater)
+				|| (player.onGround() && (chosen.jump() || player.horizontalCollision));
 		boolean sprint = inWater ? SwimPlanning.swimSprint(true, eyesInWater, 1.0F, food) : food > 6;
 		AgentInputStates.MotorStep step = AgentInputStates.stepMotor(motor,
 				new AgentInputStates.MotorTarget(chosen.yaw(), SwimPlanning.swimPitch(inWater, eyesInWater, 0.0F), true, jump, sprint),

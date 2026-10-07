@@ -37,7 +37,9 @@ public final class AgentLifecycleReducer {
 				nowEpochMs,
 				""
 		);
-		return transition(current, revised, current.state().isActive(), current.state().isActive());
+		// An idle or completed agent may be running a detached self-preservation action; the new goal cancels it.
+		boolean cancelAction = current.state().isActive() || isDetachedActionState(current.state());
+		return transition(current, revised, cancelAction, current.state().isActive());
 	}
 
 	public static AgentTransition queue(AgentRecord current, String prompt, int queueLimit, long nowEpochMs) {
@@ -262,7 +264,8 @@ public final class AgentLifecycleReducer {
 				nowEpochMs,
 				current.lastError()
 		);
-		return transition(current, promoted, false, false);
+		// The completed agent may still be running a detached action; the promoted goal must not inherit it.
+		return transition(current, promoted, true, false);
 	}
 
 	public static AgentTransition rejectQueuedGoal(
@@ -418,9 +421,22 @@ public final class AgentLifecycleReducer {
 		}
 	}
 
-	/** States without an active task in which the model may still act (fight, flee, eat, equip...). */
+	/** States without an active task in which the model may still defend itself (fight, flee, eat, equip...). */
 	public static boolean isDetachedActionState(AgentLifecycleState state) {
 		return state == AgentLifecycleState.IDLE || state == AgentLifecycleState.COMPLETED;
+	}
+
+	/**
+	 * Self-preservation actions a danger-woken agent without a task may take: fight or flee, eat or drink, raise a
+	 * shield or totem, equip armor and weapons, move away and look. Breaking, placing, crafting, containers, chat
+	 * and other work still need a task the model adopted (takeTask), so nobody can steer the body around it.
+	 */
+	public static boolean isSelfPreservationAction(dev.agaminggod.arenaagents.protocol.ActionType type) {
+		return switch (type) {
+			case FIGHT_TARGET, FLEE_FROM, ATTACK, USE_RANGED, BLOCK_WITH_SHIELD, USE_ITEM, SELECT_ITEM, SELECT_TOOL,
+					EQUIP_ITEM, NAVIGATE_TO, MOVE_TO, LOOK_AT, CONTROL, CONTROL_SEQUENCE, WAIT, DISMOUNT, WAKE_UP -> true;
+			default -> false;
+		};
 	}
 
 	private static long nextRevision(AgentRecord current) {

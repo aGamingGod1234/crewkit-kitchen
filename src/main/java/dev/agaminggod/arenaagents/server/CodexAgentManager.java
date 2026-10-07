@@ -628,7 +628,20 @@ public final class CodexAgentManager {
 
 	public AgentTransition stop(String selector) {
 		AgentRecord record = resolve(selector);
+		// No task to pause, but the body may be running a detached self-preservation action: stop that instead of
+		// failing (and without inventing a goal). The lifecycle and revision stay unchanged.
+		if (dev.agaminggod.arenaagents.agent.AgentLifecycleReducer.isDetachedActionState(record.state())) {
+			cancelDetachedAction(record.agentId(), "Stopped by an operator");
+			return new AgentTransition(record, record, true, false);
+		}
 		return savedData.registry().stop(record.agentId(), System.currentTimeMillis());
+	}
+
+	/** Cancels any detached action of an idle or completed agent and releases its held keys. */
+	public boolean cancelDetachedAction(AgentId agentId, String reason) {
+		boolean cancelled = runtimeHooks.cancelDetachedAction(agentId, reason);
+		if (server != null) findAgentPlayer(agentId).ifPresent(OfflineAgentPlayers::stop);
+		return cancelled;
 	}
 
 	public AgentTransition resume(String selector) {

@@ -31,6 +31,14 @@ public final class SwimPlanning {
 		return inWater;
 	}
 
+	/**
+	 * Hold jump only when the body must rise or stay afloat: off the ground in water, or with the eyes under water.
+	 * Standing in one-deep or waterlogged blocks it would only hop.
+	 */
+	public static boolean floatJump(boolean inWater, boolean onGround, boolean eyesInWater) {
+		return inWater && (!onGround || eyesInWater);
+	}
+
 	/** Sprint-swim while the eyes are under water and moving forward, as a player does; never at the surface. */
 	public static boolean swimSprint(boolean inWater, boolean eyesInWater, float forward, int foodLevel) {
 		return inWater && eyesInWater && forward > 0.0F && foodLevel > 6;
@@ -50,21 +58,73 @@ public final class SwimPlanning {
 	}
 
 	/**
-	 * Fight in water: hold jump (stay up, reach targets at or above) unless the target is clearly below, where
-	 * releasing it lets the agent sink and sprint-swim down toward it.
+	 * Fight in water: while swimming hold jump (stay up, reach targets at or above) unless the target is clearly below,
+	 * where releasing it lets the agent sink and sprint-swim down toward it.
 	 */
-	public static boolean fightJump(boolean inWater, double targetDy) {
-		return inWater && targetDy > -1.0D;
+	public static boolean fightJump(boolean swimming, double targetDy) {
+		return swimming && targetDy > -1.0D;
 	}
 
-	/** Ticks without a hit or gained ground before TARGET_UNREACHABLE; swimming gets a fair attempt. */
-	public static int unreachableTicks(boolean agentInWater, boolean targetInWater, int landTicks) {
-		return agentInWater || targetInWater ? Math.max(landTicks, WATER_UNREACHABLE_TICKS) : landTicks;
+	/** Ticks without a hit or gained ground before TARGET_UNREACHABLE; only an agent that must swim gets longer. */
+	public static int unreachableTicks(boolean agentSwimming, int landTicks) {
+		return agentSwimming ? Math.max(landTicks, WATER_UNREACHABLE_TICKS) : landTicks;
 	}
 
 	/** navigate_to rises to the surface first while the eyes are under water (no path can start there). */
 	public static boolean needsSurfacing(boolean inWater, boolean eyesInWater) {
 		return inWater && eyesInWater;
+	}
+
+	/** Conservative swim speed for breath budgeting (the headless check measured about 3.5 blocks/s rising). */
+	public static final double SURFACING_BLOCKS_PER_SECOND = 2.0D;
+	/** Surfacing must close this much distance to the open surface every second, or it is blocked. */
+	public static final double SURFACING_MIN_PROGRESS = 0.25D;
+	public static final long SURFACING_PROGRESS_WINDOW_MS = 1_000L;
+	/** Columns searched around the agent for open water surface, and the deepest water column followed. */
+	public static final int SURFACE_SEARCH_RADIUS = 8;
+	public static final int SURFACE_SEARCH_DEPTH = 24;
+
+	/** What one cell is to a swimmer heading up: water to swim through, open air (the surface), or solid (ice, rock). */
+	public enum Cell { WATER, OPEN, SOLID }
+
+	@FunctionalInterface
+	public interface ColumnView {
+		Cell at(int x, int y, int z);
+	}
+
+	/** The nearest breathable spot: column x/z and the y of its first open (air) cell above the water. */
+	public record Surface(int x, int openY, int z, double distance) {
+	}
+
+	/**
+	 * Nearest open water surface from the eyes: each column within {@link #SURFACE_SEARCH_RADIUS} whose cell at eye
+	 * level is water is followed upward through water to its first open cell; ice, rock or an overhang closes it.
+	 * Cost is the straight swim distance. Null when no column within reach is open (sealed tunnel, ice sheet).
+	 */
+	public static Surface nearestSurface(ColumnView view, int x, int eyeY, int z) {
+		Surface best = null;
+		for (int dx = -SURFACE_SEARCH_RADIUS; dx <= SURFACE_SEARCH_RADIUS; dx++) {
+			for (int dz = -SURFACE_SEARCH_RADIUS; dz <= SURFACE_SEARCH_RADIUS; dz++) {
+				if (dx * dx + dz * dz > SURFACE_SEARCH_RADIUS * SURFACE_SEARCH_RADIUS) continue;
+				Cell start = view.at(x + dx, eyeY, z + dz);
+				if (start == Cell.SOLID) continue;
+				for (int dy = 0; dy <= SURFACE_SEARCH_DEPTH; dy++) {
+					Cell cell = view.at(x + dx, eyeY + dy, z + dz);
+					if (cell == Cell.SOLID) break;
+					if (cell == Cell.OPEN) {
+						double distance = Math.sqrt(dx * dx + dz * dz + (double) dy * dy);
+						if (best == null || distance < best.distance()) best = new Surface(x + dx, eyeY + dy, z + dz, distance);
+						break;
+					}
+				}
+			}
+		}
+		return best;
+	}
+
+	/** Enough breath to swim the distance to the surface at a conservative speed (fail fast otherwise). */
+	public static boolean surfacingFeasible(int air, double distance) {
+		return airSecondsLeft(air) >= distance / SURFACING_BLOCKS_PER_SECOND;
 	}
 
 	/** Seconds of breath left before drowning damage starts (Respiration only makes it last longer). */

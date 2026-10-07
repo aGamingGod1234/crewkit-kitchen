@@ -106,7 +106,7 @@ test('awaiting confirmation: danger after the finishing turn wakes the model and
 	}
 });
 
-test('a completed task: danger wakes a no-task turn with every body tool; ordinary sightings do not', async () => {
+test('a completed task: danger wakes a no-task turn that may defend itself; ordinary sightings do not', async () => {
 	const bridge = new FakeBridge();
 	let release;
 	const gate = new Promise((resolve) => { release = resolve; });
@@ -120,7 +120,7 @@ test('a completed task: danger wakes a no-task turn with every body tool; ordina
 		release();
 		await eventually(() => planner.outcomes.length === 2);
 		assert.equal(planner.outcomes[1].result.reasonCode, 'STALE_PLAN');
-		assert.match(planner.outcomes[1].result.message, /task is complete[\s\S]*wake you again at once with every body tool/);
+		assert.match(planner.outcomes[1].result.message, /task is complete[\s\S]*wake you again at once to defend yourself/);
 		const rejected = traces.filter((row) => row.event === 'native_tool_rejected');
 		assert.deepEqual(rejected.map(({ toolKind, actionType, reasonCode }) => ({ toolKind, actionType, reasonCode })),
 			[{ toolKind: 'action', actionType: 'fight_target', reasonCode: 'STALE_PLAN' }], 'the undispatched call is visible in the trace');
@@ -139,9 +139,70 @@ test('a completed task: danger wakes a no-task turn with every body tool; ordina
 		await eventually(() => planner.outcomes.length === 4);
 		assert.equal(planner.outcomes[2].result?.state, 'SUCCEEDED');
 		assert.equal(planner.outcomes[3].error?.code, 'CONVERSATION_ONLY', 'with no task there is nothing to finish again');
+		assert.match(planner.outcomes[3].error.message, /only defend yourself/);
 		assert.equal(registry.get('agent-a').state, DynamicAgentState.COMPLETED, 'defending never reopens the finished task');
 		await settle();
 		assert.equal(planner.requests.length, 2, 'a danger turn needs no chat reply and is not retried');
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+const BREAK = normalizeMinecraftToolCall('act', { actionType: 'break_block', arguments: { x: 1, y: 64, z: 0, expectedBlockId: 'minecraft:stone', timeoutMs: 5_000 } });
+
+test('a danger-woken no-task turn is limited to self-preservation; work still needs takeTask', async () => {
+	const bridge = new FakeBridge();
+	const { registry, planner, run } = await launch(bridge, [[FINISH], [BREAK]]);
+	try {
+		await eventually(() => planner.outcomes.length === 1);
+		bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'complete', goalRevision: 2 } });
+		await eventually(() => registry.get('agent-a').state === DynamicAgentState.COMPLETED);
+		bridge.emit('observation', hurt(2, 2, 15));
+		await eventually(() => planner.outcomes.length === 2);
+		assert.equal(planner.outcomes[1].error?.code, 'CONVERSATION_ONLY');
+		assert.match(planner.outcomes[1].error.message, /player request: call takeTask/);
+		assert.equal(bridge.sent.filter(({ type }) => type === 'action_command').length, 0, 'breaking blocks is not self-preservation');
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('an operator takeover reported by Minecraft suppresses no-task danger wakes', async () => {
+	const bridge = new FakeBridge();
+	const { registry, planner, run } = await launch(bridge, [[FINISH], [FIGHT]]);
+	try {
+		await eventually(() => planner.outcomes.length === 1);
+		bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'complete', goalRevision: 2 } });
+		await eventually(() => registry.get('agent-a').state === DynamicAgentState.COMPLETED);
+		const reserved = hurt(2, 2, 15);
+		reserved.payload.observation.player.operatorControlled = true;
+		bridge.emit('observation', reserved);
+		await settle();
+		assert.equal(planner.requests.length, 1, 'the operator owns the body: no turn may act on it');
+		bridge.emit('observation', hurt(2, 3, 14));
+		await eventually(() => planner.requests.length === 2);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('awaiting confirmation: work begun while waiting gets its follow-up wake, then waiting resumes', async () => {
+	const bridge = new DeferredCompletionBridge();
+	const { planner, run } = await launch(bridge, [[FINISH, FIGHT], [], []]);
+	const ordinary = (eventSequence) => ({ agentId: 'agent-a', payload: { goalRevision: 1, eventSequence, attention: true, observation: { player: { x: 0, y: 64, z: 0 } } } });
+	try {
+		await eventually(() => bridge.sent.some(({ type }) => type === 'goal_completed'));
+		awaitConfirmation(bridge);
+		await eventually(() => fights(bridge).length === 1);
+		resolveFight(bridge, fights(bridge)[0]);
+		await eventually(() => planner.outcomes.length === 2);
+		await settle();
+		bridge.emit('observation', ordinary(5));
+		await eventually(() => planner.requests.length === 2);
+		await settle();
+		bridge.emit('observation', ordinary(6));
+		await settle();
+		assert.equal(planner.requests.length, 2, 'a turn without new body work returns the goal to plain waiting (no redo loop)');
 	} finally {
 		await run.coordinator.stop();
 	}

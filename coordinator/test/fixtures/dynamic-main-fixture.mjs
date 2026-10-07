@@ -194,6 +194,7 @@ function factToWireObservation(value, goalRevision, eventSequence, attention, ob
 			health: player.health ?? 20, maxHealth: 20, armor: 0, foodLevel: player.hunger ?? 20, saturation: 5,
 			gameMode: 'survival', onGround: true, inWater: false, onFire: player.fire === true,
 			air: player.air ?? 300, maxAir: 300, suffocating: false, fallDistance: player.fallDistance ?? 0, effects: [],
+			...(player.operatorControlled === true ? { operatorControlled: true } : {}),
 		},
 		inventory: { items: (value.inventory?.items ?? []).map((item, index) => ({ itemId: item.itemId, count: item.count, damage: 0, maxDamage: 0, slot: item.slot ?? index })), selectedItem: 'minecraft:air' },
 		entities: (value.items ?? []).map((item) => ({ uuid: item.stableId, type: 'minecraft:item', name: 'drop', distance: Math.hypot(item.x - position.x, item.y - position.y, item.z - position.z), position: { x: item.x, y: item.y, z: item.z }, itemId: item.itemId, count: item.count })),

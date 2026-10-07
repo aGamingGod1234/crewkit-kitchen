@@ -197,6 +197,10 @@ public final class PovSessionRuntime {
 					LOGGER.info("Took over agent {} without stopping it: {}", agentId, unstoppable.getMessage());
 				}
 			}
+			if (!stopped && dev.agaminggod.arenaagents.agent.AgentLifecycleReducer.isDetachedActionState(record.state())) {
+				// An idle or completed agent may be mid-way through a detached action; the operator owns the body now.
+				manager.cancelDetachedAction(agentId, "An operator took over the body");
+			}
 			long revision = manager.registry().require(agentId).goalRevision();
 			session.initialLifecycle(stopped && plan.resumeOnExit()
 					|| pendingRespawnResume != null && pendingRespawnResume == record.goalRevision(), revision);

@@ -2370,9 +2370,10 @@ test('33 progress messages have identical delivery in one TCP chunk or separate 
 
 test('underwater breath facts survive wire validation and adaptation', () => {
 	const payload = currentCollectorObservation();
-	Object.assign(payload.player, { inWater: true, air: 150, underWater: true, airSecondsLeft: 7.5 });
+	Object.assign(payload.player, { inWater: true, air: 150, underWater: true, airSecondsLeft: 7.5, operatorControlled: true });
 	const adapted = adaptObservation(validateProtocolV2Payload('observation', payload));
 	assert.equal(adapted.player.underWater, true);
 	assert.equal(adapted.player.airSecondsLeft, 7.5);
 	assert.equal(adapted.player.air, 150);
+	assert.equal(adapted.player.operatorControlled, true, 'a /takeover is reported so danger never wakes the model onto the operator body');
 });

@@ -284,6 +284,7 @@ public final class VerificationMain {
 		passedAssertions += dev.agaminggod.arenaagents.server.pov.PovViewRedirectVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.pov.PovStatePublisherVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.pov.PovSessionVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.pov.DetachedActionReservationVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.pov.OperatorBodyControlVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.client.pov.PovClientStateVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.client.pov.PovInputCaptureVerification.verify();
