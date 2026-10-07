@@ -39,6 +39,25 @@ public final class AgentDeathCapture {
 		return allowVanillaDeath(recoveredByScenario, false, recordDeath);
 	}
 
+	/** How Entity.kill(ServerLevel) (the /kill command) treats a Carpet fake player. */
+	public enum KillRoute {
+		/** Carpet's own behaviour: disconnect the fake. Kept for players that are not Arena bodies. */
+		CARPET_DISCONNECT,
+		/** Vanilla LivingEntity.kill: lethal generic_kill damage, so the body dies like a real player and stays connected. */
+		VANILLA_DEATH,
+		/** The body is already dead and waiting for respawn; a second kill records nothing and keeps it connected. */
+		ALREADY_DEAD
+	}
+
+	/**
+	 * Carpet overrides kill(ServerLevel) to disconnect the fake player. For an Arena body that left the server,
+	 * the manager's recovery recreated it in place, so /kill looked like leave/rejoin with nothing lost.
+	 */
+	public static KillRoute killRoute(boolean arenaBody, boolean deadOrDying) {
+		if (!arenaBody) return KillRoute.CARPET_DISCONNECT;
+		return deadOrDying ? KillRoute.ALREADY_DEAD : KillRoute.VANILLA_DEATH;
+	}
+
 	/** A totem save is not a death: let vanilla pop it and record nothing. */
 	public static boolean allowVanillaDeath(boolean recoveredByScenario, boolean totemWillSave, Runnable recordDeath) {
 		Objects.requireNonNull(recordDeath, "recordDeath must not be null");
