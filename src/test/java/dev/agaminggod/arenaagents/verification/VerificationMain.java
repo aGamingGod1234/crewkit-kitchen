@@ -173,6 +173,7 @@ public final class VerificationMain {
 		passedAssertions += CoordinatorVoiceEndpointRefreshVerification.verify();
 		passedAssertions += CodexAgentServerRuntimeVoiceStartVerification.verify();
 		passedAssertions += AgentActivityPresentationVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.FailureChatThrottleVerification.verify();
 		passedAssertions += AgentDeathCaptureVerification.verify();
 		passedAssertions += AgentControlSyncVerification.verify();
 		passedAssertions += VoiceConsentCommandVerification.verify();
