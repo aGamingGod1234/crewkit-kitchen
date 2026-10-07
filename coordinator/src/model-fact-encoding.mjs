@@ -2,7 +2,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { randomUUID } from 'node:crypto';
 
 export const MODEL_FACT_FORMAT = 'minecraft-facts-v1';
-export const MODEL_FACT_INSTRUCTIONS = `Compact factual replies use format:"minecraft-facts-v1": data is the original JSON, {$rows:{columns,rows}} represents an array of records in column order, and {$ref:N} is the exact value at values[N] in this reply. {$object:[[key,value],...]} preserves literal objects with reserved keys. Null, missing fields, coverage and freshness keep their meanings. Complete replies need no previous reply. observe and available action/sequence postAction samples default to complete snapshots with observationView.id alongside observation. view:"changes" plus afterObservationId requests changed whole sections against that exact delivered ID, including across observe and postAction. Apply observationView.replace and remove to that baseline; retain unchanged sections. observationView.retainMetadata lists top-level sample fields to copy from that same exact baseline; all other metadata is current, and missing fields are absent. Action receipts and per-step history are unchanged. Missing, stale or different-world baselines return full. Request view:"full" whenever the baseline is uncertain.`;
+export const MODEL_FACT_INSTRUCTIONS = `Compact factual replies use format:"minecraft-facts-v1": data is the original JSON, {$rows:{columns,rows,optional?}} represents an array of records in column order (a null cell in an optional column means that field is absent), and {$ref:N} is the exact value at values[N] in this reply. {$object:[[key,value],...]} preserves literal objects with reserved keys. Null, missing fields, coverage and freshness keep their meanings. Complete replies need no previous reply. observe and available action/sequence postAction samples default to complete snapshots with observationView.id alongside observation. view:"changes" plus afterObservationId requests changed whole sections against that exact delivered ID, including across observe and postAction. Apply observationView.replace and remove to that baseline; retain unchanged sections. observationView.retainMetadata lists top-level sample fields to copy from that same exact baseline; all other metadata is current, and missing fields are absent. Action receipts and per-step history are unchanged. Missing, stale or different-world baselines return full. Request view:"full" whenever the baseline is uncertain.`;
 const MAX_DELIVERED_VIEWS = 8;
 const MAX_DELIVERED_VIEW_BYTES = 2 * 1024 * 1024;
 const RETAINABLE_METADATA = ['taskMemory', 'goal', 'goalSpec', 'executionSettings'];
@@ -46,15 +46,19 @@ export function encodeModelFacts(value) {
   if (Array.isArray(current)) {
    const rows = current.map(child => pack(child));
    if (current.length >= 3 && current.every(record)) {
-    const columns = Object.keys(current[0]);
-    if (current.every(row => Object.keys(row).length === columns.length && columns.every(column => Object.hasOwn(row, column)))) {
+    // Mixed rows (a slab with state among plain stone) share one table: a column missing from some
+    // rows is listed in optional, where null means absent, unless a present value is itself null.
+    const columns = [...new Set(current.flatMap(row => Object.keys(row)))];
+    const optional = columns.filter(column => !current.every(row => Object.hasOwn(row, column)));
+    const representable = optional.every(column => current.every(row => !Object.hasOwn(row, column) || row[column] !== null));
+    if (representable && columns.length <= 64) {
      // Reuse packed children, including dictionary-backed/literal rows. Packing
      // those children again doubles recursive work at every nested row level.
-     const table = { $rows: { columns, rows: rows.map(row => {
+     const table = { $rows: { columns, rows: rows.map((row, index) => {
       const packed = marked(row) && Object.hasOwn(row, '$ref') ? values[row.$ref] : row;
       const fields = marked(packed) && Object.hasOwn(packed, '$object') ? Object.fromEntries(packed.$object) : packed;
-      return columns.map(column => fields[column]);
-     }) } };
+      return columns.map(column => Object.hasOwn(current[index], column) ? fields[column] : null);
+     }), ...(optional.length === 0 ? {} : { optional }) } };
      if (bytes(table) < bytes(rows)) return table;
     }
    }
@@ -103,9 +107,11 @@ export function decodeModelFacts(value) {
    return structuredClone(resolved.get(index));
   }
   if (Object.keys(current).length === 1 && Object.hasOwn(current, '$rows')) {
-   const { columns, rows } = current.$rows ?? {};
+   const { columns, rows, optional = [] } = current.$rows ?? {};
    if (!Array.isArray(columns) || columns.some(column => typeof column !== 'string') || new Set(columns).size !== columns.length || !Array.isArray(rows) || rows.some(row => !Array.isArray(row) || row.length !== columns.length)) throw new TypeError('Invalid fact rows');
-   return rows.map(row => Object.fromEntries(columns.map((column, index) => [column, unpack(row[index])])));
+   if (!Array.isArray(optional) || optional.some(column => !columns.includes(column))) throw new TypeError('Invalid optional fact columns');
+   const absent = new Set(optional);
+   return rows.map(row => Object.fromEntries(columns.flatMap((column, index) => absent.has(column) && row[index] === null ? [] : [[column, unpack(row[index])]])));
   }
   if (Object.keys(current).length === 1 && Object.hasOwn(current, '$object')) {
    if (!Array.isArray(current.$object) || current.$object.some(entry => !Array.isArray(entry) || entry.length !== 2 || typeof entry[0] !== 'string')) throw new TypeError('Invalid literal fact object');
@@ -201,6 +207,29 @@ export class ModelObservationViews {
   return { value: nested ? { ...owned, postAction: presented } : presented,
    commit: () => commit(eligible ? next : null), commitWithoutView: () => commit(null) };
  }
+}
+
+/** True when the observation carries the compact heard section, which replaces raw sound perception events. */
+export function hasHeardSection(observation) {
+ return Array.isArray(observation?.heard) || Array.isArray(observation?.player?.heard);
+}
+
+/** Drops raw sound events from perception when heard already reports them; a no-op without heard. */
+export function withoutHeardSoundEvents(perception, observation) {
+ if (!hasHeardSection(observation) || !record(perception) || !Array.isArray(perception.events)) return perception;
+ const events = perception.events.filter(event => event?.type !== 'sound');
+ if (events.length === perception.events.length) return perception;
+ return { ...perception, events, soundEventsInHeard: perception.events.length - events.length };
+}
+
+/** Applies withoutHeardSoundEvents to the observation-bearing parts of a tool result. */
+export function presentHeardSounds(value) {
+ if (!record(value)) return value;
+ const strip = holder => record(holder) && record(holder.perception) ? { ...holder, perception: withoutHeardSoundEvents(holder.perception, holder) } : holder;
+ let result = strip(value);
+ if (record(result.observation)) result = { ...result, observation: strip(result.observation) };
+ if (record(result.postAction?.observation)) result = { ...result, postAction: { ...result.postAction, observation: strip(result.postAction.observation) } };
+ return result;
 }
 
 /** Compress only the JSON data line emitted by buildNativeEventInput. */

@@ -46,7 +46,7 @@ export class NativeProgramExecutor {
 		const run = { record: { ...record }, context, programId, maxActions, timeoutMs, expectedDurationMs, planningLeadMs: planningLeadMs ?? null, actions: 0, actionsSucceeded: 0, actionsFailed: 0, receipts: [], resolve, result,
 			settled: false, bodyPending: false, pendingActionId: null, stopping: null, timer: null, planningDueTimer: null, planningDueNotified: false, planningDueVersion: null, cancellationTimer: null,
 			observation: programObservation(context.observation), eventSequence: context.eventSequence, engine: null,
-			observationIntervalMs, observationTimer: null, refresh: null, refreshGeneration: 0, decision: null, decisionSequence: 0, lastOrdinaryNotificationAt: Number.NEGATIVE_INFINITY, ordinaryNotificationTimer: null };
+			observationIntervalMs, observationTimer: null, refresh: null, refreshGeneration: 0, decision: null, decisionSequence: 0, lastOrdinaryNotificationAt: Number.NEGATIVE_INFINITY, ordinaryNotificationTimer: null, unseenAttention: false };
 		run.engine = new ArenaScriptEngine({
 			dispatch: (command) => { void this.#dispatch(run, command); },
 			cancel: (actionId) => { void this.#cancelBody(run, actionId); },
@@ -100,8 +100,11 @@ export class NativeProgramExecutor {
 		if (!run || run.record.goalRevision !== record.goalRevision || run.settled) return false;
 		if (!Number.isSafeInteger(payload.eventSequence) || payload.eventSequence <= run.eventSequence) return false;
 		try {
+			const previousObservation = run.observation;
 			run.observation = programObservation(payload.observation ?? payload);
 			run.eventSequence = payload.eventSequence;
+			// A new hazard in view, lost health or air, or a changed dimension/readiness is never held back.
+			if (hazardEdge(previousObservation, run.observation)) run.lastOrdinaryNotificationAt = Number.NEGATIVE_INFINITY;
 			if (run.refresh?.purpose === 'interval') {
 				// A newer publication replaces background sampling, but cannot replace
 				// the terminal-effect barrier owned by a completed action.
@@ -117,8 +120,10 @@ export class NativeProgramExecutor {
 				const priority = payload.priority ?? 'ordinary';
 				// Ordinary sightings while the routine keeps running keep the same decision handle (so an
 				// in-flight respondProgram stays valid) and only refresh its facts; see #notifyDecision.
-				if (this.#deferrableOrdinary(run, priority)) this.#notifyDecision(run, priority);
-				else this.#requestDecision(run, run.engine.refreshDirectiveRequest(), priority);
+				if (this.#deferrableOrdinary(run, priority)) {
+					this.#foldOrdinary(run, run.engine.refreshDirectiveRequest());
+					this.#notifyDecision(run, priority);
+				} else this.#requestDecision(run, run.engine.refreshDirectiveRequest(), priority);
 			}
 			this.#check(run);
 			return true;
@@ -156,6 +161,7 @@ export class NativeProgramExecutor {
 		run.decision = { decisionId: `${run.programId}:decision-${++run.decisionSequence}`, programVersion: request.version,
 			trigger: request.trigger, priority: request.priority, eventSequence: request.eventSequence,
 			...(request.actionFailure === undefined ? {} : { actionFailure: request.actionFailure }) };
+		run.unseenAttention = true;
 		// The engine must finish applying the authored attention policy first.
 		const decision = run.decision;
 		queueMicrotask(() => {
@@ -188,6 +194,7 @@ export class NativeProgramExecutor {
 			run.lastOrdinaryNotificationAt = now;
 		}
 		this.#clearOrdinaryNotification(run);
+		run.unseenAttention = false;
 		// The pending request retains its highest urgency, but later ordinary
 		// discoveries must not repeatedly interrupt that same reconsideration.
 		try { run.context.onDecision(this.status(run.record), { priority: notificationPriority }); }
@@ -197,6 +204,14 @@ export class NativeProgramExecutor {
 	#deferrableOrdinary(run, notificationPriority) {
 		return notificationPriority !== 'urgent' && run.decision?.priority !== 'urgent' && run.decision?.actionFailure === undefined
 			&& run.engine.snapshot().status === 'ACTIVE';
+	}
+
+	/** Newer ordinary attention folded into the pending decision: same handle, latest trigger and facts, not yet seen. */
+	#foldOrdinary(run, request) {
+		if (run.decision === null || request === null || request === undefined) return;
+		run.decision.trigger = request.trigger;
+		run.decision.eventSequence = request.eventSequence;
+		run.unseenAttention = true;
 	}
 
 	#clearOrdinaryNotification(run) {
@@ -235,7 +250,11 @@ export class NativeProgramExecutor {
 				...(directive === 'finish' ? { finishRequested: true } : {}) }, true);
 			return run.result;
 		}
+		// The model answered what it was shown; attention folded in after that notification is still owed to it.
+		const unseen = directive === 'continue' && run.unseenAttention === true ? { trigger: request.trigger } : null;
+		run.unseenAttention = false;
 		run.engine.applyDirective({ ...request, directive, ...(compiled === null ? {} : { install: { programId, version: request.version + 1, compiled } }) });
+		if (unseen !== null && run.decision === null && run.engine.snapshot().status === 'ACTIVE') run.engine.notifyAttention({ priority: 'ordinary', trigger: unseen.trigger });
 		this.#check(run);
 		return this.status(record) ?? { state: 'ENDED' };
 	}
@@ -368,6 +387,7 @@ export class NativeProgramExecutor {
 				|| JSON.stringify(request.actionFailure) !== JSON.stringify(run.decision.actionFailure));
 			// A different ordinary trigger on a running routine is new facts for the same decision, not a new handle.
 			if (escalated || (request && request.trigger !== run.decision.trigger && !this.#deferrableOrdinary(run, request.priority))) this.#requestDecision(run, request);
+			else if (request && request.trigger !== run.decision.trigger) this.#foldOrdinary(run, request);
 		}
 		const snapshot = run.engine.snapshot();
 		if (run.stopping !== null && !run.bodyPending) this.#finish(run, run.stopping);
@@ -409,6 +429,30 @@ function canonicalCommand(command) {
 	const { type: validatedType, ...normalized } = validateAction({ ...args, type });
 	return Object.freeze({ ...command, action: Object.freeze({ type: validatedType, arguments: Object.freeze(normalized) }) });
 }
+const HAZARD_BLOCK = /lava|fire|magma/i;
+function hazardKeys(observation) {
+	const keys = new Set();
+	for (const block of Array.isArray(observation?.blocks) ? observation.blocks : []) {
+		const id = block?.blockId ?? block?.id;
+		if (typeof id === 'string' && HAZARD_BLOCK.test(id)) keys.add(`${id}@${block.x},${block.y},${block.z}`);
+	}
+	return keys;
+}
+const finiteValue = (value) => (Number.isFinite(value) ? value : null);
+/** Facts that must reach the model at once even when the routine itself keeps running. */
+export function hazardEdge(previous, next) {
+	if (previous === null || typeof previous !== 'object' || next === null || typeof next !== 'object') return false;
+	const before = hazardKeys(previous);
+	for (const key of hazardKeys(next)) if (!before.has(key)) return true;
+	const health = [finiteValue(previous.player?.health), finiteValue(next.player?.health)];
+	if (health[0] !== null && health[1] !== null && health[1] < health[0]) return true;
+	const air = [finiteValue(previous.player?.air ?? previous.player?.airSupply), finiteValue(next.player?.air ?? next.player?.airSupply)];
+	if (air[0] !== null && air[1] !== null && air[1] < air[0]) return true;
+	if ((previous.world?.dimension ?? null) !== (next.world?.dimension ?? null)) return true;
+	if (previous.ready !== next.ready || JSON.stringify(previous.status ?? null) !== JSON.stringify(next.status ?? null)) return true;
+	return false;
+}
+
 function programObservation(observation) {
 	return observation && Object.hasOwn(observation, 'ready') && (Object.hasOwn(observation, 'position') || observation.ready === false)
 		? adaptObservation(observation) : observation;

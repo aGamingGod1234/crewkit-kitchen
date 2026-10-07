@@ -3,7 +3,7 @@ import { DEFAULT_AGENT_CAP, DEFAULT_SERVICE_TIER } from './constants.mjs';
 import { parseDecision } from './decision-parser.mjs';
 import { ModelCatalogCache } from './model-catalog-cache.mjs';
 import { MAX_TOOL_RESULT_BYTES, MINECRAFT_DYNAMIC_TOOLS, NATIVE_AGENT_INSTRUCTIONS, normalizeMinecraftToolCall, toolResultContent } from './native-minecraft-tools.mjs';
-import { encodeModelFacts, encodeNativeEventInput, ModelObservationViews } from './model-fact-encoding.mjs';
+import { encodeModelFacts, encodeNativeEventInput, ModelObservationViews, presentHeardSounds } from './model-fact-encoding.mjs';
 import { PLANNER_OUTPUT_SCHEMA, PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
 import { createSessionMetadata, profileFingerprint } from './provider-session.mjs';
 import { recordProviderTurn } from './provider-turn-recorder.mjs';
@@ -806,6 +806,8 @@ export class SharedCodexAgent {
 			return response;
 		} catch (error) {
 			if (previousExecutor !== null && this.#active === active) active.collector.replaceExecuteTool(previousExecutor);
+			// A rejected steer never reached the model, so it cannot be the baseline for omitted event fields.
+			this.#observationViews.forgetEventMetadata();
 			throw withNativeTurn(error, active.collector.snapshot());
 		}
 	}
@@ -965,6 +967,8 @@ function boundedFactCandidate(value, depth = 0, budget = { nodes: 32_768 }) {
 }
 
 export function presentNativeToolResult(value, tool, views = new ModelObservationViews()) {
+	// Raw sound packets duplicate the compact heard section when it is present.
+	value = presentHeardSounds(value);
 	const originalText = JSON.stringify(value ?? null);
 	const tryPresentation = candidate => {
 		const prepared = views.prepare(candidate, tool);

@@ -1,4 +1,5 @@
 import { generateDirectorScript } from './director-script-generator.mjs';
+import { hasHeardSection, withoutHeardSoundEvents } from './model-fact-encoding.mjs';
 import { EventEmitter } from 'node:events';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile } from 'node:fs/promises';
@@ -144,6 +145,7 @@ export class DynamicCoordinator extends EventEmitter {
 	#memoryDirectory;
 	#nativeConversationRecoveries = new Map();
 	#nativeObservationSignatures = new Map();
+	#perceptionSequences = new Map();
 	#nativeWorldSignals = new Map();
 	#nativeConfirmationWaits = new Map();
 	// Agents that started body work while their finished goal awaits confirmation: their follow-up wakes pass.
@@ -349,6 +351,18 @@ export class DynamicCoordinator extends EventEmitter {
 
 	get registry() { return this.#registry; }
 	get bridge() { return this.#bridge; }
+
+	/**
+	 * With the compact heard section present, a perception change made only of new raw sound packets is
+	 * already summarised there (and heard lava raises its own "heard" fact), so it is not attention by itself.
+	 */
+	#withoutSoundOnlyAttention(agentId, payload, wireObservation) {
+		const perception = wireObservation?.perception;
+		const latest = Number.isSafeInteger(perception?.latestSequence) ? perception.latestSequence : null;
+		const previous = this.#perceptionSequences.get(agentId);
+		if (latest !== null) this.#perceptionSequences.set(agentId, latest);
+		return soundOnlyPerceptionChange(payload, wireObservation, previous) ? { ...payload, attention: false, changedFacts: [] } : payload;
+	}
 
 	requestSupervisedObservation(key) {
 		if (this.#stopping || this.#closed || key === null || typeof key !== 'object') return false;
@@ -903,7 +917,7 @@ export class DynamicCoordinator extends EventEmitter {
 				const worldSignals = this.#usesNativeTools(record)
 					? this.#rememberNativeWorldSignals(record, lifecycleGeneration, connectionEpoch, observation)
 					: null;
-				const classified = classifyObservationTrigger(message.payload, wireObservation, worldSignals);
+				const classified = classifyObservationTrigger(this.#withoutSoundOnlyAttention(record.agentId, message.payload, wireObservation), wireObservation, worldSignals);
 				const pendingAttention = this.#pendingAttention.get(record.agentId);
 				const attention = pendingAttention?.goalRevision === record.goalRevision
 					? mergeAttentionTrigger(classified, pendingAttention)
@@ -4675,6 +4689,16 @@ function finiteOrNull(value) {
 	return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
+export function soundOnlyPerceptionChange(payload, wireObservation, previousSequence) {
+	if (!hasHeardSection(wireObservation) || !Number.isSafeInteger(previousSequence)) return false;
+	if (typeof payload?.trigger === 'string' && payload.trigger.trim().length > 0) return false;
+	const changedFacts = Array.isArray(payload?.changedFacts) ? payload.changedFacts : [];
+	if (changedFacts.length === 0 || !changedFacts.every((fact) => fact === 'perception')) return false;
+	const events = Array.isArray(wireObservation.perception?.events) ? wireObservation.perception.events : [];
+	const fresh = events.filter((event) => Number.isSafeInteger(event?.sequence) && event.sequence > previousSequence);
+	return fresh.length > 0 && fresh.every((event) => event.type === 'sound');
+}
+
 export function classifyObservationTrigger(payload, observation, signals = null) {
 	const explicitTrigger = typeof payload.trigger === 'string' && payload.trigger.trim().length > 0 ? payload.trigger.trim().slice(0, 128) : null;
 	const attention = payload.attention === true;
@@ -4827,7 +4851,7 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 		...(observation.eventSequence === undefined ? {} : { eventSequence: observation.eventSequence }),
 		...(observation.freshness === undefined ? {} : { freshness: observation.freshness }),
 		...(observation.coverage === undefined ? {} : { coverage: compactCoverageForEvent(observation.coverage) }),
-		...(observation.perception === undefined ? {} : { perception: compactPerceptionForEvent(observation.perception) }),
+		...(observation.perception === undefined ? {} : { perception: compactPerceptionForEvent(withoutHeardSoundEvents(observation.perception, observation)) }),
 		...(observation.ready === undefined ? {} : { ready: observation.ready }),
 		...(observation.status === undefined ? {} : { status: observation.status }),
 		...(observation.velocity === undefined ? {} : { velocity: observation.velocity }),
@@ -5060,7 +5084,7 @@ function compactEventObservationForBudget(observation) {
 		items: itemRows.values,
 		entities: entityRows.values,
 		blocks: blockRows.values,
-		...(observation.blockDefaults === undefined ? {} : { blockDefaults: observation.blockDefaults }), ...(observation.blockTags === undefined ? {} : { blockTags: observation.blockTags }),
+		...(observation.blockDefaults === undefined ? {} : { blockDefaults: observation.blockDefaults }), ...(observation.blockTags === undefined ? {} : { blockTags: retainedBlockTags(observation.blockTags, blockRows.values) }),
 		...(landmarkRows === null ? {} : { landmarks: landmarkRows.values }),
 		...(nearbyContainerRows === null ? {} : { nearbyContainers: nearbyContainerRows.values }),
 		...(optionRows === null ? {} : { options: optionRows.values }),
@@ -5097,7 +5121,7 @@ function compactPlanningDueObservation(observation) {
 		items: itemRows.values,
 		entities: entityRows.values,
 		blocks: blockRows.values,
-		...(observation.blockDefaults === undefined ? {} : { blockDefaults: observation.blockDefaults }), ...(observation.blockTags === undefined ? {} : { blockTags: observation.blockTags }),
+		...(observation.blockDefaults === undefined ? {} : { blockDefaults: observation.blockDefaults }), ...(observation.blockTags === undefined ? {} : { blockTags: retainedBlockTags(observation.blockTags, blockRows.values) }),
 		...(observation.world === undefined ? {} : { world: compactWorldForEvent(observation.world) }),
 		...(observation.currentAction === undefined ? {} : { currentAction: observation.currentAction }),
 		...(observation.lastResult === undefined ? {} : { lastResult: compactLastResultForEvent(observation.lastResult) }),
@@ -5146,6 +5170,12 @@ function compactBlockDefaults(blocks) {
 	});
 	if (!omitted) return { blocks: values };
 	return { blocks: values, blockDefaults: EVENT_BLOCK_DEFAULTS, ...(Object.keys(blockTags).length === 0 ? {} : { blockTags }) };
+}
+
+function retainedBlockTags(blockTags, rows) {
+	const retained = new Set(rows.map((row) => row?.blockId));
+	const kept = Object.fromEntries(Object.entries(blockTags ?? {}).filter(([blockId]) => retained.has(blockId)));
+	return Object.keys(kept).length === 0 ? undefined : kept;
 }
 
 function isFullCubeBounds(bounds) {

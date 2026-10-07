@@ -78,3 +78,57 @@ test('model call and turn usage become flat trace fields', async () => {
 		{ modelCalls: 2, inputTokens: 5, cachedInputTokens: 9, cacheWriteInputTokens: 1, outputTokens: 7, contextTokens: 15 });
 	assert.deepEqual(turnUsageTraceFields(undefined), {});
 });
+
+test('mixed terrain still packs into one row table with optional columns and reconstructs exactly', async () => {
+	const { mixedTerrainBlocks } = await import('../src/benchmark/token-budget.mjs');
+	const { encodeModelFacts } = await import('../src/model-fact-encoding.mjs');
+	const sizes = measureTokenBudget();
+	assert.ok(sizes.mixedTerrainEncodedBytes <= 10_000, `mixed terrain event ${sizes.mixedTerrainEncodedBytes} bytes`);
+	const wake = representativeProgramWake(1);
+	wake.observation.blocks = mixedTerrainBlocks();
+	const raw = buildNativeEventInput(representativeRecord(), wake);
+	const encoded = JSON.parse(encodeNativeEventInput(raw).slice(raw.indexOf('\n') + 1));
+	assert.ok(Array.isArray(encoded.data.observation.blocks.$rows.optional));
+	assert.deepEqual(decodeModelFacts(encoded), JSON.parse(raw.slice(raw.indexOf('\n') + 1)));
+	const nulls = [{ a: 1, b: null }, { a: 2 }, { a: 3, b: 4 }];
+	assert.deepEqual(decodeModelFacts(encodeModelFacts({ rows: nulls, pad: 'x'.repeat(1_100) })).rows, nulls, 'a real null in a sometimes-missing column stays exact');
+});
+
+test('budget compaction keeps block tags only for retained rows', () => {
+	const wake = representativeProgramWake(1);
+	wake.observation.blocks = Array.from({ length: 32 }, (_, index) => ({ stableId: `${index},64,0`, x: index, y: 64, z: 0, blockId: `minecraft:block_${index}`, tags: [`minecraft:tag_${index}`, 'x'.repeat(200)] }));
+	const observation = payload(buildNativeEventInput(representativeRecord(), wake)).observation;
+	assert.ok(observation.blocks.length < 32, 'the oversized event was compacted');
+	assert.deepEqual(Object.keys(observation.blockTags).sort(), observation.blocks.map((block) => block.blockId).sort());
+});
+
+test('raw sound perception events are dropped from model inputs only when heard is present', async () => {
+	const { presentHeardSounds } = await import('../src/model-fact-encoding.mjs');
+	const events = [{ sequence: 1, type: 'sound', soundId: 'minecraft:block.lava.pop' }, { sequence: 2, type: 'title', text: 'Night' }];
+	const silent = representativeProgramWake(1);
+	silent.observation.perception = { latestSequence: 2, events };
+	assert.equal(payload(buildNativeEventInput(representativeRecord(), silent)).observation.perception.events.length, 2, 'no heard section: unchanged');
+	const hearing = representativeProgramWake(1);
+	hearing.observation.perception = { latestSequence: 2, events };
+	hearing.observation.player = { ...hearing.observation.player, heard: [{ sound: 'lava', direction: 'ahead', elevation: 'level', distance: 6 }] };
+	const perception = payload(buildNativeEventInput(representativeRecord(), hearing)).observation.perception;
+	assert.deepEqual(perception.events.map((event) => event.type), ['title']);
+	assert.equal(perception.soundEventsInHeard, 1);
+	const tool = presentHeardSounds({ state: 'SUCCEEDED', observation: { heard: [], perception: { events } } });
+	assert.deepEqual(tool.observation.perception.events.map((event) => event.type), ['title']);
+	const plain = { observation: { perception: { events } } };
+	assert.equal(presentHeardSounds(plain).observation.perception, plain.observation.perception);
+});
+
+test('a perception change made only of new sounds is not attention when heard is present', async () => {
+	const { soundOnlyPerceptionChange, classifyObservationTrigger } = await import('../src/dynamic-main.mjs');
+	const wire = (events, heard = []) => ({ heard, perception: { latestSequence: events.at(-1)?.sequence ?? 0, events } });
+	const sounds = [{ sequence: 4, type: 'sound' }, { sequence: 5, type: 'sound' }];
+	const payloadFor = { attention: true, changedFacts: ['perception'] };
+	assert.equal(soundOnlyPerceptionChange(payloadFor, wire(sounds), 3), true);
+	assert.equal(soundOnlyPerceptionChange(payloadFor, wire([...sounds, { sequence: 6, type: 'title' }]), 3), false, 'a title is still news');
+	assert.equal(soundOnlyPerceptionChange({ ...payloadFor, changedFacts: ['perception', 'heard'] }, wire(sounds), 3), false, 'heard lava keeps its own fact');
+	assert.equal(soundOnlyPerceptionChange(payloadFor, { perception: wire(sounds).perception }, 3), false, 'without heard nothing changes');
+	assert.equal(soundOnlyPerceptionChange(payloadFor, wire(sounds), undefined), false, 'unknown baseline');
+	assert.equal(classifyObservationTrigger({ attention: false, changedFacts: [] }, {}).attention, false);
+});

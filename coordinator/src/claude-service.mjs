@@ -40,7 +40,14 @@ const MCP_TOOL_TIMEOUT_MS = '600000';
 // fresh Claude Code session (same system prompt and tools, so the cached prefix is reused) with a short
 // carry-over of recent actions; each event already restates the goal, task memory, facts and program state.
 const DEFAULT_CONTEXT_ROTATION_TOKENS = 64_000;
+// Hysteresis: a fresh session whose first turns already pass the threshold (large tool results) must not thrash.
+const MIN_TURNS_BETWEEN_ROTATIONS = 3;
 const CARRY_OVER_TOOL_CALLS = 10;
+const CARRY_OVER_CONVERSATION = 6;
+// Streamed token events renew liveness at most this often.
+const STREAM_PROGRESS_INTERVAL_MS = 1_000;
+// Claude Code builds without --include-partial-messages; recorded when one rejects the flag.
+const PARTIAL_MESSAGES_UNSUPPORTED = new Set();
 
 /**
  * Tool names, instructions, and the dedicated Minecraft workspace are the same ones
@@ -336,7 +343,14 @@ class ClaudeAgent {
 	#lastContextTokens = 0;
 	#rotationDue = false;
 	#rotations = 0;
+	#turnsSinceRotation = 0;
+	#pendingCarryOver = null;
+	#processUsed = false;
+	#processCostUsd = 0;
+	#lastStreamProgressAt = 0;
 	#recentTools = [];
+	#recentConversation = [];
+	#lastProgram = null;
 	#lastAgentText = null;
 
 	constructor(profile, { config, cwd, controlProtocol, systemPromptFile, toolServer, spawn, terminate, fs, schedule, cancelSchedule, sessionGeneration, resetReason, onInvalidated }) {
@@ -404,7 +418,6 @@ class ClaudeAgent {
 		if (goalRevision !== this.#goalRevision) throw new ClaudeProviderError('STALE_GOAL_REVISION', `Goal revision ${String(goalRevision)} does not match ${this.#goalRevision}`);
 		if (signal?.aborted) throw signal.reason ?? new ClaudeProviderError('TURN_INTERRUPTED', 'Native tool turn was interrupted');
 		if (this.#active !== null) throw new ClaudeProviderError('TURN_IN_PROGRESS', `Claude agent '${this.agentId}' already has an active turn`);
-		const carryOver = await this.#rotateIfDue();
 		await this.#ensureProcess();
 		// An interrupted turn still owes Claude Code's closing result line; never let it close this turn.
 		await this.#waitForIdle();
@@ -439,12 +452,17 @@ class ClaudeAgent {
 			void this.interrupt().catch(() => {});
 		};
 		signal?.addEventListener('abort', abort, { once: true });
+		let completed = false;
 		try {
 			// Same compact fact encoding Codex receives; the observe tool description documents it.
 			const encoded = encodeNativeEventInput(input, this.#observationViews);
+			const carryOver = this.#pendingCarryOver;
 			this.#writeUserMessage(carryOver === null ? encoded : `${carryOver}
 
 ${encoded}`);
+			this.#pendingCarryOver = null;
+			this.#processUsed = true;
+			this.#noteEventFacts(input);
 			this.#awaitingResult += 1;
 			silence.restart();
 			const result = await Promise.race([turnPromise, silence.promise]);
@@ -452,6 +470,8 @@ ${encoded}`);
 				throw new ClaudeProviderError('STALE_PLAN', 'Claude native turn belongs to an obsolete goal revision');
 			}
 			this.#sessionState = 'warm';
+			this.#turnsSinceRotation += 1;
+			completed = true;
 			return result;
 		} catch (error) {
 			this.#observationViews.forgetEventMetadata();
@@ -461,6 +481,8 @@ ${encoded}`);
 			signal?.removeEventListener('abort', abort);
 			silence.dispose();
 			if (this.#active === active) this.#active = null;
+			// Rotate right after a finished turn, off the next event's critical path, and prewarm the new session.
+			if (completed) this.#rotateAfterTurn();
 		}
 	}
 
@@ -477,7 +499,7 @@ ${encoded}`);
 		// turn accounting. Steers therefore ride along with the next tool result; if the turn ends first the
 		// rejection makes the coordinator defer the event to the next turn.
 		return new Promise((resolve, reject) => {
-			active.pendingSteers.push({ text: encodeNativeEventInput(input, this.#observationViews), resolve: () => resolve({ turnId: active.turnId }), reject });
+			active.pendingSteers.push({ text: input, resolve: () => resolve({ turnId: active.turnId }), reject });
 			active.silence.restart();
 		});
 	}
@@ -594,6 +616,7 @@ ${encoded}`);
 	}
 
 	async #startProcess() {
+		this.#resetContextState();
 		let resolveListed;
 		this.#toolsListed = { promise: new Promise((resolve) => { resolveListed = resolve; }), resolve: () => resolveListed() };
 		void this.#toolsListed.promise.catch(() => {});
@@ -650,7 +673,11 @@ ${encoded}`);
 
 	#onMessage(message) {
 		const active = this.#active;
-		if (active !== null && !active.settled) {
+		const now = Date.now();
+		// Token deltas arrive many times a second; renewing timers and leases for each one is wasted work.
+		const renew = message?.type !== 'stream_event' || now - this.#lastStreamProgressAt >= STREAM_PROGRESS_INTERVAL_MS;
+		if (active !== null && !active.settled && renew) {
+			this.#lastStreamProgressAt = now;
 			active.silence.restart();
 			try { active.onProgress?.({ phase: 'provider' }); } catch { /* progress reporting cannot fail provider work */ }
 		}
@@ -677,9 +704,18 @@ ${encoded}`);
 		if (message?.type !== 'result') return;
 		if (typeof message.session_id === 'string') this.#sessionId = message.session_id;
 		this.#finishCalls();
-		if (active !== null && Number.isFinite(message.total_cost_usd) && message.total_cost_usd >= 0) {
-			active.usage.costUsd = message.total_cost_usd;
-			this.#usage.costUsd += message.total_cost_usd;
+		// In streaming input mode total_cost_usd is the running total for this Claude Code process.
+		if (Number.isFinite(message.total_cost_usd) && message.total_cost_usd >= 0) {
+			const delta = message.total_cost_usd >= this.#processCostUsd ? message.total_cost_usd - this.#processCostUsd : message.total_cost_usd;
+			this.#processCostUsd = message.total_cost_usd;
+			this.#usage.costUsd += delta;
+			if (active !== null) active.usage.costUsd = (active.usage.costUsd ?? 0) + delta;
+		}
+		// Per-step assistant output_tokens are placeholders; the result's usage covers this turn's real output.
+		const turnOutput = message.usage?.output_tokens;
+		if (active !== null && Number.isSafeInteger(turnOutput) && turnOutput >= 0) {
+			this.#usage.output += turnOutput - active.usage.output;
+			active.usage.output = turnOutput;
 		}
 		if (this.#awaitingResult > 0) this.#awaitingResult -= 1;
 		if (this.#awaitingResult === 0) for (const resolve of this.#idleWaiters.splice(0)) resolve();
@@ -719,6 +755,7 @@ ${encoded}`);
 				content = presented.response;
 				commit = presented.commit;
 				this.#rememberTool(name, args, result);
+				this.#noteProgram(result);
 			} catch (error) {
 				this.#rememberTool(name, args, { state: 'FAILED', reasonCode: error?.code ?? 'TOOL_EXECUTION_FAILED' });
 				content = toolResultContent({
@@ -730,8 +767,12 @@ ${encoded}`);
 			} finally {
 				active.silence.resume();
 			}
-			const delivered = deliverSteers(active, content);
-			commit();
+			const delivered = deliverSteers(active, content, (text) => {
+				this.#noteEventFacts(text);
+				return encodeNativeEventInput(text, this.#observationViews);
+			});
+			// A settled (interrupted or aborted) turn may never show this result to the model.
+			if (!active.settled) commit();
 			this.#requestAt = Date.now();
 			return delivered;
 		};
@@ -741,26 +782,56 @@ ${encoded}`);
 		return mcpContent(await task);
 	}
 
-	/** Starts a fresh Claude Code session between turns once the context has grown past the threshold. */
-	async #rotateIfDue() {
-		if (!this.#rotationDue || this.#process === null || this.#awaitingResult > 0) return null;
-		const carryOver = this.#carryOver();
-		this.#rotationDue = false;
+	/** Starts and prewarms a fresh Claude Code session after a finished turn once the context has grown past the threshold. */
+	#rotateAfterTurn() {
+		if (!this.#rotationDue || this.#turnsSinceRotation < MIN_TURNS_BETWEEN_ROTATIONS) return;
+		if (this.#process === null || this.#active !== null || this.#awaitingResult > 0 || this.#disposed) return;
+		const carryOver = this.#carryOver('Session refreshed to keep context small');
 		this.#rotations += 1;
-		await this.#stopProcess();
-		this.#observationViews.reset();
-		this.#recentTools = [];
-		this.#lastAgentText = null;
-		return carryOver;
+		void this.#stopProcess().then(() => {
+			// The previous session's views and baselines are gone with it (see #releaseProcessState).
+			this.#pendingCarryOver = carryOver;
+			if (this.#disposed || this.#invalidationError !== null) return undefined;
+			return this.#ensureProcess();
+		}).catch(() => {});
 	}
 
-	#carryOver() {
+	#carryOver(reason) {
 		const lines = this.#recentTools.map((entry) => `- ${entry}`);
 		return [
-			'Session refreshed to keep context small: your earlier turns are not shown. The event below restates your goal, task memory, facts and program state; read taskPlan, queryMemory or taskMemory for anything else.',
+			`${reason}: your earlier turns are not shown. The event below restates your goal, task memory and facts; read taskPlan, programStatus, queryMemory or taskMemory for anything else.`,
 			...(lines.length === 0 ? [] : ['Your most recent tool calls (oldest first):', ...lines]),
+			...(this.#recentConversation.length === 0 ? [] : ['Recent conversation already delivered to you (oldest first):', ...this.#recentConversation.map((entry) => `- ${entry}`)]),
+			...(this.#lastProgram === null ? [] : [`Last known program (verify with programStatus): ${JSON.stringify(this.#lastProgram)}`]),
 			...(this.#lastAgentText === null ? [] : [`Your last note: ${JSON.stringify(this.#lastAgentText)}`]),
 		].join('\n');
+	}
+
+	/** Remembers delivered conversation and program state from a native event for a later carry-over. */
+	#noteEventFacts(text) {
+		const separator = text.indexOf('\n');
+		if (separator < 0) return;
+		const lineEnd = text.indexOf('\n', separator + 1);
+		let value;
+		try { value = JSON.parse(text.slice(separator + 1, lineEnd < 0 ? text.length : lineEnd)); } catch { return; }
+		for (const entry of Array.isArray(value?.conversation?.entries) ? value.conversation.entries : []) {
+			const speaker = typeof entry?.sourceName === 'string' ? entry.sourceName : typeof entry?.sourceId === 'string' ? entry.sourceId : entry?.kind ?? 'message';
+			if (typeof entry?.text !== 'string') continue;
+			this.#recentConversation.push(`${truncate(String(speaker), 48)}: ${truncate(entry.text, 200)}`);
+		}
+		if (this.#recentConversation.length > CARRY_OVER_CONVERSATION) this.#recentConversation.splice(0, this.#recentConversation.length - CARRY_OVER_CONVERSATION);
+		if (value?.program !== null && typeof value?.program === 'object') this.#noteProgram(value.program);
+	}
+
+	#noteProgram(value) {
+		if (value === null || typeof value !== 'object' || typeof value.programId !== 'string') return;
+		const decision = value.decision ?? value.status?.decision;
+		this.#lastProgram = {
+			programId: value.programId,
+			...(typeof value.state === 'string' ? { state: value.state } : {}),
+			...(typeof value.engineState === 'string' ? { engineState: value.engineState } : {}),
+			...(typeof decision?.decisionId === 'string' ? { pendingDecisionId: decision.decisionId, trigger: decision.trigger } : {}),
+		};
 	}
 
 	#rememberTool(name, args, result) {
@@ -870,6 +941,7 @@ ${encoded}`);
 	#onProcessExit(state, error) {
 		if (state.exited) return;
 		state.exited = true;
+		if (/unknown option[^\n]*--include-partial-messages/i.test(state.stderr)) PARTIAL_MESSAGES_UNSUPPORTED.add(partialMessagesKey(this.#config));
 		if (this.#process !== state) return;
 		this.#process = null;
 		this.#releaseProcessState();
@@ -892,6 +964,20 @@ ${encoded}`);
 		this.#awaitingResult = 0;
 		for (const resolve of this.#idleWaiters.splice(0)) resolve();
 		this.#sessionState = 'cold';
+		// An unplanned restart (unacknowledged interrupt, stuck turn) also loses the conversation.
+		if (this.#processUsed && this.#pendingCarryOver === null) this.#pendingCarryOver = this.#carryOver('Claude Code restarted');
+		this.#resetContextState();
+	}
+
+	/** A new Claude Code process has never seen earlier events, fact views or omitted metadata. */
+	#resetContextState() {
+		this.#observationViews.reset();
+		this.#rotationDue = false;
+		this.#turnsSinceRotation = 0;
+		this.#processUsed = false;
+		this.#processCostUsd = 0;
+		this.#calls.clear();
+		this.#currentCallId = null;
 	}
 
 	#runOneShot(prompt) {
@@ -991,7 +1077,7 @@ export function buildClaudeLaunch(profile, config, { cwd, systemPromptFile, mcpC
 	const args = [
 		...launch.args,
 		'--print',
-		...(streaming ? ['--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--include-partial-messages'] : ['--output-format', 'json']),
+		...(streaming ? ['--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', ...(PARTIAL_MESSAGES_UNSUPPORTED.has(partialMessagesKey(config)) ? [] : ['--include-partial-messages'])] : ['--output-format', 'json']),
 		'--model', profile.model,
 		'--effort', profile.reasoningEffort,
 		'--system-prompt-file', systemPromptFile,
@@ -1073,10 +1159,10 @@ function resultErrorCode(document) {
 }
 
 /** Appends queued steers to a tool result so the model sees them before its next decision. */
-function deliverSteers(active, content) {
+function deliverSteers(active, content, encode = (text) => text) {
 	const steers = active.pendingSteers.splice(0);
 	if (steers.length === 0) return content;
-	const text = `Newer coordinator events for this turn (treat them exactly like the turn input):\n${steers.map((steer) => steer.text).join('\n\n')}`;
+	const text = `Newer coordinator events for this turn (treat them exactly like the turn input):\n${steers.map((steer) => encode(steer.text)).join('\n\n')}`;
 	for (const steer of steers) steer.resolve();
 	return { ...content, contentItems: [...content.contentItems, { type: 'inputText', text }] };
 }
@@ -1227,6 +1313,7 @@ function nativeToken(value) { return Number.isSafeInteger(value) && value >= 0 ?
 function finiteDuration(value) { return Number.isFinite(value) && value >= 0 ? Math.round(value) : null; }
 function requireText(value, field) { if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError(`${field} must be nonblank`); return value.trim(); }
 function requireStringArray(value, field) { if (!Array.isArray(value) || value.length === 0) throw new TypeError(`${field} must be a nonempty array`); return [...new Set(value.map((entry) => requireText(entry, field)))]; }
+function partialMessagesKey(config) { return String(config.executable ?? 'claude'); }
 function nonnegativeInteger(value, field) { if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${field} must be a nonnegative safe integer`); return value; }
 function truncate(text, max) { return text.length <= max ? text : `${text.slice(0, max - 3)}...`; }
 function mergeUsage(target, usage) {

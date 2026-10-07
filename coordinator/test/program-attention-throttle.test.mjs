@@ -72,3 +72,63 @@ test('urgent attention always notifies at once', async t => {
 	assert.equal(run.decisions.length, 2);
 	assert.equal(run.decisions[1].priority, 'urgent');
 });
+
+test('ordinary attention folded after the last notification is not lost when the model answers continue', async t => {
+	const run = setup(t);
+	run.sight();
+	await turn();
+	const first = run.decisions[0].decisionId;
+	run.advance(3_000);
+	run.sight();
+	await turn();
+	assert.equal(run.decisions.length, 1);
+	const folded = run.executor.status(record).decision;
+	assert.equal(folded.decisionId, first);
+	assert.equal(folded.eventSequence, 3, 'the folded decision carries the newest facts');
+	run.executor.respond(record, { programId: 'throttle', decisionId: first, directive: 'continue' });
+	await turn();
+	const reopened = run.executor.status(record).decision;
+	assert.ok(reopened && reopened.decisionId !== first, 'the unseen sighting opens a new decision');
+	const deferred = run.timers.find(timer => !timer.cleared && timer.ms === 27_000);
+	assert.ok(deferred, 'through the same window');
+	run.advance(27_000);
+	deferred.callback();
+	assert.equal(run.decisions.length, 2);
+	assert.equal(run.decisions[1].decisionId, reopened.decisionId);
+});
+
+test('a continue with nothing unseen does not reopen a decision', async t => {
+	const run = setup(t);
+	run.sight();
+	await turn();
+	run.executor.respond(record, { programId: 'throttle', decisionId: run.decisions[0].decisionId, directive: 'continue' });
+	await turn();
+	assert.equal(run.executor.status(record).decision, undefined);
+});
+
+test('lava newly in view, lost health or a changed dimension skip the ordinary window', async t => {
+	for (const change of [
+		(observation) => ({ ...observation, blocks: [{ stableId: '3,63,0', x: 3, y: 63, z: 0, blockId: 'minecraft:lava', tags: [], state: {} }] }),
+		(observation) => ({ ...observation, player: { ...observation.player, health: 19 } }),
+		(observation) => ({ ...observation, world: { worldId: 'w', dimension: 'minecraft:the_nether' } }),
+	]) {
+		const run = setup(t);
+		run.sight();
+		await turn();
+		run.executor.respond(record, { programId: 'throttle', decisionId: run.decisions[0].decisionId, directive: 'continue' });
+		run.advance(2_000);
+		run.sight({ observation: change({ ...observation(), world: { worldId: 'w', dimension: 'minecraft:overworld' } }) });
+		await turn();
+		assert.equal(run.decisions.length, 2, 'a hazard edge reaches the model at once');
+	}
+});
+
+test('hazard edges compare against the previous facts only', async () => {
+	const { hazardEdge } = await import('../src/native-program-executor.mjs');
+	const lava = { blocks: [{ x: 1, y: 2, z: 3, blockId: 'minecraft:lava' }], player: { health: 20, air: 300 } };
+	assert.equal(hazardEdge(lava, lava), false, 'lava already in view is not a new edge');
+	assert.equal(hazardEdge({ blocks: [], player: { health: 20 } }, lava), true);
+	assert.equal(hazardEdge({ player: { health: 20, air: 300 } }, { player: { health: 20, air: 280 } }), true);
+	assert.equal(hazardEdge({ player: { health: 18 } }, { player: { health: 20 } }), false, 'healing is not a hazard');
+	assert.equal(hazardEdge(null, lava), false);
+});

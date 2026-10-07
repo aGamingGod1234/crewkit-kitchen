@@ -71,6 +71,26 @@ export function representativeObservation(sequence = 1) {
 	};
 }
 
+/** Mixed terrain: plain cubes beside slabs, fluids, torches and stateful blocks, so rows do not share one shape. */
+export function mixedTerrainBlocks() {
+	const kinds = [
+		{ blockId: 'minecraft:stone', tags: ['minecraft:mineable/pickaxe', 'minecraft:base_stone_overworld'] },
+		{ blockId: 'minecraft:dirt', tags: ['minecraft:mineable/shovel', 'minecraft:dirt'] },
+		{ blockId: 'minecraft:grass_block', tags: ['minecraft:mineable/shovel', 'minecraft:dirt'], state: { snowy: 'false' } },
+		{ blockId: 'minecraft:oak_slab', tags: ['minecraft:slabs', 'minecraft:mineable/axe'], state: { type: 'bottom', waterlogged: 'false' }, bounds: [{ minX: 0, minY: 0, minZ: 0, maxX: 1, maxY: 0.5, maxZ: 1 }] },
+		{ blockId: 'minecraft:water', tags: [], state: { level: '0' }, fluid: 'minecraft:water', replaceable: true, bounds: [] },
+		{ blockId: 'minecraft:lava', tags: [], state: { level: '0' }, fluid: 'minecraft:lava', replaceable: true, bounds: [] },
+		{ blockId: 'minecraft:iron_ore', tags: ['minecraft:mineable/pickaxe', 'minecraft:iron_ores'] },
+		{ blockId: 'minecraft:wall_torch', tags: ['minecraft:wall_post_override'], state: { facing: 'north' }, bounds: [{ minX: 0.34, minY: 0.2, minZ: 0.62, maxX: 0.66, maxY: 0.8, maxZ: 1 }], replaceable: false },
+	];
+	return Array.from({ length: 32 }, (_, index) => {
+		const kind = kinds[[0, 0, 1, 0, 2, 0, 3, 6, 0, 1, 4, 0, 7, 0, 5, 2][index % 16]];
+		const x = -440 + (index % 6), y = 80 + Math.floor(index / 6), z = 127 - (index % 3);
+		return { stableId: `${x},${y},${z}`, x, y, z, ...kind, state: kind.state ?? {}, bounds: kind.bounds ?? [{ minX: 0, minY: 0, minZ: 0, maxX: 1, maxY: 1, maxZ: 1 }],
+			distance: Number((1.5 + index * 0.21).toFixed(2)), ...(index % 4 === 0 ? { placeableFaces: ['up', 'north'] } : {}) };
+	});
+}
+
 export function representativeTaskMemory() {
 	return { worldId: 'fixture-world', dimension: 'minecraft:overworld', revision: 41, currentGoalRevision: 1, historical: true,
 		progress: [{ key: 'iron-tools', label: 'Iron tools', summary: 'Have stone pickaxe and 4 raw iron; need furnace, 3 iron ingots for pickaxe, then bucket and more iron for armor.', goalRevision: 1 }],
@@ -121,7 +141,15 @@ export function measureTokenBudget({ agentsMarkdown = '', skillMarkdown = '' } =
 		eventRawBytes: bytes(raw),
 		eventEncodedFirstBytes: bytes(first),
 		eventEncodedRepeatBytes: bytes(second),
+		...measureMixedTerrain(record),
 	};
+}
+
+function measureMixedTerrain(record) {
+	const wake = representativeProgramWake(1);
+	wake.observation.blocks = mixedTerrainBlocks();
+	const raw = buildNativeEventInput(record, wake);
+	return { mixedTerrainRawBytes: bytes(raw), mixedTerrainEncodedBytes: bytes(encodeNativeEventInput(raw)) };
 }
 
 /**
