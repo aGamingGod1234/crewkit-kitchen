@@ -155,6 +155,25 @@ public final class PovClient {
 	}
 
 	/**
+	 * True when {@code entity} is the operator's own body seen from an agent view: the body stays in the world
+	 * during spectate and takeover, so it is drawn like any other player. A spectator body stays hidden, as it is
+	 * for everyone else.
+	 */
+	/** True while the taken-over agent is asleep, which is when vanilla would show the in-bed screen. */
+	public static boolean agentSleeping() {
+		if (!isTakeover()) return false;
+		AbstractClientPlayer agent = agentPlayer();
+		return agent != null && agent.isSleeping();
+	}
+
+	public static boolean showsOperatorBody(Object entity) {
+		if (!isActive()) return false;
+		Minecraft client = Minecraft.getInstance();
+		return entity != null && entity == client.player && client.getCameraEntity() != client.player
+				&& !client.player.isSpectator();
+	}
+
+	/**
 	 * The agent's in-level client entity while it is what the camera shows. Null without a session,
 	 * while the signal is lost or while the agent is dead, so first-person hands draw nothing then.
 	 */

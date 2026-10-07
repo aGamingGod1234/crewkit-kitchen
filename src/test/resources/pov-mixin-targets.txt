@@ -8,6 +8,7 @@ net.minecraft.client.MouseHandler
 net.minecraft.client.gui.Gui
 net.minecraft.client.gui.contextualbar.ExperienceBarRenderer
 net.minecraft.client.gui.screens.debug.GameModeSwitcherScreen
+net.minecraft.client.gui.screens.InBedChatScreen
 net.minecraft.client.gui.screens.MenuScreens
 net.minecraft.client.gui.screens.inventory.AbstractContainerScreen
 net.minecraft.client.gui.screens.inventory.InventoryScreen
@@ -17,6 +18,7 @@ net.minecraft.client.player.KeyboardInput
 net.minecraft.client.player.LocalPlayer
 net.minecraft.client.renderer.GameRenderer
 net.minecraft.client.renderer.ItemInHandRenderer
+net.minecraft.client.renderer.LevelRenderer
 net.minecraft.client.renderer.ScreenEffectRenderer
 net.minecraft.client.renderer.entity.EntityRenderer
 net.minecraft.client.renderer.entity.player.AvatarRenderer

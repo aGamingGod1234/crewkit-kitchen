@@ -22,6 +22,7 @@ import net.minecraft.network.protocol.game.ServerboundContainerClickPacket;
 import net.minecraft.network.protocol.game.ServerboundPickItemFromBlockPacket;
 import net.minecraft.network.protocol.game.ServerboundPickItemFromEntityPacket;
 import net.minecraft.network.protocol.game.ServerboundPlayerActionPacket;
+import net.minecraft.network.protocol.game.ServerboundPlayerCommandPacket;
 import net.minecraft.network.protocol.game.ServerboundPlayerLoadedPacket;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
@@ -89,6 +90,7 @@ public final class OperatorActionDispatcher {
 				OptionalInt button = decodeMenuButton(action.a());
 				yield button.isPresent() ? menuButton(agent, button.getAsInt()) : Outcome.IGNORED;
 			}
+			case LEAVE_BED -> leaveBed(agent);
 			// The controller handles respawn itself because the body is usually absent then.
 			case RESPAWN -> Outcome.IGNORED;
 		};
@@ -115,6 +117,21 @@ public final class OperatorActionDispatcher {
 			case START -> startUseItem(agent, keys);
 			case NONE -> { }
 		}
+	}
+
+	/**
+	 * LocalPlayer.aiStep: a fresh jump press in the air with a glider equipped asks the server to start gliding. The
+	 * held jump key only reaches Carpet's jump action, which never does this, so elytra could not open in a takeover.
+	 * The relayed handler runs vanilla's own tryToStartFallFlying checks (airborne, not riding, no levitation, glider).
+	 */
+	static Outcome jumpPressed(ServerPlayer agent) {
+		if (agent.onGround() || agent.isFallFlying() || agent.onClimbable() || agent.getAbilities().flying
+				|| agent.isInWater() || agent.isPassenger()) {
+			return Outcome.IGNORED;
+		}
+		prepareBody(agent);
+		agent.connection.handlePlayerCommand(new ServerboundPlayerCommandPacket(agent, ServerboundPlayerCommandPacket.Action.START_FALL_FLYING));
+		return agent.isFallFlying() ? Outcome.RELAYED : Outcome.IGNORED;
 	}
 
 	/** Server-checked one-click melee; a held attack only mines, so entities are hit once per click. */
@@ -252,6 +269,18 @@ public final class OperatorActionDispatcher {
 		agent.resetLastActionTime();
 		vehicle.openCustomInventoryScreen(agent);
 		return Outcome.MENU_OPENED;
+	}
+
+	/**
+	 * Vanilla InBedChatScreen sends STOP_SLEEPING; relayed so the handler's own checks run. The handler then waits for
+	 * the client to confirm its position, which a Carpet body never does, so that wait is cleared again.
+	 */
+	static Outcome leaveBed(ServerPlayer agent) {
+		if (!agent.isSleeping()) return Outcome.IGNORED;
+		prepareBody(agent);
+		agent.connection.handlePlayerCommand(new ServerboundPlayerCommandPacket(agent, ServerboundPlayerCommandPacket.Action.STOP_SLEEPING));
+		prepareBody(agent);
+		return Outcome.RELAYED;
 	}
 
 	static Outcome closeMenu(ServerPlayer agent) {

@@ -305,7 +305,10 @@ public final class OperatorBodyControlVerification {
 				&& OperatorActionDispatcher.decodeMenuButton(-1).isEmpty(), "menu buttons must be non-negative");
 		check(OperatorActionDispatcher.decodeIncludeData(1) && !OperatorActionDispatcher.decodeIncludeData(0),
 				"pick-block data flag decodes");
-		return 9;
+		// Actions travel by ordinal, so existing ones keep their numbers and new ones are appended.
+		check(dev.agaminggod.arenaagents.pov.OperatorAction.RESPAWN.ordinal() == 10
+				&& dev.agaminggod.arenaagents.pov.OperatorAction.LEAVE_BED.ordinal() == 11, "leave bed is appended after respawn");
+		return 10;
 	}
 
 	private static int verifyLeasePriority() {

@@ -80,12 +80,15 @@ public final class CarpetOperatorBodyController implements OperatorBodyControlle
 	public void applyFrame(OperatorInputPayload payload) {
 		if (!active || payload == null) return;
 		Frame next = Frame.decode(payload, frame);
+		boolean jumpPressed = next.jump() && (frame == null || !frame.jump());
 		keys.onFrame(next);
 		frame = next;
 		lastInputSequence = Math.max(0, payload.sequence());
 		guarded("frame", () -> {
 			ServerPlayer agent = bind();
-			if (agent != null) push(agent);
+			if (agent == null) return;
+			if (jumpPressed) OperatorActionDispatcher.jumpPressed(agent);
+			push(agent);
 		});
 	}
 

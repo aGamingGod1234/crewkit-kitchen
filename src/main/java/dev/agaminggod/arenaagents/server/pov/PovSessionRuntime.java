@@ -170,6 +170,7 @@ public final class PovSessionRuntime {
 				record.state() == AgentLifecycleState.DEAD);
 		if (mode == PovMode.TAKEOVER) beginTakeover(server, manager, state, session, operator, record);
 		state.sessions.put(operator.getUUID(), session);
+		if (mode == PovMode.TAKEOVER) PovMessageRelay.start(agentPlayerUuid, operator.getUUID(), agentName);
 		if (agent != null) {
 			session.observeAgent(agent, agent.position(), AGENT_LOOK_RESET_JUMP_BLOCKS);
 			if (session.takeover()) sampleAgent(session, agent);
@@ -271,6 +272,7 @@ public final class PovSessionRuntime {
 			}
 		} finally {
 			STATES.remove(server);
+			PovMessageRelay.clearAll();
 			AgentControlReservations.releaseAll(server);
 		}
 	}
@@ -355,6 +357,7 @@ public final class PovSessionRuntime {
 	 * tick used to) showed the operator the previous tick's position, one tick behind its own input.
 	 */
 	public static void endTick(MinecraftServer server) {
+		PovMessageRelay.flush(server);
 		State state = STATES.get(server);
 		if (state == null || state.sessions.isEmpty()) return;
 		CodexAgentManager manager = CodexAgentManager.get(server);
@@ -425,6 +428,7 @@ public final class PovSessionRuntime {
 	private static void end(MinecraftServer server, State state, PovSession session, PovExitReason reason,
 			String detail, ServerPlayer operator) {
 		if (!state.sessions.remove(session.operatorId(), session)) return;
+		PovMessageRelay.stop(session.agentPlayerUuid(), session.operatorId());
 		String message = detail == null ? reason.message() : detail;
 		boolean online = operator != null && reason != PovExitReason.OPERATOR_DISCONNECTED;
 		if (session.takeover()) {

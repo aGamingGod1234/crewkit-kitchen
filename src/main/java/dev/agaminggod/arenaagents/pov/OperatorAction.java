@@ -17,5 +17,7 @@ public enum OperatorAction {
 	CLOSE_MENU,
 	MENU_CLICK,
 	MENU_BUTTON,
-	RESPAWN
+	RESPAWN,
+	/** The in-bed screen's Leave Bed button (or Escape): vanilla STOP_SLEEPING for the agent. */
+	LEAVE_BED
 }
