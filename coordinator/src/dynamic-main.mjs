@@ -1879,7 +1879,7 @@ export class DynamicCoordinator extends EventEmitter {
 	async #takeTask(work, tool) {
 		if (work.request.conversationOnly !== true) {
 			return { state: 'REJECTED', reasonCode: 'TASK_ALREADY_ACTIVE', executed: false,
-				message: 'You already have a task. takeTask only adopts a player request when you have none; treat their message as input to your current task.' };
+				message: 'You already have a task. takeTask only adopts a player request when you have none; treat their message as input to your current task and act on it now (awaiting operator confirmation never blocks this).' };
 		}
 		if (work.taskAdopted !== undefined) return { ...work.taskAdopted, executed: false };
 		const delivered = [...(work.request.deliveredPlayerRequests ?? []), ...(work.steeredPlayerRequests ?? [])];
@@ -3216,6 +3216,7 @@ export class DynamicCoordinator extends EventEmitter {
 			if (!isCurrent()) throw Object.assign(new Error('Native input belongs to an obsolete lifecycle'), { code: 'STALE_PLAN' });
 			const input = buildNativeEventInput(record, {
 				...request.nativeEvent, taskMemory, dangerSummary: request.dangerSummary,
+				awaitingConfirmation: this.#awaitingNativeConfirmation(record, request.lifecycleGeneration),
 				observation: this.#nativeRuntime.decorateObservation(record, request.nativeEvent.observation ?? {}),
 				conversation: reservation?.conversation ?? { mode: 'unread', baseSequence: null, nextSequence: -1, entries: [] },
 			});
@@ -4582,7 +4583,8 @@ export function classifyObservationTrigger(payload, observation, signals = null)
 	const attention = payload.attention === true;
 	if (explicitTrigger !== null) return { attention: true, priority: payload.priority === 'urgent' || ['damage', 'threat', 'lava', 'fire', 'suffocation', 'fall'].includes(explicitTrigger) ? 'urgent' : 'ordinary', trigger: explicitTrigger };
 	const changedFacts = Array.isArray(payload.changedFacts) ? payload.changedFacts : [];
-	const joinedFacts = changedFacts.filter((value) => typeof value === 'string').join('|').toLowerCase();
+	// Healing signals are classified on their own below; their names must not read as damage/air/fall facts.
+	const joinedFacts = changedFacts.filter((value) => typeof value === 'string' && !value.startsWith('survival.')).join('|').toLowerCase();
 	const player = observation?.player ?? {};
 	const before = signals?.previousPlayer;
 	const healthDecreased = Number.isFinite(player.health) && Number.isFinite(before?.health) && player.health < before.health;
@@ -4597,6 +4599,10 @@ export function classifyObservationTrigger(payload, observation, signals = null)
 	if (joinedFacts.includes('fire') || player.onFire === true || player.fire === true) return { attention: true, priority: 'urgent', trigger: 'fire' };
 	if (joinedFacts.includes('suffoc') || joinedFacts.includes('air')) return { attention: true, priority: 'urgent', trigger: 'suffocation' };
 	if (joinedFacts.includes('fall')) return { attention: true, priority: 'urgent', trigger: 'fall' };
+	// Debounced healing facts from Minecraft. Low health with no food while threatened is urgent so the model can
+	// weigh a retreat; a safe chance to eat is ordinary attention. The model decides whether to eat or flee.
+	if (changedFacts.includes('survival.low_health_no_food')) return { attention: true, priority: 'urgent', trigger: 'low_health' };
+	if (changedFacts.includes('survival.heal_opportunity')) return { attention: true, priority: 'ordinary', trigger: 'heal_opportunity' };
 	// Visible lava is relevant evidence, not proof the player is inside it.
 	if (signals?.movementLoop === true) return { attention: true, priority: 'urgent', trigger: 'movement_loop' };
 	if (signals?.resourceDiscovery === true) return { attention: true, priority: 'ordinary', trigger: 'resource_discovery' };
@@ -4681,7 +4687,7 @@ function sameSupervisionKey(left, right) {
 		&& left?.profileFingerprint === right?.profileFingerprint;
 }
 
-export function buildNativeEventInput(record, { event, trigger, programId, status, result, planningLeadMs, eventSequence, taskMemory = null, dangerSummary = null, observation = {}, conversation = { mode: 'unread', baseSequence: -1, nextSequence: -1, entries: [] }, conversationOnly = false } = {}) {
+export function buildNativeEventInput(record, { event, trigger, programId, status, result, planningLeadMs, eventSequence, taskMemory = null, dangerSummary = null, observation = {}, conversation = { mode: 'unread', baseSequence: -1, nextSequence: -1, entries: [] }, conversationOnly = false, awaitingConfirmation = false } = {}) {
 	const eventName = typeof event === 'string' && event.length > 0 ? event : event?.event;
 	const normalizedEvent = typeof eventName === 'string' && eventName.length > 0 ? eventName : 'observation';
 	const eventPlanningLeadMs = status?.planningLeadMs ?? planningLeadMs ?? event?.planningLeadMs;
@@ -4811,11 +4817,15 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 		? 'Live Minecraft event. Program planning is due soon: prepare the next intention while the current authorised routine keeps running. This is advisory and does not require a pending decisionId; use the current programVersion and timing context, and do not blindly renew or cancel the current program.'
 		: dangerPaused
 			? 'Live Minecraft event. Program paused for danger: call fight_target or flee_from now; respond to the program later.'
-			: 'Live Minecraft event. Advance the current goal using fresh facts. Keep authorised routines running while you reason; respond explicitly to pending program decisions.';
+			: awaitingConfirmation === true
+				? AWAITING_CONFIRMATION_EVENT_INSTRUCTION
+				: 'Live Minecraft event. Advance the current goal using fresh facts. Keep authorised routines running while you reason; respond explicitly to pending program decisions.';
 	return `${instruction}\n${json}`;
 }
 
 const DANGER_PAUSE_TRIGGERS = new Set(['damage', 'threat']);
+// Waiting for the operator only means "do not redo the finished work or re-run finish"; it never blocks new requests.
+export const AWAITING_CONFIRMATION_EVENT_INSTRUCTION = 'Live Minecraft event. Your finished goal awaits operator confirmation: do not redo it or re-run finish. Waiting never blocks new requests: act on player messages now with any tool, as part of your task, then call finish again when done.';
 const UUID_TEXT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const DEFAULT_TASK_REQUEST_TIMEOUT_MS = 10_000;
 const MINIMAL_TASK_MEMORY_BYTES = 2_048;

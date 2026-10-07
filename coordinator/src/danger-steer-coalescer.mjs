@@ -10,8 +10,9 @@
 
 export const DANGER_STEER_INTERVAL_MS = 2_000;
 const DANGER_STEER_TRIGGERS = new Set(['damage', 'threat']);
-// Half health and three hearts: crossing either changes what a sensible choice is.
-const LOW_HEALTH_THRESHOLDS = Object.freeze([10, 6]);
+// 70% (when eating while safe becomes worthwhile), half health and three hearts: crossing any changes what a
+// sensible choice is. 14 is deliberate: waiting to be told at 5 hearts taught agents to heal far too late.
+const LOW_HEALTH_THRESHOLDS = Object.freeze([14, 10, 6]);
 const MAX_SUMMARY_ATTACKERS = 4;
 
 /** The danger facts of one steer request, or null when the request is not a damage/threat steer. */

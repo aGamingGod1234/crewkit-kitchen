@@ -118,6 +118,8 @@ public final class CodexAgentServerRuntime {
 		ServerLifecycleEvents.SERVER_STOPPING.register(CodexAgentServerRuntime::stop);
 		ServerLifecycleEvents.END_DATA_PACK_RELOAD.register((server, resourceManager, success) ->
 				ServerObservationCollector.clearTagCache());
+		// Who hurt which player: turns a player's potential risk into an active threat for 30 s after a hit.
+		dev.agaminggod.arenaagents.server.perception.AggressionLedger.register();
 		ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
 			WorldPlayerNames.get(server).remember(handler.getPlayer().getGameProfile().name(), handler.getPlayer().getUUID());
 			VoiceConsentRegistry.playerConnected(server, handler.getPlayer().getUUID());

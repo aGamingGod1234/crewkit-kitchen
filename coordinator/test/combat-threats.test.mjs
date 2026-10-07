@@ -56,10 +56,10 @@ test('a server threat edge is urgent "threat" attention, after damage but before
 });
 
 test('threat facts are always present on the player and the most urgent threat wins over the nearest', () => {
-	assert.deepEqual(threatFacts(undefined), { threats: [], threat: null, bestWeapon: null });
+	assert.deepEqual(threatFacts(undefined), { threats: [], threat: null, highestRiskThreat: null, bestWeapon: null });
 	const facts = threatFacts({ entries: [threatEntry(CREEPER, 'minecraft:creeper', 6, ['swelling']), threatEntry(ZOMBIE, 'minecraft:zombie', 3, ['targeting'])],
 		bestWeapon: { slot: 1, itemId: 'minecraft:stone_sword' } });
-	assert.deepEqual(facts.threats.map((threat) => threat.uuid), [ZOMBIE, CREEPER], 'threats are nearest first');
+	assert.deepEqual(facts.threats.map((threat) => threat.uuid), [ZOMBIE, CREEPER], 'without risk scores, threats are nearest first');
 	assert.equal(facts.threat.uuid, CREEPER, 'a swelling creeper outranks a closer zombie');
 	assert.equal(facts.threat.stableId, CREEPER, 'the threat id can be copied as an exact targetId');
 	assert.deepEqual(facts.bestWeapon, { slot: 1, itemId: 'minecraft:stone_sword' });

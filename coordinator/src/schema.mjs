@@ -106,6 +106,8 @@ export function validateAction(value) {
 			if (action.desiredRange !== undefined) requireFiniteRange(action.desiredRange, 'action.desiredRange', 1, 6);
 			if (action.fleeAtHealth !== undefined) requireFiniteRange(action.fleeAtHealth, 'action.fleeAtHealth', 0, 2048);
 			if (action.continueWithAttackers !== undefined) requireBoolean(action.continueWithAttackers, 'action.continueWithAttackers');
+			// The model picks the policy; Minecraft only applies it. named (default) never switches by itself.
+			if (action.targetPolicy !== undefined) requireOneOf(action.targetPolicy, 'action.targetPolicy', ['named', 'highest_risk', 'nearest_attacker']);
 			requireDuration(action.timeoutMs, 'action.timeoutMs');
 			break;
 		case 'flee_from':

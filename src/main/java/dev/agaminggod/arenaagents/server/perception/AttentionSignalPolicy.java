@@ -46,6 +46,8 @@ public final class AttentionSignalPolicy {
 
 		// Threat edges matter during actions too: they exist so the model can react before damage.
 		addNewThreatSignals(facts, threatSignals(previous), threatSignals(current));
+		// Healing signals (a safe chance to eat, or low health with no food under threat) are debounced server-side.
+		addNewSurvivalSignals(facts, survivalSignals(previous), survivalSignals(current));
 		if (!activeActionWindow && !inventory(previous).equals(inventory(current))) facts.add("inventory");
 		if (newFailure(previous, current)) facts.add("lastResult");
 		if (!Objects.equals(dimension(previous), dimension(current))) facts.add("world.dimension");
@@ -66,6 +68,21 @@ public final class AttentionSignalPolicy {
 	/** One fact per newly reported "uuid.signal"; the server latch already debounces flickering signals. */
 	static void addNewThreatSignals(Set<String> facts, Set<String> before, Set<String> after) {
 		for (String signal : after) if (!before.contains(signal)) facts.add("threats." + signal);
+	}
+
+	static void addNewSurvivalSignals(Set<String> facts, Set<String> before, Set<String> after) {
+		for (String signal : after) if (!before.contains(signal)) facts.add("survival." + signal);
+	}
+
+	static Set<String> survivalSignals(JsonObject observation) {
+		TreeSet<String> signals = new TreeSet<>();
+		JsonArray names = array(object(observation, "survival"), "signals");
+		if (names == null) return signals;
+		for (JsonElement name : names) {
+			String signal = primitiveString(name);
+			if (signal != null) signals.add(signal);
+		}
+		return signals;
 	}
 
 	static Set<String> threatSignals(JsonObject observation) {

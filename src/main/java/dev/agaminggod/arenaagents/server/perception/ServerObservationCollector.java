@@ -89,6 +89,7 @@ public final class ServerObservationCollector {
 	private final Map<AgentId, RawSpatialObservation.Key> spatialKeys = new HashMap<>();
 	private final Map<AgentId, RawPlayerState> lastRawStates = new HashMap<>();
 	private final ThreatPerception threats = new ThreatPerception();
+	private final SurvivalPerception survival = new SurvivalPerception();
 	private final Map<AgentId, InventorySnapshot> lastInventories = new HashMap<>();
 	private static final IdentityHashMap<Holder<?>, List<String>> TAG_VALUES = new IdentityHashMap<>();
 
@@ -161,8 +162,11 @@ public final class ServerObservationCollector {
 		}
 		player.add("effects", effects(agent));
 		observation.add("player", player);
-		JsonObject threat = ThreatPerception.toJson(threats.sample(agentId, agent));
+		ThreatPerception.Snapshot threatSnapshot = threats.sample(agentId, agent);
+		JsonObject threat = ThreatPerception.toJson(threatSnapshot);
 		if (threat != null) observation.add("threats", threat);
+		JsonObject healing = SurvivalPerception.toJson(survival.sample(agentId, agent, threatSnapshot));
+		if (healing != null) observation.add("survival", healing);
 		observation.add("interaction", interaction(agentId, agent));
 
 		observation.add("inventory", inventory(agent));
@@ -423,7 +427,11 @@ public final class ServerObservationCollector {
 				}
 				continue;
 			}
-			RawPlayerState current = rawPlayerState(agent, threats.sample(agentId, agent).signalKeys());
+			ThreatPerception.Snapshot threatSnapshot = threats.sample(agentId, agent);
+			// Survival signals ride the same forced-attention rule as threat signals: a new one is delivered now.
+			Set<String> signalKeys = new HashSet<>(threatSnapshot.signalKeys());
+			for (String signal : survival.sample(agentId, agent, threatSnapshot).signals()) signalKeys.add("survival:" + signal);
+			RawPlayerState current = rawPlayerState(agent, Set.copyOf(signalKeys));
 			synchronized (lastRawStates) {
 				RawPlayerState previous = lastRawStates.put(agentId, current);
 				boolean inventoryChanged = updateInventory(agentId, agent);
@@ -435,6 +443,7 @@ public final class ServerObservationCollector {
 		synchronized (lastRawStates) {
 			lastRawStates.keySet().removeIf(agentId -> !tracked.contains(agentId));
 			threats.retain(tracked);
+			survival.retain(tracked);
 			lastInventories.keySet().removeIf(agentId -> !tracked.contains(agentId));
 		}
 		return List.copyOf(changed);

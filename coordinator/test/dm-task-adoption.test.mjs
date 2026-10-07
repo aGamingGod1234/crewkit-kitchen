@@ -3,6 +3,7 @@ import test from 'node:test';
 import { AgentRegistry, DynamicAgentState } from '../src/agent-registry.mjs';
 import { normalizeMinecraftToolCall, NATIVE_AGENT_INSTRUCTIONS, MINECRAFT_DYNAMIC_TOOLS } from '../src/native-minecraft-tools.mjs';
 import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
+import { AWAITING_CONFIRMATION_EVENT_INSTRUCTION } from '../src/dynamic-main.mjs';
 import { DeferredCompletionBridge, FakePlanner, record, immutableGoalSpec, eventually, start } from './fixtures/dynamic-main-fixture.mjs';
 
 // A player's DM to an agent with no active task: the model decides whether it is a request,
@@ -312,6 +313,8 @@ test('a goal turn refuses takeTask; waiting for confirmation, "continue" still g
 		bridge.emit('conversation_event', dm('continue', 1, 1));
 		await eventually(() => planner.requests.length === 2);
 		assert.equal(inputOf(planner.requests[1]).mode, 'goal', 'awaiting confirmation is still an active goal, never conversation-only');
+		assert.equal(planner.requests[1].input.split('\n')[0], AWAITING_CONFIRMATION_EVENT_INSTRUCTION,
+			'a message while awaiting confirmation says waiting never blocks acting on it');
 		await eventually(() => planner.outcomes.length === 2);
 		assert.equal(planner.outcomes[1].result.reasonCode, 'TASK_ALREADY_ACTIVE', 'takeTask can never replace an active task');
 		assert.equal(taskRequests(bridge).length, 0);
