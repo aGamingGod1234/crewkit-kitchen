@@ -160,6 +160,13 @@ public final class AgentRegistryVerification {
 				registry.setRespawnPolicy(created.agentId(), RespawnPolicy.RESPAWN_AUTOMATICALLY, START_TIME + 1L).respawnPolicy(),
 				"automatic respawn requires an explicit policy change");
 
+		AgentTransition detached = registry.beginAction(created.agentId(), created.goalRevision(), START_TIME + 1L);
+		assertTrue(detached.before() == detached.after() && detached.after().state() == AgentLifecycleState.IDLE,
+				"a body action with no task leaves the idle lifecycle and revision untouched");
+		assertTrue(registry.actionFinished(created.agentId(), created.goalRevision(), START_TIME + 1L).after().state()
+				== AgentLifecycleState.IDLE, "finishing that action keeps the agent idle (no task is invented)");
+		expectFailure(() -> registry.beginAction(created.agentId(), created.goalRevision() + 1L, START_TIME + 1L), "STALE_REVISION");
+
 		AgentTransition started = registry.start(created.agentId(), "Build a shelter", START_TIME + 1L);
 		assertEquals(AgentLifecycleState.STARTING, started.after().state(), "start state");
 		assertEquals(1L, started.after().goalRevision(), "start revision");
@@ -197,7 +204,7 @@ public final class AgentRegistryVerification {
 		assertEquals(AgentLifecycleState.DISCONNECTED, disconnected.after().state(), "disconnect state");
 		AgentTransition resumedAfterDisconnect = registry.resume(created.agentId(), START_TIME + 8L);
 		assertEquals(AgentLifecycleState.STARTING, resumedAfterDisconnect.after().state(), "resume after coordinator reconnect");
-		return 26;
+		return 29;
 	}
 
 	private static int verifyCoordinatorCompletion() {

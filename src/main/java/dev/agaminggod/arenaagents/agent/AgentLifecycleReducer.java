@@ -152,6 +152,12 @@ public final class AgentLifecycleReducer {
 	}
 
 	public static AgentTransition beginAction(AgentRecord current, long revision, long nowEpochMs) {
+		// No task (idle, or the finished task is completed): the model still owns its body, like a player. A body
+		// action runs detached from any goal, so the lifecycle and revision stay exactly as they are.
+		if (isDetachedActionState(current.state())) {
+			requireRevision(current, revision);
+			return transition(current, current, false, false);
+		}
 		requireState(current, "act", AgentLifecycleState.STARTING, AgentLifecycleState.PLANNING);
 		requireRevision(current, revision);
 		return transition(current, current.withLifecycle(
@@ -165,6 +171,9 @@ public final class AgentLifecycleReducer {
 	}
 
 	public static AgentTransition actionFinished(AgentRecord current, long revision, long nowEpochMs) {
+		if (isDetachedActionState(current.state()) && current.goalRevision() == revision) {
+			return transition(current, current, false, false);
+		}
 		requireState(current, "finish action", AgentLifecycleState.ACTING);
 		requireRevision(current, revision);
 		return transition(current, current.withLifecycle(
@@ -407,6 +416,11 @@ public final class AgentLifecycleReducer {
 			throw new AgentDomainException(
 					"GOAL_NOT_SATISFIED", "Queued work can be promoted only after factual satisfaction");
 		}
+	}
+
+	/** States without an active task in which the model may still act (fight, flee, eat, equip...). */
+	public static boolean isDetachedActionState(AgentLifecycleState state) {
+		return state == AgentLifecycleState.IDLE || state == AgentLifecycleState.COMPLETED;
 	}
 
 	private static long nextRevision(AgentRecord current) {

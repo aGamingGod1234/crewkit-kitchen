@@ -2313,7 +2313,21 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	static boolean acceptsActionRevision(AgentRecord record, ServerActionRequest request) {
 		if (record.acceptsRevision(request.goalRevision())) return true;
-		return isDetachedConversationReply(record, request);
+		return isDetachedConversationReply(record, request) || isDetachedBodyAction(record, request);
+	}
+
+	/**
+	 * With no active task (idle, or its task completed or awaiting nothing more) the model may still use its body at
+	 * the same revision: fight, flee, eat, equip, move. The action changes no goal lifecycle (see
+	 * {@link dev.agaminggod.arenaagents.agent.AgentLifecycleReducer#isDetachedActionState}). Paused and dead agents stay
+	 * blocked: an operator stop or death is not "no task".
+	 */
+	static boolean isDetachedBodyAction(AgentRecord record, ServerActionRequest request) {
+		return request.goalRevision() == record.goalRevision()
+				&& dev.agaminggod.arenaagents.agent.AgentLifecycleReducer.isDetachedActionState(record.state())
+				// Chat keeps its own detached-reply rule (direct or proximity only while idle).
+				&& request.type() != ActionType.CHAT
+				&& request.type() != ActionType.RESPAWN && request.type() != ActionType.COMPLETE_GOAL;
 	}
 
 	static boolean isDetachedConversationReply(AgentRecord record, ServerActionRequest request) {
