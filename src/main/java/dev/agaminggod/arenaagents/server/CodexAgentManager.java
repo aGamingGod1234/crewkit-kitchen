@@ -31,6 +31,7 @@ import dev.agaminggod.arenaagents.server.group.AgentGroupRegistry;
 import dev.agaminggod.arenaagents.server.group.AgentGroupSavedData;
 import dev.agaminggod.arenaagents.server.group.AgentGroupSpawnCoordinator;
 import dev.agaminggod.arenaagents.server.conversation.ConversationEvent;
+import dev.agaminggod.arenaagents.server.conversation.ModelTaskAdoption;
 import dev.agaminggod.arenaagents.server.conversation.PendingConversationWake;
 import dev.agaminggod.arenaagents.server.pov.AgentControlReservations;
 import dev.agaminggod.arenaagents.server.pov.PovExitReason;
@@ -97,6 +98,9 @@ public final class CodexAgentManager {
 	private final MinecraftServer server;
 	private final AgentSavedData savedData;
 	private final GoalCompiler goalCompiler = new GoalCompiler();
+	// Lazily created: verification fixtures allocate managers without running field initializers.
+	private ModelTaskAdoption.SpokenRequests spokenRequests;
+	private ModelTaskAdoption.Requesters modelTaskRequesters;
 	private final AgentGroupSavedData groupSavedData;
 	private final Map<AgentId, AgentChunkTicket> chunkTickets = new LinkedHashMap<>();
 	private final Map<AgentChunkTicket, Integer> chunkTicketReferences = new LinkedHashMap<>();
@@ -491,8 +495,11 @@ public final class CodexAgentManager {
 				&& draft.intent() != DraftIntent.TRANSLATE_REPLACE) {
 			return Optional.empty();
 		}
-		return resolveGoalDraft(
+		Optional<GoalDraftResult> result = resolveGoalDraft(
 				draft.draftId(), draft.requestingPlayerId(), false, GoalDraftChoice.CONFIRM, advisoryRoute);
+		result.flatMap(GoalDraftResult::transition).flatMap(transition -> transition.after().currentGoal())
+				.ifPresent(goal -> modelTaskRequesters().draftActivated(draft.agentId(), draft.draftId(), goal.goalId()));
+		return result;
 	}
 
 	public void validateGoalDraftTranslation(PendingGoalDraft draft, GoalPredicate predicate) {
@@ -662,34 +669,64 @@ public final class CodexAgentManager {
 		);
 	}
 
+	/** Player messages Minecraft delivered to each agent; takeTask must name one of them. */
+	public synchronized ModelTaskAdoption.SpokenRequests spokenRequests() {
+		if (spokenRequests == null) spokenRequests = new ModelTaskAdoption.SpokenRequests();
+		return spokenRequests;
+	}
+
+	private synchronized ModelTaskAdoption.Requesters modelTaskRequesters() {
+		if (modelTaskRequesters == null) modelTaskRequesters = new ModelTaskAdoption.Requesters();
+		return modelTaskRequesters;
+	}
+
 	/**
-	 * Applies a model's takeTask call through the normal goal lifecycle, crediting the player who
-	 * asked. A request the compiler understands keeps its checkable completion; any other request
-	 * becomes an open task the requester confirms, so the model's own words never need a translation
-	 * round trip before the agent can act.
+	 * Applies a model's takeTask call through the normal goal paths, crediting the player whose
+	 * delivered message asked for it. Starting reuses submitGoal, so compiler rejections, advisory
+	 * plans and translation drafts behave exactly as for a typed goal.
 	 */
-	public AgentTransition adoptModelTask(AgentId agentId, long expectedGoalRevision, UUID requesterId, String request, boolean resume) {
+	public ModelTaskAdoption.Outcome adoptModelTask(AgentId agentId, ModelTaskAdoption.TaskRequest request, GoalSpecRequestSink requestSink) {
 		AgentRecord record = savedData.registry().require(Objects.requireNonNull(agentId, "agentId must not be null"));
-		if (record.goalRevision() != expectedGoalRevision) {
+		if (record.goalRevision() != request.goalRevision()) {
+			// A newer goal (for example the same message started it through speech routing) is
+			// already running: the model should simply continue with it.
+			if (record.state().isActive()) {
+				return ModelTaskAdoption.Outcome.accepted("TASK_ALREADY_ACTIVE", "A task is already running; continue with it.", record.goalRevision());
+			}
 			throw new AgentDomainException("STALE_REVISION", "My task changed before this request arrived; check again.");
 		}
-		ServerPlayer requester = server.getPlayerList().getPlayer(Objects.requireNonNull(requesterId, "requesterId must not be null"));
+		ModelTaskAdoption.requireSpokenBy(spokenRequests().find(agentId, request.conversationSequence()),
+				request.requesterId(), record.goalRevision());
+		ServerPlayer requester = server.getPlayerList().getPlayer(request.requesterId());
 		if (requester == null) {
 			throw new AgentDomainException("REQUESTER_OFFLINE", "The player who asked is no longer online.");
 		}
-		var operation = dev.agaminggod.arenaagents.server.conversation.ModelTaskAdoption.operation(
-				record.state(), resume, GoalControl.mayControl(requester.createCommandSourceStack()),
+		ModelTaskAdoption.Operation operation = ModelTaskAdoption.operation(
+				record.state(), request.resume(), GoalControl.mayControl(requester.createCommandSourceStack()),
 				AgentControlReservations.isReserved(server, agentId));
 		SkitModeRuntime.requireNormalControlAllowed(server, agentId);
-		long now = System.currentTimeMillis();
-		if (operation == dev.agaminggod.arenaagents.server.conversation.ModelTaskAdoption.Operation.RESUME) {
-			return savedData.registry().resume(agentId, now);
+		if (operation == ModelTaskAdoption.Operation.RESUME) {
+			AgentTransition resumed = savedData.registry().resume(agentId, System.currentTimeMillis());
+			spokenRequests().consume(agentId, request.conversationSequence());
+			return ModelTaskAdoption.Outcome.accepted("TASK_RESUMED", "Resumed the paused task.", resumed.after().goalRevision());
 		}
-		GoalCompilation compilation = compileGoalResult(request, requester.level());
-		GoalSpec spec = compilation.acceptedSpec().orElseGet(() -> dev.agaminggod.arenaagents.agent.AgentGoal.create(request, now).spec());
-		return operation == dev.agaminggod.arenaagents.server.conversation.ModelTaskAdoption.Operation.REPLACE
-				? savedData.registry().replace(agentId, spec, now)
-				: savedData.registry().start(agentId, spec, now);
+		GoalSubmission submission = submitGoal(agentId.toString(), request.request(), requester.level(),
+				Optional.of(request.requesterId()), GoalSubmission.Operation.START, requestSink);
+		spokenRequests().consume(agentId, request.conversationSequence());
+		if (submission.transition().isPresent()) {
+			AgentRecord started = submission.transition().orElseThrow().after();
+			started.currentGoal().ifPresent(goal -> modelTaskRequesters().startedGoal(agentId, goal.goalId(), request.requesterId()));
+			return ModelTaskAdoption.Outcome.accepted("TASK_STARTED", "Started the task.", started.goalRevision());
+		}
+		modelTaskRequesters().pendingDraft(agentId, submission.pendingDraft().orElseThrow().draftId(), request.requesterId());
+		return ModelTaskAdoption.Outcome.pending("TASK_TRANSLATING",
+				"Minecraft is turning this into a checkable goal; it starts by itself once validated.", record.goalRevision());
+	}
+
+	/** The player who asked for a model-adopted task may confirm that task is done. */
+	public boolean mayConfirmAsModelTaskRequester(AgentId agentId, UUID playerId) {
+		AgentRecord record = savedData.registry().require(agentId);
+		return modelTaskRequesters().mayConfirm(agentId, record.currentGoal().map(dev.agaminggod.arenaagents.agent.AgentGoal::goalId), playerId);
 	}
 
 	private PendingGoalDraft translatedSubmissionDraft(

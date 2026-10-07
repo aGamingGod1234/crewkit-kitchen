@@ -342,19 +342,20 @@ function normalizeProtocolV2Payload(type, value) {
 		}
 		case 'task_request':
 			// The model chose to adopt a player's conversational request; Minecraft decides whether it may start.
-			exactKeys(value, ['requestId', 'goalRevision', 'requesterId', 'request', 'resume'], ['requestId', 'goalRevision', 'requesterId', 'request', 'resume'], type);
+			exactKeys(value, ['requestId', 'goalRevision', 'requesterId', 'conversationSequence', 'request', 'resume'], ['requestId', 'goalRevision', 'requesterId', 'conversationSequence', 'request', 'resume'], type);
 			if (typeof value.requesterId !== 'string' || !UUID_PATTERN.test(value.requesterId)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'task_request.requesterId must be a player UUID');
 			return {
 				requestId: requireIdentifier(value.requestId, 'requestId'),
 				goalRevision: revision(value.goalRevision, 'goalRevision'),
 				requesterId: value.requesterId,
+				conversationSequence: nonnegativeInteger(value.conversationSequence, 'conversationSequence'),
 				request: boundedText(value.request, 'request', 512),
 				resume: boolean(value.resume, 'resume'),
 			};
 		case 'task_request_result': {
 			exactKeys(value, ['requestId', 'status', 'reasonCode', 'message', 'goalRevision'], ['requestId', 'status', 'reasonCode', 'message', 'goalRevision'], type);
 			const status = requireIdentifier(value.status, 'status');
-			if (!['accepted', 'rejected'].includes(status)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'task_request_result status must be accepted or rejected');
+			if (!['accepted', 'pending', 'rejected'].includes(status)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'task_request_result status must be accepted, pending or rejected');
 			return {
 				requestId: requireIdentifier(value.requestId, 'requestId'),
 				status,
