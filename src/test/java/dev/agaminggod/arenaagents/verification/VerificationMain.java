@@ -237,6 +237,7 @@ public final class VerificationMain {
 		passedAssertions += AttentionHazardVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.perception.ThreatAttentionVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.runtime.controller.CombatPlanningVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.perception.CombatRiskVerification.verify();
 		passedAssertions += MenuCapabilityRegistryVerification.verify();
 		passedAssertions += VoiceSubsystemVerification.verify();
 		passedAssertions += VoiceDirectorVerification.verify();
@@ -394,6 +395,27 @@ public final class VerificationMain {
 				"INVALID_FIELD",
 				"continueWithAttackers",
 				"fight_target continueWithAttackers must be a boolean"
+		);
+		ActionCommand riskPolicy = codec.decodeCommand(commandJson("fight_target",
+				"\"targetId\":\"00000000-0000-0000-0000-000000000001\",\"targetPolicy\":\"highest_risk\",\"timeoutMs\":15000"));
+		assertEquals("highest_risk", riskPolicy.arguments().get("targetPolicy").getAsString(),
+				"fight_target keeps the model-chosen targetPolicy");
+		expectProtocolException(
+				() -> codec.decodeCommand(commandJson("fight_target",
+						"\"targetId\":\"00000000-0000-0000-0000-000000000001\",\"targetPolicy\":\"auto\",\"timeoutMs\":15000")),
+				"INVALID_FIELD",
+				"targetPolicy",
+				"fight_target targetPolicy must be a known policy"
+		);
+		ActionCommand optIn = codec.decodeCommand(commandJson("fight_target",
+				"\"targetId\":\"00000000-0000-0000-0000-000000000001\",\"includePlayers\":true,\"timeoutMs\":15000"));
+		assertEquals(true, optIn.arguments().get("includePlayers").getAsBoolean(), "fight_target keeps the model's includePlayers opt-in");
+		expectProtocolException(
+				() -> codec.decodeCommand(commandJson("fight_target",
+						"\"targetId\":\"00000000-0000-0000-0000-000000000001\",\"includePlayers\":\"yes\",\"timeoutMs\":15000")),
+				"INVALID_FIELD",
+				"includePlayers",
+				"fight_target includePlayers must be a boolean"
 		);
 		assertDecodedType(codec, "flee_from", "\"targetId\":\"00000000-0000-0000-0000-000000000001\",\"distance\":16,\"timeoutMs\":10000", ActionType.FLEE_FROM);
 		assertDecodedType(codec, "follow_entity", "\"targetSelector\":\"player:Lucas\",\"distance\":3,\"timeoutMs\":30000", ActionType.FOLLOW_ENTITY);

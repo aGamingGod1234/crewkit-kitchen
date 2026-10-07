@@ -598,6 +598,11 @@ public final class ServerActionExecutor {
 					arguments.has("desiredRange") ? number(arguments, "desiredRange") : null,
 					arguments.has("fleeAtHealth") ? (float) number(arguments, "fleeAtHealth") : null,
 					!arguments.has("continueWithAttackers") || bool(arguments, "continueWithAttackers"),
+					// The model chooses the policy; the controller only applies it (named by default).
+					dev.agaminggod.arenaagents.server.runtime.controller.CombatPlanning.TargetPolicy.parse(
+							nullableString(arguments, "targetPolicy")),
+					// Players are follow-through or policy candidates only when the model opts in.
+					arguments.has("includePlayers") && bool(arguments, "includePlayers"),
 					integer(arguments, "timeoutMs"), System.currentTimeMillis()));
 			case FLEE_FROM -> ActiveAction.controller(request, player, new ServerFleeController(
 					resolveCombatTarget(player, string(arguments, "targetId")),

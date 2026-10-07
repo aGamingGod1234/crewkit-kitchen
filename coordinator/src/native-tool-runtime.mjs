@@ -14,6 +14,8 @@ const POST_ACTION_OBSERVATION_TYPES = new Set(['pick_up_item', 'break_block', 'n
 // The model may answer danger with these while its program is paused for a decision, without first
 // settling the program decision; the paused program keeps its decision for a later respondProgram.
 const PAUSED_PROGRAM_DANGER_ACTIONS = new Set(['fight_target', 'flee_from']);
+// Waiting only stops repeating the finished work; new player requests stay the model's to act on.
+export const AWAITING_CONFIRMATION_MESSAGE = 'The remaining condition requires operator confirmation. Report completion once, then end this turn. Do not repeat the finished work or finish checks while waiting. This never blocks new requests: if a player asks for something (even more equipment changes), do it at once, then call finish again.';
 
 
 export class NativeToolRuntime {
@@ -993,7 +995,9 @@ export class NativeToolRuntime {
 		const finishReservation = this.#sequenceFinishReservations.get(record.agentId);
 		if (finishReservation !== undefined && finishReservation !== sequenceFinishToken) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'A finishing native sequence owns the player');
 		const executionEpoch = this.#executionEpoch(record.agentId);
-		if (this.#actions.has(record.agentId)) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'The Minecraft body is already executing an action');
+		if (this.#actions.has(record.agentId)) throw codedError('NATIVE_ACTION_IN_PROGRESS', tool.actionType === 'fight_target' && this.#actions.get(record.agentId)?.actionType === 'fight_target'
+			? 'A fight_target already owns the body; to switch targets call replaceAction with its actionId and the new fight_target (weapon and swing timing carry over), or set targetPolicy'
+			: 'The Minecraft body is already executing an action');
 		if (this.#completions.has(record.agentId)) throw codedError('NATIVE_COMPLETION_IN_PROGRESS', 'Goal completion verification is already running');
 
 		const ordinal = ++this.#sequence;
@@ -1180,7 +1184,7 @@ export class NativeToolRuntime {
 			verified: payload.verified === true,
 			reasonCode: String(payload.reasonCode ?? '').slice(0, 128),
 			facts,
-			...(awaitingConfirmation ? { message: 'The remaining condition requires operator confirmation. Report completion once, then end this turn. Do not repeat the physical work or finish checks while waiting.' } : {}),
+			...(awaitingConfirmation ? { message: AWAITING_CONFIRMATION_MESSAGE } : {}),
 		});
 		return true;
 	}

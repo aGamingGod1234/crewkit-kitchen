@@ -42,6 +42,7 @@ export function adaptObservation(value) {
 	for (const field of ['swimming', 'gliding', 'sprinting', 'crouching', 'onClimbable', 'inLava', 'horizontalCollision', 'verticalCollision', 'passenger']) copyBoolean(playerSource, player, field);
 	copyExtensions(playerSource, player, ['pose', 'vehicle']);
 	Object.assign(player, threatFacts(source.threats));
+	Object.assign(player, survivalFacts(source.survival));
 
 	const entities = boundedDataArray(source.entities, 'entities', MAX_ENTITIES)
 		.map((value, index) => entityFacts(value, index));
@@ -117,19 +118,38 @@ function entityFacts(value, index) {
 		result.count = positiveInteger(source.count, `entities[${index}].count`);
 	}
 	copyExtensions(source, result, ['velocity', 'yaw', 'pitch', 'pose', 'bounds', 'equipment', 'usingItem', 'onFire', 'pickable', 'parentId', 'partName',
-		'alive', 'hostile', 'health', 'maxHealth', 'targetingAgent', 'swelling', 'fuse', 'perceivedBy']);
+		'alive', 'hostile', 'health', 'maxHealth', 'targetingAgent', 'swelling', 'fuse', 'perceivedBy', 'potentialRisk', 'risk', 'expectedHitDamage']);
 	return result;
 }
 
-const THREAT_URGENCY = Object.freeze({ swelling: 3, creeper_close: 2, targeting: 1, ranged_sight: 1 });
+const THREAT_URGENCY = Object.freeze({ swelling: 3, creeper_close: 2, attacked: 2, targeting: 1, ranged_sight: 1 });
+
+/**
+ * Healing facts as player facts: canHealNow (hurt, safe and able to eat), bestFood ({ slot, itemId, nutrition } or
+ * null), safe, and the debounced signals healOpportunity / lowHealthNoFood. Always present so conditions never fail.
+ */
+export function survivalFacts(value) {
+	if (value === undefined) return { canHealNow: false, bestFood: null, healOpportunity: false, lowHealthNoFood: false };
+	const source = ownDataRecord(value, 'wire observation.survival');
+	const signals = boundedDataArray(source.signals, 'survival.signals', 2).map((signal) => identifier(signal, 'survival signal'));
+	const food = source.bestFood === undefined ? null : ownDataRecord(source.bestFood, 'survival.bestFood');
+	return {
+		canHealNow: boolean(source.canHealNow, 'survival.canHealNow'),
+		safe: boolean(source.safe, 'survival.safe'),
+		bestFood: food === null ? null : { slot: nonNegativeInteger(food.slot, 'bestFood.slot'), itemId: identifier(food.itemId, 'bestFood.itemId'), nutrition: nonNegativeInteger(food.nutrition, 'bestFood.nutrition') },
+		healOpportunity: signals.includes('heal_opportunity'),
+		lowHealthNoFood: signals.includes('low_health_no_food'),
+	};
+}
 
 /**
  * Server-sensed threats as player facts so watcher conditions can read them directly:
- * player.state().threats (nearest first), player.state().threat (the most urgent, or null) and
- * player.state().bestWeapon ({ slot, itemId } or null). Always present, so conditions never hit a missing member.
+ * player.state().threats (highest risk first), player.state().threat (the most urgent signal, or null),
+ * player.state().highestRiskThreat (or null) and player.state().bestWeapon ({ slot, itemId } or null).
+ * Always present, so conditions never hit a missing member.
  */
 export function threatFacts(value) {
-	if (value === undefined) return { threats: [], threat: null, bestWeapon: null };
+	if (value === undefined) return { threats: [], threat: null, highestRiskThreat: null, bestWeapon: null };
 	const source = ownDataRecord(value, 'wire observation.threats');
 	const threats = boundedDataArray(source.entries, 'threats.entries', 8).map((entry, index) => {
 		const row = ownDataRecord(entry, `threats.entries[${index}]`);
@@ -139,14 +159,18 @@ export function threatFacts(value) {
 			distance: finiteNumber(row.distance, 'threat distance'), bearing: finiteNumber(row.bearing, 'threat bearing'),
 			targeting: boolean(row.targeting, 'threat targeting'), swelling: boolean(row.swelling, 'threat swelling'),
 			lineOfSight: boolean(row.lineOfSight, 'threat lineOfSight'), signals,
+			risk: row.risk === undefined ? 0 : finiteNumber(row.risk, 'threat risk'),
+			...(row.riskFactors === undefined ? {} : { riskFactors: { ...ownDataRecord(row.riskFactors, 'threat riskFactors') } }),
+			...(row.expectedHitDamage === undefined ? {} : { expectedHitDamage: finiteNumber(row.expectedHitDamage, 'threat expectedHitDamage') }),
 		};
-	}).sort((left, right) => left.distance - right.distance);
+	}).sort((left, right) => right.risk - left.risk || left.distance - right.distance);
 	const urgency = (threat) => Math.max(0, ...threat.signals.map((signal) => THREAT_URGENCY[signal] ?? 0));
 	const threat = threats.reduce((best, next) => best === null || urgency(next) > urgency(best) ? next : best, null);
 	const weapon = source.bestWeapon === undefined ? null : ownDataRecord(source.bestWeapon, 'threats.bestWeapon');
 	return {
 		threats,
 		threat,
+		highestRiskThreat: threats[0] ?? null,
 		bestWeapon: weapon === null ? null : { slot: nonNegativeInteger(weapon.slot, 'bestWeapon.slot'), itemId: identifier(weapon.itemId, 'bestWeapon.itemId') },
 	};
 }

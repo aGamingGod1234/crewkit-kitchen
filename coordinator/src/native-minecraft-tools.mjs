@@ -24,7 +24,7 @@ const MAX_PROGRAM_SOURCE_BYTES = 65_536;
 const MAX_PROGRAM_PRECONDITION_BYTES = 4_096;
 const MAX_SEQUENCE_FINISH_BYTES = 4_096;
 const INVENTORY_FACT_FIELDS = ['selectedSlot', 'selectedItem', 'selectedItemId', 'selectedItemCount', 'tagCounts'];
-const COMPACT_ROW_FIELDS = ['uuid', 'stableId', 'type', 'typeId', 'name', 'slot', 'position', 'x', 'y', 'z', 'distance', 'distanceSquared', 'blockId', 'itemId', 'count', 'damage', 'maxDamage', 'tags', 'fingerprint', 'hotbar', 'displayName', 'maxStackSize', 'health', 'maxHealth', 'hostile', 'alive', 'targetingAgent', 'swelling', 'fuse', 'perceivedBy', 'withinInteractionRange', 'capabilities', 'velocity', 'bounds', 'pickable', 'parentId', 'partName', 'state', 'bearing', 'elevation', 'omittedFields'];
+const COMPACT_ROW_FIELDS = ['uuid', 'stableId', 'type', 'typeId', 'name', 'slot', 'position', 'x', 'y', 'z', 'distance', 'distanceSquared', 'blockId', 'itemId', 'count', 'damage', 'maxDamage', 'tags', 'fingerprint', 'hotbar', 'displayName', 'maxStackSize', 'health', 'maxHealth', 'hostile', 'alive', 'targetingAgent', 'swelling', 'fuse', 'perceivedBy', 'potentialRisk', 'risk', 'expectedHitDamage', 'withinInteractionRange', 'capabilities', 'velocity', 'bounds', 'pickable', 'parentId', 'partName', 'state', 'bearing', 'elevation', 'omittedFields'];
 const NATIVE_ACTION_TYPES = Object.freeze(Object.keys(ACTION_FIELDS));
 const POST_ACTION_VIEW_TOOLS = new Set(['moveTo', 'mine', 'act', 'sequence']);
 const OBSERVATION_VIEW_PROPERTIES = {
@@ -51,11 +51,11 @@ export const NATIVE_AGENT_INSTRUCTIONS = `You control one live Minecraft player 
 
 Read taskPlan at task start; replace it at meaningful revisions with stable IDs; you own it.
 
-Keep provider/model/effort/tier; death does not change the active goal. Batch known independent reads and reuse fresh result facts. Use sequence for safe linear chains; use ArenaScript for conditional/repeated work with bounded background:true. finish verifies goalSpec. queueProgram needs a fresh precondition; only natural exhaustion starts it. expectedDurationMs never extends timeout. Use startAction to reason while one chosen action runs; settle exact handles and program decisions.
+Keep provider/model/effort/tier; death does not change the active goal. Batch known independent reads and reuse fresh result facts. Use sequence for safe linear chains; use ArenaScript for conditional/repeated work with bounded background:true. finish verifies goalSpec. queueProgram needs a fresh precondition; only natural exhaustion starts it. Use startAction to reason while one chosen action runs; settle exact handles and program decisions.
 
-Survival is part of the goal. Threat attention (player.threat) precedes damage: act fight_target/flee_from, not moveTo; creepers flee; low health flee, eat. Guard mining with a threat watch (after:"reconsider"). Danger-paused programs let you act; respond later. taskMemory keeps deaths, routes, progress, lessons.
+Survival is part of the goal. Threat attention precedes damage: act fight_target/flee_from, not moveTo; creepers flee. Threats sort by risk; retarget via targetPolicy or replaceAction. Eat when safe below 70% health; no food under threat: flee. Guard mining with a threat watch (after:"reconsider"). Danger-paused programs let you act; respond later.
 
-Use capabilities/focused inspections; omitted or unobserved facts are unknown. queryMemory paginates nextOffset; reuse exact noteKey with fresh prerequisites/current targets and program.parameters(). Notes are hypotheses; receipts historical. Keep metadata separate; noteKey executes the entire note as source. exploreFrontier returns candidates; choose moveTo. Mine exact observed blockId. Claim effects from evidence. No task: takeTask a player's request, end turn; else say. Plain text is invisible; speech playback is asynchronous.`;
+Use capabilities/focused inspections; omitted or unobserved facts are unknown. queryMemory paginates nextOffset; reuse exact noteKey with fresh prerequisites/current targets and program.parameters(). noteKey executes the entire note as source. exploreFrontier returns candidates; choose moveTo. Mine exact observed blockId. Claim effects from evidence. No task: takeTask a player's request, end turn; else say. Awaiting confirmation never blocks new requests. Plain text is invisible; speech playback is asynchronous.`;
 
 export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 	tool('taskMemory', 'Remember places, connected routes, task progress and lessons across deaths. Death sites, outbound trails and workstations are recorded automatically. Entries are model-authored historical notes, never current world truth. shared:true explicitly shares an entry with agents in this world and dimension. Query route waypoints and earlier deaths with pagination; reobserve before recovery. Routes use from/to place keys and 2..64 waypoints. Choose recovery or rebuilding yourself.', objectSchema({
@@ -142,7 +142,7 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 	tool('wait', 'Pause briefly and wait for the body result.', objectSchema({
 		durationMs: integerSchema(MIN_DURATION_MS, MAX_DURATION_MS),
 	}, ['durationMs'])),
-	tool('act', 'Execute one supported advanced player action. Supply exactly the required fields. For interact_block omit optional hitX/hitY/hitZ to use the actual block shape. Before pick_up_item check current inventory and use a freshly observed target UUID; nearby drops may already be collected.', objectSchema({
+	tool('act', 'Execute one supported advanced player action. Supply exactly the required fields. For interact_block omit optional hitX/hitY/hitZ to use the actual block shape. Before pick_up_item check current inventory and use a freshly observed target UUID; nearby drops may already be collected. fight_target takes optional targetPolicy: named (default), highest_risk or nearest_attacker (live switching among attacking mobs with hysteresis, never creepers); follow-through and policies skip players unless includePlayers:true; replaceAction with a new fight_target retargets keeping weapon and swing timing.', objectSchema({
 		actionType: { type: 'string', enum: NATIVE_ACTION_TYPES },
 		arguments: { type: 'object' },
 	}, ['actionType', 'arguments'])),
@@ -159,7 +159,7 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 		resume: { type: 'boolean' },
 		requesterId: { type: 'string', minLength: 36, maxLength: 36, pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' },
 	})),
-	tool('finish', 'Ask Minecraft to verify the immutable active goal. Read unmet facts on failure. If AWAITING_OPERATOR_CONFIRMATION, report once with say and end this turn until new input; do not repeat the work or verification.', objectSchema({
+	tool('finish', 'Ask Minecraft to verify the immutable active goal. Read unmet facts on failure. If AWAITING_OPERATOR_CONFIRMATION, report once with say and end this turn until new input; do not repeat the work or verification. Waiting never blocks new player requests: act on them at once, then finish again.', objectSchema({
 		summary: { type: 'string', minLength: 1, maxLength: 512 },
 	}, ['summary'])),
 ]);

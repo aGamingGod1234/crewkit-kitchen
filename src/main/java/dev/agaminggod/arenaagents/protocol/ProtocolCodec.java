@@ -66,6 +66,9 @@ public final class ProtocolCodec {
 	private static final String FIELD_DISTANCE = "distance";
 	private static final String FIELD_FLEE_AT_HEALTH = "fleeAtHealth";
 	private static final String FIELD_CONTINUE_WITH_ATTACKERS = "continueWithAttackers";
+	private static final String FIELD_TARGET_POLICY = "targetPolicy";
+	private static final String FIELD_INCLUDE_PLAYERS = "includePlayers";
+	private static final Set<String> TARGET_POLICIES = Set.of("named", "highest_risk", "nearest_attacker");
 	private static final String FIELD_SOURCE_KIND = "sourceKind";
 	private static final String FIELD_SOURCE_SLOT = "sourceSlot";
 	private static final String FIELD_DESTINATION_KIND = "destinationKind";
@@ -517,12 +520,16 @@ public final class ProtocolCodec {
 		requireDuration(command, FIELD_TIMEOUT_MS);
 	}
 
-	/** Exact observed target like attack; desiredRange, fleeAtHealth and continueWithAttackers are optional. */
+	/** Exact observed target like attack; desiredRange, fleeAtHealth, continueWithAttackers and targetPolicy are optional. */
 	private static void validateFightTarget(JsonObject command) throws ProtocolException {
 		requireUuid(command, FIELD_TARGET_ID);
 		if (present(command, FIELD_DESIRED_RANGE)) requireFiniteRange(command, FIELD_DESIRED_RANGE, 1.0D, 6.0D);
 		if (present(command, FIELD_FLEE_AT_HEALTH)) requireFiniteRange(command, FIELD_FLEE_AT_HEALTH, 0.0D, 2048.0D);
 		if (present(command, FIELD_CONTINUE_WITH_ATTACKERS)) requireBoolean(command, FIELD_CONTINUE_WITH_ATTACKERS);
+		if (present(command, FIELD_INCLUDE_PLAYERS)) requireBoolean(command, FIELD_INCLUDE_PLAYERS);
+		if (present(command, FIELD_TARGET_POLICY) && !TARGET_POLICIES.contains(requireString(command, FIELD_TARGET_POLICY))) {
+			throw invalidField("Field 'targetPolicy' must be named, highest_risk or nearest_attacker");
+		}
 		requireDuration(command, FIELD_TIMEOUT_MS);
 	}
 
@@ -966,7 +973,7 @@ public final class ProtocolCodec {
 				FIELD_X, FIELD_Y, FIELD_Z, FIELD_TOLERANCE, FIELD_SPRINT, FIELD_TIMEOUT_MS
 		));
 		fields.put(ActionType.FIGHT_TARGET, List.of(
-				FIELD_TARGET_ID, FIELD_DESIRED_RANGE, FIELD_FLEE_AT_HEALTH, FIELD_CONTINUE_WITH_ATTACKERS, FIELD_TIMEOUT_MS
+				FIELD_TARGET_ID, FIELD_DESIRED_RANGE, FIELD_FLEE_AT_HEALTH, FIELD_CONTINUE_WITH_ATTACKERS, FIELD_TARGET_POLICY, FIELD_INCLUDE_PLAYERS, FIELD_TIMEOUT_MS
 		));
 		fields.put(ActionType.FLEE_FROM, List.of(FIELD_TARGET_ID, FIELD_DISTANCE, FIELD_TIMEOUT_MS));
 		fields.put(ActionType.FOLLOW_ENTITY, List.of(FIELD_TARGET_SELECTOR, FIELD_DISTANCE, FIELD_TIMEOUT_MS));

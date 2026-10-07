@@ -50,7 +50,7 @@ public final class ServerFleeController implements ServerController {
 	}
 
 	/** Another threat sensed this tick, with the geometry the pure flee rules need. */
-	private record Other(Mob mob, CombatPlanning.FleeThreat threat) {
+	private record Other(LivingEntity mob, CombatPlanning.FleeThreat threat) {
 	}
 
 	@Override
@@ -116,13 +116,14 @@ public final class ServerFleeController implements ServerController {
 	/**
 	 * Hostiles other than the named target that the flee must also get away from: sensed threats within 16 blocks
 	 * (targeting the agent, its last attacker, or with sight of it) and any creeper within the 7-block blast margin.
+	 * Players count only while they actively attack the agent (hurt it within 30 s).
 	 */
 	private List<Other> otherThreats(ServerPlayer player) {
-		List<Mob> mobs = player.level().getEntitiesOfClass(Mob.class, player.getBoundingBox().inflate(CombatPlanning.THREAT_RANGE),
-				mob -> mob != target && mob.isAlive() && ThreatPerception.isHostileTo(mob, player));
+		List<LivingEntity> mobs = player.level().getEntitiesOfClass(LivingEntity.class, player.getBoundingBox().inflate(CombatPlanning.THREAT_RANGE),
+				mob -> mob != target && mob != player && ThreatPerception.isActiveThreat(player, mob));
 		List<Other> others = new ArrayList<>(mobs.size());
 		Set<String> present = new HashSet<>();
-		for (Mob mob : mobs) {
+		for (LivingEntity mob : mobs) {
 			double away = player.distanceTo(mob);
 			boolean creeper = mob instanceof Creeper;
 			boolean nearCreeper = creeper && away < CombatPlanning.CREEPER_SAFE_DISTANCE;

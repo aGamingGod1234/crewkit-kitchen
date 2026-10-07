@@ -7,13 +7,16 @@ import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputState;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputStates;
 import dev.agaminggod.arenaagents.server.perception.ThreatPerception;
+import dev.agaminggod.arenaagents.server.perception.RiskAssessment;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.UUID;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.util.Mth;
@@ -31,17 +34,39 @@ import net.minecraft.world.phys.Vec3;
  * model passed continueWithAttackers:false, so one fight_target clears a pack without ever starting a new fight.
  * It ends when no attacker remains, at the optional model-chosen fleeAtHealth bail-out, or timeout.
  * The hit itself is the same server call the attack action uses (player.attack + swing).
+ *
+ * <p>Retargeting stays the model's choice: replaceAction with a new fight_target switches targets and inherits the
+ * cancelled fight's weapon slot and swing timing (a short handoff, so the stance carries over), and the optional
+ * model-chosen targetPolicy (highest_risk or nearest_attacker) re-evaluates attackers twice a second with
+ * hysteresis (see {@link CombatPlanning#policyRetarget}).
+ *
+ * <p>Follow-through and policy switching only consider mobs. Players (other agents included) are only ever switched to
+ * when the model passed includePlayers:true; creative and spectator players never are. A stray sweep, arrow or thorns
+ * hit from another player therefore never starts a player fight the model did not choose.
  */
 public final class ServerFightController implements ServerController {
 	static final double MAX_CHASE_DISTANCE = 32.0D;
 	/** No hit landed and no ground gained for this long means the target cannot be reached (5 s). */
 	static final int UNREACHABLE_TICKS = 100;
+	/** A replacement fight_target that starts within 2 s of a cancelled one inherits its weapon and timing. */
+	static final long HANDOFF_TICKS = 40L;
+
+	private record Handoff(int weaponSlot, int backoffTicks, long gameTime) {
+	}
+
+	private static final Map<UUID, Handoff> HANDOFFS = new HashMap<>();
 
 	private LivingEntity target;
 	private String targetType;
 	private final double desiredRange;
 	private final Float fleeAtHealth;
 	private final boolean continueWithAttackers;
+	private final CombatPlanning.TargetPolicy targetPolicy;
+	private final boolean includePlayers;
+	private int ticksOnTarget;
+	private int policyCountdown = CombatPlanning.POLICY_INTERVAL_TICKS;
+	private int policySwitches;
+	private boolean handoffChecked;
 	private final long timeoutMs;
 	/** Kill counts per entity type in kill order, reported in every result. */
 	private final Map<String, Integer> kills = new LinkedHashMap<>();
@@ -60,7 +85,14 @@ public final class ServerFightController implements ServerController {
 
 	public ServerFightController(LivingEntity target, Double desiredRange, Float fleeAtHealth, boolean continueWithAttackers,
 			long timeoutMs, long startedAt) {
+		this(target, desiredRange, fleeAtHealth, continueWithAttackers, CombatPlanning.TargetPolicy.NAMED, false, timeoutMs, startedAt);
+	}
+
+	public ServerFightController(LivingEntity target, Double desiredRange, Float fleeAtHealth, boolean continueWithAttackers,
+			CombatPlanning.TargetPolicy targetPolicy, boolean includePlayers, long timeoutMs, long startedAt) {
 		this.target = Objects.requireNonNull(target, "target must not be null");
+		this.targetPolicy = Objects.requireNonNull(targetPolicy, "targetPolicy must not be null");
+		this.includePlayers = includePlayers;
 		this.targetType = typeOf(target);
 		this.desiredRange = desiredRange == null ? CombatPlanning.DEFAULT_FIGHT_RANGE : desiredRange;
 		this.fleeAtHealth = fleeAtHealth;
@@ -75,6 +107,7 @@ public final class ServerFightController implements ServerController {
 		if (!player.isAlive()) {
 			return finish(TickResult.failed("AGENT_DEAD", "Agent player died while fighting " + targetType + kills(), progress()));
 		}
+		if (!handoffChecked) inheritHandoff(player);
 		boolean killed = target.isDeadOrDying();
 		if (killed || !target.isAlive() || target.isRemoved() || target.level() != player.level()) {
 			if (killed) kills.merge(targetType, 1, Integer::sum);
@@ -87,6 +120,8 @@ public final class ServerFightController implements ServerController {
 			}
 			switchTo(next);
 		}
+		applyTargetPolicy(player);
+		ticksOnTarget++;
 		if (CombatPlanning.shouldBailOut(player.getHealth(), fleeAtHealth)) {
 			return finish(TickResult.failed("LOW_HEALTH_BAILOUT", String.format(Locale.ROOT,
 					"Health %.1f reached fleeAtHealth %.1f; %s has %.1f health at %.1f blocks",
@@ -159,21 +194,81 @@ public final class ServerFightController implements ServerController {
 		return CombatPlanning.canStep(new MinecraftNavigationWorld(player.level()), feet, moveYaw) ? aligned : 0.0F;
 	}
 
-	/** Nearest hostile already targeting the agent or that just hurt it (never a creeper), or null. */
+	/**
+	 * Next attacker after the target dies: the nearest one (never a creeper), or under highest_risk the riskiest.
+	 * Players count only while they are actively attacking the agent.
+	 */
 	private LivingEntity nextAttacker(ServerPlayer player) {
-		List<Mob> mobs = nearbyHostiles(player);
-		List<CombatPlanning.AttackerCandidate> candidates = new ArrayList<>(mobs.size());
-		for (Mob mob : mobs) {
-			candidates.add(new CombatPlanning.AttackerCandidate(player.distanceTo(mob), mob.getTarget() == player,
-					player.getLastHurtByMob() == mob, mob instanceof Creeper));
+		List<LivingEntity> hostiles = nearbyHostiles(player);
+		if (targetPolicy != CombatPlanning.TargetPolicy.NAMED) {
+			int index = CombatPlanning.policyRetarget(targetPolicy, null, policyCandidates(player, hostiles), 0);
+			return index < 0 ? null : hostiles.get(index);
+		}
+		List<CombatPlanning.AttackerCandidate> candidates = new ArrayList<>(hostiles.size());
+		for (LivingEntity hostile : hostiles) {
+			candidates.add(new CombatPlanning.AttackerCandidate(player.distanceTo(hostile), attacking(player, hostile),
+					player.getLastHurtByMob() == hostile, hostile instanceof Creeper));
 		}
 		int index = CombatPlanning.nextAttacker(candidates);
-		return index < 0 ? null : mobs.get(index);
+		return index < 0 ? null : hostiles.get(index);
 	}
 
-	private List<Mob> nearbyHostiles(ServerPlayer player) {
-		return player.level().getEntitiesOfClass(Mob.class, player.getBoundingBox().inflate(CombatPlanning.THREAT_RANGE),
-				mob -> mob != target && mob.isAlive() && !mob.isDeadOrDying() && ThreatPerception.isHostileTo(mob, player));
+	/** The model-chosen live policy: every half second, switch only to a clearly better attacker. */
+	private void applyTargetPolicy(ServerPlayer player) {
+		if (targetPolicy == CombatPlanning.TargetPolicy.NAMED || --policyCountdown > 0) return;
+		policyCountdown = CombatPlanning.POLICY_INTERVAL_TICKS;
+		List<LivingEntity> hostiles = nearbyHostiles(player);
+		if (hostiles.isEmpty()) return;
+		RiskAssessment.Assessment current = RiskAssessment.assess(player, target);
+		int index = CombatPlanning.policyRetarget(targetPolicy, new CombatPlanning.PolicyCandidate(player.distanceTo(target),
+				current.risk(), true, target instanceof Creeper), policyCandidates(player, hostiles), ticksOnTarget);
+		if (index < 0) return;
+		policySwitches++;
+		switchTo(hostiles.get(index));
+	}
+
+	private List<CombatPlanning.PolicyCandidate> policyCandidates(ServerPlayer player, List<LivingEntity> hostiles) {
+		List<CombatPlanning.PolicyCandidate> candidates = new ArrayList<>(hostiles.size());
+		for (LivingEntity hostile : hostiles) {
+			candidates.add(new CombatPlanning.PolicyCandidate(player.distanceTo(hostile), RiskAssessment.assess(player, hostile).risk(),
+					attacking(player, hostile), hostile instanceof Creeper));
+		}
+		return candidates;
+	}
+
+	private static boolean attacking(ServerPlayer player, LivingEntity hostile) {
+		return (hostile instanceof Mob mob && mob.getTarget() == player) || player.getLastHurtByMob() == hostile
+				|| RiskAssessment.attackedRecently(player, hostile);
+	}
+
+	/**
+	 * Candidates for follow-through and policy switches: hostile mobs and creatures actively attacking the agent.
+	 * Players only when the model opted in with includePlayers (never creative or spectator players).
+	 */
+	private List<LivingEntity> nearbyHostiles(ServerPlayer player) {
+		return player.level().getEntitiesOfClass(LivingEntity.class, player.getBoundingBox().inflate(CombatPlanning.THREAT_RANGE),
+				entity -> entity != target && entity != player && switchable(entity, includePlayers)
+						&& ThreatPerception.isActiveThreat(player, entity));
+	}
+
+	/** Pure gate: a player is only a follow-through or policy candidate when the model opted in. */
+	static boolean switchable(LivingEntity entity, boolean includePlayers) {
+		return CombatPlanning.switchableKind(entity instanceof net.minecraft.world.entity.player.Player, includePlayers);
+	}
+
+	/** Takes over the weapon slot and swing timing of a fight the model just replaced (replaceAction retarget). */
+	private void inheritHandoff(ServerPlayer player) {
+		handoffChecked = true;
+		Handoff handoff;
+		synchronized (HANDOFFS) {
+			handoff = HANDOFFS.remove(player.getUUID());
+		}
+		long now = player.level().getGameTime();
+		if (handoff == null || handoff.gameTime() > now || now - handoff.gameTime() > HANDOFF_TICKS) return;
+		if (handoff.weaponSlot() >= 0 && HotbarWeapons.rank(player.getInventory().getItem(handoff.weaponSlot())) > 0) {
+			weaponSlot = handoff.weaponSlot();
+		}
+		backoffTicks = handoff.backoffTicks();
 	}
 
 	private void switchTo(LivingEntity next) {
@@ -181,6 +276,7 @@ public final class ServerFightController implements ServerController {
 		targetType = typeOf(next);
 		hits = 0;
 		backoffTicks = 0;
+		ticksOnTarget = 0;
 		ticksWithoutProgress = 0;
 		closestDistance = Double.MAX_VALUE;
 	}
@@ -199,19 +295,25 @@ public final class ServerFightController implements ServerController {
 
 	/** Sensed hostiles still around (creepers included), nearest first, so the model can choose what is next. */
 	private String remainingThreats(ServerPlayer player) {
-		List<Mob> remaining = new ArrayList<>();
-		for (Mob mob : nearbyHostiles(player)) {
-			if (ThreatPerception.isSensedThreat(player, mob)) remaining.add(mob);
+		String switches = policySwitches == 0 ? "" : "; " + targetPolicy.wireName() + " switched target " + policySwitches + "x";
+		List<LivingEntity> remaining = new ArrayList<>();
+		// Reported to the model even when they are not switch candidates: it can still choose to fight them.
+		for (LivingEntity hostile : player.level().getEntitiesOfClass(LivingEntity.class,
+				player.getBoundingBox().inflate(CombatPlanning.THREAT_RANGE),
+				entity -> entity != target && entity != player && ThreatPerception.isActiveThreat(player, entity))) {
+			if (ThreatPerception.isSensedThreat(player, hostile)) remaining.add(hostile);
 		}
-		if (remaining.isEmpty()) return continueWithAttackers ? "; no other attackers" : "";
-		remaining.sort(Comparator.comparingDouble(player::distanceTo));
-		StringBuilder text = new StringBuilder("; remaining threats: ");
+		if (remaining.isEmpty()) return switches + (continueWithAttackers ? "; no other attackers" : "");
+		// Highest risk first, the same order as the threats observation, so the model can pick what is next.
+		remaining.sort(Comparator.comparingDouble((LivingEntity hostile) -> RiskAssessment.assess(player, hostile).risk()).reversed());
+		StringBuilder text = new StringBuilder(switches).append("; remaining threats: ");
 		for (int index = 0; index < Math.min(4, remaining.size()); index++) {
-			Mob mob = remaining.get(index);
+			LivingEntity hostile = remaining.get(index);
 			if (index > 0) text.append(", ");
-			text.append(typeOf(mob)).append(' ').append(mob.getUUID())
-					.append(String.format(Locale.ROOT, " at %.1f blocks", player.distanceTo(mob)));
-			if (mob instanceof Creeper creeper && creeper.getSwellDir() > 0) text.append(" (swelling)");
+			text.append(typeOf(hostile)).append(' ').append(hostile.getUUID())
+					.append(String.format(Locale.ROOT, " at %.1f blocks, risk %.0f", player.distanceTo(hostile),
+							RiskAssessment.assess(player, hostile).risk()));
+			if (hostile instanceof Creeper creeper && creeper.getSwellDir() > 0) text.append(" (swelling)");
 		}
 		if (remaining.size() > 4) text.append(" and ").append(remaining.size() - 4).append(" more");
 		return text.toString();
@@ -247,5 +349,9 @@ public final class ServerFightController implements ServerController {
 	@Override
 	public void cancel(ServerPlayer player) {
 		input.release();
+		// Remember the stance for a replacement fight_target the model may start right after (a retarget).
+		synchronized (HANDOFFS) {
+			HANDOFFS.put(player.getUUID(), new Handoff(weaponSlot, backoffTicks, player.level().getGameTime()));
+		}
 	}
 }

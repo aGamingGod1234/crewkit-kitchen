@@ -143,8 +143,9 @@ const PLAYER_DETAIL_FIELDS = ['pose', 'swimming', 'gliding', 'sprinting', 'crouc
 const STACK_DETAIL_FIELDS = ['displayName', 'fingerprint', 'maxStackSize', 'tooltip', 'tooltipTruncated'];
 const MENU_STACK_DETAIL_FIELDS = ['damage', 'maxDamage', ...STACK_DETAIL_FIELDS];
 const ENTITY_DETAIL_FIELDS = ['velocity', 'yaw', 'pitch', 'pose', 'bounds', 'equipment', 'usingItem', 'onFire', 'pickable', 'parentId', 'partName',
-	'alive', 'hostile', 'health', 'maxHealth', 'targetingAgent', 'swelling', 'fuse', 'perceivedBy'];
-const THREAT_SIGNALS = new Set(['targeting', 'swelling', 'creeper_close', 'ranged_sight']);
+	'alive', 'hostile', 'health', 'maxHealth', 'targetingAgent', 'swelling', 'fuse', 'perceivedBy', 'potentialRisk', 'risk', 'expectedHitDamage'];
+const THREAT_SIGNALS = new Set(['targeting', 'swelling', 'creeper_close', 'ranged_sight', 'attacked']);
+const SURVIVAL_SIGNALS = new Set(['heal_opportunity', 'low_health_no_food']);
 const MAX_THREAT_ENTRIES = 8;
 const BLOCK_DETAIL_FIELDS = ['state', 'bounds', 'boundsTruncated', 'replaceable', 'fluid'];
 const MENU_DETAIL_FIELDS = ['containerId', 'stateId', 'slotCount', 'offset', 'hasMore', 'details'];
@@ -1799,7 +1800,7 @@ function observedDetails(value, field, depth = 0) {
 }
 
 function normalizeObservation(value) {
-	const allowed = ['goalRevision', 'observedAtEpochMs', 'ready', 'status', 'eventSequence', 'attention', 'changedFacts', 'position', 'velocity', 'view', 'player', 'inventory', 'entities', 'blocks', 'landmarks', 'nearbyContainers', 'world', 'currentAction', 'lastResult', 'interaction', 'coverage', 'perception', 'threats'];
+	const allowed = ['goalRevision', 'observedAtEpochMs', 'ready', 'status', 'eventSequence', 'attention', 'changedFacts', 'position', 'velocity', 'view', 'player', 'inventory', 'entities', 'blocks', 'landmarks', 'nearbyContainers', 'world', 'currentAction', 'lastResult', 'interaction', 'coverage', 'perception', 'threats', 'survival'];
 	exactKeys(value, allowed, ['goalRevision', 'observedAtEpochMs', 'ready', 'status'], 'observation');
 	const normalized = {
 		goalRevision: revision(value.goalRevision, 'goalRevision'),
@@ -1815,7 +1816,7 @@ function normalizeObservation(value) {
 		if (normalized.attention === false && normalized.changedFacts?.length > 0) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Non-attention observation cannot contain changed facts');
 		return normalized;
 	}
-	for (const key of allowed.slice(4).filter((field) => !['interaction', 'landmarks', 'coverage', 'perception', 'threats'].includes(field))) if (!Object.hasOwn(value, key)) throw new ProtocolV2Error('MISSING_FIELD', `observation field '${key}' is required when ready`);
+	for (const key of allowed.slice(4).filter((field) => !['interaction', 'landmarks', 'coverage', 'perception', 'threats', 'survival'].includes(field))) if (!Object.hasOwn(value, key)) throw new ProtocolV2Error('MISSING_FIELD', `observation field '${key}' is required when ready`);
 	normalized.eventSequence = positiveInteger(value.eventSequence, 'eventSequence');
 	normalized.attention = boolean(value.attention, 'attention');
 	normalized.changedFacts = changedFactPaths(value.changedFacts);
@@ -1836,6 +1837,29 @@ function normalizeObservation(value) {
 	if (value.coverage !== undefined) normalized.coverage = observedDetails(value.coverage, 'coverage');
 	if (value.perception !== undefined) normalized.perception = perceptionObservation(value.perception);
 	if (value.threats !== undefined) normalized.threats = threatsObservation(value.threats);
+	if (value.survival !== undefined) normalized.survival = survivalObservation(value.survival);
+	return normalized;
+}
+
+/** Healing facts (present while hurt or signalling): safe, canHealNow, bestFood and debounced signals. */
+function survivalObservation(value) {
+	exactKeys(value, ['safe', 'canHealNow', 'bestFood', 'signals'], ['safe', 'canHealNow', 'signals'], 'survival');
+	const normalized = {
+		safe: boolean(value.safe, 'survival.safe'),
+		canHealNow: boolean(value.canHealNow, 'survival.canHealNow'),
+		signals: boundedArray(value.signals, 'survival.signals', SURVIVAL_SIGNALS.size).map((signal) => {
+			if (!SURVIVAL_SIGNALS.has(signal)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'survival.signals contains an unknown signal');
+			return signal;
+		}),
+	};
+	if (value.bestFood !== undefined) {
+		exactKeys(value.bestFood, ['slot', 'itemId', 'nutrition'], ['slot', 'itemId', 'nutrition'], 'survival.bestFood');
+		normalized.bestFood = {
+			slot: nonnegativeInteger(value.bestFood.slot, 'survival.bestFood.slot'),
+			itemId: requireIdentifier(value.bestFood.itemId, 'survival.bestFood.itemId'),
+			nutrition: nonnegativeInteger(value.bestFood.nutrition, 'survival.bestFood.nutrition'),
+		};
+	}
 	return normalized;
 }
 
@@ -1845,7 +1869,7 @@ function threatsObservation(value) {
 	const entries = boundedArray(value.entries, 'threats.entries', MAX_THREAT_ENTRIES).map((entry, index) => {
 		const field = `threats.entries[${index}]`;
 		const keys = ['uuid', 'type', 'distance', 'bearing', 'targeting', 'swelling', 'lineOfSight', 'signals'];
-		exactKeys(entry, keys, keys, field);
+		exactKeys(entry, [...keys, 'risk', 'riskFactors', 'expectedHitDamage'], keys, field);
 		const signals = boundedArray(entry.signals, `${field}.signals`, THREAT_SIGNALS.size).map((signal) => {
 			if (!THREAT_SIGNALS.has(signal)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}.signals contains an unknown signal`);
 			return signal;
@@ -1855,6 +1879,10 @@ function threatsObservation(value) {
 			distance: finiteNumber(entry.distance, `${field}.distance`), bearing: finiteNumber(entry.bearing, `${field}.bearing`),
 			targeting: boolean(entry.targeting, `${field}.targeting`), swelling: boolean(entry.swelling, `${field}.swelling`),
 			lineOfSight: boolean(entry.lineOfSight, `${field}.lineOfSight`), signals,
+			// Open-ended risk (no upper bound) with its factors, and the expected hit after the agent's armour.
+			...(entry.risk === undefined ? {} : { risk: finiteNumber(entry.risk, `${field}.risk`) }),
+			...(entry.riskFactors === undefined ? {} : { riskFactors: observedDetails(entry.riskFactors, `${field}.riskFactors`) }),
+			...(entry.expectedHitDamage === undefined ? {} : { expectedHitDamage: finiteNumber(entry.expectedHitDamage, `${field}.expectedHitDamage`) }),
 		};
 	});
 	if (value.bestWeapon === undefined) return { entries };
@@ -2024,7 +2052,8 @@ function isFactualChangedPath(path) {
 	if (path === 'world.dimension') return true;
 	if (path.startsWith('player.')) return FACTUAL_PLAYER_FIELDS.has(path.slice('player.'.length));
 	if (/^entities\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(path)) return true;
-	if (/^threats\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(?:targeting|swelling|creeper_close|ranged_sight)$/i.test(path)) return true;
+	if (/^threats\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(?:targeting|swelling|creeper_close|ranged_sight|attacked)$/i.test(path)) return true;
+	if (/^survival\.(?:heal_opportunity|low_health_no_food)$/.test(path)) return true;
 	return /^blocks\.-?\d+,-?\d+,-?\d+$/.test(path);
 }
 

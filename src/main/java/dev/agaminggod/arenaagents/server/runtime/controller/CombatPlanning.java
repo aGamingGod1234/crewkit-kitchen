@@ -129,6 +129,86 @@ public final class CombatPlanning {
 	}
 
 	/**
+	 * Model-chosen fight_target targeting policy. The model picks it; the controller only applies it live.
+	 * named: fight the given target (then follow-through, if enabled). highest_risk: keep switching to the attacker
+	 * with the highest risk score. nearest_attacker: keep switching to the nearest attacker. Only mobs or players
+	 * already attacking the agent qualify and creepers are never chosen, so a policy never starts a new fight.
+	 */
+	public enum TargetPolicy {
+		NAMED("named"), HIGHEST_RISK("highest_risk"), NEAREST_ATTACKER("nearest_attacker");
+
+		private final String wireName;
+
+		TargetPolicy(String wireName) {
+			this.wireName = wireName;
+		}
+
+		public String wireName() {
+			return wireName;
+		}
+
+		public static TargetPolicy parse(String value) {
+			if (value == null) return NAMED;
+			for (TargetPolicy policy : values()) if (policy.wireName.equals(value)) return policy;
+			throw new IllegalArgumentException("unknown targetPolicy " + value);
+		}
+	}
+
+	/** Policies are re-evaluated twice a second. */
+	public static final int POLICY_INTERVAL_TICKS = 10;
+	/** Hysteresis: stay on a target at least 1.5 s before a policy may switch away from it. */
+	public static final int POLICY_MIN_DWELL_TICKS = 30;
+	/** Hysteresis: highest_risk switches only to a clearly riskier attacker (25% and 5 points more). */
+	public static final double RISK_SWITCH_RATIO = 1.25D;
+	public static final double RISK_SWITCH_MARGIN = 5.0D;
+	/** Hysteresis: nearest_attacker switches only to an attacker at least 2 blocks nearer. */
+	public static final double NEAREST_SWITCH_MARGIN = 2.0D;
+
+	/** One fight candidate for a target policy; attacking means targeting or recently hurting the agent. */
+	public record PolicyCandidate(double distance, double risk, boolean attacking, boolean creeper) {
+	}
+
+	/** Players (other agents included) are switch candidates only when the model passed includePlayers:true. */
+	public static boolean switchableKind(boolean player, boolean includePlayers) {
+		return !player || includePlayers;
+	}
+
+	static boolean policyEligible(PolicyCandidate candidate) {
+		return candidate.attacking() && !candidate.creeper() && candidate.distance() <= THREAT_RANGE;
+	}
+
+	/**
+	 * The candidate index a live policy switches to, or -1 to keep the current target. {@code current} is the
+	 * current target's own facts (null when it is gone, which skips the dwell and margin checks).
+	 */
+	public static int policyRetarget(TargetPolicy policy, PolicyCandidate current, List<PolicyCandidate> others, int ticksOnTarget) {
+		Objects.requireNonNull(policy, "policy must not be null");
+		Objects.requireNonNull(others, "others must not be null");
+		if (policy == TargetPolicy.NAMED) return -1;
+		if (current != null && ticksOnTarget < POLICY_MIN_DWELL_TICKS) return -1;
+		int best = -1;
+		for (int index = 0; index < others.size(); index++) {
+			PolicyCandidate candidate = others.get(index);
+			if (!policyEligible(candidate)) continue;
+			if (best < 0) {
+				best = index;
+				continue;
+			}
+			PolicyCandidate leader = others.get(best);
+			boolean better = policy == TargetPolicy.HIGHEST_RISK
+					? candidate.risk() > leader.risk() || (candidate.risk() == leader.risk() && candidate.distance() < leader.distance())
+					: candidate.distance() < leader.distance();
+			if (better) best = index;
+		}
+		if (best < 0 || current == null) return best;
+		PolicyCandidate leader = others.get(best);
+		boolean clearlyBetter = policy == TargetPolicy.HIGHEST_RISK
+				? leader.risk() > current.risk() * RISK_SWITCH_RATIO + RISK_SWITCH_MARGIN
+				: leader.distance() < current.distance() - NEAREST_SWITCH_MARGIN;
+		return clearlyBetter ? best : -1;
+	}
+
+	/**
 	 * One threat during a flee. dx/dz point from the agent to the threat; closing means it gained ground over
 	 * the last half second (or has not been watched that long yet).
 	 */

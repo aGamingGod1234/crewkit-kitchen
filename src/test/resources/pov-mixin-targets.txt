@@ -18,6 +18,8 @@ net.minecraft.client.player.LocalPlayer
 net.minecraft.client.renderer.GameRenderer
 net.minecraft.client.renderer.ItemInHandRenderer
 net.minecraft.client.renderer.ScreenEffectRenderer
+net.minecraft.client.renderer.entity.EntityRenderer
+net.minecraft.client.renderer.entity.player.AvatarRenderer
 net.minecraft.server.level.ChunkMap
 net.minecraft.server.level.ChunkMap$TrackedEntity
 net.minecraft.server.level.ServerLevel

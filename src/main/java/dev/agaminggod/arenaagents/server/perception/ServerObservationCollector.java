@@ -89,6 +89,7 @@ public final class ServerObservationCollector {
 	private final Map<AgentId, RawSpatialObservation.Key> spatialKeys = new HashMap<>();
 	private final Map<AgentId, RawPlayerState> lastRawStates = new HashMap<>();
 	private final ThreatPerception threats = new ThreatPerception();
+	private final SurvivalPerception survival = new SurvivalPerception();
 	private final Map<AgentId, InventorySnapshot> lastInventories = new HashMap<>();
 	private static final IdentityHashMap<Holder<?>, List<String>> TAG_VALUES = new IdentityHashMap<>();
 
@@ -161,8 +162,11 @@ public final class ServerObservationCollector {
 		}
 		player.add("effects", effects(agent));
 		observation.add("player", player);
-		JsonObject threat = ThreatPerception.toJson(threats.sample(agentId, agent));
+		ThreatPerception.Snapshot threatSnapshot = threats.sample(agentId, agent);
+		JsonObject threat = ThreatPerception.toJson(threatSnapshot);
 		if (threat != null) observation.add("threats", threat);
+		JsonObject healing = SurvivalPerception.toJson(survival.sample(agentId, agent, threatSnapshot));
+		if (healing != null) observation.add("survival", healing);
 		observation.add("interaction", interaction(agentId, agent));
 
 		observation.add("inventory", inventory(agent));
@@ -423,7 +427,11 @@ public final class ServerObservationCollector {
 				}
 				continue;
 			}
-			RawPlayerState current = rawPlayerState(agent, threats.sample(agentId, agent).signalKeys());
+			ThreatPerception.Snapshot threatSnapshot = threats.sample(agentId, agent);
+			// Survival signals ride the same forced-attention rule as threat signals: a new one is delivered now.
+			Set<String> signalKeys = new HashSet<>(threatSnapshot.signalKeys());
+			for (String signal : survival.sample(agentId, agent, threatSnapshot).signals()) signalKeys.add("survival:" + signal);
+			RawPlayerState current = rawPlayerState(agent, Set.copyOf(signalKeys));
 			synchronized (lastRawStates) {
 				RawPlayerState previous = lastRawStates.put(agentId, current);
 				boolean inventoryChanged = updateInventory(agentId, agent);
@@ -435,6 +443,7 @@ public final class ServerObservationCollector {
 		synchronized (lastRawStates) {
 			lastRawStates.keySet().removeIf(agentId -> !tracked.contains(agentId));
 			threats.retain(tracked);
+			survival.retain(tracked);
 			lastInventories.keySet().removeIf(agentId -> !tracked.contains(agentId));
 		}
 		return List.copyOf(changed);
@@ -779,6 +788,18 @@ public final class ServerObservationCollector {
 		}
 		heard.sort(Comparator.comparingDouble(agent::distanceToSqr));
 		return heard.size() > 8 ? List.copyOf(heard.subList(0, 8)) : heard;
+	}
+
+	/**
+	 * Whether the agent perceives this entity the way its observation does: seen (in view with line of sight), or
+	 * heard as a hostile hunting it within 16 blocks. Used to keep presentation from revealing hidden positions.
+	 */
+	public static boolean perceives(ServerPlayer agent, ObservationVisibility.Frame visibility, Entity entity) {
+		if (visibility.isEntityWithinView(entity) && visibility.hasLineOfSight(entity)) return true;
+		if (!(entity instanceof net.minecraft.world.entity.Mob mob) || !ThreatPerception.isHostileTo(mob, agent)
+				|| agent.distanceTo(mob) > ThreatPerception.RANGE) return false;
+		boolean hurtRecently = agent.getLastHurtByMob() == mob && agent.tickCount - agent.getLastHurtByMobTimestamp() <= 100;
+		return hearsThreat(mob.getTarget() == agent, hurtRecently, false);
 	}
 
 	/** A hunting hostile the agent cannot see is still perceived (by sound); a visible one is reported by sight. */

@@ -84,8 +84,17 @@ public final class ObservationDetails {
 	static void combat(JsonObject target, ServerPlayer player, LivingEntity living) {
 		target.addProperty("alive", living.isAlive());
 		// A calm neutral mob (enderman, zombified piglin, piglin tolerating gold) is not hostile to this agent.
-		target.addProperty("hostile", living instanceof net.minecraft.world.entity.Mob mob
-				? ThreatPerception.isHostileTo(mob, player) : living instanceof net.minecraft.world.entity.monster.Enemy);
+		// A player (or calm creature) counts as hostile only once it actually hurt this agent recently.
+		target.addProperty("hostile", (living instanceof net.minecraft.world.entity.Mob mob
+				? ThreatPerception.isHostileTo(mob, player) : living instanceof net.minecraft.world.entity.monster.Enemy)
+				|| RiskAssessment.attackedRecently(player, living));
+		if (RiskAssessment.carriesRisk(player, living)) {
+			// potentialRisk is always shown; risk appears only while the creature or player actively engages this agent.
+			RiskAssessment.Assessment assessment = RiskAssessment.assess(player, living);
+			target.addProperty("potentialRisk", assessment.risk());
+			if (assessment.active()) target.addProperty("risk", assessment.risk());
+			target.addProperty("expectedHitDamage", assessment.hit().damage());
+		}
 		target.addProperty("health", Float.isFinite(living.getHealth()) ? living.getHealth() : 0.0F);
 		target.addProperty("maxHealth", Float.isFinite(living.getMaxHealth()) ? living.getMaxHealth() : 0.0F);
 		if (living instanceof net.minecraft.world.entity.Mob mob) target.addProperty("targetingAgent", mob.getTarget() == player);

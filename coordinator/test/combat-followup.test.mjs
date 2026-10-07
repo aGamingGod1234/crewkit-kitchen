@@ -59,6 +59,7 @@ test('danger steering: materially new facts are never held back', () => {
 	assert.equal(creeper.request.dangerSummary.foldedEvents, 1, 'and carries the hits folded before it');
 	const swelling = coalescer.offer(damageSteer(17, [threat(CREEPER, 'minecraft:creeper', 5, { swelling: true })]), 300);
 	assert.equal(swelling.action, 'deliver', 'a creeper starting to swell steers at once');
+	assert.equal(coalescer.offer(damageSteer(13, [threat(CREEPER, 'minecraft:creeper', 5, { swelling: true })]), 350).action, 'deliver', 'crossing 70% health steers at once');
 	assert.equal(coalescer.offer(damageSteer(11, [threat(CREEPER, 'minecraft:creeper', 5, { swelling: true })]), 400).action, 'fold');
 	assert.equal(coalescer.offer(damageSteer(10, [threat(CREEPER, 'minecraft:creeper', 5, { swelling: true })]), 500).action, 'deliver', 'crossing half health steers at once');
 	assert.equal(coalescer.offer({ priority: 'urgent', trigger: 'threat', nativeEvent: { event: 'observation', observation: hurt(10, [threat(CREEPER, 'minecraft:creeper', 5, { swelling: true })]) } }, 600).action, 'deliver', 'a new trigger kind steers at once');
@@ -207,7 +208,7 @@ test('trace replay: kill, then a second zombie hitting every ~1.1 s no longer st
 		assert.ok(steers.length <= Math.ceil((13 * 1_100) / DANGER_STEER_INTERVAL_MS) + 2, `about one steer per ${DANGER_STEER_INTERVAL_MS} ms (got ${steers.length})`);
 		for (let index = 1; index < steers.length; index++) {
 			const gap = steers[index].at - steers[index - 1].at;
-			const crossedHalf = health(steers[index - 1]) > 10 && health(steers[index]) <= 10;
+			const crossedHalf = [14, 10, 6].some((threshold) => health(steers[index - 1]) > threshold && health(steers[index]) <= threshold);
 			assert.ok(gap >= DANGER_STEER_INTERVAL_MS || crossedHalf, `steers ${index - 1}->${index} only ${gap} ms apart without new facts`);
 		}
 		// A creeper appears: materially new, delivered immediately even inside the interval.

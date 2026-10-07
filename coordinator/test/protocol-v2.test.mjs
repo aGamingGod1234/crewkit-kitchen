@@ -1796,6 +1796,34 @@ test('threat facts, combat entity fields and threat attention paths are accepted
 	assert.equal(Object.hasOwn(validateProtocolV2Payload('observation', withoutThreats), 'threats'), false, 'threats stay optional');
 });
 
+test('risk facts, player attackers and healing signals are accepted as observation facts', () => {
+	const observation = readyServerObservation();
+	const player = '00000000-0000-0000-0000-0000000000b2';
+	observation.attention = true;
+	observation.changedFacts = [`threats.${player}.attacked`, 'survival.low_health_no_food'];
+	observation.entities = [{ uuid: player, type: 'minecraft:player', name: 'Steve', distance: 3, position: { x: 3, y: 64, z: 0 },
+		alive: true, hostile: true, health: 20, maxHealth: 20, potentialRisk: 92.4, risk: 92.4, expectedHitDamage: 5.1 }];
+	observation.threats = { entries: [{ uuid: player, type: 'minecraft:player', distance: 3, bearing: 10, targeting: false, swelling: false, lineOfSight: true,
+		signals: ['attacked'], risk: 2400.5, riskFactors: { proximity: 0.5, health: 1.34, speed: 1, size: 1, damage: 1.3, behaviour: 1.25 }, expectedHitDamage: 5.1 }] };
+	observation.survival = { safe: false, canHealNow: false, signals: ['low_health_no_food'] };
+	const normalized = validateProtocolV2Payload('observation', observation);
+	assert.equal(normalized.threats.entries[0].risk, 2400.5, 'risk is open-ended');
+	assert.equal(normalized.threats.entries[0].riskFactors.health, 1.34);
+	assert.equal(normalized.entities[0].potentialRisk, 92.4);
+	assert.deepEqual(normalized.survival, { safe: false, canHealNow: false, signals: ['low_health_no_food'] });
+	assert.deepEqual(normalized.changedFacts, [`threats.${player}.attacked`, 'survival.low_health_no_food']);
+	const fed = structuredClone(observation);
+	fed.survival = { safe: true, canHealNow: true, bestFood: { slot: 3, itemId: 'minecraft:bread', nutrition: 5 }, signals: ['heal_opportunity'] };
+	fed.changedFacts = ['survival.heal_opportunity'];
+	assert.equal(validateProtocolV2Payload('observation', fed).survival.bestFood.itemId, 'minecraft:bread');
+	const unknown = structuredClone(observation);
+	unknown.survival.signals = ['starving'];
+	assert.throws(() => validateProtocolV2Payload('observation', unknown), /unknown signal/);
+	const badPath = structuredClone(observation);
+	badPath.changedFacts = ['survival.starving'];
+	assert.throws(() => validateProtocolV2Payload('observation', badPath), /factual observation path/);
+});
+
 test('player packet observations preserve approximate sounds, visible bars, and event attention', () => {
 	const observation = readyServerObservation();
 	observation.attention = true;

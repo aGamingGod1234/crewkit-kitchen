@@ -5,6 +5,7 @@
   "client": [
     "AbstractClientPlayerMixin",
     "AvatarRendererMixin",
+    "EntityRendererRiskMixin",
     "CameraEyeHeightAccessor",
     "ClientPlayerDisplayNameMixin",
     "FontManagerAccessor",
