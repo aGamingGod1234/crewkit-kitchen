@@ -253,19 +253,17 @@ test('takeTask cannot credit a player who did not message the agent in this conv
 });
 
 test('with several senders takeTask needs an explicit requester, who must be one of them', async () => {
+	// Both messages are in the turn's first delivered batch. A message steered in mid-turn may land after the
+	// model's first call; then the default requester is the sender who started the turn, which is also correct.
 	const registry = new AgentRegistry();
-	let releaseTurn;
-	const secondMessageSteered = new Promise((resolve) => { releaseTurn = resolve; });
-	const planner = scriptedPlanner(registry, [[() => secondMessageSteered, TAKE, { kind: 'take_task', resume: false, requesterId: OTHER }]]);
+	const planner = scriptedPlanner(registry, [[TAKE, { kind: 'take_task', resume: false, requesterId: OTHER }]]);
 	const run = await start({ registry, planner, config: NATIVE_CONFIG });
 	try {
 		run.bridge.emit('conversation_event', dm('hi there', 1, 0));
-		await eventually(() => planner.requests.length === 1);
 		run.bridge.emit('conversation_event', dm('can you fetch some wood', 2, 0, OTHER));
-		await eventually(() => planner.steers.length === 1);
-		await settle();
-		releaseTurn();
-		await eventually(() => taskRequests(run.bridge).length === 1);
+		await eventually(() => taskRequests(run.bridge).length === 1 && planner.outcomes.length >= 1);
+		const delivered = JSON.parse(planner.requests[0].input.split('\n').at(-1)).conversation.entries;
+		assert.deepEqual(delivered.map(({ sequence }) => sequence), [1, 2], 'both messages reach the first turn');
 		assert.equal(planner.outcomes[0].result.reasonCode, 'REQUESTER_REQUIRED');
 		assert.match(planner.outcomes[0].result.message, new RegExp(OTHER));
 		const request = taskRequests(run.bridge)[0].payload;
