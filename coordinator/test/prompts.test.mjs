@@ -21,7 +21,8 @@ const state = {
 const PROFILE_FINGERPRINT = profileFingerprint(state.agent);
 
 test('native program reference shares the actual language, action contract and examples within its response budget', () => {
-	assert.ok(Buffer.byteLength(ARENA_SCRIPT_API_REFERENCE) < 13_000);
+	// Raised from 13,000 for the fight/flee calls and threat-watcher guidance; still well under the 16 KiB tool page.
+	assert.ok(Buffer.byteLength(ARENA_SCRIPT_API_REFERENCE) < 14_500);
 	assert.ok(ARENA_SCRIPT_API_REFERENCE.includes(SCRIPT_ACTION_REFERENCE));
 	assert.match(ARENA_SCRIPT_API_REFERENCE, /Watcher example/);
 	assert.match(ARENA_SCRIPT_API_REFERENCE, /world\.queryMemory/);

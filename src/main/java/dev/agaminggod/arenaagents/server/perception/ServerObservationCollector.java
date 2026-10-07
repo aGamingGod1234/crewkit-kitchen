@@ -25,6 +25,7 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import net.minecraft.core.BlockPos;
@@ -87,6 +88,7 @@ public final class ServerObservationCollector {
 			new ObservationSectionCache<>(LANDMARK_CACHE_CAPACITY, LANDMARK_CACHE_TICKS, value -> value);
 	private final Map<AgentId, RawSpatialObservation.Key> spatialKeys = new HashMap<>();
 	private final Map<AgentId, RawPlayerState> lastRawStates = new HashMap<>();
+	private final ThreatPerception threats = new ThreatPerception();
 	private final Map<AgentId, InventorySnapshot> lastInventories = new HashMap<>();
 	private static final IdentityHashMap<Holder<?>, List<String>> TAG_VALUES = new IdentityHashMap<>();
 
@@ -159,6 +161,8 @@ public final class ServerObservationCollector {
 		}
 		player.add("effects", effects(agent));
 		observation.add("player", player);
+		JsonObject threat = ThreatPerception.toJson(threats.sample(agentId, agent));
+		if (threat != null) observation.add("threats", threat);
 		observation.add("interaction", interaction(agentId, agent));
 
 		observation.add("inventory", inventory(agent));
@@ -419,7 +423,7 @@ public final class ServerObservationCollector {
 				}
 				continue;
 			}
-			RawPlayerState current = rawPlayerState(agent);
+			RawPlayerState current = rawPlayerState(agent, threats.sample(agentId, agent).signalKeys());
 			synchronized (lastRawStates) {
 				RawPlayerState previous = lastRawStates.put(agentId, current);
 				boolean inventoryChanged = updateInventory(agentId, agent);
@@ -430,6 +434,7 @@ public final class ServerObservationCollector {
 		}
 		synchronized (lastRawStates) {
 			lastRawStates.keySet().removeIf(agentId -> !tracked.contains(agentId));
+			threats.retain(tracked);
 			lastInventories.keySet().removeIf(agentId -> !tracked.contains(agentId));
 		}
 		return List.copyOf(changed);
@@ -727,13 +732,16 @@ public final class ServerObservationCollector {
 				candidates.add(new EntityCandidate(entity, agent.distanceToSqr(entity)));
 			}
 		}
+		List<Entity> heard = heardThreats(level, agent, visibility);
+		List<Entity> selected = new ArrayList<>(heard);
 		for (EntityCandidate candidate : selectNearestVisible(
 				candidates,
 				Comparator.comparingDouble(EntityCandidate::distanceSquared),
-				MAX_ENTITIES,
+				MAX_ENTITIES - heard.size(),
 				entry -> visibility.hasLineOfSight(entry.entity())
-		)) {
-			Entity entity = candidate.entity();
+		)) selected.add(candidate.entity());
+		selected.sort(Comparator.comparingDouble(agent::distanceToSqr));
+		for (Entity entity : selected) {
 					JsonObject json = new JsonObject();
 					json.addProperty("uuid", entity.getUUID().toString());
 					json.addProperty("type", BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString());
@@ -741,6 +749,7 @@ public final class ServerObservationCollector {
 					json.addProperty("distance", finite(agent.distanceTo(entity)));
 					json.add("position", vector(entity.position()));
 					ObservationDetails.entity(json, agent, entity);
+					json.addProperty("perceivedBy", heard.contains(entity) ? "sound" : "sight");
 					if (entity instanceof ServerPlayer player) {
 						json.addProperty("isPlayer", true);
 					}
@@ -752,6 +761,29 @@ public final class ServerObservationCollector {
 					values.add(json);
 		}
 		return values;
+	}
+
+	/**
+	 * Hostile mobs hunting the agent (targeting it or hurt it in the last 5 s) within 16 blocks that the view
+	 * cone or line of sight would hide, e.g. a skeleton shooting the agent's back while it mines. A player hears
+	 * these; they are reported with perceivedBy "sound". At most 8, nearest first.
+	 */
+	private static List<Entity> heardThreats(ServerLevel level, ServerPlayer agent, ObservationVisibility.Frame visibility) {
+		List<Entity> heard = new ArrayList<>();
+		for (net.minecraft.world.entity.Mob mob : level.getEntitiesOfClass(net.minecraft.world.entity.Mob.class,
+				agent.getBoundingBox().inflate(ThreatPerception.RANGE), mob -> mob instanceof net.minecraft.world.entity.monster.Enemy && mob.isAlive())) {
+			if (agent.distanceTo(mob) > ThreatPerception.RANGE) continue;
+			boolean hurtRecently = agent.getLastHurtByMob() == mob && agent.tickCount - agent.getLastHurtByMobTimestamp() <= 100;
+			if (!hearsThreat(mob.getTarget() == agent, hurtRecently, visibility.isEntityWithinView(mob) && visibility.hasLineOfSight(mob))) continue;
+			heard.add(mob);
+		}
+		heard.sort(Comparator.comparingDouble(agent::distanceToSqr));
+		return heard.size() > 8 ? List.copyOf(heard.subList(0, 8)) : heard;
+	}
+
+	/** A hunting hostile the agent cannot see is still perceived (by sound); a visible one is reported by sight. */
+	static boolean hearsThreat(boolean targetingAgent, boolean hurtAgentRecently, boolean visible) {
+		return !visible && (targetingAgent || hurtAgentRecently);
 	}
 
 	static <T> List<T> selectNearestVisible(
@@ -1157,7 +1189,7 @@ public final class ServerObservationCollector {
 		return value.substring(0, value.offsetByCodePoints(0, MAX_ENTITY_NAME_CODE_POINTS));
 	}
 
-	private static RawPlayerState rawPlayerState(ServerPlayer agent) {
+	private static RawPlayerState rawPlayerState(ServerPlayer agent, Set<String> threatSignals) {
 		LivingEntity attacker = agent.getLastHurtByMob();
 		return new RawPlayerState(
 				finite(agent.getHealth()),
@@ -1170,7 +1202,8 @@ public final class ServerObservationCollector {
 				agent.onGround(),
 				finite(agent.fallDistance),
 				attacker != null && attacker.isAlive() ? attacker.getUUID() : null,
-				PlayerObservationEvents.sequence(agent)
+				PlayerObservationEvents.sequence(agent),
+				threatSignals
 			);
 	}
 
@@ -1194,15 +1227,24 @@ public final class ServerObservationCollector {
 		boolean onGround,
 		double fallDistance,
 		java.util.UUID lastAttacker,
-		long perceptionSequence
+		long perceptionSequence,
+		Set<String> threatSignals
 	) {
+		RawPlayerState(double health, int foodLevel, double saturation, boolean onFire, boolean inWater, int air,
+				boolean suffocating, boolean onGround, double fallDistance, java.util.UUID lastAttacker, long perceptionSequence) {
+			this(health, foodLevel, saturation, onFire, inWater, air, suffocating, onGround, fallDistance, lastAttacker,
+					perceptionSequence, Set.of());
+		}
+
 		boolean requiresForcedAttention(RawPlayerState previous, boolean inventoryChanged) {
 			// Narrow exception: preserve menu/components, events, hazards and every other raw wake.
 			return inventoryChanged || !AttentionSignalPolicy.safeAir(air) || !AttentionSignalPolicy.safeAir(previous.air)
 					|| health != previous.health || foodLevel != previous.foodLevel || saturation != previous.saturation
 					|| onFire != previous.onFire || inWater != previous.inWater || suffocating != previous.suffocating
 					|| onGround != previous.onGround || fallDistance != previous.fallDistance
-					|| !Objects.equals(lastAttacker, previous.lastAttacker) || perceptionSequence != previous.perceptionSequence;
+					|| !Objects.equals(lastAttacker, previous.lastAttacker) || perceptionSequence != previous.perceptionSequence
+					// A newly latched threat signal must reach the model now; a signal expiring is only a quiet refresh.
+					|| !previous.threatSignals.containsAll(threatSignals);
 		}
 	}
 

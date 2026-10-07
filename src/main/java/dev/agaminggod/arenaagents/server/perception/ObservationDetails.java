@@ -76,6 +76,21 @@ public final class ObservationDetails {
 			target.add("equipment", equipment);
 			target.addProperty("usingItem", living.isUsingItem());
 			target.addProperty("onFire", living.isOnFire());
+			combat(target, player, living);
+		}
+	}
+
+	/** Fight-or-flee facts the model needs: hostility, whether it hunts this agent, health and creeper fuse. */
+	static void combat(JsonObject target, ServerPlayer player, LivingEntity living) {
+		target.addProperty("alive", living.isAlive());
+		target.addProperty("hostile", living instanceof net.minecraft.world.entity.monster.Enemy);
+		target.addProperty("health", Float.isFinite(living.getHealth()) ? living.getHealth() : 0.0F);
+		target.addProperty("maxHealth", Float.isFinite(living.getMaxHealth()) ? living.getMaxHealth() : 0.0F);
+		if (living instanceof net.minecraft.world.entity.Mob mob) target.addProperty("targetingAgent", mob.getTarget() == player);
+		if (living instanceof net.minecraft.world.entity.monster.Creeper creeper) {
+			target.addProperty("swelling", creeper.getSwellDir() > 0);
+			// 0 idle .. 1 exploding; vanilla's fuse is 1.5 s from 0 to 1.
+			target.addProperty("fuse", Math.round(creeper.getSwelling(1.0F) * 100.0F) / 100.0D);
 		}
 	}
 

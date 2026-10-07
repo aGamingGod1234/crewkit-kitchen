@@ -867,15 +867,21 @@ export class ArenaScriptInterpreter {
 	}
 }
 
+const EXACT_TARGET_CALLS = Object.freeze({
+	'player.attack': [ACTION_FIELDS.attack, ['targetId', 'timeoutMs']],
+	'player.useRanged': [ACTION_FIELDS.use_ranged, ['targetId', 'drawDurationMs', 'timeoutMs']],
+	'player.fightTarget': [ACTION_FIELDS.fight_target, ['targetId', 'timeoutMs']],
+	'player.fleeFrom': [ACTION_FIELDS.flee_from, ['targetId', 'distance', 'timeoutMs']],
+});
+
 function validateExactTargetArguments(path, args, node, fail) {
-	if (path !== 'player.attack' && path !== 'player.useRanged') return;
+	if (!Object.hasOwn(EXACT_TARGET_CALLS, path)) return;
 	if (args.length !== 1 || args[0] === null || typeof args[0] !== 'object' || Array.isArray(args[0])) {
 		throw fail('exact target actions require one argument object with targetId');
 	}
 	const target = args[0];
-	const expected = path === 'player.attack' ? ['targetId', 'timeoutMs'] : ['targetId', 'drawDurationMs', 'timeoutMs'];
+	const [allowed, expected] = EXACT_TARGET_CALLS[path];
 	const keys = Object.keys(target);
-	const allowed = path === 'player.attack' ? ACTION_FIELDS.attack : ACTION_FIELDS.use_ranged;
 	if (keys.some((key) => !allowed.includes(key)) || expected.some((key) => !Object.hasOwn(target, key))) {
 		throw fail('exact target actions require targetId and reject targetSelector');
 	}

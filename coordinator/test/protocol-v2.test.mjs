@@ -1772,6 +1772,30 @@ test('event inspection uses bounded pages and an explicit event sequence cursor'
 	}
 });
 
+test('threat facts, combat entity fields and threat attention paths are accepted; unknown signals are not', () => {
+	const observation = readyServerObservation();
+	const creeper = '00000000-0000-0000-0000-0000000000cc';
+	observation.attention = true;
+	observation.changedFacts = [`threats.${creeper}.swelling`];
+	observation.entities = [{ uuid: creeper, type: 'minecraft:creeper', name: 'Creeper', distance: 4, position: { x: 14, y: 64, z: -3 },
+		alive: true, hostile: true, health: 20, maxHealth: 20, targetingAgent: true, swelling: true, fuse: 0.4, perceivedBy: 'sound' }];
+	observation.threats = { entries: [{ uuid: creeper, type: 'minecraft:creeper', distance: 4, bearing: -170, targeting: true, swelling: true, lineOfSight: true, signals: ['creeper_close', 'swelling', 'targeting'] }],
+		bestWeapon: { slot: 2, itemId: 'minecraft:stone_sword' } };
+	const normalized = validateProtocolV2Payload('observation', observation);
+	assert.deepEqual(normalized.threats, observation.threats);
+	assert.equal(normalized.entities[0].perceivedBy, 'sound');
+	assert.equal(normalized.entities[0].fuse, 0.4);
+	assert.deepEqual(normalized.changedFacts, [`threats.${creeper}.swelling`]);
+	const unknown = structuredClone(observation);
+	unknown.threats.entries[0].signals = ['panic'];
+	assert.throws(() => validateProtocolV2Payload('observation', unknown), /unknown signal/);
+	const badPath = structuredClone(observation);
+	badPath.changedFacts = [`threats.${creeper}.panic`];
+	assert.throws(() => validateProtocolV2Payload('observation', badPath), /factual observation path/);
+	const withoutThreats = readyServerObservation();
+	assert.equal(Object.hasOwn(validateProtocolV2Payload('observation', withoutThreats), 'threats'), false, 'threats stay optional');
+});
+
 test('player packet observations preserve approximate sounds, visible bars, and event attention', () => {
 	const observation = readyServerObservation();
 	observation.attention = true;
@@ -1865,7 +1889,7 @@ test('protocol v2 preserves nullable desired block state and defers block-id mat
 });
 
 test('protocol v2 rejects retired high-level controller action types', () => {
-	for (const actionType of ['build_sequence', 'fight_target', 'flee_from', 'follow_entity', 'complete_goal']) {
+	for (const actionType of ['build_sequence', 'follow_entity', 'complete_goal']) {
 		assert.throws(
 			() => validateProtocolV2Payload('action_command', {
 				traceId: TRACE_ID,

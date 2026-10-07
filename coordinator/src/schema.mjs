@@ -101,6 +101,17 @@ export function validateAction(value) {
 			requireTargetId(action.targetId, 'action.targetId');
 			requireDuration(action.timeoutMs, 'action.timeoutMs');
 			break;
+		case 'fight_target':
+			requireTargetId(action.targetId, 'action.targetId');
+			if (action.desiredRange !== undefined) requireFiniteRange(action.desiredRange, 'action.desiredRange', 1, 6);
+			if (action.fleeAtHealth !== undefined) requireFiniteRange(action.fleeAtHealth, 'action.fleeAtHealth', 0, 2048);
+			requireDuration(action.timeoutMs, 'action.timeoutMs');
+			break;
+		case 'flee_from':
+			requireTargetId(action.targetId, 'action.targetId');
+			requireFiniteRange(action.distance, 'action.distance', 1, 64);
+			requireDuration(action.timeoutMs, 'action.timeoutMs');
+			break;
 		case 'transfer_container':
 			requireCoordinates(action, true, 'action');
 			requireOneOf(action.sourceKind, 'action.sourceKind', ['player', 'container']);

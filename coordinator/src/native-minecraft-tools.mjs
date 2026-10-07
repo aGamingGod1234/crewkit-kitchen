@@ -24,7 +24,7 @@ const MAX_PROGRAM_SOURCE_BYTES = 65_536;
 const MAX_PROGRAM_PRECONDITION_BYTES = 4_096;
 const MAX_SEQUENCE_FINISH_BYTES = 4_096;
 const INVENTORY_FACT_FIELDS = ['selectedSlot', 'selectedItem', 'selectedItemId', 'selectedItemCount', 'tagCounts'];
-const COMPACT_ROW_FIELDS = ['uuid', 'stableId', 'type', 'typeId', 'name', 'slot', 'position', 'x', 'y', 'z', 'distance', 'distanceSquared', 'blockId', 'itemId', 'count', 'damage', 'maxDamage', 'tags', 'fingerprint', 'hotbar', 'displayName', 'maxStackSize', 'health', 'maxHealth', 'hostile', 'alive', 'withinInteractionRange', 'capabilities', 'velocity', 'bounds', 'pickable', 'parentId', 'partName', 'state', 'bearing', 'elevation', 'omittedFields'];
+const COMPACT_ROW_FIELDS = ['uuid', 'stableId', 'type', 'typeId', 'name', 'slot', 'position', 'x', 'y', 'z', 'distance', 'distanceSquared', 'blockId', 'itemId', 'count', 'damage', 'maxDamage', 'tags', 'fingerprint', 'hotbar', 'displayName', 'maxStackSize', 'health', 'maxHealth', 'hostile', 'alive', 'targetingAgent', 'swelling', 'fuse', 'perceivedBy', 'withinInteractionRange', 'capabilities', 'velocity', 'bounds', 'pickable', 'parentId', 'partName', 'state', 'bearing', 'elevation', 'omittedFields'];
 const NATIVE_ACTION_TYPES = Object.freeze(Object.keys(ACTION_FIELDS));
 const POST_ACTION_VIEW_TOOLS = new Set(['moveTo', 'mine', 'act', 'sequence']);
 const OBSERVATION_VIEW_PROPERTIES = {
@@ -53,7 +53,7 @@ Read taskPlan at task start; replace it at meaningful revisions. Stable IDs reta
 
 Keep provider/model/effort/tier; death does not change the active goal. Batch known independent reads and reuse fresh result facts. Use sequence for safe linear chains; use ArenaScript for conditional/repeated work with bounded background:true. finish verifies goalSpec. queueProgram requires a fresh precondition; only natural exhaustion starts it. expectedDurationMs never extends timeout. Use startAction to reason while one chosen action runs; settle exact handles and program decisions.
 
-Survival is part of the goal. Author real defensive interrupts with after:"reconsider"; reassess before resuming. Unhandled danger pauses unrelated work. taskMemory retains earlier deaths, routes, assets, progress and lessons. Reobserve; shared:true shares selected notes. You choose defense and recovery.
+Survival is part of the goal; you choose defense. Threat attention (player.threat) precedes damage: act fight_target/flee_from, not moveTo; creepers flee; low health flee, eat. Guard mining programs with a threat watch (after:"reconsider"). taskMemory keeps deaths, routes, progress, lessons; shared:true shares notes.
 
 Use capabilities/focused inspections; omitted or unobserved facts are unknown. queryMemory paginates nextOffset; reuse exact noteKey with fresh prerequisites/current targets and program.parameters(). Notes are hypotheses; receipts historical. Keep metadata separate; noteKey executes the entire note as source. exploreFrontier returns candidates; choose moveTo. Mine exact observed blockId. Claim effects from evidence. conversation_only uses say; plain text is invisible; speech playback is asynchronous.`;
 

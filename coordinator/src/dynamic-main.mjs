@@ -4426,7 +4426,7 @@ function finiteOrNull(value) {
 export function classifyObservationTrigger(payload, observation, signals = null) {
 	const explicitTrigger = typeof payload.trigger === 'string' && payload.trigger.trim().length > 0 ? payload.trigger.trim().slice(0, 128) : null;
 	const attention = payload.attention === true;
-	if (explicitTrigger !== null) return { attention: true, priority: payload.priority === 'urgent' || ['damage', 'lava', 'fire', 'suffocation', 'fall'].includes(explicitTrigger) ? 'urgent' : 'ordinary', trigger: explicitTrigger };
+	if (explicitTrigger !== null) return { attention: true, priority: payload.priority === 'urgent' || ['damage', 'threat', 'lava', 'fire', 'suffocation', 'fall'].includes(explicitTrigger) ? 'urgent' : 'ordinary', trigger: explicitTrigger };
 	const changedFacts = Array.isArray(payload.changedFacts) ? payload.changedFacts : [];
 	const joinedFacts = changedFacts.filter((value) => typeof value === 'string').join('|').toLowerCase();
 	const player = observation?.player ?? {};
@@ -4436,6 +4436,9 @@ export function classifyObservationTrigger(payload, observation, signals = null)
 	// available, also exclude healing from legacy/general-purpose deltas.
 	const healthDelta = joinedFacts.includes('health') && (!Number.isFinite(before?.health) || !Number.isFinite(player.health) || healthDecreased);
 	if (healthDecreased || healthDelta || joinedFacts.includes('attacker') || joinedFacts.includes('damage')) return { attention: true, priority: 'urgent', trigger: 'damage' };
+	// Server-sensed threat edges (a mob starts targeting, a creeper swells or closes in, a ranged mob gets a
+	// clear shot) wake the model before the first hit; the server latch debounces each mob and signal.
+	if (changedFacts.some((fact) => typeof fact === 'string' && fact.startsWith('threats.'))) return { attention: true, priority: 'urgent', trigger: 'threat' };
 	if (player.inLava === true || joinedFacts.includes('player.inlava')) return { attention: true, priority: 'urgent', trigger: 'lava' };
 	if (joinedFacts.includes('fire') || player.onFire === true || player.fire === true) return { attention: true, priority: 'urgent', trigger: 'fire' };
 	if (joinedFacts.includes('suffoc') || joinedFacts.includes('air')) return { attention: true, priority: 'urgent', trigger: 'suffocation' };
@@ -4537,7 +4540,8 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 	const optionSource = Array.isArray(observation.options) ? observation.options : null;
 	const inventoryRows = boundedEventArray(inventorySource, 32);
 	const itemRows = boundedEventArray(itemSource, 16);
-	const entityRows = boundedEventArray(entitySource, 16);
+	// Hostile or hunting mobs (including ones only heard behind the agent) survive the nearest-16 cut.
+	const entityRows = boundedEventArray(entitySource, 16, isHazardousEventFact);
 	const blockRows = boundedEventArray(blockSource, 32, isHazardousEventFact);
 	const landmarkRows = landmarkSource === null ? null : boundedEventArray(landmarkSource, 32);
 	const nearbyContainerRows = nearbyContainerSource === null ? null : boundedEventArray(nearbyContainerSource, 16);
@@ -4807,7 +4811,7 @@ function retainedEventCoverage(coverage, retainedCounts) {
 	}));
 }
 
-const COMPACT_EVENT_ROW_FIELDS = ['uuid', 'stableId', 'type', 'name', 'position', 'x', 'y', 'z', 'distance', 'blockId', 'itemId', 'count', 'slot', 'tags', 'velocity', 'bounds', 'pickable', 'parentId', 'partName', 'state', 'bearing', 'elevation', 'id', 'feasible', 'moveTo', 'reason', 'cause', 'hazard', 'damage', 'maxDamage', 'fingerprint', 'hotbar', 'displayName', 'maxStackSize', 'hostile', 'alive', 'health', 'maxHealth', 'withinInteractionRange', 'capabilities'];
+const COMPACT_EVENT_ROW_FIELDS = ['uuid', 'stableId', 'type', 'name', 'position', 'x', 'y', 'z', 'distance', 'blockId', 'itemId', 'count', 'slot', 'tags', 'velocity', 'bounds', 'pickable', 'parentId', 'partName', 'state', 'bearing', 'elevation', 'id', 'feasible', 'moveTo', 'reason', 'cause', 'hazard', 'damage', 'maxDamage', 'fingerprint', 'hotbar', 'displayName', 'maxStackSize', 'hostile', 'alive', 'health', 'maxHealth', 'targetingAgent', 'swelling', 'fuse', 'perceivedBy', 'withinInteractionRange', 'capabilities'];
 
 function compactEventRows(value) {
 	return asArray(value).map((entry) => {
@@ -4822,6 +4826,7 @@ function compactEventRows(value) {
 function isHazardousEventFact(value) {
 	if (value === null || typeof value !== 'object') return false;
 	if (value.hostile === true && value.alive !== false) return true;
+	if (value.targetingAgent === true || value.swelling === true) return true;
 	const text = ['blockId', 'itemId', 'type', 'name', 'reason', 'cause', 'hazard'].map((field) => value[field]).filter((field) => typeof field === 'string').join(' ');
 	return /lava|fire|magma|cactus|campfire|tnt|creeper|ghast|blaze|wither|warden|dragon|hostile/i.test(text);
 }
