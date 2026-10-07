@@ -28,7 +28,8 @@
     "MultiPlayerGameModePovMixin",
     "MenuScreensInvoker",
     "InventoryScreenPovMixin",
-    "AbstractContainerScreenPovMixin"
+    "AbstractContainerScreenPovMixin",
+    "ScreenEffectRendererPovMixin"
   ],
   "injectors": {
     "defaultRequire": 1

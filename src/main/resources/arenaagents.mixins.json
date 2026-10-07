@@ -12,6 +12,8 @@
     "EntityPlayerActionPackAccessor",
     "EntityPlayerActionPackMixin",
     "EntityPlayerMPFakeMixin",
+    "FakePlayerCheckFallDamageMixin",
+    "FakePlayerFallAuthorityMixin",
     "LevelMutationRevisionMixin",
     "LevelChunkMutationRevisionMixin",
     "ShulkerShapeRevisionMixin",
