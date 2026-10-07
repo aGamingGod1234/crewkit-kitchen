@@ -3072,6 +3072,10 @@ export class DynamicCoordinator extends EventEmitter {
 				observation: this.#nativeRuntime.decorateObservation(record, request.nativeEvent.observation ?? {}),
 				conversation: reservation?.conversation ?? { mode: 'unread', baseSequence: null, nextSequence: -1, entries: [] },
 			});
+			const contextTrimmed = JSON.parse(input.slice(input.indexOf('\n') + 1)).contextTrimmed;
+			if (contextTrimmed !== undefined) {
+				this.#writeTrace('native_event_context_trimmed', { agentId: record.agentId, goalRevision: record.goalRevision, fields: contextTrimmed });
+			}
 			if (reservation) {
 				const delivered = JSON.parse(input.slice(input.indexOf('\n') + 1)).conversation;
 				inbox.trim(reservation.token, delivered.entries.length);
@@ -4619,6 +4623,13 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 			conversation: overflowConversation,
 		};
 		json = JSON.stringify(overflowPayload);
+		// Player messages outrank optional context. If the compacted event still leaves
+		// no room for the oldest unread message, fall back to core facts instead of
+		// failing every later turn with the same oversized context.
+		if (unreadConversation.entries.length > 0 && !fitsWithOldestMessage(overflowPayload, eventBudgetBytes)) {
+			Object.assign(overflowPayload, minimalEventContext(overflowPayload));
+			json = JSON.stringify(overflowPayload);
+		}
 		// Protect the oldest unread instructions. Later messages stay unread and
 		// are delivered by a following turn, never acknowledged via a skipped tail.
 		while (Buffer.byteLength(json, 'utf8') > eventBudgetBytes && overflowConversation.entries.length > 0) {
@@ -4635,6 +4646,58 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 		? 'Live Minecraft event. Program planning is due soon: prepare the next intention while the current authorised routine keeps running. This is advisory and does not require a pending decisionId; use the current programVersion and timing context, and do not blindly renew or cancel the current program.'
 		: 'Live Minecraft event. Advance the current goal using fresh facts. Keep authorised routines running while you reason; respond explicitly to pending program decisions.';
 	return `${instruction}\n${json}`;
+}
+
+const MINIMAL_TASK_MEMORY_BYTES = 2_048;
+const MINIMAL_RECEIPTS = 2;
+const MINIMAL_OBSERVATION_FIELDS = new Set(['observedAtEpochMs', 'eventSequence', 'freshness', 'ready', 'status', 'player', 'inventory', 'currentAction', 'lastResult', 'death', 'recovery', 'failureClass', 'continuity', 'resultCoverage']);
+
+function fitsWithOldestMessage(payload, budgetBytes) {
+	const probe = { ...payload, conversation: { ...payload.conversation, entries: payload.conversation.entries.slice(0, 1) } };
+	return Buffer.byteLength(JSON.stringify(probe), 'utf8') <= budgetBytes;
+}
+
+// Core facts only: where the agent is, what it holds and what just happened.
+// contextTrimmed lists what was dropped, largest first with original byte sizes,
+// so the model can look it up again and traces show which context outgrew the budget.
+function minimalEventContext(payload) {
+	const observation = payload.observation ?? {};
+	const sizes = {};
+	const minimalObservation = {};
+	for (const [key, value] of Object.entries(observation)) {
+		if (MINIMAL_OBSERVATION_FIELDS.has(key)) minimalObservation[key] = value;
+		else sizes[`observation.${key}`] = Buffer.byteLength(JSON.stringify(value ?? null), 'utf8');
+	}
+	if (observation.inventory !== undefined) {
+		minimalObservation.inventory = { ...observation.inventory, items: asArray(observation.inventory.items).slice(0, 8) };
+	}
+	const result = { observation: minimalObservation };
+	if (payload.taskMemory !== undefined) {
+		const encoded = JSON.stringify(payload.taskMemory);
+		const bytes = Buffer.byteLength(encoded, 'utf8');
+		if (bytes > MINIMAL_TASK_MEMORY_BYTES) {
+			sizes.taskMemory = bytes;
+			result.taskMemory = { truncated: true, excerpt: truncateUtf8(encoded, MINIMAL_TASK_MEMORY_BYTES) };
+		}
+	}
+	const programResult = payload.program?.result;
+	if (Array.isArray(programResult?.receipts) && programResult.receipts.length > MINIMAL_RECEIPTS) {
+		sizes['program.result.receipts'] = Buffer.byteLength(JSON.stringify(programResult.receipts), 'utf8');
+		result.program = { ...payload.program, result: { ...programResult, receipts: programResult.receipts.slice(-MINIMAL_RECEIPTS), omittedReceipts: (programResult.omittedReceipts ?? 0) + programResult.receipts.length - MINIMAL_RECEIPTS } };
+	}
+	result.contextTrimmed = Object.fromEntries(Object.entries(sizes).sort(([, left], [, right]) => right - left).slice(0, 12));
+	return result;
+}
+
+function truncateUtf8(text, maxBytes) {
+	let end = Math.min(text.length, maxBytes);
+	while (end > 0 && Buffer.byteLength(text.slice(0, end), 'utf8') > maxBytes) end -= 1;
+	// Never end on the first half of a surrogate pair.
+	if (end > 0 && end < text.length) {
+		const code = text.charCodeAt(end - 1);
+		if (code >= 0xd800 && code <= 0xdbff) end -= 1;
+	}
+	return text.slice(0, end);
 }
 
 function boundedEventArray(value, limit, preserve = null) {

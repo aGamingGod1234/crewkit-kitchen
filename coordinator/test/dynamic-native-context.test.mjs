@@ -1219,7 +1219,7 @@ for (const failTail of [false, true]) for (const toolCalls of [0, 1]) {
 	});
 }
 
-test('zero-fit native conversation reports actionable failure without advancing unread delivery', async t => {
+test('oversized task memory is trimmed so unread conversation still reaches the model', async t => {
 	let contextSize = 20000;
 	t.mock.method(RuntimeMemoryContext.prototype, 'taskContext', async () => ({ summary: 'x'.repeat(contextSize) }));
 	const registry = new AgentRegistry(), planner = new FakePlanner(registry);
@@ -1228,11 +1228,15 @@ test('zero-fit native conversation reports actionable failure without advancing 
 	const message = sequence => run.bridge.emit('conversation_event', { agentId: 'agent-a', payload: { sequence, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct', text: `Important ${sequence}`, goalRevision: 0, observedAtEpochMs: sequence } });
 	try {
 		message(1);
-		await eventually(() => run.bridge.sent.some(message => message.type === 'agent_error' && message.payload.code === 'NATIVE_CONVERSATION_BUDGET_EXCEEDED'));
-		assert.equal(planner.requests.length, 0, 'an empty substitute never reaches the provider');
-		contextSize = 0; message(2);
 		await eventually(() => planner.requests.length === 1);
-		assert.deepEqual(JSON.parse(planner.requests[0].input.split('\n')[1]).conversation.entries.map(entry => entry.sequence), [1, 2]);
+		const first = JSON.parse(planner.requests[0].input.split('\n')[1]);
+		assert.deepEqual(first.conversation.entries.map(entry => entry.sequence), [1], 'the message is delivered instead of failing the turn');
+		assert.equal(first.taskMemory.truncated, true);
+		assert.ok(first.contextTrimmed.taskMemory > 20_000);
+		assert.equal(run.bridge.sent.some(message => message.type === 'agent_error' && message.payload.code === 'NATIVE_CONVERSATION_BUDGET_EXCEEDED'), false);
+		contextSize = 0; message(2);
+		await eventually(() => planner.requests.length === 2);
+		assert.deepEqual(JSON.parse(planner.requests[1].input.split('\n')[1]).conversation.entries.map(entry => entry.sequence), [2]);
 	} finally { await run.coordinator.stop(); }
 });
 
