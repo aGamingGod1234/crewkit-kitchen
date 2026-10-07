@@ -1949,7 +1949,7 @@ test('protocol v2 carries an exact observed dropped-item identity to Minecraft',
 
 function currentCollectorObservation() {
 	const payload = readyServerObservation();
-	Object.assign(payload.player, { pose: 'standing', swimming: false, gliding: false, sprinting: false, crouching: false,
+	Object.assign(payload.player, { pose: 'standing', underWater: false, swimming: false, gliding: false, sprinting: false, crouching: false,
 		onClimbable: false, inLava: false, horizontalCollision: false, verticalCollision: false, passenger: false });
 	payload.world.worldId = '00000000-0000-0000-0000-000000000999';
 	Object.assign(payload.interaction.menu, { containerId: 0, stateId: 1, slotCount: 46, offset: 0, hasMore: true });
@@ -2366,4 +2366,13 @@ test('33 progress messages have identical delivery in one TCP chunk or separate 
 		assert.equal(socket.destroyed, false);
 		assert.equal(socket.paused, false);
 	}
+});
+
+test('underwater breath facts survive wire validation and adaptation', () => {
+	const payload = currentCollectorObservation();
+	Object.assign(payload.player, { inWater: true, air: 150, underWater: true, airSecondsLeft: 7.5 });
+	const adapted = adaptObservation(validateProtocolV2Payload('observation', payload));
+	assert.equal(adapted.player.underWater, true);
+	assert.equal(adapted.player.airSecondsLeft, 7.5);
+	assert.equal(adapted.player.air, 150);
 });

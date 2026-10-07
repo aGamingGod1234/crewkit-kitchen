@@ -139,7 +139,7 @@ const FACTUAL_TOP_LEVEL_PATHS = new Set([
 ]);
 const TRUSTED_ENVELOPES = new WeakSet();
 const TRUSTED_PAYLOAD_TYPES = new WeakMap();
-const PLAYER_DETAIL_FIELDS = ['pose', 'swimming', 'gliding', 'sprinting', 'crouching', 'onClimbable', 'inLava', 'horizontalCollision', 'verticalCollision', 'passenger', 'vehicle'];
+const PLAYER_DETAIL_FIELDS = ['pose', 'underWater', 'airSecondsLeft', 'swimming', 'gliding', 'sprinting', 'crouching', 'onClimbable', 'inLava', 'horizontalCollision', 'verticalCollision', 'passenger', 'vehicle'];
 const STACK_DETAIL_FIELDS = ['displayName', 'fingerprint', 'maxStackSize', 'tooltip', 'tooltipTruncated'];
 const MENU_STACK_DETAIL_FIELDS = ['damage', 'maxDamage', ...STACK_DETAIL_FIELDS];
 const ENTITY_DETAIL_FIELDS = ['velocity', 'yaw', 'pitch', 'pose', 'bounds', 'equipment', 'usingItem', 'onFire', 'pickable', 'parentId', 'partName',

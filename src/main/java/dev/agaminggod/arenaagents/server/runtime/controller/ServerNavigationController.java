@@ -88,6 +88,8 @@ public final class ServerNavigationController implements ServerController {
 	private AgentInputStates.MotorState motorState;
 	private boolean lastSprint;
 	private ResourceKey<Level> startingDimension;
+	/** Elapsed ms when the current rise to the water surface began, or -1 while not surfacing. */
+	private long surfacingSinceMs = -1L;
 
 	public ServerNavigationController(
 			Vec3 destination,
@@ -134,9 +136,23 @@ public final class ServerNavigationController implements ServerController {
 		if (elapsedMs >= timeoutMs) {
 			return fail(player, "ACTION_TIMEOUT", "Navigation timed out", currentProgress());
 		}
-		if (!hasAirReserve(player.isInWater(), player.getAirSupply())) {
-			return fail(player, "AIR_RESERVE_REACHED", "Water traversal stopped at its breathing reserve", currentProgress());
+		// Under water no path can start (routes only use the surface), and with breath running out the route must wait:
+		// rise to the surface first like a player holding space, then plan from there. Stopping the action instead
+		// handed a sinking, drowning body back to the model (the play-test's NO_STANDABLE_PATH / AIR_RESERVE_REACHED).
+		if (SwimPlanning.needsSurfacing(player.isInWater(), player.isUnderWater())
+				&& (plan == null || !hasAirReserve(true, player.getAirSupply()))) {
+			if (surfacingSinceMs < 0L) surfacingSinceMs = elapsedMs;
+			if (elapsedMs - surfacingSinceMs >= SwimPlanning.SURFACING_TIMEOUT_MS) {
+				return fail(player, player.getAirSupply() <= MIN_AIR_RESERVE ? "AIR_RESERVE_REACHED" : "NO_STANDABLE_PATH",
+						String.format(java.util.Locale.ROOT, "Could not rise to the water surface within %d s (%.1f s of air left)",
+								SwimPlanning.SURFACING_TIMEOUT_MS / 1_000L, SwimPlanning.airSecondsLeft(player.getAirSupply())),
+						currentProgress());
+			}
+			plan = null;
+			surface(player, nowEpochMs);
+			return TickResult.running(currentProgress());
 		}
+		surfacingSinceMs = -1L;
 		MinecraftNavigationWorld world = new MinecraftNavigationWorld(player.level());
 		if (navigationStartPosition == null) navigationStartPosition = player.position();
 		if (plan == null) {
@@ -555,11 +571,39 @@ public final class ServerNavigationController implements ServerController {
 		return null;
 	}
 
+	/**
+	 * One surfacing tick: hold jump, look up and sprint-swim toward the destination, which is how a player gets out
+	 * of deep water; the route is planned once the eyes are above the surface.
+	 */
+	private void surface(ServerPlayer player, long nowEpochMs) {
+		if (inputLease == null) {
+			inputController = AgentInputRuntime.controller(player);
+			inputLease = inputController.acquire(AgentInputRuntime.requireAgentId(player), InputOwner.NAVIGATION, 100);
+		}
+		if (motorState == null) motorState = AgentInputStates.MotorState.initial(player.getYRot(), player.getXRot());
+		double dx = destination.x - player.getX();
+		double dz = destination.z - player.getZ();
+		float yaw = dx * dx + dz * dz < 0.0025D ? motorState.yaw()
+				: net.minecraft.util.Mth.wrapDegrees((float) Math.toDegrees(Math.atan2(-dx, dz)));
+		boolean swimSprint = SwimPlanning.swimSprint(true, true, 1.0F, player.getFoodData().getFoodLevel());
+		AgentInputStates.MotorStep step = AgentInputStates.stepMotor(motorState,
+				new AgentInputStates.MotorTarget(yaw, SwimPlanning.SURFACING_PITCH, true, SwimPlanning.holdJump(true), swimSprint),
+				nowEpochMs);
+		motorState = step.state();
+		lastSprint = step.sprint();
+		inputController.apply(inputLease, new dev.agaminggod.arenaagents.server.runtime.input.AgentInputState(
+				step.forward(), step.strafe(), step.jump(), false, step.sprint(),
+				false, false, step.state().yaw(), step.state().pitch(),
+				player.getInventory().getSelectedSlot(), InteractionHand.MAIN_HAND
+		));
+	}
+
 	/** Holds the lease, view and sprint with no movement keys while a route is being planned. */
 	private void coast(ServerPlayer player) {
 		if (inputLease == null || motorState == null) return;
+		// Afloat, keep holding jump while planning; releasing it sank the body back under between plans.
 		inputController.apply(inputLease, new dev.agaminggod.arenaagents.server.runtime.input.AgentInputState(
-				0.0F, 0.0F, false, false, lastSprint && player.getFoodData().getFoodLevel() > 6,
+				0.0F, 0.0F, SwimPlanning.holdJump(player.isInWater()), false, lastSprint && player.getFoodData().getFoodLevel() > 6,
 				false, false, motorState.yaw(), motorState.pitch(),
 				player.getInventory().getSelectedSlot(), InteractionHand.MAIN_HAND
 		));

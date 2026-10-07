@@ -60,7 +60,7 @@ class FakeBridge extends EventEmitter {
 		if (event === 'disconnected' && (message?.connectionEpoch ?? this.connectionEpoch) === this.connectionEpoch) this.connected = false;
 		if (event === 'observation' && message?.payload?.observation !== undefined) {
 			const payload = message.payload;
-			message = { ...message, payload: factToWireObservation(payload.observation, payload.goalRevision, payload.eventSequence, payload.attention === true, payload.observedAtEpochMs ?? 1) };
+			message = { ...message, payload: factToWireObservation(payload.observation, payload.goalRevision, payload.eventSequence, payload.attention === true, payload.observedAtEpochMs ?? 1, payload.changedFacts) };
 		}
 		if ((message?.connectionEpoch ?? this.connectionEpoch) === this.connectionEpoch) {
 			if (Number.isSafeInteger(message?.payload?.eventSequence)) {
@@ -184,12 +184,12 @@ function record(agentId = 'agent-a') {
 	return { agentId, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority', state: DynamicAgentState.IDLE, goalRevision: 0, queue: [] };
 }
 
-function factToWireObservation(value, goalRevision, eventSequence, attention, observedAtEpochMs) {
+function factToWireObservation(value, goalRevision, eventSequence, attention, observedAtEpochMs, changedFacts = undefined) {
 	const player = value.player ?? {};
 	const position = { x: player.x ?? 0, y: player.y ?? 64, z: player.z ?? 0 };
 	return {
 		goalRevision, observedAtEpochMs, ready: true, status: 'ready', eventSequence, attention,
-		changedFacts: attention ? ['player.health'] : [], position, velocity: { x: 0, y: 0, z: 0 }, view: { yaw: 0, pitch: 0 },
+		changedFacts: attention ? (changedFacts ?? ['player.health']) : [], position, velocity: { x: 0, y: 0, z: 0 }, view: { yaw: 0, pitch: 0 },
 		player: {
 			health: player.health ?? 20, maxHealth: 20, armor: 0, foodLevel: player.hunger ?? 20, saturation: 5,
 			gameMode: 'survival', onGround: true, inWater: false, onFire: player.fire === true,

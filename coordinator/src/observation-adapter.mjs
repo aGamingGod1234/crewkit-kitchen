@@ -35,6 +35,9 @@ export function adaptObservation(value) {
 	copyBoolean(playerSource, player, 'onGround');
 	copyBoolean(playerSource, player, 'inWater');
 	copyBoolean(playerSource, player, 'suffocating');
+	// Eyes under water and the seconds of breath left before drowning damage starts.
+	copyBoolean(playerSource, player, 'underWater');
+	copyNumber(playerSource, player, 'airSecondsLeft');
 	copyNumber(playerSource, player, 'fallDistance');
 	if (Object.hasOwn(playerSource, 'gameMode')) player.gameMode = identifier(playerSource.gameMode, 'player.gameMode');
 	if (Object.hasOwn(playerSource, 'effects')) player.effects = effectFacts(playerSource.effects);

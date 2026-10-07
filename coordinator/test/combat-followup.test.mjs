@@ -224,3 +224,48 @@ test('trace replay: kill, then a second zombie hitting every ~1.1 s no longer st
 		assert.equal(health(steers.at(-1)), currentHealth - 1, 'the model always ends up with the latest health');
 	} finally { release(); await run.coordinator.stop(); }
 });
+
+test('danger and drowning attention during a deciding native turn steer it and never interrupt it', async () => {
+	let release;
+	const gate = new Promise(resolve => { release = resolve; });
+	const clock = { now: 0, timers: new Map(), id: 0 };
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	const steers = [];
+	planner.requestNativeTurn = async request => { planner.requests.push(request); if (planner.requests.length === 1) await gate; return { status: 'completed', toolCalls: 1 }; };
+	planner.steerNativeTurn = async request => { steers.push({ at: clock.now, input: request.input }); return { turnId: 'deciding' }; };
+	const run = await start({ registry, planner, controlNow: () => clock.now,
+		setSteerTimeout: (callback, delay) => { const id = ++clock.id; clock.timers.set(id, { callback, due: clock.now + delay }); return id; },
+		clearSteerTimeout: id => clock.timers.delete(id),
+		config: { bridge: { port: 25570, secret: 's'.repeat(32) },
+			codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } } } });
+	const advance = async ms => {
+		clock.now += ms;
+		for (const [id, timer] of [...clock.timers]) if (timer.due <= clock.now) { clock.timers.delete(id); timer.callback(); }
+		for (let index = 0; index < 6; index++) await tick();
+	};
+	let sequence = 0;
+	const wire = (health, air = 300) => ({ player: { x: 0, y: 64, z: 0, health, air, lastAttacker: { uuid: ZOMBIE_B, type: 'minecraft:zombie', distance: 2 } },
+		threats: { entries: [threat(ZOMBIE_B, 'minecraft:zombie', 2)] },
+		items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } });
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Survive the night.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: ++sequence, observation: wire(20) } });
+		await eventually(() => planner.requests.length === 1);
+		let health = 20;
+		for (let hit = 0; hit < 8; hit++) {
+			health -= 1;
+			run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: ++sequence, changedFacts: ['player.health'], observation: wire(health) } });
+			await advance(400);
+		}
+		const before = steers.length;
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: ++sequence, attention: true, changedFacts: ['player.air'], observation: wire(health, 150) } });
+		await advance(10);
+		await eventually(() => steers.length > before);
+		assert.deepEqual(planner.interruptions, [], 'urgent attention never cancels the turn the model is reasoning in');
+		assert.equal(planner.requests.length, 1, 'no replacement turn was started');
+		assert.ok(steers.length > 0 && steers.length < 9, `danger hits are steered and coalesced (got ${steers.length})`);
+		assert.equal(steers.length, before + 1, 'the half-air drowning warning is delivered at once, not folded');
+		assert.match(steers.at(-1).input, /"air":150/);
+	} finally { release(); await run.coordinator.stop(); }
+});

@@ -19,6 +19,8 @@ import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.monster.Creeper;
+import net.minecraft.world.entity.monster.Guardian;
+import net.minecraft.world.entity.monster.zombie.Drowned;
 
 /**
  * Model-chosen flee_from: sprints away from the named entity and every other hostile threat within 16 blocks
@@ -26,7 +28,10 @@ import net.minecraft.world.entity.monster.Creeper;
  * the requested distance away and no longer closing in, or it lost the agent. It never reports success while
  * another threat inside that distance is still closing in or any creeper is within 7 blocks, so escaping a
  * zombie cannot end beside a creeper. Unlike navigate_to it has no destination to "arrive" at.
- * Steering re-picks a walkable heading every tick (step-ups are jumped, hazards and deep drops avoided).
+ * Steering re-picks a walkable heading every tick (step-ups are jumped, hazards and deep drops avoided). Deep water
+ * is costed, not blocked: land headings win when one exists, and once in water the agent swims like a player (jump
+ * held, sprint-swim and look up while submerged). It never reports an escape while the agent is under water or
+ * afloat without footing; it keeps going to the surface and a shore first (see {@link SwimPlanning#fleeMayEnd}).
  */
 public final class ServerFleeController implements ServerController {
 	private final Entity target;
@@ -61,8 +66,9 @@ public final class ServerFleeController implements ServerController {
 		List<CombatPlanning.FleeThreat> otherThreats = others.stream().map(Other::threat).toList();
 		int blocker = CombatPlanning.escapeBlocker(otherThreats, distance);
 		boolean targetPresent = target.isAlive() && !target.isRemoved() && target.level() == player.level();
+		boolean mayEnd = SwimPlanning.fleeMayEnd(player.isInWater(), player.isUnderWater(), player.onGround());
 		if (!targetPresent) {
-			if (blocker < 0) return finish(TickResult.succeeded("TARGET_GONE", targetType + " is gone" + clearOf(others)));
+			if (blocker < 0 && mayEnd) return finish(TickResult.succeeded("TARGET_GONE", targetType + " is gone" + clearOf(others)));
 			// The named chaser is gone but others still close in: keep fleeing from them.
 			return drive(player, nowEpochMs, others, false) ? running(elapsed, others, blocker, 0.0D)
 					: blocked(player, others, -1.0D);
@@ -75,7 +81,7 @@ public final class ServerFleeController implements ServerController {
 		CombatPlanning.FleeProgress.Outcome outcome = progress.observe(current, hunting);
 		// A creeper as the named target is held to the same blast margin as any other creeper.
 		boolean creeperTooClose = target instanceof Creeper && current < CombatPlanning.CREEPER_SAFE_DISTANCE;
-		if (blocker < 0 && !creeperTooClose) {
+		if (blocker < 0 && !creeperTooClose && mayEnd) {
 			switch (outcome) {
 				case ESCAPED -> {
 					return finish(TickResult.succeeded("ESCAPED", String.format(Locale.ROOT,
@@ -91,7 +97,7 @@ public final class ServerFleeController implements ServerController {
 		if (elapsed >= timeoutMs) {
 			return finish(TickResult.timedOut("FLEE_TIMED_OUT", String.format(Locale.ROOT,
 					"Still %.1f of %.1f blocks from %s when the flee timed out", current, distance, targetType)
-					+ blockerText(others, blocker), fraction));
+					+ blockerText(others, blocker) + waterText(player), fraction));
 		}
 		if (!drive(player, nowEpochMs, others, true)) return blocked(player, others, current);
 		return TickResult.running(fraction);
@@ -153,7 +159,7 @@ public final class ServerFleeController implements ServerController {
 		float awayYaw = away == null ? motor.yaw() : away;
 		GridPosition feet = new GridPosition(Mth.floor(player.getX()), Mth.floor(player.getY() + 0.2D), Mth.floor(player.getZ()));
 		CombatPlanning.Heading chosen = CombatPlanning.fleeHeading(
-				new MinecraftNavigationWorld(player.level()), feet, awayYaw, heading);
+				new MinecraftNavigationWorld(player.level()), feet, awayYaw, heading, waterPenalty(includeTarget, others));
 		if (!chosen.clear()) {
 			if (player.onGround() || player.isInWater()) return false;
 			// Mid-jump the feet cell is ambiguous; coast without input and judge again on landing.
@@ -162,14 +168,38 @@ public final class ServerFleeController implements ServerController {
 			return true;
 		}
 		heading = chosen.yaw();
-		boolean jump = player.isInWater() || (player.onGround() && (chosen.jump() || player.horizontalCollision));
-		boolean sprint = !player.isInWater() && player.getFoodData().getFoodLevel() > 6;
+		boolean inWater = player.isInWater();
+		boolean eyesInWater = player.isUnderWater();
+		int food = player.getFoodData().getFoodLevel();
+		// In water a player holds space (rise, stay afloat, climb out at the shore) and sprint-swims while submerged.
+		boolean jump = SwimPlanning.holdJump(inWater) || (player.onGround() && (chosen.jump() || player.horizontalCollision));
+		boolean sprint = inWater ? SwimPlanning.swimSprint(true, eyesInWater, 1.0F, food) : food > 6;
 		AgentInputStates.MotorStep step = AgentInputStates.stepMotor(motor,
-				new AgentInputStates.MotorTarget(chosen.yaw(), 0.0F, true, jump, sprint), nowEpochMs);
+				new AgentInputStates.MotorTarget(chosen.yaw(), SwimPlanning.swimPitch(inWater, eyesInWater, 0.0F), true, jump, sprint),
+				nowEpochMs);
 		motor = step.state();
 		input.apply(player, new AgentInputState(step.forward(), step.strafe(), step.jump(), false, step.sprint(),
 				false, false, step.yaw(), step.pitch(), player.getInventory().getSelectedSlot(), InteractionHand.MAIN_HAND));
 		return true;
+	}
+
+	/** Drowned and guardians out-swim a player, so water is a last resort while one is among the threats. */
+	private float waterPenalty(boolean includeTarget, List<Other> others) {
+		boolean aquatic = includeTarget && aquatic(target);
+		for (Other other : others) aquatic |= aquatic(other.mob());
+		return aquatic ? SwimPlanning.AQUATIC_THREAT_WATER_PENALTY_DEGREES : SwimPlanning.WATER_PENALTY_DEGREES;
+	}
+
+	private static boolean aquatic(Entity entity) {
+		return entity instanceof Drowned || entity instanceof Guardian;
+	}
+
+	/** "; still under water with 6.5 s of air" so a timed-out flee tells the model it must still surface. */
+	private static String waterText(ServerPlayer player) {
+		if (!player.isInWater() || player.onGround()) return "";
+		return player.isUnderWater()
+				? String.format(Locale.ROOT, "; still under water with %.1f s of air", SwimPlanning.airSecondsLeft(player.getAirSupply()))
+				: "; still swimming in deep water";
 	}
 
 	/** "; also clear of 2 other threat(s), nearest minecraft:creeper at 11.4 blocks" when others are around. */
