@@ -12,6 +12,8 @@ import dev.agaminggod.arenaagents.pov.OperatorActionPayload;
 import dev.agaminggod.arenaagents.pov.OperatorBodyController;
 import dev.agaminggod.arenaagents.pov.OperatorBodyControllers;
 import dev.agaminggod.arenaagents.pov.OperatorInputPayload;
+import dev.agaminggod.arenaagents.pov.OperatorTextPayload;
+import dev.agaminggod.arenaagents.pov.OperatorCreativeSlotPayload;
 import dev.agaminggod.arenaagents.pov.PovDeath;
 import dev.agaminggod.arenaagents.pov.PovMode;
 import dev.agaminggod.arenaagents.pov.PovStopPayload;
@@ -170,6 +172,8 @@ public final class PovSessionRuntime {
 				record.state() == AgentLifecycleState.DEAD);
 		if (mode == PovMode.TAKEOVER) beginTakeover(server, manager, state, session, operator, record);
 		state.sessions.put(operator.getUUID(), session);
+		if (mode == PovMode.TAKEOVER) PovMessageRelay.start(agentPlayerUuid, operator.getUUID(), agentName);
+		if (mode == PovMode.TAKEOVER && agent != null) PovUiForwarder.showAgentRecipeBook(operator, agent);
 		if (agent != null) {
 			session.observeAgent(agent, agent.position(), AGENT_LOOK_RESET_JUMP_BLOCKS);
 			if (session.takeover()) sampleAgent(session, agent);
@@ -275,6 +279,7 @@ public final class PovSessionRuntime {
 			}
 		} finally {
 			STATES.remove(server);
+			PovMessageRelay.clearAll();
 			AgentControlReservations.releaseAll(server);
 		}
 	}
@@ -359,6 +364,7 @@ public final class PovSessionRuntime {
 	 * tick used to) showed the operator the previous tick's position, one tick behind its own input.
 	 */
 	public static void endTick(MinecraftServer server) {
+		PovMessageRelay.flush(server);
 		State state = STATES.get(server);
 		if (state == null || state.sessions.isEmpty()) return;
 		CodexAgentManager manager = CodexAgentManager.get(server);
@@ -372,6 +378,7 @@ public final class PovSessionRuntime {
 				ServerPlayer agent = record == null ? null : findAgent(server, record).orElse(null);
 				session.publisher().tick(operator, agent, death(record, session.mode()), session.lookResetSeq(),
 						inputSequence(session));
+				if (agent != null) PovUiForwarder.refreshMerchant(operator, agent, server.getTickCount());
 			} catch (RuntimeException failure) {
 				// Same policy as a failing session tick: end the session instead of warning every tick.
 				LOGGER.warn("Stopped POV session {} for agent {} after a publish failure", session.id(), session.agentId(), failure);
@@ -429,6 +436,7 @@ public final class PovSessionRuntime {
 	private static void end(MinecraftServer server, State state, PovSession session, PovExitReason reason,
 			String detail, ServerPlayer operator) {
 		if (!state.sessions.remove(session.operatorId(), session)) return;
+		PovMessageRelay.stop(session.agentPlayerUuid(), session.operatorId());
 		String message = detail == null ? reason.message() : detail;
 		boolean online = operator != null && reason != PovExitReason.OPERATOR_DISCONNECTED;
 		if (session.takeover()) {
@@ -450,6 +458,10 @@ public final class PovSessionRuntime {
 					step(session, "report the takeover", () -> queueReport(server, state, session, operator));
 				}
 			}
+		}
+		if (online && session.takeover()) {
+			step(session, "restore the operator recipe book", () -> PovUiForwarder.restoreOperatorRecipeBook(operator));
+			step(session, "resync the operator inventory", () -> operator.inventoryMenu.sendAllDataToRemote());
 		}
 		if (online) {
 			step(session, "send the stop payload", () -> {
@@ -561,6 +573,26 @@ public final class PovSessionRuntime {
 		if (session != null) session.controller().applyFrame(frame);
 	}
 
+	public static void handleCreativeSlot(ServerPlayer operator, OperatorCreativeSlotPayload slot) {
+		PovSession session = activeTakeover(operator, slot.sessionId());
+		if (session != null) session.controller().applyCreativeSlot(slot);
+	}
+
+	public static void handleText(ServerPlayer operator, OperatorTextPayload text) {
+		PovSession session = activeTakeover(operator, text.sessionId());
+		if (session != null) session.controller().applyText(text);
+	}
+
+	/** The takeover session driving this agent player, if any; used to show it the agent's screens. */
+	static Optional<PovSession> takeoverOf(ServerPlayer agent) {
+		State state = STATES.get(agent.level().getServer());
+		if (state == null) return Optional.empty();
+		for (PovSession session : state.sessions.values()) {
+			if (session.takeover() && session.agentPlayerUuid().equals(agent.getUUID())) return Optional.of(session);
+		}
+		return Optional.empty();
+	}
+
 	public static void handleAction(ServerPlayer operator, OperatorActionPayload action) {
 		PovSession session = activeTakeover(operator, action.sessionId());
 		if (session == null) return;
@@ -568,7 +600,11 @@ public final class PovSessionRuntime {
 			// The agent's own inventory is always clickable server-side; the publisher mirrors it only while the
 			// operator has the E screen open, so the client receives container-0 contents to fill that screen.
 			if (action.action() == OperatorAction.OPEN_INVENTORY) session.publisher().setInventoryOpen(true);
-			if (action.action() == OperatorAction.CLOSE_MENU) session.publisher().setInventoryOpen(false);
+			if (action.action() == OperatorAction.CLOSE_MENU) {
+				session.publisher().setInventoryOpen(false);
+				// The creative screen edits the operator's own client inventory view; give it back its real contents.
+				operator.inventoryMenu.sendAllDataToRemote();
+			}
 			session.controller().applyAction(operator, action);
 			return;
 		}

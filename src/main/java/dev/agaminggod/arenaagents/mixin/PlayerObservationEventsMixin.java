@@ -2,6 +2,8 @@ package dev.agaminggod.arenaagents.mixin;
 
 import carpet.patches.EntityPlayerMPFake;
 import dev.agaminggod.arenaagents.server.perception.PlayerObservationEvents;
+import dev.agaminggod.arenaagents.server.pov.PovMessageRelay;
+import dev.agaminggod.arenaagents.server.pov.PovUiForwarder;
 import io.netty.channel.ChannelFutureListener;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.server.network.ServerCommonPacketListenerImpl;
@@ -15,8 +17,11 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 abstract class PlayerObservationEventsMixin {
 	@Inject(method = "send(Lnet/minecraft/network/protocol/Packet;Lio/netty/channel/ChannelFutureListener;)V", at = @At("HEAD"))
 	private void arenaagents$observeAddressedPacket(Packet<?> packet, ChannelFutureListener listener, CallbackInfo callback) {
-		if ((Object) this instanceof ServerGamePacketListenerImpl connection && connection.player instanceof EntityPlayerMPFake) {
-			PlayerObservationEvents.capture(connection.player, packet);
-		}
+		if (!((Object) this instanceof ServerGamePacketListenerImpl connection)) return;
+		if (connection.player instanceof EntityPlayerMPFake) PlayerObservationEvents.capture(connection.player, packet);
+		// Agent text a takeover operator should see, and the operator's own text to drop broadcasts it already got.
+		PovMessageRelay.observe(connection.player, packet);
+		// Screen data (sign editor, offers, recipe book) the takeover operator's client needs for the agent's body.
+		PovUiForwarder.observe(connection.player, packet);
 	}
 }

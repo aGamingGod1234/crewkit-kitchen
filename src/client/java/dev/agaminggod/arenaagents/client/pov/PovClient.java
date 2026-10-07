@@ -91,6 +91,9 @@ public final class PovClient {
 		if (!ClientPlayNetworking.registerGlobalReceiver(PovStopPayload.TYPE,
 				(payload, context) -> context.client().execute(() -> acceptStop(context.client(), payload))))
 			throw new IllegalStateException("Agent POV stop receiver is already registered");
+		if (!ClientPlayNetworking.registerGlobalReceiver(dev.agaminggod.arenaagents.pov.AgentPovBookPayload.TYPE,
+				(payload, context) -> context.client().execute(() -> PovScreens.openBook(TRACKER.session().orElse(null), payload))))
+			throw new IllegalStateException("Agent POV book receiver is already registered");
 		ClientTickEvents.END_CLIENT_TICK.register(PovClient::tick);
 		ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> client.execute(() -> endLocal(client)));
 		ClientLevelEvents.AFTER_CLIENT_LEVEL_CHANGE.register((client, level) -> {
@@ -152,6 +155,25 @@ public final class PovClient {
 
 	public static boolean isActive() {
 		return TRACKER.session().isPresent();
+	}
+
+	/**
+	 * True when {@code entity} is the operator's own body seen from an agent view: the body stays in the world
+	 * during spectate and takeover, so it is drawn like any other player. A spectator body stays hidden, as it is
+	 * for everyone else.
+	 */
+	/** True while the taken-over agent is asleep, which is when vanilla would show the in-bed screen. */
+	public static boolean agentSleeping() {
+		if (!isTakeover()) return false;
+		AbstractClientPlayer agent = agentPlayer();
+		return agent != null && agent.isSleeping();
+	}
+
+	public static boolean showsOperatorBody(Object entity) {
+		if (!isActive()) return false;
+		Minecraft client = Minecraft.getInstance();
+		return entity != null && entity == client.player && client.getCameraEntity() != client.player
+				&& !client.player.isSpectator();
 	}
 
 	/**

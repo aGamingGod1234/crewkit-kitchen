@@ -39,8 +39,5 @@ abstract class MultiPlayerGameModePovMixin {
 		if (PovScreens.interceptButtonClick(containerId, buttonId)) callback.cancel();
 	}
 
-	@Inject(method = {"handlePlaceRecipe", "handleSlotStateChanged"}, at = @At("HEAD"), cancellable = true)
-	private void arenaagents$dropMirroredMenuPackets(CallbackInfo callback) {
-		if (PovScreens.blocksVanillaMenuPackets()) callback.cancel();
-	}
+	// Recipe placement and crafter toggles reach ClientCommonPacketListenerPovMixin, which relays or drops them.
 }

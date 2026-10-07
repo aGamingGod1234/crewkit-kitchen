@@ -1,7 +1,11 @@
 package dev.agaminggod.arenaagents.client.mixin;
 
+import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
+import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
+import dev.agaminggod.arenaagents.client.pov.PovClient;
 import dev.agaminggod.arenaagents.client.pov.input.OperatorInputSender;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.player.LocalPlayer;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -35,5 +39,15 @@ abstract class MinecraftPovMixin {
 	@Inject(method = "pickBlockOrEntity", at = @At("HEAD"), cancellable = true)
 	private void arenaagents$noOperatorPick(CallbackInfo callback) {
 		if (OperatorInputSender.sessionActive()) callback.cancel();
+	}
+
+	/**
+	 * Vanilla opens the in-bed screen (chat plus Leave Bed) while the local player sleeps and closes it on waking.
+	 * In a takeover the body that sleeps is the agent, so both checks read it; Leave Bed is relayed by
+	 * InBedChatScreenPovMixin.
+	 */
+	@WrapOperation(method = "tick", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/player/LocalPlayer;isSleeping()Z"))
+	private boolean arenaagents$agentInBed(LocalPlayer player, Operation<Boolean> original) {
+		return PovClient.isTakeover() ? PovClient.agentSleeping() : original.call(player);
 	}
 }

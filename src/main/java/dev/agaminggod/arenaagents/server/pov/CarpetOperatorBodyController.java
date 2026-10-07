@@ -7,6 +7,8 @@ import dev.agaminggod.arenaagents.pov.OperatorActionPayload;
 import dev.agaminggod.arenaagents.pov.OperatorBodyController;
 import dev.agaminggod.arenaagents.pov.OperatorBodyControllers;
 import dev.agaminggod.arenaagents.pov.OperatorInputPayload;
+import dev.agaminggod.arenaagents.pov.OperatorTextPayload;
+import dev.agaminggod.arenaagents.pov.OperatorCreativeSlotPayload;
 import dev.agaminggod.arenaagents.server.CodexAgentManager;
 import dev.agaminggod.arenaagents.server.OfflineAgentPlayers;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
@@ -80,12 +82,16 @@ public final class CarpetOperatorBodyController implements OperatorBodyControlle
 	public void applyFrame(OperatorInputPayload payload) {
 		if (!active || payload == null) return;
 		Frame next = Frame.decode(payload, frame);
+		boolean jumpPressed = next.jump() && (frame == null || !frame.jump());
 		keys.onFrame(next);
 		frame = next;
 		lastInputSequence = Math.max(0, payload.sequence());
 		guarded("frame", () -> {
 			ServerPlayer agent = bind();
-			if (agent != null) push(agent);
+			if (agent == null) return;
+			// LocalPlayer.aiStep: a double-tap toggles creative flight first; only an untoggled press may open elytra.
+			if (jumpPressed && !OperatorActionDispatcher.toggleFlight(agent, keys)) OperatorActionDispatcher.jumpPressed(agent);
+			push(agent);
 		});
 	}
 
@@ -101,6 +107,24 @@ public final class CarpetOperatorBodyController implements OperatorBodyControlle
 			if (agent == null) return;
 			OperatorActionDispatcher.dispatch(agent, action, keys, frameOf(agent));
 			push(agent);
+		});
+	}
+
+	@Override
+	public void applyCreativeSlot(OperatorCreativeSlotPayload slot) {
+		if (!active || slot == null) return;
+		guarded("creative slot", () -> {
+			ServerPlayer agent = bind();
+			if (agent != null) OperatorActionDispatcher.creativeSlot(agent, slot.slot(), slot.stack());
+		});
+	}
+
+	@Override
+	public void applyText(OperatorTextPayload text) {
+		if (!active || text == null) return;
+		guarded("text " + text.kind(), () -> {
+			ServerPlayer agent = bind();
+			if (agent != null) OperatorActionDispatcher.text(agent, text);
 		});
 	}
 
@@ -364,7 +388,11 @@ public final class CarpetOperatorBodyController implements OperatorBodyControlle
 
 		enum UseStep { NONE, START, RELEASE }
 
+		/** LocalPlayer.jumpTriggerTime: the second jump press within this many ticks toggles creative flight. */
+		static final int FLIGHT_TOGGLE_TICKS = 7;
+
 		private int rightClickDelay;
+		private int jumpTriggerTime;
 		private int missTicks;
 		private int attackPulse;
 		private int usePulse;
@@ -373,6 +401,7 @@ public final class CarpetOperatorBodyController implements OperatorBodyControlle
 		private boolean sprintRequest;
 
 		void tick() {
+			if (jumpTriggerTime > 0) jumpTriggerTime--;
 			if (rightClickDelay > 0) rightClickDelay--;
 			if (missTicks > 0) missTicks--;
 			if (attackPulse > 0) attackPulse--;
@@ -419,6 +448,20 @@ public final class CarpetOperatorBodyController implements OperatorBodyControlle
 		/** End of a server tick: a held sprint key keeps requesting, a consumed double-tap does not. */
 		void sprintTickEnded(Frame frame) {
 			sprintRequest = frame.sprint();
+		}
+
+		/**
+		 * A jump press while the body may fly. Returns true when it toggles flight: the first press opens the window,
+		 * a second one inside it toggles, as long as the body is not swimming or riding something it cannot jump.
+		 */
+		boolean flightTogglePress(boolean canToggleNow) {
+			if (jumpTriggerTime == 0) {
+				jumpTriggerTime = FLIGHT_TOGGLE_TICKS;
+				return false;
+			}
+			if (!canToggleNow) return false;
+			jumpTriggerTime = 0;
+			return true;
 		}
 
 		boolean attackHeld(Frame frame) {
@@ -471,6 +514,7 @@ public final class CarpetOperatorBodyController implements OperatorBodyControlle
 		}
 
 		void newBody() {
+			jumpTriggerTime = 0;
 			rightClickDelay = 0;
 			missTicks = 0;
 			attackPulse = 0;

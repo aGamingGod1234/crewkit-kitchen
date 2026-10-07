@@ -231,6 +231,7 @@ public final class VerificationMain {
 		passedAssertions += dev.agaminggod.arenaagents.server.perception.ObservationPageVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.perception.PlayerObservationEventsVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.runtime.input.RidingJumpInputVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.runtime.input.VanillaMoveInputVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.runtime.input.UseTickPhaseVerification.verify();
 		passedAssertions += ActionSuccessLedgerVerification.verify();
 		passedAssertions += InputStateVerification.verify();
@@ -286,10 +287,13 @@ public final class VerificationMain {
 		passedAssertions += dev.agaminggod.arenaagents.server.pov.PovSessionVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.pov.DetachedActionReservationVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.pov.OperatorBodyControlVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.pov.PovMessageRelayVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.client.pov.PovClientStateVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.client.pov.PovInputCaptureVerification.verify();
 		verifyJsonLineFraming(codec);
 		passedAssertions += PovContractsVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.pov.PovRelayVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.client.pov.input.PovOutgoingRelayVerification.verify();
 
 		System.out.printf("PASS: %d protocol and core assertions%n", passedAssertions);
 	}

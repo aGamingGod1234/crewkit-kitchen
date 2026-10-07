@@ -1,5 +1,6 @@
 package dev.agaminggod.arenaagents.server.conversation;
 
+import dev.agaminggod.arenaagents.server.pov.PovMessageRelay;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
@@ -264,11 +265,16 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 		String recipientName = Optional.ofNullable(byId.get(event.recipientId()))
 				.map(OnlineParticipant::displayName)
 				.orElse(event.recipientId());
+		// Agent bodies that get their own line; a takeover operator sees that line through the body already.
+		List<java.util.UUID> agentBodies = receipt.deliveredIds().stream().map(byId::get)
+				.filter(participant -> participant != null && participant.agentRecord() != null)
+				.map(participant -> participant.player().getUUID()).toList();
 		for (String deliveredId : receipt.deliveredIds()) {
 			OnlineParticipant participant = byId.get(deliveredId);
 			if (participant == null) continue;
 			boolean mirror = receipt.mirroredOperatorIds().contains(deliveredId);
-			if (deliverToPlayers && !suppressedPlayerIds.contains(participant.player().getUUID().toString())) {
+			boolean seenThroughBody = mirror && PovMessageRelay.relaysAnyTo(participant.player().getUUID(), agentBodies);
+			if (deliverToPlayers && !seenThroughBody && !suppressedPlayerIds.contains(participant.player().getUUID().toString())) {
 				if (event.audience() == ConversationAudience.DIRECT
 						&& !mirror
 						&& participant.agentRecord() == null) {
