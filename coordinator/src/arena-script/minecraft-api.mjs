@@ -20,6 +20,8 @@ export const EXACT_TARGET_ACTIONS = Object.freeze({
 	attack: Object.freeze(['targetId', 'timeoutMs']),
 	pickUpItem: Object.freeze(['targetSelector']),
 	useRanged: ACTION_FIELDS.use_ranged,
+	fightTarget: ACTION_FIELDS.fight_target,
+	fleeFrom: ACTION_FIELDS.flee_from,
 	interactEntity: Object.freeze(['targetId', 'hand', 'expectedItemId']),
 });
 

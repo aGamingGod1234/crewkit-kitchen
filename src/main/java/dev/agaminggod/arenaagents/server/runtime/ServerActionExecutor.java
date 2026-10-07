@@ -15,6 +15,8 @@ import dev.agaminggod.arenaagents.server.perception.ObservationVisibility;
 import dev.agaminggod.arenaagents.server.conversation.ConversationAudience;
 import dev.agaminggod.arenaagents.server.conversation.ServerAgentConversationRouter;
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerController;
+import dev.agaminggod.arenaagents.server.runtime.controller.ServerFightController;
+import dev.agaminggod.arenaagents.server.runtime.controller.ServerFleeController;
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerNavigationController;
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerItemPickupController;
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerLookController;
@@ -84,7 +86,8 @@ public final class ServerActionExecutor {
 			ActionType.CHAT, ActionType.WAIT, ActionType.SET_DOOR, ActionType.PICK_UP_ITEM, ActionType.DROP_ITEM,
 			ActionType.TRANSFER_CONTAINER, ActionType.CRAFT_INVENTORY, ActionType.CRAFT_TABLE,
 			ActionType.FURNACE_TRANSACTION, ActionType.EQUIP_ITEM, ActionType.SELECT_TOOL,
-			ActionType.BLOCK_WITH_SHIELD, ActionType.USE_RANGED, ActionType.RESPAWN
+			ActionType.BLOCK_WITH_SHIELD, ActionType.USE_RANGED, ActionType.RESPAWN,
+			ActionType.FIGHT_TARGET, ActionType.FLEE_FROM
 			, ActionType.INTERACT_BLOCK, ActionType.INTERACT_ENTITY, ActionType.DISMOUNT,
 			ActionType.START_FALL_FLYING, ActionType.MENU_TRANSFER, ActionType.MENU_BUTTON,
 			ActionType.ANVIL_RENAME, ActionType.MENU_CLICK, ActionType.MENU_CLOSE,
@@ -589,6 +592,15 @@ public final class ServerActionExecutor {
 			)));
 			case ATTACK -> ActiveAction.immediate(request, player,
 					() -> attack(player, string(arguments, "targetId")));
+			// Persistent model-chosen combat: the model decides to fight or flee, the controller makes it effective.
+			case FIGHT_TARGET -> ActiveAction.controller(request, player, new ServerFightController(
+					combatTarget(player, string(arguments, "targetId")),
+					arguments.has("desiredRange") ? number(arguments, "desiredRange") : null,
+					arguments.has("fleeAtHealth") ? (float) number(arguments, "fleeAtHealth") : null,
+					integer(arguments, "timeoutMs"), System.currentTimeMillis()));
+			case FLEE_FROM -> ActiveAction.controller(request, player, new ServerFleeController(
+					resolveCombatTarget(player, string(arguments, "targetId")),
+					number(arguments, "distance"), integer(arguments, "timeoutMs"), System.currentTimeMillis()));
 			case SELECT_ITEM -> ActiveAction.immediate(request, player,
 					() -> selectItem(player, string(arguments, "itemId")));
 			case USE_ITEM -> ActiveAction.use(request, player, integer(arguments, "durationMs"),
@@ -1016,6 +1028,35 @@ public final class ServerActionExecutor {
 		}
 		player.attack(target);
 		player.swing(net.minecraft.world.InteractionHand.MAIN_HAND);
+	}
+
+	private net.minecraft.world.entity.LivingEntity combatTarget(ServerPlayer player, String targetId) {
+		Entity target = resolveCombatTarget(player, targetId);
+		if (!(target instanceof net.minecraft.world.entity.LivingEntity living)) {
+			throw new AgentDomainException("TARGET_NOT_LIVING", "fight_target needs a living entity; use attack for multipart hits");
+		}
+		if (target instanceof ServerPlayer targetPlayer && (targetPlayer.isCreative() || targetPlayer.isSpectator())) {
+			throw new AgentDomainException("TARGET_INVULNERABLE", "Creative and spectator players cannot be valid combat targets");
+		}
+		if (!protection.mayInteractWithEntity(player, target)) {
+			throw new AgentDomainException("PROTECTION_DENIED", "Attack was denied");
+		}
+		return living;
+	}
+
+	/**
+	 * Exact UUID like attack, but a reported threat (an enemy targeting, hurting or with sight of the agent within
+	 * 16 blocks) is accepted even outside the view cone: the model must be able to fight or flee what is behind it.
+	 */
+	static Entity resolveCombatTarget(ServerPlayer player, String targetId) {
+		try {
+			return resolveExactObservedTarget(player, targetId);
+		} catch (AgentDomainException hidden) {
+			if (!"TARGET_NOT_VISIBLE".equals(hidden.code())) throw hidden;
+			Entity target = player.level().getEntity(java.util.UUID.fromString(targetId));
+			if (target != null && dev.agaminggod.arenaagents.server.perception.ThreatPerception.isSensedThreat(player, target)) return target;
+			throw hidden;
+		}
 	}
 
 	/** Resolves only the exact UUID supplied from the agent's retained observation. */
@@ -2026,6 +2067,12 @@ public final class ServerActionExecutor {
 					);
 					case FAILED -> result(
 							ServerActionState.FAILED,
+							controllerResult.reasonCode(),
+							controllerResult.message(),
+							now
+					);
+					case TIMED_OUT -> result(
+							ServerActionState.TIMED_OUT,
 							controllerResult.reasonCode(),
 							controllerResult.message(),
 							now

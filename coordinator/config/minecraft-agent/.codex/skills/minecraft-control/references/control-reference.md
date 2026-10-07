@@ -419,6 +419,22 @@ Fields: `targetId`, `timeoutMs`.
 {"tool":"act","arguments":{"actionType":"attack","arguments":{"targetId":"550e8400-e29b-41d4-a716-446655440000","timeoutMs":15000}}}
 ```
 
+### fight_target
+
+Fields: `targetId`, `timeoutMs`, optional `desiredRange` (1..6, default 2.5) and `fleeAtHealth`. You chose to fight: the body selects the best hotbar weapon (sword > axe > other tool), turns, closes to reach, swings only at a full attack charge and steps back after each hit. Results: `TARGET_KILLED`, `TARGET_GONE`, `LOW_HEALTH_BAILOUT` (your fleeAtHealth reached; decide next), `TARGET_UNREACHABLE`, `TARGET_ESCAPED`, or `FIGHT_TIMED_OUT`. The target may be a `player.threat` uuid behind you.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"fight_target","arguments":{"targetId":"550e8400-e29b-41d4-a716-446655440000","timeoutMs":15000,"fleeAtHealth":6}}}
+```
+
+### flee_from
+
+Fields: `targetId`, `distance` (1..64), `timeoutMs`. Sprints away (jumping steps, steering around walls, hazards and deep drops) until at least `distance` away and the target is not closing (`ESCAPED`), it lost you (`TARGET_LOST`), it is gone (`TARGET_GONE`), or `FLEE_TIMED_OUT`. Use this, not navigation, to escape; navigation stops at its point while the mob keeps chasing.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"flee_from","arguments":{"targetId":"550e8400-e29b-41d4-a716-446655440000","distance":12,"timeoutMs":8000}}}
+```
+
 ### select_item
 
 Fields: `itemId`.

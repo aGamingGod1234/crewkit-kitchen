@@ -44,6 +44,8 @@ public final class AttentionSignalPolicy {
 			facts.add("player.lastAttacker");
 		}
 
+		// Threat edges matter during actions too: they exist so the model can react before damage.
+		addNewThreatSignals(facts, threatSignals(previous), threatSignals(current));
 		if (!activeActionWindow && !inventory(previous).equals(inventory(current))) facts.add("inventory");
 		if (newFailure(previous, current)) facts.add("lastResult");
 		if (!Objects.equals(dimension(previous), dimension(current))) facts.add("world.dimension");
@@ -59,6 +61,28 @@ public final class AttentionSignalPolicy {
 			addChanged(facts, "landmarks", previous.get("landmarks"), current.get("landmarks"));
 		}
 		return facts.stream().limit(AttentionFactDelta.MAX_CHANGED_FACTS).toList();
+	}
+
+	/** One fact per newly reported "uuid.signal"; the server latch already debounces flickering signals. */
+	static void addNewThreatSignals(Set<String> facts, Set<String> before, Set<String> after) {
+		for (String signal : after) if (!before.contains(signal)) facts.add("threats." + signal);
+	}
+
+	static Set<String> threatSignals(JsonObject observation) {
+		TreeSet<String> signals = new TreeSet<>();
+		JsonArray entries = array(object(observation, "threats"), "entries");
+		if (entries == null) return signals;
+		for (JsonElement value : entries) {
+			if (!value.isJsonObject()) continue;
+			String uuid = primitiveString(value.getAsJsonObject().get("uuid"));
+			JsonArray names = array(value.getAsJsonObject(), "signals");
+			if (uuid == null || names == null) continue;
+			for (JsonElement name : names) {
+				String signal = primitiveString(name);
+				if (signal != null) signals.add(uuid + "." + signal);
+			}
+		}
+		return signals;
 	}
 
 	private static void addChanged(Set<String> facts, String path, JsonElement before, JsonElement after) {

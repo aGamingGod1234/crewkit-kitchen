@@ -296,6 +296,8 @@ test('every production action type is implemented or terminates with an explicit
 		control_sequence: { frames: [inputFrame], maxTicks: 1 },
 		look_at: { x: 1, y: 1, z: 0 },
 		attack: { targetId: uuid, timeoutMs: 1_000 },
+		fight_target: { targetId: uuid, timeoutMs: 1_000, fleeAtHealth: 6 },
+		flee_from: { targetId: uuid, distance: 8, timeoutMs: 1_000 },
 		select_item: { itemId: 'minecraft:stick' },
 		use_item: { durationMs: 1 },
 		break_block: { x: 1, y: 1, z: 0, expectedBlockId: 'minecraft:stone', timeoutMs: 1_000 },

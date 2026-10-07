@@ -41,6 +41,7 @@ export function adaptObservation(value) {
 	if (Object.hasOwn(playerSource, 'lastAttacker')) player.lastAttacker = attackerFacts(playerSource.lastAttacker);
 	for (const field of ['swimming', 'gliding', 'sprinting', 'crouching', 'onClimbable', 'inLava', 'horizontalCollision', 'verticalCollision', 'passenger']) copyBoolean(playerSource, player, field);
 	copyExtensions(playerSource, player, ['pose', 'vehicle']);
+	Object.assign(player, threatFacts(source.threats));
 
 	const entities = boundedDataArray(source.entities, 'entities', MAX_ENTITIES)
 		.map((value, index) => entityFacts(value, index));
@@ -115,8 +116,39 @@ function entityFacts(value, index) {
 		result.itemId = identifier(source.itemId, `entities[${index}].itemId`);
 		result.count = positiveInteger(source.count, `entities[${index}].count`);
 	}
-	copyExtensions(source, result, ['velocity', 'yaw', 'pitch', 'pose', 'bounds', 'equipment', 'usingItem', 'onFire', 'pickable', 'parentId', 'partName']);
+	copyExtensions(source, result, ['velocity', 'yaw', 'pitch', 'pose', 'bounds', 'equipment', 'usingItem', 'onFire', 'pickable', 'parentId', 'partName',
+		'alive', 'hostile', 'health', 'maxHealth', 'targetingAgent', 'swelling', 'fuse', 'perceivedBy']);
 	return result;
+}
+
+const THREAT_URGENCY = Object.freeze({ swelling: 3, creeper_close: 2, targeting: 1, ranged_sight: 1 });
+
+/**
+ * Server-sensed threats as player facts so watcher conditions can read them directly:
+ * player.state().threats (nearest first), player.state().threat (the most urgent, or null) and
+ * player.state().bestWeapon ({ slot, itemId } or null). Always present, so conditions never hit a missing member.
+ */
+export function threatFacts(value) {
+	if (value === undefined) return { threats: [], threat: null, bestWeapon: null };
+	const source = ownDataRecord(value, 'wire observation.threats');
+	const threats = boundedDataArray(source.entries, 'threats.entries', 8).map((entry, index) => {
+		const row = ownDataRecord(entry, `threats.entries[${index}]`);
+		const signals = boundedDataArray(row.signals, `threats.entries[${index}].signals`, 4).map((signal) => identifier(signal, 'threat signal'));
+		return {
+			stableId: identifier(row.uuid, 'threat uuid'), uuid: identifier(row.uuid, 'threat uuid'), type: identifier(row.type, 'threat type'),
+			distance: finiteNumber(row.distance, 'threat distance'), bearing: finiteNumber(row.bearing, 'threat bearing'),
+			targeting: boolean(row.targeting, 'threat targeting'), swelling: boolean(row.swelling, 'threat swelling'),
+			lineOfSight: boolean(row.lineOfSight, 'threat lineOfSight'), signals,
+		};
+	}).sort((left, right) => left.distance - right.distance);
+	const urgency = (threat) => Math.max(0, ...threat.signals.map((signal) => THREAT_URGENCY[signal] ?? 0));
+	const threat = threats.reduce((best, next) => best === null || urgency(next) > urgency(best) ? next : best, null);
+	const weapon = source.bestWeapon === undefined ? null : ownDataRecord(source.bestWeapon, 'threats.bestWeapon');
+	return {
+		threats,
+		threat,
+		bestWeapon: weapon === null ? null : { slot: nonNegativeInteger(weapon.slot, 'bestWeapon.slot'), itemId: identifier(weapon.itemId, 'bestWeapon.itemId') },
+	};
 }
 
 function blockFacts(value, index) {

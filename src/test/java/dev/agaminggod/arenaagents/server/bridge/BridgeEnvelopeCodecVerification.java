@@ -69,11 +69,11 @@ public final class BridgeEnvelopeCodecVerification {
 		expectFailure(() -> MultiplexedServerBridge.decodeActionRequest(new BridgeEnvelope(
 				2, "server-instance", "00000000-0000-0000-0000-000000000001", "action_command", "message-3", missingProvenance
 		)), "MISSING_FIELD");
-		JsonObject fightArguments = new JsonObject();
-		fightArguments.addProperty("targetSelector", "nearest_hostile");
-		fightArguments.addProperty("desiredRange", 2.5D);
-		fightArguments.addProperty("timeoutMs", 5_000L);
-		JsonObject fightPayload = actionPayload("fight-1", ActionType.FIGHT_TARGET.wireName(), fightArguments);
+		JsonObject followArguments = new JsonObject();
+		followArguments.addProperty("targetSelector", "player:Lucas");
+		followArguments.addProperty("distance", 3.0D);
+		followArguments.addProperty("timeoutMs", 5_000L);
+		JsonObject fightPayload = actionPayload("follow-1", ActionType.FOLLOW_ENTITY.wireName(), followArguments);
 		expectFailure(() -> MultiplexedServerBridge.decodeActionRequest(new BridgeEnvelope(
 				2, "server-instance", "00000000-0000-0000-0000-000000000001", "action_command", "message-2", fightPayload
 		)), "UNSUPPORTED_ARENA_SCRIPT_ACTION");

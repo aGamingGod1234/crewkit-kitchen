@@ -11,7 +11,9 @@ public interface ServerController {
 	enum State {
 		RUNNING,
 		SUCCEEDED,
-		FAILED
+		FAILED,
+		/** The requested duration ran out before the controller's goal; reported as a TIMED_OUT action. */
+		TIMED_OUT
 	}
 
 	record TickResult(State state, String reasonCode, String message, double progress) {
@@ -34,6 +36,10 @@ public interface ServerController {
 
 		public static TickResult failed(String reasonCode, String message, double progress) {
 			return new TickResult(State.FAILED, reasonCode, message, progress);
+		}
+
+		public static TickResult timedOut(String reasonCode, String message, double progress) {
+			return new TickResult(State.TIMED_OUT, reasonCode, message, progress);
 		}
 	}
 }

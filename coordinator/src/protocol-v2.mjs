@@ -140,7 +140,10 @@ const TRUSTED_PAYLOAD_TYPES = new WeakMap();
 const PLAYER_DETAIL_FIELDS = ['pose', 'swimming', 'gliding', 'sprinting', 'crouching', 'onClimbable', 'inLava', 'horizontalCollision', 'verticalCollision', 'passenger', 'vehicle'];
 const STACK_DETAIL_FIELDS = ['displayName', 'fingerprint', 'maxStackSize', 'tooltip', 'tooltipTruncated'];
 const MENU_STACK_DETAIL_FIELDS = ['damage', 'maxDamage', ...STACK_DETAIL_FIELDS];
-const ENTITY_DETAIL_FIELDS = ['velocity', 'yaw', 'pitch', 'pose', 'bounds', 'equipment', 'usingItem', 'onFire', 'pickable', 'parentId', 'partName'];
+const ENTITY_DETAIL_FIELDS = ['velocity', 'yaw', 'pitch', 'pose', 'bounds', 'equipment', 'usingItem', 'onFire', 'pickable', 'parentId', 'partName',
+	'alive', 'hostile', 'health', 'maxHealth', 'targetingAgent', 'swelling', 'fuse', 'perceivedBy'];
+const THREAT_SIGNALS = new Set(['targeting', 'swelling', 'creeper_close', 'ranged_sight']);
+const MAX_THREAT_ENTRIES = 8;
 const BLOCK_DETAIL_FIELDS = ['state', 'bounds', 'boundsTruncated', 'replaceable', 'fluid'];
 const MENU_DETAIL_FIELDS = ['containerId', 'stateId', 'slotCount', 'offset', 'hasMore', 'details'];
 
@@ -1770,7 +1773,7 @@ function observedDetails(value, field, depth = 0) {
 }
 
 function normalizeObservation(value) {
-	const allowed = ['goalRevision', 'observedAtEpochMs', 'ready', 'status', 'eventSequence', 'attention', 'changedFacts', 'position', 'velocity', 'view', 'player', 'inventory', 'entities', 'blocks', 'landmarks', 'nearbyContainers', 'world', 'currentAction', 'lastResult', 'interaction', 'coverage', 'perception'];
+	const allowed = ['goalRevision', 'observedAtEpochMs', 'ready', 'status', 'eventSequence', 'attention', 'changedFacts', 'position', 'velocity', 'view', 'player', 'inventory', 'entities', 'blocks', 'landmarks', 'nearbyContainers', 'world', 'currentAction', 'lastResult', 'interaction', 'coverage', 'perception', 'threats'];
 	exactKeys(value, allowed, ['goalRevision', 'observedAtEpochMs', 'ready', 'status'], 'observation');
 	const normalized = {
 		goalRevision: revision(value.goalRevision, 'goalRevision'),
@@ -1786,7 +1789,7 @@ function normalizeObservation(value) {
 		if (normalized.attention === false && normalized.changedFacts?.length > 0) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Non-attention observation cannot contain changed facts');
 		return normalized;
 	}
-	for (const key of allowed.slice(4).filter((field) => !['interaction', 'landmarks', 'coverage', 'perception'].includes(field))) if (!Object.hasOwn(value, key)) throw new ProtocolV2Error('MISSING_FIELD', `observation field '${key}' is required when ready`);
+	for (const key of allowed.slice(4).filter((field) => !['interaction', 'landmarks', 'coverage', 'perception', 'threats'].includes(field))) if (!Object.hasOwn(value, key)) throw new ProtocolV2Error('MISSING_FIELD', `observation field '${key}' is required when ready`);
 	normalized.eventSequence = positiveInteger(value.eventSequence, 'eventSequence');
 	normalized.attention = boolean(value.attention, 'attention');
 	normalized.changedFacts = changedFactPaths(value.changedFacts);
@@ -1806,7 +1809,33 @@ function normalizeObservation(value) {
 	if (value.interaction !== undefined) normalized.interaction = interactionObservation(value.interaction);
 	if (value.coverage !== undefined) normalized.coverage = observedDetails(value.coverage, 'coverage');
 	if (value.perception !== undefined) normalized.perception = perceptionObservation(value.perception);
+	if (value.threats !== undefined) normalized.threats = threatsObservation(value.threats);
 	return normalized;
+}
+
+/** Server-sensed threats (latched signals) plus the best hotbar weapon, present only while something threatens. */
+function threatsObservation(value) {
+	exactKeys(value, ['entries', 'bestWeapon'], ['entries'], 'threats');
+	const entries = boundedArray(value.entries, 'threats.entries', MAX_THREAT_ENTRIES).map((entry, index) => {
+		const field = `threats.entries[${index}]`;
+		const keys = ['uuid', 'type', 'distance', 'bearing', 'targeting', 'swelling', 'lineOfSight', 'signals'];
+		exactKeys(entry, keys, keys, field);
+		const signals = boundedArray(entry.signals, `${field}.signals`, THREAT_SIGNALS.size).map((signal) => {
+			if (!THREAT_SIGNALS.has(signal)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}.signals contains an unknown signal`);
+			return signal;
+		});
+		return {
+			uuid: requireIdentifier(entry.uuid, `${field}.uuid`), type: requireIdentifier(entry.type, `${field}.type`),
+			distance: finiteNumber(entry.distance, `${field}.distance`), bearing: finiteNumber(entry.bearing, `${field}.bearing`),
+			targeting: boolean(entry.targeting, `${field}.targeting`), swelling: boolean(entry.swelling, `${field}.swelling`),
+			lineOfSight: boolean(entry.lineOfSight, `${field}.lineOfSight`), signals,
+		};
+	});
+	if (value.bestWeapon === undefined) return { entries };
+	exactKeys(value.bestWeapon, ['slot', 'itemId'], ['slot', 'itemId'], 'threats.bestWeapon');
+	const slot = nonnegativeInteger(value.bestWeapon.slot, 'threats.bestWeapon.slot');
+	if (slot > 8) throw new ProtocolV2Error('INVALID_PAYLOAD', 'threats.bestWeapon.slot must be a hotbar slot');
+	return { entries, bestWeapon: { slot, itemId: requireIdentifier(value.bestWeapon.itemId, 'threats.bestWeapon.itemId') } };
 }
 
 function perceptionObservation(value) {
@@ -1969,6 +1998,7 @@ function isFactualChangedPath(path) {
 	if (path === 'world.dimension') return true;
 	if (path.startsWith('player.')) return FACTUAL_PLAYER_FIELDS.has(path.slice('player.'.length));
 	if (/^entities\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(path)) return true;
+	if (/^threats\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(?:targeting|swelling|creeper_close|ranged_sight)$/i.test(path)) return true;
 	return /^blocks\.-?\d+,-?\d+,-?\d+$/.test(path);
 }
 

@@ -194,7 +194,7 @@ public final class ServerActionExecutorVerification {
 				case CONTROL, MOVE_TO, NAVIGATE_TO, LOOK_AT, ATTACK, SELECT_ITEM, USE_ITEM, BREAK_BLOCK, PLACE_BLOCK, PICK_UP_ITEM,
 						CHAT, WAIT, SET_DOOR, DROP_ITEM, TRANSFER_CONTAINER, CRAFT_INVENTORY, CRAFT_TABLE,
 						FURNACE_TRANSACTION, EQUIP_ITEM, SELECT_TOOL, BLOCK_WITH_SHIELD, USE_RANGED,
-						INTERACT_BLOCK, INTERACT_ENTITY, DISMOUNT, START_FALL_FLYING -> true;
+						INTERACT_BLOCK, INTERACT_ENTITY, DISMOUNT, START_FALL_FLYING, FIGHT_TARGET, FLEE_FROM -> true;
 				case MENU_TRANSFER, MENU_BUTTON, ANVIL_RENAME, MENU_CLICK, MENU_CLOSE,
 						CONTROL_SEQUENCE, WAKE_UP, SET_FLIGHT, WRITE_SIGN, EDIT_BOOK, BEACON_EFFECTS -> true;
 				case RESPAWN -> true;
@@ -205,8 +205,6 @@ public final class ServerActionExecutorVerification {
 		}
 		for (ActionType retired : List.of(
 				ActionType.BUILD_SEQUENCE,
-				ActionType.FIGHT_TARGET,
-				ActionType.FLEE_FROM,
 				ActionType.FOLLOW_ENTITY
 		)) {
 			assertThrows(AgentDomainException.class, () -> ServerActionExecutor.requireArenaScriptPrimitive(retired),

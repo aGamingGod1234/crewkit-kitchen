@@ -8,7 +8,7 @@ import { validateProgramParameters } from '../program-parameters.mjs';
 const ORDINARY_PRIORITY = 'ordinary';
 const URGENT_PRIORITY = 'urgent';
 const DEFAULT_ATTENTION_TRIGGER = 'attention';
-const SURVIVAL_TRIGGERS = new Set(['damage', 'lava', 'fire', 'suffocation', 'fall']);
+const SURVIVAL_TRIGGERS = new Set(['damage', 'threat', 'lava', 'fire', 'suffocation', 'fall']);
 
 /** Runs one provenanced ArenaScript program without adding gameplay decisions. */
 export class ArenaScriptEngine {
@@ -66,6 +66,9 @@ export class ArenaScriptEngine {
 		// The agent can waive repeated ordinary perception during a chosen leg.
 		// All fresh facts and watcher edges above remain live; urgency bypasses it.
 		const survival = priority === URGENT_PRIORITY && SURVIVAL_TRIGGERS.has(trigger);
+		// A threat is treated like damage: the model is always notified, because the server latch raises each
+		// signal once. A watcher that already reacted keeps its handler's fight/flee running (#requestModel never
+		// suspends a watcher-owned action); an unhandled threat pauses the routine.
 		if (attention && (edges === 0 || survival) && (priority === URGENT_PRIORITY || this.#vm.shouldReassess(this.#facts))) this.#requestModel(null, { priority, trigger });
 		this.#requestExhaustedContinuation();
 		return this.snapshot();

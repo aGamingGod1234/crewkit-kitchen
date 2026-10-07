@@ -233,6 +233,8 @@ public final class VerificationMain {
 		passedAssertions += ActionSuccessLedgerVerification.verify();
 		passedAssertions += InputStateVerification.verify();
 		passedAssertions += AttentionHazardVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.perception.ThreatAttentionVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.runtime.controller.CombatPlanningVerification.verify();
 		passedAssertions += MenuCapabilityRegistryVerification.verify();
 		passedAssertions += VoiceSubsystemVerification.verify();
 		passedAssertions += VoiceDirectorVerification.verify();
@@ -379,8 +381,8 @@ public final class VerificationMain {
 		assertDecodedType(codec, "pick_up_item", "\"targetSelector\":\"minecraft:item\"", ActionType.PICK_UP_ITEM);
 		assertDecodedType(codec, "drop_item", "\"slot\":0,\"count\":1", ActionType.DROP_ITEM);
 		assertDecodedType(codec, "navigate_to", "\"x\":10,\"y\":64,\"z\":-5,\"tolerance\":1.25,\"sprint\":true,\"timeoutMs\":30000", ActionType.NAVIGATE_TO);
-		assertDecodedType(codec, "fight_target", "\"targetSelector\":\"nearest_hostile\",\"desiredRange\":2.5,\"timeoutMs\":15000", ActionType.FIGHT_TARGET);
-		assertDecodedType(codec, "flee_from", "\"targetSelector\":\"last_attacker\",\"distance\":16,\"timeoutMs\":10000", ActionType.FLEE_FROM);
+		assertDecodedType(codec, "fight_target", "\"targetId\":\"00000000-0000-0000-0000-000000000001\",\"desiredRange\":2.5,\"fleeAtHealth\":6,\"timeoutMs\":15000", ActionType.FIGHT_TARGET);
+		assertDecodedType(codec, "flee_from", "\"targetId\":\"00000000-0000-0000-0000-000000000001\",\"distance\":16,\"timeoutMs\":10000", ActionType.FLEE_FROM);
 		assertDecodedType(codec, "follow_entity", "\"targetSelector\":\"player:Lucas\",\"distance\":3,\"timeoutMs\":30000", ActionType.FOLLOW_ENTITY);
 		assertDecodedType(codec, "interact_block", "\"x\":1,\"y\":64,\"z\":-2,\"face\":\"north\",\"hand\":\"main\",\"expectedItemId\":\"minecraft:air\"", ActionType.INTERACT_BLOCK);
 		assertDecodedType(codec, "interact_entity", "\"targetId\":\"00000000-0000-0000-0000-000000000001\",\"hand\":\"off\",\"expectedItemId\":\"minecraft:lead\"", ActionType.INTERACT_ENTITY);
