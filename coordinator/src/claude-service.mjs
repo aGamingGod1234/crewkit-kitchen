@@ -6,8 +6,9 @@ import path from 'node:path';
 
 import { terminateChildProcess } from './child-process-lifecycle.mjs';
 import { ClaudeToolServer } from './claude-tool-server.mjs';
-import { goalSpecInstructions, nativeInstructions, nativeRecoveryInstructions, recoveryInstructions } from './codex-service.mjs';
+import { goalSpecInstructions, nativeInstructions, nativeRecoveryInstructions, presentNativeToolResult, recoveryInstructions } from './codex-service.mjs';
 import { parseDecision } from './decision-parser.mjs';
+import { ModelObservationViews, encodeNativeEventInput } from './model-fact-encoding.mjs';
 import { NATIVE_AGENT_INSTRUCTIONS, normalizeMinecraftToolCall, toolResultContent } from './native-minecraft-tools.mjs';
 import { PLANNER_OUTPUT_SCHEMA, PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
 import { DIRECTLY_SPAWNABLE_WINDOWS_EXTENSIONS, createProviderChildEnvironment, environmentValue, findExecutableOnPath, findNpmEntrypointBesideShim } from './provider-environment.mjs';
@@ -35,6 +36,18 @@ const DEFAULT_STDERR_LIMIT_BYTES = 64 * 1_024;
 const MAX_PUBLIC_AGENT_MESSAGE_CHARS = 1_280;
 // Claude Code would otherwise apply its own MCP timeout to long-running tools such as runProgram.
 const MCP_TOOL_TIMEOUT_MS = '600000';
+// Every model call re-reads the whole conversation. Past this many context tokens the next turn starts a
+// fresh Claude Code session (same system prompt and tools, so the cached prefix is reused) with a short
+// carry-over of recent actions; each event already restates the goal, task memory, facts and program state.
+const DEFAULT_CONTEXT_ROTATION_TOKENS = 64_000;
+// Hysteresis: a fresh session whose first turns already pass the threshold (large tool results) must not thrash.
+const MIN_TURNS_BETWEEN_ROTATIONS = 3;
+const CARRY_OVER_TOOL_CALLS = 10;
+const CARRY_OVER_CONVERSATION = 6;
+// Streamed token events renew liveness at most this often.
+const STREAM_PROGRESS_INTERVAL_MS = 1_000;
+// Claude Code builds without --include-partial-messages; recorded when one rejects the flag.
+const PARTIAL_MESSAGES_UNSUPPORTED = new Set();
 
 /**
  * Tool names, instructions, and the dedicated Minecraft workspace are the same ones
@@ -321,6 +334,24 @@ class ClaudeAgent {
 	#disposed = false;
 	#invalidationError = null;
 	#turnSequence = 0;
+	#observationViews = new ModelObservationViews();
+	// Token accounting across this agent's Claude Code sessions (rotation keeps one running total).
+	#usage = { calls: 0, input: 0, cacheRead: 0, cacheWrite: 0, output: 0, costUsd: 0 };
+	#calls = new Map();
+	#currentCallId = null;
+	#requestAt = null;
+	#lastContextTokens = 0;
+	#rotationDue = false;
+	#rotations = 0;
+	#turnsSinceRotation = 0;
+	#pendingCarryOver = null;
+	#processUsed = false;
+	#processCostUsd = 0;
+	#lastStreamProgressAt = 0;
+	#recentTools = [];
+	#recentConversation = [];
+	#lastProgram = null;
+	#lastAgentText = null;
 
 	constructor(profile, { config, cwd, controlProtocol, systemPromptFile, toolServer, spawn, terminate, fs, schedule, cancelSchedule, sessionGeneration, resetReason, onInvalidated }) {
 		this.#profile = structuredClone(profile);
@@ -406,6 +437,7 @@ class ClaudeAgent {
 			onProgress,
 			silence,
 			toolCalls: 0,
+			usage: { calls: 0, input: 0, cacheRead: 0, cacheWrite: 0, output: 0, costUsd: null },
 			publishedMessage: false,
 			pendingSteers: [],
 			tail: Promise.resolve(),
@@ -420,8 +452,17 @@ class ClaudeAgent {
 			void this.interrupt().catch(() => {});
 		};
 		signal?.addEventListener('abort', abort, { once: true });
+		let completed = false;
 		try {
-			this.#writeUserMessage(input);
+			// Same compact fact encoding Codex receives; the observe tool description documents it.
+			const encoded = encodeNativeEventInput(input, this.#observationViews);
+			const carryOver = this.#pendingCarryOver;
+			this.#writeUserMessage(carryOver === null ? encoded : `${carryOver}
+
+${encoded}`);
+			this.#pendingCarryOver = null;
+			this.#processUsed = true;
+			this.#noteEventFacts(input);
 			this.#awaitingResult += 1;
 			silence.restart();
 			const result = await Promise.race([turnPromise, silence.promise]);
@@ -429,14 +470,19 @@ class ClaudeAgent {
 				throw new ClaudeProviderError('STALE_PLAN', 'Claude native turn belongs to an obsolete goal revision');
 			}
 			this.#sessionState = 'warm';
+			this.#turnsSinceRotation += 1;
+			completed = true;
 			return result;
 		} catch (error) {
+			this.#observationViews.forgetEventMetadata();
 			if (error?.code === 'PLANNING_TIMEOUT') await this.interrupt().catch(() => {});
 			throw error;
 		} finally {
 			signal?.removeEventListener('abort', abort);
 			silence.dispose();
 			if (this.#active === active) this.#active = null;
+			// Rotate right after a finished turn, off the next event's critical path, and prewarm the new session.
+			if (completed) this.#rotateAfterTurn();
 		}
 	}
 
@@ -570,6 +616,7 @@ class ClaudeAgent {
 	}
 
 	async #startProcess() {
+		this.#resetContextState();
 		let resolveListed;
 		this.#toolsListed = { promise: new Promise((resolve) => { resolveListed = resolve; }), resolve: () => resolveListed() };
 		void this.#toolsListed.promise.catch(() => {});
@@ -626,10 +673,16 @@ class ClaudeAgent {
 
 	#onMessage(message) {
 		const active = this.#active;
-		if (active !== null && !active.settled) {
+		const now = Date.now();
+		// Token deltas arrive many times a second; renewing timers and leases for each one is wasted work.
+		const renew = message?.type !== 'stream_event' || now - this.#lastStreamProgressAt >= STREAM_PROGRESS_INTERVAL_MS;
+		if (active !== null && !active.settled && renew) {
+			this.#lastStreamProgressAt = now;
 			active.silence.restart();
 			try { active.onProgress?.({ phase: 'provider' }); } catch { /* progress reporting cannot fail provider work */ }
 		}
+		if (message?.type === 'stream_event') { this.#onStreamEvent(message.event); return; }
+		if (message?.type === 'assistant') this.#noteAssistantUsage(message.message);
 		if (message?.type === 'system' && message.subtype === 'init') {
 			if (typeof message.session_id === 'string') this.#sessionId = message.session_id;
 			if (typeof message.model === 'string' && message.model.length > 0 && message.model.length <= 256) {
@@ -642,6 +695,7 @@ class ClaudeAgent {
 			const text = (Array.isArray(message.message?.content) ? message.message.content : [])
 				.filter((block) => block?.type === 'text' && typeof block.text === 'string').map((block) => block.text).join('\n').trim();
 			if (text.length > 0) {
+				this.#lastAgentText = text.slice(0, 400);
 				active.publishedMessage = true;
 				safeVerbose(active.onVerbose, 'agent_message', text.slice(0, MAX_PUBLIC_AGENT_MESSAGE_CHARS));
 			}
@@ -649,12 +703,26 @@ class ClaudeAgent {
 		}
 		if (message?.type !== 'result') return;
 		if (typeof message.session_id === 'string') this.#sessionId = message.session_id;
+		this.#finishCalls();
+		// In streaming input mode total_cost_usd is the running total for this Claude Code process.
+		if (Number.isFinite(message.total_cost_usd) && message.total_cost_usd >= 0) {
+			const delta = message.total_cost_usd >= this.#processCostUsd ? message.total_cost_usd - this.#processCostUsd : message.total_cost_usd;
+			this.#processCostUsd = message.total_cost_usd;
+			this.#usage.costUsd += delta;
+			if (active !== null) active.usage.costUsd = (active.usage.costUsd ?? 0) + delta;
+		}
+		// Per-step assistant output_tokens are placeholders; the result's usage covers this turn's real output.
+		const turnOutput = message.usage?.output_tokens;
+		if (active !== null && Number.isSafeInteger(turnOutput) && turnOutput >= 0) {
+			this.#usage.output += turnOutput - active.usage.output;
+			active.usage.output = turnOutput;
+		}
 		if (this.#awaitingResult > 0) this.#awaitingResult -= 1;
 		if (this.#awaitingResult === 0) for (const resolve of this.#idleWaiters.splice(0)) resolve();
 		if (active === null || active.settled) return;
 		if (message.subtype === 'success' && message.is_error !== true) {
 			// Tool responses are returned before Claude Code continues, but drain the queue defensively.
-			void active.tail.then(() => active.resolve({ status: 'completed', toolCalls: active.toolCalls }));
+			void active.tail.then(() => active.resolve({ status: 'completed', toolCalls: active.toolCalls, ...(active.usage.calls === 0 && active.usage.costUsd === null ? {} : { usage: { ...active.usage, contextTokens: this.#lastContextTokens } }) }));
 			return;
 		}
 		active.reject(new ClaudeProviderError(resultErrorCode(message) ?? 'TURN_FAILED',
@@ -671,6 +739,7 @@ class ClaudeAgent {
 			if (active.settled) return toolResultContent({ state: 'FAILED', reasonCode: 'TURN_NOT_ACTIVE', message: 'The Minecraft turn already ended.' }, false);
 			active.silence.pause();
 			let content;
+			let commit = () => {};
 			try {
 				const tool = normalizeMinecraftToolCall(name, args);
 				const result = await active.executeTool({
@@ -681,8 +750,14 @@ class ClaudeAgent {
 					callId: toolUseId,
 					tool,
 				});
-				content = toolResultContent(result);
+				// Same compact fact encoding and observation views Codex receives.
+				const presented = presentNativeToolResult(result, tool, this.#observationViews);
+				content = presented.response;
+				commit = presented.commit;
+				this.#rememberTool(name, args, result);
+				this.#noteProgram(result);
 			} catch (error) {
+				this.#rememberTool(name, args, { state: 'FAILED', reasonCode: error?.code ?? 'TOOL_EXECUTION_FAILED' });
 				content = toolResultContent({
 					state: 'FAILED',
 					reasonCode: String(error?.code ?? 'TOOL_EXECUTION_FAILED').slice(0, 128),
@@ -692,7 +767,14 @@ class ClaudeAgent {
 			} finally {
 				active.silence.resume();
 			}
-			return deliverSteers(active, content);
+			const delivered = deliverSteers(active, content, (text) => {
+				this.#noteEventFacts(text);
+				return encodeNativeEventInput(text, this.#observationViews);
+			});
+			// A settled (interrupted or aborted) turn may never show this result to the model.
+			if (!active.settled) commit();
+			this.#requestAt = Date.now();
+			return delivered;
 		};
 		// Codex executes one Minecraft tool at a time; parallel Claude tool calls are serialized the same way.
 		const task = active.tail.then(run, run);
@@ -700,8 +782,136 @@ class ClaudeAgent {
 		return mcpContent(await task);
 	}
 
+	/** Starts and prewarms a fresh Claude Code session after a finished turn once the context has grown past the threshold. */
+	#rotateAfterTurn() {
+		if (!this.#rotationDue || this.#turnsSinceRotation < MIN_TURNS_BETWEEN_ROTATIONS) return;
+		if (this.#process === null || this.#active !== null || this.#awaitingResult > 0 || this.#disposed) return;
+		const carryOver = this.#carryOver('Session refreshed to keep context small');
+		this.#rotations += 1;
+		void this.#stopProcess().then(() => {
+			// The previous session's views and baselines are gone with it (see #releaseProcessState).
+			this.#pendingCarryOver = carryOver;
+			if (this.#disposed || this.#invalidationError !== null) return undefined;
+			return this.#ensureProcess();
+		}).catch(() => {});
+	}
+
+	#carryOver(reason) {
+		const lines = this.#recentTools.map((entry) => `- ${entry}`);
+		return [
+			`${reason}: your earlier turns are not shown. The event below restates your goal, task memory and facts; read taskPlan, programStatus, queryMemory or taskMemory for anything else.`,
+			...(lines.length === 0 ? [] : ['Your most recent tool calls (oldest first):', ...lines]),
+			...(this.#recentConversation.length === 0 ? [] : ['Recent conversation already delivered to you (oldest first):', ...this.#recentConversation.map((entry) => `- ${entry}`)]),
+			...(this.#lastProgram === null ? [] : [`Last known program (verify with programStatus): ${JSON.stringify(this.#lastProgram)}`]),
+			...(this.#lastAgentText === null ? [] : [`Your last note: ${JSON.stringify(this.#lastAgentText)}`]),
+		].join('\n');
+	}
+
+	/** Remembers delivered conversation and program state from a native event for a later carry-over. */
+	#noteEventFacts(text) {
+		const separator = text.indexOf('\n');
+		if (separator < 0) return;
+		const lineEnd = text.indexOf('\n', separator + 1);
+		let value;
+		try { value = JSON.parse(text.slice(separator + 1, lineEnd < 0 ? text.length : lineEnd)); } catch { return; }
+		for (const entry of Array.isArray(value?.conversation?.entries) ? value.conversation.entries : []) {
+			const speaker = typeof entry?.sourceName === 'string' ? entry.sourceName : typeof entry?.sourceId === 'string' ? entry.sourceId : entry?.kind ?? 'message';
+			if (typeof entry?.text !== 'string') continue;
+			this.#recentConversation.push(`${truncate(String(speaker), 48)}: ${truncate(entry.text, 200)}`);
+		}
+		if (this.#recentConversation.length > CARRY_OVER_CONVERSATION) this.#recentConversation.splice(0, this.#recentConversation.length - CARRY_OVER_CONVERSATION);
+		if (value?.program !== null && typeof value?.program === 'object') this.#noteProgram(value.program);
+	}
+
+	#noteProgram(value) {
+		if (value === null || typeof value !== 'object' || typeof value.programId !== 'string') return;
+		const decision = value.decision ?? value.status?.decision;
+		this.#lastProgram = {
+			programId: value.programId,
+			...(typeof value.state === 'string' ? { state: value.state } : {}),
+			...(typeof value.engineState === 'string' ? { engineState: value.engineState } : {}),
+			...(typeof decision?.decisionId === 'string' ? { pendingDecisionId: decision.decisionId, trigger: decision.trigger } : {}),
+		};
+	}
+
+	#rememberTool(name, args, result) {
+		const argsText = truncate(JSON.stringify(args ?? {}), 160);
+		const outcome = [result?.state, result?.reasonCode].filter((value) => typeof value === 'string').join(' ');
+		this.#recentTools.push(`${name} ${argsText} -> ${outcome || 'returned'}`);
+		if (this.#recentTools.length > CARRY_OVER_TOOL_CALLS) this.#recentTools.splice(0, this.#recentTools.length - CARRY_OVER_TOOL_CALLS);
+	}
+
+	/** --include-partial-messages: message_start is the first streamed event (after prefill), message_stop ends generation. */
+	#onStreamEvent(event) {
+		const id = event?.message?.id;
+		if (event?.type === 'message_start' && typeof id === 'string') {
+			this.#currentCallId = id;
+			const call = this.#call(id);
+			call.firstEventAt ??= Date.now();
+			mergeUsage(call.usage, event.message.usage);
+			return;
+		}
+		const call = this.#currentCallId === null ? undefined : this.#calls.get(this.#currentCallId);
+		if (call === undefined) return;
+		if (event?.type === 'message_delta') mergeUsage(call.usage, event.usage);
+		else if (event?.type === 'message_stop') this.#finishCall(call);
+	}
+
+	/** Without partial messages each API call still arrives as assistant messages sharing one message id. */
+	#noteAssistantUsage(message) {
+		if (typeof message?.id !== 'string') return;
+		const call = this.#call(message.id);
+		call.firstEventAt ??= Date.now();
+		mergeUsage(call.usage, message.usage);
+	}
+
+	#call(id) {
+		let call = this.#calls.get(id);
+		if (call === undefined) {
+			call = { id, requestAt: this.#requestAt, firstEventAt: null, usage: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 }, done: false };
+			this.#calls.set(id, call);
+		}
+		return call;
+	}
+
+	#finishCalls() {
+		for (const call of this.#calls.values()) this.#finishCall(call);
+		this.#calls.clear();
+		this.#currentCallId = null;
+	}
+
+	#finishCall(call) {
+		if (call.done) return;
+		call.done = true;
+		const endedAt = Date.now();
+		const { input, cacheRead, cacheWrite, output } = call.usage;
+		const contextTokens = input + cacheRead + cacheWrite;
+		this.#lastContextTokens = contextTokens;
+		const rotationTokens = this.#config.contextRotationTokens;
+		if (rotationTokens > 0 && contextTokens >= rotationTokens) this.#rotationDue = true;
+		addUsage(this.#usage, call.usage);
+		const active = this.#active;
+		if (active === null) return;
+		addUsage(active.usage, call.usage);
+		const total = this.#usage;
+		const requestAt = call.requestAt;
+		safeVerbose(active.onVerbose, 'live_usage', JSON.stringify({
+			inputTokens: total.input + total.cacheRead + total.cacheWrite, cachedInputTokens: total.cacheRead, cacheWriteInputTokens: total.cacheWrite,
+			outputTokens: total.output, totalTokens: total.input + total.cacheRead + total.cacheWrite + total.output,
+			threadId: `claude:${this.agentId}:${this.#sessionGeneration}`, reportedAtEpochMs: endedAt,
+			last: { inputTokens: contextTokens, cachedInputTokens: cacheRead, cacheWriteInputTokens: cacheWrite, outputTokens: output, totalTokens: contextTokens + output },
+			call: {
+				provider: 'claude', turnId: active.turnId, contextTokens, rotations: this.#rotations,
+				...(requestAt === null || call.firstEventAt === null ? {} : { firstEventMs: Math.max(0, call.firstEventAt - requestAt) }),
+				...(call.firstEventAt === null ? {} : { streamMs: Math.max(0, endedAt - call.firstEventAt) }),
+				...(requestAt === null ? {} : { totalMs: Math.max(0, endedAt - requestAt) }),
+			},
+		}));
+	}
+
 	#writeUserMessage(text) {
 		this.#writeLine({ type: 'user', message: { role: 'user', content: text } });
+		this.#requestAt = Date.now();
 	}
 
 	#writeLine(value) {
@@ -731,6 +941,7 @@ class ClaudeAgent {
 	#onProcessExit(state, error) {
 		if (state.exited) return;
 		state.exited = true;
+		if (/unknown option[^\n]*--include-partial-messages/i.test(state.stderr)) PARTIAL_MESSAGES_UNSUPPORTED.add(partialMessagesKey(this.#config));
 		if (this.#process !== state) return;
 		this.#process = null;
 		this.#releaseProcessState();
@@ -753,6 +964,20 @@ class ClaudeAgent {
 		this.#awaitingResult = 0;
 		for (const resolve of this.#idleWaiters.splice(0)) resolve();
 		this.#sessionState = 'cold';
+		// An unplanned restart (unacknowledged interrupt, stuck turn) also loses the conversation.
+		if (this.#processUsed && this.#pendingCarryOver === null) this.#pendingCarryOver = this.#carryOver('Claude Code restarted');
+		this.#resetContextState();
+	}
+
+	/** A new Claude Code process has never seen earlier events, fact views or omitted metadata. */
+	#resetContextState() {
+		this.#observationViews.reset();
+		this.#rotationDue = false;
+		this.#turnsSinceRotation = 0;
+		this.#processUsed = false;
+		this.#processCostUsd = 0;
+		this.#calls.clear();
+		this.#currentCallId = null;
 	}
 
 	#runOneShot(prompt) {
@@ -852,7 +1077,7 @@ export function buildClaudeLaunch(profile, config, { cwd, systemPromptFile, mcpC
 	const args = [
 		...launch.args,
 		'--print',
-		...(streaming ? ['--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose'] : ['--output-format', 'json']),
+		...(streaming ? ['--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', ...(PARTIAL_MESSAGES_UNSUPPORTED.has(partialMessagesKey(config)) ? [] : ['--include-partial-messages'])] : ['--output-format', 'json']),
 		'--model', profile.model,
 		'--effort', profile.reasoningEffort,
 		'--system-prompt-file', systemPromptFile,
@@ -934,10 +1159,10 @@ function resultErrorCode(document) {
 }
 
 /** Appends queued steers to a tool result so the model sees them before its next decision. */
-function deliverSteers(active, content) {
+function deliverSteers(active, content, encode = (text) => text) {
 	const steers = active.pendingSteers.splice(0);
 	if (steers.length === 0) return content;
-	const text = `Newer coordinator events for this turn (treat them exactly like the turn input):\n${steers.map((steer) => steer.text).join('\n\n')}`;
+	const text = `Newer coordinator events for this turn (treat them exactly like the turn input):\n${steers.map((steer) => encode(steer.text)).join('\n\n')}`;
 	for (const steer of steers) steer.resolve();
 	return { ...content, contentItems: [...content.contentItems, { type: 'inputText', text }] };
 }
@@ -1021,6 +1246,7 @@ function validateServiceConfig(config) {
 		maxDecisionBytes: positiveInteger(config.maxDecisionBytes ?? DEFAULT_MAX_DECISION_BYTES, 'maxDecisionBytes'),
 		stdoutLineLimitBytes: positiveInteger(config.stdoutLimitBytes ?? DEFAULT_STDOUT_LINE_LIMIT_BYTES, 'stdoutLimitBytes'),
 		stderrLimitBytes: positiveInteger(config.stderrLimitBytes ?? DEFAULT_STDERR_LIMIT_BYTES, 'stderrLimitBytes'),
+		contextRotationTokens: nonnegativeInteger(config.contextRotationTokens ?? DEFAULT_CONTEXT_ROTATION_TOKENS, 'contextRotationTokens'),
 	};
 }
 
@@ -1087,4 +1313,18 @@ function nativeToken(value) { return Number.isSafeInteger(value) && value >= 0 ?
 function finiteDuration(value) { return Number.isFinite(value) && value >= 0 ? Math.round(value) : null; }
 function requireText(value, field) { if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError(`${field} must be nonblank`); return value.trim(); }
 function requireStringArray(value, field) { if (!Array.isArray(value) || value.length === 0) throw new TypeError(`${field} must be a nonempty array`); return [...new Set(value.map((entry) => requireText(entry, field)))]; }
+function partialMessagesKey(config) { return String(config.executable ?? 'claude'); }
+function nonnegativeInteger(value, field) { if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${field} must be a nonnegative safe integer`); return value; }
+function truncate(text, max) { return text.length <= max ? text : `${text.slice(0, max - 3)}...`; }
+function mergeUsage(target, usage) {
+	if (usage === null || typeof usage !== 'object') return;
+	// Streaming repeats cumulative counts per message, so the largest value seen is the call's total.
+	for (const [key, field] of [['input', 'input_tokens'], ['cacheRead', 'cache_read_input_tokens'], ['cacheWrite', 'cache_creation_input_tokens'], ['output', 'output_tokens']]) {
+		if (Number.isSafeInteger(usage[field]) && usage[field] > target[key]) target[key] = usage[field];
+	}
+}
+function addUsage(target, usage) {
+	target.calls += 1;
+	for (const key of ['input', 'cacheRead', 'cacheWrite', 'output']) target[key] += usage[key];
+}
 function positiveInteger(value, field) { if (!Number.isSafeInteger(value) || value <= 0) throw new TypeError(`${field} must be a positive safe integer`); return value; }

@@ -1,0 +1,134 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { MEASURED_SESSION, estimateHourlyTokens, measureTokenBudget, representativeProgramWake, representativeRecord } from '../src/benchmark/token-budget.mjs';
+import { EVENT_BLOCK_DEFAULTS, buildNativeEventInput } from '../src/dynamic-main.mjs';
+import { ModelObservationViews, decodeModelFacts, encodeNativeEventInput } from '../src/model-fact-encoding.mjs';
+
+const payload = (input) => decodeModelFacts(JSON.parse(input.slice(input.indexOf('\n') + 1)));
+
+test('a representative program wake stays inside its byte budget for every provider', () => {
+	const sizes = measureTokenBudget();
+	// Before: 15,759 raw bytes sent to Claude on every wake (Codex: 12,685 encoded).
+	assert.ok(sizes.eventRawBytes <= 11_000, `raw event ${sizes.eventRawBytes} bytes`);
+	assert.ok(sizes.eventEncodedFirstBytes <= 9_000, `first encoded event ${sizes.eventEncodedFirstBytes} bytes`);
+	assert.ok(sizes.eventEncodedRepeatBytes <= 7_500, `repeat encoded event ${sizes.eventEncodedRepeatBytes} bytes`);
+	assert.ok(sizes.toolSchemaBytes <= 28_000, `tool schemas ${sizes.toolSchemaBytes} bytes`);
+});
+
+test('unchanged goal, goalSpec and taskMemory are named instead of repeated within one provider context', () => {
+	const record = representativeRecord();
+	const views = new ModelObservationViews();
+	const first = payload(encodeNativeEventInput(buildNativeEventInput(record, representativeProgramWake(1)), views));
+	assert.ok(first.goalSpec && first.taskMemory);
+	assert.equal(first.sameAsPreviousEvent, undefined);
+	const second = payload(encodeNativeEventInput(buildNativeEventInput(record, representativeProgramWake(2)), views));
+	assert.deepEqual(second.sameAsPreviousEvent, ['goalSpec', 'taskMemory']);
+	assert.equal(second.goalSpec, undefined);
+	assert.equal(second.goal, 'Beat the game', 'short fields are always repeated');
+
+	const changed = representativeProgramWake(3);
+	changed.taskMemory = { ...changed.taskMemory, revision: 42 };
+	const third = payload(encodeNativeEventInput(buildNativeEventInput(record, changed), views));
+	assert.deepEqual(third.sameAsPreviousEvent, ['goalSpec']);
+	assert.equal(third.taskMemory.revision, 42);
+
+	views.reset();
+	assert.equal(payload(encodeNativeEventInput(buildNativeEventInput(record, representativeProgramWake(4)), views)).sameAsPreviousEvent, undefined, 'a new provider context gets everything again');
+	const nether = representativeProgramWake(5);
+	nether.observation.world = { ...nether.observation.world, dimension: 'minecraft:the_nether' };
+	assert.equal(payload(encodeNativeEventInput(buildNativeEventInput(record, nether), views)).sameAsPreviousEvent, undefined, 'another world identity is a new baseline');
+
+	const failed = new ModelObservationViews();
+	encodeNativeEventInput(buildNativeEventInput(record, representativeProgramWake(6)), failed);
+	failed.forgetEventMetadata();
+	assert.equal(payload(encodeNativeEventInput(buildNativeEventInput(record, representativeProgramWake(7)), failed)).sameAsPreviousEvent, undefined, 'an undelivered turn is not a baseline');
+});
+
+test('event blocks omit only fields that follow from the row, and say so', () => {
+	const wake = representativeProgramWake(1);
+	wake.observation.blocks = [
+		{ stableId: '1,64,0', x: 1, y: 64, z: 0, blockId: 'minecraft:stone', tags: ['minecraft:mineable/pickaxe'], state: {}, bounds: [{ minX: 0, minY: 0, minZ: 0, maxX: 1, maxY: 1, maxZ: 1 }] },
+		{ stableId: '2,64,0', x: 2, y: 64, z: 0, blockId: 'minecraft:oak_slab', tags: ['minecraft:slabs'], state: { type: 'bottom' }, bounds: [{ minX: 0, minY: 0, minZ: 0, maxX: 1, maxY: 0.5, maxZ: 1 }] },
+		{ stableId: 'custom', x: 3, y: 64, z: 0, blockId: 'minecraft:dirt', tags: ['a'] },
+		{ stableId: '4,64,0', x: 4, y: 64, z: 0, blockId: 'minecraft:dirt', tags: ['b'] },
+	];
+	const observation = payload(buildNativeEventInput(representativeRecord(), wake)).observation;
+	assert.equal(observation.blockDefaults, EVENT_BLOCK_DEFAULTS);
+	assert.deepEqual(observation.blockTags, { 'minecraft:stone': ['minecraft:mineable/pickaxe'], 'minecraft:oak_slab': ['minecraft:slabs'] });
+	assert.deepEqual(observation.blocks[0], { x: 1, y: 64, z: 0, blockId: 'minecraft:stone' });
+	assert.deepEqual(observation.blocks[1], { x: 2, y: 64, z: 0, blockId: 'minecraft:oak_slab', state: { type: 'bottom' }, bounds: [{ minX: 0, minY: 0, minZ: 0, maxX: 1, maxY: 0.5, maxZ: 1 }] });
+	assert.equal(observation.blocks[2].stableId, 'custom', 'a stableId that is not x,y,z is kept');
+	assert.deepEqual(observation.blocks[2].tags, ['a'], 'disagreeing tags for one blockId stay on the rows');
+	assert.deepEqual(observation.blocks[3].tags, ['b']);
+});
+
+test('the hourly estimate counts the context each call re-reads', () => {
+	const unbounded = estimateHourlyTokens({ calls: MEASURED_SESSION.modelCalls, turns: MEASURED_SESSION.turns, prefixTokens: 15_000, eventTokens: 4_000, toolResultTokens: 1_000, toolResults: 416, maxContextTokens: 160_000 });
+	const rotated = estimateHourlyTokens({ calls: MEASURED_SESSION.modelCalls, turns: MEASURED_SESSION.turns, prefixTokens: 15_000, eventTokens: 4_000, toolResultTokens: 1_000, toolResults: 416, maxContextTokens: 64_000 });
+	assert.ok(rotated.averageContextTokens < unbounded.averageContextTokens);
+	assert.equal(rotated.averageContextTokens, 15_000 + 24_500);
+});
+
+test('model call and turn usage become flat trace fields', async () => {
+	const { modelCallTraceFields, turnUsageTraceFields } = await import('../src/dynamic-main.mjs');
+	assert.deepEqual(modelCallTraceFields({ last: { inputTokens: 70_205, cachedInputTokens: 70_000, cacheWriteInputTokens: 200, outputTokens: 40 },
+		call: { provider: 'claude', turnId: '1:2', contextTokens: 70_205, rotations: 1, firstEventMs: 2_100, streamMs: 900, totalMs: 3_000, extra: 'ignored' } }),
+	{ provider: 'claude', turnId: '1:2', contextTokens: 70_205, inputTokens: 70_205, cachedInputTokens: 70_000, cacheWriteInputTokens: 200, outputTokens: 40, rotations: 1, firstEventMs: 2_100, streamMs: 900, totalMs: 3_000 });
+	assert.deepEqual(turnUsageTraceFields({ calls: 2, input: 5, cacheRead: 9, cacheWrite: 1, output: 7, costUsd: null, contextTokens: 15 }),
+		{ modelCalls: 2, inputTokens: 5, cachedInputTokens: 9, cacheWriteInputTokens: 1, outputTokens: 7, contextTokens: 15 });
+	assert.deepEqual(turnUsageTraceFields(undefined), {});
+});
+
+test('mixed terrain still packs into one row table with optional columns and reconstructs exactly', async () => {
+	const { mixedTerrainBlocks } = await import('../src/benchmark/token-budget.mjs');
+	const { encodeModelFacts } = await import('../src/model-fact-encoding.mjs');
+	const sizes = measureTokenBudget();
+	assert.ok(sizes.mixedTerrainEncodedBytes <= 10_000, `mixed terrain event ${sizes.mixedTerrainEncodedBytes} bytes`);
+	const wake = representativeProgramWake(1);
+	wake.observation.blocks = mixedTerrainBlocks();
+	const raw = buildNativeEventInput(representativeRecord(), wake);
+	const encoded = JSON.parse(encodeNativeEventInput(raw).slice(raw.indexOf('\n') + 1));
+	assert.ok(Array.isArray(encoded.data.observation.blocks.$rows.optional));
+	assert.deepEqual(decodeModelFacts(encoded), JSON.parse(raw.slice(raw.indexOf('\n') + 1)));
+	const nulls = [{ a: 1, b: null }, { a: 2 }, { a: 3, b: 4 }];
+	assert.deepEqual(decodeModelFacts(encodeModelFacts({ rows: nulls, pad: 'x'.repeat(1_100) })).rows, nulls, 'a real null in a sometimes-missing column stays exact');
+});
+
+test('budget compaction keeps block tags only for retained rows', () => {
+	const wake = representativeProgramWake(1);
+	wake.observation.blocks = Array.from({ length: 32 }, (_, index) => ({ stableId: `${index},64,0`, x: index, y: 64, z: 0, blockId: `minecraft:block_${index}`, tags: [`minecraft:tag_${index}`, 'x'.repeat(200)] }));
+	const observation = payload(buildNativeEventInput(representativeRecord(), wake)).observation;
+	assert.ok(observation.blocks.length < 32, 'the oversized event was compacted');
+	assert.deepEqual(Object.keys(observation.blockTags).sort(), observation.blocks.map((block) => block.blockId).sort());
+});
+
+test('raw sound perception events are dropped from model inputs only when heard is present', async () => {
+	const { presentHeardSounds } = await import('../src/model-fact-encoding.mjs');
+	const events = [{ sequence: 1, type: 'sound', soundId: 'minecraft:block.lava.pop' }, { sequence: 2, type: 'title', text: 'Night' }];
+	const silent = representativeProgramWake(1);
+	silent.observation.perception = { latestSequence: 2, events };
+	assert.equal(payload(buildNativeEventInput(representativeRecord(), silent)).observation.perception.events.length, 2, 'no heard section: unchanged');
+	const hearing = representativeProgramWake(1);
+	hearing.observation.perception = { latestSequence: 2, events };
+	hearing.observation.player = { ...hearing.observation.player, heard: [{ sound: 'lava', direction: 'ahead', elevation: 'level', distance: 6 }] };
+	const perception = payload(buildNativeEventInput(representativeRecord(), hearing)).observation.perception;
+	assert.deepEqual(perception.events.map((event) => event.type), ['title']);
+	assert.equal(perception.soundEventsInHeard, 1);
+	const tool = presentHeardSounds({ state: 'SUCCEEDED', observation: { heard: [], perception: { events } } });
+	assert.deepEqual(tool.observation.perception.events.map((event) => event.type), ['title']);
+	const plain = { observation: { perception: { events } } };
+	assert.equal(presentHeardSounds(plain).observation.perception, plain.observation.perception);
+});
+
+test('a perception change made only of new sounds is not attention when heard is present', async () => {
+	const { soundOnlyPerceptionChange, classifyObservationTrigger } = await import('../src/dynamic-main.mjs');
+	const wire = (events, heard = []) => ({ heard, perception: { latestSequence: events.at(-1)?.sequence ?? 0, events } });
+	const sounds = [{ sequence: 4, type: 'sound' }, { sequence: 5, type: 'sound' }];
+	const payloadFor = { attention: true, changedFacts: ['perception'] };
+	assert.equal(soundOnlyPerceptionChange(payloadFor, wire(sounds), 3), true);
+	assert.equal(soundOnlyPerceptionChange(payloadFor, wire([...sounds, { sequence: 6, type: 'title' }]), 3), false, 'a title is still news');
+	assert.equal(soundOnlyPerceptionChange({ ...payloadFor, changedFacts: ['perception', 'heard'] }, wire(sounds), 3), false, 'heard lava keeps its own fact');
+	assert.equal(soundOnlyPerceptionChange(payloadFor, { perception: wire(sounds).perception }, 3), false, 'without heard nothing changes');
+	assert.equal(soundOnlyPerceptionChange(payloadFor, wire(sounds), undefined), false, 'unknown baseline');
+	assert.equal(classifyObservationTrigger({ attention: false, changedFacts: [] }, {}).attention, false);
+});

@@ -204,7 +204,7 @@ function taskIdentity(record) {
  return record.currentGoal ? `prompt:${record.currentGoal}` : null;
 }
 function numericUsage(value) {
- const out = {}; for (const key of ['inputTokens', 'cachedInputTokens', 'outputTokens', 'reasoningOutputTokens', 'totalTokens']) if (Number.isSafeInteger(value?.[key]) && value[key] >= 0) out[key] = value[key];
+ const out = {}; for (const key of ['inputTokens', 'cachedInputTokens', 'cacheWriteInputTokens', 'outputTokens', 'reasoningOutputTokens', 'totalTokens']) if (Number.isSafeInteger(value?.[key]) && value[key] >= 0) out[key] = value[key];
  if (out.inputTokens !== undefined && out.cachedInputTokens !== undefined && out.cachedInputTokens <= out.inputTokens) out.uncachedInputTokens = out.inputTokens - out.cachedInputTokens;
  return Object.keys(out).length ? out : null;
 }

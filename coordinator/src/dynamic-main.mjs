@@ -1,4 +1,5 @@
 import { generateDirectorScript } from './director-script-generator.mjs';
+import { hasHeardSection, withoutHeardSoundEvents } from './model-fact-encoding.mjs';
 import { EventEmitter } from 'node:events';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile } from 'node:fs/promises';
@@ -144,6 +145,7 @@ export class DynamicCoordinator extends EventEmitter {
 	#memoryDirectory;
 	#nativeConversationRecoveries = new Map();
 	#nativeObservationSignatures = new Map();
+	#perceptionSequences = new Map();
 	#nativeWorldSignals = new Map();
 	#nativeConfirmationWaits = new Map();
 	// Agents that started body work while their finished goal awaits confirmation: their follow-up wakes pass.
@@ -349,6 +351,18 @@ export class DynamicCoordinator extends EventEmitter {
 
 	get registry() { return this.#registry; }
 	get bridge() { return this.#bridge; }
+
+	/**
+	 * With the compact heard section present, a perception change made only of new raw sound packets is
+	 * already summarised there (and heard lava raises its own "heard" fact), so it is not attention by itself.
+	 */
+	#withoutSoundOnlyAttention(agentId, payload, wireObservation) {
+		const perception = wireObservation?.perception;
+		const latest = Number.isSafeInteger(perception?.latestSequence) ? perception.latestSequence : null;
+		const previous = this.#perceptionSequences.get(agentId);
+		if (latest !== null) this.#perceptionSequences.set(agentId, latest);
+		return soundOnlyPerceptionChange(payload, wireObservation, previous) ? { ...payload, attention: false, changedFacts: [] } : payload;
+	}
 
 	requestSupervisedObservation(key) {
 		if (this.#stopping || this.#closed || key === null || typeof key !== 'object') return false;
@@ -903,7 +917,7 @@ export class DynamicCoordinator extends EventEmitter {
 				const worldSignals = this.#usesNativeTools(record)
 					? this.#rememberNativeWorldSignals(record, lifecycleGeneration, connectionEpoch, observation)
 					: null;
-				const classified = classifyObservationTrigger(message.payload, wireObservation, worldSignals);
+				const classified = classifyObservationTrigger(this.#withoutSoundOnlyAttention(record.agentId, message.payload, wireObservation), wireObservation, worldSignals);
 				const pendingAttention = this.#pendingAttention.get(record.agentId);
 				const attention = pendingAttention?.goalRevision === record.goalRevision
 					? mergeAttentionTrigger(classified, pendingAttention)
@@ -1639,7 +1653,7 @@ export class DynamicCoordinator extends EventEmitter {
 			.then(async () => this.#planner.requestNativeTurn({
 				agentId: record.agentId,
 				goalRevision: record.goalRevision,
-				input: await this.#nativeTurnInput(record, request),
+				input: await this.#nativeTurnInput(record, request).then((input) => { if (typeof input === 'string') work.inputBytes = Buffer.byteLength(input, 'utf8'); return input; }),
 				recoverySummary: record.lastSummary,
 				priority: request.priority,
 				preserveState: request.preserveState === true,
@@ -2052,7 +2066,9 @@ export class DynamicCoordinator extends EventEmitter {
 		if (record !== null && record.goalRevision === work.goalRevision
 				&& this.#isConnectionEpochCurrent(work.connectionEpoch)
 				&& this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) {
-			this.#writeTrace('native_turn_completed', { agentId: work.agentId, goalRevision: work.goalRevision, traceId: work.traceId, toolCalls: result?.toolCalls ?? 0 });
+			this.#writeTrace('native_turn_completed', { agentId: work.agentId, goalRevision: work.goalRevision, traceId: work.traceId, toolCalls: result?.toolCalls ?? 0,
+				trigger: work.request.nativeEvent?.trigger ?? work.request.trigger ?? null, wakeEvent: work.request.nativeEvent?.event ?? null,
+				...(work.inputBytes === undefined ? {} : { inputBytes: work.inputBytes }), ...turnUsageTraceFields(result?.usage) });
 		}
 		if (this.#reschedulePendingNativeTurn(pending)) return result;
 		if (work.request.nativeConversationDelivery?.omittedEntries > 0
@@ -2876,6 +2892,8 @@ export class DynamicCoordinator extends EventEmitter {
 					if (stage === 'live_usage') {
 						const value = JSON.parse(message), usage = this.#taskViews.snapshot(viewRecord).usage;
 						if (usage !== null) this.#writeTrace('native_token_usage', { agentId, goalRevision, scope: 'thread_total', sessionKey: createHash('sha256').update(String(value.threadId ?? '')).digest('hex'), ...usage });
+						// Per model call (Claude): tokens for this call plus prefill/stream timing, so busy time can be split.
+						if (value.call !== null && typeof value.call === 'object') this.#writeTrace('native_model_call', { agentId, goalRevision, ...modelCallTraceFields(value) });
 					}
 				}
 				if (!this.#verboseEnabled) return;
@@ -4671,6 +4689,16 @@ function finiteOrNull(value) {
 	return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
+export function soundOnlyPerceptionChange(payload, wireObservation, previousSequence) {
+	if (!hasHeardSection(wireObservation) || !Number.isSafeInteger(previousSequence)) return false;
+	if (typeof payload?.trigger === 'string' && payload.trigger.trim().length > 0) return false;
+	const changedFacts = Array.isArray(payload?.changedFacts) ? payload.changedFacts : [];
+	if (changedFacts.length === 0 || !changedFacts.every((fact) => fact === 'perception')) return false;
+	const events = Array.isArray(wireObservation.perception?.events) ? wireObservation.perception.events : [];
+	const fresh = events.filter((event) => Number.isSafeInteger(event?.sequence) && event.sequence > previousSequence);
+	return fresh.length > 0 && fresh.every((event) => event.type === 'sound');
+}
+
 export function classifyObservationTrigger(payload, observation, signals = null) {
 	const explicitTrigger = typeof payload.trigger === 'string' && payload.trigger.trim().length > 0 ? payload.trigger.trim().slice(0, 128) : null;
 	const attention = payload.attention === true;
@@ -4772,6 +4800,25 @@ function mergePlannerRequest(previous, next) {
 	return { ...next, priority, trigger: winner.trigger };
 }
 
+function finiteCount(value) { return Number.isSafeInteger(value) && value >= 0 ? value : null; }
+
+export function modelCallTraceFields(value) {
+	const call = value.call, last = value.last ?? {};
+	const fields = { provider: typeof call.provider === 'string' ? call.provider : null, turnId: typeof call.turnId === 'string' ? call.turnId : null,
+		contextTokens: finiteCount(call.contextTokens), inputTokens: finiteCount(last.inputTokens), cachedInputTokens: finiteCount(last.cachedInputTokens),
+		cacheWriteInputTokens: finiteCount(last.cacheWriteInputTokens), outputTokens: finiteCount(last.outputTokens), rotations: finiteCount(call.rotations),
+		firstEventMs: finiteCount(call.firstEventMs), streamMs: finiteCount(call.streamMs), totalMs: finiteCount(call.totalMs) };
+	return Object.fromEntries(Object.entries(fields).filter(([, field]) => field !== null));
+}
+
+export function turnUsageTraceFields(usage) {
+	if (usage === null || typeof usage !== 'object') return {};
+	const fields = { modelCalls: finiteCount(usage.calls), inputTokens: finiteCount(usage.input), cachedInputTokens: finiteCount(usage.cacheRead),
+		cacheWriteInputTokens: finiteCount(usage.cacheWrite), outputTokens: finiteCount(usage.output), contextTokens: finiteCount(usage.contextTokens),
+		costUsd: Number.isFinite(usage.costUsd) && usage.costUsd >= 0 ? usage.costUsd : null };
+	return Object.fromEntries(Object.entries(fields).filter(([, field]) => field !== null));
+}
+
 function sameSupervisionKey(left, right) {
 	return left?.agentId === right?.agentId
 		&& left?.goalRevision === right?.goalRevision
@@ -4804,7 +4851,7 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 		...(observation.eventSequence === undefined ? {} : { eventSequence: observation.eventSequence }),
 		...(observation.freshness === undefined ? {} : { freshness: observation.freshness }),
 		...(observation.coverage === undefined ? {} : { coverage: compactCoverageForEvent(observation.coverage) }),
-		...(observation.perception === undefined ? {} : { perception: compactPerceptionForEvent(observation.perception) }),
+		...(observation.perception === undefined ? {} : { perception: compactPerceptionForEvent(withoutHeardSoundEvents(observation.perception, observation)) }),
 		...(observation.ready === undefined ? {} : { ready: observation.ready }),
 		...(observation.status === undefined ? {} : { status: observation.status }),
 		...(observation.velocity === undefined ? {} : { velocity: observation.velocity }),
@@ -4816,7 +4863,7 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 		},
 		items: itemRows.values,
 		entities: entityRows.values,
-		blocks: blockRows.values,
+		...compactBlockDefaults(blockRows.values),
 		...(landmarkRows === null ? {} : { landmarks: landmarkRows.values }),
 		...(nearbyContainerRows === null ? {} : { nearbyContainers: nearbyContainerRows.values }),
 		...(observation.world === undefined ? {} : { world: observation.world }),
@@ -5037,6 +5084,7 @@ function compactEventObservationForBudget(observation) {
 		items: itemRows.values,
 		entities: entityRows.values,
 		blocks: blockRows.values,
+		...(observation.blockDefaults === undefined ? {} : { blockDefaults: observation.blockDefaults }), ...(observation.blockTags === undefined ? {} : { blockTags: retainedBlockTags(observation.blockTags, blockRows.values) }),
 		...(landmarkRows === null ? {} : { landmarks: landmarkRows.values }),
 		...(nearbyContainerRows === null ? {} : { nearbyContainers: nearbyContainerRows.values }),
 		...(optionRows === null ? {} : { options: optionRows.values }),
@@ -5073,6 +5121,7 @@ function compactPlanningDueObservation(observation) {
 		items: itemRows.values,
 		entities: entityRows.values,
 		blocks: blockRows.values,
+		...(observation.blockDefaults === undefined ? {} : { blockDefaults: observation.blockDefaults }), ...(observation.blockTags === undefined ? {} : { blockTags: retainedBlockTags(observation.blockTags, blockRows.values) }),
 		...(observation.world === undefined ? {} : { world: compactWorldForEvent(observation.world) }),
 		...(observation.currentAction === undefined ? {} : { currentAction: observation.currentAction }),
 		...(observation.lastResult === undefined ? {} : { lastResult: compactLastResultForEvent(observation.lastResult) }),
@@ -5097,6 +5146,43 @@ function retainedEventCoverage(coverage, retainedCounts) {
 }
 
 const COMPACT_EVENT_ROW_FIELDS = ['uuid', 'stableId', 'type', 'name', 'position', 'x', 'y', 'z', 'distance', 'blockId', 'itemId', 'count', 'slot', 'tags', 'velocity', 'bounds', 'pickable', 'parentId', 'partName', 'state', 'bearing', 'elevation', 'id', 'feasible', 'moveTo', 'reason', 'cause', 'hazard', 'damage', 'maxDamage', 'fingerprint', 'hotbar', 'displayName', 'maxStackSize', 'hostile', 'alive', 'health', 'maxHealth', 'targetingAgent', 'swelling', 'fuse', 'perceivedBy', 'potentialRisk', 'risk', 'expectedHitDamage', 'withinInteractionRange', 'capabilities'];
+
+// Blocks are about half of every event. Most rows repeat values that follow from the row itself.
+export const EVENT_BLOCK_DEFAULTS = 'Omitted block fields mean: stableId "x,y,z", bounds one full cube, state {}, tags from blockTags[blockId].';
+function compactBlockDefaults(blocks) {
+	let omitted = false;
+	// Block tags belong to the block type, so each blockId's tags are listed once when every row agrees.
+	const tagsById = new Map();
+	for (const block of blocks) {
+		if (block === null || typeof block !== 'object' || typeof block.blockId !== 'string' || !Array.isArray(block.tags)) continue;
+		const encoded = JSON.stringify(block.tags);
+		tagsById.set(block.blockId, tagsById.has(block.blockId) && tagsById.get(block.blockId) !== encoded ? null : encoded);
+	}
+	const blockTags = Object.fromEntries([...tagsById].filter(([, encoded]) => encoded !== null).map(([blockId, encoded]) => [blockId, JSON.parse(encoded)]));
+	const values = blocks.map((block) => {
+		if (block === null || typeof block !== 'object' || Array.isArray(block)) return block;
+		const compact = { ...block };
+		if (Object.hasOwn(blockTags, compact.blockId) && Array.isArray(compact.tags)) { delete compact.tags; omitted = true; }
+		if (compact.stableId === `${compact.x},${compact.y},${compact.z}`) { delete compact.stableId; omitted = true; }
+		if (isFullCubeBounds(compact.bounds)) { delete compact.bounds; omitted = true; }
+		if (compact.state !== null && typeof compact.state === 'object' && !Array.isArray(compact.state) && Object.keys(compact.state).length === 0) { delete compact.state; omitted = true; }
+		return compact;
+	});
+	if (!omitted) return { blocks: values };
+	return { blocks: values, blockDefaults: EVENT_BLOCK_DEFAULTS, ...(Object.keys(blockTags).length === 0 ? {} : { blockTags }) };
+}
+
+function retainedBlockTags(blockTags, rows) {
+	const retained = new Set(rows.map((row) => row?.blockId));
+	const kept = Object.fromEntries(Object.entries(blockTags ?? {}).filter(([blockId]) => retained.has(blockId)));
+	return Object.keys(kept).length === 0 ? undefined : kept;
+}
+
+function isFullCubeBounds(bounds) {
+	return Array.isArray(bounds) && bounds.length === 1 && bounds[0] !== null && typeof bounds[0] === 'object'
+		&& Object.keys(bounds[0]).length === 6 && bounds[0].minX === 0 && bounds[0].minY === 0 && bounds[0].minZ === 0
+		&& bounds[0].maxX === 1 && bounds[0].maxY === 1 && bounds[0].maxZ === 1;
+}
 
 function compactEventRows(value) {
 	return asArray(value).map((entry) => {
