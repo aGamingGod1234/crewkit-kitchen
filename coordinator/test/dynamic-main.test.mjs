@@ -90,9 +90,41 @@ test('an empty ready roster does not initialize providers through bootstrap cata
 	);
 	await coordinator.start();
 	try {
+		let startsAtBootstrapSnapshot = null;
+		const send = bridge.send.bind(bridge);
+		bridge.send = async (type, ...rest) => {
+			if (type === 'catalog_snapshot' && startsAtBootstrapSnapshot === null) startsAtBootstrapSnapshot = [...starts];
+			return send(type, ...rest);
+		};
 		bridge.emit('ready', { connectionEpoch: 1, serverInstanceId: 'empty', registry: [] });
-		await eventually(() => bridge.sent.some(({ type }) => type === 'catalog_snapshot'));
-		assert.deepEqual(starts, []);
+		await eventually(() => startsAtBootstrapSnapshot !== null);
+		assert.deepEqual(startsAtBootstrapSnapshot, []);
+	} finally {
+		await coordinator.stop();
+	}
+});
+
+test('a roster saved under one provider still publishes every provider to the summon menu', async () => {
+	const bridge = new FakeBridge();
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	const model = (provider, id) => ({ provider, id, model: id, displayName: id, reasoningEfforts: ['low'], serviceTiers: [] });
+	const provider = new FakeProvider();
+	provider.bootstrapCatalog = async () => ({ refreshedAtEpochMs: 1, models: [model('claude', 'claude-opus-5-5')] });
+	provider.catalog.refresh = async () => ({
+		refreshedAtEpochMs: 2,
+		models: [model('codex', 'gpt-6-luna'), model('gemini', 'gemini-3.1-pro'), model('claude', 'claude-opus-5-5')],
+	});
+	const coordinator = createDynamicCoordinator(
+		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'arena_script' } },
+		{ bridge, registry, planner, codexService: provider },
+	);
+	await coordinator.start();
+	try {
+		bridge.emit('ready', { connectionEpoch: 1, serverInstanceId: 'claude-only', registry: [] });
+		await eventually(() => bridge.sent.some(({ type, payload }) => type === 'catalog_snapshot' && payload.refreshedAtEpochMs === 2));
+		const latest = bridge.sent.filter(({ type }) => type === 'catalog_snapshot').at(-1);
+		assert.deepEqual([...new Set(latest.payload.models.map(({ provider }) => provider))], ['codex', 'gemini', 'claude']);
 	} finally {
 		await coordinator.stop();
 	}
