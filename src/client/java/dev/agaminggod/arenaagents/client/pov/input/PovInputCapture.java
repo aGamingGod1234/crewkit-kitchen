@@ -9,6 +9,8 @@ public final class PovInputCapture {
 	public static final int HOTBAR_SIZE = 9;
 	public static final int SLOT_ACK_TICKS = 20;
 	public static final int MAX_QUEUED_CLICKS = 64;
+	/** Vanilla's default Options.sprintWindow: ticks between forward taps that still count as a double-tap. */
+	public static final int DEFAULT_SPRINT_WINDOW = 7;
 
 	public enum Click { ATTACK, USE, PICK, DROP, DROP_STACK, SWAP_HANDS, OPEN_INVENTORY }
 
@@ -34,6 +36,10 @@ public final class PovInputCapture {
 	private int pendingAckTicks;
 	private int requestedSlot = -1;
 	private int scrollSteps;
+	private int sprintWindow = DEFAULT_SPRINT_WINDOW;
+	private int sprintTriggerTicks;
+	private boolean hadForwardImpulse;
+	private boolean hadSneak;
 
 	public void recordMovement(boolean forward, boolean backward, boolean left, boolean right,
 			boolean jump, boolean sneak, boolean sprint) {
@@ -49,6 +55,11 @@ public final class PovInputCapture {
 
 	public boolean movementCaptured() {
 		return movementCaptured;
+	}
+
+	/** The operator's own double-tap window option; 0 turns double-tap sprinting off like vanilla. */
+	public void setSprintWindow(int ticks) {
+		sprintWindow = Math.max(0, ticks);
 	}
 
 	public void recordHeld(boolean attack, boolean use) {
@@ -119,7 +130,28 @@ public final class PovInputCapture {
 			strafe /= length;
 		}
 		movementCaptured = false;
-		return new Frame(forward, strafe, packHeldFlags(jump, sneak, sprint, attackHeld, useHeld), Math.max(currentSlot(), 0));
+		boolean sprintRequest = sprint || doubleTappedForward(forward > 1.0E-5F);
+		return new Frame(forward, strafe, packHeldFlags(jump, sneak, sprintRequest, attackHeld, useHeld),
+				Math.max(currentSlot(), 0));
+	}
+
+	/**
+	 * The key half of vanilla LocalPlayer.aiStep's double-tap: a fresh forward press arms the window, and a
+	 * second fresh press inside it requests sprint for one frame. Sneak (as of the previous tick, like vanilla)
+	 * and the back key disarm it. The server applies the body half (hunger, blindness, item use, collisions),
+	 * so the request rides the sprint flag and the server's sprint latch decides.
+	 */
+	private boolean doubleTappedForward(boolean forwardImpulse) {
+		if (sprintTriggerTicks > 0) sprintTriggerTicks--;
+		if (hadSneak || backwardKey) sprintTriggerTicks = 0;
+		boolean tapped = false;
+		if (forwardImpulse && !sneak && !hadForwardImpulse) {
+			if (sprintTriggerTicks > 0) tapped = true;
+			else sprintTriggerTicks = sprintWindow;
+		}
+		hadForwardImpulse = forwardImpulse;
+		hadSneak = sneak;
+		return tapped;
 	}
 
 	/** Ends a tick without a frame (slot not known yet); clicks and slot requests stay queued. */
@@ -168,5 +200,8 @@ public final class PovInputCapture {
 		movementCaptured = false;
 		requestedSlot = -1;
 		scrollSteps = 0;
+		sprintTriggerTicks = 0;
+		hadForwardImpulse = false;
+		hadSneak = false;
 	}
 }

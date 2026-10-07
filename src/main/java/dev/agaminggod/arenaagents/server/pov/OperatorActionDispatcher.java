@@ -149,6 +149,10 @@ public final class OperatorActionDispatcher {
 		if (hit instanceof BlockHitResult blockHit && hit.getType() == HitResult.Type.BLOCK
 				&& !agent.level().getBlockState(blockHit.getBlockPos()).isAir()) {
 			// Mining belongs to the held attack; the pulse keeps a sub-tick click held long enough to start it.
+			// Carpet's 5-tick blockHitDelay after a break is vanilla's destroyDelay, which only throttles a held
+			// key: vanilla startDestroyBlock ignores it, so every click may start (or creative-break) at once.
+			// Left in place, a 2-tick pulse only counts the delay down and fast clicks were lost.
+			((EntityPlayerActionPackAccessor) OfflineAgentPlayers.actions(agent)).arenaagents$setBlockHitDelay(0);
 			keys.blockClicked();
 			return Outcome.BLOCK_TARGETED;
 		}

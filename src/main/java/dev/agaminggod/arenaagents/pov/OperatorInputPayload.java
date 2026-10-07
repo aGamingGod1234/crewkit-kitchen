@@ -22,6 +22,7 @@ public record OperatorInputPayload(
 ) implements CustomPacketPayload {
 	public static final int HELD_JUMP = 1;
 	public static final int HELD_SNEAK = 2;
+	/** Sprint request: the sprint key, or one frame for a forward double-tap. The server latches sprint itself. */
 	public static final int HELD_SPRINT = 4;
 	public static final int HELD_ATTACK = 8;
 	public static final int HELD_USE = 16;

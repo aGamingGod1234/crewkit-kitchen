@@ -17,10 +17,14 @@ import dev.agaminggod.arenaagents.server.runtime.input.InputOwner;
 import dev.agaminggod.arenaagents.server.runtime.input.LeasedServerInputController;
 import java.lang.ref.WeakReference;
 import java.util.Objects;
+import net.minecraft.core.component.DataComponents;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.util.Mth;
 import net.minecraft.world.InteractionHand;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.item.component.UseEffects;
+import net.minecraft.world.phys.Vec3;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -110,6 +114,7 @@ public final class CarpetOperatorBodyController implements OperatorBodyControlle
 			OperatorActionDispatcher.tickUseKey(agent, keys, frameOf(agent));
 			// Re-applying every tick renews the lease well inside the 40-tick deadman.
 			push(agent);
+			keys.sprintTickEnded(frameOf(agent));
 		});
 	}
 
@@ -167,9 +172,15 @@ public final class CarpetOperatorBodyController implements OperatorBodyControlle
 
 	private void push(ServerPlayer agent) {
 		Frame current = frameOf(agent);
-		AgentInputState state = current.toInputState(keys, agent.isUsingItem(), canSprint(agent));
+		boolean sprinting = keys.sprinting(current, sprintBody(agent, current));
+		AgentInputState state = current.toInputState(keys, agent.isUsingItem(), sprinting);
 		lease.apply(AgentInputRuntime.controller(server), state,
 				() -> CarpetInputStateSink.setMeleeByClickOnly(agentId, agent.getUUID(), true));
+		// The sink only writes sprint when the input state changes, but vanilla also ends sprint on the server
+		// (a sprint-knockback hit), so write it again whenever the body drifted from the operator's decision.
+		if (lease.held() && agent.isSprinting() != state.sprint()) {
+			OfflineAgentPlayers.actions(agent).setSprinting(state.sprint());
+		}
 	}
 
 	private Frame frameOf(ServerPlayer agent) {
@@ -189,9 +200,31 @@ public final class CarpetOperatorBodyController implements OperatorBodyControlle
 		}
 	}
 
-	private static boolean canSprint(ServerPlayer agent) {
-		// Vanilla refuses sprint at 6 food or less unless the player may fly.
-		return agent.getFoodData().getFoodLevel() > 6 || agent.getAbilities().mayfly;
+	/** The body facts LocalPlayer.aiStep reads; the operator's client cannot see them, so the server decides. */
+	private static SprintBody sprintBody(ServerPlayer agent, Frame frame) {
+		Entity vehicle = agent.getVehicle();
+		boolean slowUse = agent.isUsingItem()
+				&& !agent.getUseItem().getOrDefault(DataComponents.USE_EFFECTS, UseEffects.DEFAULT).canSprint();
+		Vec3 motion = agent.getDeltaMovement();
+		boolean majorCollision = agent.horizontalCollision
+				&& !SprintBody.minorCollision(agent.getYRot(), frame.forward(), frame.strafe(), motion.x, motion.z);
+		return new SprintBody(
+				agent.isSprinting(),
+				agent.isMobilityRestricted(),
+				vehicle != null,
+				vehicle != null && vehicle.canSprint(),
+				// Player.hasEnoughFoodToDoExhaustiveManoeuvres: more than 6 food, or the player may fly.
+				agent.getFoodData().hasEnoughFood() || agent.getAbilities().mayfly,
+				agent.isInShallowWater(),
+				agent.getAbilities().flying,
+				slowUse,
+				agent.isFallFlying(),
+				agent.isUnderWater(),
+				agent.isCrouching() || agent.isVisuallyCrawling(),
+				agent.isSwimming(),
+				agent.isInWater(),
+				agent.onGround(),
+				majorCollision);
 	}
 
 	private void guarded(String phase, Runnable work) {
@@ -243,12 +276,13 @@ public final class CarpetOperatorBodyController implements OperatorBodyControlle
 
 		/**
 		 * Held keys for the shared sink. Use is always released here: the dispatcher's use-key loop owns it.
-		 * Sneak wins over sprint, sprint needs forward input and food, and using an item pauses mining.
+		 * {@code sprinting} is the latched decision from {@link Keys#sprinting}, not the sprint key; sneak still
+		 * wins because Carpet's sneak setter ends sprint. Using an item pauses mining.
 		 */
-		AgentInputState toInputState(Keys keys, boolean usingItem, boolean canSprint) {
-			boolean sprinting = sprint && !sneak && forward > 0.0F && canSprint;
+		AgentInputState toInputState(Keys keys, boolean usingItem, boolean sprinting) {
+			boolean sprint = sprinting && !sneak;
 			boolean attacking = keys.attackHeld(this) && !usingItem;
-			return new AgentInputState(forward, strafe, jump, sneak, sprinting, attacking, false,
+			return new AgentInputState(forward, strafe, jump, sneak, sprint, attacking, false,
 					yaw, pitch, keys.slot(this), InteractionHand.MAIN_HAND);
 		}
 
@@ -274,6 +308,51 @@ public final class CarpetOperatorBodyController implements OperatorBodyControlle
 		}
 	}
 
+	/** What LocalPlayer's sprint checks read from the body; plain so the rules can be verified without a server. */
+	record SprintBody(
+			boolean sprinting,
+			boolean blind,
+			boolean passenger,
+			boolean vehicleCanSprint,
+			boolean enoughFood,
+			boolean inShallowWater,
+			boolean flying,
+			boolean slowDueToUsingItem,
+			boolean fallFlying,
+			boolean underWater,
+			boolean movingSlowly,
+			boolean swimming,
+			boolean inWater,
+			boolean onGround,
+			boolean majorCollision
+	) {
+		/** LocalPlayer.isHorizontalCollisionMinor's limit: about 8 degrees between intended and actual motion. */
+		static final double MINOR_COLLISION_RADIANS = 0.13962634F;
+
+		/** LocalPlayer.isSprintingPossible. */
+		boolean possible(boolean allowedInShallowWater) {
+			return !blind && (passenger ? vehicleCanSprint : enoughFood) && (allowedInShallowWater || !inShallowWater);
+		}
+
+		/**
+		 * LocalPlayer.isHorizontalCollisionMinor, which the server never runs (its default is always false, so
+		 * any graze would stop sprint). The body's motion after a collided move keeps the collided direction,
+		 * so it stands in for the move vector vanilla passes.
+		 */
+		static boolean minorCollision(float yaw, float forward, float strafe, double motionX, double motionZ) {
+			double radians = yaw * (Math.PI / 180.0);
+			double sin = Mth.sin((float) radians);
+			double cos = Mth.cos((float) radians);
+			double intendedX = strafe * cos - forward * sin;
+			double intendedZ = forward * cos + strafe * sin;
+			double intendedSquared = intendedX * intendedX + intendedZ * intendedZ;
+			double motionSquared = motionX * motionX + motionZ * motionZ;
+			if (intendedSquared < 1.0E-5F || motionSquared < 1.0E-5F) return false;
+			double dot = intendedX * motionX + intendedZ * motionZ;
+			return Math.acos(dot / Math.sqrt(intendedSquared * motionSquared)) < MINOR_COLLISION_RADIANS;
+		}
+	}
+
 	/** Vanilla client key timing the server has to reproduce for a body without a real client. */
 	static final class Keys {
 		/** Minecraft.rightClickDelay after startUseItem: a held use key repeats every four ticks. */
@@ -291,6 +370,7 @@ public final class CarpetOperatorBodyController implements OperatorBodyControlle
 		private int usePulse;
 		private int slotOverride = -1;
 		private int staleFrameSlot = -1;
+		private boolean sprintRequest;
 
 		void tick() {
 			if (rightClickDelay > 0) rightClickDelay--;
@@ -304,6 +384,41 @@ public final class CarpetOperatorBodyController implements OperatorBodyControlle
 			if (!next.attack()) missTicks = 0;
 			// The client caught up with (or moved away from) a server-chosen slot.
 			if (slotOverride >= 0 && next.selectedSlot() != staleFrameSlot) slotOverride = -1;
+			// The sprint flag is the sprint key or a one-frame double-tap of forward. Several frames can land in
+			// one server tick, so a request is kept until the tick has evaluated it.
+			if (next.sprint()) sprintRequest = true;
+		}
+
+		/**
+		 * Vanilla LocalPlayer.aiStep sprint rules. Sprint is a latch, not a held key: a request (sprint key or
+		 * double-tap) only starts it, and it lasts until forward is released, the body hits a wall head-on,
+		 * hunger or blindness forbid it, or sneak is held. The body's own sprint flag is the latch, so a
+		 * server-side stop (sprint-knockback hit) needs a fresh request just like on a vanilla client.
+		 */
+		boolean sprinting(Frame frame, SprintBody body) {
+			boolean forward = frame.forward() > 1.0E-5F;
+			boolean sprinting = body.sprinting();
+			if (!sprinting && sprintRequest && forward && !frame.sneak() && body.possible(body.flying())
+					&& !body.slowDueToUsingItem()
+					&& (!body.fallFlying() || body.underWater())
+					&& (!body.movingSlowly() || body.underWater())) {
+				sprinting = true;
+			}
+			if (sprinting) {
+				if (body.swimming()) {
+					if (!body.possible(true) || !body.inWater() || !forward && !body.onGround() && !frame.sneak()) {
+						sprinting = false;
+					}
+				} else if (!body.possible(body.flying()) || !forward || body.majorCollision()) {
+					sprinting = false;
+				}
+			}
+			return sprinting && !frame.sneak();
+		}
+
+		/** End of a server tick: a held sprint key keeps requesting, a consumed double-tap does not. */
+		void sprintTickEnded(Frame frame) {
+			sprintRequest = frame.sprint();
 		}
 
 		boolean attackHeld(Frame frame) {
@@ -360,6 +475,7 @@ public final class CarpetOperatorBodyController implements OperatorBodyControlle
 			missTicks = 0;
 			attackPulse = 0;
 			usePulse = 0;
+			sprintRequest = false;
 		}
 
 		void reset() {
