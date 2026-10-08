@@ -247,9 +247,6 @@ export class ArenaScriptEngine {
 		return this.#pendingRequest !== null && sameRequest(request, this.#coalescedRequest ?? this.#pendingRequest);
 	}
 
-	/** Straight-line commands left, counting the one running (null when loops or unknown calls make that unknowable). */
-	remainingCommands() { return this.#status === 'ACTIVE' && this.#vm !== null ? this.#vm.remainingStraightLineCommands() : null; }
-
 	snapshot() { const pending = this.#coalescedRequest ?? this.#pendingRequest; return Object.freeze({ status: this.#status, eventSequence: this.#eventSequence, factsSequence: this.#factsSequence, generation: this.#generation, lifecycleEpoch: this.#lifecycleEpoch, continuationEpoch: this.#continuationEpoch, activeActionId: this.#activeActionId(), activeQueryId: this.#active?.kind === 'query' ? this.#active.actionId : null, programId: this.#program?.programId ?? null, version: this.#program?.version ?? null, pendingRequestPriority: pending?.priority ?? null, pendingRequestTrigger: pending?.trigger ?? null }); }
 
 	#activate(target) {

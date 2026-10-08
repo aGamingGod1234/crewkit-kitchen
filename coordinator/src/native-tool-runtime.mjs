@@ -15,7 +15,6 @@ const POST_ACTION_OBSERVATION_TYPES = new Set(['pick_up_item', 'break_block', 'n
 // The model may answer danger with these while its program is paused for a decision, without first
 // settling the program decision; the paused program keeps its decision for a later respondProgram.
 const PAUSED_PROGRAM_DANGER_ACTIONS = new Set(['fight_target', 'flee_from']);
-const MAX_ADVISORY_MISSES = 2;
 // Waiting only stops repeating the finished work; new player requests stay the model's to act on.
 export const AWAITING_CONFIRMATION_MESSAGE = 'The remaining condition requires operator confirmation. Report completion once, then end this turn. Do not repeat the finished work or finish checks while waiting. This never blocks new requests: if a player asks for something (even more equipment changes), do it at once, then call finish again.';
 
@@ -51,11 +50,7 @@ export class NativeToolRuntime {
 	#onProgramEvent;
 	#onWorkStarted;
 	#planningLeadTime;
-	#planningFloorTime;
 	#onModelActionCancelled;
-	// Early advisories cost a model turn, so they stay off until the model has queued a successor by itself, and stop
-	// again after two programs that got one and still ran out with nothing queued.
-	#advisoryMisses = new Map();
 	#sweeps = new Map();
 	#sessionId;
 	#receipts = new Map();
@@ -82,7 +77,6 @@ export class NativeToolRuntime {
 		onProgramEvent = () => {},
 		onWorkStarted = () => () => {},
 		planningLeadTime = () => null,
-		planningFloorTime = () => null,
 		onModelActionCancelled = () => {},
 		sessionId = randomUUID(),
 		occupancy = new ExplorationOccupancy(),
@@ -127,8 +121,6 @@ export class NativeToolRuntime {
 		this.#onWorkStarted = onWorkStarted;
 		if (typeof planningLeadTime !== 'function') throw new TypeError('planningLeadTime must be a function');
 		this.#planningLeadTime = planningLeadTime;
-		if (typeof planningFloorTime !== 'function') throw new TypeError('planningFloorTime must be a function');
-		this.#planningFloorTime = planningFloorTime;
 		if (typeof onModelActionCancelled !== 'function') throw new TypeError('onModelActionCancelled must be a function');
 		this.#onModelActionCancelled = onModelActionCancelled;
 		this.#sessionId = sessionId.length <= 36 ? sessionId : createHash('sha256').update(sessionId).digest('hex').slice(0, 32);
@@ -539,7 +531,6 @@ export class NativeToolRuntime {
 				maxActions: tool.maxActions, timeoutMs: tool.timeoutMs, observationIntervalMs: tool.observationIntervalMs,
 				expectedDurationMs: tool.expectedDurationMs } } });
 		run.pendingSuccessor = successor;
-		this.#advisoryState(record.agentId).misses = 0;
 		this.#trace('native_program_successor_queued', { agentId: record.agentId, ...successorSummary(successor) });
 		return { state: 'QUEUED', programId: run.programId, goalRevision: run.goalRevision, pendingSuccessor: successorSummary(successor) };
 	}
@@ -567,7 +558,6 @@ export class NativeToolRuntime {
 			...(run.startedAtMs === undefined ? {} : { durationMs: Math.max(0, Date.now() - run.startedAtMs) }) });
 		const successor = run.pendingSuccessor;
 		run.pendingSuccessor = null;
-		if (run.remainingWorkAdvised === true) this.#noteAdvisoryOutcome(agentId, run, successor != null, outcome);
 		const handoff = successor != null && error === null && outcome.state === 'YIELDED'
 			&& outcome.reasonCode === 'PROGRAM_EXHAUSTED' && outcome.decision == null
 			&& outcome.actionsFailed === 0 && outcome.actionsSucceeded === outcome.actions
@@ -595,26 +585,6 @@ export class NativeToolRuntime {
 		if (error !== null && run.request.tool.background !== true) run.reject(error);
 		else run.resolve(result);
 		if (!handoff && run.detached && this.#executionEpoch(agentId) === run.epoch) this.#programEvent(run, { event: 'program_ended', result });
-	}
-
-	/**
-	 * An early advisory only pays when the model queues a successor before the body idles; otherwise it is an extra
-	 * model turn. Two programs in a row that ran out with nothing queued mean it is not chaining.
-	 */
-	#noteAdvisoryOutcome(agentId, run, queued, outcome) {
-		const state = this.#advisoryState(agentId);
-		if (queued) state.misses = 0;
-		else if (outcome.state === 'YIELDED' && outcome.reasonCode === 'PROGRAM_EXHAUSTED') state.misses += 1;
-		this.#trace('native_program_advisory_outcome', { agentId, goalRevision: run.goalRevision, programId: run.programId, queued, misses: state.misses });
-	}
-
-	#advisoryState(agentId) {
-		let state = this.#advisoryMisses.get(agentId);
-		if (state === undefined) {
-			state = { misses: MAX_ADVISORY_MISSES };
-			this.#advisoryMisses.set(agentId, state);
-		}
-		return state;
 	}
 
 	async #startSuccessor(previous, run, successor) {
@@ -733,29 +703,23 @@ export class NativeToolRuntime {
 			maxActions: request.tool.maxActions ?? 64, timeoutMs: request.tool.timeoutMs ?? 30_000 });
 		// Missing measurements leave preparation disabled rather than guessing a delay.
 		let planningLeadMs;
-		let planningFloorMs;
 		try {
 			const measured = this.#planningLeadTime(record);
 			if (Number.isFinite(measured) && measured > 0) planningLeadMs = Math.ceil(measured);
-			const typical = this.#planningFloorTime(record);
-			if (Number.isFinite(typical) && typical > 0) planningFloorMs = Math.floor(typical);
 		} catch { /* Telemetry must not prevent authorised work. */ }
 		// The executor samples right after each action returns; that one sample may use
 		// the server's post-result publication. Later interval samples still request.
 		let lastActionResult = null;
-		return await this.#programExecutor.run(record, { source, parameters: request.tool.parameters, expectedDurationMs: request.tool.expectedDurationMs, programId: run.programId, maxActions: request.tool.maxActions, timeoutMs: request.tool.timeoutMs, observationIntervalMs: request.tool.observationIntervalMs, planningLeadMs, planningFloorMs, provenance: nativeMemoryProvenance(request, record) }, {
-			allowRemainingWorkAdvisory: () => this.#advisoryState(record.agentId).misses < MAX_ADVISORY_MISSES,
-			onPlanningDue: (_status, { planningLeadMs, trigger, commands, estimatedMs } = {}) => {
+		return await this.#programExecutor.run(record, { source, parameters: request.tool.parameters, expectedDurationMs: request.tool.expectedDurationMs, programId: run.programId, maxActions: request.tool.maxActions, timeoutMs: request.tool.timeoutMs, observationIntervalMs: request.tool.observationIntervalMs, planningLeadMs, provenance: nativeMemoryProvenance(request, record) }, {
+			onPlanningDue: (_status, { planningLeadMs } = {}) => {
 				if (this.#programRuns.get(record.agentId) !== run || this.#executionEpoch(record.agentId) !== run.epoch) return;
 				const status = { ...this.#programStatus(record, run.programId), planningLeadMs };
 				if (run.pendingSuccessor != null || !this.canPrepareProgram(record, run.programId, status.programVersion)) return;
 				const wasDetached = run.detached;
 				run.detached = true;
-				if (trigger === 'remaining_work') run.remainingWorkAdvised = true;
 				run.detach({ ...status, advisory: 'program_planning_due' });
 				this.#trace('native_program_planning_due', { agentId: record.agentId, goalRevision: run.goalRevision,
-					programId: run.programId, programVersion: status.programVersion, planningLeadMs,
-					...(trigger === 'remaining_work' ? { basis: trigger, remainingCommands: commands, estimatedRemainingMs: estimatedMs } : {}) });
+					programId: run.programId, programVersion: status.programVersion, planningLeadMs });
 				if (wasDetached) this.#programEvent(run, { event: 'program_planning_due', status, priority: 'ordinary' });
 			},
 			onDecision: (_status, { priority } = {}) => {
@@ -1297,7 +1261,6 @@ export class NativeToolRuntime {
 			this.#placedWorkstations.clear(agentId);
 			this.#lastLive.delete(agentId);
 			this.#receipts.delete(agentId);
-			this.#advisoryMisses.delete(agentId);
 		}
 		this.#observations.delete(agentId);
 		this.#inspectedTargets.delete(agentId);

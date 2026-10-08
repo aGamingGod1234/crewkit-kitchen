@@ -313,7 +313,6 @@ export class DynamicCoordinator extends EventEmitter {
 			executionSettings: (record) => this.#planner.getExecutionSettings?.(record.agentId) ?? null,
 			planningLeadTime: (record) => this.#planner.getNativeDecisionTiming?.(record.agentId)?.p95Ms ?? null,
 			onModelActionCancelled: (record) => this.#releaseHeldWakeForCancelledAction(record),
-			planningFloorTime: (record) => this.#planner.getNativeDecisionTiming?.(record.agentId)?.p50Ms ?? null,
 			occupancy: new ExplorationOccupancy({ memoryStore: new ObservedMemoryStore({ directory: memoryDirectory }) }),
 			bridge: nativeBridge,
 			registry: this.#registry,
