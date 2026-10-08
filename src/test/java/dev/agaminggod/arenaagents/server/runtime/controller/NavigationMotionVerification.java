@@ -48,6 +48,11 @@ public final class NavigationMotionVerification {
 				"a destination more than a block behind is turned to and walked to, as before");
 		ServerNavigationController.Heading over = ServerNavigationController.heading(33.0F, 0.01D, 0.02D, true, Float.NaN);
 		assertEquals(33.0F, over.viewYaw(), "directly over the point the view holds");
+		// Review finding: a swimmer half a block past its endpoint held its view, and with no separate walk direction
+		// in water it swam on, looped back and stalled. Swimming and climbing turn toward the point.
+		ServerNavigationController.Heading swim = ServerNavigationController.heading(-82.5F, -0.2D, 0.0D, true, Float.NaN, false);
+		assertTrue(Math.abs(AgentInputStates.shortestAngleDelta(90.0F, swim.viewYaw())) < 1.0F && Float.isNaN(swim.moveYaw()),
+				"a swimmer turns its view onto a point behind it and swims there");
 
 		AgentInputStates.MotorStep back = AgentInputStates.stepMotor(
 				new AgentInputStates.MotorState(-82.5F, 20.0F, 0.0F, 0.0F, false),

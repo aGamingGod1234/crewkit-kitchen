@@ -715,8 +715,11 @@ public final class ServerNavigationController implements ServerController {
 		double steerDz = steer.z - player.getZ();
 		double steerHorizontal = Math.sqrt(steerDx * steerDx + steerDz * steerDz);
 		boolean walkingOnGround = !swimming && !climbing && !crouching && !gapJump && player.onGround();
+		// Swimming and climbing move where the view points (no separate walk direction), so they never hold the
+		// heading near a point: a swimmer that held it swam on past the point, looped back and stalled.
 		Heading heading = heading(motorState.yaw(), steerDx, steerDz, steerIsEndpoint,
-				walkingOnGround && steerIsWaypoint ? gazeYaw(player.position(), plan.nodes(), waypointIndex) : Float.NaN);
+				walkingOnGround && steerIsWaypoint ? gazeYaw(player.position(), plan.nodes(), waypointIndex) : Float.NaN,
+				!swimming && !climbing);
 		float targetYaw = heading.viewYaw();
 		float moveYaw = swimming || climbing ? Float.NaN : heading.moveYaw();
 		float targetPitch;
@@ -796,12 +799,17 @@ public final class ServerNavigationController implements ServerController {
 	 * ahead) when it is within {@link #MAX_GAZE_OFFSET_DEGREES} of the walk direction, else the walk direction.
 	 */
 	static Heading heading(float currentYaw, double dx, double dz, boolean endpoint, float gazeYaw) {
+		return heading(currentYaw, dx, dz, endpoint, gazeYaw, true);
+	}
+
+	/** As above; with {@code mayHold} false (swimming, climbing) the view always turns toward a nearby point. */
+	static Heading heading(float currentYaw, double dx, double dz, boolean endpoint, float gazeYaw, boolean mayHold) {
 		double horizontal = Math.sqrt(dx * dx + dz * dz);
 		// Directly over the point atan2 has no direction; holding the heading avoids a spurious turn.
 		if (horizontal < 0.05D) return new Heading(currentYaw, Float.NaN);
 		float moveYaw = net.minecraft.util.Mth.wrapDegrees((float) Math.toDegrees(Math.atan2(-dx, dz)));
 		float offView = Math.abs(AgentInputStates.shortestAngleDelta(currentYaw, moveYaw));
-		if (horizontal < HOLD_HEADING_DISTANCE && (endpoint || offView > BEHIND_DEGREES)) {
+		if (mayHold && horizontal < HOLD_HEADING_DISTANCE && (endpoint || offView > BEHIND_DEGREES)) {
 			return new Heading(currentYaw, moveYaw);
 		}
 		if (!Float.isNaN(gazeYaw) && offView <= 90.0F
