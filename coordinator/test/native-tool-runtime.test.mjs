@@ -1830,3 +1830,127 @@ test('a lifecycle that ends during the publication grace period sends no request
 	assert.equal(requests.length, 2, 'the disposed goal does not ask the server for another sample');
 	assert.equal(result.postAction.freshness.fresh, false, 'the action result stays authoritative without fresh facts');
 });
+
+test('a forced local death notice does not satisfy the post-result barrier', async () => {
+	const { runtime, sent, requests } = postResultRuntime();
+	runtime.updateObservation(record(), { entities: [] }, { eventSequence: 5 });
+	const pending = runtime.execute(nativeCall(navigate), record());
+	await turn();
+	runtime.onActionResult(record(), { actionId: sent[0][2].actionId, state: 'SUCCEEDED', reasonCode: 'DESTINATION_REACHED' });
+	await turn();
+	// The coordinator's synthetic death notice reuses the last live sequence, so it is no newer than the result.
+	assert.equal(runtime.updateObservation(record(), { death: { cause: 'minecraft:lava' } }, { eventSequence: 5, force: true }), true);
+	let settled = false;
+	void pending.then(() => { settled = true; });
+	await turn();
+	await turn();
+	assert.equal(settled, false, 'a stored update that does not advance the sequence proves nothing about the world after the result');
+	requests[0].resolve({ eventSequence: 6, observation: { requested: true } });
+	const result = await pending;
+	assert.equal(result.postAction.freshness.fresh, true);
+	assert.equal(result.postAction.eventSequence, 6, 'freshness comes from a strictly newer authoritative sample');
+	assert.equal(result.postAction.observation.requested, true);
+});
+
+test('a death notice during the publication grace period neither ends the wait nor counts as a publication', async () => {
+	const { runtime, sent, requests } = postResultRuntime({ publicationGraceMs: 150 });
+	runtime.updateObservation(record(), { entities: [] }, { eventSequence: 1 });
+	await publishedAction(runtime, sent, 2);
+	await publishedAction(runtime, sent, 3);
+	const pending = runtime.execute(nativeCall(navigate), record());
+	await turn();
+	runtime.onActionResult(record(), { actionId: sent.at(-1)[2].actionId, state: 'SUCCEEDED', reasonCode: 'DESTINATION_REACHED' });
+	await sleep(5);
+	runtime.updateObservation(record(), { death: { cause: 'minecraft:lava' } }, { eventSequence: 3, force: true });
+	let settled = false;
+	void pending.then(() => { settled = true; });
+	await sleep(10);
+	assert.equal(settled, false);
+	assert.equal(requests.length, 2, 'the grace period is still running');
+	await sleep(200);
+	assert.equal(requests.length, 3, 'with no real publication the request goes out when the grace period ends');
+	requests[2].resolve({ eventSequence: 9, observation: { requested: true } });
+	const result = await pending;
+	assert.equal(result.postAction.eventSequence, 9);
+	assert.equal(result.postAction.observation.requested, true);
+	// The death notice was not a publication, so the missed one reset the streak: the next result requests at once.
+	const next = runtime.execute(nativeCall(navigate), record());
+	await turn();
+	runtime.onActionResult(record(), { actionId: sent.at(-1)[2].actionId, state: 'SUCCEEDED', reasonCode: 'DESTINATION_REACHED' });
+	await turn();
+	assert.equal(requests.length, 4);
+	runtime.updateObservation(record(), { pushed: 10 }, { eventSequence: 10 });
+	await next;
+});
+
+// Every consumer of the shared raw sample must treat it as read only. Freezing it where the runtime hands it
+// over makes any in-place write throw instead of silently corrupting the next reader.
+function deepFreeze(value) {
+	if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
+		Object.freeze(value);
+		for (const key of Reflect.ownKeys(value)) deepFreeze(value[key]);
+	}
+	return value;
+}
+
+test('no consumer mutates the stored raw sample', async () => {
+	const frozen = [];
+	const { runtime, sent, requests } = postResultRuntime({
+		memoryObservation: (_record, observation, options) => { assert.equal(options.owned, true); frozen.push(deepFreeze(observation)); },
+	});
+	const sample = (sequence) => ({ ready: true, player: { health: 20, x: 0, y: 64, z: 0 }, inventory: { items: [{ itemId: 'minecraft:stone', count: sequence }] }, entities: [{ uuid: `e-${sequence}`, type: 'minecraft:pig' }], observedAtEpochMs: sequence });
+	runtime.updateObservation(record(), sample(1), { eventSequence: 1 });
+	assert.ok(runtime.decorateObservation(record()));
+	assert.ok(runtime.snapshotLive('agent-a'));
+	const observing = runtime.execute(nativeCall({ kind: 'observe' }), record());
+	while (requests.length === 0) await turn();
+	requests[0].resolve({ eventSequence: 2, observation: sample(2) });
+	assert.equal((await observing).freshness.fresh, true);
+	const action = runtime.execute(nativeCall(navigate), record());
+	await turn();
+	runtime.onActionResult(record(), { actionId: sent.at(-1)[2].actionId, state: 'SUCCEEDED', reasonCode: 'DESTINATION_REACHED' });
+	await turn();
+	runtime.updateObservation(record(), sample(3), { eventSequence: 3 });
+	assert.equal((await action).postAction.freshness.fresh, true);
+	// Death merging reads the last live sample.
+	runtime.updateObservation(record(), { death: { cause: 'minecraft:lava' } }, { eventSequence: 3, force: true });
+	assert.ok(runtime.decorateObservation(record(), { death: { cause: 'minecraft:lava' } }));
+	assert.ok(frozen.length >= 4);
+	assert.ok(frozen.every(Object.isFrozen));
+});
+
+test('program continuations read the stored raw sample without mutating it', async () => {
+	const { runtime, sent } = postResultRuntime({ memoryObservation: (_record, observation) => { deepFreeze(observation); } });
+	const observation = (sequence) => ({ player: { health: 20 }, inventory: { items: [] }, observedAtEpochMs: sequence });
+	runtime.updateObservation(record(), observation(1), { eventSequence: 1 });
+	const pending = runtime.execute(nativeCall({ kind: 'run_program', source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2);' }), record());
+	for (const [index, sequence] of [2, 3].entries()) {
+		while (sent.length <= index) await turn();
+		runtime.onActionResult(record(), { actionId: sent[index][2].actionId, state: 'SUCCEEDED', reasonCode: 'WAIT_COMPLETED' });
+		runtime.updateObservation(record(), observation(sequence), { eventSequence: sequence });
+	}
+	const result = await pending;
+	assert.equal(result.reasonCode, 'PROGRAM_EXHAUSTED');
+	assert.equal(result.actions, 2);
+});
+
+test('a publication read after the grace timer by a busy event loop is not counted as missed', async () => {
+	const traces = [];
+	const { runtime, sent, requests } = postResultRuntime({ publicationGraceMs: 40, trace: (event) => traces.push(event) });
+	runtime.updateObservation(record(), { entities: [] }, { eventSequence: 1 });
+	await publishedAction(runtime, sent, 2);
+	await publishedAction(runtime, sent, 3);
+	const pending = runtime.execute(nativeCall(navigate), record());
+	await turn();
+	runtime.onActionResult(record(), { actionId: sent.at(-1)[2].actionId, state: 'SUCCEEDED', reasonCode: 'DESTINATION_REACHED' });
+	// The loop stalls past the grace period; the socket's publication is only handled after the expired timer.
+	setTimeout(() => {
+		const until = performance.now() + 60;
+		while (performance.now() < until);
+		setImmediate(() => runtime.updateObservation(record(), { pushed: 4 }, { eventSequence: 4 }));
+	}, 15);
+	const result = await pending;
+	assert.equal(requests.length, 2, 'the late-read publication needs no request');
+	assert.equal(result.postAction.eventSequence, 4);
+	assert.equal(traces.includes('native_post_result_publication_missed'), false);
+});

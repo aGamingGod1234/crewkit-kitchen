@@ -12,11 +12,13 @@ import { compileProgramPrecondition, evaluateProgramPrecondition } from './progr
 const FORGET_REASONS = /agent_removed|server_replaced|coordinator_stopped/;
 const TERMINAL_ACTION_STATES = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT']);
 const POST_ACTION_OBSERVATION_TYPES = new Set(['pick_up_item', 'break_block', 'navigate_to']);
-// The server publishes its post-result observation in the same tick as the result, so a tick (50 ms) plus
-// serialization of the busiest agents covers it; past this the explicit request takes over. The wait only
-// starts once an agent's last results were each followed by a publication, so a server that does not
-// publish after results (or an agent whose publication was missed) keeps requesting at once.
-const POST_RESULT_PUBLICATION_GRACE_MS = 75;
+// The server publishes its post-result observation in the same tick as the result. Live, with eight agents on a
+// loaded machine, the first one arrived a median 13 ms and p95 34 ms after the result; 40 ms (under one tick)
+// held the miss rate at 0.2% of results, and 75 ms did no better. Past it the explicit request takes over, so a
+// miss costs at most this much. The wait only starts once an agent's last results were each followed by a
+// publication, so a server that does not publish after results (or an agent whose publication was missed)
+// keeps requesting at once.
+const POST_RESULT_PUBLICATION_GRACE_MS = 40;
 const PUBLICATION_EVIDENCE_RESULTS = 2;
 const EXPIRED = Symbol('expired');
 // The model may answer danger with these while its program is paused for a decision, without first
@@ -181,6 +183,10 @@ export class NativeToolRuntime {
 	#notePublishedSample(record) {
 		const pending = this.#postResultSamples.get(record.agentId);
 		if (pending === undefined || pending.goalRevision !== record.goalRevision || pending.published) return;
+		// A forced local update (a synthetic death notice) is stored at the last live sequence, which is no newer
+		// than the result: it must neither satisfy the barrier nor count as proof that the server published.
+		const stored = this.#observations.get(record.agentId);
+		if (stored?.goalRevision !== record.goalRevision || stored.eventSequence <= pending.eventSequence) return;
 		pending.published = true;
 		this.#publicationStreaks.set(record.agentId, (this.#publicationStreaks.get(record.agentId) ?? 0) + 1);
 		pending.wake?.();
@@ -437,6 +443,9 @@ export class NativeToolRuntime {
 			const pending = afterResult === null ? undefined : this.#postResultSamples.get(record.agentId);
 			if (pending?.result === afterResult && pending.goalRevision === record.goalRevision) {
 				await this.#awaitPostResultSample(record, epoch, afterEventSequence, pending);
+				// Fresh means a stored sample newer than the one the result was fenced at, whoever delivered it.
+				const sampled = this.#observations.get(record.agentId);
+				if (sampled?.goalRevision !== record.goalRevision || sampled.eventSequence <= pending.eventSequence) await this.#requestSample(record, epoch, pending.eventSequence);
 				freshness = { fresh: true, afterEventSequence: pending.eventSequence };
 			} else {
 				await this.#requestSample(record, epoch, afterEventSequence);
@@ -483,6 +492,10 @@ export class NativeToolRuntime {
 			const expired = new Promise((resolve) => { timer = setTimeout(resolve, this.#publicationGraceMs, EXPIRED); });
 			try { if (await Promise.race([published, expired]) !== EXPIRED) return; }
 			finally { clearTimeout(timer); }
+			if (pending.published) return;
+			// A busy event loop runs an expired timer before it reads the socket, so a publication that already
+			// arrived is handled in the poll phase after this timer. One check-phase turn lets it count.
+			await new Promise((resolve) => setImmediate(resolve));
 			if (pending.published) return;
 			if (this.#executionEpoch(record.agentId) !== epoch) throw codedError('STALE_NATIVE_TOOL', 'Observation request outlived its lifecycle');
 			this.#trace('native_post_result_publication_missed', { agentId: record.agentId, goalRevision: record.goalRevision, waitedMs: Math.round(performance.now() - startedAt) });
