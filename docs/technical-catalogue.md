@@ -306,3 +306,21 @@ Notes: these numbers come from replaying recorded play sessions offline, headles
 - **Solution:** Server sounds now reach the agent, and client-only ambient sounds such as lava popping are recreated using the client's own odds. The model gets direction and distance.
 - **Result:** (measured, headless server) an agent heard both lava pockets through one-block walls, in the right directions. A rescan costs 0.4 to 0.9 ms on the server. (observed, live play) a Sol agent located a hidden lava pool.
 - **Sources:** PR #48, the T3 thread "Add hearing to agent perception"
+
+## Branch claude/spectate-visuals (pull request pending, Oct 8, 2026)
+
+Notes: before numbers come from the recorded GPT-6.1 Sol "beat the game" session (play-session-3 trace, 117 move_to and 22 navigate_to actions with per-tick yaw). After numbers come from replaying the same positions through the new steering and from closed-loop simulations in the Java verification suite; no live spectated session has been recorded yet.
+
+### The camera that spun 360 degrees on every stair
+*Branch claude/spectate-visuals · Oct 8, 2026*
+- **Problem:** Watching an agent dig a staircase, the camera did a full turn on every step. A one-block move carried the body about 0.2 blocks past the stair it was aiming for, and the walking code turned to face that point behind it: a 180 degree spin in four ticks. The next "look at the block" turned it the same way again, completing the circle. It happened in 76 of 117 short moves. Diagonal stairs also swung the view 90 degrees left and right at each step, and control frames, camera sweeps, mining and attacks could snap the view in one tick.
+- **Solution:** Within the last block of a move, or when a waypoint has fallen behind, the agent keeps facing the way it was going and steps back onto the spot, like a player tapping S. On stairs it looks down the staircase instead of at each next block. Every other way the agent turns its head (control frames, camera sweeps, mining, attacking, using blocks, aiming a bow, opening chests and furnaces) now turns at player speed, and actions still wait until the view has arrived.
+- **Result:** (measured, replaying the trace positions) moves with a spin over 120 degrees fell from 75 of 117 to 4 of 117 (the four are real turns toward targets more than a block away), and average yaw travel in the last block of a move fell from 141 degrees to 0. (measured, simulation) the stair overshoot now turns the view 0 degrees instead of more than 120, and on a diagonal staircase the view holds one heading instead of swinging 90 degrees at every step. (measured) no head turn anywhere exceeds 45 degrees per tick, and a 180 degree control turn takes about 6 ticks (0.3 s) instead of 1.
+- **Sources:** this branch, `ServerNavigationController.heading`, `NavigationMotionVerification`, `ServerActionExecutorVerification`
+
+### Items that appeared in furnaces with no screen
+*Branch claude/spectate-visuals · Oct 8, 2026*
+- **Problem:** Crafting already showed its menu to spectators, but putting items into a furnace, moving items to or from a chest, equipping armour and pulling a tool from the backpack all opened the menu, moved the items and closed it inside one server tick. Spectators only see the state at the end of each tick, so ore "magically appeared" in furnaces and a pickaxe "just appeared" in the hand.
+- **Solution:** These one-move jobs now run like a player: turn to the block, open the screen and show it, move the stack, keep the screen up a moment, then close it. The move itself is unchanged and still checked to the exact item count.
+- **Result:** (measured, real vanilla furnace menu in the verification suite) a furnace load now shows the furnace screen for 3 ticks before and 3 ticks after the move, 0.35 seconds in all, instead of 0 ticks. In the play-test all 4 furnace actions and the 5 successful tool selections ran with no screen. A tool that is already on the hotbar is still selected instantly, like pressing a number key.
+- **Sources:** this branch, `AdvancedInteractionService.PacedMenuTransaction`, `AdvancedInteractionRollbackVerification`
