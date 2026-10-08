@@ -112,8 +112,8 @@ public final class ServerObservationWireBudget {
 	}
 
 	private static Fitted fitted(JsonObject candidate, List<String> reductions, boolean copyResult) {
-		// Binary search restores its winning prefix after the last predicate call.
-		refreshCoverage(sectionTotals(candidate), candidate);
+		// Binary search restores its winning prefix after the last predicate call; an untrimmed tree was just refreshed by it.
+		if (!reductions.isEmpty()) refreshCoverage(sectionTotals(candidate), candidate);
 		// A caller that kept the source gets a copy the predicate never saw; an owner takes the tree itself.
 		return Fitted.trusted(copyResult ? candidate.deepCopy() : candidate, reductions);
 	}

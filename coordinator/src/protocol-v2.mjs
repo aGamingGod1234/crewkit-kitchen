@@ -1847,8 +1847,8 @@ function normalizeObservation(value) {
 	normalized.inventory = inventoryObservation(value.inventory);
 	normalized.entities = boundedArray(value.entities, 'entities', MAX_ENTITIES).map(entityObservation);
 	const blockTags = blockTagDictionary(value.blockTags);
-	normalized.blocks = boundedArray(value.blocks, 'blocks', MAX_BLOCKS).map((row, index) => blockObservation(withBlockTags(row, blockTags), index));
-	if (Object.hasOwn(value, 'landmarks')) normalized.landmarks = boundedArray(value.landmarks, 'landmarks', MAX_LANDMARKS).map((row, index) => landmarkObservation(withBlockTags(row, blockTags), index));
+	normalized.blocks = boundedArray(value.blocks, 'blocks', MAX_BLOCKS).map((row, index) => blockObservation(row, index, blockTags));
+	if (Object.hasOwn(value, 'landmarks')) normalized.landmarks = boundedArray(value.landmarks, 'landmarks', MAX_LANDMARKS).map((row, index) => landmarkObservation(row, index, blockTags));
 	normalized.nearbyContainers = boundedArray(value.nearbyContainers, 'nearbyContainers', MAX_NEARBY_TRANSACTION_TARGETS).map(nearbyContainerObservation);
 	normalized.world = worldObservation(value.world);
 	normalized.currentAction = currentActionObservation(value.currentAction);
@@ -1873,6 +1873,13 @@ function blockTagDictionary(value) {
 	const entries = Object.entries(value);
 	if (entries.length > MAX_BLOCKS + MAX_LANDMARKS) throw new ProtocolV2Error('INVALID_PAYLOAD', `blockTags exceeds bound of ${MAX_BLOCKS + MAX_LANDMARKS}`);
 	return new Map(entries.map(([blockId, tags]) => [requireIdentifier(blockId, 'blockTags key'), observationTags(tags, `blockTags.${blockId}`)]));
+}
+
+/** A row's own tags, or its block type's tags from the dictionary (already validated; each row gets its own copy). */
+function rowTags(value, field, dictionary) {
+	if (value.tags !== undefined) return observationTags(value.tags, `${field}.tags`);
+	const shared = dictionary === null ? undefined : dictionary.get(value.blockId);
+	return shared === undefined ? undefined : [...shared];
 }
 
 function withBlockTags(row, dictionary) {
@@ -2487,7 +2494,7 @@ function entityObservation(value, index) {
 	return normalized;
 }
 
-function blockObservation(value, index) {
+function blockObservation(value, index, blockTags = null) {
 	if (!isPlainObject(value)) throw new ProtocolV2Error('INVALID_PAYLOAD', `blocks[${index}] must be an object`);
 	const field = `blocks[${index}]`;
 	exactKeys(value, ['x', 'y', 'z', 'blockId', 'placeableFaces', 'tags', ...BLOCK_DETAIL_FIELDS], ['x', 'y', 'z', 'blockId', 'placeableFaces'], field);
@@ -2506,11 +2513,12 @@ function blockObservation(value, index) {
 		blockId: requireIdentifier(value.blockId, `${field}.blockId`),
 		placeableFaces,
 	};
-	if (value.tags !== undefined) normalized.tags = observationTags(value.tags, `${field}.tags`);
+	const tags = rowTags(value, field, blockTags);
+	if (tags !== undefined) normalized.tags = tags;
 	return normalized;
 }
 
-function landmarkObservation(value, index) {
+function landmarkObservation(value, index, blockTags = null) {
 	const field = `landmarks[${index}]`;
 	if (!isPlainObject(value)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be an object`);
 	exactKeys(value, ['x', 'y', 'z', 'blockId', 'distance', 'bearing', 'elevation', 'tags'], ['x', 'y', 'z', 'blockId', 'distance', 'bearing', 'elevation'], field);
@@ -2525,7 +2533,8 @@ function landmarkObservation(value, index) {
 	};
 	if (normalized.bearing < -180 || normalized.bearing > 180) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}.bearing must be in [-180, 180]`);
 	if (normalized.elevation < -90 || normalized.elevation > 90) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}.elevation must be in [-90, 90]`);
-	if (value.tags !== undefined) normalized.tags = observationTags(value.tags, `${field}.tags`);
+	const tags = rowTags(value, field, blockTags);
+	if (tags !== undefined) normalized.tags = tags;
 	return normalized;
 }
 
