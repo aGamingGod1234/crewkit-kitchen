@@ -618,8 +618,8 @@ public final class ServerActionExecutor {
 					number(arguments, "z")
 			)));
 			// Aim like a player first (eased turn, settled look), then the vanilla hit.
-			case ATTACK -> ActiveAction.aimed(request, player,
-					() -> attackAimPoint(resolveExactObservedTarget(player, string(arguments, "targetId"))),
+			case ATTACK -> ActiveAction.aimedAtEntity(request, player,
+					() -> resolveExactObservedTarget(player, string(arguments, "targetId")),
 					() -> attack(player, string(arguments, "targetId")));
 			// Persistent model-chosen combat: the model decides to fight or flee, the controller makes it effective.
 			case FIGHT_TARGET -> ActiveAction.controller(request, player, new ServerFightController(
@@ -1076,9 +1076,19 @@ public final class ServerActionExecutor {
 		player.swing(net.minecraft.world.InteractionHand.MAIN_HAND);
 	}
 
+	/** The center of the hitbox: the steadiest point to track, and the crosshair only needs to be anywhere on the box. */
 	private static Vec3 attackAimPoint(Entity target) {
-		return target instanceof net.minecraft.world.entity.boss.enderdragon.EnderDragonPart
-				? target.getBoundingBox().getCenter() : target.getEyePosition();
+		return target.getBoundingBox().getCenter();
+	}
+
+	/**
+	 * True when the crosshair ray from {@code eye} along {@code look} meets {@code box} (or the eye is inside it), the
+	 * way a player's crosshair turns red on a mob. Reach is not judged here; the vanilla attack still checks it.
+	 */
+	static boolean crosshairOnBox(Vec3 eye, Vec3 look, net.minecraft.world.phys.AABB box) {
+		if (box.contains(eye)) return true;
+		double length = eye.distanceTo(box.getCenter()) + box.getSize();
+		return box.clip(eye, eye.add(look.normalize().scale(length))).isPresent();
 	}
 
 	private static Vec3 entityInteractionAimPoint(Entity target, JsonObject arguments) {
@@ -1760,7 +1770,8 @@ public final class ServerActionExecutor {
 		private int initialPlacementItemCount;
 		private String resourceLeaseKey;
 		private int placementAttempts;
-		private final AimGate aimGate = new AimGate();
+		private AimGate aimGate = new AimGate();
+		private java.util.function.Supplier<Entity> immediateAimEntity;
 		private long aimReadyElapsedMs = -1L;
 		private Vec3 transactionAimTarget;
 		/** Look a directional placement needs; held while placing, then the view eases back to the face aim. */
@@ -1834,6 +1845,18 @@ public final class ServerActionExecutor {
 				Runnable operation) {
 			ActiveAction action = new ActiveAction(request, player, Mode.AIMED, DEFAULT_TIMEOUT_MS, operation, null, 0.0D, false, null);
 			action.immediateAimTarget = Objects.requireNonNull(aimTarget, "aimTarget must not be null");
+			return action;
+		}
+
+		/**
+		 * A melee swing: the view turns toward the target's hitbox center at player speed and swings once the crosshair
+		 * is on the hitbox for {@link AimGate#ATTACK_SETTLE_TICKS} tick, instead of settling within 3 degrees for 3 ticks.
+		 */
+		static ActiveAction aimedAtEntity(ServerActionRequest request, ServerPlayer player,
+				java.util.function.Supplier<Entity> target, Runnable operation) {
+			ActiveAction action = aimed(request, player, () -> attackAimPoint(target.get()), operation);
+			action.immediateAimEntity = target;
+			action.aimGate = new AimGate(AimGate.ATTACK_SETTLE_TICKS);
 			return action;
 		}
 
@@ -2214,7 +2237,7 @@ public final class ServerActionExecutor {
 					}
 				}
 			} else if (mode == Mode.AIMED) {
-				AimGate.State aim = aimAt(immediateAimTarget.get());
+				AimGate.State aim = immediateAimEntity == null ? aimAt(immediateAimTarget.get()) : aimAtEntity(immediateAimEntity.get());
 				if (aim == AimGate.State.FAILED) {
 					return result(ServerActionState.FAILED, "AIM_NOT_REACHED",
 							"The agent's view did not settle on the target", now);
@@ -2561,6 +2584,21 @@ public final class ServerActionExecutor {
 					AgentInputStates.turnPitch(player.getXRot(), desired.pitch()),
 					player.getInventory().getSelectedSlot(), InteractionHand.MAIN_HAND));
 			return aimGate.observe(player.getYRot(), player.getXRot(), desired.yaw(), desired.pitch());
+		}
+
+		/** Turns toward the target's hitbox center; ready once the crosshair is on the hitbox. */
+		private AimGate.State aimAtEntity(Entity target) {
+			Vec3 center = attackAimPoint(target);
+			AgentInputState desired = AgentInputStates.lookingAt(
+					player, center, 0.0F, 0.0F, false, false, false, false, false, InteractionHand.MAIN_HAND);
+			LeasedServerInputController input = AgentInputRuntime.controller(player);
+			if (inputLease == null) inputLease = input.acquire(request.agentId(), InputOwner.INTERACTION, 300);
+			input.apply(inputLease, new AgentInputState(0.0F, 0.0F, false, false, false, false, false,
+					AgentInputStates.turnYaw(player.getYRot(), desired.yaw()),
+					AgentInputStates.turnPitch(player.getXRot(), desired.pitch()),
+					player.getInventory().getSelectedSlot(), InteractionHand.MAIN_HAND));
+			return aimGate.observeAligned(crosshairOnBox(player.getEyePosition(), player.getViewVector(1.0F),
+					target.getBoundingBox().inflate(target.getPickRadius())));
 		}
 
 		private Vec3 placementAimTarget() {

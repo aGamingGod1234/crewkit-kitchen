@@ -477,7 +477,22 @@ public final class ServerActionExecutorVerification {
 		AimGate.State last = AimGate.State.AIMING;
 		for (int tick = 0; tick < AimGate.MAX_TICKS; tick++) last = stuck.observe(0.0F, 0.0F, 90.0F, 0.0F);
 		assertEquals(AimGate.State.FAILED, last, "a view that never arrives fails instead of interacting blind");
-		return 8;
+
+		// Review finding: attacks waited 3 settled ticks within 3 degrees even when already aimed (+150 ms per swing).
+		AimGate attack = new AimGate(AimGate.ATTACK_SETTLE_TICKS);
+		assertEquals(AimGate.State.AIMING, attack.observeAligned(false), "off the hitbox keeps turning");
+		assertEquals(AimGate.State.READY, attack.observeAligned(true), "one tick on the hitbox swings");
+		// A zombie-sized box 3 blocks ahead: 6 degrees off its center is still on the hitbox, 20 degrees is not.
+		net.minecraft.world.phys.AABB zombie = new net.minecraft.world.phys.AABB(-0.3D, 0.0D, 2.7D, 0.3D, 1.95D, 3.3D);
+		Vec3 eye = new Vec3(0.0D, 1.62D, 0.0D);
+		Vec3 center = zombie.getCenter().subtract(eye).normalize();
+		assertTrue(ServerActionExecutor.crosshairOnBox(eye, center, zombie), "the hitbox center is on the box");
+		assertTrue(ServerActionExecutor.crosshairOnBox(eye, center.yRot((float) Math.toRadians(4.0D)), zombie),
+				"4 degrees off a mob 3 blocks away is still on its hitbox");
+		assertFalse(ServerActionExecutor.crosshairOnBox(eye, center.yRot((float) Math.toRadians(20.0D)), zombie),
+				"20 degrees off misses it");
+		assertFalse(ServerActionExecutor.crosshairOnBox(eye, center.scale(-1.0D), zombie), "looking away misses it");
+		return 14;
 	}
 
 	private static void verifyRemovalReceipts() {
