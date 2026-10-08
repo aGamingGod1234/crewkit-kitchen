@@ -30,6 +30,32 @@ test('compiles a bounded program and records its model-owned policy', () => {
 	assert.ok(Object.isFrozen(compiled.stepLocations));
 });
 
+test('compiles model-authored act tool calls as existing primitives with the safe default policy', () => {
+	const compiled = parseArenaScript(`for (let x = 10; x < 12; x += 1) {
+		await act({ actionType: "mine", arguments: { x, y: 64, z: 10, expectedBlockId: "minecraft:stone" } });
+	}`);
+	assert.deepEqual(compiled.primitiveCalls, ['break_block']);
+	assert.equal(compiled.unhandledPolicy, 'pause_and_notify');
+	assert.throws(() => parseArenaScript('await player.wait(1);'), error => error.code === 'MISSING_UNHANDLED_POLICY');
+	const twoArgumentAlias = parseArenaScript('await act("look_at", {x: 10.5, y: 64.5, z: 10.5}); await act("break_block", {x: 10, y: 64, z: 10, expectedBlockId: "minecraft:stone"});');
+	assert.deepEqual(twoArgumentAlias.primitiveCalls, ['break_block', 'look_at']);
+	const directNameAliases = parseArenaScript('await look_at({x:10.5,y:64.5,z:10.5}); await mine({x:10,y:64,z:10,expectedBlockId:"minecraft:stone"});');
+	assert.deepEqual(directNameAliases.primitiveCalls, ['break_block', 'look_at']);
+	const caughtAction = parseArenaScript('await act("move_to", {x: 10, y: 64, z: 10, tolerance: 1, sprint: false}).catch(() => {});');
+	assert.deepEqual(caughtAction.primitiveCalls, ['move_to']);
+	const capturedNaturalToolSource = parseArenaScript('for (let x=10;x<26;x++){ await act({actionType:"move_to",arguments:{x:x-0.5,y:64,z:10.5,tolerance:1}}).catch(()=>{}); await mine({x:x,y:64,z:10,expectedBlockId:"minecraft:stone",autoAim:true}).catch(()=>{}); }');
+	assert.deepEqual(capturedNaturalToolSource.primitiveCalls, ['break_block', 'move_to']);
+	const shadowedToolName = parseArenaScript('program.onUnhandledAttention("pause_and_notify"); async function mine() { await player.wait(1); } await mine();');
+	assert.deepEqual(shadowedToolName.primitiveCalls, ['wait']);
+	const shadowedActName = parseArenaScript('program.onUnhandledAttention("pause_and_notify"); async function act() { await player.wait(1); } await act();');
+	assert.deepEqual(shadowedActName.primitiveCalls, ['wait']);
+	assert.throws(() => parseArenaScript('while (true) {}'), error => error.code === 'UNBOUNDED_LOOP' && /literal-bounded for/.test(error.message));
+	assert.throws(
+		() => parseArenaScript('await act({actionType:"mine",arguments:{x:1,y:64,z:1}}).catch(() => {});'),
+		error => error.code === 'INVALID_ARENA_SCRIPT_COMMAND' && /observed non-air expectedBlockId.*expectedBlockId/.test(error.message),
+	);
+});
+
 test('admits the exact Task 2 direct action and terminal API calls', () => {
 	assert.doesNotThrow(() => parseArenaScript(`
 		program.onUnhandledAttention("continue_and_notify");
@@ -282,7 +308,7 @@ test('rejects unsupported syntax and ASTs over the configured limit', () => {
 test('requires exactly one supported unhandled-attention policy', () => {
 	assert.throws(
 		() => parseArenaScript('const value = 1;'),
-		(error) => error.code === 'MISSING_UNHANDLED_POLICY',
+		(error) => error.code === 'MISSING_UNHANDLED_POLICY' && /program.onUnhandledAttention\("pause_and_notify"\)/.test(error.message),
 	);
 	assert.throws(
 		() => parseArenaScript(`

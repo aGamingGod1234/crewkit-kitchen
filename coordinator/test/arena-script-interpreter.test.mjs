@@ -203,6 +203,43 @@ test('yields a command and resumes from its typed result', () => {
 	assert.equal(second.summary, 'arrived');
 });
 
+test('maps a model-authored act call to the same validated player primitive', () => {
+	const source = 'for (let x = 10; x < 12; x += 1) await act({ actionType: "mine", arguments: { x, y: 64, z: 10, expectedBlockId: "minecraft:stone" } });';
+	const vm = interpreter(source);
+	const command = vm.start(facts());
+	assert.equal(command.call.primitive, 'break_block');
+	assert.deepEqual(Object.fromEntries(Object.entries(command.call.arguments)), {
+		x: 10, y: 64, z: 10, expectedBlockId: 'minecraft:stone', timeoutMs: 15_000,
+	});
+	assert.doesNotThrow(() => validateAction({ type: command.call.primitive, ...command.call.arguments }));
+	const navigateVm = new ArenaScriptInterpreter(parseArenaScript('await act({actionType:"navigate_to",arguments:{x:1,y:64,z:2}});'), SCRIPT_BINDINGS);
+	const navigate = navigateVm.start(facts());
+	assert.equal(navigate.call.primitive, 'navigate_to');
+	assert.deepEqual(Object.fromEntries(Object.entries(navigate.call.arguments)), { x: 1, y: 64, z: 2, tolerance: 1, sprint: true, timeoutMs: 30_000 });
+	assert.doesNotThrow(() => validateAction({ type: navigate.call.primitive, ...navigate.call.arguments }));
+	const lookAtVm = new ArenaScriptInterpreter(parseArenaScript('await act("look_at", { x: 10.5, y: 64.5, z: 10.5 });'), SCRIPT_BINDINGS);
+	const lookAt = lookAtVm.start(facts());
+	assert.equal(lookAt.call.primitive, 'look_at');
+	assert.deepEqual(Object.fromEntries(Object.entries(lookAt.call.arguments)), { x: 10.5, y: 64.5, z: 10.5 });
+	assert.doesNotThrow(() => validateAction({ type: lookAt.call.primitive, ...lookAt.call.arguments }));
+	const directMineVm = new ArenaScriptInterpreter(parseArenaScript('await mine({x:10,y:64,z:10,expectedBlockId:"minecraft:stone"});'), SCRIPT_BINDINGS);
+	const directMine = directMineVm.start(facts());
+	assert.equal(directMine.call.primitive, 'break_block');
+	assert.deepEqual(Object.fromEntries(Object.entries(directMine.call.arguments)), { x: 10, y: 64, z: 10, expectedBlockId: 'minecraft:stone', timeoutMs: 15_000 });
+	assert.doesNotThrow(() => validateAction({ type: directMine.call.primitive, ...directMine.call.arguments }));
+	const extraToolFieldVm = new ArenaScriptInterpreter(parseArenaScript('await mine({x:10,y:64,z:10,expectedBlockId:"minecraft:stone",autoAim:true});'), SCRIPT_BINDINGS);
+	const extraToolField = extraToolFieldVm.start(facts());
+	assert.throws(() => validateAction({ type: extraToolField.call.primitive, ...extraToolField.call.arguments }));
+	const caughtVm = new ArenaScriptInterpreter(parseArenaScript('await act("look_at", {x: 10.5, y: 64.5, z: 10.5}).catch(() => {});'), SCRIPT_BINDINGS);
+	const caught = caughtVm.start(facts());
+	assert.equal(caught.call.primitive, 'look_at');
+	const caughtMineVm = new ArenaScriptInterpreter(parseArenaScript('await mine({x:10,y:64,z:10,expectedBlockId:"minecraft:stone"}).catch(() => {});'), SCRIPT_BINDINGS);
+	assert.equal(caughtMineVm.start(facts()).call.primitive, 'break_block');
+	assert.throws(() => interpreter('await act({ actionType: "mine", arguments: { x: 1, y: 64, z: 10 } });'), error => error.code === 'INVALID_ARENA_SCRIPT_COMMAND' && /expectedBlockId/.test(error.message));
+	assert.throws(() => interpreter('await act({ actionType: "mine" });'), error => error.code === 'UNSUPPORTED_SYNTAX' && /x,y,z,expectedBlockId.*world\.blocks.*act\("mine"/.test(error.message));
+	assert.throws(() => interpreter('await act({ actionType: action, arguments: {} });'), error => error.code === 'UNSUPPORTED_SYNTAX' && /actionType must be a literal/.test(error.message));
+});
+
 test('emits exact stable target ids and rejects selector fallbacks', () => {
 	const targetId = '00000000-0000-0000-0000-000000000001';
 	const vm = interpreter(`

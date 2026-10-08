@@ -6,8 +6,15 @@ import {
 	normalizeArenaScriptLimits,
 } from './limits.mjs';
 import { PLAYER_MEMBER_PRIMITIVES, SCRIPT_API_CALL_PATHS, PURE_API_PATHS } from './minecraft-api.mjs';
-import { ACTION_FIELDS } from '../constants.mjs';
+import { ACTION_FIELDS, OPTIONAL_ACTION_FIELDS } from '../constants.mjs';
 import { FACT_DOMAIN } from './fact-domains.mjs';
+
+const PLAYER_MEMBERS_BY_ACTION_TYPE = new Map(Object.entries(PLAYER_MEMBER_PRIMITIVES).map(([member, primitive]) => [primitive, member]));
+PLAYER_MEMBERS_BY_ACTION_TYPE.set('mine', 'mine');
+const ACTION_TOOL_DEFAULTS = Object.freeze({
+	break_block: Object.freeze({ timeoutMs: 15_000 }),
+	navigate_to: Object.freeze({ tolerance: 1, sprint: true, timeoutMs: 30_000 }),
+});
 
 const ALLOWED_GLOBALS = new Set([
 	'program',
@@ -159,6 +166,7 @@ function validateProgram(ast, limits) {
 		nodeCount: 0,
 		stepLocations: new Map(),
 		policyCount: 0,
+		actionToolAliasCount: 0,
 		unhandledPolicy: null,
 		survivalPolicy: 'pause_and_notify',
 		hasReassessmentCondition: false,
@@ -176,17 +184,18 @@ function validateProgram(ast, limits) {
 	validateWatcherPrologue(ast);
 	const rootScope = createLexicalScope(null, ast.body, state);
 	visit(ast, state, { functionBinding: null, functionNode: null, scope: rootScope, topLevelExpression: false, inFunction: false });
-
-	if (state.policyCount === 0) {
-		throw arenaError('MISSING_UNHANDLED_POLICY', 'exactly one top-level program.onUnhandledAttention policy is required');
+	if (state.policyCount === 0 && state.actionToolAliasCount === 0) {
+		throw arenaError('MISSING_UNHANDLED_POLICY', 'add one top-level program.onUnhandledAttention("pause_and_notify") policy');
 	}
+
 	detectRecursion(state);
 	validateFunctionCallDependencies(state);
 
 	return {
 		nodeCount: state.nodeCount,
 		stepLocations: createFrozenMap(state.stepLocations),
-		unhandledPolicy: state.unhandledPolicy,
+		// Tool-shaped source with no explicit policy inherits the existing safest policy.
+		unhandledPolicy: state.unhandledPolicy ?? 'pause_and_notify',
 		survivalPolicy: state.survivalPolicy,
 		hasReassessmentCondition: state.hasReassessmentCondition,
 		watcherCount: state.watcherCount,
@@ -262,7 +271,11 @@ function visit(node, state, context) {
 			}
 			return;
 		case 'ExpressionStatement':
-			visit(node.expression, state, { ...context, topLevelExpression: context.topLevelExpression });
+			visit(node.expression, state, {
+				...context,
+				topLevelExpression: context.topLevelExpression,
+				discardedNoopActionCatch: isNoopActionCatchStatement(node.expression, context.scope),
+			});
 			return;
 		case 'EmptyStatement':
 			return;
@@ -360,7 +373,7 @@ function visit(node, state, context) {
 		case 'WhileStatement':
 		case 'DoWhileStatement':
 		case 'ForInStatement':
-			throw arenaError('UNBOUNDED_LOOP', `${node.type} does not have a literal static bound`, node);
+			throw arenaError('UNBOUNDED_LOOP', 'use a literal-bounded for loop or program.repeatUntil(...,{maxIterations:N},...)', node);
 		case 'ForOfStatement': {
 			if (node.await || node.left.type !== 'VariableDeclaration' || !['const', 'let'].includes(node.left.kind)
 				|| node.left.declarations.length !== 1 || node.left.declarations[0].id.type !== 'Identifier') {
@@ -434,6 +447,10 @@ function validateCallExpression(node, state, context) {
 	if (node.optional) {
 		throw arenaError('UNSUPPORTED_SYNTAX', 'optional calls are not allowed', node);
 	}
+	if (context.discardedNoopActionCatch && isNoopActionCatchCall(node, context.scope)) rewriteNoopActionCatch(node);
+	if (node.callee.type === 'Identifier' && isActionToolAliasName(node.callee.name) && !resolveBinding(context.scope, node.callee.name)) {
+		rewriteActionToolCall(node, state);
+	}
 	const path = staticMemberPath(node.callee);
 	let functionBinding = null;
 	if (node.callee.type === 'Identifier') {
@@ -442,7 +459,7 @@ function validateCallExpression(node, state, context) {
 			throw arenaError('UNSUPPORTED_SYNTAX', `approved built-in ${node.callee.name} cannot resolve to a local binding`, node.callee);
 		}
 		if (!functionBinding?.callable && !APPROVED_BUILTIN_CALLS.has(node.callee.name)) {
-			throw arenaError('UNSUPPORTED_SYNTAX', 'calls must target an immutable local function or approved built-in', node.callee);
+			throw arenaError('UNSUPPORTED_SYNTAX', 'use a supported call such as await player.mine({...}); tool names are not functions', node.callee);
 		}
 	} else if (node.callee.type === 'MemberExpression') {
 		if (node.callee.computed || node.callee.optional) {
@@ -455,7 +472,7 @@ function validateCallExpression(node, state, context) {
 			throw arenaError('UNSUPPORTED_SYNTAX', `approved Arena API root ${path[0]} cannot resolve to a local binding`, node.callee);
 		}
 		if (!path || !APPROVED_API_CALL_PATHS.has(path.join('.'))) {
-			throw arenaError('UNSUPPORTED_SYNTAX', 'calls must target an approved Arena API member path', node.callee);
+			throw arenaError('UNSUPPORTED_SYNTAX', 'direct API calls only; use await tryResult(player.moveTo({...})) instead of .catch(...)', node.callee);
 		}
 	} else {
 		throw arenaError('UNSUPPORTED_SYNTAX', 'calls must use an identifier or approved Arena API member path', node.callee);
@@ -544,15 +561,124 @@ function validatePlayerPrimitiveArity(node, memberName) {
 function validateMineTarget(node) {
 	const argument = node.arguments[0];
 	if (!argument || argument.type !== 'ObjectExpression') {
-		throw arenaError('INVALID_ARENA_SCRIPT_COMMAND', 'player.mine requires an object containing expectedBlockId', node);
+		throw arenaError('INVALID_ARENA_SCRIPT_COMMAND', 'player.mine needs x,y,z and an observed non-air expectedBlockId from world.blocks', node);
 	}
 	const expected = argument.properties.find((property) => propertyName(property.key) === 'expectedBlockId');
 	if (!expected) {
-		throw arenaError('INVALID_ARENA_SCRIPT_COMMAND', 'player.mine requires the observed non-air expectedBlockId', argument);
+		throw arenaError('INVALID_ARENA_SCRIPT_COMMAND', 'player.mine needs an observed non-air expectedBlockId from the same world.blocks row, e.g. {x:b.x,y:b.y,z:b.z,expectedBlockId:b.blockId}', argument);
 	}
 	if (expected.value?.type === 'Literal' && (typeof expected.value.value !== 'string' || expected.value.value.trim() === '' || /(?:^|:)air$/u.test(expected.value.value))) {
 		throw arenaError('INVALID_ARENA_SCRIPT_COMMAND', 'player.mine expectedBlockId must identify a non-air block', expected.value);
 	}
+}
+
+function rewriteActionToolCall(node, state) {
+	let actionTypeValue;
+	let actionArguments;
+	if (node.callee.name !== 'act') {
+		if (node.arguments.length !== 1 || node.arguments[0]?.type !== 'ObjectExpression') {
+			const fields = node.callee.name === 'mine' || node.callee.name === 'break_block' ? '{x,y,z,expectedBlockId}' : '{...action fields...}';
+			throw arenaError('UNSUPPORTED_SYNTAX', `${node.callee.name} needs one action object, e.g. ${node.callee.name}(${fields})`, node);
+		}
+		actionTypeValue = node.callee.name;
+		actionArguments = node.arguments[0];
+	} else if (node.arguments.length === 2 && node.arguments[0]?.type === 'Literal' && typeof node.arguments[0].value === 'string') {
+		actionTypeValue = node.arguments[0].value;
+		actionArguments = node.arguments[1];
+	} else if (node.arguments.length === 1 && node.arguments[0]?.type === 'ObjectExpression') {
+		const properties = node.arguments[0].properties;
+		const actionType = properties.find((property) => propertyName(property.key) === 'actionType');
+		const argumentsProperty = properties.find((property) => propertyName(property.key) === 'arguments');
+		if (properties.length === 1 && actionType?.kind === 'init' && !actionType.method && !actionType.computed
+			&& actionType.value?.type === 'Literal' && typeof actionType.value.value === 'string') {
+			throw arenaError('UNSUPPORTED_SYNTAX', missingActionToolArgumentsHint(actionType.value.value), node);
+		}
+		if (properties.length !== 2 || properties.some((property) => property.kind !== 'init' || property.method || property.computed)
+			|| !actionType || !argumentsProperty || actionType.value?.type !== 'Literal' || typeof actionType.value.value !== 'string') {
+			throw arenaError('UNSUPPORTED_SYNTAX', 'act() needs {actionType:"mine",arguments:{...}} or act("mine",{...}); actionType must be a literal', node);
+		}
+		actionTypeValue = actionType.value.value;
+		actionArguments = argumentsProperty.value;
+	} else {
+		throw arenaError('UNSUPPORTED_SYNTAX', 'act() needs {actionType:"mine",arguments:{...}} or act("mine",{...}); actionType must be a literal', node);
+	}
+	if (actionArguments?.type !== 'ObjectExpression') {
+		throw arenaError('UNSUPPORTED_SYNTAX', 'act arguments must be an object literal, e.g. act("mine",{x:b.x,y:b.y,z:b.z,expectedBlockId:b.blockId})', node);
+	}
+	const member = PLAYER_MEMBERS_BY_ACTION_TYPE.get(actionTypeValue);
+	if (!member) {
+		throw arenaError('UNSUPPORTED_SYNTAX', `act actionType "${actionTypeValue}" has no ArenaScript primitive; use a supported player.<action> call`, node);
+	}
+	state.actionToolAliasCount += 1;
+	appendActionToolDefaults(actionArguments, ACTION_TOOL_DEFAULTS[PLAYER_MEMBER_PRIMITIVES[member]]);
+	const { start, end, loc } = node.callee;
+	node.callee = {
+		type: 'MemberExpression',
+		object: { type: 'Identifier', name: 'player', start, end, loc },
+		property: { type: 'Identifier', name: member, start, end, loc },
+		computed: false,
+		optional: false,
+		start,
+		end,
+		loc,
+	};
+	node.arguments = [actionArguments];
+}
+
+function appendActionToolDefaults(argument, defaults) {
+	for (const [name, value] of Object.entries(defaults ?? {})) {
+		if (argument.properties.some((property) => propertyName(property.key) === name)) continue;
+		argument.properties.push({
+			type: 'Property',
+			kind: 'init',
+			method: false,
+			shorthand: false,
+			computed: false,
+			key: { type: 'Identifier', name },
+			value: { type: 'Literal', value },
+		});
+	}
+}
+
+function missingActionToolArgumentsHint(actionType) {
+	if (actionType === 'mine' || actionType === 'break_block') {
+		return 'mine needs x,y,z,expectedBlockId; use a world.blocks row: act("mine",{x:b.x,y:b.y,z:b.z,expectedBlockId:b.blockId})';
+	}
+	const member = PLAYER_MEMBERS_BY_ACTION_TYPE.get(actionType);
+	const primitive = member === undefined ? null : PLAYER_MEMBER_PRIMITIVES[member];
+	const fields = primitive === null ? [] : ACTION_FIELDS[primitive].filter((field) =>
+		!(OPTIONAL_ACTION_FIELDS[primitive] ?? []).includes(field) && !Object.hasOwn(ACTION_TOOL_DEFAULTS[primitive] ?? {}, field));
+	return `act actionType "${actionType}" needs ${fields.length > 0 ? fields.join(', ') : 'its required fields'} in an arguments object`;
+}
+
+function isNoopActionCatchStatement(statement, scope) {
+	if (statement?.type !== 'AwaitExpression') return false;
+	const call = statement.argument;
+	return call?.type === 'CallExpression' && isNoopActionCatchCall(call, scope);
+}
+
+function isNoopActionCatchCall(node, scope) {
+	const callee = node?.callee;
+	const handler = node?.arguments?.[0];
+	const actionCall = callee?.type === 'MemberExpression' && !callee.computed && !callee.optional
+		&& propertyName(callee.property) === 'catch' ? callee.object : null;
+	return node.arguments.length === 1 && actionCall?.type === 'CallExpression'
+		&& actionCall.callee?.type === 'Identifier' && isActionToolAliasName(actionCall.callee.name)
+		&& !resolveBinding(scope, actionCall.callee.name)
+		&& handler?.type === 'ArrowFunctionExpression' && !handler.async && handler.params.length === 0
+		&& handler.body?.type === 'BlockStatement' && handler.body.body.length === 0;
+}
+
+function isActionToolAliasName(name) {
+	return name === 'act' || PLAYER_MEMBERS_BY_ACTION_TYPE.has(name);
+}
+
+function rewriteNoopActionCatch(node) {
+	// The discarded no-op handler leaves the normalized action result on the existing tryResult path.
+	const { start, end, loc } = node.callee;
+	const actionCall = node.callee.object;
+	node.callee = { type: 'Identifier', name: 'tryResult', start, end, loc };
+	node.arguments = [actionCall];
 }
 
 function validateExactTargetCall(node) {
