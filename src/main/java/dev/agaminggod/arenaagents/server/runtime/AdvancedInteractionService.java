@@ -193,8 +193,19 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 		return !limitedCrafting || recipeBook.contains(recipeKey);
 	}
 
-	static boolean craftOutputSatisfiesRequest(int outputCount, int requestedCount) {
-		return requestedCount > 0 && outputCount >= requestedCount;
+	/** Crafts needed for {@code requestedCount} items; a request below one craft's output still takes one craft. */
+	static int craftsForRequest(int outputCount, int requestedCount) {
+		if (outputCount <= 0 || requestedCount <= 0) return 0;
+		return Math.max(1, (requestedCount + outputCount - 1) / outputCount);
+	}
+
+	/**
+	 * Upper bound on the time a batch of {@code crafts} takes at player click pace: opening, a pickup and a put-back
+	 * per ingredient, one click per item placed in each cell, the result click and the linger.
+	 */
+	static long craftBatchMs(int cells, int ingredients, int crafts) {
+		long clicks = 2L * ingredients + (long) cells * crafts + 1L;
+		return (CraftTransaction.OPEN_TICKS + clicks * CraftTransaction.CLICK_TICKS + CraftTransaction.LINGER_TICKS) * 50L;
 	}
 
 	static String craftPlacementFailureReason(RecipeBookMenu.PostPlaceAction placement) {
@@ -449,9 +460,12 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 	 * appear in the hand with no screen at all (play-test: every furnace_transaction and select_tool).
 	 */
 	private abstract class PacedMenuTransaction extends Transaction {
-		/** Same pacing as crafting: the opened screen is shown before the move and after it. */
-		static final int OPEN_TICKS = 3;
-		static final int LINGER_TICKS = 3;
+		/**
+		 * Same pacing as crafting: the opened screen is shown before the move and after it. The POV publisher
+		 * snapshots every tick, so 2 ticks is the least a spectator is guaranteed to see on each side of the move.
+		 */
+		static final int OPEN_TICKS = 2;
+		static final int LINGER_TICKS = 2;
 
 		private int ticks;
 		private int actTick = -1;
@@ -900,11 +914,11 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 	 */
 	private final class CraftTransaction extends Transaction {
 		/** Ticks the opened, empty grid is shown before the first click. */
-		static final int OPEN_TICKS = 3;
+		static final int OPEN_TICKS = 2;
 		/** Ticks between clicks: quick, but each item movement is readable. */
 		static final int CLICK_TICKS = 2;
 		/** Ticks the menu stays open after the result has been taken. */
-		static final int LINGER_TICKS = 3;
+		static final int LINGER_TICKS = 2;
 
 		private enum Phase { START, FILL, LINGER }
 
@@ -922,6 +936,11 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 		/** Menu slot index of each grid cell still to fill, mapped to the one ingredient vanilla chose for it. */
 		private final Map<Integer, ItemStack> pendingGrid = new LinkedHashMap<>();
 		private int carrySourceSlot = -1;
+		/** Crafts requested (output count rounded up), and how many the grid is filled for after the limits below. */
+		private int requestedCrafts = 1;
+		private int plannedCrafts = 1;
+		/** Why fewer crafts than requested are planned; null when the whole request fits. */
+		private String craftLimit;
 		private TickResult committed;
 		/** Inventory, grid and cursor ownership when this transaction last finished a tick. */
 		private List<TransactionSnapshot.OwnedStack> ownershipAtLastTick;
@@ -1074,22 +1093,17 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 				} else if (gridStacks.stream().anyMatch(stack -> !stack.isEmpty() && stack.getCount() != 1)) {
 					reasonCode = "CRAFT_COUNT_UNSUPPORTED";
 					message = "Safe crafting requires exactly one item in every occupied input slot";
-				} else if (output.isEmpty() || !craftOutputSatisfiesRequest(output.getCount(), integer(arguments, "count"))) {
+				} else if (output.isEmpty()) {
 					reasonCode = "CRAFT_COUNT_UNSUPPORTED";
-					message = "One craft of this recipe makes " + output.getCount()
-							+ "; request at most that many and craft again for more";
+					message = "Vanilla recipe placement produced no result";
 				} else if (menuCapacity(menu, playerSlotStart(), playerSlotEnd(), output) < output.getCount()) {
 					reasonCode = "DESTINATION_FULL";
 					message = "Player inventory cannot accept the complete crafting result";
 				} else {
-					// Click order: every cell of one ingredient while it is carried, then the next ingredient.
-					for (Slot slot : gridSlots) {
-						if (!slot.hasItem() || pendingGrid.containsKey(slot.index)) continue;
-						for (Slot same : gridSlots) {
-							if (same.hasItem() && ItemStack.isSameItemSameComponents(same.getItem(), slot.getItem())) {
-								pendingGrid.put(same.index, same.getItem().copyWithCount(1));
-							}
-						}
+					Refusal refusal = planBatch(output, input);
+					if (refusal != null) {
+						reasonCode = refusal.code();
+						message = refusal.message();
 					}
 				}
 			} catch (RuntimeException placementFailure) {
@@ -1109,6 +1123,81 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 						placementGuard, gridSlots);
 			}
 			return null;
+		}
+
+		private record Refusal(String code, String message) {
+		}
+
+		/**
+		 * Works out how many crafts the grid is filled for, as a player stacks the ingredients of several crafts
+		 * before taking the result once. The dry run holds one craft; the request may need more, limited by what the
+		 * inventory holds, a cell's stack size, the room for the result and the action's time budget. Fills
+		 * {@link #pendingGrid} with the items each cell still needs.
+		 */
+		private Refusal planBatch(ItemStack output, CraftingInput input) {
+			requestedCrafts = craftsForRequest(output.getCount(), integer(arguments, "count"));
+			List<ItemStack> kinds = new ArrayList<>();
+			int cells = 0;
+			for (Slot slot : gridSlots) {
+				if (!slot.hasItem()) continue;
+				cells++;
+				if (kinds.stream().noneMatch(kind -> ItemStack.isSameItemSameComponents(kind, slot.getItem()))) {
+					kinds.add(slot.getItem().copyWithCount(1));
+				}
+			}
+			int crafts = requestedCrafts;
+			if (crafts > 1 && craftingRecipe.getRemainingItems(input).stream().anyMatch(rest -> !rest.isEmpty())) {
+				return new Refusal("CRAFT_COUNT_UNSUPPORTED", "This recipe leaves an item behind in the grid, so it crafts one at a time: "
+						+ "one craft makes " + output.getCount() + "; request at most that many and craft again for more");
+			}
+			String limit = null;
+			for (ItemStack kind : kinds) {
+				int kindCells = (int) gridSlots.stream().filter(slot ->
+						slot.hasItem() && ItemStack.isSameItemSameComponents(slot.getItem(), kind)).count();
+				// The dry run has already moved one craft's worth out of the inventory into the grid.
+				int held = kindCells;
+				for (int index = playerSlotStart(); index <= playerSlotEnd(); index++) {
+					Slot slot = menu.getSlot(index);
+					if (slot.hasItem() && ItemStack.isSameItemSameComponents(slot.getItem(), kind) && slot.mayPickup(player)) {
+						held += slot.getItem().getCount();
+					}
+				}
+				if (held / kindCells < crafts) {
+					crafts = held / kindCells;
+					limit = "the inventory holds ingredients for only " + craftsText(crafts);
+				}
+				if (kind.getMaxStackSize() < crafts) {
+					crafts = kind.getMaxStackSize();
+					limit = "a crafting cell holds at most " + crafts + " " + itemId(kind);
+				}
+			}
+			int room = menuCapacity(menu, playerSlotStart(), playerSlotEnd(), output) / output.getCount();
+			if (room < crafts) {
+				crafts = room;
+				limit = "the inventory has room for only " + craftsText(crafts);
+			}
+			// Clicking is paced like a player's, so a large batch needs a larger timeoutMs; do what fits.
+			long budgetMs = timeoutMs * 3L / 4L;
+			while (crafts > 1 && craftBatchMs(cells, kinds.size(), crafts) > budgetMs) {
+				crafts--;
+				limit = "timeoutMs " + timeoutMs + " allows only " + craftsText(crafts);
+			}
+			plannedCrafts = crafts;
+			craftLimit = crafts < requestedCrafts ? limit : null;
+			// Click order: every cell of one ingredient while it is carried, then the next ingredient.
+			for (Slot slot : gridSlots) {
+				if (!slot.hasItem() || pendingGrid.containsKey(slot.index)) continue;
+				for (Slot same : gridSlots) {
+					if (same.hasItem() && ItemStack.isSameItemSameComponents(same.getItem(), slot.getItem())) {
+						pendingGrid.put(same.index, same.getItem().copyWithCount(plannedCrafts));
+					}
+				}
+			}
+			return null;
+		}
+
+		private static String craftsText(int crafts) {
+			return crafts + " craft" + (crafts == 1 ? "" : "s");
 		}
 
 		/** One click: pick up an ingredient, drop one into a grid cell, put the rest back, or take the result. */
@@ -1132,15 +1221,22 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 			}
 			if (next != null && ItemStack.isSameItemSameComponents(carried, next.getValue())) {
 				int carriedBefore = carried.getCount();
+				int needed = next.getValue().getCount();
 				Slot cell = menu.getSlot(next.getKey());
-				// Right click drops exactly one item into the cell.
-				click(next.getKey(), 1, ContainerInput.PICKUP);
-				if (cell.getItem().getCount() != 1 || !ItemStack.isSameItemSameComponents(cell.getItem(), next.getValue())
-						|| menu.getCarried().getCount() != carriedBefore - 1) {
+				int cellBefore = cell.getItem().getCount();
+				// One left click puts the whole carried stack in when the cell can take it all; otherwise a right
+				// click drops exactly one item, as a player counts out a short stack.
+				boolean wholeStack = carriedBefore <= needed;
+				int placed = wholeStack ? carriedBefore : 1;
+				click(next.getKey(), wholeStack ? 0 : 1, ContainerInput.PICKUP);
+				if (cell.getItem().getCount() != cellBefore + placed
+						|| !ItemStack.isSameItemSameComponents(cell.getItem(), next.getValue())
+						|| menu.getCarried().getCount() != carriedBefore - placed) {
 					return failureAfterPlacement("CRAFT_INPUT_REJECTED",
-							"The crafting grid did not accept exactly one ingredient", placementGuard, gridSlots);
+							"The crafting grid did not accept the ingredient count it was given", placementGuard, gridSlots);
 				}
-				pendingGrid.remove(next.getKey());
+				if (placed >= needed) pendingGrid.remove(next.getKey());
+				else pendingGrid.put(next.getKey(), next.getValue().copyWithCount(needed - placed));
 				return TickResult.running();
 			}
 			// This ingredient is in every cell that needs it: put the rest back where it came from. A pickup during
@@ -1230,38 +1326,63 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 			}
 			Slot resultSlot = menu.getSlot(0);
 			ItemStack output = resultSlot.getItem().copy();
-			if (output.isEmpty() || !craftOutputSatisfiesRequest(output.getCount(), integer(arguments, "count"))) {
+			if (output.isEmpty()) {
 				return failureAfterPlacement("CRAFT_COUNT_UNSUPPORTED",
-						"One vanilla craft must produce at least the requested count", placementGuard, gridSlots);
+						"The filled grid produced no craft result", placementGuard, gridSlots);
 			}
-			if (menuCapacity(menu, playerSlotStart(), playerSlotEnd(), output) < output.getCount()) {
+			// A pickup during the pacing can have filled the room planned for, so the crafts are capped again here.
+			int crafts = Math.min(plannedCrafts, menuCapacity(menu, playerSlotStart(), playerSlotEnd(), output) / output.getCount());
+			if (crafts < 1) {
 				return failureAfterPlacement("DESTINATION_FULL",
 						"Player inventory cannot accept the complete crafting result", placementGuard, gridSlots);
+			}
+			if (crafts < plannedCrafts && craftLimit == null) craftLimit = "the inventory filled while crafting";
+			if (crafts > 1 && remainders.stream().anyMatch(rest -> !rest.isEmpty())) {
+				return failureAfterPlacement("CRAFT_REMAINDER_UNSAFE",
+						"A multi-craft batch cannot leave recipe remainders in the grid", placementGuard, gridSlots);
 			}
 			if (!resultSlot.mayPickup(player)) {
 				return failureAfterPlacement("CRAFT_RESULT_LOCKED",
 						"Vanilla menu denied taking the crafting result", placementGuard, gridSlots);
 			}
-			TransactionSnapshot.CraftingAccounting accounting;
-			try {
-				accounting = TransactionSnapshot.CraftingAccounting.plan(
-						ownedStacks(player.getInventory(), gridSlots), ownedStacks(gridStacks),
-						ownedStacks(remainders), ownedStack(output));
-			} catch (IllegalArgumentException invalidAccounting) {
-				return failureAfterPlacement("CRAFT_ACCOUNTING_UNSAFE", safeMessage(invalidAccounting),
-						placementGuard, gridSlots);
-			}
+			List<TransactionSnapshot.OwnedStack> ownedBefore = ownedStacks(player.getInventory(), gridSlots);
 			CraftMenuSnapshot beforeCraft = CraftMenuSnapshot.capture(menu);
 			try {
 				menu.incrementStateId();
-				ItemStack moved = craftCommitter.quickMove(menu, player, 0);
+				// One shift-click on the result crafts again while the grid still holds a full set, as in vanilla.
+				int done = 0;
+				int movedCount = 0;
+				while (done < crafts) {
+					ItemStack moved = craftCommitter.quickMove(menu, player, 0);
+					if (moved.isEmpty() || moved.getCount() != output.getCount()) break;
+					movedCount += moved.getCount();
+					done++;
+				}
 				menu.broadcastChanges();
-				TransactionPostcondition.Verdict craftVerdict = accounting.verify(
-						ownedStacks(player.getInventory(), gridSlots));
-				if (!moved.isEmpty() && moved.getCount() == output.getCount()
-						&& craftVerdict instanceof TransactionPostcondition.Verdict.Succeeded) {
-					committed = TickResult.succeeded("CRAFT_CONFIRMED",
-							"Crafted " + output.getCount() + " " + itemId(output) + " through visible menu clicks");
+				TransactionPostcondition.Verdict craftVerdict = null;
+				if (done > 0) {
+					final int craftsDone = done;
+					TransactionSnapshot.CraftingAccounting accounting;
+					try {
+						accounting = TransactionSnapshot.CraftingAccounting.plan(
+								ownedBefore, ownedStacks(gridStacks.stream().map(stack ->
+										stack.isEmpty() ? stack : stack.copyWithCount(craftsDone)).toList()),
+								ownedStacks(remainders), ownedStack(output.copyWithCount(movedCount)));
+					} catch (IllegalArgumentException invalidAccounting) {
+						return rollbackCommittedCraft(
+								menu, beforeCraft, placementGuard, gridSlots,
+								"CRAFT_ACCOUNTING_UNSAFE", safeMessage(invalidAccounting));
+					}
+					craftVerdict = accounting.verify(ownedStacks(player.getInventory(), gridSlots));
+				}
+				if (done > 0 && craftVerdict instanceof TransactionPostcondition.Verdict.Succeeded) {
+					int requestedItems = integer(arguments, "count");
+					String what = movedCount + " " + itemId(output);
+					if (done < crafts && craftLimit == null) craftLimit = "the inventory filled while crafting";
+					committed = movedCount >= requestedItems
+							? TickResult.succeeded("CRAFT_CONFIRMED", "Crafted " + what + " through visible menu clicks")
+							: TickResult.succeeded("CRAFT_PARTIAL", "Crafted " + what + " through visible menu clicks; "
+									+ requestedItems + " were requested but " + (craftLimit == null ? "the craft stopped early" : craftLimit));
 					phase = Phase.LINGER;
 					nextActionTick = ticks + LINGER_TICKS;
 					return TickResult.running();

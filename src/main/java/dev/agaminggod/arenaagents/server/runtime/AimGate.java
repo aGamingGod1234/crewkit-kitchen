@@ -10,8 +10,8 @@ import net.minecraft.util.Mth;
 final class AimGate {
 	/** Close enough that the crosshair sits on the target face. */
 	static final float TOLERANCE_DEGREES = 3.0F;
-	/** Aligned ticks before the interaction, so a spectator sees the look settle before the arm swings. */
-	static final int SETTLE_TICKS = 3;
+	/** Aligned ticks before the interaction, so a spectator sees the look settle for a tick before the arm swings. */
+	static final int SETTLE_TICKS = 2;
 	/** A swing needs the crosshair on the hitbox for one tick; players click as soon as it is on a moving mob. */
 	static final int ATTACK_SETTLE_TICKS = 1;
 	/** Two seconds at 20 TPS covers a rate-limited half turn with margin. */

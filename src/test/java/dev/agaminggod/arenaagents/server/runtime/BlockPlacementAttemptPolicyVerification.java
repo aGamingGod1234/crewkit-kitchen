@@ -29,7 +29,19 @@ public final class BlockPlacementAttemptPolicyVerification {
 		);
 		assertEquals(java.util.List.of(), BlockPlacementAttemptPolicy.supportedFaces(direction -> false),
 				"unsupported blocks expose no placeable faces");
-		return 11;
+		assertEquals(3, BlockPlacementAttemptPolicy.countedAttempts(3, 0), "temporary refusals keep the whole retry budget");
+		assertEquals(3, BlockPlacementAttemptPolicy.countedAttempts(3, 1), "one final refusal still earns a repeat");
+		assertEquals(8, BlockPlacementAttemptPolicy.countedAttempts(2, BlockPlacementAttemptPolicy.FINAL_REFUSAL_LIMIT),
+				"repeated final refusals spend the budget");
+		assertTrue(BlockPlacementAttemptPolicy.isExhausted(BlockPlacementAttemptPolicy.countedAttempts(2, 2)),
+				"two final refusals end the placement after 2 clicks, not 8");
+		assertFalse(BlockPlacementAttemptPolicy.shouldAttempt(10_000L, BlockPlacementAttemptPolicy.countedAttempts(2, 2)),
+				"no click is issued once refusals are final");
+		assertTrue(BlockPlacementAttemptPolicy.shouldAttempt(250L, BlockPlacementAttemptPolicy.countedAttempts(1, 1)),
+				"the repeat after a first final refusal is still sent");
+		long failMs = (BlockPlacementAttemptPolicy.FINAL_REFUSAL_LIMIT - 1) * BlockPlacementAttemptPolicy.RETRY_INTERVAL_MS;
+		assertEquals(250L, failMs, "a final refusal now fails 250 ms after the first click (was 1750 ms)");
+		return 17;
 	}
 
 	private static void assertEquals(Object expected, Object actual, String label) {

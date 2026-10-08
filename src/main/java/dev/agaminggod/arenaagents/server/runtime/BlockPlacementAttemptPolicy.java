@@ -16,6 +16,11 @@ public final class BlockPlacementAttemptPolicy {
 	);
 	static final long RETRY_INTERVAL_MS = 250L;
 	static final int MAX_ATTEMPTS = 8;
+	/**
+	 * Consecutive refusals with no temporary cause (see ServerActionExecutor.placementRefusalMayClear) after which
+	 * more clicks only repeat the same answer. One repeat is kept in case the first saw a stale view of the world.
+	 */
+	static final int FINAL_REFUSAL_LIMIT = 2;
 
 	private BlockPlacementAttemptPolicy() {
 	}
@@ -24,6 +29,11 @@ public final class BlockPlacementAttemptPolicy {
 		return attempts >= 0
 				&& attempts < MAX_ATTEMPTS
 				&& Math.max(0L, elapsedMs) >= attempts * RETRY_INTERVAL_MS;
+	}
+
+	/** The attempts that count against the budget: all of it once the refusals are final. */
+	static int countedAttempts(int attempts, int finalRefusals) {
+		return finalRefusals >= FINAL_REFUSAL_LIMIT ? Math.max(attempts, MAX_ATTEMPTS) : attempts;
 	}
 
 	static boolean isExhausted(int attempts) {

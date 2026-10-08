@@ -53,19 +53,25 @@ public final class RecipeActionVerification {
 				"minecraft:planks", loadedPlankRecipes,
 				List.of("minecraft:spruce_log")),
 				"rejects generic planks when no loaded recipe matches observed ingredients");
-		assertTrue(AdvancedInteractionService.craftOutputSatisfiesRequest(4, 1),
+		assertEquals(1, AdvancedInteractionService.craftsForRequest(4, 1),
 				"one vanilla plank craft may exceed the requested minimum");
-		assertTrue(AdvancedInteractionService.craftOutputSatisfiesRequest(4, 4),
+		assertEquals(1, AdvancedInteractionService.craftsForRequest(4, 4),
 				"an exact vanilla craft output satisfies the request");
-		assertFalse(AdvancedInteractionService.craftOutputSatisfiesRequest(4, 5),
-				"one craft cannot claim an output larger than it produced");
+		assertEquals(2, AdvancedInteractionService.craftsForRequest(4, 5),
+				"a request above one craft's output stacks a second craft");
+		assertEquals(4, AdvancedInteractionService.craftsForRequest(4, 16), "16 planks are four crafts");
+		assertEquals(0, AdvancedInteractionService.craftsForRequest(4, 0), "a zero request crafts nothing");
+		assertTrue(AdvancedInteractionService.craftBatchMs(1, 1, 4) < AdvancedInteractionService.craftBatchMs(1, 1, 8),
+				"a larger batch needs more click time");
+		assertTrue(AdvancedInteractionService.craftBatchMs(1, 1, 4) < 4 * AdvancedInteractionService.craftBatchMs(1, 1, 1),
+				"stacking four crafts clicks faster than four separate crafts");
 		assertEquals("RECIPE_INPUTS_UNAVAILABLE", AdvancedInteractionService.craftPlacementFailureReason(
 				net.minecraft.world.inventory.RecipeBookMenu.PostPlaceAction.PLACE_GHOST_RECIPE),
 				"vanilla ghost placement reports missing inputs instead of generic placement rejection");
 		assertEquals("RECIPE_PLACEMENT_REJECTED", AdvancedInteractionService.craftPlacementFailureReason(
 				net.minecraft.world.inventory.RecipeBookMenu.PostPlaceAction.NOTHING),
 				"successful placement has no missing-input diagnostic");
-		return 13;
+		return 17;
 	}
 
 	private static void expectFailure(String expectedCode, Runnable action, String label) {
