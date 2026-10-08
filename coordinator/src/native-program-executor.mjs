@@ -48,7 +48,7 @@ export class NativeProgramExecutor {
 			observation: programObservation(context.observation), eventSequence: context.eventSequence, engine: null,
 			observationIntervalMs, observationTimer: null, refresh: null, refreshGeneration: 0, decision: null, decisionSequence: 0,
 			urgentNotificationQueued: false,
-			notifiedDecisionId: null, notifiedEventSequence: null, notifiedDecisions: [],
+			notifiedDecisionId: null, notifiedDecisions: [], firstNotifiedDecision: null,
 			lastOrdinaryNotificationAt: Number.NEGATIVE_INFINITY, ordinaryNotificationTimer: null, unseenAttention: false };
 		run.engine = new ArenaScriptEngine({
 			dispatch: (command) => { void this.#dispatch(run, command); },
@@ -179,6 +179,7 @@ export class NativeProgramExecutor {
 			trigger: request.trigger, priority: request.priority, eventSequence: request.eventSequence,
 			...(request.actionFailure === undefined ? {} : { actionFailure: request.actionFailure }) };
 		run.notifiedDecisions = [];
+		run.firstNotifiedDecision = null;
 		run.unseenAttention = true;
 		// The engine must finish applying the authored attention policy first.
 		if (notificationPriority === 'urgent') this.#scheduleUrgentNotification(run);
@@ -244,9 +245,7 @@ export class NativeProgramExecutor {
 	#rememberNotifiedDecision(run) {
 		const snapshot = { decisionId: run.decision.decisionId, eventSequence: run.eventSequence,
 			trigger: run.decision.trigger, facts: urgentFactsSnapshot(run.observation) };
-		run.notifiedEventSequence = snapshot.eventSequence;
-		run.notifiedDecisions.push(snapshot);
-		if (run.notifiedDecisions.length > 8) run.notifiedDecisions.shift();
+		rememberNotifiedSnapshot(run, snapshot);
 	}
 
 	/** A new decision handle is owed only for a higher urgency, a changed action failure or a new urgent trigger. */
@@ -297,21 +296,24 @@ export class NativeProgramExecutor {
 		const currentHandle = currentDecision?.decisionId === decisionId;
 		const stopDirective = directive === 'pause' || directive === 'finish';
 		const supersededHandle = stopDirective && isIssuedDecisionId(run, decisionId);
-		if (!currentHandle && !supersededHandle) throw codedError('STALE_PROGRAM_DECISION', 'Read the current program decision before responding');
+		if (!currentHandle && !supersededHandle) {
+			if (!stopDirective && currentDecision?.priority === 'urgent' && isIssuedDecisionId(run, decisionId)) {
+				throw freshDecisionError(run, currentDecision, null);
+			}
+			throw codedError('STALE_PROGRAM_DECISION', 'Read the current program decision before responding');
+		}
+		const request = run.engine.refreshDirectiveRequest();
+		if (request === null) throw codedError('STALE_PROGRAM_DECISION', 'The program no longer needs this decision');
+		if (directive === 'continue' && request.actionFailure !== undefined) throw codedError('PROGRAM_REPLACEMENT_REQUIRED', 'A halted routine after repeated action failure requires replacement or an explicit stop');
 		if (!stopDirective && currentHandle && currentDecision.priority === 'urgent') {
-			const notified = eventSequence === undefined
-				? run.notifiedDecisions.findLast((entry) => entry.decisionId === decisionId && entry.eventSequence === run.notifiedEventSequence)
-				: run.notifiedDecisions.findLast((entry) => entry.decisionId === decisionId && entry.eventSequence === eventSequence);
+			const notified = notifiedSnapshotForResponse(run, decisionId, eventSequence);
 			if (notified === undefined) throw freshDecisionError(run, currentDecision, null);
-			const changes = urgentFactChanges(notified, currentDecision, run);
+			const changes = urgentFactChanges(notified, currentDecision, run, { continueOnly: directive === 'continue' });
 			if ((directive === 'replace' && run.eventSequence !== notified.eventSequence) || changes.material) {
 				throw freshDecisionError(run, currentDecision, notified);
 			}
 		}
 		const compiled = directive === 'replace' ? parseArenaScript(source) : null;
-		const request = run.engine.refreshDirectiveRequest();
-		if (request === null) throw codedError('STALE_PROGRAM_DECISION', 'The program no longer needs this decision');
-		if (directive === 'continue' && request.actionFailure !== undefined) throw codedError('PROGRAM_REPLACEMENT_REQUIRED', 'A halted routine after repeated action failure requires replacement or an explicit stop');
 		run.decision = null;
 		if (directive === 'replace') {
 			// Replacements may wait for the current body action to acknowledge before
@@ -508,8 +510,14 @@ function canonicalCommand(command) {
 const CONTINUE_HEALTH_DROP_LIMIT = 4;
 const CONTINUE_AIR_DROP_LIMIT = 20;
 const CONTINUE_THREAT_DISTANCE_LIMIT = 2;
+// At three hearts, another bounded two-heart loss could leave only one heart.
+const CONTINUE_HEALTH_FLOOR = CONTINUE_HEALTH_DROP_LIMIT + 2;
+// Air is measured in ticks at 20 per second, so 60 leaves about three seconds.
+const CONTINUE_MIN_AIR = 60;
+const CONTINUE_CLOSE_THREAT_DISTANCE = 3;
+const INLINE_THREAT_LIMIT = 8;
 // A continue may cover up to two hearts, one second of air, or two blocks of approach from the notified facts.
-const HOSTILE_ENTITY_TYPE = /(?:zombie|skeleton|creeper|spider|enderman|witch|pillager|vindicator|evoker|ravager|phantom|guardian|blaze|ghast|wither|warden|hoglin|piglin_brute|silverfish|endermite|slime|magma_cube|shulker|vex|breeze|drowned|husk|stray|bogged)/i;
+const HOSTILE_ENTITY_TYPE = /(?:zombie|skeleton|creeper|spider|enderman|witch|pillager|vindicator|evoker|ravager|phantom|guardian|blaze|ghast|wither|warden|hoglin|piglin|silverfish|endermite|slime|magma_cube|shulker|vex|breeze|drowned|husk|stray|bogged|illusioner|giant|dragon|zoglin|(?:spectral_)?arrow|trident|fireball|wither_skull|shulker_bullet|llama_spit|wind_charge|projectile|tnt|firework_rocket)/i;
 
 function urgentFactsSnapshot(observation) {
 	const player = observation?.player ?? {};
@@ -518,16 +526,17 @@ function urgentFactsSnapshot(observation) {
 		if (entry === null || typeof entry !== 'object') return;
 		const uuid = entry.uuid ?? entry.stableId ?? entry.id;
 		if (typeof uuid !== 'string') return;
-		const type = typeof entry.type === 'string' ? entry.type : null;
+		const type = typeof entry.type === 'string' ? entry.type : typeof entry.typeId === 'string' ? entry.typeId : null;
 		const threat = assumeThreat || entry.hostile === true || entry.targetingAgent === true || entry.targeting === true
 			|| entry.swelling === true || HOSTILE_ENTITY_TYPE.test(type ?? '');
 		if (!threat) return;
 		const previous = threats.get(uuid) ?? {};
+		const distance = threatDistance(entry, player);
 		threats.set(uuid, { ...previous, uuid, ...(type === null ? {} : { type }),
 			...(typeof entry.targeting === 'boolean' || typeof entry.targetingAgent === 'boolean' ? { targeting: entry.targeting ?? entry.targetingAgent } : {}),
 			...(typeof entry.swelling === 'boolean' ? { swelling: entry.swelling } : {}),
 			...(Number.isFinite(entry.fuse) ? { fuse: entry.fuse } : {}),
-			...(Number.isFinite(entry.distance) ? { distance: entry.distance } : {}),
+			...(distance === null ? {} : { distance }),
 		});
 	};
 	for (const entity of Array.isArray(observation?.entities) ? observation.entities : []) addThreat(entity);
@@ -541,12 +550,13 @@ function urgentFactsSnapshot(observation) {
 	if (lastAttacker !== null) addThreat(lastAttacker, true);
 	return {
 		health: finiteValue(player.health), air: finiteValue(player.air ?? player.airSupply), lastAttacker,
+		onFire: onFireValue(player),
 		threats: [...threats.values()], hazards: [...hazardKeys(observation)].sort(),
 		dimension: observation?.world?.dimension ?? null, ready: observation?.ready ?? null, status: observation?.status ?? null,
 	};
 }
 
-function urgentFactChanges(notified, decision, run) {
+function urgentFactChanges(notified, decision, run, { continueOnly = false } = {}) {
 	const before = notified.facts;
 	const after = urgentFactsSnapshot(run.observation);
 	const facts = {};
@@ -554,10 +564,19 @@ function urgentFactChanges(notified, decision, run) {
 	const airUnknownChanged = (before.air === null) !== (after.air === null);
 	const healthDrop = before.health === null || after.health === null ? 0 : before.health - after.health;
 	const airDrop = before.air === null || after.air === null ? 0 : before.air - after.air;
-	if (healthUnknownChanged || healthDrop !== 0) facts.health = { notified: before.health, current: after.health, ...(healthUnknownChanged ? {} : { droppedBy: healthDrop }) };
-	if (airUnknownChanged || airDrop !== 0) facts.air = { notified: before.air, current: after.air, ...(airUnknownChanged ? {} : { droppedBy: airDrop }) };
+	const lowRemainingHealth = after.health !== null && after.health <= CONTINUE_HEALTH_FLOOR;
+	const largeRelativeHealthDrop = after.health !== null && healthDrop > after.health / 2;
+	const criticalAir = after.air !== null && (after.air <= 0 || after.air < CONTINUE_MIN_AIR);
+	if (healthUnknownChanged || healthDrop !== 0 || lowRemainingHealth || largeRelativeHealthDrop) {
+		facts.health = { notified: before.health, current: after.health, ...(healthUnknownChanged ? {} : { droppedBy: healthDrop }),
+			...(lowRemainingHealth ? { lowRemainingHealth: true } : {}), ...(largeRelativeHealthDrop ? { largeRelativeDrop: true } : {}) };
+	}
+	if (airUnknownChanged || airDrop !== 0 || criticalAir) facts.air = { notified: before.air, current: after.air,
+		...(airUnknownChanged ? {} : { droppedBy: airDrop }), ...(criticalAir ? { critical: true } : {}) };
 	if (notified.trigger !== decision.trigger) facts.triggerChanged = { notified: notified.trigger, current: decision.trigger };
 	if (JSON.stringify(before.lastAttacker) !== JSON.stringify(after.lastAttacker)) facts.lastAttacker = after.lastAttacker;
+	const newFire = after.onFire === true && before.onFire !== true;
+	if (newFire) facts.onFire = { notified: before.onFire, current: true };
 	const oldThreats = new Map(before.threats.map((entry) => [entry.uuid, entry]));
 	const newThreats = after.threats.filter((entry) => !oldThreats.has(entry.uuid));
 	const changedThreats = [];
@@ -572,6 +591,8 @@ function urgentFactChanges(notified, decision, run) {
 		if (Number.isFinite(old.distance) && Number.isFinite(current.distance) && old.distance - current.distance > CONTINUE_THREAT_DISTANCE_LIMIT) {
 			changed.distance = { notified: old.distance, current: current.distance };
 		}
+		if (Number.isFinite(current.distance) && current.distance <= CONTINUE_CLOSE_THREAT_DISTANCE
+			&& (!Number.isFinite(old.distance) || current.distance < old.distance)) changed.closeApproach = true;
 		if (Object.keys(changed).length > 0) changedThreats.push({ uuid: current.uuid, type: current.type, changes: changed });
 	}
 	if (newThreats.length > 0) facts.newThreats = newThreats;
@@ -584,6 +605,7 @@ function urgentFactChanges(notified, decision, run) {
 	return {
 		facts,
 		material: notified.trigger !== decision.trigger || healthUnknownChanged || airUnknownChanged
+			|| (continueOnly && (lowRemainingHealth || largeRelativeHealthDrop || criticalAir)) || newFire
 			|| healthDrop > CONTINUE_HEALTH_DROP_LIMIT || airDrop > CONTINUE_AIR_DROP_LIMIT
 			|| (before.lastAttacker?.uuid !== after.lastAttacker?.uuid && after.lastAttacker !== null)
 			|| newThreats.length > 0 || changedThreats.length > 0 || newHazards.length > 0
@@ -594,27 +616,28 @@ function urgentFactChanges(notified, decision, run) {
 function freshDecisionError(run, decision, notified) {
 	const currentFacts = urgentFactsSnapshot(run.observation);
 	const changes = notified === null ? null : urgentFactChanges(notified, decision, run).facts;
+	const exposedFacts = limitInlineThreatFacts(changes && Object.keys(changes).length > 0 ? changes : {
+		health: currentFacts.health, air: currentFacts.air, lastAttacker: currentFacts.lastAttacker, onFire: currentFacts.onFire,
+		threats: currentFacts.threats, hazards: currentFacts.hazards, dimension: currentFacts.dimension,
+		ready: currentFacts.ready, status: currentFacts.status,
+	});
 	const freshDecision = {
 		decisionId: decision.decisionId,
 		eventSequence: run.eventSequence,
 		trigger: decision.trigger,
-		facts: changes && Object.keys(changes).length > 0 ? changes : {
-			health: currentFacts.health, air: currentFacts.air, lastAttacker: currentFacts.lastAttacker,
-			threats: currentFacts.threats, hazards: currentFacts.hazards,
-		},
+		facts: exposedFacts,
 	};
 	decision.eventSequence = run.eventSequence;
-	const snapshot = { decisionId: decision.decisionId, eventSequence: run.eventSequence, trigger: decision.trigger, facts: currentFacts };
+	const snapshot = { decisionId: decision.decisionId, eventSequence: run.eventSequence, trigger: decision.trigger,
+		facts: freshDecisionSnapshotFacts(notified, currentFacts, exposedFacts) };
 	run.notifiedDecisionId = decision.decisionId;
-	run.notifiedEventSequence = run.eventSequence;
-	run.notifiedDecisions.push(snapshot);
-	if (run.notifiedDecisions.length > 8) run.notifiedDecisions.shift();
+	rememberNotifiedSnapshot(run, snapshot);
 	const error = codedError('STALE_PROGRAM_DECISION', `New danger facts arrived after this decision. Fresh decision: ${JSON.stringify(freshDecision)}`);
 	error.freshDecision = freshDecision;
 	return error;
 }
 
-const HAZARD_BLOCK = /lava|fire|magma/i;
+const HAZARD_BLOCK = /lava|fire|magma|tnt/i;
 function hazardKeys(observation) {
 	const keys = new Set();
 	for (const block of Array.isArray(observation?.blocks) ? observation.blocks : []) {
@@ -624,6 +647,75 @@ function hazardKeys(observation) {
 	return keys;
 }
 const finiteValue = (value) => (Number.isFinite(value) ? value : null);
+function threatDistance(entry, player) {
+	const directDistance = finiteValue(entry.distance);
+	if (directDistance !== null) return directDistance;
+	const squaredDistance = finiteValue(entry.distanceSquared);
+	if (squaredDistance !== null && squaredDistance >= 0) return Math.sqrt(squaredDistance);
+	const from = entry.position ?? entry;
+	const to = player.position ?? player;
+	const coordinates = ['x', 'y', 'z'].map((axis) => [finiteValue(from?.[axis]), finiteValue(to?.[axis])]);
+	if (coordinates.some(([left, right]) => left === null || right === null)) return null;
+	return Math.hypot(...coordinates.map(([left, right]) => left - right));
+}
+function rememberNotifiedSnapshot(run, snapshot) {
+	run.notifiedDecisions.push(snapshot);
+	if (run.notifiedDecisions.length > 8) run.notifiedDecisions.shift();
+	// Keep the first shown facts after the rolling history evicts later snapshots.
+	if (run.firstNotifiedDecision?.decisionId !== snapshot.decisionId) run.firstNotifiedDecision = snapshot;
+}
+function notifiedSnapshotForResponse(run, decisionId, eventSequence) {
+	const snapshots = run.notifiedDecisions.filter((entry) => entry.decisionId === decisionId);
+	if (run.firstNotifiedDecision?.decisionId === decisionId
+		&& !snapshots.some((entry) => entry.eventSequence === run.firstNotifiedDecision.eventSequence)) snapshots.push(run.firstNotifiedDecision);
+	snapshots.sort((left, right) => left.eventSequence - right.eventSequence);
+	if (eventSequence === undefined) return snapshots[0];
+	if (!Number.isSafeInteger(eventSequence) || eventSequence > run.eventSequence) return undefined;
+	// A status can carry a folded sequence; use the nearest earlier facts the model was shown.
+	return snapshots.filter((entry) => entry.eventSequence <= eventSequence).at(-1);
+}
+function limitInlineThreatFacts(facts) {
+	let remaining = INLINE_THREAT_LIMIT;
+	let omittedThreats = 0;
+	const bounded = { ...facts };
+	for (const field of ['newThreats', 'changedThreats', 'threats']) {
+		if (!Array.isArray(bounded[field])) continue;
+		const entries = bounded[field];
+		bounded[field] = entries.slice(0, remaining);
+		remaining -= bounded[field].length;
+		omittedThreats += entries.length - bounded[field].length;
+	}
+	if (omittedThreats > 0) bounded.omittedThreats = omittedThreats;
+	return bounded;
+}
+function freshDecisionSnapshotFacts(notified, current, exposed) {
+	const facts = notified === null
+		? { health: null, air: null, lastAttacker: null, onFire: null, threats: [], hazards: [], dimension: null, ready: null, status: null }
+		: { ...notified.facts, threats: [...notified.facts.threats], hazards: [...notified.facts.hazards] };
+	for (const field of ['health', 'air', 'lastAttacker', 'onFire', 'dimension', 'ready', 'status']) {
+		if (Object.hasOwn(exposed, field)) facts[field] = current[field];
+	}
+	if (Array.isArray(exposed.hazards)) facts.hazards = [...current.hazards];
+	else if (Array.isArray(exposed.newHazards)) facts.hazards = [...new Set([...facts.hazards, ...exposed.newHazards])];
+	if (Object.hasOwn(exposed, 'playerStatus')) {
+		facts.ready = current.ready;
+		facts.status = current.status;
+	}
+	// Omitted rows stay unseen so a retry cannot authorize threats absent from the inline response.
+	const currentThreats = new Map(current.threats.map((entry) => [entry.uuid, entry]));
+	const knownThreats = new Map(facts.threats.map((entry) => [entry.uuid, entry]));
+	for (const field of ['newThreats', 'changedThreats', 'threats']) {
+		for (const row of Array.isArray(exposed[field]) ? exposed[field] : []) {
+			const currentThreat = currentThreats.get(row.uuid);
+			if (currentThreat !== undefined) knownThreats.set(row.uuid, currentThreat);
+		}
+	}
+	facts.threats = [...knownThreats.values()];
+	return facts;
+}
+function onFireValue(player) {
+	return typeof player?.onFire === 'boolean' ? player.onFire : typeof player?.fire === 'boolean' ? player.fire : null;
+}
 /** Facts that must reach the model at once even when the routine itself keeps running. */
 export function hazardEdge(previous, next) {
 	if (previous === null || typeof previous !== 'object' || next === null || typeof next !== 'object') return false;
@@ -633,6 +725,7 @@ export function hazardEdge(previous, next) {
 	if (health[0] !== null && health[1] !== null && health[1] < health[0]) return true;
 	const air = [finiteValue(previous.player?.air ?? previous.player?.airSupply), finiteValue(next.player?.air ?? next.player?.airSupply)];
 	if (air[0] !== null && air[1] !== null && air[1] < air[0]) return true;
+	if (onFireValue(previous.player) !== true && onFireValue(next.player) === true) return true;
 	if ((previous.world?.dimension ?? null) !== (next.world?.dimension ?? null)) return true;
 	if (previous.ready !== next.ready || JSON.stringify(previous.status ?? null) !== JSON.stringify(next.status ?? null)) return true;
 	return false;
