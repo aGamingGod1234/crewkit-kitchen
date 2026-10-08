@@ -94,6 +94,7 @@ public final class AdvancedInteractionRollbackVerification {
 			verifyPacedToolSelection(components);
 			verifyCraftPickupDuringPacing(components);
 			verifyCraftFailureWithFullInventory(components);
+			verifyExternallyClosedCraftMenu(components);
 			if (failure != null) throw failure;
 		}
 		return 151;
@@ -146,6 +147,16 @@ public final class AdvancedInteractionRollbackVerification {
 		var settled = committed.tick(System.currentTimeMillis());
 		assertEquals("CRAFT_CONFIRMED", settled.reasonCode(), "death while the menu closes keeps the committed success");
 		committed.cleanup();
+
+		// Cancel during the linger after the take: the pickaxe exists, so the craft reports success, not a cancel.
+		Fixture lingering = craftFixture();
+		var cancelled = halfFilledPickaxe(components, lingering);
+		for (int tick = 0; tick < 200 && count(lingering, Items.WOODEN_PICKAXE) == 0; tick++) cancelled.tick(System.currentTimeMillis());
+		assertEquals("CRAFT_CONFIRMED", cancelled.committedResult().reasonCode(), "the lingering craft exposes its committed result");
+		cancelled.cancel("operator stop");
+		var reported = cancelled.tick(System.currentTimeMillis());
+		assertEquals(ServerTransactionAdapter.TickState.SUCCEEDED, reported.state(), "a cancel in the linger reports the craft that happened");
+		assertEquals(1, count(lingering, Items.WOODEN_PICKAXE), "and the pickaxe is kept");
 	}
 
 	/**
@@ -766,6 +777,27 @@ public final class AdvancedInteractionRollbackVerification {
 		assertEquals(2, count(fixture, Items.OAK_PLANKS), "the two leftover planks went back to another slot");
 		assertEquals(3, count(fixture, Items.COBBLESTONE), "the picked-up cobblestone is kept");
 		assertTrue(fixture.player().containerMenu.getCarried().isEmpty(), "nothing is left on the cursor");
+	}
+
+	/**
+	 * Review finding: when someone else closed the table menu, vanilla dropped the grid and cursor planks at the body
+	 * (full inventory), the craft absorbed that loss as an external change, and MENU_CLOSED then claimed the exact
+	 * ownership was restored. The loss is now reported as dropped at the body.
+	 */
+	private static void verifyExternallyClosedCraftMenu(ComponentBindings components) {
+		components.stack(Items.DIRT, 1, 0);
+		Fixture fixture = craftFixture();
+		fixture.player().recordDrops = true;
+		var transaction = halfFilledPickaxe(components, fixture);
+		for (int slot = 0; slot < 36; slot++) {
+			if (fixture.inventory().getItem(slot).isEmpty()) fixture.inventory().setItem(slot, components.stack(Items.DIRT, 64, 0));
+		}
+		fixture.player().closeContainer();
+		var result = tickToEnd(fixture, transaction).result();
+		transaction.cleanup();
+		assertEquals("MENU_CLOSED", result.reasonCode(), "the external close fails the craft: " + result.message());
+		assertTrue(!result.message().contains("was restored"), "it never claims a restore that did not happen: " + result.message());
+		assertTrue(result.message().contains("3 dropped at the body"), "the dropped planks are reported: " + result.message());
 	}
 
 	/** A failure with a full inventory returns what fits and drops the rest at the body, like vanilla closing a menu. */

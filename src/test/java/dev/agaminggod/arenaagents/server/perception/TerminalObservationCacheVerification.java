@@ -46,7 +46,7 @@ public final class TerminalObservationCacheVerification {
 			terrainLoads.incrementAndGet(); return new RawSpatialObservation(List.of(), List.of());
 		};
 		java.util.function.Supplier<ServerObservationCollector.SightSample> loadLandmarks = () -> {
-			landmarkLoads.incrementAndGet(); return new ServerObservationCollector.SightSample(List.of(), SightedFeatures.Sample.EMPTY);
+			landmarkLoads.incrementAndGet(); return new ServerObservationCollector.SightSample(List.of());
 		};
 		spatial.getOrCompute(spatialKey, 10, loadTerrain);
 		landmarks.getOrCompute(landmarkKey, 10, loadLandmarks);

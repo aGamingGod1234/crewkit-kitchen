@@ -2424,7 +2424,7 @@ test('sighted structures, caves and ore veins pass wire validation with bounded 
 	observation.attention = true;
 	observation.changedFacts = ['sighted'];
 	observation.sighted = {
-		structures: [{ x: 40, y: 62, z: -12, distance: 41, bearing: -20, structure: 'minecraft:shipwreck_beached', new: true }],
+		structures: [{ x: 40, y: 62, z: -12, distance: 41, bearing: -20, structure: 'shipwreck', new: true }],
 		caves: [{ x: 6, y: 58, z: 3, distance: 9, bearing: 35, air: 61 }],
 		veins: [{ x: 2, y: 60, z: 1, distance: 3, bearing: 10, blockId: 'minecraft:deepslate_iron_ore', visible: 5 }],
 	};

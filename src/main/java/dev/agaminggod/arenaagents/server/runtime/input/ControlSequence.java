@@ -89,6 +89,16 @@ public final class ControlSequence {
 		return new Step(current.input(), Status.RUNNING, frameIndex, elapsedTicks, maxTicks, current.instantLook());
 	}
 
+	/**
+	 * Takes back the tick the last running step consumed. The executor calls it while the view is still turning onto
+	 * a frame's look, so the frame's authored ticks (and the sequence budget) start only once the aim arrives.
+	 */
+	public void refundTick() {
+		if (terminal != null || frameTicks < 1 || elapsedTicks < 1) throw new IllegalStateException("only a running step's tick can be refunded");
+		frameTicks--;
+		elapsedTicks--;
+	}
+
 	private Step finish(Status status) {
 		terminal = status;
 		return step(null, status);

@@ -390,6 +390,18 @@ public record TransactionSnapshot(List<SlotState> slots) {
 		return result;
 	}
 
+	/** What {@code after} holds less of than {@code before}, per item identity (the stacks that left ownership). */
+	public static List<OwnedStack> ownershipLost(List<OwnedStack> before, List<OwnedStack> after) {
+		HashMap<ItemIdentity, Integer> previous = aggregateOwned(before);
+		HashMap<ItemIdentity, Integer> current = aggregateOwned(after);
+		List<OwnedStack> lost = new ArrayList<>();
+		previous.forEach((key, count) -> {
+			int missing = count - current.getOrDefault(key, 0);
+			if (missing > 0) lost.add(new OwnedStack(key.itemId(), missing, key.fingerprint()));
+		});
+		return lost;
+	}
+
 	public record ItemIdentity(String itemId, String fingerprint) {
 		public ItemIdentity {
 			Objects.requireNonNull(itemId, "itemId must not be null");

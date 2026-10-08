@@ -74,7 +74,7 @@ test('sight, workstation and tool-wear facts stay small next to a representative
 	const base = sizes(() => {});
 	const cave = { x: -452, y: 80, z: 131, distance: 15, bearing: -34, air: 61 };
 	const vein = { blockId: 'minecraft:iron_ore', x: -441, y: 84, z: 126, distance: 4, bearing: 12, visible: 3 };
-	const structure = { structure: 'minecraft:village_plains', x: -400, y: 63, z: 200, distance: 90, bearing: -20, new: true };
+	const structure = { structure: 'village', x: -400, y: 63, z: 200, distance: 90, bearing: -20, new: true };
 	const typical = sizes((observation) => { observation.sighted = { caves: [cave], veins: [vein] }; });
 	const full = sizes((observation) => { observation.sighted = { structures: Array(4).fill(structure), caves: Array(3).fill(cave), veins: Array(4).fill(vein) }; });
 	const leftBehind = sizes((observation) => { observation.leftBehind = [{ blockId: 'minecraft:crafting_table', x: -436, y: 86, z: 120, distance: 21 }]; });

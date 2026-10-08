@@ -78,6 +78,14 @@ public final class ServerObservationCollector {
 	private static final int LANDMARK_CACHE_CAPACITY = 16;
 	/** Mutation revision keys provide freshness; this age bounds retained stationary poses. */
 	private static final long LANDMARK_CACHE_TICKS = 200L;
+	/**
+	 * Structure, cave and vein rows cost structure lookups, up to 3,000 block reads and a flood fill each; half a second
+	 * between recomputes is still faster than a player reads the scene, and the rows' bearings follow the live view.
+	 */
+	static final long SIGHTED_RECOMPUTE_TICKS = 10L;
+	/** Landmark sight rays are reused while the eye stays within half a block and the view within 4 degrees. */
+	static final double LANDMARK_EYE_QUANTUM = 0.5D;
+	static final float LANDMARK_VIEW_QUANTUM_DEGREES = 4.0F;
 	private static final EquipmentSlot[] EQUIPMENT_SLOTS = EquipmentSlot.values();
 
 	private final CodexAgentManager manager;
@@ -88,6 +96,8 @@ public final class ServerObservationCollector {
 			new ObservationSectionCache<>(LANDMARK_CACHE_CAPACITY, LANDMARK_CACHE_TICKS, value -> value);
 	/** Structure starts each agent saw recently, so a structure is announced as new once, not on every glance. */
 	private final Map<AgentId, Map<String, Long>> seenStructures = new HashMap<>();
+	/** Each agent's last structure, cave and vein rows, recomputed at most every {@link #SIGHTED_RECOMPUTE_TICKS}. */
+	private final Map<AgentId, SightedMemo> sightedSamples = new HashMap<>();
 	private final Map<AgentId, RawSpatialObservation.Key> spatialKeys = new HashMap<>();
 	private final Map<AgentId, RawPlayerState> lastRawStates = new HashMap<>();
 	private final ThreatPerception threats = new ThreatPerception();
@@ -198,6 +208,10 @@ public final class ServerObservationCollector {
 		world.addProperty("dayTime", level.getDefaultClockTime());
 		world.addProperty("raining", level.isRaining());
 		world.addProperty("thundering", level.isThundering());
+		// Both shown to a player (difficulty in the menu, the gamerule by /gamerule): they decide whether health regenerates.
+		world.addProperty("difficulty", level.getDifficulty().getSerializedName());
+		world.addProperty("naturalRegeneration",
+				level.getGameRules().get(net.minecraft.world.level.gamerules.GameRules.NATURAL_HEALTH_REGENERATION));
 		observation.add("world", world);
 		observation.add("currentAction", currentAction(agentId));
 		observation.add("lastResult", lastResult(agentId));
@@ -400,6 +414,9 @@ public final class ServerObservationCollector {
 		spatialKeys.remove(agentId);
 		spatialCache.invalidateMatching(key -> key.agentId().equals(agentId));
 		landmarkCache.invalidateMatching(key -> key.agentId().equals(agentId));
+		synchronized (sightedSamples) {
+			sightedSamples.remove(agentId);
+		}
 		invalidatePlayerState(agentId);
 	}
 
@@ -462,6 +479,9 @@ public final class ServerObservationCollector {
 			synchronized (seenStructures) {
 				SightedFeatures.retain(seenStructures, tracked);
 			}
+			synchronized (sightedSamples) {
+				SightedFeatures.retain(sightedSamples, tracked);
+			}
 			survival.retain(tracked);
 			lastInventories.keySet().removeIf(agentId -> !tracked.contains(agentId));
 		}
@@ -485,18 +505,19 @@ public final class ServerObservationCollector {
 		RawSpatialObservation raw = spatialCache.getOrCompute(
 			key, level.getGameTime(), () -> rawSpatialObservation(level, agent, position));
 		Vec3 eye = agent.getEyePosition();
+		// Quantized so a still agent's small head movements reuse the sight rays instead of recasting all 80.
 		LandmarkSampleKey landmarkKey = new LandmarkSampleKey(
 			agentId,
 			level.dimension().identifier().toString(),
 			position.getX(),
 			position.getY(),
 			position.getZ(),
-			eye.x,
-			eye.y,
-			eye.z,
-			agent.getYRot(),
-			agent.getXRot(),
-			agent.getY(),
+			quantize(eye.x, LANDMARK_EYE_QUANTUM),
+			quantize(eye.y, LANDMARK_EYE_QUANTUM),
+			quantize(eye.z, LANDMARK_EYE_QUANTUM),
+			(float) quantize(net.minecraft.util.Mth.wrapDegrees(agent.getYRot()), LANDMARK_VIEW_QUANTUM_DEGREES),
+			(float) quantize(agent.getXRot(), LANDMARK_VIEW_QUANTUM_DEGREES),
+			quantize(agent.getY(), LANDMARK_EYE_QUANTUM),
 			agent.isDescending(),
 			agent.getMainHandItem().getItem(),
 			worldMutationRevision(level, position, LANDMARK_SIGHT_DISTANCE + 1)
@@ -504,12 +525,13 @@ public final class ServerObservationCollector {
 		SightSample sight = landmarkCache.getOrCompute(
 			landmarkKey,
 			level.getGameTime(),
-			() -> sightSample(level, agent, position, visibility, raw)
+			() -> sightRays(level, agent, position)
 		);
 		JsonObject value = new JsonObject();
 		value.add("blocks", blocks(level, agent, raw.blocks(), visibility));
 		value.add("landmarks", landmarks(level, agent, visibility, sight.surfaces()));
-		JsonObject sighted = SightedFeatures.toJson(sight.sighted(), eye, agent.getYRot(),
+		SightedFeatures.Sample seen = sightedSample(agentId, level, agent, position, visibility, raw, sight);
+		JsonObject sighted = SightedFeatures.toJson(seen, eye, agent.getYRot(),
 				structureKey -> markStructureSeen(agentId, structureKey, level.getGameTime()));
 		if (sighted != null) value.add("sighted", sighted);
 		value.add("nearbyContainers", nearbyTransactionTargets(raw.containers(), level::getBlockState,
@@ -990,22 +1012,46 @@ public final class ServerObservationCollector {
 		return sightRays(level, agent, center).surfaces();
 	}
 
-	/** Sight-ray surfaces plus the structure, cave and ore-vein rows they reveal, cached per view. */
-	record SightSample(List<VisibleSurfaceCandidate> surfaces, SightedFeatures.Sample sighted) {
+	/**
+	 * Sight-ray surfaces (landmarks), plus every block a ray hit and the open cell in front of it, cached per
+	 * quantized view. The structure, cave and vein rows are derived from these at most every
+	 * {@link #SIGHTED_RECOMPUTE_TICKS}.
+	 */
+	record SightSample(List<VisibleSurfaceCandidate> surfaces, List<BlockPos> hits, List<BlockPos> openings) {
+		SightSample(List<VisibleSurfaceCandidate> surfaces) {
+			this(surfaces, List.of(), List.of());
+		}
 	}
 
-	/** Every block a sight ray hit and the open cell in front of it, besides the deduplicated landmark surfaces. */
-	record SightRays(List<VisibleSurfaceCandidate> surfaces, List<BlockPos> hits, List<BlockPos> openings) {
+	/** An agent's last sighted rows and when (and in which dimension) they were computed. */
+	record SightedMemo(String dimension, long gameTime, SightedFeatures.Sample sample) {
 	}
 
-	private static SightSample sightSample(
+	static double quantize(double value, double quantum) {
+		return Math.round(value / quantum) * quantum;
+	}
+
+	/** Whether the agent's sighted rows are due: none yet, another dimension, or {@link #SIGHTED_RECOMPUTE_TICKS} old. */
+	static boolean sightedDue(SightedMemo memo, String dimension, long gameTime) {
+		return memo == null || !memo.dimension().equals(dimension) || gameTime - memo.gameTime() >= SIGHTED_RECOMPUTE_TICKS
+				|| gameTime < memo.gameTime();
+	}
+
+	private SightedFeatures.Sample sightedSample(
+			AgentId agentId,
 			ServerLevel level,
 			ServerPlayer agent,
 			BlockPos center,
 			ObservationVisibility.Frame visibility,
-			RawSpatialObservation raw
+			RawSpatialObservation raw,
+			SightSample rays
 	) {
-		SightRays rays = sightRays(level, agent, center);
+		String dimension = level.dimension().identifier().toString();
+		long gameTime = level.getGameTime();
+		synchronized (sightedSamples) {
+			SightedMemo memo = sightedSamples.get(agentId);
+			if (!sightedDue(memo, dimension, gameTime)) return memo.sample();
+		}
 		List<BlockPos> seenLocalOre = new ArrayList<>();
 		int visibilityChecks = 0;
 		for (BlockObservationOrdering.Candidate candidate : raw.blocks()) {
@@ -1014,8 +1060,12 @@ public final class ServerObservationCollector {
 			BlockPos position = center.offset(candidate.x(), candidate.y(), candidate.z());
 			if (level.hasChunkAt(position) && visibility.canSeeBlock(position)) seenLocalOre.add(position);
 		}
-		return new SightSample(rays.surfaces(), SightedFeatures.sample(level, agent.getEyePosition(), rays.hits(), rays.openings(),
-				seenLocalOre, visibility::canSeeBlock));
+		SightedFeatures.Sample sample = SightedFeatures.sample(level, agent.getEyePosition(), rays.hits(), rays.openings(),
+				seenLocalOre, visibility::canSeeBlock);
+		synchronized (sightedSamples) {
+			sightedSamples.put(agentId, new SightedMemo(dimension, gameTime, sample));
+		}
+		return sample;
 	}
 
 	private boolean markStructureSeen(AgentId agentId, String key, long gameTime) {
@@ -1024,7 +1074,7 @@ public final class ServerObservationCollector {
 		}
 	}
 
-	private static SightRays sightRays(
+	private static SightSample sightRays(
 			ServerLevel level,
 			ServerPlayer agent,
 			BlockPos center
@@ -1079,7 +1129,7 @@ public final class ServerObservationCollector {
 				.thenComparingInt(VisibleSurfaceCandidate::y)
 				.thenComparingInt(VisibleSurfaceCandidate::x)
 				.thenComparingInt(VisibleSurfaceCandidate::z));
-		return new SightRays(List.copyOf(ordered), List.copyOf(hits), List.copyOf(openings));
+		return new SightSample(List.copyOf(ordered), List.copyOf(hits), List.copyOf(openings));
 	}
 
 	static boolean withinLocalBlockScan(BlockPos center, BlockPos position) {

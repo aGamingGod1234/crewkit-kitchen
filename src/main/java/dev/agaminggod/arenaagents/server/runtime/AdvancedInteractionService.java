@@ -294,7 +294,8 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 		final ServerPlayer player;
 		final ServerActionRequest request;
 		final JsonObject arguments;
-		final ElapsedTimeAccumulator elapsedTime = new ElapsedTimeAccumulator(System.currentTimeMillis());
+		/** Started on the first tick, so the turn toward a block menu before it opens never eats the paced budget. */
+		ElapsedTimeAccumulator elapsedTime;
 		final long timeoutMs;
 		final TerminalGate terminal = new TerminalGate();
 		final List<ItemStack> retainedEscrow = new ArrayList<>();
@@ -314,6 +315,7 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 		public TickResult tick(long nowEpochMs) {
 			TickResult existing = terminal.terminalResult();
 			if (existing != null) return existing;
+			if (elapsedTime == null) elapsedTime = new ElapsedTimeAccumulator(nowEpochMs);
 			// Work already committed (a craft whose result was taken) stays a success even if the agent dies or the
 			// deadline passes while the menu is still being closed.
 			TickResult committed = committedResult();
@@ -337,13 +339,16 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 		abstract TickResult execute(long nowEpochMs);
 
 		/** A success that is already irreversible while the transaction finishes its presentation, else null. */
-		TickResult committedResult() {
+		@Override
+		public TickResult committedResult() {
 			return null;
 		}
 
+		/** A cancel during the linger after committed work reports that work; the items have already moved. */
 		@Override
 		public void cancel(String reason) {
-			terminal.finish(TickResult.cancelled(reason == null ? "Transaction cancelled" : reason));
+			TickResult committed = committedResult();
+			terminal.finish(committed != null ? committed : TickResult.cancelled(reason == null ? "Transaction cancelled" : reason));
 			cleanup();
 		}
 
@@ -507,7 +512,7 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 		}
 
 		@Override
-		TickResult committedResult() {
+		public TickResult committedResult() {
 			return committed;
 		}
 
@@ -922,6 +927,7 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 		private List<TransactionSnapshot.OwnedStack> ownershipAtLastTick;
 		/** Stacks this transaction dropped at the body because no inventory slot could take them, as vanilla does. */
 		private final List<TransactionSnapshot.OwnedStack> droppedAtBody = new ArrayList<>();
+		private boolean externalCloseAccounted;
 
 		CraftTransaction(ServerPlayer player, ServerActionRequest request, JsonObject arguments, boolean table) {
 			super(player, request, arguments, arguments.get("timeoutMs").getAsLong());
@@ -933,7 +939,18 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 			// Pickups land in the inventory between the craft's paced ticks (a player picks up items with a menu
 			// open too); only this transaction's own clicks must conserve ownership.
 			if (placementGuard != null && ownershipAtLastTick != null) {
-				placementGuard.absorbExternal(ownershipAtLastTick, heldOwnership());
+				List<TransactionSnapshot.OwnedStack> held = heldOwnership();
+				if (menu != null && player.containerMenu != menu && !externalCloseAccounted) {
+					// Closed by someone else (the table broke, the server closed it): vanilla put the grid and cursor
+					// back and dropped at the body what did not fit. That loss is recorded as dropped at the body, not
+					// absorbed like a pickup, or the failure would claim the exact ownership was restored.
+					externalCloseAccounted = true;
+					List<TransactionSnapshot.OwnedStack> lost = TransactionSnapshot.ownershipLost(ownershipAtLastTick, held);
+					droppedAtBody.addAll(lost);
+					held = new ArrayList<>(held);
+					held.addAll(lost);
+				}
+				placementGuard.absorbExternal(ownershipAtLastTick, held);
 			}
 			TickResult result = step();
 			ownershipAtLastTick = placementGuard == null || result.terminal() ? null : heldOwnership();
@@ -956,7 +973,13 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 				return TickResult.running();
 			}
 			if (ticks < nextActionTick) return TickResult.running();
-			if (phase == Phase.LINGER) return committed;
+			if (phase == Phase.LINGER) {
+				// Leftovers (remainders, or the grid with a full inventory) go back now, so the result can say where.
+				returnMenuItems();
+				int dropped = droppedAtBody.stream().mapToInt(TransactionSnapshot.OwnedStack::count).sum();
+				return dropped == 0 ? committed : TickResult.succeeded(committed.reasonCode(), committed.message() + "; "
+						+ dropped + " leftover item" + (dropped == 1 ? " was" : "s were") + " dropped at the body because the inventory is full");
+			}
 			nextActionTick = ticks + CLICK_TICKS;
 			if (player.containerMenu != menu) {
 				return failureAfterPlacement("MENU_CLOSED", "The crafting menu closed before the craft finished",
@@ -1347,7 +1370,7 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 		}
 
 		@Override
-		TickResult committedResult() {
+		public TickResult committedResult() {
 			return phase == Phase.LINGER ? committed : null;
 		}
 
