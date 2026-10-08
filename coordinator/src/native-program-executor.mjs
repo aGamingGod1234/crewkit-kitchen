@@ -25,12 +25,13 @@ export class NativeProgramExecutor {
 		this.#now = now; this.#ordinaryAttentionIntervalMs = ordinaryAttentionIntervalMs;
 	}
 
-	run(record, { source, parameters, maxActions = 64, timeoutMs = 30_000, expectedDurationMs, planningLeadMs, observationIntervalMs, programId: suppliedProgramId, provenance = {} } = {}, context = {}) {
+	run(record, { source, parameters, maxActions = 64, timeoutMs = 30_000, expectedDurationMs, planningLeadMs, planningFloorMs, observationIntervalMs, programId: suppliedProgramId, provenance = {} } = {}, context = {}) {
 		validateRecord(record);
 		integer(maxActions, 'maxActions', 1, 256); integer(timeoutMs, 'timeoutMs', 1, 120_000);
 		if (expectedDurationMs !== undefined) integer(expectedDurationMs, 'expectedDurationMs', 1, timeoutMs);
 		parameters = validateProgramParameters(parameters);
 		if (planningLeadMs !== undefined && planningLeadMs !== null) integer(planningLeadMs, 'planningLeadMs', 0, Number.MAX_SAFE_INTEGER);
+		if (planningFloorMs !== undefined && planningFloorMs !== null) integer(planningFloorMs, 'planningFloorMs', 0, Number.MAX_SAFE_INTEGER);
 		if (observationIntervalMs !== undefined) {
 			integer(observationIntervalMs, 'observationIntervalMs', 100, 5000);
 			if (typeof context.refreshObservation !== 'function') throw codedError('INSPECTION_UNAVAILABLE', 'Requested sampling requires fresh observations');
@@ -43,7 +44,7 @@ export class NativeProgramExecutor {
 		if (typeof programId !== 'string' || !/^[A-Za-z0-9._:-]{1,128}$/.test(programId)) throw new TypeError('programId must be a bounded identifier');
 		let resolve;
 		const result = new Promise((done) => { resolve = done; });
-		const run = { record: { ...record }, context, programId, maxActions, timeoutMs, expectedDurationMs, planningLeadMs: planningLeadMs ?? null, actions: 0, actionsSucceeded: 0, actionsFailed: 0, receipts: [], resolve, result,
+		const run = { record: { ...record }, context, programId, maxActions, timeoutMs, expectedDurationMs, planningLeadMs: planningLeadMs ?? null, planningFloorMs: planningFloorMs ?? 0, firstDispatchAt: null, actions: 0, actionsSucceeded: 0, actionsFailed: 0, receipts: [], resolve, result,
 			settled: false, bodyPending: false, pendingActionId: null, stopping: null, timer: null, planningDueTimer: null, planningDueNotified: false, planningDueVersion: null, cancellationTimer: null,
 			observation: programObservation(context.observation), eventSequence: context.eventSequence, engine: null,
 			observationIntervalMs, observationTimer: null, refresh: null, refreshGeneration: 0, decision: null, decisionSequence: 0, notifiedDecisionId: null, lastOrdinaryNotificationAt: Number.NEGATIVE_INFINITY, ordinaryNotificationTimer: null, unseenAttention: false };
@@ -140,17 +141,42 @@ export class NativeProgramExecutor {
 		const delay = Math.max(0, (run.expectedDurationMs ?? run.timeoutMs) - run.planningLeadMs);
 		run.planningDueTimer = this.#setTimeout(() => {
 			run.planningDueTimer = null;
-			// The advisory belongs to the version for which the deadline timer was
-			// armed. A replacement invalidates the old timer without interrupting
-			// the body or manufacturing a new decision.
-			if (run.settled || run.stopping !== null || run.planningDueNotified) return;
-			run.planningDueNotified = true;
-			const snapshot = run.engine.snapshot();
-			if (run.decision !== null || snapshot.status !== 'ACTIVE' || snapshot.version !== run.planningDueVersion) return;
-			try { run.context.onPlanningDue(this.status(run.record), { planningLeadMs: run.planningLeadMs }); }
-			catch { /* planning-ahead is advisory and cannot interrupt body execution */ }
+			this.#advisePlanning(run, {});
 		}, delay);
 		run.planningDueTimer?.unref?.();
+	}
+
+	/**
+	 * The advisory belongs to the version for which it was armed. A replacement invalidates it without
+	 * interrupting the body or manufacturing a new decision.
+	 */
+	#advisePlanning(run, details) {
+		if (run.settled || run.stopping !== null || run.planningDueNotified) return;
+		run.planningDueNotified = true;
+		this.#clearPlanningDue(run);
+		const snapshot = run.engine.snapshot();
+		if (run.decision !== null || snapshot.status !== 'ACTIVE' || snapshot.version !== run.planningDueVersion) return;
+		try { run.context.onPlanningDue(this.status(run.record), { planningLeadMs: run.planningLeadMs, ...details }); }
+		catch { /* planning-ahead is advisory and cannot interrupt body execution */ }
+	}
+
+	/**
+	 * Programs use a fraction of their timeout, so the timeout-based advisory never lands. Straight-line source
+	 * knows what it has left: advise once that remaining work is inside the model's measured decision time (so the
+	 * next step can be queued before the body goes idle) but not so close that the answer would arrive late.
+	 */
+	#adviseFromRemainingWork(run) {
+		const completed = run.actionsSucceeded + run.actionsFailed;
+		if (run.settled || run.stopping !== null || run.planningDueNotified || run.expectedDurationMs !== undefined || run.decision !== null
+			|| !(run.planningLeadMs > 0) || completed < 2 || typeof run.context.onPlanningDue !== 'function') return;
+		try {
+			const commands = run.engine.remainingCommands();
+			if (!Number.isSafeInteger(commands) || commands < 1) return;
+			const estimatedMs = Math.round(commands * (this.#now() - run.firstDispatchAt) / completed);
+			if (estimatedMs > run.planningLeadMs || estimatedMs < run.planningFloorMs) return;
+			if (run.context.allowRemainingWorkAdvisory?.() === false) return;
+			this.#advisePlanning(run, { trigger: 'remaining_work', commands, estimatedMs });
+		} catch { /* an estimate that cannot be made means no early advisory */ }
 	}
 
 	#requestDecision(run, request, notificationPriority = request?.priority) {
@@ -302,6 +328,7 @@ export class NativeProgramExecutor {
 		try { command = canonicalCommand(suppliedCommand); }
 		catch (error) { this.#return(run, failure(error, 'INVALID_PROGRAM_ACTION'), true); return; }
 		run.actions++;
+		run.firstDispatchAt ??= this.#now();
 		run.bodyPending = true;
 		run.pendingActionId = command.actionId;
 		let result;
@@ -346,6 +373,7 @@ export class NativeProgramExecutor {
 			if (run.stopping !== null) run.engine.suspend(run.stopping.reasonCode);
 			run.engine.ingestActionResult({ actionId: command.actionId, state: result.state, reasonCode: result.reasonCode, eventSequence: fresh.eventSequence });
 			this.#check(run);
+			this.#adviseFromRemainingWork(run);
 		} catch (error) { this.#return(run, { state: 'YIELDED', reasonCode: boundedReason(error?.code, 'FRESH_OBSERVATION_REQUIRED') }, true); }
 		finally { this.#scheduleObservation(run); }
 	}

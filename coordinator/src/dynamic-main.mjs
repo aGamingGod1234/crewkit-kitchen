@@ -80,6 +80,10 @@ const GOAL_SPEC_PROPOSAL_RETRY_MS = 5_000;
 const TERMINAL_GOAL_SPEC_REJECTIONS = new Set(['UNKNOWN_GOAL_DRAFT', 'GOAL_DRAFT_AGENT_MISMATCH', 'STALE_GOAL_DRAFT']);
 const QUIET_LIFECYCLE_ERRORS = new Set(['PLAN_CANCELLED', 'STALE_PLAN', 'STALE_GOAL_REVISION', 'GOAL_REVISION_COLLISION']);
 const MAX_CONVERSATION_WAKE_TRANSACTIONS = 4_096;
+const GENERIC_WAKE_TRIGGERS = new Set(['attention', 'observation']);
+// Longest an ordinary wake is held for the model's own running action. Long walks (navigate_to ran up to 37 s) must
+// still let the model change course, and the model's own decision p95 is about 8 s.
+const ORDINARY_WAKE_HOLD_MS = 15_000;
 const MAX_NATIVE_MOVEMENT_HISTORY = 12;
 const MAX_NATIVE_RESOURCE_MEMORY = 512;
 const DEFAULT_CONNECTION_OPERATION_CAP = 256;
@@ -130,6 +134,8 @@ export class DynamicCoordinator extends EventEmitter {
 	#agentOperationCap;
 	#providerWork = new Map();
 	#pendingAttention = new Map();
+	// Ordinary wakes skipped while the model's own action ran, so the completion wake can name what they saw.
+	#actionDeferredWakes = new Map();
 	#attentionFlushes = new Map();
 	#lifecycleGenerations = new Map();
 	#providerRetryAfter = new Map();
@@ -300,6 +306,7 @@ export class DynamicCoordinator extends EventEmitter {
 			memoryObservation: (record, observation) => this.#playerMemory.observe(record, observation),
 			executionSettings: (record) => this.#planner.getExecutionSettings?.(record.agentId) ?? null,
 			planningLeadTime: (record) => this.#planner.getNativeDecisionTiming?.(record.agentId)?.p95Ms ?? null,
+			planningFloorTime: (record) => this.#planner.getNativeDecisionTiming?.(record.agentId)?.p50Ms ?? null,
 			occupancy: new ExplorationOccupancy({ memoryStore: new ObservedMemoryStore({ directory: memoryDirectory }) }),
 			bridge: nativeBridge,
 			registry: this.#registry,
@@ -510,6 +517,7 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#totalAgentOperations = 0;
 		this.#providerWork.clear();
 		this.#pendingAttention.clear();
+		this.#actionDeferredWakes.clear();
 		this.#attentionFlushes.clear();
 		this.#lifecycleGenerations.clear();
 		this.#programRuntime.disposeAll();
@@ -970,6 +978,13 @@ export class DynamicCoordinator extends EventEmitter {
 					// The program owns ordinary progress. It explicitly notifies the model
 					// when reconsideration or a new intention is needed.
 					if (this.#nativeRuntime.hasProgram(record) && !forcedContinuation && pendingAttention?.goalRevision !== record.goalRevision) return;
+					// The model can only wait for its own running action, and the action's result is followed by an
+					// attention observation that wakes it with fresher facts. Danger, conversation and forced
+					// continuations (a pending attention) still wake it now.
+					if (!forcedContinuation && pendingAttention?.goalRevision !== record.goalRevision && attention.priority !== 'urgent'
+						&& this.#nativeRuntime.hasModelAction(record) && this.#holdWakeForModelAction(record, attention.trigger)) return;
+					const resumedTrigger = this.#resumeDeferredWake(record, attention);
+					const wakeTrigger = forcedContinuation ? attention.trigger : resumedTrigger;
 					this.#scheduleNativeTurn(record, {
 						agentId: record.agentId,
 						goalRevision: record.goalRevision,
@@ -978,10 +993,10 @@ export class DynamicCoordinator extends EventEmitter {
 						executionSettings: this.#planner.getExecutionSettings?.(record.agentId) ?? null,
 						eventSequence: message.payload.eventSequence,
 						priority: attention.priority,
-						trigger: attention.trigger,
+						trigger: wakeTrigger,
 						lifecycleGeneration,
 						connectionEpoch,
-						nativeEvent: { event: 'observation', trigger: forcedContinuation ? 'continuation' : attention.trigger, observation },
+						nativeEvent: { event: 'observation', trigger: forcedContinuation ? 'continuation' : wakeTrigger, observation },
 					});
 					return;
 				}
@@ -1146,6 +1161,7 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#programRuntime.disposeAll();
 			void this.#nativeRuntime.disposeAll('bridge_disconnected');
 			this.#pendingAttention.clear();
+			this.#actionDeferredWakes.clear();
 			this.#attentionFlushes.clear();
 			this.#providerRetryAfter.clear();
 			this.#providerProbeDeadlines.clear();
@@ -1669,6 +1685,8 @@ export class DynamicCoordinator extends EventEmitter {
 			}
 			this.#traceEventReady(record, request, existing.traceId, 'pending');
 			existing.pending = mergePlannerRequest(existing.pending, request);
+			// How long a queued wake waits for the running turn (and its closing call) to end is reported when it does.
+			if (existing.kind === 'native') existing.pendingSince ??= safeClockRead(this.#controlNow);
 			return existing.promise;
 		}
 		const supervisionKey = this.#supervisionKey(record, request.lifecycleGeneration);
@@ -1682,6 +1700,7 @@ export class DynamicCoordinator extends EventEmitter {
 			kind: 'native',
 			request,
 			pending: null,
+			pendingSince: null,
 			steerQueued: null,
 			steerRequest: null,
 			steerPromise: null,
@@ -1747,6 +1766,30 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#writeTrace('native_event_ready', { agentId: record.agentId, goalRevision: record.goalRevision, traceId, mode,
 			trigger: request.trigger ?? null, eventName: request.nativeEvent?.event ?? null, priority: request.priority ?? null,
 			...(Number.isFinite(request.receiptMonotonicMs) ? { receiptMonotonicMs: request.receiptMonotonicMs } : {}) });
+	}
+
+	/** True when this ordinary wake is held back for the running action; false once the first held wake has waited the limit. */
+	#holdWakeForModelAction(record, trigger) {
+		const now = safeClockRead(this.#controlNow);
+		const previous = this.#actionDeferredWakes.get(record.agentId);
+		if (previous?.goalRevision === record.goalRevision && now !== null && previous.firstAt !== null && now - previous.firstAt >= ORDINARY_WAKE_HOLD_MS) return false;
+		const entry = previous?.goalRevision === record.goalRevision ? previous : { goalRevision: record.goalRevision, trigger: null, count: 0, firstAt: now };
+		entry.count += 1;
+		// A sighting or discovery is signalled once, so the first named reason survives the plain heartbeats after it.
+		if (entry.trigger === null && !GENERIC_WAKE_TRIGGERS.has(trigger)) entry.trigger = trigger;
+		this.#actionDeferredWakes.set(record.agentId, entry);
+		if (entry.count === 1) this.#writeTrace('native_wake_deferred_for_action', { agentId: record.agentId, goalRevision: record.goalRevision, trigger });
+		return true;
+	}
+
+	/** The trigger to wake with: a generic completion wake adopts the named reason it replaced. */
+	#resumeDeferredWake(record, attention) {
+		const entry = this.#actionDeferredWakes.get(record.agentId);
+		if (entry === undefined) return attention.trigger;
+		this.#actionDeferredWakes.delete(record.agentId);
+		if (entry.goalRevision !== record.goalRevision) return attention.trigger;
+		this.#writeTrace('native_wake_resumed_after_action', { agentId: record.agentId, goalRevision: record.goalRevision, skippedWakes: entry.count, deferredTrigger: entry.trigger });
+		return attention.priority !== 'urgent' && entry.trigger !== null && GENERIC_WAKE_TRIGGERS.has(attention.trigger) ? entry.trigger : attention.trigger;
 	}
 
 	#nativePreparationIsCurrent(record, request) {
@@ -2141,13 +2184,16 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#providerWork.delete(work.agentId);
 		this.#providerRetryAfter.delete(work.agentId);
 		const pending = this.#pendingWithFoldedSteer(work);
+		const completedAt = safeClockRead(this.#controlNow);
+		const pendingWaitMs = work.pendingSince == null || completedAt === null || pending === null ? null : Math.max(0, Math.round(completedAt - work.pendingSince));
 		const record = this.#registry.get(work.agentId);
 		if (record !== null && record.goalRevision === work.goalRevision
 				&& this.#isConnectionEpochCurrent(work.connectionEpoch)
 				&& this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) {
 			this.#writeTrace('native_turn_completed', { agentId: work.agentId, goalRevision: work.goalRevision, traceId: work.traceId, toolCalls: result?.toolCalls ?? 0,
 				trigger: work.request.nativeEvent?.trigger ?? work.request.trigger ?? null, wakeEvent: work.request.nativeEvent?.event ?? null,
-				...(work.inputBytes === undefined ? {} : { inputBytes: work.inputBytes }), ...turnUsageTraceFields(result?.usage) });
+				...(work.inputBytes === undefined ? {} : { inputBytes: work.inputBytes }), ...turnUsageTraceFields(result?.usage),
+				...(pendingWaitMs === null ? {} : { pendingWaitMs, pendingTrigger: pending?.trigger ?? null }) });
 		}
 		if (this.#reschedulePendingNativeTurn(pending)) return result;
 		if (work.request.nativeConversationDelivery?.omittedEntries > 0
@@ -2255,6 +2301,10 @@ export class DynamicCoordinator extends EventEmitter {
 			: [DynamicAgentState.STARTING, DynamicAgentState.PLANNING, DynamicAgentState.ACTING, DynamicAgentState.DEAD];
 		if (!this.#usesNativeTools(record) || !eligible.includes(record.state)) return false;
 		if (!this.#nativePreparationIsCurrent(record, request) || this.#confirmationBlocksRequest(record, request)) return false;
+		// An ordinary observation queued behind a turn that then started its own action is stale for the same reason.
+		if (request.priority !== 'urgent' && request.conversationOnly !== true && request.nativeEvent?.event === 'observation'
+				&& request.nativeEvent.trigger !== 'continuation' && !(request.nativeConversationDelivery?.omittedEntries > 0) && this.#nativeRuntime.hasModelAction(record)
+				&& this.#holdWakeForModelAction(record, request.trigger)) return false;
 		this.#scheduleNativeTurn(record, request);
 		return true;
 	}
@@ -2634,6 +2684,7 @@ export class DynamicCoordinator extends EventEmitter {
 
 	#invalidateAcceptedLifecycle(agentId) {
 		this.#pendingAttention.delete(agentId);
+		this.#actionDeferredWakes.delete(agentId);
 		this.#attentionFlushes.delete(agentId);
 		this.#contextCursors.delete(agentId);
 		this.#nativeObservationSignatures.delete(agentId);

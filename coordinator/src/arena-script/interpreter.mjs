@@ -5,6 +5,7 @@ import { PLAYER_MEMBER_PRIMITIVES, MATH_METHODS } from './minecraft-api.mjs';
 import { filterObserved, isTrustedInterpreterFacts, markObservedCandidateSet, nearestFromCurrent } from './facts.mjs';
 import { MAX_LINE_BYTES, ACTION_FIELDS } from '../constants.mjs';
 import { validateProgramParameters } from '../program-parameters.mjs';
+import { remainingTopLevelCommands } from './remaining-work.mjs';
 
 const CAPABILITY_NAMES = new Set(['program', 'player', 'world', 'inventory', 'math']);
 const CAPABILITY_MEMBERS = Object.freeze({
@@ -221,6 +222,14 @@ export class ArenaScriptInterpreter {
 			this.#lifecycle = saved.lifecycle;
 			this.#watcherExecution = saved.watcherExecution;
 		}
+	}
+
+	/** Commands the top-level code has left, counting the one now running, or null when it is not straight-line. */
+	remainingStraightLineCommands() {
+		if (this.#lifecycle !== 'ACTIVE' || this.#waiting === null || this.#watcherExecution) return null;
+		const root = this.#frames.find((frame) => frame.type === 'after-statement' && frame.frame.statements === this.#compiled.ast.body)?.frame;
+		const after = root === undefined ? null : remainingTopLevelCommands(root.statements, root.index);
+		return after === null ? null : after + 1;
 	}
 
 	abortPendingCommand(stateToken) {
