@@ -6,6 +6,7 @@ import { createInterpreterFacts } from '../src/arena-script/facts.mjs';
 import { parseArenaScript } from '../src/arena-script/parser.mjs';
 import { SCRIPT_BINDINGS } from '../src/arena-script/minecraft-api.mjs';
 import { validateAction } from '../src/schema.mjs';
+import { normalizeMinecraftToolCall } from '../src/native-minecraft-tools.mjs';
 
 const ACTION_BINDINGS = Object.freeze(Object.assign(Object.create(null), {
 	player: Object.freeze(Object.assign(Object.create(null), {
@@ -217,6 +218,15 @@ test('maps a model-authored act call to the same validated player primitive', ()
 	assert.equal(navigate.call.primitive, 'navigate_to');
 	assert.deepEqual(Object.fromEntries(Object.entries(navigate.call.arguments)), { x: 1, y: 64, z: 2, tolerance: 1, sprint: true, timeoutMs: 30_000 });
 	assert.doesNotThrow(() => validateAction({ type: navigate.call.primitive, ...navigate.call.arguments }));
+	const moveToVm = new ArenaScriptInterpreter(parseArenaScript('await act("move_to",{x:1,y:64,z:2});'), SCRIPT_BINDINGS);
+	const moveTo = moveToVm.start(facts());
+	assert.equal(moveTo.call.primitive, 'move_to');
+	assert.deepEqual(Object.fromEntries(Object.entries(moveTo.call.arguments)), { x: 1, y: 64, z: 2, tolerance: 1, sprint: true });
+	assert.doesNotThrow(() => validateAction({ type: moveTo.call.primitive, ...moveTo.call.arguments }));
+	const nativeMove = normalizeMinecraftToolCall('moveTo', { x: 1, y: 64, z: 2 });
+	assert.deepEqual({ tolerance: moveTo.call.arguments.tolerance, sprint: moveTo.call.arguments.sprint }, { tolerance: nativeMove.arguments.tolerance, sprint: nativeMove.arguments.sprint });
+	const nativeLegacyMove = normalizeMinecraftToolCall('act', { actionType: 'move_to', arguments: { x: 1, y: 64, z: 2, tolerance: moveTo.call.arguments.tolerance, sprint: moveTo.call.arguments.sprint } });
+	assert.deepEqual({ kind: 'action', actionType: moveTo.call.primitive, arguments: { ...moveTo.call.arguments } }, nativeLegacyMove);
 	const lookAtVm = new ArenaScriptInterpreter(parseArenaScript('await act("look_at", { x: 10.5, y: 64.5, z: 10.5 });'), SCRIPT_BINDINGS);
 	const lookAt = lookAtVm.start(facts());
 	assert.equal(lookAt.call.primitive, 'look_at');
@@ -227,9 +237,22 @@ test('maps a model-authored act call to the same validated player primitive', ()
 	assert.equal(directMine.call.primitive, 'break_block');
 	assert.deepEqual(Object.fromEntries(Object.entries(directMine.call.arguments)), { x: 10, y: 64, z: 10, expectedBlockId: 'minecraft:stone', timeoutMs: 15_000 });
 	assert.doesNotThrow(() => validateAction({ type: directMine.call.primitive, ...directMine.call.arguments }));
-	const extraToolFieldVm = new ArenaScriptInterpreter(parseArenaScript('await mine({x:10,y:64,z:10,expectedBlockId:"minecraft:stone",autoAim:true});'), SCRIPT_BINDINGS);
-	const extraToolField = extraToolFieldVm.start(facts());
-	assert.throws(() => validateAction({ type: extraToolField.call.primitive, ...extraToolField.call.arguments }));
+	assert.deepEqual({ kind: 'action', actionType: directMine.call.primitive, arguments: { ...directMine.call.arguments } }, normalizeMinecraftToolCall('mine', { x: 10, y: 64, z: 10, expectedBlockId: 'minecraft:stone' }));
+	const autoAimSource = 'await mine({x:10,y:64,z:10,expectedBlockId:"minecraft:stone",autoAim:true});';
+	const autoAimVm = new ArenaScriptInterpreter(parseArenaScript(autoAimSource), SCRIPT_BINDINGS);
+	const autoAimFirst = autoAimVm.start(facts());
+	const nativeMine = normalizeMinecraftToolCall('mine', { x: 10, y: 64, z: 10, expectedBlockId: 'minecraft:stone', autoAim: true });
+	assert.equal(nativeMine.kind, 'sequence');
+	assert.deepEqual({ primitive: autoAimFirst.call.primitive, arguments: { ...autoAimFirst.call.arguments } }, {
+		primitive: nativeMine.actions[0].actionType, arguments: nativeMine.actions[0].arguments,
+	});
+	const autoAimSecond = autoAimVm.resume(actionResult(autoAimFirst), facts());
+	assert.deepEqual({ primitive: autoAimSecond.call.primitive, arguments: { ...autoAimSecond.call.arguments } }, {
+		primitive: nativeMine.actions[1].actionType, arguments: nativeMine.actions[1].arguments,
+	});
+	const failedAimVm = new ArenaScriptInterpreter(parseArenaScript(autoAimSource), SCRIPT_BINDINGS);
+	const failedAimFirst = failedAimVm.start(facts());
+	assert.equal(failedAimVm.resume(actionResult(failedAimFirst, 'FAILED', 'LOOK_FAILED'), facts()).kind, 'idle');
 	const caughtVm = new ArenaScriptInterpreter(parseArenaScript('await act("look_at", {x: 10.5, y: 64.5, z: 10.5}).catch(() => {});'), SCRIPT_BINDINGS);
 	const caught = caughtVm.start(facts());
 	assert.equal(caught.call.primitive, 'look_at');

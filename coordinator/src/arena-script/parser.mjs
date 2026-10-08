@@ -13,6 +13,7 @@ const PLAYER_MEMBERS_BY_ACTION_TYPE = new Map(Object.entries(PLAYER_MEMBER_PRIMI
 PLAYER_MEMBERS_BY_ACTION_TYPE.set('mine', 'mine');
 const ACTION_TOOL_DEFAULTS = Object.freeze({
 	break_block: Object.freeze({ timeoutMs: 15_000 }),
+	move_to: Object.freeze({ tolerance: 1, sprint: true }),
 	navigate_to: Object.freeze({ tolerance: 1, sprint: true, timeoutMs: 30_000 }),
 });
 
@@ -181,6 +182,7 @@ function validateProgram(ast, limits) {
 		watcherActivationNode: watcherActivationNode(ast),
 	};
 
+	rewriteActionToolAliases(ast, state);
 	validateWatcherPrologue(ast);
 	const rootScope = createLexicalScope(null, ast.body, state);
 	visit(ast, state, { functionBinding: null, functionNode: null, scope: rootScope, topLevelExpression: false, inFunction: false });
@@ -271,11 +273,7 @@ function visit(node, state, context) {
 			}
 			return;
 		case 'ExpressionStatement':
-			visit(node.expression, state, {
-				...context,
-				topLevelExpression: context.topLevelExpression,
-				discardedNoopActionCatch: isNoopActionCatchStatement(node.expression, context.scope),
-			});
+			visit(node.expression, state, { ...context, topLevelExpression: context.topLevelExpression });
 			return;
 		case 'EmptyStatement':
 			return;
@@ -447,10 +445,6 @@ function validateCallExpression(node, state, context) {
 	if (node.optional) {
 		throw arenaError('UNSUPPORTED_SYNTAX', 'optional calls are not allowed', node);
 	}
-	if (context.discardedNoopActionCatch && isNoopActionCatchCall(node, context.scope)) rewriteNoopActionCatch(node);
-	if (node.callee.type === 'Identifier' && isActionToolAliasName(node.callee.name) && !resolveBinding(context.scope, node.callee.name)) {
-		rewriteActionToolCall(node, state);
-	}
 	const path = staticMemberPath(node.callee);
 	let functionBinding = null;
 	if (node.callee.type === 'Identifier') {
@@ -546,6 +540,76 @@ function validateCallExpression(node, state, context) {
 	if (functionBinding) state.functionCalls.push(Object.freeze({ binding: functionBinding, node, ownerFunctionNode: context.functionNode }));
 }
 
+/** Rewrite natural action-tool spellings before static checks inspect their call paths. */
+function rewriteActionToolAliases(ast, state) {
+	const rootScope = createActionAliasScope(null, ast.body);
+	const errors = [];
+	const rewrite = (node, scope) => {
+		if (!node || typeof node !== 'object') return;
+		if (Array.isArray(node)) {
+			for (const child of node) rewrite(child, scope);
+			return;
+		}
+		if (node.type === 'ExpressionStatement' && isNoopActionCatchStatement(node.expression, scope)) {
+			rewriteNoopActionCatch(node.expression.argument);
+		}
+		if (node.type === 'CallExpression' && node.callee?.type === 'Identifier'
+			&& isActionToolAliasName(node.callee.name) && !resolveBinding(scope, node.callee.name)) {
+			try { rewriteActionToolCall(node, state); }
+			catch (error) { errors.push(error); }
+		}
+		if (node.type === 'Program') {
+			for (const statement of node.body) rewrite(statement, rootScope);
+			return;
+		}
+		if (node.type === 'BlockStatement') {
+			const blockScope = createActionAliasScope(scope, node.body);
+			for (const statement of node.body) rewrite(statement, blockScope);
+			return;
+		}
+		if (isFunctionNode(node)) {
+			const functionScope = createActionAliasParameterScope(scope, node);
+			rewrite(node.body, functionScope);
+			return;
+		}
+		if (node.type === 'ForStatement') {
+			const loopScope = createActionAliasScope(scope, [node.init]);
+			for (const child of [node.init, node.test, node.update, node.body]) rewrite(child, loopScope);
+			return;
+		}
+		if (node.type === 'ForOfStatement') {
+			const loopScope = createActionAliasScope(scope, [node.left]);
+			for (const child of [node.left, node.right, node.body]) rewrite(child, loopScope);
+			return;
+		}
+		for (const [key, child] of Object.entries(node)) {
+			if (key === 'loc' || key === 'start' || key === 'end' || key === 'type') continue;
+			rewrite(child, scope);
+		}
+	};
+	rewrite(ast, rootScope);
+	if (errors.length > 0) throw errors[0];
+}
+
+function createActionAliasScope(parent, statements) {
+	const scope = { parent, bindings: new Map() };
+	for (const statement of statements ?? []) {
+		if (statement?.type === 'FunctionDeclaration' && statement.id?.type === 'Identifier') scope.bindings.set(statement.id.name, true);
+		if (statement?.type !== 'VariableDeclaration') continue;
+		for (const declaration of statement.declarations) {
+			if (declaration.id?.type === 'Identifier') scope.bindings.set(declaration.id.name, true);
+		}
+	}
+	return scope;
+}
+
+function createActionAliasParameterScope(parent, node) {
+	const scope = { parent, bindings: new Map() };
+	for (const parameter of node.params) if (parameter.type === 'Identifier') scope.bindings.set(parameter.name, true);
+	if (node.id?.type === 'Identifier') scope.bindings.set(node.id.name, true);
+	return scope;
+}
+
 function validatePlayerPrimitiveArity(node, memberName) {
 	if (ACTION_FIELDS[PLAYER_MEMBER_PRIMITIVES[memberName]]?.length === 0) {
 		if (node.arguments.length !== 0) {
@@ -575,13 +639,20 @@ function validateMineTarget(node) {
 function rewriteActionToolCall(node, state) {
 	let actionTypeValue;
 	let actionArguments;
+	const aliasName = node.callee.name;
 	if (node.callee.name !== 'act') {
-		if (node.arguments.length !== 1 || node.arguments[0]?.type !== 'ObjectExpression') {
+		const primitive = PLAYER_MEMBER_PRIMITIVES[node.callee.name];
+		if (node.arguments.length === 0 && ACTION_FIELDS[primitive]?.length === 0) {
+			actionTypeValue = node.callee.name;
+			actionArguments = null;
+		} else if (node.arguments.length === 1 && node.arguments[0]?.type === 'ObjectExpression') {
+			actionTypeValue = node.callee.name;
+			actionArguments = node.arguments[0];
+		} else {
 			const fields = node.callee.name === 'mine' || node.callee.name === 'break_block' ? '{x,y,z,expectedBlockId}' : '{...action fields...}';
-			throw arenaError('UNSUPPORTED_SYNTAX', `${node.callee.name} needs one action object, e.g. ${node.callee.name}(${fields})`, node);
+			const hint = ACTION_FIELDS[primitive]?.length === 0 ? `${node.callee.name}() takes no arguments` : `${node.callee.name} needs one action object, e.g. ${node.callee.name}(${fields})`;
+			throw arenaError('UNSUPPORTED_SYNTAX', hint, node);
 		}
-		actionTypeValue = node.callee.name;
-		actionArguments = node.arguments[0];
 	} else if (node.arguments.length === 2 && node.arguments[0]?.type === 'Literal' && typeof node.arguments[0].value === 'string') {
 		actionTypeValue = node.arguments[0].value;
 		actionArguments = node.arguments[1];
@@ -602,7 +673,7 @@ function rewriteActionToolCall(node, state) {
 	} else {
 		throw arenaError('UNSUPPORTED_SYNTAX', 'act() needs {actionType:"mine",arguments:{...}} or act("mine",{...}); actionType must be a literal', node);
 	}
-	if (actionArguments?.type !== 'ObjectExpression') {
+	if (actionArguments !== null && actionArguments?.type !== 'ObjectExpression') {
 		throw arenaError('UNSUPPORTED_SYNTAX', 'act arguments must be an object literal, e.g. act("mine",{x:b.x,y:b.y,z:b.z,expectedBlockId:b.blockId})', node);
 	}
 	const member = PLAYER_MEMBERS_BY_ACTION_TYPE.get(actionTypeValue);
@@ -610,7 +681,10 @@ function rewriteActionToolCall(node, state) {
 		throw arenaError('UNSUPPORTED_SYNTAX', `act actionType "${actionTypeValue}" has no ArenaScript primitive; use a supported player.<action> call`, node);
 	}
 	state.actionToolAliasCount += 1;
+	const primitive = PLAYER_MEMBER_PRIMITIVES[member];
+	if (actionArguments !== null) validateActionToolAliasFields(aliasName, primitive, actionArguments, node);
 	appendActionToolDefaults(actionArguments, ACTION_TOOL_DEFAULTS[PLAYER_MEMBER_PRIMITIVES[member]]);
+	if (aliasName === 'mine') node.arenaActionToolAlias = 'mine';
 	const { start, end, loc } = node.callee;
 	node.callee = {
 		type: 'MemberExpression',
@@ -622,7 +696,18 @@ function rewriteActionToolCall(node, state) {
 		end,
 		loc,
 	};
-	node.arguments = [actionArguments];
+	node.arguments = actionArguments === null ? [] : [actionArguments];
+}
+
+function validateActionToolAliasFields(aliasName, primitive, argument, node) {
+	const nativeFields = new Set(ACTION_FIELDS[primitive] ?? []);
+	if (aliasName === 'mine') nativeFields.add('autoAim');
+	for (const property of argument.properties) {
+		const name = propertyName(property.key);
+		if (!nativeFields.has(name)) {
+			throw arenaError('UNSUPPORTED_SYNTAX', `${aliasName} does not accept field "${name}"; use only ${[...nativeFields].join(', ')}`, property ?? node);
+		}
+	}
 }
 
 function appendActionToolDefaults(argument, defaults) {
@@ -646,6 +731,7 @@ function missingActionToolArgumentsHint(actionType) {
 	}
 	const member = PLAYER_MEMBERS_BY_ACTION_TYPE.get(actionType);
 	const primitive = member === undefined ? null : PLAYER_MEMBER_PRIMITIVES[member];
+	if (primitive !== null && ACTION_FIELDS[primitive].length === 0) return `act actionType "${actionType}" needs an empty arguments object: {}`;
 	const fields = primitive === null ? [] : ACTION_FIELDS[primitive].filter((field) =>
 		!(OPTIONAL_ACTION_FIELDS[primitive] ?? []).includes(field) && !Object.hasOwn(ACTION_TOOL_DEFAULTS[primitive] ?? {}, field));
 	return `act actionType "${actionType}" needs ${fields.length > 0 ? fields.join(', ') : 'its required fields'} in an arguments object`;

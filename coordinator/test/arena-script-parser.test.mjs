@@ -37,6 +37,10 @@ test('compiles model-authored act tool calls as existing primitives with the saf
 	assert.deepEqual(compiled.primitiveCalls, ['break_block']);
 	assert.equal(compiled.unhandledPolicy, 'pause_and_notify');
 	assert.throws(() => parseArenaScript('await player.wait(1);'), error => error.code === 'MISSING_UNHANDLED_POLICY');
+	assert.doesNotThrow(() => parseArenaScript('await respawn(); await dismount();'));
+	assert.throws(() => parseArenaScript('await mine({x:1,y:64,z:1,expectedBlockId:"minecraft:stone",unknownField:true});'), error => error.code === 'UNSUPPORTED_SYNTAX' && /unknownField/.test(error.message));
+	assert.throws(() => parseArenaScript('await act("move_to",{x:1,y:64,z:1,unknownField:true});'), error => error.code === 'UNSUPPORTED_SYNTAX' && /unknownField/.test(error.message));
+	assert.throws(() => parseArenaScript('await act("break_block",{x:1,y:64,z:1,expectedBlockId:"minecraft:stone",autoAim:true});'), error => error.code === 'UNSUPPORTED_SYNTAX' && /autoAim/.test(error.message));
 	const twoArgumentAlias = parseArenaScript('await act("look_at", {x: 10.5, y: 64.5, z: 10.5}); await act("break_block", {x: 10, y: 64, z: 10, expectedBlockId: "minecraft:stone"});');
 	assert.deepEqual(twoArgumentAlias.primitiveCalls, ['break_block', 'look_at']);
 	const directNameAliases = parseArenaScript('await look_at({x:10.5,y:64.5,z:10.5}); await mine({x:10,y:64,z:10,expectedBlockId:"minecraft:stone"});');
@@ -54,6 +58,13 @@ test('compiles model-authored act tool calls as existing primitives with the saf
 		() => parseArenaScript('await act({actionType:"mine",arguments:{x:1,y:64,z:1}}).catch(() => {});'),
 		error => error.code === 'INVALID_ARENA_SCRIPT_COMMAND' && /observed non-air expectedBlockId.*expectedBlockId/.test(error.message),
 	);
+});
+
+test('rewrites action aliases before rejecting watcher handler chat', () => {
+	for (const action of ['chat({message:"hello"})', 'act("chat",{message:"hello"})']) {
+		assert.throws(() => parseArenaScript(`program.onUnhandledAttention("continue_and_notify"); program.watch(() => true, {mode:"boundary"}, async () => { await ${action}; }); await player.wait(1);`), error => error.code === 'UNSUPPORTED_SYNTAX' && /watcher handlers cannot call player\.chat/.test(error.message));
+	}
+	assert.throws(() => parseArenaScript('await act("look_at",{x:mine({x:1,y:64,z:1,expectedBlockId:"minecraft:stone"}).catch(()=>{}),y:64,z:1}).catch(()=>{});'), error => error.code === 'UNSUPPORTED_SYNTAX' && /direct API calls only/.test(error.message));
 });
 
 test('admits the exact Task 2 direct action and terminal API calls', () => {
