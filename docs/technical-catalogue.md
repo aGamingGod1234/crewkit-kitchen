@@ -308,7 +308,7 @@ Notes: these numbers come from replaying recorded play sessions offline, headles
 - **Sources:** PR #48, the T3 thread "Add hearing to agent perception"
 
 
-## Branch claude/threat-heal (Oct 8, 2026, pull request pending)
+## PR #48, continued: threats and healing (Oct 8, 2026)
 
 ### A creeper that read "risk 4" until it was three blocks away
 *claude/threat-heal · Oct 8*
@@ -324,7 +324,7 @@ Notes: these numbers come from replaying recorded play sessions offline, headles
 - **Result:** Beef thrown to an idle agent at 6.1 HP: no wake until health fell to 4.1 HP → woken with the exact pickup call on the next observation (measured, replay test). A tasked agent at 4 hearts with food in view: no alert → one urgent alert within the same observation, with no repeat at the same food and health (measured, replay test). Live effect on survival is not measured yet.
 - **Sources:** `play-session-3-trace.jsonl` lines 884-933 and 2515-2523; branch claude/threat-heal
 
-## Branch claude/spectate-visuals (pull request pending, Oct 8, 2026)
+## PR #48, continued: what spectators see (Oct 8, 2026)
 
 Notes: before numbers come from the recorded GPT-6.1 Sol "beat the game" session (play-session-3 trace, 117 move_to and 22 navigate_to actions with per-tick yaw). After numbers come from replaying the same positions through the new steering and from closed-loop simulations in the Java verification suite; no live spectated session has been recorded yet.
 
@@ -349,7 +349,7 @@ Notes: before numbers come from the recorded GPT-6.1 Sol "beat the game" session
 - **Result:** (measured) the new verification reproduces the exact play-test message on the old code and passes on the new one: the craft completes, the pickup is kept and the leftover planks return to another slot. With a full inventory the craft fails with its real reason and all 5 planks are accounted for at the agent's feet, instead of "ROLLBACK_FAILED". In the play-test this was 1 of 12 table crafts.
 - **Sources:** this branch, `AdvancedInteractionService.CraftTransaction`, `TransactionSnapshot.CraftPlacementGuard`, `AdvancedInteractionRollbackVerification`
 
-## Branch claude/explore-resource (Oct 8, 2026, pull request pending)
+## PR #48, continued: exploration and resourcefulness (Oct 8, 2026)
 
 ### Agents that walked past a shipwreck to strip mine
 *claude/explore-resource · Oct 8, 2026*
