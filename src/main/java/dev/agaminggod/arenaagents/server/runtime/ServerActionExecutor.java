@@ -1234,14 +1234,16 @@ public final class ServerActionExecutor {
 	}
 
 	/**
-	 * A refused click may succeed on a later one only when something temporary caused it: an entity standing in the
-	 * space the block needs (it can walk out) or the item's use cooldown. Anything else, such as no replaceable
-	 * target, an unsupported state or a protected area, repeats identically.
+	 * A refused click may succeed on a later one only when something temporary caused it: another entity standing in
+	 * the space the block needs (it can walk out) or the item's use cooldown. Anything else repeats identically: no
+	 * replaceable target, an unsupported state, a protected area, or the placing body itself in the way (the action
+	 * holds the body still).
 	 */
 	private static boolean placementRefusalMayClear(ServerPlayer player, BlockHitResult hit, ItemStack stack, BlockState predicted) {
 		if (player.getCooldowns().isOnCooldown(stack)) return true;
 		BlockPos target = hit.getBlockPos().relative(hit.getDirection());
-		return !player.level().isUnobstructed(predicted, target, CollisionContext.placementContext(player));
+		VoxelShape shape = predicted.getCollisionShape(player.level(), target, CollisionContext.placementContext(player));
+		return !shape.isEmpty() && !player.level().isUnobstructed(player, shape.move(target.getX(), target.getY(), target.getZ()));
 	}
 
 	private static BlockHitResult placementHit(ServerPlayer player, BlockPos position, Direction requestedFace) {

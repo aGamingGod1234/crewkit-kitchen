@@ -545,21 +545,22 @@ export class VirtualWorld extends EventEmitter {
 				const recipe = simulatorCraftRecipe(args.recipeId);
 				if (!recipe) return { done: true, state: 'FAILED', reasonCode: 'RECIPE_NOT_FOUND', changed: false };
 				if (normalized.type === 'craft_inventory' && recipe.table) return { done: true, state: 'FAILED', reasonCode: 'RECIPE_GRID_MISMATCH', changed: false };
-				if (args.count > recipe.count) return { done: true, state: 'FAILED', reasonCode: 'CRAFT_COUNT_UNSUPPORTED', changed: false };
-				for (const [itemId, count] of Object.entries(recipe.inputs)) {
-					if (this.countInventoryItem(agentId, itemId) < count) return { done: true, state: 'FAILED', reasonCode: 'INGREDIENTS_MISSING', changed: false };
-				}
+				// A count above one batch stacks several crafts, as production does; the inventory may cover only some of them.
+				const requestedCrafts = Math.max(1, Math.ceil(args.count / recipe.count));
+				const affordableCrafts = Math.min(...Object.entries(recipe.inputs).map(([itemId, count]) => Math.floor(this.countInventoryItem(agentId, itemId) / count)));
+				if (affordableCrafts < 1) return { done: true, state: 'FAILED', reasonCode: 'INGREDIENTS_MISSING', changed: false };
+				const crafts = Math.min(requestedCrafts, affordableCrafts);
 				if (elapsedTicks + 1 < 2) return { done: false, changed: false };
 				const inventoryBefore = clone(player.inventory);
 				try {
-					for (const [itemId, count] of Object.entries(recipe.inputs)) this.removeInventoryItem(agentId, itemId, count);
-					this.addInventoryItem(agentId, recipe.output, recipe.count);
+					for (const [itemId, count] of Object.entries(recipe.inputs)) this.removeInventoryItem(agentId, itemId, count * crafts);
+					this.addInventoryItem(agentId, recipe.output, recipe.count * crafts);
 				} catch (error) {
 					player.inventory = inventoryBefore;
 					if (error.code === 'WORLD_CAPACITY_EXCEEDED') return { done: true, state: 'FAILED', reasonCode: error.code, changed: false };
 					throw error;
 				}
-				return { done: true, state: 'SUCCEEDED', reasonCode: 'CRAFTED', changed: true };
+				return { done: true, state: 'SUCCEEDED', reasonCode: crafts < requestedCrafts ? 'CRAFT_PARTIAL' : 'CRAFTED', changed: true };
 			}
 			case 'chat': {
 				if ((args.audience ?? 'public') === 'direct') {
@@ -1003,8 +1004,8 @@ function conversationText(value) {
 	if ([...value].length > MAX_CONVERSATION_LENGTH) throw Object.assign(new RangeError(`MESSAGE_TOO_LARGE: message exceeds ${MAX_CONVERSATION_LENGTH} code points`), { code: 'MESSAGE_TOO_LARGE' });
 	return value;
 }
-// Only the fixture recipes are modeled. count requests a minimum from one full batch,
-// matching the production crafting transaction; it never scales a recipe.
+// Only the fixture recipes are modeled. count asks for at least that many items: a request within one batch
+// crafts one batch, a larger one stacks more batches, as the production crafting transaction does.
 export function simulatorCraftRecipe(recipeId) {
 	const recipes = {
 		'minecraft:planks': { output: 'minecraft:oak_planks', count: 4, inputs: { 'minecraft:oak_log': 1 } },

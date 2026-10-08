@@ -53,13 +53,14 @@ test('mining rejects mismatched and distant blocks without mutation; matching ne
 	}
 });
 
-test('crafting uses one full batch and rejects too many outputs and table-only inventory recipes', async t => {
-	for (const count of [1, 4, 8]) {
+test('crafting stacks batches for a larger count, reports a partial result, and rejects table-only inventory recipes', async t => {
+	for (const count of [1, 4, 8, 12]) {
 		const f = fixture(t, { inventory: { items: [{ itemId: 'minecraft:oak_log', count: 2 }] } });
-		const before = f.world.inventories('alice');
 		const result = await act(f, 'craft_inventory', { recipeId: 'minecraft:planks', count, timeoutMs: 1000 });
-		if (count === 8) { assert.equal(result.reasonCode, 'CRAFT_COUNT_UNSUPPORTED'); assert.deepEqual(f.world.inventories('alice'), before); }
-		else { assert.equal(result.state, 'SUCCEEDED'); assert.equal(f.world.countInventoryItem('alice', 'minecraft:oak_planks'), 4); assert.equal(f.world.countInventoryItem('alice', 'minecraft:oak_log'), 1); }
+		assert.equal(result.state, 'SUCCEEDED');
+		if (count <= 4) { assert.equal(f.world.countInventoryItem('alice', 'minecraft:oak_planks'), 4); assert.equal(f.world.countInventoryItem('alice', 'minecraft:oak_log'), 1); }
+		else { assert.equal(f.world.countInventoryItem('alice', 'minecraft:oak_planks'), 8); assert.equal(f.world.countInventoryItem('alice', 'minecraft:oak_log'), 0); }
+		assert.equal(result.reasonCode, count === 12 ? 'CRAFT_PARTIAL' : 'CRAFTED');
 	}
 	const f = fixture(t, { inventory: { items: [{ itemId: 'minecraft:cobblestone', count: 3 }, { itemId: 'minecraft:stick', count: 2 }] } });
 	const before = f.world.inventories('alice');
