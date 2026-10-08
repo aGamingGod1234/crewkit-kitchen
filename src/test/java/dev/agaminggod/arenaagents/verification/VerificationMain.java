@@ -217,6 +217,8 @@ public final class VerificationMain {
 		passedAssertions += dev.agaminggod.arenaagents.server.perception.TerminalObservationCacheVerification.verify();
 		passedAssertions += ServerObservationRayTargetVerification.verify();
 		passedAssertions += ServerObservationWireBudgetVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.bridge.ObservationWirePipelineVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.perception.ObservationBlockTagsVerification.verify();
 		passedAssertions += ActionProgressTrackerVerification.verify();
 		passedAssertions += AdvancedInteractionRollbackVerification.verify();
 		passedAssertions += BlockPlacementPostconditionVerification.verify();

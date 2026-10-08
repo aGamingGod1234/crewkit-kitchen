@@ -14,70 +14,96 @@ public final class ServerObservationWireBudget {
 	private ServerObservationWireBudget() {
 	}
 
+	/** Fits a copy of {@code source}; the source is left untouched. */
 	public static Fitted fit(JsonObject source, Predicate<JsonObject> fitsCompleteEnvelope) {
 		Objects.requireNonNull(source, "source must not be null");
 		Objects.requireNonNull(fitsCompleteEnvelope, "fitsCompleteEnvelope must not be null");
-		JsonObject candidate = source.deepCopy();
+		return fit(source.deepCopy(), sectionTotals(source), fitsCompleteEnvelope, true);
+	}
+
+	/**
+	 * Fits {@code owned} in place and returns it without copying. The caller hands the tree over: it must not use,
+	 * share or retain it afterwards, and the predicate must not retain it either.
+	 */
+	public static Fitted fitOwned(JsonObject owned, Predicate<JsonObject> fitsCompleteEnvelope) {
+		Objects.requireNonNull(owned, "owned must not be null");
+		Objects.requireNonNull(fitsCompleteEnvelope, "fitsCompleteEnvelope must not be null");
+		return fit(owned, sectionTotals(owned), fitsCompleteEnvelope, false);
+	}
+
+	private static Fitted fit(JsonObject candidate, int[] totals, Predicate<JsonObject> fitsCompleteEnvelope, boolean copyResult) {
 		Predicate<JsonObject> fits = value -> {
-			refreshCoverage(source, value);
+			refreshCoverage(totals, value);
 			return fitsCompleteEnvelope.test(value);
 		};
 		ArrayList<String> reductions = new ArrayList<>();
-		if (fits.test(candidate)) return fitted(candidate, reductions);
+		if (fits.test(candidate)) return fitted(candidate, reductions, copyResult);
 
 		if (removeCandidateTags(candidate)) reductions.add("candidateTags");
 		if (candidate.has("coverage") && !reductions.isEmpty()) candidate.getAsJsonObject("coverage").addProperty("tagsOmitted", true);
-		if (fits.test(candidate)) return fitted(candidate, reductions);
+		if (fits.test(candidate)) return fitted(candidate, reductions, copyResult);
 
 		if (trimTail(candidate, candidate.get("landmarks"), fits, "landmarks", reductions)) {
-			return fitted(candidate, reductions);
+			return fitted(candidate, reductions, copyResult);
 		}
 		if (trimTail(candidate, candidate.get("blocks"), fits, "blocks", reductions)) {
-			return fitted(candidate, reductions);
+			return fitted(candidate, reductions, copyResult);
 		}
 		if (trimTail(candidate, candidate.get("nearbyContainers"), fits,
 				"nearbyContainers", reductions)) {
-			return fitted(candidate, reductions);
+			return fitted(candidate, reductions, copyResult);
 		}
 		if (trimTail(candidate, candidate.get("entities"), fits, "entities", reductions)) {
-			return fitted(candidate, reductions);
+			return fitted(candidate, reductions, copyResult);
 		}
 
 		JsonObject player = object(candidate, "player");
 		if (trimTail(candidate, player == null ? null : player.get("effects"), fits,
 				"player.effects", reductions)) {
-			return fitted(candidate, reductions);
+			return fitted(candidate, reductions, copyResult);
 		}
 
 		if (dropSingleton(candidate.get("landmarks"), "landmarks", reductions)
-				&& fits.test(candidate)) return fitted(candidate, reductions);
+				&& fits.test(candidate)) return fitted(candidate, reductions, copyResult);
 		if (dropSingleton(candidate.get("blocks"), "blocks", reductions)
-				&& fits.test(candidate)) return fitted(candidate, reductions);
+				&& fits.test(candidate)) return fitted(candidate, reductions, copyResult);
 		if (dropSingleton(candidate.get("nearbyContainers"), "nearbyContainers", reductions)
-				&& fits.test(candidate)) return fitted(candidate, reductions);
+				&& fits.test(candidate)) return fitted(candidate, reductions, copyResult);
 		if (dropSingleton(candidate.get("entities"), "entities", reductions)
-				&& fits.test(candidate)) return fitted(candidate, reductions);
+				&& fits.test(candidate)) return fitted(candidate, reductions, copyResult);
 		if (dropSingleton(player == null ? null : player.get("effects"), "player.effects", reductions)
-				&& fits.test(candidate)) return fitted(candidate, reductions);
+				&& fits.test(candidate)) return fitted(candidate, reductions, copyResult);
 		if (!fits.test(candidate)) {
 			throw new BridgeProtocolException("OBSERVATION_TOO_LARGE",
 					"Protected observation facts exceed the complete bridge envelope limit");
 		}
-		return fitted(candidate, reductions);
+		return fitted(candidate, reductions, copyResult);
 	}
 
-	private static void refreshCoverage(JsonObject source, JsonObject candidate) {
+	private static final List<String> COVERED_SECTIONS = List.of("blocks", "landmarks", "entities", "nearbyContainers");
+
+	/** Entries each covered section had before any trimming (returned plus already omitted); -1 when not reported. */
+	private static int[] sectionTotals(JsonObject source) {
+		int[] totals = new int[COVERED_SECTIONS.size()];
+		JsonObject sourceSections = object(object(source, "coverage"), "sections");
+		for (int index = 0; index < totals.length; index++) {
+			JsonObject original = object(sourceSections, COVERED_SECTIONS.get(index));
+			totals[index] = original == null ? -1 : original.get("returned").getAsInt()
+					+ (original.has("omittedByWire") ? original.get("omittedByWire").getAsInt() : 0);
+		}
+		return totals;
+	}
+
+	private static void refreshCoverage(int[] totals, JsonObject candidate) {
 		JsonObject coverage = object(candidate, "coverage");
 		if (coverage == null) return;
 		JsonObject sections = object(coverage, "sections");
 		if (sections == null) return;
-		JsonObject sourceSections = object(object(source, "coverage"), "sections");
-		for (String field : List.of("blocks", "landmarks", "entities", "nearbyContainers")) {
+		for (int index = 0; index < totals.length; index++) {
+			String field = COVERED_SECTIONS.get(index);
 			JsonObject section = object(sections, field);
-			JsonObject original = object(sourceSections, field);
-			if (section == null || original == null) continue;
-			int before = original.get("returned").getAsInt()
-					+ (original.has("omittedByWire") ? original.get("omittedByWire").getAsInt() : 0);
+			if (section == null || totals[index] < 0) continue;
+			int before = totals[index];
 			JsonArray values = array(candidate, field);
 			int returned = values == null ? 0 : values.size();
 			section.addProperty("returned", returned);
@@ -85,15 +111,16 @@ public final class ServerObservationWireBudget {
 		}
 	}
 
-	private static Fitted fitted(JsonObject candidate, List<String> reductions) {
+	private static Fitted fitted(JsonObject candidate, List<String> reductions, boolean copyResult) {
 		// Binary search restores its winning prefix after the last predicate call.
-		refreshCoverage(candidate, candidate);
-		// The predicate has observed candidate, so establish sole ownership before taking the trusted path.
-		return Fitted.trusted(candidate.deepCopy(), reductions);
+		refreshCoverage(sectionTotals(candidate), candidate);
+		// A caller that kept the source gets a copy the predicate never saw; an owner takes the tree itself.
+		return Fitted.trusted(copyResult ? candidate.deepCopy() : candidate, reductions);
 	}
 
 	private static boolean removeCandidateTags(JsonObject observation) {
-		boolean changed = false;
+		// The per-block-type dictionary is the tags of the rows that stayed untagged, so it goes with them.
+		boolean changed = observation.remove(ObservationBlockTags.FIELD) != null;
 		for (String field : List.of("blocks", "landmarks", "nearbyContainers", "entities")) {
 			changed |= removeTags(array(observation, field));
 		}
@@ -177,6 +204,11 @@ public final class ServerObservationWireBudget {
 
 		public JsonObject observation() {
 			return observation.deepCopy();
+		}
+
+		/** The fitted tree itself, for a caller that owns this result and drops it; no copy is made. */
+		public JsonObject takeObservation() {
+			return observation;
 		}
 
 		public List<String> reductions() {

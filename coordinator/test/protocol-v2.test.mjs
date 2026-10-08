@@ -2493,3 +2493,65 @@ test('sighted structures, caves and ore veins pass wire validation with bounded 
 	assert.equal(validateProtocolV2Payload('observation', known).sighted.structures[0].new, undefined, 'new is optional');
 	assert.equal(Object.hasOwn(validateProtocolV2Payload('observation', readyServerObservation()), 'sighted'), false, 'sighted stays optional');
 });
+
+test('block tags listed once per type are put back on every row before anything reads the observation', () => {
+	const tags = ['#minecraft:mineable/pickaxe', '#minecraft:base_stone_overworld'];
+	const grass = ['#minecraft:dirt'];
+	const row = (x, blockId, rowTags) => ({ x, y: 64, z: 0, blockId, placeableFaces: ['up'], ...(rowTags === undefined ? {} : { tags: rowTags }) });
+	const landmark = (x, blockId, rowTags) => ({ x, y: 66, z: 4, blockId, distance: 9, bearing: 3, elevation: 1, ...(rowTags === undefined ? {} : { tags: rowTags }) });
+	const full = readyServerObservation();
+	full.blocks = [row(1, 'minecraft:stone', tags), row(2, 'minecraft:stone', tags), row(3, 'minecraft:grass_block', grass)];
+	full.landmarks = [landmark(5, 'minecraft:stone', tags)];
+	const compact = readyServerObservation();
+	compact.blocks = [row(1, 'minecraft:stone'), row(2, 'minecraft:stone'), row(3, 'minecraft:grass_block', grass)];
+	compact.landmarks = [landmark(5, 'minecraft:stone')];
+	compact.blockTags = { 'minecraft:stone': tags };
+
+	const expanded = validateProtocolV2Payload('observation', compact);
+	const reference = validateProtocolV2Payload('observation', full);
+	assert.deepEqual(expanded, reference, 'the expanded observation is the observation sent with tags on every row');
+	assert.equal(JSON.stringify(expanded), JSON.stringify(reference), 'same fields in the same order');
+	assert.equal(Object.hasOwn(expanded, 'blockTags'), false, 'the dictionary is consumed, not forwarded');
+	assert.notStrictEqual(expanded.blocks[0].tags, expanded.blocks[1].tags, 'rows do not share one tags array');
+	assert.deepEqual(adaptObservation(expanded), adaptObservation(reference), 'the model-facing adaptation is identical');
+
+	const inline = readyServerObservation();
+	inline.blocks = [row(1, 'minecraft:stone', ['#own']), row(2, 'minecraft:stone')];
+	inline.blockTags = { 'minecraft:stone': tags };
+	const mixed = validateProtocolV2Payload('observation', inline);
+	assert.deepEqual(mixed.blocks.map((entry) => entry.tags), [['#own'], tags], 'inline tags win and the dictionary only fills gaps');
+
+	for (const bad of [
+		{ 'minecraft:stone': 'not an array' },
+		{ 'minecraft:stone': ['no hash'] },
+		{ '': tags },
+		[],
+	]) {
+		const broken = readyServerObservation();
+		broken.blocks = [row(1, 'minecraft:stone')];
+		broken.blockTags = bad;
+		assert.throws(() => validateProtocolV2Payload('observation', broken), ProtocolV2Error);
+	}
+	const notReady = { goalRevision: 4, observedAtEpochMs: 20, ready: false, status: 'PLAYER_DEAD', blockTags: { 'minecraft:stone': tags } };
+	assert.throws(() => validateProtocolV2Payload('observation', notReady), ProtocolV2Error, 'an unavailable observation carries no live facts');
+
+	const withoutDictionary = validateProtocolV2Payload('observation', full);
+	assert.equal(withoutDictionary.blocks[0].tags.length, 2, 'observations from a server that sends tags on every row still decode');
+});
+
+test('an observation embedded in an inspection result gets its block tags back too', () => {
+	const tags = ['#minecraft:mineable/pickaxe'];
+	const embedded = {
+		blocks: [{ x: 1, y: 2, z: 3, blockId: 'minecraft:stone', placeableFaces: [] }, { x: 2, y: 2, z: 3, blockId: 'minecraft:stone', placeableFaces: [], tags: tags }],
+		landmarks: [{ x: 9, y: 2, z: 3, blockId: 'minecraft:stone', distance: 4, bearing: 0, elevation: 0 }],
+		blockTags: { 'minecraft:stone': tags },
+		entities: [],
+	};
+	const result = validateProtocolV2Payload('inspection_result', { goalRevision: 4, requestId: 'req-1', result: { observation: embedded, eventSequence: 9 } });
+	assert.equal(Object.hasOwn(result.result.observation, 'blockTags'), false);
+	assert.deepEqual(result.result.observation.blocks.map((entry) => entry.tags), [tags, tags]);
+	assert.deepEqual(result.result.observation.landmarks[0].tags, tags);
+	assert.equal(result.result.eventSequence, 9, 'the rest of the result is untouched');
+	const plain = validateProtocolV2Payload('inspection_result', { goalRevision: 4, requestId: 'req-2', result: { section: 'inventory', entries: [] } });
+	assert.deepEqual(plain.result, { section: 'inventory', entries: [] });
+});

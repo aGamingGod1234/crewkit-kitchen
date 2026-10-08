@@ -77,8 +77,11 @@ public final class ServerObservationCollector {
 	public static final int MAX_TAG_COUNT_ENTRIES = 128;
 	private static final int MAX_ENTITY_NAME_CODE_POINTS = 256;
 	private static final int SPATIAL_CACHE_CAPACITY = 16;
-	/** Position and local mutations invalidate candidates; facing is filtered on every observation. */
-	private static final long SPATIAL_CACHE_TICKS = 10L;
+	/**
+	 * Position and local mutations (block writes and chunk loads at chunk resolution) are in the key, so this age only
+	 * bounds how long a still agent's candidates are retained; facing is filtered on every observation.
+	 */
+	private static final long SPATIAL_CACHE_TICKS = 200L;
 	private static final int LANDMARK_CACHE_CAPACITY = 16;
 	/** Mutation revision keys provide freshness; this age bounds retained stationary poses. */
 	private static final long LANDMARK_CACHE_TICKS = 200L;
@@ -87,6 +90,11 @@ public final class ServerObservationCollector {
 	 * between recomputes is still faster than a player reads the scene, and the rows' bearings follow the live view.
 	 */
 	static final long SIGHTED_RECOMPUTE_TICKS = 10L;
+	/**
+	 * A still agent (same block, eye, view and mutation revisions) with a complete far-sight scan would recompute the
+	 * identical rows, so they are reused this long; the age only bounds what the revisions cannot see.
+	 */
+	static final long SIGHTED_STILL_TICKS = 100L;
 	/** Landmark sight rays are reused while the eye stays within half a block and the view within 4 degrees. */
 	static final double LANDMARK_EYE_QUANTUM = 0.5D;
 	static final float LANDMARK_VIEW_QUANTUM_DEGREES = 4.0F;
@@ -225,6 +233,7 @@ public final class ServerObservationCollector {
 		observation.add("lastResult", lastResult(agentId));
 		observation.add("perception", PlayerObservationEvents.snapshot(agent));
 		observation.add("coverage", ObservationPage.coverage(observation));
+		ObservationBlockTags.compact(observation);
 		return observation;
 	}
 
@@ -505,7 +514,10 @@ public final class ServerObservationCollector {
 		return changedActiveAgentSamples(records).stream().map(RawPlayerChange::agentId).toList();
 	}
 
-	/** Raw freshness and forced attention are separate: safe air alone needs only a fresh sample. */
+	/**
+	 * Agents whose raw state reached an edge the attention policy raises as a fact. The baseline refreshes on every
+	 * sample, so quiet churn (safe air, landing, regeneration, footsteps) never reaches the bridge between heartbeats.
+	 */
 	public List<RawPlayerChange> changedActiveAgentSamples(List<AgentRecord> records) {
 		Objects.requireNonNull(records, "records must not be null");
 		List<RawPlayerChange> changed = new ArrayList<>();
@@ -536,8 +548,11 @@ public final class ServerObservationCollector {
 			synchronized (lastRawStates) {
 				RawPlayerState previous = lastRawStates.put(agentId, current);
 				boolean inventoryChanged = updateInventory(agentId, agent);
-				if (previous != null && (!current.equals(previous) || inventoryChanged)) {
-					changed.add(new RawPlayerChange(agentId, current.requiresForcedAttention(previous, inventoryChanged)));
+				// Every sample still refreshes the baseline above, but only an edge the attention policy treats as a
+				// fact is reported; routine state (footsteps, landing, regeneration) waits for the idle heartbeat.
+				if (previous != null && (!current.equals(previous) || inventoryChanged)
+						&& current.requiresForcedAttention(previous, inventoryChanged)) {
+					changed.add(new RawPlayerChange(agentId, true));
 				}
 			}
 		}
@@ -571,11 +586,13 @@ public final class ServerObservationCollector {
 		BlockPos position = agent.blockPosition();
 		RawSpatialObservation raw = rawSpatial(agentId, level, agent, position);
 		Vec3 eye = agent.getEyePosition();
-		SightSample sight = sightSample(agentId, level, agent, position);
+		LandmarkSampleKey sightKey = landmarkKey(agentId, level, agent, position);
+		SightSample sight = sightSample(level, agent, position, sightKey);
 		JsonObject value = new JsonObject();
 		value.add("blocks", blocks(level, agent, raw.blocks(), visibility));
 		value.add("landmarks", landmarks(level, agent, visibility, sight.surfaces()));
-		SightedFeatures.Sample seen = sightedSample(agentId, level, agent, position, visibility, raw, sight);
+		StillPose pose = new StillPose(spatialKeys.get(agentId), sightKey, eye.x, eye.y, eye.z, agent.getYRot(), agent.getXRot());
+		SightedFeatures.Sample seen = sightedSample(agentId, level, agent, position, visibility, raw, sight, pose);
 		JsonObject sighted = SightedFeatures.toJson(seen, eye, agent.getYRot(), announcements(agentId), level.getGameTime());
 		if (sighted != null) value.add("sighted", sighted);
 		value.add("nearbyContainers", nearbyTransactionTargets(raw.containers(), level::getBlockState,
@@ -592,10 +609,10 @@ public final class ServerObservationCollector {
 		return spatialCache.getOrCompute(key, level.getGameTime(), () -> rawSpatialObservation(level, agent, position));
 	}
 
-	private SightSample sightSample(AgentId agentId, ServerLevel level, ServerPlayer agent, BlockPos position) {
+	private static LandmarkSampleKey landmarkKey(AgentId agentId, ServerLevel level, ServerPlayer agent, BlockPos position) {
 		Vec3 eye = agent.getEyePosition();
 		// Quantized so a still agent's small head movements reuse the sight rays instead of recasting all 80.
-		LandmarkSampleKey landmarkKey = new LandmarkSampleKey(
+		return new LandmarkSampleKey(
 			agentId,
 			level.dimension().identifier().toString(),
 			position.getX(),
@@ -611,6 +628,13 @@ public final class ServerObservationCollector {
 			agent.getMainHandItem().getItem(),
 			worldMutationRevision(level, position, LANDMARK_SIGHT_DISTANCE + 1)
 		);
+	}
+
+	private SightSample sightSample(AgentId agentId, ServerLevel level, ServerPlayer agent, BlockPos position) {
+		return sightSample(level, agent, position, landmarkKey(agentId, level, agent, position));
+	}
+
+	private SightSample sightSample(ServerLevel level, ServerPlayer agent, BlockPos position, LandmarkSampleKey landmarkKey) {
 		return landmarkCache.getOrCompute(
 			landmarkKey,
 			level.getGameTime(),
@@ -1108,7 +1132,15 @@ public final class ServerObservationCollector {
 	}
 
 	/** An agent's last sighted rows and when (and in which dimension) they were computed. */
-	record SightedMemo(String dimension, long gameTime, SightedFeatures.Sample sample) {
+	record SightedMemo(String dimension, long gameTime, SightedFeatures.Sample sample, StillPose pose, boolean settled) {
+		SightedMemo(String dimension, long gameTime, SightedFeatures.Sample sample) {
+			this(dimension, gameTime, sample, null, false);
+		}
+	}
+
+	/** Everything the sighted rows are computed from besides the loaded world: block, eye, view and both mutation keys. */
+	record StillPose(RawSpatialObservation.Key spatial, LandmarkSampleKey sight, double eyeX, double eyeY, double eyeZ,
+			float yaw, float pitch) {
 	}
 
 	static double quantize(double value, double quantum) {
@@ -1121,6 +1153,13 @@ public final class ServerObservationCollector {
 				|| gameTime < memo.gameTime();
 	}
 
+	/** As above, but a still agent whose last scan completed keeps its rows up to {@link #SIGHTED_STILL_TICKS}. */
+	static boolean sightedDue(SightedMemo memo, String dimension, long gameTime, StillPose pose) {
+		if (!sightedDue(memo, dimension, gameTime)) return false;
+		return memo == null || !memo.dimension().equals(dimension) || gameTime < memo.gameTime()
+				|| gameTime - memo.gameTime() >= SIGHTED_STILL_TICKS || !memo.settled() || !memo.pose().equals(pose);
+	}
+
 	private SightedFeatures.Sample sightedSample(
 			AgentId agentId,
 			ServerLevel level,
@@ -1128,26 +1167,27 @@ public final class ServerObservationCollector {
 			BlockPos center,
 			ObservationVisibility.Frame visibility,
 			RawSpatialObservation raw,
-			SightSample rays
+			SightSample rays,
+			StillPose pose
 	) {
 		String dimension = level.dimension().identifier().toString();
 		long gameTime = level.getGameTime();
 		SightedMemo memo;
 		synchronized (sightedSamples) {
 			memo = sightedSamples.get(agentId);
-			if (!sightedDue(memo, dimension, gameTime)) return memo.sample();
+			if (!sightedDue(memo, dimension, gameTime, pose)) return memo.sample();
 		}
 		// Over the level's passes for this tick the previous rows stand (still due, so recomputed next tick).
 		if (!levelIndex(level).tryPass(gameTime, false)) {
 			return memo != null && memo.dimension().equals(dimension) ? memo.sample() : SightedFeatures.Sample.EMPTY;
 		}
 		long started = PerceptionTiming.start();
-		SightedFeatures.Sample sample = sightedNow(agentId, level, agent, center, visibility, raw, rays, FarSight.Request.passive()).sample();
+		Sighted computed = sightedNow(agentId, level, agent, center, visibility, raw, rays, FarSight.Request.passive());
 		PerceptionTiming.record("sighted", started);
 		synchronized (sightedSamples) {
-			sightedSamples.put(agentId, new SightedMemo(dimension, gameTime, sample));
+			sightedSamples.put(agentId, new SightedMemo(dimension, gameTime, computed.sample(), pose, computed.far().complete()));
 		}
-		return sample;
+		return computed.sample();
 	}
 
 	/** Caves and veins of the current view plus one far-sight pass, computed now (no throttle). */
@@ -1523,7 +1563,7 @@ public final class ServerObservationCollector {
 				agent.onGround(),
 				finite(agent.fallDistance),
 				attacker != null && attacker.isAlive() ? attacker.getUUID() : null,
-				PlayerObservationEvents.sequence(agent),
+				PlayerObservationEvents.attentionSequence(agent),
 				threatSignals
 			);
 	}
@@ -1557,15 +1597,22 @@ public final class ServerObservationCollector {
 					perceptionSequence, Set.of());
 		}
 
+		/**
+		 * Whether this sample is an edge {@link AttentionSignalPolicy} raises as a fact, so it goes out now. Sounds,
+		 * landing, regeneration, saturation and food above the warning level change often and are not facts; the idle
+		 * heartbeat carries them within half a second.
+		 */
 		boolean requiresForcedAttention(RawPlayerState previous, boolean inventoryChanged) {
-			// Narrow exception: preserve menu/components, events, hazards and every other raw wake.
 			return inventoryChanged || !AttentionSignalPolicy.safeAir(air) || !AttentionSignalPolicy.safeAir(previous.air)
 					// Crossing the half-air warning must reach the model while there is still time to surface.
 					|| AttentionSignalPolicy.airBand(air) != AttentionSignalPolicy.airBand(previous.air)
-					|| health != previous.health || foodLevel != previous.foodLevel || saturation != previous.saturation
-					|| onFire != previous.onFire || inWater != previous.inWater || suffocating != previous.suffocating
-					|| onGround != previous.onGround || fallDistance != previous.fallDistance
-					|| !Objects.equals(lastAttacker, previous.lastAttacker) || perceptionSequence != previous.perceptionSequence
+					|| health < previous.health
+					|| AttentionSignalPolicy.foodBecameCritical(previous.foodLevel, foodLevel)
+					|| (onFire && !previous.onFire) || (suffocating && !previous.suffocating)
+					|| AttentionSignalPolicy.fallBecameHazardous(previous.fallDistance, fallDistance)
+					|| !Objects.equals(lastAttacker, previous.lastAttacker)
+					// Chat, titles, boss bars and lava sounds; other sounds are not part of this sequence.
+					|| perceptionSequence != previous.perceptionSequence
 					// A newly latched threat signal must reach the model now; a signal expiring is only a quiet refresh.
 					|| !previous.threatSignals.containsAll(threatSignals);
 		}

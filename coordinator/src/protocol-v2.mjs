@@ -382,7 +382,7 @@ function normalizeProtocolV2Payload(type, value) {
 			exactKeys(value, ['goalRevision', 'requestId', 'result', 'error'], ['goalRevision', 'requestId'], type);
 			if ((value.result === undefined) === (value.error === undefined)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Inspection needs exactly one result or error');
 			return { goalRevision: revision(value.goalRevision, 'goalRevision'), requestId: requireIdentifier(value.requestId, 'requestId'),
-				...(value.error === undefined ? { result: observedDetails(value.result, 'inspection.result') } : { error: { code: requireIdentifier(value.error.code, 'error.code'), message: boundedText(value.error.message, 'error.message', 2048) } }) };
+				...(value.error === undefined ? { result: expandEmbeddedBlockTags(observedDetails(value.result, 'inspection.result')) } : { error: { code: requireIdentifier(value.error.code, 'error.code'), message: boundedText(value.error.message, 'error.message', 2048) } }) };
 		}
 		case 'action_command':
 			return normalizeActionCommand(value);
@@ -1819,7 +1819,7 @@ function observedDetails(value, field, depth = 0) {
 }
 
 function normalizeObservation(value) {
-	const allowed = ['goalRevision', 'observedAtEpochMs', 'ready', 'status', 'eventSequence', 'attention', 'changedFacts', 'position', 'velocity', 'view', 'player', 'inventory', 'entities', 'blocks', 'landmarks', 'nearbyContainers', 'world', 'currentAction', 'lastResult', 'interaction', 'coverage', 'perception', 'threats', 'survival', 'heard', 'sighted'];
+	const allowed = ['goalRevision', 'observedAtEpochMs', 'ready', 'status', 'eventSequence', 'attention', 'changedFacts', 'position', 'velocity', 'view', 'player', 'inventory', 'entities', 'blocks', 'landmarks', 'nearbyContainers', 'world', 'currentAction', 'lastResult', 'interaction', 'coverage', 'perception', 'threats', 'survival', 'heard', 'sighted', 'blockTags'];
 	exactKeys(value, allowed, ['goalRevision', 'observedAtEpochMs', 'ready', 'status'], 'observation');
 	const normalized = {
 		goalRevision: revision(value.goalRevision, 'goalRevision'),
@@ -1835,7 +1835,7 @@ function normalizeObservation(value) {
 		if (normalized.attention === false && normalized.changedFacts?.length > 0) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Non-attention observation cannot contain changed facts');
 		return normalized;
 	}
-	for (const key of allowed.slice(4).filter((field) => !['interaction', 'landmarks', 'coverage', 'perception', 'threats', 'survival', 'heard', 'sighted'].includes(field))) if (!Object.hasOwn(value, key)) throw new ProtocolV2Error('MISSING_FIELD', `observation field '${key}' is required when ready`);
+	for (const key of allowed.slice(4).filter((field) => !['interaction', 'landmarks', 'coverage', 'perception', 'threats', 'survival', 'heard', 'sighted', 'blockTags'].includes(field))) if (!Object.hasOwn(value, key)) throw new ProtocolV2Error('MISSING_FIELD', `observation field '${key}' is required when ready`);
 	normalized.eventSequence = positiveInteger(value.eventSequence, 'eventSequence');
 	normalized.attention = boolean(value.attention, 'attention');
 	normalized.changedFacts = changedFactPaths(value.changedFacts);
@@ -1846,8 +1846,9 @@ function normalizeObservation(value) {
 	normalized.player = playerObservation(value.player);
 	normalized.inventory = inventoryObservation(value.inventory);
 	normalized.entities = boundedArray(value.entities, 'entities', MAX_ENTITIES).map(entityObservation);
-	normalized.blocks = boundedArray(value.blocks, 'blocks', MAX_BLOCKS).map(blockObservation);
-	if (Object.hasOwn(value, 'landmarks')) normalized.landmarks = boundedArray(value.landmarks, 'landmarks', MAX_LANDMARKS).map(landmarkObservation);
+	const blockTags = blockTagDictionary(value.blockTags);
+	normalized.blocks = boundedArray(value.blocks, 'blocks', MAX_BLOCKS).map((row, index) => blockObservation(withBlockTags(row, blockTags), index));
+	if (Object.hasOwn(value, 'landmarks')) normalized.landmarks = boundedArray(value.landmarks, 'landmarks', MAX_LANDMARKS).map((row, index) => landmarkObservation(withBlockTags(row, blockTags), index));
 	normalized.nearbyContainers = boundedArray(value.nearbyContainers, 'nearbyContainers', MAX_NEARBY_TRANSACTION_TARGETS).map(nearbyContainerObservation);
 	normalized.world = worldObservation(value.world);
 	normalized.currentAction = currentActionObservation(value.currentAction);
@@ -1860,6 +1861,36 @@ function normalizeObservation(value) {
 	if (value.heard !== undefined) normalized.heard = heardObservation(value.heard);
 	if (value.sighted !== undefined) normalized.sighted = sightedObservation(value.sighted);
 	return normalized;
+}
+
+/**
+ * The server lists each block type's tags once (`blockTags`) and leaves them off the rows of that type. Rows get their
+ * tags back here, before anything else reads the observation, so every consumer sees the rows it always saw.
+ */
+function blockTagDictionary(value) {
+	if (value === undefined) return null;
+	if (!isPlainObject(value)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'blockTags must be an object');
+	const entries = Object.entries(value);
+	if (entries.length > MAX_BLOCKS + MAX_LANDMARKS) throw new ProtocolV2Error('INVALID_PAYLOAD', `blockTags exceeds bound of ${MAX_BLOCKS + MAX_LANDMARKS}`);
+	return new Map(entries.map(([blockId, tags]) => [requireIdentifier(blockId, 'blockTags key'), observationTags(tags, `blockTags.${blockId}`)]));
+}
+
+function withBlockTags(row, dictionary) {
+	if (dictionary === null || !isPlainObject(row) || row.tags !== undefined || typeof row.blockId !== 'string') return row;
+	const tags = dictionary.get(row.blockId);
+	return tags === undefined ? row : { ...row, tags: [...tags] };
+}
+
+/** The same expansion for an observation embedded in an inspection result, which is kept as bounded JSON facts. */
+function expandEmbeddedBlockTags(result) {
+	const observation = result?.observation;
+	if (!isPlainObject(observation) || observation.blockTags === undefined) return result;
+	const dictionary = blockTagDictionary(observation.blockTags);
+	const { blockTags: _omitted, ...rest } = observation;
+	for (const section of ['blocks', 'landmarks']) {
+		if (Array.isArray(rest[section])) rest[section] = rest[section].map((row) => withBlockTags(row, dictionary));
+	}
+	return { ...result, observation: rest };
 }
 
 function sightedBlockIds(value, field) {

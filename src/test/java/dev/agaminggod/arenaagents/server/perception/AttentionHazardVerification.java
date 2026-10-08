@@ -56,10 +56,69 @@ public final class AttentionHazardVerification {
 		assertTrue(rawState(59, 20, true, 0, 0).requiresForcedAttention(rawState(60, 20, true, 0, 0), false),
 				"continuing critical air remains forced");
 		assertTrue(rawState(298, 19, true, 0, 0).requiresForcedAttention(before, false), "damage plus safe air remains forced");
-		assertTrue(rawState(298, 20, false, 0, 0).requiresForcedAttention(before, false), "other raw transitions remain forced");
 		assertTrue(rawState(298, 20, true, 6, 0).requiresForcedAttention(before, false), "hazardous falling remains forced");
 		assertTrue(rawState(298, 20, true, 0, 1).requiresForcedAttention(before, false), "perception events remain forced");
-		return 10;
+		return 9 + verifyRoutineStateWaitsForHeartbeat();
+	}
+
+	/**
+	 * Only edges AttentionSignalPolicy raises as a fact force an observation; everything else rides the idle heartbeat.
+	 * Each case also checks the policy side, so the two cannot drift apart.
+	 */
+	private static int verifyRoutineStateWaitsForHeartbeat() {
+		var rest = raw(20, 20, 5, false, false, 300, false, true, 0.0D, null, 0L);
+		assertFalse(raw(20, 20, 5, false, false, 300, false, false, 0.0D, null, 0L).requiresForcedAttention(rest, false),
+				"leaving the ground is not a fact");
+		assertFalse(rest.requiresForcedAttention(raw(20, 20, 5, false, false, 300, false, false, 0.0D, null, 0L), false),
+				"landing is not a fact");
+		assertFalse(raw(20, 20, 5, false, false, 300, false, true, 3.5D, null, 0L).requiresForcedAttention(rest, false),
+				"falling below the damaging distance is not a fact");
+		assertFalse(raw(20, 20, 5, false, false, 300, false, true, 0.0D, null, 0L).requiresForcedAttention(
+				raw(20, 20, 5, false, false, 300, false, true, 9.0D, null, 0L), false), "a fall ending is not a fact");
+		assertTrue(raw(20, 20, 5, false, false, 300, false, false, 6.0D, null, 0L).requiresForcedAttention(rest, false),
+				"reaching the damaging fall distance is a fact");
+		assertFalse(raw(20, 20, 5, false, false, 300, false, false, 8.0D, null, 0L).requiresForcedAttention(
+				raw(20, 20, 5, false, false, 300, false, false, 7.0D, null, 0L), false), "falling further is not a new fact");
+		assertFalse(raw(20, 20, 3, false, false, 300, false, true, 0.0D, null, 0L).requiresForcedAttention(rest, false),
+				"saturation drifting is not a fact");
+		assertFalse(raw(20, 19, 5, false, false, 300, false, true, 0.0D, null, 0L).requiresForcedAttention(rest, false),
+				"hunger above the warning level is not a fact");
+		assertTrue(raw(20, 6, 5, false, false, 300, false, true, 0.0D, null, 0L).requiresForcedAttention(
+				raw(20, 7, 5, false, false, 300, false, true, 0.0D, null, 0L), false), "food reaching the warning level is a fact");
+		assertFalse(raw(20, 5, 5, false, false, 300, false, true, 0.0D, null, 0L).requiresForcedAttention(
+				raw(20, 6, 5, false, false, 300, false, true, 0.0D, null, 0L), false), "food falling further is not a new fact");
+		assertFalse(raw(20, 20, 5, false, true, 300, false, true, 0.0D, null, 0L).requiresForcedAttention(rest, false),
+				"entering water is not a fact");
+		var wounded = raw(18, 20, 5, false, false, 300, false, true, 0.0D, null, 0L);
+		assertFalse(raw(20, 20, 5, false, false, 300, false, true, 0.0D, null, 0L).requiresForcedAttention(wounded, false),
+				"regeneration is not a fact");
+		assertTrue(wounded.requiresForcedAttention(rest, false), "a health drop is a fact");
+		assertTrue(raw(20, 20, 5, true, false, 300, false, true, 0.0D, null, 0L).requiresForcedAttention(rest, false),
+				"catching fire is a fact");
+		assertFalse(rest.requiresForcedAttention(raw(20, 20, 5, true, false, 300, false, true, 0.0D, null, 0L), false),
+				"burning out is not a fact");
+		assertTrue(raw(20, 20, 5, false, false, 300, true, true, 0.0D, null, 0L).requiresForcedAttention(rest, false),
+				"suffocating is a fact");
+		assertTrue(raw(20, 20, 5, false, false, 300, false, true, 0.0D, java.util.UUID.randomUUID(), 0L)
+				.requiresForcedAttention(rest, false), "a new attacker is a fact");
+
+		JsonObject before = observation("idle");
+		JsonObject after = before.deepCopy();
+		after.getAsJsonObject("player").addProperty("onGround", false);
+		after.getAsJsonObject("player").addProperty("saturation", 1.0D);
+		after.getAsJsonObject("player").addProperty("fallDistance", 3.5D);
+		assertFalse(AttentionSignalPolicy.changedFacts(before, after).stream().anyMatch(fact -> fact.startsWith("player.")),
+				"the policy raises none of the routine changes the heartbeat carries");
+		after.getAsJsonObject("player").addProperty("fallDistance", 6.0D);
+		assertTrue(AttentionSignalPolicy.changedFacts(before, after).contains("player.fallDistance"), "and raises the fall that matters");
+		return 19;
+	}
+
+	private static ServerObservationCollector.RawPlayerState raw(double health, int food, double saturation, boolean onFire,
+			boolean inWater, int air, boolean suffocating, boolean onGround, double fallDistance, java.util.UUID attacker,
+			long perceptionSequence) {
+		return new ServerObservationCollector.RawPlayerState(health, food, saturation, onFire, inWater, air, suffocating,
+				onGround, fallDistance, attacker, perceptionSequence);
 	}
 
 	/** Drowning attention must leave time to decide: it fires at half air (7.5 s), once per dive. */

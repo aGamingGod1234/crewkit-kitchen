@@ -11,6 +11,7 @@ import com.google.gson.stream.JsonReader;
 import com.google.gson.stream.JsonToken;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.io.Writer;
 import java.util.Base64;
 import java.util.function.Supplier;
 import java.io.StringReader;
@@ -23,6 +24,7 @@ import java.util.Set;
 
 public final class BridgeEnvelopeCodec {
 	public static final int MAX_LINE_BYTES = 65_536;
+	private static final int SMALL_FRAME_HINT = 512;
 	// 256 queued specs: escaped 4096-character requests, 64 identifiers (256 chars),
 	// 16 predicate leaves with 16 properties of 64+128 chars, plus current goal and metadata fit below this bound.
 	static final int MAX_REGISTRY_ENTRY_BYTES = 128 * 1024 * 1024;
@@ -33,6 +35,8 @@ public final class BridgeEnvelopeCodec {
 			"protocolVersion", "serverInstanceId", "agentId", "type", "messageId", "payload"
 	);
 	private static final Gson GSON = new GsonBuilder().serializeNulls().create();
+	/** Size of the last observation frame plus slack, so the next one is written without regrowing its buffer. */
+	private volatile int observationFrameHint = SMALL_FRAME_HINT;
 
 	public BridgeEnvelope decode(String line) {
 		if (line == null || line.getBytes(StandardCharsets.UTF_8).length > MAX_LINE_BYTES) {
@@ -169,8 +173,9 @@ public final class BridgeEnvelopeCodec {
 		Objects.requireNonNull(type, "type must not be null");
 		Objects.requireNonNull(messageId, "messageId must not be null");
 		Objects.requireNonNull(payload, "payload must not be null");
-		return serialize(protocolVersion, serverInstanceId, agentId, type, messageId, payload)
-				.getBytes(StandardCharsets.UTF_8).length;
+		Utf8Sink sink = new Utf8Sink(false, 0);
+		writeEnvelope(protocolVersion, serverInstanceId, agentId, type, messageId, payload, sink);
+		return sink.finish();
 	}
 
 	/** Preflight logical publication before lifecycle commit; fragments consume one queue slot. */
@@ -305,32 +310,27 @@ public final class BridgeEnvelopeCodec {
 		BridgeEnvelope checked = java.util.Objects.requireNonNull(envelope, "envelope must not be null");
 		EncodedFrame cached = checked.encodedFrame();
 		if (cached != null) return cached;
-		byte[] jsonBytes = serialize(checked).getBytes(StandardCharsets.UTF_8);
-		byte[] wireBytes = Arrays.copyOf(jsonBytes, jsonBytes.length + 1);
-		wireBytes[jsonBytes.length] = (byte) '\n';
+		// Written straight to UTF-8 with the newline delimiter; large observations skip the String and its two byte copies.
+		boolean observation = "observation".equals(checked.type());
+		Utf8Sink sink = new Utf8Sink(true, observation ? observationFrameHint : SMALL_FRAME_HINT);
+		writeEnvelope(checked.protocolVersion(), checked.serverInstanceId(), checked.agentId(), checked.type(),
+				checked.messageId(), checked.payloadView(), sink);
+		sink.write('\n');
+		byte[] wireBytes = sink.toByteArray();
+		if (observation) observationFrameHint = wireBytes.length + (wireBytes.length >> 3);
 		EncodedFrame encoded = new EncodedFrame(wireBytes);
 		checked.cacheEncodedFrame(encoded);
 		return checked.encodedFrame();
 	}
 
-	private static String serialize(BridgeEnvelope envelope) {
-		return serialize(
-				envelope.protocolVersion(),
-				envelope.serverInstanceId(),
-				envelope.agentId(),
-				envelope.type(),
-				envelope.messageId(),
-				envelope.payloadView()
-		);
-	}
-
-	private static String serialize(
+	private static void writeEnvelope(
 			int protocolVersion,
 			String serverInstanceId,
 			String agentId,
 			String type,
 			String messageId,
-			JsonObject payload
+			JsonObject payload,
+			Writer output
 	) {
 		JsonObject object = new JsonObject();
 		object.addProperty("protocolVersion", protocolVersion);
@@ -339,7 +339,93 @@ public final class BridgeEnvelopeCodec {
 		object.addProperty("type", type);
 		object.addProperty("messageId", messageId);
 		object.add("payload", payload);
-		return GSON.toJson(object);
+		GSON.toJson(object, output);
+	}
+
+	/**
+	 * Gson output as UTF-8, byte for byte what {@code String.getBytes(UTF_8)} returns (a lone surrogate becomes '?'),
+	 * either only counted or also kept. Counting needs no buffer at all.
+	 */
+	private static final class Utf8Sink extends Writer {
+		private final boolean keep;
+		private byte[] bytes;
+		private int length;
+		private char pendingHigh;
+
+		Utf8Sink(boolean keep, int capacityHint) {
+			this.keep = keep;
+			this.bytes = keep ? new byte[Math.max(256, capacityHint)] : null;
+		}
+
+		@Override public void write(int value) { put((char) value); }
+
+		@Override public void write(char[] buffer, int offset, int count) {
+			for (int index = offset, end = offset + count; index < end; index++) put(buffer[index]);
+		}
+
+		@Override public void write(String text, int offset, int count) {
+			for (int index = offset, end = offset + count; index < end; index++) put(text.charAt(index));
+		}
+
+		@Override public void flush() { }
+
+		@Override public void close() { }
+
+		/** Completes a trailing lone high surrogate and returns the byte length. */
+		int finish() {
+			if (pendingHigh != 0) {
+				pendingHigh = 0;
+				emit('?');
+			}
+			return length;
+		}
+
+		byte[] toByteArray() {
+			finish();
+			return Arrays.copyOf(bytes, length);
+		}
+
+		private void put(char value) {
+			if (value < 0x80 && pendingHigh == 0) {
+				emit(value);
+				return;
+			}
+			if (pendingHigh != 0) {
+				char high = pendingHigh;
+				pendingHigh = 0;
+				if (Character.isLowSurrogate(value)) {
+					int codePoint = Character.toCodePoint(high, value);
+					emit(0xF0 | (codePoint >> 18));
+					emit(0x80 | ((codePoint >> 12) & 0x3F));
+					emit(0x80 | ((codePoint >> 6) & 0x3F));
+					emit(0x80 | (codePoint & 0x3F));
+					return;
+				}
+				emit('?');
+			}
+			if (value < 0x80) {
+				emit(value);
+			} else if (value < 0x800) {
+				emit(0xC0 | (value >> 6));
+				emit(0x80 | (value & 0x3F));
+			} else if (Character.isHighSurrogate(value)) {
+				pendingHigh = value;
+			} else if (Character.isLowSurrogate(value)) {
+				emit('?');
+			} else {
+				emit(0xE0 | (value >> 12));
+				emit(0x80 | ((value >> 6) & 0x3F));
+				emit(0x80 | (value & 0x3F));
+			}
+		}
+
+		private void emit(int value) {
+			if (keep) {
+				if (length == bytes.length) bytes = Arrays.copyOf(bytes, bytes.length * 2);
+				bytes[length] = (byte) value;
+			}
+			length++;
+		}
 	}
 
 	public static final class EncodedFrame {
