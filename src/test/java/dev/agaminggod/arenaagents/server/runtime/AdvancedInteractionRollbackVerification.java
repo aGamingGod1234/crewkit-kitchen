@@ -88,6 +88,7 @@ public final class AdvancedInteractionRollbackVerification {
 			verifyPartialMenuInput(components);
 			verifyNativeCraftTransaction(components);
 			verifyMultiCraftTransaction(components);
+			verifyBreakSpeedAdvice(components);
 			verifyNativePickaxeTransaction(components);
 			verifyCraftDeath(components);
 			verifyHorizontalFacingPlacement(components);
@@ -98,7 +99,7 @@ public final class AdvancedInteractionRollbackVerification {
 			verifyExternallyClosedCraftMenu(components);
 			if (failure != null) throw failure;
 		}
-		return 174;
+		return 179;
 	}
 
 	/** Tick a table pickaxe craft until both planks cells are filled and one plank is still on the cursor. */
@@ -288,6 +289,32 @@ public final class AdvancedInteractionRollbackVerification {
 		assertEquals("RECIPE_INPUTS_UNAVAILABLE", unavailable.reasonCode(), "missing ingredients are named: " + unavailable.message());
 		noLogs.cleanup();
 		assertTrue(!AgentInventoryView.isOpen(missing.player()), "failed craft closes the inventory screen");
+	}
+
+	/** A strictly faster tool in the bag is named in the break result; the held tool, a tie or nothing better is silent. */
+	private static void verifyBreakSpeedAdvice(ComponentBindings components) {
+		Fixture fixture = fixture();
+		var logBlock = net.minecraft.world.level.block.Blocks.OAK_LOG;
+		var stoneBlock = net.minecraft.world.level.block.Blocks.STONE;
+		// The headless registries carry no tool components, so give the two items the rules vanilla gives them here.
+		fixture.inventory().setItem(3, components.tool(Items.STONE_AXE, 131, 4.0F, logBlock));
+		fixture.inventory().setItem(5, components.tool(Items.WOODEN_PICKAXE, 59, 2.0F, stoneBlock));
+		var log = logBlock.defaultBlockState();
+		var stone = stoneBlock.defaultBlockState();
+		assertEquals("faster tool in inventory: hand (held) 60 ticks, stone_axe slot 3: 15 ticks",
+				BreakSpeedAdvisor.advise(fixture.inventory(), log, log.getDestroySpeed(null, null), 1.0F),
+				"a log by hand names the stone axe in the bag");
+		assertEquals("faster tool in inventory: hand (held) 150 ticks, wooden_pickaxe slot 5: 23 ticks",
+				BreakSpeedAdvisor.advise(fixture.inventory(), stone, stone.getDestroySpeed(null, null), 1.0F),
+				"stone by hand names the pickaxe, the axe being no faster than the hand there");
+		fixture.inventory().setSelectedSlot(3);
+		assertTrue(BreakSpeedAdvisor.advise(fixture.inventory(), log, log.getDestroySpeed(null, null), 4.0F) == null,
+				"holding the best tool adds nothing to the result");
+		fixture.inventory().setSelectedSlot(5);
+		assertTrue(BreakSpeedAdvisor.advise(fixture.inventory(), stone, stone.getDestroySpeed(null, null), 2.0F) == null,
+				"the pickaxe in hand is already the fastest for stone");
+		assertTrue(BreakSpeedAdvisor.advise(fixture.inventory(),
+				net.minecraft.world.level.block.Blocks.GRASS_BLOCK.defaultBlockState(), 0.0F, 1.0F) == null, "an instant block needs no advice");
 	}
 
 	/** A count above one craft's output stacks several crafts in the grid and takes the result once, as a player does. */
@@ -1000,6 +1027,19 @@ public final class AdvancedInteractionRollbackVerification {
 				holder.bindComponents(components.build());
 			}
 			return new ItemStack(item, count);
+		}
+
+		/** A stack whose item mines {@code block} at {@code speed} with the right tool, as a vanilla axe or pickaxe does. */
+		private ItemStack tool(Item item, int maxDamage, float speed, net.minecraft.world.level.block.Block block) {
+			stack(item, 1, maxDamage);
+			DataComponentMap.Builder bound = DataComponentMap.builder();
+			bound.addAll(item.builtInRegistryHolder().components());
+			bound.set(DataComponents.TOOL, new net.minecraft.world.item.component.Tool(
+					java.util.List.of(net.minecraft.world.item.component.Tool.Rule.minesAndDrops(
+							net.minecraft.core.HolderSet.direct(block.builtInRegistryHolder()), speed)),
+					1.0F, 1, true));
+			item.builtInRegistryHolder().bindComponents(bound.build());
+			return new ItemStack(item, 1);
 		}
 
 		@Override

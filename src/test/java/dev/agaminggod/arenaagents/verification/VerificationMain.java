@@ -84,6 +84,7 @@ import dev.agaminggod.arenaagents.server.runtime.ActionProgressTrackerVerificati
 import dev.agaminggod.arenaagents.server.runtime.AdvancedInteractionRollbackVerification;
 import dev.agaminggod.arenaagents.server.runtime.BlockPlacementPostconditionVerification;
 import dev.agaminggod.arenaagents.server.runtime.BlockPlacementAttemptPolicyVerification;
+import dev.agaminggod.arenaagents.server.runtime.BreakSpeedAdvisorVerification;
 import dev.agaminggod.arenaagents.server.runtime.DesiredBlockStateVerification;
 import dev.agaminggod.arenaagents.server.runtime.ResourceLeaseManagerVerification;
 import dev.agaminggod.arenaagents.server.runtime.RecipeActionVerification;
@@ -220,6 +221,7 @@ public final class VerificationMain {
 		passedAssertions += AdvancedInteractionRollbackVerification.verify();
 		passedAssertions += BlockPlacementPostconditionVerification.verify();
 		passedAssertions += BlockPlacementAttemptPolicyVerification.verify();
+		passedAssertions += BreakSpeedAdvisorVerification.verify();
 		passedAssertions += DesiredBlockStateVerification.verify();
 		passedAssertions += ResourceLeaseManagerVerification.verify();
 		passedAssertions += RecipeActionVerification.verify();

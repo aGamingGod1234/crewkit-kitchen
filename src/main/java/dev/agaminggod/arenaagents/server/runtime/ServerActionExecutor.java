@@ -1803,6 +1803,8 @@ public final class ServerActionExecutor {
 		private int placementRestoreTicks;
 		private java.util.function.Supplier<Vec3> immediateAimTarget;
 		private boolean breakInputIssued;
+		/** Set when the inventory holds a strictly faster tool for this block; appended to the success message. */
+		private String breakSpeedNote;
 		private boolean breakObservedInCarpet;
 		private BlockBreakReceipt breakReceiptBaseline;
 		private int breakTicks;
@@ -2162,6 +2164,7 @@ public final class ServerActionExecutor {
 						return null;
 					}
 					clearPostBreakDelay();
+					breakSpeedNote = BreakSpeedAdvisor.advise(player, block, player.level().getBlockState(block));
 					breakInputIssued = true;
 				}
 				// Renew the deadman lease without restarting Carpet's continuous attack.
@@ -2178,9 +2181,10 @@ public final class ServerActionExecutor {
 				if (ownedTransition) {
 					lastObservation = breakObservation(now, hit, currentBlockId, 1.0D, true);
 					// A fact, not a refusal: lava the agent hears beside the opened block can now flow in.
+					String broken = dev.agaminggod.arenaagents.server.perception.HearingPerception.lavaHeardNear(player, block, 2.5D)
+							? "Block broken; lava is heard within 2 blocks of it" : "Block broken";
 					return result(ServerActionState.SUCCEEDED, "BLOCK_BROKEN",
-							dev.agaminggod.arenaagents.server.perception.HearingPerception.lavaHeardNear(player, block, 2.5D)
-									? "Block broken; lava is heard within 2 blocks of it" : "Block broken", now);
+							breakSpeedNote == null ? broken : broken + "; " + breakSpeedNote, now);
 				}
 				if (!currentState.isAir() && !expectedBlockId.equals(currentBlockId)) {
 					lastObservation = breakObservation(now, hit, currentBlockId, 0.0D, false);
