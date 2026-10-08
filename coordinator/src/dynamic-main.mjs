@@ -4833,10 +4833,18 @@ function mergeAttentionTrigger(previous, next) {
 	};
 }
 
-function mergePlannerRequest(previous, next) {
+export function mergePlannerRequest(previous, next) {
 	if (previous === null || previous === undefined) return next;
 	const priority = previous.priority === 'urgent' || next.priority === 'urgent' ? 'urgent' : 'ordinary';
 	const winner = next.priority === priority ? next : previous;
+	// A program that ended (or asked for a decision) while the model was still in a turn must not be replaced by the
+	// plain observation that followed: the model would wake without the program's result and have to ask for it.
+	const programEvent = previous.nativeEvent?.event;
+	if (['program_ended', 'program_attention', 'program_handoff_rejected'].includes(programEvent) && next.nativeEvent?.event === 'observation'
+			&& next.nativeEvent.conversationOnly !== true && next.priority !== 'urgent' && previous.goalRevision === next.goalRevision) {
+		return { ...next, priority, trigger: winner.trigger, nativeEvent: { ...previous.nativeEvent, observation: next.nativeEvent.observation ?? previous.nativeEvent.observation,
+			...(next.eventSequence === undefined ? {} : { eventSequence: next.eventSequence }) } };
+	}
 	return { ...next, priority, trigger: winner.trigger };
 }
 

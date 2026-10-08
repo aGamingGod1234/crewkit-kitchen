@@ -132,3 +132,22 @@ test('a perception change made only of new sounds is not attention when heard is
 	assert.equal(soundOnlyPerceptionChange(payloadFor, wire(sounds), undefined), false, 'unknown baseline');
 	assert.equal(classifyObservationTrigger({ attention: false, changedFacts: [] }, {}).attention, false);
 });
+
+test('rotating the recorded Sol Codex session at 64k context tokens halves its input', async () => {
+	const { readFile } = await import('node:fs/promises');
+	const { replayContextRotation } = await import('../src/benchmark/token-budget.mjs');
+	const { DEFAULT_CONTEXT_ROTATION_TOKENS } = await import('../src/context-carry-over.mjs');
+	const series = JSON.parse(await readFile(new URL('./fixtures/codex-sol-context-series.json', import.meta.url), 'utf8'));
+	const calls = series.calls.map(([context, cached]) => ({ context, cached }));
+	const prefixTokens = calls[0].context;
+	const before = replayContextRotation({ calls, turnEnds: series.turnEnds, prefixTokens, thresholdTokens: 0 });
+	const after = replayContextRotation({ calls, turnEnds: series.turnEnds, prefixTokens, thresholdTokens: DEFAULT_CONTEXT_ROTATION_TOKENS });
+	// Recorded: 68 calls, 6,883,432 input tokens, 101,227 average context, 253,672 uncached.
+	assert.equal(before.inputTokens, 6_883_432);
+	assert.ok(after.inputTokens <= before.inputTokens * 0.5, `${after.inputTokens} input tokens after rotation`);
+	assert.ok(after.averageContextTokens < 50_000, `${after.averageContextTokens} average context tokens`);
+	// Each fresh thread's first call is counted wholly uncached, so uncached input grows a little; weighting cached input at
+	// a tenth of the uncached price the session still costs about a third less.
+	const weighted = ({ inputTokens, uncachedInputTokens }) => uncachedInputTokens + (inputTokens - uncachedInputTokens) / 10;
+	assert.ok(weighted(after) <= weighted(before) * 0.7, `${Math.round(weighted(after))} vs ${Math.round(weighted(before))} weighted tokens`);
+});

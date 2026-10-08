@@ -108,3 +108,17 @@ test('program traces carry size, a short hash and a termination word, never the 
 	assert.equal(programTermination({ state: 'FAILED', reasonCode: 'X' }), 'failed');
 	assert.equal(programTermination({ state: 'YIELDED', reasonCode: 'FRESH_OBSERVATION_REQUIRED' }), 'yielded');
 });
+
+test('a program result is not lost when an ordinary observation follows it into the same pending turn', async () => {
+	const { mergePlannerRequest } = await import('../src/dynamic-main.mjs');
+	const ended = { goalRevision: 1, priority: 'ordinary', trigger: 'program_ended', eventSequence: 5,
+		nativeEvent: { event: 'program_ended', programId: 'p-1', result: { state: 'YIELDED', reasonCode: 'PROGRAM_EXHAUSTED', actions: 2 }, observation: { at: 5 }, eventSequence: 5 } };
+	const seen = { goalRevision: 1, priority: 'ordinary', trigger: 'observation', eventSequence: 6, nativeEvent: { event: 'observation', trigger: 'observation', observation: { at: 6 } } };
+	const merged = mergePlannerRequest(ended, seen);
+	assert.equal(merged.nativeEvent.event, 'program_ended');
+	assert.equal(merged.nativeEvent.result.reasonCode, 'PROGRAM_EXHAUSTED');
+	assert.deepEqual(merged.nativeEvent.observation, { at: 6 }, 'with the newest facts');
+	assert.equal(merged.nativeEvent.eventSequence, 6);
+	const danger = { ...seen, priority: 'urgent', trigger: 'damage', nativeEvent: { event: 'observation', trigger: 'damage', observation: { at: 7 } } };
+	assert.equal(mergePlannerRequest(ended, danger).nativeEvent.trigger, 'damage', 'danger still leads');
+});

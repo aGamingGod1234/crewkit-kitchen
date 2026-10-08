@@ -165,3 +165,33 @@ export function estimateHourlyTokens({ calls, turns, prefixTokens, eventTokens, 
 	const averageContext = prefixTokens + averageConversation;
 	return { averageContextTokens: Math.round(averageContext), inputTokens: Math.round(calls * averageContext), newTokens: Math.round(calls * growthPerCall) };
 }
+
+/**
+ * Replays a recorded per-call context series under context rotation: after a finished turn whose last call reached
+ * `thresholdTokens` (and at least `minTurns` turns on the current thread), the next call starts from the fixed prefix
+ * plus a carry-over. Each call keeps its recorded growth (the new event and tool results). The first call on a fresh
+ * thread is counted as wholly uncached; later calls keep their recorded uncached share.
+ */
+export function replayContextRotation({ calls, turnEnds, prefixTokens, carryOverTokens = 1_200, thresholdTokens = 64_000, minTurns = 3 }) {
+	const ends = new Set(turnEnds);
+	let previousRecorded = prefixTokens, context = 0, turnsOnThread = 0, freshThread = false, rotations = 0;
+	let input = 0, uncached = 0;
+	calls.forEach(({ context: recorded, cached }, index) => {
+		const growth = index === 0 ? recorded : recorded - previousRecorded;
+		previousRecorded = recorded;
+		context = index === 0 ? recorded : context + growth;
+		input += context;
+		uncached += freshThread ? context : Math.max(0, recorded - cached);
+		freshThread = false;
+		if (!ends.has(index + 1)) return;
+		turnsOnThread += 1;
+		if (thresholdTokens > 0 && context >= thresholdTokens && turnsOnThread >= minTurns) {
+			// The next call adds its own recorded growth on top of the fresh prefix and carry-over.
+			context = prefixTokens + carryOverTokens;
+			turnsOnThread = 0;
+			freshThread = true;
+			rotations += 1;
+		}
+	});
+	return { calls: calls.length, inputTokens: input, averageContextTokens: Math.round(input / Math.max(1, calls.length)), uncachedInputTokens: uncached, rotations };
+}

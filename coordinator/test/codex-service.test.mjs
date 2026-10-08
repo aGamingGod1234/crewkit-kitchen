@@ -1569,7 +1569,8 @@ for (const inheritedInstructions of [false, true]) {
 test('native usage snapshots distinguish observed deltas, missing baselines, counter resets and failures', async (t) => {
 	const transport = new FakeSharedTransport();
 	transport.autoComplete = false;
-	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	// The huge per-call samples below would otherwise rotate to a fresh thread (see codex-context-rotation.test.mjs).
+	const service = new CodexService({ cwd: 'C:\\workspace', contextRotationTokens: 0 }, { transport });
 	t.after(() => service.stop());
 	const agent = await service.createAgent(profile('native-accounting'), { controlProtocol: 'native_tools' });
 	const tick = () => new Promise((resolve) => setImmediate(resolve));
