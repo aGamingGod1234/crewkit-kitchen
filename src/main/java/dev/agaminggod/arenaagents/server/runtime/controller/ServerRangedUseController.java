@@ -11,7 +11,6 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
-import net.minecraft.commands.arguments.EntityAnchorArgument;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.InteractionHand;
@@ -39,6 +38,8 @@ public final class ServerRangedUseController implements ServerTransactionAdapter
 	private UseConfirmation useConfirmation = UseConfirmation.initial();
 	private boolean started;
 	private boolean released;
+	/** The view has finished its player-speed turn onto the aim point; the arrow is loosed only after that. */
+	private boolean aimSettled;
 
 	public ServerRangedUseController(
 			ServerPlayer player,
@@ -85,8 +86,10 @@ public final class ServerRangedUseController implements ServerTransactionAdapter
 				|| !ObservationVisibility.canSeeEntity(player, target))) {
 			return finish(ServerTransactionAdapter.TickResult.failed("TARGET_UNAVAILABLE", "Ranged target is no longer alive"));
 		}
-		if (!released && (!started || trackTarget)) {
-			player.lookAt(EntityAnchorArgument.Anchor.EYES, trackTarget ? target.getBoundingBox().getCenter() : aimPoint);
+		if (!released && (!aimSettled || trackTarget)) {
+			// Draw while turning, as a player does; a snap onto the aim point read as a camera jump to spectators.
+			boolean onAim = ServerLookController.turnToward(player, trackTarget ? target.getBoundingBox().getCenter() : aimPoint);
+			aimSettled = aimSettled || onAim;
 		}
 		if (!started) {
 			InteractionResult result = player.gameMode.useItem(player, player.level(), bow, hand);
@@ -98,7 +101,7 @@ public final class ServerRangedUseController implements ServerTransactionAdapter
 			useConfirmation = useConfirmation.observeUsing(true);
 			useTimer.observeStarted(true, nowEpochMs);
 		}
-		if (!released && useTimer.durationElapsed(nowEpochMs, drawDurationMs)) {
+		if (!released && aimSettled && useTimer.durationElapsed(nowEpochMs, drawDurationMs)) {
 			player.releaseUsingItem();
 			released = true;
 			useConfirmation = useConfirmation.observeUsing(player.isUsingItem());

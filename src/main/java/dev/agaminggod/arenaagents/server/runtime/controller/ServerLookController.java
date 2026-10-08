@@ -40,6 +40,21 @@ public final class ServerLookController implements ServerController {
 		return TickResult.running(Math.min(0.99D, (double) ticks / 8.0D));
 	}
 
+	/**
+	 * One eased view step toward {@code point} outside a look_at action (bow aim); the arrival step is Carpet's
+	 * exact lookAt. Returns true once the view is on the point.
+	 */
+	public static boolean turnToward(ServerPlayer player, Vec3 point) {
+		Angles goal = anglesTo(player.getEyePosition(), point);
+		Angles next = step(new Angles(player.getYRot(), player.getXRot()), goal);
+		if (next.equals(goal)) {
+			OfflineAgentPlayers.actions(player).lookAt(point);
+			return true;
+		}
+		OfflineAgentPlayers.actions(player).look(next.yaw(), next.pitch());
+		return false;
+	}
+
 	/** Advances one eased tick; returns {@code goal} itself once both axes arrive. */
 	static Angles step(Angles current, Angles goal) {
 		float yaw = AgentInputStates.turnYaw(current.yaw(), goal.yaw());

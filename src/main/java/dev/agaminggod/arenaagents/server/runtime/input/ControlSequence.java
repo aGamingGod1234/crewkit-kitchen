@@ -43,9 +43,14 @@ public final class ControlSequence {
 							(branch.get("value").getAsBoolean() ? 1.0D : 0.0D), branch.get("nextFrame").getAsInt()));
 				}
 			}
-			frames.add(new Frame(input(frame), frame.get("ticks").getAsInt(), branches));
+			frames.add(new Frame(input(frame), frame.get("ticks").getAsInt(), branches, instantLook(frame)));
 		}
 		return new ControlSequence(frames, arguments.get("maxTicks").getAsInt());
+	}
+
+	/** True when the model asked for the frame's yaw and pitch at once instead of a player-speed turn. */
+	public static boolean instantLook(JsonObject frame) {
+		return frame.has("instantLook") && !frame.get("instantLook").isJsonNull() && frame.get("instantLook").getAsBoolean();
 	}
 
 	public static AgentInputState input(JsonObject frame) {
@@ -80,7 +85,8 @@ public final class ControlSequence {
 		}
 		frameTicks++;
 		elapsedTicks++;
-		return step(frames.get(frameIndex).input(), Status.RUNNING);
+		Frame current = frames.get(frameIndex);
+		return new Step(current.input(), Status.RUNNING, frameIndex, elapsedTicks, maxTicks, current.instantLook());
 	}
 
 	private Step finish(Status status) {
@@ -92,7 +98,11 @@ public final class ControlSequence {
 		return new Step(input, status, frameIndex, elapsedTicks, maxTicks);
 	}
 
-	public record Frame(AgentInputState input, int ticks, List<Branch> branches) {
+	public record Frame(AgentInputState input, int ticks, List<Branch> branches, boolean instantLook) {
+		public Frame(AgentInputState input, int ticks, List<Branch> branches) {
+			this(input, ticks, branches, false);
+		}
+
 		public Frame {
 			Objects.requireNonNull(input, "input must not be null");
 			if (ticks < 1 || ticks > 200) throw new IllegalArgumentException("frame ticks must be 1..200");
@@ -137,5 +147,10 @@ public final class ControlSequence {
 			boolean onGround, boolean horizontalCollision, boolean hurt, boolean usingItem) { }
 
 	public enum Status { RUNNING, COMPLETED, BRANCH_STOPPED, BUDGET_EXHAUSTED }
-	public record Step(AgentInputState input, Status status, int frameIndex, int elapsedTicks, int maxTicks) { }
+	public record Step(AgentInputState input, Status status, int frameIndex, int elapsedTicks, int maxTicks,
+			boolean instantLook) {
+		public Step(AgentInputState input, Status status, int frameIndex, int elapsedTicks, int maxTicks) {
+			this(input, status, frameIndex, elapsedTicks, maxTicks, false);
+		}
+	}
 }

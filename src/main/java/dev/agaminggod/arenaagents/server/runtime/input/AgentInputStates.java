@@ -80,7 +80,19 @@ public final class AgentInputStates {
 
 		float desiredForward = 0.0F;
 		float desiredStrafe = 0.0F;
-		if (target.moving()) {
+		boolean sprint = target.sprint();
+		if (target.moving() && target.decoupled()) {
+			// The view and the walk direction differ (holding the heading on a short approach, or watching the path
+			// ahead): press the keys that move toward moveYaw relative to the view, backpedalling if it is behind,
+			// as a player who steps back onto a spot instead of turning around.
+			float relativeRadians = (float) Math.toRadians(shortestAngleDelta(yaw, target.moveYaw()));
+			desiredForward = (float) Math.cos(relativeRadians);
+			desiredStrafe = -(float) Math.sin(relativeRadians);
+			if (Math.abs(desiredForward) < MOVEMENT_EPSILON) desiredForward = 0.0F;
+			if (Math.abs(desiredStrafe) < MOVEMENT_EPSILON) desiredStrafe = 0.0F;
+			// Vanilla cannot sprint without forward input.
+			sprint = sprint && desiredForward > 0.0F;
+		} else if (target.moving()) {
 			// Move mostly forward while turning, then bleed into a lateral component. This avoids
 			// the stop-and-reverse oscillation that a hard yaw snap causes around corners.
 			float relativeRadians = (float) Math.toRadians(shortestAngleDelta(yaw, target.yaw()));
@@ -97,7 +109,7 @@ public final class AgentInputStates {
 				desiredStrafe == 0.0F ? MOVE_DECELERATION : MOVE_ACCELERATION);
 		boolean jump = target.jumpRequested();
 		MotorState next = new MotorState(yaw, pitch, forward, strafe, target.jumpRequested());
-		return new MotorStep(next, forward, strafe, jump, target.sprint());
+		return new MotorStep(next, forward, strafe, jump, sprint);
 	}
 
 	/** One eased turn step along the shortest arc; lands exactly on the target once it is close. */
@@ -168,17 +180,31 @@ public final class AgentInputStates {
 		}
 	}
 
+	/**
+	 * {@code yaw} is where the view turns. {@code moveYaw} is the walk direction when it differs from the view, or
+	 * NaN to walk where the view points (turning first, then walking).
+	 */
 	public record MotorTarget(
 			float yaw,
 			float pitch,
 			boolean moving,
 			boolean jumpRequested,
-			boolean sprint
+			boolean sprint,
+			float moveYaw
 	) {
 		public MotorTarget {
-			if (!Float.isFinite(yaw) || !Float.isFinite(pitch) || pitch < -90.0F || pitch > 90.0F) {
+			if (!Float.isFinite(yaw) || !Float.isFinite(pitch) || pitch < -90.0F || pitch > 90.0F
+					|| Float.isInfinite(moveYaw)) {
 				throw new IllegalArgumentException("invalid motor target angles");
 			}
+		}
+
+		public MotorTarget(float yaw, float pitch, boolean moving, boolean jumpRequested, boolean sprint) {
+			this(yaw, pitch, moving, jumpRequested, sprint, Float.NaN);
+		}
+
+		public boolean decoupled() {
+			return !Float.isNaN(moveYaw);
 		}
 	}
 

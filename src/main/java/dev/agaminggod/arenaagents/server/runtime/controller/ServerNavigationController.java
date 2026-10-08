@@ -59,6 +59,13 @@ public final class ServerNavigationController implements ServerController {
 	/** Gap jumps take off from the edge cell: between its center (2.0) and the landing's near side (1.0). */
 	static final double GAP_TAKEOFF_MAX_DISTANCE = 2.0D;
 	static final double GAP_TAKEOFF_MIN_DISTANCE = 1.0D;
+	/** Inside this horizontal distance the view holds its heading on the final approach and after an overshoot. */
+	static final double HOLD_HEADING_DISTANCE = 1.0D;
+	/** A steer point further round than this has been passed; the path never asks for such a turn this close. */
+	static final float BEHIND_DEGREES = 100.0F;
+	static final int GAZE_LOOKAHEAD_NODES = 3;
+	static final float MAX_GAZE_OFFSET_DEGREES = 50.0F;
+	private static final double GAZE_MIN_DISTANCE = 1.5D;
 
 	private final Vec3 destination;
 	private final AABB arrivalRegion;
@@ -258,7 +265,7 @@ public final class ServerNavigationController implements ServerController {
 				? steeringIndex(world, player.position(), active, waypointIndex) : waypointIndex;
 		Vec3 steer = steerIndex == waypointIndex ? target
 				: targetFor(world, active.get(steerIndex), steerIndex == active.size() - 1);
-		drive(player, world, waypoint, target, steer, nowEpochMs);
+		drive(player, world, waypoint, target, steer, steerIndex == active.size() - 1, steerIndex == waypointIndex, nowEpochMs);
 		return TickResult.running(lastProgressValue);
 	}
 
@@ -684,6 +691,8 @@ public final class ServerNavigationController implements ServerController {
 			PathNode waypoint,
 			Vec3 target,
 			Vec3 steer,
+			boolean steerIsEndpoint,
+			boolean steerIsWaypoint,
 			long nowEpochMs
 	) {
 		boolean gapJump = waypoint.traversal() == TraversalType.JUMP_GAP;
@@ -705,9 +714,11 @@ public final class ServerNavigationController implements ServerController {
 		double steerDx = steer.x - player.getX();
 		double steerDz = steer.z - player.getZ();
 		double steerHorizontal = Math.sqrt(steerDx * steerDx + steerDz * steerDz);
-		// Directly over the target atan2 has no direction; holding the heading avoids a spurious turn.
-		float targetYaw = steerHorizontal < 0.05D ? motorState.yaw() : net.minecraft.util.Mth.wrapDegrees(
-				(float) Math.toDegrees(Math.atan2(-steerDx, steerDz)));
+		boolean walkingOnGround = !swimming && !climbing && !crouching && !gapJump && player.onGround();
+		Heading heading = heading(motorState.yaw(), steerDx, steerDz, steerIsEndpoint,
+				walkingOnGround && steerIsWaypoint ? gazeYaw(player.position(), plan.nodes(), waypointIndex) : Float.NaN);
+		float targetYaw = heading.viewYaw();
+		float moveYaw = swimming || climbing ? Float.NaN : heading.moveYaw();
 		float targetPitch;
 		if (swimming || climbing) {
 			Vec3 delta = target.add(0.0D, 0.85D, 0.0D).subtract(player.getEyePosition());
@@ -719,6 +730,7 @@ public final class ServerNavigationController implements ServerController {
 		if (climbing && atClimbColumn) {
 			net.minecraft.core.Direction wall = world.climbDirection(waypoint.position());
 			if (wall != null) targetYaw = (float) Math.toDegrees(Math.atan2(-wall.getStepX(), wall.getStepZ()));
+			moveYaw = Float.NaN;
 		}
 		double targetDx = target.x - player.getX();
 		double targetDz = target.z - player.getZ();
@@ -736,7 +748,8 @@ public final class ServerNavigationController implements ServerController {
 						targetPitch,
 						!descendingClimb,
 						jump,
-						sprintSwim || !swimming && !crouching && !climbing && (sprint || gapJump) && player.getFoodData().getFoodLevel() > 6
+						sprintSwim || !swimming && !crouching && !climbing && (sprint || gapJump) && player.getFoodData().getFoodLevel() > 6,
+						moveYaw
 				),
 				nowEpochMs
 		);
@@ -768,6 +781,56 @@ public final class ServerNavigationController implements ServerController {
 		double run = Math.max(GAZE_MIN_HORIZONTAL, horizontalDistance);
 		return net.minecraft.util.Mth.clamp(
 				WALKING_GAZE_PITCH - (float) Math.toDegrees(Math.atan2(rise, run)), -60.0F, 60.0F);
+	}
+
+	/** View and walk direction for one tick; {@code moveYaw} is NaN when the body walks where it looks. */
+	record Heading(float viewYaw, float moveYaw) {
+	}
+
+	/**
+	 * Where to look and where to walk. Within {@link #HOLD_HEADING_DISTANCE} of the endpoint, or of a waypoint that
+	 * has fallen behind (stepping down a stair carries the body past the cell center), the view keeps its heading
+	 * and the keys step onto the point, as a player backs up half a block instead of spinning round to face it.
+	 * Turning toward a point that close also swings wildly as atan2 sweeps around it; the play-test showed a
+	 * 180 degree spin at the end of 76 of 117 short moves. Otherwise the view follows {@code gazeYaw} (the path
+	 * ahead) when it is within {@link #MAX_GAZE_OFFSET_DEGREES} of the walk direction, else the walk direction.
+	 */
+	static Heading heading(float currentYaw, double dx, double dz, boolean endpoint, float gazeYaw) {
+		double horizontal = Math.sqrt(dx * dx + dz * dz);
+		// Directly over the point atan2 has no direction; holding the heading avoids a spurious turn.
+		if (horizontal < 0.05D) return new Heading(currentYaw, Float.NaN);
+		float moveYaw = net.minecraft.util.Mth.wrapDegrees((float) Math.toDegrees(Math.atan2(-dx, dz)));
+		float offView = Math.abs(AgentInputStates.shortestAngleDelta(currentYaw, moveYaw));
+		if (horizontal < HOLD_HEADING_DISTANCE && (endpoint || offView > BEHIND_DEGREES)) {
+			return new Heading(currentYaw, moveYaw);
+		}
+		if (!Float.isNaN(gazeYaw) && offView <= 90.0F
+				&& Math.abs(AgentInputStates.shortestAngleDelta(moveYaw, gazeYaw)) <= MAX_GAZE_OFFSET_DEGREES) {
+			return new Heading(gazeYaw, moveYaw);
+		}
+		return new Heading(moveYaw, Float.NaN);
+	}
+
+	/**
+	 * Direction to the furthest of the next {@link #GAZE_LOOKAHEAD_NODES} walk, step and drop nodes, or NaN. Used
+	 * where the straight-line lookahead stops (each level change of a stair): steering node by node there turns
+	 * the view left and right at every step of a diagonal staircase, while a player looks down the stairs.
+	 */
+	static float gazeYaw(Vec3 position, List<PathNode> nodes, int index) {
+		int furthest = -1;
+		int last = Math.min(nodes.size() - 1, index + GAZE_LOOKAHEAD_NODES);
+		for (int candidate = index; candidate <= last; candidate++) {
+			TraversalType traversal = nodes.get(candidate).traversal();
+			if (traversal != TraversalType.WALK && traversal != TraversalType.DROP_DOWN
+					&& traversal != TraversalType.JUMP_UP) break;
+			furthest = candidate;
+		}
+		if (furthest <= index) return Float.NaN;
+		GridPosition far = nodes.get(furthest).position();
+		double dx = far.x() + 0.5D - position.x;
+		double dz = far.z() + 0.5D - position.z;
+		if (dx * dx + dz * dz < GAZE_MIN_DISTANCE * GAZE_MIN_DISTANCE) return Float.NaN;
+		return net.minecraft.util.Mth.wrapDegrees((float) Math.toDegrees(Math.atan2(-dx, dz)));
 	}
 
 	/**
