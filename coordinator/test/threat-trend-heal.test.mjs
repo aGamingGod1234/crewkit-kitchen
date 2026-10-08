@@ -66,7 +66,11 @@ test('dropped beef: healing facts list it with the exact call, and say health wi
 		`hunt minecraft:cow 3 blocks away: fight_target targetId ${COW}, pick_up_item its drop, eat it`,
 	]);
 	assert.equal(healingFacts({ player: { health: 6, foodLevel: 18 } }).naturalRegen, true);
-	assert.match(NO_TASK_HEAL_INSTRUCTION, /regenerates only while foodLevel is 18 or more/);
+	assert.match(NO_TASK_HEAL_INSTRUCTION, /regenerates on its own only while healing\.naturalRegen is true \(foodLevel 18 or more/);
+	assert.equal(healingFacts({ player: { health: 6, foodLevel: 4 }, world: { difficulty: 'peaceful', naturalRegeneration: true } }).naturalRegen, true,
+		'Peaceful regenerates at any food level');
+	assert.equal(healingFacts({ player: { health: 6, foodLevel: 20 }, world: { difficulty: 'normal', naturalRegeneration: false } }).naturalRegen, false,
+		'the naturalRegeneration gamerule off stops it even with a full bar');
 	assert.doesNotMatch(NO_TASK_HEAL_INSTRUCTION, /A full food bar regenerates health/, 'the vague line that let 17 read as "nearly full" is gone');
 });
 

@@ -198,6 +198,10 @@ public final class ServerObservationCollector {
 		world.addProperty("dayTime", level.getDefaultClockTime());
 		world.addProperty("raining", level.isRaining());
 		world.addProperty("thundering", level.isThundering());
+		// Both shown to a player (difficulty in the menu, the gamerule by /gamerule): they decide whether health regenerates.
+		world.addProperty("difficulty", level.getDifficulty().getSerializedName());
+		world.addProperty("naturalRegeneration",
+				level.getGameRules().get(net.minecraft.world.level.gamerules.GameRules.NATURAL_HEALTH_REGENERATION));
 		observation.add("world", world);
 		observation.add("currentAction", currentAction(agentId));
 		observation.add("lastResult", lastResult(agentId));

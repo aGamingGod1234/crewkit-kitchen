@@ -292,6 +292,8 @@ function worldFacts(value) {
 		dayTime: nonNegativeInteger(source.dayTime, 'world.dayTime'),
 		raining: boolean(source.raining, 'world.raining'),
 		thundering: boolean(source.thundering, 'world.thundering'),
+		...(Object.hasOwn(source, 'difficulty') ? { difficulty: identifier(source.difficulty, 'world.difficulty') } : {}),
+		...(Object.hasOwn(source, 'naturalRegeneration') ? { naturalRegeneration: boolean(source.naturalRegeneration, 'world.naturalRegeneration') } : {}),
 	};
 }
 

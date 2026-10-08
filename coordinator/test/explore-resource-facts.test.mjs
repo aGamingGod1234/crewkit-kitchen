@@ -145,7 +145,8 @@ test('ingest path: sight, threat trend, healing, sound and wear facts survive th
 		player: { health: 7, maxHealth: 20, armor: 0, foodLevel: 15, saturation: 0, gameMode: 'survival', onGround: true, inWater: false, onFire: false,
 			air: 300, maxAir: 300, suffocating: false, fallDistance: 0, effects: [] },
 		inventory: { items: [{ slot: 0, itemId: 'minecraft:stone_pickaxe', count: 1, damage: 120, maxDamage: 131 }], selectedItem: 'minecraft:stone_pickaxe' },
-		entities: [], blocks: [], nearbyContainers: [], world: { dimension: 'minecraft:overworld', gameTime: 1, dayTime: 1, raining: false, thundering: false },
+		entities: [], blocks: [], nearbyContainers: [], world: { dimension: 'minecraft:overworld', gameTime: 1, dayTime: 1, raining: false, thundering: false,
+			difficulty: 'peaceful', naturalRegeneration: true },
 		currentAction: { active: false }, lastResult: { present: false },
 		threats: { entries: [{ uuid: zombie, type: 'minecraft:zombie', distance: 9, bearing: 40, targeting: true, swelling: false, lineOfSight: true, signals: ['targeting'],
 			risk: 6, expectedHitDamage: 3, closingSpeed: 2, approaching: true, etaSeconds: 3.5, contactRisk: 40 }] },
@@ -175,6 +176,7 @@ test('ingest path: sight, threat trend, healing, sound and wear facts survive th
 		assert.equal(event.observation.player.safe, false);
 		assert.equal(event.observation.player.heard[0].sound, 'zombie groan', 'heard survives');
 		assert.equal(event.observation.inventory.items[0].usesLeft, 11, 'wear reaches the model as usesLeft');
+		assert.deepEqual([event.observation.world.difficulty, event.observation.world.naturalRegeneration], ['peaceful', true], 'regeneration rules survive');
 		assert.deepEqual(toolResult.observation.sighted, SIGHTED, 'observe tool results carry what the agent sees');
 	} finally { await run.coordinator.stop(); }
 });

@@ -2497,10 +2497,15 @@ function nearbyContainerObservation(value, index) {
 	};
 }
 
+const WORLD_DIFFICULTIES = new Set(['peaceful', 'easy', 'normal', 'hard']);
+
 function worldObservation(value) {
 	if (!isPlainObject(value)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'world must be an object');
-	exactKeys(value, ['dimension', 'worldId', 'gameTime', 'dayTime', 'raining', 'thundering'], ['dimension', 'gameTime', 'dayTime', 'raining', 'thundering'], 'world');
-	return { ...optionalObservedDetails(value, ['worldId']), dimension: requireIdentifier(value.dimension, 'world.dimension'), gameTime: nonnegativeInteger(value.gameTime, 'world.gameTime'), dayTime: nonnegativeInteger(value.dayTime, 'world.dayTime'), raining: boolean(value.raining, 'world.raining'), thundering: boolean(value.thundering, 'world.thundering') };
+	exactKeys(value, ['dimension', 'worldId', 'gameTime', 'dayTime', 'raining', 'thundering', 'difficulty', 'naturalRegeneration'], ['dimension', 'gameTime', 'dayTime', 'raining', 'thundering'], 'world');
+	if (value.difficulty !== undefined && !WORLD_DIFFICULTIES.has(value.difficulty)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'world.difficulty is invalid');
+	return { ...optionalObservedDetails(value, ['worldId']), dimension: requireIdentifier(value.dimension, 'world.dimension'), gameTime: nonnegativeInteger(value.gameTime, 'world.gameTime'), dayTime: nonnegativeInteger(value.dayTime, 'world.dayTime'), raining: boolean(value.raining, 'world.raining'), thundering: boolean(value.thundering, 'world.thundering'),
+		...(value.difficulty === undefined ? {} : { difficulty: value.difficulty }),
+		...(value.naturalRegeneration === undefined ? {} : { naturalRegeneration: boolean(value.naturalRegeneration, 'world.naturalRegeneration') }) };
 }
 
 function currentActionObservation(value) {

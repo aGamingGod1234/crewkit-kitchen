@@ -5124,7 +5124,7 @@ export function lowHealthWake(observation, wokenAtHealth = null) {
 	if (wokenAtHealth !== null && health > wokenAtHealth - FURTHER_DROP_POINTS) return { wake: false, health: wokenAtHealth };
 	const facts = healingFacts(observation);
 	const nothingToEat = facts.bestFood === null && Object.values(facts.foodSources).every((rows) => rows.length === 0);
-	if (nothingToEat && Number.isFinite(player.foodLevel) && player.foodLevel >= REGENERATING_FOOD_LEVEL) return { wake: false, health: wokenAtHealth };
+	if (nothingToEat && facts.naturalRegen === true) return { wake: false, health: wokenAtHealth };
 	return { wake: true, health };
 }
 
@@ -5224,6 +5224,16 @@ export function threatOutlook(observation) {
 	return `${soonest.type} ${soonest.uuid} is ${soonest.distance} blocks away closing at ${soonest.closingSpeed} blocks/s: contact range in ${soonest.etaSeconds} s (risk ${soonest.risk} now${then}).`;
 }
 
+/**
+ * Whether health regenerates on its own, as vanilla decides it: never with the naturalRegeneration gamerule off; in
+ * Peaceful at any food level; otherwise only while the food bar is 18 or more. Null when the food level is unknown.
+ */
+export function naturalRegeneration(player, world) {
+	if (world?.naturalRegeneration === false) return false;
+	if (world?.difficulty === 'peaceful') return true;
+	return Number.isFinite(player?.foodLevel) ? player.foodLevel >= REGENERATING_FOOD_LEVEL : null;
+}
+
 /** The facts a no-task low-health turn needs: health, hunger, carried food and the nearest food sources in view. */
 export function healingFacts(observation) {
 	const player = observation?.player ?? {};
@@ -5244,15 +5254,14 @@ export function healingFacts(observation) {
 		.map((item) => ({ stableId: item.stableId, itemId: item.itemId, count: item.count, source: item }));
 	const facts = {
 		health: player.health ?? null, maxHealth: player.maxHealth ?? 20, foodLevel: player.foodLevel ?? null, saturation: player.saturation ?? null,
-		// Vanilla regenerates health only while the food bar is 18 or more.
-		naturalRegen: Number.isFinite(player.foodLevel) ? player.foodLevel >= REGENERATING_FOOD_LEVEL : null,
+		naturalRegen: naturalRegeneration(player, observation?.world),
 		bestFood: player.bestFood ?? null, safe: player.safe ?? null, threats: list(player.threats).length,
 		foodSources: { animals: nearest(animals, 4), plants: nearest(plants, 4), drops: nearest(drops, 4) },
 	};
 	return { ...facts, options: healingOptions(facts) };
 }
-export const NO_TASK_HEAL_INSTRUCTION = 'Live Minecraft event: low health. You have no active task; any finished task stays finished, so do not redo it. Recovering is your call. Health regenerates only while foodLevel is 18 or more (healing.naturalRegen), so below that it stays low until you eat. healing.options lists the food in reach as exact calls: eat carried food (select_item, then use_item), pick_up_item a food drop, fight_target a passive animal and pick up its drop, mine fully grown crops or melon, or interact with ripe berries; then eat. Other work is a player request and needs takeTask.';
-export const TASK_HEAL_INSTRUCTION = 'Live Minecraft event: low health with food in reach. Whether to recover before continuing the task is your call. Health regenerates only while foodLevel is 18 or more (healing.naturalRegen). healing.options lists the food in reach as exact calls (eat carried food with select_item then use_item; pick_up_item a food drop; fight_target a passive animal and pick up its drop). Keep authorised routines running unless you choose otherwise; respond explicitly to pending program decisions.';
+export const NO_TASK_HEAL_INSTRUCTION = 'Live Minecraft event: low health. You have no active task; any finished task stays finished, so do not redo it. Recovering is your call. Health regenerates on its own only while healing.naturalRegen is true (foodLevel 18 or more; any level in Peaceful), otherwise it stays low until you eat. healing.options lists the food in reach as exact calls: eat carried food (select_item, then use_item), pick_up_item a food drop, fight_target a passive animal and pick up its drop, mine fully grown crops or melon, or interact with ripe berries; then eat. Other work is a player request and needs takeTask.';
+export const TASK_HEAL_INSTRUCTION = 'Live Minecraft event: low health with food in reach. Whether to recover before continuing the task is your call. Health regenerates on its own only while healing.naturalRegen is true (foodLevel 18 or more; any level in Peaceful). healing.options lists the food in reach as exact calls (eat carried food with select_item then use_item; pick_up_item a food drop; fight_target a passive animal and pick up its drop). Keep authorised routines running unless you choose otherwise; respond explicitly to pending program decisions.';
 export const NO_TASK_DANGER_INSTRUCTION = 'Live Minecraft event: danger. You have no active task; any finished task stays finished, so do not redo it. Defend yourself now: fight_target, flee_from, eat or drink, shield or totem, equip armor and weapons, move away. Other work is a player request and needs takeTask.';
 // Waiting for the operator only means "do not redo the finished work or re-run finish"; it never blocks new requests.
 export const AWAITING_CONFIRMATION_EVENT_INSTRUCTION = 'Live Minecraft event. Your finished goal awaits operator confirmation: do not redo it or re-run finish. Waiting never blocks new requests: act on player messages now with any tool, as part of your task, then call finish again when done.';
