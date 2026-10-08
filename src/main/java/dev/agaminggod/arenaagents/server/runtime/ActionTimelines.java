@@ -22,7 +22,7 @@ public final class ActionTimelines {
 	/** startedAtEpochMs and startedTick are 0 when the action ended before it started. */
 	public record Timeline(long acceptedAtEpochMs, long startedAtEpochMs, long startedTick, long endedTick) { }
 
-	static synchronized void remember(AgentId agentId, String actionId, Timeline timeline) {
+	public static synchronized void remember(AgentId agentId, String actionId, Timeline timeline) {
 		RECENT.put(agentId + "/" + actionId, timeline);
 	}
 

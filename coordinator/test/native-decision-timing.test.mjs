@@ -53,9 +53,9 @@ test('the turn chain is timed end to end: admitted, provider start, tool request
 	await planner.requestNativeTurn({ agentId: AGENT_ID, input: 'act', goalRevision: 1, traceId: 'trace-timing-1', onVerbose: (stage, message) => verbose.push([stage, message]),
 		executeTool: async () => { clock += 25; return { state: 'SUCCEEDED' }; } });
 	const names = rows.map((row) => row.event);
-	for (const event of ['native_turn_admitted', 'native_provider_turn_started', 'native_tool_queue_timing', 'native_tool_result_returned']) assert.ok(names.includes(event), event);
-	assert.ok(names.indexOf('native_provider_turn_started') < names.indexOf('native_tool_queue_timing') && names.indexOf('native_tool_queue_timing') < names.indexOf('native_tool_result_returned'));
-	const returned = rows.find((row) => row.event === 'native_tool_result_returned').fields;
+	for (const event of ['native_turn_admitted', 'native_provider_turn_started', 'native_tool_queue_timing', 'native_tool_executed']) assert.ok(names.includes(event), event);
+	assert.ok(names.indexOf('native_provider_turn_started') < names.indexOf('native_tool_queue_timing') && names.indexOf('native_tool_queue_timing') < names.indexOf('native_tool_executed'));
+	const returned = rows.find((row) => row.event === 'native_tool_executed').fields;
 	assert.deepEqual([returned.callId, returned.toolKind, returned.executeMs, returned.state], ['call-1', 'action', 25, 'SUCCEEDED']);
 	assert.equal(rows.find((row) => row.event === 'native_tool_queue_timing').fields.turnId, '1:1');
 	assert.deepEqual(verbose.filter(([stage]) => stage === 'provider_event').map(([, message]) => JSON.parse(message)), [{ event: 'native_provider_turn_sent', turnId: '1:1' }]);

@@ -28,7 +28,9 @@ export function stats(values) {
 	const sorted = values.filter((value) => Number.isFinite(value)).sort((left, right) => left - right);
 	if (sorted.length === 0) return { n: 0, median: null, p90: null, mean: null };
 	const rank = (fraction) => sorted[Math.min(sorted.length - 1, Math.ceil(fraction * sorted.length) - 1)];
-	return { n: sorted.length, median: rank(0.5), p90: rank(0.9), mean: sorted.reduce((sum, value) => sum + value, 0) / sorted.length };
+	const middle = sorted.length >> 1;
+	const median = sorted.length % 2 === 1 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+	return { n: sorted.length, median, p90: rank(0.9), mean: sorted.reduce((sum, value) => sum + value, 0) / sorted.length };
 }
 
 /** Milliseconds from row a to row b: monotonic when both rows share a process clock, wall clock otherwise. */
@@ -53,7 +55,7 @@ export function buildChains(rows, { agent = null } = {}) {
 	const agentState = (id) => {
 		let state = byAgent.get(id);
 		if (state === undefined) {
-			state = { ready: null, built: null, sent: null, lastResult: null, lastRequest: null, lastCall: null, lastCompletedAt: null, actions: [], requests: [], requestActions: new Map() };
+			state = { ready: null, built: null, sent: null, turnStart: null, lastResult: null, lastRequest: null, lastCall: null, lastCompletedAt: null, actions: [], requests: [], requestActions: new Map() };
 			byAgent.set(id, state);
 		}
 		return state;
@@ -65,15 +67,14 @@ export function buildChains(rows, { agent = null } = {}) {
 		const state = agentState(id);
 		switch (row.event) {
 			case 'native_event_ready':
-				if (row.mode === 'turn') { state.ready = row; state.lastResult = null; }
+				if (row.mode === 'turn') { state.ready = row; state.turnStart = { ready: row, built: null, sent: null }; state.lastResult = null; }
 				break;
-			case 'native_input_built': state.built = row; break;
-			case 'native_provider_turn_sent': state.sent = row; break;
+			case 'native_input_built': state.built = row; if (state.turnStart !== null) state.turnStart.built = row; break;
+			case 'native_provider_turn_sent': state.sent = row; if (state.turnStart !== null) state.turnStart.sent = row; break;
 			case 'native_model_call': state.lastCall = row; break;
 			case 'native_tool_queue_timing': {
 				const previousResult = state.lastResult;
-				const request = { row, call: state.lastCall, boundary: previousResult ?? state.sent ?? state.ready, firstOfTurn: previousResult === null,
-					ready: state.ready, built: state.built, sent: state.sent, result: null, actions: 0 };
+				const request = { row, call: state.lastCall, boundary: previousResult ?? state.sent ?? state.ready, executed: null, delivered: null, actions: 0 };
 				state.lastRequest = request;
 				state.requests.push(request);
 				state.lastResult = null;
@@ -83,16 +84,21 @@ export function buildChains(rows, { agent = null } = {}) {
 				state.lastCall = null;
 				break;
 			}
-			case 'native_tool_result_returned': {
+			// The coordinator finished the tool call; the adapter then formats the result and writes it to the provider.
+			case 'native_tool_executed':
+			case 'native_provider_tool_result_sent': {
 				state.lastResult = row;
 				const request = state.requests.findLast((entry) => entry.row.callId === row.callId);
-				if (request !== undefined) request.result = row;
+				if (request !== undefined) request[row.event === 'native_tool_executed' ? 'executed' : 'delivered'] = row;
 				break;
 			}
 			case 'native_tool_dispatch_started': {
 				const request = state.lastRequest !== null && (row.callId == null || row.callId === state.lastRequest.row.callId) ? state.lastRequest : null;
 				const action = { agentId: id, actionId: row.actionId, actionType: row.actionType, request, step: request === null ? null : request.actions++,
-					dispatch: row, journal: null, sent: null, progress: null, completed: null, postAction: null, returned: null, next: null };
+					dispatch: row, journal: null, sent: null, progress: null, completed: null, postAction: null, returned: null, delivered: null, next: null,
+					// Startup marks wait for the first action the turn dispatches, even when earlier requests were reads.
+					turnStart: state.turnStart };
+				state.turnStart = null;
 				state.actions.push(action);
 				byAction.set(row.actionId, action);
 				break;
@@ -110,7 +116,7 @@ export function buildChains(rows, { agent = null } = {}) {
 		for (let index = 0; index < state.actions.length; index += 1) {
 			const action = state.actions[index];
 			const request = action.request;
-			if (request !== null) action.returned = request.result;
+			if (request !== null) { action.returned = request.executed; action.delivered = request.delivered ?? request.executed; }
 			const nextRequest = request === null ? null : state.requests[state.requests.indexOf(request) + 1] ?? null;
 			action.next = nextRequest;
 			chains.push(stagesOf(action, nextRequest));
@@ -120,14 +126,14 @@ export function buildChains(rows, { agent = null } = {}) {
 }
 
 function stagesOf(action, nextRequest) {
-	const { request, dispatch, journal, sent, completed, returned } = action;
+	const { request, dispatch, journal, sent, completed, returned, delivered, turnStart } = action;
 	const t = {};
-	// Only the first action a tool request dispatches pays for the model and the hop to the tool server.
+	// Only the first action a tool request dispatches pays for the model and the hop to the tool server; only the first of a turn pays for its startup.
 	const lead = request !== null && action.step === 0;
 	const call = request?.call ?? null;
-	if (lead && request.firstOfTurn) {
-		t.eventToTurn = between(request.ready, request.sent);
-		t.inputBuild = request.built?.buildMs ?? null;
+	if (turnStart !== null) {
+		t.eventToTurn = between(turnStart.ready, turnStart.sent);
+		t.inputBuild = turnStart.built?.buildMs ?? null;
 	}
 	if (lead) {
 		t.model = between(request.boundary, request.row);
@@ -140,6 +146,7 @@ function stagesOf(action, nextRequest) {
 	t.journal = journal?.journalMs ?? null;
 	t.dispatchToSent = between(dispatch, sent);
 	t.send = sent?.sendMs ?? null;
+	const unstarted = completed !== null && Number.isFinite(completed.javaAcceptedAtEpochMs) && !(completed.javaStartedAtEpochMs > 0);
 	if (completed !== null) {
 		t.sentToAccept = diff(completed.javaAcceptedAtEpochMs, sent?.at);
 		t.acceptToStart = diff(completed.javaStartedAtEpochMs, completed.javaAcceptedAtEpochMs);
@@ -147,12 +154,17 @@ function stagesOf(action, nextRequest) {
 		t.endToCoordinator = diff(completed.at, completed.javaEndedAtEpochMs);
 		t.sentToDone = between(sent, completed);
 		t.javaElapsed = completed.javaElapsedMs ?? null;
+		// Java accepted the command but it ended without ever executing (cancelled, preempted, stale): not body time.
+		if (unstarted) t.unstartedWait = diff(completed.javaEndedAtEpochMs, sent?.at) ?? between(sent, completed);
 	}
 	t.postAction = action.postAction?.waitMs ?? null;
-	if (completed !== null && returned !== null && action.request !== null && returned === action.request.result) t.resultToModel = between(completed, returned);
-	t.nextThink = returned !== null && nextRequest !== null ? between(returned, nextRequest.row) : null;
+	if (completed !== null && delivered !== null && delivered !== undefined) {
+		t.resultToModel = between(completed, delivered);
+		if (returned !== null && returned !== delivered) t.resultDelivery = between(returned, delivered);
+	}
+	t.nextThink = delivered !== null && delivered !== undefined && nextRequest !== null ? between(delivered, nextRequest.row) : null;
 	const javaStart = completed?.javaStartedAtEpochMs > 0 ? completed.javaStartedAtEpochMs : null;
-	return { agentId: action.agentId, actionId: action.actionId, actionType: action.actionType, state: completed?.state ?? null, step: action.step,
+	return { agentId: action.agentId, actionId: action.actionId, actionType: action.actionType, state: completed?.state ?? null, step: action.step, unstarted,
 		callId: request?.row.callId ?? null, requestAt: request?.row.at ?? null, sentAt: sent?.at ?? null, startedAt: javaStart, endedAt: completed?.javaEndedAtEpochMs ?? completed?.at ?? null, stages: t, ticks: completed === null ? null : { started: completed.javaStartedTick ?? null, ended: completed.javaEndedTick ?? null } };
 }
 
@@ -160,7 +172,7 @@ function stagesOf(action, nextRequest) {
 export function bodyIdle(chains) {
 	const perAgent = new Map();
 	for (const chain of chains) {
-		if (chain.sentAt === null || chain.endedAt === null) continue;
+		if (chain.sentAt === null || chain.endedAt === null || chain.unstarted) continue;
 		const start = chain.startedAt ?? chain.sentAt;
 		if (chain.endedAt < start) continue;
 		const list = perAgent.get(chain.agentId) ?? [];
@@ -199,15 +211,19 @@ const STAGE_LABELS = [
 	['run', 'action runs (Java start -> end)'],
 	['endToCoordinator', 'Java end -> coordinator receives result'],
 	['postAction', 'post-action observation wait'],
-	['resultToModel', 'result received -> returned to model'],
-	['nextThink', 'result returned -> next tool request'],
+	['resultToModel', 'result received -> handed to provider'],
+	['resultDelivery', '  of which format + provider send'],
+	['unstartedWait', 'bridge send -> end, action never started'],
+	['nextThink', 'result handed to provider -> next tool request'],
 ];
 
 export function summarize(rows, options = {}) {
 	const { chains, timestamped } = buildChains(rows, options);
 	const stages = STAGE_LABELS.map(([key, label]) => ({ key, label, ...stats(chains.map((chain) => chain.stages[key]).filter((value) => value !== null && value !== undefined)) }));
 	const recorded = recordedDurations(rows, options.agent ?? null);
-	return { timestamped, rowCount: rows.length, actions: chains.length, stages, idle: bodyIdle(chains), recorded, chains };
+	const unstartedChains = chains.filter((chain) => chain.unstarted);
+	const unstartedWaits = unstartedChains.map((chain) => chain.stages.unstartedWait).filter(Number.isFinite);
+	return { timestamped, rowCount: rows.length, actions: chains.length, stages, idle: bodyIdle(chains), unstarted: { count: unstartedChains.length, waitMs: unstartedWaits.reduce((sum, value) => sum + value, 0) }, recorded, chains };
 }
 
 /** Duration fields every trace has always carried; the only source for traces that predate timestamps. */
@@ -245,6 +261,7 @@ export function renderReport(summary, { rows = 15 } = {}) {
 		out.push('Body idle share (time with no action running, first start to last end)');
 		out.push(table(['agent', 'actions', 'window s', 'busy s', 'idle'], summary.idle.map((entry) => [entry.agentId.slice(0, 8), String(entry.actions), fmt(entry.windowMs / 1000), fmt(entry.busyMs / 1000), `${Math.round(entry.idleShare * 100)}%`])));
 	}
+	if (summary.unstarted.count > 0) out.push(`${summary.unstarted.count} action(s) were accepted by Java but never started; their ${fmt(summary.unstarted.waitMs / 1000)} s of waiting is excluded from the busy and idle times above.`);
 	const sample = summary.chains.slice(-rows);
 	if (sample.length > 0) {
 		out.push('');

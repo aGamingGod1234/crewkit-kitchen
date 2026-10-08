@@ -1052,8 +1052,10 @@ test('native Codex turn executes a Minecraft tool and returns its result before 
 	assert.equal(threadStart.baseInstructions.length < 1_500, true);
 
 	const executed = [];
+	const providerEvents = [];
 	const turn = agent.act('event: DM from Lucas: hi', {
 		goalRevision: 1,
+		onVerbose: (stage, message) => { if (stage === 'provider_event') providerEvents.push(JSON.parse(message)); },
 		executeTool: async (request) => {
 			executed.push(request);
 			return { state: 'SUCCEEDED', delivered: true };
@@ -1076,6 +1078,9 @@ test('native Codex turn executes a Minecraft tool and returns its result before 
 		result: { success: true, contentItems: [{ type: 'inputText', text: '{"state":"SUCCEEDED","delivered":true}' }] },
 	});
 	assert.equal(transport.calls.some((call) => call.method === 'turn/interrupt'), false);
+	// The latency trace stamps the result when the tool response has been written to the app server, not when the executor returned.
+	assert.deepEqual(providerEvents.filter((entry) => entry.event === 'native_provider_tool_result_sent'), [{ event: 'native_provider_tool_result_sent', callId: 'call-1' }]);
+	assert.equal(providerEvents.some((entry) => entry.event === 'native_provider_turn_sent'), true, 'Codex reports the turn-sent stage through the same channel');
 
 	transport.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } } });
 	assert.partialDeepStrictEqual(await turn, { status: 'completed', toolCalls: 1 });
@@ -1312,7 +1317,7 @@ test('native Codex bounds the raw completed agent message before public preproce
 		threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' },
 	} });
 	assert.partialDeepStrictEqual(await turn, { status: 'completed', toolCalls: 0 });
-	assert.deepEqual(events, [{ stage: 'agent_message', message: publicMessage.slice(0, 1_280) }]);
+	assert.deepEqual(events.filter(({ stage }) => stage !== 'provider_event'), [{ stage: 'agent_message', message: publicMessage.slice(0, 1_280) }]);
 	await service.stop();
 });
 

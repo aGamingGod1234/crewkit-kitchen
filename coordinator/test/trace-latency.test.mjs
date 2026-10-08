@@ -23,7 +23,8 @@ function syntheticRows({ mono = true, restartAt = null } = {}) {
 		row(30, 'native_provider_turn_sent', { turnId: '1:1' }),
 		row(3030, 'native_model_call', { turnId: '1:1', firstEventMs: 2200, streamMs: 800, totalMs: 3000, toolNames: ['mcp__minecraft__observe'] }),
 		row(3040, 'native_tool_queue_timing', { traceId: 't1', callId: 'c1', turnId: '1:1', toolKind: 'observe', queueWaitMs: null }),
-		row(3045, 'native_tool_result_returned', { traceId: 't1', callId: 'c1', toolKind: 'observe', executeMs: 5, state: null }),
+		row(3045, 'native_tool_executed', { traceId: 't1', callId: 'c1', toolKind: 'observe', executeMs: 5, state: null }),
+		row(3048, 'native_provider_tool_result_sent', { callId: 'c1' }),
 		row(5045, 'native_model_call', { turnId: '1:1', firstEventMs: 1500, streamMs: 500, totalMs: 2000 }),
 		row(5060, 'native_tool_queue_timing', { traceId: 't1', callId: 'c2', turnId: '1:1', toolKind: 'action', queueWaitMs: null }),
 		row(5065, 'native_tool_dispatch_started', { traceId: 't1', actionId: 'native:s:1:agent:1', actionType: 'navigate_to', callId: 'c2' }),
@@ -32,13 +33,15 @@ function syntheticRows({ mono = true, restartAt = null } = {}) {
 		row(5400, 'native_tool_action_completed', { actionId: 'native:s:1:agent:1', state: 'SUCCEEDED', javaElapsedMs: 300, javaEndedAtEpochMs: T + 5390,
 			javaAcceptedAtEpochMs: T + 5080, javaStartedAtEpochMs: T + 5100, javaStartedTick: 100, javaEndedTick: 107 }),
 		row(5408, 'native_tool_post_action_sampled', { actionId: 'native:s:1:agent:1', callId: 'c2', waitMs: 8 }),
-		row(5420, 'native_tool_result_returned', { traceId: 't1', callId: 'c2', toolKind: 'action', executeMs: 360, state: 'SUCCEEDED' }),
+		row(5420, 'native_tool_executed', { traceId: 't1', callId: 'c2', toolKind: 'action', executeMs: 360, state: 'SUCCEEDED' }),
+		row(5426, 'native_provider_tool_result_sent', { callId: 'c2' }),
 		row(8420, 'native_tool_queue_timing', { traceId: 't1', callId: 'c3', turnId: '1:1', toolKind: 'action', queueWaitMs: null }),
 		row(8430, 'native_tool_dispatch_started', { traceId: 't1', actionId: 'native:s:2:agent:1', actionType: 'break_block', callId: 'c3' }),
 		row(8435, 'native_tool_command_sent', { actionId: 'native:s:2:agent:1', callId: 'c3', dispatchMs: 5, sendMs: 3 }),
 		row(8710, 'native_tool_action_completed', { actionId: 'native:s:2:agent:1', state: 'SUCCEEDED', javaElapsedMs: 200, javaEndedAtEpochMs: T + 8700,
 			javaAcceptedAtEpochMs: T + 8440, javaStartedAtEpochMs: T + 8500, javaStartedTick: 170, javaEndedTick: 174 }),
-		row(8720, 'native_tool_result_returned', { traceId: 't1', callId: 'c3', toolKind: 'action', executeMs: 290, state: 'SUCCEEDED' }),
+		row(8720, 'native_tool_executed', { traceId: 't1', callId: 'c3', toolKind: 'action', executeMs: 290, state: 'SUCCEEDED' }),
+		row(8725, 'native_provider_tool_result_sent', { callId: 'c3' }),
 	];
 }
 
@@ -50,14 +53,16 @@ test('a timestamped trace becomes the per-action chain with exact stage duration
 	assert.deepEqual(
 		{ eventToTurn: first.eventToTurn, inputBuild: first.inputBuild, model: first.model, modelToTool: first.modelToTool, requestToDispatch: first.requestToDispatch,
 			journal: first.journal, dispatchToSent: first.dispatchToSent, send: first.send, sentToAccept: first.sentToAccept, acceptToStart: first.acceptToStart,
-			run: first.run, endToCoordinator: first.endToCoordinator, postAction: first.postAction, resultToModel: first.resultToModel, nextThink: first.nextThink },
-		{ eventToTurn: undefined, inputBuild: undefined, model: 2015, modelToTool: 15, requestToDispatch: 5,
+			run: first.run, endToCoordinator: first.endToCoordinator, postAction: first.postAction, resultToModel: first.resultToModel, resultDelivery: first.resultDelivery, nextThink: first.nextThink },
+		// The turn's first request was an observe, so its startup marks wait for this first dispatched action.
+		{ eventToTurn: 30, inputBuild: 12, model: 2012, modelToTool: 15, requestToDispatch: 5,
 			journal: 4, dispatchToSent: 6, send: 2, sentToAccept: 9, acceptToStart: 20,
-			run: 290, endToCoordinator: 10, postAction: 8, resultToModel: 20, nextThink: 3000 },
+			run: 290, endToCoordinator: 10, postAction: 8, resultToModel: 26, resultDelivery: 6, nextThink: 2994 },
 	);
 	assert.deepEqual([first.prefill, first.generate], [1500, 500], 'the model call just before the request is the one that decided the action');
 	assert.deepEqual([chains[0].ticks.started, chains[0].ticks.ended], [100, 107]);
-	assert.equal(chains[1].stages.model, 3000);
+	assert.equal(chains[1].stages.model, 2994);
+	assert.equal(chains[1].stages.eventToTurn, undefined, 'only the first dispatched action of a turn carries its startup');
 	assert.equal(chains[1].stages.nextThink, null, 'the last action has no next request');
 });
 
@@ -80,17 +85,53 @@ test('body idle share is the time no action ran between the first start and the 
 	assert.ok(Math.abs(idle[0].idleShare - (1 - 490 / 3600)) < 1e-9);
 });
 
+test('startup marks stay with the turn until an action is dispatched, however many reads come first', () => {
+	const rows = syntheticRows().filter((row) => row.callId !== 'c2' && row.callId !== 'c3' && !['native_tool_post_action_sampled', 'native_tool_action_completed', 'native_tool_dispatch_started', 'native_tool_command_sent', 'native_tool_journal_written'].includes(row.event));
+	assert.equal(buildChains(rows).chains.length, 0, 'a turn of reads dispatches nothing');
+	const read = (offset, callId) => [
+		{ event: 'native_tool_queue_timing', at: T + offset, mono: 500 + offset, agentId: AGENT, callId, toolKind: 'observe', queueWaitMs: null },
+		{ event: 'native_tool_executed', at: T + offset + 2, mono: 502 + offset, agentId: AGENT, callId, toolKind: 'observe' },
+	];
+	const action = [
+		{ event: 'native_tool_queue_timing', at: T + 9000, mono: 9500, agentId: AGENT, callId: 'c9', toolKind: 'action', queueWaitMs: null },
+		{ event: 'native_tool_dispatch_started', at: T + 9004, mono: 9504, agentId: AGENT, actionId: 'native:s:9:agent:1', actionType: 'wait', callId: 'c9' },
+	];
+	const { chains } = buildChains([...rows.slice(0, 3), ...read(4000, 'r1'), ...read(5000, 'r2'), ...read(6000, 'r3'), ...action]);
+	assert.equal(chains.length, 1);
+	assert.deepEqual([chains[0].stages.eventToTurn, chains[0].stages.inputBuild], [30, 12]);
+});
+
+test('an action Java accepted but never started is reported apart from busy and idle time', () => {
+	const rows = syntheticRows();
+	const completed = rows.find((row) => row.event === 'native_tool_action_completed' && row.actionId === 'native:s:2:agent:1');
+	delete completed.javaStartedAtEpochMs;
+	delete completed.javaStartedTick;
+	completed.state = 'CANCELLED';
+	const { chains } = buildChains(rows);
+	assert.equal(chains[1].unstarted, true);
+	assert.equal(chains[1].stages.unstartedWait, 8700 - 8435);
+	assert.equal(chains[1].stages.run, null);
+	const idle = bodyIdle(chains);
+	assert.equal(idle[0].actions, 1, 'only the action that executed counts toward busy time');
+	assert.equal(idle[0].windowMs, 5390 - 5100);
+	assert.equal(idle[0].busyMs, 290);
+	const summary = summarize(rows);
+	assert.deepEqual(summary.unstarted, { count: 1, waitMs: 8700 - 8435 });
+	assert.match(renderReport(summary), /1 action\(s\) were accepted by Java but never started; their 0\.3 s of waiting is excluded/);
+	assert.equal(summarize(syntheticRows()).unstarted.count, 0);
+});
+
 test('a coordinator restart (monotonic clock reset) falls back to the wall clock', () => {
 	const { chains } = buildChains(syntheticRows({ restartAt: 5000 }));
 	assert.equal(chains[0].stages.requestToDispatch, 5);
 	assert.equal(chains[0].stages.dispatchToSent, 6);
-	assert.equal(chains[0].stages.nextThink, 3000);
+	assert.equal(chains[0].stages.nextThink, 2994);
 });
 
 test('rows without monotonic time still chain on the wall clock', () => {
 	const { chains } = buildChains(syntheticRows({ mono: false }));
-	assert.equal(chains[0].stages.model, 2015);
-	assert.equal(chains[0].stages.nextThink, 3000);
+	assert.equal(chains[0].stages.model, 2012);
+	assert.equal(chains[0].stages.nextThink, 2994);
 });
 
 test('a trace from before timestamps degrades to recorded durations and says so', () => {
@@ -108,20 +149,22 @@ test('a trace from before timestamps degrades to recorded durations and says so'
 	assert.equal(summary.timestamped, false);
 	assert.equal(summary.actions, 1);
 	const decision = summary.recorded.find((entry) => entry.label.startsWith('decision segment'));
-	assert.deepEqual([decision.n, decision.median, decision.p90], [2, 4000, 6000]);
+	assert.deepEqual([decision.n, decision.median, decision.p90], [2, 5000, 6000]);
 	// Only the fields a model call always carried survive without timestamps.
 	assert.ok(summary.stages.filter((stage) => !['prefill', 'generate'].includes(stage.key)).every((stage) => stage.n === 0));
 	assert.deepEqual(summary.idle, []);
 	const text = renderReport(summary);
 	assert.match(text, /timestamps: NO/);
-	assert.match(text, /decision segment: provider start -> tool request\s+2\s+4000\s+6000/);
+	assert.match(text, /decision segment: provider start -> tool request\s+2\s+5000\s+6000/);
 });
 
 test('summary medians and p90 use nearest rank', () => {
-	assert.deepEqual(stats([5, 1, 3, 2, 4, 10, 7, 8, 9, 6]), { n: 10, median: 5, p90: 9, mean: 5.5 });
+	assert.deepEqual(stats([5, 1, 3, 2, 4, 10, 7, 8, 9, 6]), { n: 10, median: 5.5, p90: 9, mean: 5.5 });
+	assert.equal(stats([1, 2, 3, 4]).median, 2.5, 'an even count averages the two middle values');
+	assert.equal(stats([4, 1, 9]).median, 4);
 	assert.deepEqual(stats([]), { n: 0, median: null, p90: null, mean: null });
 	const summary = summarize(syntheticRows());
-	assert.equal(summary.stages.find((stage) => stage.key === 'run').median, 200);
+	assert.equal(summary.stages.find((stage) => stage.key === 'run').median, 245);
 	assert.equal(summary.stages.find((stage) => stage.key === 'run').p90, 290);
 	assert.match(renderReport(summary), /Body idle share[\s\S]*86%/);
 });
@@ -154,7 +197,7 @@ test('the command line prints the report and tolerates a torn last line', async 
 		const run = spawnSync(process.execPath, [SCRIPT, file, '--rows', '2'], { encoding: 'utf8' });
 		assert.equal(run.status, 0, run.stderr);
 		assert.match(run.stdout, /timestamps: yes/);
-		assert.match(run.stdout, /action runs \(Java start -> end\)\s+2\s+200\s+290/);
+		assert.match(run.stdout, /action runs \(Java start -> end\)\s+2\s+245\s+290/);
 		const json = spawnSync(process.execPath, [SCRIPT, file, '--json'], { encoding: 'utf8' });
 		assert.equal(JSON.parse(json.stdout).actions, 2);
 		assert.equal(spawnSync(process.execPath, [SCRIPT], { encoding: 'utf8' }).status, 2);

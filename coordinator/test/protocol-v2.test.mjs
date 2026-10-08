@@ -2355,6 +2355,8 @@ function largeQueuedRecord() {
 test('fragmented registry waits for completion and preserves every long UTF-8 queued goal', async (t) => {
 	const { bridge, socket, hello, emit } = framingFixture(t);
 	assert.equal(hello.payload.registryFragments, true);
+	// Java sends action clocks only to a coordinator that announces this; an older one rejects the unknown keys.
+	assert.equal(hello.payload.actionTiming, true);
 	const record = largeQueuedRecord();
 	assert.ok(Buffer.byteLength(JSON.stringify(record)) > 65_536);
 	const completed = once(bridge, 'ready');

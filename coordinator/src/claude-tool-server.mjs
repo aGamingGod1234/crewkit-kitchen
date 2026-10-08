@@ -22,11 +22,11 @@ export class ClaudeToolServer {
 	#tools = MINECRAFT_DYNAMIC_TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema }));
 
 	/** Registers one agent route. `callTool(name, args, meta)` returns MCP tool-call content. */
-	async register({ callTool, onToolsListed = () => {} }) {
+	async register({ callTool, onToolsListed = () => {}, onToolResponded = () => {} }) {
 		if (typeof callTool !== 'function') throw new TypeError('callTool must be a function');
 		await this.#start();
 		const token = randomBytes(32).toString('hex');
-		this.#routes.set(token, { callTool, onToolsListed });
+		this.#routes.set(token, { callTool, onToolsListed, onToolResponded });
 		return {
 			url: `http://127.0.0.1:${this.#port}${MCP_PATH}`,
 			token,
@@ -75,13 +75,13 @@ export class ClaudeToolServer {
 				return sendJson(response, rpcError(null, -32600, 'Expected one JSON-RPC message'));
 			}
 			if (message.id === undefined || message.id === null) return send(response, 202);
-			sendJson(response, await this.#dispatch(route, message));
+			sendJson(response, await this.#dispatch(route, message, response));
 		} catch (error) {
 			if (!response.headersSent) sendJson(response, rpcError(null, -32700, String(error?.message ?? error).slice(0, 256)));
 		}
 	}
 
-	async #dispatch(route, { id, method, params }) {
+	async #dispatch(route, { id, method, params }, response) {
 		switch (method) {
 			case 'initialize':
 				return rpcResult(id, {
@@ -97,7 +97,10 @@ export class ClaudeToolServer {
 			case 'tools/call': {
 				if (typeof params?.name !== 'string') return rpcError(id, -32602, 'tools/call requires a tool name');
 				const toolUseId = typeof params?._meta?.['claudecode/toolUseId'] === 'string' ? params._meta['claudecode/toolUseId'] : null;
-				return rpcResult(id, await route.callTool(params.name, params.arguments ?? {}, { toolUseId }));
+				const result = await route.callTool(params.name, params.arguments ?? {}, { toolUseId });
+				// 'finish' fires once the tool result has been handed to the operating system, the last point this process controls.
+				response.once('finish', () => { try { route.onToolResponded({ toolUseId }); } catch { /* latency tracing cannot fail delivery */ } });
+				return rpcResult(id, result);
 			}
 			default:
 				return rpcError(id, -32601, `Method not found: ${String(method).slice(0, 64)}`);

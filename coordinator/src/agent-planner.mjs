@@ -335,7 +335,7 @@ export class AgentPlanner {
 								try {
 									if (signal.aborted) throw signal.reason;
 									const toolResult = await executeTool(request);
-									this.#traceNativeTiming(record, 'native_tool_result_returned', {
+									this.#traceNativeTiming(record, 'native_tool_executed', {
 										traceId, callId: request?.callId ?? null, toolKind: request?.tool?.kind ?? 'unknown',
 										executeMs: elapsed(executorEnteredAt, this.#now()), state: typeof toolResult?.state === 'string' ? toolResult.state.slice(0, 64) : null,
 									});

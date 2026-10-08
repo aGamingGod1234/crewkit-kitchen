@@ -1135,6 +1135,7 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 			input: inputs.length === 1 ? inputs[0].input : inputs.length === 0 ? '' : JSON.stringify(inputs),
 			inputBytes, inputCount: inputs.length, toolCalls, toolResultBytes, toolResponses: toolResponses.snapshot(), compaction };
 	};
+	const providerEvent = (event, fields) => safeVerbose(onVerbose, 'provider_event', JSON.stringify({ event, ...fields }));
 	const respond = async (id, response, metadata) => {
 		let measurement = null;
 		// Capture the exact presented response, excluding its RPC envelope. A lost
@@ -1225,6 +1226,7 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 				if (!settled) {
 					const presented = presentNativeToolResult(result, tool, observationViews);
 					await respond(id, presented.response, measurementMetadata(result));
+					providerEvent('native_provider_tool_result_sent', { callId: params.callId });
 					if (!settled) presented.commit();
 					safeVerbose(onVerbose, 'live_result', presented.response.contentItems[0].text.slice(0, 1200));
 				}
@@ -1236,6 +1238,7 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 					message: String(error?.message ?? error).slice(0, 512),
 					...(error?.actionContract === undefined ? {} : { actionContract: error.actionContract }),
 				}, false), measurementMetadata(null));
+				providerEvent('native_provider_tool_result_sent', { callId: params.callId });
 			} finally {
 				if (executionStarted) {
 					onToolExecutionEnd();
@@ -1347,7 +1350,7 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 		recordInput(method, input) { inputs.push({ method, input }); inputBytes += Buffer.byteLength(input, 'utf8'); },
 		replaceOnVerbose(next) { onVerbose = next; },
 		/** Stage timestamp for the latency trace, delivered through whichever verbose callback currently owns the turn. */
-		providerEvent(event, fields) { safeVerbose(onVerbose, 'provider_event', JSON.stringify({ event, ...fields })); },
+		providerEvent,
 		replaceExecuteTool(next) {
 			if (typeof next !== 'function') throw new TypeError('native tool executor must be a function');
 			const previous = toolExecutor;
@@ -1433,7 +1436,7 @@ function createProviderSilenceDeadline(timeoutMs, schedule, cancelSchedule) {
 
 function safeVerbose(callback, stage, message) {
 	if (typeof callback !== 'function') return;
-	if (stage.startsWith('live_')) {
+	if (stage.startsWith('live_') || stage === 'provider_event') {
 		try { Promise.resolve(callback(stage, String(message ?? '').slice(0, 2048))).catch(() => {}); } catch { /* read-only view */ }
 		return;
 	}

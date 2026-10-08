@@ -1020,6 +1020,11 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			if (!capability.isJsonPrimitive() || !capability.getAsJsonPrimitive().isBoolean()) throw new BridgeProtocolException("INVALID_FIELD", "registryFragments must be a boolean");
 			source.registryFragments = capability.getAsBoolean();
 		}
+		if (envelope.payload().has("actionTiming")) {
+			JsonElement capability = envelope.payload().get("actionTiming");
+			if (!capability.isJsonPrimitive() || !capability.getAsJsonPrimitive().isBoolean()) throw new BridgeProtocolException("INVALID_FIELD", "actionTiming must be a boolean");
+			source.actionTiming = capability.getAsBoolean();
+		}
 
 		while (true) {
 			ensureHandshakeTimeRemaining(source);
@@ -2658,7 +2663,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		payload.addProperty("observedAtEpochMs", result.observedAtEpochMs());
 		payload.addProperty("executionStarted", result.executionStarted());
 		payload.addProperty("physicalAttempted", result.physicalAttempted());
-		ActionTimelines.Timeline timeline = ActionTimelines.recall(result.agentId(), result.actionId());
+		// An older coordinator rejects unknown action_result keys and would leave the action unresolved, and the
+		// bundled coordinator can lag the jar (rollback to last-known-good, external package roots), so only a
+		// coordinator that announced actionTiming in its hello receives the clocks.
+		ActionTimelines.Timeline timeline = target.actionTiming ? ActionTimelines.recall(result.agentId(), result.actionId()) : null;
 		if (timeline != null) {
 			JsonObject timing = new JsonObject();
 			timing.addProperty("acceptedAtEpochMs", timeline.acceptedAtEpochMs());
@@ -2764,7 +2772,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		payload.addProperty("progress", progress.progress());
 		payload.addProperty("elapsedMs", progress.elapsedMs());
 		payload.addProperty("observedAtEpochMs", progress.observedAtEpochMs());
-		if (manager.server() != null) payload.addProperty("serverTick", manager.server().getTickCount());
+		Session timingSession = session;
+		if (manager.server() != null && timingSession != null && timingSession.actionTiming) payload.addProperty("serverTick", manager.server().getTickCount());
 		if (progress.actionObservation() != null) payload.add("actionObservation", actionObservationPayload(progress.actionObservation()));
 		send("action_progress", progress.agentId().toString(), payload);
 		if (progress.actionObservation() == null || progress.actionObservation().progress() == null
@@ -3952,6 +3961,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		private final long handshakeStartedNanos;
 		private final long handshakeTimeoutNanos = TimeUnit.MILLISECONDS.toNanos(HANDSHAKE_TIMEOUT_MS);
 		private volatile boolean registryFragments;
+		private volatile boolean actionTiming;
 		private volatile String clientNonce;
 		private volatile String serverNonce;
 		private volatile String authResponseMessageId;

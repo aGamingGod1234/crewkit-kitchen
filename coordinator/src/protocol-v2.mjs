@@ -238,13 +238,14 @@ function normalizeProtocolV2Payload(type, value) {
 				proof: authenticationToken(value.proof, 'proof'),
 			};
 		case 'hello':
-			exactKeys(value, ['replyTo', 'clientNonce', 'serverNonce', 'proof', 'launchId', 'registryFragments'], ['replyTo', 'clientNonce', 'serverNonce', 'proof'], type);
+			exactKeys(value, ['replyTo', 'clientNonce', 'serverNonce', 'proof', 'launchId', 'registryFragments', 'actionTiming'], ['replyTo', 'clientNonce', 'serverNonce', 'proof'], type);
 			return {
 				replyTo: boundedText(value.replyTo, 'replyTo', MAX_COMMAND_ID_LENGTH),
 				clientNonce: authenticationToken(value.clientNonce, 'clientNonce'),
 				serverNonce: authenticationToken(value.serverNonce, 'serverNonce'),
 				proof: authenticationToken(value.proof, 'proof'),
 				...(value.registryFragments === undefined ? {} : { registryFragments: boolean(value.registryFragments, 'registryFragments') }),
+				...(value.actionTiming === undefined ? {} : { actionTiming: boolean(value.actionTiming, 'actionTiming') }),
 				...(value.launchId === undefined ? {} : { launchId: launchIdentity(value.launchId) }),
 			};
 		case 'hello_ack':
@@ -847,6 +848,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 					launchId: this.#launchId,
 				}),
 				registryFragments: true,
+				actionTiming: true,
 				...(this.#launchId === null ? {} : { launchId: this.#launchId }),
 			},
 		});

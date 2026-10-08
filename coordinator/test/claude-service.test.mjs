@@ -188,6 +188,8 @@ test('a Claude native turn executes Minecraft tools through the coordinator and 
 		assert.equal(executed[0].agentId, 'claude-a');
 		assert.equal(executed[0].callId, 'toolu_1');
 		assert.deepEqual(verbose.filter(([stage]) => stage !== 'provider_event'), [['agent_message', 'Looking around.']]);
+		// Stamped once the MCP response has left the tool server, so the trace does not count formatting as free.
+		assert.deepEqual(providerEvents(verbose).filter((entry) => entry.event === 'native_provider_tool_result_sent'), [{ event: 'native_provider_tool_result_sent', callId: 'toolu_1' }]);
 		assert.equal(agent.sessionMetadata().sessionState, 'warm');
 	} finally { await close(); }
 });

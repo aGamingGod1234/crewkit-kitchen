@@ -628,6 +628,9 @@ ${encoded}`);
 		this.#route = await this.#toolServer.register({
 			callTool: (name, args, meta) => this.#callTool(name, args, meta),
 			onToolsListed: () => this.#toolsListed?.resolve(),
+			onToolResponded: ({ toolUseId }) => {
+				if (toolUseId !== null && this.#active !== null) providerEvent(this.#active.onVerbose, 'native_provider_tool_result_sent', { callId: toolUseId });
+			},
 		});
 		this.#assertUsable();
 		const launch = buildClaudeLaunch(this.#profile, this.#config, {

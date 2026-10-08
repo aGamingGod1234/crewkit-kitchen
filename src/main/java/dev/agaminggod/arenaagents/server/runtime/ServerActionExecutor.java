@@ -312,7 +312,6 @@ public final class ServerActionExecutor {
 
 	public synchronized void tick() {
 		long now = System.currentTimeMillis();
-		long serverTick = manager.server() == null ? 0L : manager.server().getTickCount();
 		retryPendingPublications();
 		List<ActiveAction> actions = new ArrayList<>(active.values());
 		try (ServerPathPlanner.TickScope ignored = ServerPathPlanner.beginServerTick()) {
@@ -322,6 +321,7 @@ public final class ServerActionExecutor {
 				if (pending != null) finish(action, pending.pending());
 			}
 			if (actions.isEmpty()) return;
+			long serverTick = manager.server() == null ? 0L : manager.server().getTickCount();
 			int start = roundRobinStart(pathfindingRoundRobinCursor, actions.size());
 			pathfindingRoundRobinCursor++;
 			for (int offset = 0; offset < actions.size(); offset++) {
