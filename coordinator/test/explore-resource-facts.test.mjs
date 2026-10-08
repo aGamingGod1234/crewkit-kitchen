@@ -132,3 +132,49 @@ test('taskPlan says what the strategy read is for, and the guide covers resource
 	assert.ok(Buffer.byteLength(JSON.stringify(minecraftCapabilities({ section: 'strategy', topic: 'resources' }))) <= 4_096, 'still one small read');
 });
 
+
+test('ingest path: sight, threat trend, healing, sound and wear facts survive the bridge, adapter and event projection', async () => {
+	const { FakePlanner, eventually, start } = await import('./fixtures/dynamic-main-fixture.mjs');
+	const { AgentRegistry } = await import('../src/agent-registry.mjs');
+	const { validateProtocolV2Payload } = await import('../src/protocol-v2.mjs');
+	const zombie = '00000000-0000-4000-8000-0000000000aa';
+	// The wire observation exactly as the mod sends it, normalized by the same protocol check the live bridge runs.
+	const wire = validateProtocolV2Payload('observation', {
+		goalRevision: 1, observedAtEpochMs: 1, ready: true, status: 'ready', eventSequence: 1, attention: true, changedFacts: ['sighted'],
+		position: { x: 0.5, y: 64, z: 0.5 }, velocity: { x: 0, y: 0, z: 0 }, view: { yaw: 0, pitch: 0 },
+		player: { health: 7, maxHealth: 20, armor: 0, foodLevel: 15, saturation: 0, gameMode: 'survival', onGround: true, inWater: false, onFire: false,
+			air: 300, maxAir: 300, suffocating: false, fallDistance: 0, effects: [] },
+		inventory: { items: [{ slot: 0, itemId: 'minecraft:stone_pickaxe', count: 1, damage: 120, maxDamage: 131 }], selectedItem: 'minecraft:stone_pickaxe' },
+		entities: [], blocks: [], nearbyContainers: [], world: { dimension: 'minecraft:overworld', gameTime: 1, dayTime: 1, raining: false, thundering: false },
+		currentAction: { active: false }, lastResult: { present: false },
+		threats: { entries: [{ uuid: zombie, type: 'minecraft:zombie', distance: 9, bearing: 40, targeting: true, swelling: false, lineOfSight: true, signals: ['targeting'],
+			risk: 6, expectedHitDamage: 3, closingSpeed: 2, approaching: true, etaSeconds: 3.5, contactRisk: 40 }] },
+		survival: { safe: false, canHealNow: false, signals: [], bestFood: { slot: 4, itemId: 'minecraft:bread', nutrition: 5 } },
+		heard: [{ sound: 'zombie groan', source: 'minecraft:zombie', direction: 'right', elevation: 'level', distance: 9 }],
+		sighted: SIGHTED,
+	});
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	let toolResult;
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		if (planner.requests.length === 1) toolResult = await request.executeTool({ agentId: request.agentId, goalRevision: request.goalRevision, turnId: 't-1', callId: 'c-1', tool: { kind: 'observe' } });
+		return { status: 'completed', toolCalls: 1 };
+	};
+	const run = await start({ registry, planner, config: { bridge: { port: 25570, secret: 's'.repeat(32) },
+		codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } } } });
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Mine iron.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: wire });
+		await eventually(() => toolResult !== undefined);
+		const event = payload(planner.requests[0].input);
+		assert.deepEqual(event.observation.sighted, SIGHTED, 'events carry what the agent sees');
+		const threat = event.observation.player.threats[0];
+		assert.deepEqual([threat.closingSpeed, threat.approaching, threat.etaSeconds, threat.contactRisk], [2, true, 3.5, 40], 'threat trend survives');
+		assert.equal(event.observation.player.bestFood.itemId, 'minecraft:bread', 'healing facts survive');
+		assert.equal(event.observation.player.safe, false);
+		assert.equal(event.observation.player.heard[0].sound, 'zombie groan', 'heard survives');
+		assert.equal(event.observation.inventory.items[0].usesLeft, 11, 'wear reaches the model as usesLeft');
+		assert.deepEqual(toolResult.observation.sighted, SIGHTED, 'observe tool results carry what the agent sees');
+	} finally { await run.coordinator.stop(); }
+});

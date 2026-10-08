@@ -101,6 +101,8 @@ export function adaptObservation(value) {
 		...(Object.hasOwn(source, 'currentAction') ? { currentAction: currentActionFacts(source.currentAction) } : {}),
 		...(Object.hasOwn(source, 'lastResult') ? { lastResult: lastResultFacts(source.lastResult) } : {}),
 		...(Object.hasOwn(source, 'interaction') ? { interaction: interactionFacts(source.interaction) } : {}),
+		// Structures, caves and ore veins in line of sight; the protocol already bounded and validated each row.
+		...(Object.hasOwn(source, 'sighted') ? { sighted: extensionValue(source.sighted, 'sighted') } : {}),
 	};
 }
 
