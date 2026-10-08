@@ -206,16 +206,19 @@ public final class BridgeIntegrationFindingsVerification {
                 eq(false, rawForce(299, 298, 20, 20, false), "actual raw classifier keeps safe air quiet");
                 observation.getAsJsonObject("player").addProperty("air", 299 - (tick % 100));
                 observation.addProperty("observedAtEpochMs", 1_000L + tick);
+                // Inside the heartbeat window the coming heartbeat answers a routine request, so nothing is queued.
                 invoke(f.bridge, "queueObservation", new Class<?>[]{AgentId.class}, id);
                 publication.scheduleIdleHeartbeat(List.of(id));
                 final List<MultiplexedServerBridge.ObservationPublication.Result> results = new ArrayList<>();
                 publication.drain(agent -> results.add(publication.publish(agent, f.session, observation, writer, publication.takeHeartbeat(agent))));
-                eq(1, results.size(), "coalesced normal sample per tick");
-                if (results.getFirst() == MultiplexedServerBridge.ObservationPublication.Result.SUPPRESSED) suppressed++;
-                else due++;
+                eq(tick % interval == 0 ? 1 : 0, results.size(), "only the due heartbeat is published at tick " + tick);
+                for (var result : results) {
+                    if (result == MultiplexedServerBridge.ObservationPublication.Result.SUPPRESSED) suppressed++;
+                    else due++;
+                }
             }
             eq(2, due, "sustained quiet air retains two due heartbeats");
-            eq(interval * 2 - 2, suppressed, "quiet predeadline publications suppressed");
+            eq(0, suppressed, "quiet predeadline requests never reach the queue");
             for (String control : List.of("damage", "critical_air", "inventory", "explicit")) {
                 if (!control.equals("explicit")) eq(true, rawForce(control.equals("critical_air") ? 61 : 299,
                         control.equals("critical_air") ? 60 : 298, 20, control.equals("damage") ? 19 : 20,
