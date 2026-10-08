@@ -151,3 +151,19 @@ test('a routine whose source ran out does not wait out the window for its pendin
 	assert.equal(run.decisions.length, 2, 'the idle body notifies at once instead of after the window');
 	assert.ok(run.timers.filter(timer => timer.ms === 27_000).every(timer => timer.cleared), 'the deferred timer is retired');
 });
+
+test('sightings on an idle body fold into the pending decision: one notification, and the in-flight answer stays valid', async t => {
+	const run = setup(t);
+	run.sight();
+	await turn();
+	assert.equal(run.decisions.length, 1);
+	const { decisionId } = run.decisions[0];
+	run.finishAction();
+	await turn();
+	run.finishAction();
+	for (let index = 0; index < 5; index++) await turn();
+	for (let index = 0; index < 4; index++) { run.advance(1_000); run.sight(); await turn(); }
+	assert.equal(run.decisions.length, 1, 'no new handle and no new wake per observation');
+	assert.equal(run.executor.status(record).decision.decisionId, decisionId);
+	assert.doesNotThrow(() => run.executor.respond(record, { programId: 'throttle', decisionId, directive: 'continue' }), 'the model answers the handle it was given');
+});

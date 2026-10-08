@@ -55,6 +55,7 @@ test('getting food counts as self-preservation; other breaking does not', () => 
 	assert.equal(isSelfPreservationTool(PICK_UP), true);
 	assert.equal(isSelfPreservationTool(HARVEST), true);
 	assert.equal(isSelfPreservationTool(act('break_block', { x: 3, y: 64, z: 0, expectedBlockId: 'minecraft:melon', timeoutMs: 5_000 })), true);
+	assert.equal(isSelfPreservationTool(act('break_block', { x: 3, y: 64, z: 0, expectedBlockId: 'minecraft:cave_vines_plant', timeoutMs: 5_000 })), false);
 	assert.equal(isSelfPreservationTool(MINE_STONE), false);
 	assert.equal(isSelfPreservationTool(act('place_block', { x: 1, y: 64, z: 0, face: 'up', itemId: 'minecraft:dirt' })), false);
 	assert.equal(isSelfPreservationTool(normalizeMinecraftToolCall('sequence', { actions: [
@@ -151,7 +152,7 @@ test('a danger turn comes first; when it ends at low health the recovery turn fo
 	const { bridge, planner, run } = await completedAgent([[], []]);
 	try {
 		bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 2, eventSequence: 2, attention: true, changedFacts: ['player.health'],
-			observation: { player: { x: 0, y: 64, z: 0, health: 2, maxHealth: 20 } } } });
+			observation: { player: { x: 0, y: 64, z: 0, health: 2, maxHealth: 20 }, items: [{ stableId: DROP, itemId: 'minecraft:beef', count: 1, x: 2, y: 64, z: 0 }] } } });
 		await eventually(() => planner.requests.length === 3);
 		assert.match(planner.requests[1].input.split('\n')[0], /danger/);
 		assert.equal(planner.requests[2].input.split('\n')[0], NO_TASK_HEAL_INSTRUCTION);
@@ -170,4 +171,25 @@ test('takeover and healthy bodies are never woken to heal', async () => {
 	} finally {
 		await run.coordinator.stop();
 	}
+});
+
+test('control frames with no task may move and aim but not attack or use; berries are a right-click', () => {
+	const frame = (attack, use) => ({ forward: 1, strafe: 0, jump: false, sneak: false, sprint: true, attack, use, yaw: 0, pitch: 0, selectedSlot: 0, hand: 'main', ticks: 10 });
+	assert.equal(isSelfPreservationTool(act('control', frame(false, false))), true);
+	assert.equal(isSelfPreservationTool(act('control', frame(true, false))), false, 'a held attack could break any block');
+	assert.equal(isSelfPreservationTool(act('control', frame(false, true))), false, 'a held use could place blocks or open containers');
+	assert.equal(isSelfPreservationTool(act('control_sequence', { frames: [frame(false, false), frame(false, true)], maxTicks: 20 })), false);
+	assert.equal(isSelfPreservationTool(act('control_sequence', { frames: [frame(false, false)], maxTicks: 20 })), true);
+	assert.equal(isSelfPreservationTool(act('interact_block', { x: 3, y: 64, z: 0, face: 'up', hand: 'main', expectedItemId: 'minecraft:air' })), true, 'Minecraft checks the berries are ripe');
+	assert.equal(isSelfPreservationTool(act('break_block', { x: 3, y: 64, z: 0, expectedBlockId: 'minecraft:sweet_berry_bush', timeoutMs: 5_000 })), false, 'berries are picked, not the bush broken');
+});
+
+test('heal wakes need a 2+ point further drop, and a regenerating body with nothing to eat is left alone', () => {
+	const at = (health, extra = {}) => ({ player: { health, maxHealth: 20, ...extra } });
+	assert.equal(lowHealthWake(at(9), 10).wake, false, 'one point of starvation does not wake again');
+	assert.equal(lowHealthWake(at(8), 10).wake, true);
+	assert.equal(lowHealthWake(at(4, { foodLevel: 19 })).wake, false, 'a full food bar regenerates and there is nothing to eat');
+	assert.equal(lowHealthWake({ ...at(4, { foodLevel: 19 }), entities: [{ stableId: COW, type: 'minecraft:cow', x: 1, y: 0, z: 0 }] }).wake, true, 'food in view is worth a turn');
+	assert.equal(lowHealthWake(at(4, { foodLevel: 19, bestFood: { slot: 0, itemId: 'minecraft:bread', nutrition: 5 } })).wake, true);
+	assert.equal(lowHealthWake(at(4, { foodLevel: 12 })).wake, true, 'a hungry body should hear about it');
 });

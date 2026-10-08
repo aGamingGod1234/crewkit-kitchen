@@ -428,9 +428,10 @@ public final class AgentLifecycleReducer {
 
 	/**
 	 * Self-preservation actions an agent without a task may take: fight or flee, eat or drink, raise a shield or
-	 * totem, equip armor and weapons, move away and look, and pick up dropped items (food after a hunt). Breaking is
-	 * allowed only for food plants (see {@link #isFoodHarvest}); placing, crafting, containers, chat and other work
-	 * still need a task the model adopted (takeTask), so nobody can steer the body around it.
+	 * totem, equip armor and weapons, move away and look, and pick up food after a hunt. Breaking is allowed only for
+	 * food plants (see {@link #isFoodHarvest}); the bridge also limits control frames (no attack or use) and checks the
+	 * live food target. Placing, crafting, containers, chat and other work still need a task the model adopted
+	 * (takeTask), so nobody can steer the body around it.
 	 */
 	public static boolean isSelfPreservationAction(dev.agaminggod.arenaagents.protocol.ActionType type) {
 		return switch (type) {
@@ -441,10 +442,9 @@ public final class AgentLifecycleReducer {
 		};
 	}
 
-	/** Blocks that are food when broken. Breaking checks the block is exactly the expected one first. */
+	/** Blocks that are food when broken (crops, melons). Berries are picked by right-click instead, as in vanilla. */
 	public static final java.util.Set<String> FOOD_PLANT_BLOCKS = java.util.Set.of("minecraft:wheat", "minecraft:carrots",
-			"minecraft:potatoes", "minecraft:beetroots", "minecraft:sweet_berry_bush", "minecraft:cave_vines",
-			"minecraft:cave_vines_plant", "minecraft:melon");
+			"minecraft:potatoes", "minecraft:beetroots", "minecraft:melon");
 
 	/** Harvesting a crop, berries or a melon to eat: the only breaking an agent without a task may do. */
 	public static boolean isFoodHarvest(dev.agaminggod.arenaagents.protocol.ActionType type, String expectedBlockId) {

@@ -38,7 +38,8 @@ export class ContextCarryOver {
 		for (const entry of Array.isArray(value?.conversation?.entries) ? value.conversation.entries : []) {
 			const speaker = typeof entry?.sourceName === 'string' ? entry.sourceName : typeof entry?.sourceId === 'string' ? entry.sourceId : entry?.kind ?? 'message';
 			if (typeof entry?.text !== 'string') continue;
-			this.#conversation.push(`${truncate(String(speaker), 48)}: ${truncate(entry.text, 200)}`);
+			// Quoted, so a player's newlines cannot forge extra carry-over lines.
+			this.#conversation.push(`${JSON.stringify(truncate(String(speaker), 48))}: ${JSON.stringify(truncate(entry.text, 200))}`);
 		}
 		if (this.#conversation.length > CARRY_OVER_CONVERSATION) this.#conversation.splice(0, this.#conversation.length - CARRY_OVER_CONVERSATION);
 		if (value?.program !== null && typeof value?.program === 'object') this.#noteProgram(value.program);

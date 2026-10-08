@@ -120,5 +120,16 @@ test('a program result is not lost when an ordinary observation follows it into 
 	assert.deepEqual(merged.nativeEvent.observation, { at: 6 }, 'with the newest facts');
 	assert.equal(merged.nativeEvent.eventSequence, 6);
 	const danger = { ...seen, priority: 'urgent', trigger: 'damage', nativeEvent: { event: 'observation', trigger: 'damage', observation: { at: 7 } } };
-	assert.equal(mergePlannerRequest(ended, danger).nativeEvent.trigger, 'damage', 'danger still leads');
+	const urgent = mergePlannerRequest(ended, danger);
+	assert.equal(urgent.nativeEvent.trigger, 'damage', 'danger still leads');
+	assert.equal(urgent.nativeEvent.event, 'observation');
+	assert.deepEqual(urgent.nativeEvent.observation, { at: 7 });
+	assert.equal(urgent.nativeEvent.result.reasonCode, 'PROGRAM_EXHAUSTED', 'and still carries the program result');
+	const attention = { ...ended, nativeEvent: { event: 'program_attention', programId: 'p-2', status: { decision: { decisionId: 'p-2:decision-1' } }, observation: { at: 5 } } };
+	assert.equal(mergePlannerRequest(attention, danger).nativeEvent.status.decision.decisionId, 'p-2:decision-1', 'or the decision handle');
+	const { buildNativeEventInput } = await import('../src/dynamic-main.mjs');
+	const input = buildNativeEventInput({ goalRevision: 1, currentGoal: 'Find lava' }, mergePlannerRequest(ended, danger).nativeEvent);
+	const payload = JSON.parse(input.slice(input.indexOf('\n') + 1));
+	assert.equal(payload.trigger, 'damage');
+	assert.equal(payload.program.result.reasonCode, 'PROGRAM_EXHAUSTED', 'the model sees both');
 });

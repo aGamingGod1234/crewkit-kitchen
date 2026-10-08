@@ -230,9 +230,9 @@ export class CodexService {
 		};
 		const { threadId, response } = await startThread(threadParams);
 		const rotationTokens = this.#config.contextRotationTokens;
-		// A rotated thread keeps the same instructions and tools; the stale recovery summary is not repeated.
+		// A rotated thread starts with exactly the same parameters, so any prefix caching across threads stays possible.
 		const rotateThread = controlProtocol === 'native_tools' && rotationTokens > 0
-			? async () => (await startThread({ ...threadParams, developerInstructions: nativeRecoveryInstructions(null) })).threadId
+			? async () => (await startThread(threadParams)).threadId
 			: null;
 	const sessionGeneration = (this.#sessionGenerations.get(profile.agentId) ?? 0) + 1;
 		this.#sessionGenerations.set(profile.agentId, sessionGeneration);
@@ -429,6 +429,7 @@ export class SharedCodexAgent {
 	#rotationTokens = 0;
 	#rotationDue = false;
 	#rotationPromise = null;
+	#rotationGeneration = 0;
 	#turnsSinceRotation = 0;
 	#rotations = 0;
 	#pendingCarryOver = null;
@@ -667,8 +668,11 @@ export class SharedCodexAgent {
 			adopted.collector.replaceOnVerbose(onVerbose);
 			signal?.addEventListener('abort', abortAdopted, { once: true });
 			try {
-				await this.#steerActiveNativeTurn(input, { goalRevision, executeTool });
-				return await adoptedTurn;
+				await this.#steerActiveNativeTurn(input, { goalRevision, executeTool: this.#rememberingTools(executeTool) });
+				const result = await adoptedTurn;
+				this.#turnsSinceRotation += 1;
+				this.#rotateAfterTurn();
+				return result;
 			} catch (error) {
 				throw withNativeTurn(error, adopted.collector.snapshot());
 			} finally {
@@ -678,21 +682,15 @@ export class SharedCodexAgent {
 		if (!prewarm && this.#prewarmPromise !== null) {
 			try { await this.#prewarmPromise; } catch { /* a real event continues cold after a failed or interrupted prewarm */ }
 		}
-		// A rotation started after the previous turn finishes before this event reaches a thread.
-		if (this.#rotationPromise !== null) await this.#rotationPromise;
-		if (this.#disposed) throw this.#invalidationError ?? new CodexProtocolError('AGENT_DISPOSED', `Codex agent '${this.agentId}' is disposed`);
+		// An event never waits for a thread start: it runs on the current thread and the unfinished rotation is dropped
+		// (a later finished turn tries again).
+		if (this.#rotationPromise !== null) {
+			this.#rotationGeneration += 1;
+			this.#rotationPromise = null;
+		}
 		if (this.#active !== null) throw new CodexProtocolError('TURN_IN_PROGRESS', `Codex agent '${this.agentId}' already has an active turn`);
 		const carryOver = this.#carryOver;
-		const rememberingExecuteTool = async (request) => {
-			try {
-				const result = await executeTool(request);
-				carryOver.rememberTool(request?.tool, result);
-				return result;
-			} catch (error) {
-				carryOver.rememberTool(request?.tool, null, error);
-				throw error;
-			}
-		};
+		const rememberingExecuteTool = this.#rememberingTools(executeTool);
 		let completed = false;
 
 		const silenceDeadline = createProviderSilenceDeadline(this.#planningTimeoutMs, this.#schedule, this.#cancelSchedule);
@@ -814,21 +812,37 @@ export class SharedCodexAgent {
 		}
 	}
 
+	#rememberingTools(executeTool) {
+		const carryOver = this.#carryOver;
+		return async (request) => {
+			try {
+				const result = await executeTool(request);
+				carryOver.rememberTool(request?.tool, result);
+				return result;
+			} catch (error) {
+				carryOver.rememberTool(request?.tool, null, error);
+				throw error;
+			}
+		};
+	}
+
 	/** Moves to a fresh thread once the context passed the threshold; the next event starts with a short carry-over. */
 	#rotateAfterTurn() {
 		if (!this.#rotationDue || this.#rotateThread === null || this.#turnsSinceRotation < MIN_TURNS_BETWEEN_ROTATIONS) return;
 		if (this.#active !== null || this.#disposed || this.#rotationPromise !== null) return;
 		const carryOver = this.#carryOver.text('Session refreshed to keep context small');
 		const previousThreadId = this.#threadId;
+		const generation = ++this.#rotationGeneration;
 		const rotation = Promise.resolve().then(() => this.#rotateThread()).then((threadId) => {
-			if (this.#disposed || this.#threadId !== previousThreadId) {
+			if (this.#disposed || this.#threadId !== previousThreadId || generation !== this.#rotationGeneration || this.#active !== null) {
 				void this.#transport.request('thread/unsubscribe', { threadId }).catch(() => {});
 				return;
 			}
 			this.#threadId = threadId;
 			// The new thread has never seen earlier events, fact views, omitted metadata or usage counters.
 			this.#observationViews.reset();
-			this.#nativeUsageTotal = null;
+			// This service created the thread a moment ago, so its counters start at zero rather than unknown.
+			this.#nativeUsageTotal = { input: 0, output: 0, reasoning: 0, cached: 0, cacheWrite: 0 };
 			this.#nativeUsagePreviousEnd = null;
 			this.#pendingCarryOver = carryOver;
 			this.#rotationDue = false;
@@ -880,6 +894,8 @@ export class SharedCodexAgent {
 		try {
 			const response = await steerPromise;
 			if (response?.turnId !== turnId) throw new CodexProtocolError('INVALID_TURN_STEER', 'turn/steer response did not preserve the active turn');
+			// Steered DMs, decisions and danger summaries are part of what a fresh thread must not lose.
+			this.#carryOver.noteEvent(input);
 			if (executeTool !== null) active.prewarm = false;
 			return response;
 		} catch (error) {
