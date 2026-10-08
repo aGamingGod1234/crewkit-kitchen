@@ -62,6 +62,35 @@ test('event blocks omit only fields that follow from the row, and say so', () =>
 	assert.deepEqual(observation.blocks[3].tags, ['b']);
 });
 
+test('sight, workstation and tool-wear facts stay small next to a representative wake', async () => {
+	const { encodeNativeEventInput: encode } = await import('../src/model-fact-encoding.mjs');
+	const { withToolWear } = await import('../src/resource-facts.mjs');
+	const sizes = (mutate) => {
+		const wake = representativeProgramWake(1);
+		mutate(wake.observation);
+		const raw = buildNativeEventInput(representativeRecord(), wake);
+		return { raw: Buffer.byteLength(raw), encoded: Buffer.byteLength(encode(raw)) };
+	};
+	const base = sizes(() => {});
+	const cave = { x: -452, y: 80, z: 131, distance: 15, bearing: -34, air: 61 };
+	const vein = { blockId: 'minecraft:iron_ore', x: -441, y: 84, z: 126, distance: 4, bearing: 12, visible: 3 };
+	const structure = { structure: 'minecraft:village_plains', x: -400, y: 63, z: 200, distance: 90, bearing: -20, new: true };
+	const typical = sizes((observation) => { observation.sighted = { caves: [cave], veins: [vein] }; });
+	const full = sizes((observation) => { observation.sighted = { structures: Array(4).fill(structure), caves: Array(3).fill(cave), veins: Array(4).fill(vein) }; });
+	const leftBehind = sizes((observation) => { observation.leftBehind = [{ blockId: 'minecraft:crafting_table', x: -436, y: 86, z: 120, distance: 21 }]; });
+	// Measured when added: typical +190 raw/+190 encoded, all 11 rows +1,032/+475, one workstation +92/+92;
+	// tool wear on Java-shaped rows: raw 10,557 -> 10,311, encoded 8,104 -> 8,202.
+	assert.ok(typical.encoded - base.encoded <= 256, `typical sighted costs ${typical.encoded - base.encoded} bytes`);
+	assert.ok(full.encoded - base.encoded <= 900, `every sighted row costs ${full.encoded - base.encoded} bytes`);
+	assert.ok(leftBehind.encoded - base.encoded <= 128, `one left-behind workstation costs ${leftBehind.encoded - base.encoded} bytes`);
+	// Java sends damage:0/maxDamage:0 on every stack; the model view keeps wear only where it can change.
+	const javaRows = (observation) => { observation.inventory.items = observation.inventory.items.map((item) => ({ damage: 0, maxDamage: 0, ...item })); };
+	assert.deepEqual(sizes(javaRows), base, 'the always-zero damage pair on blocks never reaches the model');
+	const rows = representativeProgramWake(1).observation.inventory;
+	javaRows({ inventory: rows });
+	assert.ok(Buffer.byteLength(JSON.stringify(withToolWear(rows))) < Buffer.byteLength(JSON.stringify(rows)), 'wear rows are smaller than raw rows');
+});
+
 test('the hourly estimate counts the context each call re-reads', () => {
 	const unbounded = estimateHourlyTokens({ calls: MEASURED_SESSION.modelCalls, turns: MEASURED_SESSION.turns, prefixTokens: 15_000, eventTokens: 4_000, toolResultTokens: 1_000, toolResults: 416, maxContextTokens: 160_000 });
 	const rotated = estimateHourlyTokens({ calls: MEASURED_SESSION.modelCalls, turns: MEASURED_SESSION.turns, prefixTokens: 15_000, eventTokens: 4_000, toolResultTokens: 1_000, toolResults: 416, maxContextTokens: 64_000 });

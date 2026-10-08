@@ -10,7 +10,8 @@ for (const event of ['program_planning_due', 'observation']) {
 			blocks: event === 'observation' ? Array.from({ length: 32 }, (_, x) => ({ blockId: 'minecraft:stone', x, y: 64, z: 0, largeDetail: 'x'.repeat(1000) })) : [] };
 		const input = JSON.parse(buildNativeEventInput({ goalRevision: 1, currentGoal: 'Mine safely.' }, { event, observation }).split('\n')[1]);
 		const projected = input.observation;
-		for (const field of ['damage', 'maxDamage', 'fingerprint', 'hotbar', 'maxStackSize']) assert.equal(projected.inventory.items[0][field], item[field]);
+		for (const field of ['maxDamage', 'fingerprint', 'hotbar', 'maxStackSize']) assert.equal(projected.inventory.items[0][field], item[field]);
+		assert.equal(projected.inventory.items[0].usesLeft, item.maxDamage - item.damage, 'wear reaches the model as usesLeft');
 		assert.deepEqual(projected.inventory.items[0].omittedFields, ['tooltip']);
 		for (const field of ['hostile', 'alive', 'health', 'bounds', 'velocity']) assert.deepEqual(projected.entities[0][field], entity[field]);
 		assert.deepEqual(projected.entities[0].omittedFields, ['customDetail']);

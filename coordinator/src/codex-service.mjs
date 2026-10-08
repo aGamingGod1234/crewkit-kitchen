@@ -4,6 +4,7 @@ import { parseDecision } from './decision-parser.mjs';
 import { ModelCatalogCache } from './model-catalog-cache.mjs';
 import { MAX_TOOL_RESULT_BYTES, MINECRAFT_DYNAMIC_TOOLS, NATIVE_AGENT_INSTRUCTIONS, normalizeMinecraftToolCall, toolResultContent } from './native-minecraft-tools.mjs';
 import { encodeModelFacts, encodeNativeEventInput, ModelObservationViews, presentHeardSounds } from './model-fact-encoding.mjs';
+import { presentToolWear } from './resource-facts.mjs';
 import { PLANNER_OUTPUT_SCHEMA, PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
 import { createSessionMetadata, profileFingerprint } from './provider-session.mjs';
 import { recordProviderTurn } from './provider-turn-recorder.mjs';
@@ -1062,7 +1063,7 @@ function boundedFactCandidate(value, depth = 0, budget = { nodes: 32_768 }) {
 
 export function presentNativeToolResult(value, tool, views = new ModelObservationViews()) {
 	// Raw sound packets duplicate the compact heard section when it is present.
-	value = presentHeardSounds(value);
+	value = presentToolWear(presentHeardSounds(value));
 	const originalText = JSON.stringify(value ?? null);
 	const tryPresentation = candidate => {
 		const prepared = views.prepare(candidate, tool);

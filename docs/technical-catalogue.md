@@ -306,3 +306,19 @@ Notes: these numbers come from replaying recorded play sessions offline, headles
 - **Solution:** Server sounds now reach the agent, and client-only ambient sounds such as lava popping are recreated using the client's own odds. The model gets direction and distance.
 - **Result:** (measured, headless server) an agent heard both lava pockets through one-block walls, in the right directions. A rescan costs 0.4 to 0.9 ms on the server. (observed, live play) a Sol agent located a hidden lava pool.
 - **Sources:** PR #48, the T3 thread "Add hearing to agent perception"
+
+## Branch claude/explore-resource (Oct 8, 2026, pull request pending)
+
+### Agents that walked past a shipwreck to strip mine
+*claude/explore-resource · Oct 8, 2026*
+- **Problem:** In a "beat the game" play-test, GPT-6.1 Sol saw a shipwreck, walked toward it and turned back to strip mine at Y 16; it ignored a cave next to spawn and left most of an iron vein. The agent only received individual block rows, so nothing in its view said "this is a shipwreck", "this is a cave" or "this vein is bigger than what you mined" (the trace shows 215 stone and 1 iron ore broken).
+- **Solution:** The server now recognises what a player recognises at a glance, using only blocks in the agent's line of sight: built blocks inside a generated structure piece become one structure row, dark roofed open space in view becomes a cave row, and visible ore is grouped into connected veins with a count of the visible blocks. A newly seen structure wakes the model once; going there stays the model's choice.
+- **Result:** (measured, headless Fabric server) a world-generated plains village was named from its edge and woke the model exactly once; an iron vein of 5 reported 3 visible blocks (2 were hidden); a dug 1x2 tunnel was not a cave and the cave beyond it was; a sunlit hillside overhang that first read as a cave was removed by requiring shade. Cost per wake (measured, token benchmark): +190 bytes for a typical cave and vein, +475 encoded bytes with every row filled.
+- **Sources:** branch claude/explore-resource, `play-session-3-trace.jsonl`
+
+### Was the strategy guide ever read?
+*claude/explore-resource · Oct 8, 2026*
+- **Problem:** The same play-test made 24 `capabilities` and 25 `taskPlan` calls, but the trace never logged arguments, so nobody could tell whether the model read the strategy guide that says caves and structures beat strip mining. The taskPlan pointer was a bare topic list, and the guide said nothing about carrying workstations (4 blocks placed, no crafting table or furnace ever broken), finishing worn tools (4 stone pickaxes crafted) or mining whole veins.
+- **Solution:** Each reference read now traces its section and topic, and each taskPlan result traces the topics it pointed at, with no content. The pointer says what the read is for ("Read capabilities strategy:resources before mining..."), the guide's resources topic gained a resourcefulness section, inventory rows show `usesLeft`, and placed workstations the agent walks away from are listed as `leftBehind`. The always-on instructions gained one line and stayed under 1,500 characters (1,489 to 1,497).
+- **Result:** The question is answerable from the next live trace; no behaviour change has been measured yet. (measured) tool wear made the raw event 246 bytes smaller on a 12-row inventory by dropping always-zero damage fields, at +98 encoded bytes for Codex.
+- **Sources:** branch claude/explore-resource, `play-session-3-trace.jsonl`

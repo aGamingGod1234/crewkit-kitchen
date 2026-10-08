@@ -68,6 +68,8 @@ public final class AttentionSignalPolicy {
 		addLavaChanges(facts, previous, current);
 		// Lava first heard (it stays remembered 30 s, so a pool's intermittent pops raise this once, not per pop).
 		if (heardLava(current) && !heardLava(previous)) facts.add("heard");
+		// A structure first seen (or seen again after a minute) is worth a look even mid-action; the model decides.
+		if (newStructureSighted(current)) facts.add("sighted");
 
 		boolean viewpointChanged = !Objects.equals(previous.get("position"), current.get("position"))
 				|| !Objects.equals(previous.get("view"), current.get("view"));
@@ -85,6 +87,15 @@ public final class AttentionSignalPolicy {
 
 	static void addNewSurvivalSignals(Set<String> facts, Set<String> before, Set<String> after) {
 		for (String signal : after) if (!before.contains(signal)) facts.add("survival." + signal);
+	}
+
+	static boolean newStructureSighted(JsonObject observation) {
+		JsonArray structures = array(object(observation, "sighted"), "structures");
+		if (structures == null) return false;
+		for (JsonElement value : structures) {
+			if (value.isJsonObject() && value.getAsJsonObject().has("new")) return true;
+		}
+		return false;
 	}
 
 	static Set<String> survivalSignals(JsonObject observation) {

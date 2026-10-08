@@ -58,5 +58,11 @@ export function strategyHints({ goal = null, plan = null } = {}) {
 	const text = texts.join('\n');
 	const topics = HINT_RULES.filter(([, pattern]) => pattern.test(text)).map(([topic]) => topic);
 	if (topics.length === 0) return null;
-	return { topics, read: { tool: 'capabilities', arguments: { section: 'strategy', topic: topics[0] } } };
+	return { topics, read: { tool: 'capabilities', arguments: { section: 'strategy', topic: topics[0] } }, advice: STRATEGY_ADVICE[topics[0]] ?? `Read capabilities strategy:${topics[0]} before this step.` };
 }
+
+// A bare topic list was easy to skip: say what the read is for, in one line.
+const STRATEGY_ADVICE = Object.freeze({
+	resources: 'Read capabilities strategy:resources before mining: visible caves, structures and whole ore veins usually beat strip mining.',
+	structures: 'Read capabilities strategy:structures: looting a visible structure usually beats mining the same materials.',
+});

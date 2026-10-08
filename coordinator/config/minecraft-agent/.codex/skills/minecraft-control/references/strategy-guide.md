@@ -31,6 +31,13 @@ Deep warning: below about Y -54 underground lakes and aquifers are lava, not wat
 
 Typical early amounts: iron pickaxe 3, bucket 3, shield 1, flint and steel 1, full iron armor 24. Diamond pickaxe 3 diamonds.
 
+Resourcefulness, each saving a trip or a craft:
+
+- **Look before you dig.** Observation `sighted.caves` lists dark open spaces in view and `sighted.structures` lists structures you can see. A cave usually shows more ore in minutes than a strip mine in an hour; a structure's chests may skip the mining entirely (topic structures).
+- **Mine the whole vein.** Ore generates in clusters. `sighted.veins` counts the visible connected ore of one kind; mine all of it and check the blocks around each mined ore, since veins continue out of sight.
+- **Take workstations with you.** A placed crafting table drops itself when broken (an axe is fastest); a furnace needs a pickaxe. `leftBehind` lists workstations you placed and walked away from. One carried table and furnace replace a new craft at every stop.
+- **Use the most worn tool first.** Inventory rows show `usesLeft`. Finish the most worn tool of a kind before starting a fresh one; a spare matters only when the current one is nearly gone, and one spare is usually enough.
+
 ## Structures and loot
 
 | Structure | Where | Useful for |
