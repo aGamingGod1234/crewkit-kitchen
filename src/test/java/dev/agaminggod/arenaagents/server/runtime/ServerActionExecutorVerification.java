@@ -340,7 +340,8 @@ public final class ServerActionExecutorVerification {
 		verifyModelOnlyControlBoundary();
 		return 122 + dev.agaminggod.arenaagents.protocol.PlayerActionSchemaVerification.verify()
 				+ dev.agaminggod.arenaagents.server.perception.PlayerKnowledgeInspectionVerification.verify()
-				+ verifyInteractionOutlineHit() + verifyMultipartHitTies() + verifyAimGate() + verifyControlLookEasing();
+				+ verifyInteractionOutlineHit() + verifyMultipartHitTies() + verifyAimGate() + verifyControlLookEasing()
+				+ verifyControlTurnsBeforeMoving() + verifySequenceFramesActOnceAimed();
 	}
 
 	/**
@@ -377,6 +378,87 @@ public final class ServerActionExecutorVerification {
 				"a small turn across the wrap lands in one tick");
 		assertTrue(ServerActionExecutor.MAX_CONTROL_TURN_TICKS > ticks, "the turn guard leaves room for a full half turn");
 		return 8;
+	}
+
+	/**
+	 * Review finding: control({forward:1, yaw:<opposite>, ticks}) held forward against the half-turned view, walking
+	 * toward the danger for 2-3 ticks, and the turn added its ticks of movement on top of the frame's. Now the view turns
+	 * first with no movement keys (sneak kept), and movement lasts exactly the frame's ticks in the frame's direction.
+	 */
+	private static int verifyControlTurnsBeforeMoving() {
+		int frameTicks = 10;
+		AgentInputState flee = new AgentInputState(1.0F, 0.0F, false, true, true, false, false,
+				180.0F, 0.0F, 2, InteractionHand.MAIN_HAND);
+		float yaw = 0.0F;
+		float pitch = 0.0F;
+		int turnTicks = 0;
+		int movingTicks = 0;
+		int counted = 0;
+		boolean settled = false;
+		for (int tick = 0; counted < frameTicks && tick < 60; tick++) {
+			ServerActionExecutor.ControlTick control = ServerActionExecutor.controlTick(yaw, pitch, flee, settled, turnTicks);
+			AgentInputState input = control.input();
+			if (input.forward() != 0.0F) {
+				movingTicks++;
+				assertEquals(180.0F, input.yaw(), "movement is only ever held facing the frame's own yaw");
+			} else {
+				assertTrue(input.sneak() && !input.jump() && !input.sprint() && input.selectedSlot() == 2,
+						"turning keeps sneak and the slot but holds no movement");
+			}
+			if (control.counts()) { settled = true; counted++; } else turnTicks++;
+			yaw = input.yaw();
+			pitch = input.pitch();
+		}
+		assertEquals(frameTicks, movingTicks, "movement lasts exactly the frame's ticks, not ticks plus the turn");
+		assertTrue(turnTicks >= 4 && turnTicks <= 7, "a half turn takes 4-7 ticks first, took " + turnTicks);
+		ServerActionExecutor.ControlTick instant = ServerActionExecutor.controlTick(0.0F, 0.0F, flee, true, 0);
+		assertTrue(instant.counts() && instant.input().equals(flee), "instantLook applies the frame at once");
+		return 4;
+	}
+
+	/**
+	 * Review finding: control_sequence kept attack/use pressed while turning and counted the turn against the frame,
+	 * so a pillar frame {pitch:90, jump, use, ticks:1} placed at about pitch 30. Each frame now acts once aimed.
+	 */
+	private static int verifySequenceFramesActOnceAimed() {
+		AgentInputState walk = new AgentInputState(1.0F, 0.0F, false, false, false, false, false, 0.0F, 0.0F, 0, InteractionHand.MAIN_HAND);
+		AgentInputState pillar = new AgentInputState(0.0F, 0.0F, true, false, false, false, true, 0.0F, 90.0F, 0, InteractionHand.MAIN_HAND);
+		AgentInputState swing = new AgentInputState(0.0F, 0.0F, false, false, false, true, false, 120.0F, 10.0F, 0, InteractionHand.MAIN_HAND);
+		dev.agaminggod.arenaagents.server.runtime.input.ControlSequence sequence = new dev.agaminggod.arenaagents.server.runtime.input.ControlSequence(
+				java.util.List.of(new dev.agaminggod.arenaagents.server.runtime.input.ControlSequence.Frame(walk, 3, java.util.List.of(), false),
+						new dev.agaminggod.arenaagents.server.runtime.input.ControlSequence.Frame(pillar, 1, java.util.List.of(), false),
+						new dev.agaminggod.arenaagents.server.runtime.input.ControlSequence.Frame(swing, 2, java.util.List.of(), false)), 6);
+		dev.agaminggod.arenaagents.server.runtime.input.ControlSequence.Facts facts =
+				new dev.agaminggod.arenaagents.server.runtime.input.ControlSequence.Facts(20, 20, 300, false, false, true, false, false, false);
+		float yaw = 0.0F;
+		float pitch = 0.0F;
+		int uses = 0;
+		int attacks = 0;
+		int forwardTicks = 0;
+		int turnTicks = 0;
+		int frame = -1;
+		dev.agaminggod.arenaagents.server.runtime.input.ControlSequence.Step step;
+		for (int tick = 0; tick < 80; tick++) {
+			step = sequence.next(facts);
+			if (step.status() != dev.agaminggod.arenaagents.server.runtime.input.ControlSequence.Status.RUNNING) {
+				assertEquals(dev.agaminggod.arenaagents.server.runtime.input.ControlSequence.Status.COMPLETED, step.status(),
+						"turning never eats the sequence budget the frames were sized for");
+				break;
+			}
+			if (step.frameIndex() != frame) { frame = step.frameIndex(); turnTicks = 0; }
+			ServerActionExecutor.ControlTick control = ServerActionExecutor.controlTick(yaw, pitch, step.input(), false, turnTicks);
+			if (!control.counts()) { sequence.refundTick(); turnTicks++; }
+			AgentInputState input = control.input();
+			if (input.use()) { uses++; assertEquals(90.0F, input.pitch(), "the pillar frame places looking straight down"); }
+			if (input.attack()) { attacks++; assertEquals(120.0F, input.yaw(), "the swing lands where the frame aimed"); }
+			if (input.forward() != 0.0F) forwardTicks++;
+			yaw = input.yaw();
+			pitch = input.pitch();
+		}
+		assertEquals(1, uses, "the 1-tick pillar frame uses once, after its turn");
+		assertEquals(2, attacks, "the 2-tick swing frame attacks for both its ticks, once aimed");
+		assertEquals(3, forwardTicks, "the walk frame walks for its 3 ticks");
+		return 6;
 	}
 
 	/** Placement and table opening wait until the real view has turned onto the target and settled. */
@@ -771,6 +853,35 @@ public final class ServerActionExecutorVerification {
 		if (started.cancelAction()) executor.cancel(agent.agentId(), "Lifecycle changed to " + started.after().state());
 		assertTrue(executor.activeRequest(agent.agentId()) == null && results.size() == 3,
 				"the started goal does not inherit the detached action");
+
+		// Review finding: a cancel during the 3-tick linger after a menu move reported ACTION_CANCELLED although the
+		// items had moved, so a model could repeat the move. The committed work is the result.
+		try {
+			Class<?> actionClass = Class.forName(ServerActionExecutor.class.getName() + "$ActiveAction");
+			var factory = actionClass.getDeclaredMethod("transaction", ServerActionRequest.class,
+					net.minecraft.server.level.ServerPlayer.class, ServerTransactionAdapter.ActiveTransaction.class);
+			factory.setAccessible(true);
+			AtomicInteger cancels = new AtomicInteger();
+			Object action = factory.invoke(null, request.apply(results.size()), null, new ServerTransactionAdapter.ActiveTransaction() {
+				@Override public ServerTransactionAdapter.TickResult tick(long nowEpochMs) { return ServerTransactionAdapter.TickResult.running(); }
+				@Override public void cancel(String reason) { cancels.incrementAndGet(); }
+				@Override public void cleanup() { }
+				@Override public ServerTransactionAdapter.TickResult committedResult() {
+					return ServerTransactionAdapter.TickResult.succeeded("MENU_TRANSFER_CONFIRMED", "Moved 16 minecraft:coal into the furnace");
+				}
+			});
+			Field executionStarted = actionClass.getDeclaredField("executionStarted");
+			executionStarted.setAccessible(true);
+			executionStarted.setBoolean(action, true);
+			Field activeField = ServerActionExecutor.class.getDeclaredField("active");
+			activeField.setAccessible(true);
+			((Map<AgentId, Object>) activeField.get(executor)).put(agent.agentId(), action);
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("could not install a lingering transaction", exception);
+		}
+		executor.cancel(agent.agentId(), "operator stop");
+		assertEquals(ServerActionState.SUCCEEDED, results.getLast().state(), "a cancel in the linger reports the committed move");
+		assertEquals("MENU_TRANSFER_CONFIRMED", results.getLast().reasonCode(), "with the move's own reason, not ACTION_CANCELLED");
 	}
 
 	private static CodexAgentManager uninitializedManager() {

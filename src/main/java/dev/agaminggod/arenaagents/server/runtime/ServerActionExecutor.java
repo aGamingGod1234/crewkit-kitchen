@@ -512,8 +512,12 @@ public final class ServerActionExecutor {
 			finish(action, pending.pending());
 			return true;
 		}
-		ServerActionResult result = action.result(
-				ServerActionState.CANCELLED, "ACTION_CANCELLED", cancellationReason, System.currentTimeMillis());
+		// A menu move or craft that already committed (its 3-tick linger) reports that work, not a cancel, so the
+		// model never repeats a move whose items already went across.
+		ServerTransactionAdapter.TickResult committed = action.committedTransactionResult();
+		ServerActionResult result = committed != null
+				? action.result(ServerActionState.SUCCEEDED, committed.reasonCode(), committed.message(), System.currentTimeMillis())
+				: action.result(ServerActionState.CANCELLED, "ACTION_CANCELLED", cancellationReason, System.currentTimeMillis());
 		try {
 			action.cancel(cancellationReason);
 		} catch (RuntimeException teardownFailure) {
@@ -1781,6 +1785,9 @@ public final class ServerActionExecutor {
 		private boolean instantLook;
 		private boolean controlLookSettled;
 		private int controlTurnTicks;
+		private int sequenceTurnFrame = -1;
+		private int sequenceTurnTicks;
+		private int sequenceTotalTurnTicks;
 		private int breakAimTicks;
 		private ControlSequence controlSequence;
 		private InteractionHand useHand;
@@ -2438,6 +2445,13 @@ public final class ServerActionExecutor {
 					+ ", itemCount=" + inventoryItemCount(player, placementItemId);
 		}
 
+		/** The irreversible success of a started transaction still lingering, else null. */
+		ServerTransactionAdapter.TickResult committedTransactionResult() {
+			if (mode != Mode.TRANSACTION || !executionStarted || transaction == null) return null;
+			ServerTransactionAdapter.TickResult committed = transaction.committedResult();
+			return committed != null && committed.state() == ServerTransactionAdapter.TickState.SUCCEEDED ? committed : null;
+		}
+
 		void cancel(String reason) {
 			ServerTransactionAdapter.runBestEffort(
 					() -> { if (transaction != null) transaction.cancel(reason); },
@@ -2478,12 +2492,14 @@ public final class ServerActionExecutor {
 
 		/**
 		 * Holds the view while the crosshair is on the block, else takes one player-speed step toward its center;
-		 * the attack key is held only once mining has begun.
+		 * the attack key is held only once mining has begun and only while the crosshair is on the block, so a
+		 * re-aim never mines whatever the crosshair crosses on the way.
 		 */
 		private void applyBreakInput(boolean attack) {
 			float yaw = player.getYRot();
 			float pitch = player.getXRot();
-			if (!crosshairOn(block)) {
+			boolean onTarget = crosshairOn(block);
+			if (!onTarget) {
 				AgentInputState desired = AgentInputStates.lookingAt(
 						player, Vec3.atCenterOf(block), 0.0F, 0.0F, false, false, false, false, false, InteractionHand.MAIN_HAND);
 				yaw = AgentInputStates.turnYaw(yaw, desired.yaw());
@@ -2491,7 +2507,7 @@ public final class ServerActionExecutor {
 			}
 			LeasedServerInputController input = AgentInputRuntime.controller(player);
 			if (inputLease == null) inputLease = input.acquire(request.agentId(), InputOwner.INTERACTION, 300);
-			input.apply(inputLease, new AgentInputState(0.0F, 0.0F, false, false, false, attack, false,
+			input.apply(inputLease, new AgentInputState(0.0F, 0.0F, false, false, false, attack && onTarget, false,
 					yaw, pitch, player.getInventory().getSelectedSlot(), InteractionHand.MAIN_HAND));
 		}
 
@@ -2567,8 +2583,23 @@ public final class ServerActionExecutor {
 			lastProgress = (double) step.elapsedTicks() / step.maxTicks();
 			if (step.status() == ControlSequence.Status.RUNNING) {
 				physicalAttempted = true;
-				// Sequences keep the model's frame timing; only the view moves at player speed toward each frame.
-				controlState = step.instantLook() ? step.input() : easedLook(step.input(), true);
+				if (step.frameIndex() != sequenceTurnFrame) {
+					sequenceTurnFrame = step.frameIndex();
+					sequenceTurnTicks = 0;
+				}
+				// The view turns onto each frame's look at player speed first; those ticks hold no movement or clicks
+				// and do not count against the frame, so a pillar or attack frame acts only once it is aimed. Turning is
+				// bounded per frame and, in total, by the sequence budget.
+				ControlTick control = controlTick(player.getYRot(), player.getXRot(), step.input(), step.instantLook(),
+						sequenceTotalTurnTicks >= step.maxTicks() ? MAX_CONTROL_TURN_TICKS : sequenceTurnTicks);
+				if (control.counts()) {
+					sequenceTurnTicks = 0;
+				} else {
+					controlSequence.refundTick();
+					sequenceTurnTicks++;
+					sequenceTotalTurnTicks++;
+				}
+				controlState = control.input();
 				applyControlInput();
 				return null;
 			}
@@ -2597,31 +2628,17 @@ public final class ServerActionExecutor {
 
 		/**
 		 * Applies the control frame. Unless the model asked for an instant look, the view first turns toward the
-		 * frame's yaw and pitch at player speed with the movement keys already held; attack and use wait until the
-		 * view arrives, so a click lands where the model aimed.
+		 * frame's yaw and pitch at player speed (see {@link #controlTick}); movement and clicks start once it arrives,
+		 * so the frame moves in the direction the model chose for exactly its ticks and a click lands where it aimed.
 		 */
 		private void applyControlFrame() {
-			if (instantLook || controlLookSettled) {
-				controlLookSettled = true;
-				applyControlInput();
-				return;
-			}
-			AgentInputState turning = easedLook(controlState, false);
-			if (turning.yaw() == controlState.yaw() && turning.pitch() == controlState.pitch()
-					|| controlTurnTicks >= MAX_CONTROL_TURN_TICKS) {
-				controlLookSettled = true;
-				applyControlInput();
-				return;
-			}
-			controlTurnTicks++;
+			ControlTick control = controlTick(player.getYRot(), player.getXRot(), controlState, instantLook || controlLookSettled,
+					controlTurnTicks);
+			if (control.counts()) controlLookSettled = true;
+			else controlTurnTicks++;
 			LeasedServerInputController input = AgentInputRuntime.controller(player);
 			if (inputLease == null) inputLease = input.acquire(request.agentId(), InputOwner.DIRECT_CONTROL, 250);
-			input.apply(inputLease, turning);
-		}
-
-		/** One player-speed view step from the current look toward {@code frame}'s look; ends exactly on it. */
-		private AgentInputState easedLook(AgentInputState frame, boolean keepClicks) {
-			return easedControlLook(player.getYRot(), player.getXRot(), frame, keepClicks);
+			input.apply(inputLease, control.input());
 		}
 
 		private void applyControlInput() {
@@ -2657,6 +2674,27 @@ public final class ServerActionExecutor {
 				lastObservation
 			);
 		}
+	}
+
+	/** The input for one tick of a control frame, and whether that tick counts as one of the frame's ticks. */
+	record ControlTick(AgentInputState input, boolean counts) {
+	}
+
+	/**
+	 * One tick of a control frame from the current view. With an instant look, once the look arrives this tick, or after
+	 * {@code turnTicks} reaches {@link #MAX_CONTROL_TURN_TICKS}, the frame's full input applies and the tick counts.
+	 * Before that the view eases toward the frame's look with movement, jump, sprint and clicks released (sneak and the
+	 * hotbar slot kept, so an edge stays guarded): keys held against a half-turned view would walk the wrong way, so the
+	 * agent turns and then walks, as a player does. Turning ticks do not count, so movement lasts exactly the frame's ticks.
+	 */
+	static ControlTick controlTick(float yaw, float pitch, AgentInputState frame, boolean instantLook, int turnTicks) {
+		if (instantLook) return new ControlTick(frame, true);
+		AgentInputState eased = easedControlLook(yaw, pitch, frame, true);
+		if (eased.yaw() == frame.yaw() && eased.pitch() == frame.pitch() || turnTicks >= MAX_CONTROL_TURN_TICKS) {
+			return new ControlTick(frame, true);
+		}
+		return new ControlTick(new AgentInputState(0.0F, 0.0F, false, frame.sneak(), false, false, false,
+				eased.yaw(), eased.pitch(), frame.selectedSlot(), frame.hand()), false);
 	}
 
 	/**

@@ -15,6 +15,11 @@ public interface ServerTransactionAdapter {
 		void cancel(String reason);
 
 		void cleanup();
+
+		/** A success that is already irreversible (items moved, a craft taken) while the transaction lingers, else null. */
+		default TickResult committedResult() {
+			return null;
+		}
 	}
 
 	enum TickState {
