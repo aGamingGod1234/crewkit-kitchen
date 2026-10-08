@@ -312,6 +312,7 @@ public final class ServerActionExecutor {
 
 	public synchronized void tick() {
 		long now = System.currentTimeMillis();
+		long serverTick = manager.server() == null ? 0L : manager.server().getTickCount();
 		retryPendingPublications();
 		List<ActiveAction> actions = new ArrayList<>(active.values());
 		try (ServerPathPlanner.TickScope ignored = ServerPathPlanner.beginServerTick()) {
@@ -332,6 +333,7 @@ public final class ServerActionExecutor {
 					continue;
 				}
 				ServerActionResult result;
+				action.serverTick = serverTick;
 				try {
 					result = action.tick(now);
 				} catch (RuntimeException exception) {
@@ -1787,6 +1789,10 @@ public final class ServerActionExecutor {
 		private ServerActionObservation lastObservation;
 		private boolean executionStarted;
 		private boolean physicalAttempted;
+		private final long acceptedAtEpochMs = System.currentTimeMillis();
+		private long startedAtEpochMs;
+		private long startedTick;
+		private long serverTick;
 		private double lastProgress;
 		private InputLease inputLease;
 		private AgentInputState controlState;
@@ -2020,6 +2026,8 @@ public final class ServerActionExecutor {
 			long elapsed = elapsedTime.advance(now);
 			if (!executionStarted) {
 				executionStarted = true;
+				startedAtEpochMs = now;
+				startedTick = serverTick;
 				switch (mode) {
 					case IMMEDIATE -> {
 						physicalAttempted = true;
@@ -2696,6 +2704,8 @@ public final class ServerActionExecutor {
 		}
 
 		ServerActionResult result(ServerActionState state, String reasonCode, String message, long now) {
+			ActionTimelines.remember(request.agentId(), request.actionId(),
+					new ActionTimelines.Timeline(acceptedAtEpochMs, startedAtEpochMs, startedTick, serverTick));
 			return new ServerActionResult(
 					request.agentId(),
 					request.goalRevision(),

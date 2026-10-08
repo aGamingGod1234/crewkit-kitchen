@@ -222,6 +222,16 @@ public final class ServerActionExecutorVerification {
 		invalidHand.addProperty("hand", "left");
 		assertThrows(AgentDomainException.class, () -> ServerActionExecutor.hand(invalidHand),
 				"raw control rejects an unknown hand value");
+		assertTrue(ActionTimelines.recall(progressAgent, "action-timeline-0") == null, "an action that never ran has no timeline");
+		ActionTimelines.remember(progressAgent, "action-timeline-0", new ActionTimelines.Timeline(10L, 20L, 3L, 5L));
+		assertEquals(new ActionTimelines.Timeline(10L, 20L, 3L, 5L), ActionTimelines.recall(progressAgent, "action-timeline-0"),
+				"a finished action's accept, start and end clocks are recalled for its result payload");
+		for (int index = 1; index <= 300; index++) {
+			ActionTimelines.remember(progressAgent, "action-timeline-" + index, new ActionTimelines.Timeline(index, index, index, index));
+		}
+		assertTrue(ActionTimelines.recall(progressAgent, "action-timeline-0") == null, "old timelines are evicted so the table stays bounded");
+		assertEquals(new ActionTimelines.Timeline(300L, 300L, 300L, 300L), ActionTimelines.recall(progressAgent, "action-timeline-300"),
+				"recent timelines are kept");
 		ServerActionProgress progress = new ServerActionProgress(
 				progressAgent, 7L, "action-7", ActionType.NAVIGATE_TO, 0.5D, 250L, 1_750_000_000_250L
 		);

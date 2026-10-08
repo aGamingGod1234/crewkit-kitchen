@@ -1070,6 +1070,36 @@ test('native memory operations share the program helper contract and model prove
 	assert.equal(calls[0].operation.provenance.callId, 'call-new');
 });
 
+test('the dispatch chain is traced per call: journal, bridge send and the Java accept, start and end clocks', async () => {
+	const traces = [];
+	const sent = [];
+	const runtime = new NativeToolRuntime({
+		bridge: { send: async (...args) => { await new Promise((resolve) => setTimeout(resolve, 5)); sent.push(args); } },
+		trace: (event, fields) => traces.push([event, fields]),
+		notebook: { writeNote: async () => {}, query: async () => ({}), recordReceipt: async () => {}, recordDispatch: async () => { await new Promise((resolve) => setTimeout(resolve, 5)); }, recordUnknown: async () => {} },
+	});
+	runtime.updateObservation(record(), { world: { worldId: 'world-a' } }, { eventSequence: 1 });
+	const pending = runtime.execute(nativeCall({ kind: 'action', actionType: 'wait', arguments: { durationMs: 1 } }), record());
+	await new Promise((resolve) => setTimeout(resolve, 30));
+	const actionId = sent[0][2].actionId;
+	assert.equal(runtime.onActionProgress(record(), { actionId, progress: 0.5, elapsedMs: 40, serverTick: 4_012 }), true);
+	const timing = { acceptedAtEpochMs: 1_760_000_000_010, startedAtEpochMs: 1_760_000_000_050, startedTick: 4_001, endedTick: 4_020 };
+	assert.equal(runtime.onActionResult(record(), { actionId, goalRevision: 3, state: 'SUCCEEDED', reasonCode: 'DONE', elapsedMs: 900, observedAtEpochMs: 1_760_000_000_950, timing }), true);
+	const modelResult = await pending;
+	assert.equal(modelResult.state, 'SUCCEEDED');
+	assert.equal(Object.keys(modelResult).some((key) => key.startsWith('java') || key === 'timing'), false, 'the model never sees the latency clocks');
+	const by = (event) => traces.find(([name]) => name === event)[1];
+	for (const event of ['native_tool_dispatch_started', 'native_tool_journal_written', 'native_tool_command_sent']) assert.equal(by(event).callId, 'call-new', event);
+	assert.ok(by('native_tool_journal_written').journalMs >= 0);
+	assert.ok(by('native_tool_command_sent').sendMs >= 0 && by('native_tool_command_sent').dispatchMs >= by('native_tool_command_sent').sendMs);
+	assert.equal(by('native_tool_action_progress').serverTick, 4_012);
+	const completed = by('native_tool_action_completed');
+	assert.deepEqual(
+		[completed.javaElapsedMs, completed.javaEndedAtEpochMs, completed.javaAcceptedAtEpochMs, completed.javaStartedAtEpochMs, completed.javaStartedTick, completed.javaEndedTick],
+		[900, 1_760_000_000_950, 1_760_000_000_010, 1_760_000_000_050, 4_001, 4_020],
+	);
+});
+
 test('durable preparation fences dispatch and exact cancellation prevents a later send', async () => {
 	let release;
 	const sent = [];

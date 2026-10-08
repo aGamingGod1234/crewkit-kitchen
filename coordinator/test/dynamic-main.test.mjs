@@ -728,6 +728,48 @@ test('native completed agent messages reject ArenaScript program identities', as
 	}
 });
 
+test('the latency chain marks event ready and input built, and provider stage events reach the trace but never the chat', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestPlan = async () => assert.fail('native control must not use ArenaScript planning');
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		request.onVerbose('provider_event', JSON.stringify({ event: 'native_provider_turn_sent', turnId: '1:1' }));
+		request.onVerbose('provider_event', JSON.stringify({ event: 'not_a_provider_stage', turnId: '1:1' }));
+		request.onVerbose('provider_event', 'not json');
+		return { status: 'completed', toolCalls: 0 };
+	};
+	const traces = [];
+	const run = await start({
+		registry,
+		planner,
+		traceWriter: { write: (event, fields) => { traces.push({ event, ...fields }); } },
+		config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } } },
+	});
+	try {
+		run.bridge.emit('verbose_control', { agentId: 'server', payload: { enabled: true } });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => planner.requests.length === 1);
+		await eventually(() => traces.some((trace) => trace.event === 'native_turn_completed'));
+		const ready = traces.find((trace) => trace.event === 'native_event_ready');
+		const built = traces.find((trace) => trace.event === 'native_input_built');
+		const sent = traces.find((trace) => trace.event === 'native_provider_turn_sent');
+		assert.equal(ready.mode, 'turn');
+		assert.equal(ready.eventName, 'observation');
+		assert.equal(ready.agentId, 'agent-a');
+		assert.equal(built.traceId, ready.traceId);
+		assert.ok(built.inputBytes > 0 && built.buildMs >= 0);
+		assert.equal(sent.agentId, 'agent-a');
+		assert.equal(sent.turnId, '1:1');
+		assert.equal(traces.some((trace) => trace.event === 'not_a_provider_stage'), false);
+		assert.ok(traces.indexOf(ready) < traces.indexOf(built) && traces.indexOf(built) < traces.indexOf(sent));
+		assert.equal(run.bridge.sent.some(({ type, payload }) => type === 'verbose_event' && payload.stage === 'provider_event'), false);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
 test('verbose raw cap never publishes a partial identifier after whitespace normalization', async () => {
 	const probes = [
 		`Safe ${' '.repeat(995)}00000000-0000-0000-0000-000000000000`,

@@ -752,6 +752,7 @@ export class SharedCodexAgent {
 			const encodedInput = pendingCarryOver === null ? encodedEvent : `${pendingCarryOver}\n\n${encodedEvent}`;
 			if (!prewarm) { this.#pendingCarryOver = null; carryOver.noteEvent(input); }
 			collector.recordInput('turn/start', encodedInput);
+			if (!prewarm) collector.providerEvent('native_provider_turn_sent', { inputBytes: Buffer.byteLength(encodedInput, 'utf8') });
 			const turnStartPromise = this.#transport.request('turn/start', {
 				threadId: this.#threadId,
 				input: [{ type: 'text', text: encodedInput }],
@@ -774,6 +775,7 @@ export class SharedCodexAgent {
 			}, () => {});
 			const response = await withTimeout(Promise.race([turnStartPromise, lifecyclePromise, collector.promise]), this.#planningTimeoutMs, this.#schedule, this.#cancelSchedule);
 			active.turnId = requireNestedId(response, 'turn', 'turn/start');
+			if (!prewarm) collector.providerEvent('native_provider_turn_acked', { turnId: active.turnId });
 			this.#recordEffectiveSettings(response);
 			collector.setTurnId(active.turnId);
 			if (this.#active !== active || this.#goalRevision !== goalRevision || lifecycleSettled || signal?.aborted) {
@@ -878,6 +880,7 @@ export class SharedCodexAgent {
 		const encodedInput = encodeNativeEventInput(input, this.#observationViews);
 		const submitSteer = () => {
 			active.collector.recordInput('turn/steer', encodedInput);
+			active.collector.providerEvent('native_provider_steer_sent', { turnId });
 			return this.#transport.request('turn/steer', {
 				threadId: this.#threadId, expectedTurnId: turnId,
 				input: [{ type: 'text', text: encodedInput }],
@@ -895,6 +898,7 @@ export class SharedCodexAgent {
 		try {
 			const response = await steerPromise;
 			if (response?.turnId !== turnId) throw new CodexProtocolError('INVALID_TURN_STEER', 'turn/steer response did not preserve the active turn');
+			active.collector.providerEvent('native_provider_steer_acked', { turnId });
 			// Steered DMs, decisions and danger summaries are part of what a fresh thread must not lose.
 			this.#carryOver.noteEvent(input);
 			if (executeTool !== null) active.prewarm = false;
@@ -1342,6 +1346,8 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 		snapshot,
 		recordInput(method, input) { inputs.push({ method, input }); inputBytes += Buffer.byteLength(input, 'utf8'); },
 		replaceOnVerbose(next) { onVerbose = next; },
+		/** Stage timestamp for the latency trace, delivered through whichever verbose callback currently owns the turn. */
+		providerEvent(event, fields) { safeVerbose(onVerbose, 'provider_event', JSON.stringify({ event, ...fields })); },
 		replaceExecuteTool(next) {
 			if (typeof next !== 'function') throw new TypeError('native tool executor must be a function');
 			const previous = toolExecutor;

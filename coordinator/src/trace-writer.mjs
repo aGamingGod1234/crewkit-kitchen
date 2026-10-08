@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import { types as nodeTypes } from 'node:util';
 import { appendFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
@@ -20,7 +21,12 @@ const MAX_TRACE_BYTES = 262_144;
 // The JSONL newline consumes one byte, so the serialized object reserves it.
 const MAX_TRACE_ROW_BYTES = MAX_TRACE_BYTES - 1;
 
-/** Append-only bounded traces. Public rows never contain source text or credentials. */
+/**
+ * Append-only bounded traces. Public rows never contain source text or credentials.
+ * Every row is stamped with `at` (epoch ms, comparable with Java-side timestamps) and `mono` (monotonic ms,
+ * 0.1 ms resolution, for exact durations inside one coordinator process) when it is written, so stage latency can be
+ * rebuilt from the file. A caller-supplied `at` or `mono` is kept.
+ */
 export class TraceWriter {
 	#filePath;
 	#diagnosticFilePath;
@@ -31,10 +37,12 @@ export class TraceWriter {
 	#queue;
 	#closed = false;
 	#closePromise = null;
+	#clock;
 
 	constructor(filePath, dependencies = {}) {
 		if (typeof filePath !== 'string' || filePath.trim().length === 0) throw new TypeError('trace file path must be nonblank');
 		this.#filePath = path.resolve(filePath);
+		this.#clock = { epochNow: dependencies.epochNow ?? Date.now, monotonicNow: dependencies.monotonicNow ?? (() => performance.now()) };
 		const privatePath = dependencies.diagnosticFilePath ?? dependencies.privateFilePath ?? null;
 		if (privatePath !== null && (typeof privatePath !== 'string' || privatePath.trim().length === 0)) throw new TypeError('diagnostic trace file path must be nonblank');
 		this.#diagnosticFilePath = privatePath === null ? null : path.resolve(privatePath);
@@ -75,8 +83,8 @@ export class TraceWriter {
 	write(eventOrRow, fields = {}) {
 		if (this.#closed) return Promise.resolve();
 		try {
-			const row = normalizeRow(eventOrRow, fields);
-			this.#enqueue(this.#filePath, publicTraceRow(row));
+			const stamped = stamp(this.#clock);
+			this.#enqueue(this.#filePath, publicTraceRow(normalizeRow(eventOrRow, fields), stamped));
 		} catch { /* invalid diagnostics are dropped at this boundary */ }
 		return Promise.resolve();
 	}
@@ -86,8 +94,8 @@ export class TraceWriter {
 		if (this.#closed) return Promise.resolve();
 		if (this.#diagnosticFilePath === null) return Promise.resolve();
 		try {
-			const row = normalizeRow(eventOrRow, fields);
-			this.#enqueue(this.#diagnosticFilePath, privateTraceRow(row));
+			const stamped = stamp(this.#clock);
+			this.#enqueue(this.#diagnosticFilePath, privateTraceRow(normalizeRow(eventOrRow, fields), stamped));
 		} catch { /* invalid diagnostics are dropped at this boundary */ }
 		return Promise.resolve();
 	}
@@ -132,6 +140,18 @@ function normalizeRow(eventOrRow, fields) {
 	return ownData(eventOrRow);
 }
 
+function stamp(clock) {
+	return { at: clock.epochNow(), mono: Math.round(clock.monotonicNow() * 10) / 10 };
+}
+
+/** Adds the timestamps to an already sanitized row (they need no redaction); caller-supplied values are kept. */
+function stampSanitizedRow(row, stamped) {
+	if (row === null || typeof row !== 'object' || Array.isArray(row)) return row;
+	if (row.at === undefined) row.at = stamped.at;
+	if (row.mono === undefined) row.mono = stamped.mono;
+	return row;
+}
+
 function ownData(value) {
 	if (nodeTypes.isProxy(value)) return Object.assign(Object.create(null), { event: UNSAFE });
 	const result = Object.create(null);
@@ -148,10 +168,10 @@ function ownData(value) {
 	return result;
 }
 
-function publicTraceRow(row) {
+function publicTraceRow(row, stamped) {
 	const source = ownData(row).source;
 	const sourceHash = typeof source === 'string' ? `sha256:${hashSource(source)}` : null;
-	const result = sanitizeValue(row, context(false, true));
+	const result = stampSanitizedRow(sanitizeValue(row, context(false, true)), stamped);
 	if (result && typeof result === 'object' && !Array.isArray(result)) {
 		delete result.source;
 		if (sourceHash !== null) result.sourceHash = sourceHash;
@@ -159,10 +179,10 @@ function publicTraceRow(row) {
 	return boundSerializedRow(result);
 }
 
-function privateTraceRow(row) {
+function privateTraceRow(row, stamped) {
 	const source = ownData(row).source;
 	const sourceHash = typeof source === 'string' ? `sha256:${hashSource(source)}` : null;
-	const result = sanitizeValue(row, context(true, true));
+	const result = stampSanitizedRow(sanitizeValue(row, context(true, true)), stamped);
 	if (result && typeof result === 'object' && !Array.isArray(result) && sourceHash !== null) result.sourceHash = sourceHash;
 	return boundSerializedRow(result);
 }

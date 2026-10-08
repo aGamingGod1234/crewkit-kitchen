@@ -32,6 +32,35 @@ test('native request timing includes collector arrival and reports execution que
 	assert.equal(rows.find(row => row.event === 'native_tool_queue_timing').fields.arrivalObserved, true);
 });
 
+test('the turn chain is timed end to end: admitted, provider start, tool request, result returned, and provider stage events pass through intact', async () => {
+	let clock = 0;
+	const record = nativeRecord('model-a');
+	const rows = [];
+	const verbose = [];
+	const agent = {
+		executionSettings: createExecutionSettings(record, { transport: 'test', controlProtocol: 'native_tools' }),
+		async setGoalRevision() {},
+		async act(_input, options) {
+			options.onVerbose('provider_event', JSON.stringify({ event: 'native_provider_turn_sent', turnId: '1:1' }));
+			clock = 40;
+			await options.executeTool({ callId: 'call-1', turnId: '1:1', tool: { kind: 'action' } });
+			return { status: 'completed', toolCalls: 1 };
+		},
+	};
+	const planner = new AgentPlanner({ registry: registryFor(() => record), now: () => clock,
+		scheduler: immediateScheduler, nativeTimingSink: (event, fields) => rows.push({ event, fields }),
+		codexService: { async createAgent() { return agent; }, getAgent() { return null; } } });
+	await planner.requestNativeTurn({ agentId: AGENT_ID, input: 'act', goalRevision: 1, traceId: 'trace-timing-1', onVerbose: (stage, message) => verbose.push([stage, message]),
+		executeTool: async () => { clock += 25; return { state: 'SUCCEEDED' }; } });
+	const names = rows.map((row) => row.event);
+	for (const event of ['native_turn_admitted', 'native_provider_turn_started', 'native_tool_queue_timing', 'native_tool_result_returned']) assert.ok(names.includes(event), event);
+	assert.ok(names.indexOf('native_provider_turn_started') < names.indexOf('native_tool_queue_timing') && names.indexOf('native_tool_queue_timing') < names.indexOf('native_tool_result_returned'));
+	const returned = rows.find((row) => row.event === 'native_tool_result_returned').fields;
+	assert.deepEqual([returned.callId, returned.toolKind, returned.executeMs, returned.state], ['call-1', 'action', 25, 'SUCCEEDED']);
+	assert.equal(rows.find((row) => row.event === 'native_tool_queue_timing').fields.turnId, '1:1');
+	assert.deepEqual(verbose.filter(([stage]) => stage === 'provider_event').map(([, message]) => JSON.parse(message)), [{ event: 'native_provider_turn_sent', turnId: '1:1' }]);
+});
+
 test('reference reads trace their section, topic and the taskPlan strategy pointer without content', async () => {
 	const record = nativeRecord('model-a');
 	const rows = [];

@@ -46,6 +46,7 @@ import dev.agaminggod.arenaagents.server.perception.ObservationDispatchQueue;
 import dev.agaminggod.arenaagents.server.perception.AttentionFactDelta;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationCollector;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationWireBudget;
+import dev.agaminggod.arenaagents.server.runtime.ActionTimelines;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionExecutor;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionProgress;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionObservation;
@@ -2657,6 +2658,17 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		payload.addProperty("observedAtEpochMs", result.observedAtEpochMs());
 		payload.addProperty("executionStarted", result.executionStarted());
 		payload.addProperty("physicalAttempted", result.physicalAttempted());
+		ActionTimelines.Timeline timeline = ActionTimelines.recall(result.agentId(), result.actionId());
+		if (timeline != null) {
+			JsonObject timing = new JsonObject();
+			timing.addProperty("acceptedAtEpochMs", timeline.acceptedAtEpochMs());
+			if (timeline.startedAtEpochMs() > 0L) {
+				timing.addProperty("startedAtEpochMs", timeline.startedAtEpochMs());
+				timing.addProperty("startedTick", timeline.startedTick());
+			}
+			timing.addProperty("endedTick", timeline.endedTick());
+			payload.add("timing", timing);
+		}
 		if (result.actionObservation() != null) payload.add("actionObservation", actionObservationPayload(result.actionObservation()));
 		payload.addProperty("replayProof", actionResultReplayProof(
 				secret, target.clientNonce, target.serverNonce, serverInstanceId,
@@ -2752,6 +2764,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		payload.addProperty("progress", progress.progress());
 		payload.addProperty("elapsedMs", progress.elapsedMs());
 		payload.addProperty("observedAtEpochMs", progress.observedAtEpochMs());
+		if (manager.server() != null) payload.addProperty("serverTick", manager.server().getTickCount());
 		if (progress.actionObservation() != null) payload.add("actionObservation", actionObservationPayload(progress.actionObservation()));
 		send("action_progress", progress.agentId().toString(), payload);
 		if (progress.actionObservation() == null || progress.actionObservation().progress() == null

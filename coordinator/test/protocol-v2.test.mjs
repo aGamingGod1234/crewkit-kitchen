@@ -551,6 +551,49 @@ test('action observations are optional but strictly validate authoritative movem
 	}), /distance/i);
 });
 
+test('action results carry Java accept, start and end clocks and progress carries the server tick', () => {
+	const timing = { acceptedAtEpochMs: 1_760_000_000_010, startedAtEpochMs: 1_760_000_000_050, startedTick: 4_001, endedTick: 4_020 };
+	const result = validateProtocolV2Payload('action_result', { ...actionResult('action-timing'), timing });
+	assert.deepEqual(result.timing, timing);
+	assert.equal(validateProtocolV2Payload('action_result', { ...actionResult('action-no-timing'), timing: { acceptedAtEpochMs: 5, endedTick: 9 } }).timing.startedTick, undefined);
+	assert.throws(() => validateProtocolV2Payload('action_result', { ...actionResult('action-bad-timing'), timing: { startedTick: -1 } }), /startedTick/);
+	assert.throws(() => validateProtocolV2Payload('action_result', { ...actionResult('action-extra-timing'), timing: { wall: 1 } }), /Unknown action_result.timing field/);
+	assert.equal(validateProtocolV2Payload('action_progress', { traceId: TRACE_ID, goalRevision: 1, actionId: 'action-tick', serverTick: 4_010 }).serverTick, 4_010);
+	assert.throws(() => validateProtocolV2Payload('action_progress', { traceId: TRACE_ID, goalRevision: 1, actionId: 'action-tick', serverTick: -3 }), /serverTick/);
+});
+
+test('a terminal result replayed without its timing is the same result, not a conflict', async (t) => {
+	const socket = new FakeSocket();
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
+		socketFactory: () => socket, schedule: () => 1, cancelSchedule: () => {}, currentRevision: () => 4,
+	});
+	t.after(() => bridge.stop());
+	bridge.start();
+	socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	const ready = once(bridge, 'ready');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-ack-timing', {
+		replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()],
+	}))}
+`);
+	await ready;
+	const payload = actionResult('action-timing-replay');
+	await bridge.send('action_command', 'agent-a', actionCommand('action-timing-replay'));
+	const delivered = [];
+	const errors = [];
+	bridge.on('action_result', (event) => delivered.push(event));
+	bridge.on('protocolError', (error) => errors.push(error));
+	const timing = { acceptedAtEpochMs: 10, startedAtEpochMs: 20, startedTick: 3, endedTick: 5 };
+	socket.emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-timing-1', { ...payload, timing }))}
+`);
+	await new Promise((resolve) => setImmediate(resolve));
+	socket.emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-timing-2', payload))}
+`);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(errors, []);
+	assert.deepEqual(delivered[0].payload.timing, timing);
+});
+
 test('terminal result retries are delivered until the application acknowledges them', async (t) => {
 	assert.deepEqual(
 		validateProtocolV2Payload('action_result_ack', { goalRevision: 4, actionId: 'action-ack-1' }),
