@@ -89,6 +89,7 @@ public final class CodexAgentManager {
 	private static final long RECOVERY_RETRY_DELAY_MS = 30_000L;
 	private static final long CANCELLED_SPAWN_RETENTION_MS = 120_000L;
 	private static final long LOCATION_PERSIST_INTERVAL_MS = 1_000L;
+	private static final long IDENTITY_RECONCILIATION_INTERVAL_MS = 1_000L;
 	private static final String LEGACY_HIDDEN_AGENT_TEAM = "arenaagents_hidden";
 	private static final TicketType AGENT_TICKET_TYPE = new TicketType(
 			TicketType.NO_TIMEOUT,
@@ -107,6 +108,8 @@ public final class CodexAgentManager {
 	private final Map<AgentId, Long> pendingPlayerSpawns = new LinkedHashMap<>();
 	private final Map<AgentId, VanillaRespawnAttempt> pendingVerifiedRespawns = new LinkedHashMap<>();
 	private final Map<AgentId, Long> lastLocationPersistenceEpochMs = new LinkedHashMap<>();
+	private Map<AgentId, Long> legacyBodyLookupAtEpochMs = new LinkedHashMap<>();
+	private Map<AgentId, WorldIdentityApplication> worldIdentityApplications = new LinkedHashMap<>();
 	private Map<AgentId, OfflineAgentPlayers.LegacyBodyMigration> pendingLegacyMigrations = new LinkedHashMap<>();
 	private Set<AgentId> pendingLegacyCanonicalRemovals = new LinkedHashSet<>();
 	private Map<AgentId, ServerPlayer> retainedDeadPlayers = new LinkedHashMap<>();
@@ -161,6 +164,16 @@ public final class CodexAgentManager {
 	private synchronized Map<AgentId, OfflineAgentPlayers.LegacyBodyMigration> pendingLegacyMigrations() {
 		if (pendingLegacyMigrations == null) pendingLegacyMigrations = new LinkedHashMap<>();
 		return pendingLegacyMigrations;
+	}
+
+	private synchronized Map<AgentId, Long> legacyBodyLookupAtEpochMs() {
+		if (legacyBodyLookupAtEpochMs == null) legacyBodyLookupAtEpochMs = new LinkedHashMap<>();
+		return legacyBodyLookupAtEpochMs;
+	}
+
+	private synchronized Map<AgentId, WorldIdentityApplication> worldIdentityApplications() {
+		if (worldIdentityApplications == null) worldIdentityApplications = new LinkedHashMap<>();
+		return worldIdentityApplications;
 	}
 
 	private synchronized Set<AgentId> pendingLegacyCanonicalRemovals() {
@@ -272,6 +285,8 @@ public final class CodexAgentManager {
 				}));
 		}
 		AgentRecord finalCreated = created;
+		legacyBodyLookupAtEpochMs().remove(finalCreated.agentId());
+		worldIdentityApplications().remove(finalCreated.agentId());
 		try {
 			runtimeHooks.validateProfile(finalCreated.profile());
 			OfflineAgentPlayers.spawn(
@@ -1031,6 +1046,8 @@ public final class CodexAgentManager {
 		}
 		for (AgentRecord record : records()) {
 			if (record.state() == dev.agaminggod.arenaagents.agent.AgentLifecycleState.DEAD) {
+				worldIdentityApplications().remove(record.agentId());
+				legacyBodyLookupAtEpochMs().remove(record.agentId());
 				ServerPlayer retained = retainedDeadPlayers().get(record.agentId());
 				if (retained != null && findAgentPlayer(record.agentId()).filter(player -> player == retained).isEmpty()) {
 					retainedDeadPlayers().remove(record.agentId(), retained);
@@ -1071,7 +1088,7 @@ public final class CodexAgentManager {
 					&& findAgentPlayer(record.agentId()).isEmpty()) {
 				continue;
 			}
-			if (legacyMigration == null) {
+			if (legacyMigration == null && legacyBodyLookupDue(record.agentId(), now)) {
 				try {
 					legacyMigration = OfflineAgentPlayers.stageConnectedLegacyMigration(
 							server, record.agentId(), record.profile()).orElse(null);
@@ -1114,7 +1131,7 @@ public final class CodexAgentManager {
 					);
 					lastLocationPersistenceEpochMs.put(record.agentId(), now);
 				}
-				applyWorldIdentity(player.get(), attached);
+				applyWorldIdentityIfNeeded(player.get(), attached, now);
 				trackChunkTicket(record.agentId(), player.get(), now);
 				publishPendingRegistration(attached);
 				if (pendingEntityRecoveries.remove(record.agentId())
@@ -1128,6 +1145,7 @@ public final class CodexAgentManager {
 				AgentInputRuntime.clear(server, record.agentId());
 				savedData.registry().die(record.agentId(), deathSnapshot(player.get(), now), now);
 			} else {
+				worldIdentityApplications().remove(record.agentId());
 				long deadline = pendingPlayerSpawns.getOrDefault(record.agentId(), 0L);
 				if (deadline > now) continue;
 				if (record.entityUuid().isPresent()) {
@@ -1140,6 +1158,24 @@ public final class CodexAgentManager {
 				recoverOfflinePlayer(recoveryTarget, now);
 			}
 		}
+	}
+
+	private boolean legacyBodyLookupDue(AgentId agentId, long now) {
+		Map<AgentId, Long> lastChecks = legacyBodyLookupAtEpochMs();
+		Long last = lastChecks.get(agentId);
+		if (last != null && now >= last && now - last < IDENTITY_RECONCILIATION_INTERVAL_MS) return false;
+		lastChecks.put(agentId, now);
+		return true;
+	}
+
+	private void applyWorldIdentityIfNeeded(ServerPlayer player, AgentRecord record, long now) {
+		Map<AgentId, WorldIdentityApplication> applied = worldIdentityApplications();
+		WorldIdentityApplication previous = applied.get(record.agentId());
+		if (previous != null && previous.player() == player && previous.level() == player.level()
+				&& previous.profile().equals(record.profile()) && now >= previous.appliedAtEpochMs()
+				&& now - previous.appliedAtEpochMs() < IDENTITY_RECONCILIATION_INTERVAL_MS) return;
+		applyWorldIdentity(player, record);
+		applied.put(record.agentId(), new WorldIdentityApplication(player, player.level(), record.profile(), now));
 	}
 
 	static AgentRecord prepareMissingPlayer(AgentRegistry registry, AgentRecord record,
@@ -1428,6 +1464,8 @@ public final class CodexAgentManager {
 			manager.trackWaypoint(player);
 		}
 	}
+
+	private record WorldIdentityApplication(ServerPlayer player, ServerLevel level, AgentProfile profile, long appliedAtEpochMs) { }
 
 	private void removeHiddenWorldName(String playerName) {
 		PlayerTeam team = server.getScoreboard().getPlayerTeam(LEGACY_HIDDEN_AGENT_TEAM);
@@ -1830,6 +1868,8 @@ public final class CodexAgentManager {
 		));
 		runCleanupSteps(
 				() -> lastLocationPersistenceEpochMs.remove(record.agentId()),
+				() -> legacyBodyLookupAtEpochMs().remove(record.agentId()),
+				() -> worldIdentityApplications().remove(record.agentId()),
 				() -> savedData.clearConversationWake(record.agentId()),
 				() -> savedData.clearGoalDrafts(record.agentId()),
 				() -> OfflineAgentPlayers.invalidateIdentity(record.agentId())

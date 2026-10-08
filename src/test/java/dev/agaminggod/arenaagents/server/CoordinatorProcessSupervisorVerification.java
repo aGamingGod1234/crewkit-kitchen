@@ -1301,8 +1301,11 @@ public final class CoordinatorProcessSupervisorVerification {
 				FileTime timestamp = Files.getLastModifiedTime(secret);
 				Files.writeString(secret, "w".repeat(32));
 				Files.setLastModifiedTime(secret, timestamp);
+				assertEquals(initial, CodexAgentServerRuntime.voiceConfigurationSnapshot(supervisor),
+						"same-size/same-time content remains cached");
+				Files.setLastModifiedTime(secret, FileTime.fromMillis(timestamp.toMillis() + 2_000L));
 				var rotated = CodexAgentServerRuntime.voiceConfigurationSnapshot(supervisor);
-				assertTrue(rotated.prepared() && rotated.revision() != initial.revision(), "same-size/same-time rotation detected next observation");
+				assertTrue(rotated.prepared() && rotated.revision() != initial.revision(), "mtime rotation detected next observation");
 				Files.writeString(secret, "short");
 				assertTrue(!CodexAgentServerRuntime.voiceConfigurationSnapshot(supervisor).prepared(), "invalid secret fences voice");
 			}
@@ -2409,6 +2412,9 @@ public final class CoordinatorProcessSupervisorVerification {
 			Files.writeString(secretFile, rotatedSecret, StandardCharsets.UTF_8);
 			Files.setLastModifiedTime(secretFile, originalTimestamp);
 			CodexAgentServerRuntime.reconcileBridgeConfiguration(slot, uninitializedManager(), supervisor);
+			assertEquals(initialBridge, slot.bridge(), "same-size/same-time content remains cached");
+			Files.setLastModifiedTime(secretFile, FileTime.fromMillis(originalTimestamp.toMillis() + 2_000L));
+			CodexAgentServerRuntime.reconcileBridgeConfiguration(slot, uninitializedManager(), supervisor);
 			long rotationDeadline = System.currentTimeMillis() + 3_000L;
 			while ((slot.bridge() == null || slot.bridge() == initialBridge)
 					&& System.currentTimeMillis() < rotationDeadline) {
@@ -2416,7 +2422,7 @@ public final class CoordinatorProcessSupervisorVerification {
 				CodexAgentServerRuntime.reconcileBridgeConfiguration(slot, uninitializedManager(), supervisor);
 			}
 			assertTrue(slot.bridge() != null && slot.bridge() != initialBridge,
-					"same-size same-timestamp rotation after byte 257 rebinds the explicit Java bridge");
+					"mtime rotation after byte 257 rebinds the explicit Java bridge");
 			try (Socket connection = authenticate(
 					port, rotatedSecret, "00000000-0000-0000-0000-000000000773", "explicit-tail-rotation"
 			)) {

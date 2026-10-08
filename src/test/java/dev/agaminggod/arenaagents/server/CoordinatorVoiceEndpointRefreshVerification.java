@@ -140,12 +140,12 @@ public final class CoordinatorVoiceEndpointRefreshVerification {
 			assertFalse(initialFingerprint.contains(initialTail),
 					"manual secret fingerprint never exposes plaintext tail content");
 			Files.writeString(manualSecret, rotatedManualSecret, StandardCharsets.UTF_8);
-			Files.setLastModifiedTime(manualSecret, originalTimestamp);
+			Files.setLastModifiedTime(manualSecret, FileTime.fromMillis(originalTimestamp.toMillis() + 1_000L));
 			assertEquals(512L, Files.size(manualSecret),
-					"tail-only rotation preserves the maximum accepted secret file size");
+					"same-size rotation preserves the maximum accepted secret file size");
 			long rotatedManualRevision = CodexAgentServerRuntime.voiceConfigurationRevision(manual);
 			assertFalse(initialManualRevision == rotatedManualRevision,
-					"same-size same-timestamp tail rotation advances the voice gate revision");
+					"same-size modification-time rotation advances the voice gate revision");
 			assertTrue(manualGate.reconcile(true, rotatedManualRevision),
 					"manual secret rotation recreates the worker client without restarting Minecraft");
 			assertEquals(4, voiceStarts.get(), "manual secret rotation starts one replacement worker client");

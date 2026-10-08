@@ -29,6 +29,9 @@ import java.io.Reader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.FileTime;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
@@ -58,8 +61,10 @@ public final class CodexAgentServerRuntime {
 	private static final Map<MinecraftServer, Map<String, Long>> PLANNING_UPDATES = new ConcurrentHashMap<>();
 	private static final Map<MinecraftServer, GoalVerificationRuntime> GOAL_VERIFIERS = new ConcurrentHashMap<>();
 	private static final java.util.Set<MinecraftServer> RESTORED_SERVERS = ConcurrentHashMap.newKeySet();
+	private static final Map<Path, CachedExplicitSecretObservation> EXPLICIT_SECRET_OBSERVATIONS = new ConcurrentHashMap<>();
 	private static final long PLANNING_UPDATE_INTERVAL_MS = 30_000L;
 	private static final long COORDINATOR_STATUS_MAXIMUM_AGE_MS = 2_500L;
+	private static final long MISSING_SECRET_RECHECK_NANOS = 250_000_000L;
 	private static final int MIN_EXPLICIT_SECRET_CHARACTERS = 32;
 	private static final int MAX_EXPLICIT_SECRET_CHARACTERS = 512;
 	private static boolean registered;
@@ -248,23 +253,81 @@ public final class CodexAgentServerRuntime {
 	}
 
 	private record ExplicitSecretObservation(boolean accepted, long revision) { }
+	private record CachedExplicitSecretObservation(
+			boolean present,
+			long size,
+			FileTime lastModified,
+			long checkedAtNanos,
+			ExplicitSecretObservation observation
+	) { }
 
 	private static ExplicitSecretObservation explicitSecretObservation(String configuredPath, Path fallbackPath) {
+		Path normalized;
 		try {
 			Path path = configuredPath == null || configuredPath.isBlank()
 					? fallbackPath
 					: Path.of(configuredPath);
-			Path normalized = path.toAbsolutePath().normalize();
-			return new ExplicitSecretObservation(true, java.util.Objects.hash(
-					normalized, Files.size(normalized), Files.getLastModifiedTime(normalized).toMillis(),
-					explicitSecretContentFingerprint(normalized)
-			));
-		} catch (java.io.IOException | RuntimeException unavailable) {
+			normalized = path.toAbsolutePath().normalize();
+		} catch (RuntimeException unavailable) {
 			return new ExplicitSecretObservation(false, java.util.Objects.hash(
 					configuredPath == null || configuredPath.isBlank() ? fallbackPath.toString() : configuredPath,
 					unavailable.getClass().getName()
 			));
 		}
+		long now = System.nanoTime();
+		CachedExplicitSecretObservation previous = EXPLICIT_SECRET_OBSERVATIONS.get(normalized);
+		if (previous != null && !previous.present()
+				&& now - previous.checkedAtNanos() < MISSING_SECRET_RECHECK_NANOS) return previous.observation();
+		BasicFileAttributes attributes;
+		try {
+			attributes = Files.readAttributes(normalized, BasicFileAttributes.class);
+		} catch (NoSuchFileException missing) {
+			ExplicitSecretObservation unavailable = unavailableSecretObservation(normalized, missing);
+			cacheExplicitSecret(normalized, new CachedExplicitSecretObservation(false, 0L, null, now, unavailable));
+			return unavailable;
+		} catch (IOException | RuntimeException unavailable) {
+			ExplicitSecretObservation observation = unavailableSecretObservation(normalized, unavailable);
+			cacheExplicitSecret(normalized, new CachedExplicitSecretObservation(false, 0L, null, now, observation));
+			return observation;
+		}
+		if (previous != null && previous.present() && previous.size() == attributes.size()
+				&& previous.lastModified().equals(attributes.lastModifiedTime())) return previous.observation();
+		try {
+			ExplicitSecretObservation accepted = new ExplicitSecretObservation(true, java.util.Objects.hash(
+					normalized, attributes.size(), attributes.lastModifiedTime(),
+					explicitSecretContentFingerprint(normalized)
+			));
+			cacheExplicitSecret(normalized, new CachedExplicitSecretObservation(
+					true, attributes.size(), attributes.lastModifiedTime(), now, accepted));
+			return accepted;
+		} catch (IOException | RuntimeException unavailable) {
+			ExplicitSecretObservation rejected = new ExplicitSecretObservation(false, java.util.Objects.hash(
+					normalized, attributes.size(), attributes.lastModifiedTime(), unavailable.getClass().getName()
+			));
+			cacheExplicitSecret(normalized, new CachedExplicitSecretObservation(
+					true, attributes.size(), attributes.lastModifiedTime(), now, rejected));
+			return rejected;
+		}
+	}
+
+	private static void cacheExplicitSecret(Path path, CachedExplicitSecretObservation observation) {
+		EXPLICIT_SECRET_OBSERVATIONS.put(path, observation);
+		if (EXPLICIT_SECRET_OBSERVATIONS.size() > 8) {
+			EXPLICIT_SECRET_OBSERVATIONS.keySet().stream().filter(candidate -> !candidate.equals(path)).findAny()
+					.ifPresent(EXPLICIT_SECRET_OBSERVATIONS::remove);
+		}
+	}
+
+	private static ExplicitSecretObservation unavailableSecretObservation(Path path, Exception failure) {
+		return new ExplicitSecretObservation(false, java.util.Objects.hash(path, failure.getClass().getName()));
+	}
+
+	static void clearExplicitSecretCacheForVerification(Path path) {
+		EXPLICIT_SECRET_OBSERVATIONS.remove(path.toAbsolutePath().normalize());
+	}
+
+	static Object explicitSecretCacheEntryForVerification(Path path) {
+		return EXPLICIT_SECRET_OBSERVATIONS.get(path.toAbsolutePath().normalize());
 	}
 
 	static String explicitSecretContentFingerprint(Path path) throws IOException {
@@ -657,7 +720,7 @@ public final class CodexAgentServerRuntime {
 
 	static record VoiceConfigurationSnapshot(boolean prepared, long revision) { }
 
-	/** One content read per reconciliation; never cache by size or modification time. */
+	/** Reuses the content fingerprint until the secret file's size or modification time changes. */
 	static VoiceConfigurationSnapshot voiceConfigurationSnapshot(CoordinatorProcessSupervisor supervisor) {
 		if (supervisor == null) return new VoiceConfigurationSnapshot(false, 0L);
 		ExplicitSecretObservation explicit = supervisor.snapshot().state() == CoordinatorRecoveryState.STOPPED

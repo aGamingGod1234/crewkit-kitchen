@@ -46,7 +46,10 @@ final class DurableActionJournal implements AutoCloseable {
 	private final Path path;
 	private final int maximumEntries;
 	private final int compactionEventLimit;
+	private final ForceHook forceHook;
 	private LinkedHashMap<ActionKey, Entry> entries;
+	private LinkedHashMap<ActionKey, Entry> stagedEntries;
+	private final List<Mutation> pendingTickMutations = new ArrayList<>();
 	// Server-thread ACKs survive failed commits, bounded by the retained journal identities.
 	private final LinkedHashSet<ActionKey> pendingAcknowledgements = new LinkedHashSet<>();
 	private int persistedEventCount;
@@ -64,10 +67,11 @@ final class DurableActionJournal implements AutoCloseable {
 	private long slowestCompactionNanos;
 	private boolean closed;
 
-	private DurableActionJournal(Path path, int maximumEntries, int compactionEventLimit, Loaded loaded) {
+	private DurableActionJournal(Path path, int maximumEntries, int compactionEventLimit, Loaded loaded, ForceHook forceHook) {
 		this.path = path;
 		this.maximumEntries = maximumEntries;
 		this.compactionEventLimit = compactionEventLimit;
+		this.forceHook = forceHook;
 		this.entries = loaded.entries();
 		this.persistedEventCount = loaded.eventCount();
 		this.persistedBytes = loaded.persistedBytes();
@@ -83,7 +87,12 @@ final class DurableActionJournal implements AutoCloseable {
 	}
 
 	static DurableActionJournal open(Path path, int maximumEntries, int compactionEventLimit) {
+		return open(path, maximumEntries, compactionEventLimit, ForceHook.NONE);
+	}
+
+	static DurableActionJournal open(Path path, int maximumEntries, int compactionEventLimit, ForceHook forceHook) {
 		Objects.requireNonNull(path, "path must not be null");
+		Objects.requireNonNull(forceHook, "forceHook must not be null");
 		if (maximumEntries <= 0) throw new IllegalArgumentException("maximumEntries must be positive");
 		if (compactionEventLimit <= 0) throw new IllegalArgumentException("compactionEventLimit must be positive");
 		Path normalized = path.toAbsolutePath().normalize();
@@ -94,40 +103,71 @@ final class DurableActionJournal implements AutoCloseable {
 		} else if (loaded.persistedBytes() >= 0L && Files.exists(normalized)) {
 			truncateTail(normalized, loaded.persistedBytes());
 		}
-		return new DurableActionJournal(normalized, maximumEntries, compactionEventLimit, loaded);
+		return new DurableActionJournal(normalized, maximumEntries, compactionEventLimit, loaded, forceHook);
 	}
 
 	static DurableActionJournal inMemory() {
 		return new DurableActionJournal(null, MAX_ENTRIES, Integer.MAX_VALUE,
-				new Loaded(new LinkedHashMap<>(), 0, 0L, false, newDigest()));
+				new Loaded(new LinkedHashMap<>(), 0, 0L, false, newDigest()), ForceHook.NONE);
 	}
 
 	synchronized void accept(ServerActionRequest request, UUID logicalGoalId) {
+		Mutation mutation = acceptanceMutation(request, logicalGoalId, entries);
+		persist(mutation);
+	}
+
+	/** Stages server-thread acceptance for the next journal group; actions remain gated until that group is forced. */
+	synchronized void acceptForTick(ServerActionRequest request, UUID logicalGoalId) {
+		LinkedHashMap<ActionKey, Entry> current = tickEntries();
+		Mutation mutation = acceptanceMutation(request, logicalGoalId, current);
+		stageTickMutation(mutation);
+	}
+
+	private Mutation acceptanceMutation(
+			ServerActionRequest request,
+			UUID logicalGoalId,
+			LinkedHashMap<ActionKey, Entry> current
+	) {
 		Objects.requireNonNull(request, "request must not be null");
 		ActionKey key = ActionKey.from(request);
-		Entry prior = entries.get(key);
+		Entry prior = current.get(key);
 		if (prior != null) {
 			if (!prior.request().equals(request) || !Objects.equals(prior.logicalGoalId(), logicalGoalId)) {
 				throw new AgentDomainException("ACTION_PROVENANCE_MISMATCH", "Action ID is already bound to a different durable request");
 			}
 			throw new AgentDomainException("ACTION_REPLAY", "Action ID has already been durably accepted");
 		}
-		for (Entry entry : entries.values()) {
+		for (Entry entry : current.values()) {
 			if (entry.request().agentId().equals(request.agentId())
 					&& Objects.equals(entry.logicalGoalId(), logicalGoalId)
 					&& entry.request().provenance().equals(request.provenance())) {
 				throw new AgentDomainException("ACTION_REPLAY", "Program step is already bound to action ID " + entry.request().actionId());
 			}
 		}
-		List<ActionKey> removed = admissionRemovals();
+		List<ActionKey> removed = admissionRemovals(current);
 		Entry accepted = new Entry(request, logicalGoalId, Phase.ACCEPTED, null);
-		persist(new Mutation(removed, List.of(accepted), List.of(), List.of()));
+		return new Mutation(removed, List.of(accepted), List.of(), List.of());
 	}
 
 	synchronized boolean terminalIfAccepted(ServerActionResult result) {
 		Objects.requireNonNull(result, "result must not be null");
 		if (entries.get(ActionKey.from(result)) == null) return false;
 		terminal(result);
+		return true;
+	}
+
+	/** Stages a terminal result to be forced at the next tick boundary before it can be published. */
+	synchronized boolean terminalIfAcceptedForTick(ServerActionResult result) {
+		Objects.requireNonNull(result, "result must not be null");
+		ActionKey key = ActionKey.from(result);
+		Entry prior = tickEntries().get(key);
+		if (prior == null) return false;
+		verifyResult(prior.request(), result);
+		if (prior.phase() != Phase.ACCEPTED) {
+			if (prior.result().equals(result)) return true;
+			throw new AgentDomainException("ACTION_RESULT_REPLAY_CONFLICT", "Action already has a different durable terminal result");
+		}
+		stageTickMutation(new Mutation(List.of(), List.of(), List.of(result), List.of()));
 		return true;
 	}
 
@@ -167,13 +207,23 @@ final class DurableActionJournal implements AutoCloseable {
 
 	/** One durable group per tick. A failed append leaves every identity available for retry. */
 	synchronized List<ActionKey> flushAcknowledgements() {
+		return flushTickGroup();
+	}
+
+	/** Persists staged acceptances, terminal results and ACKs in one append and one force. */
+	synchronized List<ActionKey> flushTickGroup() {
 		List<ActionKey> completed = List.copyOf(pendingAcknowledgements);
-		List<ActionKey> changed = completed.stream().filter(key -> {
-			Entry entry = entries.get(key);
+		List<ActionKey> acknowledged = completed.stream().filter(key -> {
+			Entry entry = tickEntries().get(key);
 			return entry != null && entry.phase() == Phase.TERMINAL;
 		}).toList();
-		if (!changed.isEmpty()) persist(new Mutation(List.of(), List.of(), List.of(), changed));
+		Mutation group = tickGroupMutation(acknowledged);
+		if (!group.removed().isEmpty() || !group.put().isEmpty() || !group.terminal().isEmpty() || !group.acknowledged().isEmpty()) {
+			persistTickGroup(group);
+		}
+		pendingTickMutations.clear();
 		pendingAcknowledgements.clear();
+		stagedEntries = null;
 		return completed;
 	}
 
@@ -192,6 +242,15 @@ final class DurableActionJournal implements AutoCloseable {
 
 	synchronized boolean rollbackAccepted(ServerActionRequest request) {
 		ActionKey key = ActionKey.from(request);
+		Entry staged = stagedEntries == null ? null : stagedEntries.get(key);
+		if (staged != null && staged.phase() == Phase.ACCEPTED && staged.request().equals(request)) {
+			boolean removed = pendingTickMutations.removeIf(mutation -> mutation.put().stream()
+					.anyMatch(entry -> ActionKey.from(entry.request()).equals(key)));
+			if (removed) {
+				rebuildStagedEntries();
+				return true;
+			}
+		}
 		Entry prior = entries.get(key);
 		if (prior == null || prior.phase() != Phase.ACCEPTED || !prior.request().equals(request)) return false;
 		persist(new Mutation(List.of(key), List.of(), List.of(), List.of()));
@@ -199,24 +258,45 @@ final class DurableActionJournal implements AutoCloseable {
 	}
 
 	synchronized void retainGoal(AgentId agentId, UUID logicalGoalId) {
+		List<ActionKey> removed = retainedGoalRemovals(entries, agentId, logicalGoalId);
+		if (!removed.isEmpty()) persist(new Mutation(removed, List.of(), List.of(), List.of()));
+	}
+
+	synchronized void retainGoalForTick(AgentId agentId, UUID logicalGoalId) {
+		List<ActionKey> removed = retainedGoalRemovals(tickEntries(), agentId, logicalGoalId);
+		if (!removed.isEmpty()) stageTickMutation(new Mutation(removed, List.of(), List.of(), List.of()));
+	}
+
+	private List<ActionKey> retainedGoalRemovals(Map<ActionKey, Entry> current, AgentId agentId, UUID logicalGoalId) {
 		List<ActionKey> removed = new ArrayList<>();
-		for (Map.Entry<ActionKey, Entry> entry : entries.entrySet()) {
+		for (Map.Entry<ActionKey, Entry> entry : current.entrySet()) {
 			if (entry.getKey().agentId().equals(agentId)
 					&& entry.getValue().phase() == Phase.ACKNOWLEDGED
 					&& !Objects.equals(entry.getValue().logicalGoalId(), logicalGoalId)) {
 				removed.add(entry.getKey());
 			}
 		}
-		if (!removed.isEmpty()) persist(new Mutation(List.copyOf(removed), List.of(), List.of(), List.of()));
+		return List.copyOf(removed);
 	}
 
 	synchronized void remove(AgentId agentId) {
+		List<ActionKey> removed = keysForAgent(entries, agentId);
+		if (!removed.isEmpty()) persist(new Mutation(removed, List.of(), List.of(), List.of()));
+		pendingAcknowledgements.removeIf(key -> key.agentId().equals(agentId));
+	}
+
+	synchronized void removeForTick(AgentId agentId) {
+		List<ActionKey> removed = keysForAgent(tickEntries(), agentId);
+		if (!removed.isEmpty()) stageTickMutation(new Mutation(removed, List.of(), List.of(), List.of()));
+		pendingAcknowledgements.removeIf(key -> key.agentId().equals(agentId));
+	}
+
+	private List<ActionKey> keysForAgent(Map<ActionKey, Entry> current, AgentId agentId) {
 		List<ActionKey> removed = new ArrayList<>();
-		for (ActionKey key : entries.keySet()) {
+		for (ActionKey key : current.keySet()) {
 			if (key.agentId().equals(agentId)) removed.add(key);
 		}
-		if (!removed.isEmpty()) persist(new Mutation(List.copyOf(removed), List.of(), List.of(), List.of()));
-		pendingAcknowledgements.removeIf(key -> key.agentId().equals(agentId));
+		return List.copyOf(removed);
 	}
 
 	synchronized List<Entry> snapshot() {
@@ -235,10 +315,14 @@ final class DurableActionJournal implements AutoCloseable {
 	}
 
 	private List<ActionKey> admissionRemovals() {
-		if (entries.size() < maximumEntries) return List.of();
+		return admissionRemovals(entries);
+	}
+
+	private List<ActionKey> admissionRemovals(Map<ActionKey, Entry> current) {
+		if (current.size() < maximumEntries) return List.of();
 		List<ActionKey> removed = new ArrayList<>(1);
-		int retainedSize = entries.size();
-		for (Map.Entry<ActionKey, Entry> candidate : entries.entrySet()) {
+		int retainedSize = current.size();
+		for (Map.Entry<ActionKey, Entry> candidate : current.entrySet()) {
 			if (retainedSize < maximumEntries) break;
 			if (candidate.getValue().phase() != Phase.ACKNOWLEDGED) continue;
 			removed.add(candidate.getKey());
@@ -248,6 +332,87 @@ final class DurableActionJournal implements AutoCloseable {
 			throw new AgentDomainException("ACTION_JOURNAL_FULL", "Durable action journal is full of unacknowledged actions");
 		}
 		return List.copyOf(removed);
+	}
+
+	private LinkedHashMap<ActionKey, Entry> tickEntries() {
+		return stagedEntries == null ? entries : stagedEntries;
+	}
+
+	private void stageTickMutation(Mutation mutation) {
+		if (stagedEntries == null) stagedEntries = new LinkedHashMap<>(entries);
+		applyMutation(stagedEntries, mutation);
+		pendingTickMutations.add(mutation);
+	}
+
+	private void rebuildStagedEntries() {
+		stagedEntries = pendingTickMutations.isEmpty() ? null : new LinkedHashMap<>(entries);
+		if (stagedEntries == null) return;
+		for (Mutation mutation : pendingTickMutations) applyMutation(stagedEntries, mutation);
+	}
+
+	private Mutation tickGroupMutation(List<ActionKey> queuedAcknowledgements) {
+		List<ActionKey> removed = new ArrayList<>();
+		List<Entry> put = new ArrayList<>();
+		List<ServerActionResult> terminal = new ArrayList<>();
+		LinkedHashSet<ActionKey> acknowledged = new LinkedHashSet<>(queuedAcknowledgements);
+		for (Map.Entry<ActionKey, Entry> durable : entries.entrySet()) {
+			Entry current = tickEntries().get(durable.getKey());
+			if (current == null) {
+				removed.add(durable.getKey());
+				continue;
+			}
+			if (durable.getValue().phase() == current.phase() && Objects.equals(durable.getValue().result(), current.result())) continue;
+			if (durable.getValue().phase() == Phase.ACCEPTED && current.phase() != Phase.ACCEPTED) {
+				terminal.add(current.result());
+				if (current.phase() == Phase.ACKNOWLEDGED) acknowledged.add(durable.getKey());
+			} else if (durable.getValue().phase() == Phase.TERMINAL && current.phase() == Phase.ACKNOWLEDGED) {
+				acknowledged.add(durable.getKey());
+			} else {
+				put.add(current);
+			}
+		}
+		for (Map.Entry<ActionKey, Entry> current : tickEntries().entrySet()) {
+			if (entries.containsKey(current.getKey())) continue;
+			Entry stagedAcceptance = stagedAcceptance(current.getKey());
+			if (stagedAcceptance != null && current.getValue().phase() != Phase.ACCEPTED) {
+				put.add(stagedAcceptance);
+				terminal.add(current.getValue().result());
+				if (current.getValue().phase() == Phase.ACKNOWLEDGED) acknowledged.add(current.getKey());
+			} else {
+				put.add(current.getValue());
+			}
+		}
+		return new Mutation(List.copyOf(removed), List.copyOf(put), List.copyOf(terminal), List.copyOf(acknowledged));
+	}
+
+	private Entry stagedAcceptance(ActionKey key) {
+		for (Mutation mutation : pendingTickMutations) {
+			for (Entry entry : mutation.put()) {
+				if (ActionKey.from(entry.request()).equals(key) && entry.phase() == Phase.ACCEPTED) return entry;
+			}
+		}
+		return null;
+	}
+
+	private void persistTickGroup(Mutation mutation) {
+		if (closed) throw new AgentDomainException("ACTION_JOURNAL_CLOSED", "Durable action journal is closed");
+		if (path == null || persistedEventCount < compactionEventLimit) {
+			persist(mutation);
+			return;
+		}
+		long started = System.nanoTime();
+		LinkedHashMap<ActionKey, Entry> compacted = new LinkedHashMap<>(entries);
+		applyMutation(compacted, mutation);
+		closePersistentChannel();
+		committedPrefix = writeSnapshot(path, compacted);
+		entries = compacted;
+		persistedEventCount = entries.size();
+		persistedBytes = fileSize(path);
+		openPersistentChannel();
+		long elapsed = Math.max(0L, System.nanoTime() - started);
+		compactionCount++;
+		compactionNanos += elapsed;
+		slowestCompactionNanos = Math.max(slowestCompactionNanos, elapsed);
 	}
 
 	private void persist(Mutation mutation) {
@@ -455,7 +620,9 @@ final class DurableActionJournal implements AutoCloseable {
 			persistentChannel.position(originalSize);
 			appendStarted = true;
 			writeFully(persistentChannel, ByteBuffer.wrap(frame));
+			forceHook.beforeForce();
 			persistentChannel.force(true);
+			forceHook.afterForce();
 			persistedBytes += frame.length;
 			committedPrefix.update(frame);
 		} catch (IOException exception) {
@@ -880,6 +1047,16 @@ final class DurableActionJournal implements AutoCloseable {
 	@FunctionalInterface
 	private interface FrameWriter {
 		void write(FileChannel channel) throws IOException;
+	}
+
+	interface ForceHook {
+		ForceHook NONE = new ForceHook() {
+			@Override public void beforeForce() { }
+			@Override public void afterForce() { }
+		};
+
+		void beforeForce();
+		void afterForce();
 	}
 
 	record ActionKey(AgentId agentId, long goalRevision, String actionId) {

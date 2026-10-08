@@ -35,6 +35,8 @@ import net.minecraft.core.component.DataComponentMap;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.LivingEntity;
@@ -47,6 +49,8 @@ import net.minecraft.world.item.TooltipFlag;
 import net.minecraft.world.level.block.entity.SignBlockEntity;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
@@ -1216,6 +1220,8 @@ public final class ServerObservationCollector {
 		java.util.LinkedHashSet<BlockPos> hits = new java.util.LinkedHashSet<>();
 		java.util.LinkedHashSet<BlockPos> openings = new java.util.LinkedHashSet<>();
 		Map<Long, Boolean> loadedChunks = new HashMap<>();
+		Map<Long, LevelChunk> sightChunks = new HashMap<>();
+		Map<Long, Boolean> nonAirSightSections = new HashMap<>();
 		Vec3 eye = agent.getEyePosition();
 		for (int pitchOffset : SIGHT_PITCH_OFFSETS) {
 			float pitch = net.minecraft.util.Mth.clamp(agent.getXRot() + pitchOffset, -90.0F, 90.0F);
@@ -1225,13 +1231,16 @@ public final class ServerObservationCollector {
 				Vec3 endpoint = loadedSightEndpoint(eye, direction,
 						position -> hasLoadedChunk(level, position, loadedChunks));
 				if (endpoint == null) continue;
-				BlockHitResult hit = level.clip(new ClipContext(
-						eye,
-						endpoint,
-						ClipContext.Block.VISUAL,
-						ClipContext.Fluid.ANY,
-						agent
-				));
+				ClipContext clip = new ClipContext(
+					eye,
+					endpoint,
+					ClipContext.Block.VISUAL,
+					ClipContext.Fluid.ANY,
+					agent
+				);
+				if (!rayContainsNonAir(eye, endpoint, clip,
+						position -> hasNonAirSightState(level, position, loadedChunks, sightChunks, nonAirSightSections))) continue;
+				BlockHitResult hit = level.clip(clip);
 				if (hit.getType() != HitResult.Type.BLOCK) continue;
 				BlockPos position = hit.getBlockPos();
 				if (!hasLoadedChunk(level, position, loadedChunks)) continue;
@@ -1263,6 +1272,46 @@ public final class ServerObservationCollector {
 				.thenComparingInt(VisibleSurfaceCandidate::x)
 				.thenComparingInt(VisibleSurfaceCandidate::z));
 		return new SightSample(List.copyOf(ordered), List.copyOf(hits), List.copyOf(openings));
+	}
+
+	static boolean rayContainsNonAir(
+			Vec3 start,
+			Vec3 end,
+			ClipContext clip,
+			Predicate<BlockPos> nonAirAt
+	) {
+		return BlockGetter.traverseBlocks(start, end, clip,
+				(context, position) -> nonAirAt.test(position) ? Boolean.TRUE : null,
+				context -> false);
+	}
+
+	private static boolean hasNonAirSightState(
+			ServerLevel level,
+			BlockPos position,
+			Map<Long, Boolean> loadedChunks,
+			Map<Long, LevelChunk> sightChunks,
+			Map<Long, Boolean> nonAirSightSections
+	) {
+		if (level.getChunkSource() == null) return !level.getBlockState(position).isAir();
+		if (!hasLoadedChunk(level, position, loadedChunks)) return true;
+		int chunkX = position.getX() >> 4;
+		int chunkZ = position.getZ() >> 4;
+		long chunkKey = ChunkPos.pack(chunkX, chunkZ);
+		LevelChunk chunk = sightChunks.computeIfAbsent(chunkKey,
+				ignored -> level.getChunkSource().getChunkNow(chunkX, chunkZ));
+		if (chunk == null) return true;
+		int sectionY = position.getY() >> 4;
+		int sectionIndex = level.getSectionIndexFromSectionY(sectionY);
+		LevelChunkSection[] sections = chunk.getSections();
+		if (sectionIndex < 0 || sectionIndex >= sections.length) return false;
+		long sectionKey = BlockPos.asLong(chunkX, sectionY, chunkZ);
+		boolean hasNonAir = nonAirSightSections.computeIfAbsent(sectionKey, ignored -> {
+			LevelChunkSection section = sections[sectionIndex];
+			return !section.hasOnlyAir();
+		});
+		if (!hasNonAir) return false;
+		return !sections[sectionIndex].getBlockState(
+				position.getX() & 15, position.getY() & 15, position.getZ() & 15).isAir();
 	}
 
 	static boolean withinLocalBlockScan(BlockPos center, BlockPos position) {

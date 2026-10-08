@@ -43,6 +43,10 @@ public final class CodexAgentServerRuntimeVoiceStartVerification {
 			assertFalse(supervisor.configured(), "disabled autostart skips coordinator dependency preparation");
 			assertTrue(CodexAgentServerRuntime.voiceConfigurationPrepared(supervisor),
 					"readable default voice secret prepares voice without an explicit secret property");
+			Object unchangedSecretCache = CodexAgentServerRuntime.explicitSecretCacheEntryForVerification(defaultVoiceSecret);
+			for (int index = 0; index < 20; index++) CodexAgentServerRuntime.voiceConfigurationRevision(supervisor);
+			assertTrue(unchangedSecretCache == CodexAgentServerRuntime.explicitSecretCacheEntryForVerification(defaultVoiceSecret),
+					"unchanged secret metadata reuses its cached fingerprint");
 
 			slot = new CodexAgentServerRuntime.BridgeSlot(System::currentTimeMillis);
 			CodexAgentServerRuntime.reconcileBridgeConfiguration(slot, uninitializedManager(), supervisor);
@@ -86,16 +90,21 @@ public final class CodexAgentServerRuntimeVoiceStartVerification {
 			Files.delete(defaultVoiceSecret);
 			boolean missingPrepared = CodexAgentServerRuntime.voiceConfigurationPrepared(supervisor);
 			assertFalse(missingPrepared, "missing default runtime secret keeps voice fail-closed");
+			Object missingSecretCache = CodexAgentServerRuntime.explicitSecretCacheEntryForVerification(defaultVoiceSecret);
+			for (int index = 0; index < 20; index++) CodexAgentServerRuntime.voiceConfigurationRevision(supervisor);
+			assertTrue(missingSecretCache == CodexAgentServerRuntime.explicitSecretCacheEntryForVerification(defaultVoiceSecret),
+					"a missing secret is negatively cached between bounded retries");
 			assertTrue(gate.reconcile(missingPrepared, CodexAgentServerRuntime.voiceConfigurationRevision(supervisor)),
 					"removing the effective manual secret fences the recovered voice subsystem");
 			assertEquals(2, voiceCloses.get(), "missing secret transition closes the recovered voice subsystem once");
 
 			Files.writeString(defaultVoiceSecret, "s".repeat(32), StandardCharsets.UTF_8);
+			Thread.sleep(300L);
 			assertTrue(gate.reconcile(CodexAgentServerRuntime.voiceConfigurationPrepared(supervisor),
 					CodexAgentServerRuntime.voiceConfigurationRevision(supervisor)),
 					"recreating the missing manual secret recovers voice on a later tick");
 			assertEquals(3, voiceStarts.get(), "missing secret recovery starts one replacement voice subsystem");
-			return 19;
+			return 21;
 		} finally {
 			if (slot != null) slot.close();
 			if (supervisor != null) supervisor.close();
@@ -107,6 +116,8 @@ public final class CodexAgentServerRuntimeVoiceStartVerification {
 			else Files.deleteIfExists(defaultBridgeSecret);
 			if (hadDefaultVoiceSecret) Files.write(defaultVoiceSecret, previousVoiceSecret);
 			else Files.deleteIfExists(defaultVoiceSecret);
+			CodexAgentServerRuntime.clearExplicitSecretCacheForVerification(defaultBridgeSecret);
+			CodexAgentServerRuntime.clearExplicitSecretCacheForVerification(defaultVoiceSecret);
 		}
 	}
 

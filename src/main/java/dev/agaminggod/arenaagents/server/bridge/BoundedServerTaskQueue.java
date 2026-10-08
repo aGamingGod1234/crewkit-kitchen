@@ -2,6 +2,7 @@ package dev.agaminggod.arenaagents.server.bridge;
 
 import java.util.ArrayDeque;
 import java.util.Objects;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 
 /**
@@ -88,10 +89,16 @@ final class BoundedServerTaskQueue {
 	/** Applies admitted input before vanilla physics; inspections have a separate end-tick budget. */
 	void drainBeforePhysics(int urgentMaximum, int controlMaximum, int bulkMaximum,
 			Consumer<Runnable> consumer, Runnable applyInput) {
+		drainBeforePhysics(urgentMaximum, controlMaximum, bulkMaximum, consumer, () -> true, applyInput);
+	}
+
+	/** Forces admitted durable input before it can execute; a failed boundary leaves input queued in its owner. */
+	void drainBeforePhysics(int urgentMaximum, int controlMaximum, int bulkMaximum,
+			Consumer<Runnable> consumer, BooleanSupplier prepareInput, Runnable applyInput) {
 		drain(Lane.URGENT, urgentMaximum, consumer);
 		drain(Lane.CONTROL, controlMaximum, consumer);
 		drain(Lane.BULK, bulkMaximum, consumer);
-		applyInput.run();
+		if (prepareInput.getAsBoolean()) applyInput.run();
 	}
 
 	void drainInspections(int inspectionMaximum, Consumer<Runnable> consumer) {
