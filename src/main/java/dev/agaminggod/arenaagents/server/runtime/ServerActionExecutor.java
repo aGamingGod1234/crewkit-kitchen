@@ -1195,20 +1195,19 @@ public final class ServerActionExecutor {
 			throw new AgentDomainException("NO_PLACEMENT_SUPPORT", "No adjacent solid face can support this placement");
 		}
 		ItemStack stack = player.getMainHandItem();
-		float aimPitch = player.getXRot();
-		orientPlayerForDesiredState(player, (BlockItem) stack.getItem(), stack, hit, desiredBlockState);
-		InteractionResult result;
-		try {
-			result = player.gameMode.useItemOn(
-					player,
-					player.level(),
-					stack,
-					InteractionHand.MAIN_HAND,
-					hit
-			);
-		} finally {
-			player.setXRot(aimPitch);
+		// The aim phase already turned the view to a look that yields the requested state; vanilla reads it here.
+		BlockState predicted = predictedPlacementState(player, (BlockItem) stack.getItem(), stack, hit);
+		if (predicted == null || !desiredBlockState.matches(predicted)) {
+			throw new AgentDomainException("PLACEMENT_STATE_MISMATCH",
+					"Requested block state cannot be produced by vanilla placement context from the current look");
 		}
+		InteractionResult result = player.gameMode.useItemOn(
+				player,
+				player.level(),
+				stack,
+				InteractionHand.MAIN_HAND,
+				hit
+		);
 		if (result.consumesAction()) player.swing(InteractionHand.MAIN_HAND);
 	}
 
@@ -1260,45 +1259,89 @@ public final class ServerActionExecutor {
 		return direction.toYRot();
 	}
 
-	static void orientPlayerForDesiredState(
+	/** A view direction: yaw and pitch in degrees. */
+	record Look(float yaw, float pitch) {
+	}
+
+	/** Largest yaw offset from a cardinal direction tried before the leveled cardinal looks. */
+	static final float PLACEMENT_LOOK_OFFSET_DEGREES = 40.0F;
+	/** Steepest pitch tried for a horizontal facing; below about 35 degrees the nearest look direction is horizontal. */
+	static final float PLACEMENT_LEVEL_PITCH_DEGREES = 30.0F;
+
+	/**
+	 * The look a player needs so vanilla places {@code desiredBlockState}, as close as possible to {@code aim} (the
+	 * look at the support face): the aim itself, then the aim pulled into each horizontal quadrant, then the leveled
+	 * cardinal looks (pistons and observers take facing from the nearest look direction, so a steep aim at a floor
+	 * would win over the yaw). Returns null when no particular look is required. The player's rotation is only
+	 * changed for same-tick prediction and is always restored. Throws PLACEMENT_STATE_MISMATCH when no look works.
+	 */
+	static Look requiredPlacementLook(
 			ServerPlayer player,
 			BlockItem blockItem,
 			ItemStack stack,
 			BlockHitResult hit,
-			DesiredBlockState desiredBlockState
+			DesiredBlockState desiredBlockState,
+			Look aim
 	) {
 		String requestedFacing = desiredBlockState.properties().get("facing");
 		Direction requestedDirection = requestedFacing == null ? null : Direction.byName(requestedFacing);
-		float originalYaw = player.getYRot();
-		float originalHeadYaw = player.getYHeadRot();
-		if (requestedDirection == null || !requestedDirection.getAxis().isHorizontal()) {
-			BlockState predicted = predictedPlacementState(player, blockItem, stack, hit);
-			if (predicted == null || !desiredBlockState.matches(predicted)) {
-				throw new AgentDomainException(
-						"PLACEMENT_STATE_MISMATCH",
-						"Requested block state cannot be produced by vanilla placement context"
-				);
-			}
-			return;
+		boolean horizontal = requestedDirection != null && requestedDirection.getAxis().isHorizontal();
+		if (!horizontal) {
+			if (placementMatchesAt(player, blockItem, stack, hit, desiredBlockState, aim)) return null;
+			throw new AgentDomainException("PLACEMENT_STATE_MISMATCH",
+					"Requested block state cannot be produced by vanilla placement context");
 		}
-		// Pistons, observers, dispensers and droppers take facing from the nearest look direction, so the downward
-		// aim at the support face would win over the yaw. Look level while choosing; placeBlock restores the pitch.
-		float originalPitch = player.getXRot();
-		player.setXRot(0.0F);
+		List<Look> candidates = new ArrayList<>();
+		candidates.add(aim);
+		List<Look> pulled = new ArrayList<>();
 		for (Direction direction : HORIZONTAL_PLACEMENT_DIRECTIONS) {
-			float yaw = directionalPlacementYaw(direction);
-			player.setYRot(yaw);
-			player.setYHeadRot(yaw);
-			BlockState predicted = predictedPlacementState(player, blockItem, stack, hit);
-			if (predicted != null && desiredBlockState.matches(predicted)) return;
+			float center = directionalPlacementYaw(direction);
+			float offset = net.minecraft.util.Mth.clamp(net.minecraft.util.Mth.wrapDegrees(aim.yaw() - center),
+					-PLACEMENT_LOOK_OFFSET_DEGREES, PLACEMENT_LOOK_OFFSET_DEGREES);
+			pulled.add(new Look(net.minecraft.util.Mth.wrapDegrees(center + offset),
+					net.minecraft.util.Mth.clamp(aim.pitch(), -PLACEMENT_LEVEL_PITCH_DEGREES, PLACEMENT_LEVEL_PITCH_DEGREES)));
 		}
-		player.setYRot(originalYaw);
-		player.setYHeadRot(originalHeadYaw);
-		player.setXRot(originalPitch);
+		pulled.sort(java.util.Comparator.comparingDouble(look -> lookDistance(aim, look)));
+		candidates.addAll(pulled);
+		for (Direction direction : HORIZONTAL_PLACEMENT_DIRECTIONS) {
+			candidates.add(new Look(directionalPlacementYaw(direction), 0.0F));
+		}
+		for (Look look : candidates) {
+			if (placementMatchesAt(player, blockItem, stack, hit, desiredBlockState, look)) return look;
+		}
 		throw new AgentDomainException(
 				"PLACEMENT_STATE_MISMATCH",
 				"Requested directional state cannot be produced by vanilla placement context"
 		);
+	}
+
+	static double lookDistance(Look from, Look to) {
+		return Math.abs(AgentInputStates.shortestAngleDelta(from.yaw(), to.yaw())) + Math.abs(to.pitch() - from.pitch());
+	}
+
+	/** Predicts vanilla placement with the player briefly at {@code look}; the rotation is restored in the same tick. */
+	static boolean placementMatchesAt(
+			ServerPlayer player,
+			BlockItem blockItem,
+			ItemStack stack,
+			BlockHitResult hit,
+			DesiredBlockState desiredBlockState,
+			Look look
+	) {
+		float yaw = player.getYRot();
+		float headYaw = player.getYHeadRot();
+		float pitch = player.getXRot();
+		try {
+			player.setYRot(look.yaw());
+			player.setYHeadRot(look.yaw());
+			player.setXRot(look.pitch());
+			BlockState predicted = predictedPlacementState(player, blockItem, stack, hit);
+			return predicted != null && desiredBlockState.matches(predicted);
+		} finally {
+			player.setYRot(yaw);
+			player.setYHeadRot(headYaw);
+			player.setXRot(pitch);
+		}
 	}
 
 	private static BlockState predictedPlacementState(
@@ -1716,6 +1759,11 @@ public final class ServerActionExecutor {
 		private final AimGate aimGate = new AimGate();
 		private long aimReadyElapsedMs = -1L;
 		private Vec3 transactionAimTarget;
+		/** Look a directional placement needs; held while placing, then the view eases back to the face aim. */
+		private Look placementLook;
+		private Look placementRestoreLook;
+		private ServerActionResult placementCompleted;
+		private int placementRestoreTicks;
 		private java.util.function.Supplier<Vec3> immediateAimTarget;
 		private boolean breakInputIssued;
 		private boolean breakObservedInCarpet;
@@ -2101,6 +2149,12 @@ public final class ServerActionExecutor {
 				}
 				lastObservation = breakObservation(now, hit, currentBlockId, lastProgress, breakObservedInCarpet);
 			} else if (mode == Mode.PLACE) {
+				if (placementCompleted != null) {
+					if (stepLookToward(placementRestoreLook) || ++placementRestoreTicks >= MAX_CONTROL_TURN_TICKS) {
+						return placementCompleted;
+					}
+					return null;
+				}
 				boolean placementOwned = player.isCreative()
 						? placementAttempts > 0
 						: inventoryItemCount(player, placementItemId) == initialPlacementItemCount - 1;
@@ -2116,7 +2170,12 @@ public final class ServerActionExecutor {
 					return result(ServerActionState.SUCCEEDED, "TARGET_ALREADY_SATISFIED", "Requested block was already present", now);
 				}
 				if (decision == BlockPlacementPostcondition.Decision.SUCCEEDED) {
-					return result(ServerActionState.SUCCEEDED, "BLOCK_PLACED", "Block placement confirmed", now);
+					ServerActionResult placed = result(ServerActionState.SUCCEEDED, "BLOCK_PLACED", "Block placement confirmed", now);
+					if (placementLook == null) return placed;
+					// The facing needed a particular look; ease back to the support-face aim, as a player would.
+					placementCompleted = placed;
+					placementRestoreLook = lookToward(placementAimTarget());
+					return null;
 				}
 				if (decision == BlockPlacementPostcondition.Decision.CONFLICT) {
 					return result(ServerActionState.FAILED, "PLACEMENT_CONFLICT", placementFailureMessage(
@@ -2129,12 +2188,17 @@ public final class ServerActionExecutor {
 				}
 				// Look at the support face first, like a player, then place with an arm swing. Retries are timed
 				// from the moment the view settled so a slow turn does not use up the attempt budget.
-				AimGate.State aim = aimAt(placementAimTarget());
+				Look faceAim = lookToward(placementAimTarget());
+				if (!aimGate.ready()) placementLook = directionalPlacementLook(faceAim);
+				Look aimLook = placementLook == null ? faceAim : placementLook;
+				AimGate.State aim = aimAtLook(aimLook);
 				if (aim == AimGate.State.FAILED) {
 					return result(ServerActionState.FAILED, "AIM_NOT_REACHED",
 							"The agent's view did not settle on the placement face", now);
 				}
 				if (aim == AimGate.State.READY) {
+					// Within the gate's 3 degrees: land exactly on the look the facing was predicted from.
+					if (placementLook != null) applyExactLook(placementLook);
 					if (aimReadyElapsedMs < 0L) aimReadyElapsedMs = elapsed;
 					if (BlockPlacementAttemptPolicy.shouldAttempt(elapsed - aimReadyElapsedMs, placementAttempts)) {
 						physicalAttempted = true;
@@ -2429,6 +2493,44 @@ public final class ServerActionExecutor {
 			if (inputLease == null) inputLease = input.acquire(request.agentId(), InputOwner.INTERACTION, 300);
 			input.apply(inputLease, new AgentInputState(0.0F, 0.0F, false, false, false, attack, false,
 					yaw, pitch, player.getInventory().getSelectedSlot(), InteractionHand.MAIN_HAND));
+		}
+
+		private Look lookToward(Vec3 target) {
+			AgentInputState desired = AgentInputStates.lookingAt(
+					player, target, 0.0F, 0.0F, false, false, false, false, false, InteractionHand.MAIN_HAND);
+			return new Look(desired.yaw(), desired.pitch());
+		}
+
+		/** The look a directional placement needs, or null; null too when the item or support is not ready yet. */
+		private Look directionalPlacementLook(Look faceAim) {
+			ItemStack stack = player.getMainHandItem();
+			if (!(stack.getItem() instanceof BlockItem blockItem)
+					|| !BuiltInRegistries.ITEM.getKey(stack.getItem()).toString().equals(placementItemId)) return null;
+			BlockHitResult hit = placementHit(player, block, placementRequestedFace);
+			if (hit == null) return null;
+			return requiredPlacementLook(player, blockItem, stack, hit, desiredBlockState, faceAim);
+		}
+
+		/** One player-speed step toward {@code look} through the interaction lease; true once the view is on it. */
+		private boolean stepLookToward(Look look) {
+			float yaw = AgentInputStates.turnYaw(player.getYRot(), look.yaw());
+			float pitch = AgentInputStates.turnPitch(player.getXRot(), look.pitch());
+			applyExactLook(new Look(yaw, pitch));
+			return Math.abs(AgentInputStates.shortestAngleDelta(yaw, look.yaw())) <= 0.01F
+					&& Math.abs(pitch - look.pitch()) <= 0.01F;
+		}
+
+		private void applyExactLook(Look look) {
+			LeasedServerInputController input = AgentInputRuntime.controller(player);
+			if (inputLease == null) inputLease = input.acquire(request.agentId(), InputOwner.INTERACTION, 300);
+			input.apply(inputLease, new AgentInputState(0.0F, 0.0F, false, false, false, false, false,
+					look.yaw(), look.pitch(), player.getInventory().getSelectedSlot(), InteractionHand.MAIN_HAND));
+		}
+
+		/** Drives the view toward {@code look} through the normal input lease and reports whether it has settled. */
+		private AimGate.State aimAtLook(Look look) {
+			stepLookToward(look);
+			return aimGate.observe(player.getYRot(), player.getXRot(), look.yaw(), look.pitch());
 		}
 
 		/** Drives the view toward the target through the normal input lease and reports whether it has settled. */

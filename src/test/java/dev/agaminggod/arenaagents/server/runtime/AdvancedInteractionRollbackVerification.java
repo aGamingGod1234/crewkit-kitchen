@@ -96,7 +96,7 @@ public final class AdvancedInteractionRollbackVerification {
 			verifyCraftFailureWithFullInventory(components);
 			if (failure != null) throw failure;
 		}
-		return 143;
+		return 151;
 	}
 
 	/** Tick a table pickaxe craft until both planks cells are filled and one plank is still on the cursor. */
@@ -148,26 +148,74 @@ public final class AdvancedInteractionRollbackVerification {
 		committed.cleanup();
 	}
 
+	/**
+	 * Directional placement used to write the facing yaw in the placing tick (a north piston from a view facing
+	 * north snapped the camera 170 degrees). Now the needed look is found by same-tick prediction (rotation
+	 * restored), reached through the same eased steps and AimGate as every other aim, and eased back afterwards.
+	 */
 	private static void verifyHorizontalFacingPlacement(ComponentBindings components) {
 		Fixture fixture = craftFixture();
 		ItemStack piston = components.stack(Items.PISTON, 1, 0);
 		// Floor placement next to the agent: the aim at the support's top face pitches the view well down.
 		var hit = new net.minecraft.world.phys.BlockHitResult(new net.minecraft.world.phys.Vec3(0.5D, 63.999D, 0.5D),
 				net.minecraft.core.Direction.UP, new net.minecraft.core.BlockPos(0, 63, 0), false);
+		var north = DesiredBlockState.parse("minecraft:piston[facing=north]", "minecraft:piston");
+		fixture.player().setYRot(170.0F);
 		fixture.player().setXRot(58.0F);
-		ServerActionExecutor.orientPlayerForDesiredState(fixture.player(), (net.minecraft.world.item.BlockItem) Items.PISTON,
-				piston, hit, DesiredBlockState.parse("minecraft:piston[facing=north]", "minecraft:piston"));
-		assertEquals(0.0F, fixture.player().getXRot(), "facing blocks are chosen with a level view");
-		fixture.player().setXRot(58.0F);
+		var faceAim = new ServerActionExecutor.Look(-135.0F, 66.0F);
+		var look = ServerActionExecutor.requiredPlacementLook(fixture.player(), (net.minecraft.world.item.BlockItem) Items.PISTON,
+				piston, hit, north, faceAim);
+		assertEquals(170.0F, fixture.player().getYRot(), "choosing the look leaves the yaw untouched");
+		assertEquals(58.0F, fixture.player().getXRot(), "choosing the look leaves the pitch untouched");
+		assertTrue(look != null && Math.abs(look.pitch()) <= ServerActionExecutor.PLACEMENT_LEVEL_PITCH_DEGREES,
+				"horizontal facings are placed from a leveled view, was " + look);
+		assertTrue(ServerActionExecutor.placementMatchesAt(fixture.player(), (net.minecraft.world.item.BlockItem) Items.PISTON,
+				piston, hit, north, look), "vanilla places a north piston from the chosen look");
+		assertTrue(Math.abs(net.minecraft.util.Mth.wrapDegrees(look.yaw())) <= ServerActionExecutor.PLACEMENT_LOOK_OFFSET_DEGREES,
+				"the chosen yaw stays as close to the face aim as the facing allows, was " + look.yaw());
+
+		// The executor's aim phase: eased steps through AimGate, an exact final step, then easing back to the face aim.
+		float yaw = fixture.player().getYRot();
+		float pitch = fixture.player().getXRot();
+		float maxStep = 0.0F;
+		AimGate gate = new AimGate();
+		AimGate.State state = AimGate.State.AIMING;
+		for (int tick = 0; tick < AimGate.MAX_TICKS && state == AimGate.State.AIMING; tick++) {
+			float nextYaw = dev.agaminggod.arenaagents.server.runtime.input.AgentInputStates.turnYaw(yaw, look.yaw());
+			float nextPitch = dev.agaminggod.arenaagents.server.runtime.input.AgentInputStates.turnPitch(pitch, look.pitch());
+			maxStep = Math.max(maxStep, Math.max(Math.abs(net.minecraft.util.Mth.wrapDegrees(nextYaw - yaw)), Math.abs(nextPitch - pitch)));
+			yaw = nextYaw;
+			pitch = nextPitch;
+			state = gate.observe(yaw, pitch, look.yaw(), look.pitch());
+		}
+		assertEquals(AimGate.State.READY, state, "the view settles on the placement look");
+		float finalStep = Math.abs(net.minecraft.util.Mth.wrapDegrees(look.yaw() - yaw)) + Math.abs(look.pitch() - pitch);
+		assertTrue(finalStep <= 2.0F * AimGate.TOLERANCE_DEGREES, "the exact final step is within the gate tolerance");
+		yaw = look.yaw();
+		pitch = look.pitch();
+		for (int tick = 0; tick < 40 && (yaw != faceAim.yaw() || pitch != faceAim.pitch()); tick++) {
+			float nextYaw = dev.agaminggod.arenaagents.server.runtime.input.AgentInputStates.turnYaw(yaw, faceAim.yaw());
+			float nextPitch = dev.agaminggod.arenaagents.server.runtime.input.AgentInputStates.turnPitch(pitch, faceAim.pitch());
+			maxStep = Math.max(maxStep, Math.max(Math.abs(net.minecraft.util.Mth.wrapDegrees(nextYaw - yaw)), Math.abs(nextPitch - pitch)));
+			yaw = nextYaw;
+			pitch = nextPitch;
+		}
+		assertTrue(Math.abs(net.minecraft.util.Mth.wrapDegrees(yaw - faceAim.yaw())) < 0.01F && pitch == faceAim.pitch(),
+				"after placing, the view eases back onto the support face");
+		assertTrue(maxStep <= dev.agaminggod.arenaagents.server.runtime.input.AgentInputStates.MAX_TURN_STEP_DEGREES,
+				"no tick of the placement turns faster than the player flick limit, max " + maxStep
+						+ " (the old in-tick write jumped " + Math.abs(net.minecraft.util.Mth.wrapDegrees(170.0F - 0.0F)) + ")");
+
 		boolean rejected = false;
 		try {
-			ServerActionExecutor.orientPlayerForDesiredState(fixture.player(), (net.minecraft.world.item.BlockItem) Items.PISTON,
-					piston, hit, DesiredBlockState.parse("minecraft:piston[facing=north,extended=true]", "minecraft:piston"));
+			ServerActionExecutor.requiredPlacementLook(fixture.player(), (net.minecraft.world.item.BlockItem) Items.PISTON,
+					piston, hit, DesiredBlockState.parse("minecraft:piston[facing=north,extended=true]", "minecraft:piston"), faceAim);
 		} catch (dev.agaminggod.arenaagents.agent.AgentDomainException expected) {
-			rejected = true;
+			rejected = "PLACEMENT_STATE_MISMATCH".equals(expected.code());
 		}
-		assertTrue(rejected, "an impossible state is still rejected");
-		assertEquals(58.0F, fixture.player().getXRot(), "a rejected orientation restores the aim pitch");
+		assertTrue(rejected, "an impossible state is still rejected as PLACEMENT_STATE_MISMATCH");
+		assertEquals(170.0F, fixture.player().getYRot(), "a rejected state leaves the yaw untouched");
+		assertEquals(58.0F, fixture.player().getXRot(), "a rejected state leaves the pitch untouched");
 	}
 
 	private static void verifyNativeCraftTransaction(ComponentBindings components) {
