@@ -75,19 +75,19 @@ test('survey and lookAround survey normalize strictly; threats cannot be exclude
 
 test('merged sweep surveys keep the nearest sighting of each thing with bearings from the final heading', () => {
 	const merged = mergeSurveys([
-		{ yaw: 90, result: { survey: { structures: [{ structure: 'village', x: -60, y: 64, z: 0, distance: 60, bearing: 0 }], biomes: [{ biome: 'minecraft:desert', x: -90, y: 63, z: 0, distance: 90, bearing: 0 }] }, coverage: { complete: true } } },
-		{ yaw: 180, result: { survey: { structures: [{ structure: 'village', x: -40, y: 64, z: -10, distance: 41, bearing: -60 }, { structure: 'shipwreck', x: 0, y: 60, z: -50, distance: 50, bearing: 0 }],
-			biomes: [{ biome: 'minecraft:desert', x: -80, y: 63, z: -80, distance: 113, bearing: -45 }] }, standingIn: 'minecraft:plains', threats: { entries: [] }, coverage: { complete: false } } },
+		{ yaw: 90, result: { survey: { structures: [{ id: 'v', structure: 'village', x: -60, y: 64, z: 0, distance: 60, bearing: 0 }], biomes: [{ id: 'd', biome: 'minecraft:desert', x: -90, y: 63, z: 0, distance: 90, bearing: 0 }] }, coverage: { complete: true } } },
+		{ yaw: 180, result: { survey: { structures: [{ id: 'v', structure: 'village', x: -40, y: 64, z: -10, distance: 41, bearing: -60 }, { id: 's', structure: 'shipwreck', x: 0, y: 60, z: -50, distance: 50, bearing: 0 }],
+			biomes: [{ id: 'd', biome: 'minecraft:desert', x: -80, y: 63, z: -80, distance: 113, bearing: -45 }] }, standingIn: 'minecraft:plains', threats: { entries: [] }, coverage: { complete: false } } },
 	], 180, 4);
 	assert.deepEqual(merged.structures.map((row) => [row.structure, row.distance, row.bearing]), [['village', 41, -60], ['shipwreck', 50, 0]],
 		'one village row (the nearer sighting), nearest first');
 	assert.deepEqual(merged.biomes.map((row) => [row.biome, row.distance, row.bearing]), [['minecraft:desert', 90, -90]],
 		'the first heading saw the desert nearer; its bearing is turned to the final heading');
 	assert.equal(merged.standingIn, 'minecraft:plains');
-	assert.deepEqual(merged.threats, { entries: [] }, 'threats from the last heading always come along');
+	assert.equal(merged.threats, undefined, 'no threats at any heading adds nothing');
 	assert.equal(merged.headings, 2);
 	assert.equal(merged.complete, false);
-	assert.equal(mergeSurveys([{ yaw: 0, result: { survey: { built: Array.from({ length: 6 }, (_, index) => ({ blocks: ['minecraft:torch'], size: 1, x: index * 64, y: 64, z: 0, distance: index * 64, bearing: 0 })) } } }], 0, 2).built.length, 2,
+	assert.equal(mergeSurveys([{ yaw: 0, result: { survey: { built: Array.from({ length: 6 }, (_, index) => ({ id: `t${index}`, blocks: ['minecraft:torch'], size: 1, x: index * 64, y: 64, z: 0, distance: index * 64, bearing: 0 })) } } }], 0, 2).built.length, 2,
 		'rows per section are capped by limit');
 });
 
@@ -121,4 +121,15 @@ test('lookAround with survey surveys each heading only after the body has turned
 	assert.equal(result.survey.built.length, 1);
 	assert.equal(result.survey.built[0].bearing, 180, 'the hut seen while facing north is behind the final (south) heading');
 	assert.equal(result.survey.headings, 4);
+});
+
+test('review fix: two distinct far structures seen from two headings stay two rows, and threats from every heading are kept', () => {
+	const far = (id, x) => ({ id, blocks: ['minecraft:oak_planks'], size: 20, x, y: 64, z: 150, distance: 150, bearing: 0 });
+	const merged = mergeSurveys([
+		{ yaw: 0, result: { survey: { structures: [far('a1', 0)] }, threats: { entries: [{ uuid: 'zombie', type: 'minecraft:zombie', distance: 9, bearing: 10 }] } } },
+		{ yaw: 90, result: { survey: { structures: [far('b2', 40), far('a1', 0)] }, threats: { entries: [{ uuid: 'skeleton', type: 'minecraft:skeleton', distance: 12, bearing: 0 }] } } },
+	], 90, 4);
+	assert.equal(merged.structures.length, 2, 'two unnamed far structures are not collapsed into one');
+	assert.deepEqual(merged.threats.entries.map((entry) => [entry.uuid, entry.bearing]), [['zombie', -80], ['skeleton', 0]],
+		'the zombie seen at the first heading is still reported, turned to the final heading');
 });

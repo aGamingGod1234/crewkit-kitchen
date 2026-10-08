@@ -431,8 +431,6 @@ public final class ServerObservationCollector {
 		coverage.addProperty("currentViewOnly", true);
 		// False while chunk reads around a new position are still spread over ticks; a repeat shortly after sees more.
 		coverage.addProperty("complete", sighted.far().complete());
-		coverage.addProperty("candidates", sighted.far().candidates());
-		coverage.addProperty("sightLines", sighted.far().clips());
 		result.add("coverage", coverage);
 		return result;
 	}
@@ -1130,9 +1128,14 @@ public final class ServerObservationCollector {
 	) {
 		String dimension = level.dimension().identifier().toString();
 		long gameTime = level.getGameTime();
+		SightedMemo memo;
 		synchronized (sightedSamples) {
-			SightedMemo memo = sightedSamples.get(agentId);
+			memo = sightedSamples.get(agentId);
 			if (!sightedDue(memo, dimension, gameTime)) return memo.sample();
+		}
+		// Over the level's passes for this tick the previous rows stand (still due, so recomputed next tick).
+		if (!levelIndex(level).tryPass(gameTime, false)) {
+			return memo != null && memo.dimension().equals(dimension) ? memo.sample() : SightedFeatures.Sample.EMPTY;
 		}
 		long started = PerceptionTiming.start();
 		SightedFeatures.Sample sample = sightedNow(agentId, level, agent, center, visibility, raw, rays, FarSight.Request.passive()).sample();
@@ -1178,11 +1181,17 @@ public final class ServerObservationCollector {
 	}
 
 	/** One far-sight pass for this agent, sharing the level's chunk scans and reusing the agent's line-of-sight cache. */
-	private FarSight.Result farSight(AgentId agentId, ServerLevel level, ServerPlayer agent, FarSight.Request request) {
-		FarSight.LevelIndex index;
+	private FarSight.LevelIndex levelIndex(ServerLevel level) {
 		synchronized (farSightIndexes) {
-			index = farSightIndexes.computeIfAbsent(level, ignored -> new FarSight.LevelIndex());
+			return farSightIndexes.computeIfAbsent(level, ignored -> new FarSight.LevelIndex());
 		}
+	}
+
+	private FarSight.Result farSight(AgentId agentId, ServerLevel level, ServerPlayer agent, FarSight.Request request) {
+		FarSight.LevelIndex index = levelIndex(level);
+		boolean survey = request.clips() != FarSight.PASSIVE_CLIPS;
+		// A survey past this tick's survey budget answers from cached candidates and sight lines only.
+		if (survey && !index.tryPass(level.getGameTime(), true)) request = request.cachedOnly();
 		FarSight.SightCache cache;
 		synchronized (sightCaches) {
 			cache = agentId == null ? new FarSight.SightCache()
@@ -1194,7 +1203,7 @@ public final class ServerObservationCollector {
 			result = FarSight.look(level, agent, index, cache,
 					worldMutationRevision(level, agent.blockPosition(), LANDMARK_SIGHT_DISTANCE + 1), request);
 		}
-		PerceptionTiming.record(request.clips() == FarSight.PASSIVE_CLIPS ? "far_sight" : "survey", started);
+		PerceptionTiming.recordTick(survey ? "survey" : "far_sight", level.getGameTime(), started);
 		return result;
 	}
 

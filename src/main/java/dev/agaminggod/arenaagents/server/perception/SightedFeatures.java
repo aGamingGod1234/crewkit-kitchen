@@ -286,11 +286,31 @@ public final class SightedFeatures {
 			} else {
 				times[1] = gameTime;
 			}
-			if (keys.size() > MAX_REMEMBERED_STRUCTURES) {
-				String oldest = keys.entrySet().stream().min(Comparator.comparingLong(entry -> entry.getValue()[1])).map(Map.Entry::getKey).orElse(null);
-				if (oldest != null && !oldest.equals(key)) keys.remove(oldest);
-			}
+			evict(key);
 			return times[0];
+		}
+
+		/**
+		 * A survey showed the model this key: it counts as known (not announced again, no wake) without starting the
+		 * passive window, so surveyed rows do not reappear in the next 30 s of updates. Returns whether it was unknown.
+		 */
+		synchronized boolean acknowledge(String key, long gameTime) {
+			long[] times = keys.get(key);
+			boolean unknown = times == null || gameTime - times[1] > NEW_STRUCTURE_TICKS || gameTime < times[1];
+			if (unknown) {
+				keys.remove(key);
+				keys.put(key, new long[] {gameTime - RECENT_TICKS - 1, gameTime});
+				evict(key);
+			} else {
+				times[1] = gameTime;
+			}
+			return unknown;
+		}
+
+		private void evict(String keep) {
+			if (keys.size() <= MAX_REMEMBERED_STRUCTURES) return;
+			String oldest = keys.entrySet().stream().min(Comparator.comparingLong(entry -> entry.getValue()[1])).map(Map.Entry::getKey).orElse(null);
+			if (oldest != null && !oldest.equals(keep)) keys.remove(oldest);
 		}
 
 		synchronized int size() {
@@ -407,17 +427,26 @@ public final class SightedFeatures {
 	}
 
 	/**
-	 * Rows by section. Passive rendering keeps far-sight rows only while recently announced; a survey shows every row
-	 * of the requested sections. Both mark first sightings {@code new} and record them as seen.
+	 * Rows by section. Passive rendering keeps far-sight rows only while recently announced and marks the announcing
+	 * update {@code new}. A survey shows every row of the requested sections with an {@code id}, marks rows the model did
+	 * not know {@code new}, and records them as known without starting the passive window.
 	 */
 	static JsonObject render(Sample sample, Vec3 eye, float yaw, Announcements announcements, long gameTime, boolean passive,
 			Map<FarSight.Section, Integer> limits, Set<FarSight.Section> sections) {
 		JsonObject sighted = new JsonObject();
-		Map<String, Long> announced = new HashMap<>();
-		for (FarSight.Row row : sample.far()) announced.put(row.key(), announcements.see(row.key(), gameTime));
-		FarSight.render(sighted, sample.far(), eye, yaw,
-				row -> sections.contains(row.section()) && (!passive || gameTime - announced.get(row.key()) <= RECENT_TICKS),
-				row -> announced.get(row.key()) == gameTime, limits);
+		if (passive) {
+			Map<String, Long> announced = new HashMap<>();
+			for (FarSight.Row row : sample.far()) announced.put(row.key(), announcements.see(row.key(), gameTime));
+			FarSight.render(sighted, sample.far(), eye, yaw,
+					row -> sections.contains(row.section()) && gameTime - announced.get(row.key()) <= RECENT_TICKS,
+					row -> announced.get(row.key()) == gameTime, limits, false);
+		} else {
+			Set<String> unknown = new HashSet<>();
+			for (FarSight.Row row : sample.far()) {
+				if (sections.contains(row.section()) && announcements.acknowledge(row.key(), gameTime)) unknown.add(row.key());
+			}
+			FarSight.render(sighted, sample.far(), eye, yaw, row -> sections.contains(row.section()), row -> unknown.contains(row.key()), limits, true);
+		}
 		if (sections.contains(FarSight.Section.CAVES) && !sample.caves().isEmpty()) {
 			JsonArray rows = new JsonArray();
 			for (Sighting sighting : sample.caves()) {

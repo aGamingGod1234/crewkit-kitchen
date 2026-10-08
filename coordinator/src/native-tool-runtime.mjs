@@ -1507,25 +1507,31 @@ async function withDeadline(promise, timeoutMs, code, message) {
 }
 
 /**
- * Merges the surveys of a camera sweep: one row per thing (nearest sighting kept), at most limit per section, nearest
- * first, with bearings turned relative to the final heading so they stay right after the sweep. Threats and the biome
- * come from the last heading.
+ * Merges the surveys of a camera sweep: one row per thing (the nearest sighting kept), at most limit per section,
+ * nearest first, with bearings turned relative to the final heading so they stay right after the sweep. Far-sight rows
+ * are matched by the stable id Minecraft gives each thing; caves and veins (no id) by kind within 8 blocks. Threats are
+ * the union over every heading, each at its latest sighting; the biome comes from the last heading.
  */
 export function mergeSurveys(surveys, finalYaw, limit = 4) {
 	const sections = new Map();
+	const threats = new Map();
 	let complete = true;
+	const turn = (row, yaw) => Number.isFinite(row?.bearing) ? { ...row, bearing: Math.round(wrapDegrees(yaw + row.bearing - finalYaw)) } : { ...row };
 	for (const { yaw, result } of surveys) {
 		if (result?.coverage?.complete === false) complete = false;
+		for (const entry of Array.isArray(result?.threats?.entries) ? result.threats.entries : []) {
+			const key = typeof entry?.uuid === 'string' ? entry.uuid : JSON.stringify(entry);
+			threats.delete(key);
+			threats.set(key, turn(entry, yaw));
+		}
 		for (const [section, rows] of Object.entries(result?.survey ?? {})) {
 			if (!Array.isArray(rows)) continue;
 			const merged = sections.get(section) ?? [];
 			sections.set(section, merged);
 			for (const row of rows) {
-				const turned = Number.isFinite(row.bearing) ? { ...row, bearing: Math.round(wrapDegrees(yaw + row.bearing - finalYaw)) } : { ...row };
-				// The same thing seen from two headings: same biome, same structure within its spread, or anything else within 24 blocks.
-				const reach = section === 'structures' ? 96 : 24;
-				const index = merged.findIndex((other) => section === 'biomes' ? other.biome === row.biome
-					: surveyIdentity(other) === surveyIdentity(row) && Math.hypot(other.x - row.x, other.z - row.z) <= reach);
+				const turned = turn(row, yaw);
+				const index = merged.findIndex((other) => typeof row.id === 'string' ? other.id === row.id
+					: (other.blockId ?? null) === (row.blockId ?? null) && Math.hypot(other.x - row.x, other.y - row.y, other.z - row.z) <= 8);
 				if (index < 0) merged.push(turned);
 				else if ((turned.distance ?? Infinity) < (merged[index].distance ?? Infinity)) merged[index] = turned;
 			}
@@ -1536,14 +1542,13 @@ export function mergeSurveys(surveys, finalYaw, limit = 4) {
 		...Object.fromEntries([...sections].map(([section, rows]) => [section, [...rows].sort((left, right) => (left.distance ?? 0) - (right.distance ?? 0)).slice(0, limit)])
 			.filter(([, rows]) => rows.length > 0)),
 		...(last.standingIn === undefined ? {} : { standingIn: last.standingIn }),
-		...(last.threats === undefined ? {} : { threats: last.threats }),
+		...(threats.size === 0 && last.threats?.bestWeapon === undefined ? {} : { threats: {
+			entries: [...threats.values()].sort((left, right) => (left.distance ?? 0) - (right.distance ?? 0)),
+			...(last.threats?.bestWeapon === undefined ? {} : { bestWeapon: last.threats.bestWeapon }),
+		} }),
 		headings: surveys.length,
 		complete,
 	};
-}
-
-function surveyIdentity(row) {
-	return row.structure ?? row.blockId ?? (Array.isArray(row.blocks) ? 'built' : '');
 }
 
 // Historical sightings preserve each heading without presenting earlier targets as current facts.

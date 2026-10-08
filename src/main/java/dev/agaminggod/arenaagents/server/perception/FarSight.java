@@ -2,6 +2,7 @@ package dev.agaminggod.arenaagents.server.perception;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
+import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.server.perception.SightedFeatures.Cell;
 import dev.agaminggod.arenaagents.world.ChunkMutationRevisionAccess;
 import java.util.ArrayList;
@@ -25,8 +26,11 @@ import net.minecraft.core.registries.Registries;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.tags.BlockTags;
+import net.minecraft.tags.FluidTags;
 import net.minecraft.util.Mth;
+import net.minecraft.world.effect.MobEffects;
 import net.minecraft.world.entity.ai.village.poi.PoiTypes;
+import net.minecraft.world.level.BlockGetter;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.Level;
@@ -48,7 +52,8 @@ import net.minecraft.world.phys.shapes.CollisionContext;
  * Far sight from world data: start from what the loaded world holds (generated structures, points of interest, biomes,
  * blocks that do not belong to the terrain, lava, chests and spawners) and keep only what a clear line from the agent's
  * eye inside its view cone reaches. Nothing behind terrain, outside loaded chunks or behind the agent is reported; the
- * model turns (lookAround) to see the rest.
+ * model turns (lookAround) to see the rest. Sizes, counts and how far a thing is noticeable come only from the blocks
+ * actually seen.
  */
 public final class FarSight {
 	/** The farthest a player sees structures, biomes and big clusters: the landmark sight distance. */
@@ -63,12 +68,19 @@ public final class FarSight {
 	 * and 70 degrees, so single small blocks (ores, chests, spawners, beds, bells) are noticed within 24 blocks.
 	 */
 	static final int SMALL_SIGHT = 24;
-	/** Exposed blocks that make a built or lava cluster big enough to notice at full range; smaller ones count as small. */
+	/** Seen blocks that make a built or lava cluster big enough to notice at full range; fewer count as small. */
 	static final int LARGE_CLUSTER = 8;
 	/** Line-of-sight tests per pass; passive passes run at most every 10 ticks and reuse results while the eye is still. */
 	static final int PASSIVE_CLIPS = 128;
 	static final int SURVEY_CLIPS = 256;
-	/** Full section reads (4,096 blocks each) per level per tick, shared by every agent; palette checks are cheaper. */
+	/**
+	 * Full far-sight passes per level per tick. Observations of up to 8 agents can land on one tick; agents over the cap
+	 * keep their previous rows for a tick or two. Surveys the model asks for have their own cap; over it, a survey answers
+	 * from the agent's cached candidates and sight lines without new work.
+	 */
+	static final int PASSES_PER_TICK = 2;
+	static final int SURVEYS_PER_TICK = 1;
+	/** Full section reads (4,096 blocks each) per level per tick, shared by every agent and search; palette checks are cheaper. */
 	static final int SECTION_SCANS_PER_TICK = 8;
 	static final int PALETTE_CHECKS_PER_TICK = 2_048;
 	static final int MAX_ENTRIES_PER_SECTION = 96;
@@ -78,6 +90,11 @@ public final class FarSight {
 	static final int MAX_ROWS = 8;
 	static final int DEFAULT_SURVEY_ROWS = 4;
 	static final int MAX_SEARCHED_BLOCKS = 4;
+	/** Water fog ends at 96 blocks times the eye's water vision (at least 0.25), as the 26.1 client draws it. */
+	static final double WATER_FOG_END = 96.0D;
+	/** Lava fog ends at 1 block, or 5 with fire resistance (26.1 client). */
+	static final double LAVA_FOG_END = 1.0D;
+	static final double LAVA_FOG_END_FIRE_RESISTANT = 5.0D;
 	private static final int CHUNK_RADIUS = (RANGE >> 4) + 1;
 	private static final int[][] CHUNK_OFFSETS = chunkOffsets();
 
@@ -103,6 +120,14 @@ public final class FarSight {
 			Blocks.PODZOL, Blocks.MOSS_BLOCK, Blocks.STONE, Blocks.DEEPSLATE, Blocks.SNOW_BLOCK, Blocks.ICE, Blocks.SAND,
 			Blocks.OAK_LOG, Blocks.SPRUCE_LOG, Blocks.BIRCH_LOG, Blocks.JUNGLE_LOG, Blocks.ACACIA_LOG, Blocks.DARK_OAK_LOG,
 			Blocks.MANGROVE_LOG, Blocks.CHERRY_LOG, Blocks.PALE_OAK_LOG);
+	/**
+	 * Ground and fluids that fill whole sections: a search for them would read every section in range and find terrain,
+	 * which the agent already sees in landmarks and the local block rows.
+	 */
+	private static final Set<Block> UNSEARCHABLE = Set.of(Blocks.AIR, Blocks.CAVE_AIR, Blocks.VOID_AIR, Blocks.STONE, Blocks.DEEPSLATE,
+			Blocks.GRANITE, Blocks.DIORITE, Blocks.ANDESITE, Blocks.TUFF, Blocks.DIRT, Blocks.GRASS_BLOCK, Blocks.SAND, Blocks.RED_SAND,
+			Blocks.GRAVEL, Blocks.WATER, Blocks.NETHERRACK, Blocks.END_STONE, Blocks.BEDROCK, Blocks.SANDSTONE, Blocks.TERRACOTTA,
+			Blocks.BASALT, Blocks.BLACKSTONE, Blocks.SOUL_SAND, Blocks.SOUL_SOIL, Blocks.SNOW_BLOCK, Blocks.CLAY, Blocks.CALCITE);
 
 	/** Kinds per block state, one table per dimension class (overworld, Nether, End); read in every scanned block. */
 	private static final List<Map<BlockState, Integer>> KINDS = List.of(new ConcurrentHashMap<>(), new ConcurrentHashMap<>(),
@@ -127,7 +152,10 @@ public final class FarSight {
 		}
 	}
 
-	/** What one pass looks for: sections, extra block ids to search near the agent, rows per section and a clip budget. */
+	/**
+	 * What one pass looks for: sections, extra block ids to search near the agent, rows per section and a line-of-sight
+	 * budget. A budget of 0 answers only from cached candidates and sight lines.
+	 */
 	public record Request(Set<Section> sections, List<Block> searched, int rowsPerSection, int clips) {
 		public Request {
 			sections = sections.isEmpty() ? Set.of() : Set.copyOf(EnumSet.copyOf(sections));
@@ -138,15 +166,20 @@ public final class FarSight {
 			return new Request(EnumSet.allOf(Section.class), List.of(), DEFAULT_SURVEY_ROWS, PASSIVE_CLIPS);
 		}
 
+		Request cachedOnly() {
+			return new Request(sections, searched, rowsPerSection, 0);
+		}
+
 		boolean wants(Section section) {
 			return sections.contains(section);
 		}
 	}
 
 	/**
-	 * One reported thing. {@code label} is a structure name (near structures only), biome id or block id; {@code blocks}
-	 * lists the built block ids actually seen (far structures and built clusters); {@code size} is the visible
-	 * horizontal extent in blocks; {@code count} the exposed blocks of a lava pool or the visible blocks of a search.
+	 * One reported thing. {@code key} is stable for the thing (a structure start, or a cluster's seed block) so it is not
+	 * announced again as the agent walks along it. {@code label} is a structure name (near structures only), biome id or
+	 * block id; {@code blocks} lists the built block ids seen (far structures and built clusters); {@code size} is the
+	 * horizontal extent of what was seen; {@code count} the seen blocks of a lava pool or a search.
 	 */
 	public record Row(Section section, String key, String label, List<String> blocks, int count, int size, Cell cell, double distance) {
 		public Row {
@@ -157,9 +190,9 @@ public final class FarSight {
 		}
 	}
 
-	/** Rows nearest first per section, the visible ore that seeds veins, and how much of the view was covered. */
+	/** Rows nearest first per section, the visible ore that seeds veins, and (for measurement only) the work done. */
 	public record Result(List<Row> rows, List<BlockPos> seenOre, String standingIn, int clips, int candidates, boolean complete) {
-		public static final Result EMPTY = new Result(List.of(), List.of(), null, 0, 0, true);
+		public static final Result EMPTY = new Result(List.of(), List.of(), null, 0, 0, false);
 
 		public Result {
 			rows = List.copyOf(rows);
@@ -174,46 +207,101 @@ public final class FarSight {
 	}
 
 	private static final class SectionScan {
+		final long revision;
 		int kinds;
 		final List<Found> found = new ArrayList<>();
+		/** Exposed blocks of one searched id, read on demand and kept with the section. */
+		final Map<Block, List<Found>> searches = new HashMap<>();
+
+		SectionScan(long revision) {
+			this.revision = revision;
+		}
 	}
 
 	private static final class ChunkScan {
 		// Weak, so a scan never keeps an unloaded chunk in memory.
 		final java.lang.ref.WeakReference<LevelChunk> chunk;
-		final long revision;
 		final SectionScan[] sections;
 
-		ChunkScan(LevelChunk chunk, long revision) {
+		ChunkScan(LevelChunk chunk) {
 			this.chunk = new java.lang.ref.WeakReference<>(chunk);
-			this.revision = revision;
 			this.sections = new SectionScan[chunk.getSections().length];
 		}
 	}
 
 	/**
-	 * Scans of loaded chunks for one level, shared by every agent. A chunk's scan is kept while the same chunk object stays
-	 * loaded and its block-write revision is unchanged; work is capped per game tick across all agents.
+	 * Scans of loaded chunks for one level, shared by every agent. A section's scan is kept while the same chunk object
+	 * stays loaded and that section's write count is unchanged (crops growing in one section do not rescan the chunk);
+	 * work is capped per game tick across all agents.
 	 */
 	public static final class LevelIndex {
 		private final Map<Long, ChunkScan> chunks = new HashMap<>();
 		private long budgetTick = Long.MIN_VALUE;
 		private int scansThisTick;
 		private int checksThisTick;
+		private int passesThisTick;
+		private int surveysThisTick;
+		int sectionResets;
 
 		synchronized int size() {
 			return chunks.size();
 		}
 
+		private void roll(long tick) {
+			if (budgetTick == tick) return;
+			budgetTick = tick;
+			scansThisTick = 0;
+			checksThisTick = 0;
+			passesThisTick = 0;
+			surveysThisTick = 0;
+		}
+
+		/** Claims one of this tick's full passes; false when other agents already used them. */
+		synchronized boolean tryPass(long tick, boolean survey) {
+			roll(tick);
+			if (survey) {
+				if (surveysThisTick >= SURVEYS_PER_TICK) return false;
+				surveysThisTick++;
+				return true;
+			}
+			if (passesThisTick >= PASSES_PER_TICK) return false;
+			passesThisTick++;
+			return true;
+		}
+
 		private ChunkScan scanOf(LevelChunk chunk) {
 			long key = chunk.getPos().pack();
-			long revision = chunkRevision(chunk);
 			ChunkScan scan = chunks.get(key);
-			if (scan == null || scan.chunk.get() != chunk || scan.revision != revision) {
-				scan = new ChunkScan(chunk, revision);
+			if (scan == null || scan.chunk.get() != chunk) {
+				scan = new ChunkScan(chunk);
 				chunks.put(key, scan);
 			}
 			return scan;
+		}
+
+		/** The section's current scan, replaced when its blocks changed since it was read. */
+		private SectionScan section(LevelChunk chunk, ChunkScan scan, int sectionIndex) {
+			long revision = sectionRevision(chunk, sectionIndex);
+			SectionScan section = scan.sections[sectionIndex];
+			if (section == null || section.revision != revision) {
+				if (section != null) sectionResets++;
+				section = scan.sections[sectionIndex] = new SectionScan(revision);
+			}
+			return section;
+		}
+
+		private boolean takeCheck(long tick) {
+			roll(tick);
+			if (checksThisTick >= PALETTE_CHECKS_PER_TICK) return false;
+			checksThisTick++;
+			return true;
+		}
+
+		private boolean takeScan(long tick) {
+			roll(tick);
+			if (scansThisTick >= SECTION_SCANS_PER_TICK) return false;
+			scansThisTick++;
+			return true;
 		}
 
 		private void forgetUnloaded(ServerLevel level) {
@@ -223,10 +311,16 @@ public final class FarSight {
 		}
 	}
 
-	private static long chunkRevision(LevelChunk chunk) {
+	private static long sectionRevision(LevelChunk chunk, int sectionIndex) {
 		// Verification doubles may not carry the mixin; a scan then never outlives its game tick.
-		return chunk instanceof ChunkMutationRevisionAccess access ? access.arenaagents$chunkMutationRevision()
+		return chunk instanceof ChunkMutationRevisionAccess access ? access.arenaagents$sectionMutationRevision(sectionIndex)
 				: chunk.getLevel().getGameTime();
+	}
+
+	/** Whether a block was written after generation while its chunk has been loaded (a player's or a mob's change). */
+	static boolean changedSinceLoad(ServerLevel level, BlockPos position) {
+		LevelChunk chunk = level.getChunkSource().getChunkNow(position.getX() >> 4, position.getZ() >> 4);
+		return chunk instanceof ChunkMutationRevisionAccess access && access.arenaagents$changedSinceLoad(position);
 	}
 
 	/** Clears per-state kinds after datapack tags reload. */
@@ -272,27 +366,23 @@ public final class FarSight {
 		return SightedFeatures.built(state, null) && !SightedFeatures.natural(state);
 	}
 
+	static boolean searchable(Block block) {
+		return !UNSEARCHABLE.contains(block);
+	}
+
 	/** Reads one section's exposed blocks of the wanted kinds; returns false only when the tick's budget is spent. */
 	private static boolean scanSection(ServerLevel level, LevelIndex index, LevelChunk chunk, ChunkScan scan, int sectionIndex, int wanted, int dimensionClass) {
-		SectionScan section = scan.sections[sectionIndex];
-		if (section == null) section = scan.sections[sectionIndex] = new SectionScan();
+		SectionScan section = index.section(chunk, scan, sectionIndex);
 		int missing = wanted & ~section.kinds;
 		if (missing == 0) return true;
 		long tick = level.getGameTime();
-		if (index.budgetTick != tick) {
-			index.budgetTick = tick;
-			index.scansThisTick = 0;
-			index.checksThisTick = 0;
-		}
-		if (index.checksThisTick >= PALETTE_CHECKS_PER_TICK) return false;
-		index.checksThisTick++;
+		if (!index.takeCheck(tick)) return false;
 		LevelChunkSection blocks = chunk.getSections()[sectionIndex];
 		if (blocks.hasOnlyAir() || !blocks.maybeHas(state -> (kinds(state, dimensionClass) & missing) != 0)) {
 			section.kinds |= missing;
 			return true;
 		}
-		if (index.scansThisTick >= SECTION_SCANS_PER_TICK) return false;
-		index.scansThisTick++;
+		if (!index.takeScan(tick)) return false;
 		int baseX = chunk.getPos().getMinBlockX();
 		int baseY = chunk.getSectionYFromSectionIndex(sectionIndex) << 4;
 		int baseZ = chunk.getPos().getMinBlockZ();
@@ -344,8 +434,9 @@ public final class FarSight {
 	// ---- Line of sight ---------------------------------------------------------------------------------------------
 
 	/**
-	 * Clip results kept per agent while its eye stays within half a block and nothing in sight range changed. Each entry
-	 * maps an aim point to the block the clear line from the eye ends in.
+	 * Per-agent caches: clip results kept while the eye stays within half a block and nothing in sight range changed (each
+	 * entry maps an aim point to the block the clear line from the eye ends in), the last gathered candidates, and how
+	 * long the eye has been under water (the client's water vision, which sets how far it sees there).
 	 */
 	public static final class SightCache {
 		private String dimension;
@@ -353,6 +444,8 @@ public final class FarSight {
 		private final Map<Long, Long> ends = new HashMap<>();
 		private CandidateKey candidatesKey;
 		private Candidates candidates;
+		private long waterTick = Long.MIN_VALUE;
+		private int waterVisionTime;
 
 		void validate(String dimension, Vec3 eye, long revision) {
 			long x = Math.round(eye.x * 2.0D), y = Math.round(eye.y * 2.0D), z = Math.round(eye.z * 2.0D);
@@ -366,28 +459,53 @@ public final class FarSight {
 			}
 		}
 
+		/** Follows the client's water vision timer: +1 per tick with the eye in water (to 600), -10 per tick out of it. */
+		float waterVision(boolean eyeInWater, long gameTime) {
+			long elapsed = waterTick == Long.MIN_VALUE ? 0L : Math.max(0L, Math.min(600L, gameTime - waterTick));
+			waterTick = gameTime;
+			waterVisionTime = (int) Mth.clamp(eyeInWater ? waterVisionTime + elapsed : waterVisionTime - 10L * elapsed, 0L, 600L);
+			return FarSight.waterVision(waterVisionTime);
+		}
+
 		int size() {
 			return ends.size();
 		}
 	}
 
-	/** One pass's eye, view cone, clip budget and cache. */
+	/** The client's LocalPlayer.getWaterVision ramp: 0.6 after 5 s under water, 1 after 30 s. */
+	static float waterVision(int waterVisionTime) {
+		if (waterVisionTime >= 600) return 1.0F;
+		float early = Mth.clamp(waterVisionTime / 100.0F, 0.0F, 1.0F);
+		float late = waterVisionTime < 100 ? 0.0F : Mth.clamp((waterVisionTime - 100.0F) / 500.0F, 0.0F, 1.0F);
+		return early * 0.6F + late * 0.4F;
+	}
+
+	/** How far the agent sees: fog ends close when its eye is in lava or water, as the client draws it. */
+	static double sightRange(boolean eyeInLava, boolean fireResistant, boolean eyeInWater, float waterVision) {
+		if (eyeInLava) return fireResistant ? LAVA_FOG_END_FIRE_RESISTANT : LAVA_FOG_END;
+		if (eyeInWater) return Math.min(RANGE, WATER_FOG_END * Math.max(0.25F, waterVision));
+		return RANGE;
+	}
+
+	/** One pass's eye, view cone, sight range, clip budget and cache. */
 	static final class Sight {
 		private final ServerLevel level;
 		private final Vec3 eye;
 		private final Vec3 view;
-		private final CollisionContext context;
+		private final double range;
+		private final ClipContext clip;
 		private final SightCache cache;
 		private final Map<Long, Boolean> loadedChunks = new HashMap<>();
 		private final int budget;
 		private int sectionLimit = Integer.MAX_VALUE;
 		int clips;
 
-		Sight(ServerLevel level, Vec3 eye, Vec3 view, CollisionContext context, SightCache cache, int budget) {
+		Sight(ServerLevel level, Vec3 eye, Vec3 view, double range, CollisionContext context, SightCache cache, int budget) {
 			this.level = level;
 			this.eye = eye;
 			this.view = view;
-			this.context = context;
+			this.range = range;
+			this.clip = new ClipContext(eye, eye, ClipContext.Block.VISUAL, ClipContext.Fluid.NONE, context);
 			this.cache = cache;
 			this.budget = budget;
 		}
@@ -412,12 +530,18 @@ public final class FarSight {
 			return Math.sqrt(eye.distanceToSqr(Vec3.atCenterOf(position)));
 		}
 
+		boolean withinRange(BlockPos position) {
+			return distance(position) <= range;
+		}
+
 		/**
-		 * The block a clear line from the eye toward {@code point} ends in: the first block with a visual shape (fluids are
-		 * seen through, as {@link ObservationVisibility} rules), or the block holding the point when nothing is in the way.
-		 * Null when out of budget or the line crosses an unloaded chunk.
+		 * The block a clear line from the eye toward {@code point} ends in: the first block with a visual shape or holding
+		 * lava (lava is opaque; water is seen through, as {@link ObservationVisibility} rules), or the block holding the
+		 * point when nothing is in the way. Null when beyond sight range, out of budget, or the line crosses an unloaded
+		 * chunk.
 		 */
 		BlockPos lineEnd(Vec3 point) {
+			if (eye.distanceTo(point) > range + 1.0D) return null;
 			long key = pointKey(point);
 			Long cached = cache.ends.get(key);
 			if (cached != null) return cached == Long.MIN_VALUE ? null : BlockPos.of(cached);
@@ -426,14 +550,29 @@ public final class FarSight {
 			BlockPos end = null;
 			if (ObservationVisibility.hasLoadedSightPath(eye, point, position -> loadedChunks.computeIfAbsent(
 					ChunkPos.pack(position), ignored -> level.hasChunkAt(position)))) {
-				BlockHitResult hit = level.clip(new ClipContext(eye, point, ClipContext.Block.VISUAL, ClipContext.Fluid.NONE, context));
-				end = hit.getType() == HitResult.Type.MISS ? BlockPos.containing(point) : hit.getBlockPos().immutable();
+				end = BlockGetter.traverseBlocks(eye, point, clip, (context, position) -> {
+					BlockState state = level.getBlockState(position);
+					if (state.getFluidState().is(FluidTags.LAVA)) return position.immutable();
+					BlockHitResult hit = level.clipWithInteractionOverride(eye, point, position, context.getBlockShape(state, level, position), state);
+					return hit == null || hit.getType() == HitResult.Type.MISS ? null : hit.getBlockPos().immutable();
+				}, context -> null);
+				if (end == null) end = BlockPos.containing(point);
 			}
 			cache.ends.put(key, end == null ? Long.MIN_VALUE : end.asLong());
 			return end;
 		}
 
-		/** Whether one of the block's open faces that turn toward the eye is in view and in clear sight. */
+		/**
+		 * Whether a scanned block is still there (candidates can be a few seconds old) and one of its open faces that turn
+		 * toward the eye is in view and in clear sight within range.
+		 */
+		boolean sees(Found found) {
+			BlockPos position = BlockPos.of(found.position());
+			// The same block, not the same state: lava flows and doors open without the thing going away.
+			if (!withinRange(position) || !level.getBlockState(position).is(found.state().getBlock())) return false;
+			return seesBlock(position, found.openFaces());
+		}
+
 		boolean seesBlock(BlockPos position, int openFaces) {
 			Vec3 center = Vec3.atCenterOf(position);
 			for (Direction direction : Direction.values()) {
@@ -467,8 +606,8 @@ public final class FarSight {
 	}
 
 	/**
-	 * Everything a pass gathers from world data before testing sight: loaded chunks in range, structure starts, exposed
-	 * blocks by kind and one surface column per chunk by biome. It depends on where the eye is, not where it looks.
+	 * Everything a pass gathers from world data before testing sight: structure starts, exposed blocks by kind and one
+	 * surface column per chunk by biome. It depends on where the eye is, not where it looks.
 	 */
 	private record Candidates(List<StartView> starts, List<Found> built, List<Found> lava, List<Found> notable, List<Found> ore,
 			List<Found> poi, Map<String, List<BlockPos>> biomeColumns) {
@@ -479,8 +618,8 @@ public final class FarSight {
 
 	/**
 	 * Candidates are reused while the eye stays in the same chunk and 8-block height band, for at most 5 s: block changes,
-	 * newly loaded chunks and other agents' scans join within that time. Whether each candidate is seen is tested live on
-	 * every pass. (Keying on block changes instead missed almost every time in a village, where crops and doors change.)
+	 * newly loaded chunks and other agents' scans join within that time. Whether each candidate is seen, and is still
+	 * there, is checked live on every pass. (Keying on block changes missed almost every time in a village.)
 	 */
 	private record CandidateKey(String dimension, int chunkX, int chunkZ, int band, long age) {
 	}
@@ -488,24 +627,38 @@ public final class FarSight {
 	static final long CANDIDATE_TICKS = 100L;
 
 	record Cluster(List<Found> members, double distance) {
+		/** The member with the smallest packed position: stable while the cluster stands, wherever the agent views it from. */
+		long seed() {
+			long seed = Long.MAX_VALUE;
+			for (Found member : members) seed = Math.min(seed, member.position());
+			return seed;
+		}
 	}
 
 	/**
 	 * Looks once from the agent's eye. Candidates come from loaded chunks within {@link #RANGE}; each is reported only if a
-	 * clear line from the eye inside the view cone reaches it, and only within the distance its size makes noticeable.
+	 * clear line from the eye inside the view cone reaches it, and only within the distance the seen part makes noticeable.
 	 */
 	static Result look(ServerLevel level, ServerPlayer agent, LevelIndex index, SightCache cache, long revision, Request request) {
 		Vec3 eye = agent.getEyePosition();
 		Vec3 view = agent.getViewVector(1.0F);
 		String dimension = level.dimension().identifier().toString();
+		long gameTime = level.getGameTime();
 		cache.validate(dimension, eye, revision);
-		Sight sight = new Sight(level, eye, view.lengthSqr() == 0.0D ? Vec3.ZERO : view.normalize(), CollisionContext.of(agent), cache, request.clips());
+		boolean eyeInWater = agent.isEyeInFluid(FluidTags.WATER);
+		double range = sightRange(agent.isEyeInFluid(FluidTags.LAVA), agent.hasEffect(MobEffects.FIRE_RESISTANCE), eyeInWater,
+				cache.waterVision(eyeInWater, gameTime));
+		Sight sight = new Sight(level, eye, view.lengthSqr() == 0.0D ? Vec3.ZERO : view.normalize(), range, CollisionContext.of(agent), cache,
+				request.clips());
 		int dimensionClass = dimensionClass(level);
 		int eyeChunkX = Mth.floor(eye.x) >> 4, eyeChunkZ = Mth.floor(eye.z) >> 4;
-		CandidateKey key = new CandidateKey(dimension, eyeChunkX, eyeChunkZ, Mth.floor(eye.y) >> 3, level.getGameTime() / CANDIDATE_TICKS);
+		CandidateKey key = new CandidateKey(dimension, eyeChunkX, eyeChunkZ, Mth.floor(eye.y) >> 3, gameTime / CANDIDATE_TICKS);
 		Candidates gathered = key.equals(cache.candidatesKey) ? cache.candidates : null;
+		PerceptionTiming.count("far_sight_candidate_cache_hit", gathered == null ? 0 : 1);
 		boolean complete = true;
 		if (gathered == null) {
+			// Over the tick's budget a survey answers only from what is cached; there is nothing cached here.
+			if (request.clips() == 0) return Result.EMPTY;
 			List<LevelChunk> loaded = new ArrayList<>();
 			for (int[] offset : CHUNK_OFFSETS) {
 				LevelChunk chunk = level.getChunkSource().getChunkNow(eyeChunkX + offset[0], eyeChunkZ + offset[1]);
@@ -517,15 +670,15 @@ public final class FarSight {
 			List<Found> built = new ArrayList<>(), lava = new ArrayList<>(), notable = new ArrayList<>(), ore = new ArrayList<>(), poi = new ArrayList<>();
 			synchronized (index) {
 				index.forgetUnloaded(level);
+				int resets = index.sectionResets;
 				complete = scanAround(level, index, eye, loaded, dimensionClass, built, lava, notable, ore, poi, structureBoxes);
+				PerceptionTiming.count("far_sight_section_rescans", index.sectionResets - resets);
 			}
 			gathered = new Candidates(starts, built, lava, notable, ore, poi, biomeColumns(level, loaded));
 			// Only a finished gather is reused; an unfinished one is redone next pass so the spread-out scan continues.
 			cache.candidatesKey = complete ? key : null;
 			cache.candidates = complete ? gathered : null;
 		}
-		List<Found> built = gathered.built(), lava = gathered.lava(), notable = gathered.notable(), ore = gathered.ore(), poi = gathered.poi();
-		List<StartView> starts = gathered.starts();
 		List<Row> rows = new ArrayList<>();
 		int candidates = gathered.size();
 		ToDoubleFunction<Found> distance = found -> Math.sqrt(eye.distanceToSqr(Vec3.atCenterOf(BlockPos.of(found.position()))));
@@ -533,26 +686,29 @@ public final class FarSight {
 		// Lava first, as a hazard; then shares of the budget per section (they sum to the whole pass).
 		if (request.wants(Section.BLOCKS)) {
 			sight.section(0.10D);
-			rows.addAll(lavaRows(sight, cluster(lava, distance), distance, request.rowsPerSection()));
+			rows.addAll(lavaRows(sight, cluster(gathered.lava(), distance), request.rowsPerSection()));
 		}
 		if (request.wants(Section.STRUCTURES)) {
-			sight.section(0.30D);
-			rows.addAll(structureRows(level, sight, starts, request.rowsPerSection()));
+			sight.section(0.25D);
+			rows.addAll(structureRows(level, sight, gathered.starts(), request.rowsPerSection()));
 		}
 		if (request.wants(Section.POI)) {
 			sight.section(0.10D);
-			rows.addAll(poiRows(sight, poi, distance, request.rowsPerSection()));
+			rows.addAll(poiRows(sight, gathered.poi(), distance, request.rowsPerSection()));
 		}
 		if (request.wants(Section.BUILT)) {
-			sight.section(0.20D);
-			rows.addAll(builtRows(sight, cluster(built, distance), distance, request.rowsPerSection()));
+			sight.section(0.25D);
+			rows.addAll(builtRows(sight, cluster(gathered.built(), distance), request.rowsPerSection()));
 		}
 		if (request.wants(Section.BLOCKS)) {
 			sight.section(0.05D);
-			rows.addAll(notableRows(sight, notable, distance, request.rowsPerSection()));
+			rows.addAll(notableRows(sight, gathered.notable(), distance, request.rowsPerSection()));
 			for (Block block : request.searched()) {
 				sight.section(0.05D);
-				List<Found> matches = search(level, eye, block);
+				List<Found> matches = new ArrayList<>();
+				synchronized (index) {
+					if (!search(level, index, eye, block, matches)) complete = false;
+				}
 				candidates += matches.size();
 				rows.addAll(searchedRows(sight, block, matches, distance));
 			}
@@ -566,11 +722,15 @@ public final class FarSight {
 		if (request.wants(Section.VEINS)) {
 			sight.section(0.10D);
 			int tests = 0;
-			for (Found found : ore.stream().sorted(Comparator.comparingDouble(distance)).toList()) {
+			for (Found found : gathered.ore().stream().sorted(Comparator.comparingDouble(distance)).toList()) {
 				if (tests++ >= SightedFeatures.MAX_VEIN_SEEDS * 2 || sight.exhausted()) break;
-				if (sight.seesBlock(BlockPos.of(found.position()), found.openFaces())) seenOre.add(BlockPos.of(found.position()));
+				if (sight.sees(found)) seenOre.add(BlockPos.of(found.position()));
 			}
 		}
+		// Every row is judged by its own distance: a structure or cluster near the edge never reports a block past range.
+		rows.removeIf(row -> row.distance() > range);
+		PerceptionTiming.count("far_sight_candidates", candidates);
+		PerceptionTiming.count("far_sight_sight_lines", sight.clips);
 		return new Result(rows, seenOre, standingIn, sight.clips, candidates, complete && sight.clips < request.clips());
 	}
 
@@ -699,47 +859,85 @@ public final class FarSight {
 		return clusters;
 	}
 
-	/** How far a thing of this many exposed blocks is noticeable: big clusters to full range, small ones up close. */
-	static int noticeableDistance(int exposedBlocks) {
-		return exposedBlocks >= LARGE_CLUSTER ? RANGE : SMALL_SIGHT;
+	/** How far a thing of this many seen blocks is noticeable: big ones to full range, small ones up close. */
+	static int noticeableDistance(int seenBlocks) {
+		return seenBlocks >= LARGE_CLUSTER ? RANGE : SMALL_SIGHT;
+	}
+
+	/** The members a player sees, tested nearest first; enough to tell a large cluster from a small one. */
+	record SeenPart(List<Found> seen, int tested) {
+		int count() {
+			return seen.size();
+		}
+
+		Found nearest() {
+			return seen.getFirst();
+		}
+
+		int horizontalSize() {
+			int minX = Integer.MAX_VALUE, maxX = Integer.MIN_VALUE, minZ = Integer.MAX_VALUE, maxZ = Integer.MIN_VALUE;
+			for (Found member : seen) {
+				minX = Math.min(minX, BlockPos.getX(member.position()));
+				maxX = Math.max(maxX, BlockPos.getX(member.position()));
+				minZ = Math.min(minZ, BlockPos.getZ(member.position()));
+				maxZ = Math.max(maxZ, BlockPos.getZ(member.position()));
+			}
+			return Math.max(maxX - minX, maxZ - minZ) + 1;
+		}
+	}
+
+	/**
+	 * Tests a cluster's members nearest first. A cluster within {@link #SMALL_SIGHT} needs one seen block; farther, it
+	 * needs {@link #LARGE_CLUSTER} seen blocks, so one torch in front of a house at 200 blocks is not reported because of
+	 * the hidden rooms behind it. Stops once the answer is known or after {@code maxTests} members.
+	 */
+	static SeenPart seenPart(Cluster cluster, Predicate<Found> sees, ToDoubleFunction<Found> distance, int maxTests) {
+		List<Found> seen = new ArrayList<>();
+		int tested = 0;
+		boolean near = cluster.distance() <= SMALL_SIGHT;
+		for (Found member : cluster.members()) {
+			if (tested >= maxTests) break;
+			if (!near && seen.size() + (cluster.members().size() - tested) < LARGE_CLUSTER) break;
+			tested++;
+			if (sees.test(member)) seen.add(member);
+			if (near && !seen.isEmpty() && seen.size() >= 3) break;
+			if (!near && seen.size() >= LARGE_CLUSTER) break;
+		}
+		List<Found> noticed = seen.stream().filter(member -> distance.applyAsDouble(member) <= noticeableDistance(seen.size())).toList();
+		return new SeenPart(noticed, tested);
 	}
 
 	private static String blockId(BlockState state) {
 		return BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
 	}
 
-	private static String coarseKey(String prefix, BlockPos position) {
-		return prefix + "@" + (position.getX() >> 5) + "," + (position.getY() >> 5) + "," + (position.getZ() >> 5);
-	}
-
-	private static List<Row> lavaRows(Sight sight, List<Cluster> clusters, ToDoubleFunction<Found> distance, int limit) {
+	private static List<Row> lavaRows(Sight sight, List<Cluster> clusters, int limit) {
 		List<Row> rows = new ArrayList<>();
 		int tests = 0;
 		for (Cluster pool : clusters) {
-			if (rows.size() >= limit || tests >= 24 || sight.exhausted()) break;
-			if (pool.distance() > noticeableDistance(pool.members().size())) continue;
-			for (Found member : pool.members().subList(0, Math.min(4, pool.members().size()))) {
-				tests++;
-				BlockPos position = BlockPos.of(member.position());
-				if (!sight.seesBlock(position, member.openFaces())) continue;
-				rows.add(new Row(Section.BLOCKS, coarseKey("lava", position), "minecraft:lava", List.of(), pool.members().size(), 0,
-						Cell.of(position), distance.applyAsDouble(member)));
-				break;
-			}
+			if (rows.size() >= limit || tests >= 32 || sight.exhausted()) break;
+			if (pool.distance() > RANGE || pool.distance() > SMALL_SIGHT && pool.members().size() < LARGE_CLUSTER) continue;
+			SeenPart part = seenPart(pool, sight::sees, member -> sight.distance(BlockPos.of(member.position())), 12);
+			tests += part.tested();
+			if (part.count() == 0) continue;
+			BlockPos nearest = BlockPos.of(part.nearest().position());
+			rows.add(new Row(Section.BLOCKS, "lava@" + pool.seed(), "minecraft:lava", List.of(), part.count(), 0, Cell.of(nearest),
+					sight.distance(nearest)));
 		}
 		return rows;
 	}
 
 	/**
 	 * A structure is seen when a clear line from the eye toward one of its pieces (centre, top, or a side facing the eye)
-	 * ends on a built block inside that structure. Near ones are named; far ones list the built blocks seen and the size
-	 * of the pieces seen.
+	 * ends on a built block inside that structure that was there since generation (a torch a player put into an ancient
+	 * city's box does not name the city). Near ones are named; far ones list the built blocks seen and the size of the
+	 * pieces seen.
 	 */
 	private static List<Row> structureRows(ServerLevel level, Sight sight, List<StartView> starts, int limit) {
 		List<Row> rows = new ArrayList<>();
 		for (StartView view : starts) {
 			if (rows.size() >= limit || sight.exhausted()) break;
-			if (view.distance() > RANGE) continue;
+			if (view.distance() > sight.range) continue;
 			List<StructurePiece> pieces = new ArrayList<>(view.start().getPieces());
 			pieces.sort(Comparator.comparingDouble(piece -> boxDistance(sight.eye, piece.getBoundingBox())));
 			BlockPos nearest = null;
@@ -749,15 +947,15 @@ public final class FarSight {
 			for (StructurePiece piece : pieces) {
 				if (tested >= 6 || sight.exhausted()) break;
 				BoundingBox box = piece.getBoundingBox();
-				if (boxDistance(sight.eye, box) > RANGE) break;
+				if (boxDistance(sight.eye, box) > sight.range) break;
 				tested++;
 				for (Vec3 aim : aimPoints(sight.eye, box)) {
 					if (!sight.inView(aim)) continue;
 					BlockPos end = sight.lineEnd(aim);
-					if (end == null) continue;
+					if (end == null || !sight.withinRange(end)) continue;
 					if (!insideStructure(view.start(), end)) continue;
 					BlockState state = level.getBlockState(end);
-					if (!SightedFeatures.built(state, view.label())) continue;
+					if (!SightedFeatures.built(state, view.label()) || changedSinceLoad(level, end)) continue;
 					seenBlocks.add(blockId(state));
 					if (nearest == null || sight.distance(end) < sight.distance(nearest)) nearest = end;
 					minX = Math.min(minX, box.minX());
@@ -800,25 +998,24 @@ public final class FarSight {
 
 	/** Nether portals glow and span several blocks, so they count as large; beds, bells and workstations are small. */
 	private static List<Row> poiRows(Sight sight, List<Found> points, ToDoubleFunction<Found> distance, int limit) {
-		Map<String, List<Found>> groups = new LinkedHashMap<>();
-		for (Found found : points.stream().sorted(Comparator.comparingDouble(distance)).toList()) {
-			BlockPos position = BlockPos.of(found.position());
-			groups.computeIfAbsent(blockId(found.state()) + "@" + (position.getX() >> 3) + "," + (position.getY() >> 3) + "," + (position.getZ() >> 3),
-					ignored -> new ArrayList<>()).add(found);
-		}
+		Map<String, List<Found>> byType = new LinkedHashMap<>();
+		for (Found found : points) byType.computeIfAbsent(blockId(found.state()), ignored -> new ArrayList<>()).add(found);
+		List<Cluster> groups = new ArrayList<>();
+		for (List<Found> sameType : byType.values()) groups.addAll(cluster(sameType, distance));
+		groups.sort(Comparator.comparingDouble(Cluster::distance));
 		List<Row> rows = new ArrayList<>();
 		int tests = 0;
-		for (List<Found> group : groups.values()) {
+		for (Cluster group : groups) {
 			if (rows.size() >= limit || tests >= 24 || sight.exhausted()) break;
-			Found first = group.getFirst();
+			Found first = group.members().getFirst();
 			int reach = first.state().is(Blocks.NETHER_PORTAL) ? RANGE : SMALL_SIGHT;
-			if (distance.applyAsDouble(first) > reach) continue;
-			for (Found member : group.subList(0, Math.min(3, group.size()))) {
+			if (group.distance() > reach) continue;
+			for (Found member : group.members().subList(0, Math.min(3, group.members().size()))) {
 				tests++;
+				if (!sight.sees(member)) continue;
 				BlockPos position = BlockPos.of(member.position());
-				if (!sight.seesBlock(position, member.openFaces())) continue;
-				rows.add(new Row(Section.POI, coarseKey("poi:" + blockId(member.state()), position), blockId(member.state()), List.of(), 0, 0,
-						Cell.of(position), distance.applyAsDouble(member)));
+				rows.add(new Row(Section.POI, "poi@" + group.seed(), blockId(member.state()), List.of(), 0, 0, Cell.of(position),
+						distance.applyAsDouble(member)));
 				break;
 			}
 		}
@@ -826,38 +1023,24 @@ public final class FarSight {
 	}
 
 	/**
-	 * Clusters of building blocks outside every generated structure: possibly player-built. Big ones are noticeable to
-	 * full range, a lone torch only up close. The row lists the block ids actually seen, not the hidden ones.
+	 * Clusters of building blocks outside every generated structure: possibly player-built. The row lists the block ids
+	 * seen, and its size is the extent of the seen blocks; hidden rooms and back walls count for nothing.
 	 */
-	private static List<Row> builtRows(Sight sight, List<Cluster> clusters, ToDoubleFunction<Found> distance, int limit) {
+	private static List<Row> builtRows(Sight sight, List<Cluster> clusters, int limit) {
 		List<Row> rows = new ArrayList<>();
 		int tests = 0;
 		for (Cluster cluster : clusters) {
-			if (rows.size() >= limit || tests >= 48 || sight.exhausted()) break;
-			if (cluster.distance() > noticeableDistance(cluster.members().size())) continue;
-			Map<String, Integer> seen = new LinkedHashMap<>();
-			BlockPos nearest = null;
-			int clusterTests = 0;
-			for (Found member : cluster.members()) {
-				if (clusterTests >= 8 || seen.size() >= 3 && nearest != null || sight.exhausted()) break;
-				clusterTests++;
-				BlockPos position = BlockPos.of(member.position());
-				if (!sight.seesBlock(position, member.openFaces())) continue;
-				seen.merge(blockId(member.state()), 1, Integer::sum);
-				if (nearest == null) nearest = position;
-			}
-			tests += clusterTests;
-			if (nearest == null) continue;
-			int minX = Integer.MAX_VALUE, maxX = Integer.MIN_VALUE, minZ = Integer.MAX_VALUE, maxZ = Integer.MIN_VALUE;
-			for (Found member : cluster.members()) {
-				minX = Math.min(minX, BlockPos.getX(member.position()));
-				maxX = Math.max(maxX, BlockPos.getX(member.position()));
-				minZ = Math.min(minZ, BlockPos.getZ(member.position()));
-				maxZ = Math.max(maxZ, BlockPos.getZ(member.position()));
-			}
-			rows.add(new Row(Section.BUILT, coarseKey("built", nearest), null,
-					seen.entrySet().stream().sorted(Map.Entry.<String, Integer>comparingByValue().reversed()).map(Map.Entry::getKey).toList(),
-					0, Math.max(maxX - minX, maxZ - minZ) + 1, Cell.of(nearest), sight.distance(nearest)));
+			if (rows.size() >= limit || tests >= 64 || sight.exhausted()) break;
+			if (cluster.distance() > RANGE || cluster.distance() > SMALL_SIGHT && cluster.members().size() < LARGE_CLUSTER) continue;
+			SeenPart part = seenPart(cluster, sight::sees, member -> sight.distance(BlockPos.of(member.position())), 16);
+			tests += part.tested();
+			if (part.count() == 0) continue;
+			Map<String, Integer> ids = new LinkedHashMap<>();
+			for (Found member : part.seen()) ids.merge(blockId(member.state()), 1, Integer::sum);
+			BlockPos nearest = BlockPos.of(part.nearest().position());
+			rows.add(new Row(Section.BUILT, "built@" + cluster.seed(), null,
+					ids.entrySet().stream().sorted(Map.Entry.<String, Integer>comparingByValue().reversed()).map(Map.Entry::getKey).limit(3).toList(),
+					0, part.horizontalSize(), Cell.of(nearest), sight.distance(nearest)));
 		}
 		return rows;
 	}
@@ -869,46 +1052,77 @@ public final class FarSight {
 			if (rows.size() >= limit || tests >= 16 || sight.exhausted()) break;
 			if (distance.applyAsDouble(found) > SMALL_SIGHT) break;
 			tests++;
+			if (!sight.sees(found)) continue;
 			BlockPos position = BlockPos.of(found.position());
-			if (!sight.seesBlock(position, found.openFaces())) continue;
-			rows.add(new Row(Section.BLOCKS, "block:" + position.asLong(), blockId(found.state()), List.of(), 1, 0, Cell.of(position),
+			rows.add(new Row(Section.BLOCKS, "block@" + position.asLong(), blockId(found.state()), List.of(), 1, 0, Cell.of(position),
 					distance.applyAsDouble(found)));
 		}
 		return rows;
 	}
 
-	/** Exposed blocks of one id within {@link #SMALL_SIGHT}, read on demand (palette first); never loads a chunk. */
-	private static List<Found> search(ServerLevel level, Vec3 eye, Block block) {
-		List<Found> found = new ArrayList<>();
+	/**
+	 * Exposed blocks of one id within {@link #SMALL_SIGHT}, sections nearest the eye first. Each section's result is kept
+	 * with that section's scan until its blocks change, and reading a section uses the level's shared per-tick budget, so
+	 * any number of searches cannot add more than that budget to one tick. Returns false while sections are still unread.
+	 */
+	private static boolean search(ServerLevel level, LevelIndex index, Vec3 eye, Block block, List<Found> found) {
 		BlockPos center = BlockPos.containing(eye);
-		BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
+		record SectionRef(LevelChunk chunk, int index, double distance) {
+		}
+		List<SectionRef> sections = new ArrayList<>();
 		for (int cx = (center.getX() - SMALL_SIGHT) >> 4; cx <= (center.getX() + SMALL_SIGHT) >> 4; cx++) {
 			for (int cz = (center.getZ() - SMALL_SIGHT) >> 4; cz <= (center.getZ() + SMALL_SIGHT) >> 4; cz++) {
 				LevelChunk chunk = level.getChunkSource().getChunkNow(cx, cz);
 				if (chunk == null) continue;
-				LevelChunkSection[] sections = chunk.getSections();
-				for (int index = 0; index < sections.length; index++) {
-					int minY = chunk.getSectionYFromSectionIndex(index) << 4;
+				for (int sectionIndex = 0; sectionIndex < chunk.getSections().length; sectionIndex++) {
+					int minY = chunk.getSectionYFromSectionIndex(sectionIndex) << 4;
 					if (minY + 15 < center.getY() - SMALL_SIGHT || minY > center.getY() + SMALL_SIGHT) continue;
-					LevelChunkSection section = sections[index];
-					if (section.hasOnlyAir() || !section.maybeHas(state -> state.is(block))) continue;
-					for (int y = 0; y < 16; y++) for (int z = 0; z < 16; z++) for (int x = 0; x < 16; x++) {
-						BlockState state = section.getBlockState(x, y, z);
-						if (!state.is(block)) continue;
-						int wx = (cx << 4) + x, wy = minY + y, wz = (cz << 4) + z;
-						if (Math.abs(wx - center.getX()) > SMALL_SIGHT || Math.abs(wy - center.getY()) > SMALL_SIGHT
-								|| Math.abs(wz - center.getZ()) > SMALL_SIGHT) continue;
-						int open = openFaces(level, chunk, cursor, wx, wy, wz, state);
-						if (open != 0) found.add(new Found(BlockPos.asLong(wx, wy, wz), state, 0, open));
-						if (found.size() >= 1_024) return found;
-					}
+					sections.add(new SectionRef(chunk, sectionIndex, eye.distanceTo(new Vec3((cx << 4) + 8, minY + 8, (cz << 4) + 8))));
 				}
 			}
 		}
-		return found;
+		sections.sort(Comparator.comparingDouble(SectionRef::distance));
+		boolean complete = true;
+		long tick = level.getGameTime();
+		BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
+		for (SectionRef ref : sections) {
+			ChunkScan scan = index.scanOf(ref.chunk());
+			SectionScan section = index.section(ref.chunk(), scan, ref.index());
+			List<Found> cached = section.searches.get(block);
+			if (cached == null) {
+				if (!index.takeCheck(tick)) {
+					complete = false;
+					continue;
+				}
+				LevelChunkSection blocks = ref.chunk().getSections()[ref.index()];
+				if (blocks.hasOnlyAir() || !blocks.maybeHas(state -> state.is(block))) {
+					cached = List.of();
+				} else {
+					if (!index.takeScan(tick)) {
+						complete = false;
+						continue;
+					}
+					cached = new ArrayList<>();
+					int baseX = ref.chunk().getPos().getMinBlockX(), baseY = ref.chunk().getSectionYFromSectionIndex(ref.index()) << 4;
+					int baseZ = ref.chunk().getPos().getMinBlockZ();
+					for (int y = 0; y < 16 && cached.size() < MAX_ENTRIES_PER_SECTION; y++) for (int z = 0; z < 16; z++) for (int x = 0; x < 16; x++) {
+						BlockState state = blocks.getBlockState(x, y, z);
+						if (!state.is(block)) continue;
+						int open = openFaces(level, ref.chunk(), cursor, baseX + x, baseY + y, baseZ + z, state);
+						if (open != 0 && cached.size() < MAX_ENTRIES_PER_SECTION) cached.add(new Found(BlockPos.asLong(baseX + x, baseY + y, baseZ + z), state, 0, open));
+					}
+				}
+				section.searches.put(block, cached);
+			}
+			for (Found match : cached) {
+				if (Math.abs(BlockPos.getX(match.position()) - center.getX()) <= SMALL_SIGHT && Math.abs(BlockPos.getY(match.position()) - center.getY()) <= SMALL_SIGHT
+						&& Math.abs(BlockPos.getZ(match.position()) - center.getZ()) <= SMALL_SIGHT) found.add(match);
+			}
+		}
+		return complete;
 	}
 
-	/** One row per searched id: the nearest visible block and how many visible blocks were found (up to 16 tests). */
+	/** One row per searched id: the nearest seen block and how many were seen (up to 16 tests). */
 	private static List<Row> searchedRows(Sight sight, Block block, List<Found> matches, ToDoubleFunction<Found> distance) {
 		int visible = 0;
 		BlockPos nearest = null;
@@ -916,10 +1130,9 @@ public final class FarSight {
 		for (Found found : matches.stream().sorted(Comparator.comparingDouble(distance)).toList()) {
 			if (tests++ >= 16 || sight.exhausted()) break;
 			if (distance.applyAsDouble(found) > SMALL_SIGHT) break;
-			BlockPos position = BlockPos.of(found.position());
-			if (!sight.seesBlock(position, found.openFaces())) continue;
+			if (!sight.sees(found)) continue;
 			visible++;
-			if (nearest == null) nearest = position;
+			if (nearest == null) nearest = BlockPos.of(found.position());
 		}
 		if (nearest == null) return List.of();
 		String id = BuiltInRegistries.BLOCK.getKey(block).toString();
@@ -933,10 +1146,6 @@ public final class FarSight {
 				.unwrapKey().map(key -> key.identifier().toString()).orElse(null);
 	}
 
-	/**
-	 * Biome regions other than the one the agent stands in, by the nearest visible ground: each loaded chunk's middle
-	 * column gives a surface block and its biome; per biome the nearest columns are tested until one is in clear sight.
-	 */
 	/** Each loaded chunk's middle surface block, grouped by its biome. */
 	private static Map<String, List<BlockPos>> biomeColumns(ServerLevel level, List<LevelChunk> loaded) {
 		Map<net.minecraft.core.Holder<net.minecraft.world.level.biome.Biome>, List<BlockPos>> byHolder = new LinkedHashMap<>();
@@ -952,12 +1161,17 @@ public final class FarSight {
 		return columns;
 	}
 
+	/**
+	 * Biome regions other than the one the agent stands in, by the nearest visible ground: per biome the nearest surface
+	 * columns within range are tested until one is in clear sight.
+	 */
 	private static List<Row> biomeRows(Sight sight, Map<String, List<BlockPos>> columns, String standingIn, int limit) {
 		List<Row> rows = new ArrayList<>();
 		List<Map.Entry<String, List<BlockPos>>> biomes = new ArrayList<>();
 		for (var entry : columns.entrySet()) {
 			if (entry.getKey().equals(standingIn)) continue;
-			List<BlockPos> surfaces = new ArrayList<>(entry.getValue());
+			List<BlockPos> surfaces = new ArrayList<>(entry.getValue().stream().filter(sight::withinRange).toList());
+			if (surfaces.isEmpty()) continue;
 			surfaces.sort(Comparator.comparingDouble(sight::distance));
 			biomes.add(Map.entry(entry.getKey(), surfaces));
 		}
@@ -984,18 +1198,25 @@ public final class FarSight {
 
 	// ---- Rendering --------------------------------------------------------------------------------------------------
 
+	/** A short stable id for a row's key, so a sweep can tell repeated sightings of one thing from distinct things. */
+	static String rowId(String key) {
+		return Integer.toUnsignedString(key.hashCode(), 36);
+	}
+
 	/**
 	 * Adds rows to {@code target} per section with bearings for the live view. {@code show} filters rows (passive updates
-	 * keep only recent sightings) and {@code isNew} marks first sightings; at most {@code limit} rows per section.
+	 * keep only recent sightings) and {@code isNew} marks first sightings; at most {@code limit} rows per section. Survey
+	 * rows carry an {@code id} so lookAround can merge headings.
 	 */
 	static void render(JsonObject target, List<Row> rows, Vec3 eye, float yaw, Predicate<Row> show, Predicate<Row> isNew,
-			Map<Section, Integer> limits) {
+			Map<Section, Integer> limits, boolean withIds) {
 		Map<Section, JsonArray> sections = new LinkedHashMap<>();
 		for (Row row : rows) {
 			if (!show.test(row)) continue;
 			JsonArray array = sections.computeIfAbsent(row.section(), ignored -> new JsonArray());
 			if (array.size() >= limits.getOrDefault(row.section(), MAX_ROWS)) continue;
 			JsonObject json = new JsonObject();
+			if (withIds) json.addProperty("id", rowId(row.key()));
 			switch (row.section()) {
 				case STRUCTURES -> {
 					if (row.label() != null) json.addProperty("structure", row.label());
@@ -1033,7 +1254,7 @@ public final class FarSight {
 		return array;
 	}
 
-	/** Parses survey include/exclude entries; unknown sections and malformed block ids are rejected. */
+	/** Parses survey include/exclude entries; unknown sections, malformed or terrain block ids are rejected. */
 	static Request surveyRequest(List<String> include, List<String> exclude, int rows) {
 		EnumSet<Section> sections = include.isEmpty() ? EnumSet.allOf(Section.class) : EnumSet.noneOf(Section.class);
 		List<Block> searched = new ArrayList<>();
@@ -1042,24 +1263,27 @@ public final class FarSight {
 				String id = entry.substring("blocks:".length());
 				var key = net.minecraft.resources.Identifier.tryParse(id);
 				if (key == null || !BuiltInRegistries.BLOCK.containsKey(key)) {
-					throw new dev.agaminggod.arenaagents.agent.AgentDomainException("INVALID_INSPECTION", "Unknown block id in include: " + id);
+					throw new AgentDomainException("INVALID_INSPECTION", "Unknown block id in include: " + id);
 				}
 				Block block = BuiltInRegistries.BLOCK.getValue(key);
+				if (!searchable(block)) {
+					throw new AgentDomainException("INVALID_INSPECTION", id + " is terrain that fills whole areas; landmarks and blocks already show it");
+				}
 				if (!searched.contains(block)) searched.add(block);
 				sections.add(Section.BLOCKS);
 				continue;
 			}
 			Section section = Section.of(entry);
-			if (section == null) throw new dev.agaminggod.arenaagents.agent.AgentDomainException("INVALID_INSPECTION", "Unknown survey section: " + entry);
+			if (section == null) throw new AgentDomainException("INVALID_INSPECTION", "Unknown survey section: " + entry);
 			sections.add(section);
 		}
 		for (String entry : exclude) {
 			Section section = Section.of(entry);
-			if (section == null) throw new dev.agaminggod.arenaagents.agent.AgentDomainException("INVALID_INSPECTION", "Unknown survey section: " + entry);
+			if (section == null) throw new AgentDomainException("INVALID_INSPECTION", "Unknown survey section: " + entry);
 			sections.remove(section);
 		}
 		if (searched.size() > MAX_SEARCHED_BLOCKS) {
-			throw new dev.agaminggod.arenaagents.agent.AgentDomainException("INVALID_INSPECTION", "At most 4 blocks:<id> searches");
+			throw new AgentDomainException("INVALID_INSPECTION", "At most 4 blocks:<id> searches");
 		}
 		return new Request(sections, searched, rows, SURVEY_CLIPS);
 	}

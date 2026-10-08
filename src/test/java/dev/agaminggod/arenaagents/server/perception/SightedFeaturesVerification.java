@@ -42,6 +42,11 @@ public final class SightedFeaturesVerification {
 		farSightClusters();
 		farSightGeometry();
 		surveyRequests();
+		seenPartsOnly();
+		stableClusterKeys();
+		surveysAcknowledge();
+		fogRange();
+		perTickBudgets();
 		return checks;
 	}
 
@@ -317,6 +322,87 @@ public final class SightedFeaturesVerification {
 		check(points.size() == 3 && points.contains(new Vec3(15.0D, 65.0D, 15.0D)) && points.contains(new Vec3(15.0D, 69.5D, 15.0D))
 				&& points.contains(new Vec3(10.5D, 65.0D, 15.0D)), "aim at the centre, the top and the side facing the eye: " + points);
 		check(FarSight.aimPoints(new Vec3(30.0D, 65.0D, 30.0D), box).size() == 4, "from a corner both facing sides are aimed at");
+	}
+
+	/** Review fix: sizes and noticeability come only from seen blocks; one visible torch in front of a hidden house is small. */
+	private static void seenPartsOnly() {
+		List<FarSight.Found> house = new ArrayList<>();
+		for (int x = 200; x < 205; x++) for (int y = 64; y < 68; y++) for (int z = 0; z < 5; z++) house.add(found(x, y, z));
+		var cluster = FarSight.cluster(house, SightedFeaturesVerification::horizontal).getFirst();
+		check(cluster.members().size() >= FarSight.LARGE_CLUSTER, "the fixture house has many exposed blocks");
+		long torch = cluster.members().getFirst().position();
+		FarSight.SeenPart one = FarSight.seenPart(cluster, member -> member.position() == torch, SightedFeaturesVerification::horizontal, 16);
+		check(one.count() == 0, "one visible torch at 200 blocks is not reported because of hidden blocks behind it");
+		FarSight.SeenPart front = FarSight.seenPart(cluster, member -> net.minecraft.core.BlockPos.getX(member.position()) == 200,
+				SightedFeaturesVerification::horizontal, 32);
+		check(front.count() >= FarSight.LARGE_CLUSTER && front.horizontalSize() >= 2 && front.horizontalSize() <= 5, "a visible front wall is reported at the size of its seen part: "
+				+ front.count() + " seen, size " + front.horizontalSize());
+		var near = FarSight.cluster(List.of(found(10, 64, 0), found(10, 65, 0)), SightedFeaturesVerification::horizontal).getFirst();
+		check(FarSight.seenPart(near, member -> true, SightedFeaturesVerification::horizontal, 16).count() == 2, "up close one seen block is enough");
+		check(FarSight.seenPart(near, member -> false, SightedFeaturesVerification::horizontal, 16).count() == 0, "nothing seen, nothing reported");
+	}
+
+	/** Review fix: a cluster keeps one key wherever it is seen from, so walking along a wall does not re-announce it. */
+	private static void stableClusterKeys() {
+		List<FarSight.Found> wall = new ArrayList<>();
+		for (int x = 0; x < 64; x++) wall.add(found(x, 64, 100));
+		long fromWest = FarSight.cluster(wall, entry -> Math.abs(net.minecraft.core.BlockPos.getX(entry.position()) - 0)).getFirst().seed();
+		long fromEast = FarSight.cluster(wall, entry -> Math.abs(net.minecraft.core.BlockPos.getX(entry.position()) - 63)).getFirst().seed();
+		check(fromWest == fromEast, "the seed of a 64-block wall is the same from either end");
+		check(!FarSight.rowId("built@" + fromWest).equals(FarSight.rowId("built@" + (fromWest + 1))) && FarSight.rowId("x").length() <= 7,
+				"row ids are short and tell clusters apart");
+	}
+
+	/** Review fix: a survey marks rows known without starting the 30 s passive window, and only unknown rows are new. */
+	private static void surveysAcknowledge() {
+		SightedFeatures.Announcements seen = new SightedFeatures.Announcements();
+		Sample sample = new Sample(List.of(farRow(FarSight.Section.STRUCTURES, "minecraft:village_plains@1,1", "village", List.of(), 0, 30, new Cell(0, 64, 50))),
+				List.of(), List.of());
+		JsonObject survey = SightedFeatures.render(sample, Vec3.ZERO, 0.0F, seen, 100L, false, Map.of(), java.util.EnumSet.allOf(FarSight.Section.class));
+		JsonObject row = survey.getAsJsonArray("structures").get(0).getAsJsonObject();
+		check(row.get("new").getAsBoolean() && row.has("id"), "a survey shows an unknown village as new, with an id");
+		check(SightedFeatures.toJson(sample, Vec3.ZERO, 0.0F, seen, 110L) == null, "the next passive update does not repeat a surveyed village");
+		JsonObject again = SightedFeatures.render(sample, Vec3.ZERO, 0.0F, seen, 120L, false, Map.of(), java.util.EnumSet.allOf(FarSight.Section.class));
+		check(!again.getAsJsonArray("structures").get(0).getAsJsonObject().has("new"), "a second survey does not call it new");
+		check(SightedFeatures.toJson(sample, Vec3.ZERO, 0.0F, seen, 120L + SightedFeatures.NEW_STRUCTURE_TICKS + 1).getAsJsonArray("structures")
+				.get(0).getAsJsonObject().get("new").getAsBoolean(), "out of sight for a minute, it is announced passively again");
+		check(!SightedFeatures.toJson(sample, Vec3.ZERO, 0.0F, new SightedFeatures.Announcements(), 0L).getAsJsonArray("structures").get(0).getAsJsonObject().has("id"),
+				"passive rows carry no id");
+	}
+
+	/** Review fix: fog limits sight with the eye in water or lava, as the 26.1 client draws it. */
+	private static void fogRange() {
+		check(FarSight.sightRange(false, false, false, 0.0F) == FarSight.RANGE, "in air the full range");
+		check(FarSight.sightRange(true, false, false, 0.0F) == 1.0D && FarSight.sightRange(true, true, false, 0.0F) == 5.0D,
+				"in lava 1 block, 5 with fire resistance");
+		check(FarSight.sightRange(false, false, true, FarSight.waterVision(0)) == 24.0D, "just under water 24 blocks");
+		check(Math.abs(FarSight.sightRange(false, false, true, FarSight.waterVision(100)) - 57.6D) < 0.01D, "after 5 s under water about 58 blocks");
+		check(FarSight.sightRange(false, false, true, FarSight.waterVision(600)) == 96.0D, "after 30 s under water 96 blocks");
+		FarSight.SightCache cache = new FarSight.SightCache();
+		cache.waterVision(true, 0L);
+		check(Math.abs(cache.waterVision(true, 100L) - 0.6F) < 0.001F, "the server follows the client's water vision timer");
+		check(cache.waterVision(false, 105L) < 0.6F, "leaving the water fades it");
+	}
+
+	/** Review fix: passes, surveys and section reads are capped per level per tick, shared by all agents and searches. */
+	private static void perTickBudgets() {
+		FarSight.LevelIndex index = new FarSight.LevelIndex();
+		int passes = 0, surveys = 0;
+		for (int agent = 0; agent < 8; agent++) {
+			if (index.tryPass(500L, false)) passes++;
+			if (index.tryPass(500L, true)) surveys++;
+		}
+		check(passes == FarSight.PASSES_PER_TICK && surveys == FarSight.SURVEYS_PER_TICK, "8 agents on one tick: 2 passes and 1 survey run");
+		check(index.tryPass(501L, false), "the next tick has budget again");
+		check(!FarSight.searchable(Blocks.STONE) && !FarSight.searchable(Blocks.WATER) && FarSight.searchable(Blocks.DIAMOND_ORE),
+				"terrain is not searchable; ores are");
+		try {
+			FarSight.surveyRequest(List.of("blocks:minecraft:stone"), List.of(), 4);
+			throw new AssertionError("a stone search was accepted");
+		} catch (dev.agaminggod.arenaagents.agent.AgentDomainException expected) {
+			check("INVALID_INSPECTION".equals(expected.code()), "a survey refuses to search stone");
+		}
+		check(FarSight.Request.passive().cachedOnly().clips() == 0, "a survey over budget makes no new sight lines");
 	}
 
 	private static void surveyRequests() {
