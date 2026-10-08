@@ -202,8 +202,11 @@ export class NativeProgramExecutor {
 	}
 
 	#deferrableOrdinary(run, notificationPriority) {
-		return notificationPriority !== 'urgent' && run.decision?.priority !== 'urgent' && run.decision?.actionFailure === undefined
-			&& run.engine.snapshot().status === 'ACTIVE';
+		if (notificationPriority === 'urgent' || run.decision?.priority === 'urgent' || run.decision?.actionFailure !== undefined) return false;
+		const snapshot = run.engine.snapshot();
+		// Deferring only helps while authored work keeps the body busy. A routine whose source ran out holds the
+		// body until the model answers the pending decision, so that wait must not also sit out the window.
+		return snapshot.status === 'ACTIVE' && (snapshot.activeActionId !== null || snapshot.activeQueryId !== null);
 	}
 
 	/** Newer ordinary attention folded into the pending decision: same handle, latest trigger and facts, not yet seen. */
@@ -388,6 +391,8 @@ export class NativeProgramExecutor {
 			// A different ordinary trigger on a running routine is new facts for the same decision, not a new handle.
 			if (escalated || (request && request.trigger !== run.decision.trigger && !this.#deferrableOrdinary(run, request.priority))) this.#requestDecision(run, request);
 			else if (request && request.trigger !== run.decision.trigger) this.#foldOrdinary(run, request);
+			// The body went idle behind a deferred ordinary notification: tell the model now.
+			if (run.decision !== null && run.ordinaryNotificationTimer !== null && !this.#deferrableOrdinary(run, run.decision.priority)) this.#notifyDecision(run, run.decision.priority);
 		}
 		const snapshot = run.engine.snapshot();
 		if (run.stopping !== null && !run.bodyPending) this.#finish(run, run.stopping);

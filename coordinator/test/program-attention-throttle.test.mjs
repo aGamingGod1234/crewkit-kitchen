@@ -24,7 +24,8 @@ function setup(t, policy = 'continue_and_notify') {
 	t.after(() => executor.cancel(record.agentId));
 	let sequence = 1;
 	const sight = (extra = {}) => executor.onObservation(record, { observation: observation(extra.health), eventSequence: ++sequence, attention: true, priority: 'ordinary', trigger: 'resource_discovery', ...extra });
-	return { executor, result, timers, decisions, sight, advance: (ms) => { now += ms; } };
+	const finishAction = () => { for (const resolve of pending.splice(0)) resolve({ state: 'SUCCEEDED', reasonCode: 'DONE', observation: observation(), eventSequence: ++sequence }); };
+	return { executor, result, timers, decisions, sight, finishAction, advance: (ms) => { now += ms; } };
 }
 
 test('ordinary sightings during a running program wake the model once per window and keep one decision handle', async t => {
@@ -131,4 +132,22 @@ test('hazard edges compare against the previous facts only', async () => {
 	assert.equal(hazardEdge({ player: { health: 20, air: 300 } }, { player: { health: 20, air: 280 } }), true);
 	assert.equal(hazardEdge({ player: { health: 18 } }, { player: { health: 20 } }), false, 'healing is not a hazard');
 	assert.equal(hazardEdge(null, lava), false);
+});
+
+test('a routine whose source ran out does not wait out the window for its pending decision', async t => {
+	const run = setup(t);
+	run.sight();
+	await turn();
+	run.executor.respond(record, { programId: 'throttle', decisionId: run.decisions[0].decisionId, directive: 'continue' });
+	run.advance(3_000);
+	run.sight();
+	await turn();
+	assert.equal(run.decisions.length, 1, 'while the body works the sighting waits for the window');
+	assert.ok(run.timers.some(timer => timer.ms === 27_000 && !timer.cleared));
+	run.finishAction();
+	await turn();
+	run.finishAction();
+	for (let index = 0; index < 5; index++) await turn();
+	assert.equal(run.decisions.length, 2, 'the idle body notifies at once instead of after the window');
+	assert.ok(run.timers.filter(timer => timer.ms === 27_000).every(timer => timer.cleared), 'the deferred timer is retired');
 });

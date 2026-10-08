@@ -315,7 +315,11 @@ export class NativeToolRuntime {
 			if (['continue', 'replace'].includes(request.tool.directive) && this.#actions.get(record.agentId)?.pausedProgram === true) {
 				throw codedError('NATIVE_ACTION_IN_PROGRESS', 'Your fight_target/flee_from still owns the body; wait for its result (or cancelAction it), then respond to the program');
 			}
+			const answered = this.#programExecutor.status?.(record)?.decision;
 			await this.#programExecutor.respond(record, request.tool);
+			this.#trace('native_program_responded', { agentId: record.agentId, goalRevision: record.goalRevision, programId: request.tool.programId,
+				directive: request.tool.directive, trigger: answered?.trigger ?? null,
+				...(request.tool.directive === 'replace' ? programSourceSummary(request.tool.source) : {}) });
 			if (run && ['replace', 'pause', 'finish'].includes(request.tool.directive)) run.pendingSuccessor = null;
 			if (['pause', 'finish'].includes(request.tool.directive)) await run.result;
 			return this.#programStatus(record, request.tool.programId);
@@ -531,6 +535,13 @@ export class NativeToolRuntime {
 		if (run.settled) return;
 		run.settled = true;
 		const result = { ...outcome, programId: run.programId, goalRevision: run.goalRevision };
+		this.#trace('native_program_ended', { agentId, goalRevision: run.goalRevision, programId: run.programId,
+			termination: programTermination(outcome), state: outcome.state ?? null, reasonCode: outcome.reasonCode ?? null,
+			...(outcome.decision?.trigger === undefined ? {} : { pendingTrigger: outcome.decision.trigger }),
+			...(outcome.trigger === undefined ? {} : { trigger: outcome.trigger }),
+			programVersion: outcome.programVersion ?? null, actions: outcome.actions ?? 0,
+			actionsSucceeded: outcome.actionsSucceeded ?? 0, actionsFailed: outcome.actionsFailed ?? 0,
+			...(run.startedAtMs === undefined ? {} : { durationMs: Math.max(0, Date.now() - run.startedAtMs) }) });
 		const successor = run.pendingSuccessor;
 		run.pendingSuccessor = null;
 		const handoff = successor != null && error === null && outcome.state === 'YIELDED'
@@ -670,7 +681,12 @@ export class NativeToolRuntime {
 		const latest = this.#observations.get(record.agentId);
 		if (latest?.goalRevision !== record.goalRevision) throw codedError('CURRENT_OBSERVATION_REQUIRED', 'A current player observation is required before running a program');
 		run.state = 'RUNNING';
-		run.deadlineEpochMs = Date.now() + (request.tool.timeoutMs ?? 30_000);
+		run.startedAtMs = Date.now();
+		run.deadlineEpochMs = run.startedAtMs + (request.tool.timeoutMs ?? 30_000);
+		this.#trace('native_program_started', { agentId: record.agentId, goalRevision: run.goalRevision, programId: run.programId,
+			origin: request.tool.noteKey === undefined ? 'source' : 'note', background: request.tool.background === true,
+			...(run.handoff == null ? {} : { successor: true }), ...programSourceSummary(source),
+			maxActions: request.tool.maxActions ?? 64, timeoutMs: request.tool.timeoutMs ?? 30_000 });
 		// Missing measurements leave preparation disabled rather than guessing a delay.
 		let planningLeadMs;
 		try {
@@ -695,6 +711,12 @@ export class NativeToolRuntime {
 			onDecision: (_status, { priority } = {}) => {
 				if (this.#programRuns.get(record.agentId) !== run || this.#executionEpoch(record.agentId) !== run.epoch) return;
 				const status = this.#programStatus(record, run.programId);
+				// The authored attention policy suspended the body: say which trigger paused it, once per decision.
+				if (status.engineState === 'SUSPENDED' && status.decision?.decisionId !== run.pausedDecisionId) {
+					run.pausedDecisionId = status.decision?.decisionId;
+					this.#trace('native_program_paused', { agentId: record.agentId, goalRevision: run.goalRevision, programId: run.programId,
+						programVersion: status.programVersion, trigger: status.decision?.trigger ?? null, priority: priority ?? status.decision?.priority ?? null });
+				}
 				const wasDetached = run.detached;
 				run.detached = true;
 				run.detach(status);
@@ -1439,6 +1461,28 @@ function successorSummary(successor) {
 	return { queueId: successor.queueId, afterProgramId: successor.afterProgramId, goalRevision: successor.goalRevision,
 		programVersion: successor.programVersion, state: 'QUEUED', maxActions: successor.request.tool.maxActions ?? 64,
 		timeoutMs: successor.request.tool.timeoutMs ?? 30_000, sourceOrigin: successor.sourceOrigin };
+}
+
+/** Size and a short fingerprint of model-authored source, so traces can tell programs apart without logging them. */
+export function programSourceSummary(source) {
+	if (typeof source !== 'string') return {};
+	return { sourceBytes: Buffer.byteLength(source, 'utf8'), sourceHash: createHash('sha256').update(source).digest('hex').slice(0, 12) };
+}
+
+/** Why a program run ended, in one word a trace reader can count. */
+export function programTermination(outcome) {
+	const reason = outcome?.reasonCode;
+	if (outcome?.state === 'CANCELLED') return 'cancelled';
+	if (outcome?.state === 'TIMED_OUT') return 'timed_out';
+	if (outcome?.state === 'FAILED' || outcome?.state === 'UNKNOWN') return 'failed';
+	if (reason === 'PROGRAM_EXHAUSTED') return 'exhausted';
+	if (reason === 'PROGRAM_FINISH_REQUESTED') return 'finished';
+	if (reason === 'MODEL_PAUSED') return 'paused_by_model';
+	if (reason === 'PROGRAM_CHECKPOINT') return 'checkpoint';
+	if (reason === 'PROGRAM_ACTION_LIMIT') return 'action_limit';
+	if (reason === 'PROGRAM_IDLE') return 'idle';
+	if (reason === 'MODEL_DECISION_REQUIRED') return 'decision_required';
+	return 'yielded';
 }
 
 function codedError(code, message) { return Object.assign(new Error(message), { code }); }
