@@ -58,6 +58,8 @@ public final class PovClient {
 	private static Entity followedBody;
 	private static PovBodyPosition.Position lastFollowed;
 	private static boolean registered;
+	// The free-look hint shows once per game launch, the first time a spectated agent is on screen.
+	private static boolean freeLookHintShown;
 	private static AgentPovStatePayload latestState;
 	private static AgentPovMenuPayload latestMenu;
 	private static float attackStrength = 1.0F;
@@ -197,6 +199,25 @@ public final class PovClient {
 		if (agent != null && !HANDS.seeded()) HANDS.tick(agent.getViewXRot(1.0F), agent.getViewYRot(1.0F));
 	}
 
+	/**
+	 * Spectate free look is wanted while the operator holds the bound sneak key with no screen open. Takeover never
+	 * free-looks: there the mouse drives the body. Called every frame from the mouse hook and every tick here, so a
+	 * press or release lands on the next frame and a release while the mouse is not captured still returns.
+	 */
+	public static void updateFreeLook(Minecraft client) {
+		PovClientSession current = TRACKER.session().orElse(null);
+		boolean wanted = current != null && !current.takeover() && client.screen == null && client.options.keyShift.isDown();
+		PovFreeLook.hold(wanted, System.nanoTime());
+	}
+
+	/**
+	 * While the camera is off the agent's look the agent's hands are hidden: drawn at the camera they would claim the
+	 * agent looks where the operator does. They come back once the return ease has landed on the agent's look.
+	 */
+	public static boolean handsHidden() {
+		return PovFreeLook.detached(System.nanoTime());
+	}
+
 	/** Smoothed agent look for the first-person hands; advanced once per client tick. */
 	public static PovHands hands() {
 		return HANDS;
@@ -299,9 +320,15 @@ public final class PovClient {
 		if (current.takeover() && agent != null) followServerPosition(agent);
 		else BODY_POSITION.reset();
 		PovHudProxy.tick(client, agent);
+		updateFreeLook(client);
+		if (agent != null && !current.takeover() && !freeLookHintShown) {
+			freeLookHintShown = true;
+			overlay(client, Component.literal("Hold ").append(client.options.keyShift.getTranslatedKeyMessage()).append(" to look around"));
+		}
 		// The view rotation is what the camera shows, so the hands chase exactly that; a lost agent forgets
 		// the bob so the hands snap to its look when it reappears instead of swinging in from a stale one.
-		if (agent != null) HANDS.tick(agent.getViewXRot(1.0F), agent.getViewYRot(1.0F));
+		// Free look hides the hands, which then reseed on the agent's look the same way.
+		if (agent != null && !handsHidden()) HANDS.tick(agent.getViewXRot(1.0F), agent.getViewYRot(1.0F));
 		else HANDS.reset();
 		// The body stays in the world in both modes; only a takeover can end on its damage, so only then is it announced.
 		if (BODY.observe(client.player.getHealth() + client.player.getAbsorptionAmount()) && current.takeover())
@@ -352,7 +379,11 @@ public final class PovClient {
 	}
 
 	private static void overlay(Minecraft client, String message) {
-		if (client.gui != null) client.gui.setOverlayMessage(Component.literal(message), false);
+		overlay(client, Component.literal(message));
+	}
+
+	private static void overlay(Minecraft client, Component message) {
+		if (client.gui != null) client.gui.setOverlayMessage(message, false);
 	}
 
 	private static Player bindCamera(Minecraft client, PovClientSession current) {
