@@ -243,6 +243,37 @@ test('steering rides along with the next tool result and resolves once delivered
 	} finally { await close(); }
 });
 
+test('Claude returns a blocking body result early and attaches the latest lazily-built steer', async () => {
+	let captured = null;
+	let releaseExecution;
+	let toolStarted;
+	const started = new Promise((resolve) => { toolStarted = resolve; });
+	const execution = new Promise((resolve) => { releaseExecution = resolve; });
+	const { service, close } = await harness({
+		async onUser(child) {
+			captured = (await child.rpc('tools/call', { name: 'wait', arguments: { durationMs: 30_000 } })).result;
+			child.emitLine({ type: 'result', subtype: 'success', is_error: false, result: 'ok', session_id: 'session-1' });
+		},
+	});
+	try {
+		const agent = await service.createAgent(profile(), { controlProtocol: 'native_tools' });
+		const turn = agent.act('Goal.', { goalRevision: 0, executeTool: async () => { toolStarted(); return execution; } });
+		void turn.catch(() => {});
+		await started;
+		let currentFacts = 'stale zombie facts';
+		const steer = agent.steer(() => currentFacts, {
+			goalRevision: 0,
+			onInterrupt: () => releaseExecution({ state: 'RUNNING', actionId: 'body-action-1', interruptedBy: 'danger' }),
+		});
+		currentFacts = 'fresh zombie and health facts';
+		assert.deepEqual(await Promise.race([steer, new Promise((resolve) => setTimeout(() => resolve('BLOCKED'), 100))]), { turnId: '1:1' });
+		assert.deepEqual(await turn, { status: 'completed', toolCalls: 1 });
+		assert.equal(JSON.parse(captured.content[0].text).actionId, 'body-action-1');
+		assert.equal(JSON.parse(captured.content[0].text).state, 'RUNNING');
+		assert.match(captured.content[1].text, /fresh zombie and health facts/);
+	} finally { releaseExecution({ state: 'RUNNING', actionId: 'body-action-1', interruptedBy: 'danger' }); await close(); }
+});
+
 test('a steer that never reaches a tool boundary is rejected so the coordinator defers it', async () => {
 	let release;
 	const { service, close } = await harness({
@@ -340,7 +371,7 @@ async function waitFor(predicate, timeoutMs = 2_000) {
 	}
 }
 
-test('danger steers before the first tool call never interrupt the reasoning turn; all arrive at the first tool boundary', async () => {
+test('pending Claude steers are superseded and built at the next tool boundary', async () => {
 	let captured = null;
 	let release;
 	const { service, children, close } = await harness({
@@ -355,8 +386,11 @@ test('danger steers before the first tool call never interrupt the reasoning tur
 		const turn = agent.act('Goal: survive.', { goalRevision: 0, executeTool: async () => ({ state: 'OK' }) });
 		await waitFor(() => release !== undefined);
 		// The play-test: ~30 threat/damage events while the model was still deciding its first action.
-		const steers = ['Threat: zombie targeting.', 'Damage: health 17.', 'Suffocation: air 150 of 300.']
-			.map((text) => agent.steer(text, { goalRevision: 0 }));
+		const steers = [
+			agent.steer('obsolete threat snapshot', { goalRevision: 0 }),
+			agent.steer('obsolete damage snapshot', { goalRevision: 0 }),
+			agent.steer('fresh suffocation facts', { goalRevision: 0 }),
+		];
 		release();
 		for (const steer of steers) assert.deepEqual(await steer, { turnId: '1:1' });
 		assert.deepEqual(await turn, { status: 'completed', toolCalls: 1 });
@@ -364,8 +398,9 @@ test('danger steers before the first tool call never interrupt the reasoning tur
 			'a steer never interrupts the model mid-reasoning');
 		assert.equal(children[0].lines.filter((line) => line.type === 'user').length, 1, 'no restarted or extra turn');
 		assert.equal(children.length, 1, 'the warm process and its reasoning are kept');
-		assert.equal(captured.content.length, 2, 'every queued steer rides on the one tool result');
-		assert.match(captured.content[1].text, /zombie targeting[\s\S]*health 17[\s\S]*air 150/);
+		assert.equal(captured.content.length, 2, 'the latest pending steer rides on the one tool result');
+		assert.match(captured.content[1].text, /fresh suffocation facts/);
+		assert.doesNotMatch(captured.content[1].text, /obsolete threat|obsolete damage/);
 	} finally { await close(); }
 });
 
@@ -555,8 +590,10 @@ test('an unacknowledged interrupt restarts Claude Code without omitted facts fro
 	} finally { await close(); }
 });
 
-test('a tool result for a settled turn is not committed as an observation baseline', async () => {
+test('a tool result for a settled turn is not committed as an observation baseline', { timeout: 3_000 }, async () => {
 	let release;
+	let toolStarted;
+	const executingTool = new Promise((resolve) => { toolStarted = resolve; });
 	let firstView = null;
 	let secondView = null;
 	const observed = { freshness: { fresh: true }, observation: { world: { worldId: 'w', dimension: 'minecraft:overworld' }, player: { health: 20, x: 1 } } };
@@ -574,9 +611,9 @@ test('a tool result for a settled turn is not committed as an observation baseli
 	});
 	try {
 		const agent = await service.createAgent(profile(), { controlProtocol: 'native_tools' });
-		const first = agent.act('One.', { goalRevision: 0, executeTool: () => new Promise((resolve) => { release = () => resolve(observed); }) });
+		const first = agent.act('One.', { goalRevision: 0, executeTool: () => new Promise((resolve) => { release = () => resolve(observed); toolStarted(); }) });
 		void first.catch(() => {});
-		await settle();
+		await executingTool;
 		await agent.interrupt();
 		await assert.rejects(first);
 		release();

@@ -65,3 +65,66 @@ for(const outcome of ['empty','transient'])test(`review repeated DEAD ${outcome}
   assert.equal(planner.requests.length,5);assert.equal(registry.get('agent-a').state,DynamicAgentState.PAUSED);
  }finally{await run.coordinator.stop();}
 });
+
+test('pending native steers use fresh facts and commit merged conversation reservations once', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	let finishTurn;
+	let finishSteer;
+	const turnGate = new Promise((resolve) => { finishTurn = resolve; });
+	const steerGate = new Promise((resolve) => { finishSteer = resolve; });
+	planner.steerRequests = [];
+	planner.deliveredSteers = [];
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		if (planner.requests.length === 1) await turnGate;
+		return { toolCalls: 1 };
+	};
+	planner.steerNativeTurn = async (request) => {
+		planner.steerRequests.push(request);
+		request.onInterrupt?.();
+		await steerGate;
+		planner.deliveredSteers.push(typeof request.input === 'function' ? await request.input() : request.input);
+		return { turnId: 'turn-1' };
+	};
+	const run = await start({ registry, planner, initialRegistry: [{ ...record(), state: DynamicAgentState.IDLE }],
+		config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } } });
+	let conversationEvents = 0;
+	run.coordinator.on('conversationEvent', () => { conversationEvents += 1; });
+	const say = (sequence) => run.bridge.emit('conversation_event', { agentId: 'agent-a', payload: {
+		sequence, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
+		text: `Question ${sequence}`, goalRevision: 0, observedAtEpochMs: sequence,
+	} });
+	const payloadOf = (input) => {
+		const payload = input.slice(input.indexOf('\n') + 1);
+		const retry = payload.indexOf('\nYour previous turn');
+		return JSON.parse(retry < 0 ? payload : payload.slice(0, retry));
+	};
+	const deliveredConversation = (input) => payloadOf(input).conversation.entries;
+	try {
+		say(1);
+		await eventually(() => planner.requests.length === 1);
+		say(2);
+		await eventually(() => planner.steerRequests.length === 1 && conversationEvents === 2);
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+			goalRevision: 0, eventSequence: 20, attention: false, observation: { player: { health: 7 } },
+		} });
+		say(3);
+		await eventually(() => conversationEvents === 3);
+		finishSteer();
+		await eventually(() => planner.deliveredSteers.length === 1);
+		const steerInput = planner.deliveredSteers[0];
+		assert.equal(payloadOf(steerInput).observation.player.health, 7);
+		assert.deepEqual(deliveredConversation(steerInput).map(({ sequence, text }) => [sequence, text]), [
+			[2, 'Question 2'], [3, 'Question 3'],
+		]);
+		finishTurn();
+		await eventually(() => planner.requests.length === 2);
+		const retryMessages = deliveredConversation(planner.requests[1].input);
+		assert.deepEqual(retryMessages, [], 'committed steer messages do not return in the following native turn');
+	} finally {
+		finishSteer();
+		finishTurn();
+		await run.coordinator.stop();
+	}
+});

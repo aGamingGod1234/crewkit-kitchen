@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { AgentRegistry, DynamicAgentState } from '../src/agent-registry.mjs';
 import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
-import { FakePlanner, RecordingGoalSupervisor, record, factToWireObservation, DEATH, eventually, start, NativeLifecycleClock } from './fixtures/dynamic-main-fixture.mjs';
+import { FakePlanner, RecordingGoalSupervisor, record, factToWireObservation, DEATH, eventually, start, NativeLifecycleClock, resolveNativeSteerInput } from './fixtures/dynamic-main-fixture.mjs';
 
 for (const providerEnd of ['failure', 'expiry']) {
 	for (const startsSuccessor of [false, true]) {
@@ -23,7 +23,7 @@ for (const providerEnd of ['failure', 'expiry']) {
 			let handle, releaseTurn;
 			const turnGate = new Promise(resolve => { releaseTurn = resolve; });
 			planner.getNativeDecisionTiming = () => ({ count: 4, p50Ms: 500, p95Ms: 999 });
-			planner.steerNativeTurn = async request => { steers.push(request); };
+			planner.steerNativeTurn = async request => { await resolveNativeSteerInput(request); steers.push(request); };
 			planner.requestNativeTurn = async request => {
 				planner.requests.push(request);
 				if (planner.requests.length > 1) return { status: 'completed', toolCalls: 0 };
@@ -105,7 +105,7 @@ test('stopping a native routine suppresses its pending planning reminder', async
 	let handle, releaseTurn;
 	const turnGate = new Promise((resolve) => { releaseTurn = resolve; });
 	planner.getNativeDecisionTiming = () => ({ count: 4, p50Ms: 4000, p95Ms: 4999 });
-	planner.steerNativeTurn = async (request) => { steers.push(request); };
+	planner.steerNativeTurn = async (request) => { await resolveNativeSteerInput(request); steers.push(request); };
 	planner.requestNativeTurn = async (request) => {
 		planner.requests.push(request);
 		handle = await request.executeTool({ agentId: request.agentId, goalRevision: request.goalRevision,

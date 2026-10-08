@@ -12,7 +12,7 @@ import { PlanningScheduler } from '../src/planning-scheduler.mjs';
 import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
 import { ModelNotebook } from '../src/model-notebook.mjs';
 import { completionContract, withCompletionContract } from './fixtures/completion-contract.mjs';
-import { SOURCE, createDynamicCoordinator, FakeBridge, FakeProvider, FakePlanner, RecordingGoalSupervisor, record, DEATH, immutableGoalSpec, eventually, start, realPlannerProvider } from './fixtures/dynamic-main-fixture.mjs';
+import { SOURCE, createDynamicCoordinator, FakeBridge, FakeProvider, FakePlanner, RecordingGoalSupervisor, record, DEATH, immutableGoalSpec, eventually, start, realPlannerProvider, resolveNativeSteerInput } from './fixtures/dynamic-main-fixture.mjs';
 
 test('acknowledges and idempotently replays one composite conversation wake', async () => {
 	const run = await start();
@@ -1262,7 +1262,7 @@ test('measured planning lead steers the same native turn once while its routine 
 	let handle, releaseTurn;
 	const thinking = new Promise(resolve => { releaseTurn = resolve; });
 	planner.getNativeDecisionTiming = () => ({ count: 4, p50Ms: 4000, p95Ms: 5000 });
-	planner.steerNativeTurn = async request => { steers.push(request); };
+	planner.steerNativeTurn = async request => { await resolveNativeSteerInput(request); steers.push(request); };
 	planner.requestNativeTurn = async request => {
 		planner.requests.push(request);
 		handle = await request.executeTool({ agentId: request.agentId, goalRevision: request.goalRevision,
@@ -1312,6 +1312,7 @@ test('a slow planning advisory does not block urgent steering or consume convers
 	const turnGate = new Promise((resolve) => { releaseTurn = resolve; });
 	planner.getNativeDecisionTiming = () => ({ count: 4, p50Ms: 4000, p95Ms: 5000 });
 	planner.steerNativeTurn = async (request) => {
+		await resolveNativeSteerInput(request);
 		steers.push(request);
 		if (steers.length === 1) await preparationGate;
 	};
@@ -1332,7 +1333,7 @@ test('a slow planning advisory does not block urgent steering or consume convers
 			observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
 		await eventually(() => handle && commands().length === 1);
 		await new Promise((resolve) => setTimeout(resolve, 0));
-		await eventually(() => steers.length === 1);
+		await eventually(() => steers.length === 1 && typeof steers[0].input === 'string');
 		const advisory = JSON.parse(steers[0].input.split('\n').at(-1));
 		assert.deepEqual(advisory.conversation.entries, [], 'advisory must not consume unread conversation');
 
@@ -1340,7 +1341,7 @@ test('a slow planning advisory does not block urgent steering or consume convers
 			sequence: 1, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
 			text: 'Please answer while the routine continues.', goalRevision: 1, observedAtEpochMs: 1_787_184_000_001,
 		} });
-		await eventually(() => steers.length === 2);
+		await eventually(() => steers.length === 2 && typeof steers[1].input === 'string');
 		const urgent = JSON.parse(steers[1].input.split('\n').at(-1));
 		assert.deepEqual(urgent.conversation.entries.map(({ sequence }) => sequence), [1]);
 		assert.equal(planner.requests.length, 1, 'urgent steering stays on the existing model turn');

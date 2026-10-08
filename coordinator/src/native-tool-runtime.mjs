@@ -67,6 +67,7 @@ export class NativeToolRuntime {
 	#postResultSamples = new Map();
 	#publicationStreaks = new Map();
 	#sequenceFinishReservations = new Map();
+	#blockingToolRuns = new Map();
 	#sequence = 0;
 	#publicationGraceMs;
 
@@ -290,6 +291,15 @@ export class NativeToolRuntime {
 			&& status.programVersion === programVersion && status.decision == null;
 	}
 
+	interruptBlockingTool(agentId, interruptedBy = 'danger') {
+		if (!['danger', 'conversation'].includes(interruptedBy)) throw new TypeError('interruptedBy must be danger or conversation');
+		const run = this.#blockingToolRuns.get(agentId);
+		if (run === undefined) return false;
+		if (run.interruptedBy !== 'conversation' || interruptedBy === 'conversation') run.interruptedBy = interruptedBy;
+		run.resolveInterruption();
+		return true;
+	}
+
 	decorateObservation(record, observation = {}) {
 		validateRecord(record);
 		const latest = this.#observations.get(record.agentId);
@@ -320,6 +330,14 @@ export class NativeToolRuntime {
 	hasCurrent(record) {
 		const latest = this.#observations.get(record.agentId);
 		return latest?.goalRevision === record.goalRevision;
+	}
+
+	latestObservation(record) {
+		validateRecord(record);
+		const latest = this.#observations.get(record.agentId);
+		return latest?.goalRevision === record.goalRevision
+			? { eventSequence: latest.eventSequence, observation: structuredClone(latest.observation) }
+			: null;
 	}
 
 	async execute(request, record, { lifecycleGeneration = null } = {}) {
@@ -373,7 +391,8 @@ export class NativeToolRuntime {
 					return this.#startReplacementAsNewAction(request, record, previous, { pausedProgram: true });
 				}
 				const tool = { ...request.tool, kind: 'action' };
-				return this.#executeAction(request, record, tool, null, request.tool.kind !== 'start_action', null, null, { pausedProgram: true });
+				const execute = () => this.#executeAction(request, record, tool, null, request.tool.kind !== 'start_action', null, null, { pausedProgram: true });
+				return request.tool.kind === 'action' ? this.#withBlockingToolRun(record, execute) : execute();
 			}
 			throw codedError('NATIVE_PROGRAM_IN_PROGRESS', 'A model-authored program owns this player; use programStatus and cancelProgram before issuing another body operation (fight_target/flee_from are allowed while it is paused for your decision)');
 		}
@@ -391,15 +410,52 @@ export class NativeToolRuntime {
 		if (request.tool.kind === 'finish') return this.#finish(request, record, lifecycleGeneration);
 		if (request.tool.kind === 'explore_frontier') return this.#exploreFrontier(request, record);
 		const tool = constrainGoalBoundNavigation(request.tool, record.currentGoalSpec);
-		if (tool.kind === 'sequence') return this.#executeSequence({ ...request, tool }, record, this.#executionEpoch(record.agentId), lifecycleGeneration);
+		if (tool.kind === 'sequence') return this.#withBlockingToolRun(record,
+			(run) => this.#executeSequence({ ...request, tool }, record, this.#executionEpoch(record.agentId), lifecycleGeneration, run));
 		if (tool.kind === 'lookAround') {
-			const sweep = {};
-			this.#sweeps.set(record.agentId, sweep);
-			try { return await this.#executeLookAround(request, record, tool, this.#executionEpoch(record.agentId)); }
-			finally { if (this.#sweeps.get(record.agentId) === sweep) this.#sweeps.delete(record.agentId); }
+			return this.#withBlockingToolRun(record, async (run) => {
+				const sweep = {};
+				this.#sweeps.set(record.agentId, sweep);
+				try { return await this.#executeLookAround(request, record, tool, this.#executionEpoch(record.agentId), run); }
+				finally { if (this.#sweeps.get(record.agentId) === sweep) this.#sweeps.delete(record.agentId); }
+			});
 		}
 		if (tool.kind !== 'action') throw codedError('INVALID_NATIVE_TOOL', 'Native tool did not normalize to an action');
-		return this.#executeAction(request, record, tool);
+		return tool.actionType === 'chat'
+			? this.#executeAction(request, record, tool)
+			: this.#withBlockingToolRun(record, () => this.#executeAction(request, record, tool));
+	}
+
+	async #withBlockingToolRun(record, operation) {
+		if (this.#blockingToolRuns.has(record.agentId)) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'A blocking native body tool is already running');
+		let resolveInterruption;
+		const interruption = new Promise((resolve) => { resolveInterruption = resolve; });
+		let releaseWork = null;
+		const run = {
+			interruption, resolveInterruption, interruptedBy: null, sequence: null, lookAround: null,
+			activeActions: 0, finished: false, released: false,
+			retainAction: () => {
+				if (releaseWork === null) releaseWork = this.#onWorkStarted(record, 'action');
+			},
+			trackAction: (result) => {
+				run.activeActions += 1;
+				const settle = () => {
+					run.activeActions -= 1;
+					if (releaseWork !== null && run.finished && run.activeActions === 0 && !run.released) { run.released = true; releaseWork(); }
+				};
+				void result.then(settle, settle);
+			},
+			finish: () => {
+				run.finished = true;
+				if (releaseWork !== null && run.activeActions === 0 && !run.released) { run.released = true; releaseWork(); }
+			},
+		};
+		this.#blockingToolRuns.set(record.agentId, run);
+		try { return await operation(run); }
+		finally {
+			run.finish();
+			if (this.#blockingToolRuns.get(record.agentId) === run) this.#blockingToolRuns.delete(record.agentId);
+		}
 	}
 
 	/**
@@ -1017,7 +1073,7 @@ export class NativeToolRuntime {
 		return result;
 	}
 
-	async #executeLookAround(request, record, tool, executionEpoch) {
+	async #executeLookAround(request, record, tool, executionEpoch, blockingRun) {
 		const source = this.#observations.get(record.agentId)?.observation ?? {};
 		const input = source.interaction?.input ?? {};
 		const selectedSlot = Number.isSafeInteger(input.selectedSlot) && input.selectedSlot >= 0 && input.selectedSlot <= 8
@@ -1028,6 +1084,7 @@ export class NativeToolRuntime {
 		const surveys = [];
 		for (let index = 0; index < tool.steps; index += 1) {
 			if (this.#executionEpoch(record.agentId) !== executionEpoch) throw codedError('NATIVE_ACTION_CANCELLED', 'Camera sweep cancelled before its next step');
+			blockingRun.lookAround = { runningStep: index + 1, completedSteps: results.length, remainingSteps: tool.steps - index - 1 };
 			const action = {
 				kind: 'action',
 				actionType: 'control',
@@ -1040,6 +1097,7 @@ export class NativeToolRuntime {
 			};
 			const result = await this.#executeAction(request, record, action, index);
 			results.push({ actionType: action.actionType, ...result });
+			if (result.state === 'RUNNING') return { ...result, lookAround: blockingRun.lookAround, results, samples };
 			if (result.state !== 'SUCCEEDED') return { state: result.state, completed: results.length, failedAt: index, results, samples };
 			const facts = await this.#observe(record, { includeMetadata: false, afterResult: result });
 			if (facts.freshness.fresh !== true) throw codedError('FRESH_OBSERVATION_REQUIRED', 'Camera sweep needs a fresh observation at each heading');
@@ -1051,7 +1109,7 @@ export class NativeToolRuntime {
 		return { state: 'SUCCEEDED', completed: results.length, results, samples, ...(tool.survey === undefined ? {} : { survey: mergeSurveys(surveys, finalYaw, tool.survey.limit) }) };
 	}
 
-	async #executeSequence(request, record, executionEpoch, lifecycleGeneration = null) {
+	async #executeSequence(request, record, executionEpoch, lifecycleGeneration = null, blockingRun) {
 		const finishToken = request.tool.finish === undefined ? null : {};
 		if (finishToken !== null) {
 			if (this.#sequenceFinishReservations.has(record.agentId)) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'A finishing native sequence already owns this player');
@@ -1066,7 +1124,10 @@ export class NativeToolRuntime {
 			for (let index = 0; index < request.tool.actions.length; index += 1) {
 				if (this.#executionEpoch(record.agentId) !== executionEpoch) throw codedError('NATIVE_ACTION_CANCELLED', 'Native sequence cancelled before its next action');
 				const action = request.tool.actions[index];
+				blockingRun.sequence = { runningStep: index + 1, completedSteps: results.length, remainingSteps: request.tool.actions.length - index - 1 };
 				lastResult = await this.#executeAction(request, record, { kind: 'action', ...action }, index, true, null, finishToken);
+				if (lastResult.state === 'RUNNING') return { ...lastResult,
+					sequence: blockingRun.sequence, ...(results.length === 0 ? {} : { results }) };
 				results.push({ actionType: action.actionType, ...lastResult });
 				if (lastResult.state !== 'SUCCEEDED') { failedAt = index; break; }
 			}
@@ -1148,7 +1209,11 @@ export class NativeToolRuntime {
 		let rejectAction;
 		const result = new Promise((resolve, reject) => { resolveAction = resolve; rejectAction = reject; });
 		result.catch(() => {});
+		const blockingRun = waitForCompletion ? this.#blockingToolRuns.get(record.agentId) ?? null : null;
 		const active = { actionId, goalRevision: record.goalRevision, actionType: tool.actionType, arguments: structuredClone(tool.arguments), worldId: this.#worldId(record), result, resolve: resolveAction, reject: rejectAction, dispatched: false, ...(programCommand === null ? {} : { engineActionId: programCommand.actionId }), ...(pausedProgram ? { pausedProgram: true } : {}) };
+		if (blockingRun !== null) {
+			blockingRun.trackAction(result);
+		}
 		if (!waitForCompletion) {
 			const releaseWork = this.#onWorkStarted(record, 'action');
 			void result.then(releaseWork, releaseWork);
@@ -1194,7 +1259,22 @@ export class NativeToolRuntime {
 			if (active.publicationError !== undefined) throw active.publicationError;
 		}
 		if (!waitForCompletion) return this.#actionStatus(record, actionId);
-		const outcome = await result;
+		let outcome;
+		if (blockingRun === null) outcome = await result;
+		else {
+			const settled = await Promise.race([
+				result.then((value) => ({ type: 'result', value })),
+				blockingRun.interruption.then(() => ({ type: 'interruption' })),
+			]);
+			if (settled.type === 'interruption') {
+				const status = this.#actionStatus(record, actionId);
+				if (status.state === 'RUNNING' || status.state === 'PREPARING') {
+					blockingRun?.retainAction();
+					return { ...status, interruptedBy: blockingRun.interruptedBy ?? 'danger' };
+				}
+				outcome = await result;
+			} else outcome = settled.value;
+		}
 		// Sequences sample after their final step; the program executor samples before each authored continuation.
 		if (!(sequenceIndex === null && programCommand === null && POST_ACTION_OBSERVATION_TYPES.has(tool.actionType))) return outcome;
 		const sampleStartedAt = performance.now();
@@ -1313,6 +1393,10 @@ export class NativeToolRuntime {
 
 	async dispose(agentId, reason = 'disposed') {
 		this.#executionEpochs.set(agentId, this.#executionEpoch(agentId) + 1);
+		// A disposed body tool may still be unwinding an observation or metadata
+		// read. Remove its interruption slot now so a newer lifecycle can own it;
+		// the old call's finally block is identity-checked and cannot clear the new one.
+		this.#blockingToolRuns.delete(agentId);
 		this.#sequenceFinishReservations.delete(agentId);
 		const program = this.#programRuns.get(agentId);
 		program?.releaseWork();

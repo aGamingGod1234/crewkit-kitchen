@@ -1904,7 +1904,10 @@ export class DynamicCoordinator extends EventEmitter {
 
 	#deliverNativeSteer(work, request) {
 		work.steerQueued = mergePlannerRequest(work.steerQueued, request);
-		if (work.steerPromise !== null) return;
+		if (work.steerPromise !== null) {
+			this.#nativeRuntime.interruptBlockingTool(work.agentId, nativeSteerInterruption(request));
+			return;
+		}
 		const steering = this.#drainNativeSteering(work);
 		const tracked = steering.finally(() => {
 			if (work.steerPromise === tracked) work.steerPromise = null;
@@ -1978,37 +1981,51 @@ export class DynamicCoordinator extends EventEmitter {
 			work.steerQueued = null;
 			work.steerRequest = request;
 			const steerStartedAt = performance.now();
+			let deliveryRequest = request;
 			try {
 				const record = this.#registry.get(work.agentId);
 				if (record === null || record.goalRevision !== work.goalRevision) throw Object.assign(new Error('Native steering belongs to an obsolete goal'), { code: 'STALE_PLAN' });
 				if (!this.#nativePreparationIsCurrent(record, request)) continue;
+				const buildInput = async () => {
+					while (true) {
+						if (work.steerQueued !== null) {
+							deliveryRequest = mergePlannerRequest(deliveryRequest, work.steerQueued);
+							work.steerQueued = null;
+							work.steerRequest = deliveryRequest;
+						}
+						const input = await this.#nativeTurnInput(record, deliveryRequest, { freshObservation: true });
+						if (work.steerQueued === null) return input;
+						this.#restoreNativeConversation(deliveryRequest);
+					}
+				};
 				await this.#planner.steerNativeTurn({
 					agentId: work.agentId,
 					goalRevision: work.goalRevision,
-					input: await this.#nativeTurnInput(record, request),
+					input: buildInput,
+					onInterrupt: () => this.#nativeRuntime.interruptBlockingTool(work.agentId, nativeSteerInterruption(request)),
 				});
-				if (!isCurrent()) { this.#restoreNativeConversation(request); work.steerQueued = null; return; }
-				await this.#commitNativeConversation(request);
-				work.steeredPlayerRequests = [...(work.steeredPlayerRequests ?? []), ...(request.deliveredPlayerRequests ?? [])];
+				if (!isCurrent()) { this.#restoreNativeConversation(deliveryRequest); work.steerQueued = null; return; }
+				await this.#commitNativeConversation(deliveryRequest);
+				work.steeredPlayerRequests = [...(work.steeredPlayerRequests ?? []), ...(deliveryRequest.deliveredPlayerRequests ?? [])];
 				if (!isCurrent()) { work.steerQueued = null; return; }
 				// Steering can be truncated just like turn/start. Drain its unread
 				// tail while this turn still accepts steering; a rejection below
 				// releases its reservation and transfers it to the pending turn instead.
-				if (request.nativeConversationDelivery?.omittedEntries > 0 && work.steerQueued === null) {
-					work.steerQueued = { ...request };
+				if (deliveryRequest.nativeConversationDelivery?.omittedEntries > 0 && work.steerQueued === null) {
+					work.steerQueued = { ...deliveryRequest };
 				}
 				this.#writeTrace('native_turn_steered', {
 					agentId: work.agentId,
 					goalRevision: work.goalRevision,
 					traceId: work.traceId,
-					trigger: request.trigger,
+					trigger: deliveryRequest.trigger,
 					steerMs: Math.round((performance.now() - steerStartedAt) * 10) / 10,
 				});
 			} catch (error) {
 				// A late rejection has no authority to rewind current conversation
 				// delivery or add recovery work after its lifecycle has ended.
 				if (!isCurrent()) { work.steerQueued = null; return; }
-				this.#restoreNativeConversation(request);
+				this.#restoreNativeConversation(deliveryRequest);
 				if (error?.code === 'CONVERSATION_STORAGE_FAILED') await this.#reportAgentError(work.agentId, error, work.connectionEpoch);
 				if (!isCurrent()) { work.steerQueued = null; return; }
 				work.pending = mergePlannerRequest(work.pending, request);
@@ -3522,7 +3539,7 @@ export class DynamicCoordinator extends EventEmitter {
 		return this.#usesNativeTools(record) ? ingested : historyIngested;
 	}
 
-	async #nativeTurnInput(record, request, { deliverConversation = true } = {}) {
+	async #nativeTurnInput(record, request, { deliverConversation = true, freshObservation = false } = {}) {
 		if (request.nativeEvent === undefined) return request.input;
 		const taskMemory = request.nativeEvent.event === 'program_planning_due' ? null : await this.#playerMemory.taskContext(record);
 		const isCurrent = () => this.#registry.get(record.agentId)?.goalRevision === record.goalRevision
@@ -3538,8 +3555,12 @@ export class DynamicCoordinator extends EventEmitter {
 		if (reservation) request.nativeConversationDelivery = { inbox, token: reservation.token, omittedEntries: 0 };
 		try {
 			if (!isCurrent()) throw Object.assign(new Error('Native input belongs to an obsolete lifecycle'), { code: 'STALE_PLAN' });
+			const latest = freshObservation ? this.#nativeRuntime.latestObservation(record) : null;
+			const nativeEvent = latest === null ? request.nativeEvent : {
+				...request.nativeEvent, eventSequence: latest.eventSequence, observation: latest.observation,
+			};
 			const input = buildNativeEventInput(record, {
-				...request.nativeEvent, taskMemory, dangerSummary: request.dangerSummary,
+				...nativeEvent, taskMemory, dangerSummary: request.dangerSummary,
 				awaitingConfirmation: this.#awaitingNativeConfirmation(record, request.lifecycleGeneration),
 				observation: this.#nativeRuntime.decorateObservation(record, request.nativeEvent.observation ?? {}),
 				conversation: reservation?.conversation ?? { mode: 'unread', baseSequence: null, nextSequence: -1, entries: [] },
@@ -5025,6 +5046,8 @@ export function mergePlannerRequest(previous, next) {
 	if (previous === null || previous === undefined) return next;
 	const priority = previous.priority === 'urgent' || next.priority === 'urgent' ? 'urgent' : 'ordinary';
 	const winner = next.priority === priority ? next : previous;
+	const dangerSummary = mergeDangerSummary(previous.dangerSummary, next.dangerSummary);
+	const mergedDanger = dangerSummary === undefined ? {} : { dangerSummary };
 	// A program that ended (or asked for a decision) while the model was still in a turn must not be replaced by the
 	// plain observation that followed: the model would wake without the program's result and have to ask for it.
 	const programEvent = previous.nativeEvent?.event;
@@ -5033,11 +5056,29 @@ export function mergePlannerRequest(previous, next) {
 		const { programId, status, result } = previous.nativeEvent;
 		const program = { ...(programId === undefined ? {} : { programId }), ...(status === undefined ? {} : { status }), ...(result === undefined ? {} : { result }) };
 		// Danger leads the wake (its own event and trigger) but still carries the program's result or decision handle.
-		if (next.priority === 'urgent') return { ...next, priority, trigger: winner.trigger, nativeEvent: { ...next.nativeEvent, ...program } };
-		return { ...next, priority, trigger: winner.trigger, nativeEvent: { ...previous.nativeEvent, observation: next.nativeEvent.observation ?? previous.nativeEvent.observation,
+		if (next.priority === 'urgent') return { ...next, ...mergedDanger, priority, trigger: winner.trigger, nativeEvent: { ...next.nativeEvent, ...program } };
+		return { ...next, ...mergedDanger, priority, trigger: winner.trigger, nativeEvent: { ...previous.nativeEvent, observation: next.nativeEvent.observation ?? previous.nativeEvent.observation,
 			...(next.eventSequence === undefined ? {} : { eventSequence: next.eventSequence }) } };
 	}
-	return { ...next, priority, trigger: winner.trigger };
+	return { ...next, ...mergedDanger, priority, trigger: winner.trigger };
+}
+
+function mergeDangerSummary(previous, next) {
+	if (previous == null) return next;
+	if (next == null) return previous;
+	return {
+		foldedEvents: previous.foldedEvents + next.foldedEvents,
+		hitsSinceLastUpdate: previous.hitsSinceLastUpdate + next.hitsSinceLastUpdate,
+		healthAtLastUpdate: previous.healthAtLastUpdate ?? next.healthAtLastUpdate,
+		healthNow: next.healthNow ?? previous.healthNow,
+		attackers: [...new Set([...(previous.attackers ?? []), ...(next.attackers ?? [])])].slice(0, 4),
+	};
+}
+
+function nativeSteerInterruption(request) {
+	const trigger = request?.nativeEvent?.trigger ?? request?.trigger;
+	return ['conversation', 'conversation_wake'].includes(trigger) || request?.nativeEvent?.conversationOnly === true
+		? 'conversation' : 'danger';
 }
 
 function finiteCount(value) { return Number.isSafeInteger(value) && value >= 0 ? value : null; }

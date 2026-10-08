@@ -1353,6 +1353,52 @@ test('urgent input steers an active native turn without replacing its turn or to
 	assert.deepEqual(executed, [{ kind: 'action', actionType: 'chat', arguments: { message: 'Stopping now.', audience: 'public' } }]);
 });
 
+test('Codex returns a blocking body result early with the steer in that tool response', async (t) => {
+	const transport = new FakeSharedTransport();
+	transport.autoComplete = false;
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	t.after(() => service.stop());
+	const agent = await service.createAgent(profile('agent-native-tool-steer'), { controlProtocol: 'native_tools' });
+	await agent.setGoalRevision(1);
+	let releaseExecution;
+	let toolStarted;
+	const started = new Promise((resolve) => { toolStarted = resolve; });
+	const execution = new Promise((resolve) => { releaseExecution = resolve; });
+	const turn = agent.act('event: wait for the action', {
+		goalRevision: 1,
+		executeTool: async () => { toolStarted(); return execution; },
+	});
+	void turn.catch(() => {});
+	await new Promise((resolve) => setImmediate(resolve));
+	transport.emit('serverRequest', {
+		id: 82,
+		method: 'item/tool/call',
+		params: { threadId: 'thread-1', turnId: 'turn-1', callId: 'danger-wait', tool: 'wait', arguments: { durationMs: 30_000 } },
+	});
+	try {
+		await started;
+		let currentFacts = 'stale danger facts';
+		const steer = agent.steer(() => currentFacts, {
+			goalRevision: 1,
+			onInterrupt: () => releaseExecution({ state: 'RUNNING', actionId: 'body-action-2', interruptedBy: 'danger' }),
+		});
+		currentFacts = 'fresh danger facts';
+		let response;
+		for (let attempt = 0; attempt < 100 && response === undefined; attempt += 1) {
+			response = transport.calls.find((call) => call.method === '$respond' && call.id === 82)?.result;
+			if (response === undefined) await new Promise((resolve) => setTimeout(resolve, 1));
+		}
+		assert.notEqual(response, undefined, 'the body tool must return before the action finishes');
+		assert.deepEqual(await steer, { turnId: 'turn-1' });
+		assert.equal(JSON.parse(response.contentItems[0].text).actionId, 'body-action-2');
+		assert.equal(JSON.parse(response.contentItems[0].text).state, 'RUNNING');
+		assert.match(response.contentItems[1].text, /fresh danger facts/);
+		assert.equal(transport.calls.some((call) => call.method === 'turn/steer'), false, 'the body result carries the event once');
+		transport.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } } });
+		assert.partialDeepStrictEqual(await turn, { status: 'completed', toolCalls: 1 });
+	} finally { releaseExecution({ state: 'RUNNING', actionId: 'body-action-2', interruptedBy: 'danger' }); }
+});
+
 test('native Codex interruption cleans up a turn whose start response arrives late', async () => {
 	const transport = new FakeSharedTransport();
 	transport.autoComplete = false;

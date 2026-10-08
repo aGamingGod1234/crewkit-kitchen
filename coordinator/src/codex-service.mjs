@@ -858,16 +858,17 @@ export class SharedCodexAgent {
 		this.#rotationPromise = rotation;
 	}
 
-	async steer(input, { goalRevision = this.#goalRevision } = {}) {
+	async steer(input, { goalRevision = this.#goalRevision, onInterrupt = null } = {}) {
 		if (this.#controlProtocol !== 'native_tools') throw new CodexProtocolError('CONTROL_PROTOCOL_MISMATCH', 'ArenaScript agents cannot steer native turns');
 		if (this.#disposed) throw this.#invalidationError ?? new CodexProtocolError('AGENT_DISPOSED', `Codex agent '${this.agentId}' is disposed`);
-		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('native steer input must be nonblank');
+		if (!(typeof input === 'function' || typeof input === 'string' && input.trim().length > 0)) throw new TypeError('native steer input must be nonblank or a builder');
+		if (onInterrupt !== null && typeof onInterrupt !== 'function') throw new TypeError('onInterrupt must be a function or null');
 		requireRevision(goalRevision);
 		if (goalRevision !== this.#goalRevision) throw new CodexProtocolError('STALE_GOAL_REVISION', `Goal revision ${goalRevision} does not match ${this.#goalRevision}`);
-		return this.#steerActiveNativeTurn(input, { goalRevision });
+		return this.#steerActiveNativeTurn(input, { goalRevision, onInterrupt });
 	}
 
-	async #steerActiveNativeTurn(input, { goalRevision, executeTool = null }) {
+	async #steerActiveNativeTurn(input, { goalRevision, executeTool = null, onInterrupt = null }) {
 		const active = this.#active;
 		if (active === null || active.goalRevision !== goalRevision) throw new CodexProtocolError('TURN_NOT_ACTIVE', `Codex agent '${this.agentId}' has no steerable native turn`);
 		const startResponse = active.turnId === null
@@ -875,9 +876,18 @@ export class SharedCodexAgent {
 			: null;
 		const turnId = active.turnId ?? requireNestedId(startResponse, 'turn', 'turn/start');
 		if (this.#active !== active || this.#goalRevision !== goalRevision) throw new CodexProtocolError('STALE_PLAN', 'Codex native turn ended before steering');
+		const toolSteer = active.collector.steerActiveTool(async () => {
+			const resolved = await resolveSteerInput(input);
+			return {
+				text: encodeNativeEventInput(resolved, this.#observationViews),
+				commit: () => this.#carryOver.noteEvent(resolved),
+			};
+		}, onInterrupt);
+		if (toolSteer !== null) return toolSteer;
 		let previousExecutor = null;
 		let steerPromise;
-		const encodedInput = encodeNativeEventInput(input, this.#observationViews);
+		const resolvedInput = await resolveSteerInput(input);
+		const encodedInput = encodeNativeEventInput(resolvedInput, this.#observationViews);
 		const submitSteer = () => {
 			active.collector.recordInput('turn/steer', encodedInput);
 			active.collector.providerEvent('native_provider_steer_sent', { turnId });
@@ -900,7 +910,7 @@ export class SharedCodexAgent {
 			if (response?.turnId !== turnId) throw new CodexProtocolError('INVALID_TURN_STEER', 'turn/steer response did not preserve the active turn');
 			active.collector.providerEvent('native_provider_steer_acked', { turnId });
 			// Steered DMs, decisions and danger summaries are part of what a fresh thread must not lose.
-			this.#carryOver.noteEvent(input);
+			this.#carryOver.noteEvent(resolvedInput);
 			if (executeTool !== null) active.prewarm = false;
 			return response;
 		} catch (error) {
@@ -1108,6 +1118,45 @@ function nativeToolSchedulingClass(tool) {
 	return 'ordered';
 }
 
+function isBlockingNativeTool(tool) {
+	return tool?.kind === 'sequence' || tool?.kind === 'lookAround'
+		|| tool?.kind === 'action' && tool.actionType !== 'chat';
+}
+
+async function resolveSteerInput(input) {
+	const resolved = typeof input === 'function' ? await input() : input;
+	if (typeof resolved !== 'string' || resolved.trim().length === 0) throw new TypeError('native steer builder must return nonblank text');
+	return resolved;
+}
+
+async function takeActiveToolSteer(control) {
+	if (control === null) return null;
+	while (control.pendingSteer !== null) {
+		const pending = control.pendingSteer;
+		let built;
+		try { built = await pending.build(); }
+		catch (error) {
+			if (control.pendingSteer !== pending) continue;
+			control.pendingSteer = null;
+			control.responseStarted = true;
+			for (const waiter of pending.waiters) waiter.reject(error);
+			return null;
+		}
+		if (control.pendingSteer !== pending) continue;
+		control.pendingSteer = null;
+		control.responseStarted = true;
+		return { ...built, waiters: pending.waiters };
+	}
+	control.responseStarted = true;
+	return null;
+}
+
+function appendNativeSteer(response, text) {
+	return { ...response, contentItems: [...response.contentItems, {
+		type: 'inputText', text: `Newer coordinator events for this turn (treat them exactly like the turn input):\n${text}`,
+	}] };
+}
+
 function createNativeTurnCollector({ transport, threadId, agentId, goalRevision, executeTool, onVerbose, usageStart = null, usagePreviousEnd = null, onUsageTotal = () => {}, observationViews = new ModelObservationViews(), onProviderActivity = () => {}, onToolExecutionStart = () => {}, onToolExecutionEnd = () => {}, onToolTiming = () => {} }) {
 	const liveMessages = new Map();
 	let expectedTurnId = null;
@@ -1163,6 +1212,7 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 		if (measurement !== null) toolResultBytes += measurement.bytes;
 	};
 	let toolExecutor = executeTool;
+	let activeBodyControl = null;
 	let completionStatus = null;
 	let orderedTail = Promise.resolve();
 	const requestArrivals = new WeakMap();
@@ -1196,12 +1246,17 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 			if (settled || completionStatus?.status === 'failed') return;
 			let executionStarted = false;
 			let executionMs;
+			let resultForMetadata = null;
+			let response = null;
+			let commitPresented = () => {};
 			const executionStartedAt = performance.now();
 			const queueWaitMs = executionStartedAt - requestArrivedAt;
 			const measurementMetadata = (result) => {
 				try { return { name: params.tool, kind: tool?.kind, hasPostAction: result?.postAction != null, executionMs, callId: params.callId, requestArrivedAt, queueWaitMs, schedulingClass }; }
 				catch { toolResponses.captureFailure(); return null; }
 			};
+			const toolControl = isBlockingNativeTool(tool) ? { tool, pendingSteer: null, responseStarted: false } : null;
+			if (toolControl !== null) activeBodyControl = toolControl;
 			try {
 				if (normalizationError) throw normalizationError;
 				safeVerbose(onVerbose, 'live_tool', `${params.tool} ${JSON.stringify(params.arguments).slice(0, 1200)}`);
@@ -1220,26 +1275,40 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 					schedulingClass,
 					tool,
 				};
-				let result;
-				try { result = await executor(executionRequest); }
+				try { resultForMetadata = await executor(executionRequest); }
 				finally { executionMs = performance.now() - executionStartedAt; }
-				if (!settled) {
-					const presented = presentNativeToolResult(result, tool, observationViews);
-					await respond(id, presented.response, measurementMetadata(result));
-					providerEvent('native_provider_tool_result_sent', { callId: params.callId });
-					if (!settled) presented.commit();
-					safeVerbose(onVerbose, 'live_result', presented.response.contentItems[0].text.slice(0, 1200));
-				}
+				const presented = presentNativeToolResult(resultForMetadata, tool, observationViews);
+				response = presented.response;
+				commitPresented = presented.commit;
 			} catch (error) {
 				if (settled) return;
-				await respond(id, toolResultContent({
+				response = toolResultContent({
 					state: 'FAILED',
 					reasonCode: String(error?.code ?? 'TOOL_EXECUTION_FAILED').slice(0, 128),
 					message: String(error?.message ?? error).slice(0, 512),
 					...(error?.actionContract === undefined ? {} : { actionContract: error.actionContract }),
-				}, false), measurementMetadata(null));
-				providerEvent('native_provider_tool_result_sent', { callId: params.callId });
+				}, false);
+				resultForMetadata = null;
+			}
+			try {
+				if (!settled) {
+					const steered = await takeActiveToolSteer(toolControl);
+					if (steered !== null) response = appendNativeSteer(response, steered.text);
+					else if (toolControl !== null) toolControl.responseStarted = true;
+					await respond(id, response, measurementMetadata(resultForMetadata));
+					providerEvent('native_provider_tool_result_sent', { callId: params.callId });
+					if (!settled) commitPresented();
+					if (steered !== null) {
+						steered.commit?.();
+						for (const waiter of steered.waiters) waiter.resolve({ turnId: expectedTurnId });
+					}
+					safeVerbose(onVerbose, 'live_result', response.contentItems[0].text.slice(0, 1200));
+				}
+			} catch (error) {
+				if (settled) return;
+				throw error;
 			} finally {
+				if (activeBodyControl === toolControl) activeBodyControl = null;
 				if (executionStarted) {
 					onToolExecutionEnd();
 					reportTiming({ phase: 'tool_completed', executionStartedAt, queueWaitMs, executionMs });
@@ -1337,6 +1406,17 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 	transport.on('notification', onNotification);
 	return {
 		promise,
+		steerActiveTool(build, onInterrupt = null) {
+			const control = activeBodyControl;
+			if (control === null || control.responseStarted) return null;
+			let resolve;
+			let reject;
+			const delivered = new Promise((resolveResult, rejectResult) => { resolve = resolveResult; reject = rejectResult; });
+			const pending = { build, waiters: [...(control.pendingSteer?.waiters ?? []), { resolve, reject }] };
+			control.pendingSteer = pending;
+			try { onInterrupt?.(); } catch { /* the tool result still carries the queued event */ }
+			return delivered;
+		},
 		setTurnId(value) {
 			expectedTurnId = value;
 			const buffered = bufferedEvents;
@@ -1360,6 +1440,9 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 		dispose() {
 			settled = true;
 			bufferedEvents = [];
+			const pending = activeBodyControl?.pendingSteer;
+			activeBodyControl = null;
+			for (const waiter of pending?.waiters ?? []) waiter.reject(new CodexProtocolError('TURN_NOT_ACTIVE', 'Codex turn ended before the steer reached a tool result'));
 			transport.off('serverRequest', onServerRequest);
 			transport.off('notification', onNotification);
 		},

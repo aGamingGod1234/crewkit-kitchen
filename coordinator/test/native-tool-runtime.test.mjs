@@ -149,6 +149,55 @@ test('native body dispatches one correlated action and resolves only its matchin
 	assert.deepEqual(await result, { state: 'SUCCEEDED', reasonCode: '', executionStarted: true });
 });
 
+test('urgent interruption returns a running action without cancelling its body command', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async (...args) => sent.push(args) } });
+	const pending = runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-interrupt', callId: 'call-interrupt',
+		tool: { kind: 'action', actionType: 'navigate_to', arguments: { x: 20, y: 64, z: 20, timeoutMs: 30_000 } },
+	}, record());
+	for (let attempt = 0; attempt < 8 && sent.length === 0; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(sent.length, 1, 'the body command starts before its interrupt is delivered');
+	const actionId = sent[0][2].actionId;
+	assert.equal(runtime.interruptBlockingTool?.('agent-a', 'danger'), true);
+	const early = await Promise.race([
+		pending,
+		new Promise((resolve) => setTimeout(() => resolve({ state: 'STILL_BLOCKED' }), 50)),
+	]);
+	assert.deepEqual(early, { actionId, goalRevision: 3, actionType: 'navigate_to', state: 'RUNNING', interruptedBy: 'danger' });
+	assert.deepEqual(sent.map(([type]) => type), ['action_command'], 'steering does not cancel the physical action');
+	assert.equal(runtime.onActionResult(record(), { actionId, goalRevision: 3, state: 'SUCCEEDED', reasonCode: 'DONE' }), true);
+});
+
+test('an interrupted sequence reports its active step and leaves later actions unstarted', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async (...args) => sent.push(args) } });
+	const pending = runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-sequence-interrupt', callId: 'call-sequence-interrupt',
+		tool: { kind: 'sequence', actions: [
+			{ actionType: 'navigate_to', arguments: { x: 8, y: 64, z: 8, timeoutMs: 30_000 } },
+			{ actionType: 'wait', arguments: { durationMs: 1_000 } },
+		] },
+	}, record());
+	for (let attempt = 0; attempt < 8 && sent.length === 0; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(sent.length, 1, 'only the current sequence step has started');
+	const actionId = sent[0][2].actionId;
+	assert.equal(runtime.interruptBlockingTool?.('agent-a', 'conversation'), true);
+	const early = await Promise.race([
+		pending,
+		new Promise((resolve) => setTimeout(() => resolve({ state: 'STILL_BLOCKED' }), 50)),
+	]);
+	assert.equal(early.state, 'RUNNING');
+	assert.equal(early.actionId, actionId);
+	assert.equal(early.actionType, 'navigate_to');
+	assert.equal(early.interruptedBy, 'conversation');
+	assert.deepEqual(early.sequence, { runningStep: 1, completedSteps: 0, remainingSteps: 1 });
+	assert.deepEqual(sent.map(([type]) => type), ['action_command']);
+	assert.equal(runtime.onActionResult(record(), { actionId, goalRevision: 3, state: 'SUCCEEDED', reasonCode: 'DONE' }), true);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(sent.map(([type]) => type), ['action_command'], 'the sequence remainder requires a new model-authored call');
+});
+
 test('native action results do not attach stale recovery without a fresh observation', async () => {
 	const sent = [];
 	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async (...args) => sent.push(args) } });

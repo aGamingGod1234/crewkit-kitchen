@@ -42,16 +42,21 @@ async function fixture(handlers={}) {
     });
   }
   function capture(kind,request) {
-    const raw=JSON.parse(request.input.split('\n')[1]);
-    const encoded=decodeModelFacts(JSON.parse(encodeNativeEventInput(request.input).split('\n')[1]));
+    const input=request.input;
+    const raw=JSON.parse(input.split('\n')[1]);
+    const encoded=decodeModelFacts(JSON.parse(encodeNativeEventInput(input).split('\n')[1]));
     assert.deepEqual(encoded.conversation,raw.conversation);
     const call={kind,goalRevision:request.goalRevision,conversation:raw.conversation,accepted:false}; calls.push(call); return call;
+  }
+  async function captureSteer(request) {
+    const input=typeof request.input==='function'?await request.input():request.input;
+    return capture('steer',{...request,input});
   }
   const planner={
     async requestPlan(){throw new Error('ArenaScript planning is outside this native probe');},
     beginReconcile(records,options){ const result=registry.reconcile(records,options); return {registry:result,complete:Promise.resolve({registry:result,providers:{valid:result.records,invalid:[],catalog:{models:[]}}})}; },
     async requestNativeTurn(request){ const call=capture('start',request); await handlers.start?.(call,calls,request); call.accepted=true; return {toolCalls:handlers.toolCalls ?? 1}; },
-    async steerNativeTurn(request){ const call=capture('steer',request); await handlers.steer?.(call,calls); call.accepted=true; return {}; },
+    async steerNativeTurn(request){ const call=await captureSteer(request); await handlers.steer?.(call,calls); call.accepted=true; return {}; },
     async interrupt(){}, async remove(id){return registry.remove(id);},
   };
   const provider={catalog:{stale:false,refresh:async()=>({models:[]}),assertSupported(){}},async start(){},async stop(){}};

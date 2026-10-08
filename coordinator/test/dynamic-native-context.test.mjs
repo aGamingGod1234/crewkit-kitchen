@@ -5,7 +5,7 @@ import { goalSpecFingerprint } from '../src/goal-spec.mjs';
 import { RuntimeMemoryContext } from '../src/runtime-memory-context.mjs';
 import { encodeNativeEventInput, decodeModelFacts } from '../src/model-fact-encoding.mjs';
 import { withCompletionContract } from './fixtures/completion-contract.mjs';
-import { SOURCE, FakeBridge, DeferredCompletionBridge, GatedAgentReadyBridge, ThrowingPlanningRegistry, FakeProvider, FakePlanner, RecordingGoalSupervisor, record, factToWireObservation, pickProfile, immutableGoalSpec, eventually, ManualTimerQueue, start } from './fixtures/dynamic-main-fixture.mjs';
+import { SOURCE, FakeBridge, DeferredCompletionBridge, GatedAgentReadyBridge, ThrowingPlanningRegistry, FakeProvider, FakePlanner, RecordingGoalSupervisor, record, factToWireObservation, pickProfile, immutableGoalSpec, eventually, ManualTimerQueue, start, resolveNativeSteerInput } from './fixtures/dynamic-main-fixture.mjs';
 
 for (const boundary of ['goal revision', 'disconnect', 'connection replacement']) {
 	test(`native inspection cancellation fences delayed replies across ${boundary}`, async () => {
@@ -1195,9 +1195,10 @@ for (const failTail of [false, true]) for (const toolCalls of [0, 1]) {
 		planner.requestNativeTurn = async request => { planner.requests.push(request); collect(request.input); if (planner.requests.length === 1) await turnGate; return { toolCalls }; };
 		planner.steerNativeTurn = async request => {
 			steerCount++;
-			if (failTail && steerCount === 3) throw Object.assign(new Error('turn ended'), { code: 'TURN_NOT_ACTIVE' });
-			collect(request.input);
 			if (steerCount === 1) await steerGate;
+			const input = await resolveNativeSteerInput(request);
+			if (failTail && steerCount === 3) throw Object.assign(new Error('turn ended'), { code: 'TURN_NOT_ACTIVE' });
+			collect(input);
 			return {};
 		};
 		const run = await start({ registry, planner, goalSupervisor: new RecordingGoalSupervisor(), config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } } });
@@ -1212,9 +1213,9 @@ for (const failTail of [false, true]) for (const toolCalls of [0, 1]) {
 			await eventually(() => failTail ? steerCount === 3 : delivered.length === 12);
 			finish();
 			await eventually(() => delivered.length === 12);
-			await eventually(() => planner.requests.length === (failTail ? 4 : 2));
+			await eventually(() => planner.requests.length === 2);
 			assert.deepEqual(delivered, Array.from({ length: 12 }, (_, index) => index + 1));
-			assert.equal(planner.requests.length, failTail ? 4 : 2, 'a synthetic tool count does not prove a visible reply; only unread continuations and one reply correction create turns');
+			assert.equal(planner.requests.length, 2, 'superseded steering drains the retained tail through one replacement turn');
 		} finally { finishSteer(); finish(); await run.coordinator.stop(); }
 	});
 }
@@ -1390,19 +1391,26 @@ test('urgent native conversation steers the active model turn while its body act
 	const registry = new AgentRegistry();
 	const planner = new FakePlanner(registry);
 	const steers = [];
+	let bodyResult = null;
 	planner.requestNativeTurn = async (request) => {
 		planner.requests.push(request);
-		const result = await request.executeTool({
+		bodyResult = await request.executeTool({
 			agentId: request.agentId,
 			goalRevision: request.goalRevision,
 			turnId: 'turn-moving',
 			callId: 'call-moving',
 			tool: { kind: 'action', actionType: 'navigate_to', arguments: { x: 20, y: 64, z: 0, tolerance: 1, sprint: true, timeoutMs: 30_000 } },
 		});
-		assert.equal(result.state, 'SUCCEEDED');
+		assert.equal(bodyResult.state, 'RUNNING');
+		assert.equal(bodyResult.interruptedBy, 'conversation');
 		return { status: 'completed', toolCalls: 1 };
 	};
-	planner.steerNativeTurn = async (request) => { steers.push(request); return { turnId: 'turn-moving' }; };
+	planner.steerNativeTurn = async (request) => {
+		request.onInterrupt?.();
+		await resolveNativeSteerInput(request);
+		steers.push(request);
+		return { turnId: 'turn-moving' };
+	};
 	const run = await start({
 		registry,
 		planner,
@@ -1420,8 +1428,9 @@ test('urgent native conversation steers the active model turn while its body act
 			agentId: 'agent-a',
 			payload: { sequence: 1, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct', text: 'Answer me while you walk.', goalRevision: 1, observedAtEpochMs: 1_787_184_000_000 },
 		});
-		await eventually(() => steers.length === 1);
+		await eventually(() => steers.length === 1 && bodyResult?.state === 'RUNNING');
 		assert.match(steers[0].input, /Answer me while you walk\./);
+		assert.deepEqual(JSON.parse(steers[0].input.slice(steers[0].input.indexOf('\n') + 1)).conversation.entries.map(({ sequence }) => sequence), [1]);
 		assert.equal(planner.requests.length, 1);
 		assert.equal(run.bridge.sent.some((message) => message.type === 'action_cancel' && message.payload.actionId === command.payload.actionId), false);
 		run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: command.payload.actionId, state: 'SUCCEEDED', reasonCode: '', executionStarted: true, eventSequence: 2 } });
@@ -1439,7 +1448,7 @@ test('a detected movement loop steers once until movement escapes and a new loop
 	const planner = new FakePlanner(registry);
 	const steers = [];
 	planner.requestNativeTurn = async request => { planner.requests.push(request); await gate; return { status: 'completed', toolCalls: 0 }; };
-	planner.steerNativeTurn = async request => { steers.push(request); return { turnId: 'thinking' }; };
+	planner.steerNativeTurn = async request => { await resolveNativeSteerInput(request); steers.push(request); return { turnId: 'thinking' }; };
 	const run = await start({ registry, planner, config: {
 		bridge: { port: 25570, secret: 's'.repeat(32) },
 		codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
@@ -1469,7 +1478,7 @@ test('new resource observations coalesce behind an active model turn without int
 	const planner = new FakePlanner(registry);
 	const steers = [];
 	planner.requestNativeTurn = async request => { planner.requests.push(request); await gate; return { status: 'completed', toolCalls: 0 }; };
-	planner.steerNativeTurn = async request => { steers.push(request); };
+	planner.steerNativeTurn = async request => { await resolveNativeSteerInput(request); steers.push(request); };
 	const run = await start({ registry, planner, config: {
 		bridge: { port: 25570, secret: 's'.repeat(32) },
 		codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
