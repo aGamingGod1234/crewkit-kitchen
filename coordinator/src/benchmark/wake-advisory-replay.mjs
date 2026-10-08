@@ -2,10 +2,12 @@
 // remaining-work planning advisory would fire and what it would do to model calls and body idle time.
 // usage: node src/benchmark/wake-advisory-replay.mjs <coordinator.jsonl> [--lead-ms N] [--floor-ms N] [--decision-ms N] [--wake-ms N]
 // Everything this prints is SIMULATED: program action counts and durations are measured in the trace, but the
-// source shape (straight line) and whether the model queues a successor are assumptions.
+// source shape (straight line), how often the model queues a successor unaided, and how often it answers an advisory
+// are assumptions.
 import { readFileSync } from 'node:fs';
 import { NativeProgramExecutor } from '../native-program-executor.mjs';
 
+const MAX_ADVISORY_MISSES = 2; // NativeToolRuntime.MAX_ADVISORY_MISSES
 const prefix = 'program.onUnhandledAttention("continue_and_notify");';
 const record = { agentId: 'replay', goalRevision: 1, provider: 'codex', model: 'replay', reasoningEffort: 'low', serviceTier: 'priority' };
 const observation = () => ({ player: { x: 0, y: 64, z: 0, health: 20 }, entities: [], items: [], blocks: [], inventory: { items: [], tagCounts: {} } });
@@ -36,23 +38,36 @@ export async function replayProgram({ actions, durationMs }, { leadMs, floorMs }
 // Deterministic coin so a run is reproducible.
 function random(seed) { let state = seed >>> 0; return () => { state = (Math.imul(state, 1664525) + 1013904223) >>> 0; return state / 2 ** 32; }; }
 
-function simulate(rows, queueRate, { gated, wakeMs, decisionMs }) {
-	const next = random(7);
+/**
+ * One model session over the recorded programs, mirroring NativeToolRuntime:
+ * - the gate starts CLOSED (misses at the limit) and opens when the model queues a successor itself;
+ * - while open, a program that fires an advisory costs one extra model call; answering it with a queued successor
+ *   replaces the post-exhaustion wake, ignoring it counts a miss, and two misses in a row close the gate again;
+ * - a program whose model already queued a successor unaided gets no advisory and no post-exhaustion wake.
+ * `unaidedRate`: how often the model queues a successor with no advisory. `answerRate`: how often it queues one when advised.
+ * `gated: false` is the always-on variant (no gate), kept only to show what the gate buys.
+ */
+function simulate(rows, { unaidedRate, answerRate, gated, wakeMs, decisionMs }) {
+	// Separate coins, so the baseline is identical across answer rates and the gate.
+	const unaided = random(7), answers = random(11);
 	const sessions = 400;
-	let programs = 0, calls = 0, idleSavedMs = 0, advisories = 0;
+	let programs = 0, calls = 0, baselineCalls = 0, idleSavedMs = 0, advisories = 0;
 	for (let session = 0; session < sessions; session += 1) {
-		let misses = 0;
+		let misses = gated ? MAX_ADVISORY_MISSES : 0;
 		for (const row of rows) {
 			programs += 1;
+			if (unaided() < unaidedRate) { misses = 0; continue; } // chained by the model itself: no wake with or without the feature
+			baselineCalls += 1;
 			calls += 1; // the post-exhaustion wake, unless an advisory is answered with a queued successor
-			if (row.fired === null || (gated && misses >= 2)) continue;
+			if (row.fired === null || misses >= MAX_ADVISORY_MISSES) continue;
 			advisories += 1;
 			calls += 1;
-			if (next() < queueRate) { calls -= 1; misses = 0; idleSavedMs += wakeMs - Math.max(0, decisionMs - row.fired.leftMs); }
+			if (answers() < answerRate) { calls -= 1; misses = 0; idleSavedMs += wakeMs - Math.max(0, decisionMs - row.fired.leftMs); }
 			else misses += 1;
 		}
 	}
-	return { callsPerExhaustedProgram: +(calls / programs).toFixed(3), advisoriesPerExhaustedProgram: +(advisories / programs).toFixed(3), bodyIdleSavedPerExhaustedProgramMs: Math.round(idleSavedMs / programs) };
+	const per = (value) => +(value / programs).toFixed(3);
+	return { baselineCallsPerExhaustedProgram: per(baselineCalls), callsPerExhaustedProgram: per(calls), advisoriesPerExhaustedProgram: per(advisories), bodyIdleSavedPerExhaustedProgramMs: Math.round(idleSavedMs / programs) };
 }
 
 export async function replay(programs, { leadMs, floorMs, decisionMs, wakeMs }) {
@@ -60,15 +75,16 @@ export async function replay(programs, { leadMs, floorMs, decisionMs, wakeMs }) 
 	const rows = [];
 	for (const program of exhausted) rows.push({ ...program, fired: await replayProgram(program, { leadMs, floorMs }) });
 	const fired = rows.filter((row) => row.fired !== null);
-	// Per exhausted program the baseline is one post-exhaustion wake. An advisory is one extra model turn that, when
-	// the model queues a successor, replaces that wake; when it does not, the wake still happens. The gate mirrors
-	// NativeToolRuntime for a model that has already queued a successor unaided: two misses in a row stop advisories. A
-	// model that never queues unaided gets no early advisory at all, so it costs nothing and is not simulated here.
-	const scenarios = [0, 0.25, 0.5, 0.75, 1].map((queueRate) => {
-		const ungated = simulate(rows, queueRate, { gated: false, wakeMs, decisionMs });
-		const gated = simulate(rows, queueRate, { gated: true, wakeMs, decisionMs });
-		return { queueRate, ungated, gated };
-	});
+	// Per exhausted program the baseline is one post-exhaustion wake (none when the model chained by itself). An advisory
+	// is one extra model turn that, when the model queues a successor, replaces that wake. Advisories stay off in a
+	// session until the model queues a successor unaided, so a model that never does costs nothing.
+	const scenarios = [];
+	for (const unaidedRate of [0, 0.25, 0.5, 1]) {
+		for (const answerRate of [0, 0.5, 1]) {
+			const args = { unaidedRate, answerRate, wakeMs, decisionMs };
+			scenarios.push({ unaidedRate, answerRate, gated: simulate(rows, { ...args, gated: true }), alwaysOn: simulate(rows, { ...args, gated: false }) });
+		}
+	}
 	return { exhausted: exhausted.length, firedCount: fired.length, rows, scenarios };
 }
 

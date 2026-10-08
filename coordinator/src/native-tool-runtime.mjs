@@ -52,6 +52,7 @@ export class NativeToolRuntime {
 	#onWorkStarted;
 	#planningLeadTime;
 	#planningFloorTime;
+	#onModelActionCancelled;
 	// Early advisories cost a model turn, so they stay off until the model has queued a successor by itself, and stop
 	// again after two programs that got one and still ran out with nothing queued.
 	#advisoryMisses = new Map();
@@ -82,6 +83,7 @@ export class NativeToolRuntime {
 		onWorkStarted = () => () => {},
 		planningLeadTime = () => null,
 		planningFloorTime = () => null,
+		onModelActionCancelled = () => {},
 		sessionId = randomUUID(),
 		occupancy = new ExplorationOccupancy(),
 	} = {}) {
@@ -127,6 +129,8 @@ export class NativeToolRuntime {
 		this.#planningLeadTime = planningLeadTime;
 		if (typeof planningFloorTime !== 'function') throw new TypeError('planningFloorTime must be a function');
 		this.#planningFloorTime = planningFloorTime;
+		if (typeof onModelActionCancelled !== 'function') throw new TypeError('onModelActionCancelled must be a function');
+		this.#onModelActionCancelled = onModelActionCancelled;
 		this.#sessionId = sessionId.length <= 36 ? sessionId : createHash('sha256').update(sessionId).digest('hex').slice(0, 32);
 		this.#occupancy = occupancy;
 	}
@@ -905,6 +909,10 @@ export class NativeToolRuntime {
 		if (active.cancelling) throw codedError('CANCELLATION_IN_PROGRESS', 'The exact action is already being cancelled');
 		active.cancelling = true;
 		active.cancellationUncertain = false;
+		// cancelAction and replaceAction both end what the model was waiting on; wakes held for it are released.
+		if (active.engineActionId === undefined) {
+			try { this.#onModelActionCancelled(record); } catch { /* the hook only releases held wakes */ }
+		}
 		// Cancelling a danger action taken while the program was paused leaves that paused program intact.
 		if (invalidateProgram && active.pausedProgram !== true) {
 			this.#executionEpochs.set(record.agentId, this.#executionEpoch(record.agentId) + 1);
