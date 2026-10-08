@@ -346,29 +346,81 @@ public final class NavigationMotionVerification {
 		route.add(new PathNode(new GridPosition(1, LEVEL + 1, 0), TraversalType.DROP_DOWN));
 		route.add(new PathNode(new GridPosition(2, LEVEL, 0), TraversalType.DROP_DOWN));
 		route.add(new PathNode(new GridPosition(3, LEVEL, 0), TraversalType.WALK));
+		WalkabilityView ground = supportedRoute(route);
 		double level = LEVEL + 1;
-		assertTrue(ServerNavigationController.passedWaypoint(new Vec3(2.26D, level, 0.5D), route, 1, level),
+		assertTrue(ServerNavigationController.passedWaypoint(ground, new Vec3(2.26D, level, 0.5D), route, 1, level),
 				"a body hanging over the far edge of a drop landing has passed it");
-		assertTrue(!ServerNavigationController.passedWaypoint(new Vec3(1.2D, level, 0.5D), route, 1, level),
+		assertTrue(!ServerNavigationController.passedWaypoint(ground, new Vec3(1.2D, level, 0.5D), route, 1, level),
 				"a body still short of the landing center has not");
-		assertTrue(!ServerNavigationController.passedWaypoint(new Vec3(1.5D, level, 0.5D), route, 1, level),
+		assertTrue(!ServerNavigationController.passedWaypoint(ground, new Vec3(1.5D, level, 0.5D), route, 1, level),
 				"standing exactly on the center is left to the normal arrival check");
-		assertTrue(!ServerNavigationController.passedWaypoint(new Vec3(2.6D, level, 0.5D), route, 1, level),
+		assertTrue(!ServerNavigationController.passedWaypoint(ground, new Vec3(2.6D, level, 0.5D), route, 1, level),
 				"more than a block past the center is a different problem than stepping back");
-		assertTrue(!ServerNavigationController.passedWaypoint(new Vec3(2.26D, level + 1.0D, 0.5D), route, 1, level),
+		assertTrue(!ServerNavigationController.passedWaypoint(ground, new Vec3(2.26D, level + 1.0D, 0.5D), route, 1, level),
 				"a body on another level has not passed it");
-		assertTrue(!ServerNavigationController.passedWaypoint(new Vec3(2.26D, level, 0.5D), route, 3, level),
+		assertTrue(!ServerNavigationController.passedWaypoint(ground, new Vec3(2.26D, level, 0.5D), route, 3, level),
 				"the endpoint always keeps its exact arrival check");
 		List<PathNode> jumpNext = new ArrayList<>(route);
 		jumpNext.set(2, new PathNode(new GridPosition(2, LEVEL + 2, 0), TraversalType.JUMP_UP));
-		assertTrue(!ServerNavigationController.passedWaypoint(new Vec3(2.26D, level, 0.5D), jumpNext, 1, level),
+		assertTrue(!ServerNavigationController.passedWaypoint(supportedRoute(jumpNext), new Vec3(2.26D, level, 0.5D), jumpNext, 1, level),
 				"a jump leg after the waypoint still needs the body to line up");
 		List<PathNode> turn = new ArrayList<>(route);
 		turn.set(2, new PathNode(new GridPosition(1, LEVEL + 1, 1), TraversalType.WALK));
-		assertTrue(!ServerNavigationController.passedWaypoint(new Vec3(2.26D, level, 0.5D), turn, 1, level),
+		WalkabilityView turned = supportedRoute(turn);
+		assertTrue(!ServerNavigationController.passedWaypoint(turned, new Vec3(2.26D, level, 0.5D), turn, 1, level),
 				"past the center along the old heading is not past a corner that turns the other way");
-		assertTrue(ServerNavigationController.passedWaypoint(new Vec3(1.5D, level, 1.2D), turn, 1, level),
+		assertTrue(ServerNavigationController.passedWaypoint(turned, new Vec3(1.5D, level, 1.2D), turn, 1, level),
 				"past the center toward the new heading is");
+		assertTrue(!ServerNavigationController.passedWaypoint(supportedRoute(route.subList(0, 2)), new Vec3(2.26D, level, 0.5D), route, 1, level),
+				"a body over the far edge with nothing to stand on toward the next node has not passed it");
+
+		// One-block-wide bridge: a body shoved sideways to the rim, still standing, is not waved on across the gap.
+		List<PathNode> bridge = new ArrayList<>();
+		for (int x = 0; x <= 5; x++) bridge.add(new PathNode(new GridPosition(x, LEVEL, 0), TraversalType.WALK));
+		WalkabilityView bridgeWorld = supportedRoute(bridge);
+		assertTrue(ServerNavigationController.passedWaypoint(bridgeWorld, new Vec3(1.7D, LEVEL, 0.5D), bridge, 1, LEVEL),
+				"a centred body past a bridge node moves on to the next one");
+		assertTrue(!ServerNavigationController.passedWaypoint(bridgeWorld, new Vec3(1.7D, LEVEL, 0.88D), bridge, 1, LEVEL),
+				"a body pushed to the south rim of a bridge has not passed the node");
+		assertTrue(!ServerNavigationController.passedWaypoint(bridgeWorld, new Vec3(1.7D, LEVEL, 0.12D), bridge, 1, LEVEL),
+				"a body pushed to the north rim of a bridge has not passed the node");
+
+		// Ledge corner: the path turns from east to south at (2,0); a body on the outside of the turn is over the void.
+		List<PathNode> ledge = new ArrayList<>();
+		ledge.add(new PathNode(new GridPosition(1, LEVEL, 0), TraversalType.WALK));
+		ledge.add(new PathNode(new GridPosition(2, LEVEL, 0), TraversalType.WALK));
+		ledge.add(new PathNode(new GridPosition(2, LEVEL, 1), TraversalType.WALK));
+		ledge.add(new PathNode(new GridPosition(2, LEVEL, 2), TraversalType.WALK));
+		WalkabilityView ledgeWorld = supportedRoute(ledge);
+		assertTrue(ServerNavigationController.passedWaypoint(ledgeWorld, new Vec3(2.5D, LEVEL, 0.8D), ledge, 1, LEVEL),
+				"a body past the corner node toward the new heading, on the ledge, has passed it");
+		assertTrue(!ServerNavigationController.passedWaypoint(ledgeWorld, new Vec3(2.92D, LEVEL, 0.7D), ledge, 1, LEVEL),
+				"a body on the outer rim of a ledge corner has not passed it");
+		assertTrue(!ServerNavigationController.passedWaypoint(ledgeWorld, new Vec3(2.5D, LEVEL, 0.1D), ledge, 1, LEVEL),
+				"a body that has not yet reached the turn has not passed it");
+
+		// Stairs down a one-block-wide cave passage with walls on both sides.
+		List<PathNode> stairs = new ArrayList<>();
+		stairs.add(new PathNode(new GridPosition(0, LEVEL + 2, 0), TraversalType.WALK));
+		stairs.add(new PathNode(new GridPosition(1, LEVEL + 1, 0), TraversalType.DROP_DOWN));
+		stairs.add(new PathNode(new GridPosition(2, LEVEL, 0), TraversalType.DROP_DOWN));
+		stairs.add(new PathNode(new GridPosition(3, LEVEL - 1, 0), TraversalType.DROP_DOWN));
+		stairs.add(new PathNode(new GridPosition(4, LEVEL - 1, 0), TraversalType.WALK));
+		Set<GridPosition> cave = supportBlocks(stairs);
+		for (int x = -1; x <= 5; x++) {
+			for (int y = LEVEL - 2; y <= LEVEL + 5; y++) {
+				cave.add(new GridPosition(x, y, -1));
+				cave.add(new GridPosition(x, y, 1));
+			}
+		}
+		WalkabilityView caveWorld = solidWorld(cave);
+		double step = LEVEL + 1;
+		assertTrue(ServerNavigationController.passedWaypoint(caveWorld, new Vec3(2.2D, step, 0.5D), stairs, 1, step),
+				"a body that clears a stair in a passage has passed it");
+		assertTrue(!ServerNavigationController.passedWaypoint(caveWorld, new Vec3(2.2D, step, 0.22D), stairs, 1, step),
+				"a body pressed against the passage wall is not waved on");
+		assertTrue(!ServerNavigationController.passedWaypoint(caveWorld, new Vec3(1.2D, step, 0.5D), stairs, 1, step),
+				"a body still on the stair has not passed it");
 	}
 
 	private static void verifyFallingSteering() {
@@ -490,6 +542,22 @@ public final class NavigationMotionVerification {
 			}
 			return WalkabilityView.Cell.CLEAR;
 		};
+	}
+
+	/** Every node's feet cell stands on a full block below it. */
+	private static Set<GridPosition> supportBlocks(List<PathNode> nodes) {
+		Set<GridPosition> blocks = new HashSet<>();
+		for (PathNode node : nodes) blocks.add(node.position().below());
+		return blocks;
+	}
+
+	private static WalkabilityView supportedRoute(List<PathNode> nodes) {
+		return solidWorld(supportBlocks(nodes));
+	}
+
+	/** Air everywhere except the listed blocks, which are solid and support a body standing on top. */
+	private static WalkabilityView solidWorld(Set<GridPosition> solid) {
+		return position -> solid.contains(position) ? WalkabilityView.Cell.SAFE_SUPPORT : WalkabilityView.Cell.CLEAR;
 	}
 
 	private static void assertEquals(Object expected, Object actual, String message) {

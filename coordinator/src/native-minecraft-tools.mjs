@@ -395,7 +395,6 @@ function normalizeMinecraftToolArguments(name, value) {
 			let actionArguments = requireObject(args.arguments);
 			if (Object.hasOwn(actionArguments, 'type')) invalid('arguments.type is reserved; use actionType');
 			// Aliases and sequence steps share defaults, then the canonical action bounds.
-			if (args.actionType === 'move_to') actionArguments = { sprint: true, ...actionArguments };
 			if (args.actionType === 'navigate_to') actionArguments = { tolerance: 1, sprint: true, timeoutMs: 30_000, ...actionArguments };
 			if (args.actionType === 'break_block') actionArguments = { timeoutMs: 15_000, ...actionArguments };
 			try {

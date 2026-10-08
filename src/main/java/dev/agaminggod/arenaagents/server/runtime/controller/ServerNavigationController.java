@@ -227,10 +227,10 @@ public final class ServerNavigationController implements ServerController {
 		if (navigationStartPosition == null) navigationStartPosition = player.position();
 		if (plan == null && blockedMoveTracking) {
 			BlockedMoveDetector.Decision blockedDecision = blockedMoveDetector.observe(
-					player.horizontalCollision, player.onGround(), blockedMoveJumpPending, blockedMoveStepUp,
+					player.horizontalCollision, groundedOnLand(player), blockedMoveJumpPending, blockedMoveStepUp,
 					player.getX(), player.getZ(), nowEpochMs);
 			blockedMoveTracking = blockedDecision != BlockedMoveDetector.Decision.CONTINUE
-					|| player.horizontalCollision && player.onGround() && !blockedMoveJumpPending && !blockedMoveStepUp;
+					|| player.horizontalCollision && groundedOnLand(player) && !blockedMoveJumpPending && !blockedMoveStepUp;
 			if (blockedDecision == BlockedMoveDetector.Decision.FAIL) {
 				return fail(player, "PATH_BLOCKED", "Navigation remained blocked after three seconds", currentProgress());
 			}
@@ -266,7 +266,7 @@ public final class ServerNavigationController implements ServerController {
 		}
 		if (player.onGround() && waypointIndex < nodes.size() - 1) {
 			Vec3 waypointCenter = center(waypoint.position());
-			if (passedWaypoint(player.position(), nodes, waypointIndex,
+			if (passedWaypoint(world, player.position(), nodes, waypointIndex,
 					world.supportHeight(waypoint.position(), waypointCenter.x, waypointCenter.z))) {
 				// A body that clears a short step lands on the supporting block's far side: the waypoint is behind it.
 				waypointIndex++;
@@ -292,10 +292,10 @@ public final class ServerNavigationController implements ServerController {
 		} else {
 			blockedMoveJumpPending = jumpPending;
 			blockedMoveStepUp = stepUp;
-			blockedMoveTracking = player.horizontalCollision && player.onGround() && !jumpPending && !stepUp;
+			blockedMoveTracking = player.horizontalCollision && groundedOnLand(player) && !jumpPending && !stepUp;
 		}
 		BlockedMoveDetector.Decision blockedDecision = reached ? BlockedMoveDetector.Decision.CONTINUE
-				: blockedMoveDetector.observe(player.horizontalCollision, player.onGround(), jumpPending, stepUp,
+				: blockedMoveDetector.observe(player.horizontalCollision, groundedOnLand(player), jumpPending, stepUp,
 						player.getX(), player.getZ(), nowEpochMs);
 		if (blockedDecision == BlockedMoveDetector.Decision.FAIL) {
 			return fail(player, "PATH_BLOCKED", "Navigation remained blocked after three seconds", lastProgressValue);
@@ -839,6 +839,11 @@ public final class ServerNavigationController implements ServerController {
 		));
 	}
 
+	/** Wading is slow and a current can pin the body against a wall, so the fast blocked rule only judges dry ground. */
+	private static boolean groundedOnLand(ServerPlayer player) {
+		return player.onGround() && !player.isInWater();
+	}
+
 	private boolean jumpPending(ServerPlayer player, MinecraftNavigationWorld world, PathNode waypoint, Vec3 target) {
 		boolean shallowWater = world.isShallowWater(waypoint.position());
 		boolean swimming = waypoint.traversal() == TraversalType.SWIM || player.isInWater();
@@ -1024,9 +1029,12 @@ public final class ServerNavigationController implements ServerController {
 	/**
 	 * True when a grounded body at a walk or drop waypoint's level has gone past it toward the next walk or drop node,
 	 * within {@link #HOLD_HEADING_DISTANCE} of its center. Without this the controller stepped back onto the waypoint
-	 * (the heading hold below), though a player just keeps going down the stairs.
+	 * (the heading hold below), though a player just keeps going down the stairs. A body standing in a later path cell
+	 * is passed on by {@link #occupiedWalkNode}; anywhere else it must still have walkable support under the whole
+	 * swept hitbox on the way to the next node, so a body shoved off a narrow bridge or ledge corner is not waved on
+	 * across the gap.
 	 */
-	static boolean passedWaypoint(Vec3 position, List<PathNode> nodes, int index, double supportY) {
+	static boolean passedWaypoint(WalkabilityView world, Vec3 position, List<PathNode> nodes, int index, double supportY) {
 		if (index < 0 || index + 1 >= nodes.size() || !Double.isFinite(supportY)) return false;
 		PathNode node = nodes.get(index);
 		PathNode next = nodes.get(index + 1);
@@ -1035,7 +1043,10 @@ public final class ServerNavigationController implements ServerController {
 		double dx = position.x - (node.position().x() + 0.5D);
 		double dz = position.z - (node.position().z() + 0.5D);
 		if (dx * dx + dz * dz > HOLD_HEADING_DISTANCE * HOLD_HEADING_DISTANCE) return false;
-		return dx * (next.position().x() - node.position().x()) + dz * (next.position().z() - node.position().z()) > 0.0D;
+		if (dx * (next.position().x() - node.position().x()) + dz * (next.position().z() - node.position().z()) <= 0.0D) {
+			return false;
+		}
+		return clearWalkLine(world, position, center(next.position()), node.position().y(), next.position().y());
 	}
 
 	private static boolean walksOrFalls(TraversalType traversal) {
@@ -1053,10 +1064,19 @@ public final class ServerNavigationController implements ServerController {
 	}
 
 	static boolean clearWalkLine(WalkabilityView world, Vec3 from, Vec3 to, int level) {
-		return clearWalkLineWithScratch(world, from, to, level, CLEAR_WALK_LINE_SCRATCH.get());
+		return clearWalkLine(world, from, to, level, level);
+	}
+
+	/** As above for a leg that changes level: each swept cell must be standable at either of the two levels. */
+	static boolean clearWalkLine(WalkabilityView world, Vec3 from, Vec3 to, int level, int otherLevel) {
+		return clearWalkLineWithScratch(world, from, to, level, otherLevel, CLEAR_WALK_LINE_SCRATCH.get());
 	}
 
 	static boolean clearWalkLineWithScratch(WalkabilityView world, Vec3 from, Vec3 to, int level, long[] checked) {
+		return clearWalkLineWithScratch(world, from, to, level, level, checked);
+	}
+
+	static boolean clearWalkLineWithScratch(WalkabilityView world, Vec3 from, Vec3 to, int level, int otherLevel, long[] checked) {
 		double dx = to.x - from.x;
 		double dz = to.z - from.z;
 		int samples = Math.max(1, (int) Math.ceil(Math.sqrt(dx * dx + dz * dz) / STEERING_SAMPLE_SPACING));
@@ -1082,7 +1102,10 @@ public final class ServerNavigationController implements ServerController {
 				checked[cursor] = key;
 				cursor = (cursor + 1) % checked.length;
 				checkedCount = Math.min(checkedCount + 1, checked.length);
-				if (world.traversalAt(new GridPosition(cellX, level, cellZ)) != TraversalType.WALK) return false;
+				if (world.traversalAt(new GridPosition(cellX, level, cellZ)) == TraversalType.WALK) continue;
+				if (otherLevel == level || world.traversalAt(new GridPosition(cellX, otherLevel, cellZ)) != TraversalType.WALK) {
+					return false;
+				}
 			}
 		}
 		return true;

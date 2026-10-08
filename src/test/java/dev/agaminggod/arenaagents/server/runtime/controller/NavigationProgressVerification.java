@@ -175,7 +175,22 @@ public final class NavigationProgressVerification {
 					pendingJump.observe(true, true, true, false, 0.0D, 0.0D, tick * 50L),
 					"a pending jump suppresses fast blocked detection");
 		}
-		return 221;
+		// A body in water is passed to the detector as not grounded: wading against a current is slow, not blocked.
+		BlockedMoveDetector current = new BlockedMoveDetector();
+		for (int tick = 0; tick < 80; tick++) {
+			assertEquals(BlockedMoveDetector.Decision.CONTINUE,
+					current.observe(true, false, false, false, 0.0D, 0.0D, tick * 50L),
+					"a body held against a wall by a water current never trips the fast blocked rule");
+		}
+		BlockedMoveDetector.Decision dry = BlockedMoveDetector.Decision.CONTINUE;
+		for (int tick = 80; tick <= 100; tick++) {
+			dry = current.observe(true, true, false, false, 0.0D, 0.0D, tick * 50L);
+			if (tick < 100) assertEquals(BlockedMoveDetector.Decision.CONTINUE, dry,
+					"leaving the water starts a fresh blocked window instead of inheriting the wading time");
+		}
+		assertEquals(BlockedMoveDetector.Decision.REPLAN, dry,
+				"a body that stays pinned after leaving the water is judged from that moment");
+		return 221 + 80 + 20 + 1;
 	}
 
 	private static void assertBounded(double value) {
