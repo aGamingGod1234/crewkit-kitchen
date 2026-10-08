@@ -544,10 +544,11 @@ test('a Claude Code without --include-partial-messages is detected and relaunche
 	const { service, children, close } = await harness({
 		rejectPartialMessages: true,
 		async onUser(child) { child.emitLine({ type: 'result', subtype: 'success', is_error: false, result: 'ok', session_id: 'session-1' }); },
-	}, { executable: 'claude-without-partial-messages', startupTimeoutMs: 500 });
+	}, { executable: 'claude-without-partial-messages', startupTimeoutMs: 60_000 });
 	try {
 		const agent = await service.createAgent(profile(), { controlProtocol: 'native_tools' });
-		await assert.rejects(agent.prewarm());
+		// The exit itself fails prewarm; a long startup deadline proves nothing waits for it.
+		await assert.rejects(agent.prewarm(), (error) => error.code === 'PROVIDER_UNAVAILABLE');
 		const replacement = await service.replaceAgent(profile(), { controlProtocol: 'native_tools' });
 		await replacement.act('One.', { goalRevision: 0, executeTool: async () => ({}) });
 		assert.equal(children.at(-1).args.includes('--include-partial-messages'), false);

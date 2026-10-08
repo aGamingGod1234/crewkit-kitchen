@@ -618,7 +618,8 @@ ${encoded}`);
 	async #startProcess() {
 		this.#resetContextState();
 		let resolveListed;
-		this.#toolsListed = { promise: new Promise((resolve) => { resolveListed = resolve; }), resolve: () => resolveListed() };
+		let rejectListed;
+		this.#toolsListed = { promise: new Promise((resolve, reject) => { resolveListed = resolve; rejectListed = reject; }), resolve: () => resolveListed(), reject: (error) => rejectListed(error) };
 		void this.#toolsListed.promise.catch(() => {});
 		this.#route = await this.#toolServer.register({
 			callTool: (name, args, meta) => this.#callTool(name, args, meta),
@@ -944,6 +945,8 @@ ${encoded}`);
 		if (/unknown option[^\n]*--include-partial-messages/i.test(state.stderr)) PARTIAL_MESSAGES_UNSUPPORTED.add(partialMessagesKey(this.#config));
 		if (this.#process !== state) return;
 		this.#process = null;
+		// A process that dies before listing the tools fails prewarm now, not at the startup deadline.
+		this.#toolsListed?.reject(error);
 		this.#releaseProcessState();
 		if (!this.#disposed) this.invalidateSession(error);
 	}
