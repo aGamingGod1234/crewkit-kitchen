@@ -22,7 +22,12 @@ export class ContextCarryOver {
 		const outcome = error !== null
 			? `error ${typeof error?.code === 'string' ? error.code : 'TOOL_FAILED'}`
 			: [result?.state, result?.reasonCode].filter((value) => typeof value === 'string').join(' ');
-		this.#tools.push(`${name} ${truncate(safeJson(args), 160)} -> ${outcome || 'returned'}`);
+		const decision = result?.decision ?? result?.status?.decision;
+		const ids = [
+			['actionId', result?.actionId], ['programId', result?.programId],
+			['decisionId', result?.decisionId ?? decision?.decisionId], ['queueId', result?.queueId],
+		].filter(([, value]) => typeof value === 'string').map(([key, value]) => `${key}=${JSON.stringify(truncate(value, 96))}`);
+		this.#tools.push(`${name} ${truncate(safeJson(args), 160)} -> ${outcome || 'returned'}${ids.length === 0 ? '' : ` (${ids.join(', ')})`}`);
 		if (this.#tools.length > CARRY_OVER_TOOL_CALLS) this.#tools.splice(0, this.#tools.length - CARRY_OVER_TOOL_CALLS);
 		if (typeof result?.programId === 'string') this.#noteProgram(result);
 	}
@@ -46,8 +51,11 @@ export class ContextCarryOver {
 	}
 
 	text(reason) {
+		const heading = reason === 'Mid-turn continuation'
+			? 'Mid-turn continuation: resume with the current event and the completed tool result below. Do not repeat completed tool calls.'
+			: `${reason}: your earlier turns are not shown. The event below restates your goal, task memory and facts; read taskPlan, programStatus, queryMemory or taskMemory for anything else.`;
 		return [
-			`${reason}: your earlier turns are not shown. The event below restates your goal, task memory and facts; read taskPlan, programStatus, queryMemory or taskMemory for anything else.`,
+			heading,
 			...(this.#tools.length === 0 ? [] : ['Your most recent tool calls (oldest first):', ...this.#tools.map((entry) => `- ${entry}`)]),
 			...(this.#conversation.length === 0 ? [] : ['Recent conversation already delivered to you (oldest first):', ...this.#conversation.map((entry) => `- ${entry}`)]),
 			...(this.#program === null ? [] : [`Last known program (verify with programStatus): ${JSON.stringify(this.#program)}`]),

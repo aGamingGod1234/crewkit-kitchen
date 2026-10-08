@@ -152,6 +152,21 @@ test('native event packing retains the developer heading, retry footer and every
 	for (const malformed of ['plain text', 'heading\nnot JSON\nfooter', 'heading\n{}\nfooter']) assert.equal(encodeNativeEventInput(malformed), malformed);
 });
 
+test('wake deltas retain budget-trimmed observation sections instead of removing them', () => {
+	const views = new ModelObservationViews();
+	const first = views.prepare(reply(observation()), observe);
+	first.commit();
+	const event = { ...reply(observation()), contextTrimmed: { 'observation.blocks': 12_000 } };
+	delete event.observation.blocks;
+	const prepared = views.prepareEvent(event);
+	assert.equal(prepared.observationView.mode, 'changes');
+	assert.equal(prepared.observationView.remove.includes('blocks'), false);
+	assert.deepEqual(prepared.observationView.replace, {});
+	const later = views.prepareEvent({ ...reply({ ...observation(), blocks: [] }), contextTrimmed: {} });
+	assert.deepEqual(later.observationView.replace.blocks, []);
+	assert.equal(later.observationView.remove.includes('blocks'), false);
+});
+
 test('wake events send changed observation sections against the exact last event view', () => {
 	const views = new ModelObservationViews();
 	const input = (eventSequence, current) => `Wake event.\n${JSON.stringify({ event: 'observation', goalRevision: 3, eventSequence, observation: current })}`;

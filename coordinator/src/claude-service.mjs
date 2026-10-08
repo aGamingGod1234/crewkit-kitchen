@@ -6,6 +6,7 @@ import path from 'node:path';
 
 import { terminateChildProcess } from './child-process-lifecycle.mjs';
 import { ClaudeToolServer } from './claude-tool-server.mjs';
+import { DEFAULT_CONTEXT_ROTATION_TOKENS } from './context-carry-over.mjs';
 import { goalSpecInstructions, nativeInstructions, nativeRecoveryInstructions, presentNativeToolResult, recoveryInstructions } from './codex-service.mjs';
 import { parseDecision } from './decision-parser.mjs';
 import { ModelObservationViews, encodeNativeEventInput } from './model-fact-encoding.mjs';
@@ -38,13 +39,16 @@ const MAX_PUBLIC_AGENT_MESSAGE_CHARS = 1_280;
 const MCP_TOOL_TIMEOUT_MS = '600000';
 // Every model call re-reads the whole conversation. Near this threshold, warm a fresh session and hand the
 // active turn over at its next tool boundary; the same prompt and tools preserve prefix reuse.
-const DEFAULT_CONTEXT_ROTATION_TOKENS = 80_000;
 // Completed turns keep the existing hysteresis; a long turn can hand off after one earlier turn on the session.
 const MIN_TURNS_BETWEEN_ROTATIONS = 3;
 const STANDBY_WARMUP_LEAD_TOKENS = 10_000;
+const STANDBY_READY_TIMEOUT_MS = 250;
+const DEFAULT_MAX_CONCURRENT_STANDBYS = 2;
+const DEFAULT_STANDBY_IDLE_TIMEOUT_MS = 3_000;
 const CARRY_OVER_TOOL_CALLS = 10;
 const MAX_TRACED_TOOLS = 8;
 const CARRY_OVER_CONVERSATION = 6;
+const RETIRED_RESULT_DRAIN_TIMEOUT_MS = 2_000;
 // Streamed token events renew liveness at most this often.
 const STREAM_PROGRESS_INTERVAL_MS = 1_000;
 // Claude Code builds without --include-partial-messages; recorded when one rejects the flag.
@@ -77,6 +81,7 @@ export class ClaudeProviderService {
 	#replacing = new Map();
 	#sessionGenerations = new Map();
 	#lifecycleGeneration = 0;
+	#standbyLeases = new Set();
 
 	constructor(config, dependencies = {}) {
 		this.#config = validateServiceConfig(config);
@@ -195,6 +200,12 @@ export class ClaudeProviderService {
 		await this.#dependencies.fs.chmod(systemPromptFile, 0o600).catch(() => {});
 		const agent = new ClaudeAgent(profile, {
 			...this.#dependencies,
+			acquireStandby: () => {
+				if (this.#standbyLeases.size >= this.#config.maxConcurrentStandbys) return null;
+				const lease = {};
+				this.#standbyLeases.add(lease);
+				return () => this.#standbyLeases.delete(lease);
+			},
 			config: this.#config,
 			cwd,
 			controlProtocol,
@@ -327,6 +338,11 @@ class ClaudeAgent {
 	#processStart = null;
 	#standbyProcess = null;
 	#standbyStart = null;
+	#standbyGeneration = 0;
+	#standbyRelease = null;
+	#standbyFailedForProcess = false;
+	#standbyIdleTimer = null;
+	#acquireStandby;
 	#route = null;
 	#sessionId = null;
 	#active = null;
@@ -347,7 +363,6 @@ class ClaudeAgent {
 	#stream = newStreamMarks();
 	#lastContextTokens = 0;
 	#rotationDue = false;
-	#midTurnRotationUsed = false;
 	#rotations = 0;
 	#turnsSinceRotation = 0;
 	#pendingCarryOver = null;
@@ -358,8 +373,10 @@ class ClaudeAgent {
 	#recentConversation = [];
 	#lastProgram = null;
 	#lastAgentText = null;
+	#routeEpochSequence = 0;
+	#handoffPending = null;
 
-	constructor(profile, { config, cwd, controlProtocol, systemPromptFile, toolServer, spawn, terminate, fs, schedule, cancelSchedule, sessionGeneration, resetReason, onInvalidated }) {
+	constructor(profile, { config, cwd, controlProtocol, systemPromptFile, toolServer, spawn, terminate, fs, schedule, cancelSchedule, acquireStandby, sessionGeneration, resetReason, onInvalidated }) {
 		this.#profile = structuredClone(profile);
 		this.#config = config;
 		this.#cwd = cwd;
@@ -371,6 +388,7 @@ class ClaudeAgent {
 		this.#fs = fs;
 		this.#schedule = schedule;
 		this.#cancelSchedule = cancelSchedule;
+		this.#acquireStandby = acquireStandby;
 		this.#sessionGeneration = sessionGeneration;
 		this.#resetReason = resetReason;
 		this.#onInvalidated = onInvalidated;
@@ -401,7 +419,7 @@ class ClaudeAgent {
 		if (revision < this.#goalRevision) throw new ClaudeProviderError('STALE_GOAL_REVISION', `Goal revision ${revision} is older than ${this.#goalRevision}`);
 		if (revision === this.#goalRevision) return;
 		this.#goalRevision = revision;
-		if ((this.#active !== null && this.#active.goalRevision !== revision) || this.#oneShot !== null) await this.interrupt();
+		if ((this.#active !== null && this.#active.goalRevision !== revision) || this.#oneShot !== null || this.#handoffPending !== null) await this.interrupt();
 	}
 
 	/** Starts Claude Code and waits until it has discovered the Minecraft tools, without spending a model turn. */
@@ -424,6 +442,7 @@ class ClaudeAgent {
 		if (goalRevision !== this.#goalRevision) throw new ClaudeProviderError('STALE_GOAL_REVISION', `Goal revision ${String(goalRevision)} does not match ${this.#goalRevision}`);
 		if (signal?.aborted) throw signal.reason ?? new ClaudeProviderError('TURN_INTERRUPTED', 'Native tool turn was interrupted');
 		if (this.#active !== null) throw new ClaudeProviderError('TURN_IN_PROGRESS', `Claude agent '${this.agentId}' already has an active turn`);
+		this.#cancelStandbyExpiry();
 		await this.#ensureProcess();
 		// An interrupted turn still owes Claude Code's closing result line; never let it close this turn.
 		await this.#waitForIdle();
@@ -438,7 +457,14 @@ class ClaudeAgent {
 		const active = {
 			turnId: `${this.#sessionGeneration}:${++this.#turnSequence}`,
 			input,
+			latestInput: input,
 			goalRevision,
+			routeEpoch: this.#process?.routeEpoch ?? null,
+			midTurnRotationUsed: false,
+			modelSawInput: false,
+			toolDigests: [],
+			toolExecutions: 0,
+			processLost: false,
 			executeTool,
 			onVerbose,
 			onProgress,
@@ -482,16 +508,17 @@ ${encoded}`);
 			completed = true;
 			return result;
 		} catch (error) {
-			this.#observationViews.forgetEventView();
+			if (!active.modelSawInput) this.#observationViews.forgetEventView();
 			if (error?.code === 'PLANNING_TIMEOUT') await this.interrupt().catch(() => {});
 			throw error;
 		} finally {
 			signal?.removeEventListener('abort', abort);
 			silence.dispose();
 			if (this.#active === active) this.#active = null;
-			// Keep a replacement warm while the next model call runs; a tool boundary can then hand off this turn.
-			if (completed) this.#prepareStandbyIfUseful();
-			if (completed) this.#rotateAfterTurn();
+			if (completed) {
+				if (this.#rotationDue && this.#turnsSinceRotation >= MIN_TURNS_BETWEEN_ROTATIONS) this.#rotateAfterTurn();
+				else this.#scheduleStandbyExpiry();
+			}
 		}
 	}
 
@@ -587,8 +614,13 @@ ${encoded}`);
 		const oneShot = this.#oneShot;
 		if (oneShot !== null) await oneShot.cancel(new ClaudeProviderError('PLAN_CANCELLED', 'Planning was cancelled'));
 		const active = this.#active;
-		if (active === null) return;
+		if (active === null) {
+			const pending = this.#handoffPending;
+			if (pending !== null) this.#cancelHandoff(pending.active);
+			return;
+		}
 		active.reject(new ClaudeProviderError('STALE_PLAN', 'Claude turn was interrupted'));
+		this.#cancelHandoff(active);
 		if (this.#process === null) return;
 		this.#writeLine({ type: 'control_request', request_id: `interrupt-${active.turnId}`, request: { subtype: 'interrupt' } });
 		try {
@@ -604,6 +636,7 @@ ${encoded}`);
 		if (this.#disposed) return;
 		this.#disposed = true;
 		const error = this.#invalidationError ?? new ClaudeProviderError('AGENT_DISPOSED', `Claude agent '${this.agentId}' is disposed`);
+		if (this.#handoffPending !== null) this.#cancelHandoff(this.#handoffPending.active);
 		this.#active?.reject(error);
 		this.#active = null;
 		await this.#oneShot?.cancel(error);
@@ -631,26 +664,29 @@ ${encoded}`);
 	}
 
 	#ensureProcess() {
+		if (this.#handoffPending !== null) return this.#handoffPending.promise.then(() => this.#ensureProcess());
 		if (this.#process !== null) return Promise.resolve();
 		// prewarm() and act() can race; both must share one Claude Code process.
 		this.#processStart ??= this.#startProcess().finally(() => { this.#processStart = null; });
 		return this.#processStart;
 	}
 
-	async #startProcess({ standby = false } = {}) {
+	async #startProcess({ standby = false, standbyGeneration = this.#standbyGeneration } = {}) {
 		if (!standby) this.#resetContextState();
 		let resolveListed;
 		let rejectListed;
 		const toolsListed = { promise: new Promise((resolve, reject) => { resolveListed = resolve; rejectListed = reject; }), resolve: () => resolveListed(), reject: (error) => rejectListed(error) };
 		void toolsListed.promise.catch(() => {});
+		const routeEpoch = ++this.#routeEpochSequence;
 		const route = await this.#toolServer.register({
-			callTool: (name, args, meta) => this.#callTool(name, args, meta),
+			callTool: (name, args, meta) => this.#callTool(name, args, meta, routeEpoch),
 			onToolsListed: () => toolsListed.resolve(),
 			onToolResponded: ({ toolUseId }) => {
 				if (toolUseId !== null && this.#active !== null) providerEvent(this.#active.onVerbose, 'native_provider_tool_result_sent', { callId: toolUseId });
 			},
 		});
-		const state = { child: null, stdout: '', stderr: '', stderrBytes: 0, exited: false, route, toolsListed, sessionId: null, standby };
+		if (standby && standbyGeneration !== this.#standbyGeneration) { route.unregister(); return null; }
+		const state = { child: null, stdout: '', stderr: '', stderrBytes: 0, exited: false, route, routeEpoch, toolsListed, sessionId: null, standby, retiredTurn: null, retiredResultPromise: null, resolveRetiredResult: null, retiredResultReceived: false, processCostUsd: 0 };
 		if (standby) this.#standbyProcess = state;
 		else { this.#route = route; this.#toolsListed = toolsListed; }
 		this.#assertUsable();
@@ -681,23 +717,28 @@ ${encoded}`);
 		child.once('error', (error) => this.#onProcessExit(state, new ClaudeProviderError('SPAWN_FAILED', `Could not start Claude Code: ${error.message}`, { cause: error })));
 		child.once('close', (exitCode, signalCode) => this.#onProcessExit(state, new ClaudeProviderError('PROVIDER_UNAVAILABLE',
 			`Claude Code exited with code ${String(exitCode)} and signal ${String(signalCode)} [stderr=${excerpt(state.stderr)}]`)));
+		return state;
 	}
 
 	#prepareStandbyIfUseful() {
 		const threshold = this.#config.contextRotationTokens;
 		if (threshold <= 0 || this.#lastContextTokens < Math.max(1, threshold - STANDBY_WARMUP_LEAD_TOKENS)
-			|| this.#disposed || this.#process === null
+			|| this.#disposed || this.#active === null || this.#active.midTurnRotationUsed || this.#standbyFailedForProcess || this.#process === null
 			|| this.#standbyProcess !== null || this.#standbyStart !== null) return;
+		const release = this.#acquireStandby?.();
+		if (typeof release !== 'function') return;
+		this.#standbyRelease = release;
+		const generation = ++this.#standbyGeneration;
 		const warming = (async () => {
-			await this.#startProcess({ standby: true });
-			const state = this.#standbyProcess;
+			const state = await this.#startProcess({ standby: true, standbyGeneration: generation });
 			if (state === null) throw new ClaudeProviderError('PROVIDER_UNAVAILABLE', 'Claude standby process exited during startup');
 			await withDeadline(state.toolsListed.promise, this.#config.startupTimeoutMs, this.#schedule, this.#cancelSchedule,
 				() => new ClaudeProviderError('PROVIDER_START_TIMEOUT', `Claude Code did not load the Minecraft tools within ${this.#config.startupTimeoutMs} ms`));
-			if (this.#standbyProcess !== state || state.exited) throw new ClaudeProviderError('PROVIDER_UNAVAILABLE', 'Claude standby process exited during startup');
+			if (generation !== this.#standbyGeneration || this.#standbyProcess !== state || state.exited) throw new ClaudeProviderError('PROVIDER_UNAVAILABLE', 'Claude standby process exited during startup');
 			return state;
 		})();
 		this.#standbyStart = warming.catch(async (error) => {
+			if (generation === this.#standbyGeneration) this.#standbyFailedForProcess = true;
 			await this.#stopStandbyProcess();
 			throw error;
 		}).finally(() => { if (this.#standbyStart === tracked) this.#standbyStart = null; });
@@ -706,54 +747,124 @@ ${encoded}`);
 	}
 
 	async #standbyAtToolBoundary() {
-		if (!this.#rotationDue || this.#midTurnRotationUsed || this.#disposed) return null;
-		this.#prepareStandbyIfUseful();
+		if (!this.#rotationDue || this.#active?.midTurnRotationUsed || this.#disposed || this.#standbyFailedForProcess) return null;
 		if (this.#standbyStart === null) return this.#standbyProcess;
-		try { return await this.#standbyStart; } catch { return null; }
+		try {
+			return await withDeadline(this.#standbyStart, STANDBY_READY_TIMEOUT_MS, this.#schedule, this.#cancelSchedule,
+				() => new ClaudeProviderError('STANDBY_READY_TIMEOUT', 'Claude standby was not ready at the next tool boundary'));
+		} catch {
+			this.#standbyFailedForProcess = true;
+			void this.#stopStandbyProcess();
+			return null;
+		}
 	}
 
 	async #stopStandbyProcess() {
+		this.#cancelStandbyExpiry();
 		const state = this.#standbyProcess;
 		this.#standbyProcess = null;
+		this.#standbyGeneration += 1;
+		this.#releaseStandbyLease();
 		if (state === null) return;
+		state.toolsListed?.reject(new ClaudeProviderError('PROVIDER_UNAVAILABLE', 'Claude standby was stopped before becoming ready'));
 		state.exited = true;
 		state.route?.unregister();
 		try { state.child?.stdin?.end?.(); } catch { /* the process may already be gone */ }
 		await Promise.resolve(this.#terminate(state.child)).catch(() => {});
 	}
 
-	async #promoteStandby(state) {
+	#promoteStandby(state, active = null) {
+		if (this.#standbyProcess !== state || state.exited) return null;
+		this.#cancelStandbyExpiry();
 		const previous = this.#process;
-		this.#pendingCarryOver = this.#carryOver('Session refreshed to keep context small');
-		this.#process = null;
-		this.#route = null;
+		if (this.#disposed) return null;
+		this.#standbyProcess = null;
+		this.#releaseStandbyLease();
+		state.standby = false;
+		this.#process = state;
+		this.#route = state.route;
+		this.#toolsListed = state.toolsListed;
+		this.#sessionId = state.sessionId;
+		if (active !== null) active.routeEpoch = state.routeEpoch;
 		if (previous !== null) {
-			previous.exited = true;
-			previous.route?.unregister();
-			try { previous.child.stdin?.end?.(); } catch { /* the process may already be gone */ }
-			await Promise.resolve(this.#terminate(previous.child)).catch(() => {});
+			previous.processCostUsd = this.#processCostUsd;
+			previous.retired = true;
+			previous.retiredTurn = active;
+			if (active !== null) previous.retiredResultPromise = new Promise((resolve) => { previous.resolveRetiredResult = resolve; });
 		}
-		if (this.#disposed) return false;
-		if (this.#standbyProcess === state && !state.exited) {
-			this.#standbyProcess = null;
-			state.standby = false;
-			this.#process = state;
-			this.#route = state.route;
-			this.#toolsListed = state.toolsListed;
-			this.#sessionId = state.sessionId;
-			this.#resetContextState();
-		} else {
-			// If the warmed process exits during handoff, keep the completed tool result and continue cold.
-			await this.#ensureProcess();
-			await withDeadline(this.#toolsListed.promise, this.#config.startupTimeoutMs, this.#schedule, this.#cancelSchedule,
-				() => new ClaudeProviderError('PROVIDER_START_TIMEOUT', `Claude Code did not load the Minecraft tools within ${this.#config.startupTimeoutMs} ms`));
-		}
+		this.#resetContextState();
 		this.#rotations += 1;
-		return true;
+		return { previous };
+	}
+
+	#releaseStandbyLease() {
+		this.#standbyRelease?.();
+		this.#standbyRelease = null;
+	}
+
+	#scheduleStandbyExpiry() {
+		if (this.#standbyProcess === null && this.#standbyStart === null) return;
+		this.#cancelStandbyExpiry();
+		this.#standbyIdleTimer = this.#schedule(() => {
+			this.#standbyIdleTimer = null;
+			void this.#stopStandbyProcess();
+		}, this.#config.standbyIdleTimeoutMs);
+		this.#standbyIdleTimer?.unref?.();
+	}
+
+	#cancelStandbyExpiry() {
+		if (this.#standbyIdleTimer === null) return;
+		this.#cancelSchedule(this.#standbyIdleTimer);
+		this.#standbyIdleTimer = null;
+	}
+
+	#retireProcess(state) {
+		if (state === null) return;
+		try { state.child.stdin?.end?.(); } catch { /* the process may already be gone */ }
+		void (async () => {
+			if (state.retiredTurn !== null && !state.retiredResultReceived && !state.exited) {
+				let timer = null;
+				const timeout = new Promise((resolve) => {
+					timer = this.#schedule(resolve, RETIRED_RESULT_DRAIN_TIMEOUT_MS);
+					timer?.unref?.();
+				});
+				await Promise.race([state.retiredResultPromise, timeout]);
+				if (timer !== null) this.#cancelSchedule(timer);
+			}
+			if (!state.exited) await Promise.resolve(this.#terminate(state.child)).catch(() => {});
+		})();
+	}
+
+	#beginHandoff(active) {
+		let resolveDone;
+		let resolveCancelled;
+		const transaction = {
+			active,
+			cancelled: false,
+			promise: new Promise((resolve) => { resolveDone = resolve; }),
+			cancelPromise: new Promise((resolve) => { resolveCancelled = resolve; }),
+			resolveDone,
+			resolveCancelled,
+		};
+		this.#handoffPending = transaction;
+		return transaction;
+	}
+
+	#finishHandoff(transaction) {
+		if (this.#handoffPending !== transaction) return;
+		this.#handoffPending = null;
+		transaction.resolveDone();
+	}
+
+	#cancelHandoff(active) {
+		const transaction = this.#handoffPending;
+		if (transaction === null || transaction.active !== active || transaction.cancelled) return;
+		transaction.cancelled = true;
+		transaction.resolveCancelled();
 	}
 
 	#onStdout(state, chunk) {
-		if (this.#process !== state && this.#standbyProcess !== state) return;
+		if (this.#process !== state && this.#standbyProcess !== state && state.retired !== true) return;
 		state.stdout += chunk;
 		if (Buffer.byteLength(state.stdout, 'utf8') > this.#config.stdoutLineLimitBytes && !state.stdout.includes('\n')) {
 			this.invalidateSession(new ClaudeProviderError('OUTPUT_LIMIT_EXCEEDED', `Claude Code output line exceeded ${this.#config.stdoutLineLimitBytes} bytes`));
@@ -771,6 +882,25 @@ ${encoded}`);
 	}
 
 	#onMessage(message, state = this.#process) {
+		if (state?.retired === true) {
+			if (message?.type === 'result') {
+				state.retiredResultReceived = true;
+				state.resolveRetiredResult?.();
+				state.resolveRetiredResult = null;
+				if (Number.isFinite(message.total_cost_usd) && message.total_cost_usd >= 0) {
+					const delta = message.total_cost_usd >= state.processCostUsd ? message.total_cost_usd - state.processCostUsd : message.total_cost_usd;
+					state.processCostUsd = message.total_cost_usd;
+					this.#usage.costUsd += delta;
+					if (state.retiredTurn !== null) state.retiredTurn.usage.costUsd = (state.retiredTurn.usage.costUsd ?? 0) + delta;
+				}
+				const turnOutput = message.usage?.output_tokens;
+				if (state.retiredTurn !== null && Number.isSafeInteger(turnOutput) && turnOutput >= 0) {
+					this.#usage.output += turnOutput - state.retiredTurn.usage.output;
+					state.retiredTurn.usage.output = turnOutput;
+				}
+			}
+			return;
+		}
 		if (state?.standby === true && this.#standbyProcess === state) {
 			if (message?.type === 'system' && message.subtype === 'init') {
 				if (typeof message.session_id === 'string') state.sessionId = message.session_id;
@@ -787,8 +917,8 @@ ${encoded}`);
 			active.silence.restart();
 			try { active.onProgress?.({ phase: 'provider' }); } catch { /* progress reporting cannot fail provider work */ }
 		}
-		if (message?.type === 'stream_event') { this.#noteStreamMarks(message.event, now); this.#onStreamEvent(message.event); return; }
-		if (message?.type === 'assistant') this.#noteAssistantUsage(message.message);
+		if (message?.type === 'stream_event') { if (active !== null) active.modelSawInput = true; this.#noteStreamMarks(message.event, now); this.#onStreamEvent(message.event); return; }
+		if (message?.type === 'assistant') { if (active !== null) active.modelSawInput = true; this.#noteAssistantUsage(message.message); }
 		if (message?.type === 'system' && message.subtype === 'init') {
 			if (typeof message.session_id === 'string') { this.#sessionId = message.session_id; if (state !== null) state.sessionId = message.session_id; }
 			if (typeof message.model === 'string' && message.model.length > 0 && message.model.length <= 256) {
@@ -835,20 +965,54 @@ ${encoded}`);
 			`Claude Code ended the turn (${String(message.subtype ?? 'error')}): ${excerpt(message.result ?? message.errors ?? '')}`));
 	}
 
-	#encodeSteer = async (input) => {
-		const text = await resolveSteerInput(input);
-		this.#noteEventFacts(text);
-		return encodeNativeEventInput(text, this.#observationViews);
-	};
+	/** Encodes a pending steer for delivery and records it as the newest event the model has been given. */
+	#steerEncoder(active) {
+		return async (input) => {
+			const text = await resolveSteerInput(input);
+			active.latestInput = text;
+			this.#noteEventFacts(text);
+			return encodeNativeEventInput(text, this.#observationViews);
+		};
+	}
 
-	async #callTool(name, args, { toolUseId }) {
+	/**
+	 * A rotation handoff carries the newest event as the replacement's current input, so a pending steer becomes that
+	 * input instead of a second copy. Its waiters resolve here, which is the only delivery the steer gets.
+	 */
+	async #foldPendingSteerIntoInput(active) {
+		while (active.pendingSteers !== null) {
+			const pending = active.pendingSteers;
+			let text;
+			try { text = await resolveSteerInput(pending.buildInput); }
+			catch (error) {
+				if (active.pendingSteers !== pending) { discardPendingSteer(pending); continue; }
+				active.pendingSteers = null;
+				discardPendingSteer(pending);
+				for (const waiter of pending.waiters) waiter.reject(error);
+				return;
+			}
+			if (active.pendingSteers !== pending) { discardPendingSteer(pending); continue; }
+			active.pendingSteers = null;
+			active.latestInput = text;
+			this.#noteEventFacts(text);
+			providerEvent(active.onVerbose, 'native_provider_steer_delivered', { turnId: active.turnId, steers: pending.waiters.length, waitMs: Math.max(0, Date.now() - pending.queuedAt) });
+			for (const waiter of pending.waiters) waiter.resolve();
+		}
+	}
+
+	async #callTool(name, args, { toolUseId }, routeEpoch) {
 		const active = this.#active;
 		if (this.#disposed || active === null || active.settled) {
 			return mcpContent(toolResultContent({ state: 'FAILED', reasonCode: 'TURN_NOT_ACTIVE', message: 'No Minecraft turn is active for this body.' }, false));
 		}
-		active.toolCalls += 1;
+		if (routeEpoch !== active.routeEpoch) {
+			return mcpContent(toolResultContent({ state: 'FAILED', reasonCode: 'SESSION_ROTATED', message: 'This tool request came from a retired Claude session.' }, false));
+		}
+		active.modelSawInput = true;
 		const run = async () => {
 			if (active.settled) return toolResultContent({ state: 'FAILED', reasonCode: 'TURN_NOT_ACTIVE', message: 'The Minecraft turn already ended.' }, false);
+			if (routeEpoch !== active.routeEpoch) return toolResultContent({ state: 'FAILED', reasonCode: 'SESSION_ROTATED', message: 'This tool request came from a retired Claude session.' }, false);
+			active.toolCalls += 1;
 			active.silence.pause();
 			let content;
 			let result;
@@ -857,18 +1021,19 @@ ${encoded}`);
 			let commit = () => {};
 			try {
 				tool = normalizeMinecraftToolCall(name, args);
-				result = await active.executeTool({
+				active.toolExecutions += 1;
+				try { result = await active.executeTool({
 					agentId: this.agentId,
 					goalRevision: active.goalRevision,
 					threadId: this.#sessionId,
 					turnId: active.turnId,
 					callId: toolUseId,
 					tool,
-				});
-				this.#rememberTool(name, args, result);
+				}); } finally { active.toolExecutions -= 1; }
+				active.toolDigests.push(this.#rememberTool(name, args, result));
 				this.#noteProgram(result);
 			} catch (error) {
-				this.#rememberTool(name, args, { state: 'FAILED', reasonCode: error?.code ?? 'TOOL_EXECUTION_FAILED' });
+				active.toolDigests.push(this.#rememberTool(name, args, { state: 'FAILED', reasonCode: error?.code ?? 'TOOL_EXECUTION_FAILED' }));
 				result = {
 					state: 'FAILED',
 					reasonCode: String(error?.code ?? 'TOOL_EXECUTION_FAILED').slice(0, 128),
@@ -876,52 +1041,115 @@ ${encoded}`);
 					...(error?.actionContract === undefined ? {} : { actionContract: error.actionContract }),
 				};
 				toolFailed = true;
-			} finally {
-				active.silence.resume();
-			}
-			if (result !== undefined && tool !== undefined && this.#rotationDue && !this.#midTurnRotationUsed && !this.#disposed) {
+			} finally { active.silence.resume(); }
+			if (active.processLost && this.#process === null && !active.settled && tool !== undefined) {
+				const transaction = this.#beginHandoff(active);
 				active.silence.pause();
 				try {
-					const standby = await this.#standbyAtToolBoundary();
-					if (standby !== null && !active.settled) {
-						const promoted = await this.#promoteStandby(standby);
-						if (promoted) {
-							this.#midTurnRotationUsed = true;
-							// The replacement has no prior view IDs, so its first tool result is always self-contained.
-							const turnInput = encodeNativeEventInput(active.input, this.#observationViews);
-							const presented = presentNativeToolResult(result, { ...tool, view: 'full' }, this.#observationViews);
-							if (toolFailed) presented.response.success = false;
-							commit = presented.commit;
-							const delivered = await deliverSteers(active, presented.response, this.#encodeSteer);
-							const [toolResult, ...steers] = delivered.contentItems.map((item) => item.text);
-							const handoff = [
-								this.#pendingCarryOver,
-								`Current turn input to continue:\n${turnInput}`,
-								`Tool result for Minecraft tool "${name}"${toolUseId === null ? '' : ` (tool use ${toolUseId})`}:\n${toolResult}`,
-								...steers,
-							].filter(Boolean).join('\n\n');
-							this.#pendingCarryOver = handoff;
-							this.#writeUserMessage(handoff);
-							this.#pendingCarryOver = null;
-							this.#processUsed = true;
-							commit();
-							return mcpContent(toolResultContent({ state: 'FAILED', reasonCode: 'SESSION_ROTATED', message: 'This process ended at a session boundary; the completed tool result continues in the replacement turn.' }, false));
+					await this.#startProcess();
+					await withDeadline(this.#toolsListed.promise, this.#config.startupTimeoutMs, this.#schedule, this.#cancelSchedule,
+						() => new ClaudeProviderError('PROVIDER_START_TIMEOUT', `Claude Code did not load the Minecraft tools within ${this.#config.startupTimeoutMs} ms`));
+					if (active.settled || this.#active !== active || active.goalRevision !== this.#goalRevision) {
+						this.#pendingCarryOver = `${this.#carryOver('Session refreshed to continue the next turn')}\n\nCompleted tool result from the interrupted turn for "${name}":\n${JSON.stringify(result)}`;
+						return toolResultContent({ state: 'FAILED', reasonCode: 'SESSION_ROTATED', message: 'The old session ended while this tool was running.' }, false);
+					}
+					active.routeEpoch = this.#process.routeEpoch;
+					active.midTurnRotationUsed = true;
+					await this.#foldPendingSteerIntoInput(active);
+					const turnInput = encodeNativeEventInput(active.latestInput, this.#observationViews);
+					const presented = presentNativeToolResult(result, { ...tool, view: 'full' }, this.#observationViews);
+					if (toolFailed) presented.response.success = false;
+					commit = presented.commit;
+					const delivered = await deliverSteers(active, presented.response, this.#steerEncoder(active));
+					const [toolResult, ...steers] = delivered.contentItems.map((item) => item.text);
+					const handoff = [
+						this.#carryOver('Mid-turn continuation', { midTurn: true }),
+						`Current turn input to continue:\n${turnInput}`,
+						...(active.toolDigests.length === 0 ? [] : ['Completed tool calls this turn (one-line digests):', ...active.toolDigests.map((entry) => `- ${entry}`)]),
+						`Tool result for Minecraft tool "${name}"${toolUseId === null ? '' : ` (tool use ${toolUseId})`}:\n${toolResult}`,
+						...steers,
+					].filter(Boolean).join('\n\n');
+					this.#pendingCarryOver = handoff;
+					this.#writeUserMessage(handoff);
+					this.#pendingCarryOver = null;
+					this.#processUsed = true;
+					commit();
+					return toolResultContent({ state: 'FAILED', reasonCode: 'SESSION_ROTATED', message: 'The completed tool result continues in a cold replacement session.' }, false);
+				} catch (error) {
+					this.#pendingCarryOver = `${this.#carryOver('Session refreshed to continue the next turn')}\n\nCompleted tool result from the interrupted turn for "${name}":\n${JSON.stringify(result)}`;
+					active.reject(error);
+					return toolResultContent({ state: 'FAILED', reasonCode: 'SESSION_ROTATED', message: 'The completed tool result was saved for the next session.' }, false);
+				} finally {
+					active.silence.resume();
+					this.#finishHandoff(transaction);
+				}
+			}
+			if (result !== undefined && tool !== undefined && this.#rotationDue && !active.midTurnRotationUsed && !this.#disposed) {
+				const transaction = this.#beginHandoff(active);
+				active.silence.pause();
+				try {
+					const standby = await Promise.race([
+						this.#standbyAtToolBoundary(),
+						transaction.cancelPromise.then(() => null),
+					]);
+					if (standby !== null && !transaction.cancelled && !active.settled
+						&& active.goalRevision === this.#goalRevision && this.#active === active) {
+						const promoted = await this.#promoteStandby(standby, active);
+						if (promoted !== null) {
+							const stillCurrent = !transaction.cancelled && !active.settled && this.#active === active
+								&& active.goalRevision === this.#goalRevision && !this.#disposed;
+							if (!stillCurrent) {
+							this.#pendingCarryOver = [
+								this.#carryOver('Session refreshed to continue the next turn'),
+								`Completed tool result from the interrupted turn for "${name}":\n${JSON.stringify(result)}`,
+							].join('\n\n');
+							this.#retireProcess(promoted.previous);
+							return toolResultContent({ state: 'FAILED', reasonCode: 'SESSION_ROTATED', message: 'The old turn was interrupted during session rotation.' }, false);
+						}
+						active.midTurnRotationUsed = true;
+						await this.#foldPendingSteerIntoInput(active);
+						const turnInput = encodeNativeEventInput(active.latestInput, this.#observationViews);
+						const presented = presentNativeToolResult(result, { ...tool, view: 'full' }, this.#observationViews);
+						if (toolFailed) presented.response.success = false;
+						commit = presented.commit;
+						const delivered = await deliverSteers(active, presented.response, this.#steerEncoder(active));
+						const [toolResult, ...steers] = delivered.contentItems.map((item) => item.text);
+						const handoff = [
+							this.#carryOver('Mid-turn continuation', { midTurn: true }),
+							`Current turn input to continue:\n${turnInput}`,
+							...(active.toolDigests.length === 0 ? [] : ['Completed tool calls this turn (one-line digests):', ...active.toolDigests.map((entry) => `- ${entry}`)]),
+							`Tool result for Minecraft tool "${name}"${toolUseId === null ? '' : ` (tool use ${toolUseId})`}:\n${toolResult}`,
+							...steers,
+						].filter(Boolean).join('\n\n');
+						this.#pendingCarryOver = handoff;
+						this.#writeUserMessage(handoff);
+						this.#pendingCarryOver = null;
+						this.#processUsed = true;
+						commit();
+						this.#retireProcess(promoted.previous);
+							return toolResultContent({ state: 'FAILED', reasonCode: 'SESSION_ROTATED', message: 'This process ended at a session boundary; the completed tool result continues in the replacement turn.' }, false);
 						}
 					}
 				} finally {
 					active.silence.resume();
+					this.#finishHandoff(transaction);
 				}
 			}
-			if (content === undefined) {
-				if (tool === undefined) content = toolResultContent(result, false);
-				else {
-					const presented = presentNativeToolResult(result, tool, this.#observationViews);
-					if (toolFailed) presented.response.success = false;
-					content = presented.response;
-					commit = presented.commit;
-				}
+			if (routeEpoch !== active.routeEpoch) {
+				this.#pendingCarryOver ??= `${this.#carryOver('Session refreshed to continue the next turn')}\n\nCompleted tool result from the interrupted turn for "${name}":\n${JSON.stringify(result)}`;
+				return toolResultContent({ state: 'FAILED', reasonCode: 'SESSION_ROTATED', message: 'This tool request came from a retired Claude session.' }, false);
 			}
-			const delivered = await deliverSteers(active, content, this.#encodeSteer);
+			if (active.settled && tool !== undefined) {
+				this.#pendingCarryOver ??= `${this.#carryOver('Turn interrupted after the tool completed')}\n\nCompleted tool result for "${name}":\n${JSON.stringify(result)}`;
+			}
+			if (tool === undefined) content = toolResultContent(result, false);
+			else {
+				const presented = presentNativeToolResult(result, tool, this.#observationViews);
+				if (toolFailed) presented.response.success = false;
+				content = presented.response;
+				commit = presented.commit;
+			}
+			const delivered = await deliverSteers(active, content, this.#steerEncoder(active));
 			// A settled (interrupted or aborted) turn may never show this result to the model.
 			if (!active.settled) commit();
 			this.#requestAt = Date.now();
@@ -937,35 +1165,23 @@ ${encoded}`);
 	#rotateAfterTurn() {
 		if (!this.#rotationDue || this.#turnsSinceRotation < MIN_TURNS_BETWEEN_ROTATIONS) return;
 		if (this.#process === null || this.#active !== null || this.#awaitingResult > 0 || this.#disposed) return;
-		const carryOver = this.#carryOver('Session refreshed to keep context small');
-		// Arm before #stopProcess yields so a racing act cannot consume a generic restart note.
-		this.#pendingCarryOver = carryOver;
-		this.#rotations += 1;
-		void this.#stopProcess().then(async () => {
-			if (this.#disposed || this.#invalidationError !== null) return;
-			if (this.#process !== null) { await this.#standbyStart?.catch(() => {}); await this.#stopStandbyProcess(); return; }
-			let standby = this.#standbyProcess;
-			if (standby === null && this.#standbyStart !== null) {
-				try { standby = await this.#standbyStart; } catch { /* a normal replacement starts below */ }
-			}
-			if (this.#process !== null) { await this.#standbyStart?.catch(() => {}); await this.#stopStandbyProcess(); return; }
-			if (standby !== null && this.#standbyProcess === standby && !standby.exited) {
-				this.#standbyProcess = null;
-				standby.standby = false;
-				this.#process = standby;
-				this.#route = standby.route;
-				this.#toolsListed = standby.toolsListed;
-				this.#sessionId = standby.sessionId;
-				return;
-			}
-			return this.#ensureProcess();
-		}).catch(() => {});
+		const standby = this.#standbyProcess;
+		if (standby === null || standby.exited) return;
+		const transaction = this.#beginHandoff(null);
+		try {
+			this.#pendingCarryOver = this.#carryOver('Session refreshed to keep context small');
+			const promoted = this.#promoteStandby(standby);
+			if (promoted !== null) this.#retireProcess(promoted.previous);
+			else this.#pendingCarryOver = null;
+		} finally { this.#finishHandoff(transaction); }
 	}
 
-	#carryOver(reason) {
+	#carryOver(reason, { midTurn = false } = {}) {
 		const lines = this.#recentTools.map((entry) => `- ${entry}`);
 		return [
-			`${reason}: your earlier turns are not shown. The event below restates your goal, task memory and facts; read taskPlan, programStatus, queryMemory or taskMemory for anything else.`,
+			midTurn
+				? `${reason}: an active tool turn resumes below. Use the completed tool result once, then continue the current goal with the latest event facts.`
+				: `${reason}: your earlier turns are not shown. The event below restates your goal, task memory and facts; read taskPlan, programStatus, queryMemory or taskMemory for anything else.`,
 			...(lines.length === 0 ? [] : ['Your most recent tool calls (oldest first):', ...lines]),
 			...(this.#recentConversation.length === 0 ? [] : ['Recent conversation already delivered to you (oldest first):', ...this.#recentConversation.map((entry) => `- ${entry}`)]),
 			...(this.#lastProgram === null ? [] : [`Last known program (verify with programStatus): ${JSON.stringify(this.#lastProgram)}`]),
@@ -1003,8 +1219,16 @@ ${encoded}`);
 	#rememberTool(name, args, result) {
 		const argsText = truncate(JSON.stringify(args ?? {}), 160);
 		const outcome = [result?.state, result?.reasonCode].filter((value) => typeof value === 'string').join(' ');
-		this.#recentTools.push(`${name} ${argsText} -> ${outcome || 'returned'}`);
+		const decision = result?.decision ?? result?.status?.decision;
+		const ids = [
+			['actionId', result?.actionId], ['programId', result?.programId],
+			['decisionId', result?.decisionId ?? decision?.decisionId], ['queueId', result?.queueId],
+		].filter(([, value]) => typeof value === 'string')
+			.map(([key, value]) => `${key}=${JSON.stringify(truncate(value, 96))}`);
+		const digest = `${name} ${argsText} -> ${outcome || 'returned'}${ids.length === 0 ? '' : ` (${ids.join(', ')})`}`;
+		this.#recentTools.push(digest);
 		if (this.#recentTools.length > CARRY_OVER_TOOL_CALLS) this.#recentTools.splice(0, this.#recentTools.length - CARRY_OVER_TOOL_CALLS);
+		return digest;
 	}
 
 	/**
@@ -1138,11 +1362,23 @@ ${encoded}`);
 			state.toolsListed?.reject(error);
 			return;
 		}
+		if (state.retired === true) {
+			state.resolveRetiredResult?.();
+			state.resolveRetiredResult = null;
+			state.retiredTurn = null;
+			state.route?.unregister();
+			return;
+		}
 		if (this.#process !== state) return;
 		this.#process = null;
 		// A process that dies before listing the tools fails prewarm now, not at the startup deadline.
 		state.toolsListed?.reject(error);
+		const activeToolCanHandoff = this.#active !== null && !this.#active.settled && this.#active.toolExecutions > 0;
 		this.#releaseProcessState();
+		if (activeToolCanHandoff) {
+			this.#active.processLost = true;
+			return;
+		}
 		if (!this.#disposed) this.invalidateSession(error);
 	}
 
@@ -1172,7 +1408,7 @@ ${encoded}`);
 		this.#observationViews.reset();
 		this.#rotationDue = false;
 		this.#lastContextTokens = 0;
-		this.#midTurnRotationUsed = false;
+		this.#standbyFailedForProcess = false;
 		this.#turnsSinceRotation = 0;
 		this.#processUsed = false;
 		this.#processCostUsd = 0;
@@ -1462,6 +1698,7 @@ function validateServiceConfig(config) {
 	for (const effort of reasoningEfforts) {
 		if (!CLAUDE_REASONING_EFFORTS.includes(effort)) throw new TypeError(`Claude reasoning effort '${effort}' must be one of ${CLAUDE_REASONING_EFFORTS.join(', ')}`);
 	}
+	const maxConcurrentStandbys = positiveInteger(config.maxConcurrentStandbys ?? DEFAULT_MAX_CONCURRENT_STANDBYS, 'maxConcurrentStandbys');
 	return {
 		...config,
 		provider: 'claude',
@@ -1477,6 +1714,8 @@ function validateServiceConfig(config) {
 		stdoutLineLimitBytes: positiveInteger(config.stdoutLimitBytes ?? DEFAULT_STDOUT_LINE_LIMIT_BYTES, 'stdoutLimitBytes'),
 		stderrLimitBytes: positiveInteger(config.stderrLimitBytes ?? DEFAULT_STDERR_LIMIT_BYTES, 'stderrLimitBytes'),
 		contextRotationTokens: nonnegativeInteger(config.contextRotationTokens ?? DEFAULT_CONTEXT_ROTATION_TOKENS, 'contextRotationTokens'),
+		maxConcurrentStandbys,
+		standbyIdleTimeoutMs: positiveInteger(config.standbyIdleTimeoutMs ?? DEFAULT_STANDBY_IDLE_TIMEOUT_MS, 'standbyIdleTimeoutMs'),
 	};
 }
 

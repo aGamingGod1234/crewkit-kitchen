@@ -159,7 +159,7 @@ export class ModelObservationViews {
   if (identity === null || identity !== this.#baseline?.identity || observation.player?.dead === true || observation.continuity?.phase === 'dead') this.#resetObservations();
  }
 
- prepare(value, tool, { minRetainedMetadataBytes = 0 } = {}) {
+ prepare(value, tool, { minRetainedMetadataBytes = 0, preserveTrimmedObservationSections = false } = {}) {
   // Only the final fresh sample is a view. Per-step observations remain
   // historical receipts, even when a sequence stopped on a failed action.
   const nested = (tool.kind === 'action' || tool.kind === 'sequence') && record(value?.postAction);
@@ -172,14 +172,22 @@ export class ModelObservationViews {
   const id = `observation-${this.#session}-${sequence}`;
   const identity = observationIdentity(observation);
   const eligible = identity !== null && snapshot.freshness?.fresh === true && observation.player?.dead !== true && observation.continuity?.phase !== 'dead';
-  const next = { id, identity, observation: structuredClone(observation), metadata: Object.fromEntries(RETAINABLE_METADATA.filter(key => Object.hasOwn(snapshot, key)).map(key => [key, structuredClone(snapshot[key])])), goalRevision: snapshot.goalRevision };
+  const previous = this.#history.get(tool.afterObservationId) ?? null;
+  const sameBaseline = eligible && previous !== null && previous.id === tool.afterObservationId && previous.identity === identity && previous.goalRevision === snapshot.goalRevision;
+  const trimmedSections = preserveTrimmedObservationSections && record(snapshot.contextTrimmed)
+   ? new Set(Object.keys(snapshot.contextTrimmed).flatMap(key => key.startsWith('observation.') ? [key.slice('observation.'.length)] : []))
+   : new Set();
+  const retainedObservation = structuredClone(observation);
+  if (sameBaseline) for (const section of trimmedSections) {
+   if (!Object.hasOwn(retainedObservation, section) && Object.hasOwn(previous.observation, section)) retainedObservation[section] = structuredClone(previous.observation[section]);
+  }
+  const next = { id, identity, observation: retainedObservation, metadata: Object.fromEntries(RETAINABLE_METADATA.filter(key => Object.hasOwn(snapshot, key)).map(key => [key, structuredClone(snapshot[key])])), goalRevision: snapshot.goalRevision };
   next.bytes = bytes(next);
   const full = { ...snapshot, observationView: { id, mode: 'full' } };
   let presented = full;
-  const previous = this.#history.get(tool.afterObservationId) ?? null;
-  if (eligible && tool.view === 'changes' && previous !== null && previous.id === tool.afterObservationId && previous.identity === identity && previous.goalRevision === snapshot.goalRevision) {
-   const replace = Object.fromEntries(Object.entries(observation).filter(([key, current]) => !Object.hasOwn(previous.observation, key) || !isDeepStrictEqual(previous.observation[key], current)));
-   const remove = Object.keys(previous.observation).filter(key => !Object.hasOwn(observation, key));
+  if (sameBaseline && tool.view === 'changes') {
+   const replace = Object.fromEntries(Object.entries(retainedObservation).filter(([key, current]) => !Object.hasOwn(previous.observation, key) || !isDeepStrictEqual(previous.observation[key], current)));
+   const remove = Object.keys(previous.observation).filter(key => !Object.hasOwn(observation, key) && !trimmedSections.has(key));
    const { observation: _full, ...metadata } = snapshot;
    const retainMetadata = RETAINABLE_METADATA.filter(key => Object.hasOwn(metadata, key) && Object.hasOwn(previous.metadata, key)
     && bytes(metadata[key] ?? null) > minRetainedMetadataBytes && isDeepStrictEqual(metadata[key], previous.metadata[key]));
@@ -221,8 +229,8 @@ export class ModelObservationViews {
   const hadFreshness = Object.hasOwn(value, 'freshness');
   const freshness = value.freshness ?? { fresh: value.observation?.freshness?.fresh !== false };
   const prepared = this.prepare({ ...value, freshness }, {
-   kind: 'observe', view: 'changes', afterObservationId: this.#latestViewId,
-  }, { minRetainedMetadataBytes: MIN_RETAINED_EVENT_FIELD_BYTES });
+  kind: 'observe', view: 'changes', afterObservationId: this.#latestViewId,
+  }, { minRetainedMetadataBytes: MIN_RETAINED_EVENT_FIELD_BYTES, preserveTrimmedObservationSections: true });
   prepared.commit();
   if (hadFreshness) return prepared.value;
   const { freshness: _freshness, ...event } = prepared.value;

@@ -17,13 +17,16 @@ class Transport extends EventEmitter {
 	contextTokens = 1_000;
 	toolsPerTurn = 1;
 	toolsThisTurn = 0;
+	emitUsageBeforeTool = false;
 	tool = null;
 	async start() {}
 	async stop() {}
 	notify() {}
 	respond(id, result) {
 		this.calls.push({ method: '$respond', id, result });
+		if (result.success === false) return Promise.resolve();
 		setImmediate(() => this.tool !== null && this.toolsThisTurn < this.toolsPerTurn ? this.requestTool() : this.finish());
+		return Promise.resolve();
 	}
 	requestTool() {
 		const toolIndex = ++this.toolsThisTurn;
@@ -47,6 +50,9 @@ class Transport extends EventEmitter {
 			setImmediate(() => {
 				if (this.hold) return;
 				if (this.tool === null) return this.finish();
+				if (this.emitUsageBeforeTool) this.emit('notification', { method: 'thread/tokenUsage/updated', params: { threadId: params.threadId, turnId, tokenUsage: {
+					last: { inputTokens: this.contextTokens, cachedInputTokens: this.contextTokens - 500, outputTokens: 4 },
+					total: { inputTokens: this.contextTokens * this.turns, outputTokens: 4 * this.turns } } } });
 				this.requestTool();
 			});
 			return { turn: { id: turnId } };
@@ -87,19 +93,23 @@ test('a Codex thread past the context threshold continues on a fresh thread with
 		await act('three');
 		await turn();
 		assert.equal(agent.rotations, 1);
-		assert.equal(transport.calls.filter(({ method }) => method === 'thread/start').length, 2);
+		assert.equal(transport.calls.filter(({ method }) => method === 'thread/start').length, 2, 'the fresh thread is started before the mid-turn handoff');
 		const [first, second] = transport.calls.filter(({ method }) => method === 'thread/start').map(({ params }) => params);
 		assert.equal(second.baseInstructions, first.baseInstructions, 'the same instructions and tools keep the prefix stable');
 		assert.deepEqual(second.dynamicTools, first.dynamicTools);
 		assert.deepEqual(transport.calls.filter(({ method }) => method === 'thread/unsubscribe').map(({ params }) => params.threadId), ['thread-1']);
+		const continuationStart = turnStarts(transport).at(-1).params;
+		assert.equal(continuationStart.threadId, 'thread-2');
+		const continuation = continuationStart.input[0].text;
+		assert.match(continuation, /^Mid-turn continuation:/);
+		assert.match(continuation, /action:break_block \{[^}]*"x":1[^}]*\} -> SUCCEEDED BLOCK_BROKEN/);
+		assert.match(continuation, /"Lucas": "find lava"/);
 		transport.contextTokens = 20_000;
 		await act('four');
 		const fourth = turnStarts(transport).at(-1).params;
 		assert.equal(fourth.threadId, 'thread-2');
 		const text = fourth.input[0].text;
-		assert.match(text, /^Session refreshed to keep context small/);
-		assert.match(text, /action:break_block \{[^}]*"x":1[^}]*\} -> SUCCEEDED BLOCK_BROKEN/);
-		assert.match(text, /"Lucas": "find lava"/);
+		assert.doesNotMatch(text, /^Session refreshed/);
 		await act('five');
 		assert.doesNotMatch(turnStarts(transport).at(-1).params.input[0].text, /Session refreshed/, 'the carry-over is sent once');
 	} finally {
@@ -140,7 +150,48 @@ test('Codex keeps a long multi-tool turn intact, then rotates at its first safe 
 		const starts = turnStarts(run.transport);
 		assert.ok(starts.slice(0, 3).every(({ params }) => params.threadId === 'thread-1'));
 		assert.equal(starts[3].params.threadId, 'thread-2');
-		assert.match(starts[3].params.input[0].text, /^Session refreshed to keep context small/);
+		assert.match(starts[3].params.input[0].text, /^Mid-turn continuation:/);
+	} finally { await run.service.stop(); }
+});
+
+test('Codex interrupts and rotates at a tool boundary, handing off the current event and exact tool result once', async () => {
+	const run = await setup({ contextRotationTokens: 60_000 });
+	let executions = 0;
+	try {
+		run.transport.tool = { name: 'mine', arguments: { x: 1, y: 64, z: 0, expectedBlockId: 'minecraft:stone' } };
+		run.transport.contextTokens = 20_000;
+		await run.act('one');
+		await run.act('two');
+		run.transport.contextTokens = 70_000;
+		run.transport.emitUsageBeforeTool = true;
+		const pending = run.agent.act(event('latest third event'), { goalRevision: 1, executeTool: async () => {
+			executions += 1;
+			run.transport.hold = true;
+			run.transport.tool = null;
+			return { state: 'SUCCEEDED', reasonCode: 'BLOCK_BROKEN', actionId: 'action-7', programId: 'program-9', decisionId: 'decision-4', queueId: 'queue-2' };
+		} });
+		await turn(); await turn(); await turn();
+		assert.equal(run.agent.rotations, 1);
+		assert.equal(executions, 1);
+		const starts = turnStarts(run.transport);
+		assert.equal(starts.at(-1).params.threadId, 'thread-2');
+		const continuation = starts.at(-1).params.input[0].text;
+		assert.match(continuation, /^Mid-turn continuation:/);
+		assert.doesNotMatch(continuation, /your earlier turns are not shown/);
+		assert.match(continuation, /latest third event/);
+		for (const id of ['action-7', 'program-9', 'decision-4', 'queue-2']) assert.match(continuation, new RegExp(id));
+		assert.equal(run.transport.calls.filter(({ method }) => method === 'turn/interrupt').at(-1).params.threadId, 'thread-1');
+		const oldCall = { id: 'late-old-call', method: 'item/tool/call', params: { threadId: 'thread-1', turnId: 'turn-3', callId: 'late-old-call', tool: 'mine', arguments: { x: 9, y: 64, z: 0 } } };
+		run.transport.emit('serverRequest', oldCall);
+		await turn();
+		const staleResponse = run.transport.calls.find(({ method, id }) => method === '$respond' && id === 'late-old-call');
+		assert.match(staleResponse.result.contentItems[0].text, /SESSION_ROTATED/);
+		assert.equal(executions, 1, 'a request from the old thread cannot execute after handoff');
+		const originalResponse = run.transport.calls.find(({ method, id }) => method === '$respond' && id === 'call-3-1');
+		assert.match(originalResponse.result.contentItems[0].text, /SESSION_ROTATED/);
+		run.transport.hold = false;
+		run.transport.finish();
+		await pending;
 	} finally { await run.service.stop(); }
 });
 
@@ -172,11 +223,12 @@ test('an event never waits for a slow thread start: it runs on the current threa
 		run.transport.contextTokens = 20_000;
 		await run.act('four');
 		assert.equal(turnStarts(run.transport).at(-1).params.threadId, 'thread-1', 'the event did not wait for the new thread');
+		run.transport.holdThreadStart = false;
 		for (const release of run.transport.pendingThreads.splice(0)) release();
 		await turn(); await turn();
 		const released = run.transport.calls.filter(({ method }) => method === 'thread/unsubscribe').map(({ params }) => params.threadId);
 		assert.ok(released.includes('thread-2'), 'the thread that started too late is released');
-		assert.equal(run.agent.rotations, 1, 'the retry after the next finished turn rotates');
+		assert.equal(run.agent.rotations, 1, 'the next available warm thread rotates after the late start is dropped');
 		await run.act('five');
 		assert.equal(turnStarts(run.transport).at(-1).params.threadId, 'thread-3');
 	} finally {
