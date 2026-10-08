@@ -115,6 +115,21 @@ test('heal nudge with a task: 4 hearts and food in reach is one urgent edge, deb
 	assert.doesNotMatch(TASK_HEAL_INSTRUCTION, /\b(must|now:)\b/, 'informs; the model decides');
 });
 
+test('heal nudge: walking past animals and crops does not repeat it; carried food or a new drop does', () => {
+	const at = (entities, extra = {}, items = []) => ({ player: { x: 0, y: 64, z: 0, health: 8, maxHealth: 20, foodLevel: 15, safe: true, ...extra }, entities, items, blocks: [] });
+	const cow = (index) => ({ stableId: `00000000-0000-0000-0000-0000000001${String(index).padStart(2, '0')}`, type: 'minecraft:cow', x: 4 + index, y: 64, z: 0 });
+	let latch = healNudgeVerdict(at([cow(0)]), null, 0).latch;
+	let nudges = 1;
+	for (let step = 1; step <= 12; step += 1) {
+		const verdict = healNudgeVerdict(at([cow(step)]), latch, step * 10_000);
+		latch = verdict.latch;
+		if (verdict.nudge) nudges += 1;
+	}
+	assert.equal(nudges, 1, '12 new cows over 2 minutes add no nudge');
+	assert.equal(healNudgeVerdict(at([cow(13)], { bestFood: { slot: 2, itemId: 'minecraft:bread', nutrition: 5 } }), latch, 130_000).nudge, true, 'food now carried');
+	assert.equal(healNudgeVerdict(at([cow(13)], {}, [{ stableId: BEEF, itemId: 'minecraft:beef', count: 1, x: 1, y: 64, z: 0 }]), latch, 130_000).nudge, true, 'a new drop');
+});
+
 function scriptedPlanner(registry) {
 	const planner = new FakePlanner(registry);
 	planner.outcomes = [];
@@ -205,5 +220,36 @@ test('heal nudge with a task steers the deciding turn once, with the food option
 		assert.equal(steers.length, 1, 'debounced: the same food at about the same health is not repeated');
 		assert.deepEqual(planner.interruptions, [], 'the model keeps its turn');
 		assert.equal(traces.filter(({ event: name }) => name === 'native_heal_nudge').length, 1);
+	} finally { release(); await run.coordinator.stop(); }
+});
+
+test('heal nudge never replaces another named trigger; it follows on the next plain sample', async () => {
+	let release;
+	const gate = new Promise((resolve) => { release = resolve; });
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	const steers = [];
+	const traces = [];
+	planner.requestNativeTurn = async (request) => { planner.requests.push(request); if (planner.requests.length === 1) await gate; return { status: 'completed', toolCalls: 1 }; };
+	planner.steerNativeTurn = async (request) => { steers.push(JSON.parse(request.input.slice(request.input.indexOf('\n') + 1)).trigger); return { turnId: 'deciding' }; };
+	const run = await start({ registry, planner, config: NATIVE_CONFIG, traceWriter: { write(event, details) { traces.push({ event, ...details }); } } });
+	let sequence = 0;
+	const beef = [{ stableId: BEEF, itemId: 'minecraft:beef', count: 1, x: 2, y: 64, z: 0 }];
+	const observe = (health, changedFacts) => run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: ++sequence, attention: true, changedFacts,
+		observation: { player: { x: 0, y: 64, z: 0, health, hunger: 15 }, items: beef, entities: [], blocks: [], inventory: { items: [] } } } });
+	const nudges = () => traces.filter(({ event }) => event === 'native_heal_nudge').length;
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Mine iron.' } });
+		observe(20, ['player.position']);
+		await eventually(() => planner.requests.length === 1);
+		observe(8, ['player.health']);
+		await eventually(() => steers.includes('damage'));
+		observe(8, ['sighted']);
+		await settle();
+		assert.equal(nudges(), 0, 'the structure sighting keeps its own ordinary wake; no nudge rides on it');
+		assert.equal(steers.includes('low_health_food'), false);
+		observe(8, ['player.position']);
+		await eventually(() => steers.includes('low_health_food'));
+		assert.equal(nudges(), 1, 'the nudge follows on the next plain sample');
 	} finally { release(); await run.coordinator.stop(); }
 });

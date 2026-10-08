@@ -1578,6 +1578,8 @@ export class DynamicCoordinator extends EventEmitter {
 	 */
 	#withHealNudge(record, observation, attention) {
 		if (!this.#usesNativeTools(record) || attention.priority === 'urgent') return attention;
+		// Another named trigger (a structure, a resource, a program edge) keeps its own wake; the nudge waits for the next sample.
+		if (attention.attention === true && !['observation', 'attention'].includes(attention.trigger)) return attention;
 		const latch = this.#healNudges.get(record.agentId);
 		const verdict = healNudgeVerdict(observation, latch?.goalRevision === record.goalRevision ? latch : null, safeClockRead(this.#epochNow));
 		if (verdict.latch === null) this.#healNudges.delete(record.agentId);
@@ -5182,12 +5184,15 @@ export function healNudgeVerdict(observation, latch = null, nowMs = null) {
 	const facts = healingFacts(observation);
 	const keys = foodSourceKeys(facts);
 	if (keys.length === 0 || !canEatNow(facts)) return { nudge: false, latch };
+	// Only food that changes what the agent can eat right now repeats the nudge: carried food or a new drop. Animals
+	// and crops passing by while walking are already in the first nudge's options and would repeat it every 10 s.
+	const ownKeys = keys.filter((key) => key.startsWith('carried:') || key.startsWith('drop:'));
 	const seen = latch?.seenFood ?? [];
 	const lower = latch === null || player.health <= latch.health - FURTHER_DROP_POINTS;
-	const fresh = keys.some((key) => !seen.includes(key));
+	const fresh = ownKeys.some((key) => !seen.includes(key));
 	const spaced = latch === null || !Number.isFinite(nowMs) || !Number.isFinite(latch.atMs) || nowMs - latch.atMs >= HEAL_NUDGE_INTERVAL_MS;
-	if (!(lower || fresh) || !spaced) return { nudge: false, latch };
-	return { nudge: true, options: facts.options.length, latch: { health: player.health, seenFood: rememberFood(seen, keys), atMs: nowMs } };
+	if (!(lower || fresh) || !spaced) return { nudge: false, latch: latch === null ? null : { ...latch, seenFood: rememberFood(seen, ownKeys) } };
+	return { nudge: true, options: facts.options.length, latch: { health: player.health, seenFood: rememberFood(seen, ownKeys), atMs: nowMs } };
 }
 
 /**
