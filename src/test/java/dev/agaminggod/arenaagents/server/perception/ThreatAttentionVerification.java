@@ -24,6 +24,7 @@ public final class ThreatAttentionVerification {
 		verifySignalRules();
 		verifyTrend();
 		verifyCreeperTimeline();
+		verifyImminentCrossing();
 		return assertions;
 	}
 
@@ -84,6 +85,32 @@ public final class ThreatAttentionVerification {
 		JsonObject second = rows.get(1).getAsJsonObject();
 		check(!second.get("approaching").getAsBoolean() && !second.has("etaSeconds") && !second.has("contactRisk"),
 				"a body that is not approaching has no ETA or contact risk on the wire");
+	}
+
+	/** Imminent marks the crossing into the last 3 s, so a mob first seen already in contact raises one urgent edge, not two. */
+	private static void verifyImminentCrossing() {
+		Set<String> armed = new java.util.HashSet<>();
+		int edges = 0;
+		// A zombie first seen hunting 1.5 blocks away: ETA 0 on every sample, never seen farther out.
+		for (int tick = 0; tick < 40; tick++) {
+			double eta = ThreatPerception.imminentEta(armed, ZOMBIE, 1.5D, ThreatPerception.trend(1.5D, 0.0D, false, false));
+			if (ThreatPerception.signals(false, true, false, false, false, true, 1.5D, false, eta).contains(ThreatPerception.IMMINENT)) edges++;
+		}
+		check(edges == 0, "a mob first seen in contact is targeting only, not imminent too");
+		// A creeper walking in from 16 blocks at 2.6 b/s: imminent appears once, when its ETA drops under 3 s.
+		int firstImminentAt = -1;
+		for (int step = 0; step <= 52; step++) {
+			double distance = 16.0D - step * 0.25D;
+			double eta = ThreatPerception.imminentEta(armed, CREEPER, distance, ThreatPerception.trend(distance, 2.6D, true, false));
+			if (ThreatPerception.signals(false, true, true, false, false, true, distance, false, eta).contains(ThreatPerception.IMMINENT)) {
+				if (firstImminentAt < 0) firstImminentAt = step;
+			}
+		}
+		double etaThen = (16.0D - firstImminentAt * 0.25D - ThreatPerception.CREEPER_CONTACT) / 2.6D;
+		check(firstImminentAt > 0 && etaThen <= ThreatPerception.IMMINENT_SECONDS && etaThen > 2.8D,
+				"an approaching creeper turns imminent as it crosses 3 s out (ETA " + etaThen + ")");
+		armed.retainAll(Set.of(CREEPER));
+		check(!armed.contains(ZOMBIE), "gone threats are pruned");
 	}
 
 	/**

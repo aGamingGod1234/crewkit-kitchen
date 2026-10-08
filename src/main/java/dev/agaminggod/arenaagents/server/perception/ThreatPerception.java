@@ -42,7 +42,8 @@ import net.minecraft.world.phys.Vec3;
  * defenses; entries are reported highest risk first. Risk is a snapshot dominated by distance, so each entry also
  * carries its trend: closing speed, whether it approaches, seconds until it reaches contact range (melee reach, or the
  * 3 blocks at which a creeper lights its fuse) and the risk it will carry there. A hunter that will arrive within
- * {@link #IMMINENT_SECONDS} raises {@link #IMMINENT}, one more urgent edge between first sighting and contact.
+ * {@link #IMMINENT_SECONDS} raises {@link #IMMINENT}, one more urgent edge between first sighting and contact. It is raised
+ * only on the crossing from farther out to within that window: a mob first seen already close is covered by targeting.
  * The model chooses what to do with them.
  */
 public final class ThreatPerception {
@@ -102,6 +103,8 @@ public final class ThreatPerception {
 
 	private final Map<AgentId, ThreatSignalLatch> latches = new HashMap<>();
 	private final Map<AgentId, Tracked> latest = new HashMap<>();
+	/** Per agent, the threats seen farther than {@link #IMMINENT_SECONDS} from contact, so crossing in can be imminent. */
+	private final Map<AgentId, Set<String>> imminentArmed = new HashMap<>();
 
 	/** Samples once per game tick per agent; repeated calls in the same tick return the same snapshot. */
 	public synchronized Snapshot sample(AgentId agentId, ServerPlayer agent) {
@@ -117,11 +120,13 @@ public final class ThreatPerception {
 	public synchronized void forget(AgentId agentId) {
 		latches.remove(agentId);
 		latest.remove(agentId);
+		imminentArmed.remove(agentId);
 	}
 
 	public synchronized void retain(Set<AgentId> agents) {
 		latches.keySet().retainAll(agents);
 		latest.keySet().retainAll(agents);
+		imminentArmed.keySet().retainAll(agents);
 	}
 
 	/** True for a hostile the agent can sense as a threat even outside its view cone (used by fight/flee). */
@@ -218,6 +223,19 @@ public final class ThreatPerception {
 		return new Trend(round(speed), approaching, contact, Double.isFinite(eta) ? round(eta) : Double.NaN);
 	}
 
+	/**
+	 * The ETA that may raise {@link #IMMINENT} this sample, or NaN. Only a threat seen earlier farther out (an ETA over
+	 * {@link #IMMINENT_SECONDS}, or holding still outside contact range) is armed, so imminent marks the crossing in and a
+	 * mob first seen already close (targeting covers it) raises no second urgent edge. Updates {@code armed}.
+	 */
+	static double imminentEta(Set<String> armed, String id, double distance, Trend trend) {
+		boolean wasArmed = armed.contains(id);
+		boolean far = Double.isFinite(trend.etaSeconds()) ? trend.etaSeconds() > IMMINENT_SECONDS
+				: Double.isFinite(trend.contactRange()) && distance > trend.contactRange();
+		if (far) armed.add(id);
+		return wasArmed ? trend.etaSeconds() : Double.NaN;
+	}
+
 	private Snapshot scan(AgentId agentId, ServerPlayer agent, long tick) {
 		// Hostile mobs, plus any creature or player that hurt the agent recently. Players are otherwise only
 		// potential risks (entity rows) and never appear here just for being near or armed.
@@ -232,6 +250,7 @@ public final class ThreatPerception {
 		Map<String, boolean[]> flags = new HashMap<>();
 		Map<String, Trend> trends = new HashMap<>();
 		Vec3 agentVelocity = agent.getDeltaMovement();
+		Set<String> armed = imminentArmed.computeIfAbsent(agentId, ignored -> new HashSet<>());
 		for (LivingEntity entity : candidates) {
 			double distance = agent.distanceTo(entity);
 			if (distance > RELEASE_RANGE) continue;
@@ -258,10 +277,11 @@ public final class ThreatPerception {
 			boolean neutral = mob == null || isNeutral(mob) || !(entity instanceof Enemy);
 			// attacked is only for players and neutral or passive creatures; a hostile mob's hit is already damage attention.
 			for (String signal : signals(neutral, targeting, creeper, swelling, ranged, sight, distance, attacked && neutral,
-					trend.etaSeconds())) {
+					imminentEta(armed, id, distance, trend))) {
 				raw.add(ThreatSignalLatch.key(id, signal));
 			}
 		}
+		armed.retainAll(present);
 		ThreatSignalLatch latch = latches.computeIfAbsent(agentId, ignored -> new ThreatSignalLatch());
 		Set<String> latched = latch.update(raw, present, tick);
 		Map<String, Long> firstSeen = new HashMap<>();
