@@ -274,6 +274,42 @@ test('Claude returns a blocking body result early and attaches the latest lazily
 	} finally { releaseExecution({ state: 'RUNNING', actionId: 'body-action-1', interruptedBy: 'danger' }); await close(); }
 });
 
+test('Claude releases a superseded steer builder reservation', async () => {
+	let captured = null;
+	let releaseExecution;
+	let finishFirstBuilder;
+	let firstBuilderStarted;
+	let discarded = 0;
+	let signalToolStarted;
+	const toolStarted = new Promise((resolve) => { signalToolStarted = resolve; });
+	const builderStarted = new Promise((resolve) => { firstBuilderStarted = resolve; });
+	const firstBuilder = new Promise((resolve) => { finishFirstBuilder = resolve; });
+	const execution = new Promise((resolve) => { releaseExecution = resolve; });
+	const { service, close } = await harness({
+		async onUser(child) {
+			captured = (await child.rpc('tools/call', { name: 'wait', arguments: { durationMs: 30_000 } })).result;
+			child.emitLine({ type: 'result', subtype: 'success', is_error: false, result: 'ok', session_id: 'session-1' });
+		},
+	});
+	try {
+		const agent = await service.createAgent(profile(), { controlProtocol: 'native_tools' });
+		const turn = agent.act('Goal.', { goalRevision: 0, executeTool: async () => { signalToolStarted(); return execution; } });
+		void turn.catch(() => {});
+		await toolStarted;
+		const first = agent.steer(async () => { firstBuilderStarted(); return firstBuilder; }, { goalRevision: 0, onDiscard: () => { discarded += 1; } });
+		releaseExecution({ state: 'RUNNING', actionId: 'body-action-1', interruptedBy: 'danger' });
+		await builderStarted;
+		const latest = agent.steer(async () => 'newest facts', { goalRevision: 0 });
+		finishFirstBuilder('obsolete reservation input');
+		assert.deepEqual(await first, { turnId: '1:1' });
+		assert.deepEqual(await latest, { turnId: '1:1' });
+		assert.deepEqual(await turn, { status: 'completed', toolCalls: 1 });
+		assert.equal(discarded, 1);
+		assert.match(captured.content[1].text, /newest facts/);
+		assert.doesNotMatch(captured.content[1].text, /obsolete reservation input/);
+	} finally { releaseExecution?.({ state: 'RUNNING', actionId: 'body-action-1', interruptedBy: 'danger' }); finishFirstBuilder?.('cleanup'); await close(); }
+});
+
 test('a steer that never reaches a tool boundary is rejected so the coordinator defers it', async () => {
 	let release;
 	const { service, close } = await harness({

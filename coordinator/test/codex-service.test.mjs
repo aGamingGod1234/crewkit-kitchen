@@ -45,6 +45,7 @@ class FakeSharedTransport extends EventEmitter {
 	turnSequence = 0;
 	autoComplete = true;
 	rejectInterrupt = false;
+	rejectRespond = false;
 	holdTurnStart = false;
 	turnStartResolvers = [];
 	message = finishDecisionJson();
@@ -52,7 +53,10 @@ class FakeSharedTransport extends EventEmitter {
 	async start() { this.calls.push({ method: '$start' }); }
 	async stop() { this.calls.push({ method: '$stop' }); }
 	notify(method, params) { this.calls.push({ method, params }); }
-	respond(id, result) { this.calls.push({ method: '$respond', id, result }); }
+	respond(id, result) {
+		this.calls.push({ method: '$respond', id, result });
+		if (this.rejectRespond) return Promise.reject(Object.assign(new Error('response write failed'), { code: 'EPIPE' }));
+	}
 
 	async request(method, params, options) {
 		this.calls.push({ method, params, options });
@@ -1397,6 +1401,42 @@ test('Codex returns a blocking body result early with the steer in that tool res
 		transport.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } } });
 		assert.partialDeepStrictEqual(await turn, { status: 'completed', toolCalls: 1 });
 	} finally { releaseExecution({ state: 'RUNNING', actionId: 'body-action-2', interruptedBy: 'danger' }); }
+});
+
+test('a failed Codex body response rejects its queued steer waiter', async (t) => {
+	const transport = new FakeSharedTransport();
+	transport.autoComplete = false;
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	t.after(() => service.stop());
+	const agent = await service.createAgent(profile('agent-native-response-failure'), { controlProtocol: 'native_tools' });
+	await agent.setGoalRevision(1);
+	let releaseExecution;
+	let toolStarted;
+	const started = new Promise((resolve) => { toolStarted = resolve; });
+	const execution = new Promise((resolve) => { releaseExecution = resolve; });
+	const turn = agent.act('event: wait for the action', {
+		goalRevision: 1,
+		executeTool: async () => { toolStarted(); return execution; },
+	});
+	void turn.catch(() => {});
+	await new Promise((resolve) => setImmediate(resolve));
+	transport.emit('serverRequest', {
+		id: 83,
+		method: 'item/tool/call',
+		params: { threadId: 'thread-1', turnId: 'turn-1', callId: 'failed-response-wait', tool: 'wait', arguments: { durationMs: 30_000 } },
+	});
+	await toolStarted;
+	const steer = agent.steer('reply to the player', {
+		goalRevision: 1,
+		onInterrupt: () => releaseExecution({ state: 'RUNNING', actionId: 'body-action-failed-response', interruptedBy: 'conversation' }),
+	});
+	transport.rejectRespond = true;
+	await assert.rejects(turn, (error) => error.code === 'TOOL_RESPONSE_DELIVERY_FAILED');
+	const steerOutcome = await Promise.race([
+		steer.then(() => ({ state: 'resolved' }), (error) => ({ state: 'rejected', code: error.code })),
+		new Promise((resolve) => setTimeout(() => resolve({ state: 'STUCK' }), 100)),
+	]);
+	assert.deepEqual(steerOutcome, { state: 'rejected', code: 'TOOL_RESPONSE_DELIVERY_FAILED' });
 });
 
 test('native Codex interruption cleans up a turn whose start response arrives late', async () => {

@@ -68,6 +68,7 @@ export class NativeToolRuntime {
 	#publicationStreaks = new Map();
 	#sequenceFinishReservations = new Map();
 	#blockingToolRuns = new Map();
+	#communications = new Map();
 	#sequence = 0;
 	#publicationGraceMs;
 
@@ -377,6 +378,7 @@ export class NativeToolRuntime {
 		}
 		if (request.tool.kind === 'cancel_action') return this.#cancelAction(record, request.tool);
 		if (request.tool.kind === 'notebook' || request.tool.kind === 'query_memory' || request.tool.kind === 'task_memory') return this.#memory(request, record);
+		if (request.tool.kind === 'action' && request.tool.actionType === 'chat') return this.#executeAction(request, record, request.tool);
 		if (this.#sequenceFinishReservations.has(record.agentId)) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'A finishing native sequence owns the player until its fresh sample and goal verification settle');
 		if (this.#sweeps.has(record.agentId)) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'A camera sweep owns this player until sampling completes');
 		if (this.#programRuns.has(record.agentId)) {
@@ -391,6 +393,10 @@ export class NativeToolRuntime {
 					return this.#startReplacementAsNewAction(request, record, previous, { pausedProgram: true });
 				}
 				const tool = { ...request.tool, kind: 'action' };
+				const interrupted = this.#actions.get(record.agentId);
+				if (request.tool.kind === 'action' && ['fight_target', 'flee_from'].includes(tool.actionType) && interrupted?.interruptedBy === 'danger') {
+					return this.#withBlockingToolRun(record, (run) => this.#replaceInterruptedDangerAction(request, record, tool, interrupted, run, { pausedProgram: true }));
+				}
 				const execute = () => this.#executeAction(request, record, tool, null, request.tool.kind !== 'start_action', null, null, { pausedProgram: true });
 				return request.tool.kind === 'action' ? this.#withBlockingToolRun(record, execute) : execute();
 			}
@@ -400,11 +406,7 @@ export class NativeToolRuntime {
 		if (request.tool.kind === 'replace_action') {
 			const previous = this.#actions.has(record.agentId) ? null : this.#terminalActionReceipt(record, request.tool.actionId, request.tool.goalRevision);
 			if (previous !== null) return replacementNotStarted(previous);
-			const epoch = this.#executionEpoch(record.agentId);
-			const cancelled = await this.#cancelAction(record, request.tool);
-			if (this.#executionEpoch(record.agentId) !== epoch + 1) throw codedError('STALE_NATIVE_TOOL', 'Lifecycle changed while cancelling the replaced action');
-			if (cancelled.state !== 'CANCELLED') return { state: 'REPLACEMENT_NOT_STARTED', reasonCode: 'ACTION_FINISHED_BEFORE_CANCEL', previous: cancelled };
-			return this.#executeAction(request, record, { ...request.tool, kind: 'action' });
+			return this.#withBlockingToolRun(record, (run) => this.#replaceAction(request, record, run));
 		}
 		if (request.tool.kind === 'start_action') return this.#executeAction(request, record, { ...request.tool, kind: 'action' }, null, false);
 		if (request.tool.kind === 'finish') return this.#finish(request, record, lifecycleGeneration);
@@ -421,9 +423,33 @@ export class NativeToolRuntime {
 			});
 		}
 		if (tool.kind !== 'action') throw codedError('INVALID_NATIVE_TOOL', 'Native tool did not normalize to an action');
+		if (['fight_target', 'flee_from'].includes(tool.actionType)) {
+			const interrupted = this.#actions.get(record.agentId);
+			if (interrupted?.interruptedBy === 'danger') {
+				return this.#withBlockingToolRun(record, (run) => this.#replaceInterruptedDangerAction(request, record, tool, interrupted, run));
+			}
+		}
 		return tool.actionType === 'chat'
 			? this.#executeAction(request, record, tool)
 			: this.#withBlockingToolRun(record, () => this.#executeAction(request, record, tool));
+	}
+
+	async #replaceAction(request, record, blockingRun) {
+		const epoch = this.#executionEpoch(record.agentId);
+		const cancelled = await this.#cancelAction(record, request.tool, { blockingRun });
+		if (cancelled.interruptedBy !== undefined) return cancelled;
+		if (this.#executionEpoch(record.agentId) !== epoch + 1) throw codedError('STALE_NATIVE_TOOL', 'Lifecycle changed while cancelling the replaced action');
+		if (cancelled.state !== 'CANCELLED') return { state: 'REPLACEMENT_NOT_STARTED', reasonCode: 'ACTION_FINISHED_BEFORE_CANCEL', previous: cancelled };
+		return this.#executeAction(request, record, { ...request.tool, kind: 'action' });
+	}
+
+	async #replaceInterruptedDangerAction(request, record, tool, interrupted, blockingRun, { pausedProgram = false } = {}) {
+		const epoch = this.#executionEpoch(record.agentId);
+		const cancelled = await this.#cancelAction(record, { actionId: interrupted.actionId, goalRevision: record.goalRevision }, { blockingRun });
+		if (cancelled.interruptedBy !== undefined) return cancelled;
+		if (this.#executionEpoch(record.agentId) !== epoch + 1) throw codedError('STALE_NATIVE_TOOL', 'Lifecycle changed while replacing the interrupted action');
+		if (cancelled.state !== 'CANCELLED') return { state: 'REPLACEMENT_NOT_STARTED', reasonCode: 'ACTION_FINISHED_BEFORE_CANCEL', previous: cancelled };
+		return this.#executeAction(request, record, tool, null, true, null, null, { pausedProgram });
 	}
 
 	async #withBlockingToolRun(record, operation) {
@@ -962,9 +988,11 @@ export class NativeToolRuntime {
 	}
 
 	#actionStatus(record, actionId) {
-		const active = this.#actions.get(record.agentId);
+		const active = actionId === undefined
+			? this.#actions.get(record.agentId) ?? this.#communications.get(record.agentId)
+			: [this.#actions.get(record.agentId), this.#communications.get(record.agentId)].find((entry) => entry?.actionId === actionId);
 		if (active?.goalRevision === record.goalRevision && (actionId === undefined || active.actionId === actionId)) {
-			return { actionId: active.actionId, goalRevision: active.goalRevision, actionType: active.actionType, state: !active.dispatched ? 'PREPARING' : active.cancelling ? 'CANCELLING' : active.cancellationUncertain ? 'CANCELLATION_UNCONFIRMED' : 'RUNNING', ...(active.progress === undefined ? {} : { progress: structuredClone(active.progress) }) };
+			return { actionId: active.actionId, goalRevision: active.goalRevision, actionType: active.actionType, state: !active.dispatched ? 'PREPARING' : active.cancelling ? 'CANCELLING' : active.cancellationUncertain ? 'CANCELLATION_UNCONFIRMED' : 'RUNNING', ...(active.progress === undefined ? {} : { progress: structuredClone(active.progress) }), ...(active.interruptedBy === undefined ? {} : { interruptedBy: active.interruptedBy }) };
 		}
 		if (actionId !== undefined) {
 			const receipt = this.#receipts.get(record.agentId)?.findLast((entry) => entry.actionId === actionId && entry.goalRevision === record.goalRevision);
@@ -989,8 +1017,9 @@ export class NativeToolRuntime {
 		return this.#notebook[method](agentId, { worldId: active.worldId, actionId: active.actionId, goalRevision: active.goalRevision, actionType: active.actionType, ...details });
 	}
 
-	async #cancelAction(record, tool, { invalidateProgram = true } = {}) {
-		const active = this.#actions.get(record.agentId);
+	async #cancelAction(record, tool, { invalidateProgram = true, blockingRun = null } = {}) {
+		const actionMap = [this.#actions, this.#communications].find((actions) => actions.get(record.agentId)?.actionId === tool.actionId);
+		const active = actionMap?.get(record.agentId);
 		if (tool.goalRevision !== record.goalRevision || active?.goalRevision !== tool.goalRevision || active.actionId !== tool.actionId) throw codedError('STALE_ACTION', 'Cancellation handle does not match the active action');
 		if (active.cancelling) throw codedError('CANCELLATION_IN_PROGRESS', 'The exact action is already being cancelled');
 		active.cancelling = true;
@@ -1006,7 +1035,7 @@ export class NativeToolRuntime {
 		}
 		if (!active.dispatched) {
 			active.cancelledBeforeDispatch = true;
-			this.#actions.delete(record.agentId);
+			actionMap.delete(record.agentId);
 			const result = { state: 'CANCELLED', reasonCode: 'CANCELLED_BEFORE_DISPATCH', executionStarted: false, physicalAttempted: false, source: 'coordinator_before_dispatch' };
 			this.#retainReceipt(record, active, result);
 			active.resolve(result);
@@ -1019,7 +1048,26 @@ export class NativeToolRuntime {
 		try {
 			// Socket drain may lag the exact server receipt. Publication success alone
 			// cannot release physical authority; the deadline includes publication too.
-			return await withDeadline(Promise.race([active.result, publication.then(() => active.result)]), 10_000, 'CANCEL_ACK_TIMEOUT', 'Cancellation has no authoritative acknowledgement; the action may still be running');
+			const cancellation = withDeadline(Promise.race([active.result, publication.then(() => active.result)]), 10_000, 'CANCEL_ACK_TIMEOUT', 'Cancellation has no authoritative acknowledgement; the action may still be running').catch((error) => {
+				active.cancelling = false;
+				active.cancellationUncertain = error?.code === 'CANCEL_ACK_TIMEOUT';
+				throw error;
+			});
+			if (blockingRun === null) return await cancellation;
+			const outcome = await Promise.race([
+				cancellation.then((value) => ({ type: 'result', value }), (error) => ({ type: 'error', error })),
+				blockingRun.interruption.then(() => ({ type: 'interruption' })),
+			]);
+			if (outcome.type === 'error') throw outcome.error;
+			if (outcome.type === 'interruption') {
+				const status = this.#actionStatus(record, tool.actionId);
+				if (['RUNNING', 'PREPARING', 'CANCELLING', 'CANCELLATION_UNCONFIRMED'].includes(status.state)) {
+					return { ...status, interruptedBy: blockingRun.interruptedBy ?? 'danger',
+						recoveryHint: `Cancellation for actionId ${tool.actionId} was requested; wait for actionStatus before issuing another body action.` };
+				}
+				return await active.result;
+			}
+			return outcome.value;
 		} catch (error) {
 			active.cancelling = false;
 			active.cancellationUncertain = error?.code === 'CANCEL_ACK_TIMEOUT';
@@ -1163,13 +1211,20 @@ export class NativeToolRuntime {
 	async #executeAction(request, record, tool, sequenceIndex = null, waitForCompletion = true, programCommand = null, sequenceFinishToken = null, { pausedProgram = false } = {}) {
 		// All native routes, including replacement and authored programs, meet here.
 		tool = constrainNavigationAction(tool, record.currentGoalSpec);
+		const communication = tool.actionType === 'chat';
+		const actionMap = communication ? this.#communications : this.#actions;
 		const finishReservation = this.#sequenceFinishReservations.get(record.agentId);
-		if (finishReservation !== undefined && finishReservation !== sequenceFinishToken) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'A finishing native sequence owns the player');
+		if (!communication && finishReservation !== undefined && finishReservation !== sequenceFinishToken) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'A finishing native sequence owns the player');
 		const executionEpoch = this.#executionEpoch(record.agentId);
-		if (this.#actions.has(record.agentId)) throw codedError('NATIVE_ACTION_IN_PROGRESS', tool.actionType === 'fight_target' && this.#actions.get(record.agentId)?.actionType === 'fight_target'
-			? 'A fight_target already owns the body; to switch targets call replaceAction with its actionId and the new fight_target (weapon and swing timing carry over), or set targetPolicy'
-			: 'The Minecraft body is already executing an action');
-		if (this.#completions.has(record.agentId)) throw codedError('NATIVE_COMPLETION_IN_PROGRESS', 'Goal completion verification is already running');
+		const bodyAction = this.#actions.get(record.agentId);
+		if (communication && this.#communications.has(record.agentId)) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'A chat is still being delivered; wait for its result before sending another say call');
+		if (!communication && bodyAction !== undefined) {
+			const message = tool.actionType === 'fight_target' && bodyAction.actionType === 'fight_target'
+				? `A fight_target owns the body as actionId ${bodyAction.actionId}; use replaceAction with that actionId and your authored fight_target to switch targets, or cancelAction with the same actionId to stop it.`
+				: `Body action ${bodyAction.actionId} is still running; use replaceAction with that actionId and your authored fight_target/flee_from to switch now, or cancelAction with the same actionId to stop it.`;
+			throw codedError('NATIVE_ACTION_IN_PROGRESS', message);
+		}
+		if (!communication && this.#completions.has(record.agentId)) throw codedError('NATIVE_COMPLETION_IN_PROGRESS', 'Goal completion verification is already running');
 
 		const ordinal = ++this.#sequence;
 		const identity = `${this.#sessionId}:${ordinal}:${safeSegment(record.agentId).slice(0, 32)}:${record.goalRevision}`;
@@ -1218,9 +1273,9 @@ export class NativeToolRuntime {
 			const releaseWork = this.#onWorkStarted(record, 'action');
 			void result.then(releaseWork, releaseWork);
 		}
-		this.#actions.set(record.agentId, active);
+		actionMap.set(record.agentId, active);
 		const failPublication = async (error) => {
-			if (this.#actions.get(record.agentId) === active) this.#actions.delete(record.agentId);
+			if (actionMap.get(record.agentId) === active) actionMap.delete(record.agentId);
 			const completed = this.#receipts.get(record.agentId)?.findLast((entry) => entry.actionId === actionId && entry.source === 'server_action_result');
 			if (completed !== undefined) return;
 			const reasonCode = active.dispatched ? 'DISPATCH_RESULT_UNKNOWN' : 'DISPATCH_NOT_SENT';
@@ -1240,7 +1295,7 @@ export class NativeToolRuntime {
 				await this.#journal('recordDispatch', record.agentId, active, { arguments: active.arguments });
 				this.#trace('native_tool_journal_written', { agentId: record.agentId, goalRevision: record.goalRevision, traceId, actionId, callId, journalMs: Math.round((performance.now() - dispatchStartedAt) * 10) / 10 });
 			}
-			if (this.#actions.get(record.agentId) !== active) return waitForCompletion ? result : this.#actionStatus(record, actionId);
+			if (actionMap.get(record.agentId) !== active) return waitForCompletion ? result : this.#actionStatus(record, actionId);
 			const current = this.#registry?.get(record.agentId);
 			if (this.#registry !== null && (current === null || current === undefined || current.goalRevision !== record.goalRevision)) {
 				throw codedError('STALE_PLAN', 'Native action became stale before bridge send');
@@ -1270,7 +1325,9 @@ export class NativeToolRuntime {
 				const status = this.#actionStatus(record, actionId);
 				if (status.state === 'RUNNING' || status.state === 'PREPARING') {
 					blockingRun?.retainAction();
-					return { ...status, interruptedBy: blockingRun.interruptedBy ?? 'danger' };
+					active.interruptedBy = blockingRun.interruptedBy ?? 'danger';
+					return { ...status, interruptedBy: active.interruptedBy,
+						recoveryHint: `replaceAction with actionId ${actionId} and your authored fight_target/flee_from switches now; cancelAction with the same actionId stops it.` };
 				}
 				outcome = await result;
 			} else outcome = settled.value;
@@ -1296,7 +1353,8 @@ export class NativeToolRuntime {
 	}
 
 	onActionProgress(record, payload = {}) {
-		const active = this.#actions.get(record.agentId);
+		const active = [this.#actions.get(record.agentId), this.#communications.get(record.agentId)]
+			.find((entry) => entry?.actionId === payload.actionId);
 		if (active === undefined || active.goalRevision !== record.goalRevision || active.actionId !== payload.actionId) return false;
 		if (payload.goalRevision !== undefined && payload.goalRevision !== active.goalRevision) return false;
 		const observation = payload.actionObservation === undefined ? undefined : structuredClone(payload.actionObservation);
@@ -1315,14 +1373,19 @@ export class NativeToolRuntime {
 
 	onActionResult(record, payload = {}) {
 		if (!TERMINAL_ACTION_STATES.has(payload.state)) return false;
-		let active = this.#actions.get(record.agentId);
+		let actionMap = this.#actions;
+		let active = actionMap.get(record.agentId);
+		if (active?.actionId !== payload.actionId) {
+			actionMap = this.#communications;
+			active = actionMap.get(record.agentId);
+		}
 		if (active === undefined || active.actionId !== payload.actionId) {
 			const unresolved = this.#receipts.get(record.agentId)?.findLast((entry) => entry.actionId === payload.actionId && entry.goalRevision === record.goalRevision && entry.state === 'UNKNOWN');
 			active = unresolved === undefined ? undefined : { ...unresolved, resolve: () => {} };
 		}
 		if (active === undefined || active.goalRevision !== record.goalRevision || active.actionId !== payload.actionId) return false;
 		if (payload.goalRevision !== undefined && payload.goalRevision !== active.goalRevision) return false;
-		if (this.#actions.get(record.agentId) === active) this.#actions.delete(record.agentId);
+		if (actionMap.get(record.agentId) === active) actionMap.delete(record.agentId);
 		const observation = payload.actionObservation;
 		const recovery = hasAuthoritativeActionObservation(observation)
 			? this.#recovery.snapshot(record.agentId, observation)
@@ -1352,9 +1415,11 @@ export class NativeToolRuntime {
 		}
 		this.#flushSpatial(record.agentId).catch((error) => this.#trace('native_spatial_memory_failed', { agentId: record.agentId, reasonCode: error?.code ?? 'MEMORY_WRITE_FAILED' }));
 		this.#trace('native_tool_action_completed', { agentId: record.agentId, goalRevision: record.goalRevision, actionId: active.actionId, ...result, ...serverTimingTraceFields(payload) });
-		const latest = this.#observations.get(record.agentId);
-		this.#postResultSamples.set(record.agentId, { result, goalRevision: record.goalRevision, published: false, wake: null, publication: null,
-			eventSequence: latest?.goalRevision === record.goalRevision ? latest.eventSequence : 0 });
+		if (active.actionType !== 'chat') {
+			const latest = this.#observations.get(record.agentId);
+			this.#postResultSamples.set(record.agentId, { result, goalRevision: record.goalRevision, published: false, wake: null, publication: null,
+				eventSequence: latest?.goalRevision === record.goalRevision ? latest.eventSequence : 0 });
+		}
 		active.resolve(result);
 		return true;
 	}
@@ -1417,21 +1482,24 @@ export class NativeToolRuntime {
 		this.#inspectedTargets.delete(agentId);
 		this.#postResultSamples.delete(agentId);
 		const active = this.#actions.get(agentId);
+		const communication = this.#communications.get(agentId);
 		const completion = this.#completions.get(agentId);
 		if (completion !== undefined) {
 			this.#completions.delete(agentId);
 			completion.reject(codedError('NATIVE_COMPLETION_CANCELLED', `Native completion cancelled: ${String(reason).slice(0, 128)}`));
 		}
-		if (active !== undefined) {
-			this.#actions.delete(agentId);
-			this.#rememberStaleAction(agentId, active);
-			active.reject(codedError('NATIVE_ACTION_CANCELLED', `Native action cancelled: ${String(reason).slice(0, 128)}`));
-			if (active.dispatched && !active.cancelling) {
-				try { await this.#bridge.send('action_cancel', agentId, { goalRevision: active.goalRevision, actionId: active.actionId }); }
+		for (const running of [active, communication]) {
+			if (running === undefined) continue;
+			const actionMap = running.actionType === 'chat' ? this.#communications : this.#actions;
+			actionMap.delete(agentId);
+			this.#rememberStaleAction(agentId, running);
+			running.reject(codedError('NATIVE_ACTION_CANCELLED', `Native action cancelled: ${String(reason).slice(0, 128)}`));
+			if (running.dispatched && !running.cancelling) {
+				try { await this.#bridge.send('action_cancel', agentId, { goalRevision: running.goalRevision, actionId: running.actionId }); }
 				catch {}
 			}
-			try { await this.#journal('recordUnknown', agentId, active, { reasonCode: active.dispatched ? 'LIFECYCLE_ENDED_BEFORE_RESULT' : 'CANCELLED_BEFORE_DISPATCH' }); }
-			catch (error) { this.#trace('native_receipt_persistence_failed', { agentId, actionId: active.actionId, reasonCode: error?.code ?? 'MEMORY_WRITE_FAILED' }); }
+			try { await this.#journal('recordUnknown', agentId, running, { reasonCode: running.dispatched ? 'LIFECYCLE_ENDED_BEFORE_RESULT' : 'CANCELLED_BEFORE_DISPATCH' }); }
+			catch (error) { this.#trace('native_receipt_persistence_failed', { agentId, actionId: running.actionId, reasonCode: error?.code ?? 'MEMORY_WRITE_FAILED' }); }
 		}
 		try { await this.#flushSpatial(agentId); }
 		catch (error) { this.#trace('native_spatial_memory_failed', { agentId, reasonCode: error?.code ?? 'MEMORY_WRITE_FAILED' }); }
@@ -1459,6 +1527,7 @@ export class NativeToolRuntime {
 		const agentIds = new Set([
 			...this.#observations.keys(),
 			...this.#actions.keys(),
+			...this.#communications.keys(),
 			...this.#completions.keys(),
 			...this.#programRuns.keys(),
 			...this.#sweeps.keys(),

@@ -1441,6 +1441,55 @@ test('urgent native conversation steers the active model turn while its body act
 	}
 });
 
+test('a distant mild threat reaches the normal body-tool boundary without interrupting', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	const steers = [];
+	let bodyResult = null;
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		bodyResult = await request.executeTool({
+			agentId: request.agentId,
+			goalRevision: request.goalRevision,
+			turnId: 'turn-moving',
+			callId: 'call-moving',
+			tool: { kind: 'action', actionType: 'navigate_to', arguments: { x: 20, y: 64, z: 0, tolerance: 1, sprint: true, timeoutMs: 30_000 } },
+		});
+		return { status: 'completed', toolCalls: 1 };
+	};
+	planner.steerNativeTurn = async (request) => {
+		request.onInterrupt?.();
+		await resolveNativeSteerInput(request);
+		steers.push(request);
+		return { turnId: 'turn-moving' };
+	};
+	const run = await start({
+		registry,
+		planner,
+		config: {
+			bridge: { port: 25570, secret: 's'.repeat(32) },
+			codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
+		},
+	});
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Walk to the ridge.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => run.bridge.sent.some((message) => message.type === 'action_command'));
+		const command = run.bridge.sent.find((message) => message.type === 'action_command');
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+			goalRevision: 1, eventSequence: 2, attention: true, priority: 'urgent', trigger: 'threat', changedFacts: ['threats.entries'],
+			observation: { player: { x: 1, y: 64, z: 0, threats: [{ uuid: 'zombie-1', type: 'minecraft:zombie', distance: 14.2, targeting: false, signals: ['targeting'] }] }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+		} });
+		await eventually(() => steers.length === 1);
+		assert.equal(bodyResult, null, 'the provider receives the urgent event, but the body call stays blocked');
+		assert.equal(run.bridge.sent.some((message) => message.type === 'action_cancel' && message.payload.actionId === command.payload.actionId), false);
+		run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: command.payload.actionId, state: 'SUCCEEDED', reasonCode: 'ARRIVED', executionStarted: true, eventSequence: 3 } });
+		await eventually(() => bodyResult?.state === 'SUCCEEDED');
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
 test('a detected movement loop steers once until movement escapes and a new loop begins', async () => {
 	let release;
 	const gate = new Promise(resolve => { release = resolve; });

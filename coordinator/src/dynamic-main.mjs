@@ -1904,8 +1904,9 @@ export class DynamicCoordinator extends EventEmitter {
 
 	#deliverNativeSteer(work, request) {
 		work.steerQueued = mergePlannerRequest(work.steerQueued, request);
+		const interruption = nativeSteerInterruption(request);
 		if (work.steerPromise !== null) {
-			this.#nativeRuntime.interruptBlockingTool(work.agentId, nativeSteerInterruption(request));
+			if (interruption !== null) this.#nativeRuntime.interruptBlockingTool(work.agentId, interruption);
 			return;
 		}
 		const steering = this.#drainNativeSteering(work);
@@ -1981,6 +1982,7 @@ export class DynamicCoordinator extends EventEmitter {
 			work.steerQueued = null;
 			work.steerRequest = request;
 			const steerStartedAt = performance.now();
+			const interruption = nativeSteerInterruption(request);
 			let deliveryRequest = request;
 			try {
 				const record = this.#registry.get(work.agentId);
@@ -1993,16 +1995,26 @@ export class DynamicCoordinator extends EventEmitter {
 							work.steerQueued = null;
 							work.steerRequest = deliveryRequest;
 						}
+						if (buildInput.discarded) throw Object.assign(new Error('Native steer input was superseded before delivery'), { code: 'STEER_SUPERSEDED' });
 						const input = await this.#nativeTurnInput(record, deliveryRequest, { freshObservation: true });
+						if (buildInput.discarded) {
+							this.#restoreNativeConversation(deliveryRequest);
+							throw Object.assign(new Error('Native steer input was superseded before delivery'), { code: 'STEER_SUPERSEDED' });
+						}
 						if (work.steerQueued === null) return input;
 						this.#restoreNativeConversation(deliveryRequest);
 					}
 				};
+				buildInput.discarded = false;
 				await this.#planner.steerNativeTurn({
 					agentId: work.agentId,
 					goalRevision: work.goalRevision,
 					input: buildInput,
-					onInterrupt: () => this.#nativeRuntime.interruptBlockingTool(work.agentId, nativeSteerInterruption(request)),
+					onInterrupt: interruption === null ? null : () => this.#nativeRuntime.interruptBlockingTool(work.agentId, interruption),
+					onDiscard: () => {
+						buildInput.discarded = true;
+						this.#restoreNativeConversation(deliveryRequest);
+					},
 				});
 				if (!isCurrent()) { this.#restoreNativeConversation(deliveryRequest); work.steerQueued = null; return; }
 				await this.#commitNativeConversation(deliveryRequest);
@@ -5076,9 +5088,24 @@ function mergeDangerSummary(previous, next) {
 }
 
 function nativeSteerInterruption(request) {
-	const trigger = request?.nativeEvent?.trigger ?? request?.trigger;
-	return ['conversation', 'conversation_wake'].includes(trigger) || request?.nativeEvent?.conversationOnly === true
-		? 'conversation' : 'danger';
+	const event = request?.nativeEvent;
+	const trigger = event?.event === 'program_attention'
+		? event.status?.decision?.trigger ?? event.trigger ?? request?.trigger
+		: event?.trigger ?? request?.trigger;
+	if (['conversation', 'conversation_wake'].includes(trigger) || event?.conversationOnly === true) return 'conversation';
+	if (trigger === 'damage' || request?.dangerSummary?.hitsSinceLastUpdate > 0) return 'danger';
+	if (['lava', 'fire', 'drowning', 'suffocation'].includes(trigger)) return 'danger';
+	if (trigger !== 'threat') return null;
+	const observation = event?.observation ?? request?.observation ?? {};
+	const threats = Array.isArray(observation?.player?.threats) ? observation.player.threats
+		: Array.isArray(observation?.threats?.entries) ? observation.threats.entries : [];
+	return threats.some((threat) => {
+		const type = typeof threat?.type === 'string' ? threat.type.toLowerCase() : '';
+		const creeper = type.includes('creeper');
+		const signals = Array.isArray(threat?.signals) ? threat.signals : [];
+		return signals.includes('imminent')
+			|| creeper && (threat.swelling === true || signals.includes('swelling') || signals.includes('creeper_close'));
+	}) ? 'danger' : null;
 }
 
 function finiteCount(value) { return Number.isSafeInteger(value) && value >= 0 ? value : null; }

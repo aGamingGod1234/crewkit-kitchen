@@ -490,11 +490,12 @@ ${encoded}`);
 		}
 	}
 
-	async steer(input, { goalRevision = this.#goalRevision, onInterrupt = null } = {}) {
+	async steer(input, { goalRevision = this.#goalRevision, onInterrupt = null, onDiscard = null } = {}) {
 		this.#assertNative('steer');
 		this.#assertUsable();
 		if (!(typeof input === 'function' || typeof input === 'string' && input.trim().length > 0)) throw new TypeError('native steer input must be nonblank or a builder');
 		if (onInterrupt !== null && typeof onInterrupt !== 'function') throw new TypeError('onInterrupt must be a function or null');
+		if (onDiscard !== null && typeof onDiscard !== 'function') throw new TypeError('onDiscard must be a function or null');
 		if (goalRevision !== this.#goalRevision) throw new ClaudeProviderError('STALE_GOAL_REVISION', `Goal revision ${goalRevision} does not match ${this.#goalRevision}`);
 		const active = this.#active;
 		if (active === null || active.settled || active.goalRevision !== goalRevision) {
@@ -504,11 +505,14 @@ ${encoded}`);
 		// turn accounting. Keep only the newest pending builder and resolve every folded request from that delivery.
 		const delivered = new Promise((resolve, reject) => {
 			const waiter = { resolve: () => resolve({ turnId: active.turnId }), reject };
+			const previous = active.pendingSteers;
 			active.pendingSteers = {
 				buildInput: typeof input === 'function' ? input : async () => input,
-				waiters: [...(active.pendingSteers?.waiters ?? []), waiter],
-				queuedAt: active.pendingSteers?.queuedAt ?? Date.now(),
+				onDiscard, discarded: false,
+				waiters: [...(previous?.waiters ?? []), waiter],
+				queuedAt: previous?.queuedAt ?? Date.now(),
 			};
+			discardPendingSteer(previous);
 			active.silence.restart();
 		});
 		try { onInterrupt?.(); } catch { /* steer delivery remains authoritative if interruption reporting fails */ }
@@ -1207,12 +1211,13 @@ async function deliverSteers(active, content, encode = (text) => text) {
 		let text;
 		try { text = await encode(await pending.buildInput()); }
 		catch (error) {
-			if (active.pendingSteers !== pending) continue;
+			if (active.pendingSteers !== pending) { discardPendingSteer(pending); continue; }
 			active.pendingSteers = null;
+			discardPendingSteer(pending);
 			for (const waiter of pending.waiters) waiter.reject(error);
 			return content;
 		}
-		if (active.pendingSteers !== pending) continue;
+		if (active.pendingSteers !== pending) { discardPendingSteer(pending); continue; }
 		active.pendingSteers = null;
 		providerEvent(active.onVerbose, 'native_provider_steer_delivered', { turnId: active.turnId, steers: pending.waiters.length, waitMs: Math.max(0, Date.now() - pending.queuedAt) });
 		const delivered = { ...content, contentItems: [...content.contentItems, {
@@ -1227,7 +1232,14 @@ async function deliverSteers(active, content, encode = (text) => text) {
 function failPendingSteers(active) {
 	const pending = active.pendingSteers;
 	active.pendingSteers = null;
+	discardPendingSteer(pending);
 	for (const waiter of pending?.waiters ?? []) waiter.reject(new ClaudeProviderError('TURN_NOT_ACTIVE', 'Claude turn ended before the steer reached a tool boundary'));
+}
+
+function discardPendingSteer(pending) {
+	if (pending === null || pending === undefined || pending.discarded) return;
+	pending.discarded = true;
+	try { pending.onDiscard?.(); } catch { /* cleanup reporting cannot interrupt the next steer */ }
 }
 
 async function resolveSteerInput(input) {

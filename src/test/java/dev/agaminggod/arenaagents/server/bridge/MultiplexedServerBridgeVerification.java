@@ -186,6 +186,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyDeathFacts();
 		verifyTraceWireValidation();
 		verifyIdleDirectReplyRevisionPolicy(registered.getFirst());
+		verifyConcurrentChatRoute(registered.getFirst());
 		verifyExactTargetObservationLedger(registered.getFirst().agentId());
 		verifyConversationAttention(registered.getFirst().agentId());
 		verifyObservationCadence(candidates);
@@ -446,6 +447,32 @@ public final class MultiplexedServerBridgeVerification {
 	 * advances the lifecycle revision, but it must not fence a result belonging to the same
 	 * logical goal before a replacement handshake can replay and acknowledge it.
 	 */
+	private static void verifyConcurrentChatRoute(AgentRecord record) {
+		ActionProvenance provenance = new ActionProvenance(
+			record.profile().provider(), record.profile().model(), record.profile().reasoning(),
+			record.profile().serviceTier(), "conversation-test", 1L, "say", 0L
+		);
+		JsonObject chatArguments = new JsonObject();
+		chatArguments.addProperty("message", "I am answering while I walk.");
+		chatArguments.addProperty("audience", "direct");
+		chatArguments.addProperty("recipientId", "10000000-0000-4000-8000-000000000001");
+		ServerActionRequest chat = new ServerActionRequest(
+			record.agentId(), record.goalRevision(), "concurrent-say", ActionType.CHAT, chatArguments, provenance
+		);
+		ServerActionRequest body = new ServerActionRequest(
+			record.agentId(), record.goalRevision(), "running-body", ActionType.NAVIGATE_TO, new JsonObject(), provenance
+		);
+		ServerActionRequest activeChat = new ServerActionRequest(
+			record.agentId(), record.goalRevision(), "running-chat", ActionType.CHAT, chatArguments, provenance
+		);
+		assertTrue(MultiplexedServerBridge.shouldRouteConcurrentChat(chat, body),
+			"chat is routed outside the occupied body action slot");
+		assertTrue(!MultiplexedServerBridge.shouldRouteConcurrentChat(chat, activeChat),
+			"a chat still waits behind an earlier chat so speech order is preserved");
+		assertTrue(!MultiplexedServerBridge.shouldRouteConcurrentChat(body, activeChat),
+			"a body action cannot use the communication route");
+	}
+
 	private static void verifyTerminalReplaySurvivesDisconnectRevision() {
 		MultiplexedServerBridge bridge = null;
 		Path secretFile = null;

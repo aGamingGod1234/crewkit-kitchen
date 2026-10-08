@@ -1295,7 +1295,11 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 					const steered = await takeActiveToolSteer(toolControl);
 					if (steered !== null) response = appendNativeSteer(response, steered.text);
 					else if (toolControl !== null) toolControl.responseStarted = true;
-					await respond(id, response, measurementMetadata(resultForMetadata));
+					try { await respond(id, response, measurementMetadata(resultForMetadata)); }
+					catch (error) {
+						for (const waiter of steered?.waiters ?? []) waiter.reject(error);
+						throw error;
+					}
 					providerEvent('native_provider_tool_result_sent', { callId: params.callId });
 					if (!settled) commitPresented();
 					if (steered !== null) {

@@ -2199,6 +2199,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		try {
 			ServerActionRequest request = decodeActionRequest(envelope);
 			AgentRecord record = validateActionProvenance(request);
+			if (shouldRouteConcurrentChat(request, actionExecutor.activeRequest(request.agentId()))) {
+				actionExecutor.submitConcurrentChat(request);
+				return;
+			}
 			if (isDetachedConversationReply(record, request)) {
 				actionExecutor.submitConversationReply(request);
 			} else {
@@ -2414,6 +2418,11 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				&& record.state() != AgentLifecycleState.COMPLETED) return false;
 		ConversationAudience audience = ConversationAudience.parse(nullableString(request.arguments(), "audience"));
 		return audience == ConversationAudience.DIRECT || audience == ConversationAudience.PROXIMITY;
+	}
+
+	static boolean shouldRouteConcurrentChat(ServerActionRequest request, ServerActionRequest activeRequest) {
+		return request != null && activeRequest != null && request.type() == ActionType.CHAT
+				&& request.agentId().equals(activeRequest.agentId()) && activeRequest.type() != ActionType.CHAT;
 	}
 
 	private static ActionProvenance decodeActionProvenance(JsonObject payload) {
