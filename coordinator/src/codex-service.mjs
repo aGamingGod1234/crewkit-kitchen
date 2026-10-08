@@ -17,6 +17,10 @@ import { ContextCarryOver, DEFAULT_CONTEXT_ROTATION_TOKENS, MIN_TURNS_BETWEEN_RO
 const DEFAULT_PLANNING_TIMEOUT_MS = 45_000;
 const DEFAULT_STARTUP_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_DECISION_BYTES = 256 * 1_024;
+// Interrupting a turn at a tool boundary and continuing on a warm thread (see rotateAtToolBoundary). Off by default: it cut
+// cost index about 29% on a 70-block turn, but the model lost a fact it had seen once and not written down (0 of 3 runs kept it,
+// against 3 of 3 without). Completed-turn rotation is separate and stays on.
+const DEFAULT_CODEX_MID_TURN_ROTATION = false;
 const THREAD_START_TIMEOUT_MS = 60_000;
 const MAX_BUFFERED_TURN_NOTIFICATIONS = 4_096;
 const MAX_PUBLIC_AGENT_MESSAGE_CANDIDATE_CHARS = 1_280;
@@ -248,6 +252,7 @@ export class CodexService {
 			reportedSettings: response,
 			rotateThread,
 			contextRotationTokens: rotationTokens,
+			midTurnRotation: this.#config.midTurnContextRotation,
 		});
 		if (lifecycleGeneration !== this.#lifecycleGeneration) {
 			await agent.dispose();
@@ -439,6 +444,7 @@ export class SharedCodexAgent {
 	#standbyThreadId = null;
 	#standbyThreadPromise = null;
 	#rotationWarmupFailed = false;
+	#midTurnRotation = DEFAULT_CODEX_MID_TURN_ROTATION;
 
 	constructor(profile, threadId, transport, dependencies = {}) {
 		this.#profile = structuredClone(profile);
@@ -459,6 +465,7 @@ export class SharedCodexAgent {
 		this.#recordEffectiveSettings(dependencies.reportedSettings, false);
 		this.#rotateThread = typeof dependencies.rotateThread === 'function' ? dependencies.rotateThread : null;
 		this.#rotationTokens = Number.isSafeInteger(dependencies.contextRotationTokens) ? dependencies.contextRotationTokens : 0;
+		if (typeof dependencies.midTurnRotation === 'boolean') this.#midTurnRotation = dependencies.midTurnRotation;
 		if (this.#controlProtocol === 'native_tools') {
 			// Keep the latest observed counter even between turns. An absent baseline
 			// stays unknown; a newly attached session does not imply a zero bill.
@@ -472,7 +479,7 @@ export class SharedCodexAgent {
 				if (method === 'thread/tokenUsage/updated' && params?.threadId === this.#threadId && this.#rotationTokens > 0
 					&& (codexTokenUsage(params?.tokenUsage?.last)?.input ?? 0) >= this.#rotationTokens) {
 					this.#rotationDue = true;
-					if (this.#active !== null && this.#turnsSinceRotation + 1 >= MIN_TURNS_BETWEEN_ROTATIONS) void this.#prepareRotationThread();
+					if (this.#midTurnRotation && this.#active !== null && this.#turnsSinceRotation + 1 >= MIN_TURNS_BETWEEN_ROTATIONS) void this.#prepareRotationThread();
 				}
 			};
 			this.#transport.on('notification', this.#onNativeNotification);
@@ -723,6 +730,7 @@ export class SharedCodexAgent {
 				usagePreviousEnd: threadId === this.#threadId ? this.#nativeUsagePreviousEnd : null,
 				isRouteCurrent: () => this.#active === active && active?.collector === created && active.routeEpoch === routeEpoch && !active.handoffPending,
 				onInputObserved: () => { if (this.#active?.collector === created) active.modelObserved = true; },
+				onAgentMessage: (text) => { if (!prewarm && this.#active?.collector === created) this.#carryOver.noteAgentMessage(text); },
 				onUsageTotal: (total) => {
 					if (this.#active?.collector !== created) return;
 					this.#nativeUsageTotal = total;
@@ -766,9 +774,9 @@ export class SharedCodexAgent {
 			},
 		};
 		this.#active = active;
-		if (!prewarm && this.#rotationDue && this.#turnsSinceRotation + 1 >= MIN_TURNS_BETWEEN_ROTATIONS) void this.#prepareRotationThread();
+		if (!prewarm && this.#midTurnRotation && this.#rotationDue && this.#turnsSinceRotation + 1 >= MIN_TURNS_BETWEEN_ROTATIONS) void this.#prepareRotationThread();
 		rotateAtToolBoundary = async ({ collector: oldCollector, routeEpoch, pendingCount, tool, result, claimSteer }) => {
-			if (prewarm || pendingCount !== 1 || !this.#rotationDue || this.#rotateThread === null
+			if (prewarm || !this.#midTurnRotation || pendingCount !== 1 || !this.#rotationDue || this.#rotateThread === null
 				|| this.#turnsSinceRotation + 1 < MIN_TURNS_BETWEEN_ROTATIONS || this.#rotationWarmupFailed
 				|| this.#active !== active || active.collector !== oldCollector || active.routeEpoch !== routeEpoch
 				|| this.#goalRevision !== goalRevision || signal?.aborted || this.#disposed) return false;
@@ -1314,7 +1322,7 @@ function appendNativeSteer(response, text) {
 	}] };
 }
 
-function createNativeTurnCollector({ transport, threadId, agentId, goalRevision, executeTool, onVerbose, usageStart = null, usagePreviousEnd = null, onUsageTotal = () => {}, observationViews = new ModelObservationViews(), isRouteCurrent = () => true, onInputObserved = () => {}, onProviderActivity = () => {}, onToolResult = async () => false, onToolExecutionStart = () => {}, onToolExecutionEnd = () => {}, onToolTiming = () => {} }) {
+function createNativeTurnCollector({ transport, threadId, agentId, goalRevision, executeTool, onVerbose, usageStart = null, usagePreviousEnd = null, onUsageTotal = () => {}, observationViews = new ModelObservationViews(), isRouteCurrent = () => true, onInputObserved = () => {}, onAgentMessage = () => {}, onProviderActivity = () => {}, onToolResult = async () => false, onToolExecutionStart = () => {}, onToolExecutionEnd = () => {}, onToolTiming = () => {} }) {
 	const liveMessages = new Map();
 	let expectedTurnId = null;
 	let bufferedEvents = [];
@@ -1375,6 +1383,8 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 	let orderedTail = Promise.resolve();
 	const requestArrivals = new WeakMap();
 	const pendingTools = new Set();
+	// Calls still queued or executing; a finished sibling whose reply is in flight no longer counts, so the last
+	// result of a parallel batch is a tool boundary too.
 	const staleResponses = new Set();
 	let resolvePromise;
 	let rejectPromise;
@@ -1584,6 +1594,7 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 		}
 		if (method === 'item/completed' && params?.item?.type === 'agentMessage' && typeof params.item.text === 'string') {
 			onInputObserved();
+			onAgentMessage(params.item.text);
 			if (!publishedAgentMessage) {
 				publishedAgentMessage = true;
 				safeVerbose(onVerbose, 'agent_message', params.item.text);
@@ -1755,6 +1766,8 @@ function validateServiceConfig(value, { requireLaunchProfile }) {
 	// Same default as Claude: a fresh thread past this many context tokens (0 disables).
 	const contextRotationTokens = value.contextRotationTokens ?? DEFAULT_CONTEXT_ROTATION_TOKENS;
 	if (!Number.isSafeInteger(contextRotationTokens) || contextRotationTokens < 0) throw new TypeError('contextRotationTokens must be a nonnegative safe integer');
+	const midTurnContextRotation = value.midTurnContextRotation ?? DEFAULT_CODEX_MID_TURN_ROTATION;
+	if (typeof midTurnContextRotation !== 'boolean') throw new TypeError('midTurnContextRotation must be a boolean');
 	if (requireLaunchProfile && value.launchProfile === undefined) throw new TypeError('Codex service launchProfile is required when no transport is injected');
 	return {
 		...value,
@@ -1763,6 +1776,7 @@ function validateServiceConfig(value, { requireLaunchProfile }) {
 		catalogTtlMs,
 		startupTimeoutMs,
 		contextRotationTokens,
+		midTurnContextRotation,
 		schedule: value.schedule ?? setTimeout,
 		cancelSchedule: value.cancelSchedule ?? clearTimeout,
 	};

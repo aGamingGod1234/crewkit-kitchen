@@ -48,7 +48,9 @@ const DEFAULT_STANDBY_IDLE_TIMEOUT_MS = 3_000;
 const CARRY_OVER_TOOL_CALLS = 10;
 const MAX_TRACED_TOOLS = 8;
 const CARRY_OVER_CONVERSATION = 6;
-const RETIRED_RESULT_DRAIN_TIMEOUT_MS = 2_000;
+// USD per token implied by Claude Code's own costUsd (exact fit over six traced turns); uncached input is a 0.1x-read
+// style estimate and tiny in practice. Used only for calls whose process ends before it reports a result line.
+const CALL_PRICE_USD = Object.freeze({ input: 2e-6, cacheRead: 0.2e-6, cacheWrite: 8e-6, output: 20e-6 });
 // Streamed token events renew liveness at most this often.
 const STREAM_PROGRESS_INTERVAL_MS = 1_000;
 // Claude Code builds without --include-partial-messages; recorded when one rejects the flag.
@@ -368,6 +370,7 @@ class ClaudeAgent {
 	#pendingCarryOver = null;
 	#processUsed = false;
 	#processCostUsd = 0;
+	#unreportedCostUsd = 0;
 	#lastStreamProgressAt = 0;
 	#recentTools = [];
 	#recentConversation = [];
@@ -443,6 +446,8 @@ class ClaudeAgent {
 		if (signal?.aborted) throw signal.reason ?? new ClaudeProviderError('TURN_INTERRUPTED', 'Native tool turn was interrupted');
 		if (this.#active !== null) throw new ClaudeProviderError('TURN_IN_PROGRESS', `Claude agent '${this.agentId}' already has an active turn`);
 		this.#cancelStandbyExpiry();
+		// A standby that failed to warm during an earlier turn must not disable rotation for the rest of the process.
+		this.#standbyFailedForProcess = false;
 		await this.#ensureProcess();
 		// An interrupted turn still owes Claude Code's closing result line; never let it close this turn.
 		await this.#waitForIdle();
@@ -515,10 +520,9 @@ ${encoded}`);
 			signal?.removeEventListener('abort', abort);
 			silence.dispose();
 			if (this.#active === active) this.#active = null;
-			if (completed) {
-				if (this.#rotationDue && this.#turnsSinceRotation >= MIN_TURNS_BETWEEN_ROTATIONS) this.#rotateAfterTurn();
-				else this.#scheduleStandbyExpiry();
-			}
+			if (completed) this.#rotateAfterTurn();
+			// A failed, interrupted or not-yet-due turn leaves any warm standby idle; it must still expire.
+			this.#scheduleStandbyExpiry();
 		}
 	}
 
@@ -686,7 +690,7 @@ ${encoded}`);
 			},
 		});
 		if (standby && standbyGeneration !== this.#standbyGeneration) { route.unregister(); return null; }
-		const state = { child: null, stdout: '', stderr: '', stderrBytes: 0, exited: false, route, routeEpoch, toolsListed, sessionId: null, standby, retiredTurn: null, retiredResultPromise: null, resolveRetiredResult: null, retiredResultReceived: false, processCostUsd: 0 };
+		const state = { child: null, stdout: '', stderr: '', stderrBytes: 0, exited: false, route, routeEpoch, toolsListed, sessionId: null, standby, retired: false };
 		if (standby) this.#standbyProcess = state;
 		else { this.#route = route; this.#toolsListed = toolsListed; }
 		this.#assertUsable();
@@ -738,8 +742,11 @@ ${encoded}`);
 			return state;
 		})();
 		this.#standbyStart = warming.catch(async (error) => {
-			if (generation === this.#standbyGeneration) this.#standbyFailedForProcess = true;
-			await this.#stopStandbyProcess();
+			// A standby stopped or promoted meanwhile belongs to someone else now; only the current warmup may mark failure.
+			if (generation === this.#standbyGeneration) {
+				this.#standbyFailedForProcess = true;
+				await this.#stopStandbyProcess();
+			}
 			throw error;
 		}).finally(() => { if (this.#standbyStart === tracked) this.#standbyStart = null; });
 		const tracked = this.#standbyStart;
@@ -779,6 +786,7 @@ ${encoded}`);
 		const previous = this.#process;
 		if (this.#disposed) return null;
 		this.#standbyProcess = null;
+		this.#standbyGeneration += 1;
 		this.#releaseStandbyLease();
 		state.standby = false;
 		this.#process = state;
@@ -786,12 +794,7 @@ ${encoded}`);
 		this.#toolsListed = state.toolsListed;
 		this.#sessionId = state.sessionId;
 		if (active !== null) active.routeEpoch = state.routeEpoch;
-		if (previous !== null) {
-			previous.processCostUsd = this.#processCostUsd;
-			previous.retired = true;
-			previous.retiredTurn = active;
-			if (active !== null) previous.retiredResultPromise = new Promise((resolve) => { previous.resolveRetiredResult = resolve; });
-		}
+		// Calls the old process made since its last result line are billed but will never be reported; this books them.
 		this.#resetContextState();
 		this.#rotations += 1;
 		return { previous };
@@ -818,21 +821,14 @@ ${encoded}`);
 		this.#standbyIdleTimer = null;
 	}
 
+	/** Stops a replaced process at once: it gets no answer for its held request, or it would pay for another model call. */
 	#retireProcess(state) {
-		if (state === null) return;
+		if (state === null) return Promise.resolve();
+		state.retired = true;
+		state.exited = true;
+		state.route?.unregister();
 		try { state.child.stdin?.end?.(); } catch { /* the process may already be gone */ }
-		void (async () => {
-			if (state.retiredTurn !== null && !state.retiredResultReceived && !state.exited) {
-				let timer = null;
-				const timeout = new Promise((resolve) => {
-					timer = this.#schedule(resolve, RETIRED_RESULT_DRAIN_TIMEOUT_MS);
-					timer?.unref?.();
-				});
-				await Promise.race([state.retiredResultPromise, timeout]);
-				if (timer !== null) this.#cancelSchedule(timer);
-			}
-			if (!state.exited) await Promise.resolve(this.#terminate(state.child)).catch(() => {});
-		})();
+		return Promise.resolve(this.#terminate(state.child)).catch(() => {});
 	}
 
 	#beginHandoff(active) {
@@ -864,7 +860,7 @@ ${encoded}`);
 	}
 
 	#onStdout(state, chunk) {
-		if (this.#process !== state && this.#standbyProcess !== state && state.retired !== true) return;
+		if (this.#process !== state && this.#standbyProcess !== state) return;
 		state.stdout += chunk;
 		if (Buffer.byteLength(state.stdout, 'utf8') > this.#config.stdoutLineLimitBytes && !state.stdout.includes('\n')) {
 			this.invalidateSession(new ClaudeProviderError('OUTPUT_LIMIT_EXCEEDED', `Claude Code output line exceeded ${this.#config.stdoutLineLimitBytes} bytes`));
@@ -882,25 +878,6 @@ ${encoded}`);
 	}
 
 	#onMessage(message, state = this.#process) {
-		if (state?.retired === true) {
-			if (message?.type === 'result') {
-				state.retiredResultReceived = true;
-				state.resolveRetiredResult?.();
-				state.resolveRetiredResult = null;
-				if (Number.isFinite(message.total_cost_usd) && message.total_cost_usd >= 0) {
-					const delta = message.total_cost_usd >= state.processCostUsd ? message.total_cost_usd - state.processCostUsd : message.total_cost_usd;
-					state.processCostUsd = message.total_cost_usd;
-					this.#usage.costUsd += delta;
-					if (state.retiredTurn !== null) state.retiredTurn.usage.costUsd = (state.retiredTurn.usage.costUsd ?? 0) + delta;
-				}
-				const turnOutput = message.usage?.output_tokens;
-				if (state.retiredTurn !== null && Number.isSafeInteger(turnOutput) && turnOutput >= 0) {
-					this.#usage.output += turnOutput - state.retiredTurn.usage.output;
-					state.retiredTurn.usage.output = turnOutput;
-				}
-			}
-			return;
-		}
 		if (state?.standby === true && this.#standbyProcess === state) {
 			if (message?.type === 'system' && message.subtype === 'init') {
 				if (typeof message.session_id === 'string') state.sessionId = message.session_id;
@@ -946,6 +923,8 @@ ${encoded}`);
 			this.#processCostUsd = message.total_cost_usd;
 			this.#usage.costUsd += delta;
 			if (active !== null) active.usage.costUsd = (active.usage.costUsd ?? 0) + delta;
+			// The reported total already covers every call made so far.
+			this.#unreportedCostUsd = 0;
 		}
 		// Per-step assistant output_tokens are placeholders; the result's usage covers this turn's real output.
 		const turnOutput = message.usage?.output_tokens;
@@ -1165,13 +1144,40 @@ ${encoded}`);
 	#rotateAfterTurn() {
 		if (!this.#rotationDue || this.#turnsSinceRotation < MIN_TURNS_BETWEEN_ROTATIONS) return;
 		if (this.#process === null || this.#active !== null || this.#awaitingResult > 0 || this.#disposed) return;
+		if (this.#standbyStart === null) { this.#rotateNow(); return; }
+		// A standby that is still starting gets a moment; one that hangs is replaced by a plain restart.
+		void withDeadline(this.#standbyStart, STANDBY_READY_TIMEOUT_MS, this.#schedule, this.#cancelSchedule,
+			() => new ClaudeProviderError('STANDBY_READY_TIMEOUT', 'Claude standby was not ready after the turn')).catch((error) => {
+			if (error?.code !== 'STANDBY_READY_TIMEOUT') return;
+			this.#standbyFailedForProcess = true;
+			void this.#stopStandbyProcess();
+		}).then(() => {
+			if (!this.#rotationDue || this.#turnsSinceRotation < MIN_TURNS_BETWEEN_ROTATIONS) return;
+			if (this.#process === null || this.#active !== null || this.#awaitingResult > 0 || this.#disposed) return;
+			this.#rotateNow();
+		});
+	}
+
+	#rotateNow() {
 		const standby = this.#standbyProcess;
-		if (standby === null || standby.exited) return;
+		if (standby === null || standby.exited || this.#standbyStart !== null) {
+			// No usable standby (warmup failed, timed out or is still hanging, or the standby cap was full): restart the
+			// way a completed turn always did, so a missing standby can never switch rotation off.
+			if (standby !== null) void this.#stopStandbyProcess();
+			// The carry-over is armed before the stop so a racing turn cannot start without it.
+			this.#pendingCarryOver = this.#carryOver('Session refreshed to keep context small');
+			this.#rotations += 1;
+			void this.#stopProcess().then(() => {
+				if (this.#disposed || this.#invalidationError !== null) return undefined;
+				return this.#ensureProcess();
+			}).catch(() => {});
+			return;
+		}
 		const transaction = this.#beginHandoff(null);
 		try {
 			this.#pendingCarryOver = this.#carryOver('Session refreshed to keep context small');
 			const promoted = this.#promoteStandby(standby);
-			if (promoted !== null) this.#retireProcess(promoted.previous);
+			if (promoted !== null) void this.#retireProcess(promoted.previous);
 			else this.#pendingCarryOver = null;
 		} finally { this.#finishHandoff(transaction); }
 	}
@@ -1286,6 +1292,20 @@ ${encoded}`);
 		this.#stream = newStreamMarks();
 	}
 
+	/**
+	 * A call still streaming when its process is dropped was billed from the moment it started; the tool call that triggers
+	 * a handoff is usually dispatched before that call's message_stop. Its output so far is a lower bound.
+	 */
+	#settleOpenCalls() {
+		for (const call of this.#calls.values()) {
+			if (call.done) continue;
+			call.done = true;
+			addUsage(this.#usage, call.usage);
+			this.#unreportedCostUsd += estimateCallCostUsd(call.usage);
+			if (this.#active !== null) addUsage(this.#active.usage, call.usage);
+		}
+	}
+
 	#finishCall(call) {
 		if (call.done) return;
 		call.done = true;
@@ -1300,6 +1320,7 @@ ${encoded}`);
 		if (rotationTokens > 0 && contextTokens >= rotationTokens) this.#rotationDue = true;
 		this.#prepareStandbyIfUseful();
 		addUsage(this.#usage, call.usage);
+		this.#unreportedCostUsd += estimateCallCostUsd(call.usage);
 		const active = this.#active;
 		if (active === null) return;
 		addUsage(active.usage, call.usage);
@@ -1362,13 +1383,6 @@ ${encoded}`);
 			state.toolsListed?.reject(error);
 			return;
 		}
-		if (state.retired === true) {
-			state.resolveRetiredResult?.();
-			state.resolveRetiredResult = null;
-			state.retiredTurn = null;
-			state.route?.unregister();
-			return;
-		}
 		if (this.#process !== state) return;
 		this.#process = null;
 		// A process that dies before listing the tools fails prewarm now, not at the startup deadline.
@@ -1405,6 +1419,13 @@ ${encoded}`);
 
 	/** A new Claude Code process has never seen earlier events, fact views or omitted metadata. */
 	#resetContextState() {
+		this.#settleOpenCalls();
+		// A process dropped before its result line (rotation, restart, loss) still billed these calls.
+		if (this.#unreportedCostUsd > 0) {
+			this.#usage.costUsd += this.#unreportedCostUsd;
+			if (this.#active !== null) this.#active.usage.costUsd = (this.#active.usage.costUsd ?? 0) + this.#unreportedCostUsd;
+		}
+		this.#unreportedCostUsd = 0;
 		this.#observationViews.reset();
 		this.#rotationDue = false;
 		this.#lastContextTokens = 0;
@@ -1800,6 +1821,10 @@ function mergeUsage(target, usage) {
 	for (const [key, field] of [['input', 'input_tokens'], ['cacheRead', 'cache_read_input_tokens'], ['cacheWrite', 'cache_creation_input_tokens'], ['output', 'output_tokens']]) {
 		if (Number.isSafeInteger(usage[field]) && usage[field] > target[key]) target[key] = usage[field];
 	}
+}
+function estimateCallCostUsd(usage) {
+	return usage.input * CALL_PRICE_USD.input + usage.cacheRead * CALL_PRICE_USD.cacheRead
+		+ usage.cacheWrite * CALL_PRICE_USD.cacheWrite + usage.output * CALL_PRICE_USD.output;
 }
 function addUsage(target, usage) {
 	target.calls += 1;

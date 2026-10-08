@@ -855,101 +855,149 @@ test('a hung Claude standby times out quickly and is not respawned at each tool 
 	} finally { clearTimeout(keepAlive); releaseStandby?.(); await close(); }
 });
 
-test('Claude usage and cost from both processes are included in the active turn', async () => {
-	let releaseOld;
-	let oldResultSent;
-	const oldResult = new Promise((resolve) => { oldResultSent = resolve; });
+test('Claude books the calls of a retired process that never reports a result, and the replacement result adds to them', async () => {
 	let agent;
 	const { service, children, close } = await harness({
 		async onUser(child) {
 			if (children.indexOf(child) === 0) {
 				usageLine(child, 'old-process-call', 85_000);
 				await child.rpc('tools/call', { name: 'say', arguments: { message: 'one execution' }, _meta: { 'claudecode/toolUseId': 'toolu_usage' } });
-				child.emitLine({ type: 'result', subtype: 'success', is_error: false, result: 'retired result', session_id: 'session-1', total_cost_usd: 0.02, usage: { output_tokens: 10 } });
-				oldResultSent();
 				return;
 			}
-			await oldResult;
 			usageLine(child, 'replacement-process-call', 30_000);
 			child.emitLine({ type: 'result', subtype: 'success', is_error: false, result: 'continued', session_id: 'session-2', total_cost_usd: 0.01, usage: { output_tokens: 5 } });
 		},
-	}, { contextRotationTokens: 80_000 }, {
-		terminate: async (child) => {
-			if (child === children[0]) await new Promise((resolve) => { releaseOld = resolve; });
-			if (child.exitCode === null) child.exit(0);
-		},
-	});
+	}, { contextRotationTokens: 80_000 });
 	try {
 		agent = await service.createAgent(profile(), { controlProtocol: 'native_tools' });
-		const resultPromise = agent.act('Long turn.', { goalRevision: 0, executeTool: async () => ({ state: 'SUCCEEDED' }) });
-		await waitFor(() => releaseOld !== undefined);
-		await oldResult;
-		releaseOld();
-		const result = await resultPromise;
+		const result = await agent.act('Long turn.', { goalRevision: 0, executeTool: async () => ({ state: 'SUCCEEDED' }) });
 		assert.equal(result.usage.calls, 2);
 		assert.equal(result.usage.cacheRead, 115_000);
-		assert.equal(result.usage.costUsd, 0.03, 'running costs from the retired and replacement processes add within this turn');
-	} finally { releaseOld?.(); await close(); }
+		// 5 input, 85000 read, 200 written and 40 output tokens at the traced price card, plus the reported 0.01.
+		assert.equal(Math.round(result.usage.costUsd * 1e5), Math.round((5 * 2e-6 + 85_000 * 0.2e-6 + 200 * 8e-6 + 40 * 20e-6 + 0.01) * 1e5));
+	} finally { await close(); }
 });
 
-test('Claude drains a retired process result in the background before terminating it', async () => {
-	let oldResultSent = false;
-	let terminateOld;
-	let releaseOldTerminated;
-	let replacementStarted;
-	let oldEnded;
-	const oldResult = new Promise((resolve) => { oldEnded = resolve; });
-	const terminated = new Promise((resolve) => { releaseOldTerminated = resolve; });
-	const replacement = new Promise((resolve) => { replacementStarted = resolve; });
-	let oldResultTimer = null;
+test('Claude books a call that was still streaming when its tool request triggered the handoff', async () => {
 	const { service, children, close } = await harness({
-		beforeToolsListed(child) {
-			if (children.indexOf(child) !== 0) return;
-			const end = child.stdin.end;
-			child.stdin.end = (...args) => {
-				end(...args);
-				oldResultTimer = setTimeout(() => {
-					if (child.exitCode !== null) return;
-					oldResultSent = true;
-					child.emitLine({ type: 'result', subtype: 'success', is_error: false, result: 'old final', session_id: 'session-1', total_cost_usd: 0.02, usage: { output_tokens: 10 } });
-					oldEnded();
-				}, 35);
-			};
+		async onUser(child) {
+			if (children.indexOf(child) === 0) {
+				usageLine(child, 'finished-call', 85_000);
+				// The tool request arrives before this call's message_stop, as with a streaming Claude Code.
+				child.emitLine({ type: 'stream_event', event: { type: 'message_start', message: { id: 'open-call', usage: { input_tokens: 3, cache_read_input_tokens: 90_000, cache_creation_input_tokens: 100, output_tokens: 1 } } } });
+				await child.rpc('tools/call', { name: 'say', arguments: { message: 'once' }, _meta: { 'claudecode/toolUseId': 'toolu_open' } });
+				return;
+			}
+			child.emitLine({ type: 'result', subtype: 'success', is_error: false, result: 'done', session_id: 'session-2', total_cost_usd: 0.01, usage: { output_tokens: 5 } });
 		},
+	}, { contextRotationTokens: 80_000 });
+	try {
+		const agent = await service.createAgent(profile(), { controlProtocol: 'native_tools' });
+		const result = await agent.act('Long turn.', { goalRevision: 0, executeTool: async () => ({ state: 'SUCCEEDED' }) });
+		assert.equal(result.usage.calls, 2, 'the open call counts as a call');
+		assert.equal(result.usage.cacheRead, 175_000);
+		const expected = (5 * 2e-6 + 85_000 * 0.2e-6 + 200 * 8e-6 + 40 * 20e-6) + (3 * 2e-6 + 90_000 * 0.2e-6 + 100 * 8e-6 + 1 * 20e-6) + 0.01;
+		assert.equal(Math.round(result.usage.costUsd * 1e5), Math.round(expected * 1e5));
+	} finally { await close(); }
+});
+
+test('Claude stops the replaced process before answering its held request, so it cannot start another model call', async () => {
+	let heldRequestAnswered = false;
+	let exitedBeforeAnswer = null;
+	let terminated = 0;
+	const { service, children, close } = await harness({
 		async onUser(child) {
 			if (children.indexOf(child) === 0) {
 				usageLine(child, 'retiring-call', 85_000);
 				await child.rpc('tools/call', { name: 'say', arguments: { message: 'once' }, _meta: { 'claudecode/toolUseId': 'toolu_retire' } });
+				exitedBeforeAnswer = child.exitCode !== null;
+				heldRequestAnswered = true;
 				return;
 			}
-			replacementStarted();
-			await Promise.race([oldResult, terminated]);
 			usageLine(child, 'replacement-call', 30_000);
 			child.emitLine({ type: 'result', subtype: 'success', is_error: false, result: 'done', session_id: 'session-2', total_cost_usd: 0.01, usage: { output_tokens: 5 } });
 		},
 	}, { contextRotationTokens: 80_000 }, {
 		terminate: async (child) => {
-			if (child === children[0]) {
-				terminateOld = true;
-				clearTimeout(oldResultTimer);
-				releaseOldTerminated();
-			}
+			if (child === children[0]) terminated += 1;
 			if (child.exitCode === null) child.exit(0);
 		},
 	});
 	try {
 		const agent = await service.createAgent(profile(), { controlProtocol: 'native_tools' });
-		const resultPromise = agent.act('Long turn.', { goalRevision: 0, executeTool: async () => ({ state: 'SUCCEEDED' }) });
-		await replacement;
-		assert.equal(oldResultSent, false, 'the new session receives the handoff before the old process drains');
-		const result = await resultPromise;
-		assert.equal(terminateOld, true, 'the old process is stopped after its final result');
-		assert.equal(oldResultSent, true);
-		assert.equal(result.usage.costUsd, 0.03, 'retired and replacement process costs add to the same turn');
-	} finally {
-		clearTimeout(oldResultTimer);
-		await close();
-	}
+		const result = await agent.act('Long turn.', { goalRevision: 0, executeTool: async () => ({ state: 'SUCCEEDED' }) });
+		assert.equal(result.status, 'completed');
+		await waitFor(() => heldRequestAnswered);
+		assert.equal(terminated, 1, 'the old process is terminated once, immediately');
+		assert.equal(exitedBeforeAnswer, true, 'the held request is only released after the old process is gone');
+		assert.equal(children[0].lines.filter((line) => line.type === 'user').length, 1, 'the old process never gets another user message');
+	} finally { await close(); }
+});
+
+test('a warm standby expires even when the turn that warmed it failed', async () => {
+	const { service, children, close } = await harness({
+		async onUser(child) {
+			usageLine(child, 'failing-turn', 85_000);
+			await settle(20);
+			child.emitLine({ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'boom', session_id: 'session-1' });
+		},
+	}, { contextRotationTokens: 80_000, standbyIdleTimeoutMs: 100 });
+	try {
+		const agent = await service.createAgent(profile(), { controlProtocol: 'native_tools' });
+		await assert.rejects(agent.act('Failing long turn.', { goalRevision: 0, executeTool: async () => ({}) }));
+		await waitFor(() => children.length === 2);
+		assert.equal(children[1].exitCode, null, 'the standby is warm right after the failed turn');
+		await waitFor(() => children[1].exitCode !== null, 1_500);
+		assert.notEqual(children[1].exitCode, null, 'an idle standby is not kept for the rest of the process');
+	} finally { await close(); }
+});
+
+test('rotation still happens when the standby never becomes ready', async () => {
+	let releaseStandby;
+	const { service, children, close } = await harness({
+		async beforeToolsListed(child) {
+			if (children.indexOf(child) === 1) await new Promise((resolve) => { releaseStandby = resolve; });
+		},
+		async onUser(child) {
+			usageLine(child, `over-${child.lines.length}`, 90_000);
+			await settle(100);
+			child.emitLine({ type: 'result', subtype: 'success', is_error: false, result: 'ok', session_id: 'session-1' });
+		},
+	}, { contextRotationTokens: 80_000 });
+	try {
+		const agent = await service.createAgent(profile(), { controlProtocol: 'native_tools' });
+		for (let index = 1; index <= 8; index++) await agent.act(`Turn ${index}`, { goalRevision: 0, executeTool: async () => ({}) });
+		await settle();
+		assert.notEqual(children[0].exitCode, null, 'the over-threshold session was replaced');
+		assert.notEqual(children[1].exitCode, null, 'the hung standby was stopped, not promoted');
+		const restartedInputs = children.slice(2).flatMap((child) => child.lines.filter((line) => line.type === 'user').map((line) => line.message.content));
+		assert.match(restartedInputs[0], /^Session refreshed to keep context small/, 'the next turn runs on the fresh session with the carry-over');
+	} finally { releaseStandby?.(); await close(); }
+});
+
+test('rotation still happens when the shared standby cap leaves this agent without a standby', async () => {
+	let releaseBlocker;
+	const blockerGate = new Promise((resolve) => { releaseBlocker = resolve; });
+	const { service, children, close } = await harness({
+		async onUser(child, content) {
+			usageLine(child, `over-${child.lines.length}`, 90_000);
+			if (content.startsWith('Blocker')) await blockerGate;
+			child.emitLine({ type: 'result', subtype: 'success', is_error: false, result: 'ok', session_id: 'session-1' });
+		},
+	}, { contextRotationTokens: 80_000, maxConcurrentStandbys: 1 });
+	try {
+		const blocker = await service.createAgent(profile({ agentId: 'claude-blocker' }), { controlProtocol: 'native_tools' });
+		const other = await service.createAgent(profile({ agentId: 'claude-other' }), { controlProtocol: 'native_tools' });
+		const held = blocker.act('Blocker turn that keeps its standby lease.', { goalRevision: 0, executeTool: async () => ({}) });
+		await waitFor(() => children.length === 2);
+		for (let index = 1; index <= 4; index++) await other.act(`Other turn ${index}`, { goalRevision: 0, executeTool: async () => ({}) });
+		await settle();
+		const otherInputs = children.slice(2).flatMap((child) => child.lines.filter((line) => line.type === 'user').map((line) => line.message.content));
+		assert.equal(children.length, 4, 'the capped agent got no standby; it restarted once after its third turn');
+		assert.match(otherInputs.at(-1), /^Session refreshed to keep context small[\s\S]*Other turn 4/);
+		releaseBlocker();
+		await held;
+	} finally { releaseBlocker(); await close(); }
 });
 
 test('Claude arms rotation carry-over before a slow process stop and consumes it once', async () => {

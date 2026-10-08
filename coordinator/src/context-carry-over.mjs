@@ -12,6 +12,7 @@ export class ContextCarryOver {
 	#tools = [];
 	#conversation = [];
 	#program = null;
+	#lastNote = null;
 
 	rememberTool(tool, result, error = null) {
 		if (tool === null || typeof tool !== 'object') return;
@@ -50,6 +51,11 @@ export class ContextCarryOver {
 		if (value?.program !== null && typeof value?.program === 'object') this.#noteProgram(value.program);
 	}
 
+	/** The model's own latest note: what it wrote down is what it chose to keep from earlier observations. */
+	noteAgentMessage(text) {
+		if (typeof text === 'string' && text.trim().length > 0) this.#lastNote = truncate(text.trim(), 400);
+	}
+
 	text(reason) {
 		const heading = reason === 'Mid-turn continuation'
 			? 'Mid-turn continuation: resume with the current event and the completed tool result below. Do not repeat completed tool calls.'
@@ -59,6 +65,7 @@ export class ContextCarryOver {
 			...(this.#tools.length === 0 ? [] : ['Your most recent tool calls (oldest first):', ...this.#tools.map((entry) => `- ${entry}`)]),
 			...(this.#conversation.length === 0 ? [] : ['Recent conversation already delivered to you (oldest first):', ...this.#conversation.map((entry) => `- ${entry}`)]),
 			...(this.#program === null ? [] : [`Last known program (verify with programStatus): ${JSON.stringify(this.#program)}`]),
+			...(this.#lastNote === null ? [] : [`Your last note: ${JSON.stringify(this.#lastNote)}`]),
 		].join('\n');
 	}
 

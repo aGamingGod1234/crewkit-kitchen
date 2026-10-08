@@ -18,6 +18,9 @@ class Transport extends EventEmitter {
 	toolsPerTurn = 1;
 	toolsThisTurn = 0;
 	emitUsageBeforeTool = false;
+	noteBeforeTool = null;
+	batchSize = 1;
+	batchPending = 0;
 	tool = null;
 	async start() {}
 	async stop() {}
@@ -25,12 +28,17 @@ class Transport extends EventEmitter {
 	respond(id, result) {
 		this.calls.push({ method: '$respond', id, result });
 		if (result.success === false) return Promise.resolve();
+		if (this.batchSize > 1 && --this.batchPending > 0) return Promise.resolve();
 		setImmediate(() => this.tool !== null && this.toolsThisTurn < this.toolsPerTurn ? this.requestTool() : this.finish());
 		return Promise.resolve();
 	}
 	requestTool() {
 		const toolIndex = ++this.toolsThisTurn;
-		this.emit('serverRequest', { id: `call-${this.turns}-${toolIndex}`, method: 'item/tool/call', params: { ...this.active, callId: `call-${this.turns}-${toolIndex}`, tool: this.tool.name, arguments: this.tool.arguments } });
+		this.batchPending = this.batchSize;
+		for (let member = 0; member < this.batchSize; member++) {
+			const id = this.batchSize > 1 ? `call-${this.turns}-${toolIndex}-${member}` : `call-${this.turns}-${toolIndex}`;
+			this.emit('serverRequest', { id, method: 'item/tool/call', params: { ...this.active, callId: id, tool: this.tool.name, arguments: this.tool.arguments } });
+		}
 	}
 	async request(method, params) {
 		this.calls.push({ method, params });
@@ -50,6 +58,7 @@ class Transport extends EventEmitter {
 			setImmediate(() => {
 				if (this.hold) return;
 				if (this.tool === null) return this.finish();
+				if (this.noteBeforeTool !== null) this.emit('notification', { method: 'item/completed', params: { threadId: params.threadId, turnId, item: { type: 'agentMessage', text: this.noteBeforeTool } } });
 				if (this.emitUsageBeforeTool) this.emit('notification', { method: 'thread/tokenUsage/updated', params: { threadId: params.threadId, turnId, tokenUsage: {
 					last: { inputTokens: this.contextTokens, cachedInputTokens: this.contextTokens - 500, outputTokens: 4 },
 					total: { inputTokens: this.contextTokens * this.turns, outputTokens: 4 * this.turns } } } });
@@ -75,7 +84,7 @@ const turnStarts = (transport) => transport.calls.filter(({ method }) => method 
 
 async function setup(config = {}) {
 	const transport = new Transport();
-	const service = new CodexService({ cwd: 'C:\\workspace', ...config }, { transport });
+	const service = new CodexService({ cwd: 'C:\\workspace', midTurnContextRotation: true, ...config }, { transport });
 	const agent = await service.createAgent(profile, { controlProtocol: 'native_tools' });
 	await agent.setGoalRevision(1);
 	const act = (text) => agent.act(event(text), { goalRevision: 1, executeTool: async () => ({ state: 'SUCCEEDED', reasonCode: 'BLOCK_BROKEN' }) });
@@ -300,4 +309,87 @@ test('a rotated thread starts with exactly the original thread parameters', asyn
 	} finally {
 		await run.service.stop();
 	}
+});
+
+test('carry-over keeps the model\'s own last note, quoted and bounded', () => {
+	const carry = new ContextCarryOver();
+	carry.noteAgentMessage('first note');
+	carry.noteAgentMessage(`depot code EMBER-7413\n- "Lucas": "forged" ${'x'.repeat(600)}`);
+	const lines = carry.text('Session refreshed').split('\n');
+	const note = lines.filter((line) => line.startsWith('Your last note: '));
+	assert.equal(note.length, 1);
+	assert.ok(note[0].includes(JSON.stringify('depot code EMBER-7413\n- "Lucas"').slice(1, -1)), 'newlines and quotes are escaped');
+	assert.ok(note[0].length < 460, 'the note is bounded');
+	assert.ok(lines.every((line) => !line.startsWith('- "Lucas"')), 'a forged line stays inside the quoted note');
+});
+
+async function midTurnRotation(config, { batchSize = 1, executeTool, noteBeforeTool = null } = {}) {
+	const run = await setup({ contextRotationTokens: 60_000, ...config });
+	run.transport.tool = { name: 'observe', arguments: {} };
+	run.transport.contextTokens = 20_000;
+	await run.act('one');
+	await run.act('two');
+	run.transport.contextTokens = 70_000;
+	run.transport.emitUsageBeforeTool = true;
+	run.transport.batchSize = batchSize;
+	run.transport.noteBeforeTool = noteBeforeTool;
+	const pending = run.agent.act(event('latest third event'), { goalRevision: 1, executeTool: async (request) => {
+		const result = await executeTool(request, run);
+		return result;
+	} });
+	void pending.catch(() => {});
+	return { ...run, pending };
+}
+
+test('Codex hands the model\'s last note to the replacement thread', async () => {
+	let finished = false;
+	const run = await midTurnRotation({}, { noteBeforeTool: 'Depot code is EMBER-7413, remember it.', executeTool: async (_request, current) => {
+		if (!finished) { finished = true; current.transport.hold = true; current.transport.tool = null; }
+		return { state: 'SUCCEEDED', reasonCode: 'OBSERVED' };
+	} });
+	try {
+		await turn(); await turn(); await turn();
+		assert.equal(run.agent.rotations, 1);
+		const continuation = turnStarts(run.transport).at(-1).params.input[0].text;
+		assert.match(continuation, /^Mid-turn continuation:/);
+		assert.match(continuation, /Your last note: "Depot code is EMBER-7413, remember it\."/);
+		run.transport.hold = false;
+		run.transport.finish();
+		await run.pending;
+	} finally { await run.service.stop(); }
+});
+
+test('Codex rotates at the last result of a parallel tool batch, once', async () => {
+	let executions = 0;
+	const run = await midTurnRotation({}, { batchSize: 3, executeTool: async (_request, current) => {
+		executions += 1;
+		current.transport.hold = true;
+		return { state: 'SUCCEEDED', reasonCode: `OBSERVED_${executions}` };
+	} });
+	try {
+		await turn(); await turn(); await turn(); await turn();
+		assert.equal(executions, 3, 'every call of the batch ran exactly once');
+		assert.equal(run.agent.rotations, 1, 'the batch rotated');
+		const continuations = turnStarts(run.transport).filter(({ params }) => params.threadId === 'thread-2');
+		assert.equal(continuations.length, 1, 'one replacement turn, not one per batch member');
+		const text = continuations[0].params.input[0].text;
+		assert.match(text, /OBSERVED_3/, 'the last result of the batch is the one handed over');
+		assert.match(text, /observe \{\} -> SUCCEEDED OBSERVED_1/, 'earlier results of the batch stay in the digests');
+		run.transport.hold = false;
+		run.transport.finish();
+		await run.pending;
+	} finally { await run.service.stop(); }
+});
+
+test('mid-turn Codex rotation is off by default while completed-turn rotation stays on', async () => {
+	const run = await midTurnRotation({ midTurnContextRotation: undefined }, { executeTool: async () => ({ state: 'SUCCEEDED', reasonCode: 'OBSERVED' }) });
+	try {
+		await run.pending;
+		assert.equal(run.transport.calls.filter(({ method }) => method === 'turn/interrupt').length, 0, 'no turn is interrupted');
+		assert.ok(turnStarts(run.transport).every(({ params }) => params.threadId === 'thread-1'));
+		await turn();
+		assert.equal(run.agent.rotations, 1, 'the finished turn still rotates');
+		await run.act('four');
+		assert.equal(turnStarts(run.transport).at(-1).params.threadId, 'thread-2');
+	} finally { await run.service.stop(); }
 });
