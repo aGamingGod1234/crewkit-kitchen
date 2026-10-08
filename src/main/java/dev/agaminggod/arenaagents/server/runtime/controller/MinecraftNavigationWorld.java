@@ -55,6 +55,10 @@ public final class MinecraftNavigationWorld implements WalkabilityView {
 		return sampledRevisions.isCurrent();
 	}
 
+	boolean belongsTo(ServerLevel candidate) {
+		return level == Objects.requireNonNull(candidate, "candidate level must not be null");
+	}
+
 	private BlockState stateAt(BlockPos position) {
 		hasChunk(position.getX(), position.getZ());
 		return level.getBlockState(position);

@@ -89,6 +89,7 @@ test('oversized recovery compaction retains remembered provenance and reports om
 test('capabilities reflect the shared action contract without inventing fields', () => {
 	assert.deepEqual(minecraftCapabilities().actions.map(({ actionType, fields }) => ({ actionType, fields })), Object.entries(ACTION_FIELDS).map(([actionType, fields]) => ({ actionType, fields: [...fields] })));
 	assert.deepEqual(minecraftCapabilities().actions.find(({ actionType }) => actionType === 'use_item').optionalFields, ['hand', 'expectedItemId', 'mode']);
+	assert.deepEqual(minecraftCapabilities().actions.find(({ actionType }) => actionType === 'move_to').optionalFields, ['sprint']);
 	const copy = minecraftCapabilities();
 	copy.actions[0].fields.push('invented');
 	assert.ok(!minecraftCapabilities().actions[0].fields.includes('invented'));
@@ -426,6 +427,16 @@ test('native Minecraft tool calls normalize to exact existing body actions', () 
 	});
 	assert.deepEqual(normalizeMinecraftToolCall('moveTo', { x: 1, y: 64, z: -2 }), {
 		kind: 'action', actionType: 'navigate_to', arguments: { x: 1, y: 64, z: -2, tolerance: 1, sprint: true, timeoutMs: 30_000 },
+	});
+	assert.deepEqual(normalizeMinecraftToolCall('act', {
+		actionType: 'move_to', arguments: { x: 1, y: 64, z: -2, tolerance: 1 },
+	}), {
+		kind: 'action', actionType: 'move_to', arguments: { x: 1, y: 64, z: -2, tolerance: 1, sprint: true },
+	});
+	assert.deepEqual(normalizeMinecraftToolCall('act', {
+		actionType: 'move_to', arguments: { x: 1, y: 64, z: -2, tolerance: 1, sprint: false },
+	}), {
+		kind: 'action', actionType: 'move_to', arguments: { x: 1, y: 64, z: -2, tolerance: 1, sprint: false },
 	});
 	assert.deepEqual(normalizeMinecraftToolCall('exploreFrontier', {}), {
 		kind: 'explore_frontier', arguments: { radius: 24, limit: 32 },

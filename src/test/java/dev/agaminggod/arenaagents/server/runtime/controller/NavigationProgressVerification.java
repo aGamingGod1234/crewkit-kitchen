@@ -24,6 +24,7 @@ public final class NavigationProgressVerification {
 		assertTrue(!ServerNavigationController.remainsInDimension(Level.OVERWORLD, Level.NETHER),
 				"navigation rejects the same coordinates after a dimension change");
 		new ServerNavigationController(new net.minecraft.world.phys.Vec3(1.0D, 64.0D, 1.0D), 0.01D, false, 0L, 1_000L);
+		int fastBlockedAssertions = verifyFastBlockedMove();
 		WaypointProgress progress = new WaypointProgress(10.0D, 1_000L, 4_000L, 3);
 
 		WaypointProgress.Update advanced = progress.observe(8.0D, true, 1_100L);
@@ -140,7 +141,41 @@ public final class NavigationProgressVerification {
 		assertTrue(ServerNavigationController.hasAirReserve(true, 61), "surface traversal retains a breathing reserve");
 		assertTrue(!ServerNavigationController.hasAirReserve(true, 60), "the exact air reserve ends water traversal");
 		assertTrue(ServerNavigationController.hasAirReserve(false, 0), "air reserve does not prevent grounded movement");
-		return 44 + NavigationPreparationVerification.verify();
+		return 44 + fastBlockedAssertions + NavigationPreparationVerification.verify();
+	}
+
+	private static int verifyFastBlockedMove() {
+		BlockedMoveDetector blocked = new BlockedMoveDetector();
+		BlockedMoveDetector.Decision decision = BlockedMoveDetector.Decision.CONTINUE;
+		for (int tick = 0; tick <= 20; tick++) {
+			decision = blocked.observe(true, true, false, false, 0.0D, 0.0D, tick * 50L);
+			if (tick < 20) assertEquals(BlockedMoveDetector.Decision.CONTINUE, decision,
+					"blocked movement waits for one second and a ten-tick still window");
+		}
+		assertEquals(BlockedMoveDetector.Decision.REPLAN, decision,
+				"a grounded collision with under 0.05 blocks in ten ticks replans after one second");
+		for (int tick = 21; tick < 60; tick++) {
+			decision = blocked.observe(true, true, false, false, 0.0D, 0.0D, tick * 50L);
+			assertEquals(BlockedMoveDetector.Decision.CONTINUE, decision,
+					"the fast blocked timer allows one recovery attempt before its terminal deadline");
+		}
+		assertEquals(BlockedMoveDetector.Decision.FAIL,
+				blocked.observe(true, true, false, false, 0.0D, 0.0D, 60 * 50L),
+				"an unrecovered collision reports blocked after three seconds total");
+
+		BlockedMoveDetector stepUp = new BlockedMoveDetector();
+		for (int tick = 0; tick < 80; tick++) {
+			assertEquals(BlockedMoveDetector.Decision.CONTINUE,
+					stepUp.observe(true, true, false, true, 0.0D, 0.0D, tick * 50L),
+					"step-ups are excluded from the fast blocked path");
+		}
+		BlockedMoveDetector pendingJump = new BlockedMoveDetector();
+		for (int tick = 0; tick < 80; tick++) {
+			assertEquals(BlockedMoveDetector.Decision.CONTINUE,
+					pendingJump.observe(true, true, true, false, 0.0D, 0.0D, tick * 50L),
+					"a pending jump suppresses fast blocked detection");
+		}
+		return 221;
 	}
 
 	private static void assertBounded(double value) {

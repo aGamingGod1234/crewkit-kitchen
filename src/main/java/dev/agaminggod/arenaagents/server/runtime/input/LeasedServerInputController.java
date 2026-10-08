@@ -102,6 +102,17 @@ public final class LeasedServerInputController implements ServerInputController 
 		return agentStates == null ? Optional.empty() : winningState(agentStates);
 	}
 
+	/** Returns the lease whose input currently wins arbitration for diagnostics. */
+	public synchronized Optional<InputLease> currentWinner(AgentId agentId) {
+		LinkedHashMap<InputLease, LeaseState> agentStates = states.get(
+				Objects.requireNonNull(agentId, "agentId must not be null")
+		);
+		return agentStates == null ? Optional.empty() : agentStates.entrySet().stream()
+				.filter(entry -> entry.getValue().state() != null)
+				.max(Map.Entry.comparingByKey(PRECEDENCE))
+				.map(Map.Entry::getKey);
+	}
+
 	/** Advances the server-tick deadman and neutralizes leases that stopped renewing. */
 	public synchronized void tick() {
 		currentTick = Math.incrementExact(currentTick);

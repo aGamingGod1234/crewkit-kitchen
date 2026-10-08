@@ -89,6 +89,7 @@ export const ACTION_FIELDS = Object.freeze({
 });
 
 export const OPTIONAL_ACTION_FIELDS = Object.freeze({
+	move_to: Object.freeze(['sprint']),
 	control: Object.freeze(['instantLook']),
 	fight_target: Object.freeze(['desiredRange', 'fleeAtHealth', 'continueWithAttackers', 'targetPolicy', 'includePlayers']),
 	place_block: Object.freeze(['desiredState']),

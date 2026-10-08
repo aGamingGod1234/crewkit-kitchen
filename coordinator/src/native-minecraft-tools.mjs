@@ -126,7 +126,7 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 		ticks: integerSchema(1, 200),
 		instantLook: { type: 'boolean' },
 	}, ['forward', 'strafe', 'jump', 'sneak', 'sprint', 'attack', 'use', 'yaw', 'pitch', 'selectedSlot', 'hand', 'ticks'])),
-	tool('moveTo', 'Navigate to an endpoint you choose through bounded loaded waypoints. When the route is observed safe, give the far target: the planner routes about 30 blocks per leg and continues on its own; unknown ground still needs observation and a new route decision.', objectSchema({
+	tool('moveTo', 'Navigate to an endpoint you choose through bounded loaded waypoints. When the route is observed safe, give the far target: the planner routes about 30 blocks per leg and continues on its own; sprint is on by default (sprint:false walks); unknown ground still needs observation and a new route decision.', objectSchema({
 		x: numberSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT),
 		y: numberSchema(-2_048, 2_048),
 		z: numberSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT),
@@ -156,7 +156,7 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 	tool('wait', 'Pause briefly and wait for the body result.', objectSchema({
 		durationMs: integerSchema(MIN_DURATION_MS, MAX_DURATION_MS),
 	}, ['durationMs'])),
-	tool('act', 'Execute one supported advanced player action. Supply exactly the required fields. For interact_block omit optional hitX/hitY/hitZ to use the actual block shape. Before pick_up_item check current inventory and use a freshly observed target UUID; drops within a block may already be collected. fight_target takes optional targetPolicy: named (default), highest_risk or nearest_attacker (live switching among attacking mobs with hysteresis, never creepers); follow-through and policies skip players unless includePlayers:true. Threats sort by risk; replaceAction with a new fight_target retargets keeping weapon and swing timing.', objectSchema({
+	tool('act', 'Execute one supported advanced player action. Supply exactly the required fields; move_to sprint defaults to true. For interact_block omit optional hitX/hitY/hitZ to use the actual block shape. Before pick_up_item check current inventory and use a freshly observed target UUID; drops within a block may already be collected. fight_target takes optional targetPolicy: named (default), highest_risk or nearest_attacker (live switching among attacking mobs with hysteresis, never creepers); follow-through and policies skip players unless includePlayers:true. Threats sort by risk; replaceAction with a new fight_target retargets keeping weapon and swing timing.', objectSchema({
 		actionType: { type: 'string', enum: NATIVE_ACTION_TYPES },
 		arguments: { type: 'object' },
 	}, ['actionType', 'arguments'])),
@@ -395,6 +395,7 @@ function normalizeMinecraftToolArguments(name, value) {
 			let actionArguments = requireObject(args.arguments);
 			if (Object.hasOwn(actionArguments, 'type')) invalid('arguments.type is reserved; use actionType');
 			// Aliases and sequence steps share defaults, then the canonical action bounds.
+			if (args.actionType === 'move_to') actionArguments = { sprint: true, ...actionArguments };
 			if (args.actionType === 'navigate_to') actionArguments = { tolerance: 1, sprint: true, timeoutMs: 30_000, ...actionArguments };
 			if (args.actionType === 'break_block') actionArguments = { timeoutMs: 15_000, ...actionArguments };
 			try {

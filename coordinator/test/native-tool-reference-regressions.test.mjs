@@ -35,7 +35,7 @@ test('focused sequence reference advertises finish with an accepted executable c
 
 test('ArenaScript movement documentation distinguishes moveTo from timed navigateTo', () => {
 	assert.match(ARENA_SCRIPT_API_REFERENCE, /moveTo and navigateTo require tolerance 0\.01\.\.16 and sprint boolean; only navigateTo accepts timeoutMs \(required, 1\.\.600000\)/);
-	assert.match(SCRIPT_ACTION_REFERENCE, /player\.moveTo\(\{ x, y, z, tolerance, sprint \}\)/);
+	assert.match(SCRIPT_ACTION_REFERENCE, /player\.moveTo\(\{ x, y, z, tolerance, sprint\? \}\)/);
 	assert.match(SCRIPT_ACTION_REFERENCE, /player\.navigateTo\(\{ x, y, z, tolerance, sprint, timeoutMs \}\)/);
 	for (const [member, primitive, args] of [
 		['moveTo', 'move_to', { x: 1, y: 64, z: 2, tolerance: 1, sprint: true }],

@@ -17,7 +17,7 @@ public final class AgentInputStates {
 	public static final float TURN_EASE = 0.7F;
 
 	/** Analog motor limits. These values are deliberately independent of server TPS. */
-	public static final float MOVE_ACCELERATION = 0.20F;
+	public static final float STRAFE_ACCELERATION = 0.20F;
 	public static final float MOVE_DECELERATION = 0.35F;
 	private static final float MOVEMENT_EPSILON = 1.0E-4F;
 
@@ -103,10 +103,10 @@ public final class AgentInputStates {
 				desiredStrafe = yawDelta < 0.0F ? 1.0F : -1.0F;
 			}
 		}
-		float forward = approach(state.forward(), desiredForward,
-				desiredForward == 0.0F ? MOVE_DECELERATION : MOVE_ACCELERATION);
+		// Forward is a direct movement command: the old five-tick ramp cost roughly 100 ms at 20 TPS.
+		float forward = desiredForward;
 		float strafe = approach(state.strafe(), desiredStrafe,
-				desiredStrafe == 0.0F ? MOVE_DECELERATION : MOVE_ACCELERATION);
+			desiredStrafe == 0.0F ? MOVE_DECELERATION : STRAFE_ACCELERATION);
 		boolean jump = target.jumpRequested();
 		MotorState next = new MotorState(yaw, pitch, forward, strafe, target.jumpRequested());
 		return new MotorStep(next, forward, strafe, jump, sprint);

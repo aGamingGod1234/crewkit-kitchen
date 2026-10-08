@@ -25,6 +25,7 @@ public final class NavigationMotionVerification {
 		verifyLookController();
 		verifySteering();
 		verifyClearWalkLineScratchEquivalence();
+		verifyForwardInputAndCornering();
 		verifyOccupiedNode();
 		verifyJumps();
 		verifyGaze();
@@ -32,6 +33,26 @@ public final class NavigationMotionVerification {
 		verifyStairOvershootDoesNotSpin();
 		verifyStaircaseGaze();
 		return assertions;
+	}
+
+	private static void verifyForwardInputAndCornering() {
+		AgentInputStates.MotorState initial = AgentInputStates.MotorState.initial(0.0F, 0.0F);
+		AgentInputStates.MotorStep straight = AgentInputStates.stepMotor(initial,
+				new AgentInputStates.MotorTarget(0.0F, 10.0F, true, false, true), 0L);
+		assertEquals(1.0F, straight.forward(), "forward input is full strength on the first movement tick");
+		assertTrue(Math.abs(straight.strafe()) < 1.0E-6F, "straight movement does not invent lateral input");
+
+		AgentInputStates.MotorStep corner = AgentInputStates.stepMotor(initial,
+				new AgentInputStates.MotorTarget(90.0F, 10.0F, true, false, true), 0L);
+		assertEquals(45.0F, corner.yaw(), "a corner keeps the existing eased turn cap");
+		assertTrue(Math.abs(corner.forward() - (float) Math.cos(Math.toRadians(45.0D))) < 1.0E-4F,
+				"cornering uses the full forward component for its current heading");
+		assertEquals(-0.2F, corner.strafe(), "cornering retains the 0.2 strafe smoothing step");
+		AgentInputStates.MotorStep settled = AgentInputStates.stepMotor(corner.state(),
+				new AgentInputStates.MotorTarget(90.0F, 10.0F, true, false, true), 50L);
+		assertTrue(settled.forward() > corner.forward(), "forward strength follows the eased corner turn immediately");
+		assertTrue(Math.abs(settled.strafe()) > Math.abs(corner.strafe()),
+				"strafe smoothing continues to ease into the corner");
 	}
 
 	private static void verifyHeadingHold() {
