@@ -364,3 +364,18 @@ Notes: before numbers come from the recorded GPT-6.1 Sol "beat the game" session
 - **Solution:** Each reference read now traces its section and topic, and each taskPlan result traces the topics it pointed at, with no content. The pointer says what the read is for ("Read capabilities strategy:resources before mining..."), the guide's resources topic gained a resourcefulness section, inventory rows show `usesLeft`, and placed workstations the agent walks away from are listed as `leftBehind`. The always-on instructions gained one line and stayed under 1,500 characters (1,489 to 1,497).
 - **Result:** The question is answerable from the next live trace; no behaviour change has been measured yet. (measured) tool wear made the raw event 246 bytes smaller on a 12-row inventory by dropping always-zero damage fields, at +98 encoded bytes for Codex.
 - **Sources:** branch claude/explore-resource, `play-session-3-trace.jsonl`
+
+## PR #48, continued: review fixes (Oct 8, 2026)
+
+### A flee that walked toward the lava first
+*PR #48 · Oct 8, 2026*
+- **Problem:** After rotations were eased, a control step kept its movement keys pressed while the view was still turning. A "turn around and run" step walked partly toward the danger for its first few ticks, and a jump-and-place pillar step placed its block on the ground ahead instead of underneath.
+- **Solution:** The view turns first with movement and clicks released, and the turn doesn't count against the step's duration.
+- **Result:** (measured, verification) a 180° turn with forward for 10 ticks used to walk about 16 ticks, the first few toward the danger. It now turns in 6 ticks and then walks exactly 10 ticks in the requested direction. Pillar placement fires looking straight down (90°) instead of about 30 to 45° mid-turn.
+
+### Seeing structures without slowing the server
+*PR #48 · Oct 8, 2026*
+- **Problem:** Structure, cave and vein sightings were recomputed on almost every observation, because the cache key used the exact view angle, which changes every tick with eased turning. Lookups could also load structure chunks on the server thread, and natural blocks inside a structure's bounds could report structures that weren't actually visible.
+- **Solution:** Sightings are recomputed at most twice a second with a rounded cache key, lookups only read chunks that are already loaded, only built blocks identify a structure, and rows use the names a player would recognise.
+- **Result:** (computed from the code) a constantly turning view went from up to 20 recomputes per second per agent to at most 2 (10× fewer). Per-observation milliseconds were not measured on a server.
+
