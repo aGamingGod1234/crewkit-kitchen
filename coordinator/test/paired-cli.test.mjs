@@ -171,11 +171,11 @@ test('terminal persistence observation controls completion and retains lifecycle
 	const f = await fixture(t);
 	for (const mode of ['normal', 'overrun', 'nan', 'regression']) {
 		let receiptCommitted = false, finalReads = 0, phases = 0;
-		const config = { ...f.config, startupMs: 30000, runtimeBudgetMs: 150000, outputDirectory: path.join(f.directory, `clock-${mode}`) };
+		const config = { ...f.config, outputDirectory: path.join(f.directory, `clock-${mode}`) };
 		const run = runPairedCli(config, { launcher, startedAtMs: 0,
 			now: () => {
 				if (!receiptCommitted || mode === 'normal') return 100;
-				if (mode === 'overrun') return ++finalReads === 1 ? 150000 : 150001;
+				if (mode === 'overrun') return ++finalReads === 1 ? config.runtimeBudgetMs : config.runtimeBudgetMs + 1;
 				return mode === 'nan' ? NaN : 99;
 			},
 			persist: async (file, value) => { await writeFile(file, JSON.stringify(value)); if (file.endsWith('completion.json')) receiptCommitted = true; },

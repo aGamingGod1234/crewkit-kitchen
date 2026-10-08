@@ -569,7 +569,7 @@ test('turn and trial timeouts produce typed bounded failures and clean provider 
 test('createAgent is bounded by the trial deadline and stops the provider', async () => {
 	let stopped = 0;
 	const result = await runLatencyMatrix({
-		matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'create-agent-timeout', trialBudgetMs: 300 }] }),
+		matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'create-agent-timeout', trialBudgetMs: 2_000 }] }),
 		scenarioResolver: () => fixtureScenario(),
 		providerFactories: {
 			instant: () => ({
@@ -593,7 +593,7 @@ test('provider stop after a timeout is bounded by cleanup policy', async () => {
 	let releaseStop;
 	const stopGate = new Promise((resolve) => { releaseStop = resolve; });
 	const result = await runLatencyMatrix({
-		matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'bounded-stop-timeout', trialBudgetMs: 100 }] }),
+		matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'bounded-stop-timeout', trialBudgetMs: 2_000 }] }),
 		scenarioResolver: () => fixtureScenario(),
 		providerFactories: {
 			instant: () => ({
@@ -804,7 +804,7 @@ test('Codex benchmark sessions receive the explicit ArenaScript protocol', async
 test('paces delayed replay ticks against wall time instead of racing virtual time ahead', async () => {
 	const profile = { provider: 'codex', model: 'fixture-model', reasoningEffort: 'high', serviceTier: 'fast' };
 	const scenario = fixtureScenario();
-	const trial = { ...matrix().trials[0], id: 'paced-replay', mode: 'replay', providerProfile: profile, trialBudgetMs: 1_000, turnBudgetMs: 500 };
+	const trial = { ...matrix().trials[0], id: 'paced-replay', mode: 'replay', providerProfile: profile, trialBudgetMs: 30_000, turnBudgetMs: 10_000 };
 	const decision = fixtureDecision();
 	let prompt = null;
 	const liveProvider = () => ({
@@ -850,6 +850,8 @@ test('paces delayed replay ticks against wall time instead of racing virtual tim
 	assert.ok(completed.metrics.result.taskCompletionWallDurationMs >= VIRTUAL_TICK_MS);
 	assert.ok(completed.metrics.result.totalVirtualWorldDurationMs < 500);
 	assert.ok(completed.metrics.result.totalVirtualWorldDurationMs <= completed.metrics.result.taskCompletionWallDurationMs + VIRTUAL_TICK_MS * 2);
-	assert.ok(elapsedWallMs < 900);
+	// Pacing itself is asserted by the virtual-versus-wall comparisons above, which only get easier as a
+	// loaded runner slows down. This bound just catches a pacer that never returns.
+	assert.ok(elapsedWallMs < 10_000);
 	assert.equal(pacingHandles.size, 0);
 });

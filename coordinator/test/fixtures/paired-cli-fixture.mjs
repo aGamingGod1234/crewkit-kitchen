@@ -18,6 +18,9 @@ const quotePS = value => `'${value.replaceAll("'", "''")}'`;
 export async function json(file) { return JSON.parse(await readFile(file, 'utf8')); }
 export async function fixture(t, mode = 'pass') {
 	const directory = await mkdtemp(path.join(tmpdir(), 'arena-paired-tiny-'));
+	// Only full_timeout exercises the trial allowance itself, by running it to the cutoff. The other modes finish at
+	// once, so their allowance is just headroom for a loaded runner to relay the trial phase.
+	const trialMs = mode === 'full_timeout' ? 3000 : 15000;
 	t.after(() => rm(directory, { recursive: true, force: true }));
 	const arms = [];
 	for (const id of ['A', 'B']) {
@@ -69,13 +72,14 @@ process.exitCode=report.status==='FAILED'?1:0;
 	await writeFile(path.join(serverTemplate, 'fabric-server-launch.jar'), 'harmless fixture, never executed');
 	const server = path.join(directory, 'idle.mjs'); await writeFile(server, "process.stdin.on('data', () => process.exit(0)); setInterval(() => {},1000);");
 	const matrixPath = path.join(directory, 'matrix.json');
-	await writeFile(matrixPath, JSON.stringify({ version: 1, scenarios: [{ id: 'natural-fixture', ...profile, task: mode, timeoutMs: 3000, scenarioTimeoutMs: 3000, world: { mode: 'natural', seed: '-9223372036854775808' }, requireFactualSuccess: true, assert: [{ type: 'rcon', command: 'data get entity {agent} Inventory', match: 'oak_log' }] }] }));
+	await writeFile(matrixPath, JSON.stringify({ version: 1, scenarios: [{ id: 'natural-fixture', ...profile, task: mode, timeoutMs: trialMs, scenarioTimeoutMs: trialMs, world: { mode: 'natural', seed: '-9223372036854775808' }, requireFactualSuccess: true, assert: [{ type: 'rcon', command: 'data get entity {agent} Inventory', match: 'oak_log' }] }] }));
 	// Reserve setup, equal trial and cleanup for all four Windows fixture arms,
 	// plus terminal IO. Setup includes multiple shell/Node launches on CI.
-	// startupMs and the terminal slack are ceilings, not waits: a PowerShell cold start under CPU
-	// contention took 33 s against the former 30 s, which timed the first arm out and left the
-	// run INCOMPLETE. The 3 s trial and the cleanup limit are what the tests exercise.
-	const startupMs = 120000, trialMs = 3000, cleanupMs = 15000;
+	// startupMs, cleanupMs and the terminal slack are ceilings, not waits: under CPU contention a
+	// PowerShell cold start took 33 s against the former 30 s startup limit and a healthy cleanup
+	// took 15.2 s against the former 15 s one, each of which left the run INCOMPLETE. The 3 s trial
+	// is what the tests exercise; tests that need cleanup to expire set their own cleanupMs.
+	const startupMs = 120000, cleanupMs = 60000;
 	const config = { runtimeBudgetMs: 4 * (startupMs + trialMs + cleanupMs) + 60000, startupMs, cleanupMs, outputDirectory: path.join(directory, 'result'), matrixPath, serverTemplate, arms, scenarios: [{ id: 'natural-fixture', seed: '-9223372036854775808', trialMs }] };
 	const fakeLauncher = path.join(directory, 'fake-launcher.ps1');
 	await writeFile(fakeLauncher, `param([string] $ProjectRoot, [switch] $FunctionsOnly)

@@ -4,7 +4,8 @@ import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { runPairedCli } from '../src/benchmark/paired-cli.mjs';
 import { fixture, launcher, json } from './fixtures/paired-cli-fixture.mjs';
-test('paired launcher completes real full-budget AB/BA timeout handoffs', { skip: process.platform !== 'win32' }, async t => {
+// Four real PowerShell arms: minutes on a saturated runner, so the default per-test budget is too tight.
+test('paired launcher completes real full-budget AB/BA timeout handoffs', { skip: process.platform !== 'win32', timeout: 600_000 }, async t => {
  const f = await fixture(t, 'full_timeout');
  const report = await runPairedCli(f.config, { launcher: f.fakeLauncher });
  await writeFile(path.join(f.directory, 'full-route-result.json'), JSON.stringify({ report, fixtureDirectory: f.directory }, null, 2));

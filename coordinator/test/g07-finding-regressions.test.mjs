@@ -22,10 +22,13 @@ const profile = { provider: 'instant', model: 'fixture', reasoningEffort: 'fixed
 const matrix = (extra = {}) => ({ version: 1, fixedSeeds: [1], agentLoads: [1,4,8,16], trials: [{ id: 'fixture', mode: 'instant', scenarioId: 'block-placement', seed: 1, agentLoad: 1, repetitions: 2, providerProfile: profile, turnBudgetMs: 100, trialBudgetMs: 500, turnCap: 8, providerAvailabilityRequired: false, ...extra }] });
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
 const tick = () => new Promise(r => setImmediate(r));
+// Trials that wait on a gated provider end at their deadline. It has to fall after acquisition starts, which a
+// loaded runner delays well past the 30 ms these once used.
+const GATED_TRIAL_BUDGET_MS = 2000;
 
 test('late provider acquisition stays owned, aborts, and prevents another trial while unsettled', async () => {
   const gate = deferred(); let stops = 0, acquisitions = 0, signal;
-  const result = await runLatencyMatrix({ matrix: matrix({ trialBudgetMs: 30 }), measurements: false,
+  const result = await runLatencyMatrix({ matrix: matrix({ trialBudgetMs: GATED_TRIAL_BUDGET_MS }), measurements: false,
     providerFactories: { instant: async (_, context) => { acquisitions++; signal = context.signal; await gate.promise; return { ...profile, stop: async () => { stops++; } }; } },
   });
   try {
@@ -323,7 +326,7 @@ test('native A/B accepts required work only and excludes invalid arms from paire
 test('default live factory cancellation reclaims preflight and reports completed cleanup',async()=>{
   let creates=0,stops=0,aborted=false;
   const liveProfile={provider:'codex',model:'offline',reasoningEffort:'high',serviceTier:'priority'};
-  const result=await runLatencyMatrix({matrix:matrix({mode:'live',providerProfile:liveProfile,repetitions:1,trialBudgetMs:30}),measurements:false,
+  const result=await runLatencyMatrix({matrix:matrix({mode:'live',providerProfile:liveProfile,repetitions:1,trialBudgetMs:GATED_TRIAL_BUDGET_MS}),measurements:false,
     liveProviderOptions:{environment:{},service:{provider:'codex',async start(){},async stop(){stops++;},async createAgent(_, {signal}){creates++;return new Promise((resolve,reject)=>signal.addEventListener('abort',()=>{aborted=true;reject(signal.reason);},{once:true}));}}},
   });
   await tick();
@@ -348,7 +351,7 @@ test('default live adapter retains pending stop after its gameplay session deadl
 
 test('legacy latency CLI preserves pending acquisition and halted-matrix evidence',async()=>{
   const root=await artifactRoot('latency-cli'), gate=deferred();
-  const input=path.join(root,'matrix.json');await writeFile(input,JSON.stringify(matrix({trialBudgetMs:30})));
+  const input=path.join(root,'matrix.json');await writeFile(input,JSON.stringify(matrix({trialBudgetMs:GATED_TRIAL_BUDGET_MS})));
   const output=[];let stops=0;
   try{
     const exit=await runLatencyRunnerCli(['--matrix',input,'--artifact-directory',path.join(root,'artifacts')],{

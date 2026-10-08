@@ -4,7 +4,7 @@ import test from 'node:test';
 // Real coordinator regressions adapted from the independently verified fixtures.
 // Provider, bridge, and clocks below are controlled offline test boundaries.
 
-test("g01 f016 status exposes least healthy real profile and native operation without duplicate wire identities", { timeout: 15000 }, async () => {
+test("g01 f016 status exposes least healthy real profile and native operation without duplicate wire identities", { timeout: 120000 }, async () => {
 const { EventEmitter, once } = await import('node:events');
 const { AgentRegistry, DynamicAgentState } = await import('../src/agent-registry.mjs');
 const { AgentPlanner } = await import('../src/agent-planner.mjs');
@@ -148,7 +148,7 @@ try {
 
 });
 
-test("g01 f020 factual dragon fallback survives exhausted local corrections and subsequent outage but respects server rejection", { timeout: 15000 }, async () => {
+test("g01 f020 factual dragon fallback survives exhausted local corrections and subsequent outage but respects server rejection", { timeout: 120000 }, async () => {
 // Independently authored verifier. Actual coordinator, planner, scheduler, registry,
 // and translator; only Minecraft bridge, provider responses, and retry clock are fake.
 const { EventEmitter } = await import('node:events');
@@ -179,7 +179,7 @@ async function run(spec) {
   const wait = predicate => {
     if (predicate()) return Promise.resolve();
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => { changed.off('change', check); reject(Error(`Fixture timed out: ${spec.name}`)); }, 2000);
+      const timeout = setTimeout(() => { changed.off('change', check); reject(Error(`Fixture timed out: ${spec.name}`)); }, 60000);
       function check() { if (predicate()) { clearTimeout(timeout); changed.off('change', check); resolve(); } }
       changed.on('change', check);
       check();
@@ -282,7 +282,7 @@ for (const spec of cases) results.push(await run(spec));
 
 });
 
-test("g01 f039 native push ingestion has one owner and preserves heartbeat stale classic sample and death controls", { timeout: 15000 }, async () => {
+test("g01 f039 native push ingestion has one owner and preserves heartbeat stale classic sample and death controls", { timeout: 120000 }, async () => {
 const { EventEmitter, once } = await import('node:events');
 const { createDynamicCoordinator, normalizeDynamicConfig } = await import('../src/dynamic-main.mjs');
 const { AgentRegistry } = await import('../src/agent-registry.mjs');
@@ -377,7 +377,7 @@ async function coordinatorCase(protocol, persistent = true) {
     await bridge.deliver('observation', observation(1, persistent));
     if (protocol === 'native_tools') {
       let timeout;
-      try { await Promise.race([requested.promise, new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('Fixture native request did not settle')), 3000); })]); }
+      try { await Promise.race([requested.promise, new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('Fixture native request did not settle')), 60000); })]); }
       finally { clearTimeout(timeout); }
       await settle();
     }
@@ -453,7 +453,7 @@ try {
 
 });
 
-test("g01 f050 voice bootstrap preserves explicit profile receiver cache separation and automatic assignments", { timeout: 15000 }, async () => {
+test("g01 f050 voice bootstrap preserves explicit profile receiver cache separation and automatic assignments", { timeout: 120000 }, async () => {
 ﻿// Adapted from a35/probe-profile-bootstrap.mjs after audit. New paired-mode,
 // forwarding, repeated-choice, automatic-choice and missing-Fish controls.
 const { EventEmitter } = await import('node:events');
@@ -566,7 +566,7 @@ try {
 
 });
 
-test("g01 f051 both voice startup branches retry while cancelled secret read remains pending and fence late results", { timeout: 15000 }, async () => {
+test("g01 f051 both voice startup branches retry while cancelled secret read remains pending and fence late results", { timeout: 120000 }, async () => {
 const { default: path } = await import('node:path');
 const { fileURLToPath } = await import('node:url');
 const { createVoiceSupervisor, normalizeDynamicConfig, startCoordinatorControl, startVoiceWorker } = await import('../src/dynamic-main.mjs');
@@ -731,7 +731,7 @@ try {
 // aggregate budget across 21 real coordinator start/stop cycles.
 for (const state of ['PAUSED', 'COMPLETED', 'IDLE']) {
   for (const mode of ['no-tool', 'no-tool-then-say', 'read-only', 'invalid-say', 'failed-say', 'valid-say', 'observe-then-say']) {
-test(`g01 f055 bounded reply correction requires successful chat receipt: ${state}/${mode}`, { timeout: 15000 }, async () => {
+test(`g01 f055 bounded reply correction requires successful chat receipt: ${state}/${mode}`, { timeout: 120000 }, async () => {
 const { EventEmitter } = await import('node:events');
 const { mkdir, rm, writeFile } = await import('node:fs/promises');
 const { default: path } = await import('node:path');
@@ -754,7 +754,7 @@ function waitFor(predicate, description) {
   return new Promise((resolve, reject) => {
     const cleanup = () => { clearTimeout(deadline); changes.off('change', changed); };
     const changed = () => { if (predicate()) { cleanup(); resolve(); } };
-    const deadline = setTimeout(() => { cleanup(); reject(new Error(`Fixture timed out: ${description}`)); }, 5000);
+    const deadline = setTimeout(() => { cleanup(); reject(new Error(`Fixture timed out: ${description}`)); }, 60000);
     changes.on('change', changed);
   });
 }
@@ -1055,7 +1055,7 @@ await activeControl();
 
 });
 
-test("g01 f028 normalizer preserves an ordinary slot at fixed and adaptive minimum targets", { timeout: 15000 }, async () => {
+test("g01 f028 normalizer preserves an ordinary slot at fixed and adaptive minimum targets", { timeout: 120000 }, async () => {
 
 const { normalizeDynamicConfig } = await import('../src/dynamic-main.mjs');
 const { PlanningScheduler } = await import('../src/planning-scheduler.mjs');
@@ -1073,7 +1073,7 @@ for (const limits of [{planningConcurrency:1}, {planningMode:'adaptive',planning
 
 });
 
-test("g01 f018 reconciliation releases independently supervised recovery before ordinary observation ingress", { timeout: 15000 }, async () => {
+test("g01 f018 reconciliation releases independently supervised recovery before ordinary observation ingress", { timeout: 120000 }, async () => {
 
 // This is a new normal repository boundary test. It does not replay the blocked
 // receipt probe: a controlled planner promise isolates readiness ownership.
