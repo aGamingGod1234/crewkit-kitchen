@@ -11,6 +11,7 @@ import { reportVisibleOutput } from './verbose-output.mjs';
 import { sanitizeDiagnosticText } from './diagnostic-sanitizer.mjs';
 import { createExecutionSettings } from './provider-identity.mjs';
 import { ToolResponseSummary } from './tool-response-summary.mjs';
+import { ContextCarryOver, DEFAULT_CONTEXT_ROTATION_TOKENS, MIN_TURNS_BETWEEN_ROTATIONS } from './context-carry-over.mjs';
 
 const DEFAULT_PLANNING_TIMEOUT_MS = 45_000;
 const DEFAULT_STARTUP_TIMEOUT_MS = 15_000;
@@ -197,7 +198,7 @@ export class CodexService {
 				: await this.#workspaceManager.prepare(profile.provider, profile.agentId);
 		}
 		this.#assertLifecycleCurrent(lifecycleGeneration);
-		const response = await this.#transport.request('thread/start', {
+		const threadParams = {
 			model: profile.model,
 			serviceTier: profile.serviceTier,
 			cwd,
@@ -215,14 +216,24 @@ export class CodexService {
 			developerInstructions: controlProtocol === 'native_tools'
 				? nativeRecoveryInstructions(recoverySummary)
 				: ['goal_spec', 'director_script'].includes(controlProtocol) ? 'Return only one JSON value matching the supplied output schema. Never call tools.' : recoveryInstructions(recoverySummary),
-		}, { timeoutMs: THREAD_START_TIMEOUT_MS });
-		const threadId = requireNestedId(response, 'thread', 'thread/start');
-		if (permissionProfile !== null && (response.activePermissionProfile?.id !== permissionProfile
-				|| response.cwd !== cwd || !Array.isArray(response.runtimeWorkspaceRoots) || response.runtimeWorkspaceRoots.some((root) => root !== cwd)
-				|| !Array.isArray(response.instructionSources) || response.instructionSources.length !== 0)) {
-			throw new CodexProtocolError('MINECRAFT_WORKSPACE_MISMATCH', 'Provider did not confirm the dedicated workspace, permission profile, and isolated instruction sources');
-		}
-		if (transportGeneration !== this.#transportGeneration) throw new CodexProtocolError('SESSION_INVALIDATED', 'Codex transport generation was replaced');
+		};
+		const startThread = async (params) => {
+			const response = await this.#transport.request('thread/start', params, { timeoutMs: THREAD_START_TIMEOUT_MS });
+			const threadId = requireNestedId(response, 'thread', 'thread/start');
+			if (permissionProfile !== null && (response.activePermissionProfile?.id !== permissionProfile
+					|| response.cwd !== cwd || !Array.isArray(response.runtimeWorkspaceRoots) || response.runtimeWorkspaceRoots.some((root) => root !== cwd)
+					|| !Array.isArray(response.instructionSources) || response.instructionSources.length !== 0)) {
+				throw new CodexProtocolError('MINECRAFT_WORKSPACE_MISMATCH', 'Provider did not confirm the dedicated workspace, permission profile, and isolated instruction sources');
+			}
+			if (transportGeneration !== this.#transportGeneration) throw new CodexProtocolError('SESSION_INVALIDATED', 'Codex transport generation was replaced');
+			return { threadId, response };
+		};
+		const { threadId, response } = await startThread(threadParams);
+		const rotationTokens = this.#config.contextRotationTokens;
+		// A rotated thread starts with exactly the same parameters, so any prefix caching across threads stays possible.
+		const rotateThread = controlProtocol === 'native_tools' && rotationTokens > 0
+			? async () => (await startThread(threadParams)).threadId
+			: null;
 	const sessionGeneration = (this.#sessionGenerations.get(profile.agentId) ?? 0) + 1;
 		this.#sessionGenerations.set(profile.agentId, sessionGeneration);
 		const agent = new SharedCodexAgent(profile, threadId, this.#transport, {
@@ -234,6 +245,8 @@ export class CodexService {
 			resetReason: resetReason ?? (sessionGeneration > 1 ? 'session_replaced' : null),
 			controlProtocol,
 			reportedSettings: response,
+			rotateThread,
+			contextRotationTokens: rotationTokens,
 		});
 		if (lifecycleGeneration !== this.#lifecycleGeneration) {
 			await agent.dispose();
@@ -411,6 +424,16 @@ export class SharedCodexAgent {
 	#nativeUsageTotal = null;
 	#nativeUsagePreviousEnd = null;
 	#onNativeNotification = null;
+	// Context rotation (parity with Claude): past the threshold, the next idle moment moves to a fresh thread.
+	#rotateThread = null;
+	#rotationTokens = 0;
+	#rotationDue = false;
+	#rotationPromise = null;
+	#rotationGeneration = 0;
+	#turnsSinceRotation = 0;
+	#rotations = 0;
+	#pendingCarryOver = null;
+	#carryOver = new ContextCarryOver();
 
 	constructor(profile, threadId, transport, dependencies = {}) {
 		this.#profile = structuredClone(profile);
@@ -429,6 +452,8 @@ export class SharedCodexAgent {
 			evidence: { model: 'submitted', serviceTier: 'submitted' },
 		});
 		this.#recordEffectiveSettings(dependencies.reportedSettings, false);
+		this.#rotateThread = typeof dependencies.rotateThread === 'function' ? dependencies.rotateThread : null;
+		this.#rotationTokens = Number.isSafeInteger(dependencies.contextRotationTokens) ? dependencies.contextRotationTokens : 0;
 		if (this.#controlProtocol === 'native_tools') {
 			// Keep the latest observed counter even between turns. An absent baseline
 			// stays unknown; a newly attached session does not imply a zero bill.
@@ -439,6 +464,8 @@ export class SharedCodexAgent {
 				if (this.#active === null && method === 'thread/tokenUsage/updated' && params?.threadId === this.#threadId) {
 					this.#nativeUsageTotal = codexTokenUsage(params?.tokenUsage?.total);
 				}
+				if (method === 'thread/tokenUsage/updated' && params?.threadId === this.#threadId && this.#rotationTokens > 0
+					&& (codexTokenUsage(params?.tokenUsage?.last)?.input ?? 0) >= this.#rotationTokens) this.#rotationDue = true;
 			};
 			this.#transport.on('notification', this.#onNativeNotification);
 		}
@@ -450,6 +477,7 @@ export class SharedCodexAgent {
 	get goalRevision() { return this.#goalRevision; }
 	get planning() { return this.#active !== null; }
 	get sessionGeneration() { return this.#sessionGeneration; }
+	get rotations() { return this.#rotations; }
 	get profileFingerprint() { return profileFingerprint(this.#profile); }
 	get executionSettings() { return structuredClone(this.#executionSettings); }
 	#recordEffectiveSettings(response, turnStarted = true) {
@@ -640,8 +668,11 @@ export class SharedCodexAgent {
 			adopted.collector.replaceOnVerbose(onVerbose);
 			signal?.addEventListener('abort', abortAdopted, { once: true });
 			try {
-				await this.#steerActiveNativeTurn(input, { goalRevision, executeTool });
-				return await adoptedTurn;
+				await this.#steerActiveNativeTurn(input, { goalRevision, executeTool: this.#rememberingTools(executeTool) });
+				const result = await adoptedTurn;
+				this.#turnsSinceRotation += 1;
+				this.#rotateAfterTurn();
+				return result;
 			} catch (error) {
 				throw withNativeTurn(error, adopted.collector.snapshot());
 			} finally {
@@ -651,7 +682,16 @@ export class SharedCodexAgent {
 		if (!prewarm && this.#prewarmPromise !== null) {
 			try { await this.#prewarmPromise; } catch { /* a real event continues cold after a failed or interrupted prewarm */ }
 		}
+		// An event never waits for a thread start: it runs on the current thread and the unfinished rotation is dropped
+		// (a later finished turn tries again).
+		if (this.#rotationPromise !== null) {
+			this.#rotationGeneration += 1;
+			this.#rotationPromise = null;
+		}
 		if (this.#active !== null) throw new CodexProtocolError('TURN_IN_PROGRESS', `Codex agent '${this.agentId}' already has an active turn`);
+		const carryOver = this.#carryOver;
+		const rememberingExecuteTool = this.#rememberingTools(executeTool);
+		let completed = false;
 
 		const silenceDeadline = createProviderSilenceDeadline(this.#planningTimeoutMs, this.#schedule, this.#cancelSchedule);
 		let receivedUsageTotal = false;
@@ -661,7 +701,7 @@ export class SharedCodexAgent {
 			threadId: this.#threadId,
 			agentId: this.agentId,
 			goalRevision,
-			executeTool,
+			executeTool: prewarm ? executeTool : rememberingExecuteTool,
 			onVerbose,
 			observationViews: this.#observationViews,
 			usageStart: this.#nativeUsageTotal,
@@ -704,8 +744,12 @@ export class SharedCodexAgent {
 			void this.interrupt().catch(() => {});
 		};
 		signal?.addEventListener('abort', abort, { once: true });
+		let pendingCarryOver = null;
 		try {
-			const encodedInput = encodeNativeEventInput(input, this.#observationViews);
+			const encodedEvent = encodeNativeEventInput(input, this.#observationViews);
+			pendingCarryOver = prewarm ? null : this.#pendingCarryOver;
+			const encodedInput = pendingCarryOver === null ? encodedEvent : `${pendingCarryOver}\n\n${encodedEvent}`;
+			if (!prewarm) { this.#pendingCarryOver = null; carryOver.noteEvent(input); }
 			collector.recordInput('turn/start', encodedInput);
 			const turnStartPromise = this.#transport.request('turn/start', {
 				threadId: this.#threadId,
@@ -739,6 +783,7 @@ export class SharedCodexAgent {
 			const result = await Promise.race([collector.promise, lifecyclePromise, silenceDeadline.promise]);
 			if (this.#active !== active || this.#goalRevision !== goalRevision || signal?.aborted) throw new CodexProtocolError('STALE_PLAN', 'Codex native turn belongs to an obsolete goal revision');
 			this.#sessionState = 'warm';
+			if (!prewarm) { this.#turnsSinceRotation += 1; completed = true; }
 			return result;
 		} catch (error) {
 			if (['PLANNING_TIMEOUT', 'PROVIDER_SETTINGS_MISMATCH', 'TURN_NOTIFICATION_OVERFLOW', 'TOOL_RESPONSE_DELIVERY_FAILED'].includes(error?.code)) {
@@ -747,6 +792,8 @@ export class SharedCodexAgent {
 				try { await this.interrupt(); } catch {}
 			}
 			this.#observationViews.forgetEventMetadata();
+			// A turn that never started cannot have delivered the carry-over; the next event sends it again.
+			if (pendingCarryOver !== null && active.turnId === null && this.#pendingCarryOver === null) this.#pendingCarryOver = pendingCarryOver;
 			throw withNativeTurn(error, collector.snapshot());
 		} finally {
 			signal?.removeEventListener('abort', abort);
@@ -760,7 +807,52 @@ export class SharedCodexAgent {
 			this.#nativeUsagePreviousEnd = evidence.usage.end;
 			collector.dispose();
 			if (this.#active === active) this.#active = null;
+			// Rotate right after a finished turn, off the next event's critical path.
+			if (completed) this.#rotateAfterTurn();
 		}
+	}
+
+	#rememberingTools(executeTool) {
+		const carryOver = this.#carryOver;
+		return async (request) => {
+			try {
+				const result = await executeTool(request);
+				carryOver.rememberTool(request?.tool, result);
+				return result;
+			} catch (error) {
+				carryOver.rememberTool(request?.tool, null, error);
+				throw error;
+			}
+		};
+	}
+
+	/** Moves to a fresh thread once the context passed the threshold; the next event starts with a short carry-over. */
+	#rotateAfterTurn() {
+		if (!this.#rotationDue || this.#rotateThread === null || this.#turnsSinceRotation < MIN_TURNS_BETWEEN_ROTATIONS) return;
+		if (this.#active !== null || this.#disposed || this.#rotationPromise !== null) return;
+		const carryOver = this.#carryOver.text('Session refreshed to keep context small');
+		const previousThreadId = this.#threadId;
+		const generation = ++this.#rotationGeneration;
+		const rotation = Promise.resolve().then(() => this.#rotateThread()).then((threadId) => {
+			if (this.#disposed || this.#threadId !== previousThreadId || generation !== this.#rotationGeneration || this.#active !== null) {
+				void this.#transport.request('thread/unsubscribe', { threadId }).catch(() => {});
+				return;
+			}
+			this.#threadId = threadId;
+			// The new thread has never seen earlier events, fact views, omitted metadata or usage counters.
+			this.#observationViews.reset();
+			// This service created the thread a moment ago, so its counters start at zero rather than unknown.
+			this.#nativeUsageTotal = { input: 0, output: 0, reasoning: 0, cached: 0, cacheWrite: 0 };
+			this.#nativeUsagePreviousEnd = null;
+			this.#pendingCarryOver = carryOver;
+			this.#rotationDue = false;
+			this.#turnsSinceRotation = 0;
+			this.#rotations += 1;
+			void this.#transport.request('thread/unsubscribe', { threadId: previousThreadId }).catch(() => {});
+		}).catch(() => {
+			// The current thread keeps working; a later finished turn tries again.
+		}).finally(() => { if (this.#rotationPromise === rotation) this.#rotationPromise = null; });
+		this.#rotationPromise = rotation;
 	}
 
 	async steer(input, { goalRevision = this.#goalRevision } = {}) {
@@ -802,6 +894,8 @@ export class SharedCodexAgent {
 		try {
 			const response = await steerPromise;
 			if (response?.turnId !== turnId) throw new CodexProtocolError('INVALID_TURN_STEER', 'turn/steer response did not preserve the active turn');
+			// Steered DMs, decisions and danger summaries are part of what a fresh thread must not lose.
+			this.#carryOver.noteEvent(input);
 			if (executeTool !== null) active.prewarm = false;
 			return response;
 		} catch (error) {
@@ -1358,6 +1452,9 @@ function validateServiceConfig(value, { requireLaunchProfile }) {
 	if (!Number.isSafeInteger(catalogTtlMs) || catalogTtlMs <= 0) throw new TypeError('catalogTtlMs must be a positive safe integer');
 	const startupTimeoutMs = value.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS;
 	if (!Number.isSafeInteger(startupTimeoutMs) || startupTimeoutMs <= 0) throw new TypeError('startupTimeoutMs must be a positive safe integer');
+	// Same default as Claude: a fresh thread past this many context tokens (0 disables).
+	const contextRotationTokens = value.contextRotationTokens ?? DEFAULT_CONTEXT_ROTATION_TOKENS;
+	if (!Number.isSafeInteger(contextRotationTokens) || contextRotationTokens < 0) throw new TypeError('contextRotationTokens must be a nonnegative safe integer');
 	if (requireLaunchProfile && value.launchProfile === undefined) throw new TypeError('Codex service launchProfile is required when no transport is injected');
 	return {
 		...value,
@@ -1365,6 +1462,7 @@ function validateServiceConfig(value, { requireLaunchProfile }) {
 		maxDecisionBytes,
 		catalogTtlMs,
 		startupTimeoutMs,
+		contextRotationTokens,
 		schedule: value.schedule ?? setTimeout,
 		cancelSchedule: value.cancelSchedule ?? clearTimeout,
 	};

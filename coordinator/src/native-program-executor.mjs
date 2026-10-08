@@ -46,7 +46,7 @@ export class NativeProgramExecutor {
 		const run = { record: { ...record }, context, programId, maxActions, timeoutMs, expectedDurationMs, planningLeadMs: planningLeadMs ?? null, actions: 0, actionsSucceeded: 0, actionsFailed: 0, receipts: [], resolve, result,
 			settled: false, bodyPending: false, pendingActionId: null, stopping: null, timer: null, planningDueTimer: null, planningDueNotified: false, planningDueVersion: null, cancellationTimer: null,
 			observation: programObservation(context.observation), eventSequence: context.eventSequence, engine: null,
-			observationIntervalMs, observationTimer: null, refresh: null, refreshGeneration: 0, decision: null, decisionSequence: 0, lastOrdinaryNotificationAt: Number.NEGATIVE_INFINITY, ordinaryNotificationTimer: null, unseenAttention: false };
+			observationIntervalMs, observationTimer: null, refresh: null, refreshGeneration: 0, decision: null, decisionSequence: 0, notifiedDecisionId: null, lastOrdinaryNotificationAt: Number.NEGATIVE_INFINITY, ordinaryNotificationTimer: null, unseenAttention: false };
 		run.engine = new ArenaScriptEngine({
 			dispatch: (command) => { void this.#dispatch(run, command); },
 			cancel: (actionId) => { void this.#cancelBody(run, actionId); },
@@ -118,12 +118,14 @@ export class NativeProgramExecutor {
 			// refreshes facts without starving a model response on every physics tick.
 			if (payload.attention === true && run.decision !== null && run.decisionSequence === decisionSequence) {
 				const priority = payload.priority ?? 'ordinary';
-				// Ordinary sightings while the routine keeps running keep the same decision handle (so an
-				// in-flight respondProgram stays valid) and only refresh its facts; see #notifyDecision.
-				if (this.#deferrableOrdinary(run, priority)) {
-					this.#foldOrdinary(run, run.engine.refreshDirectiveRequest());
+				const request = run.engine.refreshDirectiveRequest();
+				// Only escalation (urgent attention or a changed action failure) needs a new handle. Ordinary sightings keep
+				// the pending decision (so an in-flight respondProgram stays valid) and only refresh its facts.
+				if (priority === 'urgent' || this.#escalates(run, request)) this.#requestDecision(run, request, priority);
+				else {
+					this.#foldOrdinary(run, request);
 					this.#notifyDecision(run, priority);
-				} else this.#requestDecision(run, run.engine.refreshDirectiveRequest(), priority);
+				}
 			}
 			this.#check(run);
 			return true;
@@ -178,6 +180,10 @@ export class NativeProgramExecutor {
 	 */
 	#notifyDecision(run, notificationPriority) {
 		if (run.settled || run.decision === null) return;
+		// A folded sighting on an idle or paused body: the model already holds this handle and answers it with the
+		// newest facts, so it is told once, not once per observation.
+		if (!this.#deferrableOrdinary(run, notificationPriority) && notificationPriority !== 'urgent'
+			&& run.notifiedDecisionId === run.decision.decisionId && run.ordinaryNotificationTimer === null) return;
 		if (this.#deferrableOrdinary(run, notificationPriority)) {
 			const dueAt = run.lastOrdinaryNotificationAt + this.#ordinaryAttentionIntervalMs;
 			const now = this.#now();
@@ -195,15 +201,27 @@ export class NativeProgramExecutor {
 		}
 		this.#clearOrdinaryNotification(run);
 		run.unseenAttention = false;
+		run.notifiedDecisionId = run.decision.decisionId;
 		// The pending request retains its highest urgency, but later ordinary
 		// discoveries must not repeatedly interrupt that same reconsideration.
 		try { run.context.onDecision(this.status(run.record), { priority: notificationPriority }); }
 		catch (error) { this.#return(run, failure(error, 'PROGRAM_NOTIFICATION_FAILED'), true); }
 	}
 
+	/** A new decision handle is owed only for a higher urgency, a changed action failure or a new urgent trigger. */
+	#escalates(run, request) {
+		if (!request) return false;
+		return request.priority !== run.decision.priority
+			|| JSON.stringify(request.actionFailure) !== JSON.stringify(run.decision.actionFailure)
+			|| (request.priority === 'urgent' && request.trigger !== run.decision.trigger);
+	}
+
 	#deferrableOrdinary(run, notificationPriority) {
-		return notificationPriority !== 'urgent' && run.decision?.priority !== 'urgent' && run.decision?.actionFailure === undefined
-			&& run.engine.snapshot().status === 'ACTIVE';
+		if (notificationPriority === 'urgent' || run.decision?.priority === 'urgent' || run.decision?.actionFailure !== undefined) return false;
+		const snapshot = run.engine.snapshot();
+		// Deferring only helps while authored work keeps the body busy. A routine whose source ran out holds the
+		// body until the model answers the pending decision, so that wait must not also sit out the window.
+		return snapshot.status === 'ACTIVE' && (snapshot.activeActionId !== null || snapshot.activeQueryId !== null);
 	}
 
 	/** Newer ordinary attention folded into the pending decision: same handle, latest trigger and facts, not yet seen. */
@@ -383,11 +401,11 @@ export class NativeProgramExecutor {
 			const request = run.engine.refreshDirectiveRequest();
 			// The shared engine coalesces failures behind an outstanding model request.
 			// Publish that changed decision without treating ordinary progress as one.
-			const escalated = request && (request.priority !== run.decision.priority
-				|| JSON.stringify(request.actionFailure) !== JSON.stringify(run.decision.actionFailure));
-			// A different ordinary trigger on a running routine is new facts for the same decision, not a new handle.
-			if (escalated || (request && request.trigger !== run.decision.trigger && !this.#deferrableOrdinary(run, request.priority))) this.#requestDecision(run, request);
+			// A different ordinary trigger is new facts for the same decision, not a new handle.
+			if (this.#escalates(run, request)) this.#requestDecision(run, request);
 			else if (request && request.trigger !== run.decision.trigger) this.#foldOrdinary(run, request);
+			// The body went idle behind a deferred ordinary notification: tell the model now, once.
+			if (run.decision !== null && run.ordinaryNotificationTimer !== null && !this.#deferrableOrdinary(run, run.decision.priority)) this.#notifyDecision(run, run.decision.priority);
 		}
 		const snapshot = run.engine.snapshot();
 		if (run.stopping !== null && !run.bodyPending) this.#finish(run, run.stopping);

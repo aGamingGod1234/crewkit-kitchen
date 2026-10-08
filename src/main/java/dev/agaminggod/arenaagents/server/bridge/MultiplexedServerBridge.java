@@ -2292,6 +2292,11 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			throw new AgentDomainException("STALE_REVISION", "Coordinator action revision is stale");
 		}
 		requireDetachedBodyActionAllowed(manager.server(), record, request);
+		// With no task, a block or item action must target food in the live world (ripe crop, berries, food drop).
+		if (isDetachedBodyAction(record, request)) {
+			dev.agaminggod.arenaagents.server.runtime.DetachedFoodTargets.require(
+					manager.findAgentPlayer(record.agentId()).orElse(null), request.type(), request.arguments());
+		}
 		ActionProvenance provenance = request.provenance();
 		AgentProfile profile = record.profile();
 		if (!profile.provider().equals(provenance.provider()) || !profile.model().equals(provenance.model())
@@ -2331,8 +2336,36 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	static boolean isDetachedBodyAction(AgentRecord record, ServerActionRequest request) {
 		return request.goalRevision() == record.goalRevision()
 				&& dev.agaminggod.arenaagents.agent.AgentLifecycleReducer.isDetachedActionState(record.state())
-				// Only self-preservation; chat keeps its own detached-reply rule (direct or proximity while idle).
-				&& dev.agaminggod.arenaagents.agent.AgentLifecycleReducer.isSelfPreservationAction(request.type());
+				// Only self-preservation, including getting food; chat keeps its own detached-reply rule (direct or
+				// proximity while idle).
+				&& detachedBodyActionAllowed(request);
+	}
+
+	static boolean detachedBodyActionAllowed(ServerActionRequest request) {
+		ActionType type = request.type();
+		// Raw input frames may move, jump and aim, but attacking or using goes through fight_target, attack and
+		// use_item, so a control frame cannot break or place blocks or open containers without a task.
+		if (type == ActionType.CONTROL || type == ActionType.CONTROL_SEQUENCE) return !controlAttacksOrUses(type, request.arguments());
+		// Picking ripe berries is a right-click; the live target is checked in DetachedFoodTargets.
+		if (type == ActionType.INTERACT_BLOCK) return true;
+		return dev.agaminggod.arenaagents.agent.AgentLifecycleReducer.isSelfPreservationAction(type)
+				|| dev.agaminggod.arenaagents.agent.AgentLifecycleReducer.isFoodHarvest(type, expectedBlockId(request.arguments()));
+	}
+
+	private static boolean controlAttacksOrUses(ActionType type, JsonObject arguments) {
+		if (arguments == null) return false;
+		if (type == ActionType.CONTROL) return pressed(arguments, "attack") || pressed(arguments, "use");
+		JsonElement frames = arguments.get("frames");
+		if (frames == null || !frames.isJsonArray()) return false;
+		for (JsonElement frame : frames.getAsJsonArray()) {
+			if (!frame.isJsonObject() || pressed(frame.getAsJsonObject(), "attack") || pressed(frame.getAsJsonObject(), "use")) return true;
+		}
+		return false;
+	}
+
+	private static boolean pressed(JsonObject frame, String field) {
+		JsonElement value = frame.get(field);
+		return value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isBoolean() || value.getAsBoolean();
 	}
 
 	/**
@@ -3216,6 +3249,12 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			throw new BridgeProtocolException("INVALID_TRACE_ID", field + " must be at most 128 UTF-8 bytes");
 		}
 		return value;
+	}
+
+	/** The expected block of a break request when it is a plain string, otherwise null. */
+	private static String expectedBlockId(JsonObject arguments) {
+		JsonElement value = arguments == null ? null : arguments.get("expectedBlockId");
+		return value != null && value.isJsonPrimitive() && value.getAsJsonPrimitive().isString() ? value.getAsString() : null;
 	}
 
 	private static String nullableString(JsonObject object, String field) {

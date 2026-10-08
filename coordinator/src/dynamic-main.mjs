@@ -147,6 +147,8 @@ export class DynamicCoordinator extends EventEmitter {
 	#nativeObservationSignatures = new Map();
 	#perceptionSequences = new Map();
 	#nativeWorldSignals = new Map();
+	// Low-health wakes of agents with no task, one per health level (see lowHealthWake).
+	#healWakes = new Map();
 	#nativeConfirmationWaits = new Map();
 	// Agents that started body work while their finished goal awaits confirmation: their follow-up wakes pass.
 	#confirmationActivity = new Set();
@@ -1510,9 +1512,12 @@ export class DynamicCoordinator extends EventEmitter {
 		const accepted = this.#nativeRuntime.updateObservation(record, observation, { eventSequence: payload.eventSequence, conversation,
 			attention: attention.attention, priority: attention.priority, trigger: attention.trigger, changedFacts: payload.changedFacts });
 		if (!accepted) this.#playerMemory.observe(record, observation);
-		if (attention.priority !== 'urgent' || !NO_TASK_WAKE_TRIGGERS.has(attention.trigger)) return;
 		// An operator's /takeover owns the body: Minecraft reports it, and the model is not woken to act on it.
 		if (observation?.player?.operatorControlled === true) return;
+		if (attention.priority !== 'urgent' || !NO_TASK_WAKE_TRIGGERS.has(attention.trigger)) {
+			this.#considerHealWake(record, observation, lifecycleGeneration, connectionEpoch);
+			return;
+		}
 		this.#nativeRuntimeEpochs.set(record.agentId, connectionEpoch);
 		this.#scheduleNativeTurn(record, {
 			agentId: record.agentId,
@@ -1528,6 +1533,37 @@ export class DynamicCoordinator extends EventEmitter {
 			dangerWake: true,
 			nativeEvent: { event: 'observation', trigger: attention.trigger, observation, conversationOnly: true, dangerWake: true },
 		});
+	}
+
+	/**
+	 * Low health with no task: once per health level, give the model a no-task turn to recover (eat, or get food:
+	 * hunt passive animals, pick up drops, harvest ripe crops or berries). Danger turns come first; this runs when the
+	 * observation was not danger, or after a no-task turn ends. The model decides; it may simply wait.
+	 */
+	#considerHealWake(record, observation, lifecycleGeneration, connectionEpoch) {
+		if (!this.#usesNativeTools(record) || ![DynamicAgentState.IDLE, DynamicAgentState.COMPLETED].includes(record.state)) return false;
+		if (observation === null || observation === undefined || this.#providerWork.has(record.agentId)) return false;
+		const latch = this.#healWakes.get(record.agentId);
+		const verdict = lowHealthWake(observation, latch?.goalRevision === record.goalRevision ? latch.health : null);
+		if (verdict.health === null) this.#healWakes.delete(record.agentId);
+		else this.#healWakes.set(record.agentId, { goalRevision: record.goalRevision, health: verdict.health });
+		if (!verdict.wake) return false;
+		this.#nativeRuntimeEpochs.set(record.agentId, connectionEpoch);
+		this.#writeTrace('native_heal_wake', { agentId: record.agentId, goalRevision: record.goalRevision, health: observation.player.health, foodLevel: observation.player.foodLevel ?? null });
+		this.#scheduleNativeTurn(record, {
+			agentId: record.agentId,
+			goalRevision: record.goalRevision,
+			observation,
+			priority: 'ordinary',
+			trigger: 'low_health_idle',
+			lifecycleGeneration,
+			connectionEpoch,
+			preserveState: true,
+			conversationOnly: true,
+			selfCareWake: true,
+			nativeEvent: { event: 'observation', trigger: 'low_health_idle', observation, conversationOnly: true, selfCareWake: true, healing: healingFacts(observation) },
+		});
+		return true;
 	}
 
 	#scheduleNativeConversation(record, event, trigger) {
@@ -1890,10 +1926,10 @@ export class DynamicCoordinator extends EventEmitter {
 			if (work.taskAdopted !== undefined) return { ...work.taskAdopted, executed: false };
 			// Player requests go through takeTask, which binds the requester and Minecraft's permission checks. Only a
 			// turn woken by danger may defend the body without a task, and only with self-preservation tools.
-			const dangerWoken = work.request.dangerWake === true || work.dangerWoken === true;
+			const dangerWoken = work.request.dangerWake === true || work.dangerWoken === true || work.request.selfCareWake === true;
 			if (!dangerWoken || record.state === DynamicAgentState.PAUSED || !isSelfPreservationTool(toolRequest.tool)) {
 				throw Object.assign(new Error(dangerWoken && record.state !== DynamicAgentState.PAUSED
-					? 'With no task you may only defend yourself: fight_target, flee_from, attack, use_ranged, block_with_shield, use_item (eat, drink, totem), select/equip items, navigate or move away, look, control, wait. Anything else is a player request: call takeTask.'
+					? 'With no task you may only look after yourself: fight_target, flee_from, attack, use_ranged, block_with_shield, use_item (eat, drink, totem), select/equip items, pick up food, mine grown crops or melons, interact with ripe berries, navigate or move away, look, control without attack/use, wait. Anything else is a player request: call takeTask.'
 					: 'You have no active task yet. If the player asked you to do something, call takeTask first and end this turn; otherwise reply with say.'), { code: 'CONVERSATION_ONLY' });
 			}
 		}
@@ -2073,7 +2109,7 @@ export class DynamicCoordinator extends EventEmitter {
 		if (this.#reschedulePendingNativeTurn(pending)) return result;
 		if (work.request.nativeConversationDelivery?.omittedEntries > 0
 			&& this.#reschedulePendingNativeTurn({ ...work.request, conversationRetry: false })) return result;
-		if (work.request.conversationOnly === true && work.request.dangerWake !== true && !work.successfulChat
+		if (work.request.conversationOnly === true && work.request.dangerWake !== true && work.request.selfCareWake !== true && !work.successfulChat
 				&& work.request.conversationRetry !== true && record !== null) {
 			this.#scheduleNativeTurn(record, {
 				...work.request,
@@ -2083,6 +2119,10 @@ export class DynamicCoordinator extends EventEmitter {
 			});
 			return result;
 		}
+		// A no-task turn (often a danger turn) ended: if the body is still low, the model may now recover.
+		if (work.request.conversationOnly === true && record !== null && record.goalRevision === work.goalRevision
+				&& this.#isConnectionEpochCurrent(work.connectionEpoch)
+				&& this.#considerHealWake(record, this.#nativeRuntime.snapshotLive(work.agentId)?.observation ?? null, work.lifecycleGeneration, work.connectionEpoch)) return result;
 		const awaitingConfirmation = record !== null && this.#awaitingNativeConfirmation(record, work.lifecycleGeneration);
 		if (awaitingConfirmation) this.#goalSupervisor.terminate(work.supervisionKey);
 		// A turn that started no body work while waiting returns the goal to plain waiting (no redo wakes).
@@ -4793,10 +4833,22 @@ function mergeAttentionTrigger(previous, next) {
 	};
 }
 
-function mergePlannerRequest(previous, next) {
+export function mergePlannerRequest(previous, next) {
 	if (previous === null || previous === undefined) return next;
 	const priority = previous.priority === 'urgent' || next.priority === 'urgent' ? 'urgent' : 'ordinary';
 	const winner = next.priority === priority ? next : previous;
+	// A program that ended (or asked for a decision) while the model was still in a turn must not be replaced by the
+	// plain observation that followed: the model would wake without the program's result and have to ask for it.
+	const programEvent = previous.nativeEvent?.event;
+	if (['program_ended', 'program_attention', 'program_handoff_rejected'].includes(programEvent) && next.nativeEvent?.event === 'observation'
+			&& next.nativeEvent.conversationOnly !== true && previous.goalRevision === next.goalRevision) {
+		const { programId, status, result } = previous.nativeEvent;
+		const program = { ...(programId === undefined ? {} : { programId }), ...(status === undefined ? {} : { status }), ...(result === undefined ? {} : { result }) };
+		// Danger leads the wake (its own event and trigger) but still carries the program's result or decision handle.
+		if (next.priority === 'urgent') return { ...next, priority, trigger: winner.trigger, nativeEvent: { ...next.nativeEvent, ...program } };
+		return { ...next, priority, trigger: winner.trigger, nativeEvent: { ...previous.nativeEvent, observation: next.nativeEvent.observation ?? previous.nativeEvent.observation,
+			...(next.eventSequence === undefined ? {} : { eventSequence: next.eventSequence }) } };
+	}
 	return { ...next, priority, trigger: winner.trigger };
 }
 
@@ -4827,7 +4879,7 @@ function sameSupervisionKey(left, right) {
 		&& left?.profileFingerprint === right?.profileFingerprint;
 }
 
-export function buildNativeEventInput(record, { event, trigger, programId, status, result, planningLeadMs, eventSequence, taskMemory = null, dangerSummary = null, observation = {}, conversation = { mode: 'unread', baseSequence: -1, nextSequence: -1, entries: [] }, conversationOnly = false, awaitingConfirmation = false, dangerWake = false } = {}) {
+export function buildNativeEventInput(record, { event, trigger, programId, status, result, planningLeadMs, eventSequence, taskMemory = null, dangerSummary = null, observation = {}, conversation = { mode: 'unread', baseSequence: -1, nextSequence: -1, entries: [] }, conversationOnly = false, awaitingConfirmation = false, dangerWake = false, selfCareWake = false, healing = null } = {}) {
 	const eventName = typeof event === 'string' && event.length > 0 ? event : event?.event;
 	const normalizedEvent = typeof eventName === 'string' && eventName.length > 0 ? eventName : 'observation';
 	const eventPlanningLeadMs = status?.planningLeadMs ?? planningLeadMs ?? event?.planningLeadMs;
@@ -4909,6 +4961,7 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 		...(eventSequence === undefined ? {} : { eventSequence }),
 		// Repeated hits folded since the last update, so one steer carries what several used to.
 		...(dangerSummary === null || dangerSummary === undefined ? {} : { dangerSinceLastUpdate: dangerSummary }),
+		...(healing === null || healing === undefined ? {} : { healing }),
 		observation: isPlanningDue ? compactPlanningDueObservation(compactObservation) : compactObservation,
 		conversation: unreadConversation,
 		...(programId === undefined ? {} : { program: { programId,
@@ -4953,6 +5006,8 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 	const dangerPaused = !isPlanningDue && status?.engineState === 'SUSPENDED' && DANGER_PAUSE_TRIGGERS.has(status?.decision?.trigger);
 	const instruction = conversationOnly === true && dangerWake === true
 		? NO_TASK_DANGER_INSTRUCTION
+		: conversationOnly === true && selfCareWake === true
+		? NO_TASK_HEAL_INSTRUCTION
 		: conversationOnly === true
 		? 'Player conversation. You have no active task. If a message asks you to do something, call takeTask (it defaults to the sender\'s words; use resume:true to continue a paused task), then end this turn; your task turn starts at once with every tool. Otherwise reply with say.'
 		: isPlanningDue
@@ -4973,12 +5028,86 @@ const NO_TASK_WAKE_TRIGGERS = new Set(['damage', 'threat', 'lava', 'fire', 'suff
 const SELF_PRESERVATION_ACTIONS = new Set(['fight_target', 'flee_from', 'attack', 'use_ranged', 'block_with_shield', 'use_item',
 	'select_item', 'select_tool', 'equip_item', 'navigate_to', 'move_to', 'look_at', 'control', 'control_sequence', 'wait', 'dismount', 'wake_up']);
 const SELF_PRESERVATION_READ_TOOLS = new Set(['observe', 'inspect', 'capabilities', 'action_status', 'cancel_action', 'lookAround']);
+// Getting food is self-preservation too: picking up drops, and breaking only blocks that are food (Minecraft checks the
+// block really is the expected one before breaking it, so these ids bound what a no-task agent can break).
+// Minecraft also checks the live target: crops fully grown, berries ripe, a picked-up stack edible.
+export const FOOD_PLANT_BLOCKS = Object.freeze(['minecraft:wheat', 'minecraft:carrots', 'minecraft:potatoes', 'minecraft:beetroots', 'minecraft:melon']);
+// Berries are picked by right-click, as in vanilla.
+export const FOOD_BERRY_BLOCKS = Object.freeze(['minecraft:sweet_berry_bush', 'minecraft:cave_vines', 'minecraft:cave_vines_plant']);
+const releasedInput = (frame) => frame?.attack === false && frame?.use === false;
+function isSelfPreservationAction(action) {
+	// Raw input may move and aim, but attack/use (which could break, place or open anything) goes through
+	// fight_target, attack and use_item.
+	if (action?.actionType === 'control') return releasedInput(action.arguments);
+	if (action?.actionType === 'control_sequence') return Array.isArray(action.arguments?.frames) && action.arguments.frames.every(releasedInput);
+	if (SELF_PRESERVATION_ACTIONS.has(action?.actionType) || ['pick_up_item', 'interact_block'].includes(action?.actionType)) return true;
+	return action?.actionType === 'break_block' && FOOD_PLANT_BLOCKS.includes(action.arguments?.expectedBlockId);
+}
 export function isSelfPreservationTool(tool) {
 	if (SELF_PRESERVATION_READ_TOOLS.has(tool?.kind)) return true;
-	if (['action', 'start_action', 'replace_action'].includes(tool?.kind)) return SELF_PRESERVATION_ACTIONS.has(tool.actionType);
-	if (tool?.kind === 'sequence') return Array.isArray(tool.actions) && tool.actions.every((action) => SELF_PRESERVATION_ACTIONS.has(action?.actionType));
+	if (['action', 'start_action', 'replace_action'].includes(tool?.kind)) return isSelfPreservationAction(tool);
+	if (tool?.kind === 'sequence') return Array.isArray(tool.actions) && tool.actions.every((action) => isSelfPreservationAction(action));
 	return false;
 }
+
+// Passive animals that drop food, and dropped items worth picking up to eat.
+const FOOD_ANIMALS = new Set(['minecraft:cow', 'minecraft:mooshroom', 'minecraft:pig', 'minecraft:sheep', 'minecraft:chicken', 'minecraft:rabbit',
+	'minecraft:cod', 'minecraft:salmon', 'minecraft:hoglin']);
+const FOOD_ITEM = /^minecraft:(?:cooked_)?(?:beef|porkchop|mutton|chicken|rabbit|cod|salmon)$|^minecraft:(?:apple|golden_apple|enchanted_golden_apple|bread|carrot|golden_carrot|potato|baked_potato|beetroot|melon_slice|sweet_berries|glow_berries|cookie|pumpkin_pie|mushroom_stew|rabbit_stew|beetroot_soup|dried_kelp)$/;
+const RIPE_AGE = { 'minecraft:wheat': 7, 'minecraft:carrots': 7, 'minecraft:potatoes': 7, 'minecraft:beetroots': 3, 'minecraft:sweet_berry_bush': 2 };
+const LOW_HEALTH_FRACTION = 0.5;
+const LOW_HEALTH_POINTS = 6;
+const RECOVERED_FRACTION = 0.7;
+// Starving on Hard drains one point at a time; only a real further drop wakes again.
+const FURTHER_DROP_POINTS = 2;
+const REGENERATING_FOOD_LEVEL = 18;
+
+/**
+ * Whether low health should wake an agent with no task, and the health level to remember. One wake per level: it
+ * rearms only after the agent recovers to 70% or loses 2+ more health. Takeover, creative/spectator and death never
+ * wake, nor does a body that is already regenerating (food bar 18+) with no food carried or in view to add.
+ * `health: null` clears the memory.
+ */
+export function lowHealthWake(observation, wokenAtHealth = null) {
+	const player = observation?.player;
+	const health = Number.isFinite(player?.health) ? player.health : null;
+	if (health === null || player.dead === true || health <= 0) return { wake: false, health: wokenAtHealth };
+	const maxHealth = Number.isFinite(player.maxHealth) && player.maxHealth > 0 ? player.maxHealth : 20;
+	if (health >= maxHealth * RECOVERED_FRACTION) return { wake: false, health: null };
+	const low = health <= Math.max(LOW_HEALTH_POINTS, maxHealth * LOW_HEALTH_FRACTION);
+	if (!low || player.operatorControlled === true || ['creative', 'spectator'].includes(player.gameMode)) return { wake: false, health: wokenAtHealth };
+	if (wokenAtHealth !== null && health > wokenAtHealth - FURTHER_DROP_POINTS) return { wake: false, health: wokenAtHealth };
+	const facts = healingFacts(observation);
+	const nothingToEat = facts.bestFood === null && Object.values(facts.foodSources).every((rows) => rows.length === 0);
+	if (nothingToEat && Number.isFinite(player.foodLevel) && player.foodLevel >= REGENERATING_FOOD_LEVEL) return { wake: false, health: wokenAtHealth };
+	return { wake: true, health };
+}
+
+/** The facts a no-task low-health turn needs: health, hunger, carried food and the nearest food sources in view. */
+export function healingFacts(observation) {
+	const player = observation?.player ?? {};
+	const list = (value) => (Array.isArray(value) ? value : []);
+	const at = (row) => (['x', 'y', 'z'].every((axis) => Number.isFinite(row?.[axis]) && Number.isFinite(player[axis]))
+		? Math.round(Math.hypot(row.x - player.x, row.y - player.y, row.z - player.z) * 10) / 10 : null);
+	const nearest = (rows, limit) => rows.map(({ source, ...row }) => ({ ...row, distance: Number.isFinite(source?.distance) ? source.distance : at(source) }))
+		.sort((left, right) => (left.distance ?? Infinity) - (right.distance ?? Infinity)).slice(0, limit);
+	const animals = list(observation?.entities).filter((entity) => FOOD_ANIMALS.has(entity?.type) && entity.alive !== false)
+		.map((entity) => ({ stableId: entity.stableId, type: entity.type, source: entity }));
+	const plants = list(observation?.blocks).filter((block) => FOOD_PLANT_BLOCKS.includes(block?.blockId) || FOOD_BERRY_BLOCKS.includes(block?.blockId)).map((block) => {
+		const age = Number(block.state?.age);
+		const ripe = block.blockId in RIPE_AGE ? (Number.isFinite(age) ? age >= RIPE_AGE[block.blockId] : null)
+			: block.blockId.startsWith('minecraft:cave_vines') ? (block.state?.berries === undefined ? null : String(block.state.berries) === 'true') : true;
+		return { x: block.x, y: block.y, z: block.z, blockId: block.blockId, harvest: FOOD_BERRY_BLOCKS.includes(block.blockId) ? 'interact' : 'mine', ...(ripe === null ? {} : { ripe }), source: block };
+	});
+	const drops = list(observation?.items).filter((item) => FOOD_ITEM.test(item?.itemId ?? ''))
+		.map((item) => ({ stableId: item.stableId, itemId: item.itemId, count: item.count, source: item }));
+	return {
+		health: player.health ?? null, maxHealth: player.maxHealth ?? 20, foodLevel: player.foodLevel ?? null, saturation: player.saturation ?? null,
+		bestFood: player.bestFood ?? null, safe: player.safe ?? null, threats: list(player.threats).length,
+		foodSources: { animals: nearest(animals, 4), plants: nearest(plants, 4), drops: nearest(drops, 4) },
+	};
+}
+export const NO_TASK_HEAL_INSTRUCTION = 'Live Minecraft event: low health. You have no active task; any finished task stays finished, so do not redo it. You may recover now if you choose: eat carried food (useItem), or get food first from healing.foodSources (fight_target a passive animal and pickUpItem the drop; mine fully grown crops or melon; interact with ripe berry bushes or glow berry vines), then eat. A full food bar regenerates health. Other work is a player request and needs takeTask.';
 export const NO_TASK_DANGER_INSTRUCTION = 'Live Minecraft event: danger. You have no active task; any finished task stays finished, so do not redo it. Defend yourself now: fight_target, flee_from, eat or drink, shield or totem, equip armor and weapons, move away. Other work is a player request and needs takeTask.';
 // Waiting for the operator only means "do not redo the finished work or re-run finish"; it never blocks new requests.
 export const AWAITING_CONFIRMATION_EVENT_INSTRUCTION = 'Live Minecraft event. Your finished goal awaits operator confirmation: do not redo it or re-run finish. Waiting never blocks new requests: act on player messages now with any tool, as part of your task, then call finish again when done.';
