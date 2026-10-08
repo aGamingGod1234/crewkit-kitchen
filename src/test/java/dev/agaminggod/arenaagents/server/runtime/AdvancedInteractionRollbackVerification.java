@@ -90,9 +90,11 @@ public final class AdvancedInteractionRollbackVerification {
 			verifyNativePickaxeTransaction(components);
 			verifyCraftDeath(components);
 			verifyHorizontalFacingPlacement(components);
+			verifyPacedFurnaceTransaction(components);
+			verifyPacedToolSelection(components);
 			if (failure != null) throw failure;
 		}
-		return 112;
+		return 131;
 	}
 
 	/** Tick a table pickaxe craft until both planks cells are filled and one plank is still on the cursor. */
@@ -353,6 +355,10 @@ public final class AdvancedInteractionRollbackVerification {
 		private FixtureGameMode(ServerPlayer player) { super(player); }
 		@Override public net.minecraft.world.InteractionResult useItemOn(ServerPlayer player, net.minecraft.world.level.Level level,
 				ItemStack stack, net.minecraft.world.InteractionHand hand, net.minecraft.world.phys.BlockHitResult hit) {
+			if (player instanceof FaultingServerPlayer fixture && fixture.furnace) {
+				player.containerMenu = new net.minecraft.world.inventory.FurnaceMenu(2, player.getInventory());
+				return net.minecraft.world.InteractionResult.SUCCESS;
+			}
 			player.containerMenu = new net.minecraft.world.inventory.CraftingMenu(1, player.getInventory(),
 					net.minecraft.world.inventory.ContainerLevelAccess.create(level, hit.getBlockPos()));
 			return net.minecraft.world.InteractionResult.SUCCESS;
@@ -550,7 +556,7 @@ public final class AdvancedInteractionRollbackVerification {
 		);
 		ServerActionRequest request = request(ActionType.SELECT_TOOL, arguments);
 		ServerTransactionAdapter.ActiveTransaction transaction = service().begin(fixture.player(), request, arguments);
-		ServerTransactionAdapter.TickResult result = transaction.tick(System.currentTimeMillis());
+		ServerTransactionAdapter.TickResult result = tickUntilTerminal(transaction);
 
 		assertEquals(ServerTransactionAdapter.TickState.FAILED, result.state(), "selection verification fails");
 		assertEquals("SELECTION_NOT_CONFIRMED", result.reasonCode(), "selection failure reason is preserved");
@@ -558,6 +564,120 @@ public final class AdvancedInteractionRollbackVerification {
 				"failed selection restores the source tool");
 		assertTrue(fixture.inventory().getItem(0).isEmpty(), "failed selection clears the destination hotbar slot");
 		assertEquals(2, fixture.inventory().getSelectedSlot(), "failed selection restores the previous selected slot");
+	}
+
+	private static ServerTransactionAdapter.TickResult tickUntilTerminal(ServerTransactionAdapter.ActiveTransaction transaction) {
+		for (int tick = 0; tick < 200; tick++) {
+			ServerTransactionAdapter.TickResult result = transaction.tick(System.currentTimeMillis());
+			if (result.terminal()) return result;
+		}
+		throw new AssertionError("transaction did not finish within 200 ticks");
+	}
+
+	/**
+	 * Real vanilla FurnaceMenu: the play-test furnace_transaction opened the menu, moved the stack and closed it in
+	 * one tick, so spectators saw items appear in the furnace with no screen. Now the screen is shown, the stack
+	 * moves while it is open, and the screen stays a moment before closing.
+	 */
+	private static void verifyPacedFurnaceTransaction(ComponentBindings components) {
+		Fixture fixture = craftFixture();
+		fixture.player().furnace = true;
+		fixture.inventory().setItem(0, components.stack(Items.RAW_IRON, 4, 0));
+		var args = json("x", 0, "y", 64, "z", 0, "operation", "insert_input", "inventorySlot", 0,
+				"count", 4, "expectedItemId", "minecraft:raw_iron", "timeoutMs", 5000);
+		var transaction = service().begin(fixture.player(), request(ActionType.FURNACE_TRANSACTION, args), args);
+		assertEquals(ServerTransactionAdapter.TickState.RUNNING, transaction.tick(System.currentTimeMillis()).state(),
+				"the furnace opens on the first tick without finishing");
+		assertTrue(fixture.player().containerMenu instanceof net.minecraft.world.inventory.FurnaceMenu,
+				"the real vanilla furnace menu is the open screen");
+		var furnace = fixture.player().containerMenu;
+		assertEquals(1, fixture.player().swings, "opening the furnace swings the arm");
+		assertTrue(!furnace.getSlot(0).hasItem(), "nothing moves on the opening tick");
+		int ticks = 1;
+		int openTicksBeforeMove = 1;
+		int openTicksAfterMove = 0;
+		ServerTransactionAdapter.TickResult result;
+		do {
+			result = transaction.tick(System.currentTimeMillis());
+			ticks++;
+			boolean open = fixture.player().containerMenu == furnace;
+			if (!result.terminal()) assertTrue(open, "the furnace stays open while the move is shown");
+			if (open && !furnace.getSlot(0).hasItem()) openTicksBeforeMove++;
+			if (open && furnace.getSlot(0).hasItem() && !result.terminal()) openTicksAfterMove++;
+		} while (!result.terminal() && ticks < 200);
+		assertEquals("TRANSACTION_CONFIRMED", result.reasonCode(), "the paced furnace move succeeds: " + result.message());
+		assertTrue(openTicksBeforeMove >= 3, "the empty furnace screen is shown before the move for " + openTicksBeforeMove + " ticks");
+		assertTrue(openTicksAfterMove >= 2, "the filled furnace screen is shown after the move for " + openTicksAfterMove + " ticks");
+		assertTrue(ticks >= 6 && ticks <= 12, "the furnace move is watchable but quick, took " + ticks + " ticks");
+		assertEquals(4, furnace.getSlot(0).getItem().getCount(), "all four raw iron are in the input slot");
+		transaction.cleanup();
+		assertTrue(fixture.player().containerMenu == fixture.player().inventoryMenu, "cleanup closes the furnace");
+		assertEquals(0, count(fixture, Items.RAW_IRON), "the raw iron left the inventory exactly once");
+		assertEquals(result, transaction.tick(System.currentTimeMillis()), "terminal furnace retry is stable");
+
+		Fixture interrupted = craftFixture();
+		interrupted.player().furnace = true;
+		interrupted.inventory().setItem(0, components.stack(Items.RAW_IRON, 4, 0));
+		var closing = service().begin(interrupted.player(), request(ActionType.FURNACE_TRANSACTION, args), args);
+		closing.tick(System.currentTimeMillis());
+		interrupted.player().closeContainer();
+		var closed = tickUntilTerminal(closing);
+		closing.cleanup();
+		assertEquals("MENU_CLOSED", closed.reasonCode(), "a furnace closed before the move fails without moving");
+		assertEquals(4, count(interrupted, Items.RAW_IRON), "the raw iron stays in the inventory");
+	}
+
+	/** select_tool moving a tool from the main inventory shows the inventory screen around the move. */
+	private static void verifyPacedToolSelection(ComponentBindings components) {
+		Fixture fixture = withPlayerHand(fixture());
+		fixture.inventory().setItem(9, components.stack(Items.IRON_PICKAXE, 1, 250));
+		JsonObject arguments = json("sourceSlot", 9, "hotbarSlot", 0,
+				"expectedItemId", "minecraft:iron_pickaxe", "minRemainingDurability", 1);
+		var transaction = service().begin(fixture.player(), request(ActionType.SELECT_TOOL, arguments), arguments);
+		assertEquals(ServerTransactionAdapter.TickState.RUNNING, transaction.tick(System.currentTimeMillis()).state(),
+				"the inventory opens before the tool moves");
+		assertTrue(AgentInventoryView.isOpen(fixture.player()), "spectators see the inventory screen");
+		assertTrue(fixture.inventory().getItem(0).isEmpty(), "the tool is not in the hand on the opening tick");
+		boolean movedWhileOpen = false;
+		ServerTransactionAdapter.TickResult result;
+		int ticks = 1;
+		do {
+			result = transaction.tick(System.currentTimeMillis());
+			ticks++;
+			if (!result.terminal() && !fixture.inventory().getItem(0).isEmpty()) {
+				movedWhileOpen |= AgentInventoryView.isOpen(fixture.player());
+			}
+		} while (!result.terminal() && ticks < 200);
+		assertEquals("TOOL_SELECTED", result.reasonCode(), "the paced tool selection succeeds: " + result.message());
+		assertTrue(movedWhileOpen, "the pickaxe moves to the hotbar while the inventory screen is shown");
+		assertTrue(ticks >= 6, "the move is paced over " + ticks + " ticks");
+		transaction.cleanup();
+		assertTrue(!AgentInventoryView.isOpen(fixture.player()), "the inventory screen closes after the move");
+		assertEquals("minecraft:iron_pickaxe", itemId(fixture.inventory().getItem(0)), "the pickaxe is in hotbar slot 0");
+		assertEquals(0, fixture.inventory().getSelectedSlot(), "and it is selected");
+
+		Fixture onHotbar = withPlayerHand(fixture());
+		onHotbar.inventory().setItem(2, components.stack(Items.IRON_PICKAXE, 1, 250));
+		JsonObject select = json("sourceSlot", 2, "hotbarSlot", 2,
+				"expectedItemId", "minecraft:iron_pickaxe", "minRemainingDurability", 1);
+		var keyPress = service().begin(onHotbar.player(), request(ActionType.SELECT_TOOL, select), select);
+		assertEquals("TOOL_SELECTED", keyPress.tick(System.currentTimeMillis()).reasonCode(),
+				"a tool already on the hotbar is one number key, no screen");
+		assertTrue(!AgentInventoryView.isOpen(onHotbar.player()), "no inventory screen for a number key");
+		keyPress.cleanup();
+	}
+
+	/** Real player equipment, whose main hand is the selected hotbar slot (the plain fixture keeps it separate). */
+	private static Fixture withPlayerHand(Fixture fixture) {
+		try {
+			Field unsafeField = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+			unsafeField.setAccessible(true);
+			setField((sun.misc.Unsafe) unsafeField.get(null), fixture.player(), LivingEntity.class, "equipment",
+					new net.minecraft.world.entity.player.PlayerEquipment(fixture.player()));
+			return fixture;
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError(exception);
+		}
 	}
 
 	private static void verifyDropExceptionRollback(ComponentBindings components) {
@@ -688,6 +808,8 @@ public final class AdvancedInteractionRollbackVerification {
 		private int swings;
 		private boolean dead;
 		private boolean recordDrops;
+		/** The fixture block opens a vanilla furnace menu instead of a crafting table. */
+		private boolean furnace;
 		private java.util.List<ItemStack> dropped; // allocated lazily: fixtures skip constructors
 
 		private FaultingServerPlayer(

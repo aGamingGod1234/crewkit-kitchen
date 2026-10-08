@@ -99,6 +99,8 @@ public final class ServerActionExecutor {
 	private static final long DEFAULT_TIMEOUT_MS = 60_000L;
 	private static final long MOVEMENT_STALL_TIMEOUT_MS = 4_000L;
 	private static final long PLACE_TIMEOUT_MS = 5_000L;
+	/** A 180 degree turn takes about 6 ticks; past this something is fighting the view and the frame starts anyway. */
+	static final int MAX_CONTROL_TURN_TICKS = 20;
 	private static final double PROGRESS_EMISSION_DELTA = 0.05D;
 	private static final long PROGRESS_HEARTBEAT_MS = 1_000L;
 	static final int MAX_CLEANUP_ATTEMPTS = 8;
@@ -590,7 +592,8 @@ public final class ServerActionExecutor {
 							integer(arguments, "selectedSlot"),
 							hand(arguments)
 					),
-					integer(arguments, "ticks")
+					integer(arguments, "ticks"),
+					ControlSequence.instantLook(arguments)
 			);
 			case CONTROL_SEQUENCE -> ActiveAction.controlSequence(request, player, ControlSequence.parse(arguments));
 			case MOVE_TO, NAVIGATE_TO -> ActiveAction.controller(
@@ -610,7 +613,9 @@ public final class ServerActionExecutor {
 					number(arguments, "y"),
 					number(arguments, "z")
 			)));
-			case ATTACK -> ActiveAction.immediate(request, player,
+			// Aim like a player first (eased turn, settled look), then the vanilla hit.
+			case ATTACK -> ActiveAction.aimed(request, player,
+					() -> attackAimPoint(resolveExactObservedTarget(player, string(arguments, "targetId"))),
 					() -> attack(player, string(arguments, "targetId")));
 			// Persistent model-chosen combat: the model decides to fight or flee, the controller makes it effective.
 			case FIGHT_TARGET -> ActiveAction.controller(request, player, new ServerFightController(
@@ -632,14 +637,20 @@ public final class ServerActionExecutor {
 			case USE_ITEM -> ActiveAction.use(request, player, integer(arguments, "durationMs"),
 					nullableString(arguments, "hand") != null ? hand(arguments) : InteractionHand.MAIN_HAND,
 					nullableString(arguments, "expectedItemId"), "once".equals(nullableString(arguments, "mode")));
-			case INTERACT_BLOCK -> ActiveAction.immediate(request, player, () -> interactBlock(
+			case INTERACT_BLOCK -> ActiveAction.aimed(request, player, () -> {
+				BlockPos position = blockPosition(arguments);
+				return blockInteractionHitLocation(position, Direction.byName(string(arguments, "face")), arguments,
+						player.level().getBlockState(position).getShape(player.level(), position, CollisionContext.of(player)));
+			}, () -> interactBlock(
 					player,
 					blockPosition(arguments),
 					Direction.byName(string(arguments, "face")),
 					hand(arguments),
 					string(arguments, "expectedItemId"), arguments
 			));
-			case INTERACT_ENTITY -> ActiveAction.immediate(request, player, () -> interactEntity(
+			case INTERACT_ENTITY -> ActiveAction.aimed(request, player,
+					() -> entityInteractionAimPoint(resolveExactObservedTarget(player, string(arguments, "targetId")), arguments),
+					() -> interactEntity(
 					player,
 					string(arguments, "targetId"),
 					hand(arguments),
@@ -744,7 +755,8 @@ public final class ServerActionExecutor {
 						player,
 						advancedInteractions.begin(player, request, arguments)
 				);
-				if (request.type() == ActionType.CRAFT_TABLE) {
+				if (request.type() == ActionType.CRAFT_TABLE || request.type() == ActionType.FURNACE_TRANSACTION
+						|| request.type() == ActionType.TRANSFER_CONTAINER) {
 					action.transactionAimTarget = Vec3.atCenterOf(blockPosition(arguments));
 				}
 				yield action;
@@ -1049,8 +1061,7 @@ public final class ServerActionExecutor {
 		if (!player.isWithinAttackRange(player.getMainHandItem(), target.getBoundingBox(), 0.0D)) {
 			throw new AgentDomainException("TARGET_TOO_FAR", "Attack target is out of reach");
 		}
-		Vec3 aimPoint = target instanceof net.minecraft.world.entity.boss.enderdragon.EnderDragonPart
-				? target.getBoundingBox().getCenter() : target.getEyePosition();
+		Vec3 aimPoint = attackAimPoint(target);
 		player.lookAt(net.minecraft.commands.arguments.EntityAnchorArgument.Anchor.EYES, aimPoint);
 		HitResult hit = Tracer.rayTrace(player, 1.0F,
 				Math.max(player.entityInteractionRange(), player.getEyePosition().distanceTo(aimPoint) + 0.1D), false);
@@ -1059,6 +1070,17 @@ public final class ServerActionExecutor {
 		}
 		player.attack(target);
 		player.swing(net.minecraft.world.InteractionHand.MAIN_HAND);
+	}
+
+	private static Vec3 attackAimPoint(Entity target) {
+		return target instanceof net.minecraft.world.entity.boss.enderdragon.EnderDragonPart
+				? target.getBoundingBox().getCenter() : target.getEyePosition();
+	}
+
+	private static Vec3 entityInteractionAimPoint(Entity target, JsonObject arguments) {
+		return arguments.has("hitX") && !arguments.get("hitX").isJsonNull() ? target.position().add(
+				number(arguments, "hitX"), number(arguments, "hitY"), number(arguments, "hitZ")
+		) : target.getBoundingBox().getCenter();
 	}
 
 	private net.minecraft.world.entity.LivingEntity combatTarget(ServerPlayer player, String targetId) {
@@ -1591,9 +1613,7 @@ public final class ServerActionExecutor {
 			throw new AgentDomainException("PROTECTION_DENIED", "Entity interaction was denied");
 		}
 		requireHeldItem(player.getItemInHand(hand), expectedItemId);
-		Vec3 requestedHit = arguments.has("hitX") && !arguments.get("hitX").isJsonNull() ? target.position().add(
-				number(arguments, "hitX"), number(arguments, "hitY"), number(arguments, "hitZ")
-		) : target.getBoundingBox().getCenter();
+		Vec3 requestedHit = entityInteractionAimPoint(target, arguments);
 		if (!target.getBoundingBox().inflate(0.001D).contains(requestedHit)) {
 			throw new AgentDomainException("INVALID_HIT", "Entity hit must be inside the observed entity bounds");
 		}
@@ -1667,7 +1687,7 @@ public final class ServerActionExecutor {
 	}
 
 	private static final class ActiveAction {
-		private enum Mode { IMMEDIATE, CONTROL, CONTROL_SEQUENCE, MOVE, USE, BREAK, PLACE, WAIT, CONTROLLER, TRANSACTION }
+		private enum Mode { IMMEDIATE, AIMED, CONTROL, CONTROL_SEQUENCE, MOVE, USE, BREAK, PLACE, WAIT, CONTROLLER, TRANSACTION }
 
 		private final ServerActionRequest request;
 		private final ServerPlayer player;
@@ -1696,6 +1716,7 @@ public final class ServerActionExecutor {
 		private final AimGate aimGate = new AimGate();
 		private long aimReadyElapsedMs = -1L;
 		private Vec3 transactionAimTarget;
+		private java.util.function.Supplier<Vec3> immediateAimTarget;
 		private boolean breakInputIssued;
 		private boolean breakObservedInCarpet;
 		private BlockBreakReceipt breakReceiptBaseline;
@@ -1708,6 +1729,11 @@ public final class ServerActionExecutor {
 		private AgentInputState controlState;
 		private int controlDurationTicks;
 		private int controlElapsedTicks;
+		/** The model asked for its view at once; otherwise a frame's look is reached at player speed first. */
+		private boolean instantLook;
+		private boolean controlLookSettled;
+		private int controlTurnTicks;
+		private int breakAimTicks;
 		private ControlSequence controlSequence;
 		private InteractionHand useHand;
 		private int useDurationTicks;
@@ -1748,11 +1774,20 @@ public final class ServerActionExecutor {
 			return new ActiveAction(request, player, Mode.IMMEDIATE, DEFAULT_TIMEOUT_MS, operation, null, 0.0D, false, null);
 		}
 
+		/** A one-tick vanilla interaction that waits for the view to turn onto {@code aimTarget} and settle first. */
+		static ActiveAction aimed(ServerActionRequest request, ServerPlayer player, java.util.function.Supplier<Vec3> aimTarget,
+				Runnable operation) {
+			ActiveAction action = new ActiveAction(request, player, Mode.AIMED, DEFAULT_TIMEOUT_MS, operation, null, 0.0D, false, null);
+			action.immediateAimTarget = Objects.requireNonNull(aimTarget, "aimTarget must not be null");
+			return action;
+		}
+
 		static ActiveAction control(
 				ServerActionRequest request,
 				ServerPlayer player,
 				AgentInputState state,
-				int durationTicks
+				int durationTicks,
+				boolean instantLook
 		) {
 			ActiveAction action = new ActiveAction(
 					request, player, Mode.CONTROL, DEFAULT_TIMEOUT_MS, null, null, 0.0D, false, null
@@ -1762,6 +1797,7 @@ public final class ServerActionExecutor {
 				throw new IllegalArgumentException("control duration must be 1..200 ticks");
 			}
 			action.controlDurationTicks = durationTicks;
+			action.instantLook = instantLook;
 			return action;
 		}
 
@@ -1913,7 +1949,7 @@ public final class ServerActionExecutor {
 					}
 					case CONTROL -> {
 						physicalAttempted = true;
-						applyControlInput();
+						applyControlFrame();
 						return null;
 					}
 					case CONTROL_SEQUENCE -> { }
@@ -1931,10 +1967,8 @@ public final class ServerActionExecutor {
 						validateBreakTarget(player, block, expectedBlockId);
 						breakReceiptBaseline = ((BlockBreakReceiptAccess) (Object) player.gameMode).arenaagents$getBlockBreakReceipt();
 						physicalAttempted = true;
-						applyLookingInput(InputOwner.INTERACTION, 300, Vec3.atCenterOf(block), 0.0F, false, true, false);
-						breakInputIssued = true;
 					}
-					case PLACE -> {
+					case PLACE, AIMED -> {
 					}
 					case WAIT -> {
 					}
@@ -1969,11 +2003,15 @@ public final class ServerActionExecutor {
 			}
 			if (mode == Mode.CONTROL) {
 				physicalAttempted = true;
-				applyControlInput();
-				controlElapsedTicks++;
+				// The frame's ticks run once its look is reached, so a turn never shortens the held input.
+				boolean frameWasHeld = controlLookSettled;
+				applyControlFrame();
+				if (frameWasHeld) controlElapsedTicks++;
 				lastProgress = (double) controlElapsedTicks / controlDurationTicks;
 				if (controlElapsedTicks >= controlDurationTicks) {
-					return result(ServerActionState.SUCCEEDED, "CONTROL_SEGMENT_COMPLETED", "Control segment completed", now);
+					return result(ServerActionState.SUCCEEDED, "CONTROL_SEGMENT_COMPLETED", controlTurnTicks == 0
+							? "Control segment completed"
+							: "Control segment completed after a " + controlTurnTicks + "-tick view turn", now);
 				}
 				return null;
 			} else if (mode == Mode.MOVE) {
@@ -1994,9 +2032,33 @@ public final class ServerActionExecutor {
 				}
 			} else if (mode == Mode.BREAK) {
 				physicalAttempted = true;
+				if (!breakInputIssued) {
+					// Look before swinging: mine from wherever the crosshair already sits on the block (a look_at
+					// usually aimed at one face), or turn toward its center at player speed first. Re-aiming every
+					// break at the exact center was a small snap after each look_at, and a large one without it.
+					if (!crosshairOn(block)) {
+						Vec3 center = Vec3.atCenterOf(block);
+						AgentInputState desired = AgentInputStates.lookingAt(
+								player, center, 0.0F, 0.0F, false, false, false, false, false, InteractionHand.MAIN_HAND);
+						// Already looking at the center (the eased turn lands exactly) yet the ray hits something else.
+						if (Math.abs(AgentInputStates.shortestAngleDelta(player.getYRot(), desired.yaw())) <= 0.5F
+								&& Math.abs(player.getXRot() - desired.pitch()) <= 0.5F) {
+							lastObservation = breakObservation(now, breakRayTarget(player),
+									blockId(player.level().getBlockState(block)), 0.0D, false);
+							return result(ServerActionState.FAILED, "TARGET_NOT_VISIBLE", "The target is not under the crosshair", now);
+						}
+						if (++breakAimTicks > AimGate.MAX_TICKS) {
+							return result(ServerActionState.FAILED, "AIM_NOT_REACHED",
+									"The agent's view did not settle on the target block", now);
+						}
+						applyBreakInput(false);
+						return null;
+					}
+					breakInputIssued = true;
+				}
 				// Renew the deadman lease without restarting Carpet's continuous attack.
 				// Slow blocks such as logs take longer than the 40-tick lease window.
-				applyLookingInput(InputOwner.INTERACTION, 300, Vec3.atCenterOf(block), 0.0F, false, true, false);
+				applyBreakInput(true);
 				breakTicks++;
 				BlockState currentState = player.level().getBlockState(block);
 				String currentBlockId = blockId(currentState);
@@ -2080,6 +2142,20 @@ public final class ServerActionExecutor {
 						placementAttempts += 1;
 					}
 				}
+			} else if (mode == Mode.AIMED) {
+				AimGate.State aim = aimAt(immediateAimTarget.get());
+				if (aim == AimGate.State.FAILED) {
+					return result(ServerActionState.FAILED, "AIM_NOT_REACHED",
+							"The agent's view did not settle on the target", now);
+				}
+				if (aim == AimGate.State.READY) {
+					physicalAttempted = true;
+					releaseInput();
+					immediate.run();
+					if (request.type() == ActionType.ATTACK) return result(ServerActionState.SUCCEEDED,
+							"ATTACK_APPLIED", "Vanilla attack applied to the requested target; damage or death is not confirmed", now);
+					return result(ServerActionState.SUCCEEDED, "ACTION_COMPLETED", "Action completed", now);
+				}
 			} else if (mode == Mode.WAIT && elapsed >= timeoutMs) {
 				return result(ServerActionState.SUCCEEDED, "ACTION_COMPLETED", "Action completed", now);
 			}
@@ -2115,8 +2191,8 @@ public final class ServerActionExecutor {
 			}
 			if (mode == Mode.TRANSACTION) {
 				if (transactionAimTarget != null) {
-					// Block menus (the crafting table) open only after the agent has turned to face the block; the
-					// look is held while the menu is in use.
+					// Block menus (crafting table, furnace, chest) open only after the agent has turned to face the
+					// block; the look is held while the menu is in use.
 					AimGate.State aim = aimAt(transactionAimTarget);
 					if (aim == AimGate.State.FAILED) {
 						return result(ServerActionState.FAILED, "AIM_NOT_REACHED",
@@ -2332,6 +2408,29 @@ public final class ServerActionExecutor {
 			));
 		}
 
+		private boolean crosshairOn(BlockPos target) {
+			return breakRayTarget(player) instanceof BlockHitResult hit && target.equals(hit.getBlockPos());
+		}
+
+		/**
+		 * Holds the view while the crosshair is on the block, else takes one player-speed step toward its center;
+		 * the attack key is held only once mining has begun.
+		 */
+		private void applyBreakInput(boolean attack) {
+			float yaw = player.getYRot();
+			float pitch = player.getXRot();
+			if (!crosshairOn(block)) {
+				AgentInputState desired = AgentInputStates.lookingAt(
+						player, Vec3.atCenterOf(block), 0.0F, 0.0F, false, false, false, false, false, InteractionHand.MAIN_HAND);
+				yaw = AgentInputStates.turnYaw(yaw, desired.yaw());
+				pitch = AgentInputStates.turnPitch(pitch, desired.pitch());
+			}
+			LeasedServerInputController input = AgentInputRuntime.controller(player);
+			if (inputLease == null) inputLease = input.acquire(request.agentId(), InputOwner.INTERACTION, 300);
+			input.apply(inputLease, new AgentInputState(0.0F, 0.0F, false, false, false, attack, false,
+					yaw, pitch, player.getInventory().getSelectedSlot(), InteractionHand.MAIN_HAND));
+		}
+
 		/** Drives the view toward the target through the normal input lease and reports whether it has settled. */
 		private AimGate.State aimAt(Vec3 target) {
 			AgentInputState desired = AgentInputStates.lookingAt(
@@ -2366,7 +2465,8 @@ public final class ServerActionExecutor {
 			lastProgress = (double) step.elapsedTicks() / step.maxTicks();
 			if (step.status() == ControlSequence.Status.RUNNING) {
 				physicalAttempted = true;
-				controlState = step.input();
+				// Sequences keep the model's frame timing; only the view moves at player speed toward each frame.
+				controlState = step.instantLook() ? step.input() : easedLook(step.input(), true);
 				applyControlInput();
 				return null;
 			}
@@ -2391,6 +2491,35 @@ public final class ServerActionExecutor {
 					() -> OfflineAgentPlayers.actions(player).stopAll(),
 					player::stopUsingItem
 			);
+		}
+
+		/**
+		 * Applies the control frame. Unless the model asked for an instant look, the view first turns toward the
+		 * frame's yaw and pitch at player speed with the movement keys already held; attack and use wait until the
+		 * view arrives, so a click lands where the model aimed.
+		 */
+		private void applyControlFrame() {
+			if (instantLook || controlLookSettled) {
+				controlLookSettled = true;
+				applyControlInput();
+				return;
+			}
+			AgentInputState turning = easedLook(controlState, false);
+			if (turning.yaw() == controlState.yaw() && turning.pitch() == controlState.pitch()
+					|| controlTurnTicks >= MAX_CONTROL_TURN_TICKS) {
+				controlLookSettled = true;
+				applyControlInput();
+				return;
+			}
+			controlTurnTicks++;
+			LeasedServerInputController input = AgentInputRuntime.controller(player);
+			if (inputLease == null) inputLease = input.acquire(request.agentId(), InputOwner.DIRECT_CONTROL, 250);
+			input.apply(inputLease, turning);
+		}
+
+		/** One player-speed view step from the current look toward {@code frame}'s look; ends exactly on it. */
+		private AgentInputState easedLook(AgentInputState frame, boolean keepClicks) {
+			return easedControlLook(player.getYRot(), player.getXRot(), frame, keepClicks);
 		}
 
 		private void applyControlInput() {
@@ -2426,6 +2555,18 @@ public final class ServerActionExecutor {
 				lastObservation
 			);
 		}
+	}
+
+	/**
+	 * One player-speed view step from ({@code yaw}, {@code pitch}) toward the frame's look, with the frame's keys.
+	 * The arrival step returns the frame's own yaw (not a wrapped equivalent) so callers can test arrival exactly.
+	 */
+	static AgentInputState easedControlLook(float yaw, float pitch, AgentInputState frame, boolean keepClicks) {
+		float nextYaw = AgentInputStates.turnYaw(yaw, frame.yaw());
+		if (AgentInputStates.shortestAngleDelta(nextYaw, frame.yaw()) == 0.0F) nextYaw = frame.yaw();
+		float nextPitch = AgentInputStates.turnPitch(pitch, frame.pitch());
+		return new AgentInputState(frame.forward(), frame.strafe(), frame.jump(), frame.sneak(), frame.sprint(),
+				keepClicks && frame.attack(), keepClicks && frame.use(), nextYaw, nextPitch, frame.selectedSlot(), frame.hand());
 	}
 
 	static ServerController.TickResult requireControllerResult(

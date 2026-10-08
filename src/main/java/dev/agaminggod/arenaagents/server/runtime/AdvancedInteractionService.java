@@ -437,25 +437,109 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 		}
 	}
 
-	private final class TransferTransaction extends Transaction {
+	/**
+	 * A one-move menu job paced the way a player does it: the screen opens and is shown for {@link #OPEN_TICKS},
+	 * the stack moves, the screen stays {@link #LINGER_TICKS}, then cleanup closes it. Done in a single tick, the
+	 * menu opened and closed between two POV snapshots, so a spectator saw items appear in a furnace or a tool
+	 * appear in the hand with no screen at all (play-test: every furnace_transaction and select_tool).
+	 */
+	private abstract class PacedMenuTransaction extends Transaction {
+		/** Same pacing as crafting: the opened screen is shown before the move and after it. */
+		static final int OPEN_TICKS = 3;
+		static final int LINGER_TICKS = 3;
+
+		private int ticks;
+		private int actTick = -1;
+		private int lingerUntil;
+		private AbstractContainerMenu shown;
+		private boolean inventoryView;
+		private TickResult committed;
+
+		PacedMenuTransaction(ServerPlayer player, ServerActionRequest request, JsonObject arguments, long timeoutMs) {
+			super(player, request, arguments, timeoutMs);
+		}
+
+		/** Validates and opens the screen; returns a terminal result to stop before any move, else null. */
+		abstract TickResult open();
+
+		/** The single exact move, run once while the screen is shown. */
+		abstract TickResult act();
+
+		/** False when the job needs no screen (a tool already on the hotbar is one number key). */
+		boolean needsScreen() {
+			return true;
+		}
+
+		/** The agent's own inventory screen, which the server never opens: mark it so spectators see it. */
+		void openInventoryScreen() {
+			useInventoryMenu(player);
+			AgentInventoryView.open(player);
+			inventoryView = true;
+		}
+
+		@Override
+		final TickResult execute(long nowEpochMs) {
+			ticks++;
+			if (committed != null) return ticks >= lingerUntil ? committed : TickResult.running();
+			if (actTick < 0) {
+				if (!needsScreen()) return actOnce();
+				TickResult stopped = open();
+				if (stopped != null) return stopped;
+				shown = player.containerMenu;
+				actTick = ticks + OPEN_TICKS;
+				return TickResult.running();
+			}
+			if (ticks < actTick) return TickResult.running();
+			if (player.containerMenu != shown) {
+				return TickResult.failed("MENU_CLOSED", "The menu closed before the item was moved; nothing was moved");
+			}
+			TickResult result = actOnce();
+			if (result.state() != TickState.SUCCEEDED) return result;
+			committed = result;
+			lingerUntil = ticks + LINGER_TICKS;
+			return TickResult.running();
+		}
+
+		private TickResult actOnce() {
+			if (executed) return TickResult.failed("TRANSACTION_CONFLICT", "Menu move executed more than once");
+			executed = true;
+			return act();
+		}
+
+		@Override
+		TickResult committedResult() {
+			return committed;
+		}
+
+		@Override
+		void beforeCleanup() {
+			if (inventoryView) AgentInventoryView.close(player);
+		}
+	}
+
+	private final class TransferTransaction extends PacedMenuTransaction {
+		private ChestMenu menu;
+
 		TransferTransaction(ServerPlayer player, ServerActionRequest request, JsonObject arguments) {
 			super(player, request, arguments, arguments.get("timeoutMs").getAsLong());
 		}
 
 		@Override
-		TickResult execute(long nowEpochMs) {
-			if (executed) return TickResult.failed("TRANSACTION_CONFLICT", "Transfer executed more than once");
-			executed = true;
-			String sourceKind = text(arguments, "sourceKind");
-			String destinationKind = text(arguments, "destinationKind");
-			if (sourceKind.equals(destinationKind)) {
+		TickResult open() {
+			if (text(arguments, "sourceKind").equals(text(arguments, "destinationKind"))) {
 				return TickResult.failed("INVALID_TRANSFER", "Exactly one transfer endpoint must be the container");
 			}
 			AbstractContainerMenu opened = openBlockMenu(blockPosition(arguments));
+			player.swing(InteractionHand.MAIN_HAND);
 			if (opened.getClass() != ChestMenu.class) return unsupportedMenu(opened);
-			ChestMenu menu = (ChestMenu) opened;
-			int source = menuSlot(menu, sourceKind, integer(arguments, "sourceSlot"));
-			int destination = menuSlot(menu, destinationKind, integer(arguments, "destinationSlot"));
+			menu = (ChestMenu) opened;
+			return null;
+		}
+
+		@Override
+		TickResult act() {
+			int source = menuSlot(menu, text(arguments, "sourceKind"), integer(arguments, "sourceSlot"));
+			int destination = menuSlot(menu, text(arguments, "destinationKind"), integer(arguments, "destinationSlot"));
 			return transfer(this, player, menu, source, destination,
 					text(arguments, "expectedItemId"), integer(arguments, "count"), true);
 		}
@@ -536,17 +620,23 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 		}
 	}
 
-	private final class FurnaceTransaction extends Transaction {
+	private final class FurnaceTransaction extends PacedMenuTransaction {
+		private AbstractContainerMenu opened;
+
 		FurnaceTransaction(ServerPlayer player, ServerActionRequest request, JsonObject arguments) {
 			super(player, request, arguments, arguments.get("timeoutMs").getAsLong());
 		}
 
 		@Override
-		TickResult execute(long nowEpochMs) {
-			if (executed) return TickResult.failed("TRANSACTION_CONFLICT", "Furnace transaction executed more than once");
-			executed = true;
-			AbstractContainerMenu opened = openBlockMenu(blockPosition(arguments));
+		TickResult open() {
+			opened = openBlockMenu(blockPosition(arguments));
+			player.swing(InteractionHand.MAIN_HAND);
 			if (!(opened instanceof AbstractFurnaceMenu) || !vanillaFurnaceMenu(opened)) return unsupportedMenu(opened);
+			return null;
+		}
+
+		@Override
+		TickResult act() {
 			String operation = text(arguments, "operation");
 			int playerSlot = furnacePlayerSlot(integer(arguments, "inventorySlot"));
 			int source = operation.equals("take_output") ? 2 : playerSlot;
@@ -561,16 +651,19 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 		}
 	}
 
-	private final class EquipmentTransaction extends Transaction {
+	private final class EquipmentTransaction extends PacedMenuTransaction {
 		EquipmentTransaction(ServerPlayer player, ServerActionRequest request, JsonObject arguments) {
 			super(player, request, arguments, EQUIPMENT_TIMEOUT_MS);
 		}
 
 		@Override
-		TickResult execute(long nowEpochMs) {
-			if (executed) return TickResult.failed("TRANSACTION_CONFLICT", "Equipment transaction executed more than once");
-			executed = true;
-			useInventoryMenu(player);
+		TickResult open() {
+			openInventoryScreen();
+			return null;
+		}
+
+		@Override
+		TickResult act() {
 			int source = inventoryMenuSlot(integer(arguments, "sourceSlot"));
 			int destination = switch (text(arguments, "targetSlot")) {
 				case "head" -> 5;
@@ -585,15 +678,24 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 		}
 	}
 
-	private final class ToolSelectionTransaction extends Transaction {
+	private final class ToolSelectionTransaction extends PacedMenuTransaction {
 		ToolSelectionTransaction(ServerPlayer player, ServerActionRequest request, JsonObject arguments) {
 			super(player, request, arguments, EQUIPMENT_TIMEOUT_MS);
 		}
 
 		@Override
-		TickResult execute(long nowEpochMs) {
-			if (executed) return TickResult.failed("TRANSACTION_CONFLICT", "Tool selection executed more than once");
-			executed = true;
+		boolean needsScreen() {
+			return inventoryMenuSlot(integer(arguments, "sourceSlot")) != inventoryMenuSlot(integer(arguments, "hotbarSlot"));
+		}
+
+		@Override
+		TickResult open() {
+			openInventoryScreen();
+			return null;
+		}
+
+		@Override
+		TickResult act() {
 			useInventoryMenu(player);
 			int inventorySource = integer(arguments, "sourceSlot");
 			int hotbarSlot = integer(arguments, "hotbarSlot");

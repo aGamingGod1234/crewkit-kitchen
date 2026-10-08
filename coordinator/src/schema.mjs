@@ -67,13 +67,15 @@ export function validateAction(value) {
 			requireIntRange(action.selectedSlot, 'action.selectedSlot', 0, 8);
 			requireOneOf(action.hand, 'action.hand', ['main', 'off']);
 			requireIntRange(action.ticks, 'action.ticks', 1, 200);
+			if (action.instantLook !== undefined) requireBoolean(action.instantLook, 'action.instantLook');
 			break;
 		case 'control_sequence':
 			if (!Array.isArray(action.frames) || action.frames.length < 1 || action.frames.length > 64) throw invalid('INVALID_FIELD', 'action.frames must contain 1 to 64 frames');
 			requireIntRange(action.maxTicks, 'action.maxTicks', 1, 2000);
 			for (const frame of action.frames) {
 				requireObject(frame, 'frame');
-				requireKeys(frame, [...ACTION_FIELDS.control, 'branches'], 'frame', ACTION_FIELDS.control);
+				requireKeys(frame, [...ACTION_FIELDS.control, 'branches'], 'frame',
+					ACTION_FIELDS.control.filter((field) => !OPTIONAL_ACTION_FIELDS.control.includes(field)));
 				const { branches, ...input } = frame;
 				validateAction({ type: 'control', ...input });
 				if (branches === undefined) continue;

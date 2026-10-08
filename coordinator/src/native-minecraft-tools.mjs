@@ -101,7 +101,7 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 		steps: integerSchema(2, MAX_LOOK_AROUND_STEPS),
 		ticksPerStep: integerSchema(1, MAX_LOOK_AROUND_TICKS),
 	}, ['centerYaw', 'pitch', 'steps', 'ticksPerStep'])),
-	tool('control', 'Hold one complete player input frame for 1 to 200 server ticks. Use for precise movement, jumps, attacks, item use, view, and hotbar control. In water jump is a held swim-up key (rise, stay afloat, climb out at a shore); without it the body sinks. Sprint while underWater swims along the view pitch.', objectSchema({
+	tool('control', 'Hold one complete player input frame for 1 to 200 server ticks. Use for precise movement, jumps, attacks, item use, view, and hotbar control. The view turns to yaw/pitch at player speed first (about 6 ticks for 180 degrees) with movement keys held and attack/use waiting for the aim; ticks count from arrival. instantLook:true writes the look at once. In water jump is a held swim-up key (rise, stay afloat, climb out at a shore); without it the body sinks. Sprint while underWater swims along the view pitch.', objectSchema({
 		forward: numberSchema(-1, 1),
 		strafe: numberSchema(-1, 1),
 		jump: { type: 'boolean' },
@@ -114,6 +114,7 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 		selectedSlot: integerSchema(0, 8),
 		hand: { type: 'string', enum: ['main', 'off'] },
 		ticks: integerSchema(1, 200),
+		instantLook: { type: 'boolean' },
 	}, ['forward', 'strafe', 'jump', 'sneak', 'sprint', 'attack', 'use', 'yaw', 'pitch', 'selectedSlot', 'hand', 'ticks'])),
 	tool('moveTo', 'Navigate to one agent-chosen endpoint of an observed safe route leg through bounded loaded waypoints. Choose useful corners, landings or branches instead of every block; unknown ground still needs observation and a new route decision.', objectSchema({
 		x: numberSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT),
@@ -302,7 +303,7 @@ function normalizeMinecraftToolArguments(name, value) {
 				ticksPerStep: integer(args.ticksPerStep, 'ticksPerStep', 1, MAX_LOOK_AROUND_TICKS),
 			};
 		case 'control':
-			requireExactKeys(args, ['forward', 'strafe', 'jump', 'sneak', 'sprint', 'attack', 'use', 'yaw', 'pitch', 'selectedSlot', 'hand', 'ticks']);
+			requireExactKeys(args, ['forward', 'strafe', 'jump', 'sneak', 'sprint', 'attack', 'use', 'yaw', 'pitch', 'selectedSlot', 'hand', 'ticks', 'instantLook']);
 			try {
 				return {
 					kind: 'action',

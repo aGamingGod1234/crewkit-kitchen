@@ -27,7 +27,142 @@ public final class NavigationMotionVerification {
 		verifyOccupiedNode();
 		verifyJumps();
 		verifyGaze();
+		verifyHeadingHold();
+		verifyStairOvershootDoesNotSpin();
+		verifyStaircaseGaze();
 		return assertions;
+	}
+
+	private static void verifyHeadingHold() {
+		// Body just past a stair landing's center: the point is 0.2 behind.
+		ServerNavigationController.Heading behind = ServerNavigationController.heading(-82.5F, -0.2D, 0.0D, false, Float.NaN);
+		assertEquals(-82.5F, behind.viewYaw(), "a passed waypoint inside one block keeps the view's heading");
+		assertTrue(Math.abs(AgentInputStates.shortestAngleDelta(90.0F, behind.moveYaw())) < 1.0F,
+				"the keys still walk back toward the passed point");
+		ServerNavigationController.Heading endpoint = ServerNavigationController.heading(0.0F, 0.6D, 0.0D, true, Float.NaN);
+		assertEquals(0.0F, endpoint.viewYaw(), "the final approach sidesteps instead of turning to a point under a block away");
+		ServerNavigationController.Heading corner = ServerNavigationController.heading(0.0F, 0.9D, 0.0D, false, Float.NaN);
+		assertTrue(Float.isNaN(corner.moveYaw()), "a sideways waypoint that is not behind still turns the view (path corners)");
+		ServerNavigationController.Heading far = ServerNavigationController.heading(0.0F, 0.0D, -3.0D, true, Float.NaN);
+		assertTrue(Float.isNaN(far.moveYaw()) && Math.abs(AgentInputStates.shortestAngleDelta(far.viewYaw(), 180.0F)) < 1.0F,
+				"a destination more than a block behind is turned to and walked to, as before");
+		ServerNavigationController.Heading over = ServerNavigationController.heading(33.0F, 0.01D, 0.02D, true, Float.NaN);
+		assertEquals(33.0F, over.viewYaw(), "directly over the point the view holds");
+
+		AgentInputStates.MotorStep back = AgentInputStates.stepMotor(
+				new AgentInputStates.MotorState(-82.5F, 20.0F, 0.0F, 0.0F, false),
+				new AgentInputStates.MotorTarget(-82.5F, 10.0F, true, false, true, 97.5F), 0L);
+		assertEquals(-82.5F, back.yaw(), "a held heading never turns");
+		assertTrue(back.forward() < 0.0F && Math.abs(back.strafe()) < 1.0E-3F, "a point behind is reached by backing up");
+		assertTrue(!back.sprint(), "no sprint while backing up");
+	}
+
+	/**
+	 * Closed-loop replay of the play-test staircase step: a move_to one block down carries the body about 0.2
+	 * past the landing's center. Old steering turned the view toward the point behind (the trace's 180 degree
+	 * spin at 45 degrees a tick); the held heading backs onto it without turning.
+	 */
+	private static void verifyStairOvershootDoesNotSpin() {
+		StairRun old = simulateStairStep(false);
+		StairRun held = simulateStairStep(true);
+		assertTrue(old.yawTravel() > 120.0F, "coupled steering reproduces the play-test spin, travelled " + old.yawTravel());
+		assertTrue(held.yawTravel() <= 1.0F, "held heading does not turn during the overshoot, travelled " + held.yawTravel());
+		assertTrue(held.maxStep() <= 1.0F, "held heading has no per-tick yaw jump, max " + held.maxStep());
+		assertTrue(held.closestAfterLanding() < 0.15D, "the body backs onto the landing, closest " + held.closestAfterLanding());
+	}
+
+	private record StairRun(float yawTravel, float maxStep, double closestAfterLanding) {
+	}
+
+	private static StairRun simulateStairStep(boolean hold) {
+		double targetX = 76.5D;
+		double targetZ = 231.5D;
+		double x = 76.3D;
+		double z = 231.55D;
+		double vx = 0.24D;
+		double vz = 0.0D;
+		AgentInputStates.MotorState motor = new AgentInputStates.MotorState(-82.5F, 28.0F, 1.0F, 0.0F, false);
+		float travel = 0.0F;
+		float maxStep = 0.0F;
+		double closest = Double.MAX_VALUE;
+		for (int tick = 0; tick < 30; tick++) {
+			boolean airborne = tick < 4;
+			double dx = targetX - x;
+			double dz = targetZ - z;
+			AgentInputStates.MotorTarget target;
+			if (hold) {
+				ServerNavigationController.Heading heading = ServerNavigationController.heading(motor.yaw(), dx, dz, true, Float.NaN);
+				target = new AgentInputStates.MotorTarget(heading.viewYaw(), 10.0F, true, false, false, heading.moveYaw());
+			} else {
+				float yaw = Math.hypot(dx, dz) < 0.05D ? motor.yaw()
+						: net.minecraft.util.Mth.wrapDegrees((float) Math.toDegrees(Math.atan2(-dx, dz)));
+				target = new AgentInputStates.MotorTarget(yaw, 10.0F, true, false, false);
+			}
+			AgentInputStates.MotorStep step = AgentInputStates.stepMotor(motor, target, tick * 50L);
+			float turned = Math.abs(AgentInputStates.shortestAngleDelta(motor.yaw(), step.yaw()));
+			travel += turned;
+			maxStep = Math.max(maxStep, turned);
+			motor = step.state();
+			// Vanilla moveRelative: strafe is +x in input space, forward +z, rotated by the view yaw.
+			double radians = Math.toRadians(step.yaw());
+			double sin = Math.sin(radians);
+			double cos = Math.cos(radians);
+			double ax = step.strafe() * cos - step.forward() * sin;
+			double az = step.forward() * cos + step.strafe() * sin;
+			double length = Math.hypot(ax, az);
+			if (length > 1.0D) {
+				ax /= length;
+				az /= length;
+			}
+			double acceleration = airborne ? 0.02D : 0.1D;
+			double friction = airborne ? 0.91D : 0.546D;
+			vx = vx * friction + ax * acceleration;
+			vz = vz * friction + az * acceleration;
+			x += vx;
+			z += vz;
+			if (!airborne) closest = Math.min(closest, Math.hypot(targetX - x, targetZ - z));
+		}
+		return new StairRun(travel, maxStep, closest);
+	}
+
+	/** A diagonal staircase: east and south steps, each one block down. */
+	private static void verifyStaircaseGaze() {
+		List<PathNode> nodes = new ArrayList<>();
+		int x = 0;
+		int y = LEVEL;
+		int z = 0;
+		nodes.add(new PathNode(new GridPosition(x, y, z), TraversalType.WALK));
+		for (int step = 0; step < 4; step++) {
+			nodes.add(new PathNode(new GridPosition(++x, --y, z), TraversalType.DROP_DOWN));
+			nodes.add(new PathNode(new GridPosition(x, --y, ++z), TraversalType.DROP_DOWN));
+		}
+		float oldMin = 180.0F;
+		float oldMax = -180.0F;
+		float newMin = 180.0F;
+		float newMax = -180.0F;
+		float view = -45.0F;
+		for (int index = 1; index < nodes.size() - 3; index++) {
+			GridPosition from = nodes.get(index - 1).position();
+			GridPosition to = nodes.get(index).position();
+			Vec3 position = new Vec3(from.x() + 0.5D, from.y(), from.z() + 0.5D);
+			double dx = to.x() - from.x();
+			double dz = to.z() - from.z();
+			float nodeYaw = net.minecraft.util.Mth.wrapDegrees((float) Math.toDegrees(Math.atan2(-dx, dz)));
+			oldMin = Math.min(oldMin, nodeYaw);
+			oldMax = Math.max(oldMax, nodeYaw);
+			float gaze = ServerNavigationController.gazeYaw(position, nodes, index);
+			ServerNavigationController.Heading heading = ServerNavigationController.heading(view, dx, dz, false, gaze);
+			view = heading.viewYaw();
+			newMin = Math.min(newMin, view);
+			newMax = Math.max(newMax, view);
+			assertTrue(!Float.isNaN(heading.moveYaw()), "the keys still walk each stair cell while the view looks down the stairs");
+		}
+		assertEquals(90.0F, oldMax - oldMin, "node-by-node steering swung the view 90 degrees at every stair");
+		assertTrue(newMax - newMin <= 30.0F, "looking down the stairs keeps the view within 30 degrees, swung "
+				+ (newMax - newMin));
+		List<PathNode> ladder = List.of(nodes.get(0), new PathNode(new GridPosition(0, LEVEL + 1, 0), TraversalType.CLIMB));
+		assertTrue(Float.isNaN(ServerNavigationController.gazeYaw(new Vec3(0.5D, LEVEL, 0.5D), ladder, 0)),
+				"climbs keep their own facing");
 	}
 
 	private static void verifyEasedTurning() {

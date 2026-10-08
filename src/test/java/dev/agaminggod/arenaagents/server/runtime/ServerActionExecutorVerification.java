@@ -340,7 +340,43 @@ public final class ServerActionExecutorVerification {
 		verifyModelOnlyControlBoundary();
 		return 122 + dev.agaminggod.arenaagents.protocol.PlayerActionSchemaVerification.verify()
 				+ dev.agaminggod.arenaagents.server.perception.PlayerKnowledgeInspectionVerification.verify()
-				+ verifyInteractionOutlineHit() + verifyMultipartHitTies() + verifyAimGate();
+				+ verifyInteractionOutlineHit() + verifyMultipartHitTies() + verifyAimGate() + verifyControlLookEasing();
+	}
+
+	/**
+	 * A control frame's look is reached at player speed: the play-test lookAround and control frames wrote yaw in
+	 * one tick (a 180 degree camera snap). Keys stay held while turning, clicks wait for the aim, and the final step
+	 * lands on the frame's exact yaw so arrival is testable.
+	 */
+	private static int verifyControlLookEasing() {
+		AgentInputState frame = new AgentInputState(1.0F, 0.0F, true, false, true, true, true,
+				180.0F, -30.0F, 3, InteractionHand.MAIN_HAND);
+		float yaw = 0.0F;
+		float pitch = 20.0F;
+		float maxStep = 0.0F;
+		int ticks = 0;
+		AgentInputState step;
+		do {
+			step = ServerActionExecutor.easedControlLook(yaw, pitch, frame, false);
+			maxStep = Math.max(maxStep, Math.abs(net.minecraft.util.Mth.wrapDegrees(step.yaw() - yaw)));
+			assertTrue(step.forward() == 1.0F && step.jump() && step.sprint() && step.selectedSlot() == 3,
+					"movement keys and hotbar slot are held while the view turns");
+			assertTrue(!step.attack() && !step.use(), "attack and use wait until the view arrives");
+			yaw = step.yaw();
+			pitch = step.pitch();
+			ticks++;
+		} while ((yaw != frame.yaw() || pitch != frame.pitch()) && ticks < 40);
+		assertEquals(180.0F, yaw, "the turn ends exactly on the requested yaw, not a wrapped -180");
+		assertEquals(-30.0F, pitch, "the turn ends exactly on the requested pitch");
+		assertTrue(maxStep <= dev.agaminggod.arenaagents.server.runtime.input.AgentInputStates.MAX_TURN_STEP_DEGREES,
+				"no control frame turns faster than the player flick limit, max " + maxStep);
+		assertTrue(ticks >= 4 && ticks <= 7, "a 180 degree control turn takes 200-350 ms, took " + ticks + " ticks");
+		assertTrue(ServerActionExecutor.easedControlLook(-178.0F, 0.0F, frame, true).attack(),
+				"control sequences keep their authored clicks while the view eases");
+		assertEquals(180.0F, ServerActionExecutor.easedControlLook(-178.0F, -30.0F, frame, false).yaw(),
+				"a small turn across the wrap lands in one tick");
+		assertTrue(ServerActionExecutor.MAX_CONTROL_TURN_TICKS > ticks, "the turn guard leaves room for a full half turn");
+		return 8;
 	}
 
 	/** Placement and table opening wait until the real view has turned onto the target and settled. */

@@ -45,6 +45,8 @@ public final class ProtocolCodec {
 	private static final String FIELD_PITCH = "pitch";
 	private static final String FIELD_SELECTED_SLOT = "selectedSlot";
 	private static final String FIELD_TICKS = "ticks";
+	/** Optional on control frames: true writes the frame's yaw and pitch at once instead of a player-speed turn. */
+	private static final String FIELD_INSTANT_LOOK = "instantLook";
 	private static final String FIELD_TARGET_SELECTOR = "targetSelector";
 	private static final String FIELD_TARGET_ID = "targetId";
 	private static final String FIELD_TIMEOUT_MS = "timeoutMs";
@@ -429,6 +431,7 @@ public final class ProtocolCodec {
 		requireIntegralRange(command, FIELD_SELECTED_SLOT, 0L, 8L);
 		requireOneOf(command, FIELD_HAND, List.of("main", "off"));
 		requireIntegralRange(command, FIELD_TICKS, 1L, 200L);
+		if (present(command, FIELD_INSTANT_LOOK)) requireBoolean(command, FIELD_INSTANT_LOOK);
 	}
 
 	private static boolean present(JsonObject arguments, String field) {
@@ -954,7 +957,8 @@ public final class ProtocolCodec {
 		fields.put(ActionType.MOVE_TO, List.of(FIELD_X, FIELD_Y, FIELD_Z, FIELD_TOLERANCE, FIELD_SPRINT));
 		fields.put(ActionType.CONTROL, List.of(
 				FIELD_FORWARD, FIELD_STRAFE, FIELD_JUMP, FIELD_SNEAK, FIELD_SPRINT,
-				FIELD_ATTACK, FIELD_USE, FIELD_YAW, FIELD_PITCH, FIELD_SELECTED_SLOT, FIELD_HAND, FIELD_TICKS
+				FIELD_ATTACK, FIELD_USE, FIELD_YAW, FIELD_PITCH, FIELD_SELECTED_SLOT, FIELD_HAND, FIELD_TICKS,
+				FIELD_INSTANT_LOOK
 		));
 		fields.put(ActionType.LOOK_AT, List.of(FIELD_X, FIELD_Y, FIELD_Z));
 		fields.put(ActionType.ATTACK, List.of(FIELD_TARGET_ID, FIELD_TIMEOUT_MS));
