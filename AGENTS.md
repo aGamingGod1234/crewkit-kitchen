@@ -11,3 +11,5 @@ We are building a catalogue of the hard technical problems in this project and h
 - **Result:** before and after numbers (tokens, cost, time, latency, success rate, damage, and so on). Say whether each number was measured or estimated, and roughly how.
 
 Keep entries short and video-ready, without code-level detail. Skip routine fixes and anything without a real result to report.
+
+Also append each entry to `docs/technical-catalogue.md` under a heading for that pull request, so the whole project's catalogue lives in one place.
