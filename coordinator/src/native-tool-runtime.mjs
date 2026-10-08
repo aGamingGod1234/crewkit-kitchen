@@ -3,6 +3,7 @@ import { validateTraceId } from './control-latency-registry.mjs';
 import { ExplorationOccupancy, observationWorldId } from './explore-frontier.mjs';
 import { hasDurableObservationFacts, RecoveryProgressStore } from './recovery-progress-wrap.mjs';
 import { classifyBodyFailure, composeTwoCallView } from './two-call-llm-wrap.mjs';
+import { PlacedWorkstations } from './resource-facts.mjs';
 import { minecraftCapabilities, normalizeMinecraftToolCall, toolResultContent } from './native-minecraft-tools.mjs';
 import { NativeProgramExecutor } from './native-program-executor.mjs';
 import { parseArenaScript } from './arena-script/parser.mjs';
@@ -33,6 +34,7 @@ export class NativeToolRuntime {
 	#memoryReady = new Set();
 	#pendingSpatial = new Map();
 	#recovery = new RecoveryProgressStore();
+	#placedWorkstations = new PlacedWorkstations();
 	#decorateObservation;
 	#requestObservation;
 	#inspectObservation;
@@ -277,11 +279,13 @@ export class NativeToolRuntime {
 		if (isSparseDeathObservation(observation) && hasDurableObservationFacts(source)) {
 			this.#recovery.remember(record.agentId, record.goalRevision, source);
 		}
-		return composeTwoCallView(ownedSource, this.#recovery.snapshot(record.agentId, ownedSource), {
+		const view = composeTwoCallView(ownedSource, this.#recovery.snapshot(record.agentId, ownedSource), {
 			occupancy: this.#occupancy,
 			agentId: record.agentId,
 			goal: record.currentGoal ?? record.currentGoalSpec?.originalRequest ?? null,
 		});
+		const leftBehind = this.#placedWorkstations.leftBehind(record.agentId, view);
+		return leftBehind.length === 0 ? view : { ...view, leftBehind };
 	}
 
 	hasCurrent(record) {
@@ -1165,6 +1169,7 @@ export class NativeToolRuntime {
 			...(failureClass === null ? {} : { failureClass }),
 		};
 		this.#retainReceipt(record, active, { ...result, source: 'server_action_result' });
+		this.#placedWorkstations.onActionResult(record.agentId, { actionType: active.actionType, arguments: active.arguments, state }, this.#observations.get(record.agentId)?.observation);
 		if (this.#notebook !== null && active.worldId != null) {
 			try {
 				Promise.resolve(this.#notebook.recordReceipt(record.agentId, terminalReceipt(active, payload))).catch((error) => this.#trace('native_receipt_persistence_failed', { agentId: record.agentId, actionId: active.actionId, reasonCode: error?.code ?? 'MEMORY_WRITE_FAILED' }));
@@ -1224,6 +1229,7 @@ export class NativeToolRuntime {
 		// Physical authority is released before waiting on persistence below.
 		if (FORGET_REASONS.test(String(reason))) {
 			this.#recovery.forget(agentId);
+			this.#placedWorkstations.clear(agentId);
 			this.#lastLive.delete(agentId);
 			this.#receipts.delete(agentId);
 		}

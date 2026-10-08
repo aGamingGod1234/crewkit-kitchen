@@ -84,8 +84,10 @@ public final class ServerObservationCollector {
 	private final ServerActionExecutor actionExecutor;
 	private final ObservationSectionCache<RawSpatialObservation.Key, RawSpatialObservation> spatialCache =
 			new ObservationSectionCache<>(SPATIAL_CACHE_CAPACITY, SPATIAL_CACHE_TICKS, value -> value);
-	private final ObservationSectionCache<LandmarkSampleKey, List<VisibleSurfaceCandidate>> landmarkCache =
+	private final ObservationSectionCache<LandmarkSampleKey, SightSample> landmarkCache =
 			new ObservationSectionCache<>(LANDMARK_CACHE_CAPACITY, LANDMARK_CACHE_TICKS, value -> value);
+	/** Structure starts each agent saw recently, so a structure is announced as new once, not on every glance. */
+	private final Map<AgentId, Map<String, Long>> seenStructures = new HashMap<>();
 	private final Map<AgentId, RawSpatialObservation.Key> spatialKeys = new HashMap<>();
 	private final Map<AgentId, RawPlayerState> lastRawStates = new HashMap<>();
 	private final ThreatPerception threats = new ThreatPerception();
@@ -187,6 +189,7 @@ public final class ServerObservationCollector {
 		JsonObject spatial = spatialObservation(agentId, level, agent, visibility);
 		observation.add("blocks", spatial.get("blocks"));
 		observation.add("landmarks", spatial.get("landmarks"));
+		if (spatial.has("sighted")) observation.add("sighted", spatial.get("sighted"));
 		observation.add("nearbyContainers", spatial.get("nearbyContainers"));
 		JsonObject world = new JsonObject();
 		world.addProperty("dimension", level.dimension().identifier().toString());
@@ -456,6 +459,9 @@ public final class ServerObservationCollector {
 		synchronized (lastRawStates) {
 			lastRawStates.keySet().removeIf(agentId -> !tracked.contains(agentId));
 			threats.retain(tracked);
+			synchronized (seenStructures) {
+				SightedFeatures.retain(seenStructures, tracked);
+			}
 			survival.retain(tracked);
 			lastInventories.keySet().removeIf(agentId -> !tracked.contains(agentId));
 		}
@@ -495,14 +501,17 @@ public final class ServerObservationCollector {
 			agent.getMainHandItem().getItem(),
 			worldMutationRevision(level, position, LANDMARK_SIGHT_DISTANCE + 1)
 		);
-		List<VisibleSurfaceCandidate> landmarkCandidates = landmarkCache.getOrCompute(
+		SightSample sight = landmarkCache.getOrCompute(
 			landmarkKey,
 			level.getGameTime(),
-			() -> visibleSurfaceCandidates(level, agent, position)
+			() -> sightSample(level, agent, position, visibility, raw)
 		);
 		JsonObject value = new JsonObject();
 		value.add("blocks", blocks(level, agent, raw.blocks(), visibility));
-		value.add("landmarks", landmarks(level, agent, visibility, landmarkCandidates));
+		value.add("landmarks", landmarks(level, agent, visibility, sight.surfaces()));
+		JsonObject sighted = SightedFeatures.toJson(sight.sighted(), eye, agent.getYRot(),
+				structureKey -> markStructureSeen(agentId, structureKey, level.getGameTime()));
+		if (sighted != null) value.add("sighted", sighted);
 		value.add("nearbyContainers", nearbyTransactionTargets(raw.containers(), level::getBlockState,
 				target -> level.hasChunkAt(target) && visibility.canSeeBlock(target), agent.position(),
 				target -> agent.isWithinBlockInteractionRange(target, 0.0D)));
@@ -978,7 +987,51 @@ public final class ServerObservationCollector {
 			ServerPlayer agent,
 			BlockPos center
 	) {
+		return sightRays(level, agent, center).surfaces();
+	}
+
+	/** Sight-ray surfaces plus the structure, cave and ore-vein rows they reveal, cached per view. */
+	record SightSample(List<VisibleSurfaceCandidate> surfaces, SightedFeatures.Sample sighted) {
+	}
+
+	/** Every block a sight ray hit and the open cell in front of it, besides the deduplicated landmark surfaces. */
+	record SightRays(List<VisibleSurfaceCandidate> surfaces, List<BlockPos> hits, List<BlockPos> openings) {
+	}
+
+	private static SightSample sightSample(
+			ServerLevel level,
+			ServerPlayer agent,
+			BlockPos center,
+			ObservationVisibility.Frame visibility,
+			RawSpatialObservation raw
+	) {
+		SightRays rays = sightRays(level, agent, center);
+		List<BlockPos> seenLocalOre = new ArrayList<>();
+		int visibilityChecks = 0;
+		for (BlockObservationOrdering.Candidate candidate : raw.blocks()) {
+			if (SightedFeatures.oreFamily(candidate.blockId()) == null) continue;
+			if (visibilityChecks++ == SightedFeatures.MAX_VEIN_SEEDS * 2) break;
+			BlockPos position = center.offset(candidate.x(), candidate.y(), candidate.z());
+			if (level.hasChunkAt(position) && visibility.canSeeBlock(position)) seenLocalOre.add(position);
+		}
+		return new SightSample(rays.surfaces(), SightedFeatures.sample(level, agent.getEyePosition(), rays.hits(), rays.openings(),
+				seenLocalOre, visibility::canSeeBlock));
+	}
+
+	private boolean markStructureSeen(AgentId agentId, String key, long gameTime) {
+		synchronized (seenStructures) {
+			return SightedFeatures.markSeen(seenStructures.computeIfAbsent(agentId, ignored -> new HashMap<>()), key, gameTime);
+		}
+	}
+
+	private static SightRays sightRays(
+			ServerLevel level,
+			ServerPlayer agent,
+			BlockPos center
+	) {
 		Map<Long, VisibleSurfaceCandidate> candidates = new HashMap<>();
+		java.util.LinkedHashSet<BlockPos> hits = new java.util.LinkedHashSet<>();
+		java.util.LinkedHashSet<BlockPos> openings = new java.util.LinkedHashSet<>();
 		Map<Long, Boolean> loadedChunks = new HashMap<>();
 		Vec3 eye = agent.getEyePosition();
 		for (int pitchOffset : SIGHT_PITCH_OFFSETS) {
@@ -999,6 +1052,8 @@ public final class ServerObservationCollector {
 				if (hit.getType() != HitResult.Type.BLOCK) continue;
 				BlockPos position = hit.getBlockPos();
 				if (!hasLoadedChunk(level, position, loadedChunks)) continue;
+				hits.add(position.immutable());
+				openings.add(position.relative(hit.getDirection()).immutable());
 				double distanceSquared = agent.distanceToSqr(
 						position.getX() + 0.5D,
 						position.getY() + 0.5D,
@@ -1024,7 +1079,7 @@ public final class ServerObservationCollector {
 				.thenComparingInt(VisibleSurfaceCandidate::y)
 				.thenComparingInt(VisibleSurfaceCandidate::x)
 				.thenComparingInt(VisibleSurfaceCandidate::z));
-		return List.copyOf(ordered);
+		return new SightRays(List.copyOf(ordered), List.copyOf(hits), List.copyOf(openings));
 	}
 
 	static boolean withinLocalBlockScan(BlockPos center, BlockPos position) {

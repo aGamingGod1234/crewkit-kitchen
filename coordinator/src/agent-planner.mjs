@@ -29,6 +29,29 @@ const RETRYABLE_DECISION_ERRORS = new Set([
 	'DECISION_FIELD_MISMATCH',
 	'DUPLICATE_DECISION_FIELD',
 ]);
+const REFERENCE_KEY = /^[a-z0-9:_.-]{1,64}$/;
+
+/**
+ * Argument metadata for reference reads, so a trace answers whether the model read a
+ * strategy topic and which topics taskPlan pointed at. Identifiers only; no content.
+ */
+export function nativeToolReferenceTraceFields(tool, result) {
+	const key = (value) => typeof value === 'string' && REFERENCE_KEY.test(value) ? value : (value === undefined ? undefined : 'other');
+	if (tool?.kind === 'capabilities') {
+		const topic = key(tool.topic);
+		return { toolKind: 'capabilities', section: key(tool.section) ?? 'all', ...(topic === undefined ? {} : { topic }),
+			...(Number.isSafeInteger(tool.offset) ? { offset: tool.offset } : {}) };
+	}
+	if (tool?.kind === 'task_plan') {
+		const strategy = result?.strategy;
+		const topics = Array.isArray(strategy?.topics) ? strategy.topics.map(key).filter((topic) => topic !== undefined).slice(0, 8) : [];
+		const steps = Array.isArray(result?.plan?.steps) ? result.plan.steps : [];
+		return { toolKind: 'task_plan', operation: key(tool.operation) ?? 'read', planSteps: steps.length,
+			openPlanSteps: steps.filter((step) => step?.status !== 'complete').length, strategyTopics: topics,
+			...(key(strategy?.read?.arguments?.topic) === undefined ? {} : { strategyRead: key(strategy.read.arguments.topic) }) };
+	}
+	return null;
+}
 
 export class AgentPlanner {
 	#registry;
@@ -310,6 +333,8 @@ export class AgentPlanner {
 								try {
 									if (signal.aborted) throw signal.reason;
 									const toolResult = await executeTool(request);
+									const reference = nativeToolReferenceTraceFields(request?.tool, toolResult);
+									if (reference !== null) this.#recordNativeTiming(record, 'native_tool_reference', { traceId, callId: request?.callId ?? null, ...reference, ...timingIdentity });
 									if (!firstUsableToolRecorded && isUsableNativeToolResult(toolResult)) {
 										firstUsableToolRecorded = true;
 										const usableAt = this.#now();

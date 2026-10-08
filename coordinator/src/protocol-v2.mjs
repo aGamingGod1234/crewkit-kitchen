@@ -135,7 +135,7 @@ const FACTUAL_PLAYER_FIELDS = new Set([
 	'onFire', 'air', 'maxAir', 'suffocating', 'fallDistance', 'lastAttacker', 'effects',
 ]);
 const FACTUAL_TOP_LEVEL_PATHS = new Set([
-	'ready', 'status', 'position', 'velocity', 'view', 'inventory', 'entities', 'blocks', 'landmarks', 'nearbyContainers', 'world', 'currentAction', 'lastResult', 'perception', 'heard',
+	'ready', 'status', 'position', 'velocity', 'view', 'inventory', 'entities', 'blocks', 'landmarks', 'nearbyContainers', 'world', 'currentAction', 'lastResult', 'perception', 'heard', 'sighted',
 ]);
 const TRUSTED_ENVELOPES = new WeakSet();
 const TRUSTED_PAYLOAD_TYPES = new WeakMap();
@@ -1800,7 +1800,7 @@ function observedDetails(value, field, depth = 0) {
 }
 
 function normalizeObservation(value) {
-	const allowed = ['goalRevision', 'observedAtEpochMs', 'ready', 'status', 'eventSequence', 'attention', 'changedFacts', 'position', 'velocity', 'view', 'player', 'inventory', 'entities', 'blocks', 'landmarks', 'nearbyContainers', 'world', 'currentAction', 'lastResult', 'interaction', 'coverage', 'perception', 'threats', 'survival', 'heard'];
+	const allowed = ['goalRevision', 'observedAtEpochMs', 'ready', 'status', 'eventSequence', 'attention', 'changedFacts', 'position', 'velocity', 'view', 'player', 'inventory', 'entities', 'blocks', 'landmarks', 'nearbyContainers', 'world', 'currentAction', 'lastResult', 'interaction', 'coverage', 'perception', 'threats', 'survival', 'heard', 'sighted'];
 	exactKeys(value, allowed, ['goalRevision', 'observedAtEpochMs', 'ready', 'status'], 'observation');
 	const normalized = {
 		goalRevision: revision(value.goalRevision, 'goalRevision'),
@@ -1816,7 +1816,7 @@ function normalizeObservation(value) {
 		if (normalized.attention === false && normalized.changedFacts?.length > 0) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Non-attention observation cannot contain changed facts');
 		return normalized;
 	}
-	for (const key of allowed.slice(4).filter((field) => !['interaction', 'landmarks', 'coverage', 'perception', 'threats', 'survival', 'heard'].includes(field))) if (!Object.hasOwn(value, key)) throw new ProtocolV2Error('MISSING_FIELD', `observation field '${key}' is required when ready`);
+	for (const key of allowed.slice(4).filter((field) => !['interaction', 'landmarks', 'coverage', 'perception', 'threats', 'survival', 'heard', 'sighted'].includes(field))) if (!Object.hasOwn(value, key)) throw new ProtocolV2Error('MISSING_FIELD', `observation field '${key}' is required when ready`);
 	normalized.eventSequence = positiveInteger(value.eventSequence, 'eventSequence');
 	normalized.attention = boolean(value.attention, 'attention');
 	normalized.changedFacts = changedFactPaths(value.changedFacts);
@@ -1839,6 +1839,36 @@ function normalizeObservation(value) {
 	if (value.threats !== undefined) normalized.threats = threatsObservation(value.threats);
 	if (value.survival !== undefined) normalized.survival = survivalObservation(value.survival);
 	if (value.heard !== undefined) normalized.heard = heardObservation(value.heard);
+	if (value.sighted !== undefined) normalized.sighted = sightedObservation(value.sighted);
+	return normalized;
+}
+
+const SIGHTED_ROWS = Object.freeze({
+	structures: { maximum: 4, label: ['structure', requireIdentifier], extra: { new: boolean } },
+	caves: { maximum: 3, extra: { air: positiveInteger } },
+	veins: { maximum: 4, label: ['blockId', requireIdentifier], extra: { visible: positiveInteger } },
+});
+
+/** Structures, dark open spaces and ore veins currently in line of sight; never unseen ones. */
+function sightedObservation(value) {
+	exactKeys(value, Object.keys(SIGHTED_ROWS), [], 'sighted');
+	const normalized = {};
+	for (const [kind, { maximum, label, extra }] of Object.entries(SIGHTED_ROWS)) {
+		if (value[kind] === undefined) continue;
+		normalized[kind] = boundedArray(value[kind], `sighted.${kind}`, maximum).map((entry, index) => {
+			const field = `sighted.${kind}[${index}]`;
+			const required = [...(label === undefined ? [] : [label[0]]), 'x', 'y', 'z', 'distance', 'bearing'];
+			exactKeys(entry, [...required, ...Object.keys(extra)], kind === 'structures' ? required : [...required, ...Object.keys(extra)], field);
+			const bearing = finiteNumber(entry.bearing, `${field}.bearing`);
+			if (bearing < -180 || bearing > 180) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}.bearing must be in [-180, 180]`);
+			return {
+				...(label === undefined ? {} : { [label[0]]: label[1](entry[label[0]], `${field}.${label[0]}`) }),
+				x: integer(entry.x, `${field}.x`), y: integer(entry.y, `${field}.y`), z: integer(entry.z, `${field}.z`),
+				distance: nonnegativeFiniteNumber(entry.distance, `${field}.distance`), bearing,
+				...Object.fromEntries(Object.entries(extra).filter(([key]) => entry[key] !== undefined).map(([key, check]) => [key, check(entry[key], `${field}.${key}`)])),
+			};
+		});
+	}
 	return normalized;
 }
 

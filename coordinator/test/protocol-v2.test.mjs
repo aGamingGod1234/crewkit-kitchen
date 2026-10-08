@@ -2418,3 +2418,33 @@ test('heard sounds and the first-heard-lava fact pass wire validation with relat
 	assert.throws(() => validateProtocolV2Payload('observation', crowded));
 	assert.equal(Object.hasOwn(validateProtocolV2Payload('observation', readyServerObservation()), 'heard'), false, 'heard stays optional');
 });
+
+test('sighted structures, caves and ore veins pass wire validation with bounded rows', () => {
+	const observation = readyServerObservation();
+	observation.attention = true;
+	observation.changedFacts = ['sighted'];
+	observation.sighted = {
+		structures: [{ x: 40, y: 62, z: -12, distance: 41, bearing: -20, structure: 'minecraft:shipwreck_beached', new: true }],
+		caves: [{ x: 6, y: 58, z: 3, distance: 9, bearing: 35, air: 61 }],
+		veins: [{ x: 2, y: 60, z: 1, distance: 3, bearing: 10, blockId: 'minecraft:deepslate_iron_ore', visible: 5 }],
+	};
+	const normalized = validateProtocolV2Payload('observation', observation);
+	assert.deepEqual(normalized.sighted, observation.sighted);
+	assert.deepEqual(normalized.changedFacts, ['sighted']);
+	for (const mutate of [
+		(value) => { value.sighted.structures[0].hidden = true; },
+		(value) => { value.sighted.caves[0].bearing = 270; },
+		(value) => { delete value.sighted.veins[0].visible; },
+		(value) => { value.sighted.veins[0].visible = 0; },
+		(value) => { value.sighted.caves = Array.from({ length: 4 }, () => value.sighted.caves[0]); },
+		(value) => { value.sighted.mineshafts = []; },
+	]) {
+		const bad = structuredClone(observation);
+		mutate(bad);
+		assert.throws(() => validateProtocolV2Payload('observation', bad));
+	}
+	const known = structuredClone(observation);
+	delete known.sighted.structures[0].new;
+	assert.equal(validateProtocolV2Payload('observation', known).sighted.structures[0].new, undefined, 'new is optional');
+	assert.equal(Object.hasOwn(validateProtocolV2Payload('observation', readyServerObservation()), 'sighted'), false, 'sighted stays optional');
+});

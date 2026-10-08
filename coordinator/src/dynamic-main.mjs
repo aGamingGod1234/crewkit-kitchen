@@ -25,6 +25,7 @@ import { ModelNotebook } from './model-notebook.mjs';
 import { RuntimeMemoryContext } from './runtime-memory-context.mjs';
 import { TaskMemoryStore } from './task-memory-store.mjs';
 import { LiveTaskViews } from './live-task-view.mjs';
+import { withToolWear } from './resource-facts.mjs';
 import { ObservedMemoryStore } from './observed-memory-store.mjs';
 import { ExplorationOccupancy } from './explore-frontier.mjs';
 import { ProviderService } from './provider-service.mjs';
@@ -4787,6 +4788,8 @@ export function classifyObservationTrigger(payload, observation, signals = null)
 	if (changedFacts.includes('survival.heal_opportunity')) return { attention: true, priority: 'ordinary', trigger: 'heal_opportunity' };
 	// Visible lava is relevant evidence, not proof the player is inside it.
 	if (signals?.movementLoop === true) return { attention: true, priority: 'urgent', trigger: 'movement_loop' };
+	// A structure came into view (new, or again after a minute): worth a look; the model decides whether to go.
+	if (changedFacts.includes('sighted')) return { attention: true, priority: 'ordinary', trigger: 'structure_sighted' };
 	if (signals?.resourceDiscovery === true) return { attention: true, priority: 'ordinary', trigger: 'resource_discovery' };
 	if (!attention) return { attention: false, priority: 'ordinary', trigger: 'observation' };
 	return { attention: true, priority: 'ordinary', trigger: 'attention' };
@@ -4904,7 +4907,8 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 	const eventName = typeof event === 'string' && event.length > 0 ? event : event?.event;
 	const normalizedEvent = typeof eventName === 'string' && eventName.length > 0 ? eventName : 'observation';
 	const eventPlanningLeadMs = status?.planningLeadMs ?? planningLeadMs ?? event?.planningLeadMs;
-	const inventorySource = asArray(observation.inventory?.items);
+	// The model reads wear as usesLeft; programs keep the raw damage facts.
+	const inventorySource = asArray(withToolWear(observation.inventory)?.items);
 	const itemSource = asArray(observation.items);
 	const entitySource = asArray(observation.entities).filter((entity) => entity?.type !== 'minecraft:item');
 	const blockSource = asArray(observation.blocks);
@@ -4938,6 +4942,8 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 		entities: entityRows.values,
 		...compactBlockDefaults(blockRows.values),
 		...(landmarkRows === null ? {} : { landmarks: landmarkRows.values }),
+		...(observation.sighted === undefined ? {} : { sighted: observation.sighted }),
+		...(observation.leftBehind === undefined ? {} : { leftBehind: observation.leftBehind }),
 		...(nearbyContainerRows === null ? {} : { nearbyContainers: nearbyContainerRows.values }),
 		...(observation.world === undefined ? {} : { world: observation.world }),
 		...(observation.currentAction === undefined ? {} : { currentAction: observation.currentAction }),
@@ -5249,7 +5255,7 @@ const UUID_TEXT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
 const DEFAULT_TASK_REQUEST_TIMEOUT_MS = 10_000;
 const MINIMAL_TASK_MEMORY_BYTES = 2_048;
 const MINIMAL_RECEIPTS = 2;
-const MINIMAL_OBSERVATION_FIELDS = new Set(['observedAtEpochMs', 'eventSequence', 'freshness', 'ready', 'status', 'player', 'inventory', 'currentAction', 'lastResult', 'death', 'recovery', 'failureClass', 'continuity', 'resultCoverage']);
+const MINIMAL_OBSERVATION_FIELDS = new Set(['observedAtEpochMs', 'eventSequence', 'freshness', 'ready', 'status', 'player', 'inventory', 'sighted', 'leftBehind', 'currentAction', 'lastResult', 'death', 'recovery', 'failureClass', 'continuity', 'resultCoverage']);
 
 function fitsWithOldestMessage(payload, budgetBytes) {
 	const probe = { ...payload, conversation: { ...payload.conversation, entries: payload.conversation.entries.slice(0, 1) } };
@@ -5385,6 +5391,8 @@ function compactPlanningDueObservation(observation) {
 		entities: entityRows.values,
 		blocks: blockRows.values,
 		...(observation.blockDefaults === undefined ? {} : { blockDefaults: observation.blockDefaults }), ...(observation.blockTags === undefined ? {} : { blockTags: retainedBlockTags(observation.blockTags, blockRows.values) }),
+		...(observation.sighted === undefined ? {} : { sighted: observation.sighted }),
+		...(observation.leftBehind === undefined ? {} : { leftBehind: observation.leftBehind }),
 		...(observation.world === undefined ? {} : { world: compactWorldForEvent(observation.world) }),
 		...(observation.currentAction === undefined ? {} : { currentAction: observation.currentAction }),
 		...(observation.lastResult === undefined ? {} : { lastResult: compactLastResultForEvent(observation.lastResult) }),
@@ -5408,7 +5416,7 @@ function retainedEventCoverage(coverage, retainedCounts) {
 	}));
 }
 
-const COMPACT_EVENT_ROW_FIELDS = ['uuid', 'stableId', 'type', 'name', 'position', 'x', 'y', 'z', 'distance', 'blockId', 'itemId', 'count', 'slot', 'tags', 'velocity', 'bounds', 'pickable', 'parentId', 'partName', 'state', 'bearing', 'elevation', 'id', 'feasible', 'moveTo', 'reason', 'cause', 'hazard', 'damage', 'maxDamage', 'fingerprint', 'hotbar', 'displayName', 'maxStackSize', 'hostile', 'alive', 'health', 'maxHealth', 'targetingAgent', 'swelling', 'fuse', 'perceivedBy', 'potentialRisk', 'risk', 'expectedHitDamage', 'withinInteractionRange', 'capabilities'];
+const COMPACT_EVENT_ROW_FIELDS = ['uuid', 'stableId', 'type', 'name', 'position', 'x', 'y', 'z', 'distance', 'blockId', 'itemId', 'count', 'slot', 'tags', 'velocity', 'bounds', 'pickable', 'parentId', 'partName', 'state', 'bearing', 'elevation', 'id', 'feasible', 'moveTo', 'reason', 'cause', 'hazard', 'damage', 'maxDamage', 'usesLeft', 'fingerprint', 'hotbar', 'displayName', 'maxStackSize', 'hostile', 'alive', 'health', 'maxHealth', 'targetingAgent', 'swelling', 'fuse', 'perceivedBy', 'potentialRisk', 'risk', 'expectedHitDamage', 'withinInteractionRange', 'capabilities'];
 
 // Blocks are about half of every event. Most rows repeat values that follow from the row itself.
 export const EVENT_BLOCK_DEFAULTS = 'Omitted block fields mean: stableId "x,y,z", bounds one full cube, state {}, tags from blockTags[blockId].';
