@@ -204,6 +204,40 @@ test('Codex interrupts and rotates at a tool boundary, handing off the current e
 	} finally { await run.service.stop(); }
 });
 
+test('Codex hands a steer queued on the running tool to the replacement thread once, with the RUNNING result', async () => {
+	const run = await setup({ contextRotationTokens: 60_000 });
+	let steerResult = null;
+	try {
+		run.transport.tool = { name: 'mine', arguments: { x: 1, y: 64, z: 0, expectedBlockId: 'minecraft:stone' } };
+		run.transport.contextTokens = 20_000;
+		await run.act('one');
+		await run.act('two');
+		run.transport.contextTokens = 70_000;
+		run.transport.emitUsageBeforeTool = true;
+		const pending = run.agent.act(event('latest third event'), { goalRevision: 1, executeTool: async () => {
+			run.transport.hold = true;
+			run.transport.tool = null;
+			steerResult = run.agent.steer('DANGER-FACTS-NEWEST', { goalRevision: 1 }).then((value) => value, (error) => ({ error: error.code }));
+			await turn();
+			return { state: 'RUNNING', reasonCode: 'ACTION_RUNNING', actionId: 'action-7' };
+		} });
+		void pending.catch(() => {});
+		await turn(); await turn(); await turn();
+		assert.equal(run.agent.rotations, 1);
+		const continuation = turnStarts(run.transport).at(-1).params.input[0].text;
+		assert.equal((continuation.match(/DANGER-FACTS-NEWEST/g) ?? []).length, 1, 'the pending steer reaches the replacement thread once');
+		assert.equal((continuation.match(/"reasonCode":"ACTION_RUNNING"/g) ?? []).length, 1, 'the RUNNING result reaches it once');
+		assert.equal(run.transport.calls.some(({ method }) => method === 'turn/steer'), false, 'no second delivery on the old thread');
+		const oldReply = run.transport.calls.find(({ method, id }) => method === '$respond' && id === 'call-3-1');
+		assert.doesNotMatch(oldReply.result.contentItems.map((item) => item.text).join(''), /DANGER-FACTS-NEWEST/);
+		const outcome = await steerResult;
+		assert.equal(outcome.error, undefined, 'the steer waiter resolves once the replacement turn starts');
+		run.transport.hold = false;
+		run.transport.finish();
+		await pending;
+	} finally { await run.service.stop(); }
+});
+
 test('carry-over remembers recent tools, chat and program state in a bounded text', () => {
 	const carry = new ContextCarryOver();
 	for (let index = 0; index < 12; index++) carry.rememberTool({ kind: 'action', actionType: 'break_block', arguments: { x: index } }, { state: 'SUCCEEDED', reasonCode: 'BLOCK_BROKEN' });

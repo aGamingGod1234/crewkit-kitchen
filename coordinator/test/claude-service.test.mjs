@@ -644,6 +644,49 @@ test('Claude rotates at a tool boundary and delivers the executed tool result on
 	} finally { await close(); }
 });
 
+test('a steer queued before a rotation handoff moves to the replacement session once, with the RUNNING early return', async () => {
+	let resumed = null;
+	let steerSettled = 0;
+	let builds = 0;
+	let older = null;
+	const { service, children, close } = await harness({
+		async onUser(child, content) {
+			const index = children.indexOf(child);
+			if (index === 0) {
+				usageLine(child, 'long-turn-over-threshold', 85_000);
+				await child.rpc('tools/call', { name: 'say', arguments: { message: 'long action' }, _meta: { 'claudecode/toolUseId': 'toolu_running' } });
+				child.emitLine({ type: 'result', subtype: 'success', is_error: false, result: 'old process ended', session_id: 'session-1' });
+				return;
+			}
+			resumed = content;
+			usageLine(child, 'resumed-turn', 30_000);
+			child.emitLine({ type: 'result', subtype: 'success', is_error: false, result: 'continued', session_id: 'session-2' });
+		},
+	}, { contextRotationTokens: 80_000 });
+	try {
+		const agent = await service.createAgent(profile(), { controlProtocol: 'native_tools' });
+		const result = await agent.act(nativeEvent(2), {
+			goalRevision: 0,
+			executeTool: async () => {
+				// The body is still busy: the tool returns a RUNNING early result while a newer event waits for this boundary.
+				older = agent.steer(async () => { builds += 1; return 'OLDER-SUPERSEDED-EVENT'; }, { goalRevision: 0 });
+				void agent.steer(async () => { builds += 1; return 'DANGER-EVENT-NEWEST'; }, { goalRevision: 0 }).then(() => { steerSettled += 1; }, () => {});
+				await settle(50);
+				return { state: 'RUNNING', reasonCode: 'ACTION_RUNNING' };
+			},
+		});
+		assert.equal(result.status, 'completed');
+		await older;
+		assert.equal(children.length, 2, 'the handoff happened at the RUNNING boundary');
+		assert.equal((resumed.match(/DANGER-EVENT-NEWEST/g) ?? []).length, 1, 'the pending steer reaches the replacement exactly once');
+		assert.equal((resumed.match(/"reasonCode":"ACTION_RUNNING"/g) ?? []).length, 1, 'the RUNNING result reaches the replacement exactly once');
+		assert.doesNotMatch(resumed, /Newer coordinator events/, 'the steer is the current input, not a second copy');
+		assert.equal(steerSettled, 1, 'the steer waiter resolves once');
+		assert.doesNotMatch(resumed, /OLDER-SUPERSEDED-EVENT/);
+		assert.equal(builds, 1, 'only the newest builder runs');
+	} finally { await close(); }
+});
+
 test('Claude carries a failed tool result across a first-turn boundary rotation exactly once', async () => {
 	let toolExecutions = 0;
 	let resumedInput = null;
