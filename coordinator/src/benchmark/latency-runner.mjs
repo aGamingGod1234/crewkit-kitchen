@@ -1037,6 +1037,7 @@ async function defaultReplayFactory(profile, context = {}) {
 		providerProfile: profile,
 		scenario: context.scenario ?? context.trial?.scenario ?? {},
 		protocolVersion: context.matrix?.protocolVersion ?? 2,
+		sleep: context.options?.sleep,
 	});
 }
 

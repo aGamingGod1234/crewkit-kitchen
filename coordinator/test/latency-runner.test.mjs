@@ -15,6 +15,8 @@ import { VIRTUAL_TICK_MS, VirtualWorld } from '../src/simulator/virtual-world.mj
 import { VirtualMinecraftBridge } from '../src/simulator/virtual-minecraft-bridge.mjs';
 
 const PROFILE = Object.freeze({ provider: 'instant', model: 'deterministic-v1', reasoningEffort: 'fixed', serviceTier: 'local' });
+// Trial and turn budgets here are real-time harness limits. They only have to outlast a loaded runner;
+// the tests that exercise a timeout set their own small budget.
 const SOURCE = 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); program.finish("done");';
 
 function matrix(overrides = {}) {
@@ -26,7 +28,7 @@ function matrix(overrides = {}) {
 		agentLoads: [1, 4, 8, 16],
 		trials: [1, 4, 8, 16].map((agentLoad) => ({
 			id: `instant-${agentLoad}`, mode: 'instant', scenarioId: 'fixture-wait', seed: 42, agentLoad,
-			providerProfile: PROFILE, repetitions: 1, turnBudgetMs: 100, trialBudgetMs: 1_000, turnCap: 2,
+			providerProfile: PROFILE, repetitions: 1, turnBudgetMs: 10_000, trialBudgetMs: 60_000, turnCap: 2,
 			providerAvailabilityRequired: false,
 		})),
 		...overrides,
@@ -286,7 +288,7 @@ test('command parity hashes actual ordered commands for every agent and rejects 
 	const run = async (durationMs) => {
 		let virtual;
 		const result = await runLatencyMatrix({
-			matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'command-parity', agentLoad: 4, turnBudgetMs: 1_000, trialBudgetMs: 5_000 }] }),
+			matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'command-parity', agentLoad: 4, turnBudgetMs: 10_000, trialBudgetMs: 60_000 }] }),
 			scenarioResolver: () => ({ ...fixtureScenario(), success: () => true }),
 			providerFactories: { instant: () => ({ ...instantProvider(), async createAgent() {
 				return { async setGoalRevision() {}, async decide() {
@@ -326,7 +328,7 @@ test('live-session parity ignores only session identity and still rejects change
 		scenario.world.agents = { [agentId]: scenario.world.agents[scenario.agentId] };
 		scenario.agentId = agentId;
 		const result = await runLatencyMatrix({
-			matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'live-command-parity', mode: 'live', providerProfile: profile, agentLoad: 4, turnBudgetMs: 1_000, trialBudgetMs: 5_000 }] }),
+			matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'live-command-parity', mode: 'live', providerProfile: profile, agentLoad: 4, turnBudgetMs: 10_000, trialBudgetMs: 60_000 }] }),
 			scenarioResolver: () => ({ ...scenario, success: () => true }),
 			providerFactories: { codex: () => ({ ...profile, synthetic: false, available: true, async createAgent() {
 				return { async setGoalRevision() {}, async decide() {
@@ -445,7 +447,7 @@ test('marks synthetic identity and returns scoped benchmark and system summaries
 	assert.ok(recorder.snapshot().every((row) => row.trialId === 'summary-trial'));
 });
 
-test('shipped default matrix proves physical stone-tool success for every isolated load', async () => {
+test('shipped default matrix proves physical stone-tool success for every isolated load', { timeout: 300_000 }, async () => {
 	const result = await runLatencyMatrix({ artifactDirectory: null });
 	assert.equal(result.status, 'PASSED');
 	assert.equal(result.trials.length, 20);
@@ -473,7 +475,7 @@ test('delayed stone-tool pacing completes in one planner turn without reactive c
 		matrix: matrix({
 			trials: [{
 				...matrix().trials[0], id: 'stone-delayed-completion', mode: 'live', scenarioId: scenario.id,
-				providerProfile: profile, trialBudgetMs: 5_000, turnBudgetMs: 1_000, turnCap: 4,
+				providerProfile: profile, trialBudgetMs: 60_000, turnBudgetMs: 10_000, turnCap: 4,
 			}],
 		}),
 		scenarioResolver: () => scenario,
@@ -587,7 +589,9 @@ test('createAgent is bounded by the trial deadline and stops the provider', asyn
 });
 
 test('provider stop after a timeout is bounded by cleanup policy', async () => {
-	const startedAt = performance.now();
+	let stopFinished = false;
+	let releaseStop;
+	const stopGate = new Promise((resolve) => { releaseStop = resolve; });
 	const result = await runLatencyMatrix({
 		matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'bounded-stop-timeout', trialBudgetMs: 100 }] }),
 		scenarioResolver: () => fixtureScenario(),
@@ -597,16 +601,20 @@ test('provider stop after a timeout is bounded by cleanup policy', async () => {
 				provider: 'instant',
 				synthetic: true,
 				async createAgent() { return new Promise(() => {}); },
-				async stop() { await new Promise((resolve) => setTimeout(resolve, 250)); },
+				async stop() { await stopGate; stopFinished = true; },
 			}),
 		},
 		artifactDirectory: null,
 	});
-	assert.equal(result.trials[0].status, 'TIMED_OUT');
-	assert.ok(performance.now() - startedAt < 220, 'timeout cleanup must not wait for an unbounded provider stop');
-	assert.equal(result.cleanup.ok, false, 'pending shutdown cannot be certified clean');
-	assert.equal(result.trials[0].cleanup.providerStop, 'pending');
-	assert.equal(result.executionStopped.code, 'CLEANUP_INCOMPLETE');
+	try {
+		assert.equal(result.trials[0].status, 'TIMED_OUT');
+		assert.equal(stopFinished, false, 'timeout cleanup must not wait for an unbounded provider stop');
+		assert.equal(result.cleanup.ok, false, 'pending shutdown cannot be certified clean');
+		assert.equal(result.trials[0].cleanup.providerStop, 'pending');
+		assert.equal(result.executionStopped.code, 'CLEANUP_INCOMPLETE');
+	} finally {
+		releaseStop();
+	}
 });
 
 test('malformed planner/runtime decisions remain typed failures instead of timeout results', async () => {

@@ -4,9 +4,15 @@ import { AgentRegistry, DynamicAgentState } from '../../src/agent-registry.mjs';
 import { createDynamicCoordinator as createProductionCoordinator } from '../../src/dynamic-main.mjs';
 import { validateProtocolV2Payload } from '../../src/protocol-v2.mjs';
 import { encodeNativeEventInput, decodeModelFacts } from '../../src/model-fact-encoding.mjs';
-async function until(predicate, label) {
-  for (let i = 0; i < 1000; i++) { if (predicate()) return; await new Promise(resolve => setTimeout(resolve, 5)); }
-  throw new Error(`Finite probe failed to reach: ${label}`);
+// A missing event is bounded by a wall-clock deadline, not an iteration count: with durable inbox writes
+// behind a contended disk the awaited condition legitimately takes tens of seconds.
+async function until(predicate, label, timeoutMs = 120_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (predicate()) return;
+    if (Date.now() > deadline) throw new Error(`Finite probe failed to reach: ${label}`);
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
 }
 async function flush() { await new Promise(resolve => setTimeout(resolve, 150)); }
 function gate() { let resolve, reject; const promise = new Promise((a,b) => { resolve=a; reject=b; }); return { promise, resolve, reject }; }

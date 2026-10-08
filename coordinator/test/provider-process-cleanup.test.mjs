@@ -215,7 +215,10 @@ test('Codex transport surfaces server tool requests and sends their JSON-RPC res
 	await transport.stop();
 });
 
-test('Windows cleanup terminates the complete provider process tree', async () => {
+test('Windows cleanup terminates the complete provider process tree', async (t) => {
+	// The forced pass only runs while the one outer deadline has time left, so a real 50 ms
+	// budget fails whenever a loaded runner stalls the event loop. Virtual time pins the order.
+	t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000 });
 	const child = new UncooperativeChild();
 	child.pid = 4_242;
 	const calls = [];
@@ -224,11 +227,15 @@ test('Windows cleanup terminates the complete provider process tree', async () =
 		callback(null, '', '');
 	};
 
-	await terminateChildProcess(child, {
+	const cleanup = terminateChildProcess(child, {
 		timeoutMs: 50,
 		platform: 'win32',
 		execFile: execute,
 	});
+	// Let the graceful taskkill settle and the half-deadline exit wait start before time moves.
+	await new Promise((resolve) => setImmediate(resolve));
+	t.mock.timers.tick(25);
+	await cleanup;
 
 	assert.deepEqual(calls.map((call) => call.args), [
 		['/PID', '4242', '/T'],
@@ -236,7 +243,8 @@ test('Windows cleanup terminates the complete provider process tree', async () =
 	]);
 });
 
-test('Windows cleanup accepts a late exit when forced taskkill reports an already-gone process', async () => {
+test('Windows cleanup accepts a late exit when forced taskkill reports an already-gone process', async (t) => {
+	t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000 });
 	const child = new UncooperativeChild();
 	child.pid = 4_243;
 	let calls = 0;
@@ -253,24 +261,27 @@ test('Windows cleanup accepts a late exit when forced taskkill reports an alread
 		});
 	};
 
-	await terminateChildProcess(child, {
-		// This assertion exercises the late-exit path, not the minimum timeout.
-		// Leave enough headroom for a loaded Windows CI runner to schedule the
-		// setImmediate callback after the graceful taskkill wait.
+	// Virtual time: the late-exit path must not depend on how fast a loaded runner schedules the
+	// graceful wait and the setImmediate exit.
+	const cleanup = terminateChildProcess(child, {
 		timeoutMs: 250,
 		platform: 'win32',
 		execFile: execute,
 	});
+	await new Promise((resolve) => setImmediate(resolve));
+	t.mock.timers.tick(125);
+	await cleanup;
 	assert.equal(calls, 2);
 });
 
-test('Windows cleanup has one outer deadline when taskkill never settles', async () => {
+test('Windows cleanup has one outer deadline when taskkill never settles', async (t) => {
+	t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000 });
 	const child = new UncooperativeChild();
 	child.pid = 4_244;
 	let calls = 0;
 	const startedAt = Date.now();
 
-	await assert.rejects(
+	const rejected = assert.rejects(
 		terminateChildProcess(child, {
 			timeoutMs: 20,
 			platform: 'win32',
@@ -278,9 +289,16 @@ test('Windows cleanup has one outer deadline when taskkill never settles', async
 		}),
 		/before the 20ms deadline/,
 	);
+	t.mock.timers.tick(20);
+	// Only zero-length waits may remain once the single deadline has passed.
+	for (let step = 0; step < 3; step++) {
+		await new Promise((resolve) => setImmediate(resolve));
+		t.mock.timers.tick(0);
+	}
+	await rejected;
 
 	assert.equal(calls, 1);
-	assert.ok(Date.now() - startedAt < 250);
+	assert.equal(Date.now() - startedAt, 20, 'no time beyond the one deadline was spent');
 	assert.deepEqual(child.signals, ['SIGKILL']);
 });
 

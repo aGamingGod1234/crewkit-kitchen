@@ -140,7 +140,9 @@ function windowsAclRepairScript() {
 
 async function currentWindowsSid() {
 	try {
-		const { stdout } = await execFile('whoami', ['/user', '/fo', 'csv', '/nh'], { windowsHide: true });
+		// A bare `whoami` resolves through PATH, where Git Bash's MSYS whoami shadows the Windows tool and rejects /user.
+		const systemRoot = process.env.SystemRoot ?? process.env.windir ?? 'C:\\Windows';
+		const { stdout } = await execFile(path.win32.join(systemRoot, 'System32', 'whoami.exe'), ['/user', '/fo', 'csv', '/nh'], { windowsHide: true });
 		const sid = String(stdout).match(/S-\d-\d+(?:-\d+)+/i)?.[0];
 		if (sid !== undefined) return sid;
 	} catch {

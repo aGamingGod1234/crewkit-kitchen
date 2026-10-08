@@ -2,6 +2,9 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { PendingConversationInbox } from '../../src/pending-conversation-inbox.mjs';
+// Every append is four fsynced writes, so these tests cost seconds on an idle CI disk and minutes when
+// builds share the disk. Their time is I/O latency, not behaviour, so they get their own budget.
+export const DISK_BOUND = { timeout: 600_000 };
 export const entry = (sequence) => ({ sequence, kind: 'player_message', sourceId: 'fixture-player', recipientId: 'fixture-agent',
 	scope: 'direct', text: `  Instruction ${sequence}: ${'x'.repeat(250)}  `, goalRevision: sequence % 3, observedAtEpochMs: sequence });
 export async function fixture(t, storeFactory) {

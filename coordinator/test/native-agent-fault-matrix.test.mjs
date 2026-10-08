@@ -93,7 +93,10 @@ test('temporarily unsupported profile stays active with one bounded recovery own
 	const result = await createNativeGoalHarness({
 		unsupportedProfile: true,
 		turns: [['observe']],
-	}).run();
+	}).run({
+		// Observe several recovery cycles instead of a wall-clock window, which a loaded runner shrinks.
+		stopWhen: (current) => current.recoveryDispatches >= 5,
+	});
 	assert.equal(result.finalState, DynamicAgentState.PLANNING);
 	assert.equal(result.states.includes(DynamicAgentState.ERROR), false);
 	assert.equal(result.states.includes(DynamicAgentState.PAUSED), false);

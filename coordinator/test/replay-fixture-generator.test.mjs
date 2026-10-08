@@ -5,6 +5,7 @@ import { generateReplayRecordings } from '../src/benchmark/replay-fixture-genera
 import { runLatencyMatrix, normalizeLatencyMatrix } from '../src/benchmark/latency-runner.mjs';
 import { getSimulatorScenario } from '../src/simulator/simulator-scenarios.mjs';
 import { VirtualMinecraftBridge } from '../src/simulator/virtual-minecraft-bridge.mjs';
+import { createVirtualClock } from './fixtures/virtual-clock.mjs';
 
 const PROFILE = Object.freeze({ provider: 'replay', model: 'capture-v1', reasoningEffort: 'fixed', serviceTier: 'local' });
 const SEED = 20260821;
@@ -32,7 +33,7 @@ function matrix(loads = [1, 4]) {
 	});
 }
 
-function activeActionHazardMatrix() {
+function activeActionHazardMatrix({ turnBudgetMs = 2_000, trialBudgetMs } = {}) {
 	const base = matrix([4]);
 	return normalizeLatencyMatrix({
 		...base,
@@ -40,7 +41,8 @@ function activeActionHazardMatrix() {
 			...trial,
 			id: 'active-action-lava-replay-4',
 			scenarioId: 'active-action-lava-attention',
-			turnBudgetMs: 2_000,
+			turnBudgetMs,
+			...(trialBudgetMs === undefined ? {} : { trialBudgetMs }),
 		})),
 	});
 }
@@ -54,10 +56,11 @@ function activeActionHazardScenario() {
 	};
 }
 
-async function withLavaAttentionDuringActiveWait(callback) {
+async function withLavaAttentionDuringActiveWait(callback, clock) {
 	const errors = [];
 	const virtualBridgeFactory = (options) => {
 		const bridge = new VirtualMinecraftBridge(options);
+		clock.observe(bridge);
 		const waiting = new Set();
 		const tick = options.world.tick;
 		// Start hazard time after every initial action is ready, independent of provider timer jitter.
@@ -152,15 +155,19 @@ test('ordinary delayed stone records remain single-turn and replay without promp
 });
 
 test('records a cleanup-aborted continuation after hazard attention during an active action', async () => {
-	const delayedMatrix = activeActionHazardMatrix();
+	// World ticks and provider delays share one virtual clock. Wall-clock timers made the tick count
+	// inside a 500 ms delay depend on machine load, so capture and replay saw different prompts.
+	const clock = createVirtualClock();
+	// The turn budgets are real-time harness limits, not part of what this test measures.
+	const delayedMatrix = activeActionHazardMatrix({ turnBudgetMs: 30_000, trialBudgetMs: 120_000 });
 	let initialDelays = 0;
 	const jitteredCaptureTimer = {
 		setTimeout(callback, milliseconds) {
 			// Reproduce one provider callback missing two world ticks under CI load.
 			const late = milliseconds === 10 && ++initialDelays === 3;
-			return setTimeout(callback, milliseconds + (late ? 100 : 0));
+			return clock.timer.setTimeout(callback, milliseconds + (late ? 100 : 0));
 		},
-		clearTimeout,
+		clearTimeout: clock.timer.clearTimeout,
 	};
 	await withLavaAttentionDuringActiveWait(async (virtualBridgeFactory) => {
 		const fixture = await generateReplayRecordings({
@@ -169,6 +176,7 @@ test('records a cleanup-aborted continuation after hazard attention during an ac
 			delayMs: ({ turnIndex }) => turnIndex === 0 ? 10 : 500,
 			delayTimer: jitteredCaptureTimer,
 			virtualBridgeFactory,
+			...clock.trialOptions(),
 		});
 		assert.ok(fixture.recordings.every((record) => record.decisions.length >= 2));
 		assert.equal(initialDelays, 4);
@@ -179,6 +187,8 @@ test('records a cleanup-aborted continuation after hazard attention during an ac
 			replayRecordings: fixture.recordings,
 			artifactDirectory: null,
 			virtualBridgeFactory,
+			sleep: clock.sleep,
+			...clock.trialOptions(),
 		});
 
 		assert.equal(replay.status, 'PASSED', JSON.stringify(replay.trials.map((trial) => trial.error)));
@@ -186,7 +196,7 @@ test('records a cleanup-aborted continuation after hazard attention during an ac
 		assert.notEqual(replay.trials[0].error?.code, 'REPLAY_EXHAUSTED');
 		assert.notEqual(replay.trials[0].error?.code, 'REPLAY_PROMPT_MISMATCH');
 		assert.equal(replay.cleanup.ok, true);
-	});
+	}, clock);
 });
 
 test('cancels and clears a pending capture delay when the provider turn times out', async () => {
@@ -204,7 +214,8 @@ test('cancels and clears a pending capture delay when the provider turn times ou
 	};
 	const timedOutMatrix = normalizeLatencyMatrix({
 		...matrix([1]),
-		trials: [{ ...matrix([1]).trials[0], turnBudgetMs: 20, trialBudgetMs: 250 }],
+		// The 20 ms turn budget is under test; the trial budget only has to outlast a loaded runner's setup.
+		trials: [{ ...matrix([1]).trials[0], turnBudgetMs: 20, trialBudgetMs: 30_000 }],
 	});
 
 	await assert.rejects(

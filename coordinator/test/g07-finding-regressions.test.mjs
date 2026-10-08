@@ -338,7 +338,8 @@ test('default live adapter retains pending stop after its gameplay session deadl
   const liveProfile={provider:'codex',model:'offline',reasoningEffort:'high',serviceTier:'priority'};
   const service={provider:'codex',async start(){},async createAgent(){if(++creates===1)return {};await createGate.promise;return {async decide(){throw Error('must not turn');}};},async removeAgent(){},async stop(){stops++;await stopGate.promise;}};
   try {
-    const result=await runLatencyMatrix({matrix:matrix({mode:'live',providerProfile:liveProfile,trialBudgetMs:60}),measurements:false,liveProviderOptions:{environment:{},serviceFactory:()=>{factories++;return service;}}});
+    // The deadline must fall after the second createAgent is pending; setup on a loaded runner can take well over 60 ms.
+    const result=await runLatencyMatrix({matrix:matrix({mode:'live',providerProfile:liveProfile,trialBudgetMs:3000}),measurements:false,liveProviderOptions:{environment:{},serviceFactory:()=>{factories++;return service;}}});
     assert.equal(creates,2);assert.equal(stops,1);assert.equal(factories,1);
     assert.equal(result.trials[0].status,'TIMED_OUT');assert.equal(result.cleanup.ok,false);
     assert.equal(result.trials[0].cleanup.providerStop,'pending');assert.equal(result.executionStopped.unexecutedTrials,1);

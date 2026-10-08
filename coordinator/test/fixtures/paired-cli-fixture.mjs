@@ -72,8 +72,11 @@ process.exitCode=report.status==='FAILED'?1:0;
 	await writeFile(matrixPath, JSON.stringify({ version: 1, scenarios: [{ id: 'natural-fixture', ...profile, task: mode, timeoutMs: 3000, scenarioTimeoutMs: 3000, world: { mode: 'natural', seed: '-9223372036854775808' }, requireFactualSuccess: true, assert: [{ type: 'rcon', command: 'data get entity {agent} Inventory', match: 'oak_log' }] }] }));
 	// Reserve setup, equal trial and cleanup for all four Windows fixture arms,
 	// plus terminal IO. Setup includes multiple shell/Node launches on CI.
-	const startupMs = 30000, trialMs = 3000, cleanupMs = 15000;
-	const config = { runtimeBudgetMs: 4 * (startupMs + trialMs + cleanupMs) + 3000, startupMs, cleanupMs, outputDirectory: path.join(directory, 'result'), matrixPath, serverTemplate, arms, scenarios: [{ id: 'natural-fixture', seed: '-9223372036854775808', trialMs }] };
+	// startupMs and the terminal slack are ceilings, not waits: a PowerShell cold start under CPU
+	// contention took 33 s against the former 30 s, which timed the first arm out and left the
+	// run INCOMPLETE. The 3 s trial and the cleanup limit are what the tests exercise.
+	const startupMs = 120000, trialMs = 3000, cleanupMs = 15000;
+	const config = { runtimeBudgetMs: 4 * (startupMs + trialMs + cleanupMs) + 60000, startupMs, cleanupMs, outputDirectory: path.join(directory, 'result'), matrixPath, serverTemplate, arms, scenarios: [{ id: 'natural-fixture', seed: '-9223372036854775808', trialMs }] };
 	const fakeLauncher = path.join(directory, 'fake-launcher.ps1');
 	await writeFile(fakeLauncher, `param([string] $ProjectRoot, [switch] $FunctionsOnly)
 . ${quotePS(launcher)} -ProjectRoot $ProjectRoot -FunctionsOnly

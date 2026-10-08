@@ -400,7 +400,8 @@ test('buildClaudeLaunch keeps the bridge secret out of the child and disables au
 	assert.equal(launch.options.windowsHide, true);
 });
 
-async function waitFor(predicate, timeoutMs = 2_000) {
+// The deadline only bounds a failure; a passing test never waits for it, so it carries no behaviour under load.
+async function waitFor(predicate, timeoutMs = 20_000) {
 	const started = Date.now();
 	while (!predicate()) {
 		if (Date.now() - started > timeoutMs) throw new Error('condition was not reached');
@@ -587,7 +588,7 @@ test('rotation waits for hysteresis, happens after a finished turn with a prewar
 		const second = sentPayload(children[0].lines.filter((line) => line.type === 'user')[1].message.content);
 		assert.deepEqual(second.data.sameAsPreviousEvent, ['goalSpec', 'taskMemory']);
 		await run(3);
-		await settle();
+		await waitFor(() => children.length === 2 && children[0].exitCode !== null);
 		assert.equal(children.length, 2, 'the warmed standby becomes the new session without another spawn');
 		assert.notEqual(children[0].exitCode, null);
 		await run(4);
@@ -1091,7 +1092,7 @@ test('an unacknowledged interrupt restarts Claude Code without omitted facts fro
 		answer = false;
 		const stuck = agent.act(nativeEvent(2), { goalRevision: 0, executeTool: async () => ({}) });
 		void stuck.catch(() => {});
-		await settle();
+		await waitFor(() => children[0].lines.filter((line) => line.type === 'user').length === 2);
 		await agent.interrupt();
 		await assert.rejects(stuck);
 		answer = true;
@@ -1132,7 +1133,7 @@ test('a tool result for a settled turn is not committed as an observation baseli
 		await agent.interrupt();
 		await assert.rejects(first);
 		release();
-		await settle();
+		await waitFor(() => firstView !== null);
 		assert.equal(firstView.mode, 'full');
 		await agent.act('Two.', { goalRevision: 0, executeTool: async () => observed });
 		assert.equal(secondView.mode, 'full', 'a view the model never saw cannot be a changes baseline');
@@ -1140,24 +1141,22 @@ test('a tool result for a settled turn is not committed as an observation baseli
 });
 
 test('a steer that never reached the model does not become the metadata baseline', async () => {
-	let respond;
-	let responseCount = 0;
+	const responders = [];
 	const { service, children, close } = await harness({
-		async onUser(child) { responseCount += 1; respond = () => child.emitLine({ type: 'result', subtype: 'success', is_error: false, result: 'ok', session_id: 'session-1' }); },
+		async onUser(child) { responders.push(() => child.emitLine({ type: 'result', subtype: 'success', is_error: false, result: 'ok', session_id: 'session-1' })); },
 	});
 	try {
 		const agent = await service.createAgent(profile(), { controlProtocol: 'native_tools' });
 		const turn = agent.act(nativeEvent(1), { goalRevision: 0, executeTool: async () => ({}) });
-		await waitFor(() => responseCount > 0);
+		await waitFor(() => responders.length === 1);
 		const steer = agent.steer(nativeEvent(2, (wake) => ({ ...wake, taskMemory: { ...wake.taskMemory, revision: 99 } })), { goalRevision: 0 });
 		void steer.catch(() => {});
-		respond();
+		responders[0]();
 		await turn;
 		await assert.rejects(steer, (error) => error.code === 'TURN_NOT_ACTIVE');
-		const previousResponses = responseCount;
 		const next = agent.act(nativeEvent(3), { goalRevision: 0, executeTool: async () => ({}) });
-		await waitFor(() => responseCount > previousResponses);
-		respond();
+		await waitFor(() => responders.length === 2);
+		responders[1]();
 		await next;
 		const payload = sentPayload(children[0].lines.filter((line) => line.type === 'user')[1].message.content).data;
 		assert.deepEqual(payload.sameAsPreviousEvent, ['goalSpec', 'taskMemory'], 'compared with the delivered turn, not the rejected steer');

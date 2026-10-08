@@ -908,7 +908,7 @@ const results = [];
   }
 }
 
-test("g01 f019 completed lifecycle automatically recovers rejected steering with conversation-only authority", { timeout: 15000 }, async () => {
+test("g01 f019 completed lifecycle automatically recovers rejected steering with conversation-only authority", { timeout: 120000 }, async () => {
 const { EventEmitter } = await import('node:events');
 const { fileURLToPath } = await import('node:url');
 const { mkdir, writeFile } = await import('node:fs/promises');
@@ -923,9 +923,9 @@ const { validateProtocolV2Payload } = await import('../src/protocol-v2.mjs');
 // Independently authored integration. Only transport/server replies are fixtures.
 const owned = fileURLToPath(new URL('./', import.meta.url));
 const tick = () => new Promise(resolve => setImmediate(resolve));
-async function until(predicate, label) {
-  for (let i=0; i<500; i++) { if (predicate()) return; await new Promise(r=>setTimeout(r, 5)); }
-  throw new Error(`Did not reach ${label}`);
+async function until(predicate, label, timeoutMs=120000) {
+  const deadline=Date.now()+timeoutMs;
+  for(;;) { if (predicate()) return; if (Date.now()>deadline) throw new Error(`Did not reach ${label}`); await new Promise(r=>setTimeout(r, 5)); }
 }
 class Clock {
   now=0; seq=0; timers=new Map();
