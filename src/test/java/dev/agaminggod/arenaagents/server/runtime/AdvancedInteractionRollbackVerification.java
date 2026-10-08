@@ -99,7 +99,7 @@ public final class AdvancedInteractionRollbackVerification {
 			verifyExternallyClosedCraftMenu(components);
 			if (failure != null) throw failure;
 		}
-		return 179;
+		return 189;
 	}
 
 	/** Tick a table pickaxe craft until both planks cells are filled and one plank is still on the cursor. */
@@ -372,6 +372,40 @@ public final class AdvancedInteractionRollbackVerification {
 		assertTrue(timedResult.message().contains("timeoutMs 2000 allows only 10 crafts"), "the time limit is named: " + timedResult.message());
 		assertEquals(40, count(slow, Items.OAK_PLANKS), "ten crafts made forty planks");
 		assertEquals(54, count(slow, Items.OAK_LOG), "ten logs were used");
+		assertTrue(timedResult.message().contains("16 crafts need a timeoutMs of about 2800"),
+				"the timeout the full batch needs is named: " + timedResult.message());
+
+		Fixture adequate = craftFixture();
+		adequate.inventory().setItem(0, components.stack(Items.OAK_LOG, 64, 0));
+		var enough = json("recipeId", "minecraft:oak_planks", "count", 64, "timeoutMs", 2800);
+		var enoughTransaction = service().begin(adequate.player(), request(ActionType.CRAFT_INVENTORY, enough), enough);
+		var enoughResult = tickToEnd(adequate, enoughTransaction).result();
+		enoughTransaction.cleanup();
+		assertEquals("CRAFT_CONFIRMED", enoughResult.reasonCode(), "the named timeout crafts the whole batch: " + enoughResult.message());
+		assertEquals(64, count(adequate, Items.OAK_PLANKS), "sixteen crafts made sixty-four planks");
+
+		// Exactly sixteen logs fill the cell with one whole-stack click, so the batch is not trimmed by the click pace.
+		Fixture exact = craftFixture();
+		exact.inventory().setItem(0, components.stack(Items.OAK_LOG, 16, 0));
+		var exactRequest = json("recipeId", "minecraft:oak_planks", "count", 64, "timeoutMs", 2000);
+		var exactTransaction = service().begin(exact.player(), request(ActionType.CRAFT_INVENTORY, exactRequest), exactRequest);
+		var exactResult = tickToEnd(exact, exactTransaction).result();
+		exactTransaction.cleanup();
+		assertEquals("CRAFT_CONFIRMED", exactResult.reasonCode(), "an exact stack is not trimmed: " + exactResult.message());
+		assertEquals(64, count(exact, Items.OAK_PLANKS), "sixteen crafts made sixty-four planks from the exact stack");
+		assertEquals(0, count(exact, Items.OAK_LOG), "every log was used");
+
+		// Ten and ten: the first stack goes in whole, six are counted out of the second and four go back.
+		Fixture split = craftFixture();
+		split.inventory().setItem(0, components.stack(Items.OAK_LOG, 10, 0));
+		split.inventory().setItem(1, components.stack(Items.OAK_LOG, 10, 0));
+		var splitTransaction = service().begin(split.player(), request(ActionType.CRAFT_INVENTORY, exactRequest), exactRequest);
+		var splitResult = tickToEnd(split, splitTransaction).result();
+		splitTransaction.cleanup();
+		assertEquals("CRAFT_CONFIRMED", splitResult.reasonCode(), "split stacks that fit the pace are not trimmed: " + splitResult.message());
+		assertEquals(64, count(split, Items.OAK_PLANKS), "split stacks made sixty-four planks");
+		assertEquals(4, count(split, Items.OAK_LOG), "the four spare logs went back");
+		assertTrue(split.player().inventoryMenu.getCarried().isEmpty(), "cursor cleaned after the split batch");
 
 		Fixture crowded = craftFixture();
 		crowded.inventory().setItem(0, components.stack(Items.OAK_LOG, 5, 0));

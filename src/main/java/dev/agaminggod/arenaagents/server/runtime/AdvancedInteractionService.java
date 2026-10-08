@@ -200,12 +200,39 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 	}
 
 	/**
-	 * Upper bound on the time a batch of {@code crafts} takes at player click pace: opening, a pickup and a put-back
-	 * per ingredient, one click per item placed in each cell, the result click and the linger.
+	 * Clicks that fill {@code cells} cells of one ingredient with {@code crafts} items each, replaying the fill: a pickup
+	 * takes a whole slot, a left click places the carried stack when it fits the cell, otherwise one right click per
+	 * item, and what is left is put back. {@code stacks} are the slots holding the ingredient in pickup order.
 	 */
-	static long craftBatchMs(int cells, int ingredients, int crafts) {
-		long clicks = 2L * ingredients + (long) cells * crafts + 1L;
-		return (CraftTransaction.OPEN_TICKS + clicks * CraftTransaction.CLICK_TICKS + CraftTransaction.LINGER_TICKS) * 50L;
+	static int craftIngredientClicks(List<Integer> stacks, int cells, int crafts) {
+		int clicks = 0;
+		int carried = 0;
+		int next = 0;
+		for (int cell = 0; cell < cells; cell++) {
+			int needed = crafts;
+			while (needed > 0) {
+				if (carried == 0) {
+					if (next >= stacks.size()) return clicks;
+					carried = stacks.get(next++);
+					clicks++;
+				}
+				if (carried <= needed) {
+					clicks++;
+					needed -= carried;
+					carried = 0;
+				} else {
+					clicks += needed;
+					carried -= needed;
+					needed = 0;
+				}
+			}
+		}
+		return carried > 0 ? clicks + 1 : clicks;
+	}
+
+	/** Time a craft of {@code clicks} fill clicks takes at player click pace: opening, the clicks, the result click and the linger. */
+	static long craftBatchMs(long clicks) {
+		return (CraftTransaction.OPEN_TICKS + (clicks + 1L) * CraftTransaction.CLICK_TICKS + CraftTransaction.LINGER_TICKS) * 50L;
 	}
 
 	static String craftPlacementFailureReason(RecipeBookMenu.PostPlaceAction placement) {
@@ -1100,7 +1127,7 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 					reasonCode = "DESTINATION_FULL";
 					message = "Player inventory cannot accept the complete crafting result";
 				} else {
-					Refusal refusal = planBatch(output, input);
+					Refusal refusal = planBatch(output, input, beforePlacement);
 					if (refusal != null) {
 						reasonCode = refusal.code();
 						message = refusal.message();
@@ -1134,13 +1161,11 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 		 * inventory holds, a cell's stack size, the room for the result and the action's time budget. Fills
 		 * {@link #pendingGrid} with the items each cell still needs.
 		 */
-		private Refusal planBatch(ItemStack output, CraftingInput input) {
+		private Refusal planBatch(ItemStack output, CraftingInput input, CraftMenuSnapshot beforePlacement) {
 			requestedCrafts = craftsForRequest(output.getCount(), integer(arguments, "count"));
 			List<ItemStack> kinds = new ArrayList<>();
-			int cells = 0;
 			for (Slot slot : gridSlots) {
 				if (!slot.hasItem()) continue;
-				cells++;
 				if (kinds.stream().noneMatch(kind -> ItemStack.isSameItemSameComponents(kind, slot.getItem()))) {
 					kinds.add(slot.getItem().copyWithCount(1));
 				}
@@ -1176,11 +1201,15 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 				crafts = room;
 				limit = "the inventory has room for only " + craftsText(crafts);
 			}
-			// Clicking is paced like a player's, so a large batch needs a larger timeoutMs; do what fits.
+			// Clicking is paced like a player's, so a large batch needs a larger timeoutMs; do what fits. The clicks
+			// follow the real stacks: a whole stack goes in with one click, a longer one is counted out per item.
 			long budgetMs = timeoutMs * 3L / 4L;
-			while (crafts > 1 && craftBatchMs(cells, kinds.size(), crafts) > budgetMs) {
+			int fitCrafts = crafts;
+			long fullBatchMs = craftFillMs(kinds, crafts, beforePlacement);
+			while (crafts > 1 && craftFillMs(kinds, crafts, beforePlacement) > budgetMs) {
 				crafts--;
-				limit = "timeoutMs " + timeoutMs + " allows only " + craftsText(crafts);
+				limit = "timeoutMs " + timeoutMs + " allows only " + craftsText(crafts)
+						+ "; " + craftsText(fitCrafts) + " need a timeoutMs of about " + (fullBatchMs * 4L / 3L);
 			}
 			plannedCrafts = crafts;
 			craftLimit = crafts < requestedCrafts ? limit : null;
@@ -1194,6 +1223,24 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 				}
 			}
 			return null;
+		}
+
+		/** Pace of filling the grid for {@code crafts} crafts, from the inventory as it was before the dry run. */
+		private long craftFillMs(List<ItemStack> kinds, int crafts, CraftMenuSnapshot beforePlacement) {
+			long clicks = 0;
+			for (ItemStack kind : kinds) {
+				int kindCells = (int) gridSlots.stream().filter(slot ->
+						slot.hasItem() && ItemStack.isSameItemSameComponents(slot.getItem(), kind)).count();
+				List<Integer> stacks = new ArrayList<>();
+				for (int index = playerSlotStart(); index <= playerSlotEnd(); index++) {
+					ItemStack held = beforePlacement.slots().get(index);
+					if (!held.isEmpty() && ItemStack.isSameItemSameComponents(held, kind) && menu.getSlot(index).mayPickup(player)) {
+						stacks.add(held.getCount());
+					}
+				}
+				clicks += craftIngredientClicks(stacks, kindCells, crafts);
+			}
+			return craftBatchMs(clicks);
 		}
 
 		private static String craftsText(int crafts) {
