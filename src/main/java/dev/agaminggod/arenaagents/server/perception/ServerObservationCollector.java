@@ -525,7 +525,12 @@ public final class ServerObservationCollector {
 		SightSample sight = landmarkCache.getOrCompute(
 			landmarkKey,
 			level.getGameTime(),
-			() -> sightRays(level, agent, position)
+			() -> {
+				long started = PerceptionTiming.start();
+				SightSample rays = sightRays(level, agent, position);
+				PerceptionTiming.record("sight_rays", started);
+				return rays;
+			}
 		);
 		JsonObject value = new JsonObject();
 		value.add("blocks", blocks(level, agent, raw.blocks(), visibility));
@@ -1052,6 +1057,7 @@ public final class ServerObservationCollector {
 			SightedMemo memo = sightedSamples.get(agentId);
 			if (!sightedDue(memo, dimension, gameTime)) return memo.sample();
 		}
+		long started = PerceptionTiming.start();
 		List<BlockPos> seenLocalOre = new ArrayList<>();
 		int visibilityChecks = 0;
 		for (BlockObservationOrdering.Candidate candidate : raw.blocks()) {
@@ -1062,6 +1068,7 @@ public final class ServerObservationCollector {
 		}
 		SightedFeatures.Sample sample = SightedFeatures.sample(level, agent.getEyePosition(), rays.hits(), rays.openings(),
 				seenLocalOre, visibility::canSeeBlock);
+		PerceptionTiming.record("sighted", started);
 		synchronized (sightedSamples) {
 			sightedSamples.put(agentId, new SightedMemo(dimension, gameTime, sample));
 		}
