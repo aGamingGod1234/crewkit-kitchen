@@ -2,6 +2,8 @@ package dev.agaminggod.arenaagents.server.perception;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /** Verifies threat signals: latched debounce, one attention edge per new signal, and forced delivery. */
@@ -20,7 +22,86 @@ public final class ThreatAttentionVerification {
 		verifyForcedDelivery();
 		verifyHeardThreats();
 		verifySignalRules();
+		verifyTrend();
+		verifyCreeperTimeline();
 		return assertions;
+	}
+
+	private static void verifyTrend() {
+		// Blocks per tick in, blocks per second out: a creeper walking 0.13 b/t straight at a standing agent.
+		check(Math.abs(ThreatPerception.closingSpeed(0.0D, 0.0D, 0.0D, 0.0D, 16.0D, 0.0D, -0.13D, 0.0D) - 2.6D) < 1.0E-9D,
+				"closing speed is the approach along the line between them, per second");
+		check(ThreatPerception.closingSpeed(0.0D, 0.0D, 0.0D, 0.0D, 16.0D, 0.0D, 0.13D, 0.0D) < 0.0D, "receding is negative");
+		check(Math.abs(ThreatPerception.closingSpeed(0.0D, 0.0D, 0.0D, 0.0D, 16.0D, 0.0D, 0.0D, 0.13D)) < 1.0E-9D,
+				"circling at a fixed distance is not closing");
+		check(Math.abs(ThreatPerception.closingSpeed(0.0D, 0.0D, -0.13D, 0.0D, 16.0D, 0.0D, -0.13D, 0.0D)) < 1.0E-9D,
+				"a chaser matching a fleeing agent's speed is not closing");
+		check(ThreatPerception.closingSpeed(0.0D, 0.0D, 0.0D, 0.0D, 0.0D, 0.0D, 1.0D, 1.0D) == 0.0D, "a coincident body has no direction");
+
+		ThreatPerception.Trend creeper = ThreatPerception.trend(16.0D, 2.6D, true, false);
+		check(creeper.approaching() && creeper.contactRange() == ThreatPerception.CREEPER_CONTACT && creeper.etaSeconds() == 5.0D,
+				"a creeper 16 blocks off at 2.6 b/s reaches fuse range (3 blocks) in 5 s");
+		check(ThreatPerception.trend(10.0D, 4.0D, false, false).etaSeconds() == 2.0D, "a melee mob reaches 2 blocks of reach");
+		check(ThreatPerception.trend(1.5D, 0.0D, false, false).etaSeconds() == 0.0D, "already in reach is an ETA of 0");
+		ThreatPerception.Trend pacing = ThreatPerception.trend(8.0D, 0.1D, false, false);
+		check(!pacing.approaching() && Double.isNaN(pacing.etaSeconds()), "pacing is not approaching and has no ETA");
+		check(Double.isNaN(ThreatPerception.trend(12.0D, 3.0D, false, true).etaSeconds()), "a ranged mob already reaches; no ETA");
+
+		check(!ThreatPerception.signals(false, true, true, false, false, true, 16.0D, false, 5.0D).contains(ThreatPerception.IMMINENT),
+				"5 s out is targeting only");
+		check(ThreatPerception.signals(false, true, true, false, false, true, 10.0D, false, 2.9D).equals(List.of("targeting", "imminent")),
+				"under 3 s a hunting creeper is imminent, one more edge before it is close");
+		check(ThreatPerception.signals(false, false, true, false, false, true, 8.0D, false, 2.0D).contains(ThreatPerception.IMMINENT),
+				"a creeper that sees the agent and walks in is imminent even before it targets");
+		check(!ThreatPerception.signals(false, false, true, false, false, false, 8.0D, false, 2.0D).contains(ThreatPerception.IMMINENT),
+				"one behind a wall that is not hunting is not");
+		check(!ThreatPerception.signals(false, true, false, false, true, true, 8.0D, false, 1.0D).contains(ThreatPerception.IMMINENT),
+				"ranged mobs use ranged_sight, not imminent");
+		check(ThreatPerception.signals(true, false, false, false, false, true, 3.0D, false, 1.0D).isEmpty(),
+				"a calm neutral mob walking past is not imminent");
+		check(!ThreatPerception.signals(false, true, false, false, false, true, 8.0D, false, Double.NaN).contains(ThreatPerception.IMMINENT),
+				"no ETA (not approaching) is never imminent");
+
+		JsonObject before = observation();
+		before.add("threats", threats(entry(CREEPER, "minecraft:creeper", "targeting")));
+		JsonObject after = observation();
+		JsonObject both = entry(CREEPER, "minecraft:creeper", "targeting");
+		both.getAsJsonArray("signals").add("imminent");
+		after.add("threats", threats(both));
+		check(AttentionFactDelta.between(before, after, 1L, 1L).changedFacts().equals(List.of("threats." + CREEPER + ".imminent")),
+				"becoming imminent is a new urgent edge for an already reported threat");
+
+		ThreatPerception.Snapshot snapshot = new ThreatPerception.Snapshot(List.of(
+				new ThreatPerception.Entry(CREEPER, "minecraft:creeper", 16.0D, 0.0D, true, false, true, List.of("targeting"), 4.3D, Map.of(),
+						0.0D, creeper, 145.0D),
+				new ThreatPerception.Entry(ZOMBIE, "minecraft:zombie", 6.0D, 0.0D, true, false, true, List.of("targeting"), 30.0D, Map.of(),
+						3.0D, pacing, Double.NaN)), Set.of(), -1, null);
+		JsonArray rows = ThreatPerception.toJson(snapshot).getAsJsonArray("entries");
+		JsonObject first = rows.get(0).getAsJsonObject();
+		check(first.get("closingSpeed").getAsDouble() == 2.6D && first.get("approaching").getAsBoolean()
+				&& first.get("etaSeconds").getAsDouble() == 5.0D && first.get("contactRisk").getAsDouble() == 145.0D,
+				"the wire row carries closing speed, approaching, ETA and the risk at contact");
+		JsonObject second = rows.get(1).getAsJsonObject();
+		check(!second.get("approaching").getAsBoolean() && !second.has("etaSeconds") && !second.has("contactRisk"),
+				"a body that is not approaching has no ETA or contact risk on the wire");
+	}
+
+	/**
+	 * Play-test (2026-10-08): a creeper targeting the agent read risk 4 at 16 blocks and the model treated it as minor;
+	 * risk only reached 100-200 at about 3 blocks. The risk at contact range shows what was coming from the first edge.
+	 */
+	private static void verifyCreeperTimeline() {
+		double far = RiskModel.score(creeper(16.0D, 0.0D)).risk();
+		double five = RiskModel.score(creeper(5.0D, ThreatDamage.explosionDamage(5.0D, ThreatDamage.CREEPER_RADIUS))).risk();
+		double contact = RiskModel.score(creeper(ThreatPerception.CREEPER_CONTACT,
+				ThreatDamage.explosionDamage(ThreatPerception.CREEPER_CONTACT, ThreatDamage.CREEPER_RADIUS))).risk();
+		check(far >= 3.0D && far <= 6.0D, "a hunting creeper 16 blocks off scores about 4 (" + far + ")");
+		check(five < 100.0D, "still under 100 at 5 blocks (" + five + ")");
+		check(contact >= 100.0D && contact <= 200.0D, "about 145 once it is at fuse range, " + contact + "; that is its contactRisk");
+	}
+
+	private static RiskModel.Input creeper(double distance, double hit) {
+		return new RiskModel.Input(0.6D, 1.7D, 20.0D, 0.0D, false, 0.25D, 0.13D, distance, hit, false, false, true, false, 0.0D);
 	}
 
 	private static void verifyLatch() {

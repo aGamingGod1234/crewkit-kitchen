@@ -68,6 +68,17 @@ public final class ThreatDamage {
 		return LOCAL.get().cached(attacker, agent);
 	}
 
+	/** Expected blast on this agent were the creeper to explode {@code distance} blocks away (risk at contact). */
+	public static double creeperBlastAt(Creeper creeper, ServerPlayer agent, double distance) {
+		try {
+			double radius = CREEPER_RADIUS * (creeper.isPowered() ? 2.0D : 1.0D);
+			DamageSource source = agent.level().damageSources().explosion(creeper, creeper);
+			return round(afterDefenses(agent.level(), agent, source, explosionDamage(distance, radius)));
+		} catch (RuntimeException unexpected) {
+			return RiskModel.REFERENCE_HIT_DAMAGE;
+		}
+	}
+
 	private Estimate cached(LivingEntity attacker, ServerPlayer agent) {
 		long tick = agent.level().getGameTime();
 		if (tick != cacheTick) {

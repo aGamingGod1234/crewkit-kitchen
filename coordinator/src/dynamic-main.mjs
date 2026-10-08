@@ -149,6 +149,8 @@ export class DynamicCoordinator extends EventEmitter {
 	#nativeWorldSignals = new Map();
 	// Low-health wakes of agents with no task, one per health level (see lowHealthWake).
 	#healWakes = new Map();
+	// Low-health-with-food nudges of agents with a task (see healNudgeVerdict).
+	#healNudges = new Map();
 	#nativeConfirmationWaits = new Map();
 	// Agents that started body work while their finished goal awaits confirmation: their follow-up wakes pass.
 	#confirmationActivity = new Set();
@@ -655,6 +657,7 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#nativeConversationRecoveries.delete(message.agentId);
 			this.#nativeObservationSignatures.delete(message.agentId);
 			this.#nativeWorldSignals.delete(message.agentId);
+			this.#healNudges.delete(message.agentId);
 			this.#nativeConfirmationWaits.delete(message.agentId);
 			this.#confirmationActivity.delete(message.agentId);
 			this.#supervisedObservationRequests.delete(message.agentId);
@@ -921,9 +924,10 @@ export class DynamicCoordinator extends EventEmitter {
 					: null;
 				const classified = classifyObservationTrigger(this.#withoutSoundOnlyAttention(record.agentId, message.payload, wireObservation), wireObservation, worldSignals);
 				const pendingAttention = this.#pendingAttention.get(record.agentId);
-				const attention = pendingAttention?.goalRevision === record.goalRevision
+				const merged = pendingAttention?.goalRevision === record.goalRevision
 					? mergeAttentionTrigger(classified, pendingAttention)
 					: classified;
+				const attention = noTask ? merged : this.#withHealNudge(record, observation, merged);
 				if (pendingAttention?.goalRevision === record.goalRevision) this.#pendingAttention.delete(record.agentId);
 				if (noTask) {
 					this.#observeWithoutTask(record, observation, message.payload, attention, lifecycleGeneration, connectionEpoch);
@@ -1544,9 +1548,9 @@ export class DynamicCoordinator extends EventEmitter {
 		if (!this.#usesNativeTools(record) || ![DynamicAgentState.IDLE, DynamicAgentState.COMPLETED].includes(record.state)) return false;
 		if (observation === null || observation === undefined || this.#providerWork.has(record.agentId)) return false;
 		const latch = this.#healWakes.get(record.agentId);
-		const verdict = lowHealthWake(observation, latch?.goalRevision === record.goalRevision ? latch.health : null);
-		if (verdict.health === null) this.#healWakes.delete(record.agentId);
-		else this.#healWakes.set(record.agentId, { goalRevision: record.goalRevision, health: verdict.health });
+		const verdict = healWakeVerdict(observation, latch?.goalRevision === record.goalRevision ? latch : null);
+		if (verdict.latch === null) this.#healWakes.delete(record.agentId);
+		else this.#healWakes.set(record.agentId, { goalRevision: record.goalRevision, ...verdict.latch });
 		if (!verdict.wake) return false;
 		this.#nativeRuntimeEpochs.set(record.agentId, connectionEpoch);
 		this.#writeTrace('native_heal_wake', { agentId: record.agentId, goalRevision: record.goalRevision, health: observation.player.health, foodLevel: observation.player.foodLevel ?? null });
@@ -1564,6 +1568,23 @@ export class DynamicCoordinator extends EventEmitter {
 			nativeEvent: { event: 'observation', trigger: 'low_health_idle', observation, conversationOnly: true, selfCareWake: true, healing: healingFacts(observation) },
 		});
 		return true;
+	}
+
+	/**
+	 * An agent with a task at low health with food in reach: one urgent attention edge (debounced, see healNudgeVerdict)
+	 * so the model hears it at once instead of in the 30 s ordinary window. It carries healing facts and options; the
+	 * routine keeps running unless the model chooses otherwise. Danger observations pass through untouched.
+	 */
+	#withHealNudge(record, observation, attention) {
+		if (!this.#usesNativeTools(record) || attention.priority === 'urgent') return attention;
+		const latch = this.#healNudges.get(record.agentId);
+		const verdict = healNudgeVerdict(observation, latch?.goalRevision === record.goalRevision ? latch : null, safeClockRead(this.#epochNow));
+		if (verdict.latch === null) this.#healNudges.delete(record.agentId);
+		else this.#healNudges.set(record.agentId, { goalRevision: record.goalRevision, ...verdict.latch });
+		if (!verdict.nudge) return attention;
+		this.#writeTrace('native_heal_nudge', { agentId: record.agentId, goalRevision: record.goalRevision, health: observation.player.health,
+			foodLevel: observation.player.foodLevel ?? null, options: verdict.options });
+		return { attention: true, priority: 'urgent', trigger: 'low_health_food' };
 	}
 
 	#scheduleNativeConversation(record, event, trigger) {
@@ -4950,9 +4971,14 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 			omittedEntries: 0,
 		};
 	const isPlanningDue = normalizedEvent === 'program_planning_due';
+	// A program's attention event names the program, so the decision carries the trigger that raised it.
+	const effectiveTrigger = status?.decision?.trigger ?? trigger;
+	const eventHealing = healing ?? (HEALING_EVENT_TRIGGERS.has(effectiveTrigger) && Number.isFinite(observation.player?.health) ? healingFacts(observation) : null);
+	const outlook = isPlanningDue ? null : threatOutlook(observation);
 	const payload = {
 		event: normalizedEvent,
 		trigger: typeof trigger === 'string' && trigger.length > 0 ? trigger : (isPlanningDue ? normalizedEvent : 'observation'),
+		...(outlook === null ? {} : { threatOutlook: outlook }),
 		mode: conversationOnly === true ? 'conversation_only' : 'goal',
 		goal: record?.currentGoal ?? null,
 		goalSpec: record?.currentGoalSpec ?? null,
@@ -4961,7 +4987,7 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 		...(eventSequence === undefined ? {} : { eventSequence }),
 		// Repeated hits folded since the last update, so one steer carries what several used to.
 		...(dangerSummary === null || dangerSummary === undefined ? {} : { dangerSinceLastUpdate: dangerSummary }),
-		...(healing === null || healing === undefined ? {} : { healing }),
+		...(eventHealing === null || eventHealing === undefined ? {} : { healing: eventHealing }),
 		observation: isPlanningDue ? compactPlanningDueObservation(compactObservation) : compactObservation,
 		conversation: unreadConversation,
 		...(programId === undefined ? {} : { program: { programId,
@@ -5016,7 +5042,9 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 			? 'Live Minecraft event. Program paused for danger: call fight_target or flee_from now; respond to the program later.'
 			: awaitingConfirmation === true
 				? AWAITING_CONFIRMATION_EVENT_INSTRUCTION
-				: 'Live Minecraft event. Advance the current goal using fresh facts. Keep authorised routines running while you reason; respond explicitly to pending program decisions.';
+				: effectiveTrigger === 'low_health_food'
+					? TASK_HEAL_INSTRUCTION
+					: 'Live Minecraft event. Advance the current goal using fresh facts. Keep authorised routines running while you reason; respond explicitly to pending program decisions.';
 	return `${instruction}\n${json}`;
 }
 
@@ -5061,6 +5089,15 @@ const RECOVERED_FRACTION = 0.7;
 // Starving on Hard drains one point at a time; only a real further drop wakes again.
 const FURTHER_DROP_POINTS = 2;
 const REGENERATING_FOOD_LEVEL = 18;
+// With a task, low health and food in reach gets one urgent nudge at 4 hearts (or 40%), then again only after 2+ more
+// health is lost or new food comes into reach, never more often than every 10 s.
+const HEAL_NUDGE_POINTS = 8;
+const HEAL_NUDGE_FRACTION = 0.4;
+const HEAL_NUDGE_INTERVAL_MS = 10_000;
+const MAX_SEEN_FOOD = 64;
+const ALWAYS_EDIBLE = new Set(['minecraft:golden_apple', 'minecraft:enchanted_golden_apple']);
+// Events that carry healing facts (and options) even when the caller passed none.
+const HEALING_EVENT_TRIGGERS = new Set(['low_health_food', 'low_health_idle', 'heal_opportunity', 'low_health']);
 
 /**
  * Whether low health should wake an agent with no task, and the health level to remember. One wake per level: it
@@ -5083,6 +5120,99 @@ export function lowHealthWake(observation, wokenAtHealth = null) {
 	return { wake: true, health };
 }
 
+/** A low body that is ours to wake: alive, survival or adventure, not taken over, at or below the given level. */
+function lowEligibleBody(player, points, fraction) {
+	const health = Number.isFinite(player?.health) ? player.health : null;
+	if (health === null || player.dead === true || health <= 0 || player.operatorControlled === true || ['creative', 'spectator'].includes(player.gameMode)) return false;
+	const maxHealth = Number.isFinite(player.maxHealth) && player.maxHealth > 0 ? player.maxHealth : 20;
+	return health <= Math.max(points, maxHealth * fraction);
+}
+
+/** Stable keys of the food in reach: carried best food, then drops, animals and ripe plants in view. */
+export function foodSourceKeys(facts) {
+	const sources = facts?.foodSources ?? {};
+	return [
+		...(facts?.bestFood?.itemId ? [`carried:${facts.bestFood.itemId}`] : []),
+		...(sources.drops ?? []).map((drop) => `drop:${drop.stableId}`),
+		...(sources.animals ?? []).map((animal) => `animal:${animal.stableId}`),
+		...(sources.plants ?? []).filter((plant) => plant.ripe !== false).map((plant) => `plant:${plant.x},${plant.y},${plant.z}`),
+	];
+}
+
+function canEatNow(facts) {
+	return !(Number.isFinite(facts?.foodLevel) && facts.foodLevel >= 20) || ALWAYS_EDIBLE.has(facts?.bestFood?.itemId);
+}
+
+function rememberFood(seen, keys) {
+	return [...new Set([...seen, ...keys])].slice(-MAX_SEEN_FOOD);
+}
+
+/**
+ * The no-task heal wake (lowHealthWake) plus food that comes into reach after it: a drop thrown to the agent or an
+ * animal walking up is a chance the model has not seen yet, so it wakes once more for each new source while still low.
+ * `latch` is { health, seenFood } or null; the result's latch is null once the body recovered.
+ */
+export function healWakeVerdict(observation, latch = null) {
+	const verdict = lowHealthWake(observation, latch?.health ?? null);
+	if (verdict.health === null) return { wake: false, latch: null };
+	const facts = healingFacts(observation);
+	const keys = foodSourceKeys(facts);
+	const seen = latch?.seenFood ?? [];
+	const fresh = keys.some((key) => !seen.includes(key));
+	const wake = verdict.wake || (latch !== null && fresh && canEatNow(facts) && lowEligibleBody(observation.player, LOW_HEALTH_POINTS, LOW_HEALTH_FRACTION));
+	return { wake, latch: { health: verdict.health, seenFood: rememberFood(seen, keys) } };
+}
+
+/**
+ * With a task: whether low health with reachable food should raise one urgent attention edge. Fires at 4 hearts
+ * (or 40%) while safe and able to eat, then again only after 2+ more health is lost or new food comes into reach,
+ * at most every 10 s; recovering to 70% resets it. `latch` is { health, seenFood, atMs } or null.
+ */
+export function healNudgeVerdict(observation, latch = null, nowMs = null) {
+	const player = observation?.player ?? {};
+	const maxHealth = Number.isFinite(player.maxHealth) && player.maxHealth > 0 ? player.maxHealth : 20;
+	if (Number.isFinite(player.health) && player.health >= maxHealth * RECOVERED_FRACTION) return { nudge: false, latch: null };
+	if (!lowEligibleBody(player, HEAL_NUDGE_POINTS, HEAL_NUDGE_FRACTION) || player.safe === false) return { nudge: false, latch };
+	const facts = healingFacts(observation);
+	const keys = foodSourceKeys(facts);
+	if (keys.length === 0 || !canEatNow(facts)) return { nudge: false, latch };
+	const seen = latch?.seenFood ?? [];
+	const lower = latch === null || player.health <= latch.health - FURTHER_DROP_POINTS;
+	const fresh = keys.some((key) => !seen.includes(key));
+	const spaced = latch === null || !Number.isFinite(nowMs) || !Number.isFinite(latch.atMs) || nowMs - latch.atMs >= HEAL_NUDGE_INTERVAL_MS;
+	if (!(lower || fresh) || !spaced) return { nudge: false, latch };
+	return { nudge: true, options: facts.options.length, latch: { health: player.health, seenFood: rememberFood(seen, keys), atMs: nowMs } };
+}
+
+/**
+ * Concrete ways to get food now, nearest first, as the native calls that do it. They are facts about reach, not a plan:
+ * the model chooses whether and which.
+ */
+export function healingOptions(facts) {
+	const options = [];
+	const away = (distance) => (Number.isFinite(distance) ? ` ${distance} blocks away` : '');
+	if (facts.bestFood?.itemId) options.push(`eat carried ${facts.bestFood.itemId} (slot ${facts.bestFood.slot}): select_item, then use_item`);
+	for (const drop of facts.foodSources.drops.slice(0, 2)) options.push(`pick up ${drop.count ?? 1}x ${drop.itemId}${away(drop.distance)}: pick_up_item targetSelector ${drop.stableId}, then eat it`);
+	for (const animal of facts.foodSources.animals.slice(0, 1)) options.push(`hunt ${animal.type}${away(animal.distance)}: fight_target targetId ${animal.stableId}, pick_up_item its drop, eat it`);
+	for (const plant of facts.foodSources.plants.filter((row) => row.ripe !== false).slice(0, 1)) {
+		options.push(`harvest ${plant.blockId} at ${plant.x},${plant.y},${plant.z}${away(plant.distance)}: ${plant.harvest === 'interact' ? 'interact_block' : 'break_block'}, pick up, eat`);
+	}
+	return options;
+}
+
+/**
+ * One line on the threat that reaches contact range soonest (risk is a snapshot dominated by distance, so a creeper
+ * closing in from 16 blocks reads about 4). Null when nothing approaches.
+ */
+export function threatOutlook(observation) {
+	const threats = Array.isArray(observation?.player?.threats) ? observation.player.threats : [];
+	const soonest = threats.filter((threat) => threat?.approaching === true && Number.isFinite(threat.etaSeconds))
+		.sort((left, right) => left.etaSeconds - right.etaSeconds)[0];
+	if (soonest === undefined) return null;
+	const then = Number.isFinite(soonest.contactRisk) ? `, about ${soonest.contactRisk} there` : '';
+	return `${soonest.type} ${soonest.uuid} is ${soonest.distance} blocks away closing at ${soonest.closingSpeed} blocks/s: contact range in ${soonest.etaSeconds} s (risk ${soonest.risk} now${then}).`;
+}
+
 /** The facts a no-task low-health turn needs: health, hunger, carried food and the nearest food sources in view. */
 export function healingFacts(observation) {
 	const player = observation?.player ?? {};
@@ -5101,13 +5231,17 @@ export function healingFacts(observation) {
 	});
 	const drops = list(observation?.items).filter((item) => FOOD_ITEM.test(item?.itemId ?? ''))
 		.map((item) => ({ stableId: item.stableId, itemId: item.itemId, count: item.count, source: item }));
-	return {
+	const facts = {
 		health: player.health ?? null, maxHealth: player.maxHealth ?? 20, foodLevel: player.foodLevel ?? null, saturation: player.saturation ?? null,
+		// Vanilla regenerates health only while the food bar is 18 or more.
+		naturalRegen: Number.isFinite(player.foodLevel) ? player.foodLevel >= REGENERATING_FOOD_LEVEL : null,
 		bestFood: player.bestFood ?? null, safe: player.safe ?? null, threats: list(player.threats).length,
 		foodSources: { animals: nearest(animals, 4), plants: nearest(plants, 4), drops: nearest(drops, 4) },
 	};
+	return { ...facts, options: healingOptions(facts) };
 }
-export const NO_TASK_HEAL_INSTRUCTION = 'Live Minecraft event: low health. You have no active task; any finished task stays finished, so do not redo it. You may recover now if you choose: eat carried food (useItem), or get food first from healing.foodSources (fight_target a passive animal and pickUpItem the drop; mine fully grown crops or melon; interact with ripe berry bushes or glow berry vines), then eat. A full food bar regenerates health. Other work is a player request and needs takeTask.';
+export const NO_TASK_HEAL_INSTRUCTION = 'Live Minecraft event: low health. You have no active task; any finished task stays finished, so do not redo it. Recovering is your call. Health regenerates only while foodLevel is 18 or more (healing.naturalRegen), so below that it stays low until you eat. healing.options lists the food in reach as exact calls: eat carried food (select_item, then use_item), pick_up_item a food drop, fight_target a passive animal and pick up its drop, mine fully grown crops or melon, or interact with ripe berries; then eat. Other work is a player request and needs takeTask.';
+export const TASK_HEAL_INSTRUCTION = 'Live Minecraft event: low health with food in reach. Whether to recover before continuing the task is your call. Health regenerates only while foodLevel is 18 or more (healing.naturalRegen). healing.options lists the food in reach as exact calls (eat carried food with select_item then use_item; pick_up_item a food drop; fight_target a passive animal and pick up its drop). Keep authorised routines running unless you choose otherwise; respond explicitly to pending program decisions.';
 export const NO_TASK_DANGER_INSTRUCTION = 'Live Minecraft event: danger. You have no active task; any finished task stays finished, so do not redo it. Defend yourself now: fight_target, flee_from, eat or drink, shield or totem, equip armor and weapons, move away. Other work is a player request and needs takeTask.';
 // Waiting for the operator only means "do not redo the finished work or re-run finish"; it never blocks new requests.
 export const AWAITING_CONFIRMATION_EVENT_INSTRUCTION = 'Live Minecraft event. Your finished goal awaits operator confirmation: do not redo it or re-run finish. Waiting never blocks new requests: act on player messages now with any tool, as part of your task, then call finish again when done.';

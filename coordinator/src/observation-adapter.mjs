@@ -147,7 +147,7 @@ export function heardFacts(value) {
 	});
 }
 
-const THREAT_URGENCY = Object.freeze({ swelling: 3, creeper_close: 2, attacked: 2, targeting: 1, ranged_sight: 1 });
+const THREAT_URGENCY = Object.freeze({ swelling: 3, creeper_close: 2, attacked: 2, imminent: 2, targeting: 1, ranged_sight: 1 });
 
 /**
  * Healing facts as player facts: canHealNow (hurt, safe and able to eat), bestFood ({ slot, itemId, nutrition } or
@@ -178,7 +178,7 @@ export function threatFacts(value) {
 	const source = ownDataRecord(value, 'wire observation.threats');
 	const threats = boundedDataArray(source.entries, 'threats.entries', 8).map((entry, index) => {
 		const row = ownDataRecord(entry, `threats.entries[${index}]`);
-		const signals = boundedDataArray(row.signals, `threats.entries[${index}].signals`, 4).map((signal) => identifier(signal, 'threat signal'));
+		const signals = boundedDataArray(row.signals, `threats.entries[${index}].signals`, 6).map((signal) => identifier(signal, 'threat signal'));
 		return {
 			stableId: identifier(row.uuid, 'threat uuid'), uuid: identifier(row.uuid, 'threat uuid'), type: identifier(row.type, 'threat type'),
 			distance: finiteNumber(row.distance, 'threat distance'), bearing: finiteNumber(row.bearing, 'threat bearing'),
@@ -187,6 +187,10 @@ export function threatFacts(value) {
 			risk: row.risk === undefined ? 0 : finiteNumber(row.risk, 'threat risk'),
 			...(row.riskFactors === undefined ? {} : { riskFactors: { ...ownDataRecord(row.riskFactors, 'threat riskFactors') } }),
 			...(row.expectedHitDamage === undefined ? {} : { expectedHitDamage: finiteNumber(row.expectedHitDamage, 'threat expectedHitDamage') }),
+			...(row.closingSpeed === undefined ? {} : { closingSpeed: finiteNumber(row.closingSpeed, 'threat closingSpeed') }),
+			...(row.approaching === undefined ? {} : { approaching: boolean(row.approaching, 'threat approaching') }),
+			...(row.etaSeconds === undefined ? {} : { etaSeconds: finiteNumber(row.etaSeconds, 'threat etaSeconds') }),
+			...(row.contactRisk === undefined ? {} : { contactRisk: finiteNumber(row.contactRisk, 'threat contactRisk') }),
 		};
 	}).sort((left, right) => right.risk - left.risk || left.distance - right.distance);
 	const urgency = (threat) => Math.max(0, ...threat.signals.map((signal) => THREAT_URGENCY[signal] ?? 0));

@@ -110,6 +110,21 @@ public final class RiskAssessment {
 		return new Assessment(result.risk(), active, result, hit);
 	}
 
+	/**
+	 * The risk the same opponent carries once it reaches {@code contactRange} while still hunting (not yet swelling).
+	 * Risk is dominated by distance, so a creeper closing in from 16 blocks reads about 4 yet about 145 at 3 blocks;
+	 * this tells the model what is coming, not what is here. Only the distance and, for a creeper, the blast change.
+	 */
+	public static double contactRisk(ServerPlayer agent, LivingEntity entity, double contactRange) {
+		Assessment now = assess(agent, entity);
+		double hit = entity instanceof Creeper creeper ? ThreatDamage.creeperBlastAt(creeper, agent, contactRange) : now.hit().damage();
+		AttributeInstance speed = entity.getAttribute(Attributes.MOVEMENT_SPEED);
+		Vec3 motion = entity.hurtTime > 0 ? Vec3.ZERO : entity instanceof Player ? entity.getKnownSpeed() : entity.getDeltaMovement();
+		return RiskModel.score(new RiskModel.Input(entity.getBbWidth(), entity.getBbHeight(), entity.getHealth(), entity.getArmorValue(),
+				entity instanceof Player, speed == null ? Double.NaN : speed.getValue(), Math.hypot(motion.x, motion.z), contactRange,
+				hit, false, false, true, false, 0.0D)).risk();
+	}
+
 	private static boolean holdsRangedWeapon(LivingEntity entity) {
 		ItemStack held = entity.getMainHandItem();
 		return held.getItem() instanceof BowItem || held.getItem() instanceof CrossbowItem || held.is(Items.TRIDENT);
