@@ -427,16 +427,29 @@ public final class AgentLifecycleReducer {
 	}
 
 	/**
-	 * Self-preservation actions a danger-woken agent without a task may take: fight or flee, eat or drink, raise a
-	 * shield or totem, equip armor and weapons, move away and look. Breaking, placing, crafting, containers, chat
-	 * and other work still need a task the model adopted (takeTask), so nobody can steer the body around it.
+	 * Self-preservation actions an agent without a task may take: fight or flee, eat or drink, raise a shield or
+	 * totem, equip armor and weapons, move away and look, and pick up dropped items (food after a hunt). Breaking is
+	 * allowed only for food plants (see {@link #isFoodHarvest}); placing, crafting, containers, chat and other work
+	 * still need a task the model adopted (takeTask), so nobody can steer the body around it.
 	 */
 	public static boolean isSelfPreservationAction(dev.agaminggod.arenaagents.protocol.ActionType type) {
 		return switch (type) {
 			case FIGHT_TARGET, FLEE_FROM, ATTACK, USE_RANGED, BLOCK_WITH_SHIELD, USE_ITEM, SELECT_ITEM, SELECT_TOOL,
-					EQUIP_ITEM, NAVIGATE_TO, MOVE_TO, LOOK_AT, CONTROL, CONTROL_SEQUENCE, WAIT, DISMOUNT, WAKE_UP -> true;
+					EQUIP_ITEM, NAVIGATE_TO, MOVE_TO, LOOK_AT, CONTROL, CONTROL_SEQUENCE, WAIT, DISMOUNT, WAKE_UP,
+					PICK_UP_ITEM -> true;
 			default -> false;
 		};
+	}
+
+	/** Blocks that are food when broken. Breaking checks the block is exactly the expected one first. */
+	public static final java.util.Set<String> FOOD_PLANT_BLOCKS = java.util.Set.of("minecraft:wheat", "minecraft:carrots",
+			"minecraft:potatoes", "minecraft:beetroots", "minecraft:sweet_berry_bush", "minecraft:cave_vines",
+			"minecraft:cave_vines_plant", "minecraft:melon");
+
+	/** Harvesting a crop, berries or a melon to eat: the only breaking an agent without a task may do. */
+	public static boolean isFoodHarvest(dev.agaminggod.arenaagents.protocol.ActionType type, String expectedBlockId) {
+		return type == dev.agaminggod.arenaagents.protocol.ActionType.BREAK_BLOCK && expectedBlockId != null
+				&& FOOD_PLANT_BLOCKS.contains(expectedBlockId);
 	}
 
 	private static long nextRevision(AgentRecord current) {

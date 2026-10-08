@@ -362,6 +362,28 @@ public final class MultiplexedServerBridgeVerification {
 		assertTrue(!MultiplexedServerBridge.acceptsActionRevision(idle, new ServerActionRequest(
 				idle.agentId(), idle.goalRevision() + 1L, "idle-wait-stale", ActionType.WAIT, new JsonObject(), provenance
 		)), "a detached body action cannot cross a lifecycle revision");
+		ServerActionRequest pickUp = new ServerActionRequest(
+				idle.agentId(), idle.goalRevision(), "idle-pick-up", ActionType.PICK_UP_ITEM, new JsonObject(), provenance
+		);
+		assertTrue(MultiplexedServerBridge.isDetachedBodyAction(idle, pickUp), "with no task the model may pick up food it hunted");
+		JsonObject wheat = new JsonObject();
+		wheat.addProperty("expectedBlockId", "minecraft:wheat");
+		assertTrue(MultiplexedServerBridge.isDetachedBodyAction(idle, new ServerActionRequest(
+				idle.agentId(), idle.goalRevision(), "idle-harvest", ActionType.BREAK_BLOCK, wheat, provenance
+		)), "with no task the model may harvest a crop to eat");
+		JsonObject stone = new JsonObject();
+		stone.addProperty("expectedBlockId", "minecraft:stone");
+		assertTrue(!MultiplexedServerBridge.acceptsActionRevision(idle, new ServerActionRequest(
+				idle.agentId(), idle.goalRevision(), "idle-mine", ActionType.BREAK_BLOCK, stone, provenance
+		)), "breaking anything but food still needs a task");
+		JsonObject malformed = new JsonObject();
+		malformed.add("expectedBlockId", new JsonObject());
+		assertTrue(!MultiplexedServerBridge.acceptsActionRevision(idle, new ServerActionRequest(
+				idle.agentId(), idle.goalRevision(), "idle-malformed", ActionType.BREAK_BLOCK, malformed, provenance
+		)), "a malformed expected block is refused, not thrown");
+		assertTrue(!MultiplexedServerBridge.acceptsActionRevision(idle, new ServerActionRequest(
+				idle.agentId(), idle.goalRevision(), "idle-place", ActionType.PLACE_BLOCK, new JsonObject(), provenance
+		)), "placing still needs a task");
 		assertTrue(!MultiplexedServerBridge.acceptsActionRevision(idle, new ServerActionRequest(
 				idle.agentId(), idle.goalRevision() + 1L, "idle-stale", ActionType.CHAT, direct, provenance
 		)), "idle conversation cannot cross a lifecycle revision");

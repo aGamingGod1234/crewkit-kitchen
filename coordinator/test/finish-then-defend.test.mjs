@@ -139,7 +139,7 @@ test('a completed task: danger wakes a no-task turn that may defend itself; ordi
 		await eventually(() => planner.outcomes.length === 4);
 		assert.equal(planner.outcomes[2].result?.state, 'SUCCEEDED');
 		assert.equal(planner.outcomes[3].error?.code, 'CONVERSATION_ONLY', 'with no task there is nothing to finish again');
-		assert.match(planner.outcomes[3].error.message, /only defend yourself/);
+		assert.match(planner.outcomes[3].error.message, /only look after yourself/);
 		assert.equal(registry.get('agent-a').state, DynamicAgentState.COMPLETED, 'defending never reopens the finished task');
 		await settle();
 		assert.equal(planner.requests.length, 2, 'a danger turn needs no chat reply and is not retried');

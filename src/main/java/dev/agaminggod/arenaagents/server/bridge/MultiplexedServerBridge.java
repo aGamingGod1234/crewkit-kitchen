@@ -2331,8 +2331,11 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	static boolean isDetachedBodyAction(AgentRecord record, ServerActionRequest request) {
 		return request.goalRevision() == record.goalRevision()
 				&& dev.agaminggod.arenaagents.agent.AgentLifecycleReducer.isDetachedActionState(record.state())
-				// Only self-preservation; chat keeps its own detached-reply rule (direct or proximity while idle).
-				&& dev.agaminggod.arenaagents.agent.AgentLifecycleReducer.isSelfPreservationAction(request.type());
+				// Only self-preservation, including getting food; chat keeps its own detached-reply rule (direct or
+				// proximity while idle).
+				&& (dev.agaminggod.arenaagents.agent.AgentLifecycleReducer.isSelfPreservationAction(request.type())
+						|| dev.agaminggod.arenaagents.agent.AgentLifecycleReducer.isFoodHarvest(request.type(),
+								expectedBlockId(request.arguments())));
 	}
 
 	/**
@@ -3216,6 +3219,12 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			throw new BridgeProtocolException("INVALID_TRACE_ID", field + " must be at most 128 UTF-8 bytes");
 		}
 		return value;
+	}
+
+	/** The expected block of a break request when it is a plain string, otherwise null. */
+	private static String expectedBlockId(JsonObject arguments) {
+		JsonElement value = arguments == null ? null : arguments.get("expectedBlockId");
+		return value != null && value.isJsonPrimitive() && value.getAsJsonPrimitive().isString() ? value.getAsString() : null;
 	}
 
 	private static String nullableString(JsonObject object, String field) {
