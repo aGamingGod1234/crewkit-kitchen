@@ -165,7 +165,7 @@ for (const stale of [true, false]) test(`completion-correction rejection ${stale
 	} finally { f.manager.disposeAll(); }
 });
 
-for (const failedAim of [false, true]) test(`shipped collection example reconsiders ${failedAim ? 'failed aim' : 'missing targets'} without pausing`, async () => {
+for (const failedAim of [false, true]) test(`shipped collection example reconsiders ${failedAim ? 'failed mining' : 'missing targets'} without pausing`, async () => {
 	const requests = [];
 	const f = managerFixture({ async requestPlan(request) { requests.push(request); return { directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);' }; } });
 	const source = /Multi-tree collection example:\n([\s\S]*?)\n\nWatcher example/.exec(PLANNER_SYSTEM_PROMPT)[1];
@@ -173,7 +173,7 @@ for (const failedAim of [false, true]) test(`shipped collection example reconsid
 	try {
 		await f.manager.installDecision(f.record(), { directive: 'replace', source }, { observation: seen, eventSequence: 1 });
 		await tick();
-		if (failedAim) { const action = f.sent.find(row => row.type === 'action_command').payload; assert.equal(action.actionType, 'look_at'); await f.manager.onActionResult(f.record(), { actionId: action.actionId, state: 'FAILED', reasonCode: 'TARGET_UNAVAILABLE' }); await f.manager.onObservation(f.record(), { observation: seen, eventSequence: 2 }); await tick(); }
+		if (failedAim) { const action = f.sent.find(row => row.type === 'action_command').payload; assert.equal(action.actionType, 'break_block'); await f.manager.onActionResult(f.record(), { actionId: action.actionId, state: 'FAILED', reasonCode: 'TARGET_NOT_VISIBLE' }); await f.manager.onObservation(f.record(), { observation: seen, eventSequence: 2 }); await tick(); }
 		assert.equal(requests.length, 1);
 		assert.equal(f.record().state, 'ACTING');
 		assert.equal(f.sent.filter(row => row.type === 'action_command').at(-1).payload.actionType, 'wait');

@@ -347,7 +347,27 @@ test('native Minecraft tools expose the common fast path plus one validated adva
 	assert.match(NATIVE_AGENT_INSTRUCTIONS, /program\.parameters\(\)/);
 	assert.match(NATIVE_AGENT_INSTRUCTIONS, /queueProgram/);
 	assert.match(MINECRAFT_DYNAMIC_TOOLS.find((tool) => tool.name === 'queueProgram').description, /runtime chooses no gameplay/);
+	assert.match(MINECRAFT_DYNAMIC_TOOLS.find((tool) => tool.name === 'queueProgram').description, /Start requires successful natural PROGRAM_EXHAUSTED, no pending decision/);
+	assert.match(MINECRAFT_DYNAMIC_TOOLS.find((tool) => tool.name === 'queueProgram').description, /optional expectedDurationMs must fit it/);
 	assert.match(MINECRAFT_DYNAMIC_TOOLS.find((tool) => tool.name === 'runProgram').description, /noteKey executes the entire note text as ArenaScript/);
+});
+
+test('guidance tells the model to loop bulk work, reuse facts, stop polling and end turns without text', () => {
+	const tools = Object.fromEntries(MINECRAFT_DYNAMIC_TOOLS.map((tool) => [tool.name, tool.description]));
+	assert.ok(NATIVE_AGENT_INSTRUCTIONS.length <= 1_380, 'leave headroom for later guidance requests');
+	assert.match(NATIVE_AGENT_INSTRUCTIONS, /looping background:true program \(repeatUntil a count\), not per 2-3 blocks: exhaustion costs a decision/);
+	assert.match(NATIVE_AGENT_INSTRUCTIONS, /queue a known next program right after starting it/);
+	assert.match(NATIVE_AGENT_INSTRUCTIONS, /reuse fresh result facts before observe\/inspect\. Never poll/);
+	assert.match(NATIVE_AGENT_INSTRUCTIONS, /End a turn by stopping, no closing text/);
+	assert.doesNotMatch(tools.startAction, /actionStatus reads it sooner/, 'contradicts the no-polling rule');
+	assert.match(tools.actionStatus, /Never poll/);
+	assert.match(tools.programStatus, /Never poll/);
+	assert.match(tools.observe, /skip it when a fresh postAction sample has them/);
+	assert.match(tools.moveTo, /give the far target/);
+	assert.match(tools.mine, /turns to the block's center itself/);
+	assert.match(tools.mine, /collected while you keep mining; pick up stragglers once at the end/);
+	assert.match(tools.survey, /One call batches several of these reads/);
+	assert.match(tools.inspect, /several visible-world reads use survey/);
 });
 
 test('optional mining aim expands only the exact caller-chosen block and preserves the single-action default', () => {

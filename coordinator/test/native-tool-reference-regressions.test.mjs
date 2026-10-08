@@ -55,8 +55,7 @@ test('postAction tools point to one complete observation-view contract without c
 	for (const phrase of ['observationView.id', 'afterObservationId', 'exact delivered ID', 'observationView.replace and remove', 'stale or different-world', 'view:"full"']) assert.ok(observe.description.includes(phrase), phrase);
 	for (const name of ['moveTo', 'mine', 'act', 'sequence']) {
 		const tool = MINECRAFT_DYNAMIC_TOOLS.find(tool => tool.name === name);
-		assert.match(tool.description, /shared observation-view contract described by observe/);
-		assert.match(tool.description, /receipt\/history coverage and omission markers are unchanged/);
+		assert.match(tool.description, /postAction facts use observe's view contract/);
 		assert.doesNotMatch(tool.description, /unknown baselines return full/);
 		assert.deepEqual(tool.inputSchema.properties.view, observe.inputSchema.properties.view);
 		assert.deepEqual(tool.inputSchema.properties.afterObservationId, observe.inputSchema.properties.afterObservationId);
