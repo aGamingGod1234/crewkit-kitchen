@@ -1,5 +1,6 @@
 package dev.agaminggod.arenaagents.mixin;
 
+import dev.agaminggod.arenaagents.world.ChunkMutationRevisionAccess;
 import dev.agaminggod.arenaagents.world.WorldMutationRevisionAccess;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.Level;
@@ -8,14 +9,17 @@ import net.minecraft.world.level.chunk.LevelChunk;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 /** Observe the actual write, including callers that bypass Level.setBlock. */
 @Mixin(LevelChunk.class)
-abstract class LevelChunkMutationRevisionMixin {
+abstract class LevelChunkMutationRevisionMixin implements ChunkMutationRevisionAccess {
 	@Shadow @Final private Level level;
+	@Unique
+	private long arenaagents$chunkMutationRevision;
 
 	@Inject(method = "setBlockState", at = @At("RETURN"))
 	private void arenaagents$recordBlockMutation(
@@ -23,7 +27,13 @@ abstract class LevelChunkMutationRevisionMixin {
 			CallbackInfoReturnable<BlockState> callback
 	) {
 		if (callback.getReturnValue() != null) {
+			arenaagents$chunkMutationRevision++;
 			((WorldMutationRevisionAccess) level).arenaagents$recordWorldMutation(position);
 		}
+	}
+
+	@Override
+	public long arenaagents$chunkMutationRevision() {
+		return arenaagents$chunkMutationRevision;
 	}
 }

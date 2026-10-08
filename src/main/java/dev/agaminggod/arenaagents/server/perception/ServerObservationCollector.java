@@ -94,8 +94,12 @@ public final class ServerObservationCollector {
 			new ObservationSectionCache<>(SPATIAL_CACHE_CAPACITY, SPATIAL_CACHE_TICKS, value -> value);
 	private final ObservationSectionCache<LandmarkSampleKey, SightSample> landmarkCache =
 			new ObservationSectionCache<>(LANDMARK_CACHE_CAPACITY, LANDMARK_CACHE_TICKS, value -> value);
-	/** Structure starts each agent saw recently, so a structure is announced as new once, not on every glance. */
-	private final Map<AgentId, Map<String, Long>> seenStructures = new HashMap<>();
+	/** Far-sight rows each agent saw recently, so a structure is announced as new once, not on every glance. */
+	private final Map<AgentId, SightedFeatures.Announcements> seenStructures = new HashMap<>();
+	/** World-data scans of loaded chunks, shared by every agent in a level. */
+	private final Map<ServerLevel, FarSight.LevelIndex> farSightIndexes = new java.util.WeakHashMap<>();
+	/** Each agent's line-of-sight results, reused while its eye and the world in sight range are unchanged. */
+	private final Map<AgentId, FarSight.SightCache> sightCaches = new HashMap<>();
 	/** Each agent's last structure, cave and vein rows, recomputed at most every {@link #SIGHTED_RECOMPUTE_TICKS}. */
 	private final Map<AgentId, SightedMemo> sightedSamples = new HashMap<>();
 	private final Map<AgentId, RawSpatialObservation.Key> spatialKeys = new HashMap<>();
@@ -222,12 +226,22 @@ public final class ServerObservationCollector {
 
 	/** Read a focused page from the player's current entitled view without changing game state. */
 	public JsonObject collectInspection(ServerPlayer agent, JsonObject query) {
+		return collectInspection(null, agent, query);
+	}
+
+	/** As {@link #collectInspection(ServerPlayer, JsonObject)}; the agent id lets a survey reuse its caches and threats. */
+	public JsonObject collectInspection(AgentId agentId, ServerPlayer agent, JsonObject query) {
 		String section = query.get("section").getAsString();
+		if ("survey".equals(section)) return withInspectionMetadata(survey(agentId, agent, query), section, agent);
 		int offset = query.has("offset") ? query.get("offset").getAsInt() : 0;
 		int limit = query.has("limit") ? query.get("limit").getAsInt() : 16;
 		if (offset < 0 || limit < 1 || limit > ObservationPage.MAX_ENTRIES) {
 			throw new AgentDomainException("INVALID_INSPECTION", "offset must be nonnegative and limit must be between 1 and 32");
 		}
+		return withInspectionMetadata(inspectionSection(agent, query, section, offset, limit), section, agent);
+	}
+
+	private JsonObject inspectionSection(ServerPlayer agent, JsonObject query, String section, int offset, int limit) {
 		JsonObject result;
 		switch (section) {
 			case "recipes" -> result = PlayerKnowledgeInspection.recipes(agent, query, offset, limit);
@@ -372,6 +386,10 @@ public final class ServerObservationCollector {
 			}
 			default -> throw new AgentDomainException("UNSUPPORTED_INSPECTION", "Unknown inspection section: " + section);
 		}
+		return result;
+	}
+
+	private static JsonObject withInspectionMetadata(JsonObject result, String section, ServerPlayer agent) {
 		result.addProperty("section", section);
 		result.addProperty("observedAtEpochMs", System.currentTimeMillis());
 		result.addProperty("gameTime", agent.level().getGameTime());
@@ -379,6 +397,51 @@ public final class ServerObservationCollector {
 		result.addProperty("worldId", ObservedWorldIdentity.get(agent.level().getServer()));
 		result.addProperty("revision", worldMutationRevision(agent.level(), agent.blockPosition(), LANDMARK_SIGHT_DISTANCE + 1));
 		return result;
+	}
+
+	/**
+	 * What the agent sees from its eye in its current view cone, from world data: structures, points of interest,
+	 * biomes, possibly player-built clusters, notable blocks, caves and veins, filtered by include/exclude. Threats are
+	 * always included. Nothing turns the body; seeing around takes lookAround.
+	 */
+	private JsonObject survey(AgentId agentId, ServerPlayer agent, JsonObject query) {
+		ServerLevel level = agent.level();
+		int rows = query.has("limit") ? query.get("limit").getAsInt() : FarSight.DEFAULT_SURVEY_ROWS;
+		if (rows < 1 || rows > FarSight.MAX_ROWS) throw new AgentDomainException("INVALID_INSPECTION", "survey limit must be between 1 and 8");
+		FarSight.Request request = FarSight.surveyRequest(inspectionStrings(query, "include"), inspectionStrings(query, "exclude"), rows);
+		BlockPos position = agent.blockPosition();
+		ObservationVisibility.Frame visibility = ObservationVisibility.frame(level, agent);
+		RawSpatialObservation raw = agentId == null ? rawSpatialObservation(level, agent, position) : rawSpatial(agentId, level, agent, position);
+		SightSample rays = agentId == null ? sightRays(level, agent, position) : sightSample(agentId, level, agent, position);
+		Sighted sighted = sightedNow(agentId, level, agent, position, visibility, raw, rays, request);
+		Map<FarSight.Section, Integer> limits = new java.util.EnumMap<>(FarSight.Section.class);
+		for (FarSight.Section section : FarSight.Section.values()) limits.put(section, rows);
+		JsonObject result = new JsonObject();
+		result.add("survey", SightedFeatures.render(sighted.sample(), agent.getEyePosition(), agent.getYRot(),
+				agentId == null ? new SightedFeatures.Announcements() : announcements(agentId), level.getGameTime(), false, limits, request.sections()));
+		if (sighted.far().standingIn() != null) result.addProperty("standingIn", sighted.far().standingIn());
+		if (agentId != null) {
+			JsonObject threat = ThreatPerception.toJson(threats.sample(agentId, agent));
+			if (threat != null) result.add("threats", threat);
+		}
+		JsonObject coverage = new JsonObject();
+		coverage.addProperty("rangeBlocks", FarSight.RANGE);
+		coverage.addProperty("smallBlocksWithin", FarSight.SMALL_SIGHT);
+		coverage.addProperty("namedWithin", FarSight.NAMED_STRUCTURE_DISTANCE);
+		coverage.addProperty("currentViewOnly", true);
+		// False while chunk reads around a new position are still spread over ticks; a repeat shortly after sees more.
+		coverage.addProperty("complete", sighted.far().complete());
+		coverage.addProperty("candidates", sighted.far().candidates());
+		coverage.addProperty("sightLines", sighted.far().clips());
+		result.add("coverage", coverage);
+		return result;
+	}
+
+	private static List<String> inspectionStrings(JsonObject query, String field) {
+		if (!query.has(field)) return List.of();
+		List<String> values = new ArrayList<>();
+		for (var value : query.getAsJsonArray(field)) values.add(value.getAsString());
+		return values;
 	}
 
 	private static JsonObject blockDetails(ServerPlayer agent, BlockPos position) {
@@ -416,6 +479,9 @@ public final class ServerObservationCollector {
 		landmarkCache.invalidateMatching(key -> key.agentId().equals(agentId));
 		synchronized (sightedSamples) {
 			sightedSamples.remove(agentId);
+		}
+		synchronized (sightCaches) {
+			sightCaches.remove(agentId);
 		}
 		invalidatePlayerState(agentId);
 	}
@@ -482,6 +548,9 @@ public final class ServerObservationCollector {
 			synchronized (sightedSamples) {
 				SightedFeatures.retain(sightedSamples, tracked);
 			}
+			synchronized (sightCaches) {
+				SightedFeatures.retain(sightCaches, tracked);
+			}
 			survival.retain(tracked);
 			lastInventories.keySet().removeIf(agentId -> !tracked.contains(agentId));
 		}
@@ -498,12 +567,30 @@ public final class ServerObservationCollector {
 			ObservationVisibility.Frame visibility
 	) {
 		BlockPos position = agent.blockPosition();
+		RawSpatialObservation raw = rawSpatial(agentId, level, agent, position);
+		Vec3 eye = agent.getEyePosition();
+		SightSample sight = sightSample(agentId, level, agent, position);
+		JsonObject value = new JsonObject();
+		value.add("blocks", blocks(level, agent, raw.blocks(), visibility));
+		value.add("landmarks", landmarks(level, agent, visibility, sight.surfaces()));
+		SightedFeatures.Sample seen = sightedSample(agentId, level, agent, position, visibility, raw, sight);
+		JsonObject sighted = SightedFeatures.toJson(seen, eye, agent.getYRot(), announcements(agentId), level.getGameTime());
+		if (sighted != null) value.add("sighted", sighted);
+		value.add("nearbyContainers", nearbyTransactionTargets(raw.containers(), level::getBlockState,
+				target -> level.hasChunkAt(target) && visibility.canSeeBlock(target), agent.position(),
+				target -> agent.isWithinBlockInteractionRange(target, 0.0D)));
+		return value;
+	}
+
+	private RawSpatialObservation rawSpatial(AgentId agentId, ServerLevel level, ServerPlayer agent, BlockPos position) {
 		RawSpatialObservation.Key key = spatialKey(agentId, level.dimension().identifier().toString(),
 				position, worldMutationRevision(level, position, BLOCK_RADIUS));
 		RawSpatialObservation.Key previous = spatialKeys.put(agentId, key);
 		if (previous != null && !previous.equals(key)) spatialCache.invalidate(previous);
-		RawSpatialObservation raw = spatialCache.getOrCompute(
-			key, level.getGameTime(), () -> rawSpatialObservation(level, agent, position));
+		return spatialCache.getOrCompute(key, level.getGameTime(), () -> rawSpatialObservation(level, agent, position));
+	}
+
+	private SightSample sightSample(AgentId agentId, ServerLevel level, ServerPlayer agent, BlockPos position) {
 		Vec3 eye = agent.getEyePosition();
 		// Quantized so a still agent's small head movements reuse the sight rays instead of recasting all 80.
 		LandmarkSampleKey landmarkKey = new LandmarkSampleKey(
@@ -522,7 +609,7 @@ public final class ServerObservationCollector {
 			agent.getMainHandItem().getItem(),
 			worldMutationRevision(level, position, LANDMARK_SIGHT_DISTANCE + 1)
 		);
-		SightSample sight = landmarkCache.getOrCompute(
+		return landmarkCache.getOrCompute(
 			landmarkKey,
 			level.getGameTime(),
 			() -> {
@@ -532,17 +619,6 @@ public final class ServerObservationCollector {
 				return rays;
 			}
 		);
-		JsonObject value = new JsonObject();
-		value.add("blocks", blocks(level, agent, raw.blocks(), visibility));
-		value.add("landmarks", landmarks(level, agent, visibility, sight.surfaces()));
-		SightedFeatures.Sample seen = sightedSample(agentId, level, agent, position, visibility, raw, sight);
-		JsonObject sighted = SightedFeatures.toJson(seen, eye, agent.getYRot(),
-				structureKey -> markStructureSeen(agentId, structureKey, level.getGameTime()));
-		if (sighted != null) value.add("sighted", sighted);
-		value.add("nearbyContainers", nearbyTransactionTargets(raw.containers(), level::getBlockState,
-				target -> level.hasChunkAt(target) && visibility.canSeeBlock(target), agent.position(),
-				target -> agent.isWithinBlockInteractionRange(target, 0.0D)));
-		return value;
 	}
 
 	static RawSpatialObservation.Key spatialKey(AgentId agentId, String dimension, BlockPos position, long revision) {
@@ -776,6 +852,7 @@ public final class ServerObservationCollector {
 		synchronized (TAG_VALUES) {
 			TAG_VALUES.clear();
 		}
+		FarSight.clearKinds();
 	}
 
 	private static JsonArray entities(
@@ -1058,6 +1135,25 @@ public final class ServerObservationCollector {
 			if (!sightedDue(memo, dimension, gameTime)) return memo.sample();
 		}
 		long started = PerceptionTiming.start();
+		SightedFeatures.Sample sample = sightedNow(agentId, level, agent, center, visibility, raw, rays, FarSight.Request.passive()).sample();
+		PerceptionTiming.record("sighted", started);
+		synchronized (sightedSamples) {
+			sightedSamples.put(agentId, new SightedMemo(dimension, gameTime, sample));
+		}
+		return sample;
+	}
+
+	/** Caves and veins of the current view plus one far-sight pass, computed now (no throttle). */
+	private Sighted sightedNow(
+			AgentId agentId,
+			ServerLevel level,
+			ServerPlayer agent,
+			BlockPos center,
+			ObservationVisibility.Frame visibility,
+			RawSpatialObservation raw,
+			SightSample rays,
+			FarSight.Request request
+	) {
 		List<BlockPos> seenLocalOre = new ArrayList<>();
 		int visibilityChecks = 0;
 		for (BlockObservationOrdering.Candidate candidate : raw.blocks()) {
@@ -1066,19 +1162,40 @@ public final class ServerObservationCollector {
 			BlockPos position = center.offset(candidate.x(), candidate.y(), candidate.z());
 			if (level.hasChunkAt(position) && visibility.canSeeBlock(position)) seenLocalOre.add(position);
 		}
-		SightedFeatures.Sample sample = SightedFeatures.sample(level, agent.getEyePosition(), rays.hits(), rays.openings(),
-				seenLocalOre, visibility::canSeeBlock);
-		PerceptionTiming.record("sighted", started);
-		synchronized (sightedSamples) {
-			sightedSamples.put(agentId, new SightedMemo(dimension, gameTime, sample));
-		}
-		return sample;
+		FarSight.Result far = farSight(agentId, level, agent, request);
+		seenLocalOre.addAll(far.seenOre());
+		return new Sighted(SightedFeatures.sample(level, agent.getEyePosition(), rays.hits(), rays.openings(),
+				seenLocalOre, visibility::canSeeBlock, far.rows()), far);
 	}
 
-	private boolean markStructureSeen(AgentId agentId, String key, long gameTime) {
+	private record Sighted(SightedFeatures.Sample sample, FarSight.Result far) {
+	}
+
+	private SightedFeatures.Announcements announcements(AgentId agentId) {
 		synchronized (seenStructures) {
-			return SightedFeatures.markSeen(seenStructures.computeIfAbsent(agentId, ignored -> new HashMap<>()), key, gameTime);
+			return seenStructures.computeIfAbsent(agentId, ignored -> new SightedFeatures.Announcements());
 		}
+	}
+
+	/** One far-sight pass for this agent, sharing the level's chunk scans and reusing the agent's line-of-sight cache. */
+	private FarSight.Result farSight(AgentId agentId, ServerLevel level, ServerPlayer agent, FarSight.Request request) {
+		FarSight.LevelIndex index;
+		synchronized (farSightIndexes) {
+			index = farSightIndexes.computeIfAbsent(level, ignored -> new FarSight.LevelIndex());
+		}
+		FarSight.SightCache cache;
+		synchronized (sightCaches) {
+			cache = agentId == null ? new FarSight.SightCache()
+					: sightCaches.computeIfAbsent(agentId, ignored -> new FarSight.SightCache());
+		}
+		long started = PerceptionTiming.start();
+		FarSight.Result result;
+		synchronized (cache) {
+			result = FarSight.look(level, agent, index, cache,
+					worldMutationRevision(level, agent.blockPosition(), LANDMARK_SIGHT_DISTANCE + 1), request);
+		}
+		PerceptionTiming.record(request.clips() == FarSight.PASSIVE_CLIPS ? "far_sight" : "survey", started);
+		return result;
 	}
 
 	private static SightSample sightRays(

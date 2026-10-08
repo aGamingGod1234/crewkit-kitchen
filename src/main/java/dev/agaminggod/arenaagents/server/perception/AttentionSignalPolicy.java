@@ -89,11 +89,14 @@ public final class AttentionSignalPolicy {
 		for (String signal : after) if (!before.contains(signal)) facts.add("survival." + signal);
 	}
 
+	/** A newly sighted structure, possibly player-built cluster or point of interest; new biomes and lava ride along quietly. */
 	static boolean newStructureSighted(JsonObject observation) {
-		JsonArray structures = array(object(observation, "sighted"), "structures");
-		if (structures == null) return false;
-		for (JsonElement value : structures) {
-			if (value.isJsonObject() && value.getAsJsonObject().has("new")) return true;
+		for (String section : List.of("structures", "built", "poi")) {
+			JsonArray rows = array(object(observation, "sighted"), section);
+			if (rows == null) continue;
+			for (JsonElement value : rows) {
+				if (value.isJsonObject() && value.getAsJsonObject().has("new")) return true;
+			}
 		}
 		return false;
 	}
