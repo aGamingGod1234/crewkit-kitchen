@@ -21,6 +21,7 @@ public final class PovClientStateVerification {
 		verifyTracker();
 		verifyLook();
 		verifyView();
+		verifyFreeLook();
 		verifyHands();
 		verifyBodyMonitor();
 		verifyBodyPosition();
@@ -143,6 +144,110 @@ public final class PovClientStateVerification {
 		PovView.reset();
 		PovLook.reset(0.0F, 0.0F);
 		check(PovView.yaw(agent, 0.5F, 42.0F) == 42.0F && !PovView.isTarget(agent), "reset releases the view");
+	}
+
+	private static void verifyFreeLook() {
+		long ms = 1_000_000L;
+		Object agent = new Object();
+		PovView.reset();
+		PovView.bind(agent, false);
+		PovView.acceptPose(10.0F, 20.0F);
+		check(PovFreeLook.mode(0L) == PovFreeLook.Mode.LOCKED && !PovFreeLook.detached(0L), "spectate starts locked to the agent");
+		check(!PovFreeLook.turn(100.0D, 0.0D), "the mouse does not turn a locked view");
+		check(PovView.yaw(agent, 1.0F, 42.0F, 0L) == 10.0F && PovView.pitch(agent, 1.0F, 7.0F, 0L) == 20.0F, "a locked view shows the agent's look");
+
+		PovFreeLook.hold(true, 10L * ms);
+		check(PovFreeLook.mode(10L * ms) == PovFreeLook.Mode.FREE && PovFreeLook.detached(10L * ms), "holding sneak frees the camera");
+		check(PovView.yaw(agent, 1.0F, 42.0F, 10L * ms) == 10.0F && PovView.pitch(agent, 1.0F, 7.0F, 10L * ms) == 20.0F,
+				"free look starts from the agent's current view, no jump");
+		check(PovFreeLook.turn(100.0D, -100.0D), "the mouse turns a free view");
+		check(near(PovView.yaw(agent, 1.0F, 42.0F, 11L * ms), 25.0F) && near(PovView.pitch(agent, 1.0F, 7.0F, 11L * ms), 5.0F),
+				"free look uses the Entity.turn mouse scale");
+		PovView.tick();
+		PovView.acceptPose(-40.0F, 0.0F);
+		PovView.tick();
+		check(near(PovView.yaw(agent, 1.0F, 42.0F, 12L * ms), 25.0F), "the agent turning does not move a free camera");
+		check(PovView.agentYaw(1.0F, 42.0F) == -40.0F && PovView.agentPitch(1.0F, 7.0F) == 0.0F, "the agent's own look stays readable during free look");
+		PovFreeLook.turn(1200.0D * 2.0D, 0.0D);
+		check(near(PovView.yaw(agent, 1.0F, 42.0F, 13L * ms), 25.0F), "a full 360 degree turn comes back to the same yaw");
+		PovFreeLook.turn(1000.0D, 0.0D);
+		check(near(PovView.yaw(agent, 1.0F, 42.0F, 13L * ms), 175.0F), "free yaw is not limited");
+		PovFreeLook.turn(100.0D, 0.0D);
+		check(near(PovView.yaw(agent, 1.0F, 42.0F, 13L * ms), -170.0F), "free yaw wraps past 180");
+		PovFreeLook.turn(0.0D, 5000.0D);
+		check(PovView.pitch(agent, 1.0F, 7.0F, 13L * ms) == 90.0F, "free pitch stops at straight down");
+		PovFreeLook.turn(0.0D, -5000.0D);
+		check(PovView.pitch(agent, 1.0F, 7.0F, 13L * ms) == -90.0F, "free pitch stops at straight up");
+		PovFreeLook.turn(Double.NaN, 1.0D);
+		check(PovView.pitch(agent, 1.0F, 7.0F, 13L * ms) == -90.0F, "non-finite mouse input is ignored");
+		PovFreeLook.hold(true, 14L * ms);
+		check(near(PovView.yaw(agent, 1.0F, 42.0F, 14L * ms), -170.0F), "holding on does not reseed the free view");
+
+		// Released at -170 / -90 while the agent looks -40 / 0: the return turns 130 degrees the short way and 90 up.
+		PovFreeLook.hold(false, 100L * ms);
+		check(PovFreeLook.mode(100L * ms) == PovFreeLook.Mode.RETURNING && PovFreeLook.detached(100L * ms), "releasing sneak starts the return");
+		check(!PovFreeLook.turn(100.0D, 0.0D), "the mouse does not steer the return");
+		check(near(PovView.yaw(agent, 1.0F, 42.0F, 100L * ms), -170.0F) && PovView.pitch(agent, 1.0F, 7.0F, 100L * ms) == -90.0F,
+				"the return starts where the free view was");
+		float halfway = PovFreeLook.ease(0.5F);
+		check(near(halfway, 0.875F), "the return eases out (cubic)");
+		check(near(PovView.yaw(agent, 1.0F, 42.0F, 200L * ms), -170.0F + 130.0F * halfway)
+				&& near(PovView.pitch(agent, 1.0F, 7.0F, 200L * ms), -90.0F + 90.0F * halfway), "the return glides toward the agent's look");
+		check(PovFreeLook.ease(0.0F) == 0.0F && PovFreeLook.ease(1.0F) == 1.0F && PovFreeLook.ease(2.0F) == 1.0F && PovFreeLook.ease(-1.0F) == 0.0F,
+				"the ease is clamped to its ends");
+		check(PovFreeLook.RETURN_NANOS >= 150L * ms && PovFreeLook.RETURN_NANOS <= 250L * ms, "the return lasts 150 to 250 ms");
+		check(PovFreeLook.detached(299L * ms), "the camera is still detached just before the return lands");
+		check(PovView.yaw(agent, 1.0F, 42.0F, 300L * ms) == -40.0F && PovView.pitch(agent, 1.0F, 7.0F, 300L * ms) == 0.0F
+				&& PovFreeLook.mode(300L * ms) == PovFreeLook.Mode.LOCKED, "the return lands on the agent's look and locks");
+		PovView.tick();
+		PovView.acceptPose(60.0F, 10.0F);
+		PovView.tick();
+		check(PovView.yaw(agent, 1.0F, 42.0F, 301L * ms) == 60.0F, "a locked view follows the agent again");
+
+		// Sneak again mid-return: the free view continues from what was on screen.
+		PovFreeLook.hold(true, 400L * ms);
+		PovFreeLook.turn(200.0D, 0.0D);
+		PovFreeLook.hold(false, 500L * ms);
+		float midYaw = PovView.yaw(agent, 1.0F, 42.0F, 550L * ms);
+		PovView.pitch(agent, 1.0F, 7.0F, 550L * ms);
+		PovFreeLook.hold(true, 560L * ms);
+		check(near(PovView.yaw(agent, 1.0F, 42.0F, 560L * ms), midYaw), "grabbing during the return continues from the shown view");
+
+		// The return chases the live agent look, across the 180 seam the short way.
+		PovFreeLook.reset();
+		PovView.bind(agent, false);
+		PovView.acceptPose(170.0F, 0.0F);
+		PovView.tick();
+		PovView.tick();
+		PovView.yaw(agent, 1.0F, 42.0F, 0L);
+		PovView.pitch(agent, 1.0F, 7.0F, 0L);
+		PovFreeLook.hold(true, 0L);
+		PovFreeLook.hold(false, 0L);
+		PovView.acceptPose(-170.0F, 0.0F);
+		PovView.tick();
+		PovView.tick();
+		float crossing = PovView.yaw(agent, 1.0F, 42.0F, 100L * ms);
+		check(near(crossing, 170.0F + 20.0F * PovFreeLook.ease(0.5F)), "the return takes the short way across 180: " + crossing);
+
+		// Takeover never free-looks: the mouse drives the body.
+		PovFreeLook.reset();
+		PovView.bind(agent, true);
+		PovLook.reset(5.0F, 6.0F);
+		check(!PovFreeLook.turn(100.0D, 0.0D), "a free-look turn never steals takeover mouse input");
+		check(PovView.yaw(agent, 1.0F, 42.0F, 0L) == 5.0F, "takeover reads the predicted look");
+		// Free look before any frame was shown waits for one, so it never starts from a made-up view.
+		PovView.reset();
+		PovFreeLook.hold(true, 0L);
+		check(PovFreeLook.mode(0L) == PovFreeLook.Mode.LOCKED, "free look waits for a shown frame");
+		PovView.bind(agent, false);
+		PovView.acceptPose(30.0F, 0.0F);
+		PovView.yaw(agent, 1.0F, 42.0F, 0L);
+		PovView.pitch(agent, 1.0F, 7.0F, 0L);
+		PovFreeLook.hold(true, 1L);
+		check(PovFreeLook.mode(1L) == PovFreeLook.Mode.FREE && PovView.yaw(agent, 1.0F, 42.0F, 1L) == 30.0F, "the next frame frees it");
+		PovView.reset();
+		check(PovFreeLook.mode(1L) == PovFreeLook.Mode.LOCKED, "ending or switching the view drops free look");
+		PovLook.reset(0.0F, 0.0F);
 	}
 
 	private static void verifyHands() {

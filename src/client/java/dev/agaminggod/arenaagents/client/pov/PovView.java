@@ -46,14 +46,32 @@ public final class PovView {
 	}
 
 	public static float yaw(Object entity, float partialTick, float original) {
-		if (entity == null || entity != target) return original;
-		if (takeover) return PovLook.yaw();
-		return hasPose ? PovLook.lerpYaw(previousYaw, currentYaw, partialTick) : original;
+		return yaw(entity, partialTick, original, System.nanoTime());
 	}
 
 	public static float pitch(Object entity, float partialTick, float original) {
+		return pitch(entity, partialTick, original, System.nanoTime());
+	}
+
+	/** Spectating, the camera shows the agent's look unless the operator is free-looking (PovFreeLook). */
+	static float yaw(Object entity, float partialTick, float original, long now) {
+		if (entity == null || entity != target) return original;
+		if (takeover) return PovLook.yaw();
+		return PovFreeLook.yaw(agentYaw(partialTick, original), now);
+	}
+
+	static float pitch(Object entity, float partialTick, float original, long now) {
 		if (entity == null || entity != target) return original;
 		if (takeover) return PovLook.pitch();
+		return PovFreeLook.pitch(agentPitch(partialTick, original), now);
+	}
+
+	/** The agent's own look this frame, ignoring free look; {@code original} until the first pose arrives. */
+	public static float agentYaw(float partialTick, float original) {
+		return hasPose ? PovLook.lerpYaw(previousYaw, currentYaw, partialTick) : original;
+	}
+
+	public static float agentPitch(float partialTick, float original) {
 		return hasPose ? previousPitch + (currentPitch - previousPitch) * partialTick : original;
 	}
 
@@ -70,5 +88,6 @@ public final class PovView {
 		takeover = false;
 		hasPose = false;
 		previousYaw = previousPitch = currentYaw = currentPitch = latestYaw = latestPitch = 0.0F;
+		PovFreeLook.reset();
 	}
 }

@@ -2,8 +2,11 @@ package dev.agaminggod.arenaagents.client.mixin;
 
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
+import dev.agaminggod.arenaagents.client.pov.PovClient;
+import dev.agaminggod.arenaagents.client.pov.PovFreeLook;
 import dev.agaminggod.arenaagents.client.pov.PovLook;
 import dev.agaminggod.arenaagents.client.pov.input.OperatorInputSender;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.MouseHandler;
 import net.minecraft.client.ScrollWheelHandler;
 import net.minecraft.client.player.LocalPlayer;
@@ -17,7 +20,9 @@ abstract class MouseHandlerPovMixin {
 			target = "Lnet/minecraft/client/player/LocalPlayer;turn(DD)V"))
 	private void arenaagents$turnAgentView(LocalPlayer player, double yaw, double pitch, Operation<Void> original) {
 		if (OperatorInputSender.sessionActive()) {
-			PovLook.turn(yaw, pitch);
+			// Spectate free look (sneak held) turns the camera only; otherwise the takeover look as before.
+			PovClient.updateFreeLook(Minecraft.getInstance());
+			if (!PovFreeLook.turn(yaw, pitch)) PovLook.turn(yaw, pitch);
 			return;
 		}
 		original.call(player, yaw, pitch);
