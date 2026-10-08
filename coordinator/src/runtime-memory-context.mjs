@@ -26,7 +26,8 @@ export class RuntimeMemoryContext {
 	get notebook() { return this.#notebook; }
 	get sessionId() { return this.#sessionId; }
 
-	observe(record, observation) {
+	// `owned` promises the observation is an immutable snapshot nobody else will change, so it is not copied again.
+	observe(record, observation, { owned = false } = {}) {
 		const { agentId, goalRevision } = recordIdentity(record);
 		const source = ownRecord(observation, 'observation');
 		const world = source.world === undefined ? {} : ownRecord(source.world, 'observation.world');
@@ -44,7 +45,8 @@ export class RuntimeMemoryContext {
 		this.#contexts.set(agentId, context);
 		if (!worldId.startsWith('session:') && context.dimension !== undefined) {
 			const scope = { agentId, ...context };
-			const snapshot = structuredClone(pick(source, ['world', 'worldTick', 'observedAtEpochMs', 'position', 'player', 'ready', 'death', 'inventory', 'lastLiveInventory', 'blocks', 'landmarks', 'nearbyContainers']));
+			const picked = pick(source, ['world', 'worldTick', 'observedAtEpochMs', 'position', 'player', 'ready', 'death', 'inventory', 'lastLiveInventory', 'blocks', 'landmarks', 'nearbyContainers']);
+			const snapshot = owned ? picked : structuredClone(picked);
 			const pending = Promise.resolve(this.#taskPending.get(agentId)).catch(() => {}).then(async () => {
 				await this.#tasks.observe(scope, snapshot);
 				this.#taskContexts.set(agentId, await this.#tasks.summary(scope));

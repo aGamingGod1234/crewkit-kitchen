@@ -376,3 +376,17 @@ test('an unrelated later observation failure must not reject an already persiste
   }
 });
 }
+
+test('an owned observation reaches task memory without another copy, a borrowed one is isolated', async () => {
+	const snapshots = [];
+	const taskMemory = { observe: async (_scope, snapshot) => { snapshots.push(snapshot); }, summary: async () => ({}), query: async () => ({}), remember: async () => ({}), flush: async () => {} };
+	const memory = new RuntimeMemoryContext({ taskMemory });
+	const source = { ...observation, position: { x: 1, y: 64, z: 2 }, blocks: [{ x: 1, y: 63, z: 2, blockId: 'minecraft:stone' }] };
+	memory.observe(record, source, { owned: true });
+	memory.observe(record, source);
+	await memory.flush();
+	assert.equal(snapshots.length, 2);
+	assert.equal(snapshots[0].blocks, source.blocks, 'the immutable snapshot is shared as is');
+	assert.notEqual(snapshots[1].blocks, source.blocks, 'a caller that may still change its object gets a copy');
+	assert.deepEqual(snapshots[1].blocks, source.blocks);
+});

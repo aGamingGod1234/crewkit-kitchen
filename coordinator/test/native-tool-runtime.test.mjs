@@ -1612,10 +1612,11 @@ test('fresh observation is fenced after asynchronous metadata finishes', async (
 
 // A server-shaped runtime: each request stays pending until the test answers it,
 // like an inspection that the server serves on its next tick.
-function postResultRuntime({ registry = null } = {}) {
+function postResultRuntime({ registry = null, ...options } = {}) {
 	const sent = [];
 	const requests = [];
 	const runtime = new NativeToolRuntime({
+		...options,
 		registry,
 		bridge: { send: async (...args) => { sent.push(args); } },
 		requestObservation: (_record, { afterEventSequence }) => new Promise((resolve, reject) => { requests.push({ afterEventSequence, resolve, reject }); }),
@@ -1736,4 +1737,96 @@ test('program continuations use post-result publications that arrive before samp
 	assert.equal(result.reasonCode, 'PROGRAM_EXHAUSTED');
 	assert.equal(result.actions, 2);
 	assert.equal(requests.length, 0, 'both continuations used publications that arrived before sampling');
+});
+
+const navigate = { kind: 'action', actionType: 'navigate_to', arguments: { x: 1, y: 64, z: 0, tolerance: 1, sprint: false, timeoutMs: 1000 } };
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Runs one navigate_to whose result is followed by the server's publication, as the Java bridge does in the same tick.
+async function publishedAction(runtime, sent, sequence) {
+	const pending = runtime.execute(nativeCall(navigate), record());
+	await turn();
+	runtime.onActionResult(record(), { actionId: sent.at(-1)[2].actionId, state: 'SUCCEEDED', reasonCode: 'DESTINATION_REACHED' });
+	await turn();
+	runtime.updateObservation(record(), { pushed: sequence }, { eventSequence: sequence });
+	return pending;
+}
+
+test('once publications follow results, the post-result request waits for the publication instead of costing a server sample', async () => {
+	const { runtime, sent, requests } = postResultRuntime({ publicationGraceMs: 500 });
+	runtime.updateObservation(record(), { entities: [] }, { eventSequence: 1 });
+	// Until two results in a row were published, the request still goes out at once.
+	await publishedAction(runtime, sent, 2);
+	await publishedAction(runtime, sent, 3);
+	assert.equal(requests.length, 2, 'unproven publications are raced against an immediate request');
+	const pending = runtime.execute(nativeCall(navigate), record());
+	await turn();
+	runtime.onActionResult(record(), { actionId: sent.at(-1)[2].actionId, state: 'SUCCEEDED', reasonCode: 'DESTINATION_REACHED' });
+	await sleep(20);
+	assert.equal(requests.length, 2, 'the request is held back while the publication can still arrive');
+	runtime.updateObservation(record(), { pushed: 4 }, { eventSequence: 4 });
+	const result = await pending;
+	assert.equal(requests.length, 2, 'a publication inside the grace period needs no request');
+	assert.equal(result.postAction.freshness.fresh, true);
+	assert.equal(result.postAction.eventSequence, 4);
+});
+
+test('a missing publication still gets its request once the grace period ends, and stops the waiting', async () => {
+	const traces = [];
+	const { runtime, sent, requests } = postResultRuntime({ publicationGraceMs: 40, trace: (event, fields) => traces.push({ event, ...fields }) });
+	runtime.updateObservation(record(), { entities: [] }, { eventSequence: 1 });
+	await publishedAction(runtime, sent, 2);
+	await publishedAction(runtime, sent, 3);
+	const pending = runtime.execute(nativeCall(navigate), record());
+	await turn();
+	runtime.onActionResult(record(), { actionId: sent.at(-1)[2].actionId, state: 'SUCCEEDED', reasonCode: 'DESTINATION_REACHED' });
+	await sleep(10);
+	assert.equal(requests.length, 2);
+	await sleep(80);
+	assert.equal(requests.length, 3, 'the explicit request remains the guarantee');
+	assert.equal(requests[2].afterEventSequence, 3, 'it is fenced at the result, like the immediate request');
+	requests[2].resolve({ eventSequence: 9, observation: { requested: true } });
+	const result = await pending;
+	assert.equal(result.postAction.eventSequence, 9);
+	assert.equal(result.postAction.observation.requested, true);
+	assert.ok(traces.some(({ event, waitedMs }) => event === 'native_post_result_publication_missed' && waitedMs >= 30));
+	// The miss ends the waiting: the next result requests at once again.
+	const next = runtime.execute(nativeCall(navigate), record());
+	await turn();
+	runtime.onActionResult(record(), { actionId: sent.at(-1)[2].actionId, state: 'SUCCEEDED', reasonCode: 'DESTINATION_REACHED' });
+	await turn();
+	assert.equal(requests.length, 4);
+	runtime.updateObservation(record(), { pushed: 10 }, { eventSequence: 10 });
+	await next;
+});
+
+test('a server that never publishes after results is asked at once every time', async () => {
+	const { runtime, sent, requests } = postResultRuntime({ publicationGraceMs: 500 });
+	runtime.updateObservation(record(), { entities: [] }, { eventSequence: 1 });
+	for (let index = 0; index < 4; index += 1) {
+		const pending = runtime.execute(nativeCall(navigate), record());
+		await turn();
+		runtime.onActionResult(record(), { actionId: sent.at(-1)[2].actionId, state: 'SUCCEEDED', reasonCode: 'DESTINATION_REACHED' });
+		await turn();
+		assert.equal(requests.length, index + 1, 'no publication was ever seen, so nothing is waited for');
+		requests[index].resolve({ eventSequence: 10 + index, observation: { requested: index } });
+		assert.equal((await pending).postAction.eventSequence, 10 + index);
+	}
+});
+
+test('a lifecycle that ends during the publication grace period sends no request', async () => {
+	let current = record();
+	const { runtime, sent, requests } = postResultRuntime({ publicationGraceMs: 40, registry: { get: () => current } });
+	runtime.updateObservation(record(), { entities: [] }, { eventSequence: 1 });
+	await publishedAction(runtime, sent, 2);
+	await publishedAction(runtime, sent, 3);
+	const pending = runtime.execute(nativeCall(navigate), record()).catch((error) => error);
+	await turn();
+	runtime.onActionResult(record(), { actionId: sent.at(-1)[2].actionId, state: 'SUCCEEDED', reasonCode: 'DESTINATION_REACHED' });
+	await sleep(5);
+	current = record({ goalRevision: 4 });
+	await runtime.dispose('agent-a', 'goal_steered');
+	const result = await pending;
+	assert.equal(requests.length, 2, 'the disposed goal does not ask the server for another sample');
+	assert.equal(result.postAction.freshness.fresh, false, 'the action result stays authoritative without fresh facts');
 });

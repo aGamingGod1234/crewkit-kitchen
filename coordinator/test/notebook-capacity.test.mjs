@@ -3,7 +3,7 @@ import test from 'node:test';
 import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ModelNotebook } from '../src/model-notebook.mjs';
+import { ModelNotebook, serializedBytes } from '../src/model-notebook.mjs';
 import { NotebookActionJournal, emptyNotebook } from '../src/notebook-action-journal.mjs';
 import { AtomicAgentStore } from '../src/observed-memory-store.mjs';
 
@@ -104,4 +104,19 @@ test('small retention budgets cannot prevent full terminal enrichment or erase i
 	const restored = new ModelNotebook(options);
 	assert.deepEqual(await restored.findReceipt('a', { actionId: action.actionId }), result);
 	assert.equal((await restored.listUnresolved('a', query)).total, 0);
+});
+
+test('incremental size accounting equals serializing the whole notebook', () => {
+	const entry = (kind, revision, text) => ({ kind, revision, worldId: query.worldId, text, key: `k${revision}` });
+	const awkward = `quote " slash ${String.fromCharCode(92)} accent ${String.fromCharCode(0xe9, 0x2028, 0xd83d, 0xde00)}`;
+	const empty = emptyNotebook();
+	const full = { ...empty, revision: 9, evictedNotes: 3, evictedReceipts: 12,
+		notes: [entry('note', 1, 'plain'), entry('note', 2, awkward)],
+		receipts: [entry('receipt', 3, 'x'.repeat(500)), entry('receipt', 4, '')], recovery: [entry('receipt', 5, 'pending')] };
+	for (const state of [empty, full, { ...full, notes: [] }, { ...full, receipts: [], recovery: [] }, { ...full, recovery: [] }]) {
+		assert.equal(serializedBytes(state, true), byteLength(state));
+		assert.equal(serializedBytes(state, false), byteLength({ ...state, recovery: [] }));
+	}
+	// Entries are measured once and remembered: repeating the call on the same objects stays exact.
+	assert.equal(serializedBytes(full, true), byteLength(full));
 });

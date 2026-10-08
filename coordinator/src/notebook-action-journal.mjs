@@ -15,7 +15,7 @@ const digest = bytes => createHash('sha256').update(bytes).digest('hex');
  * log truncation, so either side of a crash replays the same committed revisions.
  */
 export class NotebookActionJournal {
-	#directory; #disk; #logs = new Map();
+	#directory; #disk; #logs = new Map(); #directoryReady = false;
 	constructor({ directory = null } = {}) {
 		this.#directory = directory === null ? null : resolve(directory);
 		this.#disk = new AtomicAgentStore({ directory, namespace: 'notebook' });
@@ -63,7 +63,7 @@ export class NotebookActionJournal {
 		const encoded = JSON.stringify(delta(previous, state));
 		const bytes = Buffer.from(`${digest(encoded)} ${encoded}\n`);
 		if (bytes.length > MAX_RECORD_BYTES) throw new Error('ACTION_JOURNAL_RECORD_TOO_LARGE');
-		await mkdir(this.#directory, { recursive: true });
+		if (!this.#directoryReady) { await mkdir(this.#directory, { recursive: true }); this.#directoryReady = true; }
 		if (log.records >= CHECKPOINT_RECORDS || log.bytes + bytes.length > CHECKPOINT_BYTES) {
 			// Checkpoint the OLD committed state. Failure here cannot commit the new
 			// action or cause a retry to mistake it for an already durable dispatch.
@@ -71,7 +71,7 @@ export class NotebookActionJournal {
 			await this.#truncate(agentId, 0);
 			log.bytes = 0; log.records = 0;
 		}
-		const file = await open(this.#path(agentId), 'a', 0o600);
+		const file = await this.#openForAppend(agentId);
 		try {
 			await file.writeFile(bytes);
 			await file.sync();
@@ -87,6 +87,15 @@ export class NotebookActionJournal {
 			catch (error) { log.poisoned = true; throw error; }
 		}
 		log.bytes += bytes.length; log.records++;
+	}
+	async #openForAppend(agentId) {
+		try { return await open(this.#path(agentId), 'a', 0o600); }
+		catch (error) {
+			// The directory is created once; if it was removed since, recreate it rather than fail the dispatch.
+			if (error.code !== 'ENOENT') throw error;
+			await mkdir(this.#directory, { recursive: true });
+			return open(this.#path(agentId), 'a', 0o600);
+		}
 	}
 	async #truncate(agentId, size) {
 		const file = await open(this.#path(agentId), 'r+');

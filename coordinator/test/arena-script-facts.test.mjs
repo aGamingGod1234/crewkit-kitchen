@@ -175,3 +175,48 @@ test('menu and coverage changes invalidate their watcher domains without changin
 	assert.equal(changed.player, first.player);
 	assert.equal(changedInterpreterFactDomains(first, changed), FACT_DOMAIN.menu | FACT_DOMAIN.worldState);
 });
+
+test('candidate arrays that are not plain dense data are still rejected after the single-pass copy', () => {
+	const block = () => ({ stableId: 'a', blockId: 'minecraft:stone', x: 0, y: 64, z: 0 });
+	const accessor = [block()];
+	Object.defineProperty(accessor, 0, { get() { return block(); }, enumerable: true });
+	const holes = [block(), , block()];
+	const extra = [block()];
+	extra.note = 'custom key';
+	const symbol = [block()];
+	symbol[Symbol('hidden')] = true;
+	const tagged = { ...block(), tags: ['#ok'] };
+	Object.defineProperty(tagged.tags, 0, { get() { return '#ok'; }, enumerable: true });
+	for (const blocks of [accessor, holes, extra, symbol, new Proxy([], {}), [tagged]]) {
+		assert.throws(() => createInterpreterFacts(observation({ blocks })), TypeError);
+	}
+	assert.throws(() => createInterpreterFacts(observation({ blocks: [{ ...block(), reach: Number.NaN }] })), TypeError);
+	assert.throws(() => createInterpreterFacts(observation({ blocks: [JSON.parse('{"stableId":"a","blockId":"minecraft:stone","x":0,"y":64,"z":0,"__proto__":{}}')] })), /unsafe key/);
+	// A candidate without finite coordinates is skipped before any of its other fields are inspected.
+	assert.equal(createInterpreterFacts(observation({ blocks: [{ ...block(), x: Number.NaN, reach: Number.NaN }] })).world.blocks.length, 0);
+});
+
+test('copied candidates keep their shape: frozen null-prototype records with a frozen position and tags', () => {
+	const facts = createInterpreterFacts(observation({
+		blocks: [{ stableId: 'b', blockId: 'minecraft:stone', x: 1, y: 64, z: 2, tags: ['#mineable'], state: { facing: 'north' }, skipped: undefined }],
+		inventory: { items: [{ itemId: 'minecraft:stick', count: 2, slot: 0, tags: ['#sticks'] }], tagCounts: {} },
+	}));
+	const [block] = facts.world.blocks;
+	assert.deepEqual(Object.keys(block), ['stableId', 'blockId', 'x', 'y', 'z', 'tags', 'state', 'position']);
+	assert.equal(Object.getPrototypeOf(block), null);
+	assert.ok(Object.isFrozen(block) && Object.isFrozen(block.position) && Object.isFrozen(block.tags) && Object.isFrozen(block.state));
+	assert.deepEqual({ ...block.position }, { x: 1, y: 64, z: 2 });
+	const [stick] = facts.inventory.items;
+	assert.equal(Object.getPrototypeOf(stick), null);
+	assert.ok(Object.isFrozen(stick) && Object.isFrozen(stick.tags));
+});
+
+test('unchanged candidates keep their identity across observations', () => {
+	const blocks = () => Array.from({ length: 30 }, (_, index) => ({ stableId: `b${index}`, blockId: 'minecraft:stone', x: index, y: 64, z: 0, tags: ['#mineable'] }));
+	const first = createInterpreterFacts(observation({ blocks: blocks() }));
+	const moved = createInterpreterFacts(observation({ player: { x: 5, y: 64, z: 0, health: 20 }, blocks: blocks() }), first);
+	assert.equal(moved.world.blocks, first.world.blocks, 'an identical list is shared, not rebuilt');
+	assert.notEqual(moved.player, first.player);
+	const changed = createInterpreterFacts(observation({ blocks: blocks().slice(1) }), first);
+	assert.notEqual(changed.world.blocks, first.world.blocks);
+});
