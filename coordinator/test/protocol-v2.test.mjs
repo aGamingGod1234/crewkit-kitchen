@@ -1772,6 +1772,77 @@ test('event inspection uses bounded pages and an explicit event sequence cursor'
 	}
 });
 
+test('threat facts, combat entity fields and threat attention paths are accepted; unknown signals are not', () => {
+	const observation = readyServerObservation();
+	const creeper = '00000000-0000-0000-0000-0000000000cc';
+	observation.attention = true;
+	observation.changedFacts = [`threats.${creeper}.swelling`];
+	observation.entities = [{ uuid: creeper, type: 'minecraft:creeper', name: 'Creeper', distance: 4, position: { x: 14, y: 64, z: -3 },
+		alive: true, hostile: true, health: 20, maxHealth: 20, targetingAgent: true, swelling: true, fuse: 0.4, perceivedBy: 'sound' }];
+	observation.threats = { entries: [{ uuid: creeper, type: 'minecraft:creeper', distance: 4, bearing: -170, targeting: true, swelling: true, lineOfSight: true, signals: ['creeper_close', 'swelling', 'targeting'] }],
+		bestWeapon: { slot: 2, itemId: 'minecraft:stone_sword' } };
+	const normalized = validateProtocolV2Payload('observation', observation);
+	assert.deepEqual(normalized.threats, observation.threats);
+	assert.equal(normalized.entities[0].perceivedBy, 'sound');
+	assert.equal(normalized.entities[0].fuse, 0.4);
+	assert.deepEqual(normalized.changedFacts, [`threats.${creeper}.swelling`]);
+	const unknown = structuredClone(observation);
+	unknown.threats.entries[0].signals = ['panic'];
+	assert.throws(() => validateProtocolV2Payload('observation', unknown), /unknown signal/);
+	const badPath = structuredClone(observation);
+	badPath.changedFacts = [`threats.${creeper}.panic`];
+	assert.throws(() => validateProtocolV2Payload('observation', badPath), /factual observation path/);
+	const withoutThreats = readyServerObservation();
+	assert.equal(Object.hasOwn(validateProtocolV2Payload('observation', withoutThreats), 'threats'), false, 'threats stay optional');
+});
+
+test('threat trend facts and the imminent edge are accepted; a malformed trend is not', () => {
+	const observation = readyServerObservation();
+	const creeper = '00000000-0000-0000-0000-0000000000cc';
+	observation.attention = true;
+	observation.changedFacts = [`threats.${creeper}.imminent`];
+	observation.threats = { entries: [{ uuid: creeper, type: 'minecraft:creeper', distance: 10, bearing: 0, targeting: true, swelling: false, lineOfSight: true,
+		signals: ['imminent', 'targeting'], risk: 7.1, riskFactors: { proximity: 0.23 }, expectedHitDamage: 0, closingSpeed: 2.6, approaching: true, etaSeconds: 2.7, contactRisk: 145 }] };
+	const normalized = validateProtocolV2Payload('observation', observation);
+	assert.deepEqual(normalized.threats.entries[0], { ...observation.threats.entries[0] });
+	assert.deepEqual(normalized.changedFacts, [`threats.${creeper}.imminent`]);
+	const stationary = structuredClone(observation);
+	delete stationary.threats.entries[0].etaSeconds;
+	delete stationary.threats.entries[0].contactRisk;
+	assert.equal(Object.hasOwn(validateProtocolV2Payload('observation', stationary).threats.entries[0], 'etaSeconds'), false, 'ETA is omitted when not approaching');
+	const bad = structuredClone(observation);
+	bad.threats.entries[0].approaching = 'yes';
+	assert.throws(() => validateProtocolV2Payload('observation', bad), ProtocolV2Error);
+});
+
+test('risk facts, player attackers and healing signals are accepted as observation facts', () => {
+	const observation = readyServerObservation();
+	const player = '00000000-0000-0000-0000-0000000000b2';
+	observation.attention = true;
+	observation.changedFacts = [`threats.${player}.attacked`, 'survival.low_health_no_food'];
+	observation.entities = [{ uuid: player, type: 'minecraft:player', name: 'Steve', distance: 3, position: { x: 3, y: 64, z: 0 },
+		alive: true, hostile: true, health: 20, maxHealth: 20, potentialRisk: 92.4, risk: 92.4, expectedHitDamage: 5.1 }];
+	observation.threats = { entries: [{ uuid: player, type: 'minecraft:player', distance: 3, bearing: 10, targeting: false, swelling: false, lineOfSight: true,
+		signals: ['attacked'], risk: 2400.5, riskFactors: { proximity: 0.5, health: 1.34, speed: 1, size: 1, damage: 1.3, behaviour: 1.25 }, expectedHitDamage: 5.1 }] };
+	observation.survival = { safe: false, canHealNow: false, signals: ['low_health_no_food'] };
+	const normalized = validateProtocolV2Payload('observation', observation);
+	assert.equal(normalized.threats.entries[0].risk, 2400.5, 'risk is open-ended');
+	assert.equal(normalized.threats.entries[0].riskFactors.health, 1.34);
+	assert.equal(normalized.entities[0].potentialRisk, 92.4);
+	assert.deepEqual(normalized.survival, { safe: false, canHealNow: false, signals: ['low_health_no_food'] });
+	assert.deepEqual(normalized.changedFacts, [`threats.${player}.attacked`, 'survival.low_health_no_food']);
+	const fed = structuredClone(observation);
+	fed.survival = { safe: true, canHealNow: true, bestFood: { slot: 3, itemId: 'minecraft:bread', nutrition: 5 }, signals: ['heal_opportunity'] };
+	fed.changedFacts = ['survival.heal_opportunity'];
+	assert.equal(validateProtocolV2Payload('observation', fed).survival.bestFood.itemId, 'minecraft:bread');
+	const unknown = structuredClone(observation);
+	unknown.survival.signals = ['starving'];
+	assert.throws(() => validateProtocolV2Payload('observation', unknown), /unknown signal/);
+	const badPath = structuredClone(observation);
+	badPath.changedFacts = ['survival.starving'];
+	assert.throws(() => validateProtocolV2Payload('observation', badPath), /factual observation path/);
+});
+
 test('player packet observations preserve approximate sounds, visible bars, and event attention', () => {
 	const observation = readyServerObservation();
 	observation.attention = true;
@@ -1865,7 +1936,7 @@ test('protocol v2 preserves nullable desired block state and defers block-id mat
 });
 
 test('protocol v2 rejects retired high-level controller action types', () => {
-	for (const actionType of ['build_sequence', 'fight_target', 'flee_from', 'follow_entity', 'complete_goal']) {
+	for (const actionType of ['build_sequence', 'follow_entity', 'complete_goal']) {
 		assert.throws(
 			() => validateProtocolV2Payload('action_command', {
 				traceId: TRACE_ID,
@@ -1897,7 +1968,7 @@ test('protocol v2 carries an exact observed dropped-item identity to Minecraft',
 
 function currentCollectorObservation() {
 	const payload = readyServerObservation();
-	Object.assign(payload.player, { pose: 'standing', swimming: false, gliding: false, sprinting: false, crouching: false,
+	Object.assign(payload.player, { pose: 'standing', underWater: false, swimming: false, gliding: false, sprinting: false, crouching: false,
 		onClimbable: false, inLava: false, horizontalCollision: false, verticalCollision: false, passenger: false });
 	payload.world.worldId = '00000000-0000-0000-0000-000000000999';
 	Object.assign(payload.interaction.menu, { containerId: 0, stateId: 1, slotCount: 46, offset: 0, hasMore: true });
@@ -2314,4 +2385,66 @@ test('33 progress messages have identical delivery in one TCP chunk or separate 
 		assert.equal(socket.destroyed, false);
 		assert.equal(socket.paused, false);
 	}
+});
+
+test('underwater breath facts survive wire validation and adaptation', () => {
+	const payload = currentCollectorObservation();
+	Object.assign(payload.player, { inWater: true, air: 150, underWater: true, airSecondsLeft: 7.5, operatorControlled: true });
+	const adapted = adaptObservation(validateProtocolV2Payload('observation', payload));
+	assert.equal(adapted.player.underWater, true);
+	assert.equal(adapted.player.airSecondsLeft, 7.5);
+	assert.equal(adapted.player.air, 150);
+	assert.equal(adapted.player.operatorControlled, true, 'a /takeover is reported so danger never wakes the model onto the operator body');
+});
+
+test('heard sounds and the first-heard-lava fact pass wire validation with relative direction only', () => {
+	const observation = readyServerObservation();
+	observation.attention = true;
+	observation.changedFacts = ['heard'];
+	observation.heard = [
+		{ sound: 'block.lava.pop', direction: 'front', elevation: 'below', distance: 3, count: 2 },
+		{ sound: 'block.stone.step', source: 'minecraft:zombie', direction: 'here', elevation: 'above', distance: 2, secondsAgo: 6 },
+	];
+	const normalized = validateProtocolV2Payload('observation', observation);
+	assert.deepEqual(normalized.heard, observation.heard);
+	assert.deepEqual(normalized.changedFacts, ['heard']);
+	for (const [field, value] of [['direction', 'north'], ['elevation', 'up'], ['distance', -2], ['x', 4]]) {
+		const bad = structuredClone(observation);
+		bad.heard[0][field] = value;
+		assert.throws(() => validateProtocolV2Payload('observation', bad), /heard\[0\]|INVALID|unexpected|unknown/i, `${field} is validated`);
+	}
+	const crowded = structuredClone(observation);
+	crowded.heard = Array.from({ length: 7 }, () => observation.heard[0]);
+	assert.throws(() => validateProtocolV2Payload('observation', crowded));
+	assert.equal(Object.hasOwn(validateProtocolV2Payload('observation', readyServerObservation()), 'heard'), false, 'heard stays optional');
+});
+
+test('sighted structures, caves and ore veins pass wire validation with bounded rows', () => {
+	const observation = readyServerObservation();
+	observation.attention = true;
+	observation.changedFacts = ['sighted'];
+	observation.sighted = {
+		structures: [{ x: 40, y: 62, z: -12, distance: 41, bearing: -20, structure: 'shipwreck', new: true }],
+		caves: [{ x: 6, y: 58, z: 3, distance: 9, bearing: 35, air: 61 }],
+		veins: [{ x: 2, y: 60, z: 1, distance: 3, bearing: 10, blockId: 'minecraft:deepslate_iron_ore', visible: 5 }],
+	};
+	const normalized = validateProtocolV2Payload('observation', observation);
+	assert.deepEqual(normalized.sighted, observation.sighted);
+	assert.deepEqual(normalized.changedFacts, ['sighted']);
+	for (const mutate of [
+		(value) => { value.sighted.structures[0].hidden = true; },
+		(value) => { value.sighted.caves[0].bearing = 270; },
+		(value) => { delete value.sighted.veins[0].visible; },
+		(value) => { value.sighted.veins[0].visible = 0; },
+		(value) => { value.sighted.caves = Array.from({ length: 4 }, () => value.sighted.caves[0]); },
+		(value) => { value.sighted.mineshafts = []; },
+	]) {
+		const bad = structuredClone(observation);
+		mutate(bad);
+		assert.throws(() => validateProtocolV2Payload('observation', bad));
+	}
+	const known = structuredClone(observation);
+	delete known.sighted.structures[0].new;
+	assert.equal(validateProtocolV2Payload('observation', known).sighted.structures[0].new, undefined, 'new is optional');
+	assert.equal(Object.hasOwn(validateProtocolV2Payload('observation', readyServerObservation()), 'sighted'), false, 'sighted stays optional');
 });

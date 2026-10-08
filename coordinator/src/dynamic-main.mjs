@@ -1,6 +1,7 @@
 import { generateDirectorScript } from './director-script-generator.mjs';
+import { hasHeardSection, withoutHeardSoundEvents } from './model-fact-encoding.mjs';
 import { EventEmitter } from 'node:events';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -24,10 +25,12 @@ import { ModelNotebook } from './model-notebook.mjs';
 import { RuntimeMemoryContext } from './runtime-memory-context.mjs';
 import { TaskMemoryStore } from './task-memory-store.mjs';
 import { LiveTaskViews } from './live-task-view.mjs';
+import { withToolWear } from './resource-facts.mjs';
 import { ObservedMemoryStore } from './observed-memory-store.mjs';
 import { ExplorationOccupancy } from './explore-frontier.mjs';
 import { ProviderService } from './provider-service.mjs';
 import { ProviderTurnRecorder } from './provider-turn-recorder.mjs';
+import { DangerSteerCoalescer } from './danger-steer-coalescer.mjs';
 import {
 	DEFAULT_AGENT_CAP,
 	DEFAULT_GOAL_QUEUE_CAP,
@@ -143,8 +146,18 @@ export class DynamicCoordinator extends EventEmitter {
 	#memoryDirectory;
 	#nativeConversationRecoveries = new Map();
 	#nativeObservationSignatures = new Map();
+	#perceptionSequences = new Map();
 	#nativeWorldSignals = new Map();
+	// Low-health wakes of agents with no task, one per health level (see lowHealthWake).
+	#healWakes = new Map();
+	// Low-health-with-food nudges of agents with a task (see healNudgeVerdict).
+	#healNudges = new Map();
 	#nativeConfirmationWaits = new Map();
+	// Agents that started body work while their finished goal awaits confirmation: their follow-up wakes pass.
+	#confirmationActivity = new Set();
+	// takeTask round trips awaiting Minecraft's task_request_result, keyed by requestId.
+	#taskRequests = new Map();
+	#taskRequestTimeoutMs;
 	#supervisedObservationRequests = new Map();
 	#conversationWakeTransactions = new Map();
 	#directorRequests = new Set();
@@ -170,6 +183,8 @@ export class DynamicCoordinator extends EventEmitter {
 	#latencyRegistry;
 	#controlNow;
 	#epochNow;
+	#setSteerTimeout;
+	#clearSteerTimeout;
 	#disconnectedAt = null;
 	#supportedAgentIds = new Set();
 	#reconciledStatus = false;
@@ -193,7 +208,7 @@ export class DynamicCoordinator extends EventEmitter {
 	#providerCliNotices = { connectionEpoch: null, agents: new Set() };
 	#providerCliStartupLogged = false;
 
-	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, goalSupervisor, codexControlProtocol = 'native_tools', memoryDirectory = null, runtimeSessionId, traceWriter = null, providerTurnRecorder = null, runtimeGeneration = null, runtimeHooks = {}, benchmarkRecorder = null, providerCliHealth = null, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval, setGoalSpecTimeout = defaultGoalSpecTimeout, clearGoalSpecTimeout = clearTimeout, connectionOperationCap = DEFAULT_CONNECTION_OPERATION_CAP, agentOperationCap = DEFAULT_AGENT_OPERATION_CAP, goalSpecRequestCap = connectionOperationCap, maxPendingAgentOperations = DEFAULT_MAX_PENDING_AGENT_OPERATIONS, maxPendingAgentTransactions = DEFAULT_MAX_PENDING_AGENT_TRANSACTIONS }) {
+	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, goalSupervisor, codexControlProtocol = 'native_tools', memoryDirectory = null, runtimeSessionId, traceWriter = null, providerTurnRecorder = null, runtimeGeneration = null, runtimeHooks = {}, benchmarkRecorder = null, providerCliHealth = null, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval, setGoalSpecTimeout = defaultGoalSpecTimeout, clearGoalSpecTimeout = clearTimeout, setSteerTimeout = setTimeout, clearSteerTimeout = clearTimeout, taskRequestTimeoutMs = DEFAULT_TASK_REQUEST_TIMEOUT_MS, connectionOperationCap = DEFAULT_CONNECTION_OPERATION_CAP, agentOperationCap = DEFAULT_AGENT_OPERATION_CAP, goalSpecRequestCap = connectionOperationCap, maxPendingAgentOperations = DEFAULT_MAX_PENDING_AGENT_OPERATIONS, maxPendingAgentTransactions = DEFAULT_MAX_PENDING_AGENT_TRANSACTIONS }) {
 		super();
 		this.#memoryDirectory = memoryDirectory;
 		if (providerCliHealth !== null && typeof providerCliHealth.check !== 'function') throw new TypeError('providerCliHealth.check must be a function');
@@ -228,6 +243,9 @@ export class DynamicCoordinator extends EventEmitter {
 		if (!Number.isSafeInteger(maxPendingAgentTransactions) || maxPendingAgentTransactions < 1) throw new TypeError('maxPendingAgentTransactions must be a positive safe integer');
 		this.#controlNow = controlNow;
 		this.#epochNow = epochNow;
+		if (typeof setSteerTimeout !== 'function' || typeof clearSteerTimeout !== 'function') throw new TypeError('steer timer callbacks must be functions');
+		this.#setSteerTimeout = setSteerTimeout;
+		this.#clearSteerTimeout = clearSteerTimeout;
 		this.#maxPendingAgentOperations = maxPendingAgentOperations;
 		this.#maxPendingAgentTransactions = maxPendingAgentTransactions;
 		const programBridge = {
@@ -333,10 +351,23 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#clearStatusInterval = requireDependency(clearStatusInterval, 'clearStatusInterval');
 		this.#setGoalSpecTimeout = requireDependency(setGoalSpecTimeout, 'setGoalSpecTimeout');
 		this.#clearGoalSpecTimeout = requireDependency(clearGoalSpecTimeout, 'clearGoalSpecTimeout');
+		this.#taskRequestTimeoutMs = taskRequestTimeoutMs;
 	}
 
 	get registry() { return this.#registry; }
 	get bridge() { return this.#bridge; }
+
+	/**
+	 * With the compact heard section present, a perception change made only of new raw sound packets is
+	 * already summarised there (and heard lava raises its own "heard" fact), so it is not attention by itself.
+	 */
+	#withoutSoundOnlyAttention(agentId, payload, wireObservation) {
+		const perception = wireObservation?.perception;
+		const latest = Number.isSafeInteger(perception?.latestSequence) ? perception.latestSequence : null;
+		const previous = this.#perceptionSequences.get(agentId);
+		if (latest !== null) this.#perceptionSequences.set(agentId, latest);
+		return soundOnlyPerceptionChange(payload, wireObservation, previous) ? { ...payload, attention: false, changedFacts: [] } : payload;
+	}
 
 	requestSupervisedObservation(key) {
 		if (this.#stopping || this.#closed || key === null || typeof key !== 'object') return false;
@@ -521,6 +552,7 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#nativeConfirmationWaits.clear();
 		this.#supervisedObservationRequests.clear();
 		this.#conversationWakeTransactions.clear();
+		this.#settleTaskRequests(undefined, 'COORDINATOR_STOPPING', 'The coordinator is stopping.');
 		this.#cancelGoalSpecRequests();
 		if (this.#traceWriter !== null && typeof this.#traceWriter.close === 'function') await this.#traceWriter.close();
 		if (this.#providerTurnRecorder !== null) await Promise.resolve(this.#providerTurnRecorder.close()).catch(() => {});
@@ -626,8 +658,11 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#nativeConversationRecoveries.delete(message.agentId);
 			this.#nativeObservationSignatures.delete(message.agentId);
 			this.#nativeWorldSignals.delete(message.agentId);
+			this.#healNudges.delete(message.agentId);
 			this.#nativeConfirmationWaits.delete(message.agentId);
+			this.#confirmationActivity.delete(message.agentId);
 			this.#supervisedObservationRequests.delete(message.agentId);
+			this.#settleTaskRequests(message.agentId, 'AGENT_REMOVED', 'This agent was removed.');
 			this.#forgetConversationWakes(message.agentId);
 			this.#cancelGoalSpecRequests(message.agentId);
 			this.#supportedAgentIds.delete(message.agentId);
@@ -866,7 +901,9 @@ export class DynamicCoordinator extends EventEmitter {
 				if (!this.#isConnectionEpochCurrent(connectionEpoch)) return;
 				if (!this.#isLifecycleGenerationCurrent(message.agentId, lifecycleGeneration)) return;
 				const record = this.#registry.assertCurrentRevision(message.agentId, message.payload.goalRevision);
-				if (![DynamicAgentState.STARTING, DynamicAgentState.PLANNING, DynamicAgentState.ACTING].includes(record.state)) return;
+				// Finished or idle native agents still own their body: danger must reach the model (see below).
+				const noTask = this.#usesNativeTools(record) && [DynamicAgentState.IDLE, DynamicAgentState.COMPLETED].includes(record.state);
+				if (!noTask && ![DynamicAgentState.STARTING, DynamicAgentState.PLANNING, DynamicAgentState.ACTING].includes(record.state)) return;
 				const wireObservation = message.payload.observation ?? message.payload;
 				const supervisionKey = this.#supervisionKey(record, lifecycleGeneration);
 				this.#goalSupervisor.factualProgress(supervisionKey, factualProgressSignature(wireObservation), factualProgressDetails(wireObservation));
@@ -886,12 +923,17 @@ export class DynamicCoordinator extends EventEmitter {
 				const worldSignals = this.#usesNativeTools(record)
 					? this.#rememberNativeWorldSignals(record, lifecycleGeneration, connectionEpoch, observation)
 					: null;
-				const classified = classifyObservationTrigger(message.payload, wireObservation, worldSignals);
+				const classified = classifyObservationTrigger(this.#withoutSoundOnlyAttention(record.agentId, message.payload, wireObservation), wireObservation, worldSignals);
 				const pendingAttention = this.#pendingAttention.get(record.agentId);
-				const attention = pendingAttention?.goalRevision === record.goalRevision
+				const merged = pendingAttention?.goalRevision === record.goalRevision
 					? mergeAttentionTrigger(classified, pendingAttention)
 					: classified;
+				const attention = noTask ? merged : this.#withHealNudge(record, observation, merged);
 				if (pendingAttention?.goalRevision === record.goalRevision) this.#pendingAttention.delete(record.agentId);
+				if (noTask) {
+					this.#observeWithoutTask(record, observation, message.payload, attention, lifecycleGeneration, connectionEpoch);
+					return;
+				}
 				const ledger = this.#ledger(record.agentId);
 				ledger.ingest('observation', wireObservation);
 				if (this.#usesNativeTools(record)) {
@@ -1055,6 +1097,14 @@ export class DynamicCoordinator extends EventEmitter {
 				}
 			}, { connectionEpoch, terminal: true });
 		});
+		this.#listen('task_request_result', (message) => {
+			// Settled directly: the agent queue may be busy applying the goal_control this result follows.
+			const pending = this.#taskRequests.get(message.payload.requestId);
+			if (pending === undefined || pending.agentId !== message.agentId) return;
+			this.#taskRequests.delete(message.payload.requestId);
+			clearTimeout(pending.timer);
+			pending.resolve(message.payload);
+		});
 		this.#listen('goal_completion_result', (message, connectionEpoch) => {
 			return this.#enqueueAgent(message.agentId, async () => {
 				const current = this.#registry.get(message.agentId);
@@ -1075,6 +1125,7 @@ export class DynamicCoordinator extends EventEmitter {
             for(const requestId of this.#directorRequests) this.#scheduler.cancel(`director-${requestId}`, 'Director connection closed');
 			this.#setVerboseEnabled(false);
 			this.#cancelGoalSpecRequests();
+			this.#settleTaskRequests(undefined, 'BRIDGE_DISCONNECTED', 'Lost the connection to Minecraft before it answered.');
 			for (const record of this.#registry.list()) {
 				const work = this.#providerWork.get(record.agentId);
 				if (work?.kind === 'native') {
@@ -1456,6 +1507,89 @@ export class DynamicCoordinator extends EventEmitter {
 		}
 	}
 
+	/**
+	 * An agent with no task (finished or idle) still has a body. Its facts stay current for observe/inspect, and urgent
+	 * danger (damage, a threat, fire, lava, drowning, a fall) wakes the model at once in a no-task turn with every body
+	 * tool. Ordinary sightings never wake it, so a finished task is not restarted or redone.
+	 */
+	#observeWithoutTask(record, observation, payload, attention, lifecycleGeneration, connectionEpoch) {
+		const conversation = this.#conversationMemory(record.agentId).history();
+		const accepted = this.#nativeRuntime.updateObservation(record, observation, { eventSequence: payload.eventSequence, conversation,
+			attention: attention.attention, priority: attention.priority, trigger: attention.trigger, changedFacts: payload.changedFacts });
+		if (!accepted) this.#playerMemory.observe(record, observation);
+		// An operator's /takeover owns the body: Minecraft reports it, and the model is not woken to act on it.
+		if (observation?.player?.operatorControlled === true) return;
+		if (attention.priority !== 'urgent' || !NO_TASK_WAKE_TRIGGERS.has(attention.trigger)) {
+			this.#considerHealWake(record, observation, lifecycleGeneration, connectionEpoch);
+			return;
+		}
+		this.#nativeRuntimeEpochs.set(record.agentId, connectionEpoch);
+		this.#scheduleNativeTurn(record, {
+			agentId: record.agentId,
+			goalRevision: record.goalRevision,
+			observation,
+			eventSequence: payload.eventSequence,
+			priority: 'urgent',
+			trigger: attention.trigger,
+			lifecycleGeneration,
+			connectionEpoch,
+			preserveState: true,
+			conversationOnly: true,
+			dangerWake: true,
+			nativeEvent: { event: 'observation', trigger: attention.trigger, observation, conversationOnly: true, dangerWake: true },
+		});
+	}
+
+	/**
+	 * Low health with no task: once per health level, give the model a no-task turn to recover (eat, or get food:
+	 * hunt passive animals, pick up drops, harvest ripe crops or berries). Danger turns come first; this runs when the
+	 * observation was not danger, or after a no-task turn ends. The model decides; it may simply wait.
+	 */
+	#considerHealWake(record, observation, lifecycleGeneration, connectionEpoch) {
+		if (!this.#usesNativeTools(record) || ![DynamicAgentState.IDLE, DynamicAgentState.COMPLETED].includes(record.state)) return false;
+		if (observation === null || observation === undefined || this.#providerWork.has(record.agentId)) return false;
+		const latch = this.#healWakes.get(record.agentId);
+		const verdict = healWakeVerdict(observation, latch?.goalRevision === record.goalRevision ? latch : null);
+		if (verdict.latch === null) this.#healWakes.delete(record.agentId);
+		else this.#healWakes.set(record.agentId, { goalRevision: record.goalRevision, ...verdict.latch });
+		if (!verdict.wake) return false;
+		this.#nativeRuntimeEpochs.set(record.agentId, connectionEpoch);
+		this.#writeTrace('native_heal_wake', { agentId: record.agentId, goalRevision: record.goalRevision, health: observation.player.health, foodLevel: observation.player.foodLevel ?? null });
+		this.#scheduleNativeTurn(record, {
+			agentId: record.agentId,
+			goalRevision: record.goalRevision,
+			observation,
+			priority: 'ordinary',
+			trigger: 'low_health_idle',
+			lifecycleGeneration,
+			connectionEpoch,
+			preserveState: true,
+			conversationOnly: true,
+			selfCareWake: true,
+			nativeEvent: { event: 'observation', trigger: 'low_health_idle', observation, conversationOnly: true, selfCareWake: true, healing: healingFacts(observation) },
+		});
+		return true;
+	}
+
+	/**
+	 * An agent with a task at low health with food in reach: one urgent attention edge (debounced, see healNudgeVerdict)
+	 * so the model hears it at once instead of in the 30 s ordinary window. It carries healing facts and options; the
+	 * routine keeps running unless the model chooses otherwise. Danger observations pass through untouched.
+	 */
+	#withHealNudge(record, observation, attention) {
+		if (!this.#usesNativeTools(record) || attention.priority === 'urgent') return attention;
+		// Another named trigger (a structure, a resource, a program edge) keeps its own wake; the nudge waits for the next sample.
+		if (attention.attention === true && !['observation', 'attention'].includes(attention.trigger)) return attention;
+		const latch = this.#healNudges.get(record.agentId);
+		const verdict = healNudgeVerdict(observation, latch?.goalRevision === record.goalRevision ? latch : null, safeClockRead(this.#epochNow));
+		if (verdict.latch === null) this.#healNudges.delete(record.agentId);
+		else this.#healNudges.set(record.agentId, { goalRevision: record.goalRevision, ...verdict.latch });
+		if (!verdict.nudge) return attention;
+		this.#writeTrace('native_heal_nudge', { agentId: record.agentId, goalRevision: record.goalRevision, health: observation.player.health,
+			foodLevel: observation.player.foodLevel ?? null, options: verdict.options });
+		return { attention: true, priority: 'urgent', trigger: 'low_health_food' };
+	}
+
 	#scheduleNativeConversation(record, event, trigger) {
 		const conversationOnly = [DynamicAgentState.IDLE, DynamicAgentState.COMPLETED, DynamicAgentState.PAUSED].includes(record.state);
 		if (!conversationOnly && ![DynamicAgentState.STARTING, DynamicAgentState.PLANNING, DynamicAgentState.ACTING].includes(record.state)) return;
@@ -1509,6 +1643,7 @@ export class DynamicCoordinator extends EventEmitter {
 
 	#confirmationBlocksRequest(record, request) {
 		return this.#awaitingNativeConfirmation(record, request.lifecycleGeneration)
+			&& !this.#confirmationActivity.has(record.agentId)
 			&& (request.priority !== 'urgent' || request.trigger === 'stuck' || request.nativeEvent?.trigger === 'continuation');
 	}
 
@@ -1548,6 +1683,9 @@ export class DynamicCoordinator extends EventEmitter {
 			steerQueued: null,
 			steerRequest: null,
 			steerPromise: null,
+			// Repeated damage/threat steers into this turn fold into one summary (see danger-steer-coalescer.mjs).
+			dangerSteer: new DangerSteerCoalescer(),
+			dangerSteerTimer: null,
 			preparationPromise: null,
 			traceId: planningTraceId(record.agentId, record.goalRevision, request.lifecycleGeneration, 'native'),
 			promise: null,
@@ -1558,6 +1696,7 @@ export class DynamicCoordinator extends EventEmitter {
 			expired: false,
 		};
 		this.#providerWork.set(record.agentId, work);
+		work.dangerSteer.noteDelivered(request, safeClockRead(this.#controlNow));
 		try {
 			if (request.preserveState !== true) {
 				if (record.state === DynamicAgentState.STARTING) this.#registry.setState(record.agentId, DynamicAgentState.PLANNING, { goalRevision: record.goalRevision });
@@ -1574,7 +1713,7 @@ export class DynamicCoordinator extends EventEmitter {
 			.then(async () => this.#planner.requestNativeTurn({
 				agentId: record.agentId,
 				goalRevision: record.goalRevision,
-				input: await this.#nativeTurnInput(record, request),
+				input: await this.#nativeTurnInput(record, request).then((input) => { if (typeof input === 'string') work.inputBytes = Buffer.byteLength(input, 'utf8'); return input; }),
 				recoverySummary: record.lastSummary,
 				priority: request.priority,
 				preserveState: request.preserveState === true,
@@ -1605,6 +1744,41 @@ export class DynamicCoordinator extends EventEmitter {
 	}
 
 	#queueNativeSteer(work, request) {
+		// Danger reaching a no-task conversation turn lets it defend the body (self-preservation tools only).
+		if (request.dangerWake === true) work.dangerWoken = true;
+		const decision = work.dangerSteer.offer(request, safeClockRead(this.#controlNow));
+		if (decision.action === 'fold') {
+			this.#writeTrace('native_turn_steer_coalesced', { agentId: work.agentId, goalRevision: work.goalRevision,
+				traceId: work.traceId, trigger: request.trigger, foldedEvents: decision.folded });
+			if (work.dangerSteerTimer === null) {
+				work.dangerSteerTimer = this.#setSteerTimeout(() => {
+					work.dangerSteerTimer = null;
+					if (this.#providerWork.get(work.agentId) !== work || work.expired === true) return;
+					const folded = work.dangerSteer.flush(safeClockRead(this.#controlNow));
+					if (folded !== null) this.#deliverNativeSteer(work, folded);
+				}, decision.dueInMs);
+				work.dangerSteerTimer?.unref?.();
+			}
+			return;
+		}
+		this.#cancelDangerSteerTimer(work);
+		this.#deliverNativeSteer(work, decision.request);
+	}
+
+	#cancelDangerSteerTimer(work) {
+		if (work.dangerSteerTimer === null || work.dangerSteerTimer === undefined) return;
+		this.#clearSteerTimeout(work.dangerSteerTimer);
+		work.dangerSteerTimer = null;
+	}
+
+	/** Pending work plus any danger summary still folded when the turn ends, so no hit is lost. */
+	#pendingWithFoldedSteer(work) {
+		this.#cancelDangerSteerTimer(work);
+		const folded = work.dangerSteer?.flush(safeClockRead(this.#controlNow)) ?? null;
+		return folded === null ? work.pending : mergePlannerRequest(work.pending, folded);
+	}
+
+	#deliverNativeSteer(work, request) {
 		work.steerQueued = mergePlannerRequest(work.steerQueued, request);
 		if (work.steerPromise !== null) return;
 		const steering = this.#drainNativeSteering(work);
@@ -1690,6 +1864,7 @@ export class DynamicCoordinator extends EventEmitter {
 				});
 				if (!isCurrent()) { this.#restoreNativeConversation(request); work.steerQueued = null; return; }
 				await this.#commitNativeConversation(request);
+				work.steeredPlayerRequests = [...(work.steeredPlayerRequests ?? []), ...(request.deliveredPlayerRequests ?? [])];
 				if (!isCurrent()) { work.steerQueued = null; return; }
 				// Steering can be truncated just like turn/start. Drain its unread
 				// tail while this turn still accepts steering; a rejection below
@@ -1730,19 +1905,57 @@ export class DynamicCoordinator extends EventEmitter {
 		while (work.steerPromise !== null) await work.steerPromise;
 	}
 
+	/**
+	 * Every model tool call. A call that ends without reaching Minecraft (refused, stale, gated) is traced as
+	 * native_tool_rejected with its kind and reason code only, so an idle body is explainable from the trace.
+	 */
 	async #executeNativeTool(work, toolRequest) {
+		const traceRejection = (reasonCode) => this.#writeTrace('native_tool_rejected', {
+			agentId: work.agentId, goalRevision: work.goalRevision, traceId: work.traceId,
+			callId: typeof toolRequest?.callId === 'string' ? toolRequest.callId.slice(0, 128) : null,
+			toolKind: toolRequest?.tool?.kind ?? 'unknown',
+			...(typeof toolRequest?.tool?.actionType === 'string' ? { actionType: toolRequest.tool.actionType } : {}),
+			reasonCode: String(reasonCode ?? 'UNKNOWN').slice(0, 128),
+		});
+		let result;
+		try {
+			result = await this.#executeNativeToolCall(work, toolRequest);
+		} catch (error) {
+			traceRejection(error?.code ?? 'TOOL_EXECUTION_FAILED');
+			throw error;
+		}
+		if (result?.executed === false) traceRejection(result.reasonCode);
+		return result;
+	}
+
+	async #executeNativeToolCall(work, toolRequest) {
 		const record = this.#registry.get(work.agentId);
 		if (work.expired === true || record === null || record.goalRevision !== work.goalRevision
 				|| !this.#isConnectionEpochCurrent(work.connectionEpoch)
 				|| !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) {
+			const finished = record !== null && [DynamicAgentState.COMPLETED, DynamicAgentState.IDLE].includes(record.state)
+				&& record.goalRevision > work.goalRevision;
 			return { state: 'CANCELLED', reasonCode: 'STALE_PLAN', executed: false,
 				goalRevision: work.goalRevision, currentGoalRevision: record?.goalRevision ?? null,
-				message: 'This goal turn has ended or been superseded. No action was dispatched. End this turn and await the next goal event.' };
+				message: work.taskAdopted !== undefined
+					? 'Your task was accepted. Nothing was dispatched from this turn: end it now and the task turn starts with every tool.'
+					: finished
+						? 'Your task is complete, so this turn has ended and nothing was dispatched. End it now: damage and threats wake you again at once to defend yourself (fight, flee, eat, equip, move away).'
+						: 'This goal turn has ended or been superseded. No action was dispatched. End this turn and await the next goal event.' };
 		}
+		if (toolRequest.tool.kind === 'take_task') return this.#takeTask(work, toolRequest.tool);
 		if (work.request.conversationOnly === true
 				&& toolRequest.tool.kind !== 'observe'
 				&& !(toolRequest.tool.kind === 'action' && toolRequest.tool.actionType === 'chat')) {
-			throw Object.assign(new Error('Idle conversation turns may only observe and reply with chat'), { code: 'CONVERSATION_ONLY' });
+			if (work.taskAdopted !== undefined) return { ...work.taskAdopted, executed: false };
+			// Player requests go through takeTask, which binds the requester and Minecraft's permission checks. Only a
+			// turn woken by danger may defend the body without a task, and only with self-preservation tools.
+			const dangerWoken = work.request.dangerWake === true || work.dangerWoken === true || work.request.selfCareWake === true;
+			if (!dangerWoken || record.state === DynamicAgentState.PAUSED || !isSelfPreservationTool(toolRequest.tool)) {
+				throw Object.assign(new Error(dangerWoken && record.state !== DynamicAgentState.PAUSED
+					? 'With no task you may only look after yourself: fight_target, flee_from, attack, use_ranged, block_with_shield, use_item (eat, drink, totem), select/equip items, pick up food, mine grown crops or melons, interact with ripe berries, navigate or move away, look, control without attack/use, wait. Anything else is a player request: call takeTask.'
+					: 'You have no active task yet. If the player asked you to do something, call takeTask first and end this turn; otherwise reply with say.'), { code: 'CONVERSATION_ONLY' });
+			}
 		}
 		const executesBody = toolRequest.tool.kind === 'action'
 			|| toolRequest.tool.kind === 'sequence'
@@ -1768,7 +1981,17 @@ export class DynamicCoordinator extends EventEmitter {
 			if (executesBody && record.state === DynamicAgentState.PLANNING) {
 				this.#registry.setState(record.agentId, DynamicAgentState.ACTING, { goalRevision: record.goalRevision });
 			}
-			supervisionToken = supervisionKind === null ? null : this.#goalSupervisor.begin(work.supervisionKey, supervisionKind);
+			// After finish awaits operator confirmation the goal's work leases are terminated;
+			// the body must still act at once, so it runs unsupervised instead of failing to acquire a lease.
+			const awaitingConfirmation = sameSupervisionKey(this.#nativeConfirmationWaits.get(work.agentId), work.supervisionKey);
+			const supervised = supervisionKind !== null && !awaitingConfirmation;
+			supervisionToken = supervised ? this.#goalSupervisor.begin(work.supervisionKey, supervisionKind) : null;
+			if (awaitingConfirmation && executesBody && !['chat', 'wait'].includes(toolRequest.tool.actionType)) {
+				// Work begun while waiting (defending, a player's extra request) may need follow-up wakes, such as its
+				// own action result; let those through until a turn ends without new body work (see completion).
+				this.#confirmationActivity.add(work.agentId);
+				work.actedWhileAwaiting = true;
+			}
 			call.token = supervisionToken;
 			this.#goalSupervisor.progress(work.supervisionToken);
 			result = await this.#nativeRuntime.execute(toolRequest, record, { lifecycleGeneration: work.lifecycleGeneration });
@@ -1782,10 +2005,14 @@ export class DynamicCoordinator extends EventEmitter {
 					// Waiting belongs to this goal lifecycle, not just the provider turn that
 					// requested verification. Ordinary queued sightings cannot resume it.
 					this.#nativeConfirmationWaits.set(record.agentId, work.supervisionKey);
+					this.#confirmationActivity.delete(record.agentId);
 					this.#goalSupervisor.terminate(work.supervisionKey);
-				} else if (toolRequest.tool.kind === 'finish' || (executesBody
-					&& !['chat', 'wait'].includes(toolRequest.tool.actionType))) {
+				} else if (toolRequest.tool.kind === 'finish') {
+					// Body actions while waiting (defending, eating, a player's extra request) leave the finished goal
+					// awaiting confirmation; only a new finish result changes it. Clearing it restarted goal supervision,
+					// which woke the model to redo the finished work.
 					this.#nativeConfirmationWaits.delete(record.agentId);
+					this.#confirmationActivity.delete(record.agentId);
 				}
 			}
 			return result;
@@ -1803,6 +2030,76 @@ export class DynamicCoordinator extends EventEmitter {
 				&& this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) {
 				this.#registry.setState(latest.agentId, DynamicAgentState.PLANNING, { goalRevision: latest.goalRevision });
 			}
+		}
+	}
+
+	/**
+	 * The model chose to adopt a player's request. Only a conversation-only turn (no active task)
+	 * may do so, and only for a player message delivered in this turn, so neither the model nor a
+	 * player talking to it can credit someone else. Minecraft owns the decision: it starts or
+	 * resumes the goal through its normal lifecycle (goal_control follows), stages a translation
+	 * draft, or refuses with a reason the model can relay. Nothing here starts work on its own.
+	 */
+	async #takeTask(work, tool) {
+		if (work.request.conversationOnly !== true) {
+			return { state: 'REJECTED', reasonCode: 'TASK_ALREADY_ACTIVE', executed: false,
+				message: 'You already have a task. takeTask only adopts a player request when you have none; treat their message as input to your current task and act on it now (awaiting operator confirmation never blocks this).' };
+		}
+		if (work.taskAdopted !== undefined) return { ...work.taskAdopted, executed: false };
+		const delivered = [...(work.request.deliveredPlayerRequests ?? []), ...(work.steeredPlayerRequests ?? [])];
+		const senders = [...new Set(delivered.map((entry) => entry.sourceId))];
+		if (tool.requesterId !== undefined && !senders.includes(tool.requesterId)) {
+			return { state: 'REJECTED', reasonCode: 'UNKNOWN_REQUESTER', executed: false,
+				message: 'That player did not ask you anything in this conversation. Use the sourceId of a message you received.' };
+		}
+		if (tool.requesterId === undefined && senders.length !== 1) {
+			return { state: 'REJECTED', reasonCode: senders.length === 0 ? 'NO_PLAYER_REQUEST' : 'REQUESTER_REQUIRED', executed: false,
+				message: senders.length === 0
+					? 'No player asked you anything in this conversation. Only adopt a task a player requested.'
+					: `Several players messaged you; pass requesterId (one of ${senders.join(', ')}) for the player whose request you adopt.` };
+		}
+		const requesterId = tool.requesterId ?? senders[0];
+		const asked = delivered.filter((entry) => entry.sourceId === requesterId).at(-1);
+		const requestId = randomUUID();
+		const outcome = new Promise((resolve) => {
+			const timer = setTimeout(() => this.#settleTaskRequest(requestId, 'TASK_REQUEST_TIMEOUT', 'Minecraft did not answer in time; nothing started. Try again.'), this.#taskRequestTimeoutMs);
+			timer.unref?.();
+			this.#taskRequests.set(requestId, { agentId: work.agentId, resolve, timer });
+		});
+		try {
+			await this.#sendForEpoch(work.connectionEpoch, 'task_request', work.agentId, {
+				requestId, goalRevision: work.goalRevision, requesterId, conversationSequence: asked.sequence,
+				request: tool.request ?? asked.text, resume: tool.resume === true,
+			});
+		} catch (error) {
+			this.#settleTaskRequest(requestId, 'TASK_REQUEST_UNSENT', 'The request could not be sent to Minecraft.');
+			throw error;
+		}
+		const result = await outcome;
+		this.#writeTrace('native_task_request', { agentId: work.agentId, goalRevision: work.goalRevision, status: result.status, reasonCode: result.reasonCode });
+		if (result.status === 'rejected') {
+			return { state: 'REJECTED', reasonCode: result.reasonCode, executed: false,
+				message: `${result.message} Tell the player with say.` };
+		}
+		work.taskAdopted = result.status === 'pending'
+			? { state: 'PENDING', reasonCode: result.reasonCode, goalRevision: result.goalRevision, requesterId,
+				message: `${result.message} You may tell the player briefly with say, then end this turn; your task turn starts when the goal does.` }
+			: { state: 'SUCCEEDED', reasonCode: result.reasonCode, goalRevision: result.goalRevision, requesterId,
+				message: 'Minecraft accepted this as your task. End this turn now: your task turn starts immediately with every tool.' };
+		return work.taskAdopted;
+	}
+
+	#settleTaskRequest(requestId, reasonCode, message) {
+		const pending = this.#taskRequests.get(requestId);
+		if (pending === undefined) return;
+		this.#taskRequests.delete(requestId);
+		clearTimeout(pending.timer);
+		pending.resolve({ requestId, status: 'rejected', reasonCode, message, goalRevision: 0 });
+	}
+
+	#settleTaskRequests(agentId, reasonCode, message) {
+		for (const [requestId, pending] of this.#taskRequests) {
+			if (agentId === undefined || pending.agentId === agentId) this.#settleTaskRequest(requestId, reasonCode, message);
 		}
 	}
 
@@ -1824,17 +2121,19 @@ export class DynamicCoordinator extends EventEmitter {
 		if (this.#providerWork.get(work.agentId) !== work) return null;
 		this.#providerWork.delete(work.agentId);
 		this.#providerRetryAfter.delete(work.agentId);
-		const pending = work.pending;
+		const pending = this.#pendingWithFoldedSteer(work);
 		const record = this.#registry.get(work.agentId);
 		if (record !== null && record.goalRevision === work.goalRevision
 				&& this.#isConnectionEpochCurrent(work.connectionEpoch)
 				&& this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) {
-			this.#writeTrace('native_turn_completed', { agentId: work.agentId, goalRevision: work.goalRevision, traceId: work.traceId, toolCalls: result?.toolCalls ?? 0 });
+			this.#writeTrace('native_turn_completed', { agentId: work.agentId, goalRevision: work.goalRevision, traceId: work.traceId, toolCalls: result?.toolCalls ?? 0,
+				trigger: work.request.nativeEvent?.trigger ?? work.request.trigger ?? null, wakeEvent: work.request.nativeEvent?.event ?? null,
+				...(work.inputBytes === undefined ? {} : { inputBytes: work.inputBytes }), ...turnUsageTraceFields(result?.usage) });
 		}
 		if (this.#reschedulePendingNativeTurn(pending)) return result;
 		if (work.request.nativeConversationDelivery?.omittedEntries > 0
 			&& this.#reschedulePendingNativeTurn({ ...work.request, conversationRetry: false })) return result;
-		if (work.request.conversationOnly === true && !work.successfulChat
+		if (work.request.conversationOnly === true && work.request.dangerWake !== true && work.request.selfCareWake !== true && !work.successfulChat
 				&& work.request.conversationRetry !== true && record !== null) {
 			this.#scheduleNativeTurn(record, {
 				...work.request,
@@ -1844,8 +2143,14 @@ export class DynamicCoordinator extends EventEmitter {
 			});
 			return result;
 		}
+		// A no-task turn (often a danger turn) ended: if the body is still low, the model may now recover.
+		if (work.request.conversationOnly === true && record !== null && record.goalRevision === work.goalRevision
+				&& this.#isConnectionEpochCurrent(work.connectionEpoch)
+				&& this.#considerHealWake(record, this.#nativeRuntime.snapshotLive(work.agentId)?.observation ?? null, work.lifecycleGeneration, work.connectionEpoch)) return result;
 		const awaitingConfirmation = record !== null && this.#awaitingNativeConfirmation(record, work.lifecycleGeneration);
 		if (awaitingConfirmation) this.#goalSupervisor.terminate(work.supervisionKey);
+		// A turn that started no body work while waiting returns the goal to plain waiting (no redo wakes).
+		if (awaitingConfirmation && work.actedWhileAwaiting !== true) this.#confirmationActivity.delete(work.agentId);
 		if (!awaitingConfirmation && this.#isActiveNativeGoal(work)) {
 			this.#goalSupervisor.ensure(work.supervisionKey, (result?.toolCalls ?? 0) === 0 ? 'zero_tool_turn' : 'turn_completed');
 		}
@@ -1868,7 +2173,7 @@ export class DynamicCoordinator extends EventEmitter {
 		}
 		if (this.#providerWork.get(work.agentId) !== work) return null;
 		this.#providerWork.delete(work.agentId);
-		const pending = work.pending;
+		const pending = this.#pendingWithFoldedSteer(work);
 		const record = this.#registry.get(work.agentId);
 		const staleLifecycle = record?.goalRevision !== work.goalRevision
 			|| !this.#isConnectionEpochCurrent(work.connectionEpoch)
@@ -2319,6 +2624,7 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#deferredProviderRecovery.delete(agentId);
 		this.#nativeWorldSignals.delete(agentId);
 		this.#nativeConfirmationWaits.delete(agentId);
+		this.#confirmationActivity.delete(agentId);
 		this.#advanceLifecycleGeneration(agentId);
 	}
 
@@ -2650,6 +2956,8 @@ export class DynamicCoordinator extends EventEmitter {
 					if (stage === 'live_usage') {
 						const value = JSON.parse(message), usage = this.#taskViews.snapshot(viewRecord).usage;
 						if (usage !== null) this.#writeTrace('native_token_usage', { agentId, goalRevision, scope: 'thread_total', sessionKey: createHash('sha256').update(String(value.threadId ?? '')).digest('hex'), ...usage });
+						// Per model call (Claude): tokens for this call plus prefill/stream timing, so busy time can be split.
+						if (value.call !== null && typeof value.call === 'object') this.#writeTrace('native_model_call', { agentId, goalRevision, ...modelCallTraceFields(value) });
 					}
 				}
 				if (!this.#verboseEnabled) return;
@@ -2899,6 +3207,7 @@ export class DynamicCoordinator extends EventEmitter {
 
 	#invalidateServerInstance(connectionEpoch) {
 		this.#cancelGoalSpecRequests();
+		this.#settleTaskRequests(undefined, 'BRIDGE_DISCONNECTED', 'Minecraft restarted before answering.');
 		this.#healthRegistry.reset();
 		this.#factLedgers.clear();
 		this.#conversationMemories.clear();
@@ -3072,6 +3381,7 @@ export class DynamicCoordinator extends EventEmitter {
 			&& this.#isLifecycleGenerationCurrent(record.agentId, request.lifecycleGeneration);
 		if (!isCurrent()) throw Object.assign(new Error('Native input belongs to an obsolete lifecycle'), { code: 'STALE_PLAN' });
 		delete request.nativeConversationDelivery;
+		request.deliveredPlayerRequests = [];
 		const inbox = this.#pendingConversationInbox(record.agentId);
 		await inbox.open(this.#serverInstanceId);
 		if (!isCurrent()) throw Object.assign(new Error('Native input belongs to an obsolete lifecycle'), { code: 'STALE_PLAN' });
@@ -3080,13 +3390,22 @@ export class DynamicCoordinator extends EventEmitter {
 		try {
 			if (!isCurrent()) throw Object.assign(new Error('Native input belongs to an obsolete lifecycle'), { code: 'STALE_PLAN' });
 			const input = buildNativeEventInput(record, {
-				...request.nativeEvent, taskMemory,
+				...request.nativeEvent, taskMemory, dangerSummary: request.dangerSummary,
+				awaitingConfirmation: this.#awaitingNativeConfirmation(record, request.lifecycleGeneration),
 				observation: this.#nativeRuntime.decorateObservation(record, request.nativeEvent.observation ?? {}),
 				conversation: reservation?.conversation ?? { mode: 'unread', baseSequence: null, nextSequence: -1, entries: [] },
 			});
+			const contextTrimmed = JSON.parse(input.slice(input.indexOf('\n') + 1)).contextTrimmed;
+			if (contextTrimmed !== undefined) {
+				this.#writeTrace('native_event_context_trimmed', { agentId: record.agentId, goalRevision: record.goalRevision, fields: contextTrimmed });
+			}
 			if (reservation) {
 				const delivered = JSON.parse(input.slice(input.indexOf('\n') + 1)).conversation;
 				inbox.trim(reservation.token, delivered.entries.length);
+				// takeTask may only credit a player whose message this turn actually delivered.
+				request.deliveredPlayerRequests = delivered.entries
+					.filter((entry) => ['player_message', 'proximity_speech'].includes(entry.kind) && UUID_TEXT.test(entry.sourceId ?? ''))
+					.map((entry) => ({ sequence: entry.sequence, sourceId: entry.sourceId.toLowerCase(), text: entry.text }));
 				request.nativeConversationDelivery.omittedEntries = delivered.omittedEntries + (reservation.more ? 1 : 0);
 			}
 			return request.retryInstruction === undefined ? input : `${input}\n${request.retryInstruction}`;
@@ -3241,6 +3560,9 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		clearStatusInterval: dependencies.clearStatusInterval,
 		setGoalSpecTimeout: dependencies.setGoalSpecTimeout,
 		clearGoalSpecTimeout: dependencies.clearGoalSpecTimeout,
+		setSteerTimeout: dependencies.setSteerTimeout,
+		clearSteerTimeout: dependencies.clearSteerTimeout,
+		taskRequestTimeoutMs: dependencies.taskRequestTimeoutMs,
 		maxPendingAgentOperations: dependencies.maxPendingAgentOperations,
 		maxPendingAgentTransactions: dependencies.maxPendingAgentTransactions,
 		connectionOperationCap: dependencies.connectionOperationCap,
@@ -4431,12 +4753,23 @@ function finiteOrNull(value) {
 	return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
+export function soundOnlyPerceptionChange(payload, wireObservation, previousSequence) {
+	if (!hasHeardSection(wireObservation) || !Number.isSafeInteger(previousSequence)) return false;
+	if (typeof payload?.trigger === 'string' && payload.trigger.trim().length > 0) return false;
+	const changedFacts = Array.isArray(payload?.changedFacts) ? payload.changedFacts : [];
+	if (changedFacts.length === 0 || !changedFacts.every((fact) => fact === 'perception')) return false;
+	const events = Array.isArray(wireObservation.perception?.events) ? wireObservation.perception.events : [];
+	const fresh = events.filter((event) => Number.isSafeInteger(event?.sequence) && event.sequence > previousSequence);
+	return fresh.length > 0 && fresh.every((event) => event.type === 'sound');
+}
+
 export function classifyObservationTrigger(payload, observation, signals = null) {
 	const explicitTrigger = typeof payload.trigger === 'string' && payload.trigger.trim().length > 0 ? payload.trigger.trim().slice(0, 128) : null;
 	const attention = payload.attention === true;
-	if (explicitTrigger !== null) return { attention: true, priority: payload.priority === 'urgent' || ['damage', 'lava', 'fire', 'suffocation', 'fall'].includes(explicitTrigger) ? 'urgent' : 'ordinary', trigger: explicitTrigger };
+	if (explicitTrigger !== null) return { attention: true, priority: payload.priority === 'urgent' || ['damage', 'threat', 'lava', 'fire', 'suffocation', 'fall'].includes(explicitTrigger) ? 'urgent' : 'ordinary', trigger: explicitTrigger };
 	const changedFacts = Array.isArray(payload.changedFacts) ? payload.changedFacts : [];
-	const joinedFacts = changedFacts.filter((value) => typeof value === 'string').join('|').toLowerCase();
+	// Healing signals are classified on their own below; their names must not read as damage/air/fall facts.
+	const joinedFacts = changedFacts.filter((value) => typeof value === 'string' && !value.startsWith('survival.')).join('|').toLowerCase();
 	const player = observation?.player ?? {};
 	const before = signals?.previousPlayer;
 	const healthDecreased = Number.isFinite(player.health) && Number.isFinite(before?.health) && player.health < before.health;
@@ -4444,12 +4777,21 @@ export function classifyObservationTrigger(payload, observation, signals = null)
 	// available, also exclude healing from legacy/general-purpose deltas.
 	const healthDelta = joinedFacts.includes('health') && (!Number.isFinite(before?.health) || !Number.isFinite(player.health) || healthDecreased);
 	if (healthDecreased || healthDelta || joinedFacts.includes('attacker') || joinedFacts.includes('damage')) return { attention: true, priority: 'urgent', trigger: 'damage' };
+	// Server-sensed threat edges (a mob starts targeting, a creeper swells or closes in, a ranged mob gets a
+	// clear shot) wake the model before the first hit; the server latch debounces each mob and signal.
+	if (changedFacts.some((fact) => typeof fact === 'string' && fact.startsWith('threats.'))) return { attention: true, priority: 'urgent', trigger: 'threat' };
 	if (player.inLava === true || joinedFacts.includes('player.inlava')) return { attention: true, priority: 'urgent', trigger: 'lava' };
 	if (joinedFacts.includes('fire') || player.onFire === true || player.fire === true) return { attention: true, priority: 'urgent', trigger: 'fire' };
 	if (joinedFacts.includes('suffoc') || joinedFacts.includes('air')) return { attention: true, priority: 'urgent', trigger: 'suffocation' };
 	if (joinedFacts.includes('fall')) return { attention: true, priority: 'urgent', trigger: 'fall' };
+	// Debounced healing facts from Minecraft. Low health with no food while threatened is urgent so the model can
+	// weigh a retreat; a safe chance to eat is ordinary attention. The model decides whether to eat or flee.
+	if (changedFacts.includes('survival.low_health_no_food')) return { attention: true, priority: 'urgent', trigger: 'low_health' };
+	if (changedFacts.includes('survival.heal_opportunity')) return { attention: true, priority: 'ordinary', trigger: 'heal_opportunity' };
 	// Visible lava is relevant evidence, not proof the player is inside it.
 	if (signals?.movementLoop === true) return { attention: true, priority: 'urgent', trigger: 'movement_loop' };
+	// A structure came into view (new, or again after a minute): worth a look; the model decides whether to go.
+	if (changedFacts.includes('sighted')) return { attention: true, priority: 'ordinary', trigger: 'structure_sighted' };
 	if (signals?.resourceDiscovery === true) return { attention: true, priority: 'ordinary', trigger: 'resource_discovery' };
 	if (!attention) return { attention: false, priority: 'ordinary', trigger: 'observation' };
 	return { attention: true, priority: 'ordinary', trigger: 'attention' };
@@ -4517,11 +4859,42 @@ function mergeAttentionTrigger(previous, next) {
 	};
 }
 
-function mergePlannerRequest(previous, next) {
+export function mergePlannerRequest(previous, next) {
 	if (previous === null || previous === undefined) return next;
 	const priority = previous.priority === 'urgent' || next.priority === 'urgent' ? 'urgent' : 'ordinary';
 	const winner = next.priority === priority ? next : previous;
+	// A program that ended (or asked for a decision) while the model was still in a turn must not be replaced by the
+	// plain observation that followed: the model would wake without the program's result and have to ask for it.
+	const programEvent = previous.nativeEvent?.event;
+	if (['program_ended', 'program_attention', 'program_handoff_rejected'].includes(programEvent) && next.nativeEvent?.event === 'observation'
+			&& next.nativeEvent.conversationOnly !== true && previous.goalRevision === next.goalRevision) {
+		const { programId, status, result } = previous.nativeEvent;
+		const program = { ...(programId === undefined ? {} : { programId }), ...(status === undefined ? {} : { status }), ...(result === undefined ? {} : { result }) };
+		// Danger leads the wake (its own event and trigger) but still carries the program's result or decision handle.
+		if (next.priority === 'urgent') return { ...next, priority, trigger: winner.trigger, nativeEvent: { ...next.nativeEvent, ...program } };
+		return { ...next, priority, trigger: winner.trigger, nativeEvent: { ...previous.nativeEvent, observation: next.nativeEvent.observation ?? previous.nativeEvent.observation,
+			...(next.eventSequence === undefined ? {} : { eventSequence: next.eventSequence }) } };
+	}
 	return { ...next, priority, trigger: winner.trigger };
+}
+
+function finiteCount(value) { return Number.isSafeInteger(value) && value >= 0 ? value : null; }
+
+export function modelCallTraceFields(value) {
+	const call = value.call, last = value.last ?? {};
+	const fields = { provider: typeof call.provider === 'string' ? call.provider : null, turnId: typeof call.turnId === 'string' ? call.turnId : null,
+		contextTokens: finiteCount(call.contextTokens), inputTokens: finiteCount(last.inputTokens), cachedInputTokens: finiteCount(last.cachedInputTokens),
+		cacheWriteInputTokens: finiteCount(last.cacheWriteInputTokens), outputTokens: finiteCount(last.outputTokens), rotations: finiteCount(call.rotations),
+		firstEventMs: finiteCount(call.firstEventMs), streamMs: finiteCount(call.streamMs), totalMs: finiteCount(call.totalMs) };
+	return Object.fromEntries(Object.entries(fields).filter(([, field]) => field !== null));
+}
+
+export function turnUsageTraceFields(usage) {
+	if (usage === null || typeof usage !== 'object') return {};
+	const fields = { modelCalls: finiteCount(usage.calls), inputTokens: finiteCount(usage.input), cachedInputTokens: finiteCount(usage.cacheRead),
+		cacheWriteInputTokens: finiteCount(usage.cacheWrite), outputTokens: finiteCount(usage.output), contextTokens: finiteCount(usage.contextTokens),
+		costUsd: Number.isFinite(usage.costUsd) && usage.costUsd >= 0 ? usage.costUsd : null };
+	return Object.fromEntries(Object.entries(fields).filter(([, field]) => field !== null));
 }
 
 function sameSupervisionKey(left, right) {
@@ -4532,11 +4905,12 @@ function sameSupervisionKey(left, right) {
 		&& left?.profileFingerprint === right?.profileFingerprint;
 }
 
-export function buildNativeEventInput(record, { event, trigger, programId, status, result, planningLeadMs, eventSequence, taskMemory = null, observation = {}, conversation = { mode: 'unread', baseSequence: -1, nextSequence: -1, entries: [] }, conversationOnly = false } = {}) {
+export function buildNativeEventInput(record, { event, trigger, programId, status, result, planningLeadMs, eventSequence, taskMemory = null, dangerSummary = null, observation = {}, conversation = { mode: 'unread', baseSequence: -1, nextSequence: -1, entries: [] }, conversationOnly = false, awaitingConfirmation = false, dangerWake = false, selfCareWake = false, healing = null } = {}) {
 	const eventName = typeof event === 'string' && event.length > 0 ? event : event?.event;
 	const normalizedEvent = typeof eventName === 'string' && eventName.length > 0 ? eventName : 'observation';
 	const eventPlanningLeadMs = status?.planningLeadMs ?? planningLeadMs ?? event?.planningLeadMs;
-	const inventorySource = asArray(observation.inventory?.items);
+	// The model reads wear as usesLeft; programs keep the raw damage facts.
+	const inventorySource = asArray(withToolWear(observation.inventory)?.items);
 	const itemSource = asArray(observation.items);
 	const entitySource = asArray(observation.entities).filter((entity) => entity?.type !== 'minecraft:item');
 	const blockSource = asArray(observation.blocks);
@@ -4545,7 +4919,8 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 	const optionSource = Array.isArray(observation.options) ? observation.options : null;
 	const inventoryRows = boundedEventArray(inventorySource, 32);
 	const itemRows = boundedEventArray(itemSource, 16);
-	const entityRows = boundedEventArray(entitySource, 16);
+	// Hostile or hunting mobs (including ones only heard behind the agent) survive the nearest-16 cut.
+	const entityRows = boundedEventArray(entitySource, 16, isHazardousEventFact);
 	const blockRows = boundedEventArray(blockSource, 32, isHazardousEventFact);
 	const landmarkRows = landmarkSource === null ? null : boundedEventArray(landmarkSource, 32);
 	const nearbyContainerRows = nearbyContainerSource === null ? null : boundedEventArray(nearbyContainerSource, 16);
@@ -4555,7 +4930,7 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 		...(observation.eventSequence === undefined ? {} : { eventSequence: observation.eventSequence }),
 		...(observation.freshness === undefined ? {} : { freshness: observation.freshness }),
 		...(observation.coverage === undefined ? {} : { coverage: compactCoverageForEvent(observation.coverage) }),
-		...(observation.perception === undefined ? {} : { perception: compactPerceptionForEvent(observation.perception) }),
+		...(observation.perception === undefined ? {} : { perception: compactPerceptionForEvent(withoutHeardSoundEvents(observation.perception, observation)) }),
 		...(observation.ready === undefined ? {} : { ready: observation.ready }),
 		...(observation.status === undefined ? {} : { status: observation.status }),
 		...(observation.velocity === undefined ? {} : { velocity: observation.velocity }),
@@ -4567,8 +4942,10 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 		},
 		items: itemRows.values,
 		entities: entityRows.values,
-		blocks: blockRows.values,
+		...compactBlockDefaults(blockRows.values),
 		...(landmarkRows === null ? {} : { landmarks: landmarkRows.values }),
+		...(observation.sighted === undefined ? {} : { sighted: observation.sighted }),
+		...(observation.leftBehind === undefined ? {} : { leftBehind: observation.leftBehind }),
 		...(nearbyContainerRows === null ? {} : { nearbyContainers: nearbyContainerRows.values }),
 		...(observation.world === undefined ? {} : { world: observation.world }),
 		...(observation.currentAction === undefined ? {} : { currentAction: observation.currentAction }),
@@ -4602,15 +4979,23 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 			omittedEntries: 0,
 		};
 	const isPlanningDue = normalizedEvent === 'program_planning_due';
+	// A program's attention event names the program, so the decision carries the trigger that raised it.
+	const effectiveTrigger = status?.decision?.trigger ?? trigger;
+	const eventHealing = healing ?? (HEALING_EVENT_TRIGGERS.has(effectiveTrigger) && Number.isFinite(observation.player?.health) ? healingFacts(observation) : null);
+	const outlook = isPlanningDue ? null : threatOutlook(observation);
 	const payload = {
 		event: normalizedEvent,
 		trigger: typeof trigger === 'string' && trigger.length > 0 ? trigger : (isPlanningDue ? normalizedEvent : 'observation'),
+		...(outlook === null ? {} : { threatOutlook: outlook }),
 		mode: conversationOnly === true ? 'conversation_only' : 'goal',
 		goal: record?.currentGoal ?? null,
 		goalSpec: record?.currentGoalSpec ?? null,
 		goalRevision: record?.goalRevision ?? 0,
 		...(taskMemory === null ? {} : { taskMemory }),
 		...(eventSequence === undefined ? {} : { eventSequence }),
+		// Repeated hits folded since the last update, so one steer carries what several used to.
+		...(dangerSummary === null || dangerSummary === undefined ? {} : { dangerSinceLastUpdate: dangerSummary }),
+		...(eventHealing === null || eventHealing === undefined ? {} : { healing: eventHealing }),
 		observation: isPlanningDue ? compactPlanningDueObservation(compactObservation) : compactObservation,
 		conversation: unreadConversation,
 		...(programId === undefined ? {} : { program: { programId,
@@ -4631,6 +5016,13 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 			conversation: overflowConversation,
 		};
 		json = JSON.stringify(overflowPayload);
+		// Player messages outrank optional context. If the compacted event still leaves
+		// no room for the oldest unread message, fall back to core facts instead of
+		// failing every later turn with the same oversized context.
+		if (unreadConversation.entries.length > 0 && !fitsWithOldestMessage(overflowPayload, eventBudgetBytes)) {
+			Object.assign(overflowPayload, minimalEventContext(overflowPayload));
+			json = JSON.stringify(overflowPayload);
+		}
 		// Protect the oldest unread instructions. Later messages stay unread and
 		// are delivered by a following turn, never acknowledged via a skipped tail.
 		while (Buffer.byteLength(json, 'utf8') > eventBudgetBytes && overflowConversation.entries.length > 0) {
@@ -4643,10 +5035,288 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 			throw Object.assign(new TypeError(`Native event context leaves no room for unread conversation sequence ${unreadConversation.entries[0].sequence}; messages remain unread. Reduce the event or task context before retrying.`), { code: 'NATIVE_CONVERSATION_BUDGET_EXCEEDED' });
 		}
 	}
-	const instruction = isPlanningDue
+	// A program paused by damage or a threat must not cost a respondProgram/programStatus detour first:
+	// fight_target and flee_from run directly while it is paused (native-tool-runtime keeps its decision).
+	const dangerPaused = !isPlanningDue && status?.engineState === 'SUSPENDED' && DANGER_PAUSE_TRIGGERS.has(status?.decision?.trigger);
+	const instruction = conversationOnly === true && dangerWake === true
+		? NO_TASK_DANGER_INSTRUCTION
+		: conversationOnly === true && selfCareWake === true
+		? NO_TASK_HEAL_INSTRUCTION
+		: conversationOnly === true
+		? 'Player conversation. You have no active task. If a message asks you to do something, call takeTask (it defaults to the sender\'s words; use resume:true to continue a paused task), then end this turn; your task turn starts at once with every tool. Otherwise reply with say.'
+		: isPlanningDue
 		? 'Live Minecraft event. Program planning is due soon: prepare the next intention while the current authorised routine keeps running. This is advisory and does not require a pending decisionId; use the current programVersion and timing context, and do not blindly renew or cancel the current program.'
-		: 'Live Minecraft event. Advance the current goal using fresh facts. Keep authorised routines running while you reason; respond explicitly to pending program decisions.';
+		: dangerPaused
+			? 'Live Minecraft event. Program paused for danger: call fight_target or flee_from now; respond to the program later.'
+			: awaitingConfirmation === true
+				? AWAITING_CONFIRMATION_EVENT_INSTRUCTION
+				: effectiveTrigger === 'low_health_food'
+					? TASK_HEAL_INSTRUCTION
+					: 'Live Minecraft event. Advance the current goal using fresh facts. Keep authorised routines running while you reason; respond explicitly to pending program decisions.';
 	return `${instruction}\n${json}`;
+}
+
+const DANGER_PAUSE_TRIGGERS = new Set(['damage', 'threat']);
+// Urgent facts that wake an agent with no task: the body is still the model's to defend.
+const NO_TASK_WAKE_TRIGGERS = new Set(['damage', 'threat', 'lava', 'fire', 'suffocation', 'fall', 'low_health']);
+// With no task, a danger-woken turn may defend the body only: these mirror Minecraft's own detached-action allowlist
+// (AgentLifecycleReducer.isSelfPreservationAction). Everything else is a player request and needs takeTask.
+const SELF_PRESERVATION_ACTIONS = new Set(['fight_target', 'flee_from', 'attack', 'use_ranged', 'block_with_shield', 'use_item',
+	'select_item', 'select_tool', 'equip_item', 'navigate_to', 'move_to', 'look_at', 'control', 'control_sequence', 'wait', 'dismount', 'wake_up']);
+const SELF_PRESERVATION_READ_TOOLS = new Set(['observe', 'inspect', 'capabilities', 'action_status', 'cancel_action', 'lookAround']);
+// Getting food is self-preservation too: picking up drops, and breaking only blocks that are food (Minecraft checks the
+// block really is the expected one before breaking it, so these ids bound what a no-task agent can break).
+// Minecraft also checks the live target: crops fully grown, berries ripe, a picked-up stack edible.
+export const FOOD_PLANT_BLOCKS = Object.freeze(['minecraft:wheat', 'minecraft:carrots', 'minecraft:potatoes', 'minecraft:beetroots', 'minecraft:melon']);
+// Berries are picked by right-click, as in vanilla.
+export const FOOD_BERRY_BLOCKS = Object.freeze(['minecraft:sweet_berry_bush', 'minecraft:cave_vines', 'minecraft:cave_vines_plant']);
+const releasedInput = (frame) => frame?.attack === false && frame?.use === false;
+function isSelfPreservationAction(action) {
+	// Raw input may move and aim, but attack/use (which could break, place or open anything) goes through
+	// fight_target, attack and use_item.
+	if (action?.actionType === 'control') return releasedInput(action.arguments);
+	if (action?.actionType === 'control_sequence') return Array.isArray(action.arguments?.frames) && action.arguments.frames.every(releasedInput);
+	if (SELF_PRESERVATION_ACTIONS.has(action?.actionType) || ['pick_up_item', 'interact_block'].includes(action?.actionType)) return true;
+	return action?.actionType === 'break_block' && FOOD_PLANT_BLOCKS.includes(action.arguments?.expectedBlockId);
+}
+export function isSelfPreservationTool(tool) {
+	if (SELF_PRESERVATION_READ_TOOLS.has(tool?.kind)) return true;
+	if (['action', 'start_action', 'replace_action'].includes(tool?.kind)) return isSelfPreservationAction(tool);
+	if (tool?.kind === 'sequence') return Array.isArray(tool.actions) && tool.actions.every((action) => isSelfPreservationAction(action));
+	return false;
+}
+
+// Passive animals that drop food, and dropped items worth picking up to eat.
+const FOOD_ANIMALS = new Set(['minecraft:cow', 'minecraft:mooshroom', 'minecraft:pig', 'minecraft:sheep', 'minecraft:chicken', 'minecraft:rabbit',
+	'minecraft:cod', 'minecraft:salmon', 'minecraft:hoglin']);
+const FOOD_ITEM = /^minecraft:(?:cooked_)?(?:beef|porkchop|mutton|chicken|rabbit|cod|salmon)$|^minecraft:(?:apple|golden_apple|enchanted_golden_apple|bread|carrot|golden_carrot|potato|baked_potato|beetroot|melon_slice|sweet_berries|glow_berries|cookie|pumpkin_pie|mushroom_stew|rabbit_stew|beetroot_soup|dried_kelp)$/;
+const RIPE_AGE = { 'minecraft:wheat': 7, 'minecraft:carrots': 7, 'minecraft:potatoes': 7, 'minecraft:beetroots': 3, 'minecraft:sweet_berry_bush': 2 };
+const LOW_HEALTH_FRACTION = 0.5;
+const LOW_HEALTH_POINTS = 6;
+const RECOVERED_FRACTION = 0.7;
+// Starving on Hard drains one point at a time; only a real further drop wakes again.
+const FURTHER_DROP_POINTS = 2;
+const REGENERATING_FOOD_LEVEL = 18;
+// With a task, low health and food in reach gets one urgent nudge at 4 hearts (or 40%), then again only after 2+ more
+// health is lost or new food comes into reach, never more often than every 10 s.
+const HEAL_NUDGE_POINTS = 8;
+const HEAL_NUDGE_FRACTION = 0.4;
+const HEAL_NUDGE_INTERVAL_MS = 10_000;
+const MAX_SEEN_FOOD = 64;
+const ALWAYS_EDIBLE = new Set(['minecraft:golden_apple', 'minecraft:enchanted_golden_apple']);
+// Events that carry healing facts (and options) even when the caller passed none.
+const HEALING_EVENT_TRIGGERS = new Set(['low_health_food', 'low_health_idle', 'heal_opportunity', 'low_health']);
+
+/**
+ * Whether low health should wake an agent with no task, and the health level to remember. One wake per level: it
+ * rearms only after the agent recovers to 70% or loses 2+ more health. Takeover, creative/spectator and death never
+ * wake, nor does a body that is already regenerating (food bar 18+) with no food carried or in view to add.
+ * `health: null` clears the memory.
+ */
+export function lowHealthWake(observation, wokenAtHealth = null) {
+	const player = observation?.player;
+	const health = Number.isFinite(player?.health) ? player.health : null;
+	if (health === null || player.dead === true || health <= 0) return { wake: false, health: wokenAtHealth };
+	const maxHealth = Number.isFinite(player.maxHealth) && player.maxHealth > 0 ? player.maxHealth : 20;
+	if (health >= maxHealth * RECOVERED_FRACTION) return { wake: false, health: null };
+	const low = health <= Math.max(LOW_HEALTH_POINTS, maxHealth * LOW_HEALTH_FRACTION);
+	if (!low || player.operatorControlled === true || ['creative', 'spectator'].includes(player.gameMode)) return { wake: false, health: wokenAtHealth };
+	if (wokenAtHealth !== null && health > wokenAtHealth - FURTHER_DROP_POINTS) return { wake: false, health: wokenAtHealth };
+	const facts = healingFacts(observation);
+	const nothingToEat = facts.bestFood === null && Object.values(facts.foodSources).every((rows) => rows.length === 0);
+	if (nothingToEat && facts.naturalRegen === true) return { wake: false, health: wokenAtHealth };
+	return { wake: true, health };
+}
+
+/** A low body that is ours to wake: alive, survival or adventure, not taken over, at or below the given level. */
+function lowEligibleBody(player, points, fraction) {
+	const health = Number.isFinite(player?.health) ? player.health : null;
+	if (health === null || player.dead === true || health <= 0 || player.operatorControlled === true || ['creative', 'spectator'].includes(player.gameMode)) return false;
+	const maxHealth = Number.isFinite(player.maxHealth) && player.maxHealth > 0 ? player.maxHealth : 20;
+	return health <= Math.max(points, maxHealth * fraction);
+}
+
+/** Stable keys of the food in reach: carried best food, then drops, animals and ripe plants in view. */
+export function foodSourceKeys(facts) {
+	const sources = facts?.foodSources ?? {};
+	return [
+		...(facts?.bestFood?.itemId ? [`carried:${facts.bestFood.itemId}`] : []),
+		...(sources.drops ?? []).map((drop) => `drop:${drop.stableId}`),
+		...(sources.animals ?? []).map((animal) => `animal:${animal.stableId}`),
+		...(sources.plants ?? []).filter((plant) => plant.ripe !== false).map((plant) => `plant:${plant.x},${plant.y},${plant.z}`),
+	];
+}
+
+function canEatNow(facts) {
+	return !(Number.isFinite(facts?.foodLevel) && facts.foodLevel >= 20) || ALWAYS_EDIBLE.has(facts?.bestFood?.itemId);
+}
+
+function rememberFood(seen, keys) {
+	return [...new Set([...seen, ...keys])].slice(-MAX_SEEN_FOOD);
+}
+
+/**
+ * The no-task heal wake (lowHealthWake) plus food that comes into reach after it: a drop thrown to the agent or an
+ * animal walking up is a chance the model has not seen yet, so it wakes once more for each new source while still low.
+ * `latch` is { health, seenFood } or null; the result's latch is null once the body recovered.
+ */
+export function healWakeVerdict(observation, latch = null) {
+	const verdict = lowHealthWake(observation, latch?.health ?? null);
+	if (verdict.health === null) return { wake: false, latch: null };
+	const facts = healingFacts(observation);
+	const keys = foodSourceKeys(facts);
+	const seen = latch?.seenFood ?? [];
+	const fresh = keys.some((key) => !seen.includes(key));
+	const wake = verdict.wake || (latch !== null && fresh && canEatNow(facts) && lowEligibleBody(observation.player, LOW_HEALTH_POINTS, LOW_HEALTH_FRACTION));
+	return { wake, latch: { health: verdict.health, seenFood: rememberFood(seen, keys) } };
+}
+
+/**
+ * With a task: whether low health with reachable food should raise one urgent attention edge. Fires at 4 hearts
+ * (or 40%) while safe and able to eat, then again only after 2+ more health is lost or new food comes into reach,
+ * at most every 10 s; recovering to 70% resets it. `latch` is { health, seenFood, atMs } or null.
+ */
+export function healNudgeVerdict(observation, latch = null, nowMs = null) {
+	const player = observation?.player ?? {};
+	const maxHealth = Number.isFinite(player.maxHealth) && player.maxHealth > 0 ? player.maxHealth : 20;
+	if (Number.isFinite(player.health) && player.health >= maxHealth * RECOVERED_FRACTION) return { nudge: false, latch: null };
+	if (!lowEligibleBody(player, HEAL_NUDGE_POINTS, HEAL_NUDGE_FRACTION) || player.safe === false) return { nudge: false, latch };
+	const facts = healingFacts(observation);
+	const keys = foodSourceKeys(facts);
+	if (keys.length === 0 || !canEatNow(facts)) return { nudge: false, latch };
+	// Only food that changes what the agent can eat right now repeats the nudge: carried food or a new drop. Animals
+	// and crops passing by while walking are already in the first nudge's options and would repeat it every 10 s.
+	const ownKeys = keys.filter((key) => key.startsWith('carried:') || key.startsWith('drop:'));
+	const seen = latch?.seenFood ?? [];
+	const lower = latch === null || player.health <= latch.health - FURTHER_DROP_POINTS;
+	const fresh = ownKeys.some((key) => !seen.includes(key));
+	const spaced = latch === null || !Number.isFinite(nowMs) || !Number.isFinite(latch.atMs) || nowMs - latch.atMs >= HEAL_NUDGE_INTERVAL_MS;
+	if (!(lower || fresh) || !spaced) return { nudge: false, latch: latch === null ? null : { ...latch, seenFood: rememberFood(seen, ownKeys) } };
+	return { nudge: true, options: facts.options.length, latch: { health: player.health, seenFood: rememberFood(seen, ownKeys), atMs: nowMs } };
+}
+
+/**
+ * Concrete ways to get food now, nearest first, as the native calls that do it. They are facts about reach, not a plan:
+ * the model chooses whether and which.
+ */
+export function healingOptions(facts) {
+	const options = [];
+	const away = (distance) => (Number.isFinite(distance) ? ` ${distance} blocks away` : '');
+	if (facts.bestFood?.itemId) options.push(`eat carried ${facts.bestFood.itemId} (slot ${facts.bestFood.slot}): select_item, then use_item`);
+	for (const drop of facts.foodSources.drops.slice(0, 2)) options.push(`pick up ${drop.count ?? 1}x ${drop.itemId}${away(drop.distance)}: pick_up_item targetSelector ${drop.stableId}, then eat it`);
+	for (const animal of facts.foodSources.animals.slice(0, 1)) options.push(`hunt ${animal.type}${away(animal.distance)}: fight_target targetId ${animal.stableId}, pick_up_item its drop, eat it`);
+	for (const plant of facts.foodSources.plants.filter((row) => row.ripe !== false).slice(0, 1)) {
+		options.push(`harvest ${plant.blockId} at ${plant.x},${plant.y},${plant.z}${away(plant.distance)}: ${plant.harvest === 'interact' ? 'interact_block' : 'break_block'}, pick up, eat`);
+	}
+	return options;
+}
+
+/**
+ * One line on the threat that reaches contact range soonest (risk is a snapshot dominated by distance, so a creeper
+ * closing in from 16 blocks reads about 4). Null when nothing approaches.
+ */
+export function threatOutlook(observation) {
+	const threats = Array.isArray(observation?.player?.threats) ? observation.player.threats : [];
+	const soonest = threats.filter((threat) => threat?.approaching === true && Number.isFinite(threat.etaSeconds))
+		.sort((left, right) => left.etaSeconds - right.etaSeconds)[0];
+	if (soonest === undefined) return null;
+	const then = Number.isFinite(soonest.contactRisk) ? `, about ${soonest.contactRisk} there` : '';
+	return `${soonest.type} ${soonest.uuid} is ${soonest.distance} blocks away closing at ${soonest.closingSpeed} blocks/s: contact range in ${soonest.etaSeconds} s (risk ${soonest.risk} now${then}).`;
+}
+
+/**
+ * Whether health regenerates on its own, as vanilla decides it: never with the naturalRegeneration gamerule off; in
+ * Peaceful at any food level; otherwise only while the food bar is 18 or more. Null when the food level is unknown.
+ */
+export function naturalRegeneration(player, world) {
+	if (world?.naturalRegeneration === false) return false;
+	if (world?.difficulty === 'peaceful') return true;
+	return Number.isFinite(player?.foodLevel) ? player.foodLevel >= REGENERATING_FOOD_LEVEL : null;
+}
+
+/** The facts a no-task low-health turn needs: health, hunger, carried food and the nearest food sources in view. */
+export function healingFacts(observation) {
+	const player = observation?.player ?? {};
+	const list = (value) => (Array.isArray(value) ? value : []);
+	const at = (row) => (['x', 'y', 'z'].every((axis) => Number.isFinite(row?.[axis]) && Number.isFinite(player[axis]))
+		? Math.round(Math.hypot(row.x - player.x, row.y - player.y, row.z - player.z) * 10) / 10 : null);
+	const nearest = (rows, limit) => rows.map(({ source, ...row }) => ({ ...row, distance: Number.isFinite(source?.distance) ? source.distance : at(source) }))
+		.sort((left, right) => (left.distance ?? Infinity) - (right.distance ?? Infinity)).slice(0, limit);
+	const animals = list(observation?.entities).filter((entity) => FOOD_ANIMALS.has(entity?.type) && entity.alive !== false)
+		.map((entity) => ({ stableId: entity.stableId, type: entity.type, source: entity }));
+	const plants = list(observation?.blocks).filter((block) => FOOD_PLANT_BLOCKS.includes(block?.blockId) || FOOD_BERRY_BLOCKS.includes(block?.blockId)).map((block) => {
+		const age = Number(block.state?.age);
+		const ripe = block.blockId in RIPE_AGE ? (Number.isFinite(age) ? age >= RIPE_AGE[block.blockId] : null)
+			: block.blockId.startsWith('minecraft:cave_vines') ? (block.state?.berries === undefined ? null : String(block.state.berries) === 'true') : true;
+		return { x: block.x, y: block.y, z: block.z, blockId: block.blockId, harvest: FOOD_BERRY_BLOCKS.includes(block.blockId) ? 'interact' : 'mine', ...(ripe === null ? {} : { ripe }), source: block };
+	});
+	const drops = list(observation?.items).filter((item) => FOOD_ITEM.test(item?.itemId ?? ''))
+		.map((item) => ({ stableId: item.stableId, itemId: item.itemId, count: item.count, source: item }));
+	const facts = {
+		health: player.health ?? null, maxHealth: player.maxHealth ?? 20, foodLevel: player.foodLevel ?? null, saturation: player.saturation ?? null,
+		naturalRegen: naturalRegeneration(player, observation?.world),
+		bestFood: player.bestFood ?? null, safe: player.safe ?? null, threats: list(player.threats).length,
+		foodSources: { animals: nearest(animals, 4), plants: nearest(plants, 4), drops: nearest(drops, 4) },
+	};
+	return { ...facts, options: healingOptions(facts) };
+}
+export const NO_TASK_HEAL_INSTRUCTION = 'Live Minecraft event: low health. You have no active task; any finished task stays finished, so do not redo it. Recovering is your call. Health regenerates on its own only while healing.naturalRegen is true (foodLevel 18 or more; any level in Peaceful), otherwise it stays low until you eat. healing.options lists the food in reach as exact calls: eat carried food (select_item, then use_item), pick_up_item a food drop, fight_target a passive animal and pick up its drop, mine fully grown crops or melon, or interact with ripe berries; then eat. Other work is a player request and needs takeTask.';
+export const TASK_HEAL_INSTRUCTION = 'Live Minecraft event: low health with food in reach. Whether to recover before continuing the task is your call. Health regenerates on its own only while healing.naturalRegen is true (foodLevel 18 or more; any level in Peaceful). healing.options lists the food in reach as exact calls (eat carried food with select_item then use_item; pick_up_item a food drop; fight_target a passive animal and pick up its drop). Keep authorised routines running unless you choose otherwise; respond explicitly to pending program decisions.';
+export const NO_TASK_DANGER_INSTRUCTION = 'Live Minecraft event: danger. You have no active task; any finished task stays finished, so do not redo it. Defend yourself now: fight_target, flee_from, eat or drink, shield or totem, equip armor and weapons, move away. Other work is a player request and needs takeTask.';
+// Waiting for the operator only means "do not redo the finished work or re-run finish"; it never blocks new requests.
+export const AWAITING_CONFIRMATION_EVENT_INSTRUCTION = 'Live Minecraft event. Your finished goal awaits operator confirmation: do not redo it or re-run finish. Waiting never blocks new requests: act on player messages now with any tool, as part of your task, then call finish again when done.';
+const UUID_TEXT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const DEFAULT_TASK_REQUEST_TIMEOUT_MS = 10_000;
+const MINIMAL_TASK_MEMORY_BYTES = 2_048;
+const MINIMAL_RECEIPTS = 2;
+const MINIMAL_OBSERVATION_FIELDS = new Set(['observedAtEpochMs', 'eventSequence', 'freshness', 'ready', 'status', 'player', 'inventory', 'sighted', 'leftBehind', 'currentAction', 'lastResult', 'death', 'recovery', 'failureClass', 'continuity', 'resultCoverage']);
+
+function fitsWithOldestMessage(payload, budgetBytes) {
+	const probe = { ...payload, conversation: { ...payload.conversation, entries: payload.conversation.entries.slice(0, 1) } };
+	return Buffer.byteLength(JSON.stringify(probe), 'utf8') <= budgetBytes;
+}
+
+// Core facts only: where the agent is, what it holds and what just happened.
+// contextTrimmed lists what was dropped, largest first with original byte sizes,
+// so the model can look it up again and traces show which context outgrew the budget.
+function minimalEventContext(payload) {
+	const observation = payload.observation ?? {};
+	const sizes = {};
+	const minimalObservation = {};
+	for (const [key, value] of Object.entries(observation)) {
+		if (MINIMAL_OBSERVATION_FIELDS.has(key)) minimalObservation[key] = value;
+		else sizes[`observation.${key}`] = Buffer.byteLength(JSON.stringify(value ?? null), 'utf8');
+	}
+	if (observation.inventory !== undefined) {
+		minimalObservation.inventory = { ...observation.inventory, items: asArray(observation.inventory.items).slice(0, 8) };
+	}
+	const result = { observation: minimalObservation };
+	if (payload.taskMemory !== undefined) {
+		const encoded = JSON.stringify(payload.taskMemory);
+		const bytes = Buffer.byteLength(encoded, 'utf8');
+		if (bytes > MINIMAL_TASK_MEMORY_BYTES) {
+			sizes.taskMemory = bytes;
+			result.taskMemory = { truncated: true, excerpt: truncateUtf8(encoded, MINIMAL_TASK_MEMORY_BYTES) };
+		}
+	}
+	const programResult = payload.program?.result;
+	if (Array.isArray(programResult?.receipts) && programResult.receipts.length > MINIMAL_RECEIPTS) {
+		sizes['program.result.receipts'] = Buffer.byteLength(JSON.stringify(programResult.receipts), 'utf8');
+		result.program = { ...payload.program, result: { ...programResult, receipts: programResult.receipts.slice(-MINIMAL_RECEIPTS), omittedReceipts: (programResult.omittedReceipts ?? 0) + programResult.receipts.length - MINIMAL_RECEIPTS } };
+	}
+	result.contextTrimmed = Object.fromEntries(Object.entries(sizes).sort(([, left], [, right]) => right - left).slice(0, 12));
+	return result;
+}
+
+function truncateUtf8(text, maxBytes) {
+	let end = Math.min(text.length, maxBytes);
+	while (end > 0 && Buffer.byteLength(text.slice(0, end), 'utf8') > maxBytes) end -= 1;
+	// Never end on the first half of a surrogate pair.
+	if (end > 0 && end < text.length) {
+		const code = text.charCodeAt(end - 1);
+		if (code >= 0xd800 && code <= 0xdbff) end -= 1;
+	}
+	return text.slice(0, end);
 }
 
 function boundedEventArray(value, limit, preserve = null) {
@@ -4697,6 +5367,7 @@ function compactEventObservationForBudget(observation) {
 		items: itemRows.values,
 		entities: entityRows.values,
 		blocks: blockRows.values,
+		...(observation.blockDefaults === undefined ? {} : { blockDefaults: observation.blockDefaults }), ...(observation.blockTags === undefined ? {} : { blockTags: retainedBlockTags(observation.blockTags, blockRows.values) }),
 		...(landmarkRows === null ? {} : { landmarks: landmarkRows.values }),
 		...(nearbyContainerRows === null ? {} : { nearbyContainers: nearbyContainerRows.values }),
 		...(optionRows === null ? {} : { options: optionRows.values }),
@@ -4733,6 +5404,9 @@ function compactPlanningDueObservation(observation) {
 		items: itemRows.values,
 		entities: entityRows.values,
 		blocks: blockRows.values,
+		...(observation.blockDefaults === undefined ? {} : { blockDefaults: observation.blockDefaults }), ...(observation.blockTags === undefined ? {} : { blockTags: retainedBlockTags(observation.blockTags, blockRows.values) }),
+		...(observation.sighted === undefined ? {} : { sighted: observation.sighted }),
+		...(observation.leftBehind === undefined ? {} : { leftBehind: observation.leftBehind }),
 		...(observation.world === undefined ? {} : { world: compactWorldForEvent(observation.world) }),
 		...(observation.currentAction === undefined ? {} : { currentAction: observation.currentAction }),
 		...(observation.lastResult === undefined ? {} : { lastResult: compactLastResultForEvent(observation.lastResult) }),
@@ -4756,7 +5430,44 @@ function retainedEventCoverage(coverage, retainedCounts) {
 	}));
 }
 
-const COMPACT_EVENT_ROW_FIELDS = ['uuid', 'stableId', 'type', 'name', 'position', 'x', 'y', 'z', 'distance', 'blockId', 'itemId', 'count', 'slot', 'tags', 'velocity', 'bounds', 'pickable', 'parentId', 'partName', 'state', 'bearing', 'elevation', 'id', 'feasible', 'moveTo', 'reason', 'cause', 'hazard', 'damage', 'maxDamage', 'fingerprint', 'hotbar', 'displayName', 'maxStackSize', 'hostile', 'alive', 'health', 'maxHealth', 'withinInteractionRange', 'capabilities'];
+const COMPACT_EVENT_ROW_FIELDS = ['uuid', 'stableId', 'type', 'name', 'position', 'x', 'y', 'z', 'distance', 'blockId', 'itemId', 'count', 'slot', 'tags', 'velocity', 'bounds', 'pickable', 'parentId', 'partName', 'state', 'bearing', 'elevation', 'id', 'feasible', 'moveTo', 'reason', 'cause', 'hazard', 'damage', 'maxDamage', 'usesLeft', 'fingerprint', 'hotbar', 'displayName', 'maxStackSize', 'hostile', 'alive', 'health', 'maxHealth', 'targetingAgent', 'swelling', 'fuse', 'perceivedBy', 'potentialRisk', 'risk', 'expectedHitDamage', 'withinInteractionRange', 'capabilities'];
+
+// Blocks are about half of every event. Most rows repeat values that follow from the row itself.
+export const EVENT_BLOCK_DEFAULTS = 'Omitted block fields mean: stableId "x,y,z", bounds one full cube, state {}, tags from blockTags[blockId].';
+function compactBlockDefaults(blocks) {
+	let omitted = false;
+	// Block tags belong to the block type, so each blockId's tags are listed once when every row agrees.
+	const tagsById = new Map();
+	for (const block of blocks) {
+		if (block === null || typeof block !== 'object' || typeof block.blockId !== 'string' || !Array.isArray(block.tags)) continue;
+		const encoded = JSON.stringify(block.tags);
+		tagsById.set(block.blockId, tagsById.has(block.blockId) && tagsById.get(block.blockId) !== encoded ? null : encoded);
+	}
+	const blockTags = Object.fromEntries([...tagsById].filter(([, encoded]) => encoded !== null).map(([blockId, encoded]) => [blockId, JSON.parse(encoded)]));
+	const values = blocks.map((block) => {
+		if (block === null || typeof block !== 'object' || Array.isArray(block)) return block;
+		const compact = { ...block };
+		if (Object.hasOwn(blockTags, compact.blockId) && Array.isArray(compact.tags)) { delete compact.tags; omitted = true; }
+		if (compact.stableId === `${compact.x},${compact.y},${compact.z}`) { delete compact.stableId; omitted = true; }
+		if (isFullCubeBounds(compact.bounds)) { delete compact.bounds; omitted = true; }
+		if (compact.state !== null && typeof compact.state === 'object' && !Array.isArray(compact.state) && Object.keys(compact.state).length === 0) { delete compact.state; omitted = true; }
+		return compact;
+	});
+	if (!omitted) return { blocks: values };
+	return { blocks: values, blockDefaults: EVENT_BLOCK_DEFAULTS, ...(Object.keys(blockTags).length === 0 ? {} : { blockTags }) };
+}
+
+function retainedBlockTags(blockTags, rows) {
+	const retained = new Set(rows.map((row) => row?.blockId));
+	const kept = Object.fromEntries(Object.entries(blockTags ?? {}).filter(([blockId]) => retained.has(blockId)));
+	return Object.keys(kept).length === 0 ? undefined : kept;
+}
+
+function isFullCubeBounds(bounds) {
+	return Array.isArray(bounds) && bounds.length === 1 && bounds[0] !== null && typeof bounds[0] === 'object'
+		&& Object.keys(bounds[0]).length === 6 && bounds[0].minX === 0 && bounds[0].minY === 0 && bounds[0].minZ === 0
+		&& bounds[0].maxX === 1 && bounds[0].maxY === 1 && bounds[0].maxZ === 1;
+}
 
 function compactEventRows(value) {
 	return asArray(value).map((entry) => {
@@ -4771,6 +5482,9 @@ function compactEventRows(value) {
 function isHazardousEventFact(value) {
 	if (value === null || typeof value !== 'object') return false;
 	if (value.hostile === true && value.alive !== false) return true;
+	if (value.targetingAgent === true || value.swelling === true) return true;
+	// An active risk (engaging the agent right now) is kept under budget like a hostile.
+	if (typeof value.risk === 'number') return true;
 	const text = ['blockId', 'itemId', 'type', 'name', 'reason', 'cause', 'hazard'].map((field) => value[field]).filter((field) => typeof field === 'string').join(' ');
 	return /lava|fire|magma|cactus|campfire|tnt|creeper|ghast|blaze|wither|warden|dragon|hostile/i.test(text);
 }

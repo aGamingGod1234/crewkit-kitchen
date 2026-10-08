@@ -1,5 +1,6 @@
 package dev.agaminggod.arenaagents.server.conversation;
 
+import dev.agaminggod.arenaagents.server.pov.PovMessageRelay;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
@@ -264,11 +265,16 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 		String recipientName = Optional.ofNullable(byId.get(event.recipientId()))
 				.map(OnlineParticipant::displayName)
 				.orElse(event.recipientId());
+		// Agent bodies that get their own line; a takeover operator sees that line through the body already.
+		List<java.util.UUID> agentBodies = receipt.deliveredIds().stream().map(byId::get)
+				.filter(participant -> participant != null && participant.agentRecord() != null)
+				.map(participant -> participant.player().getUUID()).toList();
 		for (String deliveredId : receipt.deliveredIds()) {
 			OnlineParticipant participant = byId.get(deliveredId);
 			if (participant == null) continue;
 			boolean mirror = receipt.mirroredOperatorIds().contains(deliveredId);
-			if (deliverToPlayers && !suppressedPlayerIds.contains(participant.player().getUUID().toString())) {
+			boolean seenThroughBody = mirror && PovMessageRelay.relaysAnyTo(participant.player().getUUID(), agentBodies);
+			if (deliverToPlayers && !seenThroughBody && !suppressedPlayerIds.contains(participant.player().getUUID().toString())) {
 				if (event.audience() == ConversationAudience.DIRECT
 						&& !mirror
 						&& participant.agentRecord() == null) {
@@ -307,7 +313,11 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 				source.dimensionId()
 		);
 		GoalRoute route = reserved ? GoalRoute.EVENT_ONLY : routePlayerGoal(target, delivered, sourceLevel);
-		if (route.publish()) eventSink.publish(delivered, route.wakeSpec());
+		if (route.publish()) {
+			eventSink.publish(delivered, route.wakeSpec());
+			// The model may later adopt exactly this delivered message as a task (takeTask).
+			manager.spokenRequests().record(delivered);
+		}
 	}
 
 	private GoalRoute routePlayerGoal(AgentRecord target, ConversationEvent event, ServerLevel sourceLevel) {
@@ -320,10 +330,12 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 		}
 		ServerPlayer requester = manager.server().getPlayerList().getPlayer(requestingPlayerId(event));
 		boolean operator = requester != null && GoalControl.mayControl(requester.createCommandSourceStack());
-		if (operator && ConversationWakePolicy.isPlayerGoalChannel(event.kind(), event.audience())
+		// Operators confirm any task; the player who asked for a model-adopted task confirms that one.
+		boolean mayConfirm = operator || manager.mayConfirmAsModelTaskRequester(target.agentId(), requestingPlayerId(event));
+		if (mayConfirm && ConversationWakePolicy.isPlayerGoalChannel(event.kind(), event.audience())
 				&& ConversationWakePolicy.isCompletionConfirmation(event.text())
 				&& dev.agaminggod.arenaagents.server.CodexAgentServerRuntime.confirmCurrentGoalFromSpeech(manager.server(), target.agentId())) {
-			notifyRequester(requester.getUUID(), "Confirmed. Minecraft will finish this goal after checking its requirements.");
+			notifyRequester(requestingPlayerId(event), "Confirmed. Minecraft will finish this goal after checking its requirements.");
 			return GoalRoute.CONSUMED;
 		}
 		boolean replaceRequested = ConversationWakePolicy.mayReplaceGoalFromSpeech(

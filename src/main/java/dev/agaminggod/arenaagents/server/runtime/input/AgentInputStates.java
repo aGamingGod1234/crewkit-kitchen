@@ -7,9 +7,14 @@ import net.minecraft.world.InteractionHand;
 import net.minecraft.world.phys.Vec3;
 
 public final class AgentInputStates {
-	/** Maximum view rotation applied by one server tick. */
-	public static final float MAX_YAW_STEP_DEGREES = 12.0F;
-	public static final float MAX_PITCH_STEP_DEGREES = 8.0F;
+	/**
+	 * Eased, player-like view turning. Each tick covers TURN_EASE of the remaining angle, at least
+	 * MIN_TURN_STEP_DEGREES and at most MAX_TURN_STEP_DEGREES, so a 180 degree flick settles in about
+	 * 300 ms and a 90 degree turn in about 200 ms, without the one-tick snap a direct rotation write makes.
+	 */
+	public static final float MAX_TURN_STEP_DEGREES = 45.0F;
+	public static final float MIN_TURN_STEP_DEGREES = 6.0F;
+	public static final float TURN_EASE = 0.7F;
 
 	/** Analog motor limits. These values are deliberately independent of server TPS. */
 	public static final float MOVE_ACCELERATION = 0.20F;
@@ -70,17 +75,24 @@ public final class AgentInputStates {
 		if (nowEpochMs < 0L) throw new IllegalArgumentException("nowEpochMs must not be negative");
 
 		float yawDelta = shortestAngleDelta(state.yaw(), target.yaw());
-		float pitchDelta = target.pitch() - state.pitch();
-		float yaw = Mth.wrapDegrees(state.yaw() + clamp(yawDelta, -MAX_YAW_STEP_DEGREES, MAX_YAW_STEP_DEGREES));
-		float pitch = Mth.clamp(
-				state.pitch() + clamp(pitchDelta, -MAX_PITCH_STEP_DEGREES, MAX_PITCH_STEP_DEGREES),
-				-90.0F,
-				90.0F
-		);
+		float yaw = turnYaw(state.yaw(), target.yaw());
+		float pitch = turnPitch(state.pitch(), target.pitch());
 
 		float desiredForward = 0.0F;
 		float desiredStrafe = 0.0F;
-		if (target.moving()) {
+		boolean sprint = target.sprint();
+		if (target.moving() && target.decoupled()) {
+			// The view and the walk direction differ (holding the heading on a short approach, or watching the path
+			// ahead): press the keys that move toward moveYaw relative to the view, backpedalling if it is behind,
+			// as a player who steps back onto a spot instead of turning around.
+			float relativeRadians = (float) Math.toRadians(shortestAngleDelta(yaw, target.moveYaw()));
+			desiredForward = (float) Math.cos(relativeRadians);
+			desiredStrafe = -(float) Math.sin(relativeRadians);
+			if (Math.abs(desiredForward) < MOVEMENT_EPSILON) desiredForward = 0.0F;
+			if (Math.abs(desiredStrafe) < MOVEMENT_EPSILON) desiredStrafe = 0.0F;
+			// Vanilla cannot sprint without forward input.
+			sprint = sprint && desiredForward > 0.0F;
+		} else if (target.moving()) {
 			// Move mostly forward while turning, then bleed into a lateral component. This avoids
 			// the stop-and-reverse oscillation that a hard yaw snap causes around corners.
 			float relativeRadians = (float) Math.toRadians(shortestAngleDelta(yaw, target.yaw()));
@@ -97,7 +109,29 @@ public final class AgentInputStates {
 				desiredStrafe == 0.0F ? MOVE_DECELERATION : MOVE_ACCELERATION);
 		boolean jump = target.jumpRequested();
 		MotorState next = new MotorState(yaw, pitch, forward, strafe, target.jumpRequested());
-		return new MotorStep(next, forward, strafe, jump, target.sprint());
+		return new MotorStep(next, forward, strafe, jump, sprint);
+	}
+
+	/** One eased turn step along the shortest arc; lands exactly on the target once it is close. */
+	public static float turnYaw(float current, float target) {
+		float delta = shortestAngleDelta(current, target);
+		float step = turnStep(delta);
+		return step == delta ? Mth.wrapDegrees(target) : Mth.wrapDegrees(current + step);
+	}
+
+	public static float turnPitch(float current, float target) {
+		if (!Float.isFinite(current) || !Float.isFinite(target)) throw new IllegalArgumentException("angles must be finite");
+		float clampedTarget = Mth.clamp(target, -90.0F, 90.0F);
+		float delta = clampedTarget - current;
+		float step = turnStep(delta);
+		return step == delta ? clampedTarget : Mth.clamp(current + step, -90.0F, 90.0F);
+	}
+
+	/** Signed eased step for a remaining turn; returns {@code delta} itself when this tick finishes it. */
+	static float turnStep(float delta) {
+		float magnitude = Math.abs(delta);
+		float step = clamp(magnitude * TURN_EASE, MIN_TURN_STEP_DEGREES, MAX_TURN_STEP_DEGREES);
+		return step >= magnitude ? delta : Math.copySign(step, delta);
 	}
 
 	/** Returns the shortest signed turn from {@code current} to {@code target}. */
@@ -146,17 +180,31 @@ public final class AgentInputStates {
 		}
 	}
 
+	/**
+	 * {@code yaw} is where the view turns. {@code moveYaw} is the walk direction when it differs from the view, or
+	 * NaN to walk where the view points (turning first, then walking).
+	 */
 	public record MotorTarget(
 			float yaw,
 			float pitch,
 			boolean moving,
 			boolean jumpRequested,
-			boolean sprint
+			boolean sprint,
+			float moveYaw
 	) {
 		public MotorTarget {
-			if (!Float.isFinite(yaw) || !Float.isFinite(pitch) || pitch < -90.0F || pitch > 90.0F) {
+			if (!Float.isFinite(yaw) || !Float.isFinite(pitch) || pitch < -90.0F || pitch > 90.0F
+					|| Float.isInfinite(moveYaw)) {
 				throw new IllegalArgumentException("invalid motor target angles");
 			}
+		}
+
+		public MotorTarget(float yaw, float pitch, boolean moving, boolean jumpRequested, boolean sprint) {
+			this(yaw, pitch, moving, jumpRequested, sprint, Float.NaN);
+		}
+
+		public boolean decoupled() {
+			return !Float.isNaN(moveYaw);
 		}
 	}
 

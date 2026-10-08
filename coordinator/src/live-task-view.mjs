@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { sanitizeDiagnosticText } from './diagnostic-sanitizer.mjs';
+import { strategyHints } from './minecraft-strategy-reference.mjs';
 
 const KINDS = ['inventory', 'world', 'milestone', 'manual'];
 const STATES = ['pending', 'active', 'complete', 'lost'];
@@ -158,7 +159,9 @@ export class LiveTaskViews {
    }
    state.plan = plan; state.lastObserved=Object.fromEntries(Object.entries(state.lastObserved).filter(([id])=>plan.steps.some(s=>s.id===id))); state.revision++; this.#reconcile(state); this.#save(state);
   }
-  return { goal: state.goal, revision: state.revision, plan: structuredClone(state.plan), advisory: true };
+  // Points at on-demand strategy topics relevant to unfinished steps; reading them stays the model's choice.
+  const strategy = strategyHints({ goal: state.goal, plan: state.plan });
+  return { goal: state.goal, revision: state.revision, plan: structuredClone(state.plan), advisory: true, ...(strategy === null ? {} : { strategy }) };
  }
  event(record, stage, value) {
   const state = this.#state(record);
@@ -201,7 +204,7 @@ function taskIdentity(record) {
  return record.currentGoal ? `prompt:${record.currentGoal}` : null;
 }
 function numericUsage(value) {
- const out = {}; for (const key of ['inputTokens', 'cachedInputTokens', 'outputTokens', 'reasoningOutputTokens', 'totalTokens']) if (Number.isSafeInteger(value?.[key]) && value[key] >= 0) out[key] = value[key];
+ const out = {}; for (const key of ['inputTokens', 'cachedInputTokens', 'cacheWriteInputTokens', 'outputTokens', 'reasoningOutputTokens', 'totalTokens']) if (Number.isSafeInteger(value?.[key]) && value[key] >= 0) out[key] = value[key];
  if (out.inputTokens !== undefined && out.cachedInputTokens !== undefined && out.cachedInputTokens <= out.inputTokens) out.uncachedInputTokens = out.inputTokens - out.cachedInputTokens;
  return Object.keys(out).length ? out : null;
 }

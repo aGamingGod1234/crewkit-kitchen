@@ -55,6 +55,24 @@ public final class AgentDeathCaptureVerification {
 				"unhandled lethal damage continues through the vanilla death screen");
 		assertions++;
 		assertEquals(1, recorded.get(), "vanilla death is recorded exactly once before the player disconnects");
+		assertions++;
+		assertEquals(true, AgentDeathCapture.allowVanillaDeath(false, true, recorded::incrementAndGet),
+				"a totem save lets vanilla pop the totem");
+		assertions++;
+		assertEquals(1, recorded.get(), "a totem save is never recorded as a death, so the agent is not respawned");
+		assertions++;
+
+		assertEquals(AgentDeathCapture.KillRoute.VANILLA_DEATH, AgentDeathCapture.killRoute(true, false),
+				"/kill on a living Arena body is a vanilla death, never Carpet's disconnect and recreate");
+		assertions++;
+		assertEquals(AgentDeathCapture.KillRoute.ALREADY_DEAD, AgentDeathCapture.killRoute(true, true),
+				"/kill on a dead Arena body records no second death and keeps the body connected for respawn");
+		assertions++;
+		assertEquals(AgentDeathCapture.KillRoute.CARPET_DISCONNECT, AgentDeathCapture.killRoute(false, false),
+				"plain Carpet bots keep Carpet's /kill disconnect");
+		assertions++;
+		assertEquals(AgentDeathCapture.KillRoute.CARPET_DISCONNECT, AgentDeathCapture.killRoute(false, true),
+				"a dead plain Carpet bot keeps Carpet's /kill disconnect");
 		return assertions + 1;
 	}
 

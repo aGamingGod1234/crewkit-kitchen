@@ -128,9 +128,16 @@ test('rejects unknown fields, unsupported actions, and unsafe numeric/text value
 	assert.throws(() => validateAction({ type: 'interact_block', x: 1, y: 64, z: 2, face: 'north', hand: 'third', expectedItemId: 'minecraft:air' }), /hand/);
 	assert.throws(() => validateAction({ type: 'menu_button', menuId: 'minecraft:enchantment', buttonId: 256, timeoutMs: 5_000 }), /buttonId/);
 	assert.throws(() => validateAction({ type: 'pick_up_item', targetSelector: 'nearest_item' }), /UUID/);
-	for (const type of ['build_sequence', 'fight_target', 'flee_from', 'follow_entity', 'complete_goal']) {
+	for (const type of ['build_sequence', 'follow_entity', 'complete_goal']) {
 		assert.throws(() => validateAction({ type }), /Unsupported action/);
 	}
+	const target = '00000000-0000-0000-0000-000000000001';
+	assert.equal(validateAction({ type: 'fight_target', targetId: target, timeoutMs: 15_000 }).type, 'fight_target');
+	assert.equal(validateAction({ type: 'fight_target', targetId: target, timeoutMs: 15_000, desiredRange: 2.5, fleeAtHealth: 6 }).fleeAtHealth, 6);
+	assert.equal(validateAction({ type: 'flee_from', targetId: target, distance: 12, timeoutMs: 8_000 }).distance, 12);
+	assert.throws(() => validateAction({ type: 'fight_target', targetId: 'nearest_hostile', timeoutMs: 15_000 }), /UUID/);
+	assert.throws(() => validateAction({ type: 'fight_target', targetId: target, timeoutMs: 15_000, desiredRange: 9 }), /desiredRange/);
+	assert.throws(() => validateAction({ type: 'flee_from', targetId: target, distance: 100, timeoutMs: 8_000 }), /distance/);
 });
 
 test('requires detached complete model-program provenance for action commands', () => {

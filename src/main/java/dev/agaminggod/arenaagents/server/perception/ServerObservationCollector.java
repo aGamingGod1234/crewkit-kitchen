@@ -25,6 +25,7 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import net.minecraft.core.BlockPos;
@@ -77,16 +78,30 @@ public final class ServerObservationCollector {
 	private static final int LANDMARK_CACHE_CAPACITY = 16;
 	/** Mutation revision keys provide freshness; this age bounds retained stationary poses. */
 	private static final long LANDMARK_CACHE_TICKS = 200L;
+	/**
+	 * Structure, cave and vein rows cost structure lookups, up to 3,000 block reads and a flood fill each; half a second
+	 * between recomputes is still faster than a player reads the scene, and the rows' bearings follow the live view.
+	 */
+	static final long SIGHTED_RECOMPUTE_TICKS = 10L;
+	/** Landmark sight rays are reused while the eye stays within half a block and the view within 4 degrees. */
+	static final double LANDMARK_EYE_QUANTUM = 0.5D;
+	static final float LANDMARK_VIEW_QUANTUM_DEGREES = 4.0F;
 	private static final EquipmentSlot[] EQUIPMENT_SLOTS = EquipmentSlot.values();
 
 	private final CodexAgentManager manager;
 	private final ServerActionExecutor actionExecutor;
 	private final ObservationSectionCache<RawSpatialObservation.Key, RawSpatialObservation> spatialCache =
 			new ObservationSectionCache<>(SPATIAL_CACHE_CAPACITY, SPATIAL_CACHE_TICKS, value -> value);
-	private final ObservationSectionCache<LandmarkSampleKey, List<VisibleSurfaceCandidate>> landmarkCache =
+	private final ObservationSectionCache<LandmarkSampleKey, SightSample> landmarkCache =
 			new ObservationSectionCache<>(LANDMARK_CACHE_CAPACITY, LANDMARK_CACHE_TICKS, value -> value);
+	/** Structure starts each agent saw recently, so a structure is announced as new once, not on every glance. */
+	private final Map<AgentId, Map<String, Long>> seenStructures = new HashMap<>();
+	/** Each agent's last structure, cave and vein rows, recomputed at most every {@link #SIGHTED_RECOMPUTE_TICKS}. */
+	private final Map<AgentId, SightedMemo> sightedSamples = new HashMap<>();
 	private final Map<AgentId, RawSpatialObservation.Key> spatialKeys = new HashMap<>();
 	private final Map<AgentId, RawPlayerState> lastRawStates = new HashMap<>();
+	private final ThreatPerception threats = new ThreatPerception();
+	private final SurvivalPerception survival = new SurvivalPerception();
 	private final Map<AgentId, InventorySnapshot> lastInventories = new HashMap<>();
 	private static final IdentityHashMap<Holder<?>, List<String>> TAG_VALUES = new IdentityHashMap<>();
 
@@ -131,6 +146,16 @@ public final class ServerObservationCollector {
 		player.addProperty("onFire", agent.isOnFire());
 		player.addProperty("air", Math.max(0, agent.getAirSupply()));
 		player.addProperty("maxAir", Math.max(1, agent.getMaxAirSupply()));
+		// Eyes under water: air is draining. airSecondsLeft is the time before drowning damage starts.
+		player.addProperty("underWater", agent.isUnderWater());
+		// Only while an operator's /takeover owns the body, so the coordinator never wakes the model to act on it.
+		if (dev.agaminggod.arenaagents.server.pov.AgentControlReservations.isReserved(level.getServer(), agentId)) {
+			player.addProperty("operatorControlled", true);
+		}
+		if (agent.isUnderWater()) {
+			player.addProperty("airSecondsLeft", Math.round(dev.agaminggod.arenaagents.server.runtime.controller.SwimPlanning
+					.airSecondsLeft(agent.getAirSupply()) * 10.0D) / 10.0D);
+		}
 		player.addProperty("suffocating", agent.isInWall());
 		player.addProperty("fallDistance", finite(agent.fallDistance));
 		player.addProperty("pose", agent.getPose().name().toLowerCase(java.util.Locale.ROOT));
@@ -159,6 +184,14 @@ public final class ServerObservationCollector {
 		}
 		player.add("effects", effects(agent));
 		observation.add("player", player);
+		ThreatPerception.Snapshot threatSnapshot = threats.sample(agentId, agent);
+		JsonObject threat = ThreatPerception.toJson(threatSnapshot);
+		if (threat != null) observation.add("threats", threat);
+		JsonObject healing = SurvivalPerception.toJson(survival.sample(agentId, agent, threatSnapshot));
+		if (healing != null) observation.add("survival", healing);
+		// Sounds a player would hear (sent packets plus client-only ambience such as lava), most salient first.
+		JsonArray heard = HearingPerception.observe(agent);
+		if (!heard.isEmpty()) observation.add("heard", heard);
 		observation.add("interaction", interaction(agentId, agent));
 
 		observation.add("inventory", inventory(agent));
@@ -166,6 +199,7 @@ public final class ServerObservationCollector {
 		JsonObject spatial = spatialObservation(agentId, level, agent, visibility);
 		observation.add("blocks", spatial.get("blocks"));
 		observation.add("landmarks", spatial.get("landmarks"));
+		if (spatial.has("sighted")) observation.add("sighted", spatial.get("sighted"));
 		observation.add("nearbyContainers", spatial.get("nearbyContainers"));
 		JsonObject world = new JsonObject();
 		world.addProperty("dimension", level.dimension().identifier().toString());
@@ -174,6 +208,10 @@ public final class ServerObservationCollector {
 		world.addProperty("dayTime", level.getDefaultClockTime());
 		world.addProperty("raining", level.isRaining());
 		world.addProperty("thundering", level.isThundering());
+		// Both shown to a player (difficulty in the menu, the gamerule by /gamerule): they decide whether health regenerates.
+		world.addProperty("difficulty", level.getDifficulty().getSerializedName());
+		world.addProperty("naturalRegeneration",
+				level.getGameRules().get(net.minecraft.world.level.gamerules.GameRules.NATURAL_HEALTH_REGENERATION));
 		observation.add("world", world);
 		observation.add("currentAction", currentAction(agentId));
 		observation.add("lastResult", lastResult(agentId));
@@ -376,6 +414,9 @@ public final class ServerObservationCollector {
 		spatialKeys.remove(agentId);
 		spatialCache.invalidateMatching(key -> key.agentId().equals(agentId));
 		landmarkCache.invalidateMatching(key -> key.agentId().equals(agentId));
+		synchronized (sightedSamples) {
+			sightedSamples.remove(agentId);
+		}
 		invalidatePlayerState(agentId);
 	}
 
@@ -419,7 +460,11 @@ public final class ServerObservationCollector {
 				}
 				continue;
 			}
-			RawPlayerState current = rawPlayerState(agent);
+			ThreatPerception.Snapshot threatSnapshot = threats.sample(agentId, agent);
+			// Survival signals ride the same forced-attention rule as threat signals: a new one is delivered now.
+			Set<String> signalKeys = new HashSet<>(threatSnapshot.signalKeys());
+			for (String signal : survival.sample(agentId, agent, threatSnapshot).signals()) signalKeys.add("survival:" + signal);
+			RawPlayerState current = rawPlayerState(agent, Set.copyOf(signalKeys));
 			synchronized (lastRawStates) {
 				RawPlayerState previous = lastRawStates.put(agentId, current);
 				boolean inventoryChanged = updateInventory(agentId, agent);
@@ -430,6 +475,14 @@ public final class ServerObservationCollector {
 		}
 		synchronized (lastRawStates) {
 			lastRawStates.keySet().removeIf(agentId -> !tracked.contains(agentId));
+			threats.retain(tracked);
+			synchronized (seenStructures) {
+				SightedFeatures.retain(seenStructures, tracked);
+			}
+			synchronized (sightedSamples) {
+				SightedFeatures.retain(sightedSamples, tracked);
+			}
+			survival.retain(tracked);
 			lastInventories.keySet().removeIf(agentId -> !tracked.contains(agentId));
 		}
 		return List.copyOf(changed);
@@ -452,30 +505,35 @@ public final class ServerObservationCollector {
 		RawSpatialObservation raw = spatialCache.getOrCompute(
 			key, level.getGameTime(), () -> rawSpatialObservation(level, agent, position));
 		Vec3 eye = agent.getEyePosition();
+		// Quantized so a still agent's small head movements reuse the sight rays instead of recasting all 80.
 		LandmarkSampleKey landmarkKey = new LandmarkSampleKey(
 			agentId,
 			level.dimension().identifier().toString(),
 			position.getX(),
 			position.getY(),
 			position.getZ(),
-			eye.x,
-			eye.y,
-			eye.z,
-			agent.getYRot(),
-			agent.getXRot(),
-			agent.getY(),
+			quantize(eye.x, LANDMARK_EYE_QUANTUM),
+			quantize(eye.y, LANDMARK_EYE_QUANTUM),
+			quantize(eye.z, LANDMARK_EYE_QUANTUM),
+			(float) quantize(net.minecraft.util.Mth.wrapDegrees(agent.getYRot()), LANDMARK_VIEW_QUANTUM_DEGREES),
+			(float) quantize(agent.getXRot(), LANDMARK_VIEW_QUANTUM_DEGREES),
+			quantize(agent.getY(), LANDMARK_EYE_QUANTUM),
 			agent.isDescending(),
 			agent.getMainHandItem().getItem(),
 			worldMutationRevision(level, position, LANDMARK_SIGHT_DISTANCE + 1)
 		);
-		List<VisibleSurfaceCandidate> landmarkCandidates = landmarkCache.getOrCompute(
+		SightSample sight = landmarkCache.getOrCompute(
 			landmarkKey,
 			level.getGameTime(),
-			() -> visibleSurfaceCandidates(level, agent, position)
+			() -> sightRays(level, agent, position)
 		);
 		JsonObject value = new JsonObject();
 		value.add("blocks", blocks(level, agent, raw.blocks(), visibility));
-		value.add("landmarks", landmarks(level, agent, visibility, landmarkCandidates));
+		value.add("landmarks", landmarks(level, agent, visibility, sight.surfaces()));
+		SightedFeatures.Sample seen = sightedSample(agentId, level, agent, position, visibility, raw, sight);
+		JsonObject sighted = SightedFeatures.toJson(seen, eye, agent.getYRot(),
+				structureKey -> markStructureSeen(agentId, structureKey, level.getGameTime()));
+		if (sighted != null) value.add("sighted", sighted);
 		value.add("nearbyContainers", nearbyTransactionTargets(raw.containers(), level::getBlockState,
 				target -> level.hasChunkAt(target) && visibility.canSeeBlock(target), agent.position(),
 				target -> agent.isWithinBlockInteractionRange(target, 0.0D)));
@@ -727,13 +785,16 @@ public final class ServerObservationCollector {
 				candidates.add(new EntityCandidate(entity, agent.distanceToSqr(entity)));
 			}
 		}
+		List<Entity> heard = heardThreats(level, agent, visibility);
+		List<Entity> selected = new ArrayList<>(heard);
 		for (EntityCandidate candidate : selectNearestVisible(
 				candidates,
 				Comparator.comparingDouble(EntityCandidate::distanceSquared),
-				MAX_ENTITIES,
+				MAX_ENTITIES - heard.size(),
 				entry -> visibility.hasLineOfSight(entry.entity())
-		)) {
-			Entity entity = candidate.entity();
+		)) selected.add(candidate.entity());
+		selected.sort(Comparator.comparingDouble(agent::distanceToSqr));
+		for (Entity entity : selected) {
 					JsonObject json = new JsonObject();
 					json.addProperty("uuid", entity.getUUID().toString());
 					json.addProperty("type", BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString());
@@ -741,6 +802,7 @@ public final class ServerObservationCollector {
 					json.addProperty("distance", finite(agent.distanceTo(entity)));
 					json.add("position", vector(entity.position()));
 					ObservationDetails.entity(json, agent, entity);
+					json.addProperty("perceivedBy", heard.contains(entity) ? "sound" : "sight");
 					if (entity instanceof ServerPlayer player) {
 						json.addProperty("isPlayer", true);
 					}
@@ -752,6 +814,41 @@ public final class ServerObservationCollector {
 					values.add(json);
 		}
 		return values;
+	}
+
+	/**
+	 * Hostile mobs hunting the agent (targeting it or hurt it in the last 5 s) within 16 blocks that the view
+	 * cone or line of sight would hide, e.g. a skeleton shooting the agent's back while it mines. A player hears
+	 * these; they are reported with perceivedBy "sound". At most 8, nearest first.
+	 */
+	private static List<Entity> heardThreats(ServerLevel level, ServerPlayer agent, ObservationVisibility.Frame visibility) {
+		List<Entity> heard = new ArrayList<>();
+		for (net.minecraft.world.entity.Mob mob : level.getEntitiesOfClass(net.minecraft.world.entity.Mob.class,
+				agent.getBoundingBox().inflate(ThreatPerception.RANGE), mob -> ThreatPerception.isHostileTo(mob, agent) && mob.isAlive())) {
+			if (agent.distanceTo(mob) > ThreatPerception.RANGE) continue;
+			boolean hurtRecently = agent.getLastHurtByMob() == mob && agent.tickCount - agent.getLastHurtByMobTimestamp() <= 100;
+			if (!hearsThreat(mob.getTarget() == agent, hurtRecently, visibility.isEntityWithinView(mob) && visibility.hasLineOfSight(mob))) continue;
+			heard.add(mob);
+		}
+		heard.sort(Comparator.comparingDouble(agent::distanceToSqr));
+		return heard.size() > 8 ? List.copyOf(heard.subList(0, 8)) : heard;
+	}
+
+	/**
+	 * Whether the agent perceives this entity the way its observation does: seen (in view with line of sight), or
+	 * heard as a hostile hunting it within 16 blocks. Used to keep presentation from revealing hidden positions.
+	 */
+	public static boolean perceives(ServerPlayer agent, ObservationVisibility.Frame visibility, Entity entity) {
+		if (visibility.isEntityWithinView(entity) && visibility.hasLineOfSight(entity)) return true;
+		if (!(entity instanceof net.minecraft.world.entity.Mob mob) || !ThreatPerception.isHostileTo(mob, agent)
+				|| agent.distanceTo(mob) > ThreatPerception.RANGE) return false;
+		boolean hurtRecently = agent.getLastHurtByMob() == mob && agent.tickCount - agent.getLastHurtByMobTimestamp() <= 100;
+		return hearsThreat(mob.getTarget() == agent, hurtRecently, false);
+	}
+
+	/** A hunting hostile the agent cannot see is still perceived (by sound); a visible one is reported by sight. */
+	static boolean hearsThreat(boolean targetingAgent, boolean hurtAgentRecently, boolean visible) {
+		return !visible && (targetingAgent || hurtAgentRecently);
 	}
 
 	static <T> List<T> selectNearestVisible(
@@ -912,7 +1009,79 @@ public final class ServerObservationCollector {
 			ServerPlayer agent,
 			BlockPos center
 	) {
+		return sightRays(level, agent, center).surfaces();
+	}
+
+	/**
+	 * Sight-ray surfaces (landmarks), plus every block a ray hit and the open cell in front of it, cached per
+	 * quantized view. The structure, cave and vein rows are derived from these at most every
+	 * {@link #SIGHTED_RECOMPUTE_TICKS}.
+	 */
+	record SightSample(List<VisibleSurfaceCandidate> surfaces, List<BlockPos> hits, List<BlockPos> openings) {
+		SightSample(List<VisibleSurfaceCandidate> surfaces) {
+			this(surfaces, List.of(), List.of());
+		}
+	}
+
+	/** An agent's last sighted rows and when (and in which dimension) they were computed. */
+	record SightedMemo(String dimension, long gameTime, SightedFeatures.Sample sample) {
+	}
+
+	static double quantize(double value, double quantum) {
+		return Math.round(value / quantum) * quantum;
+	}
+
+	/** Whether the agent's sighted rows are due: none yet, another dimension, or {@link #SIGHTED_RECOMPUTE_TICKS} old. */
+	static boolean sightedDue(SightedMemo memo, String dimension, long gameTime) {
+		return memo == null || !memo.dimension().equals(dimension) || gameTime - memo.gameTime() >= SIGHTED_RECOMPUTE_TICKS
+				|| gameTime < memo.gameTime();
+	}
+
+	private SightedFeatures.Sample sightedSample(
+			AgentId agentId,
+			ServerLevel level,
+			ServerPlayer agent,
+			BlockPos center,
+			ObservationVisibility.Frame visibility,
+			RawSpatialObservation raw,
+			SightSample rays
+	) {
+		String dimension = level.dimension().identifier().toString();
+		long gameTime = level.getGameTime();
+		synchronized (sightedSamples) {
+			SightedMemo memo = sightedSamples.get(agentId);
+			if (!sightedDue(memo, dimension, gameTime)) return memo.sample();
+		}
+		List<BlockPos> seenLocalOre = new ArrayList<>();
+		int visibilityChecks = 0;
+		for (BlockObservationOrdering.Candidate candidate : raw.blocks()) {
+			if (SightedFeatures.oreFamily(candidate.blockId()) == null) continue;
+			if (visibilityChecks++ == SightedFeatures.MAX_VEIN_SEEDS * 2) break;
+			BlockPos position = center.offset(candidate.x(), candidate.y(), candidate.z());
+			if (level.hasChunkAt(position) && visibility.canSeeBlock(position)) seenLocalOre.add(position);
+		}
+		SightedFeatures.Sample sample = SightedFeatures.sample(level, agent.getEyePosition(), rays.hits(), rays.openings(),
+				seenLocalOre, visibility::canSeeBlock);
+		synchronized (sightedSamples) {
+			sightedSamples.put(agentId, new SightedMemo(dimension, gameTime, sample));
+		}
+		return sample;
+	}
+
+	private boolean markStructureSeen(AgentId agentId, String key, long gameTime) {
+		synchronized (seenStructures) {
+			return SightedFeatures.markSeen(seenStructures.computeIfAbsent(agentId, ignored -> new HashMap<>()), key, gameTime);
+		}
+	}
+
+	private static SightSample sightRays(
+			ServerLevel level,
+			ServerPlayer agent,
+			BlockPos center
+	) {
 		Map<Long, VisibleSurfaceCandidate> candidates = new HashMap<>();
+		java.util.LinkedHashSet<BlockPos> hits = new java.util.LinkedHashSet<>();
+		java.util.LinkedHashSet<BlockPos> openings = new java.util.LinkedHashSet<>();
 		Map<Long, Boolean> loadedChunks = new HashMap<>();
 		Vec3 eye = agent.getEyePosition();
 		for (int pitchOffset : SIGHT_PITCH_OFFSETS) {
@@ -933,6 +1102,8 @@ public final class ServerObservationCollector {
 				if (hit.getType() != HitResult.Type.BLOCK) continue;
 				BlockPos position = hit.getBlockPos();
 				if (!hasLoadedChunk(level, position, loadedChunks)) continue;
+				hits.add(position.immutable());
+				openings.add(position.relative(hit.getDirection()).immutable());
 				double distanceSquared = agent.distanceToSqr(
 						position.getX() + 0.5D,
 						position.getY() + 0.5D,
@@ -958,7 +1129,7 @@ public final class ServerObservationCollector {
 				.thenComparingInt(VisibleSurfaceCandidate::y)
 				.thenComparingInt(VisibleSurfaceCandidate::x)
 				.thenComparingInt(VisibleSurfaceCandidate::z));
-		return List.copyOf(ordered);
+		return new SightSample(List.copyOf(ordered), List.copyOf(hits), List.copyOf(openings));
 	}
 
 	static boolean withinLocalBlockScan(BlockPos center, BlockPos position) {
@@ -1157,7 +1328,7 @@ public final class ServerObservationCollector {
 		return value.substring(0, value.offsetByCodePoints(0, MAX_ENTITY_NAME_CODE_POINTS));
 	}
 
-	private static RawPlayerState rawPlayerState(ServerPlayer agent) {
+	private static RawPlayerState rawPlayerState(ServerPlayer agent, Set<String> threatSignals) {
 		LivingEntity attacker = agent.getLastHurtByMob();
 		return new RawPlayerState(
 				finite(agent.getHealth()),
@@ -1170,7 +1341,8 @@ public final class ServerObservationCollector {
 				agent.onGround(),
 				finite(agent.fallDistance),
 				attacker != null && attacker.isAlive() ? attacker.getUUID() : null,
-				PlayerObservationEvents.sequence(agent)
+				PlayerObservationEvents.sequence(agent),
+				threatSignals
 			);
 	}
 
@@ -1194,15 +1366,26 @@ public final class ServerObservationCollector {
 		boolean onGround,
 		double fallDistance,
 		java.util.UUID lastAttacker,
-		long perceptionSequence
+		long perceptionSequence,
+		Set<String> threatSignals
 	) {
+		RawPlayerState(double health, int foodLevel, double saturation, boolean onFire, boolean inWater, int air,
+				boolean suffocating, boolean onGround, double fallDistance, java.util.UUID lastAttacker, long perceptionSequence) {
+			this(health, foodLevel, saturation, onFire, inWater, air, suffocating, onGround, fallDistance, lastAttacker,
+					perceptionSequence, Set.of());
+		}
+
 		boolean requiresForcedAttention(RawPlayerState previous, boolean inventoryChanged) {
 			// Narrow exception: preserve menu/components, events, hazards and every other raw wake.
 			return inventoryChanged || !AttentionSignalPolicy.safeAir(air) || !AttentionSignalPolicy.safeAir(previous.air)
+					// Crossing the half-air warning must reach the model while there is still time to surface.
+					|| AttentionSignalPolicy.airBand(air) != AttentionSignalPolicy.airBand(previous.air)
 					|| health != previous.health || foodLevel != previous.foodLevel || saturation != previous.saturation
 					|| onFire != previous.onFire || inWater != previous.inWater || suffocating != previous.suffocating
 					|| onGround != previous.onGround || fallDistance != previous.fallDistance
-					|| !Objects.equals(lastAttacker, previous.lastAttacker) || perceptionSequence != previous.perceptionSequence;
+					|| !Objects.equals(lastAttacker, previous.lastAttacker) || perceptionSequence != previous.perceptionSequence
+					// A newly latched threat signal must reach the model now; a signal expiring is only a quiet refresh.
+					|| !previous.threatSignals.containsAll(threatSignals);
 		}
 	}
 

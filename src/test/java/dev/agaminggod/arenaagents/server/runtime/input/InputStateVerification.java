@@ -605,12 +605,12 @@ public final class InputStateVerification {
 				new AgentInputStates.MotorTarget(-170.0F, -20.0F, true, false, true),
 				0L
 		);
-		assertEquals(AgentInputStates.MAX_YAW_STEP_DEGREES,
+		assertEquals(20.0F * AgentInputStates.TURN_EASE,
 				Math.abs(AgentInputStates.shortestAngleDelta(initial.yaw(), turn.state().yaw())),
-				"yaw takes the shortest bounded step across wrap");
-		assertEquals(AgentInputStates.MAX_PITCH_STEP_DEGREES,
+				"yaw takes the shortest eased step across wrap");
+		assertEquals(40.0F * AgentInputStates.TURN_EASE,
 				Math.abs(initial.pitch() - turn.state().pitch()),
-				"pitch takes a bounded step");
+				"pitch takes an eased step short of its target");
 		assertTrue(turn.forward() >= 0.0F, "target-relative motor does not reverse unnecessarily");
 		assertTrue(Math.abs(turn.strafe()) > 0.0F, "target-relative motor supplies useful strafing");
 
@@ -651,7 +651,7 @@ public final class InputStateVerification {
 				6L
 		);
 		assertEquals(true, repulsed.jump(), "a released jump request can pulse again");
-		AgentInputStates.MotorState facingEast = new AgentInputStates.MotorState(-90.0F, 0.0F, 0.0F, -1.0F, false);
+		AgentInputStates.MotorState facingEast = new AgentInputStates.MotorState(-90.0F, 0.0F, 0.0F, -0.8F, false);
 		AgentInputStates.MotorStep turningSouth = AgentInputStates.stepMotor(
 				facingEast,
 				new AgentInputStates.MotorTarget(0.0F, 0.0F, true, false, false),

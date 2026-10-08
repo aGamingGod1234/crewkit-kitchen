@@ -5,6 +5,7 @@ import com.mojang.authlib.GameProfile;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.protocol.ActionType;
 import dev.agaminggod.arenaagents.server.runtime.transaction.ServerTransactionAdapter;
+import dev.agaminggod.arenaagents.server.runtime.menu.AgentInventoryView;
 import dev.agaminggod.arenaagents.server.runtime.menu.MenuInspection;
 import dev.agaminggod.arenaagents.server.runtime.menu.MenuStackIdentity;
 import java.lang.reflect.Field;
@@ -87,26 +88,171 @@ public final class AdvancedInteractionRollbackVerification {
 			verifyPartialMenuInput(components);
 			verifyNativeCraftTransaction(components);
 			verifyNativePickaxeTransaction(components);
+			verifyCraftDeath(components);
+			verifyHorizontalFacingPlacement(components);
+			verifyPacedFurnaceTransaction(components);
+			verifyPacedToolSelection(components);
+			verifyCraftPickupDuringPacing(components);
+			verifyCraftFailureWithFullInventory(components);
+			verifyExternallyClosedCraftMenu(components);
 			if (failure != null) throw failure;
 		}
-		return 76;
+		return 151;
+	}
+
+	/** Tick a table pickaxe craft until both planks cells are filled and one plank is still on the cursor. */
+	private static ServerTransactionAdapter.ActiveTransaction halfFilledPickaxe(ComponentBindings components, Fixture fixture) {
+		fixture.inventory().setItem(0, components.stack(Items.OAK_PLANKS, 3, 0));
+		fixture.inventory().setItem(1, components.stack(Items.STICK, 2, 0));
+		var args = json("recipeId", "minecraft:wooden_pickaxe", "count", 1, "timeoutMs", 5000, "x", 0, "y", 64, "z", 0);
+		var transaction = service().begin(fixture.player(), request(ActionType.CRAFT_TABLE, args), args);
+		for (int tick = 0; tick < 200; tick++) {
+			transaction.tick(System.currentTimeMillis());
+			if (fixture.player().containerMenu instanceof net.minecraft.world.inventory.CraftingMenu crafting
+					&& crafting.getInputGridSlots().stream().filter(Slot::hasItem).count() == 2) {
+				return transaction;
+			}
+		}
+		throw new AssertionError("pickaxe craft never reached a half-filled grid");
+	}
+
+	private static void verifyCraftDeath(ComponentBindings components) {
+		components.stack(Items.STICK, 1, 0);
+		components.stack(Items.WOODEN_PICKAXE, 1, 59);
+		// Death mid-fill: the inventory already dropped as death loot, so the grid and cursor drop at the body.
+		Fixture dying = craftFixture();
+		var transaction = halfFilledPickaxe(components, dying);
+		var menu = dying.player().containerMenu;
+		assertEquals(1, menu.getCarried().getCount(), "one plank is on the cursor when the agent dies");
+		dying.inventory().clearContent();
+		dying.player().dead = true;
+		dying.player().recordDrops = true;
+		var died = tickToEnd(dying, transaction).result();
+		assertEquals("AGENT_DEAD", died.reasonCode(), "death fails an uncommitted craft");
+		transaction.cleanup();
+		int droppedPlanks = dying.player().dropped.stream().filter(stack -> stack.is(Items.OAK_PLANKS)).mapToInt(ItemStack::getCount).sum();
+		assertEquals(3, droppedPlanks, "grid and cursor planks drop at the body instead of vanishing");
+		assertEquals(0, count(dying, Items.OAK_PLANKS), "nothing is put back into the dead player's inventory");
+		assertTrue(menu.getCarried().isEmpty(), "dead agent's cursor is cleared");
+		assertTrue(((net.minecraft.world.inventory.CraftingMenu) menu).getInputGridSlots().stream().noneMatch(Slot::hasItem), "dead agent's grid is cleared");
+
+		// Death after the result was taken: the craft really happened and is reported as a success.
+		Fixture late = craftFixture();
+		var committed = halfFilledPickaxe(components, late);
+		for (int tick = 0; tick < 200 && count(late, Items.WOODEN_PICKAXE) == 0; tick++) {
+			assertEquals(ServerTransactionAdapter.TickState.RUNNING, committed.tick(System.currentTimeMillis()).state(), "craft runs until commit");
+		}
+		assertEquals(1, count(late, Items.WOODEN_PICKAXE), "pickaxe committed before the menu closes");
+		late.player().dead = true;
+		var settled = committed.tick(System.currentTimeMillis());
+		assertEquals("CRAFT_CONFIRMED", settled.reasonCode(), "death while the menu closes keeps the committed success");
+		committed.cleanup();
+
+		// Cancel during the linger after the take: the pickaxe exists, so the craft reports success, not a cancel.
+		Fixture lingering = craftFixture();
+		var cancelled = halfFilledPickaxe(components, lingering);
+		for (int tick = 0; tick < 200 && count(lingering, Items.WOODEN_PICKAXE) == 0; tick++) cancelled.tick(System.currentTimeMillis());
+		assertEquals("CRAFT_CONFIRMED", cancelled.committedResult().reasonCode(), "the lingering craft exposes its committed result");
+		cancelled.cancel("operator stop");
+		var reported = cancelled.tick(System.currentTimeMillis());
+		assertEquals(ServerTransactionAdapter.TickState.SUCCEEDED, reported.state(), "a cancel in the linger reports the craft that happened");
+		assertEquals(1, count(lingering, Items.WOODEN_PICKAXE), "and the pickaxe is kept");
+	}
+
+	/**
+	 * Directional placement used to write the facing yaw in the placing tick (a north piston from a view facing
+	 * north snapped the camera 170 degrees). Now the needed look is found by same-tick prediction (rotation
+	 * restored), reached through the same eased steps and AimGate as every other aim, and eased back afterwards.
+	 */
+	private static void verifyHorizontalFacingPlacement(ComponentBindings components) {
+		Fixture fixture = craftFixture();
+		ItemStack piston = components.stack(Items.PISTON, 1, 0);
+		// Floor placement next to the agent: the aim at the support's top face pitches the view well down.
+		var hit = new net.minecraft.world.phys.BlockHitResult(new net.minecraft.world.phys.Vec3(0.5D, 63.999D, 0.5D),
+				net.minecraft.core.Direction.UP, new net.minecraft.core.BlockPos(0, 63, 0), false);
+		var north = DesiredBlockState.parse("minecraft:piston[facing=north]", "minecraft:piston");
+		fixture.player().setYRot(170.0F);
+		fixture.player().setXRot(58.0F);
+		var faceAim = new ServerActionExecutor.Look(-135.0F, 66.0F);
+		var look = ServerActionExecutor.requiredPlacementLook(fixture.player(), (net.minecraft.world.item.BlockItem) Items.PISTON,
+				piston, hit, north, faceAim);
+		assertEquals(170.0F, fixture.player().getYRot(), "choosing the look leaves the yaw untouched");
+		assertEquals(58.0F, fixture.player().getXRot(), "choosing the look leaves the pitch untouched");
+		assertTrue(look != null && Math.abs(look.pitch()) <= ServerActionExecutor.PLACEMENT_LEVEL_PITCH_DEGREES,
+				"horizontal facings are placed from a leveled view, was " + look);
+		assertTrue(ServerActionExecutor.placementMatchesAt(fixture.player(), (net.minecraft.world.item.BlockItem) Items.PISTON,
+				piston, hit, north, look), "vanilla places a north piston from the chosen look");
+		assertTrue(Math.abs(net.minecraft.util.Mth.wrapDegrees(look.yaw())) <= ServerActionExecutor.PLACEMENT_LOOK_OFFSET_DEGREES,
+				"the chosen yaw stays as close to the face aim as the facing allows, was " + look.yaw());
+
+		// The executor's aim phase: eased steps through AimGate, an exact final step, then easing back to the face aim.
+		float yaw = fixture.player().getYRot();
+		float pitch = fixture.player().getXRot();
+		float maxStep = 0.0F;
+		AimGate gate = new AimGate();
+		AimGate.State state = AimGate.State.AIMING;
+		for (int tick = 0; tick < AimGate.MAX_TICKS && state == AimGate.State.AIMING; tick++) {
+			float nextYaw = dev.agaminggod.arenaagents.server.runtime.input.AgentInputStates.turnYaw(yaw, look.yaw());
+			float nextPitch = dev.agaminggod.arenaagents.server.runtime.input.AgentInputStates.turnPitch(pitch, look.pitch());
+			maxStep = Math.max(maxStep, Math.max(Math.abs(net.minecraft.util.Mth.wrapDegrees(nextYaw - yaw)), Math.abs(nextPitch - pitch)));
+			yaw = nextYaw;
+			pitch = nextPitch;
+			state = gate.observe(yaw, pitch, look.yaw(), look.pitch());
+		}
+		assertEquals(AimGate.State.READY, state, "the view settles on the placement look");
+		float finalStep = Math.abs(net.minecraft.util.Mth.wrapDegrees(look.yaw() - yaw)) + Math.abs(look.pitch() - pitch);
+		assertTrue(finalStep <= 2.0F * AimGate.TOLERANCE_DEGREES, "the exact final step is within the gate tolerance");
+		yaw = look.yaw();
+		pitch = look.pitch();
+		for (int tick = 0; tick < 40 && (yaw != faceAim.yaw() || pitch != faceAim.pitch()); tick++) {
+			float nextYaw = dev.agaminggod.arenaagents.server.runtime.input.AgentInputStates.turnYaw(yaw, faceAim.yaw());
+			float nextPitch = dev.agaminggod.arenaagents.server.runtime.input.AgentInputStates.turnPitch(pitch, faceAim.pitch());
+			maxStep = Math.max(maxStep, Math.max(Math.abs(net.minecraft.util.Mth.wrapDegrees(nextYaw - yaw)), Math.abs(nextPitch - pitch)));
+			yaw = nextYaw;
+			pitch = nextPitch;
+		}
+		assertTrue(Math.abs(net.minecraft.util.Mth.wrapDegrees(yaw - faceAim.yaw())) < 0.01F && pitch == faceAim.pitch(),
+				"after placing, the view eases back onto the support face");
+		assertTrue(maxStep <= dev.agaminggod.arenaagents.server.runtime.input.AgentInputStates.MAX_TURN_STEP_DEGREES,
+				"no tick of the placement turns faster than the player flick limit, max " + maxStep
+						+ " (the old in-tick write jumped " + Math.abs(net.minecraft.util.Mth.wrapDegrees(170.0F - 0.0F)) + ")");
+
+		boolean rejected = false;
+		try {
+			ServerActionExecutor.requiredPlacementLook(fixture.player(), (net.minecraft.world.item.BlockItem) Items.PISTON,
+					piston, hit, DesiredBlockState.parse("minecraft:piston[facing=north,extended=true]", "minecraft:piston"), faceAim);
+		} catch (dev.agaminggod.arenaagents.agent.AgentDomainException expected) {
+			rejected = "PLACEMENT_STATE_MISMATCH".equals(expected.code());
+		}
+		assertTrue(rejected, "an impossible state is still rejected as PLACEMENT_STATE_MISMATCH");
+		assertEquals(170.0F, fixture.player().getYRot(), "a rejected state leaves the yaw untouched");
+		assertEquals(58.0F, fixture.player().getXRot(), "a rejected state leaves the pitch untouched");
 	}
 
 	private static void verifyNativeCraftTransaction(ComponentBindings components) {
-		// Real RecipeManager, InventoryMenu, placement and quickMoveStack; only player/world effects are fixtures.
+		// Real RecipeManager, InventoryMenu, vanilla slot clicks and quickMoveStack; only player/world effects are fixtures.
 		components.stack(Items.OAK_PLANKS, 1, 0);
 		Fixture fixture = craftFixture();
 		fixture.inventory().setItem(0, components.stack(Items.OAK_LOG, 2, 0));
 		var args = json("recipeId", "minecraft:oak_planks", "count", 4, "timeoutMs", 5000);
 		var transaction = service().begin(fixture.player(), request(ActionType.CRAFT_INVENTORY, args), args);
-		var result = transaction.tick(System.currentTimeMillis());
-		assertEquals("CRAFT_CONFIRMED", result.reasonCode(), "native log recipe reaches commit: " + result.message());
+		var first = transaction.tick(System.currentTimeMillis());
+		assertEquals(ServerTransactionAdapter.TickState.RUNNING, first.state(), "inventory craft opens its screen before clicking");
+		assertTrue(AgentInventoryView.isOpen(fixture.player()), "agent inventory screen is mirrored while crafting");
+		assertEquals(0, count(fixture, Items.OAK_PLANKS), "no output appears on the opening tick");
+		assertEquals(2, count(fixture, Items.OAK_LOG), "planning dry run leaves the inventory untouched");
+		CraftTrace trace = tickToEnd(fixture, transaction);
+		assertEquals("CRAFT_CONFIRMED", trace.result().reasonCode(), "native log recipe reaches commit: " + trace.result().message());
+		assertTrue(trace.maxCarried() > 0, "the log is carried on the cursor between slots");
+		assertEquals(1, trace.maxFilledCells(), "the 2x2 grid visibly holds the log before the result is taken");
+		assertTrue(trace.ticks() >= 8, "inventory craft is paced over several ticks, was " + trace.ticks());
 		transaction.cleanup();
+		assertTrue(!AgentInventoryView.isOpen(fixture.player()), "inventory screen closes after crafting");
 		assertEquals(1, count(fixture, Items.OAK_LOG), "one native craft consumes one log");
 		assertEquals(4, count(fixture, Items.OAK_PLANKS), "one native craft owns four planks");
 		assertTrue(fixture.player().inventoryMenu.getInputGridSlots().stream().allMatch(slot -> !slot.hasItem()), "native grid cleaned");
 		assertTrue(fixture.player().inventoryMenu.getCarried().isEmpty(), "native cursor cleaned");
-		assertEquals(result, transaction.tick(System.currentTimeMillis()), "terminal craft retry is stable");
+		assertEquals(trace.result(), transaction.tick(System.currentTimeMillis()), "terminal craft retry is stable");
 		transaction.cleanup();
 		assertEquals(4, count(fixture, Items.OAK_PLANKS), "terminal retry and cleanup cannot duplicate output");
 
@@ -121,7 +267,7 @@ public final class AdvancedInteractionRollbackVerification {
 					throw new IllegalStateException("owned postcommit craft fault");
 				});
 		var fault = faulting.begin(failed.player(), request(ActionType.CRAFT_INVENTORY, args), args);
-		var rejected = fault.tick(System.currentTimeMillis());
+		var rejected = tickToEnd(failed, fault).result();
 		assertEquals("CRAFT_POSTCOMMIT_EXCEPTION", rejected.reasonCode(), "postcommit exception restores native transaction: " + rejected.message());
 		fault.cleanup();
 		assertEquals(2, count(failed, Items.OAK_LOG), "postcommit rollback restores original logs");
@@ -129,10 +275,18 @@ public final class AdvancedInteractionRollbackVerification {
 		assertEquals(rejected, fault.tick(System.currentTimeMillis()), "failed terminal retry is stable");
 		assertEquals(1, commits[0], "failed transaction cannot recommit");
 		var retry = service().begin(failed.player(), request(ActionType.CRAFT_INVENTORY, args), args);
-		assertEquals("CRAFT_CONFIRMED", retry.tick(System.currentTimeMillis()).reasonCode(), "new craft succeeds after rollback");
+		assertEquals("CRAFT_CONFIRMED", tickToEnd(failed, retry).result().reasonCode(), "new craft succeeds after rollback");
 		retry.cleanup();
 		assertEquals(1, count(failed, Items.OAK_LOG), "retry consumes only one original log");
 		assertEquals(4, count(failed, Items.OAK_PLANKS), "retry produces only one native result");
+
+		Fixture missing = craftFixture();
+		var noLogs = service().begin(missing.player(), request(ActionType.CRAFT_INVENTORY, args), args);
+		var unavailable = tickToEnd(missing, noLogs).result();
+		assertEquals(ServerTransactionAdapter.TickState.FAILED, unavailable.state(), "craft without ingredients fails honestly");
+		assertEquals("RECIPE_INPUTS_UNAVAILABLE", unavailable.reasonCode(), "missing ingredients are named: " + unavailable.message());
+		noLogs.cleanup();
+		assertTrue(!AgentInventoryView.isOpen(missing.player()), "failed craft closes the inventory screen");
 	}
 
 	private static int count(Fixture fixture, Item item) {
@@ -144,6 +298,26 @@ public final class AdvancedInteractionRollbackVerification {
 		return count;
 	}
 
+	private record CraftTrace(ServerTransactionAdapter.TickResult result, int ticks, int maxCarried, int maxFilledCells) {
+	}
+
+	/** Ticks a paced craft like the server does, recording what a spectator of the open menu would see. */
+	private static CraftTrace tickToEnd(Fixture fixture, ServerTransactionAdapter.ActiveTransaction transaction) {
+		int maxCarried = 0;
+		int maxFilled = 0;
+		for (int tick = 1; tick <= 200; tick++) {
+			var result = transaction.tick(System.currentTimeMillis());
+			var menu = fixture.player().containerMenu;
+			maxCarried = Math.max(maxCarried, menu.getCarried().getCount());
+			if (menu instanceof net.minecraft.world.inventory.AbstractCraftingMenu crafting) {
+				int filled = (int) crafting.getInputGridSlots().stream().filter(Slot::hasItem).count();
+				maxFilled = Math.max(maxFilled, filled);
+			}
+			if (result.terminal()) return new CraftTrace(result, tick, maxCarried, maxFilled);
+		}
+		throw new AssertionError("craft transaction did not finish within 200 ticks");
+	}
+
 	private static void verifyNativePickaxeTransaction(ComponentBindings components) {
 		components.stack(Items.STICK, 1, 0);
 		components.stack(Items.WOODEN_PICKAXE, 1, 59);
@@ -152,9 +326,16 @@ public final class AdvancedInteractionRollbackVerification {
 		fixture.inventory().setItem(1, components.stack(Items.STICK, 2, 0));
 		var args = json("recipeId", "minecraft:wooden_pickaxe", "count", 1, "timeoutMs", 5000, "x", 0, "y", 64, "z", 0);
 		var transaction = service().begin(fixture.player(), request(ActionType.CRAFT_TABLE, args), args);
-		var result = transaction.tick(System.currentTimeMillis());
-		assertEquals("CRAFT_CONFIRMED", result.reasonCode(), "native pickaxe table recipe commits: " + result.message());
+		assertEquals(ServerTransactionAdapter.TickState.RUNNING, transaction.tick(System.currentTimeMillis()).state(),
+				"table craft opens the table before clicking");
 		assertEquals(net.minecraft.world.inventory.CraftingMenu.class, fixture.player().containerMenu.getClass(), "native crafting table menu used");
+		assertEquals(1, fixture.player().swings, "opening the table swings the arm");
+		assertEquals(0, count(fixture, Items.WOODEN_PICKAXE), "no pickaxe on the opening tick");
+		CraftTrace trace = tickToEnd(fixture, transaction);
+		assertEquals("CRAFT_CONFIRMED", trace.result().reasonCode(), "native pickaxe table recipe commits: " + trace.result().message());
+		assertEquals(5, trace.maxFilledCells(), "all five pickaxe cells are visibly filled before the result is taken");
+		assertEquals(3, trace.maxCarried(), "the plank stack is carried while it is dealt into the grid");
+		assertTrue(trace.ticks() >= 20 && trace.ticks() <= 40, "table craft is watchable but quick, took " + trace.ticks() + " ticks");
 		transaction.cleanup();
 		assertEquals(0, count(fixture, Items.OAK_PLANKS), "pickaxe consumes three planks");
 		assertEquals(0, count(fixture, Items.STICK), "pickaxe consumes two sticks");
@@ -162,6 +343,30 @@ public final class AdvancedInteractionRollbackVerification {
 		assertTrue(fixture.player().containerMenu == fixture.player().inventoryMenu, "table menu cleanup returns to inventory");
 		transaction.cleanup(); transaction.tick(System.currentTimeMillis());
 		assertEquals(1, count(fixture, Items.WOODEN_PICKAXE), "table terminal retries cannot duplicate pickaxe");
+
+		// The menu closing halfway must not strand ingredients in the grid or on the cursor.
+		Fixture interrupted = craftFixture();
+		interrupted.inventory().setItem(0, components.stack(Items.OAK_PLANKS, 3, 0));
+		interrupted.inventory().setItem(1, components.stack(Items.STICK, 2, 0));
+		var halfway = service().begin(interrupted.player(), request(ActionType.CRAFT_TABLE, args), args);
+		var table = (net.minecraft.world.inventory.CraftingMenu) null;
+		for (int tick = 0; tick < 200; tick++) {
+			assertEquals(ServerTransactionAdapter.TickState.RUNNING, halfway.tick(System.currentTimeMillis()).state(), "craft still running");
+			if (interrupted.player().containerMenu instanceof net.minecraft.world.inventory.CraftingMenu crafting
+					&& crafting.getInputGridSlots().stream().filter(Slot::hasItem).count() == 2) {
+				table = crafting;
+				break;
+			}
+		}
+		assertTrue(table != null && !table.getCarried().isEmpty(), "interrupted while planks are in the grid and on the cursor");
+		interrupted.player().closeContainer();
+		var closed = tickToEnd(interrupted, halfway).result();
+		halfway.cleanup();
+		assertEquals("MENU_CLOSED", closed.reasonCode(), "closing the menu fails the craft: " + closed.message());
+		assertTrue(closed.message().contains("ownership was restored"), "failure reports restored ownership: " + closed.message());
+		assertEquals(3, count(interrupted, Items.OAK_PLANKS), "planks return to the inventory");
+		assertEquals(2, count(interrupted, Items.STICK), "sticks stay in the inventory");
+		assertEquals(0, count(interrupted, Items.WOODEN_PICKAXE), "no partial craft output");
 	}
 
 	private static Fixture craftFixture() {
@@ -211,6 +416,10 @@ public final class AdvancedInteractionRollbackVerification {
 		private FixtureGameMode(ServerPlayer player) { super(player); }
 		@Override public net.minecraft.world.InteractionResult useItemOn(ServerPlayer player, net.minecraft.world.level.Level level,
 				ItemStack stack, net.minecraft.world.InteractionHand hand, net.minecraft.world.phys.BlockHitResult hit) {
+			if (player instanceof FaultingServerPlayer fixture && fixture.furnace) {
+				player.containerMenu = new net.minecraft.world.inventory.FurnaceMenu(2, player.getInventory());
+				return net.minecraft.world.InteractionResult.SUCCESS;
+			}
 			player.containerMenu = new net.minecraft.world.inventory.CraftingMenu(1, player.getInventory(),
 					net.minecraft.world.inventory.ContainerLevelAccess.create(level, hit.getBlockPos()));
 			return net.minecraft.world.InteractionResult.SUCCESS;
@@ -408,7 +617,7 @@ public final class AdvancedInteractionRollbackVerification {
 		);
 		ServerActionRequest request = request(ActionType.SELECT_TOOL, arguments);
 		ServerTransactionAdapter.ActiveTransaction transaction = service().begin(fixture.player(), request, arguments);
-		ServerTransactionAdapter.TickResult result = transaction.tick(System.currentTimeMillis());
+		ServerTransactionAdapter.TickResult result = tickUntilTerminal(transaction);
 
 		assertEquals(ServerTransactionAdapter.TickState.FAILED, result.state(), "selection verification fails");
 		assertEquals("SELECTION_NOT_CONFIRMED", result.reasonCode(), "selection failure reason is preserved");
@@ -416,6 +625,201 @@ public final class AdvancedInteractionRollbackVerification {
 				"failed selection restores the source tool");
 		assertTrue(fixture.inventory().getItem(0).isEmpty(), "failed selection clears the destination hotbar slot");
 		assertEquals(2, fixture.inventory().getSelectedSlot(), "failed selection restores the previous selected slot");
+	}
+
+	private static ServerTransactionAdapter.TickResult tickUntilTerminal(ServerTransactionAdapter.ActiveTransaction transaction) {
+		for (int tick = 0; tick < 200; tick++) {
+			ServerTransactionAdapter.TickResult result = transaction.tick(System.currentTimeMillis());
+			if (result.terminal()) return result;
+		}
+		throw new AssertionError("transaction did not finish within 200 ticks");
+	}
+
+	/**
+	 * Real vanilla FurnaceMenu: the play-test furnace_transaction opened the menu, moved the stack and closed it in
+	 * one tick, so spectators saw items appear in the furnace with no screen. Now the screen is shown, the stack
+	 * moves while it is open, and the screen stays a moment before closing.
+	 */
+	private static void verifyPacedFurnaceTransaction(ComponentBindings components) {
+		Fixture fixture = craftFixture();
+		fixture.player().furnace = true;
+		fixture.inventory().setItem(0, components.stack(Items.RAW_IRON, 4, 0));
+		var args = json("x", 0, "y", 64, "z", 0, "operation", "insert_input", "inventorySlot", 0,
+				"count", 4, "expectedItemId", "minecraft:raw_iron", "timeoutMs", 5000);
+		var transaction = service().begin(fixture.player(), request(ActionType.FURNACE_TRANSACTION, args), args);
+		assertEquals(ServerTransactionAdapter.TickState.RUNNING, transaction.tick(System.currentTimeMillis()).state(),
+				"the furnace opens on the first tick without finishing");
+		assertTrue(fixture.player().containerMenu instanceof net.minecraft.world.inventory.FurnaceMenu,
+				"the real vanilla furnace menu is the open screen");
+		var furnace = fixture.player().containerMenu;
+		assertEquals(1, fixture.player().swings, "opening the furnace swings the arm");
+		assertTrue(!furnace.getSlot(0).hasItem(), "nothing moves on the opening tick");
+		int ticks = 1;
+		int openTicksBeforeMove = 1;
+		int openTicksAfterMove = 0;
+		ServerTransactionAdapter.TickResult result;
+		do {
+			result = transaction.tick(System.currentTimeMillis());
+			ticks++;
+			boolean open = fixture.player().containerMenu == furnace;
+			if (!result.terminal()) assertTrue(open, "the furnace stays open while the move is shown");
+			if (open && !furnace.getSlot(0).hasItem()) openTicksBeforeMove++;
+			if (open && furnace.getSlot(0).hasItem() && !result.terminal()) openTicksAfterMove++;
+		} while (!result.terminal() && ticks < 200);
+		assertEquals("TRANSACTION_CONFIRMED", result.reasonCode(), "the paced furnace move succeeds: " + result.message());
+		assertTrue(openTicksBeforeMove >= 3, "the empty furnace screen is shown before the move for " + openTicksBeforeMove + " ticks");
+		assertTrue(openTicksAfterMove >= 2, "the filled furnace screen is shown after the move for " + openTicksAfterMove + " ticks");
+		assertTrue(ticks >= 6 && ticks <= 12, "the furnace move is watchable but quick, took " + ticks + " ticks");
+		assertEquals(4, furnace.getSlot(0).getItem().getCount(), "all four raw iron are in the input slot");
+		transaction.cleanup();
+		assertTrue(fixture.player().containerMenu == fixture.player().inventoryMenu, "cleanup closes the furnace");
+		assertEquals(0, count(fixture, Items.RAW_IRON), "the raw iron left the inventory exactly once");
+		assertEquals(result, transaction.tick(System.currentTimeMillis()), "terminal furnace retry is stable");
+
+		Fixture interrupted = craftFixture();
+		interrupted.player().furnace = true;
+		interrupted.inventory().setItem(0, components.stack(Items.RAW_IRON, 4, 0));
+		var closing = service().begin(interrupted.player(), request(ActionType.FURNACE_TRANSACTION, args), args);
+		closing.tick(System.currentTimeMillis());
+		interrupted.player().closeContainer();
+		var closed = tickUntilTerminal(closing);
+		closing.cleanup();
+		assertEquals("MENU_CLOSED", closed.reasonCode(), "a furnace closed before the move fails without moving");
+		assertEquals(4, count(interrupted, Items.RAW_IRON), "the raw iron stays in the inventory");
+	}
+
+	/** select_tool moving a tool from the main inventory shows the inventory screen around the move. */
+	private static void verifyPacedToolSelection(ComponentBindings components) {
+		Fixture fixture = withPlayerHand(fixture());
+		fixture.inventory().setItem(9, components.stack(Items.IRON_PICKAXE, 1, 250));
+		JsonObject arguments = json("sourceSlot", 9, "hotbarSlot", 0,
+				"expectedItemId", "minecraft:iron_pickaxe", "minRemainingDurability", 1);
+		var transaction = service().begin(fixture.player(), request(ActionType.SELECT_TOOL, arguments), arguments);
+		assertEquals(ServerTransactionAdapter.TickState.RUNNING, transaction.tick(System.currentTimeMillis()).state(),
+				"the inventory opens before the tool moves");
+		assertTrue(AgentInventoryView.isOpen(fixture.player()), "spectators see the inventory screen");
+		assertTrue(fixture.inventory().getItem(0).isEmpty(), "the tool is not in the hand on the opening tick");
+		boolean movedWhileOpen = false;
+		ServerTransactionAdapter.TickResult result;
+		int ticks = 1;
+		do {
+			result = transaction.tick(System.currentTimeMillis());
+			ticks++;
+			if (!result.terminal() && !fixture.inventory().getItem(0).isEmpty()) {
+				movedWhileOpen |= AgentInventoryView.isOpen(fixture.player());
+			}
+		} while (!result.terminal() && ticks < 200);
+		assertEquals("TOOL_SELECTED", result.reasonCode(), "the paced tool selection succeeds: " + result.message());
+		assertTrue(movedWhileOpen, "the pickaxe moves to the hotbar while the inventory screen is shown");
+		assertTrue(ticks >= 6, "the move is paced over " + ticks + " ticks");
+		transaction.cleanup();
+		assertTrue(!AgentInventoryView.isOpen(fixture.player()), "the inventory screen closes after the move");
+		assertEquals("minecraft:iron_pickaxe", itemId(fixture.inventory().getItem(0)), "the pickaxe is in hotbar slot 0");
+		assertEquals(0, fixture.inventory().getSelectedSlot(), "and it is selected");
+
+		Fixture onHotbar = withPlayerHand(fixture());
+		onHotbar.inventory().setItem(2, components.stack(Items.IRON_PICKAXE, 1, 250));
+		JsonObject select = json("sourceSlot", 2, "hotbarSlot", 2,
+				"expectedItemId", "minecraft:iron_pickaxe", "minRemainingDurability", 1);
+		var keyPress = service().begin(onHotbar.player(), request(ActionType.SELECT_TOOL, select), select);
+		assertEquals("TOOL_SELECTED", keyPress.tick(System.currentTimeMillis()).reasonCode(),
+				"a tool already on the hotbar is one number key, no screen");
+		assertTrue(!AgentInventoryView.isOpen(onHotbar.player()), "no inventory screen for a number key");
+		keyPress.cleanup();
+	}
+
+	/** Real player equipment, whose main hand is the selected hotbar slot (the plain fixture keeps it separate). */
+	private static Fixture withPlayerHand(Fixture fixture) {
+		try {
+			Field unsafeField = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+			unsafeField.setAccessible(true);
+			setField((sun.misc.Unsafe) unsafeField.get(null), fixture.player(), LivingEntity.class, "equipment",
+					new net.minecraft.world.entity.player.PlayerEquipment(fixture.player()));
+			return fixture;
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError(exception);
+		}
+	}
+
+	/** Starts a table pickaxe craft with five planks and ticks until the plank stack is on the cursor. */
+	private static ServerTransactionAdapter.ActiveTransaction pickaxeWithPlanksCarried(ComponentBindings components, Fixture fixture) {
+		fixture.inventory().setItem(0, components.stack(Items.OAK_PLANKS, 5, 0));
+		fixture.inventory().setItem(1, components.stack(Items.STICK, 2, 0));
+		var args = json("recipeId", "minecraft:wooden_pickaxe", "count", 1, "timeoutMs", 5000, "x", 0, "y", 64, "z", 0);
+		var transaction = service().begin(fixture.player(), request(ActionType.CRAFT_TABLE, args), args);
+		for (int tick = 0; tick < 200; tick++) {
+			assertEquals(ServerTransactionAdapter.TickState.RUNNING, transaction.tick(System.currentTimeMillis()).state(), "craft running");
+			if (fixture.player().containerMenu instanceof net.minecraft.world.inventory.CraftingMenu crafting
+					&& crafting.getCarried().is(Items.OAK_PLANKS) && fixture.inventory().getItem(0).isEmpty()) {
+				return transaction;
+			}
+		}
+		throw new AssertionError("the plank stack was never carried");
+	}
+
+	/**
+	 * Play-test ROLLBACK_FAILED ("the leftover ingredient could not be put back"): the agent had just mined, and a
+	 * drop it walked over landed in the slot the ingredient stack had been lifted from. Putting the rest back into
+	 * that slot swapped stacks, and the ownership check then counted the pickup as a rollback failure.
+	 */
+	private static void verifyCraftPickupDuringPacing(ComponentBindings components) {
+		components.stack(Items.STICK, 1, 0);
+		components.stack(Items.WOODEN_PICKAXE, 1, 59);
+		Fixture fixture = craftFixture();
+		var transaction = pickaxeWithPlanksCarried(components, fixture);
+		fixture.inventory().add(components.stack(Items.COBBLESTONE, 3, 0));
+		assertEquals("minecraft:cobblestone", itemId(fixture.inventory().getItem(0)),
+				"the pickup lands in the slot the planks were lifted from");
+		var result = tickToEnd(fixture, transaction).result();
+		transaction.cleanup();
+		assertEquals("CRAFT_CONFIRMED", result.reasonCode(), "a pickup during the craft no longer fails it: " + result.message());
+		assertEquals(1, count(fixture, Items.WOODEN_PICKAXE), "the pickaxe is crafted");
+		assertEquals(2, count(fixture, Items.OAK_PLANKS), "the two leftover planks went back to another slot");
+		assertEquals(3, count(fixture, Items.COBBLESTONE), "the picked-up cobblestone is kept");
+		assertTrue(fixture.player().containerMenu.getCarried().isEmpty(), "nothing is left on the cursor");
+	}
+
+	/**
+	 * Review finding: when someone else closed the table menu, vanilla dropped the grid and cursor planks at the body
+	 * (full inventory), the craft absorbed that loss as an external change, and MENU_CLOSED then claimed the exact
+	 * ownership was restored. The loss is now reported as dropped at the body.
+	 */
+	private static void verifyExternallyClosedCraftMenu(ComponentBindings components) {
+		components.stack(Items.DIRT, 1, 0);
+		Fixture fixture = craftFixture();
+		fixture.player().recordDrops = true;
+		var transaction = halfFilledPickaxe(components, fixture);
+		for (int slot = 0; slot < 36; slot++) {
+			if (fixture.inventory().getItem(slot).isEmpty()) fixture.inventory().setItem(slot, components.stack(Items.DIRT, 64, 0));
+		}
+		fixture.player().closeContainer();
+		var result = tickToEnd(fixture, transaction).result();
+		transaction.cleanup();
+		assertEquals("MENU_CLOSED", result.reasonCode(), "the external close fails the craft: " + result.message());
+		assertTrue(!result.message().contains("was restored"), "it never claims a restore that did not happen: " + result.message());
+		assertTrue(result.message().contains("3 dropped at the body"), "the dropped planks are reported: " + result.message());
+	}
+
+	/** A failure with a full inventory returns what fits and drops the rest at the body, like vanilla closing a menu. */
+	private static void verifyCraftFailureWithFullInventory(ComponentBindings components) {
+		components.stack(Items.DIRT, 1, 0);
+		Fixture fixture = craftFixture();
+		fixture.player().recordDrops = true;
+		var transaction = pickaxeWithPlanksCarried(components, fixture);
+		fixture.inventory().setItem(1, ItemStack.EMPTY);
+		for (int slot = 0; slot < 36; slot++) {
+			if (fixture.inventory().getItem(slot).isEmpty()) fixture.inventory().setItem(slot, components.stack(Items.DIRT, 64, 0));
+		}
+		var result = tickToEnd(fixture, transaction).result();
+		transaction.cleanup();
+		assertEquals("RECIPE_INPUTS_UNAVAILABLE", result.reasonCode(), "the vanished sticks fail the craft honestly: " + result.message());
+		assertTrue(result.message().contains("dropped at the body"), "the drop is reported: " + result.message());
+		int dropped = fixture.player().dropped == null ? 0
+				: fixture.player().dropped.stream().filter(stack -> stack.is(Items.OAK_PLANKS)).mapToInt(ItemStack::getCount).sum();
+		assertEquals(5, dropped + count(fixture, Items.OAK_PLANKS), "every plank is in the inventory or dropped at the body");
+		assertEquals(5, dropped, "with no room, all five planks drop at the body");
+		assertTrue(fixture.player().containerMenu == fixture.player().inventoryMenu, "the table menu is closed");
+		assertTrue(fixture.player().inventoryMenu.getCarried().isEmpty(), "the cursor is empty");
 	}
 
 	private static void verifyDropExceptionRollback(ComponentBindings components) {
@@ -543,6 +947,12 @@ public final class AdvancedInteractionRollbackVerification {
 		private MenuFixtureLevel fixtureLevel;
 		private boolean failMainHandVerification;
 		private boolean throwOnDrop;
+		private int swings;
+		private boolean dead;
+		private boolean recordDrops;
+		/** The fixture block opens a vanilla furnace menu instead of a crafting table. */
+		private boolean furnace;
+		private java.util.List<ItemStack> dropped; // allocated lazily: fixtures skip constructors
 
 		private FaultingServerPlayer(
 				MinecraftServer server,
@@ -555,7 +965,7 @@ public final class AdvancedInteractionRollbackVerification {
 
 		@Override
 		public boolean isAlive() {
-			return true;
+			return !dead;
 		}
 
 		@Override
@@ -576,6 +986,7 @@ public final class AdvancedInteractionRollbackVerification {
 		@Override public void triggerRecipeCrafted(RecipeHolder<?> recipe, java.util.List<ItemStack> ingredients) { }
 		@Override public boolean isWithinBlockInteractionRange(net.minecraft.core.BlockPos position, double padding) { return true; }
 		@Override public boolean isDescending() { return false; }
+		@Override public void swing(net.minecraft.world.InteractionHand hand) { swings++; }
 		@Override public void closeContainer() {
 			containerMenu.removed(this);
 			containerMenu = inventoryMenu;
@@ -594,6 +1005,16 @@ public final class AdvancedInteractionRollbackVerification {
 		public ItemEntity drop(ItemStack stack, boolean randomDirection) {
 			if (throwOnDrop) throw new IllegalStateException("injected drop failure after inventory debit");
 			return super.drop(stack, randomDirection);
+		}
+
+		@Override
+		public ItemEntity drop(ItemStack stack, boolean randomly, boolean includeThrower) {
+			if (recordDrops) {
+				if (dropped == null) dropped = new java.util.ArrayList<>();
+				dropped.add(stack.copy());
+				return null;
+			}
+			return super.drop(stack, randomly, includeThrower);
 		}
 	}
 

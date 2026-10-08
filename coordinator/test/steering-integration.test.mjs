@@ -130,7 +130,10 @@ test('encoded authoritative history does not reduce the optional context and old
 	const optionalBytes = Buffer.byteLength(JSON.stringify(withGoal)) - Buffer.byteLength(JSON.stringify(goal));
 	assert.ok(optionalBytes <= 16_384);
 	assert.equal(conversation.entries.length, 64, 'input source remains unread and unmodified');
-	assert.throws(() => buildNativeEventInput({ ...registered, currentGoal: goal }, { ...options, taskMemory: { summary: 'z'.repeat(20_000) } }), { code: 'NATIVE_CONVERSATION_BUDGET_EXCEEDED' });
+	const trimmed = payloadOf(buildNativeEventInput({ ...registered, currentGoal: goal }, { ...options, taskMemory: { summary: 'z'.repeat(20_000) } }));
+	assert.equal(trimmed.conversation.entries[0].sequence, 1, 'oversized task memory is trimmed before the oldest unread message is dropped');
+	assert.equal(trimmed.taskMemory.truncated, true);
+	assert.equal(trimmed.goal, goal);
 });
 
 test('large planner allowance does not relax physical frames or logical fragment limits', t => {

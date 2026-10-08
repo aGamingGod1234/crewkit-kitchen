@@ -24,7 +24,10 @@ const DETERMINISTIC_FAILURE_CODES = new Set([
 	'NO_STANDABLE_PATH',
 	'RECIPE_NOT_FOUND',
 	'RECIPE_NOT_UNLOCKED',
+	'TARGET_AIR',
+	'TARGET_INVULNERABLE',
 ]);
+const NO_PROGRESS_FAILURE_LIMIT = 8;
 const PLAYER_PRIMITIVES = PLAYER_MEMBER_PRIMITIVES;
 const COMPOUND_ACTIONS = new Set(['control_sequence', 'edit_book']);
 const COMPOUND_ACTION_BYTES = 32_768;
@@ -56,6 +59,7 @@ export class ArenaScriptInterpreter {
 	#deferredCommand = null;
 	#awaitingWatcherDecision = false;
 	#deterministicFailure = null;
+	#failureStreak = 0;
 
 	constructor(compiled, bindings, { limits = DEFAULT_ARENA_SCRIPT_LIMITS, parameters } = {}) {
 		if (!compiled?.ast || compiled.ast.type !== 'Program') throw executionError('INVALID_PROGRAM', 'ArenaScript INVALID_PROGRAM: compiled program is required');
@@ -256,6 +260,7 @@ export class ArenaScriptInterpreter {
 		this.#lifecycle = 'ACTIVE';
 		this.#loopIterations = 0;
 		this.#deterministicFailure = null;
+		this.#failureStreak = 0;
 	}
 
 	#beginSlice() {
@@ -652,6 +657,15 @@ export class ArenaScriptInterpreter {
 		// Waiting does not establish a new approach. Keep a failed action's streak
 		// so a wait/retry loop yields to the selected model after another failure.
 		if (waiting.primitive === 'wait' && result.state === 'SUCCEEDED') return null;
+		// Any run of failures with no success in between is a loop making no progress,
+		// even when it alternates targets or codes (e.g. mining two cleared blocks in turn).
+		if (result.state === 'SUCCEEDED') this.#failureStreak = 0;
+		else if (result.state === 'FAILED' || result.state === 'TIMED_OUT') this.#failureStreak += 1;
+		if (this.#failureStreak >= NO_PROGRESS_FAILURE_LIMIT) {
+			this.#failureStreak = 0;
+			this.#deterministicFailure = null;
+			return { stepId: waiting.stepId, actionType: waiting.primitive, arguments: waiting.arguments, state: result.state, reasonCode: result.reasonCode };
+		}
 		const deterministic = result.state === 'TIMED_OUT'
 			|| (result.state === 'FAILED' && DETERMINISTIC_FAILURE_CODES.has(result.reasonCode));
 		if (!deterministic) {
@@ -853,15 +867,21 @@ export class ArenaScriptInterpreter {
 	}
 }
 
+const EXACT_TARGET_CALLS = Object.freeze({
+	'player.attack': [ACTION_FIELDS.attack, ['targetId', 'timeoutMs']],
+	'player.useRanged': [ACTION_FIELDS.use_ranged, ['targetId', 'drawDurationMs', 'timeoutMs']],
+	'player.fightTarget': [ACTION_FIELDS.fight_target, ['targetId', 'timeoutMs']],
+	'player.fleeFrom': [ACTION_FIELDS.flee_from, ['targetId', 'distance', 'timeoutMs']],
+});
+
 function validateExactTargetArguments(path, args, node, fail) {
-	if (path !== 'player.attack' && path !== 'player.useRanged') return;
+	if (!Object.hasOwn(EXACT_TARGET_CALLS, path)) return;
 	if (args.length !== 1 || args[0] === null || typeof args[0] !== 'object' || Array.isArray(args[0])) {
 		throw fail('exact target actions require one argument object with targetId');
 	}
 	const target = args[0];
-	const expected = path === 'player.attack' ? ['targetId', 'timeoutMs'] : ['targetId', 'drawDurationMs', 'timeoutMs'];
+	const [allowed, expected] = EXACT_TARGET_CALLS[path];
 	const keys = Object.keys(target);
-	const allowed = path === 'player.attack' ? ACTION_FIELDS.attack : ACTION_FIELDS.use_ranged;
 	if (keys.some((key) => !allowed.includes(key)) || expected.some((key) => !Object.hasOwn(target, key))) {
 		throw fail('exact target actions require targetId and reject targetSelector');
 	}

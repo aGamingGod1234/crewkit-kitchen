@@ -77,6 +77,8 @@ public final class CameraMixinVerification {
 			Class<?> playerInfo = target.loadClass("net.minecraft.client.multiplayer.PlayerInfo");
 			if (java.util.Arrays.stream(playerInfo.getDeclaredMethods()).noneMatch(method -> method.getName().contains("arenaagents$tabLabel")))
 				throw new AssertionError("Fabric did not apply the tab-list name mixin");
+			if (java.util.Arrays.stream(playerInfo.getDeclaredMethods()).noneMatch(method -> method.getName().contains("arenaagents$agentTabSkin")))
+				throw new AssertionError("Fabric did not apply the tab-list agent face mixin");
 			Class<?> player = target.loadClass("net.minecraft.world.entity.player.Player");
 			if (java.util.Arrays.stream(player.getDeclaredMethods()).noneMatch(method -> method.getName().contains("arenaagents$clientLabel")))
 				throw new AssertionError("Fabric did not apply the target HUD name mixin");

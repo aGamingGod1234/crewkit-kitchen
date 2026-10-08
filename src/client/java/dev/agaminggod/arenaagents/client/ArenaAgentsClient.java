@@ -21,6 +21,7 @@ public final class ArenaAgentsClient implements ClientModInitializer {
 		AgentControlClient.register();
 		PovClient.register();
 		OperatorInputSender.register();
+		dev.agaminggod.arenaagents.client.presentation.RiskOverlayClient.register();
 		// Mirrored container screens read the same stand-in player the HUD renders from.
 		PovScreens.setProxyInventory(() -> {
 			var proxy = PovHudProxy.current();

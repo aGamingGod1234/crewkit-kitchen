@@ -106,3 +106,37 @@ test('planning due input carries timing and version while keeping the current ro
 	assert.equal(payload.observation.currentAction.state, 'RUNNING');
 	assert.equal(Object.hasOwn(payload.program, 'decision'), false);
 });
+
+test('oversized task memory and observation context never leave a player message undeliverable', () => {
+	const exploration = {
+		kind: 'candidates',
+		candidates: Array.from({ length: 32 }, (_, index) => ({
+			id: `block:${index},64,${-index}`, kind: 'observed_block', position: { x: index + 0.5, y: 64.5, z: -index + 0.5 },
+			blockId: 'minecraft:birch_log', blockState: { axis: 'y', waterlogged: 'false', facing: 'north' },
+			distance: 3.1415926535 * (index + 1), seen: true, visited: false, blocked: false, stale: false, reachability: 'unknown',
+		})),
+		totalCandidates: 180, truncated: true, knownCells: 96, reason: 'Distance-sorted facts. Reachability is unknown; choose a target explicitly.',
+	};
+	const build = (conversation) => buildNativeEventInput(record, {
+		event: 'observation',
+		taskMemory: { summary: 's'.repeat(3_000), steps: Array.from({ length: 120 }, (_, index) => ({ step: index, note: 'n'.repeat(160) })) },
+		observation: {
+			player: { x: 32, y: 107, z: 1015, health: 20 },
+			inventory: { items: Array.from({ length: 20 }, (_, index) => ({ itemId: `minecraft:item_${index}`, count: 3, slot: index })) },
+			blocks: Array.from({ length: 32 }, (_, index) => ({ blockId: 'minecraft:oak_leaves', x: index, y: 108, z: 1015, blockState: { distance: '3', persistent: 'false' } })),
+			exploration,
+			ownedPlacements: Array.from({ length: 40 }, (_, index) => ({ blockId: 'minecraft:crafting_table', x: index, y: 107, z: 1016, placedAtTick: 1_000 + index })),
+		},
+		conversation,
+	});
+	const message = { sequence: 2, text: 'Operator takeover report: An operator controlled your body for 13 s. Moved 1 block.' };
+	const payload = payloadOf(build([message]));
+	assert.deepEqual(payload.conversation.entries.map(({ sequence }) => sequence), [2], 'the unread message is delivered');
+	assert.equal(payload.conversation.omittedEntries, 0);
+	assert.ok(payload.observation.exploration === undefined || payload.observation.exploration.candidates.length <= 8, 'exploration is trimmed under budget pressure');
+	assert.equal(payload.taskMemory.truncated, true, 'oversized task memory is cut to an excerpt');
+	assert.ok(payload.contextTrimmed.taskMemory > 16_384, 'the trimmed context names what outgrew the budget');
+	assert.ok(Buffer.byteLength(JSON.stringify(payload), 'utf8') <= 16_384 + Buffer.byteLength(JSON.stringify(record.currentGoal), 'utf8'));
+	const followUp = payloadOf(build([message, { sequence: 3, text: 'please continue getting the stone pickaxe' }]));
+	assert.deepEqual(followUp.conversation.entries.map(({ sequence }) => sequence), [2, 3], 'a follow-up DM is delivered too');
+});

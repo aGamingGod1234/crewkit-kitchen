@@ -114,10 +114,13 @@ test('ordinary discoveries do not repeat an unresolved urgent program interrupti
 	run.observe(10, 10);
 	await tick();
 	assert.equal(events.at(-1).priority, 'urgent');
+	const notified = events.length, decisionId = events.at(-1).status.decision.decisionId;
 	run.runtime.updateObservation(record, observation(10), { eventSequence: 11, attention: true, priority: 'ordinary', trigger: 'resource_discovery', changedFacts: ['blocks'] });
 	await tick();
-	assert.equal(events.at(-1).priority, 'ordinary', 'a coalesced urgent decision does not make every later discovery urgent');
-	assert.equal(events.at(-1).status.decision.priority, 'urgent', 'the pending hazard is still represented');
+	assert.equal(events.length, notified, 'a later discovery folds into the decision the model already holds instead of waking it again');
+	const status = await run.call('programStatus');
+	assert.equal(status.decision.decisionId, decisionId, 'the in-flight handle stays valid');
+	assert.equal(status.decision.priority, 'urgent', 'the pending hazard is still represented');
 });
 
 test('program cancellation fences the next command and stale handles cannot cancel replacements', async t => {

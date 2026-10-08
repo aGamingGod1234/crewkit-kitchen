@@ -21,7 +21,8 @@ const state = {
 const PROFILE_FINGERPRINT = profileFingerprint(state.agent);
 
 test('native program reference shares the actual language, action contract and examples within its response budget', () => {
-	assert.ok(Buffer.byteLength(ARENA_SCRIPT_API_REFERENCE) < 13_000);
+	// Raised from 13,000 for the fight/flee calls and threat-watcher guidance; still well under the 16 KiB tool page.
+	assert.ok(Buffer.byteLength(ARENA_SCRIPT_API_REFERENCE) < 14_500);
 	assert.ok(ARENA_SCRIPT_API_REFERENCE.includes(SCRIPT_ACTION_REFERENCE));
 	assert.match(ARENA_SCRIPT_API_REFERENCE, /Watcher example/);
 	assert.match(ARENA_SCRIPT_API_REFERENCE, /world\.queryMemory/);
@@ -148,7 +149,7 @@ test('planner tells agents to collect observed drops and never pause for routine
 	assert.match(PLANNER_SYSTEM_PROMPT, /ArenaScript can't call it/);
 	assert.match(PLANNER_SYSTEM_PROMPT, /inspect owns entityType\/recipe filters/);
 	assert.match(PLANNER_SYSTEM_PROMPT, /noteKey executes the whole note as source/);
-	assert.match(PLANNER_SYSTEM_PROMPT, /player\.state\(\)\.velocity and world\.state\(\)\.landmarks/);
+	assert.match(PLANNER_SYSTEM_PROMPT, /player\.state\(\)\.velocity\/\.heard\/\.heardLava and world\.state\(\)\.landmarks/);
 	assert.match(PLANNER_SYSTEM_PROMPT, /observationIntervalMs:100\.\.5000/);
 	assert.match(PLANNER_SYSTEM_PROMPT, /Batch independent inspections; reuse fresh facts and safe sequences/);
 	assert.match(PLANNER_SYSTEM_PROMPT, /program\.parameters\(\)/);

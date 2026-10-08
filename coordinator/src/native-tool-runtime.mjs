@@ -3,6 +3,7 @@ import { validateTraceId } from './control-latency-registry.mjs';
 import { ExplorationOccupancy, observationWorldId } from './explore-frontier.mjs';
 import { hasDurableObservationFacts, RecoveryProgressStore } from './recovery-progress-wrap.mjs';
 import { classifyBodyFailure, composeTwoCallView } from './two-call-llm-wrap.mjs';
+import { PlacedWorkstations } from './resource-facts.mjs';
 import { minecraftCapabilities, normalizeMinecraftToolCall, toolResultContent } from './native-minecraft-tools.mjs';
 import { NativeProgramExecutor } from './native-program-executor.mjs';
 import { parseArenaScript } from './arena-script/parser.mjs';
@@ -11,6 +12,11 @@ import { compileProgramPrecondition, evaluateProgramPrecondition } from './progr
 const FORGET_REASONS = /agent_removed|server_replaced|coordinator_stopped/;
 const TERMINAL_ACTION_STATES = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT']);
 const POST_ACTION_OBSERVATION_TYPES = new Set(['pick_up_item', 'break_block', 'navigate_to']);
+// The model may answer danger with these while its program is paused for a decision, without first
+// settling the program decision; the paused program keeps its decision for a later respondProgram.
+const PAUSED_PROGRAM_DANGER_ACTIONS = new Set(['fight_target', 'flee_from']);
+// Waiting only stops repeating the finished work; new player requests stay the model's to act on.
+export const AWAITING_CONFIRMATION_MESSAGE = 'The remaining condition requires operator confirmation. Report completion once, then end this turn. Do not repeat the finished work or finish checks while waiting. This never blocks new requests: if a player asks for something (even more equipment changes), do it at once, then call finish again.';
 
 
 export class NativeToolRuntime {
@@ -28,6 +34,7 @@ export class NativeToolRuntime {
 	#memoryReady = new Set();
 	#pendingSpatial = new Map();
 	#recovery = new RecoveryProgressStore();
+	#placedWorkstations = new PlacedWorkstations();
 	#decorateObservation;
 	#requestObservation;
 	#inspectObservation;
@@ -272,11 +279,13 @@ export class NativeToolRuntime {
 		if (isSparseDeathObservation(observation) && hasDurableObservationFacts(source)) {
 			this.#recovery.remember(record.agentId, record.goalRevision, source);
 		}
-		return composeTwoCallView(ownedSource, this.#recovery.snapshot(record.agentId, ownedSource), {
+		const view = composeTwoCallView(ownedSource, this.#recovery.snapshot(record.agentId, ownedSource), {
 			occupancy: this.#occupancy,
 			agentId: record.agentId,
 			goal: record.currentGoal ?? record.currentGoalSpec?.originalRequest ?? null,
 		});
+		const leftBehind = this.#placedWorkstations.leftBehind(record.agentId, view);
+		return leftBehind.length === 0 ? view : { ...view, leftBehind };
 	}
 
 	hasCurrent(record) {
@@ -295,7 +304,7 @@ export class NativeToolRuntime {
 		}
 		if (request.tool.kind === 'inspect') return this.#inspect(request.tool, record);
 		if (request.tool.kind === 'capabilities') {
-			if (request.tool.section === 'program' || request.tool.section === 'control') return { ...minecraftCapabilities(request.tool), ...await this.#executionMetadata(record) };
+			if (['program', 'control', 'strategy'].includes(request.tool.section)) return { ...minecraftCapabilities(request.tool), ...await this.#executionMetadata(record) };
 			return { ...minecraftCapabilities(), ...await this.#executionMetadata(record), ...await this.#memorySummary(record), runtime: { freshObservations: this.#requestObservation !== null, focusedInspection: this.#inspectObservation !== null, notebook: this.#notebook !== null || this.#memoryOperation !== null, asynchronousActions: true, cancellation: true, reactivePrograms: { available: true, background: true, engine: 'ArenaScript', modelAuthored: true, plannerCalls: false } } };
 		}
 		if (request.tool.kind === 'action_status') return this.#actionStatus(record, request.tool.actionId);
@@ -306,7 +315,15 @@ export class NativeToolRuntime {
 		if (request.tool.kind === 'respond_program') {
 			if (request.tool.goalRevision !== record.goalRevision) throw codedError('STALE_PROGRAM_DECISION', 'Decision belongs to an older goal');
 			const run = this.#programRuns.get(record.agentId);
+			// A program cannot resume while the model's own danger action still owns the body.
+			if (['continue', 'replace'].includes(request.tool.directive) && this.#actions.get(record.agentId)?.pausedProgram === true) {
+				throw codedError('NATIVE_ACTION_IN_PROGRESS', 'Your fight_target/flee_from still owns the body; wait for its result (or cancelAction it), then respond to the program');
+			}
+			const answered = this.#programExecutor.status?.(record)?.decision;
 			await this.#programExecutor.respond(record, request.tool);
+			this.#trace('native_program_responded', { agentId: record.agentId, goalRevision: record.goalRevision, programId: request.tool.programId,
+				directive: request.tool.directive, trigger: answered?.trigger ?? null,
+				...(request.tool.directive === 'replace' ? programSourceSummary(request.tool.source) : {}) });
 			if (run && ['replace', 'pause', 'finish'].includes(request.tool.directive)) run.pendingSuccessor = null;
 			if (['pause', 'finish'].includes(request.tool.directive)) await run.result;
 			return this.#programStatus(record, request.tool.programId);
@@ -315,7 +332,13 @@ export class NativeToolRuntime {
 		if (request.tool.kind === 'notebook' || request.tool.kind === 'query_memory' || request.tool.kind === 'task_memory') return this.#memory(request, record);
 		if (this.#sequenceFinishReservations.has(record.agentId)) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'A finishing native sequence owns the player until its fresh sample and goal verification settle');
 		if (this.#sweeps.has(record.agentId)) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'A camera sweep owns this player until sampling completes');
-		if (this.#programRuns.has(record.agentId)) throw codedError('NATIVE_PROGRAM_IN_PROGRESS', 'A model-authored program owns this player; use programStatus and cancelProgram before issuing another body operation');
+		if (this.#programRuns.has(record.agentId)) {
+			if (this.#dangerActionWhilePaused(request.tool, record)) {
+				const tool = { ...request.tool, kind: 'action' };
+				return this.#executeAction(request, record, tool, null, request.tool.kind !== 'start_action', null, null, { pausedProgram: true });
+			}
+			throw codedError('NATIVE_PROGRAM_IN_PROGRESS', 'A model-authored program owns this player; use programStatus and cancelProgram before issuing another body operation (fight_target/flee_from are allowed while it is paused for your decision)');
+		}
 		if (request.tool.kind === 'run_program') return this.#runProgram(request, record);
 		if (request.tool.kind === 'replace_action') {
 			const epoch = this.#executionEpoch(record.agentId);
@@ -337,6 +360,19 @@ export class NativeToolRuntime {
 		}
 		if (tool.kind !== 'action') throw codedError('INVALID_NATIVE_TOOL', 'Native tool did not normalize to an action');
 		return this.#executeAction(request, record, tool);
+	}
+
+	/**
+	 * True when the model chose fight_target/flee_from while its program is suspended awaiting a decision and owns
+	 * no body action. The program stays paused with its decision intact; respondProgram later resumes, replaces or
+	 * ends it. Nothing here chooses an action: it only removes the respondProgram/programStatus detour under danger.
+	 */
+	#dangerActionWhilePaused(tool, record) {
+		if (!['action', 'start_action'].includes(tool.kind) || !PAUSED_PROGRAM_DANGER_ACTIONS.has(tool.actionType)) return false;
+		const run = this.#programRuns.get(record.agentId);
+		if (run?.goalRevision !== record.goalRevision || run.state !== 'RUNNING' || run.epoch !== this.#executionEpoch(record.agentId)) return false;
+		const status = this.#programExecutor.status?.(record);
+		return status?.decision != null && status.engineState === 'SUSPENDED' && !this.#actions.has(record.agentId);
 	}
 
 	async #observe(record, { includeMetadata = true, afterResult = null } = {}) {
@@ -503,6 +539,13 @@ export class NativeToolRuntime {
 		if (run.settled) return;
 		run.settled = true;
 		const result = { ...outcome, programId: run.programId, goalRevision: run.goalRevision };
+		this.#trace('native_program_ended', { agentId, goalRevision: run.goalRevision, programId: run.programId,
+			termination: programTermination(outcome), state: outcome.state ?? null, reasonCode: outcome.reasonCode ?? null,
+			...(outcome.decision?.trigger === undefined ? {} : { pendingTrigger: outcome.decision.trigger }),
+			...(outcome.trigger === undefined ? {} : { trigger: outcome.trigger }),
+			programVersion: outcome.programVersion ?? null, actions: outcome.actions ?? 0,
+			actionsSucceeded: outcome.actionsSucceeded ?? 0, actionsFailed: outcome.actionsFailed ?? 0,
+			...(run.startedAtMs === undefined ? {} : { durationMs: Math.max(0, Date.now() - run.startedAtMs) }) });
 		const successor = run.pendingSuccessor;
 		run.pendingSuccessor = null;
 		const handoff = successor != null && error === null && outcome.state === 'YIELDED'
@@ -642,7 +685,12 @@ export class NativeToolRuntime {
 		const latest = this.#observations.get(record.agentId);
 		if (latest?.goalRevision !== record.goalRevision) throw codedError('CURRENT_OBSERVATION_REQUIRED', 'A current player observation is required before running a program');
 		run.state = 'RUNNING';
-		run.deadlineEpochMs = Date.now() + (request.tool.timeoutMs ?? 30_000);
+		run.startedAtMs = Date.now();
+		run.deadlineEpochMs = run.startedAtMs + (request.tool.timeoutMs ?? 30_000);
+		this.#trace('native_program_started', { agentId: record.agentId, goalRevision: run.goalRevision, programId: run.programId,
+			origin: request.tool.noteKey === undefined ? 'source' : 'note', background: request.tool.background === true,
+			...(run.handoff == null ? {} : { successor: true }), ...programSourceSummary(source),
+			maxActions: request.tool.maxActions ?? 64, timeoutMs: request.tool.timeoutMs ?? 30_000 });
 		// Missing measurements leave preparation disabled rather than guessing a delay.
 		let planningLeadMs;
 		try {
@@ -667,6 +715,12 @@ export class NativeToolRuntime {
 			onDecision: (_status, { priority } = {}) => {
 				if (this.#programRuns.get(record.agentId) !== run || this.#executionEpoch(record.agentId) !== run.epoch) return;
 				const status = this.#programStatus(record, run.programId);
+				// The authored attention policy suspended the body: say which trigger paused it, once per decision.
+				if (status.engineState === 'SUSPENDED' && status.decision?.decisionId !== run.pausedDecisionId) {
+					run.pausedDecisionId = status.decision?.decisionId;
+					this.#trace('native_program_paused', { agentId: record.agentId, goalRevision: run.goalRevision, programId: run.programId,
+						programVersion: status.programVersion, trigger: status.decision?.trigger ?? null, priority: priority ?? status.decision?.priority ?? null });
+				}
 				const wasDetached = run.detached;
 				run.detached = true;
 				run.detach(status);
@@ -809,7 +863,8 @@ export class NativeToolRuntime {
 		if (active.cancelling) throw codedError('CANCELLATION_IN_PROGRESS', 'The exact action is already being cancelled');
 		active.cancelling = true;
 		active.cancellationUncertain = false;
-		if (invalidateProgram) {
+		// Cancelling a danger action taken while the program was paused leaves that paused program intact.
+		if (invalidateProgram && active.pausedProgram !== true) {
 			this.#executionEpochs.set(record.agentId, this.#executionEpoch(record.agentId) + 1);
 			if (this.#programRuns.has(record.agentId)) Promise.resolve(this.#programExecutor.cancel(record.agentId, 'MODEL_CANCELLED')).catch((error) => this.#trace('native_program_cancel_failed', { agentId: record.agentId, reasonCode: error?.code ?? 'PROGRAM_CANCEL_FAILED' }));
 		}
@@ -960,13 +1015,15 @@ export class NativeToolRuntime {
 		}
 	}
 
-	async #executeAction(request, record, tool, sequenceIndex = null, waitForCompletion = true, programCommand = null, sequenceFinishToken = null) {
+	async #executeAction(request, record, tool, sequenceIndex = null, waitForCompletion = true, programCommand = null, sequenceFinishToken = null, { pausedProgram = false } = {}) {
 		// All native routes, including replacement and authored programs, meet here.
 		tool = constrainNavigationAction(tool, record.currentGoalSpec);
 		const finishReservation = this.#sequenceFinishReservations.get(record.agentId);
 		if (finishReservation !== undefined && finishReservation !== sequenceFinishToken) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'A finishing native sequence owns the player');
 		const executionEpoch = this.#executionEpoch(record.agentId);
-		if (this.#actions.has(record.agentId)) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'The Minecraft body is already executing an action');
+		if (this.#actions.has(record.agentId)) throw codedError('NATIVE_ACTION_IN_PROGRESS', tool.actionType === 'fight_target' && this.#actions.get(record.agentId)?.actionType === 'fight_target'
+			? 'A fight_target already owns the body; to switch targets call replaceAction with its actionId and the new fight_target (weapon and swing timing carry over), or set targetPolicy'
+			: 'The Minecraft body is already executing an action');
 		if (this.#completions.has(record.agentId)) throw codedError('NATIVE_COMPLETION_IN_PROGRESS', 'Goal completion verification is already running');
 
 		const ordinal = ++this.#sequence;
@@ -1007,7 +1064,7 @@ export class NativeToolRuntime {
 		let rejectAction;
 		const result = new Promise((resolve, reject) => { resolveAction = resolve; rejectAction = reject; });
 		result.catch(() => {});
-		const active = { actionId, goalRevision: record.goalRevision, actionType: tool.actionType, arguments: structuredClone(tool.arguments), worldId: this.#worldId(record), result, resolve: resolveAction, reject: rejectAction, dispatched: false, ...(programCommand === null ? {} : { engineActionId: programCommand.actionId }) };
+		const active = { actionId, goalRevision: record.goalRevision, actionType: tool.actionType, arguments: structuredClone(tool.arguments), worldId: this.#worldId(record), result, resolve: resolveAction, reject: rejectAction, dispatched: false, ...(programCommand === null ? {} : { engineActionId: programCommand.actionId }), ...(pausedProgram ? { pausedProgram: true } : {}) };
 		if (!waitForCompletion) {
 			const releaseWork = this.#onWorkStarted(record, 'action');
 			void result.then(releaseWork, releaseWork);
@@ -1112,6 +1169,7 @@ export class NativeToolRuntime {
 			...(failureClass === null ? {} : { failureClass }),
 		};
 		this.#retainReceipt(record, active, { ...result, source: 'server_action_result' });
+		this.#placedWorkstations.onActionResult(record.agentId, { actionType: active.actionType, arguments: active.arguments, state }, this.#observations.get(record.agentId)?.observation);
 		if (this.#notebook !== null && active.worldId != null) {
 			try {
 				Promise.resolve(this.#notebook.recordReceipt(record.agentId, terminalReceipt(active, payload))).catch((error) => this.#trace('native_receipt_persistence_failed', { agentId: record.agentId, actionId: active.actionId, reasonCode: error?.code ?? 'MEMORY_WRITE_FAILED' }));
@@ -1153,7 +1211,7 @@ export class NativeToolRuntime {
 			verified: payload.verified === true,
 			reasonCode: String(payload.reasonCode ?? '').slice(0, 128),
 			facts,
-			...(awaitingConfirmation ? { message: 'The remaining condition requires operator confirmation. Report completion once, then end this turn. Do not repeat the physical work or finish checks while waiting.' } : {}),
+			...(awaitingConfirmation ? { message: AWAITING_CONFIRMATION_MESSAGE } : {}),
 		});
 		return true;
 	}
@@ -1171,6 +1229,7 @@ export class NativeToolRuntime {
 		// Physical authority is released before waiting on persistence below.
 		if (FORGET_REASONS.test(String(reason))) {
 			this.#recovery.forget(agentId);
+			this.#placedWorkstations.clear(agentId);
 			this.#lastLive.delete(agentId);
 			this.#receipts.delete(agentId);
 		}
@@ -1408,6 +1467,28 @@ function successorSummary(successor) {
 	return { queueId: successor.queueId, afterProgramId: successor.afterProgramId, goalRevision: successor.goalRevision,
 		programVersion: successor.programVersion, state: 'QUEUED', maxActions: successor.request.tool.maxActions ?? 64,
 		timeoutMs: successor.request.tool.timeoutMs ?? 30_000, sourceOrigin: successor.sourceOrigin };
+}
+
+/** Size and a short fingerprint of model-authored source, so traces can tell programs apart without logging them. */
+export function programSourceSummary(source) {
+	if (typeof source !== 'string') return {};
+	return { sourceBytes: Buffer.byteLength(source, 'utf8'), sourceHash: createHash('sha256').update(source).digest('hex').slice(0, 12) };
+}
+
+/** Why a program run ended, in one word a trace reader can count. */
+export function programTermination(outcome) {
+	const reason = outcome?.reasonCode;
+	if (outcome?.state === 'CANCELLED') return 'cancelled';
+	if (outcome?.state === 'TIMED_OUT') return 'timed_out';
+	if (outcome?.state === 'FAILED' || outcome?.state === 'UNKNOWN') return 'failed';
+	if (reason === 'PROGRAM_EXHAUSTED') return 'exhausted';
+	if (reason === 'PROGRAM_FINISH_REQUESTED') return 'finished';
+	if (reason === 'MODEL_PAUSED') return 'paused_by_model';
+	if (reason === 'PROGRAM_CHECKPOINT') return 'checkpoint';
+	if (reason === 'PROGRAM_ACTION_LIMIT') return 'action_limit';
+	if (reason === 'PROGRAM_IDLE') return 'idle';
+	if (reason === 'MODEL_DECISION_REQUIRED') return 'decision_required';
+	return 'yielded';
 }
 
 function codedError(code, message) { return Object.assign(new Error(message), { code }); }

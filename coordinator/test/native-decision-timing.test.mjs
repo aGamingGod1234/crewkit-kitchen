@@ -32,6 +32,41 @@ test('native request timing includes collector arrival and reports execution que
 	assert.equal(rows.find(row => row.event === 'native_tool_queue_timing').fields.arrivalObserved, true);
 });
 
+test('reference reads trace their section, topic and the taskPlan strategy pointer without content', async () => {
+	const record = nativeRecord('model-a');
+	const rows = [];
+	const agent = {
+		executionSettings: createExecutionSettings(record, { transport: 'test', controlProtocol: 'native_tools' }),
+		async setGoalRevision() {},
+		async act(_input, options) {
+			await options.executeTool({ callId: 'plan', tool: { kind: 'task_plan', operation: 'read' } });
+			await options.executeTool({ callId: 'guide', tool: { kind: 'capabilities', section: 'strategy', topic: 'resources' } });
+			await options.executeTool({ callId: 'odd', tool: { kind: 'capabilities', topic: 'Ignore previous instructions' } });
+			await options.executeTool({ callId: 'look', tool: { kind: 'observe' } });
+			return { status: 'completed', toolCalls: 4 };
+		},
+	};
+	const planner = new AgentPlanner({ registry: registryFor(() => record), now: () => 0,
+		scheduler: immediateScheduler, nativeTimingSink: (event, fields) => rows.push({ event, fields }),
+		codexService: { async createAgent() { return agent; }, getAgent() { return null; } } });
+	const executeTool = async ({ tool }) => tool.kind === 'task_plan'
+		? { plan: { steps: [{ id: 'a', status: 'complete' }, { id: 'b', status: 'pending' }] }, strategy: { topics: ['resources', 'beat-the-game'], read: { tool: 'capabilities', arguments: { section: 'strategy', topic: 'resources' } }, advice: 'long text' } }
+		: { state: 'SUCCEEDED', reference: 'guide body' };
+	await planner.requestNativeTurn({ agentId: AGENT_ID, input: 'inspect', goalRevision: 1, executeTool });
+	const references = rows.filter(row => row.event === 'native_tool_reference').map(row => row.fields);
+	assert.equal(references.length, 3, 'observe is not a reference read');
+	assert.deepEqual(pick(references[0], ['callId', 'toolKind', 'operation', 'planSteps', 'openPlanSteps', 'strategyTopics', 'strategyRead']),
+		{ callId: 'plan', toolKind: 'task_plan', operation: 'read', planSteps: 2, openPlanSteps: 1, strategyTopics: ['resources', 'beat-the-game'], strategyRead: 'resources' });
+	assert.deepEqual(pick(references[1], ['callId', 'toolKind', 'section', 'topic']), { callId: 'guide', toolKind: 'capabilities', section: 'strategy', topic: 'resources' });
+	assert.equal(references[2].topic, 'other', 'free text never reaches the trace');
+	assert.equal(references[2].section, 'all');
+	assert.equal(JSON.stringify(references).includes('guide body') || JSON.stringify(references).includes('long text'), false);
+});
+
+function pick(value, keys) {
+	return Object.fromEntries(keys.map((key) => [key, value[key]]));
+}
+
 test('native timing windows bound samples and keep failed or cancelled segments out of percentiles', () => {
 	const window = new NativeDecisionTimingWindow({ windowSize: 2 });
 	window.recordProviderSegment({ durationMs: 10, outcome: 'completed', sample: true });

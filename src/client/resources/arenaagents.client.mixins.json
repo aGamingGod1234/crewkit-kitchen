@@ -5,6 +5,7 @@
   "client": [
     "AbstractClientPlayerMixin",
     "AvatarRendererMixin",
+    "EntityRendererRiskMixin",
     "CameraEyeHeightAccessor",
     "ClientPlayerDisplayNameMixin",
     "FontManagerAccessor",
@@ -12,7 +13,10 @@
     "PlayerInfoMixin",
     "PlanItemIconsRenderMixin",
     "SkinManagerMixin",
+    "ClientCommonPacketListenerPovMixin",
     "ClientPacketListenerPovMixin",
+    "RecipeBookComponentPovMixin",
+    "PlayerInfiniteMaterialsPovMixin",
     "EntityPovRotationMixin",
     "ExperienceBarRendererPovMixin",
     "GameModeSwitcherScreenPovMixin",
@@ -21,14 +25,17 @@
     "ItemInHandRendererPovMixin",
     "LivingEntityPovRotationMixin",
     "KeyboardInputPovMixin",
+    "LevelRendererPovMixin",
     "LocalPlayerPovMixin",
     "MinecraftPovMixin",
     "MouseHandlerPovMixin",
     "MultiPlayerGameModeAccessor",
     "MultiPlayerGameModePovMixin",
     "MenuScreensInvoker",
+    "InBedChatScreenPovMixin",
     "InventoryScreenPovMixin",
-    "AbstractContainerScreenPovMixin"
+    "AbstractContainerScreenPovMixin",
+    "ScreenEffectRendererPovMixin"
   ],
   "injectors": {
     "defaultRequire": 1

@@ -83,6 +83,19 @@ abstract class AvatarRendererMixin {
 		});
 	}
 
+	/** Runs after the friendly-name injection above: appends the watched agent's risk label (presentation only). */
+	@Inject(
+			method = "extractRenderState(Lnet/minecraft/world/entity/Avatar;Lnet/minecraft/client/renderer/entity/state/AvatarRenderState;F)V",
+			at = @At("RETURN")
+	)
+	private void arenaagents$riskLabel(Avatar avatar, AvatarRenderState state, float partialTick, CallbackInfo callback) {
+		if (!dev.agaminggod.arenaagents.client.presentation.RiskOverlayClient.has(avatar.getId())) return;
+		state.nameTag = dev.agaminggod.arenaagents.client.presentation.RiskOverlayClient.decorate(avatar.getId(), state.nameTag);
+		if (state.nameTagAttachment == null) {
+			state.nameTagAttachment = avatar.getAttachments().getNullable(EntityAttachment.NAME_TAG, 0, avatar.getYRot());
+		}
+	}
+
 	private static Optional<DirectorSnapshotPayload.Actor> castActor(Avatar avatar) {
 		return DirectorClientState.snapshot().stream().flatMap(snapshot -> snapshot.actors().stream())
 				.filter(actor -> avatar.getUUID().equals(AgentIdentity.offlinePlayerUuid(actor.playerName())))

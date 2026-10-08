@@ -41,7 +41,7 @@ public final class AttentionHazardVerification {
 		assertTrue(lava.changedFacts().contains("blocks.0,64,0"), "lava is delivered as an observed block fact");
 		assertFalse(lava.changedFacts().stream().anyMatch(AttentionHazardVerification::isTacticalLabel),
 				"lava attention does not choose flee, jump, or another movement");
-		return 11 + verifyRawAirSampling();
+		return 11 + verifyRawAirSampling() + verifyHalfAirWarning();
 	}
 
 	private static int verifyRawAirSampling() {
@@ -60,6 +60,25 @@ public final class AttentionHazardVerification {
 		assertTrue(rawState(298, 20, true, 6, 0).requiresForcedAttention(before, false), "hazardous falling remains forced");
 		assertTrue(rawState(298, 20, true, 0, 1).requiresForcedAttention(before, false), "perception events remain forced");
 		return 10;
+	}
+
+	/** Drowning attention must leave time to decide: it fires at half air (7.5 s), once per dive. */
+	private static int verifyHalfAirWarning() {
+		JsonObject before = observation("idle");
+		before.getAsJsonObject("player").addProperty("air", 151);
+		JsonObject after = before.deepCopy();
+		after.getAsJsonObject("player").addProperty("air", 150);
+		assertTrue(AttentionFactDelta.between(before, after, 9L, 125L).changedFacts().contains("player.air"),
+				"crossing half air raises the drowning attention");
+		JsonObject deeper = after.deepCopy();
+		deeper.getAsJsonObject("player").addProperty("air", 120);
+		assertFalse(AttentionFactDelta.between(after, deeper, 10L, 126L).changedFacts().contains("player.air"),
+				"air draining further inside the same band does not re-raise it (debounced)");
+		assertTrue(rawState(150, 20, true, 0, 0).requiresForcedAttention(rawState(151, 20, true, 0, 0), false),
+				"the half-air crossing is delivered at once, not with the next routine sample");
+		assertFalse(rawState(140, 20, true, 0, 0).requiresForcedAttention(rawState(141, 20, true, 0, 0), false),
+				"air draining inside the warning band alone is not forced");
+		return 4;
 	}
 
 	private static ServerObservationCollector.RawPlayerState rawState(int air, double health, boolean onGround,

@@ -51,6 +51,8 @@ Choose meaningful observed route legs between corners, landings and branches. Re
 
 Declare `program.onUnhandledAttention(mode, {reassessWhen: () => condition})` before top-level execution to filter routine unhandled attention using a pure condition you author from current facts. Cover the reasons this leg needs your next decision. Only exact false suppresses an ordinary notification; missing, unknown or failing conditions retain notification. Fresh samples, physical collision checks and authored watchers remain active. Urgent attention and existing failure, checkpoint or exhaustion requests bypass this filter. Omitting it keeps normal attention behavior.
 
+Water is traversable terrain, not a hazard: navigateTo swims at the surface and through flooded passages and onto flooded floors while one breath covers the underwater stretch, and rises for air when it does not. Manage air from underWater and airSecondsLeft. Capabilities section strategy, topic water, has swimming and underwater mining details.
+
 Check every movement receipt and stop for a new decision on the first blocked leg. The filter does not turn a single failed action into a model request by itself. After your attention and watcher declarations, use this ArenaScript fragment with the observed leg you chose:
 
 ```javascript
@@ -367,6 +369,18 @@ Optional finish:{summary} requests verification of the immutable active goal aft
 {"tool":"sequence","arguments":{"actions":[{"actionType":"craft_inventory","arguments":{"recipeId":"minecraft:oak_planks","count":4,"timeoutMs":15000}},{"actionType":"craft_inventory","arguments":{"recipeId":"minecraft:stick","count":4,"timeoutMs":15000}}],"finish":{"summary":"Crafted the requested sticks; verify current inventory."}}}
 ```
 
+### takeTask
+
+With no active task, a player message in this conversation that asks you to do something is yours to accept. Call takeTask to adopt it: request defaults to that player's latest words, so rewrite it as the concrete task when that is clearer. If you have a paused task and they say "continue", call takeTask with resume:true; only an operator can give a paused agent a different task. On a completed agent, name what to continue in request. Pass requesterId only when several players messaged you. Minecraft starts the task, validates it first (PENDING: it starts by itself), or refuses (taken over, busy, paused, unclear request, requester offline) with a reason to relay using say. takeTask never replaces an active task. After success end the turn; the task turn starts at once with every tool. Plain chat needs only say.
+
+```json executor-call
+{"tool":"takeTask","arguments":{"request":"Craft a stone pickaxe and bring it to me."}}
+```
+
+```json executor-bad-call
+{"tool":"takeTask","arguments":{"requesterId":"Lucas"}}
+```
+
 ### finish
 
 Ask Minecraft to verify the immutable active goal. A failed check keeps the goal active.
@@ -417,6 +431,22 @@ Fields: `targetId`, `timeoutMs`.
 
 ```json executor-call
 {"tool":"act","arguments":{"actionType":"attack","arguments":{"targetId":"550e8400-e29b-41d4-a716-446655440000","timeoutMs":15000}}}
+```
+
+### fight_target
+
+Fields: `targetId`, `timeoutMs`, optional `desiredRange` (1..6, default 2.5), `fleeAtHealth` and `continueWithAttackers` (default true). You chose to fight: the body selects the best hotbar weapon (sword > axe > other tool), turns, closes to reach, swings only at a full attack charge and steps back after each hit. When the target dies it continues to the nearest mob already attacking you (never a creeper, never one that is not attacking) until none remain; pass `continueWithAttackers:false` to stop after the named target. Results: `TARGET_KILLED`, `TARGET_GONE`, `LOW_HEALTH_BAILOUT` (your fleeAtHealth reached; decide next), `TARGET_UNREACHABLE`, `TARGET_ESCAPED`, or `FIGHT_TIMED_OUT`; each message lists all kills and any remaining threats (uuid, distance, swelling creepers). The target may be a `player.threat` uuid behind you.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"fight_target","arguments":{"targetId":"550e8400-e29b-41d4-a716-446655440000","timeoutMs":15000,"fleeAtHealth":6}}}
+```
+
+### flee_from
+
+Fields: `targetId`, `distance` (1..64), `timeoutMs`. Sprints away from the target and every other hostile threat within 16 blocks (nearer ones and creepers, especially swelling ones, push hardest), jumping steps and steering around walls, hazards and deep drops, until at least `distance` away and the target is not closing (`ESCAPED`), it lost you (`TARGET_LOST`), it is gone (`TARGET_GONE`), or `FLEE_TIMED_OUT`. It never ends while another threat inside `distance` is still closing in or any creeper is within 7 blocks. Use this, not navigation, to escape; navigation stops at its point while the mob keeps chasing.
+
+```json executor-call
+{"tool":"act","arguments":{"actionType":"flee_from","arguments":{"targetId":"550e8400-e29b-41d4-a716-446655440000","distance":12,"timeoutMs":8000}}}
 ```
 
 ### select_item

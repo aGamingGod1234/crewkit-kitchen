@@ -2,11 +2,13 @@ package dev.agaminggod.arenaagents.client.pov.input;
 
 import dev.agaminggod.arenaagents.client.pov.PovClient;
 import dev.agaminggod.arenaagents.client.pov.PovClientSession;
+import dev.agaminggod.arenaagents.client.pov.PovHudProxy;
 import dev.agaminggod.arenaagents.client.pov.PovLook;
 import dev.agaminggod.arenaagents.client.pov.screen.PovScreens;
 import dev.agaminggod.arenaagents.pov.OperatorAction;
 import dev.agaminggod.arenaagents.pov.OperatorActionPayload;
 import dev.agaminggod.arenaagents.pov.OperatorInputPayload;
+import dev.agaminggod.arenaagents.pov.OperatorTextPayload;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.minecraft.client.Minecraft;
@@ -48,6 +50,8 @@ public final class OperatorInputSender {
 
 	public static void observeServerSlot(int slot) {
 		CAPTURE.observeServerSlot(slot);
+		// The state payload just wrote the server's slot into the HUD; keep a pending local choice on screen.
+		if (PovClient.isTakeover()) PovHudProxy.showSelectedSlot(CAPTURE.selectedSlot());
 	}
 
 	/** Runs at the head of Minecraft.handleKeybinds so vanilla finds no clicks to act on. */
@@ -74,6 +78,20 @@ public final class OperatorInputSender {
 		PovClientSession session = PovClient.session().filter(PovClientSession::takeover).orElse(null);
 		if (session == null) return;
 		send(Minecraft.getInstance(), new OperatorActionPayload(session.sessionId(), nextSequence(), action, a, b, c));
+	}
+
+	/** Text typed into a vanilla screen for the agent (anvil, sign, book); spectators never send anything. */
+	public static void sendText(java.util.function.BiFunction<Long, Integer, OperatorTextPayload> build) {
+		PovClientSession session = PovClient.session().filter(PovClientSession::takeover).orElse(null);
+		if (session == null) return;
+		send(Minecraft.getInstance(), build.apply(session.sessionId(), nextSequence()));
+	}
+
+	/** A creative inventory change for a creative agent (slot -1 drops the stack). */
+	public static void sendCreativeSlot(short slot, net.minecraft.world.item.ItemStack stack) {
+		PovClientSession session = PovClient.session().filter(PovClientSession::takeover).orElse(null);
+		if (session == null) return;
+		send(Minecraft.getInstance(), new dev.agaminggod.arenaagents.pov.OperatorCreativeSlotPayload(session.sessionId(), nextSequence(), slot, stack));
 	}
 
 	private static void tick(Minecraft client) {
@@ -103,12 +121,16 @@ public final class OperatorInputSender {
 			CAPTURE.skipFrame();
 			return;
 		}
+		CAPTURE.setSprintWindow(client.options.sprintWindow().get());
 		PovInputCapture.Frame frame = CAPTURE.nextFrame();
+		PovHudProxy.showSelectedSlot(frame.selectedSlot());
 		float yaw = PovLook.yaw();
 		float pitch = PovLook.pitch();
 		long sessionId = session.sessionId();
-		if (send(client, new OperatorInputPayload(sessionId, nextSequence(), frame.forward(), frame.strafe(),
+		int frameSequence = nextSequence();
+		if (send(client, new OperatorInputPayload(sessionId, frameSequence, frame.forward(), frame.strafe(),
 				yaw, pitch, frame.heldFlags(), frame.selectedSlot()))) {
+			PovClient.inputFrameSent(frameSequence);
 			framesSent = true;
 			frameSessionId = sessionId;
 			lastYaw = yaw;

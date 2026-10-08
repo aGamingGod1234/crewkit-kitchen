@@ -67,13 +67,15 @@ export function validateAction(value) {
 			requireIntRange(action.selectedSlot, 'action.selectedSlot', 0, 8);
 			requireOneOf(action.hand, 'action.hand', ['main', 'off']);
 			requireIntRange(action.ticks, 'action.ticks', 1, 200);
+			if (action.instantLook !== undefined) requireBoolean(action.instantLook, 'action.instantLook');
 			break;
 		case 'control_sequence':
 			if (!Array.isArray(action.frames) || action.frames.length < 1 || action.frames.length > 64) throw invalid('INVALID_FIELD', 'action.frames must contain 1 to 64 frames');
 			requireIntRange(action.maxTicks, 'action.maxTicks', 1, 2000);
 			for (const frame of action.frames) {
 				requireObject(frame, 'frame');
-				requireKeys(frame, [...ACTION_FIELDS.control, 'branches'], 'frame', ACTION_FIELDS.control);
+				requireKeys(frame, [...ACTION_FIELDS.control, 'branches'], 'frame',
+					ACTION_FIELDS.control.filter((field) => !OPTIONAL_ACTION_FIELDS.control.includes(field)));
 				const { branches, ...input } = frame;
 				validateAction({ type: 'control', ...input });
 				if (branches === undefined) continue;
@@ -99,6 +101,22 @@ export function validateAction(value) {
 			break;
 		case 'attack':
 			requireTargetId(action.targetId, 'action.targetId');
+			requireDuration(action.timeoutMs, 'action.timeoutMs');
+			break;
+		case 'fight_target':
+			requireTargetId(action.targetId, 'action.targetId');
+			if (action.desiredRange !== undefined) requireFiniteRange(action.desiredRange, 'action.desiredRange', 1, 6);
+			if (action.fleeAtHealth !== undefined) requireFiniteRange(action.fleeAtHealth, 'action.fleeAtHealth', 0, 2048);
+			if (action.continueWithAttackers !== undefined) requireBoolean(action.continueWithAttackers, 'action.continueWithAttackers');
+			// The model picks the policy; Minecraft only applies it. named (default) never switches by itself.
+			// Players are never follow-through or policy candidates unless the model opts in.
+			if (action.includePlayers !== undefined) requireBoolean(action.includePlayers, 'action.includePlayers');
+			if (action.targetPolicy !== undefined) requireOneOf(action.targetPolicy, 'action.targetPolicy', ['named', 'highest_risk', 'nearest_attacker']);
+			requireDuration(action.timeoutMs, 'action.timeoutMs');
+			break;
+		case 'flee_from':
+			requireTargetId(action.targetId, 'action.targetId');
+			requireFiniteRange(action.distance, 'action.distance', 1, 64);
 			requireDuration(action.timeoutMs, 'action.timeoutMs');
 			break;
 		case 'transfer_container':

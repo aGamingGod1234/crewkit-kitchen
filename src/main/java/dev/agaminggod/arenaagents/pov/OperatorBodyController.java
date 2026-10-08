@@ -19,6 +19,14 @@ public interface OperatorBodyController {
 	/** Performs a one-shot action against the agent immediately. */
 	void applyAction(ServerPlayer operator, OperatorActionPayload action);
 
+	/** Relays text typed into a vanilla screen (anvil name, sign, book) to the agent's body. */
+	default void applyText(OperatorTextPayload text) {
+	}
+
+	/** Relays a creative inventory slot change (or drop, slot -1) to a creative agent's body. */
+	default void applyCreativeSlot(OperatorCreativeSlotPayload slot) {
+	}
+
 	/** Called every server tick while active; re-acquires leases that lifecycle events cleared and applies input. */
 	void tick();
 
@@ -26,4 +34,9 @@ public interface OperatorBodyController {
 	void end();
 
 	boolean active();
+
+	/** Sequence of the last input frame applied to the body, 0 before any; echoed in poses for latency checks. */
+	default int lastInputSequence() {
+		return 0;
+	}
 }

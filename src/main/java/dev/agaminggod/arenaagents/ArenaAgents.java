@@ -18,6 +18,7 @@ public final class ArenaAgents implements ModInitializer {
 		AgentModelArgumentType.register();
 		PayloadTypeRegistry.clientboundPlay().register(GoalPayload.TYPE, GoalPayload.CODEC);
 		AgentControlSync.register();
+		dev.agaminggod.arenaagents.risk.RiskOverlayPublisher.register();
 		ArenaAgentCommands.register();
 		CodexAgentCommands.register();
 		CodexAgentServerRuntime.register();

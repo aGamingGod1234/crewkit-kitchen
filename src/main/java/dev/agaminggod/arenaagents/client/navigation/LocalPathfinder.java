@@ -19,12 +19,20 @@ public final class LocalPathfinder implements PathPlanner {
 	public static final int MAX_DROP_BLOCKS = 3;
 	public static final int MAX_RETAINED_NODES = 32_768;
 	public static final int MAX_EXPANDED_NODES_PER_SLICE = 512;
+	/**
+	 * Consecutive submerged cells a route may cross on one full breath: vanilla 300 air less a 60-tick reserve is 12 s,
+	 * at a conservative 2 blocks/s. Callers pass the live breath for the run that contains the start.
+	 */
+	public static final int FULL_BREATH_SUBMERGED_NODES = 24;
 
 	private static final int WALK_COST = 10;
 	private static final int JUMP_UP_COST = 14;
 	private static final int JUMP_GAP_COST = 18;
 	private static final int DROP_BASE_COST = 11;
 	private static final int DROP_PER_BLOCK_COST = 1;
+	private static final int SURFACE_SWIM_COST = 16;
+	/** Submerged swimming costs more so a dry or surface route of similar length wins. */
+	private static final int SUBMERGED_SWIM_COST = 20;
 	private static final int HEIGHT_HEURISTIC_COST = 1;
 	private static final int[][] CARDINAL_OFFSETS = {
 		{1, 0},
@@ -94,14 +102,23 @@ public final class LocalPathfinder implements PathPlanner {
 			return PathPlan.failed(PathOutcome.INVALID, 0);
 		}
 		if (start.equals(destination)) return new PathPlan(List.of(new PathNode(start, TraversalType.START)), PathOutcome.FOUND, 0);
-		return new Search(start, Set.of(destination), destination, 0, Set.of()).advance(view, budget);
+		return new Search(start, Set.of(destination), destination, 0, Set.of(), FULL_BREATH_SUBMERGED_NODES).advance(view, budget);
 	}
 
 	/** Retains one bounded search. The caller must discard it when its terrain snapshot changes. */
 	public Search beginSearch(GridPosition start, Set<GridPosition> goals, GridPosition destination,
 			int radius, Set<GridPosition> previousFrontiers) {
+		return beginSearch(start, goals, destination, radius, previousFrontiers, FULL_BREATH_SUBMERGED_NODES);
+	}
+
+	/**
+	 * As {@link #beginSearch(GridPosition, Set, GridPosition, int, Set)} where the start's submerged run may continue
+	 * for at most {@code startBreathNodes} cells (the swimmer's remaining air); later runs get a full breath.
+	 */
+	public Search beginSearch(GridPosition start, Set<GridPosition> goals, GridPosition destination,
+			int radius, Set<GridPosition> previousFrontiers, int startBreathNodes) {
 		if (radius < 1 || radius > 64) throw new IllegalArgumentException("local search radius must be 1..64");
-		return new Search(start, goals, destination, radius, previousFrontiers);
+		return new Search(start, goals, destination, radius, previousFrontiers, startBreathNodes);
 	}
 
 	public static final class Search {
@@ -113,14 +130,18 @@ public final class LocalPathfinder implements PathPlanner {
 		private final PriorityQueue<SearchNode> open = new PriorityQueue<>(OPEN_ORDER);
 		private final Map<GridPosition, Long> bestCosts = new HashMap<>();
 		private final Map<GridPosition, ParentEdge> parents = new HashMap<>();
+		/** Submerged cells still allowed before the route must reach air, per best-cost position. */
+		private final Map<GridPosition, Integer> breath = new HashMap<>();
+		private final int startBreathNodes;
 		private final Set<GridPosition> closed = new HashSet<>();
 		private SearchNode frontier;
 		private long nextSequence;
 		private boolean finished;
 
 		private Search(GridPosition start, Set<GridPosition> goals, GridPosition destination,
-				int radius, Set<GridPosition> previousFrontiers) {
+				int radius, Set<GridPosition> previousFrontiers, int startBreathNodes) {
 			this.start = Objects.requireNonNull(start);
+			this.startBreathNodes = Math.max(0, Math.min(FULL_BREATH_SUBMERGED_NODES, startBreathNodes));
 			this.goals = Set.copyOf(goals);
 			this.destination = Objects.requireNonNull(destination);
 			this.radius = radius;
@@ -153,6 +174,8 @@ public final class LocalPathfinder implements PathPlanner {
 				if (!budget.tryExpand()) return PathPlan.failed(budget.exhaustionOutcome(), budget.expandedNodes() - expandedAtStart);
 				open.remove();
 				closed.add(current.position());
+				int currentBreath = breath.computeIfAbsent(current.position(),
+						ignored -> view.isSubmerged(start) ? startBreathNodes : FULL_BREATH_SUBMERGED_NODES);
 				if (radius > 0 && isFrontier(view, current.position())
 						&& (frontier == null || current.heuristicCost() < frontier.heuristicCost()
 						|| (current.heuristicCost() == frontier.heuristicCost() && current.pathCost() < frontier.pathCost()))) {
@@ -163,10 +186,14 @@ public final class LocalPathfinder implements PathPlanner {
 					long candidateCost = saturatedAdd(current.pathCost(), neighbor.cost());
 					long knownCost = bestCosts.getOrDefault(neighbor.position(), Long.MAX_VALUE);
 					if (candidateCost >= knownCost) continue;
+					// Reaching air (or never leaving it) restores a full breath; each submerged cell spends one.
+					int neighborBreath = view.isSubmerged(neighbor.position()) ? currentBreath - 1 : FULL_BREATH_SUBMERGED_NODES;
+					if (neighborBreath < 0) continue;
 					if (!bestCosts.containsKey(neighbor.position()) && bestCosts.size() >= MAX_RETAINED_NODES) {
 						return finish(frontierPlan(PathOutcome.NODE_LIMIT, budget.expandedNodes() - expandedAtStart));
 					}
 					bestCosts.put(neighbor.position(), candidateCost);
+					breath.put(neighbor.position(), neighborBreath);
 					parents.put(neighbor.position(), new ParentEdge(current.position(), neighbor.traversal()));
 					open.add(new SearchNode(neighbor.position(), candidateCost,
 							heuristic(neighbor.position(), destination), nextSequence++));
@@ -183,6 +210,8 @@ public final class LocalPathfinder implements PathPlanner {
 		private boolean isFrontier(WalkabilityView view, GridPosition position) {
 			int distance = distanceFromStart(position);
 			if (distance < Math.min(8, radius) || previousFrontiers.contains(position)) return false;
+			// A partial route never ends with the eyes under water; the next segment would start out of breath.
+			if (view.isSubmerged(position)) return false;
 			if (distance == radius) return true;
 			for (int[] offset : CARDINAL_OFFSETS) {
 				if (view.cellAt(position.offset(offset[0], 0, offset[1])) == WalkabilityView.Cell.UNLOADED) return true;
@@ -206,6 +235,20 @@ public final class LocalPathfinder implements PathPlanner {
 			for (int dy : new int[]{1, -1}) {
 				GridPosition vertical = current.offset(0, dy, 0);
 				if (view.isTraversable(vertical)) neighbors.add(new Neighbor(vertical, TraversalType.CLIMB, 16));
+			}
+		}
+		if (view.cellAt(current) == WalkabilityView.Cell.WATER) {
+			// Swim straight up or down a flooded column, as a player does with jump held or released.
+			for (int dy : new int[]{1, -1}) {
+				GridPosition vertical;
+				try {
+					vertical = current.offset(0, dy, 0);
+				} catch (ArithmeticException exception) {
+					continue;
+				}
+				if (view.traversalAt(vertical) == TraversalType.SWIM) {
+					neighbors.add(new Neighbor(vertical, TraversalType.SWIM, swimCost(view, vertical)));
+				}
 			}
 		}
 		for (int[] offset : CARDINAL_OFFSETS) {
@@ -235,7 +278,8 @@ public final class LocalPathfinder implements PathPlanner {
 	) {
 		TraversalType traversal = view.traversalAt(sameLevel);
 		if (traversal != null) {
-			return new Neighbor(sameLevel, traversal, traversal == TraversalType.WALK ? WALK_COST : 16);
+			return new Neighbor(sameLevel, traversal, traversal == TraversalType.WALK ? WALK_COST
+					: traversal == TraversalType.SWIM ? swimCost(view, sameLevel) : 16);
 		}
 
 		GridPosition jumpDestination;
@@ -301,6 +345,10 @@ public final class LocalPathfinder implements PathPlanner {
 			}
 		}
 		return true;
+	}
+
+	private static int swimCost(WalkabilityView view, GridPosition position) {
+		return view.isSubmerged(position) ? SUBMERGED_SWIM_COST : SURFACE_SWIM_COST;
 	}
 
 	private static boolean isStandable(WalkabilityView view, GridPosition position) {

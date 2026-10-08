@@ -353,9 +353,87 @@ public final class MultiplexedServerBridgeVerification {
 				"idle conversation cannot publish chat");
 		assertTrue(!MultiplexedServerBridge.isDetachedConversationReply(idle, publicReply),
 				"public chat cannot enter the detached reply executor");
-		assertTrue(!MultiplexedServerBridge.acceptsActionRevision(idle, new ServerActionRequest(
+		ServerActionRequest idleBody = new ServerActionRequest(
 				idle.agentId(), idle.goalRevision(), "idle-wait", ActionType.WAIT, new JsonObject(), provenance
-		)), "idle conversation cannot execute physical actions");
+		);
+		assertTrue(MultiplexedServerBridge.acceptsActionRevision(idle, idleBody)
+				&& MultiplexedServerBridge.isDetachedBodyAction(idle, idleBody),
+				"with no task the model still owns its body: a same-revision physical action runs detached");
+		assertTrue(!MultiplexedServerBridge.acceptsActionRevision(idle, new ServerActionRequest(
+				idle.agentId(), idle.goalRevision() + 1L, "idle-wait-stale", ActionType.WAIT, new JsonObject(), provenance
+		)), "a detached body action cannot cross a lifecycle revision");
+		ServerActionRequest pickUp = new ServerActionRequest(
+				idle.agentId(), idle.goalRevision(), "idle-pick-up", ActionType.PICK_UP_ITEM, new JsonObject(), provenance
+		);
+		assertTrue(MultiplexedServerBridge.isDetachedBodyAction(idle, pickUp), "with no task the model may pick up food it hunted");
+		JsonObject wheat = new JsonObject();
+		wheat.addProperty("expectedBlockId", "minecraft:wheat");
+		assertTrue(MultiplexedServerBridge.isDetachedBodyAction(idle, new ServerActionRequest(
+				idle.agentId(), idle.goalRevision(), "idle-harvest", ActionType.BREAK_BLOCK, wheat, provenance
+		)), "with no task the model may harvest a crop to eat");
+		JsonObject stone = new JsonObject();
+		stone.addProperty("expectedBlockId", "minecraft:stone");
+		assertTrue(!MultiplexedServerBridge.acceptsActionRevision(idle, new ServerActionRequest(
+				idle.agentId(), idle.goalRevision(), "idle-mine", ActionType.BREAK_BLOCK, stone, provenance
+		)), "breaking anything but food still needs a task");
+		JsonObject malformed = new JsonObject();
+		malformed.add("expectedBlockId", new JsonObject());
+		assertTrue(!MultiplexedServerBridge.acceptsActionRevision(idle, new ServerActionRequest(
+				idle.agentId(), idle.goalRevision(), "idle-malformed", ActionType.BREAK_BLOCK, malformed, provenance
+		)), "a malformed expected block is refused, not thrown");
+		assertTrue(!MultiplexedServerBridge.acceptsActionRevision(idle, new ServerActionRequest(
+				idle.agentId(), idle.goalRevision(), "idle-place", ActionType.PLACE_BLOCK, new JsonObject(), provenance
+		)), "placing still needs a task");
+		JsonObject walk = new JsonObject();
+		walk.addProperty("attack", false);
+		walk.addProperty("use", false);
+		assertTrue(MultiplexedServerBridge.isDetachedBodyAction(idle, new ServerActionRequest(
+				idle.agentId(), idle.goalRevision(), "idle-walk", ActionType.CONTROL, walk, provenance
+		)), "with no task raw movement frames still run");
+		JsonObject swing = walk.deepCopy();
+		swing.addProperty("attack", true);
+		assertTrue(!MultiplexedServerBridge.acceptsActionRevision(idle, new ServerActionRequest(
+				idle.agentId(), idle.goalRevision(), "idle-swing", ActionType.CONTROL, swing, provenance
+		)), "a held attack in a control frame could break any block, so it needs a task");
+		JsonObject frames = new JsonObject();
+		com.google.gson.JsonArray sequence = new com.google.gson.JsonArray();
+		sequence.add(walk.deepCopy());
+		JsonObject place = walk.deepCopy();
+		place.addProperty("use", true);
+		sequence.add(place);
+		frames.add("frames", sequence);
+		assertTrue(!MultiplexedServerBridge.acceptsActionRevision(idle, new ServerActionRequest(
+				idle.agentId(), idle.goalRevision(), "idle-frames", ActionType.CONTROL_SEQUENCE, frames, provenance
+		)), "a use frame in a control sequence needs a task");
+		JsonObject sweetBerry = new JsonObject();
+		sweetBerry.addProperty("expectedBlockId", "minecraft:sweet_berry_bush");
+		assertTrue(!MultiplexedServerBridge.acceptsActionRevision(idle, new ServerActionRequest(
+				idle.agentId(), idle.goalRevision(), "idle-break-bush", ActionType.BREAK_BLOCK, sweetBerry, provenance
+		)), "berries are picked by right-click, not by breaking the bush");
+		assertTrue(MultiplexedServerBridge.isDetachedBodyAction(idle, new ServerActionRequest(
+				idle.agentId(), idle.goalRevision(), "idle-pick-berries", ActionType.INTERACT_BLOCK, new JsonObject(), provenance
+		)), "a right-click passes the static gate; the live target must be ripe berries");
+		java.util.function.Function<String, java.util.Map<String, String>> age = value -> java.util.Map.of("age", value);
+		assertTrue(dev.agaminggod.arenaagents.server.runtime.DetachedFoodTargets.harvestableByBreaking("minecraft:wheat", age.apply("7")), "grown wheat is food");
+		assertTrue(!dev.agaminggod.arenaagents.server.runtime.DetachedFoodTargets.harvestableByBreaking("minecraft:wheat", age.apply("6")), "growing wheat is not harvested");
+		assertTrue(dev.agaminggod.arenaagents.server.runtime.DetachedFoodTargets.harvestableByBreaking("minecraft:beetroots", age.apply("3")), "grown beetroots are food");
+		assertTrue(dev.agaminggod.arenaagents.server.runtime.DetachedFoodTargets.harvestableByBreaking("minecraft:melon", java.util.Map.of()), "a melon is food");
+		assertTrue(!dev.agaminggod.arenaagents.server.runtime.DetachedFoodTargets.harvestableByBreaking("minecraft:stone", java.util.Map.of()), "stone is not food");
+		assertTrue(dev.agaminggod.arenaagents.server.runtime.DetachedFoodTargets.harvestableByUse("minecraft:sweet_berry_bush", age.apply("2")), "a bush with berries is picked");
+		assertTrue(!dev.agaminggod.arenaagents.server.runtime.DetachedFoodTargets.harvestableByUse("minecraft:sweet_berry_bush", age.apply("1")), "a bush without berries is not");
+		assertTrue(dev.agaminggod.arenaagents.server.runtime.DetachedFoodTargets.harvestableByUse("minecraft:cave_vines_plant", java.util.Map.of("berries", "true")), "glow berries are picked");
+		assertTrue(!dev.agaminggod.arenaagents.server.runtime.DetachedFoodTargets.harvestableByUse("minecraft:cave_vines", java.util.Map.of("berries", "false")), "bare vines are not");
+		assertTrue(!dev.agaminggod.arenaagents.server.runtime.DetachedFoodTargets.harvestableByUse("minecraft:chest", java.util.Map.of()), "a chest is not food");
+		assertTrue(dev.agaminggod.arenaagents.server.runtime.DetachedFoodTargets.explicitItem("nearest_item") == null,
+				"with no task a pick-up must name the exact item, so its stack can be checked for food");
+		assertTrue(dev.agaminggod.arenaagents.server.runtime.DetachedFoodTargets.explicitItem("00000000-0000-0000-0000-0000000000d1") != null, "an item UUID is checkable");
+		try {
+			dev.agaminggod.arenaagents.server.runtime.DetachedFoodTargets.require(null, ActionType.PICK_UP_ITEM, new JsonObject());
+			throw new AssertionError("a detached pick-up without a body must be refused");
+		} catch (dev.agaminggod.arenaagents.agent.AgentDomainException expected) {
+			assertTrue("PLAYER_UNAVAILABLE".equals(expected.code()), "refused for want of a body");
+		}
+		dev.agaminggod.arenaagents.server.runtime.DetachedFoodTargets.require(null, ActionType.FIGHT_TARGET, new JsonObject());
 		assertTrue(!MultiplexedServerBridge.acceptsActionRevision(idle, new ServerActionRequest(
 				idle.agentId(), idle.goalRevision() + 1L, "idle-stale", ActionType.CHAT, direct, provenance
 		)), "idle conversation cannot cross a lifecycle revision");

@@ -59,6 +59,8 @@ public final class BoundedServerTaskQueueVerification {
 				"control traffic is isolated from bulk traffic");
 		assertEquals(BoundedServerTaskQueue.Lane.CONTROL, MultiplexedServerBridge.inboundLane("agent_notice"),
 				"launch-time agent notices ride the control lane");
+		assertEquals(BoundedServerTaskQueue.Lane.CONTROL, MultiplexedServerBridge.inboundLane("task_request"),
+				"model task requests ride the control lane with other lifecycle requests");
 		assertEquals(BoundedServerTaskQueue.Lane.BULK, MultiplexedServerBridge.inboundLane("verbose_event"),
 				"verbose telemetry cannot consume reserved action capacity");
 

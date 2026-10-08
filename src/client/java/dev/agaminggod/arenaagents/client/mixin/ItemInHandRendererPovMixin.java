@@ -108,7 +108,9 @@ abstract class ItemInHandRendererPovMixin {
 			return;
 		}
 		AbstractClientPlayer agent = PovClient.agentPlayer();
-		if (agent != null) original.call(renderer, agent, partialTick, pitch, hand, attack, stack, inverseArmHeight, poseStack, collector, light);
+		// Spectate free look hides the hands until the camera is back on the agent's look (PovClient.handsHidden).
+		if (agent != null && !PovClient.handsHidden())
+			original.call(renderer, agent, partialTick, pitch, hand, attack, stack, inverseArmHeight, poseStack, collector, light);
 	}
 
 	// Hand selection (bow, crossbow, charged crossbow, item in use) keeps vanilla's logic on the agent's items.

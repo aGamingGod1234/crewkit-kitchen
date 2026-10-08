@@ -8,16 +8,21 @@ import { validateAction } from './schema.mjs';
 import { validateProgramParameters } from './program-parameters.mjs';
 
 const TERMINAL = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT']);
+// Session trace: ordinary sightings re-woke the model every ~3 s while a program ran (305 of 358 turns ended with no tool call).
+export const ORDINARY_ATTENTION_INTERVAL_MS = 30_000;
 
 /** Runs selected-model ArenaScript through native tools, returning every new decision to its caller. */
 export class NativeProgramExecutor {
-	#runs = new Map(); #setTimeout; #clearTimeout; #cancellationTimeoutMs; #sessionId; #sequence = 0;
-	constructor({ setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout, cancellationTimeoutMs = 5_000, sessionId = randomUUID() } = {}) {
+	#runs = new Map(); #setTimeout; #clearTimeout; #cancellationTimeoutMs; #sessionId; #sequence = 0; #now; #ordinaryAttentionIntervalMs;
+	constructor({ setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout, cancellationTimeoutMs = 5_000, sessionId = randomUUID(), now = Date.now, ordinaryAttentionIntervalMs = ORDINARY_ATTENTION_INTERVAL_MS } = {}) {
 		if (typeof setTimeoutFn !== 'function' || typeof clearTimeoutFn !== 'function') throw new TypeError('timer callbacks are required');
 		if (typeof sessionId !== 'string' || !/^[A-Za-z0-9._:-]{1,128}$/.test(sessionId)) throw new TypeError('sessionId must be a bounded identifier');
 		this.#sessionId = createHash('sha256').update(sessionId).digest('hex').slice(0, 32);
 		integer(cancellationTimeoutMs, 'cancellationTimeoutMs', 1, 10_000);
 		this.#setTimeout = setTimeoutFn; this.#clearTimeout = clearTimeoutFn; this.#cancellationTimeoutMs = cancellationTimeoutMs;
+		if (typeof now !== 'function') throw new TypeError('now must be a function');
+		integer(ordinaryAttentionIntervalMs, 'ordinaryAttentionIntervalMs', 0, 600_000);
+		this.#now = now; this.#ordinaryAttentionIntervalMs = ordinaryAttentionIntervalMs;
 	}
 
 	run(record, { source, parameters, maxActions = 64, timeoutMs = 30_000, expectedDurationMs, planningLeadMs, observationIntervalMs, programId: suppliedProgramId, provenance = {} } = {}, context = {}) {
@@ -41,7 +46,7 @@ export class NativeProgramExecutor {
 		const run = { record: { ...record }, context, programId, maxActions, timeoutMs, expectedDurationMs, planningLeadMs: planningLeadMs ?? null, actions: 0, actionsSucceeded: 0, actionsFailed: 0, receipts: [], resolve, result,
 			settled: false, bodyPending: false, pendingActionId: null, stopping: null, timer: null, planningDueTimer: null, planningDueNotified: false, planningDueVersion: null, cancellationTimer: null,
 			observation: programObservation(context.observation), eventSequence: context.eventSequence, engine: null,
-			observationIntervalMs, observationTimer: null, refresh: null, refreshGeneration: 0, decision: null, decisionSequence: 0 };
+			observationIntervalMs, observationTimer: null, refresh: null, refreshGeneration: 0, decision: null, decisionSequence: 0, notifiedDecisionId: null, lastOrdinaryNotificationAt: Number.NEGATIVE_INFINITY, ordinaryNotificationTimer: null, unseenAttention: false };
 		run.engine = new ArenaScriptEngine({
 			dispatch: (command) => { void this.#dispatch(run, command); },
 			cancel: (actionId) => { void this.#cancelBody(run, actionId); },
@@ -95,8 +100,11 @@ export class NativeProgramExecutor {
 		if (!run || run.record.goalRevision !== record.goalRevision || run.settled) return false;
 		if (!Number.isSafeInteger(payload.eventSequence) || payload.eventSequence <= run.eventSequence) return false;
 		try {
+			const previousObservation = run.observation;
 			run.observation = programObservation(payload.observation ?? payload);
 			run.eventSequence = payload.eventSequence;
+			// A new hazard in view, lost health or air, or a changed dimension/readiness is never held back.
+			if (hazardEdge(previousObservation, run.observation)) run.lastOrdinaryNotificationAt = Number.NEGATIVE_INFINITY;
 			if (run.refresh?.purpose === 'interval') {
 				// A newer publication replaces background sampling, but cannot replace
 				// the terminal-effect barrier owned by a completed action.
@@ -109,7 +117,15 @@ export class NativeProgramExecutor {
 			// A new attention event invalidates an older decision. Ordinary progress
 			// refreshes facts without starving a model response on every physics tick.
 			if (payload.attention === true && run.decision !== null && run.decisionSequence === decisionSequence) {
-				this.#requestDecision(run, run.engine.refreshDirectiveRequest(), payload.priority ?? 'ordinary');
+				const priority = payload.priority ?? 'ordinary';
+				const request = run.engine.refreshDirectiveRequest();
+				// Only escalation (urgent attention or a changed action failure) needs a new handle. Ordinary sightings keep
+				// the pending decision (so an in-flight respondProgram stays valid) and only refresh its facts.
+				if (priority === 'urgent' || this.#escalates(run, request)) this.#requestDecision(run, request, priority);
+				else {
+					this.#foldOrdinary(run, request);
+					this.#notifyDecision(run, priority);
+				}
 			}
 			this.#check(run);
 			return true;
@@ -147,15 +163,79 @@ export class NativeProgramExecutor {
 		run.decision = { decisionId: `${run.programId}:decision-${++run.decisionSequence}`, programVersion: request.version,
 			trigger: request.trigger, priority: request.priority, eventSequence: request.eventSequence,
 			...(request.actionFailure === undefined ? {} : { actionFailure: request.actionFailure }) };
+		run.unseenAttention = true;
 		// The engine must finish applying the authored attention policy first.
 		const decision = run.decision;
 		queueMicrotask(() => {
 			if (run.settled || run.decision !== decision) return;
-			// The pending request retains its highest urgency, but later ordinary
-			// discoveries must not repeatedly interrupt that same reconsideration.
-			try { run.context.onDecision(this.status(run.record), { priority: notificationPriority }); }
-			catch (error) { this.#return(run, failure(error, 'PROGRAM_NOTIFICATION_FAILED'), true); }
+			this.#notifyDecision(run, notificationPriority);
 		});
+	}
+
+	/**
+	 * Wakes the model for the pending decision. Ordinary attention on a routine that keeps running
+	 * (nothing is paused, no action failed) is not urgent: one notification per window carries the
+	 * latest facts, instead of a fresh model call for every sighting while the authored work continues.
+	 * Urgent, failed or paused decisions always notify at once.
+	 */
+	#notifyDecision(run, notificationPriority) {
+		if (run.settled || run.decision === null) return;
+		// A folded sighting on an idle or paused body: the model already holds this handle and answers it with the
+		// newest facts, so it is told once, not once per observation.
+		if (!this.#deferrableOrdinary(run, notificationPriority) && notificationPriority !== 'urgent'
+			&& run.notifiedDecisionId === run.decision.decisionId && run.ordinaryNotificationTimer === null) return;
+		if (this.#deferrableOrdinary(run, notificationPriority)) {
+			const dueAt = run.lastOrdinaryNotificationAt + this.#ordinaryAttentionIntervalMs;
+			const now = this.#now();
+			if (now < dueAt) {
+				if (run.ordinaryNotificationTimer === null) {
+					run.ordinaryNotificationTimer = this.#setTimeout(() => {
+						run.ordinaryNotificationTimer = null;
+						this.#notifyDecision(run, run.decision?.priority ?? 'ordinary');
+					}, dueAt - now);
+					run.ordinaryNotificationTimer?.unref?.();
+				}
+				return;
+			}
+			run.lastOrdinaryNotificationAt = now;
+		}
+		this.#clearOrdinaryNotification(run);
+		run.unseenAttention = false;
+		run.notifiedDecisionId = run.decision.decisionId;
+		// The pending request retains its highest urgency, but later ordinary
+		// discoveries must not repeatedly interrupt that same reconsideration.
+		try { run.context.onDecision(this.status(run.record), { priority: notificationPriority }); }
+		catch (error) { this.#return(run, failure(error, 'PROGRAM_NOTIFICATION_FAILED'), true); }
+	}
+
+	/** A new decision handle is owed only for a higher urgency, a changed action failure or a new urgent trigger. */
+	#escalates(run, request) {
+		if (!request) return false;
+		return request.priority !== run.decision.priority
+			|| JSON.stringify(request.actionFailure) !== JSON.stringify(run.decision.actionFailure)
+			|| (request.priority === 'urgent' && request.trigger !== run.decision.trigger);
+	}
+
+	#deferrableOrdinary(run, notificationPriority) {
+		if (notificationPriority === 'urgent' || run.decision?.priority === 'urgent' || run.decision?.actionFailure !== undefined) return false;
+		const snapshot = run.engine.snapshot();
+		// Deferring only helps while authored work keeps the body busy. A routine whose source ran out holds the
+		// body until the model answers the pending decision, so that wait must not also sit out the window.
+		return snapshot.status === 'ACTIVE' && (snapshot.activeActionId !== null || snapshot.activeQueryId !== null);
+	}
+
+	/** Newer ordinary attention folded into the pending decision: same handle, latest trigger and facts, not yet seen. */
+	#foldOrdinary(run, request) {
+		if (run.decision === null || request === null || request === undefined) return;
+		run.decision.trigger = request.trigger;
+		run.decision.eventSequence = request.eventSequence;
+		run.unseenAttention = true;
+	}
+
+	#clearOrdinaryNotification(run) {
+		if (run.ordinaryNotificationTimer === null || run.ordinaryNotificationTimer === undefined) return;
+		this.#clearTimeout(run.ordinaryNotificationTimer);
+		run.ordinaryNotificationTimer = null;
 	}
 
 	status(record) {
@@ -188,7 +268,11 @@ export class NativeProgramExecutor {
 				...(directive === 'finish' ? { finishRequested: true } : {}) }, true);
 			return run.result;
 		}
+		// The model answered what it was shown; attention folded in after that notification is still owed to it.
+		const unseen = directive === 'continue' && run.unseenAttention === true ? { trigger: request.trigger } : null;
+		run.unseenAttention = false;
 		run.engine.applyDirective({ ...request, directive, ...(compiled === null ? {} : { install: { programId, version: request.version + 1, compiled } }) });
+		if (unseen !== null && run.decision === null && run.engine.snapshot().status === 'ACTIVE') run.engine.notifyAttention({ priority: 'ordinary', trigger: unseen.trigger });
 		this.#check(run);
 		return this.status(record) ?? { state: 'ENDED' };
 	}
@@ -317,8 +401,11 @@ export class NativeProgramExecutor {
 			const request = run.engine.refreshDirectiveRequest();
 			// The shared engine coalesces failures behind an outstanding model request.
 			// Publish that changed decision without treating ordinary progress as one.
-			if (request && (request.trigger !== run.decision.trigger || request.priority !== run.decision.priority
-				|| JSON.stringify(request.actionFailure) !== JSON.stringify(run.decision.actionFailure))) this.#requestDecision(run, request);
+			// A different ordinary trigger is new facts for the same decision, not a new handle.
+			if (this.#escalates(run, request)) this.#requestDecision(run, request);
+			else if (request && request.trigger !== run.decision.trigger) this.#foldOrdinary(run, request);
+			// The body went idle behind a deferred ordinary notification: tell the model now, once.
+			if (run.decision !== null && run.ordinaryNotificationTimer !== null && !this.#deferrableOrdinary(run, run.decision.priority)) this.#notifyDecision(run, run.decision.priority);
 		}
 		const snapshot = run.engine.snapshot();
 		if (run.stopping !== null && !run.bodyPending) this.#finish(run, run.stopping);
@@ -334,6 +421,7 @@ export class NativeProgramExecutor {
 		run.settled = true;
 		this.#clearTimeout(run.timer);
 		this.#clearPlanningDue(run);
+		this.#clearOrdinaryNotification(run);
 		if (run.observationTimer !== null) this.#clearTimeout(run.observationTimer);
 		if (run.cancellationTimer !== null) this.#clearTimeout(run.cancellationTimer);
 		this.#runs.delete(run.record.agentId);
@@ -359,6 +447,30 @@ function canonicalCommand(command) {
 	const { type: validatedType, ...normalized } = validateAction({ ...args, type });
 	return Object.freeze({ ...command, action: Object.freeze({ type: validatedType, arguments: Object.freeze(normalized) }) });
 }
+const HAZARD_BLOCK = /lava|fire|magma/i;
+function hazardKeys(observation) {
+	const keys = new Set();
+	for (const block of Array.isArray(observation?.blocks) ? observation.blocks : []) {
+		const id = block?.blockId ?? block?.id;
+		if (typeof id === 'string' && HAZARD_BLOCK.test(id)) keys.add(`${id}@${block.x},${block.y},${block.z}`);
+	}
+	return keys;
+}
+const finiteValue = (value) => (Number.isFinite(value) ? value : null);
+/** Facts that must reach the model at once even when the routine itself keeps running. */
+export function hazardEdge(previous, next) {
+	if (previous === null || typeof previous !== 'object' || next === null || typeof next !== 'object') return false;
+	const before = hazardKeys(previous);
+	for (const key of hazardKeys(next)) if (!before.has(key)) return true;
+	const health = [finiteValue(previous.player?.health), finiteValue(next.player?.health)];
+	if (health[0] !== null && health[1] !== null && health[1] < health[0]) return true;
+	const air = [finiteValue(previous.player?.air ?? previous.player?.airSupply), finiteValue(next.player?.air ?? next.player?.airSupply)];
+	if (air[0] !== null && air[1] !== null && air[1] < air[0]) return true;
+	if ((previous.world?.dimension ?? null) !== (next.world?.dimension ?? null)) return true;
+	if (previous.ready !== next.ready || JSON.stringify(previous.status ?? null) !== JSON.stringify(next.status ?? null)) return true;
+	return false;
+}
+
 function programObservation(observation) {
 	return observation && Object.hasOwn(observation, 'ready') && (Object.hasOwn(observation, 'position') || observation.ready === false)
 		? adaptObservation(observation) : observation;

@@ -8,6 +8,8 @@ import dev.agaminggod.arenaagents.server.runtime.input.InputOwner;
 import dev.agaminggod.arenaagents.server.runtime.input.InputStateSink;
 import dev.agaminggod.arenaagents.server.runtime.input.LeasedServerInputController;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.UUID;
 import net.minecraft.world.InteractionHand;
@@ -29,6 +31,8 @@ public final class OperatorBodyControlVerification {
 	public static int verify() {
 		return verifyFrameDecoding()
 				+ verifyInputStateConversion()
+				+ verifySprintLatch()
+				+ verifyMinorCollision()
 				+ verifyAttackKeyTiming()
 				+ verifyUseKeyTiming()
 				+ verifyServerSelectedSlot()
@@ -80,13 +84,121 @@ public final class OperatorBodyControlVerification {
 		check(all.hand() == InteractionHand.MAIN_HAND && all.selectedSlot() == 3
 				&& all.yaw() == 30.0F && all.pitch() == -20.0F, "hand, slot and look are carried");
 		int sprintOnly = OperatorInputPayload.HELD_SPRINT;
-		check(decode(1, 0, 0, 0, sprintOnly, 0, null).toInputState(keys, false, true).sprint(), "forward sprint is kept");
-		check(!decode(-1, 0, 0, 0, sprintOnly, 0, null).toInputState(keys, false, true).sprint(), "no sprint without forward input");
-		check(!decode(1, 0, 0, 0, sprintOnly, 0, null).toInputState(keys, false, false).sprint(), "no sprint when too hungry");
+		check(decode(1, 0, 0, 0, 0, 0, null).toInputState(keys, false, true).sprint(),
+				"the latched sprint decision reaches the sink without the key held");
+		check(!decode(1, 0, 0, 0, sprintOnly, 0, null).toInputState(keys, false, false).sprint(),
+				"a held sprint key alone never bypasses the latch decision");
 		int attackOnly = OperatorInputPayload.HELD_ATTACK;
 		check(!decode(0, 0, 0, 0, attackOnly, 0, null).toInputState(keys, true, true).attack(),
 				"using an item pauses held mining like vanilla");
-		return 8;
+		return 7;
+	}
+
+	private static int verifySprintLatch() {
+		CarpetOperatorBodyController.Keys keys = new CarpetOperatorBodyController.Keys();
+		CarpetOperatorBodyController.Frame walk = decode(1, 0, 0, 0, 0, 0, null);
+		CarpetOperatorBodyController.Frame sprintKey = decode(1, 0, 0, 0, OperatorInputPayload.HELD_SPRINT, 0, null);
+		CarpetOperatorBodyController.Frame stand = decode(0, 0, 0, 0, 0, 0, null);
+		check(!keys.sprinting(walk, body(false)), "walking forward alone never sprints");
+		keys.onFrame(sprintKey);
+		check(keys.sprinting(sprintKey, body(false)), "the sprint key starts sprint while moving forward");
+		keys.onFrame(walk);
+		keys.sprintTickEnded(walk);
+		check(keys.sprinting(walk, body(true)), "sprint stays latched after the sprint key is let go");
+		check(!keys.sprinting(stand, body(true)), "letting go of forward ends sprint");
+		check(!keys.sprinting(decode(-1, 0, 0, 0, 0, 0, null), body(true)), "walking backwards ends sprint");
+		check(!keys.sprinting(walk, body(true, Body.MAJOR_COLLISION)), "running into a wall head-on ends sprint");
+		check(keys.sprinting(decode(0.70710677F, 0.70710677F, 0, 0, 0, 0, null), body(true)),
+				"a diagonal keeps forward impulse and keeps sprinting");
+		check(!keys.sprinting(walk, body(true, Body.HUNGRY)), "running out of food ends sprint");
+		check(!keys.sprinting(walk, body(true, Body.BLIND)), "blindness ends sprint");
+		check(!keys.sprinting(decode(1, 0, 0, 0, OperatorInputPayload.HELD_SNEAK, 0, null), body(true)),
+				"sneaking ends sprint");
+
+		CarpetOperatorBodyController.Keys held = new CarpetOperatorBodyController.Keys();
+		held.onFrame(sprintKey);
+		held.sprintTickEnded(sprintKey);
+		check(!held.sprinting(stand, body(false)), "no sprint starts without forward input");
+		check(!held.sprinting(decode(1, 0, 0, 0, OperatorInputPayload.HELD_SPRINT | OperatorInputPayload.HELD_SNEAK, 0, null),
+				body(false)), "no sprint starts while sneaking");
+		check(!held.sprinting(sprintKey, body(false, Body.HUNGRY)), "no sprint starts at 6 food or less");
+		check(!held.sprinting(sprintKey, body(false, Body.BLIND)), "no sprint starts while blind");
+		check(!held.sprinting(sprintKey, body(false, Body.SLOW_ITEM)), "no sprint starts while an item slows the body");
+		check(!held.sprinting(sprintKey, body(false, Body.CRAWLING)), "no sprint starts while crouching or crawling");
+		check(held.sprinting(sprintKey, body(false, Body.CRAWLING, Body.UNDER_WATER)), "crawling under water may sprint");
+		check(!held.sprinting(sprintKey, body(false, Body.FALL_FLYING)), "no sprint starts while gliding");
+		check(!held.sprinting(sprintKey, body(false, Body.SHALLOW_WATER)), "no sprint starts in shallow water");
+		check(held.sprinting(sprintKey, body(false, Body.SHALLOW_WATER, Body.FLYING)), "flying ignores shallow water");
+		check(!held.sprinting(sprintKey, body(false, Body.PASSENGER)), "a vehicle that cannot sprint blocks sprint");
+		check(held.sprinting(sprintKey, body(false, Body.PASSENGER, Body.VEHICLE_SPRINTS, Body.HUNGRY)),
+				"a sprinting vehicle ignores the rider's hunger");
+		check(held.sprinting(sprintKey, body(false)), "a held sprint key restarts sprint after a server-side stop");
+
+		CarpetOperatorBodyController.Keys tapped = new CarpetOperatorBodyController.Keys();
+		tapped.onFrame(sprintKey);
+		tapped.onFrame(walk);
+		check(tapped.sprinting(walk, body(false)), "a one-frame double-tap still counts when the next frame lands first");
+		tapped.sprintTickEnded(walk);
+		check(!tapped.sprinting(walk, body(false)), "a consumed double-tap does not restart sprint later");
+		tapped.onFrame(sprintKey);
+		tapped.newBody();
+		check(!tapped.sprinting(walk, body(false)), "a new body forgets a pending request");
+
+		CarpetOperatorBodyController.Keys swimmer = new CarpetOperatorBodyController.Keys();
+		check(swimmer.sprinting(walk, body(true, Body.SWIMMING, Body.IN_WATER, Body.MAJOR_COLLISION)),
+				"swim-sprinting ignores wall bumps like vanilla");
+		check(!swimmer.sprinting(walk, body(true, Body.SWIMMING)), "leaving the water ends swim-sprinting");
+		check(!swimmer.sprinting(stand, body(true, Body.SWIMMING, Body.IN_WATER)),
+				"letting go of forward while swimming in open water ends sprint");
+		check(swimmer.sprinting(stand, body(true, Body.SWIMMING, Body.IN_WATER, Body.ON_GROUND)),
+				"swim-sprinting on the bottom survives letting go of forward");
+		check(swimmer.sprinting(walk, body(true, Body.SWIMMING, Body.IN_WATER, Body.SHALLOW_WATER)),
+				"swim-sprinting is allowed in shallow water");
+		return 31;
+	}
+
+	private static int verifyMinorCollision() {
+		check(CarpetOperatorBodyController.SprintBody.minorCollision(0.0F, 1.0F, 0.0F, 0.0D, 0.2D),
+				"motion along the intended direction is a minor collision");
+		check(CarpetOperatorBodyController.SprintBody.minorCollision(0.0F, 1.0F, 0.0F, 0.01D, 0.2D),
+				"a few degrees off is still minor");
+		check(!CarpetOperatorBodyController.SprintBody.minorCollision(0.0F, 1.0F, 0.0F, 0.2D, 0.0D),
+				"motion sideways to the intent is a real collision");
+		check(!CarpetOperatorBodyController.SprintBody.minorCollision(0.0F, 1.0F, 0.0F, 0.0D, 0.0D),
+				"no motion at all is a head-on collision");
+		check(CarpetOperatorBodyController.SprintBody.minorCollision(90.0F, 1.0F, 0.0F, -0.2D, 0.0D),
+				"yaw rotates the intent like vanilla (facing -X at 90 degrees)");
+		check(!CarpetOperatorBodyController.SprintBody.minorCollision(0.0F, 0.0F, 0.0F, 0.0D, 0.2D),
+				"no intent is never minor");
+		return 6;
+	}
+
+	private enum Body {
+		BLIND, PASSENGER, VEHICLE_SPRINTS, HUNGRY, SHALLOW_WATER, FLYING, SLOW_ITEM, FALL_FLYING, UNDER_WATER,
+		CRAWLING, SWIMMING, IN_WATER, ON_GROUND, MAJOR_COLLISION
+	}
+
+	/** A healthy body standing on dry land with the given sprint flag, changed by the listed facts. */
+	private static CarpetOperatorBodyController.SprintBody body(boolean sprinting, Body... facts) {
+		EnumSet<Body> set = EnumSet.noneOf(Body.class);
+		set.addAll(Arrays.asList(facts));
+		boolean swimming = set.contains(Body.SWIMMING);
+		return new CarpetOperatorBodyController.SprintBody(
+				sprinting,
+				set.contains(Body.BLIND),
+				set.contains(Body.PASSENGER),
+				set.contains(Body.VEHICLE_SPRINTS),
+				!set.contains(Body.HUNGRY),
+				set.contains(Body.SHALLOW_WATER),
+				set.contains(Body.FLYING),
+				set.contains(Body.SLOW_ITEM),
+				set.contains(Body.FALL_FLYING),
+				set.contains(Body.UNDER_WATER),
+				set.contains(Body.CRAWLING),
+				swimming,
+				set.contains(Body.IN_WATER),
+				set.contains(Body.ON_GROUND) || !swimming,
+				set.contains(Body.MAJOR_COLLISION));
 	}
 
 	private static int verifyAttackKeyTiming() {
@@ -193,7 +305,10 @@ public final class OperatorBodyControlVerification {
 				&& OperatorActionDispatcher.decodeMenuButton(-1).isEmpty(), "menu buttons must be non-negative");
 		check(OperatorActionDispatcher.decodeIncludeData(1) && !OperatorActionDispatcher.decodeIncludeData(0),
 				"pick-block data flag decodes");
-		return 9;
+		// Actions travel by ordinal, so existing ones keep their numbers and new ones are appended.
+		check(dev.agaminggod.arenaagents.pov.OperatorAction.RESPAWN.ordinal() == 10
+				&& dev.agaminggod.arenaagents.pov.OperatorAction.LEAVE_BED.ordinal() == 11, "leave bed is appended after respawn");
+		return 10;
 	}
 
 	private static int verifyLeasePriority() {

@@ -28,7 +28,7 @@ public final class TerminalObservationCacheVerification {
 				(CodexAgentManager) unsafe.allocateInstance(CodexAgentManager.class),
 				(ServerActionExecutor) unsafe.allocateInstance(ServerActionExecutor.class));
 		var spatial = (ObservationSectionCache<RawSpatialObservation.Key, RawSpatialObservation>) field(collector, "spatialCache");
-		var landmarks = (ObservationSectionCache<ServerObservationCollector.LandmarkSampleKey, List<?>>) field(collector, "landmarkCache");
+		var landmarks = (ObservationSectionCache<ServerObservationCollector.LandmarkSampleKey, ServerObservationCollector.SightSample>) field(collector, "landmarkCache");
 		var rawStates = (Map<AgentId, Object>) field(collector, "lastRawStates");
 		var inventories = (Map<AgentId, Object>) field(collector, "lastInventories");
 		var keys = (Map<AgentId, RawSpatialObservation.Key>) field(collector, "spatialKeys");
@@ -45,7 +45,9 @@ public final class TerminalObservationCacheVerification {
 		java.util.function.Supplier<RawSpatialObservation> loadTerrain = () -> {
 			terrainLoads.incrementAndGet(); return new RawSpatialObservation(List.of(), List.of());
 		};
-		java.util.function.Supplier<List<?>> loadLandmarks = () -> { landmarkLoads.incrementAndGet(); return List.of(); };
+		java.util.function.Supplier<ServerObservationCollector.SightSample> loadLandmarks = () -> {
+			landmarkLoads.incrementAndGet(); return new ServerObservationCollector.SightSample(List.of());
+		};
 		spatial.getOrCompute(spatialKey, 10, loadTerrain);
 		landmarks.getOrCompute(landmarkKey, 10, loadLandmarks);
 		keys.put(agent, spatialKey);

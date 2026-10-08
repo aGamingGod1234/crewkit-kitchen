@@ -455,6 +455,15 @@ tasks.register('verifyCameraMixin', JavaExec) {
 	}
 }
 
+tasks.register('verifyLiveWindows', JavaExec) {
+	group = 'verification'
+	description = 'Renders the Minecraft-styled live plan and terminal windows headlessly to build/reports/live-task-windows.'
+	dependsOn tasks.named('testClasses')
+	classpath = sourceSets.test.runtimeClasspath
+	mainClass.set('dev.agaminggod.arenaagents.control.LiveTaskWindowRenderVerification')
+	systemProperty 'java.awt.headless', 'true'
+}
+
 tasks.register('verifyPovMixins', JavaExec) {
 	group = 'verification'
 	description = 'Verifies that every POV mixin applies under Fabric without starting client main or a world.'

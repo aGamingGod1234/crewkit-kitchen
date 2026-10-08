@@ -51,7 +51,21 @@ public final class ControlSequenceVerification {
 		reject(() -> new ControlSequence.Branch("nearest_hostile", 1, 0), "hidden target selection cannot be a condition");
 		reject(() -> new ControlSequence.Frame(drawing, 201, List.of()), "oversized frame is rejected");
 		reject(() -> new ControlSequence(List.of(frame(drawing, 1)), 2001), "oversized sequence budget is rejected");
-		return 24;
+		com.google.gson.JsonObject frame = com.google.gson.JsonParser.parseString(
+				"{\"forward\":0,\"strafe\":0,\"jump\":false,\"sneak\":false,\"sprint\":false,\"attack\":false,"
+						+ "\"use\":false,\"yaw\":90,\"pitch\":0,\"selectedSlot\":0,\"hand\":\"main\",\"ticks\":1}").getAsJsonObject();
+		com.google.gson.JsonObject instant = frame.deepCopy();
+		instant.addProperty("instantLook", true);
+		com.google.gson.JsonObject arguments = new com.google.gson.JsonObject();
+		com.google.gson.JsonArray frames = new com.google.gson.JsonArray();
+		frames.add(frame);
+		frames.add(instant);
+		arguments.add("frames", frames);
+		arguments.addProperty("maxTicks", 4);
+		ControlSequence parsed = ControlSequence.parse(arguments);
+		check(!parsed.next(SAFE).instantLook(), "frames ease their look unless the model asks otherwise");
+		check(parsed.next(SAFE).instantLook(), "a frame with instantLook:true is marked for an instant look");
+		return 26;
 	}
 
 	private static ControlSequence.Frame frame(AgentInputState input, int ticks) { return new ControlSequence.Frame(input, ticks, List.of()); }

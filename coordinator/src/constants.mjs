@@ -47,10 +47,12 @@ export const TERMINAL_ACTION_STATES = Object.freeze([
 
 export const ACTION_FIELDS = Object.freeze({
 	move_to: Object.freeze(['x', 'y', 'z', 'tolerance', 'sprint']),
-	control: Object.freeze(['forward', 'strafe', 'jump', 'sneak', 'sprint', 'attack', 'use', 'yaw', 'pitch', 'selectedSlot', 'hand', 'ticks']),
+	control: Object.freeze(['forward', 'strafe', 'jump', 'sneak', 'sprint', 'attack', 'use', 'yaw', 'pitch', 'selectedSlot', 'hand', 'ticks', 'instantLook']),
 	control_sequence: Object.freeze(['frames', 'maxTicks']),
 	look_at: Object.freeze(['x', 'y', 'z']),
 	attack: Object.freeze(['targetId', 'timeoutMs']),
+	fight_target: Object.freeze(['targetId', 'desiredRange', 'fleeAtHealth', 'continueWithAttackers', 'targetPolicy', 'includePlayers', 'timeoutMs']),
+	flee_from: Object.freeze(['targetId', 'distance', 'timeoutMs']),
 	select_item: Object.freeze(['itemId']),
 	use_item: Object.freeze(['durationMs', 'hand', 'expectedItemId', 'mode']),
 	break_block: Object.freeze(['x', 'y', 'z', 'expectedBlockId', 'timeoutMs']),
@@ -87,6 +89,8 @@ export const ACTION_FIELDS = Object.freeze({
 });
 
 export const OPTIONAL_ACTION_FIELDS = Object.freeze({
+	control: Object.freeze(['instantLook']),
+	fight_target: Object.freeze(['desiredRange', 'fleeAtHealth', 'continueWithAttackers', 'targetPolicy', 'includePlayers']),
 	place_block: Object.freeze(['desiredState']),
 	chat: Object.freeze(['audience', 'recipientId']),
 	use_item: Object.freeze(['hand', 'expectedItemId', 'mode']),

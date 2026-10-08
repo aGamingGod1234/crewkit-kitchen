@@ -3,7 +3,7 @@ package dev.agaminggod.arenaagents.client.pov;
 /** Locally predicted takeover look. Mouse capture turns it and the camera reads it every frame. */
 public final class PovLook {
 	// Entity.turn scales raw mouse deltas by the same factor, in float arithmetic.
-	private static final float TURN_SCALE = 0.15F;
+	static final float TURN_SCALE = 0.15F;
 	private static float yaw;
 	private static float pitch;
 

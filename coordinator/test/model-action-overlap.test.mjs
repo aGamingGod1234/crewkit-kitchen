@@ -44,7 +44,7 @@ test('native guidance exposes safe model-action overlap and the deterministic ti
 	const programDescription = MINECRAFT_DYNAMIC_TOOLS.find(({ name }) => name === 'runProgram').description;
 	const startActionDescription = MINECRAFT_DYNAMIC_TOOLS.find(({ name }) => name === 'startAction').description;
 	assert.ok(NATIVE_AGENT_INSTRUCTIONS.length < 1_500);
-	assert.match(NATIVE_AGENT_INSTRUCTIONS, /sequence for safe linear chains.*ArenaScript for conditional\/repeated work/);
+	assert.match(NATIVE_AGENT_INSTRUCTIONS, /sequence for safe linear chains.*ArenaScript for conditional work; repeat work.*one looping background:true program/);
 	assert.match(NATIVE_AGENT_INSTRUCTIONS, /startAction to reason while one chosen action runs/);
 	assert.match(programDescription, /One recent-p95 advisory may arrive near timeout/);
 	assert.match(programDescription, /never chooses or dispatches actions/);

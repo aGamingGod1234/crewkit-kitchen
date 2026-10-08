@@ -12,6 +12,11 @@ import java.util.TreeSet;
 /** Selects factual changes important enough to request model attention. */
 public final class AttentionSignalPolicy {
 	private static final int CRITICAL_AIR = 60;
+	/**
+	 * Half of the vanilla 300 air: 7.5 s before drowning damage. The model needs several seconds to decide, so the
+	 * 3 s critical edge alone came too late in the play-test. Each edge fires once per dive (air refills on surfacing).
+	 */
+	static final int WARNING_AIR = 150;
 	private static final int CRITICAL_FOOD = 6;
 	private static final double HAZARDOUS_FALL_DISTANCE = 6.0D;
 
@@ -20,6 +25,11 @@ public final class AttentionSignalPolicy {
 
 	static boolean safeAir(int air) {
 		return air > CRITICAL_AIR;
+	}
+
+	/** 0 above the warning, 1 at or below the warning, 2 at or below critical air. */
+	static int airBand(int air) {
+		return air <= CRITICAL_AIR ? 2 : air <= WARNING_AIR ? 1 : 0;
 	}
 
 	public static List<String> changedFacts(JsonObject previous, JsonObject current) {
@@ -35,7 +45,8 @@ public final class AttentionSignalPolicy {
 		if (decreased(beforePlayer, afterPlayer, "health")) facts.add("player.health");
 		if (started(beforePlayer, afterPlayer, "onFire")) facts.add("player.onFire");
 		if (started(beforePlayer, afterPlayer, "suffocating")) facts.add("player.suffocating");
-		if (crossedAtOrBelow(beforePlayer, afterPlayer, "air", CRITICAL_AIR)) facts.add("player.air");
+		if (crossedAtOrBelow(beforePlayer, afterPlayer, "air", CRITICAL_AIR)
+				|| crossedAtOrBelow(beforePlayer, afterPlayer, "air", WARNING_AIR)) facts.add("player.air");
 		if (crossedAtOrBelow(beforePlayer, afterPlayer, "foodLevel", CRITICAL_FOOD)) facts.add("player.foodLevel");
 		if (crossedAtOrAbove(beforePlayer, afterPlayer, "fallDistance", HAZARDOUS_FALL_DISTANCE)) {
 			facts.add("player.fallDistance");
@@ -44,6 +55,10 @@ public final class AttentionSignalPolicy {
 			facts.add("player.lastAttacker");
 		}
 
+		// Threat edges matter during actions too: they exist so the model can react before damage.
+		addNewThreatSignals(facts, threatSignals(previous), threatSignals(current));
+		// Healing signals (a safe chance to eat, or low health with no food under threat) are debounced server-side.
+		addNewSurvivalSignals(facts, survivalSignals(previous), survivalSignals(current));
 		if (!activeActionWindow && !inventory(previous).equals(inventory(current))) facts.add("inventory");
 		if (newFailure(previous, current)) facts.add("lastResult");
 		if (!Objects.equals(dimension(previous), dimension(current))) facts.add("world.dimension");
@@ -51,6 +66,10 @@ public final class AttentionSignalPolicy {
 		JsonObject afterPerception = object(current, "perception");
 		if (afterPerception != null) addChanged(facts, "perception", beforePerception == null ? null : beforePerception.get("latestSequence"), afterPerception.get("latestSequence"));
 		addLavaChanges(facts, previous, current);
+		// Lava first heard (it stays remembered 30 s, so a pool's intermittent pops raise this once, not per pop).
+		if (heardLava(current) && !heardLava(previous)) facts.add("heard");
+		// A structure first seen (or seen again after a minute) is worth a look even mid-action; the model decides.
+		if (newStructureSighted(current)) facts.add("sighted");
 
 		boolean viewpointChanged = !Objects.equals(previous.get("position"), current.get("position"))
 				|| !Objects.equals(previous.get("view"), current.get("view"));
@@ -59,6 +78,52 @@ public final class AttentionSignalPolicy {
 			addChanged(facts, "landmarks", previous.get("landmarks"), current.get("landmarks"));
 		}
 		return facts.stream().limit(AttentionFactDelta.MAX_CHANGED_FACTS).toList();
+	}
+
+	/** One fact per newly reported "uuid.signal"; the server latch already debounces flickering signals. */
+	static void addNewThreatSignals(Set<String> facts, Set<String> before, Set<String> after) {
+		for (String signal : after) if (!before.contains(signal)) facts.add("threats." + signal);
+	}
+
+	static void addNewSurvivalSignals(Set<String> facts, Set<String> before, Set<String> after) {
+		for (String signal : after) if (!before.contains(signal)) facts.add("survival." + signal);
+	}
+
+	static boolean newStructureSighted(JsonObject observation) {
+		JsonArray structures = array(object(observation, "sighted"), "structures");
+		if (structures == null) return false;
+		for (JsonElement value : structures) {
+			if (value.isJsonObject() && value.getAsJsonObject().has("new")) return true;
+		}
+		return false;
+	}
+
+	static Set<String> survivalSignals(JsonObject observation) {
+		TreeSet<String> signals = new TreeSet<>();
+		JsonArray names = array(object(observation, "survival"), "signals");
+		if (names == null) return signals;
+		for (JsonElement name : names) {
+			String signal = primitiveString(name);
+			if (signal != null) signals.add(signal);
+		}
+		return signals;
+	}
+
+	static Set<String> threatSignals(JsonObject observation) {
+		TreeSet<String> signals = new TreeSet<>();
+		JsonArray entries = array(object(observation, "threats"), "entries");
+		if (entries == null) return signals;
+		for (JsonElement value : entries) {
+			if (!value.isJsonObject()) continue;
+			String uuid = primitiveString(value.getAsJsonObject().get("uuid"));
+			JsonArray names = array(value.getAsJsonObject(), "signals");
+			if (uuid == null || names == null) continue;
+			for (JsonElement name : names) {
+				String signal = primitiveString(name);
+				if (signal != null) signals.add(uuid + "." + signal);
+			}
+		}
+		return signals;
 	}
 
 	private static void addChanged(Set<String> facts, String path, JsonElement before, JsonElement after) {
@@ -110,6 +175,16 @@ public final class AttentionSignalPolicy {
 		for (String position : positions) {
 			if (!Objects.equals(before.get(position), after.get(position))) facts.add("blocks." + position);
 		}
+	}
+
+	static boolean heardLava(JsonObject observation) {
+		JsonArray heard = array(observation, "heard");
+		if (heard == null) return false;
+		for (JsonElement value : heard) {
+			String sound = value.isJsonObject() ? primitiveString(value.getAsJsonObject().get("sound")) : null;
+			if (sound != null && HearingPerception.isLava(sound)) return true;
+		}
+		return false;
 	}
 
 	private static java.util.Map<String, String> lavaByPosition(JsonArray blocks) {

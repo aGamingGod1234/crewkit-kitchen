@@ -141,7 +141,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			"AI agent coordinator is offline; check logs/arena-agents-coordinator-error.log for the startup cause";
 	private static final Logger LOGGER = LoggerFactory.getLogger(MultiplexedServerBridge.class);
 	private static final Set<String> INBOUND_TYPES = Set.of(
-			"auth_challenge", "hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "conversation_wake_ack", "goal_spec_proposal", "director_script_result", "request_observation", "inspection_request", "action_command", "action_cancel", "action_result_ack", "agent_error", "agent_notice", "verbose_event", "task_view", "heartbeat"
+			"auth_challenge", "hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "conversation_wake_ack", "goal_spec_proposal", "task_request", "director_script_result", "request_observation", "inspection_request", "action_command", "action_cancel", "action_result_ack", "agent_error", "agent_notice", "verbose_event", "task_view", "heartbeat"
 	);
 
 	private final CodexAgentManager manager;
@@ -969,7 +969,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			// an action_cancel can never overtake its preceding action_command.
 			case "agent_ready", "planning_state", "goal_completed", "action_command", "action_cancel",
 					"action_result_ack" -> BoundedServerTaskQueue.Lane.URGENT;
-			case "coordinator_status", "conversation_wake_ack", "goal_spec_proposal",
+			case "coordinator_status", "conversation_wake_ack", "goal_spec_proposal", "task_request",
 					"request_observation", "agent_notice", "heartbeat" -> BoundedServerTaskQueue.Lane.CONTROL;
 			case "inspection_request" -> BoundedServerTaskQueue.Lane.INSPECTION;
 			default -> BoundedServerTaskQueue.Lane.BULK;
@@ -1149,6 +1149,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			case "goal_completed" -> acceptGoalCompleted(envelope);
 			case "conversation_wake_ack" -> acceptConversationWakeAck(envelope);
 			case "goal_spec_proposal" -> acceptGoalSpecProposal(envelope);
+			case "task_request" -> acceptTaskRequest(envelope);
             case "director_script_result" -> dev.agaminggod.arenaagents.server.DirectorScriptGeneration.accept(manager.server(), envelope.payload());
 			case "request_observation" -> acceptObservationRequest(envelope);
 			case "inspection_request" -> acceptInspectionRequest(envelope);
@@ -1261,6 +1262,20 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			String code = exception instanceof AgentDomainException domain ? domain.code() : ((BridgeProtocolException) exception).code();
 			sendGoalSpecResult(agentId, requestIdValue, "rejected", code);
 		}
+	}
+
+	/**
+	 * The model chose takeTask for a player's request. Minecraft applies its normal start or resume
+	 * (publishing goal_control first), stages the usual translation draft, or explains the refusal;
+	 * every identifiable request is answered so the model can tell the player.
+	 */
+	private void acceptTaskRequest(BridgeEnvelope envelope) {
+		AgentId agentId = AgentId.parse(envelope.agentId());
+		ModelTaskRequestHandler.handle(
+				envelope.payload(),
+				request -> manager.adoptModelTask(agentId, request, this::publishGoalSpecRequest),
+				() -> manager.registry().require(agentId).goalRevision()
+		).ifPresent(result -> send("task_request_result", agentId.toString(), result));
 	}
 
 	static String goalSpecSummary(JsonObject payload) {
@@ -1575,6 +1590,11 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		} catch (IllegalArgumentException exception) {
 			throw new BridgeProtocolException("INVALID_COORDINATOR_STATUS", exception.getMessage(), exception);
 		}
+	}
+
+	@Override
+	public boolean cancelDetachedAction(AgentId agentId, String reason) {
+		return actionExecutor.cancel(agentId, reason);
 	}
 
 	private void acceptAgentError(BridgeEnvelope envelope) {
@@ -2271,6 +2291,12 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				|| (!respawn && !acceptsActionRevision(record, request))) {
 			throw new AgentDomainException("STALE_REVISION", "Coordinator action revision is stale");
 		}
+		requireDetachedBodyActionAllowed(manager.server(), record, request);
+		// With no task, a block or item action must target food in the live world (ripe crop, berries, food drop).
+		if (isDetachedBodyAction(record, request)) {
+			dev.agaminggod.arenaagents.server.runtime.DetachedFoodTargets.require(
+					manager.findAgentPlayer(record.agentId()).orElse(null), request.type(), request.arguments());
+		}
 		ActionProvenance provenance = request.provenance();
 		AgentProfile profile = record.profile();
 		if (!profile.provider().equals(provenance.provider()) || !profile.model().equals(provenance.model())
@@ -2296,9 +2322,61 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		return record;
 	}
 
-	static boolean acceptsActionRevision(AgentRecord record, ServerActionRequest request) {
+	public static boolean acceptsActionRevision(AgentRecord record, ServerActionRequest request) {
 		if (record.acceptsRevision(request.goalRevision())) return true;
-		return isDetachedConversationReply(record, request);
+		return isDetachedConversationReply(record, request) || isDetachedBodyAction(record, request);
+	}
+
+	/**
+	 * With no active task (idle, or its task completed or awaiting nothing more) the model may still use its body at
+	 * the same revision: fight, flee, eat, equip, move. The action changes no goal lifecycle (see
+	 * {@link dev.agaminggod.arenaagents.agent.AgentLifecycleReducer#isDetachedActionState}). Paused and dead agents stay
+	 * blocked: an operator stop or death is not "no task".
+	 */
+	static boolean isDetachedBodyAction(AgentRecord record, ServerActionRequest request) {
+		return request.goalRevision() == record.goalRevision()
+				&& dev.agaminggod.arenaagents.agent.AgentLifecycleReducer.isDetachedActionState(record.state())
+				// Only self-preservation, including getting food; chat keeps its own detached-reply rule (direct or
+				// proximity while idle).
+				&& detachedBodyActionAllowed(request);
+	}
+
+	static boolean detachedBodyActionAllowed(ServerActionRequest request) {
+		ActionType type = request.type();
+		// Raw input frames may move, jump and aim, but attacking or using goes through fight_target, attack and
+		// use_item, so a control frame cannot break or place blocks or open containers without a task.
+		if (type == ActionType.CONTROL || type == ActionType.CONTROL_SEQUENCE) return !controlAttacksOrUses(type, request.arguments());
+		// Picking ripe berries is a right-click; the live target is checked in DetachedFoodTargets.
+		if (type == ActionType.INTERACT_BLOCK) return true;
+		return dev.agaminggod.arenaagents.agent.AgentLifecycleReducer.isSelfPreservationAction(type)
+				|| dev.agaminggod.arenaagents.agent.AgentLifecycleReducer.isFoodHarvest(type, expectedBlockId(request.arguments()));
+	}
+
+	private static boolean controlAttacksOrUses(ActionType type, JsonObject arguments) {
+		if (arguments == null) return false;
+		if (type == ActionType.CONTROL) return pressed(arguments, "attack") || pressed(arguments, "use");
+		JsonElement frames = arguments.get("frames");
+		if (frames == null || !frames.isJsonArray()) return false;
+		for (JsonElement frame : frames.getAsJsonArray()) {
+			if (!frame.isJsonObject() || pressed(frame.getAsJsonObject(), "attack") || pressed(frame.getAsJsonObject(), "use")) return true;
+		}
+		return false;
+	}
+
+	private static boolean pressed(JsonObject frame, String field) {
+		JsonElement value = frame.get(field);
+		return value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isBoolean() || value.getAsBoolean();
+	}
+
+	/**
+	 * A detached action never bypasses a /takeover, skit playback or Director reservation: a takeover of an idle or
+	 * completed agent does not change its revision, so the reservation itself must refuse the model's action.
+	 */
+	public static void requireDetachedBodyActionAllowed(net.minecraft.server.MinecraftServer server, AgentRecord record,
+			ServerActionRequest request) {
+		if (isDetachedBodyAction(record, request)) {
+			dev.agaminggod.arenaagents.server.SkitModeRuntime.requireNormalControlAllowed(server, record.agentId());
+		}
 	}
 
 	static boolean isDetachedConversationReply(AgentRecord record, ServerActionRequest request) {
@@ -3171,6 +3249,12 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			throw new BridgeProtocolException("INVALID_TRACE_ID", field + " must be at most 128 UTF-8 bytes");
 		}
 		return value;
+	}
+
+	/** The expected block of a break request when it is a plain string, otherwise null. */
+	private static String expectedBlockId(JsonObject arguments) {
+		JsonElement value = arguments == null ? null : arguments.get("expectedBlockId");
+		return value != null && value.isJsonPrimitive() && value.getAsJsonPrimitive().isString() ? value.getAsString() : null;
 	}
 
 	private static String nullableString(JsonObject object, String field) {

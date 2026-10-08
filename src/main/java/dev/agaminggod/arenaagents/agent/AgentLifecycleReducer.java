@@ -37,7 +37,9 @@ public final class AgentLifecycleReducer {
 				nowEpochMs,
 				""
 		);
-		return transition(current, revised, current.state().isActive(), current.state().isActive());
+		// An idle or completed agent may be running a detached self-preservation action; the new goal cancels it.
+		boolean cancelAction = current.state().isActive() || isDetachedActionState(current.state());
+		return transition(current, revised, cancelAction, current.state().isActive());
 	}
 
 	public static AgentTransition queue(AgentRecord current, String prompt, int queueLimit, long nowEpochMs) {
@@ -152,6 +154,12 @@ public final class AgentLifecycleReducer {
 	}
 
 	public static AgentTransition beginAction(AgentRecord current, long revision, long nowEpochMs) {
+		// No task (idle, or the finished task is completed): the model still owns its body, like a player. A body
+		// action runs detached from any goal, so the lifecycle and revision stay exactly as they are.
+		if (isDetachedActionState(current.state())) {
+			requireRevision(current, revision);
+			return transition(current, current, false, false);
+		}
 		requireState(current, "act", AgentLifecycleState.STARTING, AgentLifecycleState.PLANNING);
 		requireRevision(current, revision);
 		return transition(current, current.withLifecycle(
@@ -165,6 +173,9 @@ public final class AgentLifecycleReducer {
 	}
 
 	public static AgentTransition actionFinished(AgentRecord current, long revision, long nowEpochMs) {
+		if (isDetachedActionState(current.state()) && current.goalRevision() == revision) {
+			return transition(current, current, false, false);
+		}
 		requireState(current, "finish action", AgentLifecycleState.ACTING);
 		requireRevision(current, revision);
 		return transition(current, current.withLifecycle(
@@ -253,7 +264,8 @@ public final class AgentLifecycleReducer {
 				nowEpochMs,
 				current.lastError()
 		);
-		return transition(current, promoted, false, false);
+		// The completed agent may still be running a detached action; the promoted goal must not inherit it.
+		return transition(current, promoted, true, false);
 	}
 
 	public static AgentTransition rejectQueuedGoal(
@@ -407,6 +419,37 @@ public final class AgentLifecycleReducer {
 			throw new AgentDomainException(
 					"GOAL_NOT_SATISFIED", "Queued work can be promoted only after factual satisfaction");
 		}
+	}
+
+	/** States without an active task in which the model may still defend itself (fight, flee, eat, equip...). */
+	public static boolean isDetachedActionState(AgentLifecycleState state) {
+		return state == AgentLifecycleState.IDLE || state == AgentLifecycleState.COMPLETED;
+	}
+
+	/**
+	 * Self-preservation actions an agent without a task may take: fight or flee, eat or drink, raise a shield or
+	 * totem, equip armor and weapons, move away and look, and pick up food after a hunt. Breaking is allowed only for
+	 * food plants (see {@link #isFoodHarvest}); the bridge also limits control frames (no attack or use) and checks the
+	 * live food target. Placing, crafting, containers, chat and other work still need a task the model adopted
+	 * (takeTask), so nobody can steer the body around it.
+	 */
+	public static boolean isSelfPreservationAction(dev.agaminggod.arenaagents.protocol.ActionType type) {
+		return switch (type) {
+			case FIGHT_TARGET, FLEE_FROM, ATTACK, USE_RANGED, BLOCK_WITH_SHIELD, USE_ITEM, SELECT_ITEM, SELECT_TOOL,
+					EQUIP_ITEM, NAVIGATE_TO, MOVE_TO, LOOK_AT, CONTROL, CONTROL_SEQUENCE, WAIT, DISMOUNT, WAKE_UP,
+					PICK_UP_ITEM -> true;
+			default -> false;
+		};
+	}
+
+	/** Blocks that are food when broken (crops, melons). Berries are picked by right-click instead, as in vanilla. */
+	public static final java.util.Set<String> FOOD_PLANT_BLOCKS = java.util.Set.of("minecraft:wheat", "minecraft:carrots",
+			"minecraft:potatoes", "minecraft:beetroots", "minecraft:melon");
+
+	/** Harvesting a crop, berries or a melon to eat: the only breaking an agent without a task may do. */
+	public static boolean isFoodHarvest(dev.agaminggod.arenaagents.protocol.ActionType type, String expectedBlockId) {
+		return type == dev.agaminggod.arenaagents.protocol.ActionType.BREAK_BLOCK && expectedBlockId != null
+				&& FOOD_PLANT_BLOCKS.contains(expectedBlockId);
 	}
 
 	private static long nextRevision(AgentRecord current) {

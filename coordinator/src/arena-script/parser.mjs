@@ -504,7 +504,8 @@ function validateCallExpression(node, state, context) {
 		validateWatcher(node, state, context);
 	}
 	const primitive = path?.[0] === 'player' ? PLAYER_MEMBER_PRIMITIVES[path[1]] : null;
-	if (primitive === 'attack' || primitive === 'use_ranged' || primitive === 'interact_entity') {
+	if (primitive === 'attack' || primitive === 'use_ranged' || primitive === 'interact_entity'
+		|| primitive === 'fight_target' || primitive === 'flee_from') {
 		validateExactTargetCall(node);
 	}
 	if (primitive === 'navigate_to' || primitive === 'move_to') {

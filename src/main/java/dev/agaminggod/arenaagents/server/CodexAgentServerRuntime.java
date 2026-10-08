@@ -118,6 +118,8 @@ public final class CodexAgentServerRuntime {
 		ServerLifecycleEvents.SERVER_STOPPING.register(CodexAgentServerRuntime::stop);
 		ServerLifecycleEvents.END_DATA_PACK_RELOAD.register((server, resourceManager, success) ->
 				ServerObservationCollector.clearTagCache());
+		// Who hurt which player: turns a player's potential risk into an active threat for 30 s after a hit.
+		dev.agaminggod.arenaagents.server.perception.AggressionLedger.register();
 		ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
 			WorldPlayerNames.get(server).remember(handler.getPlayer().getGameProfile().name(), handler.getPlayer().getUUID());
 			VoiceConsentRegistry.playerConnected(server, handler.getPlayer().getUUID());
@@ -133,6 +135,7 @@ public final class CodexAgentServerRuntime {
 			if (!(entity instanceof net.minecraft.server.level.ServerPlayer player)) return true;
 			return AgentDeathCapture.allowVanillaDeath(
 					ScenarioRuntimeService.recoverParkourDeath(player),
+					AgentDeathCapture.totemWillSave(player, source),
 					() -> CodexAgentManager.get(player.level().getServer()).captureDeath(player, source)
 			);
 		});
@@ -331,6 +334,8 @@ public final class CodexAgentServerRuntime {
 	}
 
 	private static void endTick(MinecraftServer server) {
+		// First, so the operator's view of this tick's physics is not held behind the bridge work below.
+		PovSessionRuntime.endTick(server);
 		SkitActors.tick(server);
 		CodexAgentManager manager = CodexAgentManager.get(server);
 		CoordinatorProcessSupervisor supervisor = COORDINATORS.get(server);

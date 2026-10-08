@@ -158,6 +158,8 @@ public final class VerificationMain {
 		dev.agaminggod.arenaagents.server.voice.VoiceProfileVerification.main(new String[0]);
 		passedAssertions += GoalInventoryCapacityVerification.verify();
 		passedAssertions += AgentConversationRouterVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.conversation.ModelTaskAdoptionVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.bridge.ModelTaskRequestHandlerVerification.verify();
 		passedAssertions += NativeAgentWhisperTargetsVerification.verify();
 		passedAssertions += AgentGroupRegistryVerification.verify();
 		passedAssertions += AgentModelArgumentVerification.verify();
@@ -173,6 +175,7 @@ public final class VerificationMain {
 		passedAssertions += CoordinatorVoiceEndpointRefreshVerification.verify();
 		passedAssertions += CodexAgentServerRuntimeVoiceStartVerification.verify();
 		passedAssertions += AgentActivityPresentationVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.FailureChatThrottleVerification.verify();
 		passedAssertions += AgentDeathCaptureVerification.verify();
 		passedAssertions += AgentControlSyncVerification.verify();
 		passedAssertions += VoiceConsentCommandVerification.verify();
@@ -227,17 +230,24 @@ public final class VerificationMain {
 		passedAssertions += GoalVerificationRuntimeVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.perception.ObservationPageVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.perception.PlayerObservationEventsVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.perception.HearingPerceptionVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.perception.SightedFeaturesVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.runtime.input.RidingJumpInputVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.runtime.input.VanillaMoveInputVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.runtime.input.UseTickPhaseVerification.verify();
 		passedAssertions += ActionSuccessLedgerVerification.verify();
 		passedAssertions += InputStateVerification.verify();
 		passedAssertions += AttentionHazardVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.perception.ThreatAttentionVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.runtime.controller.CombatPlanningVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.perception.CombatRiskVerification.verify();
 		passedAssertions += MenuCapabilityRegistryVerification.verify();
 		passedAssertions += VoiceSubsystemVerification.verify();
 		passedAssertions += VoiceDirectorVerification.verify();
 		passedAssertions += ServerPathPlannerVerification.verify();
 		passedAssertions += MinecraftNavigationWorldVerification.verify();
 		passedAssertions += NavigationProgressVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.runtime.controller.NavigationMotionVerification.verify();
 		passedAssertions += SurvivalReflexVerification.verify();
 		passedAssertions += ItemPickupProgressVerification.verify();
 		passedAssertions += ScenarioCoreVerification.verify();
@@ -277,11 +287,15 @@ public final class VerificationMain {
 		passedAssertions += dev.agaminggod.arenaagents.server.pov.PovViewRedirectVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.pov.PovStatePublisherVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.pov.PovSessionVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.pov.DetachedActionReservationVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.pov.OperatorBodyControlVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.pov.PovMessageRelayVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.client.pov.PovClientStateVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.client.pov.PovInputCaptureVerification.verify();
 		verifyJsonLineFraming(codec);
 		passedAssertions += PovContractsVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.pov.PovRelayVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.client.pov.input.PovOutgoingRelayVerification.verify();
 
 		System.out.printf("PASS: %d protocol and core assertions%n", passedAssertions);
 	}
@@ -377,8 +391,40 @@ public final class VerificationMain {
 		assertDecodedType(codec, "pick_up_item", "\"targetSelector\":\"minecraft:item\"", ActionType.PICK_UP_ITEM);
 		assertDecodedType(codec, "drop_item", "\"slot\":0,\"count\":1", ActionType.DROP_ITEM);
 		assertDecodedType(codec, "navigate_to", "\"x\":10,\"y\":64,\"z\":-5,\"tolerance\":1.25,\"sprint\":true,\"timeoutMs\":30000", ActionType.NAVIGATE_TO);
-		assertDecodedType(codec, "fight_target", "\"targetSelector\":\"nearest_hostile\",\"desiredRange\":2.5,\"timeoutMs\":15000", ActionType.FIGHT_TARGET);
-		assertDecodedType(codec, "flee_from", "\"targetSelector\":\"last_attacker\",\"distance\":16,\"timeoutMs\":10000", ActionType.FLEE_FROM);
+		assertDecodedType(codec, "fight_target", "\"targetId\":\"00000000-0000-0000-0000-000000000001\",\"desiredRange\":2.5,\"fleeAtHealth\":6,\"timeoutMs\":15000", ActionType.FIGHT_TARGET);
+		ActionCommand followThrough = codec.decodeCommand(commandJson("fight_target",
+				"\"targetId\":\"00000000-0000-0000-0000-000000000001\",\"continueWithAttackers\":false,\"timeoutMs\":15000"));
+		assertEquals(false, followThrough.arguments().get("continueWithAttackers").getAsBoolean(),
+				"fight_target keeps the model's continueWithAttackers opt-out");
+		expectProtocolException(
+				() -> codec.decodeCommand(commandJson("fight_target",
+						"\"targetId\":\"00000000-0000-0000-0000-000000000001\",\"continueWithAttackers\":\"yes\",\"timeoutMs\":15000")),
+				"INVALID_FIELD",
+				"continueWithAttackers",
+				"fight_target continueWithAttackers must be a boolean"
+		);
+		ActionCommand riskPolicy = codec.decodeCommand(commandJson("fight_target",
+				"\"targetId\":\"00000000-0000-0000-0000-000000000001\",\"targetPolicy\":\"highest_risk\",\"timeoutMs\":15000"));
+		assertEquals("highest_risk", riskPolicy.arguments().get("targetPolicy").getAsString(),
+				"fight_target keeps the model-chosen targetPolicy");
+		expectProtocolException(
+				() -> codec.decodeCommand(commandJson("fight_target",
+						"\"targetId\":\"00000000-0000-0000-0000-000000000001\",\"targetPolicy\":\"auto\",\"timeoutMs\":15000")),
+				"INVALID_FIELD",
+				"targetPolicy",
+				"fight_target targetPolicy must be a known policy"
+		);
+		ActionCommand optIn = codec.decodeCommand(commandJson("fight_target",
+				"\"targetId\":\"00000000-0000-0000-0000-000000000001\",\"includePlayers\":true,\"timeoutMs\":15000"));
+		assertEquals(true, optIn.arguments().get("includePlayers").getAsBoolean(), "fight_target keeps the model's includePlayers opt-in");
+		expectProtocolException(
+				() -> codec.decodeCommand(commandJson("fight_target",
+						"\"targetId\":\"00000000-0000-0000-0000-000000000001\",\"includePlayers\":\"yes\",\"timeoutMs\":15000")),
+				"INVALID_FIELD",
+				"includePlayers",
+				"fight_target includePlayers must be a boolean"
+		);
+		assertDecodedType(codec, "flee_from", "\"targetId\":\"00000000-0000-0000-0000-000000000001\",\"distance\":16,\"timeoutMs\":10000", ActionType.FLEE_FROM);
 		assertDecodedType(codec, "follow_entity", "\"targetSelector\":\"player:Lucas\",\"distance\":3,\"timeoutMs\":30000", ActionType.FOLLOW_ENTITY);
 		assertDecodedType(codec, "interact_block", "\"x\":1,\"y\":64,\"z\":-2,\"face\":\"north\",\"hand\":\"main\",\"expectedItemId\":\"minecraft:air\"", ActionType.INTERACT_BLOCK);
 		assertDecodedType(codec, "interact_entity", "\"targetId\":\"00000000-0000-0000-0000-000000000001\",\"hand\":\"off\",\"expectedItemId\":\"minecraft:lead\"", ActionType.INTERACT_ENTITY);

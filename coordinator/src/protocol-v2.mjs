@@ -47,6 +47,7 @@ export const COORDINATOR_TO_SERVER_TYPES = Object.freeze([
 	'goal_completed',
 	'director_script_result',
 	'goal_spec_proposal',
+	'task_request',
 	'conversation_wake_ack',
 	'request_observation',
 	'inspection_request',
@@ -80,6 +81,7 @@ export const SERVER_TO_COORDINATOR_TYPES = Object.freeze([
 	'director_script_request',
 	'goal_spec_request',
 	'goal_spec_result',
+	'task_request_result',
 	'verbose_control',
 	'task_view_request',
 	'heartbeat',
@@ -133,14 +135,18 @@ const FACTUAL_PLAYER_FIELDS = new Set([
 	'onFire', 'air', 'maxAir', 'suffocating', 'fallDistance', 'lastAttacker', 'effects',
 ]);
 const FACTUAL_TOP_LEVEL_PATHS = new Set([
-	'ready', 'status', 'position', 'velocity', 'view', 'inventory', 'entities', 'blocks', 'landmarks', 'nearbyContainers', 'world', 'currentAction', 'lastResult', 'perception',
+	'ready', 'status', 'position', 'velocity', 'view', 'inventory', 'entities', 'blocks', 'landmarks', 'nearbyContainers', 'world', 'currentAction', 'lastResult', 'perception', 'heard', 'sighted',
 ]);
 const TRUSTED_ENVELOPES = new WeakSet();
 const TRUSTED_PAYLOAD_TYPES = new WeakMap();
-const PLAYER_DETAIL_FIELDS = ['pose', 'swimming', 'gliding', 'sprinting', 'crouching', 'onClimbable', 'inLava', 'horizontalCollision', 'verticalCollision', 'passenger', 'vehicle'];
+const PLAYER_DETAIL_FIELDS = ['pose', 'underWater', 'airSecondsLeft', 'operatorControlled', 'swimming', 'gliding', 'sprinting', 'crouching', 'onClimbable', 'inLava', 'horizontalCollision', 'verticalCollision', 'passenger', 'vehicle'];
 const STACK_DETAIL_FIELDS = ['displayName', 'fingerprint', 'maxStackSize', 'tooltip', 'tooltipTruncated'];
 const MENU_STACK_DETAIL_FIELDS = ['damage', 'maxDamage', ...STACK_DETAIL_FIELDS];
-const ENTITY_DETAIL_FIELDS = ['velocity', 'yaw', 'pitch', 'pose', 'bounds', 'equipment', 'usingItem', 'onFire', 'pickable', 'parentId', 'partName'];
+const ENTITY_DETAIL_FIELDS = ['velocity', 'yaw', 'pitch', 'pose', 'bounds', 'equipment', 'usingItem', 'onFire', 'pickable', 'parentId', 'partName',
+	'alive', 'hostile', 'health', 'maxHealth', 'targetingAgent', 'swelling', 'fuse', 'perceivedBy', 'potentialRisk', 'risk', 'expectedHitDamage'];
+const THREAT_SIGNALS = new Set(['targeting', 'swelling', 'creeper_close', 'ranged_sight', 'attacked', 'imminent']);
+const SURVIVAL_SIGNALS = new Set(['heal_opportunity', 'low_health_no_food']);
+const MAX_THREAT_ENTRIES = 8;
 const BLOCK_DETAIL_FIELDS = ['state', 'bounds', 'boundsTruncated', 'replaceable', 'fluid'];
 const MENU_DETAIL_FIELDS = ['containerId', 'stateId', 'slotCount', 'offset', 'hasMore', 'details'];
 
@@ -333,6 +339,30 @@ function normalizeProtocolV2Payload(type, value) {
 				requestId: requireIdentifier(value.requestId, 'requestId'),
 				status,
 				reasonCode: requireIdentifier(value.reasonCode, 'reasonCode'),
+			};
+		}
+		case 'task_request':
+			// The model chose to adopt a player's conversational request; Minecraft decides whether it may start.
+			exactKeys(value, ['requestId', 'goalRevision', 'requesterId', 'conversationSequence', 'request', 'resume'], ['requestId', 'goalRevision', 'requesterId', 'conversationSequence', 'request', 'resume'], type);
+			if (typeof value.requesterId !== 'string' || !UUID_PATTERN.test(value.requesterId)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'task_request.requesterId must be a player UUID');
+			return {
+				requestId: requireIdentifier(value.requestId, 'requestId'),
+				goalRevision: revision(value.goalRevision, 'goalRevision'),
+				requesterId: value.requesterId,
+				conversationSequence: nonnegativeInteger(value.conversationSequence, 'conversationSequence'),
+				request: boundedText(value.request, 'request', 512),
+				resume: boolean(value.resume, 'resume'),
+			};
+		case 'task_request_result': {
+			exactKeys(value, ['requestId', 'status', 'reasonCode', 'message', 'goalRevision'], ['requestId', 'status', 'reasonCode', 'message', 'goalRevision'], type);
+			const status = requireIdentifier(value.status, 'status');
+			if (!['accepted', 'pending', 'rejected'].includes(status)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'task_request_result status must be accepted, pending or rejected');
+			return {
+				requestId: requireIdentifier(value.requestId, 'requestId'),
+				status,
+				reasonCode: boundedText(value.reasonCode, 'reasonCode', MAX_REASON_CODE_LENGTH),
+				message: boundedText(value.message, 'message', MAX_RESULT_MESSAGE_LENGTH),
+				goalRevision: revision(value.goalRevision, 'goalRevision'),
 			};
 		}
 		case 'conversation_wake_ack':
@@ -1770,7 +1800,7 @@ function observedDetails(value, field, depth = 0) {
 }
 
 function normalizeObservation(value) {
-	const allowed = ['goalRevision', 'observedAtEpochMs', 'ready', 'status', 'eventSequence', 'attention', 'changedFacts', 'position', 'velocity', 'view', 'player', 'inventory', 'entities', 'blocks', 'landmarks', 'nearbyContainers', 'world', 'currentAction', 'lastResult', 'interaction', 'coverage', 'perception'];
+	const allowed = ['goalRevision', 'observedAtEpochMs', 'ready', 'status', 'eventSequence', 'attention', 'changedFacts', 'position', 'velocity', 'view', 'player', 'inventory', 'entities', 'blocks', 'landmarks', 'nearbyContainers', 'world', 'currentAction', 'lastResult', 'interaction', 'coverage', 'perception', 'threats', 'survival', 'heard', 'sighted'];
 	exactKeys(value, allowed, ['goalRevision', 'observedAtEpochMs', 'ready', 'status'], 'observation');
 	const normalized = {
 		goalRevision: revision(value.goalRevision, 'goalRevision'),
@@ -1786,7 +1816,7 @@ function normalizeObservation(value) {
 		if (normalized.attention === false && normalized.changedFacts?.length > 0) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Non-attention observation cannot contain changed facts');
 		return normalized;
 	}
-	for (const key of allowed.slice(4).filter((field) => !['interaction', 'landmarks', 'coverage', 'perception'].includes(field))) if (!Object.hasOwn(value, key)) throw new ProtocolV2Error('MISSING_FIELD', `observation field '${key}' is required when ready`);
+	for (const key of allowed.slice(4).filter((field) => !['interaction', 'landmarks', 'coverage', 'perception', 'threats', 'survival', 'heard', 'sighted'].includes(field))) if (!Object.hasOwn(value, key)) throw new ProtocolV2Error('MISSING_FIELD', `observation field '${key}' is required when ready`);
 	normalized.eventSequence = positiveInteger(value.eventSequence, 'eventSequence');
 	normalized.attention = boolean(value.attention, 'attention');
 	normalized.changedFacts = changedFactPaths(value.changedFacts);
@@ -1806,7 +1836,119 @@ function normalizeObservation(value) {
 	if (value.interaction !== undefined) normalized.interaction = interactionObservation(value.interaction);
 	if (value.coverage !== undefined) normalized.coverage = observedDetails(value.coverage, 'coverage');
 	if (value.perception !== undefined) normalized.perception = perceptionObservation(value.perception);
+	if (value.threats !== undefined) normalized.threats = threatsObservation(value.threats);
+	if (value.survival !== undefined) normalized.survival = survivalObservation(value.survival);
+	if (value.heard !== undefined) normalized.heard = heardObservation(value.heard);
+	if (value.sighted !== undefined) normalized.sighted = sightedObservation(value.sighted);
 	return normalized;
+}
+
+const SIGHTED_ROWS = Object.freeze({
+	structures: { maximum: 4, label: ['structure', requireIdentifier], extra: { new: boolean } },
+	caves: { maximum: 3, extra: { air: positiveInteger } },
+	veins: { maximum: 4, label: ['blockId', requireIdentifier], extra: { visible: positiveInteger } },
+});
+
+/** Structures, dark open spaces and ore veins currently in line of sight; never unseen ones. */
+function sightedObservation(value) {
+	exactKeys(value, Object.keys(SIGHTED_ROWS), [], 'sighted');
+	const normalized = {};
+	for (const [kind, { maximum, label, extra }] of Object.entries(SIGHTED_ROWS)) {
+		if (value[kind] === undefined) continue;
+		normalized[kind] = boundedArray(value[kind], `sighted.${kind}`, maximum).map((entry, index) => {
+			const field = `sighted.${kind}[${index}]`;
+			const required = [...(label === undefined ? [] : [label[0]]), 'x', 'y', 'z', 'distance', 'bearing'];
+			exactKeys(entry, [...required, ...Object.keys(extra)], kind === 'structures' ? required : [...required, ...Object.keys(extra)], field);
+			const bearing = finiteNumber(entry.bearing, `${field}.bearing`);
+			if (bearing < -180 || bearing > 180) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}.bearing must be in [-180, 180]`);
+			return {
+				...(label === undefined ? {} : { [label[0]]: label[1](entry[label[0]], `${field}.${label[0]}`) }),
+				x: integer(entry.x, `${field}.x`), y: integer(entry.y, `${field}.y`), z: integer(entry.z, `${field}.z`),
+				distance: nonnegativeFiniteNumber(entry.distance, `${field}.distance`), bearing,
+				...Object.fromEntries(Object.entries(extra).filter(([key]) => entry[key] !== undefined).map(([key, check]) => [key, check(entry[key], `${field}.${key}`)])),
+			};
+		});
+	}
+	return normalized;
+}
+
+const HEARD_DIRECTIONS = new Set(['front', 'front_right', 'right', 'back_right', 'back', 'back_left', 'left', 'front_left', 'here']);
+const HEARD_ELEVATIONS = new Set(['above', 'below', 'level']);
+const MAX_HEARD_ENTRIES = 6;
+
+/** Sounds the player hears (packets plus client-only ambience), most salient first; relative direction only. */
+function heardObservation(value) {
+	return boundedArray(value, 'heard', MAX_HEARD_ENTRIES).map((entry, index) => {
+		const field = `heard[${index}]`;
+		exactKeys(entry, ['sound', 'source', 'direction', 'elevation', 'distance', 'count', 'secondsAgo'], ['sound', 'direction', 'elevation', 'distance'], field);
+		if (!HEARD_DIRECTIONS.has(entry.direction)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}.direction is invalid`);
+		if (!HEARD_ELEVATIONS.has(entry.elevation)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}.elevation is invalid`);
+		return {
+			sound: boundedText(entry.sound, `${field}.sound`, 128),
+			...(entry.source === undefined ? {} : { source: requireIdentifier(entry.source, `${field}.source`) }),
+			direction: entry.direction,
+			elevation: entry.elevation,
+			distance: nonnegativeInteger(entry.distance, `${field}.distance`),
+			...(entry.count === undefined ? {} : { count: positiveInteger(entry.count, `${field}.count`) }),
+			...(entry.secondsAgo === undefined ? {} : { secondsAgo: nonnegativeInteger(entry.secondsAgo, `${field}.secondsAgo`) }),
+		};
+	});
+}
+
+/** Healing facts (present while hurt or signalling): safe, canHealNow, bestFood and debounced signals. */
+function survivalObservation(value) {
+	exactKeys(value, ['safe', 'canHealNow', 'bestFood', 'signals'], ['safe', 'canHealNow', 'signals'], 'survival');
+	const normalized = {
+		safe: boolean(value.safe, 'survival.safe'),
+		canHealNow: boolean(value.canHealNow, 'survival.canHealNow'),
+		signals: boundedArray(value.signals, 'survival.signals', SURVIVAL_SIGNALS.size).map((signal) => {
+			if (!SURVIVAL_SIGNALS.has(signal)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'survival.signals contains an unknown signal');
+			return signal;
+		}),
+	};
+	if (value.bestFood !== undefined) {
+		exactKeys(value.bestFood, ['slot', 'itemId', 'nutrition'], ['slot', 'itemId', 'nutrition'], 'survival.bestFood');
+		normalized.bestFood = {
+			slot: nonnegativeInteger(value.bestFood.slot, 'survival.bestFood.slot'),
+			itemId: requireIdentifier(value.bestFood.itemId, 'survival.bestFood.itemId'),
+			nutrition: nonnegativeInteger(value.bestFood.nutrition, 'survival.bestFood.nutrition'),
+		};
+	}
+	return normalized;
+}
+
+/** Server-sensed threats (latched signals) plus the best hotbar weapon, present only while something threatens. */
+function threatsObservation(value) {
+	exactKeys(value, ['entries', 'bestWeapon'], ['entries'], 'threats');
+	const entries = boundedArray(value.entries, 'threats.entries', MAX_THREAT_ENTRIES).map((entry, index) => {
+		const field = `threats.entries[${index}]`;
+		const keys = ['uuid', 'type', 'distance', 'bearing', 'targeting', 'swelling', 'lineOfSight', 'signals'];
+		exactKeys(entry, [...keys, 'risk', 'riskFactors', 'expectedHitDamage', 'closingSpeed', 'approaching', 'etaSeconds', 'contactRisk'], keys, field);
+		const signals = boundedArray(entry.signals, `${field}.signals`, THREAT_SIGNALS.size).map((signal) => {
+			if (!THREAT_SIGNALS.has(signal)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}.signals contains an unknown signal`);
+			return signal;
+		});
+		return {
+			uuid: requireIdentifier(entry.uuid, `${field}.uuid`), type: requireIdentifier(entry.type, `${field}.type`),
+			distance: finiteNumber(entry.distance, `${field}.distance`), bearing: finiteNumber(entry.bearing, `${field}.bearing`),
+			targeting: boolean(entry.targeting, `${field}.targeting`), swelling: boolean(entry.swelling, `${field}.swelling`),
+			lineOfSight: boolean(entry.lineOfSight, `${field}.lineOfSight`), signals,
+			// Open-ended risk (no upper bound) with its factors, and the expected hit after the agent's armour.
+			...(entry.risk === undefined ? {} : { risk: finiteNumber(entry.risk, `${field}.risk`) }),
+			...(entry.riskFactors === undefined ? {} : { riskFactors: observedDetails(entry.riskFactors, `${field}.riskFactors`) }),
+			...(entry.expectedHitDamage === undefined ? {} : { expectedHitDamage: finiteNumber(entry.expectedHitDamage, `${field}.expectedHitDamage`) }),
+			// Trend: blocks per second closing in (negative recedes), seconds to contact range, and the risk it carries there.
+			...(entry.closingSpeed === undefined ? {} : { closingSpeed: finiteNumber(entry.closingSpeed, `${field}.closingSpeed`) }),
+			...(entry.approaching === undefined ? {} : { approaching: boolean(entry.approaching, `${field}.approaching`) }),
+			...(entry.etaSeconds === undefined ? {} : { etaSeconds: finiteNumber(entry.etaSeconds, `${field}.etaSeconds`) }),
+			...(entry.contactRisk === undefined ? {} : { contactRisk: finiteNumber(entry.contactRisk, `${field}.contactRisk`) }),
+		};
+	});
+	if (value.bestWeapon === undefined) return { entries };
+	exactKeys(value.bestWeapon, ['slot', 'itemId'], ['slot', 'itemId'], 'threats.bestWeapon');
+	const slot = nonnegativeInteger(value.bestWeapon.slot, 'threats.bestWeapon.slot');
+	if (slot > 8) throw new ProtocolV2Error('INVALID_PAYLOAD', 'threats.bestWeapon.slot must be a hotbar slot');
+	return { entries, bestWeapon: { slot, itemId: requireIdentifier(value.bestWeapon.itemId, 'threats.bestWeapon.itemId') } };
 }
 
 function perceptionObservation(value) {
@@ -1969,6 +2111,8 @@ function isFactualChangedPath(path) {
 	if (path === 'world.dimension') return true;
 	if (path.startsWith('player.')) return FACTUAL_PLAYER_FIELDS.has(path.slice('player.'.length));
 	if (/^entities\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(path)) return true;
+	if (/^threats\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(?:targeting|swelling|creeper_close|ranged_sight|attacked|imminent)$/i.test(path)) return true;
+	if (/^survival\.(?:heal_opportunity|low_health_no_food)$/.test(path)) return true;
 	return /^blocks\.-?\d+,-?\d+,-?\d+$/.test(path);
 }
 
@@ -2353,10 +2497,15 @@ function nearbyContainerObservation(value, index) {
 	};
 }
 
+const WORLD_DIFFICULTIES = new Set(['peaceful', 'easy', 'normal', 'hard']);
+
 function worldObservation(value) {
 	if (!isPlainObject(value)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'world must be an object');
-	exactKeys(value, ['dimension', 'worldId', 'gameTime', 'dayTime', 'raining', 'thundering'], ['dimension', 'gameTime', 'dayTime', 'raining', 'thundering'], 'world');
-	return { ...optionalObservedDetails(value, ['worldId']), dimension: requireIdentifier(value.dimension, 'world.dimension'), gameTime: nonnegativeInteger(value.gameTime, 'world.gameTime'), dayTime: nonnegativeInteger(value.dayTime, 'world.dayTime'), raining: boolean(value.raining, 'world.raining'), thundering: boolean(value.thundering, 'world.thundering') };
+	exactKeys(value, ['dimension', 'worldId', 'gameTime', 'dayTime', 'raining', 'thundering', 'difficulty', 'naturalRegeneration'], ['dimension', 'gameTime', 'dayTime', 'raining', 'thundering'], 'world');
+	if (value.difficulty !== undefined && !WORLD_DIFFICULTIES.has(value.difficulty)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'world.difficulty is invalid');
+	return { ...optionalObservedDetails(value, ['worldId']), dimension: requireIdentifier(value.dimension, 'world.dimension'), gameTime: nonnegativeInteger(value.gameTime, 'world.gameTime'), dayTime: nonnegativeInteger(value.dayTime, 'world.dayTime'), raining: boolean(value.raining, 'world.raining'), thundering: boolean(value.thundering, 'world.thundering'),
+		...(value.difficulty === undefined ? {} : { difficulty: value.difficulty }),
+		...(value.naturalRegeneration === undefined ? {} : { naturalRegeneration: boolean(value.naturalRegeneration, 'world.naturalRegeneration') }) };
 }
 
 function currentActionObservation(value) {

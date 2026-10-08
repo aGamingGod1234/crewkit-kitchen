@@ -22,6 +22,27 @@ import net.minecraft.network.protocol.game.ServerboundContainerClickPacket;
 import net.minecraft.network.protocol.game.ServerboundPickItemFromBlockPacket;
 import net.minecraft.network.protocol.game.ServerboundPickItemFromEntityPacket;
 import net.minecraft.network.protocol.game.ServerboundPlayerActionPacket;
+import net.minecraft.network.protocol.game.ServerboundPlayerCommandPacket;
+import net.minecraft.network.protocol.game.ServerboundContainerSlotStateChangedPacket;
+import net.minecraft.network.protocol.game.ServerboundEditBookPacket;
+import net.minecraft.network.protocol.game.ServerboundPlaceRecipePacket;
+import net.minecraft.network.protocol.game.ServerboundRecipeBookChangeSettingsPacket;
+import net.minecraft.network.protocol.game.ServerboundRecipeBookSeenRecipePacket;
+import net.minecraft.network.protocol.game.ServerboundRenameItemPacket;
+import net.minecraft.network.protocol.game.ServerboundSelectBundleItemPacket;
+import net.minecraft.network.protocol.game.ServerboundSelectTradePacket;
+import net.minecraft.network.protocol.game.ServerboundSetBeaconPacket;
+import net.minecraft.network.protocol.game.ServerboundSetCreativeModeSlotPacket;
+import net.minecraft.network.protocol.game.ServerboundSignUpdatePacket;
+import net.minecraft.core.Holder;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.world.effect.MobEffect;
+import net.minecraft.world.inventory.RecipeBookType;
+import net.minecraft.world.item.crafting.display.RecipeDisplayId;
+import dev.agaminggod.arenaagents.pov.OperatorTextPayload;
+import java.util.List;
+import net.minecraft.world.entity.PlayerRideableJumping;
+import net.minecraft.world.entity.player.Abilities;
 import net.minecraft.network.protocol.game.ServerboundPlayerLoadedPacket;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
@@ -89,9 +110,75 @@ public final class OperatorActionDispatcher {
 				OptionalInt button = decodeMenuButton(action.a());
 				yield button.isPresent() ? menuButton(agent, button.getAsInt()) : Outcome.IGNORED;
 			}
+			case LEAVE_BED -> leaveBed(agent);
+			case SELECT_TRADE -> relay(agent, listener -> listener.handleSelectTrade(new ServerboundSelectTradePacket(action.a())));
+			case SET_BEACON -> beaconEffects(action.a(), action.b())
+					.map(effects -> relay(agent, listener -> listener.handleSetBeaconPacket(effects)))
+					.orElse(Outcome.IGNORED);
+			// The container id is the one the operator's screen showed, so vanilla still refuses a stale screen.
+			case PLACE_RECIPE -> relay(agent, listener -> listener.handlePlaceRecipe(new ServerboundPlaceRecipePacket(
+					action.c(), new RecipeDisplayId(action.a()), action.b() != 0)));
+			case RECIPE_BOOK_SETTINGS -> decodeRecipeBookType(action.a())
+					.map(type -> relay(agent, listener -> listener.handleRecipeBookChangeSettingsPacket(
+							new ServerboundRecipeBookChangeSettingsPacket(type, action.b() != 0, action.c() != 0))))
+					.orElse(Outcome.IGNORED);
+			case RECIPE_SEEN -> relay(agent, listener -> listener.handleRecipeBookSeenRecipePacket(
+					new ServerboundRecipeBookSeenRecipePacket(new RecipeDisplayId(action.a()))));
+			// The vanilla packet decoder refuses negative indices other than -1 (no selection).
+			case SELECT_BUNDLE_ITEM -> action.b() < -1 ? Outcome.IGNORED
+					: relay(agent, listener -> listener.handleBundleItemSelectedPacket(
+							new ServerboundSelectBundleItemPacket(action.a(), action.b())));
+			case CRAFTER_SLOT -> relay(agent, listener -> listener.handleContainerSlotStateChanged(
+					new ServerboundContainerSlotStateChangedPacket(action.a(), action.c(), action.b() != 0)));
 			// The controller handles respawn itself because the body is usually absent then.
 			case RESPAWN -> Outcome.IGNORED;
 		};
+	}
+
+	/**
+	 * Text typed into a vanilla screen for the agent, rebuilt into the vanilla packet and handled by the agent's own
+	 * connection: AnvilMenu, SignBlockEntity and the book handler apply their own checks (open menu, allowed sign
+	 * editor and distance, hotbar or off-hand slot, text filtering and length).
+	 */
+	static Outcome text(ServerPlayer agent, OperatorTextPayload text) {
+		List<String> lines = text.lines();
+		return switch (text.kind()) {
+			case RENAME_ITEM -> relay(agent, listener -> listener.handleRenameItem(new ServerboundRenameItemPacket(lines.get(0))));
+			case SIGN_UPDATE -> relay(agent, listener -> listener.handleSignUpdate(new ServerboundSignUpdatePacket(
+					text.pos(), text.value() != 0, lines.get(0), lines.get(1), lines.get(2), lines.get(3))));
+			case EDIT_BOOK -> relay(agent, listener -> listener.handleEditBook(
+					new ServerboundEditBookPacket(text.value(), lines, text.title())));
+		};
+	}
+
+	/** ServerboundSetCreativeModeSlotPacket for the agent; vanilla checks infinite materials, features, slot and size. */
+	static Outcome creativeSlot(ServerPlayer agent, short slot, ItemStack stack) {
+		return relay(agent, listener -> listener.handleSetCreativeModeSlot(new ServerboundSetCreativeModeSlotPacket(slot, stack)));
+	}
+
+	/** Beacon effects by registry id as ServerboundSetBeaconPacket carries them; an unknown id is refused like a bad packet. */
+	static Optional<ServerboundSetBeaconPacket> beaconEffects(int primary, int secondary) {
+		Optional<Optional<Holder<MobEffect>>> first = effect(primary);
+		Optional<Optional<Holder<MobEffect>>> second = effect(secondary);
+		if (first.isEmpty() || second.isEmpty()) return Optional.empty();
+		return Optional.of(new ServerboundSetBeaconPacket(first.get(), second.get()));
+	}
+
+	private static Optional<Optional<Holder<MobEffect>>> effect(int id) {
+		if (id == -1) return Optional.of(Optional.empty());
+		if (id < 0) return Optional.empty();
+		return BuiltInRegistries.MOB_EFFECT.get(id).map(holder -> Optional.of((Holder<MobEffect>) holder));
+	}
+
+	static Optional<RecipeBookType> decodeRecipeBookType(int ordinal) {
+		RecipeBookType[] types = RecipeBookType.values();
+		return ordinal >= 0 && ordinal < types.length ? Optional.of(types[ordinal]) : Optional.empty();
+	}
+
+	private static Outcome relay(ServerPlayer agent, java.util.function.Consumer<ServerGamePacketListenerImpl> handler) {
+		prepareBody(agent);
+		handler.accept(agent.connection);
+		return Outcome.RELAYED;
 	}
 
 	/**
@@ -115,6 +202,34 @@ public final class OperatorActionDispatcher {
 			case START -> startUseItem(agent, keys);
 			case NONE -> { }
 		}
+	}
+
+	/**
+	 * LocalPlayer.aiStep: a fresh jump press in the air with a glider equipped asks the server to start gliding. The
+	 * held jump key only reaches Carpet's jump action, which never does this, so elytra could not open in a takeover.
+	 * The relayed handler runs vanilla's own tryToStartFallFlying checks (airborne, not riding, no levitation, glider).
+	 */
+	static Outcome jumpPressed(ServerPlayer agent) {
+		if (agent.onGround() || agent.isFallFlying() || agent.onClimbable() || agent.getAbilities().flying
+				|| agent.isInWater() || agent.isPassenger()) {
+			return Outcome.IGNORED;
+		}
+		prepareBody(agent);
+		agent.connection.handlePlayerCommand(new ServerboundPlayerCommandPacket(agent, ServerboundPlayerCommandPacket.Action.START_FALL_FLYING));
+		return agent.isFallFlying() ? Outcome.RELAYED : Outcome.IGNORED;
+	}
+
+	/** LocalPlayer.aiStep creative flight toggle on a jump press; true when the press toggled flight. */
+	static boolean toggleFlight(ServerPlayer agent, CarpetOperatorBodyController.Keys keys) {
+		Abilities abilities = agent.getAbilities();
+		if (!abilities.mayfly || agent.isSpectator()) return false;
+		boolean vehicleAllows = agent.getVehicle() == null
+				|| agent.getControlledVehicle() instanceof PlayerRideableJumping jumping && jumping.canJump();
+		if (!keys.flightTogglePress(!agent.isSwimming() && vehicleAllows)) return false;
+		abilities.flying = !abilities.flying;
+		if (abilities.flying && agent.onGround()) agent.jumpFromGround();
+		agent.onUpdateAbilities();
+		return true;
 	}
 
 	/** Server-checked one-click melee; a held attack only mines, so entities are hit once per click. */
@@ -149,6 +264,10 @@ public final class OperatorActionDispatcher {
 		if (hit instanceof BlockHitResult blockHit && hit.getType() == HitResult.Type.BLOCK
 				&& !agent.level().getBlockState(blockHit.getBlockPos()).isAir()) {
 			// Mining belongs to the held attack; the pulse keeps a sub-tick click held long enough to start it.
+			// Carpet's 5-tick blockHitDelay after a break is vanilla's destroyDelay, which only throttles a held
+			// key: vanilla startDestroyBlock ignores it, so every click may start (or creative-break) at once.
+			// Left in place, a 2-tick pulse only counts the delay down and fast clicks were lost.
+			((EntityPlayerActionPackAccessor) OfflineAgentPlayers.actions(agent)).arenaagents$setBlockHitDelay(0);
 			keys.blockClicked();
 			return Outcome.BLOCK_TARGETED;
 		}
@@ -248,6 +367,18 @@ public final class OperatorActionDispatcher {
 		agent.resetLastActionTime();
 		vehicle.openCustomInventoryScreen(agent);
 		return Outcome.MENU_OPENED;
+	}
+
+	/**
+	 * Vanilla InBedChatScreen sends STOP_SLEEPING; relayed so the handler's own checks run. The handler then waits for
+	 * the client to confirm its position, which a Carpet body never does, so that wait is cleared again.
+	 */
+	static Outcome leaveBed(ServerPlayer agent) {
+		if (!agent.isSleeping()) return Outcome.IGNORED;
+		prepareBody(agent);
+		agent.connection.handlePlayerCommand(new ServerboundPlayerCommandPacket(agent, ServerboundPlayerCommandPacket.Action.STOP_SLEEPING));
+		prepareBody(agent);
+		return Outcome.RELAYED;
 	}
 
 	static Outcome closeMenu(ServerPlayer agent) {

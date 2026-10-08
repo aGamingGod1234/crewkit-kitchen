@@ -35,12 +35,22 @@ export function adaptObservation(value) {
 	copyBoolean(playerSource, player, 'onGround');
 	copyBoolean(playerSource, player, 'inWater');
 	copyBoolean(playerSource, player, 'suffocating');
+	// Eyes under water and the seconds of breath left before drowning damage starts.
+	copyBoolean(playerSource, player, 'underWater');
+	copyNumber(playerSource, player, 'airSecondsLeft');
+	// Present (true) only while an operator's /takeover owns the body.
+	copyBoolean(playerSource, player, 'operatorControlled');
 	copyNumber(playerSource, player, 'fallDistance');
 	if (Object.hasOwn(playerSource, 'gameMode')) player.gameMode = identifier(playerSource.gameMode, 'player.gameMode');
 	if (Object.hasOwn(playerSource, 'effects')) player.effects = effectFacts(playerSource.effects);
 	if (Object.hasOwn(playerSource, 'lastAttacker')) player.lastAttacker = attackerFacts(playerSource.lastAttacker);
 	for (const field of ['swimming', 'gliding', 'sprinting', 'crouching', 'onClimbable', 'inLava', 'horizontalCollision', 'verticalCollision', 'passenger']) copyBoolean(playerSource, player, field);
 	copyExtensions(playerSource, player, ['pose', 'vehicle']);
+	Object.assign(player, threatFacts(source.threats));
+	Object.assign(player, survivalFacts(source.survival));
+	player.heard = heardFacts(source.heard);
+	// Nearest heard lava (pops, rumble, dripping) or null, so a watch condition can guard mining without a loop.
+	player.heardLava = player.heard.filter((entry) => entry.sound.includes('lava')).reduce((best, entry) => best === null || entry.distance < best.distance ? entry : best, null);
 
 	const entities = boundedDataArray(source.entities, 'entities', MAX_ENTITIES)
 		.map((value, index) => entityFacts(value, index));
@@ -91,6 +101,8 @@ export function adaptObservation(value) {
 		...(Object.hasOwn(source, 'currentAction') ? { currentAction: currentActionFacts(source.currentAction) } : {}),
 		...(Object.hasOwn(source, 'lastResult') ? { lastResult: lastResultFacts(source.lastResult) } : {}),
 		...(Object.hasOwn(source, 'interaction') ? { interaction: interactionFacts(source.interaction) } : {}),
+		// Structures, caves and ore veins in line of sight; the protocol already bounded and validated each row.
+		...(Object.hasOwn(source, 'sighted') ? { sighted: extensionValue(source.sighted, 'sighted') } : {}),
 	};
 }
 
@@ -115,8 +127,83 @@ function entityFacts(value, index) {
 		result.itemId = identifier(source.itemId, `entities[${index}].itemId`);
 		result.count = positiveInteger(source.count, `entities[${index}].count`);
 	}
-	copyExtensions(source, result, ['velocity', 'yaw', 'pitch', 'pose', 'bounds', 'equipment', 'usingItem', 'onFire', 'pickable', 'parentId', 'partName']);
+	copyExtensions(source, result, ['velocity', 'yaw', 'pitch', 'pose', 'bounds', 'equipment', 'usingItem', 'onFire', 'pickable', 'parentId', 'partName',
+		'alive', 'hostile', 'health', 'maxHealth', 'targetingAgent', 'swelling', 'fuse', 'perceivedBy', 'potentialRisk', 'risk', 'expectedHitDamage']);
 	return result;
+}
+
+/** Recent sounds as a player fact: [{ sound, source?, direction, elevation, distance, count?, secondsAgo? }], always present ([] when silent). */
+export function heardFacts(value) {
+	if (value === undefined) return [];
+	return boundedDataArray(value, 'heard', 6).map((entry, index) => {
+		const row = ownDataRecord(entry, `heard[${index}]`);
+		return {
+			sound: boundedText(row.sound, `heard[${index}].sound`, 128),
+			...(row.source === undefined ? {} : { source: identifier(row.source, `heard[${index}].source`) }),
+			direction: identifier(row.direction, `heard[${index}].direction`),
+			elevation: identifier(row.elevation, `heard[${index}].elevation`),
+			distance: nonNegativeInteger(row.distance, `heard[${index}].distance`),
+			...(row.count === undefined ? {} : { count: positiveInteger(row.count, `heard[${index}].count`) }),
+			...(row.secondsAgo === undefined ? {} : { secondsAgo: nonNegativeInteger(row.secondsAgo, `heard[${index}].secondsAgo`) }),
+		};
+	});
+}
+
+const THREAT_URGENCY = Object.freeze({ swelling: 3, creeper_close: 2, attacked: 2, imminent: 2, targeting: 1, ranged_sight: 1 });
+
+/**
+ * Healing facts as player facts: canHealNow (hurt, safe and able to eat), bestFood ({ slot, itemId, nutrition } or
+ * null), safe, and the debounced signals healOpportunity / lowHealthNoFood. Always present so conditions never fail.
+ */
+export function survivalFacts(value) {
+	if (value === undefined) return { canHealNow: false, bestFood: null, healOpportunity: false, lowHealthNoFood: false };
+	const source = ownDataRecord(value, 'wire observation.survival');
+	const signals = boundedDataArray(source.signals, 'survival.signals', 2).map((signal) => identifier(signal, 'survival signal'));
+	const food = source.bestFood === undefined ? null : ownDataRecord(source.bestFood, 'survival.bestFood');
+	return {
+		canHealNow: boolean(source.canHealNow, 'survival.canHealNow'),
+		safe: boolean(source.safe, 'survival.safe'),
+		bestFood: food === null ? null : { slot: nonNegativeInteger(food.slot, 'bestFood.slot'), itemId: identifier(food.itemId, 'bestFood.itemId'), nutrition: nonNegativeInteger(food.nutrition, 'bestFood.nutrition') },
+		healOpportunity: signals.includes('heal_opportunity'),
+		lowHealthNoFood: signals.includes('low_health_no_food'),
+	};
+}
+
+/**
+ * Server-sensed threats as player facts so watcher conditions can read them directly:
+ * player.state().threats (highest risk first), player.state().threat (the most urgent signal, or null),
+ * player.state().highestRiskThreat (or null) and player.state().bestWeapon ({ slot, itemId } or null).
+ * Always present, so conditions never hit a missing member.
+ */
+export function threatFacts(value) {
+	if (value === undefined) return { threats: [], threat: null, highestRiskThreat: null, bestWeapon: null };
+	const source = ownDataRecord(value, 'wire observation.threats');
+	const threats = boundedDataArray(source.entries, 'threats.entries', 8).map((entry, index) => {
+		const row = ownDataRecord(entry, `threats.entries[${index}]`);
+		const signals = boundedDataArray(row.signals, `threats.entries[${index}].signals`, 6).map((signal) => identifier(signal, 'threat signal'));
+		return {
+			stableId: identifier(row.uuid, 'threat uuid'), uuid: identifier(row.uuid, 'threat uuid'), type: identifier(row.type, 'threat type'),
+			distance: finiteNumber(row.distance, 'threat distance'), bearing: finiteNumber(row.bearing, 'threat bearing'),
+			targeting: boolean(row.targeting, 'threat targeting'), swelling: boolean(row.swelling, 'threat swelling'),
+			lineOfSight: boolean(row.lineOfSight, 'threat lineOfSight'), signals,
+			risk: row.risk === undefined ? 0 : finiteNumber(row.risk, 'threat risk'),
+			...(row.riskFactors === undefined ? {} : { riskFactors: { ...ownDataRecord(row.riskFactors, 'threat riskFactors') } }),
+			...(row.expectedHitDamage === undefined ? {} : { expectedHitDamage: finiteNumber(row.expectedHitDamage, 'threat expectedHitDamage') }),
+			...(row.closingSpeed === undefined ? {} : { closingSpeed: finiteNumber(row.closingSpeed, 'threat closingSpeed') }),
+			...(row.approaching === undefined ? {} : { approaching: boolean(row.approaching, 'threat approaching') }),
+			...(row.etaSeconds === undefined ? {} : { etaSeconds: finiteNumber(row.etaSeconds, 'threat etaSeconds') }),
+			...(row.contactRisk === undefined ? {} : { contactRisk: finiteNumber(row.contactRisk, 'threat contactRisk') }),
+		};
+	}).sort((left, right) => right.risk - left.risk || left.distance - right.distance);
+	const urgency = (threat) => Math.max(0, ...threat.signals.map((signal) => THREAT_URGENCY[signal] ?? 0));
+	const threat = threats.reduce((best, next) => best === null || urgency(next) > urgency(best) ? next : best, null);
+	const weapon = source.bestWeapon === undefined ? null : ownDataRecord(source.bestWeapon, 'threats.bestWeapon');
+	return {
+		threats,
+		threat,
+		highestRiskThreat: threats[0] ?? null,
+		bestWeapon: weapon === null ? null : { slot: nonNegativeInteger(weapon.slot, 'bestWeapon.slot'), itemId: identifier(weapon.itemId, 'bestWeapon.itemId') },
+	};
 }
 
 function blockFacts(value, index) {
@@ -205,6 +292,8 @@ function worldFacts(value) {
 		dayTime: nonNegativeInteger(source.dayTime, 'world.dayTime'),
 		raining: boolean(source.raining, 'world.raining'),
 		thundering: boolean(source.thundering, 'world.thundering'),
+		...(Object.hasOwn(source, 'difficulty') ? { difficulty: identifier(source.difficulty, 'world.difficulty') } : {}),
+		...(Object.hasOwn(source, 'naturalRegeneration') ? { naturalRegeneration: boolean(source.naturalRegeneration, 'world.naturalRegeneration') } : {}),
 	};
 }
 

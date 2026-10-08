@@ -252,11 +252,28 @@ public record TransactionSnapshot(List<SlotState> slots) {
 	}
 
 	public static final class CraftPlacementGuard {
-		private final Map<ItemIdentity, Integer> ownedBeforePlacement;
+		private final HashMap<ItemIdentity, Integer> ownedBeforePlacement;
 		private boolean placementAttempted;
 
 		public CraftPlacementGuard(List<OwnedStack> ownedBeforePlacement) {
-			this.ownedBeforePlacement = Map.copyOf(aggregateOwned(ownedBeforePlacement));
+			this.ownedBeforePlacement = aggregateOwned(ownedBeforePlacement);
+		}
+
+		/**
+		 * Rebases the baseline by what changed between two of the transaction's own ticks (an item picked up while
+		 * the menu is open, as a player does, or a menu closed by someone else). Only the transaction's own clicks
+		 * must conserve ownership; the paced craft spans many ticks, so a pickup is not a rollback failure.
+		 */
+		public void absorbExternal(List<OwnedStack> before, List<OwnedStack> after) {
+			Map<ItemIdentity, Integer> previous = aggregateOwned(before);
+			Map<ItemIdentity, Integer> current = aggregateOwned(after);
+			HashSet<ItemIdentity> keys = new HashSet<>(previous.keySet());
+			keys.addAll(current.keySet());
+			for (ItemIdentity key : keys) {
+				int delta = current.getOrDefault(key, 0) - previous.getOrDefault(key, 0);
+				if (delta != 0) ownedBeforePlacement.merge(key, delta, Integer::sum);
+			}
+			ownedBeforePlacement.values().removeIf(count -> count == 0);
 		}
 
 		public void markPlacementAttempted() {
@@ -275,7 +292,14 @@ public record TransactionSnapshot(List<SlotState> slots) {
 		}
 
 		public boolean mayReportCleanFailure(List<OwnedStack> observedCurrentOwnership) {
-			return placementAttempted && ownedBeforePlacement.equals(aggregateOwned(observedCurrentOwnership));
+			return mayReportCleanFailure(observedCurrentOwnership, List.of());
+		}
+
+		/** As above, counting stacks the transaction itself dropped at the body because the inventory was full. */
+		public boolean mayReportCleanFailure(List<OwnedStack> observedCurrentOwnership, List<OwnedStack> droppedAtBody) {
+			List<OwnedStack> accounted = new ArrayList<>(observedCurrentOwnership);
+			accounted.addAll(droppedAtBody);
+			return placementAttempted && ownedBeforePlacement.equals(aggregateOwned(accounted));
 		}
 	}
 
@@ -364,6 +388,18 @@ public record TransactionSnapshot(List<SlotState> slots) {
 			result.merge(key, stack.count(), Integer::sum);
 		}
 		return result;
+	}
+
+	/** What {@code after} holds less of than {@code before}, per item identity (the stacks that left ownership). */
+	public static List<OwnedStack> ownershipLost(List<OwnedStack> before, List<OwnedStack> after) {
+		HashMap<ItemIdentity, Integer> previous = aggregateOwned(before);
+		HashMap<ItemIdentity, Integer> current = aggregateOwned(after);
+		List<OwnedStack> lost = new ArrayList<>();
+		previous.forEach((key, count) -> {
+			int missing = count - current.getOrDefault(key, 0);
+			if (missing > 0) lost.add(new OwnedStack(key.itemId(), missing, key.fingerprint()));
+		});
+		return lost;
 	}
 
 	public record ItemIdentity(String itemId, String fingerprint) {

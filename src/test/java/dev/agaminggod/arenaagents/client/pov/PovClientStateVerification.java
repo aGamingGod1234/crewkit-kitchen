@@ -3,7 +3,10 @@ package dev.agaminggod.arenaagents.client.pov;
 import dev.agaminggod.arenaagents.pov.PovMode;
 import java.util.UUID;
 
-/** Dependency-free checks for the POV session state machine, view routing, look math, hand bob and body damage. */
+/**
+ * Dependency-free checks for the POV session state machine, view routing, look math, hand bob, body damage, the
+ * takeover body position stream and the latency probe.
+ */
 public final class PovClientStateVerification {
 	private static final UUID AGENT_A = UUID.fromString("00000000-0000-0000-0000-00000000000a");
 	private static final UUID AGENT_B = UUID.fromString("00000000-0000-0000-0000-00000000000b");
@@ -18,8 +21,11 @@ public final class PovClientStateVerification {
 		verifyTracker();
 		verifyLook();
 		verifyView();
+		verifyFreeLook();
 		verifyHands();
 		verifyBodyMonitor();
+		verifyBodyPosition();
+		verifyLatencyProbe();
 		return checks;
 	}
 
@@ -140,6 +146,110 @@ public final class PovClientStateVerification {
 		check(PovView.yaw(agent, 0.5F, 42.0F) == 42.0F && !PovView.isTarget(agent), "reset releases the view");
 	}
 
+	private static void verifyFreeLook() {
+		long ms = 1_000_000L;
+		Object agent = new Object();
+		PovView.reset();
+		PovView.bind(agent, false);
+		PovView.acceptPose(10.0F, 20.0F);
+		check(PovFreeLook.mode(0L) == PovFreeLook.Mode.LOCKED && !PovFreeLook.detached(0L), "spectate starts locked to the agent");
+		check(!PovFreeLook.turn(100.0D, 0.0D), "the mouse does not turn a locked view");
+		check(PovView.yaw(agent, 1.0F, 42.0F, 0L) == 10.0F && PovView.pitch(agent, 1.0F, 7.0F, 0L) == 20.0F, "a locked view shows the agent's look");
+
+		PovFreeLook.hold(true, 10L * ms);
+		check(PovFreeLook.mode(10L * ms) == PovFreeLook.Mode.FREE && PovFreeLook.detached(10L * ms), "holding sneak frees the camera");
+		check(PovView.yaw(agent, 1.0F, 42.0F, 10L * ms) == 10.0F && PovView.pitch(agent, 1.0F, 7.0F, 10L * ms) == 20.0F,
+				"free look starts from the agent's current view, no jump");
+		check(PovFreeLook.turn(100.0D, -100.0D), "the mouse turns a free view");
+		check(near(PovView.yaw(agent, 1.0F, 42.0F, 11L * ms), 25.0F) && near(PovView.pitch(agent, 1.0F, 7.0F, 11L * ms), 5.0F),
+				"free look uses the Entity.turn mouse scale");
+		PovView.tick();
+		PovView.acceptPose(-40.0F, 0.0F);
+		PovView.tick();
+		check(near(PovView.yaw(agent, 1.0F, 42.0F, 12L * ms), 25.0F), "the agent turning does not move a free camera");
+		check(PovView.agentYaw(1.0F, 42.0F) == -40.0F && PovView.agentPitch(1.0F, 7.0F) == 0.0F, "the agent's own look stays readable during free look");
+		PovFreeLook.turn(1200.0D * 2.0D, 0.0D);
+		check(near(PovView.yaw(agent, 1.0F, 42.0F, 13L * ms), 25.0F), "a full 360 degree turn comes back to the same yaw");
+		PovFreeLook.turn(1000.0D, 0.0D);
+		check(near(PovView.yaw(agent, 1.0F, 42.0F, 13L * ms), 175.0F), "free yaw is not limited");
+		PovFreeLook.turn(100.0D, 0.0D);
+		check(near(PovView.yaw(agent, 1.0F, 42.0F, 13L * ms), -170.0F), "free yaw wraps past 180");
+		PovFreeLook.turn(0.0D, 5000.0D);
+		check(PovView.pitch(agent, 1.0F, 7.0F, 13L * ms) == 90.0F, "free pitch stops at straight down");
+		PovFreeLook.turn(0.0D, -5000.0D);
+		check(PovView.pitch(agent, 1.0F, 7.0F, 13L * ms) == -90.0F, "free pitch stops at straight up");
+		PovFreeLook.turn(Double.NaN, 1.0D);
+		check(PovView.pitch(agent, 1.0F, 7.0F, 13L * ms) == -90.0F, "non-finite mouse input is ignored");
+		PovFreeLook.hold(true, 14L * ms);
+		check(near(PovView.yaw(agent, 1.0F, 42.0F, 14L * ms), -170.0F), "holding on does not reseed the free view");
+
+		// Released at -170 / -90 while the agent looks -40 / 0: the return turns 130 degrees the short way and 90 up.
+		PovFreeLook.hold(false, 100L * ms);
+		check(PovFreeLook.mode(100L * ms) == PovFreeLook.Mode.RETURNING && PovFreeLook.detached(100L * ms), "releasing sneak starts the return");
+		check(!PovFreeLook.turn(100.0D, 0.0D), "the mouse does not steer the return");
+		check(near(PovView.yaw(agent, 1.0F, 42.0F, 100L * ms), -170.0F) && PovView.pitch(agent, 1.0F, 7.0F, 100L * ms) == -90.0F,
+				"the return starts where the free view was");
+		float halfway = PovFreeLook.ease(0.5F);
+		check(near(halfway, 0.875F), "the return eases out (cubic)");
+		check(near(PovView.yaw(agent, 1.0F, 42.0F, 200L * ms), -170.0F + 130.0F * halfway)
+				&& near(PovView.pitch(agent, 1.0F, 7.0F, 200L * ms), -90.0F + 90.0F * halfway), "the return glides toward the agent's look");
+		check(PovFreeLook.ease(0.0F) == 0.0F && PovFreeLook.ease(1.0F) == 1.0F && PovFreeLook.ease(2.0F) == 1.0F && PovFreeLook.ease(-1.0F) == 0.0F,
+				"the ease is clamped to its ends");
+		check(PovFreeLook.RETURN_NANOS >= 150L * ms && PovFreeLook.RETURN_NANOS <= 250L * ms, "the return lasts 150 to 250 ms");
+		check(PovFreeLook.detached(299L * ms), "the camera is still detached just before the return lands");
+		check(PovView.yaw(agent, 1.0F, 42.0F, 300L * ms) == -40.0F && PovView.pitch(agent, 1.0F, 7.0F, 300L * ms) == 0.0F
+				&& PovFreeLook.mode(300L * ms) == PovFreeLook.Mode.LOCKED, "the return lands on the agent's look and locks");
+		PovView.tick();
+		PovView.acceptPose(60.0F, 10.0F);
+		PovView.tick();
+		check(PovView.yaw(agent, 1.0F, 42.0F, 301L * ms) == 60.0F, "a locked view follows the agent again");
+
+		// Sneak again mid-return: the free view continues from what was on screen.
+		PovFreeLook.hold(true, 400L * ms);
+		PovFreeLook.turn(200.0D, 0.0D);
+		PovFreeLook.hold(false, 500L * ms);
+		float midYaw = PovView.yaw(agent, 1.0F, 42.0F, 550L * ms);
+		PovView.pitch(agent, 1.0F, 7.0F, 550L * ms);
+		PovFreeLook.hold(true, 560L * ms);
+		check(near(PovView.yaw(agent, 1.0F, 42.0F, 560L * ms), midYaw), "grabbing during the return continues from the shown view");
+
+		// The return chases the live agent look, across the 180 seam the short way.
+		PovFreeLook.reset();
+		PovView.bind(agent, false);
+		PovView.acceptPose(170.0F, 0.0F);
+		PovView.tick();
+		PovView.tick();
+		PovView.yaw(agent, 1.0F, 42.0F, 0L);
+		PovView.pitch(agent, 1.0F, 7.0F, 0L);
+		PovFreeLook.hold(true, 0L);
+		PovFreeLook.hold(false, 0L);
+		PovView.acceptPose(-170.0F, 0.0F);
+		PovView.tick();
+		PovView.tick();
+		float crossing = PovView.yaw(agent, 1.0F, 42.0F, 100L * ms);
+		check(near(crossing, 170.0F + 20.0F * PovFreeLook.ease(0.5F)), "the return takes the short way across 180: " + crossing);
+
+		// Takeover never free-looks: the mouse drives the body.
+		PovFreeLook.reset();
+		PovView.bind(agent, true);
+		PovLook.reset(5.0F, 6.0F);
+		check(!PovFreeLook.turn(100.0D, 0.0D), "a free-look turn never steals takeover mouse input");
+		check(PovView.yaw(agent, 1.0F, 42.0F, 0L) == 5.0F, "takeover reads the predicted look");
+		// Free look before any frame was shown waits for one, so it never starts from a made-up view.
+		PovView.reset();
+		PovFreeLook.hold(true, 0L);
+		check(PovFreeLook.mode(0L) == PovFreeLook.Mode.LOCKED, "free look waits for a shown frame");
+		PovView.bind(agent, false);
+		PovView.acceptPose(30.0F, 0.0F);
+		PovView.yaw(agent, 1.0F, 42.0F, 0L);
+		PovView.pitch(agent, 1.0F, 7.0F, 0L);
+		PovFreeLook.hold(true, 1L);
+		check(PovFreeLook.mode(1L) == PovFreeLook.Mode.FREE && PovView.yaw(agent, 1.0F, 42.0F, 1L) == 30.0F, "the next frame frees it");
+		PovView.reset();
+		check(PovFreeLook.mode(1L) == PovFreeLook.Mode.LOCKED, "ending or switching the view drops free look");
+		PovLook.reset(0.0F, 0.0F);
+	}
+
 	private static void verifyHands() {
 		PovHands hands = new PovHands();
 		check(!hands.seeded(), "hands start unseeded");
@@ -180,6 +290,59 @@ public final class PovClientStateVerification {
 		monitor.reset();
 		check(!monitor.flashing(), "reset clears the flash");
 		check(!monitor.observe(4.0F) && !monitor.flashing(), "the first reading after reset is a baseline, not damage");
+	}
+
+	private static void verifyBodyPosition() {
+		PovBodyPosition stream = new PovBodyPosition();
+		check(stream.next() == null, "no position before the first pose keeps vanilla placement");
+		// One pose per tick (the normal case): each tick shows the newest server tick, nothing is held back.
+		for (int tick = 1; tick <= 5; tick++) {
+			stream.accept(tick, 64.0D, 0.0D);
+			PovBodyPosition.Position shown = stream.next();
+			check(shown != null && shown.x() == tick && stream.pending() == 0, "steady poses are shown the tick they arrive " + tick);
+		}
+		check(stream.next() == null, "a tick without a pose holds the current position");
+		// Arrivals bunching at the tick boundary (0, 2, 0, 2...) still advance one server tick per client tick.
+		stream.reset();
+		stream.accept(1.0D, 64.0D, 0.0D);
+		stream.accept(2.0D, 64.0D, 0.0D);
+		check(stream.next().x() == 1.0D && stream.pending() == 1, "a bunched pair shows the older pose and keeps one in reserve");
+		check(stream.next().x() == 2.0D, "the reserve covers the tick that received nothing");
+		stream.accept(3.0D, 64.0D, 0.0D);
+		stream.accept(4.0D, 64.0D, 0.0D);
+		check(stream.next().x() == 3.0D && stream.next().x() == 4.0D, "bunched poses keep moving one step per tick");
+		// A burst after a hiccup is caught up at once instead of being replayed late.
+		for (int pose = 10; pose < 13; pose++) stream.accept(pose, 64.0D, 0.0D);
+		check(stream.next().x() == 11.0D && stream.pending() == 1, "a burst skips to one behind the newest pose");
+		for (int pose = 20; pose < 30; pose++) stream.accept(pose, 64.0D, 0.0D);
+		check(stream.pending() == PovBodyPosition.MAX_PENDING, "the pending poses are bounded");
+		stream.accept(Double.NaN, 64.0D, 0.0D);
+		stream.accept(1.0D, Double.POSITIVE_INFINITY, 0.0D);
+		check(stream.pending() == PovBodyPosition.MAX_PENDING, "non-finite positions are dropped");
+		stream.reset();
+		check(stream.pending() == 0 && stream.next() == null, "reset forgets every pending pose");
+	}
+
+	private static void verifyLatencyProbe() {
+		java.util.List<String> reports = new java.util.ArrayList<>();
+		PovLatencyProbe probe = new PovLatencyProbe(reports::add);
+		long millis = 1_000_000L;
+		probe.sent(5, 0L);
+		probe.sent(7, 50L * millis);
+		check(probe.acknowledged(5, 80L * millis) == 80L * millis, "the round trip runs from send to the acknowledging pose");
+		check(probe.acknowledged(5, 130L * millis) == -1L, "a repeated acknowledgement is not a new sample");
+		check(probe.acknowledged(0, 130L * millis) == -1L, "sequence zero acknowledges nothing");
+		check(probe.acknowledged(6, 130L * millis) == -1L, "an action sequence that was never a frame is ignored");
+		check(probe.acknowledged(7, 130L * millis) == 80L * millis, "frames are matched by sequence");
+		check(probe.acknowledged(7 + 128, 200L * millis) == -1L, "a ring slot reused by another sequence is not matched");
+		for (int sequence = 1000; sequence < 1000 + PovLatencyProbe.WINDOW; sequence++) {
+			probe.sent(sequence, sequence * millis);
+			probe.acknowledged(sequence, sequence * millis + 60L * millis);
+		}
+		check(reports.size() == 1 && reports.get(0).contains("average 61.0 ms") && reports.get(0).contains("worst 80.0 ms"),
+				"a full window reports the average and worst round trip: " + reports);
+		probe.reset();
+		check(probe.acknowledged(1000, 0L) == -1L, "reset forgets sent frames");
 	}
 
 	private static boolean near(float actual, float expected) {

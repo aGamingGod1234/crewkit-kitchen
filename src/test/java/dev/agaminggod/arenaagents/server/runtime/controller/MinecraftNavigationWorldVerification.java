@@ -42,6 +42,13 @@ public final class MinecraftNavigationWorldVerification {
 				"open water is represented separately so breathing clearance can govern traversal");
 		assertEquals(WalkabilityView.Cell.HAZARD, classify(Blocks.LAVA.defaultBlockState(), true),
 				"lava never inherits shallow-water traversal");
+		BlockState slab = Blocks.STONE_SLAB.defaultBlockState();
+		assertEquals(classify(slab, false), classify(slab.setValue(BlockStateProperties.WATERLOGGED, true), false),
+				"a waterlogged slab supports like a dry one instead of reading as a hazard");
+		assertEquals(WalkabilityView.Cell.BLOCKED, classify(Blocks.OAK_FENCE.defaultBlockState().setValue(BlockStateProperties.WATERLOGGED, true), false),
+				"a waterlogged fence is a barrier, not a hazard");
+		assertEquals(WalkabilityView.Cell.WATER, classify(Blocks.SEAGRASS.defaultBlockState(), false),
+				"seagrass is swimmable water");
 		assertEquals(WalkabilityView.Cell.HAZARD, classify(Blocks.MAGMA_BLOCK.defaultBlockState(), false),
 				"damaging support remains hazardous");
 		assertEquals(WalkabilityView.Cell.BLOCKED, classify(Blocks.OAK_FENCE.defaultBlockState(), false),
@@ -69,7 +76,7 @@ public final class MinecraftNavigationWorldVerification {
 				.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO)), "a top slab leaves real clearance for a crouching player");
 		assertTrue(!MinecraftNavigationWorld.crouchClearance(Blocks.STONE_SLAB.defaultBlockState()
 				.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO)), "a bottom slab does not invent a crouch passage through solid collision");
-		return 21 + verifySampledRevisions();
+		return 24 + verifySampledRevisions();
 	}
 
 	private static int verifySampledRevisions() {

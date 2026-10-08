@@ -18,6 +18,7 @@ public final class AgentChatReporter {
 	public static final Set<String> NOTICE_SEVERITIES = Set.of("error", "warning", "info");
 	public static final int MAX_NOTICE_LENGTH = 2_048;
 	private static final Logger LOGGER = LoggerFactory.getLogger(AgentChatReporter.class);
+	private static final FailureChatThrottle FAILURE_THROTTLE = new FailureChatThrottle();
 
 	private AgentChatReporter() {
 	}
@@ -100,8 +101,9 @@ public final class AgentChatReporter {
 	public static void result(CodexAgentManager manager, AgentRecord record, ServerActionResult result) {
 		AgentVerboseState verbose = verboseState(manager);
 		if (verbose != null && !verbose.standardActivityEnabled()) return;
-		AgentActivityPresentation.result(result).ifPresent(message ->
-				report(manager, record, message, ChatFormatting.RED));
+		AgentActivityPresentation.result(result)
+				.filter(message -> FAILURE_THROTTLE.allow(record.agentId().toString(), message, System.currentTimeMillis()))
+				.ifPresent(message -> report(manager, record, message, ChatFormatting.RED));
 	}
 
 	public static void completed(CodexAgentManager manager, AgentRecord record, String summary) {

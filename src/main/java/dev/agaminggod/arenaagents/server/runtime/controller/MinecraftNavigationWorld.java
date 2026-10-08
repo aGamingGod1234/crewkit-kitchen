@@ -248,8 +248,10 @@ public final class MinecraftNavigationWorld implements WalkabilityView {
 		Objects.requireNonNull(collision, "collision must not be null");
 		if (isIntrinsicHazard(state)) return Cell.HAZARD;
 		if (!state.getFluidState().isEmpty()) {
-			if ((!state.is(Blocks.WATER) && !state.getFluidState().is(FluidTags.WATER)) || !collision.isEmpty()) return Cell.HAZARD;
-			return standingWater ? Cell.CLEAR : Cell.WATER;
+			if (!state.is(Blocks.WATER) && !state.getFluidState().is(FluidTags.WATER)
+					&& !state.getFluidState().getType().isSame(net.minecraft.world.level.material.Fluids.WATER)) return Cell.HAZARD;
+			// A waterlogged solid (slab, stairs, fence, chest) keeps the dry block's collision role; water is no hazard.
+			if (collision.isEmpty()) return standingWater ? Cell.CLEAR : Cell.WATER;
 		}
 		if (state.is(BlockTags.CLIMBABLE)) return Cell.CLIMBABLE;
 		if (isOpenDoor(state)) return Cell.CLEAR;

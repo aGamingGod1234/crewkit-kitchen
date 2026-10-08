@@ -25,41 +25,66 @@ public final class LiveTaskWindowRenderVerification {
   SwingUtilities.invokeAndWait(() -> {
    try {
     Class<?> outer = Class.forName("dev.agaminggod.arenaagents.client.control.LiveAgentWindows");
-    var detailField = outer.getDeclaredField("detail"); detailField.setAccessible(true);
-    JTextArea detail = new JTextArea(); detailField.set(null, detail);
     Class<?> graphClass = Class.forName(outer.getName() + "$Graph");
     var constructor = graphClass.getDeclaredConstructor(); constructor.setAccessible(true);
     JPanel graph = (JPanel) constructor.newInstance();
+    set(outer, "graph", graph);
     var setData = graphClass.getDeclaredMethod("setData", com.google.gson.JsonObject.class); setData.setAccessible(true);
+    var centerOf = graphClass.getDeclaredMethod("centerOf", String.class); centerOf.setAccessible(true);
     var snapshot = JsonParser.parseString("""
-      {"plan":{"steps":[
-       {"id":"wood","label":"Craft wooden pickaxe","kind":"milestone","status":"complete","dependsOn":[],"detail":"First tool crafted."},
-       {"id":"food","label":"Carry food for the trip","kind":"inventory","status":"complete","dependsOn":[],"detail":"Current supplies."},
-       {"id":"iron","label":"Carry an iron pickaxe","kind":"inventory","status":"complete","dependsOn":["wood"],"detail":"Required for diamonds."},
-       {"id":"portal","label":"Establish Nether portal","kind":"world","status":"complete","dependsOn":["iron"],"detail":"Known infrastructure."},
-       {"id":"nether","label":"Enter the Nether","kind":"milestone","status":"complete","dependsOn":["portal"],"detail":"Historical milestone."},
-       {"id":"blaze","label":"Collect blaze rods","kind":"inventory","status":"active","dependsOn":["nether","food"],"detail":"Current advisory step."},
-       {"id":"end","label":"Enter the End","kind":"milestone","status":"pending","dependsOn":["blaze"],"detail":"Find the stronghold."}
+      {"goalRevision":1,"goal":"Beat the game and kill the ender dragon","active":true,"verified":false,"revision":2,"generatedAt":1,
+       "events":[{"stage":"live_lifecycle","message":"Goal lifecycle operation 'start' accepted.","sequence":1,"at":1},
+        {"stage":"live_planner","message":"Native turn queued with ordinary priority.","sequence":2,"at":2},
+        {"stage":"live_provider","message":"Provider native_turn request started (attempt 1).","sequence":3,"at":3},
+        {"stage":"live_agent_message","message":"Need to find logs. Heading to the birch forest to the east before night falls, then crafting a table and wooden pickaxe.","sequence":4,"at":4},
+        {"stage":"live_retry","message":"No factual world progress for 30 seconds; reassessing without pausing the goal.","sequence":5,"at":5}],
+       "usage":{"inputTokens":639453,"cachedInputTokens":582144,"outputTokens":2253},"allowance":null,
+       "plan":{"steps":[
+       {"id":"wood","label":"Wood + stone tools","kind":"milestone","status":"complete","dependsOn":[],"detail":"First tool crafted."},
+       {"id":"food","label":"Get food","kind":"inventory","status":"pending","dependsOn":[],"detail":"Current supplies."},
+       {"id":"logs","label":"Gather ~12 logs","kind":"inventory","status":"active","dependsOn":["wood"],"detail":"Wood for a base."},
+       {"id":"iron","label":"Iron tools/armor, bucket","kind":"inventory","status":"lost","dependsOn":["logs"],"detail":"Required for diamonds."},
+       {"id":"portal","label":"Nether portal","kind":"world","status":"pending","dependsOn":["iron"],"detail":"Known infrastructure."},
+       {"id":"blaze","label":"Collect blaze rods","kind":"inventory","status":"pending","dependsOn":["portal","food"],"detail":"Current advisory step."},
+       {"id":"pearls","label":"Ender pearls","kind":"inventory","status":"pending","dependsOn":["portal"],"detail":"Trade or hunt."},
+       {"id":"end","label":"Enter the End and kill the dragon","kind":"milestone","status":"pending","dependsOn":["blaze","pearls"],"detail":"Find the stronghold."}
       ]}}
       """).getAsJsonObject();
+    set(outer, "latest", snapshot);
+    var viewClass = Class.forName(outer.getName() + "$PlanView");
+    var viewConstructor = viewClass.getDeclaredConstructor(graphClass); viewConstructor.setAccessible(true);
+    JPanel view = (JPanel) viewConstructor.newInstance(graph);
     setData.invoke(graph, snapshot);
-    graph.setSize(graph.getPreferredSize());
-    render(graph, output.resolve("branch-map-before-death.png"));
-    graph.dispatchEvent(new MouseEvent(graph, MouseEvent.MOUSE_CLICKED, 0, 0, 280, 60, 1, false));
-    if (!detail.getText().contains("Carry an iron pickaxe")) throw new AssertionError("Graph click did not select the step");
-    snapshot.getAsJsonObject("plan").getAsJsonArray("steps").get(2).getAsJsonObject().addProperty("status", "lost");
+    for (int[] size : new int[][]{{1180, 720}, {760, 460}}) {
+     view.setSize(size[0], size[1]); view.doLayout();
+     var center = (java.awt.Point) centerOf.invoke(graph, "end");
+     if (center == null || center.x < 0 || center.y < 0 || center.x > graph.getWidth() || center.y > graph.getHeight())
+      throw new AssertionError("Plan step does not fit inside the window at " + size[0] + "x" + size[1]);
+     render(view, output.resolve("plan-" + size[0] + "x" + size[1] + ".png"));
+    }
+    view.setSize(1180, 720); view.doLayout();
+    var center = (java.awt.Point) centerOf.invoke(graph, "iron");
+    graph.dispatchEvent(new MouseEvent(graph, MouseEvent.MOUSE_CLICKED, 0, 0, center.x, center.y, 1, false));
+    if (!detail(outer).contains("Iron tools/armor")) throw new AssertionError("Graph click did not select the step");
+    snapshot.getAsJsonObject("plan").getAsJsonArray("steps").get(3).getAsJsonObject().addProperty("status", "complete");
     setData.invoke(graph, snapshot);
-    if (!detail.getText().contains("State: lost")) throw new AssertionError("Selected detail did not refresh after revision");
-    render(graph, output.resolve("branch-map-after-death.png"));
-    detail.setCaretPosition(10);setData.invoke(graph,snapshot);
-    if(detail.getCaretPosition()!=10)throw new AssertionError("Unchanged polling reset the detail reading position");
-    snapshot.addProperty("goalRevision",2);setData.invoke(graph,snapshot);
-    if(!detail.getText().startsWith("Select a step"))throw new AssertionError("New task retained the previous selected step");
-    System.out.println("Headless native graph rendering, step selection, reading position and task reset passed; images: " + output);
+    if (!detail(outer).contains("State: complete")) throw new AssertionError("Selected detail did not refresh after revision");
+    render(view, output.resolve("plan-selected.png"));
+    snapshot.addProperty("goalRevision", 2); setData.invoke(graph, snapshot);
+    if (!detail(outer).startsWith("Select a step")) throw new AssertionError("New task retained the previous selected step");
+    var terminalClass = Class.forName(outer.getName() + "$TerminalView");
+    var terminalConstructor = terminalClass.getDeclaredConstructor(); terminalConstructor.setAccessible(true);
+    JPanel terminal = (JPanel) terminalConstructor.newInstance();
+    for (int[] size : new int[][]{{960, 620}, {640, 420}}) {
+     terminal.setSize(size[0], size[1]);
+     render(terminal, output.resolve("terminal-" + size[0] + "x" + size[1] + ".png"));
+    }
+    System.out.println("Headless plan and terminal rendering, fit, step selection and task reset passed; images: " + output);
    } catch (Exception exception) { throw new RuntimeException(exception); }
   });
   if(List.of(args).contains("--native")) verifyNative(output);
  }
+ private static String detail(Class<?> outer) throws Exception { return (String) call(outer, "detailText"); }
  /** Opt-in on an explicitly authorized GUI machine; uses the same packaged JFrame implementation. */
  private static void verifyNative(Path output) throws Exception {
   if(GraphicsEnvironment.isHeadless())throw new IllegalStateException("--native requires an authorized GUI machine");
@@ -80,7 +105,7 @@ public final class LiveTaskWindowRenderVerification {
    call(windows,"toggleTerminal",AgentControlAgent.class,first);flushEdt();
    JFrame terminal=(JFrame)get(windows,"terminalFrame");check(terminal!=null && terminal.isShowing() && get(windows,"planFrame")==plan,"Terminal opens independently");checks++;
    packet(windows,first,1,true,"Connected","First task output");
-   check(((JTextArea)get(windows,"terminal")).getText().contains("First task output"),"Live packet populates terminal");checks++;
+   check(((String)call(windows,"terminalText")).contains("First task output"),"Live packet populates terminal");checks++;
    SwingUtilities.invokeAndWait(()->plan.dispatchEvent(new WindowEvent(plan,WindowEvent.WINDOW_CLOSING)));
    check(get(windows,"planFrame")==null && get(windows,"terminalFrame")==terminal && terminal.isShowing(),"Plan close keeps terminal open");checks++;
    Properties saved=new Properties();try(var in=Files.newInputStream(settings)){saved.load(in);}
@@ -93,29 +118,29 @@ public final class LiveTaskWindowRenderVerification {
    check((boolean)call(windows,"planEnabled") && !(boolean)call(windows,"terminalEnabled"),"Preferences reload the last independent toggles");checks++;
    call(windows,"toggleTerminal",AgentControlAgent.class,first);flushEdt();
    call(windows,"select",AgentControlAgent.class,second);flushEdt();
-   check(!((JTextArea)get(windows,"terminal")).getText().contains("First task output") && ((JFrame)get(windows,"terminalFrame")).getTitle().contains("Window QA Two"),"Agent switch clears prior output and updates title");checks++;
+   check(!((String)call(windows,"terminalText")).contains("First task output") && ((JFrame)get(windows,"terminalFrame")).getTitle().contains("Window QA Two"),"Agent switch clears prior output and updates title");checks++;
    packet(windows,first,2,true,"Connected","Late old agent output");
-   check(!((JTextArea)get(windows,"terminal")).getText().contains("Late old agent output"),"Late packet for former selection is ignored");checks++;
+   check(!((String)call(windows,"terminalText")).contains("Late old agent output"),"Late packet for former selection is ignored");checks++;
    packet(windows,second,2,true,"Connected","Second task output");
    packet(windows,second,1,true,"Connected","Old revision output");
-   check(!((JTextArea)get(windows,"terminal")).getText().contains("Old revision output"),"Older goal revision cannot replace current display");checks++;
+   check(!((String)call(windows,"terminalText")).contains("Old revision output"),"Older goal revision cannot replace current display");checks++;
    JFrame currentPlan=(JFrame)get(windows,"planFrame");
    SwingUtilities.invokeAndWait(()->currentPlan.dispatchEvent(new WindowEvent(currentPlan,WindowEvent.WINDOW_CLOSING)));
    set(windows,"receivedAt",System.currentTimeMillis()-5000);
    call(windows,"accept",LiveTaskViewPayload.Snapshot.class,get(windows,"lastSnapshot"));flushEdt();
    Thread.sleep(1200);flushEdt();
-   check(((JTextArea)get(windows,"terminal")).getText().contains("Live data is stale"),"Terminal alone refreshes stale state and cached replay cannot hide it");checks++;
+   check(((String)call(windows,"terminalText")).contains("Live data is stale"),"Terminal alone refreshes stale state and cached replay cannot hide it");checks++;
    packet(windows,second,2,false,"Coordinator offline; displayed data may be stale","Second task output");
-   check(((JTextArea)get(windows,"terminal")).getText().contains("Coordinator offline"),"Offline coordinator is shown");checks++;
+   check(((String)call(windows,"terminalText")).contains("Coordinator offline"),"Offline coordinator is shown");checks++;
    packet(windows,second,3,true,"Connected","Fresh task output");
-   String fresh=((JTextArea)get(windows,"terminal")).getText();check(fresh.contains("Fresh task output") && !fresh.contains("Second task output") && !fresh.contains("offline"),"Fresh task reconnect replaces old output");checks++;
+   String fresh=((String)call(windows,"terminalText"));check(fresh.contains("Fresh task output") && !fresh.contains("Second task output") && !fresh.contains("offline"),"Fresh task reconnect replaces old output");checks++;
    call(windows,"clearView",String.class,"Selected agent is no longer available");flushEdt();
-   String removed=((JTextArea)get(windows,"terminal")).getText();check(removed.contains("no longer available") && !removed.contains("Fresh task output"),"Removed selected agent clears terminal content");checks++;
+   String removed=((String)call(windows,"terminalText"));check(removed.contains("no longer available") && !removed.contains("Fresh task output"),"Removed selected agent clears terminal content");checks++;
    call(windows,"disconnect");flushEdt();
    check(get(windows,"planFrame")==null && get(windows,"terminalFrame")==null && (boolean)call(windows,"terminalEnabled"),"Minecraft disconnect disposes frames and retains local preference");checks++;
    SwingUtilities.invokeAndWait(()->{try{call(windows,"syncFrames");}catch(Exception e){throw new RuntimeException(e);}});
    packet(windows,second,3,true,"Connected","After reconnect output");
-   check(((JFrame)get(windows,"terminalFrame")).isShowing() && ((JTextArea)get(windows,"terminal")).getText().contains("After reconnect output"),"Reconnect frame synchronization restores enabled viewer");checks++;
+   check(((JFrame)get(windows,"terminalFrame")).isShowing() && ((String)call(windows,"terminalText")).contains("After reconnect output"),"Reconnect frame synchronization restores enabled viewer");checks++;
    String result="PASS: "+checks+" native window lifecycle checks\nLiveAgentWindows origin: "+origin+"\nSettings: isolated temporary directory\nScope: actual JFrame implementation; Minecraft Manage widgets and server networking are not launched\n";
    Files.writeString(output.resolve("native-verification.txt"),result);System.out.print(result);
   } catch(Throwable failure) {
@@ -137,9 +162,9 @@ public final class LiveTaskWindowRenderVerification {
  private static void set(Class<?> type,String name,Object value)throws Exception{var f=type.getDeclaredField(name);f.setAccessible(true);f.set(null,value);}
  private static Object call(Class<?> type,String name)throws Exception{var m=type.getDeclaredMethod(name);m.setAccessible(true);return m.invoke(null);}
  private static Object call(Class<?> type,String name,Class<?> parameter,Object value)throws Exception{var m=type.getDeclaredMethod(name,parameter);m.setAccessible(true);return m.invoke(null,value);}
- private static void render(JPanel graph, Path output) throws Exception {
-  BufferedImage image = new BufferedImage(graph.getWidth(), graph.getHeight(), BufferedImage.TYPE_INT_RGB);
-  var graphics = image.createGraphics(); graph.paint(graphics); graphics.dispose();
+ private static void render(JPanel panel, Path output) throws Exception {
+  BufferedImage image = new BufferedImage(panel.getWidth(), panel.getHeight(), BufferedImage.TYPE_INT_RGB);
+  var graphics = image.createGraphics(); panel.paint(graphics); graphics.dispose();
   ImageIO.write(image, "png", output.toFile());
  }
 }

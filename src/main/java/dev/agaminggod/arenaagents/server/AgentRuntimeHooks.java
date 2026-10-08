@@ -25,6 +25,11 @@ public interface AgentRuntimeHooks {
 	default void onRemoved(AgentId agentId, long terminalRevision) {
 	}
 
+	/** Cancels a detached action (no task: idle or completed). Returns true when one was running. */
+	default boolean cancelDetachedAction(AgentId agentId, String reason) {
+		return false;
+	}
+
 	default void onServerStopping() {
 	}
 

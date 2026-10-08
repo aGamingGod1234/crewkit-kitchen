@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { withToolWear } from '../src/resource-facts.mjs';
 import test from 'node:test';
 import { MAX_TOOL_RESULT_BYTES, toolResultContent } from '../src/native-minecraft-tools.mjs';
 import { presentNativeToolResult } from '../src/codex-service.mjs';
@@ -126,7 +127,7 @@ for (const kind of ['sequence', 'action']) test(`provider presentation budgets l
 	}
 	assert.equal(result.postAction.eventSequence, 42);
 	assert.equal(result.postAction.freshness.fresh, true);
-	assert.deepEqual(result.postAction.observation.inventory.items, inventory.items);
+	assert.deepEqual(result.postAction.observation.inventory.items, withToolWear(inventory).items, 'the model reads wear as usesLeft');
 	assert.equal(result.postAction.observation.inventory.selectedSlot, inventory.selectedSlot);
 	assert.deepEqual(result.postAction.observation.inventory.selectedItem, inventory.selectedItem);
 	assert.equal(Object.hasOwn(result.postAction.observation.inventory, 'tagCounts'), false);
@@ -166,7 +167,7 @@ test('provider postAction fallback unions prior section omissions with newly omi
 	const result = present(value, 'sequence');
 	assert.equal(result.completed, 2);
 	assert.equal(result.postAction.truncated, true);
-	assert.deepEqual(result.postAction.observation.inventory, inventory);
+	assert.deepEqual(result.postAction.observation.inventory, withToolWear(inventory), 'the model reads wear as usesLeft');
 	assert.deepEqual(result.postAction.observation.resultCoverage.omittedSections.sort(), ['earlierSection', 'player']);
 	assert.deepEqual(result.postAction.observation.resultCoverage.omittedFields, ['earlier.field', 'player']);
 	assert.deepEqual(value, original);

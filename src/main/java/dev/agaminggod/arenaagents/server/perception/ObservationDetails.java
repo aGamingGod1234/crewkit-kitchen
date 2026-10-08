@@ -76,6 +76,32 @@ public final class ObservationDetails {
 			target.add("equipment", equipment);
 			target.addProperty("usingItem", living.isUsingItem());
 			target.addProperty("onFire", living.isOnFire());
+			combat(target, player, living);
+		}
+	}
+
+	/** Fight-or-flee facts the model needs: hostility, whether it hunts this agent, health and creeper fuse. */
+	static void combat(JsonObject target, ServerPlayer player, LivingEntity living) {
+		target.addProperty("alive", living.isAlive());
+		// A calm neutral mob (enderman, zombified piglin, piglin tolerating gold) is not hostile to this agent.
+		// A player (or calm creature) counts as hostile only once it actually hurt this agent recently.
+		target.addProperty("hostile", (living instanceof net.minecraft.world.entity.Mob mob
+				? ThreatPerception.isHostileTo(mob, player) : living instanceof net.minecraft.world.entity.monster.Enemy)
+				|| RiskAssessment.attackedRecently(player, living));
+		if (RiskAssessment.carriesRisk(player, living)) {
+			// potentialRisk is always shown; risk appears only while the creature or player actively engages this agent.
+			RiskAssessment.Assessment assessment = RiskAssessment.assess(player, living);
+			target.addProperty("potentialRisk", assessment.risk());
+			if (assessment.active()) target.addProperty("risk", assessment.risk());
+			target.addProperty("expectedHitDamage", assessment.hit().damage());
+		}
+		target.addProperty("health", Float.isFinite(living.getHealth()) ? living.getHealth() : 0.0F);
+		target.addProperty("maxHealth", Float.isFinite(living.getMaxHealth()) ? living.getMaxHealth() : 0.0F);
+		if (living instanceof net.minecraft.world.entity.Mob mob) target.addProperty("targetingAgent", mob.getTarget() == player);
+		if (living instanceof net.minecraft.world.entity.monster.Creeper creeper) {
+			target.addProperty("swelling", creeper.getSwellDir() > 0);
+			// 0 idle .. 1 exploding; vanilla's fuse is 1.5 s from 0 to 1.
+			target.addProperty("fuse", Math.round(creeper.getSwelling(1.0F) * 100.0F) / 100.0D);
 		}
 	}
 

@@ -14,6 +14,7 @@ const ACTION_BINDINGS = Object.freeze(Object.assign(Object.create(null), {
 		attack: Object.freeze(Object.assign(Object.create(null), { primitive: 'attack' })),
 		useRanged: Object.freeze(Object.assign(Object.create(null), { primitive: 'use_ranged' })),
 		craftInventory: Object.freeze(Object.assign(Object.create(null), { primitive: 'craft_inventory' })),
+		mine: Object.freeze(Object.assign(Object.create(null), { primitive: 'break_block' })),
 	})),
 }));
 
@@ -409,6 +410,53 @@ test('resets per-slice loop budget after each valid command result while retaini
 	const exhausted = vm.resume(actionResult(third), facts());
 	assert.equal(exhausted.kind, 'checkpoint');
 	assert.equal(exhausted.reason, 'repeat_until_exhausted');
+});
+
+test('a loop alternating failed mines on cleared blocks yields to the model', () => {
+	// Seen live: a program mined (-3,17,-8) and (-3,16,-8) in turn after both were air,
+	// several times a second, and nothing stopped it.
+	const vm = interpreter(`
+		program.onUnhandledAttention("continue_and_notify");
+		await program.repeatUntil(() => false, { maxIterations: 64 }, async () => {
+			await player.mine({ x: -3, y: 17, z: -8, expectedBlockId: "minecraft:stone" });
+			await player.mine({ x: -3, y: 16, z: -8, expectedBlockId: "minecraft:stone" });
+		});
+	`);
+	let step = vm.start(facts());
+	let failures = 0;
+	while (step.kind === 'command' && failures < 64) {
+		step = vm.resume(actionResult(step, 'FAILED', 'TARGET_INVALID_FOR_TEST'), facts());
+		failures += 1;
+	}
+	assert.equal(step.kind, 'replan', 'a no-progress loop stops instead of spinning');
+	assert.equal(failures, 8, 'eight failures in a row with no success hand control back');
+	assert.equal(step.reason, 'repeated_action_failure:TARGET_INVALID_FOR_TEST');
+
+	const air = interpreter(`
+		program.onUnhandledAttention("continue_and_notify");
+		await program.repeatUntil(() => false, { maxIterations: 64 }, async () => {
+			await player.mine({ x: -3, y: 17, z: -8, expectedBlockId: "minecraft:stone" });
+		});
+	`);
+	const first = air.start(facts());
+	const second = air.resume(actionResult(first, 'FAILED', 'TARGET_AIR'), facts());
+	assert.equal(second.kind, 'command');
+	assert.equal(air.resume(actionResult(second, 'FAILED', 'TARGET_AIR'), facts()).reason, 'repeated_action_failure:TARGET_AIR',
+		'mining air twice at the same step is deterministic');
+});
+
+test('successes between failures keep a working loop running', () => {
+	const vm = interpreter(`
+		program.onUnhandledAttention("continue_and_notify");
+		await program.repeatUntil(() => false, { maxIterations: 40 }, async () => {
+			await player.mine({ x: 1, y: 64, z: 0, expectedBlockId: "minecraft:stone" });
+		});
+	`);
+	let step = vm.start(facts());
+	for (let index = 0; index < 30; index += 1) {
+		step = vm.resume(actionResult(step, index % 4 === 3 ? 'SUCCEEDED' : 'FAILED', index % 4 === 3 ? 'BLOCK_BROKEN' : 'TARGET_TOO_FAR'), facts());
+		assert.equal(step.kind, 'command', `iteration ${index} keeps running`);
+	}
 });
 
 test('requests model recovery after the same deterministic failure twice', () => {
