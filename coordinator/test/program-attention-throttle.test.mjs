@@ -7,7 +7,7 @@ const observation = (health = 20) => ({ player: { x: 0, y: 64, z: 0, health }, e
 const turn = () => new Promise(resolve => setImmediate(resolve));
 
 function setup(t, policy = 'continue_and_notify') {
-	let now = 1_000_000;
+	let now = 1_000_000, sequence = 1;
 	const timers = [], decisions = [], pending = [];
 	const executor = new NativeProgramExecutor({
 		setTimeoutFn: (callback, ms) => { const timer = { callback, ms, cleared: false }; timers.push(timer); return timer; },
@@ -18,11 +18,10 @@ function setup(t, policy = 'continue_and_notify') {
 	const result = executor.run(record, { source: `program.onUnhandledAttention("${policy}"); await player.wait(1); await player.wait(2);`, programId: 'throttle' }, {
 		observation: observation(), eventSequence: 1,
 		executeAction: () => new Promise((resolve) => { pending.push(resolve); }),
-		cancelAction: async () => { for (const resolve of pending.splice(0)) resolve({ state: 'CANCELLED', reasonCode: 'INPUT_RELEASED' }); return { state: 'CANCELLED' }; },
-		onDecision: (status, { priority }) => decisions.push({ decisionId: status.decision?.decisionId, priority }),
+		cancelAction: async () => { for (const resolve of pending.splice(0)) resolve({ state: 'CANCELLED', reasonCode: 'INPUT_RELEASED', observation: observation(), eventSequence: ++sequence }); return { state: 'CANCELLED' }; },
+		onDecision: (status, { priority }) => decisions.push({ decisionId: status.decision?.decisionId, eventSequence: status.decision?.eventSequence, priority }),
 	});
 	t.after(() => executor.cancel(record.agentId));
-	let sequence = 1;
 	const sight = (extra = {}) => executor.onObservation(record, { observation: observation(extra.health), eventSequence: ++sequence, attention: true, priority: 'ordinary', trigger: 'resource_discovery', ...extra });
 	const finishAction = () => { for (const resolve of pending.splice(0)) resolve({ state: 'SUCCEEDED', reasonCode: 'DONE', observation: observation(), eventSequence: ++sequence }); };
 	return { executor, result, timers, decisions, sight, finishAction, advance: (ms) => { now += ms; } };
@@ -72,6 +71,38 @@ test('urgent attention always notifies at once', async t => {
 	await turn();
 	assert.equal(run.decisions.length, 2);
 	assert.equal(run.decisions[1].priority, 'urgent');
+});
+
+test('repeated urgent attention refreshes facts and notifies without changing the decision handle', async t => {
+	const run = setup(t);
+	run.sight({ priority: 'urgent', trigger: 'damage', health: 18 });
+	await turn();
+	const decisionId = run.decisions[0].decisionId;
+	run.sight({ priority: 'urgent', trigger: 'damage', health: 16 });
+	await turn();
+	run.sight({ priority: 'urgent', trigger: 'damage', health: 14 });
+	await turn();
+	assert.equal(run.decisions.length, 3, 'each urgent observation still notifies the model');
+	assert.deepEqual(run.decisions.map(decision => decision.decisionId), [decisionId, decisionId, decisionId]);
+	assert.equal(run.executor.status(record).decision.eventSequence, 5, 'the live handle carries the latest observed facts');
+	assert.equal(run.executor.status(record).decision.trigger, 'damage');
+	assert.throws(() => run.executor.respond(record, { programId: 'throttle', decisionId, directive: 'continue', eventSequence: run.decisions[0].eventSequence }),
+		{ code: 'STALE_PROGRAM_DECISION' }, 'the first urgent event sequence cannot authorize continuing on later facts');
+	assert.doesNotThrow(() => run.executor.respond(record, { programId: 'throttle', decisionId, directive: 'continue', eventSequence: 5 }),
+		'the same stable handle accepts a continue explicitly bound to the latest facts');
+});
+
+test('urgent-to-urgent trigger escalation keeps the same decision handle and refreshes the trigger', async t => {
+	const run = setup(t);
+	run.sight({ priority: 'urgent', trigger: 'damage', health: 18 });
+	await turn();
+	const decisionId = run.decisions[0].decisionId;
+	run.sight({ priority: 'urgent', trigger: 'suffocation', health: 18 });
+	await turn();
+	assert.equal(run.decisions.length, 2, 'a materially different urgent trigger still notifies');
+	assert.equal(run.decisions[1].decisionId, decisionId, 'urgent escalation does not invalidate the handle already shown');
+	assert.equal(run.executor.status(record).decision.trigger, 'suffocation');
+	assert.equal(run.executor.status(record).decision.eventSequence, 4);
 });
 
 test('ordinary attention folded after the last notification is not lost when the model answers continue', async t => {

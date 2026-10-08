@@ -344,6 +344,10 @@ export class NativeToolRuntime {
 		if (this.#sweeps.has(record.agentId)) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'A camera sweep owns this player until sampling completes');
 		if (this.#programRuns.has(record.agentId)) {
 			if (this.#dangerActionWhilePaused(request.tool, record)) {
+				if (request.tool.kind === 'replace_action') {
+					const previous = this.#terminalActionReceipt(record, request.tool.actionId, request.tool.goalRevision);
+					return this.#startReplacementAsNewAction(request, record, previous, { pausedProgram: true });
+				}
 				const tool = { ...request.tool, kind: 'action' };
 				return this.#executeAction(request, record, tool, null, request.tool.kind !== 'start_action', null, null, { pausedProgram: true });
 			}
@@ -351,6 +355,8 @@ export class NativeToolRuntime {
 		}
 		if (request.tool.kind === 'run_program') return this.#runProgram(request, record);
 		if (request.tool.kind === 'replace_action') {
+			const previous = this.#actions.has(record.agentId) ? null : this.#terminalActionReceipt(record, request.tool.actionId, request.tool.goalRevision);
+			if (previous !== null) return this.#startReplacementAsNewAction(request, record, previous);
 			const epoch = this.#executionEpoch(record.agentId);
 			const cancelled = await this.#cancelAction(record, request.tool);
 			if (this.#executionEpoch(record.agentId) !== epoch + 1) throw codedError('STALE_NATIVE_TOOL', 'Lifecycle changed while cancelling the replaced action');
@@ -378,11 +384,22 @@ export class NativeToolRuntime {
 	 * ends it. Nothing here chooses an action: it only removes the respondProgram/programStatus detour under danger.
 	 */
 	#dangerActionWhilePaused(tool, record) {
-		if (!['action', 'start_action'].includes(tool.kind) || !PAUSED_PROGRAM_DANGER_ACTIONS.has(tool.actionType)) return false;
+		if (!['action', 'start_action', 'replace_action'].includes(tool.kind) || !PAUSED_PROGRAM_DANGER_ACTIONS.has(tool.actionType)) return false;
 		const run = this.#programRuns.get(record.agentId);
 		if (run?.goalRevision !== record.goalRevision || run.state !== 'RUNNING' || run.epoch !== this.#executionEpoch(record.agentId)) return false;
 		const status = this.#programExecutor.status?.(record);
-		return status?.decision != null && status.engineState === 'SUSPENDED' && !this.#actions.has(record.agentId);
+		return status?.decision != null && status.engineState === 'SUSPENDED' && !this.#actions.has(record.agentId)
+			&& (tool.kind !== 'replace_action' || this.#terminalActionReceipt(record, tool.actionId, tool.goalRevision) !== null);
+	}
+
+	#terminalActionReceipt(record, actionId, goalRevision) {
+		if (goalRevision !== record.goalRevision) return null;
+		return this.#receipts.get(record.agentId)?.findLast((entry) => entry.actionId === actionId && entry.goalRevision === goalRevision && TERMINAL_ACTION_STATES.has(entry.state)) ?? null;
+	}
+
+	async #startReplacementAsNewAction(request, record, previous, { pausedProgram = false } = {}) {
+		const started = await this.#executeAction(request, record, { ...request.tool, kind: 'action' }, null, false, null, null, { pausedProgram });
+		return { ...started, startedAs: 'start_action', replacedAction: { actionId: previous.actionId, state: previous.state } };
 	}
 
 	async #observe(record, { includeMetadata = true, afterResult = null } = {}) {

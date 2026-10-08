@@ -46,7 +46,9 @@ export class NativeProgramExecutor {
 		const run = { record: { ...record }, context, programId, maxActions, timeoutMs, expectedDurationMs, planningLeadMs: planningLeadMs ?? null, actions: 0, actionsSucceeded: 0, actionsFailed: 0, receipts: [], resolve, result,
 			settled: false, bodyPending: false, pendingActionId: null, stopping: null, timer: null, planningDueTimer: null, planningDueNotified: false, planningDueVersion: null, cancellationTimer: null,
 			observation: programObservation(context.observation), eventSequence: context.eventSequence, engine: null,
-			observationIntervalMs, observationTimer: null, refresh: null, refreshGeneration: 0, decision: null, decisionSequence: 0, notifiedDecisionId: null, lastOrdinaryNotificationAt: Number.NEGATIVE_INFINITY, ordinaryNotificationTimer: null, unseenAttention: false };
+			observationIntervalMs, observationTimer: null, refresh: null, refreshGeneration: 0, decision: null, decisionSequence: 0, decisionIssuedEventSequence: null,
+			urgentNotificationQueued: false,
+			notifiedDecisionId: null, lastOrdinaryNotificationAt: Number.NEGATIVE_INFINITY, ordinaryNotificationTimer: null, unseenAttention: false };
 		run.engine = new ArenaScriptEngine({
 			dispatch: (command) => { void this.#dispatch(run, command); },
 			cancel: (actionId) => { void this.#cancelBody(run, actionId); },
@@ -160,15 +162,43 @@ export class NativeProgramExecutor {
 				trigger: request.trigger, ...(request.actionFailure === undefined ? {} : { actionFailure: request.actionFailure }) });
 			return;
 		}
+		if (run.decision !== null && run.decision.priority === 'urgent' && request.priority === 'urgent'
+			&& run.decision.programVersion === request.version) {
+			// Urgent facts may change faster than the model can answer. Keep the
+			// already-shown handle, but bind it to the newest decision context.
+			run.decision.trigger = request.trigger;
+			run.decision.eventSequence = request.eventSequence;
+			if (request.actionFailure === undefined) delete run.decision.actionFailure;
+			else run.decision.actionFailure = request.actionFailure;
+			run.unseenAttention = true;
+			this.#scheduleUrgentNotification(run);
+			return;
+		}
 		run.decision = { decisionId: `${run.programId}:decision-${++run.decisionSequence}`, programVersion: request.version,
 			trigger: request.trigger, priority: request.priority, eventSequence: request.eventSequence,
 			...(request.actionFailure === undefined ? {} : { actionFailure: request.actionFailure }) };
+		run.decisionIssuedEventSequence = request.eventSequence;
 		run.unseenAttention = true;
 		// The engine must finish applying the authored attention policy first.
-		const decision = run.decision;
+		if (notificationPriority === 'urgent') this.#scheduleUrgentNotification(run);
+		else {
+			const decision = run.decision;
+			queueMicrotask(() => {
+				if (run.settled || run.decision !== decision) return;
+				this.#notifyDecision(run, notificationPriority);
+			});
+		}
+	}
+
+	#scheduleUrgentNotification(run) {
+		if (run.urgentNotificationQueued) return;
+		run.urgentNotificationQueued = true;
 		queueMicrotask(() => {
-			if (run.settled || run.decision !== decision) return;
-			this.#notifyDecision(run, notificationPriority);
+			run.urgentNotificationQueued = false;
+			if (run.settled || run.decision?.priority !== 'urgent') return;
+			// Several snapshots can arrive in one bridge batch. One notification uses
+			// the latest refreshed handle/facts; later urgent events still notify again.
+			this.#notifyDecision(run, 'urgent');
 		});
 	}
 
@@ -246,16 +276,31 @@ export class NativeProgramExecutor {
 			...(run.decision === null ? {} : { decision: structuredClone(run.decision) }) };
 	}
 
-	respond(record, { programId, decisionId, directive, source }) {
+	respond(record, { programId, decisionId, eventSequence, directive, source }) {
 		const run = this.#runs.get(record.agentId);
-		if (!run || run.record.goalRevision !== record.goalRevision || run.programId !== programId || run.settled || run.stopping !== null
-			|| run.decision?.decisionId !== decisionId) throw codedError('STALE_PROGRAM_DECISION', 'Read the current program decision before responding');
 		if (!['continue', 'pause', 'replace', 'finish'].includes(directive)) throw codedError('INVALID_PROGRAM_DIRECTIVE', 'Unsupported program directive');
+		if (!run || run.record.goalRevision !== record.goalRevision || run.programId !== programId || run.settled || run.stopping !== null) {
+			throw codedError('STALE_PROGRAM_DECISION', 'Read the current program decision before responding');
+		}
+		const currentDecision = run.decision;
+		const currentHandle = currentDecision?.decisionId === decisionId;
+		const stopDirective = directive === 'pause' || directive === 'finish';
+		const supersededHandle = stopDirective && isIssuedDecisionId(run, decisionId);
+		if (!currentHandle && !supersededHandle) throw codedError('STALE_PROGRAM_DECISION', 'Read the current program decision before responding');
+		if (!stopDirective && currentHandle && eventSequence !== undefined && eventSequence !== currentDecision.eventSequence) {
+			throw codedError('STALE_PROGRAM_DECISION', 'The decision facts changed; read the current decision before continuing or replacing the program');
+		}
+		if (!stopDirective && currentHandle && currentDecision.priority === 'urgent'
+			&& currentDecision.eventSequence !== run.decisionIssuedEventSequence
+			&& eventSequence !== currentDecision.eventSequence) {
+			throw codedError('STALE_PROGRAM_DECISION', 'The decision facts changed; read the current decision before continuing or replacing the program');
+		}
 		const compiled = directive === 'replace' ? parseArenaScript(source) : null;
 		const request = run.engine.refreshDirectiveRequest();
 		if (request === null) throw codedError('STALE_PROGRAM_DECISION', 'The program no longer needs this decision');
 		if (directive === 'continue' && request.actionFailure !== undefined) throw codedError('PROGRAM_REPLACEMENT_REQUIRED', 'A halted routine after repeated action failure requires replacement or an explicit stop');
 		run.decision = null;
+		run.decisionIssuedEventSequence = null;
 		if (directive === 'replace') {
 			// Replacements may wait for the current body action to acknowledge before
 			// installing their next engine version. Fence the old advisory now so a
@@ -474,6 +519,14 @@ export function hazardEdge(previous, next) {
 function programObservation(observation) {
 	return observation && Object.hasOwn(observation, 'ready') && (Object.hasOwn(observation, 'position') || observation.ready === false)
 		? adaptObservation(observation) : observation;
+}
+function isIssuedDecisionId(run, decisionId) {
+	const prefix = `${run.programId}:decision-`;
+	if (typeof decisionId !== 'string' || !decisionId.startsWith(prefix)) return false;
+	const suffix = decisionId.slice(prefix.length);
+	if (!/^[1-9]\d*$/.test(suffix)) return false;
+	const sequence = Number(suffix);
+	return Number.isSafeInteger(sequence) && sequence > 0 && sequence <= run.decisionSequence;
 }
 function validateRecord(record) {
 	for (const key of ['agentId', 'provider', 'model', 'reasoningEffort']) if (typeof record?.[key] !== 'string' || record[key].trim().length === 0 || record[key].length > 256) throw new TypeError(`record.${key} is required`);

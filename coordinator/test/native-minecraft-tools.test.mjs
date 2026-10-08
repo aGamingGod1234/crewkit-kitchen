@@ -15,6 +15,13 @@ import { goalSpecFingerprint, parseGoalSpec } from '../src/goal-spec.mjs';
 import { ModelNotebook } from '../src/model-notebook.mjs';
 import { TaskMemoryStore } from '../src/task-memory-store.mjs';
 
+test('respondProgram carries the decision event sequence used to authorize a continue', () => {
+	const tool = normalizeMinecraftToolCall('respondProgram', { programId: 'program-1', goalRevision: 1,
+		decisionId: 'program-1:decision-2', eventSequence: 27, directive: 'continue' });
+	assert.equal(tool.kind, 'respond_program');
+	assert.equal(tool.eventSequence, 27);
+});
+
 test('oversized real memory query pages round-trip every entry with advancing absolute offsets', async () => {
 	const notebook = new ModelNotebook();
 	const taskMemory = new TaskMemoryStore();
