@@ -241,11 +241,11 @@ test('replace_action can return early while its exact cancellation is still awai
 	const replacement = runtime.execute(nativeCall({ kind: 'replace_action', actionId: handle.actionId, goalRevision: 3, actionType: 'wait', arguments: { durationMs: 1 } }), record());
 	await new Promise((resolve) => setImmediate(resolve));
 	assert.deepEqual(sent.map(([type]) => type), ['action_command', 'action_cancel']);
-	assert.equal(runtime.interruptBlockingTool('agent-a', 'conversation'), true);
+	assert.equal(runtime.interruptBlockingTool('agent-a'), true);
 	const early = await Promise.race([replacement, new Promise((resolve) => setTimeout(() => resolve({ state: 'STILL_BLOCKED' }), 50))]);
 	assert.equal(early.state, 'CANCELLING');
 	assert.equal(early.actionId, handle.actionId);
-	assert.equal(early.interruptedBy, 'conversation');
+	assert.equal(early.interruptedBy, 'danger');
 	assert.match(early.recoveryHint, /cancellation.*requested/i);
 	assert.equal(sent.filter(([type]) => type === 'action_command').length, 1, 'replacement waits for the exact cancellation receipt');
 	assert.equal(runtime.onActionResult(record(), { actionId: handle.actionId, goalRevision: 3, state: 'CANCELLED', reasonCode: 'ACTION_CANCELLED' }), true);
@@ -264,7 +264,7 @@ test('an interrupted sequence reports its active step and leaves later actions u
 	for (let attempt = 0; attempt < 8 && sent.length === 0; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
 	assert.equal(sent.length, 1, 'only the current sequence step has started');
 	const actionId = sent[0][2].actionId;
-	assert.equal(runtime.interruptBlockingTool?.('agent-a', 'conversation'), true);
+	assert.equal(runtime.interruptBlockingTool('agent-a'), true);
 	const early = await Promise.race([
 		pending,
 		new Promise((resolve) => setTimeout(() => resolve({ state: 'STILL_BLOCKED' }), 50)),
@@ -272,8 +272,9 @@ test('an interrupted sequence reports its active step and leaves later actions u
 	assert.equal(early.state, 'RUNNING');
 	assert.equal(early.actionId, actionId);
 	assert.equal(early.actionType, 'navigate_to');
-	assert.equal(early.interruptedBy, 'conversation');
+	assert.equal(early.interruptedBy, 'danger');
 	assert.deepEqual(early.sequence, { runningStep: 1, completedSteps: 0, remainingSteps: 1 });
+	assert.match(early.recoveryHint, /Later steps were not started/);
 	assert.deepEqual(sent.map(([type]) => type), ['action_command']);
 	assert.equal(runtime.onActionResult(record(), { actionId, goalRevision: 3, state: 'SUCCEEDED', reasonCode: 'DONE' }), true);
 	await new Promise((resolve) => setImmediate(resolve));

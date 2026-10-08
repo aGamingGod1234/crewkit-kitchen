@@ -1387,7 +1387,7 @@ test('failed active native conversation remains unread through fresh-fact recove
 	} finally { await run.coordinator.stop(); }
 });
 
-test('urgent native conversation steers the active model turn while its body action continues', async () => {
+test('a native conversation waits for the normal body-tool boundary instead of interrupting', async () => {
 	const registry = new AgentRegistry();
 	const planner = new FakePlanner(registry);
 	const steers = [];
@@ -1401,8 +1401,6 @@ test('urgent native conversation steers the active model turn while its body act
 			callId: 'call-moving',
 			tool: { kind: 'action', actionType: 'navigate_to', arguments: { x: 20, y: 64, z: 0, tolerance: 1, sprint: true, timeoutMs: 30_000 } },
 		});
-		assert.equal(bodyResult.state, 'RUNNING');
-		assert.equal(bodyResult.interruptedBy, 'conversation');
 		return { status: 'completed', toolCalls: 1 };
 	};
 	planner.steerNativeTurn = async (request) => {
@@ -1428,14 +1426,15 @@ test('urgent native conversation steers the active model turn while its body act
 			agentId: 'agent-a',
 			payload: { sequence: 1, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct', text: 'Answer me while you walk.', goalRevision: 1, observedAtEpochMs: 1_787_184_000_000 },
 		});
-		await eventually(() => steers.length === 1 && bodyResult?.state === 'RUNNING');
+		await eventually(() => steers.length === 1);
 		assert.match(steers[0].input, /Answer me while you walk\./);
 		assert.deepEqual(JSON.parse(steers[0].input.slice(steers[0].input.indexOf('\n') + 1)).conversation.entries.map(({ sequence }) => sequence), [1]);
+		assert.equal(steers[0].onInterrupt, null, 'a conversation does not ask the body tool to return early');
+		assert.equal(bodyResult, null, 'the provider receives the message, but the body call stays blocked');
 		assert.equal(planner.requests.length, 1);
 		assert.equal(run.bridge.sent.some((message) => message.type === 'action_cancel' && message.payload.actionId === command.payload.actionId), false);
-		run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: command.payload.actionId, state: 'SUCCEEDED', reasonCode: '', executionStarted: true, eventSequence: 2 } });
-		for (let index = 0; index < 10; index += 1) await new Promise((resolve) => setImmediate(resolve));
-		assert.equal(planner.requests.length, 1);
+		run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: command.payload.actionId, state: 'SUCCEEDED', reasonCode: 'ARRIVED', executionStarted: true, eventSequence: 2 } });
+		await eventually(() => bodyResult?.state === 'SUCCEEDED');
 	} finally {
 		await run.coordinator.stop();
 	}

@@ -1428,7 +1428,7 @@ test('a failed Codex body response rejects its queued steer waiter', async (t) =
 	await toolStarted;
 	const steer = agent.steer('reply to the player', {
 		goalRevision: 1,
-		onInterrupt: () => releaseExecution({ state: 'RUNNING', actionId: 'body-action-failed-response', interruptedBy: 'conversation' }),
+		onInterrupt: () => releaseExecution({ state: 'RUNNING', actionId: 'body-action-failed-response', interruptedBy: 'danger' }),
 	});
 	transport.rejectRespond = true;
 	await assert.rejects(turn, (error) => error.code === 'TOOL_RESPONSE_DELIVERY_FAILED');

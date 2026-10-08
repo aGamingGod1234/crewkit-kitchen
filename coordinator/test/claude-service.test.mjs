@@ -668,7 +668,7 @@ test('a steer that never reached the model does not become the metadata baseline
 	try {
 		const agent = await service.createAgent(profile(), { controlProtocol: 'native_tools' });
 		const turn = agent.act(nativeEvent(1), { goalRevision: 0, executeTool: async () => ({}) });
-		await settle();
+		while (respond === undefined) await settle(10);
 		const steer = agent.steer(nativeEvent(2, (wake) => ({ ...wake, taskMemory: { ...wake.taskMemory, revision: 99 } })), { goalRevision: 0 });
 		void steer.catch(() => {});
 		respond();

@@ -292,11 +292,10 @@ export class NativeToolRuntime {
 			&& status.programVersion === programVersion && status.decision == null;
 	}
 
-	interruptBlockingTool(agentId, interruptedBy = 'danger') {
-		if (!['danger', 'conversation'].includes(interruptedBy)) throw new TypeError('interruptedBy must be danger or conversation');
+	interruptBlockingTool(agentId) {
 		const run = this.#blockingToolRuns.get(agentId);
 		if (run === undefined) return false;
-		if (run.interruptedBy !== 'conversation' || interruptedBy === 'conversation') run.interruptedBy = interruptedBy;
+		run.interruptedBy = 'danger';
 		run.resolveInterruption();
 		return true;
 	}
@@ -1327,7 +1326,7 @@ export class NativeToolRuntime {
 					blockingRun?.retainAction();
 					active.interruptedBy = blockingRun.interruptedBy ?? 'danger';
 					return { ...status, interruptedBy: active.interruptedBy,
-						recoveryHint: `replaceAction with actionId ${actionId} and your authored fight_target/flee_from switches now; cancelAction with the same actionId stops it.` };
+						recoveryHint: `replaceAction with actionId ${actionId} and your authored fight_target/flee_from switches now; cancelAction with the same actionId stops it.${blockingRun.sequence === null && blockingRun.lookAround === null ? '' : ' Later steps were not started.'}` };
 				}
 				outcome = await result;
 			} else outcome = settled.value;

@@ -1906,7 +1906,7 @@ export class DynamicCoordinator extends EventEmitter {
 		work.steerQueued = mergePlannerRequest(work.steerQueued, request);
 		const interruption = nativeSteerInterruption(request);
 		if (work.steerPromise !== null) {
-			if (interruption !== null) this.#nativeRuntime.interruptBlockingTool(work.agentId, interruption);
+			if (interruption) this.#nativeRuntime.interruptBlockingTool(work.agentId);
 			return;
 		}
 		const steering = this.#drainNativeSteering(work);
@@ -2010,7 +2010,7 @@ export class DynamicCoordinator extends EventEmitter {
 					agentId: work.agentId,
 					goalRevision: work.goalRevision,
 					input: buildInput,
-					onInterrupt: interruption === null ? null : () => this.#nativeRuntime.interruptBlockingTool(work.agentId, interruption),
+					onInterrupt: interruption ? () => this.#nativeRuntime.interruptBlockingTool(work.agentId) : null,
 					onDiscard: () => {
 						buildInput.discarded = true;
 						this.#restoreNativeConversation(deliveryRequest);
@@ -5092,7 +5092,6 @@ function nativeSteerInterruption(request) {
 	const trigger = event?.event === 'program_attention'
 		? event.status?.decision?.trigger ?? event.trigger ?? request?.trigger
 		: event?.trigger ?? request?.trigger;
-	if (['conversation', 'conversation_wake'].includes(trigger) || event?.conversationOnly === true) return 'conversation';
 	if (trigger === 'damage' || request?.dangerSummary?.hitsSinceLastUpdate > 0) return 'danger';
 	if (['lava', 'fire', 'drowning', 'suffocation'].includes(trigger)) return 'danger';
 	if (trigger !== 'threat') return null;
