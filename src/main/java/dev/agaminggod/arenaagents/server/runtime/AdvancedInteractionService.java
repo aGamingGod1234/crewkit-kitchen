@@ -918,6 +918,10 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 		private final Map<Integer, ItemStack> pendingGrid = new LinkedHashMap<>();
 		private int carrySourceSlot = -1;
 		private TickResult committed;
+		/** Inventory, grid and cursor ownership when this transaction last finished a tick. */
+		private List<TransactionSnapshot.OwnedStack> ownershipAtLastTick;
+		/** Stacks this transaction dropped at the body because no inventory slot could take them, as vanilla does. */
+		private final List<TransactionSnapshot.OwnedStack> droppedAtBody = new ArrayList<>();
 
 		CraftTransaction(ServerPlayer player, ServerActionRequest request, JsonObject arguments, boolean table) {
 			super(player, request, arguments, arguments.get("timeoutMs").getAsLong());
@@ -926,6 +930,23 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 
 		@Override
 		TickResult execute(long nowEpochMs) {
+			// Pickups land in the inventory between the craft's paced ticks (a player picks up items with a menu
+			// open too); only this transaction's own clicks must conserve ownership.
+			if (placementGuard != null && ownershipAtLastTick != null) {
+				placementGuard.absorbExternal(ownershipAtLastTick, heldOwnership());
+			}
+			TickResult result = step();
+			ownershipAtLastTick = placementGuard == null || result.terminal() ? null : heldOwnership();
+			return result;
+		}
+
+		private List<TransactionSnapshot.OwnedStack> heldOwnership() {
+			List<TransactionSnapshot.OwnedStack> owned = ownedStacks(player.getInventory(), gridSlots);
+			if (menu != null) addOwned(owned, menu.getCarried());
+			return owned;
+		}
+
+		private TickResult step() {
 			ticks++;
 			if (phase == Phase.START) {
 				TickResult failure = start();
@@ -1099,14 +1120,64 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 				pendingGrid.remove(next.getKey());
 				return TickResult.running();
 			}
-			// This ingredient is in every cell that needs it: put the rest back where it came from.
-			click(carrySourceSlot, 0, ContainerInput.PICKUP);
+			// This ingredient is in every cell that needs it: put the rest back where it came from. A pickup during
+			// the pacing can have filled that emptied slot (the play-test ROLLBACK_FAILED after mining), so the rest
+			// goes to any slot that takes it, a click per tick, or is dropped at the body when the inventory is full.
+			int target = putBackSlot(carrySourceSlot, carried);
 			carrySourceSlot = -1;
-			if (!menu.getCarried().isEmpty()) {
-				return failureAfterPlacement("MENU_INPUT_PARTIAL",
-						"The leftover ingredient could not be put back", placementGuard, gridSlots);
+			if (target >= 0) {
+				click(target, 0, ContainerInput.PICKUP);
+			} else {
+				ItemStack rest = menu.getCarried();
+				menu.setCarried(ItemStack.EMPTY);
+				returnToInventoryOrDrop(rest);
+				menu.broadcastChanges();
 			}
 			return TickResult.running();
+		}
+
+		/** The source slot if it still takes the stack, else a matching unfilled stack, else an empty slot, else -1. */
+		private int putBackSlot(int source, ItemStack stack) {
+			if (source >= 0 && accepts(menu.getSlot(source), stack, true)) return source;
+			for (int index = playerSlotStart(); index <= playerSlotEnd(); index++) {
+				if (accepts(menu.getSlot(index), stack, false)) return index;
+			}
+			for (int index = playerSlotStart(); index <= playerSlotEnd(); index++) {
+				Slot slot = menu.getSlot(index);
+				if (!slot.hasItem() && slot.mayPlace(stack)) return index;
+			}
+			return -1;
+		}
+
+		private static boolean accepts(Slot slot, ItemStack stack, boolean emptyAllowed) {
+			if (!slot.hasItem()) return emptyAllowed && slot.mayPlace(stack);
+			return ItemStack.isSameItemSameComponents(slot.getItem(), stack)
+					&& slot.getItem().getCount() < slot.getMaxStackSize(slot.getItem());
+		}
+
+		/** Vanilla placeItemBackInInventory, with the dropped remainder recorded for ownership accounting. */
+		private void returnToInventoryOrDrop(ItemStack stack) {
+			if (stack == null || stack.isEmpty()) return;
+			int fits = Math.min(stack.getCount(), inventoryRoom(player.getInventory(), stack));
+			if (fits > 0) player.getInventory().placeItemBackInInventory(stack.split(fits));
+			if (stack.isEmpty()) return;
+			droppedAtBody.add(ownedStack(stack.copy()));
+			player.drop(stack, false);
+		}
+
+		/** Returns the cursor and grid to the inventory (or the body when full) before the menu closes. */
+		private void returnMenuItems() {
+			if (menu == null) return;
+			ItemStack carried = menu.getCarried();
+			menu.setCarried(ItemStack.EMPTY);
+			returnToInventoryOrDrop(carried);
+			if (gridSlots == null || player.containerMenu != menu) return;
+			for (Slot slot : gridSlots) {
+				ItemStack stack = slot.getItem();
+				if (stack.isEmpty()) continue;
+				slot.set(ItemStack.EMPTY);
+				returnToInventoryOrDrop(stack);
+			}
 		}
 
 		/** Shift-clicks the result out of the filled grid with exact ingredient, remainder and output accounting. */
@@ -1234,14 +1305,17 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 			}
 			boolean restored;
 			try {
-				restored = placementGuard.mayReportCleanFailure(ownedStacks(player.getInventory(), gridSlots));
+				restored = placementGuard.mayReportCleanFailure(ownedStacks(player.getInventory(), gridSlots), droppedAtBody);
 			} catch (RuntimeException observationFailure) {
 				restored = false;
 				if (cleanupFailure != null) cleanupFailure.addSuppressed(observationFailure);
 				else cleanupFailure = observationFailure;
 			}
 			if (restored) {
-				return TickResult.failed(reasonCode, message + "; exact pre-placement ownership was restored");
+				int dropped = droppedAtBody.stream().mapToInt(TransactionSnapshot.OwnedStack::count).sum();
+				return TickResult.failed(reasonCode, message + (dropped == 0
+						? "; exact pre-placement ownership was restored"
+						: "; ingredients were returned like vanilla, " + dropped + " dropped at the body because the inventory is full"));
 			}
 			String suffix = cleanupFailure == null ? "" : ": " + safeMessage(cleanupFailure);
 			return TickResult.failed("ROLLBACK_FAILED",
@@ -1298,6 +1372,7 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 		@Override
 		void beforeCleanup() {
 			if (!player.isAlive()) dropMenuItemsAtBody();
+			else returnMenuItems();
 			if (table) return;
 			// Closing the inventory screen: vanilla returns the cursor and any grid items to the inventory.
 			AgentInventoryView.close(player);
@@ -1770,6 +1845,17 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 
 	private static String itemId(ItemStack stack) {
 		return BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
+	}
+
+	/** Items of this kind the main inventory can still take (a lower bound of what placeItemBackInInventory places). */
+	private static int inventoryRoom(Inventory inventory, ItemStack stack) {
+		int room = 0;
+		for (int slot = 0; slot < Inventory.INVENTORY_SIZE; slot++) {
+			ItemStack held = inventory.getItem(slot);
+			if (held.isEmpty()) room += stack.getMaxStackSize();
+			else if (ItemStack.isSameItemSameComponents(held, stack)) room += Math.max(0, held.getMaxStackSize() - held.getCount());
+		}
+		return room;
 	}
 
 	private static void returnCarried(ServerPlayer player, AbstractContainerMenu menu) {

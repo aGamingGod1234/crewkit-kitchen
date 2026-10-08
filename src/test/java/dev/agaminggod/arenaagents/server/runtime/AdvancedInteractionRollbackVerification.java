@@ -92,9 +92,11 @@ public final class AdvancedInteractionRollbackVerification {
 			verifyHorizontalFacingPlacement(components);
 			verifyPacedFurnaceTransaction(components);
 			verifyPacedToolSelection(components);
+			verifyCraftPickupDuringPacing(components);
+			verifyCraftFailureWithFullInventory(components);
 			if (failure != null) throw failure;
 		}
-		return 131;
+		return 143;
 	}
 
 	/** Tick a table pickaxe craft until both planks cells are filled and one plank is still on the cursor. */
@@ -678,6 +680,66 @@ public final class AdvancedInteractionRollbackVerification {
 		} catch (ReflectiveOperationException exception) {
 			throw new AssertionError(exception);
 		}
+	}
+
+	/** Starts a table pickaxe craft with five planks and ticks until the plank stack is on the cursor. */
+	private static ServerTransactionAdapter.ActiveTransaction pickaxeWithPlanksCarried(ComponentBindings components, Fixture fixture) {
+		fixture.inventory().setItem(0, components.stack(Items.OAK_PLANKS, 5, 0));
+		fixture.inventory().setItem(1, components.stack(Items.STICK, 2, 0));
+		var args = json("recipeId", "minecraft:wooden_pickaxe", "count", 1, "timeoutMs", 5000, "x", 0, "y", 64, "z", 0);
+		var transaction = service().begin(fixture.player(), request(ActionType.CRAFT_TABLE, args), args);
+		for (int tick = 0; tick < 200; tick++) {
+			assertEquals(ServerTransactionAdapter.TickState.RUNNING, transaction.tick(System.currentTimeMillis()).state(), "craft running");
+			if (fixture.player().containerMenu instanceof net.minecraft.world.inventory.CraftingMenu crafting
+					&& crafting.getCarried().is(Items.OAK_PLANKS) && fixture.inventory().getItem(0).isEmpty()) {
+				return transaction;
+			}
+		}
+		throw new AssertionError("the plank stack was never carried");
+	}
+
+	/**
+	 * Play-test ROLLBACK_FAILED ("the leftover ingredient could not be put back"): the agent had just mined, and a
+	 * drop it walked over landed in the slot the ingredient stack had been lifted from. Putting the rest back into
+	 * that slot swapped stacks, and the ownership check then counted the pickup as a rollback failure.
+	 */
+	private static void verifyCraftPickupDuringPacing(ComponentBindings components) {
+		components.stack(Items.STICK, 1, 0);
+		components.stack(Items.WOODEN_PICKAXE, 1, 59);
+		Fixture fixture = craftFixture();
+		var transaction = pickaxeWithPlanksCarried(components, fixture);
+		fixture.inventory().add(components.stack(Items.COBBLESTONE, 3, 0));
+		assertEquals("minecraft:cobblestone", itemId(fixture.inventory().getItem(0)),
+				"the pickup lands in the slot the planks were lifted from");
+		var result = tickToEnd(fixture, transaction).result();
+		transaction.cleanup();
+		assertEquals("CRAFT_CONFIRMED", result.reasonCode(), "a pickup during the craft no longer fails it: " + result.message());
+		assertEquals(1, count(fixture, Items.WOODEN_PICKAXE), "the pickaxe is crafted");
+		assertEquals(2, count(fixture, Items.OAK_PLANKS), "the two leftover planks went back to another slot");
+		assertEquals(3, count(fixture, Items.COBBLESTONE), "the picked-up cobblestone is kept");
+		assertTrue(fixture.player().containerMenu.getCarried().isEmpty(), "nothing is left on the cursor");
+	}
+
+	/** A failure with a full inventory returns what fits and drops the rest at the body, like vanilla closing a menu. */
+	private static void verifyCraftFailureWithFullInventory(ComponentBindings components) {
+		components.stack(Items.DIRT, 1, 0);
+		Fixture fixture = craftFixture();
+		fixture.player().recordDrops = true;
+		var transaction = pickaxeWithPlanksCarried(components, fixture);
+		fixture.inventory().setItem(1, ItemStack.EMPTY);
+		for (int slot = 0; slot < 36; slot++) {
+			if (fixture.inventory().getItem(slot).isEmpty()) fixture.inventory().setItem(slot, components.stack(Items.DIRT, 64, 0));
+		}
+		var result = tickToEnd(fixture, transaction).result();
+		transaction.cleanup();
+		assertEquals("RECIPE_INPUTS_UNAVAILABLE", result.reasonCode(), "the vanished sticks fail the craft honestly: " + result.message());
+		assertTrue(result.message().contains("dropped at the body"), "the drop is reported: " + result.message());
+		int dropped = fixture.player().dropped == null ? 0
+				: fixture.player().dropped.stream().filter(stack -> stack.is(Items.OAK_PLANKS)).mapToInt(ItemStack::getCount).sum();
+		assertEquals(5, dropped + count(fixture, Items.OAK_PLANKS), "every plank is in the inventory or dropped at the body");
+		assertEquals(5, dropped, "with no room, all five planks drop at the body");
+		assertTrue(fixture.player().containerMenu == fixture.player().inventoryMenu, "the table menu is closed");
+		assertTrue(fixture.player().inventoryMenu.getCarried().isEmpty(), "the cursor is empty");
 	}
 
 	private static void verifyDropExceptionRollback(ComponentBindings components) {
