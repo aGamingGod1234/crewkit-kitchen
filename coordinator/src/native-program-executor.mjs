@@ -46,9 +46,10 @@ export class NativeProgramExecutor {
 		const run = { record: { ...record }, context, programId, maxActions, timeoutMs, expectedDurationMs, planningLeadMs: planningLeadMs ?? null, actions: 0, actionsSucceeded: 0, actionsFailed: 0, receipts: [], resolve, result,
 			settled: false, bodyPending: false, pendingActionId: null, stopping: null, timer: null, planningDueTimer: null, planningDueNotified: false, planningDueVersion: null, cancellationTimer: null,
 			observation: programObservation(context.observation), eventSequence: context.eventSequence, engine: null,
-			observationIntervalMs, observationTimer: null, refresh: null, refreshGeneration: 0, decision: null, decisionSequence: 0, decisionIssuedEventSequence: null,
+			observationIntervalMs, observationTimer: null, refresh: null, refreshGeneration: 0, decision: null, decisionSequence: 0,
 			urgentNotificationQueued: false,
-			notifiedDecisionId: null, lastOrdinaryNotificationAt: Number.NEGATIVE_INFINITY, ordinaryNotificationTimer: null, unseenAttention: false };
+			notifiedDecisionId: null, notifiedEventSequence: null, notifiedDecisions: [],
+			lastOrdinaryNotificationAt: Number.NEGATIVE_INFINITY, ordinaryNotificationTimer: null, unseenAttention: false };
 		run.engine = new ArenaScriptEngine({
 			dispatch: (command) => { void this.#dispatch(run, command); },
 			cancel: (actionId) => { void this.#cancelBody(run, actionId); },
@@ -177,7 +178,7 @@ export class NativeProgramExecutor {
 		run.decision = { decisionId: `${run.programId}:decision-${++run.decisionSequence}`, programVersion: request.version,
 			trigger: request.trigger, priority: request.priority, eventSequence: request.eventSequence,
 			...(request.actionFailure === undefined ? {} : { actionFailure: request.actionFailure }) };
-		run.decisionIssuedEventSequence = request.eventSequence;
+		run.notifiedDecisions = [];
 		run.unseenAttention = true;
 		// The engine must finish applying the authored attention policy first.
 		if (notificationPriority === 'urgent') this.#scheduleUrgentNotification(run);
@@ -232,10 +233,20 @@ export class NativeProgramExecutor {
 		this.#clearOrdinaryNotification(run);
 		run.unseenAttention = false;
 		run.notifiedDecisionId = run.decision.decisionId;
+		run.decision.eventSequence = run.eventSequence;
+		this.#rememberNotifiedDecision(run);
 		// The pending request retains its highest urgency, but later ordinary
 		// discoveries must not repeatedly interrupt that same reconsideration.
 		try { run.context.onDecision(this.status(run.record), { priority: notificationPriority }); }
 		catch (error) { this.#return(run, failure(error, 'PROGRAM_NOTIFICATION_FAILED'), true); }
+	}
+
+	#rememberNotifiedDecision(run) {
+		const snapshot = { decisionId: run.decision.decisionId, eventSequence: run.eventSequence,
+			trigger: run.decision.trigger, facts: urgentFactsSnapshot(run.observation) };
+		run.notifiedEventSequence = snapshot.eventSequence;
+		run.notifiedDecisions.push(snapshot);
+		if (run.notifiedDecisions.length > 8) run.notifiedDecisions.shift();
 	}
 
 	/** A new decision handle is owed only for a higher urgency, a changed action failure or a new urgent trigger. */
@@ -287,20 +298,21 @@ export class NativeProgramExecutor {
 		const stopDirective = directive === 'pause' || directive === 'finish';
 		const supersededHandle = stopDirective && isIssuedDecisionId(run, decisionId);
 		if (!currentHandle && !supersededHandle) throw codedError('STALE_PROGRAM_DECISION', 'Read the current program decision before responding');
-		if (!stopDirective && currentHandle && eventSequence !== undefined && eventSequence !== currentDecision.eventSequence) {
-			throw codedError('STALE_PROGRAM_DECISION', 'The decision facts changed; read the current decision before continuing or replacing the program');
-		}
-		if (!stopDirective && currentHandle && currentDecision.priority === 'urgent'
-			&& currentDecision.eventSequence !== run.decisionIssuedEventSequence
-			&& eventSequence !== currentDecision.eventSequence) {
-			throw codedError('STALE_PROGRAM_DECISION', 'The decision facts changed; read the current decision before continuing or replacing the program');
+		if (!stopDirective && currentHandle && currentDecision.priority === 'urgent') {
+			const notified = eventSequence === undefined
+				? run.notifiedDecisions.findLast((entry) => entry.decisionId === decisionId && entry.eventSequence === run.notifiedEventSequence)
+				: run.notifiedDecisions.findLast((entry) => entry.decisionId === decisionId && entry.eventSequence === eventSequence);
+			if (notified === undefined) throw freshDecisionError(run, currentDecision, null);
+			const changes = urgentFactChanges(notified, currentDecision, run);
+			if ((directive === 'replace' && run.eventSequence !== notified.eventSequence) || changes.material) {
+				throw freshDecisionError(run, currentDecision, notified);
+			}
 		}
 		const compiled = directive === 'replace' ? parseArenaScript(source) : null;
 		const request = run.engine.refreshDirectiveRequest();
 		if (request === null) throw codedError('STALE_PROGRAM_DECISION', 'The program no longer needs this decision');
 		if (directive === 'continue' && request.actionFailure !== undefined) throw codedError('PROGRAM_REPLACEMENT_REQUIRED', 'A halted routine after repeated action failure requires replacement or an explicit stop');
 		run.decision = null;
-		run.decisionIssuedEventSequence = null;
 		if (directive === 'replace') {
 			// Replacements may wait for the current body action to acknowledge before
 			// installing their next engine version. Fence the old advisory now so a
@@ -492,6 +504,116 @@ function canonicalCommand(command) {
 	const { type: validatedType, ...normalized } = validateAction({ ...args, type });
 	return Object.freeze({ ...command, action: Object.freeze({ type: validatedType, arguments: Object.freeze(normalized) }) });
 }
+
+const CONTINUE_HEALTH_DROP_LIMIT = 4;
+const CONTINUE_AIR_DROP_LIMIT = 20;
+const CONTINUE_THREAT_DISTANCE_LIMIT = 2;
+// A continue may cover up to two hearts, one second of air, or two blocks of approach from the notified facts.
+const HOSTILE_ENTITY_TYPE = /(?:zombie|skeleton|creeper|spider|enderman|witch|pillager|vindicator|evoker|ravager|phantom|guardian|blaze|ghast|wither|warden|hoglin|piglin_brute|silverfish|endermite|slime|magma_cube|shulker|vex|breeze|drowned|husk|stray|bogged)/i;
+
+function urgentFactsSnapshot(observation) {
+	const player = observation?.player ?? {};
+	const threats = new Map();
+	const addThreat = (entry, assumeThreat = false) => {
+		if (entry === null || typeof entry !== 'object') return;
+		const uuid = entry.uuid ?? entry.stableId ?? entry.id;
+		if (typeof uuid !== 'string') return;
+		const type = typeof entry.type === 'string' ? entry.type : null;
+		const threat = assumeThreat || entry.hostile === true || entry.targetingAgent === true || entry.targeting === true
+			|| entry.swelling === true || HOSTILE_ENTITY_TYPE.test(type ?? '');
+		if (!threat) return;
+		const previous = threats.get(uuid) ?? {};
+		threats.set(uuid, { ...previous, uuid, ...(type === null ? {} : { type }),
+			...(typeof entry.targeting === 'boolean' || typeof entry.targetingAgent === 'boolean' ? { targeting: entry.targeting ?? entry.targetingAgent } : {}),
+			...(typeof entry.swelling === 'boolean' ? { swelling: entry.swelling } : {}),
+			...(Number.isFinite(entry.fuse) ? { fuse: entry.fuse } : {}),
+			...(Number.isFinite(entry.distance) ? { distance: entry.distance } : {}),
+		});
+	};
+	for (const entity of Array.isArray(observation?.entities) ? observation.entities : []) addThreat(entity);
+	for (const entry of Array.isArray(observation?.threats?.entries) ? observation.threats.entries : []) addThreat(entry, true);
+	for (const entry of Array.isArray(player.threats) ? player.threats : []) addThreat(entry, true);
+	addThreat(observation?.threats?.threat, true);
+	addThreat(player.threat, true);
+	const lastAttacker = player.lastAttacker && typeof player.lastAttacker.uuid === 'string'
+		? { uuid: player.lastAttacker.uuid, ...(typeof player.lastAttacker.type === 'string' ? { type: player.lastAttacker.type } : {}) }
+		: null;
+	if (lastAttacker !== null) addThreat(lastAttacker, true);
+	return {
+		health: finiteValue(player.health), air: finiteValue(player.air ?? player.airSupply), lastAttacker,
+		threats: [...threats.values()], hazards: [...hazardKeys(observation)].sort(),
+		dimension: observation?.world?.dimension ?? null, ready: observation?.ready ?? null, status: observation?.status ?? null,
+	};
+}
+
+function urgentFactChanges(notified, decision, run) {
+	const before = notified.facts;
+	const after = urgentFactsSnapshot(run.observation);
+	const facts = {};
+	const healthUnknownChanged = (before.health === null) !== (after.health === null);
+	const airUnknownChanged = (before.air === null) !== (after.air === null);
+	const healthDrop = before.health === null || after.health === null ? 0 : before.health - after.health;
+	const airDrop = before.air === null || after.air === null ? 0 : before.air - after.air;
+	if (healthUnknownChanged || healthDrop !== 0) facts.health = { notified: before.health, current: after.health, ...(healthUnknownChanged ? {} : { droppedBy: healthDrop }) };
+	if (airUnknownChanged || airDrop !== 0) facts.air = { notified: before.air, current: after.air, ...(airUnknownChanged ? {} : { droppedBy: airDrop }) };
+	if (notified.trigger !== decision.trigger) facts.triggerChanged = { notified: notified.trigger, current: decision.trigger };
+	if (JSON.stringify(before.lastAttacker) !== JSON.stringify(after.lastAttacker)) facts.lastAttacker = after.lastAttacker;
+	const oldThreats = new Map(before.threats.map((entry) => [entry.uuid, entry]));
+	const newThreats = after.threats.filter((entry) => !oldThreats.has(entry.uuid));
+	const changedThreats = [];
+	for (const current of after.threats) {
+		const old = oldThreats.get(current.uuid);
+		if (old === undefined) continue;
+		const changed = {};
+		if (old.type !== current.type) changed.type = { notified: old.type, current: current.type };
+		if (current.swelling === true && old.swelling !== true) changed.swelling = true;
+		if (current.targeting === true && old.targeting !== true) changed.targeting = true;
+		if (Number.isFinite(old.fuse) && Number.isFinite(current.fuse) && current.fuse < old.fuse) changed.fuse = { notified: old.fuse, current: current.fuse };
+		if (Number.isFinite(old.distance) && Number.isFinite(current.distance) && old.distance - current.distance > CONTINUE_THREAT_DISTANCE_LIMIT) {
+			changed.distance = { notified: old.distance, current: current.distance };
+		}
+		if (Object.keys(changed).length > 0) changedThreats.push({ uuid: current.uuid, type: current.type, changes: changed });
+	}
+	if (newThreats.length > 0) facts.newThreats = newThreats;
+	if (changedThreats.length > 0) facts.changedThreats = changedThreats;
+	const oldHazards = new Set(before.hazards);
+	const newHazards = after.hazards.filter((hazard) => !oldHazards.has(hazard));
+	if (newHazards.length > 0) facts.newHazards = newHazards;
+	if (before.dimension !== after.dimension) facts.dimension = { notified: before.dimension, current: after.dimension };
+	if (before.ready !== after.ready || before.status !== after.status) facts.playerStatus = { notified: before.status, current: after.status, ready: after.ready };
+	return {
+		facts,
+		material: notified.trigger !== decision.trigger || healthUnknownChanged || airUnknownChanged
+			|| healthDrop > CONTINUE_HEALTH_DROP_LIMIT || airDrop > CONTINUE_AIR_DROP_LIMIT
+			|| (before.lastAttacker?.uuid !== after.lastAttacker?.uuid && after.lastAttacker !== null)
+			|| newThreats.length > 0 || changedThreats.length > 0 || newHazards.length > 0
+			|| before.dimension !== after.dimension || before.ready !== after.ready || before.status !== after.status,
+	};
+}
+
+function freshDecisionError(run, decision, notified) {
+	const currentFacts = urgentFactsSnapshot(run.observation);
+	const changes = notified === null ? null : urgentFactChanges(notified, decision, run).facts;
+	const freshDecision = {
+		decisionId: decision.decisionId,
+		eventSequence: run.eventSequence,
+		trigger: decision.trigger,
+		facts: changes && Object.keys(changes).length > 0 ? changes : {
+			health: currentFacts.health, air: currentFacts.air, lastAttacker: currentFacts.lastAttacker,
+			threats: currentFacts.threats, hazards: currentFacts.hazards,
+		},
+	};
+	decision.eventSequence = run.eventSequence;
+	const snapshot = { decisionId: decision.decisionId, eventSequence: run.eventSequence, trigger: decision.trigger, facts: currentFacts };
+	run.notifiedDecisionId = decision.decisionId;
+	run.notifiedEventSequence = run.eventSequence;
+	run.notifiedDecisions.push(snapshot);
+	if (run.notifiedDecisions.length > 8) run.notifiedDecisions.shift();
+	const error = codedError('STALE_PROGRAM_DECISION', `New danger facts arrived after this decision. Fresh decision: ${JSON.stringify(freshDecision)}`);
+	error.freshDecision = freshDecision;
+	return error;
+}
+
 const HAZARD_BLOCK = /lava|fire|magma/i;
 function hazardKeys(observation) {
 	const keys = new Set();

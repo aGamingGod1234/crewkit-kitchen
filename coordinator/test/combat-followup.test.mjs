@@ -84,15 +84,29 @@ test('a damage-paused program shows the one-line danger instruction; ordinary de
 	assert.match(ordinary.split('\n')[0], /respond explicitly to pending program decisions/);
 });
 
-test('urgent danger decisions show the action hint before suspension for each danger trigger', () => {
-	for (const trigger of ['damage', 'threat', 'defensive_handler_completed', 'suffocation', 'lava', 'fire', 'fall']) {
+test('urgent program hints match the actual danger trigger', () => {
+	for (const trigger of ['damage', 'threat', 'lava', 'fire']) {
 		const input = buildNativeEventInput({ agentId: 'agent-a', goalRevision: 1, currentGoal: 'Survive the night.' }, {
 			event: 'program_attention', trigger: 'program_attention', programId: 'p1',
 			status: { state: 'RUNNING', engineState: 'ACTIVE', programVersion: 1,
 				decision: { decisionId: 'p1:decision-2', trigger, priority: 'urgent' } },
 			observation: hurt(12),
 		});
-		assert.match(input.split('\n')[0], /call fight_target or flee_from now/, `${trigger} should surface immediate danger guidance while the routine is active`);
+		assert.match(input.split('\n')[0], /call fight_target or flee_from now/, `${trigger} supports a fight or flee response`);
+	}
+	for (const [trigger, expected] of [
+		['suffocation', /Suffocation needs attention/],
+		['fall', /Fall danger needs attention/],
+		['defensive_handler_completed', /defensive handler finished/i],
+	]) {
+		const input = buildNativeEventInput({ agentId: 'agent-a', goalRevision: 1, currentGoal: 'Survive the night.' }, {
+			event: 'program_attention', trigger: 'program_attention', programId: 'p1',
+			status: { state: 'RUNNING', engineState: 'ACTIVE', programVersion: 1,
+				decision: { decisionId: 'p1:decision-2', trigger, priority: 'urgent' } },
+			observation: hurt(12),
+		});
+		assert.match(input.split('\n')[0], expected, `${trigger} should have a matching short hint`);
+		assert.doesNotMatch(input.split('\n')[0], /call fight_target or flee_from now/, `${trigger} must not suggest an unrelated action`);
 	}
 });
 
@@ -170,6 +184,28 @@ test('replaceAction for danger starts as a new action when the program body hand
 	assert.equal((await h.call('programStatus', { programId: handle.programId })).decision.decisionId, decisionBefore,
 		'the program decision stays live for a later continue, pause or finish');
 	h.finish(h.commands()[1], 'SUCCEEDED', 'TARGET_KILLED');
+});
+
+test('replaceAction does not start from a successful old receipt even while danger-paused', async t => {
+	const h = runtimeHarness(t);
+	const handle = await h.call('runProgram', { background: true, timeoutMs: 60_000,
+		source: 'program.onUnhandledAttention("pause_and_notify"); await player.wait(1000); await player.wait(2);' });
+	await tick();
+	const completed = h.commands()[0];
+	h.finish(completed, 'SUCCEEDED', 'ACTION_COMPLETED');
+	await tick();
+	const active = h.commands()[1];
+	h.hit(17, 10);
+	await tick();
+	h.finish(active, 'CANCELLED');
+	await tick();
+	assert.equal((await h.call('programStatus')).engineState, 'SUSPENDED');
+	const replacement = await h.call('replaceAction', { actionId: completed.payload.actionId, goalRevision: 1,
+		actionType: 'fight_target', arguments: { targetId: ZOMBIE_B, timeoutMs: 15_000 } });
+	assert.equal(replacement.state, 'REPLACEMENT_NOT_STARTED');
+	assert.equal(replacement.reasonCode, 'ACTION_FINISHED_BEFORE_CANCEL');
+	assert.equal(h.commands().length, 2, 'the stale receipt cannot start an unrequested replacement');
+	assert.equal((await h.call('programStatus', { programId: handle.programId })).engineState, 'SUSPENDED');
 });
 
 test('cancelling a direct flee taken during the pause leaves the paused program for the model', async t => {

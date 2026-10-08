@@ -5203,7 +5203,7 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 		: isPlanningDue
 		? 'Live Minecraft event. Program planning is due soon: prepare the next intention while the current authorised routine keeps running. This is advisory and does not require a pending decisionId; use the current programVersion and timing context, and do not blindly renew or cancel the current program.'
 		: dangerDecision
-			? 'Live Minecraft event. Danger needs attention: call fight_target or flee_from now; respond to the program later.'
+			? dangerDecisionInstruction(status.decision.trigger)
 			: awaitingConfirmation === true
 				? AWAITING_CONFIRMATION_EVENT_INSTRUCTION
 				: effectiveTrigger === 'low_health_food'
@@ -5213,6 +5213,15 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 }
 
 const DANGER_DECISION_TRIGGERS = new Set(['damage', 'threat', 'lava', 'fire', 'suffocation', 'fall', 'defensive_handler_completed']);
+function dangerDecisionInstruction(trigger) {
+	if (['damage', 'threat', 'lava', 'fire'].includes(trigger)) {
+		return 'Live Minecraft event. Danger needs attention: call fight_target or flee_from now; respond to the program later.';
+	}
+	if (trigger === 'suffocation') return 'Live Minecraft event. Suffocation needs attention: use fresh facts to address it, then respond to the program.';
+	if (trigger === 'fall') return 'Live Minecraft event. Fall danger needs attention: choose a safe response from fresh facts, then respond to the program.';
+	if (trigger === 'defensive_handler_completed') return 'Live Minecraft event. The defensive handler finished; check its result and fresh facts, then respond to the program.';
+	return 'Live Minecraft event. Danger needs attention: choose a safe response from fresh facts, then respond to the program.';
+}
 // Urgent facts that wake an agent with no task: the body is still the model's to defend.
 const NO_TASK_WAKE_TRIGGERS = new Set(['damage', 'threat', 'lava', 'fire', 'suffocation', 'fall', 'low_health']);
 // With no task, a danger-woken turn may defend the body only: these mirror Minecraft's own detached-action allowlist

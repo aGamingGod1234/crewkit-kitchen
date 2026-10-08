@@ -22,6 +22,15 @@ test('respondProgram carries the decision event sequence used to authorize a con
 	assert.equal(tool.eventSequence, 27);
 });
 
+test('respondProgram description retains directive semantics within the base byte budget', () => {
+	const description = MINECRAFT_DYNAMIC_TOOLS.find((tool) => tool.name === 'respondProgram').description;
+	assert.match(description, /continue preserves/i);
+	assert.match(description, /replace.*fresh facts invalidate/i);
+	assert.match(description, /pause stops/i);
+	assert.match(description, /finish.*factual goal verification/i);
+	assert.ok(Buffer.byteLength(description, 'utf8') <= 237, 'description stays within the base description byte count');
+});
+
 test('oversized real memory query pages round-trip every entry with advancing absolute offsets', async () => {
 	const notebook = new ModelNotebook();
 	const taskMemory = new TaskMemoryStore();
