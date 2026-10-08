@@ -15,11 +15,20 @@ class Transport extends EventEmitter {
 	threads = 0;
 	turns = 0;
 	contextTokens = 1_000;
+	toolsPerTurn = 1;
+	toolsThisTurn = 0;
 	tool = null;
 	async start() {}
 	async stop() {}
 	notify() {}
-	respond(id, result) { this.calls.push({ method: '$respond', id, result }); setImmediate(() => this.finish()); }
+	respond(id, result) {
+		this.calls.push({ method: '$respond', id, result });
+		setImmediate(() => this.tool !== null && this.toolsThisTurn < this.toolsPerTurn ? this.requestTool() : this.finish());
+	}
+	requestTool() {
+		const toolIndex = ++this.toolsThisTurn;
+		this.emit('serverRequest', { id: `call-${this.turns}-${toolIndex}`, method: 'item/tool/call', params: { ...this.active, callId: `call-${this.turns}-${toolIndex}`, tool: this.tool.name, arguments: this.tool.arguments } });
+	}
 	async request(method, params) {
 		this.calls.push({ method, params });
 		if (method === 'initialize') return {};
@@ -34,10 +43,11 @@ class Transport extends EventEmitter {
 		if (method === 'turn/start') {
 			const turnId = `turn-${++this.turns}`;
 			this.active = { threadId: params.threadId, turnId };
+			this.toolsThisTurn = 0;
 			setImmediate(() => {
 				if (this.hold) return;
 				if (this.tool === null) return this.finish();
-				this.emit('serverRequest', { id: `call-${this.turns}`, method: 'item/tool/call', params: { ...this.active, callId: `call-${this.turns}`, tool: this.tool.name, arguments: this.tool.arguments } });
+				this.requestTool();
 			});
 			return { turn: { id: turnId } };
 		}
@@ -110,6 +120,28 @@ test('small contexts never rotate and 0 disables rotation', async () => {
 			await service.stop();
 		}
 	}
+});
+
+test('Codex keeps a long multi-tool turn intact, then rotates at its first safe completed-turn boundary', async () => {
+	const run = await setup();
+	try {
+		run.transport.tool = { name: 'mine', arguments: { x: 1, y: 64, z: 0, expectedBlockId: 'minecraft:stone' } };
+		run.transport.contextTokens = 70_000;
+		run.transport.toolsPerTurn = 8;
+		const long = await run.act('long tool chain');
+		assert.equal(long.toolCalls, 8, 'all tool results finish on the thread that issued their requests');
+		assert.equal(run.agent.rotations, 0, 'the existing three-turn hysteresis remains in force');
+		run.transport.toolsPerTurn = 1;
+		await run.act('second turn');
+		await run.act('third turn');
+		await turn();
+		assert.equal(run.agent.rotations, 1, 'the default Codex rotation threshold is active');
+		await run.act('after rotation');
+		const starts = turnStarts(run.transport);
+		assert.ok(starts.slice(0, 3).every(({ params }) => params.threadId === 'thread-1'));
+		assert.equal(starts[3].params.threadId, 'thread-2');
+		assert.match(starts[3].params.input[0].text, /^Session refreshed to keep context small/);
+	} finally { await run.service.stop(); }
 });
 
 test('carry-over remembers recent tools, chat and program state in a bounded text', () => {

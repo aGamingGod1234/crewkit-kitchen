@@ -2,7 +2,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { randomUUID } from 'node:crypto';
 
 export const MODEL_FACT_FORMAT = 'minecraft-facts-v1';
-export const MODEL_FACT_INSTRUCTIONS = `Compact factual replies use format:"minecraft-facts-v1": data is the original JSON, {$rows:{columns,rows,optional?}} represents an array of records in column order (a null cell in an optional column means that field is absent), and {$ref:N} is the exact value at values[N] in this reply. {$object:[[key,value],...]} preserves literal objects with reserved keys. Null, missing fields, coverage and freshness keep their meanings. Complete replies need no previous reply. observe and available action/sequence postAction samples default to complete snapshots with observationView.id alongside observation. view:"changes" plus afterObservationId requests changed whole sections against that exact delivered ID, including across observe and postAction. Apply observationView.replace and remove to that baseline; retain unchanged sections. observationView.retainMetadata lists top-level sample fields to copy from that same exact baseline; all other metadata is current, and missing fields are absent. Action receipts and per-step history are unchanged. Missing, stale or different-world baselines return full. Request view:"full" whenever the baseline is uncertain.`;
+export const MODEL_FACT_INSTRUCTIONS = `Compact factual replies use format:"minecraft-facts-v1": data is the original JSON, {$rows:{columns,rows,optional?}} represents an array of records in column order (a null cell in an optional column means that field is absent), and {$ref:N} is the exact value at values[N] in this reply. {$object:[[key,value],...]} preserves literal objects with reserved keys. Null, missing fields, coverage and freshness keep their meanings. Complete replies need no previous reply. observe and available action/sequence postAction samples default to complete snapshots with observationView.id alongside observation. view:"changes" plus afterObservationId requests changed whole sections against that exact delivered ID, including across observe, postAction and wake events. Apply observationView.replace and remove to that baseline; retain unchanged sections. observationView.retainMetadata lists top-level sample fields to copy from that same exact baseline; all other metadata is current, and missing fields are absent. Action receipts and per-step history are unchanged. Missing, stale or different-world baselines return full. Request view:"full" whenever the baseline is uncertain.`;
 const MAX_DELIVERED_VIEWS = 8;
 const MAX_DELIVERED_VIEW_BYTES = 2 * 1024 * 1024;
 const RETAINABLE_METADATA = ['taskMemory', 'goal', 'goalSpec', 'executionSettings'];
@@ -131,9 +131,12 @@ export class ModelObservationViews {
  #sequence = 0;
  #committedSequence = 0;
  #generation = 0;
+ #latestViewId = null;
  #eventMetadata = null;
  reset() { this.#resetObservations(); this.#eventMetadata = null; }
- #resetObservations() { this.#baseline = null; this.#history.clear(); this.#historyBytes = 0; this.#generation++; }
+ #resetObservations() { this.#baseline = null; this.#history.clear(); this.#historyBytes = 0; this.#latestViewId = null; this.#generation++; }
+ /** An event may have been encoded but not delivered; force a full view until delivery is certain again. */
+ forgetEventView() { this.reset(); }
  /** A turn that may not have reached the model must not become the baseline for omitted event fields. */
  forgetEventMetadata() { this.#eventMetadata = null; }
  /** Omits goal, goalSpec and taskMemory when they equal the previous event delivered in this same provider context. */
@@ -156,7 +159,7 @@ export class ModelObservationViews {
   if (identity === null || identity !== this.#baseline?.identity || observation.player?.dead === true || observation.continuity?.phase === 'dead') this.#resetObservations();
  }
 
- prepare(value, tool) {
+ prepare(value, tool, { minRetainedMetadataBytes = 0 } = {}) {
   // Only the final fresh sample is a view. Per-step observations remain
   // historical receipts, even when a sequence stopped on a failed action.
   const nested = (tool.kind === 'action' || tool.kind === 'sequence') && record(value?.postAction);
@@ -178,7 +181,8 @@ export class ModelObservationViews {
    const replace = Object.fromEntries(Object.entries(observation).filter(([key, current]) => !Object.hasOwn(previous.observation, key) || !isDeepStrictEqual(previous.observation[key], current)));
    const remove = Object.keys(previous.observation).filter(key => !Object.hasOwn(observation, key));
    const { observation: _full, ...metadata } = snapshot;
-   const retainMetadata = RETAINABLE_METADATA.filter(key => Object.hasOwn(metadata, key) && Object.hasOwn(previous.metadata, key) && isDeepStrictEqual(metadata[key], previous.metadata[key]));
+   const retainMetadata = RETAINABLE_METADATA.filter(key => Object.hasOwn(metadata, key) && Object.hasOwn(previous.metadata, key)
+    && bytes(metadata[key] ?? null) > minRetainedMetadataBytes && isDeepStrictEqual(metadata[key], previous.metadata[key]));
    for (const key of retainMetadata) delete metadata[key];
    const changes = { ...metadata, observationView: { id, mode: 'changes', baseId: previous.id, replace, remove, ...(retainMetadata.length === 0 ? {} : { retainMetadata }) } };
    if (bytes(changes) < bytes(full)) presented = changes;
@@ -197,6 +201,7 @@ export class ModelObservationViews {
    } else if (baseline === null || baseline.identity !== this.#baseline?.identity) return;
    if (baseline === null || baseline.bytes > MAX_DELIVERED_VIEW_BYTES) return;
    this.#history.set(baseline.id, baseline);
+   this.#latestViewId = baseline.id;
    this.#historyBytes += baseline.bytes;
    while (this.#history.size > MAX_DELIVERED_VIEWS || this.#historyBytes > MAX_DELIVERED_VIEW_BYTES) {
     const oldest = this.#history.keys().next().value;
@@ -206,6 +211,22 @@ export class ModelObservationViews {
   };
   return { value: nested ? { ...owned, postAction: presented } : presented,
    commit: () => commit(eligible ? next : null), commitWithoutView: () => commit(null) };
+ }
+ /** Wake observations share the exact delivered-view history used by observe and postAction replies. */
+ prepareEvent(value) {
+  if (observationIdentity(value.observation) === null) {
+   this.#resetObservations();
+   return value;
+  }
+  const hadFreshness = Object.hasOwn(value, 'freshness');
+  const freshness = value.freshness ?? { fresh: value.observation?.freshness?.fresh !== false };
+  const prepared = this.prepare({ ...value, freshness }, {
+   kind: 'observe', view: 'changes', afterObservationId: this.#latestViewId,
+  }, { minRetainedMetadataBytes: MIN_RETAINED_EVENT_FIELD_BYTES });
+  prepared.commit();
+  if (hadFreshness) return prepared.value;
+  const { freshness: _freshness, ...event } = prepared.value;
+  return event;
  }
 }
 
@@ -244,7 +265,8 @@ export function encodeNativeEventInput(input, views = null) {
   if (value.event === 'player_death' || value.observation.player?.dead === true || value.observation.continuity?.phase === 'dead') views?.reset();
   else views?.observeEvent(value.observation);
   const retained = typeof views?.retainEventMetadata === 'function' ? views.retainEventMetadata(value) : value;
-  const encoded = encodeModelFacts(retained);
+  const eventView = typeof views?.prepareEvent === 'function' ? views.prepareEvent(retained) : retained;
+  const encoded = encodeModelFacts(eventView);
   return encoded === value ? input : `${input.slice(0, separator + 1)}${JSON.stringify(encoded)}${input.slice(end)}`;
  } catch { return input; }
 }

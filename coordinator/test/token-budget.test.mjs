@@ -12,6 +12,8 @@ test('a representative program wake stays inside its byte budget for every provi
 	assert.ok(sizes.eventRawBytes <= 11_000, `raw event ${sizes.eventRawBytes} bytes`);
 	assert.ok(sizes.eventEncodedFirstBytes <= 9_000, `first encoded event ${sizes.eventEncodedFirstBytes} bytes`);
 	assert.ok(sizes.eventEncodedRepeatBytes <= 7_500, `repeat encoded event ${sizes.eventEncodedRepeatBytes} bytes`);
+	assert.ok(sizes.eventEncodedRepeatBytes < sizes.eventEncodedFirstBytes / 2,
+		`repeated wake event delta ${sizes.eventEncodedRepeatBytes} bytes vs full ${sizes.eventEncodedFirstBytes} bytes`);
 	// 27,965 -> 29,106 bytes: the survey tool and lookAround's survey option (far sight) added 1,141 bytes.
 	assert.ok(sizes.toolSchemaBytes <= 29_200, `tool schemas ${sizes.toolSchemaBytes} bytes`);
 });
@@ -41,7 +43,7 @@ test('unchanged goal, goalSpec and taskMemory are named instead of repeated with
 
 	const failed = new ModelObservationViews();
 	encodeNativeEventInput(buildNativeEventInput(record, representativeProgramWake(6)), failed);
-	failed.forgetEventMetadata();
+	failed.forgetEventView();
 	assert.equal(payload(encodeNativeEventInput(buildNativeEventInput(record, representativeProgramWake(7)), failed)).sameAsPreviousEvent, undefined, 'an undelivered turn is not a baseline');
 });
 

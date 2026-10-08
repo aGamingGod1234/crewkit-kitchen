@@ -794,7 +794,7 @@ export class SharedCodexAgent {
 				// accepted ID (or fence the late start) before releasing ownership.
 				try { await this.interrupt(); } catch {}
 			}
-			this.#observationViews.forgetEventMetadata();
+			this.#observationViews.forgetEventView();
 			// A turn that never started cannot have delivered the carry-over; the next event sends it again.
 			if (pendingCarryOver !== null && active.turnId === null && this.#pendingCarryOver === null) this.#pendingCarryOver = pendingCarryOver;
 			throw withNativeTurn(error, collector.snapshot());
@@ -916,7 +916,7 @@ export class SharedCodexAgent {
 		} catch (error) {
 			if (previousExecutor !== null && this.#active === active) active.collector.replaceExecuteTool(previousExecutor);
 			// A rejected steer never reached the model, so it cannot be the baseline for omitted event fields.
-			this.#observationViews.forgetEventMetadata();
+			this.#observationViews.forgetEventView();
 			throw withNativeTurn(error, active.collector.snapshot());
 		}
 	}
