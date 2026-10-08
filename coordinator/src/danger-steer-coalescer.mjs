@@ -5,8 +5,8 @@
 // but each one grows the context the model must read before it can act: in the live trace 13 per-hit steers
 // grew the turn from 79k to 191k input tokens in 15 seconds while the model kept re-deciding. Here the first
 // danger steer goes out at once; further hits fold into one summary delivered at most every interval, or at
-// once when something materially new happens (a new trigger kind, a new threat type or a swelling creeper,
-// or health crossing a low threshold). The model still receives every fact; it just gets time to decide.
+// once when something materially new happens (a new trigger kind, a new threat type, a threat escalating to
+// imminent, close or swelling, or health crossing a low threshold). The model still receives every fact; it just gets time to decide.
 
 export const DANGER_STEER_INTERVAL_MS = 2_000;
 const DANGER_STEER_TRIGGERS = new Set(['damage', 'threat']);
@@ -14,6 +14,9 @@ const DANGER_STEER_TRIGGERS = new Set(['damage', 'threat']);
 // sensible choice is. 14 is deliberate: waiting to be told at 5 hearts taught agents to heal far too late.
 const LOW_HEALTH_THRESHOLDS = Object.freeze([14, 10, 6]);
 const MAX_SUMMARY_ATTACKERS = 4;
+// Signals that mean a known threat just got materially closer to hurting the agent (ETA under 3 s, a creeper
+// within 5 blocks, a lit fuse); each is new information even when that threat type was already delivered.
+const ESCALATION_SIGNALS = Object.freeze(['imminent', 'creeper_close', 'swelling']);
 
 /** The danger facts of one steer request, or null when the request is not a damage/threat steer. */
 export function dangerSteerFacts(request) {
@@ -28,6 +31,7 @@ export function dangerSteerFacts(request) {
 		if (typeof threat?.type !== 'string') continue;
 		threatKeys.add(threat.type);
 		if (threat.swelling === true) threatKeys.add(`${threat.type}#swelling`);
+		for (const signal of Array.isArray(threat.signals) ? threat.signals : []) if (ESCALATION_SIGNALS.includes(signal)) threatKeys.add(`${threat.type}#${signal}`);
 	}
 	return {
 		trigger,

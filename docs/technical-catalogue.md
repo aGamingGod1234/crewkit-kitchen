@@ -306,3 +306,20 @@ Notes: these numbers come from replaying recorded play sessions offline, headles
 - **Solution:** Server sounds now reach the agent, and client-only ambient sounds such as lava popping are recreated using the client's own odds. The model gets direction and distance.
 - **Result:** (measured, headless server) an agent heard both lava pockets through one-block walls, in the right directions. A rescan costs 0.4 to 0.9 ms on the server. (observed, live play) a Sol agent located a hidden lava pool.
 - **Sources:** PR #48, the T3 thread "Add hearing to agent perception"
+
+
+## Branch claude/threat-heal (Oct 8, 2026, pull request pending)
+
+### A creeper that read "risk 4" until it was three blocks away
+*claude/threat-heal · Oct 8*
+- **Problem:** In a live play-test a creeper hunting a Sonnet agent showed risk 4 at 16 blocks and only jumped to 100-200 at about 3 blocks, because risk measures danger right now and a creeper's blast cannot reach from far away. The model was alerted at once, but nothing in the alert said the creeper was closing in or how soon it would arrive. It took 5.5 s to decide, and by then the creeper was at the fuse.
+- **Solution:** Every threat now carries its trend: closing speed, seconds until it reaches contact range (fuse range for a creeper, melee reach for others) and the risk it will have when it gets there. A hunter due within 3 s raises one extra urgent "imminent" alert. That alert, and a creeper closing inside 5 blocks, now reach a model that is mid-decision at once instead of being held for up to 2 s. The first alert also leads with a one-line outlook. The model still decides what to do.
+- **Result:** First alert for that creeper: risk 4.3 with no trend → risk 4.3 plus "contact range in 5 s, about 145 there" (estimated with the risk model at 2.6 blocks/s closing; checked in the Java verification). Urgent alerts per approaching creeper: 3 → 4, with the new one about 3 s before fuse range (estimated). A creeper-close or imminent alert during a deciding turn: held up to 2,000 ms → delivered at 0 ms (measured in a replay test). The model's own 5.5 s first decision (2.8 s to first token on a cold 25.9k-token cache) is unchanged (measured, play-session-3 trace).
+- **Sources:** `play-session-3-trace.jsonl` lines 548-842; branch claude/threat-heal
+
+### An agent that died next to a cow and a piece of beef
+*claude/threat-heal · Oct 8*
+- **Problem:** After the creepers, the same agent sat at 6 HP with a food bar of 17. Minecraft only regenerates health at 18 or more, but the wake message said "a full food bar regenerates health". The model used its one heal turn to do nothing. The raw beef Lucas then threw to it never woke it again, because a new heal wake needed 2 more HP lost first. Agents with a task were worse off: food that was only in view raised no alert at all, and carried food raised an ordinary alert that a running routine hears at most once every 30 s.
+- **Solution:** Heal facts now say whether the body is regenerating and list the food in reach as exact calls, nearest first: pick up this drop, hunt this cow, eat this item. New food in reach wakes an idle agent once per source. An agent with a task gets one urgent alert at 4 hearts when food is in reach, repeated only after 2 more HP lost or new food, and never more than every 10 s. The routine keeps running and the model chooses.
+- **Result:** Beef thrown to an idle agent at 6.1 HP: no wake until health fell to 4.1 HP → woken with the exact pickup call on the next observation (measured, replay test). A tasked agent at 4 hearts with food in view: no alert → one urgent alert within the same observation, with no repeat at the same food and health (measured, replay test). Live effect on survival is not measured yet.
+- **Sources:** `play-session-3-trace.jsonl` lines 884-933 and 2515-2523; branch claude/threat-heal

@@ -144,7 +144,7 @@ const STACK_DETAIL_FIELDS = ['displayName', 'fingerprint', 'maxStackSize', 'tool
 const MENU_STACK_DETAIL_FIELDS = ['damage', 'maxDamage', ...STACK_DETAIL_FIELDS];
 const ENTITY_DETAIL_FIELDS = ['velocity', 'yaw', 'pitch', 'pose', 'bounds', 'equipment', 'usingItem', 'onFire', 'pickable', 'parentId', 'partName',
 	'alive', 'hostile', 'health', 'maxHealth', 'targetingAgent', 'swelling', 'fuse', 'perceivedBy', 'potentialRisk', 'risk', 'expectedHitDamage'];
-const THREAT_SIGNALS = new Set(['targeting', 'swelling', 'creeper_close', 'ranged_sight', 'attacked']);
+const THREAT_SIGNALS = new Set(['targeting', 'swelling', 'creeper_close', 'ranged_sight', 'attacked', 'imminent']);
 const SURVIVAL_SIGNALS = new Set(['heal_opportunity', 'low_health_no_food']);
 const MAX_THREAT_ENTRIES = 8;
 const BLOCK_DETAIL_FIELDS = ['state', 'bounds', 'boundsTruncated', 'replaceable', 'fluid'];
@@ -1893,7 +1893,7 @@ function threatsObservation(value) {
 	const entries = boundedArray(value.entries, 'threats.entries', MAX_THREAT_ENTRIES).map((entry, index) => {
 		const field = `threats.entries[${index}]`;
 		const keys = ['uuid', 'type', 'distance', 'bearing', 'targeting', 'swelling', 'lineOfSight', 'signals'];
-		exactKeys(entry, [...keys, 'risk', 'riskFactors', 'expectedHitDamage'], keys, field);
+		exactKeys(entry, [...keys, 'risk', 'riskFactors', 'expectedHitDamage', 'closingSpeed', 'approaching', 'etaSeconds', 'contactRisk'], keys, field);
 		const signals = boundedArray(entry.signals, `${field}.signals`, THREAT_SIGNALS.size).map((signal) => {
 			if (!THREAT_SIGNALS.has(signal)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}.signals contains an unknown signal`);
 			return signal;
@@ -1907,6 +1907,11 @@ function threatsObservation(value) {
 			...(entry.risk === undefined ? {} : { risk: finiteNumber(entry.risk, `${field}.risk`) }),
 			...(entry.riskFactors === undefined ? {} : { riskFactors: observedDetails(entry.riskFactors, `${field}.riskFactors`) }),
 			...(entry.expectedHitDamage === undefined ? {} : { expectedHitDamage: finiteNumber(entry.expectedHitDamage, `${field}.expectedHitDamage`) }),
+			// Trend: blocks per second closing in (negative recedes), seconds to contact range, and the risk it carries there.
+			...(entry.closingSpeed === undefined ? {} : { closingSpeed: finiteNumber(entry.closingSpeed, `${field}.closingSpeed`) }),
+			...(entry.approaching === undefined ? {} : { approaching: boolean(entry.approaching, `${field}.approaching`) }),
+			...(entry.etaSeconds === undefined ? {} : { etaSeconds: finiteNumber(entry.etaSeconds, `${field}.etaSeconds`) }),
+			...(entry.contactRisk === undefined ? {} : { contactRisk: finiteNumber(entry.contactRisk, `${field}.contactRisk`) }),
 		};
 	});
 	if (value.bestWeapon === undefined) return { entries };
@@ -2076,7 +2081,7 @@ function isFactualChangedPath(path) {
 	if (path === 'world.dimension') return true;
 	if (path.startsWith('player.')) return FACTUAL_PLAYER_FIELDS.has(path.slice('player.'.length));
 	if (/^entities\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(path)) return true;
-	if (/^threats\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(?:targeting|swelling|creeper_close|ranged_sight|attacked)$/i.test(path)) return true;
+	if (/^threats\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(?:targeting|swelling|creeper_close|ranged_sight|attacked|imminent)$/i.test(path)) return true;
 	if (/^survival\.(?:heal_opportunity|low_health_no_food)$/.test(path)) return true;
 	return /^blocks\.-?\d+,-?\d+,-?\d+$/.test(path);
 }

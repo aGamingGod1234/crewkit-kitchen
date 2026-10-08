@@ -1796,6 +1796,25 @@ test('threat facts, combat entity fields and threat attention paths are accepted
 	assert.equal(Object.hasOwn(validateProtocolV2Payload('observation', withoutThreats), 'threats'), false, 'threats stay optional');
 });
 
+test('threat trend facts and the imminent edge are accepted; a malformed trend is not', () => {
+	const observation = readyServerObservation();
+	const creeper = '00000000-0000-0000-0000-0000000000cc';
+	observation.attention = true;
+	observation.changedFacts = [`threats.${creeper}.imminent`];
+	observation.threats = { entries: [{ uuid: creeper, type: 'minecraft:creeper', distance: 10, bearing: 0, targeting: true, swelling: false, lineOfSight: true,
+		signals: ['imminent', 'targeting'], risk: 7.1, riskFactors: { proximity: 0.23 }, expectedHitDamage: 0, closingSpeed: 2.6, approaching: true, etaSeconds: 2.7, contactRisk: 145 }] };
+	const normalized = validateProtocolV2Payload('observation', observation);
+	assert.deepEqual(normalized.threats.entries[0], { ...observation.threats.entries[0] });
+	assert.deepEqual(normalized.changedFacts, [`threats.${creeper}.imminent`]);
+	const stationary = structuredClone(observation);
+	delete stationary.threats.entries[0].etaSeconds;
+	delete stationary.threats.entries[0].contactRisk;
+	assert.equal(Object.hasOwn(validateProtocolV2Payload('observation', stationary).threats.entries[0], 'etaSeconds'), false, 'ETA is omitted when not approaching');
+	const bad = structuredClone(observation);
+	bad.threats.entries[0].approaching = 'yes';
+	assert.throws(() => validateProtocolV2Payload('observation', bad), ProtocolV2Error);
+});
+
 test('risk facts, player attackers and healing signals are accepted as observation facts', () => {
 	const observation = readyServerObservation();
 	const player = '00000000-0000-0000-0000-0000000000b2';
