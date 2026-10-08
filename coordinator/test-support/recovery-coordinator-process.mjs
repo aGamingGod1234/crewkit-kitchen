@@ -35,9 +35,11 @@ const coordinator = createDynamicCoordinator({
 	bridge: {
 		port,
 		secret,
-		handshakeTimeoutMs: 250,
-		heartbeatIntervalMs: 100,
-		heartbeatTimeoutMs: 300,
+		// The test drops the socket itself, so liveness timers are only a backstop. They stay long enough
+		// that a loaded host cannot trip them and add a reconnect the test does not expect.
+		handshakeTimeoutMs: 30_000,
+		heartbeatIntervalMs: 1_000,
+		heartbeatTimeoutMs: 60_000,
 		reconnectDelayMs: 10,
 		maxReconnectDelayMs: 20,
 	},

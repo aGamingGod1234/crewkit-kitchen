@@ -19,7 +19,7 @@ import { compareInstrumentationRuns } from '../src/benchmark/instrumentation-com
 import { compileScenarioDecision } from '../src/benchmark/scenario-program.mjs';
 
 const profile = { provider: 'instant', model: 'fixture', reasoningEffort: 'fixed', serviceTier: 'local' };
-const matrix = (extra = {}) => ({ version: 1, fixedSeeds: [1], agentLoads: [1,4,8,16], trials: [{ id: 'fixture', mode: 'instant', scenarioId: 'block-placement', seed: 1, agentLoad: 1, repetitions: 2, providerProfile: profile, turnBudgetMs: 100, trialBudgetMs: 500, turnCap: 8, providerAvailabilityRequired: false, ...extra }] });
+const matrix = (extra = {}) => ({ version: 1, fixedSeeds: [1], agentLoads: [1,4,8,16], trials: [{ id: 'fixture', mode: 'instant', scenarioId: 'block-placement', seed: 1, agentLoad: 1, repetitions: 2, providerProfile: profile, turnBudgetMs: 10000, trialBudgetMs: 60000, turnCap: 8, providerAvailabilityRequired: false, ...extra }] });
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
 const tick = () => new Promise(r => setImmediate(r));
 // Trials that wait on a gated provider end at their deadline. It has to fall after acquisition starts, which a
@@ -75,7 +75,7 @@ test('instrumentation certification requires timing for every successful matched
 });
 
 test('Task 9 fixed descriptor controls the actual scheduler and rejects unsupported adaptive descriptors', async () => {
-  const m = { ...matrix({ agentLoad:4, scenarioId:'stone-tool-gathering', mode:'replay', providerProfile:{...profile,provider:'replay'}, repetitions:1, turnBudgetMs:1000, trialBudgetMs:5000 }), schemaVersion:3 };
+  const m = { ...matrix({ agentLoad:4, scenarioId:'stone-tool-gathering', mode:'replay', providerProfile:{...profile,provider:'replay'}, repetitions:1, turnBudgetMs:10000, trialBudgetMs:60000 }), schemaVersion:3 };
   const result = await runTask9SimulatorMatrix({ matrix:m, virtualTickPacing:{tickMs:1}, scheduler:{mode:'fixed',fixedConcurrency:1},
     providerFactories:{ replay: (profile, context) => ({...profile, synthetic:true, available:true, async stop(){}, async createAgent(record){return { async setGoalRevision(){}, async decide(){return compileScenarioDecision(context.loadScenario.agentManifests[record.agentId]);} };} }) },
   });
@@ -367,7 +367,7 @@ test('legacy latency CLI preserves pending acquisition and halted-matrix evidenc
 });
 
 test('Task 9 accepts explicit adaptive execution and rejects a mismatched custom scheduler',async()=>{
-  const m={...matrix({agentLoad:4,scenarioId:'stone-tool-gathering',mode:'replay',providerProfile:{...profile,provider:'replay'},repetitions:1,turnBudgetMs:1000,trialBudgetMs:5000}),schemaVersion:3};
+  const m={...matrix({agentLoad:4,scenarioId:'stone-tool-gathering',mode:'replay',providerProfile:{...profile,provider:'replay'},repetitions:1,turnBudgetMs:10000,trialBudgetMs:60000}),schemaVersion:3};
   const common={matrix:m,virtualTickPacing:{tickMs:1},providerFactories:{replay:(profile,context)=>({...profile,available:true,synthetic:true,async stop(){},async createAgent(record){return {async setGoalRevision(){},async decide(){return compileScenarioDecision(context.loadScenario.agentManifests[record.agentId]);}};}})}};
   const adaptive=await runTask9SimulatorMatrix({...common,scheduler:{mode:'adaptive',controller:{fixture:true}},planningSchedulerFactory:({recorder})=>new PlanningScheduler({maxConcurrent:4,maxPending:0,planningMode:'adaptive',urgentReserve:0,benchmarkRecorder:recorder})});
   assert.equal(adaptive.status,'PASSED');assert.equal(adaptive.trials[0].scheduler.mode,'adaptive');

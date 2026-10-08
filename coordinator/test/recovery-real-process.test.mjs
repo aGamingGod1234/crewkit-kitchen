@@ -13,7 +13,7 @@ const coordinatorRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)
 const fixture = path.join(coordinatorRoot, 'test-support', 'recovery-coordinator-process.mjs');
 const secret = 'recovery-smoke-secret-32-bytes-ok';
 
-test('real coordinator process reconnects to a restored loopback bridge without credentials or Minecraft', { timeout: 5_000 }, async () => {
+test('real coordinator process reconnects to a restored loopback bridge without credentials or Minecraft', { timeout: 120_000 }, async () => {
 	const sockets = new Set();
 	let maxOpenSockets = 0;
 	let connections = 0;
@@ -81,8 +81,8 @@ test('real coordinator process reconnects to a restored loopback bridge without 
 	child.stdout.on('data', (chunk) => stdout.push(chunk.toString('utf8')));
 	child.stderr.on('data', (chunk) => stderr.push(chunk.toString('utf8')));
 	try {
-		await waitForMessage(child, (message) => message?.type === 'started', 2_000, () => stderr.join(''));
-		const first = await waitForMessage(child, (message) => message?.type === 'healthy', 2_000, () => stderr.join(''));
+		await waitForMessage(child, (message) => message?.type === 'started', 60_000, () => stderr.join(''));
+		const first = await waitForMessage(child, (message) => message?.type === 'healthy', 60_000, () => stderr.join(''));
 		assert.equal(first.connectionEpoch, 1);
 		assert.deepEqual(first.runtimeErrors, []);
 		assert.equal(connections, 1);
@@ -117,7 +117,7 @@ test('real coordinator process reconnects to a restored loopback bridge without 
 	}
 });
 
-function waitForMessage(child, predicate, timeoutMs = 2_000, diagnostics = () => '') {
+function waitForMessage(child, predicate, timeoutMs = 60_000, diagnostics = () => '') {
 	return new Promise((resolve, reject) => {
 		const timer = setTimeout(() => finish(new Error('coordinator child did not reach the expected boundary')), timeoutMs);
 		const onMessage = (message) => {

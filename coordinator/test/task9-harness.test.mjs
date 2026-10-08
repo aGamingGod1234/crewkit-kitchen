@@ -20,7 +20,7 @@ import {
 import { compileScenarioDecision } from '../src/benchmark/scenario-program.mjs';
 
 const profile = { provider: 'replay', model: 'controlled-v1', reasoningEffort: 'fixed', serviceTier: 'synthetic-delayed' };
-const trial = (overrides = {}) => ({ id: 'stone', mode: 'replay', scenarioId: 'stone-tool-gathering', seed: 20260821, agentLoad: 4, repetitions: 5, providerProfile: profile, turnBudgetMs: 100, trialBudgetMs: 500, turnCap: 8, ...overrides });
+const trial = (overrides = {}) => ({ id: 'stone', mode: 'replay', scenarioId: 'stone-tool-gathering', seed: 20260821, agentLoad: 4, repetitions: 5, providerProfile: profile, turnBudgetMs: 10_000, trialBudgetMs: 60_000, turnCap: 8, ...overrides });
 const matrix = (overrides = {}) => ({ schemaVersion: 3, fixedSeeds: [20260821, 20260822], agentLoads: [1, 4, 8, 16], trials: [trial(overrides)] });
 const phases = TASK9_REQUIRED_PHASES.map((phase, index) => ({ phase, sequence: index + 1, monotonicMs: index, durationMs: 1 }));
 

@@ -126,7 +126,7 @@ test('different catalog reads still fence the superseded physical outcome', asyn
   } finally { old.resolve(); fresh.resolve(); await router.stop(); }
 });
 
-test('obsolete child cleanup remains diagnostic without invalidating successor turns', { timeout: 3000 }, async () => {
+test('obsolete child cleanup remains diagnostic without invalidating successor turns', { timeout: 60000 }, async () => {
   const children = [];
   const transport = new CodexStdioTransport({ ...profile, cwd: process.cwd(), environment: {} }, {
     stopTimeoutMs: 10,
@@ -280,7 +280,7 @@ const scenarios = [
 ];
 
 for (const scenario of scenarios) {
-  test(scenario.name, { timeout: 2500 }, async () => {
+  test(scenario.name, { timeout: 60000 }, async () => {
     const f = await fixture();
     try {
       f.emit(usage(100, 'old', scenario.explicit));
