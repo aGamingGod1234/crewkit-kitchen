@@ -395,3 +395,11 @@ Notes: before numbers come from the recorded GPT-6.1 Sol "beat the game" session
 - **Solution:** Every trace row now carries a wall-clock and a monotonic timestamp, the coordinator marks each stage from event to result (event ready, model turn sent, tool request, journal write, bridge send, result returned), and the Java server reports when it accepted, started and finished each action and which server tick that was. The server only sends these clocks to a coordinator that announced it understands them, so an older coordinator paired with a newer jar still works. A new `scripts/trace-latency.mjs` turns a trace into the per-action latency table with medians, p90 and how long the body sat idle.
 - **Result:** (measured by the implementer, unit-level) the stamps cost about 3 microseconds and 32 bytes per trace row. The model never sees these clocks. This layer measures; it does not make anything faster by itself.
 - **Sources:** this branch, `TraceWriter`, `ActionTimelines`, `scripts/trace-latency.mjs`
+
+## Speed run: no wasted wakes (Oct 9, 2026)
+
+### The model was woken up while its own action was still running
+- **Problem:** While an agent ran an action the model had started itself, routine changes (a new block in view, a heartbeat) still woke the model. It could do nothing useful with them, so each wake cost a full model call and the action's real completion then woke it again.
+- **Solution:** Ordinary wakes are now held while the model's own action runs. Dangers, chat and other urgent events still go through at once. The first held wake starts a 15 s timer, so a one-time sighting is released with the freshest facts even if nothing else arrives, and cancelling or replacing the action releases or drops what was held. The completion wake adopts the named reason of the wake it replaced. An earlier idea that also told the model early about remaining work was removed because replaying recorded traces showed it could add calls.
+- **Result:** (replay of recorded play traces, implementer's figure, not re-measured at integration) 9 of 98 turns were held-back wakes, about 5.9% of model cost. Which wakes were held is traced as `native_wake_deferred_for_action` and `native_wake_resumed_after_action`.
+- **Sources:** this branch, `dynamic-main.mjs` wake hold, `native-tool-runtime.mjs`, `test/wake-while-action-runs.test.mjs`
