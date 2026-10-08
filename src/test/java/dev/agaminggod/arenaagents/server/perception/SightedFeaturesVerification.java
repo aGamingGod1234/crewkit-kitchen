@@ -30,6 +30,9 @@ public final class SightedFeaturesVerification {
 		veinsCountOnlySeenOre();
 		cavesNeedRoomRoofAndNaturalWalls();
 		structuresKeepNearestPerStart();
+		structureLabels();
+		onlyBuiltBlocksIdentifyStructures();
+		sightedRecomputeIsThrottled();
 		structuresAreNewOncePerMinute();
 		rendering();
 		attention();
@@ -71,6 +74,12 @@ public final class SightedFeaturesVerification {
 				== SightedFeatures.MAX_VEINS, "vein rows are capped");
 	}
 
+	/** An irregular natural cave: a rough blob around (cx, cy, cz), as carvers leave it. */
+	private static boolean blob(Cell cell, int cx, int cy, int cz) {
+		int dx = cell.x() - cx, dy = cell.y() - cy, dz = cell.z() - cz;
+		return dx * dx + dy * dy * 2 + dz * dz <= 7 + Math.floorMod(cell.x() * 7 + cell.z() * 13 + cell.y() * 5, 4);
+	}
+
 	private static void cavesNeedRoomRoofAndNaturalWalls() {
 		Map<Cell, String> world = new HashMap<>();
 		// A dug 1x2 tunnel along +x: the open cell in front of its end wall is not a cave.
@@ -82,42 +91,119 @@ public final class SightedFeaturesVerification {
 				cell -> "air".equals(world.get(cell)), cell -> !"minecraft:oak_planks".equals(world.get(cell)), FROM_ORIGIN);
 		check(tunnel.isEmpty(), "a dug tunnel is not a cave");
 
-		// A 5x4x5 natural room 40 blocks away is a cave when roofed, and not when open to the sky.
-		Map<Cell, String> room = new HashMap<>();
-		for (int x = 38; x <= 42; x++) for (int y = 0; y <= 3; y++) for (int z = -2; z <= 2; z++) room.put(new Cell(x, y, z), "air");
+		// Review finding: a dug 3x3 tunnel held 45 roofed air cells in the box and passed as a cave.
+		Set<Cell> wide = new HashSet<>();
+		for (int x = 20; x <= 60; x++) for (int y = 0; y <= 2; y++) for (int z = -1; z <= 1; z++) wide.add(new Cell(x, y, z));
+		check(SightedFeatures.caves(List.of(new Cell(40, 1, 0)), cell -> true, cell -> true, wide::contains, cell -> true, FROM_ORIGIN).isEmpty(),
+				"a dug 3x3 tunnel (straight faces) is not a cave");
+		Set<Cell> dugRoom = new HashSet<>();
+		for (int x = 38; x <= 42; x++) for (int y = 0; y <= 3; y++) for (int z = -2; z <= 2; z++) dugRoom.add(new Cell(x, y, z));
+		check(SightedFeatures.caves(List.of(new Cell(40, 1, 0)), cell -> true, cell -> true, dugRoom::contains, cell -> true, FROM_ORIGIN).isEmpty(),
+				"a dug rectangular room is not a cave");
+		// Review finding: air behind a wall counted. A sealed pocket beside a small dug nook adds nothing.
+		Set<Cell> nook = new HashSet<>(List.of(new Cell(40, 0, 0), new Cell(40, 1, 0)));
+		Set<Cell> withPocket = new HashSet<>(nook);
+		// Sealed pockets on both sides, behind one-block walls: 50 air cells the old count included.
+		for (int x : new int[] {38, 42}) for (int y = -1; y <= 3; y++) for (int z = -2; z <= 2; z++) withPocket.add(new Cell(x, y, z));
+		check(SightedFeatures.caves(List.of(new Cell(40, 1, 0)), cell -> true, cell -> true, withPocket::contains, cell -> true, FROM_ORIGIN).isEmpty(),
+				"air sealed behind a wall is not counted toward a cave");
+
+		// A natural cave 40 blocks away is a cave when roofed, and not when open to the sky.
 		Cell inside = new Cell(40, 1, 0);
-		List<Sighting> cave = SightedFeatures.caves(List.of(inside, new Cell(41, 1, 1)), cell -> true, cell -> true,
-				cell -> "air".equals(room.get(cell)), cell -> true, FROM_ORIGIN);
-		check(cave.size() == 1, "two openings of one cave make one row");
-		check(cave.getFirst().count() >= SightedFeatures.CAVE_MIN_AIR, "the row carries its open-air count");
-		check(SightedFeatures.caves(List.of(inside), cell -> false, cell -> true, cell -> "air".equals(room.get(cell)), cell -> true, FROM_ORIGIN).isEmpty(),
+		java.util.function.Predicate<Cell> cave = cell -> blob(cell, 40, 1, 0);
+		List<Sighting> rows = SightedFeatures.caves(List.of(inside, new Cell(41, 1, 1)), cell -> true, cell -> true, cave, cell -> true, FROM_ORIGIN);
+		check(rows.size() == 1, "two openings of one cave make one row");
+		check(rows.getFirst().count() >= SightedFeatures.CAVE_MIN_AIR, "the row carries its open-air count: " + rows.getFirst().count());
+		check(SightedFeatures.caves(List.of(inside), cell -> false, cell -> true, cave, cell -> true, FROM_ORIGIN).isEmpty(),
 				"an unroofed hollow (valley, ravine floor) is not reported as a cave");
-		check(SightedFeatures.caves(List.of(inside), cell -> cell.x() == 40, cell -> true, cell -> "air".equals(room.get(cell)), cell -> true, FROM_ORIGIN).isEmpty(),
+		check(SightedFeatures.caves(List.of(inside), cell -> cell.x() == 40, cell -> true, cave, cell -> true, FROM_ORIGIN).isEmpty(),
 				"a ledge over open air (a hillside overhang) is not a cave");
-		check(SightedFeatures.caves(List.of(inside), cell -> true, cell -> true, cell -> "air".equals(room.get(cell)), cell -> false, FROM_ORIGIN).isEmpty(),
+		check(SightedFeatures.caves(List.of(inside), cell -> true, cell -> true, cave, cell -> false, FROM_ORIGIN).isEmpty(),
 				"a roofed room with built walls is a building, not a cave");
-		check(SightedFeatures.caves(List.of(inside, new Cell(38, 1, 2), new Cell(42, 2, -2)), cell -> true, cell -> true, cell -> "air".equals(room.get(cell)), cell -> true, FROM_ORIGIN).size() == 1,
-				"openings across one room stay one row");
-		check(SightedFeatures.caves(List.of(inside), cell -> true, cell -> false, cell -> "air".equals(room.get(cell)), cell -> true, FROM_ORIGIN).isEmpty(),
+		check(SightedFeatures.caves(List.of(inside, new Cell(39, 1, 1), new Cell(41, 2, -1)), cell -> true, cell -> true, cave, cell -> true, FROM_ORIGIN).size() == 1,
+				"openings across one cave stay one row");
+		check(SightedFeatures.caves(List.of(inside), cell -> true, cell -> false, cave, cell -> true, FROM_ORIGIN).isEmpty(),
 				"a sky-lit opening is not a cave");
 		check(!SightedFeatures.caveSpace(true, SightedFeatures.CAVE_MIN_AIR - 1, 100, 100), "too little air is not a cave");
 
 		List<Cell> many = new ArrayList<>();
-		Map<Cell, String> big = new HashMap<>();
-		for (int x = 0; x < 64; x++) for (int y = 0; y < 4; y++) for (int z = 0; z < 4; z++) big.put(new Cell(x, y, z), "air");
 		for (int x = 2; x < 64; x += 12) many.add(new Cell(x, 1, 1));
-		check(SightedFeatures.caves(many, cell -> true, cell -> true, cell -> "air".equals(big.get(cell)), cell -> true, FROM_ORIGIN).size()
+		// A long winding natural passage of rough cross-section.
+		java.util.function.Predicate<Cell> passage = cell -> cell.x() >= 0 && cell.x() < 64 && blob(cell, cell.x(), 1, 1);
+		check(SightedFeatures.caves(many, cell -> true, cell -> true, passage, cell -> true, FROM_ORIGIN).size()
 				== SightedFeatures.MAX_CAVES, "cave rows are capped");
 	}
 
 	private static void structuresKeepNearestPerStart() {
 		List<Sighting> rows = SightedFeatures.nearestPerKey(List.of(
-				new Sighting("minecraft:shipwreck@1,2", "minecraft:shipwreck", new Cell(30, 60, 0), 30, 0),
-				new Sighting("minecraft:village_plains@5,5", "minecraft:village_plains", new Cell(80, 70, 0), 80, 0),
-				new Sighting("minecraft:shipwreck@1,2", "minecraft:shipwreck", new Cell(25, 60, 0), 25, 0)), SightedFeatures.MAX_STRUCTURES);
+				new Sighting("minecraft:shipwreck@1,2", "shipwreck", new Cell(30, 60, 0), 30, 0),
+				new Sighting("minecraft:village_plains@5,5", "village", new Cell(80, 70, 0), 80, 0),
+				new Sighting("minecraft:shipwreck@1,2", "shipwreck", new Cell(25, 60, 0), 25, 0)), SightedFeatures.MAX_STRUCTURES);
 		check(rows.size() == 2, "one row per structure start");
 		check(rows.getFirst().cell().equals(new Cell(25, 60, 0)), "the nearest seen block represents the structure");
-		check("minecraft:village_plains".equals(rows.get(1).label()), "structures are ordered nearest first");
+		check("village".equals(rows.get(1).label()), "structures are ordered nearest first");
+	}
+
+	/** Review decision: structures read as a player names them, and buried treasure (never visible) is never reported. */
+	private static void structureLabels() {
+		String[][] expected = {
+				{"minecraft:village_plains", "village"}, {"minecraft:village_snowy", "village"}, {"minecraft:shipwreck_beached", "shipwreck"},
+				{"minecraft:desert_pyramid", "desert temple"}, {"minecraft:jungle_pyramid", "jungle temple"}, {"minecraft:swamp_hut", "witch hut"},
+				{"minecraft:igloo", "igloo"}, {"minecraft:ruined_portal_nether", "ruined portal"}, {"minecraft:mineshaft_mesa", "mineshaft"},
+				{"minecraft:stronghold", "stronghold"}, {"minecraft:monument", "ocean monument"}, {"minecraft:mansion", "woodland mansion"},
+				{"minecraft:pillager_outpost", "pillager outpost"}, {"minecraft:trail_ruins", "trail ruins"},
+				{"minecraft:trial_chambers", "trial chambers"}, {"minecraft:ancient_city", "ancient city"},
+				{"minecraft:fortress", "nether fortress"}, {"minecraft:bastion_remnant", "bastion"}, {"minecraft:end_city", "end city"},
+				{"minecraft:ocean_ruin_warm", "ocean ruins"}};
+		for (String[] pair : expected) check(pair[1].equals(SightedFeatures.structureLabel(pair[0])), pair[0] + " reads as " + pair[1]);
+		check(SightedFeatures.structureLabel("minecraft:buried_treasure") == null, "buried treasure is never reported");
+		check("sky tower".equals(SightedFeatures.structureLabel("mymod:sky_tower")), "a datapack structure reads as its name");
+	}
+
+	/**
+	 * Review finding: natural blocks inside a structure piece's box (a desert temple's sandstone seen from a cave below)
+	 * reported the structure though nothing built was visible. Only built blocks identify one now.
+	 */
+	private static void onlyBuiltBlocksIdentifyStructures() {
+		for (var block : List.of(Blocks.SANDSTONE, Blocks.RED_SANDSTONE, Blocks.TERRACOTTA, Blocks.ORANGE_TERRACOTTA, Blocks.OAK_LOG,
+				Blocks.OAK_LEAVES, Blocks.VINE, Blocks.SHORT_GRASS, Blocks.SNOW_BLOCK, Blocks.PACKED_ICE, Blocks.BLUE_ICE, Blocks.OBSIDIAN,
+				Blocks.MAGMA_BLOCK, Blocks.SCULK, Blocks.CRIMSON_NYLIUM, Blocks.STONE, Blocks.DEEPSLATE, Blocks.WATER, Blocks.IRON_ORE,
+				Blocks.SMOOTH_BASALT, Blocks.RAW_IRON_BLOCK, Blocks.COBWEB, Blocks.GRAVEL, Blocks.SAND)) {
+			check(!SightedFeatures.built(block.defaultBlockState(), "desert temple"), block + " is terrain, not building");
+		}
+		for (var block : List.of(Blocks.CUT_SANDSTONE, Blocks.CHISELED_SANDSTONE, Blocks.SANDSTONE_STAIRS, Blocks.OAK_PLANKS,
+				Blocks.SPRUCE_FENCE, Blocks.STONE_BRICKS, Blocks.MOSSY_COBBLESTONE, Blocks.PRISMARINE_BRICKS, Blocks.DARK_PRISMARINE,
+				Blocks.NETHER_BRICKS, Blocks.POLISHED_BLACKSTONE_BRICKS, Blocks.GILDED_BLACKSTONE, Blocks.PURPUR_BLOCK,
+				Blocks.END_STONE_BRICKS, Blocks.DEEPSLATE_TILES, Blocks.TUFF_BRICKS, Blocks.WAXED_CUT_COPPER, Blocks.MUD_BRICKS,
+				Blocks.CHEST, Blocks.RAIL, Blocks.GLASS_PANE, Blocks.WHITE_WOOL, Blocks.CRYING_OBSIDIAN, Blocks.HAY_BLOCK)) {
+			check(SightedFeatures.built(block.defaultBlockState(), "village"), block + " shows building");
+		}
+		check(SightedFeatures.built(Blocks.OBSIDIAN.defaultBlockState(), "ruined portal"), "a ruined portal is known by its obsidian frame");
+		check(SightedFeatures.built(Blocks.SNOW_BLOCK.defaultBlockState(), "igloo"), "an igloo is known by its snow dome");
+	}
+
+	/** Review finding: the sight cache keyed on the exact view rarely hit, so every observation recomputed the rows. */
+	private static void sightedRecomputeIsThrottled() {
+		ServerObservationCollector.SightedMemo memo = new ServerObservationCollector.SightedMemo("minecraft:overworld", 100L, Sample.EMPTY);
+		check(ServerObservationCollector.sightedDue(null, "minecraft:overworld", 100L), "the first sample is computed");
+		check(!ServerObservationCollector.sightedDue(memo, "minecraft:overworld", 109L), "within 10 ticks the rows are reused");
+		check(ServerObservationCollector.sightedDue(memo, "minecraft:overworld", 110L), "after 10 ticks they are recomputed");
+		check(ServerObservationCollector.sightedDue(memo, "minecraft:the_nether", 101L), "a dimension change recomputes at once");
+		int recomputes = 0;
+		ServerObservationCollector.SightedMemo current = null;
+		for (long tick = 0; tick < 200; tick++) {
+			if (ServerObservationCollector.sightedDue(current, "minecraft:overworld", tick)) {
+				recomputes++;
+				current = new ServerObservationCollector.SightedMemo("minecraft:overworld", tick, Sample.EMPTY);
+			}
+		}
+		check(recomputes == 20, "an observation every tick for 10 s recomputes 20 times, not 200: " + recomputes);
+		check(ServerObservationCollector.quantize(64.62D, ServerObservationCollector.LANDMARK_EYE_QUANTUM) == 64.5D
+				&& ServerObservationCollector.quantize(64.70D, ServerObservationCollector.LANDMARK_EYE_QUANTUM) == 64.5D,
+				"eye positions within a quarter block share a landmark key");
+		check(ServerObservationCollector.quantize(91.0D, ServerObservationCollector.LANDMARK_VIEW_QUANTUM_DEGREES)
+				== ServerObservationCollector.quantize(93.5D, ServerObservationCollector.LANDMARK_VIEW_QUANTUM_DEGREES),
+				"a 2.5 degree head movement reuses the sight rays");
 	}
 
 	private static void structuresAreNewOncePerMinute() {
@@ -133,12 +219,12 @@ public final class SightedFeaturesVerification {
 	private static void rendering() {
 		check(SightedFeatures.toJson(Sample.EMPTY, Vec3.ZERO, 0.0F, key -> true) == null, "nothing seen: no field");
 		Sample sample = new Sample(
-				List.of(new Sighting("minecraft:shipwreck@1,2", "minecraft:shipwreck", new Cell(0, 60, 40), 40.4, 0)),
+				List.of(new Sighting("minecraft:shipwreck@1,2", "shipwreck", new Cell(0, 60, 40), 40.4, 0)),
 				List.of(new Sighting("cave@0,0,1", null, new Cell(10, 0, 0), 10.2, 44)),
 				List.of(new Sighting("minecraft:iron_ore@1,0,0", "minecraft:deepslate_iron_ore", new Cell(1, 0, 0), 1.2, 5)));
 		JsonObject json = SightedFeatures.toJson(sample, new Vec3(0.5D, 0.0D, 0.5D), 0.0F, key -> key.startsWith("minecraft:shipwreck"));
 		JsonObject structure = json.getAsJsonArray("structures").get(0).getAsJsonObject();
-		check("minecraft:shipwreck".equals(structure.get("structure").getAsString()) && structure.get("new").getAsBoolean(), "structure row names the structure and marks it new");
+		check("shipwreck".equals(structure.get("structure").getAsString()) && structure.get("new").getAsBoolean(), "structure row names the structure and marks it new");
 		check(structure.get("distance").getAsLong() == 40 && structure.get("bearing").getAsLong() == 0, "straight ahead at 40 blocks");
 		JsonObject cave = json.getAsJsonArray("caves").get(0).getAsJsonObject();
 		check(cave.get("air").getAsInt() == 44 && cave.get("bearing").getAsLong() == -90, "a cave to the east is 90 degrees off a south-facing view, signed like landmarks");
@@ -155,7 +241,7 @@ public final class SightedFeaturesVerification {
 		JsonObject sighted = new JsonObject();
 		JsonArray structures = new JsonArray();
 		JsonObject row = new JsonObject();
-		row.addProperty("structure", "minecraft:village_plains");
+		row.addProperty("structure", "village");
 		structures.add(row);
 		sighted.add("structures", structures);
 		current.add("sighted", sighted);
@@ -170,8 +256,11 @@ public final class SightedFeaturesVerification {
 		check(SightedFeatures.natural(Blocks.STONE.defaultBlockState()) && SightedFeatures.natural(Blocks.DEEPSLATE.defaultBlockState()), "stone is natural");
 		check(SightedFeatures.natural(Blocks.WATER.defaultBlockState()) && SightedFeatures.natural(Blocks.SAND.defaultBlockState()), "water and sand are natural");
 		check(SightedFeatures.natural(Blocks.IRON_ORE.defaultBlockState()), "ore is part of a cave wall");
-		check(!SightedFeatures.natural(Blocks.OAK_PLANKS.defaultBlockState()) && !SightedFeatures.natural(Blocks.OBSIDIAN.defaultBlockState())
-				&& !SightedFeatures.natural(Blocks.COBBLESTONE.defaultBlockState()), "planks, obsidian and cobblestone identify built structures");
+		check(!SightedFeatures.natural(Blocks.OAK_PLANKS.defaultBlockState()) && !SightedFeatures.natural(Blocks.COBBLESTONE.defaultBlockState()),
+				"planks and cobblestone are not cave walls");
+		check(SightedFeatures.natural(Blocks.SANDSTONE.defaultBlockState()) && SightedFeatures.natural(Blocks.OBSIDIAN.defaultBlockState())
+				&& SightedFeatures.natural(Blocks.SNOW_BLOCK.defaultBlockState()) && SightedFeatures.natural(Blocks.MAGMA_BLOCK.defaultBlockState()),
+				"sandstone, obsidian, snow and magma line natural caves");
 	}
 
 	private static void check(boolean condition, String message) {

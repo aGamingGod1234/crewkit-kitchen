@@ -11,7 +11,7 @@ import { decodeModelFacts } from '../src/model-fact-encoding.mjs';
 import { presentNativeToolResult } from '../src/codex-service.mjs';
 
 const SIGHTED = {
-	structures: [{ structure: 'minecraft:shipwreck_beached', x: 40, y: 62, z: -12, distance: 41, bearing: -20, new: true }],
+	structures: [{ structure: 'shipwreck', x: 40, y: 62, z: -12, distance: 41, bearing: -20, new: true }],
 	caves: [{ x: 6, y: 58, z: 3, distance: 9, bearing: 35, air: 61 }],
 	veins: [{ blockId: 'minecraft:iron_ore', x: 2, y: 60, z: 1, distance: 3, bearing: 10, visible: 5 }],
 };
