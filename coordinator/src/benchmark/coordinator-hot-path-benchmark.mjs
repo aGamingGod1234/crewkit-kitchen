@@ -5,7 +5,7 @@
 //   model   each agent blocks on navigate_to calls one after another: tool call -> command sent, result -> tool returned
 //   program each agent runs one ArenaScript routine of back-to-back waits: result -> next command sent
 //   obs     a running routine receives a stream of observations: ingest latency per observation
-// Environment: TICK_MS (server tick, default 50). Wall times are noisy on a shared machine; compare alternating runs.
+// Environment: TICK_MS (server tick, default 50); TRACE=0 turns the public and private trace files off (default on, as in play). Wall times are noisy on a shared machine; compare alternating runs.
 import { pathToFileURL } from 'node:url';
 import path from 'node:path';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -21,6 +21,7 @@ const OBS_SIZE = Number(process.env.OBS_SCALE ?? 1);
 const imp = (rel) => import(pathToFileURL(path.join(root, rel)).href);
 const fx = await imp('test/fixtures/dynamic-main-fixture.mjs');
 const { AgentRegistry } = await imp('src/agent-registry.mjs');
+const { TraceWriter } = await imp('src/trace-writer.mjs');
 const { FakeBridge, FakePlanner, RecordingGoalSupervisor, factToWireObservation, eventually, start, record } = fx;
 
 const cpuMs = () => { const u = process.cpuUsage(); return (u.user + u.system) / 1000; };
@@ -100,7 +101,8 @@ planner.requestNativeTurn = async (request) => { executors.set(request.agentId, 
 const bridge = new SimBridge();
 const agentIds = Array.from({ length: AGENTS }, (_, i) => `agent-${i + 1}`);
 const config = { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } };
-const run = await start({ bridge, registry, planner, goalSupervisor: new RecordingGoalSupervisor(), config, memoryDirectory: dir, initialRegistry: agentIds.map((id) => record(id)) });
+const traceWriter = process.env.TRACE === '0' ? null : new TraceWriter(path.join(dir, 'trace', 'public.jsonl'), { diagnosticFilePath: path.join(dir, 'trace', 'private.jsonl') });
+const run = await start({ bridge, registry, planner, goalSupervisor: new RecordingGoalSupervisor(), config, memoryDirectory: dir, ...(traceWriter === null ? {} : { traceWriter }), initialRegistry: agentIds.map((id) => record(id)) });
 for (const id of agentIds) {
 	bridge.emit('goal_control', { agentId: id, payload: { operation: 'start', goalRevision: 1, goal: 'Bench loop.' } });
 	bridge.emit('observation', { agentId: id, payload: bigObservation(id, 1, 1) });
