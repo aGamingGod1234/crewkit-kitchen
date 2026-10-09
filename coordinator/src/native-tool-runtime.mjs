@@ -50,6 +50,7 @@ export class NativeToolRuntime {
 	#onProgramEvent;
 	#onWorkStarted;
 	#planningLeadTime;
+	#onModelActionCancelled;
 	#sweeps = new Map();
 	#sessionId;
 	#receipts = new Map();
@@ -76,6 +77,7 @@ export class NativeToolRuntime {
 		onProgramEvent = () => {},
 		onWorkStarted = () => () => {},
 		planningLeadTime = () => null,
+		onModelActionCancelled = () => {},
 		sessionId = randomUUID(),
 		occupancy = new ExplorationOccupancy(),
 	} = {}) {
@@ -119,6 +121,8 @@ export class NativeToolRuntime {
 		this.#onWorkStarted = onWorkStarted;
 		if (typeof planningLeadTime !== 'function') throw new TypeError('planningLeadTime must be a function');
 		this.#planningLeadTime = planningLeadTime;
+		if (typeof onModelActionCancelled !== 'function') throw new TypeError('onModelActionCancelled must be a function');
+		this.#onModelActionCancelled = onModelActionCancelled;
 		this.#sessionId = sessionId.length <= 36 ? sessionId : createHash('sha256').update(sessionId).digest('hex').slice(0, 32);
 		this.#occupancy = occupancy;
 	}
@@ -252,6 +256,12 @@ export class NativeToolRuntime {
 	hasProgram(record, programId) {
 		const run = this.#programRuns.get(record.agentId);
 		return run?.goalRevision === record.goalRevision && (programId === undefined || run.programId === programId);
+	}
+
+	/** True while an action the model itself started (not one a program authored) owns the body. */
+	hasModelAction(record) {
+		const active = this.#actions.get(record.agentId);
+		return active !== undefined && active.goalRevision === record.goalRevision && active.engineActionId === undefined;
 	}
 
 	canPrepareProgram(record, programId, programVersion) {
@@ -863,6 +873,10 @@ export class NativeToolRuntime {
 		if (active.cancelling) throw codedError('CANCELLATION_IN_PROGRESS', 'The exact action is already being cancelled');
 		active.cancelling = true;
 		active.cancellationUncertain = false;
+		// cancelAction and replaceAction both end what the model was waiting on; wakes held for it are released.
+		if (active.engineActionId === undefined) {
+			try { this.#onModelActionCancelled(record); } catch { /* the hook only releases held wakes */ }
+		}
 		// Cancelling a danger action taken while the program was paused leaves that paused program intact.
 		if (invalidateProgram && active.pausedProgram !== true) {
 			this.#executionEpochs.set(record.agentId, this.#executionEpoch(record.agentId) + 1);
