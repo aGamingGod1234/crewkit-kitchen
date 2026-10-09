@@ -257,3 +257,42 @@ test('coordinator sends crewkit_state to the server over the bridge', async () =
     assert.deepEqual(msg.payload, payload);
   } finally { await run.coordinator.stop(); }
 });
+
+test('finding 3: checkout idempotency key is persisted per quote before sending and survives 409 IN_PROGRESS', async () => {
+  const stateFile = path.join(process.env.CREWKIT_RECORDS_DIR, 'state-test.json');
+  const saved = { key: process.env.REAP_API_KEY, state: process.env.CREWKIT_STATE_FILE, fetch: globalThis.fetch };
+  process.env.CREWKIT_STATE_FILE = stateFile;
+  const client = await import('../src/crewkit/reap-client.mjs');
+  process.env.REAP_API_KEY = 'test-key-not-real'; // fetch is mocked below; nothing leaves the process
+  const seen = [];
+  let inProgress = 1;
+  globalThis.fetch = async (url, init) => {
+    const key = init.headers['Idempotency-Key'];
+    const persisted = JSON.parse(readFileSync(stateFile, 'utf8')).checkoutKeys;
+    seen.push({ key, persistedBeforeSend: Object.values(persisted).some((v) => v.key === key), quoteId: JSON.parse(init.body).quoteId });
+    const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+    if (inProgress-- > 0) return json(409, { error: { code: 'IDEMPOTENCY_REQUEST_IN_PROGRESS', message: 'in progress' } });
+    return json(200, { id: 'chk', status: 'REQUIRES_ACTION', nextAction: { url: '[x]' } });
+  };
+  try {
+    const c1 = await client.createCheckout('quote-1', 'enr-1', { inProgressWaitMs: 5 });
+    assert.equal(c1.id, 'chk');
+    assert.equal(seen.length, 2, 'one 409 wait, then success');
+    assert.equal(seen[0].key, seen[1].key, '409 IN_PROGRESS retried with the same key');
+    assert.ok(seen.every((s) => s.persistedBeforeSend), 'key written to state.json before the request');
+    await client.createCheckout('quote-1', 'enr-1');
+    assert.equal(seen[2].key, seen[0].key, 'same quote retried later reuses the key');
+    await client.createCheckout('quote-2', 'enr-1');
+    assert.notEqual(seen[3].key, seen[0].key, 'a new quote gets a new key');
+    const keys = JSON.parse(readFileSync(stateFile, 'utf8')).checkoutKeys;
+    assert.deepEqual(Object.keys(keys).sort(), ['quote-1', 'quote-2']);
+    inProgress = 99;
+    await assert.rejects(client.createCheckout('quote-3', 'enr-1', { inProgressWaitMs: 1 }), (e) => e.code === 'IDEMPOTENCY_REQUEST_IN_PROGRESS');
+    const q3 = seen.filter((s) => s.quoteId === 'quote-3');
+    assert.ok(q3.length > 1 && new Set(q3.map((s) => s.key)).size === 1, 'never a new key while in progress');
+  } finally {
+    globalThis.fetch = saved.fetch;
+    if (saved.key === undefined) delete process.env.REAP_API_KEY; else process.env.REAP_API_KEY = saved.key;
+    if (saved.state === undefined) delete process.env.CREWKIT_STATE_FILE; else process.env.CREWKIT_STATE_FILE = saved.state;
+  }
+});

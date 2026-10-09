@@ -30,12 +30,32 @@ export const VENUE = {
   addressLine1: '65 Mohamed Sultan Road', city: 'Singapore', postalCode: '239001', country: 'SG',
 };
 
-export const loadState = () => (existsSync(stateFile) ? JSON.parse(readFileSync(stateFile, 'utf8')) : {});
+// CREWKIT_STATE_FILE lets tests use a scratch file instead of the real state.json.
+const statePath = () => process.env.CREWKIT_STATE_FILE || stateFile;
+export const loadState = () => (existsSync(statePath()) ? JSON.parse(readFileSync(statePath(), 'utf8')) : {});
 export const saveState = (patch) => {
   const next = { ...loadState(), ...patch };
-  writeFileSync(stateFile, JSON.stringify(next, null, 2));
+  writeFileSync(statePath(), JSON.stringify(next, null, 2));
   return next;
 };
+
+const IDEMPOTENCY_TTL_MS = 24 * 60 * 60_000; // Reap keeps keys 24 h
+
+/**
+ * One Idempotency-Key per checkout of a given quote (and enrollment), written to state.json BEFORE the
+ * request is sent, so a crash or retry after sending replays the same checkout instead of creating a second one.
+ */
+export function checkoutIdempotencyKey(quoteId, enrollmentId) {
+  const now = Date.now();
+  const kept = Object.fromEntries(Object.entries(loadState().checkoutKeys || {})
+    .filter(([, v]) => now - Date.parse(v.at) < IDEMPOTENCY_TTL_MS));
+  const hit = kept[quoteId];
+  if (hit && hit.enrollmentId === enrollmentId) return hit.key;
+  // Different enrollment means a different body; reusing the key would be IDEMPOTENT_PARAMETER_MISMATCH.
+  const key = randomUUID();
+  saveState({ checkoutKeys: { ...kept, [quoteId]: { key, enrollmentId, at: new Date(now).toISOString() } } });
+  return key;
+}
 
 export class ReapError extends Error {
   constructor(status, body) {
@@ -48,11 +68,12 @@ export class ReapError extends Error {
 let calls = 0;
 export const callCount = () => calls;
 
-export async function reap(method, path, body, { idempotent = false, idempotencyKey, headers = {}, retries = 3 } = {}) {
+export async function reap(method, path, body, { idempotent = false, idempotencyKey, headers = {}, retries = 3, inProgressWaits = 10, inProgressWaitMs = 1000 } = {}) {
   const key = process.env.REAP_API_KEY;
   if (!key) throw new Error('REAP_API_KEY missing: put it in reap/.env as REAP_API_KEY=...');
   // One key per logical operation, reused across network/429/5xx retries (docs: cached errors replay).
   const idem = idempotent ? (idempotencyKey || randomUUID()) : null;
+  let waits = 0;
   for (let attempt = 0; ; attempt++) {
     calls++;
     let res;
@@ -75,6 +96,14 @@ export async function reap(method, path, body, { idempotent = false, idempotency
     const text = await res.text();
     const json = text ? safeJson(text) : null;
     if (res.ok) return json;
+    // The first request with this key is still running at Reap: wait and ask again with the SAME key.
+    // A new key here could create a second checkout.
+    if (res.status === 409 && json?.error?.code === 'IDEMPOTENCY_REQUEST_IN_PROGRESS' && idem && waits < inProgressWaits) {
+      waits++; attempt--;
+      const after = Number(res.headers.get('retry-after'));
+      await sleep(after > 0 ? after * 1000 : inProgressWaitMs);
+      continue;
+    }
     const retryable = res.status === 429 || res.status >= 500;
     if (retryable && attempt < retries) {
       const after = Number(res.headers.get('retry-after'));
@@ -129,10 +158,14 @@ export const getQuote = (id) => reap('GET', `/agentic/quotes/${id}`);
 export const selectShipping = (quoteId, shippingOptionId) =>
   reap('POST', `/agentic/quotes/${quoteId}/shipping-option`, { shippingOptionId });
 
-export const createCheckout = (quoteId, enrollmentId, { simulate = false } = {}) =>
+export const createCheckout = (quoteId, enrollmentId, { simulate = false, inProgressWaitMs } = {}) =>
   reap('POST', '/agentic/checkouts', {
     quoteId, enrollmentId, presentation: { type: 'REDIRECT', returnUrl: RETURN_URL },
-  }, { idempotent: true, headers: simulate ? { 'X-Simulate-Checkout': 'COMPLETED' } : {} });
+  }, {
+    idempotent: true, idempotencyKey: checkoutIdempotencyKey(quoteId, enrollmentId),
+    headers: simulate ? { 'X-Simulate-Checkout': 'COMPLETED' } : {},
+    ...(inProgressWaitMs === undefined ? {} : { inProgressWaitMs }),
+  });
 export const getCheckout = (id) => reap('GET', `/agentic/checkouts/${id}`);
 
 const TERMINAL = new Set(['COMPLETED', 'FAILED', 'EXPIRED']);
