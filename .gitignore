@@ -65,3 +65,9 @@ secrets/
 Thumbs.db
 Desktop.ini
 launcher_profiles.*.backup.json
+
+# CrewKit Kitchen: Reap key and local state
+.env
+coordinator/src/crewkit/.env
+coordinator/src/crewkit/state.json
+crewkit-records/
