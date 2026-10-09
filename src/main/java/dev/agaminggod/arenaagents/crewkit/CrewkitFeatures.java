@@ -15,6 +15,7 @@ public final class CrewkitFeatures {
 			// items:       new dev.agaminggod.arenaagents.crewkit.items.ItemsFeature(),
 			// flow:        new dev.agaminggod.arenaagents.crewkit.flow.FlowFeature(),
 			// cast:        new dev.agaminggod.arenaagents.crewkit.cast.CastFeature(),
+			new dev.agaminggod.arenaagents.crewkit.director.DirectorFeature()
 		);
 	}
 }

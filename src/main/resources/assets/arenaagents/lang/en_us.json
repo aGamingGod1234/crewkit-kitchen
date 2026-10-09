@@ -72,5 +72,8 @@
   "item.arenaagents.camera_dolly": "Tripod Camera",
   "block.arenaagents.camera_dolly": "Camera",
   "entity.arenaagents.camera_rig": "Tripod Camera",
-  "key.arenaagents.camera_controls": "Open Camera Controls"
+  "key.arenaagents.camera_controls": "Open Camera Controls",
+  "key.arenaagents.crewkit_next": "CrewKit camera: next mark",
+  "key.arenaagents.crewkit_prev": "CrewKit camera: previous mark",
+  "key.arenaagents.crewkit_release": "CrewKit camera: release"
 }

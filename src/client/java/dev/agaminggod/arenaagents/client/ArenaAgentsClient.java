@@ -18,6 +18,7 @@ public final class ArenaAgentsClient implements ClientModInitializer {
 		dev.agaminggod.arenaagents.client.control.PlanItemIcons.register();
 		CodexAgentRenderers.register();
 		CameraDirectorClient.register();
+		dev.agaminggod.arenaagents.client.crewkit.CrewkitCameraClient.register();
 		AgentControlClient.register();
 		PovClient.register();
 		OperatorInputSender.register();
