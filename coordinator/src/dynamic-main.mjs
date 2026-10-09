@@ -370,6 +370,13 @@ export class DynamicCoordinator extends EventEmitter {
 	get registry() { return this.#registry; }
 	get bridge() { return this.#bridge; }
 
+	// CrewKit Kitchen: push one crewkit_state event to the mod on the current connection. False when no server is connected.
+	async sendCrewkitState(payload) {
+		if (!this.#connected) return false;
+		await this.#sendForEpoch(this.#connectionEpoch, 'crewkit_state', 'server', payload);
+		return true;
+	}
+
 	/**
 	 * With the compact heard section present, a perception change made only of new raw sound packets is
 	 * already summarised there (and heard lava raises its own "heard" fact), so it is not attention by itself.
@@ -3939,6 +3946,11 @@ async function runCli(reporter = new RuntimeErrorReporter()) {
 	const disposeDiagnostics = wireRuntimeDiagnostics(coordinator, reporter);
 	try {
 		await startCoordinatorControl(coordinator, voiceSupervisor);
+		// CrewKit Kitchen: local run trigger + crewkit_state delivery. Optional; never blocks coordinator start.
+		try {
+			const { startCrewkitService } = await import('./crewkit/service.mjs');
+			await startCrewkitService({ sendState: (payload) => coordinator.sendCrewkitState(payload), logger: (message) => process.stderr.write(`[crewkit] ${message}\n`) });
+		} catch (crewkitError) { process.stderr.write(`[crewkit] trigger unavailable: ${crewkitError.message}\n`); }
 	} catch (error) {
 		await Promise.allSettled([coordinator.stop(), voiceSupervisor.close(), protocolAudit?.close()]);
 		disposeDiagnostics();

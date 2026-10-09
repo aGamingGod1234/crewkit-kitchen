@@ -58,6 +58,7 @@ export const COORDINATOR_TO_SERVER_TYPES = Object.freeze([
 	'agent_notice',
 	'verbose_event',
 	'task_view',
+	'crewkit_state',
 	'heartbeat',
 ]);
 
@@ -89,6 +90,7 @@ export const SERVER_TO_COORDINATOR_TYPES = Object.freeze([
 ]);
 
 const COORDINATOR_TYPES = new Set(COORDINATOR_TO_SERVER_TYPES);
+const CREWKIT_EVENT_SET = new Set(['brief', 'item_added', 'quote', 'gate_blocked', 'item_removed', 'gate_passed', 'checkout', 'completed', 'record', 'failed', 'expired', 'calls', 'reset']);
 const SERVER_TYPES = new Set(SERVER_TO_COORDINATOR_TYPES);
 const REVISION_GUARDED_INBOUND_TYPES = new Set(['observation', 'inspection_result', 'conversation_event', 'action_progress', 'action_result', 'goal_completion_result']);
 const REVISION_GUARDED_OUTBOUND_TYPES = new Set(['agent_ready', 'planning_state', 'goal_completed', 'conversation_wake_ack', 'request_observation', 'inspection_request', 'action_command', 'action_cancel', 'agent_error', 'verbose_event']);
@@ -410,6 +412,16 @@ function normalizeProtocolV2Payload(type, value) {
 				code: boundedText(value.code, 'code', MAX_REASON_CODE_LENGTH),
 				message: boundedText(value.message, 'message', MAX_RESULT_MESSAGE_LENGTH),
 			};
+		}
+		case 'crewkit_state': {
+			// CrewKit Kitchen event (docs/crewkit/CONTRACT.md). data is event-specific and stays a small object.
+			exactKeys(value, ['runId', 'seq', 'event', 'data'], ['runId', 'seq', 'event', 'data'], type);
+			requireIdentifier(value.runId, 'runId');
+			nonnegativeInteger(value.seq, 'seq');
+			if (!CREWKIT_EVENT_SET.has(value.event)) throw new ProtocolV2Error('INVALID_PAYLOAD', `crewkit_state event '${String(value.event)}' is not allowed`);
+			if (!isPlainObject(value.data)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'crewkit_state data must be an object');
+			if (Buffer.byteLength(JSON.stringify(value)) > 16_384) throw new ProtocolV2Error('INVALID_PAYLOAD', 'crewkit_state exceeds the wire budget');
+			return structuredClone(value);
 		}
 		case 'task_view_request':
 			exactKeys(value, ['goalRevision'], ['goalRevision'], type);
