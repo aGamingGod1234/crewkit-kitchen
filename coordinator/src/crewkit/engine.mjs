@@ -46,7 +46,7 @@ const needText = (n) => `${n.label} (${n.per === 'person' ? 'each' : n.per === '
 // Every available, priced product in the brief currency, in Reap's relevance order.
 // Reap reports the display name ("Popular Bookstore"), not the domain we search with ("popular.com.sg"),
 // so the one-merchant rule locks onto the merchant name of the first product picked.
-function pickable(products, currency, lockedMerchant) {
+export function pickable(products, currency, lockedMerchant) {
   return (products || []).filter((p) => {
     if (p.available === false || p.previewVariant?.available === false) return false;
     if (lockedMerchant && p.merchant?.name !== lockedMerchant) return false;
@@ -54,7 +54,7 @@ function pickable(products, currency, lockedMerchant) {
     if (price && typeof price === 'object' && price.currency && price.currency !== currency) return false;
     return toMoney(price, currency).amount > 0; // free gifts and unpriced listings are never part of a kit
   }).map((p) => ({
-    productId: p.id, variantId: p.previewVariant?.id ?? null, realName: p.name, merchant: p.merchant?.name || merchant || 'unknown',
+    productId: p.id, variantId: p.previewVariant?.id ?? null, realName: p.name, merchant: p.merchant?.name || 'unknown',
     unitPrice: toMoney(p.previewVariant?.price ?? p.priceRange?.min, currency),
   }));
 }

@@ -15,7 +15,7 @@ const tape = JSON.parse(readFileSync(path.join(here, 'fixtures', 'crewkit-handma
 const { evaluateGate, planRework, quoteTotals, checkRequirements, validateQuoteItems } = await import('../src/crewkit/gate.mjs');
 const { mapToMcItem } = await import('../src/crewkit/mapping.mjs');
 const { startRun } = await import('../src/crewkit/runner.mjs');
-const { runCrewkit } = await import('../src/crewkit/engine.mjs');
+const { runCrewkit, pickable } = await import('../src/crewkit/engine.mjs');
 const { replayApi, recordingApi } = await import('../src/crewkit/tape.mjs');
 const { createEventStream } = await import('../src/crewkit/events.mjs');
 
@@ -427,4 +427,10 @@ test('chef voice runs from the runner on the real tape and CREWKIT_CHEF_VOICE=0 
   } finally {
     if (saved === undefined) delete process.env.CREWKIT_CHEF_VOICE; else process.env.CREWKIT_CHEF_VOICE = saved;
   }
+});
+
+test('edge 1: a search result without merchant.name maps to merchant unknown instead of throwing', () => {
+  const opts = pickable([{ id: 'p1', name: 'Pen', previewVariant: { id: 'v1', price: SGD(1.5) } }], 'SGD', null);
+  assert.equal(opts.length, 1);
+  assert.equal(opts[0].merchant, 'unknown');
 });
