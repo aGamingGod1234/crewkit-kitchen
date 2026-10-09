@@ -105,7 +105,14 @@ public final class FlowFeature implements CrewkitFeature {
 
 	/** Ghost copies of cart items on their destination plates: key = item + occurrence, value = live ghost. */
 	private final Map<String, Ghost> ghosts = new LinkedHashMap<>();
-	private static final double GHOST_SCALE = 0.35;
+	private static final double ITEM_SCALE = 0.3;
+	/** Lift of a laid item's centre above the surface it rests on, so its low edge clears the plate. */
+	private static final double ITEM_LIFT = 0.09;
+	private static final double TRAY_H = 0.06;
+	/** Table min corners (x, z), 4 wide by 2 deep; same as SetBuilder.TABLES. */
+	private static final int[][] TABLES = {{4, 12}, {12, 12}, {20, 12}, {8, 16}, {16, 16}};
+	private static final int TABLE_W = 4;
+	private static final int TABLE_D = 2;
 
 	private record Ghost(String tag, String mcItem, Pos pos) {}
 
@@ -508,24 +515,19 @@ public final class FlowFeature implements CrewkitFeature {
 		later(t + 22, () -> setTransform(server, "ck_flow_bag", scaleOnly(1.6), 4));
 
 		long start = t + 26;
-		int[] perSeatCount = new int[CrewkitAnchors.SEATS.length];
 		List<Wave> waves = buildWaves(items);
+		List<List<Placement>> plan = layout(waves);
 		for (int w = 0; w < waves.size(); w++) {
 			Wave wave = waves.get(w);
 			long at = start + w * 18L;
 			final int li = w;
 			later(at, () -> sound(server, "item.bundle.remove_one", floor, 0.8, 1.1 + 0.03 * li));
-			List<Pos> targets = new ArrayList<>();
-			if (wave.perPlate()) {
-				for (int s : wave.seats()) targets.add(plateSlot(s, perSeatCount[s]++));
-			} else if (wave.seats().isEmpty()) {
-				targets.add(rel(14.0, PLATE_Y, 13.0)); // centre of table B (blocks x 12..15, z 12..13)
-			} else {
-				targets.add(trayPos(server, wave.seats(), at));
-			}
+			List<Placement> targets = plan.get(w);
 			for (int k = 0; k < targets.size(); k++) {
-				fly(server, wave.mcItem(), floor, targets.get(k), at + k);
-				Ghost g = takeGhost(pendingGhosts, wave.mcItem(), targets.get(k));
+				Placement pl = targets.get(k);
+				if (pl.tray() != null) spawnTray(server, pl, at);
+				fly(server, wave.mcItem(), floor, pl.item(), at + k);
+				Ghost g = takeGhost(pendingGhosts, wave.mcItem(), pl.item());
 				// The ghost fades just as the solid item lands on it: ghost = in cart, solid = paid.
 				if (g != null) later(at + k + 19, () -> fadeGhost(server, g));
 			}
@@ -549,38 +551,85 @@ public final class FlowFeature implements CrewkitFeature {
 		String tag = "ck_flow_it_" + (itemSerial++);
 		double hop = 3.0 + Math.min(2.0, Math.hypot(to.x - from.x, to.z - from.z) / 10.0);
 		later(at, () -> run(server, "summon minecraft:item_display " + from.up(0.6) + " {" + tags(tag, "ck_flow_item")
-			+ ",item:{id:\"" + mcItem + "\",count:1},billboard:\"vertical\",teleport_duration:5"
-			+ ",brightness:{sky:15,block:15},transformation:" + scaleOnly(0.45) + "}"));
+			+ ",item:{id:\"" + mcItem + "\",count:1},teleport_duration:5"
+			+ ",brightness:{sky:15,block:15},transformation:" + laid(ITEM_SCALE) + "}"));
 		for (int i = 1; i <= 4; i++) {
 			double s = i / 4.0;
 			double arc = 4 * hop * s * (1 - s);
-			Pos p = new Pos(from.x + (to.x - from.x) * s, from.y + 0.6 + (to.y + 0.22 - from.y - 0.6) * s + arc, from.z + (to.z - from.z) * s);
+			Pos p = new Pos(from.x + (to.x - from.x) * s, from.y + 0.6 + (to.y - from.y - 0.6) * s + arc, from.z + (to.z - from.z) * s);
 			later(at + 1 + (i - 1) * 5L, () -> tp(server, tag, p));
 		}
 		later(at + 21, () -> sound(server, "entity.item_frame.add_item", to, 0.8, 1.0));
 	}
 
-	private Pos trayCentre(List<Integer> seats) {
-		double x = 0, z = 0;
-		for (int s : seats) {
-			Pos p = platePos(s);
-			x += p.x;
-			z += p.z;
+	/** Where one delivered item rests; tray is the tray's surface centre for shared items, else null. */
+	private record Placement(Pos item, Pos tray, double trayW) {}
+
+	/**
+	 * Final resting spot of every item, wave by wave. Delivery and ghosts both use this, so a solid item
+	 * lands exactly where its ghost stood. Plates hold up to 3 items in a row or triangle, 4+ in a 2x2 grid;
+	 * shared items go on a tray lying flat on a real table cloth.
+	 */
+	private List<List<Placement>> layout(List<Wave> waves) {
+		int[] total = new int[CrewkitAnchors.SEATS.length];
+		for (Wave w : waves) if (w.perPlate()) for (int s : w.seats()) total[s]++;
+		int[] used = new int[CrewkitAnchors.SEATS.length];
+		Map<String, Integer> traysAt = new LinkedHashMap<>();
+		List<List<Placement>> out = new ArrayList<>();
+		for (Wave w : waves) {
+			List<Placement> list = new ArrayList<>();
+			if (w.perPlate()) {
+				for (int s : w.seats()) list.add(new Placement(plateSlot(s, used[s]++, total[s]), null, 0));
+			} else {
+				double width = w.seats().size() == 2 ? 0.8 : 1.0;
+				boolean pair = !w.seats().isEmpty() && w.seats().size() <= 2;
+				int[] table = pair ? tableOf(w.seats().get(0)) : TABLES[1];
+				double x = table[0] + TABLE_W / 2.0;
+				if (pair) {
+					double sx = 0;
+					int n = 0;
+					for (int s : w.seats()) {
+						if (tableOf(s) == table) { sx += CrewkitAnchors.SEATS[s][0]; n++; }
+					}
+					x = sx / n;
+				}
+				// Several trays on one table spread along its long axis instead of stacking.
+				int nth = traysAt.merge(table[0] + "," + table[1], 1, Integer::sum) - 1;
+				x += (nth % 2 == 1 ? 1 : -1) * ((nth + 1) / 2) * (width + 0.15);
+				x = Math.max(table[0] + width / 2 + 0.05, Math.min(table[0] + TABLE_W - width / 2 - 0.05, x));
+				Pos tray = rel(x, PLATE_Y, table[1] + TABLE_D / 2.0);
+				list.add(new Placement(tray.up(TRAY_H + ITEM_LIFT), tray, width));
+			}
+			out.add(list);
 		}
-		return new Pos(x / seats.size(), CrewkitAnchors.origin.getY() + PLATE_Y, z / seats.size());
+		return out;
 	}
 
-	private Pos trayPos(MinecraftServer server, List<Integer> seats, long at) {
-		Pos tray = trayCentre(seats);
+	/** Table cell (min corner) under a seat's plate; mirrors SetBuilder.TABLES. */
+	private static int[] tableOf(int seat) {
+		double[] s = CrewkitAnchors.SEATS[seat];
+		double px = s[0];
+		double pz = s[1] + (s[2] == 0 ? 0.85 : -0.85);
+		for (int[] t : TABLES) {
+			if (px >= t[0] && px <= t[0] + TABLE_W && pz >= t[1] && pz <= t[1] + TABLE_D) return t;
+		}
+		return TABLES[1];
+	}
+
+	private void spawnTray(MinecraftServer server, Placement pl, long at) {
 		String tag = "ck_flow_tray_" + (itemSerial++);
-		double w = seats.size() == 2 ? 0.8 : 1.0;
 		later(Math.max(0, at - 4), () -> {
-			run(server, "summon minecraft:block_display " + tray + " {" + tags(tag)
-				+ ",block_state:{Name:\"minecraft:spruce_planks\"},brightness:{sky:15,block:15}"
+			run(server, "summon minecraft:block_display " + pl.tray() + " {" + tags(tag)
+				+ ",block_state:{Name:\"minecraft:spruce_planks\"},brightness:{sky:15,block:15},Rotation:[0f,0f]"
 				+ ",transformation:" + box(0.01, 0.01, 0.01) + "}");
-			later(1, () -> setTransform(server, tag, box(w, 0.06, 0.5), 4));
+			later(1, () -> setTransform(server, tag, box(pl.trayW(), TRAY_H, 0.5), 4));
 		});
-		return tray.up(0.06);
+	}
+
+	/** Item lying back on the table, tipped up 30 degrees toward the camera (south). */
+	private static String laid(double s) {
+		return "{left_rotation:[-0.5f,0f,0f,0.8660254f],right_rotation:[0f,0f,0f,1f],translation:[0f,0f,0f],scale:["
+			+ f(s) + "f," + f(s) + "f," + f(s) + "f]}";
 	}
 
 	private List<DeliveryItem> collectDelivery() {
@@ -619,20 +668,13 @@ public final class FlowFeature implements CrewkitFeature {
 	/** Where each cart item will be plated, using the same layout as delivery. Shared items sit on the tray spot. */
 	private Map<String, Pos> ghostTargets() {
 		Map<String, Pos> out = new LinkedHashMap<>();
-		int[] perSeatCount = new int[CrewkitAnchors.SEATS.length];
-		for (Wave wave : buildWaves(ledgerDelivery())) {
-			List<Pos> targets = new ArrayList<>();
-			if (wave.perPlate()) {
-				for (int s : wave.seats()) targets.add(plateSlot(s, perSeatCount[s]++));
-			} else if (wave.seats().isEmpty()) {
-				targets.add(rel(14.0, PLATE_Y, 13.0));
-			} else {
-				targets.add(trayCentre(wave.seats()).up(0.06));
-			}
-			for (Pos p : targets) {
+		List<Wave> waves = buildWaves(ledgerDelivery());
+		List<List<Placement>> plan = layout(waves);
+		for (int w = 0; w < waves.size(); w++) {
+			for (Placement pl : plan.get(w)) {
 				int n = 0;
-				while (out.containsKey(wave.mcItem() + "#" + n)) n++;
-				out.put(wave.mcItem() + "#" + n, p);
+				while (out.containsKey(waves.get(w).mcItem() + "#" + n)) n++;
+				out.put(waves.get(w).mcItem() + "#" + n, pl.item());
 			}
 		}
 		return out;
@@ -651,7 +693,7 @@ public final class FlowFeature implements CrewkitFeature {
 		}
 		int born = 0;
 		for (Map.Entry<String, Pos> e : want.entrySet()) {
-			Pos p = e.getValue().up(0.22);
+			Pos p = e.getValue();
 			Ghost old = ghosts.get(e.getKey());
 			if (old != null) {
 				if (Math.abs(old.pos().x - p.x) + Math.abs(old.pos().y - p.y) + Math.abs(old.pos().z - p.z) > 0.01) {
@@ -665,16 +707,16 @@ public final class FlowFeature implements CrewkitFeature {
 			ghosts.put(e.getKey(), g);
 			// Dim, small and slightly see-through-looking: low light, no glow, ground mode.
 			run(server, "summon minecraft:item_display " + p + " {" + tags(g.tag(), "ck_flow_ghost")
-				+ ",item:{id:\"" + mcItem + "\",count:1},billboard:\"vertical\",teleport_duration:10,view_range:0.6f"
+				+ ",item:{id:\"" + mcItem + "\",count:1},teleport_duration:10"
 				+ ",brightness:{sky:4,block:2},transformation:" + scaleOnly(0.01) + "}");
 			final int delay = 2 + Math.min(10, born++ / 2);
-			later(delay, () -> setTransform(server, g.tag(), scaleOnly(GHOST_SCALE), 6));
+			later(delay, () -> setTransform(server, g.tag(), laid(ITEM_SCALE), 6));
 		}
 		if (born > 0) sound(server, "block.amethyst_block.chime", rel(14.0, 3.0, 13.0), 0.35, 1.8);
 	}
 
 	private static Ghost takeGhost(Map<String, Ghost> pending, String mcItem, Pos target) {
-		Pos p = target.up(0.22);
+		Pos p = target;
 		String best = null;
 		double bestD = 0.05;
 		for (Map.Entry<String, Ghost> e : pending.entrySet()) {
@@ -741,11 +783,17 @@ public final class FlowFeature implements CrewkitFeature {
 		return rel(s[0], PLATE_Y, s[1] + dz);
 	}
 
-	private Pos plateSlot(int seat, int k) {
+	/** k-th of {@code total} items on a seat's 0.6 plate: one centred, a row of 2, a triangle of 3, else a 2x2 grid. */
+	private Pos plateSlot(int seat, int k, int total) {
 		Pos c = platePos(seat);
-		double[][] slots = {{-0.13, 0.0}, {0.13, 0.0}, {0.0, -0.13}, {0.0, 0.13}};
+		double[][] slots = switch (Math.max(1, total)) {
+			case 1 -> new double[][] {{0, 0}};
+			case 2 -> new double[][] {{-0.15, 0}, {0.15, 0}};
+			case 3 -> new double[][] {{-0.15, -0.13}, {0.15, -0.13}, {0, 0.13}};
+			default -> new double[][] {{-0.15, -0.13}, {0.15, -0.13}, {-0.15, 0.13}, {0.15, 0.13}};
+		};
 		double[] o = slots[k % slots.length];
-		return new Pos(c.x + o[0], c.y + 0.05 + 0.12 * (k / slots.length), c.z + o[1]);
+		return new Pos(c.x + o[0], c.y + 0.05 + ITEM_LIFT + 0.1 * (k / slots.length), c.z + o[1]);
 	}
 
 	// ---------------------------------------------------------------- failed / expired
