@@ -28,7 +28,11 @@ public final class BoardsFeature implements CrewkitFeature {
 	/** Number scale while it shows "CART S$x" (longer text than a plain amount). */
 	private static final float CART_SCALE = 3.4f;
 	private static final int MAX_ROLL_SOUNDS = 8;
-	private static final int STATUS_MAX = 30;
+	private static final int STATUS_MAX = 18;
+	private static final int ORDER_ROW = 4;
+	private static final int ORDER_LINE = 15;
+	private static final float VALUE_SCALE = 2.6f;
+	private static final float ORDER_SCALE = 2.2f;
 	private static final int TYPE_CHARS_PER_TICK = 2;
 
 	private static final String[] ROW_LABELS = {"BUDGET", "QUOTED", "CHARGED", "VARIANCE", "ORDER"};
@@ -114,16 +118,14 @@ public final class BoardsFeature implements CrewkitFeature {
 				JsonObject left = object(data, "budgetRemaining");
 				double value = left != null ? amount(left) : budget - amount(object(data, "total"));
 				rollTo(value, ROLL_TICKS, now);
-				JsonObject shipping = object(data, "shipping");
-				setStatus("QUOTED " + CrewkitText.money(amount(object(data, "total")), currency)
-						+ (shipping != null ? " (SHIP " + CrewkitText.money(amount(shipping), currency) + ")" : ""), CrewkitText.WHITE);
+								setStatus("QUOTED " + CrewkitText.money(amount(object(data, "total")), currency), CrewkitText.WHITE);
 			}
 			case "gate_blocked" -> {
 				ensureBudgetBoard(server);
 				priced = true;
 				double over = Math.abs(amount(object(data, "over")));
 				rollTo(-over, ROLL_TICKS + 6, now);
-				setStatus("OVER BY " + CrewkitText.money(over, currency) + " - BLOCKED", CrewkitText.RED);
+				setStatus("OVER " + CrewkitText.money(over, currency), CrewkitText.RED);
 				track.merge("{block_state:{Name:\"minecraft:red_concrete\"}}");
 				pulse(number, NUMBER_SCALE, 1.15f);
 			}
@@ -132,19 +134,19 @@ public final class BoardsFeature implements CrewkitFeature {
 				priced = true;
 				double total = amount(object(data, "total"));
 				rollTo(budget - total, ROLL_TICKS + 6, now);
-				setStatus("WITHIN BUDGET - " + CrewkitText.money(total, currency), CrewkitText.GREEN);
+				setStatus("WITHIN BUDGET", CrewkitText.GREEN);
 				track.merge("{block_state:{Name:\"minecraft:gray_concrete\"}}");
 			}
 			case "checkout" -> {
 				ensureBudgetBoard(server);
-				setStatus("WAITING FOR HUMAN APPROVAL", CrewkitText.BLUE);
+				setStatus("AWAITING APPROVAL", CrewkitText.BLUE);
 			}
 			case "completed" -> {
 				ensureBudgetBoard(server);
 				priced = true;
 				JsonObject paid = object(data, "finalAmount");
 				if (paid != null) rollTo(budget - amount(paid), ROLL_TICKS, now);
-				setStatus("ORDER PLACED - " + (paid != null ? CrewkitText.money(amount(paid), currency) : ""), CrewkitText.GREEN);
+				setStatus(paid != null ? "PLACED " + CrewkitText.money(amount(paid), currency) : "PLACED", CrewkitText.GREEN);
 				stopTimer(now, CrewkitText.GREEN);
 			}
 			case "failed", "expired" -> {
@@ -227,11 +229,11 @@ public final class BoardsFeature implements CrewkitFeature {
 		sandbox = CrewkitDisplays.text(server, new Vec3(x + 3.1, y + 2.2, z), TAG, CrewkitText.of(" LIVE SANDBOX ", CrewkitText.WHITE, true), 0.85f,
 				"background:" + CrewkitText.argb(255, 0xC2410C));
 		number = CrewkitDisplays.text(server, new Vec3(x, y + 0.45, z), TAG, CrewkitText.of(CrewkitText.money(0, currency), CrewkitText.GREEN, true), NUMBER_SCALE, "");
-		status = CrewkitDisplays.text(server, new Vec3(x, y - 0.1, z), TAG, CrewkitText.of("", CrewkitText.MUTED, false), 1.6f, "");
+		status = CrewkitDisplays.text(server, new Vec3(x, y - 0.1, z), TAG, CrewkitText.of("", CrewkitText.MUTED, false), 2.6f, "");
 		track = CrewkitDisplays.block(server, new Vec3(x - BAR_WIDTH / 2, y - 0.75, z - 0.02), TAG, "minecraft:gray_concrete", BAR_WIDTH, BAR_HEIGHT, 0.01f, "");
 		fill = CrewkitDisplays.block(server, new Vec3(x - BAR_WIDTH / 2, y - 0.75, z - 0.005), TAG, "minecraft:lime_concrete", 0.001f, BAR_HEIGHT, 0.01f, "");
-		timer = CrewkitDisplays.text(server, new Vec3(x - 2.2, y - 1.7, z), TAG, label("TICKET 00:00", CrewkitText.WHITE), 1.9f, "");
-		calls = CrewkitDisplays.text(server, new Vec3(x + 2.2, y - 1.7, z), TAG, callsText(0), 1.9f, "");
+		timer = CrewkitDisplays.text(server, new Vec3(x, y - 1.55, z), TAG, label("TICKET 00:00", CrewkitText.WHITE), 2.5f, "");
+		calls = CrewkitDisplays.text(server, new Vec3(x, y - 2.1, z), TAG, callsText(0), 2.5f, "");
 		lastFillWidth = 0.001f;
 		lastFillBlock = "minecraft:lime_concrete";
 	}
@@ -284,7 +286,7 @@ public final class BoardsFeature implements CrewkitFeature {
 	}
 
 	private void setStatus(String text, int color) {
-		// One line, inside the 9-block board at scale 1.6 (about 32 bold glyphs); clip instead of wrapping into the number.
+		// One line, inside the 9-block board at scale 2.6 (about 18 bold glyphs); clip instead of wrapping into the number.
 		if (status != null) status.text(CrewkitText.of(clip(text, STATUS_MAX), color, true));
 	}
 
@@ -300,7 +302,7 @@ public final class BoardsFeature implements CrewkitFeature {
 		callCount = Math.max(0, count);
 		calls.text(callsText(callCount));
 		if (!animate) return;
-		pulse(calls, 1.9f, 1.25f);
+		pulse(calls, 2.5f, 1.15f);
 		CrewkitSounds.play(server, calls.pos(), "minecraft:ui.button.click", 0.4f, 1.6f);
 	}
 
@@ -326,12 +328,14 @@ public final class BoardsFeature implements CrewkitFeature {
 		Vec3 a = CrewkitAnchors.at(CrewkitAnchors.LEDGER);
 		double x = a.x, y = a.y, z = a.z + WALL_FRONT;
 		billPanel = CrewkitDisplays.block(server, new Vec3(x - 5, y - 2.4, z - 0.04), TAG, "minecraft:black_concrete", 10f, 5.1f, 0.02f, "");
-		billTitle = CrewkitDisplays.text(server, new Vec3(x, y + 1.85, z), TAG, CrewkitText.of("THE BILL", CrewkitText.WHITE, true), 2.4f, "");
-		for (int i = 0; i < ROW_LABELS.length; i++) {
-			double rowY = y + 1.0 - i * 0.78;
-			rowLabels[i] = CrewkitDisplays.text(server, new Vec3(x - 2.7, rowY, z), TAG, CrewkitText.of(ROW_LABELS[i], CrewkitText.MUTED, true), 1.9f, "");
-			rowValues[i] = CrewkitDisplays.text(server, new Vec3(x + 1.9, rowY, z), TAG, CrewkitText.of("-", CrewkitText.MUTED, true), 2.1f, "");
+		billTitle = CrewkitDisplays.text(server, new Vec3(x, y + 1.9, z), TAG, CrewkitText.of("THE BILL", CrewkitText.WHITE, true), 2.8f, "");
+		// Four numeric rows; the order id has no label and sits centred on two lines along the bottom.
+		for (int i = 0; i < ORDER_ROW; i++) {
+			double rowY = y + 1.15 - i * 0.7;
+			rowLabels[i] = CrewkitDisplays.text(server, new Vec3(x - 2.7, rowY, z), TAG, CrewkitText.of(ROW_LABELS[i], CrewkitText.MUTED, true), 2.4f, "");
+			rowValues[i] = CrewkitDisplays.text(server, new Vec3(x + 2.2, rowY, z), TAG, CrewkitText.of("-", CrewkitText.MUTED, true), VALUE_SCALE, "");
 		}
+		rowValues[ORDER_ROW] = CrewkitDisplays.text(server, new Vec3(x, y - 2.3, z), TAG, CrewkitText.of("-", CrewkitText.MUTED, true), ORDER_SCALE, "");
 	}
 
 	private void stampRecord(MinecraftServer server, JsonObject data) {
@@ -348,7 +352,7 @@ public final class BoardsFeature implements CrewkitFeature {
 				CrewkitText.money(quoted, cur),
 				CrewkitText.money(charged, cur),
 				(variance > 0.004 ? "+" : "") + CrewkitText.money(variance, cur),
-				orderId == null ? "-" : clip(orderId, 18),
+				orderId == null ? "-" : twoLines(orderId, ORDER_LINE),
 		};
 		int[] colors = {CrewkitText.WHITE, CrewkitText.WHITE, CrewkitText.WHITE, verdict, CrewkitText.BLUE};
 		int at = 1;
@@ -356,7 +360,7 @@ public final class BoardsFeature implements CrewkitFeature {
 			CrewkitDisplay value = rowValues[i];
 			String full = values[i];
 			int color = colors[i];
-			float rest = i == 4 ? 1.7f : 2.1f;
+			float rest = i == ORDER_ROW ? ORDER_SCALE : VALUE_SCALE;
 			CrewkitSchedule.after(at, () -> value.transform(rest, 0, 0, 0, 0));
 			// Typewriter: two characters per tick behind a cursor, a soft key click every few characters.
 			int steps = (full.length() + TYPE_CHARS_PER_TICK - 1) / TYPE_CHARS_PER_TICK;
@@ -412,6 +416,16 @@ public final class BoardsFeature implements CrewkitFeature {
 	private static String string(JsonObject data, String key) {
 		JsonElement element = data == null ? null : data.get(key);
 		return element != null && element.isJsonPrimitive() ? element.getAsString() : null;
+	}
+
+	/** Splits an order id into centred lines of at most {@code width} chars (two for real ids). */
+	private static String twoLines(String text, int width) {
+		StringBuilder out = new StringBuilder();
+		for (int i = 0; i < text.length(); i += width) {
+			if (i > 0) out.append('\n');
+			out.append(text, i, Math.min(text.length(), i + width));
+		}
+		return out.toString();
 	}
 
 	private static String clip(String text, int max) {

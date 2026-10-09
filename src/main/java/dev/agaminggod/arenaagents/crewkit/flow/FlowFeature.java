@@ -342,7 +342,7 @@ public final class FlowFeature implements CrewkitFeature {
 			Pos label = rel(cx, QR_Y + QR_TILES + 0.2, PASS_Z - 0.2);
 			run(server, "summon minecraft:text_display " + label + " {" + tags("ck_flow_qr_label")
 				+ ",billboard:\"vertical\",shadow:0b,line_width:240,brightness:{sky:15,block:15},background:" + argb(0xE0102A8C)
-				+ ",transformation:" + scaleOnly(1.1)
+				+ ",transformation:" + scaleOnly(1.3)
 				+ ",text:{text:\"SCAN TO APPROVE ON REAP\",color:\"#FFFFFF\",bold:true}}");
 			sound(server, "block.amethyst_block.chime", rel(cx, cy, PASS_Z), 1.0, 1.0);
 		});

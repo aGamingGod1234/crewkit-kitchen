@@ -9,11 +9,11 @@ import java.util.Locale;
 /** SNBT text components, the board palette, and money formatting for display entities. */
 public final class CrewkitText {
 	public static final int WHITE = 0xF4F1EA;
-	public static final int MUTED = 0x9AA0A6;
+	public static final int MUTED = 0xC4CAD0;
 	public static final int GREEN = 0x3DDC84;
 	public static final int AMBER = 0xFFB020;
 	public static final int RED = 0xFF4D3D;
-	public static final int BLUE = 0x6E8BFF;
+	public static final int BLUE = 0x9DB2FF;
 
 	private CrewkitText() {}
 
