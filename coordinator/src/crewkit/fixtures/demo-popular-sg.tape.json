@@ -1,17 +1,17 @@
 {
   "version": 1,
-  "recordedAt": "2026-10-09T08:23:55.913Z",
-  "note": "search entries are REAL Reap sandbox responses (popular.com.sg / \"Popular Bookstore\", SGD) recorded 2026-10-09T08:23:55.913Z. createQuote/getQuote/createCheckout/getCheckout are SYNTHETIC (prices from those searches, shipping 4 SGD assumed) because REAP_EMAIL is not set yet. Re-record with a simulate run once it is.",
+  "recordedAt": "2026-10-09T09:34:02.477Z",
+  "note": "REAL Reap sandbox run ck-mv0rqdbe-634dea (simulate mode, hosted approval by a human), recorded 2026-10-09T09:34:02.477Z, order ord_01M4G0J3JSEP31G7NASSA0K649, S$102.75 of S$105. Approval URLs redacted. Repeated REQUIRES_ACTION polls while waiting for approval trimmed to 8.",
   "entries": [
     {
       "op": "search",
       "key": "name badge holder",
-      "ms": 944,
+      "ms": 1009,
       "response": {
-        "id": "qry_164665a6d8ba4a42b5a0a7f2fd0d5146",
+        "id": "qry_7ac7e5dc23154ef3a977b7cf0516607d",
         "products": [
           {
-            "id": "prd_1d802f9443964e7b8c1d4efae06c7505",
+            "id": "prd_e2a42320338a42a08946dae94b911033",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -29,7 +29,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_148b869b93a94d5396478b4e6d59228d",
+              "id": "var_bd963965908e4150b47f2acfd460d130",
               "price": {
                 "amount": 3.15,
                 "currency": "SGD"
@@ -38,7 +38,7 @@
             }
           },
           {
-            "id": "prd_6fb4da62d4b44032b72094943b7ea003",
+            "id": "prd_73315c90e1b342a696f8000b4a65499f",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -56,7 +56,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_574b2f3bf21b4f52a640ec1ca3be9df4",
+              "id": "var_3d4e1a43309e49e596b003542f0cb07b",
               "price": {
                 "amount": 2.65,
                 "currency": "SGD"
@@ -65,7 +65,7 @@
             }
           },
           {
-            "id": "prd_a77aaf95c7c94e719623b67924150396",
+            "id": "prd_0974be9cee394974b9569271d284f057",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -83,7 +83,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_fe1e306897c848a0905cdcaf10cbe4a5",
+              "id": "var_79bc6545540345439fe5edc4ff1e5247",
               "price": {
                 "amount": 29,
                 "currency": "SGD"
@@ -92,7 +92,7 @@
             }
           },
           {
-            "id": "prd_6eeb0533a019402c9b6927b2478db59a",
+            "id": "prd_7c284e5039ac444b8d27eec8bd18fc8c",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -110,7 +110,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_97b38c3a19fc4040bbbeb641bfd99623",
+              "id": "var_5059d97b1b774d0880517479ef2c084f",
               "price": {
                 "amount": 2.65,
                 "currency": "SGD"
@@ -119,7 +119,7 @@
             }
           },
           {
-            "id": "prd_642c2e99d087426887c47434aade5fd9",
+            "id": "prd_6dbc4bed559b46d8acd8338846973377",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -137,7 +137,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_24ee4734f73a442da7a214563b1d2f4c",
+              "id": "var_7892ed1ba4a24571a17065460becf115",
               "price": {
                 "amount": 1.9,
                 "currency": "SGD"
@@ -146,7 +146,7 @@
             }
           },
           {
-            "id": "prd_80bf5a02ec8440b8acfb0c9bbb5051af",
+            "id": "prd_c9b23b44195746b98bca04f35b8ddd2f",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -164,7 +164,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_4a5d20690fde4c32a2dc7f60c40b8f64",
+              "id": "var_1d0d56c9677648e38d8bdcd4551f664f",
               "name": "BLUE",
               "price": {
                 "amount": 0.45,
@@ -174,7 +174,7 @@
             }
           },
           {
-            "id": "prd_95707a744ff64a1c99dd4f93697aa842",
+            "id": "prd_9012fb3b493041c0b044ca6d86075178",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -192,7 +192,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_410acbc7406b455e89b3e42dc1ac5833",
+              "id": "var_1ccdc294ea78490f8ac94b1933c57b29",
               "name": "BLACK",
               "price": {
                 "amount": 3.85,
@@ -202,7 +202,7 @@
             }
           },
           {
-            "id": "prd_3adcacff8f934c90afd1965ff1686362",
+            "id": "prd_313fa644bd8c4dc5a6ca41b6dc2c757b",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -220,7 +220,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_0d850a55dcbe429e885c7d188a1a4634",
+              "id": "var_dfcd72a9928046b0ab4ed4a530a3731f",
               "price": {
                 "amount": 2.65,
                 "currency": "SGD"
@@ -229,7 +229,7 @@
             }
           },
           {
-            "id": "prd_b909964a22a0470aad149806dc7da379",
+            "id": "prd_2bdbda4d001944ce906e2978bf16b1bd",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -247,7 +247,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_8225d74a6a7d4e2684cfc0ee0d940941",
+              "id": "var_d260559947e34655b0983486cb7adf9e",
               "price": {
                 "amount": 0.45,
                 "currency": "SGD"
@@ -256,7 +256,7 @@
             }
           },
           {
-            "id": "prd_b9830bdb16ea496393d802053ab23c0f",
+            "id": "prd_0a060d12bcd849418860219b8c4fa139",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -274,7 +274,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_43df126a4ee84d60a2942edd5cd2f49e",
+              "id": "var_45778a78c02a4c2c97535e0f0140f787",
               "price": {
                 "amount": 0.4,
                 "currency": "SGD"
@@ -294,12 +294,12 @@
     {
       "op": "search",
       "key": "a5 notebook",
-      "ms": 687,
+      "ms": 762,
       "response": {
-        "id": "qry_ee8b9a64b0984dfd8f8b1d2b4addbee4",
+        "id": "qry_32028813145c43f1989188a23875d076",
         "products": [
           {
-            "id": "prd_db8e877e24bd46a7a5c6915e57bb0ca1",
+            "id": "prd_98ebd1b306704d32be50f2f9ac3759b2",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -317,7 +317,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_353bd48c89fa4fca8f87b6ba63ddb646",
+              "id": "var_ff1256f4882f44dd9ef47e28dab72a5f",
               "price": {
                 "amount": 5.6,
                 "currency": "SGD"
@@ -326,7 +326,7 @@
             }
           },
           {
-            "id": "prd_134c1be0a42d450f91fa843f247ca673",
+            "id": "prd_5134ba8f27ea4b318a25be7ccc8d1590",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -344,7 +344,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_b9f07ddd859a4c16a45a07419cada18a",
+              "id": "var_52c9db51fa184e8f99885dc90e8d3b75",
               "price": {
                 "amount": 5.6,
                 "currency": "SGD"
@@ -353,7 +353,7 @@
             }
           },
           {
-            "id": "prd_383095f4f77a42c0a9e07224623dc580",
+            "id": "prd_d086830b579c47f2b19467663f36be30",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -371,7 +371,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_e68eb824810d49a6bc54f04c9654503f",
+              "id": "var_8086a2e3c5e1446b926bfafe4e907c0e",
               "price": {
                 "amount": 14.9,
                 "currency": "SGD"
@@ -380,7 +380,7 @@
             }
           },
           {
-            "id": "prd_1063de499dcf45a789bc1854d9ebe9d5",
+            "id": "prd_27de8fd324914f4aa02c66fe17bb7cb9",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -398,7 +398,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_0d45bbbff8f24e23b14f377e918bf8c4",
+              "id": "var_dd928b92e43541539c81c4fe09b35062",
               "price": {
                 "amount": 14.9,
                 "currency": "SGD"
@@ -407,7 +407,7 @@
             }
           },
           {
-            "id": "prd_88e0eecb34e34c428b7b766d2632adcf",
+            "id": "prd_928de68cba9b4ce7b248ad2d936f32bc",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -425,7 +425,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_6cf5b4a8df294dfba3f82d5a4e8ca2f3",
+              "id": "var_8f188f808d494b45bf9f789825623a3e",
               "name": "Peek-a-boo",
               "price": {
                 "amount": 7.9,
@@ -435,7 +435,7 @@
             }
           },
           {
-            "id": "prd_3ef6c6f326bf4a2c84a9c3125206d8f1",
+            "id": "prd_11b2109daf0149e090a93a936c65d252",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -453,7 +453,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_695b4c9238054331b4c4116ff1c6cc6f",
+              "id": "var_0786afefde994fbbacd2933771cdb948",
               "price": {
                 "amount": 2.6,
                 "currency": "SGD"
@@ -462,7 +462,7 @@
             }
           },
           {
-            "id": "prd_96ed8a427f1d41029155a59f6ea8964e",
+            "id": "prd_5c22d30d18144454bbef138d3d2f32eb",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -480,7 +480,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_bdb22ea234fa4427b7af0c538c703e64",
+              "id": "var_3acfb84c89c149c9bb7f9abdd8a74595",
               "name": "Outdoor_Rabbit",
               "price": {
                 "amount": 8.9,
@@ -490,7 +490,7 @@
             }
           },
           {
-            "id": "prd_7fcaf9cea81e4839a0ae6c6e3cee31d7",
+            "id": "prd_62c03c8d6c734648868d110308dcb5e0",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -508,7 +508,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_35b10769fe17460a83af9c510b231fdc",
+              "id": "var_a33d08f31b5445f482d1cd8fc3fcc118",
               "price": {
                 "amount": 6.3,
                 "currency": "SGD"
@@ -517,7 +517,7 @@
             }
           },
           {
-            "id": "prd_689dc10a3c2649e9bc64636a4ab2ed20",
+            "id": "prd_bd6d16e690a54b42850985887e1ddf1e",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -535,7 +535,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_459a833772954c51a23776182cff7c89",
+              "id": "var_4c3173b1fd754f4181a275740e3736f4",
               "name": "A5",
               "price": {
                 "amount": 12,
@@ -556,12 +556,12 @@
     {
       "op": "search",
       "key": "gel pen",
-      "ms": 790,
+      "ms": 629,
       "response": {
-        "id": "qry_7a4819094c534c989520b73dd4a9fbd8",
+        "id": "qry_82c8825bf35c420c87224f50f717b81b",
         "products": [
           {
-            "id": "prd_f3650489fe0f45e4b99bf10be41dc326",
+            "id": "prd_3c1a803645774f05bffdcca4fdc9428d",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -579,7 +579,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_eed2627753444230bd6c2a180928df03",
+              "id": "var_fc184f287c984649b45b29021490e750",
               "name": "BLACK",
               "price": {
                 "amount": 2.2,
@@ -589,7 +589,7 @@
             }
           },
           {
-            "id": "prd_38760e0fd8c34627ae5085a34b1d252f",
+            "id": "prd_b1795d1062434a43a10847e07360f26f",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -607,7 +607,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_26a7505e2299406ea11a7aeffcf2c9c8",
+              "id": "var_735f5c8188804322a4b11bb6f7504d96",
               "name": "BLUE_BLACK",
               "price": {
                 "amount": 1.75,
@@ -617,7 +617,7 @@
             }
           },
           {
-            "id": "prd_32d290d204ca414cb5e68fa64d84c15e",
+            "id": "prd_7f927a2c1e304a3c9364a7b94688ee72",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -635,7 +635,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_b0c27335e64b4731abb558ae1e1fd922",
+              "id": "var_ef952850a77d491e8fcc965ca311065e",
               "name": "BLACK",
               "price": {
                 "amount": 1.75,
@@ -645,7 +645,7 @@
             }
           },
           {
-            "id": "prd_9af95fa62a1e45ed8c962b9bd9bd7f53",
+            "id": "prd_f7b3a5b3bcd14dc0beb8829202f6f7fd",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -663,7 +663,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_533de2784ded404fa0cf79277a4ffa6f",
+              "id": "var_1518806e74924772b7d894d584d208bd",
               "name": "BLACK",
               "price": {
                 "amount": 2.75,
@@ -673,7 +673,7 @@
             }
           },
           {
-            "id": "prd_b69251f8c72b4bb2aebd9943aa3bdd1c",
+            "id": "prd_7b31396c155743609c68b04e0c0c1b54",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -691,7 +691,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_b4551ae0c594435bbf6558f50b2b8f85",
+              "id": "var_38da29410b3e4cd4bb58302ff2b70100",
               "name": "Pink_Blue",
               "price": {
                 "amount": 5.9,
@@ -701,7 +701,7 @@
             }
           },
           {
-            "id": "prd_b5e42042acdf44f88f6ad437fdc8a4ae",
+            "id": "prd_2a9fc9df02594ab590c476a1f258bd33",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -719,7 +719,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_19a96b873ff14ab98eb73c79ce2b883e",
+              "id": "var_ee001cf71a2242189801f0c71f6be4ab",
               "name": "BLACK",
               "price": {
                 "amount": 1.75,
@@ -729,7 +729,7 @@
             }
           },
           {
-            "id": "prd_df32010414264df49847e558e6ab452d",
+            "id": "prd_4a77b57ed8154c8ab95116ccc5e3755f",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -747,7 +747,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_c56d4430e45546e386ecd7947c5d8c86",
+              "id": "var_7d65a14c4df146258b86bd65013fc63f",
               "name": "BLUE_BLACK",
               "price": {
                 "amount": 2.65,
@@ -757,7 +757,7 @@
             }
           },
           {
-            "id": "prd_e5ca3043bd47432a92457f3ea817944e",
+            "id": "prd_c96549afddf1452f982ed066073e70d5",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -775,7 +775,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_3cdff48b178d4be7b7beaca62f7af589",
+              "id": "var_c5d88baac3e24604a0f0b2f4bbe328f5",
               "name": "BLACK",
               "price": {
                 "amount": 2.2,
@@ -785,7 +785,7 @@
             }
           },
           {
-            "id": "prd_2f56dfee98c44f67b53b4d342bd9ca79",
+            "id": "prd_85f4ada171a245889db30f7c6fa8535d",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -803,7 +803,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_41f0c449aed844d9b86ba7cb6fbd8744",
+              "id": "var_0cdea93184ab4105a25df1a3d7f5ae4e",
               "name": "BLACK",
               "price": {
                 "amount": 2,
@@ -824,12 +824,12 @@
     {
       "op": "search",
       "key": "usb-c charging cable",
-      "ms": 703,
+      "ms": 776,
       "response": {
-        "id": "qry_1de942b4d02d4d5a9914fadbc9dee87a",
+        "id": "qry_16837bd62097495aa3ad50ebbe0f4eae",
         "products": [
           {
-            "id": "prd_359458b3584e4e648db076c54f0409bf",
+            "id": "prd_edef98f348924728ab3c3112ca00fba1",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -847,7 +847,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_9c7d5af3791340bd82e80bd951bacf4f",
+              "id": "var_3f8a0045c68048d2b747b77c2f4e1ff4",
               "price": {
                 "amount": 15.9,
                 "currency": "SGD"
@@ -856,7 +856,7 @@
             }
           },
           {
-            "id": "prd_5a1dae1d7b2b45768b5b306565eef82f",
+            "id": "prd_31508a736cdd44939bd0bde7dc958f08",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -874,7 +874,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_5a328376374847b2ab9976eba0a65e66",
+              "id": "var_a9eaba538b1945e1b329cf7f99bf6cb3",
               "price": {
                 "amount": 18.9,
                 "currency": "SGD"
@@ -883,7 +883,7 @@
             }
           },
           {
-            "id": "prd_c5896002f8b543eeb3a8dbae7fcff509",
+            "id": "prd_a90a4e417704454ea174a3475510693b",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -901,7 +901,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_e419c3b1be4f4861bff90dbd54833da0",
+              "id": "var_ce33d99daee0499e805940547770063e",
               "price": {
                 "amount": 23.9,
                 "currency": "SGD"
@@ -910,7 +910,7 @@
             }
           },
           {
-            "id": "prd_71222038ce184ab5b8f8f4b01a9c1078",
+            "id": "prd_31ece0625fbd4738be1839868e8c5b23",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -928,7 +928,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_61f34d29c8fc4d0e96f39b969f574be8",
+              "id": "var_51a9e63041d04c4e8ea06171a7f35dc2",
               "price": {
                 "amount": 24.2,
                 "currency": "SGD"
@@ -937,7 +937,7 @@
             }
           },
           {
-            "id": "prd_7ef0df7aa7d54e318c5bbdc1beeba6ad",
+            "id": "prd_26b2bf531019424098fdc3992c685032",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -955,7 +955,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_1e6a0b4b64e443189a9218bf1f5d540c",
+              "id": "var_61365a529f0343d8b9673c216826d616",
               "price": {
                 "amount": 15.9,
                 "currency": "SGD"
@@ -964,7 +964,7 @@
             }
           },
           {
-            "id": "prd_41c885ba23a94979a3c02670dd84a1c4",
+            "id": "prd_3ebb9438be1342bc8d18d372072b7c34",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -982,7 +982,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_d346f5963d1145f19ba2535f507bba7f",
+              "id": "var_e101a4c1d781434ab03c183cdf702140",
               "price": {
                 "amount": 34,
                 "currency": "SGD"
@@ -991,7 +991,7 @@
             }
           },
           {
-            "id": "prd_7d839df23f22400690deba35a3377d36",
+            "id": "prd_d04db5e472364b31ac51aadf817db870",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -1009,7 +1009,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_1cf02461da8545318e06a07eed127749",
+              "id": "var_a5532a88951841ce9d9f37ccb8d415b5",
               "price": {
                 "amount": 21.9,
                 "currency": "SGD"
@@ -1018,7 +1018,7 @@
             }
           },
           {
-            "id": "prd_0b4af0a01607451e9f260dd033624fd4",
+            "id": "prd_690e21be00aa4888b02e1cfc4f85b0ee",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -1036,7 +1036,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_fc2ebc1137314e4e92b3bbfdcd57c5d5",
+              "id": "var_f0d09c2bc6514d91af0c6b11f0109c9f",
               "name": "BLACK",
               "price": {
                 "amount": 19.7,
@@ -1046,7 +1046,7 @@
             }
           },
           {
-            "id": "prd_e37c2e51c4434416a5e43c2cbb1143b1",
+            "id": "prd_0c9242052f6b4252949ee90540bbb7c9",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -1064,7 +1064,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_e62f420761014c55ae0349c583002cf5",
+              "id": "var_e3dfcf0e6c414d52b8f723017f83341b",
               "price": {
                 "amount": 24.9,
                 "currency": "SGD"
@@ -1073,7 +1073,7 @@
             }
           },
           {
-            "id": "prd_278c52087de74efd9274bc03b60d09b3",
+            "id": "prd_aabf13b729f348c0abca2d04f25c93bf",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -1091,7 +1091,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_34ca5366a54647e08f374fb95f52b550",
+              "id": "var_41ddfb626efc4fb3a99211872885f6e1",
               "price": {
                 "amount": 35.9,
                 "currency": "SGD"
@@ -1111,12 +1111,12 @@
     {
       "op": "search",
       "key": "sticky notes",
-      "ms": 669,
+      "ms": 734,
       "response": {
-        "id": "qry_a7e49151ffda4a3c87d8353e46c7c7ea",
+        "id": "qry_dd67fad2d1dd48349c0ff77d97f0fc75",
         "products": [
           {
-            "id": "prd_f5ec2905c2a04767b3c097da0b65f6f6",
+            "id": "prd_6e41c571cf2a4f679e062b776526a61e",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -1134,7 +1134,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_77871870e5274263b7f69e4c6c615732",
+              "id": "var_fb236cb5af104624a4447b54b0b26582",
               "price": {
                 "amount": 12,
                 "currency": "SGD"
@@ -1143,7 +1143,7 @@
             }
           },
           {
-            "id": "prd_0e6af891b3fa4511874221288702c2bf",
+            "id": "prd_47222870fdda4260a2dcdb5340076bc8",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -1161,7 +1161,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_8fcf1368df1e41859ab6b9258ca95472",
+              "id": "var_c05c94b674a44979a6a64f86bdc70ed0",
               "price": {
                 "amount": 12,
                 "currency": "SGD"
@@ -1170,7 +1170,7 @@
             }
           },
           {
-            "id": "prd_4454b4cda3d7413a9dab30ec60866aaa",
+            "id": "prd_00ff5e756dd247a795e52659efd57a1f",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -1188,7 +1188,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_d92e6df1bf4a4f43a1983461cb44c8e9",
+              "id": "var_2ca59d74d97346318b234c00e7fa9c7a",
               "price": {
                 "amount": 13.3,
                 "currency": "SGD"
@@ -1197,7 +1197,7 @@
             }
           },
           {
-            "id": "prd_cae6ab858ba746349f5eea83a7ad86c0",
+            "id": "prd_84f42d48e9fe4daa9cf4046e31f63ebb",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -1215,7 +1215,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_c0970ea81c8f466e9e7183525ed2f131",
+              "id": "var_f83d2025cb754aa5a9a18871e012bfc3",
               "name": "MIXED",
               "price": {
                 "amount": 10.2,
@@ -1225,7 +1225,7 @@
             }
           },
           {
-            "id": "prd_34b3ff68216342fc911e1f3772ce5753",
+            "id": "prd_870e62cbdaf4431d9fb3ce989711bb69",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -1243,7 +1243,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_92eecc11ee1f4efe958b219a6cd540bc",
+              "id": "var_d4540e49f8cf41f9a86c5bd61504ea53",
               "price": {
                 "amount": 12,
                 "currency": "SGD"
@@ -1252,7 +1252,7 @@
             }
           },
           {
-            "id": "prd_29afc4b71bf04f76bb258887d08fb751",
+            "id": "prd_9cb52a90d0d0484d9f4d30031132b8d2",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -1270,7 +1270,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_41874bd5c1b8409c8f8354c1bb266784",
+              "id": "var_dbca46d9d00748f0b18706ce59cba13c",
               "price": {
                 "amount": 7.9,
                 "currency": "SGD"
@@ -1279,7 +1279,7 @@
             }
           },
           {
-            "id": "prd_ba816e9cff5a45b6b1bd21e4b73697be",
+            "id": "prd_615bb8e6c45746589d0e29763922a165",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -1297,7 +1297,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_11885a54e5834713b3d2e3db91b4f28e",
+              "id": "var_7fc600b242f145e38aa413bb61e54dd8",
               "price": {
                 "amount": 24.2,
                 "currency": "SGD"
@@ -1306,7 +1306,7 @@
             }
           },
           {
-            "id": "prd_39c2a65520584fbeaf07743e43051a5f",
+            "id": "prd_e6de869148db49f18a137f353995207e",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -1324,7 +1324,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_917e786423af4091b114814d313b93ee",
+              "id": "var_1e44ebd59d864936a37b4b3d9e303f9e",
               "price": {
                 "amount": 24.2,
                 "currency": "SGD"
@@ -1333,7 +1333,7 @@
             }
           },
           {
-            "id": "prd_76401bcb80f84bd6874724df49c60e88",
+            "id": "prd_07f26a3ad1284091b6e2b73f75a24511",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -1351,7 +1351,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_6c77899d053f4432bb49c73d4afd3fb8",
+              "id": "var_191f172128cc4ef9adc5184c498262f1",
               "price": {
                 "amount": 24.2,
                 "currency": "SGD"
@@ -1360,7 +1360,7 @@
             }
           },
           {
-            "id": "prd_0fc8aa10fdb04938831945d5e6a4e40e",
+            "id": "prd_da55e3845fdb4149af1a0bc3ff85083c",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -1378,7 +1378,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_0147aadec18347cdab5f04db26f47605",
+              "id": "var_a60c42222aff4d56be35196957ec0d9b",
               "price": {
                 "amount": 24.2,
                 "currency": "SGD"
@@ -1398,12 +1398,12 @@
     {
       "op": "search",
       "key": "whiteboard marker",
-      "ms": 674,
+      "ms": 679,
       "response": {
-        "id": "qry_152a263ce821443292a8f57130e9aa4b",
+        "id": "qry_8958a85417414044993b5d660c6e6c26",
         "products": [
           {
-            "id": "prd_d5f49ad5334d461fa4a2c0e0117fb15a",
+            "id": "prd_69073bddcd1a4a869b623a128dc3ab71",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -1421,7 +1421,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_d7dcaadccc7d45afacde6cc7d6ff918c",
+              "id": "var_368301fb26ee4497834c0df55aed4881",
               "price": {
                 "amount": 7.65,
                 "currency": "SGD"
@@ -1430,7 +1430,7 @@
             }
           },
           {
-            "id": "prd_11acdf49c11c4e0eb9181b6e283c7272",
+            "id": "prd_7b7822060a404592be193f98ed5f3e6a",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -1448,7 +1448,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_f1ff41d403f84627ad6b42f4e89af0c1",
+              "id": "var_b58ed9131d054655be9d008b10a9c2d3",
               "name": "BLACK",
               "price": {
                 "amount": 1.75,
@@ -1458,7 +1458,7 @@
             }
           },
           {
-            "id": "prd_a00cab22e7a84dd08a19447d25e6884d",
+            "id": "prd_df8e6523aa42421a8d14fe1940255305",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -1476,7 +1476,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_a3a19aac0ff74201b817587dfe6e036d",
+              "id": "var_8d12d88e6c3640a19fa236f774aa0883",
               "name": "BLACK",
               "price": {
                 "amount": 1.35,
@@ -1486,7 +1486,7 @@
             }
           },
           {
-            "id": "prd_35e29d6b704c4acb89ef782147b118bd",
+            "id": "prd_a588d07fcf8a4ccd8fe129f118e41d7b",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -1504,7 +1504,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_b451663d1b894038aa53a83e0e6d9a3b",
+              "id": "var_b96ff3f636ab4531b14595cdca9cb194",
               "name": "BLACK",
               "price": {
                 "amount": 1.55,
@@ -1514,7 +1514,7 @@
             }
           },
           {
-            "id": "prd_04417358e9074b27aba006e59068c73e",
+            "id": "prd_96bea0faad084804b3daa0e2a464838d",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -1532,7 +1532,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_9e18322ade7b49689e334c16b88fd68c",
+              "id": "var_5d3c475f807c4875b8673ad4c832fa2d",
               "name": "BLACK",
               "price": {
                 "amount": 3,
@@ -1542,7 +1542,7 @@
             }
           },
           {
-            "id": "prd_d69bcf0f5c204a8fbe881c1eed28a708",
+            "id": "prd_94e8aa18a727405992490128db9d6e34",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -1560,7 +1560,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_2f1434c70c664f458c985b26fe2c1701",
+              "id": "var_fd0117646e374a9784dd78cd9070bdf2",
               "name": "NA",
               "price": {
                 "amount": 8.9,
@@ -1570,7 +1570,7 @@
             }
           },
           {
-            "id": "prd_5b8ab8385e794b679992feca5e34a37d",
+            "id": "prd_4e60f88696c1490093c0efdf6b951cfa",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -1588,7 +1588,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_de98faa6979d41b5a4ffd5b31891ea28",
+              "id": "var_eba442c238e746488db4b6eb8e681199",
               "price": {
                 "amount": 8.35,
                 "currency": "SGD"
@@ -1597,7 +1597,7 @@
             }
           },
           {
-            "id": "prd_a44ca0fe11524fb19c424e3c3a220e58",
+            "id": "prd_73bef21b5fab439bae877ee362722dfe",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -1615,7 +1615,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_cec0a257abb1450a89d92ce3fcd06cd9",
+              "id": "var_17c3be54ac254a8dbab99119784477f5",
               "price": {
                 "amount": 11.6,
                 "currency": "SGD"
@@ -1624,7 +1624,7 @@
             }
           },
           {
-            "id": "prd_682499b562af4caea4e3e3c429b656ff",
+            "id": "prd_19ff6e22519b4ece8a035359b5fcaf96",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -1642,7 +1642,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_48825132326d4a9680f94d61042e8e2b",
+              "id": "var_d6e1d6da5f8046728228d07294fe2772",
               "price": {
                 "amount": 3.95,
                 "currency": "SGD"
@@ -1651,7 +1651,7 @@
             }
           },
           {
-            "id": "prd_1c4b1151db564190a7f57a12f1f99e84",
+            "id": "prd_2814b35eb6104e0a893953b50821b025",
             "merchant": {
               "name": "Popular Bookstore"
             },
@@ -1669,7 +1669,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_b9dc7564cddd4b919fba201f7b9ae69b",
+              "id": "var_14eb960876464403a3eebd2806c3c07e",
               "name": "BLACK",
               "price": {
                 "amount": 1.5,
@@ -1690,294 +1690,2012 @@
     {
       "op": "createQuote",
       "key": "",
-      "ms": 1714,
-      "response": {
-        "id": "11111111-1111-4111-8111-000000000001",
-        "expiresAt": "2026-10-09T08:34:02.107Z",
-        "shippingOptions": [
-          {
-            "id": "ship_std",
-            "name": "Standard Delivery (synthetic)",
-            "selected": true,
-            "price": {
-              "amount": 4,
-              "currency": "SGD"
-            },
-            "details": []
-          }
-        ],
-        "amountBreakdown": {
-          "itemsSubtotal": {
-            "amount": 246.45,
-            "currency": "SGD"
-          },
-          "shipping": {
-            "amount": 4,
-            "currency": "SGD"
-          },
-          "tax": {
-            "amount": {
-              "amount": 0,
-              "currency": "SGD"
-            },
-            "includedInPrices": true
-          },
-          "discounts": [],
-          "additionalCharges": [],
-          "finalAmount": {
-            "amount": 250.45,
-            "currency": "SGD"
-          }
-        }
+      "ms": 1439,
+      "error": {
+        "status": 409,
+        "code": "VARIANT_UNAVAILABLE",
+        "message": "409 VARIANT_UNAVAILABLE: The selected item is sold out. Choose another variant or product.",
+        "detail": null
       }
     },
     {
       "op": "createQuote",
       "key": "",
-      "ms": 1701,
+      "ms": 1176,
+      "error": {
+        "status": 409,
+        "code": "VARIANT_UNAVAILABLE",
+        "message": "409 VARIANT_UNAVAILABLE: The selected item is sold out. Choose another variant or product.",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 1054,
+      "error": {
+        "status": 409,
+        "code": "VARIANT_UNAVAILABLE",
+        "message": "409 VARIANT_UNAVAILABLE: The selected item is sold out. Choose another variant or product.",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 7806,
       "response": {
-        "id": "11111111-1111-4111-8111-000000000002",
-        "expiresAt": "2026-10-09T08:34:03.810Z",
+        "id": "02edfdc5-29e2-4ae0-b372-a007f893b3dc",
         "shippingOptions": [
           {
-            "id": "ship_std",
-            "name": "Standard Delivery (synthetic)",
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (BELOW $90)",
             "selected": true,
             "price": {
-              "amount": 4,
+              "amount": 4.9,
               "currency": "SGD"
-            },
-            "details": []
+            }
           }
         ],
         "amountBreakdown": {
           "itemsSubtotal": {
-            "amount": 177.45,
+            "amount": 13.2,
             "currency": "SGD"
           },
           "shipping": {
-            "amount": 4,
+            "amount": 4.9,
             "currency": "SGD"
           },
           "tax": {
             "amount": {
               "amount": 0,
               "currency": "SGD"
-            },
-            "includedInPrices": true
+            }
           },
           "discounts": [],
           "additionalCharges": [],
           "finalAmount": {
-            "amount": 181.45,
+            "amount": 18.1,
             "currency": "SGD"
           }
-        }
+        },
+        "expiresAt": "2026-10-09T09:39:15.422Z"
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 1079,
+      "error": {
+        "status": 409,
+        "code": "VARIANT_UNAVAILABLE",
+        "message": "409 VARIANT_UNAVAILABLE: The selected item is sold out. Choose another variant or product.",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 7820,
+      "response": {
+        "id": "a89688d6-f91a-4b01-9fd6-3d6228535fce",
+        "shippingOptions": [
+          {
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (BELOW $90)",
+            "selected": true,
+            "price": {
+              "amount": 4.9,
+              "currency": "SGD"
+            }
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 12,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4.9,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 16.9,
+            "currency": "SGD"
+          }
+        },
+        "expiresAt": "2026-10-09T09:39:26.337Z"
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 7453,
+      "response": {
+        "id": "ad2beac5-f8b4-410c-abaf-7aa017cf3bb9",
+        "shippingOptions": [
+          {
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (BELOW $90)",
+            "selected": true,
+            "price": {
+              "amount": 4.9,
+              "currency": "SGD"
+            }
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 7.65,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4.9,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 12.55,
+            "currency": "SGD"
+          }
+        },
+        "expiresAt": "2026-10-09T09:39:35.322Z"
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 1244,
+      "error": {
+        "status": 409,
+        "code": "VARIANT_UNAVAILABLE",
+        "message": "409 VARIANT_UNAVAILABLE: The selected item is sold out. Choose another variant or product.",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 1104,
+      "error": {
+        "status": 409,
+        "code": "VARIANT_UNAVAILABLE",
+        "message": "409 VARIANT_UNAVAILABLE: The selected item is sold out. Choose another variant or product.",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 6896,
+      "response": {
+        "id": "a1a65ff2-fe31-4a49-9f6b-14a741220fb1",
+        "shippingOptions": [
+          {
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (BELOW $90)",
+            "selected": true,
+            "price": {
+              "amount": 4.9,
+              "currency": "SGD"
+            }
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 15.9,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4.9,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 20.8,
+            "currency": "SGD"
+          }
+        },
+        "expiresAt": "2026-10-09T09:39:47.986Z"
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 3679,
+      "error": {
+        "status": 503,
+        "code": "AGENTIC_SERVICE_UNAVAILABLE",
+        "message": "503 AGENTIC_SERVICE_UNAVAILABLE: Agentic Payments is temporarily unavailable",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 3859,
+      "error": {
+        "status": 503,
+        "code": "AGENTIC_SERVICE_UNAVAILABLE",
+        "message": "503 AGENTIC_SERVICE_UNAVAILABLE: Agentic Payments is temporarily unavailable",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 1501,
+      "error": {
+        "status": 409,
+        "code": "VARIANT_UNAVAILABLE",
+        "message": "409 VARIANT_UNAVAILABLE: The selected item is sold out. Choose another variant or product.",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 1066,
+      "error": {
+        "status": 409,
+        "code": "VARIANT_UNAVAILABLE",
+        "message": "409 VARIANT_UNAVAILABLE: The selected item is sold out. Choose another variant or product.",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 6829,
+      "response": {
+        "id": "ab643562-b99e-4b66-a1fd-eaab4252dc7b",
+        "shippingOptions": [
+          {
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (BELOW $90)",
+            "selected": true,
+            "price": {
+              "amount": 4.9,
+              "currency": "SGD"
+            }
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 89.4,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4.9,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 94.3,
+            "currency": "SGD"
+          }
+        },
+        "expiresAt": "2026-10-09T09:40:23.032Z"
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 1159,
+      "error": {
+        "status": 409,
+        "code": "VARIANT_UNAVAILABLE",
+        "message": "409 VARIANT_UNAVAILABLE: The selected item is sold out. Choose another variant or product.",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 2229,
+      "error": {
+        "status": 409,
+        "code": "VARIANT_UNAVAILABLE",
+        "message": "409 VARIANT_UNAVAILABLE: The selected item is sold out. Choose another variant or product.",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 1188,
+      "error": {
+        "status": 409,
+        "code": "VARIANT_UNAVAILABLE",
+        "message": "409 VARIANT_UNAVAILABLE: The selected item is sold out. Choose another variant or product.",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 1281,
+      "error": {
+        "status": 409,
+        "code": "VARIANT_UNAVAILABLE",
+        "message": "409 VARIANT_UNAVAILABLE: The selected item is sold out. Choose another variant or product.",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 1648,
+      "error": {
+        "status": 409,
+        "code": "VARIANT_UNAVAILABLE",
+        "message": "409 VARIANT_UNAVAILABLE: The selected item is sold out. Choose another variant or product.",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 969,
+      "error": {
+        "status": 409,
+        "code": "VARIANT_UNAVAILABLE",
+        "message": "409 VARIANT_UNAVAILABLE: The selected item is sold out. Choose another variant or product.",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 1123,
+      "error": {
+        "status": 409,
+        "code": "VARIANT_UNAVAILABLE",
+        "message": "409 VARIANT_UNAVAILABLE: The selected item is sold out. Choose another variant or product.",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 3677,
+      "error": {
+        "status": 503,
+        "code": "AGENTIC_SERVICE_UNAVAILABLE",
+        "message": "503 AGENTIC_SERVICE_UNAVAILABLE: Agentic Payments is temporarily unavailable",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 3713,
+      "error": {
+        "status": 503,
+        "code": "AGENTIC_SERVICE_UNAVAILABLE",
+        "message": "503 AGENTIC_SERVICE_UNAVAILABLE: Agentic Payments is temporarily unavailable",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 3892,
+      "error": {
+        "status": 503,
+        "code": "AGENTIC_SERVICE_UNAVAILABLE",
+        "message": "503 AGENTIC_SERVICE_UNAVAILABLE: Agentic Payments is temporarily unavailable",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 1402,
+      "error": {
+        "status": 409,
+        "code": "VARIANT_UNAVAILABLE",
+        "message": "409 VARIANT_UNAVAILABLE: The selected item is sold out. Choose another variant or product.",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 2054,
+      "error": {
+        "status": 409,
+        "code": "VARIANT_UNAVAILABLE",
+        "message": "409 VARIANT_UNAVAILABLE: The selected item is sold out. Choose another variant or product.",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 1683,
+      "error": {
+        "status": 409,
+        "code": "VARIANT_UNAVAILABLE",
+        "message": "409 VARIANT_UNAVAILABLE: The selected item is sold out. Choose another variant or product.",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 7401,
+      "response": {
+        "id": "f58005af-c9f1-458f-97b7-174437313e97",
+        "shippingOptions": [
+          {
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (BELOW $90)",
+            "selected": true,
+            "price": {
+              "amount": 4.9,
+              "currency": "SGD"
+            }
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 15.9,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4.9,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 20.8,
+            "currency": "SGD"
+          }
+        },
+        "expiresAt": "2026-10-09T09:41:36.987Z"
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 1250,
+      "error": {
+        "status": 409,
+        "code": "VARIANT_UNAVAILABLE",
+        "message": "409 VARIANT_UNAVAILABLE: The selected item is sold out. Choose another variant or product.",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 6695,
+      "response": {
+        "id": "046451a4-cdfd-4899-ba64-55a4eb814fd8",
+        "shippingOptions": [
+          {
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (BELOW $90)",
+            "selected": true,
+            "price": {
+              "amount": 4.9,
+              "currency": "SGD"
+            }
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 18.9,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4.9,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 23.8,
+            "currency": "SGD"
+          }
+        },
+        "expiresAt": "2026-10-09T09:41:47.663Z"
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 6677,
+      "response": {
+        "id": "5ec97e7f-0793-4ed0-a405-a7bb7ca0f103",
+        "shippingOptions": [
+          {
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (BELOW $90)",
+            "selected": true,
+            "price": {
+              "amount": 4.9,
+              "currency": "SGD"
+            }
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 23.9,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4.9,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 28.8,
+            "currency": "SGD"
+          }
+        },
+        "expiresAt": "2026-10-09T09:41:55.364Z"
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 8357,
+      "response": {
+        "id": "4e2ad778-cb5d-4269-a4fb-2e5ed9c7807e",
+        "shippingOptions": [
+          {
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (ABOVE $90)",
+            "selected": true,
+            "price": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 196.85,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 0,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 196.85,
+            "currency": "SGD"
+          }
+        },
+        "expiresAt": "2026-10-09T09:42:02.122Z"
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 1288,
+      "error": {
+        "status": 409,
+        "code": "VARIANT_UNAVAILABLE",
+        "message": "409 VARIANT_UNAVAILABLE: The selected item is sold out. Choose another variant or product.",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 7010,
+      "response": {
+        "id": "ff05b709-30da-4e08-84ff-c1d046fad672",
+        "shippingOptions": [
+          {
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (BELOW $90)",
+            "selected": true,
+            "price": {
+              "amount": 4.9,
+              "currency": "SGD"
+            }
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 13.2,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4.9,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 18.1,
+            "currency": "SGD"
+          }
+        },
+        "expiresAt": "2026-10-09T09:42:12.693Z"
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 3806,
+      "error": {
+        "status": 503,
+        "code": "AGENTIC_SERVICE_UNAVAILABLE",
+        "message": "503 AGENTIC_SERVICE_UNAVAILABLE: Agentic Payments is temporarily unavailable",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 7478,
+      "response": {
+        "id": "dc308e7b-2f24-4dce-ad5c-439fc1e67c1b",
+        "shippingOptions": [
+          {
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (BELOW $90)",
+            "selected": true,
+            "price": {
+              "amount": 4.9,
+              "currency": "SGD"
+            }
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 12,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4.9,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 16.9,
+            "currency": "SGD"
+          }
+        },
+        "expiresAt": "2026-10-09T09:42:29.632Z"
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 8548,
+      "response": {
+        "id": "3f2f1f58-cd09-4ba6-95b0-44029fb570f0",
+        "shippingOptions": [
+          {
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (BELOW $90)",
+            "selected": true,
+            "price": {
+              "amount": 4.9,
+              "currency": "SGD"
+            }
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 7.65,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4.9,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 12.55,
+            "currency": "SGD"
+          }
+        },
+        "expiresAt": "2026-10-09T09:42:38.050Z"
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 8090,
+      "response": {
+        "id": "87e038e1-2cba-4f44-9211-af79cd6e300b",
+        "shippingOptions": [
+          {
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (BELOW $90)",
+            "selected": true,
+            "price": {
+              "amount": 4.9,
+              "currency": "SGD"
+            }
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 15.9,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4.9,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 20.8,
+            "currency": "SGD"
+          }
+        },
+        "expiresAt": "2026-10-09T09:42:47.577Z"
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 7990,
+      "response": {
+        "id": "db5f32fa-b4dd-46a6-ba96-cc7426928883",
+        "shippingOptions": [
+          {
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (BELOW $90)",
+            "selected": true,
+            "price": {
+              "amount": 4.9,
+              "currency": "SGD"
+            }
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 18.9,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4.9,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 23.8,
+            "currency": "SGD"
+          }
+        },
+        "expiresAt": "2026-10-09T09:42:56.810Z"
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 1133,
+      "error": {
+        "status": 409,
+        "code": "VARIANT_UNAVAILABLE",
+        "message": "409 VARIANT_UNAVAILABLE: The selected item is sold out. Choose another variant or product.",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 1413,
+      "error": {
+        "status": 409,
+        "code": "VARIANT_UNAVAILABLE",
+        "message": "409 VARIANT_UNAVAILABLE: The selected item is sold out. Choose another variant or product.",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 7538,
+      "response": {
+        "id": "ac777717-89eb-4d86-8624-e8a771258e17",
+        "shippingOptions": [
+          {
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (BELOW $90)",
+            "selected": true,
+            "price": {
+              "amount": 4.9,
+              "currency": "SGD"
+            }
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 15.9,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4.9,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 20.8,
+            "currency": "SGD"
+          }
+        },
+        "expiresAt": "2026-10-09T09:43:10.258Z"
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 1108,
+      "error": {
+        "status": 409,
+        "code": "VARIANT_UNAVAILABLE",
+        "message": "409 VARIANT_UNAVAILABLE: The selected item is sold out. Choose another variant or product.",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 1041,
+      "error": {
+        "status": 409,
+        "code": "VARIANT_UNAVAILABLE",
+        "message": "409 VARIANT_UNAVAILABLE: The selected item is sold out. Choose another variant or product.",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 7661,
+      "response": {
+        "id": "7687b9c0-124a-4c27-a519-f28938dd4a51",
+        "shippingOptions": [
+          {
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (BELOW $90)",
+            "selected": true,
+            "price": {
+              "amount": 4.9,
+              "currency": "SGD"
+            }
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 37.8,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4.9,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 42.7,
+            "currency": "SGD"
+          }
+        },
+        "expiresAt": "2026-10-09T09:43:22.967Z"
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 1452,
+      "error": {
+        "status": 409,
+        "code": "VARIANT_UNAVAILABLE",
+        "message": "409 VARIANT_UNAVAILABLE: The selected item is sold out. Choose another variant or product.",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 1217,
+      "error": {
+        "status": 409,
+        "code": "VARIANT_UNAVAILABLE",
+        "message": "409 VARIANT_UNAVAILABLE: The selected item is sold out. Choose another variant or product.",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 7374,
+      "response": {
+        "id": "999bdb98-fd8f-46a8-97a2-41ba728291d0",
+        "shippingOptions": [
+          {
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (BELOW $90)",
+            "selected": true,
+            "price": {
+              "amount": 4.9,
+              "currency": "SGD"
+            }
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 15.9,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4.9,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 20.8,
+            "currency": "SGD"
+          }
+        },
+        "expiresAt": "2026-10-09T09:43:36.323Z"
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 7377,
+      "response": {
+        "id": "6a4f9c95-f141-41b0-b1ad-fba9c83276d2",
+        "shippingOptions": [
+          {
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (ABOVE $90)",
+            "selected": true,
+            "price": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 137.25,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 0,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 137.25,
+            "currency": "SGD"
+          }
+        },
+        "expiresAt": "2026-10-09T09:43:43.772Z"
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 1377,
+      "error": {
+        "status": 409,
+        "code": "VARIANT_UNAVAILABLE",
+        "message": "409 VARIANT_UNAVAILABLE: The selected item is sold out. Choose another variant or product.",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 6832,
+      "response": {
+        "id": "72a82d28-df51-4bfe-b366-2905d1480a24",
+        "shippingOptions": [
+          {
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (BELOW $90)",
+            "selected": true,
+            "price": {
+              "amount": 4.9,
+              "currency": "SGD"
+            }
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 15.9,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4.9,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 20.8,
+            "currency": "SGD"
+          }
+        },
+        "expiresAt": "2026-10-09T09:43:53.491Z"
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 8155,
+      "response": {
+        "id": "ba56d620-23e8-4402-88ed-d117862f5171",
+        "shippingOptions": [
+          {
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (BELOW $90)",
+            "selected": true,
+            "price": {
+              "amount": 4.9,
+              "currency": "SGD"
+            }
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 15.9,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4.9,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 20.8,
+            "currency": "SGD"
+          }
+        },
+        "expiresAt": "2026-10-09T09:44:01.633Z"
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 7415,
+      "response": {
+        "id": "33737cbc-8ac8-44d4-b700-9587916458ce",
+        "shippingOptions": [
+          {
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (BELOW $90)",
+            "selected": true,
+            "price": {
+              "amount": 4.9,
+              "currency": "SGD"
+            }
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 2.7,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4.9,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 7.6,
+            "currency": "SGD"
+          }
+        },
+        "expiresAt": "2026-10-09T09:44:10.522Z"
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 6983,
+      "response": {
+        "id": "8e6b0295-1a86-4b4c-ac38-f0bd66813771",
+        "shippingOptions": [
+          {
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (BELOW $90)",
+            "selected": true,
+            "price": {
+              "amount": 4.9,
+              "currency": "SGD"
+            }
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 1.35,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4.9,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 6.25,
+            "currency": "SGD"
+          }
+        },
+        "expiresAt": "2026-10-09T09:44:18.894Z"
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 7707,
+      "response": {
+        "id": "ef2ad8d4-a5d9-440f-83e0-cc38c0df9464",
+        "shippingOptions": [
+          {
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (BELOW $90)",
+            "selected": true,
+            "price": {
+              "amount": 4.9,
+              "currency": "SGD"
+            }
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 7.9,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4.9,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 12.8,
+            "currency": "SGD"
+          }
+        },
+        "expiresAt": "2026-10-09T09:44:26.890Z"
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 6752,
+      "response": {
+        "id": "9dc14cf8-a00c-415f-b76f-bce828295189",
+        "shippingOptions": [
+          {
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (BELOW $90)",
+            "selected": true,
+            "price": {
+              "amount": 4.9,
+              "currency": "SGD"
+            }
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 15.9,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4.9,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 20.8,
+            "currency": "SGD"
+          }
+        },
+        "expiresAt": "2026-10-09T09:44:35.747Z"
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 1158,
+      "error": {
+        "status": 409,
+        "code": "VARIANT_UNAVAILABLE",
+        "message": "409 VARIANT_UNAVAILABLE: The selected item is sold out. Choose another variant or product.",
+        "detail": null
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 7740,
+      "response": {
+        "id": "721cbc81-2edc-45e2-ae98-d5900803a1db",
+        "shippingOptions": [
+          {
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (BELOW $90)",
+            "selected": true,
+            "price": {
+              "amount": 4.9,
+              "currency": "SGD"
+            }
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 16.8,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4.9,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 21.7,
+            "currency": "SGD"
+          }
+        },
+        "expiresAt": "2026-10-09T09:44:45.518Z"
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 7524,
+      "response": {
+        "id": "849e5d44-6af0-488c-ac7f-5519f11f74d6",
+        "shippingOptions": [
+          {
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (BELOW $90)",
+            "selected": true,
+            "price": {
+              "amount": 4.9,
+              "currency": "SGD"
+            }
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 44.7,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4.9,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 49.6,
+            "currency": "SGD"
+          }
+        },
+        "expiresAt": "2026-10-09T09:44:54.308Z"
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 9180,
+      "response": {
+        "id": "84563907-0c96-49a1-85ab-1e4cb7b95022",
+        "shippingOptions": [
+          {
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (BELOW $90)",
+            "selected": true,
+            "price": {
+              "amount": 4.9,
+              "currency": "SGD"
+            }
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 10.5,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4.9,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 15.4,
+            "currency": "SGD"
+          }
+        },
+        "expiresAt": "2026-10-09T09:45:02.859Z"
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 7825,
+      "response": {
+        "id": "f25272e5-2c4b-4824-adee-dab753da4b80",
+        "shippingOptions": [
+          {
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (ABOVE $90)",
+            "selected": true,
+            "price": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 131.65,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 0,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 131.65,
+            "currency": "SGD"
+          }
+        },
+        "expiresAt": "2026-10-09T09:45:12.440Z"
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 6917,
+      "response": {
+        "id": "dda64e37-f4f8-422c-bdfc-64ed4280b493",
+        "shippingOptions": [
+          {
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (ABOVE $90)",
+            "selected": true,
+            "price": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 102.75,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 0,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            }
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 102.75,
+            "currency": "SGD"
+          }
+        },
+        "expiresAt": "2026-10-09T09:45:19.987Z"
       }
     },
     {
       "op": "getQuote",
       "key": "",
-      "ms": 407,
+      "ms": 91,
       "response": {
-        "id": "11111111-1111-4111-8111-000000000002",
-        "expiresAt": "2026-10-09T08:34:03.810Z",
+        "id": "dda64e37-f4f8-422c-bdfc-64ed4280b493",
         "shippingOptions": [
           {
-            "id": "ship_std",
-            "name": "Standard Delivery (synthetic)",
+            "id": "ship_0",
+            "name": "LOCAL DELIVERY - STANDARD (ABOVE $90)",
             "selected": true,
             "price": {
-              "amount": 4,
+              "amount": 0,
               "currency": "SGD"
-            },
-            "details": []
+            }
           }
         ],
         "amountBreakdown": {
           "itemsSubtotal": {
-            "amount": 177.45,
+            "amount": 102.75,
             "currency": "SGD"
           },
           "shipping": {
-            "amount": 4,
+            "amount": 0,
             "currency": "SGD"
           },
           "tax": {
             "amount": {
               "amount": 0,
               "currency": "SGD"
-            },
-            "includedInPrices": true
+            }
           },
           "discounts": [],
           "additionalCharges": [],
           "finalAmount": {
-            "amount": 181.45,
+            "amount": 102.75,
             "currency": "SGD"
           }
-        }
+        },
+        "expiresAt": "2026-10-09T09:45:19.987Z"
       }
     },
     {
       "op": "createCheckout",
       "key": "",
-      "ms": 1314,
+      "ms": 321,
       "response": {
-        "id": "22222222-2222-4222-8222-000000000001",
+        "id": "7117a4b6-1ce6-47a6-ac67-b5d1371b9e0d",
         "status": "REQUIRES_ACTION",
-        "quoteId": "11111111-1111-4111-8111-000000000002",
-        "enrollmentId": "3d5cb503-4115-4cf7-90f0-7a4193b7b8cc",
+        "quoteId": "dda64e37-f4f8-422c-bdfc-64ed4280b493",
+        "enrollmentId": "88cb75ba-2d8e-4e95-a5ed-a8b08b026b31",
         "amount": {
-          "amount": 181.45,
+          "amount": 102.75,
           "currency": "SGD"
         },
         "nextAction": {
           "type": "REDIRECT",
           "url": "[redacted]",
-          "expiresAt": "2026-10-09T08:39:05.531Z"
+          "expiresAt": "2026-10-09T09:55:26.843Z"
         }
       }
     },
     {
       "op": "getCheckout",
       "key": "",
-      "ms": 300,
+      "ms": 306,
       "response": {
-        "id": "22222222-2222-4222-8222-000000000001",
+        "id": "7117a4b6-1ce6-47a6-ac67-b5d1371b9e0d",
         "status": "REQUIRES_ACTION",
-        "quoteId": "11111111-1111-4111-8111-000000000002",
-        "enrollmentId": "3d5cb503-4115-4cf7-90f0-7a4193b7b8cc",
-        "orderId": null,
-        "finalAmount": null,
-        "nextAction": {
-          "type": "REDIRECT",
-          "url": "[redacted]",
-          "expiresAt": "2026-10-09T08:39:05.531Z"
-        }
-      }
-    },
-    {
-      "op": "getCheckout",
-      "key": "",
-      "ms": 300,
-      "response": {
-        "id": "22222222-2222-4222-8222-000000000001",
-        "status": "REQUIRES_ACTION",
-        "quoteId": "11111111-1111-4111-8111-000000000002",
-        "enrollmentId": "3d5cb503-4115-4cf7-90f0-7a4193b7b8cc",
-        "orderId": null,
-        "finalAmount": null,
-        "nextAction": {
-          "type": "REDIRECT",
-          "url": "[redacted]",
-          "expiresAt": "2026-10-09T08:39:05.531Z"
-        }
-      }
-    },
-    {
-      "op": "getCheckout",
-      "key": "",
-      "ms": 300,
-      "response": {
-        "id": "22222222-2222-4222-8222-000000000001",
-        "status": "REQUIRES_ACTION",
-        "quoteId": "11111111-1111-4111-8111-000000000002",
-        "enrollmentId": "3d5cb503-4115-4cf7-90f0-7a4193b7b8cc",
-        "orderId": null,
-        "finalAmount": null,
-        "nextAction": {
-          "type": "REDIRECT",
-          "url": "[redacted]",
-          "expiresAt": "2026-10-09T08:39:05.531Z"
-        }
-      }
-    },
-    {
-      "op": "getCheckout",
-      "key": "",
-      "ms": 300,
-      "response": {
-        "id": "22222222-2222-4222-8222-000000000001",
-        "status": "REQUIRES_ACTION",
-        "quoteId": "11111111-1111-4111-8111-000000000002",
-        "enrollmentId": "3d5cb503-4115-4cf7-90f0-7a4193b7b8cc",
-        "orderId": null,
-        "finalAmount": null,
-        "nextAction": {
-          "type": "REDIRECT",
-          "url": "[redacted]",
-          "expiresAt": "2026-10-09T08:39:05.531Z"
-        }
-      }
-    },
-    {
-      "op": "getCheckout",
-      "key": "",
-      "ms": 300,
-      "response": {
-        "id": "22222222-2222-4222-8222-000000000001",
-        "status": "REQUIRES_ACTION",
-        "quoteId": "11111111-1111-4111-8111-000000000002",
-        "enrollmentId": "3d5cb503-4115-4cf7-90f0-7a4193b7b8cc",
-        "orderId": null,
-        "finalAmount": null,
-        "nextAction": {
-          "type": "REDIRECT",
-          "url": "[redacted]",
-          "expiresAt": "2026-10-09T08:39:05.531Z"
-        }
-      }
-    },
-    {
-      "op": "getCheckout",
-      "key": "",
-      "ms": 300,
-      "response": {
-        "id": "22222222-2222-4222-8222-000000000001",
-        "status": "REQUIRES_ACTION",
-        "quoteId": "11111111-1111-4111-8111-000000000002",
-        "enrollmentId": "3d5cb503-4115-4cf7-90f0-7a4193b7b8cc",
-        "orderId": null,
-        "finalAmount": null,
-        "nextAction": {
-          "type": "REDIRECT",
-          "url": "[redacted]",
-          "expiresAt": "2026-10-09T08:39:05.532Z"
-        }
-      }
-    },
-    {
-      "op": "getCheckout",
-      "key": "",
-      "ms": 300,
-      "response": {
-        "id": "22222222-2222-4222-8222-000000000001",
-        "status": "PROCESSING",
-        "quoteId": "11111111-1111-4111-8111-000000000002",
-        "enrollmentId": "3d5cb503-4115-4cf7-90f0-7a4193b7b8cc",
-        "orderId": null,
-        "finalAmount": null,
-        "nextAction": null
-      }
-    },
-    {
-      "op": "getCheckout",
-      "key": "",
-      "ms": 300,
-      "response": {
-        "id": "22222222-2222-4222-8222-000000000001",
-        "status": "COMPLETED",
-        "quoteId": "11111111-1111-4111-8111-000000000002",
-        "enrollmentId": "3d5cb503-4115-4cf7-90f0-7a4193b7b8cc",
-        "orderId": "POP-SG-DEMO-0001",
+        "quoteId": "dda64e37-f4f8-422c-bdfc-64ed4280b493",
+        "enrollmentId": "88cb75ba-2d8e-4e95-a5ed-a8b08b026b31",
+        "orderId": "ord_01M4G0J3JSEP31G7NASSA0K649",
         "finalAmount": {
-          "amount": 181.45,
+          "amount": 102.75,
           "currency": "SGD"
         },
-        "nextAction": null
+        "nextAction": {
+          "type": "REDIRECT",
+          "url": "[redacted]",
+          "expiresAt": "2026-10-09T09:55:26.843Z"
+        },
+        "createdAt": "2026-10-09T09:40:26.958Z",
+        "updatedAt": "2026-10-09T09:40:26.958Z"
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 289,
+      "response": {
+        "id": "7117a4b6-1ce6-47a6-ac67-b5d1371b9e0d",
+        "status": "REQUIRES_ACTION",
+        "quoteId": "dda64e37-f4f8-422c-bdfc-64ed4280b493",
+        "enrollmentId": "88cb75ba-2d8e-4e95-a5ed-a8b08b026b31",
+        "orderId": "ord_01M4G0J3JSEP31G7NASSA0K649",
+        "finalAmount": {
+          "amount": 102.75,
+          "currency": "SGD"
+        },
+        "nextAction": {
+          "type": "REDIRECT",
+          "url": "[redacted]",
+          "expiresAt": "2026-10-09T09:55:26.843Z"
+        },
+        "createdAt": "2026-10-09T09:40:26.958Z",
+        "updatedAt": "2026-10-09T09:40:26.958Z"
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 274,
+      "response": {
+        "id": "7117a4b6-1ce6-47a6-ac67-b5d1371b9e0d",
+        "status": "REQUIRES_ACTION",
+        "quoteId": "dda64e37-f4f8-422c-bdfc-64ed4280b493",
+        "enrollmentId": "88cb75ba-2d8e-4e95-a5ed-a8b08b026b31",
+        "orderId": "ord_01M4G0J3JSEP31G7NASSA0K649",
+        "finalAmount": {
+          "amount": 102.75,
+          "currency": "SGD"
+        },
+        "nextAction": {
+          "type": "REDIRECT",
+          "url": "[redacted]",
+          "expiresAt": "2026-10-09T09:55:26.843Z"
+        },
+        "createdAt": "2026-10-09T09:40:26.958Z",
+        "updatedAt": "2026-10-09T09:40:26.958Z"
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 289,
+      "response": {
+        "id": "7117a4b6-1ce6-47a6-ac67-b5d1371b9e0d",
+        "status": "REQUIRES_ACTION",
+        "quoteId": "dda64e37-f4f8-422c-bdfc-64ed4280b493",
+        "enrollmentId": "88cb75ba-2d8e-4e95-a5ed-a8b08b026b31",
+        "orderId": "ord_01M4G0J3JSEP31G7NASSA0K649",
+        "finalAmount": {
+          "amount": 102.75,
+          "currency": "SGD"
+        },
+        "nextAction": {
+          "type": "REDIRECT",
+          "url": "[redacted]",
+          "expiresAt": "2026-10-09T09:55:26.843Z"
+        },
+        "createdAt": "2026-10-09T09:40:26.958Z",
+        "updatedAt": "2026-10-09T09:40:26.958Z"
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 434,
+      "response": {
+        "id": "7117a4b6-1ce6-47a6-ac67-b5d1371b9e0d",
+        "status": "REQUIRES_ACTION",
+        "quoteId": "dda64e37-f4f8-422c-bdfc-64ed4280b493",
+        "enrollmentId": "88cb75ba-2d8e-4e95-a5ed-a8b08b026b31",
+        "orderId": "ord_01M4G0J3JSEP31G7NASSA0K649",
+        "finalAmount": {
+          "amount": 102.75,
+          "currency": "SGD"
+        },
+        "nextAction": {
+          "type": "REDIRECT",
+          "url": "[redacted]",
+          "expiresAt": "2026-10-09T09:55:26.843Z"
+        },
+        "createdAt": "2026-10-09T09:40:26.958Z",
+        "updatedAt": "2026-10-09T09:40:26.958Z"
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 281,
+      "response": {
+        "id": "7117a4b6-1ce6-47a6-ac67-b5d1371b9e0d",
+        "status": "REQUIRES_ACTION",
+        "quoteId": "dda64e37-f4f8-422c-bdfc-64ed4280b493",
+        "enrollmentId": "88cb75ba-2d8e-4e95-a5ed-a8b08b026b31",
+        "orderId": "ord_01M4G0J3JSEP31G7NASSA0K649",
+        "finalAmount": {
+          "amount": 102.75,
+          "currency": "SGD"
+        },
+        "nextAction": {
+          "type": "REDIRECT",
+          "url": "[redacted]",
+          "expiresAt": "2026-10-09T09:55:26.843Z"
+        },
+        "createdAt": "2026-10-09T09:40:26.958Z",
+        "updatedAt": "2026-10-09T09:40:26.958Z"
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 288,
+      "response": {
+        "id": "7117a4b6-1ce6-47a6-ac67-b5d1371b9e0d",
+        "status": "REQUIRES_ACTION",
+        "quoteId": "dda64e37-f4f8-422c-bdfc-64ed4280b493",
+        "enrollmentId": "88cb75ba-2d8e-4e95-a5ed-a8b08b026b31",
+        "orderId": "ord_01M4G0J3JSEP31G7NASSA0K649",
+        "finalAmount": {
+          "amount": 102.75,
+          "currency": "SGD"
+        },
+        "nextAction": {
+          "type": "REDIRECT",
+          "url": "[redacted]",
+          "expiresAt": "2026-10-09T09:55:26.843Z"
+        },
+        "createdAt": "2026-10-09T09:40:26.958Z",
+        "updatedAt": "2026-10-09T09:40:26.958Z"
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 282,
+      "response": {
+        "id": "7117a4b6-1ce6-47a6-ac67-b5d1371b9e0d",
+        "status": "REQUIRES_ACTION",
+        "quoteId": "dda64e37-f4f8-422c-bdfc-64ed4280b493",
+        "enrollmentId": "88cb75ba-2d8e-4e95-a5ed-a8b08b026b31",
+        "orderId": "ord_01M4G0J3JSEP31G7NASSA0K649",
+        "finalAmount": {
+          "amount": 102.75,
+          "currency": "SGD"
+        },
+        "nextAction": {
+          "type": "REDIRECT",
+          "url": "[redacted]",
+          "expiresAt": "2026-10-09T09:55:26.843Z"
+        },
+        "createdAt": "2026-10-09T09:40:26.958Z",
+        "updatedAt": "2026-10-09T09:40:26.958Z"
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 285,
+      "response": {
+        "id": "7117a4b6-1ce6-47a6-ac67-b5d1371b9e0d",
+        "status": "PROCESSING",
+        "quoteId": "dda64e37-f4f8-422c-bdfc-64ed4280b493",
+        "enrollmentId": "88cb75ba-2d8e-4e95-a5ed-a8b08b026b31",
+        "orderId": "ord_01M4G0J3JSEP31G7NASSA0K649",
+        "finalAmount": {
+          "amount": 102.75,
+          "currency": "SGD"
+        },
+        "nextAction": null,
+        "createdAt": "2026-10-09T09:40:26.958Z",
+        "updatedAt": "2026-10-09T09:43:42.066Z"
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 300,
+      "response": {
+        "id": "7117a4b6-1ce6-47a6-ac67-b5d1371b9e0d",
+        "status": "PROCESSING",
+        "quoteId": "dda64e37-f4f8-422c-bdfc-64ed4280b493",
+        "enrollmentId": "88cb75ba-2d8e-4e95-a5ed-a8b08b026b31",
+        "orderId": "ord_01M4G0J3JSEP31G7NASSA0K649",
+        "finalAmount": {
+          "amount": 102.75,
+          "currency": "SGD"
+        },
+        "nextAction": null,
+        "createdAt": "2026-10-09T09:40:26.958Z",
+        "updatedAt": "2026-10-09T09:40:26.958Z"
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 284,
+      "response": {
+        "id": "7117a4b6-1ce6-47a6-ac67-b5d1371b9e0d",
+        "status": "PROCESSING",
+        "quoteId": "dda64e37-f4f8-422c-bdfc-64ed4280b493",
+        "enrollmentId": "88cb75ba-2d8e-4e95-a5ed-a8b08b026b31",
+        "orderId": "ord_01M4G0J3JSEP31G7NASSA0K649",
+        "finalAmount": {
+          "amount": 102.75,
+          "currency": "SGD"
+        },
+        "nextAction": null,
+        "createdAt": "2026-10-09T09:40:26.958Z",
+        "updatedAt": "2026-10-09T09:40:26.958Z"
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 265,
+      "response": {
+        "id": "7117a4b6-1ce6-47a6-ac67-b5d1371b9e0d",
+        "status": "PROCESSING",
+        "quoteId": "dda64e37-f4f8-422c-bdfc-64ed4280b493",
+        "enrollmentId": "88cb75ba-2d8e-4e95-a5ed-a8b08b026b31",
+        "orderId": "ord_01M4G0J3JSEP31G7NASSA0K649",
+        "finalAmount": {
+          "amount": 102.75,
+          "currency": "SGD"
+        },
+        "nextAction": null,
+        "createdAt": "2026-10-09T09:40:26.958Z",
+        "updatedAt": "2026-10-09T09:40:26.958Z"
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 297,
+      "response": {
+        "id": "7117a4b6-1ce6-47a6-ac67-b5d1371b9e0d",
+        "status": "PROCESSING",
+        "quoteId": "dda64e37-f4f8-422c-bdfc-64ed4280b493",
+        "enrollmentId": "88cb75ba-2d8e-4e95-a5ed-a8b08b026b31",
+        "orderId": "ord_01M4G0J3JSEP31G7NASSA0K649",
+        "finalAmount": {
+          "amount": 102.75,
+          "currency": "SGD"
+        },
+        "nextAction": null,
+        "createdAt": "2026-10-09T09:40:26.958Z",
+        "updatedAt": "2026-10-09T09:40:26.958Z"
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 289,
+      "response": {
+        "id": "7117a4b6-1ce6-47a6-ac67-b5d1371b9e0d",
+        "status": "PROCESSING",
+        "quoteId": "dda64e37-f4f8-422c-bdfc-64ed4280b493",
+        "enrollmentId": "88cb75ba-2d8e-4e95-a5ed-a8b08b026b31",
+        "orderId": "ord_01M4G0J3JSEP31G7NASSA0K649",
+        "finalAmount": {
+          "amount": 102.75,
+          "currency": "SGD"
+        },
+        "nextAction": null,
+        "createdAt": "2026-10-09T09:40:26.958Z",
+        "updatedAt": "2026-10-09T09:40:26.958Z"
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 309,
+      "response": {
+        "id": "7117a4b6-1ce6-47a6-ac67-b5d1371b9e0d",
+        "status": "PROCESSING",
+        "quoteId": "dda64e37-f4f8-422c-bdfc-64ed4280b493",
+        "enrollmentId": "88cb75ba-2d8e-4e95-a5ed-a8b08b026b31",
+        "orderId": "ord_01M4G0J3JSEP31G7NASSA0K649",
+        "finalAmount": {
+          "amount": 102.75,
+          "currency": "SGD"
+        },
+        "nextAction": null,
+        "createdAt": "2026-10-09T09:40:26.958Z",
+        "updatedAt": "2026-10-09T09:40:26.958Z"
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 333,
+      "response": {
+        "id": "7117a4b6-1ce6-47a6-ac67-b5d1371b9e0d",
+        "status": "PROCESSING",
+        "quoteId": "dda64e37-f4f8-422c-bdfc-64ed4280b493",
+        "enrollmentId": "88cb75ba-2d8e-4e95-a5ed-a8b08b026b31",
+        "orderId": "ord_01M4G0J3JSEP31G7NASSA0K649",
+        "finalAmount": {
+          "amount": 102.75,
+          "currency": "SGD"
+        },
+        "nextAction": null,
+        "createdAt": "2026-10-09T09:40:26.958Z",
+        "updatedAt": "2026-10-09T09:40:26.958Z"
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 309,
+      "response": {
+        "id": "7117a4b6-1ce6-47a6-ac67-b5d1371b9e0d",
+        "status": "COMPLETED",
+        "quoteId": "dda64e37-f4f8-422c-bdfc-64ed4280b493",
+        "enrollmentId": "88cb75ba-2d8e-4e95-a5ed-a8b08b026b31",
+        "orderId": "ord_01M4G0J3JSEP31G7NASSA0K649",
+        "finalAmount": {
+          "amount": 102.75,
+          "currency": "SGD"
+        },
+        "nextAction": null,
+        "createdAt": "2026-10-09T09:40:26.958Z",
+        "updatedAt": "2026-10-09T09:44:21.666Z"
       }
     }
   ],
-  "enrollmentId": "3d5cb503-4115-4cf7-90f0-7a4193b7b8cc"
+  "enrollmentId": "88cb75ba-2d8e-4e95-a5ed-a8b08b026b31"
 }

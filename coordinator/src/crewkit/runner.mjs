@@ -12,7 +12,8 @@ const here = dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = join(here, '..', '..', '..');
 export const RECORDS_DIR = process.env.CREWKIT_RECORDS_DIR || join(REPO_ROOT, 'crewkit-records');
 export const DEFAULT_TAPE = join(here, 'fixtures', 'demo-popular-sg.tape.json');
-export const DEFAULT_BRIEF = join(here, 'fixtures', 'demo-brief.json');
+// Matches the recorded real run in DEFAULT_TAPE (6 guests, S$105).
+export const DEFAULT_BRIEF = join(here, 'fixtures', 'demo-brief-6.json');
 export const MODES = ['replay', 'simulate', 'live'];
 
 function resolveEnrollmentId(brief) {
@@ -78,7 +79,7 @@ export async function startRun(rawBrief, { mode = 'replay', sinks = [], bridgeSi
   const done = (async () => {
     let result;
     try {
-      result = await runCrewkit({ brief, api, emit: stream.emit, enrollmentId, log, ...(pollEveryMs !== undefined ? { pollEveryMs } : mode === 'replay' ? { pollEveryMs: 2500 * speed } : {}), ...(mode === 'replay' && speed === 0 ? { sleep: async () => {} } : {}) });
+      result = await runCrewkit({ brief, api, emit: stream.emit, enrollmentId, log, ...(pollEveryMs !== undefined ? { pollEveryMs } : {}), ...(mode === 'replay' ? { sleep: speed > 0 ? (ms) => new Promise((r) => setTimeout(r, ms * speed)) : async () => {} } : {}) });
     } catch (e) {
       // Unexpected errors still end the run visibly. Messages come from Reap error bodies, never the key.
       stream.emit('failed', { status: e.code || 'ERROR', reason: String(e.message).slice(0, 300) });

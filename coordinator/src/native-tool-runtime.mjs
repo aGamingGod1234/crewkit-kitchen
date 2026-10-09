@@ -1654,7 +1654,7 @@ export async function crewkitShop(tool) {
 			last: last === null ? null : { runId: last.runId, mode: last.mode, status: last.status, reason: last.reason ?? null, record: last.record ?? null, calls: last.calls ?? null } };
 	}
 	try {
-		const run = await controller.start(tool.brief, { mode: tool.mode ?? process.env.CREWKIT_AGENT_MODE ?? 'replay' });
+		const run = await controller.start(tool.brief, { mode: tool.mode ?? process.env.CREWKIT_AGENT_MODE ?? 'replay', ...(process.env.CREWKIT_REPLAY_SPEED === undefined ? {} : { speed: Number(process.env.CREWKIT_REPLAY_SPEED) }) });
 		return { state: 'SUCCEEDED', reasonCode: 'CREWKIT_STARTED', runId: run.runId,
 			message: 'Shopping run started. The kitchen shows every step; nothing is bought until a human approves on Reap. Use crewkit_shop status later instead of polling.' };
 	} catch (error) {

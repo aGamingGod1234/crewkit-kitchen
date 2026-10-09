@@ -1,0 +1,1983 @@
+{
+  "version": 1,
+  "recordedAt": "2026-10-09T08:23:55.913Z",
+  "note": "search entries are REAL Reap sandbox responses (popular.com.sg / \"Popular Bookstore\", SGD) recorded 2026-10-09T08:23:55.913Z. createQuote/getQuote/createCheckout/getCheckout are SYNTHETIC (prices from those searches, shipping 4 SGD assumed) because REAP_EMAIL is not set yet. Re-record with a simulate run once it is.",
+  "entries": [
+    {
+      "op": "search",
+      "key": "name badge holder",
+      "ms": 944,
+      "response": {
+        "id": "qry_164665a6d8ba4a42b5a0a7f2fd0d5146",
+        "products": [
+          {
+            "id": "prd_1d802f9443964e7b8c1d4efae06c7505",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Durable N/Badge w/BR #8138",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_0a3b81b1-82db-4f31-9b0e-209f98b22133.jpg?v=1742990820",
+            "priceRange": {
+              "min": {
+                "amount": 3.15,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 3.15,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_148b869b93a94d5396478b4e6d59228d",
+              "price": {
+                "amount": 3.15,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_6fb4da62d4b44032b72094943b7ea003",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Durable DB-Badge Reels #8152",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_185a848b-4c24-40f0-9759-c31f02e93ae0.jpg?v=1742990829",
+            "priceRange": {
+              "min": {
+                "amount": 2.65,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 2.65,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_574b2f3bf21b4f52a640ec1ca3be9df4",
+              "price": {
+                "amount": 2.65,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_a77aaf95c7c94e719623b67924150396",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Centre ID Holder With Lanyard",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_bea2317c-f6e8-4731-92b5-010b6e24aba1.jpg?v=1743003641",
+            "priceRange": {
+              "min": {
+                "amount": 29,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 29,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_fe1e306897c848a0905cdcaf10cbe4a5",
+              "price": {
+                "amount": 29,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_6eeb0533a019402c9b6927b2478db59a",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Durable Badge Reel With Key Ring 8222",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_2e3cb9db-3273-49d4-bc04-cfa0f22919fc.jpg?v=1742990865",
+            "priceRange": {
+              "min": {
+                "amount": 2.65,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 2.65,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_97b38c3a19fc4040bbbeb641bfd99623",
+              "price": {
+                "amount": 2.65,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_642c2e99d087426887c47434aade5fd9",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "DURABLE N/BADGE CLIP 60X90MM 8003- CLEAR",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_95b2dea1-1263-4855-a392-b2c83cd1ad86.jpg?v=1742991016",
+            "priceRange": {
+              "min": {
+                "amount": 1.9,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 1.9,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_24ee4734f73a442da7a214563b1d2f4c",
+              "price": {
+                "amount": 1.9,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_80bf5a02ec8440b8acfb0c9bbb5051af",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "POP Bazic PVC Soft Card Case 9.7 × 7.4cm – Horizontal",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/9555831930183_W_1-Photoroom.png?v=1782196522",
+            "priceRange": {
+              "min": {
+                "amount": 0.45,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 0.45,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_4a5d20690fde4c32a2dc7f60c40b8f64",
+              "name": "BLUE",
+              "price": {
+                "amount": 0.45,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_95707a744ff64a1c99dd4f93697aa842",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Durable Badge Reel Style 8324",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_c4715b03-2120-4da2-bfd0-389faea9b481.jpg?v=1769582114",
+            "priceRange": {
+              "min": {
+                "amount": 3.85,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 3.85,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_410acbc7406b455e89b3e42dc1ac5833",
+              "name": "BLACK",
+              "price": {
+                "amount": 3.85,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_3adcacff8f934c90afd1965ff1686362",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "DURABLE BADGE RL W/SPRING FASTENER 8221",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_6c0e7961-1638-45c4-ab75-3f93f2adf177.jpg?v=1742990899",
+            "priceRange": {
+              "min": {
+                "amount": 2.65,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 2.65,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_0d850a55dcbe429e885c7d188a1a4634",
+              "price": {
+                "amount": 2.65,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_b909964a22a0470aad149806dc7da379",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Name Badge",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_e381e08c-88ac-46ac-9673-31b66b5b6164.jpg?v=1742997752",
+            "priceRange": {
+              "min": {
+                "amount": 0.45,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 0.45,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_8225d74a6a7d4e2684cfc0ee0d940941",
+              "price": {
+                "amount": 0.45,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_b9830bdb16ea496393d802053ab23c0f",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "POP Bazic PVC Card Holder 85 × 54mm",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_e07bbc1a-d0e6-419e-b1cc-c502123bb1b8.png?v=1782198382",
+            "priceRange": {
+              "min": {
+                "amount": 0.4,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 0.4,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_43df126a4ee84d60a2942edd5cd2f49e",
+              "price": {
+                "amount": 0.4,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          }
+        ],
+        "pagination": {
+          "nextCursor": null,
+          "hasNextPage": false,
+          "returnedCount": 10
+        },
+        "warnings": []
+      }
+    },
+    {
+      "op": "search",
+      "key": "a5 notebook",
+      "ms": 687,
+      "response": {
+        "id": "qry_ee8b9a64b0984dfd8f8b1d2b4addbee4",
+        "products": [
+          {
+            "id": "prd_db8e877e24bd46a7a5c6915e57bb0ca1",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Hw Soft Ring Line Notebook A5 70g 160pg",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_a893c27e-efcb-4120-91d7-168a7df2cf80.png?v=1764118386",
+            "priceRange": {
+              "min": {
+                "amount": 5.6,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 5.6,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_353bd48c89fa4fca8f87b6ba63ddb646",
+              "price": {
+                "amount": 5.6,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_134c1be0a42d450f91fa843f247ca673",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Hw Soft Ring Grid Notebook A5 70g 160pg",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_1cc7ceb4-b6c7-4e2f-a1c4-033c776c6a35.png?v=1764118377",
+            "priceRange": {
+              "min": {
+                "amount": 5.6,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 5.6,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_b9f07ddd859a4c16a45a07419cada18a",
+              "price": {
+                "amount": 5.6,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_383095f4f77a42c0a9e07224623dc580",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "LOOM A5 Hard Cover Notebook – Heart",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_621f8e22-c7f3-4e9c-9889-7b0efd0ec6d5.jpg?v=1781766203",
+            "priceRange": {
+              "min": {
+                "amount": 14.9,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 14.9,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_e68eb824810d49a6bc54f04c9654503f",
+              "price": {
+                "amount": 14.9,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_1063de499dcf45a789bc1854d9ebe9d5",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "DELI NUSIGN  A5 PU NOTEBOOK BLUE ENS281",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_3ee1e8ac-4e8a-49f8-9c0c-609f4bd49be9.jpg?v=1746581501",
+            "priceRange": {
+              "min": {
+                "amount": 14.9,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 14.9,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_0d45bbbff8f24e23b14f377e918bf8c4",
+              "price": {
+                "amount": 14.9,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_88e0eecb34e34c428b7b766d2632adcf",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "PAW PATROL Spiral A5 Notebook with Divider 70GSM",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/9555831980553.jpg?v=1689060593",
+            "priceRange": {
+              "min": {
+                "amount": 7.9,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 7.9,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_6cf5b4a8df294dfba3f82d5a4e8ca2f3",
+              "name": "Peek-a-boo",
+              "price": {
+                "amount": 7.9,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_3ef6c6f326bf4a2c84a9c3125206d8f1",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Azone Threadsewn Notebook 5mm Dots A5",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_842766c6-29b6-4eea-85d2-5b37dff0d7ed.jpg?v=1743010280",
+            "priceRange": {
+              "min": {
+                "amount": 2.6,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 2.6,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_695b4c9238054331b4c4116ff1c6cc6f",
+              "price": {
+                "amount": 2.6,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_96ed8a427f1d41029155a59f6ea8964e",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "A5 Disc-Bound Ruled Notebook 60 Sheets",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_17aa6f9e-2f41-4b48-a34e-63be0b3cd432.jpg?v=1790150342",
+            "priceRange": {
+              "min": {
+                "amount": 8.9,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 8.9,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_bdb22ea234fa4427b7af0c538c703e64",
+              "name": "Outdoor_Rabbit",
+              "price": {
+                "amount": 8.9,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_7fcaf9cea81e4839a0ae6c6e3cee31d7",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Hw Wire-o Pp Line Notebook A5 80g 160pg",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_eae632e4-4b26-4c75-940c-99585d478731.png?v=1764118409",
+            "priceRange": {
+              "min": {
+                "amount": 6.3,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 6.3,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_35b10769fe17460a83af9c510b231fdc",
+              "price": {
+                "amount": 6.3,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_689dc10a3c2649e9bc64636a4ab2ed20",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "UG HC A5 ELASTIC NOTE BOOK",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_cc3d0ea0-af64-49ed-be23-5b322856a1a9.jpg?v=1786004902",
+            "priceRange": {
+              "min": {
+                "amount": 8.2,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 12,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_459a833772954c51a23776182cff7c89",
+              "name": "A5",
+              "price": {
+                "amount": 12,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          }
+        ],
+        "pagination": {
+          "nextCursor": null,
+          "hasNextPage": false,
+          "returnedCount": 9
+        },
+        "warnings": []
+      }
+    },
+    {
+      "op": "search",
+      "key": "gel pen",
+      "ms": 790,
+      "response": {
+        "id": "qry_7a4819094c534c989520b73dd4a9fbd8",
+        "products": [
+          {
+            "id": "prd_f3650489fe0f45e4b99bf10be41dc326",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "PILOT G2 GEL PEN 0.7MM",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_8063da30-1590-45ca-b486-fb320e21f8a0.jpg?v=1769589305",
+            "priceRange": {
+              "min": {
+                "amount": 2.2,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 2.2,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_eed2627753444230bd6c2a180928df03",
+              "name": "BLACK",
+              "price": {
+                "amount": 2.2,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_38760e0fd8c34627ae5085a34b1d252f",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "PILOT JUICE GEL PEN ULTRA-FINE 0.38MM",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_9921dbd5-40f0-4682-b266-cec01004106a.jpg?v=1754981921",
+            "priceRange": {
+              "min": {
+                "amount": 1.75,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 1.75,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_26a7505e2299406ea11a7aeffcf2c9c8",
+              "name": "BLUE_BLACK",
+              "price": {
+                "amount": 1.75,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_32d290d204ca414cb5e68fa64d84c15e",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "PILOT JUICE GEL PEN EXTRA-FINE 0.5MM",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_08aedf4e-d263-4686-af79-c2fedc23d5e0.jpg?v=1754981819",
+            "priceRange": {
+              "min": {
+                "amount": 1.75,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 1.75,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_b0c27335e64b4731abb558ae1e1fd922",
+              "name": "BLACK",
+              "price": {
+                "amount": 1.75,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_9af95fa62a1e45ed8c962b9bd9bd7f53",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "PILOT FRIXION CLICKER ERASABLE GEL PEN 0.5MM",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_3add083e-8c77-4408-8ccf-5d861e356078.jpg?v=1779727828",
+            "priceRange": {
+              "min": {
+                "amount": 2.75,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 2.75,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_533de2784ded404fa0cf79277a4ffa6f",
+              "name": "BLACK",
+              "price": {
+                "amount": 2.75,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_b69251f8c72b4bb2aebd9943aa3bdd1c",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Cherry Cola Gel Pen",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_641d684e-dfea-4bc4-ad05-f93455a04929.jpg?v=1789455970",
+            "priceRange": {
+              "min": {
+                "amount": 5.9,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 5.9,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_b4551ae0c594435bbf6558f50b2b8f85",
+              "name": "Pink_Blue",
+              "price": {
+                "amount": 5.9,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_b5e42042acdf44f88f6ad437fdc8a4ae",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "PILOT JUICE GEL PEN FINE 0.7MM",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_35e18b1c-cb18-4a10-8a61-4d468bae23af.jpg?v=1754981845",
+            "priceRange": {
+              "min": {
+                "amount": 1.75,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 1.75,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_19a96b873ff14ab98eb73c79ce2b883e",
+              "name": "BLACK",
+              "price": {
+                "amount": 1.75,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_df32010414264df49847e558e6ab452d",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "PILOT JUICE UP GEL PEN 0.5MM",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_b70e34e4-6c30-4b52-add5-df612ee4055a.jpg?v=1779727897",
+            "priceRange": {
+              "min": {
+                "amount": 2.65,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 2.65,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_c56d4430e45546e386ecd7947c5d8c86",
+              "name": "BLUE_BLACK",
+              "price": {
+                "amount": 2.65,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_e5ca3043bd47432a92457f3ea817944e",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "PILOT G2 GEL PEN 0.5MM",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_40cdd0a4-f4de-4835-9920-299d97de4599.jpg?v=1769589297",
+            "priceRange": {
+              "min": {
+                "amount": 2.2,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 2.2,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_3cdff48b178d4be7b7beaca62f7af589",
+              "name": "BLACK",
+              "price": {
+                "amount": 2.2,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_2f56dfee98c44f67b53b4d342bd9ca79",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "PILOT B2P GEL PEN 0.7MM",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_44667501-7c2d-4d38-8453-74ce9f09503d.jpg?v=1754981714",
+            "priceRange": {
+              "min": {
+                "amount": 2,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 2,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_41f0c449aed844d9b86ba7cb6fbd8744",
+              "name": "BLACK",
+              "price": {
+                "amount": 2,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          }
+        ],
+        "pagination": {
+          "nextCursor": null,
+          "hasNextPage": false,
+          "returnedCount": 9
+        },
+        "warnings": []
+      }
+    },
+    {
+      "op": "search",
+      "key": "usb-c charging cable",
+      "ms": 703,
+      "response": {
+        "id": "qry_1de942b4d02d4d5a9914fadbc9dee87a",
+        "products": [
+          {
+            "id": "prd_359458b3584e4e648db076c54f0409bf",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Ugreen L532 240W USB-C to USB-C PD Fast Charging Cable 1M",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_1f8a32a8-6201-4c6f-b6fd-3c5ffe2871ac.webp?v=1775725727",
+            "priceRange": {
+              "min": {
+                "amount": 15.9,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 15.9,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_9c7d5af3791340bd82e80bd951bacf4f",
+              "price": {
+                "amount": 15.9,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_5a1dae1d7b2b45768b5b306565eef82f",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Ugreen L532 240W USB-C to USB-C PD Fast Charging Cable 2M",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_83edc46f-bd2c-4560-81c0-29daadd449c7.webp?v=1775725911",
+            "priceRange": {
+              "min": {
+                "amount": 18.9,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 18.9,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_5a328376374847b2ab9976eba0a65e66",
+              "price": {
+                "amount": 18.9,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_c5896002f8b543eeb3a8dbae7fcff509",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "UGREEN 3M 240W USB-C to USB-C PD Fast Charging Cable - Grey (L532_65909)",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_45d6b6b3-407e-4459-834f-095a1adbc58c.jpg?v=1782783179",
+            "priceRange": {
+              "min": {
+                "amount": 23.9,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 23.9,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_e419c3b1be4f4861bff90dbd54833da0",
+              "price": {
+                "amount": 23.9,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_71222038ce184ab5b8f8f4b01a9c1078",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Momax DC62D USB-C to USB-C Magnetic Cable 100W (2M) - Black",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_ea4d345f-2331-48a0-84ca-b7124c261f4a.webp?v=1773899520",
+            "priceRange": {
+              "min": {
+                "amount": 24.2,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 24.2,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_61f34d29c8fc4d0e96f39b969f574be8",
+              "price": {
+                "amount": 24.2,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_7ef0df7aa7d54e318c5bbdc1beeba6ad",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Ugreen US334 100W & 480Mbps USB-C 2.0 to Angled USB-C M/M Round Cable Aluminium Shell with Braided 2m (Black)",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_a7aeb189-8605-424a-b0f9-a793440a40e3.webp?v=1774508106",
+            "priceRange": {
+              "min": {
+                "amount": 15.9,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 15.9,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_1e6a0b4b64e443189a9218bf1f5d540c",
+              "price": {
+                "amount": 15.9,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_41c885ba23a94979a3c02670dd84a1c4",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Anker 2-in-1 4ft USB-C Cable",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_50e5b28f-a2c8-4d3c-a353-47a9b1f324c9.jpg?v=1781741249",
+            "priceRange": {
+              "min": {
+                "amount": 34,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 34,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_d346f5963d1145f19ba2535f507bba7f",
+              "price": {
+                "amount": 34,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_7d839df23f22400690deba35a3377d36",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Mazer InfiniteLink Cobra2 240W USB C-C Magnetic Cable (1.25m) Pink",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_9b1fc1be-89a8-4c26-a73e-9933b13d84ab.webp?v=1777278899",
+            "priceRange": {
+              "min": {
+                "amount": 21.9,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 21.9,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_1cf02461da8545318e06a07eed127749",
+              "price": {
+                "amount": 21.9,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_0b4af0a01607451e9f260dd033624fd4",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Anker USB-C to USB-C 240W (3ft)",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_554b3f99-5d98-4c43-8959-8b2733d774ad.jpg?v=1774497606",
+            "priceRange": {
+              "min": {
+                "amount": 19.7,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 19.7,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_fc2ebc1137314e4e92b3bbfdcd57c5d5",
+              "name": "BLACK",
+              "price": {
+                "amount": 19.7,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_e37c2e51c4434416a5e43c2cbb1143b1",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Mazer InfiniteLink Cobra Magnetic 4-in-1 2M/60W Fast Charging Cable",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_b2f599a2-0413-456a-a6d5-ec4760193920.jpg?v=1775718573",
+            "priceRange": {
+              "min": {
+                "amount": 24.9,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 24.9,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_e62f420761014c55ae0349c583002cf5",
+              "price": {
+                "amount": 24.9,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_278c52087de74efd9274bc03b60d09b3",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Verbatim Sync & Charge Cable 240W USB-C to USB-C with LED Display (SCC4-CCD240) Black",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_e01290d4-05f3-4811-81dc-3a3bf79f5eb6.jpg?v=1790154407",
+            "priceRange": {
+              "min": {
+                "amount": 35.9,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 35.9,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_34ca5366a54647e08f374fb95f52b550",
+              "price": {
+                "amount": 35.9,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          }
+        ],
+        "pagination": {
+          "nextCursor": null,
+          "hasNextPage": false,
+          "returnedCount": 10
+        },
+        "warnings": []
+      }
+    },
+    {
+      "op": "search",
+      "key": "sticky notes",
+      "ms": 669,
+      "response": {
+        "id": "qry_a7e49151ffda4a3c87d8353e46c7c7ea",
+        "products": [
+          {
+            "id": "prd_f5ec2905c2a04767b3c097da0b65f6f6",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Post-it® 654-5ssau Super Sticky Notes, Rio De Janeiro Collection, 3x3\"",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_bf8b5b21-3ba5-4e66-887d-c55b2fda8b01.webp?v=1782866127",
+            "priceRange": {
+              "min": {
+                "amount": 12,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 12,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_77871870e5274263b7f69e4c6c615732",
+              "price": {
+                "amount": 12,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_0e6af891b3fa4511874221288702c2bf",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Post-it® 654-5ssne Simply Serene Collection Super Sticky Notes 3x3\", 5pads, 86sheets",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_e9a10045-0bf2-4313-b63d-813011e801b8.jpg?v=1782866231",
+            "priceRange": {
+              "min": {
+                "amount": 12,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 12,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_8fcf1368df1e41859ab6b9258ca95472",
+              "price": {
+                "amount": 12,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_4454b4cda3d7413a9dab30ec60866aaa",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "3M POST-IT SUPER STICKY LINED NOTES 4x4 4421-4ssmx",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_64a2ca9d-a69b-402d-9927-20167c4f9f0d.jpg?v=1782865870",
+            "priceRange": {
+              "min": {
+                "amount": 13.3,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 13.3,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_d92e6df1bf4a4f43a1983461cb44c8e9",
+              "price": {
+                "amount": 13.3,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_cae6ab858ba746349f5eea83a7ad86c0",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Post-it® Super Sticky Lined Notes, 4x6\"",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_14d55e54-faf4-4bae-8086-be488beea735.jpg?v=1782947324",
+            "priceRange": {
+              "min": {
+                "amount": 4.75,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 10.2,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_c0970ea81c8f466e9e7183525ed2f131",
+              "name": "MIXED",
+              "price": {
+                "amount": 10.2,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_34b3ff68216342fc911e1f3772ce5753",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Post-it® 654-5SSMIA Super Sticky Notes Miami Collection, 3x3\"",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_01ef50f7-5134-4d39-9e07-f68f15b28688.webp?v=1782865612",
+            "priceRange": {
+              "min": {
+                "amount": 12,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 12,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_92eecc11ee1f4efe958b219a6cd540bc",
+              "price": {
+                "amount": 12,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_29afc4b71bf04f76bb258887d08fb751",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Sanrio Kuromi Index Sticky Notes",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_179e2855-f4e8-452f-8481-aca06c3c1bfe.jpg?v=1764118604",
+            "priceRange": {
+              "min": {
+                "amount": 7.9,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 7.9,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_41874bd5c1b8409c8f8354c1bb266784",
+              "price": {
+                "amount": 7.9,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_ba816e9cff5a45b6b1bd21e4b73697be",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "3m Post-it Super Sticky Note,6541ssmc-5n",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_28fa6b07-e6a5-435e-a73d-cc6a9d534858.jpg?v=1782865911",
+            "priceRange": {
+              "min": {
+                "amount": 24.2,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 24.2,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_11885a54e5834713b3d2e3db91b4f28e",
+              "price": {
+                "amount": 24.2,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_39c2a65520584fbeaf07743e43051a5f",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "3m Post-it Super Sticky Note,6541ssmc-2n",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_31a66c8f-ce47-4ce3-92bf-43cdeeefdef0.jpg?v=1782865903",
+            "priceRange": {
+              "min": {
+                "amount": 24.2,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 24.2,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_917e786423af4091b114814d313b93ee",
+              "price": {
+                "amount": 24.2,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_76401bcb80f84bd6874724df49c60e88",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "3m Post-it Super Sticky Note,6541ssmc-4n",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_6c76cef4-bcf0-4e5d-a816-ae43ee375c45.jpg?v=1782865907",
+            "priceRange": {
+              "min": {
+                "amount": 24.2,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 24.2,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_6c77899d053f4432bb49c73d4afd3fb8",
+              "price": {
+                "amount": 24.2,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_0fc8aa10fdb04938831945d5e6a4e40e",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "3m Post-it Super Sticky Note,6541ssmc-7n",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_3150078c-7301-47c4-8539-ccaec8f75691.jpg?v=1782865916",
+            "priceRange": {
+              "min": {
+                "amount": 24.2,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 24.2,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_0147aadec18347cdab5f04db26f47605",
+              "price": {
+                "amount": 24.2,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          }
+        ],
+        "pagination": {
+          "nextCursor": null,
+          "hasNextPage": false,
+          "returnedCount": 10
+        },
+        "warnings": []
+      }
+    },
+    {
+      "op": "search",
+      "key": "whiteboard marker",
+      "ms": 674,
+      "response": {
+        "id": "qry_152a263ce821443292a8f57130e9aa4b",
+        "products": [
+          {
+            "id": "prd_d5f49ad5334d461fa4a2c0e0117fb15a",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Pilot V Board Master Whiteboard Marker (bullet Medium Tip) Set Of 5 Colors",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_103f6934-122d-45ac-9b5b-901940df7951.jpg?v=1744185794",
+            "priceRange": {
+              "min": {
+                "amount": 7.65,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 7.65,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_d7dcaadccc7d45afacde6cc7d6ff918c",
+              "price": {
+                "amount": 7.65,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_11acdf49c11c4e0eb9181b6e283c7272",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "PILOT V BOARD MASTER WHITEBOARD MARKER MEDIUM BULLET TIP (BEGREEN)",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_0bed1edd-84c1-472c-9908-93506b4edfa9.jpg?v=1754981646",
+            "priceRange": {
+              "min": {
+                "amount": 1.75,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 1.75,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_f1ff41d403f84627ad6b42f4e89af0c1",
+              "name": "BLACK",
+              "price": {
+                "amount": 1.75,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_a00cab22e7a84dd08a19447d25e6884d",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Pilot V Board Master Slim Whiteboard Marker",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_4835c96a-9254-4481-8177-ffaf49240be0.jpg?v=1754981874",
+            "priceRange": {
+              "min": {
+                "amount": 1.35,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 1.35,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_a3a19aac0ff74201b817587dfe6e036d",
+              "name": "BLACK",
+              "price": {
+                "amount": 1.35,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_35e29d6b704c4acb89ef782147b118bd",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Artline Supreme Whiteboard Marker – 1.5mm",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_fd1fd4af-8858-4bd4-b492-76a36a7f196f.jpg?v=1784528454",
+            "priceRange": {
+              "min": {
+                "amount": 1.55,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 1.55,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_b451663d1b894038aa53a83e0e6d9a3b",
+              "name": "BLACK",
+              "price": {
+                "amount": 1.55,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_04417358e9074b27aba006e59068c73e",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "PENTEL Maxiflo Liquid Ink Whiteboard Marker",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_56c6a61d-87ad-486c-81be-839c7714cf16.jpg?v=1754982737",
+            "priceRange": {
+              "min": {
+                "amount": 3,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 3,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_9e18322ade7b49689e334c16b88fd68c",
+              "name": "BLACK",
+              "price": {
+                "amount": 3,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_d69bcf0f5c204a8fbe881c1eed28a708",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Pop Bazic Whiteboard Marker 10pcs Set",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_9619365a-5841-4360-8b87-133c813da7d3.jpg?v=1785197124",
+            "priceRange": {
+              "min": {
+                "amount": 8.9,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 8.9,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_2f1434c70c664f458c985b26fe2c1701",
+              "name": "NA",
+              "price": {
+                "amount": 8.9,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_5b8ab8385e794b679992feca5e34a37d",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "STABILO WHITEBOARD MARKER-6 COL",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_5e6c192b-2dfb-4cc4-924f-25a4a662e432.jpg?v=1743477487",
+            "priceRange": {
+              "min": {
+                "amount": 8.35,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 8.35,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_de98faa6979d41b5a4ffd5b31891ea28",
+              "price": {
+                "amount": 8.35,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_a44ca0fe11524fb19c424e3c3a220e58",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Stabilo Plan Whiteboard Markers 8-colour",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_2518d711-282f-4945-ae83-9c4e7b1d2098.jpg?v=1743040349",
+            "priceRange": {
+              "min": {
+                "amount": 11.6,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 11.6,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_cec0a257abb1450a89d92ce3fcd06cd9",
+              "price": {
+                "amount": 11.6,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_682499b562af4caea4e3e3c429b656ff",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "Pilot V Board Master Slim Whiteboard Markers Pack Of 3 Colors",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_7210ccef-ba63-4269-a221-700c8e449a7a.jpg?v=1743000070",
+            "priceRange": {
+              "min": {
+                "amount": 3.95,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 3.95,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_48825132326d4a9680f94d61042e8e2b",
+              "price": {
+                "amount": 3.95,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "prd_1c4b1151db564190a7f57a12f1f99e84",
+            "merchant": {
+              "name": "Popular Bookstore"
+            },
+            "name": "PILOT V BOARD MASTER MARKER SLIM WITH DUSTER",
+            "imageUrl": "https://cdn.shopify.com/s/files/1/0574/5662/3823/files/download_cf3c4d7e-d2a1-42dd-ab7a-6d1aaa178b72.jpg?v=1769590197",
+            "priceRange": {
+              "min": {
+                "amount": 1.5,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 1.5,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_b9dc7564cddd4b919fba201f7b9ae69b",
+              "name": "BLACK",
+              "price": {
+                "amount": 1.5,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          }
+        ],
+        "pagination": {
+          "nextCursor": null,
+          "hasNextPage": false,
+          "returnedCount": 10
+        },
+        "warnings": []
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 1714,
+      "response": {
+        "id": "11111111-1111-4111-8111-000000000001",
+        "expiresAt": "2026-10-09T08:34:02.107Z",
+        "shippingOptions": [
+          {
+            "id": "ship_std",
+            "name": "Standard Delivery (synthetic)",
+            "selected": true,
+            "price": {
+              "amount": 4,
+              "currency": "SGD"
+            },
+            "details": []
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 246.45,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            },
+            "includedInPrices": true
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 250.45,
+            "currency": "SGD"
+          }
+        }
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 1701,
+      "response": {
+        "id": "11111111-1111-4111-8111-000000000002",
+        "expiresAt": "2026-10-09T08:34:03.810Z",
+        "shippingOptions": [
+          {
+            "id": "ship_std",
+            "name": "Standard Delivery (synthetic)",
+            "selected": true,
+            "price": {
+              "amount": 4,
+              "currency": "SGD"
+            },
+            "details": []
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 177.45,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            },
+            "includedInPrices": true
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 181.45,
+            "currency": "SGD"
+          }
+        }
+      }
+    },
+    {
+      "op": "getQuote",
+      "key": "",
+      "ms": 407,
+      "response": {
+        "id": "11111111-1111-4111-8111-000000000002",
+        "expiresAt": "2026-10-09T08:34:03.810Z",
+        "shippingOptions": [
+          {
+            "id": "ship_std",
+            "name": "Standard Delivery (synthetic)",
+            "selected": true,
+            "price": {
+              "amount": 4,
+              "currency": "SGD"
+            },
+            "details": []
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 177.45,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            },
+            "includedInPrices": true
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 181.45,
+            "currency": "SGD"
+          }
+        }
+      }
+    },
+    {
+      "op": "createCheckout",
+      "key": "",
+      "ms": 1314,
+      "response": {
+        "id": "22222222-2222-4222-8222-000000000001",
+        "status": "REQUIRES_ACTION",
+        "quoteId": "11111111-1111-4111-8111-000000000002",
+        "enrollmentId": "3d5cb503-4115-4cf7-90f0-7a4193b7b8cc",
+        "amount": {
+          "amount": 181.45,
+          "currency": "SGD"
+        },
+        "nextAction": {
+          "type": "REDIRECT",
+          "url": "[redacted]",
+          "expiresAt": "2026-10-09T08:39:05.531Z"
+        }
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 300,
+      "response": {
+        "id": "22222222-2222-4222-8222-000000000001",
+        "status": "REQUIRES_ACTION",
+        "quoteId": "11111111-1111-4111-8111-000000000002",
+        "enrollmentId": "3d5cb503-4115-4cf7-90f0-7a4193b7b8cc",
+        "orderId": null,
+        "finalAmount": null,
+        "nextAction": {
+          "type": "REDIRECT",
+          "url": "[redacted]",
+          "expiresAt": "2026-10-09T08:39:05.531Z"
+        }
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 300,
+      "response": {
+        "id": "22222222-2222-4222-8222-000000000001",
+        "status": "REQUIRES_ACTION",
+        "quoteId": "11111111-1111-4111-8111-000000000002",
+        "enrollmentId": "3d5cb503-4115-4cf7-90f0-7a4193b7b8cc",
+        "orderId": null,
+        "finalAmount": null,
+        "nextAction": {
+          "type": "REDIRECT",
+          "url": "[redacted]",
+          "expiresAt": "2026-10-09T08:39:05.531Z"
+        }
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 300,
+      "response": {
+        "id": "22222222-2222-4222-8222-000000000001",
+        "status": "REQUIRES_ACTION",
+        "quoteId": "11111111-1111-4111-8111-000000000002",
+        "enrollmentId": "3d5cb503-4115-4cf7-90f0-7a4193b7b8cc",
+        "orderId": null,
+        "finalAmount": null,
+        "nextAction": {
+          "type": "REDIRECT",
+          "url": "[redacted]",
+          "expiresAt": "2026-10-09T08:39:05.531Z"
+        }
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 300,
+      "response": {
+        "id": "22222222-2222-4222-8222-000000000001",
+        "status": "REQUIRES_ACTION",
+        "quoteId": "11111111-1111-4111-8111-000000000002",
+        "enrollmentId": "3d5cb503-4115-4cf7-90f0-7a4193b7b8cc",
+        "orderId": null,
+        "finalAmount": null,
+        "nextAction": {
+          "type": "REDIRECT",
+          "url": "[redacted]",
+          "expiresAt": "2026-10-09T08:39:05.531Z"
+        }
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 300,
+      "response": {
+        "id": "22222222-2222-4222-8222-000000000001",
+        "status": "REQUIRES_ACTION",
+        "quoteId": "11111111-1111-4111-8111-000000000002",
+        "enrollmentId": "3d5cb503-4115-4cf7-90f0-7a4193b7b8cc",
+        "orderId": null,
+        "finalAmount": null,
+        "nextAction": {
+          "type": "REDIRECT",
+          "url": "[redacted]",
+          "expiresAt": "2026-10-09T08:39:05.531Z"
+        }
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 300,
+      "response": {
+        "id": "22222222-2222-4222-8222-000000000001",
+        "status": "REQUIRES_ACTION",
+        "quoteId": "11111111-1111-4111-8111-000000000002",
+        "enrollmentId": "3d5cb503-4115-4cf7-90f0-7a4193b7b8cc",
+        "orderId": null,
+        "finalAmount": null,
+        "nextAction": {
+          "type": "REDIRECT",
+          "url": "[redacted]",
+          "expiresAt": "2026-10-09T08:39:05.532Z"
+        }
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 300,
+      "response": {
+        "id": "22222222-2222-4222-8222-000000000001",
+        "status": "PROCESSING",
+        "quoteId": "11111111-1111-4111-8111-000000000002",
+        "enrollmentId": "3d5cb503-4115-4cf7-90f0-7a4193b7b8cc",
+        "orderId": null,
+        "finalAmount": null,
+        "nextAction": null
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 300,
+      "response": {
+        "id": "22222222-2222-4222-8222-000000000001",
+        "status": "COMPLETED",
+        "quoteId": "11111111-1111-4111-8111-000000000002",
+        "enrollmentId": "3d5cb503-4115-4cf7-90f0-7a4193b7b8cc",
+        "orderId": "POP-SG-DEMO-0001",
+        "finalAmount": {
+          "amount": 181.45,
+          "currency": "SGD"
+        },
+        "nextAction": null
+      }
+    }
+  ],
+  "enrollmentId": "3d5cb503-4115-4cf7-90f0-7a4193b7b8cc"
+}

@@ -10,7 +10,7 @@ process.env.CREWKIT_RECORDS_DIR = mkdtempSync(path.join(tmpdir(), 'crewkit-test-
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixtures = path.join(here, '..', 'src', 'crewkit', 'fixtures');
 const brief = JSON.parse(readFileSync(path.join(fixtures, 'demo-brief.json'), 'utf8'));
-const tape = JSON.parse(readFileSync(path.join(fixtures, 'demo-popular-sg.tape.json'), 'utf8'));
+const tape = JSON.parse(readFileSync(path.join(here, 'fixtures', 'crewkit-handmade.tape.json'), 'utf8'));
 
 const { evaluateGate, planRework, quoteTotals, checkRequirements, validateQuoteItems } = await import('../src/crewkit/gate.mjs');
 const { mapToMcItem } = await import('../src/crewkit/mapping.mjs');
@@ -125,7 +125,7 @@ const EXPECTED = ['reset', 'brief', 'item_added', 'item_added', 'item_added', 'i
 
 test('replay emits the full contract sequence with one runId and gap-free seq', async () => {
   const sent = [];
-  const { runId, done } = await startRun(brief, { mode: 'replay', speed: 0, sinks: [(p) => sent.push(p)] });
+  const { runId, done } = await startRun(brief, { mode: 'replay', speed: 0, tape, sinks: [(p) => sent.push(p)] });
   const r = await done;
   assert.equal(r.status, 'COMPLETED');
   assert.deepEqual(names(sent), EXPECTED);
@@ -189,7 +189,7 @@ test('checkout EXPIRED emits expired and never completed or record', async () =>
 test('finding 2: approval URL goes only to the bridge sink, never to files, logs or the event log', async () => {
   const { REPLAY_APPROVAL_URL } = await import('../src/crewkit/tape.mjs');
   const bridge = []; const logged = [];
-  const { done } = await startRun(brief, { mode: 'replay', speed: 0, bridgeSinks: [(p) => bridge.push(p)], sinks: [(p) => logged.push(p)] });
+  const { done } = await startRun(brief, { mode: 'replay', speed: 0, tape, bridgeSinks: [(p) => bridge.push(p)], sinks: [(p) => logged.push(p)] });
   const r = await done;
   const raw = bridge.filter((p) => p.event === 'checkout');
   assert.ok(raw.length && raw.every((p) => p.data.approvalUrl === REPLAY_APPROVAL_URL), 'mod gets the replay placeholder for the QR');
@@ -210,14 +210,16 @@ test('finding 2: recorded tapes store [redacted] instead of the hosted approval 
   assert.equal(live.nextAction.url, secret, 'the engine still gets the real response');
   assert.ok(!JSON.stringify(rec.tape).includes('SECRET-TOKEN'));
   assert.equal(rec.tape.entries[0].response.nextAction.url, '[redacted]');
-  assert.ok(!readFileSync(path.join(fixtures, 'demo-popular-sg.tape.json'), 'utf8').includes('/approve/'), 'committed fixture is redacted');
+  assert.ok(!/approve\/|prava\.space|ses_/.test(readFileSync(path.join(fixtures, 'demo-popular-sg.tape.json'), 'utf8')), 'committed real fixture is redacted');
 });
 
 test('finding 2: crewkit_shop status never returns the approval URL to the model', async () => {
   const { getCrewkitController } = await import('../src/crewkit/service.mjs');
   const { crewkitShop } = await import('../src/native-tool-runtime.mjs');
   const controller = getCrewkitController();
+  process.env.CREWKIT_REPLAY_SPEED = '0';
   const started = await crewkitShop({ action: 'start', mode: 'replay' });
+  delete process.env.CREWKIT_REPLAY_SPEED;
   assert.equal(started.reasonCode, 'CREWKIT_STARTED');
   const deadline = Date.now() + 60_000;
   while (controller.active !== null && Date.now() < deadline) await new Promise((r) => setTimeout(r, 200));
@@ -240,7 +242,7 @@ test('a recorded tape replays to the same events', async () => {
 test('crewkit_state passes protocol validation and rejects unknown events', async () => {
   const { validateProtocolV2Payload, COORDINATOR_TO_SERVER_TYPES } = await import('../src/protocol-v2.mjs');
   assert.ok(COORDINATOR_TO_SERVER_TYPES.includes('crewkit_state'));
-  const { done } = await startRun(brief, { mode: 'replay', speed: 0, writeRecords: false });
+  const { done } = await startRun(brief, { mode: 'replay', speed: 0, tape, writeRecords: false });
   for (const p of (await done).events) assert.deepEqual(validateProtocolV2Payload('crewkit_state', p), p);
   assert.throws(() => validateProtocolV2Payload('crewkit_state', { runId: 'r', seq: 1, event: 'explode', data: {} }));
   assert.throws(() => validateProtocolV2Payload('crewkit_state', { runId: 'r', seq: 1, event: 'reset', data: {}, extra: 1 }));
@@ -325,4 +327,15 @@ test('sold-out mandatory need with no in-stock substitute fails BRIEF_INFEASIBLE
   const { r, events } = await run(t);
   assert.equal(r.status, 'BRIEF_INFEASIBLE');
   assert.ok(!events.some((e) => e.event === 'checkout'));
+});
+
+test('the committed real Reap tape replays the 6-guest brief to the recorded order', async () => {
+  const brief6 = JSON.parse(readFileSync(path.join(fixtures, 'demo-brief-6.json'), 'utf8'));
+  const { done } = await startRun(brief6, { mode: 'replay', speed: 0, writeRecords: false });
+  const r = await done;
+  assert.equal(r.status, 'COMPLETED');
+  assert.deepEqual(r.record, { budget: 105, quoted: 102.75, charged: 102.75, variance: 0, orderId: 'ord_01M4G0J3JSEP31G7NASSA0K649', currency: 'SGD' });
+  const ev = r.events.map((e) => e.event);
+  assert.ok(ev.indexOf('gate_blocked') < ev.indexOf('gate_passed'), 'first quote over budget, then passes');
+  assert.ok(r.events.some((e) => e.event === 'item_removed' && e.data.why === 'sold_out'), 'sold-out beat present');
 });
