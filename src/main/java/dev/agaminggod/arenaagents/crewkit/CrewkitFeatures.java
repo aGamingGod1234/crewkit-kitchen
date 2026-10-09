@@ -26,6 +26,7 @@ public final class CrewkitFeatures {
 						new dev.agaminggod.arenaagents.crewkit.fun.guests.GuestChatterFeature(),
 						new dev.agaminggod.arenaagents.crewkit.fun.party.CelebrationFeature(),
 						new dev.agaminggod.arenaagents.crewkit.fun.pigeons.ReapPigeonFeature(),
+						new dev.agaminggod.arenaagents.crewkit.fun.busy.KitchenRushFeature(),
 						new dev.agaminggod.arenaagents.crewkit.director.DirectorFeature(),
 					});
 				}
