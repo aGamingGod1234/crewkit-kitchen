@@ -10,7 +10,7 @@ CrewKit Kitchen
 
 An AI chef turns a workshop guest list into a budget-checked Reap order, shown in Minecraft.
 
-(93 characters.)
+(92 characters.)
 
 ## Description (~150 words)
 
