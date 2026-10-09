@@ -40,9 +40,15 @@ public final class ItemsFeature implements CrewkitFeature {
 	/** Pantry counter: west end of the counter line (layout: counter x 2..14, z 3..5, worktop at y 2). */
 	static final double[] PANTRY = {3.5, 2.15, 4.5};
 
-	static final double ITEM_SCALE = 0.55;
-	static final double SLOT_HEIGHT = 0.46;
-	static final double LABEL_SCALE = 0.9;
+	static final double ITEM_SCALE = 0.42;
+	static final double SLOT_HEIGHT = 0.36;
+	/** Horizontal pitch between stack columns once the stack goes 2+ wide. */
+	static final double COLUMN_PITCH = 0.46;
+	/** Highest item top, relative to the set origin; the ceiling beams start at y=7. */
+	static final double STACK_CEILING = 6.3;
+	static final double LABEL_SCALE = 0.45;
+	/** Hover label characters per line. */
+	static final int LABEL_COLS = 28;
 	static final int ARC_TICKS = 18;
 	static final int TUMBLE_TICKS = 22;
 	static final int HOVER_GRACE = 6;
@@ -160,7 +166,7 @@ public final class ItemsFeature implements CrewkitFeature {
 		if (stack.isEmpty() && fallers.isEmpty() && fan.isEmpty()) return;
 		refreshChef(level);
 		Vec3 head = headTop();
-		for (int i = 0; i < stack.size(); i++) stack.get(i).tick(level, i, head);
+		for (int i = 0; i < stack.size(); i++) stack.get(i).tick(level, i, stack.size(), head);
 		for (Iterator<Faller> it = fallers.iterator(); it.hasNext(); ) if (it.next().tick(level)) it.remove();
 		for (Iterator<Candidate> it = fan.iterator(); it.hasNext(); ) if (it.next().tick(level)) it.remove();
 		hover(level);
@@ -210,9 +216,28 @@ public final class ItemsFeature implements CrewkitFeature {
 		return CrewkitAnchors.at(CrewkitAnchors.AGENT).add(0, 1.92, 0);
 	}
 
-	private static Vec3 slotPos(Vec3 head, int index, long now) {
-		double sway = Math.sin(now * 0.07 + index * 0.9) * 0.018 * index;
-		return head.add(sway, ITEM_SCALE * 0.5 + index * SLOT_HEIGHT, 0);
+	/**
+	 * Slot centre on the chef's head. One column while it fits under STACK_CEILING; past that the stack
+	 * becomes a grid 2 (then 3) wide, filled row by row, so the top item never reaches the beams.
+	 */
+	private static Vec3 slotPos(Vec3 head, int index, int count, long now) {
+		double room = CrewkitAnchors.origin.getY() + STACK_CEILING - head.y - ITEM_SCALE;
+		int rows = Math.max(1, (int) Math.floor(room / SLOT_HEIGHT) + 1);
+		int cols = Math.max(1, Math.min(3, (count + rows - 1) / rows));
+		int row = index / cols;
+		int col = index % cols;
+		double sway = Math.sin(now * 0.07 + row * 0.9) * 0.012 * row;
+		double x = (col - (cols - 1) * 0.5) * COLUMN_PITCH;
+		return head.add(x + sway, ITEM_SCALE * 0.5 + Math.min(row, rows - 1) * SLOT_HEIGHT, 0);
+	}
+
+	/** Product name on at most two lines of {@code cols}, broken at a space when possible; the rest is clipped. */
+	static String wrapName(String name, int cols) {
+		String s = name == null ? "" : name.strip();
+		if (s.length() <= cols) return s;
+		int cut = s.lastIndexOf(' ', cols);
+		if (cut < cols / 2) cut = cols;
+		return s.substring(0, cut).stripTrailing() + "\n" + Fx.truncate(s.substring(cut).strip(), cols);
 	}
 
 	private static Vec3 rel(double[] r) {
@@ -469,13 +494,14 @@ public final class ItemsFeature implements CrewkitFeature {
 		long lastHover;
 		boolean labelShown;
 
-		void tick(ServerLevel level, int index, Vec3 head) {
-			Vec3 target = slotPos(head, index, now);
+		void tick(ServerLevel level, int index, int count, Vec3 head) {
+			Vec3 target = slotPos(head, index, count, now);
 			if (flying) {
 				t++;
 				double s = Math.min(1.0, t / (double) arcTicks);
 				double e = Fx.easeInOut(s);
-				double lift = 1.4 + 0.25 * index;
+				// Arc peak stays under the beams too.
+				double lift = Math.min(1.4 + 0.25 * index, Math.max(0.3, CrewkitAnchors.origin.getY() + STACK_CEILING - Math.max(from.y, target.y)));
 				pos = from.lerp(target, e).add(0, Math.sin(Math.PI * s) * lift, 0);
 				Fx.move(level, display, pos);
 				if (t >= arcTicks) land(level, index, target);
@@ -498,7 +524,7 @@ public final class ItemsFeature implements CrewkitFeature {
 			hitbox = Fx.summon(server, "minecraft:interaction", pos.add(0, -SLOT_HEIGHT * 0.5, 0),
 					"width:" + Fx.f(ITEM_SCALE + 0.05) + ",height:" + Fx.f(SLOT_HEIGHT) + ",response:false");
 			label = Fx.summon(server, "minecraft:text_display", labelPos(),
-					"text:" + labelText() + ",billboard:\"center\",line_width:220,alignment:\"left\",text_opacity:16,background:0"
+					"text:" + labelText() + ",billboard:\"center\",line_width:200,alignment:\"center\",text_opacity:16,background:0"
 							+ ",teleport_duration:2,shadow:true,view_range:2.0f," + Fx.tf(LABEL_SCALE * 0.85));
 			if (qty > 1) spawnBadge();
 		}
@@ -516,23 +542,22 @@ public final class ItemsFeature implements CrewkitFeature {
 			later(5, () -> Fx.merge(server, d, Fx.tf(ITEM_SCALE) + "," + Fx.interp(3)));
 		}
 
+		/** Small badge on the item's lower-left corner, in front of it (camera side). */
 		Vec3 badgePos() {
-			return pos.add(-ITEM_SCALE * 0.55, -0.16, 0.2);
+			return pos.add(-ITEM_SCALE * 0.42, -0.14, 0.18);
 		}
 
-		/** Label to the right of the item (camera looks north, so +x is screen right), left edge near the item. */
+		/** Label centred just above the item, slightly toward the camera; the text grows upward from here. */
 		Vec3 labelPos() {
-			int px = Math.min(220, 6 * Math.max(Fx.truncate(realName, 34).length(), 16));
-			double half = px * 0.5 * 0.025 * LABEL_SCALE;
-			return pos.add(ITEM_SCALE * 0.5 + 0.15 + half, -0.2, 0.05);
+			return pos.add(0, ITEM_SCALE * 0.5 + 0.04, 0.2);
 		}
 
 		String labelText() {
-			String priceLine = money(unitPrice, currency) + (qty > 1 ? "  x" + qty + "  = " + money(unitPrice * qty, currency) : "");
+			String priceLine = money(unitPrice, currency) + (qty > 1 ? " x" + qty + " = " + money(unitPrice * qty, currency) : "");
 			return Fx.component(
-					Fx.text(Fx.truncate(realName, 34) + "\n", "white", true),
-					Fx.text(priceLine + (merchant.isEmpty() ? "" : "\n"), "#FFD24A", false),
-					Fx.text(Fx.truncate(merchant, 34), "#A8B3BD", false));
+					Fx.text(wrapName(realName, LABEL_COLS) + "\n", "white", true),
+					Fx.text(Fx.truncate(priceLine, LABEL_COLS) + (merchant.isEmpty() ? "" : "\n"), "#FFD24A", false),
+					Fx.text(Fx.truncate(merchant, LABEL_COLS), "#A8B3BD", false));
 		}
 
 		void spawnBadge() {
@@ -540,7 +565,7 @@ public final class ItemsFeature implements CrewkitFeature {
 					"text:" + Fx.component(Fx.text("x" + qty, "#FFD24A", true))
 							+ ",billboard:\"center\",background:" + 0xC0141414 + ",teleport_duration:2,view_range:2.0f," + Fx.tf(0.0));
 			UUID b = badge;
-			later(1, () -> Fx.merge(server, b, Fx.tf(0.75) + "," + Fx.interp(4)));
+			later(1, () -> Fx.merge(server, b, Fx.tf(0.45) + "," + Fx.interp(4)));
 		}
 
 		void refreshBadgeAndLabel() {
