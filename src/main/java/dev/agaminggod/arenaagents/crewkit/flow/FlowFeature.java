@@ -14,9 +14,9 @@ import java.util.Map;
 import net.minecraft.commands.CommandSource;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.protocol.game.ClientboundMapItemDataPacket;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
-import net.minecraft.world.level.Level;
 import net.minecraft.world.level.material.MapColor;
 import net.minecraft.world.level.saveddata.maps.MapId;
 import net.minecraft.world.level.saveddata.maps.MapItemSavedData;
@@ -92,6 +92,9 @@ public final class FlowFeature implements CrewkitFeature {
 	private boolean delivered;
 	private int itemSerial;
 	private final Map<String, Line> ledger = new LinkedHashMap<>();
+	/** Map ids and pixel data of the QR on show; pushed to clients because frame sync alone sends only the id. */
+	private final List<MapId> qrMapIds = new ArrayList<>();
+	private final List<MapItemSavedData> qrMaps = new ArrayList<>();
 
 	private static final class Line {
 		String mcItem;
@@ -140,6 +143,7 @@ public final class FlowFeature implements CrewkitFeature {
 			}
 		}
 		if (hourglass && (now - hourglassStart) % 20 == 0) flipHourglass(server);
+		if (!qrMaps.isEmpty() && now % 100 == 0) syncQrMaps(server);
 	}
 
 	@Override
@@ -348,7 +352,7 @@ public final class FlowFeature implements CrewkitFeature {
 			ServerLevel level = server.overworld();
 			for (int ty = 0; ty < QR_TILES; ty++) {
 				for (int tx = 0; tx < QR_TILES; tx++) {
-					MapItemSavedData map = MapItemSavedData.createFresh(0, 0, (byte) 0, false, false, Level.OVERWORLD).locked();
+					MapItemSavedData map = MapItemSavedData.createFresh(0, 0, (byte) 0, false, false, level.dimension()).locked();
 					for (int y = 0; y < 128; y++) {
 						for (int x = 0; x < 128; x++) {
 							int gx = (tx * 128 + x - offset);
@@ -357,8 +361,11 @@ public final class FlowFeature implements CrewkitFeature {
 							map.setColor(x, y, dark ? black : white);
 						}
 					}
+					map.setDirty();
 					MapId id = level.getFreeMapId();
 					level.setMapData(id, map);
+					qrMapIds.add(id);
+					qrMaps.add(map);
 					// Tile row 0 is the top; frames facing south hang on the north edge of their block.
 					int bx = QR_X + tx;
 					int by = QR_Y + (QR_TILES - 1 - ty);
@@ -369,6 +376,8 @@ public final class FlowFeature implements CrewkitFeature {
 						tags("ck_flow_qr"), id.id()));
 				}
 			}
+			syncQrMaps(server);
+			later(5, () -> syncQrMaps(server));
 			LOGGER.info("CrewKit QR: {} modules, {} px/module on {}x{} maps", n, px, QR_TILES, QR_TILES);
 			return true;
 		} catch (RuntimeException e) {
@@ -402,8 +411,20 @@ public final class FlowFeature implements CrewkitFeature {
 		}
 	}
 
+	private void syncQrMaps(MinecraftServer server) {
+		ServerLevel level = server.overworld();
+		for (int i = 0; i < qrMaps.size(); i++) {
+			MapItemSavedData map = qrMaps.get(i);
+			var packet = new ClientboundMapItemDataPacket(qrMapIds.get(i), map.scale, true, List.of(),
+				new MapItemSavedData.MapPatch(0, 0, 128, 128, map.colors.clone()));
+			for (var viewer : level.players()) viewer.connection.send(packet);
+		}
+	}
+
 	private void clearQr(MinecraftServer server, boolean shrinkCard) {
 		hourglass = false;
+		qrMapIds.clear();
+		qrMaps.clear();
 		run(server, "kill @e[tag=ck_flow_qr]");
 		run(server, "kill @e[tag=ck_flow_qr_label]");
 		run(server, "kill @e[tag=ck_flow_hourglass]");
