@@ -63,6 +63,7 @@ public final class BoardsFeature implements CrewkitFeature {
 	 */
 	private boolean priced;
 	private boolean cartMode;
+	private int recordGen;
 
 	// Bill board
 	private CrewkitDisplay billPanel, billTitle;
@@ -215,12 +216,15 @@ public final class BoardsFeature implements CrewkitFeature {
 		callsReported = false;
 		priced = false;
 		cartMode = false;
+		recordGen++;
 	}
 
 	// ---- budget board ----
 
 	private void ensureBudgetBoard(MinecraftServer server) {
-		if (number != null) return;
+		if (number != null && number.alive()) return;
+		// A summon into an unloaded chunk leaves dead handles; clear what is left and respawn.
+		if (number != null) killAll(panel, header, sandbox, number, status, track, fill, timer, calls);
 		Vec3 a = CrewkitAnchors.at(CrewkitAnchors.BUDGET);
 		double x = a.x, y = a.y, z = a.z + WALL_FRONT;
 		panel = CrewkitDisplays.block(server, new Vec3(x - 4.5, y - 2.2, z - 0.04), TAG, "minecraft:black_concrete", 9f, 4.9f, 0.02f, "");
@@ -324,7 +328,12 @@ public final class BoardsFeature implements CrewkitFeature {
 	// ---- bill board ----
 
 	private void ensureBill(MinecraftServer server) {
-		if (billTitle != null) return;
+		if (billTitle != null && billTitle.alive()) return;
+		if (billTitle != null) {
+			killAll(billPanel, billTitle);
+			killAll(rowLabels);
+			killAll(rowValues);
+		}
 		Vec3 a = CrewkitAnchors.at(CrewkitAnchors.LEDGER);
 		double x = a.x, y = a.y, z = a.z + WALL_FRONT;
 		billPanel = CrewkitDisplays.block(server, new Vec3(x - 5, y - 2.4, z - 0.04), TAG, "minecraft:black_concrete", 10f, 5.1f, 0.02f, "");
@@ -340,6 +349,7 @@ public final class BoardsFeature implements CrewkitFeature {
 
 	private void stampRecord(MinecraftServer server, JsonObject data) {
 		ensureBill(server);
+		int gen = ++recordGen;
 		String cur = string(data, "currency") != null ? string(data, "currency") : currency;
 		double budgetValue = number(data, "budget", budget);
 		double quoted = number(data, "quoted", 0);
@@ -361,7 +371,9 @@ public final class BoardsFeature implements CrewkitFeature {
 			String full = values[i];
 			int color = colors[i];
 			float rest = i == ORDER_ROW ? ORDER_SCALE : VALUE_SCALE;
-			CrewkitSchedule.after(at, () -> value.transform(rest, 0, 0, 0, 0));
+			CrewkitSchedule.after(at, () -> {
+				if (gen == recordGen) value.transform(rest, 0, 0, 0, 0);
+			});
 			// Typewriter: two characters per tick behind a cursor, a soft key click every few characters.
 			int steps = (full.length() + TYPE_CHARS_PER_TICK - 1) / TYPE_CHARS_PER_TICK;
 			for (int k = 1; k <= steps; k++) {
@@ -374,15 +386,22 @@ public final class BoardsFeature implements CrewkitFeature {
 						+ ",extra:[" + (done ? "{text:\"\"}" : CrewkitText.of("_", CrewkitText.MUTED, true)) + "]}";
 				boolean click = k % 2 == 1;
 				CrewkitSchedule.after(at + k, () -> {
+					if (gen != recordGen) return;
 					value.text(partial);
 					if (click) CrewkitSounds.play(server, value.pos(), "minecraft:block.note_block.hat", 0.35f, 1.9f);
 				});
 			}
 			int end = at + steps;
 			// Then the stamp: a quick swell and settle, with the stamp sound on the settle.
-			CrewkitSchedule.after(end + 2, () -> value.transform(rest * 1.25f, 0, 0, 0, 2));
-			CrewkitSchedule.after(end + 4, () -> value.transform(rest, 0, 0, 0, 3));
-			CrewkitSchedule.after(end + 5, () -> CrewkitSounds.play(server, value.pos(), "minecraft:ui.cartography_table.take_result", 1.0f, 1.0f));
+			CrewkitSchedule.after(end + 2, () -> {
+				if (gen == recordGen) value.transform(rest * 1.25f, 0, 0, 0, 2);
+			});
+			CrewkitSchedule.after(end + 4, () -> {
+				if (gen == recordGen) value.transform(rest, 0, 0, 0, 3);
+			});
+			CrewkitSchedule.after(end + 5, () -> {
+				if (gen == recordGen) CrewkitSounds.play(server, value.pos(), "minecraft:ui.cartography_table.take_result", 1.0f, 1.0f);
+			});
 			at = end + 9;
 		}
 	}
@@ -426,6 +445,10 @@ public final class BoardsFeature implements CrewkitFeature {
 			out.append(text, i, Math.min(text.length(), i + width));
 		}
 		return out.toString();
+	}
+
+	private static void killAll(CrewkitDisplay... displays) {
+		for (CrewkitDisplay d : displays) if (d != null) d.kill();
 	}
 
 	private static String clip(String text, int max) {

@@ -37,6 +37,7 @@ public final class CrewkitDispatcher {
 			CrewkitReplay.stop();
 			CrewkitSchedule.clear();
 			forgetRuns();
+			clearRetired();
 		});
 		CrewkitCommands.register();
 	}
@@ -119,9 +120,14 @@ public final class CrewkitDispatcher {
 		return true;
 	}
 
+	/** Retire the current run so a still-polling old run cannot redraw the boards after a reset. */
 	static synchronized void forgetRuns() {
+		if (currentRun != null) retiredRuns.add(currentRun);
 		currentRun = null;
 		lastSeq = Long.MIN_VALUE;
+	}
+
+	static synchronized void clearRetired() {
 		retiredRuns.clear();
 	}
 

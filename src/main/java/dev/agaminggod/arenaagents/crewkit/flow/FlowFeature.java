@@ -47,7 +47,11 @@ public final class FlowFeature implements CrewkitFeature {
 	}
 
 	/** One product line to plate. seats = guest names; 1 = own plate, 2 = shared tray, else room tray. */
-	public record DeliveryItem(String mcItem, String realName, List<String> seats) {}
+	public record DeliveryItem(String mcItem, String realName, List<String> seats) {
+		public DeliveryItem {
+			seats = seats == null ? List.of() : seats;
+		}
+	}
 
 	// Layout, in blocks relative to CrewkitAnchors.origin (x east, y up, z south). Camera looks north.
 	private static final double PASS_Z = 9.45;
@@ -91,6 +95,7 @@ public final class FlowFeature implements CrewkitFeature {
 	private String statusColor = "#555555";
 	private boolean ticketSpawned;
 	private boolean gateDown;
+	private int gateGen;
 	private String qrUrl;
 	private boolean hourglass;
 	private long hourglassStart;
@@ -181,6 +186,8 @@ public final class FlowFeature implements CrewkitFeature {
 		ticketSpawned = false;
 		gateDown = false;
 		qrUrl = null;
+		qrMaps.clear();
+		qrMapIds.clear();
 		hourglass = false;
 		platesSet = false;
 		delivered = false;
@@ -281,18 +288,23 @@ public final class FlowFeature implements CrewkitFeature {
 			+ tags("ck_flow_gate_sign") + ",billboard:\"vertical\",teleport_duration:7,shadow:0b,line_width:200"
 			+ ",brightness:{sky:15,block:15},background:" + GATE_RED
 			+ ",transformation:" + scaleOnly(1.3) + ",text:" + sign + "}");
+		int gen = gateGen;
 		later(10, () -> {
+			if (gen != gateGen) return;
 			for (int i = 0; i < BAR_COUNT; i++) {
 				tp(server, "ck_flow_bar_" + i, rel(BAR_X0 + i, BAR_DOWN_Y, BAR_Z));
 			}
 			tp(server, "ck_flow_gate_sign", rel(BAR_X0 + BAR_COUNT / 2.0, BAR_DOWN_Y + 1.2, BAR_Z + 0.08));
 		});
-		later(17, () -> sound(server, "block.iron_door.close", rel(BAR_X0 + BAR_COUNT / 2.0, BAR_DOWN_Y, BAR_Z), 1.0, 0.8));
+		later(17, () -> {
+			if (gen == gateGen) sound(server, "block.iron_door.close", rel(BAR_X0 + BAR_COUNT / 2.0, BAR_DOWN_Y, BAR_Z), 1.0, 0.8);
+		});
 	}
 
 	private void liftGate(MinecraftServer server) {
 		if (!gateDown) return;
 		gateDown = false;
+		gateGen++;
 		Pos mid = rel(BAR_X0 + BAR_COUNT / 2.0, BAR_DOWN_Y, BAR_Z);
 		sound(server, "block.iron_door.open", mid, 1.0, 1.0);
 		for (int i = 0; i < BAR_COUNT; i++) {
@@ -340,10 +352,12 @@ public final class FlowFeature implements CrewkitFeature {
 			if (!url.equals(qrUrl)) return;
 			if (!spawnQrMaps(server, url)) spawnQrPixels(server, url);
 			Pos label = rel(cx, QR_Y + QR_TILES + 0.2, PASS_Z - 0.2);
+			// A replay points at the project repo; the real approval happens on the laptop with the passkey.
+			boolean repo = url.startsWith("https://github.com/");
 			run(server, "summon minecraft:text_display " + label + " {" + tags("ck_flow_qr_label")
-				+ ",billboard:\"vertical\",shadow:0b,line_width:240,brightness:{sky:15,block:15},background:" + argb(0xE0102A8C)
+				+ ",billboard:\"vertical\",shadow:0b,line_width:240,brightness:{sky:15,block:15},background:" + argb(repo ? 0xE04A4F55 : 0xE0102A8C)
 				+ ",transformation:" + scaleOnly(1.3)
-				+ ",text:{text:\"SCAN TO APPROVE ON REAP\",color:\"#FFFFFF\",bold:true}}");
+				+ ",text:{text:\"" + (repo ? "REPLAY: QR OPENS PROJECT REPO" : "APPROVE ON REAP") + "\",color:\"#FFFFFF\",bold:true}}");
 			sound(server, "block.amethyst_block.chime", rel(cx, cy, PASS_Z), 1.0, 1.0);
 		});
 		later(appear + 8, () -> {

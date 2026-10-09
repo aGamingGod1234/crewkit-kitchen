@@ -156,7 +156,13 @@ public final class ItemsFeature implements CrewkitFeature {
 				due.add(s);
 			}
 		}
-		for (Scheduled s : due) s.task.run();
+		for (Scheduled s : due) {
+			try {
+				s.task.run();
+			} catch (RuntimeException e) {
+				LOGGER.warn("items task", e);
+			}
+		}
 
 		if (now >= busyUntil && !queue.isEmpty()) {
 			int busy = queue.poll().getAsInt();

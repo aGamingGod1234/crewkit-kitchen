@@ -13,7 +13,7 @@
 {"t":35500,"seq":13,"event":"calls","data":{"count":9}}
 {"t":37000,"seq":14,"event":"quote","data":{"total":{"amount":149.7,"currency":"SGD"},"budgetRemaining":{"amount":0.3,"currency":"SGD"},"shipping":{"amount":8,"currency":"SGD"},"quoteId":"qt_sbx_002"}}
 {"t":39500,"seq":15,"event":"gate_passed","data":{"total":{"amount":149.7,"currency":"SGD"}}}
-{"t":42500,"seq":16,"event":"checkout","data":{"approvalUrl":"https://sandbox.reap.example/approve/chk_sbx_42","status":"PENDING_APPROVAL","checkoutId":"chk_sbx_42"}}
+{"t":42500,"seq":16,"event":"checkout","data":{"approvalUrl":"https://github.com/aGamingGod1234/crewkit-kitchen","status":"PENDING_APPROVAL","checkoutId":"chk_sbx_42"}}
 {"t":43500,"seq":17,"event":"calls","data":{"count":10}}
 {"t":57500,"seq":18,"event":"calls","data":{"count":12}}
 {"t":58500,"seq":19,"event":"completed","data":{"orderId":"ord_sbx_7Q2K9","finalAmount":{"amount":149.7,"currency":"SGD"}}}
