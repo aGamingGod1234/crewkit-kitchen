@@ -130,6 +130,11 @@ def coordinatorRuntimeIncludes = [
 	'node_modules/acorn/**',
 ]
 def coordinatorRuntimeExcludes = [
+	// Local secrets and run state never ship: the Reap key, enrollment/idempotency state and run records.
+	'**/.env',
+	'**/.env.*',
+	'**/state.json',
+	'**/crewkit-records/**',
 	'**/__pycache__/**',
 	'**/*.pyc',
 	// Keep benchmark, simulator, headless and native-tool experiments in the
