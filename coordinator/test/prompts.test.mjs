@@ -30,6 +30,10 @@ test('native program reference shares the actual language, action contract and e
 	assert.match(ARENA_SCRIPT_API_REFERENCE, /bounded background(?::true)? work/);
 	assert.match(ARENA_SCRIPT_API_REFERENCE, /reuse exact noteKey if fresh prerequisites\/targets match/);
 	assert.doesNotMatch(ARENA_SCRIPT_API_REFERENCE, /Return exactly one JSON object/);
+	assert.match(ARENA_SCRIPT_API_REFERENCE, /an unqueued PROGRAM_EXHAUSTED needs another model decision/);
+	assert.doesNotMatch(ARENA_SCRIPT_API_REFERENCE, /each PROGRAM_EXHAUSTED costs/);
+	assert.match(ARENA_SCRIPT_API_REFERENCE, /count above one craft's output \(16 planks\) stacks crafts and takes the result once; CRAFT_PARTIAL says how many were made and why/);
+	assert.match(ARENA_SCRIPT_API_REFERENCE, /A break result naming a faster inventory tool means selectTool to it before the next block/);
 });
 
 test('script bindings and the installed tool reference include every shared player action', () => {
@@ -74,7 +78,7 @@ test('every shipped planner example compiles and executes its intended branch wi
 			yielded = vm.resume({ stateToken: yielded.stateToken, state: 'SUCCEEDED', reasonCode: 'DONE' }, createInterpreterFacts(observation));
 			assert.equal(yielded.kind, 'watcher_decision', 'defense requests reassessment before unrelated work');
 		} else {
-			assert.deepEqual(dispatched, ['look_at', 'break_block', 'pick_up_item']);
+			assert.deepEqual(dispatched, ['break_block', 'pick_up_item'], 'mine aims itself and stragglers are collected once after the loop');
 			assert.equal(yielded.kind, 'finish');
 		}
 		results.push(yielded.kind);
@@ -98,26 +102,34 @@ test('shipped defensive watcher reacts to the agent-chosen visible threat before
 	assert.deepEqual({ ...step.call.arguments }, { durationMs: 750 });
 });
 
-test('collection example yields for missing targets or failed aim and verifies inventory after mining', () => {
+test('collection example mines without lookAt or per-block pickup, collects stragglers once and verifies inventory', () => {
 	const source = /Multi-tree collection example:\n([\s\S]*?)\n\nWatcher example/.exec(PLANNER_SYSTEM_PROMPT)[1];
+	assert.doesNotMatch(source, /lookAt/);
 	const observation = { player: { x: 0, y: 64, z: 0, health: 20 },
 		blocks: [{ stableId: 'block-1', blockId: 'minecraft:oak_log', x: 1, y: 64, z: 0, tags: ['#minecraft:logs'] }],
 		items: [], entities: [], inventory: { items: [], tagCounts: { '#minecraft:logs': 0 } } };
+	const done = { state: 'SUCCEEDED', reasonCode: 'DONE' };
 	const missing = new ArenaScriptInterpreter(parseArenaScript(source), SCRIPT_BINDINGS);
 	assert.equal(missing.start(createInterpreterFacts({ ...observation, blocks: [] })).kind, 'idle');
-	const failedAim = new ArenaScriptInterpreter(parseArenaScript(source), SCRIPT_BINDINGS);
-	let step = failedAim.start(createInterpreterFacts(observation));
-	assert.equal(step.call.primitive, 'look_at');
-	assert.deepEqual({ ...step.call.arguments }, { x: 1.5, y: 64.5, z: 0.5 });
-	step = failedAim.resume({ stateToken: step.stateToken, state: 'FAILED', reasonCode: 'TARGET_UNAVAILABLE' }, createInterpreterFacts(observation));
-	assert.equal(step.kind, 'idle', 'a failed aim requests reassessment without dispatching mining');
+	const failedMine = new ArenaScriptInterpreter(parseArenaScript(source), SCRIPT_BINDINGS);
+	let step = failedMine.start(createInterpreterFacts(observation));
+	assert.equal(step.call.primitive, 'break_block', 'mine is the first and only per-block action');
+	assert.deepEqual({ ...step.call.arguments }, { x: 1, y: 64, z: 0, expectedBlockId: 'minecraft:oak_log', timeoutMs: 30000 });
+	step = failedMine.resume({ stateToken: step.stateToken, state: 'FAILED', reasonCode: 'TARGET_NOT_VISIBLE' }, createInterpreterFacts(observation));
+	assert.equal(step.kind, 'idle', 'a failed mine requests reassessment without further actions');
+	const inventory = { items: [{ itemId: 'minecraft:oak_log', count: 8, slot: 0 }], tagCounts: { '#minecraft:logs': 8 } };
 	const collected = new ArenaScriptInterpreter(parseArenaScript(source), SCRIPT_BINDINGS);
 	step = collected.start(createInterpreterFacts(observation));
-	step = collected.resume({ stateToken: step.stateToken, state: 'SUCCEEDED', reasonCode: 'DONE' }, createInterpreterFacts(observation));
-	assert.equal(step.call.primitive, 'break_block');
-	const inventory = { items: [{ itemId: 'minecraft:oak_log', count: 8, slot: 0 }], tagCounts: { '#minecraft:logs': 8 } };
 	step = collected.resume({ stateToken: step.stateToken, state: 'SUCCEEDED', reasonCode: 'BLOCK_BROKEN' }, createInterpreterFacts({ ...observation, blocks: [], inventory }));
 	assert.equal(step.kind, 'finish', 'automatic collection ends the loop without targeting a vanished drop');
+	const straggler = new ArenaScriptInterpreter(parseArenaScript(source), SCRIPT_BINDINGS);
+	const drop = { stableId: '00000000-0000-0000-0000-000000000001', itemId: 'minecraft:oak_log', count: 1, x: 3, y: 64, z: 0, tags: ['#minecraft:logs'] };
+	step = straggler.start(createInterpreterFacts(observation));
+	step = straggler.resume({ stateToken: step.stateToken, state: 'SUCCEEDED', reasonCode: 'BLOCK_BROKEN' }, createInterpreterFacts({ ...observation, blocks: [], items: [drop] }));
+	assert.equal(step.call.primitive, 'pick_up_item', 'a drop that was not collected is picked up once the loop ends');
+	assert.equal(step.call.arguments.targetSelector, drop.stableId);
+	step = straggler.resume({ stateToken: step.stateToken, ...done }, createInterpreterFacts({ ...observation, blocks: [], inventory }));
+	assert.equal(step.kind, 'finish');
 });
 
 test('planner input always carries complete authoritative state with explicitly labeled empty supplemental deltas', () => {
@@ -151,11 +163,10 @@ test('planner tells agents to collect observed drops and never pause for routine
 	assert.match(PLANNER_SYSTEM_PROMPT, /noteKey executes the whole note as source/);
 	assert.match(PLANNER_SYSTEM_PROMPT, /player\.state\(\)\.velocity\/\.heard\/\.heardLava and world\.state\(\)\.landmarks/);
 	assert.match(PLANNER_SYSTEM_PROMPT, /observationIntervalMs:100\.\.5000/);
-	assert.match(PLANNER_SYSTEM_PROMPT, /Batch independent inspections; reuse fresh facts and safe sequences/);
 	assert.match(PLANNER_SYSTEM_PROMPT, /program\.parameters\(\)/);
-	assert.match(PLANNER_SYSTEM_PROMPT, /queueProgram binds one authored successor/);
-	assert.match(PLANNER_SYSTEM_PROMPT, /Successful natural PROGRAM_EXHAUSTED, no pending decision/);
-	assert.match(PLANNER_SYSTEM_PROMPT, /expectedDurationMs:1\.\.timeoutMs/);
+	assert.match(PLANNER_SYSTEM_PROMPT, /Bulk work is one program: program\.repeatUntil/);
+	assert.match(PLANNER_SYSTEM_PROMPT, /player\.mine turns to the block center itself/);
+	assert.match(PLANNER_SYSTEM_PROMPT, /collected while you keep mining/);
 	assert.doesNotMatch(PLANNER_SYSTEM_PROMPT, /runProgram accepts noteKey[^\n]*entityType/);
 });
 

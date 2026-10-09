@@ -82,8 +82,7 @@ test('fight_target accepts a model-chosen targetPolicy everywhere it is authored
 test('native guidance stays under the cap and says when to heal and that confirmation never blocks requests', () => {
 	assert.ok(NATIVE_AGENT_INSTRUCTIONS.length < 1_500, `native instructions are ${NATIVE_AGENT_INSTRUCTIONS.length} characters`);
 	assert.match(NATIVE_AGENT_INSTRUCTIONS, /Eat when safe below 70% health; no food under threat: flee\./);
-	assert.match(NATIVE_AGENT_INSTRUCTIONS, /retarget via targetPolicy or replaceAction/);
-	assert.match(NATIVE_AGENT_INSTRUCTIONS, /Awaiting confirmation never blocks new requests\./);
+	assert.match(MINECRAFT_DYNAMIC_TOOLS.find((tool) => tool.name === 'act').description, /replaceAction with a new fight_target retargets/);
 	assert.match(AWAITING_CONFIRMATION_MESSAGE, /never blocks new requests/);
 	assert.match(AWAITING_CONFIRMATION_MESSAGE, /even more equipment changes/);
 	assert.match(MINECRAFT_DYNAMIC_TOOLS.find((tool) => tool.name === 'finish').description, /Waiting never blocks new player requests/);

@@ -47,7 +47,7 @@ Choose travel equipment from current inventory: a capable durable tool and usefu
 
 ## Cave travel
 
-Choose meaningful observed route legs between corners, landings and branches. Reuse parameterized background routines and a chosen queued successor when fresh prerequisites match. On known ground, reuse current results and inspect missing details; broad block pages after every one-block waypoint add work without establishing more route safety. Reassess when new geometry, unknown coverage, threats, relevant resource opportunities or leg exhaustion change the decision. Historical routes still need checking in the direction you will travel.
+Give moveTo the far target when the route is observed safe (about 30 blocks per leg), not each corner. Reuse parameterized background routines and a chosen queued successor when fresh prerequisites match. On known ground, reuse current results and inspect missing details; broad block pages after every one-block waypoint add work without establishing more route safety. Reassess when new geometry, unknown coverage, threats, relevant resource opportunities or leg exhaustion change the decision. Historical routes still need checking in the direction you will travel.
 
 Declare `program.onUnhandledAttention(mode, {reassessWhen: () => condition})` before top-level execution to filter routine unhandled attention using a pure condition you author from current facts. Cover the reasons this leg needs your next decision. Only exact false suppresses an ordinary notification; missing, unknown or failing conditions retain notification. Fresh samples, physical collision checks and authored watchers remain active. Urgent attention and existing failure, checkpoint or exhaustion requests bypass this filter. Omitting it keeps normal attention behavior.
 
@@ -87,7 +87,7 @@ Branches read only your player facts. Numeric conditions are health_below (0..20
 
 StartAction returns a handle immediately. ActionStatus reads its state or terminal receipt. CancelAction requires the exact actionId and goalRevision and waits for acknowledgement. ReplaceAction starts its replacement only after CANCELLED. If cancellation is unconfirmed or the old action already completed, reassess before another mutation.
 
-RunProgram executes your ArenaScript using the same interpreter as script mode. Source is at most 65536 UTF-8 bytes; maxActions defaults to 64 and caps at 256; timeoutMs defaults to 30000 and caps at 120000. Author an explicit program.onUnhandledAttention mode: continue_and_notify completes the current action before yielding; pause_and_notify cancels it before yielding. Watchers, branches, selected targets, and reactions come from your source. No other model plans its steps. Player calls await correlated physical results and new observation barriers; world.inspect and world.queryMemory are bounded reads, world.remember writes your notes. A deadline or lifecycle change stops further steps and requests release of its physical action; unknown acknowledgement remains uncertain. Program completion or program.finish yields to you; use the separate finish tool for factual goal verification.
+RunProgram executes your ArenaScript using the same interpreter as script mode. Source is at most 65536 UTF-8 bytes; maxActions defaults to 64 and caps at 256; timeoutMs defaults to 30000 and caps at 120000. Author an explicit program.onUnhandledAttention mode: continue_and_notify completes the current action before yielding; pause_and_notify cancels it before yielding. Watchers, branches, selected targets, and reactions come from your source. No other model plans its steps. Player calls await correlated physical results and new observation barriers; world.inspect and world.queryMemory are bounded reads, world.remember writes your notes. A deadline or lifecycle change stops further steps and requests release of its physical action; unknown acknowledgement remains uncertain. Program completion or program.finish yields to you; use the separate finish tool for factual goal verification. Put bulk work in one program that loops with program.repeatUntil to a count, sized with maxActions and timeoutMs: an unqueued PROGRAM_EXHAUSTED needs another model decision.
 
 Optional parameters is a pure JSON object, at most 4096 serialized UTF-8 bytes, depth 16 and 256 total object properties/array entries. Its detached, immutable data is available through program.parameters(). Supply observed coordinates, exact identities and quantities without rewriting tested source. Match current prerequisites before reuse; parameters supply data, never extra commands. Optional expectedDurationMs is your estimated duration from 1 to timeoutMs. It can bring the measured planning advisory before source completion; it does not extend the deadline or guarantee preparation finishes in time.
 
@@ -95,7 +95,7 @@ Optional parameters is a pure JSON object, at most 4096 serialized UTF-8 bytes, 
 
 Move to a standing position beside a solid target, with room for both feet and head. Removing a tree's bottom log still leaves the next log at head height. Use the goal's allowed tolerance; a tighter tolerance needlessly excludes safe positions. After NO_STANDABLE_PATH, choose another observed approach with clearance.
 
-Mining requires an observed, reachable non-air expectedBlockId and the exact block under the crosshair. For one known reachable block, use mine with autoAim:true or a sequence of look_at at its center, then break_block. AutoAim expands to those two actions at the same chosen coordinates and expectedBlockId, stopping if aim fails. Omitted or false autoAim preserves the single mining action. It selects no alternate target. A broken block does not prove collection. Blocking mining, movement, and pickup return postAction with updated inventory and entities. Use these facts when freshness.fresh is true; otherwise observe before a dependent action.
+Mining requires an observed, reachable non-air expectedBlockId with a clear line of sight. mine turns to the block center itself at player speed, so call it directly; use look_at first only for a specific aim point (autoAim:true just prepends that look_at). It selects no alternate target. A broken block does not prove collection; drops within about a block are collected while you keep mining, so pick up stragglers once at the end. Blocking mining, movement, and pickup return postAction with updated inventory and entities. Use these facts when freshness.fresh is true; otherwise observe before a dependent action.
 
 For a resource goal with multiple accepted item types, compare fresh visible sources and choose the nearest reachable one. Reassess when its route or collection fails. For a quantity goal, count held matching items and collect reachable matching drops toward the remaining amount before mining more. Drops can enter inventory automatically as you approach. Once inventory meets goalSpec, request finish. Only request pick_up_item while more is needed and the UUID appears in fresh facts, including after ITEM_PICKED_UP. ITEM_NOT_FOUND means the selected entity is unavailable. Reconcile inventory and reacquire remaining drops. Melee attempts and bow release also need effect evidence before claiming a hit.
 
@@ -187,7 +187,7 @@ Cancel the exact active handle, wait for acknowledgement, then execute your repl
 
 ### startAction
 
-Start one model-chosen action and return its handle immediately. Poll actionStatus for the factual result or cancel the exact handle.
+Start one model-chosen action and return its handle immediately. Its result arrives as an event after you end your turn; never poll actionStatus. Cancel the exact handle to stop it.
 
 ```json executor-call
 {"tool":"startAction","arguments":{"actionType":"wait","arguments":{"durationMs":500}}}
@@ -317,7 +317,7 @@ Hold one complete player input frame for 1 to 200 server ticks. Use for precise 
 
 ### moveTo
 
-Navigate toward one short, confirmed waypoint through bounded loaded safe waypoints; use control for ordinary exploration.
+Navigate to an endpoint you choose through bounded loaded safe waypoints. When the route is observed safe, give the far target: the planner routes about 30 blocks per leg. Use control for ordinary exploration.
 
 Native moveTo maps to navigate_to, with tolerance:1, sprint:true and timeoutMs:30000 defaults. Its timeout accepts 1..600000ms, matching act and sequence. In ArenaScript, player.moveTo accepts x/y/z, tolerance and sprint only; player.navigateTo additionally requires timeoutMs. Program deadlines still apply.
 
@@ -335,16 +335,12 @@ List factual observed or unknown adjacent-space candidates. This tool never choo
 
 ### mine
 
-Mine one observed, visible, in-range block coordinate with its exact current blockId.
+Mine one observed, visible, in-range block coordinate with its exact current blockId. It turns to the block itself; no look_at is needed.
 
 timeoutMs defaults to 15000 and accepts 1..600000ms, matching act and sequence break_block. Program deadlines still apply.
 
 ```json executor-call
 {"tool":"mine","arguments":{"x":11,"y":64,"z":10,"expectedBlockId":"minecraft:oak_log","timeoutMs":15000}}
-```
-
-```json executor-call
-{"tool":"mine","arguments":{"x":11,"y":64,"z":10,"expectedBlockId":"minecraft:oak_log","timeoutMs":15000,"autoAim":true}}
 ```
 
 ### say
@@ -373,10 +369,10 @@ Execute one supported advanced player action. Supply exactly the fields required
 
 ### sequence
 
-Execute 2 to 8 known actions in order, stopping on the first factual failure. results contains step receipts. When a step attempted movement, mining, or pickup, postAction samples facts after the last attempted step. This pair aims and mines one observed, reachable block in one call; choose subsequent targets from that fresh result.
+Execute 2 to 8 known actions in order, stopping on the first factual failure. results contains step receipts. When a step attempted movement, mining, or pickup, postAction samples facts after the last attempted step. This pair walks to and mines one observed, reachable block in one call; choose subsequent targets from that fresh result.
 
 ```json executor-call
-{"tool":"sequence","arguments":{"actions":[{"actionType":"look_at","arguments":{"x":11.5,"y":64.5,"z":10.5}},{"actionType":"break_block","arguments":{"x":11,"y":64,"z":10,"expectedBlockId":"minecraft:oak_log","timeoutMs":15000}}]}}
+{"tool":"sequence","arguments":{"actions":[{"actionType":"navigate_to","arguments":{"x":11.5,"y":64,"z":9.5,"tolerance":1,"sprint":true,"timeoutMs":30000}},{"actionType":"break_block","arguments":{"x":11,"y":64,"z":10,"expectedBlockId":"minecraft:oak_log","timeoutMs":15000}}]}}
 ```
 
 Optional finish:{summary} requests verification of the immutable active goal after every step succeeds and fresh final facts are available. A failed step skips finish; action success alone does not prove the goal. Read the returned finish verification facts. If AWAITING_OPERATOR_CONFIRMATION, report once with say and end the turn until new input.
