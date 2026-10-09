@@ -65,6 +65,10 @@ public final class CodexAgentServerRuntime {
 	private static final long PLANNING_UPDATE_INTERVAL_MS = 30_000L;
 	private static final long COORDINATOR_STATUS_MAXIMUM_AGE_MS = 2_500L;
 	private static final long MISSING_SECRET_RECHECK_NANOS = 250_000_000L;
+	// Metadata alone misses a rotation that keeps the size and modification time (cp -p, robocopy), so the content is
+	// re-read at least this often. The window bounds how long a same-size, same-time rotation goes unnoticed.
+	static final long EXPLICIT_SECRET_REHASH_INTERVAL_MS = 1_000L;
+	private static final long EXPLICIT_SECRET_REHASH_NANOS = EXPLICIT_SECRET_REHASH_INTERVAL_MS * 1_000_000L;
 	private static final int MIN_EXPLICIT_SECRET_CHARACTERS = 32;
 	private static final int MAX_EXPLICIT_SECRET_CHARACTERS = 512;
 	private static boolean registered;
@@ -291,7 +295,8 @@ public final class CodexAgentServerRuntime {
 			return observation;
 		}
 		if (previous != null && previous.present() && previous.size() == attributes.size()
-				&& previous.lastModified().equals(attributes.lastModifiedTime())) return previous.observation();
+				&& previous.lastModified().equals(attributes.lastModifiedTime())
+				&& now - previous.checkedAtNanos() < EXPLICIT_SECRET_REHASH_NANOS) return previous.observation();
 		try {
 			ExplicitSecretObservation accepted = new ExplicitSecretObservation(true, java.util.Objects.hash(
 					normalized, attributes.size(), attributes.lastModifiedTime(),
@@ -720,7 +725,7 @@ public final class CodexAgentServerRuntime {
 
 	static record VoiceConfigurationSnapshot(boolean prepared, long revision) { }
 
-	/** Reuses the content fingerprint until the secret file's size or modification time changes. */
+	/** Reuses the content fingerprint until the secret file's size or modification time changes, or the rehash interval passes. */
 	static VoiceConfigurationSnapshot voiceConfigurationSnapshot(CoordinatorProcessSupervisor supervisor) {
 		if (supervisor == null) return new VoiceConfigurationSnapshot(false, 0L);
 		ExplicitSecretObservation explicit = supervisor.snapshot().state() == CoordinatorRecoveryState.STOPPED

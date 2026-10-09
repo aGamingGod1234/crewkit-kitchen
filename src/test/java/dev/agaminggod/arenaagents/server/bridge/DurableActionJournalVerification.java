@@ -177,7 +177,7 @@ public final class DurableActionJournalVerification {
 		} catch (IOException exception) {
 			throw new AssertionError(exception);
 		}
-		return 57;
+		return 61;
 	}
 
 	private static void verifyCrashBoundaries(Path directory) {
@@ -273,12 +273,18 @@ public final class DurableActionJournalVerification {
 			journal.acceptForTick(first, goalId);
 			journal.acceptForTick(second, goalId);
 			if (!journal.snapshot().isEmpty()) throw new AssertionError("Staged acceptances are not visible as durable journal state");
+			if (journal.stagedAcceptances().size() != 2) throw new AssertionError("Both staged acceptances are reported as not yet durable");
 			if (journal.performanceSnapshotForVerification().appendCount() != 0L) {
 				throw new AssertionError("Staging actions must not write or force the journal");
 			}
 			journal.flushTickGroup();
 			if (journal.performanceSnapshotForVerification().appendCount() != 1L) {
 				throw new AssertionError("Two accepted actions in one tick must share one journal force");
+			}
+			if (!journal.stagedAcceptances().isEmpty()) throw new AssertionError("A forced acceptance is no longer staged");
+			journal.flushTickGroup();
+			if (journal.performanceSnapshotForVerification().appendCount() != 1L) {
+				throw new AssertionError("A flush with nothing staged must not write or force");
 			}
 			assertContainsEntry(journal, DurableActionJournal.Phase.ACCEPTED, first, null);
 			assertContainsEntry(journal, DurableActionJournal.Phase.ACCEPTED, second, null);

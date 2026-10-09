@@ -129,6 +129,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private static final int SERVER_CONTROL_TASKS_PER_TICK = 16;
 	private static final int SERVER_BULK_TASKS_PER_TICK = 8;
 	private static final int SERVER_INSPECTION_TASKS_PER_TICK = 8;
+	// One second of consecutive failed journal writes, then unrecorded acceptances go back to the model.
+	private static final int JOURNAL_FAILURE_REJECTION_THRESHOLD = 20;
+	private static final long JOURNAL_FAILURE_WARNING_INTERVAL_NANOS = 5_000_000_000L;
 	private static final int OBSERVATION_HISTORY_CAPACITY = 4_096;
 	private static final int MAX_TARGET_IDS_PER_OBSERVATION = 64;
 	private static final int MAX_TARGET_IDS_WITH_INSPECTIONS = 320;
@@ -186,6 +189,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private final ProgramActionLedger programActions = new ProgramActionLedger();
 	private final TerminalResultLedger terminalResults = new TerminalResultLedger();
 	private List<ServerActionResult> pendingDurableTerminalResults = new ArrayList<>();
+	private int consecutiveJournalFailures;
+	private long lastJournalFailureWarningNanos;
 	private List<PendingRespawnPublication> pendingRespawnPublications = new ArrayList<>();
 	private final DurableActionJournal actionJournal;
 	private final Object verboseControlLock = new Object();
@@ -480,7 +485,23 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		serverTasks.drainBeforePhysics(
 				SERVER_TASKS_PER_TICK - SERVER_CONTROL_TASKS_PER_TICK - SERVER_BULK_TASKS_PER_TICK - SERVER_INSPECTION_TASKS_PER_TICK,
 				SERVER_CONTROL_TASKS_PER_TICK, SERVER_BULK_TASKS_PER_TICK,
-				this::runServerTask, this::flushActionJournalGroup, actionExecutor::tick);
+				this::runServerTask, this::executeAcceptedInput);
+	}
+
+	/**
+	 * Forces admitted actions before they run, then forces again so a result that finishes in the executor leaves in the
+	 * same tick. While the journal cannot write, only agents whose acceptance is still staged wait; the rest keep running.
+	 */
+	private void executeAcceptedInput() {
+		boolean durable = flushActionJournalGroup();
+		actionExecutor.tick(durable ? Set.of() : agentsWithStagedAcceptances());
+		if (durable) flushActionJournalGroup();
+	}
+
+	private Set<AgentId> agentsWithStagedAcceptances() {
+		Set<AgentId> agents = new HashSet<>();
+		for (ServerActionRequest request : actionJournal.stagedAcceptances()) agents.add(request.agentId());
+		return agents;
 	}
 
 	private void runServerTask(Runnable task) {
@@ -1187,8 +1208,16 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	private boolean flushActionJournalGroup() {
+		List<DurableActionJournal.ActionKey> acknowledged;
 		try {
-			for (DurableActionJournal.ActionKey key : actionJournal.flushTickGroup()) {
+			acknowledged = actionJournal.flushTickGroup();
+		} catch (AgentDomainException exception) {
+			recordJournalFailure(exception);
+			return false;
+		}
+		consecutiveJournalFailures = 0;
+		try {
+			for (DurableActionJournal.ActionKey key : acknowledged) {
 				terminalResults.acknowledge(key.agentId(), key.goalRevision(), key.actionId());
 			}
 			List<ServerActionResult> durableResults = pendingDurableTerminalResults();
@@ -1200,9 +1229,33 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			publishDurableRespawnResults();
 			return true;
 		} catch (AgentDomainException exception) {
-			// Keep the action executor behind the durability barrier and retry the whole group next tick.
-			LOGGER.debug("Action journal group will retry before input execution: {}", exception.getMessage());
+			LOGGER.debug("Committed action publication will retry next tick: {}", exception.getMessage());
 			return false;
+		}
+	}
+
+	/**
+	 * The journal retains the whole group and retries every tick. A persistent outage must not stall silently:
+	 * warn, and after a bounded number of failures hand the not-yet-durable acceptances back to the model.
+	 */
+	private void recordJournalFailure(AgentDomainException exception) {
+		consecutiveJournalFailures++;
+		long now = System.nanoTime();
+		if (consecutiveJournalFailures == 1 || now - lastJournalFailureWarningNanos >= JOURNAL_FAILURE_WARNING_INTERVAL_NANOS) {
+			lastJournalFailureWarningNanos = now;
+			LOGGER.warn("Action journal write failed {} time(s) in a row; accepted actions wait for it: {}",
+					consecutiveJournalFailures, exception.getCause() == null ? exception.getMessage() : exception.getCause());
+		}
+		if (consecutiveJournalFailures >= JOURNAL_FAILURE_REJECTION_THRESHOLD) rejectStagedAcceptances();
+	}
+
+	private void rejectStagedAcceptances() {
+		for (ServerActionRequest request : actionJournal.stagedAcceptances()) {
+			// A respawn already moved the lifecycle and reports through the respawn publication; it keeps retrying.
+			if (request.type() == ActionType.RESPAWN || !actionJournal.rollbackAccepted(request)) continue;
+			programActions.rollback(request);
+			actionExecutor.rejectUnstarted(request, "ACTION_JOURNAL_UNAVAILABLE",
+					"The server could not record the action durably; it did not run. Try it again.");
 		}
 	}
 

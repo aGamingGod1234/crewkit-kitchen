@@ -210,8 +210,24 @@ final class DurableActionJournal implements AutoCloseable {
 		return flushTickGroup();
 	}
 
+	/** Requests accepted this tick whose acceptance is not durable yet and which have not finished. */
+	synchronized List<ServerActionRequest> stagedAcceptances() {
+		if (stagedEntries == null) return List.of();
+		List<ServerActionRequest> staged = new ArrayList<>();
+		for (Mutation mutation : pendingTickMutations) {
+			for (Entry entry : mutation.put()) {
+				ActionKey key = ActionKey.from(entry.request());
+				if (entry.phase() != Phase.ACCEPTED || entries.containsKey(key)) continue;
+				Entry current = stagedEntries.get(key);
+				if (current != null && current.phase() == Phase.ACCEPTED) staged.add(current.request());
+			}
+		}
+		return staged;
+	}
+
 	/** Persists staged acceptances, terminal results and ACKs in one append and one force. */
 	synchronized List<ActionKey> flushTickGroup() {
+		if (pendingTickMutations.isEmpty() && pendingAcknowledgements.isEmpty()) return List.of();
 		List<ActionKey> completed = List.copyOf(pendingAcknowledgements);
 		List<ActionKey> acknowledged = completed.stream().filter(key -> {
 			Entry entry = tickEntries().get(key);

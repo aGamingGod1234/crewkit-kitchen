@@ -274,6 +274,7 @@ public final class VerificationMain {
 		passedAssertions += BoundedServerTaskQueueVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.bridge.ActionAcknowledgementRetryVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.bridge.BridgeAcknowledgementTickVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.bridge.BridgeJournalGroupVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.bridge.ServerTaskPhaseVerification.verify();
 		passedAssertions += dev.agaminggod.arenaagents.server.bridge.TerminalReplayFairnessVerification.verify();
 		passedAssertions += ProgramActionLedgerVerification.verify();

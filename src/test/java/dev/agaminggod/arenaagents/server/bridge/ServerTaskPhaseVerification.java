@@ -45,13 +45,7 @@ public final class ServerTaskPhaseVerification {
 		require(!capacity.offer(BoundedServerTaskQueue.Lane.INSPECTION, () -> { }), "inspection cannot consume urgent reserve");
 		require(capacity.offer(BoundedServerTaskQueue.Lane.URGENT, () -> { }), "command admission survives inspection pressure");
 		require(capacity.offer(BoundedServerTaskQueue.Lane.URGENT, () -> { }), "exact cancellation admission survives inspection pressure");
-		var gated = new BoundedServerTaskQueue(4, 1, 1);
-		var executions = new int[1];
-		gated.drainBeforePhysics(2, 1, 1, Runnable::run, () -> false, () -> executions[0]++);
-		require(executions[0] == 0, "action execution stays behind a failed durability barrier");
-		gated.drainBeforePhysics(2, 1, 1, Runnable::run, () -> true, () -> executions[0]++);
-		require(executions[0] == 1, "action execution resumes after the durability barrier succeeds");
-		return 20;
+		return 18;
 	}
 
 	private static void require(boolean condition, String message) {
