@@ -1087,17 +1087,24 @@ export class NativeToolRuntime {
 			rejectAction(error);
 		};
 		let publication = Promise.resolve();
-		this.#trace('native_tool_dispatch_started', { agentId: record.agentId, goalRevision: record.goalRevision, traceId, actionId, actionType: payload.actionType });
+		const callId = request.callId ?? null;
+		const dispatchStartedAt = performance.now();
+		this.#trace('native_tool_dispatch_started', { agentId: record.agentId, goalRevision: record.goalRevision, traceId, actionId, actionType: payload.actionType, callId });
 		try {
-			if (typeof this.#notebook?.recordDispatch === 'function' && active.worldId !== null) await this.#journal('recordDispatch', record.agentId, active, { arguments: active.arguments });
+			if (typeof this.#notebook?.recordDispatch === 'function' && active.worldId !== null) {
+				await this.#journal('recordDispatch', record.agentId, active, { arguments: active.arguments });
+				this.#trace('native_tool_journal_written', { agentId: record.agentId, goalRevision: record.goalRevision, traceId, actionId, callId, journalMs: Math.round((performance.now() - dispatchStartedAt) * 10) / 10 });
+			}
 			if (this.#actions.get(record.agentId) !== active) return waitForCompletion ? result : this.#actionStatus(record, actionId);
 			const current = this.#registry?.get(record.agentId);
 			if (this.#registry !== null && (current === null || current === undefined || current.goalRevision !== record.goalRevision)) {
 				throw codedError('STALE_PLAN', 'Native action became stale before bridge send');
 			}
 			active.dispatched = true;
+			const sendStartedAt = performance.now();
 			publication = Promise.resolve(this.#bridge.send('action_command', record.agentId, payload)).then(() => {
-				this.#trace('native_tool_command_sent', { agentId: record.agentId, goalRevision: record.goalRevision, traceId, actionId, actionType: payload.actionType });
+				this.#trace('native_tool_command_sent', { agentId: record.agentId, goalRevision: record.goalRevision, traceId, actionId, actionType: payload.actionType, callId,
+					dispatchMs: Math.round((performance.now() - dispatchStartedAt) * 10) / 10, sendMs: Math.round((performance.now() - sendStartedAt) * 10) / 10 });
 			}, failPublication);
 		} catch (error) {
 			await failPublication(error);
@@ -1109,8 +1116,11 @@ export class NativeToolRuntime {
 		if (!waitForCompletion) return this.#actionStatus(record, actionId);
 		const outcome = await result;
 		// Sequences sample after their final step; the program executor samples before each authored continuation.
-		return sequenceIndex === null && programCommand === null && POST_ACTION_OBSERVATION_TYPES.has(tool.actionType)
-			? this.#withPostAction(record, outcome, executionEpoch, outcome) : outcome;
+		if (!(sequenceIndex === null && programCommand === null && POST_ACTION_OBSERVATION_TYPES.has(tool.actionType))) return outcome;
+		const sampleStartedAt = performance.now();
+		const sampled = await this.#withPostAction(record, outcome, executionEpoch, outcome);
+		this.#trace('native_tool_post_action_sampled', { agentId: record.agentId, goalRevision: record.goalRevision, traceId, actionId, callId, waitMs: Math.round((performance.now() - sampleStartedAt) * 10) / 10 });
+		return sampled;
 	}
 
 	async #withPostAction(record, outcome, executionEpoch, afterResult = null) {
@@ -1137,6 +1147,7 @@ export class NativeToolRuntime {
 			actionId: active.actionId,
 			...(payload.progress === undefined ? {} : { progress: payload.progress }),
 			...(payload.elapsedMs === undefined ? {} : { elapsedMs: payload.elapsedMs }),
+			...(payload.serverTick === undefined ? {} : { serverTick: payload.serverTick }),
 			...(observation === undefined ? {} : { actionObservation: observation }),
 		});
 		return true;
@@ -1180,7 +1191,7 @@ export class NativeToolRuntime {
 			} catch (error) { this.#trace('native_receipt_persistence_failed', { agentId: record.agentId, actionId: active.actionId, reasonCode: error?.code ?? 'MEMORY_WRITE_FAILED' }); }
 		}
 		this.#flushSpatial(record.agentId).catch((error) => this.#trace('native_spatial_memory_failed', { agentId: record.agentId, reasonCode: error?.code ?? 'MEMORY_WRITE_FAILED' }));
-		this.#trace('native_tool_action_completed', { agentId: record.agentId, goalRevision: record.goalRevision, actionId: active.actionId, ...result });
+		this.#trace('native_tool_action_completed', { agentId: record.agentId, goalRevision: record.goalRevision, actionId: active.actionId, ...result, ...serverTimingTraceFields(payload) });
 		const latest = this.#observations.get(record.agentId);
 		this.#postResultSamples.set(record.agentId, { result, goalRevision: record.goalRevision, published: false, wake: null,
 			eventSequence: latest?.goalRevision === record.goalRevision ? latest.eventSequence : 0 });
@@ -1438,6 +1449,14 @@ function mergeDeathObservation(observation, lastLive) {
 }
 
 function safeSegment(value) { return String(value).replace(/[^A-Za-z0-9._:-]/g, '_') || 'item'; }
+/** Java-side clocks of a terminal result for the latency trace: accepted, started and ended. Never shown to the model. */
+function serverTimingTraceFields(payload) {
+	const timing = payload?.timing ?? {};
+	const fields = { javaElapsedMs: payload?.elapsedMs, javaEndedAtEpochMs: payload?.observedAtEpochMs, javaAcceptedAtEpochMs: timing.acceptedAtEpochMs,
+		javaStartedAtEpochMs: timing.startedAtEpochMs, javaStartedTick: timing.startedTick, javaEndedTick: timing.endedTick };
+	return Object.fromEntries(Object.entries(fields).filter(([, value]) => Number.isSafeInteger(value)));
+}
+
 function terminalReceipt(active, payload) {
 	return {
 		worldId: active.worldId, actionId: active.actionId, goalRevision: active.goalRevision, actionType: active.actionType,

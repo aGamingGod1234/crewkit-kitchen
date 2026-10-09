@@ -1662,10 +1662,12 @@ export class DynamicCoordinator extends EventEmitter {
 				&& existing.connectionEpoch === request.connectionEpoch
 				&& (request.priority === 'urgent' || request.nativeEvent?.event === 'program_planning_due')
 			) {
+				this.#traceEventReady(record, request, existing.traceId, 'steer');
 				if (request.nativeEvent?.event === 'program_planning_due') this.#queueNativePreparation(existing, request);
 				else this.#queueNativeSteer(existing, request);
 				return existing.promise;
 			}
+			this.#traceEventReady(record, request, existing.traceId, 'pending');
 			existing.pending = mergePlannerRequest(existing.pending, request);
 			return existing.promise;
 		}
@@ -1696,6 +1698,7 @@ export class DynamicCoordinator extends EventEmitter {
 			expired: false,
 		};
 		this.#providerWork.set(record.agentId, work);
+		this.#traceEventReady(record, request, work.traceId, 'turn');
 		work.dangerSteer.noteDelivered(request, safeClockRead(this.#controlNow));
 		try {
 			if (request.preserveState !== true) {
@@ -1709,11 +1712,18 @@ export class DynamicCoordinator extends EventEmitter {
 			throw error;
 		}
 		const verboseReporter = this.#verboseReporter(record.agentId, record.goalRevision, { allowPublicAgentMessage: true, connectionEpoch: request.connectionEpoch });
+		const eventReadyAt = performance.now();
 		work.promise = Promise.resolve()
 			.then(async () => this.#planner.requestNativeTurn({
 				agentId: record.agentId,
 				goalRevision: record.goalRevision,
-				input: await this.#nativeTurnInput(record, request).then((input) => { if (typeof input === 'string') work.inputBytes = Buffer.byteLength(input, 'utf8'); return input; }),
+				input: await this.#nativeTurnInput(record, request).then((input) => {
+					if (typeof input === 'string') {
+						work.inputBytes = Buffer.byteLength(input, 'utf8');
+						this.#writeTrace('native_input_built', { agentId: record.agentId, goalRevision: record.goalRevision, traceId: work.traceId, inputBytes: work.inputBytes, buildMs: Math.round((performance.now() - eventReadyAt) * 10) / 10 });
+					}
+					return input;
+				}),
 				recoverySummary: record.lastSummary,
 				priority: request.priority,
 				preserveState: request.preserveState === true,
@@ -1730,6 +1740,13 @@ export class DynamicCoordinator extends EventEmitter {
 			}, (error) => this.#failNativeTurn(work, error))
 			.finally(() => verboseReporter.dispose());
 		return work.promise;
+	}
+
+	/** Marks the moment an observation or attention event reaches the coordinator's turn scheduling; the first stage of a latency chain. */
+	#traceEventReady(record, request, traceId, mode) {
+		this.#writeTrace('native_event_ready', { agentId: record.agentId, goalRevision: record.goalRevision, traceId, mode,
+			trigger: request.trigger ?? null, eventName: request.nativeEvent?.event ?? null, priority: request.priority ?? null,
+			...(Number.isFinite(request.receiptMonotonicMs) ? { receiptMonotonicMs: request.receiptMonotonicMs } : {}) });
 	}
 
 	#nativePreparationIsCurrent(record, request) {
@@ -1853,6 +1870,7 @@ export class DynamicCoordinator extends EventEmitter {
 			const request = work.steerQueued;
 			work.steerQueued = null;
 			work.steerRequest = request;
+			const steerStartedAt = performance.now();
 			try {
 				const record = this.#registry.get(work.agentId);
 				if (record === null || record.goalRevision !== work.goalRevision) throw Object.assign(new Error('Native steering belongs to an obsolete goal'), { code: 'STALE_PLAN' });
@@ -1877,6 +1895,7 @@ export class DynamicCoordinator extends EventEmitter {
 					goalRevision: work.goalRevision,
 					traceId: work.traceId,
 					trigger: request.trigger,
+					steerMs: Math.round((performance.now() - steerStartedAt) * 10) / 10,
 				});
 			} catch (error) {
 				// A late rejection has no authority to rewind current conversation
@@ -2950,6 +2969,7 @@ export class DynamicCoordinator extends EventEmitter {
 		let publishedAgentMessage = false;
 		const reporter = (stage, message) => {
 			try {
+				if (stage === 'provider_event') { this.#traceProviderEvent(agentId, goalRevision, message); return; }
 				const viewRecord = this.#registry.get(agentId);
 				if (viewRecord !== null && viewRecord.goalRevision === goalRevision && this.#isConnectionEpochCurrent(connectionEpoch)) {
 					this.#taskViews.event(viewRecord, stage, message);
@@ -2977,6 +2997,15 @@ export class DynamicCoordinator extends EventEmitter {
 		};
 		this.#verboseReporters.add(reporter);
 		return reporter;
+	}
+
+	/** Provider stage timestamps (turn sent, steer delivered) ride the verbose channel so providers need no trace dependency. */
+	#traceProviderEvent(agentId, goalRevision, message) {
+		let value;
+		try { value = JSON.parse(message); } catch { return; }
+		if (typeof value?.event !== 'string' || !value.event.startsWith('native_provider_')) return;
+		const { event, ...fields } = value;
+		this.#writeTrace(event, { agentId, goalRevision, ...fields });
 	}
 
 	#setVerboseEnabled(enabled) {
@@ -4880,13 +4909,18 @@ export function mergePlannerRequest(previous, next) {
 
 function finiteCount(value) { return Number.isSafeInteger(value) && value >= 0 ? value : null; }
 
+function stringList(value) { return Array.isArray(value) ? value.slice(0, 8).filter((entry) => typeof entry === 'string').map((entry) => entry.slice(0, 64)) : null; }
+
 export function modelCallTraceFields(value) {
 	const call = value.call, last = value.last ?? {};
 	const fields = { provider: typeof call.provider === 'string' ? call.provider : null, turnId: typeof call.turnId === 'string' ? call.turnId : null,
 		contextTokens: finiteCount(call.contextTokens), inputTokens: finiteCount(last.inputTokens), cachedInputTokens: finiteCount(last.cachedInputTokens),
 		cacheWriteInputTokens: finiteCount(last.cacheWriteInputTokens), outputTokens: finiteCount(last.outputTokens), rotations: finiteCount(call.rotations),
-		firstEventMs: finiteCount(call.firstEventMs), streamMs: finiteCount(call.streamMs), totalMs: finiteCount(call.totalMs) };
-	return Object.fromEntries(Object.entries(fields).filter(([, field]) => field !== null));
+		firstEventMs: finiteCount(call.firstEventMs), streamMs: finiteCount(call.streamMs), totalMs: finiteCount(call.totalMs),
+		requestAt: finiteCount(call.requestAt), firstEventAt: finiteCount(call.firstEventAt), startMs: finiteCount(call.startMs), streamEvents: finiteCount(call.streamEvents),
+		firstEventSource: ['stream', 'assistant'].includes(call.firstEventSource) ? call.firstEventSource : null,
+		toolNames: stringList(call.toolNames), toolStartMs: Array.isArray(call.toolStartMs) ? call.toolStartMs.slice(0, 8).map(finiteCount).filter((entry) => entry !== null) : null };
+	return Object.fromEntries(Object.entries(fields).filter(([, field]) => field !== null && !(Array.isArray(field) && field.length === 0)));
 }
 
 export function turnUsageTraceFields(usage) {

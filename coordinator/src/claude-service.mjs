@@ -43,6 +43,7 @@ const DEFAULT_CONTEXT_ROTATION_TOKENS = 64_000;
 // Hysteresis: a fresh session whose first turns already pass the threshold (large tool results) must not thrash.
 const MIN_TURNS_BETWEEN_ROTATIONS = 3;
 const CARRY_OVER_TOOL_CALLS = 10;
+const MAX_TRACED_TOOLS = 8;
 const CARRY_OVER_CONVERSATION = 6;
 // Streamed token events renew liveness at most this often.
 const STREAM_PROGRESS_INTERVAL_MS = 1_000;
@@ -340,6 +341,8 @@ class ClaudeAgent {
 	#calls = new Map();
 	#currentCallId = null;
 	#requestAt = null;
+	// Stream marks of the model call in flight; a call keeps the object it started with.
+	#stream = newStreamMarks();
 	#lastContextTokens = 0;
 	#rotationDue = false;
 	#rotations = 0;
@@ -460,6 +463,7 @@ class ClaudeAgent {
 			this.#writeUserMessage(carryOver === null ? encoded : `${carryOver}
 
 ${encoded}`);
+			providerEvent(onVerbose, 'native_provider_turn_sent', { turnId: active.turnId, sessionGeneration: this.#sessionGeneration });
 			this.#pendingCarryOver = null;
 			this.#processUsed = true;
 			this.#noteEventFacts(input);
@@ -499,7 +503,7 @@ ${encoded}`);
 		// turn accounting. Steers therefore ride along with the next tool result; if the turn ends first the
 		// rejection makes the coordinator defer the event to the next turn.
 		return new Promise((resolve, reject) => {
-			active.pendingSteers.push({ text: input, resolve: () => resolve({ turnId: active.turnId }), reject });
+			active.pendingSteers.push({ text: input, queuedAt: Date.now(), resolve: () => resolve({ turnId: active.turnId }), reject });
 			active.silence.restart();
 		});
 	}
@@ -624,6 +628,9 @@ ${encoded}`);
 		this.#route = await this.#toolServer.register({
 			callTool: (name, args, meta) => this.#callTool(name, args, meta),
 			onToolsListed: () => this.#toolsListed?.resolve(),
+			onToolResponded: ({ toolUseId }) => {
+				if (toolUseId !== null && this.#active !== null) providerEvent(this.#active.onVerbose, 'native_provider_tool_result_sent', { callId: toolUseId });
+			},
 		});
 		this.#assertUsable();
 		const launch = buildClaudeLaunch(this.#profile, this.#config, {
@@ -682,7 +689,7 @@ ${encoded}`);
 			active.silence.restart();
 			try { active.onProgress?.({ phase: 'provider' }); } catch { /* progress reporting cannot fail provider work */ }
 		}
-		if (message?.type === 'stream_event') { this.#onStreamEvent(message.event); return; }
+		if (message?.type === 'stream_event') { this.#noteStreamMarks(message.event, now); this.#onStreamEvent(message.event); return; }
 		if (message?.type === 'assistant') this.#noteAssistantUsage(message.message);
 		if (message?.type === 'system' && message.subtype === 'init') {
 			if (typeof message.session_id === 'string') this.#sessionId = message.session_id;
@@ -842,13 +849,27 @@ ${encoded}`);
 		if (this.#recentTools.length > CARRY_OVER_TOOL_CALLS) this.#recentTools.splice(0, this.#recentTools.length - CARRY_OVER_TOOL_CALLS);
 	}
 
+	/**
+	 * Marks the call's first stream event of any kind, so a late or missing message_start cannot hide the
+	 * prefill/generation split, and records every tool the model starts, including Claude Code's own (Read, Glob) that
+	 * never reach the Minecraft tool server.
+	 */
+	#noteStreamMarks(event, now) {
+		const marks = this.#stream;
+		marks.firstAt ??= now;
+		marks.events += 1;
+		if (event?.type === 'message_start') marks.startAt ??= now;
+		else if (event?.type === 'content_block_start' && event.content_block?.type === 'tool_use' && typeof event.content_block.name === 'string' && marks.tools.length < MAX_TRACED_TOOLS) {
+			marks.tools.push({ name: event.content_block.name.slice(0, 64), at: now });
+		}
+	}
+
 	/** --include-partial-messages: message_start is the first streamed event (after prefill), message_stop ends generation. */
 	#onStreamEvent(event) {
 		const id = event?.message?.id;
 		if (event?.type === 'message_start' && typeof id === 'string') {
 			this.#currentCallId = id;
 			const call = this.#call(id);
-			call.firstEventAt ??= Date.now();
 			mergeUsage(call.usage, event.message.usage);
 			return;
 		}
@@ -869,8 +890,9 @@ ${encoded}`);
 	#call(id) {
 		let call = this.#calls.get(id);
 		if (call === undefined) {
-			call = { id, requestAt: this.#requestAt, firstEventAt: null, usage: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 }, done: false };
+			call = { id, requestAt: this.#requestAt, firstEventAt: null, stream: this.#stream, usage: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 }, done: false };
 			this.#calls.set(id, call);
+			this.#currentCallId = id;
 		}
 		return call;
 	}
@@ -879,12 +901,16 @@ ${encoded}`);
 		for (const call of this.#calls.values()) this.#finishCall(call);
 		this.#calls.clear();
 		this.#currentCallId = null;
+		this.#stream = newStreamMarks();
 	}
 
 	#finishCall(call) {
 		if (call.done) return;
 		call.done = true;
+		if (this.#stream === call.stream) this.#stream = newStreamMarks();
 		const endedAt = Date.now();
+		// Stream events, when present, mark the true first token of the call; an assistant message only proves it had finished.
+		const firstAt = call.stream.firstAt ?? call.firstEventAt;
 		const { input, cacheRead, cacheWrite, output } = call.usage;
 		const contextTokens = input + cacheRead + cacheWrite;
 		this.#lastContextTokens = contextTokens;
@@ -903,9 +929,13 @@ ${encoded}`);
 			last: { inputTokens: contextTokens, cachedInputTokens: cacheRead, cacheWriteInputTokens: cacheWrite, outputTokens: output, totalTokens: contextTokens + output },
 			call: {
 				provider: 'claude', turnId: active.turnId, contextTokens, rotations: this.#rotations,
-				...(requestAt === null || call.firstEventAt === null ? {} : { firstEventMs: Math.max(0, call.firstEventAt - requestAt) }),
-				...(call.firstEventAt === null ? {} : { streamMs: Math.max(0, endedAt - call.firstEventAt) }),
-				...(requestAt === null ? {} : { totalMs: Math.max(0, endedAt - requestAt) }),
+				...(requestAt === null || firstAt === null ? {} : { firstEventMs: Math.max(0, firstAt - requestAt) }),
+				...(firstAt === null ? {} : { streamMs: Math.max(0, endedAt - firstAt) }),
+				...(requestAt === null ? {} : { totalMs: Math.max(0, endedAt - requestAt), requestAt }),
+				...(firstAt === null ? {} : { firstEventAt: firstAt, firstEventSource: call.stream.firstAt === null ? 'assistant' : 'stream' }),
+				...(requestAt === null || call.stream.startAt === null ? {} : { startMs: Math.max(0, call.stream.startAt - requestAt) }),
+				streamEvents: call.stream.events,
+				...(call.stream.tools.length === 0 ? {} : { toolNames: call.stream.tools.map((tool) => tool.name), ...(requestAt === null ? {} : { toolStartMs: call.stream.tools.map((tool) => Math.max(0, tool.at - requestAt)) }) }),
 			},
 		}));
 	}
@@ -981,6 +1011,7 @@ ${encoded}`);
 		this.#processCostUsd = 0;
 		this.#calls.clear();
 		this.#currentCallId = null;
+		this.#stream = newStreamMarks();
 	}
 
 	#runOneShot(prompt) {
@@ -1165,6 +1196,7 @@ function resultErrorCode(document) {
 function deliverSteers(active, content, encode = (text) => text) {
 	const steers = active.pendingSteers.splice(0);
 	if (steers.length === 0) return content;
+	providerEvent(active.onVerbose, 'native_provider_steer_delivered', { turnId: active.turnId, steers: steers.length, waitMs: Math.max(0, Date.now() - Math.min(...steers.map((steer) => steer.queuedAt))) });
 	const text = `Newer coordinator events for this turn (treat them exactly like the turn input):\n${steers.map((steer) => encode(steer.text)).join('\n\n')}`;
 	for (const steer of steers) steer.resolve();
 	return { ...content, contentItems: [...content.contentItems, { type: 'inputText', text }] };
@@ -1295,6 +1327,15 @@ function agentDirectoryName(agentId) {
 function stripCodeFence(text) {
 	const fenced = /^```(?:json)?\s*\n([\s\S]*?)\n```$/.exec(text);
 	return fenced === null ? text : fenced[1].trim();
+}
+
+/** Stage timestamp for the latency trace; the coordinator stamps it when the verbose channel delivers it. */
+function providerEvent(callback, event, fields) {
+	safeVerbose(callback, 'provider_event', JSON.stringify({ event, ...fields }));
+}
+
+function newStreamMarks() {
+	return { firstAt: null, startAt: null, events: 0, tools: [] };
 }
 
 function safeVerbose(callback, stage, message) {

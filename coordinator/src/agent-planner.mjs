@@ -237,6 +237,7 @@ export class AgentPlanner {
 			const admittedAt = this.#now();
 			const queueWaitMs = elapsed(queuedAt, admittedAt);
 			safeVerbose(onVerbose, 'planner', 'Native turn admitted by the planning scheduler.');
+			this.#traceNativeTiming(record, 'native_turn_admitted', { traceId, queueWaitMs });
 			this.#recordTracePhase(record, traceId, 'queue_wait', queuedAt, admittedAt, 'completed');
 			this.#registry.assertCurrentRevision(agentId, goalRevision);
 			if (!preserveState) this.#registry.setState(agentId, DynamicAgentState.PLANNING, { goalRevision });
@@ -305,6 +306,7 @@ export class AgentPlanner {
 				}, async () => {
 					nativeTurnStartedAt = this.#now();
 					beginProviderSegment(nativeTurnStartedAt);
+					this.#traceNativeTiming(record, 'native_provider_turn_started', { traceId, agentReadyMs: elapsed(admittedAt, nativeTurnStartedAt) });
 					try {
 						const turnResult = await agent.act(input, {
 							goalRevision,
@@ -323,7 +325,7 @@ export class AgentPlanner {
 								const hasArrival = Number.isFinite(request?.requestArrivedAt);
 								recordToolRequest(request, hasArrival ? request.requestArrivedAt : executorEnteredAt);
 								this.#recordNativeTiming(record, 'native_tool_queue_timing', {
-									traceId, callId: request?.callId ?? null, toolKind: request?.tool?.kind ?? 'unknown',
+									traceId, callId: request?.callId ?? null, turnId: request?.turnId ?? null, toolKind: request?.tool?.kind ?? 'unknown',
 									queueWaitMs: Number.isFinite(request?.queueWaitMs) ? request.queueWaitMs : null,
 									arrivalObserved: hasArrival, ...timingIdentity,
 								});
@@ -333,6 +335,10 @@ export class AgentPlanner {
 								try {
 									if (signal.aborted) throw signal.reason;
 									const toolResult = await executeTool(request);
+									this.#traceNativeTiming(record, 'native_tool_executed', {
+										traceId, callId: request?.callId ?? null, toolKind: request?.tool?.kind ?? 'unknown',
+										executeMs: elapsed(executorEnteredAt, this.#now()), state: typeof toolResult?.state === 'string' ? toolResult.state.slice(0, 64) : null,
+									});
 									const reference = nativeToolReferenceTraceFields(request?.tool, toolResult);
 									if (reference !== null) this.#recordNativeTiming(record, 'native_tool_reference', { traceId, callId: request?.callId ?? null, ...reference, ...timingIdentity });
 									if (!firstUsableToolRecorded && isUsableNativeToolResult(toolResult)) {
@@ -697,6 +703,11 @@ export class AgentPlanner {
 
 	#recordNativeTiming(record, event, fields) {
 		this.#record(event, record, fields);
+		this.#traceNativeTiming(record, event, fields);
+	}
+
+	/** Trace-file only: stage timestamps for latency analysis that benchmark recorders do not consume. */
+	#traceNativeTiming(record, event, fields) {
 		if (this.#nativeTimingSink === null) return;
 		try {
 			const result = this.#nativeTimingSink(event, {
@@ -910,7 +921,7 @@ function buildCorrectiveRetryInput(input, error, retryCount) {
 
 function safeVerbose(callback, stage, message) {
 	if (typeof callback !== 'function') return;
-	if (stage.startsWith('live_')) {
+	if (stage.startsWith('live_') || stage === 'provider_event') {
 		try { Promise.resolve(callback(stage, String(message ?? '').slice(0, 2048))).catch(() => {}); } catch { /* view output cannot affect planning */ }
 		return;
 	}

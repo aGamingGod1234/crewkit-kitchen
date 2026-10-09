@@ -46,6 +46,7 @@ import dev.agaminggod.arenaagents.server.perception.ObservationDispatchQueue;
 import dev.agaminggod.arenaagents.server.perception.AttentionFactDelta;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationCollector;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationWireBudget;
+import dev.agaminggod.arenaagents.server.runtime.ActionTimelines;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionExecutor;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionProgress;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionObservation;
@@ -1018,6 +1019,11 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			JsonElement capability = envelope.payload().get("registryFragments");
 			if (!capability.isJsonPrimitive() || !capability.getAsJsonPrimitive().isBoolean()) throw new BridgeProtocolException("INVALID_FIELD", "registryFragments must be a boolean");
 			source.registryFragments = capability.getAsBoolean();
+		}
+		if (envelope.payload().has("actionTiming")) {
+			JsonElement capability = envelope.payload().get("actionTiming");
+			if (!capability.isJsonPrimitive() || !capability.getAsJsonPrimitive().isBoolean()) throw new BridgeProtocolException("INVALID_FIELD", "actionTiming must be a boolean");
+			source.actionTiming = capability.getAsBoolean();
 		}
 
 		while (true) {
@@ -2657,6 +2663,20 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		payload.addProperty("observedAtEpochMs", result.observedAtEpochMs());
 		payload.addProperty("executionStarted", result.executionStarted());
 		payload.addProperty("physicalAttempted", result.physicalAttempted());
+		// An older coordinator rejects unknown action_result keys and would leave the action unresolved, and the
+		// bundled coordinator can lag the jar (rollback to last-known-good, external package roots), so only a
+		// coordinator that announced actionTiming in its hello receives the clocks.
+		ActionTimelines.Timeline timeline = target.actionTiming ? ActionTimelines.recall(result.agentId(), result.actionId()) : null;
+		if (timeline != null) {
+			JsonObject timing = new JsonObject();
+			timing.addProperty("acceptedAtEpochMs", timeline.acceptedAtEpochMs());
+			if (timeline.startedAtEpochMs() > 0L) {
+				timing.addProperty("startedAtEpochMs", timeline.startedAtEpochMs());
+				timing.addProperty("startedTick", timeline.startedTick());
+			}
+			timing.addProperty("endedTick", timeline.endedTick());
+			payload.add("timing", timing);
+		}
 		if (result.actionObservation() != null) payload.add("actionObservation", actionObservationPayload(result.actionObservation()));
 		payload.addProperty("replayProof", actionResultReplayProof(
 				secret, target.clientNonce, target.serverNonce, serverInstanceId,
@@ -2752,6 +2772,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		payload.addProperty("progress", progress.progress());
 		payload.addProperty("elapsedMs", progress.elapsedMs());
 		payload.addProperty("observedAtEpochMs", progress.observedAtEpochMs());
+		Session timingSession = session;
+		if (manager.server() != null && timingSession != null && timingSession.actionTiming) payload.addProperty("serverTick", manager.server().getTickCount());
 		if (progress.actionObservation() != null) payload.add("actionObservation", actionObservationPayload(progress.actionObservation()));
 		send("action_progress", progress.agentId().toString(), payload);
 		if (progress.actionObservation() == null || progress.actionObservation().progress() == null
@@ -3939,6 +3961,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		private final long handshakeStartedNanos;
 		private final long handshakeTimeoutNanos = TimeUnit.MILLISECONDS.toNanos(HANDSHAKE_TIMEOUT_MS);
 		private volatile boolean registryFragments;
+		private volatile boolean actionTiming;
 		private volatile String clientNonce;
 		private volatile String serverNonce;
 		private volatile String authResponseMessageId;

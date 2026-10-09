@@ -238,13 +238,14 @@ function normalizeProtocolV2Payload(type, value) {
 				proof: authenticationToken(value.proof, 'proof'),
 			};
 		case 'hello':
-			exactKeys(value, ['replyTo', 'clientNonce', 'serverNonce', 'proof', 'launchId', 'registryFragments'], ['replyTo', 'clientNonce', 'serverNonce', 'proof'], type);
+			exactKeys(value, ['replyTo', 'clientNonce', 'serverNonce', 'proof', 'launchId', 'registryFragments', 'actionTiming'], ['replyTo', 'clientNonce', 'serverNonce', 'proof'], type);
 			return {
 				replyTo: boundedText(value.replyTo, 'replyTo', MAX_COMMAND_ID_LENGTH),
 				clientNonce: authenticationToken(value.clientNonce, 'clientNonce'),
 				serverNonce: authenticationToken(value.serverNonce, 'serverNonce'),
 				proof: authenticationToken(value.proof, 'proof'),
 				...(value.registryFragments === undefined ? {} : { registryFragments: boolean(value.registryFragments, 'registryFragments') }),
+				...(value.actionTiming === undefined ? {} : { actionTiming: boolean(value.actionTiming, 'actionTiming') }),
 				...(value.launchId === undefined ? {} : { launchId: launchIdentity(value.launchId) }),
 			};
 		case 'hello_ack':
@@ -847,6 +848,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 					launchId: this.#launchId,
 				}),
 				registryFragments: true,
+				actionTiming: true,
 				...(this.#launchId === null ? {} : { launchId: this.#launchId }),
 			},
 		});
@@ -2213,7 +2215,7 @@ function normalizeActionTarget(value, field) {
 }
 
 function normalizeActionProgress(value) {
-	const allowed = ['traceId', 'goalRevision', 'actionId', 'commandId', 'actionType', 'state', 'message', 'progress', 'elapsedMs', 'observedAtEpochMs', 'actionObservation'];
+	const allowed = ['traceId', 'goalRevision', 'actionId', 'commandId', 'actionType', 'state', 'message', 'progress', 'elapsedMs', 'observedAtEpochMs', 'serverTick', 'actionObservation'];
 	exactKeys(value, allowed, ['traceId', 'goalRevision', 'actionId'], 'action_progress');
 	const actionId = requireIdentifier(value.actionId, 'actionId');
 	if (value.commandId !== undefined && value.commandId !== actionId) throw new ProtocolV2Error('INVALID_PAYLOAD', 'commandId must match actionId');
@@ -2228,6 +2230,7 @@ function normalizeActionProgress(value) {
 	}
 	if (value.elapsedMs !== undefined) normalized.elapsedMs = nonnegativeInteger(value.elapsedMs, 'elapsedMs');
 	if (value.observedAtEpochMs !== undefined) normalized.observedAtEpochMs = nonnegativeInteger(value.observedAtEpochMs, 'observedAtEpochMs');
+	if (value.serverTick !== undefined) normalized.serverTick = nonnegativeInteger(value.serverTick, 'serverTick');
 	if (value.actionObservation !== undefined) {
 		normalized.actionObservation = normalizeActionObservation(value.actionObservation);
 		if (normalized.progress !== undefined && normalized.actionObservation.progress !== undefined
@@ -2239,7 +2242,7 @@ function normalizeActionProgress(value) {
 }
 
 function normalizeActionResult(value) {
-	const allowed = ['traceId', 'goalRevision', 'actionId', 'commandId', 'actionType', 'state', 'reasonCode', 'message', 'elapsedMs', 'observedAtEpochMs', 'executionStarted', 'physicalAttempted', 'actionObservation', 'replayProof'];
+	const allowed = ['traceId', 'goalRevision', 'actionId', 'commandId', 'actionType', 'state', 'reasonCode', 'message', 'elapsedMs', 'observedAtEpochMs', 'executionStarted', 'physicalAttempted', 'timing', 'actionObservation', 'replayProof'];
 	exactKeys(value, allowed, ['traceId', 'goalRevision', 'actionId', 'commandId', 'actionType', 'state', 'reasonCode', 'message', 'elapsedMs', 'observedAtEpochMs'], 'action_result');
 	const actionId = requireIdentifier(value.actionId, 'actionId');
 	if (value.commandId !== actionId) throw new ProtocolV2Error('INVALID_PAYLOAD', 'commandId must match actionId');
@@ -2265,14 +2268,22 @@ function normalizeActionResult(value) {
 		if (typeof value.physicalAttempted !== 'boolean') throw new ProtocolV2Error('INVALID_PAYLOAD', 'physicalAttempted must be a boolean');
 		normalized.physicalAttempted = value.physicalAttempted;
 	}
+	if (value.timing !== undefined) normalized.timing = normalizeActionTiming(value.timing);
 	if (value.actionObservation !== undefined) normalized.actionObservation = normalizeActionObservation(value.actionObservation);
 	if (value.replayProof !== undefined) normalized.replayProof = authenticationToken(value.replayProof, 'replayProof');
 	if (normalized.physicalAttempted === true && normalized.executionStarted !== true) throw new ProtocolV2Error('INVALID_PAYLOAD', 'physicalAttempted requires executionStarted');
 	return normalized;
 }
 
+/** Java-side clocks for latency traces. Informational only: a replayed result may lack them, so they stay out of the fingerprint. */
+function normalizeActionTiming(value) {
+	const keys = ['acceptedAtEpochMs', 'startedAtEpochMs', 'startedTick', 'endedTick'];
+	exactKeys(value, keys, [], 'action_result.timing');
+	return Object.fromEntries(keys.filter((key) => value[key] !== undefined).map((key) => [key, nonnegativeInteger(value[key], `timing.${key}`)]));
+}
+
 function terminalResultFingerprint(payload) {
-	const { replayProof: _replayProof, ...result } = payload;
+	const { replayProof: _replayProof, timing: _timing, ...result } = payload;
 	return createHash('sha256').update(JSON.stringify(result)).digest('hex');
 }
 

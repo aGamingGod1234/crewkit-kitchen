@@ -752,6 +752,7 @@ export class SharedCodexAgent {
 			const encodedInput = pendingCarryOver === null ? encodedEvent : `${pendingCarryOver}\n\n${encodedEvent}`;
 			if (!prewarm) { this.#pendingCarryOver = null; carryOver.noteEvent(input); }
 			collector.recordInput('turn/start', encodedInput);
+			if (!prewarm) collector.providerEvent('native_provider_turn_sent', { inputBytes: Buffer.byteLength(encodedInput, 'utf8') });
 			const turnStartPromise = this.#transport.request('turn/start', {
 				threadId: this.#threadId,
 				input: [{ type: 'text', text: encodedInput }],
@@ -774,6 +775,7 @@ export class SharedCodexAgent {
 			}, () => {});
 			const response = await withTimeout(Promise.race([turnStartPromise, lifecyclePromise, collector.promise]), this.#planningTimeoutMs, this.#schedule, this.#cancelSchedule);
 			active.turnId = requireNestedId(response, 'turn', 'turn/start');
+			if (!prewarm) collector.providerEvent('native_provider_turn_acked', { turnId: active.turnId });
 			this.#recordEffectiveSettings(response);
 			collector.setTurnId(active.turnId);
 			if (this.#active !== active || this.#goalRevision !== goalRevision || lifecycleSettled || signal?.aborted) {
@@ -878,6 +880,7 @@ export class SharedCodexAgent {
 		const encodedInput = encodeNativeEventInput(input, this.#observationViews);
 		const submitSteer = () => {
 			active.collector.recordInput('turn/steer', encodedInput);
+			active.collector.providerEvent('native_provider_steer_sent', { turnId });
 			return this.#transport.request('turn/steer', {
 				threadId: this.#threadId, expectedTurnId: turnId,
 				input: [{ type: 'text', text: encodedInput }],
@@ -895,6 +898,7 @@ export class SharedCodexAgent {
 		try {
 			const response = await steerPromise;
 			if (response?.turnId !== turnId) throw new CodexProtocolError('INVALID_TURN_STEER', 'turn/steer response did not preserve the active turn');
+			active.collector.providerEvent('native_provider_steer_acked', { turnId });
 			// Steered DMs, decisions and danger summaries are part of what a fresh thread must not lose.
 			this.#carryOver.noteEvent(input);
 			if (executeTool !== null) active.prewarm = false;
@@ -1131,6 +1135,7 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 			input: inputs.length === 1 ? inputs[0].input : inputs.length === 0 ? '' : JSON.stringify(inputs),
 			inputBytes, inputCount: inputs.length, toolCalls, toolResultBytes, toolResponses: toolResponses.snapshot(), compaction };
 	};
+	const providerEvent = (event, fields) => safeVerbose(onVerbose, 'provider_event', JSON.stringify({ event, ...fields }));
 	const respond = async (id, response, metadata) => {
 		let measurement = null;
 		// Capture the exact presented response, excluding its RPC envelope. A lost
@@ -1221,6 +1226,7 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 				if (!settled) {
 					const presented = presentNativeToolResult(result, tool, observationViews);
 					await respond(id, presented.response, measurementMetadata(result));
+					providerEvent('native_provider_tool_result_sent', { callId: params.callId });
 					if (!settled) presented.commit();
 					safeVerbose(onVerbose, 'live_result', presented.response.contentItems[0].text.slice(0, 1200));
 				}
@@ -1232,6 +1238,7 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 					message: String(error?.message ?? error).slice(0, 512),
 					...(error?.actionContract === undefined ? {} : { actionContract: error.actionContract }),
 				}, false), measurementMetadata(null));
+				providerEvent('native_provider_tool_result_sent', { callId: params.callId });
 			} finally {
 				if (executionStarted) {
 					onToolExecutionEnd();
@@ -1342,6 +1349,8 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 		snapshot,
 		recordInput(method, input) { inputs.push({ method, input }); inputBytes += Buffer.byteLength(input, 'utf8'); },
 		replaceOnVerbose(next) { onVerbose = next; },
+		/** Stage timestamp for the latency trace, delivered through whichever verbose callback currently owns the turn. */
+		providerEvent,
 		replaceExecuteTool(next) {
 			if (typeof next !== 'function') throw new TypeError('native tool executor must be a function');
 			const previous = toolExecutor;
@@ -1427,7 +1436,7 @@ function createProviderSilenceDeadline(timeoutMs, schedule, cancelSchedule) {
 
 function safeVerbose(callback, stage, message) {
 	if (typeof callback !== 'function') return;
-	if (stage.startsWith('live_')) {
+	if (stage.startsWith('live_') || stage === 'provider_event') {
 		try { Promise.resolve(callback(stage, String(message ?? '').slice(0, 2048))).catch(() => {}); } catch { /* read-only view */ }
 		return;
 	}

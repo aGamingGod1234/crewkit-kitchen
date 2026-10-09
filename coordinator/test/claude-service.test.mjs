@@ -187,7 +187,9 @@ test('a Claude native turn executes Minecraft tools through the coordinator and 
 		assert.equal(executed[0].tool.kind, 'observe');
 		assert.equal(executed[0].agentId, 'claude-a');
 		assert.equal(executed[0].callId, 'toolu_1');
-		assert.deepEqual(verbose, [['agent_message', 'Looking around.']]);
+		assert.deepEqual(verbose.filter(([stage]) => stage !== 'provider_event'), [['agent_message', 'Looking around.']]);
+		// Stamped once the MCP response has left the tool server, so the trace does not count formatting as free.
+		assert.deepEqual(providerEvents(verbose).filter((entry) => entry.event === 'native_provider_tool_result_sent'), [{ event: 'native_provider_tool_result_sent', callId: 'toolu_1' }]);
 		assert.equal(agent.sessionMetadata().sessionState, 'warm');
 	} finally { await close(); }
 });
@@ -404,6 +406,74 @@ test('Claude per-call usage and timing reach live usage; cost is a per-process r
 		assert.equal(live.cacheWriteInputTokens, 200);
 		assert.ok(Number.isSafeInteger(live.call.firstEventMs) && Number.isSafeInteger(live.call.streamMs) && Number.isSafeInteger(live.call.totalMs));
 		assert.ok(children[0].args.includes('--include-partial-messages'));
+	} finally { await close(); }
+});
+
+const modelCall = (verbose) => verbose.filter(([stage]) => stage === 'live_usage').map(([, message]) => JSON.parse(message).call);
+const providerEvents = (verbose) => verbose.filter(([stage]) => stage === 'provider_event').map(([, message]) => JSON.parse(message));
+
+test('model call trace names every tool the model starts, CLI-local ones included, and sends the turn-sent stage', async () => {
+	const { service, close } = await harness({
+		async onUser(child) {
+			child.emitLine({ type: 'stream_event', event: { type: 'message_start', message: { id: 'msg_a', usage: { input_tokens: 5, cache_read_input_tokens: 1000, cache_creation_input_tokens: 10, output_tokens: 1 } } } });
+			child.emitLine({ type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'toolu_1', name: 'Read', input: {} } } });
+			child.emitLine({ type: 'stream_event', event: { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'toolu_2', name: 'mcp__minecraft__observe', input: {} } } });
+			child.emitLine({ type: 'stream_event', event: { type: 'message_delta', usage: { output_tokens: 9 } } });
+			child.emitLine({ type: 'stream_event', event: { type: 'message_stop' } });
+			child.emitLine({ type: 'result', subtype: 'success', is_error: false, result: 'ok', session_id: 'session-1' });
+		},
+	});
+	try {
+		const agent = await service.createAgent(profile(), { controlProtocol: 'native_tools' });
+		const verbose = [];
+		await agent.act('One.', { goalRevision: 0, onVerbose: (stage, message) => verbose.push([stage, message]), executeTool: async () => ({}) });
+		const [call] = modelCall(verbose);
+		assert.deepEqual(call.toolNames, ['Read', 'mcp__minecraft__observe']);
+		assert.equal(call.toolStartMs.length, 2);
+		assert.equal(call.firstEventSource, 'stream');
+		assert.equal(call.streamEvents, 5);
+		assert.ok(Number.isSafeInteger(call.requestAt) && Number.isSafeInteger(call.firstEventAt) && call.firstEventAt >= call.requestAt);
+		assert.ok(Number.isSafeInteger(call.startMs));
+		assert.deepEqual(providerEvents(verbose).map((entry) => entry.event), ['native_provider_turn_sent']);
+	} finally { await close(); }
+});
+
+test('model call timing starts at the first stream event of any kind when message_start is missing', async () => {
+	const { service, close } = await harness({
+		async onUser(child) {
+			child.emitLine({ type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } });
+			await settle(40);
+			child.emitLine({ type: 'assistant', message: { id: 'msg_b', content: [{ type: 'text', text: 'done' }], usage: { input_tokens: 5, cache_read_input_tokens: 1000, cache_creation_input_tokens: 10, output_tokens: 3 } } });
+			child.emitLine({ type: 'stream_event', event: { type: 'message_stop' } });
+			child.emitLine({ type: 'result', subtype: 'success', is_error: false, result: 'ok', session_id: 'session-1' });
+		},
+	});
+	try {
+		const agent = await service.createAgent(profile(), { controlProtocol: 'native_tools' });
+		const verbose = [];
+		await agent.act('One.', { goalRevision: 0, onVerbose: (stage, message) => verbose.push([stage, message]), executeTool: async () => ({}) });
+		const [call] = modelCall(verbose);
+		assert.equal(call.firstEventSource, 'stream');
+		assert.equal(call.startMs, undefined, 'no message_start was seen');
+		assert.ok(call.streamMs >= 30, 'generation time is kept instead of collapsing to the assistant message');
+		assert.equal(call.totalMs, call.firstEventMs + call.streamMs);
+	} finally { await close(); }
+});
+
+test('model call without stream events reports that its first event is the assistant message', async () => {
+	const { service, close } = await harness({
+		async onUser(child) {
+			child.emitLine({ type: 'assistant', message: { id: 'msg_c', content: [{ type: 'text', text: 'done' }], usage: { input_tokens: 5, cache_read_input_tokens: 1000, cache_creation_input_tokens: 10, output_tokens: 3 } } });
+			child.emitLine({ type: 'result', subtype: 'success', is_error: false, result: 'ok', session_id: 'session-1' });
+		},
+	});
+	try {
+		const agent = await service.createAgent(profile(), { controlProtocol: 'native_tools' });
+		const verbose = [];
+		await agent.act('One.', { goalRevision: 0, onVerbose: (stage, message) => verbose.push([stage, message]), executeTool: async () => ({}) });
+		const [call] = modelCall(verbose);
+		assert.equal(call.firstEventSource, 'assistant');
+		assert.equal(call.streamEvents, 0);
 	} finally { await close(); }
 });
 

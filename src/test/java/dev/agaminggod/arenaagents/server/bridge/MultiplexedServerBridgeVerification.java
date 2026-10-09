@@ -29,6 +29,7 @@ import dev.agaminggod.arenaagents.server.goal.PendingGoalDraft;
 import dev.agaminggod.arenaagents.server.perception.ObservationDispatchQueue;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationWireBudget;
 import dev.agaminggod.arenaagents.server.runtime.ActionProvenance;
+import dev.agaminggod.arenaagents.server.runtime.ActionTimelines;
 import dev.agaminggod.arenaagents.server.runtime.GoalCompletionVerifier;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionProgress;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionObservation;
@@ -113,6 +114,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyReplacementHandshakeSupersedesPendingDisconnect();
 		verifyAuthenticatedReconnectRecovery();
 		verifyTerminalReplaySurvivesDisconnectRevision();
+		verifyActionTimingFollowsNegotiatedCapability();
 		verifyAcceptedActionRecoversWithoutReplay();
 		verifyRebindPersistsCancellationBeforeClosingJournal();
 		verifyObsoletePlannerReadinessIsIgnored();
@@ -545,6 +547,76 @@ public final class MultiplexedServerBridgeVerification {
 					Files.deleteIfExists(secretFile);
 				} catch (java.io.IOException exception) {
 					throw new AssertionError("could not remove terminal replay bridge secret", exception);
+				}
+			}
+		}
+	}
+
+	/** An older coordinator rejects unknown action_result keys, so Java clocks may only reach one that announced actionTiming. */
+	private static void verifyActionTimingFollowsNegotiatedCapability() {
+		verifyActionTimingReplay(false);
+		verifyActionTimingReplay(true);
+	}
+
+	private static void verifyActionTimingReplay(boolean negotiated) {
+		MultiplexedServerBridge bridge = null;
+		Path secretFile = null;
+		try {
+			String secret = "0123456789abcdef0123456789abcdef";
+			secretFile = Files.createTempFile("arena-agents-action-timing-secret-", ".txt");
+			Files.writeString(secretFile, secret);
+			CodexAgentManager manager = uninitializedManager();
+			AgentRecord active = manager.registry().create("gpt-5.6-sol", "high", Optional.of("Timing"), 2_500L);
+			manager.registry().start(active.agentId(), "finish the timed action", 2_501L);
+			AgentRecord started = manager.registry().require(active.agentId());
+			ServerActionResult result = new ServerActionResult(
+					started.agentId(), started.goalRevision(), "timed-action-" + negotiated, ActionType.WAIT,
+					"trace-timed-action", ServerActionState.SUCCEEDED, "DONE", "done", 1L,
+					1_750_000_000_001L, true, true
+			);
+			ActionTimelines.remember(result.agentId(), result.actionId(), new ActionTimelines.Timeline(1_750_000_000_000L, 1_750_000_000_001L, 40L, 41L));
+			bridge = new MultiplexedServerBridge(manager, 0, secretFile);
+			bridge.start();
+			TerminalResultLedger ledger = bridge.terminalResultsForVerification();
+			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+			try (Socket first = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader firstReader = new BufferedReader(new InputStreamReader(first.getInputStream(), StandardCharsets.UTF_8))) {
+				first.setSoTimeout(2_000);
+				authenticate(first, firstReader, codec, secret, "hello-action-timing-first");
+				assertTrue(ledger.retain(result), "the timed result is retained for replay");
+				assertTrue(ledger.claim(result, session(bridge)), "the first session owns the initial delivery");
+				bridge.tick();
+			}
+			MultiplexedServerBridge activeBridge = bridge;
+			awaitCondition(() -> !activeBridge.observationPublicationForVerification().hasActiveSession(),
+					"timing fixture releases the first session");
+			manager.registry().disconnect(active.agentId(), 2_502L);
+			bridge.tick();
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+				socket.setSoTimeout(2_000);
+				String messageId = "hello-action-timing-replacement";
+				AuthenticationExchange exchange = beginAuthentication(socket, reader, codec, secret, messageId);
+				writeAuthenticatedHello(socket, codec, secret, null, messageId, exchange, negotiated);
+				assertEquals("hello_ack", codec.decode(reader.readLine()).type(), "timing fixture authenticates");
+				assertEquals("verbose_control", codec.decode(reader.readLine()).type(), "timing fixture consumes verbose control");
+				BridgeEnvelope replay = codec.decode(reader.readLine());
+				assertEquals("action_result", replay.type(), "the retained result is replayed on handshake");
+				assertEquals(negotiated, replay.payload().has("timing"),
+						"timing reaches only a coordinator that announced actionTiming (negotiated=" + negotiated + ")");
+				if (negotiated) {
+					assertEquals(41L, replay.payload().getAsJsonObject("timing").get("endedTick").getAsLong(), "negotiated timing carries the end tick");
+				}
+			}
+		} catch (Exception exception) {
+			throw new AssertionError("action timing capability verification failed (negotiated=" + negotiated + ")", exception);
+		} finally {
+			if (bridge != null) bridge.close();
+			if (secretFile != null) {
+				try {
+					Files.deleteIfExists(secretFile);
+				} catch (java.io.IOException exception) {
+					throw new AssertionError("could not remove action timing bridge secret", exception);
 				}
 			}
 		}
@@ -3629,6 +3701,18 @@ public final class MultiplexedServerBridgeVerification {
 			String messageId,
 			AuthenticationExchange exchange
 	) throws Exception {
+		writeAuthenticatedHello(socket, codec, secret, launchId, messageId, exchange, false);
+	}
+
+	private static void writeAuthenticatedHello(
+			Socket socket,
+			BridgeEnvelopeCodec codec,
+			String secret,
+			String launchId,
+			String messageId,
+			AuthenticationExchange exchange,
+			boolean actionTiming
+	) throws Exception {
 		String clientNonce = exchange.clientNonce();
 		String serverNonce = exchange.serverNonce();
 		BridgeEnvelope response = exchange.response();
@@ -3640,6 +3724,7 @@ public final class MultiplexedServerBridgeVerification {
 				secret, "coordinator", clientNonce, serverNonce, response.serverInstanceId(), launchId
 		));
 		if (launchId != null) payload.addProperty("launchId", launchId);
+		if (actionTiming) payload.addProperty("actionTiming", true);
 		socket.getOutputStream().write(codec.encode(new BridgeEnvelope(
 				2, response.serverInstanceId(), "server", "hello", messageId, payload
 		)).getBytes(StandardCharsets.UTF_8));

@@ -177,6 +177,30 @@ test('reserves truncation-marker bytes at the serialized line boundary', async (
 	assert.doesNotMatch(lines[0], /\uD800|\uDFFF/);
 });
 
+test('every row is stamped with epoch and monotonic time, and caller stamps are kept', async () => {
+	const lines = [];
+	let wall = 1_760_000_000_000;
+	let mono = 5_000.04;
+	const writer = new TraceWriter('C:\\runtime\\trace.jsonl', {
+		diagnosticFilePath: 'C:\\runtime\\private.jsonl',
+		mkdir: async () => {},
+		appendFile: async (_path, value) => lines.push(value),
+		epochNow: () => wall++,
+		monotonicNow: () => (mono += 1.26),
+	});
+	await writer.write('stage', { agentId: 'a', durationMs: 7 });
+	await writer.write({ event: 'row-form', actionId: 'x' });
+	await writer.write('supplied', { at: 42, mono: 1.5 });
+	await writer.close();
+	const rows = lines.map((line) => JSON.parse(line));
+	assert.deepEqual(Object.keys(rows[0]), ['event', 'agentId', 'durationMs', 'at', 'mono']);
+	assert.deepEqual(rows[0], { event: 'stage', at: 1_760_000_000_000, mono: 5_001.3, agentId: 'a', durationMs: 7 });
+	assert.deepEqual(Object.keys(rows[1]), ['event', 'actionId', 'at', 'mono']);
+	assert.ok(rows[1].at > rows[0].at && rows[1].mono > rows[0].mono);
+	assert.equal(rows[2].at, 42);
+	assert.equal(rows[2].mono, 1.5);
+});
+
 test('trace writes never reject when mkdir or append sinks fail', async () => {
 	let appendCalls = 0;
 	const writer = new TraceWriter('C:\\runtime\\trace.jsonl', {
