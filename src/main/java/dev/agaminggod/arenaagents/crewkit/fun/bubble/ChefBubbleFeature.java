@@ -75,6 +75,20 @@ public final class ChefBubbleFeature implements CrewkitFeature {
 		}
 	}
 
+	/** Says a line in the chef's bubble from outside the feature (skits). colorHint is the ink colour, 0xRRGGBB. */
+	public static void say(MinecraftServer server, String text, int colorHint) {
+		try {
+			for (CrewkitFeature f : dev.agaminggod.arenaagents.crewkit.CrewkitFeatures.all()) {
+				if (f instanceof ChefBubbleFeature bubble) {
+					bubble.say(server, text, false, colorHint, "", "", INK);
+					return;
+				}
+			}
+		} catch (RuntimeException e) {
+			CrewkitDispatcher.LOGGER.warn("CrewKit bubble: say failed", e);
+		}
+	}
+
 	private void onActivity(MinecraftServer server, JsonObject data) {
 		if (data == null) return;
 		String kind = str(data, "kind", "");

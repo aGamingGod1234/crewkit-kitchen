@@ -50,6 +50,18 @@ public final class CastCommands {
 									"CrewKit chef is now " + player.getScoreboardName()), true);
 							return 1;
 						})))
+				.then(Commands.literal("skit")
+						.then(Commands.literal("on").executes(context -> skit(context.getSource(), true)))
+						.then(Commands.literal("off").executes(context -> skit(context.getSource(), false)))
+						.then(Commands.literal("test").executes(context -> {
+							boolean on = dev.agaminggod.arenaagents.crewkit.fun.skit.StablecoinSkit.enabled();
+							dev.agaminggod.arenaagents.crewkit.fun.skit.StablecoinSkit.setEnabled(true);
+							boolean played = dev.agaminggod.arenaagents.crewkit.fun.skit.StablecoinSkit.play(context.getSource().getServer(),
+									() -> context.getSource().getServer().sendSystemMessage(Component.literal("CrewKit skit: QR would show now")));
+							dev.agaminggod.arenaagents.crewkit.fun.skit.StablecoinSkit.setEnabled(on);
+							context.getSource().sendSuccess(() -> Component.literal(played ? "CrewKit skit: playing" : "CrewKit skit: could not start"), true);
+							return played ? 1 : 0;
+						})))
 				.then(Commands.literal("cast")
 						.then(Commands.literal("brief")
 								.executes(context -> brief(context.getSource(),
@@ -75,6 +87,12 @@ public final class CastCommands {
 		new CastFeature().onEvent(source.getServer(), "brief", data, 0);
 		source.sendSuccess(() -> Component.literal("CrewKit cast: " + guests.size() + " guests on their way"), true);
 		return guests.size();
+	}
+
+	private static int skit(CommandSourceStack source, boolean on) {
+		dev.agaminggod.arenaagents.crewkit.fun.skit.StablecoinSkit.setEnabled(on);
+		source.sendSuccess(() -> Component.literal("CrewKit stablecoin skit " + (on ? "on" : "off")), true);
+		return 1;
 	}
 
 	private static int event(CommandSourceStack source, String event) {

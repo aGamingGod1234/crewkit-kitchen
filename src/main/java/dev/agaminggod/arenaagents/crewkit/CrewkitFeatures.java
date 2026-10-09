@@ -30,6 +30,7 @@ public final class CrewkitFeatures {
 						new dev.agaminggod.arenaagents.crewkit.fun.printer.ReceiptPrinterFeature(),
 						new dev.agaminggod.arenaagents.crewkit.fun.bubble.ChefBubbleFeature(),
 						new dev.agaminggod.arenaagents.crewkit.fun.dance.GuestDanceFeature(),
+						new dev.agaminggod.arenaagents.crewkit.fun.skit.StablecoinSkit(),
 						new dev.agaminggod.arenaagents.crewkit.director.DirectorFeature(),
 					});
 				}

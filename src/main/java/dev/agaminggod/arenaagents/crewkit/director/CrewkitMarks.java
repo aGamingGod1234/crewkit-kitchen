@@ -155,8 +155,13 @@ public final class CrewkitMarks {
 	public static final Mark GUESTS_WIDE = fit("guests_wide", "Dining room, three-quarter",
 			new Box(3.2, 1, 10.8, 16.8, 4.4, 15.3), 0.9, -0.4, -0.8);
 
+	public static final Mark PASS_PAY = fit("pass_pay", "Stablecoin skit: guest and chef at the pass",
+			new Box(7.8, 1, 6.6, 11.2, 4.2, 10.6), 0.75, -0.3, -0.9);
+	public static final Mark BROKER = fit("broker", "Stablecoin skit: money broker nook",
+			new Box(2, 1, 17, 5.6, 4.4, 20), -0.85, -0.3, 0.35);
+
 	/** Manual stepping order, matching the film's beat order. */
-	public static final List<Mark> ORDER = List.of(WIDE, BRIEF, LINE, QUOTES, BUDGET, GATE, QR, DOOR, PLATING, CELEBRATE, BILL,
+	public static final List<Mark> ORDER = List.of(WIDE, BRIEF, LINE, QUOTES, BUDGET, GATE, PASS_PAY, BROKER, QR, DOOR, PLATING, CELEBRATE, BILL,
 			GUESTS_A, GUESTS_B, GUESTS_WIDE);
 
 	public static Optional<Mark> byId(String id) {

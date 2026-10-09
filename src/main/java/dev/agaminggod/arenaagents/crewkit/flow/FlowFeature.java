@@ -141,7 +141,7 @@ public final class FlowFeature implements CrewkitFeature {
 			case "item_removed" -> { onItemRemoved(data); refreshGhosts(server); }
 			case "gate_blocked" -> onGateBlocked(server, data);
 			case "gate_passed" -> onGatePassed(server, data);
-			case "checkout" -> onCheckout(server, data);
+			case "checkout" -> checkoutWithSkit(server, data);
 			case "completed" -> onCompleted(server, data);
 			case "failed", "expired" -> onFailed(server, event, data);
 			case "reset" -> reset(server);
@@ -186,6 +186,7 @@ public final class FlowFeature implements CrewkitFeature {
 		ticketSpawned = false;
 		gateDown = false;
 		qrUrl = null;
+		skitUrl = null;
 		qrMaps.clear();
 		qrMapIds.clear();
 		hourglass = false;
@@ -326,6 +327,26 @@ public final class FlowFeature implements CrewkitFeature {
 	}
 
 	// ---------------------------------------------------------------- checkout QR
+
+	/** URL the stablecoin skit is playing for, so a repeated checkout does not restart it. */
+	private String skitUrl;
+
+	/** Plays the stablecoin skit first when it is on; the QR follows when the skit signals done (or at once if it cannot play). */
+	private void checkoutWithSkit(MinecraftServer server, JsonObject data) {
+		String url = str(data, "approvalUrl", "");
+		if (url.isEmpty() || url.equals(qrUrl) || url.equals(skitUrl)) return;
+		skitUrl = url;
+		final JsonObject d = data;
+		boolean deferred = false;
+		try {
+			deferred = dev.agaminggod.arenaagents.crewkit.fun.skit.StablecoinSkit.play(server, () -> {
+				if (url.equals(skitUrl)) onCheckout(server, d);
+			});
+		} catch (RuntimeException e) {
+			LOGGER.warn("CrewKit stablecoin skit failed to start", e);
+		}
+		if (!deferred) onCheckout(server, d);
+	}
 
 	private void onCheckout(MinecraftServer server, JsonObject data) {
 		String url = str(data, "approvalUrl", "");

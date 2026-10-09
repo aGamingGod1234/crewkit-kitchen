@@ -53,7 +53,8 @@ public final class DirectorFeature implements CrewkitFeature {
 			case "activity" -> activityShot(data);
 			case "gate_blocked" -> new Shot("gate", 60);
 			case "gate_passed" -> new Shot("gate", 50);
-			case "checkout" -> new Shot("qr", 100);
+			// The stablecoin skit cues its own shots and then the QR.
+			case "checkout" -> dev.agaminggod.arenaagents.crewkit.fun.skit.StablecoinSkit.active() ? null : new Shot("qr", 100);
 			case "completed" -> new Shot("door", 60);
 			case "record" -> new Shot("bill", 120);
 			case "failed", "expired" -> new Shot("budget", 60);
@@ -107,6 +108,16 @@ public final class DirectorFeature implements CrewkitFeature {
 			QUEUE.clear();
 			QUEUE.addLast(new Shot(mark, 100, true));
 			nextAllowed = now;
+		}
+	}
+
+	/** Cuts to {@code mark} next, dropping queued beats (used by skits that drive their own beats). */
+	public static void cue(String mark, int dwellTicks) {
+		synchronized (QUEUE) {
+			QUEUE.clear();
+			QUEUE.addLast(new Shot(mark, dwellTicks));
+			nextAllowed = now;
+			currentIdle = false;
 		}
 	}
 
