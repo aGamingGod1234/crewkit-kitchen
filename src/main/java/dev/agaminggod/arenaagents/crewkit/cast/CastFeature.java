@@ -68,8 +68,8 @@ public final class CastFeature implements CrewkitFeature {
 	private static final double PANTRY_MIN_X = 3.5;
 	private static final double PANTRY_MAX_X = 13.5;
 	private static final double FRONT_AISLE_Z = 10.2;
-	private static final double BACK_AISLE_Z = 15.5;
-	private static final double[] SIDE_AISLES_X = {2.5, 14.0, 25.5};
+	private static final double BACK_AISLE_Z = 15.25;
+	private static final double[] SIDE_AISLES_X = {2.5, 10.0, 18.0, 26.5};
 
 	private static final List<Guest> GUESTS = new ArrayList<>();
 	private static final Deque<Leg> CHEF_LEGS = new ArrayDeque<>();
