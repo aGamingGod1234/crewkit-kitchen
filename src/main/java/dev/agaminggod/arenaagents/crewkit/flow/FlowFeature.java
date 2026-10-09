@@ -71,7 +71,7 @@ public final class FlowFeature implements CrewkitFeature {
 	private static final int BAR_COUNT = 7;
 	private static final double BAR_Z = 9.7;
 	private static final double BAR_DOWN_Y = 1.25;
-	private static final double BAR_UP_Y = 7.2;
+	private static final double BAR_UP_Y = 9.2; // above the ceiling panels (y 8..9)
 	private static final double BAR_HEIGHT = 3.0;
 	private static final double HOURGLASS_X = 12.3;
 	/** Plates and trays sit on the cloth (carpet on a top slab), not inside it. */
@@ -513,7 +513,8 @@ public final class FlowFeature implements CrewkitFeature {
 		Map<String, Ghost> pendingGhosts = new LinkedHashMap<>(ghosts);
 		ghosts.clear();
 		Pos door = rel(BAG[0] + 1.0, BAG[1] + 3.2, BAG[2]);
-		Pos floor = rel(BAG[0], BAG[1] + 0.45, BAG[2]);
+		Pos floor = rel(BAG[0], BAG[1] + 0.8, BAG[2]);
+		Pos swell = rel(BAG[0], BAG[1] + 1.05, BAG[2]);
 		long t = 6;
 		later(t, () -> {
 			sound(server, "block.wooden_door.open", rel(27.0, 1.5, 5.5), 1.0, 1.0);
@@ -527,8 +528,8 @@ public final class FlowFeature implements CrewkitFeature {
 		});
 		later(t + 11, () -> sound(server, "item.bundle.drop_contents", floor, 1.0, 1.0));
 		// Bag opens: a quick swell before items pop out.
-		later(t + 18, () -> setTransform(server, "ck_flow_bag", scaleOnly(2.1), 4));
-		later(t + 22, () -> setTransform(server, "ck_flow_bag", scaleOnly(1.6), 4));
+		later(t + 18, () -> { setTransform(server, "ck_flow_bag", scaleOnly(2.1), 4); tp(server, "ck_flow_bag", swell); });
+		later(t + 22, () -> { setTransform(server, "ck_flow_bag", scaleOnly(1.6), 4); tp(server, "ck_flow_bag", floor); });
 
 		long start = t + 26;
 		List<Wave> waves = buildWaves(items);

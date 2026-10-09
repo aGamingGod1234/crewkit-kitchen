@@ -60,14 +60,16 @@ public final class CastFeature implements CrewkitFeature {
 
 	// Kitchen positions, relative to the set origin (see docs/crewkit/kitchen-layout.html).
 	private static final double[] DOOR_OUTSIDE = {28.6, 5.5};
-	private static final double[] DOOR_INSIDE = {26.5, 5.5};
+	private static final double[] DOOR_INSIDE = {24.9, 5.5};
+	/** Guests walk in along x=25.5, west of the delivery barrels at x=26. */
+	private static final double ENTRY_X = 25.5;
 	private static final double[] PASS = {9.5, 7.3};
 	private static final double PANTRY_Z = 5.7;
 	private static final double PANTRY_MIN_X = 3.5;
 	private static final double PANTRY_MAX_X = 13.5;
 	private static final double FRONT_AISLE_Z = 10.2;
-	private static final double BACK_AISLE_Z = 15.25;
-	private static final double[] SIDE_AISLES_X = {2.5, 10.0, 18.0, 26.5};
+	private static final double BACK_AISLE_Z = 15.5;
+	private static final double[] SIDE_AISLES_X = {2.5, 14.0, 25.5};
 
 	private static final List<Guest> GUESTS = new ArrayList<>();
 	private static final Deque<Leg> CHEF_LEGS = new ArrayDeque<>();
@@ -78,6 +80,7 @@ public final class CastFeature implements CrewkitFeature {
 	private static boolean runActive;
 	private static boolean releaseWhenIdle;
 	private static Vec3 holdPos;
+	private static boolean eastDoorsOpen;
 	private static int itemsWalked;
 	private static long clock;
 
@@ -183,6 +186,7 @@ public final class CastFeature implements CrewkitFeature {
 		clock++;
 		ServerLevel level = server.overworld();
 		for (Guest guest : GUESTS) tickGuest(level, guest);
+		if (eastDoorsOpen && GUESTS.stream().allMatch(guest -> guest.seated)) setEastDoors(level, false);
 		tickChef(server);
 	}
 
@@ -199,6 +203,7 @@ public final class CastFeature implements CrewkitFeature {
 			}
 		}
 		GUESTS.clear();
+		setEastDoors(server.overworld(), false);
 		CHEF_LEGS.clear();
 		chefLeg = null;
 		chefNpc = null;
@@ -293,13 +298,29 @@ public final class CastFeature implements CrewkitFeature {
 			return;
 		}
 		guest.path.addAll(routeToSeat(seat));
+		setEastDoors(level, true);
+	}
+
+	/** Opens or shuts the east entrance doors at (27, 1..2, 5..6) so guests never walk through closed doors. */
+	private static void setEastDoors(ServerLevel level, boolean open) {
+		if (eastDoorsOpen == open) return;
+		eastDoorsOpen = open;
+		for (int y = 1; y <= 2; y++) {
+			for (int z = 5; z <= 6; z++) {
+				net.minecraft.core.BlockPos pos = CrewkitAnchors.origin.offset(27, y, z);
+				var state = level.getBlockState(pos);
+				if (state.hasProperty(net.minecraft.world.level.block.state.properties.BlockStateProperties.OPEN)) {
+					level.setBlock(pos, state.setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.OPEN, open), 2);
+				}
+			}
+		}
 	}
 
 	/** Door, down the east side, along the front aisle, and round the tables through the nearest side aisle if needed. */
 	private static List<Leg> routeToSeat(double[] seat) {
 		List<Leg> legs = new ArrayList<>();
-		legs.add(Leg.walk(rel(DOOR_INSIDE[0], FLOOR_Y, DOOR_INSIDE[1]), GUEST_SPEED));
-		legs.add(Leg.walk(rel(DOOR_INSIDE[0], FLOOR_Y, FRONT_AISLE_Z), GUEST_SPEED));
+		legs.add(Leg.walk(rel(ENTRY_X, FLOOR_Y, DOOR_OUTSIDE[1]), GUEST_SPEED));
+		legs.add(Leg.walk(rel(ENTRY_X, FLOOR_Y, FRONT_AISLE_Z), GUEST_SPEED));
 		double seatX = seat[0];
 		double seatZ = seat[1];
 		if (seatZ < 12) {
