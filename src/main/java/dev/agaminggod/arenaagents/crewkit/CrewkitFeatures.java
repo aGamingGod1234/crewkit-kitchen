@@ -23,6 +23,7 @@ public final class CrewkitFeatures {
 						new dev.agaminggod.arenaagents.crewkit.flow.ReceiptFeature(),
 						new dev.agaminggod.arenaagents.crewkit.cast.CastFeature(),
 						new dev.agaminggod.arenaagents.crewkit.fun.soldout.SoldOutFeature(),
+						new dev.agaminggod.arenaagents.crewkit.fun.guests.GuestChatterFeature(),
 						new dev.agaminggod.arenaagents.crewkit.director.DirectorFeature(),
 					});
 				}
