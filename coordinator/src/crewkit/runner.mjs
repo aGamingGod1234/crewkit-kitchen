@@ -29,15 +29,16 @@ export function writeRecord({ runId, mode, brief, result, dir = RECORDS_DIR }) {
   mkdirSync(dir, { recursive: true });
   const at = new Date().toISOString();
   const json = {
-    runId, mode, at, title: brief.title, merchant: brief.merchant, status: result.status, reason: result.reason ?? null,
+    runId, mode, at, title: brief.title, merchant: brief.merchant, status: result.status, outcome: result.status === 'COMPLETED' ? 'order placed' : 'no order placed', reason: result.reason ?? null,
     budget: brief.budget, quoteId: result.quote?.id ?? null, checkoutId: result.checkout?.id ?? null,
     record: result.record, calls: result.calls,
-    items: result.cart.map(({ id, realName, merchant, mcItem, unitPrice, qty, per, variantId }) => ({ id, realName, merchant, mcItem, unitPrice, qty, per, variantId })),
+    // Lines swapped out or dropped stay in the file with qty 0 so the rework is auditable.
+    items: result.cart.map(({ id, needId, realName, merchant, mcItem, unitPrice, qty, per, optional, variantId }) => ({ id, needId, realName, merchant, mcItem, unitPrice, qty, per, optional, variantId })),
   };
   const jsonFile = join(dir, `${runId}.json`);
   writeFileSync(jsonFile, JSON.stringify(json, null, 2));
-  const rows = [['item', 'realName', 'merchant', 'per', 'qty', 'unitPrice', 'lineTotal', 'currency']];
-  for (const i of json.items) rows.push([i.id, i.realName, i.merchant, i.per, i.qty, i.unitPrice.amount, Math.round(i.qty * i.unitPrice.amount * 100) / 100, i.unitPrice.currency]);
+  const rows = [['item', 'need', 'realName', 'merchant', 'per', 'qty', 'unitPrice', 'lineTotal', 'currency']];
+  for (const i of json.items) rows.push([i.id, i.needId, i.realName, i.merchant, i.per, i.qty, i.unitPrice.amount, Math.round(i.qty * i.unitPrice.amount * 100) / 100, i.unitPrice.currency]);
   if (result.record) {
     const r = result.record;
     rows.push([], ['budget', 'quoted', 'charged', 'variance', 'orderId', 'currency'], [r.budget, r.quoted, r.charged, r.variance, r.orderId, r.currency]);

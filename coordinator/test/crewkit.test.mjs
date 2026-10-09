@@ -12,7 +12,7 @@ const fixtures = path.join(here, '..', 'src', 'crewkit', 'fixtures');
 const brief = JSON.parse(readFileSync(path.join(fixtures, 'demo-brief.json'), 'utf8'));
 const tape = JSON.parse(readFileSync(path.join(fixtures, 'demo-popular-sg.tape.json'), 'utf8'));
 
-const { evaluateGate, planRework, quoteTotals } = await import('../src/crewkit/gate.mjs');
+const { evaluateGate, planRework, quoteTotals, checkRequirements, validateQuoteItems } = await import('../src/crewkit/gate.mjs');
 const { mapToMcItem } = await import('../src/crewkit/mapping.mjs');
 const { startRun } = await import('../src/crewkit/runner.mjs');
 const { runCrewkit } = await import('../src/crewkit/engine.mjs');
@@ -40,19 +40,33 @@ test('gate blocks a currency mismatch and an expired or nearly expired quote', (
   assert.equal(evaluateGate({ totals: totals(10, { expiresAt: new Date(Date.now() + 5000).toISOString() }), budget }).code, 'QUOTE_EXPIRED');
 });
 
-test('rework shares per-person items per pair first, then drops optional items', () => {
+test('rework swaps to cheaper substitutes and drops only optional extras, never mandatory quantities', () => {
+  const alt = (id, amount) => ({ productId: id, variantId: id, realName: id, merchant: 'popular.com.sg', unitPrice: SGD(amount) });
   const cart = [
-    { id: 'cable', per: 'person', shareAs: 'pair', qty: 12, unitPrice: SGD(7.9) },
-    { id: 'pen', per: 'person', qty: 12, unitPrice: SGD(1.2) },
-    { id: 'stickers', per: 'room', optional: true, qty: 1, unitPrice: SGD(20) },
+    { id: 'cable', needId: 'cable', qty: 6, unitPrice: SGD(12.9), alternates: [alt('cheap_cable', 7.9)] },
+    { id: 'notebook', needId: 'notebook', qty: 12, unitPrice: SGD(4.5), alternates: [alt('cheap_nb', 2.2)] },
+    { id: 'pen', needId: 'pen', qty: 12, unitPrice: SGD(1.8), alternates: [] },
+    { id: 'markers', needId: 'markers', qty: 1, optional: true, unitPrice: SGD(6.9), alternates: [] },
   ];
-  const a = planRework({ cart, total: 194.9, budget, guestCount: 12 });
-  assert.deepEqual(a.changes.map((c) => [c.id, c.qtyRemoved, c.newQty]), [['cable', 6, 6]]);
+  const a = planRework({ cart, total: 196.6, budget });
+  assert.deepEqual(a.changes.map((c) => [c.type, c.id]), [['swap', 'cable'], ['swap', 'notebook']]);
   assert.equal(a.fits, true);
-  const b = planRework({ cart, total: 210, budget, guestCount: 12 });
-  assert.deepEqual(b.changes.map((c) => c.id), ['cable', 'stickers']);
-  const c = planRework({ cart: [cart[1]], total: 300, budget, guestCount: 12 });
-  assert.equal(c.changes.length, 0);
+  assert.ok(a.changes.every((c) => c.type !== 'drop' || cart.find((x) => x.id === c.id).optional));
+  const b = planRework({ cart, total: 210, budget });
+  assert.deepEqual(b.changes.map((c) => [c.type, c.id]), [['swap', 'cable'], ['swap', 'notebook'], ['drop', 'markers']]);
+  const c = planRework({ cart, total: 300, budget });
+  assert.equal(c.fits, false, 'infeasible: caller reports BRIEF_INFEASIBLE');
+});
+
+test('requirements check and quote line rules', () => {
+  const needs = [{ id: 'pen', per: 'person' }, { id: 'cable', per: 'pair' }, { id: 'markers', per: 'room', optional: true }];
+  const required = (n) => (n.per === 'person' ? 12 : n.per === 'pair' ? 6 : 1);
+  assert.deepEqual(checkRequirements({ needs, required, cart: [{ needId: 'pen', qty: 0 }, { needId: 'pen', qty: 12 }, { needId: 'cable', qty: 6 }] }), { ok: true, missing: [] });
+  assert.deepEqual(checkRequirements({ needs, required, cart: [{ needId: 'pen', qty: 10 }] }), { ok: false, missing: [{ need: 'pen', qty: 2 }, { need: 'cable', qty: 6 }] });
+  assert.throws(() => validateQuoteItems([]), { code: 'QUOTE_ITEMS_INVALID' });
+  assert.throws(() => validateQuoteItems(Array.from({ length: 21 }, (_, i) => ({ variantId: 'v' + i, quantity: 1 }))), { code: 'QUOTE_ITEMS_INVALID' });
+  assert.throws(() => validateQuoteItems([{ variantId: 'v', quantity: 1.5 }]), { code: 'QUOTE_ITEMS_INVALID' });
+  assert.throws(() => validateQuoteItems([{ variantId: 'a', quantity: 1 }, { variantId: 'b', quantity: 1 }], ['popular.com.sg', 'anker.com.sg']), { code: 'MIXED_MERCHANTS' });
 });
 
 test('product names map to allowlisted vanilla items', () => {
@@ -61,11 +75,13 @@ test('product names map to allowlisted vanilla items', () => {
   assert.equal(mapToMcItem({ productName: 'Type-C Fast Charging Cable 1m' }), 'minecraft:lead');
   assert.equal(mapToMcItem({ productName: 'Pokka Jasmine Green Tea 500ml' }), 'minecraft:honey_bottle');
   assert.equal(mapToMcItem({ productName: 'Mini Portable Bluetooth Speaker' }), 'minecraft:note_block');
+  assert.equal(mapToMcItem({ productName: 'Campap A5 Ruled Exercise Book', needLabel: 'notebook' }), 'minecraft:writable_book', 'need label wins');
   assert.equal(mapToMcItem({ productName: 'Open Day Thing', needLabel: 'unknown' }), 'minecraft:paper', 'no "pen" match inside "Open"; falls back to paper');
 });
 
 const EXPECTED = ['reset', 'brief', 'item_added', 'item_added', 'item_added', 'item_added', 'item_added', 'item_added',
-  'quote', 'gate_blocked', 'item_removed', 'quote', 'gate_passed', 'checkout', 'checkout', 'completed', 'record'];
+  'quote', 'gate_blocked', 'item_removed', 'item_added', 'item_removed', 'item_added', 'quote', 'requirements', 'gate_passed',
+  'checkout', 'checkout', 'completed', 'record'];
 
 test('replay emits the full contract sequence with one runId and gap-free seq', async () => {
   const sent = [];
@@ -79,9 +95,14 @@ test('replay emits the full contract sequence with one runId and gap-free seq', 
   assert.deepEqual(calls, calls.map((_, i) => i + 1));
   assert.equal(calls.at(-1), r.calls);
   const blocked = sent.find((p) => p.event === 'gate_blocked').data;
-  assert.deepEqual(blocked.over, SGD(44.9));
-  assert.deepEqual(sent.find((p) => p.event === 'item_removed').data.qtyRemoved, 6);
-  assert.deepEqual(sent.find((p) => p.event === 'record').data, { budget: 150, quoted: 147.5, charged: 147.5, variance: 0, orderId: 'POP-SG-1048213', currency: 'SGD' });
+  assert.deepEqual(blocked.over, SGD(46.6));
+  const removed = sent.filter((p) => p.event === 'item_removed').map((p) => [p.data.id, p.data.qtyRemoved]);
+  assert.deepEqual(removed, [['cable', 6], ['notebook', 12]]);
+  const swappedIn = sent.filter((p) => p.event === 'item_added').slice(-2).map((p) => [p.data.id, p.data.needId, p.data.qty]);
+  assert.deepEqual(swappedIn, [['cable-alt1', 'cable', 6], ['notebook-alt1', 'notebook', 12]], 'mandatory quantities kept');
+  assert.deepEqual(sent.find((p) => p.event === 'requirements').data, { ok: true, missing: [] });
+  assert.equal(JSON.parse(readFileSync(r.files.jsonFile, 'utf8')).outcome, 'order placed');
+  assert.deepEqual(sent.find((p) => p.event === 'record').data, { budget: 150, quoted: 139, charged: 139, variance: 0, orderId: 'POP-SG-1048213', currency: 'SGD' });
   assert.ok(existsSync(r.files.jsonFile) && existsSync(r.files.csvFile) && existsSync(r.eventsFile));
   assert.equal(readFileSync(r.eventsFile, 'utf8').trim().split('\n').length, sent.length);
 });
@@ -102,6 +123,14 @@ test('expired quote at the pre-checkout re-read triggers a new quote before chec
   assert.equal(r.status, 'COMPLETED');
   assert.deepEqual(names(events).filter((e) => e === 'quote').length, 3);
   assert.ok(names(events).indexOf('gate_passed') > names(events).lastIndexOf('quote'));
+});
+
+test('a budget no permitted kit can meet fails BRIEF_INFEASIBLE without cutting a need', async () => {
+  const stream = createEventStream({ runId: 't', sinks: [] });
+  const r = await runCrewkit({ brief: { ...brief, budget: SGD(60) }, api: replayApi(tape, { speed: 0 }), emit: stream.emit, enrollmentId: 'e', sleep: async () => {} });
+  assert.equal(r.status, 'BRIEF_INFEASIBLE');
+  assert.equal(names(stream.log).at(-1), 'failed');
+  assert.ok(!names(stream.log).includes('item_removed') && !names(stream.log).includes('checkout'));
 });
 
 test('checkout EXPIRED emits expired and never completed or record', async () => {

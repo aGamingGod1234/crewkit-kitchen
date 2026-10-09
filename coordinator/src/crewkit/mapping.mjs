@@ -1,5 +1,5 @@
 // Maps a real Reap product to a vanilla Minecraft stand-in from docs/crewkit/items-allowlist.json.
-// Keyword match on the product name first, then the brief's need label. Cached per product id.
+// Keyword match on the brief's need label first, then the product name. Cached per product id.
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -36,8 +36,9 @@ function bestMatch(text, items) {
 
 export function mapToMcItem({ productId, productName, needLabel }, list = loadAllowlist()) {
   if (productId && cache.has(productId)) return cache.get(productId);
-  const mcItem = bestMatch(productName, list.items)
-    ?? bestMatch(needLabel, list.items)
+  // Need label first so a swapped product keeps the same stand-in (an "exercise book" is still the notebook).
+  const mcItem = bestMatch(needLabel, list.items)
+    ?? bestMatch(productName, list.items)
     ?? list.fallbacks?.stationery_or_paper
     ?? 'minecraft:paper';
   if (productId) cache.set(productId, mcItem);

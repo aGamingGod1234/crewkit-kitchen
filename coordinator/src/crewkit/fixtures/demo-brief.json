@@ -9,11 +9,13 @@
   "budget": { "amount": 150, "currency": "SGD" },
   "merchant": "popular.com.sg",
   "needs": [
-    { "id": "badge", "label": "name badge", "query": "name badge lanyard", "per": "person" },
+    { "id": "badge", "label": "name badge", "query": "name badge holder", "per": "person" },
     { "id": "notebook", "label": "notebook", "query": "A5 notebook", "per": "person" },
     { "id": "pen", "label": "pen", "query": "gel pen", "per": "person" },
-    { "id": "drink", "label": "a drink", "query": "green tea drink", "per": "person" },
-    { "id": "cable", "label": "phone charging cable", "query": "usb-c charging cable", "per": "person", "shareAs": "pair" },
-    { "id": "speaker", "label": "speaker", "query": "bluetooth speaker", "per": "room" }
+    { "id": "cable", "label": "phone charging cable", "query": "usb-c charging cable", "per": "pair" }
+  ],
+  "extras": [
+    { "id": "sticky_notes", "label": "sticky notes", "query": "post-it notes", "per": "room" },
+    { "id": "markers", "label": "whiteboard markers", "query": "whiteboard marker", "per": "room" }
   ]
 }

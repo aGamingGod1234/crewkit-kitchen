@@ -37,7 +37,7 @@ async function main() {
   });
   console.error(`[crewkit] run ${runId} mode=${mode}`);
   const r = await done;
-  console.error(`[crewkit] ${r.status}${r.reason ? ` (${r.reason})` : ''} calls=${r.calls} events=${r.events.length}`);
+  console.error(`[crewkit] ${r.status === 'COMPLETED' ? 'order placed' : r.status}${r.reason ? ` (${r.reason})` : ''} calls=${r.calls} events=${r.events.length}`);
   if (r.record) console.error(`[crewkit] record ${JSON.stringify(r.record)}`);
   for (const f of [r.eventsFile, r.files?.jsonFile, r.files?.csvFile, r.tapeFile].filter(Boolean)) console.error(`[crewkit] wrote ${f}`);
   process.exit(r.status === 'COMPLETED' ? 0 : 2);

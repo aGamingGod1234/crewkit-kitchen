@@ -14,7 +14,7 @@ export async function liveApi({ simulate = false } = {}) {
     kind: simulate ? 'simulate' : 'live',
     search: (query, opts) => c.search(query, opts),
     details: (ids) => c.details(ids),
-    createQuote: (items) => c.createQuote(items),
+    createQuote: (items, merchants) => c.createQuote(items, { merchants }),
     getQuote: (id) => c.getQuote(id),
     createCheckout: (quoteId, enrollmentId) => c.createCheckout(quoteId, enrollmentId, { simulate }),
     getCheckout: (id) => c.getCheckout(id),

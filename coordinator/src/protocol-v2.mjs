@@ -90,7 +90,7 @@ export const SERVER_TO_COORDINATOR_TYPES = Object.freeze([
 ]);
 
 const COORDINATOR_TYPES = new Set(COORDINATOR_TO_SERVER_TYPES);
-const CREWKIT_EVENT_SET = new Set(['brief', 'item_added', 'quote', 'gate_blocked', 'item_removed', 'gate_passed', 'checkout', 'completed', 'record', 'failed', 'expired', 'calls', 'reset']);
+const CREWKIT_EVENT_SET = new Set(['brief', 'item_added', 'quote', 'gate_blocked', 'item_removed', 'gate_passed', 'checkout', 'completed', 'record', 'failed', 'expired', 'calls', 'reset', 'requirements']);
 const SERVER_TYPES = new Set(SERVER_TO_COORDINATOR_TYPES);
 const REVISION_GUARDED_INBOUND_TYPES = new Set(['observation', 'inspection_result', 'conversation_event', 'action_progress', 'action_result', 'goal_completion_result']);
 const REVISION_GUARDED_OUTBOUND_TYPES = new Set(['agent_ready', 'planning_state', 'goal_completed', 'conversation_wake_ack', 'request_observation', 'inspection_request', 'action_command', 'action_cancel', 'agent_error', 'verbose_event']);

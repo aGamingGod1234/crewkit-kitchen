@@ -2,11 +2,11 @@
   "version": 1,
   "recordedAt": "2026-10-09T08:20:00.000Z",
   "enrollmentId": "33333333-3333-4333-8333-000000000001",
-  "note": "HAND-WRITTEN fixture, not a real Reap recording. popular.com.sg-style SGD stationery + drinks. First quote 194.90 vs budget 150 (~30% over); sharing cables per pair brings it to 147.50.",
+  "note": "HAND-WRITTEN fixture, not a real Reap recording (no API key yet). popular.com.sg-style SGD stationery kit. First quote 196.60 vs budget 150 (~31% over). Rework keeps every mandatory quantity: swaps the cable and notebook for cheaper same-merchant products, giving 139.00. Replace with a recorded tape once the key arrives.",
   "entries": [
     {
       "op": "search",
-      "key": "name badge lanyard",
+      "key": "name badge holder",
       "ms": 1150,
       "response": {
         "id": "search_1",
@@ -20,11 +20,11 @@
             "imageUrl": null,
             "priceRange": {
               "min": {
-                "amount": 1.5,
+                "amount": 1.9,
                 "currency": "SGD"
               },
               "max": {
-                "amount": 1.5,
+                "amount": 1.9,
                 "currency": "SGD"
               }
             },
@@ -33,7 +33,35 @@
               "id": "var_badge_01",
               "name": "Default",
               "price": {
-                "amount": 1.5,
+                "amount": 1.9,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "pop_badge_02",
+            "merchant": {
+              "name": "popular.com.sg"
+            },
+            "name": "Name Badge Holder with Clip (Pack of 1)",
+            "imageUrl": null,
+            "priceRange": {
+              "min": {
+                "amount": 1.2,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 1.2,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_badge_02",
+              "name": "Default",
+              "price": {
+                "amount": 1.2,
                 "currency": "SGD"
               },
               "available": true
@@ -43,7 +71,7 @@
         "pagination": {
           "nextCursor": null,
           "hasNextPage": false,
-          "returnedCount": 1
+          "returnedCount": 2
         },
         "warnings": []
       }
@@ -60,7 +88,35 @@
             "merchant": {
               "name": "popular.com.sg"
             },
-            "name": "Campap A5 Ruled Notebook 80 Sheets",
+            "name": "Campap A5 Hardcover Ruled Notebook 96 Sheets",
+            "imageUrl": null,
+            "priceRange": {
+              "min": {
+                "amount": 4.5,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 4.5,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_nb_01",
+              "name": "Default",
+              "price": {
+                "amount": 4.5,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "pop_nb_02",
+            "merchant": {
+              "name": "popular.com.sg"
+            },
+            "name": "Campap A5 Ruled Exercise Book 80 Pages",
             "imageUrl": null,
             "priceRange": {
               "min": {
@@ -74,7 +130,7 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_nb_01",
+              "id": "var_nb_02",
               "name": "Default",
               "price": {
                 "amount": 2.2,
@@ -87,7 +143,7 @@
         "pagination": {
           "nextCursor": null,
           "hasNextPage": false,
-          "returnedCount": 1
+          "returnedCount": 2
         },
         "warnings": []
       }
@@ -108,11 +164,11 @@
             "imageUrl": null,
             "priceRange": {
               "min": {
-                "amount": 1.2,
+                "amount": 1.8,
                 "currency": "SGD"
               },
               "max": {
-                "amount": 1.2,
+                "amount": 1.8,
                 "currency": "SGD"
               }
             },
@@ -121,51 +177,35 @@
               "id": "var_pen_01",
               "name": "Default",
               "price": {
-                "amount": 1.2,
+                "amount": 1.8,
                 "currency": "SGD"
               },
               "available": true
             }
-          }
-        ],
-        "pagination": {
-          "nextCursor": null,
-          "hasNextPage": false,
-          "returnedCount": 1
-        },
-        "warnings": []
-      }
-    },
-    {
-      "op": "search",
-      "key": "green tea drink",
-      "ms": 1060,
-      "response": {
-        "id": "search_4",
-        "products": [
+          },
           {
-            "id": "pop_tea_01",
+            "id": "pop_pen_02",
             "merchant": {
               "name": "popular.com.sg"
             },
-            "name": "Pokka Jasmine Green Tea 500ml",
+            "name": "Faber-Castell 1423 Ball Pen 0.5mm Blue",
             "imageUrl": null,
             "priceRange": {
               "min": {
-                "amount": 1.45,
+                "amount": 0.9,
                 "currency": "SGD"
               },
               "max": {
-                "amount": 1.45,
+                "amount": 0.9,
                 "currency": "SGD"
               }
             },
             "available": true,
             "previewVariant": {
-              "id": "var_tea_01",
+              "id": "var_pen_02",
               "name": "Default",
               "price": {
-                "amount": 1.45,
+                "amount": 0.9,
                 "currency": "SGD"
               },
               "available": true
@@ -175,7 +215,7 @@
         "pagination": {
           "nextCursor": null,
           "hasNextPage": false,
-          "returnedCount": 1
+          "returnedCount": 2
         },
         "warnings": []
       }
@@ -185,14 +225,42 @@
       "key": "usb-c charging cable",
       "ms": 1320,
       "response": {
-        "id": "search_5",
+        "id": "search_4",
         "products": [
           {
             "id": "pop_cable_01",
             "merchant": {
               "name": "popular.com.sg"
             },
-            "name": "Type-C to Type-C Fast Charging Cable 1m",
+            "name": "Energizer USB-C to USB-C Charging Cable 1.2m",
+            "imageUrl": null,
+            "priceRange": {
+              "min": {
+                "amount": 12.9,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 12.9,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_cable_01",
+              "name": "Default",
+              "price": {
+                "amount": 12.9,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          },
+          {
+            "id": "pop_cable_02",
+            "merchant": {
+              "name": "popular.com.sg"
+            },
+            "name": "Prolink USB-C to USB-C Charging Cable 1m",
             "imageUrl": null,
             "priceRange": {
               "min": {
@@ -206,10 +274,54 @@
             },
             "available": true,
             "previewVariant": {
-              "id": "var_cable_01",
+              "id": "var_cable_02",
               "name": "Default",
               "price": {
                 "amount": 7.9,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          }
+        ],
+        "pagination": {
+          "nextCursor": null,
+          "hasNextPage": false,
+          "returnedCount": 2
+        },
+        "warnings": []
+      }
+    },
+    {
+      "op": "search",
+      "key": "post-it notes",
+      "ms": 1010,
+      "response": {
+        "id": "search_5",
+        "products": [
+          {
+            "id": "pop_post_01",
+            "merchant": {
+              "name": "popular.com.sg"
+            },
+            "name": "3M Post-it Notes 3x3in Pack of 12",
+            "imageUrl": null,
+            "priceRange": {
+              "min": {
+                "amount": 9.9,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 9.9,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_post_01",
+              "name": "Default",
+              "price": {
+                "amount": 9.9,
                 "currency": "SGD"
               },
               "available": true
@@ -226,34 +338,34 @@
     },
     {
       "op": "search",
-      "key": "bluetooth speaker",
-      "ms": 1010,
+      "key": "whiteboard marker",
+      "ms": 940,
       "response": {
         "id": "search_6",
         "products": [
           {
-            "id": "pop_spk_01",
+            "id": "pop_wbm_01",
             "merchant": {
               "name": "popular.com.sg"
             },
-            "name": "Mini Portable Bluetooth Speaker",
+            "name": "Pilot Whiteboard Marker Set of 4",
             "imageUrl": null,
             "priceRange": {
               "min": {
-                "amount": 19.9,
+                "amount": 6.9,
                 "currency": "SGD"
               },
               "max": {
-                "amount": 19.9,
+                "amount": 6.9,
                 "currency": "SGD"
               }
             },
             "available": true,
             "previewVariant": {
-              "id": "var_spk_01",
+              "id": "var_wbm_01",
               "name": "Default",
               "price": {
-                "amount": 19.9,
+                "amount": 6.9,
                 "currency": "SGD"
               },
               "available": true
@@ -289,7 +401,7 @@
         ],
         "amountBreakdown": {
           "itemsSubtotal": {
-            "amount": 190.9,
+            "amount": 192.6,
             "currency": "SGD"
           },
           "shipping": {
@@ -306,7 +418,7 @@
           "discounts": [],
           "additionalCharges": [],
           "finalAmount": {
-            "amount": 194.9,
+            "amount": 196.6,
             "currency": "SGD"
           }
         }
@@ -333,7 +445,7 @@
         ],
         "amountBreakdown": {
           "itemsSubtotal": {
-            "amount": 143.5,
+            "amount": 135,
             "currency": "SGD"
           },
           "shipping": {
@@ -350,7 +462,7 @@
           "discounts": [],
           "additionalCharges": [],
           "finalAmount": {
-            "amount": 147.5,
+            "amount": 139,
             "currency": "SGD"
           }
         }
@@ -377,7 +489,7 @@
         ],
         "amountBreakdown": {
           "itemsSubtotal": {
-            "amount": 143.5,
+            "amount": 135,
             "currency": "SGD"
           },
           "shipping": {
@@ -394,7 +506,7 @@
           "discounts": [],
           "additionalCharges": [],
           "finalAmount": {
-            "amount": 147.5,
+            "amount": 139,
             "currency": "SGD"
           }
         }
@@ -410,7 +522,7 @@
         "quoteId": "11111111-1111-4111-8111-000000000002",
         "enrollmentId": "33333333-3333-4333-8333-000000000001",
         "amount": {
-          "amount": 147.5,
+          "amount": 139,
           "currency": "SGD"
         },
         "nextAction": {
@@ -567,7 +679,7 @@
         "enrollmentId": "33333333-3333-4333-8333-000000000001",
         "orderId": "POP-SG-1048213",
         "finalAmount": {
-          "amount": 147.5,
+          "amount": 139,
           "currency": "SGD"
         },
         "nextAction": null,

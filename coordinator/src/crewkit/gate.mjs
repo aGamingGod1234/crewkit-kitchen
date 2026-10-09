@@ -40,32 +40,67 @@ export function evaluateGate({ totals, budget, now = Date.now(), marginMs = EXPI
   }
   return { ok: true };
 }
-
 /**
- * Plan the cheapest-to-explain cuts that bring the estimated total under budget.
- * Order: share per-person items that allow it (one per pair), then drop optional needs.
- * cart: [{ id, per, qty, unitPrice:{amount}, shareAs?, optional? }]
- * @returns {{ changes: [{ id, qtyRemoved, newQty, newPer?, why }], estimatedTotal: number, fits: boolean }}
+ * Plan rework that keeps every mandatory quantity. Two moves only:
+ *  1. swap a line to a cheaper permitted substitute from the same merchant (biggest saving first),
+ *  2. drop optional extras (most expensive first).
+ * Mandatory quantities are never reduced. If even all moves cannot fit, fits=false and the caller
+ * reports BRIEF_INFEASIBLE so the organiser changes the brief.
+ * cart: [{ id, needId, qty, unitPrice:{amount}, optional, alternates:[{ productId, unitPrice:{amount}, ... }] }]
+ * @returns {{ changes: Array<{type:'swap', id, needId, to, saving} | {type:'drop', id, needId, saving}>, estimatedTotal, fits }}
  */
-export function planRework({ cart, total, budget, guestCount }) {
+export function planRework({ cart, total, budget }) {
   const changes = [];
-  let estimate = total;
-  const pairs = Math.ceil(guestCount / 2);
-  const shareable = cart.filter((c) => c.per === 'person' && c.shareAs === 'pair' && c.qty > pairs);
-  // Biggest saving first so the fewest items move.
-  shareable.sort((a, b) => (b.qty - pairs) * b.unitPrice.amount - (a.qty - pairs) * a.unitPrice.amount);
-  for (const c of shareable) {
-    if (estimate <= budget.amount) break;
-    const qtyRemoved = c.qty - pairs;
-    estimate = r2(estimate - qtyRemoved * c.unitPrice.amount);
-    changes.push({ id: c.id, qtyRemoved, newQty: pairs, newPer: 'pair', why: 'share one per pair' });
+  let estimate = r2(total);
+  const swaps = [];
+  for (const c of cart) {
+    if (c.qty <= 0 || c.substitutes === false) continue;
+    const cheapest = (c.alternates || []).filter((a) => a.unitPrice.amount < c.unitPrice.amount)
+      .sort((a, b) => a.unitPrice.amount - b.unitPrice.amount)[0];
+    if (cheapest) swaps.push({ type: 'swap', id: c.id, needId: c.needId, to: cheapest, saving: r2((c.unitPrice.amount - cheapest.unitPrice.amount) * c.qty) });
   }
-  const optional = cart.filter((c) => c.optional && !changes.some((x) => x.id === c.id));
-  optional.sort((a, b) => b.qty * b.unitPrice.amount - a.qty * a.unitPrice.amount);
-  for (const c of optional) {
+  swaps.sort((a, b) => b.saving - a.saving);
+  for (const s of swaps) {
     if (estimate <= budget.amount) break;
-    estimate = r2(estimate - c.qty * c.unitPrice.amount);
-    changes.push({ id: c.id, qtyRemoved: c.qty, newQty: 0, why: 'drop optional item' });
+    estimate = r2(estimate - s.saving);
+    changes.push(s);
+  }
+  const extras = cart.filter((c) => c.optional && c.qty > 0)
+    .map((c) => {
+      const swapped = changes.find((x) => x.id === c.id);
+      const unit = swapped ? swapped.to.unitPrice.amount : c.unitPrice.amount;
+      return { type: 'drop', id: c.id, needId: c.needId, saving: r2(unit * c.qty), swapped };
+    })
+    .sort((a, b) => b.saving - a.saving);
+  for (const d of extras) {
+    if (estimate <= budget.amount) break;
+    estimate = r2(estimate - d.saving);
+    if (d.swapped) changes.splice(changes.indexOf(d.swapped), 1); // no point swapping a line we drop
+    delete d.swapped;
+    changes.push(d);
   }
   return { changes, estimatedTotal: estimate, fits: estimate <= budget.amount };
+}
+
+/** Deterministic requirements check: every mandatory need must be covered at its full quantity. */
+export function checkRequirements({ needs, cart, required }) {
+  const missing = [];
+  for (const n of needs) {
+    if (n.optional) continue;
+    const want = required(n);
+    const have = cart.filter((c) => c.needId === n.id).reduce((s, c) => s + c.qty, 0);
+    if (have < want) missing.push({ need: n.id, qty: want - have });
+  }
+  return { ok: missing.length === 0, missing };
+}
+
+/** Reap quote limits: 1 to 20 lines, positive integer quantities, and (our rule) one merchant per quote. */
+export function validateQuoteItems(items, merchants = []) {
+  if (!Array.isArray(items) || items.length < 1 || items.length > 20) throw Object.assign(new Error(`A quote takes 1 to 20 items, got ${items?.length ?? 0}`), { code: 'QUOTE_ITEMS_INVALID' });
+  for (const i of items) {
+    if (!i?.variantId || !Number.isInteger(i.quantity) || i.quantity < 1) throw Object.assign(new Error(`Invalid quote line ${JSON.stringify(i)}`), { code: 'QUOTE_ITEMS_INVALID' });
+  }
+  const distinct = [...new Set(merchants.filter(Boolean))];
+  if (distinct.length > 1) throw Object.assign(new Error(`One quote is one merchant request; cart mixes ${distinct.join(', ')}`), { code: 'MIXED_MERCHANTS' });
+  return items;
 }

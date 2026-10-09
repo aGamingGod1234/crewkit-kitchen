@@ -5,6 +5,7 @@ import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { validateQuoteItems } from './gate.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const envFile = join(here, '.env');
@@ -17,7 +18,7 @@ if (existsSync(envFile)) {
   }
 }
 
-const BASE = process.env.REAP_BASE_URL || 'https://sandbox.api.reap.global';
+const BASE = process.env.REAP_BASE_URL || 'https://sg.sandbox.api.reap.global'; // canonical; sandbox.api.reap.global is an alias
 const VERSION = process.env.REAP_VERSION || '2025-02-14';
 const RETURN_URL = process.env.REAP_RETURN_URL || 'https://example.com/crewkit/done';
 const EMAIL = process.env.REAP_EMAIL || 'chef@crewkit.example';
@@ -105,11 +106,19 @@ export const search = (query, { merchant, mode = 'ONLY', limit = 10, country = '
     pagination: { limit },
     ...(merchant ? { merchantPreference: { mode, merchantName: merchant } } : {}),
   });
-export const details = (productIds) => reap('POST', '/agentic/products/details', { productIds });
+// details takes 1 to 10 product ids per call; batch larger lists and merge.
+export async function details(productIds) {
+  const out = { products: [], errors: [] };
+  for (let i = 0; i < productIds.length; i += 10) {
+    const r = await reap('POST', '/agentic/products/details', { productIds: productIds.slice(i, i + 10) });
+    out.products.push(...(r?.products || [])); out.errors.push(...(r?.errors || []));
+  }
+  return out;
+}
 export const variant = (productId, optionIds) => reap('POST', '/agentic/products/variant', { productId, optionIds });
 
-export const createQuote = (items, { email = EMAIL, address = VENUE } = {}) =>
-  reap('POST', '/agentic/quotes', { items, email, shippingAddress: address }, { idempotent: true });
+export const createQuote = (items, { email = EMAIL, address = VENUE, merchants = [] } = {}) =>
+  validateQuoteItems(items, merchants) && reap('POST', '/agentic/quotes', { items, email, shippingAddress: address }, { idempotent: true });
 export const getQuote = (id) => reap('GET', `/agentic/quotes/${id}`);
 export const selectShipping = (quoteId, shippingOptionId) =>
   reap('POST', `/agentic/quotes/${quoteId}/shipping-option`, { shippingOptionId });
