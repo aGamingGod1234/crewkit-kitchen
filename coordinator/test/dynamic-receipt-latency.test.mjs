@@ -175,7 +175,7 @@ test('a conflicting terminal cannot block a later correlated action receipt', as
 for (const retirement of [null, 'disconnect', 'action_lease']) {
 	test(`cold conversation dispatch is durable before send and lifecycle fenced: ${retirement ?? 'current'}`, async (t) => {
 		const directory = await mkdtemp(join(tmpdir(), 'arena-cold-dispatch-'));
-		t.after(() => rm(directory, { recursive: true, force: true }));
+		t.after(() => rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
 		const registry = new AgentRegistry();
 		const planner = new FakePlanner(registry);
 		const turn = gate(), storage = gate();
@@ -252,7 +252,7 @@ test('shutdown is bounded with stuck receipt storage and leaves the result unack
 
 test('shutdown releases a second blocking action before stuck terminal storage settles', async (t) => {
 	const directory = await mkdtemp(join(tmpdir(), 'arena-stop-receipt-'));
-	t.after(() => rm(directory, { recursive: true, force: true }));
+	t.after(() => rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
 	const unknown = t.mock.method(ModelNotebook.prototype, 'recordUnknown');
 	const run = await fixture({ memoryDirectory: directory });
 	const storage = gate();

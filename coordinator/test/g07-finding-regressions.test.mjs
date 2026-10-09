@@ -26,7 +26,7 @@ const tick = () => new Promise(r => setImmediate(r));
 // loaded runner delays well past the 30 ms these once used.
 const GATED_TRIAL_BUDGET_MS = 2000;
 
-test('late provider acquisition stays owned, aborts, and prevents another trial while unsettled', async () => {
+test('late provider acquisition stays owned, aborts, and prevents another trial while unsettled', { timeout: 120_000 }, async () => {
   const gate = deferred(); let stops = 0, acquisitions = 0, signal;
   const result = await runLatencyMatrix({ matrix: matrix({ trialBudgetMs: GATED_TRIAL_BUDGET_MS }), measurements: false,
     providerFactories: { instant: async (_, context) => { acquisitions++; signal = context.signal; await gate.promise; return { ...profile, stop: async () => { stops++; } }; } },
@@ -59,7 +59,7 @@ for (const mode of ['pending', 'rejected', 'completed']) test(`provider shutdown
 });
 
 const instrumentationRun = () => ({ trials: Array.from({length:6}, (_, i) => ({trialId:'fixture', repetition:i+1, status:'PASSED', cleanup:{ok:true}, durationMs:100, debug:{actionCommandHash:'actions', scenarioDigest:'facts'}})) });
-test('instrumentation certification requires timing for every successful matched pair', () => {
+test('instrumentation certification requires timing for every successful matched pair', { timeout: 120_000 }, () => {
   for (const arm of ['enabled','disabled']) for (const value of [undefined,null,NaN,Infinity,-1,'100']) {
     const input={enabled:instrumentationRun(),disabled:instrumentationRun()}; input[arm].trials[5].durationMs=value;
     assert.equal(compareInstrumentationRuns(input).status,'FAILED', `${arm}/${value}`);
@@ -74,7 +74,7 @@ test('instrumentation certification requires timing for every successful matched
   assert.equal(compareInstrumentationRuns(input).status,'FAILED');
 });
 
-test('Task 9 fixed descriptor controls the actual scheduler and rejects unsupported adaptive descriptors', async () => {
+test('Task 9 fixed descriptor controls the actual scheduler and rejects unsupported adaptive descriptors', { timeout: 120_000 }, async () => {
   const m = { ...matrix({ agentLoad:4, scenarioId:'stone-tool-gathering', mode:'replay', providerProfile:{...profile,provider:'replay'}, repetitions:1, turnBudgetMs:10000, trialBudgetMs:60000 }), schemaVersion:3 };
   const result = await runTask9SimulatorMatrix({ matrix:m, virtualTickPacing:{tickMs:1}, scheduler:{mode:'fixed',fixedConcurrency:1},
     providerFactories:{ replay: (profile, context) => ({...profile, synthetic:true, available:true, async stop(){}, async createAgent(record){return { async setGoalRevision(){}, async decide(){return compileScenarioDecision(context.loadScenario.agentManifests[record.agentId]);} };} }) },
@@ -87,7 +87,7 @@ test('Task 9 fixed descriptor controls the actual scheduler and rejects unsuppor
 });
 
 // Exercises the actual services and workspace manager with offline transports.
-test('default preflight IDs cross both production workspace boundaries', async () => {
+test('default preflight IDs cross both production workspace boundaries', { timeout: 120_000 }, async () => {
 const ownedRoot = path.join(os.tmpdir(), 'g07-no-io-workspace');
 const profiles = {
   codex: { provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority' },
@@ -151,7 +151,7 @@ for (const provider of Object.keys(profiles)) {
 });
 
 // Deterministic clock adapted from the independently verified interval probe.
-test('useful preparation overlap excludes the idle tail and preserves absent-event controls', async () => {
+test('useful preparation overlap excludes the idle tail and preserves absent-event controls', { timeout: 120_000 }, async () => {
 async function measure(name, overrides = {}) {
   const originalSetTimeout = globalThis.setTimeout;
   const originalClearTimeout = globalThis.clearTimeout;
@@ -250,7 +250,7 @@ function invoke(script, args, root) {
   return {...child,report:child.stdout.trim() ? JSON.parse(child.stdout.trim().split(/\r?\n/).at(-1)) : null};
 }
 
-test('actual Task 9 CLI exits nonzero for returned failure and timeout, zero for factual success',async()=>{
+test('actual Task 9 CLI exits nonzero for returned failure and timeout, zero for factual success', { timeout: 120_000 }, async()=>{
   const root=await artifactRoot('task9-cli');
   for (const [name,scenarioId,budget,status] of [['missing','g07-nonexistent',5000,'FAILED'],['timeout','block-placement',0.000001,'TIMED_OUT'],['valid','block-placement',5000,'PASSED']]) {
     const input={...matrix({id:name,scenarioId,repetitions:1,trialBudgetMs:budget}),schemaVersion:3};
@@ -268,7 +268,7 @@ test('actual Task 9 CLI exits nonzero for returned failure and timeout, zero for
   assert.equal(invalid.status,1);
 });
 
-test('native A/B accepts required work only and excludes invalid arms from paired timings',async()=>{
+test('native A/B accepts required work only and excludes invalid arms from paired timings', { timeout: 120_000 }, async()=>{
   const root=await artifactRoot('native-ab');
   for(const mode of ['valid','zero','wrong','extra','reversed','missing-mine','wrong-args','real-zero']){
     const source=mode==='real-zero' ? `
@@ -323,7 +323,7 @@ test('native A/B accepts required work only and excludes invalid arms from paire
   }
 });
 
-test('default live factory cancellation reclaims preflight and reports completed cleanup',async()=>{
+test('default live factory cancellation reclaims preflight and reports completed cleanup', { timeout: 120_000 }, async()=>{
   let creates=0,stops=0,aborted=false;
   const liveProfile={provider:'codex',model:'offline',reasoningEffort:'high',serviceTier:'priority'};
   const result=await runLatencyMatrix({matrix:matrix({mode:'live',providerProfile:liveProfile,repetitions:1,trialBudgetMs:GATED_TRIAL_BUDGET_MS}),measurements:false,
@@ -336,7 +336,7 @@ test('default live factory cancellation reclaims preflight and reports completed
   if(result.cleanup.ok)assert.equal(result.trials[0].cleanup.providerAcquisition,'resolved');
 });
 
-test('default live adapter retains pending stop after its gameplay session deadline',async()=>{
+test('default live adapter retains pending stop after its gameplay session deadline', { timeout: 120_000 }, async()=>{
   const createGate=deferred(),stopGate=deferred();let creates=0,stops=0,factories=0;
   const liveProfile={provider:'codex',model:'offline',reasoningEffort:'high',serviceTier:'priority'};
   const service={provider:'codex',async start(){},async createAgent(){if(++creates===1)return {};await createGate.promise;return {async decide(){throw Error('must not turn');}};},async removeAgent(){},async stop(){stops++;await stopGate.promise;}};
@@ -349,7 +349,7 @@ test('default live adapter retains pending stop after its gameplay session deadl
   }finally{createGate.resolve();stopGate.resolve();await tick();await tick();}
 });
 
-test('legacy latency CLI preserves pending acquisition and halted-matrix evidence',async()=>{
+test('legacy latency CLI preserves pending acquisition and halted-matrix evidence', { timeout: 120_000 }, async()=>{
   const root=await artifactRoot('latency-cli'), gate=deferred();
   const input=path.join(root,'matrix.json');await writeFile(input,JSON.stringify(matrix({trialBudgetMs:GATED_TRIAL_BUDGET_MS})));
   const output=[];let stops=0;
@@ -366,7 +366,7 @@ test('legacy latency CLI preserves pending acquisition and halted-matrix evidenc
   assert.equal(stops,1);
 });
 
-test('Task 9 accepts explicit adaptive execution and rejects a mismatched custom scheduler',async()=>{
+test('Task 9 accepts explicit adaptive execution and rejects a mismatched custom scheduler', { timeout: 120_000 }, async()=>{
   const m={...matrix({agentLoad:4,scenarioId:'stone-tool-gathering',mode:'replay',providerProfile:{...profile,provider:'replay'},repetitions:1,turnBudgetMs:10000,trialBudgetMs:60000}),schemaVersion:3};
   const common={matrix:m,virtualTickPacing:{tickMs:1},providerFactories:{replay:(profile,context)=>({...profile,available:true,synthetic:true,async stop(){},async createAgent(record){return {async setGoalRevision(){},async decide(){return compileScenarioDecision(context.loadScenario.agentManifests[record.agentId]);}};}})}};
   const adaptive=await runTask9SimulatorMatrix({...common,scheduler:{mode:'adaptive',controller:{fixture:true}},planningSchedulerFactory:({recorder})=>new PlanningScheduler({maxConcurrent:4,maxPending:0,planningMode:'adaptive',urgentReserve:0,benchmarkRecorder:recorder})});

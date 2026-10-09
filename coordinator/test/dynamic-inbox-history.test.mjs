@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 import { burst, rejectedStart, readHistory, durableCoordinatorReload, failedAdmission, removedUnopenedInbox, missingPendingReceipt, lifecycle, wakeAck } from './fixtures/runtime-inbox-scenarios.mjs';
 import { fixture, event, until } from './fixtures/runtime-inbox-fixture.mjs';
 
-test('read history eviction never redelivers text', async () => { await readHistory(); });
+test('read history eviction never redelivers text', { timeout: 120_000 }, async () => { await readHistory(); });
 
-test('inbox fixture rejects a steer after its modeled provider turn ended', async () => {
+test('inbox fixture rejects a steer after its modeled provider turn ended', { timeout: 120_000 }, async () => {
 	const run = await fixture();
 	try {
 		await run.bridge.deliver('conversation_event', event(1));

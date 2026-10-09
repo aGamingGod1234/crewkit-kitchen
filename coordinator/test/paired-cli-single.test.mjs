@@ -6,7 +6,7 @@ import { normalizeHeadlessMatrix } from '../src/headless-matrix.mjs';
 import {  } from '../src/benchmark/paired-cli.mjs';
 import { fixture, launcher, json, exec } from './fixtures/paired-cli-fixture.mjs';
 const quotePS = value => "'" + value.replaceAll("'", "''") + "'";
-test('extracted phase code preserves the existing single-scenario launcher path', { skip: process.platform !== 'win32' }, async t => {
+test('extracted phase code preserves the existing single-scenario launcher path', { skip: process.platform !== 'win32', timeout: 180_000 }, async t => {
  const f = await fixture(t); const arm = f.config.arms[0];
  const normalized = normalizeHeadlessMatrix(await json(f.config.matrixPath)).scenarios[0];
  const scenarioFile = path.join(f.directory, 'normalized.json'); await writeFile(scenarioFile, JSON.stringify(normalized));

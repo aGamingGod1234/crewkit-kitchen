@@ -387,15 +387,17 @@ export class NativeToolRuntime {
 				if (previous !== null && previous.state !== 'CANCELLED') return replacementNotStarted(previous);
 			}
 			if (this.#dangerActionWhilePaused(request.tool, record)) {
+				const interruptedHere = this.#interruptedPausedDangerAction(record);
+				if (interruptedHere !== null) {
+					// The model's own paused-program fight/flee was interrupted by danger: switch it by its exact handle.
+					const switchTool = { ...request.tool, kind: 'action' };
+					return this.#withBlockingToolRun(record, (run) => this.#replaceInterruptedDangerAction(request, record, switchTool, interruptedHere, run, { pausedProgram: true }));
+				}
 				if (request.tool.kind === 'replace_action') {
 					const previous = this.#terminalActionReceipt(record, request.tool.actionId, request.tool.goalRevision);
 					return this.#startReplacementAsNewAction(request, record, previous, { pausedProgram: true });
 				}
 				const tool = { ...request.tool, kind: 'action' };
-				const interrupted = this.#actions.get(record.agentId);
-				if (request.tool.kind === 'action' && ['fight_target', 'flee_from'].includes(tool.actionType) && interrupted?.interruptedBy === 'danger') {
-					return this.#withBlockingToolRun(record, (run) => this.#replaceInterruptedDangerAction(request, record, tool, interrupted, run, { pausedProgram: true }));
-				}
 				const execute = () => this.#executeAction(request, record, tool, null, request.tool.kind !== 'start_action', null, null, { pausedProgram: true });
 				return request.tool.kind === 'action' ? this.#withBlockingToolRun(record, execute) : execute();
 			}
@@ -446,7 +448,8 @@ export class NativeToolRuntime {
 		const epoch = this.#executionEpoch(record.agentId);
 		const cancelled = await this.#cancelAction(record, { actionId: interrupted.actionId, goalRevision: record.goalRevision }, { blockingRun });
 		if (cancelled.interruptedBy !== undefined) return cancelled;
-		if (this.#executionEpoch(record.agentId) !== epoch + 1) throw codedError('STALE_NATIVE_TOOL', 'Lifecycle changed while replacing the interrupted action');
+		// Cancelling a paused-program danger action keeps the program (and its epoch); any other cancel advances it by one.
+		if (this.#executionEpoch(record.agentId) !== (pausedProgram ? epoch : epoch + 1)) throw codedError('STALE_NATIVE_TOOL', 'Lifecycle changed while replacing the interrupted action');
 		if (cancelled.state !== 'CANCELLED') return { state: 'REPLACEMENT_NOT_STARTED', reasonCode: 'ACTION_FINISHED_BEFORE_CANCEL', previous: cancelled };
 		return this.#executeAction(request, record, tool, null, true, null, null, { pausedProgram });
 	}
@@ -490,16 +493,27 @@ export class NativeToolRuntime {
 	 */
 	#dangerActionWhilePaused(tool, record) {
 		if (!['action', 'start_action', 'replace_action'].includes(tool.kind) || !PAUSED_PROGRAM_DANGER_ACTIONS.has(tool.actionType)) return false;
+		const interrupted = this.#interruptedPausedDangerAction(record);
+		if (interrupted !== null) {
+			return tool.kind === 'action' || (tool.kind === 'replace_action' && tool.actionId === interrupted.actionId && tool.goalRevision === interrupted.goalRevision);
+		}
 		if (!this.#pausedProgramForDanger(record)) return false;
 		if (tool.kind === 'replace_action') return this.#terminalActionReceipt(record, tool.actionId, tool.goalRevision)?.state === 'CANCELLED';
 		return true;
 	}
 
-	#pausedProgramForDanger(record) {
+	#pausedProgramForDanger(record, { ownsAction = false } = {}) {
 		const run = this.#programRuns.get(record.agentId);
 		if (run?.goalRevision !== record.goalRevision || run.state !== 'RUNNING' || run.epoch !== this.#executionEpoch(record.agentId)) return false;
 		const status = this.#programExecutor.status?.(record);
-		return status?.decision != null && status.engineState === 'SUSPENDED' && !this.#actions.has(record.agentId);
+		return status?.decision != null && status.engineState === 'SUSPENDED' && (ownsAction || !this.#actions.has(record.agentId));
+	}
+
+	/** The model's own fight/flee taken while the program is paused, once danger interrupted its blocking call; else null. */
+	#interruptedPausedDangerAction(record) {
+		const active = this.#actions.get(record.agentId);
+		if (active === undefined || active.pausedProgram !== true || active.interruptedBy !== 'danger' || active.goalRevision !== record.goalRevision) return null;
+		return this.#pausedProgramForDanger(record, { ownsAction: true }) ? active : null;
 	}
 
 	#terminalActionReceipt(record, actionId, goalRevision) {

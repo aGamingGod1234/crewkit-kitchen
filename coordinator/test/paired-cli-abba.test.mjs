@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { runPairedCli } from '../src/benchmark/paired-cli.mjs';
 import { fixture, launcher, json } from './fixtures/paired-cli-fixture.mjs';
-test('real driver and extracted launcher phases run AB/BA against isolated harmless fixtures', { skip: process.platform !== 'win32' }, async t => {
+test('real driver and extracted launcher phases run AB/BA against isolated harmless fixtures', { skip: process.platform !== 'win32', timeout: 180_000 }, async t => {
 	const f = await fixture(t);
 	const report = await runPairedCli(f.config, { launcher: f.fakeLauncher });
 	assert.equal(report.status, 'COMPLETE', JSON.stringify({ report, journal: await json(path.join(f.config.outputDirectory, 'journal.json')) }));

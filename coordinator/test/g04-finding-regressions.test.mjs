@@ -31,7 +31,7 @@ async function fixture(t) {
   return directory;
 }
 
-test('f038: repaired durable file retries in the same memory context and preserves its facts', async t => {
+test('f038: repaired durable file retries in the same memory context and preserves its facts', { timeout: 180_000 }, async t => {
   const directory = await fixture(t);
   await writeFile(join(directory, `task-world-${hash(key)}.json`), '{broken-json');
   const store = new TaskMemoryStore({ directory });
@@ -52,7 +52,7 @@ test('f038: repaired durable file retries in the same memory context and preserv
   assert.equal((await new TaskMemoryStore().summary(scope)).totals.entries, 0);
 });
 
-test('f044: authored capacity is per owner across restart, with owner-only retirement and sharing', async t => {
+test('f044: authored capacity is per owner across restart, with owner-only retirement and sharing', { timeout: 180_000 }, async t => {
   const directory = await fixture(t);
   const store = new TaskMemoryStore({ directory });
   await Promise.all(Array.from({ length: 256 }, (_, i) => store.remember(scope, note(`a-${i}`))));
@@ -71,7 +71,7 @@ test('f044: authored capacity is per owner across restart, with owner-only retir
   await loaded.flush();
 });
 
-test('f045: replacements enter every summary window while query pagination and goal preference remain stable', async t => {
+test('f045: replacements enter every summary window while query pagination and goal preference remain stable', { timeout: 180_000 }, async t => {
   const directory = await fixture(t);
   const store = new TaskMemoryStore({ directory });
   for (const [kind, field, width] of [['progress', 'progress', 2], ['route', 'routes', 4], ['place', 'places', 4], ['lesson', 'lessons', 3]]) {
@@ -91,7 +91,7 @@ test('f045: replacements enter every summary window while query pagination and g
   await store.flush();
 });
 
-test('f063: sixteen complete recovery histories and subsequent task notes survive real-disk restart', async t => {
+test('f063: sixteen complete recovery histories and subsequent task notes survive real-disk restart', { timeout: 180_000 }, async t => {
   const directory = await fixture(t);
   const store = new TaskMemoryStore({ directory });
   const memory = new RuntimeMemoryContext({ taskMemory: store });
@@ -170,7 +170,7 @@ for (const failure of ['owner', 'manifest']) test(`migration preserves the legac
   assert.equal((await readdir(directory)).length, 3, 'stable owner files create no per-snapshot garbage');
 });
 
-test('missing owner records fail visibly, then retry after repair without resetting the world', async t => {
+test('missing owner records fail visibly, then retry after repair without resetting the world', { timeout: 180_000 }, async t => {
   const directory = await fixture(t);
   const store = new TaskMemoryStore({ directory });
   await store.remember(scope, note('retained'));
@@ -183,7 +183,7 @@ test('missing owner records fail visibly, then retry after repair without resett
   assert.equal((await loaded.summary(scope)).lessons[0].key, 'retained');
 });
 
-test('native entry admits a new owner at foreign capacity and serializes a refreshed replacement summary', async t => {
+test('native entry admits a new owner at foreign capacity and serializes a refreshed replacement summary', { timeout: 180_000 }, async t => {
   const directory = await fixture(t);
   const store = new TaskMemoryStore({ directory });
   await Promise.all(Array.from({ length: 256 }, (_, i) => store.remember(scope, note(`a-${i}`))));

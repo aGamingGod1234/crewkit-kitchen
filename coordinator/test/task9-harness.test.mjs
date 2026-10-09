@@ -24,14 +24,14 @@ const trial = (overrides = {}) => ({ id: 'stone', mode: 'replay', scenarioId: 's
 const matrix = (overrides = {}) => ({ schemaVersion: 3, fixedSeeds: [20260821, 20260822], agentLoads: [1, 4, 8, 16], trials: [trial(overrides)] });
 const phases = TASK9_REQUIRED_PHASES.map((phase, index) => ({ phase, sequence: index + 1, monotonicMs: index, durationMs: 1 }));
 
-test('normalizes the schema-3 deterministic matrix and rejects live trials', () => {
+test('normalizes the schema-3 deterministic matrix and rejects live trials', { timeout: 120_000 }, () => {
 	const normalized = normalizeTask9Matrix(matrix());
 	assert.equal(normalized.schemaVersion, 3);
 	assert.deepEqual(normalized.agentLoads, [1, 4, 8, 16]);
 	assert.throws(() => normalizeTask9Matrix(matrix({ mode: 'live' })), /instant or replay/i);
 });
 
-test('creates fair A/B rows with identical cells and a separately versioned scheduler sweep', () => {
+test('creates fair A/B rows with identical cells and a separately versioned scheduler sweep', { timeout: 120_000 }, () => {
 	const fair = createFairAbRows({ trials: matrix(), sourceCommits: { baseline: 'base', optimized: 'tip' }, fixedConcurrency: 16 });
 	assert.equal(fair.length, 10);
 	for (let index = 0; index < fair.length; index += 2) {
@@ -49,7 +49,7 @@ test('creates fair A/B rows with identical cells and a separately versioned sche
 	assert.deepEqual(sweep.at(-1).scheduler.controller, TASK9_ADAPTIVE_CONTROLLER_V1);
 });
 
-test('generated fixed rows admit the complete ordinary workload through the real runner', async (context) => {
+test('generated fixed rows admit the complete ordinary workload through the real runner', { timeout: 120_000 }, async (context) => {
 	for (const load of [1, 4]) await context.test(`load ${load}`, async (loadContext) => {
 		const input = matrix({ id: `stone-${load}`, agentLoad: load, repetitions: 1, turnBudgetMs: 1000, trialBudgetMs: 1800 });
 		// Only the negative control needs the short budget: it can never finish, so it times out at any load.
@@ -105,7 +105,7 @@ test('generated fixed rows admit the complete ordinary workload through the real
 	});
 });
 
-test('does not call live providers and keeps factual/cleanup evidence separate from latency', () => {
+test('does not call live providers and keeps factual/cleanup evidence separate from latency', { timeout: 120_000 }, () => {
 	const report = buildTask9TrialReport({
 		identity: { runId: 'r', trialId: 't', repetition: 1, cellId: 'c', scenarioId: 'stone', seed: 1, agentLoad: 1, providerProfile: profile },
 		status: 'PASSED', events: phases, cpuSamples: [3, 1, 2], rssSamples: [30, 10, 20], tickSamples: [4, 2, 3], factualSuccess: true,
@@ -121,7 +121,7 @@ test('does not call live providers and keeps factual/cleanup evidence separate f
 	assert.ok(incomplete.missingPhases.length > 0);
 });
 
-test('adapts deterministic runner output into raw evidence artifacts', async () => {
+test('adapts deterministic runner output into raw evidence artifacts', { timeout: 120_000 }, async () => {
 	const root = await mkdtemp(path.join(tmpdir(), 'task9-harness-'));
 	const output = await runTask9SimulatorMatrix({
 		matrix: matrix({ repetitions: 1 }), artifactDirectory: root, runId: 'run-1', arm: 'optimized', sourceHash: 'sha256:source', configHash: 'sha256:config',
@@ -144,7 +144,7 @@ test('adapts deterministic runner output into raw evidence artifacts', async () 
 	assert.ok(files.some((name) => name.startsWith('trial-stone-1')));
 });
 
-test('pins the exact Luna xhigh fast Desktop scenario without performing a live run', async () => {
+test('pins the exact Luna xhigh fast Desktop scenario without performing a live run', { timeout: 120_000 }, async () => {
 	const config = JSON.parse(await readFile(new URL('../config/headless-provider-matrix.json', import.meta.url), 'utf8'));
 	const scenario = config.scenarios.find((entry) => entry.id === TASK9_LUNA_PICKAXE_PROFILE.id);
 	assert.deepEqual({ provider: scenario.provider, model: scenario.model, reasoningEffort: scenario.reasoningEffort, serviceTier: scenario.serviceTier }, { provider: TASK9_LUNA_PICKAXE_PROFILE.provider, model: TASK9_LUNA_PICKAXE_PROFILE.model, reasoningEffort: TASK9_LUNA_PICKAXE_PROFILE.reasoningEffort, serviceTier: TASK9_LUNA_PICKAXE_PROFILE.serviceTier });

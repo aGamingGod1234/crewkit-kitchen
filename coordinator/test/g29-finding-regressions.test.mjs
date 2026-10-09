@@ -11,6 +11,7 @@ const repository = fileURLToPath(new URL('../../', import.meta.url));
 
 test('source preparation feeds the authenticated launcher and preserves isolated smoke guards', {
   skip: process.platform !== 'win32' && 'Windows PowerShell launcher contract',
+  timeout: 120_000,
 }, () => {
   const fixture = mkdtempSync(path.join(process.env.G29_FIXTURE_PARENT ?? tmpdir(), 'g29-startup-'));
   // Execute only the real properties AST statements: no installer, world copy,

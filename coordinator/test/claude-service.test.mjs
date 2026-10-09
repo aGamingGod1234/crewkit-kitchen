@@ -720,6 +720,39 @@ test('Claude carries a failed tool result across a first-turn boundary rotation 
 	} finally { await close(); }
 });
 
+test('a cold-restart handoff whose write fails keeps the folded steer for the next turn', async () => {
+	let steerSettled = 0;
+	let nextInput = null;
+	const { service, children, close } = await harness({
+		beforeToolsListed(child) { if (children.indexOf(child) === 1) child.stdin.destroyed = true; },
+		async onUser(child) {
+			if (children.indexOf(child) === 0) {
+				await child.rpc('tools/call', { name: 'say', arguments: { message: 'long action' }, _meta: { 'claudecode/toolUseId': 'toolu_cold' } });
+				return;
+			}
+			nextInput = child.lines.filter((line) => line.type === 'user').at(-1).message.content;
+			child.emitLine({ type: 'result', subtype: 'success', is_error: false, result: 'continued', session_id: 'session-2' });
+		},
+	});
+	try {
+		const agent = await service.createAgent(profile(), { controlProtocol: 'native_tools' });
+		await assert.rejects(agent.act(nativeEvent(1), {
+			goalRevision: 0,
+			executeTool: async () => {
+				void agent.steer(async () => 'FOLDED-STEER-TEXT', { goalRevision: 0 }).then(() => { steerSettled += 1; }, () => {});
+				children[0].exit(1);
+				return { state: 'SUCCEEDED', reasonCode: 'ACTION_COMPLETED' };
+			},
+		}), (error) => error.code === 'PROVIDER_UNAVAILABLE');
+		assert.equal(children.length, 2, 'the tool result restarted Claude Code cold');
+		assert.equal(steerSettled, 1, 'the steer waiter already resolved when it was folded into the handoff');
+		children[1].stdin.destroyed = false;
+		await agent.act(nativeEvent(2), { goalRevision: 0, executeTool: async () => ({}) });
+		assert.equal((nextInput.match(/FOLDED-STEER-TEXT/g) ?? []).length, 1, 'the folded steer reaches the model in the next turn');
+		assert.equal((nextInput.match(/"reasonCode":"ACTION_COMPLETED"/g) ?? []).length, 1, 'the completed tool result is carried once');
+	} finally { await close(); }
+});
+
 test('interrupting while a standby is pending cancels handoff before it writes a ghost turn', async () => {
 	let agent;
 	let releaseStandby;

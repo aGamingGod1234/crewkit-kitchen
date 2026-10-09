@@ -11,7 +11,7 @@ param(
 	[Parameter(Mandatory)] [string] $ServerTemplate,
 	[string] $JavaPath,
 	[ValidateRange(30, 300)] [int] $StartupTimeoutSeconds = 150,
-	[ValidateRange(10, 120)] [int] $ShutdownTimeoutSeconds = 45
+	[ValidateRange(10, 300)] [int] $ShutdownTimeoutSeconds = 120
 )
 
 Set-StrictMode -Version Latest

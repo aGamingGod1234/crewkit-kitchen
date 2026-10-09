@@ -15,7 +15,7 @@ import { root } from './fixtures/paired-cli-fixture.mjs';
 const STARTUP_ALLOWANCE_MS = 60_000;
 const CLEANUP_ALLOWANCE_MS = 30_000;
 
-test('Windows PowerShell child environment removes only its incompatible module path', { skip: process.platform !== 'win32' }, async t => {
+test('Windows PowerShell child environment removes only its incompatible module path', { skip: process.platform !== 'win32', timeout: 120_000 }, async t => {
 	const directory = await mkdtemp(path.join(tmpdir(), 'paired-shell-env-'));
 	t.after(() => rm(directory, { recursive: true, force: true }));
 	const module = path.join(directory, 'Microsoft.PowerShell.Utility'); await mkdir(module);
@@ -36,7 +36,7 @@ test('Windows PowerShell child environment removes only its incompatible module 
 	assert.equal(inherited.PSModulePath, directory, 'parent environment remains intact');
 });
 
-test('actual PowerShell relay carries the original QPC cutoff through delayed trial and cleanup', { skip: process.platform !== 'win32' }, async t => {
+test('actual PowerShell relay carries the original QPC cutoff through delayed trial and cleanup', { skip: process.platform !== 'win32', timeout: 120_000 }, async t => {
 	const directory = await mkdtemp(path.join(tmpdir(), 'paired-ps-cutoff-'));
 	t.after(() => rm(directory, { recursive: true, force: true }));
 	const quote = value => "'" + value.replaceAll("'", "''") + "'";

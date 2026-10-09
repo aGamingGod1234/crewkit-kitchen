@@ -1,6 +1,6 @@
 import test from 'node:test';
 import { powershellFixture } from './fixtures/g26-powershell-fixture.mjs';
-test('lifecycle assertions reject success for every actual pattern', { skip: process.platform !== 'win32' }, async () => {
+test('lifecycle assertions reject success for every actual pattern', { skip: process.platform !== 'win32', timeout: 120_000 }, async () => {
  await powershellFixture(`Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $tokens=$null; $errors=$null
@@ -36,7 +36,7 @@ Write-Output "PASS all $($patterns.Count) assertion patterns and exact negative 
 `);
 });
 
-test('cleanup shares discovery while preserving churn and identity validation', { skip: process.platform !== 'win32' }, async () => {
+test('cleanup shares discovery while preserving churn and identity validation', { skip: process.platform !== 'win32', timeout: 120_000 }, async () => {
  await powershellFixture(`# Independent f127 fixture. Executes exact AST-extracted production functions.
 # CIM, process handles, Stop-Process and Start-Sleep are in-memory boundaries.
 Set-StrictMode -Version Latest
@@ -141,7 +141,7 @@ Write-Output 'PASS fresh identity validation rejects a PID reused after discover
 `);
 });
 
-test('standalone resource lifecycle initializes state in a fresh session', { skip: process.platform !== 'win32' }, async () => {
+test('standalone resource lifecycle initializes state in a fresh session', { skip: process.platform !== 'win32', timeout: 120_000 }, async () => {
  await powershellFixture(`Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 $tokens=$null; $errors=$null

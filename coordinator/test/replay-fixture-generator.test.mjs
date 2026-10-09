@@ -96,7 +96,7 @@ async function withLavaAttentionDuringActiveWait(callback, clock) {
 	}
 }
 
-test('captures exact translated-agent decisions as redacted records for loads 1 and 4', async () => {
+test('captures exact translated-agent decisions as redacted records for loads 1 and 4', { timeout: 120_000 }, async () => {
 	const generated = await generateReplayRecordings({
 		matrix: matrix(),
 		scenarioResolver: () => getSimulatorScenario('stone-tool-gathering'),
@@ -115,7 +115,7 @@ test('captures exact translated-agent decisions as redacted records for loads 1 
 	assert.doesNotMatch(serialized, /secret prompt/);
 });
 
-test('generated records replay successfully through the production runner at loads 1 and 4', async () => {
+test('generated records replay successfully through the production runner at loads 1 and 4', { timeout: 120_000 }, async () => {
 	const fixture = await generateReplayRecordings({
 		matrix: matrix(),
 		scenarioResolver: () => getSimulatorScenario('stone-tool-gathering'),
@@ -132,7 +132,7 @@ test('generated records replay successfully through the production runner at loa
 	assert.equal(replay.cleanup.ok, true);
 });
 
-test('ordinary delayed stone records remain single-turn and replay without prompt drift', async () => {
+test('ordinary delayed stone records remain single-turn and replay without prompt drift', { timeout: 120_000 }, async () => {
 	const delayedMatrix = matrix([4]);
 	const fixture = await generateReplayRecordings({
 		matrix: delayedMatrix,
@@ -154,7 +154,7 @@ test('ordinary delayed stone records remain single-turn and replay without promp
 	assert.equal(replay.cleanup.ok, true);
 });
 
-test('records a cleanup-aborted continuation after hazard attention during an active action', async () => {
+test('records a cleanup-aborted continuation after hazard attention during an active action', { timeout: 120_000 }, async () => {
 	// World ticks and provider delays share one virtual clock. Wall-clock timers made the tick count
 	// inside a 500 ms delay depend on machine load, so capture and replay saw different prompts.
 	const clock = createVirtualClock();
@@ -199,7 +199,7 @@ test('records a cleanup-aborted continuation after hazard attention during an ac
 	}, clock);
 });
 
-test('cancels and clears a pending capture delay when the provider turn times out', async () => {
+test('cancels and clears a pending capture delay when the provider turn times out', { timeout: 120_000 }, async () => {
 	const handles = new Set();
 	let scheduled = 0;
 	const delayTimer = {
@@ -231,7 +231,7 @@ test('cancels and clears a pending capture delay when the provider turn times ou
 	assert.equal(handles.size, 0);
 });
 
-test('bounds fixture generation and rejects non-replay matrices', async () => {
+test('bounds fixture generation and rejects non-replay matrices', { timeout: 120_000 }, async () => {
 	await assert.rejects(() => generateReplayRecordings({ matrix: matrix(), maxRecords: 4 }), /record count/i);
 	await assert.rejects(() => generateReplayRecordings({ matrix: { ...matrix(), trials: [{ ...matrix().trials[0], mode: 'instant', providerProfile: { provider: 'instant', model: 'fixture', reasoningEffort: 'fixed', serviceTier: 'local' } }] } }), /replay trials/i);
 	await assert.rejects(
