@@ -349,6 +349,7 @@ export class NativeToolRuntime {
 			if (this.#taskPlan === null) throw codedError('PLAN_UNAVAILABLE', 'Task planning view is unavailable');
 			return this.#taskPlan(record, request.tool);
 		}
+		if (request.tool.kind === 'crewkit_shop') return crewkitShop(request.tool);
 		if (request.tool.kind === 'inspect') return this.#inspect(request.tool, record);
 		if (request.tool.kind === 'capabilities') {
 			if (['program', 'control', 'strategy'].includes(request.tool.section)) return { ...minecraftCapabilities(request.tool), ...await this.#executionMetadata(record) };
@@ -1639,6 +1640,20 @@ function validateRecord(record) {
 		if (typeof record[field] !== 'string' || record[field].length === 0) throw new TypeError(`record.${field} must be nonblank`);
 	}
 	if (!Number.isSafeInteger(record.goalRevision) || record.goalRevision < 0) throw new TypeError('record.goalRevision must be a nonnegative safe integer');
+}
+
+// CrewKit Kitchen tool. The run happens server-side; the result carries status and ids only, never the Reap key or card data.
+async function crewkitShop(tool) {
+	const { getCrewkitController } = await import('./crewkit/service.mjs');
+	const controller = getCrewkitController();
+	if (tool.action === 'status') return { state: 'SUCCEEDED', reasonCode: 'CREWKIT_STATUS', active: controller.active, last: controller.last };
+	try {
+		const run = await controller.start(tool.brief, { mode: tool.mode ?? process.env.CREWKIT_AGENT_MODE ?? 'replay' });
+		return { state: 'SUCCEEDED', reasonCode: 'CREWKIT_STARTED', runId: run.runId,
+			message: 'Shopping run started. The kitchen shows every step; nothing is bought until a human approves on Reap. Use crewkit_shop status later instead of polling.' };
+	} catch (error) {
+		return { state: 'REJECTED', reasonCode: error.status === 409 ? 'CREWKIT_BUSY' : 'CREWKIT_INVALID', message: String(error.message).slice(0, 300) };
+	}
 }
 
 function validateRequest(request, record) {

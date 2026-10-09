@@ -176,6 +176,12 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 	tool('finish', 'Ask Minecraft to verify the immutable active goal. Read unmet facts on failure. If AWAITING_OPERATOR_CONFIRMATION, report once with say and end this turn until new input; do not repeat the work or verification. Waiting never blocks new player requests: act on them at once, then finish again.', objectSchema({
 		summary: { type: 'string', minLength: 1, maxLength: 512 },
 	}, ['summary'])),
+	// CrewKit Kitchen: the server runs the purchase, enforces the budget and requirements, and holds the Reap key. The model only starts it.
+	tool('crewkit_shop', 'CrewKit Kitchen: buy an event kit through Reap for an order ticket. start begins one run (search, quote, budget gate, hosted human approval); the kitchen shows every step and payment needs a human to approve on Reap. Omit brief to use the posted order ticket. status reports the latest run. You never see payment details.', objectSchema({
+		action: { type: 'string', enum: ['start', 'status'] },
+		mode: { type: 'string', enum: ['replay', 'simulate', 'live'] },
+		brief: { type: 'object' },
+	}, ['action'])),
 ]);
 
 export function normalizeMinecraftToolCall(name, value) {
@@ -439,6 +445,14 @@ function normalizeMinecraftToolArguments(name, value) {
 				kind: 'finish',
 				summary: boundedText(args.summary, 'summary', 512),
 			};
+		case 'crewkit_shop': {
+			requireExactKeys(args, ['action', 'mode', 'brief']);
+			if (!['start', 'status'].includes(args.action)) invalid('crewkit_shop action must be start or status');
+			if (args.mode !== undefined && !['replay', 'simulate', 'live'].includes(args.mode)) invalid('crewkit_shop mode must be replay, simulate or live');
+			if (args.brief !== undefined && (args.brief === null || typeof args.brief !== 'object' || Array.isArray(args.brief) || JSON.stringify(args.brief).length > 16_384)) invalid('crewkit_shop brief must be an object under 16 KB');
+			// The server validates the brief, enforces budget and requirements, and never returns the Reap key.
+			return { kind: 'crewkit_shop', action: args.action, ...(args.mode === undefined ? {} : { mode: args.mode }), ...(args.brief === undefined ? {} : { brief: structuredClone(args.brief) }) };
+		}
 		default:
 			throw codedError('UNKNOWN_MINECRAFT_TOOL', `Unknown Minecraft tool '${String(name)}'`);
 	}

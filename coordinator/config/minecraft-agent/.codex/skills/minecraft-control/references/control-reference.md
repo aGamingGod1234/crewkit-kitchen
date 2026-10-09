@@ -401,6 +401,14 @@ Ask Minecraft to verify the immutable active goal. A failed check keeps the goal
 {"tool":"finish","arguments":{"summary":"Crafted and collected the iron pickaxe."}}
 ```
 
+### crewkit_shop
+
+CrewKit Kitchen only. Start one server-run purchase of the posted order ticket through Reap, or read its status. The server enforces the budget and every mandatory quantity; payment waits for a human to approve on Reap's page. The result never contains payment details.
+
+```json executor-call
+{"tool":"crewkit_shop","arguments":{"action":"start"}}
+```
+
 ## Advanced action reference
 
 Call through act, startAction, or a sequence step. Optional fields may be omitted. Capabilities lists the current action contract.
