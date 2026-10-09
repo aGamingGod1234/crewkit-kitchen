@@ -63,7 +63,7 @@ public final class SetCommands {
 		int placed = SetBuilder.build(level, origin);
 		long ms = (System.nanoTime() - started) / 1_000_000L;
 		source.sendSuccess(() -> Component.literal("CrewKit kitchen built at " + origin.toShortString()
-				+ " (" + placed + " blocks, " + ms + " ms). Camera: ck_player marker, facing north."), true);
+				+ " (" + placed + " blocks, " + ms + " ms). Camera: ck_player anchor (14,5,19), facing north."), true);
 		return placed;
 	}
 

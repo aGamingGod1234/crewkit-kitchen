@@ -13,9 +13,6 @@ import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Entity;
-import net.minecraft.world.entity.EntitySpawnReason;
-import net.minecraft.world.entity.EntityType;
-import net.minecraft.world.entity.Marker;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
@@ -51,15 +48,6 @@ public final class SetBuilder {
 	// No neighbour/shape updates: we set every state explicitly (doors, panes, trapdoors), and no drops or container spills.
 	private static final int FLAGS = Block.UPDATE_CLIENTS | Block.UPDATE_KNOWN_SHAPE | Block.UPDATE_SUPPRESS_DROPS
 			| Block.UPDATE_SKIP_BLOCK_ENTITY_SIDEEFFECTS;
-
-	private static final Object[][] MARKERS = {
-			{"ck_budget", CrewkitAnchors.BUDGET},
-			{"ck_ledger", CrewkitAnchors.LEDGER},
-			{"ck_agent", CrewkitAnchors.AGENT},
-			{"ck_screen", CrewkitAnchors.SCREEN},
-			{"ck_crate", CrewkitAnchors.CRATE},
-			{"ck_player", CrewkitAnchors.PLAYER},
-	};
 
 	private SetBuilder() {
 	}
@@ -98,7 +86,9 @@ public final class SetBuilder {
 		// KitchenDecor puts sea lanterns in the west wall at (0,3,3..5); Exterior clears x=-1, so seal their backs.
 		for (int z = 3; z <= 5; z++) level.setBlock(origin.offset(-1, 3, z), Blocks.WHITE_CONCRETE.defaultBlockState(), FLAGS);
 		data.nextGeneration();
-		spawnMarkers(level);
+		// Anchors are computed from CrewkitAnchors; no marker entities (they showed as "Unnamed Marker" gizmos
+		// in editor mods). Clear any left by older builds.
+		killMarkers(level);
 		return placed;
 	}
 
@@ -146,7 +136,7 @@ public final class SetBuilder {
 		ServerLevel level = levelOf(server, data.dimension);
 		CrewkitAnchors.origin = data.origin;
 		new Placer(level, data.origin).doors(false);
-		if (countMarkers(level) < MARKERS.length) spawnMarkers(level);
+		killMarkers(level);
 	}
 
 	public static boolean isBuilt(MinecraftServer server) {
@@ -165,46 +155,9 @@ public final class SetBuilder {
 
 	// ---- markers ----
 
-	static String generationTag(int generation) {
-		return "ck_set_gen_" + generation;
-	}
-
-	/** Entity load hook: drop set markers from an older build (e.g. saved in a chunk that was unloaded at teardown). */
+	/** Entity load hook: drop anchor markers saved by older builds. The set no longer spawns any. */
 	static void discardIfStale(Entity entity, ServerLevel level) {
-		if (!entity.entityTags().contains(SET_TAG)) return;
-		SetSavedData data = SetSavedData.get(level.getServer());
-		if (!data.built || !entity.entityTags().contains(generationTag(data.generation))) {
-			level.getServer().execute(entity::discard);
-			return;
-		}
-		// resetDynamic runs at SERVER_STARTED, before saved entities load, and may respawn the anchors.
-		// When the saved copy loads later, keep exactly one marker per anchor tag.
-		String anchor = null;
-		for (Object[] row : MARKERS) if (entity.entityTags().contains((String) row[0])) anchor = (String) row[0];
-		if (anchor == null) return;
-		for (Entity other : level.getAllEntities()) {
-			if (other != entity && other.isAlive() && other.entityTags().contains(SET_TAG) && other.entityTags().contains(anchor)) {
-				level.getServer().execute(entity::discard);
-				return;
-			}
-		}
-	}
-
-	private static void spawnMarkers(ServerLevel level) {
-		killMarkers(level);
-		for (Object[] row : MARKERS) {
-			String tag = (String) row[0];
-			Vec3 pos = CrewkitAnchors.at((int[]) row[1]);
-			Marker marker = EntityType.MARKER.create(level, EntitySpawnReason.COMMAND);
-			if (marker == null) continue;
-			// ck_player is the demo camera: face north, 25 degrees down. Others face south (into the room).
-			boolean camera = tag.equals("ck_player");
-			marker.snapTo(pos.x, pos.y, pos.z, camera ? 180.0F : 0.0F, camera ? 25.0F : 0.0F);
-			marker.addTag(SET_TAG);
-			marker.addTag(tag);
-			marker.addTag(generationTag(SetSavedData.get(level.getServer()).generation));
-			level.addFreshEntity(marker);
-		}
+		if (entity.entityTags().contains(SET_TAG)) level.getServer().execute(entity::discard);
 	}
 
 	private static void killMarkers(ServerLevel level) {
@@ -213,14 +166,6 @@ public final class SetBuilder {
 			if (entity.entityTags().contains(SET_TAG)) doomed.add(entity);
 		}
 		doomed.forEach(Entity::discard);
-	}
-
-	private static int countMarkers(ServerLevel level) {
-		int count = 0;
-		for (Entity entity : level.getAllEntities()) {
-			if (entity.entityTags().contains(SET_TAG)) count++;
-		}
-		return count;
 	}
 
 	// ---- volume helpers ----
