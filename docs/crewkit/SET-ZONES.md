@@ -49,7 +49,7 @@ The text sits inside those rectangles, including the timer and calls at about y 
 - **East pantry x=26, z 2..3, y 1..3.** East back-of-house x 16..25, z 2..4: y=1 only.
 - **Table dressing:** you may replace the carpet in the middle cells of each table (A: x 5..6, B: x 13..14, C: x 21..22, D: x 9..10, E: x 17..18; both z rows) with candles or flower pots at y=2. The slab top under them is at y=2.0. Seat-end cells keep their carpet for plates.
 - **West sideboard:** x=1, z 18..20, y 1..2. Nothing at y≥3 there, because the banner is at y=6.
-- **Walking paths. Keep clear at y 1..2:** chef path x 2..15, z 5..7. Corridor x 2..25, z 9..10 (x 2..15 at z=9 is free). Aisles x 9..10 and x 17..18 at z 11..14. Centre aisle x 12..15, z 15..20. Bag drop x 24..25, z 5..6.
+- **Walking paths. Keep clear at y 1..2:** chef path x 2..15, z 5..7. Corridor x 2..25, z 9..10 (z=9, x 2..15 holds the thin spruce frontage panels of the pass, so treat it as occupied). Aisles x 9..10 and x 17..18 at z 11..14. Centre aisle x 12..15, z 15..20. Bag drop x 24..25, z 5..6.
 
 ## Left for Exterior
 

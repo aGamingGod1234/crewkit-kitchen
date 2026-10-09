@@ -28,21 +28,26 @@ import net.minecraft.world.level.block.state.properties.SlabType;
 import net.minecraft.world.phys.Vec3;
 
 /**
- * Places the CrewKit kitchen set procedurally at {@link CrewkitAnchors#origin}, from docs/crewkit/kitchen-layout.html.
- * Relative coords: x east 0..27, z south 0..21, floor at y=0, ceiling at y=7. The south face is open for the camera.
+ * Places the CrewKit kitchen shell procedurally at {@link CrewkitAnchors#origin}; zones in docs/crewkit/SET-ZONES.md.
+ * Relative coords: x east 0..27, z south 0..21, floor at y=0, beams at y=7, ceiling panels at y=8. South face open.
+ * After the shell, {@link KitchenDecor} and {@link Exterior} dress it.
  */
 public final class SetBuilder {
 	public static final int WIDTH = 28;
 	public static final int DEPTH = 22;
+	/** Beam level; the coffered ceiling panels sit one above at {@link #ROOF}. */
 	public static final int CEILING = 7;
-	/** Foundation layer under the floor; part of the snapshot volume. */
+	public static final int ROOF = 8;
+	/** Foundation layer under the floor. */
 	static final int MIN_Y = -1;
+	/** Teardown snapshot box (relative): the footprint plus 6 blocks east, west and north for the exterior. */
+	static final int[] VOLUME = {-6, MIN_Y, -6, WIDTH - 1 + 6, 14, DEPTH - 1};
 	/** Top surface of the table cloths (carpet on a top slab), relative to origin y. Plates sit here. */
 	public static final double TABLE_TOP_Y = 2.0625;
 	/** Entity tag on every marker this track spawns. Deliberately not "crewkit" so /crewkit reset keeps the anchors. */
 	public static final String SET_TAG = "ck_set";
 
-	// No neighbour/shape updates: we set every state explicitly (doors, lanterns, chains), and no drops or container spills.
+	// No neighbour/shape updates: we set every state explicitly (doors, panes, trapdoors), and no drops or container spills.
 	private static final int FLAGS = Block.UPDATE_CLIENTS | Block.UPDATE_KNOWN_SHAPE | Block.UPDATE_SUPPRESS_DROPS
 			| Block.UPDATE_SKIP_BLOCK_ENTITY_SIDEEFFECTS;
 
@@ -68,48 +73,66 @@ public final class SetBuilder {
 
 		List<BlockState> palette = data.palette;
 		int[] snapshot = data.snapshot;
-		if (!sameSpot || !data.hasSnapshot()) {
+		int[] bounds = data.bounds;
+		// Re-snapshot on a new spot, or when an older save used a smaller box (rebuilding in place would otherwise lose the margin).
+		if (!sameSpot || !data.hasSnapshot() || !java.util.Arrays.equals(bounds, VOLUME)) {
+			if (sameSpot && data.built && data.hasSnapshot()) restore(level, origin, data);
 			Map<BlockState, Integer> index = new HashMap<>();
 			List<BlockState> states = new ArrayList<>();
-			int[] packed = new int[WIDTH * DEPTH * (CEILING - MIN_Y + 1)];
-			forVolume((x, y, z, i) -> packed[i] = index.computeIfAbsent(level.getBlockState(origin.offset(x, y, z)), state -> {
+			int[] packed = new int[volumeSize(VOLUME)];
+			forVolume(VOLUME, (x, y, z, i) -> packed[i] = index.computeIfAbsent(level.getBlockState(origin.offset(x, y, z)), state -> {
 				states.add(state);
 				return states.size() - 1;
 			}));
 			palette = states;
 			snapshot = packed;
+			bounds = VOLUME;
 		}
 
 		CrewkitAnchors.origin = origin.immutable();
-		data.update(origin.immutable(), dimension, true, palette, snapshot);
+		data.update(origin.immutable(), dimension, true, palette, snapshot, bounds);
 		int placed = new Placer(level, origin).placeAll();
+		KitchenDecor.place(level, origin.immutable());
+		Exterior.place(level, origin.immutable());
 		data.nextGeneration();
 		spawnMarkers(level);
 		return placed;
 	}
 
-	/** Removes the set: restores the terrain snapshot (or air if none) and kills the anchor markers. */
+	/** Removes the set: restores the terrain snapshot (or air over the footprint if none) and kills the anchor markers. */
 	public static boolean teardown(MinecraftServer server) {
 		SetSavedData data = SetSavedData.get(server);
 		if (data.origin == null) return false;
 		ServerLevel level = levelOf(server, data.dimension);
 		BlockPos origin = data.origin;
 		killMarkers(level);
-		boolean restore = data.hasSnapshot();
-		List<BlockState> palette = data.palette;
-		int[] snapshot = data.snapshot;
-		// clear top-down first so hanging/attached blocks never pop
-		for (int y = CEILING; y >= MIN_Y; y--) {
-			for (int z = 0; z < DEPTH; z++) {
-				for (int x = 0; x < WIDTH; x++) {
-					BlockState state = restore ? palette.get(snapshot[index(x, y, z)]) : (y < 0 ? null : Blocks.AIR.defaultBlockState());
-					if (state != null) level.setBlock(origin.offset(x, y, z), state, FLAGS);
+		if (data.hasSnapshot()) {
+			restore(level, origin, data);
+		} else {
+			for (int y = ROOF; y >= 0; y--) {
+				for (int z = 0; z < DEPTH; z++) {
+					for (int x = 0; x < WIDTH; x++) level.setBlock(origin.offset(x, y, z), Blocks.AIR.defaultBlockState(), FLAGS);
 				}
 			}
 		}
-		data.update(origin, data.dimension, false, List.of(), new int[0]);
+		data.update(origin, data.dimension, false, List.of(), new int[0], VOLUME);
 		data.nextGeneration(); // markers left in unloaded chunks become stale
 		return true;
+	}
+
+	private static void restore(ServerLevel level, BlockPos origin, SetSavedData data) {
+		int[] b = data.bounds;
+		if (data.snapshot.length != volumeSize(b)) return;
+		List<BlockState> palette = data.palette;
+		int[] snapshot = data.snapshot;
+		// top-down so hanging/attached blocks never pop
+		for (int y = b[4]; y >= b[1]; y--) {
+			for (int z = b[2]; z <= b[5]; z++) {
+				for (int x = b[0]; x <= b[3]; x++) {
+					level.setBlock(origin.offset(x, y, z), palette.get(snapshot[index(b, x, y, z)]), FLAGS);
+				}
+			}
+		}
 	}
 
 	/** Hook for the core /crewkit reset. Static blocks stay; re-close the delivery door and make sure anchors exist. */
@@ -118,7 +141,7 @@ public final class SetBuilder {
 		if (!data.built || data.origin == null) return;
 		ServerLevel level = levelOf(server, data.dimension);
 		CrewkitAnchors.origin = data.origin;
-		new Placer(level, data.origin).deliveryDoor(false);
+		new Placer(level, data.origin).doors(false);
 		if (countMarkers(level) < MARKERS.length) spawnMarkers(level);
 	}
 
@@ -189,23 +212,37 @@ public final class SetBuilder {
 		void visit(int x, int y, int z, int index);
 	}
 
-	private static void forVolume(VolumeVisitor visitor) {
-		for (int y = MIN_Y; y <= CEILING; y++) {
-			for (int z = 0; z < DEPTH; z++) {
-				for (int x = 0; x < WIDTH; x++) {
-					visitor.visit(x, y, z, index(x, y, z));
+	private static void forVolume(int[] b, VolumeVisitor visitor) {
+		for (int y = b[1]; y <= b[4]; y++) {
+			for (int z = b[2]; z <= b[5]; z++) {
+				for (int x = b[0]; x <= b[3]; x++) {
+					visitor.visit(x, y, z, index(b, x, y, z));
 				}
 			}
 		}
 	}
 
-	private static int index(int x, int y, int z) {
-		return ((y - MIN_Y) * DEPTH + z) * WIDTH + x;
+	private static int volumeSize(int[] b) {
+		return (b[3] - b[0] + 1) * (b[4] - b[1] + 1) * (b[5] - b[2] + 1);
 	}
 
-	// ---- the set itself ----
+	private static int index(int[] b, int x, int y, int z) {
+		int w = b[3] - b[0] + 1;
+		int d = b[5] - b[2] + 1;
+		return ((y - b[1]) * d + (z - b[2])) * w + (x - b[0]);
+	}
+
+	// ---- the shell ----
 
 	private static final class Placer {
+		// Back-wall pillars frame the boards; side pillars bracket the window bays.
+		private static final int[][] PILLARS = {{1, 1}, {11, 1}, {15, 1}, {1, 11}, {1, 17}, {1, 21}, {26, 11}, {26, 17}, {26, 21}};
+		private static final int[] BEAMS_Z = {1, 5, 9, 13, 17, 21};
+		private static final int[] BEAMS_X = {1, 5, 9, 13, 14, 18, 22, 26};
+		private static final int[] COFFER_X = {3, 7, 11, 16, 20, 24};
+		private static final int[] COFFER_Z = {3, 7, 11, 15, 19};
+		private static final int[][] TABLES = {{4, 12}, {12, 12}, {20, 12}, {8, 16}, {16, 16}};
+
 		private final Level level;
 		private final BlockPos origin;
 		private int placed;
@@ -232,87 +269,139 @@ public final class SetBuilder {
 			fill(x0, y0, z0, x1, y1, z1, block.defaultBlockState());
 		}
 
-		boolean isAir(int x, int y, int z) {
-			return level.getBlockState(origin.offset(x, y, z)).isAir();
-		}
-
 		int placeAll() {
 			shell();
+			ceiling();
+			pillars();
 			boards();
-			counterLine();
+			windowsAndWainscot();
+			counterBase();
 			pass();
-			deliveryDoor(false);
+			deliveryDoor();
 			tables();
-			lanterns();
-			decor();
-			hiddenLights();
+			fillLights();
 			return placed;
 		}
 
 		private void shell() {
-			fill(0, 1, 0, WIDTH - 1, CEILING - 1, DEPTH - 1, Blocks.AIR);
+			fill(0, 1, 0, WIDTH - 1, ROOF, DEPTH - 1, Blocks.AIR);
 			fill(0, MIN_Y, 0, WIDTH - 1, MIN_Y, DEPTH - 1, Blocks.SMOOTH_STONE);
-			// Floor: white border, checkered tiles in the kitchen, polished deepslate in the dining room.
+			// Floor: quartz border; light polished tuff in the kitchen, glossy polished blackstone in the dining room.
 			for (int z = 0; z < DEPTH; z++) {
 				for (int x = 0; x < WIDTH; x++) {
 					Block floor;
-					if (x <= 1 || x >= WIDTH - 2 || z <= 1 || z >= DEPTH - 2) floor = Blocks.WHITE_CONCRETE;
-					else if (z <= 9) floor = ((x + z) & 1) == 0 ? Blocks.DEEPSLATE_TILES : Blocks.POLISHED_DEEPSLATE;
-					else floor = Blocks.POLISHED_DEEPSLATE;
+					if (x <= 1 || x >= WIDTH - 2 || z <= 1 || z >= DEPTH - 2 || z == 10) floor = Blocks.SMOOTH_QUARTZ;
+					else if (z <= 9) floor = Blocks.POLISHED_TUFF;
+					else floor = Blocks.POLISHED_BLACKSTONE;
 					set(x, 0, z, floor);
 				}
 			}
-			// Line between kitchen and dining room.
-			fill(2, 0, 10, WIDTH - 3, 0, 10, Blocks.SMOOTH_QUARTZ);
-			// Walls (back + sides), ceiling. South is open.
-			fill(0, 1, 0, WIDTH - 1, CEILING - 1, 0, Blocks.WHITE_CONCRETE);
-			fill(0, 1, 0, 0, CEILING - 1, DEPTH - 1, Blocks.WHITE_CONCRETE);
-			fill(WIDTH - 1, 1, 0, WIDTH - 1, CEILING - 1, DEPTH - 1, Blocks.WHITE_CONCRETE);
-			fill(0, CEILING, 0, WIDTH - 1, CEILING, DEPTH - 1, Blocks.WHITE_CONCRETE);
-			// Quartz pillars standing proud of the walls; back ones frame the two boards.
-			int[][] pillars = {{1, 1}, {11, 1}, {15, 1}, {26, 1}, {1, 11}, {26, 11}, {1, 21}, {26, 21}};
-			for (int[] p : pillars) fill(p[0], 1, p[1], p[0], CEILING - 1, p[1], Blocks.QUARTZ_PILLAR);
-			// Crown moulding: upside-down quartz stairs along the top of the walls.
-			for (int x = 2; x <= WIDTH - 3; x++) {
-				if (x == 11 || x == 15) continue;
-				set(x, CEILING - 1, 1, stairs(Blocks.SMOOTH_QUARTZ_STAIRS, Direction.NORTH, Half.TOP));
+			// Blue runner down the centre aisle toward the camera.
+			fill(13, 1, 15, 14, 1, DEPTH - 2, Blocks.BLUE_CARPET);
+			// Walls (back + sides) up to the roof so the coffers are sealed; south is open.
+			fill(0, 1, 0, WIDTH - 1, ROOF, 0, Blocks.WHITE_CONCRETE);
+			fill(0, 1, 0, 0, ROOF, DEPTH - 1, Blocks.WHITE_CONCRETE);
+			fill(WIDTH - 1, 1, 0, WIDTH - 1, ROOF, DEPTH - 1, Blocks.WHITE_CONCRETE);
+			// Front corner plants (plain azalea, no magenta).
+			set(2, 1, DEPTH - 1, Blocks.AZALEA);
+			set(WIDTH - 3, 1, DEPTH - 1, Blocks.AZALEA);
+		}
+
+		private void ceiling() {
+			// Coffered ceiling: white terracotta panels at y=8, stripped spruce beams at y=7, a lit copper bulb per coffer.
+			fill(1, ROOF, 1, WIDTH - 2, ROOF, DEPTH - 1, Blocks.WHITE_TERRACOTTA);
+			BlockState alongX = Blocks.STRIPPED_SPRUCE_LOG.defaultBlockState().setValue(BlockStateProperties.AXIS, Direction.Axis.X);
+			BlockState alongZ = Blocks.STRIPPED_SPRUCE_LOG.defaultBlockState().setValue(BlockStateProperties.AXIS, Direction.Axis.Z);
+			for (int z : BEAMS_Z) fill(1, CEILING, z, WIDTH - 2, CEILING, z, alongX);
+			for (int x : BEAMS_X) {
+				for (int z = 1; z < DEPTH; z++) {
+					boolean crossing = false;
+					for (int bz : BEAMS_Z) crossing |= bz == z;
+					if (!crossing) set(x, CEILING, z, alongZ);
+				}
 			}
-			for (int z = 2; z <= DEPTH - 1; z++) {
-				if (z == 11 || z == 21) continue;
-				set(1, CEILING - 1, z, stairs(Blocks.SMOOTH_QUARTZ_STAIRS, Direction.WEST, Half.TOP));
-				set(WIDTH - 2, CEILING - 1, z, stairs(Blocks.SMOOTH_QUARTZ_STAIRS, Direction.EAST, Half.TOP));
+			BlockState bulb = Blocks.WAXED_COPPER_BULB.defaultBlockState().setValue(BlockStateProperties.LIT, true);
+			for (int x : COFFER_X) for (int z : COFFER_Z) set(x, ROOF, z, bulb);
+		}
+
+		private void pillars() {
+			for (int[] p : PILLARS) {
+				set(p[0], 1, p[1], Blocks.CHISELED_QUARTZ_BLOCK);
+				fill(p[0], 2, p[1], p[0], 5, p[1], Blocks.QUARTZ_PILLAR);
+				set(p[0], 6, p[1], Blocks.CHISELED_QUARTZ_BLOCK);
 			}
+			// Crown moulding on the side walls (none on the back wall: it would cover the board displays).
+			for (int z = 2; z <= DEPTH - 2; z++) {
+				if (z == 11 || z == 17 || z == 19) continue;
+				set(1, 6, z, stairs(Blocks.SMOOTH_QUARTZ_STAIRS, Direction.WEST, Half.TOP));
+				set(WIDTH - 2, 6, z, stairs(Blocks.SMOOTH_QUARTZ_STAIRS, Direction.EAST, Half.TOP));
+			}
+			// Brand-blue banners above the sideboard and the east wainscot.
+			set(1, 6, 19, Blocks.BLUE_WALL_BANNER.defaultBlockState().setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.EAST));
+			set(WIDTH - 2, 6, 19, Blocks.BLUE_WALL_BANNER.defaultBlockState().setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.WEST));
 		}
 
 		private void boards() {
-			// Budget board (ck_budget 6,4,0): blue panel over a lapis ledge, x 2..10.
-			fill(2, 2, 0, 10, 2, 0, Blocks.LAPIS_BLOCK);
-			fill(2, 3, 0, 10, 5, 0, Blocks.BLUE_CONCRETE);
-			// Bill board (ck_ledger 21,4,0): black panel x 16..25, 5 rows tall.
-			fill(16, 1, 0, 25, 5, 0, Blocks.BLACK_CONCRETE);
+			// BoardsFeature draws display panels at z=1.05 over budget x 2..11 / y 1.8..6.7 and bill x 16.5..26.5 / y 1.6..6.7.
+			// Backings sit in the wall; frames stay outside those rectangles (logs in the wall plane, thin lips at z=1).
+			BlockState logX = Blocks.DARK_OAK_LOG.defaultBlockState().setValue(BlockStateProperties.AXIS, Direction.Axis.X);
+			fill(2, 2, 0, 10, 6, 0, Blocks.BLUE_CONCRETE);
+			fill(2, 1, 0, 10, 1, 0, logX);
+			fill(2, 7, 0, 10, 7, 0, logX);
+			fill(16, 2, 0, 25, 6, 0, Blocks.BLACK_CONCRETE);
+			fill(16, 1, 0, 25, 1, 0, logX);
+			fill(16, 7, 0, 25, 7, 0, logX);
+			fill(26, 1, 0, 26, 7, 0, Blocks.DARK_OAK_LOG);
+			BlockState sill = Blocks.DARK_OAK_SLAB.defaultBlockState().setValue(BlockStateProperties.SLAB_TYPE, SlabType.BOTTOM);
+			BlockState lip = Blocks.DARK_OAK_TRAPDOOR.defaultBlockState().setValue(BlockStateProperties.HALF, Half.TOP);
+			fill(2, 1, 1, 10, 1, 1, sill);
+			fill(16, 1, 1, 25, 1, 1, sill);
+			fill(2, 6, 1, 10, 6, 1, lip);
+			fill(16, 6, 1, 25, 6, 1, lip);
 		}
 
-		private void counterLine() {
-			// Back row z=3: smooth stone, barrel and crafting table at the ends.
-			fill(2, 1, 3, 13, 1, 3, Blocks.SMOOTH_STONE);
-			set(2, 1, 3, Blocks.BARREL.defaultBlockState().setValue(BlockStateProperties.FACING, Direction.UP));
-			set(13, 1, 3, Blocks.CRAFTING_TABLE);
-			// Front row z=4: polished andesite worktop with the stove (furnace) between two smokers, lit, facing the room.
-			fill(2, 1, 4, 13, 1, 4, Blocks.POLISHED_ANDESITE);
-			set(5, 1, 4, lit(Blocks.SMOKER));
-			set(6, 1, 4, lit(Blocks.FURNACE));
-			set(7, 1, 4, lit(Blocks.SMOKER));
-			// Props on the back row.
-			set(3, 2, 3, Blocks.BREWING_STAND);
-			set(6, 2, 3, Blocks.CAULDRON);
-			set(9, 2, 3, Blocks.POTTED_FERN);
-			set(12, 2, 3, Blocks.DECORATED_POT);
-			set(13, 2, 4, Blocks.POTTED_RED_TULIP);
+		private void windowsAndWainscot() {
+			BlockState pane = Blocks.GLASS_PANE.defaultBlockState()
+					.setValue(BlockStateProperties.NORTH, true)
+					.setValue(BlockStateProperties.SOUTH, true);
+			BlockState header = Blocks.STRIPPED_SPRUCE_LOG.defaultBlockState().setValue(BlockStateProperties.AXIS, Direction.Axis.Z);
+			for (int x : new int[] {0, WIDTH - 1}) {
+				for (int z = 12; z <= 16; z++) {
+					fill(x, 3, z, x, 5, z, z == 14 ? Blocks.STRIPPED_SPRUCE_LOG.defaultBlockState() : pane);
+					set(x, 6, z, header);
+				}
+			}
+			BlockState cap = Blocks.SPRUCE_TRAPDOOR.defaultBlockState().setValue(BlockStateProperties.HALF, Half.BOTTOM);
+			int[][] runs = {{1, 12, 16}, {WIDTH - 2, 12, 16}, {WIDTH - 2, 18, 20}};
+			for (int[] r : runs) {
+				fill(r[0], 1, r[1], r[0], 2, r[2], Blocks.STRIPPED_SPRUCE_WOOD);
+				fill(r[0], 3, r[1], r[0], 3, r[2], cap);
+			}
+		}
+
+		private void counterBase() {
+			// Two-deep counter x 2..14; the stove group (smoker, furnace, smoker) sits under the hood bay x 12..14.
+			fill(2, 1, 3, 14, 1, 3, Blocks.SMOOTH_STONE);
+			fill(2, 1, 4, 14, 1, 4, Blocks.POLISHED_ANDESITE);
+			set(12, 1, 4, lit(Blocks.SMOKER));
+			set(13, 1, 4, lit(Blocks.FURNACE));
+			set(14, 1, 4, lit(Blocks.SMOKER));
 		}
 
 		private void pass() {
-			// The pass (ck_screen 9,2,8): birch counter with a ticket rail (chain between two posts).
-			fill(2, 1, 8, 15, 1, 8, Blocks.BIRCH_PLANKS);
+			// The pass (ck_screen 9,2,8): smooth quartz top at y=2.0, spruce frontage panels, two recessed barrels.
+			fill(2, 1, 8, 15, 1, 8, Blocks.SMOOTH_QUARTZ);
+			BlockState barrel = Blocks.BARREL.defaultBlockState().setValue(BlockStateProperties.FACING, Direction.SOUTH);
+			set(4, 1, 8, barrel);
+			set(13, 1, 8, barrel);
+			// Open trapdoor facing south = panel on the north edge of its cell, flush against the pass.
+			BlockState front = Blocks.SPRUCE_TRAPDOOR.defaultBlockState()
+					.setValue(BlockStateProperties.OPEN, true)
+					.setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.SOUTH);
+			for (int x = 2; x <= 15; x++) {
+				if (x != 4 && x != 13) set(x, 1, 9, front);
+			}
+			// Ticket rail: chain between two spruce posts.
 			fill(2, 2, 8, 2, 3, 8, Blocks.SPRUCE_FENCE);
 			fill(15, 2, 8, 15, 3, 8, Blocks.SPRUCE_FENCE);
 			for (int x = 3; x <= 14; x++) {
@@ -320,11 +409,25 @@ public final class SetBuilder {
 			}
 		}
 
-		void deliveryDoor(boolean open) {
-			// East wall, z 4..7: orange frame, spruce double door at z=5,6 (2 tall).
-			fill(WIDTH - 1, 1, 4, WIDTH - 1, 3, 4, Blocks.ORANGE_TERRACOTTA);
-			fill(WIDTH - 1, 1, 7, WIDTH - 1, 3, 7, Blocks.ORANGE_TERRACOTTA);
-			fill(WIDTH - 1, 3, 5, WIDTH - 1, 3, 6, Blocks.ORANGE_TERRACOTTA);
+		private void deliveryDoor() {
+			// East wall, z 4..7: stripped dark oak frame, stone brick threshold, spruce double door at z=5,6.
+			fill(WIDTH - 1, 1, 4, WIDTH - 1, 3, 4, Blocks.STRIPPED_DARK_OAK_LOG);
+			fill(WIDTH - 1, 1, 7, WIDTH - 1, 3, 7, Blocks.STRIPPED_DARK_OAK_LOG);
+			fill(WIDTH - 1, 3, 5, WIDTH - 1, 3, 6,
+					Blocks.STRIPPED_DARK_OAK_LOG.defaultBlockState().setValue(BlockStateProperties.AXIS, Direction.Axis.Z));
+			fill(WIDTH - 2, 0, 5, WIDTH - 1, 0, 6, Blocks.STONE_BRICKS);
+			doors(false);
+			// Lantern over the door on a short chain from the ceiling beam (outside every board sightline).
+			fill(WIDTH - 2, 5, 5, WIDTH - 2, 6, 5, Blocks.IRON_CHAIN.defaultBlockState().setValue(BlockStateProperties.AXIS, Direction.Axis.Y));
+			set(WIDTH - 2, 4, 5, Blocks.LANTERN.defaultBlockState().setValue(BlockStateProperties.HANGING, true));
+			// Compact delivery stack south of the bag drop.
+			BlockState barrel = Blocks.BARREL.defaultBlockState().setValue(BlockStateProperties.FACING, Direction.UP);
+			set(WIDTH - 2, 1, 8, barrel);
+			set(WIDTH - 2, 2, 8, barrel);
+			set(WIDTH - 2, 1, 9, barrel);
+		}
+
+		void doors(boolean open) {
 			door(WIDTH - 1, 5, DoorHingeSide.LEFT, open);
 			door(WIDTH - 1, 6, DoorHingeSide.RIGHT, open);
 		}
@@ -339,61 +442,29 @@ public final class SetBuilder {
 		}
 
 		private void tables() {
-			// Tables A, B, C (4x2) and D, E spares: dark oak top slab with a white cloth.
-			int[][] tables = {{4, 12}, {12, 12}, {20, 12}, {8, 16}, {16, 16}};
-			for (int[] t : tables) {
+			// Tables A, B, C (4x2) and D, E spares: dark oak top slab with a white cloth (surface = TABLE_TOP_Y).
+			for (int[] t : TABLES) {
 				fill(t[0], 1, t[1], t[0] + 3, 1, t[1] + 1,
 						Blocks.DARK_OAK_SLAB.defaultBlockState().setValue(BlockStateProperties.SLAB_TYPE, SlabType.TOP));
 				fill(t[0], 2, t[1], t[0] + 3, 2, t[1] + 1, Blocks.WHITE_CARPET);
 			}
-			// Seats from CrewkitAnchors.SEATS. facing 0 = sitter faces south, so the stair back points north.
+			// Seats from CrewkitAnchors.SEATS: spruce stair plus a trapdoor backrest behind the sitter.
+			// facing 0 = sitter faces south (stair back north); an open trapdoor facing F has its panel on the side opposite F.
 			for (double[] seat : CrewkitAnchors.SEATS) {
 				int x = (int) Math.floor(seat[0]);
 				int z = (int) Math.floor(seat[1]);
-				Direction back = seat[2] == 0 ? Direction.NORTH : Direction.SOUTH;
-				set(x, 1, z, stairs(Blocks.SPRUCE_STAIRS, back, Half.BOTTOM));
+				Direction faces = seat[2] == 0 ? Direction.SOUTH : Direction.NORTH;
+				set(x, 1, z, stairs(Blocks.SPRUCE_STAIRS, faces.getOpposite(), Half.BOTTOM));
+				set(x, 2, z, Blocks.SPRUCE_TRAPDOOR.defaultBlockState()
+						.setValue(BlockStateProperties.OPEN, true)
+						.setValue(BlockStateProperties.HORIZONTAL_FACING, faces));
 			}
 		}
 
-		private void lanterns() {
-			// Kept out of the camera's sight lines to the two boards: along the side walls and over B, D, E.
-			int[][] chained = {{2, 6}, {2, 12}, {2, 18}, {25, 9}, {25, 13}, {25, 18}, {10, 17}, {18, 17}};
-			for (int[] l : chained) {
-				set(l[0], CEILING - 1, l[1], Blocks.IRON_CHAIN.defaultBlockState().setValue(BlockStateProperties.AXIS, Direction.Axis.Y));
-				set(l[0], CEILING - 2, l[1], hangingLantern());
-			}
-			set(13, CEILING - 1, 13, hangingLantern());
-			set(14, CEILING - 1, 13, hangingLantern());
-		}
-
-		private void decor() {
-			// Delivery corner: barrels stacked by the door, bag drop at ck_crate (25,1,6) stays clear.
-			BlockState barrel = Blocks.BARREL.defaultBlockState().setValue(BlockStateProperties.FACING, Direction.UP);
-			set(26, 1, 8, barrel);
-			set(26, 2, 8, barrel);
-			set(26, 1, 9, barrel);
-			set(26, 1, 3, Blocks.HAY_BLOCK);
-			set(26, 1, 2, barrel);
-			// Plants at the corners of the dining room.
-			set(2, 1, 10, Blocks.FLOWERING_AZALEA);
-			set(25, 1, 11, Blocks.FLOWERING_AZALEA);
-			set(2, 1, 20, Blocks.AZALEA);
-			set(25, 1, 20, Blocks.AZALEA);
-			// Pantry corner behind the counter.
-			set(14, 1, 2, barrel);
-			set(14, 1, 3, Blocks.SMOKER.defaultBlockState().setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.SOUTH));
-			set(1, 1, 2, Blocks.COMPOSTER);
-		}
-
-		private void hiddenLights() {
-			// Invisible light blocks: a ceiling grid plus a lower grid so faces get even light from every side.
-			BlockState light = Blocks.LIGHT.defaultBlockState().setValue(BlockStateProperties.LEVEL, 15);
-			for (int z = 2; z <= DEPTH - 1; z += 3) {
-				for (int x = 2; x <= WIDTH - 3; x += 3) {
-					if (isAir(x, CEILING - 1, z)) set(x, CEILING - 1, z, light);
-					if (z >= 5 && isAir(x, 3, z)) set(x, 3, z, light);
-				}
-			}
+		private void fillLights() {
+			// The bulbs do the real lighting (shaders cast proper shadows); a soft front fill keeps faces toward the camera readable.
+			BlockState fill = Blocks.LIGHT.defaultBlockState().setValue(BlockStateProperties.LEVEL, 9);
+			for (int x : new int[] {4, 10, 17, 23}) set(x, 4, 19, fill);
 		}
 
 		private static BlockState stairs(Block block, Direction facing, Half half) {
@@ -406,10 +477,6 @@ public final class SetBuilder {
 			return block.defaultBlockState()
 					.setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.SOUTH)
 					.setValue(BlockStateProperties.LIT, true);
-		}
-
-		private static BlockState hangingLantern() {
-			return Blocks.LANTERN.defaultBlockState().setValue(BlockStateProperties.HANGING, true);
 		}
 	}
 }

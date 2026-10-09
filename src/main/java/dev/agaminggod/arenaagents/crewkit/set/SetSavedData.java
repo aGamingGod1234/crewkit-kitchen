@@ -19,6 +19,8 @@ import net.minecraft.world.level.saveddata.SavedDataType;
  * snapshot of the terrain the set replaced, so teardown can put the world back.
  */
 public final class SetSavedData extends SavedData {
+	/** Snapshot box relative to origin: minX, minY, minZ, maxX, maxY, maxZ. v1 saves had no field and used this box. */
+	static final int[] V1_BOUNDS = {0, -1, 0, 27, 7, 21};
 	private static final Codec<int[]> INT_ARRAY = Codec.INT_STREAM.xmap(IntStream::toArray, Arrays::stream);
 	private static final Codec<SetSavedData> CODEC = RecordCodecBuilder.create(instance -> instance.group(
 			BlockPos.CODEC.optionalFieldOf("origin").forGetter(data -> Optional.ofNullable(data.origin)),
@@ -26,7 +28,8 @@ public final class SetSavedData extends SavedData {
 			Codec.BOOL.optionalFieldOf("built", false).forGetter(data -> data.built),
 			BlockState.CODEC.listOf().optionalFieldOf("snapshot_palette", List.of()).forGetter(data -> data.palette),
 			INT_ARRAY.optionalFieldOf("snapshot", new int[0]).forGetter(data -> data.snapshot),
-			Codec.INT.optionalFieldOf("generation", 0).forGetter(data -> data.generation)
+			Codec.INT.optionalFieldOf("generation", 0).forGetter(data -> data.generation),
+			INT_ARRAY.optionalFieldOf("snapshot_bounds", V1_BOUNDS).forGetter(data -> data.bounds)
 	).apply(instance, SetSavedData::new));
 	public static final SavedDataType<SetSavedData> TYPE = new SavedDataType<>(
 			Identifier.fromNamespaceAndPath("arenaagents", "crewkit_set"),
@@ -42,11 +45,13 @@ public final class SetSavedData extends SavedData {
 	int[] snapshot = new int[0];
 	/** Bumped on every build; markers carry it so stale ones from unloaded chunks can be dropped on load. */
 	int generation;
+	int[] bounds = V1_BOUNDS;
 
 	public SetSavedData() {
 	}
 
-	private SetSavedData(Optional<BlockPos> origin, String dimension, boolean built, List<BlockState> palette, int[] snapshot, int generation) {
+	private SetSavedData(Optional<BlockPos> origin, String dimension, boolean built, List<BlockState> palette, int[] snapshot, int generation, int[] bounds) {
+		this.bounds = bounds.length == 6 ? bounds : V1_BOUNDS;
 		this.origin = origin.orElse(null);
 		this.generation = generation;
 		this.dimension = dimension;
@@ -67,7 +72,8 @@ public final class SetSavedData extends SavedData {
 		return snapshot.length > 0 && !palette.isEmpty();
 	}
 
-	void update(BlockPos origin, String dimension, boolean built, List<BlockState> palette, int[] snapshot) {
+	void update(BlockPos origin, String dimension, boolean built, List<BlockState> palette, int[] snapshot, int[] bounds) {
+		this.bounds = bounds;
 		this.origin = origin;
 		this.dimension = dimension;
 		this.built = built;
