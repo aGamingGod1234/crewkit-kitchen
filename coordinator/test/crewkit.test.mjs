@@ -296,3 +296,33 @@ test('finding 3: checkout idempotency key is persisted per quote before sending 
     if (saved.state === undefined) delete process.env.CREWKIT_STATE_FILE; else process.env.CREWKIT_STATE_FILE = saved.state;
   }
 });
+
+test('sold-out line: probes each line, swaps that need to an in-stock product, shows item_removed why sold_out', async () => {
+  const t = structuredClone(tape);
+  const first = t.entries.findIndex((e) => e.op === 'createQuote');
+  const okProbe = { op: 'createQuote', key: '', ms: 0, response: structuredClone(t.entries[first].response) };
+  const soldOut = { op: 'createQuote', key: '', ms: 0, error: { status: 409, code: 'VARIANT_UNAVAILABLE', message: 'The selected item is sold out.', detail: null } };
+  // full quote fails; probes: badge ok, notebook sold out, pen/cable/sticky/markers ok; first notebook substitute ok
+  t.entries.splice(first, 0, soldOut, okProbe, soldOut, okProbe, okProbe, okProbe, okProbe, okProbe);
+  const { r, events } = await run(t);
+  assert.equal(r.status, 'COMPLETED');
+  const removed = events.filter((e) => e.event === 'item_removed');
+  assert.deepEqual([removed[0].data.id, removed[0].data.why], ['notebook', 'sold_out']);
+  const next = events[events.indexOf(removed[0]) + 1];
+  assert.equal(next.event, 'item_added');
+  assert.equal(next.data.needId, 'notebook');
+  assert.equal(next.data.qty, removed[0].data.qtyRemoved, 'mandatory quantity kept');
+  assert.deepEqual(events.find((e) => e.event === 'requirements').data, { ok: true, missing: [] });
+});
+
+test('sold-out mandatory need with no in-stock substitute fails BRIEF_INFEASIBLE', async () => {
+  const t = structuredClone(tape);
+  for (const e of t.entries) if (e.op === 'search') e.response.products = e.response.products.slice(0, 1);
+  const first = t.entries.findIndex((e) => e.op === 'createQuote');
+  const soldOut = { op: 'createQuote', key: '', ms: 0, error: { status: 400, code: 'AGENTIC_REQUEST_REJECTED', message: 'rejected', detail: { errors: [{ field: 'items' }] } } };
+  const okProbe = { op: 'createQuote', key: '', ms: 0, response: structuredClone(t.entries[first].response) };
+  t.entries.splice(first, 0, soldOut, soldOut, okProbe, okProbe, okProbe, okProbe, okProbe);
+  const { r, events } = await run(t);
+  assert.equal(r.status, 'BRIEF_INFEASIBLE');
+  assert.ok(!events.some((e) => e.event === 'checkout'));
+});

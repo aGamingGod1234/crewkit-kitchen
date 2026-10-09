@@ -70,7 +70,7 @@ export class RunFailed extends Error {
  * @param {(event:string, data:object)=>void} o.emit
  * @param {string} o.enrollmentId
  */
-export async function runCrewkit({ brief: rawBrief, api, emit, enrollmentId, pollEveryMs = 2500, pollTimeoutMs = 15 * 60_000, maxQuotes = 4, sleep = defaultSleep, now = Date.now, log = () => {} }) {
+export async function runCrewkit({ brief: rawBrief, api, emit, enrollmentId, pollEveryMs = 2500, pollTimeoutMs = 15 * 60_000, maxQuotes = 8, sleep = defaultSleep, now = Date.now, log = () => {} }) {
   const brief = rawBrief.needs?.[0]?.queries ? rawBrief : normalizeBrief(rawBrief);
   const { budget, guestCount } = brief;
   const cur = budget.currency;
@@ -171,6 +171,53 @@ export async function runCrewkit({ brief: rawBrief, api, emit, enrollmentId, pol
     return null;
   };
 
+  // Real sandbox stock: a line over its stock fails the whole quote (409 VARIANT_UNAVAILABLE, or
+  // 400 AGENTIC_REQUEST_REJECTED on field items). Find the line, swap that need to another product from
+  // the same merchant that quotes at the full quantity, and show it in the kitchen as a sold-out beat.
+  const isStockError = (e) => e?.code === 'VARIANT_UNAVAILABLE'
+    || (e?.code === 'AGENTIC_REQUEST_REJECTED' && (e.detail?.errors || []).some((x) => String(x?.field ?? '').startsWith('items')));
+  // Sandbox answers 503 AGENTIC_SERVICE_UNAVAILABLE / QUOTE_TEMPORARILY_UNAVAILABLE under bursts of merchant
+  // requests; the client already retried quickly, so back off longer before giving up.
+  const BUSY = new Set(['AGENTIC_SERVICE_UNAVAILABLE', 'QUOTE_TEMPORARILY_UNAVAILABLE']);
+  const quoteCall = async (items, merchants) => {
+    for (let attempt = 0; ; attempt++) {
+      try { return await call('createQuote', items, merchants); }
+      catch (e) {
+        if (!(BUSY.has(e?.code) || e?.status === 503) || attempt >= 3) throw e;
+        log(`Reap busy (${e.code}), waiting ${5 * (attempt + 1)}s`);
+        await sleep(5000 * (attempt + 1));
+      }
+    }
+  };
+  const probe = async (variantId, quantity, merchant) => {
+    try { await quoteCall([{ variantId, quantity }], [merchant]); return true; }
+    catch (e) { if (isStockError(e)) return false; throw e; }
+  };
+  const handleStock = async (err) => {
+    const lines = result.cart.filter((c) => c.qty > 0);
+    const indexed = (err.detail?.errors || []).map((x) => /items\[(\d+)\]/.exec(String(x?.field ?? ''))?.[1]).filter((i) => i !== undefined).map(Number);
+    let bad = indexed.map((i) => lines[i]).filter(Boolean);
+    if (!bad.length) for (const l of lines) if (!(await probe(l.variantId, l.qty, l.merchant))) bad.push(l);
+    if (!bad.length) return fail('failed', err.code, `${err.message} (every line quotes on its own)`);
+    for (const item of bad) {
+      const need = brief.needs.find((n) => n.id === item.needId);
+      const qty = item.qty;
+      let to = null;
+      for (const alt of [...item.alternates]) {
+        const candidate = await resolveVariant(alt);
+        if (candidate && await probe(candidate.variantId, qty, candidate.merchant)) { to = candidate; break; }
+        item.alternates = item.alternates.filter((a) => a.productId !== alt.productId); // sold out too
+      }
+      log(`${item.realName} is sold out at qty ${qty}${to ? `, swapping to ${to.realName}` : ''}`);
+      emit('item_removed', { id: item.id, qtyRemoved: qty, why: 'sold_out' });
+      item.qty = 0;
+      if (to) { addLine(need, to, qty, item.alternates.filter((a) => a.productId !== to.productId)); continue; }
+      if (need.optional) continue; // an extra may go; a mandatory need may not
+      return fail('failed', 'BRIEF_INFEASIBLE', `${need.label}: no product at ${item.merchant} has ${qty} in stock`);
+    }
+    return null;
+  };
+
   let checkout = null;
   while (!checkout) {
     if (quotes >= maxQuotes) return fail('failed', 'QUOTE_LIMIT', `Gave up after ${maxQuotes} quotes`);
@@ -179,9 +226,10 @@ export async function runCrewkit({ brief: rawBrief, api, emit, enrollmentId, pol
     const items = lines.map((c) => ({ variantId: c.variantId, quantity: c.qty }));
     try { validateQuoteItems(items, lines.map((c) => c.merchant)); } catch (e) { return fail('failed', e.code, e.message); }
     try {
-      quote = await call('createQuote', items, lines.map((c) => c.merchant));
+      quote = await quoteCall(items, lines.map((c) => c.merchant));
     } catch (e) {
       if (REQUOTE_CODES.has(e.code)) continue;
+      if (isStockError(e)) { const stop = await handleStock(e); if (stop) return stop; continue; }
       return fail('failed', e.code || 'QUOTE_ERROR', e.message);
     }
     let totals = quoteTotals(quote, cur);
