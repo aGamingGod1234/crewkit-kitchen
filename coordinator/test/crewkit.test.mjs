@@ -481,3 +481,14 @@ test('edge 3: idempotent POSTs retry 429 with the same key but throw on 5xx; che
     if (saved.state === undefined) delete process.env.CREWKIT_STATE_FILE; else process.env.CREWKIT_STATE_FILE = saved.state;
   }
 });
+
+test('edge 6: COMPLETED without orderId or finalAmount fails COMPLETED_INCOMPLETE and records nothing', async () => {
+  for (const field of ['orderId', 'finalAmount']) {
+    const t = structuredClone(tape);
+    const last = t.entries.findLastIndex((e) => e.op === 'getCheckout');
+    delete t.entries[last].response[field];
+    const { r, events } = await run(t);
+    assert.equal(r.status, 'COMPLETED_INCOMPLETE', field);
+    assert.ok(!names(events).includes('completed') && !names(events).includes('record'));
+  }
+});

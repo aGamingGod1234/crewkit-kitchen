@@ -346,8 +346,12 @@ export async function runCrewkit({ brief: rawBrief, api, emit, enrollmentId, pol
   if (status === 'FAILED') return fail('failed', 'FAILED', 'Reap: the charge or the merchant order did not go through');
   if (status === 'EXPIRED') return fail('expired', 'EXPIRED', 'Approval was not given before the link expired');
 
-  const finalAmount = toMoney(latest.finalAmount ?? checkout.amount, cur);
-  emit('completed', { orderId: latest.orderId ?? null, finalAmount });
+  // COMPLETED must carry the order and the real charge; never record the pre-approval amount as charged.
+  if (latest.orderId == null || latest.finalAmount == null) {
+    return fail('failed', 'COMPLETED_INCOMPLETE', `Reap reported COMPLETED without ${latest.orderId == null ? 'an orderId' : 'a finalAmount'}`);
+  }
+  const finalAmount = toMoney(latest.finalAmount, cur);
+  emit('completed', { orderId: latest.orderId, finalAmount });
   const record = {
     budget: budget.amount,
     quoted: result.quote.total.amount,
