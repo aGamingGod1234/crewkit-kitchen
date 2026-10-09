@@ -1,4 +1,100 @@
-# Arena Agents: summonable AI-controlled players for Minecraft
+# CrewKit Kitchen
+
+**An AI chef buys your event's supplies through Reap's Agentic API, inside a budget you set, and you can watch every step happen in a Minecraft kitchen.**
+
+Built for the Reap x 65labs Agentic Buildathon (Singapore). Track: Most Worthwhile Problem. Build path: Reap Agentic API (sandbox).
+
+Demo video: `TODO: add link`
+
+## The problem
+
+Companies and event teams are starting to let agents spend money: workshop kits, team offsites, office supplies. The hard part is not placing the order. It is trusting it. Today the agent's work is a chat log. You cannot see at a glance what it bought, whether it stayed in budget, who approved the payment, or whether the order really went through.
+
+## What CrewKit does
+
+You give the chef a brief: guests, a budget, what each person needs. The chef searches Reap's catalogue, builds a cart, and asks Reap for a quote. Our server checks the quote against the budget. If it is over, the checkout is blocked and the chef has to rework the cart. When the total fits, Reap returns a hosted approval page. A human scans a QR code and approves on that page. Only when Reap reports the order as `COMPLETED` does the kitchen celebrate, plate the items for each named guest, and stamp a bill board with budget, quoted, charged, variance, and order id.
+
+The room is the audit log. A red ticket means over budget. Dropped gate bars mean the checkout is blocked. A bag at the door means Reap placed the order.
+
+## How it works
+
+```mermaid
+flowchart LR
+    Human([Human: writes brief]) --> Chef[Chef agent<br/>LLM plans the cart]
+    Chef -->|tool calls| Engine[CrewKit engine<br/>coordinator/src/crewkit]
+    Engine -->|search, quote, checkout, poll| Reap[Reap Agentic API<br/>sandbox]
+    Engine --> Gate{Server budget gate}
+    Gate -->|over budget| Chef
+    Gate -->|within budget| Engine
+    Reap -->|approval URL| Page[Reap hosted approval page]
+    Page -->|QR scan, approve| Human2([Human approves on phone])
+    Human2 --> Page
+    Engine -->|crewkit_state events| Bridge[crewkit_state bridge]
+    Bridge --> Mod[Fabric mod<br/>Minecraft kitchen]
+    Mod --> Room[Ticket, counter, gate, QR,<br/>delivery bag, plating, bill board]
+```
+
+1. **Chef agent.** An LLM reads the brief and chooses what to search for and buy. It works through a small set of tools and never touches money directly.
+2. **CrewKit engine.** Node code in `coordinator/src/crewkit/`. It calls Reap's endpoints, holds the API key, runs the budget gate, and emits events.
+3. **Reap Agentic API.** `POST /agentic/products/search`, `POST /agentic/quotes`, `POST /agentic/checkouts`, then `GET /agentic/checkouts/:id` until the status is terminal.
+4. **`crewkit_state` bridge.** One new message type on the existing coordinator-to-server bridge. Each event carries a run id and a sequence number, so the mod ignores stale or repeated events. See [docs/crewkit/CONTRACT.md](docs/crewkit/CONTRACT.md).
+5. **Fabric mod kitchen.** Turns each event into a physical action in the world.
+6. **Human approval.** Happens on Reap's own hosted page, not in our code.
+
+## Money safety
+
+- **The budget gate lives on the server.** The chef can propose any cart. Our code compares the Reap quote total, with shipping, to the budget and refuses to create a checkout when it is over. The model cannot skip this step.
+- **The key and card never reach the LLM.** The Reap API key stays in a gitignored `.env` read by the engine. Card details are entered on Reap's hosted pages and never pass through our code or logs.
+- **A human approves every purchase.** Reap mandates (pre-approved spending) are not live yet, so each checkout needs approval on Reap's hosted page.
+- **Celebrate only on `COMPLETED`.** Reap defines it as "the merchant order is placed". `PROCESSING`, `FAILED`, and `EXPIRED` never trigger the delivery scene.
+- **Idempotency.** Every enrollment, quote, and checkout call carries an `Idempotency-Key` that is stored before sending. A retry replays the same result and cannot double-buy.
+- **Reconcile against what was charged.** The bill board uses `finalAmount` from the checkout, not the quote.
+
+## Honest disclosure
+
+- The Minecraft agent platform underneath is **Agent Arena**, existing work by the project owner, published under MIT. The fork's base content is kept below.
+- **Built at the event:** the Reap purchasing client, the chef and its tools, the budget gate, the run record, the `crewkit_state` bridge message, the kitchen set, the visual choreography, and this documentation. Everything under `coordinator/src/crewkit/`, `src/main/java/dev/agaminggod/arenaagents/crewkit/`, and `docs/crewkit/` is new.
+- This runs against the **Reap sandbox**. No real money moves.
+
+## Quick start
+
+Placeholders: other tracks fill in exact commands.
+
+```text
+# 1. Build and install the mod and coordinator (see "Agent Arena" below)
+TODO
+
+# 2. Build the kitchen in your world
+/crewkit build
+
+# 3. Copy the env template and add your Reap sandbox key
+#    coordinator/src/crewkit/.env  (gitignored)
+
+# 4. Run the chef
+node coordinator/src/crewkit/cli.mjs run <brief> --mode replay|simulate|live
+```
+
+| Mode | What it does |
+|---|---|
+| `replay` | Plays a recorded run through the kitchen. No network. |
+| `simulate` | Calls the sandbox with `X-Simulate-Checkout: COMPLETED`. |
+| `live` | Full flow: sandbox card, hosted approval page, polling. |
+
+Docs: [contract](docs/crewkit/CONTRACT.md), [brief and script](docs/crewkit/brief-and-script.md), [Reap API notes](docs/crewkit/reap-api-notes.md), [submission text](docs/crewkit/SUBMISSION.md), [judge Q&A](docs/crewkit/JUDGE-QA.md).
+
+## Team
+
+`TODO: names and roles`
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+---
+
+# Agent Arena (base platform)
+
+## Arena Agents: summonable AI-controlled players for Minecraft
 
 Arena Agents is a Fabric + Carpet mod pack and local coordinator for Minecraft Java 26.1.2. It adds offline fake players controlled through local provider CLIs. Codex and Claude use their existing local CLI logins (Codex CLI and Claude Code); the mod stores no provider API keys. The Gemini provider ID remains visible for saved-profile compatibility, but production planning fails closed because Antigravity CLI has no enforceable no-tool boundary.
 
@@ -6,7 +102,7 @@ Each agent is a real `ServerPlayer` with vanilla collision, gravity, health, hun
 
 The coordinator uses the selected provider's control path for every summonable NPC: Codex and Claude both drive the body through the same native Minecraft tools, workspace, AGENTS.md, and minecraft-control skill. The former fixed two-client planner is retired and is not a runtime fallback.
 
-## Safety boundaries
+### Safety boundaries
 
 - The authenticated bridge binds only to `127.0.0.1:25570` and accepts bounded, schema-validated Minecraft actions, not shell or filesystem tools.
 - A shared secret of at least 32 characters is stored in `runtime\bridge-secret.txt`, passed to the server by file path, and exposed to the coordinator only through its process environment.
@@ -15,7 +111,7 @@ The coordinator uses the selected provider's control path for every summonable N
 - The default scheduler permits all 16 registered agents to plan concurrently. Each agent still has at most one provider turn and one physical world action in flight.
 - The original world at `%APPDATA%\.minecraft\saves\New World (76)` is never opened by preparation or automated verification; scripts work from a copied runtime world.
 
-## Build and automated verification
+### Build and automated verification
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\run-automated-verification.ps1
@@ -39,7 +135,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-performance-re
 
 This repeats the isolated eight-agent soak 50 times after the clean verifier. The summonable-agent path permits 16 concurrent planner turns, sends at most eight queued observations per server tick, caches expensive spatial sections for 10 ticks, and throttles action progress to a material 5% change or a one-second heartbeat. ArenaScript providers return one validated program envelope and the local interpreter schedules one authorized physical primitive at a time; Codex's native-tools path retains its own tool-session contract. Optional bounded `coordinator_status.latencies` rows expose sample count, p50, and p95 durations without prompts, observations, model output, or credentials. See [the measured headless report](docs/plans/2026-08-11-eight-agent-performance-reliability-report.md).
 
-## Prepare the source-checkout runtime
+### Prepare the source-checkout runtime
 
 These scripts are for the repository's legacy two-client test layout. They are not in the release ZIP. `prepare-runtime.ps1` requires the project-local JDK, an existing Fabric API JAR in the normal Minecraft directory, and the exact source world `%APPDATA%\.minecraft\saves\New World (76)`. It copies that world into `runtime/server`; it never starts the source world. Close Minecraft and the official launcher, then run:
 
@@ -50,15 +146,15 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-launcher-profiles.ps1
 
 Preparation verifies the copied world before it reuses it. It creates `runtime/server` with `online-mode=true` on `127.0.0.1:25565`, matching the default server launcher. Joining players need an authenticated Minecraft account. Existing offline settings are rejected without conversion; see [runtime/README.md](runtime/README.md) for this development-only layout and migration boundary.
 
-## Install the Windows release ZIP
+### Install the Windows release ZIP
 
 The Reliability workflow publishes `arena-agents-modpack-<version>.zip`. Build it with `.\gradlew.bat packageWindowsDistribution`. Extract the complete ZIP and follow its `README.md`. The shipped command is `.\scripts\install-distribution.ps1`; source-only preparation and launcher-profile scripts are deliberately absent. The installer creates `%APPDATA%\.minecraft-arena-agents`, installs the exact Arena Agents, Arena Agents Voice, Fabric API, Fabric Carpet, and Simple Voice Chat JARs, removes older package-owned JARs, and installs the matching coordinator and Node.js runtime. It preserves unrelated mods and restores the previous package files if an update fails.
 
-### Provider CLI checks
+#### Provider CLI checks
 
 Agents think through a provider CLI installed on the machine that runs the coordinator: `claude` (Claude Code), `codex` (Codex CLI) or `agy` (Antigravity). Each time an agent is launched, or re-registered after a coordinator reconnect, the coordinator probes that CLI with the same executable resolution and environment the agent process uses and reports three failure states to everyone in Minecraft chat: **not installed** (`claude`, `codex` or `agy` was not found on PATH, under `%APPDATA%\npm` or beside an npm `.cmd` shim, in `%USERPROFILE%\.local\bin` or in `%LOCALAPPDATA%\agy\bin`), **broken** (the CLI exists but `--version` fails, cannot start or times out), and **not signed in** (`claude auth status`, `codex login status` or `agy models` reports no login; an `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` or `GEMINI_API_KEY` in the coordinator environment counts as signed in). The chat line names the fix: install the CLI and restart Minecraft, reinstall or update it, or run `claude auth login`, `codex login` or `agy` on the server machine and relaunch the agent. Players who join later see the latest notice for each affected agent. The same three results are logged once per provider with a `[provider-cli]` prefix when the coordinator first connects to the server. A healthy CLI produces no chat message.
 
-## Run summonable NPC mode
+### Run summonable NPC mode
 
 For the source-checkout runtime, start the Fabric server and coordinator in separate terminals:
 
@@ -98,7 +194,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-dynamic-coordinator.ps1
 
 `/codex summon` and the legacy two-argument form use the configured Codex default. The command center asks each installed provider CLI for its current model catalog and uses a bounded built-in catalog when discovery is unavailable. Availability still depends on the installed CLI, its login, and that provider's model access. Player-facing speed choices are `Normal` and `Fast mode`; provider wire values stay internal. A newly summoned NPC remains idle until `/codex start`; `stop` freezes its active work, `queue` preserves later goals, and `steer` interrupts the current plan at a higher revision.
 
-### Run skit mode
+#### Run skit mode
 
 Skit mode is a deliberate, world-persisted toggle for staging short-form scenes. It
 does not give agents a second control system. Turn it on, summon a named agent,
@@ -248,17 +344,17 @@ Press the configured Agent Controls key (`G` by default) in a world to open the 
 
 Arena setup defaults to building 80 blocks in front of the operator so construction remains visible; exact server coordinates are published before the reset job starts. `At my position` and deterministic fixed lanes remain available. World mutation is deliberately paced while bookkeeping and verification retain their higher bounded throughput, so the arena visibly grows instead of appearing all at once. The build dashboard reports the current phase, processed work, successful world changes, exact origin, actionable failures, and retry state. Each preset authors only the contestant stations, building plots, or parkour lanes required by the configured roster and adds a connected operator observation deck. Parkour lanes progress through easy, medium, hard, and expert sections; decorated checkpoints save progress, and lava deaths respawn Adventure-mode participants at their latest checkpoint. The compact in-world HUD shows four readable health/score cards, while the Live Arena workspace exposes the full scrollable roster and meaningful activity feed. Authored-map research and attribution are recorded in [MAP-SOURCES.md](MAP-SOURCES.md).
 
-## Visual release validation
+### Visual release validation
 
 The release gate starts a temporary offline Fabric server with the exact five JARs from the Windows ZIP: Arena Agents, Arena Agents Voice, Fabric API, Fabric Carpet, and Simple Voice Chat. It waits for Minecraft's `Done` marker, runs `codex status`, checks for mixin and crash failures, sends `stop`, and requires a clean exit. Live launcher gameplay and provider-latency acceptance remain separate manual checks.
 
-## Current action surface
+### Current action surface
 
 The server-authoritative executor drives Carpet's real player action pack for movement, looking, jumping, attacking, item use, and block interaction. Observations include vanilla HUD/player state, inventory/equipment, visible nearby entities and blocks, world state, the active action, and the last result. Entity and block facts are gated by the current view and line of sight; hidden creature health and other server-only combat facts are not exposed as sight. Damage publishes a fresh factual observation without cancelling the current action or choosing fight, flight, or replanning for the model. Death is reconciled into a persistent `DEAD` lifecycle state and remains under the selected model's coordinate-free respawn primitive.
 
 Container transfers, crafting recipes, and furnace transactions use server-authoritative, fail-closed adapters with inventory-conservation checks and rollback paths. Crafting expands Minecraft's trimmed recipe remainders back into the full grid before validating ownership, including horizontally and vertically offset recipes. Forced chunk tickets remain fail-closed until their Minecraft 26.1.2 adapter is runtime-validated; unsupported operations never report false success.
 
-## ArenaScript control boundary
+### ArenaScript control boundary
 
 The selected provider, model, reasoning effort, and service tier own gameplay strategy, program source, watcher conditions, interruption policy, fallbacks, and respawn decisions. The coordinator only validates the envelope, compiles the source, evaluates it in the local interpreter, and enforces goal/version/provenance fences. Invalid source is returned to that same selected model with bounded compiler diagnostics; no heuristic or alternate model supplies a replacement.
 
