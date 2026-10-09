@@ -23,7 +23,10 @@ public final class BoardsFeature implements CrewkitFeature {
 	private static final float BAR_WIDTH = 7.6f;
 	private static final float BAR_HEIGHT = 0.32f;
 	private static final float NUMBER_SCALE = 5.0f;
-	private static final int ROLL_TICKS = 24;
+	/** Each cart change eases over ~1.5 s so the number visibly counts instead of jumping. */
+	private static final int ROLL_TICKS = 30;
+	/** Number scale while it shows "CART S$x" (longer text than a plain amount). */
+	private static final float CART_SCALE = 3.4f;
 	private static final int MAX_ROLL_SOUNDS = 8;
 	private static final int STATUS_MAX = 30;
 
@@ -49,6 +52,12 @@ public final class BoardsFeature implements CrewkitFeature {
 	private int callCount;
 	/** Once a run reports absolute `calls` counts (the Node engine does, before its first item), stop estimating +1 per item. */
 	private boolean callsReported;
+	/**
+	 * False until the first quote or gate result. Before that the per-item math is only a cart estimate,
+	 * so an overshoot shows as a neutral "CART S$x" and the first red is the real gate moment.
+	 */
+	private boolean priced;
+	private boolean cartMode;
 
 	// Bill board
 	private CrewkitDisplay billPanel, billTitle;
@@ -67,6 +76,7 @@ public final class BoardsFeature implements CrewkitFeature {
 				unitPrices.clear();
 				callCount = 0;
 				callsReported = false;
+				priced = false;
 				ensureBudgetBoard(server);
 				ensureBill(server);
 				remaining.snap(0);
@@ -99,6 +109,7 @@ public final class BoardsFeature implements CrewkitFeature {
 			}
 			case "quote" -> {
 				ensureBudgetBoard(server);
+				priced = true;
 				JsonObject left = object(data, "budgetRemaining");
 				double value = left != null ? amount(left) : budget - amount(object(data, "total"));
 				rollTo(value, ROLL_TICKS, now);
@@ -108,6 +119,7 @@ public final class BoardsFeature implements CrewkitFeature {
 			}
 			case "gate_blocked" -> {
 				ensureBudgetBoard(server);
+				priced = true;
 				double over = Math.abs(amount(object(data, "over")));
 				rollTo(-over, ROLL_TICKS + 6, now);
 				setStatus("OVER BY " + CrewkitText.money(over, currency) + " - BLOCKED", CrewkitText.RED);
@@ -116,6 +128,7 @@ public final class BoardsFeature implements CrewkitFeature {
 			}
 			case "gate_passed" -> {
 				ensureBudgetBoard(server);
+				priced = true;
 				double total = amount(object(data, "total"));
 				rollTo(budget - total, ROLL_TICKS + 6, now);
 				setStatus("WITHIN BUDGET - " + CrewkitText.money(total, currency), CrewkitText.GREEN);
@@ -127,6 +140,7 @@ public final class BoardsFeature implements CrewkitFeature {
 			}
 			case "completed" -> {
 				ensureBudgetBoard(server);
+				priced = true;
 				JsonObject paid = object(data, "finalAmount");
 				if (paid != null) rollTo(budget - amount(paid), ROLL_TICKS, now);
 				setStatus("ORDER PLACED - " + (paid != null ? CrewkitText.money(amount(paid), currency) : ""), CrewkitText.GREEN);
@@ -196,6 +210,8 @@ public final class BoardsFeature implements CrewkitFeature {
 		lastTimerText = "";
 		callCount = 0;
 		callsReported = false;
+		priced = false;
+		cartMode = false;
 	}
 
 	// ---- budget board ----
@@ -226,8 +242,14 @@ public final class BoardsFeature implements CrewkitFeature {
 	}
 
 	private void renderNumber(double value) {
-		String text = CrewkitText.money(value, currency);
-		int color = colorFor(value);
+		boolean cart = !priced && value < -0.004;
+		if (cart != cartMode) {
+			cartMode = cart;
+			number.transform(cart ? CART_SCALE : NUMBER_SCALE, 0, 0, 0, 4);
+			header.text(CrewkitText.of(cart ? "CART SO FAR" : "BUDGET LEFT", CrewkitText.MUTED, true));
+		}
+		String text = cart ? "CART " + CrewkitText.money(budget - value, currency) : CrewkitText.money(value, currency);
+		int color = cart ? CrewkitText.WHITE : colorFor(value);
 		if (text.equals(lastNumberText) && color == lastNumberColor) return;
 		lastNumberText = text;
 		lastNumberColor = color;
