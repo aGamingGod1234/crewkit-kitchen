@@ -146,7 +146,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			"AI agent coordinator is offline; check logs/arena-agents-coordinator-error.log for the startup cause";
 	private static final Logger LOGGER = LoggerFactory.getLogger(MultiplexedServerBridge.class);
 	private static final Set<String> INBOUND_TYPES = Set.of(
-			"auth_challenge", "hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "conversation_wake_ack", "goal_spec_proposal", "task_request", "director_script_result", "request_observation", "inspection_request", "action_command", "action_cancel", "action_result_ack", "agent_error", "agent_notice", "verbose_event", "task_view", "heartbeat"
+			"auth_challenge", "hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "conversation_wake_ack", "goal_spec_proposal", "task_request", "director_script_result", "crewkit_state", "request_observation", "inspection_request", "action_command", "action_cancel", "action_result_ack", "agent_error", "agent_notice", "verbose_event", "task_view", "heartbeat"
 	);
 
 	private final CodexAgentManager manager;
@@ -1213,6 +1213,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			case "goal_spec_proposal" -> acceptGoalSpecProposal(envelope);
 			case "task_request" -> acceptTaskRequest(envelope);
             case "director_script_result" -> dev.agaminggod.arenaagents.server.DirectorScriptGeneration.accept(manager.server(), envelope.payload());
+			case "crewkit_state" -> dev.agaminggod.arenaagents.crewkit.core.CrewkitDispatcher.accept(manager.server(), envelope.payload());
 			case "request_observation" -> acceptObservationRequest(envelope);
 			case "inspection_request" -> acceptInspectionRequest(envelope);
 			case "action_command" -> acceptAction(envelope);

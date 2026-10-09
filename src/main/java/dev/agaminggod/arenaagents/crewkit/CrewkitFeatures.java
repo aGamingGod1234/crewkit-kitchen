@@ -17,7 +17,7 @@ public final class CrewkitFeatures {
 			synchronized (CrewkitFeatures.class) {
 				if (features == null) {
 					features = List.of(new CrewkitFeature[] {
-						// core-boards: new dev.agaminggod.arenaagents.crewkit.core.BoardsFeature(),
+						new dev.agaminggod.arenaagents.crewkit.core.BoardsFeature(),
 						new dev.agaminggod.arenaagents.crewkit.items.ItemsFeature(),
 						new dev.agaminggod.arenaagents.crewkit.flow.FlowFeature(),
 						new dev.agaminggod.arenaagents.crewkit.cast.CastFeature(),
