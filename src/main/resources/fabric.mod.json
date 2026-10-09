@@ -5,7 +5,7 @@
 	"name": "Arena Agents",
 	"description": "Summon configurable Codex-powered humanoid agents that can act autonomously in Minecraft.",
 	"icon": "assets/arenaagents/icon.png",
-	"license": "All-Rights-Reserved",
+	"license": "MIT",
 	"environment": "*",
 	"entrypoints": {
 		"main": [
