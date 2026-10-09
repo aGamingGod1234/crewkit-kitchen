@@ -94,6 +94,8 @@ public final class SetBuilder {
 		int placed = new Placer(level, origin).placeAll();
 		KitchenDecor.place(level, origin.immutable());
 		Exterior.place(level, origin.immutable());
+		// KitchenDecor puts sea lanterns in the west wall at (0,3,3..5); Exterior clears x=-1, so seal their backs.
+		for (int z = 3; z <= 5; z++) level.setBlock(origin.offset(-1, 3, z), Blocks.WHITE_CONCRETE.defaultBlockState(), FLAGS);
 		data.nextGeneration();
 		spawnMarkers(level);
 		return placed;
@@ -106,6 +108,7 @@ public final class SetBuilder {
 		ServerLevel level = levelOf(server, data.dimension);
 		BlockPos origin = data.origin;
 		killMarkers(level);
+		KitchenDecor.removeEntities(level, origin); // item frames would otherwise drop as items
 		if (data.hasSnapshot()) {
 			restore(level, origin, data);
 		} else {
