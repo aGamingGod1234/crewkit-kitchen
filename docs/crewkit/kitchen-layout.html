@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CrewKit Kitchen · set layout</title>
+<style>
+  body{margin:0;font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;color:#141414;background:#f6f2ea}
+  .wrap{max-width:900px;margin:0 auto;padding:20px}
+  h1{font-size:28px;margin:0 0 4px} h2{font-size:18px;margin:22px 0 8px}
+  svg{width:100%;height:auto;background:#fffdf8;border:1px solid #e4ddd0;border-radius:14px}
+  table{width:100%;border-collapse:collapse;font-size:14px} td,th{padding:6px;border-bottom:1px solid #e4ddd0;text-align:left;vertical-align:top}
+  code{font:13px ui-monospace,Consolas,monospace;background:#efe9dd;padding:1px 4px;border-radius:4px}
+  .sw{display:inline-block;width:12px;height:12px;border-radius:3px;vertical-align:-1px;margin-right:4px;border:1px solid #0002}
+</style></head><body><div class="wrap">
+<h1>CrewKit Kitchen: set layout</h1>
+<p>Top-down, 1 square = 1 block. Footprint 28 × 22, ceiling at y+7 (fits the 48³ template limit). Origin (0,0) is the north-west floor corner. The camera looks north from the south edge, so the pass and boards face the room.</p>
+
+<svg viewBox="-1 -1 30 24" xmlns="http://www.w3.org/2000/svg" font-family="system-ui" font-size="0.62">
+  <defs><pattern id="g" width="1" height="1" patternUnits="userSpaceOnUse"><path d="M1 0H0V1" fill="none" stroke="#e8e1d3" stroke-width="0.04"/></pattern></defs>
+  <rect x="0" y="0" width="28" height="22" fill="url(#g)" stroke="#141414" stroke-width="0.15"/>
+  <!-- back wall boards -->
+  <rect x="2" y="0" width="9" height="0.6" fill="#2747d8"/><text x="2.2" y="1.5">Budget board + timer (ck_budget)</text>
+  <rect x="16" y="0" width="10" height="0.6" fill="#141414"/><text x="16.2" y="1.5">Bill board / ledger (ck_ledger)</text>
+  <!-- kitchen line: stove + head stack -->
+  <rect x="2" y="3" width="12" height="2" fill="#9aa0a6"/><text x="2.2" y="4.2" fill="#fff">Counter line: stove, smoker, head stack</text>
+  <circle cx="8" cy="6" r="0.5" fill="#d97757"/><text x="8.8" y="6.3">Chef start (ck_agent)</text>
+  <!-- ticket rail + pass -->
+  <rect x="2" y="8" width="14" height="1.2" fill="#c9b78f"/><text x="2.2" y="8.85">The pass: ticket rail, gate bars, QR frame (ck_screen)</text>
+  <!-- delivery door -->
+  <rect x="27.4" y="4" width="0.6" height="3" fill="#c2410c"/><text x="21.6" y="5.2">Delivery door</text>
+  <rect x="24" y="5.5" width="2" height="2" fill="none" stroke="#c2410c" stroke-width="0.12" stroke-dasharray="0.3 0.2"/><text x="20.4" y="8.4">Bag drop (ck_crate)</text>
+  <!-- guest tables -->
+  <g fill="#e5eafc" stroke="#2747d8" stroke-width="0.1">
+    <rect x="4" y="12" width="4" height="2"/><rect x="12" y="12" width="4" height="2"/><rect x="20" y="12" width="4" height="2"/>
+    <rect x="8" y="16.5" width="4" height="2"/><rect x="16" y="16.5" width="4" height="2"/>
+  </g>
+  <g fill="#1f8a4c">
+    <circle cx="4.5" cy="11.4" r="0.35"/><circle cx="7.5" cy="11.4" r="0.35"/><circle cx="4.5" cy="14.6" r="0.35"/><circle cx="7.5" cy="14.6" r="0.35"/>
+    <circle cx="12.5" cy="11.4" r="0.35"/><circle cx="15.5" cy="11.4" r="0.35"/><circle cx="12.5" cy="14.6" r="0.35"/><circle cx="15.5" cy="14.6" r="0.35"/>
+    <circle cx="20.5" cy="11.4" r="0.35"/><circle cx="23.5" cy="11.4" r="0.35"/><circle cx="20.5" cy="14.6" r="0.35"/><circle cx="23.5" cy="14.6" r="0.35"/>
+    <circle cx="8.5" cy="15.9" r="0.35"/><circle cx="11.5" cy="15.9" r="0.35"/><circle cx="16.5" cy="15.9" r="0.35"/><circle cx="19.5" cy="15.9" r="0.35"/>
+  </g>
+  <text x="4" y="10.6">Table A</text><text x="12" y="10.6">Table B</text><text x="20" y="10.6">Table C</text>
+  <text x="8" y="19.3">Table D (spare)</text><text x="16" y="19.3">Table E (spare)</text>
+  <!-- camera -->
+  <polygon points="14,21.6 13.3,20.6 14.7,20.6" fill="#141414"/><text x="15" y="21.4">Camera (ck_player), y+5, pitch 25° down</text>
+</svg>
+
+<h2>Anchors (marker entities)</h2>
+<table>
+<tr><th>Tag</th><th>Block (x, y, z)</th><th>Used for</th></tr>
+<tr><td><code>ck_budget</code></td><td>6, 4, 0 (on the wall face)</td><td>Budget counter and timer text displays</td></tr>
+<tr><td><code>ck_ledger</code></td><td>21, 4, 0</td><td>Bill board rows: budget, quoted, charged, variance, order id</td></tr>
+<tr><td><code>ck_agent</code></td><td>8, 1, 6</td><td>Chef spawn and walk-path start</td></tr>
+<tr><td><code>ck_screen</code></td><td>9, 2, 8</td><td>The pass: ticket rail, head stack view, gate bars, QR map frame</td></tr>
+<tr><td><code>ck_crate</code></td><td>25, 1, 6</td><td>Delivery bag drop inside the door</td></tr>
+<tr><td><code>ck_player</code></td><td>14, 5, 21</td><td>Demo camera position, facing north</td></tr>
+</table>
+
+<h2>Seats</h2>
+<p>Tables A–C seat 12 (4 each), filled in brief order: James, John and Sandy at Table A, then Guest4 onwards. Tables D and E hold 8 spares for briefs with more guests. Seats are stairs facing the table; guests are Carpet players sat with a ride on an invisible marker.</p>
+
+<h2>Block palette (one colour language)</h2>
+<p>
+<span class="sw" style="background:#f0eee8"></span>Walls: white concrete, quartz pillars ·
+<span class="sw" style="background:#7d7f7d"></span>Counters: smooth stone, polished andesite tops ·
+<span class="sw" style="background:#2c2f33"></span>Floor: polished deepslate tiles with a white concrete border ·
+<span class="sw" style="background:#2747d8"></span>Accent (brand, budget): blue concrete, lapis block ·
+<span class="sw" style="background:#1f8a4c"></span>OK / passed: lime or green concrete ·
+<span class="sw" style="background:#c2410c"></span>Over budget / gate: red concrete, orange glazed trim ·
+Light: lanterns on chains plus hidden light blocks (no shadows on faces).
+</p>
+<p>Plates are thin white <code>block_display</code> slabs (white concrete, scale 0.6 × 0.05 × 0.6) at each seat.</p>
+</div></body></html>
