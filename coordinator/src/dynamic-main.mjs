@@ -309,7 +309,7 @@ export class DynamicCoordinator extends EventEmitter {
 			},
 			memoryOperation: (record, operation) => this.#playerMemory.execute(record, operation),
 			taskContext: (record) => this.#playerMemory.taskContext(record),
-			memoryObservation: (record, observation) => this.#playerMemory.observe(record, observation),
+			memoryObservation: (record, observation, options) => this.#playerMemory.observe(record, observation, options),
 			executionSettings: (record) => this.#planner.getExecutionSettings?.(record.agentId) ?? null,
 			planningLeadTime: (record) => this.#planner.getNativeDecisionTiming?.(record.agentId)?.p95Ms ?? null,
 			onModelActionCancelled: (record) => this.#releaseHeldWakeForCancelledAction(record),
@@ -4892,10 +4892,21 @@ function factualProgressProjection(observation) {
 	};
 }
 
+// Same value with every object's keys in sorted order, so equal facts serialize identically.
 function sortFactualValue(value) {
-	if (Array.isArray(value)) return value.map(sortFactualValue);
+	if (Array.isArray(value)) {
+		const sorted = new Array(value.length);
+		for (let index = 0; index < value.length; index += 1) sorted[index] = sortFactualValue(value[index]);
+		return sorted;
+	}
 	if (value !== null && typeof value === 'object') {
-		return Object.fromEntries(Object.keys(value).sort().map((key) => [key, sortFactualValue(value[key])]));
+		const keys = Object.keys(value).sort();
+		const sorted = {};
+		for (const key of keys) {
+			if (key === '__proto__') Object.defineProperty(sorted, key, { value: sortFactualValue(value[key]), enumerable: true, writable: true, configurable: true });
+			else sorted[key] = sortFactualValue(value[key]);
+		}
+		return sorted;
 	}
 	return value;
 }

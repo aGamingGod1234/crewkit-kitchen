@@ -39,3 +39,14 @@ test('critical air and explicit attention retain their wake semantics', () => {
   });
   assert.equal(classifyObservationTrigger({ attention: true, changedFacts: [], trigger: 'requested_replan' }, observation()).attention, true);
 });
+
+test('observation signatures ignore key order but follow every fact, including a key named __proto__', () => {
+	const base = { ready: true, status: 'ready', position: { x: 1, y: 64, z: 2 }, player: { health: 20, effects: [] }, inventory: { items: [{ itemId: 'minecraft:stick', count: 1 }] }, world: { dimension: 'minecraft:overworld' } };
+	const reordered = { world: { dimension: 'minecraft:overworld' }, inventory: { items: [{ count: 1, itemId: 'minecraft:stick' }] }, player: { effects: [], health: 20 }, position: { z: 2, y: 64, x: 1 }, status: 'ready', ready: true };
+	assert.equal(nativeObservationSignature(base), nativeObservationSignature(reordered));
+	assert.notEqual(nativeObservationSignature(base), nativeObservationSignature({ ...base, player: { health: 19, effects: [] } }));
+	const pollutedA = { ...base, landmarks: [JSON.parse('{"blockId":"minecraft:stone","__proto__":{"a":1}}')] };
+	const pollutedB = { ...base, landmarks: [JSON.parse('{"blockId":"minecraft:stone","__proto__":{"a":2}}')] };
+	assert.notEqual(nativeObservationSignature(pollutedA), nativeObservationSignature(pollutedB), 'the own key is data, not a prototype assignment');
+	assert.equal(Object.getPrototypeOf(pollutedA.landmarks[0]), Object.prototype);
+});

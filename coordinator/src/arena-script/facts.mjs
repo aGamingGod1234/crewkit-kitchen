@@ -160,14 +160,14 @@ function copyCandidate(value, kind) {
 	if (kind === 'item' && (typeof source.itemId !== 'string' || !nonNegativeInteger(source.count))) throw new TypeError('observation item has invalid item fields');
 	if (kind === 'entity' && typeof source.type !== 'string') throw new TypeError('observation entity has invalid type');
 	if (kind === 'block' && typeof source.blockId !== 'string') throw new TypeError('observation block has invalid block id');
-	const copied = Object.assign(Object.create(null), copyFactData(source, `observation ${kind}`));
+	const copied = copyRecordFields(source, `observation ${kind}`);
 	if (Object.hasOwn(source, 'tags')) {
 		const tags = denseDataArray(source.tags, `observation ${kind} tags`);
 		if (tags.some((tag) => typeof tag !== 'string')) throw new TypeError(`observation ${kind} has invalid tags`);
 		copied.tags = Object.freeze([...tags]);
 	}
 	copied.position = freezeRecord({ x: source.x, y: source.y, z: source.z });
-	return freezeRecord(copied);
+	return Object.freeze(copied);
 }
 
 function copyInventory(values) {
@@ -175,14 +175,28 @@ function copyInventory(values) {
 	return observedList(denseDataArray(values, 'observation inventory items').map((value) => {
 		const source = ownDataRecord(value, 'observation inventory item');
 		if (typeof source.itemId !== 'string' || !nonNegativeInteger(source.count)) throw new TypeError('observation inventory item has an invalid schema');
-		const copied = Object.assign(Object.create(null), copyFactData(source, 'observation inventory item'));
+		const copied = copyRecordFields(source, 'observation inventory item');
 		if (Object.hasOwn(source, 'tags')) {
 			const tags = denseDataArray(source.tags, 'observation inventory item tags');
 			if (tags.some((tag) => typeof tag !== 'string')) throw new TypeError('observation inventory item has invalid tags');
 			copied.tags = Object.freeze([...tags]);
 		}
-		return freezeRecord(copied);
+		return Object.freeze(copied);
 	}));
+}
+
+/** Same result as copying a validated record with copyFactData, minus the intermediate frozen copies. */
+function copyRecordFields(source, label) {
+	const copied = Object.create(null);
+	let ancestors = null;
+	for (const key of Object.keys(source)) {
+		const entry = source[key];
+		if (entry === undefined) continue;
+		if (entry === null || typeof entry === 'string' || typeof entry === 'boolean' || Number.isFinite(entry)) { copied[key] = entry; continue; }
+		ancestors ??= new Set([source]);
+		copied[key] = copyFactData(entry, `${label}.${key}`, ancestors, 1);
+	}
+	return copied;
 }
 
 function copyFactData(value, label, ancestors = new Set(), depth = 0) {
@@ -198,6 +212,25 @@ function copyFactData(value, label, ancestors = new Set(), depth = 0) {
 }
 
 function denseDataArray(value, label) {
+	// A plain array with exactly its indices and `length` as own keys needs one descriptor check per element.
+	// Anything else takes the exhaustive path below, which also names the failure.
+	if (Array.isArray(value) && !nodeTypes.isProxy(value) && Object.getPrototypeOf(value) === Array.prototype) {
+		const length = value.length;
+		if (Reflect.ownKeys(value).length === length + 1) {
+			const copied = new Array(length);
+			let index = 0;
+			for (; index < length; index += 1) {
+				const descriptor = Object.getOwnPropertyDescriptor(value, index);
+				if (descriptor === undefined || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) break;
+				copied[index] = descriptor.value;
+			}
+			if (index === length) return copied;
+		}
+	}
+	return exhaustiveDenseDataArray(value, label);
+}
+
+function exhaustiveDenseDataArray(value, label) {
 	if (!Array.isArray(value) || nodeTypes.isProxy(value) || Object.getPrototypeOf(value) !== Array.prototype) throw new TypeError(`${label} must be a plain array`);
 	const descriptors = Object.getOwnPropertyDescriptors(value);
 	const keys = Reflect.ownKeys(value);
@@ -215,7 +248,9 @@ function denseDataArray(value, label) {
 }
 
 function ownDataRecord(value, label) {
-	if (value === null || typeof value !== 'object' || Array.isArray(value) || nodeTypes.isProxy(value) || ![null, Object.prototype].includes(Object.getPrototypeOf(value))) throw new TypeError(`${label} must be a plain data record`);
+	if (value === null || typeof value !== 'object' || Array.isArray(value) || nodeTypes.isProxy(value)) throw new TypeError(`${label} must be a plain data record`);
+	const prototype = Object.getPrototypeOf(value);
+	if (prototype !== null && prototype !== Object.prototype) throw new TypeError(`${label} must be a plain data record`);
 	const record = Object.create(null);
 	for (const key of Reflect.ownKeys(value)) {
 		if (typeof key !== 'string' || FORBIDDEN_KEYS.has(key)) throw new TypeError(`${label} contains an unsafe key`);
@@ -244,6 +279,11 @@ function reuseEqual(previous, next) {
 function sameTrustedValue(left, right) {
 	if (Object.is(left, right)) return true;
 	if (left === null || right === null || typeof left !== 'object' || typeof right !== 'object' || Array.isArray(left) !== Array.isArray(right)) return false;
+	if (Array.isArray(left)) {
+		if (left.length !== right.length) return false;
+		for (let index = 0; index < left.length; index += 1) if (!sameTrustedValue(left[index], right[index])) return false;
+		return true;
+	}
 	const leftKeys = Object.keys(left);
 	const rightKeys = Object.keys(right);
 	if (leftKeys.length !== rightKeys.length) return false;

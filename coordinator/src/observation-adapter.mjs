@@ -525,6 +525,25 @@ function nonNegativeInteger(value, label) {
 }
 
 function boundedDataArray(value, label, maximum) {
+	// A plain array with exactly its indices and `length` as own keys needs one descriptor check per element.
+	// Anything else takes the exhaustive path below, which also names the failure.
+	if (Array.isArray(value) && !nodeTypes.isProxy(value) && Object.getPrototypeOf(value) === Array.prototype) {
+		const length = value.length;
+		if (length <= maximum && Reflect.ownKeys(value).length === length + 1) {
+			const copied = new Array(length);
+			let index = 0;
+			for (; index < length; index += 1) {
+				const descriptor = Object.getOwnPropertyDescriptor(value, index);
+				if (descriptor === undefined || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) break;
+				copied[index] = descriptor.value;
+			}
+			if (index === length) return copied;
+		}
+	}
+	return exhaustiveBoundedDataArray(value, label, maximum);
+}
+
+function exhaustiveBoundedDataArray(value, label, maximum) {
 	if (!Array.isArray(value) || nodeTypes.isProxy(value) || Object.getPrototypeOf(value) !== Array.prototype) throw new TypeError(`${label} must be a plain array`);
 	const descriptors = Object.getOwnPropertyDescriptors(value);
 	const keys = Reflect.ownKeys(value);

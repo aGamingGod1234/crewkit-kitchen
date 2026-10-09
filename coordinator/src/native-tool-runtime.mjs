@@ -12,6 +12,15 @@ import { compileProgramPrecondition, evaluateProgramPrecondition } from './progr
 const FORGET_REASONS = /agent_removed|server_replaced|coordinator_stopped/;
 const TERMINAL_ACTION_STATES = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT']);
 const POST_ACTION_OBSERVATION_TYPES = new Set(['pick_up_item', 'break_block', 'navigate_to']);
+// The server publishes its post-result observation in the same tick as the result. Live, with eight agents on a
+// loaded machine, the first one arrived a median 13 ms and p95 34 ms after the result; 40 ms (under one tick)
+// held the miss rate at 0.2% of results, and 75 ms did no better. Past it the explicit request takes over, so a
+// miss costs at most this much. The wait only starts once an agent's last results were each followed by a
+// publication, so a server that does not publish after results (or an agent whose publication was missed)
+// keeps requesting at once.
+const POST_RESULT_PUBLICATION_GRACE_MS = 40;
+const PUBLICATION_EVIDENCE_RESULTS = 2;
+const EXPIRED = Symbol('expired');
 // The model may answer danger with these while its program is paused for a decision, without first
 // settling the program decision; the paused program keeps its decision for a later respondProgram.
 const PAUSED_PROGRAM_DANGER_ACTIONS = new Set(['fight_target', 'flee_from']);
@@ -56,8 +65,10 @@ export class NativeToolRuntime {
 	#receipts = new Map();
 	#executionEpochs = new Map();
 	#postResultSamples = new Map();
+	#publicationStreaks = new Map();
 	#sequenceFinishReservations = new Map();
 	#sequence = 0;
+	#publicationGraceMs;
 
 	constructor({
 		bridge,
@@ -80,6 +91,7 @@ export class NativeToolRuntime {
 		onModelActionCancelled = () => {},
 		sessionId = randomUUID(),
 		occupancy = new ExplorationOccupancy(),
+		publicationGraceMs = POST_RESULT_PUBLICATION_GRACE_MS,
 	} = {}) {
 		if (typeof bridge?.send !== 'function') throw new TypeError('bridge.send must be a function');
 		if (registry !== null && typeof registry?.get !== 'function') throw new TypeError('registry.get must be a function');
@@ -125,6 +137,8 @@ export class NativeToolRuntime {
 		this.#onModelActionCancelled = onModelActionCancelled;
 		this.#sessionId = sessionId.length <= 36 ? sessionId : createHash('sha256').update(sessionId).digest('hex').slice(0, 32);
 		this.#occupancy = occupancy;
+		if (!Number.isFinite(publicationGraceMs) || publicationGraceMs < 0) throw new TypeError('publicationGraceMs must be a nonnegative number');
+		this.#publicationGraceMs = publicationGraceMs;
 	}
 
 	async initializeMemory(agentId) {
@@ -169,7 +183,12 @@ export class NativeToolRuntime {
 	#notePublishedSample(record) {
 		const pending = this.#postResultSamples.get(record.agentId);
 		if (pending === undefined || pending.goalRevision !== record.goalRevision || pending.published) return;
+		// A forced local update (a synthetic death notice) is stored at the last live sequence, which is no newer
+		// than the result: it must neither satisfy the barrier nor count as proof that the server published.
+		const stored = this.#observations.get(record.agentId);
+		if (stored?.goalRevision !== record.goalRevision || stored.eventSequence <= pending.eventSequence) return;
 		pending.published = true;
+		this.#publicationStreaks.set(record.agentId, (this.#publicationStreaks.get(record.agentId) ?? 0) + 1);
 		pending.wake?.();
 	}
 
@@ -187,7 +206,7 @@ export class NativeToolRuntime {
 		// methods still clone at their boundaries, so sharing here does not expose
 		// mutable coordinator state while avoiding a duplicate deep copy per update.
 		const storedObservation = structuredClone(raw);
-		this.#memoryObservation?.(record, storedObservation);
+		this.#memoryObservation?.(record, storedObservation, { owned: true });
 		const program = this.#programRuns.get(record.agentId);
 		// Remember invalidation even if the player returns before storage resolves.
 		const lookupWorld = program?.noteLookupWorld;
@@ -412,7 +431,8 @@ export class NativeToolRuntime {
 		return { ...started, startedAs: 'start_action', replacedAction: { actionId: previous.actionId, state: previous.state } };
 	}
 
-	async #observe(record, { includeMetadata = true, afterResult = null } = {}) {
+	// `lean` returns the stored sample itself (no copy, no model-facing decoration) for internal callers that only read it.
+	async #observe(record, { includeMetadata = true, afterResult = null, lean = false } = {}) {
 		const epoch = this.#executionEpoch(record.agentId);
 		await this.initializeMemory(record.agentId);
 		if (this.#executionEpoch(record.agentId) !== epoch) throw codedError('STALE_NATIVE_TOOL', 'Observation request outlived its lifecycle');
@@ -423,6 +443,9 @@ export class NativeToolRuntime {
 			const pending = afterResult === null ? undefined : this.#postResultSamples.get(record.agentId);
 			if (pending?.result === afterResult && pending.goalRevision === record.goalRevision) {
 				await this.#awaitPostResultSample(record, epoch, afterEventSequence, pending);
+				// Fresh means a stored sample newer than the one the result was fenced at, whoever delivered it.
+				const sampled = this.#observations.get(record.agentId);
+				if (sampled?.goalRevision !== record.goalRevision || sampled.eventSequence <= pending.eventSequence) await this.#requestSample(record, epoch, pending.eventSequence);
 				freshness = { fresh: true, afterEventSequence: pending.eventSequence };
 			} else {
 				await this.#requestSample(record, epoch, afterEventSequence);
@@ -433,10 +456,10 @@ export class NativeToolRuntime {
 		}
 		const latest = this.#observations.get(record.agentId);
 		const facts = latest?.goalRevision === record.goalRevision
-			? structuredClone(latest)
+			? lean ? { eventSequence: latest.eventSequence, observation: latest.observation } : structuredClone(latest)
 			: { eventSequence: 0, goal: record.currentGoal ?? null, goalSpec: record.currentGoalSpec ?? null, observation: {} };
 		delete facts.goalRevision;
-		facts.observation = this.#decorate(record, facts.observation ?? {});
+		if (!lean) facts.observation = this.#decorate(record, facts.observation ?? {});
 		// Internal continuations need fresh world facts, not model-facing metadata.
 		const metadata = includeMetadata ? { ...await this.#executionMetadata(record), ...await this.#memorySummary(record) } : {};
 		this.#assertCurrent(record);
@@ -454,28 +477,44 @@ export class NativeToolRuntime {
 
 	/**
 	 * Uses the server's post-result publication when it is already here or arrives
-	 * first. The explicit request remains the guarantee; answering it costs the
-	 * server one more tick, which previously delayed every authored continuation.
+	 * first. The server publishes it in the same tick as the result, while an explicit
+	 * request is only answered a tick later, so the request is held back for a short
+	 * grace period: sent at once it cost the server one more observation per action.
+	 * The request remains the guarantee when the publication does not come.
 	 */
 	async #awaitPostResultSample(record, epoch, afterEventSequence, pending) {
 		if (pending.published) return;
-		const published = new Promise((resolve) => { pending.wake = resolve; });
+		pending.publication ??= new Promise((resolve) => { pending.wake = resolve; });
+		const published = pending.publication;
+		if ((this.#publicationStreaks.get(record.agentId) ?? 0) >= PUBLICATION_EVIDENCE_RESULTS && this.#publicationGraceMs > 0) {
+			const startedAt = performance.now();
+			let timer;
+			const expired = new Promise((resolve) => { timer = setTimeout(resolve, this.#publicationGraceMs, EXPIRED); });
+			try { if (await Promise.race([published, expired]) !== EXPIRED) return; }
+			finally { clearTimeout(timer); }
+			if (pending.published) return;
+			// A busy event loop runs an expired timer before it reads the socket, so a publication that already
+			// arrived is handled in the poll phase after this timer. One check-phase turn lets it count.
+			await new Promise((resolve) => setImmediate(resolve));
+			if (pending.published) return;
+			if (this.#executionEpoch(record.agentId) !== epoch) throw codedError('STALE_NATIVE_TOOL', 'Observation request outlived its lifecycle');
+			this.#trace('native_post_result_publication_missed', { agentId: record.agentId, goalRevision: record.goalRevision, waitedMs: Math.round(performance.now() - startedAt) });
+		}
 		const requested = this.#requestSample(record, epoch, afterEventSequence);
 		// A superseded request still stores its newer sample under the same lifecycle checks.
 		requested.catch(() => {});
-		try {
-			try { await Promise.race([published, requested]); }
-			catch (error) {
-				// An observation already on the wire may still be queued behind the
-				// action-result handler. Give that queued publication one event-loop
-				// turn to arrive before treating an inspection error as authoritative.
-				if (!pending.published) {
-					await new Promise((resolve) => setImmediate(resolve));
-				}
-				if (!pending.published) throw error;
+		try { await Promise.race([published, requested]); }
+		catch (error) {
+			// An observation already on the wire may still be queued behind the
+			// action-result handler. Give that queued publication one event-loop
+			// turn to arrive before treating an inspection error as authoritative.
+			if (!pending.published) {
+				await new Promise((resolve) => setImmediate(resolve));
 			}
+			if (!pending.published) throw error;
 		}
-		finally { pending.wake = null; }
+		// The request answered first: the server did not publish in time, so stop waiting for it.
+		if (!pending.published) this.#publicationStreaks.set(record.agentId, 0);
 	}
 
 	async #memorySummary(record) {
@@ -784,7 +823,7 @@ export class NativeToolRuntime {
 			refreshObservation: async () => {
 				const afterResult = lastActionResult;
 				lastActionResult = null;
-				const facts = await this.#observe(record, { includeMetadata: false, afterResult });
+				const facts = await this.#observe(record, { includeMetadata: false, afterResult, lean: true });
 				if (facts.freshness.fresh !== true) throw codedError('FRESH_OBSERVATION_REQUIRED', 'Program continuation needs a new authoritative player observation');
 				const snapshot = this.#observations.get(record.agentId);
 				const pending = this.#postResultSamples.get(record.agentId);
@@ -1234,7 +1273,7 @@ export class NativeToolRuntime {
 		this.#flushSpatial(record.agentId).catch((error) => this.#trace('native_spatial_memory_failed', { agentId: record.agentId, reasonCode: error?.code ?? 'MEMORY_WRITE_FAILED' }));
 		this.#trace('native_tool_action_completed', { agentId: record.agentId, goalRevision: record.goalRevision, actionId: active.actionId, ...result, ...serverTimingTraceFields(payload) });
 		const latest = this.#observations.get(record.agentId);
-		this.#postResultSamples.set(record.agentId, { result, goalRevision: record.goalRevision, published: false, wake: null,
+		this.#postResultSamples.set(record.agentId, { result, goalRevision: record.goalRevision, published: false, wake: null, publication: null,
 			eventSequence: latest?.goalRevision === record.goalRevision ? latest.eventSequence : 0 });
 		active.resolve(result);
 		return true;
@@ -1288,6 +1327,7 @@ export class NativeToolRuntime {
 			this.#placedWorkstations.clear(agentId);
 			this.#lastLive.delete(agentId);
 			this.#receipts.delete(agentId);
+			this.#publicationStreaks.delete(agentId);
 		}
 		this.#observations.delete(agentId);
 		this.#inspectedTargets.delete(agentId);

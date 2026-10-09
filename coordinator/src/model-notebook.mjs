@@ -161,7 +161,7 @@ export class ModelNotebook {
 		};
 		while (state.notes.length > this.#maximumNotes) { state.notes.shift(); state.evictedNotes++; }
 		while (state.receipts.length > this.#maximumReceipts) evictReceipt(state.receipts[0]);
-		while (Buffer.byteLength(JSON.stringify({ ...state, recovery: [] }), 'utf8') > this.#maximumBytes) {
+		while (serializedBytes(state, false) > this.#maximumBytes) {
 			const receipt = state.receipts.find((entry) => entry !== retained);
 			const note = state.notes.find((entry) => entry !== retained);
 			if (receipt && (!note || receipt.revision <= note.revision)) {
@@ -178,7 +178,7 @@ export class ModelNotebook {
 		// suffices: mutations are serialized and older terminal history is evictable.
 		// Pending records (including legacy states at exactly 4 MB) are never dropped.
 		const maximumBytes = MAX_NOTEBOOK_BYTES + (retained === null || retained.source === 'server_action_result' ? TERMINAL_RESERVE_BYTES : 0);
-		while (Buffer.byteLength(JSON.stringify(state), 'utf8') > maximumBytes) {
+		while (serializedBytes(state, true) > maximumBytes) {
 			const receipt = state.receipts.find(entry => entry !== retained && entry.source === 'server_action_result');
 			const note = state.notes.find(entry => entry !== retained);
 			if (receipt && (!note || receipt.revision <= note.revision)) evictReceipt(receipt);
@@ -189,6 +189,23 @@ export class ModelNotebook {
 	}
 }
 
+// Entries are immutable, so each is measured once; a whole-state stringify per mutation is the only other way to know the size.
+const ENTRY_BYTES = new WeakMap();
+function entryBytes(entry) {
+	let bytes = ENTRY_BYTES.get(entry);
+	if (bytes === undefined) { bytes = Buffer.byteLength(JSON.stringify(entry), 'utf8'); ENTRY_BYTES.set(entry, bytes); }
+	return bytes;
+}
+/** Exactly Buffer.byteLength(JSON.stringify(state)) (recovery counted only when asked), without serializing the entries again. */
+export function serializedBytes(state, includeRecovery) {
+	let total = Buffer.byteLength(JSON.stringify({ ...state, notes: [], receipts: [], recovery: [] }), 'utf8');
+	for (const list of includeRecovery ? [state.notes, state.receipts, state.recovery] : [state.notes, state.receipts]) {
+		if (list.length === 0) continue;
+		total += list.length - 1;
+		for (const entry of list) total += entryBytes(entry);
+	}
+	return total;
+}
 function recoveryLimit() { return Object.assign(new Error('RECEIPT_RECOVERY_LIMIT'), { code: 'RECEIPT_RECOVERY_LIMIT' }); }
 function samePayload(existing, next) { const { revision: _revision, ...payload } = existing; return isDeepStrictEqual(payload, next); }
 function text(value, field, maximum) {
