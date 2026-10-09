@@ -46,17 +46,17 @@ public final class DirectorFeature implements CrewkitFeature {
 	/** Event to shot, or null to leave the camera where it is. Dwell = how long the shot holds after arriving. */
 	static Shot shotFor(String event, JsonObject data) {
 		return switch (event == null ? "" : event) {
-			case "brief" -> new Shot("brief", 90);
-			case "candidates", "item_added" -> new Shot("line", 60);
-			case "item_removed" -> new Shot("line", 50);
-			case "quote" -> new Shot("quotes", 60);
-			case "activity" -> activityShot(data);
-			case "gate_blocked" -> new Shot("gate", 60);
-			case "gate_passed" -> new Shot("gate", 50);
+			case "brief" -> new Shot("brief", 140);
+			case "candidates", "item_added" -> new Shot("line", 160);
+			case "item_removed" -> null;
+			case "quote" -> new Shot("quotes", 140);
+			case "activity" -> null; // story beats only: per-call cuts made the camera jump around
+			case "gate_blocked" -> new Shot("gate", 120);
+			case "gate_passed" -> new Shot("gate", 100);
 			// The stablecoin skit cues its own shots and then the QR.
 			case "checkout" -> dev.agaminggod.arenaagents.crewkit.fun.skit.StablecoinSkit.active() ? null : new Shot("qr", 100);
 			case "completed" -> new Shot("door", 60);
-			case "record" -> new Shot("bill", 120);
+			case "record" -> new Shot("bill", 220);
 			case "failed", "expired" -> new Shot("budget", 60);
 			case "reset" -> new Shot("wide", 20);
 			default -> null; // "calls" and friends: the counter ticks in whatever shot is live
@@ -99,6 +99,7 @@ public final class DirectorFeature implements CrewkitFeature {
 	 * Called by GuestChatterFeature.
 	 */
 	public static void guestSpoke(Vec3 at) {
+		if (true) return; // keep the camera on the chef; guest chatter stays in the background
 		var o = CrewkitAnchors.origin;
 		double x = at.x - o.getX();
 		String mark = x < 10 ? "guests_a" : x < 18 ? "guests_b" : "guests_wide";
@@ -130,9 +131,7 @@ public final class DirectorFeature implements CrewkitFeature {
 			now++;
 			if (QUEUE.isEmpty() && now >= nextAllowed && now - lastCut >= IDLE_TICKS && current != null) {
 				// Downtime: visit the guests, then settle on the wide. Each shot drifts slowly while it holds.
-				QUEUE.addLast(new Shot("guests_a", 100, true));
-				QUEUE.addLast(new Shot("guests_b", 100, true));
-				QUEUE.addLast(new Shot("wide", 120, true));
+				QUEUE.addLast(new Shot("line", 240, true));
 			}
 			if (now < nextAllowed || QUEUE.isEmpty()) return;
 			shot = QUEUE.pollFirst();

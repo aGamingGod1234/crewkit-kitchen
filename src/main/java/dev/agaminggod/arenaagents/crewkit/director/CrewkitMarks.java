@@ -131,7 +131,7 @@ public final class CrewkitMarks {
 	public static final Mark BRIEF = fit("brief", "Brief: ticket and seated guests",
 			new Box(3.2, 1, 8.6, 16.6, 4.4, 15.3), -0.9, -0.55, -0.7);
 	public static final Mark LINE = fit("line", "Line: chef, head stack, bubble, candidate fan",
-			new Box(5.8, 1, 5.6, 11.2, 6.6, 7.9), -1, -0.05, 0.12);
+			new Box(7.4, 1.2, 5.8, 9.6, 6.2, 7.3), -1, -0.08, 0.15);
 	public static final Mark BUDGET = fit("budget", "Budget board",
 			new Box(2, 1.8, 1.05, 11, 6.7, 1.1), 0, 0, -1);
 	public static final Mark QUOTES = fit("quotes", "Quotes: ticker, printer, jar, busy sign",
