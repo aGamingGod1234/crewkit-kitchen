@@ -1758,8 +1758,25 @@ function normalizeConversationWake(value) {
 	};
 }
 
+const SURVEY_SECTIONS = Object.freeze(['structures', 'poi', 'biomes', 'built', 'blocks', 'caves', 'veins']);
+
+/** Survey include/exclude: section names, plus blocks:<namespaced id> searches in include only; at most 8 entries. */
+function surveySections(value, field, allowSearch) {
+	return boundedArray(value, `query.${field}`, 8).map((entry, index) => {
+		const text = boundedText(entry, `query.${field}[${index}]`, 263);
+		if (SURVEY_SECTIONS.includes(text) || (allowSearch && /^blocks:[a-z0-9_.-]+:[a-z0-9_./-]+$/.test(text))) return text;
+		throw new ProtocolV2Error('INVALID_PAYLOAD', `Unknown survey section: ${text}`);
+	});
+}
+
 export function normalizeInspectionQuery(value) {
-	exactKeys(value, ['section', 'offset', 'limit', 'slot', 'x', 'y', 'z', 'afterSequence', 'recipeId', 'entityType', 'outputItemId'], ['section'], 'inspection.query');
+	exactKeys(value, ['section', 'offset', 'limit', 'slot', 'x', 'y', 'z', 'afterSequence', 'recipeId', 'entityType', 'outputItemId', 'include', 'exclude'], ['section'], 'inspection.query');
+	if (value.section === 'survey') {
+		exactKeys(value, ['section', 'limit', 'include', 'exclude'], ['section'], 'inspection.query');
+		const limit = positiveInteger(value.limit === undefined ? 4 : value.limit, 'query.limit');
+		if (limit > 8) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Survey rows per section must be 1 to 8');
+		return { section: 'survey', limit, ...(value.include === undefined ? {} : { include: surveySections(value.include, 'include', true) }), ...(value.exclude === undefined ? {} : { exclude: surveySections(value.exclude, 'exclude', false) }) };
+	}
 	if (!['observation', 'inventory', 'menu', 'entities', 'blocks', 'item', 'block', 'events', 'landmarks', 'nearby_containers', 'recipes', 'mechanics'].includes(value.section)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Unknown inspection section');
 	const sectionFields = { item: ['slot'], block: ['x', 'y', 'z'], events: ['afterSequence'], recipes: ['recipeId', 'outputItemId'], entities: ['entityType'] };
 	exactKeys(value, ['section', 'offset', 'limit', ...(sectionFields[value.section] ?? [])], ['section'], 'inspection.query');
@@ -1843,29 +1860,44 @@ function normalizeObservation(value) {
 	return normalized;
 }
 
+function sightedBlockIds(value, field) {
+	const ids = boundedArray(value, field, 4).map((id, index) => requireIdentifier(id, `${field}[${index}]`));
+	if (ids.length === 0) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must name at least one block`);
+	return ids;
+}
+
+// Far-sight rows (structures, built, biomes, poi, blocks) appear in passive updates only while newly sighted. A near
+// structure is named (structure); a far one gives clues (blocks seen, size) instead.
 const SIGHTED_ROWS = Object.freeze({
-	structures: { maximum: 4, label: ['structure', requireIdentifier], extra: { new: boolean } },
-	caves: { maximum: 3, extra: { air: positiveInteger } },
-	veins: { maximum: 4, label: ['blockId', requireIdentifier], extra: { visible: positiveInteger } },
+	structures: { maximum: 4, required: {}, optional: { structure: requireIdentifier, blocks: sightedBlockIds, size: positiveInteger, new: boolean }, oneOf: ['structure', 'blocks'] },
+	caves: { maximum: 3, required: { air: positiveInteger }, optional: {} },
+	veins: { maximum: 4, required: { blockId: requireIdentifier, visible: positiveInteger }, optional: {} },
+	built: { maximum: 3, required: { blocks: sightedBlockIds, size: positiveInteger }, optional: { new: boolean } },
+	biomes: { maximum: 4, required: { biome: requireIdentifier }, optional: { new: boolean } },
+	poi: { maximum: 4, required: { blockId: requireIdentifier }, optional: { new: boolean } },
+	blocks: { maximum: 4, required: { blockId: requireIdentifier }, optional: { count: positiveInteger, new: boolean } },
 });
 
-/** Structures, dark open spaces and ore veins currently in line of sight; never unseen ones. */
+/** What the agent currently sees (structures, built clusters, biomes, points of interest, blocks, caves, veins); never unseen things. */
 function sightedObservation(value) {
 	exactKeys(value, Object.keys(SIGHTED_ROWS), [], 'sighted');
 	const normalized = {};
-	for (const [kind, { maximum, label, extra }] of Object.entries(SIGHTED_ROWS)) {
+	for (const [kind, { maximum, required, optional, oneOf }] of Object.entries(SIGHTED_ROWS)) {
 		if (value[kind] === undefined) continue;
 		normalized[kind] = boundedArray(value[kind], `sighted.${kind}`, maximum).map((entry, index) => {
 			const field = `sighted.${kind}[${index}]`;
-			const required = [...(label === undefined ? [] : [label[0]]), 'x', 'y', 'z', 'distance', 'bearing'];
-			exactKeys(entry, [...required, ...Object.keys(extra)], kind === 'structures' ? required : [...required, ...Object.keys(extra)], field);
+			const place = ['x', 'y', 'z', 'distance', 'bearing'];
+			exactKeys(entry, [...place, ...Object.keys(required), ...Object.keys(optional)], [...place, ...Object.keys(required)], field);
+			if (oneOf !== undefined && oneOf.filter((key) => entry[key] !== undefined).length !== 1) {
+				throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} needs exactly one of ${oneOf.join(' or ')}`);
+			}
 			const bearing = finiteNumber(entry.bearing, `${field}.bearing`);
 			if (bearing < -180 || bearing > 180) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}.bearing must be in [-180, 180]`);
+			const checks = { ...required, ...optional };
 			return {
-				...(label === undefined ? {} : { [label[0]]: label[1](entry[label[0]], `${field}.${label[0]}`) }),
+				...Object.fromEntries(Object.entries(checks).filter(([key]) => entry[key] !== undefined).map(([key, check]) => [key, check(entry[key], `${field}.${key}`)])),
 				x: integer(entry.x, `${field}.x`), y: integer(entry.y, `${field}.y`), z: integer(entry.z, `${field}.z`),
 				distance: nonnegativeFiniteNumber(entry.distance, `${field}.distance`), bearing,
-				...Object.fromEntries(Object.entries(extra).filter(([key]) => entry[key] !== undefined).map(([key, check]) => [key, check(entry[key], `${field}.${key}`)])),
 			};
 		});
 	}

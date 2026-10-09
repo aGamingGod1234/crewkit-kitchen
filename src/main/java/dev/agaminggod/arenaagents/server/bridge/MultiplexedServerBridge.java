@@ -1393,7 +1393,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				return;
 			} else {
 				ServerPlayer player = manager.findAgentPlayer(id).orElseThrow(() -> new AgentDomainException("PLAYER_UNAVAILABLE", "No player to inspect"));
-				JsonObject inspection = observations.collectInspection(player, query);
+				JsonObject inspection = observations.collectInspection(id, player, query);
 				ObservationPublication.Result published = observationPublication.deliverInspection(id, source, inspection,
 						(agent, result) -> {
 							reply.add("result", result);
@@ -1414,7 +1414,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	static JsonObject validateInspectionQuery(JsonObject query) {
-		Set<String> sections = Set.of("observation", "inventory", "menu", "entities", "blocks", "item", "block", "events", "landmarks", "nearby_containers", "recipes", "mechanics");
+		Set<String> sections = Set.of("observation", "inventory", "menu", "entities", "blocks", "item", "block", "events", "landmarks", "nearby_containers", "recipes", "mechanics", "survey");
 		JsonElement sectionValue = query.get("section");
 		if (sectionValue == null || !sectionValue.isJsonPrimitive() || !sectionValue.getAsJsonPrimitive().isString()
 				|| !sections.contains(sectionValue.getAsString())) throw new AgentDomainException("INVALID_INSPECTION", "Unknown inspection section");
@@ -1425,8 +1425,18 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		if ("events".equals(section)) allowed.add("afterSequence");
 		if ("recipes".equals(section)) allowed.addAll(Set.of("recipeId", "outputItemId"));
 		if ("entities".equals(section)) allowed.add("entityType");
+		if ("survey".equals(section)) {
+			allowed.remove("offset");
+			allowed.addAll(Set.of("include", "exclude"));
+		}
 		if (!allowed.containsAll(query.keySet())) throw new AgentDomainException("INVALID_INSPECTION", "Unexpected field for inspection section");
 		JsonObject result = query.deepCopy();
+		if ("survey".equals(section)) {
+			if (!result.has("limit")) result.addProperty("limit", 4);
+			inspectionInteger(result, "limit", 1, 8);
+			for (String field : List.of("include", "exclude")) if (result.has(field)) surveySections(result.get(field), field);
+			return result;
+		}
 		if (!result.has("offset")) result.addProperty("offset", 0);
 		if (!result.has("limit")) result.addProperty("limit", 16);
 		inspectionInteger(result, "offset", 0, 4096);
@@ -1447,6 +1457,18 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			}
 		}
 		return result;
+	}
+
+	/** Survey include/exclude: up to 8 section names or blocks:<namespaced id> entries (include only). */
+	private static void surveySections(JsonElement value, String field) {
+		if (!value.isJsonArray() || value.getAsJsonArray().size() > 8) throw new AgentDomainException("INVALID_INSPECTION", field + " must be an array of at most 8 entries");
+		Set<String> sections = Set.of("structures", "poi", "biomes", "built", "blocks", "caves", "veins");
+		for (JsonElement entry : value.getAsJsonArray()) {
+			if (!entry.isJsonPrimitive() || !entry.getAsJsonPrimitive().isString()) throw new AgentDomainException("INVALID_INSPECTION", field + " entries must be strings");
+			String text = entry.getAsString();
+			boolean search = "include".equals(field) && text.length() <= 263 && text.matches("blocks:[a-z0-9_.-]+:[a-z0-9_./-]+");
+			if (!sections.contains(text) && !search) throw new AgentDomainException("INVALID_INSPECTION", "Unknown survey section: " + text);
+		}
 	}
 
 	private static long inspectionInteger(JsonObject query, String field, long minimum, long maximum) {

@@ -12,7 +12,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.ToDoubleFunction;
+import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.Vec3;
 
 /** Structure, cave and ore-vein sightings: only seen blocks count, and dug tunnels or houses are not caves. */
@@ -29,14 +31,22 @@ public final class SightedFeaturesVerification {
 		oreFamilies();
 		veinsCountOnlySeenOre();
 		cavesNeedRoomRoofAndNaturalWalls();
-		structuresKeepNearestPerStart();
 		structureLabels();
 		onlyBuiltBlocksIdentifyStructures();
 		sightedRecomputeIsThrottled();
-		structuresAreNewOncePerMinute();
+		announcements();
 		rendering();
 		attention();
 		naturalTerrain();
+		farSightKinds();
+		farSightClusters();
+		farSightGeometry();
+		surveyRequests();
+		seenPartsOnly();
+		stableClusterKeys();
+		surveysAcknowledge();
+		fogRange();
+		perTickBudgets();
 		return checks;
 	}
 
@@ -134,16 +144,6 @@ public final class SightedFeaturesVerification {
 				== SightedFeatures.MAX_CAVES, "cave rows are capped");
 	}
 
-	private static void structuresKeepNearestPerStart() {
-		List<Sighting> rows = SightedFeatures.nearestPerKey(List.of(
-				new Sighting("minecraft:shipwreck@1,2", "shipwreck", new Cell(30, 60, 0), 30, 0),
-				new Sighting("minecraft:village_plains@5,5", "village", new Cell(80, 70, 0), 80, 0),
-				new Sighting("minecraft:shipwreck@1,2", "shipwreck", new Cell(25, 60, 0), 25, 0)), SightedFeatures.MAX_STRUCTURES);
-		check(rows.size() == 2, "one row per structure start");
-		check(rows.getFirst().cell().equals(new Cell(25, 60, 0)), "the nearest seen block represents the structure");
-		check("village".equals(rows.get(1).label()), "structures are ordered nearest first");
-	}
-
 	/** Review decision: structures read as a player names them, and buried treasure (never visible) is never reported. */
 	private static void structureLabels() {
 		String[][] expected = {
@@ -206,33 +206,224 @@ public final class SightedFeaturesVerification {
 				"a 2.5 degree head movement reuses the sight rays");
 	}
 
-	private static void structuresAreNewOncePerMinute() {
-		Map<String, Long> seen = new HashMap<>();
-		check(SightedFeatures.markSeen(seen, "minecraft:shipwreck@1,2", 100), "first sighting is new");
-		check(!SightedFeatures.markSeen(seen, "minecraft:shipwreck@1,2", 700), "a second glance is not new");
-		check(!SightedFeatures.markSeen(seen, "minecraft:shipwreck@1,2", 1_800), "steady sighting stays not new");
-		check(SightedFeatures.markSeen(seen, "minecraft:shipwreck@1,2", 1_800 + SightedFeatures.NEW_STRUCTURE_TICKS + 1), "seen again after a minute away is new");
-		for (int index = 0; index < SightedFeatures.MAX_REMEMBERED_STRUCTURES + 5; index++) SightedFeatures.markSeen(seen, "s" + index, 5_000 + index);
+	/** A far-sight row is announced once, rides passive updates for 30 s, and is announced again after a minute away. */
+	private static void announcements() {
+		SightedFeatures.Announcements seen = new SightedFeatures.Announcements();
+		check(seen.see("village", 100) == 100, "first sighting is announced now");
+		check(seen.see("village", 400) == 100, "a second glance keeps the first announcement");
+		check(seen.see("village", 1_500) == 100, "a steady sighting (glances under a minute apart) is never re-announced");
+		long back = 1_500 + SightedFeatures.NEW_STRUCTURE_TICKS + 1;
+		check(seen.see("village", back) == back, "seen again after a minute out of sight is announced again");
+		for (int index = 0; index < SightedFeatures.MAX_REMEMBERED_STRUCTURES + 5; index++) seen.see("s" + index, 5_000 + index);
 		check(seen.size() <= SightedFeatures.MAX_REMEMBERED_STRUCTURES, "the latch is bounded");
 	}
 
+	private static FarSight.Row farRow(FarSight.Section section, String key, String label, List<String> blocks, int count, int size, Cell cell) {
+		return new FarSight.Row(section, key, label, blocks, count, size, cell, Math.sqrt((double) cell.x() * cell.x() + (double) cell.z() * cell.z()));
+	}
+
 	private static void rendering() {
-		check(SightedFeatures.toJson(Sample.EMPTY, Vec3.ZERO, 0.0F, key -> true) == null, "nothing seen: no field");
+		SightedFeatures.Announcements seen = new SightedFeatures.Announcements();
+		check(SightedFeatures.toJson(Sample.EMPTY, Vec3.ZERO, 0.0F, seen, 0L) == null, "nothing seen: no field");
 		Sample sample = new Sample(
-				List.of(new Sighting("minecraft:shipwreck@1,2", "shipwreck", new Cell(0, 60, 40), 40.4, 0)),
+				List.of(farRow(FarSight.Section.STRUCTURES, "minecraft:shipwreck@1,2", "shipwreck", List.of(), 0, 20, new Cell(0, 60, 40)),
+						farRow(FarSight.Section.STRUCTURES, "minecraft:village_plains@9,9", null, List.of("minecraft:oak_planks", "minecraft:cobblestone"), 0, 48, new Cell(0, 70, 150)),
+						farRow(FarSight.Section.BUILT, "built@1,2,3", null, List.of("minecraft:oak_planks", "minecraft:glass", "minecraft:torch"), 0, 20, new Cell(-100, 64, 100)),
+						farRow(FarSight.Section.BIOMES, "biome:minecraft:desert", "minecraft:desert", List.of(), 0, 0, new Cell(64, 64, 64)),
+						farRow(FarSight.Section.POI, "poi:minecraft:nether_portal@1", "minecraft:nether_portal", List.of(), 0, 0, new Cell(10, 64, 120)),
+						farRow(FarSight.Section.BLOCKS, "lava@1", "minecraft:lava", List.of(), 12, 0, new Cell(5, 60, 20))),
 				List.of(new Sighting("cave@0,0,1", null, new Cell(10, 0, 0), 10.2, 44)),
 				List.of(new Sighting("minecraft:iron_ore@1,0,0", "minecraft:deepslate_iron_ore", new Cell(1, 0, 0), 1.2, 5)));
-		JsonObject json = SightedFeatures.toJson(sample, new Vec3(0.5D, 0.0D, 0.5D), 0.0F, key -> key.startsWith("minecraft:shipwreck"));
-		JsonObject structure = json.getAsJsonArray("structures").get(0).getAsJsonObject();
-		check("shipwreck".equals(structure.get("structure").getAsString()) && structure.get("new").getAsBoolean(), "structure row names the structure and marks it new");
-		check(structure.get("distance").getAsLong() == 40 && structure.get("bearing").getAsLong() == 0, "straight ahead at 40 blocks");
+		JsonObject json = SightedFeatures.toJson(sample, new Vec3(0.5D, 0.0D, 0.5D), 0.0F, seen, 1_000L);
+		JsonObject near = json.getAsJsonArray("structures").get(0).getAsJsonObject();
+		check("shipwreck".equals(near.get("structure").getAsString()) && near.get("new").getAsBoolean(), "a near structure is named and marked new");
+		check(near.get("distance").getAsLong() == 40 && near.get("bearing").getAsLong() == 0, "straight ahead at 40 blocks");
+		JsonObject far = json.getAsJsonArray("structures").get(1).getAsJsonObject();
+		check(!far.has("structure") && far.getAsJsonArray("blocks").size() == 2 && far.get("size").getAsInt() == 48,
+				"a far structure gives clues (built blocks seen, size), not a name");
+		JsonObject built = json.getAsJsonArray("built").get(0).getAsJsonObject();
+		check(built.getAsJsonArray("blocks").size() == 3 && built.get("size").getAsInt() == 20 && built.get("bearing").getAsLong() == 45,
+				"a built cluster lists its seen blocks, its size and a bearing (45 degrees to the right)");
+		check("minecraft:desert".equals(json.getAsJsonArray("biomes").get(0).getAsJsonObject().get("biome").getAsString()), "biome row");
+		check("minecraft:nether_portal".equals(json.getAsJsonArray("poi").get(0).getAsJsonObject().get("blockId").getAsString()), "poi row");
+		check(json.getAsJsonArray("blocks").get(0).getAsJsonObject().get("count").getAsInt() == 12, "a lava pool row carries its exposed size");
 		JsonObject cave = json.getAsJsonArray("caves").get(0).getAsJsonObject();
 		check(cave.get("air").getAsInt() == 44 && cave.get("bearing").getAsLong() == -90, "a cave to the east is 90 degrees off a south-facing view, signed like landmarks");
 		JsonObject vein = json.getAsJsonArray("veins").get(0).getAsJsonObject();
 		check(vein.get("visible").getAsInt() == 5 && "minecraft:deepslate_iron_ore".equals(vein.get("blockId").getAsString()), "vein row keeps the seen block id and count");
-		JsonObject repeat = SightedFeatures.toJson(sample, Vec3.ZERO, 0.0F, key -> false);
-		check(!repeat.getAsJsonArray("structures").get(0).getAsJsonObject().has("new"), "a known structure carries no new flag");
-		check(json.toString().length() < 400, "three rows stay compact: " + json.toString().length() + " characters");
+
+		JsonObject later = SightedFeatures.toJson(sample, Vec3.ZERO, 0.0F, seen, 1_000L + SightedFeatures.RECENT_TICKS);
+		check(later.getAsJsonArray("structures").size() == 2 && !later.getAsJsonArray("structures").get(0).getAsJsonObject().has("new"),
+				"within 30 s the rows stay in passive updates without the new flag");
+		JsonObject steady = SightedFeatures.toJson(sample, Vec3.ZERO, 0.0F, seen, 1_000L + SightedFeatures.RECENT_TICKS + 1);
+		check(!steady.has("structures") && !steady.has("built") && !steady.has("biomes") && !steady.has("poi") && !steady.has("blocks"),
+				"after 30 s a structure still in view is not re-told on every passive update");
+		check(steady.has("caves") && steady.has("veins"), "caves and veins still describe the current view");
+		JsonObject survey = SightedFeatures.render(sample, Vec3.ZERO, 0.0F, seen, 1_000L + SightedFeatures.RECENT_TICKS + 2, false,
+				Map.of(FarSight.Section.STRUCTURES, 1), java.util.EnumSet.of(FarSight.Section.STRUCTURES, FarSight.Section.BUILT));
+		check(survey.getAsJsonArray("structures").size() == 1 && survey.has("built") && !survey.has("caves") && !survey.has("biomes"),
+				"a survey shows known rows again, only the asked sections, and honours the per-section limit");
+		check(json.toString().length() < 1_100, "every section filled stays compact: " + json.toString().length() + " characters");
+	}
+
+	private static void farSightKinds() {
+		BlockState planks = Blocks.OAK_PLANKS.defaultBlockState();
+		check(FarSight.looksBuilt(planks, 0) && FarSight.looksBuilt(Blocks.GLASS.defaultBlockState(), 0) && FarSight.looksBuilt(Blocks.TORCH.defaultBlockState(), 0),
+				"planks, glass and torches look built");
+		check(FarSight.looksBuilt(Blocks.NETHERRACK.defaultBlockState(), 0) && !FarSight.looksBuilt(Blocks.NETHERRACK.defaultBlockState(), 1),
+				"netherrack is out of place in the overworld, not in the Nether");
+		check(FarSight.looksBuilt(Blocks.GRASS_BLOCK.defaultBlockState(), 1) && FarSight.looksBuilt(Blocks.OAK_LOG.defaultBlockState(), 1)
+				&& !FarSight.looksBuilt(Blocks.CRIMSON_STEM.defaultBlockState(), 1), "overworld ground and logs are out of place in the Nether; its own stems are not");
+		for (Block natural : List.of(Blocks.STONE, Blocks.GRASS_BLOCK, Blocks.SAND, Blocks.OAK_LOG, Blocks.OAK_LEAVES, Blocks.OBSIDIAN, Blocks.MAGMA_BLOCK,
+				Blocks.MOSSY_COBBLESTONE, Blocks.MOSS_CARPET, Blocks.PALE_MOSS_CARPET, Blocks.IRON_ORE, Blocks.WATER, Blocks.SMOOTH_BASALT)) {
+			check(!FarSight.looksBuilt(natural.defaultBlockState(), 0), natural + " is terrain (boulders and moss carpets included)");
+		}
+		check(FarSight.kinds(Blocks.LAVA.defaultBlockState(), 0) == FarSight.LAVA, "lava");
+		check(FarSight.kinds(Blocks.DEEPSLATE_DIAMOND_ORE.defaultBlockState(), 0) == FarSight.ORE, "ore");
+		check(FarSight.kinds(Blocks.SPAWNER.defaultBlockState(), 0) == (FarSight.NOTABLE | FarSight.BUILT), "a spawner is notable and built");
+		check((FarSight.kinds(Blocks.BELL.defaultBlockState(), 0) & FarSight.POI) != 0 && (FarSight.kinds(Blocks.NETHER_PORTAL.defaultBlockState(), 0) & FarSight.POI) != 0,
+				"bells and portals are points of interest");
+		check(FarSight.kinds(Blocks.AIR.defaultBlockState(), 0) == 0 && FarSight.kinds(Blocks.STONE.defaultBlockState(), 0) == 0, "air and stone are nothing");
+		BlockState air = Blocks.AIR.defaultBlockState(), stone = Blocks.STONE.defaultBlockState(), lava = Blocks.LAVA.defaultBlockState();
+		check(FarSight.faceOpen(stone, air) && FarSight.faceOpen(stone, Blocks.GLASS.defaultBlockState()) && FarSight.faceOpen(stone, Blocks.WATER.defaultBlockState()),
+				"a face next to air, glass or water can be seen");
+		check(!FarSight.faceOpen(stone, stone) && !FarSight.faceOpen(planks, Blocks.DIRT.defaultBlockState()), "a face against a solid block cannot");
+		check(FarSight.faceOpen(lava, air) && !FarSight.faceOpen(lava, lava) && !FarSight.faceOpen(lava, stone), "lava shows only where it meets air");
+		check(FarSight.noticeableDistance(FarSight.LARGE_CLUSTER) == FarSight.RANGE && FarSight.noticeableDistance(FarSight.LARGE_CLUSTER - 1) == FarSight.SMALL_SIGHT,
+				"big clusters are noticed to full range, small ones only up close");
+		check(FarSight.SMALL_SIGHT == 24 && FarSight.NAMED_STRUCTURE_DISTANCE == 64 && FarSight.RANGE == 256, "documented sight distances");
+	}
+
+	private static FarSight.Found found(int x, int y, int z) {
+		return new FarSight.Found(net.minecraft.core.BlockPos.asLong(x, y, z), Blocks.OAK_PLANKS.defaultBlockState(), FarSight.BUILT, 1);
+	}
+
+	private static double horizontal(FarSight.Found entry) {
+		double x = net.minecraft.core.BlockPos.getX(entry.position()), z = net.minecraft.core.BlockPos.getZ(entry.position());
+		return Math.sqrt(x * x + z * z);
+	}
+
+	private static void farSightClusters() {
+		List<FarSight.Found> blocks = new ArrayList<>();
+		for (int x = 100; x < 105; x++) for (int y = 64; y < 68; y++) blocks.add(found(x, y, 50));
+		blocks.add(found(10, 64, 10));
+		blocks.add(found(300, 64, 50));
+		var clusters = FarSight.cluster(blocks, SightedFeaturesVerification::horizontal);
+		check(clusters.size() == 3, "a house and two far-apart torches are three clusters: " + clusters.size());
+		check(clusters.get(0).members().size() == 1 && clusters.get(1).members().size() == 20, "nearest cluster first; the house keeps all 20 blocks");
+		check(net.minecraft.core.BlockPos.getX(clusters.get(1).members().getFirst().position()) == 100, "members are nearest first");
+	}
+
+	private static void farSightGeometry() {
+		var box = new net.minecraft.world.level.levelgen.structure.BoundingBox(10, 60, 10, 19, 69, 19);
+		check(FarSight.boxDistance(new Vec3(0.0D, 65.0D, 15.0D), box) == 10.0D, "distance to a box is to its nearest face");
+		check(FarSight.boxDistance(new Vec3(15.0D, 65.0D, 15.0D), box) == 0.0D, "inside a box is distance 0");
+		List<Vec3> points = FarSight.aimPoints(new Vec3(0.0D, 65.0D, 15.0D), box);
+		check(points.size() == 3 && points.contains(new Vec3(15.0D, 65.0D, 15.0D)) && points.contains(new Vec3(15.0D, 69.5D, 15.0D))
+				&& points.contains(new Vec3(10.5D, 65.0D, 15.0D)), "aim at the centre, the top and the side facing the eye: " + points);
+		check(FarSight.aimPoints(new Vec3(30.0D, 65.0D, 30.0D), box).size() == 4, "from a corner both facing sides are aimed at");
+	}
+
+	/** Review fix: sizes and noticeability come only from seen blocks; one visible torch in front of a hidden house is small. */
+	private static void seenPartsOnly() {
+		List<FarSight.Found> house = new ArrayList<>();
+		for (int x = 200; x < 205; x++) for (int y = 64; y < 68; y++) for (int z = 0; z < 5; z++) house.add(found(x, y, z));
+		var cluster = FarSight.cluster(house, SightedFeaturesVerification::horizontal).getFirst();
+		check(cluster.members().size() >= FarSight.LARGE_CLUSTER, "the fixture house has many exposed blocks");
+		long torch = cluster.members().getFirst().position();
+		FarSight.SeenPart one = FarSight.seenPart(cluster, member -> member.position() == torch, SightedFeaturesVerification::horizontal, 16);
+		check(one.count() == 0, "one visible torch at 200 blocks is not reported because of hidden blocks behind it");
+		FarSight.SeenPart front = FarSight.seenPart(cluster, member -> net.minecraft.core.BlockPos.getX(member.position()) == 200,
+				SightedFeaturesVerification::horizontal, 32);
+		check(front.count() >= FarSight.LARGE_CLUSTER && front.horizontalSize() >= 2 && front.horizontalSize() <= 5, "a visible front wall is reported at the size of its seen part: "
+				+ front.count() + " seen, size " + front.horizontalSize());
+		var near = FarSight.cluster(List.of(found(10, 64, 0), found(10, 65, 0)), SightedFeaturesVerification::horizontal).getFirst();
+		check(FarSight.seenPart(near, member -> true, SightedFeaturesVerification::horizontal, 16).count() == 2, "up close one seen block is enough");
+		check(FarSight.seenPart(near, member -> false, SightedFeaturesVerification::horizontal, 16).count() == 0, "nothing seen, nothing reported");
+	}
+
+	/** Review fix: a cluster keeps one key wherever it is seen from, so walking along a wall does not re-announce it. */
+	private static void stableClusterKeys() {
+		List<FarSight.Found> wall = new ArrayList<>();
+		for (int x = 0; x < 64; x++) wall.add(found(x, 64, 100));
+		long fromWest = FarSight.cluster(wall, entry -> Math.abs(net.minecraft.core.BlockPos.getX(entry.position()) - 0)).getFirst().seed();
+		long fromEast = FarSight.cluster(wall, entry -> Math.abs(net.minecraft.core.BlockPos.getX(entry.position()) - 63)).getFirst().seed();
+		check(fromWest == fromEast, "the seed of a 64-block wall is the same from either end");
+		check(!FarSight.rowId("built@" + fromWest).equals(FarSight.rowId("built@" + (fromWest + 1))) && FarSight.rowId("x").length() <= 7,
+				"row ids are short and tell clusters apart");
+	}
+
+	/** Review fix: a survey marks rows known without starting the 30 s passive window, and only unknown rows are new. */
+	private static void surveysAcknowledge() {
+		SightedFeatures.Announcements seen = new SightedFeatures.Announcements();
+		Sample sample = new Sample(List.of(farRow(FarSight.Section.STRUCTURES, "minecraft:village_plains@1,1", "village", List.of(), 0, 30, new Cell(0, 64, 50))),
+				List.of(), List.of());
+		JsonObject survey = SightedFeatures.render(sample, Vec3.ZERO, 0.0F, seen, 100L, false, Map.of(), java.util.EnumSet.allOf(FarSight.Section.class));
+		JsonObject row = survey.getAsJsonArray("structures").get(0).getAsJsonObject();
+		check(row.get("new").getAsBoolean() && row.has("id"), "a survey shows an unknown village as new, with an id");
+		check(SightedFeatures.toJson(sample, Vec3.ZERO, 0.0F, seen, 110L) == null, "the next passive update does not repeat a surveyed village");
+		JsonObject again = SightedFeatures.render(sample, Vec3.ZERO, 0.0F, seen, 120L, false, Map.of(), java.util.EnumSet.allOf(FarSight.Section.class));
+		check(!again.getAsJsonArray("structures").get(0).getAsJsonObject().has("new"), "a second survey does not call it new");
+		check(SightedFeatures.toJson(sample, Vec3.ZERO, 0.0F, seen, 120L + SightedFeatures.NEW_STRUCTURE_TICKS + 1).getAsJsonArray("structures")
+				.get(0).getAsJsonObject().get("new").getAsBoolean(), "out of sight for a minute, it is announced passively again");
+		check(!SightedFeatures.toJson(sample, Vec3.ZERO, 0.0F, new SightedFeatures.Announcements(), 0L).getAsJsonArray("structures").get(0).getAsJsonObject().has("id"),
+				"passive rows carry no id");
+	}
+
+	/** Review fix: fog limits sight with the eye in water or lava, as the 26.1 client draws it. */
+	private static void fogRange() {
+		check(FarSight.sightRange(false, false, false, 0.0F) == FarSight.RANGE, "in air the full range");
+		check(FarSight.sightRange(true, false, false, 0.0F) == 1.0D && FarSight.sightRange(true, true, false, 0.0F) == 5.0D,
+				"in lava 1 block, 5 with fire resistance");
+		check(FarSight.sightRange(false, false, true, FarSight.waterVision(0)) == 24.0D, "just under water 24 blocks");
+		check(Math.abs(FarSight.sightRange(false, false, true, FarSight.waterVision(100)) - 57.6D) < 0.01D, "after 5 s under water about 58 blocks");
+		check(FarSight.sightRange(false, false, true, FarSight.waterVision(600)) == 96.0D, "after 30 s under water 96 blocks");
+		FarSight.SightCache cache = new FarSight.SightCache();
+		cache.waterVision(true, 0L);
+		check(Math.abs(cache.waterVision(true, 100L) - 0.6F) < 0.001F, "the server follows the client's water vision timer");
+		check(cache.waterVision(false, 105L) < 0.6F, "leaving the water fades it");
+	}
+
+	/** Review fix: passes, surveys and section reads are capped per level per tick, shared by all agents and searches. */
+	private static void perTickBudgets() {
+		FarSight.LevelIndex index = new FarSight.LevelIndex();
+		int passes = 0, surveys = 0;
+		for (int agent = 0; agent < 8; agent++) {
+			if (index.tryPass(500L, false)) passes++;
+			if (index.tryPass(500L, true)) surveys++;
+		}
+		check(passes == FarSight.PASSES_PER_TICK && surveys == FarSight.SURVEYS_PER_TICK, "8 agents on one tick: 2 passes and 1 survey run");
+		check(index.tryPass(501L, false), "the next tick has budget again");
+		check(!FarSight.searchable(Blocks.STONE) && !FarSight.searchable(Blocks.WATER) && FarSight.searchable(Blocks.DIAMOND_ORE),
+				"terrain is not searchable; ores are");
+		try {
+			FarSight.surveyRequest(List.of("blocks:minecraft:stone"), List.of(), 4);
+			throw new AssertionError("a stone search was accepted");
+		} catch (dev.agaminggod.arenaagents.agent.AgentDomainException expected) {
+			check("INVALID_INSPECTION".equals(expected.code()), "a survey refuses to search stone");
+		}
+		check(FarSight.Request.passive().cachedOnly().clips() == 0, "a survey over budget makes no new sight lines");
+	}
+
+	private static void surveyRequests() {
+		FarSight.Request all = FarSight.surveyRequest(List.of(), List.of(), 4);
+		check(all.sections().size() == FarSight.Section.values().length && all.searched().isEmpty() && all.clips() == FarSight.SURVEY_CLIPS,
+				"no include means every section");
+		FarSight.Request some = FarSight.surveyRequest(List.of("structures", "blocks:minecraft:diamond_ore"), List.of(), 2);
+		check(some.sections().equals(java.util.EnumSet.of(FarSight.Section.STRUCTURES, FarSight.Section.BLOCKS))
+				&& some.searched().equals(List.of(Blocks.DIAMOND_ORE)), "include picks sections and blocks:<id> searches");
+		FarSight.Request less = FarSight.surveyRequest(List.of(), List.of("biomes", "caves"), 4);
+		check(!less.wants(FarSight.Section.BIOMES) && !less.wants(FarSight.Section.CAVES) && less.wants(FarSight.Section.BUILT), "exclude drops sections");
+		for (var bad : List.of(List.of("mineshafts"), List.of("blocks:minecraft:not_a_block"))) {
+			try {
+				FarSight.surveyRequest(bad, List.of(), 4);
+				throw new AssertionError("survey accepted " + bad);
+			} catch (dev.agaminggod.arenaagents.agent.AgentDomainException expected) {
+				check("INVALID_INSPECTION".equals(expected.code()), "survey rejects " + bad);
+			}
+		}
+		check(FarSight.Request.passive().clips() == FarSight.PASSIVE_CLIPS && FarSight.PASSIVE_CLIPS < FarSight.SURVEY_CLIPS,
+				"passive passes use the smaller line-of-sight budget");
 	}
 
 	private static void attention() {
@@ -250,6 +441,19 @@ public final class SightedFeaturesVerification {
 		row.addProperty("new", true);
 		check(AttentionSignalPolicy.newStructureSighted(current), "a new structure is detected");
 		check(AttentionSignalPolicy.changedFacts(previous, current).contains("sighted"), "a new structure requests attention");
+		for (String section : List.of("built", "poi", "biomes", "blocks")) {
+			JsonObject quiet = new JsonObject();
+			JsonObject rows = new JsonObject();
+			JsonArray array = new JsonArray();
+			JsonObject fresh = new JsonObject();
+			fresh.addProperty("new", true);
+			array.add(fresh);
+			rows.add(section, array);
+			quiet.add("sighted", rows);
+			boolean wakes = section.equals("built") || section.equals("poi");
+			check(AttentionSignalPolicy.newStructureSighted(quiet) == wakes,
+					"a new " + section + " row " + (wakes ? "wakes the model" : "rides along without waking it"));
+		}
 	}
 
 	private static void naturalTerrain() {

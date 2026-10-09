@@ -33,7 +33,7 @@ Observe reports freshness.fresh for the sample barrier. False identifies cached 
 
 Compact observations keep resultCoverage row counts separate from omittedFields. Field paths such as inventory.extra or entities[].equipment identify omitted or shortened fields; [] means at least one retained row. All rows retained does not mean all fields retained. Existing server coverage still applies; omitted facts remain unknown.
 
-Inspect supports inventory, menu, entities, blocks, landmarks, nearby_containers, item, block, events, recipes, and mechanics. Pages use offset 0..4096 and limit 1..32. Item detail requires slot; block detail requires visible x/y/z. Events accept afterSequence for newly delivered player-accessible events. Recipes lists installed rules; an exact recipeId retrieves its ingredient, result, and workstation display details with explicit coverage. Mechanics reports installed version and current native player attributes and abilities. Recipe rules do not reveal hidden resources or positions. Copy returned stack fingerprints, containerId, stateId, raw slot indexes, target identities, and hit geometry. Continue a shortened page using nextOffset; unreturned details remain unknown.
+Inspect supports inventory, menu, entities, blocks, landmarks, nearby_containers, item, block, events, recipes, mechanics, and survey (the survey tool's fields: include, exclude, limit). Pages use offset 0..4096 and limit 1..32. Item detail requires slot; block detail requires visible x/y/z. Events accept afterSequence for newly delivered player-accessible events. Recipes lists installed rules; an exact recipeId retrieves its ingredient, result, and workstation display details with explicit coverage. Mechanics reports installed version and current native player attributes and abilities. Recipe rules do not reveal hidden resources or positions. Copy returned stack fingerprints, containerId, stateId, raw slot indexes, target identities, and hit geometry. Continue a shortened page using nextOffset; unreturned details remain unknown.
 
 ExploreFrontier lists observed positions and unknown neighboring cells. It never chooses or travels to a destination. Reachability remains unknown until checked by the body. Choose coordinates explicitly with moveTo or input frames. Stored places are scoped to world and dimension and can become stale.
 
@@ -285,10 +285,26 @@ Cancel the exact program, including a pending notebook load, and wait for its re
 
 ### lookAround
 
-Turn through 2 to 8 camera steps. Returned samples retain sightings from each heading; reacquire a target before acting on a historical sighting.
+Turn through 2 to 8 camera steps. Returned samples retain sightings from each heading; reacquire a target before acting on a historical sighting. Add `survey` (same fields as the survey tool) to survey each heading once the body faces it; the merged rows keep the nearest sighting of each thing, with bearings relative to the final heading.
 
 ```json executor-call
 {"tool":"lookAround","arguments":{"centerYaw":90,"pitch":0,"steps":4,"ticksPerStep":3}}
+```
+
+```json executor-call
+{"tool":"lookAround","arguments":{"centerYaw":0,"pitch":0,"steps":4,"ticksPerStep":3,"survey":{"include":["structures","built","biomes"],"limit":3}}}
+```
+
+### survey
+
+Read what the player sees now, from its eye and view cone (about 150 degrees), using what the loaded world holds: structures (named within 64 blocks; farther, the built blocks seen and the size of the pieces seen), poi (nether portals, bells, beds, workstations), biomes (nearest visible ground of each other biome), built (blocks that do not belong to the terrain, outside every generated structure: possibly player-built, a hint only), blocks (lava pools, spawners, chests; `blocks:<id>` searches exposed blocks of one id within 24 blocks), caves and veins. Big things count to 256 blocks; single small blocks only within 24. Nothing behind terrain, in unloaded chunks or behind the player is reported; turn or use lookAround with survey to see around. `include` and `exclude` pick sections, `limit` sets rows per section (1 to 8, default 4). Threat facts are always included. Passive observation updates carry these rows only when newly sighted.
+
+```json executor-call
+{"tool":"survey","arguments":{}}
+```
+
+```json executor-call
+{"tool":"survey","arguments":{"include":["structures","blocks:minecraft:diamond_ore"],"limit":2}}
 ```
 
 ### control

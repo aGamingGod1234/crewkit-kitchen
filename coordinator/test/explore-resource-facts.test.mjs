@@ -11,7 +11,13 @@ import { decodeModelFacts } from '../src/model-fact-encoding.mjs';
 import { presentNativeToolResult } from '../src/codex-service.mjs';
 
 const SIGHTED = {
-	structures: [{ structure: 'shipwreck', x: 40, y: 62, z: -12, distance: 41, bearing: -20, new: true }],
+	structures: [{ structure: 'shipwreck', size: 18, x: 40, y: 62, z: -12, distance: 41, bearing: -20, new: true },
+		{ blocks: ['minecraft:oak_planks', 'minecraft:cobblestone'], size: 52, x: 0, y: 66, z: 160, distance: 160, bearing: 0, new: true }],
+	// Far-sight rows from world data: possibly player-built clusters, biomes, points of interest and notable blocks.
+	built: [{ blocks: ['minecraft:oak_planks', 'minecraft:glass', 'minecraft:torch'], size: 5, x: -100, y: 64, z: 100, distance: 141, bearing: 45, new: true }],
+	biomes: [{ biome: 'minecraft:desert', x: 64, y: 63, z: 64, distance: 90, bearing: -45, new: true }],
+	poi: [{ blockId: 'minecraft:nether_portal', x: 10, y: 64, z: 120, distance: 120, bearing: -5 }],
+	blocks: [{ blockId: 'minecraft:lava', count: 12, x: 5, y: 60, z: 20, distance: 21, bearing: -14 }],
 	caves: [{ x: 6, y: 58, z: 3, distance: 9, bearing: 35, air: 61 }],
 	veins: [{ blockId: 'minecraft:iron_ore', x: 2, y: 60, z: 1, distance: 3, bearing: 10, visible: 5 }],
 };

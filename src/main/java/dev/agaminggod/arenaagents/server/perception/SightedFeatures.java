@@ -5,6 +5,7 @@ import com.google.gson.JsonObject;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -18,19 +19,18 @@ import java.util.function.Predicate;
 import java.util.function.ToDoubleFunction;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
-import net.minecraft.core.registries.Registries;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.levelgen.Heightmap;
-import net.minecraft.world.level.levelgen.structure.StructureStart;
 import net.minecraft.world.phys.Vec3;
 
 /**
- * Things a player recognises at a glance in its current view: structures, dark open spaces (caves) and ore
- * veins. Every row starts from a block the agent sees; nothing outside its line of sight is ever reported.
+ * Things a player recognises at a glance in its current view: dark open spaces (caves) and ore veins from what the sight
+ * rays and the local scan see, plus the far-sight rows ({@link FarSight}: structures, points of interest, biomes,
+ * possibly player-built clusters, lava and notable blocks). Nothing outside the agent's line of sight is ever reported.
  */
 public final class SightedFeatures {
 	static final int MAX_STRUCTURES = 4;
@@ -59,7 +59,15 @@ public final class SightedFeatures {
 	static final int MAX_VEIN_VISIBILITY_CHECKS = 48;
 	/** A structure seen again within a minute is not new; one seen after that is announced again. */
 	static final long NEW_STRUCTURE_TICKS = 1_200L;
-	static final int MAX_REMEMBERED_STRUCTURES = 64;
+	/**
+	 * Passive updates carry a far-sight row only for 30 s after it is announced: long enough to survive a model turn that
+	 * coalesces several updates, short enough that the same village is not re-told on every update.
+	 */
+	static final long RECENT_TICKS = 600L;
+	static final int MAX_REMEMBERED_STRUCTURES = 128;
+	/** Passive rows per far-sight section; a survey can ask for up to {@link FarSight#MAX_ROWS}. */
+	static final Map<FarSight.Section, Integer> PASSIVE_ROWS = Map.of(FarSight.Section.STRUCTURES, MAX_STRUCTURES,
+			FarSight.Section.POI, 4, FarSight.Section.BIOMES, 4, FarSight.Section.BUILT, 3, FarSight.Section.BLOCKS, 4);
 	private static final Set<net.minecraft.world.level.block.Block> NATURAL_BLOCKS = Set.of(
 			Blocks.STONE, Blocks.DEEPSLATE, Blocks.GRANITE, Blocks.DIORITE, Blocks.ANDESITE, Blocks.TUFF, Blocks.NETHERRACK,
 			Blocks.BASALT, Blocks.BLACKSTONE, Blocks.DIRT, Blocks.GRASS_BLOCK, Blocks.COARSE_DIRT, Blocks.SAND, Blocks.RED_SAND,
@@ -119,17 +127,17 @@ public final class SightedFeatures {
 	}
 
 	/** Rows computed once per cached view; bearings are added when the rows are rendered. */
-	public record Sample(List<Sighting> structures, List<Sighting> caves, List<Sighting> veins) {
+	public record Sample(List<FarSight.Row> far, List<Sighting> caves, List<Sighting> veins) {
 		public static final Sample EMPTY = new Sample(List.of(), List.of(), List.of());
 
 		public Sample {
-			structures = List.copyOf(structures);
+			far = List.copyOf(far);
 			caves = List.copyOf(caves);
 			veins = List.copyOf(veins);
 		}
 
 		boolean isEmpty() {
-			return structures.isEmpty() && caves.isEmpty() && veins.isEmpty();
+			return far.isEmpty() && caves.isEmpty() && veins.isEmpty();
 		}
 	}
 
@@ -261,23 +269,53 @@ public final class SightedFeatures {
 		return Math.max(Math.abs(left.x() - right.x()), Math.max(Math.abs(left.y() - right.y()), Math.abs(left.z() - right.z())));
 	}
 
-	/** Keeps the nearest seen cell for each structure start, nearest structures first. */
-	static List<Sighting> nearestPerKey(List<Sighting> sightings, int maximum) {
-		Map<String, Sighting> nearest = new LinkedHashMap<>();
-		for (Sighting sighting : sightings) {
-			nearest.merge(sighting.key(), sighting, (left, right) -> right.distance() < left.distance() ? right : left);
-		}
-		return nearest.values().stream().sorted(Comparator.comparingDouble(Sighting::distance)).limit(maximum).toList();
-	}
+	/**
+	 * When each far-sight key was announced and last seen, per agent. A key is announced when first seen, or seen again
+	 * after a minute out of sight; it stays in passive updates for {@link #RECENT_TICKS} after that.
+	 */
+	static final class Announcements {
+		private final Map<String, long[]> keys = new LinkedHashMap<>();
 
-	/** Records a sighting and says whether it is new: unseen before, or not seen for a minute. */
-	static boolean markSeen(Map<String, Long> remembered, String key, long gameTime) {
-		Long previous = remembered.put(key, gameTime);
-		if (remembered.size() > MAX_REMEMBERED_STRUCTURES) {
-			String oldest = remembered.entrySet().stream().min(Map.Entry.comparingByValue()).map(Map.Entry::getKey).orElse(null);
-			if (oldest != null && !oldest.equals(key)) remembered.remove(oldest);
+		/** Records a sighting and returns the tick it was announced. */
+		synchronized long see(String key, long gameTime) {
+			long[] times = keys.get(key);
+			if (times == null || gameTime - times[1] > NEW_STRUCTURE_TICKS || gameTime < times[1]) {
+				times = new long[] {gameTime, gameTime};
+				keys.remove(key);
+				keys.put(key, times);
+			} else {
+				times[1] = gameTime;
+			}
+			evict(key);
+			return times[0];
 		}
-		return previous == null || gameTime - previous > NEW_STRUCTURE_TICKS;
+
+		/**
+		 * A survey showed the model this key: it counts as known (not announced again, no wake) without starting the
+		 * passive window, so surveyed rows do not reappear in the next 30 s of updates. Returns whether it was unknown.
+		 */
+		synchronized boolean acknowledge(String key, long gameTime) {
+			long[] times = keys.get(key);
+			boolean unknown = times == null || gameTime - times[1] > NEW_STRUCTURE_TICKS || gameTime < times[1];
+			if (unknown) {
+				keys.remove(key);
+				keys.put(key, new long[] {gameTime - RECENT_TICKS - 1, gameTime});
+				evict(key);
+			} else {
+				times[1] = gameTime;
+			}
+			return unknown;
+		}
+
+		private void evict(String keep) {
+			if (keys.size() <= MAX_REMEMBERED_STRUCTURES) return;
+			String oldest = keys.entrySet().stream().min(Comparator.comparingLong(entry -> entry.getValue()[1])).map(Map.Entry::getKey).orElse(null);
+			if (oldest != null && !oldest.equals(keep)) keys.remove(oldest);
+		}
+
+		synchronized int size() {
+			return keys.size();
+		}
 	}
 
 	/** Natural terrain: what cave walls are made of. */
@@ -325,40 +363,18 @@ public final class SightedFeatures {
 	}
 
 	/**
-	 * The structure start with a piece at {@code position}, looked up only through loaded chunks: the chunk holding
-	 * the block and the chunk holding each referenced start. Vanilla's lookup loads a start's chunk on demand, which
-	 * could stall the server tick; an unloaded start is simply not reported.
-	 */
-	static StructureStart loadedStructureWithPieceAt(ServerLevel level, BlockPos position) {
-		var chunks = level.getChunkSource();
-		var chunk = chunks.getChunkNow(position.getX() >> 4, position.getZ() >> 4);
-		if (chunk == null || !chunk.hasAnyStructureReferences()) return null;
-		for (var references : chunk.getAllReferences().entrySet()) {
-			for (long reference : references.getValue()) {
-				var startChunk = chunks.getChunkNow(net.minecraft.world.level.ChunkPos.getX(reference),
-						net.minecraft.world.level.ChunkPos.getZ(reference));
-				if (startChunk == null) continue;
-				StructureStart start = startChunk.getStartForStructure(references.getKey());
-				if (start == null || !start.isValid() || !start.getBoundingBox().isInside(position)) continue;
-				for (var piece : start.getPieces()) {
-					if (piece.getBoundingBox().isInside(position)) return start;
-				}
-			}
-		}
-		return null;
-	}
-
-	/**
 	 * Computes the rows for one view. {@code seenHits} are blocks the sight rays hit; {@code openings} are the open
-	 * cells in front of those hits; {@code seenLocalOre} are ore blocks in the local cube that passed visibility.
+	 * cells in front of those hits; {@code seenOre} are ore blocks (local cube and far sight) that passed visibility;
+	 * {@code far} are the far-sight rows of the same view.
 	 */
 	static Sample sample(
 			ServerLevel level,
 			Vec3 eye,
 			List<BlockPos> seenHits,
 			List<BlockPos> openings,
-			List<BlockPos> seenLocalOre,
-			Predicate<BlockPos> canSee
+			List<BlockPos> seenOre,
+			Predicate<BlockPos> canSee,
+			List<FarSight.Row> far
 	) {
 		ToDoubleFunction<Cell> distance = cell -> Math.sqrt(eye.distanceToSqr(cell.x() + 0.5D, cell.y() + 0.5D, cell.z() + 0.5D));
 		Map<Long, Boolean> chunks = new HashMap<>();
@@ -366,22 +382,6 @@ public final class SightedFeatures {
 				(((long) (cell.x() >> 4)) << 32) ^ ((long) (cell.z() >> 4) & 0xffffffffL),
 				key -> level.hasChunkAt(cell.position()));
 		Function<Cell, BlockState> stateAt = cell -> loaded.test(cell) ? level.getBlockState(cell.position()) : null;
-
-		List<Sighting> structureHits = new ArrayList<>();
-		var registry = level.registryAccess().lookupOrThrow(Registries.STRUCTURE);
-		for (BlockPos hit : seenHits) {
-			Cell cell = Cell.of(hit);
-			if (!loaded.test(cell)) continue;
-			BlockState state = level.getBlockState(hit);
-			if (state.isAir()) continue;
-			StructureStart start = loadedStructureWithPieceAt(level, hit);
-			if (start == null) continue;
-			var id = registry.getKey(start.getStructure());
-			String label = id == null ? null : structureLabel(id.toString());
-			if (label == null || !built(state, label)) continue;
-			structureHits.add(new Sighting(id + "@" + start.getChunkPos().x() + "," + start.getChunkPos().z(), label, cell,
-					distance.applyAsDouble(cell), 0));
-		}
 
 		List<Cell> openCells = openings.stream().map(Cell::of).distinct().toList();
 		Map<Long, Integer> surfaces = new HashMap<>();
@@ -401,7 +401,7 @@ public final class SightedFeatures {
 				distance);
 
 		ArrayList<Cell> ore = new ArrayList<>();
-		for (BlockPos position : seenLocalOre) ore.add(Cell.of(position));
+		for (BlockPos position : seenOre) ore.add(Cell.of(position));
 		for (BlockPos hit : seenHits) {
 			Cell cell = Cell.of(hit);
 			BlockState state = stateAt.apply(cell);
@@ -413,24 +413,41 @@ public final class SightedFeatures {
 					return state == null ? "minecraft:air" : BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
 				},
 				cell -> canSee.test(cell.position()), distance);
-		return new Sample(nearestPerKey(structureHits, MAX_STRUCTURES), caves, veins);
+		return new Sample(far, caves, veins);
 	}
 
-	/** Renders rows with bearings for the current view; marks structures not seen in the last minute as new. */
-	static JsonObject toJson(Sample sample, Vec3 eye, float yaw, Predicate<String> isNewStructure) {
-		if (sample.isEmpty()) return null;
+	/**
+	 * Renders rows with bearings for the current view. Far-sight rows appear only while recently announced (see
+	 * {@link Announcements}), and carry {@code new} on the update that announces them; caves and veins describe the current
+	 * view on every update.
+	 */
+	static JsonObject toJson(Sample sample, Vec3 eye, float yaw, Announcements announcements, long gameTime) {
+		JsonObject sighted = render(sample, eye, yaw, announcements, gameTime, true, PASSIVE_ROWS, EnumSet.allOf(FarSight.Section.class));
+		return sighted.size() == 0 ? null : sighted;
+	}
+
+	/**
+	 * Rows by section. Passive rendering keeps far-sight rows only while recently announced and marks the announcing
+	 * update {@code new}. A survey shows every row of the requested sections with an {@code id}, marks rows the model did
+	 * not know {@code new}, and records them as known without starting the passive window.
+	 */
+	static JsonObject render(Sample sample, Vec3 eye, float yaw, Announcements announcements, long gameTime, boolean passive,
+			Map<FarSight.Section, Integer> limits, Set<FarSight.Section> sections) {
 		JsonObject sighted = new JsonObject();
-		if (!sample.structures().isEmpty()) {
-			JsonArray rows = new JsonArray();
-			for (Sighting sighting : sample.structures()) {
-				JsonObject row = row(sighting, eye, yaw);
-				row.addProperty("structure", sighting.label());
-				if (isNewStructure.test(sighting.key())) row.addProperty("new", true);
-				rows.add(row);
+		if (passive) {
+			Map<String, Long> announced = new HashMap<>();
+			for (FarSight.Row row : sample.far()) announced.put(row.key(), announcements.see(row.key(), gameTime));
+			FarSight.render(sighted, sample.far(), eye, yaw,
+					row -> sections.contains(row.section()) && gameTime - announced.get(row.key()) <= RECENT_TICKS,
+					row -> announced.get(row.key()) == gameTime, limits, false);
+		} else {
+			Set<String> unknown = new HashSet<>();
+			for (FarSight.Row row : sample.far()) {
+				if (sections.contains(row.section()) && announcements.acknowledge(row.key(), gameTime)) unknown.add(row.key());
 			}
-			sighted.add("structures", rows);
+			FarSight.render(sighted, sample.far(), eye, yaw, row -> sections.contains(row.section()), row -> unknown.contains(row.key()), limits, true);
 		}
-		if (!sample.caves().isEmpty()) {
+		if (sections.contains(FarSight.Section.CAVES) && !sample.caves().isEmpty()) {
 			JsonArray rows = new JsonArray();
 			for (Sighting sighting : sample.caves()) {
 				JsonObject row = row(sighting, eye, yaw);
@@ -439,7 +456,7 @@ public final class SightedFeatures {
 			}
 			sighted.add("caves", rows);
 		}
-		if (!sample.veins().isEmpty()) {
+		if (sections.contains(FarSight.Section.VEINS) && !sample.veins().isEmpty()) {
 			JsonArray rows = new JsonArray();
 			for (Sighting sighting : sample.veins()) {
 				JsonObject row = row(sighting, eye, yaw);

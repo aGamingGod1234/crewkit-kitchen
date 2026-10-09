@@ -945,6 +945,7 @@ export class NativeToolRuntime {
 		const hand = input.hand === 'off_hand' ? 'off' : 'main';
 		const results = [];
 		const samples = [];
+		const surveys = [];
 		for (let index = 0; index < tool.steps; index += 1) {
 			if (this.#executionEpoch(record.agentId) !== executionEpoch) throw codedError('NATIVE_ACTION_CANCELLED', 'Camera sweep cancelled before its next step');
 			const action = {
@@ -963,8 +964,11 @@ export class NativeToolRuntime {
 			const facts = await this.#observe(record, { includeMetadata: false, afterResult: result });
 			if (facts.freshness.fresh !== true) throw codedError('FRESH_OBSERVATION_REQUIRED', 'Camera sweep needs a fresh observation at each heading');
 			samples.push(sweepSample(facts, action.arguments));
+			// Each heading is surveyed only once the body faces it: no free 360.
+			if (tool.survey !== undefined) surveys.push({ yaw: action.arguments.yaw, result: await this.#inspect({ kind: 'inspect', ...tool.survey }, record) });
 		}
-		return { state: 'SUCCEEDED', completed: results.length, results, samples };
+		const finalYaw = samples.at(-1)?.yaw ?? tool.centerYaw;
+		return { state: 'SUCCEEDED', completed: results.length, results, samples, ...(tool.survey === undefined ? {} : { survey: mergeSurveys(surveys, finalYaw, tool.survey.limit) }) };
 	}
 
 	async #executeSequence(request, record, executionEpoch, lifecycleGeneration = null) {
@@ -1500,6 +1504,51 @@ async function withDeadline(promise, timeoutMs, code, message) {
 	} finally {
 		clearTimeout(timer);
 	}
+}
+
+/**
+ * Merges the surveys of a camera sweep: one row per thing (the nearest sighting kept), at most limit per section,
+ * nearest first, with bearings turned relative to the final heading so they stay right after the sweep. Far-sight rows
+ * are matched by the stable id Minecraft gives each thing; caves and veins (no id) by kind within 8 blocks. Threats are
+ * the union over every heading, each at its latest sighting; the biome comes from the last heading.
+ */
+export function mergeSurveys(surveys, finalYaw, limit = 4) {
+	const sections = new Map();
+	const threats = new Map();
+	let complete = true;
+	const turn = (row, yaw) => Number.isFinite(row?.bearing) ? { ...row, bearing: Math.round(wrapDegrees(yaw + row.bearing - finalYaw)) } : { ...row };
+	for (const { yaw, result } of surveys) {
+		if (result?.coverage?.complete === false) complete = false;
+		for (const entry of Array.isArray(result?.threats?.entries) ? result.threats.entries : []) {
+			const key = typeof entry?.uuid === 'string' ? entry.uuid : JSON.stringify(entry);
+			threats.delete(key);
+			threats.set(key, turn(entry, yaw));
+		}
+		for (const [section, rows] of Object.entries(result?.survey ?? {})) {
+			if (!Array.isArray(rows)) continue;
+			const merged = sections.get(section) ?? [];
+			sections.set(section, merged);
+			for (const row of rows) {
+				const turned = turn(row, yaw);
+				const index = merged.findIndex((other) => typeof row.id === 'string' ? other.id === row.id
+					: (other.blockId ?? null) === (row.blockId ?? null) && Math.hypot(other.x - row.x, other.y - row.y, other.z - row.z) <= 8);
+				if (index < 0) merged.push(turned);
+				else if ((turned.distance ?? Infinity) < (merged[index].distance ?? Infinity)) merged[index] = turned;
+			}
+		}
+	}
+	const last = surveys.at(-1)?.result ?? {};
+	return {
+		...Object.fromEntries([...sections].map(([section, rows]) => [section, [...rows].sort((left, right) => (left.distance ?? 0) - (right.distance ?? 0)).slice(0, limit)])
+			.filter(([, rows]) => rows.length > 0)),
+		...(last.standingIn === undefined ? {} : { standingIn: last.standingIn }),
+		...(threats.size === 0 && last.threats?.bestWeapon === undefined ? {} : { threats: {
+			entries: [...threats.values()].sort((left, right) => (left.distance ?? 0) - (right.distance ?? 0)),
+			...(last.threats?.bestWeapon === undefined ? {} : { bestWeapon: last.threats.bestWeapon }),
+		} }),
+		headings: surveys.length,
+		complete,
+	};
 }
 
 // Historical sightings preserve each heading without presenting earlier targets as current facts.

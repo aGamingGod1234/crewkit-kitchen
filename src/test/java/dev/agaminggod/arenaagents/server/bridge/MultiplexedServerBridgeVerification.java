@@ -4068,6 +4068,29 @@ public final class MultiplexedServerBridgeVerification {
 		recipes.addProperty("recipeId", "minecraft:oak_planks");
 		recipes.addProperty("section", "mechanics");
 		assertThrowsCode(() -> MultiplexedServerBridge.validateInspectionQuery(recipes), "INVALID_INSPECTION");
+		JsonObject survey = new JsonObject();
+		survey.addProperty("section", "survey");
+		assertEquals(4, MultiplexedServerBridge.validateInspectionQuery(survey).get("limit").getAsInt(), "a survey defaults to 4 rows per section");
+		com.google.gson.JsonArray include = new com.google.gson.JsonArray();
+		include.add("structures");
+		include.add("blocks:minecraft:diamond_ore");
+		survey.add("include", include);
+		com.google.gson.JsonArray exclude = new com.google.gson.JsonArray();
+		exclude.add("biomes");
+		survey.add("exclude", exclude);
+		survey.addProperty("limit", 8);
+		MultiplexedServerBridge.validateInspectionQuery(survey);
+		survey.addProperty("limit", 9);
+		assertThrowsCode(() -> MultiplexedServerBridge.validateInspectionQuery(survey), "INVALID_INSPECTION");
+		survey.addProperty("limit", 2);
+		exclude.add("blocks:minecraft:stone");
+		assertThrowsCode(() -> MultiplexedServerBridge.validateInspectionQuery(survey), "INVALID_INSPECTION");
+		exclude.remove(1);
+		include.add("threats");
+		assertThrowsCode(() -> MultiplexedServerBridge.validateInspectionQuery(survey), "INVALID_INSPECTION");
+		include.remove(2);
+		survey.addProperty("offset", 0);
+		assertThrowsCode(() -> MultiplexedServerBridge.validateInspectionQuery(survey), "INVALID_INSPECTION");
 	}
 
 	private static void verifyInspectionPublication(AgentId agent) {

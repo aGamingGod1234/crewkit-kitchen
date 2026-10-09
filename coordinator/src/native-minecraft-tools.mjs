@@ -32,7 +32,15 @@ const OBSERVATION_VIEW_PROPERTIES = {
 	view: { type: 'string', enum: ['full', 'changes'] },
 	afterObservationId: { type: 'string', minLength: 1, maxLength: 128 },
 };
-export const INSPECTION_SECTIONS = Object.freeze(['observation', 'inventory', 'menu', 'entities', 'blocks', 'landmarks', 'nearby_containers', 'item', 'block', 'events', 'recipes', 'mechanics']);
+export const INSPECTION_SECTIONS = Object.freeze(['observation', 'inventory', 'menu', 'entities', 'blocks', 'landmarks', 'nearby_containers', 'item', 'block', 'events', 'recipes', 'mechanics', 'survey']);
+export const SURVEY_SECTIONS = Object.freeze(['structures', 'poi', 'biomes', 'built', 'blocks', 'caves', 'veins']);
+const MAX_SURVEY_ROWS = 8;
+const SURVEY_INCLUDE_PATTERN = /^blocks:[a-z0-9_.-]+:[a-z0-9_./-]+$/;
+const SURVEY_PROPERTIES = {
+	include: { type: 'array', maxItems: 8, items: { type: 'string', maxLength: 263, pattern: '^(structures|poi|biomes|built|blocks(:[a-z0-9_.-]+:[a-z0-9_./-]+)?|caves|veins)$' } },
+	exclude: { type: 'array', maxItems: 7, items: { type: 'string', enum: [...SURVEY_SECTIONS] } },
+	limit: integerSchema(1, MAX_SURVEY_ROWS),
+};
 
 export function minecraftCapabilities({ section = 'all', topic, offset } = {}) {
 	if (section === 'program') return { version: 1, section: 'program', engine: 'ArenaScript', reference: ARENA_SCRIPT_API_REFERENCE };
@@ -95,12 +103,14 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 	tool('programStatus', 'Read the running program, pending decision, pendingSuccessor summary, or latest terminal result. Does not wait or change the player. Use it to inspect a background handle or exact attention; never poll progress: end your turn; program end and decisions arrive as events. Background completion does not mean the goal is complete.', objectSchema({ programId: { type: 'string', minLength: 1, maxLength: 128 } })),
 	tool('respondProgram', 'Answer the exact pending program decision. Continue preserves authored work. Replace installs new source after releasing the old action and retains the original deadline and action budget; use it when fresh facts invalidate prerequisites or current targets. Pause and finish stop the routine; finish still requires separate factual goal verification.', objectSchema({ programId: { type: 'string', minLength: 1, maxLength: 128 }, goalRevision: integerSchema(0, Number.MAX_SAFE_INTEGER), decisionId: { type: 'string', minLength: 1, maxLength: 256 }, directive: { type: 'string', enum: ['continue', 'pause', 'replace', 'finish'] }, source: { type: 'string', minLength: 1, maxLength: MAX_PROGRAM_SOURCE_BYTES } }, ['programId', 'goalRevision', 'decisionId', 'directive'])),
 	tool('cancelProgram', 'Cancel the exact program and wait for its result. New body actions remain blocked while cancellation is unconfirmed. Handles are scoped to this agent and goal revision.', objectSchema({ programId: { type: 'string', minLength: 1, maxLength: 128 }, goalRevision: integerSchema(0, Number.MAX_SAFE_INTEGER) }, ['programId', 'goalRevision'])),
-	tool('lookAround', 'Turn through 2 to 8 camera steps, sampling fresh facts at each heading. Returns bounded historical sightings with timestamps and omitted counts; reacquire targets before acting.', objectSchema({
+	tool('lookAround', 'Turn through 2 to 8 camera steps, sampling fresh facts at each heading. Returns bounded historical sightings with timestamps and omitted counts; reacquire targets before acting. Optional survey (survey tool fields) surveys each heading and merges the rows.', objectSchema({
 		centerYaw: numberSchema(-180, 180),
 		pitch: numberSchema(-90, 90),
 		steps: integerSchema(2, MAX_LOOK_AROUND_STEPS),
 		ticksPerStep: integerSchema(1, MAX_LOOK_AROUND_TICKS),
+		survey: { type: 'object' },
 	}, ['centerYaw', 'pitch', 'steps', 'ticksPerStep'])),
+	tool('survey', 'What you see now from your eye in your view cone (turn or lookAround to see more): structures (named within 64 blocks, else built blocks seen and size), poi (portals, bells, beds, workstations), biomes (nearest visible ground), built (unnatural blocks outside generated structures: possibly player-built, a hint), blocks (lava pools, spawners, chests; blocks:<id> searches within 24), caves, veins. Big things count to 256 blocks, single blocks within 24. Threats always included. Passive updates show only new sightings.', objectSchema(SURVEY_PROPERTIES)),
 	tool('control', 'Hold one complete player input frame for 1 to 200 server ticks. Use for precise movement, jumps, attacks, item use, view, and hotbar control. The view turns to yaw/pitch at player speed first (about 6 ticks for 180 degrees) with movement keys held and attack/use waiting for the aim; ticks count from arrival. instantLook:true writes the look at once. In water jump is a held swim-up key (rise, stay afloat, climb out at a shore); without it the body sinks. Sprint while underWater swims along the view pitch.', objectSchema({
 		forward: numberSchema(-1, 1),
 		strafe: numberSchema(-1, 1),
@@ -207,9 +217,14 @@ function normalizeMinecraftToolArguments(name, value) {
 			}
 			if (args.offset !== undefined && args.topic === undefined) invalid('control reference offset requires a topic');
 			return { kind: 'capabilities', ...(args.section === undefined ? {} : { section: args.section }), ...(args.topic === undefined ? {} : { topic: args.topic }), ...(args.offset === undefined ? {} : { offset: integer(args.offset, 'offset', 0, Number.MAX_SAFE_INTEGER) }) };
+		case 'survey':
+			requireExactKeys(args, ['include', 'exclude', 'limit']);
+			return normalizeSurvey({ ...args, section: 'survey' });
 		case 'inspect': {
-			requireExactKeys(args, ['section', 'offset', 'limit', 'slot', 'x', 'y', 'z', 'afterSequence', 'recipeId', 'entityType', 'outputItemId']);
+			requireExactKeys(args, ['section', 'offset', 'limit', 'slot', 'x', 'y', 'z', 'afterSequence', 'recipeId', 'entityType', 'outputItemId', 'include', 'exclude']);
 			if (!INSPECTION_SECTIONS.includes(args.section)) invalid('section is not supported');
+			if (args.section === 'survey') return normalizeSurvey(args);
+			if (args.include !== undefined || args.exclude !== undefined) invalid('include and exclude are only valid for survey');
 			const query = { kind: 'inspect', section: args.section, offset: optionalInteger(args.offset, 0, 'offset', 0, 4_096), limit: optionalInteger(args.limit, 32, 'limit', 1, 32) };
 			if (args.section === 'item') query.slot = integer(args.slot, 'slot', 0, 255);
 			else if (args.slot !== undefined) invalid('slot is only valid for item inspection');
@@ -293,15 +308,23 @@ function normalizeMinecraftToolArguments(name, value) {
 			if (source !== undefined && Buffer.byteLength(source, 'utf8') > MAX_PROGRAM_SOURCE_BYTES) invalid('source must fit 65536 UTF-8 bytes');
 			return { kind: 'respond_program', programId: boundedText(args.programId, 'programId', 128), goalRevision: integer(args.goalRevision, 'goalRevision', 0, Number.MAX_SAFE_INTEGER), decisionId: boundedText(args.decisionId, 'decisionId', 256), directive: args.directive, ...(source === undefined ? {} : { source }) };
 		}
-		case 'lookAround':
-			requireExactKeys(args, ['centerYaw', 'pitch', 'steps', 'ticksPerStep']);
+		case 'lookAround': {
+			requireExactKeys(args, ['centerYaw', 'pitch', 'steps', 'ticksPerStep', 'survey']);
+			let survey;
+			if (args.survey !== undefined) {
+				requireExactKeys(requireObject(args.survey), ['include', 'exclude', 'limit']);
+				const { kind: _kind, ...query } = normalizeSurvey({ ...args.survey, section: 'survey' });
+				survey = query;
+			}
 			return {
 				kind: 'lookAround',
 				centerYaw: finiteNumber(args.centerYaw, 'centerYaw', -180, 180),
 				pitch: finiteNumber(args.pitch, 'pitch', -90, 90),
 				steps: integer(args.steps, 'steps', 2, MAX_LOOK_AROUND_STEPS),
 				ticksPerStep: integer(args.ticksPerStep, 'ticksPerStep', 1, MAX_LOOK_AROUND_TICKS),
+				...(survey === undefined ? {} : { survey }),
 			};
+		}
 		case 'control':
 			requireExactKeys(args, ['forward', 'strafe', 'jump', 'sneak', 'sprint', 'attack', 'use', 'yaw', 'pitch', 'selectedSlot', 'hand', 'ticks', 'instantLook']);
 			try {
@@ -418,6 +441,27 @@ function normalizeMinecraftToolArguments(name, value) {
 		default:
 			throw codedError('UNKNOWN_MINECRAFT_TOOL', `Unknown Minecraft tool '${String(name)}'`);
 	}
+}
+
+/** A survey inspection: sections to include (plus blocks:<id> searches) or exclude, and rows per section. */
+function normalizeSurvey(args) {
+	const { section: _section, include, exclude, limit, ...rest } = args;
+	if (Object.keys(rest).length > 0) invalid(`survey does not accept ${Object.keys(rest).join(', ')}`);
+	const list = (value, field, allowSearch, maximum) => {
+		if (value === undefined) return undefined;
+		if (!Array.isArray(value) || value.length > maximum) invalid(`${field} must be an array of at most ${maximum} entries`);
+		return [...new Set(value.map((entry) => {
+			if (typeof entry !== 'string' || !(SURVEY_SECTIONS.includes(entry) || (allowSearch && entry.length <= 263 && SURVEY_INCLUDE_PATTERN.test(entry)))) {
+				invalid(`${field} entries are ${SURVEY_SECTIONS.join(', ')}${allowSearch ? ' or blocks:<namespaced block id>' : ''}`);
+			}
+			return entry;
+		}))];
+	};
+	const included = list(include, 'include', true, 8);
+	const excluded = list(exclude, 'exclude', false, 7);
+	if (included !== undefined && included.filter((entry) => entry.startsWith('blocks:')).length > 4) invalid('at most 4 blocks:<id> searches');
+	return { kind: 'inspect', section: 'survey', limit: optionalInteger(limit, 4, 'limit', 1, MAX_SURVEY_ROWS),
+		...(included === undefined ? {} : { include: included }), ...(excluded === undefined ? {} : { exclude: excluded }) };
 }
 
 function normalizeSequenceAction(value) {
