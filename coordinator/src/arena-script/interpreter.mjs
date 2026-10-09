@@ -5,6 +5,7 @@ import { PLAYER_MEMBER_PRIMITIVES, MATH_METHODS } from './minecraft-api.mjs';
 import { filterObserved, isTrustedInterpreterFacts, markObservedCandidateSet, nearestFromCurrent } from './facts.mjs';
 import { MAX_LINE_BYTES, ACTION_FIELDS } from '../constants.mjs';
 import { validateProgramParameters } from '../program-parameters.mjs';
+import { validateAction } from '../schema.mjs';
 
 const CAPABILITY_NAMES = new Set(['program', 'player', 'world', 'inventory', 'math']);
 const CAPABILITY_MEMBERS = Object.freeze({
@@ -87,14 +88,20 @@ export class ArenaScriptInterpreter {
 		if (normalizedResult.stateToken !== this.#waiting.stateToken) throw executionError('STALE_STATE_TOKEN', 'ArenaScript STALE_STATE_TOKEN: action result does not match the pending command');
 		const normalizedFacts = freezeFacts(facts);
 		this.#context.facts = normalizedFacts;
-		const repeatedFailure = query ? null : this.#trackDeterministicFailure(this.#waiting, normalizedResult);
+		const waiting = this.#waiting;
+		const repeatedFailure = query ? null : this.#trackDeterministicFailure(waiting, normalizedResult);
 		if (repeatedFailure !== null) {
 			this.#waiting = null;
 			return this.#replanAtFailure(repeatedFailure);
 		}
-		this.#waiting.environment.setResult(query ? normalizedResult.value : normalizedResult);
 		this.#waiting = null;
 		this.#beginSlice();
+		if (waiting.sequenceContinuation && normalizedResult.state === 'SUCCEEDED') {
+			const next = waiting.sequenceContinuation;
+			this.#yieldCommand(next.path, next.arguments, next.node, next.environment, { pendingResult: false });
+			return this.#run();
+		}
+		waiting.environment.setResult(query ? normalizedResult.value : normalizedResult);
 		return this.#run();
 	}
 
@@ -537,6 +544,7 @@ export class ArenaScriptInterpreter {
 	#afterCall({ node, environment, base }) {
 		const args = this.#values.splice(base);
 		const path = memberPath(node.callee);
+		if (node.arenaActionToolAlias === 'mine') return this.#runMineActionToolAlias(node, environment, args, path?.join('.') ?? null);
 		if (node.callee.type === 'Identifier') {
 			if (node.callee.name === 'tryResult') return this.#values.push(args[0]);
 			const target = environment.get(node.callee.name, node.callee);
@@ -586,7 +594,29 @@ export class ArenaScriptInterpreter {
 		}
 	}
 
-	#yieldCommand(path, args, node, environment) {
+	#runMineActionToolAlias(node, environment, args, path) {
+		const input = args[0];
+		if (args.length !== 1 || input === null || typeof input !== 'object' || Array.isArray(input)) {
+			throw this.#error('INVALID_ARGUMENT', 'ArenaScript INVALID_ARGUMENT: mine requires one action object', node);
+		}
+		const autoAim = input.autoAim ?? false;
+		if (typeof autoAim !== 'boolean') throw this.#error('INVALID_ARGUMENT', 'ArenaScript INVALID_ARGUMENT: mine autoAim must be a boolean', node);
+		const { autoAim: _autoAim, ...miningInput } = input;
+		let miningAction;
+		try { miningAction = validateAction({ type: 'break_block', ...miningInput }); }
+		catch (error) { throw this.#error('INVALID_ARGUMENT', `ArenaScript INVALID_ARGUMENT: ${error?.message ?? 'invalid mining arguments'}`, node); }
+		const miningArguments = frozenRecord(Object.fromEntries(Object.entries(miningAction).filter(([key]) => key !== 'type')));
+		if (!autoAim) return this.#yieldCommand(path, [miningArguments], node, environment);
+		let aimAction;
+		try { aimAction = validateAction({ type: 'look_at', x: miningAction.x + 0.5, y: miningAction.y + 0.5, z: miningAction.z + 0.5 }); }
+		catch (error) { throw this.#error('INVALID_ARGUMENT', `ArenaScript INVALID_ARGUMENT: ${error?.message ?? 'invalid mining target'}`, node); }
+		const aimArguments = frozenRecord(Object.fromEntries(Object.entries(aimAction).filter(([key]) => key !== 'type')));
+		return this.#yieldCommand('player.lookAt', [aimArguments], node, environment, {
+			sequenceContinuation: { path, arguments: [miningArguments], node, environment },
+		});
+	}
+
+	#yieldCommand(path, args, node, environment, { pendingResult = true, sequenceContinuation = null } = {}) {
 		if (this.#watcherExecution && path === 'player.chat') throw this.#error('WATCHER_UNAUTHORIZED', 'ArenaScript WATCHER_UNAUTHORIZED: watcher handlers cannot speak', node);
 		validateExactTargetArguments(path, args, node, (message) => this.#error('INVALID_ARGUMENT', `ArenaScript INVALID_ARGUMENT: ${message}`, node));
 		const binding = actionBinding(this.#bindings, path);
@@ -596,7 +626,7 @@ export class ArenaScriptInterpreter {
 		const stateToken = `arena-state-${++this.#sequence}`;
 		const commandArguments = freezeOutput(args.length === 0 ? frozenRecord({}) : args.length === 1 ? args[0] : args,
 			COMPOUND_ACTIONS.has(binding.primitive) ? COMPOUND_ACTION_BYTES : CANONICAL_LIMITS.outputBytes);
-		this.#frames.push({ type: 'pending-result', environment });
+		if (pendingResult) this.#frames.push({ type: 'pending-result', environment });
 		this.#waiting = {
 			environment,
 			stateToken,
@@ -604,6 +634,7 @@ export class ArenaScriptInterpreter {
 			primitive: binding.primitive,
 			arguments: commandArguments,
 			signature: JSON.stringify([binding.primitive, commandArguments]),
+			...(sequenceContinuation === null ? {} : { sequenceContinuation }),
 		};
 		this.#yield = frozenRecord({
 			kind: 'command',
