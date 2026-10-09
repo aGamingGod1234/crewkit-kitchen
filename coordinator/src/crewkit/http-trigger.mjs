@@ -23,12 +23,12 @@ export function createCrewkitController({ sink = () => {}, log = () => {} } = {}
       let run;
       try {
         run = await startRun(brief ?? JSON.parse(readFileSync(DEFAULT_BRIEF, 'utf8')), {
-          mode, sinks: [sink], log, ...(speed !== undefined ? { speed: Number(speed) } : {}), ...(typeof tape === 'string' && tape.endsWith('.tape.json') ? { tape } : {}),
+          mode, bridgeSinks: [sink], log, ...(speed !== undefined ? { speed: Number(speed) } : {}), ...(typeof tape === 'string' && tape.endsWith('.tape.json') ? { tape } : {}),
         });
       } catch (e) { active = null; e.status ??= 400; throw e; }
       active = { runId: run.runId, mode, startedAt: Date.now() };
       run.done.then((r) => {
-        last = { runId: run.runId, mode, status: r.status, reason: r.reason ?? null, record: r.record ?? null, calls: r.calls, approvalUrl: r.checkout?.approvalUrl ?? null };
+        last = { runId: run.runId, mode, status: r.status, reason: r.reason ?? null, record: r.record ?? null, calls: r.calls };
       }).catch((e) => { last = { runId: run.runId, mode, status: 'ERROR', reason: e.message }; })
         .finally(() => { active = null; });
       return run;

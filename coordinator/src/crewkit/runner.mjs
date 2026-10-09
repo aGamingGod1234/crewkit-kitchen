@@ -57,7 +57,7 @@ export function writeRecord({ runId, mode, brief, result, dir = RECORDS_DIR }) {
  * opts: mode, sinks[], tape (replay path or object), speed (replay latency scale), record (save tape in live/simulate),
  *       pollEveryMs, writeRecords
  */
-export async function startRun(rawBrief, { mode = 'replay', sinks = [], tape = DEFAULT_TAPE, speed = 1, recordTape = true, pollEveryMs, writeRecords = true, log = () => {}, runId = `ck-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}` } = {}) {
+export async function startRun(rawBrief, { mode = 'replay', sinks = [], bridgeSinks = [], tape = DEFAULT_TAPE, speed = 1, recordTape = true, pollEveryMs, writeRecords = true, log = () => {}, runId = `ck-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}` } = {}) {
   if (!MODES.includes(mode)) throw new TypeError(`mode must be one of ${MODES.join(', ')}`);
   const brief = normalizeBrief(rawBrief);
   let api; let enrollmentId;
@@ -74,7 +74,7 @@ export async function startRun(rawBrief, { mode = 'replay', sinks = [], tape = D
     if (recordTape) api = recordingApi(api, { note: `${mode} run ${runId}: ${brief.title}` });
   }
   const eventsFile = join(RECORDS_DIR, `${runId}.events.ndjson`);
-  const stream = createEventStream({ runId, sinks: [ndjsonSink(eventsFile), ...sinks] });
+  const stream = createEventStream({ runId, sinks: [ndjsonSink(eventsFile), ...sinks], bridgeSinks });
   const done = (async () => {
     let result;
     try {

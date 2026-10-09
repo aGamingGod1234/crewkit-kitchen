@@ -1643,10 +1643,16 @@ function validateRecord(record) {
 }
 
 // CrewKit Kitchen tool. The run happens server-side; the result carries status and ids only, never the Reap key or card data.
-async function crewkitShop(tool) {
+export async function crewkitShop(tool) {
 	const { getCrewkitController } = await import('./crewkit/service.mjs');
 	const controller = getCrewkitController();
-	if (tool.action === 'status') return { state: 'SUCCEEDED', reasonCode: 'CREWKIT_STATUS', active: controller.active, last: controller.last };
+	if (tool.action === 'status') {
+		// Explicit fields only: the hosted approval URL (or anything else payment-bearing) must never reach the model.
+		const { active, last } = controller;
+		return { state: 'SUCCEEDED', reasonCode: 'CREWKIT_STATUS',
+			active: active === null ? null : { runId: active.runId, mode: active.mode, startedAt: active.startedAt },
+			last: last === null ? null : { runId: last.runId, mode: last.mode, status: last.status, reason: last.reason ?? null, record: last.record ?? null, calls: last.calls ?? null } };
+	}
 	try {
 		const run = await controller.start(tool.brief, { mode: tool.mode ?? process.env.CREWKIT_AGENT_MODE ?? 'replay' });
 		return { state: 'SUCCEEDED', reasonCode: 'CREWKIT_STARTED', runId: run.runId,

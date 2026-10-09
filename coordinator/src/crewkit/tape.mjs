@@ -3,6 +3,10 @@
 // Tapes hold Reap responses only. The API key and card data are never part of a response we call.
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { redactApproval } from './events.mjs';
+
+// Replay never has a real approval page; the QR points at the project instead.
+export const REPLAY_APPROVAL_URL = 'https://github.com/aGamingGod1234/crewkit-kitchen';
 
 export const OPS = ['search', 'details', 'createQuote', 'getQuote', 'createCheckout', 'getCheckout'];
 
@@ -31,7 +35,7 @@ export function recordingApi(inner, { note = '' } = {}) {
       const t0 = Date.now();
       try {
         const response = await inner[op](...args);
-        tape.entries.push({ op, key: keyFor(op, args), ms: Date.now() - t0, response });
+        tape.entries.push({ op, key: keyFor(op, args), ms: Date.now() - t0, response: redactApproval(response) });
         return response;
       } catch (e) {
         tape.entries.push({ op, key: keyFor(op, args), ms: Date.now() - t0, error: { status: e.status ?? 0, code: e.code ?? 'NETWORK', message: String(e.message).slice(0, 300), detail: e.detail ?? null } });
@@ -41,6 +45,11 @@ export function recordingApi(inner, { note = '' } = {}) {
   }
   api.save = (file) => { mkdirSync(dirname(file), { recursive: true }); writeFileSync(file, JSON.stringify(tape, null, 2)); return file; };
   return api;
+}
+
+function withReplayUrl(value) {
+  if (value && typeof value === 'object' && value.nextAction && typeof value.nextAction === 'object' && 'url' in value.nextAction) value.nextAction.url = REPLAY_APPROVAL_URL;
+  return value;
 }
 
 function shiftExpiry(value, shiftMs) {
@@ -85,7 +94,7 @@ export function replayApi(tapeOrPath, { speed = 1 } = {}) {
       }
       if (speed > 0 && entry.ms) await sleep(entry.ms * speed);
       if (entry.error) throw new ReplayError(entry.error.status, entry.error);
-      return shiftExpiry(structuredClone(entry.response), shiftMs);
+      return withReplayUrl(shiftExpiry(structuredClone(entry.response), shiftMs));
     };
   }
   return api;

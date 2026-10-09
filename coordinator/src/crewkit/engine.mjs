@@ -223,7 +223,7 @@ export async function runCrewkit({ brief: rawBrief, api, emit, enrollmentId, pol
   // 3. Hosted approval, then poll every pollEveryMs until terminal.
   const approvalUrl = checkout.nextAction?.url ?? null;
   emit('checkout', { approvalUrl, status: checkout.status, checkoutId: checkout.id, amount: toMoney(checkout.amount, cur) });
-  result.checkout = { id: checkout.id, approvalUrl };
+  result.checkout = { id: checkout.id }; // the approval URL goes only to the mod via emit
   let status = checkout.status;
   let latest = checkout;
   const started = now();

@@ -186,6 +186,47 @@ test('checkout EXPIRED emits expired and never completed or record', async () =>
   assert.ok(!names(events).includes('completed') && !names(events).includes('record'));
 });
 
+test('finding 2: approval URL goes only to the bridge sink, never to files, logs or the event log', async () => {
+  const { REPLAY_APPROVAL_URL } = await import('../src/crewkit/tape.mjs');
+  const bridge = []; const logged = [];
+  const { done } = await startRun(brief, { mode: 'replay', speed: 0, bridgeSinks: [(p) => bridge.push(p)], sinks: [(p) => logged.push(p)] });
+  const r = await done;
+  const raw = bridge.filter((p) => p.event === 'checkout');
+  assert.ok(raw.length && raw.every((p) => p.data.approvalUrl === REPLAY_APPROVAL_URL), 'mod gets the replay placeholder for the QR');
+  const onDisk = [r.eventsFile, r.files.jsonFile, r.files.csvFile].map((file) => readFileSync(file, 'utf8')).join(' ');
+  for (const text of [onDisk, JSON.stringify(logged), JSON.stringify(r.events), JSON.stringify(r.checkout)]) {
+    assert.ok(!text.includes(REPLAY_APPROVAL_URL) && !/approve/i.test(text.replace(/approvalUrl/g, '')), 'no approval URL outside the bridge');
+  }
+  assert.ok(logged.filter((p) => p.event === 'checkout').every((p) => p.data.approvalUrl === '[redacted]'));
+});
+
+test('finding 2: recorded tapes store [redacted] instead of the hosted approval URL', async () => {
+  const secret = 'https://pay.sandbox.reap.global/approve/SECRET-TOKEN';
+  const inner = { kind: 'live' };
+  for (const op of ['search', 'details', 'createQuote', 'getQuote', 'getCheckout']) inner[op] = async () => ({});
+  inner.createCheckout = async () => ({ id: 'c', status: 'REQUIRES_ACTION', nextAction: { type: 'REDIRECT', url: secret, expiresAt: future } });
+  const rec = recordingApi(inner);
+  const live = await rec.createCheckout('q', 'e');
+  assert.equal(live.nextAction.url, secret, 'the engine still gets the real response');
+  assert.ok(!JSON.stringify(rec.tape).includes('SECRET-TOKEN'));
+  assert.equal(rec.tape.entries[0].response.nextAction.url, '[redacted]');
+  assert.ok(!readFileSync(path.join(fixtures, 'demo-popular-sg.tape.json'), 'utf8').includes('/approve/'), 'committed fixture is redacted');
+});
+
+test('finding 2: crewkit_shop status never returns the approval URL to the model', async () => {
+  const { getCrewkitController } = await import('../src/crewkit/service.mjs');
+  const { crewkitShop } = await import('../src/native-tool-runtime.mjs');
+  const controller = getCrewkitController();
+  const started = await crewkitShop({ action: 'start', mode: 'replay' });
+  assert.equal(started.reasonCode, 'CREWKIT_STARTED');
+  const deadline = Date.now() + 60_000;
+  while (controller.active !== null && Date.now() < deadline) await new Promise((r) => setTimeout(r, 200));
+  const status = await crewkitShop({ action: 'status' });
+  assert.equal(status.last.status, 'COMPLETED');
+  const text = JSON.stringify(status);
+  assert.ok(!/approvalUrl|https?:\/\//.test(text), text);
+});
+
 test('a recorded tape replays to the same events', async () => {
   const stream1 = createEventStream({ runId: 'a', sinks: [] });
   const rec = recordingApi(replayApi(tape, { speed: 0 }));

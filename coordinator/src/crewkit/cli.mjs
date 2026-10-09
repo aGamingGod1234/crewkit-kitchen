@@ -14,7 +14,7 @@ const [cmd, briefPath] = args.filter((a, i) => !a.startsWith('--') && !(i > 0 &&
 
 async function main() {
   if (cmd !== 'run') {
-    console.log('usage: node coordinator/src/crewkit/cli.mjs run [brief.json] --mode replay|simulate|live [--speed 1] [--tape file] [--post [url]] [--quiet]');
+    console.log('usage: node coordinator/src/crewkit/cli.mjs run [brief.json] --mode replay|simulate|live [--speed 1] [--tape file] [--post [url]] [--quiet] [--show-approval-url]');
     process.exitCode = cmd ? 1 : 0;
     return;
   }
@@ -35,6 +35,8 @@ async function main() {
     speed: Number(flag('--speed', 1)),
     ...(typeof flag('--tape') === 'string' ? { tape: flag('--tape') } : {}),
     sinks: quiet ? [] : [consoleSink()],
+    // For a human approving from a terminal without the mod. Off by default so agents reading stdout never see it.
+    bridgeSinks: flag('--show-approval-url', false) ? [(p) => { if (p.event === 'checkout' && p.data.approvalUrl && p.data.status === 'REQUIRES_ACTION') console.error(`[crewkit] approve at: ${p.data.approvalUrl}`); }] : [],
     log: (m) => console.error(`[crewkit] ${m}`),
   });
   console.error(`[crewkit] run ${runId} mode=${mode}`);
