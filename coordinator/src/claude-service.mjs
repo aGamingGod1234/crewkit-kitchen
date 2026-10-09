@@ -1024,6 +1024,7 @@ ${encoded}`);
 			if (active.processLost && this.#process === null && !active.settled && tool !== undefined) {
 				const transaction = this.#beginHandoff(active);
 				active.silence.pause();
+				let handoff = null;
 				try {
 					await this.#startProcess();
 					await withDeadline(this.#toolsListed.promise, this.#config.startupTimeoutMs, this.#schedule, this.#cancelSchedule,
@@ -1041,7 +1042,7 @@ ${encoded}`);
 					commit = presented.commit;
 					const delivered = await deliverSteers(active, presented.response, this.#steerEncoder(active));
 					const [toolResult, ...steers] = delivered.contentItems.map((item) => item.text);
-					const handoff = [
+					handoff = [
 						this.#carryOver('Mid-turn continuation', { midTurn: true }),
 						`Current turn input to continue:\n${turnInput}`,
 						...(active.toolDigests.length === 0 ? [] : ['Completed tool calls this turn (one-line digests):', ...active.toolDigests.map((entry) => `- ${entry}`)]),
@@ -1055,7 +1056,8 @@ ${encoded}`);
 					commit();
 					return toolResultContent({ state: 'FAILED', reasonCode: 'SESSION_ROTATED', message: 'The completed tool result continues in a cold replacement session.' }, false);
 				} catch (error) {
-					this.#pendingCarryOver = `${this.#carryOver('Session refreshed to continue the next turn')}\n\nCompleted tool result from the interrupted turn for "${name}":\n${JSON.stringify(result)}`;
+					// A built handoff already folded the pending steer and resolved its waiters, so it is the only copy the model can still get.
+					this.#pendingCarryOver = handoff ?? `${this.#carryOver('Session refreshed to continue the next turn')}\n\nCompleted tool result from the interrupted turn for "${name}":\n${JSON.stringify(result)}`;
 					active.reject(error);
 					return toolResultContent({ state: 'FAILED', reasonCode: 'SESSION_ROTATED', message: 'The completed tool result was saved for the next session.' }, false);
 				} finally {
