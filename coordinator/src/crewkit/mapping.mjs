@@ -1,11 +1,11 @@
-// Maps a real Reap product to a vanilla Minecraft stand-in from docs/crewkit/items-allowlist.json.
+// Maps a real Reap product to a vanilla Minecraft stand-in from the bundled items-allowlist.json (copy of docs/crewkit/items-allowlist.json).
 // Keyword match on the brief's need label first, then the product name. Cached per product id.
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
-export const ALLOWLIST_PATH = join(here, '..', '..', '..', 'docs', 'crewkit', 'items-allowlist.json');
+export const ALLOWLIST_PATH = join(here, 'items-allowlist.json');
 
 let allowlist = null;
 export function loadAllowlist(path = ALLOWLIST_PATH) {
