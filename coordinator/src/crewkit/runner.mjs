@@ -16,6 +16,38 @@ export const DEFAULT_TAPE = join(here, 'fixtures', 'demo-popular-sg.tape.json');
 // Matches the recorded real run in DEFAULT_TAPE (6 guests, S$105).
 export const DEFAULT_BRIEF = join(here, 'fixtures', 'demo-brief-6.json');
 export const MODES = ['replay', 'simulate', 'live'];
+// Replays deliver Reap calls in bursts; space 'activity' events so the kitchen visuals do not pile up.
+export const ACTIVITY_GAP_MS = 350;
+
+/**
+ * Wraps emit so consecutive 'activity' events are at least gapMs apart in real time. Events queue in order
+ * (seq unchanged) and the engine never waits; drain() resolves once everything queued has been emitted.
+ */
+export function pacedEmit(emit, gapMs = ACTIVITY_GAP_MS, { now = Date.now, wait = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
+  const queue = [];
+  let last = -Infinity;
+  let running = false;
+  let pumping = Promise.resolve();
+  const pump = async () => {
+    running = true;
+    try {
+      while (queue.length) {
+        const [event, data] = queue[0];
+        if (event === 'activity') {
+          const due = last + gapMs - now();
+          if (due > 0) await wait(due);
+          last = now();
+        }
+        queue.shift();
+        emit(event, data);
+      }
+    } finally { running = false; }
+  };
+  return {
+    emit(event, data = {}) { queue.push([event, data]); if (!running) pumping = pump(); },
+    async drain() { while (running) await pumping; },
+  };
+}
 
 function resolveEnrollmentId(brief) {
   if (brief.enrollmentId) return brief.enrollmentId;
@@ -79,15 +111,18 @@ export async function startRun(rawBrief, { mode = 'replay', sinks = [], bridgeSi
   // speak(line) says one proximity line as Chef; CREWKIT_CHEF_VOICE=0 or chefVoice:false turns it off.
   const voice = speak && chefVoice ? [createChefVoice({ speak, log })] : [];
   const stream = createEventStream({ runId, sinks: [ndjsonSink(eventsFile), ...sinks, ...voice], bridgeSinks });
+  const paced = mode === 'replay' && speed > 0 ? pacedEmit(stream.emit) : null;
+  const emit = paced ? paced.emit : stream.emit;
   const done = (async () => {
     let result;
     try {
-      result = await runCrewkit({ brief, api, emit: stream.emit, enrollmentId, log, ...(pollEveryMs !== undefined ? { pollEveryMs } : {}), ...(mode === 'replay' ? { sleep: speed > 0 ? (ms) => new Promise((r) => setTimeout(r, ms * speed)) : async () => {} } : {}) });
+      result = await runCrewkit({ brief, api, emit, enrollmentId, log, ...(pollEveryMs !== undefined ? { pollEveryMs } : {}), ...(mode === 'replay' ? { sleep: speed > 0 ? (ms) => new Promise((r) => setTimeout(r, ms * speed)) : async () => {} } : {}) });
     } catch (e) {
       // Unexpected errors still end the run visibly. Messages come from Reap error bodies, never the key.
-      stream.emit('failed', { status: e.code || 'ERROR', reason: String(e.message).slice(0, 300) });
+      emit('failed', { status: e.code || 'ERROR', reason: String(e.message).slice(0, 300) });
       result = { status: e.code || 'ERROR', reason: e.message, cart: [], calls: 0 };
     }
+    await paced?.drain();
     if (api.save) {
       api.tape.enrollmentId = enrollmentId;
       result.tapeFile = api.save(join(RECORDS_DIR, 'tapes', `${runId}.tape.json`));

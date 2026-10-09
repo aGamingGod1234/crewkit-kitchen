@@ -4,7 +4,7 @@ import { dirname } from 'node:path';
 
 export const CREWKIT_EVENTS = Object.freeze([
   'brief', 'item_added', 'quote', 'gate_blocked', 'item_removed', 'gate_passed',
-  'checkout', 'completed', 'record', 'failed', 'expired', 'calls', 'reset', 'requirements', 'candidates',
+  'checkout', 'completed', 'record', 'failed', 'expired', 'calls', 'reset', 'requirements', 'candidates', 'activity',
 ]);
 const KNOWN = new Set(CREWKIT_EVENTS);
 

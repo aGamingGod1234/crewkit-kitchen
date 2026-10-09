@@ -23,7 +23,7 @@ const SGD = (amount) => ({ amount, currency: 'SGD' });
 const budget = SGD(150); // unit tests; the demo brief itself is S$190
 const future = new Date(Date.now() + 10 * 60_000).toISOString();
 const totals = (amount, extra = {}) => ({ quoteId: 'q', total: SGD(amount), shipping: SGD(4), subtotal: SGD(amount - 4), expiresAt: future, invalid: null, ...extra });
-const names = (events) => events.map((e) => e.event).filter((e) => e !== 'calls');
+const names = (events) => events.map((e) => e.event).filter((e) => e !== 'calls' && e !== 'activity');
 
 test('gate passes at exactly the budget and blocks one cent over, shipping included', () => {
   assert.deepEqual(evaluateGate({ totals: totals(150), budget }), { ok: true });
@@ -127,7 +127,7 @@ test('candidates: each need fans up to 5 same-merchant search results right befo
   const brief6 = JSON.parse(readFileSync(path.join(fixtures, 'demo-brief-6.json'), 'utf8'));
   const { done } = await startRun(brief6, { mode: 'replay', speed: 0, writeRecords: false });
   const r = await done;
-  const ev = r.events.filter((e) => e.event !== 'calls');
+  const ev = r.events.filter((e) => e.event !== 'calls' && e.event !== 'activity');
   const fans = ev.filter((e) => e.event === 'candidates');
   assert.equal(fans.length, brief6.needs.length + (brief6.extras || []).length);
   for (const f of fans) {
@@ -516,4 +516,40 @@ test('edge 8: brief caps reject oversize needs, extras, altQueries, guests and b
   assert.throws(() => normalizeBrief({ ...ok, guestCount: 41 }), /capped at 40 guests/);
   assert.throws(() => normalizeBrief({ ...ok, guestCount: undefined, guests: Array.from({ length: 41 }, (_, i) => `g${i}`) }), /capped at 40 guests/);
   assert.throws(() => normalizeBrief({ ...ok, budget: SGD(10000.01) }), /capped at 10000/);
+});
+
+test('replay narrates Reap calls with activity events (docs/crewkit/ACTIVITY.md)', async () => {
+  const brief6 = JSON.parse(readFileSync(path.join(fixtures, 'demo-brief-6.json'), 'utf8'));
+  const { done } = await startRun(brief6, { mode: 'replay', speed: 0, writeRecords: false });
+  const r = await done;
+  assert.equal(r.status, 'COMPLETED');
+  const act = r.events.filter((e) => e.event === 'activity').map((e) => e.data);
+  const KINDS = new Set(['search', 'quote', 'probe', 'details', 'backoff', 'retry', 'think']);
+  const RESULTS = new Set(['pending', 'ok', 'sold_out', 'over', 'busy', 'error']);
+  assert.ok(act.length > 0);
+  for (const a of act) {
+    assert.ok(KINDS.has(a.kind), a.kind);
+    assert.ok(RESULTS.has(a.result), a.result);
+    assert.ok(typeof a.text === 'string' && a.text.length > 0 && a.text.length <= 40, a.text);
+    if (a.amount) assert.deepEqual(Object.keys(a.amount).sort(), ['amount', 'currency']);
+  }
+  // one pending before each Reap call, so pending count equals the call count
+  assert.equal(act.filter((a) => a.result === 'pending').length, r.calls);
+  const probes = act.filter((a) => a.kind === 'probe' && a.result !== 'pending');
+  assert.ok(probes.length && probes.every((a) => a.realName && /^minecraft:/.test(a.mcItem) && a.qty > 0));
+  assert.ok(act.some((a) => a.kind === 'quote' && a.result === 'over' && a.amount));
+  assert.ok(act.some((a) => a.kind === 'backoff' && a.result === 'busy'));
+  assert.ok(act.some((a) => a.kind === 'think' && /^Over by S\$/.test(a.text)));
+});
+
+test('paced emit spaces activity events but keeps order and never blocks the caller', async () => {
+  const { pacedEmit } = await import('../src/crewkit/runner.mjs');
+  const out = [];
+  let t = 0;
+  const waits = [];
+  const paced = pacedEmit((event) => out.push(event), 350, { now: () => t, wait: async (ms) => { waits.push(ms); t += ms; } });
+  paced.emit('quote'); paced.emit('activity'); paced.emit('activity'); paced.emit('calls'); paced.emit('activity');
+  await paced.drain();
+  assert.deepEqual(out, ['quote', 'activity', 'activity', 'calls', 'activity']);
+  assert.deepEqual(waits, [350, 350]);
 });
