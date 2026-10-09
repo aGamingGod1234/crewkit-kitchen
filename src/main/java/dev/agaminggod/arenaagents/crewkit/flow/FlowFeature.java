@@ -369,11 +369,13 @@ public final class FlowFeature implements CrewkitFeature {
 					// Tile row 0 is the top; frames facing south hang on the north edge of their block.
 					int bx = QR_X + tx;
 					int by = QR_Y + (QR_TILES - 1 - ty);
+					int wx = CrewkitAnchors.origin.getX() + bx;
+					int wy = CrewkitAnchors.origin.getY() + by;
+					int wz = CrewkitAnchors.origin.getZ() + QR_Z;
 					run(server, String.format(Locale.ROOT,
-						"summon minecraft:glow_item_frame %d %d %d {%s,Facing:3b,Fixed:1b,Invisible:1b,Invulnerable:1b,Silent:1b"
+						"summon minecraft:glow_item_frame %d %d %d {%s,Pos:[%d.5d,%d.5d,%d.05d],block_pos:[I;%d,%d,%d],Facing:3b,Fixed:1b,Invisible:1b,Invulnerable:1b,Silent:1b"
 							+ ",Item:{id:\"minecraft:filled_map\",count:1,components:{\"minecraft:map_id\":%d}}}",
-						CrewkitAnchors.origin.getX() + bx, CrewkitAnchors.origin.getY() + by, CrewkitAnchors.origin.getZ() + QR_Z,
-						tags("ck_flow_qr"), id.id()));
+						wx, wy, wz, tags("ck_flow_qr"), wx, wy, wz, wx, wy, wz, id.id()));
 				}
 			}
 			syncQrMaps(server);
@@ -714,7 +716,11 @@ public final class FlowFeature implements CrewkitFeature {
 	}
 
 	private static final CommandSource FAILURE_LOGGER = new CommandSource() {
-		@Override public void sendSystemMessage(Component message) { LOGGER.warn("CrewKit flow command: {}", message.getString()); }
+		@Override public void sendSystemMessage(Component message) {
+			String text = message.getString();
+			// Empty selectors (kill on a clean kitchen, sounds with nobody online) are expected.
+			if (!text.startsWith("No entity was found") && !text.startsWith("No player was found")) LOGGER.warn("CrewKit flow command: {}", text);
+		}
 		@Override public boolean acceptsSuccess() { return false; }
 		@Override public boolean acceptsFailure() { return true; }
 		@Override public boolean shouldInformAdmins() { return false; }
