@@ -514,7 +514,7 @@ public final class ServerActionExecutor {
 			finish(action, pending.pending());
 			return true;
 		}
-		// A menu move or craft that already committed (its 3-tick linger) reports that work, not a cancel, so the
+		// A menu move or craft that already committed (its linger) reports that work, not a cancel, so the
 		// model never repeats a move whose items already went across.
 		ServerTransactionAdapter.TickResult committed = action.committedTransactionResult();
 		ServerActionResult result = committed != null
@@ -1197,7 +1197,7 @@ public final class ServerActionExecutor {
 		}
 	}
 
-	private static void placeBlock(
+	private static PlacementClick placeBlock(
 			ServerProtectionPolicy protection,
 			ServerPlayer player,
 			BlockPos position,
@@ -1225,6 +1225,25 @@ public final class ServerActionExecutor {
 				hit
 		);
 		if (result.consumesAction()) player.swing(InteractionHand.MAIN_HAND);
+		return new PlacementClick(result.consumesAction(),
+				result.consumesAction() || placementRefusalMayClear(player, hit, stack, predicted));
+	}
+
+	/** What one placement click did: whether the server consumed it, and whether a refusal could still clear. */
+	record PlacementClick(boolean consumed, boolean mayClear) {
+	}
+
+	/**
+	 * A refused click may succeed on a later one only when something temporary caused it: another entity standing in
+	 * the space the block needs (it can walk out) or the item's use cooldown. Anything else repeats identically: no
+	 * replaceable target, an unsupported state, a protected area, or the placing body itself in the way (the action
+	 * holds the body still).
+	 */
+	private static boolean placementRefusalMayClear(ServerPlayer player, BlockHitResult hit, ItemStack stack, BlockState predicted) {
+		if (player.getCooldowns().isOnCooldown(stack)) return true;
+		BlockPos target = hit.getBlockPos().relative(hit.getDirection());
+		VoxelShape shape = predicted.getCollisionShape(player.level(), target, CollisionContext.placementContext(player));
+		return !shape.isEmpty() && !player.level().isUnobstructed(player, shape.move(target.getX(), target.getY(), target.getZ()));
 	}
 
 	private static BlockHitResult placementHit(ServerPlayer player, BlockPos position, Direction requestedFace) {
@@ -1772,6 +1791,9 @@ public final class ServerActionExecutor {
 		private int initialPlacementItemCount;
 		private String resourceLeaseKey;
 		private int placementAttempts;
+		private java.util.function.Supplier<PlacementClick> placementClick;
+		/** Consecutive clicks the server refused for a reason that cannot clear; see BlockPlacementAttemptPolicy. */
+		private int finalRefusals;
 		private AimGate aimGate = new AimGate();
 		private java.util.function.Supplier<Entity> immediateAimEntity;
 		private long aimReadyElapsedMs = -1L;
@@ -1783,6 +1805,8 @@ public final class ServerActionExecutor {
 		private int placementRestoreTicks;
 		private java.util.function.Supplier<Vec3> immediateAimTarget;
 		private boolean breakInputIssued;
+		/** Set when the inventory holds a strictly faster tool for this block; appended to the success message. */
+		private String breakSpeedNote;
 		private boolean breakObservedInCarpet;
 		private BlockBreakReceipt breakReceiptBaseline;
 		private int breakTicks;
@@ -1856,7 +1880,7 @@ public final class ServerActionExecutor {
 
 		/**
 		 * A melee swing: the view turns toward the target's hitbox center at player speed and swings once the crosshair
-		 * is on the hitbox for {@link AimGate#ATTACK_SETTLE_TICKS} tick, instead of settling within 3 degrees for 3 ticks.
+		 * is on the hitbox for {@link AimGate#ATTACK_SETTLE_TICKS} tick, instead of settling within 3 degrees for {@link AimGate#SETTLE_TICKS} ticks.
 		 */
 		static ActiveAction aimedAtEntity(ServerActionRequest request, ServerPlayer player,
 				java.util.function.Supplier<Entity> target, Runnable operation) {
@@ -1930,7 +1954,7 @@ public final class ServerActionExecutor {
 		static ActiveAction placeBlock(
 				ServerActionRequest request,
 				ServerPlayer player,
-				Runnable operation,
+				java.util.function.Supplier<PlacementClick> click,
 				BlockPos block,
 				String initialBlockId,
 				String expectedBlockId,
@@ -1944,12 +1968,13 @@ public final class ServerActionExecutor {
 					player,
 					Mode.PLACE,
 					PLACE_TIMEOUT_MS,
-					operation,
+					null,
 					null,
 					0.0D,
 					false,
 					block
 			);
+			action.placementClick = Objects.requireNonNull(click, "click must not be null");
 			action.initialBlockId = Objects.requireNonNull(initialBlockId, "initialBlockId must not be null");
 			action.expectedBlockId = Objects.requireNonNull(expectedBlockId, "expectedBlockId must not be null");
 			action.desiredBlockState = Objects.requireNonNull(desiredBlockState, "desiredBlockState must not be null");
@@ -2140,6 +2165,8 @@ public final class ServerActionExecutor {
 						applyBreakInput(false);
 						return null;
 					}
+					clearPostBreakDelay();
+					breakSpeedNote = BreakSpeedAdvisor.advise(player, block, player.level().getBlockState(block));
 					breakInputIssued = true;
 				}
 				// Renew the deadman lease without restarting Carpet's continuous attack.
@@ -2156,9 +2183,10 @@ public final class ServerActionExecutor {
 				if (ownedTransition) {
 					lastObservation = breakObservation(now, hit, currentBlockId, 1.0D, true);
 					// A fact, not a refusal: lava the agent hears beside the opened block can now flow in.
+					String broken = dev.agaminggod.arenaagents.server.perception.HearingPerception.lavaHeardNear(player, block, 2.5D)
+							? "Block broken; lava is heard within 2 blocks of it" : "Block broken";
 					return result(ServerActionState.SUCCEEDED, "BLOCK_BROKEN",
-							dev.agaminggod.arenaagents.server.perception.HearingPerception.lavaHeardNear(player, block, 2.5D)
-									? "Block broken; lava is heard within 2 blocks of it" : "Block broken", now);
+							breakSpeedNote == null ? broken : broken + "; " + breakSpeedNote, now);
 				}
 				if (!currentState.isAir() && !expectedBlockId.equals(currentBlockId)) {
 					lastObservation = breakObservation(now, hit, currentBlockId, 0.0D, false);
@@ -2202,7 +2230,7 @@ public final class ServerActionExecutor {
 						desiredBlockState,
 										placementOwned,
 										elapsed >= timeoutMs,
-										placementAttempts
+										BlockPlacementAttemptPolicy.countedAttempts(placementAttempts, finalRefusals)
 								);
 				if (decision == BlockPlacementPostcondition.Decision.ALREADY_SATISFIED) {
 					return result(ServerActionState.SUCCEEDED, "TARGET_ALREADY_SATISFIED", "Requested block was already present", now);
@@ -2222,7 +2250,10 @@ public final class ServerActionExecutor {
 				if (decision == BlockPlacementPostcondition.Decision.TIMED_OUT
 						|| decision == BlockPlacementPostcondition.Decision.EXHAUSTED) {
 					return result(ServerActionState.TIMED_OUT, "PLACEMENT_NOT_CONFIRMED", placementFailureMessage(
-							"Block placement was not confirmed"), now);
+							finalRefusals >= BlockPlacementAttemptPolicy.FINAL_REFUSAL_LIMIT
+									? "Block placement was not confirmed; the server refused " + finalRefusals
+											+ " clicks and nothing in the way can clear"
+									: "Block placement was not confirmed"), now);
 				}
 				// Look at the support face first, like a player, then place with an arm swing. Retries are timed
 				// from the moment the view settled so a slow turn does not use up the attempt budget.
@@ -2238,10 +2269,12 @@ public final class ServerActionExecutor {
 					// Within the gate's 3 degrees: land exactly on the look the facing was predicted from.
 					if (placementLook != null) applyExactLook(placementLook);
 					if (aimReadyElapsedMs < 0L) aimReadyElapsedMs = elapsed;
-					if (BlockPlacementAttemptPolicy.shouldAttempt(elapsed - aimReadyElapsedMs, placementAttempts)) {
+					if (BlockPlacementAttemptPolicy.shouldAttempt(elapsed - aimReadyElapsedMs,
+							BlockPlacementAttemptPolicy.countedAttempts(placementAttempts, finalRefusals))) {
 						physicalAttempted = true;
-						immediate.run();
+						PlacementClick click = placementClick.get();
 						placementAttempts += 1;
+						finalRefusals = click.mayClear() ? 0 : finalRefusals + 1;
 					}
 				}
 			} else if (mode == Mode.AIMED) {
@@ -2526,6 +2559,15 @@ public final class ServerActionExecutor {
 		 * the attack key is held only once mining has begun and only while the crosshair is on the block, so a
 		 * re-aim never mines whatever the crosshair crosses on the way.
 		 */
+		/**
+		 * Carpet sets a 5-tick blockHitDelay after every break and spends it before the next attack starts. That is
+		 * vanilla's destroyDelay, which only throttles a held attack key: startDestroyBlock ignores it, so a freshly
+		 * pressed key (every break action presses anew) starts at once. The break time itself is untouched.
+		 */
+		private void clearPostBreakDelay() {
+			((EntityPlayerActionPackAccessor) (Object) OfflineAgentPlayers.actions(player)).arenaagents$setBlockHitDelay(0);
+		}
+
 		private void applyBreakInput(boolean attack) {
 			float yaw = player.getYRot();
 			float pitch = player.getXRot();

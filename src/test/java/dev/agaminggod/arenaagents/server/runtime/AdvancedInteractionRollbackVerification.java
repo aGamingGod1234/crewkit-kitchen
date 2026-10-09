@@ -87,6 +87,8 @@ public final class AdvancedInteractionRollbackVerification {
 			verifyBeaconEffects(components);
 			verifyPartialMenuInput(components);
 			verifyNativeCraftTransaction(components);
+			verifyMultiCraftTransaction(components);
+			verifyBreakSpeedAdvice(components);
 			verifyNativePickaxeTransaction(components);
 			verifyCraftDeath(components);
 			verifyHorizontalFacingPlacement(components);
@@ -97,7 +99,7 @@ public final class AdvancedInteractionRollbackVerification {
 			verifyExternallyClosedCraftMenu(components);
 			if (failure != null) throw failure;
 		}
-		return 151;
+		return 189;
 	}
 
 	/** Tick a table pickaxe craft until both planks cells are filled and one plank is still on the cursor. */
@@ -289,6 +291,136 @@ public final class AdvancedInteractionRollbackVerification {
 		assertTrue(!AgentInventoryView.isOpen(missing.player()), "failed craft closes the inventory screen");
 	}
 
+	/** A strictly faster tool in the bag is named in the break result; the held tool, a tie or nothing better is silent. */
+	private static void verifyBreakSpeedAdvice(ComponentBindings components) {
+		Fixture fixture = fixture();
+		var logBlock = net.minecraft.world.level.block.Blocks.OAK_LOG;
+		var stoneBlock = net.minecraft.world.level.block.Blocks.STONE;
+		// The headless registries carry no tool components, so give the two items the rules vanilla gives them here.
+		fixture.inventory().setItem(3, components.tool(Items.STONE_AXE, 131, 4.0F, logBlock));
+		fixture.inventory().setItem(5, components.tool(Items.WOODEN_PICKAXE, 59, 2.0F, stoneBlock));
+		var log = logBlock.defaultBlockState();
+		var stone = stoneBlock.defaultBlockState();
+		assertEquals("faster tool in inventory: hand (held) 60 ticks, stone_axe slot 3: 15 ticks",
+				BreakSpeedAdvisor.advise(fixture.inventory(), log, log.getDestroySpeed(null, null), 1.0F),
+				"a log by hand names the stone axe in the bag");
+		assertEquals("faster tool in inventory: hand (held) 150 ticks, wooden_pickaxe slot 5: 23 ticks",
+				BreakSpeedAdvisor.advise(fixture.inventory(), stone, stone.getDestroySpeed(null, null), 1.0F),
+				"stone by hand names the pickaxe, the axe being no faster than the hand there");
+		fixture.inventory().setSelectedSlot(3);
+		assertTrue(BreakSpeedAdvisor.advise(fixture.inventory(), log, log.getDestroySpeed(null, null), 4.0F) == null,
+				"holding the best tool adds nothing to the result");
+		fixture.inventory().setSelectedSlot(5);
+		assertTrue(BreakSpeedAdvisor.advise(fixture.inventory(), stone, stone.getDestroySpeed(null, null), 2.0F) == null,
+				"the pickaxe in hand is already the fastest for stone");
+		assertTrue(BreakSpeedAdvisor.advise(fixture.inventory(),
+				net.minecraft.world.level.block.Blocks.GRASS_BLOCK.defaultBlockState(), 0.0F, 1.0F) == null, "an instant block needs no advice");
+	}
+
+	/** A count above one craft's output stacks several crafts in the grid and takes the result once, as a player does. */
+	private static void verifyMultiCraftTransaction(ComponentBindings components) {
+		components.stack(Items.OAK_PLANKS, 1, 0);
+		components.stack(Items.COBBLESTONE, 1, 0);
+
+		Fixture batch = craftFixture();
+		batch.inventory().setItem(0, components.stack(Items.OAK_LOG, 5, 0));
+		var sixteen = json("recipeId", "minecraft:oak_planks", "count", 16, "timeoutMs", 5000);
+		var transaction = service().begin(batch.player(), request(ActionType.CRAFT_INVENTORY, sixteen), sixteen);
+		CraftTrace trace = tickToEnd(batch, transaction);
+		transaction.cleanup();
+		assertEquals("CRAFT_CONFIRMED", trace.result().reasonCode(), "16 planks craft in one action: " + trace.result().message());
+		assertTrue(trace.result().message().contains("Crafted 16 minecraft:oak_planks"), "the result names the full output: " + trace.result().message());
+		assertEquals(1, count(batch, Items.OAK_LOG), "four logs were consumed, exactly as four crafts would");
+		assertEquals(16, count(batch, Items.OAK_PLANKS), "four crafts made sixteen planks");
+		assertEquals(4, trace.maxGridItems(), "the cell visibly holds all four logs before the result is taken");
+		assertEquals(1, trace.maxFilledCells(), "one cell holds the stack");
+		assertTrue(batch.player().inventoryMenu.getInputGridSlots().stream().noneMatch(Slot::hasItem), "grid cleaned after the batch");
+		assertTrue(batch.player().inventoryMenu.getCarried().isEmpty(), "cursor cleaned after the batch");
+
+		Fixture separate = craftFixture();
+		separate.inventory().setItem(0, components.stack(Items.OAK_LOG, 5, 0));
+		var four = json("recipeId", "minecraft:oak_planks", "count", 4, "timeoutMs", 5000);
+		int separateTicks = 0;
+		for (int craft = 0; craft < 4; craft++) {
+			var single = service().begin(separate.player(), request(ActionType.CRAFT_INVENTORY, four), four);
+			separateTicks += tickToEnd(separate, single).ticks();
+			single.cleanup();
+		}
+		assertEquals(16, count(separate, Items.OAK_PLANKS), "four separate crafts make the same sixteen planks");
+		assertTrue(trace.ticks() < separateTicks, "one batched action (" + trace.ticks() + " ticks) is quicker than four separate ones ("
+				+ separateTicks + " ticks)");
+
+		Fixture short3 = craftFixture();
+		short3.inventory().setItem(0, components.stack(Items.OAK_LOG, 3, 0));
+		var partialIngredients = service().begin(short3.player(), request(ActionType.CRAFT_INVENTORY, sixteen), sixteen);
+		var partial = tickToEnd(short3, partialIngredients).result();
+		partialIngredients.cleanup();
+		assertEquals("CRAFT_PARTIAL", partial.reasonCode(), "ingredients for three crafts report a partial result: " + partial.message());
+		assertEquals(ServerTransactionAdapter.TickState.SUCCEEDED, partial.state(), "the crafts that were possible succeed");
+		assertTrue(partial.message().contains("Crafted 12 minecraft:oak_planks") && partial.message().contains("16 were requested")
+				&& partial.message().contains("ingredients for only 3 crafts"), "the shortfall is stated: " + partial.message());
+		assertEquals(0, count(short3, Items.OAK_LOG), "the three logs were used");
+		assertEquals(12, count(short3, Items.OAK_PLANKS), "three crafts made twelve planks");
+
+		Fixture slow = craftFixture();
+		slow.inventory().setItem(0, components.stack(Items.OAK_LOG, 64, 0));
+		var sixtyFour = json("recipeId", "minecraft:oak_planks", "count", 64, "timeoutMs", 2000);
+		var timed = service().begin(slow.player(), request(ActionType.CRAFT_INVENTORY, sixtyFour), sixtyFour);
+		var timedResult = tickToEnd(slow, timed).result();
+		timed.cleanup();
+		assertEquals("CRAFT_PARTIAL", timedResult.reasonCode(), "a batch too slow for timeoutMs is trimmed, not abandoned: " + timedResult.message());
+		assertTrue(timedResult.message().contains("timeoutMs 2000 allows only 10 crafts"), "the time limit is named: " + timedResult.message());
+		assertEquals(40, count(slow, Items.OAK_PLANKS), "ten crafts made forty planks");
+		assertEquals(54, count(slow, Items.OAK_LOG), "ten logs were used");
+		assertTrue(timedResult.message().contains("16 crafts need a timeoutMs of about 2800"),
+				"the timeout the full batch needs is named: " + timedResult.message());
+
+		Fixture adequate = craftFixture();
+		adequate.inventory().setItem(0, components.stack(Items.OAK_LOG, 64, 0));
+		var enough = json("recipeId", "minecraft:oak_planks", "count", 64, "timeoutMs", 2800);
+		var enoughTransaction = service().begin(adequate.player(), request(ActionType.CRAFT_INVENTORY, enough), enough);
+		var enoughResult = tickToEnd(adequate, enoughTransaction).result();
+		enoughTransaction.cleanup();
+		assertEquals("CRAFT_CONFIRMED", enoughResult.reasonCode(), "the named timeout crafts the whole batch: " + enoughResult.message());
+		assertEquals(64, count(adequate, Items.OAK_PLANKS), "sixteen crafts made sixty-four planks");
+
+		// Exactly sixteen logs fill the cell with one whole-stack click, so the batch is not trimmed by the click pace.
+		Fixture exact = craftFixture();
+		exact.inventory().setItem(0, components.stack(Items.OAK_LOG, 16, 0));
+		var exactRequest = json("recipeId", "minecraft:oak_planks", "count", 64, "timeoutMs", 2000);
+		var exactTransaction = service().begin(exact.player(), request(ActionType.CRAFT_INVENTORY, exactRequest), exactRequest);
+		var exactResult = tickToEnd(exact, exactTransaction).result();
+		exactTransaction.cleanup();
+		assertEquals("CRAFT_CONFIRMED", exactResult.reasonCode(), "an exact stack is not trimmed: " + exactResult.message());
+		assertEquals(64, count(exact, Items.OAK_PLANKS), "sixteen crafts made sixty-four planks from the exact stack");
+		assertEquals(0, count(exact, Items.OAK_LOG), "every log was used");
+
+		// Ten and ten: the first stack goes in whole, six are counted out of the second and four go back.
+		Fixture split = craftFixture();
+		split.inventory().setItem(0, components.stack(Items.OAK_LOG, 10, 0));
+		split.inventory().setItem(1, components.stack(Items.OAK_LOG, 10, 0));
+		var splitTransaction = service().begin(split.player(), request(ActionType.CRAFT_INVENTORY, exactRequest), exactRequest);
+		var splitResult = tickToEnd(split, splitTransaction).result();
+		splitTransaction.cleanup();
+		assertEquals("CRAFT_CONFIRMED", splitResult.reasonCode(), "split stacks that fit the pace are not trimmed: " + splitResult.message());
+		assertEquals(64, count(split, Items.OAK_PLANKS), "split stacks made sixty-four planks");
+		assertEquals(4, count(split, Items.OAK_LOG), "the four spare logs went back");
+		assertTrue(split.player().inventoryMenu.getCarried().isEmpty(), "cursor cleaned after the split batch");
+
+		Fixture crowded = craftFixture();
+		crowded.inventory().setItem(0, components.stack(Items.OAK_LOG, 5, 0));
+		crowded.inventory().setItem(1, components.stack(Items.OAK_PLANKS, 60, 0));
+		for (int slot = 2; slot < 36; slot++) crowded.inventory().setItem(slot, components.stack(Items.COBBLESTONE, 64, 0));
+		var eight = json("recipeId", "minecraft:oak_planks", "count", 8, "timeoutMs", 5000);
+		var cramped = service().begin(crowded.player(), request(ActionType.CRAFT_INVENTORY, eight), eight);
+		var crampedResult = tickToEnd(crowded, cramped).result();
+		cramped.cleanup();
+		assertEquals("CRAFT_PARTIAL", crampedResult.reasonCode(), "room for one craft reports a partial result: " + crampedResult.message());
+		assertTrue(crampedResult.message().contains("room for only 1 craft"), "the room limit is named: " + crampedResult.message());
+		assertEquals(64, count(crowded, Items.OAK_PLANKS), "only the fitting craft was taken");
+		assertEquals(4, count(crowded, Items.OAK_LOG), "the unused logs went back to the inventory");
+	}
+
 	private static int count(Fixture fixture, Item item) {
 		int count = 0;
 		for (int slot = 0; slot < fixture.inventory().getContainerSize(); slot++) {
@@ -298,24 +430,27 @@ public final class AdvancedInteractionRollbackVerification {
 		return count;
 	}
 
-	private record CraftTrace(ServerTransactionAdapter.TickResult result, int ticks, int maxCarried, int maxFilledCells) {
+	private record CraftTrace(ServerTransactionAdapter.TickResult result, int ticks, int maxCarried, int maxFilledCells,
+			int maxGridItems) {
 	}
 
 	/** Ticks a paced craft like the server does, recording what a spectator of the open menu would see. */
 	private static CraftTrace tickToEnd(Fixture fixture, ServerTransactionAdapter.ActiveTransaction transaction) {
 		int maxCarried = 0;
 		int maxFilled = 0;
-		for (int tick = 1; tick <= 200; tick++) {
+		int maxItems = 0;
+		for (int tick = 1; tick <= 400; tick++) {
 			var result = transaction.tick(System.currentTimeMillis());
 			var menu = fixture.player().containerMenu;
 			maxCarried = Math.max(maxCarried, menu.getCarried().getCount());
 			if (menu instanceof net.minecraft.world.inventory.AbstractCraftingMenu crafting) {
 				int filled = (int) crafting.getInputGridSlots().stream().filter(Slot::hasItem).count();
 				maxFilled = Math.max(maxFilled, filled);
+				maxItems = Math.max(maxItems, crafting.getInputGridSlots().stream().mapToInt(slot -> slot.getItem().getCount()).sum());
 			}
-			if (result.terminal()) return new CraftTrace(result, tick, maxCarried, maxFilled);
+			if (result.terminal()) return new CraftTrace(result, tick, maxCarried, maxFilled, maxItems);
 		}
-		throw new AssertionError("craft transaction did not finish within 200 ticks");
+		throw new AssertionError("craft transaction did not finish within 400 ticks");
 	}
 
 	private static void verifyNativePickaxeTransaction(ComponentBindings components) {
@@ -335,7 +470,7 @@ public final class AdvancedInteractionRollbackVerification {
 		assertEquals("CRAFT_CONFIRMED", trace.result().reasonCode(), "native pickaxe table recipe commits: " + trace.result().message());
 		assertEquals(5, trace.maxFilledCells(), "all five pickaxe cells are visibly filled before the result is taken");
 		assertEquals(3, trace.maxCarried(), "the plank stack is carried while it is dealt into the grid");
-		assertTrue(trace.ticks() >= 20 && trace.ticks() <= 40, "table craft is watchable but quick, took " + trace.ticks() + " ticks");
+		assertTrue(trace.ticks() >= 16 && trace.ticks() <= 40, "table craft is watchable but quick, took " + trace.ticks() + " ticks");
 		transaction.cleanup();
 		assertEquals(0, count(fixture, Items.OAK_PLANKS), "pickaxe consumes three planks");
 		assertEquals(0, count(fixture, Items.STICK), "pickaxe consumes two sticks");
@@ -667,9 +802,9 @@ public final class AdvancedInteractionRollbackVerification {
 			if (open && furnace.getSlot(0).hasItem() && !result.terminal()) openTicksAfterMove++;
 		} while (!result.terminal() && ticks < 200);
 		assertEquals("TRANSACTION_CONFIRMED", result.reasonCode(), "the paced furnace move succeeds: " + result.message());
-		assertTrue(openTicksBeforeMove >= 3, "the empty furnace screen is shown before the move for " + openTicksBeforeMove + " ticks");
+		assertTrue(openTicksBeforeMove >= 2, "the empty furnace screen is shown before the move for " + openTicksBeforeMove + " ticks");
 		assertTrue(openTicksAfterMove >= 2, "the filled furnace screen is shown after the move for " + openTicksAfterMove + " ticks");
-		assertTrue(ticks >= 6 && ticks <= 12, "the furnace move is watchable but quick, took " + ticks + " ticks");
+		assertTrue(ticks >= 5 && ticks <= 12, "the furnace move is watchable but quick, took " + ticks + " ticks");
 		assertEquals(4, furnace.getSlot(0).getItem().getCount(), "all four raw iron are in the input slot");
 		transaction.cleanup();
 		assertTrue(fixture.player().containerMenu == fixture.player().inventoryMenu, "cleanup closes the furnace");
@@ -711,7 +846,7 @@ public final class AdvancedInteractionRollbackVerification {
 		} while (!result.terminal() && ticks < 200);
 		assertEquals("TOOL_SELECTED", result.reasonCode(), "the paced tool selection succeeds: " + result.message());
 		assertTrue(movedWhileOpen, "the pickaxe moves to the hotbar while the inventory screen is shown");
-		assertTrue(ticks >= 6, "the move is paced over " + ticks + " ticks");
+		assertTrue(ticks >= 5, "the move is paced over " + ticks + " ticks");
 		transaction.cleanup();
 		assertTrue(!AgentInventoryView.isOpen(fixture.player()), "the inventory screen closes after the move");
 		assertEquals("minecraft:iron_pickaxe", itemId(fixture.inventory().getItem(0)), "the pickaxe is in hotbar slot 0");
@@ -926,6 +1061,19 @@ public final class AdvancedInteractionRollbackVerification {
 				holder.bindComponents(components.build());
 			}
 			return new ItemStack(item, count);
+		}
+
+		/** A stack whose item mines {@code block} at {@code speed} with the right tool, as a vanilla axe or pickaxe does. */
+		private ItemStack tool(Item item, int maxDamage, float speed, net.minecraft.world.level.block.Block block) {
+			stack(item, 1, maxDamage);
+			DataComponentMap.Builder bound = DataComponentMap.builder();
+			bound.addAll(item.builtInRegistryHolder().components());
+			bound.set(DataComponents.TOOL, new net.minecraft.world.item.component.Tool(
+					java.util.List.of(net.minecraft.world.item.component.Tool.Rule.minesAndDrops(
+							net.minecraft.core.HolderSet.direct(block.builtInRegistryHolder()), speed)),
+					1.0F, 1, true));
+			item.builtInRegistryHolder().bindComponents(bound.build());
+			return new ItemStack(item, 1);
 		}
 
 		@Override

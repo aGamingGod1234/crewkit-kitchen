@@ -53,19 +53,36 @@ public final class RecipeActionVerification {
 				"minecraft:planks", loadedPlankRecipes,
 				List.of("minecraft:spruce_log")),
 				"rejects generic planks when no loaded recipe matches observed ingredients");
-		assertTrue(AdvancedInteractionService.craftOutputSatisfiesRequest(4, 1),
+		assertEquals(1, AdvancedInteractionService.craftsForRequest(4, 1),
 				"one vanilla plank craft may exceed the requested minimum");
-		assertTrue(AdvancedInteractionService.craftOutputSatisfiesRequest(4, 4),
+		assertEquals(1, AdvancedInteractionService.craftsForRequest(4, 4),
 				"an exact vanilla craft output satisfies the request");
-		assertFalse(AdvancedInteractionService.craftOutputSatisfiesRequest(4, 5),
-				"one craft cannot claim an output larger than it produced");
+		assertEquals(2, AdvancedInteractionService.craftsForRequest(4, 5),
+				"a request above one craft's output stacks a second craft");
+		assertEquals(4, AdvancedInteractionService.craftsForRequest(4, 16), "16 planks are four crafts");
+		assertEquals(0, AdvancedInteractionService.craftsForRequest(4, 0), "a zero request crafts nothing");
+		assertTrue(AdvancedInteractionService.craftBatchMs(5) < AdvancedInteractionService.craftBatchMs(9),
+				"more clicks need more time");
+		assertTrue(AdvancedInteractionService.craftBatchMs(AdvancedInteractionService.craftIngredientClicks(List.of(64), 1, 4))
+				< 4 * AdvancedInteractionService.craftBatchMs(AdvancedInteractionService.craftIngredientClicks(List.of(64), 1, 1)),
+				"stacking four crafts clicks faster than four separate crafts");
+		assertEquals(2, AdvancedInteractionService.craftIngredientClicks(List.of(16), 1, 16),
+				"a stack that exactly fills the cell is one pickup and one placing click");
+		assertEquals(4, AdvancedInteractionService.craftIngredientClicks(List.of(10, 6), 1, 16),
+				"two stacks that together fill the cell are whole-stack clicks");
+		assertEquals(10, AdvancedInteractionService.craftIngredientClicks(List.of(10, 10), 1, 16),
+				"a stack longer than the remaining need is counted out one item per click and the rest put back");
+		assertEquals(18, AdvancedInteractionService.craftIngredientClicks(List.of(64), 1, 16),
+				"a 64 stack for sixteen is a pickup, sixteen single placings and the put-back");
+		assertEquals(4, AdvancedInteractionService.craftIngredientClicks(List.of(64, 64), 2, 64),
+				"two cells that each take a full stack are whole-stack clicks");
 		assertEquals("RECIPE_INPUTS_UNAVAILABLE", AdvancedInteractionService.craftPlacementFailureReason(
 				net.minecraft.world.inventory.RecipeBookMenu.PostPlaceAction.PLACE_GHOST_RECIPE),
 				"vanilla ghost placement reports missing inputs instead of generic placement rejection");
 		assertEquals("RECIPE_PLACEMENT_REJECTED", AdvancedInteractionService.craftPlacementFailureReason(
 				net.minecraft.world.inventory.RecipeBookMenu.PostPlaceAction.NOTHING),
 				"successful placement has no missing-input diagnostic");
-		return 13;
+		return 22;
 	}
 
 	private static void expectFailure(String expectedCode, Runnable action, String label) {

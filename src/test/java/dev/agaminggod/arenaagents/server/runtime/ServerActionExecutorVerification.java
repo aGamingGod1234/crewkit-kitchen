@@ -477,8 +477,7 @@ public final class ServerActionExecutorVerification {
 		assertEquals(AimGate.State.AIMING, gate.observe(170.0F, 0.0F, -90.0F, 40.0F), "far view keeps aiming");
 		assertEquals(AimGate.State.AIMING, gate.observe(-80.0F, 30.0F, -90.0F, 40.0F), "a turn still in progress does not interact");
 		assertEquals(AimGate.State.AIMING, gate.observe(-89.0F, 39.0F, -90.0F, 40.0F), "first aligned tick only starts settling");
-		assertEquals(AimGate.State.AIMING, gate.observe(-89.5F, 40.0F, -90.0F, 40.0F), "second aligned tick still settling");
-		assertEquals(AimGate.State.READY, gate.observe(-90.0F, 40.0F, -90.0F, 40.0F), "settled view allows the interaction");
+		assertEquals(AimGate.State.READY, gate.observe(-89.5F, 40.0F, -90.0F, 40.0F), "second aligned tick allows the interaction");
 		assertEquals(AimGate.State.READY, gate.observe(0.0F, 0.0F, -90.0F, 40.0F), "readiness is kept for retries");
 		AimGate wrap = new AimGate();
 		for (int tick = 1; tick < AimGate.SETTLE_TICKS; tick++) wrap.observe(179.0F, 0.0F, -179.0F, 0.0F);
@@ -502,7 +501,7 @@ public final class ServerActionExecutorVerification {
 		assertFalse(ServerActionExecutor.crosshairOnBox(eye, center.yRot((float) Math.toRadians(20.0D)), zombie),
 				"20 degrees off misses it");
 		assertFalse(ServerActionExecutor.crosshairOnBox(eye, center.scale(-1.0D), zombie), "looking away misses it");
-		return 14;
+		return 13;
 	}
 
 	private static void verifyRemovalReceipts() {
