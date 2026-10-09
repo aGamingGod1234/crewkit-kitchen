@@ -38,7 +38,25 @@ public final class PlayerObservationEventsVerification {
 		before.add("perception", new PlayerObservationEvents.Stream().snapshot());
 		after.add("perception", other.snapshot());
 		check(AttentionSignalPolicy.changedFacts(before, after).contains("perception"), "new entitled events request model attention");
-		return 15;
+		return 15 + verifyAttentionSequence();
+	}
+
+	/** Footsteps arrive many times a second; only events that are facts of their own move the forced-observation sequence. */
+	private static int verifyAttentionSequence() {
+		PlayerObservationEvents.Stream stream = new PlayerObservationEvents.Stream();
+		stream.record(PlayerObservationEvents.soundEvent("minecraft:block.grass.step", 0, 0, 2, 0), 1, "minecraft:overworld");
+		stream.record(PlayerObservationEvents.soundEvent("minecraft:entity.zombie.ambient", 4, 0, 4, 0), 2, "minecraft:overworld");
+		check(stream.snapshot().get("latestSequence").getAsLong() == 2, "sounds still advance the public sequence");
+		check(stream.attentionSequence() == 0, "sounds do not move the attention sequence");
+		stream.record(PlayerObservationEvents.soundEvent("minecraft:block.lava.extinguish", 1, 0, 1, 0), 3, "minecraft:overworld");
+		check(stream.attentionSequence() == 3, "a lava sound is still an attention fact (the policy raises heard lava)");
+		stream.text("system_message", "hello", 4, "minecraft:overworld");
+		check(stream.attentionSequence() == 4, "chat advances the attention sequence");
+		stream.record(PlayerObservationEvents.soundEvent("minecraft:block.grass.step", 0, 0, 2, 0), 5, "minecraft:overworld");
+		check(stream.attentionSequence() == 4 && stream.snapshot().get("latestSequence").getAsLong() == 5, "later footsteps leave it where it was");
+		stream.boss("bar", "Boss", 0.5F, false, 6, "minecraft:overworld");
+		check(stream.attentionSequence() == 6, "boss bars advance the attention sequence");
+		return 6;
 	}
 
 	private static void check(boolean condition, String message) {

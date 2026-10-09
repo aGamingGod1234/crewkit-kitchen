@@ -204,6 +204,28 @@ public final class SightedFeaturesVerification {
 		check(ServerObservationCollector.quantize(91.0D, ServerObservationCollector.LANDMARK_VIEW_QUANTUM_DEGREES)
 				== ServerObservationCollector.quantize(93.5D, ServerObservationCollector.LANDMARK_VIEW_QUANTUM_DEGREES),
 				"a 2.5 degree head movement reuses the sight rays");
+		stillAgentKeepsItsRows();
+	}
+
+	/** An idle agent's heartbeats (every 10 ticks or more) would recompute identical rows; a still pose keeps them. */
+	private static void stillAgentKeepsItsRows() {
+		String overworld = "minecraft:overworld";
+		ServerObservationCollector.StillPose pose = new ServerObservationCollector.StillPose(null, null, 10.5D, 65.62D, -3.5D, 90.0F, 5.0F);
+		ServerObservationCollector.SightedMemo settled = new ServerObservationCollector.SightedMemo(overworld, 100L, Sample.EMPTY, pose, true);
+		check(!ServerObservationCollector.sightedDue(settled, overworld, 109L, pose), "inside the recompute interval nothing changes");
+		check(!ServerObservationCollector.sightedDue(settled, overworld, 110L, pose), "a still agent keeps its rows past 10 ticks");
+		check(!ServerObservationCollector.sightedDue(settled, overworld, 199L, pose), "and up to the still bound");
+		check(ServerObservationCollector.sightedDue(settled, overworld, 100L + ServerObservationCollector.SIGHTED_STILL_TICKS, pose),
+				"the still bound ends the reuse");
+		ServerObservationCollector.StillPose turned = new ServerObservationCollector.StillPose(null, null, 10.5D, 65.62D, -3.5D, 90.5F, 5.0F);
+		check(ServerObservationCollector.sightedDue(settled, overworld, 110L, turned), "any change of view recomputes after the interval");
+		ServerObservationCollector.StillPose moved = new ServerObservationCollector.StillPose(null, null, 10.51D, 65.62D, -3.5D, 90.0F, 5.0F);
+		check(ServerObservationCollector.sightedDue(settled, overworld, 110L, moved), "any step recomputes after the interval");
+		check(!ServerObservationCollector.sightedDue(settled, overworld, 105L, moved), "the 10 tick interval still holds for a moving agent");
+		ServerObservationCollector.SightedMemo unsettled = new ServerObservationCollector.SightedMemo(overworld, 100L, Sample.EMPTY, pose, false);
+		check(ServerObservationCollector.sightedDue(unsettled, overworld, 110L, pose), "rows from an unfinished far-sight scan are never reused");
+		check(ServerObservationCollector.sightedDue(settled, "minecraft:the_nether", 101L, pose), "a dimension change recomputes at once");
+		check(ServerObservationCollector.sightedDue(null, overworld, 100L, pose), "the first sample is computed");
 	}
 
 	/** A far-sight row is announced once, rides passive updates for 30 s, and is announced again after a minute away. */

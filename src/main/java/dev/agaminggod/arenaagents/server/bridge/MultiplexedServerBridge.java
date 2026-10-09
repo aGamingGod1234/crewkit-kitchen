@@ -42,6 +42,7 @@ import dev.agaminggod.arenaagents.server.goal.GoalInventoryCapacity;
 import dev.agaminggod.arenaagents.server.goal.GoalSpecWireCodec;
 import dev.agaminggod.arenaagents.server.goal.GoalVerificationRuntime;
 import dev.agaminggod.arenaagents.server.goal.GoalSubmission;
+import dev.agaminggod.arenaagents.server.perception.ObservationBlockTags;
 import dev.agaminggod.arenaagents.server.perception.ObservationDispatchQueue;
 import dev.agaminggod.arenaagents.server.perception.AttentionFactDelta;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationCollector;
@@ -163,7 +164,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			AgentConstants.DEFAULT_AGENT_LIMIT,
 			OBSERVATIONS_PER_TICK,
 			configuredHeartbeatMinimumIntervalTicks(),
-			(agentId, payload) -> ServerObservationWireBudget.fit(payload, candidate ->
+			(agentId, payload) -> ServerObservationWireBudget.fitOwned(payload, candidate ->
 					codec.encodedLineBytesForPayload(
 							2, serverInstanceId, agentId.toString(), "observation",
 							MAX_OBSERVATION_MESSAGE_ID, candidate
@@ -636,11 +637,31 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			AgentId agentId, Object sourceSession, JsonObject observation,
 			ObservationPublication.Writer writer, boolean allowUnchanged,
 			java.util.function.BiFunction<AgentId, JsonObject, ServerObservationWireBudget.Fitted> fitter) {
+		return publishObservationWithInputGuard(publication, inputController, agentId, sourceSession, observation, writer,
+				allowUnchanged, fitter, false);
+	}
+
+	/** For a freshly collected tree the caller never touches again; see {@link ObservationPublication#publishOwned}. */
+	static ObservationPublication.Result publishOwnedObservationWithInputGuard(
+			ObservationPublication publication, Optional<LeasedServerInputController> inputController,
+			AgentId agentId, Object sourceSession, JsonObject observation,
+			ObservationPublication.Writer writer, boolean allowUnchanged) {
+		return publishObservationWithInputGuard(publication, inputController, agentId, sourceSession, observation, writer,
+				allowUnchanged, publication.fitter, true);
+	}
+
+	private static ObservationPublication.Result publishObservationWithInputGuard(
+			ObservationPublication publication, Optional<LeasedServerInputController> inputController,
+			AgentId agentId, Object sourceSession, JsonObject observation,
+			ObservationPublication.Writer writer, boolean allowUnchanged,
+			java.util.function.BiFunction<AgentId, JsonObject, ServerObservationWireBudget.Fitted> fitter, boolean owned) {
 		Objects.requireNonNull(publication, "publication must not be null");
 		Objects.requireNonNull(inputController, "input controller must not be null");
 		long revision = inputController.map(LeasedServerInputController::mutationRevision).orElse(-1L);
 		try {
-			return publication.publish(agentId, sourceSession, observation, writer, allowUnchanged, fitter);
+			return owned
+					? publication.publishOwned(agentId, sourceSession, observation, writer, allowUnchanged, fitter)
+					: publication.publish(agentId, sourceSession, observation, writer, allowUnchanged, fitter);
 		} finally {
 			if (inputController.isPresent() && inputController.get().mutationRevision() != revision) {
 				throw new BridgeProtocolException(
@@ -1019,6 +1040,23 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		source.beginAuthentication(clientNonce, serverNonce, response);
 	}
 
+	/** Whether the coordinator's hello announced an optional capability; a coordinator that predates it says nothing. */
+	static boolean announcedCapability(JsonObject hello, String name) {
+		if (!hello.has(name)) return false;
+		JsonElement capability = hello.get(name);
+		if (!capability.isJsonPrimitive() || !capability.getAsJsonPrimitive().isBoolean()) throw new BridgeProtocolException("INVALID_FIELD", name + " must be a boolean");
+		return capability.getAsBoolean();
+	}
+
+	/**
+	 * Observation tags are listed once per block type only for a coordinator that announced {@code blockTags}; an older
+	 * one (the installer can keep a last-known-good coordinator) rejects the dictionary, so its rows keep their tags.
+	 */
+	static JsonObject forSession(JsonObject observation, boolean blockTags) {
+		if (blockTags) ObservationBlockTags.compact(observation);
+		return observation;
+	}
+
 	private void acceptHello(BridgeEnvelope envelope, Session source) {
 		if (!"hello".equals(envelope.type()) || !"server".equals(envelope.agentId())) {
 			throw new BridgeProtocolException("HANDSHAKE_REQUIRED", "hello must be the first coordinator message");
@@ -1040,16 +1078,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		if (!MessageDigest.isEqual(expectedProof.getBytes(StandardCharsets.UTF_8), suppliedProof.getBytes(StandardCharsets.UTF_8))) {
 			throw new BridgeProtocolException("AUTHENTICATION_FAILED", "Coordinator did not prove possession of the bridge secret");
 		}
-		if (envelope.payload().has("registryFragments")) {
-			JsonElement capability = envelope.payload().get("registryFragments");
-			if (!capability.isJsonPrimitive() || !capability.getAsJsonPrimitive().isBoolean()) throw new BridgeProtocolException("INVALID_FIELD", "registryFragments must be a boolean");
-			source.registryFragments = capability.getAsBoolean();
-		}
-		if (envelope.payload().has("actionTiming")) {
-			JsonElement capability = envelope.payload().get("actionTiming");
-			if (!capability.isJsonPrimitive() || !capability.getAsJsonPrimitive().isBoolean()) throw new BridgeProtocolException("INVALID_FIELD", "actionTiming must be a boolean");
-			source.actionTiming = capability.getAsBoolean();
-		}
+		source.registryFragments = announcedCapability(envelope.payload(), "registryFragments");
+		source.actionTiming = announcedCapability(envelope.payload(), "actionTiming");
+		source.blockTags = announcedCapability(envelope.payload(), "blockTags");
 
 		while (true) {
 			ensureHandshakeTimeRemaining(source);
@@ -1465,7 +1496,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			String section = requiredString(query, "section");
 			if ("observation".equals(section)) {
 				observations.invalidate(id);
-				JsonObject observation = observations.collect(id);
+				JsonObject observation = forSession(observations.collect(id), source.blockTags);
 				ObservationPublication.Result published = publishObservationWithInputGuard(
 						observationPublication, AgentInputRuntime.existingController(manager.server()), id, source, observation,
 						(agent, fresh) -> {
@@ -2978,6 +3009,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	private void queueObservation(AgentId agentId) {
 		if (!manager.isCoordinatorVisible(agentId)) return;
+		// The heartbeat that closes the window collects and delivers a fresh observation anyway.
+		if (observationPublication.heartbeatWindowOpen(agentId)) return;
 		if (!observationPublication.offer(agentId)) {
 			LOGGER.debug("Observation request coalesced or deferred for {}", agentId);
 		}
@@ -3000,8 +3033,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		boolean heartbeat = observationPublication.takeHeartbeat(agentId);
 		final JsonObject observation;
 		try {
-			observation = observations.collect(agentId);
-			ObservationPublication.Result result = publishObservationWithInputGuard(
+			observation = forSession(observations.collect(agentId), source.blockTags);
+			ObservationPublication.Result result = publishOwnedObservationWithInputGuard(
 					observationPublication,
 					AgentInputRuntime.existingController(manager.server()),
 					agentId,
@@ -3097,8 +3130,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private boolean sendObservationEnvelope(Session source, AgentId agentId, JsonObject payload) {
 		if (session != source || !source.open.get() || !source.authenticated.get()) return false;
 		observationEnqueueHook.run();
-		BridgeEnvelope envelope = new BridgeEnvelope(2, serverInstanceId, agentId.toString(), "observation",
+		// The publication owns this payload and keeps it unchanged as the delivered baseline, so the envelope adopts it.
+		BridgeEnvelope envelope = BridgeEnvelope.fromDecoded(2, serverInstanceId, agentId.toString(), "observation",
 				"server-" + messageIds.incrementAndGet(), payload);
+		// The frame is cached on the envelope, so this size check is the one serialization the enqueue reuses.
 		if (codec.encodedLineBytes(envelope) > BridgeEnvelopeCodec.MAX_LINE_BYTES) {
 			throw new BridgeProtocolException("LINE_TOO_LARGE", "Fitted observation exceeds the actual wire envelope");
 		}
@@ -3681,6 +3716,13 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			return due == null || due <= heartbeatTick;
 		}
 
+		/** Whether the agent's last delivery is younger than the heartbeat interval, so a heartbeat is still to come. */
+		boolean heartbeatWindowOpen(AgentId agentId) {
+			synchronized (lifecycleLock) {
+				return published.hasDelivered(agentId) && !heartbeatDue(agentId);
+			}
+		}
+
 		boolean takeHeartbeat(AgentId agentId) {
 			synchronized (lifecycleLock) {
 				return heartbeatPending.remove(agentId);
@@ -3748,6 +3790,17 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 		Result publish(AgentId agentId, Object sourceSession, JsonObject observation, Writer writer, boolean allowUnchanged,
 				java.util.function.BiFunction<AgentId, JsonObject, ServerObservationWireBudget.Fitted> deliveryFitter) {
+			Objects.requireNonNull(observation, "observation must not be null");
+			return publishOwned(agentId, sourceSession, observation.deepCopy(), writer, allowUnchanged, deliveryFitter);
+		}
+
+		/**
+		 * As {@link #publish}, for a freshly collected tree nothing else holds: the publication annotates, fits, sends and
+		 * keeps it as the delivered baseline without a single copy. The writer must not mutate or retain the payload, and
+		 * the fitter may return, trim or mutate the tree it is given. The caller must not touch the tree afterwards.
+		 */
+		Result publishOwned(AgentId agentId, Object sourceSession, JsonObject observation, Writer writer, boolean allowUnchanged,
+				java.util.function.BiFunction<AgentId, JsonObject, ServerObservationWireBudget.Fitted> deliveryFitter) {
 			Objects.requireNonNull(agentId, "agentId must not be null");
 			Objects.requireNonNull(sourceSession, "sourceSession must not be null");
 			Objects.requireNonNull(observation, "observation must not be null");
@@ -3758,18 +3811,18 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				long observedAtEpochMs = observation.get("observedAtEpochMs").getAsLong();
 				AttentionFactDelta delta = published.delta(agentId, observation, eventSequence, observedAtEpochMs);
 				if (!allowUnchanged && published.hasDelivered(agentId) && !delta.attention()) return Result.SUPPRESSED;
-				JsonObject delivery = observation.deepCopy();
+				JsonObject delivery = observation;
 				attachDelta(delivery, delta);
 				ServerObservationWireBudget.Fitted fitted = deliveryFitter.apply(agentId, delivery);
-				delivery = fitted.observation();
+				delivery = fitted.takeObservation();
 				if (!fitted.reductions().isEmpty()) {
 					delta = published.delta(agentId, delivery, eventSequence, observedAtEpochMs);
 					attachDelta(delivery, delta);
-					delivery = deliveryFitter.apply(agentId, delivery).observation();
+					delivery = deliveryFitter.apply(agentId, delivery).takeObservation();
 					attachDelta(delivery, published.delta(agentId, delivery, eventSequence, observedAtEpochMs));
 				}
 				if (!writer.send(agentId, delivery)) return Result.DELIVERY_RETRY;
-				published.commit(agentId, delivery);
+				published.commitOwned(agentId, delivery);
 				nextHeartbeatTick.put(agentId, nextHeartbeatDeadline());
 				return Result.COMMITTED;
 			}
@@ -3838,7 +3891,12 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 
 		public synchronized void commit(AgentId agentId, JsonObject deliveredObservation) {
-			delivered.put(agentId, deliveredObservation.deepCopy());
+			commitOwned(agentId, deliveredObservation.deepCopy());
+		}
+
+		/** As {@link #commit}, keeping the tree itself as the baseline: the caller never touches it again. */
+		synchronized void commitOwned(AgentId agentId, JsonObject deliveredObservation) {
+			delivered.put(agentId, deliveredObservation);
 			if (deliveredObservation.has("eventSequence") && deliveredObservation.get("eventSequence").isJsonPrimitive()
 					&& deliveredObservation.get("eventSequence").getAsJsonPrimitive().isNumber()) {
 				long eventSequence = deliveredObservation.get("eventSequence").getAsLong();
@@ -4075,6 +4133,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		private final long handshakeTimeoutNanos = TimeUnit.MILLISECONDS.toNanos(HANDSHAKE_TIMEOUT_MS);
 		private volatile boolean registryFragments;
 		private volatile boolean actionTiming;
+		private volatile boolean blockTags;
 		private volatile String clientNonce;
 		private volatile String serverNonce;
 		private volatile String authResponseMessageId;

@@ -467,3 +467,11 @@ Notes: before numbers come from the recorded GPT-6.1 Sol "beat the game" session
 - **Solution:** One journal sync runs before actions run and one right after, air-only sight rays skip the clip, path checks no longer allocate, death bookkeeping is throttled and secret checks are cached. A first version delayed every result by one tick, which review caught and fixed.
 - **Result:** (measured, headless) action round trip equal to base (1 agent p50 ~95 ms); mean tick 2.63 -> 2.48 ms (1 agent) and 5.07 -> 4.58 ms (8 agents moving).
 - **Sources:** this branch, `DurableActionJournal`, `ServerObservationCollector`, `ServerNavigationController`, `MultiplexedServerBridge`
+
+## Speed run: observation cadence and size (Oct 9, 2026)
+
+### Sending the model a full view only when something that matters changed
+- **Problem:** Every footstep, sound and bit of regeneration made the server collect and send a full view, and block tags repeated on every row.
+- **Solution:** Immediate observations are sent only for facts that matter (damage, fire, air, new threats and attackers, inventory, chat); everything else rides the half-second heartbeat, idle scans are cached, observations are no longer deep-copied, and tags are listed once per block type for coordinators that announce support.
+- **Result:** (measured, headless, model-free) 8 sprinting agents 7.54 -> 4.15 ms/tick; 8 agents with mobs 5.60 -> 2.12 ms/tick; observations per second with mobs 60 -> 17.5; wire bytes down 70 to 80%. Threat signals still reach the coordinator in the same tick (creeper swelling p95 5 -> 7 ms, max 10 -> 13 ms, n = 60).
+- **Sources:** this branch, `ServerObservationCollector`, `ObservationBlockTags`, `ServerObservationWireBudget`, `MultiplexedServerBridge`, `protocol-v2.mjs`

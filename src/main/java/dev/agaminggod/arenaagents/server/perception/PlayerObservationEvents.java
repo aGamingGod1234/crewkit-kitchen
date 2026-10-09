@@ -105,6 +105,17 @@ public final class PlayerObservationEvents {
 		}
 	}
 
+	/**
+	 * Sequence of the newest event that is a fact of its own: chat, titles, boss bars and lava sounds. Other sounds only
+	 * reach the model through the heard section, so they wait for the next heartbeat instead of forcing an observation.
+	 */
+	public static long attentionSequence(ServerPlayer player) {
+		synchronized (PLAYERS) {
+			Stream current = PLAYERS.get(player);
+			return current == null ? 0 : current.attentionSequence;
+		}
+	}
+
 	private static Stream stream(ServerPlayer player) {
 		synchronized (PLAYERS) { return PLAYERS.computeIfAbsent(player, ignored -> new Stream()); }
 	}
@@ -114,6 +125,7 @@ public final class PlayerObservationEvents {
 		private final ArrayDeque<JsonObject> events = new ArrayDeque<>();
 		private final LinkedHashMap<String, JsonObject> bars = new LinkedHashMap<>();
 		private long sequence;
+		private long attentionSequence;
 		private String lastSignature;
 		private long lastTick = -1;
 
@@ -124,11 +136,22 @@ public final class PlayerObservationEvents {
 			lastSignature = signature;
 			JsonObject owned = event.deepCopy();
 			owned.addProperty("sequence", ++sequence);
+			if (carriesAttention(event)) attentionSequence = sequence;
 			owned.addProperty("gameTime", tick);
 			owned.addProperty("dimension", dimension);
 			owned.addProperty("observedAtEpochMs", System.currentTimeMillis());
 			events.addLast(owned);
 			while (events.size() > MAX_EVENTS) events.removeFirst();
+		}
+
+		long attentionSequence() {
+			return attentionSequence;
+		}
+
+		/** Lava stays an attention fact (the policy raises "heard" for it); every other sound is routine. */
+		private static boolean carriesAttention(JsonObject event) {
+			if (!"sound".equals(event.get("type").getAsString())) return true;
+			return event.has("soundId") && HearingPerception.isLava(event.get("soundId").getAsString());
 		}
 
 		void text(String kind, String value, long tick, String dimension) {

@@ -32,6 +32,16 @@ public final class AttentionSignalPolicy {
 		return air <= CRITICAL_AIR ? 2 : air <= WARNING_AIR ? 1 : 0;
 	}
 
+	/** Food falling to the warning level; the same edge {@link #changedFacts} reports as "player.foodLevel". */
+	static boolean foodBecameCritical(int before, int after) {
+		return before > CRITICAL_FOOD && after <= CRITICAL_FOOD;
+	}
+
+	/** A fall reaching the damaging distance; the same edge {@link #changedFacts} reports as "player.fallDistance". */
+	static boolean fallBecameHazardous(double before, double after) {
+		return before < HAZARDOUS_FALL_DISTANCE && after >= HAZARDOUS_FALL_DISTANCE;
+	}
+
 	public static List<String> changedFacts(JsonObject previous, JsonObject current) {
 		Objects.requireNonNull(current, "current must not be null");
 		if (previous == null) return List.of();
