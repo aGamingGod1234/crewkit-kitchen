@@ -116,6 +116,15 @@ public final class CastFeature implements CrewkitFeature {
 		CHEF_LEGS.add(Leg.pause(ticks));
 	}
 
+	/** Drops queued and in-progress chef walks and releases the run hold, so a fresh placement is not undone. */
+	public static void clearChefWalks() {
+		CHEF_LEGS.clear();
+		chefLeg = null;
+		holdPos = null;
+		runActive = false;
+		releaseWhenIdle = false;
+	}
+
 	public static boolean chefBusy() { return chefLeg != null || !CHEF_LEGS.isEmpty(); }
 
 	/** Assigns the chef skin to a player (agent or human) by putting it on the chef team; clears the previous chef. */
@@ -158,6 +167,8 @@ public final class CastFeature implements CrewkitFeature {
 			case "completed" -> {
 				ensureChef(server);
 				chefQueueWalk(doorPos(), 0, -90f);
+				chefQueuePause(60);
+				chefQueueWalk(CrewkitAnchors.at(CrewkitAnchors.AGENT), 0, ChefReady.FACING_YAW);
 				for (int i = 0; i < GUESTS.size(); i++) GUESTS.get(i).lookAtPlateAt = clock + 20 + i * 4L;
 				releaseWhenIdle = true;
 			}
@@ -330,7 +341,10 @@ public final class CastFeature implements CrewkitFeature {
 		String name = chefName(server);
 		if (name != null) {
 			ServerPlayer player = server.getPlayerList().getPlayerByName(name);
-			if (player != null) return player;
+			if (player != null) {
+				if (chefNpc != null) removeChefNpc(server); // the real chef is back: drop the stand-in
+				return player;
+			}
 		}
 		if (chefNpc != null) {
 			Entity npc = server.overworld().getEntity(chefNpc);

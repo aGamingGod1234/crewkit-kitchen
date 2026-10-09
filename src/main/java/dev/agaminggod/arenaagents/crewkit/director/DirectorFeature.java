@@ -28,6 +28,7 @@ public final class DirectorFeature implements CrewkitFeature {
 	private static String current;
 	private static long now;
 	private static long nextAllowed;
+	private static boolean urgent;
 
 	/** Event to shot, or null to leave the camera where it is. Dwell = how long the shot holds after arriving. */
 	static Shot shotFor(String event) {
@@ -41,7 +42,8 @@ public final class DirectorFeature implements CrewkitFeature {
 			case "checkout" -> new Shot("qr", 80);
 			case "completed" -> new Shot("door", 90);
 			case "record" -> new Shot("bill", 100);
-			case "failed", "expired" -> new Shot("gate", 60);
+			case "failed", "expired" -> new Shot("budget", 60);
+			case "candidates" -> new Shot("line", 60);
 			case "reset" -> new Shot("wide", 20);
 			default -> null; // "calls": the counter ticks in whatever shot is live
 		};
@@ -53,6 +55,8 @@ public final class DirectorFeature implements CrewkitFeature {
 		if (shot == null) return;
 		synchronized (QUEUE) {
 			if ("reset".equals(event)) { QUEUE.clear(); current = null; nextAllowed = now; }
+			// The bag drops right away, so the door shot cuts in now with a short move instead of waiting its turn.
+			if ("completed".equals(event)) { QUEUE.clear(); nextAllowed = now; urgent = true; current = null; }
 			Shot last = QUEUE.peekLast();
 			String tail = last != null ? last.mark() : current;
 			if (shot.mark().equals(tail)) return; // already there or on the way
@@ -66,19 +70,22 @@ public final class DirectorFeature implements CrewkitFeature {
 	@Override
 	public void tick(MinecraftServer server) {
 		Shot shot;
+		int move;
 		synchronized (QUEUE) {
 			now++;
 			if (now < nextAllowed || QUEUE.isEmpty()) return;
 			shot = QUEUE.pollFirst();
 			current = shot.mark();
-			nextAllowed = now + MOVE_TICKS + shot.dwellTicks();
+			move = urgent ? 12 : MOVE_TICKS;
+			urgent = false;
+			nextAllowed = now + move + shot.dwellTicks();
 		}
-		send(server, shot.mark(), MOVE_TICKS);
+		send(server, shot.mark(), move);
 	}
 
 	@Override
 	public void reset(MinecraftServer server) {
-		synchronized (QUEUE) { QUEUE.clear(); current = null; nextAllowed = now; }
+		synchronized (QUEUE) { QUEUE.clear(); current = null; nextAllowed = now; urgent = false; }
 	}
 
 	/** Sends a mark to every client that has the CrewKit camera. */

@@ -23,13 +23,13 @@ public final class CrewkitMarks {
 	}
 
 	public static final Mark WIDE = new Mark("wide", "Wide: whole kitchen", 14.0, 5.6, 19.5, 14.0, 1.0, 9.5);
-	public static final Mark LINE = new Mark("line", "Counter line: chef and head stack", 11.0, 3.2, 10.8, 8.0, 2.2, 5.5);
+	public static final Mark LINE = new Mark("line", "Counter line: chef and head stack", 11.5, 3.8, 11.5, 8.5, 3.4, 6.5);
 	public static final Mark BUDGET = new Mark("budget", "Budget board", 6.5, 4.2, 5.2, 6.5, 4.0, 0.5);
-	public static final Mark GATE = new Mark("gate", "The pass: ticket and gate bars", 9.5, 2.9, 13.5, 9.5, 2.2, 8.5);
-	public static final Mark QR = new Mark("qr", "QR on the pass", 9.5, 2.5, 11.2, 9.5, 2.3, 8.5);
+	public static final Mark GATE = new Mark("gate", "The pass: ticket and gate bars", 8.5, 3.2, 14.5, 8.5, 2.4, 9.4);
+	public static final Mark QR = new Mark("qr", "QR on the pass", 9.5, 3.6, 12.3, 9.5, 3.6, 9.0);
 	public static final Mark DOOR = new Mark("door", "Delivery door", 21.0, 3.0, 10.5, 25.5, 1.2, 6.0);
-	public static final Mark PLATING = new Mark("plating", "Tables: plating per guest", 14.0, 4.2, 18.5, 14.0, 1.0, 13.0);
-	public static final Mark BILL = new Mark("bill", "Bill board", 21.0, 4.2, 5.2, 21.0, 4.0, 0.5);
+	public static final Mark PLATING = new Mark("plating", "Tables: plating per guest", 10.0, 4.6, 19.0, 10.0, 1.6, 13.0);
+	public static final Mark BILL = new Mark("bill", "Bill board", 21.5, 4.3, 6.2, 21.5, 4.2, 0.5);
 
 	/** Manual stepping order, matching the film's beat order. */
 	public static final List<Mark> ORDER = List.of(WIDE, LINE, BUDGET, GATE, QR, DOOR, PLATING, BILL);

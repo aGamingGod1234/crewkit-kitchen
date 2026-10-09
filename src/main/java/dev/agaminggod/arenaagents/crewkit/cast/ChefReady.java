@@ -6,6 +6,7 @@ import dev.agaminggod.arenaagents.crewkit.CrewkitAnchors;
 import dev.agaminggod.arenaagents.server.CodexAgentManager;
 import java.util.Optional;
 import java.util.Set;
+import net.fabricmc.fabric.api.entity.event.v1.ServerPlayerEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
@@ -32,6 +33,13 @@ public final class ChefReady {
 
 	static void register() {
 		ServerTickEvents.END_SERVER_TICK.register(ChefReady::tick);
+		// A dead Chef comes back to the anchor instead of the world spawn.
+		ServerPlayerEvents.AFTER_RESPAWN.register((oldPlayer, newPlayer, alive) -> {
+			if (NAME.equalsIgnoreCase(newPlayer.getName().getString())
+					&& dev.agaminggod.arenaagents.crewkit.set.SetBuilder.builtInThisWorld) {
+				ready(newPlayer.level().getServer());
+			}
+		});
 	}
 
 	/** Summons or reuses Chef and puts it at the anchor. Returns a one-line status for the operator. */
@@ -57,6 +65,7 @@ public final class ChefReady {
 		}
 		// The team is keyed by player name, so the skin applies the moment the agent joins.
 		CastFeature.assignChef(server, NAME);
+		CastFeature.clearChefWalks();
 		pendingTicks = PLACE_TIMEOUT_TICKS;
 		tick(server);
 		return status;
@@ -70,6 +79,7 @@ public final class ChefReady {
 		if (player.isEmpty()) return;
 		ServerPlayer chef = player.get();
 		pendingTicks = 0;
+		chef.setInvulnerable(true);
 		// Re-assigning by the real player name also discards any stand-in mannequin.
 		CastFeature.assignChef(server, chef.getScoreboardName());
 		dev.agaminggod.arenaagents.server.OfflineAgentPlayers.stop(chef);

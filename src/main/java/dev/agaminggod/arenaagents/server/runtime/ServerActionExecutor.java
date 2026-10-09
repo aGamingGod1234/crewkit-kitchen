@@ -626,7 +626,7 @@ public final class ServerActionExecutor {
 	 * talks and calls crewkit_shop. Reject actions that would move it or change the set (it tried to mine on camera).
 	 */
 	private static void rejectCrewkitChefWorldAction(ServerActionRequest request, ServerPlayer player) {
-		if (player == null || !dev.agaminggod.arenaagents.crewkit.cast.ChefReady.NAME.equals(player.getName().getString())) return;
+		if (player == null || !dev.agaminggod.arenaagents.crewkit.cast.ChefReady.NAME.equalsIgnoreCase(player.getName().getString())) return;
 		switch (request.type()) {
 			case BREAK_BLOCK, PLACE_BLOCK, BUILD_SEQUENCE, ATTACK, FIGHT_TARGET, USE_ITEM, USE_RANGED, INTERACT_BLOCK,
 					INTERACT_ENTITY, MOVE_TO, NAVIGATE_TO, FOLLOW_ENTITY, FLEE_FROM, CONTROL, CONTROL_SEQUENCE, DROP_ITEM,

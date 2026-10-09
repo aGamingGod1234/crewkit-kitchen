@@ -384,7 +384,7 @@ export class DynamicCoordinator extends EventEmitter {
 	async speakAsAgentNamed(name, message) {
 		try {
 			if (!this.#connected) return false;
-			const record = this.#registry.list().find((entry) => entry.name === name);
+			const record = this.#registry.list().find((entry) => String(entry.name).toLowerCase() === String(name).toLowerCase());
 			if (record === undefined || !this.#usesNativeTools(record)) return false;
 			// Bind the line to the live connection, as a player message wake does; an idle Chef may not have been observed yet.
 			this.#nativeRuntimeEpochs.set(record.agentId, this.#connectionEpoch);
