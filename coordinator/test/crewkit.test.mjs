@@ -434,3 +434,16 @@ test('edge 1: a search result without merchant.name maps to merchant unknown ins
   assert.equal(opts.length, 1);
   assert.equal(opts[0].merchant, 'unknown');
 });
+
+test('edge 2: getCheckout errors back off pollEveryMs each time and stop with POLL_ERROR after 10', async () => {
+  const stream = createEventStream({ runId: 't', sinks: [] });
+  const api = replayApi(tape, { speed: 0 });
+  let polls = 0;
+  api.getCheckout = async () => { polls += 1; throw Object.assign(new Error('boom'), { code: 'NETWORK' }); };
+  const sleeps = [];
+  const r = await runCrewkit({ brief, api, emit: stream.emit, enrollmentId: 'e', pollEveryMs: 7, sleep: async (ms) => { sleeps.push(ms); } });
+  assert.equal(r.status, 'POLL_ERROR');
+  assert.equal(polls, 10);
+  assert.ok(sleeps.filter((ms) => ms === 7).length >= 10, 'every poll error sleeps pollEveryMs');
+  assert.equal(names(stream.log).at(-1), 'failed');
+});

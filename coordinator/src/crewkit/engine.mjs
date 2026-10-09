@@ -46,6 +46,8 @@ const needText = (n) => `${n.label} (${n.per === 'person' ? 'each' : n.per === '
 // Every available, priced product in the brief currency, in Reap's relevance order.
 // Reap reports the display name ("Popular Bookstore"), not the domain we search with ("popular.com.sg"),
 // so the one-merchant rule locks onto the merchant name of the first product picked.
+const MAX_POLL_ERRORS = 10;
+
 export function pickable(products, currency, lockedMerchant) {
   return (products || []).filter((p) => {
     if (p.available === false || p.previewVariant?.available === false) return false;
@@ -317,14 +319,18 @@ export async function runCrewkit({ brief: rawBrief, api, emit, enrollmentId, pol
   let status = checkout.status;
   let latest = checkout;
   const started = now();
+  let pollErrors = 0;
   for (;;) {
     if (TERMINAL.has(status) && latest.orderId !== undefined) break;
     if (now() - started > pollTimeoutMs) return fail('expired', 'POLL_TIMEOUT', `No terminal status after ${Math.round(pollTimeoutMs / 1000)}s`);
     if (!TERMINAL.has(status)) await sleep(pollEveryMs);
     try {
       latest = await call('getCheckout', checkout.id);
+      pollErrors = 0;
     } catch (e) {
       log(`poll error ${e.code || e.message}`);
+      if (++pollErrors >= MAX_POLL_ERRORS) return fail('failed', 'POLL_ERROR', `Checkout status unreadable after ${pollErrors} attempts: ${e.code || e.message}`);
+      await sleep(pollEveryMs); // a terminal status skips the top-of-loop sleep, so back off here too
       continue;
     }
     if (latest.status !== status) {
