@@ -70,7 +70,7 @@ export class RunFailed extends Error {
  * @param {(event:string, data:object)=>void} o.emit
  * @param {string} o.enrollmentId
  */
-export async function runCrewkit({ brief: rawBrief, api, emit, enrollmentId, pollEveryMs = 2500, pollTimeoutMs = 15 * 60_000, maxQuotes = 8, sleep = defaultSleep, now = Date.now, log = () => {} }) {
+export async function runCrewkit({ brief: rawBrief, api, emit, enrollmentId, pollEveryMs = 2500, pollTimeoutMs = 15 * 60_000, maxQuotes = 8, probeGapMs = 1000, sleep = defaultSleep, now = Date.now, log = () => {} }) {
   const brief = rawBrief.needs?.[0]?.queries ? rawBrief : normalizeBrief(rawBrief);
   const { budget, guestCount } = brief;
   const cur = budget.currency;
@@ -189,9 +189,18 @@ export async function runCrewkit({ brief: rawBrief, api, emit, enrollmentId, pol
       }
     }
   };
+  // failedAt: smallest quantity at which a variant was refused, so no quantity is probed twice.
+  const failedAt = new Map();
   const probe = async (variantId, quantity, merchant) => {
+    const known = failedAt.get(variantId);
+    if (known !== undefined && quantity >= known) return false;
+    await sleep(probeGapMs); // space merchant requests; bursts get 503s in sandbox
     try { await quoteCall([{ variantId, quantity }], [merchant]); return true; }
-    catch (e) { if (isStockError(e)) return false; throw e; }
+    catch (e) {
+      if (!isStockError(e)) throw e;
+      failedAt.set(variantId, Math.min(known ?? Infinity, quantity));
+      return false;
+    }
   };
   const handleStock = async (err) => {
     const lines = result.cart.filter((c) => c.qty > 0);
@@ -202,18 +211,34 @@ export async function runCrewkit({ brief: rawBrief, api, emit, enrollmentId, pol
     for (const item of bad) {
       const need = brief.needs.find((n) => n.id === item.needId);
       const qty = item.qty;
-      let to = null;
-      for (const alt of [...item.alternates]) {
-        const candidate = await resolveVariant(alt);
-        if (candidate && await probe(candidate.variantId, qty, candidate.merchant)) { to = candidate; break; }
-        item.alternates = item.alternates.filter((a) => a.productId !== alt.productId); // sold out too
+      const alts = [];
+      for (const a of item.alternates) { const c = await resolveVariant(a); if (c) alts.push(c); }
+      // 1. one other product that has the whole quantity
+      let pieces = null;
+      for (const c of alts) if (await probe(c.variantId, qty, c.merchant)) { pieces = [[c, qty]]; break; }
+      // 2. otherwise split the quantity across products (this one included), largest piece first
+      if (!pieces) {
+        const self = { productId: item.productId, variantId: item.variantId, realName: item.realName, merchant: item.merchant, unitPrice: item.unitPrice };
+        let remaining = qty;
+        pieces = [];
+        for (const c of [self, ...alts]) {
+          if (remaining === 0) break;
+          for (const q of [...new Set([remaining, Math.ceil(remaining / 2), 1])]) {
+            if (q <= remaining && await probe(c.variantId, q, c.merchant)) { pieces.push([c, q]); remaining -= q; break; }
+          }
+        }
+        if (remaining > 0) pieces = null;
       }
-      log(`${item.realName} is sold out at qty ${qty}${to ? `, swapping to ${to.realName}` : ''}`);
+      log(`${item.realName} is sold out at qty ${qty}${pieces ? `; now ${pieces.map(([c, q]) => `${q} x ${c.realName}`).join(' + ')}` : ''}`);
       emit('item_removed', { id: item.id, qtyRemoved: qty, why: 'sold_out' });
       item.qty = 0;
-      if (to) { addLine(need, to, qty, item.alternates.filter((a) => a.productId !== to.productId)); continue; }
+      if (pieces) {
+        const used = new Set(pieces.map(([c]) => c.productId));
+        for (const [c, q] of pieces) addLine(need, c, q, item.alternates.filter((a) => !used.has(a.productId)));
+        continue;
+      }
       if (need.optional) continue; // an extra may go; a mandatory need may not
-      return fail('failed', 'BRIEF_INFEASIBLE', `${need.label}: no product at ${item.merchant} has ${qty} in stock`);
+      return fail('failed', 'BRIEF_INFEASIBLE', `${need.label}: not enough stock at ${item.merchant} for ${qty}`);
     }
     return null;
   };
