@@ -48,7 +48,8 @@ public final class CrewkitMarks {
 	/** Builds a mark: look along (fx, fy, fz) at the box centre from the closest distance that frames the box. */
 	static Mark fit(String id, String label, Box b, double fx, double fy, double fz) {
 		double[] f = norm(fx, fy, fz);
-		double dist = fitDistance(b, f, FIT_VFOV, FIT_ASPECT);
+		// Demo framing: sit closer than the full-fit distance so the action fills the frame (wide shots stay full).
+		double dist = fitDistance(b, f, FIT_VFOV, FIT_ASPECT) * (id.startsWith("wide") || id.equals("celebrate") ? 1.0 : 0.72);
 		double cx = b.cx(), cy = b.cy(), cz = b.cz();
 		double ex = cx - f[0] * dist, ey = cy - f[1] * dist, ez = cz - f[2] * dist;
 		double sx = ex - f[0] * DRIFT, sy = ey - f[1] * DRIFT, sz = ez - f[2] * DRIFT;

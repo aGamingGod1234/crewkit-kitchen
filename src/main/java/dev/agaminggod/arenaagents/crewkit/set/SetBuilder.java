@@ -447,12 +447,10 @@ public final class SetBuilder {
 			for (int x = 2; x <= 15; x++) {
 				if (x != 4 && x != 13) set(x, 1, 9, front);
 			}
-			// Ticket rail: chain between two spruce posts.
-			fill(2, 2, 8, 2, 3, 8, Blocks.SPRUCE_FENCE);
-			fill(15, 2, 8, 15, 3, 8, Blocks.SPRUCE_FENCE);
-			for (int x = 3; x <= 14; x++) {
-				set(x, 3, 8, Blocks.IRON_CHAIN.defaultBlockState().setValue(BlockStateProperties.AXIS, Direction.Axis.X));
-			}
+			// No ticket-rail chain: it hid the chef from the camera. Clear the cells in case an older build left it.
+			fill(2, 2, 8, 2, 3, 8, Blocks.AIR);
+			fill(15, 2, 8, 15, 3, 8, Blocks.AIR);
+			for (int x = 3; x <= 14; x++) set(x, 3, 8, Blocks.AIR.defaultBlockState());
 		}
 
 		private void deliveryDoor() {
