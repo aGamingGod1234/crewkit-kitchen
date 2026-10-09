@@ -2,7 +2,7 @@
 
 The chef is a normal Agent Arena NPC. A provider (Claude or Codex) drives it through the native Minecraft tools, and one of those tools is `crewkit_shop`. When the model calls it, the coordinator runs the purchase (replay, simulate or live), streams `crewkit_state` events to the mod, and the kitchen plays every step. The model only sees the run id and status. It never sees the Reap key, card data or the approval URL.
 
-Verified on the Mini PC on 2026-10-09 with Claude Sonnet 5.5 (medium) in replay mode. The agent's first tool call was `mcp__minecraft__crewkit_shop` 3.4 s after the goal started. It returned `SUCCEEDED`, 39 events reached the mod, and the run ended `COMPLETED`.
+Verified on the Mini PC on 2026-10-09 with Claude Sonnet 5.5 (medium) in replay mode. One-step flow verified on the Laptop on 2026-10-09 with Claude Opus 5.5 (low), replay: `/crewkit stage` placed Chef at 8.5,101,6.5 facing south in the chef skin; the DM below produced `crewkit_shop` with a brief built from the message (190 SGD, 12 guests, 12 badges/notebooks/pens, 6 cables, 2 extras), events reached the mod 22 s after the DM, 12 guests sat, and the run ended `COMPLETED` (181.45 of 190 SGD). The agent's first tool call was `mcp__minecraft__crewkit_shop` 3.4 s after the goal started. It returned `SUCCEEDED`, 39 events reached the mod, and the run ended `COMPLETED`.
 
 ## Before you start
 
@@ -23,20 +23,19 @@ Verified on the Mini PC on 2026-10-09 with Claude Sonnet 5.5 (medium) in replay 
    /crewkit build at 0 100 0
    /crewkit stage
    ```
-3. Summon the chef next to the stove (ck_agent is at 8,1,6 relative to the origin), and give it the chef skin:
+   `/crewkit stage` also runs `/crewkit chef ready`: it summons an agent named `Chef` (provider `claude`, model `claude-opus-5-5`, effort `low`), or reuses it if it already exists, puts it on the ck_agent anchor (8,1,6 from the origin) facing the pass, and gives it the chef skin. Wait until `/codex list` shows `Chef | Ready` (about 5 s). Run `/crewkit chef ready` on its own at any time to bring Chef back to the anchor. It is idempotent, and `/crewkit reset` keeps the agent.
+3. DM Chef the order. Its standing instructions (`coordinator/config/minecraft-agent/AGENTS.md`, "CrewKit Kitchen chef") make `crewkit_shop` its first tool call. Use this exact text (Minecraft caps a typed command at 256 characters, so keep it short):
    ```text
-   /execute positioned 8.5 101 6.5 run codex summon claude claude-sonnet-5-5 medium Chef
-   /crewkit chef Chef
+   /msg Chef New order: hackathon workshop, 12 guests incl. James, John, Sandy. Budget 190 SGD. Per guest: name badge, A5 notebook, gel pen. One USB-C cable per pair. Extras: sticky notes, whiteboard markers.
    ```
-   Codex works too: `/codex summon <codex-model> <reasoning> Chef`. Wait until `/codex list` shows `Chef | Ready`.
-4. Give it the job:
-   ```text
-   /codex start Chef Shop for the workshop kit: use crewkit_shop to start the order for the posted ticket.
-   ```
+   Add the word `simulate` or `live` to the message to pick that mode; otherwise it runs `replay` (or `CREWKIT_AGENT_MODE`). Replay plays the recorded Popular tape, so keep the DM close to the posted ticket's items for replay. Other items need `simulate` or `live`.
+
+The old manual path still works: `/codex summon claude claude-opus-5-5 low Chef`, `/crewkit chef Chef`, then `/codex start Chef <task>`.
 
 ## What to expect
 
-- Tool call: `crewkit_shop {"action":"start"}`. `mode` is optional and defaults to `CREWKIT_AGENT_MODE`, else `replay`. Leaving out `brief` uses the posted ticket (`coordinator/src/crewkit/fixtures/demo-brief.json`, "Order ticket #001: Hackathon workshop kit").
+- Tool call: `crewkit_shop {"action":"start","brief":{...}}` with a brief built from the DM (title, one guest entry per guest with generic names filling in for unnamed ones, budget, needs per person/pair/room, extras). `mode` is optional and defaults to `CREWKIT_AGENT_MODE`, else `replay`. Leaving out `brief` uses the posted ticket (`coordinator/src/crewkit/fixtures/demo-brief.json`, "Order ticket #001: Hackathon workshop kit").
+- During the run the kitchen owns the chef: CastFeature walks the real agent player (pantry, pass, door) and holds the agent's own inputs from `brief` until the walks after `completed` finish, so its movement never fights the choreography. Chef ends the run at the delivery door; `/crewkit chef ready` puts it back on the anchor for the next take.
 - Result to the model: `{state:"SUCCEEDED", reasonCode:"CREWKIT_STARTED", runId}`. The agent may follow up with `crewkit_shop {"action":"status"}` and then `finish`.
 - In the world: ticket on the rail and guests sit, items stack on the chef, the budget board counts down and the gate drops then lifts, the QR code appears on the pass, then delivery and plating, and the bill board stamps the record. The server log shows `CrewKit event <name> seq=<n>` for each step.
 - Check from a shell: `curl http://127.0.0.1:4777/crewkit/status` shows `active`, then `last.status: "COMPLETED"`.
